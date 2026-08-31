@@ -273,7 +273,9 @@ Per-CPU load balancing is introduced conservatively:
 
 - enqueue locally when affinity and capacity allow;
 - wake on the last CPU when it is online and permitted;
-- otherwise select the least loaded permitted queue;
+- otherwise preserve the slot-spread target while it is at most one queued
+  continuation above the least-loaded permitted queue, and override it only
+  for an actual greater-than-one imbalance;
 - rebalance only at bounded points, never by a global scan in every tick;
 - preserve existing System/User fairness and donation semantics globally;
 - affinity masks are validated against the admitted online set.

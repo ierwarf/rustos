@@ -893,9 +893,12 @@ where
         options.dvm_block_shmem = true;
     }
 
-    // A frame-rate proof additionally requires real input. Reuse the normal
-    // DVM uinput path; no QMP or embedded-volume shortcut is added.
+    // A frame-rate proof is the complete graphical product topology: shared
+    // display control/pixels, its production DVM-backed app volume, and real
+    // input. Reuse those providers atomically; a GTK consumer without the
+    // shared display aperture can render only QEMU's unrelated guest console.
     if options.min_ui_fps.is_some() {
+        options.gui_dvm_surfaces = true;
         options.exercise_input = true;
         options.dvm_block_shmem = true;
     }

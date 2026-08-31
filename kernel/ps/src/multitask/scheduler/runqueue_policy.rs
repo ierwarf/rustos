@@ -29,6 +29,23 @@ const fn runqueue_is_imbalanced(source_count: usize, target_count: usize) -> boo
     source_count > target_count.saturating_add(1)
 }
 
+/// Preserve the exact locality/spread target while it is at most one queued
+/// continuation above the least-loaded CPU. A single long-lived kernel worker
+/// must not permanently erase one residue from user-task distribution; the
+/// least-loaded override is reserved for an actual queue imbalance.
+const fn placement_target_cpu(
+    preferred_cpu: usize,
+    least_loaded_cpu: usize,
+    preferred_count: usize,
+    least_loaded_count: usize,
+) -> usize {
+    if runqueue_is_imbalanced(preferred_count, least_loaded_count) {
+        least_loaded_cpu
+    } else {
+        preferred_cpu
+    }
+}
+
 impl Scheduler {
     #[cfg(not(test))]
     fn runqueue_online_affinity_mask(&self, slot: usize) -> u64 {
@@ -80,13 +97,19 @@ impl Scheduler {
                 .nth(spread)
                 .unwrap_or(current)
         };
-        runqueue::least_loaded_cpu(eligible, preferred)
+        let least_loaded = runqueue::least_loaded_cpu(eligible, preferred);
+        placement_target_cpu(
+            preferred,
+            least_loaded,
+            runqueue::published_runnable_count(preferred),
+            runqueue::published_runnable_count(least_loaded),
+        )
     }
 
     /// Publishes one exact wake to a placement target chosen by the caller.
     ///
     /// The owner-word CAS and mailbox record remain the authority in every
-    /// build.  Callers that already have an exact target (the outgoing CPU of
+    /// build. Callers that already have an exact target (the outgoing CPU of
     /// an assembly transition, for example) use this rather than recreating
     /// the publication protocol around a test-only mirror.
     ///
@@ -395,7 +418,7 @@ impl super::Scheduler {
 
 #[cfg(test)]
 mod tests {
-    use super::{active_balance_opportunity_due, runqueue_is_imbalanced};
+    use super::{active_balance_opportunity_due, placement_target_cpu, runqueue_is_imbalanced};
 
     #[test]
     fn active_balance_requires_more_than_one_excess_runnable() {
@@ -403,6 +426,15 @@ mod tests {
         assert!(!runqueue_is_imbalanced(4, 3));
         assert!(runqueue_is_imbalanced(2, 0));
         assert!(runqueue_is_imbalanced(5, 3));
+    }
+
+    #[test]
+    fn placement_keeps_one_task_tolerance_before_overriding_spread() {
+        assert_eq!(placement_target_cpu(1, 2, 0, 0), 1);
+        assert_eq!(placement_target_cpu(1, 2, 1, 0), 1);
+        assert_eq!(placement_target_cpu(1, 2, 2, 0), 2);
+        assert_eq!(placement_target_cpu(1, 2, 4, 3), 1);
+        assert_eq!(placement_target_cpu(1, 2, 5, 3), 2);
     }
 
     #[test]

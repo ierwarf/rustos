@@ -26,9 +26,11 @@ use rustos_user_abi::syscall::{
 /// Interrupt delivery is the primary wake path. This bounded watchdog is a
 /// second, independent failure detector for a lost/coalesced MSI-X edge or a
 /// producer/service restart race; it does not consume or interpret records.
-/// At 100 ms it adds at most ten idle wakeups per second while keeping the
-/// 2,048-slot ring far from exhaustion under the admitted 256 frame/s ceiling.
-const INPUT_INGESTION_WATCHDOG_MS: u64 = 100;
+/// Keep this below L0's 50 ms fixed-ring credit timeout: if a doorbell is lost,
+/// the consumer must repoll and publish credit before the producer fails closed.
+/// At 25 ms it adds at most forty idle wakeups per second while remaining far
+/// below the 2,048-slot exhaustion time at the admitted 256 frame/s ceiling.
+const INPUT_INGESTION_WATCHDOG_MS: u64 = 25;
 
 #[inline]
 fn input_broker_abi_is_current(abi_version: u16) -> bool {
@@ -205,6 +207,8 @@ mod tests {
 
     #[test]
     fn ingestion_watchdog_is_bounded_below_ring_exhaustion_time() {
-        assert!((1..=100).contains(&INPUT_INGESTION_WATCHDOG_MS));
+        // Recovery must repoll before L0's 50 ms credit watchdog can fail
+        // closed, while remaining strictly positive to avoid a busy loop.
+        assert!((1..50).contains(&INPUT_INGESTION_WATCHDOG_MS));
     }
 }

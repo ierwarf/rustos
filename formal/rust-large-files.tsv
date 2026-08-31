@@ -32,5 +32,6 @@ services/uiserver/src/sys.rs	1625	uiserver-sys	Split syscall wrappers by IPC, VM
 services/uiserver/src/wayland.rs	3245	uiserver-wayland	Split protocol objects, dispatch, surface lifecycle, and tests.
 tools/hostd/src/runtime.rs	2841	hostd	Split launch, QMP, process identity, recovery, and evidence sealing.
 tools/xtask/src/build/mod.rs	1505	xtask-build	Split build planning, signing, staging, and artifact validation.
+tools/xtask/src/kvm/tests.rs	1305	xtask-kvm	Split smoke-option parsing tests from marker acceptance and SMP ring3 qualification tests.
 tools/xtask/src/formal_contracts/registry.rs	1583	xtask-formal	Split schema decode, semantic validation, generation, and tests.
 tools/xtask/src/stage/mod.rs	1356	xtask-stage	Split package staging, manifests, extents, and signing inputs.

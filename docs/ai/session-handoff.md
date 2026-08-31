@@ -67,44 +67,82 @@ Measured on a 1-vCPU boot: admission refusals **0**, and
 `pager-anon-fault-progress` rose from 14 to 25 milestones (~900 -> ~1600 faults
 actually served by the pager).
 
-### Open bug: 8 vCPU misses `smp-cpu-first-user-dispatch arg0=0x1`
+### Closed: 8-vCPU CPU1 user-dispatch starvation
 
-Plain `kvm-smoke --rustos-vcpus 8` intermittently fails with that single
-missing marker. CPU 1 comes online, is scheduler-ready, takes its first
-clockevent and reschedule IPI, enters idle, and dispatches kernel work
-(`smp-ap-first-work-dispatch`) - its event set is identical to CPU 2's except
-that it never runs a user task. No panic, lockdep, corruption, or stale marker
-appears in any failing run.
+The failure was scheduler placement, not pager throughput or missing CPU/IPI
+readiness. `runqueue_target_cpu` computed the exact last-CPU/slot-spread target
+and then unconditionally replaced it with the globally least-loaded queue. One
+long-lived kernel continuation on CPU1 therefore erased residue 1 from user
+placement even when the difference was only one queued task; CPU1 kept running
+kernel work but never received a user continuation.
 
-**Not caused by the pager.** With `PAGER_DEMAND_ADMISSION_WIRED = false` and a
-matching fresh seal it still failed the same way (1 of 3 passed), so this is a
-scheduler placement or boot-latency question.
+Placement now preserves the exact locality/spread target while its queued
+count is at most one above the least-loaded eligible CPU, matching the existing
+active-balance threshold. It overrides the target only for a greater-than-one
+imbalance. A focused regression fixes the 0/1/2 and 3/4/5 boundaries.
 
-Hypotheses tried and **rejected**, so nobody repeats them:
+Fresh exact-tree evidence: the focused kernel-ps test, both scheduler TLC
+models, `cargo xtask check`, `cargo xtask build`, and the PR formal seal pass.
+Across 15 freshly built 8-vCPU boots, `smp-cpu-first-user-dispatch arg0=0x1`
+was never missing. The control is just as sharp: on the same commit with the
+placement override restored, it was missing in 5 of 5 runs at `--timeout 60`
+and 3 of 3 at `--timeout 120`, so the CPU never recovered given four times the
+budget. `kvm-smoke` also passes at 1, 2, and 4 vCPU.
 
-- *Housekeeping monopolises its CPU.* Pipelining pager work 1 -> 8 faults per
-  turn (kept, it is a real throughput win) did not fix it. `Thread::new`'s
-  second argument is `weight_micros`, a time slice, not a priority, so
-  housekeeping is not preempting by priority either.
-- *`slot % online_count` cannot produce residue 1 with a strided slot
-  allocator.* Replacing it with a rotating placement counter did not fix it,
-  and the change broke the `cfg(test)` build, so it was reverted.
-- Instrumenting which CPU housekeeping runs on produced no output from either
-  `kernel-executive` or `kernel-compat`, which is itself unexplained and is the
-  next thread to pull: the probe string is present in `nucleus.elf` and the
-  category/level are enabled, yet the milestone never reaches the debugcon log.
+**Method warning, and it invalidated a whole session of conclusions.**
+`cargo xtask kvm-smoke` does **not** rebuild the image; it boots whatever is
+already in `build/image/`. Every earlier "instrumentation produced no output
+from `kernel-executive` or `kernel-compat`" note came from probes that were
+never compiled into the booted kernel, and the hypotheses that session recorded
+as *rejected* were tested against a stale image. Treat them as untested, not
+disproved. Always `cargo xtask build` after a source change, then refresh
+`formal/verify-all.sh --profile pr` (~25 s; the lanes cache) before drawing any
+multi-vCPU conclusion. Multi-vCPU runs check the seal against the current
+source hash, and a stale seal fails with `formal verification run binding
+mismatch`, which reads exactly like a boot failure.
+`--smp-iteration` needs its own `formal/verify-smp-iteration.sh` seal.
 
-Start there rather than re-guessing at placement.
+### Open: the `--min-ui-fps 60` gate does not pass, at any vCPU count
 
-**Method warning that invalidated several earlier measurements.** Multi-vCPU
-runs verify the formal seal against the current source hash, so any source edit
-makes 2/4/8-vCPU runs fail with `formal verification run binding mismatch` -
-which reads exactly like a boot failure. Six 8-vCPU measurements were thrown
-away to this. **Re-run `formal/verify-all.sh --profile pr` after every source
-change before drawing a multi-vCPU conclusion.** `--smp-iteration` needs its own
-`formal/verify-smp-iteration.sh` seal, is capped at `--timeout 30`, and also
-requires uiserver, dvm-block, and storaged readiness inside those 30 seconds,
-which this tree does not yet reach.
+This is **not** an SMP problem: `--min-ui-fps 60` fails identically at 1 vCPU
+and at 8, so do not spend another session treating it as one. The CPU1
+placement fix above is unrelated to it and is not blocked on it.
+
+The gate now implies `--gui-dvm-surfaces` (a `kvm/options.rs` change kept in
+this change set: a GTK consumer without the shared display aperture can only
+render QEMU's unrelated guest console, so the old gate proved the wrong thing).
+That makes it strictly harder, and it currently stops in two places:
+
+- **With the shared surfaces.** uiserver never sees the compositor. The DVM
+  reports `gpu-compositor primed contract=3` at its own t=1.6 s and RustOS
+  confirms `gui-dvm: peer ready lease rebound invitation=2` at t=2.9 s, which
+  is where `GPU_PRIME_DURATION_NS` and `GUI_DVM_PEER_READY` are published - yet
+  `display_get_info` keeps returning `flags=0x6` (no
+  `DISPLAY_INFO_FLAG_GPU_COMPOSITOR`) until t=63 s, and uiserver exits
+  `errno=110`. The ioctl drain is wired (`prepare_ioctl` ->
+  `gpu_atlas_info()`), so the open question is why the poll does not observe
+  the already-published atlas contract. Note the bootstrap worker logs
+  `GPU provider pending attempt=` only at powers of two and stops after
+  `attempt=2`: either the worker stops polling or those lines are being lost.
+  Establish which before theorising - that ambiguity is the whole reason this
+  is still open.
+- **Without them.** The boot is clean (`missing=[]`, `dvm-display-ready=true`)
+  but WayClick never launches, `runtimed` logs `accept failed: errno=110` after
+  two consecutive 30 s waits, and every fps window stays false.
+
+One measurement worth keeping: timed waits overshoot badly under the input
+exercise. `runtimed: idle wait overshoot budget_us=10000 elapsed_us=~30000` is
+a consistent 3x, and `inputd` charges `log_us=~1400` per turn - debugcon port
+writes, taken under a global lock with interrupts disabled, dwarf that turn's
+`drain_us`/`decode_us`. A 60 fps proof needs 16.6 ms frames, so the wake
+latency and the logging cost are both plausible first suspects.
+
+Two in-flight changes belong to this gate and are kept because they are
+independently justified: `INPUT_INGESTION_WATCHDOG_MS` 100 -> 25 ms (verified
+load-bearing - with the committed 100 ms value the run dies on
+`fixed input-ring credit timeout outstanding=1279 limit=1279 timeout_ms=50`,
+because the consumer must repoll and publish credit before L0's 50 ms credit
+watchdog fails closed) and the `--min-ui-fps` topology change above.
 
 ### Log volume and CI
 
@@ -128,11 +166,17 @@ workspace package, so the host-test step could never have passed.
 `bash formal/verify-all.sh --profile pr` **sealed**: 44 artifacts, every lane
 green, including implementation-mutations at 612 mutants with none surviving.
 `formal/check-rust-source-contracts.py` passes at 489 Rust files and 107
-critical/high surfaces. Unit tests: kernel-compat 160, kernel-ps 262,
-kernel-mm 41, kernel-hal 66, kernel-executive 6, kernel-ipc-runtime 61,
-pagerd 18, rustos-user-abi 42. KVM smoke passes at 1, 2, and 4 vCPU; 8 vCPU as
-qualified above. `cargo fmt --all --check` is clean except three files with
-pre-existing committed drift (nucleus lockdep preemption, two xtask files).
+critical/high surfaces. Unit tests: kernel-ps 263, kernel-compat 160, xtask 147,
+rustos-user-abi 42, driver-domain-protocol 21, runtime-control 15.
+`cargo fmt --all -- --check` is clean.
+
+Plain `kvm-smoke` passes at 1, 2, 4, and 8 vCPU. The 8-vCPU run is no longer
+CPU1-starved in any of 15 boots. It is still intermittent for a *different*
+reason - 2 of 6 repeats missed
+`uiserver: gpu-scene compiler ready contract=3`, the same uiserver GPU
+readiness latency the `--min-ui-fps` section above is open on. Do not read that
+residual flake as the placement bug returning: check which marker is missing
+before concluding anything.
 
 ### Contract and registry work landed with the behaviour
 

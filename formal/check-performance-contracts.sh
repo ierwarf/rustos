@@ -552,9 +552,9 @@ rg -Fq 'arm_consumer_wake()' \
     echo "inputd wait broker no longer publishes wake generation before cursor recheck" >&2
     exit 1
 }
-rg -Fq 'const INPUT_INGESTION_WATCHDOG_MS: u64 = 100;' \
+rg -Fq 'const INPUT_INGESTION_WATCHDOG_MS: u64 = 25;' \
     kernel/compat/src/user/syscall/linux/input_broker_ops.rs || {
-    echo "inputd wait broker lost its bounded lost-interrupt watchdog" >&2
+    echo "inputd wait broker lost its sub-credit-timeout lost-interrupt watchdog" >&2
     exit 1
 }
 rg -Fq 'const INPUT_RING_RECOVERY_KICK_RECORDS: u64 = 2;' \

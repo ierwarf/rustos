@@ -6,13 +6,12 @@ mod tests {
         DEFAULT_UI_FPS_ACTIVE_WINDOWS, DVM_BLOCK_FEATURE_FLUSH, DVM_BLOCK_FLAG_DVM_READY,
         DVM_BLOCK_FLAG_READ_ONLY, DVM_BLOCK_FLAG_RUSTOS_READY, DVM_BLOCK_MEDIA_BLOCK_BYTES,
         DVM_BLOCK_MEDIA_FEATURES, DVM_BLOCK_READY_MARKER, DVM_BOOTSTRAP_FRAME_MARKER,
-        DVM_CONTROL_AUTHENTICATION,
-        DVM_CONTROL_CAPABILITIES, DVM_CONTROL_PROTOCOL, DVM_CONTROL_STATE, DVM_CONTROL_TRANSPORT,
+        DVM_CONTROL_AUTHENTICATION, DVM_CONTROL_CAPABILITIES, DVM_CONTROL_PROTOCOL, DVM_CONTROL_STATE, DVM_CONTROL_TRANSPORT,
         DVM_DISPLAY_REGION_BYTES, DVM_GPU_COMPOSITOR_MARKER, DVM_KEYBOARD_INGRESS_MARKER,
         DVM_POINTER_INGRESS_MARKER, DvmNetworkCounters, GuestDisplay, MAX_SMOKE_TIMEOUT,
         PHYSICAL_GPU_PROFILES, RUSTOS_BOOT_MARKER, RUSTOS_DVM_BLOCK_E2E_MARKER,
         RUSTOS_DVM_BLOCK_FIRST_COMPLETION_MARKER, RUSTOS_DVM_BLOCK_FLUSH_FAULT_MARKER,
-        RUSTOS_DVM_BLOCK_MARKER, RUSTOS_GPU_SCENE_COMPILER_MARKER, RUSTOS_INIT_IDENTITY_MARKER,
+        RUSTOS_DVM_BLOCK_MARKER, RUSTOS_GPU_ACTIVE_MARKER, RUSTOS_GPU_SCENE_COMPILER_MARKER, RUSTOS_INIT_IDENTITY_MARKER,
         RUSTOS_POST_INIT_PROVENANCE_MARKER, RUSTOS_SMP_READINESS, RustosSmpReadiness,
         SMP_QUALIFICATION_DEADLINE_US, SMP_QUALIFICATION_WORK_BITS, SMP_QUALIFICATION_WORK_UNITS,
         VIRTUAL_GPU_EVIDENCE, WAYCLICK_FIRST_FRAME_MARKER, WayclickProfileObservation,
@@ -618,8 +617,19 @@ mod tests {
             parse_smoke_options(vec!["--min-ui-fps".into(), "20".into()].into_iter()).unwrap();
         assert_eq!(options.min_ui_fps, Some(20));
         assert_eq!(options.ui_proof_windows, DEFAULT_UI_FPS_ACTIVE_WINDOWS);
+        assert!(options.gui_dvm_surfaces);
         assert!(options.exercise_input);
         assert!(options.dvm_block_shmem);
+        assert!(
+            options
+                .expected_markers
+                .contains(&RUSTOS_GPU_ACTIVE_MARKER.to_owned())
+        );
+        assert!(
+            options
+                .expected_dvm_markers
+                .contains(&DVM_BOOTSTRAP_FRAME_MARKER.to_owned())
+        );
         assert!(
             options
                 .expected_markers
