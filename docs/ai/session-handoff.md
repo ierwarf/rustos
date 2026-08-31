@@ -151,6 +151,25 @@ The begin line now marks one dispatched load. Measured: the same gap is **6 ms**
 the boot log dropped from thousands of lines to ~350, and a healthy boot logs
 3-4 begins.
 
+### Contention panics now name the code that has to change
+
+`ProcessStateLock` contention panics (`ProcessStateLock contention cannot
+block`) reported `process_table/identity.rs` as both the owner and the waiter -
+the one file that is never at fault, because it holds nothing but the thin
+`with_*` accessors. That named neither the subsystem that took the lock nor the
+one that could not wait for it, which is the only thing the panic exists to
+say. The accessors now capture their own `#[track_caller]` location and hand it
+to `ProcessStateLock::lock_at`, so the attribution survives the accessor layer.
+
+The panic itself is still open, and it is worth stating plainly what its
+contract costs: a lock taken from a context that can neither block nor tolerate
+100,000 spins turns transient SMP contention into a dead machine.
+`process_table::try_with_process_state_mut` already exists precisely because
+the exception path must fail closed instead, so the shape of the fix is known -
+what is missing is knowing which caller is in the non-blockable context, which
+is what the attribution above now supplies. Reproduce under
+`--min-ui-fps 60 --rustos-vcpus 8`; it appeared in roughly one run in four.
+
 ### Open: the `--min-ui-fps 60` gate does not pass, at any vCPU count
 
 This is **not** an SMP problem: `--min-ui-fps 60` fails identically at 1 vCPU

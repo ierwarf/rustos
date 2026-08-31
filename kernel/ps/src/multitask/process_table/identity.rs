@@ -300,56 +300,64 @@ impl ProcessRef {
         }
     }
 
+    #[track_caller]
     pub fn with_state<R>(&self, f: impl FnOnce(u64, &UserProcessState) -> R) -> R {
+        let site = core::panic::Location::caller();
         let state = self
             .state()
             .expect("process reference lost its state object");
-        let state = unsafe { state.as_ref() }.lock();
+        let state = unsafe { state.as_ref() }.lock_at(site);
         f(self.process_id, &state)
     }
 
+    #[track_caller]
     pub fn with_state_mut<R>(&self, f: impl FnOnce(u64, &mut UserProcessState) -> R) -> R {
+        let site = core::panic::Location::caller();
         let state = self
             .state()
             .expect("process reference lost its state object");
-        let mut state = unsafe { state.as_ref() }.lock();
+        let mut state = unsafe { state.as_ref() }.lock_at(site);
         f(self.process_id, &mut state)
     }
 
+    #[track_caller]
     pub fn with_visible_state<R>(&self, f: impl FnOnce(u64, &UserProcessState) -> R) -> Option<R> {
-        let state = unsafe { self.state()?.as_ref() }.lock();
+        let state = unsafe { self.state()?.as_ref() }.lock_at(core::panic::Location::caller());
         process_state_is_visible(self.handle).then(|| f(self.process_id, &state))
     }
 
     /// Accesses state only while the exact process and MM generations retained
     /// by the caller remain the committed live identity.
+    #[track_caller]
     pub fn with_exact_visible_state<R>(
         &self,
         expected: ProcessIdentity,
         f: impl FnOnce(u64, &UserProcessState) -> R,
     ) -> Option<R> {
-        let state = unsafe { self.state()?.as_ref() }.lock();
+        let state = unsafe { self.state()?.as_ref() }.lock_at(core::panic::Location::caller());
         (live_process_identity(self.handle) == Some(expected)).then(|| f(self.process_id, &state))
     }
 
     /// Mutable counterpart of with_exact_visible_state. The process-state lock
     /// closes exec/exit replacement while the caller commits a generation-bound
     /// address-space transaction.
+    #[track_caller]
     pub fn with_exact_visible_state_mut<R>(
         &self,
         expected: ProcessIdentity,
         f: impl FnOnce(u64, &mut UserProcessState) -> R,
     ) -> Option<R> {
-        let mut state = unsafe { self.state()?.as_ref() }.lock();
+        let mut state = unsafe { self.state()?.as_ref() }.lock_at(core::panic::Location::caller());
         (live_process_identity(self.handle) == Some(expected))
             .then(|| f(self.process_id, &mut state))
     }
 
+    #[track_caller]
     pub fn with_visible_state_mut<R>(
         &self,
         f: impl FnOnce(u64, &mut UserProcessState) -> R,
     ) -> Option<R> {
-        let mut state = unsafe { self.state()?.as_ref() }.lock();
+        let mut state = unsafe { self.state()?.as_ref() }.lock_at(core::panic::Location::caller());
         process_state_is_visible(self.handle).then(|| f(self.process_id, &mut state))
     }
 

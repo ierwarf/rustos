@@ -113,7 +113,24 @@ impl<T> ProcessStateLock<T> {
 impl<T: ?Sized> ProcessStateLock<T> {
     #[track_caller]
     pub(super) fn lock(&self) -> ProcessStateGuard<'_, T> {
-        let acquire_site = Location::caller();
+        self.lock_at(Location::caller())
+    }
+
+    /// Acquires while attributing the acquisition to an explicit `acquire_site`.
+    ///
+    /// Every observed contention panic named
+    /// `process_table/identity.rs` for both the owner and the waiter - the one
+    /// file that is never at fault, because it holds nothing but the thin
+    /// `with_*` accessors. That attribution identifies neither the subsystem
+    /// that took the lock nor the one that could not wait for it, which is the
+    /// only thing the panic exists to tell you. The accessors now capture
+    /// their own `#[track_caller]` location and hand it here, so the site
+    /// survives the accessor layer no matter how the wrappers above it are
+    /// annotated.
+    pub(super) fn lock_at(
+        &self,
+        acquire_site: &'static Location<'static>,
+    ) -> ProcessStateGuard<'_, T> {
         let owner = current_owner_token();
         self.assert_not_recursive(owner, acquire_site);
         let mut spins = 0usize;
