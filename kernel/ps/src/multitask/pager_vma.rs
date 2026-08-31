@@ -568,13 +568,26 @@ pub fn protect_for_process(
     })
 }
 
-pub fn unmap_for_process(process_id: u64, start: u64, end: u64) -> Result<bool, PagerVmaError> {
+/// Unmaps one exact range and reports the identity whose slot was released.
+///
+/// Returning the stamped `(process_handle, process_generation)` lets the caller
+/// name to the pager exactly what ring0 released, instead of re-deriving an
+/// identity that could disagree with the publication.
+pub fn unmap_for_process(
+    process_id: u64,
+    start: u64,
+    end: u64,
+) -> Result<Option<(u64, u64)>, PagerVmaError> {
     let retained =
         super::process_table::retain_process_by_pid(process_id).ok_or(PagerVmaError::Stale)?;
     let identity = retained.live_identity().ok_or(PagerVmaError::Stale)?;
     let page_count =
         usize::try_from((end - start) / PAGER_PAGE_BYTES).map_err(|_| PagerVmaError::Malformed)?;
-    retained.with_state_mut(|_, state| {
+    let process = retained
+        .handle()
+        .object_identity()
+        .ok_or(PagerVmaError::Stale)?;
+    let unmapped = retained.with_state_mut(|_, state| {
         rewrite_attenuated_range(retained.handle(), identity, start, end, None, || {
             state
                 .address_space_mut()
@@ -585,7 +598,8 @@ pub fn unmap_for_process(process_id: u64, start: u64, end: u64) -> Result<bool, 
                 .map(|_| ())
                 .map_err(|_| PagerVmaError::Stale)
         })
-    })
+    })?;
+    Ok(unmapped.then(|| (process.slot(), process.generation())))
 }
 
 pub(super) fn revoke(

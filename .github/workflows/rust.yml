@@ -69,7 +69,8 @@ jobs:
         -p storage-fat
         -p trace-loc-macro
         -p boot-random
-        -p driver-abi
+        -p driver-domain-protocol
+        -p rustos-user-abi
         -p keyboard-core
         -p rustos-driver-domain-host
 

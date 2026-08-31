@@ -41,19 +41,55 @@ shape was promoted out of `kernel/ps/src/multitask/pager_fault.rs` into
 `pager_fault_token_generation`) so ring0 and pagerd read one definition rather
 than pagerd reverse-engineering a kernel-private encoding.
 
-### Known limitation: 8 vCPU is intermittent
+### pagerd region tracking was leaking, and the downgrade was silent
 
-1, 2, and 4 vCPU boots pass repeatedly. 8 vCPU is **marginal**: at `--timeout
-30` it failed 3 of 4 runs, and at `--timeout 90` it passed 1 of 2, always with
-the same single missing marker `smp-cpu-first-user-dispatch arg0=0x1` - CPU 1
-does not receive user work in time. No panic, lockdep, corruption, or stale
-marker appears in any failing run, and every service reaches readiness. The
-likely owner is early user work serialising through the single pagerd fault
-endpoint and its housekeeping dispatch turn, which is the throughput question
-the pager phase was always going to raise. **Do not treat 8-vCPU as a passing
-product gate.** Measure it before widening the envelope, and prefer a
-structural answer (fault batching, or a second dispatch turn per housekeeping
-pass) over raising timeouts.
+`invalidate_process` was only ever called from a unit test: **nothing in
+production released a pagerd region**. Ring0 does free its own VMA slot in
+`broker_unmap`, so release existed on one side of the contract only. Once the
+fixed table filled, `admit_region` returned `Pressure` forever, and
+`broker_map_anon` fell back to eager mapping **without any signal** - demand
+paging quietly stopped being used. A dead region also refused re-admission of
+its own range as an overlap, so re-mapping a freed range could never recover.
+
+The lifecycle is now symmetric. `unmap_for_process` returns the stamped
+`(process_handle, process_generation)` it released, so the caller names exactly
+what ring0 freed instead of re-deriving an identity that could disagree; the
+broker forwards that as `COMMERCIAL_MAX_PAGERD_OP_RELEASE_OBJECT`, and pagerd
+drops the matching regions. Capacities moved into the shared ABI with their
+relation written down (`PAGER_MAX_VMAS_PER_PROCESS`,
+`PAGER_MAX_TRACKED_REGIONS = 4 x` that), replacing three independent `64`s that
+had no declared relationship. Admission refusal now emits
+`pager-backing-admission-refused`, so the eager downgrade can never be silent
+again. Pager dispatch also pipelines up to 8 faults per housekeeping turn
+instead of one.
+
+Measured on a 1-vCPU boot: admission refusals **0**, and
+`pager-anon-fault-progress` rose from 14 to 25 milestones (~900 -> ~1600 faults
+actually served by the pager).
+
+### Known limitation: 8 vCPU is intermittent, and it is NOT the pager
+
+Plain `kvm-smoke --rustos-vcpus 8` intermittently fails with the single missing
+marker `smp-cpu-first-user-dispatch arg0=0x1`: CPU 1 comes online, takes
+clockevents and reschedule IPIs, enters idle, and dispatches kernel work, but
+never receives a user task. No panic, lockdep, corruption, or stale marker
+appears, and every other CPU reports the marker.
+
+**This is pre-existing and not caused by Phase 7.** With
+`PAGER_DEMAND_ADMISSION_WIRED` set to `false` and a matching fresh seal, 8 vCPU
+still failed the same way (1 of 3 passed). Pass rate is unstable across runs
+(2 of 3 in one window, 0 of 8 in another) on an unloaded 16-core host, so treat
+it as a scheduler placement or boot-latency question, not a pager one.
+
+**Method warning that invalidated several earlier measurements:** multi-vCPU
+runs verify the formal seal against the current source hash. Any source edit
+makes 2/4/8-vCPU runs fail with `formal verification run binding mismatch`,
+which looks exactly like a boot failure. **Re-run `formal/verify-all.sh
+--profile pr` after every source change before drawing any multi-vCPU
+conclusion.** `--smp-iteration` additionally needs
+`formal/verify-smp-iteration.sh` (a separate `smp-iteration` profile) and is
+capped at `--timeout 30`; that profile also requires uiserver, dvm-block, and
+storaged readiness inside those 30 seconds, which this tree does not yet reach.
 
 ### Fresh evidence for this change set
 

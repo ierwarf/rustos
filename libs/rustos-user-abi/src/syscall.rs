@@ -1125,6 +1125,12 @@ pub const COMMERCIAL_MAX_PAGERD_OP_BACKING_OBJECT: u16 = 1;
 pub const COMMERCIAL_MAX_PAGERD_OP_PAGE_CACHE_POLICY: u16 = 2;
 pub const COMMERCIAL_MAX_PAGERD_OP_FAULT_RESOLVE: u16 = 3;
 pub const COMMERCIAL_MAX_PAGERD_OP_WRITEBACK_POLICY: u16 = 4;
+/// Releases the pager's tracking for one exact process range.
+///
+/// Ring0 frees its own VMA slot on unmap; without this the pager would keep a
+/// dead region forever, refuse to re-admit that range as an overlap, and
+/// eventually exhaust its table and silently fall back to eager mapping.
+pub const COMMERCIAL_MAX_PAGERD_OP_RELEASE_OBJECT: u16 = 5;
 pub const COMMERCIAL_MAX_UISERVER_OP_DISPLAY_READINESS: u16 = 1;
 pub const COMMERCIAL_MAX_UISERVER_OP_DISPLAY_METADATA: u16 = 2;
 pub const COMMERCIAL_MAX_UISERVER_OP_SURFACE_POLICY: u16 = 3;

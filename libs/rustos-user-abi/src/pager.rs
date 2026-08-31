@@ -9,12 +9,61 @@ pub const PAGER_PAGE_BYTES: u64 = 4096;
 
 /// Fixed number of ring0 fault slots a token may name.
 pub const PAGER_MAX_FAULT_SLOTS: usize = 128;
+
+/// Pager VMA slots ring0 keeps for one process.
+///
+/// Published here because a pager sizes its own region table against it: one
+/// process must not be able to wedge the pager for every other process.
+pub const PAGER_MAX_VMAS_PER_PROCESS: usize = 64;
+
+/// Regions a pager tracks across all processes.
+///
+/// Ring0 releases a VMA slot when its range is unmapped and tells the pager, so
+/// this bounds the live working set rather than every mapping a boot creates.
+/// It is deliberately a multiple of `PAGER_MAX_VMAS_PER_PROCESS` so one process
+/// filling its own slots still leaves room for others. Exhaustion must be an
+/// explicit, observable admission refusal - never a silent downgrade to eager
+/// mapping.
+pub const PAGER_MAX_TRACKED_REGIONS: usize = 4 * PAGER_MAX_VMAS_PER_PROCESS;
 /// Width of the slot component of a fault token.
 pub const PAGER_FAULT_TOKEN_SLOT_BITS: u32 = 8;
 /// Mask selecting the slot component of a fault token.
 pub const PAGER_FAULT_TOKEN_SLOT_MASK: u64 = (1 << PAGER_FAULT_TOKEN_SLOT_BITS) - 1;
 /// Highest generation a fault token may carry before its slot fails closed.
 pub const PAGER_MAX_FAULT_TOKEN_GENERATION: u64 = u64::MAX >> PAGER_FAULT_TOKEN_SLOT_BITS;
+
+/// Exact range whose pager tracking ring0 is releasing.
+///
+/// The process identity is kernel-stamped, so a pager releases only what ring0
+/// says has died; it never infers liveness from a PID alone.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PagerReleaseRangeWire {
+    pub version: u16,
+    pub reserved0: [u16; 3],
+    pub process_handle: u64,
+    pub process_generation: u64,
+    pub start: u64,
+    pub end: u64,
+    pub reserved1: [u64; 2],
+}
+
+impl PagerReleaseRangeWire {
+    pub const fn is_canonical(self) -> bool {
+        self.version == PAGER_FAULT_ABI_VERSION
+            && self.reserved0[0] == 0
+            && self.reserved0[1] == 0
+            && self.reserved0[2] == 0
+            && self.reserved1[0] == 0
+            && self.reserved1[1] == 0
+            && self.process_handle != 0
+            && self.process_generation != 0
+            && self.start != 0
+            && self.start < self.end
+            && self.start & (PAGER_PAGE_BYTES - 1) == 0
+            && self.end & (PAGER_PAGE_BYTES - 1) == 0
+    }
+}
 
 /// One-based slot index carried by a fault token, or `None` when malformed.
 ///

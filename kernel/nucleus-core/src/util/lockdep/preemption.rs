@@ -106,7 +106,6 @@ pub fn preemption_disabled() -> bool {
     preemption_depth() != 0
 }
 
-
 /// Take one same-CPU, IRQ-atomic snapshot of scheduler-preemption ownership.
 pub fn preemption_snapshot() -> PreemptionSnapshot {
     #[cfg(rustos_boot_image)]

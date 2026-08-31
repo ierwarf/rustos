@@ -9,12 +9,15 @@ pub use page_cache::{
 use rustos_user_abi::pager::{
     pager_fault_token_generation, pager_fault_token_slot, PagerFaultDispatchWire,
     PagerFaultReplyWire, PagerFaultRequestWire, PagerVmRegionWire, PAGER_ACTION_DENY,
-    PAGER_ACTION_MAP_ZEROED, PAGER_FAULT_ABI_VERSION, PAGER_MAX_FAULT_SLOTS, VM_ACCESS_EXECUTE,
-    VM_ACCESS_READ, VM_ACCESS_WRITE, VM_FAULT_COW, VM_FAULT_PRESENT, VM_FAULT_PROTECTION,
-    VM_OBJECT_ANONYMOUS, VM_PROT_EXECUTE, VM_PROT_READ, VM_PROT_WRITE,
+    PAGER_ACTION_MAP_ZEROED, PAGER_FAULT_ABI_VERSION, PAGER_MAX_FAULT_SLOTS,
+    PAGER_MAX_TRACKED_REGIONS, VM_ACCESS_EXECUTE, VM_ACCESS_READ, VM_ACCESS_WRITE, VM_FAULT_COW,
+    VM_FAULT_PRESENT, VM_FAULT_PROTECTION, VM_OBJECT_ANONYMOUS, VM_PROT_EXECUTE, VM_PROT_READ,
+    VM_PROT_WRITE,
 };
 
-pub const PAGER_MAX_REGIONS: usize = 64;
+/// Live regions this pager tracks, sized by the shared ABI against ring0's
+/// per-process VMA capacity so one process cannot wedge the others.
+pub const PAGER_MAX_REGIONS: usize = PAGER_MAX_TRACKED_REGIONS;
 /// Exact one-shot replay state, one entry per ring0 fault slot.
 ///
 /// This replaces an append-only list of consumed tokens. That list could only
@@ -74,6 +77,35 @@ impl PagerState {
             .ok_or(PagerFaultError::Pressure)?;
         *slot = Some(region);
         Ok(())
+    }
+
+    /// Releases tracking for one exact ring0-stamped range.
+    ///
+    /// Ring0 frees its own VMA slot on unmap and then sends this. Without it a
+    /// dead region would live forever: it would refuse to re-admit the same
+    /// range as an overlap, and the fixed table would fill and start refusing
+    /// every admission, which downgrades demand paging to eager mapping.
+    pub fn release_range(
+        &mut self,
+        release: rustos_user_abi::pager::PagerReleaseRangeWire,
+    ) -> Result<usize, PagerFaultError> {
+        if !release.is_canonical() {
+            return Err(PagerFaultError::Malformed);
+        }
+        let mut released = 0;
+        for slot in &mut self.regions {
+            let matches = slot.is_some_and(|region| {
+                region.process_handle == release.process_handle
+                    && region.process_generation == release.process_generation
+                    && region.start < release.end
+                    && release.start < region.end
+            });
+            if matches {
+                *slot = None;
+                released += 1;
+            }
+        }
+        Ok(released)
     }
 
     pub fn invalidate_process(&mut self, process_handle: u64) -> usize {
@@ -419,6 +451,75 @@ mod tests {
             None
         );
         assert_eq!(decode_token(token(1, 3)), Some((0, 3)));
+    }
+
+    fn release_of(region: PagerVmRegionWire) -> rustos_user_abi::pager::PagerReleaseRangeWire {
+        rustos_user_abi::pager::PagerReleaseRangeWire {
+            version: PAGER_FAULT_ABI_VERSION,
+            reserved0: [0; 3],
+            process_handle: region.process_handle,
+            process_generation: region.process_generation,
+            start: region.start,
+            end: region.end,
+            reserved1: [0; 2],
+        }
+    }
+
+    #[test]
+    fn releasing_a_range_frees_its_slot_and_allows_re_admission() {
+        let mut pager = PagerState::new(2);
+        let region = region(2);
+        pager.admit_region(region).unwrap();
+        // Re-admitting a still-tracked range is an overlap, not a refresh.
+        assert_eq!(pager.admit_region(region), Err(PagerFaultError::Stale));
+        assert_eq!(pager.release_range(release_of(region)), Ok(1));
+        // Once ring0 says the range died, the same range is admissible again.
+        assert!(pager.admit_region(region).is_ok());
+        // Releasing a range nobody tracks is a no-op, not an error.
+        assert_eq!(pager.release_range(release_of(region)), Ok(1));
+        assert_eq!(pager.release_range(release_of(region)), Ok(0));
+    }
+
+    #[test]
+    fn admission_capacity_is_reclaimed_rather_than_leaked() {
+        let mut pager = PagerState::new(2);
+        let base = region(2);
+        // Cycle far more ranges than the table holds. Without a release path
+        // the table filled permanently and every later admission was refused,
+        // which silently downgraded demand paging to eager mapping.
+        for round in 0..4 {
+            for slot in 0..PAGER_MAX_REGIONS as u64 {
+                let start = 0x4000 + (slot + 1) * 0x10_000;
+                let region = PagerVmRegionWire {
+                    start,
+                    end: start + 0x4000,
+                    ..base
+                };
+                assert!(
+                    pager.admit_region(region).is_ok(),
+                    "round {round} slot {slot} must be admissible"
+                );
+                assert_eq!(pager.release_range(release_of(region)), Ok(1));
+            }
+        }
+    }
+
+    #[test]
+    fn release_rejects_a_malformed_or_foreign_range() {
+        let mut pager = PagerState::new(2);
+        let region = region(2);
+        pager.admit_region(region).unwrap();
+        let mut malformed = release_of(region);
+        malformed.version = 0;
+        assert_eq!(
+            pager.release_range(malformed),
+            Err(PagerFaultError::Malformed)
+        );
+        // A different process generation must not free this process's region.
+        let mut foreign = release_of(region);
+        foreign.process_generation = region.process_generation + 1;
+        assert_eq!(pager.release_range(foreign), Ok(0));
+        assert_eq!(pager.admit_region(region), Err(PagerFaultError::Stale));
     }
 
     #[test]

@@ -26,12 +26,12 @@ use core::panic::PanicInfo;
 
 use pagerd::{request_sender_is_authorized, PagerFaultError, PagerState};
 use rustos_svc_runtime::ipc;
-use rustos_user_abi::pager::{PagerFaultDispatchWire, PagerVmRegionWire};
+use rustos_user_abi::pager::{PagerFaultDispatchWire, PagerReleaseRangeWire, PagerVmRegionWire};
 use rustos_user_abi::syscall::{
     CommercialMaxProtocolRequest, CommercialMaxProtocolResponse,
     COMMERCIAL_MAX_PAGERD_OP_BACKING_OBJECT, COMMERCIAL_MAX_PAGERD_OP_FAULT_RESOLVE,
-    COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_PAGERD, IPC_MAX_INLINE_BYTES,
-    IPC_SERVICE_PAGERD,
+    COMMERCIAL_MAX_PAGERD_OP_RELEASE_OBJECT, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
+    COMMERCIAL_MAX_PROTOCOL_PAGERD, IPC_MAX_INLINE_BYTES, IPC_SERVICE_PAGERD,
 };
 
 rustos_svc_runtime::entry!(service_main);
@@ -117,6 +117,12 @@ fn handle_request(
                 pager.admit_region(region)?;
                 Ok(None)
             }),
+        COMMERCIAL_MAX_PAGERD_OP_RELEASE_OBJECT => {
+            decode_payload::<PagerReleaseRangeWire>(&request).and_then(|release| {
+                pager.release_range(release)?;
+                Ok(None)
+            })
+        }
         COMMERCIAL_MAX_PAGERD_OP_FAULT_RESOLVE => {
             decode_payload::<PagerFaultDispatchWire>(&request)
                 .and_then(|dispatch| pager.resolve_anonymous_first_touch(dispatch).map(Some))

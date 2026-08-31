@@ -644,8 +644,7 @@ fn apply_usermem_telemetry_env_overrides(
     usermem_telemetry: &mut UsermemTelemetryConfig,
 ) -> Result<()> {
     if let Some(value) = env_string("RUSTOS_USERMEM_PHASE_PROFILE") {
-        usermem_telemetry.phase_profile =
-            parse_bool_env("RUSTOS_USERMEM_PHASE_PROFILE", &value)?;
+        usermem_telemetry.phase_profile = parse_bool_env("RUSTOS_USERMEM_PHASE_PROFILE", &value)?;
     }
     Ok(())
 }
@@ -842,8 +841,8 @@ mod tests {
     use super::{
         FaultInjectionConfig, IpcTelemetryConfig, KernelBuildConfig, LifecycleTelemetryConfig,
         LockTelemetryConfig, ProjectConfigFile, SchedulerTelemetryConfig, SyscallTelemetryConfig,
-        UsermemTelemetryConfig,
-        apply_fault_rule_overrides, project_from_file, validate_fault_injection,
+        UsermemTelemetryConfig, apply_fault_rule_overrides, project_from_file,
+        validate_fault_injection,
     };
 
     /// The lock phase profile is eleven counter reads inside every tracked lock

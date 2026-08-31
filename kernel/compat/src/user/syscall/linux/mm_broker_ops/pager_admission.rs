@@ -32,9 +32,10 @@ use rustos_user_abi::pager::{
     VM_PROT_EXECUTE, VM_PROT_READ, VM_PROT_WRITE, VM_SHARING_PRIVATE,
 };
 use rustos_user_abi::syscall::{
-    COMMERCIAL_MAX_PAGERD_OP_BACKING_OBJECT, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
-    COMMERCIAL_MAX_PROTOCOL_PAGERD, CommercialMaxProtocolRequest, CommercialMaxProtocolResponse,
-    IPC_SERVICE_PAGERD, IPC_SERVICE_ROOTD, IPC_SERVICE_STORAGED, IPC_SERVICE_VFSD,
+    COMMERCIAL_MAX_PAGERD_OP_BACKING_OBJECT, COMMERCIAL_MAX_PAGERD_OP_RELEASE_OBJECT,
+    COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_PAGERD,
+    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, IPC_SERVICE_PAGERD,
+    IPC_SERVICE_ROOTD, IPC_SERVICE_STORAGED, IPC_SERVICE_VFSD,
 };
 
 /// Services that resolve or carry faults. Their own anonymous memory stays
@@ -202,6 +203,55 @@ fn observe_epoch(epoch: u64) {
     let _ = OBSERVED_PAGER_EPOCH.fetch_max(epoch, Ordering::Relaxed);
 }
 
+/// Tells pagerd that ring0 has released its VMA slot for an exact range.
+///
+/// Ring0 frees the slot itself on unmap. Without this notification pagerd would
+/// keep a dead region forever: it refuses to re-admit the same range as an
+/// overlap, and its fixed table eventually fills and starts refusing every
+/// admission, silently downgrading demand paging to eager mapping.
+/// The identity comes from the unmap that released the slot, so a release can
+/// never name a different process than the publication did.
+pub(super) fn release_anonymous_region(
+    process_handle: u64,
+    process_generation: u64,
+    start: u64,
+    end: u64,
+) {
+    let release = rustos_user_abi::pager::PagerReleaseRangeWire {
+        version: rustos_user_abi::pager::PAGER_FAULT_ABI_VERSION,
+        reserved0: [0; 3],
+        process_handle,
+        process_generation,
+        start,
+        end,
+        reserved1: [0; 2],
+    };
+    if !release.is_canonical() || fault_endpoint().is_none() {
+        return;
+    }
+    let Some(snapshot) = multitask::current_user_snapshot() else {
+        return;
+    };
+    let mut request = CommercialMaxProtocolRequest::default();
+    request.header.version = COMMERCIAL_MAX_PROTOCOL_ABI_VERSION;
+    request.header.protocol = COMMERCIAL_MAX_PROTOCOL_PAGERD;
+    request.header.op = COMMERCIAL_MAX_PAGERD_OP_RELEASE_OBJECT;
+    request.header.service_id = IPC_SERVICE_PAGERD;
+    request.header.subject_pid = snapshot.process_id();
+    request.header.subject_tid = snapshot.thread_id();
+    let payload = as_bytes(&release);
+    let Ok(payload_len) = u32::try_from(payload.len()) else {
+        return;
+    };
+    request.payload[..payload.len()].copy_from_slice(payload);
+    request.payload_len = payload_len;
+    let _ = ipc_ops::call_service_endpoint_with_class(
+        IPC_SERVICE_PAGERD,
+        as_bytes(&request),
+        ipc_ops::ServiceIpcClass::InteractiveControl,
+    );
+}
+
 /// Admits one anonymous range into pagerd so its pages fault on first touch.
 ///
 /// On success the range is published and pagerd holds matching policy state.
@@ -231,7 +281,7 @@ pub(super) fn admit_anonymous_region(
                 observe_epoch(proven);
                 return Ok(());
             }
-            Ok((_, proven)) => {
+            Ok((status, proven)) => {
                 // pagerd refused this template. Withdraw the exact generation
                 // before deciding whether a proven newer epoch is worth one
                 // more attempt.
@@ -245,6 +295,16 @@ pub(super) fn admit_anonymous_region(
                     epoch = proven;
                     continue;
                 }
+                // pagerd refused for a reason a retry cannot fix, most often a
+                // full region table. The caller falls back to eager mapping,
+                // which is correct but silently disables demand paging, so the
+                // downgrade has to be observable rather than invisible.
+                nucleus_core::debug::record_milestone(
+                    nucleus_core::debug::LogCategory::Compat,
+                    "pager-backing-admission-refused",
+                    u64::from(status.unsigned_abs()),
+                    start,
+                );
                 return Err(LINUX_ENOSYS);
             }
             Err(errno) => {

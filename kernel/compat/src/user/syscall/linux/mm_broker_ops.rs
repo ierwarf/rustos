@@ -401,8 +401,19 @@ fn broker_unmap(args: &RustosMmBrokerArgs) -> Result<(), i64> {
     let end = start.checked_add(args.len).ok_or(LINUX_EINVAL)?;
     let pager_end = checked_mapping_end(start, page_count(len)?)?;
     match multitask::unmap_pager_vma_for_process(args.target_pid, start, pager_end) {
-        Ok(true) => return Ok(()),
-        Ok(false) => {}
+        Ok(Some((process_handle, process_generation))) => {
+            // Ring0 freed its VMA slot; pagerd must drop the matching region or
+            // it would refuse to re-admit this range as an overlap and would
+            // eventually exhaust its table, silently disabling demand paging.
+            pager_admission::release_anonymous_region(
+                process_handle,
+                process_generation,
+                start,
+                pager_end,
+            );
+            return Ok(());
+        }
+        Ok(None) => {}
         Err(multitask::PagerVmaError::Pressure) => return Err(LINUX_ENOMEM),
         Err(multitask::PagerVmaError::Malformed) => return Err(LINUX_EINVAL),
         Err(_) => return Err(LINUX_EFAULT),

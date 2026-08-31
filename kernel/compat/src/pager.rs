@@ -21,8 +21,14 @@ use rustos_user_abi::syscall::{
 };
 use x86_64::{VirtAddr, structures::paging::PageTableFlags};
 
-const DISPATCH_BUDGET: usize = 1;
-const RESPONSE_BUDGET: usize = 1;
+// Faults are pipelined per housekeeping turn, not drained one at a time. At a
+// budget of one, every fault cost a full turn, so early user work serialised
+// behind housekeeping: the turn always found more work, the task never idled,
+// and load-based wake placement stopped putting user tasks on that CPU at all.
+// These stay small and fixed so the turn remains bounded; each dispatch binds
+// its own fault slot and reply handle, so several may be in flight at once.
+const DISPATCH_BUDGET: usize = 8;
+const RESPONSE_BUDGET: usize = 8;
 static FIRST_ANONYMOUS_FAULT_COMPLETED: AtomicBool = AtomicBool::new(false);
 static COMPLETED_ANONYMOUS_FAULTS: AtomicU64 = AtomicU64::new(0);
 static REJECTED_ANONYMOUS_FAULT_GRANTS: AtomicU64 = AtomicU64::new(0);
