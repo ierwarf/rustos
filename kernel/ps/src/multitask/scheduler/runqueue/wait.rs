@@ -21,6 +21,7 @@ pub(in crate::multitask) const REASON_NONE: u8 = 0;
 pub(in crate::multitask) const REASON_GENERIC: u8 = 1;
 pub(in crate::multitask) const REASON_ENDPOINT_RECEIVE: u8 = 2;
 pub(in crate::multitask) const REASON_ENDPOINT_REPLY: u8 = 3;
+pub(in crate::multitask) const REASON_PAGER_FAULT: u8 = 4;
 
 static READY_SINCE_TICKS: [AtomicU64; MAX_TASK] = [const { AtomicU64::new(0) }; MAX_TASK];
 static BLOCKED_SINCE_TICKS: [AtomicU64; MAX_TASK] = [const { AtomicU64::new(0) }; MAX_TASK];
@@ -105,12 +106,19 @@ fn validate_reason(kind: u8, id: u64) {
     assert!(
         matches!(
             kind,
-            REASON_NONE | REASON_GENERIC | REASON_ENDPOINT_RECEIVE | REASON_ENDPOINT_REPLY
+            REASON_NONE
+                | REASON_GENERIC
+                | REASON_ENDPOINT_RECEIVE
+                | REASON_ENDPOINT_REPLY
+                | REASON_PAGER_FAULT
         ),
         "scheduler wait payload has invalid reason kind"
     );
     assert!(
-        !matches!(kind, REASON_ENDPOINT_RECEIVE | REASON_ENDPOINT_REPLY) || id != 0,
+        !matches!(
+            kind,
+            REASON_ENDPOINT_RECEIVE | REASON_ENDPOINT_REPLY | REASON_PAGER_FAULT
+        ) || id != 0,
         "scheduler typed wait reason has zero identity"
     );
 }

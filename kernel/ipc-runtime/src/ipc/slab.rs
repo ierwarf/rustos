@@ -234,6 +234,13 @@ fn decode_handle<const N: usize>(handle: u64) -> Option<(usize, u64)> {
     (index < N).then_some((index, generation))
 }
 
+/// Returns the slot selected by a generational handle without validating the
+/// generation. Callers may use this only to locate advisory side metadata;
+/// the slab remains the authority for handle validity.
+pub(super) fn slot_index<const N: usize>(handle: u64) -> Option<usize> {
+    decode_handle::<N>(handle).map(|(index, _generation)| index)
+}
+
 /// Decodes the stable, nonzero slot and generation carried by a valid-shaped
 /// slab handle. This is an identity adapter only: callers must still use the
 /// slab operation that validates a live object at that generation.

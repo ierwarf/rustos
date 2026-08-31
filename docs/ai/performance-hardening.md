@@ -493,13 +493,15 @@ lock, and service restart invalidates it by advancing the epoch.
   and the `kernel-lock-class-0..5` milestones report acquisitions per class per
   window. The class the lane had been splitting was fourth; the global process
   table was first, at about ten acquisitions per synchronous round trip.
-- **Render the ranked lock census only in a lock-profile build.** Its
-  acquisition counters also enforce exact work budgets and remain live in
-  ordinary builds, but destructive census draining, per-site class rotation,
-  and debugcon output require `RUSTOS_LOCK_PHASE_PROFILE=true`. At eight vCPUs
-  unconditional rendering stretched a 15-second guest settle beyond a
-  90-second host timeout, so it is itself a p99 contaminant rather than free
-  observability.
+- **Render and populate the complete ranked lock census only in a lock-profile
+  build.** Ordinary builds retain exact work budgets, but increment only the
+  explicitly registered class while a live scope can observe its counter;
+  const-generic locks from every other class compile out the census path.
+  Host tests keep free-running counts. Destructive census draining, per-site
+  class rotation, and debugcon output require
+  `RUSTOS_LOCK_PHASE_PROFILE=true`. At eight vCPUs unconditional rendering
+  stretched a 15-second guest settle beyond a 90-second host timeout, so it is
+  itself a p99 contaminant rather than free observability.
 - **A running thread pins its own process object**, so the hot path takes no
   reference count: `reclaim_slot` refuses while `thread_count != 0`. An
   uncounted pin must re-read the published state pointer rather than cache it,
@@ -519,7 +521,7 @@ lock, and service restart invalidates it by advancing the epoch.
 
 The evidence for this lane is `cargo xtask bench`, not a debugcon capture, and
 its findings live in `docs/benchmarks/README.md`. Read that before proposing a
-change here; four separate plans have been refuted by its numbers.
+change here; multiple plausible plans have been refuted by its numbers.
 
 **Five rules, each of which was learned by getting it wrong:**
 
@@ -540,6 +542,15 @@ change here; four separate plans have been refuted by its numbers.
    once per *endpoint* call, ~2.4x more often. Mixing them inflates every ratio
    by that factor.
 
+**The kernel libraries must use the static relocation model.** The image links
+`-no-pie -static` at `KERNEL_LOAD_BASE = 0x200000` and executes at its link
+address. Configuring `relocation_model = "none"` meant "pass no rustc flag",
+so the `x86_64-unknown-linux-gnu` default compiled every library as PIC even
+though the nucleus binary already used `-C relocation-model=static`. The GOT
+double-load under 617 statics cost 25-41% across the syscall/IPC probes. The
+default, debug, and release presets all require `"static"`; the hand-relocated
+AP trampoline is assembly and is outside rustc's relocation model.
+
 **Where the cost is**, per endpoint call, measured:
 
 | phase | ticks/op | per call | ticks/call |
@@ -549,8 +560,9 @@ change here; four separate plans have been refuted by its numbers.
 | `enqueue-runtime` | 4,051 | 1.00 | 4,051 |
 | `wait-arm` | 2,897 | 1.00 | 2,897 |
 
-**Stage 0 closed the caller-only blind spot; the round trip is now 61-67%
-attributed, not 81% unmeasured.** `cargo xtask bench --isolate-probe <name>`
+**Stage 0 closed the caller-only blind spot in the pre-relocation image; that
+historical round trip was 61-67% attributed, not 81% unmeasured.**
+`cargo xtask bench --isolate-probe <name>`
 (Stage 0a) makes four syscall-path phases (`copy-request`, `enqueue`,
 `write-response`, `enqueue-deadline`) divide exactly into one round trip
 (ratio 1.00). `kernel/compat/src/user/syscall/linux/ipc_server_profile.rs`
@@ -566,7 +578,9 @@ dark cost, it is six `current.rs` functions each called *from inside* a
 phase already charged elsewhere. Net accounting: 4 clean caller phases
 (14,224 ticks) + 4 Stage 0b receiver phases (~14,414, approximate) +
 dispatch chain (~19,200-24,050, historical estimate, not independently
-re-verified) ≈ 48,000-53,000 of 78,080 ticks. What is still dark is the two
+re-verified) ≈ 48,000-53,000 of 78,080 ticks. Those absolute values predate the
+static-relocation fix and must not be used to explain the current 17,480-cycle
+production-shaped local floor. What is still dark is the two
 blocked transitions' architectural mechanics and the syscall entry/exit
 floor (~4,920 ticks for three syscalls) — not a new target, the same one
 this lane already had. Full detail, including the receiver-phase and
@@ -581,6 +595,14 @@ must re-arm); the enqueue chain's last unconditional acquisition moved
 TOCTOU guard with formal models attached. 2% of 73,760 is ~1,500 ticks, which is
 the size of everything that remains individually.
 
+The published reply `message_id` hint is not a fusion and does not remove that
+TOCTOU guard. It replaces only the preliminary `IpcReply` lookup needed to
+choose message-then-reply lock order; the nested reply access still validates
+the full generation, exact message id, and consumed state. A host counter pins
+pending detailed-response polls at one reply acquisition instead of two. The
+shipping timing remained below the two-percent floor, so the count is the
+claim.
+
 The later Phase-3 ownership cut is not another fusion. Wait reason kind, arm,
 block intent, and runnable intent now share `RunOwnerWord`; the ordinary commit
 is a single CAS and a wake either clears the arm first (commit refuses sleep)
@@ -590,9 +612,9 @@ acquisitions per scheduler entry at **1.99**, down from 2.59 before this cut.
 The remaining normal-path entries are dispatch, reply-wake handoff, pick hints,
 and retirement cleanup, so the Phase-3 zero-acquisition gate remains open.
 
-**Four telemetry profiles are build switches, all off by default**:
+**Five telemetry profiles are build switches, all off by default**:
 `[lock_telemetry]`, `[scheduler_telemetry]`, `[syscall_telemetry]`, and
-`[ipc_telemetry]`
+`[ipc_telemetry]`, plus `[usermem_telemetry]`
 `phase_profile` in `config/rustos.toml`. Each cost more than the work it
 measured. Turn one on for a diagnosis run and read the result as the cost of an
 *instrumented* operation.

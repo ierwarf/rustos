@@ -4,6 +4,8 @@ mod current;
 mod current_identity;
 mod deferred_wake;
 mod irq;
+mod pager_fault;
+mod pager_vma;
 mod process_state_lock;
 mod process_table;
 mod reschedule_observation;
@@ -39,15 +41,16 @@ use crate::user::process_state::{
 };
 
 pub use self::current::{
-    activate_suspended_user_task, activate_suspended_user_tasks,
+    PagerChargeSnapshot, activate_suspended_user_task, activate_suspended_user_tasks,
     activate_suspended_user_tasks_with_commit, any_user_process_state, arm_block_current_task,
-    arm_block_current_task_on_endpoint, arm_block_current_task_on_reply,
-    attach_reserved_ipc_priority, bind_ipc_priority_to_process_worker, bind_reserved_ipc_priority,
-    cancel_block_current_task, cancel_ipc_priority_reservation, commit_ipc_call_handoff,
+    arm_block_current_task_on_endpoint, arm_block_current_task_on_pager_fault,
+    arm_block_current_task_on_reply, attach_reserved_ipc_priority,
+    bind_ipc_priority_to_process_worker, bind_reserved_ipc_priority, cancel_block_current_task,
+    cancel_ipc_priority_reservation, commit_ipc_call_handoff,
     complete_fast_ipc_reply_wake_handoff_with_custody, complete_ipc_reply_wake_handoff,
     complete_ipc_reply_wake_handoff_with_custody, complete_retired_task_cleanup,
-    current_console_session, current_linux_thread_state,
-    current_scheduling_context_runtime_snapshot, current_task_id,
+    current_console_session, current_linux_thread_state, current_pager_charge_snapshot,
+    current_pager_vma_snapshot, current_scheduling_context_runtime_snapshot, current_task_id,
     current_thread_may_have_pending_signals, current_user_abi, current_user_address_space,
     current_user_id, current_user_log_ids, current_user_process_id, current_user_process_identity,
     current_user_process_thread_count, current_user_snapshot, current_user_stack_state,
@@ -57,20 +60,33 @@ pub use self::current::{
     is_user_process_exiting, is_user_task_alive, linux_task_affinity, linux_thread_snapshot_by_ids,
     live_user_process_identity_by_pid, live_user_process_identity_with_exact_exec_path,
     mark_user_process_exiting, mark_user_process_exiting_once, next_retired_task_cleanup,
-    note_process_exit_status, parent_process_id_of, queue_linux_process_sigchld,
-    queue_linux_signal, release_ipc_priorities_for_process, release_ipc_priority,
-    reserve_ipc_call_donation, reserve_ipc_priority, retain_current_user_process_state,
-    retire_current_user_task_due_to_fault, service_deferred_work, set_current_linux_tls_fs_base,
-    set_linux_task_affinity, set_next_latency_pick_hint, set_next_pick_hint,
-    set_next_process_pick_hint, set_next_spawn_pick_hint, set_next_synchronous_pick_hint,
-    set_windows_current_thread_affinity, set_windows_process_affinity,
-    settle_ipc_reply_scheduling_context, stop_current_linux_process,
+    note_process_exit_status, parent_process_id_of, publish_current_pager_vma,
+    publish_pager_vma_for_process, queue_linux_process_sigchld, queue_linux_signal,
+    release_ipc_priorities_for_process, release_ipc_priority, reserve_ipc_call_donation,
+    reserve_ipc_priority, retain_current_user_process_state, retire_current_user_task_due_to_fault,
+    revoke_current_pager_vma, revoke_pager_vma_for_process, service_deferred_work,
+    set_current_linux_tls_fs_base, set_linux_task_affinity, set_next_latency_pick_hint,
+    set_next_pick_hint, set_next_process_pick_hint, set_next_spawn_pick_hint,
+    set_next_synchronous_pick_hint, set_windows_current_thread_affinity,
+    set_windows_process_affinity, settle_ipc_reply_scheduling_context, stop_current_linux_process,
     task_has_system_scheduling_class, terminate_user_process, terminate_user_task,
     user_log_ids_for_task, wait_for_child, wake_task, wake_user_task, windows_process_affinity,
     with_current_mm, with_current_process_credentials, with_current_process_state,
     with_current_process_state_mut, with_current_user_linux_state_mut,
     with_current_user_process_and_linux_thread_state_mut, with_current_user_process_state,
     with_current_user_process_state_mut, with_process_state_by_pid, with_process_state_by_pid_mut,
+};
+pub use self::pager_fault::{
+    PagerFaultReservation, PagerFaultSlotError, PagerFaultState, bind_pager_fault_dispatch_reply,
+    cancel_pager_fault, claim_pager_fault_reply, consume_pager_fault_reply,
+    mark_pager_fault_blocked, next_dispatched_pager_fault_response, pager_fault_snapshot,
+    reserve_pager_fault, reserve_pager_fault_with_dispatch_grant,
+    take_next_pager_fault_for_dispatch,
+};
+pub use self::pager_vma::{
+    PagerVmaError, PagerVmaSnapshot, protect_for_process as protect_pager_vma_for_process,
+    unmap_for_process as unmap_pager_vma_for_process, validate_fault_request,
+    with_validated_fault_address_space,
 };
 pub use self::process_table::{
     ProcessIdentity, SpawnReservation, cancel_spawn as cancel_process_spawn,
@@ -88,8 +104,8 @@ pub const MAX_SCHEDULER_TASKS: usize = scheduler::MAX_TASK;
 
 pub use self::irq::{
     commit_block_current_task_and_yield, commit_fast_ipc_call_handoff_and_yield,
-    rtc_interrupt_handler_addr, software_schedule_interrupt_handler_addr,
-    timer_interrupt_handler_addr, yield_now,
+    commit_pager_fault_block_and_yield, rtc_interrupt_handler_addr,
+    software_schedule_interrupt_handler_addr, timer_interrupt_handler_addr, yield_now,
 };
 #[allow(unused_imports)]
 pub(crate) use self::irq::{

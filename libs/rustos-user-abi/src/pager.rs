@@ -4,8 +4,41 @@
 //! frames, and flush TLBs, but must not infer a policy action from an integer
 //! status or a textual label.
 
-pub const PAGER_FAULT_ABI_VERSION: u16 = 1;
+pub const PAGER_FAULT_ABI_VERSION: u16 = 2;
 pub const PAGER_PAGE_BYTES: u64 = 4096;
+
+/// Fixed number of ring0 fault slots a token may name.
+pub const PAGER_MAX_FAULT_SLOTS: usize = 128;
+/// Width of the slot component of a fault token.
+pub const PAGER_FAULT_TOKEN_SLOT_BITS: u32 = 8;
+/// Mask selecting the slot component of a fault token.
+pub const PAGER_FAULT_TOKEN_SLOT_MASK: u64 = (1 << PAGER_FAULT_TOKEN_SLOT_BITS) - 1;
+/// Highest generation a fault token may carry before its slot fails closed.
+pub const PAGER_MAX_FAULT_TOKEN_GENERATION: u64 = u64::MAX >> PAGER_FAULT_TOKEN_SLOT_BITS;
+
+/// One-based slot index carried by a fault token, or `None` when malformed.
+///
+/// Ring0 mints `token = (generation << PAGER_FAULT_TOKEN_SLOT_BITS) | slot`
+/// with a strictly increasing per-slot generation. Publishing that shape here
+/// lets a pager reject a replayed or stale token by comparing generations per
+/// slot, in fixed memory, instead of retaining every token it has ever seen -
+/// a list that can only overflow and then fail every later fault.
+pub const fn pager_fault_token_slot(token: u64) -> Option<usize> {
+    let slot = token & PAGER_FAULT_TOKEN_SLOT_MASK;
+    if slot == 0 || slot > PAGER_MAX_FAULT_SLOTS as u64 {
+        return None;
+    }
+    Some(slot as usize)
+}
+
+/// Strictly increasing per-slot generation carried by a fault token.
+pub const fn pager_fault_token_generation(token: u64) -> Option<u64> {
+    let generation = token >> PAGER_FAULT_TOKEN_SLOT_BITS;
+    if generation == 0 || generation > PAGER_MAX_FAULT_TOKEN_GENERATION {
+        return None;
+    }
+    Some(generation)
+}
 
 pub const VM_OBJECT_ANONYMOUS: u16 = 1;
 pub const VM_OBJECT_FILE_PRIVATE: u16 = 2;
@@ -58,6 +91,7 @@ pub struct PagerObjectIdentityWire {
     pub object_type: u16,
     pub reserved0: u16,
     pub rights: u32,
+    pub backing_service: u64,
     pub slot: u64,
     pub generation: u64,
     pub pager_epoch: u64,
@@ -75,6 +109,7 @@ impl PagerObjectIdentityWire {
 
     pub const fn has_authority(self) -> bool {
         self.is_canonical()
+            && (self.object_type == VM_OBJECT_ANONYMOUS || self.backing_service != 0)
             && self.slot != 0
             && self.generation != 0
             && self.pager_epoch != 0
@@ -176,6 +211,39 @@ impl PagerFaultRequestWire {
     }
 }
 
+/// A kernel-dispatched anonymous fault together with its one-shot, pre-zeroed
+/// frame capability.
+///
+/// The kernel creates this only after the fault slot has entered
+/// `DispatchedToPager`.  `pagerd` may return the capability solely in a
+/// `PAGER_ACTION_MAP_ZEROED` reply for this exact request; it is not a
+/// physical address, reusable allocation right, or cache-frame authority.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PagerFaultDispatchWire {
+    pub request: PagerFaultRequestWire,
+    pub zeroed_frame_capability: u64,
+    pub granted_frame_rights: u32,
+    pub reserved0: u32,
+    pub reserved1: [u64; 2],
+}
+
+impl PagerFaultDispatchWire {
+    pub const fn is_canonical(self) -> bool {
+        self.request.is_canonical()
+            && self.request.object.object_type == VM_OBJECT_ANONYMOUS
+            && self.zeroed_frame_capability != 0
+            && self.granted_frame_rights != 0
+            && self.granted_frame_rights & !VM_PROT_KNOWN == 0
+            && !(self.granted_frame_rights & VM_PROT_WRITE != 0
+                && self.granted_frame_rights & VM_PROT_EXECUTE != 0)
+            && self.granted_frame_rights & !self.request.object.rights == 0
+            && self.reserved0 == 0
+            && self.reserved1[0] == 0
+            && self.reserved1[1] == 0
+    }
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PagerFaultReplyWire {
@@ -252,9 +320,23 @@ impl PagerFaultReplyWire {
             _ => false,
         }
     }
+
+    /// Validates the stricter Phase-7 anonymous first-touch reply.
+    ///
+    /// A generic reply may later name a cache or COW frame, but the foundation
+    /// path must consume the exact one-shot pre-zeroed grant supplied in the
+    /// dispatch envelope and may only attenuate its rights.
+    pub const fn is_canonical_zeroed_for(self, dispatch: PagerFaultDispatchWire) -> bool {
+        dispatch.is_canonical()
+            && self.action == PAGER_ACTION_MAP_ZEROED
+            && self.frame_capability == dispatch.zeroed_frame_capability
+            && self.frame_rights & !dispatch.granted_frame_rights == 0
+            && self.is_canonical_for(dispatch.request)
+    }
 }
 
 const _: () = assert!(core::mem::size_of::<PagerFaultRequestWire>() <= 256);
+const _: () = assert!(core::mem::size_of::<PagerFaultDispatchWire>() <= 256);
 const _: () = assert!(core::mem::size_of::<PagerFaultReplyWire>() <= 256);
 
 #[cfg(test)]
@@ -295,6 +377,25 @@ mod tests {
     fn fault_wire_rejects_reserved_unknown_unaligned_and_wx_authority() {
         let valid = request();
         assert!(valid.is_canonical());
+        let file_without_owner = PagerFaultRequestWire {
+            object: PagerObjectIdentityWire {
+                object_type: VM_OBJECT_FILE_PRIVATE,
+                backing_service: 0,
+                ..valid.object
+            },
+            ..valid
+        };
+        assert!(!file_without_owner.is_canonical());
+        assert!(
+            PagerFaultRequestWire {
+                object: PagerObjectIdentityWire {
+                    backing_service: 2,
+                    ..file_without_owner.object
+                },
+                ..file_without_owner
+            }
+            .is_canonical()
+        );
         for invalid in [
             PagerFaultRequestWire {
                 reserved0: 1,
@@ -320,6 +421,13 @@ mod tests {
     #[test]
     fn fault_reply_is_explicit_generation_exact_and_wx_closed() {
         let request = request();
+        let dispatch = PagerFaultDispatchWire {
+            request,
+            zeroed_frame_capability: 61,
+            granted_frame_rights: VM_PROT_READ | VM_PROT_WRITE,
+            ..PagerFaultDispatchWire::default()
+        };
+        assert!(dispatch.is_canonical());
         let reply = PagerFaultReplyWire {
             version: PAGER_FAULT_ABI_VERSION,
             action: PAGER_ACTION_MAP_ZEROED,
@@ -334,6 +442,24 @@ mod tests {
             ..PagerFaultReplyWire::default()
         };
         assert!(reply.is_canonical_for(request));
+        assert!(reply.is_canonical_zeroed_for(dispatch));
+        assert!(
+            !PagerFaultReplyWire {
+                frame_capability: 71,
+                ..reply
+            }
+            .is_canonical_zeroed_for(dispatch)
+        );
+        assert!(
+            !PagerFaultReplyWire {
+                frame_rights: VM_PROT_READ,
+                ..reply
+            }
+            .is_canonical_zeroed_for(PagerFaultDispatchWire {
+                granted_frame_rights: VM_PROT_WRITE,
+                ..dispatch
+            })
+        );
         assert!(
             !PagerFaultReplyWire {
                 mm_generation: 67,

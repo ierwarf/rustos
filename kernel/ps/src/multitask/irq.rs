@@ -858,6 +858,62 @@ pub fn commit_block_current_task_and_yield() -> Option<bool> {
     })
 }
 
+/// Fuses an exact pager wait commit, fault-slot publication, and schedule trap.
+///
+/// Unlike a generic task wait, exception ingress may not acquire the scheduler
+/// catalog as a fallback. A cancellation that removes the slot between the
+/// owner-word commit and slot publication is repaired by restoring this CPU's
+/// exact pager wait before the trap, so no stale token can strand the task.
+pub fn commit_pager_fault_block_and_yield(token: u64) -> Option<bool> {
+    if token == 0 {
+        return Some(false);
+    }
+    let preemption = nucleus_core::util::lockdep::preemption_snapshot();
+    assert!(
+        preemption.depth == 0,
+        "pager fault blocked while raw spin lock held cpu={} apic={:#x} depth={} held_depth={} pending_depth={} class={:?}",
+        preemption.logical_cpu,
+        preemption.apic_id,
+        preemption.depth,
+        preemption.held_depth,
+        preemption.pending_depth,
+        preemption.top_class,
+    );
+    interrupts::without_interrupts(|| {
+        let committed = super::scheduler::commit_current_wait();
+        if committed != Some(true) {
+            return committed;
+        }
+
+        let published = super::pager_fault::mark_pager_fault_blocked(token).is_ok();
+        if !published && super::scheduler::wake_current_pager_fault_wait(token) != Some(true) {
+            panic!("pager fault block rollback lost exact current wait token={token:#x}");
+        }
+
+        // The owner word committed non-runnable above. Even when cancellation
+        // restored run intent, the trap must publish a fresh continuation
+        // before Rust can safely return to the interrupted user frame.
+        crate::lowlevel::interrupts::trigger_software_schedule();
+
+        // A blocked exception continuation can resume through a direct wake
+        // handoff whose scheduler token classifies the final turn as
+        // same-task. Housekeeping may have installed a kernel-task GS pair in
+        // between, so refresh the exact ordinary user-dispatch architecture
+        // contract before this exception frame returns to ring3. This is the
+        // same CR3/TSS/syscall-stack/FS/GS preparation used for every real
+        // user dispatch, not a pager-specific GS write.
+        //
+        // SAFETY: this runs on the exception path that owns the current task
+        // and is about to return to ring3, so the scheduler's current-slot
+        // custody is exactly this task and no other CPU may publish over the
+        // architecture state being refreshed.
+        unsafe {
+            scheduler_mut().refresh_current_user_return_architecture();
+        }
+        Some(published)
+    })
+}
+
 #[inline]
 fn current_wait_commit_or_fallback(
     fast: Option<bool>,

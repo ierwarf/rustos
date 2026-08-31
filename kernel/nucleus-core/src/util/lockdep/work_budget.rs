@@ -47,30 +47,96 @@ use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering}
 
 use super::{LockClass, MAX_LOCK_CLASSES, MAX_TRACKED_CPUS, current_cpu_index};
 
-/// Per-CPU, per-class acquisition counts. Monotonic and free-running; a scope
+/// Per-CPU, per-class acquisition counts. Host/profile builds are free-running;
+/// shipping builds charge only while a registered budget is live. A scope
 /// reads the delta across its own lifetime, so wrapping is harmless.
 static ACQUIRES: [[AtomicU32; MAX_LOCK_CLASSES]; MAX_TRACKED_CPUS] =
     [const { [const { AtomicU32::new(0) }; MAX_LOCK_CLASSES] }; MAX_TRACKED_CPUS];
 
+/// Per-CPU, per-class count of live cost-budget scopes. Shipping builds only
+/// charge the free-running census while a scope can observe it; diagnostic
+/// lock-profile builds keep the complete workload census.
+static ACTIVE_BUDGET_DEPTHS: [[AtomicU32; MAX_LOCK_CLASSES]; MAX_TRACKED_CPUS] =
+    [const { [const { AtomicU32::new(0) }; MAX_LOCK_CLASSES] }; MAX_TRACKED_CPUS];
+
+/// Shipping budget registration. Adding a new `declare` class requires adding
+/// it here; `declare` fails closed if the call site and this mask diverge.
+const SHIPPING_BUDGET_CLASS_MASK: u64 = 1_u64 << (LockClass::ProcessState as u8);
+
+#[inline]
+const fn is_shipping_budget_class(class: u8) -> bool {
+    SHIPPING_BUDGET_CLASS_MASK & (1_u64 << class) != 0
+}
+
 /// Records one acquisition of `class_index` on `cpu`.
 ///
-/// Called from the acquire paths, which already derived both, so this is one
-/// bounds-checked index and one increment.
+/// A shipping build increments only while a live cost-budget scope can observe
+/// the counter. Lock-profile builds retain the complete class census, and host
+/// builds retain free-running counts for focused unit tests.
 #[inline]
 pub(crate) fn charge_acquire(cpu: usize, class_index: usize) {
+    #[cfg(all(rustos_boot_image, not(rustos_lock_phase_profile)))]
+    {
+        let Some(active_depth) = ACTIVE_BUDGET_DEPTHS
+            .get(cpu)
+            .and_then(|classes| classes.get(class_index))
+        else {
+            return;
+        };
+        if active_depth.load(Ordering::Relaxed) == 0 {
+            return;
+        }
+    }
     let Some(counter) = ACQUIRES
         .get(cpu)
         .and_then(|classes| classes.get(class_index))
     else {
         return;
     };
-    // The counter is CPU-private, so this needs no atomic read-modify-write.
-    // An interrupt landing between the load and the store loses one count,
-    // which can only understate a scope; it can never fail one that behaved.
+    // Each counter is CPU-private in the kernel. An interrupt between the load
+    // and store can only understate a declared scope; it cannot manufacture a
+    // violation. Host tests preserve the same free-running behavior.
     counter.store(
         counter.load(Ordering::Relaxed).wrapping_add(1),
         Ordering::Relaxed,
     );
+}
+
+/// Charges a const-generic tracked-spin class without leaving a runtime test on
+/// classes that have no shipping cost budget. Diagnostic builds still census
+/// every class.
+#[inline]
+pub(crate) fn charge_acquire_for_class<const CLASS: u8>(cpu: usize) {
+    #[cfg(rustos_lock_phase_profile)]
+    charge_acquire(cpu, usize::from(CLASS));
+    #[cfg(not(rustos_lock_phase_profile))]
+    if is_shipping_budget_class(CLASS) {
+        charge_acquire(cpu, usize::from(CLASS));
+    }
+}
+
+#[inline]
+fn activate_budget(cpu: usize, class_index: usize) {
+    let Some(active_depth) = ACTIVE_BUDGET_DEPTHS
+        .get(cpu)
+        .and_then(|classes| classes.get(class_index))
+    else {
+        return;
+    };
+    let previous = active_depth.fetch_add(1, Ordering::Relaxed);
+    assert!(previous != u32::MAX, "lock budget nesting overflow");
+}
+
+#[inline]
+fn deactivate_budget(cpu: usize, class_index: usize) {
+    let Some(active_depth) = ACTIVE_BUDGET_DEPTHS
+        .get(cpu)
+        .and_then(|classes| classes.get(class_index))
+    else {
+        return;
+    };
+    let previous = active_depth.fetch_sub(1, Ordering::Relaxed);
+    assert!(previous != 0, "lock budget nesting underflow");
 }
 
 /// Per-site acquisition census for one selected lock class.
@@ -113,6 +179,9 @@ pub fn select_site_census_class(class_index: usize) {
 /// selected one. A direct-mapped bucket keeps the common case one line.
 #[inline]
 pub(crate) fn charge_site(class_index: usize, caller: &'static Location<'static>) {
+    if !cfg!(rustos_lock_phase_profile) {
+        return;
+    }
     if SITE_CENSUS_CLASS.load(Ordering::Relaxed) as usize != class_index {
         return;
     }
@@ -214,8 +283,9 @@ pub fn take_class_census() -> [u64; MAX_LOCK_CLASSES] {
 /// result, so nothing but this would notice.
 pub const LOCK_ACQUIRE_MAX_EXTRA_CPU_IDENTITY_DERIVATIONS: u32 = 0;
 
-/// Per-CPU count of logical-identity derivations. Same shape and same reason as
-/// [`ACQUIRES`]: monotonic, free-running, read as a delta.
+/// Per-CPU count of logical-identity derivations. Unlike the class census,
+/// identity ceilings cover generic acquire/release paths, so this stays
+/// monotonic and free-running and is read as a delta.
 static IDENTITY_DERIVATIONS: [AtomicU32; MAX_TRACKED_CPUS] =
     [const { AtomicU32::new(0) }; MAX_TRACKED_CPUS];
 
@@ -535,6 +605,7 @@ pub struct LockBudget {
     ceiling: u32,
     entry_count: u32,
     cpu: usize,
+    active_cpu: usize,
     owner: u64,
     epoch: u32,
     site: &'static Location<'static>,
@@ -548,13 +619,21 @@ pub struct LockBudget {
 pub fn declare(class: LockClass, ceiling: u32) -> LockBudget {
     let class = class as u8;
     let class_index = usize::from(class);
+    #[cfg(rustos_boot_image)]
+    assert!(
+        is_shipping_budget_class(class),
+        "lock budget class is not registered for shipping counters"
+    );
     let cpu = current_cpu_index();
+    let entry_count = acquire_count(cpu, class_index);
+    activate_budget(cpu, class_index);
     LockBudget {
         class_index,
         class,
         ceiling,
-        entry_count: acquire_count(cpu, class_index),
+        entry_count,
         cpu,
+        active_cpu: cpu,
         owner: running_owner(cpu),
         epoch: running_epoch(cpu),
         site: Location::caller(),
@@ -576,12 +655,17 @@ impl LockBudget {
 
 impl Drop for LockBudget {
     fn drop(&mut self) {
+        // Read the delta before closing the scope. The active-depth decrement
+        // must happen even if migration or an owner change makes the delta
+        // inapplicable, otherwise unrelated future acquisitions stay charged.
+        let used = self.used();
+        deactivate_budget(self.active_cpu, self.class_index);
         // `used` returns `None` when this CPU is no longer running the task
         // that declared the budget. The counter then holds another task's
         // acquisitions and says nothing about this scope, so there is nothing
         // to judge. Skipping is what keeps a contended or preempted run from
         // panicking a kernel that behaved.
-        let Some(used) = self.used() else {
+        let Some(used) = used else {
             return;
         };
         assert!(
@@ -734,5 +818,15 @@ mod tests {
         charge_acquire(cpu, class_index);
         assert_eq!(budget.used(), Some(3));
         drop(budget);
+    }
+
+    #[test]
+    fn shipping_budget_registry_is_exact_and_fail_closed() {
+        assert_eq!(
+            SHIPPING_BUDGET_CLASS_MASK,
+            1_u64 << (LockClass::ProcessState as u8)
+        );
+        assert!(is_shipping_budget_class(LockClass::ProcessState as u8));
+        assert!(!is_shipping_budget_class(LockClass::IpcEndpoint as u8));
     }
 }

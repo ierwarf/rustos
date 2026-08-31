@@ -109,11 +109,15 @@ fn main() {
 
 fn start_sessiond_ioctl_workers() -> SessiondIoctlWorkers {
     let mut senders = Vec::with_capacity(SESSIOND_IOCTL_WORKERS);
+    let mut receivers = Vec::with_capacity(SESSIOND_IOCTL_WORKERS);
     for _ in 0..SESSIOND_IOCTL_WORKERS {
         let (sender, receiver) =
             mpsc::sync_channel::<SessiondIoctlWork>(SESSIOND_IOCTL_WORKER_QUEUE_CAPACITY);
-        thread::spawn(move || sessiond_ioctl_worker(receiver));
         senders.push(sender);
+        receivers.push(receiver);
+    }
+    for receiver in receivers {
+        thread::spawn(move || sessiond_ioctl_worker(receiver));
     }
     SessiondIoctlWorkers {
         senders,

@@ -42,6 +42,18 @@ pub struct ProcessIdentity {
 }
 
 impl ProcessIdentity {
+    pub(in crate::multitask) const fn from_parts(
+        process_id: u64,
+        process_generation: u32,
+        mm_generation: u32,
+    ) -> Self {
+        Self {
+            process_id,
+            process_generation,
+            mm_generation,
+        }
+    }
+
     pub const fn process_id(self) -> u64 {
         self.process_id
     }
@@ -159,7 +171,9 @@ pub(super) fn publish_slot_visibility(
 }
 
 /// Reads a committed exact identity without consulting the table.
-fn published_live_process_identity(handle: ProcessHandle) -> Option<ProcessIdentity> {
+pub(in crate::multitask) fn published_live_process_identity(
+    handle: ProcessHandle,
+) -> Option<ProcessIdentity> {
     let before = PROCESS_IDENTITY
         .get(handle.index())?
         .load(Ordering::Acquire);
@@ -263,6 +277,14 @@ impl ProcessRef {
         self.process_id
     }
 
+    /// Returns the retained exact table handle for an internal lifecycle owner.
+    ///
+    /// The handle is deliberately confined to `multitask`: public callers use
+    /// PID labels and cannot mint process-table authority from this accessor.
+    pub(in crate::multitask) const fn handle(&self) -> ProcessHandle {
+        self.handle
+    }
+
     pub fn live_identity(&self) -> Option<ProcessIdentity> {
         live_process_identity(self.handle)
     }
@@ -308,6 +330,19 @@ impl ProcessRef {
     ) -> Option<R> {
         let state = unsafe { self.state()?.as_ref() }.lock();
         (live_process_identity(self.handle) == Some(expected)).then(|| f(self.process_id, &state))
+    }
+
+    /// Mutable counterpart of with_exact_visible_state. The process-state lock
+    /// closes exec/exit replacement while the caller commits a generation-bound
+    /// address-space transaction.
+    pub fn with_exact_visible_state_mut<R>(
+        &self,
+        expected: ProcessIdentity,
+        f: impl FnOnce(u64, &mut UserProcessState) -> R,
+    ) -> Option<R> {
+        let mut state = unsafe { self.state()?.as_ref() }.lock();
+        (live_process_identity(self.handle) == Some(expected))
+            .then(|| f(self.process_id, &mut state))
     }
 
     pub fn with_visible_state_mut<R>(

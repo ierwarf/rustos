@@ -25,6 +25,7 @@ kernel/mm/src/memory/address_space.rs	24	0
 kernel/mm/src/memory/address_space/atomic_user.rs	0	0
 kernel/mm/src/memory/address_space/rollback.rs	0	0
 kernel/mm/src/memory/address_space/owned_frames.rs	0	0
+kernel/mm/src/memory/frame_capability.rs	0	0
 kernel/mm/src/memory/kernel_vm.rs	16	0
 kernel/mm/src/memory/cache_attributes.rs	0	0
 kernel/mm/src/memory/phys.rs	5	0
@@ -37,6 +38,8 @@ services/syscalld/src/mmap_policy.rs	0	0
 libs/rustos-user-abi/src/syscall/affinity.rs	0	0
 libs/rustos-user-abi/src/syscall/activation_batch.rs	0	0
 kernel/ps/src/multitask/process_table.rs	2	0
+kernel/ps/src/multitask/pager_fault.rs	0	0
+kernel/ps/src/multitask/pager_vma.rs	0	0
 kernel/ps/src/multitask/current/ipc.rs	0	0
 kernel/ps/src/user/process_state.rs	0	0
 kernel/ps/src/multitask/scheduler.rs	16	0
@@ -101,3 +104,5 @@ libs/rustos-user-abi/src/windows.rs	0	0
 compat/windows/services/winsys/common/win_types.h	0	0
 compat/windows/services/winsys/kernelbase/exports.c	0	0
 compat/windows/services/winsys/ntdll/syscall.c	0	0
+services/pagerd/src/page_cache.rs	0	0
+services/pagerd/src/main.rs	4	0

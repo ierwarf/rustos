@@ -70,3 +70,13 @@ pub mod syscall {
 }
 
 pub use syscall::init as init_syscalls;
+
+pub mod pager {
+    /// Runs a fixed amount of normal-time pager work from nucleus housekeeping.
+    ///
+    /// Returns the number of dispatch and adoption steps performed, so the
+    /// housekeeping caller can account for the work it drove.
+    pub fn service_deferred_work() -> usize {
+        crate::pager::service_deferred_work()
+    }
+}

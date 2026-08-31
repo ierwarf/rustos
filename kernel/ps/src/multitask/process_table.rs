@@ -24,7 +24,7 @@ use super::process_state_lock::ProcessStateLock;
 use crate::memory::paging::ProcessAddressSpace;
 use crate::user::process_state::UserProcessState;
 
-const MAX_PROCESS_OBJECTS: usize = 32;
+pub(super) const MAX_PROCESS_OBJECTS: usize = 32;
 pub const MAX_THREADS_PER_PROCESS: usize = 32;
 type ProcessTableLock = TrackedSpinLock<ProcessTable, { LockClass::ProcessTable as u8 }>;
 
@@ -225,6 +225,7 @@ impl ProcessTable {
 }
 
 mod identity;
+pub(super) use identity::published_live_process_identity;
 pub use identity::{
     ProcessHandle, ProcessIdentity, ProcessRef, live_process_identity,
     live_process_identity_by_pid, release_process_ref, retain_process, retain_process_by_pid,

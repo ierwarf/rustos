@@ -136,6 +136,11 @@ pub enum LockClass {
     /// dispatch may consume per-slot inheritance without serializing on task
     /// directory state.
     SchedulerDonation = 45,
+    /// One-shot pager frame capability custody. Never nests inside the
+    /// physical allocator or page-table owners.
+    PagerFrameGrant = 46,
+    /// Serializes pager VMA writers; exception-time readers never acquire it.
+    PagerVmaPublication = 47,
 }
 
 #[cfg(rustos_boot_image)]
@@ -606,6 +611,8 @@ impl<T: ?Sized, const CLASS: u8> TrackedSpinLock<T, CLASS> {
         // keeps the acquire cheap.
         #[cfg(rustos_boot_image)]
         let acquire_cpu = disable_preemption();
+        #[cfg(rustos_boot_image)]
+        work_budget::charge_acquire_for_class::<CLASS>(acquire_cpu);
         let profile_entry = lock_profile::now();
         #[cfg(rustos_boot_image)]
         let pending = before_acquire_with_irq_tracking(acquire_cpu, CLASS, acquire_site, true);
@@ -763,6 +770,7 @@ impl<T: ?Sized, const CLASS: u8> TrackedSpinLock<T, CLASS> {
             }
             let acquire_site = Location::caller();
             let acquire_cpu = disable_preemption();
+            work_budget::charge_acquire_for_class::<CLASS>(acquire_cpu);
             let pending =
                 before_acquire_with_irq_tracking(acquire_cpu, CLASS, acquire_site, !irq_context);
             loop {
@@ -1019,7 +1027,10 @@ fn validate_class(class: u8) -> usize {
 
 #[cfg(rustos_boot_image)]
 fn before_acquire(class: u8, acquire_site: &'static Location<'static>) -> PendingAcquire {
-    before_acquire_with_irq_tracking(current_cpu_index(), class, acquire_site, true)
+    let cpu = current_cpu_index();
+    let class_index = validate_class(class);
+    work_budget::charge_acquire(cpu, class_index);
+    before_acquire_with_irq_tracking(cpu, class, acquire_site, true)
 }
 
 #[cfg(rustos_boot_image)]
@@ -1038,7 +1049,6 @@ fn before_acquire_with_irq_tracking(
     // `the_raw_acquire_path_never_rederives_the_cpu_index` rather than by a
     // declared ceiling -- see `work_budget::declare_identity_derivations_on`.
     let class_index = validate_class(class);
-    work_budget::charge_acquire(cpu, class_index);
     work_budget::charge_site(class_index, acquire_site);
     let profile_entry = lock_profile::now();
     if track_irq_usage {

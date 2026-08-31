@@ -166,6 +166,8 @@ pub unsafe fn initialize_kernel(boot_info_ptr: *const BootInfo) {
         )
         .expect("AP trampoline low-memory range is unavailable or already owned");
     }
+    mm_api::frame_capability::preallocate_pager_fault_frames()
+        .expect("kernel-mm could not wire the bounded pager fault-frame reserve");
     boot_log!(
         debug::LogLevel::Info,
         104,
@@ -771,6 +773,10 @@ pub fn housekeeping_once() -> usize {
         compat_api::syscall::RETIRED_TASK_CLEANUP_BUDGET,
     );
     work += ps_api::service_deferred_work();
+    work += compat_api::pager::service_deferred_work();
+    // Refill only from normal housekeeping after completed replies consume
+    // wired frames; exception entry remains allocator-free and bounded.
+    work += mm_api::frame_capability::replenish_pager_fault_frames(4);
     work += compat_api::syscall::service_deferred_transfer_releases();
     // Shared display mappings may own large contiguous frame sets. Reclaim a
     // bounded page quantum outside process/handle locks so close, exec, and

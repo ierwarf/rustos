@@ -217,7 +217,7 @@ substitutes.
 | 9 | `procd` | `PROCESS_POLICY` | exec/fork/wait/signal |
 | 10 | `rootd` | `ROOT_SUPERVISOR` | Core-service leases, restart budgets |
 | 11 | `sessiond` (reserved) | `SESSION_POLICY` | Console/TTY/session |
-| 12 | `pagerd` (reserved) | `PAGER_POLICY` | Backing/page-cache |
+| 12 | `pagerd` | `PAGER_POLICY` | VM object, fault, page-cache, COW, reclaim/writeback policy |
 Service IDs 5 and 13, their former capability bits, and raw syscall numbers
 `0x52550020..=0x52550022` plus `0x52550037` are permanently retired. They are
 not extension points and must continue to return `ENOSYS`.
@@ -233,10 +233,30 @@ Linux `getrandom` flag, length, and error policy; netd still owns token
 collision/admission policy. PID/TID/counter-derived pseudo-random output is
 forbidden for credentials, object capabilities, ASLR material, and Linux
 `getrandom`.
-Until a standalone `pagerd` lease exists, `syscalld` may register the reserved `IPC_SERVICE_PAGERD` endpoint and receive `PAGER_POLICY`; rootd must treat that as an explicit compatibility delegation, not a generic multi-service registration rule.
-`initd` must not be spawned until that delegated pager endpoint is registered;
-otherwise dynamic loader page-fault/backing policy can deadlock behind rootd's
-own initd spawn IPC.
+`pagerd` is a standalone rootd-managed service and is the only process that may
+register `IPC_SERVICE_PAGERD` or receive `PAGER_POLICY`. The former syscalld
+delegation is retired; it is not a fallback. `initd` must not be spawned until
+the exact pagerd endpoint and lease are registered, otherwise dynamic-loader
+fault/backing policy can deadlock behind rootd's own initd spawn IPC.
+
+Pager fault wire ABI v2 adds `backing_service` to
+`PagerObjectIdentityWire`. Anonymous objects require that field to be zero;
+file-private, file-shared, image-section, and memfd objects require a nonzero
+owning service identity. A page-cache key is the exact tuple of backing service,
+object slot/generation, backing generation, and page offset. Paths, frame
+numbers, or an object slot without generations are never cache authority.
+The bounded policy implementation is `services/pagerd/src/page_cache.rs`.
+For the anonymous Phase-7 path, `PagerFaultDispatchWire` carries the canonical
+fault request plus an opaque, one-shot pre-zeroed frame capability and its
+maximum W^X-safe rights. `pagerd` must return that exact capability only in a
+`MAP_ZEROED` reply and may only attenuate those rights; the former generic
+commercial-request `arg0` grant is not an authority channel.
+Current status: single-load admission, clean/private-COW, dirty/writeback,
+provider-generation sealing, mapped/dirty frame quarantine, exact-token dirty
+reauthorization, and TLB-acknowledged reclaim exist with model and mutation
+evidence; vfsd/storaged I/O, kernel fault dispatch, runtime pressure/restart,
+and Linux/Windows differential cutover are still required before Phase 8 is
+complete.
 ## Driver domain contract
 
 Linux kernel modules execute only inside the Linux DVM. RustOS neither stages nor

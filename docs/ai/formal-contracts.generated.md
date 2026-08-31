@@ -2,20 +2,20 @@
 # Formal Contract Registry
 
 - Schema: `3`
-- Registry SHA-256: `1125c0f9a535bdd3f1676dea5b08c3412fde38737cc458852286d0256681fac0`
-- Models: `131`
-- Whole flows: `70`
-- Transitions: `726`
+- Registry SHA-256: `bc5b8ee80c674330782eb2a2035833af87685d0506060ab82d83809dac11e404`
+- Models: `135`
+- Whole flows: `74`
+- Transitions: `748`
 - Product runtime scenarios: `3`
-- Exact source witnesses: `619`
+- Exact source witnesses: `636`
 - Apalache pilots: `3`
 - TLAPS theorem models: `2`
 - Runtime-traced models: `7`
 - Intentional-terminal exceptions: `92` (ceiling `92`)
-- Cyclic strongly connected components: `45`
-- Supporting model bindings: `103`
-- Explicit critical/high risk surfaces: `102`
-- Additional source mappings: `179`
+- Cyclic strongly connected components: `48`
+- Supporting model bindings: `107`
+- Explicit critical/high risk surfaces: `107`
+- Additional source mappings: `185`
 
 | Flow | Severity | Owners | Models | Requirements | Hazards | Sinks |
 | --- | --- | --- | --- | ---: | ---: | --- |
@@ -58,6 +58,10 @@
 | `monotonic-deadline-lifecycle` | `critical` | kernel-compat, kernel-hal, kernel-ps | clocksource-deadline/ClocksourceDeadline | 13 | 13 | cancelled, reported, retired, source-rejected, timed-out |
 | `msi-vector-ingress` | `critical` | kernel-hal, kernel-io-manager | msi-vector-lifecycle/MsiVectorLifecycle | 8 | 8 | free, permanent, rejected |
 | `netd-deferred-reply-lifecycle` | `critical` | netd | netd-deferred-reply/NetdDeferredReply | 10 | 10 | discarded, provider-not-started, rejected, replied, timed-out |
+| `page-cache-lifecycle` | `critical` | pagerd | page-cache-lifecycle/PageCacheLifecycle | 10 | 10 | rejected |
+| `pager-fault-slot-lifecycle` | `critical` | kernel-ps | pager-fault-slot-lifecycle/PagerFaultSlotLifecycle | 5 | 5 | freed |
+| `pager-frame-grant-lifecycle` | `critical` | kernel-mm | pager-frame-grant-lifecycle/PagerFrameGrantLifecycle | 3 | 3 | consumed |
+| `pager-vma-publication` | `critical` | kernel-ps | pager-vma-publication/PagerVmaPublication | 4 | 4 | revoked |
 | `pci-resource-discovery` | `critical` | kernel-hal | pci-bar-discovery/PciBarDiscovery | 9 | 9 | published, rejected |
 | `per-cpu-clockevent-lifecycle` | `critical` | kernel-hal, kernel-ps | per-cpu-clockevent-lifecycle/PerCpuClockeventLifecycle | 7 | 7 | invariant-panic, serviced |
 | `physical-frame-lifecycle` | `critical` | kernel-mm | physical-frame-lifecycle/PhysicalFrameLifecycle | 7 | 7 | allocation-failed, rejected |

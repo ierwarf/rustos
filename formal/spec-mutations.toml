@@ -31,7 +31,11 @@ required_models = [
     "ipc-transfer-authority/IpcTransferAuthority",
     "msi-vector-lifecycle/MsiVectorLifecycle",
     "netd-deferred-reply/NetdDeferredReply",
+    "page-cache-lifecycle/PageCacheLifecycle",
     "page-table-map-transaction/PageTableMapTransaction",
+    "pager-fault-slot-lifecycle/PagerFaultSlotLifecycle",
+    "pager-frame-grant-lifecycle/PagerFrameGrantLifecycle",
+    "pager-vma-publication/PagerVmaPublication",
     "per-cpu-clockevent-lifecycle/PerCpuClockeventLifecycle",
     "process-lifecycle-transaction/ProcessLifecycleTransaction",
     "product-boot/ProductBoot",
@@ -1090,6 +1094,126 @@ invariant = "NmiTakesNoTrackedLock"
 min_counterexample_states = 2
 
 [[mutation]]
+id = "page-cache-cow-dirties-shared-source"
+kind = "transition-effect"
+severity = "critical"
+model = "page-cache-lifecycle/PageCacheLifecycle"
+flow = "page-cache-lifecycle"
+find = "    /\\ cowSourceClean' = TRUE"
+replace = "    /\\ cowSourceClean' = FALSE"
+occurrence = 1
+invariant = "PrivateCowPreservesSharedClean"
+min_counterexample_states = 4
+
+[[mutation]]
+id = "page-cache-dirty-reclaim-admitted"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "page-cache-lifecycle/PageCacheLifecycle"
+flow = "page-cache-lifecycle"
+find = '''BeginReclaim ==
+    /\ state = Clean
+    /\ ~dirty
+'''
+replace = '''BeginReclaim ==
+    /\ state \in {Clean, Dirty}
+    /\ TRUE
+'''
+occurrence = 1
+invariant = "ReclaimStartsOnlyFromClean"
+min_counterexample_states = 5
+
+[[mutation]]
+id = "page-cache-duplicate-load-owner"
+kind = "transition-effect"
+severity = "critical"
+model = "page-cache-lifecycle/PageCacheLifecycle"
+flow = "page-cache-lifecycle"
+find = '''BeginLoad(g) ==
+    /\ state = Absent
+    /\ ~backingRevoked
+    /\ g > 0
+    /\ state' = Loading
+    /\ keyGeneration' = g
+    /\ loadOwners' = 1
+'''
+replace = '''BeginLoad(g) ==
+    /\ state \in {Absent, Loading}
+    /\ ~backingRevoked
+    /\ g > 0
+    /\ state' = Loading
+    /\ keyGeneration' = g
+    /\ loadOwners' = loadOwners + 1
+'''
+occurrence = 1
+invariant = "OneLoadOwner"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "page-cache-reclaim-before-tlb-ack"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "page-cache-lifecycle/PageCacheLifecycle"
+flow = "page-cache-lifecycle"
+find = '''CompleteReclaim ==
+    /\ state = Reclaiming
+    /\ tlbGeneration > 0
+    /\ tlbAck = tlbGeneration
+'''
+replace = '''CompleteReclaim ==
+    /\ state = Reclaiming
+    /\ tlbGeneration > 0
+    /\ TRUE
+'''
+occurrence = 1
+invariant = "FreedAfterExactTlbAck"
+min_counterexample_states = 5
+
+[[mutation]]
+id = "page-cache-revoked-frame-before-tlb-ack"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "page-cache-lifecycle/PageCacheLifecycle"
+flow = "page-cache-lifecycle"
+find = '''CompleteRevokedReclaim ==
+    /\ state = Revoked
+    /\ pageGeneration > 0
+    /\ ~dirty
+    /\ revokeToken = 1
+    /\ tlbGeneration > 0
+    /\ tlbAck = tlbGeneration
+'''
+replace = '''CompleteRevokedReclaim ==
+    /\ state = Revoked
+    /\ pageGeneration > 0
+    /\ ~dirty
+    /\ revokeToken = 1
+    /\ TRUE
+    /\ TRUE
+'''
+occurrence = 1
+invariant = "FreedAfterExactTlbAck"
+min_counterexample_states = 4
+
+[[mutation]]
+id = "page-cache-revoked-generation-reloads"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "page-cache-lifecycle/PageCacheLifecycle"
+flow = "page-cache-lifecycle"
+find = '''BeginLoad(g) ==
+    /\ state = Absent
+    /\ ~backingRevoked
+'''
+replace = '''BeginLoad(g) ==
+    /\ state = Absent
+    /\ TRUE
+'''
+occurrence = 1
+invariant = "RevokedBackingCannotReload"
+min_counterexample_states = 4
+
+[[mutation]]
 id = "page-table-publication-log-omitted"
 kind = "transition-effect"
 severity = "critical"
@@ -1100,6 +1224,225 @@ replace = "    /\\ commitLog' = commitLog"
 occurrence = 1
 invariant = "PublishedTopologyHasRollbackCustody"
 min_counterexample_states = 3
+
+[[mutation]]
+id = "pager-fault-slot-claim-before-block"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "pager-fault-slot-lifecycle/PagerFaultSlotLifecycle"
+flow = "pager-fault-slot-lifecycle"
+find = '''ClaimReply(replyToken, endpointMatches, requestMatches) ==
+    /\ state = Dispatched
+    /\ dispatcherOwns
+    /\ replyToken = token
+'''
+replace = '''ClaimReply(replyToken, endpointMatches, requestMatches) ==
+    /\ state \in {Blocked, Dispatched}
+    /\ replyToken = token
+    /\ endpointMatches
+    /\ requestMatches
+'''
+occurrence = 1
+invariant = "ReplyClaimRequiresDispatch"
+min_counterexample_states = 4
+
+[[mutation]]
+id = "pager-fault-slot-dispatch-ownership-bypass"
+kind = "transition-effect"
+severity = "critical"
+model = "pager-fault-slot-lifecycle/PagerFaultSlotLifecycle"
+flow = "pager-fault-slot-lifecycle"
+find = '''    /\ state' = Dispatched
+    /\ dispatcherOwns' = TRUE
+'''
+replace = '''    /\ state' = Dispatched
+    /\ dispatcherOwns' = FALSE
+'''
+occurrence = 1
+invariant = "DispatchedHasExactOwner"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "pager-fault-slot-endpoint-bypass"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "pager-fault-slot-lifecycle/PagerFaultSlotLifecycle"
+flow = "pager-fault-slot-lifecycle"
+find = '''    /\ replyToken = token
+    /\ endpointMatches
+    /\ requestMatches
+'''
+replace = '''    /\ replyToken = token
+    /\ TRUE
+    /\ requestMatches
+'''
+occurrence = 1
+invariant = "ReplyClaimRequiresBlocked"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "pager-fault-slot-token-bypass"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "pager-fault-slot-lifecycle/PagerFaultSlotLifecycle"
+flow = "pager-fault-slot-lifecycle"
+find = '''    /\ state = Dispatched
+    /\ dispatcherOwns
+    /\ replyToken = token
+    /\ endpointMatches
+'''
+replace = '''    /\ state = Dispatched
+    /\ dispatcherOwns
+    /\ TRUE
+    /\ endpointMatches
+'''
+occurrence = 1
+invariant = "ReplyClaimRequiresBlocked"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "pager-frame-grant-binding-bypass"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "pager-frame-grant-lifecycle/PagerFrameGrantLifecycle"
+flow = "pager-frame-grant-lifecycle"
+find = '''Consume(token, handleGeneration) ==
+    /\ state = Granted
+    /\ token = boundToken
+'''
+replace = '''Consume(token, handleGeneration) ==
+    /\ state = Granted
+    /\ TRUE
+'''
+occurrence = 1
+invariant = "TransferRequiresExactBinding"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "pager-frame-grant-generation-bypass"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "pager-frame-grant-lifecycle/PagerFrameGrantLifecycle"
+flow = "pager-frame-grant-lifecycle"
+find = '''    /\ token = boundToken
+    /\ handleGeneration = generation
+    /\ leafPrepared
+    /\ state' = Consumed
+'''
+replace = '''    /\ token = boundToken
+    /\ TRUE
+    /\ leafPrepared
+    /\ state' = Consumed
+'''
+occurrence = 1
+invariant = "TransferRequiresExactGeneration"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "pager-frame-grant-leaf-preparation"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "pager-frame-grant-lifecycle/PagerFrameGrantLifecycle"
+flow = "pager-frame-grant-lifecycle"
+find = '''    /\ wiredReserve > 0
+    /\ leafPrepared
+    /\ token \in 1..2
+'''
+replace = '''    /\ wiredReserve > 0
+    /\ TRUE
+    /\ token \in 1..2
+'''
+occurrence = 1
+invariant = "PublishedGrantRequiresPreparedLeaf"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "pager-frame-grant-wx-publication"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "pager-frame-grant-lifecycle/PagerFrameGrantLifecycle"
+flow = "pager-frame-grant-lifecycle"
+find = '''    /\ token \in 1..2
+    /\ ~(mayWrite /\ mayExecute)
+    /\ state' = Granted
+'''
+replace = '''    /\ token \in 1..2
+    /\ TRUE
+    /\ state' = Granted
+'''
+occurrence = 1
+invariant = "PublishedRightsAreWxSafe"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "pager-vma-publication-identity-bypass"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "pager-vma-publication/PagerVmaPublication"
+flow = "pager-vma-publication"
+find = '''    /\ sequence % 2 = 0
+    /\ identityExact
+    /\ permissionAllowed
+'''
+replace = '''    /\ sequence % 2 = 0
+    /\ TRUE
+    /\ permissionAllowed
+'''
+occurrence = 1
+invariant = "LookupRequiresExactIdentity"
+min_counterexample_states = 4
+
+[[mutation]]
+id = "pager-vma-publication-odd-commit"
+kind = "transition-effect"
+severity = "critical"
+model = "pager-vma-publication/PagerVmaPublication"
+flow = "pager-vma-publication"
+find = '''    /\ state' = Published
+    /\ sequence' = sequence + 1
+'''
+replace = '''    /\ state' = Published
+    /\ sequence' = sequence
+'''
+occurrence = 1
+invariant = "PublishedSequenceIsStable"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "pager-vma-publication-overlap-bypass"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "pager-vma-publication/PagerVmaPublication"
+flow = "pager-vma-publication"
+find = '''    /\ ~(mayWrite /\ mayExecute)
+    /\ ~hasOverlap
+    /\ state' = Writing
+'''
+replace = '''    /\ ~(mayWrite /\ mayExecute)
+    /\ TRUE
+    /\ state' = Writing
+'''
+occurrence = 1
+invariant = "PublishedVmaIsNonoverlapping"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "pager-vma-publication-permission-bypass"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "pager-vma-publication/PagerVmaPublication"
+flow = "pager-vma-publication"
+find = '''    /\ identityExact
+    /\ permissionAllowed
+    /\ lookupAdmitted' = TRUE
+'''
+replace = '''    /\ identityExact
+    /\ TRUE
+    /\ lookupAdmitted' = TRUE
+'''
+occurrence = 1
+invariant = "LookupRequiresAllowedAccess"
+min_counterexample_states = 4
 
 [[mutation]]
 id = "per-cpu-clockevent-deadline-before-lvt"

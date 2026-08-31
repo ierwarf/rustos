@@ -47,6 +47,13 @@ pub fn arm_block_current_task_on_reply(reply: u64) -> bool {
     reply != 0 && arm_current_wait(scheduler::BlockReason::EndpointReply(reply))
 }
 
+/// Arms the caller on its exact fixed pager-fault token. Endpoint IPC is
+/// intentionally absent here: exception ingress must not acquire endpoint or
+/// reply registries before this wait is committed.
+pub fn arm_block_current_task_on_pager_fault(token: u64) -> bool {
+    token != 0 && arm_current_wait(scheduler::BlockReason::PagerFault(token))
+}
+
 /// The wait payload is owner-generation-bound per slot, and the arm plus its
 /// exact reason are one store, so this CPU's own execution ownership is the
 /// whole precondition. Only a task the owner word does not place `Running`

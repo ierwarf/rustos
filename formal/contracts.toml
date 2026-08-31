@@ -1942,3 +1942,57 @@ required_artifacts = [
     "driver-domains/linux/out/artifacts/rustos-linux-dvm-x86_64.bzImage",
     "driver-domains/linux/out/artifacts/rustos-linux-dvm-x86_64.rootfs.cpio.zst",
 ]
+
+[[risk_surfaces]]
+path = "services/pagerd/src/page_cache.rs"
+severity = "critical"
+flows = ["page-cache-lifecycle"]
+reason = "pagerd must preserve exact backing identity, single-load ownership, private COW isolation, durable dirty settlement, provider-restart quarantine, and TLB acknowledgement before frame release."
+
+[[source_mappings]]
+path = "services/pagerd/src/page_cache.rs"
+models = ["page-cache-lifecycle/PageCacheLifecycle"]
+
+[[source_mappings]]
+path = "libs/rustos-user-abi/src/pager.rs"
+models = ["page-cache-lifecycle/PageCacheLifecycle"]
+
+[[risk_surfaces]]
+path = "services/pagerd/src/main.rs"
+severity = "critical"
+flows = ["pager-fault-slot-lifecycle", "pager-frame-grant-lifecycle"]
+reason = "pagerd's service entry must accept only a canonical dispatched anonymous fault and return the exact opaque pre-zeroed grant with rights attenuated to that dispatch."
+
+[[source_mappings]]
+path = "services/pagerd/src/main.rs"
+models = ["pager-fault-slot-lifecycle/PagerFaultSlotLifecycle", "pager-frame-grant-lifecycle/PagerFrameGrantLifecycle"]
+
+[[risk_surfaces]]
+path = "kernel/mm/src/memory/frame_capability.rs"
+severity = "critical"
+flows = ["pager-frame-grant-lifecycle"]
+reason = "Kernel-owned physical frames must remain opaque, W^X-safe, generation-bound to the exact fault authority, and transferable only once."
+
+[[source_mappings]]
+path = "kernel/mm/src/memory/frame_capability.rs"
+models = ["pager-frame-grant-lifecycle/PagerFrameGrantLifecycle"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/pager_fault.rs"
+severity = "critical"
+flows = ["pager-fault-slot-lifecycle"]
+reason = "Page-fault entry must reserve only fixed one-shot token custody, publish no stale request or endpoint, and remain free of allocator, process-state-lock, and service-lookup authority."
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/pager_fault.rs"
+models = ["pager-fault-slot-lifecycle/PagerFaultSlotLifecycle"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/pager_vma.rs"
+severity = "critical"
+flows = ["pager-vma-publication"]
+reason = "Exception-time fault lookup must remain bounded and lock-free while exact process, MM, VMA, permission, and revoke authority are revalidated from one all-atomic publication."
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/pager_vma.rs"
+models = ["pager-vma-publication/PagerVmaPublication"]

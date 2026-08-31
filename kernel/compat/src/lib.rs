@@ -107,4 +107,11 @@ pub(crate) mod vfs_core {
 
 pub mod user;
 
+/// Normal-time pager dispatch and reply adoption.
+///
+/// This lives beside the syscall ABI rather than in `kernel-executive` because
+/// it speaks the `CommercialMaxProtocol` envelope and drives endpoint IPC, and
+/// the workspace layering keeps `kernel-executive` above `kernel-ipc-runtime`.
+pub(crate) mod pager;
+
 pub mod api;

@@ -57,7 +57,6 @@ unsafe extern "Rust" {
 // error-code wrapper's misaligned stack.
 #[inline(always)]
 pub fn default_handler(stack_frame: InterruptStackFrame, index: u8, error_code: Option<u64>) {
-    emergency_exception_marker(index);
     unsafe {
         rustos_default_handler_alignment_bridge(stack_frame, index, error_code);
     }
@@ -98,6 +97,28 @@ fn rustos_default_handler_aligned(
     error_code: Option<u64>,
 ) {
     let cr2 = Cr2::read().map(|addr| addr.as_u64()).unwrap_or(u64::MAX);
+    let user_mode = is_user_mode(&stack_frame);
+
+    // A successfully handled demand fault is ordinary VM control flow, not an
+    // exception diagnostic. Resolve it before emitting emergency markers or
+    // dumping the recent trace ring; rejected and illegal faults retain the
+    // complete legacy diagnostic/retirement path below.
+    if user_mode && index == 14 {
+        match crate::hooks::try_handle_current_user_page_fault(
+            error_code,
+            cr2,
+            stack_frame.instruction_pointer.as_u64(),
+            stack_frame.stack_pointer.as_u64(),
+        ) {
+            crate::hooks::UserFaultDisposition::Resumed => return,
+            crate::hooks::UserFaultDisposition::Retired => {
+                crate::hooks::halt_current_retired_task();
+            }
+            crate::hooks::UserFaultDisposition::Unhandled => {}
+        }
+    }
+
+    emergency_exception_marker(index);
     crate::debug::dump_recent_trace_locations("exception");
     if index == 14 {
         log_page_fault_details(
@@ -113,7 +134,7 @@ fn rustos_default_handler_aligned(
             stack_frame.stack_pointer.as_u64(),
         );
     }
-    if is_user_mode(&stack_frame) {
+    if user_mode {
         match crate::hooks::retire_current_user_task_due_to_fault(
             index,
             error_code,
@@ -278,5 +299,25 @@ mod tests {
             assert_eq!(aligned & 0xf, 0);
             assert!(aligned <= raw_rsp);
         }
+    }
+
+    #[test]
+    fn handled_user_page_fault_skips_exception_dump_hot_path() {
+        let source = include_str!("handlers.rs");
+        let aligned = source
+            .split("fn rustos_default_handler_aligned")
+            .nth(1)
+            .expect("aligned exception handler source");
+        let hook = aligned
+            .find("try_handle_current_user_page_fault")
+            .expect("pager hook must remain installed");
+        let resumed = aligned[hook..]
+            .find("UserFaultDisposition::Resumed => return")
+            .map(|offset| hook + offset)
+            .expect("handled demand fault must return");
+        let dump = aligned
+            .find("dump_recent_trace_locations")
+            .expect("unhandled exception diagnostics must remain");
+        assert!(hook < resumed && resumed < dump);
     }
 }

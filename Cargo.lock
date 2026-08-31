@@ -693,6 +693,7 @@ dependencies = [
  "kernel-object",
  "kernel-ps",
  "nucleus-core",
+ "rustos-user-abi",
  "storage-core",
  "x86_64",
 ]

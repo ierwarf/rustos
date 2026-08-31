@@ -268,7 +268,14 @@ Scheduler-aware wait users should use `kernel_ps::api::{current_task_id, arm_blo
 
 ### Default Kernel `RUSTFLAGS`
 
-`--cfg rustos_boot_image`, `-C no-redzone`, `-C codegen-units=1`, `-C opt-level=2`, `-C overflow-checks=true`, `-C debug-assertions=false`, `-C debuginfo=0`, `-C panic=abort`.
+`--cfg rustos_boot_image`, `-C no-redzone`, `-C codegen-units=1`, `-C opt-level=2`, `-C overflow-checks=true`, `-C debug-assertions=false`, `-C debuginfo=0`, `-C panic=abort`, `-C relocation-model=static`.
+
+`relocation_model = "none"` means that xtask passes no flag; it does not mean
+"no relocations". The GNU x86_64 target then defaults kernel library crates to
+PIC and inserts a GOT load under their statics. The fixed-address,
+`-no-pie -static` image requires `"static"` in the default, debug, and release
+kernel configs. The AP trampoline's hand-written physical relocation remains
+independent of rustc's model.
 
 ### Build-Shape Knobs
 

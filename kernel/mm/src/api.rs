@@ -72,6 +72,14 @@ pub mod paging {
     pub use crate::memory::paging::*;
 }
 
+pub mod frame_capability {
+    pub use crate::memory::frame_capability::{
+        FrameGrantBinding, FrameGrantError, allocate_zeroed_frame_grant, cancel_frame_grant,
+        preallocate_pager_fault_frames, replenish_pager_fault_frames,
+        reserve_preallocated_zeroed_frame_grant, take_frame_grant,
+    };
+}
+
 pub mod phys {
     pub use crate::memory::phys::*;
 

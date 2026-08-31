@@ -1,5 +1,6 @@
 mod fast_call_tests;
 mod receiver_waiter_tests;
+mod reply_publication_tests;
 
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
@@ -91,6 +92,12 @@ fn endpoint_and_reply_handles_decode_only_in_range_generational_identities() {
     assert_eq!(endpoint_identity.kind(), ObjectKind::Endpoint);
     assert_eq!(endpoint_identity.slot(), 3);
     assert_eq!(endpoint_identity.generation(), 7);
+    assert_eq!(
+        super::KernelEndpointHandle::from_identity(3, 7),
+        Some(endpoint)
+    );
+    assert!(super::KernelEndpointHandle::from_identity(0, 7).is_none());
+    assert!(super::KernelEndpointHandle::from_identity(3, 0).is_none());
 
     let reply = super::KernelReplyHandle::from_raw((9_u64 << 16) | 11);
     let reply_identity = reply.identity().expect("reply identity");

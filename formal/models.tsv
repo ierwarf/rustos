@@ -88,6 +88,10 @@ memfd-seal-lifecycle/MemfdSealLifecycle	safety	intentional-terminal	sealed objec
 msi-vector-lifecycle/MsiVectorLifecycle	safety	intentional-terminal	failed vector leases revoke before bounded committed pool reuse	30	120	exhaustive	no	no	no
 netd-deferred-reply/NetdDeferredReply	temporal	intentional-terminal	deferred request resolves or is rejected	30	120	exhaustive	no	no	no
 network-payload-session/NetworkPayloadSession	safety	intentional-terminal	payload decision is terminal	120	900	exhaustive	no	no	no
+page-cache-lifecycle/PageCacheLifecycle	safety	check	explicit terminal stutter preserves bounded load COW writeback and reclaim progress	30	120	exhaustive	no	no	no
+pager-frame-grant-lifecycle/PagerFrameGrantLifecycle	safety	check	explicit terminal stutter preserves generation-bound one-shot frame custody	30	120	exhaustive	no	no	no
+pager-fault-slot-lifecycle/PagerFaultSlotLifecycle	safety	check	explicit terminal stutter preserves fixed allocation-free fault custody and one-shot reply authority	30	120	exhaustive	no	no	no
+pager-vma-publication/PagerVmaPublication	safety	check	explicit stable and exhausted terminals preserve bounded all-atomic publication checking	30	120	exhaustive	no	no	no
 page-table-lifecycle/PageTableLifecycle	safety	intentional-terminal	mapping lifecycle may complete	120	900	exhaustive	no	no	no
 page-table-map-transaction/PageTableMapTransaction	temporal	check	committed and failed terminals stutter after exact topology settlement	30	120	exhaustive	no	no	no
 persistent-mutation-admission/PersistentMutationAdmission	safety	intentional-terminal	mutation admission decision is terminal	30	120	exhaustive	no	no	no

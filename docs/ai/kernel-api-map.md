@@ -19,6 +19,20 @@ into another crate's private modules when `api.rs` exposes a wrapper.
 | Boot orchestration/hooks | `kernel_executive::boot` | `kernel/executive/src/boot.rs`, `kernel/executive/src/lib.rs` |
 | Logging/panic/boot trace | `nucleus_core::debug` | `kernel/nucleus-core/src/debug/mod.rs` |
 
+Page-cache victim selection, COW/writeback policy, and backing-generation
+authority are not kernel APIs. They belong to `pagerd`; kernel-mm exposes only
+opaque generation-bound all-atomic frame grants, normal-time pager-leaf
+preparation, exception-time fixed-ledger PTE installation, page-table
+transactions, and exact TLB-acknowledgement mechanisms required to commit or
+reclaim the service's admitted decision. Physical frame numbers never cross the
+pager boundary.
+`kernel-ps` separately owns the all-atomic pager VMA publication: syscall-time
+writers publish/revoke exact generations, while exception-time readers perform
+only bounded atomic lookup and never acquire `ProcessStateLock`.  The public
+target-process publish/revoke APIs retain the exact PID slot and stamp its live
+process/MM generation before accepting an unbound region template; they are
+broker-time only and never appear in the fault path.
+
 ## Boot order
 
 From `kernel/src/main.rs`:

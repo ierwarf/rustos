@@ -28,6 +28,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 mod endpoint_priority;
 #[cfg(test)]
 mod legacy_test_api;
+mod reply_publication;
 mod shared_region_hold;
 mod slab;
 
@@ -51,6 +52,7 @@ use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
 #[cfg(test)]
 use spin::Mutex;
 
+use reply_publication::{insert_reply_object, published_reply_message_id};
 use slab::GenerationalSlab;
 
 #[cfg(not(test))]
@@ -164,6 +166,21 @@ pub struct KernelEndpointHandle {
 impl KernelEndpointHandle {
     pub const fn from_raw(raw: u64) -> Self {
         Self { raw }
+    }
+
+    /// Reconstructs only a valid-shaped generational endpoint handle from an
+    /// externally stored stable identity. Liveness is revalidated by every
+    /// endpoint operation.
+    pub fn from_identity(slot: u64, generation: u64) -> Option<Self> {
+        let index = usize::try_from(slot.checked_sub(1)?).ok()?;
+        if index >= MAX_ENDPOINT_OBJECTS || generation == 0 || generation > (u64::MAX >> 16) {
+            return None;
+        }
+        let handle = Self {
+            raw: (generation << 16) | slot,
+        };
+        let identity = handle.identity()?;
+        (identity.slot() == slot && identity.generation() == generation).then_some(handle)
     }
 
     pub const fn raw(&self) -> u64 {
@@ -1647,7 +1664,7 @@ fn enqueue_endpoint_call_with_handles_faultable(
             response: None,
         })
         .map_err(|_| IpcError::NoMemory)?;
-    let reply_id = match REPLIES.insert(ReplyObject {
+    let reply_id = match insert_reply_object(ReplyObject {
         message_id,
         receiver_owner,
         used: false,
@@ -1769,16 +1786,15 @@ pub fn reserve_fast_endpoint_call_with_response_capacity(
         response: [0; IPC_FAST_INLINE_BYTES],
     };
     frame.request[..request.len()].copy_from_slice(request);
-    let reply_id = REPLIES
-        .insert(ReplyObject {
-            message_id: 0,
-            receiver_owner,
-            used: false,
-            consumed: false,
-            scheduling_context,
-            fast_frame: Some(frame),
-        })
-        .map_err(|_| IpcError::NoMemory)?;
+    let reply_id = insert_reply_object(ReplyObject {
+        message_id: 0,
+        receiver_owner,
+        used: false,
+        consumed: false,
+        scheduling_context,
+        fast_frame: Some(frame),
+    })
+    .map_err(|_| IpcError::NoMemory)?;
 
     let published = ENDPOINTS.with_mut(endpoint.raw(), |endpoint_object| {
         if endpoint_object.has_pending()
@@ -2670,12 +2686,7 @@ pub fn take_endpoint_response_detailed(
     reply: KernelReplyHandle,
     handle_capacity: usize,
 ) -> Result<EndpointResponseTake, IpcError> {
-    let message_id = REPLIES
-        .with(reply.raw(), |reply_object| {
-            (!reply_object.consumed).then_some(reply_object.message_id)
-        })
-        .flatten()
-        .ok_or(IpcError::InvalidHandle)?;
+    let message_id = published_reply_message_id(reply.raw()).ok_or(IpcError::InvalidHandle)?;
 
     let (result, consumed) = ENDPOINT_MESSAGES
         .with_mut(message_id, |message| {

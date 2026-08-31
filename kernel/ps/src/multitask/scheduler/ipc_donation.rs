@@ -787,6 +787,7 @@ mod current_donation_tests {
             process_handle: None,
             process_id: Some(0x900),
             console_session: ConsoleSessionHandle::SYSTEM,
+            pager_charge: None,
         }
     }
 

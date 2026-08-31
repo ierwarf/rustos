@@ -25,8 +25,8 @@ use x86_64::PhysAddr;
 use x86_64::VirtAddr;
 
 use super::{
-    AddressSpaceError, PAGE_4KIB, PAGE_4KIB_U64, ProcessAddressSpace, UserBufferAccess,
-    align_down, align_up, higher_half_ptr, is_user_addr, validate_user_page_access,
+    AddressSpaceError, PAGE_4KIB, PAGE_4KIB_U64, ProcessAddressSpace, UserBufferAccess, align_down,
+    align_up, higher_half_ptr, is_user_addr, validate_user_page_access,
 };
 
 /// Proof that one exact user range was admitted for reading against this
@@ -343,7 +343,6 @@ impl ProcessAddressSpace {
         // The loop translated the page-aligned base, so re-apply `start`'s own
         // offset inside that page rather than translating a second address.
         let page_offset = start_addr & (PAGE_4KIB_U64 - 1);
-        Ok(first_page_phys
-            .map(|phys| PhysAddr::new(phys.as_u64().saturating_add(page_offset))))
+        Ok(first_page_phys.map(|phys| PhysAddr::new(phys.as_u64().saturating_add(page_offset))))
     }
 }

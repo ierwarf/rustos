@@ -1,13 +1,32 @@
 #![no_std]
+//!
+//! - **Owner:** `pagerd` owns anonymous-fault policy after the kernel has
+//!   admitted an exact pager capability and fixed one-shot fault custody.
+//! - **Boundary:** Every protocol envelope, sender identity, VMA admission,
+//!   dispatch request, opaque frame capability, and requested frame right is
+//!   untrusted until the matching ABI contract accepts it.
+//! - **Lifecycle:** Register one service endpoint, admit the pager-owned VMA,
+//!   consume one dispatched anonymous fault, issue one exact reply, and lose
+//!   the old authority on token, VMA, process, or service-epoch revocation.
+//! - **Concurrency:** The service loop serializes its bounded policy state;
+//!   it holds no policy lock across endpoint receive or reply publication.
+//! - **Failure:** Malformed envelopes, foreign senders, stale generations,
+//!   non-demand/protection faults, and rights expansion return an explicit
+//!   error without reusing a frame capability or fault token.
+//! - **Forbidden:** No physical address, PID-only authority, generic request
+//!   `arg0` frame grant, W+X frame right, or kernel-policy fallback.
+//! - **Evidence:** `pager-fault-slot-lifecycle`,
+//!   `pager-frame-grant-lifecycle`, pagerd unit tests, ABI tests, and
+//!   `pager-fault-slot-lifecycle` TLA+ mutations.
 #![no_main]
 
 use core::mem::size_of;
 #[cfg(not(test))]
 use core::panic::PanicInfo;
 
-use pagerd::{PagerFaultError, PagerState};
+use pagerd::{request_sender_is_authorized, PagerFaultError, PagerState};
 use rustos_svc_runtime::ipc;
-use rustos_user_abi::pager::{PagerFaultRequestWire, PagerVmRegionWire};
+use rustos_user_abi::pager::{PagerFaultDispatchWire, PagerVmRegionWire};
 use rustos_user_abi::syscall::{
     CommercialMaxProtocolRequest, CommercialMaxProtocolResponse,
     COMMERCIAL_MAX_PAGERD_OP_BACKING_OBJECT, COMMERCIAL_MAX_PAGERD_OP_FAULT_RESOLVE,
@@ -84,7 +103,7 @@ fn handle_request(
     };
     response.header.version = COMMERCIAL_MAX_PROTOCOL_ABI_VERSION;
     if !request.has_valid_envelope()
-        || !request.subject_is_exact_sender(sender_pid, sender_tid)
+        || !request_sender_is_authorized(&request, sender_pid, sender_tid)
         || request.header.protocol != COMMERCIAL_MAX_PROTOCOL_PAGERD
         || request.header.service_id != IPC_SERVICE_PAGERD
         || request.path_len != 0
@@ -98,12 +117,10 @@ fn handle_request(
                 pager.admit_region(region)?;
                 Ok(None)
             }),
-        COMMERCIAL_MAX_PAGERD_OP_FAULT_RESOLVE => decode_payload::<PagerFaultRequestWire>(&request)
-            .and_then(|fault| {
-                pager
-                    .resolve_anonymous_first_touch(fault, request.arg0)
-                    .map(Some)
-            }),
+        COMMERCIAL_MAX_PAGERD_OP_FAULT_RESOLVE => {
+            decode_payload::<PagerFaultDispatchWire>(&request)
+                .and_then(|dispatch| pager.resolve_anonymous_first_touch(dispatch).map(Some))
+        }
         _ => Err(PagerFaultError::NotManaged),
     };
     match result {

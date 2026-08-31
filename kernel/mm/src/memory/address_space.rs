@@ -15,7 +15,6 @@
 //!   guest pointer as frame authority, or hidden identity mapping.
 //! - **Evidence:** `memory-map` and `user-memory-access`.
 use alloc::vec::Vec;
-use core::cmp::min;
 use core::ptr;
 
 use x86_64::PhysAddr;
@@ -28,14 +27,15 @@ use kernel_hal::api::arch::tlb::{AddressSpaceMutationGuard, begin_address_space_
 
 mod atomic_user;
 mod owned_frames;
+mod pager_fault_mapping;
 mod rollback;
 mod user_copy;
-pub use user_copy::{ValidatedUserRead, ValidatedUserWrite};
 use owned_frames::{
     FRAME_BATCH_CHUNK, free_frame_buffer_tail, free_owned_frames_exact, free_owned_frames_logged,
     free_owned_frames_silently, free_rollback_frames_exact, remove_owned_frame, track_owned_frame,
 };
 use rollback::{rollback_external_user_pages, rollback_user_pages};
+pub use user_copy::{ValidatedUserRead, ValidatedUserWrite};
 
 use crate::memory::{kernel_vm, phys};
 
@@ -45,6 +45,15 @@ const PAGE_4KIB_U64: u64 = PAGE_4KIB as u64;
 const USER_PML4_INDEX: usize = 1;
 pub const USER_SPACE_BASE: u64 = (USER_PML4_INDEX as u64) << 39;
 pub const USER_SPACE_END_EXCLUSIVE: u64 = ((USER_PML4_INDEX + 1) as u64) << 39;
+// Pager-leaf metadata is reserved while normal VMA policy runs. The fault path may
+// consume only those already-reserved slots, so resident working-set capacity is
+// independent of the bounded pool of simultaneously available fault frames.
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PagerFaultLeaf {
+    virtual_address: u64,
+    physical_address: u64,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AddressSpaceError {
@@ -82,6 +91,8 @@ pub struct ProcessAddressSpace {
     next_user_addr: u64,
     owned_frames: Vec<u64>,
     regions: Vec<UserRegion>,
+    pager_fault_leaves: Vec<PagerFaultLeaf>,
+    pager_fault_leaf_limit: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -120,6 +131,8 @@ impl ProcessAddressSpace {
                 frames
             },
             regions: Vec::new(),
+            pager_fault_leaves: Vec::new(),
+            pager_fault_leaf_limit: 0,
         })
     }
 
@@ -134,6 +147,8 @@ impl ProcessAddressSpace {
             next_user_addr: USER_SPACE_BASE,
             owned_frames: Vec::new(),
             regions: Vec::new(),
+            pager_fault_leaves: Vec::new(),
+            pager_fault_leaf_limit: 0,
         }
     }
 
@@ -158,6 +173,23 @@ impl ProcessAddressSpace {
                         PAGE_4KIB,
                     );
                 }
+            }
+        }
+        for leaf in &self.pager_fault_leaves {
+            let virt = VirtAddr::new(leaf.virtual_address);
+            let (src_phys, flags) = self
+                .translate_user_with_flags(virt)
+                .ok_or(AddressSpaceError::NotMapped)?;
+            cloned.map_zeroed_user_pages_at(virt, 1, flags)?;
+            let dst_phys = cloned
+                .translate_user(virt)
+                .ok_or(AddressSpaceError::NotMapped)?;
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    higher_half_ptr(src_phys),
+                    higher_half_ptr(dst_phys),
+                    PAGE_4KIB,
+                );
             }
         }
 
@@ -821,6 +853,11 @@ impl Drop for ProcessAddressSpace {
             recorded_frames.sort_unstable();
             recorded_frames.dedup();
             free_owned_frames_silently(recorded_frames.into_iter());
+            free_owned_frames_silently(
+                self.pager_fault_leaves
+                    .iter()
+                    .map(|leaf| leaf.physical_address),
+            );
             return;
         }
 
@@ -860,6 +897,12 @@ impl Drop for ProcessAddressSpace {
         // ownership oracle because shared memfd and device mappings install
         // borrowed leaf frames which their backing objects must release.
         free_owned_frames_logged(self.pml4_frame_phys, recorded_frames.into_iter());
+        free_owned_frames_logged(
+            self.pml4_frame_phys,
+            self.pager_fault_leaves
+                .iter()
+                .map(|leaf| leaf.physical_address),
+        );
     }
 }
 

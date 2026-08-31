@@ -2,7 +2,7 @@ mod block_broker_ops;
 mod broker_ops;
 mod debug_ops;
 mod error_ops;
-mod ipc_ops;
+pub(crate) mod ipc_ops;
 mod ipc_profile;
 pub(crate) mod ipc_server_profile;
 mod memory_ops;

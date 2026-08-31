@@ -115,20 +115,19 @@ and WayClick never stop running) and are reported but not gated.
 
 ## Current results
 
-One vCPU, the unrestricted probe table, from a same-session control pair whose
-anchor held at exactly 0.0% — this is the current repeatable state, not a
-single run. Both columns are that pair's two `min` readings, so the spread
-between them is this instrument's own:
+One vCPU, the unrestricted probe table, from two consecutive runs of the
+current tree. The anchor moved -2.2%, inside the 3% admission bound; both
+columns are `min` readings, so their spread is the instrument's own:
 
 | probe | min cycles | repeat |
 | --- | ---: | ---: |
 | `null_syscall_getpid` | 400 | 400 |
-| `ipc_try_recv_empty` | 1,440 | 1,360 |
-| `sched_yield` | 4,000 | 4,040 |
-| `ipc_rt_intra_process` | 15,320 | 15,360 |
-| `ipc_rt_intra_process_reply_recv` | 16,560 | 16,520 |
-| `ipc_rt_cross_process_syscalld_getuid` | 22,120 | 22,080 |
-| `vmexit_cpuid` (anchor) | 3,480 | 3,520 |
+| `ipc_try_recv_empty` | 1,400 | 1,440 |
+| `sched_yield` | 4,120 | 4,080 |
+| `ipc_rt_intra_process` | 16,120 | 16,120 |
+| `ipc_rt_intra_process_reply_recv` | 17,480 | 17,480 |
+| `ipc_rt_cross_process_syscalld_getuid` | 23,000 | 23,360 |
+| `vmexit_cpuid` (anchor) | 3,680 | 3,600 |
 
 `p99` on every probe above routinely reads 15–40x the min even though
 `ipc_rt_intra_process_reply_recv`'s min and p50 are nearly identical (the
@@ -155,20 +154,27 @@ a hot lock is a tail cause; per-operation cost reduction is a min/p50 cause.
 Look for the former, not more of the latter, before attempting `p99` work
 here again.
 
-**What sets the ~23,000-cycle floor**, per the tracked-lock class census
-(`work_budget::take_class_census()`, rendered as `kernel-lock-class-0..5`):
-about forty-two tracked-lock acquisitions per round trip at ~735 instrumented
-cycles each with no dominant sub-phase (admission, held-class-stack
-bookkeeping, and release each contribute roughly a third) — call this ~20,000
-of the floor. **The only lever that moves it is acquiring fewer locks, not
-making one cheaper**; a direct-mapped hint over the held-class-stack scan
-measured no change and was reverted. Two structural cuts already landed and
-are not to be re-attempted: `ProcessTable`'s `is_process_exiting` no longer
-takes the lock at all (a committed lifecycle publication already proves
-"not exiting" without one; see the asymmetry note below), and the busiest
-single acquisition site fell from ~10.7 to ~8.4 `ProcessTable` acquisitions
-per round trip when the own-thread process pin stopped re-pinning what a
-thread's own process already held.
+**What sets the current 17,480-cycle production-shaped local floor** is still
+the tracked-lock path, but the old absolute attribution is retired. The
+pre-relocation profile counted about forty-two acquisitions per round trip at
+~735 *instrumented* ticks each. After the GOT fix, a fresh isolated diagnostic
+run reads ~440 ticks per acquisition: `before-acquire` 162 + `spin` 31 +
+`after-acquire` 32 + `release` 215. The diagnostic build itself raises the
+probe from 17,600 to 31,040, so those 440 ticks are not shipping attribution
+and must not be multiplied into the current floor. They establish only that
+the GOT removal changed the cost shape and that the former 735/91% split is
+stale.
+
+For the lock protocol itself, the durable lever remains acquiring fewer locks;
+a direct-mapped hint over the held-class-stack scan measured no change and was
+reverted. Diagnostic bookkeeping is a separate build-shape lever: a shipping
+path must not update a census no live invariant can read. Two structural cuts
+already landed and are not to be re-attempted: `ProcessTable`'s
+`is_process_exiting` no longer takes the lock at all (a committed lifecycle
+publication already proves "not exiting" without one; see the asymmetry note
+below), and the busiest single acquisition site fell from ~10.7 to ~8.4
+`ProcessTable` acquisitions per round trip when the own-thread process pin
+stopped re-pinning what a thread's own process already held.
 
 **The publication asymmetry is deliberate, not partial.** A committed
 lifecycle publication may only prove a process **live** — an absent
@@ -432,11 +438,10 @@ landed (`vmexit_cpuid` 3,480 -> 4,360; `null_syscall_getpid`, exactly 680 in
 twelve of thirteen prior runs, read 840), which is far more than the change is
 worth. The count is the evidence, and the count is exact.
 
-Two more sites carry the same shape and are **not** taken: the equal-count pair
-at `take_endpoint_response_detailed` needs a lock-free published `message_id`
-mirror, because its nesting order is fixed at message-then-reply and cannot be
-inverted; and the send path's reply-id binding is registered verbatim as the
-`endpoint-enqueue-reply-binding-and` mutant, so fusing it edits
+The equal-count pair at `take_endpoint_response_detailed` is now resolved by
+the generation-checked published `message_id` hint described below. The send
+path's reply-id binding remains deliberately separate: it is registered
+verbatim as the `endpoint-enqueue-reply-binding-and` mutant, so fusing it edits
 `formal/implementation-mutations.tsv` for 0.35 acquisitions per round trip.
 
 ## Logical-CPU identity, and the snapshot that answered one word with six
@@ -531,16 +536,16 @@ that genuinely runs somewhere other than its link address is the AP trampoline,
 and it is hand-written assembly that does its own relocation arithmetic against
 `RUSTOS_AP_TRAMPOLINE_PHYS` -- rustc's relocation model does not reach it.
 
-Same-session A-B-A, anchor held at +1.1%:
+Same-session final pair, anchor held at -1.1%:
 
-| probe | PIC | static | Δ | A-control | B-repeat |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| `null_syscall_getpid` | 600 | **400** | **-33.3%** | 640 | 400 |
-| `ipc_try_recv_empty` | 2,440 | **1,480** | **-39.3%** | 2,520 | 1,480 |
-| `ipc_rt_intra_process` | 21,800 | **15,840** | -27.3% | 22,680 | 16,520 |
-| `ipc_rt_intra_process_reply_recv` | 23,360 | **17,600** | -24.7% | 23,920 | 16,840 |
-| `ipc_rt_cross_process_syscalld_getuid` | 31,400 | **23,760** | -24.3% | 31,280 | 23,440 |
-| `sched_yield` | 5,000 | **4,160** | -16.8% | 5,280 | 3,640 |
+| probe | PIC | static | Δ |
+| --- | ---: | ---: | ---: |
+| `null_syscall_getpid` | 600 | **400** | **-33.3%** |
+| `ipc_try_recv_empty` | 2,440 | **1,440** | **-41.0%** |
+| `ipc_rt_intra_process` | 21,800 | **15,440** | **-29.2%** |
+| `ipc_rt_intra_process_reply_recv` | 23,360 | **17,480** | **-25.2%** |
+| `ipc_rt_cross_process_syscalld_getuid` | 31,400 | **23,440** | **-25.4%** |
+| `sched_yield` | 5,000 | **4,160** | **-16.8%** |
 
 The structural evidence is host-noise-immune and agrees: `.got` went from
 0x1348 (4,936 bytes, 617 entries) to **0x30 (48 bytes, 6 entries)**, and `.text`
@@ -591,6 +596,73 @@ speedup, and the A-control reproduces the loss when the change is removed:
 `null_syscall_getpid` is unmoved at 400 in every column: that probe has reached
 a floor this class of change no longer touches.
 
+## Shipping cost budgets without a free-running census
+
+The lock-class census used to increment one per-CPU counter on every tracked
+lock acquisition in every shipping build, even though only three user-memory
+scopes create a live `LockBudget`, all for `ProcessState`. That made a
+diagnostic population counter part of every IPC endpoint, message, reply,
+runqueue, policy, and scheduler lock.
+
+Shipping now registers the exact budgeted class, activates its counter only
+for a live nested budget scope, and routes const-generic tracked locks through
+that registration. LLVM can erase the counter path entirely for every other
+class. `declare` fails closed on an unregistered shipping class. Host tests
+retain free-running counters, and `RUSTOS_LOCK_PHASE_PROFILE=true` retains the
+complete class/site census; a fresh diagnostic run still reported all lock
+phases and passed the isolated attribution gate.
+
+Same-session control/candidate/repeat (`min`; anchors 3,680 / 3,680 / 3,600):
+
+| probe | control | candidate | repeat |
+| --- | ---: | ---: | ---: |
+| `null_syscall_getpid` | 400 | 400 | 400 |
+| `ipc_try_recv_empty` | 1,440 | 1,400 | 1,440 |
+| `ipc_rt_intra_process` | 16,320 | 16,120 | 16,120 |
+| `ipc_rt_intra_process_reply_recv` | 17,600 | 17,480 | 17,480 |
+| `ipc_rt_cross_process_syscalld_getuid` | 23,760 | **23,000** | **23,360** |
+
+The first cross-process candidate is -3.2%; the repeat is -1.7%, just inside
+the two-percent floor. Treat this as an exact removal of shipping-only work
+with an end-to-end effect bounded at roughly three percent, not as a new
+latency floor. The local round-trip changes remain below the floor and carry
+no timing claim.
+
+## Refuted: gating the identity counter on a live ceiling
+
+A shipping-only no-op of `charge_identity_derivation_count` bounded the whole
+counter at 240 cross-process cycles: 23,200 -> 22,960 with the anchor fixed at
+3,640. Preserving the runtime zero-derivation ceiling with a per-CPU active
+scope instead replaces every free-running increment with an active-depth load.
+That candidate measured 23,160 and 23,480 across two boots; p50 moved from
+24,760 to 25,160 and 25,280. It was reverted. The load remains on every
+identity derivation, so the invariant-preserving form recovers none of the
+ablation reliably enough to ship.
+
+## Published reply message id removes one lock acquisition
+
+`take_endpoint_response_detailed` must lock the endpoint message before the
+reply object. It formerly locked the reply once to discover `message_id`, then
+locked it again under the message lock to validate and consume the response.
+Reply insertion now publishes an advisory per-slot `message_id`; the nested
+`REPLIES.with_mut` still validates the full generational handle, the exact
+message id, and `consumed`, so the mirror cannot authorize a stale handle.
+
+The host counter pins a pending poll at exactly one `IpcReply` acquisition
+instead of two. Same-session shipping measurements (`min`; anchors 3,640 /
+3,640 / 3,680) show the structural cut but remain below the timing floor:
+
+| probe | control | candidate | repeat |
+| --- | ---: | ---: | ---: |
+| `null_syscall_getpid` | 400 | 400 | 400 |
+| `ipc_rt_intra_process_reply_recv` | 17,520 | 17,280 | 17,400 |
+| `ipc_split_reply_to_return` | 7,040 | 7,000 | 7,000 |
+| `ipc_rt_cross_process_syscalld_getuid` | 23,200 | 23,160 | 23,280 |
+
+No end-to-end latency claim is attached: the cross-process result is neutral
+and the local improvement is 0.7-1.4%. The exact one-acquisition removal and
+the preserved authoritative validation are the acceptance evidence.
+
 ## Refuted: GS-relative per-CPU identity
 
 The queued high-risk item from the previous round was replacing the identity
@@ -630,21 +702,19 @@ structural bet from the other direction: keep one simple synchronous
 microkernel code path, and build every richer IPC service on top of it ([The QNX
 Neutrino Microkernel](https://www.qnx.com/developers/docs/6.5.0SP1/neutrino/sys_arch/kernel.html)).
 
-RustOS takes about forty-two tracked lock acquisitions per synchronous round
-trip, and the phase split says where each one goes: of roughly 735 instrumented
-cycles, the actual lock operations -- the spin that takes the word and the store
-that releases it -- are about 66. **The other 91% is the tracked-guard
-bookkeeping**: identity derivation, the held-class stack, the dependency-edge
-memo, and the preemption accounting. That is the shape of this kernel's floor,
-and it is why the levers that work here are the ones that remove a whole
-category of bookkeeping rather than the ones that make a lock cheaper.
+The pre-relocation census counted about forty-two tracked lock acquisitions per
+synchronous round trip. Its often-quoted 735 instrumented ticks/acquisition and
+"91% bookkeeping" ratio are both retired: the GOT double-load was inside that
+bookkeeping, so neither the absolute figure nor the ratio describes the current
+image. A fresh post-fix isolated profile reads about 440 instrumented ticks per
+acquisition (`before-acquire` 162, `spin` 31, `after-acquire` 32, `release`
+215), while raising the production-shaped probe from 17,600 to 31,040. It is a
+diagnostic cost shape, not shipping latency attribution.
 
-That split was measured **before** the relocation-model fix above, so its
-absolute cycle figures are stale: a large share of the bookkeeping it counted
-was the GOT double-load, not the bookkeeping's own logic. The ratio has not been
-re-measured. What survives is the conclusion, which the fix corroborates rather
-than undermines -- the winning lever was again a whole category of per-access
-cost removed at once, not a cheaper lock.
+What survives is narrower: removing a whole acquisition or a whole category of
+shipping-only work can move the floor; rearranging one cached load or one lock
+instruction has repeatedly measured below it. The GOT fix and the budgeted
+census gate above are examples of the former.
 
 ## Cost invariants
 
@@ -654,8 +724,10 @@ Four places now assert cost directly, each with a source witness or a
 mutation that kills it:
 
 - `kernel/nucleus-core/src/util/lockdep/work_budget.rs`: a ceiling on how many
-  times a scope may take a lock class (preemption/migration-safe: the guard
-  records the CPU and task and declines to judge when either changed).
+  times a scope may take a registered lock class (preemption/migration-safe:
+  the guard records the CPU and task and declines to judge when either
+  changed). Shipping increments the counter only while such a scope is live;
+  host tests and lock-profile builds retain the complete free-running census.
 - `usermem`'s batched validate/write: a ceiling of one bind each; synchronous
   receive, two.
 - `ipc_ops/reply_wait.rs`: polls per turn against `POLLS_PER_WAIT_TURN`

@@ -13,6 +13,7 @@ fn encoded_reason(reason: BlockReason) -> (u8, u64) {
             (runqueue::wait::REASON_ENDPOINT_RECEIVE, endpoint)
         }
         BlockReason::EndpointReply(reply) => (runqueue::wait::REASON_ENDPOINT_REPLY, reply),
+        BlockReason::PagerFault(token) => (runqueue::wait::REASON_PAGER_FAULT, token),
     }
 }
 
@@ -91,6 +92,26 @@ pub(in crate::multitask) fn commit_current_wait() -> Option<bool> {
         }
         runqueue::WaitCommitOutcome::InvalidOwner => None,
     }
+}
+
+/// Restores run intent for this CPU's exact pager-fault wait.
+///
+/// This is the rollback half of the fused pager block publication. If slot
+/// cancellation already won, the owner word is already runnable and the
+/// function reports success without recreating the consumed wait. A different
+/// wait identity is never disturbed.
+pub(in crate::multitask) fn wake_current_pager_fault_wait(token: u64) -> Option<bool> {
+    if token == 0 {
+        return Some(false);
+    }
+    let slot = current_running_slot()?;
+    let owner = runqueue::owner(slot);
+    let (kind, id) = runqueue::wait::reason(slot);
+    if kind == runqueue::wait::REASON_PAGER_FAULT && id == token {
+        runqueue::wake_wait(slot);
+        return Some(true);
+    }
+    Some(owner.runnable)
 }
 
 impl Scheduler {
@@ -183,6 +204,16 @@ impl Scheduler {
 
     pub(in crate::multitask) fn arm_block_current_task_on_reply(&mut self, reply: u64) -> bool {
         (reply != 0) && self.arm_block_current_task_with_reason(BlockReason::EndpointReply(reply))
+    }
+
+    /// Arms the current faulting task before a normal-time dispatcher may
+    /// publish its request to pagerd. The token is the exact fixed fault-slot
+    /// generation, never an endpoint or physical-frame identity.
+    pub(in crate::multitask) fn arm_block_current_task_on_pager_fault(
+        &mut self,
+        token: u64,
+    ) -> bool {
+        (token != 0) && self.arm_block_current_task_with_reason(BlockReason::PagerFault(token))
     }
 
     pub(in crate::multitask) fn arm_block_current_task_with_reason(
@@ -352,6 +383,7 @@ impl Scheduler {
                     BlockReason::EndpointReceive(id)
                 }
                 runqueue::wait::REASON_ENDPOINT_REPLY if id != 0 => BlockReason::EndpointReply(id),
+                runqueue::wait::REASON_PAGER_FAULT if id != 0 => BlockReason::PagerFault(id),
                 _ => panic!("scheduler wait payload has invalid exact reason"),
             }
         }
@@ -441,6 +473,41 @@ mod current_wait_tests {
         assert!(!runqueue::wait::armed(SLOT));
         // The identity is meaningless without a kind and is deliberately left
         // for the next arm to overwrite; only the kind is authority.
+        assert_eq!(runqueue::wait::reason(SLOT).0, runqueue::wait::REASON_NONE);
+        drop(published);
+    }
+
+    #[test]
+    fn pager_fault_arm_preserves_only_its_fixed_slot_token() {
+        let published = running_here(SLOT);
+        assert_eq!(
+            arm_current_wait(BlockReason::PagerFault(0xface)),
+            Some(true)
+        );
+        assert!(runqueue::wait::armed(SLOT));
+        assert_eq!(
+            runqueue::wait::reason(SLOT),
+            (runqueue::wait::REASON_PAGER_FAULT, 0xface)
+        );
+        assert_eq!(cancel_current_wait(), Some(true));
+        assert_eq!(runqueue::wait::reason(SLOT).0, runqueue::wait::REASON_NONE);
+        drop(published);
+    }
+
+    #[test]
+    fn pager_fault_commit_rollback_restores_only_the_exact_wait() {
+        let published = running_here(SLOT);
+        assert_eq!(
+            arm_current_wait(BlockReason::PagerFault(0xface)),
+            Some(true)
+        );
+        assert_eq!(commit_current_wait(), Some(true));
+        assert!(!runqueue::owner(SLOT).runnable);
+
+        assert_eq!(wake_current_pager_fault_wait(0xbeef), Some(false));
+        assert!(!runqueue::owner(SLOT).runnable);
+        assert_eq!(wake_current_pager_fault_wait(0xface), Some(true));
+        assert!(runqueue::owner(SLOT).runnable);
         assert_eq!(runqueue::wait::reason(SLOT).0, runqueue::wait::REASON_NONE);
         drop(published);
     }

@@ -24,7 +24,9 @@
 //!   `syscall-simd-lifecycle`.
 mod address_space_root;
 mod affinity;
+mod block_reason;
 pub use affinity::{AffinityCommit, AffinityError, ProcessAffinitySnapshot};
+pub(in crate::multitask) use block_reason::BlockReason;
 #[cfg(test)]
 mod activation_batch_tests;
 mod context_validation;
@@ -66,6 +68,12 @@ pub(in crate::multitask) fn local_dispatch_work_pending(cpu: usize) -> bool {
     false
 }
 
+/// Reads the effective scheduling-context owner and live donation reply from
+/// the lock-free custody ledger. Native execution deliberately returns `None`.
+pub(in crate::multitask) fn borrowed_context_charge_token(slot: usize) -> Option<(usize, u64)> {
+    donation_ledger::borrowed_context_charge_token(slot)
+}
+
 /// Enqueue the opaque post-reply token only after the scheduler catalog guard
 /// that issued it has dropped.  The target owner validates its runqueue
 /// generation without re-entering Scheduler.
@@ -102,7 +110,7 @@ use crate::user::process;
 use crate::user::process_state::{UserProcessState, WindowsThreadRuntimeState};
 
 use super::context::{SAVED_CONTEXT_BYTES, SavedContext};
-use super::current_identity::{self, TaskIdentity};
+use super::current_identity::{self, PagerChargeStamp, TaskIdentity};
 use super::process_table::{self, ProcessHandle};
 use super::run_authority;
 use super::{UserFaultDisposition, UserStackState, UserTaskBootstrap, initial_task_rflags};
@@ -133,7 +141,7 @@ pub(in crate::multitask) fn release_reply_donation(reply: u64) -> bool {
 }
 
 pub(in crate::multitask) use task_wait::{
-    arm_current_wait, cancel_current_wait, commit_current_wait,
+    arm_current_wait, cancel_current_wait, commit_current_wait, wake_current_pager_fault_wait,
 };
 
 pub(in crate::multitask) use task_directory::{
@@ -438,14 +446,6 @@ struct TaskContext {
     process_id: Option<u64>,
     user_stack: Option<UserStackState>,
     windows_thread_state: Option<WindowsThreadRuntimeState>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(in crate::multitask) enum BlockReason {
-    None,
-    Generic,
-    EndpointReceive(u64),
-    EndpointReply(u64),
 }
 
 #[derive(Clone, Copy)]
@@ -4200,27 +4200,18 @@ impl Scheduler {
         self.contexts[self.current_task_slot()]?.process_handle
     }
 
-    pub(super) fn prepare_current_task_execution(&mut self) {
-        let mut arch_marker = Self::phase_chain_start();
-        let current_slot = self.current_task_slot();
-        let current =
-            self.contexts[current_slot].expect("scheduler selected a missing task context");
-        self.assert_current_task_affinity_allows_dispatch();
-        let (task_mask, process_mask, _) = self.slot_affinity_snapshot(current_slot);
-        self.replace_slot_affinity(current_slot, task_mask, process_mask, false);
-        let return_to_user = self.context_returns_to_user(current_slot);
-        self.validate_saved_context(
-            current_slot,
-            current.user_mode,
-            self.slot_saved_rsp(current_slot),
-        )
-        .expect("scheduler selected an invalid task context");
-        self.mark_phase(SchedulerPhase::ArchValidate, &mut arch_marker);
+    fn install_current_task_architecture(
+        &mut self,
+        current_slot: usize,
+        current: TaskContext,
+        return_to_user: bool,
+        arch_marker: &mut u64,
+    ) {
         crate::memory::paging::load_address_space_phys(PhysAddr::new(
             self.slot_address_space_root(current_slot),
         ));
         let (_, kernel_stack_top) = self.slot_kernel_stack_bounds(current_slot);
-        self.mark_phase(SchedulerPhase::ArchAddressSpace, &mut arch_marker);
+        self.mark_phase(SchedulerPhase::ArchAddressSpace, arch_marker);
         if kernel_stack_top != 0 {
             assert_eq!(
                 kernel_stack_top & 0xF,
@@ -4236,27 +4227,11 @@ impl Scheduler {
             .windows_thread_state
             .map(|state| state.teb_address)
             .unwrap_or(0);
-        // Linux/x86_64 relies on FS/GS bases rather than visible segment selectors in
-        // long mode. Keep user data selectors only in the iret frame (CS/SS) and clear
-        // the other visible data selectors when returning to ring 3 so glibc sees the
-        // usual flat-user environment.
         let data_selector = if return_to_user {
             SegmentSelector(0)
         } else {
             crate::arch::gdt::kernel_data_selector()
         };
-        // Four segment loads per task switch, and consecutive user tasks want
-        // the identical null selector, so the reload wrote what was already
-        // there. A segment load is architecturally expensive even for a null
-        // selector, and the per-phase attribution measured this block as part
-        // of the largest segment of a real task switch.
-        //
-        // The registers are read rather than cached. `iretq` to a lower
-        // privilege level nulls any data selector the new CPL cannot use, so
-        // what this function last wrote is not necessarily what the CPU holds;
-        // a remembered value would be exactly as wrong as the GS-base cache
-        // that double-faulted. Four reads cost a few cycles against four
-        // writes, so the exact test is also the cheap one.
         let data_selectors_match = DS::get_reg() == data_selector
             && ES::get_reg() == data_selector
             && FS::get_reg() == data_selector
@@ -4271,7 +4246,47 @@ impl Scheduler {
         }
         FsBase::write(VirtAddr::new(fs_base));
         crate::user::syscall::prepare_for_context_return(return_to_user, user_gs_base);
-        self.mark_phase(SchedulerPhase::ArchSegments, &mut arch_marker);
+        self.mark_phase(SchedulerPhase::ArchSegments, arch_marker);
+    }
+
+    /// Refreshes the architectural user-return contract for a live exception
+    /// continuation after it resumes from a blocking scheduler handoff.
+    /// The continuation is already executing, so no catalog saved frame is
+    /// revalidated or consumed here.
+    pub(in crate::multitask) fn refresh_current_user_return_architecture(&mut self) {
+        let current_slot = self.current_task_slot();
+        let current = self.contexts[current_slot]
+            .expect("pager resume selected a missing current task context");
+        assert!(
+            current.user_mode,
+            "pager resume architecture refresh requires a user-owned kernel continuation"
+        );
+        let mut arch_marker = Self::phase_chain_start();
+        self.install_current_task_architecture(current_slot, current, true, &mut arch_marker);
+    }
+
+    pub(in crate::multitask) fn prepare_current_task_execution(&mut self) {
+        let mut arch_marker = Self::phase_chain_start();
+        let current_slot = self.current_task_slot();
+        let current =
+            self.contexts[current_slot].expect("scheduler selected a missing task context");
+        self.assert_current_task_affinity_allows_dispatch();
+        let (task_mask, process_mask, _) = self.slot_affinity_snapshot(current_slot);
+        self.replace_slot_affinity(current_slot, task_mask, process_mask, false);
+        let return_to_user = self.context_returns_to_user(current_slot);
+        self.validate_saved_context(
+            current_slot,
+            current.user_mode,
+            self.slot_saved_rsp(current_slot),
+        )
+        .expect("scheduler selected an invalid task context");
+        self.mark_phase(SchedulerPhase::ArchValidate, &mut arch_marker);
+        self.install_current_task_architecture(
+            current_slot,
+            current,
+            return_to_user,
+            &mut arch_marker,
+        );
     }
 
     /// Restore task-specific architectural state only across a real task
@@ -4420,18 +4435,30 @@ impl Scheduler {
 
     fn slot_identity(&self, slot: usize) -> Option<TaskIdentity> {
         let context = self.contexts.get(slot).copied().flatten()?;
+        let task_id = self
+            .starts
+            .get(slot)
+            .copied()
+            .flatten()
+            .map(|start| start.id);
+        let pager_charge = context.scheduling_context.policy().map(|policy| {
+            let identity = context.scheduling_context.identity();
+            PagerChargeStamp {
+                context_slot: identity.slot(),
+                context_generation: identity.generation(),
+                scheduling_domain: policy.domain,
+                policy_epoch: policy.policy_epoch,
+                period_ns: policy.period_ns,
+            }
+        });
         Some(TaskIdentity {
-            task_id: self
-                .starts
-                .get(slot)
-                .copied()
-                .flatten()
-                .map(|start| start.id),
+            task_id,
             user_mode: context.user_mode,
             abi: context.user_abi,
             process_handle: context.process_handle,
             process_id: context.process_id,
             console_session: context.console_session,
+            pager_charge,
         })
     }
 

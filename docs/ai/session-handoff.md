@@ -10,13 +10,80 @@ and `performance-hardening.md`; the measurement record lives in
 
 ## Current checkout snapshot
 
-Recorded 2026-08-29. **This block is the only current-state section.** The
-working tree is clean at `85c8a0b1` (pagerd extracted into its own service;
-two verification gaps this exposed — the zero-trust ingress discovery regex
-and a missing trust-boundaries.tsv row — fixed at the root rather than
-special-cased). `formal/selftest.sh` passes. `cargo xtask kvm-smoke
---gui-dvm-surfaces --min-ui-fps 60` passed with sustained 60,000–66,920
-`frame_hz_milli` across multiple windows, measured this session.
+Recorded 2026-08-31. **This block is the only current-state section.**
+
+**Phase 7 (anonymous demand paging) is cut over and running.**
+`PAGER_DEMAND_ADMISSION_WIRED` is `true` in `mm_broker_ops.rs`: anonymous
+`mmap` publishes a kernel-stamped pager VMA, admits it into pagerd, and first
+touch resolves through the ring0 fault path. A 1-vCPU boot resolves roughly
+900 demand faults across 106 backing admissions with no panic, lockdep,
+corruption, or `RunnableButUnqueued`.
+
+### The defect that had capped this at 64 faults
+
+pagerd's `consume()` appended every resolved token to a fixed
+`consumed_tokens` list and never reclaimed an entry. Once 64 entries filled,
+`get_mut(consumed_len)` returned `None`, so **every subsequent fault failed
+with `Pressure`** and its task never resumed. Earlier sessions read the same
+"exactly 64 completions then silence" as frame exhaustion, an allocator
+lock-holder delay, and a userspace startup-ordering stop; it was none of
+those. Symptom at the surface was ld.so reporting
+`libc.so.6: cannot map zero-fill pages`.
+
+The fix replaces that list with exact per-slot replay state. Fault tokens are
+`(generation << PAGER_FAULT_TOKEN_SLOT_BITS) | slot` with a strictly
+increasing per-slot generation, so pagerd keeps
+`accepted_generations[PAGER_MAX_FAULT_SLOTS]` and rejects any token whose
+generation is not newer than the one recorded for its slot. That is exact
+one-shot semantics in fixed memory, with no ceiling on total faults. The token
+shape was promoted out of `kernel/ps/src/multitask/pager_fault.rs` into
+`libs/rustos-user-abi/src/pager.rs` (`pager_fault_token_slot`,
+`pager_fault_token_generation`) so ring0 and pagerd read one definition rather
+than pagerd reverse-engineering a kernel-private encoding.
+
+### Known limitation: 8 vCPU is intermittent
+
+1, 2, and 4 vCPU boots pass repeatedly. 8 vCPU is **marginal**: at `--timeout
+30` it failed 3 of 4 runs, and at `--timeout 90` it passed 1 of 2, always with
+the same single missing marker `smp-cpu-first-user-dispatch arg0=0x1` - CPU 1
+does not receive user work in time. No panic, lockdep, corruption, or stale
+marker appears in any failing run, and every service reaches readiness. The
+likely owner is early user work serialising through the single pagerd fault
+endpoint and its housekeeping dispatch turn, which is the throughput question
+the pager phase was always going to raise. **Do not treat 8-vCPU as a passing
+product gate.** Measure it before widening the envelope, and prefer a
+structural answer (fault batching, or a second dispatch turn per housekeeping
+pass) over raising timeouts.
+
+### Fresh evidence for this change set
+
+`cargo xtask check`, `cargo xtask build`, and `cargo xtask verify-dvm` pass.
+`bash formal/verify-all.sh --profile pr` **sealed**: 44 artifacts, every lane
+green, including implementation-mutations at 612 mutants with none surviving.
+`formal/check-rust-source-contracts.py` passes at 489 Rust files and 107
+critical/high surfaces. Unit tests: kernel-compat 160, kernel-ps 262,
+kernel-mm 41, kernel-hal 66, kernel-executive 6, kernel-ipc-runtime 61,
+pagerd 18, rustos-user-abi 42. KVM smoke passes at 1, 2, and 4 vCPU; 8 vCPU as
+qualified above. `cargo fmt --all --check` is clean except three files with
+pre-existing committed drift (nucleus lockdep preemption, two xtask files).
+
+### Contract and registry work landed with the behaviour
+
+- `formal/trust-boundaries.tsv`: the `pager-fault-policy` identity evidence is
+  `request_sender_is_authorized`, which asserts the ring0 `(0, 0)` receive-side
+  identity for `FAULT_RESOLVE` and keeps exact nonzero subject authentication
+  for every user-originated op. Reaching pagerd's endpoint already requires
+  `IPC_SERVICE_CAP_ROOT_SUPERVISOR`.
+- Ordering and unsafe debt for the new pager code is documented rather than
+  registered: `pager_fault.rs` 14 -> 0, `frame_capability.rs` 3 -> 0, and the
+  new `irq.rs` unsafe block carries its `SAFETY:` note.
+- `formal/rust-large-files.tsv` records the growth this change set caused and
+  adds split plans for `ipc/tests.rs` and `current.rs`.
+- `pager-fault-slot-claim-before-block` survived because its witness tested
+  `claim_reply` while the mutant targets `take_next_dispatchable`. The new
+  `dispatch_never_takes_a_slot_before_its_task_has_blocked` kills it, and the
+  registry now names it. `pager-vma-publication-identity-bypass` was pinned to
+  occurrence `1/2` (the `lookup` site its witness actually exercises).
 
 ## Known open items
 
@@ -66,6 +133,14 @@ the last investigation without re-verification, and flagged as such.
   windows with no failure. If it recurs, check the receive-side segment
   reassembly next, per the last session's notes, before re-deriving from
   scratch.
+- **Intermittent uiserver startup reply timeout.** Two restored-control bench
+  boots in this session missed the 30-second readiness gate; the first relevant
+  guest event was `ipc-service-reply-timeout` during Wayland initialization,
+  followed by `uiserver: exiting with nonzero status errno=5`. Two candidate
+  runs, the diagnostic run, and the 4-vCPU run then passed without a source
+  change to that path, so this is not attributed to the lock-budget change. If
+  it recurs, preserve the first timeout envelope and trace its exact service
+  operation before proposing a fix.
 
 ## Resume sequence
 

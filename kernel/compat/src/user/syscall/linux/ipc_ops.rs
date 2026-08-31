@@ -2974,7 +2974,12 @@ pub(super) fn call_service_endpoint_with_received_entries_until(
     Ok((response, entries))
 }
 
-fn enqueue_call_and_wake(
+/// Publishes one synchronous call from the current task and wakes the parked
+/// receiver, reserving the scheduling-context custody every reply completion
+/// requires. Kernel-originated callers (the pager dispatch worker) must use
+/// this rather than a bare `enqueue_call`, which publishes no custody and
+/// panics the reply path.
+pub(crate) fn enqueue_call_and_wake(
     endpoint: KernelEndpointHandle,
     request: &[u8],
 ) -> Result<KernelReplyHandle, i64> {
@@ -2987,6 +2992,15 @@ fn enqueue_call_and_wake_with_handles(
     attached_handles: &[KernelTransferredHandle],
 ) -> Result<KernelReplyHandle, i64> {
     let task_id = multitask::current_task_id().ok_or(LINUX_EINVAL)?;
+    enqueue_call_and_wake_with_handles_for_task(endpoint, task_id, request, attached_handles)
+}
+
+fn enqueue_call_and_wake_with_handles_for_task(
+    endpoint: KernelEndpointHandle,
+    task_id: u64,
+    request: &[u8],
+    attached_handles: &[KernelTransferredHandle],
+) -> Result<KernelReplyHandle, i64> {
     // Queue priority and temporal authority are scheduler-derived, never
     // request bytes controlled by ring3. The bounded reservation precedes IPC
     // publication and carries both optional System urgency and mandatory

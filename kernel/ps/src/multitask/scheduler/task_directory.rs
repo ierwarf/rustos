@@ -164,6 +164,7 @@ mod tests {
                 process_handle: None,
                 process_id: Some(0x901),
                 console_session: crate::io::session::ConsoleSessionHandle::SYSTEM,
+                pager_charge: None,
             },
         );
         record(resident, slot);

@@ -43,8 +43,15 @@ pub struct HeartbeatSnapshot {
 pub type RetireCurrentUserTaskDueToFaultHook =
     fn(u8, Option<u64>, u64, u64, u64) -> UserFaultDisposition;
 
+/// Attempts the sole pageable user-fault admission path before generic fault
+/// retirement. The hook receives only the hardware page-fault record; it must
+/// fail closed with `Unhandled` when no exact, allocation-free pager custody
+/// can be established.
+pub type TryHandleCurrentUserPageFaultHook = fn(Option<u64>, u64, u64, u64) -> UserFaultDisposition;
+
 #[derive(Clone, Copy, Default)]
 pub struct TaskHooks {
+    pub try_handle_current_user_page_fault: Option<TryHandleCurrentUserPageFaultHook>,
     pub retire_current_user_task_due_to_fault: Option<RetireCurrentUserTaskDueToFaultHook>,
     pub halt_current_retired_task: Option<fn() -> !>,
     pub current_user_snapshot: Option<fn() -> Option<CurrentUserSnapshot>>,
@@ -76,6 +83,7 @@ struct HookRegistry {
 
 static HOOKS: RwLock<HookRegistry> = RwLock::new(HookRegistry {
     task: TaskHooks {
+        try_handle_current_user_page_fault: None,
         retire_current_user_task_due_to_fault: None,
         halt_current_retired_task: None,
         current_user_snapshot: None,
@@ -115,6 +123,20 @@ fn interrupt_hooks() -> InterruptHooks {
 
 fn heartbeat_hooks() -> HeartbeatHooks {
     HOOKS.read().heartbeat
+}
+
+/// Invokes the bounded, pageable user-fault admission hook without retaining
+/// the hook registry lock across the callback.
+pub fn try_handle_current_user_page_fault(
+    error_code: Option<u64>,
+    cr2: u64,
+    rip: u64,
+    rsp: u64,
+) -> UserFaultDisposition {
+    task_hooks()
+        .try_handle_current_user_page_fault
+        .map(|hook| hook(error_code, cr2, rip, rsp))
+        .unwrap_or(UserFaultDisposition::Unhandled)
 }
 
 pub fn retire_current_user_task_due_to_fault(
@@ -210,6 +232,37 @@ mod tests {
     fn inspect_registry_from_commit_callback() -> Option<bool> {
         CALLBACK_OBSERVED_UNLOCKED_REGISTRY.store(HOOKS.try_write().is_some(), Ordering::SeqCst);
         Some(false)
+    }
+
+    fn resume_page_fault_callback(
+        _error_code: Option<u64>,
+        _cr2: u64,
+        _rip: u64,
+        _rsp: u64,
+    ) -> UserFaultDisposition {
+        UserFaultDisposition::Resumed
+    }
+
+    #[test]
+    fn page_fault_hook_is_optional_and_its_disposition_is_preserved() {
+        assert_eq!(
+            try_handle_current_user_page_fault(Some(0), 0x4000, 0x5000, 0x6000),
+            UserFaultDisposition::Unhandled
+        );
+
+        let saved = {
+            let mut registry = HOOKS.write();
+            let saved = registry.task;
+            registry.task.try_handle_current_user_page_fault = Some(resume_page_fault_callback);
+            saved
+        };
+
+        assert_eq!(
+            try_handle_current_user_page_fault(Some(2), 0x7000, 0x8000, 0x9000),
+            UserFaultDisposition::Resumed
+        );
+
+        HOOKS.write().task = saved;
     }
 
     #[test]

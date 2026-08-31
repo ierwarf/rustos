@@ -19,7 +19,8 @@ use x86_64::{VirtAddr, instructions::interrupts};
 mod ipc;
 
 pub use ipc::{
-    arm_block_current_task, arm_block_current_task_on_endpoint, arm_block_current_task_on_reply,
+    arm_block_current_task, arm_block_current_task_on_endpoint,
+    arm_block_current_task_on_pager_fault, arm_block_current_task_on_reply,
     attach_reserved_ipc_priority, bind_ipc_priority_to_process_worker, bind_reserved_ipc_priority,
     cancel_block_current_task, cancel_ipc_priority_reservation,
     complete_fast_ipc_reply_wake_handoff_with_custody, complete_ipc_reply_wake_handoff,
@@ -152,6 +153,163 @@ pub fn current_task_id() -> Option<u64> {
 /// fall back to the locked scheduler query.
 fn published_current_identity() -> Option<super::current_identity::TaskIdentity> {
     super::current_identity::read(cpu_local::current_cpu_task_slot()?)
+}
+
+fn published_current_pager_binding() -> Option<(
+    u64,
+    process_table::ProcessHandle,
+    process_table::ProcessIdentity,
+)> {
+    let identity = published_current_identity()?;
+    let (task_id, _, handle, _) = identity.user_binding()?;
+    let process = process_table::published_live_process_identity(handle)?;
+    Some((task_id, handle, process))
+}
+
+/// Lock-free authority used to bill one pager fault to the exact native or
+/// IPC-donated scheduling context that was executing at exception entry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PagerChargeSnapshot {
+    pub context_slot: u64,
+    pub context_generation: u64,
+    pub scheduling_domain: u64,
+    pub policy_epoch: u64,
+    pub period_ns: u64,
+    pub charge_token: u64,
+}
+
+/// Resolve pager billing without acquiring the scheduler lock.
+///
+/// The donation ledger publishes the effective owner and live reply token. The
+/// selected owner's immutable policy stamp is then read through its seqlock
+/// record. A native task uses its globally unique context generation as the
+/// nonzero charge token; a passive server uses the live donation reply.
+pub fn current_pager_charge_snapshot() -> Option<PagerChargeSnapshot> {
+    interrupts::without_interrupts(|| {
+        let current_slot = cpu_local::current_cpu_task_slot()?;
+        let (owner_slot, donated_reply) =
+            super::scheduler::borrowed_context_charge_token(current_slot)
+                .unwrap_or((current_slot, 0));
+        let stamp = super::current_identity::read(owner_slot)?.pager_charge?;
+        let expected_context_slot = u64::try_from(owner_slot).ok()?.checked_add(1)?;
+        if stamp.context_slot != expected_context_slot
+            || stamp.context_generation == 0
+            || stamp.scheduling_domain == 0
+            || stamp.policy_epoch == 0
+            || stamp.period_ns == 0
+        {
+            return None;
+        }
+        Some(PagerChargeSnapshot {
+            context_slot: stamp.context_slot,
+            context_generation: stamp.context_generation,
+            scheduling_domain: stamp.scheduling_domain,
+            policy_epoch: stamp.policy_epoch,
+            period_ns: stamp.period_ns,
+            charge_token: if donated_reply != 0 {
+                donated_reply
+            } else {
+                stamp.context_generation
+            },
+        })
+    })
+}
+
+/// Stamp and publish a pager region for the current exact process/MM epoch.
+///
+/// The input is an unbound template: all process and VMA generation fields
+/// must be zero. Kernel-ps supplies them from lock-free current/process
+/// publications, so neither syscalld nor pagerd can forge process authority.
+pub fn publish_current_pager_vma(
+    template: rustos_user_abi::pager::PagerVmRegionWire,
+) -> Result<rustos_user_abi::pager::PagerVmRegionWire, super::pager_vma::PagerVmaError> {
+    let process_id = current_user_process_id().ok_or(super::pager_vma::PagerVmaError::Stale)?;
+    // VMA publication is normal-time policy work: it must prepare all
+    // intermediate page-table leaves before the all-atomic fault snapshot can
+    // authorize exception entry.  Reuse the target-process transaction so the
+    // current and non-current paths cannot diverge on that prerequisite.
+    publish_pager_vma_for_process(process_id, template)
+}
+
+/// Stamp and publish a pager VMA for one retained non-current process.
+///
+/// MM brokers invoke this before a pageable mapping becomes observable. The
+/// retain pins the exact table slot while `live_identity` supplies the current
+/// process/MM generations; therefore a recycled PID or an exec/exit boundary
+/// cannot publish authority for another address space. This is normal
+/// syscall-time work: exception entry consumes only the all-atomic VMA
+/// snapshot and never performs this lookup or takes this lock.
+pub fn publish_pager_vma_for_process(
+    process_id: u64,
+    template: rustos_user_abi::pager::PagerVmRegionWire,
+) -> Result<rustos_user_abi::pager::PagerVmRegionWire, super::pager_vma::PagerVmaError> {
+    let retained = process_table::retain_process_by_pid(process_id)
+        .ok_or(super::pager_vma::PagerVmaError::Stale)?;
+    let page_count = usize::try_from(
+        (template.end.saturating_sub(template.start)) / rustos_user_abi::pager::PAGER_PAGE_BYTES,
+    )
+    .map_err(|_| super::pager_vma::PagerVmaError::Pressure)?;
+    retained
+        .with_state_mut(|_, state| {
+            state
+                .address_space_mut()
+                .prepare_pager_fault_pages_at(VirtAddr::new(template.start), page_count)
+        })
+        .map_err(|_| super::pager_vma::PagerVmaError::Pressure)?;
+    let identity = retained
+        .live_identity()
+        .ok_or(super::pager_vma::PagerVmaError::Stale)?;
+    super::pager_vma::publish(retained.handle(), identity, template)
+}
+
+/// Resolve one current-task fault without the scheduler or process-state lock.
+///
+/// Exception entry already masks interrupts; masking here also makes direct
+/// diagnostic/test callers obey the same current-slot stability contract.
+pub fn current_pager_vma_snapshot(
+    address: u64,
+    access: u16,
+) -> Result<super::pager_vma::PagerVmaSnapshot, super::pager_vma::PagerVmaError> {
+    interrupts::without_interrupts(|| {
+        let (task_id, handle, process) =
+            published_current_pager_binding().ok_or(super::pager_vma::PagerVmaError::Stale)?;
+        let region = super::pager_vma::lookup(handle, process, address, access)?;
+        Ok(super::pager_vma::PagerVmaSnapshot {
+            task_id,
+            process_id: process.process_id(),
+            region,
+        })
+    })
+}
+
+/// Revoke the exact current-process VMA generation before removing PTEs.
+pub fn revoke_current_pager_vma(
+    start: u64,
+    vma_generation: u64,
+) -> Result<rustos_user_abi::pager::PagerVmRegionWire, super::pager_vma::PagerVmaError> {
+    interrupts::without_interrupts(|| {
+        let (_, handle, process) =
+            published_current_pager_binding().ok_or(super::pager_vma::PagerVmaError::Stale)?;
+        super::pager_vma::revoke(handle, process, start, vma_generation)
+    })
+}
+
+/// Withdraw one exact non-current pager VMA before its PTEs are removed.
+///
+/// This is the paired normal-context operation for
+/// `publish_pager_vma_for_process`; stale PID, process/MM generation, start,
+/// or VMA generation values fail closed before the publication is cleared.
+pub fn revoke_pager_vma_for_process(
+    process_id: u64,
+    start: u64,
+    vma_generation: u64,
+) -> Result<rustos_user_abi::pager::PagerVmRegionWire, super::pager_vma::PagerVmaError> {
+    let retained = process_table::retain_process_by_pid(process_id)
+        .ok_or(super::pager_vma::PagerVmaError::Stale)?;
+    let identity = retained
+        .live_identity()
+        .ok_or(super::pager_vma::PagerVmaError::Stale)?;
+    super::pager_vma::revoke(retained.handle(), identity, start, vma_generation)
 }
 
 pub fn linux_task_affinity(

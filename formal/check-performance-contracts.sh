@@ -807,6 +807,50 @@ if ! grep -Fq '#[cfg(rustos_lock_phase_profile)]' <<<"$runtime_profile_drain_bod
     exit 1
 fi
 
+# Shipping lock-cost ceilings remain executable, but a class with no live
+# budget must not pay the diagnostic census write on every acquisition. The
+# const-generic entry lets LLVM erase the counter path for every unregistered
+# class; profile builds still charge all classes, and `declare` rejects a
+# shipping budget whose class was not explicitly registered.
+for witness in \
+    'const SHIPPING_BUDGET_CLASS_MASK: u64 = 1_u64 << (LockClass::ProcessState as u8);' \
+    'pub(crate) fn charge_acquire_for_class<const CLASS: u8>(cpu: usize)' \
+    '#[cfg(rustos_lock_phase_profile)]' \
+    'if is_shipping_budget_class(CLASS)' \
+    'activate_budget(cpu, class_index);' \
+    'deactivate_budget(self.active_cpu, self.class_index);' \
+    'lock budget class is not registered for shipping counters' ; do
+    rg -Fq "$witness" kernel/nucleus-core/src/util/lockdep/work_budget.rs || {
+        echo "shipping lock-budget gate witness missing: $witness" >&2
+        exit 1
+    }
+done
+rg -Fq 'work_budget::charge_acquire_for_class::<CLASS>(acquire_cpu);' \
+    kernel/nucleus-core/src/util/lockdep.rs || {
+    echo 'const-generic tracked-lock acquisition no longer routes through the shipping budget gate' >&2
+    exit 1
+}
+
+# Detailed reply polling needs the endpoint-message lock before the reply lock.
+# The published message id is only a lock-order hint: insertion publishes it,
+# while the nested reply-slot access remains the authority for both generation
+# and message-id validity. The exact host counter pins pending polls to one
+# reply-slot acquisition instead of the former preliminary lookup plus check.
+for witness in \
+    'static REPLY_MESSAGE_IDS: [AtomicU64; MAX_REPLY_OBJECTS]' \
+    'fn insert_reply_object(reply_object: ReplyObject)' \
+    'REPLY_MESSAGE_IDS[index].store(message_id, Ordering::Release);' \
+    'published_reply_message_id(reply.raw()).ok_or(IpcError::InvalidHandle)?' \
+    'if reply_object.message_id != message_id || reply_object.consumed {' \
+    'fn pending_detailed_response_takes_one_reply_lock()' ; do
+    rg -Fq "$witness" kernel/ipc-runtime/src/ipc/mod.rs \
+        kernel/ipc-runtime/src/ipc/reply_publication.rs \
+        kernel/ipc-runtime/src/ipc/tests/reply_publication_tests.rs || {
+        echo "published reply message-id performance witness missing: $witness" >&2
+        exit 1
+    }
+done
+
 # A running thread already pins its own process object, so the hot path takes
 # no reference count: a retain plus its release are two acquisitions of the one
 # global process table, and the census measured roughly ten per synchronous

@@ -34,11 +34,24 @@ const FLAG_TASK_ID: u32 = 1 << 1;
 const FLAG_USER_MODE: u32 = 1 << 2;
 const FLAG_PROCESS: u32 = 1 << 3;
 const FLAG_PROCESS_ID: u32 = 1 << 4;
-const ABI_SHIFT: u32 = 5;
+const FLAG_PAGER_CHARGE: u32 = 1 << 5;
+const ABI_SHIFT: u32 = 6;
 const ABI_MASK: u32 = 0b11 << ABI_SHIFT;
 const ABI_NONE: u32 = 0;
 const ABI_LINUX: u32 = 1;
 const ABI_WINDOWS: u32 = 2;
+
+/// Immutable scheduling authority copied into the slot publication record.
+/// A faulting task resolves IPC donation first, then reads the selected owner's
+/// stamp without taking the scheduler lock.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct PagerChargeStamp {
+    pub(super) context_slot: u64,
+    pub(super) context_generation: u64,
+    pub(super) scheduling_domain: u64,
+    pub(super) policy_epoch: u64,
+    pub(super) period_ns: u64,
+}
 
 /// The identity fields a running task can be asked for without the scheduler
 /// lock. Everything here is bound when the slot is installed and changes only
@@ -53,6 +66,7 @@ pub(super) struct TaskIdentity {
     /// only; the scheduler's slot/current-owner state remains authoritative.
     pub(super) process_id: Option<u64>,
     pub(super) console_session: ConsoleSessionHandle,
+    pub(super) pager_charge: Option<PagerChargeStamp>,
 }
 
 impl TaskIdentity {
@@ -95,6 +109,11 @@ struct PublishedIdentity {
     /// Meaningful only under `FLAG_PROCESS_ID`.
     process_id: AtomicU64,
     console: AtomicU64,
+    pager_context_slot: AtomicU64,
+    pager_context_generation: AtomicU64,
+    pager_scheduling_domain: AtomicU64,
+    pager_policy_epoch: AtomicU64,
+    pager_period_ns: AtomicU64,
     flags: AtomicU32,
 }
 
@@ -106,6 +125,11 @@ impl PublishedIdentity {
             process: AtomicU64::new(0),
             process_id: AtomicU64::new(0),
             console: AtomicU64::new(0),
+            pager_context_slot: AtomicU64::new(0),
+            pager_context_generation: AtomicU64::new(0),
+            pager_scheduling_domain: AtomicU64::new(0),
+            pager_policy_epoch: AtomicU64::new(0),
+            pager_period_ns: AtomicU64::new(0),
             flags: AtomicU32::new(0),
         }
     }
@@ -220,6 +244,9 @@ pub(super) fn publish(slot: usize, identity: TaskIdentity) {
     if identity.process_id.is_some() {
         flags |= FLAG_PROCESS_ID;
     }
+    if identity.pager_charge.is_some() {
+        flags |= FLAG_PAGER_CHARGE;
+    }
 
     // ORDERING: the odd version must be visible before any field changes, or a
     // reader could load a half-updated record and still see a stable version.
@@ -233,6 +260,17 @@ pub(super) fn publish(slot: usize, identity: TaskIdentity) {
         .store(identity.process_id.unwrap_or(0), Ordering::Relaxed);
     cell.console
         .store(identity.console_session.raw(), Ordering::Relaxed);
+    let pager_charge = identity.pager_charge.unwrap_or_default();
+    cell.pager_context_slot
+        .store(pager_charge.context_slot, Ordering::Relaxed);
+    cell.pager_context_generation
+        .store(pager_charge.context_generation, Ordering::Relaxed);
+    cell.pager_scheduling_domain
+        .store(pager_charge.scheduling_domain, Ordering::Relaxed);
+    cell.pager_policy_epoch
+        .store(pager_charge.policy_epoch, Ordering::Relaxed);
+    cell.pager_period_ns
+        .store(pager_charge.period_ns, Ordering::Relaxed);
     cell.flags.store(flags, Ordering::Relaxed);
     // ORDERING: Release publishes every field store above to any reader that
     // observes this even version.
@@ -261,6 +299,11 @@ pub(super) fn clear(slot: usize) {
     cell.process.store(0, Ordering::Relaxed);
     cell.process_id.store(0, Ordering::Relaxed);
     cell.console.store(0, Ordering::Relaxed);
+    cell.pager_context_slot.store(0, Ordering::Relaxed);
+    cell.pager_context_generation.store(0, Ordering::Relaxed);
+    cell.pager_scheduling_domain.store(0, Ordering::Relaxed);
+    cell.pager_policy_epoch.store(0, Ordering::Relaxed);
+    cell.pager_period_ns.store(0, Ordering::Relaxed);
     cell.flags.store(0, Ordering::Relaxed);
     cell.version
         .store(version.wrapping_add(2), Ordering::Release);
@@ -281,6 +324,11 @@ pub(super) fn read(slot: usize) -> Option<TaskIdentity> {
     let process = cell.process.load(Ordering::Relaxed);
     let process_id = cell.process_id.load(Ordering::Relaxed);
     let console = cell.console.load(Ordering::Relaxed);
+    let pager_context_slot = cell.pager_context_slot.load(Ordering::Relaxed);
+    let pager_context_generation = cell.pager_context_generation.load(Ordering::Relaxed);
+    let pager_scheduling_domain = cell.pager_scheduling_domain.load(Ordering::Relaxed);
+    let pager_policy_epoch = cell.pager_policy_epoch.load(Ordering::Relaxed);
+    let pager_period_ns = cell.pager_period_ns.load(Ordering::Relaxed);
     // ORDERING: this fence keeps the field loads above from being reordered
     // after the version re-read that validates them.
     fence(Ordering::Acquire);
@@ -294,6 +342,13 @@ pub(super) fn read(slot: usize) -> Option<TaskIdentity> {
         process_handle: decode_process(process, flags),
         process_id: (flags & FLAG_PROCESS_ID != 0).then_some(process_id),
         console_session: ConsoleSessionHandle::from_raw(console),
+        pager_charge: (flags & FLAG_PAGER_CHARGE != 0).then_some(PagerChargeStamp {
+            context_slot: pager_context_slot,
+            context_generation: pager_context_generation,
+            scheduling_domain: pager_scheduling_domain,
+            policy_epoch: pager_policy_epoch,
+            period_ns: pager_period_ns,
+        }),
     })
 }
 
@@ -325,6 +380,13 @@ mod tests {
             process_handle: Some(ProcessHandle::new(7, 9)),
             process_id: Some(23),
             console_session: ConsoleSessionHandle::from_raw(5),
+            pager_charge: Some(PagerChargeStamp {
+                context_slot: 4,
+                context_generation: 42,
+                scheduling_domain: 43,
+                policy_epoch: 47,
+                period_ns: 53,
+            }),
         };
         publish(slot, identity);
         assert_eq!(read(slot), Some(identity));
@@ -360,6 +422,7 @@ mod tests {
                 process_handle: None,
                 process_id: None,
                 console_session: ConsoleSessionHandle::SYSTEM,
+                pager_charge: None,
             },
         );
         let published = read(slot).expect("published identity");
@@ -384,6 +447,7 @@ mod tests {
             process_handle: Some(ProcessHandle::new(2, 4)),
             process_id: None,
             console_session: ConsoleSessionHandle::from_raw(7),
+            pager_charge: None,
         };
         publish(slot, incomplete);
         assert_eq!(

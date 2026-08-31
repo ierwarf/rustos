@@ -54,7 +54,10 @@ const OWNER_CPU_SHIFT: u64 = OWNER_STATE_BITS;
 /// queue or get published blocked?" has no answer in the owner word — which is
 const OWNER_RUNNABLE_SHIFT: u64 = OWNER_STATE_BITS + OWNER_CPU_BITS;
 const OWNER_RUNNABLE_BIT: u64 = 1 << OWNER_RUNNABLE_SHIFT;
-const OWNER_WAIT_REASON_BITS: u64 = 2;
+// Four typed waits already consume the old two-bit range. Keep the fault-slot
+// identity distinct from endpoint/reply waits instead of overloading a reply
+// handle into exception state.
+const OWNER_WAIT_REASON_BITS: u64 = 3;
 const OWNER_WAIT_REASON_SHIFT: u64 = OWNER_RUNNABLE_SHIFT + 1;
 const OWNER_WAIT_REASON_MASK: u64 = ((1 << OWNER_WAIT_REASON_BITS) - 1) << OWNER_WAIT_REASON_SHIFT;
 const OWNER_WAIT_ARMED_SHIFT: u64 = OWNER_WAIT_REASON_SHIFT + OWNER_WAIT_REASON_BITS;

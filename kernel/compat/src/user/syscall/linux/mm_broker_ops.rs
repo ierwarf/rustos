@@ -15,6 +15,8 @@
 //! - **Evidence:** `memory-map`.
 use super::*;
 
+mod pager_admission;
+
 use alloc::vec;
 use alloc::vec::Vec;
 use x86_64::VirtAddr;
@@ -140,6 +142,30 @@ fn broker_map_anon(args: &RustosMmBrokerArgs) -> Result<(), i64> {
     let page_count = page_count(len)?;
     let mapping_end = checked_mapping_end(start, page_count)?;
     let page_flags = protection_to_page_flags(args.prot)?;
+
+    // Anonymous mappings are admitted to pagerd before publication. Fault
+    // dispatch is kernel-originated and pagerd positively authenticates the
+    // receive-side `(0, 0)` ring0 identity for FAULT_RESOLVE; user-originated
+    // BACKING_OBJECT requests retain exact nonzero subject authentication.
+    const PAGER_DEMAND_ADMISSION_WIRED: bool = true;
+    if PAGER_DEMAND_ADMISSION_WIRED
+        && args.prot != 0
+        && pager_admission::admit_anonymous_region(args.target_pid, start, mapping_end, args.prot)
+            .is_ok()
+    {
+        let Some(result) =
+            multitask::with_process_state_by_pid_mut(args.target_pid, |process_state| {
+                process_state.set_mapping_cursor(mapping_end);
+                RustosMmMapBrokerResult {
+                    addr: start,
+                    len: args.len,
+                }
+            })
+        else {
+            return Err(LINUX_ESRCH);
+        };
+        return write_out(args, &result);
+    }
 
     let Some(result) = multitask::with_process_state_by_pid_mut(args.target_pid, |process_state| {
         if args.prot == 0 {
@@ -338,7 +364,26 @@ fn broker_map_device_shared(args: &RustosMmBrokerArgs) -> Result<(), i64> {
 fn broker_protect(args: &RustosMmBrokerArgs) -> Result<(), i64> {
     let len = checked_len(args.len)?;
     let start = checked_page_addr(args.addr)?;
+    let page_count = page_count(len)?;
+    let end = checked_mapping_end(start, page_count)?;
     let page_flags = protection_to_page_flags(args.prot)?;
+    let pager_prot = pager_admission::pager_protection(args.prot).ok_or(LINUX_EINVAL)?;
+
+    match multitask::protect_pager_vma_for_process(
+        args.target_pid,
+        start,
+        end,
+        pager_prot,
+        page_flags,
+    ) {
+        Ok(true) => return Ok(()),
+        Ok(false) => {}
+        Err(multitask::PagerVmaError::Denied) => return Err(LINUX_EACCES),
+        Err(multitask::PagerVmaError::Pressure) => return Err(LINUX_ENOMEM),
+        Err(multitask::PagerVmaError::Malformed) => return Err(LINUX_EINVAL),
+        Err(_) => return Err(LINUX_EFAULT),
+    }
+
     let Some(result) = multitask::with_process_state_by_pid_mut(args.target_pid, |process_state| {
         process_state
             .address_space_mut()
@@ -354,6 +399,14 @@ fn broker_unmap(args: &RustosMmBrokerArgs) -> Result<(), i64> {
     let len = checked_len(args.len)?;
     let start = checked_page_addr(args.addr)?;
     let end = start.checked_add(args.len).ok_or(LINUX_EINVAL)?;
+    let pager_end = checked_mapping_end(start, page_count(len)?)?;
+    match multitask::unmap_pager_vma_for_process(args.target_pid, start, pager_end) {
+        Ok(true) => return Ok(()),
+        Ok(false) => {}
+        Err(multitask::PagerVmaError::Pressure) => return Err(LINUX_ENOMEM),
+        Err(multitask::PagerVmaError::Malformed) => return Err(LINUX_EINVAL),
+        Err(_) => return Err(LINUX_EFAULT),
+    }
     let Some(result) = multitask::with_process_state_by_pid_mut(args.target_pid, |process_state| {
         let mut external_segments = Vec::new();
         external_segments.extend(
