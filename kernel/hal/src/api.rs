@@ -104,6 +104,16 @@ pub mod cpu {
         crate::arch::acpi::cpu_topology()
     }
 
+    /// Number of admitted CPUs, or `0` while the topology is not yet published.
+    ///
+    /// `0` means *not known yet*, not *no CPUs*: the registry stays unpublished
+    /// until `init_acpi` stages the discovered topology, and every caller that
+    /// runs before that point sees zero. Treat it as an error, the way the SMP
+    /// bring-up and scheduler admission do
+    /// (`assert!((1..=MAX).contains(&count))`). A bare comparison such as
+    /// `discovered_count() > 1` silently reads the unpublished state as
+    /// "uniprocessor" and skips whatever it guards - which is exactly how the
+    /// AP trampoline range went unreserved on every boot.
     pub fn discovered_count() -> usize {
         crate::arch::smp::cpu_count()
     }

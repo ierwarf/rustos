@@ -159,12 +159,33 @@ pub unsafe fn initialize_kernel(boot_info_ptr: *const BootInfo) {
         boot_info.framebuffer.bytes_per_pixel,
     );
     mm_api::boot::init_phys(boot_info_ptr);
-    if hal_api::cpu::discovered_count() > 1 {
-        mm_api::phys::claim_fixed_range(
-            nucleus_core::ap_trampoline::TRAMPOLINE_PHYS,
-            nucleus_core::ap_trampoline::RESERVED_BYTES,
-        )
-        .expect("AP trampoline low-memory range is unavailable or already owned");
+    // Reserve the AP startup pages before anything can allocate, and without
+    // consulting the CPU count.
+    //
+    // This used to be guarded by `discovered_count() > 1`, but the topology
+    // registry is not published until `init_acpi` below, and `cpu_count()`
+    // reports 0 until then - so the guard was always false and the range was
+    // never claimed on any boot. Physical 0x8000..0xA000 therefore stayed in
+    // the free set while `ap_trampoline::install` wrote the trampoline into
+    // it, and `ap_trampoline::seal` later made both pages read-only in the
+    // direct map. Whichever allocation next received one of those frames
+    // panicked the kernel on its first write: an `Unhandled exception:
+    // vector = 14, error code = Some(3)` inside `memcpy`, with `cr2` always
+    // inside 0xffff_8000_0000_8000..0xA000. It was intermittent because it
+    // needed the allocator to hand out exactly those two frames.
+    //
+    // The reservation is unconditional because the range is fixed low memory
+    // that only SMP startup may own; costing 8 KiB on a uniprocessor boot is
+    // cheaper than an ordering hazard. `OutsideUsableMemory` is the one benign
+    // outcome - firmware already withheld the range, so it was never
+    // allocatable - while an `AlreadyOwned` range means something took the
+    // trampoline before SMP could, which must fail loudly.
+    match mm_api::phys::claim_fixed_range(
+        nucleus_core::ap_trampoline::TRAMPOLINE_PHYS,
+        nucleus_core::ap_trampoline::RESERVED_BYTES,
+    ) {
+        Ok(()) | Err(mm_api::phys::FixedRangeClaimError::OutsideUsableMemory) => {}
+        Err(error) => panic!("AP trampoline low-memory range is unavailable: {error:?}"),
     }
     mm_api::frame_capability::preallocate_pager_fault_frames()
         .expect("kernel-mm could not wire the bounded pager fault-frame reserve");
@@ -511,6 +532,15 @@ fn initialize_application_processors() {
     }
 
     ap_trampoline::seal();
+    // Removing write permission from a range the allocator still hands out is
+    // how a boot-time ordering slip becomes an intermittent kernel write fault
+    // in whatever code happens to receive one of these frames, minutes later
+    // and with nothing pointing back here. Prove ownership at the point the
+    // permission is removed, so the two facts cannot drift apart again.
+    assert!(
+        mm_api::phys::range_is_withheld_from_allocation(TRAMPOLINE_PHYS, RESERVED_BYTES),
+        "AP startup pages are still allocatable at seal time; retiring them R/NX          would hand a read-only frame to the next allocation"
+    );
     assert!(
         mm_api::paging::mark_direct_map_range_readonly_noexec(
             TRAMPOLINE_PHYS,

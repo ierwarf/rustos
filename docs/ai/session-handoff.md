@@ -102,6 +102,55 @@ source hash, and a stale seal fails with `formal verification run binding
 mismatch`, which reads exactly like a boot failure.
 `--smp-iteration` needs its own `formal/verify-smp-iteration.sh` seal.
 
+### Closed: the AP trampoline range was never reserved
+
+`boot.rs` claimed physical `0x8000..0xA000` - the AP trampoline and startup
+mailbox - only under `if hal_api::cpu::discovered_count() > 1`. But
+`cpu_count()` returns **0 until the topology registry is published**, and that
+publication happens later, in `init_acpi`. The guard was therefore false on
+every boot at every vCPU count, and the claim never ran.
+
+`ap_trampoline::install` then wrote the trampoline into memory the allocator
+still listed as free, and `ap_trampoline::seal` marked both pages read-only in
+the direct map. Whichever allocation next received one of those two frames
+panicked the kernel on its first write:
+`Unhandled exception: vector = 14, error code = Some(3)` inside `memcpy`, with
+`cr2` always inside `0xffff_8000_0000_8000..0xA000`. It was intermittent only
+because it needed the allocator to hand out exactly those two frames, which
+the demand-paging workload makes likely and a quiet boot does not.
+
+The claim is now unconditional and runs immediately after `init_phys`, before
+anything can allocate. `OutsideUsableMemory` is tolerated (firmware already
+withheld the range); `AlreadyOwned` fails loudly.
+
+**The contract fix matters more than the one-line fix.** Two facts had to agree
+- "this range is reserved" and "this range is read-only" - and they lived in
+different crates with nothing linking them. The seal now asserts
+`phys::range_is_withheld_from_allocation` before removing write permission, so
+the two cannot drift apart again whatever the cause. `discovered_count()` also
+documents that `0` means *not known yet*: every other caller already defended
+against it with `assert!((1..=MAX).contains(&count))`, and the trampoline claim
+was the only place that used it as a bare predicate.
+
+Evidence: plain `kvm-smoke --rustos-vcpus 8` went from 4 of 6 passing with
+kernel panics to **6 of 6 with zero panics**, twice over; 1, 2, and 4 vCPU pass.
+The `cr2 = 0x8xxx/0x9xxx` panic class does not appear in any run since.
+
+### Closed: runtimed logged the machine to a standstill
+
+`load_launch_catalog_into_state` emitted its `launch catalog load begin` pair on
+every broker pass while an off-loop catalog load was still in flight, rather
+than once per dispatched load. A slow storage read produced **2,204 of them in
+one 30 s window - 4,408 debugcon lines**. Each debugcon line is a synchronous
+port write taken under a global lock with interrupts disabled, so the
+diagnostic became the dominant machine-wide stall and extended the very read it
+was reporting on. That is the 30 s gap between uiserver's `init open_display
+done` and `init open_input begin`.
+
+The begin line now marks one dispatched load. Measured: the same gap is **6 ms**,
+the boot log dropped from thousands of lines to ~350, and a healthy boot logs
+3-4 begins.
+
 ### Open: the `--min-ui-fps 60` gate does not pass, at any vCPU count
 
 This is **not** an SMP problem: `--min-ui-fps 60` fails identically at 1 vCPU
@@ -113,22 +162,25 @@ this change set: a GTK consumer without the shared display aperture can only
 render QEMU's unrelated guest console, so the old gate proved the wrong thing).
 That makes it strictly harder, and it currently stops in two places:
 
-- **With the shared surfaces.** uiserver never sees the compositor. The DVM
-  reports `gpu-compositor primed contract=3` at its own t=1.6 s and RustOS
-  confirms `gui-dvm: peer ready lease rebound invitation=2` at t=2.9 s, which
-  is where `GPU_PRIME_DURATION_NS` and `GUI_DVM_PEER_READY` are published - yet
-  `display_get_info` keeps returning `flags=0x6` (no
-  `DISPLAY_INFO_FLAG_GPU_COMPOSITOR`) until t=63 s, and uiserver exits
-  `errno=110`. The ioctl drain is wired (`prepare_ioctl` ->
-  `gpu_atlas_info()`), so the open question is why the poll does not observe
-  the already-published atlas contract. Note the bootstrap worker logs
-  `GPU provider pending attempt=` only at powers of two and stops after
-  `attempt=2`: either the worker stops polling or those lines are being lost.
-  Establish which before theorising - that ambiguity is the whole reason this
-  is still open.
-- **Without them.** The boot is clean (`missing=[]`, `dvm-display-ready=true`)
-  but WayClick never launches, `runtimed` logs `accept failed: errno=110` after
-  two consecutive 30 s waits, and every fps window stays false.
+The gate now reaches the FPS proof and WayClick sustains **66-116 FPS across
+16 one-second windows**, so the frame rate itself is not the problem. Two
+things still stop it:
+
+- **One ~817 ms frame, every run.** `uiserver: slow gpu submit` charges it
+  entirely to `rebuild_scene_us`, `desktop refresh elapsed_ms=817` charges it
+  entirely to `refresh_desktop_surface`, and the phase split charges **all of
+  it to the chrome-strip restore**: `strips_us=816868 rails_us=377
+  launchers_us=18`. The actual drawing costs 0.4 ms. The strip restore is a
+  ~768 KB row copy, and the debugcon log shows a dense contiguous burst of
+  `pager-anon-fault-progress` immediately before it. So this is **anonymous
+  demand paging: one pagerd IPC round trip per 4 KiB of first touch**,
+  landing synchronously on the UI thread mid-frame. It wrecks exactly one
+  window (33 FPS) and trips the harness's slow-loop rule. The obvious fix is
+  fault-around - resolve a bounded run of adjacent pages per fault instead of
+  exactly one - which is a pager protocol change and wants its own change set.
+  Do not look for a rendering bug; the renderer is innocent.
+- **`fixed input-ring credit timeout outstanding=1279 limit=1279`**, and some
+  runs where the Linux DVM guest exits before readiness. Not yet root-caused.
 
 One measurement worth keeping: timed waits overshoot badly under the input
 exercise. `runtimed: idle wait overshoot budget_us=10000 elapsed_us=~30000` is

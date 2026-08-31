@@ -22,8 +22,6 @@ pub(super) fn load_launch_catalog_into_state(state: &mut BrokerState) -> bool {
     {
         return false;
     }
-    debug_line("runtimed: launch catalog load begin");
-    boot_line("runtimed: launch catalog load begin");
     let started_at = Instant::now();
     // The registry is read off the loop for the same reason as the
     // qualification contract: it is storage, it measured 70 ms here, and the
@@ -99,15 +97,32 @@ pub(crate) fn load_launch_catalog_off_loop() -> LaunchCatalogLoad {
 /// broker that could not create a thread still boots.
 fn request_launch_catalog(state: &mut BrokerState) -> Option<LaunchCatalogLoad> {
     let Some(load) = state.launch_catalog_load.as_ref() else {
+        announce_launch_catalog_load_begin();
         return Some(load_launch_catalog());
     };
     if let Some(loaded) = load.poll() {
         return Some(loaded);
     }
     if !load.busy() {
+        announce_launch_catalog_load_begin();
         load.request();
     }
     None
+}
+
+/// Announces one *dispatched* catalog load.
+///
+/// This used to run once per call of `load_launch_catalog_into_state`, which
+/// the broker loop calls on every pass while an off-loop load is still in
+/// flight. A slow storage read therefore did not produce one begin line, it
+/// produced one per pass: a single 30 s window logged 2,204 of them, 4,408
+/// debugcon lines in total. Each line is a synchronous port write taken under
+/// a global lock with interrupts disabled, so the diagnostic became the
+/// dominant machine-wide stall and extended the very read it was reporting on.
+/// A poll of work already in flight is not a new attempt and says nothing new.
+fn announce_launch_catalog_load_begin() {
+    debug_line("runtimed: launch catalog load begin");
+    boot_line("runtimed: launch catalog load begin");
 }
 
 pub(super) fn load_launch_catalog(

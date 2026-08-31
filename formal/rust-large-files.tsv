@@ -9,6 +9,7 @@ kernel/io-manager/src/input/dvm_ring.rs	1606	io-input	Split aperture admission, 
 kernel/io-manager/src/io/dvm_display.rs	1835	io-display	Split handshake, shared-surface lifecycle, present queue, and tests.
 kernel/ipc-runtime/src/ipc/mod.rs	3170	ipc-runtime	Extract the fixed FastCallFrame state machine into ipc/fast_call.rs, then split endpoint, reply, shared-region, and accounting modules.
 kernel/ipc-runtime/src/ipc/tests.rs	1306	ipc-runtime	Split endpoint call/reply tests, shared-region tests, and handle-transfer tests into sibling modules under ipc/tests/, alongside the existing reply_publication_tests.rs.
+kernel/mm/src/memory/phys.rs	1302	memory-phys	Split boot memory-map admission, the frame bitmap allocator, fixed-range claims, and tests.
 kernel/mm/src/memory/kernel_vm.rs	1435	memory-kernel-vm	Split PAT/cache policy, direct-map transactions, high-window mappings, and tests.
 kernel/ps/src/multitask/current.rs	1333	ps-current	Split the pager VMA publication/lookup wrappers into current/pager.rs and the IPC donation/handoff wrappers into current/ipc.rs, leaving only current-task identity accessors here.
 kernel/ps/src/multitask/process_table.rs	1806	process-table	Split lifecycle transaction state and markers into process_table/lifecycle.rs, then the own-thread pin, retained exact-MM generation access, and identity adapters into process_table/identity.rs.
@@ -27,7 +28,7 @@ services/runtimed/src/session.rs	2137	runtimed-session	Split TTY line discipline
 services/rootd/src/main.rs	2974	rootd	Split bootstrap graph, authority leases, restart policy, and checkpoints.
 services/syscalld/src/linux_policy.rs	1532	syscalld	Split process, memory, entropy, credential, and advisory policies.
 services/uiserver/src/main.rs	1425	uiserver	Split the protocol, scene, and GPU submission owners per V5-GPU-UI-OWNER-014; the main loop is the shared owner that split removes.
-services/uiserver/src/render.rs	1668	uiserver-render	Split scene planning, damage, raster/composition, and tests.
+services/uiserver/src/render.rs	1692	uiserver-render	Split scene planning, damage, raster/composition, and tests.
 services/uiserver/src/sys.rs	1625	uiserver-sys	Split syscall wrappers by IPC, VM, wait, input, and display.
 services/uiserver/src/wayland.rs	3245	uiserver-wayland	Split protocol objects, dispatch, surface lifecycle, and tests.
 tools/hostd/src/runtime.rs	2841	hostd	Split launch, QMP, process identity, recovery, and evidence sealing.

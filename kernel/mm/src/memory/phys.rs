@@ -652,6 +652,40 @@ pub fn alloc_frame() -> Option<PhysAddr> {
     )
 }
 
+/// Reports whether every frame of an exact range is withheld from ordinary
+/// allocation, either by an explicit claim or by never having been usable.
+///
+/// This exists so an owner that hardens a fixed physical range can prove it
+/// actually owns it. A range that is merely *written* by bootstrap code is not
+/// owned: if the allocator still lists it free, the next allocation collides
+/// with the bootstrap asset, and when the hardening also removes write
+/// permission the collision surfaces as a kernel write fault far from its
+/// cause. Ownership and hardening must be checked together, at the point the
+/// hardening happens.
+pub fn range_is_withheld_from_allocation(phys_start: u64, byte_len: u64) -> bool {
+    if byte_len == 0 || !phys_start.is_multiple_of(PAGE_SIZE) || !byte_len.is_multiple_of(PAGE_SIZE)
+    {
+        return false;
+    }
+    irq_safe(|| {
+        let state = PHYS_ALLOCATOR.lock();
+        if !state.initialized {
+            return false;
+        }
+        let Ok(start_frame) = usize::try_from(phys_start / PAGE_SIZE) else {
+            return false;
+        };
+        let Ok(pages) = usize::try_from(byte_len / PAGE_SIZE) else {
+            return false;
+        };
+        (start_frame..start_frame.saturating_add(pages)).all(|frame| {
+            frame >= state.frame_count
+                || !frame_is_boot_usable(&state, frame)
+                || state.is_used(frame)
+        })
+    })
+}
+
 /// Atomically remove one exact page-aligned boot-usable range from the general
 /// allocator. Architecture bootstrap code uses this only after resolving the
 /// complete fixed range and before writing any byte into it.
@@ -1229,5 +1263,40 @@ mod tests {
         assert!(state.is_used(4));
         assert!(state.is_used(5));
         assert!(state.is_used(6));
+    }
+
+    /// The AP startup pages must leave the free set, and stay out of it.
+    ///
+    /// `ap_trampoline::seal` makes this exact range read-only in the direct
+    /// map once the APs are up, so a frame handed out of it panics the kernel
+    /// on its first write. Boot claims the range immediately after
+    /// `init_phys`; this pins the two properties that claim depends on - that
+    /// the range is claimable from a fresh allocator, and that claiming it
+    /// actually removes both frames.
+    #[test]
+    fn ap_trampoline_range_is_claimable_and_leaves_the_free_set() {
+        let mut bitmap = [u64::MAX; 2];
+        let mut state = test_state(&mut bitmap, 128, 0);
+
+        let start = nucleus_core::ap_trampoline::TRAMPOLINE_PHYS;
+        let bytes = nucleus_core::ap_trampoline::RESERVED_BYTES;
+        let first = usize::try_from(start / PAGE_SIZE).expect("trampoline frame index");
+        let pages = usize::try_from(bytes / PAGE_SIZE).expect("trampoline page count");
+        assert_eq!(pages, 2, "the seal covers exactly the claimed range");
+
+        state
+            .claim_fixed_range_locked(start, bytes)
+            .expect("fresh allocator must be able to claim the AP startup pages");
+        for frame in first..first + pages {
+            assert!(state.is_used(frame), "frame {frame} stayed allocatable");
+        }
+        assert_eq!(state.free_frames, 128 - pages);
+
+        // A second claim must report the range as taken rather than silently
+        // handing the trampoline to two owners.
+        assert_eq!(
+            state.claim_fixed_range_locked(start, bytes),
+            Err(FixedRangeClaimError::AlreadyOwned)
+        );
     }
 }

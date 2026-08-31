@@ -1366,6 +1366,7 @@ fn refresh_desktop_surface(state: &mut AppState) {
     if state.desktop_cache.fully_valid() {
         return;
     }
+    let mut chrome_split: Option<(Duration, Duration, Duration, usize)> = None;
 
     if !state.desktop_cache.background_valid {
         if ui_profile_enabled()
@@ -1420,6 +1421,7 @@ fn refresh_desktop_surface(state: &mut AppState) {
             }
         }
 
+        let strips_elapsed = refresh_started.elapsed();
         let mut canvas = SurfaceCanvas::new(
             state.desktop_cache.pixels.as_mut_slice(),
             width as u32,
@@ -1427,12 +1429,14 @@ fn refresh_desktop_surface(state: &mut AppState) {
             width,
         );
 
+        let rails_started = Instant::now();
         chrome::draw_rail_panel(&mut canvas, topbar);
         chrome::draw_rail_panel(&mut canvas, taskbar);
-
         chrome::draw_brand_block(&mut canvas, topbar);
         chrome::draw_status_block(&mut canvas, topbar, state.launcher_programs.len());
+        let rails_elapsed = rails_started.elapsed();
 
+        let launchers_started = Instant::now();
         for (index, program) in state.launcher_programs.iter().enumerate() {
             chrome::draw_launcher_icon(
                 &mut canvas,
@@ -1440,6 +1444,12 @@ fn refresh_desktop_surface(state: &mut AppState) {
                 program.title.as_str(),
             );
         }
+        chrome_split = Some((
+            strips_elapsed,
+            rails_elapsed,
+            launchers_started.elapsed(),
+            state.launcher_programs.len(),
+        ));
         state.desktop_cache.chrome_valid = true;
         state.desktop_cache.content_version =
             state.desktop_cache.content_version.wrapping_add(1).max(1);
@@ -1461,6 +1471,20 @@ fn refresh_desktop_surface(state: &mut AppState) {
             )
             .as_str(),
         );
+        // The total alone never said which half was slow, which is the only
+        // question a slow retained-chrome rebuild raises.
+        if let Some((strips, rails, launchers, launcher_count)) = chrome_split {
+            diag_line(
+                format!(
+                    "uiserver: desktop refresh split strips_us={} rails_us={} launchers_us={} launchers={}",
+                    strips.as_micros(),
+                    rails.as_micros(),
+                    launchers.as_micros(),
+                    launcher_count,
+                )
+                .as_str(),
+            );
+        }
     }
 }
 
