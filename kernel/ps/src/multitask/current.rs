@@ -36,7 +36,6 @@ use super::{
     UserFaultDisposition, WaitChildResult, current_cpu_task_slot_admitted, process_table,
     scheduler_mut, scheduler_ref,
 };
-use crate::debug;
 use crate::io::session::ConsoleSessionHandle;
 use crate::memory::paging::ProcessAddressSpace;
 use crate::user::abi::UserAbi;

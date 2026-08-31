@@ -21,9 +21,12 @@
 //! six times at roughly two hundred cycles apiece; taking it as an argument
 //! removes the repeat without weakening any assertion.
 
-use core::sync::atomic::Ordering;
-
+// Used only under `rustos_boot_image`, where the real per-CPU preemption
+// counters exist; the host build compiles a stub that needs neither.
+#[cfg(rustos_boot_image)]
 use super::*;
+#[cfg(rustos_boot_image)]
+use core::sync::atomic::Ordering;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PreemptionSnapshot {

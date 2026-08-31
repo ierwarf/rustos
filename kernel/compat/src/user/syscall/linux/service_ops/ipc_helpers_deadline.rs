@@ -7,9 +7,13 @@
 
 use super::{
     LINUX_ENOSYS, LINUX_EPIPE, NETD_IPC_OP_REF_ACK, SYSCALL_OFFLOAD_OP_LINUX_CLOSE,
-    SYSCALL_OFFLOAD_OP_LINUX_DUP, SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET, VFS_IPC_OP_POLL_QUERY,
-    VfsIpcRequest, current_remote_vfs_handle, ipc_ops,
+    SYSCALL_OFFLOAD_OP_LINUX_DUP, VFS_IPC_OP_POLL_QUERY, VfsIpcRequest, current_remote_vfs_handle,
+    ipc_ops,
 };
+// Referenced only by this file's tests, which classify the poll-socket
+// timeout alongside the ops the production paths above use.
+#[cfg(test)]
+use super::SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET;
 use alloc::string::String;
 
 pub(in crate::user::syscall::linux::service_ops) fn remaining_service_timeout_ms(

@@ -1766,12 +1766,18 @@ for group in "${group_order[@]}"; do
     # another's synthetic scheduler while it is allocating a slot. Running it
     # beside *other* packages is unaffected: the fixtures are process-local.
     (
+        # `set -e` is inherited here, so a failing cargo would abort this
+        # subshell before it could record the exit code, and verification below
+        # would then report a missing `.rc` file instead of the real failure.
+        # Capture the status explicitly so a failed group names its own cause.
+        rc=0
         if [[ "$package" == "kernel-ps" ]]; then
-            RUST_TEST_THREADS=1 cargo "${cargo_args[@]}" > "$run_dir/$group_index.out" 2>&1
+            RUST_TEST_THREADS=1 cargo "${cargo_args[@]}" \
+                > "$run_dir/$group_index.out" 2>&1 || rc=$?
         else
-            cargo "${cargo_args[@]}" > "$run_dir/$group_index.out" 2>&1
+            cargo "${cargo_args[@]}" > "$run_dir/$group_index.out" 2>&1 || rc=$?
         fi
-        printf '%s' "$?" > "$run_dir/$group_index.rc"
+        printf '%s' "$rc" > "$run_dir/$group_index.rc"
     ) &
     group_index=$((group_index + 1))
 done

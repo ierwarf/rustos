@@ -67,29 +67,60 @@ Measured on a 1-vCPU boot: admission refusals **0**, and
 `pager-anon-fault-progress` rose from 14 to 25 milestones (~900 -> ~1600 faults
 actually served by the pager).
 
-### Known limitation: 8 vCPU is intermittent, and it is NOT the pager
+### Open bug: 8 vCPU misses `smp-cpu-first-user-dispatch arg0=0x1`
 
-Plain `kvm-smoke --rustos-vcpus 8` intermittently fails with the single missing
-marker `smp-cpu-first-user-dispatch arg0=0x1`: CPU 1 comes online, takes
-clockevents and reschedule IPIs, enters idle, and dispatches kernel work, but
-never receives a user task. No panic, lockdep, corruption, or stale marker
-appears, and every other CPU reports the marker.
+Plain `kvm-smoke --rustos-vcpus 8` intermittently fails with that single
+missing marker. CPU 1 comes online, is scheduler-ready, takes its first
+clockevent and reschedule IPI, enters idle, and dispatches kernel work
+(`smp-ap-first-work-dispatch`) - its event set is identical to CPU 2's except
+that it never runs a user task. No panic, lockdep, corruption, or stale marker
+appears in any failing run.
 
-**This is pre-existing and not caused by Phase 7.** With
-`PAGER_DEMAND_ADMISSION_WIRED` set to `false` and a matching fresh seal, 8 vCPU
-still failed the same way (1 of 3 passed). Pass rate is unstable across runs
-(2 of 3 in one window, 0 of 8 in another) on an unloaded 16-core host, so treat
-it as a scheduler placement or boot-latency question, not a pager one.
+**Not caused by the pager.** With `PAGER_DEMAND_ADMISSION_WIRED = false` and a
+matching fresh seal it still failed the same way (1 of 3 passed), so this is a
+scheduler placement or boot-latency question.
 
-**Method warning that invalidated several earlier measurements:** multi-vCPU
-runs verify the formal seal against the current source hash. Any source edit
-makes 2/4/8-vCPU runs fail with `formal verification run binding mismatch`,
-which looks exactly like a boot failure. **Re-run `formal/verify-all.sh
---profile pr` after every source change before drawing any multi-vCPU
-conclusion.** `--smp-iteration` additionally needs
-`formal/verify-smp-iteration.sh` (a separate `smp-iteration` profile) and is
-capped at `--timeout 30`; that profile also requires uiserver, dvm-block, and
-storaged readiness inside those 30 seconds, which this tree does not yet reach.
+Hypotheses tried and **rejected**, so nobody repeats them:
+
+- *Housekeeping monopolises its CPU.* Pipelining pager work 1 -> 8 faults per
+  turn (kept, it is a real throughput win) did not fix it. `Thread::new`'s
+  second argument is `weight_micros`, a time slice, not a priority, so
+  housekeeping is not preempting by priority either.
+- *`slot % online_count` cannot produce residue 1 with a strided slot
+  allocator.* Replacing it with a rotating placement counter did not fix it,
+  and the change broke the `cfg(test)` build, so it was reverted.
+- Instrumenting which CPU housekeeping runs on produced no output from either
+  `kernel-executive` or `kernel-compat`, which is itself unexplained and is the
+  next thread to pull: the probe string is present in `nucleus.elf` and the
+  category/level are enabled, yet the milestone never reaches the debugcon log.
+
+Start there rather than re-guessing at placement.
+
+**Method warning that invalidated several earlier measurements.** Multi-vCPU
+runs verify the formal seal against the current source hash, so any source edit
+makes 2/4/8-vCPU runs fail with `formal verification run binding mismatch` -
+which reads exactly like a boot failure. Six 8-vCPU measurements were thrown
+away to this. **Re-run `formal/verify-all.sh --profile pr` after every source
+change before drawing a multi-vCPU conclusion.** `--smp-iteration` needs its own
+`formal/verify-smp-iteration.sh` seal, is capped at `--timeout 30`, and also
+requires uiserver, dvm-block, and storaged readiness inside those 30 seconds,
+which this tree does not yet reach.
+
+### Log volume and CI
+
+A 30-second 1-vCPU boot logged 839 lines, of which 212 were a
+begin/complete pair per pager admission and about a hundred were scheduler
+census rows whose count and denominator were both zero. Per-admission logging
+is gone (refusals and the rate-limited `pager-anon-fault-progress` carry the
+signal) and `record_census_row` drops only information-free rows - a zero count
+against a nonzero denominator is a real observation and is kept. Boot logs are
+now 547 lines.
+
+CI is deliberately small: formatting, `cargo xtask config check`,
+`cargo xtask check`, and the host test set. The formal gate, QEMU/KVM runs, and
+docs publishing are local commands, not CI jobs; `formal-nightly.yml` was
+removed with them. CI previously ran `cargo test -p driver-abi`, which is not a
+workspace package, so the host-test step could never have passed.
 
 ### Fresh evidence for this change set
 

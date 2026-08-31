@@ -16,7 +16,7 @@
 //! spends it rather than inferring from the call graph.
 
 use nucleus_core::debug::LogCategory;
-use nucleus_core::debug::phase_profile::{PhaseProfile, phase_now};
+use nucleus_core::debug::phase_profile::PhaseProfile;
 
 pub(super) const SYSCALL_PHASE_COUNT: usize = 4;
 

@@ -245,6 +245,19 @@ fn pack_u32_pair(high: u64, low: u64) -> u64 {
     (high << 32) | low
 }
 
+/// Emits one census row, skipping rows that carry no information.
+///
+/// A zero count against a nonzero denominator is a real observation - "none of
+/// N attempts took this path" - and is kept. A row where both are zero says
+/// only that the window was idle, and repeating a hundred of those every
+/// second is what made a boot log mostly scheduler telemetry.
+fn record_census_row(name: &'static str, count: u64, total: u64) {
+    if count == 0 && total == 0 {
+        return;
+    }
+    crate::debug::record_milestone(crate::debug::LogCategory::Sched, name, count, total);
+}
+
 pub fn drain_scheduler_runtime_profile() -> usize {
     // Budget counters share the scheduler's one-second profile window.  They
     // used to be drained before this readiness check, so the fast
@@ -411,8 +424,7 @@ pub fn drain_scheduler_runtime_profile() -> usize {
         .sync_handoff_misses
         .iter()
         .fold(profile.sync_handoff_hits, |total, misses| total + misses);
-    crate::debug::record_milestone(
-        crate::debug::LogCategory::Sched,
+    record_census_row(
         "kernel-scheduler-step-sync-hits",
         profile.sync_handoff_hits,
         sync_handoff_attempts,
@@ -437,12 +449,7 @@ pub fn drain_scheduler_runtime_profile() -> usize {
             "kernel-scheduler-step-sync-miss-flag-stale",
         ),
     ] {
-        crate::debug::record_milestone(
-            crate::debug::LogCategory::Sched,
-            name,
-            reason_count,
-            sync_handoff_attempts,
-        );
+        record_census_row(name, reason_count, sync_handoff_attempts);
     }
     // Sub-reasons within the `-miss-stale` bucket: which check inside
     // `synchronous_handoff_record_is_ready` discarded a queued record.
@@ -463,12 +470,7 @@ pub fn drain_scheduler_runtime_profile() -> usize {
             "kernel-scheduler-step-sync-stale-not-candidate",
         ),
     ] {
-        crate::debug::record_milestone(
-            crate::debug::LogCategory::Sched,
-            name,
-            stale_count,
-            drained_stale,
-        );
+        record_census_row(name, stale_count, drained_stale);
     }
     // Arm-side outcome, split by which direction armed it. arg0=accepted,
     // arg1=rejected. Tests whether a round trip's hint shortfall is one-sided.
@@ -554,12 +556,7 @@ pub fn drain_scheduler_runtime_profile() -> usize {
             "kernel-scheduler-step-sync-generation-fail-retired",
         ),
     ] {
-        crate::debug::record_milestone(
-            crate::debug::LogCategory::Sched,
-            name,
-            state_count,
-            generation_fail_total,
-        );
+        record_census_row(name, state_count, generation_fail_total);
     }
     // Owner publication plus the deferred wake drain, which every acquisition
     // pays before its caller runs. arg0=prologue us, arg1=wakes drained.

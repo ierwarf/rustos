@@ -57,7 +57,6 @@ static OBSERVED_PAGER_EPOCH: AtomicU64 = AtomicU64::new(0);
 /// backing service, so the kernel owns their identity; the slot never repeats
 /// within a boot, which keeps a stale region from matching a newer fault.
 static NEXT_ANON_OBJECT_SLOT: AtomicU64 = AtomicU64::new(1);
-static PAGER_ADMISSION_ATTEMPTS: AtomicU64 = AtomicU64::new(0);
 
 /// Translates a Linux protection into pager VMA rights, including the empty
 /// protection used by guard ranges. W+X and unknown bits always fail closed.
@@ -162,24 +161,11 @@ fn admit_call(region: PagerVmRegionWire) -> Result<(i32, u64), i64> {
     request.payload[..payload.len()].copy_from_slice(payload);
     request.payload_len = payload_len;
 
-    let attempt = PAGER_ADMISSION_ATTEMPTS.fetch_add(1, Ordering::Relaxed) + 1;
-    nucleus_core::debug::record_milestone(
-        nucleus_core::debug::LogCategory::Compat,
-        "pager-backing-admission-begin",
-        region.process_handle,
-        region.start,
-    );
     let response = ipc_ops::call_service_endpoint_with_class(
         IPC_SERVICE_PAGERD,
         as_bytes(&request),
         ipc_ops::ServiceIpcClass::InteractiveControl,
     )?;
-    nucleus_core::debug::record_milestone(
-        nucleus_core::debug::LogCategory::Compat,
-        "pager-backing-admission-complete",
-        region.process_handle,
-        region.start,
-    );
     if response.len() != size_of::<CommercialMaxProtocolResponse>() {
         return Err(LINUX_EINVAL);
     }
