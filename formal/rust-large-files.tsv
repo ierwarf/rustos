@@ -13,7 +13,7 @@ kernel/mm/src/memory/phys.rs	1302	memory-phys	Split boot memory-map admission, t
 kernel/mm/src/memory/kernel_vm.rs	1435	memory-kernel-vm	Split PAT/cache policy, direct-map transactions, high-window mappings, and tests.
 kernel/ps/src/multitask/current.rs	1333	ps-current	Split the pager VMA publication/lookup wrappers into current/pager.rs and the IPC donation/handoff wrappers into current/ipc.rs, leaving only current-task identity accessors here.
 kernel/ps/src/multitask/process_table.rs	1806	process-table	Split lifecycle transaction state and markers into process_table/lifecycle.rs, then the own-thread pin, retained exact-MM generation access, and identity adapters into process_table/identity.rs.
-kernel/ps/src/multitask/scheduler.rs	5621	scheduler	The handoff chain's per-step self-timing is removed; the hit/miss split now carries its own attempt count. Next: split run queues, wakeup, deadlines, switching, accounting, and tests.
+kernel/ps/src/multitask/scheduler.rs	5638	scheduler	The handoff chain's per-step self-timing is removed; the hit/miss split now carries its own attempt count. Next: split run queues, wakeup, deadlines, switching, accounting, and tests.
 libs/driver-domain-host/src/lib.rs	5441	driver-domain-host	Split manifest, lease, QMP, recovery, input-ring publication, and process supervision.
 libs/driver-domain-protocol/src/lib.rs	4149	driver-domain-protocol	Split block, network, input, display, and control wire modules.
 libs/runtime-control/src/lib.rs	1402	runtime-control	Split codec, authority, command lifecycle, and tests.

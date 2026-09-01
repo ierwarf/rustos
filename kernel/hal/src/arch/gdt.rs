@@ -245,6 +245,23 @@ fn set_privilege_stack_for_cpu(logical_index: usize, stack_top: u64) {
     }
 }
 
+/// The ring0 stack top this CPU's TSS currently publishes, or `0` if the CPU
+/// index is outside the admitted topology.
+///
+/// Read back rather than tracked separately so the value is exactly what the
+/// hardware would load on the next ring3 -> ring0 transition. The double-fault
+/// handler uses it to tell a kernel stack overflow apart from every other
+/// double fault, which is otherwise indistinguishable from the frame alone.
+pub fn privilege_stack_top_for_current_cpu() -> u64 {
+    let cpu = nucleus_core::util::lockdep::current_cpu_index();
+    if cpu >= MAX_SUPPORTED_CPUS {
+        return 0;
+    }
+    // SAFETY: a read of one `u64`-sized field from this CPU's own permanently
+    // owned TSS slot. The fatal path takes no lock and mutates nothing.
+    unsafe { (*TSS_SLOTS[cpu].0.get()).privilege_stack_table[0].as_u64() }
+}
+
 pub fn set_interrupt_stack(index: u16, stack_top: u64) {
     let cpu = nucleus_core::util::lockdep::current_cpu_index();
     x86_64::instructions::interrupts::without_interrupts(|| {

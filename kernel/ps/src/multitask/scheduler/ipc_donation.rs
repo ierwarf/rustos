@@ -37,9 +37,27 @@ pub(super) enum IpcDonationTarget {
     BoundWorker(u64),
 }
 
+/// Which key space a donation ledger entry belongs to.
+///
+/// The ledger is keyed by a bare `u64`, and two subsystems mint keys into it:
+/// generic IPC reply handles, `(generation << 16) | (index + 1)`, and pager
+/// fault tokens, `(generation << 8) | slot`. Both are generational packings
+/// over disjoint object tables, but their *numbers* overlap - the smallest
+/// reply handle `0x1_0001` is also the fault token for slot 1 at generation
+/// 256, and slot 1 is reused constantly. Without a namespace an aliased
+/// lookup settles another subsystem's donation, which surfaces as
+/// "cancelled reply returned stale scheduling-context custody". The key is
+/// therefore the pair, never the number alone.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::multitask) enum DonationNamespace {
+    IpcReply,
+    PagerFault,
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct IpcPriorityDonation {
     pub(super) reply: u64,
+    pub(super) namespace: DonationNamespace,
     pub(super) donor_task_id: u64,
     /// Root scheduling-context owner propagated across nested passive-server
     /// calls. The immediate donor remains the reply wake owner.
@@ -80,7 +98,12 @@ impl Scheduler {
     ) -> Option<u64> {
         let slot = self.eligible_process_worker_slot(receiver_process_id)?;
         let receiver_task_id = self.starts[slot]?.id;
-        if !self.bind_reserved_ipc_priority(reply, donor_task_id, receiver_task_id) {
+        if !self.bind_reserved_ipc_priority(
+            reply,
+            DonationNamespace::IpcReply,
+            donor_task_id,
+            receiver_task_id,
+        ) {
             return None;
         }
         self.apply_ipc_donation(slot);
@@ -250,6 +273,7 @@ impl Scheduler {
             self.ipc_priority_donations[self.ipc_priority_donation_len] =
                 Some(IpcPriorityDonation {
                     reply: 0,
+                    namespace: DonationNamespace::IpcReply,
                     donor_task_id,
                     context_owner_task_id,
                     context_owner_slot,
@@ -294,11 +318,12 @@ impl Scheduler {
     pub(in crate::multitask) fn attach_reserved_ipc_priority(
         &mut self,
         reply: u64,
+        namespace: DonationNamespace,
         donor_task_id: u64,
     ) -> bool {
         #[cfg(not(test))]
         {
-            return super::donation_ledger::attach(reply, donor_task_id);
+            return super::donation_ledger::attach(reply, namespace, donor_task_id);
         }
         #[cfg(test)]
         {
@@ -308,7 +333,7 @@ impl Scheduler {
             if let Some(existing) = self.ipc_priority_donations[..self.ipc_priority_donation_len]
                 .iter()
                 .flatten()
-                .find(|entry| entry.reply == reply)
+                .find(|entry| entry.reply == reply && entry.namespace == namespace)
             {
                 return existing.donor_task_id == donor_task_id;
             }
@@ -333,6 +358,7 @@ impl Scheduler {
     pub(in crate::multitask) fn bind_reserved_ipc_priority(
         &mut self,
         reply: u64,
+        namespace: DonationNamespace,
         donor_task_id: u64,
         receiver_task_id: u64,
     ) -> bool {
@@ -349,6 +375,7 @@ impl Scheduler {
             }
             return super::donation_ledger::bind_reserved(
                 reply,
+                namespace,
                 donor_task_id,
                 receiver_task_id,
                 receiver_slot,
@@ -368,7 +395,7 @@ impl Scheduler {
             if let Some(existing) = self.ipc_priority_donations[..self.ipc_priority_donation_len]
                 .iter_mut()
                 .flatten()
-                .find(|entry| entry.reply == reply)
+                .find(|entry| entry.reply == reply && entry.namespace == namespace)
             {
                 // Match the production ledger's cross-CPU receive race: an
                 // already-bound exact reply is successful admission, but the
@@ -426,16 +453,27 @@ impl Scheduler {
             return false;
         }
 
-        if self.bind_reserved_ipc_priority(reply, donor_task_id, receiver_task_id) {
+        if self.bind_reserved_ipc_priority(
+            reply,
+            DonationNamespace::IpcReply,
+            donor_task_id,
+            receiver_task_id,
+        ) {
             return true;
         }
 
-        self.upsert_ipc_priority_donation(reply, donor_task_id, receiver_task_id)
+        self.upsert_ipc_priority_donation(
+            reply,
+            DonationNamespace::IpcReply,
+            donor_task_id,
+            receiver_task_id,
+        )
     }
 
     pub(super) fn upsert_ipc_priority_donation(
         &mut self,
         reply: u64,
+        namespace: DonationNamespace,
         donor_task_id: u64,
         receiver_task_id: u64,
     ) -> bool {
@@ -458,6 +496,7 @@ impl Scheduler {
             }
             return super::donation_ledger::upsert(
                 reply,
+                namespace,
                 donor_task_id,
                 receiver_task_id,
                 receiver_slot,
@@ -471,7 +510,7 @@ impl Scheduler {
             if let Some(entry) = self.ipc_priority_donations[..self.ipc_priority_donation_len]
                 .iter_mut()
                 .flatten()
-                .find(|entry| entry.reply == reply)
+                .find(|entry| entry.reply == reply && entry.namespace == namespace)
             {
                 entry.donor_task_id = donor_task_id;
                 entry.target = IpcDonationTarget::BoundWorker(receiver_task_id);
@@ -486,6 +525,7 @@ impl Scheduler {
             self.ipc_priority_donations[self.ipc_priority_donation_len] =
                 Some(IpcPriorityDonation {
                     reply,
+                    namespace,
                     donor_task_id,
                     context_owner_task_id,
                     context_owner_slot,
@@ -507,10 +547,16 @@ impl Scheduler {
     /// capability.  This is deliberately idempotent so reply/error/timeout
     /// races cannot leave an inherited System class behind.
     #[cfg(test)]
-    pub(in crate::multitask) fn release_ipc_priority(&mut self, reply: u64) -> bool {
+    pub(in crate::multitask) fn release_ipc_priority(
+        &mut self,
+        reply: u64,
+        namespace: DonationNamespace,
+    ) -> bool {
         let Some(index) = self.ipc_priority_donations[..self.ipc_priority_donation_len]
             .iter()
-            .position(|entry| entry.is_some_and(|entry| entry.reply == reply))
+            .position(|entry| {
+                entry.is_some_and(|entry| entry.reply == reply && entry.namespace == namespace)
+            })
         else {
             return false;
         };
@@ -641,6 +687,47 @@ impl Scheduler {
             self.lower_slot_vruntime_ceiling(target_slot, donated_floor);
         }
     }
+
+    /// Applies the one-shot latency floor for a pager fault after the donor has
+    /// committed its typed blocked state.
+    ///
+    /// Unlike generic IPC donation, the donor is intentionally not runnable:
+    /// that is the safety proof that pagerd cannot be boosted on behalf of an
+    /// unrelated running task. Durable class and budget custody is still bound
+    /// by the ordinary donation ledger before pagerd returns to userspace.
+    pub(super) fn apply_blocked_pager_donation(&mut self, donor_slot: usize, target_slot: usize) {
+        if donor_slot == target_slot || donor_slot >= MAX_TASK || target_slot >= MAX_TASK {
+            return;
+        }
+        if self.contexts[donor_slot].is_none() {
+            return;
+        }
+        if self.contexts[target_slot].is_none() {
+            return;
+        }
+        if !self.slot_blocked(donor_slot)
+            || !matches!(
+                self.slot_block_reason(donor_slot),
+                super::BlockReason::PagerFault(_)
+            )
+            || !self.slot_is_runnable(target_slot)
+            || self.slot_class(donor_slot) == Some(SchedClass::Idle)
+            || !self.is_fair_candidate_slot(target_slot)
+        {
+            return;
+        }
+        let donor_floor = self
+            .slot_vruntime(donor_slot)
+            .saturating_sub(IPC_DONATION_BONUS_NS);
+        let class_floor = self
+            .slot_class(target_slot)
+            .map(|class| {
+                self.min_ready_vruntime_in_class(class)
+                    .saturating_sub(IPC_DONATION_BONUS_NS)
+            })
+            .unwrap_or(donor_floor);
+        self.lower_slot_vruntime_ceiling(target_slot, donor_floor.min(class_floor));
+    }
 }
 
 /// Reserves one synchronous-call donation for the task this CPU is running,
@@ -743,8 +830,14 @@ pub(in crate::multitask) fn bind_current_receiver_call_donation(
     // A false result is a missing reservation, not a rejection: the ledger
     // leaves its state unchanged and the upsert path under the guard owns
     // creating the edge from scratch.
-    super::donation_ledger::bind_reserved(reply, donor_task_id, receiver_task_id, receiver_slot)
-        .then_some(true)
+    super::donation_ledger::bind_reserved(
+        reply,
+        DonationNamespace::IpcReply,
+        donor_task_id,
+        receiver_task_id,
+        receiver_slot,
+    )
+    .then_some(true)
 }
 
 #[cfg(test)]
@@ -878,7 +971,10 @@ mod current_donation_tests {
             bind_current_receiver_call_donation(0x77, donor, receiver),
             Some(true)
         );
-        assert!(super::super::donation_ledger::release_reply(0x77));
+        assert!(super::super::donation_ledger::release_reply(
+            0x77,
+            DonationNamespace::IpcReply
+        ));
         drop(published);
     }
 

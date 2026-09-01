@@ -191,7 +191,7 @@ fn fast_ipc_commit_requires_exact_typed_waits_and_mutates_both_peers_once() {
     assert_eq!(sender.block_reason, BlockReason::None);
     assert!(sender.test_ready);
 
-    assert!(scheduler.release_ipc_priority(0xdef));
+    assert!(scheduler.release_ipc_priority(0xdef, crate::multitask::scheduler::ipc_donation::DonationNamespace::IpcReply));
     {
         let cross_receiver = scheduler.contexts[sender_slot]
             .as_mut()
@@ -221,6 +221,92 @@ fn fast_ipc_commit_requires_exact_typed_waits_and_mutates_both_peers_once() {
         !scheduler.contexts[sender_slot]
             .expect("cross-CPU receiver")
             .blocked
+    );
+}
+
+#[test]
+fn pager_fault_handoff_requires_exact_waits_and_donates_after_worker_wake() {
+    let mut scheduler = boxed_scheduler();
+    let sender_slot = 1;
+    let receiver_slot = 2;
+    let sender_task_id = 801;
+    let receiver_task_id = 802;
+    let token = 0x51;
+
+    let sender = TaskContext {
+        scheduling_context: crate::multitask::scheduler::scheduling_context::SchedulingContext::bind(
+            sender_slot,
+            sender_task_id,
+        ),
+        saved_rsp: 0,
+        test_ready: false,
+        ready_since_ticks: 0,
+        blocked: true,
+        blocked_since_ticks: 1,
+        wake_armed: false,
+        block_reason: BlockReason::PagerFault(token),
+        weight: NICE_0_LOAD,
+        vruntime_ns: crate::multitask::scheduler::IPC_DONATION_BONUS_NS.saturating_mul(4),
+        exec_start_ticks: 0,
+        address_space_root: 0,
+        kernel_stack_base: 0,
+        kernel_stack_top: 0,
+        alternate_kernel_stack_base: 0,
+        alternate_kernel_stack_top: 0,
+        user_mode: true,
+        user_abi: Some(UserAbi::Linux),
+        console_session: ConsoleSessionHandle::SYSTEM,
+        process_handle: None,
+        process_id: None,
+        user_stack: None,
+        windows_thread_state: None,
+    };
+    let mut receiver = sender;
+    receiver.scheduling_context =
+        crate::multitask::scheduler::scheduling_context::SchedulingContext::bind(
+            receiver_slot,
+            receiver_task_id,
+        );
+    receiver.wake_armed = true;
+    receiver.block_reason = BlockReason::PagerService;
+    receiver.vruntime_ns = crate::multitask::scheduler::IPC_DONATION_BONUS_NS.saturating_mul(8);
+
+    scheduler.contexts[sender_slot] = Some(sender);
+    scheduler.contexts[receiver_slot] = Some(receiver);
+    scheduler.starts[sender_slot] = Some(TaskStart {
+        entry: noop_task_entry,
+        id: sender_task_id,
+    });
+    scheduler.starts[receiver_slot] = Some(TaskStart {
+        entry: noop_task_entry,
+        id: receiver_task_id,
+    });
+    scheduler.task_affinity_masks[sender_slot] = 1;
+    scheduler.process_affinity_masks[sender_slot] = 1;
+    scheduler.task_affinity_masks[receiver_slot] = 1;
+    scheduler.process_affinity_masks[receiver_slot] = 1;
+    scheduler.current_task = sender_slot;
+
+    assert_eq!(
+        scheduler.handoff_pager_fault_to_waiter(token + 1, receiver_task_id),
+        crate::multitask::scheduler::PagerFaultHandoffOutcome::SenderMismatch
+    );
+    assert_eq!(
+        scheduler.handoff_pager_fault_to_waiter(token, receiver_task_id),
+        crate::multitask::scheduler::PagerFaultHandoffOutcome::DirectSameCpu
+    );
+
+    let sender = scheduler.contexts[sender_slot].expect("fault donor retained");
+    let receiver = scheduler.contexts[receiver_slot].expect("pager worker retained");
+    assert!(sender.blocked);
+    assert_eq!(sender.block_reason, BlockReason::PagerFault(token));
+    assert!(!receiver.blocked);
+    assert!(!receiver.wake_armed);
+    assert_eq!(receiver.block_reason, BlockReason::None);
+    assert!(receiver.test_ready);
+    assert!(
+        receiver.vruntime_ns < crate::multitask::scheduler::IPC_DONATION_BONUS_NS.saturating_mul(8),
+        "pager worker did not receive the one-shot vruntime donation"
     );
 }
 
@@ -361,7 +447,7 @@ fn self_demotion_removes_base_system_class_and_caps_fair_weight() {
     assert_eq!(scheduler.slot_class(1), Some(SchedClass::System));
     assert!(scheduler.demote_current_user_task_to_user_class());
     assert_eq!(scheduler.slot_class(1), Some(SchedClass::System));
-    assert!(scheduler.release_ipc_priority(13));
+    assert!(scheduler.release_ipc_priority(13, crate::multitask::scheduler::ipc_donation::DonationNamespace::IpcReply));
     assert_eq!(scheduler.slot_class(1), Some(SchedClass::User));
 
     // The syscall is surrender-only. A task already below the nominal
@@ -964,7 +1050,7 @@ fn ipc_donation_rejects_self_referential_and_retired_targets() {
     assert!(!scheduler.inherit_ipc_priority(20, 640, 640));
     assert!(scheduler.reserve_ipc_priority(640));
     assert!(
-        !scheduler.bind_reserved_ipc_priority(20, 640, 640),
+        !scheduler.bind_reserved_ipc_priority(20, crate::multitask::scheduler::ipc_donation::DonationNamespace::IpcReply, 640, 640),
         "self-referential donation must be rejected even with a live reservation"
     );
     assert!(scheduler.cancel_ipc_priority_reservation(640));

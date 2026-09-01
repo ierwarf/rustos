@@ -20,14 +20,15 @@ mod ipc;
 
 pub use ipc::{
     arm_block_current_task, arm_block_current_task_on_endpoint,
-    arm_block_current_task_on_pager_fault, arm_block_current_task_on_reply,
-    attach_reserved_ipc_priority, bind_ipc_priority_to_process_worker, bind_reserved_ipc_priority,
-    cancel_block_current_task, cancel_ipc_priority_reservation,
+    arm_block_current_task_on_pager_fault, arm_block_current_task_on_pager_service,
+    arm_block_current_task_on_reply, attach_reserved_ipc_priority,
+    bind_ipc_priority_to_process_worker, bind_reserved_ipc_priority,
+    bind_reserved_pager_fault_priority, cancel_block_current_task, cancel_ipc_priority_reservation,
     complete_fast_ipc_reply_wake_handoff_with_custody, complete_ipc_reply_wake_handoff,
     complete_ipc_reply_wake_handoff_with_custody, demote_current_user_task_to_user_class,
     inherit_ipc_priority, release_ipc_priorities_for_process, release_ipc_priority,
-    reserve_ipc_call_donation, reserve_ipc_priority, settle_ipc_reply_scheduling_context,
-    task_has_system_scheduling_class, wake_task,
+    release_pager_fault_priority, reserve_ipc_call_donation, reserve_ipc_priority,
+    settle_ipc_reply_scheduling_context, task_has_system_scheduling_class, wake_task,
 };
 
 use super::cpu_local;

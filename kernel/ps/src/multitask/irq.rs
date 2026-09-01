@@ -890,6 +890,16 @@ pub fn commit_pager_fault_block_and_yield(token: u64) -> Option<bool> {
             panic!("pager fault block rollback lost exact current wait token={token:#x}");
         }
 
+        if published
+            && let Some(pager_task_id) = super::pager_fault::take_pager_fault_waiter_for(token)
+        {
+            // SAFETY: interrupts are masked, this exception still owns the
+            // committed faulting slot, and the waiter came from the fixed
+            // atomic rendezvous table. The scheduler path therefore touches
+            // neither generic endpoint state nor a process catalog fallback.
+            let _ = unsafe { scheduler_mut().handoff_pager_fault_to_waiter(token, pager_task_id) };
+        }
+
         // The owner word committed non-runnable above. Even when cancellation
         // restored run intent, the trap must publish a fresh continuation
         // before Rust can safely return to the interrupted user frame.

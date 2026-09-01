@@ -10,8 +10,8 @@ use rustos_user_abi::syscall::{
     SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_RECV_WITH_SENDER,
     SYS_RUSTOS_IPC_REGISTER_LINUX_SYSCALL_ENDPOINT, SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT,
     SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_IPC_REPLY_RECV_WITH_SENDER,
-    SYS_RUSTOS_IPC_VALIDATE_SERVICE_OWNER, SYS_RUSTOS_PRODUCT_EXECUTABLE_SNAPSHOT_EVIDENCE,
-    SYS_RUSTOS_PRODUCT_MILESTONE,
+    SYS_RUSTOS_IPC_TRY_RECV_WITH_SENDER, SYS_RUSTOS_IPC_VALIDATE_SERVICE_OWNER,
+    SYS_RUSTOS_PRODUCT_EXECUTABLE_SNAPSHOT_EVIDENCE, SYS_RUSTOS_PRODUCT_MILESTONE,
 };
 
 use crate::syscall::{syscall0, syscall1, syscall2, syscall3, syscall5, syscall6};
@@ -165,6 +165,29 @@ pub unsafe fn recv_with_sender(
 ) -> i64 {
     syscall6(
         SYS_RUSTOS_IPC_RECV_WITH_SENDER,
+        endpoint,
+        request_buf as u64,
+        request_capacity as u64,
+        reply_cap_out as u64,
+        sender_pid_out as u64,
+        sender_tid_out as u64,
+    )
+}
+
+/// Receive immediately if a request is queued, otherwise return `-EAGAIN`.
+/// Services with an independent event source use this before a capability
+/// wait, avoiding a poll timer while still servicing endpoint traffic.
+#[inline]
+pub unsafe fn try_recv_with_sender(
+    endpoint: u64,
+    request_buf: *mut u8,
+    request_capacity: usize,
+    reply_cap_out: *mut u64,
+    sender_pid_out: *mut u64,
+    sender_tid_out: *mut u64,
+) -> i64 {
+    syscall6(
+        SYS_RUSTOS_IPC_TRY_RECV_WITH_SENDER,
         endpoint,
         request_buf as u64,
         request_capacity as u64,

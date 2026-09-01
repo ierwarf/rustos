@@ -17,7 +17,7 @@ use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
 
 use super::{
     MAX_TASK,
-    ipc_donation::{IpcDonationTarget, IpcPriorityDonation},
+    ipc_donation::{DonationNamespace, IpcDonationTarget, IpcPriorityDonation},
 };
 
 #[derive(Clone, Copy)]
@@ -68,10 +68,12 @@ impl DonationLedger {
         })
     }
 
-    fn find_reply(&self, reply: u64) -> Option<usize> {
-        self.entries[..self.len]
-            .iter()
-            .position(|entry| entry.is_some_and(|entry| entry.donation.reply == reply))
+    fn find_reply(&self, reply: u64, namespace: DonationNamespace) -> Option<usize> {
+        self.entries[..self.len].iter().position(|entry| {
+            entry.is_some_and(|entry| {
+                entry.donation.reply == reply && entry.donation.namespace == namespace
+            })
+        })
     }
 }
 
@@ -127,6 +129,7 @@ pub(super) fn reserve(
     ledger.insert(LedgerEntry {
         donation: IpcPriorityDonation {
             reply: 0,
+            namespace: DonationNamespace::IpcReply,
             donor_task_id,
             context_owner_task_id,
             context_owner_slot,
@@ -151,12 +154,12 @@ pub(super) fn cancel_reservation(donor_task_id: u64) -> bool {
     true
 }
 
-pub(super) fn attach(reply: u64, donor_task_id: u64) -> bool {
+pub(super) fn attach(reply: u64, namespace: DonationNamespace, donor_task_id: u64) -> bool {
     if reply == 0 {
         return false;
     }
     let mut ledger = DONATION_LEDGER.lock();
-    if let Some(index) = ledger.find_reply(reply) {
+    if let Some(index) = ledger.find_reply(reply, namespace) {
         // A running receiver may bind the published reply before the sender
         // attaches its reservation. Confirm the exact donor edge instead of
         // treating that legal publication race as lost custody.
@@ -178,6 +181,7 @@ pub(super) fn attach(reply: u64, donor_task_id: u64) -> bool {
 
 pub(super) fn bind_reserved(
     reply: u64,
+    namespace: DonationNamespace,
     donor_task_id: u64,
     receiver_task_id: u64,
     receiver_slot: usize,
@@ -186,7 +190,7 @@ pub(super) fn bind_reserved(
         return false;
     }
     let mut ledger = DONATION_LEDGER.lock();
-    if let Some(index) = ledger.find_reply(reply) {
+    if let Some(index) = ledger.find_reply(reply, namespace) {
         // The receiver can consume a just-published request on another CPU
         // before the sender commits its wake/handoff. That receive path binds
         // the reservation to the actual worker. Confirm that exact edge as
@@ -212,12 +216,14 @@ pub(super) fn bind_reserved(
         .as_mut()
         .expect("scheduler donation reservation disappeared");
     entry.donation.reply = reply;
+    entry.donation.namespace = namespace;
     bind_entry_to_receiver(entry, receiver_task_id, receiver_slot);
     true
 }
 
 pub(super) fn upsert(
     reply: u64,
+    namespace: DonationNamespace,
     donor_task_id: u64,
     receiver_task_id: u64,
     receiver_slot: usize,
@@ -233,7 +239,7 @@ pub(super) fn upsert(
         return false;
     }
     let mut ledger = DONATION_LEDGER.lock();
-    if let Some(index) = ledger.find_reply(reply) {
+    if let Some(index) = ledger.find_reply(reply, namespace) {
         let previous = ledger.entries[index].expect("scheduler donation reply disappeared");
         let entry = ledger.entries[index]
             .as_mut()
@@ -265,6 +271,7 @@ pub(super) fn upsert(
     if !ledger.insert(LedgerEntry {
         donation: IpcPriorityDonation {
             reply,
+            namespace,
             donor_task_id,
             context_owner_task_id,
             context_owner_slot,
@@ -283,12 +290,12 @@ pub(super) fn upsert(
     true
 }
 
-pub(super) fn release_reply(reply: u64) -> bool {
+pub(super) fn release_reply(reply: u64, namespace: DonationNamespace) -> bool {
     if reply == 0 {
         return false;
     }
     let mut ledger = DONATION_LEDGER.lock();
-    let Some(index) = ledger.find_reply(reply) else {
+    let Some(index) = ledger.find_reply(reply, namespace) else {
         return false;
     };
     let removed = ledger.remove(index);
@@ -443,6 +450,51 @@ fn restore_context_owner_after_release(
 
 #[cfg(test)]
 mod tests {
+    use super::DonationNamespace;
+
+    static TEST_GUARD: Mutex<()> = Mutex::new(());
+
+    /// A pager fault token and an IPC reply handle can be the same number.
+    ///
+    /// Reply handles are `(generation << 16) | (index + 1)` and fault tokens
+    /// are `(generation << 8) | slot`, so the smallest reply handle `0x1_0001`
+    /// is also the fault token for slot 1 at generation 256 - and slot 1 is
+    /// reused on almost every fault. When the ledger was keyed by the number
+    /// alone, the second binding found the first entry and the reply's
+    /// scheduling-context settlement panicked with "cancelled reply returned
+    /// stale scheduling-context custody". The key is the pair.
+    #[test]
+    fn a_fault_token_never_aliases_an_equal_reply_handle() {
+        let _guard = TEST_GUARD
+            .lock()
+            .expect("donation ledger test lock poisoned");
+        reset();
+        const COLLIDING_KEY: u64 = (1 << 16) | 1;
+
+        assert!(reserve(41, 41, 4, true));
+        assert!(bind_reserved(
+            COLLIDING_KEY,
+            DonationNamespace::IpcReply,
+            41,
+            52,
+            5
+        ));
+        assert!(reserve(42, 42, 6, true));
+        assert!(bind_reserved(
+            COLLIDING_KEY,
+            DonationNamespace::PagerFault,
+            42,
+            53,
+            7
+        ));
+
+        // Each namespace releases exactly its own edge, and neither can settle
+        // or consume the other's.
+        assert!(release_reply(COLLIDING_KEY, DonationNamespace::PagerFault));
+        assert!(!release_reply(COLLIDING_KEY, DonationNamespace::PagerFault));
+        assert!(release_reply(COLLIDING_KEY, DonationNamespace::IpcReply));
+        assert!(!release_reply(COLLIDING_KEY, DonationNamespace::IpcReply));
+    }
     use core::sync::atomic::Ordering;
     use std::sync::Mutex;
 
@@ -450,8 +502,6 @@ mod tests {
         attach, bind_reserved, borrowed_context_charge_token, borrowed_context_owner_slot,
         inherited_system, release_reply, release_task, reserve, reset, upsert,
     };
-
-    static TEST_GUARD: Mutex<()> = Mutex::new(());
 
     #[test]
     fn bound_reply_inheritance_is_exactly_once_and_rebinds_without_leak() {
@@ -465,13 +515,13 @@ mod tests {
             !reserve(41, 41, 4, true),
             "a donor may reserve only one live reply edge"
         );
-        assert!(bind_reserved(700, 41, 52, 5));
-        assert!(!bind_reserved(700, 42, 53, 6));
+        assert!(bind_reserved(700, DonationNamespace::IpcReply, 41, 52, 5));
+        assert!(!bind_reserved(700, DonationNamespace::IpcReply, 42, 53, 6));
         assert!(inherited_system(5));
         assert!(!inherited_system(6));
 
         assert!(
-            bind_reserved(700, 41, 53, 6),
+            bind_reserved(700, DonationNamespace::IpcReply, 41, 53, 6),
             "the sender must accept a reply the receiver already bound"
         );
         assert!(
@@ -480,16 +530,25 @@ mod tests {
         );
         assert!(!inherited_system(6));
 
-        assert!(upsert(700, 41, 53, 6, 41, 4, true));
+        assert!(upsert(
+            700,
+            DonationNamespace::IpcReply,
+            41,
+            53,
+            6,
+            41,
+            4,
+            true
+        ));
         assert!(
             !inherited_system(5),
             "rebind retained the old receiver boost"
         );
         assert!(inherited_system(6));
-        assert!(release_reply(700));
+        assert!(release_reply(700, DonationNamespace::IpcReply));
         assert!(!inherited_system(6));
         assert!(
-            !release_reply(700),
+            !release_reply(700, DonationNamespace::IpcReply),
             "terminal reply release must be idempotent"
         );
     }
@@ -502,14 +561,20 @@ mod tests {
         reset();
 
         assert!(reserve(61, 61, 6, true));
-        assert!(attach(701, 61));
-        assert!(!attach(701, 62), "another donor claimed the reply edge");
-        assert!(attach(701, 61), "exact attach must be idempotent");
-        assert!(bind_reserved(701, 61, 62, 7));
+        assert!(attach(701, DonationNamespace::IpcReply, 61));
+        assert!(
+            !attach(701, DonationNamespace::IpcReply, 62),
+            "another donor claimed the reply edge"
+        );
+        assert!(
+            attach(701, DonationNamespace::IpcReply, 61),
+            "exact attach must be idempotent"
+        );
+        assert!(bind_reserved(701, DonationNamespace::IpcReply, 61, 62, 7));
         assert!(inherited_system(7));
         release_task(62);
         assert!(!inherited_system(7));
-        assert!(!release_reply(701));
+        assert!(!release_reply(701, DonationNamespace::IpcReply));
     }
 
     #[test]
@@ -520,23 +585,23 @@ mod tests {
         reset();
 
         assert!(reserve(71, 71, 4, false));
-        assert!(bind_reserved(710, 71, 72, 5));
+        assert!(bind_reserved(710, DonationNamespace::IpcReply, 71, 72, 5));
         assert_eq!(borrowed_context_owner_slot(5), Some(4));
         assert!(!inherited_system(5));
 
         assert!(reserve(72, 71, 4, false));
-        assert!(bind_reserved(711, 72, 73, 6));
+        assert!(bind_reserved(711, DonationNamespace::IpcReply, 72, 73, 6));
         assert_eq!(borrowed_context_owner_slot(6), Some(4));
         assert!(!inherited_system(6));
 
-        assert!(release_reply(710));
+        assert!(release_reply(710, DonationNamespace::IpcReply));
         assert_eq!(borrowed_context_owner_slot(5), None);
         assert_eq!(borrowed_context_owner_slot(6), None);
         assert!(
-            release_reply(711),
+            release_reply(711, DonationNamespace::IpcReply),
             "revoked descendant reply must retain one terminal identity"
         );
-        assert!(!release_reply(711));
+        assert!(!release_reply(711, DonationNamespace::IpcReply));
     }
 
     #[test]
@@ -547,17 +612,17 @@ mod tests {
         reset();
 
         assert!(reserve(91, 91, 4, true));
-        assert!(bind_reserved(910, 91, 92, 5));
+        assert!(bind_reserved(910, DonationNamespace::IpcReply, 91, 92, 5));
         assert!(reserve(92, 91, 4, true));
-        assert!(bind_reserved(911, 92, 93, 6));
+        assert!(bind_reserved(911, DonationNamespace::IpcReply, 92, 93, 6));
         assert!(inherited_system(5));
         assert!(inherited_system(6));
 
-        assert!(release_reply(910));
+        assert!(release_reply(910, DonationNamespace::IpcReply));
         assert!(!inherited_system(5));
         assert!(!inherited_system(6));
-        assert!(release_reply(911));
-        assert!(!release_reply(911));
+        assert!(release_reply(911, DonationNamespace::IpcReply));
+        assert!(!release_reply(911, DonationNamespace::IpcReply));
     }
 
     #[test]
@@ -568,19 +633,19 @@ mod tests {
         reset();
 
         assert!(reserve(81, 81, 4, false));
-        assert!(bind_reserved(810, 81, 90, 9));
+        assert!(bind_reserved(810, DonationNamespace::IpcReply, 81, 90, 9));
         assert_eq!(borrowed_context_owner_slot(9), Some(4));
         assert_eq!(borrowed_context_charge_token(9), Some((4, 810)));
 
         assert!(reserve(82, 82, 6, false));
-        assert!(bind_reserved(811, 82, 90, 9));
+        assert!(bind_reserved(811, DonationNamespace::IpcReply, 82, 90, 9));
         assert_eq!(borrowed_context_owner_slot(9), Some(6));
         assert_eq!(borrowed_context_charge_token(9), Some((6, 811)));
 
-        assert!(release_reply(810));
+        assert!(release_reply(810, DonationNamespace::IpcReply));
         assert_eq!(borrowed_context_owner_slot(9), Some(6));
         assert_eq!(borrowed_context_charge_token(9), Some((6, 811)));
-        assert!(release_reply(811));
+        assert!(release_reply(811, DonationNamespace::IpcReply));
         assert_eq!(borrowed_context_owner_slot(9), None);
         assert_eq!(borrowed_context_charge_token(9), None);
         assert_eq!(super::BORROWED_CONTEXT_REPLY[9].load(Ordering::Acquire), 0);

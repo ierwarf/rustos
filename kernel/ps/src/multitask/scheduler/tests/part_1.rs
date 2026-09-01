@@ -202,9 +202,9 @@ fn nested_passive_server_runtime_is_billed_to_the_root_caller_context() {
 
     let outer = scheduler.reserve_ipc_call_donation(601);
     assert!(outer.donation_reserved);
-    assert!(scheduler.bind_reserved_ipc_priority(10, 601, 602));
+    assert!(scheduler.bind_reserved_ipc_priority(10, crate::multitask::scheduler::ipc_donation::DonationNamespace::IpcReply, 601, 602));
     assert!(
-        scheduler.bind_reserved_ipc_priority(10, 601, 603),
+        scheduler.bind_reserved_ipc_priority(10, crate::multitask::scheduler::ipc_donation::DonationNamespace::IpcReply, 601, 603),
         "sender commit must accept the receiver's earlier exact bind"
     );
     assert_eq!(scheduler.effective_scheduling_context_owner_slot(2), 1);
@@ -216,7 +216,7 @@ fn nested_passive_server_runtime_is_billed_to_the_root_caller_context() {
     let nested = scheduler.reserve_ipc_call_donation(602);
     assert_eq!(nested.scheduling_context, outer.scheduling_context);
     assert_eq!(nested.scheduling_context_owner_task_id, Some(601));
-    assert!(scheduler.bind_reserved_ipc_priority(11, 602, 603));
+    assert!(scheduler.bind_reserved_ipc_priority(11, crate::multitask::scheduler::ipc_donation::DonationNamespace::IpcReply, 602, 603));
     assert_eq!(scheduler.effective_scheduling_context_owner_slot(3), 1);
 
     let (owner, donated) = scheduler
@@ -244,7 +244,7 @@ fn nested_passive_server_runtime_is_billed_to_the_root_caller_context() {
     assert_eq!(borrowed.timeout_endpoint_cap, 0);
     assert_eq!(borrowed.timeout_fault_action, 1);
 
-    assert!(scheduler.release_ipc_priority(11));
+    assert!(scheduler.release_ipc_priority(11, crate::multitask::scheduler::ipc_donation::DonationNamespace::IpcReply));
     assert_eq!(scheduler.effective_scheduling_context_owner_slot(3), 3);
     let (owner, native) = scheduler
         .charge_effective_scheduling_context_runtime(3, 200, 4_500)
@@ -933,10 +933,10 @@ fn synchronous_ipc_donation_promotes_and_revokes_a_transitive_user_chain() {
     // A completed outer reply immediately restores both servers to their
     // manifest-derived class; no priority boost can leak past capability
     // lifetime.
-    assert!(scheduler.release_ipc_priority(10));
+    assert!(scheduler.release_ipc_priority(10, crate::multitask::scheduler::ipc_donation::DonationNamespace::IpcReply));
     assert_eq!(scheduler.slot_class(2), Some(SchedClass::User));
     assert_eq!(scheduler.slot_class(3), Some(SchedClass::User));
-    assert!(scheduler.release_ipc_priority(11));
+    assert!(scheduler.release_ipc_priority(11, crate::multitask::scheduler::ipc_donation::DonationNamespace::IpcReply));
     assert_eq!(scheduler.slot_class(3), Some(SchedClass::User));
 
     // A process-owned endpoint without a sleeping receiver must select an
@@ -1011,7 +1011,7 @@ fn synchronous_ipc_donation_promotes_and_revokes_a_transitive_user_chain() {
         Some(target)
     );
     assert_eq!(scheduler.synchronous_handoff_len_for_tests(), 0);
-    assert!(scheduler.release_ipc_priority(12));
+    assert!(scheduler.release_ipc_priority(12, crate::multitask::scheduler::ipc_donation::DonationNamespace::IpcReply));
     assert_eq!(scheduler.slot_class(target), Some(SchedClass::User));
     assert!(
         scheduler.handoff_slot_ready(target),
@@ -1031,7 +1031,7 @@ fn synchronous_ipc_donation_promotes_and_revokes_a_transitive_user_chain() {
             .bind_ipc_priority_to_process_worker(13, 601, 62)
             .is_none()
     );
-    assert!(scheduler.attach_reserved_ipc_priority(13, 601));
+    assert!(scheduler.attach_reserved_ipc_priority(13, crate::multitask::scheduler::ipc_donation::DonationNamespace::IpcReply, 601));
     assert!(
         scheduler
             .ipc_priority_donations
@@ -1042,14 +1042,14 @@ fn synchronous_ipc_donation_promotes_and_revokes_a_transitive_user_chain() {
             })
     );
     assert_eq!(scheduler.slot_class(2), Some(SchedClass::User));
-    assert!(scheduler.release_ipc_priority(13));
+    assert!(scheduler.release_ipc_priority(13, crate::multitask::scheduler::ipc_donation::DonationNamespace::IpcReply));
     assert_eq!(scheduler.slot_class(2), Some(SchedClass::User));
 
     assert!(scheduler.reserve_ipc_priority(601));
-    assert!(scheduler.attach_reserved_ipc_priority(14, 601));
+    assert!(scheduler.attach_reserved_ipc_priority(14, crate::multitask::scheduler::ipc_donation::DonationNamespace::IpcReply, 601));
     assert!(scheduler.inherit_ipc_priority(14, 601, 602));
     assert_eq!(scheduler.slot_class(2), Some(SchedClass::System));
-    assert!(scheduler.release_ipc_priority(14));
+    assert!(scheduler.release_ipc_priority(14, crate::multitask::scheduler::ipc_donation::DonationNamespace::IpcReply));
     assert_eq!(scheduler.slot_class(2), Some(SchedClass::User));
 }
 

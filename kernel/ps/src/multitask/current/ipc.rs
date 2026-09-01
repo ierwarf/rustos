@@ -54,6 +54,13 @@ pub fn arm_block_current_task_on_pager_fault(token: u64) -> bool {
     token != 0 && arm_current_wait(scheduler::BlockReason::PagerFault(token))
 }
 
+/// Arms pagerd on the fixed fault-rendezvous mailbox. Unlike endpoint receive,
+/// this is backed by a bounded atomic waiter table that exception ingress can
+/// consume without touching generic IPC state.
+pub fn arm_block_current_task_on_pager_service() -> bool {
+    arm_current_wait(scheduler::BlockReason::PagerService)
+}
+
 /// The wait payload is owner-generation-bound per slot, and the arm plus its
 /// exact reason are one store, so this CPU's own execution ownership is the
 /// whole precondition. Only a task the owner word does not place `Running`
@@ -167,7 +174,12 @@ pub fn bind_reserved_ipc_priority(reply: u64, donor_task_id: u64, receiver_task_
     // SAFETY: interrupt exclusion and the scheduler access guard make binding
     // the reserved donor to one reply/receiver an atomic scheduler mutation.
     interrupts::without_interrupts(|| unsafe {
-        scheduler_mut().bind_reserved_ipc_priority(reply, donor_task_id, receiver_task_id)
+        scheduler_mut().bind_reserved_ipc_priority(
+            reply,
+            scheduler::ipc_donation::DonationNamespace::IpcReply,
+            donor_task_id,
+            receiver_task_id,
+        )
     })
 }
 
@@ -191,8 +203,45 @@ pub fn bind_ipc_priority_to_process_worker(
 
 /// Revokes the bounded priority donation owned by a completed or cancelled IPC
 /// reply capability. It is safe to call more than once for terminal races.
+/// Binds a pager-fault donation. The fault token lives in its own key space:
+/// it is `(generation << 8) | slot` while a reply handle is
+/// `(generation << 16) | (index + 1)`, and the two overlap numerically, so the
+/// ledger must be told which space this key belongs to.
+pub fn bind_reserved_pager_fault_priority(
+    fault_token: u64,
+    donor_task_id: u64,
+    receiver_task_id: u64,
+) -> bool {
+    // SAFETY: interrupt exclusion and the scheduler access guard make binding
+    // the reserved donor to one fault token and exact worker an atomic
+    // scheduler mutation; no scheduler-owned reference escapes.
+    interrupts::without_interrupts(|| unsafe {
+        scheduler_mut().bind_reserved_ipc_priority(
+            fault_token,
+            scheduler::ipc_donation::DonationNamespace::PagerFault,
+            donor_task_id,
+            receiver_task_id,
+        )
+    })
+}
+
+/// Releases a pager-fault donation from the pager-fault key space.
+pub fn release_pager_fault_priority(fault_token: u64) -> bool {
+    interrupts::without_interrupts(|| {
+        scheduler::release_reply_donation(
+            fault_token,
+            scheduler::ipc_donation::DonationNamespace::PagerFault,
+        )
+    })
+}
+
 pub fn release_ipc_priority(reply: u64) -> bool {
-    interrupts::without_interrupts(|| scheduler::release_reply_donation(reply))
+    interrupts::without_interrupts(|| {
+        scheduler::release_reply_donation(
+            reply,
+            scheduler::ipc_donation::DonationNamespace::IpcReply,
+        )
+    })
 }
 
 /// Returns the exact caller scheduling-context custody carried by one terminal
@@ -216,7 +265,12 @@ pub fn settle_ipc_reply_scheduling_context(
         // SAFETY: interrupts are masked and no scheduler-owned reference escapes.
         unsafe { scheduler_ref().scheduling_context_matches(owner_task_id, identity) }
     });
-    let _ = interrupts::without_interrupts(|| scheduler::release_reply_donation(reply));
+    let _ = interrupts::without_interrupts(|| {
+        scheduler::release_reply_donation(
+            reply,
+            scheduler::ipc_donation::DonationNamespace::IpcReply,
+        )
+    });
     valid
 }
 
@@ -277,7 +331,12 @@ pub fn complete_fast_ipc_reply_wake_handoff_with_custody(
 /// never falls back to the catalog hint path and cannot create execution
 /// authority.
 pub fn complete_ipc_reply_wake_handoff(reply: u64, task_id: u64) -> bool {
-    let _ = interrupts::without_interrupts(|| scheduler::release_reply_donation(reply));
+    let _ = interrupts::without_interrupts(|| {
+        scheduler::release_reply_donation(
+            reply,
+            scheduler::ipc_donation::DonationNamespace::IpcReply,
+        )
+    });
     // SAFETY: interrupts are masked and the scheduler access guard validates
     // the exact terminal reply and task before producing an opaque wake token.
     let token = interrupts::without_interrupts(|| unsafe {

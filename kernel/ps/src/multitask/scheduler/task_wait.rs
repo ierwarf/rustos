@@ -14,6 +14,7 @@ fn encoded_reason(reason: BlockReason) -> (u8, u64) {
         }
         BlockReason::EndpointReply(reply) => (runqueue::wait::REASON_ENDPOINT_REPLY, reply),
         BlockReason::PagerFault(token) => (runqueue::wait::REASON_PAGER_FAULT, token),
+        BlockReason::PagerService => (runqueue::wait::REASON_PAGER_SERVICE, 0),
     }
 }
 
@@ -216,6 +217,13 @@ impl Scheduler {
         (token != 0) && self.arm_block_current_task_with_reason(BlockReason::PagerFault(token))
     }
 
+    /// Arms an authorized pagerd worker on the fixed rendezvous mailbox. The
+    /// worker publishes its task ID in a separate bounded atomic table before
+    /// committing this wait, closing the exception-to-sleep race.
+    pub(in crate::multitask) fn arm_block_current_task_on_pager_service(&mut self) -> bool {
+        self.arm_block_current_task_with_reason(BlockReason::PagerService)
+    }
+
     pub(in crate::multitask) fn arm_block_current_task_with_reason(
         &mut self,
         reason: BlockReason,
@@ -384,6 +392,7 @@ impl Scheduler {
                 }
                 runqueue::wait::REASON_ENDPOINT_REPLY if id != 0 => BlockReason::EndpointReply(id),
                 runqueue::wait::REASON_PAGER_FAULT if id != 0 => BlockReason::PagerFault(id),
+                runqueue::wait::REASON_PAGER_SERVICE if id == 0 => BlockReason::PagerService,
                 _ => panic!("scheduler wait payload has invalid exact reason"),
             }
         }

@@ -231,15 +231,30 @@ pub extern "x86-interrupt" fn double_fault_handler(
     emergency_exception_marker(8);
     let cr2 = Cr2::read().map(|addr| addr.as_u64()).unwrap_or(u64::MAX);
     crate::debug::dump_recent_trace_locations("double-fault");
+    let rsp = stack_frame.stack_pointer.as_u64();
+    let ring0_top = crate::arch::gdt::privilege_stack_top_for_current_cpu();
+    // A kernel stack overflow is the one double fault whose cause is not in
+    // the frame. `#PF` deliberately has no IST - it must stay reentrant,
+    // and this kernel's page-fault handler blocks and yields, so a per-CPU
+    // IST stack would be reused by the next faulting task - which means an
+    // exhausted kernel stack cannot deliver its own `#PF` and escalates here
+    // instead. Reporting the depth below the published ring0 top, and whether
+    // the faulting address sits just under `rsp`, separates that case from an
+    // ordinary double fault without consulting any lock or scheduler state.
+    let depth_below_ring0_top = ring0_top.wrapping_sub(rsp);
+    let push_fault = cr2 != u64::MAX && cr2 < rsp && rsp.wrapping_sub(cr2) <= 4096;
     panic!(
-        "Double fault: error code = {:#x}, cr2 = {:#x}, rip = {:#x}, cs = {:#x}, rflags = {:#x}, rsp = {:#x}, ss = {:#x}",
+        "Double fault: error code = {:#x}, cr2 = {:#x}, rip = {:#x}, cs = {:#x}, rflags = {:#x}, rsp = {:#x}, ss = {:#x}, ring0_stack_top = {:#x}, depth_below_ring0_top = {:#x}, stack_push_fault = {}",
         error_code,
         cr2,
         stack_frame.instruction_pointer.as_u64(),
         stack_frame.code_segment.0,
         stack_frame.cpu_flags.bits(),
-        stack_frame.stack_pointer.as_u64(),
+        rsp,
         stack_frame.stack_segment.0,
+        ring0_top,
+        depth_below_ring0_top,
+        push_fault,
     );
 }
 

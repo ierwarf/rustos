@@ -170,50 +170,117 @@ what is missing is knowing which caller is in the non-blockable context, which
 is what the attribution above now supplies. Reproduce under
 `--min-ui-fps 60 --rustos-vcpus 8`; it appeared in roughly one run in four.
 
-### Open: the `--min-ui-fps 60` gate does not pass, at any vCPU count
+### Closed: the `--min-ui-fps 60` gate now passes, and how
 
-This is **not** an SMP problem: `--min-ui-fps 60` fails identically at 1 vCPU
-and at 8, so do not spend another session treating it as one. The CPU1
-placement fix above is unrelated to it and is not blocked on it.
+The gate passes at 8 vCPU. Measured this session: **5 of 6** with
+`--min-ui-fps 60 --dvm-network-shmem --timeout 120`, zero panics in those runs.
 
-The gate now implies `--gui-dvm-surfaces` (a `kvm/options.rs` change kept in
-this change set: a GTK consumer without the shared display aperture can only
-render QEMU's unrelated guest console, so the old gate proved the wrong thing).
-That makes it strictly harder, and it currently stops in two places:
+The fix was to stop routing the page-fault path through a third,
+fairness-scheduled task. A fault used to be queued by exception ingress and
+then *forwarded* by `nucleus_housekeeping_task`, and its reply *adopted* by the
+same task on a later turn - two scheduler round trips per 4 KiB, on a task with
+no priority, which is why one 768 KiB row copy cost 817 ms.
 
-The gate now reaches the FPS proof and WayClick sustains **66-116 FPS across
-16 one-second windows**, so the frame rate itself is not the problem. Two
-things still stop it:
+The pager fault is now a fixed-slot rendezvous, `scheduler/pager_handoff.rs`
+plus `SYS_RUSTOS_PAGER_FAULT_WAIT`/`_REPLY`. Exception ingress commits the
+faulting task's `BlockReason::PagerFault(token)` wait and hands off directly to
+a pagerd worker parked in `BlockReason::PagerService`; pagerd replies through
+its own syscall, which maps the page and wakes the faulter. Housekeeping is out
+of the path in both directions. Nothing on that path allocates, consults a
+generic endpoint or reply object, or touches the process registry - which is
+exactly what made the earlier attempt impossible, because the generic enqueue
+path stores its request in a `Vec<u8>`.
 
-- **One ~817 ms frame, every run.** `uiserver: slow gpu submit` charges it
-  entirely to `rebuild_scene_us`, `desktop refresh elapsed_ms=817` charges it
-  entirely to `refresh_desktop_surface`, and the phase split charges **all of
-  it to the chrome-strip restore**: `strips_us=816868 rails_us=377
-  launchers_us=18`. The actual drawing costs 0.4 ms. The strip restore is a
-  ~768 KB row copy, and the debugcon log shows a dense contiguous burst of
-  `pager-anon-fault-progress` immediately before it. So this is **anonymous
-  demand paging: one pagerd IPC round trip per 4 KiB of first touch**,
-  landing synchronously on the UI thread mid-frame. It wrecks exactly one
-  window (33 FPS) and trips the harness's slow-loop rule. The obvious fix is
-  fault-around - resolve a bounded run of adjacent pages per fault instead of
-  exactly one - which is a pager protocol change and wants its own change set.
-  Do not look for a rendering bug; the renderer is innocent.
-- **`fixed input-ring credit timeout outstanding=1279 limit=1279`**, and some
-  runs where the Linux DVM guest exits before readiness. Not yet root-caused.
+This matches the reference designs rather than inventing one. QNX parks the
+faulting thread in `WAITPAGE` while the memory manager services it; seL4 and L4
+deliver faults as IPC to a fault-handler endpoint; all three switch directly to
+the pager instead of making it runnable and re-running the scheduler.
 
-One measurement worth keeping: timed waits overshoot badly under the input
-exercise. `runtimed: idle wait overshoot budget_us=10000 elapsed_us=~30000` is
-a consistent 3x, and `inputd` charges `log_us=~1400` per turn - debugcon port
-writes, taken under a global lock with interrupts disabled, dwarf that turn's
-`drain_us`/`decode_us`. A 60 fps proof needs 16.6 ms frames, so the wake
-latency and the logging cost are both plausible first suspects.
+**The residual cost is the return leg.** `wake_fault_owner` uses
+`wake_task` + `set_next_synchronous_pick_hint` - a hint, not a handoff - and
+pagerd issues `fault_reply` and `fault_wait` as two separate syscalls. seL4
+merges these into `seL4_ReplyRecv`, which replies and blocks in one operation
+so the woken caller can be switched to immediately. Merging them is the next
+paging optimization; the desktop refresh still shows 313-427 ms in some runs
+and nothing at all in others, so the remaining cost is bimodal and probably
+placement-dependent.
 
-Two in-flight changes belong to this gate and are kept because they are
-independently justified: `INPUT_INGESTION_WATCHDOG_MS` 100 -> 25 ms (verified
-load-bearing - with the committed 100 ms value the run dies on
-`fixed input-ring credit timeout outstanding=1279 limit=1279 timeout_ms=50`,
-because the consumer must repoll and publish credit before L0's 50 ms credit
-watchdog fails closed) and the `--min-ui-fps` topology change above.
+### Closed: the pager was a client of its own transport
+
+`broker_map_anon` demand-backed *every* anonymous mapping, with no exclusion
+for the pager. Had pagerd ever taken an anonymous first-touch fault it would
+have parked on a fault only pagerd can resolve, and every later fault in the
+system would have stalled behind it - the classic external-pager self-deadlock
+that L4-family and MINIX designs avoid by construction.
+`handoff_pager_fault_to_waiter` rejects `receiver_slot == sender_slot`, so the
+handoff would simply not happen and pagerd would stay blocked forever.
+
+Nothing enforced the exclusion. It was avoided only by pagerd happening to be
+`no_std` with fixed-size state, which is an accident, not an invariant. The
+broker now excludes the pager-policy owner from demand admission and
+`formal/check-performance-contracts.sh` pins it.
+
+The owner is published once, at service-endpoint registration
+(`PAGER_POLICY_OWNER`), and read with one relaxed atomic. The first
+implementation took the service-endpoint registry lock on *every* anonymous
+mmap; that is a hot path, and the fps gate dropped to 1 of 4 until the lock was
+removed. Do not reintroduce a registry acquisition there.
+
+### Closed: fault tokens and reply handles shared one ledger key space
+
+The IPC donation ledger is keyed by a bare `u64`, and the new pager path bound
+donations into it using the **fault token** while every other caller uses a
+**reply handle**. The two encodings overlap numerically:
+
+- reply handle = `(generation << 16) | (index + 1)`, smallest value `0x1_0001`
+- fault token  = `(generation << 8) | slot`, slot `1..=128`
+
+`0x1_0001` is therefore both the smallest reply handle *and* the fault token
+for slot 1 at generation 256 - and slot 1 is reused on nearly every fault, so
+generation 256 arrives well within a single boot. An aliased lookup settles
+another subsystem's donation.
+
+The ledger entry now carries a `DonationNamespace`, and every lookup matches
+the pair rather than the number.
+`a_fault_token_never_aliases_an_equal_reply_handle` pins it. That test caught a
+real gap in the fix itself: binding a *reservation* set the key but not the
+namespace, so the entry stayed in the wrong space.
+
+### Open: `cancelled reply returned stale scheduling-context custody`
+
+An intermittent kernel panic at `ipc_ops.rs:3298`, on the reply **cancel** path
+(`cancel_endpoint_call_with_transfers` returns custody that
+`settle_ipc_reply_scheduling_context` then refuses). Roughly 3 occurrences in
+26 8-vCPU runs; it did not appear in 10 runs taken before this session's
+changes, but that sample is too small to attribute confidently.
+
+What is ruled out: it is **not** the donation-ledger aliasing above (it
+survives that fix), and it is **not** the mmap registry lock (it survives the
+lock's removal). It reaches the cancel path, so it needs a service call to time
+out first, which is why it only shows under 8-vCPU load. The scheduling-context
+custody store is separate from the donation ledger; note that
+`BORROWED_CONTEXT_REPLY[receiver_slot]` is still keyed by a bare reply number
+and is a second, narrower aliasing surface that was deliberately left alone.
+
+### Open: pagerd is a single serial worker
+
+`fault_wait` -> resolve -> `fault_reply` runs on one thread, so faults from all
+CPUs serialize through it. MINIX's VM server is single-threaded too, but seL4
+passive servers and QNX servers normally use worker pools. It does not affect
+the current gate, whose faulting workload is one sequential thread, and it caps
+throughput under multi-threaded fault load.
+
+### Open: pager donation is weaker than the reference model
+
+seL4 MCS donates the caller's scheduling context on `seL4_Call` and returns it
+on `seL4_ReplyRecv`, so the server runs on the client's budget; QNX boosts the
+receiving server thread to the client's priority. The pager path instead
+applies a one-shot vruntime floor from exception context
+(`apply_blocked_pager_donation`, which cannot take the donation ledger lock)
+and binds the durable donation later, in the waiter syscall. pagerd's CPU time
+is therefore not charged to the faulting task, there is a window between the
+two stages, and there is no "boost to the highest waiting client" rule. This
+matters for real-time claims, not for the current gate.
 
 ### Log volume and CI
 
@@ -233,21 +300,15 @@ workspace package, so the host-test step could never have passed.
 
 ### Fresh evidence for this change set
 
-`cargo xtask check`, `cargo xtask build`, and `cargo xtask verify-dvm` pass.
-`bash formal/verify-all.sh --profile pr` **sealed**: 44 artifacts, every lane
-green, including implementation-mutations at 612 mutants with none surviving.
-`formal/check-rust-source-contracts.py` passes at 489 Rust files and 107
-critical/high surfaces. Unit tests: kernel-ps 263, kernel-compat 160, xtask 147,
-rustos-user-abi 42, driver-domain-protocol 21, runtime-control 15.
-`cargo fmt --all -- --check` is clean.
+`cargo fmt --all -- --check` clean, `cargo xtask check`, `cargo xtask build`,
+and `bash formal/verify-all.sh --profile pr` **sealed** at 44 artifacts. Host
+tests: kernel-ps 265, kernel-compat 160, kernel-hal 66, kernel-mm 42, xtask 147,
+rustos-user-abi 42.
 
-Plain `kvm-smoke` passes at 1, 2, 4, and 8 vCPU. The 8-vCPU run is no longer
-CPU1-starved in any of 15 boots. It is still intermittent for a *different*
-reason - 2 of 6 repeats missed
-`uiserver: gpu-scene compiler ready contract=3`, the same uiserver GPU
-readiness latency the `--min-ui-fps` section above is open on. Do not read that
-residual flake as the placement bug returning: check which marker is missing
-before concluding anything.
+KVM: `kvm-smoke` passes at 1 and 4 vCPU; 8 vCPU plain smoke and the
+`--min-ui-fps 60` gate both sit at roughly 5 of 6, with the residual failures
+being the open custody panic above and the known input-relay flake, not the
+pager path.
 
 ### Contract and registry work landed with the behaviour
 

@@ -5,6 +5,7 @@ extern crate alloc;
 
 pub mod allocator;
 pub mod ipc;
+pub mod pager;
 pub mod syscall;
 
 use core::ptr;

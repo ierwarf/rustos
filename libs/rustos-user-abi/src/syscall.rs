@@ -1,15 +1,15 @@
 mod activation_batch;
 mod affinity;
 mod ipc_reply_recv;
+mod pager_fault;
 mod scheduling_context;
 pub mod smp_qualification;
-
 pub use activation_batch::*;
 pub use affinity::*;
 pub use ipc_reply_recv::*;
+pub use pager_fault::*;
 pub use scheduling_context::*;
 pub use smp_qualification::*;
-
 pub const SYS_RUSTOS_DEBUG_PRINT: u64 = 0x5255_0001;
 pub const SYS_RUSTOS_SPAWN_EXEC: u64 = 0x5255_0002;
 pub const SYS_RUSTOS_IPC_ENDPOINT_CREATE: u64 = 0x5255_0003;

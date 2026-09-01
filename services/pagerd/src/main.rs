@@ -25,13 +25,13 @@ use core::mem::size_of;
 use core::panic::PanicInfo;
 
 use pagerd::{request_sender_is_authorized, PagerFaultError, PagerState};
-use rustos_svc_runtime::ipc;
+use rustos_svc_runtime::{ipc, pager as pager_rendezvous};
 use rustos_user_abi::pager::{PagerFaultDispatchWire, PagerReleaseRangeWire, PagerVmRegionWire};
 use rustos_user_abi::syscall::{
     CommercialMaxProtocolRequest, CommercialMaxProtocolResponse,
-    COMMERCIAL_MAX_PAGERD_OP_BACKING_OBJECT, COMMERCIAL_MAX_PAGERD_OP_FAULT_RESOLVE,
-    COMMERCIAL_MAX_PAGERD_OP_RELEASE_OBJECT, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
-    COMMERCIAL_MAX_PROTOCOL_PAGERD, IPC_MAX_INLINE_BYTES, IPC_SERVICE_PAGERD,
+    COMMERCIAL_MAX_PAGERD_OP_BACKING_OBJECT, COMMERCIAL_MAX_PAGERD_OP_RELEASE_OBJECT,
+    COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_PAGERD, IPC_MAX_INLINE_BYTES,
+    IPC_SERVICE_PAGERD,
 };
 
 rustos_svc_runtime::entry!(service_main);
@@ -58,12 +58,13 @@ fn service_main() {
 
 fn serve(endpoint: u64, pager: &mut PagerState) {
     let mut bytes = [0_u8; IPC_MAX_INLINE_BYTES];
+    let mut dispatch = PagerFaultDispatchWire::default();
     loop {
         let mut reply_cap = 0;
         let mut sender_pid = 0;
         let mut sender_tid = 0;
         let received = unsafe {
-            ipc::recv_with_sender(
+            ipc::try_recv_with_sender(
                 endpoint,
                 bytes.as_mut_ptr(),
                 bytes.len(),
@@ -72,16 +73,29 @@ fn serve(endpoint: u64, pager: &mut PagerState) {
                 &mut sender_tid,
             )
         };
-        if received < 0 {
-            continue;
+        if received >= 0 {
+            let response = handle_request(pager, received as usize, &bytes, sender_pid, sender_tid);
+            unsafe {
+                ipc::reply(
+                    reply_cap,
+                    (&response as *const CommercialMaxProtocolResponse).cast::<u8>(),
+                    size_of::<CommercialMaxProtocolResponse>(),
+                );
+            }
         }
-        let response = handle_request(pager, received as usize, &bytes, sender_pid, sender_tid);
-        unsafe {
-            ipc::reply(
-                reply_cap,
-                (&response as *const CommercialMaxProtocolResponse).cast::<u8>(),
-                size_of::<CommercialMaxProtocolResponse>(),
-            );
+
+        // The pager rendezvous is the only anonymous-fault transport. A
+        // generic endpoint arrival wakes this wait and returns EAGAIN, so the
+        // next turn services that request without a polling timer.
+        // SAFETY: `dispatch` is writable for the synchronous syscall and the
+        // wrapper fixes both the pointer and exact wire size.
+        if unsafe { pager_rendezvous::fault_wait(&mut dispatch) } == 0 {
+            let reply = pager
+                .resolve_anonymous_first_touch(dispatch)
+                .unwrap_or_default();
+            // SAFETY: the repr(C) reply is copied synchronously; its embedded
+            // token remains worker-bound and is validated again by ring0.
+            let _ = unsafe { pager_rendezvous::fault_reply(reply) };
         }
     }
 }
@@ -111,24 +125,30 @@ fn handle_request(
         response.status = 13;
         return response;
     }
-    let result = match request.header.op {
-        COMMERCIAL_MAX_PAGERD_OP_BACKING_OBJECT => decode_payload::<PagerVmRegionWire>(&request)
-            .and_then(|region| {
-                pager.admit_region(region)?;
-                Ok(None)
-            }),
-        COMMERCIAL_MAX_PAGERD_OP_RELEASE_OBJECT => {
-            decode_payload::<PagerReleaseRangeWire>(&request).and_then(|release| {
-                pager.release_range(release)?;
-                Ok(None)
-            })
-        }
-        COMMERCIAL_MAX_PAGERD_OP_FAULT_RESOLVE => {
-            decode_payload::<PagerFaultDispatchWire>(&request)
-                .and_then(|dispatch| pager.resolve_anonymous_first_touch(dispatch).map(Some))
-        }
-        _ => Err(PagerFaultError::NotManaged),
-    };
+    let result: Result<Option<rustos_user_abi::pager::PagerFaultReplyWire>, PagerFaultError> =
+        match request.header.op {
+            COMMERCIAL_MAX_PAGERD_OP_BACKING_OBJECT => {
+                decode_payload::<PagerVmRegionWire>(&request).and_then(|region| {
+                    pager.admit_region(region)?;
+                    Ok(None)
+                })
+            }
+            COMMERCIAL_MAX_PAGERD_OP_RELEASE_OBJECT => {
+                decode_payload::<PagerReleaseRangeWire>(&request).and_then(|release| {
+                    pager.release_range(release)?;
+                    Ok(None)
+                })
+            }
+            // Anonymous demand faults use the worker-bound fixed rendezvous. A
+            // generic endpoint request may not carry a frame capability or become
+            // a fallback transport for the exception path.
+            _ if request.header.op
+                == rustos_user_abi::syscall::COMMERCIAL_MAX_PAGERD_OP_FAULT_RESOLVE =>
+            {
+                Err(PagerFaultError::NotManaged)
+            }
+            _ => Err(PagerFaultError::NotManaged),
+        };
     match result {
         Ok(Some(reply)) => write_payload(&mut response, &reply),
         Ok(None) => {}

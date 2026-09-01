@@ -10,6 +10,8 @@ kernel/hal/src/arch/tlb_shootdown.rs	0	0
 kernel/hal/src/arch/timer.rs	0	0
 kernel/hal/src/arch/clock.rs	5	7
 kernel/hal/src/arch/rtc.rs	3	18
+kernel/compat/src/pager.rs	0	0
+kernel/compat/src/user/syscall/linux/pager_fault_ops.rs	0	0
 kernel/compat/src/user/syscall/linux/service_ops/process_time.rs	1	0
 kernel/hal/src/arch/msi.rs	5	19
 kernel/hal/src/arch/pci.rs	4	0

@@ -552,6 +552,21 @@ rg -Fq 'arm_consumer_wake()' \
     echo "inputd wait broker no longer publishes wake generation before cursor recheck" >&2
     exit 1
 }
+# The external pager may not be a client of the transport it is the only
+# server for. Demand-backing pagerd's own anonymous memory parks pagerd on a
+# fault only pagerd can resolve, and every later fault in the system stalls
+# behind it. Nothing can break that cycle from inside, so the exclusion is an
+# invariant of the design rather than an optimization.
+rg -Fq 'let target_is_pager = ipc_ops::process_owns_pager_policy(args.target_pid);' \
+    kernel/compat/src/user/syscall/linux/mm_broker_ops.rs || {
+    echo "anonymous mmap broker lost its pager self-deadlock exclusion" >&2
+    exit 1
+}
+rg -Fq '&& !target_is_pager' \
+    kernel/compat/src/user/syscall/linux/mm_broker_ops.rs || {
+    echo "pager self-deadlock exclusion is no longer applied to demand admission" >&2
+    exit 1
+}
 rg -Fq 'const INPUT_INGESTION_WATCHDOG_MS: u64 = 25;' \
     kernel/compat/src/user/syscall/linux/input_broker_ops.rs || {
     echo "inputd wait broker lost its sub-credit-timeout lost-interrupt watchdog" >&2

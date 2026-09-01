@@ -1231,15 +1231,16 @@ kind = "transition-guard-removal"
 severity = "critical"
 model = "pager-fault-slot-lifecycle/PagerFaultSlotLifecycle"
 flow = "pager-fault-slot-lifecycle"
-find = '''ClaimReply(replyToken, endpointMatches, requestMatches) ==
+find = '''ClaimReply(replyToken, workerMatches, requestMatches) ==
     /\ state = Dispatched
     /\ dispatcherOwns
+    /\ ledgerBound
     /\ replyToken = token
 '''
-replace = '''ClaimReply(replyToken, endpointMatches, requestMatches) ==
+replace = '''ClaimReply(replyToken, workerMatches, requestMatches) ==
     /\ state \in {Blocked, Dispatched}
     /\ replyToken = token
-    /\ endpointMatches
+    /\ workerMatches
     /\ requestMatches
 '''
 occurrence = 1
@@ -1252,12 +1253,8 @@ kind = "transition-effect"
 severity = "critical"
 model = "pager-fault-slot-lifecycle/PagerFaultSlotLifecycle"
 flow = "pager-fault-slot-lifecycle"
-find = '''    /\ state' = Dispatched
-    /\ dispatcherOwns' = TRUE
-'''
-replace = '''    /\ state' = Dispatched
-    /\ dispatcherOwns' = FALSE
-'''
+find = "    /\\ dispatcherOwns' = TRUE"
+replace = "    /\\ dispatcherOwns' = FALSE"
 occurrence = 1
 invariant = "DispatchedHasExactOwner"
 min_counterexample_states = 3
@@ -1268,16 +1265,20 @@ kind = "transition-guard-removal"
 severity = "critical"
 model = "pager-fault-slot-lifecycle/PagerFaultSlotLifecycle"
 flow = "pager-fault-slot-lifecycle"
-find = '''    /\ replyToken = token
+find = '''DispatchToPager(endpointMatches, workerMatches) ==
+    /\ state = Blocked
+    /\ schedulerBlocked
     /\ endpointMatches
-    /\ requestMatches
+    /\ workerMatches
 '''
-replace = '''    /\ replyToken = token
+replace = '''DispatchToPager(endpointMatches, workerMatches) ==
+    /\ state = Blocked
+    /\ schedulerBlocked
     /\ TRUE
-    /\ requestMatches
+    /\ workerMatches
 '''
 occurrence = 1
-invariant = "ReplyClaimRequiresBlocked"
+invariant = "DispatchedHasExactOwner"
 min_counterexample_states = 3
 
 [[mutation]]
@@ -1286,19 +1287,69 @@ kind = "transition-guard-removal"
 severity = "critical"
 model = "pager-fault-slot-lifecycle/PagerFaultSlotLifecycle"
 flow = "pager-fault-slot-lifecycle"
-find = '''    /\ state = Dispatched
+find = '''ClaimReply(replyToken, workerMatches, requestMatches) ==
+    /\ state = Dispatched
     /\ dispatcherOwns
+    /\ ledgerBound
     /\ replyToken = token
-    /\ endpointMatches
+    /\ workerMatches
 '''
-replace = '''    /\ state = Dispatched
+replace = '''ClaimReply(replyToken, workerMatches, requestMatches) ==
+    /\ state = Dispatched
     /\ dispatcherOwns
+    /\ ledgerBound
     /\ TRUE
-    /\ endpointMatches
+    /\ workerMatches
 '''
 occurrence = 1
 invariant = "ReplyClaimRequiresBlocked"
 min_counterexample_states = 3
+
+[[mutation]]
+id = "pager-fault-slot-vruntime-donation-bind-bypass"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "pager-fault-slot-lifecycle/PagerFaultSlotLifecycle"
+flow = "pager-fault-slot-lifecycle"
+find = '''    /\ dispatcherOwns
+    /\ ledgerBound
+    /\ replyToken = token
+'''
+replace = '''    /\ dispatcherOwns
+    /\ TRUE
+    /\ replyToken = token
+'''
+occurrence = 1
+invariant = "ReplyClaimRequiresDonation"
+min_counterexample_states = 4
+
+[[mutation]]
+id = "pager-fault-slot-vruntime-donation-release-bypass"
+kind = "transition-effect"
+severity = "critical"
+model = "pager-fault-slot-lifecycle/PagerFaultSlotLifecycle"
+flow = "pager-fault-slot-lifecycle"
+find = '''Consume ==
+    /\ state = Claimed
+    /\ ledgerBound
+    /\ state' = Free
+    /\ token' = 0
+    /\ schedulerBlocked' = FALSE
+    /\ ledgerBound' = FALSE
+    /\ donationReleased' = TRUE
+'''
+replace = '''Consume ==
+    /\ state = Claimed
+    /\ ledgerBound
+    /\ state' = Free
+    /\ token' = 0
+    /\ schedulerBlocked' = FALSE
+    /\ ledgerBound' = FALSE
+    /\ donationReleased' = FALSE
+'''
+occurrence = 1
+invariant = "DonationReleasedBeforeWake"
+min_counterexample_states = 5
 
 [[mutation]]
 id = "pager-frame-grant-binding-bypass"

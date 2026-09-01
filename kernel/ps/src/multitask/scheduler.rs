@@ -34,9 +34,10 @@ mod dispatch_policy;
 mod donation_ledger;
 mod handoff_queue;
 mod handoffs;
-mod ipc_donation;
+pub(in crate::multitask) mod ipc_donation;
 mod linux_thread_state;
 mod locality;
+mod pager_handoff;
 mod reclaim;
 mod runqueue;
 mod runqueue_policy;
@@ -47,14 +48,15 @@ mod task_bindings;
 mod task_directory;
 mod task_wait;
 mod task_weight;
-pub(in crate::multitask) use runtime_profile::SchedulerEntryCause;
+pub use pager_handoff::PagerFaultHandoffOutcome;
 pub use runtime_profile::drain_scheduler_runtime_profile;
-pub(in crate::multitask) use runtime_profile::publish_scheduler_runtime_profile;
+pub(in crate::multitask) use runtime_profile::{
+    SchedulerEntryCause, publish_scheduler_runtime_profile,
+};
 pub(super) use task_weight::{
     INTERACTIVE_PIT_DIVISOR_FLAG, LOAD_WEIGHT_MASK, MIN_LOAD_WEIGHT, NICE_0_LOAD,
     SYSTEM_CLASS_WEIGHT_FLAG,
 };
-
 pub(in crate::multitask) fn local_dispatch_work_pending(cpu: usize) -> bool {
     // A direct synchronous handoff deliberately has no fair-runqueue entry.
     // Its FIFO publication is therefore an independent durable source of
@@ -67,13 +69,11 @@ pub(in crate::multitask) fn local_dispatch_work_pending(cpu: usize) -> bool {
     #[cfg(test)]
     false
 }
-
 /// Reads the effective scheduling-context owner and live donation reply from
 /// the lock-free custody ledger. Native execution deliberately returns `None`.
 pub(in crate::multitask) fn borrowed_context_charge_token(slot: usize) -> Option<(usize, u64)> {
     donation_ledger::borrowed_context_charge_token(slot)
 }
-
 /// Enqueue the opaque post-reply token only after the scheduler catalog guard
 /// that issued it has dropped.  The target owner validates its runqueue
 /// generation without re-entering Scheduler.
@@ -91,11 +91,10 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU8, Ordering};
 use core::{mem, ptr};
 
-use x86_64::PhysAddr;
-use x86_64::VirtAddr;
 use x86_64::instructions::segmentation::{DS, ES, FS, GS, Segment};
 use x86_64::registers::model_specific::FsBase;
 use x86_64::structures::gdt::SegmentSelector;
+use x86_64::{PhysAddr, VirtAddr};
 
 use kernel_object::api::identity::ObjectIdentity;
 
@@ -136,8 +135,11 @@ pub(super) const MAX_TASK: usize = 128;
 /// Releases reply-owned scheduling urgency without acquiring the scheduler
 /// catalog. The donation ledger's exact reply identity is the terminal owner;
 /// wake publication still runs through its separate owner-word transition.
-pub(in crate::multitask) fn release_reply_donation(reply: u64) -> bool {
-    donation_ledger::release_reply(reply)
+pub(in crate::multitask) fn release_reply_donation(
+    reply: u64,
+    namespace: ipc_donation::DonationNamespace,
+) -> bool {
+    donation_ledger::release_reply(reply, namespace)
 }
 
 pub(in crate::multitask) use task_wait::{
@@ -156,7 +158,11 @@ pub(in crate::multitask) use task_directory::{
 /// catalog guard added one acquisition per synchronous round trip and bought
 /// no exclusion the ledger did not already provide.
 pub(in crate::multitask) fn attach_reply_donation(reply: u64, donor_task_id: u64) -> bool {
-    donation_ledger::attach(reply, donor_task_id)
+    donation_ledger::attach(
+        reply,
+        ipc_donation::DonationNamespace::IpcReply,
+        donor_task_id,
+    )
 }
 
 pub(in crate::multitask) use ipc_donation::{
@@ -464,6 +470,7 @@ pub enum FastIpcCallHandoffOutcome {
     DirectCustodyUnavailable,
     OrderingUnavailable,
 }
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum FastIpcReplyHandoffOutcome {
     Direct,
@@ -1437,7 +1444,12 @@ impl Scheduler {
         donation_required: bool,
     ) -> IpcCallHandoffOutcome {
         let inherited = if donation_required {
-            self.bind_reserved_ipc_priority(reply, donor_task_id, receiver_task_id)
+            self.bind_reserved_ipc_priority(
+                reply,
+                ipc_donation::DonationNamespace::IpcReply,
+                donor_task_id,
+                receiver_task_id,
+            )
         } else {
             true
         };
@@ -1489,7 +1501,12 @@ impl Scheduler {
         let sender_task_id = self.starts[sender_slot]
             .expect("validated fast IPC sender lost identity")
             .id;
-        if !self.bind_reserved_ipc_priority(reply, sender_task_id, receiver_task_id) {
+        if !self.bind_reserved_ipc_priority(
+            reply,
+            ipc_donation::DonationNamespace::IpcReply,
+            sender_task_id,
+            receiver_task_id,
+        ) {
             return FastIpcCallHandoffOutcome::DonationUnavailable;
         }
         #[cfg(not(test))]
@@ -5035,7 +5052,7 @@ impl Scheduler {
         task_id: u64,
     ) -> Option<ReplyWakeHandoff> {
         #[cfg(test)]
-        let _ = self.release_ipc_priority(reply);
+        let _ = self.release_ipc_priority(reply, ipc_donation::DonationNamespace::IpcReply);
         #[cfg(not(test))]
         let _ = reply;
         let slot = self.find_task_slot(task_id)?;
@@ -5139,7 +5156,7 @@ impl Scheduler {
         } else {
             self.find_task_slot(caller_task_id)?
         };
-        let _ = release_reply_donation(reply);
+        let _ = release_reply_donation(reply, ipc_donation::DonationNamespace::IpcReply);
         Some(self.complete_fast_ipc_reply_handoff_slot(reply, caller_slot))
     }
 

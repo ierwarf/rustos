@@ -66,6 +66,8 @@ pub enum PagerFaultSlotError {
     Stale,
     /// The requested transition does not match the current custody state.
     Transition,
+    /// The caller is not the pagerd worker that received this dispatch.
+    Authority,
 }
 
 /// A copied, exact pager request plus the endpoint authority it is bound to.
@@ -81,7 +83,9 @@ pub struct PagerFaultReservation {
     pub endpoint: PagerEndpointCapabilityWire,
     pub zeroed_frame_capability: u64,
     pub granted_frame_rights: u32,
-    pub dispatch_reply_handle: u64,
+    /// The exact pagerd worker that owns the one-shot dispatch, or zero until
+    /// a normal-time generic IPC dispatcher has bound its reply handle.
+    pub dispatch_owner_task_id: u64,
 }
 
 struct PagerFaultSlot {
@@ -111,7 +115,7 @@ struct PagerFaultSlot {
     endpoint_rights: AtomicU64,
     zeroed_frame_capability: AtomicU64,
     granted_frame_rights: AtomicU64,
-    dispatch_reply_handle: AtomicU64,
+    dispatch_owner_task_id: AtomicU64,
 }
 
 impl PagerFaultSlot {
@@ -142,7 +146,7 @@ impl PagerFaultSlot {
             endpoint_rights: AtomicU64::new(0),
             zeroed_frame_capability: AtomicU64::new(0),
             granted_frame_rights: AtomicU64::new(0),
-            dispatch_reply_handle: AtomicU64::new(0),
+            dispatch_owner_task_id: AtomicU64::new(0),
         }
     }
 
@@ -203,6 +207,7 @@ impl PagerFaultSlot {
             .store(zeroed_frame_capability, Ordering::Relaxed);
         self.granted_frame_rights
             .store(u64::from(granted_frame_rights), Ordering::Relaxed);
+        self.dispatch_owner_task_id.store(0, Ordering::Relaxed);
     }
 
     fn read_reservation(&self, token: u64, state: PagerFaultState) -> PagerFaultReservation {
@@ -247,7 +252,7 @@ impl PagerFaultSlot {
             },
             zeroed_frame_capability: self.zeroed_frame_capability.load(Ordering::Relaxed),
             granted_frame_rights: self.granted_frame_rights.load(Ordering::Relaxed) as u32,
-            dispatch_reply_handle: self.dispatch_reply_handle.load(Ordering::Relaxed),
+            dispatch_owner_task_id: self.dispatch_owner_task_id.load(Ordering::Relaxed),
         }
     }
 
@@ -275,7 +280,7 @@ impl PagerFaultSlot {
         self.endpoint_rights.store(0, Ordering::Relaxed);
         self.zeroed_frame_capability.store(0, Ordering::Relaxed);
         self.granted_frame_rights.store(0, Ordering::Relaxed);
-        self.dispatch_reply_handle.store(0, Ordering::Relaxed);
+        self.dispatch_owner_task_id.store(0, Ordering::Relaxed);
     }
 }
 
@@ -391,7 +396,7 @@ impl PagerFaultTable {
             endpoint,
             zeroed_frame_capability,
             granted_frame_rights,
-            dispatch_reply_handle: 0,
+            dispatch_owner_task_id: 0,
         })
     }
 
@@ -441,21 +446,31 @@ impl PagerFaultTable {
             .map_err(|state| state_error(state))
     }
 
-    /// Claims one exact blocked fault for normal-time delivery to pagerd.
-    ///
-    /// Exception entry never calls this function. The dispatcher observes the
-    /// complete request only after the faulting task has committed its typed
-    /// wait, and a reply must later prove this dispatch claim before mapping.
-    fn take_next_dispatchable(&self) -> Option<PagerFaultReservation> {
+    /// Claims one blocked fault for the pagerd rendezvous worker that will
+    /// return the one-shot reply.  The owner stamp is part of the slot
+    /// authority: a pagerd worker may only complete a dispatch it received.
+    fn take_next_dispatchable_for_pager(
+        &self,
+        pager_task_id: u64,
+        endpoint: PagerEndpointCapabilityWire,
+    ) -> Option<PagerFaultReservation> {
+        if pager_task_id == 0 || !endpoint.has_authority() {
+            return None;
+        }
         for (index, slot) in self.slots.iter().enumerate() {
-            // ORDERING: Acquire observes the completed blocked transition and
-            // its preceding fault request publication before this dispatcher
-            // may attempt to take ownership of the token.
+            // ORDERING: Acquire observes the request published before the
+            // fault owner committed its blocked state.
             if slot.state.load(Ordering::Acquire) != SLOT_BLOCKED_ON_PAGER {
                 continue;
             }
-            // ORDERING: Acquire rejects a slot whose generation was recycled
-            // while this bounded scan advanced from another table entry.
+            if slot.endpoint_slot.load(Ordering::Relaxed) != endpoint.slot
+                || slot.endpoint_generation.load(Ordering::Relaxed) != endpoint.generation
+                || slot.endpoint_rights.load(Ordering::Relaxed) != endpoint.rights
+            {
+                continue;
+            }
+            // ORDERING: the state Acquire above publishes every fixed slot
+            // field; generation Acquire additionally rejects recycled slots.
             let generation = slot.generation.load(Ordering::Acquire);
             if generation == 0 {
                 continue;
@@ -465,8 +480,9 @@ impl PagerFaultTable {
                 .compare_exchange(
                     SLOT_BLOCKED_ON_PAGER,
                     SLOT_DISPATCHED_TO_PAGER,
-                    // ORDERING: AcqRel transfers the fully published request
-                    // from the blocked fault owner to exactly one dispatcher.
+                    // ORDERING: the blocked fault's complete request becomes
+                    // visible to exactly one pagerd worker before it receives
+                    // the dispatch wire.
                     Ordering::AcqRel,
                     Ordering::Acquire,
                 )
@@ -474,6 +490,11 @@ impl PagerFaultTable {
             {
                 continue;
             }
+            // ORDERING: Release binds the responder identity before the
+            // syscall returns the wire to pagerd.  A reply path observes this
+            // with Acquire before it may claim the slot.
+            slot.dispatch_owner_task_id
+                .store(pager_task_id, Ordering::Release);
             let slot_part = u64::try_from(index + 1).ok()?;
             let token = (generation << SLOT_BITS) | slot_part;
             return self.snapshot(token).ok();
@@ -481,75 +502,40 @@ impl PagerFaultTable {
         None
     }
 
-    fn bind_dispatch_reply(
+    fn claim_reply_from_pager(
         &self,
         token: u64,
-        reply_handle: u64,
-    ) -> Result<(), PagerFaultSlotError> {
-        if reply_handle == 0 {
-            return Err(PagerFaultSlotError::Malformed);
+        pager_task_id: u64,
+    ) -> Result<PagerFaultReservation, PagerFaultSlotError> {
+        if pager_task_id == 0 {
+            return Err(PagerFaultSlotError::Authority);
         }
         let (slot, generation) = self.slot_for_token(token)?;
-        // ORDERING: Acquire rejects a recycled slot before this binding can
-        // attach a reply handle to a newer reservation's token.
+        // ORDERING: Acquire distinguishes this live generation from a slot
+        // that cancellation already released for reuse.
         if slot.generation.load(Ordering::Acquire) != generation {
             return Err(PagerFaultSlotError::Stale);
         }
-        // ORDERING: Acquire observes the dispatcher's published transition, so
-        // only a slot already handed to the pager accepts a reply handle.
-        if slot.state.load(Ordering::Acquire) != SLOT_DISPATCHED_TO_PAGER {
-            return Err(state_error(slot.state.load(Ordering::Acquire)));
+        // Check lifetime and state before ownership: a cancelled or recycled
+        // token must never be misreported as a worker-authority violation.
+        // ORDERING: Acquire observes dispatch publication before authority is
+        // inspected and reply ownership is claimed.
+        let state = slot.state.load(Ordering::Acquire);
+        if state != SLOT_DISPATCHED_TO_PAGER {
+            return Err(state_error(state));
         }
-        // ORDERING: Release publishes the handle to the response poller, and
-        // the Acquire failure edge keeps a losing racer from double-binding.
-        slot.dispatch_reply_handle
-            .compare_exchange(0, reply_handle, Ordering::Release, Ordering::Acquire)
-            .map(|_| ())
-            .map_err(|_| PagerFaultSlotError::Transition)
-    }
-
-    fn next_dispatched_with_reply(&self) -> Option<PagerFaultReservation> {
-        for (index, slot) in self.slots.iter().enumerate() {
-            // ORDERING: both Acquire loads pair with the dispatcher's Release
-            // publications, so a slot is only polled once its state and reply
-            // handle are jointly visible; a half-published slot is skipped.
-            if slot.state.load(Ordering::Acquire) != SLOT_DISPATCHED_TO_PAGER
-                || slot.dispatch_reply_handle.load(Ordering::Acquire) == 0
-            {
-                continue;
-            }
-            // ORDERING: Acquire pins the generation this scan will encode into
-            // the token, so a concurrent recycle cannot alias a stale token.
-            let generation = slot.generation.load(Ordering::Acquire);
-            if generation == 0 {
-                continue;
-            }
-            let slot_part = u64::try_from(index + 1).ok()?;
-            let token = (generation << SLOT_BITS) | slot_part;
-            if let Ok(reservation) = self.snapshot(token) {
-                return Some(reservation);
-            }
+        // ORDERING: an Acquire load pairs with the rendezvous dispatch stamp,
+        // so an arbitrary pagerd worker cannot turn a guessed live token into
+        // map authority.
+        if slot.dispatch_owner_task_id.load(Ordering::Acquire) != pager_task_id {
+            return Err(PagerFaultSlotError::Authority);
         }
-        None
-    }
-
-    fn claim_reply(&self, token: u64) -> Result<PagerFaultReservation, PagerFaultSlotError> {
-        let (slot, generation) = self.slot_for_token(token)?;
-        // ORDERING: this acquire rejects a response for an earlier slot
-        // generation before it can race the one-shot reply claimant.
-        if slot.generation.load(Ordering::Acquire) != generation {
-            return Err(PagerFaultSlotError::Stale);
-        }
-        // ORDERING: AcqRel elects exactly one reply/cancel winner. A stale
-        // pager response can therefore never obtain mapping authority twice.
-        // ORDERING: this AcqRel CAS lets only one exact blocked token become
-        // ReplyClaimed while every losing response observes the terminal state.
         slot.state
             .compare_exchange(
                 SLOT_DISPATCHED_TO_PAGER,
                 SLOT_REPLY_CLAIMED,
-                // ORDERING: AcqRel elects one reply claimant for this exact
-                // token before any mapping transaction can begin.
+                // ORDERING: AcqRel is the one-shot reply linearization point;
+                // a failed Acquire reports the winning terminal transition.
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
@@ -663,7 +649,120 @@ fn state_error(state: u64) -> PagerFaultSlotError {
     }
 }
 
+/// Bounded, all-atomic pagerd receive registrations.  Exception ingress may
+/// consume one registration but never allocates, locks, or looks up a service
+/// endpoint.  A worker that is already resolving a fault simply has no entry;
+/// its next rendezvous wait drains the fixed fault slots directly.
+struct PagerFaultWaiterTable {
+    task_ids: [AtomicU64; MAX_PAGER_FAULT_SLOTS],
+    endpoint_slots: [AtomicU64; MAX_PAGER_FAULT_SLOTS],
+    endpoint_generations: [AtomicU64; MAX_PAGER_FAULT_SLOTS],
+    endpoint_rights: [AtomicU64; MAX_PAGER_FAULT_SLOTS],
+}
+
+impl PagerFaultWaiterTable {
+    const fn new() -> Self {
+        Self {
+            task_ids: [const { AtomicU64::new(0) }; MAX_PAGER_FAULT_SLOTS],
+            endpoint_slots: [const { AtomicU64::new(0) }; MAX_PAGER_FAULT_SLOTS],
+            endpoint_generations: [const { AtomicU64::new(0) }; MAX_PAGER_FAULT_SLOTS],
+            endpoint_rights: [const { AtomicU64::new(0) }; MAX_PAGER_FAULT_SLOTS],
+        }
+    }
+
+    fn register(&self, task_id: u64, endpoint: PagerEndpointCapabilityWire) -> bool {
+        if task_id == 0 || !endpoint.has_authority() {
+            return false;
+        }
+        for (index, slot) in self.task_ids.iter().enumerate() {
+            // ORDERING: Acquire pairs with waiter publication so endpoint
+            // identity fields can be read Relaxed from the claimed entry.
+            if slot.load(Ordering::Acquire) == task_id {
+                let registered = PagerEndpointCapabilityWire {
+                    slot: self.endpoint_slots[index].load(Ordering::Relaxed),
+                    generation: self.endpoint_generations[index].load(Ordering::Relaxed),
+                    rights: self.endpoint_rights[index].load(Ordering::Relaxed),
+                };
+                if registered == endpoint {
+                    return true;
+                }
+                return false;
+            }
+        }
+        for (index, slot) in self.task_ids.iter().enumerate() {
+            // `u64::MAX` is an internal initializing sentinel. Exception
+            // ingress ignores it until endpoint authority has been published.
+            // ORDERING: Acquire reserves an empty entry without consuming a
+            // concurrently published waiter.
+            if slot
+                .compare_exchange(0, u64::MAX, Ordering::Acquire, Ordering::Relaxed)
+                .is_err()
+            {
+                continue;
+            }
+            self.endpoint_slots[index].store(endpoint.slot, Ordering::Relaxed);
+            self.endpoint_generations[index].store(endpoint.generation, Ordering::Relaxed);
+            self.endpoint_rights[index].store(endpoint.rights, Ordering::Relaxed);
+            // ORDERING: Release publishes the complete endpoint identity to
+            // exception ingress and later cancellation.
+            slot.store(task_id, Ordering::Release);
+            return true;
+        }
+        false
+    }
+
+    fn take_one_for_endpoint(&self, endpoint: PagerEndpointCapabilityWire) -> Option<u64> {
+        if !endpoint.has_authority() {
+            return None;
+        }
+        for (index, task_id) in self.task_ids.iter().enumerate() {
+            // ORDERING: Acquire observes all endpoint fields published before
+            // the task identity and ignores the initializing sentinel.
+            let observed = task_id.load(Ordering::Acquire);
+            if observed == 0 || observed == u64::MAX {
+                continue;
+            }
+            let registered = PagerEndpointCapabilityWire {
+                slot: self.endpoint_slots[index].load(Ordering::Relaxed),
+                generation: self.endpoint_generations[index].load(Ordering::Relaxed),
+                rights: self.endpoint_rights[index].load(Ordering::Relaxed),
+            };
+            if registered != endpoint {
+                continue;
+            }
+            // ORDERING: AcqRel consumes exactly one published waiter; failure
+            // Acquire observes the competing take or removal.
+            if task_id
+                .compare_exchange(observed, 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Some(observed);
+            }
+        }
+        None
+    }
+
+    fn remove(&self, task_id: u64) -> bool {
+        if task_id == 0 {
+            return false;
+        }
+        let mut removed = false;
+        for slot in &self.task_ids {
+            // ORDERING: AcqRel terminally revokes this worker's waiter while
+            // failure Acquire observes a concurrent exact dispatch.
+            if slot
+                .compare_exchange(task_id, 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                removed = true;
+            }
+        }
+        removed
+    }
+}
+
 static PAGER_FAULTS: PagerFaultTable = PagerFaultTable::new();
+static PAGER_FAULT_WAITERS: PagerFaultWaiterTable = PagerFaultWaiterTable::new();
 
 /// Reserve one fixed, generation-bound pager-fault slot without allocating.
 pub fn reserve_pager_fault(
@@ -697,26 +796,44 @@ pub fn mark_pager_fault_blocked(token: u64) -> Result<(), PagerFaultSlotError> {
     PAGER_FAULTS.mark_blocked(token)
 }
 
-/// Returns one normal-time pager dispatch claim, if a faulting task has
-/// already committed its exact `PagerFault(token)` wait.
-pub fn take_next_pager_fault_for_dispatch() -> Option<PagerFaultReservation> {
-    PAGER_FAULTS.take_next_dispatchable()
+/// Registers one pagerd worker as ready to receive a fault rendezvous.
+///
+/// This runs in ordinary syscall context. Its counterpart is consumed by the
+/// exception path through a fixed atomic table, never through endpoint lookup
+/// or the generic IPC allocator.
+pub fn register_pager_fault_waiter(task_id: u64, endpoint: PagerEndpointCapabilityWire) -> bool {
+    PAGER_FAULT_WAITERS.register(task_id, endpoint)
 }
 
-pub fn bind_pager_fault_dispatch_reply(
+/// Removes every stale receive registration for this pagerd worker.
+pub fn unregister_pager_fault_waiter(task_id: u64) -> bool {
+    PAGER_FAULT_WAITERS.remove(task_id)
+}
+
+/// Takes one waiting pagerd worker for this fault's exact endpoint authority.
+/// This is bounded and all-atomic by construction.
+pub fn take_pager_fault_waiter_for(token: u64) -> Option<u64> {
+    let reservation = PAGER_FAULTS.snapshot(token).ok()?;
+    PAGER_FAULT_WAITERS.take_one_for_endpoint(reservation.endpoint)
+}
+
+/// Returns one fixed pager-fault dispatch to the exact pagerd worker that
+/// dequeued it. The returned token is bound to that worker for the reply.
+pub fn take_next_pager_fault_for_rendezvous(
+    pager_task_id: u64,
+    endpoint: PagerEndpointCapabilityWire,
+) -> Option<PagerFaultReservation> {
+    PAGER_FAULTS.take_next_dispatchable_for_pager(pager_task_id, endpoint)
+}
+
+/// Claims an exact rendezvous reply after checking the dispatching pagerd
+/// worker identity. This is deliberately separate from the generic IPC
+/// completion claim so a reply capability cannot cross the two transports.
+pub fn claim_pager_fault_reply_from_pager(
     token: u64,
-    reply_handle: u64,
-) -> Result<(), PagerFaultSlotError> {
-    PAGER_FAULTS.bind_dispatch_reply(token, reply_handle)
-}
-
-pub fn next_dispatched_pager_fault_response() -> Option<PagerFaultReservation> {
-    PAGER_FAULTS.next_dispatched_with_reply()
-}
-
-/// Claim the reply authority exactly once before a PTE transaction begins.
-pub fn claim_pager_fault_reply(token: u64) -> Result<PagerFaultReservation, PagerFaultSlotError> {
-    PAGER_FAULTS.claim_reply(token)
+    pager_task_id: u64,
+) -> Result<PagerFaultReservation, PagerFaultSlotError> {
+    PAGER_FAULTS.claim_reply_from_pager(token, pager_task_id)
 }
 
 /// Consume a reply claimant after its mapping transaction commits or rolls back.
@@ -724,14 +841,19 @@ pub fn consume_pager_fault_reply(token: u64) -> Result<(), PagerFaultSlotError> 
     PAGER_FAULTS.release(token, PagerFaultState::ReplyClaimed)
 }
 
-/// Cancel a fault whose IPC, deadline, unmap, exec, or exit path won the race.
+/// Cancel a fault whose pager dispatch, deadline, unmap, exec, or exit path won
+/// the race.
 ///
 /// Cancellation claims slot custody before waking the exact task. A reply that
 /// already claimed the slot therefore prevents an early resume, while a block
 /// commit racing this claim observes either the wake or `CancelClaimed` and
-/// performs its local owner-word rollback.
+/// performs its local owner-word rollback. A dispatched cancellation also
+/// revokes its token-bound scheduling-context donation before the donor wakes.
 pub fn cancel_pager_fault(token: u64, state: PagerFaultState) -> Result<(), PagerFaultSlotError> {
     let claimed = PAGER_FAULTS.claim_cancellation(token, state)?;
+    if state == PagerFaultState::DispatchedToPager {
+        let _ = super::current::release_ipc_priority(token);
+    }
     let _ = super::current::wake_task(claimed.request.task_id);
     PAGER_FAULTS.release(token, PagerFaultState::CancelClaimed)
 }
@@ -808,22 +930,18 @@ mod tests {
 
         table.mark_blocked(reservation.token).expect("block fault");
         let dispatched = table
-            .take_next_dispatchable()
+            .take_next_dispatchable_for_pager(71, endpoint())
             .expect("dispatch exact blocked fault");
         assert_eq!(dispatched.token, reservation.token);
         assert_eq!(dispatched.state, PagerFaultState::DispatchedToPager);
-        assert_eq!(dispatched.dispatch_reply_handle, 0);
-        table
-            .bind_dispatch_reply(reservation.token, 0xbeef)
-            .expect("bind exact IPC reply");
+        assert_eq!(dispatched.dispatch_owner_task_id, 71);
         assert_eq!(
-            table
-                .next_dispatched_with_reply()
-                .expect("poll dispatched response")
-                .dispatch_reply_handle,
-            0xbeef
+            table.claim_reply_from_pager(reservation.token, 72),
+            Err(PagerFaultSlotError::Authority)
         );
-        let claimed = table.claim_reply(reservation.token).expect("claim reply");
+        let claimed = table
+            .claim_reply_from_pager(reservation.token, 71)
+            .expect("claim exact pager reply");
         assert_eq!(claimed.state, PagerFaultState::ReplyClaimed);
         assert_eq!(claimed.request, reservation.request);
         table
@@ -858,19 +976,22 @@ mod tests {
         let table = PagerFaultTable::new();
         let reservation = table.reserve(request(), endpoint()).expect("reserve fault");
         table.mark_blocked(reservation.token).expect("block fault");
+        table
+            .take_next_dispatchable_for_pager(71, endpoint())
+            .expect("dispatch to exact pager worker");
         let cancelled = table
-            .claim_cancellation(reservation.token, PagerFaultState::BlockedOnPager)
+            .claim_cancellation(reservation.token, PagerFaultState::DispatchedToPager)
             .expect("claim cancellation");
         assert_eq!(cancelled.state, PagerFaultState::CancelClaimed);
         assert_eq!(
-            table.claim_reply(reservation.token),
+            table.claim_reply_from_pager(reservation.token, 71),
             Err(PagerFaultSlotError::Transition)
         );
         table
             .release(reservation.token, PagerFaultState::CancelClaimed)
             .expect("consume cancellation");
         assert_eq!(
-            table.claim_reply(reservation.token),
+            table.claim_reply_from_pager(reservation.token, 71),
             Err(PagerFaultSlotError::Stale)
         );
     }
@@ -893,11 +1014,12 @@ mod tests {
     }
 
     #[test]
-    fn reply_cannot_claim_a_task_that_is_not_blocked_on_pager() {
+    fn reply_cannot_claim_before_rendezvous_dispatch() {
         let table = PagerFaultTable::new();
         let reservation = table.reserve(request(), endpoint()).expect("reserve fault");
+        table.mark_blocked(reservation.token).expect("block fault");
         assert_eq!(
-            table.claim_reply(reservation.token),
+            table.claim_reply_from_pager(reservation.token, 71),
             Err(PagerFaultSlotError::Transition)
         );
     }
@@ -909,16 +1031,33 @@ mod tests {
         // Still FaultPending: the faulting task has not yet committed its
         // block, so publishing this request to the pager would let a reply
         // race a task that is still running on its own stack.
-        assert!(table.take_next_dispatchable().is_none());
+        assert!(
+            table
+                .take_next_dispatchable_for_pager(7, endpoint())
+                .is_none()
+        );
         table
             .mark_blocked(reservation.token)
             .expect("commit the block");
+        let wrong_endpoint = PagerEndpointCapabilityWire {
+            generation: endpoint().generation + 1,
+            ..endpoint()
+        };
+        assert!(
+            table
+                .take_next_dispatchable_for_pager(7, wrong_endpoint)
+                .is_none()
+        );
         let dispatched = table
-            .take_next_dispatchable()
+            .take_next_dispatchable_for_pager(7, endpoint())
             .expect("a blocked fault is dispatchable");
         assert_eq!(dispatched.token, reservation.token);
         assert_eq!(dispatched.state, PagerFaultState::DispatchedToPager);
-        // Exactly one dispatcher may own a request.
-        assert!(table.take_next_dispatchable().is_none());
+        // Exactly one endpoint-authorized pagerd worker may own a request.
+        assert!(
+            table
+                .take_next_dispatchable_for_pager(8, endpoint())
+                .is_none()
+        );
     }
 }

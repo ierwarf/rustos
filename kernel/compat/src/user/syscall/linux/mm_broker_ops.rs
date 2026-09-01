@@ -148,7 +148,17 @@ fn broker_map_anon(args: &RustosMmBrokerArgs) -> Result<(), i64> {
     // receive-side `(0, 0)` ring0 identity for FAULT_RESOLVE; user-originated
     // BACKING_OBJECT requests retain exact nonzero subject authentication.
     const PAGER_DEMAND_ADMISSION_WIRED: bool = true;
+    // The pager may not be a client of the transport it is the only server
+    // for. If pagerd's own anonymous memory were demand-backed, its first
+    // touch would park pagerd on a fault that only pagerd can resolve, and
+    // every later fault in the system would stall behind it - the classic
+    // external-pager self-deadlock. Nothing else in the system can break that
+    // cycle, so the exclusion is enforced here at admission rather than left
+    // to pagerd happening not to allocate. Its mapping falls through to the
+    // eager path below, exactly as it did before demand paging existed.
+    let target_is_pager = ipc_ops::process_owns_pager_policy(args.target_pid);
     if PAGER_DEMAND_ADMISSION_WIRED
+        && !target_is_pager
         && args.prot != 0
         && pager_admission::admit_anonymous_region(args.target_pid, start, mapping_end, args.prot)
             .is_ok()

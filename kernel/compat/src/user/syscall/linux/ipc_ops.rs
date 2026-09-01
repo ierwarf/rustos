@@ -429,6 +429,21 @@ pub(super) fn current_process_service_capability_snapshot() -> Option<(u64, u64)
     Some((process_id, capabilities))
 }
 
+/// Process that owns the live pager-policy capability, or `0`.
+///
+/// The anonymous-mmap broker must know whether it is mapping *for* the pager,
+/// and it is hot enough that taking the service-endpoint registry lock on
+/// every mapping contends with registration and lookup. The owner changes only
+/// when a service endpoint is published, so publish it once here and let the
+/// broker read one atomic.
+static PAGER_POLICY_OWNER: AtomicU64 = AtomicU64::new(0);
+
+/// Whether `process_id` owns the live pager-policy capability. Lock-free.
+pub(super) fn process_owns_pager_policy(process_id: u64) -> bool {
+    // ORDERING: Acquire pairs with the registration Release above.
+    process_id != 0 && PAGER_POLICY_OWNER.load(Ordering::Acquire) == process_id
+}
+
 fn current_process_has_service_capability_locked(capability: u64, process_id: u64) -> bool {
     if capability == 0 || multitask::is_user_process_exiting(process_id) {
         return false;
@@ -1046,6 +1061,12 @@ pub(super) fn syscall_linux_rustos_ipc_register_service_endpoint(
     }
     SERVICE_ENDPOINT_CAPS[index].store(authorization.capability, Ordering::Release);
     SERVICE_ENDPOINT_OWNERS[index].store(process_id, Ordering::Release);
+    if authorization.capability & rustos_user_abi::syscall::IPC_SERVICE_CAP_PAGER_POLICY != 0 {
+        // ORDERING: Release publishes the pager owner before its endpoint
+        // becomes visible, so a mapping that can reach the pager transport
+        // already observes which process must be excluded from it.
+        PAGER_POLICY_OWNER.store(process_id, Ordering::Release);
+    }
     // Publish the endpoint last. Acquire readers that observe it also observe
     // the rootd-authorized owner and capability written above.
     SERVICE_ENDPOINTS[index].store(endpoint, Ordering::Release);

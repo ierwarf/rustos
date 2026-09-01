@@ -268,8 +268,8 @@ reason = "Per-process VMA backing holds must outlive descriptor close, fork exac
 [[risk_surfaces]]
 path = "kernel/ps/src/multitask/scheduler.rs"
 severity = "critical"
-flows = ["scheduler-lifecycle", "scheduler-dispatch", "bootstrap-activation-handoff", "atomic-process-activation-batch", "scheduler-cpu-ownership", "smp-reschedule-ipi-lifecycle", "task-affinity-lifecycle", "cross-cpu-task-retirement", "process-address-space-lifecycle", "exception-retirement", "endpoint-lifecycle", "syscall-simd-lifecycle"]
-reason = "Task state, CPU fairness, wake races, retirement, and context integrity converge here."
+flows = ["scheduler-lifecycle", "scheduler-dispatch", "bootstrap-activation-handoff", "atomic-process-activation-batch", "scheduler-cpu-ownership", "smp-reschedule-ipi-lifecycle", "task-affinity-lifecycle", "cross-cpu-task-retirement", "process-address-space-lifecycle", "exception-retirement", "endpoint-lifecycle", "syscall-simd-lifecycle", "pager-fault-slot-lifecycle"]
+reason = "Task state, CPU fairness, wake races, retirement, context integrity, and direct pager-fault scheduler custody converge here."
 
 [[risk_surfaces]]
 path = "kernel/ps/src/multitask/scheduler/affinity.rs"
@@ -1280,6 +1280,7 @@ models = [
     "cross-cpu-task-retirement/CrossCpuTaskRetirement",
     "exec-address-space-transaction/ExecAddressSpaceTransaction",
     "ipc-fast-handoff/IpcFastHandoff",
+    "pager-fault-slot-lifecycle/PagerFaultSlotLifecycle",
     "scheduler-cpu-ownership/SchedulerCpuOwnership",
     "scheduling-context-budget/SchedulingContextBudget",
     "scheduler-thread-demotion/SchedulerThreadDemotion",
@@ -1985,6 +1986,34 @@ reason = "Page-fault entry must reserve only fixed one-shot token custody, publi
 
 [[source_mappings]]
 path = "kernel/ps/src/multitask/pager_fault.rs"
+models = ["pager-fault-slot-lifecycle/PagerFaultSlotLifecycle"]
+
+[[risk_surfaces]]
+path = "kernel/compat/src/user/syscall/linux/pager_fault_ops.rs"
+severity = "critical"
+flows = ["pager-fault-slot-lifecycle"]
+reason = "Only pager-policy authority may wait or reply; dispatch must bind the exact fault token, donor, endpoint-derived worker, and bounded scheduling-context donation before userspace can resolve the fault."
+
+[[source_mappings]]
+path = "kernel/compat/src/user/syscall/linux/pager_fault_ops.rs"
+models = ["pager-fault-slot-lifecycle/PagerFaultSlotLifecycle"]
+
+[[risk_surfaces]]
+path = "kernel/compat/src/pager.rs"
+severity = "critical"
+flows = ["pager-fault-slot-lifecycle", "pager-frame-grant-lifecycle"]
+reason = "Pager completion must claim exact worker-bound authority, consume or reject the opaque frame grant once, release donation before waking the donor, and never accept a generic IPC reply handle."
+
+[[source_mappings]]
+path = "kernel/compat/src/pager.rs"
+models = ["pager-fault-slot-lifecycle/PagerFaultSlotLifecycle", "pager-frame-grant-lifecycle/PagerFrameGrantLifecycle"]
+
+[[source_mappings]]
+path = "libs/rustos-user-abi/src/syscall.rs"
+models = ["pager-fault-slot-lifecycle/PagerFaultSlotLifecycle"]
+
+[[source_mappings]]
+path = "libs/rustos-svc-runtime/src/pager.rs"
 models = ["pager-fault-slot-lifecycle/PagerFaultSlotLifecycle"]
 
 [[risk_surfaces]]

@@ -1030,7 +1030,7 @@ handle_reply_body="$(sed -n '/^pub(super) fn syscall_linux_rustos_ipc_reply_with
 reply_recv_body="$(sed -n '/^pub(super) fn syscall_linux_rustos_ipc_reply_recv_with_sender/,$p' kernel/compat/src/user/syscall/linux/ipc_reply_recv.rs)"
 if ! grep -Fq 'scheduler_mut().complete_ipc_reply_wake_handoff(reply, task_id)' <<<"$reply_current_body" \
     || ! grep -Fq 'token.is_some_and(scheduler::enqueue_reply_wake_handoff)' <<<"$reply_current_body" \
-    || ! grep -Fq 'let _ = self.release_ipc_priority(reply);' <<<"$reply_scheduler_body" \
+    || ! grep -Fq 'let _ = self.release_ipc_priority(reply, ipc_donation::DonationNamespace::IpcReply);' <<<"$reply_scheduler_body" \
     || ! grep -Fq 'if !self.wake_task_slot(slot)' <<<"$reply_scheduler_body" \
     || ! grep -Fq 'ReplyWakeHandoff::from_owner(slot, task_id, owner)' <<<"$reply_scheduler_body" \
     || ! grep -Fq 'if !owner_still_matches(token)' <<<"$reply_enqueue_body" \
@@ -1358,7 +1358,7 @@ pager-frame-grant-lifecycle/PagerFrameGrantLifecycle|kernel-mm|memory::frame_cap
 pager-frame-grant-lifecycle/PagerFrameGrantLifecycle|kernel-mm|memory::frame_capability::tests::reused_slot_never_accepts_stale_frame_handle
 pager-frame-grant-lifecycle/PagerFrameGrantLifecycle|kernel-mm|memory::frame_capability::tests::rights_are_subset_checked_and_wx_is_never_published
 pager-fault-slot-lifecycle/PagerFaultSlotLifecycle|kernel-ps|multitask::pager_fault::tests::fault_slot_is_exact_and_consumed_once
-pager-fault-slot-lifecycle/PagerFaultSlotLifecycle|kernel-ps|multitask::pager_fault::tests::reply_cannot_claim_a_task_that_is_not_blocked_on_pager
+pager-fault-slot-lifecycle/PagerFaultSlotLifecycle|kernel-ps|multitask::scheduler::tests::pager_fault_handoff_requires_exact_waits_and_donates_after_worker_wake
 pager-fault-slot-lifecycle/PagerFaultSlotLifecycle|kernel-ps|multitask::pager_fault::tests::cancellation_wins_over_late_reply_claim
 pager-vma-publication/PagerVmaPublication|kernel-ps|multitask::pager_vma::tests::publication_stamps_exact_process_mm_and_nonzero_vma_generation
 pager-vma-publication/PagerVmaPublication|kernel-ps|multitask::pager_vma::tests::overlap_and_permission_escalation_fail_closed
