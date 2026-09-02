@@ -3,7 +3,7 @@ exit_and_publication_never_leave_authority_live	kernel/compat/src/user/syscall/l
 futex_compare_and_waiter_publication_have_one_linearization_point	kernel/compat/src/user/syscall/linux/service_ops/futex_thread.rs	futex_wait	atomic-compare-and-waiter-publication-share-one-bucket-linearization-point
 retired_slot_cannot_reuse_task_identity_before_cleanup	kernel/ps/src/multitask/scheduler.rs	complete_retired_task_cleanup	retire-clean-ack-reap-with-exact-task-and-process-identity
 readiness_change_cannot_be_lost_across_arm	kernel/compat/src/user/syscall/linux/service_ops/poll_epoll.rs	syscall_linux_epoll_wait	check-register-recheck-arm-verify-commit
-stable_endpoint_snapshot_never_admits_a_torn_publication	kernel/compat/src/user/syscall/linux/ipc_ops.rs	stable_published_service_endpoint	epoch-and-endpoint-double-read-admits-owned-publication
+stable_endpoint_snapshot_never_admits_a_torn_publication	kernel/compat/src/user/syscall/linux/ipc_ops/service_ownership.rs	stable_published_service_endpoint	epoch-and-endpoint-double-read-admits-owned-publication
 wait_lock_unlock_skips_retired_front_waiters	kernel/io-manager/src/sync.rs	wake_first_live_waiter	retired-queue-head-cannot-consume-the-only-live-wakeup
 ipc_generation_reuse_never_aliases_stale_handle	kernel/ipc-runtime/src/ipc/slab.rs	GenerationalSlab::remove	remove-advances-generation-and-wrap-retires-slot
 ipc_lock_class_graph_rejects_inverse_order	kernel/nucleus-core/src/util/lockdep.rs	before_acquire	observed-class-edge-cannot-close-a-cycle

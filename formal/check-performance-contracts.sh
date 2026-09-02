@@ -76,9 +76,12 @@ rg -Fq 'const SERVICE_ENDPOINT_STABLE_READ_ATTEMPTS: usize = 3;' "$ipc_ops" || {
     echo "service endpoint stable-read bound drifted" >&2
     exit 1
 }
+# The lookup predicates moved into `ipc_ops/service_ownership.rs`; the
+# stable-read bound stays with the registry arrays in `ipc_ops.rs`.
+service_ownership=kernel/compat/src/user/syscall/linux/ipc_ops/service_ownership.rs
 service_lookup_body=$(sed -n \
-    '/^fn service_endpoint_raw(/,/^fn stable_service_endpoint_snapshot(/p' \
-    "$ipc_ops")
+    '/^pub(super) fn service_endpoint_raw(/,/^pub(super) fn stable_service_endpoint_snapshot(/p' \
+    "$service_ownership")
 if grep -Fq 'SERVICE_ENDPOINT_REGISTRY_MUTATION.lock()' <<<"$service_lookup_body"; then
     echo "stable service endpoint lookup reacquired the global mutation lock" >&2
     exit 1

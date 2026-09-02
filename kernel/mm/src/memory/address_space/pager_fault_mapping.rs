@@ -154,33 +154,45 @@ impl ProcessAddressSpace {
             .checked_sub(page_count)
             .ok_or(AddressSpaceError::InvalidFrameOwnership)?;
 
+        let range_end = pager_fault_range_end(start, page_count)?;
+        let leaves = self.pager_fault_leaves_in_range(start.as_u64(), range_end, page_count)?;
+        if leaves.len() != page_count {
+            return Err(AddressSpaceError::NotMapped);
+        }
+
         let mut frames = Vec::new();
         frames
             .try_reserve_exact(page_count)
             .map_err(|_| AddressSpaceError::OutOfFrames)?;
-        for page_index in 0..page_count {
+        for (page_index, leaf) in leaves.iter().copied().enumerate() {
             let virt = page_addr(start, page_index)?;
-            let leaf = self
-                .pager_fault_leaf_at(virt.as_u64())
-                .ok_or(AddressSpaceError::NotMapped)?;
-            if self.translate_user(virt).map(|phys| phys.as_u64()) != Some(leaf.physical_address)
-                || frames.contains(&leaf.physical_address)
-            {
+            if leaf.virtual_address != virt.as_u64() {
+                return Err(AddressSpaceError::NotMapped);
+            }
+            if self.translate_user(virt).map(|phys| phys.as_u64()) != Some(leaf.physical_address) {
                 return Err(AddressSpaceError::InvalidFrameOwnership);
             }
             frames.push(leaf.physical_address);
         }
+        frames.sort_unstable();
+        if frames.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(AddressSpaceError::InvalidFrameOwnership);
+        }
 
         let mutation = begin_address_space_mutation(self.root_phys());
-        for (page_index, frame_phys) in frames.iter().copied().enumerate() {
-            let virt = page_addr(start, page_index)?;
+        for leaf in leaves.iter().copied() {
+            let virt = VirtAddr::new(leaf.virtual_address);
             let unmapped = self
                 .unmap_user_page(virt)
                 .ok_or(AddressSpaceError::NotMapped)?;
-            debug_assert_eq!(unmapped.as_u64(), frame_phys);
-            self.release_pager_fault_leaf(virt.as_u64(), frame_phys)
-                .expect("pager-fault leaf preflight lost exact ownership");
+            debug_assert_eq!(unmapped.as_u64(), leaf.physical_address);
         }
+        let removed = self.remove_pager_fault_leaves_in_range(start.as_u64(), range_end);
+        assert_eq!(
+            removed,
+            leaves.len(),
+            "pager-fault range preflight lost exact leaf ownership"
+        );
         let _flushed_mutation = mutation.flush_for_reclaim();
         free_owned_frames_exact(&frames);
         self.pager_fault_leaf_limit = pager_leaf_limit;
@@ -246,51 +258,53 @@ impl ProcessAddressSpace {
             .checked_sub(page_count)
             .ok_or(AddressSpaceError::InvalidFrameOwnership)?;
 
-        let present_capacity = page_count.min(self.pager_fault_leaves.len());
-        let mut virtual_addresses = Vec::new();
+        let range_end = pager_fault_range_end(start, page_count)?;
+        let leaves = self.pager_fault_leaves_in_range(start.as_u64(), range_end, page_count)?;
         let mut frames = Vec::new();
-        virtual_addresses
-            .try_reserve_exact(present_capacity)
-            .map_err(|_| AddressSpaceError::OutOfFrames)?;
         frames
-            .try_reserve_exact(present_capacity)
+            .try_reserve_exact(leaves.len())
             .map_err(|_| AddressSpaceError::OutOfFrames)?;
+        let mut leaf_index = 0;
         for page_index in 0..page_count {
             let virt = page_addr(start, page_index)?;
-            match self.pager_fault_leaf_at(virt.as_u64()) {
-                Some(leaf) => {
+            match leaves.get(leaf_index).copied() {
+                Some(leaf) if leaf.virtual_address == virt.as_u64() => {
                     if self.translate_user(virt).map(|phys| phys.as_u64())
                         != Some(leaf.physical_address)
-                        || frames.contains(&leaf.physical_address)
                     {
                         return Err(AddressSpaceError::InvalidFrameOwnership);
                     }
-                    virtual_addresses.push(virt.as_u64());
                     frames.push(leaf.physical_address);
+                    leaf_index += 1;
                 }
-                None if matches!(self.lookup_user_page_state(virt), UserPageLookup::MissingPt) => {}
-                None => return Err(AddressSpaceError::NotMapped),
+                _ if matches!(self.lookup_user_page_state(virt), UserPageLookup::MissingPt) => {}
+                _ => return Err(AddressSpaceError::NotMapped),
             }
+        }
+        if leaf_index != leaves.len() {
+            return Err(AddressSpaceError::InvalidFrameOwnership);
+        }
+        frames.sort_unstable();
+        if frames.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(AddressSpaceError::InvalidFrameOwnership);
         }
 
         let mutation = begin_address_space_mutation(self.root_phys());
-        for (virtual_address, frame_phys) in virtual_addresses
-            .iter()
-            .copied()
-            .zip(frames.iter().copied())
-        {
-            let virt = VirtAddr::new(virtual_address);
+        for leaf in leaves.iter().copied() {
+            let virt = VirtAddr::new(leaf.virtual_address);
             let unmapped = self
                 .unmap_user_page(virt)
                 .ok_or(AddressSpaceError::NotMapped)?;
-            if unmapped.as_u64() != frame_phys
-                || self
-                    .release_pager_fault_leaf(virtual_address, frame_phys)
-                    .is_err()
-            {
+            if unmapped.as_u64() != leaf.physical_address {
                 return Err(AddressSpaceError::InvalidFrameOwnership);
             }
         }
+        let removed = self.remove_pager_fault_leaves_in_range(start.as_u64(), range_end);
+        assert_eq!(
+            removed,
+            leaves.len(),
+            "pager-fault subset preflight lost exact leaf ownership"
+        );
         let _flushed_mutation = mutation.flush_for_reclaim();
         free_owned_frames_exact(&frames);
         self.pager_fault_leaf_limit = pager_leaf_limit;
@@ -306,6 +320,38 @@ impl ProcessAddressSpace {
     fn pager_fault_leaf_at(&self, virtual_address: u64) -> Option<PagerFaultLeaf> {
         self.pager_fault_leaf_index(virtual_address)
             .map(|index| self.pager_fault_leaves[index])
+    }
+
+    fn pager_fault_leaves_in_range(
+        &self,
+        start: u64,
+        end: u64,
+        maximum_count: usize,
+    ) -> Result<Vec<PagerFaultLeaf>, AddressSpaceError> {
+        let mut leaves = Vec::new();
+        leaves
+            .try_reserve_exact(maximum_count.min(self.pager_fault_leaves.len()))
+            .map_err(|_| AddressSpaceError::OutOfFrames)?;
+        for leaf in self
+            .pager_fault_leaves
+            .iter()
+            .copied()
+            .filter(|leaf| (start..end).contains(&leaf.virtual_address))
+        {
+            if leaves.len() == maximum_count {
+                return Err(AddressSpaceError::InvalidFrameOwnership);
+            }
+            leaves.push(leaf);
+        }
+        leaves.sort_unstable_by_key(|leaf| leaf.virtual_address);
+        Ok(leaves)
+    }
+
+    fn remove_pager_fault_leaves_in_range(&mut self, start: u64, end: u64) -> usize {
+        let previous_len = self.pager_fault_leaves.len();
+        self.pager_fault_leaves
+            .retain(|leaf| !(start..end).contains(&leaf.virtual_address));
+        previous_len - self.pager_fault_leaves.len()
     }
 
     fn record_pager_fault_leaf(
@@ -355,6 +401,16 @@ impl ProcessAddressSpace {
         self.pager_fault_leaves.swap_remove(index);
         Ok(())
     }
+}
+
+fn pager_fault_range_end(start: VirtAddr, page_count: usize) -> Result<u64, AddressSpaceError> {
+    let span = (page_count as u64)
+        .checked_mul(PAGE_4KIB_U64)
+        .ok_or(AddressSpaceError::AddressOverflow)?;
+    start
+        .as_u64()
+        .checked_add(span)
+        .ok_or(AddressSpaceError::AddressOverflow)
 }
 
 /// Calls `f` with an existing 4 KiB user leaf entry.
@@ -449,5 +505,45 @@ mod tests {
             Ok(())
         );
         assert_eq!(space.pager_fault_leaves.capacity(), reserved_capacity);
+    }
+
+    #[test]
+    fn pager_fault_leaf_range_collection_and_removal_are_batched_and_exact() {
+        let mut space = ProcessAddressSpace::empty_for_tests();
+        space
+            .pager_fault_leaves
+            .try_reserve_exact(4)
+            .expect("test pager-leaf metadata reservation");
+        space.pager_fault_leaf_limit = 4;
+        let start = USER_SPACE_BASE;
+
+        assert_eq!(
+            space.record_pager_fault_leaf(start + 2 * PAGE_4KIB_U64, 3 * PAGE_4KIB_U64),
+            Ok(())
+        );
+        assert_eq!(
+            space.record_pager_fault_leaf(start + 4 * PAGE_4KIB_U64, 5 * PAGE_4KIB_U64),
+            Ok(())
+        );
+        assert_eq!(space.record_pager_fault_leaf(start, PAGE_4KIB_U64), Ok(()));
+
+        let end = start + 3 * PAGE_4KIB_U64;
+        let leaves = space
+            .pager_fault_leaves_in_range(start, end, 3)
+            .expect("collect pager leaves");
+        let virtual_addresses = leaves
+            .iter()
+            .map(|leaf| leaf.virtual_address)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            virtual_addresses.as_slice(),
+            &[start, start + 2 * PAGE_4KIB_U64]
+        );
+        assert_eq!(space.remove_pager_fault_leaves_in_range(start, end), 2);
+        assert_eq!(space.pager_fault_leaves.len(), 1);
+        assert_eq!(
+            space.pager_fault_leaves[0].virtual_address,
+            start + 4 * PAGE_4KIB_U64
+        );
     }
 }

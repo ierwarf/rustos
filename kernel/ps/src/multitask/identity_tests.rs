@@ -1,6 +1,6 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use super::allocate_task_id_from;
+use super::task_id::allocate_task_id_from;
 
 #[test]
 fn task_identity_exhaustion_never_wraps_to_a_live_id() {

@@ -7,10 +7,12 @@ pub use page_cache::{
 };
 
 use rustos_user_abi::pager::{
-    pager_fault_token_generation, pager_fault_token_slot, PagerFaultDispatchWire,
-    PagerFaultReplyWire, PagerFaultRequestWire, PagerVmRegionWire, PAGER_ACTION_DENY,
-    PAGER_ACTION_MAP_ZEROED, PAGER_FAULT_ABI_VERSION, PAGER_MAX_FAULT_SLOTS,
-    PAGER_MAX_TRACKED_REGIONS, VM_ACCESS_EXECUTE, VM_ACCESS_READ, VM_ACCESS_WRITE, VM_FAULT_COW,
+    apply_region_edit, pager_fault_token_generation, pager_fault_token_slot,
+    PagerFaultDispatchWire, PagerFaultReplyWire, PagerFaultRequestWire, PagerRangeEdit,
+    PagerRegionEdit, PagerVmRegionWire, PAGER_ACTION_DENY, PAGER_ACTION_MAP_ZEROED,
+    PAGER_FAULT_ABI_VERSION, PAGER_MAX_FAULT_SLOTS, PAGER_MAX_TRACKED_REGIONS,
+    PAGER_PRESSURE_REGION_SPLIT_NO_SLOT, PAGER_PRESSURE_REGION_TABLE_FULL,
+    PAGER_PRESSURE_UNSPECIFIED, VM_ACCESS_EXECUTE, VM_ACCESS_READ, VM_ACCESS_WRITE, VM_FAULT_COW,
     VM_FAULT_PRESENT, VM_FAULT_PROTECTION, VM_OBJECT_ANONYMOUS, VM_PROT_EXECUTE, VM_PROT_READ,
     VM_PROT_WRITE,
 };
@@ -34,8 +36,23 @@ pub enum PagerFaultError {
     Malformed,
     Stale,
     NotManaged,
-    Pressure,
+    /// A bounded table refused, carrying the ABI code for *which* table.
+    ///
+    /// One undifferentiated `Pressure` made a full region table, an empty
+    /// fault-frame reserve and a full grant table read identically in the log,
+    /// so every occurrence cost a fresh investigation of all three.
+    Pressure(u16),
     EpochExhausted,
+}
+
+impl PagerFaultError {
+    /// The ABI pressure code this error carries, or `UNSPECIFIED`.
+    pub const fn pressure_code(self) -> u16 {
+        match self {
+            Self::Pressure(code) => code,
+            _ => PAGER_PRESSURE_UNSPECIFIED,
+        }
+    }
 }
 
 pub struct PagerState {
@@ -74,9 +91,113 @@ impl PagerState {
             .regions
             .iter_mut()
             .find(|slot| slot.is_none())
-            .ok_or(PagerFaultError::Pressure)?;
+            .ok_or(PagerFaultError::Pressure(PAGER_PRESSURE_REGION_TABLE_FULL))?;
         *slot = Some(region);
         Ok(())
+    }
+
+    /// Regions this pager currently tracks, across every process.
+    pub fn tracked_regions(&self) -> usize {
+        self.regions.iter().flatten().count()
+    }
+
+    /// Free region slots. A split needs one of these for its second fragment.
+    pub fn free_region_slots(&self) -> usize {
+        PAGER_MAX_REGIONS - self.tracked_regions()
+    }
+
+    /// Applies one ring0-stamped range edit to every region it overlaps,
+    /// using the shared ABI rule rather than a private one.
+    ///
+    /// # Why this is two-phase
+    ///
+    /// A `munmap` in the middle of a region splits it, so the result can need
+    /// one more slot than the input. Computing every outcome first means a
+    /// table that cannot hold the result refuses the whole edit and keeps the
+    /// original region, instead of applying the edit halfway and losing a
+    /// range the process can still touch.
+    ///
+    /// # Why refusing is safe, and dropping is not
+    ///
+    /// Ring0's VMA table is the authority for whether a mapping exists; this
+    /// table is policy for how it is backed. A region that outlives its ring0
+    /// VMA is inert - no fault can reach it, because ring0 rejects the fault
+    /// before it ever dispatches. A region that is missing while ring0 still
+    /// has its VMA kills the faulting thread. So under pressure this replica
+    /// keeps *more* than ring0, never less, and asks the caller to retry; the
+    /// broker's parked-release reconciliation is exactly that retry.
+    fn apply_edit(
+        &mut self,
+        process_handle: u64,
+        process_generation: u64,
+        edit: PagerRangeEdit,
+    ) -> Result<usize, PagerFaultError> {
+        if !edit.is_canonical() || process_handle == 0 || process_generation == 0 {
+            return Err(PagerFaultError::Malformed);
+        }
+        // Only which slots the edit touches is carried between the two passes.
+        // Caching each `PagerRegionEdit` instead would put three whole region
+        // wires per slot on the stack - about 120 KiB for a full table - in a
+        // `no_std` service whose thread stack is nowhere near that. The rule is
+        // pure, so the second pass simply re-derives it.
+        let mut touched = [false; PAGER_MAX_REGIONS];
+        let mut additional = 0_usize;
+        let mut edited = 0_usize;
+        for (index, slot) in self.regions.iter().enumerate() {
+            let Some(region) = *slot else {
+                continue;
+            };
+            if region.process_handle != process_handle
+                || region.process_generation != process_generation
+                || !edit.overlaps(region)
+            {
+                continue;
+            }
+            let outcome = apply_region_edit(region, edit);
+            if outcome.is_rejection() {
+                return Err(match outcome {
+                    PagerRegionEdit::Denied => PagerFaultError::Stale,
+                    _ => PagerFaultError::Malformed,
+                });
+            }
+            additional += outcome.additional_pager_slots();
+            edited += 1;
+            touched[index] = true;
+        }
+        if edited == 0 {
+            return Ok(0);
+        }
+        if additional > self.free_region_slots() {
+            return Err(PagerFaultError::Pressure(
+                PAGER_PRESSURE_REGION_SPLIT_NO_SLOT,
+            ));
+        }
+
+        for index in 0..PAGER_MAX_REGIONS {
+            if !touched[index] {
+                continue;
+            }
+            // Re-derived, not cached. A touched slot still holds the region the
+            // first pass measured: this pass only ever writes slot `index`
+            // after reading it, and any free slot it fills is untouched and so
+            // is skipped when the loop reaches it.
+            let Some(region) = self.regions[index] else {
+                return Err(PagerFaultError::Malformed);
+            };
+            let (fragments, len) = apply_region_edit(region, edit).pager_fragments();
+            // The edited region's own slot takes the first fragment, so the
+            // common trim case needs no free slot at all.
+            self.regions[index] = (len > 0).then(|| fragments[0]);
+            for fragment in fragments.iter().copied().take(len).skip(1) {
+                let free = self
+                    .regions
+                    .iter_mut()
+                    .find(|slot| slot.is_none())
+                    .expect("split headroom was checked before any region was withdrawn");
+                *free = Some(fragment);
+            }
+        }
+        Ok(edited)
     }
 
     /// Releases tracking for one exact ring0-stamped range.
@@ -85,6 +206,12 @@ impl PagerState {
     /// dead region would live forever: it would refuse to re-admit the same
     /// range as an overlap, and the fixed table would fill and start refusing
     /// every admission, which downgrades demand paging to eager mapping.
+    ///
+    /// A partial release **trims or splits**; it does not drop the whole
+    /// region. `munmap(2)` in the middle of a mapping leaves two smaller
+    /// mappings on either side, and ring0's VMA table already preserves them,
+    /// so dropping them here made the two replicas disagree and turned the
+    /// next fault in a surviving remainder into a dead thread.
     pub fn release_range(
         &mut self,
         release: rustos_user_abi::pager::PagerReleaseRangeWire,
@@ -92,20 +219,31 @@ impl PagerState {
         if !release.is_canonical() {
             return Err(PagerFaultError::Malformed);
         }
-        let mut released = 0;
-        for slot in &mut self.regions {
-            let matches = slot.is_some_and(|region| {
-                region.process_handle == release.process_handle
-                    && region.process_generation == release.process_generation
-                    && region.start < release.end
-                    && release.start < region.end
-            });
-            if matches {
-                *slot = None;
-                released += 1;
-            }
+        self.apply_edit(
+            release.process_handle,
+            release.process_generation,
+            release.edit(),
+        )
+    }
+
+    /// Narrows tracked protection over one exact ring0-stamped range.
+    ///
+    /// `region.prot` is what this pager answers a fault with, so a protection
+    /// change ring0 applied but never published here would let the pager grant
+    /// rights the process no longer has. Attenuation only: an edit that widens
+    /// any right the region does not already hold is refused.
+    pub fn protect_range(
+        &mut self,
+        protect: rustos_user_abi::pager::PagerProtectRangeWire,
+    ) -> Result<usize, PagerFaultError> {
+        if !protect.is_canonical() {
+            return Err(PagerFaultError::Malformed);
         }
-        Ok(released)
+        self.apply_edit(
+            protect.process_handle,
+            protect.process_generation,
+            protect.edit(),
+        )
     }
 
     pub fn invalidate_process(&mut self, process_handle: u64) -> usize {
@@ -575,5 +713,304 @@ mod tests {
         assert_eq!(reply.action, PAGER_ACTION_DENY);
         assert_eq!(reply.disposition, PAGER_DISPOSITION_NOT_DEMAND);
         assert!(reply.is_canonical_for(protection));
+    }
+
+    fn protect_of(
+        region: PagerVmRegionWire,
+        start: u64,
+        end: u64,
+        prot: u32,
+    ) -> rustos_user_abi::pager::PagerProtectRangeWire {
+        rustos_user_abi::pager::PagerProtectRangeWire {
+            version: PAGER_FAULT_ABI_VERSION,
+            reserved0: 0,
+            prot,
+            process_handle: region.process_handle,
+            process_generation: region.process_generation,
+            start,
+            end,
+            reserved1: [0; 2],
+        }
+    }
+
+    fn release_span(
+        region: PagerVmRegionWire,
+        start: u64,
+        end: u64,
+    ) -> rustos_user_abi::pager::PagerReleaseRangeWire {
+        rustos_user_abi::pager::PagerReleaseRangeWire {
+            start,
+            end,
+            ..release_of(region)
+        }
+    }
+
+    fn at(region: PagerVmRegionWire, address: u64, token_value: u64) -> PagerFaultRequestWire {
+        PagerFaultRequestWire {
+            virtual_address: address,
+            object_offset: region.object_offset + (address - region.start),
+            ..request(region, token_value)
+        }
+    }
+
+    /// Whole tracked span set, sorted, so a test compares the map rather than
+    /// one region at a time.
+    fn spans(pager: &PagerState) -> ([(u64, u64); 8], usize) {
+        let mut spans = [(0_u64, 0_u64); 8];
+        let mut len = 0;
+        for region in pager.regions.iter().flatten() {
+            assert!(len < spans.len(), "span set is larger than this fixture");
+            spans[len] = (region.start, region.end);
+            len += 1;
+        }
+        spans[..len].sort_unstable();
+        (spans, len)
+    }
+
+    /// The defect this whole rule exists for. Ring0's VMA table preserves the
+    /// left and right remainders of an interior `munmap`; this replica used to
+    /// delete every overlapping region, so the next fault in a surviving
+    /// remainder matched nothing here and killed the thread.
+    #[test]
+    fn an_interior_release_keeps_both_remainders_and_they_still_fault() {
+        let mut pager = PagerState::new(2);
+        let region = PagerVmRegionWire {
+            start: 0x10_000,
+            end: 0x18_000,
+            ..region(2)
+        };
+        pager.admit_region(region).unwrap();
+        assert_eq!(
+            pager.release_range(release_span(region, 0x12_000, 0x14_000)),
+            Ok(1)
+        );
+
+        let (spans, len) = spans(&pager);
+        assert_eq!(&spans[..len], &[(0x10_000, 0x12_000), (0x14_000, 0x18_000)]);
+
+        // Both remainders still resolve; the hole does not.
+        for (address, slot) in [(0x10_000_u64, 1_u64), (0x14_000, 2), (0x17_000, 3)] {
+            let reply = pager
+                .resolve_anonymous_first_touch(dispatch(
+                    at(region, address, token(slot, 101)),
+                    53,
+                    region.prot,
+                ))
+                .unwrap_or_else(|error| panic!("{address:#x} must still be managed: {error:?}"));
+            assert_eq!(reply.action, PAGER_ACTION_MAP_ZEROED);
+        }
+        assert_eq!(
+            pager.resolve_anonymous_first_touch(dispatch(
+                at(region, 0x12_000, token(9, 101)),
+                53,
+                region.prot
+            )),
+            Err(PagerFaultError::NotManaged)
+        );
+    }
+
+    #[test]
+    fn head_and_tail_releases_trim_in_place_without_consuming_a_slot() {
+        let mut pager = PagerState::new(2);
+        let region = PagerVmRegionWire {
+            start: 0x10_000,
+            end: 0x18_000,
+            ..region(2)
+        };
+        pager.admit_region(region).unwrap();
+        let free_before = pager.free_region_slots();
+        assert_eq!(
+            pager.release_range(release_span(region, 0x10_000, 0x12_000)),
+            Ok(1)
+        );
+        assert_eq!(pager.free_region_slots(), free_before);
+        assert_eq!(
+            pager.release_range(release_span(region, 0x16_000, 0x18_000)),
+            Ok(1)
+        );
+        let (spans, len) = spans(&pager);
+        assert_eq!(&spans[..len], &[(0x12_000, 0x16_000)]);
+        // The freed head is admissible again; the surviving middle is not.
+        let head = PagerVmRegionWire {
+            start: 0x10_000,
+            end: 0x12_000,
+            ..region
+        };
+        assert!(pager.admit_region(head).is_ok());
+        assert_eq!(pager.admit_region(region), Err(PagerFaultError::Stale));
+    }
+
+    /// A release that spans several regions can only trim the two it ends
+    /// inside, so it never needs a free slot however many it crosses.
+    #[test]
+    fn a_release_crossing_many_regions_never_grows_the_table() {
+        let mut pager = PagerState::new(2);
+        let base = region(2);
+        for index in 0..4_u64 {
+            let start = 0x10_000 + index * 0x4000;
+            pager
+                .admit_region(PagerVmRegionWire {
+                    start,
+                    end: start + 0x4000,
+                    ..base
+                })
+                .unwrap();
+        }
+        let before = pager.tracked_regions();
+        assert_eq!(before, 4);
+        assert_eq!(
+            pager.release_range(release_span(base, 0x12_000, 0x1e_000)),
+            Ok(4)
+        );
+        assert!(pager.tracked_regions() <= before);
+        let (spans, len) = spans(&pager);
+        assert_eq!(&spans[..len], &[(0x10_000, 0x12_000), (0x1e_000, 0x20_000)]);
+    }
+
+    /// Under table pressure a split must refuse rather than drop the region.
+    /// Keeping more than ring0 is inert - ring0's VMA check gates every fault
+    /// before pagerd sees it - while keeping less kills a live mapping.
+    #[test]
+    fn a_split_that_cannot_fit_refuses_and_keeps_the_region_whole() {
+        let mut pager = PagerState::new(2);
+        let base = region(2);
+        for index in 0..PAGER_MAX_REGIONS as u64 {
+            let start = 0x10_000 + index * 0x8000;
+            pager
+                .admit_region(PagerVmRegionWire {
+                    start,
+                    end: start + 0x8000,
+                    ..base
+                })
+                .unwrap();
+        }
+        assert_eq!(pager.free_region_slots(), 0);
+        let error = pager
+            .release_range(release_span(base, 0x12_000, 0x14_000))
+            .unwrap_err();
+        assert_eq!(
+            error,
+            PagerFaultError::Pressure(PAGER_PRESSURE_REGION_SPLIT_NO_SLOT)
+        );
+        assert_eq!(
+            error.pressure_code(),
+            PAGER_PRESSURE_REGION_SPLIT_NO_SLOT,
+            "the log must name which table refused"
+        );
+        // The region survives intact, so a fault anywhere in it still resolves.
+        assert_eq!(pager.tracked_regions(), PAGER_MAX_REGIONS);
+        let whole = PagerVmRegionWire {
+            start: 0x10_000,
+            end: 0x18_000,
+            ..base
+        };
+        assert!(pager
+            .resolve_anonymous_first_touch(dispatch(
+                at(whole, 0x16_000, token(4, 103)),
+                53,
+                whole.prot
+            ))
+            .is_ok());
+
+        // Once one slot frees, the parked retry succeeds.
+        let last = 0x10_000 + (PAGER_MAX_REGIONS as u64 - 1) * 0x8000;
+        assert_eq!(
+            pager.release_range(release_span(base, last, last + 0x8000)),
+            Ok(1)
+        );
+        assert_eq!(
+            pager.release_range(release_span(base, 0x12_000, 0x14_000)),
+            Ok(1)
+        );
+    }
+
+    /// `mprotect` on part of a region splits it on ring0's side. Without the
+    /// matching notification this replica keeps the original protection and
+    /// answers a fault in the narrowed span with rights the process no longer
+    /// has, because `reply.frame_rights` comes from `region.prot`.
+    #[test]
+    fn an_interior_protect_narrows_only_the_edited_span() {
+        let mut pager = PagerState::new(2);
+        let region = PagerVmRegionWire {
+            start: 0x10_000,
+            end: 0x18_000,
+            ..region(2)
+        };
+        pager.admit_region(region).unwrap();
+        assert_eq!(
+            pager.protect_range(protect_of(region, 0x12_000, 0x14_000, VM_PROT_READ)),
+            Ok(1)
+        );
+        assert_eq!(pager.tracked_regions(), 3);
+
+        // A write fault in the narrowed span is denied for illegal access...
+        let denied = pager
+            .resolve_anonymous_first_touch(dispatch(
+                at(region, 0x12_000, token(5, 107)),
+                53,
+                region.prot,
+            ))
+            .unwrap();
+        assert_eq!(denied.action, PAGER_ACTION_DENY);
+        assert_eq!(denied.disposition, PAGER_DISPOSITION_ILLEGAL_ACCESS);
+        // ...while the untouched tail still grants its original rights.
+        let granted = pager
+            .resolve_anonymous_first_touch(dispatch(
+                at(region, 0x16_000, token(6, 107)),
+                53,
+                region.prot,
+            ))
+            .unwrap();
+        assert_eq!(granted.action, PAGER_ACTION_MAP_ZEROED);
+        assert_eq!(granted.frame_rights, region.prot);
+    }
+
+    #[test]
+    fn a_protect_that_widens_rights_is_refused_without_touching_the_table() {
+        let mut pager = PagerState::new(2);
+        let mut region = region(2);
+        region.prot = VM_PROT_READ;
+        region.object.rights = VM_PROT_READ;
+        pager.admit_region(region).unwrap();
+        assert_eq!(
+            pager.protect_range(protect_of(
+                region,
+                region.start,
+                region.end,
+                VM_PROT_READ | VM_PROT_WRITE
+            )),
+            Err(PagerFaultError::Stale)
+        );
+        let (spans, len) = spans(&pager);
+        assert_eq!(&spans[..len], &[(region.start, region.end)]);
+    }
+
+    /// Sustained partial unmaps must not leak slots. Each cycle splits and
+    /// then releases both remainders, returning the table to its start size.
+    #[test]
+    fn repeated_split_and_release_cycles_reclaim_every_slot() {
+        let mut pager = PagerState::new(2);
+        let base = region(2);
+        let whole = PagerVmRegionWire {
+            start: 0x10_000,
+            end: 0x18_000,
+            ..base
+        };
+        for round in 0..64 {
+            assert!(
+                pager.admit_region(whole).is_ok(),
+                "round {round} must be admissible"
+            );
+            assert_eq!(
+                pager.release_range(release_span(whole, 0x12_000, 0x14_000)),
+                Ok(1)
+            );
+            assert_eq!(pager.tracked_regions(), 2, "round {round}");
+            assert_eq!(
+                pager.release_range(release_span(whole, 0x10_000, 0x18_000)),
+                Ok(2)
+            );
+            assert_eq!(pager.tracked_regions(), 0, "round {round}");
+        }
     }
 }

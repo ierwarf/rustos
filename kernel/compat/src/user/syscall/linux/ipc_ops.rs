@@ -26,11 +26,14 @@ mod ipc_fast_metrics;
 #[path = "ipc_reply_recv.rs"]
 mod ipc_reply_recv;
 mod reply_wait;
+mod service_ownership;
 mod subject;
+
+pub(crate) use service_ownership::*;
 
 use alloc::vec::Vec;
 use core::mem::size_of;
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 pub(super) use diagnostics::diagnostic_rate_limit_permit;
 use diagnostics::record_ipc_reply_rejection;
 #[cfg(rustos_ipc_phase_profile)]
@@ -383,6 +386,7 @@ pub(crate) fn cleanup_service_endpoints_for_process(process_id: u64) {
             SERVICE_ENDPOINTS[i].store(0, Ordering::Release);
             SERVICE_ENDPOINT_OWNERS[i].store(0, Ordering::Release);
             SERVICE_ENDPOINT_CAPS[i].store(0, Ordering::Release);
+            withdraw_pager_policy_owner(process_id);
             advance_service_endpoint_epoch(i).expect("service endpoint epoch exhausted");
             record_service_endpoint_milestone("ipc-service-exit-revoke", i as u64, process_id, 0);
             ipc_trace!(
@@ -427,108 +431,6 @@ pub(super) fn current_process_service_capability_snapshot() -> Option<(u64, u64)
             caps | entry_caps.load(Ordering::Acquire)
         });
     Some((process_id, capabilities))
-}
-
-/// Process that owns the live pager-policy capability, or `0`.
-///
-/// The anonymous-mmap broker must know whether it is mapping *for* the pager,
-/// and it is hot enough that taking the service-endpoint registry lock on
-/// every mapping contends with registration and lookup. The owner changes only
-/// when a service endpoint is published, so publish it once here and let the
-/// broker read one atomic.
-static PAGER_POLICY_OWNER: AtomicU64 = AtomicU64::new(0);
-
-/// Whether `process_id` owns the live pager-policy capability. Lock-free.
-pub(super) fn process_owns_pager_policy(process_id: u64) -> bool {
-    // ORDERING: Acquire pairs with the registration Release above.
-    process_id != 0 && PAGER_POLICY_OWNER.load(Ordering::Acquire) == process_id
-}
-
-fn current_process_has_service_capability_locked(capability: u64, process_id: u64) -> bool {
-    if capability == 0 || multitask::is_user_process_exiting(process_id) {
-        return false;
-    }
-    SERVICE_ENDPOINTS
-        .iter()
-        .zip(SERVICE_ENDPOINT_OWNERS.iter())
-        .zip(SERVICE_ENDPOINT_CAPS.iter())
-        .any(|((endpoint, owner), caps)| {
-            // Readers share the mutation critical section so this three-field
-            // tuple cannot combine generations during revoke/republication.
-            endpoint.load(Ordering::Acquire) != 0
-                && owner.load(Ordering::Acquire) == process_id
-                && caps.load(Ordering::Acquire) & capability == capability
-        })
-}
-
-fn current_process_can_lookup_service_endpoint() -> bool {
-    current_process_has_service_capability(
-        rustos_user_abi::syscall::IPC_SERVICE_CAP_ROOT_SUPERVISOR,
-    )
-}
-
-fn service_endpoint_raw(service_id: u64) -> Option<u64> {
-    let index = service_index(service_id)?;
-    Some(
-        stable_published_service_endpoint(index)
-            .map(|publication| publication.endpoint)
-            .unwrap_or(0),
-    )
-}
-
-fn stable_published_service_endpoint(index: usize) -> Option<PublishedServiceEndpoint> {
-    // Publication stores the endpoint last and revocation clears it first.
-    // An epoch/endpoint double-read therefore gives the IPC hot path a stable
-    // tuple without bouncing the global mutation-lock cache line on every
-    // service call. A concurrent mutation is reported as transient absence;
-    // callers already treat service restart/revoke as a bounded failure.
-    for _ in 0..SERVICE_ENDPOINT_STABLE_READ_ATTEMPTS {
-        let epoch_before = SERVICE_ENDPOINT_EPOCHS[index].load(Ordering::Acquire);
-        let endpoint_before = SERVICE_ENDPOINTS[index].load(Ordering::Acquire);
-        if endpoint_before == 0 {
-            return None;
-        }
-        let owner = SERVICE_ENDPOINT_OWNERS[index].load(Ordering::Acquire);
-        let endpoint_after = SERVICE_ENDPOINTS[index].load(Ordering::Acquire);
-        let epoch_after = SERVICE_ENDPOINT_EPOCHS[index].load(Ordering::Acquire);
-        if endpoint_before == endpoint_after && epoch_before == epoch_after {
-            let endpoint = stable_service_endpoint_snapshot(
-                endpoint_before,
-                owner,
-                multitask::is_user_process_exiting(owner),
-            );
-            return (endpoint != 0 && epoch_before != 0).then_some(PublishedServiceEndpoint {
-                endpoint,
-                owner,
-                epoch: epoch_before,
-            });
-        }
-        core::hint::spin_loop();
-    }
-    None
-}
-
-fn stable_service_endpoint_snapshot(endpoint: u64, owner: u64, owner_exiting: bool) -> u64 {
-    if endpoint == 0 || owner == 0 || owner_exiting {
-        0
-    } else {
-        endpoint
-    }
-}
-
-fn service_index(service_id: u64) -> Option<usize> {
-    let index = usize::try_from(service_id).ok()?;
-    (index < MAX_SERVICE_ENDPOINTS).then_some(index)
-}
-
-pub(crate) fn process_owns_live_service_endpoint(process_id: u64, service_id: u64) -> bool {
-    let Some(index) = service_index(service_id) else {
-        return false;
-    };
-    let _registry = SERVICE_ENDPOINT_REGISTRY_MUTATION.lock();
-    SERVICE_ENDPOINTS[index].load(Ordering::Acquire) != 0
-        && SERVICE_ENDPOINT_OWNERS[index].load(Ordering::Acquire) == process_id
-        && !multitask::is_user_process_exiting(process_id)
 }
 
 fn syscall_linux_rustos_ipc_validate_service_owner(args_ptr: u64) -> u64 {
@@ -998,6 +900,7 @@ pub(super) fn syscall_linux_rustos_ipc_register_service_endpoint(
         SERVICE_ENDPOINTS[index].store(0, Ordering::Release);
         SERVICE_ENDPOINT_OWNERS[index].store(0, Ordering::Release);
         SERVICE_ENDPOINT_CAPS[index].store(0, Ordering::Release);
+        withdraw_pager_policy_owner(owner);
         advance_service_endpoint_epoch(index).expect("service endpoint epoch exhausted");
         drop(registry_mutation);
         super::broker_ops::waitset_broker_ops::revoke_waitset_provider(service_id);
@@ -3000,6 +2903,28 @@ pub(super) fn call_service_endpoint_with_received_entries_until(
 /// requires. Kernel-originated callers (the pager dispatch worker) must use
 /// this rather than a bare `enqueue_call`, which publishes no custody and
 /// panics the reply path.
+/// Set when a control request is published to the pager's service endpoint,
+/// cleared by the rendezvous wait once it has decided to service it.
+///
+/// The pager blocks on a fixed fault rendezvous, not on an endpoint receive,
+/// so it has two independent arrival sources and can only wait on one of them
+/// directly. This is the published edge for the other source: the wait arms,
+/// re-checks this flag, and returns `EAGAIN` when it is set, exactly as it
+/// already re-checks for a fault reservation after arming.
+///
+/// A spurious `true` costs one extra loop through the pager's receive path and
+/// nothing else. A missed `true` costs a full reply deadline, which is why the
+/// flag is published *before* the wake rather than instead of it.
+static PAGER_CONTROL_REQUEST_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// Consumes the pending-control-request edge. Called by the rendezvous wait
+/// after it has armed, so no request published before the arm is lost.
+pub(super) fn take_pending_pager_control_request() -> bool {
+    // ORDERING: AcqRel pairs with the publisher's Release store, so observing
+    // the edge also observes the enqueued request behind it.
+    PAGER_CONTROL_REQUEST_PENDING.swap(false, Ordering::AcqRel)
+}
+
 pub(crate) fn enqueue_call_and_wake(
     endpoint: KernelEndpointHandle,
     request: &[u8],
@@ -3072,6 +2997,45 @@ fn enqueue_call_and_wake_with_handles_for_task(
         if let Some(receiver_process_id) = receiver_process_id {
             let _ = multitask::set_next_process_pick_hint(receiver_process_id);
         }
+    }
+    // The pager's fixed rendezvous wait is not an endpoint receive, so the
+    // enqueue above finds no parked receiver for it and the hint path can only
+    // publish a pick preference - which cannot unblock a blocked task. pagerd
+    // therefore used to serve its control plane only as a side effect of fault
+    // traffic: an admission call issued while pagerd was parked waited for the
+    // next page fault, or spent its whole reply deadline if none arrived.
+    // Anonymous `mmap` admission consequently cost a per-mapping timeout and
+    // then fell back to eager mapping, which is how demand paging could be off
+    // for a whole boot with nothing reporting it.
+    //
+    // The exclusion is capability-exact and lock-free, so no other service
+    // reaches this and no registry lock is taken on the call path.
+    if receiver_to_wake.is_none()
+        && let Some(receiver_process_id) = receiver_process_id
+        && process_owns_pager_policy(receiver_process_id)
+        && {
+            // Publish the pending request before the wake. The wake only
+            // reaches a pager that is already blocked or armed; a request that
+            // lands in the window between the pager's own receive attempt and
+            // its next wait arm would otherwise be a lost wakeup, and the
+            // caller would spend its whole reply deadline. The rendezvous wait
+            // re-checks this flag after arming, which closes that window the
+            // same way the fault re-check closes the fault one.
+            PAGER_CONTROL_REQUEST_PENDING.store(true, Ordering::Release);
+            true
+        }
+        && let Some(pager_task_id) =
+            multitask::wake_pager_service_waiter_for_process(receiver_process_id)
+    {
+        // Hint the pager it just woke, not the caller: the caller is about to
+        // block on its reply, and the request cannot be served until the pager
+        // runs.
+        let _ = multitask::set_next_pick_hint(pager_task_id);
+        ipc_trace!(
+            "ipc call woke parked pager control plane: endpoint={} pager_task={}",
+            endpoint.raw(),
+            pager_task_id,
+        );
     }
     if let Some(receiver_task_id) = receiver_to_wake {
         // The reply capability is the lifetime authority for this donation.
@@ -3316,7 +3280,7 @@ fn cancel_reply_wait(reply: KernelReplyHandle, caller_task_id: u64, reason: Repl
     if let Ok(cancelled) = &result {
         if let Some(custody) = cancelled.scheduling_context {
             assert!(
-                multitask::settle_ipc_reply_scheduling_context(reply.raw(), custody),
+                multitask::settle_cancelled_ipc_reply_scheduling_context(reply.raw(), custody),
                 "cancelled reply returned stale scheduling-context custody"
             );
         } else {

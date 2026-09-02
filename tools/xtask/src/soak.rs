@@ -86,7 +86,7 @@ fn display_path(path: Option<&Path>) -> String {
 
 /// The most recently archived run log, which sorts last because the archive
 /// name starts with the millisecond stamp it was written at.
-fn newest_archive(history: &Path) -> Option<PathBuf> {
+pub(crate) fn newest_archive(history: &Path) -> Option<PathBuf> {
     let mut entries: Vec<PathBuf> = fs::read_dir(history)
         .ok()?
         .filter_map(std::result::Result::ok)
@@ -98,7 +98,7 @@ fn newest_archive(history: &Path) -> Option<PathBuf> {
 }
 
 /// The guest's own panic line, verbatim, when the archived log holds one.
-fn guest_panic(archive: &Path) -> Option<String> {
+pub(crate) fn guest_panic(archive: &Path) -> Option<String> {
     let log = fs::read_to_string(archive).ok()?;
     let mut location = None;
     for line in log.lines() {

@@ -4,6 +4,18 @@
 //! frames, and flush TLBs, but must not infer a policy action from an integer
 //! status or a textual label.
 
+pub mod region_edit;
+
+pub use region_edit::{
+    PAGER_MAX_FRAME_GRANTS, PAGER_MAX_REGION_GROWTH_PER_PROTECT, PAGER_MAX_REGION_GROWTH_PER_UNMAP,
+    PAGER_MIN_FULLY_TRACKED_PROCESSES, PAGER_PRESSURE_FAULT_FRAME_RESERVE_EMPTY,
+    PAGER_PRESSURE_FAULT_SLOTS_FULL, PAGER_PRESSURE_GRANT_TABLE_FULL, PAGER_PRESSURE_KNOWN_MAX,
+    PAGER_PRESSURE_REGION_SPLIT_NO_SLOT, PAGER_PRESSURE_REGION_TABLE_FULL,
+    PAGER_PRESSURE_RELEASE_QUEUE_FULL, PAGER_PRESSURE_SEQUENCE_EXHAUSTED,
+    PAGER_PRESSURE_UNSPECIFIED, PAGER_PRESSURE_VMA_SLOTS_FULL, PAGER_WIRED_FAULT_FRAMES,
+    PagerRangeEdit, PagerRegionEdit, apply_region_edit, pager_pressure_name,
+};
+
 pub const PAGER_FAULT_ABI_VERSION: u16 = 2;
 pub const PAGER_PAGE_BYTES: u64 = 4096;
 
@@ -32,6 +44,47 @@ pub const PAGER_FAULT_TOKEN_SLOT_MASK: u64 = (1 << PAGER_FAULT_TOKEN_SLOT_BITS) 
 /// Highest generation a fault token may carry before its slot fails closed.
 pub const PAGER_MAX_FAULT_TOKEN_GENERATION: u64 = u64::MAX >> PAGER_FAULT_TOKEN_SLOT_BITS;
 
+/// Exact range whose pager-tracked protection ring0 has narrowed.
+///
+/// `mprotect` on part of a region splits it on ring0's side. Without this
+/// notification pagerd keeps one region at the original protection and answers
+/// faults in the narrowed span with the *old* rights, so the two replicas
+/// disagree about what the process may do with a page.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PagerProtectRangeWire {
+    pub version: u16,
+    pub reserved0: u16,
+    pub prot: u32,
+    pub process_handle: u64,
+    pub process_generation: u64,
+    pub start: u64,
+    pub end: u64,
+    pub reserved1: [u64; 2],
+}
+
+impl PagerProtectRangeWire {
+    pub const fn is_canonical(self) -> bool {
+        self.version == PAGER_FAULT_ABI_VERSION
+            && self.reserved0 == 0
+            && self.reserved1[0] == 0
+            && self.reserved1[1] == 0
+            && self.prot != 0
+            && self.prot & !VM_PROT_KNOWN == 0
+            && !(self.prot & VM_PROT_WRITE != 0 && self.prot & VM_PROT_EXECUTE != 0)
+            && self.process_handle != 0
+            && self.process_generation != 0
+            && self.start != 0
+            && self.start < self.end
+            && self.start & (PAGER_PAGE_BYTES - 1) == 0
+            && self.end & (PAGER_PAGE_BYTES - 1) == 0
+    }
+
+    pub const fn edit(self) -> region_edit::PagerRangeEdit {
+        region_edit::PagerRangeEdit::protect(self.start, self.end, self.prot)
+    }
+}
+
 /// Exact range whose pager tracking ring0 is releasing.
 ///
 /// The process identity is kernel-stamped, so a pager releases only what ring0
@@ -49,6 +102,10 @@ pub struct PagerReleaseRangeWire {
 }
 
 impl PagerReleaseRangeWire {
+    pub const fn edit(self) -> region_edit::PagerRangeEdit {
+        region_edit::PagerRangeEdit::unmap(self.start, self.end)
+    }
+
     pub const fn is_canonical(self) -> bool {
         self.version == PAGER_FAULT_ABI_VERSION
             && self.reserved0[0] == 0

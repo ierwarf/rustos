@@ -2022,6 +2022,20 @@ severity = "critical"
 flows = ["pager-vma-publication"]
 reason = "Exception-time fault lookup must remain bounded and lock-free while exact process, MM, VMA, permission, and revoke authority are revalidated from one all-atomic publication."
 
+[[risk_surfaces]]
+path = "libs/rustos-user-abi/src/pager/region_edit.rs"
+severity = "critical"
+flows = ["pager-vma-publication"]
+reason = "Ring0's VMA table and pagerd's region table are two replicas of one address map; the split/trim/remove rule they both apply must have exactly one definition, or a partial unmap leaves ring0 holding mappings the pager has forgotten."
+
+[[source_mappings]]
+path = "libs/rustos-user-abi/src/pager/region_edit.rs"
+models = ["pager-region-agreement/PagerRegionAgreement", "pager-vma-publication/PagerVmaPublication"]
+
+[[source_mappings]]
+path = "services/pagerd/src/lib.rs"
+models = ["pager-region-agreement/PagerRegionAgreement", "pager-fault-slot-lifecycle/PagerFaultSlotLifecycle"]
+
 [[source_mappings]]
 path = "kernel/ps/src/multitask/pager_vma.rs"
-models = ["pager-vma-publication/PagerVmaPublication"]
+models = ["pager-vma-publication/PagerVmaPublication", "pager-region-agreement/PagerRegionAgreement"]

@@ -47,24 +47,16 @@ fn cancel_grant(reservation: ps_api::PagerFaultReservation) {
     );
 }
 
-/// Wakes the exact blocked fault owner and queues it as the next bounded
-/// synchronous handoff candidate. A pager completion can release a user lock
-/// holder, so treating it as an ordinary sleeper wake can deadlock a same-class
-/// spinner until a later fairness turn. The hint carries no authority: the
-/// scheduler revalidates the task's runnable owner and saved continuation.
-fn wake_fault_owner(task_id: u64) -> bool {
-    let woke = ps_api::wake_task(task_id);
-    if woke {
-        let _ = ps_api::set_next_synchronous_pick_hint(task_id);
-    }
-    woke
+/// Wakes only the task still blocked on this exact fault token and publishes a
+/// real reply-handoff token. A delayed pager reply cannot wake a later wait.
+fn wake_fault_owner(fault_token: u64, task_id: u64) -> bool {
+    ps_api::complete_pager_fault_wake_handoff(fault_token, task_id)
 }
 
 fn finish_without_mapping(reservation: ps_api::PagerFaultReservation) {
     cancel_grant(reservation);
     let _ = ps_api::consume_pager_fault_reply(reservation.token);
-    let _ = ps_api::release_pager_fault_priority(reservation.token);
-    let _ = wake_fault_owner(reservation.request.task_id);
+    let _ = wake_fault_owner(reservation.token, reservation.request.task_id);
 }
 
 fn page_flags(rights: u32) -> PageTableFlags {
@@ -126,9 +118,13 @@ fn complete_claimed_reply(claimed: ps_api::PagerFaultReservation, reply: PagerFa
                 claimed.request.task_id,
             );
         }
+        // The reservation still owns its preallocated grant when pagerd's
+        // reply cannot claim it. Return that exact authority to the reserve;
+        // otherwise a malformed reply would leak both a grant slot and one of
+        // the bounded exception-time frames.
+        cancel_grant(claimed);
         let _ = ps_api::consume_pager_fault_reply(claimed.token);
-        let _ = ps_api::release_pager_fault_priority(claimed.token);
-        let _ = wake_fault_owner(claimed.request.task_id);
+        let _ = wake_fault_owner(claimed.token, claimed.request.task_id);
         return;
     };
     let mapped = ps_api::with_validated_fault_address_space(claimed.request, |_, address_space| {
@@ -152,8 +148,16 @@ fn complete_claimed_reply(claimed: ps_api::PagerFaultReservation, reply: PagerFa
         mm_api::phys::free_frame(frame);
     }
     let _ = ps_api::consume_pager_fault_reply(claimed.token);
-    let _ = ps_api::release_pager_fault_priority(claimed.token);
-    let woke = wake_fault_owner(claimed.request.task_id);
+    // A successful grant claim permanently transfers one wired reserve frame
+    // into the target address space (or frees it after a rejected mapping).
+    // Replace exactly that consumed frame before handing execution back to the
+    // fault owner. This is ordinary pager syscall context, not exception
+    // entry, and it closes the reserve lifecycle without running unrelated
+    // housekeeping on either handoff path. Deferring this solely to the
+    // housekeeping task lets a sustained fault-owner <-> pagerd handoff chain
+    // consume all 64 frames and turn a valid non-present fault into SIGSEGV.
+    let _ = mm_api::frame_capability::replenish_pager_fault_frames(1);
+    let woke = wake_fault_owner(claimed.token, claimed.request.task_id);
     if mapped && woke {
         let completed = COMPLETED_ANONYMOUS_FAULTS.fetch_add(1, Ordering::Relaxed) + 1;
         if completed.is_multiple_of(16) {

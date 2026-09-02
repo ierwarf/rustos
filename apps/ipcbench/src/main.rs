@@ -832,7 +832,14 @@ fn probe_exec_replace_single_thread(tsc_khz: u64) {
 enum MappingTouch {
     None,
     Read,
+    /// One byte at offset zero. On a demand-paged mapping this faults in
+    /// exactly one page no matter how many were reserved, so a multi-page
+    /// probe using this measures reservation and teardown, not fault cost.
     Write,
+    /// One byte in every 4 KiB page, so the whole reservation is resident
+    /// before it is torn down. This is the only touch that makes an unmap
+    /// walk a fully present range.
+    WriteEveryPage,
 }
 
 fn measure_anonymous_mapping(
@@ -866,12 +873,90 @@ fn measure_anonymous_mapping(
             MappingTouch::Write => {
                 ptr::write_volatile(mapping.cast::<u8>(), 0xa5);
             }
+            MappingTouch::WriteEveryPage => {
+                let base = mapping.cast::<u8>();
+                for page in 0..pages {
+                    ptr::write_volatile(base.add(page * 4096), 0xa5);
+                }
+            }
         }
         libc::munmap(mapping, len) == 0
     });
     match result {
         Some(mut samples) => report(name, &summarize(&mut samples), tsc_khz),
         None => skip(name, "mmap-touch-or-munmap-failed"),
+    }
+}
+
+/// Faults in a multi-page anonymous mapping, unmaps its middle, then touches
+/// what `munmap(2)` says must survive on either side.
+///
+/// This is a correctness probe wearing a benchmark's clothes, and it is the
+/// only one that runs the ring0/pagerd map agreement end to end on real
+/// hardware. Ring0's VMA table preserves the left and right remainders of an
+/// interior unmap; pagerd used to delete every overlapping region, so the
+/// touch after the unmap found no pager region, took a fault nothing could
+/// resolve, and killed this process. A unit test on either side alone cannot
+/// see that, because each side is self-consistent.
+///
+/// The measured interval is deliberately the whole cycle: reserve, fault the
+/// range in, split it, and re-fault both remainders. A regression that breaks
+/// agreement does not show up as a slow number here - it shows up as a `skip`
+/// line or a dead process, which is exactly the signal wanted.
+fn measure_split_mapping_survives(name: &str, pages: usize, iters: usize, tsc_khz: u64) {
+    // Three whole pages minimum: one to keep on each side of the hole, and at
+    // least one to remove. Fewer cannot produce an interior split at all.
+    if pages < 3 {
+        skip(name, "split-needs-at-least-three-pages");
+        return;
+    }
+    let Some(len) = pages.checked_mul(4096) else {
+        skip(name, "mapping-length-overflow");
+        return;
+    };
+    let hole_page = pages / 2;
+    let result = measure(iters, 4, || unsafe {
+        let mapping = libc::mmap(
+            ptr::null_mut(),
+            len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        );
+        if mapping == libc::MAP_FAILED {
+            return false;
+        }
+        let base = mapping.cast::<u8>();
+        for page in 0..pages {
+            ptr::write_volatile(base.add(page * 4096), 0xa5);
+        }
+        // Unmap one interior page. Both remainders must stay mapped.
+        if libc::munmap(base.add(hole_page * 4096).cast(), 4096) != 0 {
+            let _ = libc::munmap(mapping, len);
+            return false;
+        }
+        // Re-touch both remainders. Each already has a resident page, so this
+        // takes no fault; a write that faults here means ring0 dropped a
+        // mapping it was supposed to keep.
+        for page in (0..pages).filter(|page| *page != hole_page) {
+            ptr::write_volatile(base.add(page * 4096), 0x5a);
+            if ptr::read_volatile(base.add(page * 4096)) != 0x5a {
+                return false;
+            }
+        }
+        // Free the remainders as two separate ranges, which is what ring0 and
+        // pagerd must both now be holding.
+        let head = hole_page * 4096;
+        let tail_start = (hole_page + 1) * 4096;
+        let head_freed = head == 0 || libc::munmap(mapping, head) == 0;
+        let tail_len = len - tail_start;
+        let tail_freed = tail_len == 0 || libc::munmap(base.add(tail_start).cast(), tail_len) == 0;
+        head_freed && tail_freed
+    });
+    match result {
+        Some(mut samples) => report(name, &summarize(&mut samples), tsc_khz),
+        None => skip(name, "split-remainder-touch-or-unmap-failed"),
     }
 }
 
@@ -923,6 +1008,13 @@ fn run_all_probes(tsc_khz: u64) {
     ipc_probes::probe_ipc_intra_process(tsc_khz);
     ipc_probes::probe_ipc_intra_process_reply_recv(tsc_khz);
     ipc_probes::probe_syscall_offload(tsc_khz);
+    // The mapping probes are otherwise isolate-only, because their numbers are
+    // measurements. This one is here for its *outcome*: it is the only
+    // end-to-end check that ring0 and pagerd still agree about what an
+    // interior `munmap` leaves behind, and a disagreement kills the process
+    // rather than producing a slow number. Three pages and 64 iterations, so
+    // the default lane pays a few hundred microseconds for it.
+    measure_split_mapping_survives("mmap_split_survives_3_pages", 3, 64, tsc_khz);
 }
 
 /// A closed vocabulary rather than a dispatch table keyed by the report name:
@@ -956,9 +1048,26 @@ fn run_single_probe(name: &str, tsc_khz: u64) {
             measure_anonymous_mapping(name, 1, MappingTouch::Write, 2_000, tsc_khz)
         }
         "mmap_unmap_64" => measure_anonymous_mapping(name, 64, MappingTouch::Write, 256, tsc_khz),
+        // Reserve 1024 pages, fault exactly one, then unmap. This is the
+        // reservation-and-teardown cost of a large mapping: the unmap walks a
+        // range holding one resident page. It is *not* a fault-path or a
+        // fully-present-unmap measurement, despite the page count in its name.
         "mmap_unmap_1024_pages" => {
             measure_anonymous_mapping(name, 1024, MappingTouch::Write, 32, tsc_khz)
         }
+        // The same reservation with every page faulted in before teardown.
+        // This is the probe that actually exercises the demand-fault path and
+        // the fully-present unmap, so it is the only one whose numbers may be
+        // used to justify a change to either. Iterations are lower because one
+        // iteration costs 1024 fault round trips, not one.
+        "mmap_unmap_1024_faulted_pages" => {
+            measure_anonymous_mapping(name, 1024, MappingTouch::WriteEveryPage, 16, tsc_khz)
+        }
+        // Interior unmap, then touch what must survive on either side. This is
+        // the only probe that runs ring0/pagerd map agreement end to end; a
+        // `skip` line from it means the two replicas disagree about the map.
+        "mmap_split_survives_3_pages" => measure_split_mapping_survives(name, 3, 512, tsc_khz),
+        "mmap_split_survives_64_pages" => measure_split_mapping_survives(name, 64, 64, tsc_khz),
         "ipc_nested_passive_server" => {
             scheduling_context_probe::probe_nested_passive_server(tsc_khz)
         }

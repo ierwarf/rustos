@@ -19,6 +19,69 @@ touch resolves through the ring0 fault path. A 1-vCPU boot resolves roughly
 900 demand faults across 106 backing admissions with no panic, lockdep,
 corruption, or `RunnableButUnqueued`.
 
+### Closed: the ring0/pagerd map divergence on a partial unmap
+
+Ring0's VMA table preserved the left and right remainders of an interior
+`munmap`; pagerd deleted **every overlapping region**. A later fault in a
+surviving remainder passed ring0's VMA check, reached pagerd, matched no
+region, and killed the thread. `munmap(2)` in the middle of a mapping leaves
+two smaller mappings on either side, so ring0 was right and pagerd was wrong -
+but nothing in either module could say so, because each derived its own
+remainders.
+
+There is now one definition: `libs/rustos-user-abi/src/pager/region_edit.rs`.
+`apply_region_edit` returns the exact surviving fragments for the five possible
+outcomes, with backing offsets shifted; both replicas call it and neither
+reimplements it. Each side is tested against that rule
+(`ring0_rewrite_matches_the_shared_range_edit_rule`,
+`an_interior_release_keeps_both_remainders_and_they_still_fault`), so proving
+each equals the rule proves the two agree.
+
+Two related holes closed with it:
+
+- **`mprotect` never reached pagerd.** `reply.frame_rights` comes from
+  `region.prot`, so a narrowing ring0 applied kept granting the old rights.
+  `COMMERCIAL_MAX_PAGERD_OP_PROTECT_OBJECT` publishes it; both edit kinds
+  reconcile through the one parked-release queue, where `prot == 0` means
+  release.
+- **`PROT_NONE` is the one declared asymmetry.** Ring0 keeps a deny-all VMA so
+  the address stays owned; pagerd keeps nothing, because a span with no rights
+  raises no fault and is not a canonical wire region. `pager_fragments()` is
+  where that is written down.
+
+**The direction of disagreement is the load-bearing rule.** Under pressure a
+replica keeps *more* than ring0, never less: a pagerd region outliving its VMA
+is inert (ring0 gates every dispatch), while a missing one kills a thread. So a
+split with no free slot keeps the whole region and refuses with
+`PAGER_PRESSURE_REGION_SPLIT_NO_SLOT` for the broker's parked retry.
+
+Full contract: `docs/ai/pager-protocol-contract.md`. Model:
+`formal/pager-region-agreement/PagerRegionAgreement.tla`, whose invariant
+`FaultableIsAlwaysBackedByThePager` kills a registered wholesale-removal mutant.
+
+### Closed: the wired fault reserve had no admission point to refuse at
+
+The reserve was 64 frames behind a 128-slot fault table, and only housekeeping
+replenished it. Making the fault path a direct rendezvous cut the housekeeping
+turns that had been quietly doing that work; the reserve drained, and the first
+visible symptoms were a dead user thread, an absent `devmgrd` endpoint, and a
+failed boot - **not** "pager reserve exhausted".
+
+Two fixes, and the second matters more. Completion now replenishes before it
+wakes the fault owner, closing the frame lifecycle on the path that consumes
+it. And the reserve is now sized to the fault-slot table
+(`PAGER_WIRED_FAULT_FRAMES == PAGER_MAX_FAULT_SLOTS`), so it can only run dry
+*after* fault-slot admission has already refused - a counted refusal instead of
+an exhaustion with nothing to report it. `pager_fault_reserve_low_watermark()`
+is the check; a boot that reaches `0` has violated the progress condition
+whatever else looks healthy.
+
+The three independent `64`s are gone. Capacities live in the shared ABI with
+their relations static-asserted where both sides are visible, and
+`PagerFaultError::Pressure` now carries a `PAGER_PRESSURE_*` code so a full
+region table, an empty reserve, an exhausted grant table and a full release
+queue no longer read identically in the log.
+
 ### The defect that had capped this at 64 faults
 
 pagerd's `consume()` appended every resolved token to a fixed
@@ -89,18 +152,40 @@ placement override restored, it was missing in 5 of 5 runs at `--timeout 60`
 and 3 of 3 at `--timeout 120`, so the CPU never recovered given four times the
 budget. `kvm-smoke` also passes at 1, 2, and 4 vCPU.
 
-**Method warning, and it invalidated a whole session of conclusions.**
-`cargo xtask kvm-smoke` does **not** rebuild the image; it boots whatever is
-already in `build/image/`. Every earlier "instrumentation produced no output
-from `kernel-executive` or `kernel-compat`" note came from probes that were
-never compiled into the booted kernel, and the hypotheses that session recorded
-as *rejected* were tested against a stale image. Treat them as untested, not
-disproved. Always `cargo xtask build` after a source change, then refresh
-`formal/verify-all.sh --profile pr` (~25 s; the lanes cache) before drawing any
-multi-vCPU conclusion. Multi-vCPU runs check the seal against the current
-source hash, and a stale seal fails with `formal verification run binding
-mismatch`, which reads exactly like a boot failure.
+**Fixed: `kvm-smoke` used to boot a stale image, and it invalidated a whole
+session of conclusions.** The lane launched whatever was already in
+`build/image/`. Every earlier "instrumentation produced no output from
+`kernel-executive` or `kernel-compat`" note came from probes that were never
+compiled into the booted kernel, and the hypotheses that session recorded as
+*rejected* were tested against a stale image. **Treat every such note as
+untested, not disproved.**
+
+`cargo xtask kvm-smoke` now refreshes the boot image itself before it copies
+the disk (`crate::build::build`, pinned by
+`a_smoke_run_refreshes_the_boot_image_before_it_copies_it`). A no-op build is
+about two seconds against a thirty-second boot, so the lane pays it every time.
+`--no-build` opts out for the rare case of deliberately booting the artifact
+already on disk.
+
+Still refresh `formal/verify-all.sh --profile pr` by hand (~25 s; the lanes
+cache) before drawing any multi-vCPU conclusion. Multi-vCPU runs check the seal
+against the current source hash, and a stale seal fails with `formal
+verification run binding mismatch`, which reads exactly like a boot failure.
 `--smp-iteration` needs its own `formal/verify-smp-iteration.sh` seal.
+
+**Measure a pass rate with one command.** An 8-vCPU defect that appears in one
+boot of six is a rate, and a single run cannot measure it. `--repeat <count>`
+boots the same topology up to 64 times, prints each run's outcome, and names
+every failed run's panic line and archived debugcon log:
+
+```
+cargo xtask kvm-smoke --rustos-vcpus 8 --min-ui-fps 60 \
+    --dvm-network-shmem --timeout 120 --repeat 6
+```
+
+Repeating the lane in a shell loop instead loses each failing run's debugcon
+log to the next run's truncation - which is exactly the evidence a rare defect
+leaves behind. `cargo xtask soak` remains the equivalent for the `bench` lane.
 
 ### Closed: the AP trampoline range was never reserved
 
@@ -301,14 +386,34 @@ workspace package, so the host-test step could never have passed.
 ### Fresh evidence for this change set
 
 `cargo fmt --all -- --check` clean, `cargo xtask check`, `cargo xtask build`,
-and `bash formal/verify-all.sh --profile pr` **sealed** at 44 artifacts. Host
-tests: kernel-ps 265, kernel-compat 160, kernel-hal 66, kernel-mm 42, xtask 147,
-rustos-user-abi 42.
+and `bash formal/verify-all.sh --profile pr` **sealed** at 44 artifacts, with
+the TLC profile at 32 models and spec mutations at 183/183 killed. Host tests:
+kernel-ps 270, kernel-compat 164, kernel-hal 66, kernel-mm 46, xtask 149,
+rustos-user-abi 57, pagerd 28.
 
-KVM: `kvm-smoke` passes at 1 and 4 vCPU; 8 vCPU plain smoke and the
-`--min-ui-fps 60` gate both sit at roughly 5 of 6, with the residual failures
-being the open custody panic above and the known input-relay flake, not the
-pager path.
+**KVM evidence is blocked, and not by this change set.** Every `kvm-smoke` run
+on this checkout panics in early boot:
+
+```
+kernel/executive/src/boot.rs:267
+no validated monotonic clocksource (invariant TSC or 64-bit HPET); acpi_hpet=None
+```
+
+This is before any pager, scheduler, or user code runs. The RustOS guest is
+launched with `q35,accel=kvm,hpet=on` and `-cpu host,-x2apic,+invtsc`, so both
+candidate sources are requested and neither is being accepted -
+`hal::arch::clock::init` finds no ACPI HPET table and no usable invariant-TSC
+frequency. Reproduced twice at 1 vCPU, and **a clean `HEAD` control build shows
+the same failure**, so it predates this work. Until it is fixed there is no
+runtime evidence for anything: treat every KVM claim on this checkout as
+untested rather than as passing or failing.
+
+That leaves one gap in this change set that only a boot can close: the
+end-to-end partial-unmap probe (`mmap_split_survives_3_pages`, now in
+`ipcbench`'s default set) has never executed. It mmaps three pages, faults them
+all in, unmaps the middle one, and re-touches both remainders - which is
+precisely what used to kill the process. It is compiled and shipped; it has not
+run.
 
 ### Contract and registry work landed with the behaviour
 

@@ -5,11 +5,11 @@
 //! - **Boundary:** Every protocol envelope, sender identity, VMA admission,
 //!   dispatch request, opaque frame capability, and requested frame right is
 //!   untrusted until the matching ABI contract accepts it.
-//! - **Lifecycle:** Register one service endpoint, admit the pager-owned VMA,
-//!   consume one dispatched anonymous fault, issue one exact reply, and lose
-//!   the old authority on token, VMA, process, or service-epoch revocation.
-//! - **Concurrency:** The service loop serializes its bounded policy state;
-//!   it holds no policy lock across endpoint receive or reply publication.
+//! - **Lifecycle:** Register one service endpoint, admit pager-owned VMAs,
+//!   consume exact anonymous-fault dispatches, and lose old authority on token,
+//!   VMA, process, or service-epoch revocation.
+//! - **Concurrency:** One passive pager thread owns the bounded policy state.
+//!   It holds no policy lock across receive, reply, or reply-and-wait syscalls.
 //! - **Failure:** Malformed envelopes, foreign senders, stale generations,
 //!   non-demand/protection faults, and rights expansion return an explicit
 //!   error without reusing a frame capability or fault token.
@@ -26,12 +26,15 @@ use core::panic::PanicInfo;
 
 use pagerd::{request_sender_is_authorized, PagerFaultError, PagerState};
 use rustos_svc_runtime::{ipc, pager as pager_rendezvous};
-use rustos_user_abi::pager::{PagerFaultDispatchWire, PagerReleaseRangeWire, PagerVmRegionWire};
+use rustos_user_abi::pager::{
+    pager_pressure_name, PagerFaultDispatchWire, PagerProtectRangeWire, PagerReleaseRangeWire,
+    PagerVmRegionWire,
+};
 use rustos_user_abi::syscall::{
     CommercialMaxProtocolRequest, CommercialMaxProtocolResponse,
-    COMMERCIAL_MAX_PAGERD_OP_BACKING_OBJECT, COMMERCIAL_MAX_PAGERD_OP_RELEASE_OBJECT,
-    COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_PAGERD, IPC_MAX_INLINE_BYTES,
-    IPC_SERVICE_PAGERD,
+    COMMERCIAL_MAX_PAGERD_OP_BACKING_OBJECT, COMMERCIAL_MAX_PAGERD_OP_PROTECT_OBJECT,
+    COMMERCIAL_MAX_PAGERD_OP_RELEASE_OBJECT, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
+    COMMERCIAL_MAX_PROTOCOL_PAGERD, IPC_MAX_INLINE_BYTES, IPC_SERVICE_PAGERD,
 };
 
 rustos_svc_runtime::entry!(service_main);
@@ -39,7 +42,7 @@ rustos_svc_runtime::entry!(service_main);
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(_info: &PanicInfo<'_>) -> ! {
-    loop {}
+    rustos_svc_runtime::syscall::exit_group(101)
 }
 
 #[no_mangle]
@@ -84,19 +87,28 @@ fn serve(endpoint: u64, pager: &mut PagerState) {
             }
         }
 
-        // The pager rendezvous is the only anonymous-fault transport. A
-        // generic endpoint arrival wakes this wait and returns EAGAIN, so the
-        // next turn services that request without a polling timer.
-        // SAFETY: `dispatch` is writable for the synchronous syscall and the
-        // wrapper fixes both the pointer and exact wire size.
-        if unsafe { pager_rendezvous::fault_wait(&mut dispatch) } == 0 {
-            let reply = pager
-                .resolve_anonymous_first_touch(dispatch)
-                .unwrap_or_default();
-            // SAFETY: the repr(C) reply is copied synchronously; its embedded
-            // token remains worker-bound and is validated again by ring0.
-            let _ = unsafe { pager_rendezvous::fault_reply(reply) };
+        // The fixed rendezvous is also this passive server's blocking receive.
+        // Generic endpoint arrival wakes it with EAGAIN, returning control to
+        // the policy request loop without a polling timer.
+        // SAFETY: `dispatch` is writable for the synchronous fixed-size copy.
+        if unsafe { pager_rendezvous::fault_wait(&mut dispatch) } != 0 {
+            continue;
         }
+        // A refused fault still has to be answered. The default reply is not
+        // canonical for this dispatch, so ring0 rejects it, cancels the grant
+        // and wakes the faulting task without a mapping - which the task sees
+        // as a re-fault, not as a diagnosis. Name the cause here or the reason
+        // a thread is looping on one address exists nowhere.
+        let reply = match pager.resolve_anonymous_first_touch(dispatch) {
+            Ok(reply) => reply,
+            Err(error) => {
+                report_refused_fault(error, dispatch.request.virtual_address);
+                Default::default()
+            }
+        };
+        // SAFETY: the fixed reply is copied synchronously and remains bound to
+        // the dispatch received by this thread.
+        let _ = unsafe { pager_rendezvous::fault_reply(reply) };
     }
 }
 
@@ -139,6 +151,12 @@ fn handle_request(
                     Ok(None)
                 })
             }
+            COMMERCIAL_MAX_PAGERD_OP_PROTECT_OBJECT => {
+                decode_payload::<PagerProtectRangeWire>(&request).and_then(|protect| {
+                    pager.protect_range(protect)?;
+                    Ok(None)
+                })
+            }
             // Anonymous demand faults use the worker-bound fixed rendezvous. A
             // generic endpoint request may not carry a frame capability or become
             // a fallback transport for the exception path.
@@ -152,10 +170,56 @@ fn handle_request(
     match result {
         Ok(Some(reply)) => write_payload(&mut response, &reply),
         Ok(None) => {}
-        Err(error) => response.status = errno(error),
+        Err(error) => {
+            response.status = errno(error);
+            // The caller has to know *which* bounded table refused, because a
+            // full region table, a split with no free slot and a malformed
+            // range all reach it as one status. `value1` carries that code so
+            // the broker can retry a split refusal and only a split refusal.
+            response.value1 = u64::from(error.pressure_code());
+            if error.pressure_code() != rustos_user_abi::pager::PAGER_PRESSURE_UNSPECIFIED {
+                ipc::debug_line(pager_pressure_name(error.pressure_code()));
+            }
+        }
     }
     response.value0 = pager.epoch();
     response
+}
+
+/// Names the cause of a fault this pager could not resolve.
+///
+/// One line per distinct cause, not per fault: a thread that re-faults on the
+/// same refused address would otherwise turn its own diagnosis into the
+/// machine's dominant cost, which is how an earlier per-event log became a
+/// 30-second stall.
+fn report_refused_fault(error: PagerFaultError, address: u64) {
+    use core::sync::atomic::{AtomicU8, Ordering};
+
+    static REPORTED: AtomicU8 = AtomicU8::new(0);
+    let bit = 1_u8 << refusal_index(error);
+    if REPORTED.fetch_or(bit, Ordering::Relaxed) & bit != 0 {
+        return;
+    }
+    let _ = address;
+    ipc::debug_line(match error {
+        // A managed VMA whose region this pager does not hold is the exact
+        // ring0/pagerd divergence the shared range-edit rule exists to prevent.
+        PagerFaultError::NotManaged => "pagerd: fault refused, no region for a ring0-managed range",
+        PagerFaultError::Stale => "pagerd: fault refused, stale epoch or replayed token",
+        PagerFaultError::Malformed => "pagerd: fault refused, malformed dispatch",
+        PagerFaultError::EpochExhausted => "pagerd: fault refused, epoch exhausted",
+        PagerFaultError::Pressure(code) => pager_pressure_name(code),
+    });
+}
+
+const fn refusal_index(error: PagerFaultError) -> u32 {
+    match error {
+        PagerFaultError::Malformed => 0,
+        PagerFaultError::Stale => 1,
+        PagerFaultError::NotManaged => 2,
+        PagerFaultError::Pressure(_) => 3,
+        PagerFaultError::EpochExhausted => 4,
+    }
 }
 
 fn decode_payload<T: Copy>(request: &CommercialMaxProtocolRequest) -> Result<T, PagerFaultError> {
@@ -194,7 +258,7 @@ const fn errno(error: PagerFaultError) -> i32 {
         PagerFaultError::Malformed => 22,
         PagerFaultError::Stale => 116,
         PagerFaultError::NotManaged => 95,
-        PagerFaultError::Pressure => 11,
+        PagerFaultError::Pressure(_) => 11,
         PagerFaultError::EpochExhausted => 75,
     }
 }

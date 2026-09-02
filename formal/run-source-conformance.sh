@@ -614,7 +614,7 @@ smp_bind_body="$(sed -n '/^pub(super) fn syscall_linux_rustos_smp_qualification_
 smp_activation_body="$(sed -n '/^pub(super) fn prepare_smp_qualification_activation/,/^pub(super) fn abort_smp_qualification_activation/p' kernel/compat/src/user/syscall/linux/smp_qualification_ops.rs)"
 smp_phase_body="$(sed -n '/^pub(super) fn admit_smp_qualification_milestone/,/^pub(super) fn revoke_smp_qualification_for_process/p' kernel/compat/src/user/syscall/linux/smp_qualification_ops.rs)"
 proc_activate_body="$(sed -n '/^pub(super) fn syscall_linux_rustos_proc_activate_broker/,/^pub(super) fn syscall_linux_rustos_proc_validate_deferred_spawn_broker/p' kernel/compat/src/user/syscall/linux/proc_broker_ops.rs)"
-smp_ring3_option_body="$(sed -n '/^    if options.smp_ring3_qualification {/,/^    } else if options.smp_evidence_cohort.is_some() {/p' tools/xtask/src/kvm/options.rs)"
+smp_ring3_option_body="$(sed -n '/^    if options.smp_ring3_qualification {/,/^    } else if options.smp_evidence_cohort.is_some() {/p' tools/xtask/src/kvm/smoke_args.rs)"
 ordinary_catalog_body="$(sed -n '/^pub(super) fn load_launch_catalog/,/^\/\/\/ Reconciles the private/p' services/runtimed/src/catalog.rs)"
 qualification_reconcile_body="$(sed -n '/^pub(super) fn reconcile_kvm_smp_qualification_into_state/,/^fn defer_qualification_catalog_retry/p' services/runtimed/src/catalog.rs)"
 qualification_candidate_body="$(sed -n '/^fn qualification_catalog_candidate/,/^fn validate_ui_bootstrap_metadata/p' services/runtimed/src/catalog.rs)"
@@ -960,7 +960,7 @@ if [[ -z "$join_line" || -z "$complete_line" || "$complete_line" -le "$join_line
     || ! rg -Fq 'schema: "rustos-kvm-smp-correctness-evidence-v6"' tools/xtask/src/kvm/evidence.rs \
     || ! rg -Fq 'predecessor_schema: "rustos-kvm-smp-correctness-evidence-v5"' tools/xtask/src/kvm/evidence.rs \
     || ! rg -Fq 'smp_evidence_cohort: snapshot.run.cohort.clone()' tools/xtask/src/kvm/evidence.rs \
-    || ! rg -Fq -- '--smp-ring3-qualification requires --smp-evidence-cohort' tools/xtask/src/kvm/options.rs \
+    || ! rg -Fq -- '--smp-ring3-qualification requires --smp-evidence-cohort' tools/xtask/src/kvm/smoke_args.rs \
     || ! grep -Fq 'options.dvm_block_shmem = true;' <<<"$smp_ring3_option_body" \
     || ! grep -Fq '"file={},format=raw,if=none,id=dvm-storage-disk,cache=none,aio=threads,readonly=on",' <<<"$dvm_virtual_storage_body" \
     || ! grep -Fq 'ide-cd,drive=dvm-storage-disk,bus=ide.0,unit=0,id=dvm-storage-disk-device' <<<"$dvm_virtual_storage_body" \
@@ -1022,7 +1022,7 @@ fi
 # gone, and selection revalidates the same custody with no generic fallback.
 reply_current_body="$(sed -n '/^pub fn complete_ipc_reply_wake_handoff(/,/^pub fn release_ipc_priorities_for_process/p' kernel/ps/src/multitask/current/ipc.rs)"
 reply_custody_body="$(sed -n '/^pub fn settle_ipc_reply_scheduling_context(/,/^pub fn complete_ipc_reply_wake_handoff(/p' kernel/ps/src/multitask/current/ipc.rs)"
-reply_scheduler_body="$(sed -n '/^    pub(super) fn complete_ipc_reply_wake_handoff(/,/^    fn wake_task_slot/p' kernel/ps/src/multitask/scheduler.rs)"
+reply_scheduler_body="$(cat kernel/ps/src/multitask/scheduler/wake_handoff.rs)"
 reply_enqueue_body="$(sed -n '/^fn enqueue_reply_wake_after_catalog(/,/^pub(super) fn enqueue_reply_wake/p' kernel/ps/src/multitask/scheduler/sync_handoff.rs)"
 reply_selection_body="$(sed -n '/^    fn synchronous_handoff_record_is_ready(/,/^    pub(super) fn take_next_synchronous_pick_hint_ready_slot/p' kernel/ps/src/multitask/scheduler/handoffs.rs)"
 plain_reply_body="$(sed -n '/^pub(super) fn syscall_linux_rustos_ipc_reply(/,/^pub(super) fn syscall_linux_rustos_ipc_call_with_handles/p' kernel/compat/src/user/syscall/linux/ipc_ops.rs)"
@@ -1360,6 +1360,14 @@ pager-frame-grant-lifecycle/PagerFrameGrantLifecycle|kernel-mm|memory::frame_cap
 pager-fault-slot-lifecycle/PagerFaultSlotLifecycle|kernel-ps|multitask::pager_fault::tests::fault_slot_is_exact_and_consumed_once
 pager-fault-slot-lifecycle/PagerFaultSlotLifecycle|kernel-ps|multitask::scheduler::tests::pager_fault_handoff_requires_exact_waits_and_donates_after_worker_wake
 pager-fault-slot-lifecycle/PagerFaultSlotLifecycle|kernel-ps|multitask::pager_fault::tests::cancellation_wins_over_late_reply_claim
+pager-region-agreement/PagerRegionAgreement|rustos-user-abi|pager::region_edit::tests::an_interior_unmap_splits_into_two_mappings_like_linux
+pager-region-agreement/PagerRegionAgreement|rustos-user-abi|pager::region_edit::tests::surviving_fragments_are_exactly_the_region_minus_the_edit
+pager-region-agreement/PagerRegionAgreement|rustos-user-abi|pager::region_edit::tests::prot_none_is_a_ring0_vma_and_a_pager_removal
+pager-region-agreement/PagerRegionAgreement|kernel-ps|multitask::pager_vma::tests::ring0_rewrite_matches_the_shared_range_edit_rule
+pager-region-agreement/PagerRegionAgreement|kernel-ps|multitask::pager_vma::tests::a_split_with_no_free_vma_slot_refuses_and_keeps_every_region
+pager-region-agreement/PagerRegionAgreement|pagerd|tests::an_interior_release_keeps_both_remainders_and_they_still_fault
+pager-region-agreement/PagerRegionAgreement|pagerd|tests::a_split_that_cannot_fit_refuses_and_keeps_the_region_whole
+pager-region-agreement/PagerRegionAgreement|pagerd|tests::an_interior_protect_narrows_only_the_edited_span
 pager-vma-publication/PagerVmaPublication|kernel-ps|multitask::pager_vma::tests::publication_stamps_exact_process_mm_and_nonzero_vma_generation
 pager-vma-publication/PagerVmaPublication|kernel-ps|multitask::pager_vma::tests::overlap_and_permission_escalation_fail_closed
 pager-vma-publication/PagerVmaPublication|kernel-ps|multitask::pager_vma::tests::exec_generation_change_and_revoked_region_never_match

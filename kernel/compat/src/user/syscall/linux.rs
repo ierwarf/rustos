@@ -71,7 +71,6 @@ use rustos_user_abi::syscall::{
     RustosIpcWaitServiceEndpointArgs, RustosUserRegisters, SESSIOND_CONSOLE_GRAPH_WAIT_MAX_MS,
     SESSIOND_CONSOLE_READ_WAIT_MAX_MS, SESSIOND_CONSOLE_READINESS_LIVE,
     SESSIOND_CONSOLE_READINESS_MASK, SESSIOND_CONSOLE_READINESS_READY,
-    SYS_RUSTOS_PAGER_FAULT_REPLY, SYS_RUSTOS_PAGER_FAULT_WAIT,
     SYS_RUSTOS_PROC_ACTIVATE_BATCH_BROKER, SYS_RUSTOS_PROC_ACTIVATE_BROKER,
     SYS_RUSTOS_PROC_CANCEL_EXEC_BROKER, SYS_RUSTOS_PROC_SET_WINDOWS_RUNTIME_BROKER,
     SYS_RUSTOS_SCHED_DEMOTE_SELF, SYSCALL_OFFLOAD_ABI_VERSION, SYSCALL_OFFLOAD_OP_LINUX_ACCEPT,
@@ -234,8 +233,9 @@ pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
             syscall_linux_rustos_proc_signal_queue_broker(frame.rdi)
         }
         linux_abi::SYS_RUSTOS_MM_BROKER => syscall_linux_rustos_mm_broker(frame.rdi),
-        SYS_RUSTOS_PAGER_FAULT_WAIT => syscall_linux_rustos_pager_fault_wait(frame.rdi),
-        SYS_RUSTOS_PAGER_FAULT_REPLY => syscall_linux_rustos_pager_fault_reply(frame.rdi),
+        _ if is_pager_fault_syscall(frame.rax) => {
+            dispatch_pager_fault_syscall(frame.rax, frame.rdi)
+        }
         linux_abi::SYS_RUSTOS_BLOCK_BROKER => syscall_linux_rustos_block_broker(frame.rdi),
         _ if broker_ops::is_linux_rustos_broker_syscall(frame.rax) => {
             broker_ops::dispatch_linux_rustos_broker_syscall(frame)

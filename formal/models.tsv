@@ -91,6 +91,7 @@ network-payload-session/NetworkPayloadSession	safety	intentional-terminal	payloa
 page-cache-lifecycle/PageCacheLifecycle	safety	check	explicit terminal stutter preserves bounded load COW writeback and reclaim progress	30	120	exhaustive	no	no	no
 pager-frame-grant-lifecycle/PagerFrameGrantLifecycle	safety	check	explicit terminal stutter preserves generation-bound one-shot frame custody	30	120	exhaustive	no	no	no
 pager-fault-slot-lifecycle/PagerFaultSlotLifecycle	safety	check	explicit terminal stutter preserves fixed allocation-free fault custody and one-shot reply authority	30	120	exhaustive	no	no	no
+pager-region-agreement/PagerRegionAgreement	safety	check	explicit refusal and retry states stutter while both replicas keep every faultable address backed	30	120	exhaustive	no	no	no
 pager-vma-publication/PagerVmaPublication	safety	check	explicit stable and exhausted terminals preserve bounded all-atomic publication checking	30	120	exhaustive	no	no	no
 page-table-lifecycle/PageTableLifecycle	safety	intentional-terminal	mapping lifecycle may complete	120	900	exhaustive	no	no	no
 page-table-map-transaction/PageTableMapTransaction	temporal	check	committed and failed terminals stutter after exact topology settlement	30	120	exhaustive	no	no	no

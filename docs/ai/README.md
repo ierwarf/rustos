@@ -21,6 +21,7 @@ refactoring, recovery, and review.
 | `core-engineering-contract.md` | Mandatory source-writing contract: ownership, lifecycle, concurrency, comments, refactoring, review. |
 | `smp-contract.md` | Multi-CPU release gate: AP startup, per-CPU scheduler/IPI/TLB/futex ownership, qualification matrix. |
 | `system-flows.md` | Machine-linked end-to-end exception, IPC, wait-set, VFS, endpoint, and restart lifecycles. |
+| `pager-protocol-contract.md` | Demand-paging protocol across ring0 and pagerd: per-resource ownership and return points, the one range-edit rule both replicas apply, capacity relations, the progress condition, and the pressure codes. |
 | `commercial-quality-gates.md` | Non-negotiable definition of done and risk-ordered release acceptance scope. |
 | `physical-gpu-status.md` | Current physical GPU evidence boundary, userspace wait-set release gates, and continuation rules. |
 | `performance-hardening.md` | Boot/runtime bottleneck triage, provider policy, cleanup rules. |

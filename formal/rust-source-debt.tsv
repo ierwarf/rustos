@@ -106,5 +106,6 @@ libs/rustos-user-abi/src/windows.rs	0	0
 compat/windows/services/winsys/common/win_types.h	0	0
 compat/windows/services/winsys/kernelbase/exports.c	0	0
 compat/windows/services/winsys/ntdll/syscall.c	0	0
+libs/rustos-user-abi/src/pager/region_edit.rs	0	0
 services/pagerd/src/page_cache.rs	0	0
 services/pagerd/src/main.rs	4	0

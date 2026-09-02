@@ -135,6 +135,37 @@ pub fn inherit_ipc_priority(reply: u64, donor_task_id: u64, receiver_task_id: u6
     })
 }
 
+/// Wakes the pager out of its fixed-rendezvous wait because a control request
+/// arrived on its service endpoint. Returns the woken pager task, if any.
+///
+/// The IPC enqueue path calls this only when no endpoint receiver was parked;
+/// see [`scheduler::Scheduler::wake_pager_service_waiter_for_process`] for why
+/// the rendezvous wait is invisible to that path.
+pub fn wake_pager_service_waiter_for_process(process_id: u64) -> Option<u64> {
+    // SAFETY: interrupt exclusion and the scheduler access guard make the
+    // bounded scan and its single wake one atomic scheduler mutation; no
+    // scheduler-owned reference escapes the closure.
+    interrupts::without_interrupts(|| unsafe {
+        scheduler_mut().wake_pager_service_waiter_for_process(process_id)
+    })
+}
+
+/// Binds one dispatched fault token to the fault owner's effective scheduling
+/// context. The fixed fault slot the dispatch came from is the prior admission
+/// proof, so this needs no separate donor reservation.
+pub fn inherit_pager_fault_priority(
+    fault_token: u64,
+    donor_task_id: u64,
+    receiver_task_id: u64,
+) -> bool {
+    // SAFETY: interrupt exclusion and the scheduler access guard make the
+    // donation upsert an atomic scheduler mutation; no scheduler-owned
+    // reference escapes the closure.
+    interrupts::without_interrupts(|| unsafe {
+        scheduler_mut().inherit_pager_fault_priority(fault_token, donor_task_id, receiver_task_id)
+    })
+}
+
 /// One scheduler acquisition for the class query and the reservation an IPC
 /// call needs before it can enqueue. See [`scheduler::IpcCallAdmission`].
 pub fn reserve_ipc_call_donation(donor_task_id: u64) -> scheduler::IpcCallAdmission {
@@ -201,30 +232,6 @@ pub fn bind_ipc_priority_to_process_worker(
     })
 }
 
-/// Revokes the bounded priority donation owned by a completed or cancelled IPC
-/// reply capability. It is safe to call more than once for terminal races.
-/// Binds a pager-fault donation. The fault token lives in its own key space:
-/// it is `(generation << 8) | slot` while a reply handle is
-/// `(generation << 16) | (index + 1)`, and the two overlap numerically, so the
-/// ledger must be told which space this key belongs to.
-pub fn bind_reserved_pager_fault_priority(
-    fault_token: u64,
-    donor_task_id: u64,
-    receiver_task_id: u64,
-) -> bool {
-    // SAFETY: interrupt exclusion and the scheduler access guard make binding
-    // the reserved donor to one fault token and exact worker an atomic
-    // scheduler mutation; no scheduler-owned reference escapes.
-    interrupts::without_interrupts(|| unsafe {
-        scheduler_mut().bind_reserved_ipc_priority(
-            fault_token,
-            scheduler::ipc_donation::DonationNamespace::PagerFault,
-            donor_task_id,
-            receiver_task_id,
-        )
-    })
-}
-
 /// Releases a pager-fault donation from the pager-fault key space.
 pub fn release_pager_fault_priority(fault_token: u64) -> bool {
     interrupts::without_interrupts(|| {
@@ -244,26 +251,51 @@ pub fn release_ipc_priority(reply: u64) -> bool {
     })
 }
 
-/// Returns the exact caller scheduling-context custody carried by one terminal
-/// reply. The IPC runtime guarantees one-shot extraction; PS revalidates the
-/// live slot/generation before releasing any reply-scoped donation state.
-pub fn settle_ipc_reply_scheduling_context(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReplySchedulingContextSettlement {
+    Returned,
+    OwnerRetired,
+    IdentityMismatch,
+}
+
+const fn classify_unpublished_reply_custody(
+    identity_matches: bool,
+    owner_is_live: bool,
+) -> ReplySchedulingContextSettlement {
+    if identity_matches {
+        ReplySchedulingContextSettlement::Returned
+    } else if owner_is_live {
+        ReplySchedulingContextSettlement::IdentityMismatch
+    } else {
+        ReplySchedulingContextSettlement::OwnerRetired
+    }
+}
+
+fn settle_reply_scheduling_context(
     reply: u64,
     custody: kernel_ipc_runtime::api::ReplySchedulingContextCustody,
-) -> bool {
+) -> ReplySchedulingContextSettlement {
     let identity = custody.identity();
     let owner_task_id = custody.context_owner_task_id();
-    let valid = interrupts::without_interrupts(|| {
+    let settlement = interrupts::without_interrupts(|| {
         // Custody is decided by the live slot/task binding the identity
         // encodes, which the per-slot publication already carries. Only an
         // unresolved or mismatched binding needs the catalog guard.
         if let Some(published) =
             scheduler::published_scheduling_context_matches(owner_task_id, identity)
         {
-            return published;
+            return if published {
+                ReplySchedulingContextSettlement::Returned
+            } else {
+                ReplySchedulingContextSettlement::IdentityMismatch
+            };
         }
         // SAFETY: interrupts are masked and no scheduler-owned reference escapes.
-        unsafe { scheduler_ref().scheduling_context_matches(owner_task_id, identity) }
+        let scheduler = unsafe { scheduler_ref() };
+        classify_unpublished_reply_custody(
+            scheduler.scheduling_context_matches(owner_task_id, identity),
+            scheduler.scheduling_context_owner_is_live(owner_task_id),
+        )
     });
     let _ = interrupts::without_interrupts(|| {
         scheduler::release_reply_donation(
@@ -271,7 +303,29 @@ pub fn settle_ipc_reply_scheduling_context(
             scheduler::ipc_donation::DonationNamespace::IpcReply,
         )
     });
-    valid
+    settlement
+}
+
+/// Returns the exact caller scheduling-context custody carried by one normal
+/// reply. A live task with a mismatched object identity is always corruption;
+/// normal reply completion also requires the owner itself to remain live.
+pub fn settle_ipc_reply_scheduling_context(
+    reply: u64,
+    custody: kernel_ipc_runtime::api::ReplySchedulingContextCustody,
+) -> bool {
+    settle_reply_scheduling_context(reply, custody) == ReplySchedulingContextSettlement::Returned
+}
+
+/// Settles custody after the reply object has atomically entered Cancelled.
+/// The context owner may have retired before a downstream server observes its
+/// timeout; that is a legal terminal race. A still-live owner with a different
+/// scheduling-context identity remains a hard invariant violation.
+pub fn settle_cancelled_ipc_reply_scheduling_context(
+    reply: u64,
+    custody: kernel_ipc_runtime::api::ReplySchedulingContextCustody,
+) -> bool {
+    settle_reply_scheduling_context(reply, custody)
+        != ReplySchedulingContextSettlement::IdentityMismatch
 }
 
 pub fn complete_ipc_reply_wake_handoff_with_custody(
@@ -345,10 +399,50 @@ pub fn complete_ipc_reply_wake_handoff(reply: u64, task_id: u64) -> bool {
     interrupts::without_interrupts(|| token.is_some_and(scheduler::enqueue_reply_wake_handoff))
 }
 
+/// Returns a completed pager reply directly to the exact token-blocked fault
+/// owner. Donation release and wake publication use the pager namespace; no
+/// generic wake or best-effort pick hint can target a later wait generation.
+pub fn complete_pager_fault_wake_handoff(fault_token: u64, task_id: u64) -> bool {
+    let _ = interrupts::without_interrupts(|| {
+        scheduler::release_reply_donation(
+            fault_token,
+            scheduler::ipc_donation::DonationNamespace::PagerFault,
+        )
+    });
+    // SAFETY: interrupt exclusion and the scheduler access guard make the
+    // token check and wake one atomic scheduler mutation. The returned proof
+    // is an opaque post-wake runqueue snapshot, not a scheduler reference.
+    let token = interrupts::without_interrupts(|| unsafe {
+        scheduler_mut().complete_pager_fault_wake_handoff(fault_token, task_id)
+    });
+    interrupts::without_interrupts(|| token.is_some_and(scheduler::enqueue_reply_wake_handoff))
+}
+
 pub fn release_ipc_priorities_for_process(process_id: u64) {
     // SAFETY: interrupts are masked and the scheduler access guard exclusively
     // owns the process-wide donation retirement; no reference escapes.
     interrupts::without_interrupts(|| unsafe {
         scheduler_mut().release_ipc_priorities_for_process(process_id)
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ReplySchedulingContextSettlement, classify_unpublished_reply_custody};
+
+    #[test]
+    fn cancelled_custody_accepts_only_exact_return_or_retired_owner() {
+        assert_eq!(
+            classify_unpublished_reply_custody(true, true),
+            ReplySchedulingContextSettlement::Returned
+        );
+        assert_eq!(
+            classify_unpublished_reply_custody(false, false),
+            ReplySchedulingContextSettlement::OwnerRetired
+        );
+        assert_eq!(
+            classify_unpublished_reply_custody(false, true),
+            ReplySchedulingContextSettlement::IdentityMismatch
+        );
+    }
 }

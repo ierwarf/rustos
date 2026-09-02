@@ -56,13 +56,16 @@ macro_rules! boot_log {
 
 pub fn handle_kernel_panic(info: &PanicInfo<'_>) -> ! {
     x86_64::instructions::interrupts::disable();
+    // Every CPU must publish its allocation-free source marker before racing
+    // for the verbose panic reporter. Otherwise a nested winner can halt the
+    // only CPU whose site explains the original corruption.
+    write_panic_site_marker(info);
     if PANIC_IN_PROGRESS.swap(true, Ordering::AcqRel) {
         debug::println_emergency(format_args!("[NESTED PANIC]"));
         loop {
             x86_64::instructions::hlt();
         }
     }
-    write_panic_site_marker(info);
     // The first panic evidence must not acquire a display, allocator, or
     // scheduler-dependent lock. A lock-contract panic can occur while any of
     // those are inconsistent; trying to paint first recursively panics and

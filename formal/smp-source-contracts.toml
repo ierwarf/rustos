@@ -799,7 +799,7 @@ fail_stop = "runqueue::rollback_direct_handoff(receiver_slot, current_cpu),"
 # published here, and the fair-queue materialization is its fallback.
 [[audited_fail_stops]]
 name = "fast-ipc-reply-fallback-materialize"
-path = "kernel/ps/src/multitask/scheduler.rs"
+path = "kernel/ps/src/multitask/scheduler/wake_handoff.rs"
 establishes = "runqueue::publish_direct_handoff(caller_slot, current_cpu),"
 fail_stop = "runqueue::materialize_direct_handoff("
 

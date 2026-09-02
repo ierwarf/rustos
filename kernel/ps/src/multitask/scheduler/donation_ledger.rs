@@ -83,7 +83,15 @@ static INHERITED_SYSTEM: [AtomicU8; MAX_TASK] = [const { AtomicU8::new(0) }; MAX
 const NO_BORROWED_CONTEXT: u16 = u16::MAX;
 static BORROWED_CONTEXT_OWNER: [AtomicU16; MAX_TASK] =
     [const { AtomicU16::new(NO_BORROWED_CONTEXT) }; MAX_TASK];
+static BORROWED_CONTEXT_NAMESPACE: [AtomicU8; MAX_TASK] = [const { AtomicU8::new(0) }; MAX_TASK];
 static BORROWED_CONTEXT_REPLY: [AtomicU64; MAX_TASK] = [const { AtomicU64::new(0) }; MAX_TASK];
+
+const fn namespace_tag(namespace: DonationNamespace) -> u8 {
+    match namespace {
+        DonationNamespace::IpcReply => 1,
+        DonationNamespace::PagerFault => 2,
+    }
+}
 
 fn bind_entry_to_receiver(entry: &mut LedgerEntry, receiver_task_id: u64, receiver_slot: usize) {
     entry.donation.target = IpcDonationTarget::BoundWorker(receiver_task_id);
@@ -93,6 +101,7 @@ fn bind_entry_to_receiver(entry: &mut LedgerEntry, receiver_task_id: u64, receiv
         receiver_slot,
         entry.donation.context_owner_slot,
         entry.donation.reply,
+        entry.donation.namespace,
     );
     if entry.donation.priority_donated {
         increment_receiver(receiver_slot);
@@ -107,6 +116,9 @@ pub(super) fn reset() {
     }
     for owner in &BORROWED_CONTEXT_OWNER {
         owner.store(NO_BORROWED_CONTEXT, Ordering::Release);
+    }
+    for namespace in &BORROWED_CONTEXT_NAMESPACE {
+        namespace.store(0, Ordering::Release);
     }
     for reply in &BORROWED_CONTEXT_REPLY {
         reply.store(0, Ordering::Release);
@@ -257,12 +269,13 @@ pub(super) fn upsert(
                 previous_slot,
                 previous.donation.context_owner_slot,
                 previous.donation.reply,
+                previous.donation.namespace,
             );
             if previous.donation.priority_donated {
                 decrement_receiver(previous_slot);
             }
         }
-        publish_charge_token(receiver_slot, context_owner_slot, reply);
+        publish_charge_token(receiver_slot, context_owner_slot, reply, namespace);
         if priority_donated {
             increment_receiver(receiver_slot);
         }
@@ -283,7 +296,7 @@ pub(super) fn upsert(
     }) {
         return false;
     }
-    publish_charge_token(receiver_slot, context_owner_slot, reply);
+    publish_charge_token(receiver_slot, context_owner_slot, reply, namespace);
     if priority_donated {
         increment_receiver(receiver_slot);
     }
@@ -324,6 +337,7 @@ pub(super) fn release_reply(reply: u64, namespace: DonationNamespace) -> bool {
                         receiver_slot,
                         owner_slot,
                         entry.donation.reply,
+                        entry.donation.namespace,
                     );
                     if priority_donated {
                         decrement_receiver(receiver_slot);
@@ -405,6 +419,7 @@ fn release_entry(ledger: &DonationLedger, entry: LedgerEntry) {
             receiver_slot,
             entry.donation.context_owner_slot,
             entry.donation.reply,
+            entry.donation.namespace,
         );
         if entry.donation.priority_donated {
             decrement_receiver(receiver_slot);
@@ -412,13 +427,19 @@ fn release_entry(ledger: &DonationLedger, entry: LedgerEntry) {
     }
 }
 
-fn publish_charge_token(receiver_slot: usize, context_owner_slot: usize, reply: u64) {
+fn publish_charge_token(
+    receiver_slot: usize,
+    context_owner_slot: usize,
+    reply: u64,
+    namespace: DonationNamespace,
+) {
     assert!(
         reply != 0,
         "borrowed scheduling context requires a live reply"
     );
     let encoded = u16::try_from(context_owner_slot).expect("context owner slot exceeds u16");
     BORROWED_CONTEXT_OWNER[receiver_slot].store(encoded, Ordering::Relaxed);
+    BORROWED_CONTEXT_NAMESPACE[receiver_slot].store(namespace_tag(namespace), Ordering::Relaxed);
     BORROWED_CONTEXT_REPLY[receiver_slot].store(reply, Ordering::Release);
 }
 
@@ -427,6 +448,7 @@ fn restore_context_owner_after_release(
     receiver_slot: usize,
     context_owner_slot: usize,
     reply: u64,
+    namespace: DonationNamespace,
 ) {
     let encoded = u16::try_from(context_owner_slot).expect("context owner slot exceeds u16");
     let replacement = ledger.entries[..ledger.len]
@@ -434,16 +456,25 @@ fn restore_context_owner_after_release(
         .rev()
         .flatten()
         .find(|entry| entry.donation.custody_active && entry.receiver_slot == Some(receiver_slot))
-        .map(|entry| (entry.donation.context_owner_slot, entry.donation.reply));
+        .map(|entry| {
+            (
+                entry.donation.context_owner_slot,
+                entry.donation.reply,
+                entry.donation.namespace,
+            )
+        });
     if BORROWED_CONTEXT_OWNER[receiver_slot].load(Ordering::Relaxed) != encoded
+        || BORROWED_CONTEXT_NAMESPACE[receiver_slot].load(Ordering::Relaxed)
+            != namespace_tag(namespace)
         || BORROWED_CONTEXT_REPLY[receiver_slot].load(Ordering::Relaxed) != reply
     {
         return;
     }
-    if let Some((owner_slot, reply)) = replacement {
-        publish_charge_token(receiver_slot, owner_slot, reply);
+    if let Some((owner_slot, reply, namespace)) = replacement {
+        publish_charge_token(receiver_slot, owner_slot, reply, namespace);
     } else {
         BORROWED_CONTEXT_OWNER[receiver_slot].store(NO_BORROWED_CONTEXT, Ordering::Relaxed);
+        BORROWED_CONTEXT_NAMESPACE[receiver_slot].store(0, Ordering::Relaxed);
         BORROWED_CONTEXT_REPLY[receiver_slot].store(0, Ordering::Release);
     }
 }
@@ -494,6 +525,48 @@ mod tests {
         assert!(!release_reply(COLLIDING_KEY, DonationNamespace::PagerFault));
         assert!(release_reply(COLLIDING_KEY, DonationNamespace::IpcReply));
         assert!(!release_reply(COLLIDING_KEY, DonationNamespace::IpcReply));
+    }
+
+    /// The lock-free per-worker charge publication is part of the same key.
+    /// Releasing an equal numeric key in another namespace must not clear the
+    /// worker's newer custody stamp.
+    #[test]
+    fn colliding_namespace_cannot_clear_worker_charge_publication() {
+        let _guard = TEST_GUARD
+            .lock()
+            .expect("donation ledger test lock poisoned");
+        reset();
+        const COLLIDING_KEY: u64 = (1 << 16) | 1;
+        const WORKER_SLOT: usize = 9;
+
+        assert!(reserve(61, 61, 6, true));
+        assert!(bind_reserved(
+            COLLIDING_KEY,
+            DonationNamespace::IpcReply,
+            61,
+            70,
+            WORKER_SLOT,
+        ));
+        assert!(reserve(62, 62, 7, true));
+        assert!(bind_reserved(
+            COLLIDING_KEY,
+            DonationNamespace::PagerFault,
+            62,
+            70,
+            WORKER_SLOT,
+        ));
+        assert_eq!(
+            borrowed_context_charge_token(WORKER_SLOT),
+            Some((7, COLLIDING_KEY))
+        );
+
+        assert!(release_reply(COLLIDING_KEY, DonationNamespace::IpcReply));
+        assert_eq!(
+            borrowed_context_charge_token(WORKER_SLOT),
+            Some((7, COLLIDING_KEY))
+        );
+        assert!(release_reply(COLLIDING_KEY, DonationNamespace::PagerFault));
+        assert_eq!(borrowed_context_charge_token(WORKER_SLOT), None);
     }
     use core::sync::atomic::Ordering;
     use std::sync::Mutex;

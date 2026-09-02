@@ -71,6 +71,19 @@ pub(super) struct IpcPriorityDonation {
 }
 
 impl Scheduler {
+    /// Whether a monotonic task still owns live scheduling-context authority.
+    /// A retired task deliberately keeps its slot/start identity until bounded
+    /// cleanup completes, so slot presence alone cannot classify terminal IPC
+    /// custody as corruption.
+    pub(in crate::multitask) fn scheduling_context_owner_is_live(&self, task_id: u64) -> bool {
+        let Some(slot) = self.find_task_slot(task_id) else {
+            return false;
+        };
+        self.contexts[slot].is_some_and(|context| {
+            !self.retired[slot] && context.scheduling_context.is_bound_to(task_id)
+        })
+    }
+
     pub(super) fn eligible_process_worker_slot(&self, process_id: u64) -> Option<usize> {
         (0..MAX_TASK)
             .filter(|slot| {
@@ -465,6 +478,26 @@ impl Scheduler {
         self.upsert_ipc_priority_donation(
             reply,
             DonationNamespace::IpcReply,
+            donor_task_id,
+            receiver_task_id,
+        )
+    }
+
+    /// Binds a dispatched pager fault directly to the fault owner's effective
+    /// scheduling context. Fault entry cannot reserve the donation ledger;
+    /// the fixed fault slot is the prior admission proof for this upsert.
+    pub(in crate::multitask) fn inherit_pager_fault_priority(
+        &mut self,
+        fault_token: u64,
+        donor_task_id: u64,
+        receiver_task_id: u64,
+    ) -> bool {
+        if fault_token == 0 || donor_task_id == receiver_task_id {
+            return false;
+        }
+        self.upsert_ipc_priority_donation(
+            fault_token,
+            DonationNamespace::PagerFault,
             donor_task_id,
             receiver_task_id,
         )

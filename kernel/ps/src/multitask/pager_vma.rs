@@ -19,15 +19,24 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
 use rustos_user_abi::pager::{
-    PAGER_PAGE_BYTES, PagerEndpointCapabilityWire, PagerObjectIdentityWire, PagerVmRegionWire,
-    VM_ACCESS_EXECUTE, VM_ACCESS_KNOWN, VM_ACCESS_READ, VM_ACCESS_WRITE, VM_PROT_EXECUTE,
-    VM_PROT_READ, VM_PROT_WRITE, VM_SHARING_PRIVATE, VM_SHARING_SHARED,
+    PAGER_MAX_REGION_GROWTH_PER_PROTECT, PAGER_MAX_REGION_GROWTH_PER_UNMAP,
+    PAGER_MAX_VMAS_PER_PROCESS, PAGER_PAGE_BYTES, PagerEndpointCapabilityWire,
+    PagerObjectIdentityWire, PagerRangeEdit, PagerRegionEdit, PagerVmRegionWire, VM_ACCESS_EXECUTE,
+    VM_ACCESS_KNOWN, VM_ACCESS_READ, VM_ACCESS_WRITE, VM_PROT_EXECUTE, VM_PROT_READ, VM_PROT_WRITE,
+    VM_SHARING_PRIVATE, VM_SHARING_SHARED, apply_region_edit,
 };
 
 use super::process_table::MAX_PROCESS_OBJECTS;
 use super::process_table::{ProcessHandle, ProcessIdentity};
 
-const MAX_PAGER_VMAS_PER_PROCESS: usize = 64;
+/// Ring0's per-process pager VMA table, taken from the shared ABI.
+///
+/// This used to be a private `64` with no declared relationship to pagerd's
+/// region table, so the two capacities could drift apart silently and nothing
+/// said what the safe relation between them was. `PAGER_MIN_FULLY_TRACKED_PROCESSES`
+/// in the ABI is that relation, and it is only meaningful if both replicas
+/// read the same constant.
+const MAX_PAGER_VMAS_PER_PROCESS: usize = PAGER_MAX_VMAS_PER_PROCESS;
 const MAX_PUBLICATION_SEQUENCE: u64 = u64::MAX - 3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -457,6 +466,11 @@ where
     overlapping[..overlapping_len].sort_unstable_by_key(|(_, region)| region.start);
 
     let process = handle.object_identity().ok_or(PagerVmaError::Stale)?;
+    let edit = PagerRangeEdit {
+        start,
+        end,
+        replacement_prot,
+    };
     let mut cursor = start;
     let mut rewritten = [None; MAX_REWRITTEN_REGIONS];
     let mut rewritten_len = 0;
@@ -468,43 +482,40 @@ where
         {
             return Err(PagerVmaError::Stale);
         }
-        let segment_start = start.max(region.start);
-        let segment_end = end.min(region.end);
-        if let Some(prot) = replacement_prot {
-            if prot & !region.prot != 0 {
-                return Err(PagerVmaError::Denied);
+        // The split/trim/remove rule is the shared ABI one. pagerd applies the
+        // same call to its own replica of this region, so the two tables
+        // cannot disagree about what an edit leaves behind - which is exactly
+        // what happened while each side derived its own remainders.
+        let mut push = |fragment| {
+            rewritten[rewritten_len] = Some(fragment);
+            rewritten_len += 1;
+        };
+        match apply_region_edit(region, edit) {
+            PagerRegionEdit::Untouched(_) => return Err(PagerVmaError::Stale),
+            PagerRegionEdit::Removed => {}
+            PagerRegionEdit::Replaced(only) => push(only),
+            PagerRegionEdit::Split { left, right } => {
+                push(left);
+                push(right);
             }
+            PagerRegionEdit::ProtectedSplit {
+                left,
+                middle,
+                right,
+            } => {
+                push(left);
+                push(middle);
+                push(right);
+            }
+            PagerRegionEdit::Denied => return Err(PagerVmaError::Denied),
+            PagerRegionEdit::Malformed => return Err(PagerVmaError::Malformed),
         }
-        if region.start < segment_start {
-            let mut left = region;
-            left.end = segment_start;
-            rewritten[rewritten_len] = Some(left);
-            rewritten_len += 1;
-        }
-        if let Some(prot) = replacement_prot {
-            let mut middle = region;
-            middle.start = segment_start;
-            middle.end = segment_end;
-            middle.object_offset = region
-                .object_offset
-                .checked_add(segment_start - region.start)
-                .ok_or(PagerVmaError::Malformed)?;
-            middle.prot = prot;
-            rewritten[rewritten_len] = Some(middle);
-            rewritten_len += 1;
-        }
-        if segment_end < region.end {
-            let mut right = region;
-            right.start = segment_end;
-            right.object_offset = region
-                .object_offset
-                .checked_add(segment_end - region.start)
-                .ok_or(PagerVmaError::Malformed)?;
-            rewritten[rewritten_len] = Some(right);
-            rewritten_len += 1;
-        }
-        cursor = cursor.max(segment_end);
+        cursor = cursor.max(end.min(region.end));
     }
+    debug_assert!(
+        rewritten_len <= overlapping_len + PAGER_MAX_REGION_GROWTH_PER_PROTECT,
+        "one range edit may add at most one interior split's fragments"
+    );
     if cursor < end || rewritten_len > overlapping_len + empty_len {
         return Err(if cursor < end {
             PagerVmaError::Stale
@@ -541,19 +552,30 @@ where
     Ok(true)
 }
 
+/// Narrows protection over one exact range and reports the identity whose
+/// regions were rewritten.
+///
+/// Returning the stamped `(process_handle, process_generation)` lets the caller
+/// publish the same narrowing to the pager under the identity ring0 actually
+/// edited, rather than re-deriving one that could disagree - the same reason
+/// [`unmap_for_process`] returns it.
 pub fn protect_for_process(
     process_id: u64,
     start: u64,
     end: u64,
     prot: u32,
     page_flags: x86_64::structures::paging::PageTableFlags,
-) -> Result<bool, PagerVmaError> {
+) -> Result<Option<(u64, u64)>, PagerVmaError> {
     let retained =
         super::process_table::retain_process_by_pid(process_id).ok_or(PagerVmaError::Stale)?;
     let identity = retained.live_identity().ok_or(PagerVmaError::Stale)?;
     let page_count =
         usize::try_from((end - start) / PAGER_PAGE_BYTES).map_err(|_| PagerVmaError::Malformed)?;
-    retained.with_state_mut(|_, state| {
+    let process = retained
+        .handle()
+        .object_identity()
+        .ok_or(PagerVmaError::Stale)?;
+    let rewritten = retained.with_state_mut(|_, state| {
         rewrite_attenuated_range(retained.handle(), identity, start, end, Some(prot), || {
             state
                 .address_space_mut()
@@ -565,7 +587,8 @@ pub fn protect_for_process(
                 .map(|_| ())
                 .map_err(|_| PagerVmaError::Stale)
         })
-    })
+    })?;
+    Ok(rewritten.then(|| (process.slot(), process.generation())))
 }
 
 /// Unmaps one exact range and reports the identity whose slot was released.
@@ -632,6 +655,19 @@ mod tests {
     use crate::memory::paging::ProcessAddressSpace;
     use crate::user::process_state::UserProcessState;
     use rustos_user_abi::pager::{VM_OBJECT_ANONYMOUS, VM_PROT_READ, VM_PROT_WRITE};
+    use std::sync::Mutex;
+
+    /// The publication table is a process-wide bounded array whose free slots
+    /// are shared by every test in this module. Two tests publishing at once
+    /// can land on the same slot and make a healthy reader observe the other
+    /// writer's odd invalidation as `Unstable`, so the suite serializes here.
+    static TEST_GUARD: Mutex<()> = Mutex::new(());
+
+    fn guard() -> std::sync::MutexGuard<'static, ()> {
+        TEST_GUARD
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     fn identity(generation: u32, mm_generation: u32) -> ProcessIdentity {
         ProcessIdentity::from_parts(41, generation, mm_generation)
@@ -677,6 +713,7 @@ mod tests {
 
     #[test]
     fn publication_stamps_exact_process_mm_and_nonzero_vma_generation() {
+        let _guard = guard();
         let handle = ProcessHandle::new(29, 43);
         let identity = identity(43, 47);
         let published = publish(handle, identity, template(0x4000)).unwrap();
@@ -693,6 +730,7 @@ mod tests {
 
     #[test]
     fn overlap_and_permission_escalation_fail_closed() {
+        let _guard = guard();
         let handle = ProcessHandle::new(28, 53);
         let identity = identity(53, 59);
         let published = publish(handle, identity, template(0x8000)).unwrap();
@@ -709,6 +747,7 @@ mod tests {
 
     #[test]
     fn protection_attenuation_and_unmap_rewrite_before_mutation() {
+        let _guard = guard();
         let handle = ProcessHandle::new(27, 61);
         let identity = identity(61, 67);
         let published = publish(handle, identity, template(0x20_000)).unwrap();
@@ -781,6 +820,7 @@ mod tests {
 
     #[test]
     fn per_process_vma_bound_admits_product_envelope_and_rejects_the_next_region() {
+        let _guard = guard();
         let handle = ProcessHandle::new(26, 71);
         let identity = identity(71, 73);
         let mut published = [PagerVmRegionWire::default(); MAX_PAGER_VMAS_PER_PROCESS];
@@ -803,6 +843,7 @@ mod tests {
 
     #[test]
     fn exec_generation_change_and_revoked_region_never_match() {
+        let _guard = guard();
         let handle = ProcessHandle::new(27, 61);
         let exact_identity = identity(61, 67);
         let published = publish(handle, exact_identity, template(0xc000)).unwrap();
@@ -838,6 +879,7 @@ mod tests {
 
     #[test]
     fn target_process_publication_is_generation_bound_and_revocable() {
+        let _guard = guard();
         let _isolation = super::super::process_table::tests::isolate_process_table();
         let handle = super::super::process_table::create_process(4_242, process_state())
             .expect("test process handle");
@@ -869,5 +911,173 @@ mod tests {
             lookup(handle, identity, 0x1_0000, VM_ACCESS_READ),
             Err(PagerVmaError::Stale)
         );
+    }
+
+    /// A wide template, so an edit can land strictly inside it and split.
+    fn wide_template(start: u64, pages: u64) -> PagerVmRegionWire {
+        PagerVmRegionWire {
+            end: start + PAGER_PAGE_BYTES * pages,
+            ..template(start)
+        }
+    }
+
+    fn published_spans(
+        handle: ProcessHandle,
+        identity: ProcessIdentity,
+    ) -> alloc::vec::Vec<(u64, u64, u64)> {
+        let mut spans: alloc::vec::Vec<(u64, u64, u64)> = process_slots(handle)
+            .unwrap()
+            .iter()
+            .filter_map(|slot| slot.snapshot().unwrap())
+            .filter(|region| {
+                region.process_generation == u64::from(identity.process_generation())
+                    && region.mm_generation == u64::from(identity.mm_generation())
+            })
+            .map(|region| (region.start, region.end, region.object_offset))
+            .collect();
+        spans.sort_unstable();
+        spans
+    }
+
+    fn rule_spans(
+        region: PagerVmRegionWire,
+        edit: PagerRangeEdit,
+    ) -> alloc::vec::Vec<(u64, u64, u64)> {
+        let (fragments, len) = apply_region_edit(region, edit).fragments();
+        let mut spans: alloc::vec::Vec<(u64, u64, u64)> = fragments[..len]
+            .iter()
+            .map(|fragment| (fragment.start, fragment.end, fragment.object_offset))
+            .collect();
+        spans.sort_unstable();
+        spans
+    }
+
+    /// Ring0's rewrite must equal the shared ABI rule exactly.
+    ///
+    /// This is one half of the replica binding: pagerd is tested against the
+    /// same rule, so proving each side equals it proves the two sides agree.
+    /// They previously derived their own remainders, and an interior `munmap`
+    /// left ring0 holding two mappings that pagerd had deleted - so the next
+    /// fault in a surviving remainder passed ring0's VMA check, matched no
+    /// pagerd region, and killed the thread.
+    #[test]
+    fn ring0_rewrite_matches_the_shared_range_edit_rule() {
+        let _guard = guard();
+        let handle = ProcessHandle::new(25, 79);
+        let identity = identity(79, 83);
+        let base = 0x8_0000;
+        for (edit_start, edit_end) in [
+            (base, base + PAGER_PAGE_BYTES), // trim head
+            (base + PAGER_PAGE_BYTES * 3, base + PAGER_PAGE_BYTES * 4), // trim tail
+            (base + PAGER_PAGE_BYTES, base + PAGER_PAGE_BYTES * 2), // interior split
+            (base, base + PAGER_PAGE_BYTES * 4), // full remove
+        ] {
+            let published = publish(handle, identity, wide_template(base, 4)).unwrap();
+            assert_eq!(
+                rewrite_attenuated_range(handle, identity, edit_start, edit_end, None, || Ok(())),
+                Ok(true)
+            );
+            assert_eq!(
+                published_spans(handle, identity),
+                rule_spans(published, PagerRangeEdit::unmap(edit_start, edit_end)),
+                "unmap {edit_start:#x}..{edit_end:#x} must equal the shared rule"
+            );
+            for (start, end, _) in published_spans(handle, identity) {
+                assert_eq!(
+                    rewrite_attenuated_range(handle, identity, start, end, None, || Ok(())),
+                    Ok(true)
+                );
+            }
+            assert!(published_spans(handle, identity).is_empty());
+        }
+    }
+
+    /// An interior unmap costs exactly one extra VMA slot, and no more - the
+    /// capacity claim `PAGER_MAX_REGION_GROWTH_PER_UNMAP` states and that
+    /// pagerd's table is sized against.
+    #[test]
+    fn an_interior_unmap_costs_exactly_one_extra_vma_slot() {
+        let _guard = guard();
+        let handle = ProcessHandle::new(24, 89);
+        let identity = identity(89, 97);
+        let base = 0x9_0000;
+        let published = publish(handle, identity, wide_template(base, 4)).unwrap();
+        let before = published_spans(handle, identity).len();
+        assert_eq!(
+            rewrite_attenuated_range(
+                handle,
+                identity,
+                base + PAGER_PAGE_BYTES,
+                base + PAGER_PAGE_BYTES * 2,
+                None,
+                || Ok(()),
+            ),
+            Ok(true)
+        );
+        let after = published_spans(handle, identity).len();
+        assert_eq!(after - before, PAGER_MAX_REGION_GROWTH_PER_UNMAP);
+        assert!(after - before <= PAGER_MAX_REGION_GROWTH_PER_PROTECT);
+        // Every surviving page still faults, and the removed one does not.
+        assert!(lookup(handle, identity, base, VM_ACCESS_WRITE).is_ok());
+        assert!(
+            lookup(
+                handle,
+                identity,
+                base + PAGER_PAGE_BYTES * 2,
+                VM_ACCESS_WRITE
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            lookup(handle, identity, base + PAGER_PAGE_BYTES, VM_ACCESS_WRITE),
+            Err(PagerVmaError::Stale)
+        );
+        let _ = published;
+        for (start, end, _) in published_spans(handle, identity) {
+            assert_eq!(
+                rewrite_attenuated_range(handle, identity, start, end, None, || Ok(())),
+                Ok(true)
+            );
+        }
+    }
+
+    /// A split with no free VMA slot must refuse before it withdraws anything.
+    /// Withdrawing first and failing to republish would lose a live mapping.
+    #[test]
+    fn a_split_with_no_free_vma_slot_refuses_and_keeps_every_region() {
+        let _guard = guard();
+        let handle = ProcessHandle::new(23, 101);
+        let identity = identity(101, 103);
+        let base = 0xa_0000;
+        let mut published = alloc::vec::Vec::new();
+        for index in 0..MAX_PAGER_VMAS_PER_PROCESS as u64 {
+            let start = base + index * PAGER_PAGE_BYTES * 4;
+            published.push(publish(handle, identity, wide_template(start, 3)).unwrap());
+        }
+        let before = published_spans(handle, identity);
+        assert_eq!(before.len(), MAX_PAGER_VMAS_PER_PROCESS);
+        // Every slot is taken, so an interior split has nowhere to put its
+        // second fragment. It must refuse with `Pressure` and leave the whole
+        // table exactly as it was; the mutation closure must never run.
+        let mut mutated = false;
+        assert_eq!(
+            rewrite_attenuated_range(
+                handle,
+                identity,
+                base + PAGER_PAGE_BYTES,
+                base + PAGER_PAGE_BYTES * 2,
+                None,
+                || {
+                    mutated = true;
+                    Ok(())
+                },
+            ),
+            Err(PagerVmaError::Pressure)
+        );
+        assert!(!mutated, "no PTE may change before the split is admitted");
+        assert_eq!(published_spans(handle, identity), before);
+        for region in published {
+            revoke(handle, identity, region.start, region.vma_generation).unwrap();
+        }
     }
 }

@@ -14,12 +14,9 @@ mod run_authority;
 mod scheduler;
 mod scheduling_api;
 mod spawn;
+mod task_id;
 
-use core::{
-    cell::Cell,
-    mem,
-    sync::atomic::{AtomicU64, Ordering},
-};
+use core::{cell::Cell, mem, sync::atomic::AtomicU64};
 
 use x86_64::VirtAddr;
 use x86_64::instructions::{hlt, interrupts};
@@ -30,6 +27,7 @@ use self::cpu_local::{
     current_cpu_task_slot_admitted, publish_cpu_current_task, publish_scheduler_initialized,
     scheduler_initialized, scheduler_mut, scheduler_ref, task_slot_is_running,
 };
+use self::task_id::{NEXT_TASK_ID, allocate_task_id};
 use crate::io::session::ConsoleSessionHandle;
 use crate::memory::paging::ProcessAddressSpace;
 use crate::user::abi::UserAbi;
@@ -46,9 +44,9 @@ pub use self::current::{
     arm_block_current_task_on_endpoint, arm_block_current_task_on_pager_fault,
     arm_block_current_task_on_pager_service, arm_block_current_task_on_reply,
     attach_reserved_ipc_priority, bind_ipc_priority_to_process_worker, bind_reserved_ipc_priority,
-    bind_reserved_pager_fault_priority, cancel_block_current_task, cancel_ipc_priority_reservation,
-    commit_ipc_call_handoff, complete_fast_ipc_reply_wake_handoff_with_custody,
-    complete_ipc_reply_wake_handoff, complete_ipc_reply_wake_handoff_with_custody,
+    cancel_block_current_task, cancel_ipc_priority_reservation, commit_ipc_call_handoff,
+    complete_fast_ipc_reply_wake_handoff_with_custody, complete_ipc_reply_wake_handoff,
+    complete_ipc_reply_wake_handoff_with_custody, complete_pager_fault_wake_handoff,
     complete_retired_task_cleanup, current_console_session, current_linux_thread_state,
     current_pager_charge_snapshot, current_pager_vma_snapshot,
     current_scheduling_context_runtime_snapshot, current_task_id,
@@ -58,22 +56,24 @@ pub use self::current::{
     current_user_thread_id, current_user_wait_binding, demote_current_user_task_to_user_class,
     exec_current_user_process, exec_user_process_by_pid, exit_current_user_process,
     exit_current_user_task, halt_current_retired_task, inherit_ipc_priority,
-    is_user_process_exiting, is_user_task_alive, linux_task_affinity, linux_thread_snapshot_by_ids,
-    live_user_process_identity_by_pid, live_user_process_identity_with_exact_exec_path,
-    mark_user_process_exiting, mark_user_process_exiting_once, next_retired_task_cleanup,
-    note_process_exit_status, parent_process_id_of, publish_current_pager_vma,
-    publish_pager_vma_for_process, queue_linux_process_sigchld, queue_linux_signal,
-    release_ipc_priorities_for_process, release_ipc_priority, release_pager_fault_priority,
-    reserve_ipc_call_donation, reserve_ipc_priority, retain_current_user_process_state,
-    retire_current_user_task_due_to_fault, revoke_current_pager_vma, revoke_pager_vma_for_process,
-    service_deferred_work, set_current_linux_tls_fs_base, set_linux_task_affinity,
-    set_next_latency_pick_hint, set_next_pick_hint, set_next_process_pick_hint,
-    set_next_spawn_pick_hint, set_next_synchronous_pick_hint, set_windows_current_thread_affinity,
-    set_windows_process_affinity, settle_ipc_reply_scheduling_context, stop_current_linux_process,
+    inherit_pager_fault_priority, is_user_process_exiting, is_user_task_alive, linux_task_affinity,
+    linux_thread_snapshot_by_ids, live_user_process_identity_by_pid,
+    live_user_process_identity_with_exact_exec_path, mark_user_process_exiting,
+    mark_user_process_exiting_once, next_retired_task_cleanup, note_process_exit_status,
+    parent_process_id_of, publish_current_pager_vma, publish_pager_vma_for_process,
+    queue_linux_process_sigchld, queue_linux_signal, release_ipc_priorities_for_process,
+    release_ipc_priority, release_pager_fault_priority, reserve_ipc_call_donation,
+    reserve_ipc_priority, retain_current_user_process_state, retire_current_user_task_due_to_fault,
+    revoke_current_pager_vma, revoke_pager_vma_for_process, service_deferred_work,
+    set_current_linux_tls_fs_base, set_linux_task_affinity, set_next_latency_pick_hint,
+    set_next_pick_hint, set_next_process_pick_hint, set_next_spawn_pick_hint,
+    set_next_synchronous_pick_hint, set_windows_current_thread_affinity,
+    set_windows_process_affinity, settle_cancelled_ipc_reply_scheduling_context,
+    settle_ipc_reply_scheduling_context, stop_current_linux_process,
     task_has_system_scheduling_class, terminate_user_process, terminate_user_task,
-    user_log_ids_for_task, wait_for_child, wake_task, wake_user_task, windows_process_affinity,
-    with_current_mm, with_current_process_credentials, with_current_process_state,
-    with_current_process_state_mut, with_current_user_linux_state_mut,
+    user_log_ids_for_task, wait_for_child, wake_pager_service_waiter_for_process, wake_task,
+    wake_user_task, windows_process_affinity, with_current_mm, with_current_process_credentials,
+    with_current_process_state, with_current_process_state_mut, with_current_user_linux_state_mut,
     with_current_user_process_and_linux_thread_state_mut, with_current_user_process_state,
     with_current_user_process_state_mut, with_process_state_by_pid, with_process_state_by_pid_mut,
 };
@@ -94,10 +94,11 @@ pub use self::process_table::{
     reserve_spawn as reserve_process_spawn,
 };
 pub use self::retirement::UserFaultDisposition;
-pub use self::scheduler::FastIpcCallHandoffOutcome;
-pub use self::scheduler::drain_scheduler_runtime_profile;
 pub use self::scheduler::smp::drain_fast_ipc_eligibility_rejections;
-pub use self::scheduler::{AffinityCommit, AffinityError, ProcessAffinitySnapshot};
+pub use self::scheduler::{
+    AffinityCommit, AffinityError, FastIpcCallHandoffOutcome, ProcessAffinitySnapshot,
+    drain_scheduler_runtime_profile,
+};
 pub use self::scheduling_api::{SchedulingContextAdmission, SchedulingContextRuntimeSnapshot};
 
 /// Upper bound for schedulable task identities and cross-crate bounded registries.
@@ -135,21 +136,8 @@ pub const DEFAULT_USER_TASK_WEIGHT_MICROS: u64 = 100;
 const USER_TASK_EXEC_PATH_CAPACITY: usize = 192;
 const USER_STACK_PAGE_SIZE: u64 = 4096;
 
-static NEXT_TASK_ID: AtomicU64 = AtomicU64::new(0);
 static USER_RETURN_RESCHEDULE_ARMED: [AtomicU64; nucleus_core::util::lockdep::MAX_TRACKED_CPUS] =
     [const { AtomicU64::new(0) }; nucleus_core::util::lockdep::MAX_TRACKED_CPUS];
-
-fn allocate_task_id_from(counter: &AtomicU64) -> Option<u64> {
-    counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-            current.checked_add(1)
-        })
-        .ok()
-}
-
-fn allocate_task_id() -> Option<u64> {
-    allocate_task_id_from(&NEXT_TASK_ID)
-}
 
 pub fn is_initialized() -> bool {
     scheduler_initialized()

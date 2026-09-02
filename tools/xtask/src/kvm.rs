@@ -722,6 +722,7 @@ fn smp_runtime_missing_markers(log: &str, rustos_vcpus: u8) -> Vec<String> {
     missing
 }
 
+include!("kvm/smoke_args.rs");
 include!("kvm/options.rs");
 include!("kvm/manifest.rs");
 include!("kvm/help.rs");

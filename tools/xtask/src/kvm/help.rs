@@ -78,6 +78,13 @@ options:
                        VFCT produced by rustos-hostd prepare-amd-vfct
   --physical-amdgpu <BDF>, --amd-vfct <path>
                        compatibility aliases for the current AMD profile
+  --repeat <count>     boot this exact topology 1..=64 times and report the
+                       pass rate, naming each failed run's panic line and
+                       archived debugcon log. A defect that appears in one boot
+                       of six is a rate, and a single run cannot measure it
+  --no-build           boot the image already on disk instead of refreshing it.
+                       This lane rebuilds by default: a stale image silently
+                       answers questions about code that is no longer in the tree
   --dry-run            validate inputs and prepare KVM log paths without launching QEMU
   -h, --help           show this help
 

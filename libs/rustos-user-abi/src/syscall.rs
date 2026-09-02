@@ -1131,6 +1131,13 @@ pub const COMMERCIAL_MAX_PAGERD_OP_WRITEBACK_POLICY: u16 = 4;
 /// dead region forever, refuse to re-admit that range as an overlap, and
 /// eventually exhaust its table and silently fall back to eager mapping.
 pub const COMMERCIAL_MAX_PAGERD_OP_RELEASE_OBJECT: u16 = 5;
+/// Narrows the pager's tracked protection over one exact process range.
+///
+/// `mprotect` on part of a region splits it on ring0's side. The pager answers
+/// faults with the protection it holds, so without this notification it keeps
+/// the original rights for the narrowed span and the two replicas disagree
+/// about what the process may do with a page.
+pub const COMMERCIAL_MAX_PAGERD_OP_PROTECT_OBJECT: u16 = 6;
 pub const COMMERCIAL_MAX_UISERVER_OP_DISPLAY_READINESS: u16 = 1;
 pub const COMMERCIAL_MAX_UISERVER_OP_DISPLAY_METADATA: u16 = 2;
 pub const COMMERCIAL_MAX_UISERVER_OP_SURFACE_POLICY: u16 = 3;

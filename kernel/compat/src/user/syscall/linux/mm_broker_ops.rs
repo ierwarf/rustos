@@ -157,24 +157,39 @@ fn broker_map_anon(args: &RustosMmBrokerArgs) -> Result<(), i64> {
     // to pagerd happening not to allocate. Its mapping falls through to the
     // eager path below, exactly as it did before demand paging existed.
     let target_is_pager = ipc_ops::process_owns_pager_policy(args.target_pid);
-    if PAGER_DEMAND_ADMISSION_WIRED
-        && !target_is_pager
-        && args.prot != 0
-        && pager_admission::admit_anonymous_region(args.target_pid, start, mapping_end, args.prot)
-            .is_ok()
-    {
-        let Some(result) =
-            multitask::with_process_state_by_pid_mut(args.target_pid, |process_state| {
-                process_state.set_mapping_cursor(mapping_end);
-                RustosMmMapBrokerResult {
-                    addr: start,
-                    len: args.len,
-                }
-            })
-        else {
-            return Err(LINUX_ESRCH);
-        };
-        return write_out(args, &result);
+    if PAGER_DEMAND_ADMISSION_WIRED && !target_is_pager && args.prot != 0 {
+        match pager_admission::admit_anonymous_region(
+            args.target_pid,
+            start,
+            mapping_end,
+            args.prot,
+        ) {
+            pager_admission::AnonymousAdmission::Demand => {
+                let Some(result) =
+                    multitask::with_process_state_by_pid_mut(args.target_pid, |process_state| {
+                        process_state.set_mapping_cursor(mapping_end);
+                        RustosMmMapBrokerResult {
+                            addr: start,
+                            len: args.len,
+                        }
+                    })
+                else {
+                    return Err(LINUX_ESRCH);
+                };
+                return write_out(args, &result);
+            }
+            // Wired is this target's contract, not a downgrade: either no
+            // pager transport exists yet, or the target is a member of the
+            // graph that resolves faults. Fall through to the eager path
+            // below, exactly as every mapping did before demand paging.
+            pager_admission::AnonymousAdmission::Eager(_) => {}
+            // The pager transport is live and refused this range. Mapping it
+            // eagerly and reporting success is what let a full pagerd region
+            // table silently disable demand paging for the rest of a boot,
+            // with the eager mapping making the downgrade invisible. Fail the
+            // mapping instead; nothing here may fabricate success.
+            pager_admission::AnonymousAdmission::Failed(errno) => return Err(errno),
+        }
     }
 
     let Some(result) = multitask::with_process_state_by_pid_mut(args.target_pid, |process_state| {
@@ -386,8 +401,39 @@ fn broker_protect(args: &RustosMmBrokerArgs) -> Result<(), i64> {
         pager_prot,
         page_flags,
     ) {
-        Ok(true) => return Ok(()),
-        Ok(false) => {}
+        Ok(Some((process_handle, process_generation))) => {
+            // Ring0 has narrowed the range. pagerd decides a fault's granted
+            // rights from the protection *it* holds, so a narrowing it never
+            // hears about would let it keep granting the old rights for pages
+            // this process may no longer touch that way.
+            //
+            // The protection change has already been applied, so a failed
+            // notification must not fail `mprotect`; it is parked for
+            // reconciliation and re-sent from the next admission, exactly like
+            // a release.
+            if pager_prot != 0 {
+                let _ = pager_admission::protect_anonymous_region(
+                    process_handle,
+                    process_generation,
+                    start,
+                    end,
+                    pager_prot,
+                );
+            } else {
+                // `PROT_NONE` leaves ring0 a deny-all VMA whose lookup refuses
+                // every access before a fault can be dispatched, and a region
+                // with no rights is not a canonical wire region. The pager's
+                // outcome is therefore identical to a release of that span.
+                let _ = pager_admission::release_anonymous_region(
+                    process_handle,
+                    process_generation,
+                    start,
+                    end,
+                );
+            }
+            return Ok(());
+        }
+        Ok(None) => {}
         Err(multitask::PagerVmaError::Denied) => return Err(LINUX_EACCES),
         Err(multitask::PagerVmaError::Pressure) => return Err(LINUX_ENOMEM),
         Err(multitask::PagerVmaError::Malformed) => return Err(LINUX_EINVAL),
@@ -415,7 +461,15 @@ fn broker_unmap(args: &RustosMmBrokerArgs) -> Result<(), i64> {
             // Ring0 freed its VMA slot; pagerd must drop the matching region or
             // it would refuse to re-admit this range as an overlap and would
             // eventually exhaust its table, silently disabling demand paging.
-            pager_admission::release_anonymous_region(
+            //
+            // The unmap itself has already succeeded and the range is gone
+            // from the address space, so a failed notification must not fail
+            // `munmap` - that would report a mapping the process can no longer
+            // touch as still mapped. The release is parked for reconciliation
+            // and re-sent from the next admission, and a queue overflow is
+            // published as `pager-release-queue-overflow` rather than being
+            // absorbed here.
+            let _ = pager_admission::release_anonymous_region(
                 process_handle,
                 process_generation,
                 start,

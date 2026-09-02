@@ -35,6 +35,7 @@ required_models = [
     "page-table-map-transaction/PageTableMapTransaction",
     "pager-fault-slot-lifecycle/PagerFaultSlotLifecycle",
     "pager-frame-grant-lifecycle/PagerFrameGrantLifecycle",
+    "pager-region-agreement/PagerRegionAgreement",
     "pager-vma-publication/PagerVmaPublication",
     "per-cpu-clockevent-lifecycle/PerCpuClockeventLifecycle",
     "process-lifecycle-transaction/ProcessLifecycleTransaction",
@@ -1424,6 +1425,24 @@ replace = '''    /\ token \in 1..2
 occurrence = 1
 invariant = "PublishedRightsAreWxSafe"
 min_counterexample_states = 2
+
+[[mutation]]
+id = "pager-region-agreement-partial-edit-drops-whole-region"
+kind = "transition-effect"
+severity = "critical"
+model = "pager-region-agreement/PagerRegionAgreement"
+flow = "pager-vma-publication"
+find = '''       THEN /\ pager' = pager \ r
+            /\ UNCHANGED splitRefused
+       ELSE \* No headroom for the second fragment. Keep the whole region and
+'''
+replace = '''       THEN /\ pager' = {a \in pager : a \notin r /\ (a - 1) \notin r /\ (a + 1) \notin r}
+            /\ UNCHANGED splitRefused
+       ELSE \* No headroom for the second fragment. Keep the whole region and
+'''
+occurrence = 1
+invariant = "FaultableIsAlwaysBackedByThePager"
+min_counterexample_states = 3
 
 [[mutation]]
 id = "pager-vma-publication-identity-bypass"

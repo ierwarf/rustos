@@ -224,6 +224,43 @@ impl Scheduler {
         self.arm_block_current_task_with_reason(BlockReason::PagerService)
     }
 
+    /// Wakes the pager's fixed-rendezvous wait because a control request
+    /// arrived on its service endpoint.
+    ///
+    /// The rendezvous wait is not an endpoint receive, so a generic IPC
+    /// enqueue finds no parked receiver for it and can only publish a pick
+    /// hint - and a hint cannot unblock a blocked task. Without this, pagerd's
+    /// control plane was serviced only as a side effect of fault traffic: an
+    /// admission call issued while pagerd was parked waited for the *next*
+    /// page fault, or for its own reply deadline if none arrived. That is what
+    /// turned anonymous `mmap` admission into a per-mapping timeout.
+    ///
+    /// Scanning by process rather than consuming the fault-waiter table is
+    /// deliberate. The waiter table is published *after* the wait is armed, so
+    /// a request landing in that window would find no entry; the armed-wait
+    /// protocol, by contrast, is already race-free from the arm onward. The
+    /// scan is bounded by `MAX_TASK` and runs only when no endpoint receiver
+    /// was parked.
+    pub(in crate::multitask) fn wake_pager_service_waiter_for_process(
+        &mut self,
+        process_id: u64,
+    ) -> Option<u64> {
+        if process_id == 0 {
+            return None;
+        }
+        for slot in 0..super::MAX_TASK {
+            if self.contexts[slot].is_none_or(|context| context.process_id != Some(process_id)) {
+                continue;
+            }
+            if self.slot_block_reason(slot) != BlockReason::PagerService {
+                continue;
+            }
+            let task_id = self.starts[slot]?.id;
+            return self.wake_task_slot(slot).then_some(task_id);
+        }
+        None
+    }
+
     pub(in crate::multitask) fn arm_block_current_task_with_reason(
         &mut self,
         reason: BlockReason,

@@ -15,12 +15,13 @@ use super::{
     NetdIpcRequest, NetdIpcResponse, PROCD_SIGACTION_SA_NOCLDSTOP, PROCD_SIGCHLD_EVENT_EXIT,
     PROCD_SIGCHLD_EVENT_MASK, PRODUCT_EXECUTABLE_SNAPSHOT_BACKING_DVM_VOLUME,
     PRODUCT_EXECUTABLE_SNAPSHOT_EVIDENCE_ABI_VERSION, ProductExecutableSnapshotEvidence,
-    RustosIpcValidateServiceOwnerArgs, RustosSchedulingContextPolicy,
-    STORAGED_BULK_READ_PAYLOAD_CAPACITY, STORAGED_BULK_READ_RESPONSE_HEADER_BYTES,
-    SYSCALL_OFFLOAD_ABI_VERSION, SYSCALL_OFFLOAD_OP_LINUX_ARCH_PRCTL_POLICY,
-    SYSCALL_OFFLOAD_OP_LINUX_MPROTECT, SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET,
-    SYSCALL_OFFLOAD_OP_LINUX_STATX, SYSCALL_OFFLOAD_PATH_CAPACITY,
-    SYSCALL_OFFLOAD_PAYLOAD_CAPACITY, StoragedBulkReadResponse,
+    RustosIpcValidateServiceOwnerArgs, RustosPagerFaultReplyArgs, RustosPagerFaultWaitArgs,
+    RustosSchedulingContextPolicy, STORAGED_BULK_READ_PAYLOAD_CAPACITY,
+    STORAGED_BULK_READ_RESPONSE_HEADER_BYTES, SYS_RUSTOS_PAGER_FAULT_REPLY,
+    SYS_RUSTOS_PAGER_FAULT_WAIT, SYSCALL_OFFLOAD_ABI_VERSION,
+    SYSCALL_OFFLOAD_OP_LINUX_ARCH_PRCTL_POLICY, SYSCALL_OFFLOAD_OP_LINUX_MPROTECT,
+    SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET, SYSCALL_OFFLOAD_OP_LINUX_STATX,
+    SYSCALL_OFFLOAD_PATH_CAPACITY, SYSCALL_OFFLOAD_PAYLOAD_CAPACITY, StoragedBulkReadResponse,
     VFS_EXECUTABLE_SNAPSHOT_ABI_VERSION, VFS_EXECUTABLE_SNAPSHOT_OP_OPEN, VFS_IPC_ABI_VERSION,
     VFS_IPC_OP_OPENAT, VFS_IPC_PAYLOAD_CAPACITY, VFS_IPC_RESPONSE_HEADER_BYTES,
     VfsExecutableSnapshotRequest, VfsExecutableSnapshotResponse, VfsIpcRequest, VfsIpcResponse,
@@ -30,6 +31,13 @@ use super::{
     product_executable_snapshot_evidence_shape_valid, waitset_interest_shape_valid,
     waitset_signal_shape_valid,
 };
+
+#[test]
+fn pager_fault_wire_is_distinct_fixed_and_append_only() {
+    assert_ne!(SYS_RUSTOS_PAGER_FAULT_WAIT, SYS_RUSTOS_PAGER_FAULT_REPLY);
+    assert_eq!(size_of::<RustosPagerFaultWaitArgs>(), 16);
+    assert_eq!(size_of::<RustosPagerFaultReplyArgs>(), 120);
+}
 
 #[test]
 fn scheduling_context_policy_is_closed_versioned_and_budget_bounded() {

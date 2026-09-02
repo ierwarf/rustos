@@ -11,15 +11,14 @@ kernel/ipc-runtime/src/ipc/mod.rs	3170	ipc-runtime	Extract the fixed FastCallFra
 kernel/ipc-runtime/src/ipc/tests.rs	1306	ipc-runtime	Split endpoint call/reply tests, shared-region tests, and handle-transfer tests into sibling modules under ipc/tests/, alongside the existing reply_publication_tests.rs.
 kernel/mm/src/memory/phys.rs	1302	memory-phys	Split boot memory-map admission, the frame bitmap allocator, fixed-range claims, and tests.
 kernel/mm/src/memory/kernel_vm.rs	1435	memory-kernel-vm	Split PAT/cache policy, direct-map transactions, high-window mappings, and tests.
-kernel/ps/src/multitask/current.rs	1333	ps-current	Split the pager VMA publication/lookup wrappers into current/pager.rs and the IPC donation/handoff wrappers into current/ipc.rs, leaving only current-task identity accessors here.
 kernel/ps/src/multitask/process_table.rs	1806	process-table	Split lifecycle transaction state and markers into process_table/lifecycle.rs, then the own-thread pin, retained exact-MM generation access, and identity adapters into process_table/identity.rs.
-kernel/ps/src/multitask/scheduler.rs	5638	scheduler	The handoff chain's per-step self-timing is removed; the hit/miss split now carries its own attempt count. Next: split run queues, wakeup, deadlines, switching, accounting, and tests.
+kernel/ps/src/multitask/scheduler.rs	5509	scheduler	The terminal reply/pager wake-handoff layer now lives in scheduler/wake_handoff.rs. Next: split run queues, wakeup, deadlines, switching, accounting, and tests.
 libs/driver-domain-host/src/lib.rs	5441	driver-domain-host	Split manifest, lease, QMP, recovery, input-ring publication, and process supervision.
 libs/driver-domain-protocol/src/lib.rs	4149	driver-domain-protocol	Split block, network, input, display, and control wire modules.
 libs/runtime-control/src/lib.rs	1402	runtime-control	Split codec, authority, command lifecycle, and tests.
 libs/rustos-image-admission/src/lib.rs	1518	image-admission	Split ELF, PE, region-plan, signature, and tests.
 libs/rustos-user-abi/src/linux.rs	1534	user-abi	Split Linux constants and structures by syscall family.
-libs/rustos-user-abi/src/syscall.rs	3285	user-abi	Extract compact syscalld identity offload request and response wires into syscall/syscalld.rs, then split remaining broker protocol families.
+libs/rustos-user-abi/src/syscall.rs	3292	user-abi	Extract compact syscalld identity offload request and response wires into syscall/syscalld.rs, then split remaining broker protocol families.
 services/initd/src/main.rs	1333	initd	Split loader wire calls, rootd lease reconciliation, and child supervision into typed modules.
 services/inputd/src/main.rs	1816	inputd	Split ingress admission, queue/readiness, service RPC, and runtime.
 services/netd/src/main.rs	3444	netd	Split device ingress, socket state, routing policy, service RPC, AF_UNIX segmented ancillary transport, and tests.
@@ -33,6 +32,5 @@ services/uiserver/src/sys.rs	1625	uiserver-sys	Split syscall wrappers by IPC, VM
 services/uiserver/src/wayland.rs	3245	uiserver-wayland	Split protocol objects, dispatch, surface lifecycle, and tests.
 tools/hostd/src/runtime.rs	2841	hostd	Split launch, QMP, process identity, recovery, and evidence sealing.
 tools/xtask/src/build/mod.rs	1505	xtask-build	Split build planning, signing, staging, and artifact validation.
-tools/xtask/src/kvm/tests.rs	1305	xtask-kvm	Split smoke-option parsing tests from marker acceptance and SMP ring3 qualification tests.
 tools/xtask/src/formal_contracts/registry.rs	1583	xtask-formal	Split schema decode, semantic validation, generation, and tests.
 tools/xtask/src/stage/mod.rs	1356	xtask-stage	Split package staging, manifests, extents, and signing inputs.
