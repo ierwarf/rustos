@@ -265,9 +265,12 @@ and the xtask parser rejects any nonzero loss counter before acceptance.
   and binds every display/input shared-memory dereference to an exact mapping
   claim. Drain may win from Activating or Active; reset/unmap cannot complete
   until all in-flight claims have quiesced.
-- `page-table-map-transaction/PageTableMapTransaction` binds every newly
-  published intermediate table to a reverse commit log; failed mapping returns
-  only after exact topology restoration and one shootdown-before-reclaim edge.
+- `page-table-map-transaction/PageTableMapTransaction` binds every published
+  leaf to a reverse commit log, and every published intermediate table to
+  exactly one ownership ledger. A failed mapping returns only after exact leaf
+  restoration and one shootdown-before-reclaim edge; it keeps its tables,
+  because an exception-time installer that took no lock may already hold a leaf
+  inside one. Only retirement frees a table frame.
 - `robust-futex-owner-death/RobustFutexOwnerDeath` now distinguishes shared
   backing and exact private keys, including non-private anonymous fallback and
   kernel-generated robust/clear-child wake equivalence.

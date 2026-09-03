@@ -1220,10 +1220,10 @@ kind = "transition-effect"
 severity = "critical"
 model = "page-table-map-transaction/PageTableMapTransaction"
 flow = "memory-map"
-find = "    /\\ commitLog' = Append(commitLog, table)"
-replace = "    /\\ commitLog' = commitLog"
+find = "    /\\ leafLog' = Append(leafLog, leaf)"
+replace = "    /\\ leafLog' = leafLog"
 occurrence = 1
-invariant = "PublishedTopologyHasRollbackCustody"
+invariant = "PublishedLeavesHaveRollbackCustody"
 min_counterexample_states = 3
 
 [[mutation]]

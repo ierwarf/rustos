@@ -106,6 +106,22 @@ herd_mutant = "formal/litmus/x86_64/pager_fault_install_permit.mutant.litmus"
 herd_cat = "x86tso-mixed.cat"
 
 [[scenario]]
+id = "pager-fault-table-install"
+severity = "critical"
+flow = "memory-map"
+model = "page-table-map-transaction/PageTableMapTransaction"
+source = "kernel/mm/src/memory/address_space/pager_fault_mapping.rs"
+source_symbol = "publish_user_table_entry"
+source_anchors = [
+  "match entry.compare_exchange(0, desired, Ordering::AcqRel, Ordering::Acquire) {",
+  "let observed = entry.load(Ordering::Acquire);",
+]
+invariant = "exactly one installer publishes an absent directory entry, and every CPU that observes it also observes the zeroed table it names"
+loom_test = "only_one_installer_publishes_a_table_and_its_zeroing_is_never_missed"
+shuttle_test = "table_publication_is_exclusive_and_every_loser_returns_its_frame"
+herd_not_applicable = "the required edge is store-store - the zeroed table before the entry naming it - and x86-TSO forbids that reordering unconditionally, so a mutant litmus cannot reach the forbidden state and would be rejected as vacuous by the herd gate itself"
+
+[[scenario]]
 id = "reschedule-ipi"
 severity = "critical"
 flow = "smp-reschedule-ipi-lifecycle"

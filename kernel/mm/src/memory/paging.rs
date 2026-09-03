@@ -1,6 +1,6 @@
 pub use crate::memory::address_space::{
     AddressSpaceError, ProcessAddressSpace, USER_SPACE_BASE, USER_SPACE_END_EXCLUSIVE, UserRegion,
-    map_current_prepared_pager_fault_frame_at,
+    ensure_current_fault_tables_at, map_current_prepared_pager_fault_frame_at,
 };
 pub use crate::memory::kernel_vm::{KERNEL_PML4, KERNEL_VIRT_OFFSET, WRITE_COMBINE_BIT};
 

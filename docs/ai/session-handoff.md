@@ -15,8 +15,8 @@ the end, which this file had stopped obeying. Durable architecture lives in
 
 Recorded 2026-09-03. **This block is the only current-state section.**
 
-Boot works, `cargo xtask verify` is green, and a single 8-vCPU smoke passes.
-The `--repeat 4` gate has **not** been re-run since the VMA-table change.
+Boot works, `cargo xtask verify` is green, and the 8-vCPU `--repeat 4` gate
+passes 4/4.
 
 **Anonymous paging lives entirely in ring0 (the Zircon split).** An anonymous
 page has no backing store and no external owner, and ring0's own
@@ -30,14 +30,39 @@ half will use, live but currently unreachable. Contract:
 
 Serving at exception entry means the path may not take `ProcessStateLock`
 (sleepable by design) or the global TLB protocol, because the fault gate clears
-the interrupt flag and both require it set. So the install is a lock-free CAS
-into an **already-prepared** leaf, under a per-VMA installer permit, with frame
-ownership carried in software PTE bit 9 instead of a `Vec`. §1 is the rule;
-§1a is the two lock-free protocols and their proof rows.
+the interrupt flag and both require it set. So the install is a lock-free CAS,
+under a per-VMA installer permit, with frame ownership carried in software PTE
+bits instead of a `Vec`. §1 is the rule; §1a is the lock-free protocols and
+their proof rows.
 
-**Measured on a boot:** 979 fault entries serving 13 828 fault-around pages
-(14.1 pages per entry), 0 contended, 0 refused, 0 read-first-touches,
-0 `cannot map zero-fill pages`, 0 VMA-capacity refusals, ~1.5 GiB free.
+**Reservation no longer builds page tables.** `mmap` used to prepare every
+intermediate table for the range it reserved — one 4 KiB frame per 2 MiB
+*reserved*, so a 64 GiB reservation cost ~128 MiB of tables untouched. The
+fault path now publishes the tables it needs, by the same CAS and for the same
+reason a leaf needs no shootdown: not-present-to-present cannot leave a stale
+translation, at any level. `mmap` is now O(1) in the reservation and allocates
+nothing, so it always succeeds and exhaustion surfaces at the fault, as in
+Linux. Table frames are tagged with PTE bit 10 and reconciled against
+`owned_frames` at retirement, which fails stop on a frame claimed twice. §1c.
+
+**Measured on a boot** (`pager-anon-census-*` and `pager-anon-reservation`,
+decoded from the milestone args): 963 fault entries serving 13 592
+fault-around pages (14.1 per entry), 0 contended, 0 refused,
+0 read-first-touches, ~1.48 GiB free.
+
+The page-table numbers are the point of the change and are read, not inferred:
+boot reserved **32 909 anonymous pages (128 MiB)**, for which reservation-time
+preparation would have allocated **512 table frames**. The fault path allocated
+**98**, with 0 publication-CAS losses and 0 table-supply refusals. The absolute
+saving is small (414 frames, 1.6 MiB); what changed is the exponent — 512 was
+proportional to address space *reserved*, 98 is proportional to memory
+*touched*, so a 64 GiB reservation went from ~128 MiB of tables to none.
+
+Both numbers ride the repeating census rather than a threshold milestone,
+because a threshold line can be dropped by the log ring and a dropped line is
+indistinguishable from a zero count afterwards. That mistake was made once here
+already: the first reading said "0 tables published", and it was a dropped
+line.
 
 ### Read §1b before theorizing about this path
 
@@ -154,6 +179,19 @@ it was found. Follow the named source or contract for detail.
   It needs a service call to time out first, so it only shows under 8-vCPU
   load. Next suspect: `BORROWED_CONTEXT_REPLY[receiver_slot]` is still keyed by
   a bare reply number, a second narrower aliasing surface left alone on purpose.
+- **No reclaim, aging, or swap consumes the Accessed bit.** Fault-around
+  populates speculatively and the hardware already records which of those pages
+  were touched (`A=0` on a bit-9 leaf means "populated, never touched"), but
+  nothing reads it. Until something does, fault-around's amplification under
+  sparse or random access is unmeasured — the run is 16 pages, so the worst
+  case is 16x.
+- **Intermediate tables are never reclaimed before retirement.** `munmap` keeps
+  them, and so does a failed mapping transaction. This is deliberate: freeing a
+  table concurrently would need the RCU-shaped machinery this kernel does not
+  have (Linux needed `MMU_GATHER_RCU_TABLE_FREE` for exactly this, because of
+  lockless walkers). It matters *less* since reservation stopped building
+  tables — the count now tracks memory touched, not reserved — so revisit only
+  if a long-lived process is measured holding tables for freed ranges.
 - **pagerd is a single serial worker.** `fault_wait` → resolve → `fault_reply`
   on one thread. No longer on any live path — anonymous faults never reach it —
   but it is the shape the pager-backed page cache would inherit, and it would

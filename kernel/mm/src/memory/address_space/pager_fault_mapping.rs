@@ -13,6 +13,141 @@ use x86_64::structures::paging::page_table::PageTableEntry;
 /// the hardware translation or protection decision.
 const IRQ_OFF_PAGER_FAULT_LEAF: PageTableFlags = PageTableFlags::BIT_9;
 
+/// Strips the IRQ-off ownership tag from flags copied out of a live leaf.
+///
+/// A clone installs its own frame through the eager path, so the copy's
+/// ownership belongs to `owned_frames`.  Carrying the tag across would enter
+/// one frame in both ledgers, and retirement would then try to free it twice.
+pub(crate) fn without_irq_off_pager_fault_tag(flags: PageTableFlags) -> PageTableFlags {
+    flags.difference(IRQ_OFF_PAGER_FAULT_LEAF)
+}
+
+/// Software-owned directory bit for intermediate tables published by the
+/// IRQ-off anonymous fault path.  It is an x86 available-to-software bit, and
+/// it marks a table whose frame is accounted by the per-process lazy-table
+/// counter rather than by the `owned_frames` ledger.
+pub(crate) const LAZY_PAGER_FAULT_TABLE: PageTableFlags = PageTableFlags::BIT_10;
+
+/// The physical-address field of a paging-structure entry.
+const TABLE_ENTRY_ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
+
+/// Calls `f` with the atomic representation of one intermediate user directory
+/// entry.
+///
+/// Both installers reach a directory entry through this helper: the normal-time
+/// mapping transaction under its mutation guard, and the exception-time path
+/// under its fault-install permit.  They therefore contend on one atomic
+/// location rather than on a plain store racing a CAS.
+fn with_user_table_entry_atomic<R>(
+    parent_phys: PhysAddr,
+    index: usize,
+    f: impl FnOnce(&AtomicU64) -> R,
+) -> R {
+    // SAFETY: the caller owns this root and supplies an in-range index. A
+    // `PageTableEntry` is a `repr(transparent)` `u64` and naturally aligned, and
+    // every writer of an intermediate entry reaches it through this helper.
+    let table = unsafe { kernel_vm::phys_to_table_ref(parent_phys) };
+    let raw = &table[index] as *const PageTableEntry as *mut u64;
+    let entry = unsafe { AtomicU64::from_ptr(raw) };
+    f(entry)
+}
+
+/// Decides what an observed non-zero intermediate entry authorizes.
+fn classify_user_table_entry(observed: u64) -> Result<PhysAddr, AddressSpaceError> {
+    let flags = PageTableFlags::from_bits_truncate(observed);
+    if flags.contains(PageTableFlags::HUGE_PAGE) {
+        return Err(AddressSpaceError::HugePageConflict);
+    }
+    if !flags.contains(user_table_flags()) {
+        return Err(AddressSpaceError::ProtectionViolation);
+    }
+    Ok(PhysAddr::new(observed & TABLE_ENTRY_ADDR_MASK))
+}
+
+/// Reads one intermediate user directory entry.
+///
+/// `Ok(None)` means the level is absent, which is the ordinary demand state
+/// once tables are published at fault time rather than at reservation time.
+pub(crate) fn read_user_table_entry(
+    parent_phys: PhysAddr,
+    index: usize,
+) -> Result<Option<PhysAddr>, AddressSpaceError> {
+    with_user_table_entry_atomic(parent_phys, index, |entry| {
+        // ORDERING: Acquire pairs with the installer's release CAS, so a reader
+        // that observes this entry also observes the zeroed table it names.
+        let observed = entry.load(Ordering::Acquire);
+        if observed == 0 {
+            return Ok(None);
+        }
+        classify_user_table_entry(observed).map(Some)
+    })
+}
+
+/// Publishes `table_phys` into an absent intermediate user directory entry.
+///
+/// A directory entry moves from not-present to present exactly like a leaf, so
+/// no shootdown is owed: the hardware caches neither a TLB entry nor a
+/// paging-structure-cache entry for an absent entry, and the release CAS
+/// publishes the zeroed table before the entry that names it.
+///
+/// `Ok((child, false))` means another installer won this entry first, so
+/// `table_phys` was never published and must be returned to its supply.
+pub(crate) fn publish_user_table_entry(
+    parent_phys: PhysAddr,
+    index: usize,
+    table_phys: PhysAddr,
+    flags: PageTableFlags,
+) -> Result<(PhysAddr, bool), AddressSpaceError> {
+    let desired = table_phys.as_u64() | flags.bits();
+    with_user_table_entry_atomic(parent_phys, index, |entry| {
+        // ORDERING: AcqRel releases the zeroed table before the entry naming it.
+        match entry.compare_exchange(0, desired, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => Ok((table_phys, true)),
+            Err(observed) => classify_user_table_entry(observed).map(|child| (child, false)),
+        }
+    })
+}
+
+/// Resolves one intermediate entry during the retirement walk, recording the
+/// child frame when the entry says the fault path published it.
+fn tagged_child_of(
+    entry: &PageTableEntry,
+    tables: &mut Vec<u64>,
+) -> Result<Option<PhysAddr>, AddressSpaceError> {
+    if entry.is_unused() {
+        return Ok(None);
+    }
+    let flags = entry.flags();
+    if flags.contains(PageTableFlags::HUGE_PAGE) {
+        return Err(AddressSpaceError::HugePageConflict);
+    }
+    // Nothing publishes an intermediate entry without `PRESENT`, and nothing
+    // clears one to a non-zero value, so this state is corruption rather than
+    // an ordinary demand state.
+    if !flags.contains(PageTableFlags::PRESENT) {
+        return Err(AddressSpaceError::InvalidFrameOwnership);
+    }
+    if flags.contains(LAZY_PAGER_FAULT_TABLE) {
+        tables.push(entry.addr().as_u64());
+    }
+    Ok(Some(entry.addr()))
+}
+
+/// The virtual-address bit position each paging level indexes.
+const PML4_SHIFT: u32 = 39;
+const PDPT_SHIFT: u32 = 30;
+const PD_SHIFT: u32 = 21;
+
+/// Pages remaining from `virt` to the next boundary of the level at `shift`.
+///
+/// This is what lets an absent level skip its whole span instead of one page
+/// table at a time.
+fn pages_to_level_boundary(virt: VirtAddr, shift: u32) -> usize {
+    let span = 1_u64 << shift;
+    let offset = virt.as_u64() & (span - 1);
+    ((span - offset) / PAGE_4KIB_U64) as usize
+}
+
 /// Publishes a pre-zeroed frame into the active address space's already
 /// prepared leaf without taking an address-space lock, allocating, or issuing
 /// a TLB shootdown.
@@ -44,112 +179,130 @@ pub fn map_current_prepared_pager_fault_frame_at(
     })
 }
 
+/// Publishes every intermediate table the active root needs in order to hold a
+/// leaf for `start`, and reports how many this caller published.
+///
+/// # Exception-path contract
+///
+/// This runs at exception entry with interrupts disabled, no address-space
+/// lock, and no TLB protocol.  Its only mutations are release CAS publications
+/// of absent directory entries, and a not-present-to-present directory
+/// transition owes no shootdown for the same reason a leaf does not: the
+/// hardware caches neither a translation nor a paging-structure entry for an
+/// absent entry, so no stale state can survive the publication.
+///
+/// `supply` must yield a **zeroed** 4 KiB frame; a table is published only
+/// after its contents are, so a CPU that observes the entry observes an empty
+/// table.  `release` takes back any frame that lost its CAS, which was never
+/// reachable from any root.
+pub fn ensure_current_fault_tables_at(
+    start: VirtAddr,
+    mut supply: impl FnMut() -> Option<u64>,
+    mut release: impl FnMut(u64),
+) -> Result<usize, AddressSpaceError> {
+    validate_user_page_range(start, 1)?;
+    let table_flags = user_table_flags() | LAZY_PAGER_FAULT_TABLE;
+    let mut published = 0;
+    let mut parent = kernel_vm::current_root_phys();
+    for index in [p4_index(start), p3_index(start), p2_index(start)] {
+        parent = match read_user_table_entry(parent, index)? {
+            Some(child) => child,
+            None => {
+                let Some(frame) = supply() else {
+                    return Err(AddressSpaceError::OutOfFrames);
+                };
+                // A zero frame is not a frame, so there is nothing to give
+                // back; handing it to a release path would free address zero.
+                if frame == 0 {
+                    return Err(AddressSpaceError::InvalidFrameOwnership);
+                }
+                if !frame.is_multiple_of(PAGE_4KIB_U64) {
+                    release(frame);
+                    return Err(AddressSpaceError::InvalidFrameOwnership);
+                }
+                match publish_user_table_entry(parent, index, PhysAddr::new(frame), table_flags) {
+                    Ok((child, true)) => {
+                        published += 1;
+                        child
+                    }
+                    Ok((child, false)) => {
+                        release(frame);
+                        child
+                    }
+                    Err(error) => {
+                        release(frame);
+                        return Err(error);
+                    }
+                }
+            }
+        };
+    }
+    Ok(published)
+}
+
 impl ProcessAddressSpace {
-    /// Prepares a user range for pager replies while normal mapping policy is
-    /// still executing.
+    /// Whether every page of the range is still unmapped, walking only the
+    /// tables that already exist.
     ///
-    /// Pager-leaf metadata is reserved here, before the VMA becomes visible.
-    /// The exception path can therefore publish a resident leaf without
-    /// allocating, while the resident working set remains independent of the
-    /// bounded fault-frame pool.
-    pub fn prepare_pager_fault_pages_at(
-        &mut self,
+    /// This replaces reservation-time page-table preparation. An absent level
+    /// means nothing in the span it would cover is mapped, so the scan skips
+    /// that whole span: a reservation nobody has touched costs one directory
+    /// read rather than one read per page, and costs no frames at all.
+    ///
+    /// The check is bounded by what is *resident*, not by what is reserved,
+    /// which is the property reservation-time preparation could not have.
+    pub fn user_range_is_unmapped(
+        &self,
         start: VirtAddr,
         page_count: usize,
-    ) -> Result<(), AddressSpaceError> {
+    ) -> Result<bool, AddressSpaceError> {
         if page_count == 0 {
             return Err(AddressSpaceError::ZeroSizedAllocation);
         }
         validate_user_page_range(start, page_count)?;
-
-        // One table walk per *page table*, not per page.
-        //
-        // Every page inside one 2 MiB block resolves the same PDPT, PD and PT,
-        // so resolving them per page repeated the identical three lookups 512
-        // times over. That is `mmap` latency paid on every anonymous mapping,
-        // and it grows linearly with mapping size: a 256 MiB range did 196 608
-        // table resolutions where 512 are needed.
-        //
-        // The reservation was sized the same way. `page_count * 3` slots for a
-        // 256 MiB range is 196 608 entries - 1.5 MiB of ledger capacity - to
-        // hold at most a few hundred real table frames. The tight bound is one
-        // table per block at each level, plus one per level for the partial
-        // blocks at each end.
-        const ENTRIES_PER_TABLE_SHIFT: u32 = 9;
-        let pt_span = 1_usize << ENTRIES_PER_TABLE_SHIFT;
-        let pd_span = pt_span << ENTRIES_PER_TABLE_SHIFT;
-        let pdpt_span = pd_span << ENTRIES_PER_TABLE_SHIFT;
-        let table_capacity = page_count
-            .div_ceil(pt_span)
-            .checked_add(page_count.div_ceil(pd_span))
-            .and_then(|sum| sum.checked_add(page_count.div_ceil(pdpt_span)))
-            .and_then(|sum| sum.checked_add(3))
-            .ok_or(AddressSpaceError::AddressOverflow)?;
-        let mut published_tables = Vec::new();
-        published_tables
-            .try_reserve_exact(table_capacity)
-            .map_err(|_| AddressSpaceError::OutOfFrames)?;
-        self.owned_frames
-            .try_reserve_exact(table_capacity)
-            .map_err(|_| AddressSpaceError::OutOfFrames)?;
-        let mutation = begin_address_space_mutation(self.root_phys());
-
-        let admission = (|| {
-            let mut page_index = 0;
-            while page_index < page_count {
-                let virt = page_addr(start, page_index)?;
-                let pml4_phys = self.root_phys();
-                let pdpt_phys = ensure_next_table(
-                    &mut self.owned_frames,
-                    &mut published_tables,
-                    pml4_phys,
-                    p4_index(virt),
-                )?;
-                let pd_phys = ensure_next_table(
-                    &mut self.owned_frames,
-                    &mut published_tables,
-                    pdpt_phys,
-                    p3_index(virt),
-                )?;
-                let pt_phys = ensure_next_table(
-                    &mut self.owned_frames,
-                    &mut published_tables,
-                    pd_phys,
-                    p2_index(virt),
-                )?;
-                // SAFETY: `ensure_next_table` either retained this exact
-                // table in the address-space ownership ledger or rejected the
-                // admission. The mutation guard serializes topology changes.
-                let pt = unsafe { kernel_vm::phys_to_table_mut(pt_phys) };
-                // Every remaining page that lands in this same table is checked
-                // here, against the table this iteration already resolved.
-                let first_entry = p1_index(virt);
-                let entries_here = (pt_span - first_entry).min(page_count - page_index);
-                for entry in first_entry..first_entry + entries_here {
-                    if !pt[entry].is_unused() {
-                        return Err(AddressSpaceError::AlreadyMapped);
-                    }
+        let root = self.root_phys();
+        let mut page_index = 0;
+        while page_index < page_count {
+            let virt = page_addr(start, page_index)?;
+            let remaining = page_count - page_index;
+            let Some(pdpt_phys) = read_user_table_entry(root, p4_index(virt))? else {
+                page_index += pages_to_level_boundary(virt, PML4_SHIFT).min(remaining);
+                continue;
+            };
+            let Some(pd_phys) = read_user_table_entry(pdpt_phys, p3_index(virt))? else {
+                page_index += pages_to_level_boundary(virt, PDPT_SHIFT).min(remaining);
+                continue;
+            };
+            let Some(pt_phys) = read_user_table_entry(pd_phys, p2_index(virt))? else {
+                page_index += pages_to_level_boundary(virt, PD_SHIFT).min(remaining);
+                continue;
+            };
+            // SAFETY: every level above resolved to a present non-huge user
+            // table this address space owns, and the caller holds its exact
+            // process state, so no writer can retire it during this read.
+            let table = unsafe { kernel_vm::phys_to_table_ref(pt_phys) };
+            let first_entry = p1_index(virt);
+            let entries_here = (ENTRIES_PER_TABLE - first_entry).min(remaining);
+            for entry in first_entry..first_entry + entries_here {
+                if !table[entry].is_unused() {
+                    return Ok(false);
                 }
-                page_index += entries_here;
             }
-            Ok(())
-        })();
-        if let Err(error) = admission {
-            rollback_external_user_pages(self, &[], &published_tables, mutation);
-            return Err(error);
+            page_index += entries_here;
         }
-
-        drop(mutation);
-        Ok(())
+        Ok(true)
     }
 
-    /// Installs one pager-granted frame into a normal-time prepared user leaf.
+    /// Installs one pager-granted frame into a user leaf.
     ///
     /// # Exception-path contract
     ///
-    /// `frame_phys` must come from an exact, unconsumed frame grant. This path
-    /// performs no allocation or blocking lookup: normal-time VMA preparation
-    /// has already installed every intermediate table it may traverse.
+    /// `frame_phys` must come from an exact, unconsumed frame grant. This runs
+    /// in ordinary syscall context under the process-state lock, so unlike the
+    /// IRQ-off installer it may build the intermediate tables it needs - and it
+    /// must, because reservation no longer builds any. Its tables are recorded
+    /// in `owned_frames` rather than tagged, since this path can reach the
+    /// ledger.
     pub fn map_prepared_pager_fault_frame_at(
         &mut self,
         start: VirtAddr,
@@ -161,8 +314,18 @@ impl ProcessAddressSpace {
             return Err(AddressSpaceError::InvalidFrameOwnership);
         }
         let page_flags = normalize_user_page_flags(flags)? | IRQ_OFF_PAGER_FAULT_LEAF;
-        let mutation = begin_address_space_mutation(self.root_phys());
-        with_prepared_user_leaf_mut(self.root_phys(), start, |entry| {
+        let root = self.root_phys();
+        let mutation = begin_address_space_mutation(root);
+        let tables = (|| {
+            let pdpt_phys = ensure_next_table(&mut self.owned_frames, root, p4_index(start))?;
+            let pd_phys = ensure_next_table(&mut self.owned_frames, pdpt_phys, p3_index(start))?;
+            ensure_next_table(&mut self.owned_frames, pd_phys, p2_index(start))
+        })();
+        if let Err(error) = tables {
+            drop(mutation);
+            return Err(error);
+        }
+        with_prepared_user_leaf_mut(root, start, |entry| {
             if !entry.is_unused() {
                 return Err(AddressSpaceError::AlreadyMapped);
             }
@@ -251,7 +414,7 @@ impl ProcessAddressSpace {
                     }
                     present += 1;
                 }
-                None if matches!(self.lookup_user_page_state(virt), UserPageLookup::MissingPt) => {}
+                None if self.lookup_user_page_state(virt).is_absent() => {}
                 None => return Err(AddressSpaceError::NotMapped),
             }
         }
@@ -307,7 +470,7 @@ impl ProcessAddressSpace {
                     frames.push(leaf.physical_address);
                     leaf_index += 1;
                 }
-                _ if matches!(self.lookup_user_page_state(virt), UserPageLookup::MissingPt) => {}
+                _ if self.lookup_user_page_state(virt).is_absent() => {}
                 _ => return Err(AddressSpaceError::NotMapped),
             }
         }
@@ -373,44 +536,44 @@ impl ProcessAddressSpace {
             })
     }
 
-    /// Collects only leaves whose physical-frame ownership came from the
-    /// IRQ-off CAS path.  This normal-context page-table walk replaces a fault
-    /// path Vec mutation, so the PTE tag is the ownership ledger for those
-    /// frames during clone and address-space retirement.
-    pub(crate) fn irq_off_pager_fault_leaves(&self) -> Result<Vec<PagerFaultLeaf>, AddressSpaceError> {
-        let mut leaves = Vec::new();
+    /// Collects every frame whose ownership lives in a page-table tag rather than
+    /// in the `owned_frames` ledger.
+    ///
+    /// The fault path cannot push to a `Vec` that sits behind a sleepable lock,
+    /// so what it publishes is recorded by a software tag instead:
+    /// `IRQ_OFF_PAGER_FAULT_LEAF` for a data leaf, `LAZY_PAGER_FAULT_TABLE` for
+    /// an intermediate table.  This normal-context walk is how retirement
+    /// reclaims both, and how the two ledgers are checked against each other.
+    ///
+    /// A non-zero intermediate entry that is not present, or a huge entry in
+    /// the user subtree, is not a reclaim failure but a structural violation:
+    /// nothing in this tree can produce either, so the walk reports it rather
+    /// than guessing what the topology meant.
+    pub(crate) fn pager_fault_ownership(&self) -> Result<PagerFaultOwnership, AddressSpaceError> {
+        let mut owned = PagerFaultOwnership::empty();
         if self.pml4_frame_phys == 0 {
-            return Ok(leaves);
+            return Ok(owned);
         }
         let root = self.root_table_ref();
-        let pml4_entry = &root[USER_PML4_INDEX];
-        if pml4_entry.is_unused() {
-            return Ok(leaves);
-        }
-        if pml4_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
-            return Err(AddressSpaceError::HugePageConflict);
-        }
-        // SAFETY: this normal-context owner walks its immutable page-table
-        // hierarchy.  VMA writers serialize destructive changes externally.
-        let pdpt = unsafe { kernel_vm::phys_to_table_ref(pml4_entry.addr()) };
+        let Some(pdpt_phys) = tagged_child_of(&root[USER_PML4_INDEX], &mut owned.tables)? else {
+            return Ok(owned);
+        };
+        // SAFETY: this normal-context owner walks its own page-table hierarchy
+        // while the address space is provably inactive on every CPU.  VMA
+        // writers serialize destructive changes externally.
+        let pdpt = unsafe { kernel_vm::phys_to_table_ref(pdpt_phys) };
         for p3 in 0..ENTRIES_PER_TABLE {
-            let pdpt_entry = &pdpt[p3];
-            if pdpt_entry.is_unused() {
+            let Some(pd_phys) = tagged_child_of(&pdpt[p3], &mut owned.tables)? else {
                 continue;
-            }
-            if pdpt_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
-                return Err(AddressSpaceError::HugePageConflict);
-            }
-            let pd = unsafe { kernel_vm::phys_to_table_ref(pdpt_entry.addr()) };
+            };
+            // SAFETY: as above for the next present non-huge owned table.
+            let pd = unsafe { kernel_vm::phys_to_table_ref(pd_phys) };
             for p2 in 0..ENTRIES_PER_TABLE {
-                let pd_entry = &pd[p2];
-                if pd_entry.is_unused() {
+                let Some(pt_phys) = tagged_child_of(&pd[p2], &mut owned.tables)? else {
                     continue;
-                }
-                if pd_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
-                    return Err(AddressSpaceError::HugePageConflict);
-                }
-                let pt = unsafe { kernel_vm::phys_to_table_ref(pd_entry.addr()) };
+                };
+                // SAFETY: as above for the leaf-bearing table.
+                let pt = unsafe { kernel_vm::phys_to_table_ref(pt_phys) };
                 for p1 in 0..ENTRIES_PER_TABLE {
                     let entry = &pt[p1];
                     if entry.is_unused() || !entry.flags().contains(IRQ_OFF_PAGER_FAULT_LEAF) {
@@ -423,16 +586,15 @@ impl ProcessAddressSpace {
                         | ((p3 as u64) << 30)
                         | ((p2 as u64) << 21)
                         | ((p1 as u64) << 12);
-                    leaves.push(PagerFaultLeaf {
+                    owned.leaves.push(PagerFaultLeaf {
                         virtual_address,
                         physical_address: entry.addr().as_u64(),
                     });
                 }
             }
         }
-        Ok(leaves)
+        Ok(owned)
     }
-
 }
 
 fn pager_fault_range_end(start: VirtAddr, page_count: usize) -> Result<u64, AddressSpaceError> {
@@ -517,6 +679,79 @@ fn with_prepared_user_leaf_mut<R>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cloned_leaf_flags_drop_the_irq_off_ownership_tag() {
+        let tagged = PageTableFlags::PRESENT
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::USER_ACCESSIBLE
+            | IRQ_OFF_PAGER_FAULT_LEAF;
+        let cloned = without_irq_off_pager_fault_tag(tagged);
+        assert!(!cloned.contains(IRQ_OFF_PAGER_FAULT_LEAF));
+        assert_eq!(cloned, tagged.difference(IRQ_OFF_PAGER_FAULT_LEAF));
+    }
+
+    #[test]
+    fn the_two_software_ownership_tags_are_distinct_available_bits() {
+        assert_ne!(IRQ_OFF_PAGER_FAULT_LEAF, LAZY_PAGER_FAULT_TABLE);
+        // Neither may overlap a bit the translation or protection decision
+        // reads, or the tag would change what the hardware does.
+        let hardware = PageTableFlags::PRESENT
+            | PageTableFlags::WRITABLE
+            | PageTableFlags::USER_ACCESSIBLE
+            | PageTableFlags::WRITE_THROUGH
+            | PageTableFlags::NO_CACHE
+            | PageTableFlags::HUGE_PAGE
+            | PageTableFlags::GLOBAL
+            | PageTableFlags::NO_EXECUTE;
+        assert!(!hardware.intersects(IRQ_OFF_PAGER_FAULT_LEAF));
+        assert!(!hardware.intersects(LAZY_PAGER_FAULT_TABLE));
+    }
+
+    #[test]
+    fn a_published_table_entry_must_be_a_present_non_huge_user_table() {
+        let table = 0x0000_0000_0020_1000_u64;
+        let published = table | user_table_flags().bits();
+        assert_eq!(
+            classify_user_table_entry(published),
+            Ok(PhysAddr::new(table))
+        );
+        assert_eq!(
+            classify_user_table_entry(published | PageTableFlags::HUGE_PAGE.bits()),
+            Err(AddressSpaceError::HugePageConflict)
+        );
+        let without_user_rights =
+            table | (PageTableFlags::PRESENT | PageTableFlags::WRITABLE).bits();
+        assert_eq!(
+            classify_user_table_entry(without_user_rights),
+            Err(AddressSpaceError::ProtectionViolation)
+        );
+        // The ownership tag must change neither the verdict nor the address.
+        assert_eq!(
+            classify_user_table_entry(published | LAZY_PAGER_FAULT_TABLE.bits()),
+            Ok(PhysAddr::new(table))
+        );
+    }
+
+    #[test]
+    fn an_absent_level_skips_its_whole_span_not_one_table() {
+        // The point of the boundary walk: an untouched 512 GiB reservation is
+        // one directory read, not one read per 2 MiB block.
+        let aligned = VirtAddr::new(USER_SPACE_BASE);
+        assert_eq!(pages_to_level_boundary(aligned, PD_SHIFT), 512);
+        assert_eq!(pages_to_level_boundary(aligned, PDPT_SHIFT), 512 * 512);
+        assert_eq!(
+            pages_to_level_boundary(aligned, PML4_SHIFT),
+            512 * 512 * 512
+        );
+    }
+
+    #[test]
+    fn a_partial_block_skips_only_to_its_own_boundary() {
+        let offset = VirtAddr::new(USER_SPACE_BASE + PAGE_4KIB_U64);
+        assert_eq!(pages_to_level_boundary(offset, PD_SHIFT), 511);
+        assert_eq!(pages_to_level_boundary(offset, PDPT_SHIFT), 512 * 512 - 1);
+    }
 
     #[test]
     fn pager_fault_range_end_preserves_page_exactness() {

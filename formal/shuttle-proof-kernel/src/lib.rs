@@ -170,6 +170,77 @@ mod tests {
         );
     }
 
+    /// Every installer that loses a directory-entry CAS must return its frame,
+    /// and exactly one frame may end up reachable.
+    ///
+    /// `mmap` no longer builds intermediate tables, so several CPUs can arrive
+    /// at the same absent entry at once and each will have prepared a frame for
+    /// it. A loser that forgot to return its frame leaks one 4 KiB page per
+    /// contended fault; a loser that returned a frame the winner published
+    /// would hand a live page table back to the allocator.
+    #[test]
+    fn table_publication_is_exclusive_and_every_loser_returns_its_frame() {
+        shuttle::check_pct(
+            || {
+                const INSTALLERS: usize = 3;
+                let entry = Arc::new(AtomicUsize::new(0));
+                let returned = Arc::new(Mutex::new(Vec::new()));
+
+                let mut installers = Vec::new();
+                for frame in 1..=INSTALLERS {
+                    let entry = Arc::clone(&entry);
+                    let returned = Arc::clone(&returned);
+                    installers.push(thread::spawn(move || {
+                        match entry.compare_exchange(
+                            0,
+                            frame,
+                            Ordering::AcqRel,
+                            Ordering::Acquire,
+                        ) {
+                            Ok(_) => None,
+                            Err(observed) => {
+                                assert_ne!(observed, 0, "a failed CAS must observe a publication");
+                                // The frame was never reachable from any root,
+                                // so it goes straight back to its supply.
+                                returned.lock().unwrap().push(frame);
+                                Some(frame)
+                            }
+                        }
+                    }));
+                }
+                let mut lost = Vec::new();
+                for installer in installers {
+                    if let Some(frame) = installer.join().unwrap() {
+                        lost.push(frame);
+                    }
+                }
+
+                let published = entry.load(Ordering::Acquire);
+                assert!(
+                    (1..=INSTALLERS).contains(&published),
+                    "the entry must name exactly one installer's frame"
+                );
+                assert_eq!(lost.len(), INSTALLERS - 1, "exactly one installer may win");
+                let mut returned = returned.lock().unwrap().clone();
+                returned.sort_unstable();
+                let handed_back = returned.len();
+                returned.dedup();
+                assert_eq!(handed_back, returned.len(), "a frame was returned twice");
+                assert!(
+                    !returned.contains(&published),
+                    "the published table was returned to the allocator"
+                );
+                assert_eq!(
+                    returned.len(),
+                    INSTALLERS - 1,
+                    "every loser must return its frame"
+                );
+            },
+            iterations(),
+            pct_depth(),
+        );
+    }
+
     #[test]
     fn endpoint_exit_and_publication_have_one_terminal_owner() {
         shuttle::check_pct(

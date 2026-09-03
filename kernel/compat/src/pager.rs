@@ -13,7 +13,7 @@ use crate::multitask as ps_api;
 use rustos_user_abi::pager::{
     PagerFaultDispatchWire, PagerFaultReplyWire, PagerFaultRequestWire,
 };
-use x86_64::{VirtAddr, structures::paging::PageTableFlags};
+use x86_64::{PhysAddr, VirtAddr, structures::paging::PageTableFlags};
 
 static FIRST_ANONYMOUS_FAULT_COMPLETED: AtomicBool = AtomicBool::new(false);
 static COMPLETED_ANONYMOUS_FAULTS: AtomicU64 = AtomicU64::new(0);
@@ -25,6 +25,16 @@ static POPULATED_RUN_PAGES: AtomicU64 = AtomicU64::new(0);
 static RING0_FAULTS_WITHOUT_FRAME: AtomicU64 = AtomicU64::new(0);
 /// Anonymous faults restarted because a VMA writer held the publication.
 static CONTENDED_ANONYMOUS_FAULTS: AtomicU64 = AtomicU64::new(0);
+/// Intermediate page tables published by the fault path itself.
+///
+/// `mmap` no longer builds page tables for the range it reserves, so this is
+/// the whole page-table cost of anonymous memory: one table per 2 MiB actually
+/// touched, rather than one per 2 MiB reserved.
+static LAZY_TABLES_PUBLISHED: AtomicU64 = AtomicU64::new(0);
+/// Table frames returned because another installer won the same directory entry.
+static LAZY_TABLE_CAS_LOST: AtomicU64 = AtomicU64::new(0);
+/// Faults refused because no frame was available to hold a page table.
+static LAZY_TABLE_SUPPLY_EXHAUSTED: AtomicU64 = AtomicU64::new(0);
 /// Anonymous first touches whose access was a *read*.
 ///
 /// Counted because it decides whether a shared zero page is worth building. A
@@ -204,6 +214,17 @@ fn serve_anonymous_first_touch_enabled(
         }
     };
 
+    // Intermediate tables, before any data frame is drawn.
+    //
+    // `mmap` reserves address space and nothing else, so the tables that hold
+    // this leaf may not exist yet. Publishing them here is the same
+    // not-present-to-present transition as the leaf below and owes no
+    // shootdown; what it must not do is consume a data frame first and then
+    // discover it has nowhere to put it.
+    if let Err(outcome) = ensure_fault_tables(request) {
+        return outcome;
+    }
+
     // Frame supply, fast path first.
     //
     // The wired reserve is a *latency* device, not the supply: it is lock-free
@@ -340,6 +361,102 @@ fn serve_anonymous_first_touch_enabled(
     AnonymousFaultOutcome::Mapped
 }
 
+/// Whether a running total just crossed a reporting boundary.
+///
+/// `total.is_multiple_of(step)` is the usual gate here, and it is wrong for any
+/// counter that advances by more than one: a fault publishes up to three tables
+/// at once, so the total can step over the multiple and the counter goes silent
+/// after its first line. That is exactly how a measurement stops measuring
+/// without saying so.
+fn crosses_report_boundary(before: u64, after: u64, step: u64) -> bool {
+    before == 0 || before / step != after / step
+}
+
+/// A zeroed frame to hold a page table, from the same chain as a data leaf.
+///
+/// Reserve frames are already zeroed, which is exactly what an empty page table
+/// is, so the common case publishes a table without touching the allocator.
+fn supply_fault_table_frame() -> Option<u64> {
+    mm_api::frame_capability::take_pager_fault_frame()
+        .or_else(mm_api::frame_capability::allocate_zeroed_frame)
+        .map(|frame| frame.as_u64())
+}
+
+/// Returns a table frame that never won its publication CAS.
+fn release_fault_table_frame(frame: u64) {
+    let frame = PhysAddr::new(frame);
+    if !mm_api::frame_capability::return_pager_fault_frame(frame) {
+        mm_api::phys::free_frame(frame);
+    }
+}
+
+/// Publishes the intermediate tables this fault needs, before any data frame is
+/// drawn.
+///
+/// Ordering it first means a table shortage refuses without also pulling a data
+/// frame out of the reserve, and it leaves the leaf CAS the pure
+/// not-present-to-present transition its contract describes.
+fn ensure_fault_tables(request: PagerFaultRequestWire) -> Result<(), AnonymousFaultOutcome> {
+    let mut exhausted = false;
+    let mut released = 0_u64;
+    let outcome = mm_api::paging::ensure_current_fault_tables_at(
+        VirtAddr::new(request.virtual_address),
+        || {
+            let frame = supply_fault_table_frame();
+            exhausted |= frame.is_none();
+            frame
+        },
+        |frame| {
+            released += 1;
+            release_fault_table_frame(frame);
+        },
+    );
+    if released != 0 {
+        let before = LAZY_TABLE_CAS_LOST.fetch_add(released, Ordering::Relaxed);
+        let lost = before + released;
+        if crosses_report_boundary(before, lost, 64) {
+            nucleus_core::debug::record_milestone(
+                nucleus_core::debug::LogCategory::Compat,
+                "pager-fault-table-cas-lost",
+                lost,
+                request.virtual_address,
+            );
+        }
+    }
+    match outcome {
+        Ok(published) => {
+            let published = published as u64;
+            if published != 0 {
+                let before = LAZY_TABLES_PUBLISHED.fetch_add(published, Ordering::Relaxed);
+                let total = before + published;
+                if crosses_report_boundary(before, total, 256) {
+                    nucleus_core::debug::record_milestone(
+                        nucleus_core::debug::LogCategory::Compat,
+                        "pager-fault-table-installed",
+                        total,
+                        request.virtual_address,
+                    );
+                }
+            }
+            Ok(())
+        }
+        Err(_) => {
+            if exhausted {
+                let starved = LAZY_TABLE_SUPPLY_EXHAUSTED.fetch_add(1, Ordering::Relaxed) + 1;
+                if starved == 1 || starved.is_multiple_of(64) {
+                    nucleus_core::debug::record_milestone(
+                        nucleus_core::debug::LogCategory::Compat,
+                        "pager-fault-table-supply-exhausted",
+                        starved,
+                        request.virtual_address,
+                    );
+                }
+            }
+            Err(AnonymousFaultOutcome::Refused)
+        }
+    }
+}
+
 /// Installs the pages after the faulting one, up to the run this VMA can
 /// support, and reports how many were published.
 ///
@@ -370,7 +487,9 @@ fn populate_run_under_permit(
         return 0;
     };
     // The run may never leave the region that raised this fault: outside it
-    // this fault carries no authority, and the leaves are not prepared.
+    // this fault carries no authority. The block is aligned to its own size and
+    // 512 is a multiple of it, so the whole run lives in the one page table
+    // this fault already published.
     let first = block_start.max(region_start);
     let last = block_end.min(region_end);
     if last <= first {
@@ -472,6 +591,18 @@ pub fn record_anonymous_fault_census() {
         "pager-anon-census-access",
         READ_FIRST_TOUCHES.load(Ordering::Relaxed),
         COMPLETED_ANONYMOUS_FAULTS.load(Ordering::Relaxed),
+    );
+    // The page tables this path built, on the repeating census rather than on a
+    // threshold milestone. A threshold line can be dropped by the log ring, and
+    // a dropped line and a zero count are indistinguishable afterwards - which
+    // is the difference between "reservation stopped building tables" and "no
+    // measurement was taken".
+    nucleus_core::debug::record_milestone(
+        nucleus_core::debug::LogCategory::Compat,
+        "pager-anon-census-tables",
+        LAZY_TABLES_PUBLISHED.load(Ordering::Relaxed),
+        (LAZY_TABLE_CAS_LOST.load(Ordering::Relaxed) << 32)
+            | (LAZY_TABLE_SUPPLY_EXHAUSTED.load(Ordering::Relaxed) & u64::from(u32::MAX)),
     );
 }
 
@@ -671,7 +802,7 @@ pub fn service_deferred_work() -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::dispatch_wire;
+    use super::{crosses_report_boundary, dispatch_wire};
     use crate::multitask::{PagerFaultReservation, PagerFaultState};
     use rustos_user_abi::pager::{
         PAGER_FAULT_ABI_VERSION, PagerEndpointCapabilityWire, PagerFaultRequestWire,
@@ -730,5 +861,18 @@ mod tests {
             reservation.zeroed_frame_capability
         );
         assert_eq!(wire.granted_frame_rights, reservation.granted_frame_rights);
+    }
+
+    #[test]
+    fn a_counter_that_advances_by_more_than_one_still_reports() {
+        // The first line always appears.
+        assert!(crosses_report_boundary(0, 3, 256));
+        // Stepping over the exact multiple must still report: a fault can add
+        // three tables at once, and 255 -> 258 never equals a multiple of 256.
+        assert!(crosses_report_boundary(255, 258, 256));
+        assert!(!crosses_report_boundary(258, 260, 256));
+        // Landing exactly on the boundary reports once, not twice.
+        assert!(crosses_report_boundary(255, 256, 256));
+        assert!(!crosses_report_boundary(256, 258, 256));
     }
 }

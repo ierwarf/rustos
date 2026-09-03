@@ -1377,7 +1377,8 @@ page-table-lifecycle/PageTableLifecycle|kernel-mm|memory::address_space::tests::
 page-table-lifecycle/PageTableLifecycle|kernel-mm|memory::address_space::tests::user_page_flags_enforce_wx_and_reject_huge_pages
 page-table-lifecycle/PageTableLifecycle|kernel-mm|memory::address_space::tests::protection_span_preflight_rejects_a_hole_before_commit
 page-table-lifecycle/PageTableLifecycle|kernel-mm|memory::address_space::tests::unmap_region_plan_is_complete_before_metadata_commit
-page-table-map-transaction/PageTableMapTransaction|kernel-mm|memory::address_space::rollback::tests::intermediate_tables_rollback_in_reverse_publication_order
+page-table-map-transaction/PageTableMapTransaction|kernel-mm|memory::address_space::rollback::tests::leaf_rollback_runs_in_reverse_publication_order
+page-table-map-transaction/PageTableMapTransaction|kernel-mm|memory::address_space::pager_fault_mapping::tests::a_published_table_entry_must_be_a_present_non_huge_user_table
 page-table-lifecycle/PageTableLifecycle|kernel-mm|memory::kernel_vm::tests::direct_map_update_bounds_are_aligned_nonempty_and_nonwrapping
 page-table-lifecycle/PageTableLifecycle|kernel-mm|memory::kernel_vm::tests::kernel_segment_protection_rejects_writable_executable_authority
 page-table-lifecycle/PageTableLifecycle|syscalld|mmap_policy::tests::invalid_backing_is_rejected_before_a_fixed_replace_plan_exists

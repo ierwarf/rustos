@@ -91,18 +91,25 @@ flag**. Two locks on that path are contracted to be entered with interrupts
 So the rule is:
 
 > **Anonymous fault entry stays `IF=0`.** It may acquire the exact atomic VMA
-> publication permit, reserve one already-zeroed frame, and perform one
-> zero-to-present CAS in an already prepared 4 KiB leaf. It may not enable
-> interrupts, acquire `ProcessStateLock`, enter `begin_address_space_mutation`,
-> allocate, fault-around, or wait for a shootdown.
+> publication permit, take already-zeroed frames from the wired reserve, publish
+> the intermediate page tables its leaf needs by CAS, and perform
+> zero-to-present CAS installs in 4 KiB leaves. It may not enable interrupts,
+> acquire `ProcessStateLock`, enter `begin_address_space_mutation`, or wait for
+> a shootdown.
+
+Publishing a table is admitted for the same reason installing a leaf is: both
+are not-present-to-present transitions, and neither owes a shootdown. §1c states
+that argument and what it costs.
 
 The permit is the writer/read-side boundary: `munmap`, `mprotect`, `exec`, and
 other writers first publish the VMA as absent, wait for already-acquired leaf
 permits to drain, then perform their ordinary locked PTE mutation and TLB
 reclamation. A CAS loser returns its unused reserve frame; a CAS winner marks
-the PTE with a software ownership bit. That tag is the ownership record used
-by normal clone, unmap, and address-space retirement — no exception-time Vec
-ledger mutation or linear leaf scan exists.
+the entry with a software ownership bit — bit 9 for a leaf, bit 10 for an
+intermediate table. Those tags are the ownership record used by normal clone,
+unmap, and address-space retirement, because no exception-time `Vec` ledger
+mutation is possible. Retirement reconciles them against `owned_frames` rather
+than trusting them (§1c).
 
 What is still forbidden regardless of the interrupt flag:
 
@@ -118,6 +125,101 @@ never registers its endpoint, while the kernel keeps scheduling normally. That
 is a thread stuck inside a fault, not a service bug. `initd: fatal service
 endpoint not ready` is the message; the thread that never came back is the
 cause.
+
+---
+
+## 1c. Reservation builds no page tables
+
+`mmap` used to build every intermediate page table for the range it reserved.
+That made the cost of reserving address space proportional to the size of the
+reservation rather than to the memory actually used: **one 4 KiB table frame per
+2 MiB reserved**, so a 64 GiB reservation cost roughly 128 MiB of page tables
+before a single byte was touched, and every `mmap` also scanned every page of
+its own range to prove the leaves were free.
+
+The fault path now publishes the tables it needs, and reservation publishes
+none.
+
+### Why an intermediate entry is the same case as a leaf
+
+The rule that let the fault path install a leaf without a shootdown was that a
+**not-present-to-present transition cannot leave a stale translation**. That
+argument is about the absent entry, not about its level: x86 caches neither a
+TLB entry nor a paging-structure-cache entry (PML4E/PDPTE/PDE) for an entry
+that is not present, so nothing can hold a translation that the publication
+would have to invalidate. Linux relies on exactly this — `__pte_alloc`
+publishes a new table with a write barrier and no flush at all.
+
+What the fault path must still guarantee is the *other* direction: a CPU that
+observes the new entry must also observe the zeroed table it names. The
+publication is a release CAS over a frame that was zeroed first, which is that
+guarantee. On x86-TSO the store-store order is architectural, which is why this
+scenario is registered with `herd_not_applicable`: a litmus mutant could not
+reach the forbidden state, and the herd gate rejects a mutant that survives.
+
+### Why the CAS, and not a plain store
+
+Both installers can now reach one absent directory entry with nothing
+serializing them. The mapping transaction's `AddressSpaceMutationGuard`
+excludes other **normal-time** writers; it does not exclude a fault on another
+CPU, and the fault path takes no lock at all. A pager VMA and an eager mapping
+can be neighbours inside the same 2 MiB block, so both may need the same table.
+`ensure_next_table` therefore publishes by the same CAS the fault path uses, and
+the loser returns its frame — a frame no root ever named, so returning it owes
+no shootdown either.
+
+### Two ownership ledgers, and the check between them
+
+| Frame | Ledger | Recorded by |
+| --- | --- | --- |
+| eager data leaf | `owned_frames` | the mapping transaction, exactly |
+| eager intermediate table | `owned_frames` | the mapping transaction, exactly |
+| fault-installed leaf | `IRQ_OFF_PAGER_FAULT_LEAF` (bit 9) | the PTE itself |
+| fault-installed table | `LAZY_PAGER_FAULT_TABLE` (bit 10) | the directory entry itself |
+
+The tags exist because the fault path cannot push to a `Vec` that sits behind a
+sleepable lock. That makes the page tables an ownership record, which is a thing
+to be careful with rather than to rely on, so retirement **reconciles the two**:
+it walks the user subtree, and fails stop if one frame is claimed by both
+ledgers, if a frame is claimed as both a leaf and a table, or if the walk finds
+a topology nothing in this tree can produce (a huge entry in the user subtree,
+or a non-zero intermediate entry that is not present). A frame the allocator
+merely refuses to take back is a different fact: that is a leak with a
+diagnostic, not corruption, and it does not stop the kernel.
+
+This reconciliation is cardinality- and identity-exact **per frame**; what it
+cannot see is a subtree made unreachable by a corrupted upper entry, because
+the walk that would find it is the walk that got lost. Closing that would need
+an explicit per-process table list the fault path can append to lock-free —
+worth doing when there is a second reason to want one.
+
+### Rollback keeps its tables
+
+A failed mapping transaction no longer withdraws the intermediate tables it
+published. It cannot prove they are still empty: a concurrent installer may
+have put a leaf inside one while the guard was held. The cost is one empty
+4 KiB frame retained until retirement, which is exactly what `munmap` already
+does with the tables of the range it unmaps. `PageTableMapTransaction` states
+this as `FailureRetainsPublishedTables`, and its leaf half is unchanged.
+
+### What moved, and what it cost
+
+**Measured on one boot:** 32 909 anonymous pages reserved, for which
+preparation would have allocated 512 table frames; the fault path allocated 98,
+with no publication-CAS losses and no table-supply refusals. The absolute
+saving is 414 frames. What changed is which quantity the cost tracks — reserved
+address space before, touched memory after.
+
+`mmap` no longer allocates, so it no longer fails for want of a table frame,
+and a reservation always succeeds. Memory exhaustion moves to the fault, where
+it is a refusal — the same place and the same shape Linux puts it. The
+admission check that replaced preparation walks only the tables that already
+exist and skips the whole span of any absent level, so an untouched reservation
+of any size costs **one directory read**.
+
+`munmap` and `mprotect` had to be corrected for this: they treated only a
+missing *leaf* as an ordinary demand state, and a range the process never
+touched now has no page table either. Every absent level is ordinary.
 
 ---
 
@@ -156,7 +258,7 @@ Model: `formal/pager-fault-slot-lifecycle/PagerFaultSlotLifecycle.tla`.
 
 | | |
 | --- | --- |
-| Owner | `kernel-mm` `FaultFramePool`, `PAGER_WIRED_FAULT_FRAMES` = 128 |
+| Owner | `kernel-mm` `FaultFramePool`, `PAGER_WIRED_FAULT_FRAMES` = 2048 |
 | Admission | `FaultFramePool::reserve`, from exception context |
 | Refusal code | `PAGER_PRESSURE_FAULT_FRAME_RESERVE_EMPTY` |
 
@@ -183,8 +285,12 @@ task refills the full bounded pool before yielding. The fault which set the bit
 has already resumed through its CAS, so this is neither fault deferral nor
 generic housekeeping, and the allocator never runs in exception context.
 
-Pages populated *around* the fault (§4.5) never draw from this pool. They use
-the ordinary allocator and are best effort by construction.
+Pages populated *around* the fault (§4.5) draw from this pool too, and so do
+the intermediate page tables the fault path publishes (§1c) - a zeroed reserve
+frame is exactly what an empty page table is. Restricting fault-around to the
+allocator alone was tried and reverted: the reserve is emptiest when the fault
+rate is highest, so the run went dead precisely when it was worth most. The run
+must degrade with supply, not switch off.
 
 ### 2.3 Frame grant — pager-backed only
 
@@ -249,6 +355,8 @@ code-derived conclusions turned out to be wrong. They are listed because the
 | "Enabling interrupts in the handler caused the later instability" | The instability was a fabricated `ENOMEM` from `MAP_FIXED`. The interrupt change was unrelated. | Not attributing a new symptom to the most recent change without evidence |
 | "SeqCst on the four operations closes the Loom failure" | Loom under-approximates SeqCst. The fix was right for hardware and still failed the model. | Knowing the checker's limits before reading its verdict as a fact about the code |
 | "Fault-around's speculative pages need a software bit that was not reserved" | The hardware Accessed bit already encodes it. | Checking whether the CPU already maintains the predicate |
+| "Kani can prove the new page-table arithmetic" | Kani harnesses in this tree live only under `libs/`; `kernel/mm` is not in the proof index. | Looking at where the existing `#[kani::proof]` attributes actually are before planning a lane |
+| "Fault-around never draws the wired reserve" (this document, §2.2) | It draws it first, by design, after the allocator-only variant was measured and reverted. | Re-reading the paragraph the code comment contradicts |
 
 Two rules follow, and they are cheap:
 
@@ -262,7 +370,11 @@ Two rules follow, and they are cheap:
 
 The `pager-anon-census-*` milestones exist for the first rule: served,
 stalled, supply, and access counts on four lines, so the state of this path is
-read rather than inferred.
+read rather than inferred. `pager-anon-reservation` and
+`pager-fault-table-installed` were added for the same reason when reservation
+stopped building page tables: the first reports what preparation *would* have
+allocated, the second what the fault path actually allocates, so the change is
+read off one boot instead of argued from the diff.
 
 ---
 
@@ -611,6 +723,10 @@ the write lands. Correctness there requires a TLB shootdown, and §1 is exactly
 the rule that the fault path cannot take the global TLB protocol at exception
 entry. So a zero page needs a fault-time shootdown path to exist first.
 
+Publishing an intermediate table at fault time (§1c) is **not** the same case
+and does not supply that path: it is a not-present-to-present transition, which
+is exactly the transition that owes no shootdown.
+
 Restricting it to read-only anonymous VMAs avoids the shootdown entirely - no
 write can ever be admitted, so no copy is ever needed - but that is a rare
 mapping, and it would still cost a second ownership tag and an exclusion in
@@ -689,6 +805,11 @@ diagnosis the machine's dominant cost.
 | a ring0-owned anonymous object still carries authority | `the_ring0_anonymous_epoch_carries_object_authority` |
 | fault-around never exceeds its offer | `fault_around_takes_the_offered_run_and_never_exceeds_it` |
 | a denial still carries a canonical run | `a_denied_fault_carries_a_canonical_run_length` |
+| one installer wins a directory entry, and its zeroing is never missed | Loom `only_one_installer_publishes_a_table_and_its_zeroing_is_never_missed`, Shuttle `table_publication_is_exclusive_and_every_loser_returns_its_frame`, scenario `pager-fault-table-install` |
+| a published table entry is a present non-huge user table | `a_published_table_entry_must_be_a_present_non_huge_user_table` |
+| an absent level skips its whole span | `an_absent_level_skips_its_whole_span_not_one_table`, `a_partial_block_skips_only_to_its_own_boundary` |
+| rollback keeps its tables and reverses only leaves | `PageTableMapTransaction`, `leaf_rollback_runs_in_reverse_publication_order` |
+| a clone never enters one frame in both ledgers | `cloned_leaf_flags_drop_the_irq_off_ownership_tag` |
 
 Runtime evidence that no unit test can give: `cargo xtask kvm-smoke
 --rustos-vcpus 8 --min-ui-fps 60 --dvm-network-shmem --timeout 120 --repeat 4`.
@@ -714,3 +835,12 @@ reads exactly like a boot failure.
    fault-slot table as a `const _: () = assert!(...)`.
 5. If you make the fault path faster, re-check §5. Speed on this path works by
    removing scheduler turns, and something was probably using those turns.
+6. If you add anything the fault path publishes into a page table, it needs an
+   ownership record the fault path can actually write — a tag, not a `Vec` —
+   and a reconciliation against `owned_frames` at retirement. Say which failures
+   are leaks with a diagnostic and which are corruption that stops the kernel;
+   §1c's table is the shape to follow.
+7. If you make a page-table level absent where it used to be present, grep every
+   `UserPageLookup::Missing*` match. `munmap` and `mprotect` accepted only a
+   missing *leaf* as ordinary and failed on a missing table, which made them
+   reject any range the process had never touched.

@@ -144,3 +144,97 @@
             );
         });
     }
+
+    /// Mirrors `publish_user_table_entry`: one absent intermediate directory
+    /// entry, reachable by two installers with nothing serializing them.
+    ///
+    /// The `contents` fields stand for the 4 KiB frames each installer
+    /// prepared. They start non-zero because a fresh frame holds whatever the
+    /// last owner left, and an empty page table is precisely a zeroed one.
+    struct DirectoryPublication {
+        entry: AtomicUsize,
+        contents_a: AtomicUsize,
+        contents_b: AtomicUsize,
+    }
+
+    impl DirectoryPublication {
+        const UNINITIALIZED: usize = 0xbad;
+
+        fn absent() -> Self {
+            Self {
+                entry: AtomicUsize::new(0),
+                contents_a: AtomicUsize::new(Self::UNINITIALIZED),
+                contents_b: AtomicUsize::new(Self::UNINITIALIZED),
+            }
+        }
+    }
+
+    /// The decisive property of publishing a page table at fault time.
+    ///
+    /// `mmap` no longer builds intermediate tables, so the exception path
+    /// creates them, and it holds no lock while doing so - the normal-time
+    /// mapping transaction's guard excludes other normal-time writers, not a
+    /// fault on another CPU. Two things must therefore hold at once: exactly
+    /// one installer may win a given directory entry, so the loser's frame is
+    /// never reachable and can be returned; and any CPU that observes the
+    /// winning entry must also observe the zeroing that preceded it, or it
+    /// walks the previous owner's bytes as page-table entries.
+    #[test]
+    fn only_one_installer_publishes_a_table_and_its_zeroing_is_never_missed() {
+        loom::model(|| {
+            let directory = Arc::new(DirectoryPublication::absent());
+
+            let first = {
+                let directory = Arc::clone(&directory);
+                thread::spawn(move || {
+                    // Zero the frame, then publish the entry naming it. The
+                    // release in the CAS is what orders these two.
+                    directory.contents_a.store(0, Ordering::Relaxed);
+                    directory
+                        .entry
+                        .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                })
+            };
+            let second = {
+                let directory = Arc::clone(&directory);
+                thread::spawn(move || {
+                    directory.contents_b.store(0, Ordering::Relaxed);
+                    directory
+                        .entry
+                        .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                })
+            };
+
+            // A third participant that only reads, standing for a concurrent
+            // walker: it observes the entry and immediately dereferences the
+            // table it names. Reading here rather than after the joins is the
+            // point - a join would supply the ordering the CAS must supply.
+            let observed = directory.entry.load(Ordering::Acquire);
+            let contents = match observed {
+                1 => Some(directory.contents_a.load(Ordering::Relaxed)),
+                2 => Some(directory.contents_b.load(Ordering::Relaxed)),
+                _ => None,
+            };
+            if let Some(contents) = contents {
+                assert_eq!(
+                    contents, 0,
+                    "a walker observed a published table before it was zeroed"
+                );
+            }
+
+            let first = first.join().unwrap();
+            let second = second.join().unwrap();
+            assert!(
+                first ^ second,
+                "exactly one installer must publish the entry: first={first} second={second}"
+            );
+            let published = directory.entry.load(Ordering::Acquire);
+            assert_eq!(
+                published,
+                if first { 1 } else { 2 },
+                "the entry must name the winner's table"
+            );
+        });
+    }

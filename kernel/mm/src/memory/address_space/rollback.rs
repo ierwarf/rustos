@@ -5,22 +5,40 @@
 //! - **Lifecycle:** remove leaf entries → complete cross-CPU shootdown → remove
 //!   owned-frame metadata and free only the exact private frames.
 //! - **Concurrency:** the mutation guard excludes address-space activation and
-//!   other page-table mutation throughout rollback.
+//!   other normal-time page-table mutation throughout rollback.
 //! - **Failure:** an unexpected frame or leaf identity is a fatal invariant.
 //! - **Forbidden:** no frame free or rejected external-map return before the
 //!   corresponding stale translations are acknowledged.
 //! - **Evidence:** `tlb-shootdown-lifecycle` and
 //!   `process-address-space-lifecycle`.
+//!
+//! # Rollback is leaf-only
+//!
+//! A failed transaction keeps any intermediate table it published. Withdrawing
+//! one is no longer provable: the exception-time installer can put a leaf into
+//! a table this transaction created, in the same 2 MiB block, while the
+//! mutation guard is held - that guard excludes normal-time writers, not the
+//! fault path, and the fault path takes no lock at all. Retaining the table
+//! costs one empty 4 KiB frame until retirement, which is exactly what `munmap`
+//! already does, and it keeps `owned_frames` the exact ledger for that frame.
 
 use super::*;
+
+/// The order a rollback must withdraw in: reverse publication order.
+///
+/// A later leaf exists only because the mapping loop got past the earlier ones,
+/// so undoing in reverse is what keeps every step's precondition true and what
+/// stops a partial rollback from leaving a hole behind a live entry.
+fn rollback_order<T: Copy>(pages: &[T]) -> impl Iterator<Item = T> {
+    pages.iter().rev().copied()
+}
 
 pub(super) fn rollback_user_pages(
     space: &mut ProcessAddressSpace,
     pages: &[(VirtAddr, u64)],
-    published_tables: &[PublishedUserTable],
     mutation: AddressSpaceMutationGuard,
 ) {
-    for &(virt, frame_phys) in pages.iter().rev() {
+    for (virt, frame_phys) in rollback_order(pages) {
         let unmapped = space.unmap_user_page(virt);
         if unmapped.map(|phys| phys.as_u64()) != Some(frame_phys) {
             panic!("user page rollback mismatch");
@@ -30,62 +48,21 @@ pub(super) fn rollback_user_pages(
             debug_assert!(removed.is_ok());
         }
     }
-    rollback_published_tables(space, published_tables);
     let _flushed_mutation = mutation.flush_for_reclaim();
-    free_rollback_frames_exact(
-        pages.iter().rev().map(|(_, frame_phys)| *frame_phys).chain(
-            published_tables_in_rollback_order(published_tables).map(|table| table.table_phys),
-        ),
-    );
+    free_rollback_frames_exact(rollback_order(pages).map(|(_, frame_phys)| frame_phys));
 }
 
 pub(super) fn rollback_external_user_pages(
     space: &mut ProcessAddressSpace,
     pages: &[VirtAddr],
-    published_tables: &[PublishedUserTable],
     mutation: AddressSpaceMutationGuard,
 ) {
-    for &virt in pages.iter().rev() {
+    for virt in rollback_order(pages) {
         let _ = space.unmap_user_page(virt);
     }
-    rollback_published_tables(space, published_tables);
+    // The borrowed frames return to their backing object, so the shootdown is
+    // still owed before that object may hand them out again.
     let _flushed_mutation = mutation.flush_for_reclaim();
-    free_rollback_frames_exact(
-        published_tables_in_rollback_order(published_tables).map(|table| table.table_phys),
-    );
-}
-
-fn rollback_published_tables(
-    space: &mut ProcessAddressSpace,
-    published_tables: &[PublishedUserTable],
-) {
-    for table in published_tables_in_rollback_order(published_tables) {
-        // SAFETY: the mutation guard excludes concurrent topology changes;
-        // every logged child frame remains mapped until this rollback ends.
-        let child = unsafe { kernel_vm::phys_to_table_ref(PhysAddr::new(table.table_phys)) };
-        assert!(
-            (0..ENTRIES_PER_TABLE).all(|index| child[index].is_unused()),
-            "user page-table rollback found a live child entry"
-        );
-        // SAFETY: the commit log retains the exact live parent frame and index,
-        // and reverse order proves no surviving child depends on this entry.
-        let parent = unsafe { kernel_vm::phys_to_table_mut(PhysAddr::new(table.parent_phys)) };
-        let entry = &mut parent[table.parent_index];
-        assert_eq!(
-            entry.addr().as_u64(),
-            table.table_phys,
-            "user page-table rollback parent identity changed"
-        );
-        entry.set_unused();
-        remove_owned_frame(&mut space.owned_frames, table.table_phys)
-            .expect("user page-table rollback lost owned-frame authority");
-    }
-}
-
-fn published_tables_in_rollback_order(
-    published_tables: &[PublishedUserTable],
-) -> impl Iterator<Item = &PublishedUserTable> {
-    published_tables.iter().rev()
 }
 
 #[cfg(test)]
@@ -93,27 +70,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn intermediate_tables_rollback_in_reverse_publication_order() {
-        let published = [
-            PublishedUserTable {
-                parent_phys: 1,
-                parent_index: 2,
-                table_phys: 3,
-            },
-            PublishedUserTable {
-                parent_phys: 3,
-                parent_index: 4,
-                table_phys: 5,
-            },
-            PublishedUserTable {
-                parent_phys: 5,
-                parent_index: 6,
-                table_phys: 7,
-            },
+    fn leaf_rollback_runs_in_reverse_publication_order() {
+        let pages = [
+            (VirtAddr::new(USER_SPACE_BASE), 0x1000_u64),
+            (VirtAddr::new(USER_SPACE_BASE + PAGE_4KIB_U64), 0x2000),
+            (VirtAddr::new(USER_SPACE_BASE + 2 * PAGE_4KIB_U64), 0x3000),
         ];
-        let order = published_tables_in_rollback_order(&published)
-            .map(|table| table.table_phys)
+        let order = rollback_order(&pages)
+            .map(|(_, frame_phys)| frame_phys)
             .collect::<alloc::vec::Vec<_>>();
-        assert_eq!(order, alloc::vec![7, 5, 3]);
+        assert_eq!(order, alloc::vec![0x3000, 0x2000, 0x1000]);
     }
 }

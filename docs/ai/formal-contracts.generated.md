@@ -2,12 +2,12 @@
 # Formal Contract Registry
 
 - Schema: `3`
-- Registry SHA-256: `30100d04a7a4f30b7dbdab9d43bc2744f6c487ccb96f610069e6bbd4cce44b87`
+- Registry SHA-256: `a7f6fc25660bc316a5d43a2c3993dcf1a94a3f0958e2eba6962b4a8fbc0d8f1f`
 - Models: `136`
 - Whole flows: `74`
-- Transitions: `748`
+- Transitions: `749`
 - Product runtime scenarios: `3`
-- Exact source witnesses: `644`
+- Exact source witnesses: `645`
 - Apalache pilots: `3`
 - TLAPS theorem models: `2`
 - Runtime-traced models: `7`
@@ -54,7 +54,7 @@
 | `kernel-memory-protection` | `critical` | kernel-mm | page-table-lifecycle/PageTableLifecycle | 5 | 5 | rejected |
 | `kernel-resource-lifecycle` | `critical` | kernel-ipc-runtime, kernel-ps | kernel-resource-accounting/KernelResourceAccounting | 9 | 9 | quota-returned, rejected |
 | `loader-request-authority` | `critical` | initd, kernel-compat, loaderd | loader-request-authority/LoaderRequestAuthority | 6 | 6 | committed, denied |
-| `memory-map` | `critical` | kernel-compat, kernel-mm, syscalld | page-table-lifecycle/PageTableLifecycle, page-table-map-transaction/PageTableMapTransaction | 8 | 8 | rejected, unmapped |
+| `memory-map` | `critical` | kernel-compat, kernel-mm, syscalld | page-table-lifecycle/PageTableLifecycle, page-table-map-transaction/PageTableMapTransaction | 9 | 9 | rejected, unmapped |
 | `monotonic-deadline-lifecycle` | `critical` | kernel-compat, kernel-hal, kernel-ps | clocksource-deadline/ClocksourceDeadline | 13 | 13 | cancelled, reported, retired, source-rejected, timed-out |
 | `msi-vector-ingress` | `critical` | kernel-hal, kernel-io-manager | msi-vector-lifecycle/MsiVectorLifecycle | 8 | 8 | free, permanent, rejected |
 | `netd-deferred-reply-lifecycle` | `critical` | netd | netd-deferred-reply/NetdDeferredReply | 10 | 10 | discarded, provider-not-started, rejected, replied, timed-out |
