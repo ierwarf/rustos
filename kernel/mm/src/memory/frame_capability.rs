@@ -43,7 +43,7 @@ pub const MAX_PAGER_FRAME_GRANTS: usize = 128;
 ///
 /// With this relation the reserve can only be empty after fault-slot admission
 /// has already refused, and that refusal is counted and named.
-pub const MAX_PREALLOCATED_PAGER_FAULT_FRAMES: usize = 128;
+pub const MAX_PREALLOCATED_PAGER_FAULT_FRAMES: usize = 2048;
 
 const _: () = assert!(
     MAX_PREALLOCATED_PAGER_FAULT_FRAMES >= MAX_PAGER_FRAME_GRANTS,
@@ -58,6 +58,22 @@ const FRAME_RIGHT_WRITE: u64 = 1 << 1;
 const FRAME_RIGHT_EXECUTE: u64 = 1 << 2;
 const FRAME_RIGHT_KNOWN: u64 = FRAME_RIGHT_READ | FRAME_RIGHT_WRITE | FRAME_RIGHT_EXECUTE;
 static FIRST_FAULT_FRAME_REPLENISHMENT: AtomicBool = AtomicBool::new(false);
+/// Set by the IRQ-off consumer once the wired reserve crosses its low-water
+/// mark.  The producer consumes this at an ordinary scheduled kernel-task
+/// boundary; the bit is only a wake reason, never fault authority.
+static PAGER_FAULT_REFILL_REQUESTED: AtomicBool = AtomicBool::new(false);
+const PAGER_FAULT_REFILL_LOW_WATERMARK: usize = MAX_PREALLOCATED_PAGER_FAULT_FRAMES * 3 / 4;
+/// Frames one producer pass may publish before it yields.
+///
+/// Refilling the whole pool in a single turn is what a producer *wants*, and it
+/// is exactly wrong: every frame costs an allocator acquisition and a 4 KiB
+/// zeroing, so a full 2048-frame pass is 8 MiB of memset holding its CPU for
+/// about a millisecond. Measured, that showed up as a 1.2 ms p99 on a probe
+/// that does one `mmap` and one `munmap` and takes no fault at all - the
+/// producer was simply in front of it. The request bit survives a partial
+/// pass, so a bounded budget costs more turns and no throughput, while keeping
+/// the producer off the tail of unrelated work.
+const PAGER_FAULT_REFILL_PASS_BUDGET: usize = 128;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FrameGrantBinding {
@@ -136,6 +152,14 @@ const FAULT_FRAME_POOL_READY: u8 = 2;
 struct FaultFramePool {
     state: AtomicU8,
     frames: [AtomicU64; MAX_PREALLOCATED_PAGER_FAULT_FRAMES],
+    /// Frames currently published in `frames`, maintained incrementally.
+    ///
+    /// This is authority, not a census: a claimer decrements it before it may
+    /// take a slot, so it is what lets an empty pool be rejected in one atomic
+    /// operation instead of a full sweep of the array.
+    available: AtomicUsize,
+    /// Rotating scan origin, so concurrent claimers start on different slots.
+    cursor: AtomicUsize,
     /// Frames left at the most recent reservation, the lowest depth any
     /// reservation has observed, and reservations refused for want of a frame.
     ///
@@ -153,6 +177,8 @@ impl FaultFramePool {
         Self {
             state: AtomicU8::new(FAULT_FRAME_POOL_COLD),
             frames: [const { AtomicU64::new(0) }; MAX_PREALLOCATED_PAGER_FAULT_FRAMES],
+            available: AtomicUsize::new(0),
+            cursor: AtomicUsize::new(0),
             depth: AtomicUsize::new(usize::MAX),
             low_watermark: AtomicUsize::new(usize::MAX),
             exhaustions: AtomicU64::new(0),
@@ -170,50 +196,98 @@ impl FaultFramePool {
                 .compare_exchange(0, frame_phys, Ordering::Release, Ordering::Relaxed)
                 .is_ok()
             {
+                // ORDERING: Release makes the frame visible in its slot before
+                // the count that authorizes a claimer to go looking for it.
+                self.available.fetch_add(1, Ordering::Release);
                 return Ok(());
             }
         }
         Err(FrameGrantError::Pressure)
     }
 
+    /// Claims one wired frame, or reports the pool empty.
+    ///
+    /// This runs on every anonymous fault with interrupts disabled, so its cost
+    /// is paid by every page the system demand-pages. It used to sweep the
+    /// whole slot array on *every* call - once to find a frame and then again
+    /// to recount the survivors for the depth census - which made the fault
+    /// path O(pool size) and put a hard ceiling on how large the pool could
+    /// usefully be. The available count is now maintained incrementally, so a
+    /// claim reserves its slot before touching the array and an empty pool is
+    /// rejected without touching it at all.
     fn reserve(&self) -> Result<u64, FrameGrantError> {
         // ORDERING: Ready acquires the completed boot fill before any fault
         // can observe a slot; a cold or filling pool is not usable authority.
         if self.state.load(Ordering::Acquire) != FAULT_FRAME_POOL_READY {
             return Err(FrameGrantError::Pressure);
         }
-        let mut remaining = 0;
-        let mut reserved = 0;
-        for slot in &self.frames {
-            if reserved != 0 {
-                // ORDERING: Relaxed is a census read, not authority. It only
-                // feeds the depth counter below.
-                remaining += usize::from(slot.load(Ordering::Relaxed) != 0);
-                continue;
+        // Reserve the right to one frame first. Winning this decrement is what
+        // guarantees the scan below finds a slot, so the scan never has to run
+        // to completion to prove the pool is empty.
+        // ORDERING: AcqRel serializes concurrent claims against each other and
+        // against a producer's Release increment.
+        let remaining = match self.available.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |available| available.checked_sub(1),
+        ) {
+            Ok(previous) => previous - 1,
+            Err(_) => {
+                // The exhaustion this counter exists to make legible. Its
+                // previous first symptom was a dead user thread several layers
+                // away.
+                let empty = self.exhaustions.fetch_add(1, Ordering::Relaxed) + 1;
+                if empty.is_multiple_of(1024) || empty == 1 {
+                    crate::debug::record_milestone(
+                        crate::debug::LogCategory::Memory,
+                        "pager-pressure-fault-frame-reserve-empty",
+                        empty,
+                        MAX_PREALLOCATED_PAGER_FAULT_FRAMES as u64,
+                    );
+                }
+                // ORDERING: Release publishes the demand signal for the
+                // producer task; an empty pool is exactly when it must run.
+                PAGER_FAULT_REFILL_REQUESTED.store(true, Ordering::Release);
+                return Err(FrameGrantError::OutOfFrames);
             }
+        };
+        // A rotating start keeps concurrent claimers off each other's slots
+        // instead of having every CPU contend on index 0.
+        let start = self.cursor.fetch_add(1, Ordering::Relaxed);
+        let mut reserved = 0;
+        for offset in 0..MAX_PREALLOCATED_PAGER_FAULT_FRAMES {
+            let index = start.wrapping_add(offset) % MAX_PREALLOCATED_PAGER_FAULT_FRAMES;
             // ORDERING: AcqRel claims one exact wired frame and prevents a
             // second fault from receiving the same opaque grant backing.
-            let frame_phys = slot.swap(0, Ordering::AcqRel);
+            let frame_phys = self.frames[index].swap(0, Ordering::AcqRel);
             if frame_phys != 0 {
                 reserved = frame_phys;
+                break;
             }
         }
         if reserved == 0 {
-            // The exhaustion this counter exists to make legible. Its previous
-            // first symptom was a dead user thread several layers away.
-            let empty = self.exhaustions.fetch_add(1, Ordering::Relaxed) + 1;
-            if empty.is_multiple_of(16) || empty == 1 {
-                crate::debug::record_milestone(
-                    crate::debug::LogCategory::Memory,
-                    "pager-pressure-fault-frame-reserve-empty",
-                    empty,
-                    MAX_PREALLOCATED_PAGER_FAULT_FRAMES as u64,
-                );
-            }
+            // The count promised a frame the array did not hold. Give the
+            // reservation back rather than leaving the pool permanently short.
+            // ORDERING: Release restores the count for the next claimer.
+            self.available.fetch_add(1, Ordering::Release);
             return Err(FrameGrantError::OutOfFrames);
         }
         self.record_depth(remaining);
+        if remaining <= PAGER_FAULT_REFILL_LOW_WATERMARK {
+            // ORDERING: Release publishes the low-water observation after the
+            // exact frame reservation.  The timer only uses this as a reason
+            // to enter a safe scheduler boundary; it never performs refill
+            // allocation in IRQ context.
+            PAGER_FAULT_REFILL_REQUESTED.store(true, Ordering::Release);
+        }
         Ok(reserved)
+    }
+
+    fn has_empty_slot(&self) -> bool {
+        // ORDERING: Acquire observes either a producer's completed Release
+        // increment or a consumer's AcqRel claim. Retry state only, never
+        // frame authority.
+        self.available.load(Ordering::Acquire) < MAX_PREALLOCATED_PAGER_FAULT_FRAMES
     }
 
     fn record_depth(&self, remaining: usize) {
@@ -546,6 +620,87 @@ pub fn replenish_pager_fault_frames(budget: usize) -> usize {
     replenished
 }
 
+/// Reports whether an IRQ-off consumer crossed the reserve low-water mark.
+///
+/// IRQ code may read this bit to force its next *user-frame* timer boundary
+/// through the scheduler.  It must not call the producer itself.
+pub fn pager_fault_frame_refill_requested() -> bool {
+    // ORDERING: Acquire pairs with the IRQ consumer's Release low-water
+    // publication before a timer decides whether it may retain user execution.
+    PAGER_FAULT_REFILL_REQUESTED.load(Ordering::Acquire)
+}
+
+/// Refill the wired anonymous-fault reserve from its dedicated normal-context
+/// producer task.
+///
+/// This is intentionally separate from generic housekeeping: a burst of
+/// first-touch faults requests the producer at 75% reserve, and that producer
+/// restores the complete bounded pool before unrelated reaping or profiling
+/// work can delay it.  The fault that set the bit was already resolved by its
+/// leaf CAS; no page fault waits for this function.
+pub fn service_pager_fault_frame_refill() -> usize {
+    // ORDERING: AcqRel consumes one producer request while preserving a new
+    // IRQ-side Release request that races with this producer pass.
+    if !PAGER_FAULT_REFILL_REQUESTED.swap(false, Ordering::AcqRel) {
+        return 0;
+    }
+    let replenished = replenish_pager_fault_frames(PAGER_FAULT_REFILL_PASS_BUDGET);
+    if FAULT_FRAME_POOL.has_empty_slot() {
+        // Allocation pressure is observable and retryable.  Retain the wake
+        // reason rather than silently treating a partial producer pass as a
+        // full reserve.
+        // ORDERING: Release retains the producer wake reason until a later
+        // pass sees a fully published pool.
+        PAGER_FAULT_REFILL_REQUESTED.store(true, Ordering::Release);
+    }
+    replenished
+}
+
+/// Takes one pre-zeroed wired frame for a fault ring0 answers by itself.
+///
+/// This is the exception-entry source for anonymous first touch. Ring0 maps
+/// the frame into the faulting task's own address space and never hands it to
+/// a pager, so there is no grant to mint, publish, and claim back: the grant
+/// registry exists to carry a frame *across* a round trip to another process,
+/// and this path has no round trip. The reserve's guarantee is unchanged - one
+/// wired, already-zeroed frame is available without calling the physical
+/// allocator at exception entry.
+///
+/// The caller owns the frame outright. It must either map it or hand it back
+/// through [`return_pager_fault_frame`].
+pub fn take_pager_fault_frame() -> Option<PhysAddr> {
+    FAULT_FRAME_POOL.reserve().ok().map(PhysAddr::new)
+}
+
+/// Returns a frame from [`take_pager_fault_frame`] that was never mapped.
+///
+/// False means the reserve would not accept it; the caller must then free the
+/// frame to the ordinary allocator rather than leak it.
+pub fn return_pager_fault_frame(frame: PhysAddr) -> bool {
+    FAULT_FRAME_POOL.return_frame(frame.as_u64())
+}
+
+/// Allocates and zeroes one ordinary frame, with no grant and no reserve draw.
+///
+/// This is for pages ring0 populates around a fault *after* the fault has been
+/// answered, in ordinary syscall context. It deliberately does not touch the
+/// wired reserve: that reserve exists so exception entry never allocates, and
+/// spending it on best-effort surplus pages would trade a guarantee for a
+/// throughput gain. Returning `None` here simply means fewer surplus pages.
+pub fn allocate_zeroed_frame() -> Option<PhysAddr> {
+    let frame = phys::alloc_frame()?;
+    // SAFETY: `alloc_frame` returns one live page below the direct-map ceiling
+    // and this caller owns it exclusively until it is mapped or freed.
+    unsafe {
+        ptr::write_bytes(
+            kernel_vm::higher_half_addr(frame.as_u64()) as *mut u8,
+            0,
+            FRAME_BYTES,
+        );
+    }
+    Some(frame)
+}
+
 pub fn allocate_zeroed_frame_grant(
     binding: FrameGrantBinding,
     rights: u64,
@@ -792,6 +947,37 @@ mod tests {
         assert_eq!(pool.exhaustions.load(Ordering::Relaxed), 2);
     }
 
+    /// The ring0-served anonymous path takes a reserve frame outright instead
+    /// of minting a grant it would immediately claim back. A fault it cannot
+    /// map must therefore return that exact frame to the same pool, or every
+    /// rejected mapping would permanently shrink the reserve - the failure
+    /// mode a wired reserve exists to make impossible.
+    #[test]
+    fn a_frame_taken_for_a_ring0_fault_and_not_mapped_returns_to_the_reserve() {
+        const FRAMES: usize = 4;
+        let pool = ready_pool(FRAMES);
+        for round in 0..FRAMES * 8 {
+            let frame = pool
+                .reserve()
+                .unwrap_or_else(|error| panic!("round {round} must reserve: {error:?}"));
+            assert!(
+                pool.return_frame(frame),
+                "round {round} must return the exact unmapped frame"
+            );
+        }
+        assert_eq!(pool.exhaustions.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            pool.observed_low_watermark(),
+            Some(FRAMES - 1),
+            "a returned frame must leave the reserve exactly as deep as it was"
+        );
+        // And the reserve is still whole: every frame is reservable again.
+        for round in 0..FRAMES {
+            assert!(pool.reserve().is_ok(), "round {round} is within the reserve");
+        }
+        assert_eq!(pool.reserve(), Err(FrameGrantError::OutOfFrames));
+    }
+
     /// The static relation that makes exhaustion unreachable before fault-slot
     /// admission has already refused. A reserve smaller than the slot table
     /// can run dry while slots are still free, which is an exhaustion with no
@@ -799,6 +985,6 @@ mod tests {
     #[test]
     fn the_reserve_is_never_smaller_than_the_fault_slot_table() {
         assert!(MAX_PREALLOCATED_PAGER_FAULT_FRAMES >= MAX_PAGER_FRAME_GRANTS);
-        assert_eq!(MAX_PREALLOCATED_PAGER_FAULT_FRAMES, 128);
+        assert_eq!(MAX_PREALLOCATED_PAGER_FAULT_FRAMES, 2048);
     }
 }

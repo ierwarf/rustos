@@ -38,6 +38,40 @@ const IDENTITY_MAPPED_PHYS_LIMIT: u64 = 512 * 1024 * 1024 * 1024;
 
 static ACPI_STATE: Mutex<AcpiState> = Mutex::new(AcpiState::new());
 
+/// What the root-table walk actually found.
+///
+/// A downstream failure that can only report "absent" costs a full
+/// investigation to distinguish four different causes: no RSDP, an unreadable
+/// root table, a table this firmware never emitted, and a table that was found
+/// and then rejected by its own parser. The clocksource panic is exactly that
+/// failure, and it reported `acpi_hpet=None` for all four.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct AcpiDiscovery {
+    pub rsdp_present: bool,
+    pub rsdp_addr: u64,
+    /// The RSDP copy still carries `RSD PTR ` where the loader left it.
+    pub rsdp_signature_ok: bool,
+    pub rsdp_checksum_ok: bool,
+    pub rsdp_revision: u8,
+    pub rsdt_addr: u64,
+    pub xsdt_addr: u64,
+    /// The root table's own header passed length and checksum admission.
+    pub root_header_readable: bool,
+    /// `4` for an RSDT, `8` for an XSDT, `0` when neither was readable.
+    pub root_entry_size: u8,
+    pub root_entries: u16,
+    /// Entries whose table header passed length and checksum admission.
+    pub tables_readable: u16,
+    /// Null entries skipped. Firmware leaves these; they are not a stop.
+    pub null_entries: u16,
+    pub madt_present: bool,
+    pub mcfg_present: bool,
+    /// An `HPET` signature was found in the root table.
+    pub hpet_present: bool,
+    /// ...and `parse_hpet_table` accepted it.
+    pub hpet_admitted: bool,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CpuDescriptor {
     pub logical_index: u8,
@@ -180,6 +214,7 @@ struct AcpiState {
     cpu_topology: CpuTopology,
     region_count: usize,
     regions: [PciConfigRegion; MAX_MCFG_REGIONS],
+    discovery: AcpiDiscovery,
 }
 
 impl AcpiState {
@@ -190,6 +225,27 @@ impl AcpiState {
             cpu_topology: CpuTopology::empty(),
             region_count: 0,
             regions: [PciConfigRegion::empty(); MAX_MCFG_REGIONS],
+            // `AcpiDiscovery::default()` is not const, and this state is a
+            // `static`. Zero is the correct pre-discovery value for every
+            // field, so the zeroed literal and the `Default` impl agree.
+            discovery: AcpiDiscovery {
+                rsdp_present: false,
+                rsdp_addr: 0,
+                rsdp_signature_ok: false,
+                rsdp_checksum_ok: false,
+                rsdp_revision: 0,
+                rsdt_addr: 0,
+                xsdt_addr: 0,
+                root_header_readable: false,
+                root_entry_size: 0,
+                root_entries: 0,
+                tables_readable: 0,
+                null_entries: 0,
+                madt_present: false,
+                mcfg_present: false,
+                hpet_present: false,
+                hpet_admitted: false,
+            },
         }
     }
 
@@ -199,6 +255,7 @@ impl AcpiState {
         self.cpu_topology = CpuTopology::empty();
         self.region_count = 0;
         self.regions = [PciConfigRegion::empty(); MAX_MCFG_REGIONS];
+        self.discovery = AcpiDiscovery::default();
     }
 
     fn push_region(&mut self, region: PciConfigRegion) -> bool {
@@ -224,13 +281,23 @@ pub fn init(boot_info_ptr: *const BootInfo) {
     let mut state = ACPI_STATE.lock();
     state.reset(boot_info.acpi_rsdp_addr);
 
-    if state.rsdp_addr == 0 {
-        crate::debug::println!("ACPI RSDP unavailable.");
+    // The RSDP is read from the boot-protocol copy, never from
+    // `acpi_rsdp_addr`. The loader's information structure is not withheld
+    // from the physical allocator, and this runs after heap, framebuffer, and
+    // block-device setup, so by now those bytes are whatever last allocated
+    // them - in practice zeros, which read as "firmware exposes no ACPI".
+    if boot_info.acpi_rsdp_len == 0 {
+        crate::debug::println!("ACPI RSDP unavailable: loader supplied no RSDP.");
         return;
     }
-
+    let rsdp = &boot_info.acpi_rsdp[..boot_info.acpi_rsdp_len as usize];
     let rsdp_addr = state.rsdp_addr;
-    if let Some(topology) = load_cpu_topology(rsdp_addr).and_then(|topology| {
+    let mut discovery = AcpiDiscovery {
+        rsdp_present: true,
+        rsdp_addr,
+        ..AcpiDiscovery::default()
+    };
+    if let Some(topology) = load_cpu_topology(rsdp, &mut discovery).and_then(|topology| {
         topology.normalize_bsp_first(nucleus_core::util::lockdep::hardware_apic_id())
     }) {
         state.cpu_topology = topology;
@@ -242,7 +309,7 @@ pub fn init(boot_info_ptr: *const BootInfo) {
     } else {
         crate::debug::println!("ACPI MADT CPU topology unavailable or unsupported.");
     }
-    if load_mcfg_regions(rsdp_addr, &mut state) {
+    if load_mcfg_regions(rsdp, &mut state, &mut discovery) {
         crate::debug::println!(
             "ACPI MCFG loaded from {:#x}: {} region(s).",
             state.rsdp_addr,
@@ -251,12 +318,28 @@ pub fn init(boot_info_ptr: *const BootInfo) {
     } else {
         crate::debug::println!("ACPI MCFG unavailable; falling back to legacy PCI config access.");
     }
-    state.hpet_address = load_hpet_address(rsdp_addr).unwrap_or(0);
+    state.hpet_address = load_hpet_address(rsdp, &mut discovery).unwrap_or(0);
+    state.discovery = discovery;
     if state.hpet_address != 0 {
         crate::debug::println!("ACPI HPET available at {:#x}.", state.hpet_address);
     } else {
-        crate::debug::println!("ACPI HPET unavailable.");
+        crate::debug::println!(
+            "ACPI HPET unavailable: entries={} readable={} null={} hpet_table={}.",
+            discovery.root_entries,
+            discovery.tables_readable,
+            discovery.null_entries,
+            if discovery.hpet_present {
+                "found-but-rejected"
+            } else {
+                "absent"
+            },
+        );
     }
+}
+
+/// What the root-table walk found this boot.
+pub fn discovery() -> AcpiDiscovery {
+    ACPI_STATE.lock().discovery
 }
 
 pub fn hpet_address() -> Option<u64> {
@@ -320,28 +403,72 @@ fn boot_info_from_ptr(boot_info_ptr: *const BootInfo) -> Option<&'static BootInf
     unsafe { BootInfo::from_ptr(boot_info_ptr) }.ok()
 }
 
-fn load_cpu_topology(rsdp_addr: u64) -> Option<CpuTopology> {
-    let (root_addr, entry_size) = root_sdt_from_rsdp(rsdp_addr)?;
-    let root_table = sdt_bytes(root_addr)?;
-    let entries = root_sdt_entries(root_table, entry_size)?;
+/// Walks the root table once, handing every readable SDT to `visit`, and
+/// records what was seen.
+///
+/// This replaces three copies of the same loop. All three shared one defect: a
+/// null root entry ended the whole scan with `return`, so every table listed
+/// after it became invisible. Firmware does leave null entries - Linux's
+/// `acpi_tb_parse_root_table` skips them - and the failure it produces here is
+/// silent and position-dependent, which is the worst shape a discovery bug can
+/// have: the same firmware yields a different answer per table.
+fn walk_root_tables(
+    rsdp: &[u8],
+    discovery: &mut AcpiDiscovery,
+    mut visit: impl FnMut(&'static [u8]) -> bool,
+) {
+    record_rsdp_facts(rsdp, discovery);
+    let Some((root_addr, entry_size)) = root_sdt_from_rsdp(rsdp) else {
+        return;
+    };
+    discovery.root_entry_size = entry_size as u8;
+    let Some(root_table) = sdt_bytes(root_addr) else {
+        return;
+    };
+    discovery.root_header_readable = true;
+    let Some(entries) = root_sdt_entries(root_table, entry_size) else {
+        return;
+    };
+
     let mut index = 0;
     while index + entry_size <= entries.len() {
         let table_addr = if entry_size == 8 {
             le_u64(&entries[index..index + 8])
         } else {
-            le_u32(&entries[index..index + 4]) as u64
+            u64::from(le_u32(&entries[index..index + 4]))
         };
-        if table_addr == 0 {
-            return None;
-        }
-        if let Some(table) = sdt_bytes(table_addr)
-            && &table[..4] == b"APIC"
-        {
-            return parse_madt_table(table);
-        }
         index += entry_size;
+        discovery.root_entries = discovery.root_entries.saturating_add(1);
+        if table_addr == 0 {
+            discovery.null_entries = discovery.null_entries.saturating_add(1);
+            continue;
+        }
+        let Some(table) = sdt_bytes(table_addr) else {
+            continue;
+        };
+        discovery.tables_readable = discovery.tables_readable.saturating_add(1);
+        match &table[..4] {
+            b"APIC" => discovery.madt_present = true,
+            b"MCFG" => discovery.mcfg_present = true,
+            b"HPET" => discovery.hpet_present = true,
+            _ => {}
+        }
+        if visit(table) {
+            return;
+        }
     }
-    None
+}
+
+fn load_cpu_topology(rsdp: &[u8], discovery: &mut AcpiDiscovery) -> Option<CpuTopology> {
+    let mut topology = None;
+    walk_root_tables(rsdp, discovery, |table| {
+        if &table[..4] != b"APIC" {
+            return false;
+        }
+        topology = parse_madt_table(table);
+        true
+    });
+    topology
 }
 
 fn parse_madt_table(table: &[u8]) -> Option<CpuTopology> {
@@ -429,64 +556,29 @@ fn parse_madt_table(table: &[u8]) -> Option<CpuTopology> {
         .then_some(topology)
 }
 
-fn load_mcfg_regions(rsdp_addr: u64, state: &mut AcpiState) -> bool {
-    let Some((root_addr, entry_size)) = root_sdt_from_rsdp(rsdp_addr) else {
-        return false;
-    };
-    let Some(root_table) = sdt_bytes(root_addr) else {
-        return false;
-    };
-
-    let Some(entries) = root_sdt_entries(root_table, entry_size) else {
-        return false;
-    };
-    let mut index = 0;
+fn load_mcfg_regions(rsdp: &[u8], state: &mut AcpiState, discovery: &mut AcpiDiscovery) -> bool {
     let mut loaded = false;
-    while index + entry_size <= entries.len() {
-        let table_addr = if entry_size == 8 {
-            le_u64(&entries[index..index + 8])
-        } else {
-            le_u32(&entries[index..index + 4]) as u64
-        };
-        if table_addr == 0 {
+    walk_root_tables(rsdp, discovery, |table| {
+        if &table[..4] != b"MCFG" {
             return false;
         }
-
-        if let Some(table) = sdt_bytes(table_addr)
-            && &table[..4] == b"MCFG"
-        {
-            loaded |= parse_mcfg_table(table, state);
-            break;
-        }
-
-        index += entry_size;
-    }
-
+        loaded = parse_mcfg_table(table, state);
+        true
+    });
     loaded
 }
 
-fn load_hpet_address(rsdp_addr: u64) -> Option<u64> {
-    let (root_addr, entry_size) = root_sdt_from_rsdp(rsdp_addr)?;
-    let root_table = sdt_bytes(root_addr)?;
-    let entries = root_sdt_entries(root_table, entry_size)?;
-    let mut index = 0;
-    while index + entry_size <= entries.len() {
-        let table_addr = if entry_size == 8 {
-            le_u64(&entries[index..index + 8])
-        } else {
-            le_u32(&entries[index..index + 4]) as u64
-        };
-        if table_addr == 0 {
-            return None;
+fn load_hpet_address(rsdp: &[u8], discovery: &mut AcpiDiscovery) -> Option<u64> {
+    let mut address = None;
+    walk_root_tables(rsdp, discovery, |table| {
+        if &table[..4] != b"HPET" {
+            return false;
         }
-        if let Some(table) = sdt_bytes(table_addr)
-            && &table[..4] == b"HPET"
-        {
-            return parse_hpet_table(table);
-        }
-        index += entry_size;
-    }
-    None
+        address = parse_hpet_table(table);
+        true
+    });
+    discovery.hpet_admitted = address.is_some();
+    address
 }
 
 fn parse_hpet_table(table: &[u8]) -> Option<u64> {
@@ -510,29 +602,48 @@ fn parse_hpet_table(table: &[u8]) -> Option<u64> {
         .then_some(address)
 }
 
-fn root_sdt_from_rsdp(rsdp_addr: u64) -> Option<(u64, usize)> {
-    let rsdp_v1 = phys_bytes(rsdp_addr, RSDP_V1_LEN)?;
+/// Records why an RSDP was or was not usable, without changing admission.
+///
+/// The loader hands over a *copy* of the RSDP that it placed in its own info
+/// structure, so "the address is nonzero" and "the bytes there are still an
+/// RSDP" are different questions. Only the second one matters, and only this
+/// record can tell them apart.
+fn record_rsdp_facts(rsdp: &[u8], discovery: &mut AcpiDiscovery) {
+    if rsdp.len() < RSDP_V1_LEN {
+        return;
+    }
+    discovery.rsdp_signature_ok = &rsdp[..8] == b"RSD PTR ";
+    discovery.rsdp_checksum_ok = checksum_ok(&rsdp[..RSDP_V1_LEN]);
+    discovery.rsdp_revision = rsdp[15];
+    discovery.rsdt_addr = u64::from(le_u32(&rsdp[16..20]));
+    if discovery.rsdp_revision >= 2 && rsdp.len() >= RSDP_V2_LEN {
+        discovery.xsdt_addr = le_u64(&rsdp[24..32]);
+    }
+}
+
+fn root_sdt_from_rsdp(rsdp: &[u8]) -> Option<(u64, usize)> {
+    if rsdp.len() < RSDP_V1_LEN {
+        return None;
+    }
+    let rsdp_v1 = &rsdp[..RSDP_V1_LEN];
     if &rsdp_v1[..8] != b"RSD PTR " || !checksum_ok(rsdp_v1) {
         return None;
     }
 
     let revision = rsdp_v1[15];
-    let rsdt_addr = le_u32(&rsdp_v1[16..20]) as u64;
-    if revision < 2 {
+    let rsdt_addr = u64::from(le_u32(&rsdp_v1[16..20]));
+    if revision < 2 || rsdp.len() < RSDP_V2_LEN {
         return (rsdt_addr != 0).then_some((rsdt_addr, 4));
     }
 
-    let rsdp_v2 = phys_bytes(rsdp_addr, RSDP_V2_LEN)?;
-    let length = le_u32(&rsdp_v2[20..24]) as usize;
-    if !(RSDP_V2_LEN..=MAX_RSDP_BYTES).contains(&length) {
-        return None;
-    }
-    let rsdp_full = phys_bytes(rsdp_addr, length)?;
-    if !checksum_ok(rsdp_full) {
+    // The extended checksum covers `length` bytes, and `length` may not claim
+    // more than the loader actually handed over.
+    let length = le_u32(&rsdp[20..24]) as usize;
+    if !(RSDP_V2_LEN..=rsdp.len()).contains(&length) || !checksum_ok(&rsdp[..length]) {
         return None;
     }
 
-    let xsdt_addr = le_u64(&rsdp_full[24..32]);
+    let xsdt_addr = le_u64(&rsdp[24..32]);
     if xsdt_addr != 0 {
         Some((xsdt_addr, 8))
     } else if rsdt_addr != 0 {

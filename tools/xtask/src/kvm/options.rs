@@ -200,6 +200,22 @@ where
     if options.build_image {
         crate::build::build(config, false)?;
     }
+    // Seal once, here, before any boot and before the repeat loop.
+    //
+    // A multi-vCPU boot validates the formal profile at spawn time, and an
+    // unsealed profile fails with `formal verification run binding mismatch` -
+    // which reads exactly like a boot failure and is not one. Every working
+    // tree is unsealed the moment it is edited, so refusing here just asks the
+    // caller to run a command this process can run itself. `--repeat` made it
+    // worse: it burned every run in the batch on the same stale seal.
+    if options.rustos_vcpus > 1 && options.auto_verify {
+        let profile = if options.smp_iteration {
+            "smp-iteration"
+        } else {
+            "pr"
+        };
+        crate::formal_contracts::ensure_smp_launch_evidence(&config.root_dir, profile)?;
+    }
     if options.repeat == 1 {
         return run_one_smoke(config, &options, runtime_trace_deadlines);
     }
@@ -503,6 +519,9 @@ pub(crate) fn kvm_run_command(
         repeat: 1,
         // The interactive path owns its own `--build-image` flag above.
         build_image: false,
+        // The interactive path seals through its own `auto_verify` argument
+        // below, so the shared smoke entry must not seal a second time.
+        auto_verify: false,
         expected_markers: vec![
             RUSTOS_GPU_ACTIVE_MARKER.to_owned(),
             RUSTOS_DVM_BLOCK_MARKER.to_owned(),

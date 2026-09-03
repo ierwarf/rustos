@@ -75,10 +75,13 @@ pub mod paging {
 pub mod frame_capability {
     pub use crate::memory::frame_capability::{
         FrameGrantBinding, FrameGrantError, MAX_PAGER_FRAME_GRANTS,
-        MAX_PREALLOCATED_PAGER_FAULT_FRAMES, allocate_zeroed_frame_grant, cancel_frame_grant,
-        pager_fault_reserve_depth, pager_fault_reserve_exhaustions,
-        pager_fault_reserve_low_watermark, preallocate_pager_fault_frames,
-        replenish_pager_fault_frames, reserve_preallocated_zeroed_frame_grant, take_frame_grant,
+        MAX_PREALLOCATED_PAGER_FAULT_FRAMES, allocate_zeroed_frame, allocate_zeroed_frame_grant,
+        cancel_frame_grant, pager_fault_frame_refill_requested, pager_fault_reserve_depth,
+        pager_fault_reserve_exhaustions, pager_fault_reserve_low_watermark,
+        preallocate_pager_fault_frames,
+        replenish_pager_fault_frames, reserve_preallocated_zeroed_frame_grant,
+        return_pager_fault_frame, service_pager_fault_frame_refill, take_frame_grant,
+        take_pager_fault_frame,
     };
 }
 

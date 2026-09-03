@@ -45,9 +45,10 @@ set settles. The printed plan is not validation evidence.
 
 ## Stop rules
 
-- `session-handoff.md` is pruned to ~90 lines: `## Current checkout snapshot`
-  is the only current-state section resume tasks need. A closed item's
-  debugging narrative belongs in git history, not this file.
+- `session-handoff.md` carries current state and open work only, in about 130
+  lines. `## Current checkout snapshot` is the only current-state section
+  resume tasks need. A closed item's debugging narrative belongs in git
+  history, not this file — it had drifted to 515 lines of them once.
 - `contracts-abi.md` is organized by owner surface (`## VFS Surface`, `##
   Storage Surface`, `## Input Surface`, ...). Search for the `##` heading
   matching the task's owning service instead of reading the file from the top.

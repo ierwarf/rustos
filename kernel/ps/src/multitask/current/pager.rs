@@ -115,6 +115,29 @@ pub fn current_pager_vma_snapshot(
     })
 }
 
+/// Acquires an exact current-task publication permit for the one IRQ-off leaf
+/// CAS that resolves an anonymous first-touch fault.  The permit proves that a
+/// concurrent VMA writer has either not started, or will wait for this CAS to
+/// finish after withdrawing the publication.
+pub fn current_pager_fault_install_permit(
+    request: rustos_user_abi::pager::PagerFaultRequestWire,
+) -> Result<
+    (
+        crate::multitask::pager_vma::PagerFaultInstallPermit,
+        rustos_user_abi::pager::PagerVmRegionWire,
+    ),
+    crate::multitask::pager_vma::PagerVmaError,
+> {
+    interrupts::without_interrupts(|| {
+        let (task_id, handle, process) = published_current_pager_binding()
+            .ok_or(crate::multitask::pager_vma::PagerVmaError::Stale)?;
+        if request.task_id != task_id {
+            return Err(crate::multitask::pager_vma::PagerVmaError::Stale);
+        }
+        crate::multitask::pager_vma::acquire_fault_install(handle, process, request)
+    })
+}
+
 /// Revoke the exact current-process VMA generation before removing PTEs.
 pub fn revoke_current_pager_vma(
     start: u64,

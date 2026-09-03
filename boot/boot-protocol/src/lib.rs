@@ -3,7 +3,10 @@
 use core::mem::{align_of, size_of};
 
 pub const BOOT_INFO_MAGIC: u64 = 0x5255_5354_4F53_4749; // "RUSTOSGI"
-pub const BOOT_INFO_VERSION: u32 = 18;
+pub const BOOT_INFO_VERSION: u32 = 19;
+
+/// Bytes of the largest RSDP this protocol carries (ACPI 2.0+).
+pub const ACPI_RSDP_MAX_BYTES: usize = 36;
 pub const MAX_BOOT_MEMORY_REGIONS: u32 = 4096;
 pub const MAX_BOOT_FRAMEBUFFER_WIDTH: u32 = 7680;
 pub const MAX_BOOT_FRAMEBUFFER_HEIGHT: u32 = 4320;
@@ -546,7 +549,26 @@ pub struct BootInfo {
     pub version: u32,
     pub _reserved0: u32,
     pub rng_seed: [u8; 32],
+    /// Address the loader placed its RSDP copy at. **Diagnostics only.**
+    ///
+    /// The loader's information structure is not withheld from the physical
+    /// allocator, so this address stops being an RSDP as soon as anything
+    /// allocates. Read [`BootInfo::acpi_rsdp`] instead; this field exists only
+    /// so a failure can report where the bytes came from.
     pub acpi_rsdp_addr: u64,
+    /// The RSDP itself, copied out of the loader structure at parse time.
+    ///
+    /// Every other field here is copied by value for exactly this reason. The
+    /// RSDP was the one exception, and by the time ACPI initialization ran -
+    /// after heap, framebuffer, and block-device setup - the bytes at
+    /// `acpi_rsdp_addr` were zeros. No ACPI table was reachable, so the kernel
+    /// found no HPET, could not calibrate the TSC on a CPU whose CPUID reports
+    /// no frequency, and panicked with `no validated monotonic clocksource`.
+    /// A 36-byte copy costs nothing and removes the lifetime entirely.
+    pub acpi_rsdp: [u8; ACPI_RSDP_MAX_BYTES],
+    /// `20` for an ACPI 1.0 RSDP, `36` for 2.0+, `0` when the loader gave none.
+    pub acpi_rsdp_len: u32,
+    pub _reserved_acpi: u32,
     pub boot_volume: BootVolumeIdentity,
     pub framebuffer: FramebufferInfo,
     pub nucleus_image: NucleusImageInfo,
@@ -681,6 +703,9 @@ mod tests {
             _reserved0: 0,
             rng_seed: [0x5a; 32],
             acpi_rsdp_addr: 0,
+            acpi_rsdp: [0; ACPI_RSDP_MAX_BYTES],
+            acpi_rsdp_len: 0,
+            _reserved_acpi: 0,
             boot_volume: BootVolumeIdentity {
                 fat_volume_id: 0x1234_5678,
                 _reserved0: BootVolumeTransport::Ahci as u32,

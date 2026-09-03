@@ -83,6 +83,8 @@ options:
                        archived debugcon log. A defect that appears in one boot
                        of six is a rate, and a single run cannot measure it
   --no-build           boot the image already on disk instead of refreshing it.
+  --no-auto-verify     refuse a multi-vCPU boot whose formal profile is unsealed
+                       instead of sealing it first.
                        This lane rebuilds by default: a stale image silently
                        answers questions about code that is no longer in the tree
   --dry-run            validate inputs and prepare KVM log paths without launching QEMU

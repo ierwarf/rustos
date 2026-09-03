@@ -268,6 +268,14 @@ impl PagerState {
         Ok(self.epoch)
     }
 
+    /// Resolves one zero-fill dispatch received through the fixed rendezvous.
+    ///
+    /// Ring0 answers anonymous first touch itself, so no live dispatch reaches
+    /// this today (see `docs/ai/pager-protocol-contract.md` §0). It stays as
+    /// the worked reference for the rendezvous reply - token freshness, region
+    /// matching, the deny classes, and the run-length answer - which the page
+    /// cache's pager-backed resolution is built on top of, and which the tests
+    /// below exercise directly.
     pub fn resolve_anonymous_first_touch(
         &mut self,
         dispatch: PagerFaultDispatchWire,
@@ -306,6 +314,13 @@ impl PagerState {
         reply.action = PAGER_ACTION_MAP_ZEROED;
         reply.frame_rights = region.prot;
         reply.frame_capability = dispatch.zeroed_frame_capability;
+        // Fault-around policy. Ring0 offers what the VMA and its reserve can
+        // support; this decides how much of that to take. Anonymous first
+        // touch is overwhelmingly sequential, so taking the whole offer
+        // amortizes one rendezvous round trip over the run. Every page past
+        // the first is best effort in ring0, so asking for more can cost
+        // throughput but never correctness.
+        reply.map_run_pages = u64::from(dispatch.map_run_pages_offered);
         if !reply.is_canonical_zeroed_for(dispatch) {
             return Err(PagerFaultError::Malformed);
         }
@@ -399,6 +414,9 @@ fn reply_envelope(request: PagerFaultRequestWire) -> PagerFaultReplyWire {
         mm_generation: request.mm_generation,
         vma_generation: request.vma_generation,
         pager_epoch: request.object.pager_epoch,
+        // A denial maps nothing, but the wire still has to be canonical, and
+        // one is the only length that is always valid.
+        map_run_pages: 1,
         ..PagerFaultReplyWire::default()
     }
 }
@@ -510,6 +528,7 @@ mod tests {
             request,
             zeroed_frame_capability,
             granted_frame_rights,
+            map_run_pages_offered: 1,
             ..PagerFaultDispatchWire::default()
         }
     }
@@ -983,6 +1002,51 @@ mod tests {
         );
         let (spans, len) = spans(&pager);
         assert_eq!(&spans[..len], &[(region.start, region.end)]);
+    }
+
+    /// Fault-around policy: take the whole run ring0 offers, and never more.
+    ///
+    /// Ring0 has already clipped the offer to the VMA's own extent and to
+    /// `PAGER_FAULT_RUN_PAGES_MAX`, so exceeding it would be asking ring0 to
+    /// map outside the authority this fault carries. Asking for less would
+    /// leave the round trip unamortized for no gain: anonymous first touch is
+    /// overwhelmingly sequential.
+    #[test]
+    fn fault_around_takes_the_offered_run_and_never_exceeds_it() {
+        let mut pager = PagerState::new(2);
+        let region = PagerVmRegionWire {
+            start: 0x10_000,
+            end: 0x20_000,
+            ..region(2)
+        };
+        pager.admit_region(region).unwrap();
+        for (offered, slot) in [(1_u32, 1_u64), (4, 2), (16, 3)] {
+            let mut fault = dispatch(at(region, region.start, token(slot, 200)), 53, region.prot);
+            fault.map_run_pages_offered = offered;
+            let reply = pager.resolve_anonymous_first_touch(fault).unwrap();
+            assert_eq!(reply.action, PAGER_ACTION_MAP_ZEROED);
+            assert_eq!(reply.map_run_pages, u64::from(offered));
+            assert!(reply.map_run_pages <= u64::from(fault.map_run_pages_offered));
+            assert!(reply.is_canonical_zeroed_for(fault));
+        }
+    }
+
+    /// A denial still has to be a canonical wire, and it maps nothing.
+    #[test]
+    fn a_denied_fault_carries_a_canonical_run_length() {
+        let mut pager = PagerState::new(2);
+        let region = region(2);
+        pager.admit_region(region).unwrap();
+        let protection = PagerFaultRequestWire {
+            fault_flags: VM_FAULT_PROTECTION,
+            ..request(region, token(7, 211))
+        };
+        let reply = pager
+            .resolve_anonymous_first_touch(dispatch(protection, 97, region.prot))
+            .unwrap();
+        assert_eq!(reply.action, PAGER_ACTION_DENY);
+        assert_eq!(reply.map_run_pages, 1);
+        assert!(reply.is_canonical_for(protection));
     }
 
     /// Sustained partial unmaps must not leak slots. Each cycle splits and

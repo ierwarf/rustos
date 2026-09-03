@@ -264,9 +264,42 @@ pub unsafe fn initialize_kernel(boot_info_ptr: *const BootInfo) {
     announce_ready("ACPI", b"ACPI initialized.\r\n");
 
     let clocksource = hal_api::init_clocksource().unwrap_or_else(|| {
+        // Name the reason, not the absent value. `acpi_hpet=None` was true of
+        // four different causes - no RSDP, an unreadable root table, firmware
+        // that emits no HPET, and an HPET this parser rejected - and told a
+        // reader nothing about which. It cost a full session to distinguish
+        // them, on a machine where the answer is one line of firmware state.
+        let acpi = hal_api::arch::acpi::discovery();
+        let tsc = hal_api::arch::clock::tsc_admission_facts();
         panic!(
-            "no validated monotonic clocksource (invariant TSC or 64-bit HPET); acpi_hpet={:?}",
-            hal_api::arch::acpi::hpet_address(),
+            "no validated monotonic clocksource; \
+             rsdp={:#x} sig={} sum={} rev={} rsdt={:#x} xsdt={:#x} root_hdr={} \
+             acpi_rsdp={} root={} entries={} readable={} null={} hpet={} \
+             tsc_invariant={} tsc_cpuid_hz={:?} tsc_calibrated_hz={:?}",
+            acpi.rsdp_addr,
+            acpi.rsdp_signature_ok,
+            acpi.rsdp_checksum_ok,
+            acpi.rsdp_revision,
+            acpi.rsdt_addr,
+            acpi.xsdt_addr,
+            acpi.root_header_readable,
+            acpi.rsdp_present,
+            match acpi.root_entry_size {
+                4 => "RSDT",
+                8 => "XSDT",
+                _ => "none",
+            },
+            acpi.root_entries,
+            acpi.tables_readable,
+            acpi.null_entries,
+            match (acpi.hpet_present, acpi.hpet_admitted) {
+                (false, _) => "absent",
+                (true, false) => "rejected",
+                (true, true) => "admitted",
+            },
+            tsc.invariant_supported,
+            tsc.cpuid_frequency_hz,
+            tsc.calibrated_frequency_hz,
         )
     });
     boot_log!(
@@ -694,6 +727,11 @@ pub fn finalize_kernel_initialization() {
     flow_info(21, "kernel finalize: housekeeping task started");
     boot_log!(debug::LogLevel::Info, 135, 0, "housekeeping task started");
 
+    let pager_refill_thread = ps_api::Thread::new(tasks::nucleus_pager_fault_refill_task, 50);
+    pager_refill_thread.start();
+    flow_info(211, "kernel finalize: pager fault refill task started");
+    boot_log!(debug::LogLevel::Info, 137, 0, "pager fault refill task started");
+
     let init_thread = ps_api::Thread::new(tasks::init_bootstrap_task, 90);
     init_thread.start();
     flow_info(22, "kernel finalize: init bootstrap task started");
@@ -807,9 +845,6 @@ pub fn housekeeping_once() -> usize {
     );
     work += ps_api::service_deferred_work();
     work += compat_api::pager::service_deferred_work();
-    // Refill only from normal housekeeping after completed replies consume
-    // wired frames; exception entry remains allocator-free and bounded.
-    work += mm_api::frame_capability::replenish_pager_fault_frames(4);
     work += compat_api::syscall::service_deferred_transfer_releases();
     // Shared display mappings may own large contiguous frame sets. Reclaim a
     // bounded page quantum outside process/handle locks so close, exec, and

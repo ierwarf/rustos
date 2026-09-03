@@ -72,6 +72,40 @@ shuttle_test = "ipc_reply_timeout_and_revoke_have_one_terminal_owner"
 herd_not_applicable = "the property is a lock-protected terminal-state race; a register-level litmus would omit call identity and cancellation ownership"
 
 [[scenario]]
+id = "pager-fault-frame-reserve"
+severity = "high"
+flow = "pager-frame-grant-lifecycle"
+model = "pager-frame-grant-lifecycle/PagerFrameGrantLifecycle"
+source = "kernel/mm/src/memory/frame_capability.rs"
+source_symbol = "reserve"
+source_anchors = [
+  "|available| available.checked_sub(1),",
+  "let frame_phys = self.frames[index].swap(0, Ordering::AcqRel);",
+]
+invariant = "the availability count authorizes exactly one claimer per frame and a granted claim always finds one"
+loom_test = "two_claimers_never_receive_the_same_reserve_frame"
+shuttle_test = "fault_reserve_claims_are_exclusive_and_never_promise_a_missing_frame"
+herd_not_applicable = "the decisive edge is a single-location locked read-modify-write; x86 guarantees its atomicity by construction, so a litmus has no forbidden interleaving to exhibit and would model the array scan rather than the claim"
+
+[[scenario]]
+id = "pager-fault-install-permit"
+severity = "critical"
+flow = "pager-vma-publication"
+model = "pager-vma-publication/PagerVmaPublication"
+source = "kernel/ps/src/multitask/pager_vma.rs"
+source_symbol = "publish"
+source_anchors = [
+  "self.sequence.store(before + 1, Ordering::Release);",
+  "core::sync::atomic::fence(Ordering::SeqCst);",
+]
+invariant = "a withdrawing VMA writer never owns a prepared leaf an exception-time installer still holds a permit for"
+loom_test = "a_withdrawing_writer_never_owns_a_leaf_an_installer_still_holds"
+shuttle_test = "pager_vma_withdrawal_never_overlaps_a_held_fault_install_permit"
+herd_test = "formal/litmus/x86_64/pager_fault_install_permit.litmus"
+herd_mutant = "formal/litmus/x86_64/pager_fault_install_permit.mutant.litmus"
+herd_cat = "x86tso-mixed.cat"
+
+[[scenario]]
 id = "reschedule-ipi"
 severity = "critical"
 flow = "smp-reschedule-ipi-lifecycle"

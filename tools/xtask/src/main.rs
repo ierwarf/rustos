@@ -12,6 +12,7 @@ mod stage;
 mod storage_epoch;
 mod testinfra;
 mod util;
+mod verify;
 
 type Result<T> = anyhow::Result<T>;
 

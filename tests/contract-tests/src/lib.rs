@@ -1,7 +1,8 @@
 #[cfg(test)]
 mod tests {
     use boot_protocol::{
-        BOOT_INFO_MAGIC, BOOT_INFO_VERSION, BootInfo, BootMemoryKind, BootMemoryMap,
+        ACPI_RSDP_MAX_BYTES, BOOT_INFO_MAGIC, BOOT_INFO_VERSION, BootInfo, BootMemoryKind,
+        BootMemoryMap,
         BootMemoryRegion, BootPixelFormat, BootVolumeIdentity, EarlySystemImage, FramebufferInfo,
         NucleusImageInfo,
     };
@@ -69,6 +70,9 @@ mod tests {
             _reserved0: 0,
             rng_seed: [0x5a; 32],
             acpi_rsdp_addr: 0,
+            acpi_rsdp: [0; ACPI_RSDP_MAX_BYTES],
+            acpi_rsdp_len: 0,
+            _reserved_acpi: 0,
             boot_volume: BootVolumeIdentity::empty(),
             framebuffer: FramebufferInfo {
                 addr: 0x8000,

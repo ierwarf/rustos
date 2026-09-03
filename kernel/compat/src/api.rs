@@ -79,4 +79,22 @@ pub mod pager {
     pub fn service_deferred_work() -> usize {
         crate::pager::service_deferred_work()
     }
+
+    pub use crate::pager::AnonymousFaultOutcome;
+
+    /// Publishes one census of the ring0 anonymous fault path. See
+    /// `crate::pager::record_anonymous_fault_census`.
+    pub fn record_anonymous_fault_census() {
+        crate::pager::record_anonymous_fault_census();
+    }
+
+    /// Serves one anonymous first-touch fault in the faulting task's own
+    /// context, with no pager round trip. See
+    /// `crate::pager::serve_anonymous_first_touch`.
+    pub fn serve_anonymous_first_touch(
+        request: rustos_user_abi::pager::PagerFaultRequestWire,
+        prot: u32,
+    ) -> AnonymousFaultOutcome {
+        crate::pager::serve_anonymous_first_touch(request, prot)
+    }
 }

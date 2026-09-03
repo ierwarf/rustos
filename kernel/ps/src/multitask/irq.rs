@@ -148,6 +148,24 @@ fn retain_periodic_continuation(logical_index: usize, context_ptr: *const SavedC
     let deferred_reschedule_pending = super::reschedule_observation::request_pending(logical_index);
     let user_return_reschedule_pending =
         user_return_reschedule_flag(logical_index).load(Ordering::Acquire) != 0;
+    // An IRQ-off anonymous fault only raises this lock-free low-water bit.  A
+    // timer that interrupted a complete user frame is the first legal place to
+    // schedule the dedicated normal-context reserve producer; the fault PTE
+    // was already installed and is never deferred to that producer.
+    //
+    // The user-frame condition is load-bearing, not descriptive. An
+    // interrupted *kernel* frame has its own retention rule below
+    // (`periodic_idle_continuation_is_local`), which exists because only the
+    // idle task may be displaced that way; overriding it here would hand the
+    // scheduler a kernel continuation it never agreed to give up. Fairness
+    // accounting is reset on the way out for the same reason the non-fair
+    // branch resets it: this tick did not spend the user slice it measures.
+    if interrupted_user_frame
+        && kernel_mm::api::frame_capability::pager_fault_frame_refill_requested()
+    {
+        PERIODIC_FAIRNESS_TICKS[logical_index].store(0, Ordering::Relaxed);
+        return false;
+    }
     let fair_dispatch_due = if local_work_pending
         && !deferred_reschedule_pending
         && !user_return_reschedule_pending

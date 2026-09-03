@@ -4,7 +4,7 @@
 mod tests {
     use std::collections::VecDeque;
 
-    use loom::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use loom::sync::atomic::{AtomicBool, AtomicUsize, Ordering, fence};
     use loom::sync::{Arc, Mutex};
     use loom::thread;
 
@@ -1273,4 +1273,5 @@ mod tests {
     }
 
     include!("smp_qualification_tests.rs");
+    include!("pager_fault_tests.rs");
 }

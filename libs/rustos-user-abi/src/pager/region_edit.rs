@@ -472,7 +472,20 @@ pub const fn pager_pressure_name(code: u16) -> &'static str {
 /// refuse at, which surfaces as an unexplained SIGSEGV rather than a counted
 /// refusal. With this relation the reserve can only run dry after fault-slot
 /// admission has already refused, and that refusal is counted.
-pub const PAGER_WIRED_FAULT_FRAMES: usize = PAGER_MAX_FAULT_SLOTS;
+/// Sized to absorb a burst between producer turns, not to the fault-slot
+/// table.
+///
+/// The slot-table relation below is a floor, and it was also the whole size
+/// while a reserve frame was held only across one pager round trip - at most
+/// one per fault slot. Ring0 now serves anonymous faults itself, so this pool
+/// is the supply for *every* anonymous page, drawn from with interrupts
+/// disabled and refilled by a scheduled producer. Its size is therefore the
+/// burst it must cover between two producer turns. Measured, a boot demand
+/// pages roughly fourteen thousand pages in its first two seconds; at 128
+/// frames that missed into the physical allocator on 40% of faults, and those
+/// allocations happen in the fault handler with interrupts disabled, which is
+/// where the tail came from. 8 MiB of wired frames removes the miss.
+pub const PAGER_WIRED_FAULT_FRAMES: usize = 2048;
 /// Opaque frame grants a boot must be able to publish at once.
 pub const PAGER_MAX_FRAME_GRANTS: usize = PAGER_MAX_FAULT_SLOTS;
 

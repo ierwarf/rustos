@@ -7,9 +7,9 @@ use core::mem::size_of;
 use core::ptr;
 
 use boot_protocol::{
-    BOOT_INFO_MAGIC, BOOT_INFO_VERSION, BootInfo, BootMemoryKind, BootMemoryMap, BootMemoryRegion,
-    BootPixelFormat, BootVolumeIdentity, EarlySystemImage, FramebufferInfo, NucleusImageInfo,
-    rng_seed_usable,
+    ACPI_RSDP_MAX_BYTES, BOOT_INFO_MAGIC, BOOT_INFO_VERSION, BootInfo, BootMemoryKind,
+    BootMemoryMap, BootMemoryRegion, BootPixelFormat, BootVolumeIdentity, EarlySystemImage,
+    FramebufferInfo, NucleusImageInfo, rng_seed_usable,
 };
 
 const MULTIBOOT2_BOOTLOADER_MAGIC: u32 = 0x36d7_6289;
@@ -111,12 +111,16 @@ pub fn build_boot_info(magic: u32, mbi_addr: u32) -> *const BootInfo {
     let Some(rng_seed) = hardware_rng_seed() else {
         fatal();
     };
+    let (acpi_rsdp, acpi_rsdp_len) = tags.acpi_rsdp_bytes();
     let boot_info = BootInfo {
         magic: BOOT_INFO_MAGIC,
         version: BOOT_INFO_VERSION,
         _reserved0: 0,
         rng_seed,
         acpi_rsdp_addr: tags.acpi_rsdp_addr().unwrap_or(0),
+        acpi_rsdp: acpi_rsdp,
+        acpi_rsdp_len,
+        _reserved_acpi: 0,
         boot_volume: BootVolumeIdentity::empty(),
         framebuffer,
         nucleus_image: NucleusImageInfo {
@@ -328,6 +332,33 @@ impl Tags {
             .map(|tag| unsafe { (tag as *const RawTag).cast::<u8>().add(8) as u64 })
     }
 
+    /// Copies the loader's RSDP out of its information structure.
+    ///
+    /// Returning the address instead was the defect: nothing withholds the
+    /// loader structure from the physical allocator, so the bytes are gone by
+    /// the time ACPI initialization dereferences them. Every other field this
+    /// parser produces is already copied by value.
+    fn acpi_rsdp_bytes(&self) -> ([u8; ACPI_RSDP_MAX_BYTES], u32) {
+        let mut bytes = [0_u8; ACPI_RSDP_MAX_BYTES];
+        let Some(tag) = self
+            .find_tag(TAG_ACPI_NEW)
+            .or_else(|| self.find_tag(TAG_ACPI_OLD))
+        else {
+            return (bytes, 0);
+        };
+        // The RSDP follows the 8-byte tag header, and `find_tag` has already
+        // bounded `size` inside the information structure.
+        let available = (tag.size as usize).saturating_sub(size_of::<RawTag>());
+        let len = available.min(ACPI_RSDP_MAX_BYTES);
+        // SAFETY: `find_tag` admitted this tag with `cursor + size <= end`, so
+        // `len` bytes after the header are inside the loader structure, which
+        // is still intact at parse time - this runs before any allocation.
+        let payload =
+            unsafe { core::slice::from_raw_parts((tag as *const RawTag).cast::<u8>().add(8), len) };
+        bytes[..len].copy_from_slice(payload);
+        (bytes, len as u32)
+    }
+
     fn load_base_addr(&self) -> Option<u32> {
         let tag = self.find_tag(TAG_LOAD_BASE_ADDR)?;
         if tag.size as usize >= size_of::<RawLoadBaseTag>() {
@@ -477,6 +508,9 @@ const fn empty_boot_info() -> BootInfo {
         _reserved0: 0,
         rng_seed: [0; 32],
         acpi_rsdp_addr: 0,
+        acpi_rsdp: [0; ACPI_RSDP_MAX_BYTES],
+        acpi_rsdp_len: 0,
+        _reserved_acpi: 0,
         boot_volume: BootVolumeIdentity::empty(),
         framebuffer: FramebufferInfo::empty(),
         nucleus_image: NucleusImageInfo::empty(),

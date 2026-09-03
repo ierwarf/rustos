@@ -158,12 +158,39 @@ fn broker_map_anon(args: &RustosMmBrokerArgs) -> Result<(), i64> {
     // eager path below, exactly as it did before demand paging existed.
     let target_is_pager = ipc_ops::process_owns_pager_policy(args.target_pid);
     if PAGER_DEMAND_ADMISSION_WIRED && !target_is_pager && args.prot != 0 {
-        match pager_admission::admit_anonymous_region(
-            args.target_pid,
-            start,
-            mapping_end,
-            args.prot,
+        let mut admission =
+            pager_admission::admit_anonymous_region(args.target_pid, start, mapping_end, args.prot);
+        // `MAP_FIXED` replacement.
+        //
+        // An overlap here is usually not stale residue, it is `mmap` being
+        // asked to *replace* a range that is already mapped, which Linux
+        // performs as an implicit unmap of the target range. `ld.so` does
+        // exactly this for every shared library: it reserves the whole library
+        // span, then maps the zero-fill BSS `MAP_FIXED` inside it. Falling
+        // through to the eager path instead left the previous mapping's pages
+        // in place, so `map_zeroed_user_pages_at` refused the range and the
+        // loader reported `libc.so.6: cannot map zero-fill pages` - an ENOMEM
+        // raised with 1.59 GiB free.
+        //
+        // Tear the range down and admit once more. The retry is bounded to one
+        // attempt: if the range still overlaps after an explicit removal, the
+        // publication really is residue and the eager fallback below is the
+        // right answer.
+        if matches!(
+            admission,
+            pager_admission::AnonymousAdmission::Eager(
+                pager_admission::EagerByContract::StaleRegionOverlap
+            )
         ) {
+            let _ = multitask::unmap_pager_vma_for_process(args.target_pid, start, mapping_end);
+            admission = pager_admission::admit_anonymous_region(
+                args.target_pid,
+                start,
+                mapping_end,
+                args.prot,
+            );
+        }
+        match admission {
             pager_admission::AnonymousAdmission::Demand => {
                 let Some(result) =
                     multitask::with_process_state_by_pid_mut(args.target_pid, |process_state| {
@@ -394,48 +421,32 @@ fn broker_protect(args: &RustosMmBrokerArgs) -> Result<(), i64> {
     let page_flags = protection_to_page_flags(args.prot)?;
     let pager_prot = pager_admission::pager_protection(args.prot).ok_or(LINUX_EINVAL)?;
 
-    match multitask::protect_pager_vma_for_process(
-        args.target_pid,
-        start,
-        end,
-        pager_prot,
-        page_flags,
-    ) {
-        Ok(Some((process_handle, process_generation))) => {
-            // Ring0 has narrowed the range. pagerd decides a fault's granted
-            // rights from the protection *it* holds, so a narrowing it never
-            // hears about would let it keep granting the old rights for pages
-            // this process may no longer touch that way.
-            //
-            // The protection change has already been applied, so a failed
-            // notification must not fail `mprotect`; it is parked for
-            // reconciliation and re-sent from the next admission, exactly like
-            // a release.
-            if pager_prot != 0 {
-                let _ = pager_admission::protect_anonymous_region(
-                    process_handle,
-                    process_generation,
-                    start,
-                    end,
-                    pager_prot,
-                );
-            } else {
-                // `PROT_NONE` leaves ring0 a deny-all VMA whose lookup refuses
-                // every access before a fault can be dispatched, and a region
-                // with no rights is not a canonical wire region. The pager's
-                // outcome is therefore identical to a release of that span.
-                let _ = pager_admission::release_anonymous_region(
-                    process_handle,
-                    process_generation,
-                    start,
-                    end,
-                );
-            }
-            return Ok(());
-        }
+    match retry_transient_range_edit("mprotect", || {
+        multitask::protect_pager_vma_for_process(args.target_pid, start, end, pager_prot, page_flags)
+    }) {
+        // Ring0 holds the only map of an anonymous range and has already
+        // rewritten it under the exact process-state lock, publishing new VMA
+        // generations for every surviving fragment. There is no second replica
+        // to notify and therefore nothing that can disagree with it: the whole
+        // class of "the pager kept granting the old rights" defects is gone
+        // with the second copy, not merely reconciled faster.
+        Ok(Some(_)) => return Ok(()),
         Ok(None) => {}
         Err(multitask::PagerVmaError::Denied) => return Err(LINUX_EACCES),
-        Err(multitask::PagerVmaError::Pressure) => return Err(LINUX_ENOMEM),
+        // The per-process VMA table cannot hold this edit's fragments. This is
+        // a declared ring0 bound, not a memory shortage, and `ENOMEM` is the
+        // closest errno `mprotect` is allowed to return for it - so name it in
+        // the log, because "out of memory" with gigabytes free sends the next
+        // investigation to the wrong subsystem every time.
+        Err(multitask::PagerVmaError::Pressure) => {
+            nucleus_core::debug::record_milestone(
+                nucleus_core::debug::LogCategory::Compat,
+                "pager-protect-vma-capacity",
+                start,
+                end,
+            );
+            return Err(LINUX_ENOMEM);
+        }
         Err(multitask::PagerVmaError::Malformed) => return Err(LINUX_EINVAL),
         Err(_) => return Err(LINUX_EFAULT),
     }
@@ -451,32 +462,54 @@ fn broker_protect(args: &RustosMmBrokerArgs) -> Result<(), i64> {
     result
 }
 
+/// Retries one pager range edit while it reports transient contention.
+///
+/// `PagerVmaError::Unstable` means a writer held the publication, or an
+/// exception-time installer had not yet dropped its permit - both bounded,
+/// both about *this instant*. Reporting it to userspace as a hard error is the
+/// mistake this whole class keeps making: `EFAULT` names a bad address, and
+/// the address is fine. `mprotect` and `munmap` run in ordinary syscall
+/// context, so a retry here is free and is what the condition actually calls
+/// for. Exhausting the retries is a real anomaly, so it is counted and named
+/// rather than folded into an ordinary errno.
+fn retry_transient_range_edit<T>(
+    operation: &'static str,
+    mut edit: impl FnMut() -> Result<T, multitask::PagerVmaError>,
+) -> Result<T, multitask::PagerVmaError> {
+    const TRANSIENT_RANGE_EDIT_ATTEMPTS: usize = 8;
+    let mut last = multitask::PagerVmaError::Unstable;
+    for _ in 0..TRANSIENT_RANGE_EDIT_ATTEMPTS {
+        match edit() {
+            Err(multitask::PagerVmaError::Unstable) => {
+                last = multitask::PagerVmaError::Unstable;
+                core::hint::spin_loop();
+            }
+            other => return other,
+        }
+    }
+    nucleus_core::debug::record_milestone(
+        nucleus_core::debug::LogCategory::Compat,
+        "pager-range-edit-contended-out",
+        TRANSIENT_RANGE_EDIT_ATTEMPTS as u64,
+        operation.len() as u64,
+    );
+    Err(last)
+}
+
 fn broker_unmap(args: &RustosMmBrokerArgs) -> Result<(), i64> {
     let len = checked_len(args.len)?;
     let start = checked_page_addr(args.addr)?;
     let end = start.checked_add(args.len).ok_or(LINUX_EINVAL)?;
     let pager_end = checked_mapping_end(start, page_count(len)?)?;
-    match multitask::unmap_pager_vma_for_process(args.target_pid, start, pager_end) {
-        Ok(Some((process_handle, process_generation))) => {
-            // Ring0 freed its VMA slot; pagerd must drop the matching region or
-            // it would refuse to re-admit this range as an overlap and would
-            // eventually exhaust its table, silently disabling demand paging.
-            //
-            // The unmap itself has already succeeded and the range is gone
-            // from the address space, so a failed notification must not fail
-            // `munmap` - that would report a mapping the process can no longer
-            // touch as still mapped. The release is parked for reconciliation
-            // and re-sent from the next admission, and a queue overflow is
-            // published as `pager-release-queue-overflow` rather than being
-            // absorbed here.
-            let _ = pager_admission::release_anonymous_region(
-                process_handle,
-                process_generation,
-                start,
-                pager_end,
-            );
-            return Ok(());
-        }
+    match retry_transient_range_edit("munmap", || {
+        multitask::unmap_pager_vma_for_process(args.target_pid, start, pager_end)
+    }) {
+        // Ring0 freed its own VMA slot and that is the entire release. There is
+        // no pager region to drop, so `munmap` no longer makes a synchronous
+        // round trip to a single serial pager, and no unconfirmed release can
+        // be left behind to refuse a later mapping of the same range as an
+        // overlap.
+        Ok(Some(_)) => return Ok(()),
         Ok(None) => {}
         Err(multitask::PagerVmaError::Pressure) => return Err(LINUX_ENOMEM),
         Err(multitask::PagerVmaError::Malformed) => return Err(LINUX_EINVAL),

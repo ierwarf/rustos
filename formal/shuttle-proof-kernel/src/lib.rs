@@ -9,7 +9,7 @@
 mod tests {
     use std::collections::VecDeque;
 
-    use shuttle::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use shuttle::sync::atomic::{AtomicBool, AtomicUsize, Ordering, fence};
     use shuttle::sync::{Arc, Mutex};
     use shuttle::thread;
 
@@ -40,6 +40,136 @@ mod tests {
     /// state is intentionally checked only after all controlled tasks join;
     /// this avoids inventing a liveness failure from a schedule that simply
     /// has not run a legitimate waiter yet.
+    /// The ring0 anonymous fault path's two owners, under many schedules.
+    ///
+    /// Loom enumerates the interleavings of one installer against one writer
+    /// exhaustively. Shuttle covers what Loom's branch budget cannot: several
+    /// concurrent installers racing repeated withdrawal and republication, the
+    /// shape an 8-vCPU boot actually produces. The invariant is the same one -
+    /// a withdrawing writer never owns a prepared leaf that a permit holder
+    /// may still install into.
+    #[test]
+    fn pager_vma_withdrawal_never_overlaps_a_held_fault_install_permit() {
+        shuttle::check_pct(
+            || {
+                #[derive(Default)]
+                struct Publication {
+                    sequence: AtomicUsize,
+                    installers: AtomicUsize,
+                    writer_owns_leaf: AtomicBool,
+                }
+                let vma = Arc::new(Publication::default());
+                vma.sequence.store(2, Ordering::SeqCst);
+
+                let mut installers = Vec::new();
+                for _ in 0..3 {
+                    let vma = Arc::clone(&vma);
+                    installers.push(thread::spawn(move || {
+                        let before = vma.sequence.load(Ordering::Acquire);
+                        if before == 0 || before & 1 != 0 {
+                            return;
+                        }
+                        vma.installers.fetch_add(1, Ordering::AcqRel);
+                        fence(Ordering::SeqCst);
+                        let after = vma.sequence.load(Ordering::Acquire);
+                        if before != after {
+                            vma.installers.fetch_sub(1, Ordering::Release);
+                            return;
+                        }
+                        assert!(
+                            !vma.writer_owns_leaf.load(Ordering::Acquire),
+                            "withdrawal took the leaf while a permit was held"
+                        );
+                        vma.installers.fetch_sub(1, Ordering::Release);
+                    }));
+                }
+
+                let writer_vma = Arc::clone(&vma);
+                let writer = thread::spawn(move || {
+                    let before = writer_vma.sequence.load(Ordering::Relaxed);
+                    writer_vma.sequence.store(before + 1, Ordering::Release);
+                    fence(Ordering::SeqCst);
+                    while writer_vma.installers.load(Ordering::Acquire) != 0 {
+                        shuttle::thread::yield_now();
+                    }
+                    writer_vma.writer_owns_leaf.store(true, Ordering::Release);
+                    // Republish, exactly as a protect rewrite does.
+                    writer_vma.writer_owns_leaf.store(false, Ordering::Release);
+                    writer_vma.sequence.store(before + 2, Ordering::Release);
+                });
+
+                for installer in installers {
+                    installer.join().unwrap();
+                }
+                writer.join().unwrap();
+            },
+            iterations(),
+            pct_depth(),
+        );
+    }
+
+    /// The wired fault reserve under concurrent claimers and its producer.
+    ///
+    /// The availability count is authority: a claimer decrements before it
+    /// scans, so the array can never hand the same frame to two faults, and a
+    /// claimer that won the decrement must find one. Sweeping the array to
+    /// recompute depth - the previous shape - cannot state either property.
+    #[test]
+    fn fault_reserve_claims_are_exclusive_and_never_promise_a_missing_frame() {
+        shuttle::check_pct(
+            || {
+                const SLOTS: usize = 3;
+                struct Reserve {
+                    available: AtomicUsize,
+                    slots: Vec<AtomicUsize>,
+                }
+                let reserve = Arc::new(Reserve {
+                    available: AtomicUsize::new(SLOTS),
+                    slots: (1..=SLOTS).map(AtomicUsize::new).collect(),
+                });
+                let claimed = Arc::new(Mutex::new(Vec::new()));
+
+                let mut claimers = Vec::new();
+                for _ in 0..SLOTS + 1 {
+                    let reserve = Arc::clone(&reserve);
+                    let claimed = Arc::clone(&claimed);
+                    claimers.push(thread::spawn(move || {
+                        let granted = reserve
+                            .available
+                            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |available| {
+                                available.checked_sub(1)
+                            })
+                            .is_ok();
+                        if !granted {
+                            return;
+                        }
+                        let mut taken = 0;
+                        for slot in &reserve.slots {
+                            let frame = slot.swap(0, Ordering::AcqRel);
+                            if frame != 0 {
+                                taken = frame;
+                                break;
+                            }
+                        }
+                        assert_ne!(taken, 0, "a claim won the count but found no frame");
+                        claimed.lock().unwrap().push(taken);
+                    }));
+                }
+                for claimer in claimers {
+                    claimer.join().unwrap();
+                }
+                let mut frames = claimed.lock().unwrap().clone();
+                let handed_out = frames.len();
+                frames.sort_unstable();
+                frames.dedup();
+                assert_eq!(frames.len(), handed_out, "one frame was claimed twice");
+                assert!(handed_out <= SLOTS, "more frames were handed out than exist");
+            },
+            iterations(),
+            pct_depth(),
+        );
+    }
+
     #[test]
     fn endpoint_exit_and_publication_have_one_terminal_owner() {
         shuttle::check_pct(

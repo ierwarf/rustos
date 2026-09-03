@@ -7,6 +7,8 @@ failure output as the primary debugging context.
 
 | Command | Use | Writes | Common failure meaning |
 | --- | --- | --- | --- |
+| `cargo xtask verify` | **run the whole local pipeline as one command**: layering/manifest check, full build, host tests, formal selftest, then the `pr` seal - in that order, stopping at the first failure. Quiet on success: one line per stage with `elapsed_seconds`. A failing stage prints its own captured output and the exact command to rerun it alone | `target/`, `build/`, `build/formal/` | whichever stage failed, named in its own output |
+| `cargo xtask verify --gate [--repeat N] [--rustos-vcpus N] [--min-ui-fps N]` | the same pipeline and then the acceptance boot lane, defaulting to 4 boots at 8 vCPUs with a 60 fps floor. The seal is always the stage immediately before the boots, because a seal binds the source tree and any edit after it invalidates it | as above plus `build/kvm/` | as above, plus the per-run boot failures `kvm-smoke` names |
 | `cargo xtask dev-plan` | classify all tracked and untracked changes into fast `now` checks and one-time `stable-batch` gates | none | non-UTF-8 path or unavailable Git worktree |
 | `cargo xtask check` | validate layering/manifests/workspace | `target/` | dependency layer violation, bad manifest, missing target |
 | `cargo xtask check --timings` | run the same check and print deterministic phase timings | `target/` | same as `check`; the slow phase identifies the next optimization target |
@@ -387,6 +389,28 @@ fallback.
   scheduler, syscall, CPU-online, reschedule-IPI, TLB, robust-futex, and
   per-CPU-clockevent prerequisite is admitted. This option selects a test
   topology; it is not release evidence without the matching bounded run.
+- `--repeat <1..=64>` boots the same topology repeatedly, prints each run's
+  outcome, and names every failed run's panic line and archived debugcon log.
+  A defect that appears in one boot of six is a *rate*, and one run cannot
+  measure it. Repeating the lane in a shell loop instead loses each failing
+  run's debugcon log to the next run's truncation, which is exactly the
+  evidence a rare defect leaves behind.
+- **A multi-vCPU run seals its own formal profile.** The seal binds the source
+  tree hash, so every edit invalidates it, and an unsealed profile used to fail
+  every run with `formal verification run binding mismatch` - which reads
+  exactly like a boot failure and is not one. `kvm-smoke` now runs the
+  profile's own verification command first, once, before the repeat loop, the
+  same way `kvm-run` already did. `--no-auto-verify` restores the refusal for a
+  lane that wants to prove the tree was already sealed. What still holds: do
+  not edit tracked files *while* a boot lane runs, because the seal it took is
+  then behind the tree.
+- `kvm-smoke` refreshes the boot image itself before copying the disk. A no-op
+  build is about two seconds against a thirty-second boot, so the lane pays it
+  every time; `--no-build` opts out for the rare case of deliberately booting
+  the artifact already on disk. Without this the lane booted whatever was
+  already in `build/image/`, and a whole session of instrumentation
+  conclusions came from probes that were never compiled into the booted
+  kernel.
 - `cargo xtask kvm-run` seals its own profile. A multicore interactive launch
   whose `smp-iteration` evidence is missing, expired, or bound to an older tree
   runs `bash formal/verify-smp-iteration.sh` and revalidates before claiming a

@@ -67,16 +67,18 @@ fn try_handle_current_user_page_fault(
         return hal_api::UserFaultDisposition::Unhandled;
     };
     let page = cr2 & !(PAGER_PAGE_BYTES - 1);
-    let Ok(vma) = ps_api::current_pager_vma_snapshot(page, access) else {
-        return hal_api::UserFaultDisposition::Unhandled;
+    let vma = match ps_api::current_pager_vma_snapshot(page, access) {
+        Ok(vma) => vma,
+        // A seqlock reader that lost every retry to a concurrent VMA writer
+        // has learned nothing about this address, so it must not conclude the
+        // address is unmapped. Restart the instruction and read again.
+        Err(ps_api::PagerVmaError::Unstable) => return hal_api::UserFaultDisposition::Resumed,
+        Err(_) => return hal_api::UserFaultDisposition::Unhandled,
     };
-    if vma.task_id == 0 || vma.region.object.object_type != VM_OBJECT_ANONYMOUS {
+    if vma.task_id == 0 {
         return hal_api::UserFaultDisposition::Unhandled;
     }
     let Some(task_generation) = vma.task_id.checked_add(1) else {
-        return hal_api::UserFaultDisposition::Unhandled;
-    };
-    let Some(charge) = ps_api::current_pager_charge_snapshot() else {
         return hal_api::UserFaultDisposition::Unhandled;
     };
     let Some(object_delta) = page.checked_sub(vma.region.start) else {
@@ -85,11 +87,12 @@ fn try_handle_current_user_page_fault(
     let Some(object_offset) = vma.region.object_offset.checked_add(object_delta) else {
         return hal_api::UserFaultDisposition::Unhandled;
     };
-    let deadline_ns = hal_api::arch::clock::monotonic_nanos().saturating_add(charge.period_ns);
-    if deadline_ns == 0 {
-        return hal_api::UserFaultDisposition::Unhandled;
-    }
 
+    // The charge fields describe a *pager's* obligation: the deadline it must
+    // answer by and the domain its time is billed to. They are filled in below,
+    // on the branch that actually consults one. An anonymous fault must not be
+    // refused because a pager precondition could not be met, since it never
+    // reaches a pager.
     let request = PagerFaultRequestWire {
         version: PAGER_FAULT_ABI_VERSION,
         access,
@@ -104,11 +107,55 @@ fn try_handle_current_user_page_fault(
         vma_generation: vma.region.vma_generation,
         virtual_address: page,
         object_offset,
+        deadline_ns: 0,
+        scheduling_domain: 0,
+        charge_token: 0,
+        object: vma.region.object,
+        reserved1: [0; 2],
+    };
+    // Zircon split. An anonymous object has no external owner and no backing
+    // store, so ring0 supplies its zeroed page here, in the faulting task's own
+    // context: no fault slot, no frame grant, no block, no reply custody, and
+    // no second process on the critical path. Everything the decision needs was
+    // already validated by `current_pager_vma_snapshot` above.
+    if vma.region.object.object_type == VM_OBJECT_ANONYMOUS {
+        return match compat_api::pager::serve_anonymous_first_touch(request, vma.region.prot) {
+            compat_api::pager::AnonymousFaultOutcome::Mapped => {
+                hal_api::UserFaultDisposition::Resumed
+            }
+            // Resume without a mapping. A page fault is restartable, so the
+            // faulting instruction re-executes and faults again, and the
+            // `iretq` in between restores the interrupt flag this gate cleared
+            // - which is what lets the VMA writer finish and lets this CPU be
+            // preempted. Retiring the thread instead is how an unrelated
+            // concurrent `munmap` anywhere in the process turned a valid first
+            // touch into a SIGSEGV.
+            compat_api::pager::AnonymousFaultOutcome::Retry => {
+                hal_api::UserFaultDisposition::Resumed
+            }
+            compat_api::pager::AnonymousFaultOutcome::Refused => {
+                hal_api::UserFaultDisposition::Unhandled
+            }
+        };
+    }
+
+    // Pager-backed objects keep the fixed rendezvous: their content belongs to
+    // a service that owns load, COW, writeback and eviction policy ring0 has no
+    // way to compute. No such object is published yet, so this route is live
+    // and unreachable rather than dead - it is the contract the page cache
+    // lands on, and it stays exercised by the pager-fault unit tests.
+    let Some(charge) = ps_api::current_pager_charge_snapshot() else {
+        return hal_api::UserFaultDisposition::Unhandled;
+    };
+    let deadline_ns = hal_api::arch::clock::monotonic_nanos().saturating_add(charge.period_ns);
+    if deadline_ns == 0 {
+        return hal_api::UserFaultDisposition::Unhandled;
+    }
+    let request = PagerFaultRequestWire {
         deadline_ns,
         scheduling_domain: charge.scheduling_domain,
         charge_token: charge.charge_token,
-        object: vma.region.object,
-        reserved1: [0; 2],
+        ..request
     };
     let binding_template = mm_api::frame_capability::FrameGrantBinding {
         fault_token: 0,

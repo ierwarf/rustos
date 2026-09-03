@@ -19,6 +19,7 @@ use core::arch::x86_64::__cpuid;
 use core::hint::spin_loop;
 use core::ptr::{read_volatile, write_volatile};
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use spin::Mutex;
 
 const SOURCE_UNINITIALIZED: u8 = 0;
 const SOURCE_HPET: u8 = 1;
@@ -88,6 +89,32 @@ pub struct ClockSourceInfo {
     pub frequency_hz: u64,
 }
 
+/// Why a TSC was or was not admitted, recorded during `init`.
+///
+/// The three fields are independent failure causes and a caller that sees only
+/// "no clocksource" cannot tell them apart: a CPU without invariant TSC, an
+/// invariant TSC whose rate no enumeration reports, and a rate that was
+/// measured but fell outside the admitted range.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TscAdmissionFacts {
+    pub invariant_supported: bool,
+    /// CPUID leaf `0x15`. Intel-only in practice; AMD reports none.
+    pub cpuid_frequency_hz: Option<u64>,
+    /// Measured against another counter when CPUID cannot report a rate.
+    pub calibrated_frequency_hz: Option<u64>,
+}
+
+static TSC_FACTS: Mutex<TscAdmissionFacts> = Mutex::new(TscAdmissionFacts {
+    invariant_supported: false,
+    cpuid_frequency_hz: None,
+    calibrated_frequency_hz: None,
+});
+
+/// What `init` observed about this CPU's TSC.
+pub fn tsc_admission_facts() -> TscAdmissionFacts {
+    *TSC_FACTS.lock()
+}
+
 /// Installs a non-interrupt-counting monotonic clock source. The legacy RTC
 /// periodic interrupt is deliberately not a clock source: virtual machines may
 /// coalesce or lose those edges while the vCPU is descheduled. An invariant TSC
@@ -99,9 +126,18 @@ pub fn init() -> Option<ClockSourceInfo> {
     }
 
     let hpet = init_hpet();
-    let tsc_hz = invariant_tsc_supported()
-        .then(|| cpuid_tsc_frequency_hz().or_else(|| hpet.and_then(calibrate_tsc_with_hpet)))
-        .flatten()
+    let invariant_supported = invariant_tsc_supported();
+    let cpuid_frequency_hz = invariant_supported.then(cpuid_tsc_frequency_hz).flatten();
+    let calibrated_frequency_hz = (invariant_supported && cpuid_frequency_hz.is_none())
+        .then(|| hpet.and_then(calibrate_tsc_with_hpet))
+        .flatten();
+    *TSC_FACTS.lock() = TscAdmissionFacts {
+        invariant_supported,
+        cpuid_frequency_hz,
+        calibrated_frequency_hz,
+    };
+    let tsc_hz = cpuid_frequency_hz
+        .or(calibrated_frequency_hz)
         .filter(|hz| (MIN_TSC_HZ..=MAX_TSC_HZ).contains(hz));
     if let Some(tsc_hz) = tsc_hz {
         // The calibrated rate remains useful for each CPU's local

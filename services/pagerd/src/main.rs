@@ -1,12 +1,19 @@
 #![no_std]
 //!
-//! - **Owner:** `pagerd` owns anonymous-fault policy after the kernel has
-//!   admitted an exact pager capability and fixed one-shot fault custody.
+//! - **Owner:** `pagerd` owns *pager-backed* fault policy - load ownership,
+//!   COW, dirty writeback, eviction, and provider restart - after the kernel
+//!   has admitted an exact pager capability and fixed one-shot fault custody.
+//!   Anonymous first touch is no longer routed here: an anonymous page has no
+//!   backing store and no external owner, so ring0 supplies it directly in the
+//!   faulting task's own context (see `docs/ai/pager-protocol-contract.md` §0).
+//!   The rendezvous reply path below is therefore live and currently reached
+//!   by no dispatch; it is the contract `page_cache` lands on, and it stays
+//!   exercised by the unit tests rather than by the running system.
 //! - **Boundary:** Every protocol envelope, sender identity, VMA admission,
 //!   dispatch request, opaque frame capability, and requested frame right is
 //!   untrusted until the matching ABI contract accepts it.
 //! - **Lifecycle:** Register one service endpoint, admit pager-owned VMAs,
-//!   consume exact anonymous-fault dispatches, and lose old authority on token,
+//!   consume exact fault dispatches, and lose old authority on token,
 //!   VMA, process, or service-epoch revocation.
 //! - **Concurrency:** One passive pager thread owns the bounded policy state.
 //!   It holds no policy lock across receive, reply, or reply-and-wait syscalls.
@@ -106,6 +113,17 @@ fn serve(endpoint: u64, pager: &mut PagerState) {
                 Default::default()
             }
         };
+        // Reply and wait stay two entries on purpose. Merging them into one
+        // `ReplyRecv`-shaped call measured as no change on a single-threaded
+        // first-touch probe, and it removed the only thing that interleaved
+        // this loop's two arrival sources: returning to user mode. A pager
+        // with faults continuously queued then never drained its generic
+        // endpoint, the `mmap` admission calls that create new demand-paged
+        // regions timed out, and the fault path went quiet for the rest of the
+        // boot. Making control win the tie instead simply starved faults.
+        // Since anonymous faults stopped arriving here at all, the merge has
+        // no remaining benefit to weigh against that: do not reintroduce it.
+        //
         // SAFETY: the fixed reply is copied synchronously and remains bound to
         // the dispatch received by this thread.
         let _ = unsafe { pager_rendezvous::fault_reply(reply) };

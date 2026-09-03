@@ -1,0 +1,10 @@
+X86_64 PagerFaultInstallPermitMutant
+"Without the store-buffer barriers both owners conclude the other is absent"
+{
+uint64_t sequence=2; uint64_t installers=0;
+uint64_t 0:rax; uint64_t 1:rax;
+}
+P0                       | P1                       ;
+movq $3,(sequence)       | movq $1,(installers)     ;
+movq (installers),%rax   | movq (sequence),%rax     ;
+exists (0:rax=0 /\ 1:rax=2)

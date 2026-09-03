@@ -1,0 +1,11 @@
+X86_64 PagerFaultInstallPermit
+"A withdrawing VMA writer and an exception-time fault installer cannot each miss the other"
+{
+uint64_t sequence=2; uint64_t installers=0;
+uint64_t 0:rax; uint64_t 1:rax;
+}
+P0                       | P1                       ;
+movq $3,(sequence)       | movq $1,(installers)     ;
+mfence                   | mfence                   ;
+movq (installers),%rax   | movq (sequence),%rax     ;
+exists (0:rax=0 /\ 1:rax=2)

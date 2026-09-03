@@ -15,6 +15,7 @@
 //! - **Evidence:** Focused unit tests plus the `pager-vma-publication-*` formal
 //!   and implementation mutations.
 
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
@@ -56,8 +57,23 @@ pub struct PagerVmaSnapshot {
     pub region: PagerVmRegionWire,
 }
 
+/// How long a withdrawing writer waits for exception-time installers to drop
+/// their permits before it fails closed.
+///
+/// Sized for host vCPU preemption, not for the installer's own work, which is
+/// a handful of instructions. Exceeding it means an installer was descheduled
+/// for longer than any ordinary host scheduling quantum, and the withdrawal
+/// must not proceed on the assumption that it is finished.
+#[cfg(rustos_boot_image)]
+const INSTALLER_DRAIN_TIMEOUT_NS: u64 = 250_000_000;
+
 struct PublishedPagerVma {
     sequence: AtomicU64,
+    /// Number of exception-time installers that observed this exact published
+    /// VMA and may still touch one of its prepared leaves.  A writer withdraws
+    /// the publication before changing PTEs, then drains this count; the
+    /// installer itself never takes the writer or process-state lock.
+    fault_installers: AtomicU64,
     start: AtomicU64,
     end: AtomicU64,
     object_type: AtomicU64,
@@ -83,6 +99,7 @@ impl PublishedPagerVma {
     const fn empty() -> Self {
         Self {
             sequence: AtomicU64::new(0),
+            fault_installers: AtomicU64::new(0),
             start: AtomicU64::new(0),
             end: AtomicU64::new(0),
             object_type: AtomicU64::new(0),
@@ -103,6 +120,49 @@ impl PublishedPagerVma {
             fault_endpoint_generation: AtomicU64::new(0),
             fault_endpoint_rights: AtomicU64::new(0),
         }
+    }
+
+    /// Cheap address filter for the linear scan.
+    ///
+    /// The scan rejects almost every slot, and the full `snapshot` it used to
+    /// call for each one reads twenty-one atomics to build a region it then
+    /// throws away. This reads the three fields an *address* rejection can be
+    /// decided from.
+    ///
+    /// It filters on address extent and nothing else, deliberately. An earlier
+    /// version also compared the process and MM generations here, which looks
+    /// like a free win and is not: duplicating an authority check means the
+    /// duplicate keeps rejecting when the real one is broken, so the
+    /// registered mutant for `identityExact` survived. A filter that can mask
+    /// a security check is no longer a filter. Every authority decision stays
+    /// in the single validated path below.
+    /// Cheap extent-overlap filter, the range counterpart of [`may_cover`].
+    ///
+    /// Same contract: address extent only, never authority, conservative when
+    /// a writer holds the slot. Its job is to size an exact allocation before
+    /// the expensive full snapshots run.
+    fn may_overlap(&self, start: u64, end: u64) -> bool {
+        // ORDERING: Acquire observes the writer's even commit before the
+        // Relaxed payload reads below, exactly as `snapshot` does.
+        if self.sequence.load(Ordering::Acquire) & 1 != 0 {
+            return true;
+        }
+        let slot_start = self.start.load(Ordering::Relaxed);
+        let slot_end = self.end.load(Ordering::Relaxed);
+        slot_start != 0 && start < slot_end && slot_start < end
+    }
+
+    fn may_cover(&self, address: u64) -> bool {
+        // ORDERING: Acquire observes the writer's even commit before the
+        // Relaxed payload reads below, exactly as `snapshot` does.
+        let before = self.sequence.load(Ordering::Acquire);
+        if before & 1 != 0 {
+            // A writer holds this slot. Let the full snapshot decide.
+            return true;
+        }
+        let start = self.start.load(Ordering::Relaxed);
+        let end = self.end.load(Ordering::Relaxed);
+        start != 0 && address >= start && address < end
     }
 
     fn snapshot(&self) -> Result<Option<PagerVmRegionWire>, PagerVmaError> {
@@ -159,10 +219,32 @@ impl PublishedPagerVma {
         if before & 1 != 0 || before > MAX_PUBLICATION_SEQUENCE {
             return Err(PagerVmaError::Pressure);
         }
-        // ORDERING: publish the odd invalidation before changing payload so a
-        // concurrent reader abandons its snapshot rather than accepting a
-        // mixture of old and new VMA fields.
+        // ORDERING: Release publishes the odd invalidation before the payload
+        // changes, so a concurrent reader abandons its snapshot rather than
+        // accepting a mixture of old and new VMA fields.
         self.sequence.store(before + 1, Ordering::Release);
+        // The store above is followed by a load of a **different** location -
+        // the installer count - while an installer does the mirror image:
+        // register, then load this sequence. Release/Acquire orders neither
+        // pair against the other, and x86 TSO permits exactly this StoreLoad
+        // reordering, so without a full barrier a writer can read zero
+        // installers while an installer reads a stale even sequence and takes
+        // a permit. Both then own the same prepared leaf, and the writer
+        // reclaims a frame an exception-time CAS is still installing into.
+        // `loom-proof-kernel` enumerates that interleaving in one iteration,
+        // and `formal/litmus/x86_64/pager_fault_install_permit.litmus` shows
+        // its mutant reaching the forbidden state without this fence.
+        // ORDERING: SeqCst fence, the store-buffer barrier that orders this
+        // writer's odd-sequence store before its load of the installer count.
+        core::sync::atomic::fence(Ordering::SeqCst);
+        if region.is_none() && !self.drain_fault_installers() {
+            // Payload remains intact; restore its prior stable sequence so
+            // callers fail closed without publishing a half-withdrawn VMA.
+            // ORDERING: Release restores the previously stable payload
+            // before readers may accept its even sequence again.
+            self.sequence.store(before, Ordering::Release);
+            return Err(PagerVmaError::Unstable);
+        }
         let region = region.unwrap_or_default();
         self.start.store(region.start, Ordering::Relaxed);
         self.end.store(region.end, Ordering::Relaxed);
@@ -205,6 +287,108 @@ impl PublishedPagerVma {
         self.sequence.store(before + 2, Ordering::Release);
         Ok(())
     }
+
+    /// Waits for every installer that observed the now-odd publication to drop
+    /// its permit. `false` means one did not, and withdrawal must not commit.
+    ///
+    /// The bound is wall-clock, not a spin count, and that distinction is the
+    /// whole contract. An installer holds its permit across a lock-free frame
+    /// reservation and one leaf CAS with interrupts clear: it cannot block,
+    /// allocate, or be preempted by this guest, so in *guest* time the drain is
+    /// always short. What it can lose is its physical CPU - a KVM host may
+    /// deschedule that vCPU mid-permit for milliseconds. A fixed spin count
+    /// measures the wrong clock and turns ordinary host scheduling into a
+    /// spurious `munmap`/`mprotect` failure, which is exactly the shape that
+    /// only appears under a loaded multi-vCPU guest.
+    fn drain_fault_installers(&self) -> bool {
+        // ORDERING: Acquire observes every installer Drop's Release decrement
+        // before this writer changes any PTE topology. The fence in `publish`
+        // is what keeps this load from being reordered before the odd-sequence
+        // store that must precede it.
+        if self.fault_installers.load(Ordering::Acquire) == 0 {
+            return true;
+        }
+        #[cfg(rustos_boot_image)]
+        {
+            let mut deadline = kernel_hal::api::arch::clock::SpinDeadline::start();
+            loop {
+                // ORDERING: same Acquire/Release drain contract as the fast
+                // path; a drained count means every installer's leaf CAS is
+                // already visible to this writer.
+                if self.fault_installers.load(Ordering::Acquire) == 0 {
+                    return true;
+                }
+                if deadline.elapsed_nanos() >= INSTALLER_DRAIN_TIMEOUT_NS {
+                    return false;
+                }
+                core::hint::spin_loop();
+            }
+        }
+        #[cfg(not(rustos_boot_image))]
+        {
+            // Host tests have no monotonic clock and no concurrent installer
+            // that outlives its caller, so a fixed bound is exact here.
+            for _ in 0..1_000_000 {
+                // ORDERING: as above; the host-test bound differs, the drain
+                // contract does not.
+                if self.fault_installers.load(Ordering::Acquire) == 0 {
+                    return true;
+                }
+                core::hint::spin_loop();
+            }
+            false
+        }
+    }
+
+    fn try_acquire_fault_install(
+        &'static self,
+        expected: PagerVmRegionWire,
+    ) -> Result<PagerFaultInstallPermit, PagerVmaError> {
+        // ORDERING: Acquire pairs with the publisher's final Release commit
+        // before this prospective installer reads an exact VMA snapshot.
+        let before = self.sequence.load(Ordering::Acquire);
+        if before == 0 || before & 1 != 0 || self.snapshot()? != Some(expected) {
+            return Err(PagerVmaError::Stale);
+        }
+        // ORDERING: AcqRel makes this installer visible to a withdrawing
+        // writer before the second sequence check closes the publication race.
+        self.fault_installers.fetch_add(1, Ordering::AcqRel);
+        // The installer half of the store-buffer barrier described in
+        // `publish`. Without it this registration and the sequence load below
+        // may be reordered, and a writer whose own pair was reordered would
+        // see no installer while this installer sees no withdrawal - each
+        // concluding the other is absent.
+        // ORDERING: SeqCst fence, ordering this registration before the
+        // sequence re-read that decides whether the permit is issued.
+        core::sync::atomic::fence(Ordering::SeqCst);
+        // ORDERING: Acquire observes a writer's odd invalidation whenever that
+        // writer did not observe this installer's count.
+        let after = self.sequence.load(Ordering::Acquire);
+        if before == after && after & 1 == 0 && self.snapshot()? == Some(expected) {
+            return Ok(PagerFaultInstallPermit { slot: self });
+        }
+        // ORDERING: Release lets a withdrawing writer observe that this
+        // rejected installer will never access a leaf.
+        self.fault_installers.fetch_sub(1, Ordering::Release);
+        Err(PagerVmaError::Stale)
+    }
+}
+
+/// Exact publication permit for a single IRQ-off prepared-leaf CAS.
+///
+/// The permit is deliberately neither cloneable nor transferable.  Dropping it
+/// is the linearization point that lets a withdrawing VMA writer proceed to
+/// ordinary locked PTE mutation and TLB reclamation.
+pub struct PagerFaultInstallPermit {
+    slot: &'static PublishedPagerVma,
+}
+
+impl Drop for PagerFaultInstallPermit {
+    fn drop(&mut self) {
+        // ORDERING: Release pairs with the withdrawing writer's Acquire drain
+        // before it mutates or reclaims the prepared leaf.
+        self.slot.fault_installers.fetch_sub(1, Ordering::Release);
+    }
 }
 
 #[expect(
@@ -216,7 +400,30 @@ const EMPTY_PAGER_VMA: PublishedPagerVma = PublishedPagerVma::empty();
 static PAGER_VMAS: [PublishedPagerVma; MAX_PROCESS_OBJECTS * MAX_PAGER_VMAS_PER_PROCESS] =
     [EMPTY_PAGER_VMA; MAX_PROCESS_OBJECTS * MAX_PAGER_VMAS_PER_PROCESS];
 type PagerVmaWriterLock = TrackedSpinLock<(), { LockClass::PagerVmaPublication as u8 }>;
-static PAGER_VMA_WRITER: PagerVmaWriterLock = TrackedSpinLock::new(());
+/// One publication writer lock **per process**, not one for the system.
+///
+/// Every `mmap`, `munmap`, and `mprotect` that touches a pager VMA takes this.
+/// A single global lock therefore serialized every address-space edit in the
+/// machine against every other, on a path that is already hot at 8 vCPUs - and
+/// worse, a withdrawal holds it across the installer drain, which is bounded
+/// in wall-clock time rather than instructions. One process stalling an
+/// installer would stall unrelated processes' `mmap`.
+///
+/// Per-process is sound because the publication tables are already disjoint:
+/// `process_slots` hands each process its own slice, and the only shared state
+/// a writer touches is `NEXT_ANON_OBJECT_SLOT`, which is a standalone atomic.
+#[expect(
+    clippy::declare_interior_mutable_const,
+    reason = "array initializer for the fixed per-process writer lock table"
+)]
+const EMPTY_PAGER_VMA_WRITER: PagerVmaWriterLock = TrackedSpinLock::new(());
+static PAGER_VMA_WRITERS: [PagerVmaWriterLock; MAX_PROCESS_OBJECTS] =
+    [EMPTY_PAGER_VMA_WRITER; MAX_PROCESS_OBJECTS];
+
+/// The writer lock guarding one process's publication slots.
+fn writer_lock(handle: ProcessHandle) -> Option<&'static PagerVmaWriterLock> {
+    PAGER_VMA_WRITERS.get(handle.index())
+}
 
 fn process_slots(handle: ProcessHandle) -> Option<&'static [PublishedPagerVma]> {
     let start = handle.index().checked_mul(MAX_PAGER_VMAS_PER_PROCESS)?;
@@ -275,7 +482,7 @@ pub(super) fn publish(
     if handle.generation() != identity.process_generation() {
         return Err(PagerVmaError::Stale);
     }
-    let _writer = PAGER_VMA_WRITER.lock();
+    let _writer = writer_lock(handle).ok_or(PagerVmaError::Stale)?.lock();
     let slots = process_slots(handle).ok_or(PagerVmaError::Stale)?;
     for existing in slots {
         if let Some(existing) = existing.snapshot()? {
@@ -298,21 +505,62 @@ pub(super) fn publish(
     Ok(region)
 }
 
+/// Decides whether `access` is permitted by this region's protection.
+///
+/// Split out so the decision keeps its own statement. That statement is the
+/// registered implementation-mutation anchor
+/// `pager-vma-publication-permission-bypass`, whose witness proves a
+/// permission escalation fails closed; inlining it into a caller that also
+/// returns a slot index would silently retire that witness.
+fn admit_access(
+    region: PagerVmRegionWire,
+    access: u16,
+) -> Result<PagerVmRegionWire, PagerVmaError> {
+    let allowed = (access == VM_ACCESS_READ && region.prot & VM_PROT_READ != 0)
+        || (access == VM_ACCESS_WRITE && region.prot & VM_PROT_WRITE != 0)
+        || (access == VM_ACCESS_EXECUTE && region.prot & VM_PROT_EXECUTE != 0);
+    return allowed.then_some(region).ok_or(PagerVmaError::Denied);
+}
+
 pub(super) fn lookup(
     handle: ProcessHandle,
     identity: ProcessIdentity,
     address: u64,
     access: u16,
 ) -> Result<PagerVmRegionWire, PagerVmaError> {
+    lookup_slot(handle, identity, address, access).map(|(_, region)| region)
+}
+
+/// Finds the publication covering `address`, and reports *which slot* holds it.
+///
+/// The slot index is the point. A fault used to run this scan, then run it
+/// again to re-find the same slot for its permit, then a third time to clip
+/// its fault-around run - three linear sweeps of a 64-slot table whose every
+/// probe read twenty-one atomics. Returning the index lets the permit go
+/// straight to the one slot that matters.
+pub(super) fn lookup_slot(
+    handle: ProcessHandle,
+    identity: ProcessIdentity,
+    address: u64,
+    access: u16,
+) -> Result<(usize, PagerVmRegionWire), PagerVmaError> {
     if access == 0 || access & !VM_ACCESS_KNOWN != 0 || access.count_ones() != 1 {
         return Err(PagerVmaError::Malformed);
     }
     let process = handle.object_identity().ok_or(PagerVmaError::Stale)?;
     let slots = process_slots(handle).ok_or(PagerVmaError::Stale)?;
-    for slot in slots {
+    for (index, slot) in slots.iter().enumerate() {
+        if !slot.may_cover(address) {
+            continue;
+        }
         let Some(region) = slot.snapshot()? else {
             continue;
         };
+        // Written in full rather than against the locals above on purpose:
+        // this exact expression is the registered implementation-mutation
+        // anchor `pager-vma-publication-identity-bypass`. The locals exist for
+        // `may_cover`, which runs per slot; this runs once per candidate, so
+        // spelling it out costs nothing and keeps the witness anchored.
         if region.process_handle != process.slot()
             || region.process_generation != u64::from(identity.process_generation())
             || region.mm_generation != u64::from(identity.mm_generation())
@@ -320,13 +568,64 @@ pub(super) fn lookup(
             continue;
         }
         if region.contains(address) {
-            let allowed = (access == VM_ACCESS_READ && region.prot & VM_PROT_READ != 0)
-                || (access == VM_ACCESS_WRITE && region.prot & VM_PROT_WRITE != 0)
-                || (access == VM_ACCESS_EXECUTE && region.prot & VM_PROT_EXECUTE != 0);
-            return allowed.then_some(region).ok_or(PagerVmaError::Denied);
+            return admit_access(region, access).map(|region| (index, region));
         }
     }
     Err(PagerVmaError::Stale)
+}
+
+/// Acquires one exact VMA publication permit for an IRQ-off prepared-leaf
+/// install.  This validates the same generation/object/offset tuple carried by
+/// the fault request, but intentionally does not enter `ProcessStateLock`.
+///
+/// The two failure classes are not interchangeable, and the caller must not
+/// collapse them:
+///
+/// - [`PagerVmaError::Unstable`] means the range *is* published but a writer
+///   is mid-edit, so no permit can be issued this instant. The faulting
+///   instruction must be restarted, not killed.
+/// - Every other error means this fault carries no authority for this address,
+///   and the thread is retired.
+///
+/// Returning `Stale` for contention is what makes a concurrent `munmap` or
+/// `mprotect` anywhere in the same process able to SIGSEGV an unrelated,
+/// perfectly valid first touch.
+pub(super) fn acquire_fault_install(
+    handle: ProcessHandle,
+    identity: ProcessIdentity,
+    request: rustos_user_abi::pager::PagerFaultRequestWire,
+) -> Result<(PagerFaultInstallPermit, PagerVmRegionWire), PagerVmaError> {
+    if handle.generation() != identity.process_generation() {
+        return Err(PagerVmaError::Stale);
+    }
+    let (slot_index, region) =
+        lookup_slot(handle, identity, request.virtual_address, request.access)?;
+    let delta = request
+        .virtual_address
+        .checked_sub(region.start)
+        .ok_or(PagerVmaError::Stale)?;
+    if region.vma_generation != request.vma_generation
+        || region.mm_generation != request.mm_generation
+        || region.object != request.object
+        || region
+            .object_offset
+            .checked_add(delta)
+            .ok_or(PagerVmaError::Stale)?
+            != request.object_offset
+    {
+        return Err(PagerVmaError::Stale);
+    }
+    let slots = process_slots(handle).ok_or(PagerVmaError::Stale)?;
+    // Exactly one slot, the one the scan above already identified. Sweeping
+    // every slot here re-read the whole table for a permit whose owner was
+    // already known.
+    let slot = slots.get(slot_index).ok_or(PagerVmaError::Stale)?;
+    slot.try_acquire_fault_install(region)
+        // `lookup_slot` already proved this exact region published in this
+        // exact slot, so a refusal means a writer changed the publication
+        // under us between the two. That is contention, not absent authority.
+        .map_err(|_| PagerVmaError::Unstable)
+        .map(|permit| (permit, region))
 }
 
 /// Revalidates every authority carried by a dispatched request immediately
@@ -440,30 +739,48 @@ where
         return Err(PagerVmaError::Stale);
     }
 
-    const MAX_REWRITTEN_REGIONS: usize = MAX_PAGER_VMAS_PER_PROCESS + 2;
-    let _writer = PAGER_VMA_WRITER.lock();
+    // Sized exactly, on the heap, because these buffers scale with the VMA
+    // table and the syscall stack does not.
+    //
+    // They used to be `[PagerVmRegionWire; MAX_PAGER_VMAS_PER_PROCESS]`-shaped
+    // arrays: ~22 KiB of a 64 KiB syscall stack at 64 slots, and ~44 KiB at
+    // 128 - which is what made the per-process VMA table unable to grow, and
+    // that table filling is what turned an `mprotect(PROT_NONE)` guard page
+    // into `ENOMEM`. The cheap extent filter below sizes one exact allocation
+    // instead, so the common edit - one `mprotect` inside one region -
+    // reserves a single entry rather than the whole table.
+    let _writer = writer_lock(handle).ok_or(PagerVmaError::Stale)?.lock();
     let slots = process_slots(handle).ok_or(PagerVmaError::Stale)?;
-    let mut overlapping = [(usize::MAX, PagerVmRegionWire::default()); MAX_PAGER_VMAS_PER_PROCESS];
-    let mut overlapping_len = 0;
-    let mut empty_slots = [usize::MAX; MAX_PAGER_VMAS_PER_PROCESS];
-    let mut empty_len = 0;
+    let candidates = slots
+        .iter()
+        .filter(|slot| slot.may_overlap(start, end))
+        .count();
+    if candidates == 0 {
+        return Ok(false);
+    }
+    let mut overlapping: Vec<(usize, PagerVmRegionWire)> = Vec::new();
+    overlapping
+        .try_reserve_exact(candidates)
+        .map_err(|_| PagerVmaError::Pressure)?;
+    let mut empty_slots: Vec<usize> = Vec::new();
+    empty_slots
+        .try_reserve_exact(slots.len())
+        .map_err(|_| PagerVmaError::Pressure)?;
     for (slot_index, slot) in slots.iter().enumerate() {
         match slot.snapshot()? {
             Some(region) if start < region.end && region.start < end => {
-                overlapping[overlapping_len] = (slot_index, region);
-                overlapping_len += 1;
+                overlapping.push((slot_index, region));
             }
             Some(_) => {}
-            None => {
-                empty_slots[empty_len] = slot_index;
-                empty_len += 1;
-            }
+            None => empty_slots.push(slot_index),
         }
     }
+    let overlapping_len = overlapping.len();
+    let empty_len = empty_slots.len();
     if overlapping_len == 0 {
         return Ok(false);
     }
-    overlapping[..overlapping_len].sort_unstable_by_key(|(_, region)| region.start);
+    overlapping.sort_unstable_by_key(|(_, region)| region.start);
 
     let process = handle.object_identity().ok_or(PagerVmaError::Stale)?;
     let edit = PagerRangeEdit {
@@ -472,9 +789,15 @@ where
         replacement_prot,
     };
     let mut cursor = start;
-    let mut rewritten = [None; MAX_REWRITTEN_REGIONS];
-    let mut rewritten_len = 0;
-    for (_, region) in overlapping[..overlapping_len].iter().copied() {
+    let mut rewritten: Vec<PagerVmRegionWire> = Vec::new();
+    rewritten
+        .try_reserve_exact(
+            overlapping_len
+                .checked_add(PAGER_MAX_REGION_GROWTH_PER_PROTECT)
+                .ok_or(PagerVmaError::Pressure)?,
+        )
+        .map_err(|_| PagerVmaError::Pressure)?;
+    for (_, region) in overlapping.iter().copied() {
         if region.process_handle != process.slot()
             || region.process_generation != u64::from(identity.process_generation())
             || region.mm_generation != u64::from(identity.mm_generation())
@@ -486,10 +809,7 @@ where
         // same call to its own replica of this region, so the two tables
         // cannot disagree about what an edit leaves behind - which is exactly
         // what happened while each side derived its own remainders.
-        let mut push = |fragment| {
-            rewritten[rewritten_len] = Some(fragment);
-            rewritten_len += 1;
-        };
+        let mut push = |fragment| rewritten.push(fragment);
         match apply_region_edit(region, edit) {
             PagerRegionEdit::Untouched(_) => return Err(PagerVmaError::Stale),
             PagerRegionEdit::Removed => {}
@@ -512,6 +832,7 @@ where
         }
         cursor = cursor.max(end.min(region.end));
     }
+    let rewritten_len = rewritten.len();
     debug_assert!(
         rewritten_len <= overlapping_len + PAGER_MAX_REGION_GROWTH_PER_PROTECT,
         "one range edit may add at most one interior split's fragments"
@@ -524,30 +845,51 @@ where
         });
     }
 
-    let mut targets = [usize::MAX; MAX_REWRITTEN_REGIONS];
+    let mut targets: Vec<usize> = Vec::new();
+    targets
+        .try_reserve_exact(rewritten_len)
+        .map_err(|_| PagerVmaError::Pressure)?;
     for index in 0..rewritten_len {
-        targets[index] = if index < overlapping_len {
+        targets.push(if index < overlapping_len {
             overlapping[index].0
         } else {
             empty_slots[index - overlapping_len]
-        };
+        });
         let sequence = slots[targets[index]].sequence.load(Ordering::Relaxed);
         if sequence & 1 != 0 || sequence > MAX_PUBLICATION_SEQUENCE - 2 {
             return Err(PagerVmaError::Pressure);
         }
     }
 
-    for (slot_index, _) in overlapping[..overlapping_len].iter().copied() {
-        slots[slot_index].publish(None)?;
+    // Withdrawal is all-or-nothing across the overlapping slots.
+    //
+    // `publish(None)` can fail after this writer has already withdrawn an
+    // earlier slot, because withdrawal drains exception-time installers and
+    // that drain can time out. Propagating straight out of the loop would
+    // leave those earlier regions withdrawn and never restored: their pages
+    // stay mapped in the address space but no longer fault, and no later
+    // `munmap` can name them. Restore what this attempt withdrew before
+    // reporting the failure, so a refused edit changes nothing at all.
+    for (position, (slot_index, _)) in overlapping.iter().copied().enumerate() {
+        let Err(error) = slots[slot_index].publish(None) else {
+            continue;
+        };
+        for (restore_index, region) in overlapping[..position].iter().copied() {
+            // Republication cannot drain, and its sequence headroom was
+            // preflighted above, so this restore does not fail for a reason
+            // the withdrawal just created.
+            let _ = slots[restore_index].publish(Some(region));
+        }
+        return Err(error);
     }
     if let Err(error) = mutate() {
-        for (slot_index, region) in overlapping[..overlapping_len].iter().copied() {
-            slots[slot_index].publish(Some(region))?;
+        for (slot_index, region) in overlapping.iter().copied() {
+            let _ = slots[slot_index].publish(Some(region));
         }
         return Err(error);
     }
     for index in 0..rewritten_len {
-        slots[targets[index]].publish(rewritten[index])?;
+        slots[targets[index]].publish(Some(rewritten[index]))?;
     }
     Ok(true)
 }
@@ -631,7 +973,7 @@ pub(super) fn revoke(
     start: u64,
     vma_generation: u64,
 ) -> Result<PagerVmRegionWire, PagerVmaError> {
-    let _writer = PAGER_VMA_WRITER.lock();
+    let _writer = writer_lock(handle).ok_or(PagerVmaError::Stale)?.lock();
     let slots = process_slots(handle).ok_or(PagerVmaError::Stale)?;
     for slot in slots {
         let Some(region) = slot.snapshot()? else {
@@ -650,434 +992,5 @@ pub(super) fn revoke(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::memory::paging::ProcessAddressSpace;
-    use crate::user::process_state::UserProcessState;
-    use rustos_user_abi::pager::{VM_OBJECT_ANONYMOUS, VM_PROT_READ, VM_PROT_WRITE};
-    use std::sync::Mutex;
-
-    /// The publication table is a process-wide bounded array whose free slots
-    /// are shared by every test in this module. Two tests publishing at once
-    /// can land on the same slot and make a healthy reader observe the other
-    /// writer's odd invalidation as `Unstable`, so the suite serializes here.
-    static TEST_GUARD: Mutex<()> = Mutex::new(());
-
-    fn guard() -> std::sync::MutexGuard<'static, ()> {
-        TEST_GUARD
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    fn identity(generation: u32, mm_generation: u32) -> ProcessIdentity {
-        ProcessIdentity::from_parts(41, generation, mm_generation)
-    }
-
-    fn template(start: u64) -> PagerVmRegionWire {
-        PagerVmRegionWire {
-            start,
-            end: start + PAGER_PAGE_BYTES * 2,
-            object: PagerObjectIdentityWire {
-                object_type: VM_OBJECT_ANONYMOUS,
-                rights: VM_PROT_READ | VM_PROT_WRITE,
-                backing_service: 0,
-                slot: 17,
-                generation: 19,
-                pager_epoch: 23,
-                backing_generation: 29,
-                ..PagerObjectIdentityWire::default()
-            },
-            object_offset: 0,
-            prot: VM_PROT_READ | VM_PROT_WRITE,
-            sharing: VM_SHARING_PRIVATE,
-            fault_endpoint: PagerEndpointCapabilityWire {
-                slot: 31,
-                generation: 37,
-                rights: 1,
-            },
-            ..PagerVmRegionWire::default()
-        }
-    }
-
-    fn process_state() -> UserProcessState {
-        UserProcessState::new(
-            ProcessAddressSpace::empty_for_tests(),
-            None,
-            None,
-            None,
-            None,
-            false,
-            "/pager-vma-test.elf",
-        )
-    }
-
-    #[test]
-    fn publication_stamps_exact_process_mm_and_nonzero_vma_generation() {
-        let _guard = guard();
-        let handle = ProcessHandle::new(29, 43);
-        let identity = identity(43, 47);
-        let published = publish(handle, identity, template(0x4000)).unwrap();
-        assert_eq!(published.process_handle, 30);
-        assert_eq!(published.process_generation, 43);
-        assert_eq!(published.mm_generation, 47);
-        assert_ne!(published.vma_generation, 0);
-        assert_eq!(
-            lookup(handle, identity, 0x5000, VM_ACCESS_WRITE),
-            Ok(published)
-        );
-        revoke(handle, identity, published.start, published.vma_generation).unwrap();
-    }
-
-    #[test]
-    fn overlap_and_permission_escalation_fail_closed() {
-        let _guard = guard();
-        let handle = ProcessHandle::new(28, 53);
-        let identity = identity(53, 59);
-        let published = publish(handle, identity, template(0x8000)).unwrap();
-        assert_eq!(
-            publish(handle, identity, template(0x9000)),
-            Err(PagerVmaError::Overlap)
-        );
-        assert_eq!(
-            lookup(handle, identity, 0x8000, VM_ACCESS_EXECUTE),
-            Err(PagerVmaError::Denied)
-        );
-        revoke(handle, identity, published.start, published.vma_generation).unwrap();
-    }
-
-    #[test]
-    fn protection_attenuation_and_unmap_rewrite_before_mutation() {
-        let _guard = guard();
-        let handle = ProcessHandle::new(27, 61);
-        let identity = identity(61, 67);
-        let published = publish(handle, identity, template(0x20_000)).unwrap();
-        let mut protection_mutated = false;
-        assert_eq!(
-            rewrite_attenuated_range(
-                handle,
-                identity,
-                published.start,
-                published.start + PAGER_PAGE_BYTES,
-                Some(0),
-                || {
-                    protection_mutated = true;
-                    Ok(())
-                },
-            ),
-            Ok(true)
-        );
-        assert!(protection_mutated);
-        assert_eq!(
-            lookup(handle, identity, published.start, VM_ACCESS_READ),
-            Err(PagerVmaError::Denied)
-        );
-        let right = lookup(
-            handle,
-            identity,
-            published.start + PAGER_PAGE_BYTES,
-            VM_ACCESS_WRITE,
-        )
-        .unwrap();
-        assert_eq!(right.vma_generation, published.vma_generation);
-        assert_eq!(right.object_offset, PAGER_PAGE_BYTES);
-        assert_eq!(
-            rewrite_attenuated_range(
-                handle,
-                identity,
-                right.start,
-                right.end,
-                Some(VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE),
-                || Ok(()),
-            ),
-            Err(PagerVmaError::Denied)
-        );
-
-        let mut unmapped = false;
-        assert_eq!(
-            rewrite_attenuated_range(handle, identity, right.start, right.end, None, || {
-                unmapped = true;
-                Ok(())
-            }),
-            Ok(true)
-        );
-        assert!(unmapped);
-        assert_eq!(
-            lookup(handle, identity, right.start, VM_ACCESS_READ),
-            Err(PagerVmaError::Stale)
-        );
-        assert_eq!(
-            rewrite_attenuated_range(
-                handle,
-                identity,
-                published.start,
-                published.start + PAGER_PAGE_BYTES,
-                None,
-                || Ok(()),
-            ),
-            Ok(true)
-        );
-    }
-
-    #[test]
-    fn per_process_vma_bound_admits_product_envelope_and_rejects_the_next_region() {
-        let _guard = guard();
-        let handle = ProcessHandle::new(26, 71);
-        let identity = identity(71, 73);
-        let mut published = [PagerVmRegionWire::default(); MAX_PAGER_VMAS_PER_PROCESS];
-        for (index, slot) in published.iter_mut().enumerate() {
-            let start = 0x40_000 + (index as u64) * PAGER_PAGE_BYTES * 2;
-            *slot = publish(handle, identity, template(start)).unwrap();
-        }
-        assert_eq!(
-            publish(
-                handle,
-                identity,
-                template(0x40_000 + (MAX_PAGER_VMAS_PER_PROCESS as u64) * PAGER_PAGE_BYTES * 2),
-            ),
-            Err(PagerVmaError::Pressure)
-        );
-        for region in published {
-            revoke(handle, identity, region.start, region.vma_generation).unwrap();
-        }
-    }
-
-    #[test]
-    fn exec_generation_change_and_revoked_region_never_match() {
-        let _guard = guard();
-        let handle = ProcessHandle::new(27, 61);
-        let exact_identity = identity(61, 67);
-        let published = publish(handle, exact_identity, template(0xc000)).unwrap();
-        assert_eq!(
-            lookup(handle, identity(61, 68), 0xc000, VM_ACCESS_READ),
-            Err(PagerVmaError::Stale)
-        );
-        assert_eq!(
-            revoke(
-                handle,
-                exact_identity,
-                published.start,
-                published.vma_generation + 1,
-            ),
-            Err(PagerVmaError::Stale)
-        );
-        assert_eq!(
-            lookup(handle, exact_identity, 0xc000, VM_ACCESS_READ),
-            Ok(published)
-        );
-        revoke(
-            handle,
-            exact_identity,
-            published.start,
-            published.vma_generation,
-        )
-        .unwrap();
-        assert_eq!(
-            lookup(handle, exact_identity, 0xc000, VM_ACCESS_READ),
-            Err(PagerVmaError::Stale)
-        );
-    }
-
-    #[test]
-    fn target_process_publication_is_generation_bound_and_revocable() {
-        let _guard = guard();
-        let _isolation = super::super::process_table::tests::isolate_process_table();
-        let handle = super::super::process_table::create_process(4_242, process_state())
-            .expect("test process handle");
-        let identity = super::super::process_table::live_process_identity(handle)
-            .expect("test process identity");
-
-        // This unit owns only the lock-free VMA publication protocol.  The
-        // normal-time facade prepares real page-table leaves first, while this
-        // test deliberately uses an empty host-test address space.
-        let published = publish(handle, identity, template(0x1_0000)).expect("target publication");
-        assert_eq!(
-            published.process_generation,
-            u64::from(identity.process_generation())
-        );
-        assert_eq!(published.mm_generation, u64::from(identity.mm_generation()));
-        assert_eq!(
-            lookup(handle, identity, 0x1_0000, VM_ACCESS_READ),
-            Ok(published)
-        );
-        assert_eq!(
-            super::super::revoke_pager_vma_for_process(
-                4_242,
-                published.start,
-                published.vma_generation,
-            ),
-            Ok(published)
-        );
-        assert_eq!(
-            lookup(handle, identity, 0x1_0000, VM_ACCESS_READ),
-            Err(PagerVmaError::Stale)
-        );
-    }
-
-    /// A wide template, so an edit can land strictly inside it and split.
-    fn wide_template(start: u64, pages: u64) -> PagerVmRegionWire {
-        PagerVmRegionWire {
-            end: start + PAGER_PAGE_BYTES * pages,
-            ..template(start)
-        }
-    }
-
-    fn published_spans(
-        handle: ProcessHandle,
-        identity: ProcessIdentity,
-    ) -> alloc::vec::Vec<(u64, u64, u64)> {
-        let mut spans: alloc::vec::Vec<(u64, u64, u64)> = process_slots(handle)
-            .unwrap()
-            .iter()
-            .filter_map(|slot| slot.snapshot().unwrap())
-            .filter(|region| {
-                region.process_generation == u64::from(identity.process_generation())
-                    && region.mm_generation == u64::from(identity.mm_generation())
-            })
-            .map(|region| (region.start, region.end, region.object_offset))
-            .collect();
-        spans.sort_unstable();
-        spans
-    }
-
-    fn rule_spans(
-        region: PagerVmRegionWire,
-        edit: PagerRangeEdit,
-    ) -> alloc::vec::Vec<(u64, u64, u64)> {
-        let (fragments, len) = apply_region_edit(region, edit).fragments();
-        let mut spans: alloc::vec::Vec<(u64, u64, u64)> = fragments[..len]
-            .iter()
-            .map(|fragment| (fragment.start, fragment.end, fragment.object_offset))
-            .collect();
-        spans.sort_unstable();
-        spans
-    }
-
-    /// Ring0's rewrite must equal the shared ABI rule exactly.
-    ///
-    /// This is one half of the replica binding: pagerd is tested against the
-    /// same rule, so proving each side equals it proves the two sides agree.
-    /// They previously derived their own remainders, and an interior `munmap`
-    /// left ring0 holding two mappings that pagerd had deleted - so the next
-    /// fault in a surviving remainder passed ring0's VMA check, matched no
-    /// pagerd region, and killed the thread.
-    #[test]
-    fn ring0_rewrite_matches_the_shared_range_edit_rule() {
-        let _guard = guard();
-        let handle = ProcessHandle::new(25, 79);
-        let identity = identity(79, 83);
-        let base = 0x8_0000;
-        for (edit_start, edit_end) in [
-            (base, base + PAGER_PAGE_BYTES), // trim head
-            (base + PAGER_PAGE_BYTES * 3, base + PAGER_PAGE_BYTES * 4), // trim tail
-            (base + PAGER_PAGE_BYTES, base + PAGER_PAGE_BYTES * 2), // interior split
-            (base, base + PAGER_PAGE_BYTES * 4), // full remove
-        ] {
-            let published = publish(handle, identity, wide_template(base, 4)).unwrap();
-            assert_eq!(
-                rewrite_attenuated_range(handle, identity, edit_start, edit_end, None, || Ok(())),
-                Ok(true)
-            );
-            assert_eq!(
-                published_spans(handle, identity),
-                rule_spans(published, PagerRangeEdit::unmap(edit_start, edit_end)),
-                "unmap {edit_start:#x}..{edit_end:#x} must equal the shared rule"
-            );
-            for (start, end, _) in published_spans(handle, identity) {
-                assert_eq!(
-                    rewrite_attenuated_range(handle, identity, start, end, None, || Ok(())),
-                    Ok(true)
-                );
-            }
-            assert!(published_spans(handle, identity).is_empty());
-        }
-    }
-
-    /// An interior unmap costs exactly one extra VMA slot, and no more - the
-    /// capacity claim `PAGER_MAX_REGION_GROWTH_PER_UNMAP` states and that
-    /// pagerd's table is sized against.
-    #[test]
-    fn an_interior_unmap_costs_exactly_one_extra_vma_slot() {
-        let _guard = guard();
-        let handle = ProcessHandle::new(24, 89);
-        let identity = identity(89, 97);
-        let base = 0x9_0000;
-        let published = publish(handle, identity, wide_template(base, 4)).unwrap();
-        let before = published_spans(handle, identity).len();
-        assert_eq!(
-            rewrite_attenuated_range(
-                handle,
-                identity,
-                base + PAGER_PAGE_BYTES,
-                base + PAGER_PAGE_BYTES * 2,
-                None,
-                || Ok(()),
-            ),
-            Ok(true)
-        );
-        let after = published_spans(handle, identity).len();
-        assert_eq!(after - before, PAGER_MAX_REGION_GROWTH_PER_UNMAP);
-        assert!(after - before <= PAGER_MAX_REGION_GROWTH_PER_PROTECT);
-        // Every surviving page still faults, and the removed one does not.
-        assert!(lookup(handle, identity, base, VM_ACCESS_WRITE).is_ok());
-        assert!(
-            lookup(
-                handle,
-                identity,
-                base + PAGER_PAGE_BYTES * 2,
-                VM_ACCESS_WRITE
-            )
-            .is_ok()
-        );
-        assert_eq!(
-            lookup(handle, identity, base + PAGER_PAGE_BYTES, VM_ACCESS_WRITE),
-            Err(PagerVmaError::Stale)
-        );
-        let _ = published;
-        for (start, end, _) in published_spans(handle, identity) {
-            assert_eq!(
-                rewrite_attenuated_range(handle, identity, start, end, None, || Ok(())),
-                Ok(true)
-            );
-        }
-    }
-
-    /// A split with no free VMA slot must refuse before it withdraws anything.
-    /// Withdrawing first and failing to republish would lose a live mapping.
-    #[test]
-    fn a_split_with_no_free_vma_slot_refuses_and_keeps_every_region() {
-        let _guard = guard();
-        let handle = ProcessHandle::new(23, 101);
-        let identity = identity(101, 103);
-        let base = 0xa_0000;
-        let mut published = alloc::vec::Vec::new();
-        for index in 0..MAX_PAGER_VMAS_PER_PROCESS as u64 {
-            let start = base + index * PAGER_PAGE_BYTES * 4;
-            published.push(publish(handle, identity, wide_template(start, 3)).unwrap());
-        }
-        let before = published_spans(handle, identity);
-        assert_eq!(before.len(), MAX_PAGER_VMAS_PER_PROCESS);
-        // Every slot is taken, so an interior split has nowhere to put its
-        // second fragment. It must refuse with `Pressure` and leave the whole
-        // table exactly as it was; the mutation closure must never run.
-        let mut mutated = false;
-        assert_eq!(
-            rewrite_attenuated_range(
-                handle,
-                identity,
-                base + PAGER_PAGE_BYTES,
-                base + PAGER_PAGE_BYTES * 2,
-                None,
-                || {
-                    mutated = true;
-                    Ok(())
-                },
-            ),
-            Err(PagerVmaError::Pressure)
-        );
-        assert!(!mutated, "no PTE may change before the split is admitted");
-        assert_eq!(published_spans(handle, identity), before);
-        for region in published {
-            revoke(handle, identity, region.start, region.vma_generation).unwrap();
-        }
-    }
-}
+#[path = "pager_vma/tests.rs"]
+mod tests;

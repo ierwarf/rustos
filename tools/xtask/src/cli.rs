@@ -6,6 +6,7 @@ use crate::config::{self as config_mod, Config};
 use crate::kvm;
 use crate::stage;
 use crate::testinfra;
+use crate::verify;
 use crate::util::{default_root_dir, env_path};
 use std::path::PathBuf;
 
@@ -121,6 +122,30 @@ enum XtaskCommand {
         rustos_vcpus: u8,
         #[arg(long = "isolate-probe")]
         isolate_probe: Option<String>,
+    },
+    /// Run the whole local verification pipeline as one command.
+    ///
+    /// The stages were six separate invocations that had to be recalled from
+    /// `docs/ai/commands.md`, run in the right order, and read out of six
+    /// redirected logs. Two mistakes came from that: booting against a formal
+    /// seal invalidated by a later edit, and testing the freestanding service
+    /// binaries the wrong way. Both are ordering and invocation facts, so they
+    /// belong in one place that cannot get them wrong.
+    ///
+    /// Quiet on success: one line per stage. A failing stage prints its own
+    /// output and the exact command to rerun.
+    Verify {
+        /// Also boot the 8-vCPU acceptance topology after sealing.
+        #[arg(long)]
+        gate: bool,
+        /// Boots for the gate. A defect that appears in one boot of four is a
+        /// rate, and one run cannot measure it.
+        #[arg(long, default_value_t = 4)]
+        repeat: usize,
+        #[arg(long = "rustos-vcpus", default_value_t = 8, value_parser = clap::value_parser!(u8).range(1..=8))]
+        rustos_vcpus: u8,
+        #[arg(long = "min-ui-fps", default_value_t = 60)]
+        min_ui_fps: u32,
     },
     Selftest,
     #[command(name = "fuzz-host")]
@@ -244,6 +269,18 @@ pub(crate) fn run() -> Result<()> {
             rustos_vcpus,
             isolate_probe,
         }) => crate::soak::soak(&config, runs, rustos_vcpus, isolate_probe.as_deref()),
+        Some(XtaskCommand::Verify {
+            gate,
+            repeat,
+            rustos_vcpus,
+            min_ui_fps,
+        }) => {
+            anyhow::ensure!(
+                (1..=64).contains(&repeat),
+                "--repeat must be in 1..=64, got {repeat}"
+            );
+            verify::verify(&config, gate, repeat, rustos_vcpus, min_ui_fps)
+        }
         Some(XtaskCommand::Selftest) => testinfra::selftest(&config),
         Some(XtaskCommand::FuzzHost {
             target,

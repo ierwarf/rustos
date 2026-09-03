@@ -466,7 +466,8 @@ tokens = [
 [[required_sequences]]
 path = "kernel/hal/src/arch/clock.rs"
 tokens = [
-    "let tsc_hz = invariant_tsc_supported()",
+    "let invariant_supported = invariant_tsc_supported();",
+    "let tsc_hz = cpuid_frequency_hz",
     "TSC_HZ.store(tsc_hz, Ordering::Relaxed);",
     "if tsc_clocksource_admitted(super::smp::cpu_count())",
     "if let Some((base, period_fs, counter)) = hpet",

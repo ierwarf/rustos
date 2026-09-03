@@ -48,7 +48,7 @@ pub use self::current::{
     complete_fast_ipc_reply_wake_handoff_with_custody, complete_ipc_reply_wake_handoff,
     complete_ipc_reply_wake_handoff_with_custody, complete_pager_fault_wake_handoff,
     complete_retired_task_cleanup, current_console_session, current_linux_thread_state,
-    current_pager_charge_snapshot, current_pager_vma_snapshot,
+    current_pager_charge_snapshot, current_pager_fault_install_permit, current_pager_vma_snapshot,
     current_scheduling_context_runtime_snapshot, current_task_id,
     current_thread_may_have_pending_signals, current_user_abi, current_user_address_space,
     current_user_id, current_user_log_ids, current_user_process_id, current_user_process_identity,
@@ -85,7 +85,7 @@ pub use self::pager_fault::{
     take_pager_fault_waiter_for, unregister_pager_fault_waiter,
 };
 pub use self::pager_vma::{
-    PagerVmaError, PagerVmaSnapshot, protect_for_process as protect_pager_vma_for_process,
+    PagerFaultInstallPermit, PagerVmaError, PagerVmaSnapshot, protect_for_process as protect_pager_vma_for_process,
     unmap_for_process as unmap_pager_vma_for_process, validate_fault_request,
     with_validated_fault_address_space,
 };

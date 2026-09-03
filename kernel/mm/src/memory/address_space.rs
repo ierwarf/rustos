@@ -30,6 +30,7 @@ mod owned_frames;
 mod pager_fault_mapping;
 mod rollback;
 mod user_copy;
+pub use pager_fault_mapping::map_current_prepared_pager_fault_frame_at;
 use owned_frames::{
     FRAME_BATCH_CHUNK, free_frame_buffer_tail, free_owned_frames_exact, free_owned_frames_logged,
     free_owned_frames_silently, free_rollback_frames_exact, remove_owned_frame, track_owned_frame,
@@ -45,10 +46,6 @@ const PAGE_4KIB_U64: u64 = PAGE_4KIB as u64;
 const USER_PML4_INDEX: usize = 1;
 pub const USER_SPACE_BASE: u64 = (USER_PML4_INDEX as u64) << 39;
 pub const USER_SPACE_END_EXCLUSIVE: u64 = ((USER_PML4_INDEX + 1) as u64) << 39;
-// Pager-leaf metadata is reserved while normal VMA policy runs. The fault path may
-// consume only those already-reserved slots, so resident working-set capacity is
-// independent of the bounded pool of simultaneously available fault frames.
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct PagerFaultLeaf {
     virtual_address: u64,
@@ -91,8 +88,6 @@ pub struct ProcessAddressSpace {
     next_user_addr: u64,
     owned_frames: Vec<u64>,
     regions: Vec<UserRegion>,
-    pager_fault_leaves: Vec<PagerFaultLeaf>,
-    pager_fault_leaf_limit: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -131,8 +126,6 @@ impl ProcessAddressSpace {
                 frames
             },
             regions: Vec::new(),
-            pager_fault_leaves: Vec::new(),
-            pager_fault_leaf_limit: 0,
         })
     }
 
@@ -147,8 +140,6 @@ impl ProcessAddressSpace {
             next_user_addr: USER_SPACE_BASE,
             owned_frames: Vec::new(),
             regions: Vec::new(),
-            pager_fault_leaves: Vec::new(),
-            pager_fault_leaf_limit: 0,
         }
     }
 
@@ -175,11 +166,16 @@ impl ProcessAddressSpace {
                 }
             }
         }
-        for leaf in &self.pager_fault_leaves {
+        // IRQ-off anonymous leaves are owned by their tagged PTEs rather than
+        // the legacy Vec ledger: collect them only in this normal clone path.
+        for leaf in self.irq_off_pager_fault_leaves()? {
             let virt = VirtAddr::new(leaf.virtual_address);
             let (src_phys, flags) = self
                 .translate_user_with_flags(virt)
                 .ok_or(AddressSpaceError::NotMapped)?;
+            if src_phys.as_u64() != leaf.physical_address {
+                return Err(AddressSpaceError::InvalidFrameOwnership);
+            }
             cloned.map_zeroed_user_pages_at(virt, 1, flags)?;
             let dst_phys = cloned
                 .translate_user(virt)
@@ -853,11 +849,6 @@ impl Drop for ProcessAddressSpace {
             recorded_frames.sort_unstable();
             recorded_frames.dedup();
             free_owned_frames_silently(recorded_frames.into_iter());
-            free_owned_frames_silently(
-                self.pager_fault_leaves
-                    .iter()
-                    .map(|leaf| leaf.physical_address),
-            );
             return;
         }
 
@@ -873,6 +864,13 @@ impl Drop for ProcessAddressSpace {
         if current_frame.start_address() == self.root_phys() {
             panic!("cannot drop the active process address space");
         }
+
+        // Capture CAS-installed frame ownership before freeing the table
+        // frames that contain their tagged PTEs.  A failure is an ownership
+        // contract violation, not a reason to leak a user frame silently.
+        let irq_off_pager_fault_frames = self
+            .irq_off_pager_fault_leaves()
+            .expect("IRQ-off pager-fault PTE ownership walk failed during address-space drop");
 
         let mut recorded_frames = self.owned_frames.clone();
         recorded_frames.sort_unstable();
@@ -899,7 +897,7 @@ impl Drop for ProcessAddressSpace {
         free_owned_frames_logged(self.pml4_frame_phys, recorded_frames.into_iter());
         free_owned_frames_logged(
             self.pml4_frame_phys,
-            self.pager_fault_leaves
+            irq_off_pager_fault_frames
                 .iter()
                 .map(|leaf| leaf.physical_address),
         );

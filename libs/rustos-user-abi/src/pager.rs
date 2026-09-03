@@ -19,6 +19,20 @@ pub use region_edit::{
 pub const PAGER_FAULT_ABI_VERSION: u16 = 2;
 pub const PAGER_PAGE_BYTES: u64 = 4096;
 
+/// Upper bound on pages one fault may populate, including the faulting page.
+///
+/// Anonymous first touch costs a full rendezvous round trip per fault, and a
+/// process that touches a fresh mapping linearly pays that per 4 KiB. Populating
+/// a short run around the faulting page amortizes the round trip the way Linux's
+/// `fault_around_bytes` does for file pages (64 KiB by default) and its
+/// multi-size THP does for anonymous ones - Linux deliberately batches at
+/// 16 KiB-512 KiB rather than jumping to a 2 MiB huge page, because the memory
+/// each fault has to *zero* is what sets the latency spike.
+///
+/// 16 pages is 64 KiB, matching that default. It is a cap, not a promise: ring0
+/// offers at most this many and never fewer than one.
+pub const PAGER_FAULT_RUN_PAGES_MAX: u32 = 16;
+
 /// Fixed number of ring0 fault slots a token may name.
 pub const PAGER_MAX_FAULT_SLOTS: usize = 128;
 
@@ -26,7 +40,7 @@ pub const PAGER_MAX_FAULT_SLOTS: usize = 128;
 ///
 /// Published here because a pager sizes its own region table against it: one
 /// process must not be able to wedge the pager for every other process.
-pub const PAGER_MAX_VMAS_PER_PROCESS: usize = 64;
+pub const PAGER_MAX_VMAS_PER_PROCESS: usize = 256;
 
 /// Regions a pager tracks across all processes.
 ///
@@ -330,7 +344,13 @@ pub struct PagerFaultDispatchWire {
     pub request: PagerFaultRequestWire,
     pub zeroed_frame_capability: u64,
     pub granted_frame_rights: u32,
-    pub reserved0: u32,
+    /// Pages ring0 is willing to populate for this fault, including the
+    /// faulting page itself. Always at least 1.
+    ///
+    /// Ring0 computes this from the VMA's remaining extent and its own reserve;
+    /// pagerd decides how many of them it actually wants
+    /// ([`PagerFaultReplyWire::map_run_pages`]). Mechanism here, policy there.
+    pub map_run_pages_offered: u32,
     pub reserved1: [u64; 2],
 }
 
@@ -344,7 +364,8 @@ impl PagerFaultDispatchWire {
             && !(self.granted_frame_rights & VM_PROT_WRITE != 0
                 && self.granted_frame_rights & VM_PROT_EXECUTE != 0)
             && self.granted_frame_rights & !self.request.object.rights == 0
-            && self.reserved0 == 0
+            && self.map_run_pages_offered >= 1
+            && self.map_run_pages_offered <= PAGER_FAULT_RUN_PAGES_MAX
             && self.reserved1[0] == 0
             && self.reserved1[1] == 0
     }
@@ -367,14 +388,23 @@ pub struct PagerFaultReplyWire {
     pub source_generation: u64,
     pub replay_generation: u64,
     pub disposition: u64,
-    pub reserved0: [u64; 2],
+    /// Pages pagerd wants populated, including the faulting page.
+    ///
+    /// Never more than [`PagerFaultDispatchWire::map_run_pages_offered`]. Ring0
+    /// treats every page past the first as best effort: the guaranteed frame is
+    /// reserved at exception time, while the rest come from the wired reserve
+    /// during reply handling, and a short reserve simply maps fewer. A fault is
+    /// never failed for want of a *surplus* page.
+    pub map_run_pages: u64,
+    pub reserved0: u64,
 }
 
 impl PagerFaultReplyWire {
     pub const fn is_canonical_for(self, request: PagerFaultRequestWire) -> bool {
         if self.version != PAGER_FAULT_ABI_VERSION
-            || self.reserved0[0] != 0
-            || self.reserved0[1] != 0
+            || self.reserved0 != 0
+            || self.map_run_pages == 0
+            || self.map_run_pages > PAGER_FAULT_RUN_PAGES_MAX as u64
             || self.fault_token != request.fault_token
             || self.process_generation != request.process_generation
             || self.task_generation != request.task_generation
@@ -531,6 +561,7 @@ mod tests {
             request,
             zeroed_frame_capability: 61,
             granted_frame_rights: VM_PROT_READ | VM_PROT_WRITE,
+            map_run_pages_offered: 1,
             ..PagerFaultDispatchWire::default()
         };
         assert!(dispatch.is_canonical());
@@ -545,6 +576,7 @@ mod tests {
             vma_generation: request.vma_generation,
             pager_epoch: request.object.pager_epoch,
             frame_capability: 61,
+            map_run_pages: 1,
             ..PagerFaultReplyWire::default()
         };
         assert!(reply.is_canonical_for(request));

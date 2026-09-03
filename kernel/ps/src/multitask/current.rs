@@ -34,7 +34,8 @@ pub use ipc::{
     wake_pager_service_waiter_for_process, wake_task,
 };
 pub use pager::{
-    PagerChargeSnapshot, current_pager_charge_snapshot, current_pager_vma_snapshot,
+    PagerChargeSnapshot, current_pager_charge_snapshot, current_pager_fault_install_permit,
+    current_pager_vma_snapshot,
     publish_current_pager_vma, publish_pager_vma_for_process, revoke_current_pager_vma,
     revoke_pager_vma_for_process,
 };
