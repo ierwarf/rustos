@@ -33,13 +33,14 @@ use super::*;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use rustos_user_abi::pager::{
+    PagerAnonymousPolicyWire,
     PAGER_MAX_FAULT_SLOTS, PAGER_MAX_FRAME_GRANTS, PAGER_MAX_VMAS_PER_PROCESS,
     PAGER_WIRED_FAULT_FRAMES, PagerEndpointCapabilityWire, PagerObjectIdentityWire,
     PagerVmRegionWire, VM_OBJECT_ANONYMOUS, VM_PROT_EXECUTE, VM_PROT_READ, VM_PROT_WRITE,
     VM_SHARING_PRIVATE,
 };
 use rustos_user_abi::syscall::{
-    IPC_SERVICE_PAGERD, IPC_SERVICE_ROOTD, IPC_SERVICE_STORAGED, IPC_SERVICE_VFSD,
+    IPC_SERVICE_PAGERD,
 };
 
 // The capacities ring0 compiles against and the ones the pager sizes its own
@@ -68,19 +69,6 @@ const _: () = assert!(
 
 /// Services that resolve or carry faults.
 ///
-/// Ring0 now answers anonymous faults itself, so a fault raised inside this
-/// graph no longer has to be resolved by a member of it and the recursive-fault
-/// cycle this exclusion was built for cannot form. The exclusion is kept as a
-/// deliberate conservative hold on boot-time memory behaviour for the five
-/// services the whole system starts through, not because a cycle remains.
-/// Removing it is a separate, separately measured change.
-const PAGER_CONTROL_GRAPH: [u64; 5] = [
-    IPC_SERVICE_PAGERD,
-    IPC_SERVICE_ROOTD,
-    IPC_SERVICE_VFSD,
-    IPC_SERVICE_STORAGED,
-    linux_abi::IPC_SERVICE_LINUX_SYSCALLD,
-];
 
 /// Epoch stamped into every ring0-owned anonymous object.
 ///
@@ -142,10 +130,19 @@ fn fault_endpoint() -> Option<PagerEndpointCapabilityWire> {
 /// service-endpoint registry lock, so every eligible anonymous `mmap` could
 /// acquire that lock up to five times and contend with service registration
 /// and lookup on a hot path.
-fn in_pager_control_graph(target_pid: u64) -> bool {
-    PAGER_CONTROL_GRAPH
+fn in_pager_control_graph(target_pid: u64, policy: PagerAnonymousPolicyWire) -> bool {
+    // Which services stay wired is a judgement about boot-time memory
+    // behaviour, not a mechanism, so the list comes from the published policy
+    // rather than a ring0 constant. Ring0 answers anonymous faults itself now,
+    // so the recursive-fault cycle the list was originally built for cannot
+    // form; keeping it is a conservative hold, which is exactly the kind of
+    // decision a pager should be able to change without a kernel edit.
+    policy
+        .wired_services
         .iter()
-        .any(|service_id| ipc_ops::process_owns_published_service_endpoint(target_pid, *service_id))
+        .copied()
+        .take_while(|service_id| *service_id != 0)
+        .any(|service_id| ipc_ops::process_owns_published_service_endpoint(target_pid, service_id))
 }
 
 /// Why an anonymous range is wired instead of demand-backed. Each variant is
@@ -162,6 +159,8 @@ pub(super) enum EagerByContract {
     PagerTransportAbsent,
     /// The target is a member of the wired pager control graph.
     PagerControlGraph,
+    /// The published policy admits nothing to demand paging.
+    PolicyDisabled,
     /// This process has used its bounded per-process demand-paging capacity
     /// (`PAGER_MAX_VMAS_PER_PROCESS`). Anonymous ranges beyond it are wired.
     ///
@@ -215,6 +214,7 @@ pub(super) enum AnonymousAdmission {
 /// class happened first and hides every later class behind it.
 static WIRED_TRANSPORT_ABSENT: AtomicU64 = AtomicU64::new(0);
 static WIRED_CONTROL_GRAPH: AtomicU64 = AtomicU64::new(0);
+static WIRED_POLICY_DISABLED: AtomicU64 = AtomicU64::new(0);
 static WIRED_PROCESS_VMA_CAPACITY: AtomicU64 = AtomicU64::new(0);
 static WIRED_STALE_REGION_OVERLAP: AtomicU64 = AtomicU64::new(0);
 static ADMISSION_PUBLISH_FAILED: AtomicU64 = AtomicU64::new(0);
@@ -294,6 +294,77 @@ pub(super) fn admit_anonymous_region(
         // here, so this is unreachable rather than ordinary. Fail closed.
         return AnonymousAdmission::Failed(LINUX_EINVAL);
     };
+    admit_anonymous_rights(target_pid, start, end, rights)
+}
+
+/// Publishes one inherited anonymous range for a forked child.
+///
+/// The rights come from the parent's published region rather than from a Linux
+/// `prot` word, because what fork inherits is the reservation the parent
+/// already holds, not the pages it happened to have touched.  The child takes
+/// a **fresh** object identity: fork is still an eager copy, so parent and
+/// child must not name one backing object.  Linux likewise gives the child its
+/// own `anon_vma` rather than sharing the parent's.
+///
+/// Every failure is a fork failure, never a wire fallback.  The child's
+/// publication table is a fresh slice of the same fixed size as the parent's,
+/// so it cannot be short of what the parent held, and the transport-absent and
+/// control-graph branches can only fire for a parent that had no demand VMA to
+/// inherit.  A refusal here therefore means something is wrong, and wiring the
+/// range instead would hide it behind an eagerly mapped child.
+pub(super) fn admit_inherited_anonymous_region(
+    target_pid: u64,
+    start: u64,
+    end: u64,
+    rights: u32,
+) -> Result<PagerVmRegionWire, i64> {
+    if rights == 0 || rights & !rustos_user_abi::pager::VM_PROT_KNOWN != 0 {
+        return Err(LINUX_EINVAL);
+    }
+    let policy = crate::pager_policy::anonymous_policy();
+    if policy.demand_enabled == 0 {
+        return Err(LINUX_ENOMEM);
+    }
+    let endpoint = fault_endpoint().ok_or(LINUX_ENOMEM)?;
+    if in_pager_control_graph(target_pid, policy) {
+        return Err(LINUX_ENOMEM);
+    }
+    let template =
+        region_template(start, end, rights, RING0_ANONYMOUS_EPOCH, endpoint).ok_or(LINUX_EINVAL)?;
+    multitask::publish_pager_vma_for_process(
+        target_pid,
+        template,
+        policy.process_vma_ceiling as usize,
+    )
+    .map_err(|error| {
+        record_admission_class(
+            &ADMISSION_PUBLISH_FAILED,
+            "pager-admission-publish-failed",
+            start,
+        );
+        let _ = error;
+        LINUX_ENOMEM
+    })
+}
+
+fn admit_anonymous_rights(
+    target_pid: u64,
+    start: u64,
+    end: u64,
+    rights: u32,
+) -> AnonymousAdmission {
+    let policy = crate::pager_policy::anonymous_policy();
+    // Whether anonymous ranges are demand-backed at all is the pager's call,
+    // not a ring0 constant. Zero means every range is wired, exactly as before
+    // demand paging existed - an explicit contract, not a downgrade.
+    if policy.demand_enabled == 0 {
+        record_admission_class(
+            &WIRED_POLICY_DISABLED,
+            "pager-wired-policy-disabled",
+            target_pid,
+        );
+        return AnonymousAdmission::Eager(EagerByContract::PolicyDisabled);
+    }
     let Some(endpoint) = fault_endpoint() else {
         record_admission_class(
             &WIRED_TRANSPORT_ABSENT,
@@ -302,7 +373,7 @@ pub(super) fn admit_anonymous_region(
         );
         return AnonymousAdmission::Eager(EagerByContract::PagerTransportAbsent);
     };
-    if in_pager_control_graph(target_pid) {
+    if in_pager_control_graph(target_pid, policy) {
         record_admission_class(
             &WIRED_CONTROL_GRAPH,
             "pager-wired-control-graph",
@@ -314,7 +385,13 @@ pub(super) fn admit_anonymous_region(
     else {
         return AnonymousAdmission::Failed(LINUX_EINVAL);
     };
-    match multitask::publish_pager_vma_for_process(target_pid, template) {
+    // The demand-paging ceiling is policy: it may narrow the fixed table, so a
+    // pager can bound one process's demand footprint without a kernel edit.
+    match multitask::publish_pager_vma_for_process(
+        target_pid,
+        template,
+        policy.process_vma_ceiling as usize,
+    ) {
         Ok(_) => AnonymousAdmission::Demand,
         // The bounded per-process VMA table is full. Wire the range and
         // count it; see `EagerByContract::ProcessVmaCapacity`.

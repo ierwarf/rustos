@@ -35,7 +35,7 @@ pub use ipc::{
 };
 pub use pager::{
     PagerChargeSnapshot, current_pager_charge_snapshot, current_pager_fault_install_permit,
-    current_pager_vma_snapshot,
+    current_pager_vma_snapshot, pager_vma_regions_for_process,
     publish_current_pager_vma, publish_pager_vma_for_process, revoke_current_pager_vma,
     revoke_pager_vma_for_process,
 };

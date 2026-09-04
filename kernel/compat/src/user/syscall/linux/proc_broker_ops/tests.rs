@@ -74,6 +74,39 @@ fn process_fork_commits_child_tid_before_runnable_publication() {
 }
 
 #[test]
+fn process_fork_inherits_the_parent_reservation_before_the_child_is_runnable() {
+    let source = include_str!("fork.rs");
+    let fork = source
+        .split("pub(super) fn syscall_linux_rustos_proc_fork_broker")
+        .nth(1)
+        .expect("fork broker");
+    let snapshot = fork
+        .find("pager_vma_regions_for_process")
+        .expect("parent reservation snapshot");
+    let clone = fork
+        .find("clone_user_space")
+        .expect("child address-space clone");
+    let suspended = fork
+        .find("spawn_user_process_state_suspended_with_parent")
+        .expect("suspended child publication");
+    let inherit = fork
+        .find("inherit_anonymous_pager_vmas")
+        .expect("child reservation publication");
+    let activate = fork
+        .find("activate_suspended_user_task")
+        .expect("runnable child activation");
+    // The snapshot takes the publication writer lock, and the range edits that
+    // lock guards take the process state lock inside it. Reading before the
+    // clone is what keeps that order one-directional.
+    assert!(snapshot < clone);
+    // The child is addressed by pid, so its reservation cannot be published
+    // before the child exists, and must be complete before anything runs on
+    // it: a runnable child missing a range its parent held faults into no VMA.
+    assert!(suspended < inherit);
+    assert!(inherit < activate);
+}
+
+#[test]
 fn loader_spawn_reserves_exact_identity_before_address_space_construction() {
     let source = include_str!("../proc_broker_ops.rs");
     let spawn = source

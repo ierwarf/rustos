@@ -474,22 +474,37 @@ fn stamped_region(
         .ok_or(PagerVmaError::Malformed)
 }
 
+/// Publishes one region, refusing beyond `ceiling` live regions.
+///
+/// `ceiling` is policy and arrives from the caller; this table only enforces
+/// it. It may narrow `MAX_PAGER_VMAS_PER_PROCESS`, which is the fixed array
+/// size, and is clamped to it here so a caller cannot widen a fixed table.
 pub(super) fn publish(
     handle: ProcessHandle,
     identity: ProcessIdentity,
     template: PagerVmRegionWire,
+    ceiling: usize,
 ) -> Result<PagerVmRegionWire, PagerVmaError> {
     if handle.generation() != identity.process_generation() {
         return Err(PagerVmaError::Stale);
     }
+    let ceiling = ceiling.min(MAX_PAGER_VMAS_PER_PROCESS);
+    if ceiling == 0 {
+        return Err(PagerVmaError::Pressure);
+    }
     let _writer = writer_lock(handle).ok_or(PagerVmaError::Stale)?.lock();
     let slots = process_slots(handle).ok_or(PagerVmaError::Stale)?;
+    let mut live = 0_usize;
     for existing in slots {
         if let Some(existing) = existing.snapshot()? {
             if template.start < existing.end && existing.start < template.end {
                 return Err(PagerVmaError::Overlap);
             }
+            live += 1;
         }
+    }
+    if live >= ceiling {
+        return Err(PagerVmaError::Pressure);
     }
     let slot = slots
         .iter()
@@ -503,6 +518,26 @@ pub(super) fn publish(
     let region = stamped_region(handle, identity, template, generation)?;
     slot.publish(Some(region))?;
     Ok(region)
+}
+
+/// Whether a published region still belongs to this exact process incarnation.
+///
+/// One definition and three callers, deliberately. A second copy of this
+/// comparison is not a cheap guard: a duplicate keeps rejecting when the real
+/// one is broken, which is exactly how the registered `identityExact` mutant
+/// survived a duplicated pre-filter once already. A filter may narrow by
+/// address extent; it may never restate an authority decision.
+///
+/// This function is the registered implementation-mutation anchor
+/// `pager-vma-publication-identity-bypass`.
+fn region_matches_identity(
+    region: PagerVmRegionWire,
+    process_slot: u64,
+    identity: ProcessIdentity,
+) -> bool {
+    region.process_handle == process_slot
+        && region.process_generation == u64::from(identity.process_generation())
+        && region.mm_generation == u64::from(identity.mm_generation())
 }
 
 /// Decides whether `access` is permitted by this region's protection.
@@ -556,15 +591,10 @@ pub(super) fn lookup_slot(
         let Some(region) = slot.snapshot()? else {
             continue;
         };
-        // Written in full rather than against the locals above on purpose:
-        // this exact expression is the registered implementation-mutation
-        // anchor `pager-vma-publication-identity-bypass`. The locals exist for
-        // `may_cover`, which runs per slot; this runs once per candidate, so
-        // spelling it out costs nothing and keeps the witness anchored.
-        if region.process_handle != process.slot()
-            || region.process_generation != u64::from(identity.process_generation())
-            || region.mm_generation != u64::from(identity.mm_generation())
-        {
+        // The locals above exist for `may_cover`, which runs per slot and
+        // decides on address extent only. This runs once per candidate and is
+        // the authority decision, so it goes through the single definition.
+        if !region_matches_identity(region, process.slot(), identity) {
             continue;
         }
         if region.contains(address) {
@@ -798,11 +828,7 @@ where
         )
         .map_err(|_| PagerVmaError::Pressure)?;
     for (_, region) in overlapping.iter().copied() {
-        if region.process_handle != process.slot()
-            || region.process_generation != u64::from(identity.process_generation())
-            || region.mm_generation != u64::from(identity.mm_generation())
-            || region.start > cursor
-        {
+        if !region_matches_identity(region, process.slot(), identity) || region.start > cursor {
             return Err(PagerVmaError::Stale);
         }
         // The split/trim/remove rule is the shared ABI one. pagerd applies the
@@ -967,22 +993,68 @@ pub fn unmap_for_process(
     Ok(unmapped.then(|| (process.slot(), process.generation())))
 }
 
+/// Every region this process has published, as one reading.
+///
+/// `lookup` answers "which VMA covers this address"; fork needs the whole set,
+/// because what a child inherits is the reservation, not the pages the parent
+/// happened to have touched. The writer lock makes the set one reading rather
+/// than a scan racing an `mmap` in another thread of the same process.
+///
+/// The result is bounded by the fixed per-process slot count, so the
+/// allocation is exact and cannot grow with the workload. Residue left by a
+/// previous occupant of these slots is skipped by the same identity comparison
+/// `lookup_slot` uses; it is never inherited.
+///
+/// **Lock order:** this takes the publication writer lock, and
+/// `unmap_for_process` takes the process state lock *inside* that lock. So a
+/// caller must not already hold the process state lock, and fork does not:
+/// it reads this before it clones the address space.
+pub(super) fn snapshot_regions(
+    handle: ProcessHandle,
+    identity: ProcessIdentity,
+) -> Result<Vec<PagerVmRegionWire>, PagerVmaError> {
+    if handle.generation() != identity.process_generation() {
+        return Err(PagerVmaError::Stale);
+    }
+    let process = handle.object_identity().ok_or(PagerVmaError::Stale)?;
+    let _writer = writer_lock(handle).ok_or(PagerVmaError::Stale)?.lock();
+    let slots = process_slots(handle).ok_or(PagerVmaError::Stale)?;
+    let mut regions = Vec::new();
+    regions
+        .try_reserve_exact(MAX_PAGER_VMAS_PER_PROCESS)
+        .map_err(|_| PagerVmaError::Pressure)?;
+    for slot in slots {
+        let Some(region) = slot.snapshot()? else {
+            continue;
+        };
+        if !region_matches_identity(region, process.slot(), identity) {
+            continue;
+        }
+        regions.push(region);
+    }
+    Ok(regions)
+}
+
 pub(super) fn revoke(
     handle: ProcessHandle,
     identity: ProcessIdentity,
     start: u64,
     vma_generation: u64,
 ) -> Result<PagerVmRegionWire, PagerVmaError> {
+    let process = handle.object_identity().ok_or(PagerVmaError::Stale)?;
     let _writer = writer_lock(handle).ok_or(PagerVmaError::Stale)?.lock();
     let slots = process_slots(handle).ok_or(PagerVmaError::Stale)?;
     for slot in slots {
         let Some(region) = slot.snapshot()? else {
             continue;
         };
+        // Through the single identity definition like every other authority
+        // decision here. This also adds the exact process-slot comparison the
+        // open-coded version omitted, so residue left by a previous occupant
+        // of these slots can no longer be revoked through this handle.
         if region.start == start
             && region.vma_generation == vma_generation
-            && region.process_generation == u64::from(identity.process_generation())
-            && region.mm_generation == u64::from(identity.mm_generation())
+            && region_matches_identity(region, process.slot(), identity)
         {
             slot.publish(None)?;
             return Ok(region);

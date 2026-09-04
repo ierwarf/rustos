@@ -51,7 +51,7 @@ static READ_FIRST_TOUCHES: AtomicU64 = AtomicU64::new(0);
 /// `PAGER_FAULT_RUN_PAGES_MAX`. An unresolvable region offers exactly the
 /// faulting page: the guaranteed one.
 fn offered_run_pages(request: PagerFaultRequestWire) -> u32 {
-    use rustos_user_abi::pager::{PAGER_FAULT_RUN_PAGES_MAX, PAGER_PAGE_BYTES};
+    use rustos_user_abi::pager::PAGER_PAGE_BYTES;
 
     let Ok(snapshot) = ps_api::validate_fault_request(request) else {
         return 1;
@@ -59,10 +59,11 @@ fn offered_run_pages(request: PagerFaultRequestWire) -> u32 {
     let Some(remaining) = snapshot.region.end.checked_sub(request.virtual_address) else {
         return 1;
     };
+    // The published run length, which the validator keeps at or below
+    // `PAGER_FAULT_RUN_PAGES_MAX`, so the offer stays a canonical wire value.
+    let run_pages = u64::from(crate::pager_policy::anonymous_policy().fault_run_pages);
     let pages = remaining / PAGER_PAGE_BYTES;
-    u32::try_from(pages.min(u64::from(PAGER_FAULT_RUN_PAGES_MAX)))
-        .unwrap_or(1)
-        .max(1)
+    u32::try_from(pages.min(run_pages)).unwrap_or(1).max(1)
 }
 
 pub(crate) fn dispatch_wire(reservation: ps_api::PagerFaultReservation) -> PagerFaultDispatchWire {
@@ -473,7 +474,7 @@ fn populate_run_under_permit(
     region_start: u64,
     region_end: u64,
 ) -> u64 {
-    use rustos_user_abi::pager::{PAGER_FAULT_RUN_PAGES_MAX, PAGER_PAGE_BYTES};
+    use rustos_user_abi::pager::PAGER_PAGE_BYTES;
 
     // Align the run down to its own size, the way Linux picks an mTHP folio:
     // `ALIGN_DOWN(address, PAGE_SIZE << order)`. Running forward from wherever
@@ -481,7 +482,15 @@ fn populate_run_under_permit(
     // neighbouring run already installed; aligned blocks tile the region
     // instead, so a sequential walk touches each block exactly once and a
     // re-fault inside a populated block finds it whole.
-    let block_bytes = u64::from(PAGER_FAULT_RUN_PAGES_MAX) * PAGER_PAGE_BYTES;
+    //
+    // How long the run is comes from the published policy rather than a ring0
+    // constant: it trades zeroing latency against amplification under sparse
+    // access, which is a workload judgement the pager owns. Reading it here is
+    // one acquire load of an immutable publication, so the IRQ-off contract
+    // above is unaffected. The policy validator keeps it a power of two, which
+    // is what makes the alignment below tile rather than straddle.
+    let run_pages = u64::from(crate::pager_policy::anonymous_policy().fault_run_pages);
+    let block_bytes = run_pages * PAGER_PAGE_BYTES;
     let block_start = (request.virtual_address / block_bytes) * block_bytes;
     let Some(block_end) = block_start.checked_add(block_bytes) else {
         return 0;

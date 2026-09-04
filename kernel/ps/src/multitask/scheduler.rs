@@ -38,6 +38,7 @@ pub(in crate::multitask) mod ipc_donation;
 mod linux_thread_state;
 mod locality;
 mod pager_handoff;
+pub use pager_handoff::PagerFaultHandoffOutcome;
 mod reclaim;
 mod runqueue;
 mod runqueue_policy;
@@ -49,7 +50,6 @@ mod task_directory;
 mod task_wait;
 mod task_weight;
 mod wake_handoff;
-pub use pager_handoff::PagerFaultHandoffOutcome;
 pub use runtime_profile::drain_scheduler_runtime_profile;
 pub(in crate::multitask) use runtime_profile::{
     SchedulerEntryCause, publish_scheduler_runtime_profile,

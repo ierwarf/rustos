@@ -34,14 +34,17 @@ use core::panic::PanicInfo;
 use pagerd::{request_sender_is_authorized, PagerFaultError, PagerState};
 use rustos_svc_runtime::{ipc, pager as pager_rendezvous};
 use rustos_user_abi::pager::{
-    pager_pressure_name, PagerFaultDispatchWire, PagerProtectRangeWire, PagerReleaseRangeWire,
-    PagerVmRegionWire,
+    pager_pressure_name, PagerAnonymousPolicyWire, PagerFaultDispatchWire, PagerProtectRangeWire,
+    PagerReleaseRangeWire, PagerVmRegionWire, PAGER_FAULT_ABI_VERSION, PAGER_FAULT_RUN_PAGES_MAX,
+    PAGER_MAX_VMAS_PER_PROCESS, PAGER_MAX_WIRED_SERVICES, MM_BROKER_OP_SET_ANON_POLICY,
 };
 use rustos_user_abi::syscall::{
     CommercialMaxProtocolRequest, CommercialMaxProtocolResponse,
     COMMERCIAL_MAX_PAGERD_OP_BACKING_OBJECT, COMMERCIAL_MAX_PAGERD_OP_PROTECT_OBJECT,
     COMMERCIAL_MAX_PAGERD_OP_RELEASE_OBJECT, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
-    COMMERCIAL_MAX_PROTOCOL_PAGERD, IPC_MAX_INLINE_BYTES, IPC_SERVICE_PAGERD,
+    COMMERCIAL_MAX_PROTOCOL_PAGERD, IPC_MAX_INLINE_BYTES, IPC_SERVICE_PAGERD, IPC_SERVICE_ROOTD,
+    IPC_SERVICE_STORAGED, IPC_SERVICE_VFSD, MM_BROKER_ABI_VERSION,
+    IPC_SERVICE_LINUX_SYSCALLD, RustosMmBrokerArgs, SYS_RUSTOS_MM_BROKER,
 };
 
 rustos_svc_runtime::entry!(service_main);
@@ -62,8 +65,65 @@ fn service_main() {
         return;
     }
     ipc::debug_line("pagerd: pager policy endpoint registered");
+    publish_anonymous_policy();
     let mut pager = PagerState::new(1);
     serve(endpoint as u64, &mut pager);
+}
+
+/// Hands ring0 the anonymous-mapping policy this pager wants enforced.
+///
+/// These are arbitration decisions - how much one fault populates, how many
+/// demand-paged regions a process may hold, which services stay wired - not
+/// mechanism, so they belong here. They lived as ring0 constants only because
+/// the sole transport was a synchronous call on the fault path, which measured
+/// 5.7 ms p99 on `mmap`. Publishing once costs the fault path nothing: ring0
+/// reads an immutable publication with a single acquire.
+///
+/// Published after the endpoint exists, because ring0 authorizes this by the
+/// caller owning the pager service endpoint rather than by a PID. Ring0 keeps
+/// its own default until this lands and refuses a second publication, so a
+/// failure here leaves the system on that default rather than half-configured.
+fn publish_anonymous_policy() {
+    let mut wired_services = [0_u64; PAGER_MAX_WIRED_SERVICES];
+    // The services the whole system starts through. Ring0 answers anonymous
+    // faults itself now, so the recursive-fault cycle this list was built for
+    // cannot form; it stays as a conservative hold on boot-time memory
+    // behaviour, and it is this pager's call to keep or drop.
+    wired_services[0] = IPC_SERVICE_PAGERD;
+    wired_services[1] = IPC_SERVICE_ROOTD;
+    wired_services[2] = IPC_SERVICE_VFSD;
+    wired_services[3] = IPC_SERVICE_STORAGED;
+    wired_services[4] = IPC_SERVICE_LINUX_SYSCALLD;
+    let policy = PagerAnonymousPolicyWire {
+        version: PAGER_FAULT_ABI_VERSION,
+        reserved0: 0,
+        fault_run_pages: PAGER_FAULT_RUN_PAGES_MAX,
+        process_vma_ceiling: PAGER_MAX_VMAS_PER_PROCESS as u32,
+        demand_enabled: 1,
+        wired_services,
+        reserved1: [0; 2],
+    };
+    let args = RustosMmBrokerArgs {
+        abi_version: MM_BROKER_ABI_VERSION,
+        op: MM_BROKER_OP_SET_ANON_POLICY,
+        addr: (&policy as *const PagerAnonymousPolicyWire) as u64,
+        ..RustosMmBrokerArgs::default()
+    };
+    // SAFETY: the broker takes one pointer to a caller-owned `repr(C)` struct
+    // and copies it out before returning; `args` and the `policy` it points at
+    // both outlive this call, and ring0 validates every field before it can
+    // become policy.
+    let status = unsafe {
+        rustos_svc_runtime::syscall::syscall1(
+            SYS_RUSTOS_MM_BROKER,
+            (&args as *const RustosMmBrokerArgs) as u64,
+        )
+    };
+    if status < 0 {
+        ipc::debug_line("pagerd: anonymous policy publication refused");
+    } else {
+        ipc::debug_line("pagerd: anonymous policy published");
+    }
 }
 
 fn serve(endpoint: u64, pager: &mut PagerState) {

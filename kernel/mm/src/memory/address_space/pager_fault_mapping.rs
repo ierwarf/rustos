@@ -22,11 +22,14 @@ pub(crate) fn without_irq_off_pager_fault_tag(flags: PageTableFlags) -> PageTabl
     flags.difference(IRQ_OFF_PAGER_FAULT_LEAF)
 }
 
-/// Software-owned directory bit for intermediate tables published by the
-/// IRQ-off anonymous fault path.  It is an x86 available-to-software bit, and
-/// it marks a table whose frame is accounted by the per-process lazy-table
-/// counter rather than by the `owned_frames` ledger.
-pub(crate) const LAZY_PAGER_FAULT_TABLE: PageTableFlags = PageTableFlags::BIT_10;
+/// Software-owned directory bit for every dynamically published user table.
+///
+/// Both normal-time mappers and IRQ-off anonymous faults claim the same
+/// root-owned table descriptor before their parent-entry CAS. This x86
+/// available-to-software bit is the independent topology witness used to
+/// reconcile that descriptor list at retirement; table frames never belong to
+/// the data-leaf `owned_frames` ledger.
+pub(crate) const ROOT_OWNED_USER_TABLE: PageTableFlags = PageTableFlags::BIT_10;
 
 /// The physical-address field of a paging-structure entry.
 const TABLE_ENTRY_ADDR_MASK: u64 = 0x000f_ffff_ffff_f000;
@@ -127,7 +130,7 @@ fn tagged_child_of(
     if !flags.contains(PageTableFlags::PRESENT) {
         return Err(AddressSpaceError::InvalidFrameOwnership);
     }
-    if flags.contains(LAZY_PAGER_FAULT_TABLE) {
+    if flags.contains(ROOT_OWNED_USER_TABLE) {
         tables.push(entry.addr().as_u64());
     }
     Ok(Some(entry.addr()))
@@ -201,9 +204,10 @@ pub fn ensure_current_fault_tables_at(
     mut release: impl FnMut(u64),
 ) -> Result<usize, AddressSpaceError> {
     validate_user_page_range(start, 1)?;
-    let table_flags = user_table_flags() | LAZY_PAGER_FAULT_TABLE;
+    let table_flags = user_table_flags() | ROOT_OWNED_USER_TABLE;
     let mut published = 0;
-    let mut parent = kernel_vm::current_root_phys();
+    let root_phys = kernel_vm::current_root_phys().as_u64();
+    let mut parent = PhysAddr::new(root_phys);
     for index in [p4_index(start), p3_index(start), p2_index(start)] {
         parent = match read_user_table_entry(parent, index)? {
             Some(child) => child,
@@ -220,16 +224,23 @@ pub fn ensure_current_fault_tables_at(
                     release(frame);
                     return Err(AddressSpaceError::InvalidFrameOwnership);
                 }
+                if !crate::memory::phys::claim_lazy_table_record(root_phys, frame) {
+                    release(frame);
+                    return Err(AddressSpaceError::InvalidFrameOwnership);
+                }
                 match publish_user_table_entry(parent, index, PhysAddr::new(frame), table_flags) {
                     Ok((child, true)) => {
+                        crate::memory::phys::publish_lazy_table_record(root_phys, frame);
                         published += 1;
                         child
                     }
                     Ok((child, false)) => {
+                        crate::memory::phys::cancel_lazy_table_record(root_phys, frame);
                         release(frame);
                         child
                     }
                     Err(error) => {
+                        crate::memory::phys::cancel_lazy_table_record(root_phys, frame);
                         release(frame);
                         return Err(error);
                     }
@@ -317,9 +328,10 @@ impl ProcessAddressSpace {
         let root = self.root_phys();
         let mutation = begin_address_space_mutation(root);
         let tables = (|| {
-            let pdpt_phys = ensure_next_table(&mut self.owned_frames, root, p4_index(start))?;
-            let pd_phys = ensure_next_table(&mut self.owned_frames, pdpt_phys, p3_index(start))?;
-            ensure_next_table(&mut self.owned_frames, pd_phys, p2_index(start))
+            let root_phys = root.as_u64();
+            let pdpt_phys = ensure_next_table(root_phys, root, p4_index(start))?;
+            let pd_phys = ensure_next_table(root_phys, pdpt_phys, p3_index(start))?;
+            ensure_next_table(root_phys, pd_phys, p2_index(start))
         })();
         if let Err(error) = tables {
             drop(mutation);
@@ -539,11 +551,11 @@ impl ProcessAddressSpace {
     /// Collects every frame whose ownership lives in a page-table tag rather than
     /// in the `owned_frames` ledger.
     ///
-    /// The fault path cannot push to a `Vec` that sits behind a sleepable lock,
-    /// so what it publishes is recorded by a software tag instead:
-    /// `IRQ_OFF_PAGER_FAULT_LEAF` for a data leaf, `LAZY_PAGER_FAULT_TABLE` for
-    /// an intermediate table.  This normal-context walk is how retirement
-    /// reclaims both, and how the two ledgers are checked against each other.
+    /// Fault-installed data leaves cannot enter the sleepable `Vec` ledger, so
+    /// their PTE carries `IRQ_OFF_PAGER_FAULT_LEAF`. Every dynamically created
+    /// user table carries `ROOT_OWNED_USER_TABLE`, regardless of whether a
+    /// normal mapper or a fault published it. This normal-context walk is how
+    /// retirement reconciles tags with the root-owned descriptor list.
     ///
     /// A non-zero intermediate entry that is not present, or a huge entry in
     /// the user subtree, is not a reclaim failure but a structural violation:
@@ -693,7 +705,7 @@ mod tests {
 
     #[test]
     fn the_two_software_ownership_tags_are_distinct_available_bits() {
-        assert_ne!(IRQ_OFF_PAGER_FAULT_LEAF, LAZY_PAGER_FAULT_TABLE);
+        assert_ne!(IRQ_OFF_PAGER_FAULT_LEAF, ROOT_OWNED_USER_TABLE);
         // Neither may overlap a bit the translation or protection decision
         // reads, or the tag would change what the hardware does.
         let hardware = PageTableFlags::PRESENT
@@ -705,7 +717,7 @@ mod tests {
             | PageTableFlags::GLOBAL
             | PageTableFlags::NO_EXECUTE;
         assert!(!hardware.intersects(IRQ_OFF_PAGER_FAULT_LEAF));
-        assert!(!hardware.intersects(LAZY_PAGER_FAULT_TABLE));
+        assert!(!hardware.intersects(ROOT_OWNED_USER_TABLE));
     }
 
     #[test]
@@ -728,7 +740,7 @@ mod tests {
         );
         // The ownership tag must change neither the verdict nor the address.
         assert_eq!(
-            classify_user_table_entry(published | LAZY_PAGER_FAULT_TABLE.bits()),
+            classify_user_table_entry(published | ROOT_OWNED_USER_TABLE.bits()),
             Ok(PhysAddr::new(table))
         );
     }

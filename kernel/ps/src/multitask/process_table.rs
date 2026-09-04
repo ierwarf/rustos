@@ -228,7 +228,7 @@ mod identity;
 pub(super) use identity::published_live_process_identity;
 pub use identity::{
     ProcessHandle, ProcessIdentity, ProcessRef, live_process_identity,
-    live_process_identity_by_pid, release_process_ref, retain_process, retain_process_by_pid,
+    live_process_identity_by_pid, retain_process, retain_process_by_pid,
 };
 #[cfg(test)]
 use identity::{clear_publication_for_test, process_state_is_visible};

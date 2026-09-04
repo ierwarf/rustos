@@ -9,7 +9,6 @@ kernel/io-manager/src/input/dvm_ring.rs	1606	io-input	Split aperture admission, 
 kernel/io-manager/src/io/dvm_display.rs	1835	io-display	Split handshake, shared-surface lifecycle, present queue, and tests.
 kernel/ipc-runtime/src/ipc/mod.rs	3170	ipc-runtime	Extract the fixed FastCallFrame state machine into ipc/fast_call.rs, then split endpoint, reply, shared-region, and accounting modules.
 kernel/ipc-runtime/src/ipc/tests.rs	1306	ipc-runtime	Split endpoint call/reply tests, shared-region tests, and handle-transfer tests into sibling modules under ipc/tests/, alongside the existing reply_publication_tests.rs.
-kernel/mm/src/memory/phys.rs	1302	memory-phys	Split boot memory-map admission, the frame bitmap allocator, fixed-range claims, and tests.
 kernel/mm/src/memory/kernel_vm.rs	1435	memory-kernel-vm	Split PAT/cache policy, direct-map transactions, high-window mappings, and tests.
 kernel/ps/src/multitask/process_table.rs	1806	process-table	Split lifecycle transaction state and markers into process_table/lifecycle.rs, then the own-thread pin, retained exact-MM generation access, and identity adapters into process_table/identity.rs.
 kernel/ps/src/multitask/scheduler.rs	5509	scheduler	The terminal reply/pager wake-handoff layer now lives in scheduler/wake_handoff.rs. Next: split run queues, wakeup, deadlines, switching, accounting, and tests.

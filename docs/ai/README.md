@@ -22,6 +22,9 @@ refactoring, recovery, and review.
 | `smp-contract.md` | Multi-CPU release gate: AP startup, per-CPU scheduler/IPI/TLB/futex ownership, qualification matrix. |
 | `system-flows.md` | Machine-linked end-to-end exception, IPC, wait-set, VFS, endpoint, and restart lifecycles. |
 | `pager-protocol-contract.md` | Demand-paging protocol across ring0 and pagerd: per-resource ownership and return points, the one range-edit rule both replicas apply, capacity relations, the progress condition, and the pressure codes. |
+| `address-space-lifecycle-contract.md` | Fork/unmap/pressure/teardown conformance to general-purpose MM: the fork reservation defect, per-operation batching, one reservation authority, the missing watermark/OOM endgame, allocation-free retirement, and the withdrawn table-reclaim hazard protocol. |
+| `page-table-reclamation-contract.md` | Dynamic page-table descriptor lifetime and the order in which live empty-table reclamation may be enabled. |
+| `fork-cow-contract.md` | Admission and teardown gate that must be implemented and proven before any private anonymous mapping may be shared across a fork. |
 | `commercial-quality-gates.md` | Non-negotiable definition of done and risk-ordered release acceptance scope. |
 | `physical-gpu-status.md` | Current physical GPU evidence boundary, userspace wait-set release gates, and continuation rules. |
 | `performance-hardening.md` | Boot/runtime bottleneck triage, provider policy, cleanup rules. |

@@ -33,6 +33,20 @@ pub(super) fn syscall_linux_rustos_proc_fork_broker(args_ptr: u64) -> u64 {
         Some(reservation) => reservation,
         None => return linux_errno(LINUX_EAGAIN),
     };
+    // Read the parent's reservation before its address space is cloned.  This
+    // cannot move inside the clone below: `snapshot_regions` takes the
+    // publication writer lock, and `unmap_for_process` takes the process state
+    // lock inside that same lock, so holding the state lock here would invert
+    // the order.  A concurrent `mmap` in another parent thread between this
+    // read and the clone is therefore not covered; Linux closes that window
+    // with `mmap_lock`, which this kernel has no equivalent of on both sides.
+    let inherited_regions = match multitask::pager_vma_regions_for_process(args.source_pid) {
+        Ok(regions) => regions,
+        Err(_) => {
+            let _ = multitask::cancel_process_spawn(spawn_reservation);
+            return linux_errno(LINUX_ENOMEM);
+        }
+    };
     let child_state = match multitask::with_process_state_by_pid(args.source_pid, |parent| {
         let address_space = parent.address_space().clone_user_space()?;
         if args.clone_flags & linux_abi::CLONE_CHILD_SETTID != 0 {
@@ -111,6 +125,18 @@ pub(super) fn syscall_linux_rustos_proc_fork_broker(args_ptr: u64) -> u64 {
             return linux_errno(process_spawn_error_to_linux_errno(err));
         }
     };
+    // The child now exists but is still suspended, which is the only point at
+    // which its reservation can be published: the target is addressed by pid,
+    // and nothing may observe a runnable child whose address space is missing
+    // ranges its parent held.  A failure here revokes what it published and
+    // destroys the child, exactly as a `dup_mmap` failure destroys the child mm.
+    if let Err(errno) = crate::user::syscall::linux::mm_broker_ops::inherit_anonymous_pager_vmas(
+        child_pid,
+        &inherited_regions,
+    ) {
+        let _ = multitask::terminate_user_task(child_pid);
+        return linux_errno(errno);
+    }
     if args.clone_flags & linux_abi::CLONE_CHILD_SETTID != 0 {
         let child_tid = (child_pid as u32).to_le_bytes();
         let write_result = multitask::with_process_state_by_pid_mut(child_pid, |child| {

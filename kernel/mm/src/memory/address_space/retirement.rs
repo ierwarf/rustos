@@ -4,8 +4,8 @@
 //!   address space allocated.
 //! - **Boundary:** retirement runs only once the TLB protocol has proved the
 //!   root inactive on every CPU and no task can still reference it.
-//! - **Lifecycle:** retire the root → walk tag-recorded ownership → reconcile
-//!   the two ledgers → free.
+//! - **Lifecycle:** retire the root → walk tag-recorded ownership → drain and
+//!   reconcile the three ledgers → free.
 //! - **Concurrency:** no installer can run here; the address space is inactive
 //!   and unreachable, which is what makes the walk a stable reading.
 //! - **Failure:** a reclaim refusal is a leak with a diagnostic; a structural
@@ -58,26 +58,41 @@ impl Drop for ProcessAddressSpace {
                 self.pml4_frame_phys, error
             ),
         };
+        let mut explicit_tables =
+            crate::memory::phys::drain_lazy_table_records(self.pml4_frame_phys);
+        explicit_tables.sort_unstable();
 
         let mut recorded_frames = self.owned_frames.clone();
         recorded_frames.sort_unstable();
-        recorded_frames.dedup();
-        if recorded_frames.len() != self.owned_frames.len() {
-            crate::debug::println!(
-                "process address space: duplicate owned frame entries detected root={:#x} owned={} unique={}",
-                self.pml4_frame_phys,
-                self.owned_frames.len(),
-                recorded_frames.len(),
-            );
-        }
-        if recorded_frames.is_empty() {
-            crate::debug::println!(
-                "process address space: missing ownership ledger root={:#x}",
-                self.pml4_frame_phys,
-            );
-            recorded_frames.push(self.pml4_frame_phys);
-        }
+        // A duplicate here is the same corruption class as a cross-ledger
+        // overlap: `track_owned_frame` rejects a repeat insertion, so a repeat
+        // that reached retirement means one frame is about to be returned
+        // twice. Logging and deduplicating hid that behind a diagnostic while
+        // the neighbouring disagreement stopped the kernel.
+        assert!(
+            recorded_frames.windows(2).all(|pair| pair[0] != pair[1]),
+            "process address space: duplicate owned frame entry root={:#x} owned={}",
+            self.pml4_frame_phys,
+            self.owned_frames.len(),
+        );
+        // `new` tracks the root before the address space can be observed, and
+        // nothing unmaps it, so a ledger that has lost the root has lost
+        // entries. Reconstructing a one-frame ledger from the root leaked
+        // every other frame the process owned and reported it as a log line.
+        assert!(
+            recorded_frames
+                .binary_search(&self.pml4_frame_phys)
+                .is_ok(),
+            "process address space: ownership ledger lost its root root={:#x} owned={}",
+            self.pml4_frame_phys,
+            recorded_frames.len(),
+        );
         assert_ledgers_are_disjoint(self.pml4_frame_phys, &recorded_frames, &mut tagged);
+        assert_eq!(
+            explicit_tables, tagged.tables,
+            "process address space: explicit lazy-table ledger disagrees with PTE tags root={:#x}",
+            self.pml4_frame_phys,
+        );
 
         // owned_frames is the allocation ledger. A page-table walk is not an
         // ownership oracle because shared memfd and device mappings install
@@ -87,17 +102,18 @@ impl Drop for ProcessAddressSpace {
             self.pml4_frame_phys,
             tagged.leaves.iter().map(|leaf| leaf.physical_address),
         );
-        free_owned_frames_logged(self.pml4_frame_phys, tagged.tables.iter().copied());
+        free_owned_frames_logged(self.pml4_frame_phys, explicit_tables.into_iter());
     }
 }
 
-/// Fails stop when one frame is claimed by more than one ownership ledger.
+/// Fails stop when a frame appears in both normal-time and tagged ownership.
 ///
-/// The two ledgers are written by different paths - the normal-time mapping
+/// Those ledgers are written by different paths - the normal-time mapping
 /// transaction under its lock, and the exception-time installer through a
-/// page-table tag - and neither can observe the other while it writes. Their
-/// disagreement is therefore not recoverable bookkeeping: it means one frame is
-/// about to be returned to the allocator twice.
+/// page-table tag - and neither can observe the other while it writes. The
+/// explicit root-owned lazy-table ledger is checked for exact equality with the
+/// tags immediately afterwards. Any disagreement is corruption: it means one
+/// frame is about to be returned to the allocator twice.
 ///
 /// `recorded_frames` must be sorted; `tagged.tables` is sorted here.
 fn assert_ledgers_are_disjoint(
@@ -122,5 +138,53 @@ fn assert_ledgers_are_disjoint(
             tagged.tables.binary_search(&frame).is_err(),
             "process address space: frame claimed as both leaf and table root={root_phys:#x} frame={frame:#x}"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tagged(tables: &[u64], leaves: &[(u64, u64)]) -> PagerFaultOwnership {
+        PagerFaultOwnership {
+            tables: tables.to_vec(),
+            leaves: leaves
+                .iter()
+                .map(|&(virtual_address, physical_address)| PagerFaultLeaf {
+                    virtual_address,
+                    physical_address,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn ledgers_that_name_no_common_frame_are_accepted() {
+        let mut ownership = tagged(&[0x5000, 0x4000], &[(0x1_0000_0000, 0x6000)]);
+        assert_ledgers_are_disjoint(0x1000, &[0x1000, 0x2000, 0x3000], &mut ownership);
+        // The check sorts the tables it is given, because the leaf pass below
+        // it binary-searches them.
+        assert_eq!(ownership.tables, alloc::vec![0x4000, 0x5000]);
+    }
+
+    #[test]
+    #[should_panic(expected = "table frame claimed by both ownership ledgers")]
+    fn a_table_frame_in_both_ledgers_stops_the_kernel() {
+        let mut ownership = tagged(&[0x2000], &[]);
+        assert_ledgers_are_disjoint(0x1000, &[0x1000, 0x2000], &mut ownership);
+    }
+
+    #[test]
+    #[should_panic(expected = "leaf frame claimed by both ownership ledgers")]
+    fn a_leaf_frame_in_both_ledgers_stops_the_kernel() {
+        let mut ownership = tagged(&[], &[(0x1_0000_0000, 0x2000)]);
+        assert_ledgers_are_disjoint(0x1000, &[0x1000, 0x2000], &mut ownership);
+    }
+
+    #[test]
+    #[should_panic(expected = "frame claimed as both leaf and table")]
+    fn one_frame_cannot_be_owned_as_both_a_leaf_and_a_table() {
+        let mut ownership = tagged(&[0x4000], &[(0x1_0000_0000, 0x4000)]);
+        assert_ledgers_are_disjoint(0x1000, &[0x1000], &mut ownership);
     }
 }

@@ -14,14 +14,13 @@
 //! - **Evidence:** `physical-frame-lifecycle`.
 use boot_protocol::{BootInfo, BootMemoryKind, BootMemoryRegion};
 use core::ptr;
-use core::sync::atomic::{AtomicU64, Ordering};
 
 use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
-use x86_64::PhysAddr;
 #[cfg(all(rustos_boot_image, not(test)))]
 use x86_64::instructions::interrupts;
+use x86_64::PhysAddr;
 
-use crate::memory::kernel_vm::{DIRECT_MAP_PHYS_LIMIT, higher_half_addr};
+use crate::memory::kernel_vm::{higher_half_addr, DIRECT_MAP_PHYS_LIMIT};
 
 const PAGE_SIZE: u64 = 4096;
 const BITS_PER_WORD: usize = 64;
@@ -31,66 +30,14 @@ const PHYS_ALLOC_SCAN_MILESTONE_FRAMES: usize = 64 * 1024;
 static PHYS_ALLOCATOR: TrackedSpinLock<PhysAllocatorState, { LockClass::PhysicalAllocator as u8 }> =
     TrackedSpinLock::new(PhysAllocatorState::new());
 
-/// Count-only workload evidence for the batched allocator. These atomics never
-/// participate in admission and add no TSC read to the allocator critical
-/// section. A drain publishes `(frames, lock acquisitions)` for each class.
-// ORDERING: Profile counts are diagnostic-only and intentionally approximate;
-// the AcqRel drain claim below only elects one emitter for each time window.
-struct FrameBatchProfile {
-    alloc_frames: AtomicU64,
-    alloc_batches: AtomicU64,
-    alloc_short: AtomicU64,
-    free_frames: AtomicU64,
-    free_batches: AtomicU64,
-    free_failures: AtomicU64,
-    rollback_frames: AtomicU64,
-    rollback_batches: AtomicU64,
-    rollback_failures: AtomicU64,
-    last_drain_tick: AtomicU64,
-}
+mod lazy_table_ledger;
+pub use lazy_table_ledger::{
+    cancel_lazy_table_record, claim_lazy_table_record, drain_lazy_table_records,
+    publish_lazy_table_record, register_lazy_table_root,
+};
+use lazy_table_ledger::{LazyTableLedgerRecord, LAZY_TABLE_LEDGER};
 
-impl FrameBatchProfile {
-    const fn new() -> Self {
-        Self {
-            alloc_frames: AtomicU64::new(0),
-            alloc_batches: AtomicU64::new(0),
-            alloc_short: AtomicU64::new(0),
-            free_frames: AtomicU64::new(0),
-            free_batches: AtomicU64::new(0),
-            free_failures: AtomicU64::new(0),
-            rollback_frames: AtomicU64::new(0),
-            rollback_batches: AtomicU64::new(0),
-            rollback_failures: AtomicU64::new(0),
-            last_drain_tick: AtomicU64::new(0),
-        }
-    }
-
-    fn record_allocation(&self, requested: usize, filled: usize) {
-        self.alloc_frames
-            .fetch_add(filled as u64, Ordering::Relaxed);
-        self.alloc_batches.fetch_add(1, Ordering::Relaxed);
-        if filled < requested {
-            self.alloc_short.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
-    fn record_free(&self, frames: usize, failed: usize, rollback: bool) {
-        let freed = frames.saturating_sub(failed) as u64;
-        if rollback {
-            self.rollback_frames.fetch_add(freed, Ordering::Relaxed);
-            self.rollback_batches.fetch_add(1, Ordering::Relaxed);
-            self.rollback_failures
-                .fetch_add(failed as u64, Ordering::Relaxed);
-        } else {
-            self.free_frames.fetch_add(freed, Ordering::Relaxed);
-            self.free_batches.fetch_add(1, Ordering::Relaxed);
-            self.free_failures
-                .fetch_add(failed as u64, Ordering::Relaxed);
-        }
-    }
-}
-
-static FRAME_BATCH_PROFILE: FrameBatchProfile = FrameBatchProfile::new();
+mod frame_batch_profile;
 
 #[inline]
 fn irq_safe<T>(f: impl FnOnce() -> T) -> T {
@@ -549,6 +496,10 @@ pub fn init(boot_info_ptr: *const BootInfo) {
             .checked_mul(core::mem::size_of::<u64>())
             .expect("physical allocator bitmap size overflow");
         let bitmap_pages = bitmap_bytes.div_ceil(PAGE_SIZE as usize);
+        let lazy_table_ledger_bytes = frame_count
+            .checked_mul(core::mem::size_of::<LazyTableLedgerRecord>())
+            .expect("lazy table ledger size overflow");
+        let lazy_table_ledger_pages = lazy_table_ledger_bytes.div_ceil(PAGE_SIZE as usize);
         let image_start = align_down(boot_info.nucleus_image.phys_start, PAGE_SIZE);
         let image_end = boot_info
             .nucleus_image
@@ -595,6 +546,36 @@ pub fn init(boot_info_ptr: *const BootInfo) {
             ptr::write_bytes(bitmap_ptr.cast::<u8>(), 0xff, bitmap_bytes);
         }
 
+        let Some(lazy_table_ledger_phys) = find_usable_span_excluding_ranges(
+            memory_map,
+            lazy_table_ledger_pages,
+            &[
+                (image_start, image_end),
+                (early_system_start, early_system_end),
+                (
+                    nucleus_core::ap_trampoline::TRAMPOLINE_PHYS,
+                    nucleus_core::ap_trampoline::TRAMPOLINE_PHYS
+                        + nucleus_core::ap_trampoline::RESERVED_BYTES,
+                ),
+                (bitmap_phys, bitmap_phys + bitmap_pages as u64 * PAGE_SIZE),
+            ],
+        ) else {
+            panic!("failed to reserve lazy table ledger");
+        };
+        let lazy_table_ledger_ptr =
+            higher_half_addr(lazy_table_ledger_phys) as *mut LazyTableLedgerRecord;
+        // SAFETY: `find_usable_span_excluding_ranges` selected this complete,
+        // direct-mapped boot span; it is reserved before normal allocation and
+        // covers exactly `lazy_table_ledger_bytes` zero-initialized descriptors.
+        unsafe {
+            ptr::write_bytes(
+                lazy_table_ledger_ptr.cast::<u8>(),
+                0,
+                lazy_table_ledger_bytes,
+            );
+        }
+        LAZY_TABLE_LEDGER.install(lazy_table_ledger_ptr, frame_count);
+
         let mut new_state = PhysAllocatorState {
             initialized: false,
             bitmap_ptr,
@@ -638,6 +619,10 @@ pub fn init(boot_info_ptr: *const BootInfo) {
             new_state.reserve_phys_range(early_system.ptr, early_system.len);
         }
         new_state.reserve_phys_range(bitmap_phys, bitmap_pages as u64 * PAGE_SIZE);
+        new_state.reserve_phys_range(
+            lazy_table_ledger_phys,
+            lazy_table_ledger_pages as u64 * PAGE_SIZE,
+        );
         new_state.initialized = true;
 
         *state = new_state;
@@ -738,7 +723,7 @@ pub fn try_free_frame(phys: PhysAddr) -> Result<(), FreeFrameError> {
 /// a per-page `alloc_frame()` loop would have found on its next iteration.
 pub fn alloc_frames_batch(out: &mut [PhysAddr]) -> usize {
     let filled = irq_safe(|| PHYS_ALLOCATOR.lock().alloc_frames_locked(out));
-    FRAME_BATCH_PROFILE.record_allocation(out.len(), filled);
+    frame_batch_profile::record_allocation(out.len(), filled);
     filled
 }
 
@@ -771,72 +756,14 @@ fn try_free_frames_batch_profiled(
     rollback: bool,
 ) -> usize {
     let failed = irq_safe(|| PHYS_ALLOCATOR.lock().free_frames_locked(frames, failures));
-    FRAME_BATCH_PROFILE.record_free(frames.len(), failed, rollback);
+    frame_batch_profile::record_free(frames.len(), failed, rollback);
     failed
-}
-
-fn emit_frame_batch_total(name: &'static str, frames: &AtomicU64, batches: &AtomicU64) -> usize {
-    let frames = frames.swap(0, Ordering::Relaxed);
-    let batches = batches.swap(0, Ordering::Relaxed);
-    if frames == 0 && batches == 0 {
-        return 0;
-    }
-    crate::debug::record_milestone(crate::debug::LogCategory::Memory, name, frames, batches);
-    1
-}
-
-fn emit_frame_batch_scalar(name: &'static str, value: &AtomicU64) -> usize {
-    let value = value.swap(0, Ordering::Relaxed);
-    if value == 0 {
-        return 0;
-    }
-    crate::debug::record_milestone(crate::debug::LogCategory::Memory, name, value, 0);
-    1
 }
 
 /// Emits and clears one bounded count window. `window_ticks == 0` forces a
 /// drain for an isolated benchmark boundary.
 pub fn drain_frame_batch_profile(now_tick: u64, window_ticks: u64) -> usize {
-    let last = FRAME_BATCH_PROFILE.last_drain_tick.load(Ordering::Relaxed);
-    if window_ticks != 0 && now_tick.saturating_sub(last) < window_ticks {
-        return 0;
-    }
-    // ORDERING: Winning this AcqRel claim elects one drain owner for the
-    // window; the count swaps remain diagnostic-only relaxed operations.
-    if FRAME_BATCH_PROFILE
-        .last_drain_tick
-        .compare_exchange(last, now_tick, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        return 0;
-    }
-
-    let mut emitted = 0;
-    emitted += emit_frame_batch_total(
-        "frame-batch-alloc",
-        &FRAME_BATCH_PROFILE.alloc_frames,
-        &FRAME_BATCH_PROFILE.alloc_batches,
-    );
-    emitted += emit_frame_batch_total(
-        "frame-batch-free",
-        &FRAME_BATCH_PROFILE.free_frames,
-        &FRAME_BATCH_PROFILE.free_batches,
-    );
-    emitted += emit_frame_batch_total(
-        "frame-batch-rollback",
-        &FRAME_BATCH_PROFILE.rollback_frames,
-        &FRAME_BATCH_PROFILE.rollback_batches,
-    );
-    emitted += emit_frame_batch_scalar("frame-batch-short", &FRAME_BATCH_PROFILE.alloc_short);
-    emitted += emit_frame_batch_scalar(
-        "frame-batch-free-failure",
-        &FRAME_BATCH_PROFILE.free_failures,
-    );
-    emitted += emit_frame_batch_scalar(
-        "frame-batch-rollback-failure",
-        &FRAME_BATCH_PROFILE.rollback_failures,
-    );
-    emitted
+    frame_batch_profile::drain(now_tick, window_ticks)
 }
 
 pub fn free_frame(phys: PhysAddr) {
@@ -1174,23 +1101,6 @@ mod tests {
             filled,
             "a second rollback must reject every already-returned frame"
         );
-    }
-
-    #[test]
-    fn rollback_workload_is_counted_separately_from_ordinary_free() {
-        let profile = FrameBatchProfile::new();
-        profile.record_allocation(8, 3);
-        profile.record_free(3, 0, true);
-        profile.record_free(4, 1, false);
-
-        assert_eq!(profile.alloc_frames.load(Ordering::Relaxed), 3);
-        assert_eq!(profile.alloc_short.load(Ordering::Relaxed), 1);
-        assert_eq!(profile.rollback_frames.load(Ordering::Relaxed), 3);
-        assert_eq!(profile.rollback_batches.load(Ordering::Relaxed), 1);
-        assert_eq!(profile.rollback_failures.load(Ordering::Relaxed), 0);
-        assert_eq!(profile.free_frames.load(Ordering::Relaxed), 3);
-        assert_eq!(profile.free_batches.load(Ordering::Relaxed), 1);
-        assert_eq!(profile.free_failures.load(Ordering::Relaxed), 1);
     }
 
     #[test]

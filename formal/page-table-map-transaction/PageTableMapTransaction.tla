@@ -12,18 +12,22 @@ guard excludes other normal-time writers; it does not exclude that installer.
 Two consequences are modelled here. A failed transaction restores the exact
 leaf topology but keeps every intermediate table it published: withdrawing one
 is no longer provable, since a concurrent installer may already have put a leaf
-inside it. And every reachable table is claimed by exactly one ownership
-ledger - the transaction's `owned_frames`, or the fault path's page-table tag -
-which is the disagreement address-space retirement must fail stop on.
+inside it. Every reachable dynamically-created table is claimed by one
+root-owned descriptor list, whether the normal mapper or the fault path won
+the CAS. The directory tag is an independent topology witness, and the
+explicit root list must match it before address-space retirement frees a table
+frame. Data leaves remain outside this table descriptor domain.
 ***************************************************************************)
 
 CONSTANTS Tables, Leaves
 
 VARIABLES phase, baseLeaves, leaves, leafLog, topology, ledger, faultLedger,
+          explicitFaultLedger,
           mutationPublished, flushCount, leafFramesFreed, tableFramesFreed,
           failureReturned
 
 vars == <<phase, baseLeaves, leaves, leafLog, topology, ledger, faultLedger,
+          explicitFaultLedger,
           mutationPublished, flushCount, leafFramesFreed, tableFramesFreed,
           failureReturned>>
 
@@ -35,6 +39,7 @@ Init ==
     /\ topology = {}
     /\ ledger = {}
     /\ faultLedger = {}
+    /\ explicitFaultLedger = {}
     /\ mutationPublished = FALSE
     /\ flushCount = 0
     /\ leafFramesFreed = FALSE
@@ -46,17 +51,21 @@ Prepare ==
     /\ phase' = "prepared"
     /\ baseLeaves' = leaves
     /\ UNCHANGED <<leaves, leafLog, topology, ledger, faultLedger,
+                    explicitFaultLedger,
                     mutationPublished, flushCount, leafFramesFreed,
                     tableFramesFreed, failureReturned>>
 
-(* The transaction wins the publication CAS for one absent table. *)
+(* The normal mapper wins the publication CAS for one absent table. Both the
+   descriptor list and the directory tag are published with it. *)
 InstallTable(table) ==
     /\ phase \in {"prepared", "publishing"}
     /\ table \in Tables \ topology
     /\ phase' = "publishing"
     /\ topology' = topology \cup {table}
     /\ ledger' = ledger \cup {table}
-    /\ UNCHANGED <<baseLeaves, leaves, leafLog, faultLedger,
+    /\ faultLedger' = faultLedger \cup {table}
+    /\ explicitFaultLedger' = explicitFaultLedger \cup {table}
+    /\ UNCHANGED <<baseLeaves, leaves, leafLog,
                     mutationPublished, flushCount, leafFramesFreed,
                     tableFramesFreed, failureReturned>>
 
@@ -68,8 +77,10 @@ FaultInstallTable(table) ==
     /\ phase # "retired"
     /\ table \in Tables \ topology
     /\ topology' = topology \cup {table}
+    /\ ledger' = ledger \cup {table}
     /\ faultLedger' = faultLedger \cup {table}
-    /\ UNCHANGED <<phase, baseLeaves, leaves, leafLog, ledger,
+    /\ explicitFaultLedger' = explicitFaultLedger \cup {table}
+    /\ UNCHANGED <<phase, baseLeaves, leaves, leafLog,
                     mutationPublished, flushCount, leafFramesFreed,
                     tableFramesFreed, failureReturned>>
 
@@ -81,13 +92,15 @@ PublishLeaf(leaf) ==
     /\ leaves' = leaves \cup {leaf}
     /\ leafLog' = Append(leafLog, leaf)
     /\ mutationPublished' = TRUE
-    /\ UNCHANGED <<baseLeaves, topology, ledger, faultLedger, flushCount,
+    /\ UNCHANGED <<baseLeaves, topology, ledger, faultLedger,
+                    explicitFaultLedger, flushCount,
                     leafFramesFreed, tableFramesFreed, failureReturned>>
 
 BeginRollback ==
     /\ phase \in {"prepared", "publishing"}
     /\ phase' = "rolling-back"
     /\ UNCHANGED <<baseLeaves, leaves, leafLog, topology, ledger, faultLedger,
+                    explicitFaultLedger,
                     mutationPublished, flushCount, leafFramesFreed,
                     tableFramesFreed, failureReturned>>
 
@@ -98,6 +111,7 @@ RollbackLast ==
        /\ leaves' = leaves \ {last}
        /\ leafLog' = SubSeq(leafLog, 1, Len(leafLog) - 1)
     /\ UNCHANGED <<phase, baseLeaves, topology, ledger, faultLedger,
+                    explicitFaultLedger,
                     mutationPublished, flushCount, leafFramesFreed,
                     tableFramesFreed, failureReturned>>
 
@@ -110,6 +124,7 @@ FinishRollback ==
     /\ leafFramesFreed' = TRUE
     /\ failureReturned' = TRUE
     /\ UNCHANGED <<baseLeaves, leaves, leafLog, topology, ledger, faultLedger,
+                    explicitFaultLedger,
                     mutationPublished, tableFramesFreed>>
 
 Commit ==
@@ -117,6 +132,7 @@ Commit ==
     /\ phase' = "committed"
     /\ leafLog' = <<>>
     /\ UNCHANGED <<baseLeaves, leaves, topology, ledger, faultLedger,
+                    explicitFaultLedger,
                     mutationPublished, flushCount, leafFramesFreed,
                     tableFramesFreed, failureReturned>>
 
@@ -125,8 +141,12 @@ Commit ==
 Retire ==
     /\ phase \in {"failed", "committed"}
     /\ phase' = "retired"
+    /\ topology' = {}
+    /\ ledger' = {}
+    /\ faultLedger' = {}
+    /\ explicitFaultLedger' = {}
     /\ tableFramesFreed' = TRUE
-    /\ UNCHANGED <<baseLeaves, leaves, leafLog, topology, ledger, faultLedger,
+    /\ UNCHANGED <<baseLeaves, leaves, leafLog,
                     mutationPublished, flushCount, leafFramesFreed,
                     failureReturned>>
 
@@ -151,6 +171,7 @@ TypeOK ==
     /\ topology \subseteq Tables
     /\ ledger \subseteq Tables
     /\ faultLedger \subseteq Tables
+    /\ explicitFaultLedger \subseteq Tables
     /\ mutationPublished \in BOOLEAN
     /\ flushCount \in 0..1
     /\ leafFramesFreed \in BOOLEAN
@@ -166,9 +187,13 @@ FailureReturnsAfterRollback == failureReturned => Len(leafLog) = 0
 FailureRetainsPublishedTables ==
     failureReturned => \A table \in ledger: table \in topology
 
-(* The retirement cross-check: one frame, one ledger. *)
-LedgersNeverClaimTheSameTable == ledger \cap faultLedger = {}
-EveryReachableTableIsOwned == topology = ledger \cup faultLedger
+(* The retirement cross-check: descriptor and directory witness agree. *)
+TagsAndDescriptorsAgree == phase # "retired" => ledger = faultLedger
+EveryReachableTableIsOwned == topology = ledger
+ExplicitLedgerMatchesTags ==
+    phase # "retired" => explicitFaultLedger = faultLedger
+RetirementDrainsExplicitLedger ==
+    phase = "retired" => explicitFaultLedger = {}
 
 ReclaimFollowsSingleFlush ==
     leafFramesFreed /\ mutationPublished => flushCount = 1

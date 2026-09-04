@@ -58,6 +58,108 @@ pub const PAGER_FAULT_TOKEN_SLOT_MASK: u64 = (1 << PAGER_FAULT_TOKEN_SLOT_BITS) 
 /// Highest generation a fault token may carry before its slot fails closed.
 pub const PAGER_MAX_FAULT_TOKEN_GENERATION: u64 = u64::MAX >> PAGER_FAULT_TOKEN_SLOT_BITS;
 
+/// Service ids one policy publication may keep wired.
+pub const PAGER_MAX_WIRED_SERVICES: usize = 8;
+
+/// MM broker operation that publishes `PagerAnonymousPolicyWire`.
+///
+/// It lives beside the payload it carries rather than with the other
+/// `MM_BROKER_OP_*` constants because `syscall.rs` is over its recorded line
+/// budget and registered for splitting; putting the op next to its wire type
+/// is the reading that does not grow a file already marked for division.
+///
+/// Authority is the pager service endpoint, not syscalld's mapping-policy
+/// capability: the two gates are disjoint, so neither service can perform the
+/// other's operations.
+pub const MM_BROKER_OP_SET_ANON_POLICY: u16 = 9;
+
+/// Ring3-owned anonymous-mapping policy that ring0 reads locally.
+///
+/// Ring0 owns the per-fault mechanism - frame supply, PTE publication, TLB,
+/// and the ownership ledgers. The arbitration decisions *above* that
+/// mechanism - how much one fault may populate, how many demand-paged regions
+/// a process may hold, and which services stay wired - are policy, and they
+/// were ring0 constants only because the sole transport to ring3 was a
+/// synchronous call on the fault path. That transport measured 5.7 ms p99 on
+/// `mmap`, which retired the transport, not the ownership.
+///
+/// Publishing the decision instead of asking for it keeps the fault path
+/// local: reading this costs what reading a constant costs, so ring3 can own
+/// the policy without reintroducing a round trip. It is Zircon's split -
+/// userspace sets the policy, the kernel enforces it - rather than seL4's,
+/// which RustOS could not adopt anyway because it has an in-kernel frame
+/// allocator.
+///
+/// Until a pager publishes one, ring0 applies its own compiled-in default,
+/// which is exactly the constants this replaced.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PagerAnonymousPolicyWire {
+    pub version: u16,
+    pub reserved0: u16,
+    /// Pages one anonymous fault may populate, counting the faulting page.
+    /// `1` disables fault-around.
+    ///
+    /// A power of two, because ring0 tiles the region with blocks aligned to
+    /// their own size the way Linux picks an mTHP folio. That alignment is
+    /// what keeps a whole run inside the one page table the fault already
+    /// published, so a non-power-of-two run would not merely be untidy - it
+    /// could put the tail of a run in a table this fault never prepared.
+    pub fault_run_pages: u32,
+    /// Demand-paged regions one process may hold. It may narrow, never widen,
+    /// `PAGER_MAX_VMAS_PER_PROCESS`, which sizes ring0's fixed table.
+    pub process_vma_ceiling: u32,
+    /// `0` admits nothing to demand paging: every anonymous range is wired,
+    /// exactly as before demand paging existed.
+    pub demand_enabled: u32,
+    /// Service ids whose processes stay wired, packed from the front.
+    pub wired_services: [u64; PAGER_MAX_WIRED_SERVICES],
+    pub reserved1: [u64; 2],
+}
+
+impl PagerAnonymousPolicyWire {
+    pub const fn is_canonical(self) -> bool {
+        if self.version != PAGER_FAULT_ABI_VERSION
+            || self.reserved0 != 0
+            || self.reserved1[0] != 0
+            || self.reserved1[1] != 0
+            || self.demand_enabled > 1
+            || self.fault_run_pages == 0
+            || self.fault_run_pages > PAGER_FAULT_RUN_PAGES_MAX
+            || !self.fault_run_pages.is_power_of_two()
+            || self.process_vma_ceiling == 0
+            || self.process_vma_ceiling as usize > PAGER_MAX_VMAS_PER_PROCESS
+        {
+            return false;
+        }
+        // Packed from the front. A gap would let a truncated read drop a
+        // wired service and silently admit it to demand paging.
+        let mut index = 1;
+        while index < PAGER_MAX_WIRED_SERVICES {
+            if self.wired_services[index] != 0 && self.wired_services[index - 1] == 0 {
+                return false;
+            }
+            index += 1;
+        }
+        true
+    }
+
+    /// Whether `service_id` is kept wired by this policy.
+    pub const fn keeps_service_wired(self, service_id: u64) -> bool {
+        if service_id == 0 {
+            return false;
+        }
+        let mut index = 0;
+        while index < PAGER_MAX_WIRED_SERVICES {
+            if self.wired_services[index] == service_id {
+                return true;
+            }
+            index += 1;
+        }
+        false
+    }
+}
+
 /// Exact range whose pager-tracked protection ring0 has narrowed.
 ///
 /// `mprotect` on part of a region splits it on ring0's side. Without this

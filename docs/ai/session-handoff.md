@@ -64,6 +64,28 @@ indistinguishable from a zero count afterwards. That mistake was made once here
 already: the first reading said "0 tables published", and it was a dropped
 line.
 
+**Anonymous MM arbitration is ring3-owned.** The fault-around run length, the
+per-process demand-paging ceiling, the demand-paging toggle, and the wired
+service list are no longer ring0 constants: `pagerd` publishes them through
+`MM_BROKER_OP_SET_ANON_POLICY` at startup and ring0 reads an immutable
+publication with one acquire, so the fault path pays nothing and takes no IPC.
+Ring0 keeps a compiled-in default equal to the constants it replaced, so a
+pager that never publishes changes nothing. The rule is frequency, not speed:
+per-fault decisions are ring0 mechanism; per-mapping-lifetime and
+per-pressure-event decisions are pagerd policy. The wired fault-frame reserve
+is still ring0 — it is sized at boot before a pager exists.
+
+**The address-space lifecycle has a conformance contract.**
+`address-space-lifecycle-contract.md` states, per open item, the
+general-purpose-OS mechanism RustOS adopts rather than a local design: fork
+duplicates the reservation (§1), one mutation guard and one invalidation per
+operation (§2), one reservation authority (§3), watermark plus OOM rather than
+an LRU (§4), allocation-free retirement (§5), and where an MM decision lives
+(§7). §6 **withdraws** the hazard-reference/mutation-pin design from the
+table-reclamation contract: the IRQ-off walker plus acknowledged-IPI shootdown
+is already Linux's non-RCU table-free argument, so that machinery is not work
+that remains to be done.
+
 ### Read §1b before theorizing about this path
 
 Several confident, code-derived conclusions in this subsystem's history turned
@@ -179,12 +201,25 @@ it was found. Follow the named source or contract for detail.
   It needs a service call to time out first, so it only shows under 8-vCPU
   load. Next suspect: `BORROWED_CONTEXT_REPLY[receiver_slot]` is still keyed by
   a bare reply number, a second narrower aliasing surface left alone on purpose.
+- **Fork does not inherit a deny-all VMA.** `fork` now republishes the
+  parent's anonymous reservation for the child before the child is activated,
+  so an inherited untouched page faults normally. One class is still skipped:
+  `mprotect(PROT_NONE)`'s ring0 residue has no rights and so is not a canonical
+  wire region, which `template_is_canonical` refuses. The child's deny is
+  preserved; the ring0 reservation half is not, and only the copied Linux-side
+  reserved-range state keeps that span from being handed out. Closing it means
+  letting publication express a deny-all inherited region — a change to a
+  validator with registered security mutants, so it is its own change.
+  `address-space-lifecycle-contract.md` §1.
 - **No reclaim, aging, or swap consumes the Accessed bit.** Fault-around
   populates speculatively and the hardware already records which of those pages
   were touched (`A=0` on a bit-9 leaf means "populated, never touched"), but
   nothing reads it. Until something does, fault-around's amplification under
   sparse or random access is unmeasured — the run is 16 pages, so the worst
-  case is 16x.
+  case is 16x. **Do not start with an LRU:** without swap and with no live page
+  cache there is nothing to evict, so the missing pieces are a min-free
+  watermark and an OOM kill policy.
+  `address-space-lifecycle-contract.md` §4 has the ordering.
 - **Intermediate tables are never reclaimed before retirement.** `munmap` keeps
   them, and so does a failed mapping transaction. This is deliberate: freeing a
   table concurrently would need the RCU-shaped machinery this kernel does not
@@ -192,6 +227,37 @@ it was found. Follow the named source or contract for detail.
   lockless walkers). It matters *less* since reservation stopped building
   tables — the count now tracks memory touched, not reserved — so revisit only
   if a long-lived process is measured holding tables for freed ranges.
+- **Production live table reclaim is designed but not enabled.**  The chosen
+  direction is dynamic tables plus per-table descriptors, exact TLB
+  acknowledgement, and a root/system table budget -- not full-tree
+  preallocation or permanent cache retention.  A walker lifetime pin is **not**
+  what is missing: the installer walks with `IF` clear and `flush_for_reclaim`
+  waits for an acknowledgement from every CPU whose active root matches, which
+  is Linux's non-RCU table-free argument.
+  `address-space-lifecycle-contract.md` §6 withdraws the hazard/pin design and
+  names the two conditions that would reinstate it.  Follow
+  `docs/ai/page-table-reclamation-contract.md` in its stated order; its first
+  code slice unifies descriptor ownership and accounting before enabling any
+  live reclaim.
+- **Root-owned lazy-table accounting is now explicit.** `kernel-mm` reserves a
+  boot-sized per-frame ledger, claims before the IRQ-off table-entry CAS,
+  clears CAS losers, and drains it after the cross-CPU retirement barrier
+  before root reuse. Retirement requires identity-exact agreement with the
+  PTE tags; a hidden subtree now fails stop instead of becoming unaccounted.
+  The source and TLA proof are `pager-protocol-contract.md` §1c and
+  `PageTableMapTransaction`. **Do not begin COW yet:** an audited 2026-09-04
+  COW preflight found that `clone_user_space(&self)` cannot atomically downgrade
+  the parent, present-write faults are rejected in `hal_hooks`, and exclusive
+  `owned_frames`/tag retirement plus direct `unmap` would double-free a shared
+  leaf. The current IRQ-off first-touch proof covers only absent→present
+  publication, not present-leaf replacement or its TLB reclaim.
+  `address-space-lifecycle-contract.md` §1 lands first: a child that inherits
+  no reservation has none to share. Then bind a
+  bounded shared-frame refcount plus per-root COW mapping ledger, transactional
+  fork rollback, COW-preserving `mprotect`/`munmap`/exec retirement, and a
+  present-write fault path with exact shootdown acknowledgement; then model
+  fork/write/unmap/exit races before enabling any fork COW path. The precise
+  admission and teardown gate is `docs/ai/fork-cow-contract.md`.
 - **pagerd is a single serial worker.** `fault_wait` → resolve → `fault_reply`
   on one thread. No longer on any live path — anonymous faults never reach it —
   but it is the shape the pager-backed page cache would inherit, and it would
@@ -237,6 +303,17 @@ it was found. Follow the named source or contract for detail.
   Later runs passed with no source change to that path. If it recurs, preserve
   the first timeout envelope and trace its exact service operation before
   proposing a fix.
+- **One 8-vCPU boot in eight missed `wayclick: first frame presented`.**
+  Observed 2026-09-04 across two `--repeat 4` gate runs on the fork-inheritance
+  tree: 3/4 then 4/4. The failing run had `render=true input=true
+  wayclick=false`, so uiserver was rendering and input was flowing while the
+  client never presented. Not attributed to the MM changes on that tree: every
+  one of them is fork-only except the `region_matches_identity` extraction,
+  which is `!(a && b && c)` for the same three comparisons, and fork is not on
+  the boot lane — `runtimed` launches through `spawn_exec`, `wayclick` does not
+  fork, and the only `libc::fork()` caller in the tree is `apps/ipcbench`. Run
+  logs are overwritten per run, so settling this needs `--repeat 1` in a loop
+  with the log preserved on the failing iteration, targeting that marker.
 - **A `kernel-hal` host-test run failed once and did not reproduce in 15
   further runs.** Unattributed. Capture the failing test name if it recurs.
 - **The pager control graph is still wired eagerly, and no longer needs to be.**

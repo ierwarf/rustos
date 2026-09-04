@@ -181,6 +181,56 @@ if [[ -z "$exec_state_line" || -z "$exec_publish_line" || -z "$exec_retain_line"
     exit 1
 fi
 
+# Exception-side table installation has no allocator lock or heap admission.
+# Its explicit descriptor must therefore be claimed before the directory-entry
+# CAS, linked only by the winner, and cleared before a losing supplied frame
+# returns to `phys`.  Retirement drains that root ledger only after the
+# cross-CPU barrier and before reusing the table frames.
+fault_table_body="$(sed -n '/^pub fn ensure_current_fault_tables_at(/,$p' \
+    kernel/mm/src/memory/address_space/pager_fault_mapping.rs)"
+fault_claim_line="$(grep -n -m1 'claim_lazy_table_record' <<<"$fault_table_body" | cut -d: -f1)"
+fault_entry_line="$(grep -n -m1 'publish_user_table_entry' <<<"$fault_table_body" | cut -d: -f1)"
+fault_publish_line="$(grep -n -m1 'publish_lazy_table_record' <<<"$fault_table_body" | cut -d: -f1)"
+fault_loser_body="$(sed -n '/Ok((child, false)) => {/,/^                    }/p' <<<"$fault_table_body")"
+fault_error_body="$(sed -n '/Err(error) => {/,/^                    }/p' <<<"$fault_table_body")"
+retirement_body="$(sed -n '/^impl Drop for ProcessAddressSpace {/,/^}/p' \
+    kernel/mm/src/memory/address_space/retirement.rs)"
+retire_barrier_line="$(grep -n -m1 'begin_address_space_retirement' <<<"$retirement_body" | cut -d: -f1)"
+retire_drain_line="$(grep -n -m1 'drain_lazy_table_records' <<<"$retirement_body" | cut -d: -f1)"
+retire_free_line="$(grep -n -m1 'explicit_tables.into_iter' <<<"$retirement_body" | cut -d: -f1)"
+if [[ -z "$fault_claim_line" || -z "$fault_entry_line" || -z "$fault_publish_line" \
+    || "$fault_claim_line" -ge "$fault_entry_line" || "$fault_entry_line" -ge "$fault_publish_line" \
+    || -z "$retire_barrier_line" || -z "$retire_drain_line" || -z "$retire_free_line" \
+    || "$retire_barrier_line" -ge "$retire_drain_line" || "$retire_drain_line" -ge "$retire_free_line" ]]; then
+    echo 'lazy-table ledger must claim before CAS, resolve each loser, and drain after retirement' >&2
+    exit 1
+fi
+if ! grep -Fq 'cancel_lazy_table_record' <<<"$fault_loser_body" \
+    || ! grep -Fq 'release(frame);' <<<"$fault_loser_body" \
+    || ! grep -Fq 'cancel_lazy_table_record' <<<"$fault_error_body" \
+    || ! grep -Fq 'release(frame);' <<<"$fault_error_body"; then
+    echo 'lazy-table ledger must claim before CAS, resolve each loser, and drain after retirement' >&2
+    exit 1
+fi
+
+# Normal-time mapping must not retain intermediate table frames in the data
+# leaf ledger. It uses the identical claim -> directory-CAS -> publish/cancel
+# protocol and directory witness as the IRQ-off installer, so retirement has
+# one root-owned table descriptor list to reconcile.
+normal_table_body="$(sed -n '/^fn ensure_next_table(/,/^}/p' \
+    kernel/mm/src/memory/address_space.rs)"
+normal_claim_line="$(grep -n -m1 'claim_lazy_table_record' <<<"$normal_table_body" | cut -d: -f1)"
+normal_entry_line="$(grep -n -m1 'publish_user_table_entry' <<<"$normal_table_body" | cut -d: -f1)"
+normal_publish_line="$(grep -n -m1 'publish_lazy_table_record' <<<"$normal_table_body" | cut -d: -f1)"
+if [[ -z "$normal_claim_line" || -z "$normal_entry_line" || -z "$normal_publish_line" \
+    || "$normal_claim_line" -ge "$normal_entry_line" || "$normal_entry_line" -ge "$normal_publish_line" \
+    || ! "$normal_table_body" == *'ROOT_OWNED_USER_TABLE'* \
+    || ! "$normal_table_body" == *'cancel_lazy_table_record'* \
+    || "$normal_table_body" == *'track_owned_frame'* ]]; then
+    echo 'normal table installation must use the root descriptor claim/CAS protocol, not owned_frames' >&2
+    exit 1
+fi
+
 reschedule_publish_body="$(
     sed -n '/^fn set_local_deferred_reschedule(/,/^}/p' kernel/ps/src/multitask/irq.rs
 )"

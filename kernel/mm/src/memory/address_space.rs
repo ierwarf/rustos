@@ -40,6 +40,7 @@ pub use pager_fault_mapping::{
 };
 use pager_fault_mapping::{
     publish_user_table_entry, read_user_table_entry, without_irq_off_pager_fault_tag,
+    ROOT_OWNED_USER_TABLE,
 };
 use rollback::{rollback_external_user_pages, rollback_user_pages};
 pub use user_copy::{ValidatedUserRead, ValidatedUserWrite};
@@ -58,12 +59,13 @@ pub(crate) struct PagerFaultLeaf {
     physical_address: u64,
 }
 
-/// The frames a retirement walk must reclaim outside the `owned_frames` ledger.
+/// The frames a retirement walk must reclaim outside the data-leaf
+/// `owned_frames` ledger.
 ///
-/// Both halves are recorded by a page-table tag because the exception-time
-/// installer that created them cannot reach the ledger: it runs with interrupts
-/// disabled and may not take the sleepable process-state lock the ledger sits
-/// behind.
+/// Fault-installed data leaves are recorded only by their PTE tag because the
+/// IRQ-off installer cannot mutate a `Vec`. Every dynamically created user
+/// table, from either normal-time mapping or fault entry, is recorded by the
+/// same directory tag and root-owned descriptor list.
 #[derive(Debug)]
 pub(crate) struct PagerFaultOwnership {
     leaves: Vec<PagerFaultLeaf>,
@@ -121,6 +123,7 @@ impl ProcessAddressSpace {
     #[inline(never)]
     pub fn new() -> Result<Self, AddressSpaceError> {
         let pml4_phys = phys::alloc_frame().ok_or(AddressSpaceError::OutOfFrames)?;
+        phys::register_lazy_table_root(pml4_phys.as_u64());
         let root = unsafe { kernel_vm::phys_to_table_mut(pml4_phys) };
         root.zero();
 
@@ -189,9 +192,16 @@ impl ProcessAddressSpace {
         // IRQ-off anonymous leaves are owned by their tagged PTEs rather than
         // the legacy Vec ledger: collect them only in this normal clone path.
         //
-        // The clone's own copy is installed eagerly, so it is owned by
-        // `owned_frames` and must not carry the tag forward.  A tagged clone
-        // would sit in both ledgers and retirement would free it twice.
+        // The copy carries the tag forward, so the child's inherited page is
+        // indistinguishable from one the child faulted in itself.  It has to
+        // be: the child also inherits the pager VMA covering this range, and
+        // the range edits that VMA owns - `unmap_present_prepared_pager_fault_
+        // pages_at` and its protect counterpart - accept only tagged leaves,
+        // so an untagged copy inside a live VMA would make the child's own
+        // `munmap` of an inherited range fail.  Tagging is not double
+        // ownership: this path installs through `map_prepared_pager_fault_
+        // frame_at`, which does not enter `owned_frames`, so retirement frees
+        // the frame exactly once, through the tag walk.
         for leaf in self.pager_fault_ownership()?.leaves {
             let virt = VirtAddr::new(leaf.virtual_address);
             let (src_phys, flags) = self
@@ -200,16 +210,25 @@ impl ProcessAddressSpace {
             if src_phys.as_u64() != leaf.physical_address {
                 return Err(AddressSpaceError::InvalidFrameOwnership);
             }
-            cloned.map_zeroed_user_pages_at(virt, 1, without_irq_off_pager_fault_tag(flags))?;
-            let dst_phys = cloned
-                .translate_user(virt)
-                .ok_or(AddressSpaceError::NotMapped)?;
+            let dst_phys = phys::alloc_frame().ok_or(AddressSpaceError::OutOfFrames)?;
+            // SAFETY: both frames are 4 KiB, direct-mapped, and distinct - the
+            // destination was just allocated and is reachable only from here
+            // until the publication below.
             unsafe {
                 ptr::copy_nonoverlapping(
                     higher_half_ptr(src_phys),
                     higher_half_ptr(dst_phys),
                     PAGE_4KIB,
                 );
+            }
+            if let Err(error) = cloned.map_prepared_pager_fault_frame_at(
+                virt,
+                dst_phys.as_u64(),
+                without_irq_off_pager_fault_tag(flags),
+            ) {
+                // The frame is in no ledger yet, so nothing else can return it.
+                phys::free_frame(dst_phys);
+                return Err(error);
             }
         }
 
@@ -264,17 +283,17 @@ impl ProcessAddressSpace {
         validate_user_page_range(start, page_count)?;
 
         let page_flags = normalize_user_page_flags(flags)?;
-        let table_capacity = table_capacity_for(page_count)?;
         let mut mapped_pages = Vec::new();
         mapped_pages
             .try_reserve_exact(page_count)
             .map_err(|_| AddressSpaceError::OutOfFrames)?;
+        // Exactly the leaves this call will track. Intermediate tables are
+        // owned by `ROOT_OWNED_USER_TABLE` and the root lazy-table ledger, not
+        // by `owned_frames`, and retirement fails stop if one ever appears in
+        // both - so reserving table capacity here reserved for a push that
+        // cannot happen.
         self.owned_frames
-            .try_reserve_exact(
-                page_count
-                    .checked_add(table_capacity)
-                    .ok_or(AddressSpaceError::AddressOverflow)?,
-            )
+            .try_reserve_exact(page_count)
             .map_err(|_| AddressSpaceError::OutOfFrames)?;
         self.regions
             .try_reserve(1)
@@ -380,14 +399,12 @@ impl ProcessAddressSpace {
 
         validate_user_page_range(start, frames.len())?;
         let page_flags = normalize_user_page_flags(flags)? | leaf_flags;
-        let table_capacity = table_capacity_for(frames.len())?;
         let mut mapped_pages = Vec::new();
         mapped_pages
             .try_reserve_exact(frames.len())
             .map_err(|_| AddressSpaceError::OutOfFrames)?;
-        self.owned_frames
-            .try_reserve_exact(table_capacity)
-            .map_err(|_| AddressSpaceError::OutOfFrames)?;
+        // External frames stay owned by their backing object, so this path
+        // pushes nothing into `owned_frames` and reserves nothing in it.
         self.regions
             .try_reserve(1)
             .map_err(|_| AddressSpaceError::OutOfFrames)?;
@@ -677,9 +694,10 @@ impl ProcessAddressSpace {
         validate_user_page_range(virt, 1)?;
 
         let pml4_phys = self.root_phys();
-        let pdpt_phys = ensure_next_table(&mut self.owned_frames, pml4_phys, p4_index(virt))?;
-        let pd_phys = ensure_next_table(&mut self.owned_frames, pdpt_phys, p3_index(virt))?;
-        let pt_phys = ensure_next_table(&mut self.owned_frames, pd_phys, p2_index(virt))?;
+        let root_phys = pml4_phys.as_u64();
+        let pdpt_phys = ensure_next_table(root_phys, pml4_phys, p4_index(virt))?;
+        let pd_phys = ensure_next_table(root_phys, pdpt_phys, p3_index(virt))?;
+        let pt_phys = ensure_next_table(root_phys, pd_phys, p2_index(virt))?;
         let pt = unsafe { kernel_vm::phys_to_table_mut(pt_phys) };
 
         let entry = &mut pt[p1_index(virt)];
@@ -828,7 +846,7 @@ impl ProcessAddressSpace {
 }
 
 fn ensure_next_table(
-    owned_frames: &mut Vec<u64>,
+    root_phys: u64,
     parent_phys: PhysAddr,
     index: usize,
 ) -> Result<PhysAddr, AddressSpaceError> {
@@ -842,56 +860,42 @@ fn ensure_next_table(
     unsafe {
         kernel_vm::phys_to_table_mut(table_phys).zero();
     }
-    // The ledger entry precedes publication so that a won CAS never leaves a
-    // reachable table outside the ledger; a lost CAS withdraws it again.
-    if let Err(err) = track_owned_frame(owned_frames, table_phys.as_u64()) {
+    // Every dynamically published user table, regardless of whether a normal
+    // mapper or an IRQ-off fault won the directory CAS, has one root-owned
+    // descriptor. The claim precedes publication so a reachable table never
+    // exists outside that ledger.
+    if !phys::claim_lazy_table_record(root_phys, table_phys.as_u64()) {
         let _ = phys::try_free_frame(table_phys);
-        return Err(err);
+        return Err(AddressSpaceError::InvalidFrameOwnership);
     }
 
     // The mutation guard excludes every other normal-time writer, but not the
     // exception-time installer, which publishes tables for a pager VMA that can
     // share this 2 MiB block. The CAS is what makes the two agree on one table.
-    match publish_user_table_entry(parent_phys, index, table_phys, user_table_flags()) {
-        Ok((child, true)) => Ok(child),
+    match publish_user_table_entry(
+        parent_phys,
+        index,
+        table_phys,
+        user_table_flags() | ROOT_OWNED_USER_TABLE,
+    ) {
+        Ok((child, true)) => {
+            phys::publish_lazy_table_record(root_phys, table_phys.as_u64());
+            Ok(child)
+        }
         Ok((child, false)) => {
-            release_unpublished_table(owned_frames, table_phys);
+            phys::cancel_lazy_table_record(root_phys, table_phys.as_u64());
+            let _ = phys::try_free_frame(table_phys);
             Ok(child)
         }
         Err(err) => {
-            release_unpublished_table(owned_frames, table_phys);
+            phys::cancel_lazy_table_record(root_phys, table_phys.as_u64());
+            let _ = phys::try_free_frame(table_phys);
             Err(err)
         }
     }
 }
 
-/// Returns a table frame that never won its publication CAS.
-///
-/// No root ever named the frame, so no translation can exist for it and no
-/// shootdown is owed before it returns to the allocator.
-fn release_unpublished_table(owned_frames: &mut Vec<u64>, table_phys: PhysAddr) {
-    let _ = remove_owned_frame(owned_frames, table_phys.as_u64());
-    let _ = phys::try_free_frame(table_phys);
-}
 
-/// The most intermediate tables a page range can need.
-///
-/// One table per block at each level, plus one per level for the partial blocks
-/// at each end. Reserving `page_count * 3` instead would ask for 1.5 MiB of
-/// ledger capacity to hold a few hundred real table frames on a 256 MiB
-/// mapping, and that reservation grows with the mapping.
-fn table_capacity_for(page_count: usize) -> Result<usize, AddressSpaceError> {
-    const ENTRIES_PER_TABLE_SHIFT: u32 = 9;
-    let pt_span = 1_usize << ENTRIES_PER_TABLE_SHIFT;
-    let pd_span = pt_span << ENTRIES_PER_TABLE_SHIFT;
-    let pdpt_span = pd_span << ENTRIES_PER_TABLE_SHIFT;
-    page_count
-        .div_ceil(pt_span)
-        .checked_add(page_count.div_ceil(pd_span))
-        .and_then(|sum| sum.checked_add(page_count.div_ceil(pdpt_span)))
-        .and_then(|sum| sum.checked_add(3))
-        .ok_or(AddressSpaceError::AddressOverflow)
-}
 
 fn validate_user_page_range(start: VirtAddr, page_count: usize) -> Result<(), AddressSpaceError> {
     if page_count == 0 {
@@ -1134,19 +1138,6 @@ pub fn smoke_test() {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn table_capacity_is_bounded_by_blocks_not_by_pages() {
-        // One 4 KiB page still needs one table at each level.
-        assert_eq!(table_capacity_for(1), Ok(6));
-        assert_eq!(table_capacity_for(512), Ok(6));
-        assert_eq!(table_capacity_for(513), Ok(7));
-        // The property that matters: a 256 MiB mapping reserves ledger slots
-        // for a few hundred real tables, not for 196 608 of them.
-        let pages_256mib = 256 * 1024 * 1024 / 4096;
-        let capacity = table_capacity_for(pages_256mib).expect("bounded");
-        assert!(capacity < pages_256mib / 100, "capacity={capacity}");
-    }
 
     #[test]
     fn byte_len_to_page_count_rounds_up() {

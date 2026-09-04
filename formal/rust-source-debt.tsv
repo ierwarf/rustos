@@ -70,6 +70,7 @@ kernel/compat/src/user/syscall/linux/service_ops/ipc_helpers.rs	1	0
 kernel/compat/src/user/syscall/linux/service_ops/local_memfd_io.rs	0	0
 kernel/compat/src/user/syscall/linux/service_ops/vfs_socket.rs	0	0
 kernel/compat/src/user/syscall/linux/mm_broker_ops.rs	0	0
+kernel/compat/src/user/syscall/linux/memory_ops.rs	0	0
 kernel/compat/src/user/syscall/linux/service_ops/poll_epoll.rs	2	0
 kernel/compat/src/user/syscall/linux/service_ops/poll_epoll/control.rs	0	0
 kernel/compat/src/user/syscall/linux/waitset_broker_ops.rs	0	0

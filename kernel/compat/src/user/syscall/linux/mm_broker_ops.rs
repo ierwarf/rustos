@@ -33,6 +33,8 @@ use rustos_user_abi::syscall::{
     RustosMmMapBrokerResult, VFS_DEVICE_ACCESS_DRM_COMPAT, VFS_IPC_PAYLOAD_CAPACITY,
 };
 
+use rustos_user_abi::pager::MM_BROKER_OP_SET_ANON_POLICY;
+
 use crate::user::handles::{KernelHandle, RemoteVfsHandleKind};
 use crate::user::memfd::{MemfdError, MemfdHandle};
 
@@ -45,7 +47,17 @@ enum FileMappingSource {
 }
 
 pub(super) fn syscall_linux_rustos_mm_broker(args_ptr: u64) -> u64 {
-    if !ipc_ops::current_process_has_service_capability(IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY) {
+    // Authority is per operation, and neither gate admits the other's
+    // operations. Mapping operations act on another process's address space
+    // and stay gated on syscalld's mapping-policy capability. Publishing the
+    // anonymous policy is the pager stating its own arbitration rules, so it
+    // is gated on owning the pager endpoint instead - syscalld may not set it
+    // and the pager may not map through this broker. A caller holding neither
+    // is rejected before its arguments are read, exactly as before.
+    let has_mapping_policy =
+        ipc_ops::current_process_has_service_capability(IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY);
+    let owns_pager_endpoint = current_process_owns_pager_endpoint();
+    if !has_mapping_policy && !owns_pager_endpoint {
         return linux_errno(LINUX_EPERM);
     }
 
@@ -55,6 +67,14 @@ pub(super) fn syscall_linux_rustos_mm_broker(args_ptr: u64) -> u64 {
     };
     if args.abi_version != MM_BROKER_ABI_VERSION {
         return linux_errno(LINUX_EINVAL);
+    }
+    let authorized = if args.op == MM_BROKER_OP_SET_ANON_POLICY {
+        owns_pager_endpoint
+    } else {
+        has_mapping_policy
+    };
+    if !authorized {
+        return linux_errno(LINUX_EPERM);
     }
 
     let result = match args.op {
@@ -66,6 +86,7 @@ pub(super) fn syscall_linux_rustos_mm_broker(args_ptr: u64) -> u64 {
         MM_BROKER_OP_MAP_DEVICE_SHARED => broker_map_device_shared(&args),
         MM_BROKER_OP_PROTECT => broker_protect(&args),
         MM_BROKER_OP_UNMAP => broker_unmap(&args),
+        MM_BROKER_OP_SET_ANON_POLICY => broker_set_anon_policy(&args),
         _ => Err(LINUX_EINVAL),
     };
 
@@ -134,6 +155,115 @@ fn broker_describe_fd(args: &RustosMmBrokerArgs) -> Result<(), i64> {
         return Err(LINUX_ESRCH);
     };
     write_out(args, &result?)
+}
+
+/// Whether the calling process owns the published pager service endpoint.
+fn current_process_owns_pager_endpoint() -> bool {
+    multitask::current_user_process_id().is_some_and(|process_id| {
+        ipc_ops::process_owns_published_service_endpoint(
+            process_id,
+            rustos_user_abi::syscall::IPC_SERVICE_PAGERD,
+        )
+    })
+}
+
+/// Records the pager's anonymous-mapping policy.
+///
+/// Ring0 keeps the enforcement and applies its own default until this lands,
+/// so a pager that never publishes changes nothing. The publication is
+/// one-shot: it is read from the IRQ-off fault path with a single acquire and
+/// no seqlock, which is only sound while the fields cannot change under a
+/// reader. A pager sets this during startup, before the processes it governs
+/// exist.
+fn broker_set_anon_policy(args: &RustosMmBrokerArgs) -> Result<(), i64> {
+    if args.addr == 0 {
+        return Err(LINUX_EINVAL);
+    }
+    let policy = usermem::read_current_user_struct::<
+        rustos_user_abi::pager::PagerAnonymousPolicyWire,
+    >(args.addr)
+    .map_err(address_space_error_to_linux_errno)?;
+    if !crate::pager_policy::publish_anonymous_policy(policy) {
+        // Malformed, or a policy is already in force. Both are refusals, not
+        // partial applications: the policy that was in force still is.
+        return Err(LINUX_EINVAL);
+    }
+    Ok(())
+}
+
+/// Publishes a forked child's inherited anonymous reservation.
+///
+/// What a child inherits is the reservation, not the resident set.  Before
+/// this, `fork` copied only the pages the parent had already touched, and the
+/// child's first touch of an untouched inherited page found no VMA, was
+/// refused, and retired the thread — so whether a fork survived depended on
+/// the parent's touch order.  Linux copies the `vm_area_struct` set in
+/// `dup_mmap` and only then the page tables.
+///
+/// Called after the child pid exists and before the child is activated, so a
+/// failure is invisible: it revokes what it published and the caller destroys
+/// the child.  Revoking is not optional even though the child is about to be
+/// terminated — process-slot reclamation does not purge this table, so residue
+/// would sit in the child's slots and refuse a later mapping of the same range
+/// as an overlap.
+pub(super) fn inherit_anonymous_pager_vmas(
+    child_pid: u64,
+    parent_regions: &[rustos_user_abi::pager::PagerVmRegionWire],
+) -> Result<(), i64> {
+    let mut published: Vec<(u64, u64)> = Vec::new();
+    published
+        .try_reserve_exact(parent_regions.len())
+        .map_err(|_| LINUX_ENOMEM)?;
+    for region in parent_regions {
+        // Anonymous private is the only class `region_template` can publish,
+        // so anything else is a class this path has never been proven for.
+        // Fail the fork rather than drop the range and hand the child a hole.
+        if region.object.object_type != rustos_user_abi::pager::VM_OBJECT_ANONYMOUS
+            || region.sharing != rustos_user_abi::pager::VM_SHARING_PRIVATE
+        {
+            revoke_inherited_pager_vmas(child_pid, &published);
+            return Err(LINUX_ENOMEM);
+        }
+        // A deny-all region is `mprotect(PROT_NONE)`'s ring0 residue, and it
+        // is not a publishable template: `template_is_canonical` requires a
+        // nonzero protection, and a rights-free region is not a canonical wire
+        // region on either replica. Omitting it keeps the child's deny
+        // outcome - a touch with no covering VMA is refused exactly as a
+        // covering deny-all VMA would refuse it - but it does not carry over
+        // the *reservation* half, so ring0 alone would treat the child's guard
+        // span as re-mappable. The Linux-side reserved-range and region state
+        // that `fork_clone` copies is what still refuses to hand it out, so
+        // the guard survives at the layer `mmap` actually consults. Failing
+        // the fork instead would break every process that guards a stack.
+        if region.prot == 0 {
+            continue;
+        }
+        // Rights come from the region's current protection, not from
+        // `object.rights`. `apply_region_edit` is attenuation-only - a replica
+        // may never hand back more than the region carried - so the parent
+        // could not widen past this either, and the child inherits no
+        // authority the parent had already given up.
+        match pager_admission::admit_inherited_anonymous_region(
+            child_pid,
+            region.start,
+            region.end,
+            region.prot,
+        ) {
+            Ok(child_region) => published.push((child_region.start, child_region.vma_generation)),
+            Err(errno) => {
+                revoke_inherited_pager_vmas(child_pid, &published);
+                return Err(errno);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Withdraws exactly the regions this fork published, newest first.
+fn revoke_inherited_pager_vmas(child_pid: u64, published: &[(u64, u64)]) {
+    for &(start, vma_generation) in published.iter().rev() {
+        let _ = multitask::revoke_pager_vma_for_process(child_pid, start, vma_generation);
+    }
 }
 
 fn broker_map_anon(args: &RustosMmBrokerArgs) -> Result<(), i64> {

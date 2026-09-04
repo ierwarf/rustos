@@ -422,6 +422,12 @@ flows = ["memory-map"]
 reason = "Untrusted mapping requests cross into the ring0 page-table substrate."
 
 [[risk_surfaces]]
+path = "kernel/compat/src/user/syscall/linux/memory_ops.rs"
+severity = "critical"
+flows = ["memory-map"]
+reason = "The bootstrap mmap/mprotect/munmap/brk path reaches the same page-table substrate as the broker, including the MAP_FIXED implicit unmap that must release the range it replaces."
+
+[[risk_surfaces]]
 path = "kernel/compat/src/user/syscall/linux/service_ops/poll_epoll.rs"
 severity = "critical"
 flows = ["waitset", "input-delivery-lifecycle"]
@@ -698,6 +704,13 @@ models = [
     "physical-frame-lifecycle/PhysicalFrameLifecycle",
     "process-lifecycle-transaction/ProcessLifecycleTransaction",
     "tlb-shootdown-lifecycle/TlbShootdownLifecycle",
+]
+
+[[source_mappings]]
+path = "kernel/compat/src/user/syscall/linux/memory_ops.rs"
+models = [
+    "page-table-lifecycle/PageTableLifecycle",
+    "page-table-map-transaction/PageTableMapTransaction",
 ]
 
 [[source_mappings]]

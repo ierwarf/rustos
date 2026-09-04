@@ -63,7 +63,7 @@
         let _guard = guard();
         let handle = ProcessHandle::new(29, 43);
         let identity = identity(43, 47);
-        let published = publish(handle, identity, template(0x4000)).unwrap();
+        let published = publish(handle, identity, template(0x4000), MAX_PAGER_VMAS_PER_PROCESS).unwrap();
         assert_eq!(published.process_handle, 30);
         assert_eq!(published.process_generation, 43);
         assert_eq!(published.mm_generation, 47);
@@ -80,9 +80,9 @@
         let _guard = guard();
         let handle = ProcessHandle::new(28, 53);
         let identity = identity(53, 59);
-        let published = publish(handle, identity, template(0x8000)).unwrap();
+        let published = publish(handle, identity, template(0x8000), MAX_PAGER_VMAS_PER_PROCESS).unwrap();
         assert_eq!(
-            publish(handle, identity, template(0x9000)),
+            publish(handle, identity, template(0x9000), MAX_PAGER_VMAS_PER_PROCESS),
             Err(PagerVmaError::Overlap)
         );
         assert_eq!(
@@ -97,7 +97,7 @@
         let _guard = guard();
         let handle = ProcessHandle::new(27, 61);
         let identity = identity(61, 67);
-        let published = publish(handle, identity, template(0x20_000)).unwrap();
+        let published = publish(handle, identity, template(0x20_000), MAX_PAGER_VMAS_PER_PROCESS).unwrap();
         let mut protection_mutated = false;
         assert_eq!(
             rewrite_attenuated_range(
@@ -173,13 +173,14 @@
         let mut published = [PagerVmRegionWire::default(); MAX_PAGER_VMAS_PER_PROCESS];
         for (index, slot) in published.iter_mut().enumerate() {
             let start = 0x40_000 + (index as u64) * PAGER_PAGE_BYTES * 2;
-            *slot = publish(handle, identity, template(start)).unwrap();
+            *slot = publish(handle, identity, template(start), MAX_PAGER_VMAS_PER_PROCESS).unwrap();
         }
         assert_eq!(
             publish(
                 handle,
                 identity,
                 template(0x40_000 + (MAX_PAGER_VMAS_PER_PROCESS as u64) * PAGER_PAGE_BYTES * 2),
+                MAX_PAGER_VMAS_PER_PROCESS,
             ),
             Err(PagerVmaError::Pressure)
         );
@@ -193,7 +194,7 @@
         let _guard = guard();
         let handle = ProcessHandle::new(27, 61);
         let exact_identity = identity(61, 67);
-        let published = publish(handle, exact_identity, template(0xc000)).unwrap();
+        let published = publish(handle, exact_identity, template(0xc000), MAX_PAGER_VMAS_PER_PROCESS).unwrap();
         assert_eq!(
             lookup(handle, identity(61, 68), 0xc000, VM_ACCESS_READ),
             Err(PagerVmaError::Stale)
@@ -224,6 +225,76 @@
         );
     }
 
+    /// Fork inherits the reservation, so it needs every region at once - and
+    /// must not pick up residue a previous occupant of these slots left, which
+    /// process-slot reclamation does not purge.
+    /// The ceiling is ring3 policy that this table only enforces. It may
+    /// narrow the fixed array, never widen it.
+    #[test]
+    fn a_published_ceiling_narrows_the_fixed_table_and_cannot_widen_it() {
+        let _guard = guard();
+        let handle = ProcessHandle::new(25, 79);
+        let identity = identity(79, 83);
+        let first = publish(handle, identity, template(0x60_000), 2).unwrap();
+        let second = publish(handle, identity, template(0x70_000), 2).unwrap();
+        // Third region refused by policy, not by a full array.
+        assert_eq!(
+            publish(handle, identity, template(0x80_000), 2),
+            Err(PagerVmaError::Pressure)
+        );
+        // A ceiling past the fixed array is clamped, not honoured, so a caller
+        // cannot publish into storage that does not exist.
+        assert_eq!(
+            publish(
+                handle,
+                identity,
+                template(0x80_000),
+                MAX_PAGER_VMAS_PER_PROCESS + 4096,
+            )
+            .map(|region| region.start),
+            Ok(0x80_000)
+        );
+        let third = lookup(handle, identity, 0x80_000, VM_ACCESS_READ).unwrap();
+        // A zero ceiling admits nothing.
+        assert_eq!(
+            publish(handle, identity, template(0x90_000), 0),
+            Err(PagerVmaError::Pressure)
+        );
+        for region in [first, second, third] {
+            revoke(handle, identity, region.start, region.vma_generation).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_reservation_snapshot_returns_every_live_region_and_no_stale_residue() {
+        let _guard = guard();
+        let handle = ProcessHandle::new(26, 71);
+        let live = identity(71, 73);
+        let first = publish(handle, live, template(0x40_000), MAX_PAGER_VMAS_PER_PROCESS).unwrap();
+        let second = publish(handle, live, template(0x50_000), MAX_PAGER_VMAS_PER_PROCESS).unwrap();
+
+        let mut regions = snapshot_regions(handle, live).expect("reservation snapshot");
+        regions.sort_by_key(|region| region.start);
+        assert_eq!(regions, alloc::vec![first, second]);
+
+        // Same slots, moved-on MM generation: nothing is inheritable.
+        assert_eq!(snapshot_regions(handle, identity(71, 74)), Ok(Vec::new()));
+        // A handle whose generation disagrees with the identity is refused
+        // rather than answered from the slot contents.
+        assert_eq!(
+            snapshot_regions(ProcessHandle::new(26, 72), live),
+            Err(PagerVmaError::Stale)
+        );
+
+        revoke(handle, live, first.start, first.vma_generation).unwrap();
+        assert_eq!(
+            snapshot_regions(handle, live).map(|regions| regions.len()),
+            Ok(1)
+        );
+        revoke(handle, live, second.start, second.vma_generation).unwrap();
+        assert_eq!(snapshot_regions(handle, live), Ok(Vec::new()));
+    }
+
     #[test]
     fn target_process_publication_is_generation_bound_and_revocable() {
         let _guard = guard();
@@ -236,7 +307,7 @@
         // This unit owns only the lock-free VMA publication protocol.  The
         // normal-time facade prepares real page-table leaves first, while this
         // test deliberately uses an empty host-test address space.
-        let published = publish(handle, identity, template(0x1_0000)).expect("target publication");
+        let published = publish(handle, identity, template(0x1_0000), MAX_PAGER_VMAS_PER_PROCESS).expect("target publication");
         assert_eq!(
             published.process_generation,
             u64::from(identity.process_generation())
@@ -319,7 +390,7 @@
             (base + PAGER_PAGE_BYTES, base + PAGER_PAGE_BYTES * 2), // interior split
             (base, base + PAGER_PAGE_BYTES * 4), // full remove
         ] {
-            let published = publish(handle, identity, wide_template(base, 4)).unwrap();
+            let published = publish(handle, identity, wide_template(base, 4), MAX_PAGER_VMAS_PER_PROCESS).unwrap();
             assert_eq!(
                 rewrite_attenuated_range(handle, identity, edit_start, edit_end, None, || Ok(())),
                 Ok(true)
@@ -348,7 +419,7 @@
         let handle = ProcessHandle::new(24, 89);
         let identity = identity(89, 97);
         let base = 0x9_0000;
-        let published = publish(handle, identity, wide_template(base, 4)).unwrap();
+        let published = publish(handle, identity, wide_template(base, 4), MAX_PAGER_VMAS_PER_PROCESS).unwrap();
         let before = published_spans(handle, identity).len();
         assert_eq!(
             rewrite_attenuated_range(
@@ -399,7 +470,7 @@
         let mut published = alloc::vec::Vec::new();
         for index in 0..MAX_PAGER_VMAS_PER_PROCESS as u64 {
             let start = base + index * PAGER_PAGE_BYTES * 4;
-            published.push(publish(handle, identity, wide_template(start, 3)).unwrap());
+            published.push(publish(handle, identity, wide_template(start, 3), MAX_PAGER_VMAS_PER_PROCESS).unwrap());
         }
         let before = published_spans(handle, identity);
         assert_eq!(before.len(), MAX_PAGER_VMAS_PER_PROCESS);

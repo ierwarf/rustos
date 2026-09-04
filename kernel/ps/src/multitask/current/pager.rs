@@ -108,10 +108,11 @@ pub fn current_pager_charge_snapshot() -> Option<PagerChargeSnapshot> {
 /// Stamp and publish a pager region for the current exact process/MM epoch.
 pub fn publish_current_pager_vma(
     template: rustos_user_abi::pager::PagerVmRegionWire,
+    ceiling: usize,
 ) -> Result<rustos_user_abi::pager::PagerVmRegionWire, crate::multitask::pager_vma::PagerVmaError> {
     let process_id =
         current_user_process_id().ok_or(crate::multitask::pager_vma::PagerVmaError::Stale)?;
-    publish_pager_vma_for_process(process_id, template)
+    publish_pager_vma_for_process(process_id, template, ceiling)
 }
 
 /// Admit a range and publish a VMA for one retained process.
@@ -123,6 +124,7 @@ pub fn publish_current_pager_vma(
 pub fn publish_pager_vma_for_process(
     process_id: u64,
     template: rustos_user_abi::pager::PagerVmRegionWire,
+    ceiling: usize,
 ) -> Result<rustos_user_abi::pager::PagerVmRegionWire, crate::multitask::pager_vma::PagerVmaError> {
     let retained = process_table::retain_process_by_pid(process_id)
         .ok_or(crate::multitask::pager_vma::PagerVmaError::Stale)?;
@@ -144,7 +146,7 @@ pub fn publish_pager_vma_for_process(
     let identity = retained
         .live_identity()
         .ok_or(crate::multitask::pager_vma::PagerVmaError::Stale)?;
-    crate::multitask::pager_vma::publish(retained.handle(), identity, template)
+    crate::multitask::pager_vma::publish(retained.handle(), identity, template, ceiling)
 }
 
 /// Resolve one current-task fault without scheduler or process-state locks.
@@ -198,6 +200,25 @@ pub fn revoke_current_pager_vma(
             .ok_or(crate::multitask::pager_vma::PagerVmaError::Stale)?;
         crate::multitask::pager_vma::revoke(handle, process, start, vma_generation)
     })
+}
+
+/// Every pager VMA a non-current process has published, as one reading.
+///
+/// Fork's child inherits the parent's reservation, so it needs the whole set
+/// rather than the region covering one address. The caller must not hold the
+/// process state lock; see `pager_vma::snapshot_regions` for why.
+pub fn pager_vma_regions_for_process(
+    process_id: u64,
+) -> Result<
+    alloc::vec::Vec<rustos_user_abi::pager::PagerVmRegionWire>,
+    crate::multitask::pager_vma::PagerVmaError,
+> {
+    let retained = process_table::retain_process_by_pid(process_id)
+        .ok_or(crate::multitask::pager_vma::PagerVmaError::Stale)?;
+    let identity = retained
+        .live_identity()
+        .ok_or(crate::multitask::pager_vma::PagerVmaError::Stale)?;
+    crate::multitask::pager_vma::snapshot_regions(retained.handle(), identity)
 }
 
 /// Withdraw one exact non-current pager VMA before its PTEs are removed.

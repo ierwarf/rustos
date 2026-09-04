@@ -94,7 +94,7 @@ pager-fault-slot-lifecycle/PagerFaultSlotLifecycle	safety	check	explicit termina
 pager-region-agreement/PagerRegionAgreement	safety	check	explicit refusal and retry states stutter while both replicas keep every faultable address backed	30	120	exhaustive	no	no	no
 pager-vma-publication/PagerVmaPublication	safety	check	explicit stable and exhausted terminals preserve bounded all-atomic publication checking	30	120	exhaustive	no	no	no
 page-table-lifecycle/PageTableLifecycle	safety	intentional-terminal	mapping lifecycle may complete	120	900	exhaustive	no	no	no
-page-table-map-transaction/PageTableMapTransaction	temporal	check	retired terminal stutters once leaves settle and both table ledgers reconcile	30	120	exhaustive	no	no	no
+page-table-map-transaction/PageTableMapTransaction	temporal	check	retired terminal stutters once leaves settle and root descriptors plus directory tags reconcile	30	120	exhaustive	no	no	no
 persistent-mutation-admission/PersistentMutationAdmission	safety	intentional-terminal	mutation admission decision is terminal	30	120	exhaustive	no	no	no
 post-init-leases/PostInitLeases	safety	intentional-terminal	service lease may terminate	120	900	exhaustive	no	no	no
 post-init-bootstrap-barrier/PostInitBootstrapBarrier	safety	check	consumer success failure and fail-closed early admission stutter while exact endpoint ownership remains checked	30	120	exhaustive	no	no	no

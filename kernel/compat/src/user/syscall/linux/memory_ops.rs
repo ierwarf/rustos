@@ -1,3 +1,20 @@
+//! Bootstrap Linux memory syscalls before the MM broker is reachable.
+//!
+//! - **Owner:** `kernel-compat` owns the bootstrap `mmap`/`mprotect`/`munmap`/
+//!   `brk` envelope; `kernel-mm` owns the page-table mechanism it calls.
+//! - **Boundary:** Addresses, lengths, protections, and flags arrive from an
+//!   untrusted guest and are canonicalized before any address-space call.
+//! - **Lifecycle:** Validate and align the request, resolve or reserve the
+//!   range, replace an existing `MAP_FIXED` range by unmapping it first, then
+//!   publish the mapping and advance the cursor.
+//! - **Concurrency:** Every address-space edit runs inside the current
+//!   process-state critical section; no mapping decision is made outside it.
+//! - **Failure:** A refused unmap, a reservation conflict, or an allocation
+//!   shortfall returns a Linux errno and leaves the prior address space intact.
+//! - **Forbidden:** No discarded address-space result, no guest-selected
+//!   frame, no W+X protection, and no partial range left published on error.
+//! - **Evidence:** `memory-map`.
+
 use core::mem::size_of;
 
 use x86_64::VirtAddr;
@@ -64,6 +81,10 @@ pub(super) fn syscall_linux_sigaltstack(stack_ptr: u64, old_stack_ptr: u64) -> u
         }
         request.flags |= 0x1;
     }
+    // SAFETY: `SigaltstackRequestExtra` is `repr(C)` and spells out both of its
+    // padding runs as `_pad` fields, so every byte in `size_of` is a named
+    // field that `Default` and the assignments above initialized. The slice
+    // borrows `extra`, which outlives the copy into `request.payload` below.
     let extra_bytes = unsafe {
         core::slice::from_raw_parts(
             (&extra as *const SigaltstackRequestExtra).cast::<u8>(),
@@ -321,7 +342,15 @@ fn bootstrap_mmap(
                 return Err(LINUX_ENOMEM);
             }
             if fixed {
-                let _ = address_space.unmap_user_bytes(VirtAddr::new(start), len as usize);
+                // `MAP_FIXED` is an implicit unmap of the target range, so a
+                // refusal here means the range is still mapped and the mapping
+                // below would either fail as an overlap or replace a leaf whose
+                // frame nothing released. Discarding the result turned that
+                // into a silent leak.
+                match address_space.unmap_user_bytes(VirtAddr::new(start), len as usize) {
+                    Ok(_) | Err(paging::AddressSpaceError::NotMapped) => {}
+                    Err(err) => return Err(address_space_error_to_linux_errno(err)),
+                }
                 let _ = state.release_reserved_range(start, end);
             } else if state.has_reserved_overlap(start, end)
                 || address_space

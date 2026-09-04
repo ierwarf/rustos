@@ -168,30 +168,50 @@ can be neighbours inside the same 2 MiB block, so both may need the same table.
 the loser returns its frame — a frame no root ever named, so returning it owes
 no shootdown either.
 
-### Two ownership ledgers, and the check between them
+### Three ownership ledgers, and the checks between them
 
 | Frame | Ledger | Recorded by |
 | --- | --- | --- |
 | eager data leaf | `owned_frames` | the mapping transaction, exactly |
-| eager intermediate table | `owned_frames` | the mapping transaction, exactly |
 | fault-installed leaf | `IRQ_OFF_PAGER_FAULT_LEAF` (bit 9) | the PTE itself |
-| fault-installed table | `LAZY_PAGER_FAULT_TABLE` (bit 10) | the directory entry itself |
+| every dynamically created user table | `ROOT_OWNED_USER_TABLE` (bit 10) | the directory entry, by normal mapper or fault winner |
+| every dynamically created user table | root-owned explicit descriptor list | `phys`, before the directory-entry CAS |
 
-The tags exist because the fault path cannot push to a `Vec` that sits behind a
-sleepable lock. That makes the page tables an ownership record, which is a thing
-to be careful with rather than to rely on, so retirement **reconciles the two**:
-it walks the user subtree, and fails stop if one frame is claimed by both
-ledgers, if a frame is claimed as both a leaf and a table, or if the walk finds
-a topology nothing in this tree can produce (a huge entry in the user subtree,
-or a non-zero intermediate entry that is not present). A frame the allocator
-merely refuses to take back is a different fact: that is a leak with a
-diagnostic, not corruption, and it does not stop the kernel.
+The tags remain useful independent evidence because the fault path cannot push
+to a `Vec` behind a sleepable lock. `phys` reserves boot-sized metadata for the
+discovered physical-frame domain: each root has an intrusive head, and every
+dynamically created user table carries its root identity and successor. Both
+the normal mapper and exception path claim that record before their PTE CAS,
+link it only after a successful CAS, and clear it before returning a losing
+frame. Those operations are allocation-free and O(1) while interrupts are
+disabled on the fault path.
 
-This reconciliation is cardinality- and identity-exact **per frame**; what it
-cannot see is a subtree made unreachable by a corrupted upper entry, because
-the walk that would find it is the walk that got lost. Closing that would need
-an explicit per-process table list the fault path can append to lock-free —
-worth doing when there is a second reason to want one.
+Retirement first proves the root inactive on every CPU, then walks the tags,
+drains the explicit root list, sorts both table identities, and fails stop
+unless they agree exactly. It separately rejects an overlap between the normal
+`owned_frames` ledger and tag ownership, or a tagged leaf/table collision.
+Only after all checks can it return any recorded frame to `phys`; the explicit
+root head is already clear before the root itself becomes reusable. A frame the
+allocator merely refuses to take back is a different fact:
+that is a leak with a diagnostic, not corruption, and it does not stop the
+kernel.
+
+This eliminates the prior unreachable-subtree accounting blind spot: a damaged
+upper entry may hide tags from the page-table walk, but it cannot erase the
+root-owned record. The mismatch is detected before any dynamically created table frame is
+returned. Root ownership, rather than a process-table slot, is essential:
+`exec` temporarily retains old and new address-space roots through scheduler
+publication and finalization. They therefore have distinct ledgers without a
+cross-crate `mm_generation` handoff. `stage_exec_state` remains the lifecycle
+proof point because it retains `old_state` until the old root may retire; it
+does not own MM accounting.
+
+The root-reuse/ABA argument is explicit: the retirement barrier removes all
+execution owners, the drain clears every table record and root head, and only
+then can the root frame return to the allocator. A newly allocated root asserts
+that its head is clear. Ledger admission is fail-closed: a record claim failure
+returns the unpublished table frame and refuses the operation; a reachable
+dynamically created table can never lack an explicit record.
 
 ### Rollback keeps its tables
 
