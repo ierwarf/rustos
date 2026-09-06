@@ -195,6 +195,26 @@ expect_match \
   'preflight all three project MCP servers'
 
 expect_match \
+  "token policy forbids full ALL_TOOLS dumps" \
+  docs/ai/token-policy.md \
+  'Never emit full .*ALL_TOOLS.*objects'
+
+expect_match \
+  "token policy batches independent evidence" \
+  docs/ai/token-policy.md \
+  'batch 3–10 independent operations'
+
+expect_match \
+  "token policy forbids bootstrap rereads" \
+  docs/ai/token-policy.md \
+  'Do not reread unchanged bootstrap documents'
+
+expect_match \
+  "verify bounds failure output" \
+  tools/xtask/src/verify.rs \
+  'FAILURE_TAIL_LINES: usize = 120'
+
+expect_match \
   "RustOS code editing skill exists" \
   .agents/skills/rustos-code-editing/SKILL.md \
   '^name: rustos-code-editing'

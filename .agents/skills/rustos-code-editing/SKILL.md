@@ -18,9 +18,12 @@ probe:
 
 1. Serena: activate `/home/hongii2/rustos`, then use symbol or reference
    lookup on the target area.
-2. ast-grep MCP: list its tools and run a Rust structural query or rule probe.
-3. CodeGraph: list its tools and obtain a focused module, caller/callee,
-   dependency, or impact result.
+2. ast-grep MCP: call a known focused Rust structural query or rule probe
+   directly. Do not list tools during normal preflight; consult the pinned
+   three-tool contract only when the known probe is unavailable.
+3. CodeGraph: call a known focused module, caller/callee, dependency, or impact
+   probe directly. Do not list tools during normal preflight; consult the pinned
+   three-tool contract only when the known probe is unavailable.
 
 If any server or focused tool fails, stop source editing immediately. Report
 the server, tool, error, and last successful probe. Do not fall back to local
