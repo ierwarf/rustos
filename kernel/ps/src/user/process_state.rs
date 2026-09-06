@@ -187,7 +187,6 @@ pub struct UserProcessState {
     handles: HandleTable,
     security: ProcessSecurityContext,
     mapping_cursor: u64,
-    windows_allocations: Vec<WindowsAllocation>,
     shared_memfd_mappings: Vec<SharedMemfdMapping>,
     shared_region_mappings: Vec<SharedRegionMapping>,
     cwd: String,
@@ -219,40 +218,6 @@ impl WindowsLoadedModule {
             full_path: String::from(full_path),
             base_name: String::from(base_name),
         }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum WindowsAllocationKind {
-    Virtual,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct WindowsAllocation {
-    pub base: u64,
-    pub len: u64,
-    pub protect: u32,
-    pub kind: WindowsAllocationKind,
-}
-
-impl WindowsAllocation {
-    pub const fn new(base: u64, len: u64, protect: u32, kind: WindowsAllocationKind) -> Self {
-        Self {
-            base,
-            len,
-            protect,
-            kind,
-        }
-    }
-
-    pub fn contains_range(self, start: u64, len: u64) -> bool {
-        let Some(end) = start.checked_add(len) else {
-            return false;
-        };
-        let Some(allocation_end) = self.base.checked_add(self.len) else {
-            return false;
-        };
-        start >= self.base && end <= allocation_end
     }
 }
 
@@ -388,10 +353,8 @@ impl UserProcessState {
             align_up(runtime.allocation_base_hint)
         } else {
             let highest_region_end = address_space
-                .regions()
-                .iter()
-                .map(|region| region.end().as_u64())
-                .max()
+                .highest_user_mapping_end()
+                .expect("bootstrap address-space topology is invalid")
                 .unwrap_or(paging::USER_SPACE_BASE);
             align_up(highest_region_end.saturating_add(DEFAULT_MAPPING_GAP))
         };
@@ -407,7 +370,6 @@ impl UserProcessState {
             handles: HandleTable::new(),
             security: ProcessSecurityContext::new(logical_admin),
             mapping_cursor: default_cursor,
-            windows_allocations: Vec::new(),
             shared_memfd_mappings: Vec::new(),
             shared_region_mappings: Vec::new(),
             cwd: String::from("/"),
@@ -695,7 +657,6 @@ impl UserProcessState {
             handles: self.handles.clone(),
             security: self.security,
             mapping_cursor: self.mapping_cursor,
-            windows_allocations: self.windows_allocations.clone(),
             shared_memfd_mappings: self.shared_memfd_mappings.clone(),
             shared_region_mappings: self.shared_region_mappings.clone(),
             cwd: self.cwd.clone(),
@@ -711,7 +672,6 @@ impl UserProcessState {
         self.handles = parent.handles.clone();
         self.security = parent.security;
         self.mapping_cursor = parent.mapping_cursor;
-        self.windows_allocations = parent.windows_allocations.clone();
         self.shared_memfd_mappings = parent.shared_memfd_mappings.clone();
         self.cwd = parent.cwd.clone();
         self.set_exec_path(parent.exec_path());
@@ -833,50 +793,6 @@ impl UserProcessState {
                 .map_existing_user_pages_at(VirtAddr::new(start), frames, flags)?;
         self.set_mapping_cursor(region.end().as_u64());
         Ok(region)
-    }
-
-    pub fn record_windows_allocation(&mut self, allocation: WindowsAllocation) {
-        if let Some(existing) = self
-            .windows_allocations
-            .iter_mut()
-            .find(|existing| existing.base == allocation.base)
-        {
-            *existing = allocation;
-            return;
-        }
-        self.windows_allocations.push(allocation);
-    }
-
-    pub fn windows_allocation(&self, base: u64) -> Option<WindowsAllocation> {
-        self.windows_allocations
-            .iter()
-            .copied()
-            .find(|allocation| allocation.base == base)
-    }
-
-    pub fn windows_allocation_containing(&self, start: u64, len: u64) -> Option<WindowsAllocation> {
-        self.windows_allocations
-            .iter()
-            .copied()
-            .find(|allocation| allocation.contains_range(start, len))
-    }
-
-    pub fn update_windows_allocation_protect(&mut self, base: u64, protect: u32) -> Option<u32> {
-        let allocation = self
-            .windows_allocations
-            .iter_mut()
-            .find(|allocation| allocation.base == base)?;
-        let previous = allocation.protect;
-        allocation.protect = protect;
-        Some(previous)
-    }
-
-    pub fn remove_windows_allocation(&mut self, base: u64) -> Option<WindowsAllocation> {
-        let index = self
-            .windows_allocations
-            .iter()
-            .position(|allocation| allocation.base == base)?;
-        Some(self.windows_allocations.swap_remove(index))
     }
 
     fn sync_linux_mapping_cursor(&mut self) {

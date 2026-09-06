@@ -40,6 +40,12 @@ unless the task is a full-file review.
 For files over ~500 lines: search first, open one focused range, summarize
 findings before opening another range.
 
+Gather independent evidence in batches. When three or more known searches,
+symbol reads, diagnostics, or test commands do not depend on one another, issue
+them in one orchestrated call and reason once over the combined result. Reducing
+model/tool round trips has priority over saving a few hundred characters from a
+single focused result.
+
 ## 4. AI Docs Are Pointers, Not Essays
 
 AI docs point to canonical source files and stable contracts.
@@ -144,6 +150,13 @@ Never read whole log files. Preferred:
 Avoid opening `Cargo.lock` unless dependency resolution changed. Search for
 `crate-name` before reading a focused range.
 
+Build and test commands must use a quiet-success wrapper when their normal
+output is verbose. Capture complete output in a task-specific temporary file.
+If the command passes, expose only its exit status and bounded `test result` or
+gate summary lines. If it fails, expose the first relevant diagnostic and at
+most 120 trailing lines. Searches over KVM, serial, and debug logs must set both
+a match bound (for example `rg -m 30`) and a line/tail bound.
+
 ## 12. Prompt Cache Hygiene
 
 Prompt caching depends on an exact reusable prefix. Treat this as the stable
@@ -158,3 +171,34 @@ prefix, in order:
 Put user task text, command output, logs, and file snippets *after* that
 prefix. Do not rewrite stable instruction text mid-session. Do not cache logs
 or broad source dumps.
+
+Documents already supplied in the live context count as read. In particular,
+do not reopen environment-supplied `AGENTS.md`. After compaction or continuation,
+use headings/search first and read only the relevant router, policy, or
+`session-handoff.md` range unless the file changed.
+
+## 13. Round-Trip And Discovery Budget
+
+The dominant cost in a long repository task is repeatedly reprocessing a large
+context, not the size of one small lookup. Apply these rules by default:
+
+1. Plan an evidence set before calling tools; batch 3–10 independent operations.
+2. Do not interleave one-symbol lookup and model reasoning when the next lookups
+   are already known.
+3. Never emit full `ALL_TOOLS` objects or bulk descriptions. Search names only,
+   then inspect at most two exact descriptions capped at 2,000 characters each.
+4. Call the known RustOS source tools by namespace:
+   `mcp__serena__*`, `mcp__ast_grep__*`, and
+   `mcp__codegraph__codegraph_*`.
+5. Keep success-path command output to exit status and bounded summary lines;
+   expand diagnostics only after failure.
+6. Do not reread unchanged bootstrap documents already present in context.
+7. At a completed architectural milestone, refresh the short session handoff
+   and continue in a fresh context when available instead of carrying a task to
+   repeated 200K-token windows.
+8. A compaction is not permission to rediscover known tool schemas or replay
+   earlier evidence. Resume from the compacted state and verify only volatile
+   facts.
+
+These constraints must not weaken the Serena/ast-grep/CodeGraph source-editing
+gate, failure diagnostics, formal evidence, or required runtime acceptance.

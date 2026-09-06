@@ -20,8 +20,10 @@ use std::time::Duration;
 
 use rustos_user_abi::syscall::{SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_PHASE_PROFILE_DRAIN};
 
+mod cow_probe;
 mod ipc_probes;
 mod scheduling_context_probe;
+use cow_probe::probe_fork_cow_private_write;
 
 const SYS_LINUX_GETPID: u64 = 39;
 /// Offloaded to `syscalld`, so one call is one complete cross-process IPC
@@ -1008,6 +1010,9 @@ fn run_all_probes(tsc_khz: u64) {
     ipc_probes::probe_ipc_intra_process(tsc_khz);
     ipc_probes::probe_ipc_intra_process_reply_recv(tsc_khz);
     ipc_probes::probe_syscall_offload(tsc_khz);
+    // This is a capability probe, not just a timing sample: a failure means
+    // fork returned a non-private mapping or COW teardown lost ownership.
+    probe_fork_cow_private_write(tsc_khz, 8, 1);
     // The mapping probes are otherwise isolate-only, because their numbers are
     // measurements. This one is here for its *outcome*: it is the only
     // end-to-end check that ring0 and pagerd still agree about what an
@@ -1033,6 +1038,7 @@ fn run_single_probe(name: &str, tsc_khz: u64) {
         }
         "ipc_rt_cross_process_syscalld_getuid" => ipc_probes::probe_syscall_offload(tsc_khz),
         "fork_exit_wait" => probe_fork_exit_wait(tsc_khz),
+        "fork_cow_private_write" => probe_fork_cow_private_write(tsc_khz, 64, 4),
         "fork_exec_exit_wait" => probe_fork_exec_exit_wait(tsc_khz),
         "thread_clone_exit_join" => probe_thread_clone_exit_join(tsc_khz),
         "exec_replace_single_thread" => probe_exec_replace_single_thread(tsc_khz),

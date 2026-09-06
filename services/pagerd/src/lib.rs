@@ -480,6 +480,7 @@ mod tests {
             },
             prot: VM_PROT_READ | VM_PROT_WRITE,
             sharing: VM_SHARING_PRIVATE,
+            commit_state: rustos_user_abi::pager::VM_COMMIT_COMMITTED,
             vma_generation: 11,
             process_handle: 13,
             process_generation: 17,

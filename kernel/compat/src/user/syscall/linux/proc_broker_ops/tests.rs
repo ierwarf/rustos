@@ -46,9 +46,15 @@ fn process_fork_commits_child_tid_before_runnable_publication() {
         .split("pub(super) fn syscall_linux_rustos_proc_fork_broker")
         .nth(1)
         .expect("fork broker");
-    let validate = fork
-        .find("validate_user_write_buffer")
-        .expect("child TID prevalidation");
+    let logical_validate = fork
+        .find("writable_committed_regions_cover")
+        .expect("child TID VMA write prevalidation");
+    let present_validate = fork
+        .find("validate_user_read_buffer")
+        .expect("child TID resident-page prevalidation");
+    let eager_private = fork
+        .find("eager_private_ranges.push")
+        .expect("child TID eager-private span");
     let reservation = fork
         .find("let spawn_reservation = match multitask::reserve_process_spawn()")
         .expect("pre-clone lifecycle reservation");
@@ -65,7 +71,9 @@ fn process_fork_commits_child_tid_before_runnable_publication() {
     let activate = fork
         .find("activate_suspended_user_task")
         .expect("runnable child activation");
-    assert!(validate < suspended);
+    assert!(logical_validate < present_validate);
+    assert!(present_validate < eager_private);
+    assert!(eager_private < clone);
     assert!(reservation < clone);
     assert!(clone < suspended);
     assert!(suspended < published_reservation);
@@ -81,16 +89,16 @@ fn process_fork_inherits_the_parent_reservation_before_the_child_is_runnable() {
         .nth(1)
         .expect("fork broker");
     let snapshot = fork
-        .find("pager_vma_regions_for_process")
-        .expect("parent reservation snapshot");
+        .find("with_fork_parent_state")
+        .expect("atomic parent VMA and page-table snapshot");
     let clone = fork
-        .find("clone_user_space")
-        .expect("child address-space clone");
+        .find("clone_user_space_cow")
+        .expect("child COW address-space clone");
     let suspended = fork
-        .find("spawn_user_process_state_suspended_with_parent")
+        .find("spawn_user_process_state_suspended_with_parent_reservation")
         .expect("suspended child publication");
     let inherit = fork
-        .find("inherit_anonymous_pager_vmas")
+        .find("inherit_pager_vmas")
         .expect("child reservation publication");
     let activate = fork
         .find("activate_suspended_user_task")

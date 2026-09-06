@@ -234,6 +234,16 @@ pub use identity::{
 use identity::{clear_publication_for_test, process_state_is_visible};
 pub(super) use identity::{own_process_ref, publication_divergence_count, with_own_visible_state};
 
+/// Keep the exact-state lock bridge as an explicit process-table API instead
+/// of leaking the private identity module through a re-export.
+pub(super) fn with_own_exact_visible_state<R>(
+    handle: ProcessHandle,
+    expected: ProcessIdentity,
+    f: impl FnOnce(&UserProcessState) -> R,
+) -> Option<R> {
+    identity::with_own_exact_visible_state(handle, expected, f)
+}
+
 mod spawn;
 pub use spawn::{SpawnReservation, cancel_spawn, publish_spawn, reserve_spawn};
 

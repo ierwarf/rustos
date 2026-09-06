@@ -159,6 +159,39 @@ pub fn begin_address_space_mutation(root: PhysAddr) -> AddressSpaceMutationGuard
     }
 }
 
+/// Attempts to enter the serialized address-space mutation protocol from an
+/// interrupt-disabled synchronous exception path.
+///
+/// A page fault cannot wait for `PROTOCOL_LOCK`: its current CPU might be the
+/// acknowledgement target of the owner already holding that lock.  A single
+/// try is safe.  Failure means the faulting instruction must be restarted so
+/// `iretq` restores interrupts and lets the in-flight shootdown complete.
+/// Success proves there is no older sender waiting for this CPU, after which
+/// the ordinary exact-generation shootdown is safe even though IF remains
+/// clear on the sender.
+pub fn try_begin_address_space_mutation_from_exception(
+    root: PhysAddr,
+) -> Option<AddressSpaceMutationGuard> {
+    let root = root.as_u64();
+    assert!(
+        root != 0 && root.is_multiple_of(PAGE_SIZE),
+        "TLB invariant: exception-time mutation root is invalid"
+    );
+    #[cfg(rustos_boot_image)]
+    {
+        assert!(
+            !interrupts::are_enabled(),
+            "TLB invariant: exception-time mutation entered with interrupts enabled"
+        );
+    }
+    let guard = PROTOCOL_LOCK.try_lock()?;
+    Some(AddressSpaceMutationGuard {
+        scope: MutationScope::AddressSpace(root),
+        guard: Some(guard),
+        restore_interrupts: false,
+    })
+}
+
 pub fn begin_global_mapping_mutation() -> AddressSpaceMutationGuard {
     let (guard, restore_interrupts) = lock_protocol_bounded();
     AddressSpaceMutationGuard {

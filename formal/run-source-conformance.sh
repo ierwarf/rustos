@@ -227,7 +227,7 @@ if [[ -z "$normal_claim_line" || -z "$normal_entry_line" || -z "$normal_publish_
     || ! "$normal_table_body" == *'ROOT_OWNED_USER_TABLE'* \
     || ! "$normal_table_body" == *'cancel_lazy_table_record'* \
     || "$normal_table_body" == *'track_owned_frame'* ]]; then
-    echo 'normal table installation must use the root descriptor claim/CAS protocol, not owned_frames' >&2
+    echo 'normal table installation must use the unified frame-descriptor claim/CAS protocol' >&2
     exit 1
 fi
 
@@ -1114,6 +1114,55 @@ if ! rg -Uq 'struct ReplyObject \{[^}]*scheduling_context: Option<ReplySchedulin
     exit 1
 fi
 
+# Fork publishes a copied reservation over resident leaves, while ordinary
+# mmap reserves an empty range. The entrypoints must stay distinct, and the
+# pre-publication child-TID copyout must receive a private writable leaf rather
+# than writing through a read-only COW alias. This binding catches the failure
+# class that first appeared as an undifferentiated fork ENOMEM.
+pager_current_source=kernel/ps/src/multitask/current/pager.rs
+ordinary_vma_publish_body="$(sed -n '/^pub fn publish_pager_vma_for_process(/,/^\/\/\/ Publishes one inherited VMA/p' "$pager_current_source")"
+inherited_vma_publish_body="$(sed -n '/^pub fn publish_inherited_pager_vma_for_process(/,/^\/\/\/ Resolve one current-task fault/p' "$pager_current_source")"
+fork_broker_body="$(sed -n '/^pub(super) fn syscall_linux_rustos_proc_fork_broker(/,/^pub(super) fn valid_process_fork_plan_locally/p' kernel/compat/src/user/syscall/linux/proc_broker_ops/fork.rs)"
+pager_template_body="$(sed -n '/^fn template_is_canonical(/,/^fn stamped_region/p' kernel/ps/src/multitask/pager_vma.rs)"
+pager_admission_source=kernel/compat/src/user/syscall/linux/mm_broker_ops/pager_admission.rs
+if ! grep -Fq '.user_range_is_unmapped(' <<<"$ordinary_vma_publish_body" \
+    || grep -Fq '.user_range_is_unmapped(' <<<"$inherited_vma_publish_body" \
+    || ! grep -Fq 'publish_inherited_pager_vma_for_process' <<<"$inherited_vma_publish_body" \
+    || ! grep -Fq 'writable_committed_regions_cover(regions, args.ctid_ptr, byte_len)' <<<"$fork_broker_body" \
+    || ! grep -Fq '.validate_user_read_buffer(VirtAddr::new(args.ctid_ptr), byte_len)?' <<<"$fork_broker_body" \
+    || ! grep -Fq 'clone_user_space_cow(&cow_ranges, &eager_private_ranges)' <<<"$fork_broker_body" \
+    || grep -Fq 'region.prot != 0' <<<"$pager_template_body" \
+    || ! rg -Uq '(?s)existing\.process_handle != process\.slot\(\).*existing\.process_generation != process_generation.*existing\.mm_generation != mm_generation.*slot\.publish\(None\)\?' kernel/ps/src/multitask/pager_vma.rs \
+    || ! rg -Uq '(?s)PagerVmaError::Malformed => 1,.*PagerVmaError::Overlap => 2,.*PagerVmaError::Pressure => 3,.*PagerVmaError::Stale => 4,.*PagerVmaError::Unstable => 5,.*PagerVmaError::Denied => 6,' "$pager_admission_source" \
+    || ! grep -Fq 'count.saturating_mul(1 << 8) | pager_vma_error_class(error)' "$pager_admission_source"; then
+    echo 'fork inheritance must preserve VMA authority, separate resident publication from ordinary mmap, private pre-publication copyout, reclaim stale generations, accept PROT_NONE, and retain exact failure classes' >&2
+    exit 1
+fi
+
+# Kernel copyout is a write in the VMA/COW model even though the byte mover
+# reaches frames through the direct map. Every usermem writer must enter the
+# exact-generation wrapper; the slow path checks logical VMA authority, splits
+# against the retained root, then retranslates before constructing its proof.
+copyout_ps_source=kernel/ps/src/multitask/user_copy.rs
+copyout_mm_source=kernel/mm/src/memory/address_space/user_copy.rs
+copyout_cow_source=kernel/mm/src/memory/address_space/pager_fault_mapping.rs
+usermem_source=kernel/ps/src/user/sysops/usermem.rs
+cow_probe_source=apps/ipcbench/src/cow_probe.rs
+if ! rg -Uq 'fn with_current_write_address_space<R>\([^)]*UserCopyAddressSpace' "$usermem_source" \
+    || [ "$(rg -c 'with_current_write_address_space' "$usermem_source")" -ne 5 ] \
+    || [ "$(rg -c 'try_with_user_copy_address_space' "$usermem_source")" -ne 4 ] \
+    || ! rg -Fq 'validate_user_write_resolving_cow' "$copyout_ps_source" \
+    || ! rg -Fq 'region.commit_state != VM_COMMIT_COMMITTED' "$copyout_ps_source" \
+    || ! rg -Fq 'region.prot & VM_PROT_WRITE == 0' "$copyout_ps_source" \
+    || ! rg -Fq 'region.sharing != VM_SHARING_PRIVATE' "$copyout_ps_source" \
+    || ! rg -Uq 'resolve_cow_write_under_mutation\(\s*self\.pml4_frame_phys,\s*start,\s*frame\.as_u64\(\),\s*kind,\s*mutation' "$copyout_cow_source" \
+    || [ "$(rg -c 'translate_user_with_flags\(VirtAddr::new\(cursor\)\)' "$copyout_mm_source")" -lt 2 ] \
+    || ! rg -Uq 'libc::pread\(stamp\.fd, copyout_page\.cast\(\), 16, 0\)' "$cow_probe_source" \
+    || [ "$(rg -c 'ptr::read_volatile\(copyout_page' "$cow_probe_source")" -lt 4 ]; then
+    echo 'kernel copyout must resolve COW through exact VMA authority and retained root, retranslate, and retain the untouched-page KVM witness' >&2
+    exit 1
+fi
+
 checks=0
 # The registry is read first and executed second. One `cargo test` per witness
 # spent almost all of its time re-entering Cargo for a test binary it had
@@ -1302,7 +1351,7 @@ scheduler-cpu-ownership/SchedulerCpuOwnership|nucleus-core|util::lockdep::tests:
 tlb-shootdown-lifecycle/TlbShootdownLifecycle|kernel-hal|arch::tlb_shootdown::tests::address_space_shootdown_targets_only_matching_active_roots
 tlb-shootdown-lifecycle/TlbShootdownLifecycle|kernel-hal|arch::tlb_shootdown::tests::same_root_activation_preserves_tlb_but_root_change_reloads_cr3
 tlb-shootdown-lifecycle/TlbShootdownLifecycle|kernel-hal|arch::tlb_shootdown::tests::reclaim_requires_every_target_to_acknowledge_the_exact_generation
-tlb-shootdown-lifecycle/TlbShootdownLifecycle|kernel-mm|memory::address_space::tests::unmap_region_plan_is_complete_before_metadata_commit
+tlb-shootdown-lifecycle/TlbShootdownLifecycle|kernel-mm|memory::address_space::tests::unmap_descriptor_plan_is_complete_before_first_pte_remove
 cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::process_table::tests::exec_seal_rejects_thread_attachment_until_cancel
 cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::process_table::tests::process_address_space_and_exec_exit_are_serialized
 cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::scheduler::smp::tests::remote_retirement_waits_only_for_another_cpus_running_slot
@@ -1421,12 +1470,22 @@ pager-region-agreement/PagerRegionAgreement|pagerd|tests::an_interior_protect_na
 pager-vma-publication/PagerVmaPublication|kernel-ps|multitask::pager_vma::tests::publication_stamps_exact_process_mm_and_nonzero_vma_generation
 pager-vma-publication/PagerVmaPublication|kernel-ps|multitask::pager_vma::tests::overlap_and_permission_escalation_fail_closed
 pager-vma-publication/PagerVmaPublication|kernel-ps|multitask::pager_vma::tests::exec_generation_change_and_revoked_region_never_match
+pager-vma-publication/PagerVmaPublication|kernel-ps|multitask::pager_vma::tests::reservation_commit_state_splits_and_gates_fault_access
+pager-vma-publication/PagerVmaPublication|kernel-ps|multitask::pager_vma::tests::prot_none_reserved_and_committed_regions_publish_but_never_admit_access
+pager-vma-publication/PagerVmaPublication|kernel-ps|multitask::pager_vma::tests::publication_reclaims_stale_process_generation_before_slot_reuse
+pager-vma-publication/PagerVmaPublication|kernel-compat|user::syscall::linux::mm_broker_ops::pager_admission::tests::pager_vma_failure_telemetry_has_stable_distinct_classes
+cow-frame-lifecycle/CowFrameLifecycle|kernel-ps|multitask::pager_vma::tests::fork_hold_makes_fault_readers_retry_without_publishing_a_hole
+cow-frame-lifecycle/CowFrameLifecycle|kernel-compat|user::syscall::linux::mm_broker_ops::pager_admission::tests::inherited_file_private_reservation_preserves_dual_abi_policy
+cow-frame-lifecycle/CowFrameLifecycle|kernel-compat|user::syscall::linux::mm_broker_ops::pager_admission::tests::inherited_anonymous_private_gets_fresh_identity_and_rejects_shared
+cow-frame-lifecycle/CowFrameLifecycle|kernel-mm|memory::phys::frame_descriptor_ledger::tests::anonymous_cow_removes_one_alias_then_promotes_the_survivor_in_place
+cow-frame-lifecycle/CowFrameLifecycle|kernel-mm|memory::phys::frame_descriptor_ledger::tests::failed_fork_alias_rolls_back_to_the_exact_exclusive_owner
+cow-frame-lifecycle/CowFrameLifecycle|kernel-ps|multitask::user_copy::tests::copyout_cow_requires_committed_private_write_authority_for_both_abis
 page-table-lifecycle/PageTableLifecycle|kernel-compat|user::syscall::linux::mm_broker_ops::tests::mapping_range_rejects_noncanonical_and_wrapping_addresses
 page-table-lifecycle/PageTableLifecycle|kernel-compat|user::syscall::linux::mm_broker_ops::tests::mapping_cursor_advances_to_the_rounded_region_end
 page-table-lifecycle/PageTableLifecycle|kernel-mm|memory::address_space::tests::validate_user_page_range_rejects_unaligned_or_oob
 page-table-lifecycle/PageTableLifecycle|kernel-mm|memory::address_space::tests::user_page_flags_enforce_wx_and_reject_huge_pages
 page-table-lifecycle/PageTableLifecycle|kernel-mm|memory::address_space::tests::protection_span_preflight_rejects_a_hole_before_commit
-page-table-lifecycle/PageTableLifecycle|kernel-mm|memory::address_space::tests::unmap_region_plan_is_complete_before_metadata_commit
+page-table-lifecycle/PageTableLifecycle|kernel-mm|memory::address_space::tests::unmap_descriptor_plan_is_complete_before_first_pte_remove
 page-table-map-transaction/PageTableMapTransaction|kernel-mm|memory::address_space::rollback::tests::leaf_rollback_runs_in_reverse_publication_order
 page-table-map-transaction/PageTableMapTransaction|kernel-mm|memory::address_space::pager_fault_mapping::tests::a_published_table_entry_must_be_a_present_non_huge_user_table
 page-table-lifecycle/PageTableLifecycle|kernel-mm|memory::kernel_vm::tests::direct_map_update_bounds_are_aligned_nonempty_and_nonwrapping
@@ -1437,6 +1496,7 @@ physical-frame-lifecycle/PhysicalFrameLifecycle|kernel-mm|memory::phys::tests::b
 physical-frame-lifecycle/PhysicalFrameLifecycle|kernel-mm|memory::phys::tests::bounded_allocator_stays_under_limit
 physical-frame-lifecycle/PhysicalFrameLifecycle|kernel-mm|memory::phys::tests::reserve_phys_range_removes_kernel_image_from_free_set
 physical-frame-lifecycle/PhysicalFrameLifecycle|kernel-mm|memory::phys::tests::fixed_range_claim_is_atomic_exact_and_not_reallocatable
+physical-frame-lifecycle/PhysicalFrameLifecycle|kernel-mm|memory::phys::frame_descriptor_ledger::tests::one_catalog_tracks_tables_and_exact_data_leaves
 service-heap-lifecycle/ServiceHeapLifecycle|rustos-svc-runtime|allocator::tests::freed_large_allocation_is_reused_without_growth
 service-heap-lifecycle/ServiceHeapLifecycle|rustos-svc-runtime|allocator::tests::allocator_honors_large_alignment
 service-heap-lifecycle/ServiceHeapLifecycle|rustos-svc-runtime|allocator::tests::adjacent_frees_coalesce_for_a_larger_request

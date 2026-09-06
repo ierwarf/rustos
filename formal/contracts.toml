@@ -46,7 +46,7 @@ reason = "Logical CPU generation and online-state publication gate every future 
 [[risk_surfaces]]
 path = "kernel/hal/src/arch/tlb_shootdown.rs"
 severity = "critical"
-flows = ["tlb-shootdown-lifecycle", "process-address-space-lifecycle", "cross-cpu-task-retirement"]
+flows = ["tlb-shootdown-lifecycle", "process-address-space-lifecycle", "cross-cpu-task-retirement", "cow-frame-lifecycle"]
 reason = "CR3 activation, active-root publication, fixed-IPI acknowledgement, and reclaim admission share one cross-CPU translation lifetime."
 
 [[risk_surfaces]]
@@ -124,7 +124,7 @@ reason = "Kernel-derived endpoint lane selection prevents service priority inver
 [[risk_surfaces]]
 path = "kernel/mm/src/memory/address_space.rs"
 severity = "critical"
-flows = ["memory-map", "user-memory-access", "tlb-shootdown-lifecycle", "thread-exit-futex-cleanup", "process-lifecycle-transaction"]
+flows = ["memory-map", "user-memory-access", "tlb-shootdown-lifecycle", "thread-exit-futex-cleanup", "process-lifecycle-transaction", "cow-frame-lifecycle"]
 reason = "Page-table mutations control isolation, W xor X, cross-CPU translation visibility, and physical-frame ownership."
 
 [[risk_surfaces]]
@@ -152,10 +152,28 @@ flows = ["physical-frame-lifecycle", "tlb-shootdown-lifecycle", "process-lifecyc
 reason = "Rollback must revoke every cross-CPU translation before returning private frames or rejected external mappings."
 
 [[risk_surfaces]]
-path = "kernel/mm/src/memory/address_space/owned_frames.rs"
+path = "kernel/mm/src/memory/address_space/frame_release.rs"
 severity = "critical"
 flows = ["physical-frame-lifecycle", "tlb-shootdown-lifecycle", "process-lifecycle-transaction"]
 reason = "Exact process-frame ownership settlement must remain fail-closed and bounded after rollback, unmap, and address-space retirement."
+
+[[risk_surfaces]]
+path = "kernel/mm/src/memory/phys/frame_descriptor_ledger.rs"
+severity = "critical"
+flows = ["memory-map", "physical-frame-lifecycle", "process-lifecycle-transaction", "cow-frame-lifecycle"]
+reason = "One boot-sized tagged-union descriptor and mapping pool are the reverse authority for root, table, exclusive data, anonymous-fork COW, and private-file/section COW frame roles."
+
+[[risk_surfaces]]
+path = "kernel/mm/src/memory/phys/frame_descriptor_ledger/api.rs"
+severity = "critical"
+flows = ["memory-map", "physical-frame-lifecycle", "process-lifecycle-transaction", "cow-frame-lifecycle"]
+reason = "The narrow descriptor API must preserve exact root, virtual-address, frame, and sharing-kind identity across every claim, publication, cancellation, release, and retirement call."
+
+[[risk_surfaces]]
+path = "kernel/mm/src/memory/phys/frame_descriptor_ledger/encoding.rs"
+severity = "critical"
+flows = ["physical-frame-lifecycle", "cow-frame-lifecycle"]
+reason = "Packed descriptor and mapping-head encodings must not alias frame roles, lose mapping counts, or admit invalid root, virtual-address, and frame identities."
 
 [[risk_surfaces]]
 path = "kernel/mm/src/memory/phys.rs"
@@ -666,6 +684,7 @@ models = ["per-cpu-clockevent-lifecycle/PerCpuClockeventLifecycle"]
 path = "kernel/hal/src/arch/tlb_shootdown.rs"
 models = [
     "cross-cpu-task-retirement/CrossCpuTaskRetirement",
+    "cow-frame-lifecycle/CowFrameLifecycle",
     "process-address-space-lifetime/ProcessAddressSpaceLifetime",
     "tlb-shootdown-lifecycle/TlbShootdownLifecycle",
 ]
@@ -678,6 +697,7 @@ models = ["physical-frame-lifecycle/PhysicalFrameLifecycle", "process-lifecycle-
 path = "kernel/mm/src/memory/address_space.rs"
 models = [
     "cross-cpu-task-retirement/CrossCpuTaskRetirement",
+    "cow-frame-lifecycle/CowFrameLifecycle",
     "page-table-lifecycle/PageTableLifecycle",
     "page-table-map-transaction/PageTableMapTransaction",
     "process-address-space-lifetime/ProcessAddressSpaceLifetime",
@@ -693,18 +713,42 @@ models = ["robust-futex-owner-death/RobustFutexOwnerDeath"]
 [[source_mappings]]
 path = "kernel/mm/src/memory/address_space/rollback.rs"
 models = [
+    "cow-frame-lifecycle/CowFrameLifecycle",
     "page-table-map-transaction/PageTableMapTransaction",
     "physical-frame-lifecycle/PhysicalFrameLifecycle",
     "tlb-shootdown-lifecycle/TlbShootdownLifecycle",
 ]
 
 [[source_mappings]]
-path = "kernel/mm/src/memory/address_space/owned_frames.rs"
+path = "kernel/mm/src/memory/address_space/frame_release.rs"
 models = [
     "physical-frame-lifecycle/PhysicalFrameLifecycle",
     "process-lifecycle-transaction/ProcessLifecycleTransaction",
     "tlb-shootdown-lifecycle/TlbShootdownLifecycle",
 ]
+
+[[source_mappings]]
+path = "kernel/mm/src/memory/phys/frame_descriptor_ledger.rs"
+models = [
+    "cow-frame-lifecycle/CowFrameLifecycle",
+    "page-table-map-transaction/PageTableMapTransaction",
+    "physical-frame-lifecycle/PhysicalFrameLifecycle",
+    "process-lifecycle-transaction/ProcessLifecycleTransaction",
+]
+
+[[source_mappings]]
+path = "kernel/mm/src/memory/phys/frame_descriptor_ledger/api.rs"
+models = [
+    "page-table-map-transaction/PageTableMapTransaction",
+    "physical-frame-lifecycle/PhysicalFrameLifecycle",
+    "process-address-space-lifetime/ProcessAddressSpaceLifetime",
+    "process-lifecycle-transaction/ProcessLifecycleTransaction",
+    "cow-frame-lifecycle/CowFrameLifecycle",
+]
+
+[[source_mappings]]
+path = "kernel/mm/src/memory/phys/frame_descriptor_ledger/encoding.rs"
+models = ["physical-frame-lifecycle/PhysicalFrameLifecycle", "cow-frame-lifecycle/CowFrameLifecycle"]
 
 [[source_mappings]]
 path = "kernel/compat/src/user/syscall/linux/memory_ops.rs"
@@ -2052,3 +2096,47 @@ models = ["pager-region-agreement/PagerRegionAgreement", "pager-fault-slot-lifec
 [[source_mappings]]
 path = "kernel/ps/src/multitask/pager_vma.rs"
 models = ["pager-vma-publication/PagerVmaPublication", "pager-region-agreement/PagerRegionAgreement"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/pager_vma/fork_hold.rs"
+severity = "critical"
+flows = ["cow-frame-lifecycle"]
+reason = "Fork must hold the complete exact VMA set unstable until child aliases are published, parent write protection is globally acknowledged, and every held sequence is restored."
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/pager_vma/fork_hold.rs"
+models = ["pager-vma-publication/PagerVmaPublication", "cow-frame-lifecycle/CowFrameLifecycle"]
+
+[[risk_surfaces]]
+path = "kernel/mm/src/memory/address_space/pager_fault_mapping.rs"
+severity = "critical"
+flows = ["cow-frame-lifecycle"]
+reason = "COW PTE tagging, exact present-write replacement, last-anonymous-alias promotion, and shared-leaf release must remain synchronized with the physical mapping ledger and TLB acknowledgement."
+
+[[source_mappings]]
+path = "kernel/mm/src/memory/address_space/pager_fault_mapping.rs"
+models = ["cow-frame-lifecycle/CowFrameLifecycle"]
+
+[[risk_surfaces]]
+path = "kernel/compat/src/user/syscall/linux/proc_broker_ops/fork.rs"
+severity = "critical"
+flows = ["cow-frame-lifecycle"]
+reason = "Linux fork must hold one exact VMA and page-table snapshot, keep the child suspended, and publish inherited regions only after parent write protection is globally acknowledged."
+
+[[source_mappings]]
+path = "kernel/compat/src/user/syscall/linux/proc_broker_ops/fork.rs"
+models = ["cow-frame-lifecycle/CowFrameLifecycle"]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/pager_vma/tests.rs"
+models = ["cow-frame-lifecycle/CowFrameLifecycle"]
+
+[[risk_surfaces]]
+path = "kernel/executive/src/hal_hooks.rs"
+severity = "critical"
+flows = ["cow-frame-lifecycle"]
+reason = "Only a present user write with live writable VMA authority may enter the COW path; ordinary protection and extended x86 faults must remain terminal."
+
+[[source_mappings]]
+path = "kernel/executive/src/hal_hooks.rs"
+models = ["cow-frame-lifecycle/CowFrameLifecycle"]

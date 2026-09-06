@@ -2,9 +2,8 @@
 mod tests {
     use boot_protocol::{
         ACPI_RSDP_MAX_BYTES, BOOT_INFO_MAGIC, BOOT_INFO_VERSION, BootInfo, BootMemoryKind,
-        BootMemoryMap,
-        BootMemoryRegion, BootPixelFormat, BootVolumeIdentity, EarlySystemImage, FramebufferInfo,
-        NucleusImageInfo,
+        BootMemoryMap, BootMemoryRegion, BootPixelFormat, BootVolumeIdentity, EarlySystemImage,
+        FramebufferInfo, NucleusImageInfo,
     };
     use boot_random::{Random, init as init_random};
     use core::mem::size_of;

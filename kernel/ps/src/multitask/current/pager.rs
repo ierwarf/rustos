@@ -149,6 +149,34 @@ pub fn publish_pager_vma_for_process(
     crate::multitask::pager_vma::publish(retained.handle(), identity, template, ceiling)
 }
 
+/// Publishes one inherited VMA over a suspended fork child's cloned leaves.
+///
+/// Unlike ordinary mmap admission, fork is not reserving an empty page-table
+/// range: `clone_user_space_cow` has already installed the child's resident
+/// subset. The caller owns the child's suspended publication window and must
+/// destroy the child if this publication fails. The VMA table still rejects
+/// overlap, stale identity, and ceiling exhaustion before publishing.
+pub fn publish_inherited_pager_vma_for_process(
+    process_id: u64,
+    template: rustos_user_abi::pager::PagerVmRegionWire,
+    ceiling: usize,
+) -> Result<rustos_user_abi::pager::PagerVmRegionWire, crate::multitask::pager_vma::PagerVmaError> {
+    let retained = process_table::retain_process_by_pid(process_id)
+        .ok_or(crate::multitask::pager_vma::PagerVmaError::Stale)?;
+    let page_count = usize::try_from(
+        (template.end.saturating_sub(template.start)) / rustos_user_abi::pager::PAGER_PAGE_BYTES,
+    )
+    .map_err(|_| crate::multitask::pager_vma::PagerVmaError::Pressure)?;
+    if page_count == 0 {
+        return Err(crate::multitask::pager_vma::PagerVmaError::Pressure);
+    }
+    record_reservation(page_count as u64);
+    let identity = retained
+        .live_identity()
+        .ok_or(crate::multitask::pager_vma::PagerVmaError::Stale)?;
+    crate::multitask::pager_vma::publish(retained.handle(), identity, template, ceiling)
+}
+
 /// Resolve one current-task fault without scheduler or process-state locks.
 pub fn current_pager_vma_snapshot(
     address: u64,

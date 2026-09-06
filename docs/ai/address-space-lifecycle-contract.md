@@ -1,6 +1,7 @@
 # Address-space lifecycle conformance contract
 
-> **Status: one live defect (§1) and four open items.**  Each section names the
+> **Status: reservation authority, mutable policy, and anonymous fork COW
+> landed; pressure endgame and allocation-free retirement remain open.** Each section names the
 > general-purpose-OS mechanism RustOS adopts.  Memory management here carries no
 > RustOS-specific invention: where a RustOS constraint (IRQ-off fault entry,
 > exact TLB acknowledgement, fixed-capacity publication tables) differs from
@@ -11,114 +12,147 @@
 ## 0. Rule of construction
 
 A general-purpose kernel keeps one reservation authority, duplicates that
-authority on fork, batches page-table mutation and invalidation per operation,
-reclaims or kills under pressure, and tears an address space down without
-allocating.  RustOS currently satisfies none of those five completely.  Each
-section below states the present code, the standard mechanism, and what
-adopting it requires.
+authority only for an ABI operation whose semantics copy an address space,
+batches page-table mutation and invalidation per operation, reclaims or kills
+under pressure, and tears an address space down without allocating. Each
+section below states the present code, the adopted standard mechanism, and any
+remaining gate.
 
 ## 1. Fork must duplicate the reservation, not the resident set
 
-**Defect, not a design gate.**  `broker_map_anon`'s demand branch publishes a
-pager VMA and creates no `UserRegion` and no page table.  `clone_user_space`
-copies `regions` and the present `IRQ_OFF_PAGER_FAULT_LEAF` leaves;
-`fork_clone` copies handles and Linux process state.  Nothing publishes a pager
-VMA for the child — `publish_pager_vma_for_process` has exactly one caller, in
-anonymous admission.  Published regions are stamped with the owning process and
-MM generation and rejected on mismatch, so the child cannot reach the parent's.
-
-The child therefore inherits the pages the parent had already touched and
-**loses the reservation**.  Its first touch of a page the parent never touched
-finds no VMA, the fault is refused, and the thread is retired.  A fork/exec
-survives this; a fork whose child keeps running does not, and whether it dies
-depends on which pages the parent happened to touch first.
+**Linux-only address-space copy.** The fork broker snapshots the parent's
+published VMAs before cloning resident leaves, creates the child suspended,
+republishes the complete reservation under the child's process/MM identity,
+and activates it only after publication succeeds. Failure terminates the
+suspended child, so fork cannot succeed with a reservation hole.
 
 Linux copies the `vm_area_struct` set in `dup_mmap` and then the page tables in
-`copy_page_range`.  The inherited object is the VMA, not the PTE.
+`copy_page_range`. The inherited object is the VMA, not the PTE. RustOS follows
+that order:
 
-Required shape:
+1. hold the process-state lock and VMA writer, publish every live region at an
+   odd sequence, and drain fault installers;
+2. create the child suspended, share eligible committed private-anonymous
+   resident leaves, and eagerly copy every excluded mapping class;
+3. downgrade all corresponding parent leaves to read-only+COW under one
+   address-space mutation and wait for exact TLB acknowledgement;
+4. republish every VMA under the child's exact process/MM generation;
+5. activate only after complete publication; otherwise release every child
+   reference and terminate the child. Clone-internal failures restore parent
+   flags; later failures may leave exact sole-parent COW, which promotes on
+   the next write just as Linux's failed fork may leave write-protected PTEs.
 
-1. snapshot the parent's published VMAs under the parent's publication writer
-   lock, inside the same process-state critical section that clones the address
-   space;
-2. after `spawn_user_process_state_suspended_with_parent_reservation` returns
-   the child pid and **before** `activate_suspended_user_task`, republish each
-   range for the child;
-3. private anonymous ranges take a **fresh** anonymous object identity, exactly
-   as `region_template` mints one for a new mapping.  Fork is still an eager
-   copy, so parent and child must not name one backing object.  Linux likewise
-   gives the child its own `anon_vma`;
-4. any failure takes the existing `terminate_user_task(child_pid)` rollback,
-   which is this kernel's `mmput`/`exit_mmap`: the child address space and its
-   publications are destroyed and the child never becomes runnable.
+Rights-free `PROT_NONE` regions remain canonical reservations and are inherited
+rather than turning into re-mappable holes. `mprotect(PROT_WRITE)` cannot turn
+a COW-tagged PTE writable; the later present-write fault must split it.
 
-Any outcome other than a published child VMA fails the fork with `ENOMEM`.
-That is Linux's behaviour — a `dup_mmap` failure returns `-ENOMEM` — and it is
-the only outcome that keeps fork's result set at *succeeds* or *fails*, never
-*succeeds with a hole*.  `mmap`'s eager-wire fallbacks do not apply here:
-the child's publication table is a fresh, equally sized slice, so it cannot be
-short of what the parent held, and the transport-absent and control-graph
-branches can only fire for a parent that had no demand VMA to inherit.  A
-non-`Demand` outcome therefore means something is wrong, not that the range
-should be wired.
+Fork publication is deliberately not ordinary mmap publication. Ordinary
+`publish_pager_vma_for_process` proves that its page-table range is empty before
+it publishes a reservation. Fork first clones the resident subset into a
+suspended child and then uses `publish_inherited_pager_vma_for_process`, which
+admits those leaves only inside that suspended transaction. Reusing the
+ordinary empty-range predicate for fork is forbidden: it rejects every useful
+resident inheritance after the leaves already exist.
 
-The child's rights come from the region's current protection, not from its
-object rights: `apply_region_edit` is attenuation-only, so the parent could not
-widen past that either and the child inherits no authority the parent had
-already given up.
+Kernel copyout performed before the child becomes runnable is part of this
+transaction. For `CLONE_CHILD_SETTID`, fork first proves gapless committed VMA
+coverage with write intent in the parent and proves the target pages are
+resident. Those page-aligned leaves are eagerly copied into the child and made
+private+writable before the kernel writes the TID. A read-only COW alias is not
+a legal kernel copyout target merely because the parent VMA permits a future
+user write fault.
 
-**Known residual gap.**  A deny-all region — `mprotect(PROT_NONE)`'s ring0
-residue — is not inheritable, because a rights-free region is not a canonical
-wire region and `template_is_canonical` refuses it.  It is skipped.  The
-child's *deny* is preserved (a touch with no covering VMA is refused exactly as
-a covering deny-all VMA would refuse it), but the *reservation* half is not, so
-ring0 alone would treat the child's guard span as re-mappable.  The Linux-side
-reserved-range state that `fork_clone` copies still refuses to hand it out, so
-the guard survives at the layer `mmap` consults.  Closing this properly means
-letting publication express a deny-all inherited region, which changes a
-validator with registered security mutants and must be its own change.
+The fixed publication slots are keyed by the exact process object generation
+and MM generation, not by the reusable process-table index. Under the
+per-process writer lock, publication drains and clears any slot whose stamps do
+not match the new live identity before overlap and capacity accounting. A
+reaped process or completed exec therefore cannot leave residue that turns a
+later fork into false pressure.
 
-Acceptance: a child touches a page its parent never touched, in a range the
-parent mapped demand-paged, and both processes' pages stay private.
+This rule does **not** apply to Windows `CreateProcess`. Windows process
+creation constructs a fresh image address space through loaderd/procd; it must
+not clone the parent's reservations or invoke the Linux fork transaction.
+
+Anonymous fork COW shares the frame-descriptor substrate with file/section COW,
+but not its semantics. §3 and `fork-cow-contract.md` define that distinction.
 
 ## 2. One mutation and one invalidation per operation
 
-`map_zeroed_user_pages_at` opens an `AddressSpaceMutationGuard` per call, and
-`clone_user_space` calls it once per page.  That guard is the machine-global
-`PROTOCOL_LOCK`, taken with interrupts disabled, and its drop completes a
-shootdown.  Forking an N-resident-page process therefore takes the global
-mutation lock N times.  `track_owned_frame` scans the whole ledger per page, so
-the same loop is also O(N²).
+`map_zeroed_user_pages_at` opens one `AddressSpaceMutationGuard` per operation.
+`clone_user_space_cow` likewise batches every parent write-protection change
+under one guard and drops it once, after the last downgrade. The unpublished
+child root needs no shootdown.
+
+The former second cost is gone. `owned_frames` performed linear membership,
+insert, and removal and made N-page mapping O(N²). Exact
+`(root, virtual_address, frame)` ownership is now O(1) in the boot-sized frame
+descriptor catalog.
 
 Linux gathers a whole operation into one `mmu_gather` and issues one flush.
-For fork specifically it flushes the *parent* — the write-protect pass — and
-never the child.  RustOS's fork is an eager copy that does not modify the
-parent, and the child root has never been loaded into any CR3, so **eager fork
-needs no shootdown at all**.
+For fork specifically it flushes the parent write-protect pass and never the
+new child. RustOS now follows the same root selection and batching boundary.
 
-Required: one guard per fork/unmap/protect operation, not per page; a batched
-leaf-install entry point that the clone and the eager-map paths share; and an
-`owned_frames` membership test that is not a linear scan.  §3 decides whether
-that ledger survives at all.
+Fresh one-vCPU KVM evidence after the unified descriptor cutover (2026-09-05,
+`tsc_khz=3991354`) completed `mmap_unmap_1024_faulted_pages` with min/p50
+30.79/35.31 ms and 24,674 frame returns in 386 bounded batches (63 per batch).
+The 64-page probe completed at 33.48/68.63 us. The large sparse-reservation
+probe completed at 12.35/17.86 ms after the range walker began caching page
+table levels. These are fresh candidate measurements, not a source-paired
+A-B-A comparison, so they prove completion and bounded settlement but do not
+close a latency-regression claim. The next optimization target is the
+per-leaf claim/publish/release transaction in the fully resident 1,024-page
+case; do not weaken exact descriptor ownership to improve that number.
 
 ## 3. One reservation authority
 
-Two records claim to describe what a process has reserved.  `regions` is a
-`Vec<UserRegion>` written by the eager mapper; the pager VMA table is written
-by anonymous admission.  A demand mapping appears only in the second, and
-`clone_user_space` pushes **one single-page `UserRegion` per inherited leaf**,
-so a child's region list is one entry per resident page and never coalesces.
-`unmap_user_pages_at` understands only `owned_frames`, which is why the
-tag-owned leaves need their own unmap entry points.
+The pager VMA table is the single post-bootstrap reservation authority.
+`ProcessAddressSpace::regions` and `windows_allocations` are removed; eager and
+demand anonymous admission both publish a VMA, interval questions use that
+table, and range rewrites coalesce adjacent identity-preserving fragments.
+The bootstrap mapping path is the bounded exception before the pager endpoint
+exists: it proves overlap from page tables and is not a second live allocation
+ledger.
 
-Linux keeps one authority: the maple tree of `vm_area_struct` in `mm_struct`,
-and it merges adjacent VMAs with identical attributes so the tree cannot grow
-per page.
+Reservation and commitment are separate states of the same authority:
 
-Required: the pager VMA table is the reservation authority; `regions` becomes
-derived or is removed; every interval question is asked of the VMA layer; and
-publication merges an adjacent range with identical protection and object so a
-fork or a split cannot fragment the table into its fixed capacity.
+- `Reserved` owns the interval and denies every access before fault dispatch;
+- `Committed` promises backing and permits an authorized fault to populate it.
+
+`set_pager_vma_commit_state_for_process` performs split/coalesce under the VMA
+writer. Decommit withdraws publication, removes resident leaves, completes the
+normal invalidation contract, and republishes `Reserved`. Commit republishes
+`Committed` without pre-populating PTEs. This is the shape required by Windows
+`MEM_RESERVE`/`MEM_COMMIT`. Win32 MM must use this authority before it is
+enabled; it must not recreate `windows_allocations` in syscalld or procd.
+
+One boot-sized tagged-union `FrameDescriptorRecord` is the reverse physical
+authority for roots, lazy page tables, and exclusive user leaves. It replaces
+both the `owned_frames` vector and separate table/data descriptor arrays. Its
+role namespace reserves two shared forms from the start:
+
+- anonymous sharing for Linux fork COW;
+- private-file/section sharing for Linux `MAP_PRIVATE` and Windows
+  `PAGE_WRITECOPY`/`FILE_MAP_COPY`, including image/DLL writable data.
+
+The boot-sized mapping pool names each exact `(root, virtual_address, frame)`
+and links it to the shared frame descriptor. The first mapping is inline; one
+additional record per physical frame guarantees capacity for a complete
+two-way fork of every resident frame, while later fan-out fails before
+publication on exhaustion. The descriptor supplies COW class, backing
+identity, and mapping count; exact records supply revocation and retirement
+identity. Anonymous fork COW may promote a sole survivor in place. A
+file/section-private mapping never may, because its backing identity must stay
+immutable; even its first writable fault copies. Anonymous fork COW does not
+prove section COW, and section COW does not prove fork COW.
+
+Publication failures retain a stable class even where Linux requires the
+outer syscall to return `ENOMEM`: `Malformed=1`, `Overlap=2`, `Pressure=3`,
+`Stale=4`, `Unstable=5`, and `Denied=6`. The bounded
+`pager-admission-publish-failed` milestone stores
+`(occurrence << 8) | class` in `arg0` and the VMA start in `arg1`. Discarding
+the internal error is forbidden; doing so previously made stale-slot residue
+and a `PROT_NONE` canonicality mismatch indistinguishable from allocator
+pressure.
 
 ## 4. Memory pressure has no endgame
 
@@ -150,9 +184,10 @@ that combination has never been measured.
 
 `Drop for ProcessAddressSpace` calls `pager_fault_ownership`, which walks the
 user subtree and pushes every leaf and table into unbounded `Vec`s, and
-`drain_lazy_table_records`, which builds another.  A heap shortage during exit
-is therefore a panic — and exit is exactly when the system is likely to be
-short.
+`drain_lazy_table_records`, which builds another. The two results are now
+checked against one frame descriptor catalog rather than `owned_frames` plus a
+separate table ledger, but a heap shortage during exit is still a panic — and
+exit is exactly when the system is likely to be short.
 
 `Drop` itself is not the problem, and this is worth stating because it is the
 tempting conclusion.  Linux's teardown is also refcount-triggered and
@@ -228,14 +263,17 @@ the list of services kept wired.  `pagerd` publishes it through
 endpoint rather than by syscalld's mapping-policy capability, so neither
 service can perform the other's operations.
 
-Two properties make this safe on the IRQ-off path.  The publication is
-**one-shot**: fields are immutable after commit, so a reader takes them with a
-single acquire and no seqlock, and there is no window in which it can see half
-of one policy and half of another.  A pager sets this during startup, before
-the processes it governs exist, exactly as a Zircon job policy is set before
-the job runs rather than mutated under load.  And ring0 keeps a **compiled-in
-default equal to the constants it replaced**, so a pager that never publishes
-changes nothing; the only observable change is a pager choosing otherwise.
+The policy is mutable through an odd/even sequence snapshot. A writer claims
+an even sequence, writes the fields, and Release-publishes the next even
+sequence. Normal-context readers retry until they obtain one coherent
+snapshot. The only IRQ-off reader attempts twice and then uses the compiled-in
+default. It controls best-effort fault-around after the demanded leaf is
+already installed, so fallback changes only that run's amplification and
+cannot change access authority.
+
+If pressure policy is ever allowed to decide whether the demanded leaf itself
+is admitted, this fallback ceases to be safe: that decision and the policy
+snapshot must then become one transaction.
 
 Invariants that were implicit in a constant had to become explicit in the
 validator.  The run length must stay a power of two: ring0 tiles a region with
@@ -267,3 +305,12 @@ event and never per fault.
   <https://kernel-internals.org/mm/reclaim/>
 - Teardown is refcount-triggered and synchronous:
   <https://www.kernel.org/doc/gorman/html/understand/understand007.html>
+- Zircon VMARs form the address-space region hierarchy and mappings carry the
+  mapped-object relation:
+  <https://fuchsia.dev/reference/kernel_objects/vm_address_region>
+- Zircon exposes memory-pressure level transitions from kernel watermarks:
+  <https://fuchsia.dev/reference/syscalls/system_get_event>
+- Windows reserves and commits pages as distinct states:
+  <https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-virtualalloc>
+- Windows copy-on-write views use `FILE_MAP_COPY`/write-copy protection:
+  <https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-mapviewoffile>

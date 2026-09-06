@@ -1,3 +1,20 @@
+//! HAL exception-to-kernel policy hooks.
+//!
+//! - **Owner:** `kernel-executive` classifies architectural exceptions;
+//!   `kernel-mm` owns PTE/frame mutation and compat owns ABI fault policy.
+//! - **Boundary:** Raw x86 page-fault error bits and CR2/RIP are untrusted until
+//!   user, reserved-bit, extension, access, VMA, and PTE checks complete.
+//! - **Lifecycle:** Classify, try exact COW/first-touch service, resume on
+//!   success/retry, otherwise return unhandled for ordinary retirement.
+//! - **Concurrency:** Present-write COW uses the nonblocking exception mutation
+//!   entry and never waits behind a shootdown owner needing this CPU.
+//! - **Failure:** Malformed, extended, stale, denied, or unsupported faults fail
+//!   closed without consuming frame or task authority.
+//! - **Forbidden:** No present read/execute COW, Linux policy on Windows ABI,
+//!   exception-time service lookup, or fabricated successful mapping.
+//! - **Evidence:** `CowFrameLifecycle`, page-fault classifier tests, and the
+//!   present-read implementation mutation.
+
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use kernel_compat::api as compat_api;
@@ -6,13 +23,14 @@ use kernel_mm::api as mm_api;
 use kernel_ps::api as ps_api;
 use rustos_user_abi::pager::{
     PAGER_FAULT_ABI_VERSION, PAGER_PAGE_BYTES, PagerFaultRequestWire, VM_ACCESS_EXECUTE,
-    VM_ACCESS_READ, VM_ACCESS_WRITE, VM_OBJECT_ANONYMOUS,
+    VM_ACCESS_READ, VM_ACCESS_WRITE, VM_FAULT_COW, VM_FAULT_PRESENT, VM_FAULT_PROTECTION,
+    VM_OBJECT_ANONYMOUS, VM_OBJECT_FILE_PRIVATE, VM_OBJECT_IMAGE_SECTION, VM_SHARING_PRIVATE,
 };
 
 static FIRST_PAGER_RESERVATION_REJECTION: AtomicBool = AtomicBool::new(false);
 static FIRST_USER_PRESENT_PAGE_FAULT: AtomicBool = AtomicBool::new(false);
 
-fn page_fault_access(error_code: Option<u64>) -> Option<u16> {
+fn page_fault_access(error_code: Option<u64>) -> Option<(u16, u16)> {
     let error = error_code?;
     const PRESENT: u64 = 1 << 0;
     const WRITE: u64 = 1 << 1;
@@ -22,17 +40,25 @@ fn page_fault_access(error_code: Option<u64>) -> Option<u16> {
     const PROTECTION_KEY: u64 = 1 << 5;
     const SHADOW_STACK: u64 = 1 << 6;
     const SGX: u64 = 1 << 15;
-    if error & USER == 0 || error & (PRESENT | RESERVED | PROTECTION_KEY | SHADOW_STACK | SGX) != 0
-    {
+    if error & USER == 0 || error & (RESERVED | PROTECTION_KEY | SHADOW_STACK | SGX) != 0 {
         return None;
     }
-    Some(if error & INSTRUCTION != 0 {
-        VM_ACCESS_EXECUTE
-    } else if error & WRITE != 0 {
-        VM_ACCESS_WRITE
-    } else {
-        VM_ACCESS_READ
-    })
+    if error & PRESENT != 0 {
+        return (error & WRITE != 0 && error & INSTRUCTION == 0).then_some((
+            VM_ACCESS_WRITE,
+            VM_FAULT_PRESENT | VM_FAULT_PROTECTION | VM_FAULT_COW,
+        ));
+    }
+    Some((
+        if error & INSTRUCTION != 0 {
+            VM_ACCESS_EXECUTE
+        } else if error & WRITE != 0 {
+            VM_ACCESS_WRITE
+        } else {
+            VM_ACCESS_READ
+        },
+        0,
+    ))
 }
 
 fn cancel_reserved_fault(
@@ -51,6 +77,8 @@ fn try_handle_current_user_page_fault(
     rip: u64,
     _rsp: u64,
 ) -> hal_api::UserFaultDisposition {
+    // ORDERING: the flag only elects one diagnostic emitter. AcqRel/Acquire
+    // gives a single globally ordered first observation without guarding data.
     if error_code.is_some_and(|error| error & 0x5 == 0x5)
         && FIRST_USER_PRESENT_PAGE_FAULT
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -63,7 +91,7 @@ fn try_handle_current_user_page_fault(
             rip,
         );
     }
-    let Some(access) = page_fault_access(error_code) else {
+    let Some((access, fault_flags)) = page_fault_access(error_code) else {
         return hal_api::UserFaultDisposition::Unhandled;
     };
     let page = cr2 & !(PAGER_PAGE_BYTES - 1);
@@ -96,7 +124,7 @@ fn try_handle_current_user_page_fault(
     let request = PagerFaultRequestWire {
         version: PAGER_FAULT_ABI_VERSION,
         access,
-        fault_flags: 0,
+        fault_flags,
         reserved0: 0,
         fault_token: 0,
         process_handle: vma.region.process_handle,
@@ -113,6 +141,25 @@ fn try_handle_current_user_page_fault(
         object: vma.region.object,
         reserved1: [0; 2],
     };
+    if fault_flags & VM_FAULT_COW != 0 {
+        let kind = match (vma.region.object.object_type, vma.region.sharing) {
+            (VM_OBJECT_ANONYMOUS, VM_SHARING_PRIVATE) => mm_api::phys::CowFrameKind::AnonymousFork,
+            (VM_OBJECT_FILE_PRIVATE | VM_OBJECT_IMAGE_SECTION, VM_SHARING_PRIVATE) => {
+                mm_api::phys::CowFrameKind::PrivateFileSection
+            }
+            _ => return hal_api::UserFaultDisposition::Unhandled,
+        };
+        return match compat_api::pager::serve_private_cow_write(request, kind) {
+            compat_api::pager::AnonymousFaultOutcome::Mapped
+            | compat_api::pager::AnonymousFaultOutcome::Retry => {
+                hal_api::UserFaultDisposition::Resumed
+            }
+            compat_api::pager::AnonymousFaultOutcome::Refused => {
+                hal_api::UserFaultDisposition::Unhandled
+            }
+        };
+    }
+
     // Zircon split. An anonymous object has no external owner and no backing
     // store, so ring0 supplies its zeroed page here, in the faulting task's own
     // context: no fault slot, no frame grant, no block, no reply custody, and
@@ -180,6 +227,8 @@ fn try_handle_current_user_page_fault(
             .map_err(|_| ps_api::PagerFaultSlotError::Pressure)
         },
     ) else {
+        // ORDERING: as above, this atomic elects exactly one diagnostic emitter
+        // and does not carry pager-reservation state.
         if FIRST_PAGER_RESERVATION_REJECTION
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
@@ -314,7 +363,10 @@ pub fn register() {
 mod tests {
     use super::{page_fault_access, uses_linux_fault_policy};
     use kernel_ps::api::UserAbi;
-    use rustos_user_abi::pager::{VM_ACCESS_EXECUTE, VM_ACCESS_READ, VM_ACCESS_WRITE};
+    use rustos_user_abi::pager::{
+        VM_ACCESS_EXECUTE, VM_ACCESS_READ, VM_ACCESS_WRITE, VM_FAULT_COW, VM_FAULT_PRESENT,
+        VM_FAULT_PROTECTION,
+    };
 
     #[test]
     fn linux_fault_policy_is_not_applied_to_windows_abi() {
@@ -325,22 +377,31 @@ mod tests {
 
     #[test]
     fn anonymous_nonpresent_fault_access_is_exact() {
-        assert_eq!(page_fault_access(Some(1 << 2)), Some(VM_ACCESS_READ));
+        assert_eq!(page_fault_access(Some(1 << 2)), Some((VM_ACCESS_READ, 0)));
         assert_eq!(
             page_fault_access(Some((1 << 2) | (1 << 1))),
-            Some(VM_ACCESS_WRITE)
+            Some((VM_ACCESS_WRITE, 0))
         );
         assert_eq!(
             page_fault_access(Some((1 << 2) | (1 << 1) | (1 << 4))),
-            Some(VM_ACCESS_EXECUTE)
+            Some((VM_ACCESS_EXECUTE, 0))
         );
     }
 
     #[test]
-    fn protection_and_extended_x86_faults_stay_on_the_retirement_path() {
+    fn only_present_user_writes_enter_the_cow_candidate_path() {
+        assert_eq!(
+            page_fault_access(Some((1 << 2) | (1 << 1) | 1)),
+            Some((
+                VM_ACCESS_WRITE,
+                VM_FAULT_PRESENT | VM_FAULT_PROTECTION | VM_FAULT_COW,
+            ))
+        );
         assert_eq!(page_fault_access(None), None);
         assert_eq!(page_fault_access(Some(0)), None);
-        for forbidden in [1_u64 << 0, 1 << 3, 1 << 5, 1 << 6, 1 << 15] {
+        assert_eq!(page_fault_access(Some((1 << 2) | 1)), None);
+        assert_eq!(page_fault_access(Some((1 << 2) | (1 << 4) | 1)), None);
+        for forbidden in [1_u64 << 3, 1 << 5, 1 << 6, 1 << 15] {
             assert_eq!(page_fault_access(Some((1 << 2) | forbidden)), None);
         }
     }

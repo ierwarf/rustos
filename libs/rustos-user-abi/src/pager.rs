@@ -16,7 +16,7 @@ pub use region_edit::{
     PagerRangeEdit, PagerRegionEdit, apply_region_edit, pager_pressure_name,
 };
 
-pub const PAGER_FAULT_ABI_VERSION: u16 = 2;
+pub const PAGER_FAULT_ABI_VERSION: u16 = 3;
 pub const PAGER_PAGE_BYTES: u64 = 4096;
 
 /// Upper bound on pages one fault may populate, including the faulting page.
@@ -293,6 +293,11 @@ pub const PAGER_ACTION_TERMINATE: u16 = 6;
 pub const VM_SHARING_PRIVATE: u16 = 1;
 pub const VM_SHARING_SHARED: u16 = 2;
 
+/// Address space is reserved but has no committed backing authority.
+pub const VM_COMMIT_RESERVED: u16 = 1;
+/// Backing is committed; an admitted access may populate a missing leaf.
+pub const VM_COMMIT_COMMITTED: u16 = 2;
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PagerEndpointCapabilityWire {
@@ -348,7 +353,7 @@ pub struct PagerVmRegionWire {
     pub object_offset: u64,
     pub prot: u32,
     pub sharing: u16,
-    pub reserved0: u16,
+    pub commit_state: u16,
     pub vma_generation: u64,
     pub process_handle: u64,
     pub process_generation: u64,
@@ -364,11 +369,10 @@ impl PagerVmRegionWire {
             && self.start & (PAGER_PAGE_BYTES - 1) == 0
             && self.end & (PAGER_PAGE_BYTES - 1) == 0
             && self.object_offset & (PAGER_PAGE_BYTES - 1) == 0
-            && self.prot != 0
             && self.prot & !VM_PROT_KNOWN == 0
             && !(self.prot & VM_PROT_WRITE != 0 && self.prot & VM_PROT_EXECUTE != 0)
             && (self.sharing == VM_SHARING_PRIVATE || self.sharing == VM_SHARING_SHARED)
-            && self.reserved0 == 0
+            && (self.commit_state == VM_COMMIT_RESERVED || self.commit_state == VM_COMMIT_COMMITTED)
             && self.reserved1[0] == 0
             && self.reserved1[1] == 0
             && self.vma_generation != 0
@@ -381,6 +385,10 @@ impl PagerVmRegionWire {
 
     pub const fn contains(self, address: u64) -> bool {
         address >= self.start && address < self.end
+    }
+
+    pub const fn is_committed(self) -> bool {
+        self.commit_state == VM_COMMIT_COMMITTED
     }
 }
 

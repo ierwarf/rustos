@@ -6,8 +6,8 @@ use crate::config::{self as config_mod, Config};
 use crate::kvm;
 use crate::stage;
 use crate::testinfra;
-use crate::verify;
 use crate::util::{default_root_dir, env_path};
+use crate::verify;
 use std::path::PathBuf;
 
 #[derive(Parser)]

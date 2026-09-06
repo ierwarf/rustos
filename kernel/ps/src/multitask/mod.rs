@@ -1,6 +1,9 @@
 mod context;
 mod cpu_local;
 mod current;
+mod user_copy;
+pub(crate) use current::with_current_user_copy_mm;
+pub(crate) use user_copy::UserCopyAddressSpace;
 mod current_identity;
 mod deferred_wake;
 mod irq;
@@ -61,7 +64,7 @@ pub use self::current::{
     live_user_process_identity_with_exact_exec_path, mark_user_process_exiting,
     mark_user_process_exiting_once, next_retired_task_cleanup, note_process_exit_status,
     pager_vma_regions_for_process, parent_process_id_of, publish_current_pager_vma,
-    publish_pager_vma_for_process,
+    publish_inherited_pager_vma_for_process, publish_pager_vma_for_process,
     queue_linux_process_sigchld, queue_linux_signal, release_ipc_priorities_for_process,
     release_ipc_priority, release_pager_fault_priority, reserve_ipc_call_donation,
     reserve_ipc_priority, retain_current_user_process_state, retire_current_user_task_due_to_fault,
@@ -76,7 +79,8 @@ pub use self::current::{
     wake_user_task, windows_process_affinity, with_current_mm, with_current_process_credentials,
     with_current_process_state, with_current_process_state_mut, with_current_user_linux_state_mut,
     with_current_user_process_and_linux_thread_state_mut, with_current_user_process_state,
-    with_current_user_process_state_mut, with_process_state_by_pid, with_process_state_by_pid_mut,
+    with_current_user_process_state_mut, with_fork_parent_state, with_process_state_by_pid,
+    with_process_state_by_pid_mut,
 };
 pub use self::pager_fault::{
     PagerFaultReservation, PagerFaultSlotError, PagerFaultState, cancel_pager_fault,
@@ -86,7 +90,9 @@ pub use self::pager_fault::{
     take_pager_fault_waiter_for, unregister_pager_fault_waiter,
 };
 pub use self::pager_vma::{
-    PagerFaultInstallPermit, PagerVmaError, PagerVmaSnapshot, protect_for_process as protect_pager_vma_for_process,
+    PagerFaultInstallPermit, PagerVmaError, PagerVmaSnapshot,
+    protect_for_process as protect_pager_vma_for_process,
+    set_commit_state_for_process as set_pager_vma_commit_state_for_process,
     unmap_for_process as unmap_pager_vma_for_process, validate_fault_request,
     with_validated_fault_address_space,
 };

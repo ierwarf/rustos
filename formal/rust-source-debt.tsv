@@ -11,6 +11,7 @@ kernel/hal/src/arch/timer.rs	0	0
 kernel/hal/src/arch/clock.rs	5	7
 kernel/hal/src/arch/rtc.rs	3	18
 kernel/compat/src/pager.rs	0	0
+kernel/compat/src/user/syscall/linux/proc_broker_ops/fork.rs	0	0
 kernel/compat/src/user/syscall/linux/pager_fault_ops.rs	0	0
 kernel/compat/src/user/syscall/linux/service_ops/process_time.rs	1	0
 kernel/hal/src/arch/msi.rs	5	19
@@ -21,12 +22,17 @@ kernel/lowlevel/src/interrupts.rs	3	4
 kernel/ipc-runtime/src/ipc/mod.rs	1	12
 kernel/io-manager/src/driver/mmio.rs	0	0
 kernel/executive/src/boot.rs	2	1
+kernel/executive/src/hal_hooks.rs	0	0
 libs/driver-domain-host/src/lib.rs	23	4
 kernel/ipc-runtime/src/ipc/endpoint_priority.rs	0	0
 kernel/mm/src/memory/address_space.rs	24	0
 kernel/mm/src/memory/address_space/atomic_user.rs	0	0
 kernel/mm/src/memory/address_space/rollback.rs	0	0
-kernel/mm/src/memory/address_space/owned_frames.rs	0	0
+kernel/mm/src/memory/address_space/frame_release.rs	0	0
+kernel/mm/src/memory/address_space/pager_fault_mapping.rs	0	0
+kernel/mm/src/memory/phys/frame_descriptor_ledger.rs	0	0
+kernel/mm/src/memory/phys/frame_descriptor_ledger/api.rs	0	0
+kernel/mm/src/memory/phys/frame_descriptor_ledger/encoding.rs	0	0
 kernel/mm/src/memory/frame_capability.rs	0	0
 kernel/mm/src/memory/kernel_vm.rs	16	0
 kernel/mm/src/memory/cache_attributes.rs	0	0
@@ -42,6 +48,7 @@ libs/rustos-user-abi/src/syscall/activation_batch.rs	0	0
 kernel/ps/src/multitask/process_table.rs	2	0
 kernel/ps/src/multitask/pager_fault.rs	0	0
 kernel/ps/src/multitask/pager_vma.rs	0	0
+kernel/ps/src/multitask/pager_vma/fork_hold.rs	0	0
 kernel/ps/src/multitask/current/ipc.rs	0	0
 kernel/ps/src/user/process_state.rs	0	0
 kernel/ps/src/multitask/scheduler.rs	16	0

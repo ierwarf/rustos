@@ -16,11 +16,11 @@ use boot_protocol::{BootInfo, BootMemoryKind, BootMemoryRegion};
 use core::ptr;
 
 use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
+use x86_64::PhysAddr;
 #[cfg(all(rustos_boot_image, not(test)))]
 use x86_64::instructions::interrupts;
-use x86_64::PhysAddr;
 
-use crate::memory::kernel_vm::{higher_half_addr, DIRECT_MAP_PHYS_LIMIT};
+use crate::memory::kernel_vm::{DIRECT_MAP_PHYS_LIMIT, higher_half_addr};
 
 const PAGE_SIZE: u64 = 4096;
 const BITS_PER_WORD: usize = 64;
@@ -30,12 +30,18 @@ const PHYS_ALLOC_SCAN_MILESTONE_FRAMES: usize = 64 * 1024;
 static PHYS_ALLOCATOR: TrackedSpinLock<PhysAllocatorState, { LockClass::PhysicalAllocator as u8 }> =
     TrackedSpinLock::new(PhysAllocatorState::new());
 
-mod lazy_table_ledger;
-pub use lazy_table_ledger::{
-    cancel_lazy_table_record, claim_lazy_table_record, drain_lazy_table_records,
-    publish_lazy_table_record, register_lazy_table_root,
+mod frame_descriptor_ledger;
+pub use frame_descriptor_ledger::{
+    CowFrameKind, CowMappingClaim, DataLeafRelease, SharedAliasTicket, cancel_cow_mapping,
+    cancel_data_leaf, cancel_lazy_table_record, cancel_private_file_data_leaf, cancel_shared_alias,
+    claim_data_leaf, claim_lazy_table_record, claim_private_file_data_leaf, commit_cow_mapping,
+    data_leaf_count, data_leaf_cow_identity, data_leaf_is_owned, drain_lazy_table_records,
+    prepare_shared_alias, promote_cow_mapping_in_place, publish_data_leaf,
+    publish_lazy_table_record, publish_private_file_data_leaf, publish_shared_alias,
+    register_data_leaf_root, register_lazy_table_root, release_data_leaf, rollback_shared_alias,
+    try_claim_cow_mapping, unregister_data_leaf_root,
 };
-use lazy_table_ledger::{LazyTableLedgerRecord, LAZY_TABLE_LEDGER};
+use frame_descriptor_ledger::{CowMappingRecord, FRAME_DESCRIPTORS, FrameDescriptorRecord};
 
 mod frame_batch_profile;
 
@@ -496,10 +502,17 @@ pub fn init(boot_info_ptr: *const BootInfo) {
             .checked_mul(core::mem::size_of::<u64>())
             .expect("physical allocator bitmap size overflow");
         let bitmap_pages = bitmap_bytes.div_ceil(PAGE_SIZE as usize);
-        let lazy_table_ledger_bytes = frame_count
-            .checked_mul(core::mem::size_of::<LazyTableLedgerRecord>())
-            .expect("lazy table ledger size overflow");
-        let lazy_table_ledger_pages = lazy_table_ledger_bytes.div_ceil(PAGE_SIZE as usize);
+        let frame_descriptor_bytes = frame_count
+            .checked_mul(core::mem::size_of::<FrameDescriptorRecord>())
+            .expect("frame descriptor size overflow");
+        let frame_descriptor_pages = frame_descriptor_bytes.div_ceil(PAGE_SIZE as usize);
+        // One additional mapping record per frame admits a complete two-way
+        // fork because each shared descriptor keeps its first mapping inline.
+        let cow_mapping_count = frame_count;
+        let cow_mapping_bytes = cow_mapping_count
+            .checked_mul(core::mem::size_of::<CowMappingRecord>())
+            .expect("COW mapping record size overflow");
+        let cow_mapping_pages = cow_mapping_bytes.div_ceil(PAGE_SIZE as usize);
         let image_start = align_down(boot_info.nucleus_image.phys_start, PAGE_SIZE);
         let image_end = boot_info
             .nucleus_image
@@ -546,9 +559,9 @@ pub fn init(boot_info_ptr: *const BootInfo) {
             ptr::write_bytes(bitmap_ptr.cast::<u8>(), 0xff, bitmap_bytes);
         }
 
-        let Some(lazy_table_ledger_phys) = find_usable_span_excluding_ranges(
+        let Some(frame_descriptor_phys) = find_usable_span_excluding_ranges(
             memory_map,
-            lazy_table_ledger_pages,
+            frame_descriptor_pages,
             &[
                 (image_start, image_end),
                 (early_system_start, early_system_end),
@@ -560,21 +573,44 @@ pub fn init(boot_info_ptr: *const BootInfo) {
                 (bitmap_phys, bitmap_phys + bitmap_pages as u64 * PAGE_SIZE),
             ],
         ) else {
-            panic!("failed to reserve lazy table ledger");
+            panic!("failed to reserve physical frame descriptors");
         };
-        let lazy_table_ledger_ptr =
-            higher_half_addr(lazy_table_ledger_phys) as *mut LazyTableLedgerRecord;
+        let Some(cow_mapping_phys) = find_usable_span_excluding_ranges(
+            memory_map,
+            cow_mapping_pages,
+            &[
+                (image_start, image_end),
+                (early_system_start, early_system_end),
+                (
+                    nucleus_core::ap_trampoline::TRAMPOLINE_PHYS,
+                    nucleus_core::ap_trampoline::TRAMPOLINE_PHYS
+                        + nucleus_core::ap_trampoline::RESERVED_BYTES,
+                ),
+                (bitmap_phys, bitmap_phys + bitmap_pages as u64 * PAGE_SIZE),
+                (
+                    frame_descriptor_phys,
+                    frame_descriptor_phys + frame_descriptor_pages as u64 * PAGE_SIZE,
+                ),
+            ],
+        ) else {
+            panic!("failed to reserve COW mapping records");
+        };
+        let frame_descriptor_ptr =
+            higher_half_addr(frame_descriptor_phys) as *mut FrameDescriptorRecord;
+        let cow_mapping_ptr = higher_half_addr(cow_mapping_phys) as *mut CowMappingRecord;
         // SAFETY: `find_usable_span_excluding_ranges` selected this complete,
         // direct-mapped boot span; it is reserved before normal allocation and
-        // covers exactly `lazy_table_ledger_bytes` zero-initialized descriptors.
+        // covers exactly `frame_descriptor_bytes` zero-initialized descriptors.
         unsafe {
-            ptr::write_bytes(
-                lazy_table_ledger_ptr.cast::<u8>(),
-                0,
-                lazy_table_ledger_bytes,
-            );
+            ptr::write_bytes(frame_descriptor_ptr.cast::<u8>(), 0, frame_descriptor_bytes);
+            ptr::write_bytes(cow_mapping_ptr.cast::<u8>(), 0, cow_mapping_bytes);
         }
-        LAZY_TABLE_LEDGER.install(lazy_table_ledger_ptr, frame_count);
+        FRAME_DESCRIPTORS.install(
+            frame_descriptor_ptr,
+            frame_count,
+            cow_mapping_ptr,
+            cow_mapping_count,
+        );
 
         let mut new_state = PhysAllocatorState {
             initialized: false,
@@ -620,9 +656,10 @@ pub fn init(boot_info_ptr: *const BootInfo) {
         }
         new_state.reserve_phys_range(bitmap_phys, bitmap_pages as u64 * PAGE_SIZE);
         new_state.reserve_phys_range(
-            lazy_table_ledger_phys,
-            lazy_table_ledger_pages as u64 * PAGE_SIZE,
+            frame_descriptor_phys,
+            frame_descriptor_pages as u64 * PAGE_SIZE,
         );
+        new_state.reserve_phys_range(cow_mapping_phys, cow_mapping_pages as u64 * PAGE_SIZE);
         new_state.initialized = true;
 
         *state = new_state;

@@ -33,15 +33,12 @@ use super::*;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use rustos_user_abi::pager::{
-    PagerAnonymousPolicyWire,
     PAGER_MAX_FAULT_SLOTS, PAGER_MAX_FRAME_GRANTS, PAGER_MAX_VMAS_PER_PROCESS,
-    PAGER_WIRED_FAULT_FRAMES, PagerEndpointCapabilityWire, PagerObjectIdentityWire,
-    PagerVmRegionWire, VM_OBJECT_ANONYMOUS, VM_PROT_EXECUTE, VM_PROT_READ, VM_PROT_WRITE,
-    VM_SHARING_PRIVATE,
+    PAGER_WIRED_FAULT_FRAMES, PagerAnonymousPolicyWire, PagerEndpointCapabilityWire,
+    PagerObjectIdentityWire, PagerVmRegionWire, VM_OBJECT_ANONYMOUS, VM_PROT_EXECUTE, VM_PROT_READ,
+    VM_PROT_WRITE, VM_SHARING_PRIVATE,
 };
-use rustos_user_abi::syscall::{
-    IPC_SERVICE_PAGERD,
-};
+use rustos_user_abi::syscall::IPC_SERVICE_PAGERD;
 
 // The capacities ring0 compiles against and the ones the pager sizes its own
 // tables from have to be one set of numbers. They were three independent
@@ -108,7 +105,9 @@ pub(super) fn pager_protection(prot: u64) -> Option<u32> {
 }
 
 fn pager_rights(prot: u64) -> Option<u32> {
-    pager_protection(prot).filter(|rights| *rights != 0)
+    // A zero protection is still a reservation. Access is denied by the VMA
+    // commit/protection state, but the interval must remain authoritative.
+    pager_protection(prot)
 }
 
 /// Resolves the live pagerd endpoint as a fault capability.
@@ -161,16 +160,6 @@ pub(super) enum EagerByContract {
     PagerControlGraph,
     /// The published policy admits nothing to demand paging.
     PolicyDisabled,
-    /// This process has used its bounded per-process demand-paging capacity
-    /// (`PAGER_MAX_VMAS_PER_PROCESS`). Anonymous ranges beyond it are wired.
-    ///
-    /// This is a declared bound, not a failure: a dynamic loader publishes far
-    /// more than 64 anonymous ranges, so refusing the mapping would make an
-    /// ordinary process unable to start. What was wrong before was not the
-    /// wiring, it was that the bound was indistinguishable from a broken
-    /// transport, a refused epoch, and a stale identity - all of them mapped
-    /// to the same invisible eager mapping.
-    ProcessVmaCapacity,
     /// A published region already covers this range for this exact process
     /// generation, so the previous mapping's publication outlived its memory.
     ///
@@ -231,6 +220,40 @@ fn record_admission_class(counter: &AtomicU64, name: &'static str, detail: u64) 
     }
 }
 
+/// Stable low-byte classification for a pager VMA publication failure.
+///
+/// Keep this mapping explicit: collapsing every failure to `ENOMEM` made a
+/// stale fixed process slot look like capacity pressure and hid the lifecycle
+/// defect during the first COW fork acceptance run.
+fn pager_vma_error_class(error: multitask::PagerVmaError) -> u64 {
+    match error {
+        multitask::PagerVmaError::Malformed => 1,
+        multitask::PagerVmaError::Overlap => 2,
+        multitask::PagerVmaError::Pressure => 3,
+        multitask::PagerVmaError::Stale => 4,
+        multitask::PagerVmaError::Unstable => 5,
+        multitask::PagerVmaError::Denied => 6,
+    }
+}
+
+/// Publishes a bounded failure milestone without discarding the exact cause.
+///
+/// `arg0` packs `(occurrence << 8) | class`, while `arg1` carries the failed
+/// start address. The first occurrence and every 64th remain the only records,
+/// so preserving the cause does not turn a hot failure into an unbounded log.
+fn record_publish_failure(start: u64, error: multitask::PagerVmaError) {
+    let count = ADMISSION_PUBLISH_FAILED.fetch_add(1, Ordering::Relaxed) + 1;
+    if count == 1 || count.is_multiple_of(64) {
+        let occurrence_and_class = count.saturating_mul(1 << 8) | pager_vma_error_class(error);
+        nucleus_core::debug::record_milestone(
+            nucleus_core::debug::LogCategory::Compat,
+            "pager-admission-publish-failed",
+            occurrence_and_class,
+            start,
+        );
+    }
+}
+
 /// Builds the unbound region template. Process and VMA generations stay zero:
 /// `kernel-ps` is the only writer permitted to stamp them.
 fn region_template(
@@ -260,7 +283,7 @@ fn region_template(
         object_offset: 0,
         prot: rights,
         sharing: VM_SHARING_PRIVATE,
-        reserved0: 0,
+        commit_state: rustos_user_abi::pager::VM_COMMIT_COMMITTED,
         vma_generation: 0,
         process_handle: 0,
         process_generation: 0,
@@ -297,52 +320,68 @@ pub(super) fn admit_anonymous_region(
     admit_anonymous_rights(target_pid, start, end, rights)
 }
 
-/// Publishes one inherited anonymous range for a forked child.
+/// Produces the unbound child template for one canonical parent VMA.
 ///
-/// The rights come from the parent's published region rather than from a Linux
-/// `prot` word, because what fork inherits is the reservation the parent
-/// already holds, not the pages it happened to have touched.  The child takes
-/// a **fresh** object identity: fork is still an eager copy, so parent and
-/// child must not name one backing object.  Linux likewise gives the child its
-/// own `anon_vma` rather than sharing the parent's.
-///
-/// Every failure is a fork failure, never a wire fallback.  The child's
-/// publication table is a fresh slice of the same fixed size as the parent's,
-/// so it cannot be short of what the parent held, and the transport-absent and
-/// control-graph branches can only fire for a parent that had no demand VMA to
-/// inherit.  A refusal here therefore means something is wrong, and wiring the
-/// range instead would hide it behind an eagerly mapped child.
-pub(super) fn admit_inherited_anonymous_region(
-    target_pid: u64,
-    start: u64,
-    end: u64,
-    rights: u32,
+/// Every reservation attribute is inherited verbatim, including `PROT_NONE`,
+/// reserved/committed state, file identity, offset, sharing, and fault
+/// endpoint. Only process/VMA authority stamps are cleared. Anonymous-private
+/// objects receive the supplied fresh identity so untouched zero-fill pages do
+/// not accidentally join the parent's anonymous object.
+fn inherited_region_template(
+    parent: PagerVmRegionWire,
+    anonymous_identity: Option<(u64, PagerEndpointCapabilityWire)>,
 ) -> Result<PagerVmRegionWire, i64> {
-    if rights == 0 || rights & !rustos_user_abi::pager::VM_PROT_KNOWN != 0 {
+    if !parent.is_canonical()
+        || parent.object.object_type == VM_OBJECT_ANONYMOUS && parent.sharing != VM_SHARING_PRIVATE
+    {
         return Err(LINUX_EINVAL);
     }
+
+    let mut template = parent;
+    template.vma_generation = 0;
+    template.process_handle = 0;
+    template.process_generation = 0;
+    template.mm_generation = 0;
+    if template.object.object_type == VM_OBJECT_ANONYMOUS {
+        let (slot, endpoint) = anonymous_identity.ok_or(LINUX_ENOMEM)?;
+        if slot == 0 {
+            return Err(LINUX_ENOMEM);
+        }
+        template.object.backing_service = 0;
+        template.object.slot = slot;
+        template.object.generation = 1;
+        template.object.pager_epoch = RING0_ANONYMOUS_EPOCH;
+        template.object.backing_generation = 1;
+        template.fault_endpoint = endpoint;
+    }
+    Ok(template)
+}
+
+pub(super) fn admit_inherited_region(
+    target_pid: u64,
+    parent: rustos_user_abi::pager::PagerVmRegionWire,
+) -> Result<PagerVmRegionWire, i64> {
     let policy = crate::pager_policy::anonymous_policy();
-    if policy.demand_enabled == 0 {
+    if policy.demand_enabled == 0 || in_pager_control_graph(target_pid, policy) {
         return Err(LINUX_ENOMEM);
     }
-    let endpoint = fault_endpoint().ok_or(LINUX_ENOMEM)?;
-    if in_pager_control_graph(target_pid, policy) {
-        return Err(LINUX_ENOMEM);
-    }
-    let template =
-        region_template(start, end, rights, RING0_ANONYMOUS_EPOCH, endpoint).ok_or(LINUX_EINVAL)?;
-    multitask::publish_pager_vma_for_process(
+
+    let anonymous_identity = if parent.object.object_type == VM_OBJECT_ANONYMOUS {
+        let slot = NEXT_ANON_OBJECT_SLOT.fetch_add(1, Ordering::Relaxed);
+        let endpoint = fault_endpoint().ok_or(LINUX_ENOMEM)?;
+        Some((slot, endpoint))
+    } else {
+        None
+    };
+    let template = inherited_region_template(parent, anonymous_identity)?;
+
+    multitask::publish_inherited_pager_vma_for_process(
         target_pid,
         template,
         policy.process_vma_ceiling as usize,
     )
     .map_err(|error| {
-        record_admission_class(
-            &ADMISSION_PUBLISH_FAILED,
-            "pager-admission-publish-failed",
-            start,
-        );
-        let _ = error;
+        record_publish_failure(parent.start, error);
         LINUX_ENOMEM
     })
 }
@@ -354,17 +393,6 @@ fn admit_anonymous_rights(
     rights: u32,
 ) -> AnonymousAdmission {
     let policy = crate::pager_policy::anonymous_policy();
-    // Whether anonymous ranges are demand-backed at all is the pager's call,
-    // not a ring0 constant. Zero means every range is wired, exactly as before
-    // demand paging existed - an explicit contract, not a downgrade.
-    if policy.demand_enabled == 0 {
-        record_admission_class(
-            &WIRED_POLICY_DISABLED,
-            "pager-wired-policy-disabled",
-            target_pid,
-        );
-        return AnonymousAdmission::Eager(EagerByContract::PolicyDisabled);
-    }
     let Some(endpoint) = fault_endpoint() else {
         record_admission_class(
             &WIRED_TRANSPORT_ABSENT,
@@ -373,54 +401,58 @@ fn admit_anonymous_rights(
         );
         return AnonymousAdmission::Eager(EagerByContract::PagerTransportAbsent);
     };
-    if in_pager_control_graph(target_pid, policy) {
-        record_admission_class(
+
+    let eager_reason = if policy.demand_enabled == 0 {
+        Some((
+            EagerByContract::PolicyDisabled,
+            &WIRED_POLICY_DISABLED,
+            "pager-wired-policy-disabled",
+        ))
+    } else if in_pager_control_graph(target_pid, policy) {
+        Some((
+            EagerByContract::PagerControlGraph,
             &WIRED_CONTROL_GRAPH,
             "pager-wired-control-graph",
-            target_pid,
-        );
-        return AnonymousAdmission::Eager(EagerByContract::PagerControlGraph);
-    }
+        ))
+    } else {
+        None
+    };
+
     let Some(template) = region_template(start, end, rights, RING0_ANONYMOUS_EPOCH, endpoint)
     else {
         return AnonymousAdmission::Failed(LINUX_EINVAL);
     };
-    // The demand-paging ceiling is policy: it may narrow the fixed table, so a
-    // pager can bound one process's demand footprint without a kernel edit.
     match multitask::publish_pager_vma_for_process(
         target_pid,
         template,
         policy.process_vma_ceiling as usize,
     ) {
-        Ok(_) => AnonymousAdmission::Demand,
-        // The bounded per-process VMA table is full. Wire the range and
-        // count it; see `EagerByContract::ProcessVmaCapacity`.
+        Ok(_) => {
+            if let Some((reason, counter, milestone)) = eager_reason {
+                record_admission_class(counter, milestone, target_pid);
+                AnonymousAdmission::Eager(reason)
+            } else {
+                AnonymousAdmission::Demand
+            }
+        }
+        // Once this table is the reservation authority, exhausting it must
+        // refuse the mapping. Wiring without a publication would recreate the
+        // split authority this path is removing.
         Err(multitask::PagerVmaError::Pressure) => {
             record_admission_class(
                 &WIRED_PROCESS_VMA_CAPACITY,
-                "pager-wired-process-vma-capacity",
+                "pager-vma-capacity-refused",
                 target_pid,
             );
-            AnonymousAdmission::Eager(EagerByContract::ProcessVmaCapacity)
+            AnonymousAdmission::Failed(LINUX_ENOMEM)
         }
-        // A stale publication still covers this range. Wire it and name
-        // the exact address; see `EagerByContract::StaleRegionOverlap`.
+        // MAP_FIXED handles one explicit withdraw-and-retry in the caller.
         Err(multitask::PagerVmaError::Overlap) => {
-            record_admission_class(
-                &WIRED_STALE_REGION_OVERLAP,
-                "pager-wired-stale-region-overlap",
-                start,
-            );
+            record_admission_class(&WIRED_STALE_REGION_OVERLAP, "pager-vma-overlap", start);
             AnonymousAdmission::Eager(EagerByContract::StaleRegionOverlap)
         }
-        // A stale process identity or a malformed template. Neither is a
-        // capacity bound, so neither may be hidden behind one.
-        Err(_) => {
-            record_admission_class(
-                &ADMISSION_PUBLISH_FAILED,
-                "pager-admission-publish-failed",
-                start,
-            );
+        Err(error) => {
+            record_publish_failure(start, error);
             AnonymousAdmission::Failed(LINUX_ENOMEM)
         }
     }
@@ -430,8 +462,24 @@ fn admit_anonymous_rights(
 mod tests {
     use super::*;
 
+    fn canonical_parent_region() -> PagerVmRegionWire {
+        let endpoint = PagerEndpointCapabilityWire {
+            slot: 5,
+            generation: 7,
+            rights: 1,
+        };
+        let mut region =
+            region_template(0x4000, 0x8000, VM_PROT_READ, 3, endpoint).expect("template");
+        region.vma_generation = 11;
+        region.process_handle = 13;
+        region.process_generation = 17;
+        region.mm_generation = 19;
+        assert!(region.is_canonical());
+        region
+    }
+
     #[test]
-    fn pager_rights_rejects_write_execute_and_unknown_protection() {
+    fn pager_rights_accepts_prot_none_reservations_but_rejects_wx_and_unknown_bits() {
         assert_eq!(pager_rights(linux_abi::PROT_READ), Some(VM_PROT_READ));
         assert_eq!(
             pager_rights(linux_abi::PROT_READ | linux_abi::PROT_WRITE),
@@ -441,7 +489,9 @@ mod tests {
             pager_rights(linux_abi::PROT_WRITE | linux_abi::PROT_EXEC),
             None
         );
-        assert_eq!(pager_rights(0), None);
+        // PROT_NONE still publishes one authoritative reserved interval; its
+        // zero rights deny access until a later committed protection update.
+        assert_eq!(pager_rights(0), Some(0));
         assert_eq!(pager_protection(0), Some(0));
         assert_eq!(pager_rights(1 << 20), None);
     }
@@ -463,6 +513,79 @@ mod tests {
         assert!(template.object.has_authority());
         assert_eq!(template.object.pager_epoch, 3);
         assert_eq!(template.sharing, VM_SHARING_PRIVATE);
+    }
+
+    #[test]
+    fn inherited_file_private_reservation_preserves_dual_abi_policy() {
+        let mut parent = canonical_parent_region();
+        parent.object.object_type = rustos_user_abi::pager::VM_OBJECT_FILE_PRIVATE;
+        parent.object.rights = VM_PROT_READ | VM_PROT_WRITE;
+        parent.object.backing_service = 23;
+        parent.object.slot = 29;
+        parent.object.generation = 31;
+        parent.object.pager_epoch = 37;
+        parent.object.backing_generation = 41;
+        parent.object_offset = 0x20_000;
+        parent.prot = 0;
+        parent.commit_state = rustos_user_abi::pager::VM_COMMIT_RESERVED;
+        assert!(parent.is_canonical());
+
+        let child = inherited_region_template(parent, None).expect("file-private child template");
+        assert_eq!(child.start, parent.start);
+        assert_eq!(child.end, parent.end);
+        assert_eq!(child.object, parent.object);
+        assert_eq!(child.object_offset, parent.object_offset);
+        assert_eq!(child.prot, 0);
+        assert_eq!(child.sharing, parent.sharing);
+        assert_eq!(
+            child.commit_state,
+            rustos_user_abi::pager::VM_COMMIT_RESERVED
+        );
+        assert_eq!(child.fault_endpoint, parent.fault_endpoint);
+        assert_eq!(child.vma_generation, 0);
+        assert_eq!(child.process_handle, 0);
+        assert_eq!(child.process_generation, 0);
+        assert_eq!(child.mm_generation, 0);
+    }
+
+    #[test]
+    fn inherited_anonymous_private_gets_fresh_identity_and_rejects_shared() {
+        let parent = canonical_parent_region();
+        let endpoint = PagerEndpointCapabilityWire {
+            slot: 43,
+            generation: 47,
+            rights: u64::from(VM_PROT_READ),
+        };
+        let child = inherited_region_template(parent, Some((53, endpoint)))
+            .expect("anonymous-private child template");
+        assert_ne!(child.object.slot, parent.object.slot);
+        assert_eq!(child.object.slot, 53);
+        assert_eq!(child.object.backing_service, 0);
+        assert_eq!(child.object.rights, parent.object.rights);
+        assert_eq!(child.prot, parent.prot);
+        assert_eq!(child.commit_state, parent.commit_state);
+        assert_eq!(child.fault_endpoint, endpoint);
+
+        let mut shared = parent;
+        shared.sharing = rustos_user_abi::pager::VM_SHARING_SHARED;
+        assert!(shared.is_canonical());
+        assert_eq!(
+            inherited_region_template(shared, Some((59, endpoint))),
+            Err(LINUX_EINVAL)
+        );
+    }
+
+    #[test]
+    fn pager_vma_failure_telemetry_has_stable_distinct_classes() {
+        assert_eq!(
+            pager_vma_error_class(multitask::PagerVmaError::Malformed),
+            1
+        );
+        assert_eq!(pager_vma_error_class(multitask::PagerVmaError::Overlap), 2);
+        assert_eq!(pager_vma_error_class(multitask::PagerVmaError::Pressure), 3);
+        assert_eq!(pager_vma_error_class(multitask::PagerVmaError::Stale), 4);
+        assert_eq!(pager_vma_error_class(multitask::PagerVmaError::Unstable), 5);
+        assert_eq!(pager_vma_error_class(multitask::PagerVmaError::Denied), 6);
     }
 
     #[test]
@@ -489,9 +612,14 @@ mod tests {
             rights: 1,
         };
         assert_ne!(RING0_ANONYMOUS_EPOCH, 0);
-        let template =
-            region_template(0x4000, 0x8000, VM_PROT_READ, RING0_ANONYMOUS_EPOCH, endpoint)
-                .expect("template");
+        let template = region_template(
+            0x4000,
+            0x8000,
+            VM_PROT_READ,
+            RING0_ANONYMOUS_EPOCH,
+            endpoint,
+        )
+        .expect("template");
         assert!(template.object.has_authority());
         assert_eq!(template.object.object_type, VM_OBJECT_ANONYMOUS);
         assert_eq!(template.object.backing_service, 0);

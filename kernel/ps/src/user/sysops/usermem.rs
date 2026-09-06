@@ -35,6 +35,13 @@ fn with_current_address_space<R>(
     multitask::with_current_mm(f).ok_or(paging::AddressSpaceError::NotMapped)?
 }
 
+#[track_caller]
+fn with_current_write_address_space<R>(
+    f: impl FnOnce(&multitask::UserCopyAddressSpace<'_>) -> Result<R, paging::AddressSpaceError>,
+) -> Result<R, paging::AddressSpaceError> {
+    multitask::with_current_user_copy_mm(f).ok_or(paging::AddressSpaceError::NotMapped)?
+}
+
 pub fn copy_from_current_user_exact(
     user_ptr: u64,
     dest: &mut [u8],
@@ -75,7 +82,7 @@ pub fn copy_from_retained_user_and_validate_writes(
     write_buffers: &[(u64, usize)],
 ) -> Result<(), paging::AddressSpaceError> {
     retained
-        .try_with_address_space(|address_space| {
+        .try_with_user_copy_address_space(|address_space| {
             for (write_ptr, write_len) in write_buffers.iter().copied() {
                 if write_len != 0 {
                     let write_start = user_virt_addr(write_ptr, write_len)?;
@@ -141,7 +148,7 @@ pub fn write_current_user_bytes(
     bytes: &[u8],
 ) -> Result<(), paging::AddressSpaceError> {
     let entry = usermem_profile::now();
-    with_current_address_space(|address_space| {
+    with_current_write_address_space(|address_space| {
         let bound = usermem_profile::charge(usermem_profile::UserCopyPhase::WriteBind, entry);
         let start = user_virt_addr(user_ptr, bytes.len())?;
         let validated_write = address_space.validate_user_write(start, bytes.len())?;
@@ -159,7 +166,7 @@ pub fn write_retained_user_bytes(
     bytes: &[u8],
 ) -> Result<(), paging::AddressSpaceError> {
     retained
-        .try_with_address_space(|address_space| {
+        .try_with_user_copy_address_space(|address_space| {
             let start = user_virt_addr(user_ptr, bytes.len())?;
             address_space
                 .validate_user_write(start, bytes.len())?
@@ -172,7 +179,7 @@ pub fn validate_current_user_write_buffer(
     user_ptr: u64,
     len: usize,
 ) -> Result<(), paging::AddressSpaceError> {
-    with_current_address_space(|address_space| {
+    with_current_write_address_space(|address_space| {
         address_space.validate_user_write_buffer(user_virt_addr(user_ptr, len)?, len)
     })
 }
@@ -205,7 +212,7 @@ pub fn validate_current_user_write_buffers(
         LockClass::ProcessState,
         rustos_user_abi::performance::USER_COPY_BATCH_MAX_ADDRESS_SPACE_BINDS,
     );
-    with_current_address_space(|address_space| {
+    with_current_write_address_space(|address_space| {
         for (user_ptr, len) in buffers.iter().copied() {
             if len == 0 {
                 continue;
@@ -221,7 +228,7 @@ pub fn validate_retained_user_write_buffers(
     buffers: &[(u64, usize)],
 ) -> Result<(), paging::AddressSpaceError> {
     retained
-        .try_with_address_space(|address_space| {
+        .try_with_user_copy_address_space(|address_space| {
             for (user_ptr, len) in buffers.iter().copied() {
                 if len != 0 {
                     address_space
@@ -255,7 +262,7 @@ pub fn write_current_user_bytes_batch(
         rustos_user_abi::performance::USER_COPY_BATCH_MAX_ADDRESS_SPACE_BINDS,
     );
     let entry = usermem_profile::now();
-    with_current_address_space(|address_space| {
+    with_current_write_address_space(|address_space| {
         let mut phase = usermem_profile::charge(usermem_profile::UserCopyPhase::WriteBind, entry);
         for (user_ptr, bytes) in writes.iter().copied() {
             if bytes.is_empty() {
@@ -276,7 +283,7 @@ pub fn write_retained_user_bytes_batch(
     writes: &[(u64, &[u8])],
 ) -> Result<(), paging::AddressSpaceError> {
     retained
-        .try_with_address_space(|address_space| {
+        .try_with_user_copy_address_space(|address_space| {
             for (user_ptr, bytes) in writes.iter().copied() {
                 if bytes.is_empty() {
                     continue;

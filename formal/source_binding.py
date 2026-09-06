@@ -62,8 +62,15 @@ def source_tree_sha256(root: Path) -> str:
         relative = raw_path.decode("utf-8")
         if relative in exempt:
             continue
+        candidate = root / relative
+        # `git ls-files --cached` still reports a tracked path deleted by the
+        # current change set. Its absence is part of the tree hash; attempting
+        # to read it would make evidence generation unable to validate a
+        # legitimate source deletion.
+        if not candidate.is_file():
+            continue
         digest.update(raw_path)
         digest.update(b"\0")
-        digest.update((root / relative).read_bytes())
+        digest.update(candidate.read_bytes())
         digest.update(b"\0")
     return digest.hexdigest()

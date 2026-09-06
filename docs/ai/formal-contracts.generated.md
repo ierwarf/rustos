@@ -2,20 +2,20 @@
 # Formal Contract Registry
 
 - Schema: `3`
-- Registry SHA-256: `bca9bac04325454877f4eee332269f71450f387893b32f54558f32664ddc5df8`
-- Models: `136`
-- Whole flows: `74`
-- Transitions: `749`
+- Registry SHA-256: `2fec74cf68a0a5f3b52eaef96e4cff9c341c0bff1e62bd1e8a70a31fe67d78e9`
+- Models: `137`
+- Whole flows: `75`
+- Transitions: `755`
 - Product runtime scenarios: `3`
-- Exact source witnesses: `645`
+- Exact source witnesses: `656`
 - Apalache pilots: `3`
 - TLAPS theorem models: `2`
 - Runtime-traced models: `7`
 - Intentional-terminal exceptions: `92` (ceiling `92`)
 - Cyclic strongly connected components: `48`
-- Supporting model bindings: `108`
-- Explicit critical/high risk surfaces: `111`
-- Additional source mappings: `192`
+- Supporting model bindings: `109`
+- Explicit critical/high risk surfaces: `118`
+- Additional source mappings: `200`
 
 | Flow | Severity | Owners | Models | Requirements | Hazards | Sinks |
 | --- | --- | --- | --- | ---: | ---: | --- |
@@ -28,6 +28,7 @@
 | `capability-derivation-lifecycle` | `critical` | kernel-ipc-runtime, kernel-object, kernel-ps | capability-derivation-lifecycle/CapabilityDerivationLifecycle | 10 | 10 | rejected, revoked |
 | `commercial-envelope` | `critical` | caller, kernel-ipc, netd, service | commercial-service-envelope/CommercialServiceEnvelope | 6 | 6 | admitted, malformed-replied, peer-closed, reply-rejected, timed-out |
 | `commercial-product-boot` | `critical` | kernel-io-manager, rootd, storaged, uiserver, vfsd, wayclick, xtask-kvm | acceptance-profile-publication/AcceptanceProfilePublication, dvm-block-startup/DvmBlockStartup, dvm-display-readiness/DvmDisplayReadiness, input-ingestion-worker/InputIngestionWorker, product-boot/ProductBoot, rootd-bootstrap/RootdBootstrap, ui-frame-budget/UiFrameBudget | 19 | 19 | control-ready, failed, presented, revoked, storage-usable |
+| `cow-frame-lifecycle` | `critical` | kernel-mm, kernel-ps | cow-frame-lifecycle/CowFrameLifecycle | 4 | 4 | exclusive, rejected, validated |
 | `cpu-affinity-observation` | `critical` | kernel-compat, kernel-hal, syscalld | cpu-affinity-observation/CpuAffinityObservation | 7 | 7 | rejected, replied |
 | `cpu-online-lifecycle` | `critical` | kernel-executive, kernel-hal, kernel-mm, kernel-ps, nucleus-core | cpu-online-lifecycle/CpuOnlineLifecycle | 19 | 19 | invariant-panic, online |
 | `cpu-topology-admission` | `critical` | kernel-hal | cpu-topology-admission/CpuTopologyAdmission | 4 | 4 | published, rejected |
@@ -61,10 +62,10 @@
 | `page-cache-lifecycle` | `critical` | pagerd | page-cache-lifecycle/PageCacheLifecycle | 10 | 10 | rejected |
 | `pager-fault-slot-lifecycle` | `critical` | kernel-ps | pager-fault-slot-lifecycle/PagerFaultSlotLifecycle | 5 | 5 | freed |
 | `pager-frame-grant-lifecycle` | `critical` | kernel-mm | pager-frame-grant-lifecycle/PagerFrameGrantLifecycle | 3 | 3 | consumed |
-| `pager-vma-publication` | `critical` | kernel-ps | pager-vma-publication/PagerVmaPublication | 4 | 4 | revoked |
+| `pager-vma-publication` | `critical` | kernel-ps | pager-vma-publication/PagerVmaPublication | 5 | 5 | revoked |
 | `pci-resource-discovery` | `critical` | kernel-hal | pci-bar-discovery/PciBarDiscovery | 9 | 9 | published, rejected |
 | `per-cpu-clockevent-lifecycle` | `critical` | kernel-hal, kernel-ps | per-cpu-clockevent-lifecycle/PerCpuClockeventLifecycle | 7 | 7 | invariant-panic, serviced |
-| `physical-frame-lifecycle` | `critical` | kernel-mm | physical-frame-lifecycle/PhysicalFrameLifecycle | 7 | 7 | allocation-failed, rejected |
+| `physical-frame-lifecycle` | `critical` | kernel-mm | physical-frame-lifecycle/PhysicalFrameLifecycle | 8 | 8 | allocation-failed, rejected |
 | `post-init-bootstrap-barrier` | `critical` | initd | post-init-bootstrap-barrier/PostInitBootstrapBarrier | 5 | 5 | barrier-failed, consumer-started |
 | `post-init-service-authority` | `critical` | kernel-compat, loaderd, rootd | post-init-leases/PostInitLeases | 6 | 6 | denied, revoked |
 | `process-address-space-lifecycle` | `critical` | kernel-ps | exec-address-space-transaction/ExecAddressSpaceTransaction, process-address-space-lifetime/ProcessAddressSpaceLifetime | 15 | 15 | live, reclaimed, rejected |

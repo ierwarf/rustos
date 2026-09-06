@@ -36,6 +36,7 @@ pub mod heap {
 }
 
 pub mod address_space {
+    pub use crate::memory::address_space::ValidatedUserWrite;
     pub use crate::memory::paging::ProcessAddressSpace;
     pub use x86_64::structures::paging::PageTableFlags;
 
@@ -78,10 +79,9 @@ pub mod frame_capability {
         MAX_PREALLOCATED_PAGER_FAULT_FRAMES, allocate_zeroed_frame, allocate_zeroed_frame_grant,
         cancel_frame_grant, pager_fault_frame_refill_requested, pager_fault_reserve_depth,
         pager_fault_reserve_exhaustions, pager_fault_reserve_low_watermark,
-        preallocate_pager_fault_frames,
-        replenish_pager_fault_frames, reserve_preallocated_zeroed_frame_grant,
-        return_pager_fault_frame, service_pager_fault_frame_refill, take_frame_grant,
-        take_pager_fault_frame,
+        preallocate_pager_fault_frames, replenish_pager_fault_frames,
+        reserve_preallocated_zeroed_frame_grant, return_pager_fault_frame,
+        service_pager_fault_frame_refill, take_frame_grant, take_pager_fault_frame,
     };
 }
 

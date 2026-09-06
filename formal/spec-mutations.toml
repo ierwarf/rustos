@@ -14,6 +14,7 @@ required_models = [
     "atomic-process-activation-batch/AtomicProcessActivationBatch",
     "capability-derivation-lifecycle/CapabilityDerivationLifecycle",
     "clocksource-deadline/ClocksourceDeadline",
+    "cow-frame-lifecycle/CowFrameLifecycle",
     "cpu-online-lifecycle/CpuOnlineLifecycle",
     "cross-cpu-task-retirement/CrossCpuTaskRetirement",
     "dvm-block-startup/DvmBlockStartup",
@@ -185,6 +186,105 @@ find = "    /\\ clockCpuCount = 1"
 replace = "    /\\ TRUE"
 occurrence = 1
 invariant = "RawTscRequiresUniprocessorTopology"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "cow-cancelled-child-alias-retained"
+kind = "transition-effect"
+severity = "critical"
+model = "cow-frame-lifecycle/CowFrameLifecycle"
+flow = "cow-frame-lifecycle"
+find = '''    /\ ledger' = {"parent"}
+    /\ logicalWrite' = [logicalWrite EXCEPT !["child"] = FALSE]
+'''
+replace = '''    /\ ledger' = ledger
+    /\ logicalWrite' = [logicalWrite EXCEPT !["child"] = FALSE]
+'''
+occurrence = 1
+invariant = "ExactMappingLedger"
+min_counterexample_states = 5
+
+[[mutation]]
+id = "cow-child-activation-before-parent-tlb-ack"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "cow-frame-lifecycle/CowFrameLifecycle"
+flow = "cow-frame-lifecycle"
+find = '''ActivateChild ==
+    /\ forkPhase = "ready"
+    /\ ~parentWritableTlb
+'''
+replace = '''ActivateChild ==
+    /\ forkPhase \in {"waiting-ack", "ready"}
+    /\ TRUE
+'''
+occurrence = 1
+invariant = "ChildRunsOnlyAfterDowngradeAck"
+min_counterexample_states = 4
+
+[[mutation]]
+id = "cow-copyout-bypasses-logical-write-authority"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "cow-frame-lifecycle/CowFrameLifecycle"
+flow = "cow-frame-lifecycle"
+find = '''    /\ perm[r] = "cow"
+    /\ logicalWrite[r]
+'''
+replace = '''    /\ perm[r] = "cow"
+'''
+occurrence = 1
+invariant = "CowResolutionRequiresLogicalWrite"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "cow-old-ledger-reference-dropped-before-ack"
+kind = "transition-effect"
+severity = "critical"
+model = "cow-frame-lifecycle/CowFrameLifecycle"
+flow = "cow-frame-lifecycle"
+find = '''AckCowCopy ==
+    /\ op = "copy"
+    /\ actor \in stale
+    /\ ledger' = ledger \ {actor}
+    /\ stale' = {}
+'''
+replace = '''AckCowCopy ==
+    /\ op = "copy"
+    /\ actor \in stale
+    /\ ledger' = ledger
+    /\ stale' = {}
+'''
+occurrence = 1
+invariant = "ExactMappingLedger"
+min_counterexample_states = 4
+
+[[mutation]]
+id = "cow-private-file-last-mapping-promoted-in-place"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "cow-frame-lifecycle/CowFrameLifecycle"
+flow = "cow-frame-lifecycle"
+find = '''    /\ op' = IF kind = "anonymous" /\ Cardinality(ledger) = 1
+              THEN "promote" ELSE "copy"
+'''
+replace = '''    /\ op' = IF Cardinality(ledger) = 1
+              THEN "promote" ELSE "copy"
+'''
+occurrence = 1
+invariant = "PrivateFileNeverPromotesInPlace"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "cow-shared-mapping-made-writable-by-protect"
+kind = "transition-effect"
+severity = "critical"
+model = "cow-frame-lifecycle/CowFrameLifecycle"
+flow = "cow-frame-lifecycle"
+find = '''    /\ perm' = [perm EXCEPT ![r] = IF @ = "cow" THEN "cow" ELSE "readonly"]'''
+replace = '''    /\ perm' = [perm EXCEPT ![r] = "writable"]'''
+occurrence = 1
+invariant = "SharedMappingsStayWriteProtected"
 min_counterexample_states = 2
 
 [[mutation]]
@@ -1445,6 +1545,24 @@ invariant = "FaultableIsAlwaysBackedByThePager"
 min_counterexample_states = 3
 
 [[mutation]]
+id = "pager-vma-publication-deny-all-lookup-bypass"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "pager-vma-publication/PagerVmaPublication"
+flow = "pager-vma-publication"
+find = '''    /\ committed
+    /\ ~denyAll
+    /\ slotGeneration = currentGeneration
+'''
+replace = '''    /\ committed
+    /\ TRUE
+    /\ slotGeneration = currentGeneration
+'''
+occurrence = 1
+invariant = "DenyAllVmaIsNotAdmitted"
+min_counterexample_states = 4
+
+[[mutation]]
 id = "pager-vma-publication-identity-bypass"
 kind = "transition-guard-removal"
 severity = "critical"
@@ -1479,18 +1597,34 @@ invariant = "PublishedSequenceIsStable"
 min_counterexample_states = 3
 
 [[mutation]]
+id = "pager-vma-publication-ordinary-resident-leaf-bypass"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "pager-vma-publication/PagerVmaPublication"
+flow = "pager-vma-publication"
+find = '''    /\ mode \in {Ordinary, Inherited}
+    /\ mode = Ordinary => ~hasResidentLeaves
+'''
+replace = '''    /\ mode \in {Ordinary, Inherited}
+    /\ TRUE
+'''
+occurrence = 1
+invariant = "OrdinaryPublicationRequiresEmptyResidentSet"
+min_counterexample_states = 3
+
+[[mutation]]
 id = "pager-vma-publication-overlap-bypass"
 kind = "transition-guard-removal"
 severity = "critical"
 model = "pager-vma-publication/PagerVmaPublication"
 flow = "pager-vma-publication"
 find = '''    /\ ~(mayWrite /\ mayExecute)
+    /\ ~(noRights /\ (mayWrite \/ mayExecute))
     /\ ~hasOverlap
-    /\ state' = Writing
 '''
 replace = '''    /\ ~(mayWrite /\ mayExecute)
+    /\ ~(noRights /\ (mayWrite \/ mayExecute))
     /\ TRUE
-    /\ state' = Writing
 '''
 occurrence = 1
 invariant = "PublishedVmaIsNonoverlapping"
@@ -1504,15 +1638,39 @@ model = "pager-vma-publication/PagerVmaPublication"
 flow = "pager-vma-publication"
 find = '''    /\ identityExact
     /\ permissionAllowed
+    /\ committed
+    /\ ~denyAll
+    /\ slotGeneration = currentGeneration
     /\ lookupAdmitted' = TRUE
 '''
 replace = '''    /\ identityExact
     /\ TRUE
+    /\ committed
+    /\ ~denyAll
+    /\ slotGeneration = currentGeneration
     /\ lookupAdmitted' = TRUE
 '''
 occurrence = 1
 invariant = "LookupRequiresAllowedAccess"
 min_counterexample_states = 4
+
+[[mutation]]
+id = "pager-vma-publication-stale-generation-lookup-bypass"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "pager-vma-publication/PagerVmaPublication"
+flow = "pager-vma-publication"
+find = '''    /\ ~denyAll
+    /\ slotGeneration = currentGeneration
+    /\ lookupAdmitted' = TRUE
+'''
+replace = '''    /\ ~denyAll
+    /\ TRUE
+    /\ lookupAdmitted' = TRUE
+'''
+occurrence = 1
+invariant = "StaleProcessGenerationIsNotAdmitted"
+min_counterexample_states = 5
 
 [[mutation]]
 id = "per-cpu-clockevent-deadline-before-lvt"

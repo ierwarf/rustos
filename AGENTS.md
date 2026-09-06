@@ -14,16 +14,31 @@ Read this document first, then keep the working context small. This file, togeth
 4. Sub-agents must use **GPT-5.6 terra** with `xhigh` reasoning. Do not use GPT-5.5.
 5. Never bypass hooks with `--no-verify`, `--no-gpg-sign`, or equivalent options. Treat hook output as primary evidence.
 6. RustOS is in the middle of evacuating functionality from ring0 into user services. Move policy into `rootd`, `syscalld`, `vfsd`, `loaderd`, `netd`, `inputd`, and other named services rather than moving it back into the kernel.
+7. Every bug fix must harden the violated contract and add evidence that prevents the same failure class from returning. Every source-code commit must update the applicable Markdown owner/flow contract in the same commit; a source-only commit is incomplete.
 
 ## Context Budget
 
 See `docs/ai-map.md` for cache order and `docs/ai/token-policy.md` for the complete rules.
 
 Search before opening files. Load the stable prefix first and place the task text last. Do not include logs in the stable prefix.
+An `AGENTS.md` supplied by the environment already counts as loaded. Do not read
+it again unless its contents changed. After compaction, recover only the focused
+router or handoff section needed for the next decision; do not replay the whole
+bootstrap set.
 
 ## Tool Usage
 
 Use Serena, ast-grep, and CodeGraph together for source work. Serena owns symbol discovery, references, focused reads, and edits; ast-grep owns syntax-aware pattern/rule matching; CodeGraph owns call graph, dependency, and blast-radius checks. Use ripgrep MCP or local `rg` only for narrowly scoped text/documentation lookup. The three source-editing MCPs are a hard gate: if one fails its preflight or focused query, do not modify source and report the failure.
+
+Optimize model/tool round trips before shaving individual result bytes. Batch
+three or more known independent reads, searches, diagnostics, or checks into one
+orchestrated tool call, collect the evidence set, and then reason over it. Do not
+return to the model after each symbol or file lookup.
+
+Never print complete `ALL_TOOLS` entries or bulk tool descriptions. The known
+project namespaces are `mcp__serena__*`, `mcp__ast_grep__*`, and
+`mcp__codegraph__codegraph_*`. If discovery is unavoidable, print matching names
+only; inspect at most two exact descriptions and cap each at 2,000 characters.
 
 Allow project hooks to run. Do not bypass them with `--no-verify`, `--no-gpg-sign`, or equivalent options.
 
@@ -69,6 +84,10 @@ Narrow exceptions are defined in `docs/ai/token-policy.md` §10.
 See `docs/ai/commands.md`.
 
 Commands should remain quiet on success. Treat failure output as primary context. Do not scan log directories to diagnose build failures.
+Capture verbose test/build output outside the model context. On success, return
+only the command, exit status, and bounded result summary; on failure, return the
+first relevant error plus a bounded tail. Cap log searches with match and line
+limits.
 
 ## Hardening Direction
 
@@ -119,6 +138,8 @@ Do not preserve a legacy route merely to make an incomplete primary route appear
 ### General Principles
 
 * Prefer hardening over symptom patches. Make ownership, timeouts, queue bounds, and ABI contracts explicit in source code, manifests, registries, or AI-readable contracts.
+* A bug fix is complete only when it names the violated invariant, repairs the root cause, and adds a regression witness for the whole failure class. Testing only the observed input or retaining an errno-only/boolean-only diagnostic does not satisfy this rule.
+* Every commit that changes source code must update at least one applicable Markdown contract in the same commit. The Markdown change must record the changed invariant, lifecycle, failure classification, or evidence; release-note filler does not count. If no owner contract exists, create it before committing.
 * Fail closed, use bounded waits, and provide direct diagnostics. Never fabricate success.
 * For display, input, driver, and compatibility paths, keep fallback providers behind real hardware or virtio providers.
 * Validate against black frames, stalls, and provider-order regressions.

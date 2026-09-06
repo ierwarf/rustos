@@ -35,16 +35,17 @@ use pagerd::{request_sender_is_authorized, PagerFaultError, PagerState};
 use rustos_svc_runtime::{ipc, pager as pager_rendezvous};
 use rustos_user_abi::pager::{
     pager_pressure_name, PagerAnonymousPolicyWire, PagerFaultDispatchWire, PagerProtectRangeWire,
-    PagerReleaseRangeWire, PagerVmRegionWire, PAGER_FAULT_ABI_VERSION, PAGER_FAULT_RUN_PAGES_MAX,
-    PAGER_MAX_VMAS_PER_PROCESS, PAGER_MAX_WIRED_SERVICES, MM_BROKER_OP_SET_ANON_POLICY,
+    PagerReleaseRangeWire, PagerVmRegionWire, MM_BROKER_OP_SET_ANON_POLICY,
+    PAGER_FAULT_ABI_VERSION, PAGER_FAULT_RUN_PAGES_MAX, PAGER_MAX_VMAS_PER_PROCESS,
+    PAGER_MAX_WIRED_SERVICES,
 };
 use rustos_user_abi::syscall::{
-    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse,
+    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, RustosMmBrokerArgs,
     COMMERCIAL_MAX_PAGERD_OP_BACKING_OBJECT, COMMERCIAL_MAX_PAGERD_OP_PROTECT_OBJECT,
     COMMERCIAL_MAX_PAGERD_OP_RELEASE_OBJECT, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
-    COMMERCIAL_MAX_PROTOCOL_PAGERD, IPC_MAX_INLINE_BYTES, IPC_SERVICE_PAGERD, IPC_SERVICE_ROOTD,
-    IPC_SERVICE_STORAGED, IPC_SERVICE_VFSD, MM_BROKER_ABI_VERSION,
-    IPC_SERVICE_LINUX_SYSCALLD, RustosMmBrokerArgs, SYS_RUSTOS_MM_BROKER,
+    COMMERCIAL_MAX_PROTOCOL_PAGERD, IPC_MAX_INLINE_BYTES, IPC_SERVICE_LINUX_SYSCALLD,
+    IPC_SERVICE_PAGERD, IPC_SERVICE_ROOTD, IPC_SERVICE_STORAGED, IPC_SERVICE_VFSD,
+    MM_BROKER_ABI_VERSION, SYS_RUSTOS_MM_BROKER,
 };
 
 rustos_svc_runtime::entry!(service_main);
@@ -76,13 +77,15 @@ fn service_main() {
 /// demand-paged regions a process may hold, which services stay wired - not
 /// mechanism, so they belong here. They lived as ring0 constants only because
 /// the sole transport was a synchronous call on the fault path, which measured
-/// 5.7 ms p99 on `mmap`. Publishing once costs the fault path nothing: ring0
-/// reads an immutable publication with a single acquire.
+/// 5.7 ms p99 on `mmap`. Publication stays off the fault path: ring0 reads a
+/// coherent sequence snapshot, and the sole IRQ-off reader falls back to its
+/// compiled-in run length if a concurrent update remains unstable.
 ///
 /// Published after the endpoint exists, because ring0 authorizes this by the
 /// caller owning the pager service endpoint rather than by a PID. Ring0 keeps
-/// its own default until this lands and refuses a second publication, so a
-/// failure here leaves the system on that default rather than half-configured.
+/// its own default until this lands, so a failure here leaves the system on
+/// that default rather than half-configured. Later pressure-policy updates use
+/// the same sequence publication instead of mutating fields in place.
 fn publish_anonymous_policy() {
     let mut wired_services = [0_u64; PAGER_MAX_WIRED_SERVICES];
     // The services the whole system starts through. Ring0 answers anonymous

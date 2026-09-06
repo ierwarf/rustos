@@ -353,10 +353,9 @@ fn bootstrap_mmap(
                 }
                 let _ = state.release_reserved_range(start, end);
             } else if state.has_reserved_overlap(start, end)
-                || address_space
-                    .regions()
-                    .iter()
-                    .any(|region| region.start.as_u64() < end && start < region.end().as_u64())
+                || !address_space
+                    .user_range_is_unmapped(VirtAddr::new(start), page_count)
+                    .map_err(address_space_error_to_linux_errno)?
             {
                 return Err(LINUX_ENOMEM);
             }
@@ -438,10 +437,10 @@ fn find_bootstrap_mmap_start(
         if end > state.brk_limit() {
             return Err(LINUX_ENOMEM);
         }
-        let overlaps_mapped = address_space
-            .regions()
-            .iter()
-            .any(|region| region.start.as_u64() < end && start < region.end().as_u64());
+        let page_count = usize::try_from(len / PAGE_SIZE).map_err(|_| LINUX_ENOMEM)?;
+        let overlaps_mapped = !address_space
+            .user_range_is_unmapped(VirtAddr::new(start), page_count)
+            .map_err(address_space_error_to_linux_errno)?;
         if !overlaps_mapped && !state.has_reserved_overlap(start, end) {
             return Ok(start);
         }

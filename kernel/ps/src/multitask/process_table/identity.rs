@@ -457,6 +457,19 @@ pub(in crate::multitask) fn with_own_visible_state<R>(
     process_state_is_visible(handle).then(|| f(&state))
 }
 
+/// Exact-generation counterpart for a running task. The task pins the state
+/// pointer; the post-lock publication comparison closes exec/reuse without
+/// recursively acquiring the global process table.
+pub(in crate::multitask) fn with_own_exact_visible_state<R>(
+    handle: ProcessHandle,
+    expected: ProcessIdentity,
+    f: impl FnOnce(&UserProcessState) -> R,
+) -> Option<R> {
+    let state = published_process_state(handle)?;
+    let state = unsafe { state.as_ref() }.lock();
+    (published_live_process_identity(handle) == Some(expected)).then(|| f(&state))
+}
+
 /// Compares publication with locked lifecycle authority. Called only from the
 /// out-of-scheduler-guard profile drain; a zero result emits nothing.
 pub(in crate::multitask) fn publication_divergence_count() -> u64 {

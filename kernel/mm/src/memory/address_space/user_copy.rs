@@ -7,7 +7,8 @@
 //! - **Lifecycle:** Admit the whole span, carry the first page's translation
 //!   into the proof, then move all bytes or none.
 //! - **Concurrency:** The caller holds an exact process/MM generation for the
-//!   life of a proof; nothing here mutates a page table.
+//!   life of a proof. An explicitly supplied COW resolver may split a leaf
+//!   before proof construction; the resulting translation is read afresh.
 //! - **Failure:** Noncanonical, overflowing, unmapped, and permission errors
 //!   return before any byte moves.
 //! - **Forbidden:** No raw slice over user memory before admission, and no
@@ -106,6 +107,30 @@ impl ProcessAddressSpace {
     ) -> Result<ValidatedUserWrite<'_>, AddressSpaceError> {
         let first_phys =
             self.validate_user_buffer_access(start, byte_len, UserBufferAccess::Write)?;
+        Ok(ValidatedUserWrite {
+            address_space: self,
+            start,
+            byte_len,
+            first_phys,
+        })
+    }
+
+    /// Admits copyout with an owner-supplied resolver for readonly COW leaves.
+    /// The resolver must retain exact process/MM identity and logical VMA
+    /// write authority. Its success is not proof: the PTE is translated and
+    /// checked again before the new physical address enters the copy proof.
+    pub fn validate_user_write_resolving_cow(
+        &self,
+        start: VirtAddr,
+        byte_len: usize,
+        resolve: impl FnMut(VirtAddr) -> Result<(), AddressSpaceError>,
+    ) -> Result<ValidatedUserWrite<'_>, AddressSpaceError> {
+        let first_phys = self.validate_user_buffer_access_resolving_cow(
+            start,
+            byte_len,
+            UserBufferAccess::Write,
+            resolve,
+        )?;
         Ok(ValidatedUserWrite {
             address_space: self,
             start,
@@ -301,6 +326,18 @@ impl ProcessAddressSpace {
         byte_len: usize,
         access: UserBufferAccess,
     ) -> Result<Option<PhysAddr>, AddressSpaceError> {
+        self.validate_user_buffer_access_resolving_cow(start, byte_len, access, |_| {
+            Err(AddressSpaceError::ProtectionViolation)
+        })
+    }
+
+    fn validate_user_buffer_access_resolving_cow(
+        &self,
+        start: VirtAddr,
+        byte_len: usize,
+        access: UserBufferAccess,
+        mut resolve: impl FnMut(VirtAddr) -> Result<(), AddressSpaceError>,
+    ) -> Result<Option<PhysAddr>, AddressSpaceError> {
         if byte_len == 0 {
             return Ok(None);
         }
@@ -328,9 +365,18 @@ impl ProcessAddressSpace {
 
         let mut first_page_phys = None;
         while cursor < end_exclusive {
-            let (phys, flags) = self
+            let (mut phys, mut flags) = self
                 .translate_user_with_flags(VirtAddr::new(cursor))
                 .ok_or(AddressSpaceError::NotMapped)?;
+            if matches!(access, UserBufferAccess::Write)
+                && flags.contains(super::COW_USER_LEAF)
+                && !flags.contains(x86_64::structures::paging::PageTableFlags::WRITABLE)
+            {
+                resolve(VirtAddr::new(cursor))?;
+                (phys, flags) = self
+                    .translate_user_with_flags(VirtAddr::new(cursor))
+                    .ok_or(AddressSpaceError::NotMapped)?;
+            }
             validate_user_page_access(flags, access)?;
             if first_page_phys.is_none() {
                 first_page_phys = Some(phys);

@@ -226,11 +226,12 @@ impl FaultFramePool {
         // to completion to prove the pool is empty.
         // ORDERING: AcqRel serializes concurrent claims against each other and
         // against a producer's Release increment.
-        let remaining = match self.available.fetch_update(
-            Ordering::AcqRel,
-            Ordering::Acquire,
-            |available| available.checked_sub(1),
-        ) {
+        let remaining = match self
+            .available
+            // ORDERING: reserve one unit and observe producer publication.
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |available| {
+                available.checked_sub(1)
+            }) {
             Ok(previous) => previous - 1,
             Err(_) => {
                 // The exhaustion this counter exists to make legible. Its
@@ -973,7 +974,10 @@ mod tests {
         );
         // And the reserve is still whole: every frame is reservable again.
         for round in 0..FRAMES {
-            assert!(pool.reserve().is_ok(), "round {round} is within the reserve");
+            assert!(
+                pool.reserve().is_ok(),
+                "round {round} is within the reserve"
+            );
         }
         assert_eq!(pool.reserve(), Err(FrameGrantError::OutOfFrames));
     }

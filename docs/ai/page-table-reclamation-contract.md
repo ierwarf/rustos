@@ -18,8 +18,8 @@ are unmapped.
 The target is the normal general-OS shape:
 
 1. allocate upper levels only when a mapping/fault reaches them;
-2. own every page-table frame through a descriptor distinct from data-frame
-   ownership;
+2. own every page-table frame through a distinct role in the common physical
+   frame descriptor catalog;
 3. remove an empty subtree only after withdrawing the parent entry;
 4. defer physical reuse until exact CPU TLB acknowledgement and every
    lock-free table walker that could have observed the old entry has left; and
@@ -33,19 +33,20 @@ is IRQ-off and cannot take Linux-style sleepable/MM locks.
 
 ## 2. Separate ownership domains
 
-`owned_frames` is a data-leaf ownership collection.  It must not remain the
-authoritative lifecycle record for an intermediate table frame.  Every table
-frame, whether first published by a normal mapper or by an IRQ-off fault, has
-one boot-reserved `PageTableDescriptor` indexed by physical frame number.
+`owned_frames` has been removed. Every physical frame has one boot-reserved
+tagged-union `FrameDescriptorRecord`; its role makes root, intermediate table,
+exclusive data, anonymous-shared data, and private-file-shared data mutually
+exclusive identities.
 
 ```
-data frame:        leaf owner / shared-page owner (future COW)
-page-table frame:  PageTableDescriptor(root, level, state, pins, list links)
-root PML4:         root descriptor + per-root descriptor-list head + budget
+exclusive data:    exact (root, virtual_address)
+shared data:       COW class + backing identity + map count + map-list head
+page-table frame:  root owner + root-list link
+root PML4:         table-list head + live data count + future budget
 ```
 
-The existing lazy-table record is the seed of this descriptor catalog, not a
-second competing ledger.  The conversion must preserve its current invariant:
+The former lazy-table record is now that common catalog, not a second competing
+ledger. It preserves the invariant:
 claim descriptor before the parent-entry CAS; publish it only with a winning
 CAS; cancel it before returning a loser.  Direct normal-time `ensure_next_table`
 must enter the same descriptor lifecycle.
@@ -59,8 +60,9 @@ The descriptor's fixed metadata includes at least:
 - the TLB generation that protects an unlinked frame; and
 - per-root/system accounting state.
 
-It does **not** hold VMA policy, file backing policy, COW policy, or a user
-pointer.  Those retain their established owners.
+The descriptor holds lifecycle identity and COW class, not mapping policy or a
+user pointer. VMAs retain access/commit policy; pagerd retains file backing and
+writeback policy; bounded per-root records retain exact shared mappings.
 
 ## 3. Required lifetime
 
@@ -150,8 +152,10 @@ context.
    mutation pins; §6 states what would have to change first.
 4. Enable leaf PT reclamation after unmap; then prove upward cascade and
    descriptor/root reuse.
-5. Only afterwards integrate shared-leaf/COW ownership; COW frame references
-   are deliberately a separate ledger and must not overload table descriptors.
+5. Shared-leaf COW may proceed independently once the common catalog and exact
+   TLB acknowledgement exist; it does not depend on live empty-table reclaim.
+   This slice has landed. Shared mapping records are separate bounded nodes,
+   while physical frame identity remains in the same tagged-union catalog.
 
 Acceptance needs failures at every transition, two CPU interleavings between
 fault insert and reclaim, stale TLB acknowledgement rejection, root/frame
@@ -170,3 +174,6 @@ live reclamation.
 - Replacing a mapping such as COW requires carefully ordered invalidation for
   secondary as well as CPU TLBs:
   <https://docs.kernel.org/mm/mmu_notifier.html>
+- Zircon similarly uses one `vm_page` descriptor with tagged state/union
+  storage rather than parallel per-frame ownership arrays:
+  <https://fuchsia.googlesource.com/fuchsia/+/71b8dfbdd811e7cd56772b1406d8f32f9cfea3f1/zircon/kernel/vm/include/vm/page.h>

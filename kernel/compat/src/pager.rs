@@ -10,9 +10,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::memory as mm_api;
 use crate::multitask as ps_api;
-use rustos_user_abi::pager::{
-    PagerFaultDispatchWire, PagerFaultReplyWire, PagerFaultRequestWire,
-};
+use rustos_user_abi::pager::{PagerFaultDispatchWire, PagerFaultReplyWire, PagerFaultRequestWire};
 use x86_64::{PhysAddr, VirtAddr, structures::paging::PageTableFlags};
 
 static FIRST_ANONYMOUS_FAULT_COMPLETED: AtomicBool = AtomicBool::new(false);
@@ -43,6 +41,12 @@ static LAZY_TABLE_SUPPLY_EXHAUSTED: AtomicU64 = AtomicU64::new(0);
 /// path this fault context cannot perform. Measure the case before paying for
 /// the machinery.
 static READ_FIRST_TOUCHES: AtomicU64 = AtomicU64::new(0);
+/// Present-write COW faults completed in the faulting task.
+static COMPLETED_COW_WRITES: AtomicU64 = AtomicU64::new(0);
+/// COW faults restarted because a VMA, frame, or TLB mutation was busy.
+static CONTENDED_COW_WRITES: AtomicU64 = AtomicU64::new(0);
+/// Present-write candidates rejected after exact PTE/ledger validation.
+static REJECTED_COW_WRITES: AtomicU64 = AtomicU64::new(0);
 
 /// Pages ring0 offers to populate for this fault, including the faulting page.
 ///
@@ -148,6 +152,77 @@ pub fn serve_anonymous_first_touch(
     prot: u32,
 ) -> AnonymousFaultOutcome {
     serve_anonymous_first_touch_enabled(request, prot)
+}
+
+/// Resolves one exact private COW write without leaving exception context.
+///
+/// The VMA permit prevents unmap/protect from invalidating the fault request.
+/// The MM layer then validates the read-only COW PTE and its exact shared-frame
+/// record, copies into an unpublished reserve frame, and uses a try-only TLB
+/// transaction to replace the leaf. No IRQ-off path waits for another CPU.
+pub fn serve_private_cow_write(
+    request: PagerFaultRequestWire,
+    kind: mm_api::phys::CowFrameKind,
+) -> AnonymousFaultOutcome {
+    let (permit, _) = match ps_api::current_pager_fault_install_permit(request) {
+        Ok(held) => held,
+        Err(ps_api::PagerVmaError::Unstable) => {
+            CONTENDED_COW_WRITES.fetch_add(1, Ordering::Relaxed);
+            return AnonymousFaultOutcome::Retry;
+        }
+        Err(_) => {
+            REJECTED_COW_WRITES.fetch_add(1, Ordering::Relaxed);
+            return AnonymousFaultOutcome::Refused;
+        }
+    };
+    let Some(frame) = mm_api::frame_capability::take_pager_fault_frame()
+        .or_else(mm_api::frame_capability::allocate_zeroed_frame)
+    else {
+        drop(permit);
+        REJECTED_COW_WRITES.fetch_add(1, Ordering::Relaxed);
+        return AnonymousFaultOutcome::Refused;
+    };
+    let outcome = mm_api::paging::resolve_current_cow_write_at(
+        VirtAddr::new(request.virtual_address),
+        frame.as_u64(),
+        kind,
+    );
+    drop(permit);
+    match outcome {
+        Ok(mm_api::paging::CowWriteResult::Replaced) => {
+            let completed = COMPLETED_COW_WRITES.fetch_add(1, Ordering::Relaxed) + 1;
+            if completed == 1 || completed.is_multiple_of(4096) {
+                nucleus_core::debug::record_milestone(
+                    nucleus_core::debug::LogCategory::Compat,
+                    "pager-cow-write-complete",
+                    request.process_handle,
+                    request.virtual_address,
+                );
+            }
+            AnonymousFaultOutcome::Mapped
+        }
+        Ok(mm_api::paging::CowWriteResult::PromotedInPlace) => {
+            if !mm_api::frame_capability::return_pager_fault_frame(frame) {
+                mm_api::phys::free_frame(frame);
+            }
+            COMPLETED_COW_WRITES.fetch_add(1, Ordering::Relaxed);
+            AnonymousFaultOutcome::Mapped
+        }
+        Ok(mm_api::paging::CowWriteResult::Retry) => {
+            if !mm_api::frame_capability::return_pager_fault_frame(frame) {
+                mm_api::phys::free_frame(frame);
+            }
+            CONTENDED_COW_WRITES.fetch_add(1, Ordering::Relaxed);
+            AnonymousFaultOutcome::Retry
+        }
+        Ok(mm_api::paging::CowWriteResult::NotCow) | Err(_) => {
+            if !mm_api::frame_capability::return_pager_fault_frame(frame) {
+                mm_api::phys::free_frame(frame);
+            }
+            REJECTED_COW_WRITES.fetch_add(1, Ordering::Relaxed);
+            AnonymousFaultOutcome::Refused
+        }
+    }
 }
 
 /// What ring0 did with one anonymous fault.
@@ -486,10 +561,11 @@ fn populate_run_under_permit(
     // How long the run is comes from the published policy rather than a ring0
     // constant: it trades zeroing latency against amplification under sparse
     // access, which is a workload judgement the pager owns. Reading it here is
-    // one acquire load of an immutable publication, so the IRQ-off contract
-    // above is unaffected. The policy validator keeps it a power of two, which
-    // is what makes the alignment below tile rather than straddle.
-    let run_pages = u64::from(crate::pager_policy::anonymous_policy().fault_run_pages);
+    // a bounded sequence snapshot. If a writer overlaps both attempts, the
+    // IRQ-off reader uses the compiled-in default; that changes only this
+    // best-effort fault-around run. The policy validator keeps it a power of
+    // two, which is what makes the alignment below tile rather than straddle.
+    let run_pages = u64::from(crate::pager_policy::anonymous_policy_irq_off().fault_run_pages);
     let block_bytes = run_pages * PAGER_PAGE_BYTES;
     let block_start = (request.virtual_address / block_bytes) * block_bytes;
     let Some(block_end) = block_start.checked_add(block_bytes) else {
@@ -693,11 +769,7 @@ fn complete_claimed_reply(claimed: ps_api::PagerFaultReservation, reply: PagerFa
     if mapped {
         // Fault-around. The faulting page is served; populate the short run
         // pagerd asked for while we are still in ordinary syscall context.
-        populate_run(
-            claimed.request,
-            reply.frame_rights,
-            reply.map_run_pages,
-        );
+        populate_run(claimed.request, reply.frame_rights, reply.map_run_pages);
     }
     let _ = ps_api::consume_pager_fault_reply(claimed.token);
     // A successful grant claim permanently transfers one wired reserve frame

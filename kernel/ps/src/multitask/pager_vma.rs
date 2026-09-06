@@ -23,12 +23,16 @@ use rustos_user_abi::pager::{
     PAGER_MAX_REGION_GROWTH_PER_PROTECT, PAGER_MAX_REGION_GROWTH_PER_UNMAP,
     PAGER_MAX_VMAS_PER_PROCESS, PAGER_PAGE_BYTES, PagerEndpointCapabilityWire,
     PagerObjectIdentityWire, PagerRangeEdit, PagerRegionEdit, PagerVmRegionWire, VM_ACCESS_EXECUTE,
-    VM_ACCESS_KNOWN, VM_ACCESS_READ, VM_ACCESS_WRITE, VM_PROT_EXECUTE, VM_PROT_READ, VM_PROT_WRITE,
-    VM_SHARING_PRIVATE, VM_SHARING_SHARED, apply_region_edit,
+    VM_ACCESS_KNOWN, VM_ACCESS_READ, VM_ACCESS_WRITE, VM_COMMIT_COMMITTED, VM_COMMIT_RESERVED,
+    VM_PROT_EXECUTE, VM_PROT_READ, VM_PROT_WRITE, VM_SHARING_PRIVATE, VM_SHARING_SHARED,
+    apply_region_edit,
 };
 
 use super::process_table::MAX_PROCESS_OBJECTS;
 use super::process_table::{ProcessHandle, ProcessIdentity};
+
+mod fork_hold;
+pub(super) use fork_hold::with_fork_held_regions;
 
 /// Ring0's per-process pager VMA table, taken from the shared ABI.
 ///
@@ -86,6 +90,7 @@ struct PublishedPagerVma {
     object_offset: AtomicU64,
     prot: AtomicU64,
     sharing: AtomicU64,
+    commit_state: AtomicU64,
     vma_generation: AtomicU64,
     process_handle: AtomicU64,
     process_generation: AtomicU64,
@@ -112,6 +117,7 @@ impl PublishedPagerVma {
             object_offset: AtomicU64::new(0),
             prot: AtomicU64::new(0),
             sharing: AtomicU64::new(0),
+            commit_state: AtomicU64::new(0),
             vma_generation: AtomicU64::new(0),
             process_handle: AtomicU64::new(0),
             process_generation: AtomicU64::new(0),
@@ -150,6 +156,18 @@ impl PublishedPagerVma {
         let slot_start = self.start.load(Ordering::Relaxed);
         let slot_end = self.end.load(Ordering::Relaxed);
         slot_start != 0 && start < slot_end && slot_start < end
+    }
+
+    /// Conservative extent filter that also retains immediate neighbours for
+    /// post-edit coalescing.
+    fn may_overlap_or_touch(&self, start: u64, end: u64) -> bool {
+        // ORDERING: acquire rejects a concurrent odd writer before extent reads.
+        if self.sequence.load(Ordering::Acquire) & 1 != 0 {
+            return true;
+        }
+        let slot_start = self.start.load(Ordering::Relaxed);
+        let slot_end = self.end.load(Ordering::Relaxed);
+        slot_start != 0 && start <= slot_end && slot_start <= end
     }
 
     fn may_cover(&self, address: u64) -> bool {
@@ -191,7 +209,7 @@ impl PublishedPagerVma {
                 object_offset: self.object_offset.load(Ordering::Relaxed),
                 prot: self.prot.load(Ordering::Relaxed) as u32,
                 sharing: self.sharing.load(Ordering::Relaxed) as u16,
-                reserved0: 0,
+                commit_state: self.commit_state.load(Ordering::Relaxed) as u16,
                 vma_generation: self.vma_generation.load(Ordering::Relaxed),
                 process_handle: self.process_handle.load(Ordering::Relaxed),
                 process_generation: self.process_generation.load(Ordering::Relaxed),
@@ -267,6 +285,8 @@ impl PublishedPagerVma {
         self.prot.store(u64::from(region.prot), Ordering::Relaxed);
         self.sharing
             .store(u64::from(region.sharing), Ordering::Relaxed);
+        self.commit_state
+            .store(u64::from(region.commit_state), Ordering::Relaxed);
         self.vma_generation
             .store(region.vma_generation, Ordering::Relaxed);
         self.process_handle
@@ -338,6 +358,42 @@ impl PublishedPagerVma {
             }
             false
         }
+    }
+
+    /// Holds this exact live publication at an odd sequence without clearing
+    /// its payload. Fault readers therefore return `Unstable` and restart;
+    /// unlike a stable empty publication, the hold can never turn a concurrent
+    /// fork-time protection fault into an unmapped-address verdict.
+    fn begin_fork_hold(&self, expected: PagerVmRegionWire) -> Result<u64, PagerVmaError> {
+        // ORDERING: acquire pairs with the prior even publication before the
+        // expected payload is validated and converted into a writer hold.
+        let before = self.sequence.load(Ordering::Acquire);
+        if before == 0
+            || before & 1 != 0
+            || before > MAX_PUBLICATION_SEQUENCE - 2
+            || self.snapshot()? != Some(expected)
+        {
+            return Err(PagerVmaError::Stale);
+        }
+        // ORDERING: release publishes the odd hold; the SeqCst fence closes the
+        // writer/installer store-buffering cycle before installer drain.
+        self.sequence.store(before + 1, Ordering::Release);
+        core::sync::atomic::fence(Ordering::SeqCst);
+        if !self.drain_fault_installers() {
+            // ORDERING: release withdraws the failed odd hold so later readers
+            // may again observe the unchanged payload at its prior generation.
+            self.sequence.store(before, Ordering::Release);
+            return Err(PagerVmaError::Unstable);
+        }
+        Ok(before)
+    }
+
+    fn finish_fork_hold(&self, before: u64) {
+        // ORDERING: acquire proves this exact odd hold still owns the slot.
+        assert_eq!(self.sequence.load(Ordering::Acquire), before + 1);
+        // ORDERING: the payload was never changed; release of the next even
+        // generation publishes completed parent downgrade and TLB ACK.
+        self.sequence.store(before + 2, Ordering::Release);
     }
 
     fn try_acquire_fault_install(
@@ -437,12 +493,15 @@ fn template_is_canonical(region: PagerVmRegionWire) -> bool {
         && region.end.is_multiple_of(PAGER_PAGE_BYTES)
         && region.object_offset.is_multiple_of(PAGER_PAGE_BYTES)
         && region.object.has_authority()
-        && region.prot != 0
+        // `PROT_NONE` is still an authoritative reservation and may also be a
+        // committed guard mapping. Access is denied later by the exact VMA
+        // protection check; rejecting it here loses the reservation during
+        // fork and recreates a split address-space authority.
         && region.prot & !rustos_user_abi::pager::VM_PROT_KNOWN == 0
         && region.prot & !region.object.rights == 0
         && !(region.prot & VM_PROT_WRITE != 0 && region.prot & VM_PROT_EXECUTE != 0)
         && (region.sharing == VM_SHARING_PRIVATE || region.sharing == VM_SHARING_SHARED)
-        && region.reserved0 == 0
+        && (region.commit_state == VM_COMMIT_RESERVED || region.commit_state == VM_COMMIT_COMMITTED)
         && region.reserved1 == [0; 2]
         && region.vma_generation == 0
         && region.process_handle == 0
@@ -474,6 +533,44 @@ fn stamped_region(
         .ok_or(PagerVmaError::Malformed)
 }
 
+fn regions_mergeable(left: PagerVmRegionWire, right: PagerVmRegionWire) -> bool {
+    left.end == right.start
+        && left
+            .object_offset
+            .checked_add(left.end - left.start)
+            .is_some_and(|next| next == right.object_offset)
+        && left.object == right.object
+        && left.prot == right.prot
+        && left.sharing == right.sharing
+        && left.commit_state == right.commit_state
+        && left.vma_generation == right.vma_generation
+        && left.process_handle == right.process_handle
+        && left.process_generation == right.process_generation
+        && left.mm_generation == right.mm_generation
+        && left.fault_endpoint == right.fault_endpoint
+        && left.reserved1 == right.reserved1
+}
+
+/// Coalesces fragments from one publication generation in place.
+///
+/// Merging is deliberately identity-preserving: independently published VMAs
+/// are not silently restamped. Range edits therefore cannot leave permanent
+/// slot fragmentation when protection or commit state returns to its original
+/// value.
+fn merge_adjacent_regions(regions: &mut Vec<PagerVmRegionWire>) {
+    let mut write = 0_usize;
+    for read in 0..regions.len() {
+        let region = regions[read];
+        if write != 0 && regions_mergeable(regions[write - 1], region) {
+            regions[write - 1].end = region.end;
+        } else {
+            regions[write] = region;
+            write += 1;
+        }
+    }
+    regions.truncate(write);
+}
+
 /// Publishes one region, refusing beyond `ceiling` live regions.
 ///
 /// `ceiling` is policy and arrives from the caller; this table only enforces
@@ -494,9 +591,23 @@ pub(super) fn publish(
     }
     let _writer = writer_lock(handle).ok_or(PagerVmaError::Stale)?.lock();
     let slots = process_slots(handle).ok_or(PagerVmaError::Stale)?;
+    let process = handle.object_identity().ok_or(PagerVmaError::Stale)?;
+    let process_generation = u64::from(identity.process_generation());
+    let mm_generation = u64::from(identity.mm_generation());
     let mut live = 0_usize;
-    for existing in slots {
-        if let Some(existing) = existing.snapshot()? {
+    for slot in slots {
+        if let Some(existing) = slot.snapshot()? {
+            if existing.process_handle != process.slot()
+                || existing.process_generation != process_generation
+                || existing.mm_generation != mm_generation
+            {
+                // A reaped process slot or completed exec may leave an old
+                // generation in this fixed publication array. The writer lock
+                // and installer drain make reclamation exact before this slot
+                // can be reused by the new live identity.
+                slot.publish(None)?;
+                continue;
+            }
             if template.start < existing.end && existing.start < template.end {
                 return Err(PagerVmaError::Overlap);
             }
@@ -551,6 +662,9 @@ fn admit_access(
     region: PagerVmRegionWire,
     access: u16,
 ) -> Result<PagerVmRegionWire, PagerVmaError> {
+    if !region.is_committed() {
+        return Err(PagerVmaError::Denied);
+    }
     let allowed = (access == VM_ACCESS_READ && region.prot & VM_PROT_READ != 0)
         || (access == VM_ACCESS_WRITE && region.prot & VM_PROT_WRITE != 0)
         || (access == VM_ACCESS_EXECUTE && region.prot & VM_PROT_EXECUTE != 0);
@@ -741,12 +855,13 @@ pub fn with_validated_fault_address_space<R>(
 /// Rewrites one fully pager-managed range while preserving only attenuated
 /// authority. The original publications are withdrawn before `mutate` changes
 /// any PTE, so exception-time readers fail closed throughout the transaction.
-pub(super) fn rewrite_attenuated_range<F>(
+fn rewrite_range<F>(
     handle: ProcessHandle,
     identity: ProcessIdentity,
     start: u64,
     end: u64,
     replacement_prot: Option<u32>,
+    replacement_commit_state: Option<u16>,
     mutate: F,
 ) -> Result<bool, PagerVmaError>
 where
@@ -764,6 +879,11 @@ where
             || (prot & VM_PROT_WRITE != 0 && prot & VM_PROT_EXECUTE != 0)
     }) {
         return Err(PagerVmaError::Denied);
+    }
+    if replacement_commit_state
+        .is_some_and(|state| state != VM_COMMIT_RESERVED && state != VM_COMMIT_COMMITTED)
+    {
+        return Err(PagerVmaError::Malformed);
     }
     if handle.generation() != identity.process_generation() {
         return Err(PagerVmaError::Stale);
@@ -783,7 +903,7 @@ where
     let slots = process_slots(handle).ok_or(PagerVmaError::Stale)?;
     let candidates = slots
         .iter()
-        .filter(|slot| slot.may_overlap(start, end))
+        .filter(|slot| slot.may_overlap_or_touch(start, end))
         .count();
     if candidates == 0 {
         return Ok(false);
@@ -798,7 +918,11 @@ where
         .map_err(|_| PagerVmaError::Pressure)?;
     for (slot_index, slot) in slots.iter().enumerate() {
         match slot.snapshot()? {
-            Some(region) if start < region.end && region.start < end => {
+            Some(region)
+                if start < region.end && region.start < end
+                    || region.end == start
+                    || region.start == end =>
+            {
                 overlapping.push((slot_index, region));
             }
             Some(_) => {}
@@ -813,29 +937,54 @@ where
     overlapping.sort_unstable_by_key(|(_, region)| region.start);
 
     let process = handle.object_identity().ok_or(PagerVmaError::Stale)?;
-    let edit = PagerRangeEdit {
-        start,
-        end,
-        replacement_prot,
-    };
     let mut cursor = start;
     let mut rewritten: Vec<PagerVmRegionWire> = Vec::new();
+    let maximum_growth = if replacement_prot.is_none() && replacement_commit_state.is_none() {
+        PAGER_MAX_REGION_GROWTH_PER_UNMAP
+    } else {
+        PAGER_MAX_REGION_GROWTH_PER_PROTECT
+    };
     rewritten
         .try_reserve_exact(
             overlapping_len
-                .checked_add(PAGER_MAX_REGION_GROWTH_PER_PROTECT)
+                .checked_add(maximum_growth)
                 .ok_or(PagerVmaError::Pressure)?,
         )
         .map_err(|_| PagerVmaError::Pressure)?;
     for (_, region) in overlapping.iter().copied() {
-        if !region_matches_identity(region, process.slot(), identity) || region.start > cursor {
+        if !region_matches_identity(region, process.slot(), identity) {
+            return Err(PagerVmaError::Stale);
+        }
+        let intersects = start < region.end && region.start < end;
+        if !intersects {
+            rewritten.push(region);
+            continue;
+        }
+        if region.start > cursor {
             return Err(PagerVmaError::Stale);
         }
         // The split/trim/remove rule is the shared ABI one. pagerd applies the
         // same call to its own replica of this region, so the two tables
         // cannot disagree about what an edit leaves behind - which is exactly
         // what happened while each side derived its own remainders.
-        let mut push = |fragment| rewritten.push(fragment);
+        // A commit/decommit edit preserves protection. Supplying the region's
+        // existing protection to the shared splitter distinguishes this from
+        // unmap while keeping the geometry rule identical for both ABIs.
+        let edit = PagerRangeEdit {
+            start,
+            end,
+            replacement_prot: replacement_prot
+                .or_else(|| replacement_commit_state.map(|_| region.prot)),
+        };
+        let mut push = |mut fragment: PagerVmRegionWire| {
+            if let Some(commit_state) = replacement_commit_state
+                && fragment.start >= start
+                && fragment.end <= end
+            {
+                fragment.commit_state = commit_state;
+            }
+            rewritten.push(fragment);
+        };
         match apply_region_edit(region, edit) {
             PagerRegionEdit::Untouched(_) => return Err(PagerVmaError::Stale),
             PagerRegionEdit::Removed => {}
@@ -858,9 +1007,10 @@ where
         }
         cursor = cursor.max(end.min(region.end));
     }
+    merge_adjacent_regions(&mut rewritten);
     let rewritten_len = rewritten.len();
     debug_assert!(
-        rewritten_len <= overlapping_len + PAGER_MAX_REGION_GROWTH_PER_PROTECT,
+        rewritten_len <= overlapping_len + maximum_growth,
         "one range edit may add at most one interior split's fragments"
     );
     if cursor < end || rewritten_len > overlapping_len + empty_len {
@@ -920,6 +1070,20 @@ where
     Ok(true)
 }
 
+pub(super) fn rewrite_attenuated_range<F>(
+    handle: ProcessHandle,
+    identity: ProcessIdentity,
+    start: u64,
+    end: u64,
+    replacement_prot: Option<u32>,
+    mutate: F,
+) -> Result<bool, PagerVmaError>
+where
+    F: FnOnce() -> Result<(), PagerVmaError>,
+{
+    rewrite_range(handle, identity, start, end, replacement_prot, None, mutate)
+}
+
 /// Narrows protection over one exact range and reports the identity whose
 /// regions were rewritten.
 ///
@@ -937,8 +1101,10 @@ pub fn protect_for_process(
     let retained =
         super::process_table::retain_process_by_pid(process_id).ok_or(PagerVmaError::Stale)?;
     let identity = retained.live_identity().ok_or(PagerVmaError::Stale)?;
-    let page_count =
-        usize::try_from((end - start) / PAGER_PAGE_BYTES).map_err(|_| PagerVmaError::Malformed)?;
+    let page_count = end
+        .checked_sub(start)
+        .and_then(|bytes| usize::try_from(bytes / PAGER_PAGE_BYTES).ok())
+        .ok_or(PagerVmaError::Malformed)?;
     let process = retained
         .handle()
         .object_identity()
@@ -972,8 +1138,10 @@ pub fn unmap_for_process(
     let retained =
         super::process_table::retain_process_by_pid(process_id).ok_or(PagerVmaError::Stale)?;
     let identity = retained.live_identity().ok_or(PagerVmaError::Stale)?;
-    let page_count =
-        usize::try_from((end - start) / PAGER_PAGE_BYTES).map_err(|_| PagerVmaError::Malformed)?;
+    let page_count = end
+        .checked_sub(start)
+        .and_then(|bytes| usize::try_from(bytes / PAGER_PAGE_BYTES).ok())
+        .ok_or(PagerVmaError::Malformed)?;
     let process = retained
         .handle()
         .object_identity()
@@ -993,22 +1161,57 @@ pub fn unmap_for_process(
     Ok(unmapped.then(|| (process.slot(), process.generation())))
 }
 
-/// Every region this process has published, as one reading.
+/// Commits or decommits one fully reserved range without changing ownership.
 ///
-/// `lookup` answers "which VMA covers this address"; fork needs the whole set,
-/// because what a child inherits is the reservation, not the pages the parent
-/// happened to have touched. The writer lock makes the set one reading rather
-/// than a scan racing an `mmap` in another thread of the same process.
-///
-/// The result is bounded by the fixed per-process slot count, so the
-/// allocation is exact and cannot grow with the workload. Residue left by a
-/// previous occupant of these slots is skipped by the same identity comparison
-/// `lookup_slot` uses; it is never inherited.
-///
-/// **Lock order:** this takes the publication writer lock, and
-/// `unmap_for_process` takes the process state lock *inside* that lock. So a
-/// caller must not already hold the process state lock, and fork does not:
-/// it reads this before it clones the address space.
+/// A reserved range remains the VMA authority but refuses every access.
+/// Decommit first removes any resident leaves; commit publishes only the state
+/// transition and lets later faults populate backing. This is the primitive
+/// required by Windows `MEM_RESERVE`/`MEM_COMMIT` and is also usable by future
+/// Linux decommit policy without creating another allocation ledger.
+pub fn set_commit_state_for_process(
+    process_id: u64,
+    start: u64,
+    end: u64,
+    commit_state: u16,
+) -> Result<Option<(u64, u64)>, PagerVmaError> {
+    let retained =
+        super::process_table::retain_process_by_pid(process_id).ok_or(PagerVmaError::Stale)?;
+    let identity = retained.live_identity().ok_or(PagerVmaError::Stale)?;
+    let page_count = end
+        .checked_sub(start)
+        .and_then(|bytes| usize::try_from(bytes / PAGER_PAGE_BYTES).ok())
+        .ok_or(PagerVmaError::Malformed)?;
+    let process = retained
+        .handle()
+        .object_identity()
+        .ok_or(PagerVmaError::Stale)?;
+    let rewritten = retained.with_state_mut(|_, state| {
+        rewrite_range(
+            retained.handle(),
+            identity,
+            start,
+            end,
+            None,
+            Some(commit_state),
+            || {
+                if commit_state != VM_COMMIT_RESERVED {
+                    return Ok(());
+                }
+                state
+                    .address_space_mut()
+                    .unmap_present_prepared_pager_fault_pages_at(
+                        x86_64::VirtAddr::new(start),
+                        page_count,
+                    )
+                    .map(|_| ())
+                    .map_err(|_| PagerVmaError::Stale)
+            },
+        )
+    })?;
+    Ok(rewritten.then(|| (process.slot(), process.generation())))
+}
+
+/// Returns every region this process has published as one stable reading.
 pub(super) fn snapshot_regions(
     handle: ProcessHandle,
     identity: ProcessIdentity,

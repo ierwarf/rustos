@@ -294,6 +294,28 @@ generated multi-context source, or a test-only item, with an adjacent reason.
 
 ## Change and review workflow
 
+### Bug-fix and commit hardening
+
+Bug repair is contract work, not only a local code edit. Every bug fix MUST:
+
+1. name the violated invariant and the failure class that made the observed
+   symptom possible;
+2. repair the owning state machine, authority boundary, generation rule, or
+   failure classification rather than special-case only the observed input;
+3. add a regression witness that fails for a structurally equivalent defect;
+   use unit/integration coverage plus a source witness, formal invariant, or
+   mutation whenever the contract is critical/high; and
+4. preserve the exact terminal cause in bounded telemetry. Collapsing distinct
+   lifecycle or authority failures into one errno, boolean, or generic log is
+   forbidden when it would prevent diagnosis or recovery policy.
+
+Every commit that changes source code MUST update an applicable Markdown owner
+or flow contract in the same commit. The update must describe the changed
+invariant, lifecycle, failure/recovery rule, or evidence entry; a changelog-only
+or cosmetic edit does not satisfy the requirement. If no applicable Markdown
+contract exists, create one before committing. A source-only commit is
+incomplete even when its tests pass.
+
 For every critical/high change:
 
 1. Identify owner, whole flow, and terminal outcomes before editing.

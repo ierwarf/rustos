@@ -730,7 +730,12 @@ pub fn finalize_kernel_initialization() {
     let pager_refill_thread = ps_api::Thread::new(tasks::nucleus_pager_fault_refill_task, 50);
     pager_refill_thread.start();
     flow_info(211, "kernel finalize: pager fault refill task started");
-    boot_log!(debug::LogLevel::Info, 137, 0, "pager fault refill task started");
+    boot_log!(
+        debug::LogLevel::Info,
+        137,
+        0,
+        "pager fault refill task started"
+    );
 
     let init_thread = ps_api::Thread::new(tasks::init_bootstrap_task, 90);
     init_thread.start();

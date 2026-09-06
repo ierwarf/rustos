@@ -97,4 +97,13 @@ pub mod pager {
     ) -> AnonymousFaultOutcome {
         crate::pager::serve_anonymous_first_touch(request, prot)
     }
+
+    /// Resolves one exact anonymous-fork or private-file COW write in the
+    /// faulting task, using the bounded IRQ-safe frame and ledger path.
+    pub fn serve_private_cow_write(
+        request: rustos_user_abi::pager::PagerFaultRequestWire,
+        kind: kernel_mm::api::phys::CowFrameKind,
+    ) -> AnonymousFaultOutcome {
+        crate::pager::serve_private_cow_write(request, kind)
+    }
 }

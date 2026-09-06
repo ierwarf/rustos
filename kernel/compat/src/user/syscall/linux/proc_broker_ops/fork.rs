@@ -1,9 +1,19 @@
 //! Linux fork broker transaction.
 //!
-//! The child process-table generation and lifecycle transaction are reserved
-//! before the address-space clone. The reservation is invisible until the
-//! scheduler publishes a suspended task; every failure before that point
-//! returns its exact token.
+//! - **Owner:** `kernel-compat` composes Linux fork; `kernel-ps` owns process/VMA
+//!   publication and `kernel-mm` owns COW PTE/frame transitions.
+//! - **Boundary:** Only a validated policy request and exact source pid/tid may
+//!   consume a reserved child lifecycle token.
+//! - **Lifecycle:** Reserve invisible child, hold parent VMAs, clone COW state,
+//!   publish suspended child VMAs, then activate exactly once.
+//! - **Concurrency:** One process-state/VMA-writer transaction excludes mapping
+//!   mutation and drains fault installers through parent downgrade.
+//! - **Failure:** Every pre-activation error restores parent state, terminates
+//!   the suspended child if published, and settles the exact reservation.
+//! - **Forbidden:** No runnable child with a reservation hole, stale parent
+//!   identity, partial COW ledger, or Windows CreateProcess inheritance.
+//! - **Evidence:** `CowFrameLifecycle`, fork-hold/rollback witnesses, and the
+//!   `fork_cow_private_write` KVM probe.
 
 use super::*;
 
@@ -33,38 +43,81 @@ pub(super) fn syscall_linux_rustos_proc_fork_broker(args_ptr: u64) -> u64 {
         Some(reservation) => reservation,
         None => return linux_errno(LINUX_EAGAIN),
     };
-    // Read the parent's reservation before its address space is cloned.  This
-    // cannot move inside the clone below: `snapshot_regions` takes the
-    // publication writer lock, and `unmap_for_process` takes the process state
-    // lock inside that same lock, so holding the state lock here would invert
-    // the order.  A concurrent `mmap` in another parent thread between this
-    // read and the clone is therefore not covered; Linux closes that window
-    // with `mmap_lock`, which this kernel has no equivalent of on both sides.
-    let inherited_regions = match multitask::pager_vma_regions_for_process(args.source_pid) {
-        Ok(regions) => regions,
-        Err(_) => {
-            let _ = multitask::cancel_process_spawn(spawn_reservation);
-            return linux_errno(LINUX_ENOMEM);
-        }
-    };
-    let child_state = match multitask::with_process_state_by_pid(args.source_pid, |parent| {
-        let address_space = parent.address_space().clone_user_space()?;
+    // One mmap-lock-equivalent transaction now covers both authorities the
+    // child inherits. The process state lock stabilizes page tables while the
+    // VMA writer holds every live publication at an odd sequence; concurrent
+    // faults retry, and no mmap/unmap can be linearized inside this snapshot.
+    let forked = multitask::with_fork_parent_state(args.source_pid, |parent, regions| {
+        let mut eager_private_ranges = Vec::new();
         if args.clone_flags & linux_abi::CLONE_CHILD_SETTID != 0 {
-            address_space.validate_user_write_buffer(
-                VirtAddr::new(args.ctid_ptr),
-                core::mem::size_of::<u32>(),
-            )?;
+            let byte_len = core::mem::size_of::<u32>();
+            if !writable_committed_regions_cover(regions, args.ctid_ptr, byte_len) {
+                return Err(crate::memory::paging::AddressSpaceError::ProtectionViolation);
+            }
+            parent
+                .address_space()
+                .validate_user_read_buffer(VirtAddr::new(args.ctid_ptr), byte_len)?;
+            let page_bytes = rustos_user_abi::pager::PAGER_PAGE_BYTES;
+            let first_page = args.ctid_ptr & !(page_bytes - 1);
+            let last_byte = args
+                .ctid_ptr
+                .checked_add(byte_len as u64 - 1)
+                .ok_or(crate::memory::paging::AddressSpaceError::AddressOverflow)?;
+            let page_count = usize::try_from((last_byte - first_page) / page_bytes + 1)
+                .map_err(|_| crate::memory::paging::AddressSpaceError::AddressOverflow)?;
+            eager_private_ranges
+                .try_reserve_exact(1)
+                .map_err(|_| crate::memory::paging::AddressSpaceError::OutOfFrames)?;
+            eager_private_ranges.push(crate::memory::paging::UserRegion {
+                start: VirtAddr::new(first_page),
+                page_count,
+            });
         }
-        Ok::<_, crate::memory::paging::AddressSpaceError>(parent.fork_clone(address_space, None))
-    }) {
-        Some(Ok(state)) => state,
-        Some(Err(err)) => {
+
+        let mut cow_ranges = Vec::new();
+        cow_ranges
+            .try_reserve_exact(regions.len())
+            .map_err(|_| crate::memory::paging::AddressSpaceError::OutOfFrames)?;
+        for region in regions {
+            if region.object.object_type == rustos_user_abi::pager::VM_OBJECT_ANONYMOUS
+                && region.sharing == rustos_user_abi::pager::VM_SHARING_PRIVATE
+                && region.commit_state == rustos_user_abi::pager::VM_COMMIT_COMMITTED
+            {
+                let bytes = region
+                    .end
+                    .checked_sub(region.start)
+                    .ok_or(crate::memory::paging::AddressSpaceError::AddressOverflow)?;
+                let page_count = usize::try_from(bytes / rustos_user_abi::pager::PAGER_PAGE_BYTES)
+                    .map_err(|_| crate::memory::paging::AddressSpaceError::AddressOverflow)?;
+                cow_ranges.push(crate::memory::paging::UserRegion {
+                    start: VirtAddr::new(region.start),
+                    page_count,
+                });
+            }
+        }
+        cow_ranges.sort_unstable_by_key(|region| region.start.as_u64());
+        let address_space = parent
+            .address_space_mut()
+            .clone_user_space_cow(&cow_ranges, &eager_private_ranges)?;
+        let mut inherited_regions = Vec::new();
+        inherited_regions
+            .try_reserve_exact(regions.len())
+            .map_err(|_| crate::memory::paging::AddressSpaceError::OutOfFrames)?;
+        inherited_regions.extend_from_slice(regions);
+        Ok::<_, crate::memory::paging::AddressSpaceError>((
+            parent.fork_clone(address_space, None),
+            inherited_regions,
+        ))
+    });
+    let (child_state, inherited_regions) = match forked {
+        Ok(Ok(result)) => result,
+        Ok(Err(err)) => {
             let _ = multitask::cancel_process_spawn(spawn_reservation);
             return linux_errno(address_space_error_to_linux_errno(err));
         }
-        None => {
+        Err(_) => {
             let _ = multitask::cancel_process_spawn(spawn_reservation);
-            return linux_errno(LINUX_ESRCH);
+            return linux_errno(LINUX_ENOMEM);
         }
     };
     let mut child_thread_state = thread_snapshot.thread_state;
@@ -130,7 +183,7 @@ pub(super) fn syscall_linux_rustos_proc_fork_broker(args_ptr: u64) -> u64 {
     // and nothing may observe a runnable child whose address space is missing
     // ranges its parent held.  A failure here revokes what it published and
     // destroys the child, exactly as a `dup_mmap` failure destroys the child mm.
-    if let Err(errno) = crate::user::syscall::linux::mm_broker_ops::inherit_anonymous_pager_vmas(
+    if let Err(errno) = crate::user::syscall::linux::mm_broker_ops::inherit_pager_vmas(
         child_pid,
         &inherited_regions,
     ) {
@@ -165,6 +218,36 @@ pub(super) fn syscall_linux_rustos_proc_fork_broker(args_ptr: u64) -> u64 {
     child_pid
 }
 
+fn writable_committed_regions_cover(
+    regions: &[rustos_user_abi::pager::PagerVmRegionWire],
+    start: u64,
+    byte_len: usize,
+) -> bool {
+    if byte_len == 0 {
+        return true;
+    }
+    let Some(end) = start.checked_add(byte_len as u64) else {
+        return false;
+    };
+    let mut cursor = start;
+    for region in regions {
+        if region.end <= cursor {
+            continue;
+        }
+        if region.start > cursor
+            || region.commit_state != rustos_user_abi::pager::VM_COMMIT_COMMITTED
+            || region.prot & rustos_user_abi::pager::VM_PROT_WRITE == 0
+        {
+            return false;
+        }
+        cursor = core::cmp::min(end, region.end);
+        if cursor == end {
+            return true;
+        }
+    }
+    false
+}
+
 pub(super) fn valid_process_fork_plan_locally(args: &RustosProcForkBrokerArgs) -> bool {
     let supported =
         linux_abi::CSIGNAL | linux_abi::CLONE_CHILD_SETTID | linux_abi::CLONE_CHILD_CLEARTID;
@@ -177,4 +260,57 @@ pub(super) fn valid_process_fork_plan_locally(args: &RustosProcForkBrokerArgs) -
             == 0
             || (PROC_BROKER_USER_SPACE_BASE..PROC_BROKER_USER_SPACE_END_EXCLUSIVE)
                 .contains(&args.ctid_ptr))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::writable_committed_regions_cover;
+    use rustos_user_abi::pager::{
+        PagerVmRegionWire, VM_COMMIT_COMMITTED, VM_COMMIT_RESERVED, VM_PROT_READ, VM_PROT_WRITE,
+    };
+
+    fn region(start: u64, end: u64, prot: u32, commit_state: u16) -> PagerVmRegionWire {
+        PagerVmRegionWire {
+            start,
+            end,
+            prot,
+            commit_state,
+            ..PagerVmRegionWire::default()
+        }
+    }
+
+    #[test]
+    fn child_tid_span_requires_gapless_committed_write_authority() {
+        let regions = [
+            region(
+                0x1000,
+                0x2000,
+                VM_PROT_READ | VM_PROT_WRITE,
+                VM_COMMIT_COMMITTED,
+            ),
+            region(0x2000, 0x3000, VM_PROT_WRITE, VM_COMMIT_COMMITTED),
+        ];
+        assert!(writable_committed_regions_cover(&regions, 0x1ffe, 4));
+        assert!(!writable_committed_regions_cover(&regions, 0x2ffe, 4));
+
+        let gap = [
+            region(0x1000, 0x1800, VM_PROT_WRITE, VM_COMMIT_COMMITTED),
+            region(0x1900, 0x3000, VM_PROT_WRITE, VM_COMMIT_COMMITTED),
+        ];
+        assert!(!writable_committed_regions_cover(&gap, 0x17ff, 0x102));
+    }
+
+    #[test]
+    fn child_tid_span_rejects_reserved_or_read_only_vmas() {
+        assert!(!writable_committed_regions_cover(
+            &[region(0x1000, 0x2000, VM_PROT_WRITE, VM_COMMIT_RESERVED)],
+            0x1000,
+            4,
+        ));
+        assert!(!writable_committed_regions_cover(
+            &[region(0x1000, 0x2000, VM_PROT_READ, VM_COMMIT_COMMITTED)],
+            0x1000,
+            4,
+        ));
+    }
 }

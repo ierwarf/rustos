@@ -105,11 +105,11 @@ The permit is the writer/read-side boundary: `munmap`, `mprotect`, `exec`, and
 other writers first publish the VMA as absent, wait for already-acquired leaf
 permits to drain, then perform their ordinary locked PTE mutation and TLB
 reclamation. A CAS loser returns its unused reserve frame; a CAS winner marks
-the entry with a software ownership bit — bit 9 for a leaf, bit 10 for an
-intermediate table. Those tags are the ownership record used by normal clone,
-unmap, and address-space retirement, because no exception-time `Vec` ledger
-mutation is possible. Retirement reconciles them against `owned_frames` rather
-than trusting them (§1c).
+the entry with a software ownership bit — bit 9 for an address-space-owned
+leaf, bit 10 for an intermediate table. Every winner also claims the exact
+role in the boot-sized physical frame descriptor before PTE publication.
+Tags remain independent page-table evidence; retirement reconciles them with
+the descriptor catalog rather than trusting either source alone (§1c).
 
 What is still forbidden regardless of the interrupt flag:
 
@@ -168,33 +168,27 @@ can be neighbours inside the same 2 MiB block, so both may need the same table.
 the loser returns its frame — a frame no root ever named, so returning it owes
 no shootdown either.
 
-### Three ownership ledgers, and the checks between them
+### One physical descriptor catalog, with independent PTE evidence
 
-| Frame | Ledger | Recorded by |
+| Frame role | PTE evidence | Descriptor payload |
 | --- | --- | --- |
-| eager data leaf | `owned_frames` | the mapping transaction, exactly |
-| fault-installed leaf | `IRQ_OFF_PAGER_FAULT_LEAF` (bit 9) | the PTE itself |
-| every dynamically created user table | `ROOT_OWNED_USER_TABLE` (bit 10) | the directory entry, by normal mapper or fault winner |
-| every dynamically created user table | root-owned explicit descriptor list | `phys`, before the directory-entry CAS |
+| address-space-owned data leaf | `ROOT_OWNED_USER_LEAF` (bit 9) | exact `(root, virtual_address)` |
+| dynamically created user table | `ROOT_OWNED_USER_TABLE` (bit 10) | root owner + intrusive successor |
+| root PML4 | root frame identity | table-list head + live data-leaf count |
 
 The tags remain useful independent evidence because the fault path cannot push
-to a `Vec` behind a sleepable lock. `phys` reserves boot-sized metadata for the
-discovered physical-frame domain: each root has an intrusive head, and every
-dynamically created user table carries its root identity and successor. Both
-the normal mapper and exception path claim that record before their PTE CAS,
-link it only after a successful CAS, and clear it before returning a losing
-frame. Those operations are allocation-free and O(1) while interrupts are
-disabled on the fault path.
+to a `Vec` behind a sleepable lock. `phys` reserves one tagged-union descriptor
+for every discovered physical frame. Normal and exception installers claim a
+role before their PTE CAS, publish it only for a winning CAS, and clear it
+before returning a loser. These operations are allocation-free and O(1).
 
-Retirement first proves the root inactive on every CPU, then walks the tags,
-drains the explicit root list, sorts both table identities, and fails stop
-unless they agree exactly. It separately rejects an overlap between the normal
-`owned_frames` ledger and tag ownership, or a tagged leaf/table collision.
-Only after all checks can it return any recorded frame to `phys`; the explicit
-root head is already clear before the root itself becomes reusable. A frame the
-allocator merely refuses to take back is a different fact:
-that is a leak with a diagnostic, not corruption, and it does not stop the
-kernel.
+Retirement proves the root inactive, walks the tags, drains the descriptor's
+root table list, and fails stop unless table identities and exact data-leaf
+counts/owners agree. Only after those checks and TLB acknowledgement may it
+clear descriptor roles and return frames. The same catalog reserves shared
+anonymous and shared private-file roles. Their first exact mapping is inline;
+additional mappings come from a second boot-sized record pool, so present-write
+fault, unmap, exec, and retirement never allocate ownership metadata.
 
 This eliminates the prior unreachable-subtree accounting blind spot: a damaged
 upper entry may hide tags from the page-table walk, but it cannot erase the
@@ -371,7 +365,7 @@ code-derived conclusions turned out to be wrong. They are listed because the
 | --- | --- | --- |
 | "A fault costs 23 µs, dominated by the O(VMA) scan" | 23 µs is the whole `mmap`+touch+`munmap` cycle. The fault is a fraction of it. | Comparing `anon_mmap_reserve` (no fault) against a faulting probe *before* theorizing |
 | "Then the fault is 1.9 µs" | That differential is noise-dominated on a 1-page probe. `mmap_unmap_1024_faulted_pages` implies ~12 µs. | Using the probe whose own header says it is the only one that may justify a fault-path change |
-| "`template_is_canonical` forbids a `prot == 0` fragment, so `mprotect(PROT_NONE)` cannot publish one" | The rewrite path calls the slot's low-level `publish` and never goes through `stamped_region`. A deny-all VMA *is* installable. | Following the actual call path instead of the nearest plausible validator; a unit test caught it in 90 s |
+| "`PROT_NONE` is covered because `mprotect` can publish a deny-all fragment" | The rewrite path bypassed `stamped_region`, but initial and fork-inherited publication still rejected `prot == 0`; fork then surfaced the internal `Malformed` as `ENOMEM`. All publication modes now accept deny-all VMAs and access lookup rejects them. | Testing every publication mode against the same canonical VMA corpus and preserving the exact internal error class |
 | "Enabling interrupts in the handler caused the later instability" | The instability was a fabricated `ENOMEM` from `MAP_FIXED`. The interrupt change was unrelated. | Not attributing a new symptom to the most recent change without evidence |
 | "SeqCst on the four operations closes the Loom failure" | Loom under-approximates SeqCst. The fix was right for hardware and still failed the model. | Knowing the checker's limits before reading its verdict as a fact about the code |
 | "Fault-around's speculative pages need a software bit that was not reserved" | The hardware Accessed bit already encodes it. | Checking whether the CPU already maintains the predicate |
@@ -537,6 +531,31 @@ capacity refusals and zero `cannot map zero-fill pages` across a boot.
 The static publication table is `MAX_PROCESS_OBJECTS * PAGER_MAX_VMAS_PER_PROCESS`
 — 1.3 MiB at 32×256. That is the real ceiling on raising it again.
 
+### Fork publication and reusable process slots
+
+Ordinary mmap publication and fork inheritance have different page-table
+preconditions. The former reserves an empty range. The latter publishes the
+copied reservation over a suspended child's already-cloned resident leaves.
+They therefore use separate typed entrypoints; weakening the ordinary
+empty-range proof or routing fork through it is forbidden.
+
+The fixed per-process VMA array outlives a process-table slot. Before counting
+overlap or capacity for a new publication, the writer compares every occupied
+entry's process object generation and MM generation with the live identity,
+drains its installers, and clears mismatches. A process index match alone is
+never ownership. The regression witness must reuse the same process index with
+a newer generation and publish the same virtual range successfully.
+It must also inspect physical slot occupancy and exact stamps: success through
+another free slot does not prove that the old generation was reclaimed. The
+reclamation-removal mutation must fail this witness.
+
+Every unexpected publication failure records one stable low-byte class
+(`Malformed`, `Overlap`, `Pressure`, `Stale`, `Unstable`, or `Denied`) together
+with the failed start address. Rate limiting remains first and every 64th
+occurrence. Returning the ABI-required errno does not authorize throwing away
+the internal cause; errno-only telemetry is the failure pattern that hid both
+slot residue and the fork `PROT_NONE` mismatch.
+
 ---
 
 ## 3. One range-edit rule, for the replicas that still exist
@@ -572,8 +591,9 @@ things, and it is explicit in `PagerRegionEdit::pager_fragments`:
 
 - **ring0** keeps a deny-all VMA, so the address stays owned and `lookup`
   refuses every access before a fault can be dispatched.
-- **a pager** keeps nothing: a span with no rights can never raise a fault, and
-  a region with no rights is not a canonical wire region.
+- **a pager** keeps nothing active: a span with no rights can never raise a
+  fault. This is a range-edit policy asymmetry, not a canonicality exception;
+  a rights-free wire VMA is canonical and must survive fork publication.
 
 A deny-all region is still a legal *input* to the rule — `munmap` must be able
 to remove it.
@@ -857,7 +877,7 @@ reads exactly like a boot failure.
    removing scheduler turns, and something was probably using those turns.
 6. If you add anything the fault path publishes into a page table, it needs an
    ownership record the fault path can actually write — a tag, not a `Vec` —
-   and a reconciliation against `owned_frames` at retirement. Say which failures
+   and a reconciliation against the frame descriptor catalog at retirement. Say which failures
    are leaks with a diagnostic and which are corruption that stops the kernel;
    §1c's table is the shape to follow.
 7. If you make a page-table level absent where it used to be present, grep every

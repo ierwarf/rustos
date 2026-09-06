@@ -20,7 +20,7 @@
 //! mutation guard is held - that guard excludes normal-time writers, not the
 //! fault path, and the fault path takes no lock at all. Retaining the table
 //! costs one empty 4 KiB frame until retirement, which is exactly what `munmap`
-//! already does, and it keeps `owned_frames` the exact ledger for that frame.
+//! already does. Data leaves still release their exact physical descriptors.
 
 use super::*;
 
@@ -43,12 +43,15 @@ pub(super) fn rollback_user_pages(
         if unmapped.map(|phys| phys.as_u64()) != Some(frame_phys) {
             panic!("user page rollback mismatch");
         }
-        if space.owned_frames.contains(&frame_phys) {
-            let removed = remove_owned_frame(&mut space.owned_frames, frame_phys);
-            debug_assert!(removed.is_ok());
-        }
     }
     let _flushed_mutation = mutation.flush_for_reclaim();
+    for (virt, frame_phys) in rollback_order(pages) {
+        assert_eq!(
+            phys::release_data_leaf(space.pml4_frame_phys, virt.as_u64(), frame_phys,),
+            Some(phys::DataLeafRelease::FrameReusable),
+            "rolled-back exclusive leaf lost exact data descriptor"
+        );
+    }
     free_rollback_frames_exact(rollback_order(pages).map(|(_, frame_phys)| frame_phys));
 }
 

@@ -1,16 +1,16 @@
-//! Ring3-owned anonymous-mapping policy, published once and read locally.
+//! Ring3-owned anonymous-mapping policy, published as a coherent snapshot and read locally.
 //!
 //! - **Owner:** `pagerd` owns anonymous arbitration policy; `kernel-compat`
 //!   owns only the publication slot and the enforcement that reads it.
 //! - **Boundary:** A publication is untrusted until `is_canonical` accepts it,
 //!   and only a process holding the pagerd service endpoint may publish.
 //! - **Lifecycle:** ring0 applies its compiled-in default until pagerd
-//!   publishes exactly once; the publication is immutable afterwards.
-//! - **Concurrency:** one acquire load on the commit word, then relaxed reads
-//!   of fields that can no longer change. Safe from the IRQ-off fault path
-//!   because it neither locks nor allocates.
-//! - **Failure:** a malformed policy is refused and the default stands; a
-//!   second publication is refused rather than mutating a live policy.
+//!   publishes; later pressure-driven publications replace the whole snapshot.
+//! - **Concurrency:** writers publish through an odd/even sequence. Normal
+//!   readers retry; the single IRQ-off reader makes two attempts and falls
+//!   back to the compiled-in run length when a writer is active.
+//! - **Failure:** malformed policy and bounded writer contention are refused;
+//!   the prior stable snapshot remains authoritative.
 //! - **Forbidden:** no policy widening past the fixed table sizes, no
 //!   publication from a process that does not own the pager endpoint, and no
 //!   ring0 default that differs from the constants it replaced.
@@ -22,32 +22,35 @@
 //! was a synchronous call on the fault path, which measured 5.7 ms p99 on
 //! `mmap`. That retired the *transport*, not the ownership. Reading a
 //! published policy costs what reading a constant costs, so ring3 can own the
-//! decision without putting a round trip back on the fault. It is Zircon's
-//! split - userspace sets policy, the kernel enforces it.
+//! decision without putting a round trip back on the fault. It follows
+//! Zircon's pressure split: mutable system state is recomputed out of line and
+//! the fault path consumes a local coherent snapshot.
 //!
-//! # Why one-shot
+//! # Why a sequence, rather than a commit bit
 //!
-//! Immutability after commit is what lets the IRQ-off reader take the policy
-//! with a single acquire and no seqlock: there is no window in which a reader
-//! can observe half of one policy and half of another. A pager sets this
-//! during startup, before the processes it governs exist, exactly as a Zircon
-//! job policy is set before the job runs rather than mutated under load.
+//! Memory-pressure levels and the thresholds derived from them change while
+//! processes run. A one-shot commit would make those policy fields immutable
+//! precisely when pressure needs to narrow them. The sequence makes the whole
+//! wire value one publication: readers never combine fields from two pressure
+//! epochs. The IRQ-off fault-around reader is best effort, so an unstable read
+//! changes only that fault's speculative run length and safely uses the
+//! default; readers that make admission decisions retry in normal context.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use rustos_user_abi::pager::{
-    PagerAnonymousPolicyWire, PAGER_FAULT_ABI_VERSION, PAGER_FAULT_RUN_PAGES_MAX,
-    PAGER_MAX_VMAS_PER_PROCESS, PAGER_MAX_WIRED_SERVICES,
+    PAGER_FAULT_ABI_VERSION, PAGER_FAULT_RUN_PAGES_MAX, PAGER_MAX_VMAS_PER_PROCESS,
+    PAGER_MAX_WIRED_SERVICES, PagerAnonymousPolicyWire,
 };
 use rustos_user_abi::syscall::{
     IPC_SERVICE_LINUX_SYSCALLD, IPC_SERVICE_PAGERD, IPC_SERVICE_ROOTD, IPC_SERVICE_STORAGED,
     IPC_SERVICE_VFSD,
 };
 
-/// Publication states of the commit word.
+/// Even sequences are stable snapshots; odd sequences have a writer.
 const UNPUBLISHED: u64 = 0;
-const CLAIMED: u64 = 1;
-const COMMITTED: u64 = 2;
+const MAX_PUBLICATION_SEQUENCE: u64 = u64::MAX - 2;
+const POLICY_WRITE_ATTEMPTS: usize = 128;
 
 /// What ring0 applies until a pager publishes.
 ///
@@ -77,7 +80,7 @@ pub(crate) fn default_policy() -> PagerAnonymousPolicyWire {
 }
 
 struct PublishedAnonymousPolicy {
-    commit: AtomicU64,
+    sequence: AtomicU64,
     fault_run_pages: AtomicU64,
     process_vma_ceiling: AtomicU64,
     demand_enabled: AtomicU64,
@@ -87,7 +90,7 @@ struct PublishedAnonymousPolicy {
 impl PublishedAnonymousPolicy {
     const fn empty() -> Self {
         Self {
-            commit: AtomicU64::new(UNPUBLISHED),
+            sequence: AtomicU64::new(UNPUBLISHED),
             fault_run_pages: AtomicU64::new(0),
             process_vma_ceiling: AtomicU64::new(0),
             demand_enabled: AtomicU64::new(0),
@@ -96,16 +99,33 @@ impl PublishedAnonymousPolicy {
     }
 
     fn publish(&self, policy: PagerAnonymousPolicyWire) -> bool {
-        // ORDERING: AcqRel claims the one-shot slot before any field is
-        // written; a loser observes the claim and refuses rather than
-        // interleaving its fields with the winner's.
-        if self
-            .commit
-            .compare_exchange(UNPUBLISHED, CLAIMED, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
+        let mut stable = UNPUBLISHED;
+        let mut claimed = false;
+        for _ in 0..POLICY_WRITE_ATTEMPTS {
+            stable = self.sequence.load(Ordering::Acquire);
+            if stable & 1 != 0 {
+                core::hint::spin_loop();
+                continue;
+            }
+            if stable > MAX_PUBLICATION_SEQUENCE {
+                return false;
+            }
+            // ORDERING: AcqRel changes the stable even sequence to odd before
+            // any payload field changes. A reader that saw the old even value
+            // must reject it at its second sequence observation.
+            if self
+                .sequence
+                .compare_exchange_weak(stable, stable + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                claimed = true;
+                break;
+            }
+        }
+        if !claimed {
             return false;
         }
+
         self.fault_run_pages
             .store(u64::from(policy.fault_run_pages), Ordering::Relaxed);
         self.process_vma_ceiling
@@ -119,46 +139,77 @@ impl PublishedAnonymousPolicy {
         {
             slot.store(service_id, Ordering::Relaxed);
         }
-        // ORDERING: release commits every field above before a reader may
-        // observe `COMMITTED` and take them. Nothing writes them again, so the
-        // reader needs no second observation to prove they are stable.
-        self.commit.store(COMMITTED, Ordering::Release);
+        // ORDERING: Release publishes every Relaxed payload store before the
+        // next stable even sequence. Readers accept the payload only when two
+        // acquire observations agree on this exact sequence.
+        self.sequence.store(stable + 2, Ordering::Release);
         true
     }
 
-    fn read(&self) -> Option<PagerAnonymousPolicyWire> {
-        // ORDERING: acquire pairs with the release commit above, so every
-        // relaxed field read below observes the published value.
-        if self.commit.load(Ordering::Acquire) != COMMITTED {
-            return None;
+    fn read(&self) -> Result<Option<PagerAnonymousPolicyWire>, ()> {
+        for _ in 0..2 {
+            let before = self.sequence.load(Ordering::Acquire);
+            if before == UNPUBLISHED {
+                return Ok(None);
+            }
+            if before & 1 != 0 {
+                continue;
+            }
+
+            let mut wired_services = [0_u64; PAGER_MAX_WIRED_SERVICES];
+            for (destination, slot) in wired_services.iter_mut().zip(self.wired_services.iter()) {
+                *destination = slot.load(Ordering::Relaxed);
+            }
+            let policy = PagerAnonymousPolicyWire {
+                version: PAGER_FAULT_ABI_VERSION,
+                reserved0: 0,
+                fault_run_pages: self.fault_run_pages.load(Ordering::Relaxed) as u32,
+                process_vma_ceiling: self.process_vma_ceiling.load(Ordering::Relaxed) as u32,
+                demand_enabled: self.demand_enabled.load(Ordering::Relaxed) as u32,
+                wired_services,
+                reserved1: [0; 2],
+            };
+
+            // ORDERING: equality with the first Acquire proves no writer
+            // invalidated or committed the payload during this attempt.
+            let after = self.sequence.load(Ordering::Acquire);
+            if before == after {
+                return Ok(Some(policy));
+            }
         }
-        let mut wired_services = [0_u64; PAGER_MAX_WIRED_SERVICES];
-        for (destination, slot) in wired_services.iter_mut().zip(self.wired_services.iter()) {
-            *destination = slot.load(Ordering::Relaxed);
-        }
-        Some(PagerAnonymousPolicyWire {
-            version: PAGER_FAULT_ABI_VERSION,
-            reserved0: 0,
-            fault_run_pages: self.fault_run_pages.load(Ordering::Relaxed) as u32,
-            process_vma_ceiling: self.process_vma_ceiling.load(Ordering::Relaxed) as u32,
-            demand_enabled: self.demand_enabled.load(Ordering::Relaxed) as u32,
-            wired_services,
-            reserved1: [0; 2],
-        })
+        Err(())
     }
 }
 
 static ANONYMOUS_POLICY: PublishedAnonymousPolicy = PublishedAnonymousPolicy::empty();
 
-/// The policy in force: what a pager published, or ring0's default.
+/// The policy in force for normal, retryable context.
 ///
-/// Callable from the IRQ-off fault path: one acquire load and, at most, a
-/// handful of relaxed loads of fields that can no longer change.
+/// Admission decisions may not use a mixed or fallback snapshot, so they
+/// retry while a bounded writer publication is in progress.
 pub(crate) fn anonymous_policy() -> PagerAnonymousPolicyWire {
-    ANONYMOUS_POLICY.read().unwrap_or_else(default_policy)
+    loop {
+        match ANONYMOUS_POLICY.read() {
+            Ok(Some(policy)) => return policy,
+            Ok(None) => return default_policy(),
+            Err(()) => core::hint::spin_loop(),
+        }
+    }
 }
 
-/// Records a pager's policy. `false` means refused; the prior policy stands.
+/// The policy in force for the IRQ-off best-effort fault-around reader.
+///
+/// Two failed sequence attempts change only this fault's speculative run
+/// length, so the compiled-in default is the safe bounded fallback.
+pub(crate) fn anonymous_policy_irq_off() -> PagerAnonymousPolicyWire {
+    ANONYMOUS_POLICY
+        .read()
+        .ok()
+        .flatten()
+        .unwrap_or_else(default_policy)
+}
+
+/// Replaces the policy snapshot. `false` means the prior snapshot stands.
 pub(crate) fn publish_anonymous_policy(policy: PagerAnonymousPolicyWire) -> bool {
     policy.is_canonical() && ANONYMOUS_POLICY.publish(policy)
 }
@@ -166,6 +217,7 @@ pub(crate) fn publish_anonymous_policy(policy: PagerAnonymousPolicyWire) -> bool
 #[cfg(test)]
 mod tests {
     use super::*;
+    extern crate std;
 
     #[test]
     fn the_ring0_default_is_exactly_the_constants_it_replaced() {
@@ -222,20 +274,62 @@ mod tests {
     }
 
     #[test]
-    fn publication_is_one_shot_and_a_reader_sees_all_of_it_or_none() {
+    fn every_publication_is_a_coherent_replaceable_snapshot() {
         let slot = PublishedAnonymousPolicy::empty();
-        assert_eq!(slot.read(), None);
+        assert_eq!(slot.read(), Ok(None));
 
-        let mut published = default_policy();
-        published.fault_run_pages = 4;
-        published.demand_enabled = 0;
-        assert!(slot.publish(published));
-        assert_eq!(slot.read(), Some(published));
+        let mut first = default_policy();
+        first.fault_run_pages = 4;
+        first.demand_enabled = 0;
+        assert!(slot.publish(first));
+        assert_eq!(slot.read(), Ok(Some(first)));
 
-        // A second publication cannot mutate a live policy.
         let mut second = default_policy();
         second.fault_run_pages = 1;
-        assert!(!slot.publish(second));
-        assert_eq!(slot.read(), Some(published));
+        second.process_vma_ceiling = 7;
+        assert!(slot.publish(second));
+        assert_eq!(slot.read(), Ok(Some(second)));
+    }
+
+    #[test]
+    fn concurrent_republication_never_yields_a_mixed_policy_epoch() {
+        use core::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+
+        let slot = Arc::new(PublishedAnonymousPolicy::empty());
+        let done = Arc::new(AtomicBool::new(false));
+        let mut first = default_policy();
+        first.fault_run_pages = 4;
+        first.process_vma_ceiling = 11;
+        first.demand_enabled = 0;
+        let mut second = default_policy();
+        second.fault_run_pages = 1;
+        second.process_vma_ceiling = 23;
+        second.demand_enabled = 1;
+
+        let writer_slot = Arc::clone(&slot);
+        let writer_done = Arc::clone(&done);
+        let writer = std::thread::spawn(move || {
+            for index in 0..20_000 {
+                assert!(writer_slot.publish(if index & 1 == 0 { first } else { second }));
+            }
+            // ORDERING: release publishes completion after the last policy commit.
+            writer_done.store(true, Ordering::Release);
+        });
+
+        // ORDERING: acquire keeps the reader active until all publications finish.
+        while !done.load(Ordering::Acquire) {
+            if let Ok(Some(observed)) = slot.read() {
+                assert!(observed == first || observed == second);
+            }
+        }
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn an_irq_reader_refuses_an_in_progress_snapshot() {
+        let slot = PublishedAnonymousPolicy::empty();
+        slot.sequence.store(1, Ordering::Release);
+        assert_eq!(slot.read(), Err(()));
     }
 }

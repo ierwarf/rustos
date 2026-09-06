@@ -26,21 +26,22 @@ use x86_64::structures::paging::{PageTable, PageTableFlags};
 use kernel_hal::api::arch::tlb::{AddressSpaceMutationGuard, begin_address_space_mutation};
 
 mod atomic_user;
-mod owned_frames;
+mod frame_release;
 mod pager_fault_mapping;
 mod retirement;
 mod rollback;
 mod user_copy;
-use owned_frames::{
-    FRAME_BATCH_CHUNK, free_frame_buffer_tail, free_owned_frames_exact, free_owned_frames_logged,
-    free_owned_frames_silently, free_rollback_frames_exact, remove_owned_frame, track_owned_frame,
-};
-pub use pager_fault_mapping::{
-    ensure_current_fault_tables_at, map_current_prepared_pager_fault_frame_at,
+use frame_release::{
+    FRAME_BATCH_CHUNK, free_frame_buffer_tail, free_removed_frames_exact,
+    free_retired_frames_logged, free_rollback_frames_exact,
 };
 use pager_fault_mapping::{
-    publish_user_table_entry, read_user_table_entry, without_irq_off_pager_fault_tag,
-    ROOT_OWNED_USER_TABLE,
+    COW_USER_LEAF, ROOT_OWNED_USER_LEAF, ROOT_OWNED_USER_TABLE, publish_user_table_entry,
+    read_user_table_entry, without_root_owned_user_leaf_tag,
+};
+pub use pager_fault_mapping::{
+    CowWriteResult, ensure_current_fault_tables_at, map_current_prepared_pager_fault_frame_at,
+    resolve_current_cow_write_at,
 };
 use rollback::{rollback_external_user_pages, rollback_user_pages};
 pub use user_copy::{ValidatedUserRead, ValidatedUserWrite};
@@ -59,13 +60,12 @@ pub(crate) struct PagerFaultLeaf {
     physical_address: u64,
 }
 
-/// The frames a retirement walk must reclaim outside the data-leaf
-/// `owned_frames` ledger.
+/// The tagged frames a retirement walk reconciles with physical descriptors.
 ///
-/// Fault-installed data leaves are recorded only by their PTE tag because the
-/// IRQ-off installer cannot mutate a `Vec`. Every dynamically created user
-/// table, from either normal-time mapping or fault entry, is recorded by the
-/// same directory tag and root-owned descriptor list.
+/// Every address-space-owned data leaf has both a PTE tag and an exact
+/// `(root, virtual_address)` descriptor. Every dynamically created user table,
+/// from either normal-time mapping or fault entry, has the directory tag and a
+/// root-owned descriptor-list entry.
 #[derive(Debug)]
 pub(crate) struct PagerFaultOwnership {
     leaves: Vec<PagerFaultLeaf>,
@@ -101,6 +101,13 @@ pub struct UserRegion {
     pub page_count: usize,
 }
 
+#[derive(Clone, Copy)]
+struct ClonedLeaf {
+    virtual_address: VirtAddr,
+    child_frame_phys: u64,
+    shared_alias: Option<phys::SharedAliasTicket>,
+}
+
 impl UserRegion {
     pub fn len_bytes(&self) -> usize {
         self.page_count.saturating_mul(PAGE_4KIB)
@@ -115,8 +122,6 @@ impl UserRegion {
 pub struct ProcessAddressSpace {
     pml4_frame_phys: u64,
     next_user_addr: u64,
-    owned_frames: Vec<u64>,
-    regions: Vec<UserRegion>,
 }
 
 impl ProcessAddressSpace {
@@ -124,6 +129,7 @@ impl ProcessAddressSpace {
     pub fn new() -> Result<Self, AddressSpaceError> {
         let pml4_phys = phys::alloc_frame().ok_or(AddressSpaceError::OutOfFrames)?;
         phys::register_lazy_table_root(pml4_phys.as_u64());
+        phys::register_data_leaf_root(pml4_phys.as_u64());
         let root = unsafe { kernel_vm::phys_to_table_mut(pml4_phys) };
         root.zero();
 
@@ -143,12 +149,6 @@ impl ProcessAddressSpace {
         Ok(Self {
             pml4_frame_phys: pml4_phys.as_u64(),
             next_user_addr: USER_SPACE_BASE,
-            owned_frames: {
-                let mut frames = Vec::new();
-                track_owned_frame(&mut frames, pml4_phys.as_u64())?;
-                frames
-            },
-            regions: Vec::new(),
         })
     }
 
@@ -161,59 +161,126 @@ impl ProcessAddressSpace {
         Self {
             pml4_frame_phys: 0,
             next_user_addr: USER_SPACE_BASE,
-            owned_frames: Vec::new(),
-            regions: Vec::new(),
         }
     }
 
-    pub fn clone_user_space(&self) -> Result<Self, AddressSpaceError> {
+    /// Clones resident leaves, sharing the ranges admitted for anonymous fork
+    /// COW and eagerly copying every excluded mapping class.
+    ///
+    /// The caller holds the parent's VMA publication in an odd-sequence fork
+    /// hold, so no new fault installer can enter while the parent PTEs are
+    /// downgraded. Existing private-file COW leaves retain their descriptor
+    /// kind and backing identity. `eager_private_ranges` names writable pages
+    /// that the kernel must mutate before child publication, such as libc's
+    /// `CLONE_CHILD_SETTID` word; those pages are copied and made writable
+    /// instead of being shared. The child root is unpublished. One mutation
+    /// guard batches all parent write protection into one exact shootdown.
+    pub fn clone_user_space_cow(
+        &mut self,
+        cow_ranges: &[UserRegion],
+        eager_private_ranges: &[UserRegion],
+    ) -> Result<Self, AddressSpaceError> {
         let mut cloned = Self::new()?;
         cloned.next_user_addr = self.next_user_addr;
+        let ownership = self.pager_fault_ownership()?;
+        let mut cloned_leaves = Vec::new();
+        cloned_leaves
+            .try_reserve_exact(ownership.leaves.len())
+            .map_err(|_| AddressSpaceError::OutOfFrames)?;
+        let mut downgraded = Vec::new();
+        downgraded
+            .try_reserve_exact(ownership.leaves.len())
+            .map_err(|_| AddressSpaceError::OutOfFrames)?;
+        let mutation = begin_address_space_mutation(self.root_phys());
 
-        for region in &self.regions {
-            for page_index in 0..region.page_count {
-                let virt = page_addr(region.start, page_index)?;
-                let (src_phys, flags) = self
-                    .translate_user_with_flags(virt)
-                    .ok_or(AddressSpaceError::NotMapped)?;
-                cloned.map_zeroed_user_pages_at(virt, 1, without_irq_off_pager_fault_tag(flags))?;
-                let dst_phys = cloned
-                    .translate_user(virt)
-                    .ok_or(AddressSpaceError::NotMapped)?;
-                unsafe {
-                    ptr::copy_nonoverlapping(
-                        higher_half_ptr(src_phys),
-                        higher_half_ptr(dst_phys),
-                        PAGE_4KIB,
-                    );
-                }
-            }
-        }
-        // IRQ-off anonymous leaves are owned by their tagged PTEs rather than
-        // the legacy Vec ledger: collect them only in this normal clone path.
-        //
-        // The copy carries the tag forward, so the child's inherited page is
-        // indistinguishable from one the child faulted in itself.  It has to
-        // be: the child also inherits the pager VMA covering this range, and
-        // the range edits that VMA owns - `unmap_present_prepared_pager_fault_
-        // pages_at` and its protect counterpart - accept only tagged leaves,
-        // so an untagged copy inside a live VMA would make the child's own
-        // `munmap` of an inherited range fail.  Tagging is not double
-        // ownership: this path installs through `map_prepared_pager_fault_
-        // frame_at`, which does not enter `owned_frames`, so retirement frees
-        // the frame exactly once, through the tag walk.
-        for leaf in self.pager_fault_ownership()?.leaves {
+        for leaf in ownership.leaves {
             let virt = VirtAddr::new(leaf.virtual_address);
-            let (src_phys, flags) = self
-                .translate_user_with_flags(virt)
-                .ok_or(AddressSpaceError::NotMapped)?;
-            if src_phys.as_u64() != leaf.physical_address {
+            let Some((src_phys, flags)) = self.translate_user_with_flags(virt) else {
+                rollback_cloned_leaves(&mut cloned, &cloned_leaves);
+                drop(mutation);
+                return Err(AddressSpaceError::NotMapped);
+            };
+            if src_phys.as_u64() != leaf.physical_address
+                || !phys::data_leaf_is_owned(
+                    self.pml4_frame_phys,
+                    leaf.virtual_address,
+                    leaf.physical_address,
+                )
+            {
+                rollback_cloned_leaves(&mut cloned, &cloned_leaves);
+                drop(mutation);
                 return Err(AddressSpaceError::InvalidFrameOwnership);
             }
-            let dst_phys = phys::alloc_frame().ok_or(AddressSpaceError::OutOfFrames)?;
-            // SAFETY: both frames are 4 KiB, direct-mapped, and distinct - the
-            // destination was just allocated and is reachable only from here
-            // until the publication below.
+
+            let eager_private = user_regions_contain(eager_private_ranges, virt);
+            let inherited_cow = if flags.contains(COW_USER_LEAF) {
+                match phys::data_leaf_cow_identity(
+                    self.pml4_frame_phys,
+                    leaf.virtual_address,
+                    leaf.physical_address,
+                ) {
+                    Some(identity) => Some(identity),
+                    None => {
+                        rollback_cloned_leaves(&mut cloned, &cloned_leaves);
+                        drop(mutation);
+                        return Err(AddressSpaceError::InvalidFrameOwnership);
+                    }
+                }
+            } else {
+                None
+            };
+            let shared_identity = if eager_private {
+                None
+            } else {
+                inherited_cow.or_else(|| {
+                    user_regions_contain(cow_ranges, virt)
+                        .then_some((phys::CowFrameKind::AnonymousFork, 0))
+                })
+            };
+
+            if let Some((kind, backing_identity)) = shared_identity {
+                let Some(ticket) = phys::prepare_shared_alias(
+                    self.pml4_frame_phys,
+                    leaf.virtual_address,
+                    cloned.pml4_frame_phys,
+                    leaf.virtual_address,
+                    leaf.physical_address,
+                    kind,
+                    backing_identity,
+                ) else {
+                    rollback_cloned_leaves(&mut cloned, &cloned_leaves);
+                    drop(mutation);
+                    return Err(AddressSpaceError::OutOfFrames);
+                };
+                if let Err(error) =
+                    cloned.map_shared_cow_leaf_without_mutation(virt, leaf.physical_address, flags)
+                {
+                    phys::cancel_shared_alias(ticket);
+                    rollback_cloned_leaves(&mut cloned, &cloned_leaves);
+                    drop(mutation);
+                    return Err(error);
+                }
+                phys::publish_shared_alias(ticket);
+                cloned_leaves.push(ClonedLeaf {
+                    virtual_address: virt,
+                    child_frame_phys: leaf.physical_address,
+                    shared_alias: Some(ticket),
+                });
+                continue;
+            }
+
+            let Some(dst_phys) = phys::alloc_frame() else {
+                rollback_cloned_leaves(&mut cloned, &cloned_leaves);
+                drop(mutation);
+                return Err(AddressSpaceError::OutOfFrames);
+            };
+            let child_root = cloned.pml4_frame_phys;
+            if !phys::claim_data_leaf(child_root, leaf.virtual_address, dst_phys.as_u64()) {
+                phys::free_frame(dst_phys);
+                rollback_cloned_leaves(&mut cloned, &cloned_leaves);
+                drop(mutation);
+                return Err(AddressSpaceError::InvalidFrameOwnership);
+            }
             unsafe {
                 ptr::copy_nonoverlapping(
                     higher_half_ptr(src_phys),
@@ -221,22 +288,71 @@ impl ProcessAddressSpace {
                     PAGE_4KIB,
                 );
             }
-            if let Err(error) = cloned.map_prepared_pager_fault_frame_at(
-                virt,
-                dst_phys.as_u64(),
-                without_irq_off_pager_fault_tag(flags),
-            ) {
-                // The frame is in no ledger yet, so nothing else can return it.
+            let inherited_flags = without_root_owned_user_leaf_tag(flags);
+            let child_source_flags = if eager_private {
+                inherited_flags
+                    .difference(COW_USER_LEAF)
+                    .union(PageTableFlags::WRITABLE)
+            } else {
+                inherited_flags
+            };
+            let child_flags = match normalize_user_page_flags(child_source_flags) {
+                Ok(flags) => flags | ROOT_OWNED_USER_LEAF,
+                Err(error) => {
+                    phys::cancel_data_leaf(child_root, leaf.virtual_address, dst_phys.as_u64());
+                    phys::free_frame(dst_phys);
+                    rollback_cloned_leaves(&mut cloned, &cloned_leaves);
+                    drop(mutation);
+                    return Err(error);
+                }
+            };
+            if let Err(error) = cloned.map_user_page(virt, dst_phys, child_flags) {
+                phys::cancel_data_leaf(child_root, leaf.virtual_address, dst_phys.as_u64());
                 phys::free_frame(dst_phys);
+                rollback_cloned_leaves(&mut cloned, &cloned_leaves);
+                drop(mutation);
                 return Err(error);
             }
+            phys::publish_data_leaf(child_root, leaf.virtual_address, dst_phys.as_u64());
+            cloned_leaves.push(ClonedLeaf {
+                virtual_address: virt,
+                child_frame_phys: dst_phys.as_u64(),
+                shared_alias: None,
+            });
         }
 
-        Ok(cloned)
-    }
+        for leaf in cloned_leaves
+            .iter()
+            .filter(|leaf| leaf.shared_alias.is_some())
+        {
+            let old_flags = match self.user_page_flags(leaf.virtual_address) {
+                Ok(flags) => flags,
+                Err(error) => {
+                    restore_parent_flags(self, &downgraded);
+                    rollback_cloned_leaves(&mut cloned, &cloned_leaves);
+                    drop(mutation);
+                    return Err(error);
+                }
+            };
+            let cow_flags = old_flags
+                .difference(PageTableFlags::WRITABLE)
+                .union(ROOT_OWNED_USER_LEAF | COW_USER_LEAF);
+            if let Err(error) =
+                self.set_user_page_flags_exact_without_flush(leaf.virtual_address, cow_flags)
+            {
+                restore_parent_flags(self, &downgraded);
+                rollback_cloned_leaves(&mut cloned, &cloned_leaves);
+                drop(mutation);
+                return Err(error);
+            }
+            downgraded.push((leaf.virtual_address, old_flags));
+        }
 
-    pub fn regions(&self) -> &[UserRegion] {
-        &self.regions
+        // Drop performs the one parent-root shootdown and waits for every CPU
+        // that could retain a writable translation before the child can later
+        // become runnable.
+        drop(mutation);
+        Ok(cloned)
     }
 
     pub fn alloc_user_bytes(
@@ -282,29 +398,13 @@ impl ProcessAddressSpace {
     ) -> Result<UserRegion, AddressSpaceError> {
         validate_user_page_range(start, page_count)?;
 
-        let page_flags = normalize_user_page_flags(flags)?;
+        let page_flags = normalize_user_page_flags(flags)? | ROOT_OWNED_USER_LEAF;
         let mut mapped_pages = Vec::new();
         mapped_pages
             .try_reserve_exact(page_count)
             .map_err(|_| AddressSpaceError::OutOfFrames)?;
-        // Exactly the leaves this call will track. Intermediate tables are
-        // owned by `ROOT_OWNED_USER_TABLE` and the root lazy-table ledger, not
-        // by `owned_frames`, and retirement fails stop if one ever appears in
-        // both - so reserving table capacity here reserved for a push that
-        // cannot happen.
-        self.owned_frames
-            .try_reserve_exact(page_count)
-            .map_err(|_| AddressSpaceError::OutOfFrames)?;
-        self.regions
-            .try_reserve(1)
-            .map_err(|_| AddressSpaceError::OutOfFrames)?;
         let mutation = begin_address_space_mutation(self.root_phys());
 
-        // Frames are allocated in chunks under one `PHYS_ALLOCATOR` acquisition
-        // instead of one per page: this loop maps each page independently, so
-        // nothing downstream needs the frames to be physically adjacent, and a
-        // large mapping otherwise pays one tracked-lock acquire/release pair
-        // per 4 KiB page.
         let mut frame_buffer = [PhysAddr::new(0); FRAME_BATCH_CHUNK];
         let mut frame_buffer_len = 0usize;
         let mut frame_buffer_pos = 0usize;
@@ -333,26 +433,25 @@ impl ProcessAddressSpace {
                 ptr::write_bytes(higher_half_ptr(frame_phys), 0, PAGE_4KIB);
             }
 
+            let virtual_address = virt.as_u64();
+            if !phys::claim_data_leaf(self.pml4_frame_phys, virtual_address, frame_phys.as_u64()) {
+                phys::free_frame(frame_phys);
+                free_frame_buffer_tail(&frame_buffer[frame_buffer_pos..frame_buffer_len]);
+                rollback_user_pages(self, &mapped_pages, mutation);
+                return Err(AddressSpaceError::InvalidFrameOwnership);
+            }
             if let Err(err) = self.map_user_page(virt, frame_phys, page_flags) {
+                phys::cancel_data_leaf(self.pml4_frame_phys, virtual_address, frame_phys.as_u64());
                 phys::free_frame(frame_phys);
                 free_frame_buffer_tail(&frame_buffer[frame_buffer_pos..frame_buffer_len]);
                 rollback_user_pages(self, &mapped_pages, mutation);
                 return Err(err);
             }
-
+            phys::publish_data_leaf(self.pml4_frame_phys, virtual_address, frame_phys.as_u64());
             mapped_pages.push((virt, frame_phys.as_u64()));
         }
 
-        for &(_, frame_phys) in &mapped_pages {
-            if let Err(err) = track_owned_frame(&mut self.owned_frames, frame_phys) {
-                rollback_user_pages(self, &mapped_pages, mutation);
-                return Err(err);
-            }
-        }
-
-        let region = UserRegion { start, page_count };
-        self.regions.push(region);
-        Ok(region)
+        Ok(UserRegion { start, page_count })
     }
 
     pub fn map_existing_user_pages_at(
@@ -403,11 +502,6 @@ impl ProcessAddressSpace {
         mapped_pages
             .try_reserve_exact(frames.len())
             .map_err(|_| AddressSpaceError::OutOfFrames)?;
-        // External frames stay owned by their backing object, so this path
-        // pushes nothing into `owned_frames` and reserves nothing in it.
-        self.regions
-            .try_reserve(1)
-            .map_err(|_| AddressSpaceError::OutOfFrames)?;
         let mutation = begin_address_space_mutation(self.root_phys());
 
         for (page_index, frame_phys) in frames.iter().copied().enumerate() {
@@ -423,12 +517,10 @@ impl ProcessAddressSpace {
             mapped_pages.push(virt);
         }
 
-        let region = UserRegion {
+        Ok(UserRegion {
             start,
             page_count: frames.len(),
-        };
-        self.regions.push(region);
-        Ok(region)
+        })
     }
 
     pub fn unmap_user_bytes(
@@ -445,43 +537,47 @@ impl ProcessAddressSpace {
         start: VirtAddr,
         page_count: usize,
     ) -> Result<usize, AddressSpaceError> {
-        validate_user_page_range(start, page_count)?;
-
-        let updated_regions = self.plan_region_subtraction(start, page_count)?;
-        let mut frames = Vec::new();
-        frames
-            .try_reserve_exact(page_count)
-            .map_err(|_| AddressSpaceError::OutOfFrames)?;
-        for page_index in 0..page_count {
-            let virt = page_addr(start, page_index)?;
+        let frames = plan_user_page_unmap(start, page_count, |virt| {
             let phys = self
                 .translate_user(virt)
                 .ok_or(AddressSpaceError::NotMapped)?;
-            if phys.as_u64() % PAGE_4KIB_U64 != 0 {
-                return Err(AddressSpaceError::NotMapped);
-            }
-            if !self.owned_frames.contains(&phys.as_u64()) || frames.contains(&phys.as_u64()) {
+            if phys.as_u64() % PAGE_4KIB_U64 != 0
+                || !phys::data_leaf_is_owned(self.pml4_frame_phys, virt.as_u64(), phys.as_u64())
+            {
                 return Err(AddressSpaceError::InvalidFrameOwnership);
             }
-            frames.push(phys.as_u64());
-        }
+            Ok(phys)
+        })?;
+        let mut reusable_frames = Vec::new();
+        reusable_frames
+            .try_reserve_exact(frames.len())
+            .map_err(|_| AddressSpaceError::OutOfFrames)?;
 
         let mutation = begin_address_space_mutation(self.root_phys());
-        for page_index in 0..page_count {
-            let virt = page_addr(start, page_index)?;
+        for (page_index, frame_phys) in frames.iter().copied().enumerate() {
+            let virtual_address = page_addr(start, page_index)
+                .expect("validated unmap range changed while removing leaves")
+                .as_u64();
             let unmapped = self
-                .unmap_user_page(virt)
+                .unmap_user_page(VirtAddr::new(virtual_address))
                 .ok_or(AddressSpaceError::NotMapped)?;
-            debug_assert_eq!(Some(unmapped.as_u64()), frames.get(page_index).copied());
+            debug_assert_eq!(unmapped.as_u64(), frame_phys);
         }
         let _flushed_mutation = mutation.flush_for_reclaim();
 
-        for &frame_phys in &frames {
-            remove_owned_frame(&mut self.owned_frames, frame_phys)?;
+        for (page_index, frame_phys) in frames.iter().copied().enumerate() {
+            let virtual_address = page_addr(start, page_index)
+                .expect("validated unmap range changed while releasing descriptors")
+                .as_u64();
+            match phys::release_data_leaf(self.pml4_frame_phys, virtual_address, frame_phys) {
+                Some(phys::DataLeafRelease::FrameReusable) => {
+                    reusable_frames.push(frame_phys);
+                }
+                Some(phys::DataLeafRelease::FrameRetained) => {}
+                None => panic!("unmapped data leaf lost exact descriptor ownership"),
+            }
         }
-        free_owned_frames_exact(&frames);
-
-        self.regions = updated_regions;
+        free_removed_frames_exact(&reusable_frames);
         Ok(page_count)
     }
 
@@ -491,8 +587,6 @@ impl ProcessAddressSpace {
         page_count: usize,
     ) -> Result<usize, AddressSpaceError> {
         validate_user_page_range(start, page_count)?;
-
-        let updated_regions = self.plan_region_subtraction(start, page_count)?;
         for page_index in 0..page_count {
             let virt = page_addr(start, page_index)?;
             let phys = self
@@ -509,8 +603,6 @@ impl ProcessAddressSpace {
             self.unmap_user_page(virt)
                 .ok_or(AddressSpaceError::NotMapped)?;
         }
-
-        self.regions = updated_regions;
         Ok(page_count)
     }
 
@@ -715,40 +807,50 @@ impl ProcessAddressSpace {
         virt: VirtAddr,
         flags: PageTableFlags,
     ) -> Result<(), AddressSpaceError> {
-        validate_user_page_range(virt, 1)?;
+        // Bit 7 is PS in a directory entry, but PAT in a 4-KiB leaf PTE.
+        // Preserve it across mprotect so a write-combine external mapping
+        // cannot silently become write-back and create conflicting aliases.
+        // Software ownership and COW tags are likewise lifecycle evidence,
+        // not protection requested by mprotect, and may never be detached.
+        let existing = self.user_page_flags(virt)?;
+        self.set_user_page_flags_exact_without_flush(virt, preserve_4k_leaf_pat(existing, flags))?;
+        self.flush_if_active(virt);
+        Ok(())
+    }
 
+    fn user_page_flags(&self, virt: VirtAddr) -> Result<PageTableFlags, AddressSpaceError> {
+        self.translate_user_with_flags(virt)
+            .map(|(_, flags)| flags)
+            .ok_or(AddressSpaceError::NotMapped)
+    }
+
+    fn set_user_page_flags_exact_without_flush(
+        &mut self,
+        virt: VirtAddr,
+        flags: PageTableFlags,
+    ) -> Result<(), AddressSpaceError> {
+        validate_user_page_range(virt, 1)?;
         let root = unsafe { kernel_vm::phys_to_table_mut(self.root_phys()) };
         let pml4_entry = &mut root[p4_index(virt)];
         if pml4_entry.is_unused() || pml4_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
             return Err(AddressSpaceError::NotMapped);
         }
-
         let pdpt = unsafe { kernel_vm::phys_to_table_mut(pml4_entry.addr()) };
         let pdpt_entry = &mut pdpt[p3_index(virt)];
         if pdpt_entry.is_unused() || pdpt_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
             return Err(AddressSpaceError::NotMapped);
         }
-
         let pd = unsafe { kernel_vm::phys_to_table_mut(pdpt_entry.addr()) };
         let pd_entry = &mut pd[p2_index(virt)];
         if pd_entry.is_unused() || pd_entry.flags().contains(PageTableFlags::HUGE_PAGE) {
             return Err(AddressSpaceError::NotMapped);
         }
-
         let pt = unsafe { kernel_vm::phys_to_table_mut(pd_entry.addr()) };
         let pt_entry = &mut pt[p1_index(virt)];
         if pt_entry.is_unused() {
             return Err(AddressSpaceError::NotMapped);
         }
-
-        // Bit 7 is PS in a directory entry, but PAT in a 4-KiB leaf PTE.
-        // Preserve it across mprotect so a write-combine external mapping
-        // cannot silently become write-back and create conflicting aliases.
-        pt_entry.set_addr(
-            pt_entry.addr(),
-            preserve_4k_leaf_pat(pt_entry.flags(), flags),
-        );
-        self.flush_if_active(virt);
+        pt_entry.set_addr(pt_entry.addr(), flags);
         Ok(())
     }
 
@@ -786,62 +888,47 @@ impl ProcessAddressSpace {
         self.flush_if_active(virt);
         Some(frame_phys)
     }
+}
 
-    fn plan_region_subtraction(
-        &self,
-        start: VirtAddr,
-        page_count: usize,
-    ) -> Result<Vec<UserRegion>, AddressSpaceError> {
-        let end = page_addr(start, page_count)?;
-        let start_u64 = start.as_u64();
-        let end_u64 = end.as_u64();
-        let capacity = self
-            .regions
-            .len()
-            .checked_add(1)
-            .ok_or(AddressSpaceError::AddressOverflow)?;
-        let mut updated = Vec::new();
-        updated
-            .try_reserve_exact(capacity)
-            .map_err(|_| AddressSpaceError::OutOfFrames)?;
-        let mut touched = false;
+fn user_regions_contain(regions: &[UserRegion], address: VirtAddr) -> bool {
+    let index = regions.partition_point(|region| region.start <= address);
+    index != 0 && address < regions[index - 1].end()
+}
 
-        for region in self.regions.iter().copied() {
-            let region_start = region.start.as_u64();
-            let region_end = region.end().as_u64();
-            if end_u64 <= region_start || start_u64 >= region_end {
-                updated.push(region);
-                continue;
-            }
+fn restore_parent_flags(
+    space: &mut ProcessAddressSpace,
+    downgraded: &[(VirtAddr, PageTableFlags)],
+) {
+    for (virt, flags) in downgraded.iter().rev().copied() {
+        space
+            .set_user_page_flags_exact_without_flush(virt, flags)
+            .expect("fork COW rollback lost a parent leaf");
+    }
+}
 
-            touched = true;
-
-            if start_u64 > region_start {
-                let left_pages = ((start_u64 - region_start) / PAGE_4KIB_U64) as usize;
-                if left_pages != 0 {
-                    updated.push(UserRegion {
-                        start: region.start,
-                        page_count: left_pages,
-                    });
-                }
-            }
-
-            if end_u64 < region_end {
-                let right_pages = ((region_end - end_u64) / PAGE_4KIB_U64) as usize;
-                if right_pages != 0 {
-                    updated.push(UserRegion {
-                        start: VirtAddr::new(end_u64),
-                        page_count: right_pages,
-                    });
-                }
-            }
+fn rollback_cloned_leaves(space: &mut ProcessAddressSpace, leaves: &[ClonedLeaf]) {
+    for leaf in leaves.iter().rev().copied() {
+        let unmapped = space
+            .unmap_user_page(leaf.virtual_address)
+            .expect("fork COW rollback lost a child leaf");
+        assert_eq!(unmapped.as_u64(), leaf.child_frame_phys);
+        if let Some(ticket) = leaf.shared_alias {
+            assert!(
+                phys::rollback_shared_alias(ticket),
+                "fork COW rollback lost a shared alias"
+            );
+        } else {
+            assert_eq!(
+                phys::release_data_leaf(
+                    space.pml4_frame_phys,
+                    leaf.virtual_address.as_u64(),
+                    leaf.child_frame_phys,
+                ),
+                Some(phys::DataLeafRelease::FrameReusable),
+                "fork COW rollback lost an exclusive child leaf"
+            );
+            phys::free_frame(PhysAddr::new(leaf.child_frame_phys));
         }
-
-        if !touched {
-            return Err(AddressSpaceError::NotMapped);
-        }
-
-        Ok(updated)
     }
 }
 
@@ -895,8 +982,6 @@ fn ensure_next_table(
     }
 }
 
-
-
 fn validate_user_page_range(start: VirtAddr, page_count: usize) -> Result<(), AddressSpaceError> {
     if page_count == 0 {
         return Err(AddressSpaceError::ZeroSizedAllocation);
@@ -927,6 +1012,24 @@ where
     F: FnMut(usize) -> bool,
 {
     (0..page_count).all(&mut page_is_present)
+}
+
+fn plan_user_page_unmap(
+    start: VirtAddr,
+    page_count: usize,
+    mut resolve_owned: impl FnMut(VirtAddr) -> Result<PhysAddr, AddressSpaceError>,
+) -> Result<Vec<u64>, AddressSpaceError> {
+    validate_user_page_range(start, page_count)?;
+    let mut frames = Vec::new();
+    frames
+        .try_reserve_exact(page_count)
+        .map_err(|_| AddressSpaceError::OutOfFrames)?;
+    for page_index in 0..page_count {
+        let virt = page_addr(start, page_index)?;
+        let phys = resolve_owned(virt)?;
+        frames.push(phys.as_u64());
+    }
+    Ok(frames)
 }
 
 fn byte_len_to_page_count(byte_len: usize) -> Result<usize, AddressSpaceError> {
@@ -1025,7 +1128,13 @@ fn normalize_user_page_flags(flags: PageTableFlags) -> Result<PageTableFlags, Ad
 }
 
 fn preserve_4k_leaf_pat(existing: PageTableFlags, requested: PageTableFlags) -> PageTableFlags {
-    requested | (existing & PageTableFlags::HUGE_PAGE)
+    let preserved =
+        requested | (existing & (PageTableFlags::HUGE_PAGE | ROOT_OWNED_USER_LEAF | COW_USER_LEAF));
+    if existing.contains(COW_USER_LEAF) {
+        preserved.difference(PageTableFlags::WRITABLE)
+    } else {
+        preserved
+    }
 }
 
 enum UserPageLookup {
@@ -1136,104 +1245,4 @@ pub fn smoke_test() {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn byte_len_to_page_count_rounds_up() {
-        assert_eq!(byte_len_to_page_count(1).unwrap(), 1);
-        assert_eq!(byte_len_to_page_count(PAGE_4KIB).unwrap(), 1);
-        assert_eq!(byte_len_to_page_count(PAGE_4KIB + 1).unwrap(), 2);
-    }
-
-    #[test]
-    fn validate_user_page_range_rejects_unaligned_or_oob() {
-        assert_eq!(
-            validate_user_page_range(VirtAddr::new(USER_SPACE_BASE + 1), 1),
-            Err(AddressSpaceError::AddressNotPageAligned)
-        );
-        assert_eq!(
-            validate_user_page_range(VirtAddr::new(USER_SPACE_END_EXCLUSIVE), 1),
-            Err(AddressSpaceError::AddressOutOfRange)
-        );
-        assert!(validate_user_page_range(VirtAddr::new(USER_SPACE_BASE), 1).is_ok());
-    }
-
-    #[test]
-    fn user_page_flags_enforce_wx_and_reject_huge_pages() {
-        assert_eq!(
-            normalize_user_page_flags(PageTableFlags::WRITABLE),
-            Err(AddressSpaceError::ProtectionViolation)
-        );
-        assert_eq!(
-            normalize_user_page_flags(PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE),
-            Ok(PageTableFlags::PRESENT
-                | PageTableFlags::USER_ACCESSIBLE
-                | PageTableFlags::WRITABLE
-                | PageTableFlags::NO_EXECUTE)
-        );
-        assert_eq!(
-            normalize_user_page_flags(PageTableFlags::HUGE_PAGE | PageTableFlags::NO_EXECUTE),
-            Err(AddressSpaceError::HugePageConflict)
-        );
-    }
-
-    #[test]
-    fn mprotect_preserves_write_combine_pat_on_4k_leaf() {
-        let existing = PageTableFlags::PRESENT
-            | PageTableFlags::USER_ACCESSIBLE
-            | PageTableFlags::WRITABLE
-            | PageTableFlags::NO_EXECUTE
-            | PageTableFlags::HUGE_PAGE;
-        let requested =
-            PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE | PageTableFlags::NO_EXECUTE;
-        let preserved = preserve_4k_leaf_pat(existing, requested);
-        assert!(preserved.contains(PageTableFlags::HUGE_PAGE));
-        assert!(!preserved.contains(PageTableFlags::WRITABLE));
-    }
-
-    #[test]
-    fn protection_span_preflight_rejects_a_hole_before_commit() {
-        let mut visited = 0;
-        let accepted = validate_protection_span(4, |page_index| {
-            assert_eq!(page_index, visited);
-            visited += 1;
-            page_index != 2
-        });
-        assert!(!accepted);
-        assert_eq!(visited, 3);
-
-        assert!(validate_protection_span(4, |_| true));
-    }
-
-    #[test]
-    fn unmap_region_plan_is_complete_before_metadata_commit() {
-        let mut space = ProcessAddressSpace::empty_for_tests();
-        let start = VirtAddr::new(USER_SPACE_BASE);
-        space.regions.push(UserRegion {
-            start,
-            page_count: 4,
-        });
-        let original = space.regions.clone();
-
-        let plan = space
-            .plan_region_subtraction(VirtAddr::new(USER_SPACE_BASE + PAGE_4KIB_U64), 2)
-            .unwrap();
-        assert_eq!(space.regions, original);
-        assert_eq!(plan.len(), 2);
-        assert_eq!(
-            plan[0],
-            UserRegion {
-                start,
-                page_count: 1,
-            }
-        );
-        assert_eq!(
-            plan[1],
-            UserRegion {
-                start: VirtAddr::new(USER_SPACE_BASE + 3 * PAGE_4KIB_U64),
-                page_count: 1,
-            }
-        );
-    }
-}
+mod tests;

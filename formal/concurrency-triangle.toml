@@ -79,7 +79,7 @@ model = "pager-frame-grant-lifecycle/PagerFrameGrantLifecycle"
 source = "kernel/mm/src/memory/frame_capability.rs"
 source_symbol = "reserve"
 source_anchors = [
-  "|available| available.checked_sub(1),",
+  "available.checked_sub(1)",
   "let frame_phys = self.frames[index].swap(0, Ordering::AcqRel);",
 ]
 invariant = "the availability count authorizes exactly one claimer per frame and a granted claim always finds one"

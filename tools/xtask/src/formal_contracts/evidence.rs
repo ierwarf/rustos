@@ -507,7 +507,9 @@ pub(super) fn source_tree_hash(root: &Path) -> Result<String> {
         })
         .collect::<Result<Vec<_>>>()?;
     paths.sort();
-    paths.retain(|relative| !exempt.iter().any(|entry| entry == relative));
+    paths.retain(|relative| {
+        !exempt.iter().any(|entry| entry == relative) && root.join(relative).is_file()
+    });
     let mut hasher = Sha256::new();
     for relative in paths {
         hasher.update(relative.as_bytes());

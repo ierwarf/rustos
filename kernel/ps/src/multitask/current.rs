@@ -35,9 +35,9 @@ pub use ipc::{
 };
 pub use pager::{
     PagerChargeSnapshot, current_pager_charge_snapshot, current_pager_fault_install_permit,
-    current_pager_vma_snapshot, pager_vma_regions_for_process,
-    publish_current_pager_vma, publish_pager_vma_for_process, revoke_current_pager_vma,
-    revoke_pager_vma_for_process,
+    current_pager_vma_snapshot, pager_vma_regions_for_process, publish_current_pager_vma,
+    publish_inherited_pager_vma_for_process, publish_pager_vma_for_process,
+    revoke_current_pager_vma, revoke_pager_vma_for_process,
 };
 
 use super::cpu_local;
@@ -835,6 +835,28 @@ pub fn with_process_state_by_pid_mut<R>(
     process_table::with_process_state_by_pid_mut(process_id, f)
 }
 
+/// Serializes a Linux fork snapshot against both process-state page-table
+/// mutation and the parent's complete VMA publication. Every live VMA remains
+/// at an odd sequence while `f` runs, so concurrent faults retry instead of
+/// observing a temporary reservation hole.
+pub fn with_fork_parent_state<R>(
+    process_id: u64,
+    f: impl FnOnce(&mut UserProcessState, &[rustos_user_abi::pager::PagerVmRegionWire]) -> R,
+) -> Result<R, super::pager_vma::PagerVmaError> {
+    let retained = process_table::retain_process_by_pid(process_id)
+        .ok_or(super::pager_vma::PagerVmaError::Stale)?;
+    let identity = retained
+        .live_identity()
+        .ok_or(super::pager_vma::PagerVmaError::Stale)?;
+    retained
+        .with_visible_state_mut(|_, state| {
+            super::pager_vma::with_fork_held_regions(retained.handle(), identity, |regions| {
+                f(state, regions)
+            })
+        })
+        .ok_or(super::pager_vma::PagerVmaError::Stale)?
+}
+
 pub fn note_process_exit_status(process_id: u64, status: i32) -> Option<()> {
     process_table::note_process_exit_status(process_id, status)
 }
@@ -901,14 +923,33 @@ pub fn with_current_mm<R>(f: impl FnOnce(&ProcessAddressSpace) -> R) -> Option<R
     })?;
     let identified =
         user_copy_profile::charge(user_copy_profile::UserCopyPhase::BindIdentity, entry);
-    let result = process_table::with_own_visible_state(process_handle, |state| {
-        // Charged inside the closure so the phase ends once the per-process
-        // state lock is held and visibility has been re-tested, not when the
-        // caller's own work finishes.
+    process_table::with_own_visible_state(process_handle, |state| {
         user_copy_profile::charge(user_copy_profile::UserCopyPhase::BindVisible, identified);
         f(state.address_space())
-    });
-    result
+    })
+}
+
+/// Write-capable user-copy bind. Exact identity is sampled before the state
+/// lock and rechecked after acquisition, so the COW slow path never takes
+/// lifecycle authority recursively under ProcessStateLock.
+pub(crate) fn with_current_user_copy_mm<R>(
+    f: impl FnOnce(&super::UserCopyAddressSpace<'_>) -> R,
+) -> Option<R> {
+    let (_, _, process_handle, _) = interrupts::without_interrupts(|| {
+        if let Some(identity) = published_current_identity() {
+            return identity.user_binding();
+        }
+        // SAFETY: interrupts are masked, so the current slot is stable.
+        unsafe { scheduler_ref().current_user_process_binding() }
+    })?;
+    let identity = process_table::published_live_process_identity(process_handle)?;
+    super::process_table::with_own_exact_visible_state(process_handle, identity, |state| {
+        f(&super::UserCopyAddressSpace::new(
+            state.address_space(),
+            process_handle,
+            identity,
+        ))
+    })
 }
 
 pub fn with_current_process_credentials<R>(

@@ -170,11 +170,9 @@ fn current_process_owns_pager_endpoint() -> bool {
 /// Records the pager's anonymous-mapping policy.
 ///
 /// Ring0 keeps the enforcement and applies its own default until this lands,
-/// so a pager that never publishes changes nothing. The publication is
-/// one-shot: it is read from the IRQ-off fault path with a single acquire and
-/// no seqlock, which is only sound while the fields cannot change under a
-/// reader. A pager sets this during startup, before the processes it governs
-/// exist.
+/// so a pager that never publishes changes nothing. Publication uses an
+/// odd/even coherent snapshot. Normal readers retry; the only IRQ-off reader
+/// tries twice and falls back to the compiled-in fault-around length.
 fn broker_set_anon_policy(args: &RustosMmBrokerArgs) -> Result<(), i64> {
     if args.addr == 0 {
         return Err(LINUX_EINVAL);
@@ -191,22 +189,14 @@ fn broker_set_anon_policy(args: &RustosMmBrokerArgs) -> Result<(), i64> {
     Ok(())
 }
 
-/// Publishes a forked child's inherited anonymous reservation.
+/// Publishes every VMA inherited by a suspended fork child.
 ///
-/// What a child inherits is the reservation, not the resident set.  Before
-/// this, `fork` copied only the pages the parent had already touched, and the
-/// child's first touch of an untouched inherited page found no VMA, was
-/// refused, and retired the thread — so whether a fork survived depended on
-/// the parent's touch order.  Linux copies the `vm_area_struct` set in
-/// `dup_mmap` and only then the page tables.
-///
-/// Called after the child pid exists and before the child is activated, so a
-/// failure is invisible: it revokes what it published and the caller destroys
-/// the child.  Revoking is not optional even though the child is about to be
-/// terminated — process-slot reclamation does not purge this table, so residue
-/// would sit in the child's slots and refuse a later mapping of the same range
-/// as an overlap.
-pub(super) fn inherit_anonymous_pager_vmas(
+/// What a child inherits is the complete reservation set, including untouched,
+/// reserved, deny-all, file-backed, and image-section ranges. Resident leaves
+/// were already cloned by `clone_user_space_cow`, so this fork-only publication
+/// deliberately does not require an empty target page table. Any partial
+/// publication is revoked before the caller destroys the still-suspended child.
+pub(super) fn inherit_pager_vmas(
     child_pid: u64,
     parent_regions: &[rustos_user_abi::pager::PagerVmRegionWire],
 ) -> Result<(), i64> {
@@ -215,40 +205,7 @@ pub(super) fn inherit_anonymous_pager_vmas(
         .try_reserve_exact(parent_regions.len())
         .map_err(|_| LINUX_ENOMEM)?;
     for region in parent_regions {
-        // Anonymous private is the only class `region_template` can publish,
-        // so anything else is a class this path has never been proven for.
-        // Fail the fork rather than drop the range and hand the child a hole.
-        if region.object.object_type != rustos_user_abi::pager::VM_OBJECT_ANONYMOUS
-            || region.sharing != rustos_user_abi::pager::VM_SHARING_PRIVATE
-        {
-            revoke_inherited_pager_vmas(child_pid, &published);
-            return Err(LINUX_ENOMEM);
-        }
-        // A deny-all region is `mprotect(PROT_NONE)`'s ring0 residue, and it
-        // is not a publishable template: `template_is_canonical` requires a
-        // nonzero protection, and a rights-free region is not a canonical wire
-        // region on either replica. Omitting it keeps the child's deny
-        // outcome - a touch with no covering VMA is refused exactly as a
-        // covering deny-all VMA would refuse it - but it does not carry over
-        // the *reservation* half, so ring0 alone would treat the child's guard
-        // span as re-mappable. The Linux-side reserved-range and region state
-        // that `fork_clone` copies is what still refuses to hand it out, so
-        // the guard survives at the layer `mmap` actually consults. Failing
-        // the fork instead would break every process that guards a stack.
-        if region.prot == 0 {
-            continue;
-        }
-        // Rights come from the region's current protection, not from
-        // `object.rights`. `apply_region_edit` is attenuation-only - a replica
-        // may never hand back more than the region carried - so the parent
-        // could not widen past this either, and the child inherits no
-        // authority the parent had already given up.
-        match pager_admission::admit_inherited_anonymous_region(
-            child_pid,
-            region.start,
-            region.end,
-            region.prot,
-        ) {
+        match pager_admission::admit_inherited_region(child_pid, *region) {
             Ok(child_region) => published.push((child_region.start, child_region.vma_generation)),
             Err(errno) => {
                 revoke_inherited_pager_vmas(child_pid, &published);
@@ -273,102 +230,76 @@ fn broker_map_anon(args: &RustosMmBrokerArgs) -> Result<(), i64> {
     let mapping_end = checked_mapping_end(start, page_count)?;
     let page_flags = protection_to_page_flags(args.prot)?;
 
-    // Anonymous mappings are admitted to pagerd before publication. Fault
-    // dispatch is kernel-originated and pagerd positively authenticates the
-    // receive-side `(0, 0)` ring0 identity for FAULT_RESOLVE; user-originated
-    // BACKING_OBJECT requests retain exact nonzero subject authentication.
-    const PAGER_DEMAND_ADMISSION_WIRED: bool = true;
-    // The pager may not be a client of the transport it is the only server
-    // for. If pagerd's own anonymous memory were demand-backed, its first
-    // touch would park pagerd on a fault that only pagerd can resolve, and
-    // every later fault in the system would stall behind it - the classic
-    // external-pager self-deadlock. Nothing else in the system can break that
-    // cycle, so the exclusion is enforced here at admission rather than left
-    // to pagerd happening not to allocate. Its mapping falls through to the
-    // eager path below, exactly as it did before demand paging existed.
-    let target_is_pager = ipc_ops::process_owns_pager_policy(args.target_pid);
-    if PAGER_DEMAND_ADMISSION_WIRED && !target_is_pager && args.prot != 0 {
-        let mut admission =
+    // Every post-bootstrap anonymous mapping is first represented in the
+    // process VMA authority. Policy decides only whether committed pages are
+    // populated eagerly or on first touch.
+    let mut admission =
+        pager_admission::admit_anonymous_region(args.target_pid, start, mapping_end, args.prot);
+    if matches!(
+        admission,
+        pager_admission::AnonymousAdmission::Eager(
+            pager_admission::EagerByContract::StaleRegionOverlap
+        )
+    ) {
+        // MAP_FIXED replacement withdraws the old reservation and its present
+        // leaves, then makes exactly one fresh admission attempt.
+        let _ = multitask::unmap_pager_vma_for_process(args.target_pid, start, mapping_end);
+        admission =
             pager_admission::admit_anonymous_region(args.target_pid, start, mapping_end, args.prot);
-        // `MAP_FIXED` replacement.
-        //
-        // An overlap here is usually not stale residue, it is `mmap` being
-        // asked to *replace* a range that is already mapped, which Linux
-        // performs as an implicit unmap of the target range. `ld.so` does
-        // exactly this for every shared library: it reserves the whole library
-        // span, then maps the zero-fill BSS `MAP_FIXED` inside it. Falling
-        // through to the eager path instead left the previous mapping's pages
-        // in place, so `map_zeroed_user_pages_at` refused the range and the
-        // loader reported `libc.so.6: cannot map zero-fill pages` - an ENOMEM
-        // raised with 1.59 GiB free.
-        //
-        // Tear the range down and admit once more. The retry is bounded to one
-        // attempt: if the range still overlaps after an explicit removal, the
-        // publication really is residue and the eager fallback below is the
-        // right answer.
         if matches!(
             admission,
             pager_admission::AnonymousAdmission::Eager(
                 pager_admission::EagerByContract::StaleRegionOverlap
             )
         ) {
-            let _ = multitask::unmap_pager_vma_for_process(args.target_pid, start, mapping_end);
-            admission = pager_admission::admit_anonymous_region(
-                args.target_pid,
-                start,
-                mapping_end,
-                args.prot,
-            );
-        }
-        match admission {
-            pager_admission::AnonymousAdmission::Demand => {
-                let Some(result) =
-                    multitask::with_process_state_by_pid_mut(args.target_pid, |process_state| {
-                        process_state.set_mapping_cursor(mapping_end);
-                        RustosMmMapBrokerResult {
-                            addr: start,
-                            len: args.len,
-                        }
-                    })
-                else {
-                    return Err(LINUX_ESRCH);
-                };
-                return write_out(args, &result);
-            }
-            // Wired is this target's contract, not a downgrade: either no
-            // pager transport exists yet, or the target is a member of the
-            // graph that resolves faults. Fall through to the eager path
-            // below, exactly as every mapping did before demand paging.
-            pager_admission::AnonymousAdmission::Eager(_) => {}
-            // The pager transport is live and refused this range. Mapping it
-            // eagerly and reporting success is what let a full pagerd region
-            // table silently disable demand paging for the rest of a boot,
-            // with the eager mapping making the downgrade invisible. Fail the
-            // mapping instead; nothing here may fabricate success.
-            pager_admission::AnonymousAdmission::Failed(errno) => return Err(errno),
+            return Err(LINUX_ENOMEM);
         }
     }
 
-    let Some(result) = multitask::with_process_state_by_pid_mut(args.target_pid, |process_state| {
-        if args.prot == 0 {
-            return Ok::<RustosMmMapBrokerResult, i64>(RustosMmMapBrokerResult {
-                addr: start,
-                len: args.len,
-            });
+    match admission {
+        pager_admission::AnonymousAdmission::Demand => {
+            let Some(result) =
+                multitask::with_process_state_by_pid_mut(args.target_pid, |process_state| {
+                    process_state.set_mapping_cursor(mapping_end);
+                    RustosMmMapBrokerResult {
+                        addr: start,
+                        len: args.len,
+                    }
+                })
+            else {
+                let _ = multitask::unmap_pager_vma_for_process(args.target_pid, start, mapping_end);
+                return Err(LINUX_ESRCH);
+            };
+            return write_out(args, &result);
         }
-        process_state
-            .address_space_mut()
-            .map_zeroed_user_pages_at(VirtAddr::new(start), page_count, page_flags)
-            .map_err(address_space_error_to_linux_errno)?;
+        pager_admission::AnonymousAdmission::Eager(_) => {}
+        pager_admission::AnonymousAdmission::Failed(errno) => return Err(errno),
+    }
+
+    let Some(result) = multitask::with_process_state_by_pid_mut(args.target_pid, |process_state| {
+        if args.prot != 0 {
+            process_state
+                .address_space_mut()
+                .map_zeroed_user_pages_at(VirtAddr::new(start), page_count, page_flags)
+                .map_err(address_space_error_to_linux_errno)?;
+        }
         process_state.set_mapping_cursor(mapping_end);
         Ok::<RustosMmMapBrokerResult, i64>(RustosMmMapBrokerResult {
             addr: start,
             len: args.len,
         })
     }) else {
+        let _ = multitask::unmap_pager_vma_for_process(args.target_pid, start, mapping_end);
         return Err(LINUX_ESRCH);
     };
-    write_out(args, &result?)
+    let mapped = match result {
+        Ok(mapped) => mapped,
+        Err(errno) => {
+            let _ = multitask::unmap_pager_vma_for_process(args.target_pid, start, mapping_end);
+            return Err(errno);
+        }
+    };
+    write_out(args, &mapped)
 }
 
 fn broker_map_file_private(args: &RustosMmBrokerArgs) -> Result<(), i64> {
@@ -552,7 +483,13 @@ fn broker_protect(args: &RustosMmBrokerArgs) -> Result<(), i64> {
     let pager_prot = pager_admission::pager_protection(args.prot).ok_or(LINUX_EINVAL)?;
 
     match retry_transient_range_edit("mprotect", || {
-        multitask::protect_pager_vma_for_process(args.target_pid, start, end, pager_prot, page_flags)
+        multitask::protect_pager_vma_for_process(
+            args.target_pid,
+            start,
+            end,
+            pager_prot,
+            page_flags,
+        )
     }) {
         // Ring0 holds the only map of an anonymous range and has already
         // rewritten it under the exact process-state lock, publishing new VMA
