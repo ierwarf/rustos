@@ -141,12 +141,20 @@ install_uv_tools() {
 
 install_npm_tools() {
     local prefix="$TOOLS_ROOT/npm-global"
+    local codegraph_root="$prefix/lib/node_modules/@astudioplus/codegraph-mcp"
     mkdir -p "$prefix"
     export npm_config_prefix="$prefix"
     export npm_config_cache="$HOME/.cache/npm"
     # RustOS deliberately uses CodeGraph graph-only; skip the unused embedding
     # model, but do not skip the signed native analysis engine download.
     export CODEGRAPH_SKIP_MODEL_FETCH=1
+    # A lifecycle-script-denied install can leave the JS package and wrapper
+    # behind without the native analysis engine. A later ordinary `npm install`
+    # then reports the package as up to date and never reruns postinstall, so
+    # the broken state persists forever. Remove only the pinned CodeGraph
+    # package before reinstalling it so its admitted postinstall must execute.
+    rm -rf -- "$codegraph_root"
+    rm -f -- "$prefix/bin/codegraph-mcp" "$BIN_DIR/codegraph-mcp"
     # npm on this runner blocks dependency lifecycle scripts unless explicitly
     # admitted. CodeGraph's pinned postinstall fetches the platform engine and
     # verifies its published checksum; allow exactly that package, not arbitrary
@@ -162,14 +170,20 @@ install_npm_tools() {
         ln -sfn "$prefix/bin/$name" "$BIN_DIR/$name"
     done
 
-    local actual_codegraph actual_ripgrep
-    actual_codegraph="$(node -p "require('$prefix/lib/node_modules/@astudioplus/codegraph-mcp/package.json').version")"
+    local actual_codegraph actual_ripgrep native_codegraph
+    actual_codegraph="$(node -p "require('$codegraph_root/package.json').version")"
     actual_ripgrep="$(node -p "require('$prefix/lib/node_modules/mcp-ripgrep/package.json').version")"
     [[ "$actual_codegraph" == "$CODEGRAPH_VERSION" ]] || {
         echo "CodeGraph version mismatch: $actual_codegraph" >&2; return 1;
     }
     [[ "$actual_ripgrep" == "$RIPGREP_MCP_VERSION" ]] || {
         echo "mcp-ripgrep version mismatch: $actual_ripgrep" >&2; return 1;
+    }
+    native_codegraph="$codegraph_root/bin/codegraph-server-linux-x64"
+    [[ -x "$native_codegraph" ]] || {
+        echo "CodeGraph native engine missing after admitted reinstall: $native_codegraph" >&2
+        find "$codegraph_root/bin" -maxdepth 1 -type f -printf '%f\n' 2>/dev/null || true
+        return 1
     }
     codegraph-mcp --help >/dev/null
 }
