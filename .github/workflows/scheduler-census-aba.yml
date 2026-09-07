@@ -4,6 +4,10 @@ on:
   workflow_run:
     workflows: ["RustOS self-hosted bench"]
     types: [completed]
+  push:
+    branches: ["master"]
+    paths:
+      - ".github/workflows/scheduler-census-aba.yml"
 
 permissions:
   contents: read
@@ -15,15 +19,19 @@ concurrency:
 jobs:
   aba:
     if: >-
-      ${{ github.event.workflow_run.conclusion == 'success' &&
-          github.event.workflow_run.head_branch == 'master' }}
+      ${{
+        (github.event_name == 'push' && github.ref == 'refs/heads/master') ||
+        (github.event_name == 'workflow_run' &&
+         github.event.workflow_run.conclusion == 'success' &&
+         github.event.workflow_run.head_branch == 'master')
+      }}
     runs-on: [self-hosted, Linux, X64]
-    timeout-minutes: 180
+    timeout-minutes: 240
 
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          ref: ${{ github.event.workflow_run.head_sha }}
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.sha }}
           fetch-depth: 0
           clean: false
 
@@ -38,21 +46,24 @@ jobs:
           test -s driver-domains/linux/out/artifacts/rustos-linux-dvm-x86_64.manifest
           cargo xtask verify-dvm
           mkdir -p build/ci-bench/census-aba
+          git checkout -- kernel/ps/src/multitask/cpu_local.rs
+          test -z "$(git status --porcelain --untracked-files=no)"
 
-      - name: Control A1 - 1 vCPU
+      - name: Run anchored A-B-A at 1 and 8 vCPU
         shell: bash
         run: |
           set -euo pipefail
-          cargo xtask bench --rustos-vcpus 1 \
-            --baseline build/ci-bench/census-aba/a1-1vcpu.txt \
-            > build/ci-bench/census-aba/a1-1vcpu.log 2>&1
-          awk '/^probe[[:space:]]+iters/{show=1} show{print}' build/ci-bench/census-aba/a1-1vcpu.log | tail -n 260
+          out=build/ci-bench/census-aba
+          source_file=kernel/ps/src/multitask/cpu_local.rs
+          needle='    record_acquire_site(caller);'
 
-      - name: Apply scheduler acquisition-census ablation
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
+          cleanup() {
+            git checkout -- "$source_file" || true
+          }
+          trap cleanup EXIT
+
+          apply_ablation() {
+            python3 - <<'PY'
           from pathlib import Path
           path = Path('kernel/ps/src/multitask/cpu_local.rs')
           text = path.read_text()
@@ -62,96 +73,142 @@ jobs:
               raise SystemExit(f'expected exactly one acquisition-census charge, found {count}')
           path.write_text(text.replace(needle, '', 1))
           PY
-          git diff --check
+            git diff --check
+          }
 
-      - name: Candidate B - 1 vCPU
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo xtask bench --rustos-vcpus 1 \
-            --compare build/ci-bench/census-aba/a1-1vcpu.txt \
-            > build/ci-bench/census-aba/b-1vcpu.log 2>&1
-          awk '/^probe[[:space:]]+iters/{show=1} show{print}' build/ci-bench/census-aba/b-1vcpu.log | tail -n 300
-          grep -Eq '^  anchor vmexit_cpuid: [0-9]+ -> [0-9]+ \([+-]?[0-9]+\.[0-9]+%\) -- held$' build/ci-bench/census-aba/b-1vcpu.log
+          revert_ablation() {
+            git checkout -- "$source_file"
+            if ! grep -Fq "$needle" "$source_file"; then
+              echo 'scheduler acquisition census was not restored' >&2
+              return 1
+            fi
+          }
 
-      - name: Revert candidate and Control A2 - 1 vCPU
-        shell: bash
-        run: |
-          set -euo pipefail
-          git checkout -- kernel/ps/src/multitask/cpu_local.rs
+          wayclick_only_failure() {
+            local log=$1
+            grep -Fq 'missing=["wayclick: first frame presented"]' "$log" \
+              && ! grep -Eq '\[PANIC\]|NESTED PANIC' "$log"
+          }
+
+          run_baseline() {
+            local vcpus=$1 baseline=$2 log=$3
+            local boot_try rc
+            for boot_try in 1 2; do
+              set +e
+              cargo xtask bench --rustos-vcpus "$vcpus" --baseline "$baseline" > "$log" 2>&1
+              rc=$?
+              set -e
+              if [ "$rc" -eq 0 ]; then
+                return 0
+              fi
+              if [ "$vcpus" -eq 8 ] && wayclick_only_failure "$log" && [ "$boot_try" -lt 2 ]; then
+                echo "8-vCPU WayClick-only readiness miss; retrying baseline" >&2
+                continue
+              fi
+              echo "baseline failed vcpus=$vcpus rc=$rc" >&2
+              tail -n 220 "$log" >&2 || true
+              return "$rc"
+            done
+          }
+
+          run_compare() {
+            local vcpus=$1 baseline=$2 log=$3
+            local boot_try rc
+            for boot_try in 1 2; do
+              set +e
+              cargo xtask bench --rustos-vcpus "$vcpus" --compare "$baseline" > "$log" 2>&1
+              rc=$?
+              set -e
+              if [ "$rc" -eq 0 ]; then
+                return 0
+              fi
+              if [ "$vcpus" -eq 8 ] && wayclick_only_failure "$log" && [ "$boot_try" -lt 2 ]; then
+                echo "8-vCPU WayClick-only readiness miss; retrying comparison" >&2
+                continue
+              fi
+              echo "comparison failed vcpus=$vcpus rc=$rc" >&2
+              tail -n 220 "$log" >&2 || true
+              return "$rc"
+            done
+          }
+
+          anchor_held() {
+            grep -Eq '^  anchor vmexit_cpuid: [0-9]+ -> [0-9]+ \([+-]?[0-9]+\.[0-9]+%\) -- held$' "$1"
+          }
+
+          print_result() {
+            local title=$1 log=$2
+            echo "=== $title ==="
+            awk '/^probe[[:space:]]+iters/{show=1} show{print}' "$log" | tail -n 180 || true
+          }
+
+          run_triplets() {
+            local vcpus=$1
+            local attempt baseline a1 b a2
+            for attempt in 1 2 3; do
+              echo "=== ${vcpus}-vCPU A-B-A attempt ${attempt}/3 ==="
+              revert_ablation
+              baseline="$out/${vcpus}vcpu-try${attempt}-a1.txt"
+              a1="$out/${vcpus}vcpu-try${attempt}-a1.log"
+              b="$out/${vcpus}vcpu-try${attempt}-b.log"
+              a2="$out/${vcpus}vcpu-try${attempt}-a2.log"
+
+              run_baseline "$vcpus" "$baseline" "$a1"
+              apply_ablation
+              if ! run_compare "$vcpus" "$baseline" "$b"; then
+                revert_ablation
+                return 1
+              fi
+              revert_ablation
+              run_compare "$vcpus" "$baseline" "$a2"
+
+              print_result "${vcpus}-vCPU A1 try $attempt" "$a1"
+              print_result "${vcpus}-vCPU B try $attempt" "$b"
+              print_result "${vcpus}-vCPU A2 try $attempt" "$a2"
+
+              if anchor_held "$b" && anchor_held "$a2"; then
+                echo "accepted anchored A-B-A vcpus=$vcpus attempt=$attempt"
+                cp "$a1" "$out/accepted-${vcpus}vcpu-a1.log"
+                cp "$b" "$out/accepted-${vcpus}vcpu-b.log"
+                cp "$a2" "$out/accepted-${vcpus}vcpu-a2.log"
+                cp "$baseline" "$out/accepted-${vcpus}vcpu-a1.txt"
+                return 0
+              fi
+
+              echo "rejecting unanchored triplet vcpus=$vcpus attempt=$attempt" >&2
+              grep -E '^  anchor vmexit_cpuid:' "$b" "$a2" >&2 || true
+            done
+            echo "no anchored A-B-A triplet after 3 attempts at ${vcpus} vCPU" >&2
+            return 1
+          }
+
+          run_triplets 1
+          run_triplets 8
+          revert_ablation
           test -z "$(git status --porcelain --untracked-files=no)"
-          cargo xtask bench --rustos-vcpus 1 \
-            --compare build/ci-bench/census-aba/a1-1vcpu.txt \
-            > build/ci-bench/census-aba/a2-1vcpu.log 2>&1
-          awk '/^probe[[:space:]]+iters/{show=1} show{print}' build/ci-bench/census-aba/a2-1vcpu.log | tail -n 300
-          grep -Eq '^  anchor vmexit_cpuid: [0-9]+ -> [0-9]+ \([+-]?[0-9]+\.[0-9]+%\) -- held$' build/ci-bench/census-aba/a2-1vcpu.log
 
-      - name: Control A1 - 8 vCPU
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo xtask bench --rustos-vcpus 8 \
-            --baseline build/ci-bench/census-aba/a1-8vcpu.txt \
-            > build/ci-bench/census-aba/a1-8vcpu.log 2>&1
-          awk '/^probe[[:space:]]+iters/{show=1} show{print}' build/ci-bench/census-aba/a1-8vcpu.log | tail -n 260
-
-      - name: Apply census ablation for 8 vCPU
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
-          path = Path('kernel/ps/src/multitask/cpu_local.rs')
-          text = path.read_text()
-          needle = '    record_acquire_site(caller);\n'
-          count = text.count(needle)
-          if count != 1:
-              raise SystemExit(f'expected exactly one acquisition-census charge, found {count}')
-          path.write_text(text.replace(needle, '', 1))
-          PY
-          git diff --check
-
-      - name: Candidate B - 8 vCPU
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo xtask bench --rustos-vcpus 8 \
-            --compare build/ci-bench/census-aba/a1-8vcpu.txt \
-            > build/ci-bench/census-aba/b-8vcpu.log 2>&1
-          awk '/^probe[[:space:]]+iters/{show=1} show{print}' build/ci-bench/census-aba/b-8vcpu.log | tail -n 300
-          grep -Eq '^  anchor vmexit_cpuid: [0-9]+ -> [0-9]+ \([+-]?[0-9]+\.[0-9]+%\) -- held$' build/ci-bench/census-aba/b-8vcpu.log
-
-      - name: Revert candidate and Control A2 - 8 vCPU
-        shell: bash
-        run: |
-          set -euo pipefail
-          git checkout -- kernel/ps/src/multitask/cpu_local.rs
-          test -z "$(git status --porcelain --untracked-files=no)"
-          cargo xtask bench --rustos-vcpus 8 \
-            --compare build/ci-bench/census-aba/a1-8vcpu.txt \
-            > build/ci-bench/census-aba/a2-8vcpu.log 2>&1
-          awk '/^probe[[:space:]]+iters/{show=1} show{print}' build/ci-bench/census-aba/a2-8vcpu.log | tail -n 300
-          grep -Eq '^  anchor vmexit_cpuid: [0-9]+ -> [0-9]+ \([+-]?[0-9]+\.[0-9]+%\) -- held$' build/ci-bench/census-aba/a2-8vcpu.log
-
-      - name: Summarize A-B-A evidence
+      - name: Summarize accepted A-B-A evidence
         if: always()
         shell: bash
         run: |
           set -uo pipefail
+          out=build/ci-bench/census-aba
           {
             echo '## Scheduler acquisition-census A-B-A'
-            for log in \
-              build/ci-bench/census-aba/a1-1vcpu.log \
-              build/ci-bench/census-aba/b-1vcpu.log \
-              build/ci-bench/census-aba/a2-1vcpu.log \
-              build/ci-bench/census-aba/a1-8vcpu.log \
-              build/ci-bench/census-aba/b-8vcpu.log \
-              build/ci-bench/census-aba/a2-8vcpu.log
-            do
-              [ -f "$log" ] || continue
-              echo "### $(basename "$log")"
-              echo '```text'
-              awk '/^probe[[:space:]]+iters/{show=1} show{print}' "$log" | tail -n 120
-              echo '```'
+            for vcpus in 1 8; do
+              for side in a1 b a2; do
+                log="$out/accepted-${vcpus}vcpu-${side}.log"
+                [ -f "$log" ] || continue
+                echo "### ${vcpus} vCPU ${side}"
+                echo '```text'
+                awk '/^probe[[:space:]]+iters/{show=1} show{print}' "$log" | tail -n 150
+                echo '```'
+              done
             done
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Restore source after diagnostic ablation
+        if: always()
+        shell: bash
+        run: |
+          git checkout -- kernel/ps/src/multitask/cpu_local.rs
