@@ -62,6 +62,12 @@ runtimed
      RtlMsvcrt* and Rtl* shims that talk to the runtime broker.
 ```
 
+The UCRT runtime API-set is part of the import contract, not a compiler-version
+accident. `api-ms-win-crt-runtime-l1-1-0.dll` resolves to `ucrtbase.dll`, and
+both `_set_app_type` and the legacy-compatible `__set_app_type` spelling update
+the same WinSys application-type state. The `userdemo2` import audit checks the
+actual linked PE imports against this export surface on every fresh build.
+
 PE failures now log a step name and errno (`loaderd: pe step failed
 exec=... step=... errno=...`) so a `map executable failed errno=8` from the
 runtime is easy to localize. The supported System32 inventory lives under
@@ -146,13 +152,19 @@ runtimed
        resolve_import_closure (import + forwarder)
        build_windows_runtime_blob (argv/env, locale, heap, IO)
        SYS_RUSTOS_PROC_SET_WINDOWS_RUNTIME_BROKER
-       main + DLL page map
+       map main + DLL page
        commit, pid 반환
   -> Win32 import는 kernelbase.dll의 kernel32 forwarder로 해석
   -> CRT 호출은 msvcrt.dll / ucrtbase.dll로 진입
   -> 일부 primitive(Heap*, Tls*, locale, console IO)는 RtlMsvcrt*, Rtl*
      shim에서 runtime broker로 redirect.
 ```
+
+UCRT runtime API-set도 import contract의 일부입니다.
+`api-ms-win-crt-runtime-l1-1-0.dll`은 `ucrtbase.dll`로 resolve되고,
+`_set_app_type`과 legacy 호환 spelling인 `__set_app_type`은 같은 WinSys
+application-type 상태를 갱신합니다. `userdemo2` import audit은 fresh build마다
+실제로 link된 PE import를 이 export surface와 대조합니다.
 
 PE 실패는 이제 step 이름과 errno를 로그에 남깁니다 (`loaderd: pe step
 failed exec=... step=... errno=...`). runtime이 보던 `map executable

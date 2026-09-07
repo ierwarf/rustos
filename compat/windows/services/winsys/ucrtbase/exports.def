@@ -2,6 +2,7 @@ LIBRARY ucrtbase.dll
 EXPORTS
     __C_specific_handler
     __set_app_type
+    _set_app_type
     __setusermatherr
     __acrt_iob_func
     __getmainargs

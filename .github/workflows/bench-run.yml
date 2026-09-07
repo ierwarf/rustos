@@ -22,12 +22,13 @@ permissions:
 jobs:
   bench:
     runs-on: [self-hosted, Linux, X64]
-    timeout-minutes: 45
+    timeout-minutes: 90
 
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           fetch-depth: 0
+          clean: false
 
       - name: Install pinned Rust toolchain
         shell: bash
@@ -51,6 +52,28 @@ jobs:
           qemu-system-x86_64 --version | head -n 1
           command -v objdump
           command -v x86_64-w64-mingw32-gcc
+
+      - name: Prepare Linux DVM bundle
+        shell: bash
+        run: |
+          set -uo pipefail
+          manifest="driver-domains/linux/out/artifacts/rustos-linux-dvm-x86_64.manifest"
+          if [ -f "$manifest" ]; then
+            set +e
+            cargo xtask verify-dvm > /tmp/rustos-dvm-verify.log 2>&1
+            verify_rc=$?
+            set -e
+            if [ "$verify_rc" -eq 0 ]; then
+              echo "dvm_bundle=cached_verified"
+              exit 0
+            fi
+            echo "cached DVM rejected; rebuilding"
+            tail -n 80 /tmp/rustos-dvm-verify.log
+          fi
+          make -C driver-domains/linux build-plan
+          cargo xtask build-dvm
+          cargo xtask verify-dvm
+          echo "dvm_bundle=built_verified"
 
       - name: Benchmark baseline
         shell: bash
