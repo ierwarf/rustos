@@ -1,0 +1,59 @@
+name: Apply fault ABI lock-free lookup
+
+on:
+  push:
+    branches: ["master"]
+    paths:
+      - ".github/workflows/apply-fault-abi-lock-fix.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: [self-hosted, Linux, X64]
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          clean: false
+
+      - name: Patch exception ABI lookup
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('kernel/executive/src/hal_hooks.rs')
+          text = p.read_text()
+          old = '    let linux_abi =\n        uses_linux_fault_policy(ps_api::current_user_snapshot().map(|snapshot| snapshot.abi()));\n'
+          new = '    // Exception gates run with interrupts masked. ABI selection needs only the\n    // scheduler-owned current binding; taking ProcessStateLock here can neither\n    // park nor make progress behind a concurrent pager VMA writer on another CPU.\n    let linux_abi = uses_linux_fault_policy(ps_api::current_user_abi());\n'
+          if text.count(old) != 1:
+              raise SystemExit(f'expected exactly one fault snapshot lookup, found {text.count(old)}')
+          p.write_text(text.replace(old, new, 1))
+          PY
+          cargo fmt --all
+          git diff --check
+          git diff -- kernel/executive/src/hal_hooks.rs
+
+      - name: Validate focused source
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo check -q -p kernel-executive
+          cargo test -q -p kernel-executive
+          cargo xtask check
+          bash formal/run-source-conformance.sh
+
+      - name: Push source-only fix
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add kernel/executive/src/hal_hooks.rs
+          git diff --cached --check
+          git config user.name "ierwarf"
+          git config user.email "64543544+ierwarf@users.noreply.github.com"
+          git commit -m "fix(fault): avoid process-state lock for ABI selection"
+          git push origin HEAD:master
