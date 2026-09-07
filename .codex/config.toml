@@ -85,7 +85,8 @@ statusMessage = "Loading RustOS hook context"
 # --------------------------------------------------------------------------
 # MCP servers (project-scoped)
 # Project-declared servers are exact-version inputs. Session-provided app or
-# plugin connectors are configured outside this repository.
+# plugin connectors are configured outside this repository. Executables resolve
+# from PATH so the same checkout works on a workstation or a self-hosted runner.
 #   ripgrep   — mcp-ripgrep 0.4.0 (npm)
 #   serena    — serena-agent==1.6.0 (uv tool)
 #   ast-grep  — ast-grep CLI 0.45.2 + official sg-mcp at commit 149e20d47bb7125fb0c1451feea2f48a98742034
@@ -100,19 +101,16 @@ args = ["-y", "mcp-ripgrep@0.4.0"]
 approval_mode = "approve"
 
 [mcp_servers.serena]
-command = "/home/hongii2/.local/bin/serena"
+command = "serena"
 args = ["start-mcp-server"]
 
 [mcp_servers.ast_grep]
-command = "/home/hongii2/.local/bin/ast-grep-server"
+command = "ast-grep-server"
 args = []
 
-[mcp_servers.ast_grep.env]
-AST_GREP_PATH = "/home/hongii2/.local/bin/ast-grep"
-
 [mcp_servers.codegraph]
-command = "/home/hongii2/.local/bin/codegraph-mcp"
-args = ["--mcp", "--workspace", "/home/hongii2/rustos", "--exclude", "/home/hongii2/rustos/target", "--exclude", "/home/hongii2/rustos/build", "--exclude", "/home/hongii2/rustos/logs", "--exclude", "/home/hongii2/rustos/vendor", "--exclude", "/home/hongii2/rustos/Cargo.lock", "--profile", "all", "--graph-only"]
+command = "codegraph-mcp"
+args = ["--mcp", "--exclude", "target", "--exclude", "build", "--exclude", "logs", "--exclude", "vendor", "--exclude", "Cargo.lock", "--profile", "all", "--graph-only"]
 
 [sandbox_workspace_write]
 network_access = true
