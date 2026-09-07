@@ -1,0 +1,64 @@
+name: RustOS KVM boot smoke
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["master"]
+    paths:
+      - ".github/workflows/boot-smoke.yml"
+      - "services/rootd/src/main.rs"
+      - "services/initd/src/main.rs"
+      - "services/runtimed/src/spawn.rs"
+      - "services/loaderd/src/main.rs"
+      - "services/vfsd/src/main.rs"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rustos-kvm-boot-smoke
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    runs-on: [self-hosted, Linux, X64]
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          clean: false
+
+      - name: Environment preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          id
+          test -r /dev/kvm
+          test -w /dev/kvm
+          qemu-system-x86_64 --version | head -n 1
+
+      - name: Verify cached DVM bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f driver-domains/linux/out/artifacts/rustos-linux-dvm-x86_64.manifest
+          cargo xtask verify-dvm
+
+      - name: Boot and collect 1-vCPU readiness
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p build/boot-smoke
+          set +e
+          cargo xtask bench --rustos-vcpus 1 --baseline build/boot-smoke/control.txt > build/boot-smoke/run.log 2>&1
+          rc=$?
+          set -e
+          echo "boot_smoke_exit=$rc"
+          grep -E -m 220 'loaderd:|rootd:|initd:|runtimed:|vfsd:|ipcbench:|product-|probe|anchor|failed|FAILED|error|Error' build/boot-smoke/run.log || true
+          if [ "$rc" -ne 0 ]; then
+            echo "--- tail ---"
+            tail -n 180 build/boot-smoke/run.log
+          fi
+          exit "$rc"
