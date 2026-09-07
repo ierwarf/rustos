@@ -1,0 +1,117 @@
+name: Diagnose input worker scheduling
+
+on:
+  push:
+    branches: ["master"]
+    paths:
+      - ".github/workflows/input-worker-diag.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rustos-input-worker-diag
+  cancel-in-progress: true
+
+jobs:
+  diagnose:
+    runs-on: [self-hosted, Linux, X64]
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          clean: false
+
+      - name: Bootstrap host tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          toolroot="$RUNNER_TEMP/rustos-host-tools"
+          mkdir -p "$toolroot"
+          bootstrap_pkg() {
+            pkg="$1"; cmd="$2"
+            if command -v "$cmd" >/dev/null 2>&1; then return 0; fi
+            mapfile -t urls < <(pacman -Sp --print-format '%l' "$pkg")
+            for url in "${urls[@]}"; do
+              archive="$RUNNER_TEMP/$(basename "$url")"
+              curl --fail --location --silent --show-error "$url" -o "$archive"
+              bsdtar -xf "$archive" -C "$toolroot"
+            done
+            export PATH="$toolroot/usr/bin:$PATH"
+          }
+          bootstrap_pkg bc bc
+          bootstrap_pkg rsync rsync
+          bootstrap_pkg cpio cpio
+          bootstrap_pkg unzip unzip
+          echo "$toolroot/usr/bin" >> "$GITHUB_PATH"
+          cargo xtask verify-dvm
+
+      - name: Reference 1-vCPU input readiness
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p build/input-worker-diag
+          set +e
+          cargo xtask bench --rustos-vcpus 1 --baseline build/input-worker-diag/ref-1.txt > build/input-worker-diag/ref-1-bench.log 2>&1
+          rc=$?
+          set -e
+          cp build/kvm/rustos-debugcon.log build/input-worker-diag/ref-1-debugcon.log || true
+          echo "reference_1vcpu_exit=$rc"
+          echo '=== 1-vCPU input events ==='
+          grep -nE 'dvm-input|inputd:|input-ring|policy-ready|policy-consumer' build/input-worker-diag/ref-1-debugcon.log | tail -n 300 || true
+          exit "$rc"
+
+      - name: Instrument ingestion thread entry
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('services/inputd/src/main.rs')
+          text = path.read_text()
+          old = '''        .spawn(move || {
+            let mut ingest_scratch = vec![InputDvmRecordWire::default(); INPUTD_INGEST_MAX_EVENTS];
+'''
+          new = '''        .spawn(move || {
+            debug_line("inputd: DVM ingestion worker entered");
+            let mut ingest_scratch = vec![InputDvmRecordWire::default(); INPUTD_INGEST_MAX_EVENTS];
+'''
+          if text.count(old) != 1:
+              raise SystemExit(f'unexpected worker entry shape: {text.count(old)} matches')
+          path.write_text(text.replace(old, new, 1))
+          PY
+          cargo fmt --all
+          git diff --check
+
+      - name: Probe 8-vCPU worker scheduling
+        shell: bash
+        run: |
+          set -uo pipefail
+          set +e
+          cargo xtask bench --rustos-vcpus 8 --baseline build/input-worker-diag/probe-8.txt > build/input-worker-diag/probe-8-bench.log 2>&1
+          rc=$?
+          set -e
+          cp build/kvm/rustos-debugcon.log build/input-worker-diag/probe-8-debugcon.log || true
+          echo "probe_8vcpu_exit=$rc"
+          echo '=== 8-vCPU input events ==='
+          grep -nE 'dvm-input|inputd:|input-ring|policy-ready|policy-consumer' build/input-worker-diag/probe-8-debugcon.log | tail -n 500 || true
+          echo '=== retained input-ring header ==='
+          python3 - <<'PY'
+          from pathlib import Path
+          import struct
+          p = Path('build/kvm/dvm-input.ivshmem')
+          if p.exists():
+              b = p.read_bytes()[:144]
+              flags = struct.unpack_from('<I', b, 32)[0]
+              generation = struct.unpack_from('<Q', b, 56)[0]
+              producer = struct.unpack_from('<Q', b, 64)[0]
+              consumer = struct.unpack_from('<Q', b, 128)[0]
+              wake = struct.unpack_from('<Q', b, 136)[0]
+              print(f'flags=0x{flags:08x} provider={bool(flags&1)} rustos={bool(flags&2)} policy={bool(flags&4)} generation={generation} producer={producer} consumer={consumer} wake={wake}')
+          PY
+          echo '=== 8-vCPU bench tail ==='
+          tail -n 160 build/input-worker-diag/probe-8-bench.log || true
+          # Diagnostic step succeeds regardless of the expected 8-vCPU admission failure.
+          exit 0
