@@ -52,6 +52,43 @@ jobs:
           qemu-system-x86_64 --version | head -n 1
           command -v objdump
           command -v x86_64-w64-mingw32-gcc
+          command -v pacman
+          command -v curl
+          command -v bsdtar
+
+      - name: Bootstrap user-local DVM build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          toolroot="$RUNNER_TEMP/rustos-host-tools"
+          mkdir -p "$toolroot"
+
+          bootstrap_pkg() {
+            pkg="$1"
+            cmd="$2"
+            if command -v "$cmd" >/dev/null 2>&1; then
+              echo "$cmd=system"
+              return 0
+            fi
+            mapfile -t urls < <(pacman -Sp --print-format '%l' "$pkg")
+            if [ "${#urls[@]}" -eq 0 ]; then
+              echo "unable to resolve Arch package: $pkg" >&2
+              return 1
+            fi
+            for url in "${urls[@]}"; do
+              archive="$RUNNER_TEMP/$(basename "$url")"
+              curl --fail --location --silent --show-error "$url" -o "$archive"
+              bsdtar -xf "$archive" -C "$toolroot"
+            done
+            export PATH="$toolroot/usr/bin:$PATH"
+            command -v "$cmd"
+          }
+
+          bootstrap_pkg bc bc
+          bootstrap_pkg rsync rsync
+          bootstrap_pkg cpio cpio
+          bootstrap_pkg unzip unzip
+          echo "$toolroot/usr/bin" >> "$GITHUB_PATH"
 
       - name: Prepare Linux DVM bundle
         shell: bash
