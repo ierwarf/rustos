@@ -1,32 +1,27 @@
 {
   "mcpServers": {
     "serena": {
-      "command": "/home/hongii2/.local/bin/serena",
+      "command": "serena",
       "args": ["start-mcp-server"]
     },
     "ast_grep": {
-      "command": "/home/hongii2/.local/bin/ast-grep-server",
-      "args": [],
-      "env": {
-        "AST_GREP_PATH": "/home/hongii2/.local/bin/ast-grep"
-      }
+      "command": "ast-grep-server",
+      "args": []
     },
     "codegraph": {
-      "command": "/home/hongii2/.local/bin/codegraph-mcp",
+      "command": "codegraph-mcp",
       "args": [
         "--mcp",
-        "--workspace",
-        "/home/hongii2/rustos",
         "--exclude",
-        "/home/hongii2/rustos/target",
+        "target",
         "--exclude",
-        "/home/hongii2/rustos/build",
+        "build",
         "--exclude",
-        "/home/hongii2/rustos/logs",
+        "logs",
         "--exclude",
-        "/home/hongii2/rustos/vendor",
+        "vendor",
         "--exclude",
-        "/home/hongii2/rustos/Cargo.lock",
+        "Cargo.lock",
         "--profile",
         "all",
         "--graph-only"
