@@ -2132,18 +2132,30 @@ fn spawn_exec_via_loaderd_blocking(path: &'static [u8], weight_micros: u64) -> R
         return Err(22);
     }
     request.requester_pid = requester_pid as u64;
+    let mut canonical_path_storage = [0_u8; LOADER_SPAWN_EXEC_PATH_CAPACITY];
+    let canonical_path = if path.first() == Some(&b'/') {
+        path
+    } else {
+        let canonical_len = path.len() + 1;
+        if canonical_len > canonical_path_storage.len() {
+            return Err(22);
+        }
+        canonical_path_storage[0] = b'/';
+        copy_bytes(path, &mut canonical_path_storage[1..]);
+        &canonical_path_storage[..canonical_len]
+    };
     request.scheduling_context = register_scheduling_context_authority(
-        path,
+        canonical_path,
         request.requester_pid,
-        scheduling_context_policy_for_exec(path),
+        scheduling_context_policy_for_exec(canonical_path),
     )
     .map_err(i64::from)?;
     request.flags = SPAWN_FLAG_LOGICAL_ADMIN as u32 | LOADER_SPAWN_FLAG_DEFER_START;
     request.weight_micros = weight_micros;
-    request.exec_path_len = path.len() as u32;
+    request.exec_path_len = canonical_path.len() as u32;
     request.argv_count = 1;
     request.argv_bytes_len = (path.len() + 1) as u32;
-    copy_bytes(path, &mut request.exec_path);
+    copy_bytes(canonical_path, &mut request.exec_path);
     copy_bytes(path, &mut request.argv_bytes);
     request.argv_bytes[path.len()] = 0;
 

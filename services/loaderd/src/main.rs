@@ -80,7 +80,7 @@ use loaderd::{
 };
 
 const SYS_EXIT: u64 = 60;
-const UI_SERVER_EXEC_PATH: &str = "services/uiserver/uiserver.elf";
+const UI_SERVER_EXEC_PATH: &str = "/services/uiserver/uiserver.elf";
 static POST_UI_DEMOTED: AtomicBool = AtomicBool::new(false);
 
 #[cfg(not(test))]

@@ -177,7 +177,7 @@ static mut VFS_RESPONSE_SLOT: VfsIpcResponse = VfsIpcResponse {
 const EXECUTABLE_SNAPSHOT_MAX_BYTES: u64 = 128 * 1024 * 1024;
 const EXECUTABLE_SNAPSHOT_CACHE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 const EXECUTABLE_SNAPSHOT_WRITE_CHUNK_BYTES: usize = 256 * 1024;
-const UI_SERVER_EXEC_PATH: &[u8] = b"services/uiserver/uiserver.elf";
+const UI_SERVER_EXEC_PATH: &[u8] = b"/services/uiserver/uiserver.elf";
 static SNAPSHOT_WORKER_DEMOTED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy)]

@@ -805,7 +805,12 @@ fn build_loader_spawn_request(
     session_handle: u64,
     defer_start: bool,
 ) -> Result<LoaderSpawnRequest, i32> {
-    let exec_bytes = exec_path.as_bytes();
+    let canonical_exec_path = if exec_path.starts_with('/') {
+        exec_path.to_owned()
+    } else {
+        format!("/{exec_path}")
+    };
+    let exec_bytes = canonical_exec_path.as_bytes();
     if exec_bytes.is_empty()
         || exec_bytes.len() > LOADER_SPAWN_EXEC_PATH_CAPACITY
         || exec_bytes.contains(&0)
@@ -827,7 +832,7 @@ fn build_loader_spawn_request(
         argv_count: u16::try_from(argv.len()).map_err(|_| libc::E2BIG)?,
         env_count: u16::try_from(env.len()).map_err(|_| libc::E2BIG)?,
         requester_pid: u64::from(std::process::id()),
-        scheduling_context: request_scheduling_context_authority(exec_path)?,
+        scheduling_context: request_scheduling_context_authority(canonical_exec_path.as_str())?,
         ..LoaderSpawnRequest::default()
     };
     request.exec_path[..exec_bytes.len()].copy_from_slice(exec_bytes);
