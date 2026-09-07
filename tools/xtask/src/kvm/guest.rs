@@ -55,7 +55,7 @@ fn spawn_guests(
         config,
         layout,
         options.rustos_vcpus,
-        options.smp_iteration,
+        smp_formal_profile(options),
         false,
     )?;
 
@@ -107,14 +107,13 @@ fn spawn_rustos_guest(
     config: &Config,
     layout: &KvmLayout,
     rustos_vcpus: u8,
-    smp_iteration: bool,
+    evidence_profile: &'static str,
     append_logs: bool,
 ) -> Result<Child> {
     let readiness = RustosSmpReadiness {
         rustos_vcpus,
         ..RUSTOS_SMP_READINESS
     };
-    let evidence_profile = if smp_iteration { "smp-iteration" } else { "pr" };
     let smp_evidence = (rustos_vcpus > 1)
         .then(|| {
             crate::formal_contracts::validate_smp_launch_evidence(
@@ -808,7 +807,7 @@ impl RecoveryHarness<'_> {
                 self.config,
                 self.layout,
                 self.options.rustos_vcpus,
-                self.options.smp_iteration,
+                smp_formal_profile(self.options),
                 false,
             )?;
             self.input_doorbell

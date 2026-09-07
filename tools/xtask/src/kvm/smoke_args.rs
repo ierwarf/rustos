@@ -25,6 +25,10 @@ struct SmokeOptions {
     dvm_block_shmem: bool,
     rustos_vcpus: u8,
     smp_iteration: bool,
+    /// Internal launch-policy override. This is deliberately not parsed from
+    /// CLI input: benchmark may select the bounded formal model without also
+    /// enabling the 30-second runtime `smp_iteration` evidence mode.
+    smp_formal_profile_override: Option<&'static str>,
     smp_ring3_qualification: bool,
     smp_evidence_cohort: Option<String>,
     physical_gpu_bdf: Option<String>,
@@ -89,6 +93,7 @@ where
         dvm_block_shmem: false,
         rustos_vcpus: 1,
         smp_iteration: false,
+        smp_formal_profile_override: None,
         smp_ring3_qualification: false,
         smp_evidence_cohort: None,
         physical_gpu_bdf: None,

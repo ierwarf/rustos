@@ -151,11 +151,19 @@ pub(crate) fn verify_dvm_command(config: &Config) -> Result<()> {
     Ok(())
 }
 
+fn smp_formal_profile(options: &SmokeOptions) -> &'static str {
+    options.smp_formal_profile_override.unwrap_or(if options.smp_iteration {
+        "smp-iteration"
+    } else {
+        "pr"
+    })
+}
+
 pub(crate) fn kvm_smoke_command<I>(config: &Config, args: I) -> Result<()>
 where
     I: Iterator<Item = String>,
 {
-    kvm_smoke_command_with_runtime_trace(config, args, Some(true))
+    kvm_smoke_command_with_runtime_trace(config, args, Some(true), None)
 }
 
 /// Runs the normal KVM smoke topology without publishing product-acceptance
@@ -170,13 +178,14 @@ pub(crate) fn kvm_benchmark_command<I>(config: &Config, args: I) -> Result<()>
 where
     I: Iterator<Item = String>,
 {
-    kvm_smoke_command_with_runtime_trace(config, args, None)
+    kvm_smoke_command_with_runtime_trace(config, args, None, Some("smp-iteration"))
 }
 
 fn kvm_smoke_command_with_runtime_trace<I>(
     config: &Config,
     args: I,
     runtime_trace_deadlines: Option<bool>,
+    smp_formal_profile_override: Option<&'static str>,
 ) -> Result<()>
 where
     I: Iterator<Item = String>,
@@ -189,7 +198,8 @@ where
         print_kvm_smoke_help();
         return Ok(());
     }
-    let options = parse_smoke_options(args.into_iter())?;
+    let mut options = parse_smoke_options(args.into_iter())?;
+    options.smp_formal_profile_override = smp_formal_profile_override;
     let _launch_lock = acquire_kvm_launch_lock(&config.build_dir.join("kvm"))?;
     // A stale boot image is the most expensive mistake available here: the run
     // boots the previous build, and every conclusion drawn from it describes
@@ -209,12 +219,10 @@ where
     // caller to run a command this process can run itself. `--repeat` made it
     // worse: it burned every run in the batch on the same stale seal.
     if options.rustos_vcpus > 1 && options.auto_verify {
-        let profile = if options.smp_iteration {
-            "smp-iteration"
-        } else {
-            "pr"
-        };
-        crate::formal_contracts::ensure_smp_launch_evidence(&config.root_dir, profile)?;
+        crate::formal_contracts::ensure_smp_launch_evidence(
+            &config.root_dir,
+            smp_formal_profile(&options),
+        )?;
     }
     if options.repeat == 1 {
         return run_one_smoke(config, &options, runtime_trace_deadlines);
@@ -507,6 +515,7 @@ pub(crate) fn kvm_run_command(
         // Interactive SMP uses the same exact-tree bounded evidence profile as
         // the topology smoke run. It is observation, not a release/FPS claim.
         smp_iteration: rustos_vcpus > 1,
+        smp_formal_profile_override: None,
         smp_ring3_qualification: false,
         smp_evidence_cohort: None,
         physical_gpu_bdf: None,
