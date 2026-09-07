@@ -1,0 +1,74 @@
+name: RustOS self-hosted bench
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "perf/xtask-bench-20260907"
+    paths:
+      - ".github/workflows/bench-run.yml"
+      - "compat/windows/services/winsys/**"
+      - "apps/windows/userdemo2/**"
+      - "tools/xtask/**"
+      - "kernel/**"
+      - "libs/**"
+      - "services/**"
+      - "docs/benchmarks/**"
+      - "docs/ai/performance-hardening.md"
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    runs-on: [self-hosted, Linux, X64]
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Install pinned Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$toolchain" \
+            --profile minimal \
+            --component rust-src \
+            --target x86_64-unknown-linux-gnu \
+            --target x86_64-unknown-uefi
+
+      - name: Environment preflight
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "node=$(uname -n)"
+          id
+          test -r /dev/kvm
+          test -w /dev/kvm
+          qemu-system-x86_64 --version | head -n 1
+          command -v objdump
+          command -v x86_64-w64-mingw32-gcc
+
+      - name: Benchmark baseline
+        shell: bash
+        run: |
+          set -uo pipefail
+          mkdir -p build/ci-bench
+          set +e
+          cargo xtask bench --baseline build/ci-bench/baseline.txt > build/ci-bench/bench.log 2>&1
+          rc=$?
+          set -e
+          echo "bench_exit=$rc"
+          grep -E -m 120 '^(benchmark|bench|probe|ipc_|null_|sched_|vmexit_|isolation|anchor|comparison|error|Error|failed|FAILED)|ipcbench:' build/ci-bench/bench.log || true
+          if [ "$rc" -ne 0 ]; then
+            echo '--- failure tail ---'
+            tail -n 120 build/ci-bench/bench.log
+            if [ -f logs/userdemo2-imports.txt ]; then
+              echo '--- userdemo2 import evidence ---'
+              grep -n -C 3 -m 10 '_set_app_type\|api-ms-win-crt-runtime' logs/userdemo2-imports.txt || true
+            fi
+          fi
+          exit "$rc"
