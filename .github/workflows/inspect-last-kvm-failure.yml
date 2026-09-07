@@ -19,34 +19,22 @@ jobs:
         with:
           clean: false
 
-      - name: Inspect retained input readiness evidence
+      - name: Inspect retained 8-vCPU readiness tail
         shell: bash
         run: |
           set -uo pipefail
-          echo '=== retained input-ring header ==='
-          python3 - <<'PY'
-          from pathlib import Path
-          import struct
-          path = Path('build/kvm/dvm-input.ivshmem')
-          if not path.exists():
-              print('missing dvm-input.ivshmem')
-              raise SystemExit(0)
-          data = path.read_bytes()[:192]
-          if len(data) < 144:
-              print(f'short input ring header: {len(data)} bytes')
-              raise SystemExit(0)
-          flags = struct.unpack_from('<I', data, 32)[0]
-          generation = struct.unpack_from('<Q', data, 56)[0]
-          producer = struct.unpack_from('<Q', data, 64)[0]
-          consumer = struct.unpack_from('<Q', data, 128)[0]
-          wake_generation = struct.unpack_from('<Q', data, 136)[0]
-          print(f'flags=0x{flags:08x} provider_ready={bool(flags & 1)} rustos_ready={bool(flags & 2)} policy_consumer_ready={bool(flags & 4)}')
-          print(f'generation={generation} producer={producer} consumer={consumer} wake_generation={wake_generation}')
-          print(f'header_hex={data[:144].hex()}')
-          PY
-          echo
-          echo '=== exact RustOS input readiness events ==='
-          grep -nE 'dvm-input|inputd:|input-ring|policy-ready|policy-consumer|readiness' build/kvm/rustos-debugcon.log 2>/dev/null | tail -n 1000 || true
-          echo
           echo '=== failure summary ==='
           cat build/kvm/failure-summary.json 2>/dev/null || true
+          echo
+          echo '=== UI / ipcbench / launch progression ==='
+          grep -nE 'uiserver:|wayclick:|ipcbench:|runtimed:|sessiond:|initd:|inputd:|gpu-compositor|first frame|first-frame|spawn|activated|ready' build/kvm/rustos-debugcon.log 2>/dev/null | tail -n 1600 || true
+          echo
+          echo '=== last 500 structured RustOS records ==='
+          tail -n 500 build/kvm/rustos-debugcon.log 2>/dev/null || true
+          echo
+          echo '=== DVM tail ==='
+          tail -n 220 build/kvm/linux-dvm-serial.log 2>/dev/null || true
+          echo
+          echo '=== QEMU stderr tails ==='
+          tail -n 120 build/kvm/rustos-qemu.stderr.log 2>/dev/null || true
+          tail -n 120 build/kvm/linux-dvm-qemu.stderr.log 2>/dev/null || true
