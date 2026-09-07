@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - "perf/xtask-bench-20260907"
+      - "master"
     paths:
       - ".github/workflows/bench-run.yml"
       - "compat/windows/services/winsys/**"
