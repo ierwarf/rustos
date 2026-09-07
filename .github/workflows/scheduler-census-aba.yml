@@ -17,7 +17,7 @@ jobs:
     if: >-
       ${{ github.event.workflow_run.conclusion == 'success' &&
           github.event.workflow_run.head_branch == 'master' &&
-          github.event.workflow_run.head_sha == 'a3014c92640288f0378105a99f9e8fbafd14e3f0' }}
+          github.event.workflow_run.head_sha == '3e33abf2e2d2a540225f5dc8e61291324cc5e6f5' }}
     runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 180
 
