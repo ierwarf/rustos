@@ -13,16 +13,14 @@ RIPGREP_MCP_VERSION=0.4.0
 BIN_DIR="$HOME/.local/bin"
 TOOLS_ROOT="$HOME/.local/share/rustos-agent-tools"
 CACHE_ROOT="$HOME/.cache/rustos-agent-tools"
+MANIFEST="$TOOLS_ROOT/manifest.env"
 mkdir -p "$BIN_DIR" "$TOOLS_ROOT" "$CACHE_ROOT"
 export PATH="$BIN_DIR:$PATH"
 
-log() {
-    printf 'agent-tools: %s\n' "$*"
-}
+log() { printf 'agent-tools: %s\n' "$*"; }
 
 fetch_url() {
-    local url=$1
-    local output=$2
+    local url=$1 output=$2
     case "$url" in
         file://*) cp -- "${url#file://}" "$output" ;;
         *) curl --fail --location --retry 3 --silent --show-error "$url" -o "$output" ;;
@@ -32,27 +30,16 @@ fetch_url() {
 extract_arch_packages() {
     local root=$1
     shift
-    command -v pacman >/dev/null 2>&1 || {
-        echo 'pacman is required for user-local Arch package bootstrap' >&2
-        return 1
-    }
-    command -v bsdtar >/dev/null 2>&1 || {
-        echo 'bsdtar is required for user-local Arch package bootstrap' >&2
-        return 1
-    }
+    command -v pacman >/dev/null 2>&1 || { echo 'pacman is required' >&2; return 1; }
+    command -v bsdtar >/dev/null 2>&1 || { echo 'bsdtar is required' >&2; return 1; }
     mkdir -p "$root"
     local urls=()
     mapfile -t urls < <(pacman -Sp --print-format '%l' "$@")
-    ((${#urls[@]} > 0)) || {
-        echo "pacman produced no package URLs for: $*" >&2
-        return 1
-    }
+    ((${#urls[@]} > 0)) || { echo "no Arch package URLs for: $*" >&2; return 1; }
     local url archive
     for url in "${urls[@]}"; do
         archive="$CACHE_ROOT/$(basename "$url")"
-        if [[ ! -s "$archive" ]]; then
-            fetch_url "$url" "$archive"
-        fi
+        [[ -s "$archive" ]] || fetch_url "$url" "$archive"
         bsdtar -xf "$archive" -C "$root"
     done
 }
@@ -75,9 +62,7 @@ ensure_uv() {
 }
 
 ensure_node_stack() {
-    if command -v node >/dev/null 2>&1 \
-        && command -v npm >/dev/null 2>&1 \
-        && command -v npx >/dev/null 2>&1; then
+    if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1 && command -v npx >/dev/null 2>&1; then
         log "node=$(command -v node) npm=$(command -v npm) npx=$(command -v npx)"
         return
     fi
@@ -91,7 +76,7 @@ ensure_node_stack() {
     local npm_cli="$root/usr/lib/node_modules/npm/bin/npm-cli.js"
     local npx_cli="$root/usr/lib/node_modules/npm/bin/npx-cli.js"
     [[ -x "$node_bin" && -f "$npm_cli" && -f "$npx_cli" ]] || {
-        echo "user-local Node/npm payload is incomplete under $root" >&2
+        echo "incomplete Node/npm payload under $root" >&2
         return 1
     }
 
@@ -118,15 +103,11 @@ ensure_clangd() {
         log "clangd=$(command -v clangd)"
         return
     fi
-
     local root="$TOOLS_ROOT/arch-clang"
     rm -rf -- "$root"
     mkdir -p "$root"
     extract_arch_packages "$root" clang
-    [[ -x "$root/usr/bin/clangd" ]] || {
-        echo "clang package did not provide clangd under $root" >&2
-        return 1
-    }
+    [[ -x "$root/usr/bin/clangd" ]] || { echo 'clang package did not provide clangd' >&2; return 1; }
     cat >"$BIN_DIR/clangd" <<EOF
 #!/usr/bin/env bash
 export LD_LIBRARY_PATH="$root/usr/lib\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
@@ -136,17 +117,11 @@ EOF
 }
 
 link_uv_tool() {
-    local name=$1
-    local uv_bin_dir
+    local name=$1 uv_bin_dir source
     uv_bin_dir="$(uv tool dir --bin)"
-    local source="$uv_bin_dir/$name"
-    [[ -e "$source" ]] || {
-        echo "uv tool did not expose expected executable: $name" >&2
-        return 1
-    }
-    if [[ "$source" != "$BIN_DIR/$name" ]]; then
-        ln -sfn "$source" "$BIN_DIR/$name"
-    fi
+    source="$uv_bin_dir/$name"
+    [[ -e "$source" ]] || { echo "uv tool did not expose $name" >&2; return 1; }
+    [[ "$source" == "$BIN_DIR/$name" ]] || ln -sfn "$source" "$BIN_DIR/$name"
 }
 
 install_uv_tools() {
@@ -156,12 +131,11 @@ install_uv_tools() {
         "git+https://github.com/ast-grep/ast-grep-mcp.git@$AST_GREP_MCP_COMMIT"
 
     link_uv_tool serena
-    link_uv_tool uvx || true
     link_uv_tool ast-grep
     link_uv_tool ast-grep-server
 
     if [[ ! -f "$HOME/.serena/serena_config.yml" ]]; then
-        serena init --language-backend LSP
+        serena init -b LSP
     fi
 }
 
@@ -170,6 +144,8 @@ install_npm_tools() {
     mkdir -p "$prefix"
     export npm_config_prefix="$prefix"
     export npm_config_cache="$HOME/.cache/npm"
+    # RustOS deliberately uses CodeGraph graph-only; skip the unused embedding
+    # model, but do not skip the signed native analysis engine download.
     export CODEGRAPH_SKIP_MODEL_FETCH=1
     npm install --global --no-audit --no-fund \
         "@astudioplus/codegraph-mcp@$CODEGRAPH_VERSION" \
@@ -177,23 +153,37 @@ install_npm_tools() {
 
     local name
     for name in codegraph-mcp mcp-ripgrep; do
-        [[ -e "$prefix/bin/$name" ]] || {
-            echo "npm package did not expose expected executable: $name" >&2
-            return 1
-        }
+        [[ -e "$prefix/bin/$name" ]] || { echo "npm package did not expose $name" >&2; return 1; }
         ln -sfn "$prefix/bin/$name" "$BIN_DIR/$name"
     done
+
+    local actual_codegraph actual_ripgrep
+    actual_codegraph="$(node -p "require('$prefix/lib/node_modules/@astudioplus/codegraph-mcp/package.json').version")"
+    actual_ripgrep="$(node -p "require('$prefix/lib/node_modules/mcp-ripgrep/package.json').version")"
+    [[ "$actual_codegraph" == "$CODEGRAPH_VERSION" ]] || {
+        echo "CodeGraph version mismatch: $actual_codegraph" >&2; return 1;
+    }
+    [[ "$actual_ripgrep" == "$RIPGREP_MCP_VERSION" ]] || {
+        echo "mcp-ripgrep version mismatch: $actual_ripgrep" >&2; return 1;
+    }
+    codegraph-mcp --help >/dev/null
 }
 
 install_project_rust_analyzer() {
-    local root=${1:?repository root required}
-    local channel
+    local root=${1:?repository root required} channel
     channel="$(sed -n 's/^channel = "\(.*\)"/\1/p' "$root/rust-toolchain.toml")"
-    [[ -n "$channel" ]] || {
-        echo 'unable to read pinned Rust channel' >&2
-        return 1
-    }
+    [[ -n "$channel" ]] || { echo 'unable to read pinned Rust channel' >&2; return 1; }
     rustup toolchain install "$channel" --profile minimal --component rust-src --component rust-analyzer
+}
+
+write_manifest() {
+    cat >"$MANIFEST" <<EOF
+SERENA_VERSION=$SERENA_VERSION
+AST_GREP_VERSION=$AST_GREP_VERSION
+AST_GREP_MCP_COMMIT=$AST_GREP_MCP_COMMIT
+CODEGRAPH_VERSION=$CODEGRAPH_VERSION
+RIPGREP_MCP_VERSION=$RIPGREP_MCP_VERSION
+EOF
 }
 
 main() {
@@ -206,16 +196,17 @@ main() {
     install_project_rust_analyzer "$root"
     install_uv_tools
     install_npm_tools
+    write_manifest
 
-    log "installed versions"
+    log 'installed versions'
     serena --version
     ast-grep --version
     ast-grep-server --help >/dev/null
-    codegraph-mcp --version || codegraph-mcp --help | sed -n '1,3p'
+    codegraph-mcp --help >/dev/null
     node --version
     npm --version
-    npx --version
     clangd --version | sed -n '1p'
+    cat "$MANIFEST"
 
     log "persistent bin=$BIN_DIR"
     log "persistent tools=$TOOLS_ROOT"
