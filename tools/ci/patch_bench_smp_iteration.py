@@ -3,9 +3,13 @@ from pathlib import Path
 
 path = Path("tools/xtask/src/bench.rs")
 text = path.read_text()
-needle = '''    if let Some(probe) = isolate_probe {
+needle = '''        END_MARKER.to_owned(),
+    ];
+    if let Some(probe) = isolate_probe {
 '''
-replacement = '''    if rustos_vcpus > 1 {
+replacement = '''        END_MARKER.to_owned(),
+    ];
+    if rustos_vcpus > 1 {
         // Multi-vCPU benchmark runs are iterative performance evidence, not a
         // product/release admission lane. Use the bounded SMP verification
         // profile that kvm-run already uses for iterative multicore boots;
@@ -17,5 +21,5 @@ replacement = '''    if rustos_vcpus > 1 {
 '''
 count = text.count(needle)
 if count != 1:
-    raise SystemExit(f"expected one isolate-probe branch, found {count}")
+    raise SystemExit(f"expected one KVM isolate-probe branch, found {count}")
 path.write_text(text.replace(needle, replacement, 1))
