@@ -42,24 +42,35 @@ jobs:
           export PATH="$HOME/.local/bin:$PATH"
           bash tools/agent/bootstrap-remote-ai-tools.sh "$GITHUB_WORKSPACE"
 
+          serena_v="$(serena --version 2>&1)"
+          ast_v="$(ast-grep --version 2>&1)"
+          codegraph_v="$(codegraph-mcp --version 2>&1 || true)"
+          printf 'serena=%s\nast-grep=%s\ncodegraph=%s\n' "$serena_v" "$ast_v" "$codegraph_v"
+          grep -q '1\.6\.0' <<<"$serena_v"
+          grep -q '0\.45\.2' <<<"$ast_v"
+          grep -q '0\.20\.1' <<<"$codegraph_v"
+
       - name: Build Serena symbol index
         shell: bash
         run: |
           set -euo pipefail
           export PATH="$HOME/.local/bin:$PATH"
           mkdir -p build/agent-tools
-          serena project index "$GITHUB_WORKSPACE" \
+          cd "$GITHUB_WORKSPACE"
+          serena project index \
             --log-level WARNING \
-            --timeout 20 \
+            --timeout 60 \
             > build/agent-tools/serena-index.log 2>&1
           tail -n 80 build/agent-tools/serena-index.log
           test -d .serena/cache
+          find .serena/cache -type f -size +0c -print -quit | grep -q .
 
       - name: Smoke ast-grep structural search
         shell: bash
         run: |
           set -euo pipefail
           export PATH="$HOME/.local/bin:$PATH"
+          cd "$GITHUB_WORKSPACE"
           ast-grep run \
             --pattern 'unsafe { $$$BODY }' \
             --lang rust \
@@ -82,6 +93,8 @@ jobs:
         run: |
           set -euo pipefail
           export PATH="$HOME/.local/bin:$PATH"
+          export CODEGRAPH_TELEMETRY=off
+          cd "$GITHUB_WORKSPACE"
           codegraph-mcp \
             --graph-only \
             --workspace "$GITHUB_WORKSPACE" \
@@ -89,12 +102,15 @@ jobs:
             --exclude "$GITHUB_WORKSPACE/build" \
             --exclude "$GITHUB_WORKSPACE/logs" \
             --exclude "$GITHUB_WORKSPACE/vendor" \
+            --exclude "$GITHUB_WORKSPACE/driver-domains/linux/out" \
             --exclude "$GITHUB_WORKSPACE/Cargo.lock" \
+            --max-files 20000 \
             --profile all \
             --run-tool codegraph_get_module_summary \
             --tool-args '{"path":"kernel/ps"}' \
             > build/agent-tools/codegraph-smoke.json
           test -s build/agent-tools/codegraph-smoke.json
+          grep -Eiq 'kernel|module|symbol|dependency|summary' build/agent-tools/codegraph-smoke.json
           sed -n '1,80p' build/agent-tools/codegraph-smoke.json
 
       - name: Verify RustOS AI development environment
@@ -102,6 +118,7 @@ jobs:
         run: |
           set -euo pipefail
           export PATH="$HOME/.local/bin:$PATH"
+          cd "$GITHUB_WORKSPACE"
           tools/check-dev-environment.sh --ai
           echo '--- persistent tool footprint ---'
           du -sh "$HOME/.local/share/rustos-agent-tools" 2>/dev/null || true
