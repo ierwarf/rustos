@@ -12,18 +12,14 @@
       "command": "codegraph-mcp",
       "args": [
         "--mcp",
-        "--exclude",
-        "target",
-        "--exclude",
-        "build",
-        "--exclude",
-        "logs",
-        "--exclude",
-        "vendor",
-        "--exclude",
-        "Cargo.lock",
-        "--profile",
-        "all",
+        "--exclude", "target",
+        "--exclude", "build",
+        "--exclude", "logs",
+        "--exclude", "vendor",
+        "--exclude", "driver-domains/linux/out",
+        "--exclude", "Cargo.lock",
+        "--max-files", "20000",
+        "--profile", "all",
         "--graph-only"
       ]
     }
