@@ -1,0 +1,34 @@
+name: Cleanup extra branches
+
+on:
+  push:
+    branches: ["master"]
+    paths:
+      - ".github/workflows/cleanup-branches.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - name: Delete every branch except master
+        shell: bash
+        run: |
+          set -euo pipefail
+          for branch in \
+            build/artifact-footprint-and-speed \
+            perf/ipc-round-trip-under-30k \
+            perf/xtask-bench-20260907 \
+            phase7-pager-demand-paging
+          do
+            if git ls-remote --exit-code --heads origin "refs/heads/$branch" >/dev/null 2>&1; then
+              git push origin --delete "$branch"
+            else
+              echo "already absent: $branch"
+            fi
+          done
