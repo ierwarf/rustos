@@ -1,3 +1,4 @@
+# Retry after narrowing the source patch anchor.
 name: Apply bounded SMP bench profile fix
 
 on:
