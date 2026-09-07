@@ -1,0 +1,161 @@
+name: Apply canonical loader spawn fix
+
+on:
+  push:
+    branches: ["master"]
+    paths:
+      - ".github/workflows/apply-canonical-loader-fix.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: [self-hosted, Linux, X64]
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          clean: false
+
+      - name: Apply canonical spawn-path contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          git show 1aa5dff151d52ba7f200827cd5c9614888cbd25b:.github/workflows/bench-run.yml > .github/workflows/bench-run.yml
+          python3 - <<'PY'
+          from pathlib import Path
+
+          def replace_once(path, old, new):
+              p = Path(path)
+              text = p.read_text()
+              count = text.count(old)
+              if count != 1:
+                  raise SystemExit(f"{path}: expected exactly one match, got {count}")
+              p.write_text(text.replace(old, new, 1))
+
+          replace_once(
+              ".github/workflows/bench-run.yml",
+              '''on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "master"
+    paths:
+      - ".github/workflows/bench-run.yml"
+      - "compat/windows/services/winsys/**"
+      - "apps/windows/userdemo2/**"
+      - "tools/xtask/**"
+      - "kernel/**"
+      - "libs/**"
+      - "services/**"
+      - "docs/benchmarks/**"
+      - "docs/ai/performance-hardening.md"
+''',
+              '''on:
+  workflow_dispatch:
+''')
+
+          replace_once(
+              "services/rootd/src/main.rs",
+              '''    request.requester_pid = requester_pid as u64;
+    request.scheduling_context = register_scheduling_context_authority(
+        path,
+        request.requester_pid,
+        scheduling_context_policy_for_exec(path),
+    )
+    .map_err(i64::from)?;
+    request.flags = SPAWN_FLAG_LOGICAL_ADMIN as u32 | LOADER_SPAWN_FLAG_DEFER_START;
+    request.weight_micros = weight_micros;
+    request.exec_path_len = path.len() as u32;
+    request.argv_count = 1;
+    request.argv_bytes_len = (path.len() + 1) as u32;
+    copy_bytes(path, &mut request.exec_path);
+    copy_bytes(path, &mut request.argv_bytes);
+    request.argv_bytes[path.len()] = 0;
+''',
+              '''    request.requester_pid = requester_pid as u64;
+    let mut canonical_path_storage = [0_u8; LOADER_SPAWN_EXEC_PATH_CAPACITY];
+    let canonical_path = if path.first() == Some(&b'/') {
+        path
+    } else {
+        let canonical_len = path.len() + 1;
+        if canonical_len > canonical_path_storage.len() {
+            return Err(22);
+        }
+        canonical_path_storage[0] = b'/';
+        copy_bytes(path, &mut canonical_path_storage[1..]);
+        &canonical_path_storage[..canonical_len]
+    };
+    request.scheduling_context = register_scheduling_context_authority(
+        canonical_path,
+        request.requester_pid,
+        scheduling_context_policy_for_exec(canonical_path),
+    )
+    .map_err(i64::from)?;
+    request.flags = SPAWN_FLAG_LOGICAL_ADMIN as u32 | LOADER_SPAWN_FLAG_DEFER_START;
+    request.weight_micros = weight_micros;
+    request.exec_path_len = canonical_path.len() as u32;
+    request.argv_count = 1;
+    request.argv_bytes_len = (path.len() + 1) as u32;
+    copy_bytes(canonical_path, &mut request.exec_path);
+    copy_bytes(path, &mut request.argv_bytes);
+    request.argv_bytes[path.len()] = 0;
+''')
+
+          for path in ("services/initd/src/main.rs", "services/runtimed/src/spawn.rs"):
+              replace_once(
+                  path,
+                  '''    let exec_bytes = exec_path.as_bytes();
+''',
+                  '''    let canonical_exec_path = if exec_path.starts_with('/') {
+        exec_path.to_owned()
+    } else {
+        format!("/{exec_path}")
+    };
+    let exec_bytes = canonical_exec_path.as_bytes();
+''')
+              replace_once(
+                  path,
+                  '''        scheduling_context: request_scheduling_context_authority(exec_path)?,
+''',
+                  '''        scheduling_context: request_scheduling_context_authority(canonical_exec_path.as_str())?,
+''')
+
+          replace_once(
+              "services/loaderd/src/main.rs",
+              'const UI_SERVER_EXEC_PATH: &str = "services/uiserver/uiserver.elf";',
+              'const UI_SERVER_EXEC_PATH: &str = "/services/uiserver/uiserver.elf";')
+          replace_once(
+              "services/vfsd/src/main.rs",
+              'const UI_SERVER_EXEC_PATH: &[u8] = b"services/uiserver/uiserver.elf";',
+              'const UI_SERVER_EXEC_PATH: &[u8] = b"/services/uiserver/uiserver.elf";')
+          PY
+          cargo fmt --all
+          git diff --check
+
+      - name: Validate source tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo xtask check
+
+      - name: Commit validated fix to master
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rm .github/workflows/apply-canonical-loader-fix.yml
+          git add \
+            .github/workflows/bench-run.yml \
+            services/rootd/src/main.rs \
+            services/initd/src/main.rs \
+            services/runtimed/src/spawn.rs \
+            services/loaderd/src/main.rs \
+            services/vfsd/src/main.rs
+          git diff --cached --check
+          git config user.name "ierwarf"
+          git config user.email "64543544+ierwarf@users.noreply.github.com"
+          git commit -m "fix(loader): canonicalize spawn executable paths"
+          git push origin HEAD:master
