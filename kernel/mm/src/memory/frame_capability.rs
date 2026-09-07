@@ -185,6 +185,62 @@ impl FaultFramePool {
         }
     }
 
+    /// Fills and seals the boot reserve as one publication transaction.
+    ///
+    /// The allocator returns an exclusively owned, already-zeroed frame. Keeping
+    /// allocation behind callbacks lets host tests exercise the real boot state
+    /// machine, including partial failure, rather than filling through publish().
+    fn initialize(
+        &self,
+        mut allocate: impl FnMut() -> Option<u64>,
+        mut release: impl FnMut(u64),
+    ) -> Result<(), FrameGrantError> {
+        if self
+            .state
+            .compare_exchange(
+                FAULT_FRAME_POOL_COLD,
+                FAULT_FRAME_POOL_FILLING,
+                // ORDERING: one initializer acquires the completed failed-fill
+                // rollback before privately populating the slots.
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            // ORDERING: observe a completed Ready publication or refuse an
+            // initializer still holding private Filling ownership.
+            return (self.state.load(Ordering::Acquire) == FAULT_FRAME_POOL_READY)
+                .then_some(())
+                .ok_or(FrameGrantError::Pressure);
+        }
+        for slot in &self.frames {
+            let Some(frame_phys) = allocate() else {
+                for allocated in &self.frames {
+                    // ORDERING: withdraw only the private Filling owner's
+                    // frames; no reserve operation may consume them yet.
+                    let frame_phys = allocated.swap(0, Ordering::AcqRel);
+                    if frame_phys != 0 {
+                        release(frame_phys);
+                    }
+                }
+                // ORDERING: a later initializer acquires the empty slot array.
+                self.state.store(FAULT_FRAME_POOL_COLD, Ordering::Release);
+                return Err(FrameGrantError::OutOfFrames);
+            };
+            // ORDERING: Filling excludes consumers; Ready seals these stores.
+            slot.store(frame_phys, Ordering::Release);
+        }
+        // The boot fill bypasses publish(), so it must also establish the
+        // count that authorizes reservations. Otherwise a full array seals as
+        // Ready with zero claims, permanently stranding every wired frame.
+        // ORDERING: Filling still excludes consumers. Ready's Release store
+        // publishes both the frame slots and this count to reserve's Acquire.
+        self.available
+            .store(MAX_PREALLOCATED_PAGER_FAULT_FRAMES, Ordering::Relaxed);
+        self.state.store(FAULT_FRAME_POOL_READY, Ordering::Release);
+        Ok(())
+    }
+
     fn publish(&self, frame_phys: u64) -> Result<(), FrameGrantError> {
         if frame_phys == 0 || !frame_phys.is_multiple_of(FRAME_BYTES as u64) {
             return Err(FrameGrantError::Malformed);
@@ -499,68 +555,25 @@ pub fn pager_fault_reserve_exhaustions() -> u64 {
 static FRAME_GRANTS: FrameGrantTable = FrameGrantTable::new();
 static FAULT_FRAME_POOL: FaultFramePool = FaultFramePool::new();
 
-/// Wires the bounded fault-frame reserve after physical memory initialization.
-///
-/// This runs once before user tasks exist. A failure is terminal at boot: a
-/// pageable product topology must not advertise a fault path that later falls
-/// back to allocator work from exception context.
+/// Wires the bounded reserve before user tasks exist. Allocation and zeroing
+/// stay outside fault context; the pool owns rollback and final publication.
 pub fn preallocate_pager_fault_frames() -> Result<(), FrameGrantError> {
-    if FAULT_FRAME_POOL
-        .state
-        .compare_exchange(
-            FAULT_FRAME_POOL_COLD,
-            FAULT_FRAME_POOL_FILLING,
-            // ORDERING: AcqRel makes this initializer the only physical-frame
-            // owner while acquiring any prior failed-fill reset publication.
-            Ordering::AcqRel,
-            // ORDERING: failure needs only the published pool state below;
-            // payload fields are inaccessible until Ready.
-            Ordering::Acquire,
-        )
-        .is_err()
-    {
-        // ORDERING: Acquire observes whether a prior boot initializer sealed
-        // Ready, versus a still-private Filling attempt that must fail closed.
-        return (FAULT_FRAME_POOL.state.load(Ordering::Acquire) == FAULT_FRAME_POOL_READY)
-            .then_some(())
-            .ok_or(FrameGrantError::Pressure);
-    }
-    for slot in &FAULT_FRAME_POOL.frames {
-        let Some(frame) = phys::alloc_frame() else {
-            for allocated in &FAULT_FRAME_POOL.frames {
-                // ORDERING: AcqRel withdraws only frames published by this
-                // failed Filling owner before they are returned to phys.
-                let frame_phys = allocated.swap(0, Ordering::AcqRel);
-                if frame_phys != 0 {
-                    phys::free_frame(PhysAddr::new(frame_phys));
-                }
+    FAULT_FRAME_POOL.initialize(
+        || {
+            let frame = phys::alloc_frame()?;
+            // SAFETY: this callback exclusively owns the fresh physical frame
+            // until initialize publishes its fully zeroed contents.
+            unsafe {
+                ptr::write_bytes(
+                    kernel_vm::higher_half_addr(frame.as_u64()) as *mut u8,
+                    0,
+                    FRAME_BYTES,
+                );
             }
-            // ORDERING: Release reopens a fully drained reserve; no fault can
-            // reserve it until a later initializer publishes Ready.
-            FAULT_FRAME_POOL
-                .state
-                .store(FAULT_FRAME_POOL_COLD, Ordering::Release);
-            return Err(FrameGrantError::OutOfFrames);
-        };
-        // SAFETY: boot owns the newly allocated frame exclusively until the
-        // slot's Release publication makes its all-zero contents observable.
-        unsafe {
-            ptr::write_bytes(
-                kernel_vm::higher_half_addr(frame.as_u64()) as *mut u8,
-                0,
-                FRAME_BYTES,
-            );
-        }
-        // ORDERING: during Filling no reservation is permitted, so this
-        // direct Release store cannot race a consumer or double-publish.
-        slot.store(frame.as_u64(), Ordering::Release);
-    }
-    // ORDERING: Ready is the final boot publication; every frame-store before
-    // it is visible to a reserve operation that acquires this state.
-    FAULT_FRAME_POOL
-        .state
-        .store(FAULT_FRAME_POOL_READY, Ordering::Release);
-    Ok(())
+            Some(frame.as_u64())
+        },
+        |frame_phys| phys::free_frame(PhysAddr::new(frame_phys)),
+    )
 }
 
 /// Replenishes a bounded number of consumed wired fault frames from normal
@@ -896,6 +909,80 @@ mod tests {
         // has received its zeroed physical identity.
         pool.state.store(FAULT_FRAME_POOL_READY, Ordering::Release);
         pool
+    }
+
+    /// Boot uses direct slot stores, unlike replenishment. Its Ready seal must
+    /// publish matching claim authority, not merely a nonempty backing array.
+    #[test]
+    fn boot_filled_reserve_publishes_every_frame_before_ready() {
+        let pool = FaultFramePool::new();
+        let mut allocated = 0;
+        pool.initialize(
+            || {
+                allocated += 1;
+                Some(allocated as u64 * FRAME_BYTES as u64)
+            },
+            |_| panic!("successful fill must not release a frame"),
+        )
+        .unwrap();
+        assert_eq!(allocated, MAX_PREALLOCATED_PAGER_FAULT_FRAMES);
+        assert_eq!(pool.available.load(Ordering::Relaxed), allocated);
+        assert!(!pool.has_empty_slot());
+        pool.initialize(
+            || panic!("Ready must not allocate twice"),
+            |_| panic!("Ready must not release"),
+        )
+        .unwrap();
+        let mut seen = alloc::collections::BTreeSet::new();
+        for _ in 0..allocated {
+            assert!(seen.insert(pool.reserve().expect("boot-published claim")));
+        }
+        assert_eq!(seen.len(), allocated);
+        assert_eq!(pool.reserve(), Err(FrameGrantError::OutOfFrames));
+        assert_eq!(pool.available.load(Ordering::Relaxed), 0);
+    }
+
+    /// A failed fill returns every private frame exactly once and exposes no
+    /// claim authority; retry must publish the same full capacity as cold boot.
+    #[test]
+    fn failed_boot_fill_releases_frames_and_retries_without_phantom_claims() {
+        let pool = FaultFramePool::new();
+        let mut allocated = 0;
+        let mut released = alloc::collections::BTreeSet::new();
+        assert_eq!(
+            pool.initialize(
+                || {
+                    allocated += 1;
+                    (allocated <= 7).then_some(allocated as u64 * FRAME_BYTES as u64)
+                },
+                |frame| {
+                    assert!(released.insert(frame));
+                },
+            ),
+            Err(FrameGrantError::OutOfFrames)
+        );
+        assert_eq!(released.len(), 7);
+        assert!(
+            pool.frames
+                .iter()
+                .all(|frame| frame.load(Ordering::Relaxed) == 0)
+        );
+        assert_eq!(pool.available.load(Ordering::Relaxed), 0);
+        assert_eq!(pool.reserve(), Err(FrameGrantError::Pressure));
+        let mut next_frame = 0;
+        pool.initialize(
+            || {
+                next_frame += FRAME_BYTES as u64;
+                Some(next_frame)
+            },
+            |_| panic!("retry must complete"),
+        )
+        .unwrap();
+        assert_eq!(
+            pool.available.load(Ordering::Relaxed),
+            MAX_PREALLOCATED_PAGER_FAULT_FRAMES
+        );
+        assert!(pool.reserve().is_ok());
     }
 
     /// The progress condition for demand paging, stated as a test.

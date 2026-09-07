@@ -79,8 +79,8 @@ use rustos_user_abi::syscall::{
 use storage_fat::{FatDirEntry, FatNodeKind, FatVolume};
 use vfsd::{
     cacheable_metadata_errno, checked_next_generation, checked_seek_position, checkpoint_path_key,
-    executable_snapshot_marker, mkdir_policy, persistent_mutation_status,
-    reply_failure_diagnostic_due, should_materialize_file_cache,
+    executable_snapshot_marker, executable_snapshot_resolution_base, mkdir_policy,
+    persistent_mutation_status, reply_failure_diagnostic_due, should_materialize_file_cache,
     ui_bootstrap_snapshot_reply_completed, unlink_policy, valid_checkpoint_record,
     ExecutableSnapshotBacking, OpenDescriptionCheckpointWire, SeekPositionError,
     WaitSetInterestKey, WaitSetInterestRecord, WaitSetRegistry, WaitSetRegistryError,
@@ -106,6 +106,7 @@ use linux_types::{
 };
 use snapshot_worker::{
     demote_current_thread_or_exit, enqueue_executable_snapshot, ensure_snapshot_worker,
+    reply_snapshot_status,
 };
 use util::{
     build_linux_stat, build_linux_statx, encode_dirent, handle_kind_u16, is_at_fdcwd,
@@ -307,7 +308,20 @@ fn serve(endpoint: u64, mut state: VfsState) {
         };
         let reply = if received as usize == size_of::<VfsExecutableSnapshotRequest>() {
             let request = unsafe { &*request.as_ptr().cast::<VfsExecutableSnapshotRequest>() };
-            enqueue_executable_snapshot(reply_cap, sender_pid, sender_tid, *request)
+            if request.requester_pid != sender_pid
+                || request.requester_tid != sender_tid
+                || rustos_svc_runtime::ipc::validate_service_owner(IPC_SERVICE_LOADERD, sender_pid)
+                    < 0
+            {
+                reply_snapshot_status(reply_cap, EACCES)
+            } else {
+                match state.resolve_executable_snapshot_request(*request) {
+                    Ok(resolved) => {
+                        enqueue_executable_snapshot(reply_cap, sender_pid, sender_tid, resolved)
+                    }
+                    Err(errno) => reply_snapshot_status(reply_cap, errno),
+                }
+            }
         } else if received as usize == size_of::<VfsIpcRequest>() {
             let request = unsafe { &*request.as_ptr().cast::<VfsIpcRequest>() };
             let response = reset_vfs_response_slot(request.op);
@@ -430,6 +444,9 @@ fn reply_executable_snapshot(
     };
     response.file_bytes = snapshot.file_bytes;
     response.mount_generation = lock_vfs_storage().mount_generation;
+    response.resolved_path_len = request.path_len;
+    response.resolved_path[..request.path_len as usize]
+        .copy_from_slice(&request.path[..request.path_len as usize]);
     let send_fd = snapshot.fd as u64;
     let args = IpcReplyWithHandlesArgs {
         reply_cap,

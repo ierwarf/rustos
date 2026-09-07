@@ -210,6 +210,11 @@ lock, and service restart invalidates it by advancing the epoch.
   generated more than a thousand unrelated wakeups per second on a two-vCPU
   guest. This is a bounded bridge until those heterogeneous sources share an
   event wait object, not permission to widen synchronous IPC deadlines.
+  Runtimed never enters its procd-owned `wait4(WNOHANG)` policy round trip while
+  its authoritative running-child set is empty. Child activation is gated on
+  publication into that set, so the empty set proves that no reap is possible.
+  This prevents a five-second procd control deadline from serializing every
+  catalog, launch, and UI owner behind an impossible reap during SMP startup.
 
 - Default KVM-smoke runs keep coarse `uiserver: update tick` logs only.
 - Generic and typed slow-IPC diagnostics each emit at most one representative

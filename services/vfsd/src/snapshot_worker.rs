@@ -93,11 +93,11 @@ pub(super) fn demote_current_thread_or_exit(role: &str) {
     }
 }
 
-fn reply_snapshot_overload(reply_cap: u64) -> i64 {
+pub(super) fn reply_snapshot_status(reply_cap: u64, status: i32) -> i64 {
     let response = VfsExecutableSnapshotResponse {
         version: VFS_EXECUTABLE_SNAPSHOT_ABI_VERSION,
         op: VFS_EXECUTABLE_SNAPSHOT_OP_OPEN,
-        status: EAGAIN,
+        status,
         ..VfsExecutableSnapshotResponse::default()
     };
     // SAFETY: response is an initialized fixed-layout wire value and remains
@@ -109,6 +109,10 @@ fn reply_snapshot_overload(reply_cap: u64) -> i64 {
             size_of::<VfsExecutableSnapshotResponse>(),
         )
     }
+}
+
+fn reply_snapshot_overload(reply_cap: u64) -> i64 {
+    reply_snapshot_status(reply_cap, EAGAIN)
 }
 
 pub(super) fn enqueue_executable_snapshot(

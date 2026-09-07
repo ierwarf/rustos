@@ -4,12 +4,14 @@ mod ipc_reply_recv;
 mod pager_fault;
 mod scheduling_context;
 pub mod smp_qualification;
+mod vfs_executable_snapshot;
 pub use activation_batch::*;
 pub use affinity::*;
 pub use ipc_reply_recv::*;
 pub use pager_fault::*;
 pub use scheduling_context::*;
 pub use smp_qualification::*;
+pub use vfs_executable_snapshot::*;
 pub const SYS_RUSTOS_DEBUG_PRINT: u64 = 0x5255_0001;
 pub const SYS_RUSTOS_SPAWN_EXEC: u64 = 0x5255_0002;
 pub const SYS_RUSTOS_IPC_ENDPOINT_CREATE: u64 = 0x5255_0003;
@@ -499,11 +501,6 @@ pub const VFS_IPC_OP_CURSOR_SETTLE: u16 = 24;
 /// Acknowledge visibility of a successful tombstoning mutation so vfsd may
 /// reclaim its durable replay record without breaking response-loss retries.
 pub const VFS_IPC_OP_CHECKPOINT_ACK: u16 = 25;
-/// Private loaderd-to-vfsd request for an immutable, terminally sealed file
-/// snapshot. The returned memfd is transferred out-of-band with the reply;
-/// this operation is never exposed as a Linux filesystem syscall.
-pub const VFS_EXECUTABLE_SNAPSHOT_ABI_VERSION: u16 = 1;
-pub const VFS_EXECUTABLE_SNAPSHOT_OP_OPEN: u16 = 1;
 pub const VFS_CURSOR_SETTLE_COMMIT: u64 = 1;
 pub const VFS_CURSOR_SETTLE_CANCEL: u64 = 2;
 pub const VFS_POLL_QUERY_POLL: u64 = 1;
@@ -845,7 +842,7 @@ pub const LINUX_CPUSET_BYTES: usize = 8;
 pub const LINUX_DEFAULT_STACK_RLIMIT_BYTES: u64 = 8 * 1024 * 1024;
 pub const LINUX_TIMESPEC_SIZE: usize = 16;
 pub const LINUX_SIGACTION_SIZE: usize = 32;
-pub const LOADER_REQUEST_ABI_VERSION: u16 = 2;
+pub const LOADER_REQUEST_ABI_VERSION: u16 = 3;
 pub const LOADER_OP_SPAWN_EXEC: u16 = 1;
 pub const LOADER_OP_EXEC_TARGET: u16 = 2;
 
@@ -871,7 +868,7 @@ pub const LOADER_SPAWN_FLAG_IMMEDIATE_HANDOFF: u32 = 1 << 1;
 pub const LOADER_SPAWN_FLAG_DEFER_START: u32 = 1 << 2;
 pub const IPC_WAIT_SERVICE_ENDPOINT_ABI_VERSION: u16 = 1;
 pub const IPC_WAIT_SERVICE_ENDPOINT_MAX_TIMEOUT_MS: u64 = 30_000;
-pub const PROCD_IPC_ABI_VERSION: u16 = 3;
+pub const PROCD_IPC_ABI_VERSION: u16 = 4;
 pub const PROCD_OP_EXECVE: u16 = 1;
 pub const PROCD_OP_EXECVEAT: u16 = 2;
 pub const PROCD_OP_FORK: u16 = 3;
@@ -1767,60 +1764,6 @@ pub struct DvmBlockInfoWire {
     pub physical_block_size: u32,
     pub flags: u32,
     pub reserved0: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct VfsExecutableSnapshotRequest {
-    pub version: u16,
-    pub op: u16,
-    pub flags: u32,
-    pub requester_pid: u64,
-    pub requester_tid: u64,
-    pub max_bytes: u64,
-    pub path_len: u32,
-    pub reserved0: u32,
-    /// The caller's absolute `CLOCK_MONOTONIC` deadline in nanoseconds, or 0
-    /// when the caller sets none.
-    ///
-    /// `CLOCK_MONOTONIC` is derived from the system tick counter, so this is
-    /// comparable in the provider's own process. Carrying the end instant
-    /// rather than a duration is what lets the provider decide *not* to reply:
-    /// a reply produced after the caller abandoned its reply capability is
-    /// rejected by the kernel and reported to the caller as a permission
-    /// failure, which is how a latency problem gets misread as an authority
-    /// problem. See `V5-DEADLINE-012`.
-    pub deadline_ns: u64,
-    pub path: [u8; VFS_IPC_PATH_CAPACITY],
-}
-
-impl Default for VfsExecutableSnapshotRequest {
-    fn default() -> Self {
-        Self {
-            version: VFS_EXECUTABLE_SNAPSHOT_ABI_VERSION,
-            op: VFS_EXECUTABLE_SNAPSHOT_OP_OPEN,
-            flags: 0,
-            requester_pid: 0,
-            requester_tid: 0,
-            max_bytes: 0,
-            path_len: 0,
-            reserved0: 0,
-            deadline_ns: 0,
-            path: [0; VFS_IPC_PATH_CAPACITY],
-        }
-    }
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct VfsExecutableSnapshotResponse {
-    pub version: u16,
-    pub op: u16,
-    pub status: i32,
-    pub reserved0: u32,
-    pub reserved1: u32,
-    pub file_bytes: u64,
-    pub mount_generation: u64,
 }
 
 #[repr(C)]
@@ -2938,6 +2881,9 @@ pub struct LoaderSpawnRequest {
     pub target_pid: u64,
     pub target_tid: u64,
     pub exec_ticket: u64,
+    /// VFS directory basis for `exec_path`. Spawn requests carry zero because
+    /// their paths are absolute; exec-target requests carry `AT_FDCWD`.
+    pub exec_dirfd: u64,
     pub exec_path_len: u32,
     pub argv_count: u16,
     pub env_count: u16,
@@ -2963,6 +2909,7 @@ impl Default for LoaderSpawnRequest {
             target_pid: 0,
             target_tid: 0,
             exec_ticket: 0,
+            exec_dirfd: 0,
             exec_path_len: 0,
             argv_count: 0,
             env_count: 0,

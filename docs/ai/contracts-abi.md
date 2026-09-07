@@ -1643,7 +1643,7 @@ policy remains with the owning service.
 
 - Runtime launches route through `loaderd` (`IPC_SERVICE_LOADERD`), not direct `SYS_RUSTOS_SPAWN_EXEC`.
 - `SYS_RUSTOS_PROC_*_BROKER` calls fail with `EACCES` unless caller owns `PROCESS_LOADER`.
-- Loader request ABI v2 requires `requester_pid` to equal the kernel-stamped
+- Loader request ABI v3 requires `requester_pid` to equal the kernel-stamped
   IPC sender. Process broker ABI v3 carries that identity into deferred
   commit: ring0 binds the suspended target PID to the exact requester in a
   bounded registry. ACTIVATE consumes that pair once; foreign callers and
@@ -1664,7 +1664,16 @@ policy remains with the owning service.
   is ring0 corruption and panics instead of exposing a partially runnable
   startup cohort.
 - `SYS_RUSTOS_SPAWN_EXEC` restricted to `rootd` spawning the fixed bootstrap allowlist (`syscalld`, `vfsd`, `loaderd`, `procd`, `initd`). Fails closed for `initd`, generic apps, broad service restarts. rootd may use direct spawn only during fixed bootstrap + `loaderd` recovery; post-bootstrap restarts of other leases must call loaderd.
-- Linux `execve` → `procd` (target auth) → `loaderd` (image materialization). If loader materialization fails, procd must cancel the exec ticket via `SYS_RUSTOS_PROC_CANCEL_EXEC_BROKER` before replying.
+- Linux `execve` → `procd` (target auth) → `loaderd` (image materialization)
+  → `vfsd` (namespace resolution and immutable executable snapshot). Kernel
+  process state carries no cwd copy. Procd forwards the raw path plus
+  `AT_FDCWD`; loaderd's VFS executable-snapshot ABI v2 names the target PID,
+  and vfsd resolves the path against that PID's authoritative cwd before it
+  admits bulk I/O. Vfsd returns the canonical absolute path and the terminally
+  sealed executable handle in one reply. Loaderd uses that returned path for
+  process identity and never combines a cwd string itself. If loader
+  materialization fails, procd must cancel the exec ticket via
+  `SYS_RUSTOS_PROC_CANCEL_EXEC_BROKER` before replying.
 - An exec ticket binds one live, non-exiting Linux `(target_pid, target_tid)` pair. Cancel and exec-target validate that exact stored pair before consuming the ticket; a mismatched request must leave it live. The successful exec-target path publishes its register handoff before replacing the target image. Normal/signal process exit, a non-final target-thread exit, and sibling retirement caused by Linux exec remove stale ticket or handoff state.
   Exec detaches retired siblings from the process thread count immediately but
   keeps each scheduler slot quarantined with its exact runtime-cleanup stamp;
@@ -1788,6 +1797,12 @@ ELF file mappings cross the VFS/loader/process boundary only as one immutable
 executable snapshot. Vfsd reads the admitted file once into a bounded private
 memfd and applies
 `F_SEAL_WRITE|F_SEAL_GROW|F_SEAL_SHRINK|F_SEAL_SEAL` before publishing it.
+Relative executable paths are normalized by the vfsd endpoint receive owner
+while it exclusively owns PID cwd state; the bulk snapshot worker receives
+only the canonical absolute path. The v2 response binds that exact path to the
+handle, byte count, and mount generation returned to loaderd. A relative
+snapshot with no target PID or a directory basis other than `AT_FDCWD` fails
+closed until the ABI carries an authenticated remote directory handle.
 The kernel-stamped `product-executable-snapshot-sealed` milestone is reserved
 for a DVM-volume read. Its checksummed `evidence_v=1` payload contains the
 fixed Vfsd service identity, kernel-observed live Vfsd endpoint generation,
@@ -1925,7 +1940,7 @@ does not satisfy the 55 FPS gate.
 
 ## Process Policy Surface (`procd`)
 
-procd owns Linux `execve`, `fork`/`clone`, `wait4`, `rt_sigaction`, `rt_sigprocmask`, `sigaltstack`, `tgkill`, signal selection. Procd IPC ABI v3 has a distinct default-stop disposition and an exact coalesced SIGCHLD cause snapshot; ring0 rejects a stop signal mapped to termination, a non-stop signal mapped to stop, and every stale or out-of-mask cause selection.
+procd owns Linux `execve`, `fork`/`clone`, `wait4`, `rt_sigaction`, `rt_sigprocmask`, `sigaltstack`, `tgkill`, signal selection. Procd IPC ABI v4 removes the copied cwd payload from exec requests: the raw path and `AT_FDCWD` basis continue through loaderd to vfsd, which resolves them against the target PID's namespace. It retains v3's distinct default-stop disposition and exact coalesced SIGCHLD cause snapshot; ring0 rejects a stop signal mapped to termination, a non-stop signal mapped to stop, and every stale or out-of-mask cause selection.
 
 `wait4` routes through procd for ownership validation; kernel still performs narrow process-table wait + status/rusage copyout. `WUNTRACED` consumes one exact `(signal << 8) | 0x7f` child stop state and `WCONTINUED` consumes `0xffff`; without the matching option the state remains pending. A default stop gates every Linux task in the process while preserving its ready/block state. SIGCONT resumes all of them before its own disposition or mask is considered, and SIGKILL also removes the stop gate before termination delivery. Stop, continue, and exit queue process-directed SIGCHLD with exact coalesced cause bits. A receiving thread transfers those causes to a live sibling before retirement. Procd applies `SA_NOCLDSTOP` only when no exit cause coalesced, while ring0 revalidates and removes only the selected snapshot so a cause queued during the policy round trip remains pending.
 

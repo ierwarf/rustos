@@ -374,7 +374,9 @@ vfs_receive_body="$(
 vfs_snapshot_worker_body="$(
     cat services/vfsd/src/snapshot_worker.rs
 )"
-if ! grep -Fq 'enqueue_executable_snapshot(reply_cap, sender_pid, sender_tid, *request)' <<<"$vfs_receive_body" \
+if ! grep -Fq 'state.resolve_executable_snapshot_request(*request)' <<<"$vfs_receive_body" \
+    || ! grep -Fq 'enqueue_executable_snapshot(reply_cap, sender_pid, sender_tid, resolved)' <<<"$vfs_receive_body" \
+    || grep -Fq 'enqueue_executable_snapshot(reply_cap, sender_pid, sender_tid, *request)' <<<"$vfs_receive_body" \
     || grep -Fq 'reply_executable_snapshot(' <<<"$vfs_receive_body" \
     || ! grep -Fq 'reply_executable_snapshot(' <<<"$vfs_snapshot_worker_body" \
     || ! grep -Fq 'SnapshotWorkerAdmission' services/vfsd/src/snapshot_worker.rs \

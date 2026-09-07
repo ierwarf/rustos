@@ -120,22 +120,14 @@ pub fn procd_exec(
         Ok(path) => path,
         Err(errno) => return linux_errno(errno),
     };
-    let current_cwd = match multitask::with_current_user_process_state(|_, _, process_state| {
-        String::from(process_state.cwd())
-    }) {
-        Some(cwd) => cwd,
-        None => return linux_errno(LINUX_ESRCH),
-    };
     let mut request = new_procd_request(op);
     request.dirfd = (linux_abi::AT_FDCWD as i64) as u64;
     request.flags = flags as u32;
-    if raw_exec_path.len() > request.path.len() || current_cwd.len() > request.payload.len() {
+    if raw_exec_path.len() > request.path.len() {
         return linux_errno(LINUX_EINVAL);
     }
     request.path_len = raw_exec_path.len() as u32;
     request.path[..raw_exec_path.len()].copy_from_slice(raw_exec_path.as_bytes());
-    request.payload_len = current_cwd.len() as u32;
-    request.payload[..current_cwd.len()].copy_from_slice(current_cwd.as_bytes());
     if let Err(errno) = copy_string_vector(
         argv_ptr,
         LOADER_SPAWN_MAX_ARG_COUNT,

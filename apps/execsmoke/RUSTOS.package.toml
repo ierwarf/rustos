@@ -17,6 +17,11 @@ weight_micros = 100
 args = ["apps/execsmoke/execsmoke.elf", "execve"]
 
 [[desktop.entries]]
+display_name = "relative execve smoke"
+weight_micros = 100
+args = ["apps/execsmoke/execsmoke.elf", "relative-execve"]
+
+[[desktop.entries]]
 display_name = "execveat smoke"
 weight_micros = 100
 args = ["apps/execsmoke/execsmoke.elf", "execveat"]

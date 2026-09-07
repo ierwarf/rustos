@@ -230,6 +230,27 @@ static int run_execve_mode(const char *post_mode) {
     return 1;
 }
 
+static int run_relative_execve_mode(void) {
+    if (configure_pre_exec_state() != 0 || prepare_fd_state() != 0) {
+        return 1;
+    }
+    if (chdir(EXECSMOKE_DIR) != 0) {
+        log_line("exec smoke: chdir failed errno=%d", errno);
+        return 1;
+    }
+
+    setenv("EXECSMOKE_MODE", "post-relative-execve", 1);
+    set_env_int("EXECSMOKE_EXPECT_ARGC", 2);
+    char *const argv[] = {
+        (char *)"./execsmoke.elf",
+        (char *)"post-relative-execve",
+        NULL,
+    };
+    execve("./execsmoke.elf", argv, environ);
+    log_line("exec smoke: relative execve failed errno=%d", errno);
+    return 1;
+}
+
 static int run_execveat_mode(void) {
     if (configure_pre_exec_state() != 0 || prepare_fd_state() != 0) {
         return 1;
@@ -303,12 +324,16 @@ int main(int argc, char **argv) {
     }
 
     if (argc < 2) {
-        log_line("exec smoke: usage: execve | execveat | thread-execve | empty-argv");
+        log_line(
+            "exec smoke: usage: execve | relative-execve | execveat | thread-execve | empty-argv");
         return 1;
     }
 
     if (strcmp(argv[1], "execve") == 0) {
         return run_execve_mode("post-execve");
+    }
+    if (strcmp(argv[1], "relative-execve") == 0) {
+        return run_relative_execve_mode();
     }
     if (strcmp(argv[1], "execveat") == 0) {
         return run_execveat_mode();

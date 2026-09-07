@@ -4,8 +4,6 @@
 extern crate alloc;
 
 use alloc::collections::BTreeMap;
-use alloc::string::String;
-use alloc::vec::Vec;
 use core::mem::size_of;
 #[cfg(not(test))]
 use core::panic::PanicInfo;
@@ -432,14 +430,17 @@ fn handle_exec(request: &ProcdIpcRequest, response: &mut ProcdIpcResponse) {
         return;
     }
     let raw_path_len = request.path_len as usize;
-    if raw_path_len == 0 || request.path[..raw_path_len].contains(&0) {
+    if raw_path_len == 0
+        || raw_path_len > request.path.len()
+        || request.path[..raw_path_len].contains(&0)
+    {
         response.status = EINVAL;
         return;
     }
-    let exec_path = match resolve_exec_path(request, raw_path_len) {
+    let exec_path = match core::str::from_utf8(&request.path[..raw_path_len]) {
         Ok(path) => path,
-        Err(status) => {
-            response.status = status;
+        Err(_) => {
+            response.status = EINVAL;
             return;
         }
     };
@@ -480,6 +481,7 @@ fn handle_exec(request: &ProcdIpcRequest, response: &mut ProcdIpcResponse) {
         target_pid: request.pid,
         target_tid: request.tid,
         exec_ticket,
+        exec_dirfd: AT_FDCWD,
         exec_path_len: exec_path_len as u32,
         argv_count: request.argv_count,
         env_count: request.env_count,
@@ -533,54 +535,6 @@ fn handle_exec(request: &ProcdIpcRequest, response: &mut ProcdIpcResponse) {
     } else {
         cancel_exec_ticket(exec_ticket, request.pid, request.tid);
     }
-}
-
-fn resolve_exec_path(request: &ProcdIpcRequest, path_len: usize) -> Result<String, i32> {
-    let path = core::str::from_utf8(&request.path[..path_len]).map_err(|_| EINVAL)?;
-    if path.starts_with('/') {
-        return normalize_absolute_path(path);
-    }
-    let cwd_len = request.payload_len as usize;
-    if cwd_len == 0 || cwd_len > request.payload.len() || request.payload[..cwd_len].contains(&0) {
-        return Err(EINVAL);
-    }
-    let cwd = core::str::from_utf8(&request.payload[..cwd_len]).map_err(|_| EINVAL)?;
-    if !cwd.starts_with('/') {
-        return Err(EINVAL);
-    }
-    let mut combined = String::from(cwd);
-    if !combined.ends_with('/') {
-        combined.push('/');
-    }
-    combined.push_str(path);
-    normalize_absolute_path(combined.as_str())
-}
-
-fn normalize_absolute_path(path: &str) -> Result<String, i32> {
-    if !path.starts_with('/') {
-        return Err(EINVAL);
-    }
-    let mut components = Vec::new();
-    for part in path.split('/') {
-        match part {
-            "" | "." => {}
-            ".." => {
-                let _ = components.pop();
-            }
-            segment => components.push(segment),
-        }
-    }
-    let mut normalized = String::from("/");
-    for (index, component) in components.iter().enumerate() {
-        if index != 0 {
-            normalized.push('/');
-        }
-        normalized.push_str(component);
-    }
-    if normalized.len() > PROCD_PATH_CAPACITY {
-        return Err(EINVAL);
-    }
-    Ok(normalized)
 }
 
 fn cancel_exec_ticket(exec_ticket: u64, target_pid: u64, target_tid: u64) {

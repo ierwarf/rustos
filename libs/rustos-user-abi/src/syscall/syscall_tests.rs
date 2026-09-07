@@ -391,6 +391,11 @@ fn statx_offload_defaults_are_valid_v1_headers() {
         VFS_EXECUTABLE_SNAPSHOT_ABI_VERSION
     );
     assert_eq!(snapshot_request.op, VFS_EXECUTABLE_SNAPSHOT_OP_OPEN);
+    assert_eq!(snapshot_request.target_pid, 0);
+    assert_eq!(snapshot_request.dirfd, 0);
+
+    let snapshot_response = VfsExecutableSnapshotResponse::default();
+    assert_eq!(snapshot_response.resolved_path_len, 0);
 }
 
 #[test]

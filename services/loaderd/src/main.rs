@@ -544,28 +544,36 @@ fn handle_request(
         }
     };
 
-    let exec_path = match request_text(&request.exec_path, request.exec_path_len as usize) {
+    let requested_exec_path = match request_text(&request.exec_path, request.exec_path_len as usize)
+    {
         Ok(path) => path,
         Err(errno) => {
             response.status = errno;
             return spawn_response(response);
         }
     };
+    trace_line(&format!("loaderd: spawn begin exec={requested_exec_path}"));
+    let snapshot = match open_immutable_file_snapshot(
+        requested_exec_path,
+        request.target_pid,
+        request.exec_dirfd,
+    ) {
+        Ok(snapshot) => snapshot,
+        Err(errno) => {
+            debug_line(&format!(
+                "loaderd: open executable snapshot failed exec={requested_exec_path} errno={errno}"
+            ));
+            response.status = errno;
+            return spawn_response(response);
+        }
+    };
+    let fd = snapshot.fd;
+    let exec_path = snapshot.resolved_path.as_str();
     let exec_path_c = match CString::new(exec_path) {
         Ok(path) => path,
         Err(_) => {
+            let _ = syscall1(SYS_CLOSE, fd as u64);
             response.status = EINVAL;
-            return spawn_response(response);
-        }
-    };
-    trace_line(&format!("loaderd: spawn begin exec={exec_path}"));
-    let fd = match open_immutable_file_snapshot(exec_path) {
-        Ok(fd) => fd,
-        Err(errno) => {
-            debug_line(&format!(
-                "loaderd: open executable snapshot failed exec={exec_path} errno={errno}"
-            ));
-            response.status = errno;
             return spawn_response(response);
         }
     };
@@ -858,13 +866,22 @@ fn handle_commercial_request(
 }
 
 fn probe_image(path: &str) -> Result<u16, i32> {
-    let fd = open_immutable_file_snapshot(path)?;
+    let fd = open_immutable_file_snapshot(path, 0, 0)?.fd;
     let result = validate_executable_fd(fd).map(|admission| admission.format());
     let _ = syscall1(SYS_CLOSE, fd as u64);
     result
 }
 
-fn open_immutable_file_snapshot(path: &str) -> Result<i32, i32> {
+struct ImmutableFileSnapshot {
+    fd: i32,
+    resolved_path: String,
+}
+
+fn open_immutable_file_snapshot(
+    path: &str,
+    target_pid: u64,
+    dirfd: u64,
+) -> Result<ImmutableFileSnapshot, i32> {
     if path.is_empty() || path.len() > VFS_IPC_PATH_CAPACITY || path.as_bytes().contains(&0) {
         return Err(EINVAL);
     }
@@ -888,6 +905,8 @@ fn open_immutable_file_snapshot(path: &str) -> Result<i32, i32> {
     let mut request = VfsExecutableSnapshotRequest {
         requester_pid: pid as u64,
         requester_tid: tid as u64,
+        target_pid,
+        dirfd,
         max_bytes: ELF_MAX_SNAPSHOT_BYTES,
         path_len: path.len() as u32,
         deadline_ns: deadline.end_ns(),
@@ -951,7 +970,6 @@ fn open_immutable_file_snapshot(path: &str) -> Result<i32, i32> {
         || response.version != VFS_EXECUTABLE_SNAPSHOT_ABI_VERSION
         || response.op != VFS_EXECUTABLE_SNAPSHOT_OP_OPEN
         || response.reserved0 != 0
-        || response.reserved1 != 0
     {
         close_received(received_fd_count, &received_fd);
         return Err(EINVAL);
@@ -964,13 +982,32 @@ fn open_immutable_file_snapshot(path: &str) -> Result<i32, i32> {
         || response.file_bytes == 0
         || response.file_bytes > ELF_MAX_SNAPSHOT_BYTES
         || response.mount_generation == 0
+        || response.resolved_path_len == 0
+        || response.resolved_path_len as usize > response.resolved_path.len()
     {
         close_received(received_fd_count, &received_fd);
         return Err(EINVAL);
     }
-    i32::try_from(received_fd[0]).map_err(|_| {
+    let resolved_path = match core::str::from_utf8(
+        &response.resolved_path[..response.resolved_path_len as usize],
+    ) {
+        Ok(path) => path,
+        Err(_) => {
+            close_received(received_fd_count, &received_fd);
+            return Err(EINVAL);
+        }
+    };
+    if !resolved_path.starts_with('/') || resolved_path.as_bytes().contains(&0) {
+        close_received(received_fd_count, &received_fd);
+        return Err(EINVAL);
+    }
+    let fd = i32::try_from(received_fd[0]).map_err(|_| {
         close_received(received_fd_count, &received_fd);
         EOVERFLOW
+    })?;
+    Ok(ImmutableFileSnapshot {
+        fd,
+        resolved_path: String::from(resolved_path),
     })
 }
 

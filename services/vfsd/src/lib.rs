@@ -18,6 +18,24 @@ pub const ENOENT: i32 = 2;
 pub const ENOTDIR: i32 = 20;
 pub const EROFS: i32 = 30;
 
+/// Selects the namespace base for an executable snapshot without copying cwd
+/// into a kernel or broker-owned process record. The caller is vfsd's endpoint
+/// receive owner, which supplies its own PID-indexed cwd entry.
+pub fn executable_snapshot_resolution_base<'a>(
+    path: &str,
+    target_pid: u64,
+    dirfd_is_at_fdcwd: bool,
+    cwd: Option<&'a str>,
+) -> Result<&'a str, i32> {
+    if path.starts_with('/') {
+        return Ok("/");
+    }
+    if target_pid == 0 || !dirfd_is_at_fdcwd {
+        return Err(EINVAL);
+    }
+    Ok(cwd.unwrap_or("/"))
+}
+
 const SNAPSHOT_ADMISSION_IDLE: u8 = 0;
 const SNAPSHOT_ADMISSION_WRITING: u8 = 1;
 const SNAPSHOT_ADMISSION_READY: u8 = 2;
@@ -715,6 +733,26 @@ mod tests {
         assert!(!admission.try_claim());
         admission.release();
         assert!(admission.try_reserve());
+    }
+
+    #[test]
+    fn relative_exec_snapshot_uses_the_vfsd_owned_cwd() {
+        assert_eq!(
+            executable_snapshot_resolution_base("./a", 41, true, Some("/tmp/exec-test")),
+            Ok("/tmp/exec-test")
+        );
+        assert_eq!(
+            executable_snapshot_resolution_base("/bin/a", 0, false, None),
+            Ok("/")
+        );
+        assert_eq!(
+            executable_snapshot_resolution_base("./a", 0, true, Some("/tmp")),
+            Err(EINVAL)
+        );
+        assert_eq!(
+            executable_snapshot_resolution_base("./a", 41, false, Some("/tmp")),
+            Err(EINVAL)
+        );
     }
 
     #[test]

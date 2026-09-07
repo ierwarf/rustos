@@ -17,6 +17,41 @@ fn open_metadata_errno_is_routine(errno: i32) -> bool {
 }
 
 impl VfsState {
+    /// Converts an executable request into one canonical absolute path while
+    /// the namespace receive owner has exclusive access to cwd state. The
+    /// worker receives only this resolved request and therefore cannot invent
+    /// a second cwd authority while performing bulk I/O.
+    fn resolve_executable_snapshot_request(
+        &mut self,
+        mut request: VfsExecutableSnapshotRequest,
+    ) -> Result<VfsExecutableSnapshotRequest, i32> {
+        if request.version != VFS_EXECUTABLE_SNAPSHOT_ABI_VERSION
+            || request.op != VFS_EXECUTABLE_SNAPSHOT_OP_OPEN
+            || request.flags != 0
+            || request.reserved0 != 0
+            || request.path_len == 0
+            || request.path_len as usize > request.path.len()
+        {
+            return Err(EINVAL);
+        }
+        let raw_path = core::str::from_utf8(&request.path[..request.path_len as usize])
+            .map_err(|_| EINVAL)?;
+        if raw_path.as_bytes().contains(&0) {
+            return Err(EINVAL);
+        }
+        let base = executable_snapshot_resolution_base(
+            raw_path,
+            request.target_pid,
+            is_at_fdcwd(request.dirfd),
+            self.cwd.get(&request.target_pid).map(String::as_str),
+        )?;
+        let resolved = normalize_absolute_path(base, raw_path)?;
+        request.path.fill(0);
+        request.path_len = resolved.len() as u32;
+        request.path[..resolved.len()].copy_from_slice(resolved.as_bytes());
+        Ok(request)
+    }
+
     fn cwd_for_pid(&mut self, pid: u64) -> String {
         self.cwd
             .entry(pid)
@@ -309,6 +344,9 @@ impl VfsStorage {
         let raw_path =
             core::str::from_utf8(&request.path[..request.path_len as usize]).map_err(|_| EINVAL)?;
         if raw_path.as_bytes().contains(&0) {
+            return Err(EINVAL);
+        }
+        if !raw_path.starts_with('/') {
             return Err(EINVAL);
         }
         let path = normalize_absolute_path("/", raw_path)?;

@@ -189,7 +189,6 @@ pub struct UserProcessState {
     mapping_cursor: u64,
     shared_memfd_mappings: Vec<SharedMemfdMapping>,
     shared_region_mappings: Vec<SharedRegionMapping>,
-    cwd: String,
     exec_path: [u8; PROCESS_EXEC_PATH_CAPACITY],
     exec_path_len: usize,
 }
@@ -372,7 +371,6 @@ impl UserProcessState {
             mapping_cursor: default_cursor,
             shared_memfd_mappings: Vec::new(),
             shared_region_mappings: Vec::new(),
-            cwd: String::from("/"),
             exec_path: [0; PROCESS_EXEC_PATH_CAPACITY],
             exec_path_len: 0,
         };
@@ -614,15 +612,6 @@ impl UserProcessState {
         core::str::from_utf8(&self.exec_path[..self.exec_path_len]).unwrap_or("")
     }
 
-    pub fn cwd(&self) -> &str {
-        self.cwd.as_str()
-    }
-
-    pub fn set_cwd(&mut self, cwd: &str) {
-        self.cwd.clear();
-        self.cwd.push_str(cwd);
-    }
-
     pub fn require_logical_admin_for_file_access(&mut self, path: &str) -> bool {
         if self.security.logical_admin {
             return true;
@@ -659,7 +648,6 @@ impl UserProcessState {
             mapping_cursor: self.mapping_cursor,
             shared_memfd_mappings: self.shared_memfd_mappings.clone(),
             shared_region_mappings: self.shared_region_mappings.clone(),
-            cwd: self.cwd.clone(),
             exec_path: [0; PROCESS_EXEC_PATH_CAPACITY],
             exec_path_len: 0,
         };
@@ -673,7 +661,6 @@ impl UserProcessState {
         self.security = parent.security;
         self.mapping_cursor = parent.mapping_cursor;
         self.shared_memfd_mappings = parent.shared_memfd_mappings.clone();
-        self.cwd = parent.cwd.clone();
         self.set_exec_path(parent.exec_path());
     }
 
@@ -700,7 +687,6 @@ impl UserProcessState {
             self.security.euid,
             self.security.egid,
         );
-        let cwd = self.cwd.clone();
         let mut handles = core::mem::take(&mut self.handles);
         let closed = handles.close_cloexec();
 
@@ -713,7 +699,6 @@ impl UserProcessState {
             security.logical_admin,
             exec_path,
         );
-        fresh.cwd = cwd;
         fresh.handles = handles;
         fresh.security = security;
         for (signal, ignored) in preserved_ignored

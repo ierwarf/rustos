@@ -15,6 +15,7 @@ pub(super) const fn empty_loader_spawn_request() -> LoaderSpawnRequest {
         target_pid: 0,
         target_tid: 0,
         exec_ticket: 0,
+        exec_dirfd: 0,
         exec_path_len: 0,
         argv_count: 0,
         env_count: 0,

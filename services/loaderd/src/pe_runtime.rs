@@ -650,7 +650,7 @@ fn read_file_to_vec(path: &str) -> Result<Vec<u8>, i32> {
 }
 
 fn open_readonly(path: &str) -> Result<i32, i32> {
-    open_immutable_file_snapshot(path)
+    open_immutable_file_snapshot(path, 0, 0).map(|snapshot| snapshot.fd)
 }
 
 fn cstrings_to_strs(values: &[CString]) -> Result<Vec<&str>, i32> {

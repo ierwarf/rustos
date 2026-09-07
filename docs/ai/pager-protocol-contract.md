@@ -428,6 +428,32 @@ So the barrier is load-bearing *and* the litmus is sensitive to its removal.
 
 ### The wired frame reserve
 
+Boot filling and normal replenishment must publish the same claim authority.
+`FaultFramePool::initialize` owns `Cold -> Filling -> Ready`: it fills private
+slots, sets `available` to the complete capacity, and only then Release-publishes
+`Ready`. A reservation's Acquire of `Ready` observes both slots and count.
+A failed fill releases every private frame, leaves zero claims, and publishes
+`Cold` for retry; a second initialization of `Ready` allocates nothing.
+Previously boot stored frames directly but skipped the count update performed
+by `publish`, sealing 2048 occupied slots with zero available claims. Every
+reserve then reported exhaustion, and replenishment found no empty slot to
+repair. Host tests must exercise the production initializer with allocator
+callbacks, not emulate boot through the replenishment helper. The boot-fill
+and failed-fill/retry tests plus the `pager-boot-reserve-count-omitted`
+implementation mutation enforce this publication contract.
+
+The isolated one-vCPU `mmap_unmap_1024_faulted_pages` probe measured this
+specific repair with an identical 3,560-cycle VM-exit anchor:
+
+| build | min | p50 |
+| --- | ---: | ---: |
+| reserve count omitted | 132,352,600 cycles (33.160 ms) | 149,078,560 cycles (37.350 ms) |
+| reserve count published | 1,025,440 cycles (0.257 ms) | 14,860,440 cycles (3.723 ms) |
+
+That is a 129× minimum-latency and 10.0× median-latency improvement. A second
+candidate run measured 992,400 cycles minimum and 7,282,600 cycles p50, so the
+gain is not a single-run artifact.
+
 The availability count is **authority, not a census**: a claimer decrements it
 before it may scan the slot array, so an empty pool is rejected in one atomic
 operation and two claimers can never be promised the same frame. The previous

@@ -108,6 +108,7 @@ fn validate_request(received: usize, request: &LoaderSpawnRequest) -> Result<(),
             || request.target_pid == 0
             || request.target_tid != 0
             || request.exec_ticket != 0
+            || request.exec_dirfd != 0
             || request.exec_path_len != 0
             || request.argv_count != 0
             || request.env_count != 0
@@ -129,6 +130,7 @@ fn validate_request(received: usize, request: &LoaderSpawnRequest) -> Result<(),
         && (request.target_pid != 0
             || request.target_tid != 0
             || request.exec_ticket != 0
+            || request.exec_dirfd != 0
             || request.scheduling_context.token == 0
             || !request.scheduling_context.policy.is_canonical())
     {
@@ -138,6 +140,7 @@ fn validate_request(received: usize, request: &LoaderSpawnRequest) -> Result<(),
         && (request.target_pid == 0
             || request.target_tid == 0
             || request.exec_ticket == 0
+            || request.exec_dirfd != (-100_i64 as u64)
             || request.scheduling_context != Default::default())
     {
         return Err(EINVAL);
@@ -490,7 +493,7 @@ fn map_admitted_elf_segments_fd(
 }
 
 fn map_elf_interpreter(path: &str, prepare_handle: u64) -> Result<ElfMapResult, i32> {
-    let fd = open_immutable_file_snapshot(path)?;
+    let fd = open_immutable_file_snapshot(path, 0, 0)?.fd;
     let mut result = match map_elf_segments_fd(fd, prepare_handle, ELF_INTERP_LOAD_OFFSET, false) {
         Ok(result) => result,
         Err(errno) => {

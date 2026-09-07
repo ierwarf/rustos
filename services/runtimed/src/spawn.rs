@@ -648,6 +648,14 @@ fn retire_failed_spawn_or_abort(pid: i32, stage: &str) {
 }
 
 pub(super) fn reap_children(state: &mut BrokerState) -> bool {
+    // A child is activated only after the loop records it in `running`, so an
+    // empty owner set proves that there is nothing this process may reap. A
+    // WNOHANG wait still performs the procd ownership IPC; under SMP service
+    // pressure that call can consume its complete five-second control budget
+    // and block catalog, launch, and UI work behind an impossible reap.
+    if state.running.is_empty() {
+        return false;
+    }
     let mut reaped_any = false;
     loop {
         let mut status = 0_i32;
@@ -1139,6 +1147,23 @@ fn last_errno() -> i32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_empty_running_set_never_enters_the_wait4_policy_round_trip() {
+        let source = include_str!("spawn.rs");
+        let reap = source
+            .split_once("pub(super) fn reap_children(")
+            .expect("reap entry")
+            .1
+            .split_once("/// How long the broker may stay idle")
+            .expect("reap boundary")
+            .0;
+        let empty_guard = reap
+            .find("if state.running.is_empty() {")
+            .expect("empty owner-set guard");
+        let wait4 = reap.find("libc::SYS_wait4").expect("wait4 policy call");
+        assert!(empty_guard < wait4, "empty guard must precede wait4");
+    }
+
     /// The broker loop must not perform the launch's storage reads.
     ///
     /// `begin_tracked_launch` runs on the loop that is the console's only
