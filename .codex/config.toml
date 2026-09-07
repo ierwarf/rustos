@@ -15,17 +15,8 @@ sandbox_mode = "workspace-write"
 [features]
 hooks = true
 
-# --------------------------------------------------------------------------
-# Hooks
-#
-# Scripts live in .codex/hooks/ and read a JSON event from stdin, returning
-# a Codex hook decision on stdout. Each script computes the repo root from its
-# own location so this config is portable across clones.
-# --------------------------------------------------------------------------
-
 [[hooks.PreToolUse]]
 matcher = "^(Read|mcp__.*read.*file|mcp__serena__read_file)$"
-
 [[hooks.PreToolUse.hooks]]
 type = "command"
 command = '"$(git rev-parse --show-toplevel)/.codex/hooks/pre_read_large_file.sh"'
@@ -34,7 +25,6 @@ statusMessage = "Checking file size / allow-list"
 
 [[hooks.PreToolUse]]
 matcher = "^(apply_patch|Edit|Write|mcp__serena__(create_text_file|insert_after_symbol|insert_before_symbol|rename_symbol|replace_content|replace_in_files|replace_symbol_body|safe_delete_symbol))$"
-
 [[hooks.PreToolUse.hooks]]
 type = "command"
 command = '"$(git rev-parse --show-toplevel)/.codex/hooks/pre_edit_policy.sh"'
@@ -43,13 +33,11 @@ statusMessage = "Checking edit path policy"
 
 [[hooks.PreToolUse]]
 matcher = "^(Bash|exec_command|mcp__serena__execute_shell_command)$"
-
 [[hooks.PreToolUse.hooks]]
 type = "command"
 command = '"$(git rev-parse --show-toplevel)/.codex/hooks/pre_bash_destructive.sh"'
 timeout = 5
 statusMessage = "Checking for destructive shell"
-
 [[hooks.PreToolUse.hooks]]
 type = "command"
 command = '"$(git rev-parse --show-toplevel)/.codex/hooks/pre_commit.sh"'
@@ -58,7 +46,6 @@ statusMessage = "Pre-commit policy / fmt checks"
 
 [[hooks.PostToolUse]]
 matcher = "^(apply_patch|Edit|Write|mcp__serena__(create_text_file|insert_after_symbol|insert_before_symbol|rename_symbol|replace_content|replace_in_files|replace_symbol_body|safe_delete_symbol))$"
-
 [[hooks.PostToolUse.hooks]]
 type = "command"
 command = '"$(git rev-parse --show-toplevel)/.agents/hooks/post_edit_rust.sh"'
@@ -66,7 +53,6 @@ timeout = 120
 statusMessage = "cargo xtask check + source-contract lint"
 
 [[hooks.UserPromptSubmit]]
-
 [[hooks.UserPromptSubmit.hooks]]
 type = "command"
 command = '"$(git rev-parse --show-toplevel)/.codex/hooks/user_prompt_policy.sh"'
@@ -75,28 +61,23 @@ statusMessage = "Checking prompt safety"
 
 [[hooks.SessionStart]]
 matcher = "^(startup|resume)$"
-
 [[hooks.SessionStart.hooks]]
 type = "command"
 command = '"$(git rev-parse --show-toplevel)/.codex/hooks/session_context.sh"'
 timeout = 5
 statusMessage = "Loading RustOS hook context"
 
-# --------------------------------------------------------------------------
-# MCP servers (project-scoped)
-# Project-declared servers are exact-version inputs. Session-provided app or
-# plugin connectors are configured outside this repository. Executables resolve
-# from PATH so the same checkout works on a workstation or a self-hosted runner.
-#   ripgrep   — mcp-ripgrep 0.4.0 (npm)
-#   serena    — serena-agent==1.6.0 (uv tool)
-#   ast-grep  — ast-grep CLI 0.45.2 + official sg-mcp at commit 149e20d47bb7125fb0c1451feea2f48a98742034
+# MCP servers are exact-version project inputs installed by
+# tools/agent/bootstrap-remote-ai-tools.sh. They resolve from PATH so a checkout
+# is portable across workstations and self-hosted runners.
+#   ripgrep   — mcp-ripgrep 0.4.0
+#   serena    — serena-agent==1.6.0
+#   ast-grep  — ast-grep CLI 0.45.2 + sg-mcp commit 149e20d47bb7125fb0c1451feea2f48a98742034
 #   codegraph — @astudioplus/codegraph-mcp 0.20.1
-# --------------------------------------------------------------------------
 
 [mcp_servers.ripgrep]
 command = "npx"
 args = ["-y", "mcp-ripgrep@0.4.0"]
-
 [mcp_servers.ripgrep.tools.search]
 approval_mode = "approve"
 
@@ -110,7 +91,7 @@ args = []
 
 [mcp_servers.codegraph]
 command = "codegraph-mcp"
-args = ["--mcp", "--exclude", "target", "--exclude", "build", "--exclude", "logs", "--exclude", "vendor", "--exclude", "Cargo.lock", "--profile", "all", "--graph-only"]
+args = ["--mcp", "--exclude", "target", "--exclude", "build", "--exclude", "logs", "--exclude", "vendor", "--exclude", "driver-domains/linux/out", "--exclude", "Cargo.lock", "--max-files", "20000", "--profile", "all", "--graph-only"]
 
 [sandbox_workspace_write]
 network_access = true
