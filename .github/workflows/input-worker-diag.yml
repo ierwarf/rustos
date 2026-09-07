@@ -71,16 +71,11 @@ jobs:
           from pathlib import Path
           path = Path('services/inputd/src/main.rs')
           text = path.read_text()
-          old = '''        .spawn(move || {
-            let mut ingest_scratch = vec![InputDvmRecordWire::default(); INPUTD_INGEST_MAX_EVENTS];
-'''
-          new = '''        .spawn(move || {
-            debug_line("inputd: DVM ingestion worker entered");
-            let mut ingest_scratch = vec![InputDvmRecordWire::default(); INPUTD_INGEST_MAX_EVENTS];
-'''
-          if text.count(old) != 1:
-              raise SystemExit(f'unexpected worker entry shape: {text.count(old)} matches')
-          path.write_text(text.replace(old, new, 1))
+          needle = '        .spawn(move || {\n            let mut ingest_scratch = vec![InputDvmRecordWire::default(); INPUTD_INGEST_MAX_EVENTS];\n'
+          replacement = '        .spawn(move || {\n            debug_line("inputd: DVM ingestion worker entered");\n            let mut ingest_scratch = vec![InputDvmRecordWire::default(); INPUTD_INGEST_MAX_EVENTS];\n'
+          if text.count(needle) != 1:
+              raise SystemExit(f'unexpected worker entry shape: {text.count(needle)} matches')
+          path.write_text(text.replace(needle, replacement, 1))
           PY
           cargo fmt --all
           git diff --check
@@ -113,5 +108,4 @@ jobs:
           PY
           echo '=== 8-vCPU bench tail ==='
           tail -n 160 build/input-worker-diag/probe-8-bench.log || true
-          # Diagnostic step succeeds regardless of the expected 8-vCPU admission failure.
           exit 0
