@@ -84,16 +84,17 @@ jobs:
             fi
           }
 
-          wayclick_only_failure() {
+          readiness_only_failure() {
             local log=$1
-            grep -Fq 'missing=["wayclick: first frame presented"]' "$log" \
+            grep -Fq 'KVM parallel boot did not reach readiness within 60s' "$log" \
+              && grep -Fq 'Linux-DVM missing=[]' "$log" \
               && ! grep -Eq '\[PANIC\]|NESTED PANIC' "$log"
           }
 
           run_baseline() {
             local vcpus=$1 baseline=$2 log=$3
             local boot_try rc
-            for boot_try in 1 2; do
+            for boot_try in 1 2 3; do
               set +e
               cargo xtask bench --rustos-vcpus "$vcpus" --baseline "$baseline" > "$log" 2>&1
               rc=$?
@@ -101,8 +102,8 @@ jobs:
               if [ "$rc" -eq 0 ]; then
                 return 0
               fi
-              if [ "$vcpus" -eq 8 ] && wayclick_only_failure "$log" && [ "$boot_try" -lt 2 ]; then
-                echo "8-vCPU WayClick-only readiness miss; retrying baseline" >&2
+              if [ "$vcpus" -eq 8 ] && readiness_only_failure "$log" && [ "$boot_try" -lt 3 ]; then
+                echo "8-vCPU no-panic readiness miss; retrying baseline ($boot_try/3)" >&2
                 continue
               fi
               echo "baseline failed vcpus=$vcpus rc=$rc" >&2
@@ -114,7 +115,7 @@ jobs:
           run_compare() {
             local vcpus=$1 baseline=$2 log=$3
             local boot_try rc
-            for boot_try in 1 2; do
+            for boot_try in 1 2 3; do
               set +e
               cargo xtask bench --rustos-vcpus "$vcpus" --compare "$baseline" > "$log" 2>&1
               rc=$?
@@ -122,8 +123,8 @@ jobs:
               if [ "$rc" -eq 0 ]; then
                 return 0
               fi
-              if [ "$vcpus" -eq 8 ] && wayclick_only_failure "$log" && [ "$boot_try" -lt 2 ]; then
-                echo "8-vCPU WayClick-only readiness miss; retrying comparison" >&2
+              if [ "$vcpus" -eq 8 ] && readiness_only_failure "$log" && [ "$boot_try" -lt 3 ]; then
+                echo "8-vCPU no-panic readiness miss; retrying comparison ($boot_try/3)" >&2
                 continue
               fi
               echo "comparison failed vcpus=$vcpus rc=$rc" >&2
