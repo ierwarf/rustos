@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - "perf/xtask-bench-20260907"
+      - "master"
     paths:
       - ".github/workflows/agent-tools-bootstrap.yml"
       - "tools/agent/bootstrap-remote-ai-tools.sh"
