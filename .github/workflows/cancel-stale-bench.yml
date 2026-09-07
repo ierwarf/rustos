@@ -1,0 +1,34 @@
+name: Cancel stale self-hosted bench runs
+
+on:
+  push:
+    branches: ["master"]
+    paths:
+      - ".github/workflows/cancel-stale-bench.yml"
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  cancel:
+    runs-on: ubuntu-24.04
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Cancel obsolete 90-minute bench runs
+        shell: bash
+        run: |
+          set -euo pipefail
+          for run_id in 34093397783 34096430645; do
+            status="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}" --jq .status)"
+            echo "run ${run_id}: ${status}"
+            case "$status" in
+              queued|in_progress|waiting|pending|requested)
+                gh api --method POST "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/cancel"
+                ;;
+              *)
+                echo "no cancellation needed"
+                ;;
+            esac
+          done
