@@ -112,23 +112,42 @@ jobs:
           cargo xtask verify-dvm
           echo "dvm_bundle=built_verified"
 
-      - name: Benchmark baseline
+      - name: Benchmark control 1 - 1 vCPU
         shell: bash
         run: |
           set -uo pipefail
           mkdir -p build/ci-bench
           set +e
-          cargo xtask bench --baseline build/ci-bench/baseline.txt > build/ci-bench/bench.log 2>&1
+          cargo xtask bench --rustos-vcpus 1 --baseline build/ci-bench/control-1.txt > build/ci-bench/control-1.log 2>&1
           rc=$?
           set -e
-          echo "bench_exit=$rc"
-          grep -E -m 120 '^(benchmark|bench|probe|ipc_|null_|sched_|vmexit_|isolation|anchor|comparison|error|Error|failed|FAILED)|ipcbench:' build/ci-bench/bench.log || true
-          if [ "$rc" -ne 0 ]; then
-            echo '--- failure tail ---'
-            tail -n 120 build/ci-bench/bench.log
-            if [ -f logs/userdemo2-imports.txt ]; then
-              echo '--- userdemo2 import evidence ---'
-              grep -n -C 3 -m 10 '_set_app_type\|api-ms-win-crt-runtime' logs/userdemo2-imports.txt || true
-            fi
-          fi
+          echo "bench_control_1_exit=$rc"
+          grep -E -m 160 '^(tsc_khz|probe|[-]{10,}|tsc_overhead|null_syscall|sched_yield|ipc_|vmexit_|derived:|  cross-process|  round trip|anchor|comparison|error|Error|failed|FAILED)|ipcbench:' build/ci-bench/control-1.log || true
+          if [ "$rc" -ne 0 ]; then tail -n 120 build/ci-bench/control-1.log; fi
+          exit "$rc"
+
+      - name: Benchmark control 2 - same tree 1 vCPU
+        shell: bash
+        run: |
+          set -uo pipefail
+          set +e
+          cargo xtask bench --rustos-vcpus 1 --compare build/ci-bench/control-1.txt > build/ci-bench/control-2.log 2>&1
+          rc=$?
+          set -e
+          echo "bench_control_2_exit=$rc"
+          grep -E -m 200 '^(tsc_khz|probe|[-]{10,}|tsc_overhead|null_syscall|sched_yield|ipc_|vmexit_|derived:|  cross-process|  round trip|anchor|comparison|error|Error|failed|FAILED)|ipcbench:' build/ci-bench/control-2.log || true
+          if [ "$rc" -ne 0 ]; then tail -n 120 build/ci-bench/control-2.log; fi
+          exit "$rc"
+
+      - name: Benchmark SMP baseline - 8 vCPU
+        shell: bash
+        run: |
+          set -uo pipefail
+          set +e
+          cargo xtask bench --rustos-vcpus 8 --baseline build/ci-bench/control-8vcpu.txt > build/ci-bench/control-8vcpu.log 2>&1
+          rc=$?
+          set -e
+          echo "bench_8vcpu_exit=$rc"
+          grep -E -m 160 '^(tsc_khz|probe|[-]{10,}|tsc_overhead|null_syscall|sched_yield|ipc_|vmexit_|derived:|  cross-process|  round trip|anchor|comparison|error|Error|failed|FAILED)|ipcbench:' build/ci-bench/control-8vcpu.log || true
+          if [ "$rc" -ne 0 ]; then tail -n 120 build/ci-bench/control-8vcpu.log; fi
           exit "$rc"
