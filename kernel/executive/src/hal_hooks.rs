@@ -264,8 +264,10 @@ fn retire_current_user_task_due_to_fault(
     rip: u64,
     rsp: u64,
 ) -> hal_api::UserFaultDisposition {
-    let linux_abi =
-        uses_linux_fault_policy(ps_api::current_user_snapshot().map(|snapshot| snapshot.abi()));
+    // Exception gates run with interrupts masked. ABI selection needs only the
+    // scheduler-owned current binding; taking ProcessStateLock here can neither
+    // park nor make progress behind a concurrent pager VMA writer on another CPU.
+    let linux_abi = uses_linux_fault_policy(ps_api::current_user_abi());
     let disposition = if linux_abi {
         compat_api::syscall::retire_current_linux_task_due_to_fault(
             vector, error_code, cr2, rip, rsp,
