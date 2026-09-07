@@ -1,4 +1,4 @@
-# One-shot baseline after formal-profile/runtime-mode decoupling.
+# One-shot baseline after fault-path lock fix; primes scheduler census A-B-A.
 name: RustOS self-hosted bench
 
 on:
