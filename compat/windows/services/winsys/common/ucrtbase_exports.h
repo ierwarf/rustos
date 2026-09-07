@@ -16,6 +16,7 @@ typedef void (*_invalid_parameter_handler)(
     UINT line,
     ULONGLONG reserved);
 
+void _set_app_type(UINT app_type);
 int _set_new_mode(int mode);
 int _configthreadlocale(int mode);
 _invalid_parameter_handler _set_invalid_parameter_handler(

@@ -16,8 +16,8 @@ cross ring0/ring3, IPC, ABI, lifecycle, and hardware boundaries.
 Before changing source, verify all three project MCP servers with a focused
 probe:
 
-1. Serena: activate `/home/hongii2/rustos`, then use symbol or reference
-   lookup on the target area.
+1. Serena: activate the current repository root (`git rev-parse --show-toplevel`),
+   then use symbol or reference lookup on the target area.
 2. ast-grep MCP: call a known focused Rust structural query or rule probe
    directly. Do not list tools during normal preflight; consult the pinned
    three-tool contract only when the known probe is unavailable.

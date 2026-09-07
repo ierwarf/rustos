@@ -38,6 +38,11 @@ static int rustos_ucrt_invalid_result(void)
     return -1;
 }
 
+void _set_app_type(UINT app_type)
+{
+    __set_app_type(app_type);
+}
+
 int *__p__commode(void)
 {
     return &_commode;
