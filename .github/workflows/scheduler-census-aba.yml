@@ -16,7 +16,8 @@ jobs:
   aba:
     if: >-
       ${{ github.event.workflow_run.conclusion == 'success' &&
-          github.event.workflow_run.head_branch == 'master' }}
+          github.event.workflow_run.head_branch == 'master' &&
+          github.event.workflow_run.head_sha == 'e74cb9cda9618c1f99eb3ba7280149b56e9b3cfb' }}
     runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 180
 
