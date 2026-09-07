@@ -17,7 +17,7 @@ jobs:
     if: >-
       ${{ github.event.workflow_run.conclusion == 'success' &&
           github.event.workflow_run.head_branch == 'master' &&
-          github.event.workflow_run.head_sha == 'e74cb9cda9618c1f99eb3ba7280149b56e9b3cfb' }}
+          github.event.workflow_run.head_sha == 'a3014c92640288f0378105a99f9e8fbafd14e3f0' }}
     runs-on: [self-hosted, Linux, X64]
     timeout-minutes: 180
 
@@ -40,16 +40,14 @@ jobs:
           cargo xtask verify-dvm
           mkdir -p build/ci-bench/census-aba
 
-      - name: Control A - 1 vCPU
+      - name: Control A1 - 1 vCPU
         shell: bash
         run: |
           set -euo pipefail
-          cargo xtask bench \
-            --rustos-vcpus 1 \
+          cargo xtask bench --rustos-vcpus 1 \
             --baseline build/ci-bench/census-aba/a1-1vcpu.txt \
             > build/ci-bench/census-aba/a1-1vcpu.log 2>&1
-          grep -E '^(null_syscall|sched_yield|ipc_|vmexit_|  anchor|anchor|comparison)|ipcbench:' \
-            build/ci-bench/census-aba/a1-1vcpu.log || true
+          awk '/^probe[[:space:]]+iters/{show=1} show{print}' build/ci-bench/census-aba/a1-1vcpu.log | tail -n 260
 
       - name: Apply scheduler acquisition-census ablation
         shell: bash
@@ -66,46 +64,37 @@ jobs:
           path.write_text(text.replace(needle, '', 1))
           PY
           git diff --check
-          git diff -- kernel/ps/src/multitask/cpu_local.rs
 
       - name: Candidate B - 1 vCPU
         shell: bash
         run: |
           set -euo pipefail
-          cargo xtask bench \
-            --rustos-vcpus 1 \
+          cargo xtask bench --rustos-vcpus 1 \
             --compare build/ci-bench/census-aba/a1-1vcpu.txt \
             > build/ci-bench/census-aba/b-1vcpu.log 2>&1
-          grep -E '^(null_syscall|sched_yield|ipc_|vmexit_|  anchor|anchor|comparison)|ipcbench:' \
-            build/ci-bench/census-aba/b-1vcpu.log || true
-          grep -Eq '^  anchor vmexit_cpuid: [0-9]+ -> [0-9]+ \([+-]?[0-9]+\.[0-9]+%\) -- held$' \
-            build/ci-bench/census-aba/b-1vcpu.log
+          awk '/^probe[[:space:]]+iters/{show=1} show{print}' build/ci-bench/census-aba/b-1vcpu.log | tail -n 300
+          grep -Eq '^  anchor vmexit_cpuid: [0-9]+ -> [0-9]+ \([+-]?[0-9]+\.[0-9]+%\) -- held$' build/ci-bench/census-aba/b-1vcpu.log
 
-      - name: Revert candidate and control A2 - 1 vCPU
+      - name: Revert candidate and Control A2 - 1 vCPU
         shell: bash
         run: |
           set -euo pipefail
           git checkout -- kernel/ps/src/multitask/cpu_local.rs
           test -z "$(git status --porcelain --untracked-files=no)"
-          cargo xtask bench \
-            --rustos-vcpus 1 \
+          cargo xtask bench --rustos-vcpus 1 \
             --compare build/ci-bench/census-aba/a1-1vcpu.txt \
             > build/ci-bench/census-aba/a2-1vcpu.log 2>&1
-          grep -E '^(null_syscall|sched_yield|ipc_|vmexit_|  anchor|anchor|comparison)|ipcbench:' \
-            build/ci-bench/census-aba/a2-1vcpu.log || true
-          grep -Eq '^  anchor vmexit_cpuid: [0-9]+ -> [0-9]+ \([+-]?[0-9]+\.[0-9]+%\) -- held$' \
-            build/ci-bench/census-aba/a2-1vcpu.log
+          awk '/^probe[[:space:]]+iters/{show=1} show{print}' build/ci-bench/census-aba/a2-1vcpu.log | tail -n 300
+          grep -Eq '^  anchor vmexit_cpuid: [0-9]+ -> [0-9]+ \([+-]?[0-9]+\.[0-9]+%\) -- held$' build/ci-bench/census-aba/a2-1vcpu.log
 
-      - name: Control A - 8 vCPU
+      - name: Control A1 - 8 vCPU
         shell: bash
         run: |
           set -euo pipefail
-          cargo xtask bench \
-            --rustos-vcpus 8 \
+          cargo xtask bench --rustos-vcpus 8 \
             --baseline build/ci-bench/census-aba/a1-8vcpu.txt \
             > build/ci-bench/census-aba/a1-8vcpu.log 2>&1
-          grep -E '^(null_syscall|sched_yield|ipc_|vmexit_|  anchor|anchor|comparison)|ipcbench:' \
-            build/ci-bench/census-aba/a1-8vcpu.log || true
+          awk '/^probe[[:space:]]+iters/{show=1} show{print}' build/ci-bench/census-aba/a1-8vcpu.log | tail -n 260
 
       - name: Apply census ablation for 8 vCPU
         shell: bash
@@ -127,29 +116,23 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          cargo xtask bench \
-            --rustos-vcpus 8 \
+          cargo xtask bench --rustos-vcpus 8 \
             --compare build/ci-bench/census-aba/a1-8vcpu.txt \
             > build/ci-bench/census-aba/b-8vcpu.log 2>&1
-          grep -E '^(null_syscall|sched_yield|ipc_|vmexit_|  anchor|anchor|comparison)|ipcbench:' \
-            build/ci-bench/census-aba/b-8vcpu.log || true
-          grep -Eq '^  anchor vmexit_cpuid: [0-9]+ -> [0-9]+ \([+-]?[0-9]+\.[0-9]+%\) -- held$' \
-            build/ci-bench/census-aba/b-8vcpu.log
+          awk '/^probe[[:space:]]+iters/{show=1} show{print}' build/ci-bench/census-aba/b-8vcpu.log | tail -n 300
+          grep -Eq '^  anchor vmexit_cpuid: [0-9]+ -> [0-9]+ \([+-]?[0-9]+\.[0-9]+%\) -- held$' build/ci-bench/census-aba/b-8vcpu.log
 
-      - name: Revert candidate and control A2 - 8 vCPU
+      - name: Revert candidate and Control A2 - 8 vCPU
         shell: bash
         run: |
           set -euo pipefail
           git checkout -- kernel/ps/src/multitask/cpu_local.rs
           test -z "$(git status --porcelain --untracked-files=no)"
-          cargo xtask bench \
-            --rustos-vcpus 8 \
+          cargo xtask bench --rustos-vcpus 8 \
             --compare build/ci-bench/census-aba/a1-8vcpu.txt \
             > build/ci-bench/census-aba/a2-8vcpu.log 2>&1
-          grep -E '^(null_syscall|sched_yield|ipc_|vmexit_|  anchor|anchor|comparison)|ipcbench:' \
-            build/ci-bench/census-aba/a2-8vcpu.log || true
-          grep -Eq '^  anchor vmexit_cpuid: [0-9]+ -> [0-9]+ \([+-]?[0-9]+\.[0-9]+%\) -- held$' \
-            build/ci-bench/census-aba/a2-8vcpu.log
+          awk '/^probe[[:space:]]+iters/{show=1} show{print}' build/ci-bench/census-aba/a2-8vcpu.log | tail -n 300
+          grep -Eq '^  anchor vmexit_cpuid: [0-9]+ -> [0-9]+ \([+-]?[0-9]+\.[0-9]+%\) -- held$' build/ci-bench/census-aba/a2-8vcpu.log
 
       - name: Summarize A-B-A evidence
         if: always()
@@ -158,7 +141,6 @@ jobs:
           set -uo pipefail
           {
             echo '## Scheduler acquisition-census A-B-A'
-            echo
             for log in \
               build/ci-bench/census-aba/a1-1vcpu.log \
               build/ci-bench/census-aba/b-1vcpu.log \
@@ -170,7 +152,7 @@ jobs:
               [ -f "$log" ] || continue
               echo "### $(basename "$log")"
               echo '```text'
-              grep -E '^(null_syscall|sched_yield|ipc_|vmexit_|  anchor|anchor|comparison)|ipcbench:' "$log" | tail -n 80 || true
+              awk '/^probe[[:space:]]+iters/{show=1} show{print}' "$log" | tail -n 120
               echo '```'
             done
           } >> "$GITHUB_STEP_SUMMARY"
