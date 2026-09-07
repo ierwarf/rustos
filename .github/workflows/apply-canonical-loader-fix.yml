@@ -12,7 +12,7 @@ permissions:
 jobs:
   fix:
     runs-on: [self-hosted, Linux, X64]
-    timeout-minutes: 20
+    timeout-minutes: 10
 
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -20,28 +20,30 @@ jobs:
           fetch-depth: 0
           clean: false
 
-      - name: Apply canonical spawn-path contract
+      - name: Restore already-validated source patch
         shell: bash
         run: |
           set -euo pipefail
-          python3 tools/ci/apply_canonical_loader_fix.py
-          cargo fmt --all
+          git cat-file -e 697b4e41^{commit}
+          git checkout 697b4e41 -- \
+            services/rootd/src/main.rs \
+            services/initd/src/main.rs \
+            services/runtimed/src/spawn.rs \
+            services/loaderd/src/main.rs \
+            services/vfsd/src/main.rs
           git diff --check
 
-      - name: Validate source tree
+      - name: Revalidate source tree
         shell: bash
         run: |
           set -euo pipefail
           cargo xtask check
 
-      - name: Commit validated fix to master
+      - name: Push source-only fix
         shell: bash
         run: |
           set -euo pipefail
-          git rm .github/workflows/apply-canonical-loader-fix.yml
-          git rm tools/ci/apply_canonical_loader_fix.py
           git add \
-            .github/workflows/bench-run.yml \
             services/rootd/src/main.rs \
             services/initd/src/main.rs \
             services/runtimed/src/spawn.rs \
