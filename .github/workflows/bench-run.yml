@@ -93,7 +93,7 @@ jobs:
       - name: Prepare Linux DVM bundle
         shell: bash
         run: |
-          set -uo pipefail
+          set -euo pipefail
           manifest="driver-domains/linux/out/artifacts/rustos-linux-dvm-x86_64.manifest"
           if [ -f "$manifest" ]; then
             set +e
@@ -135,9 +135,16 @@ jobs:
           rc=$?
           set -e
           echo "bench_control_2_exit=$rc"
-          grep -E -m 200 '^(tsc_khz|probe|[-]{10,}|tsc_overhead|null_syscall|sched_yield|ipc_|vmexit_|derived:|  cross-process|  round trip|anchor|comparison|error|Error|failed|FAILED)|ipcbench:' build/ci-bench/control-2.log || true
-          if [ "$rc" -ne 0 ]; then tail -n 120 build/ci-bench/control-2.log; fi
-          exit "$rc"
+          grep -E -m 200 '^(tsc_khz|probe|[-]{10,}|tsc_overhead|null_syscall|sched_yield|ipc_|vmexit_|derived:|  cross-process|  round trip|  anchor|anchor|comparison|error|Error|failed|FAILED)|ipcbench:' build/ci-bench/control-2.log || true
+          if [ "$rc" -ne 0 ]; then
+            tail -n 120 build/ci-bench/control-2.log
+            exit "$rc"
+          fi
+          if ! grep -Eq '^  anchor vmexit_cpuid: [0-9]+ -> [0-9]+ \([+-]?[0-9]+\.[0-9]+%\) -- held$' build/ci-bench/control-2.log; then
+            echo 'benchmark control rejected: vmexit_cpuid anchor did not hold within the xtask 3% admission bound' >&2
+            grep -E '^  anchor vmexit_cpuid:|^comparison vs |no comparison:' build/ci-bench/control-2.log >&2 || true
+            exit 1
+          fi
 
       - name: Benchmark SMP baseline - 8 vCPU
         shell: bash
