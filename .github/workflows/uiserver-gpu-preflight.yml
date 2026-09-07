@@ -1,0 +1,98 @@
+name: uiserver GPU focused preflight
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["master"]
+    paths:
+      - ".github/workflows/uiserver-gpu-preflight.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: uiserver-gpu-preflight
+  cancel-in-progress: true
+
+jobs:
+  preflight:
+    runs-on: [self-hosted, Linux, X64]
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          fetch-depth: 0
+          clean: false
+      - name: Focused tool probes
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.local/bin:$PATH"
+          export CODEGRAPH_TELEMETRY=off
+          root="$GITHUB_WORKSPACE"
+          cd "$root"
+          mkdir -p build/agent-tools/gpu-preflight
+
+          echo '=== versions ==='
+          serena --version
+          ast-grep --version
+          codegraph-mcp --help >/dev/null
+
+          echo '=== Serena CLI surfaces ==='
+          serena --help | sed -n '1,160p'
+          echo '--- project help ---'
+          serena project --help | sed -n '1,200p' || true
+          echo '--- mcp help ---'
+          serena start-mcp-server --help | sed -n '1,220p' || true
+
+          echo '=== Serena focused index ==='
+          serena project index --log-level WARNING --timeout 60 \
+            > build/agent-tools/gpu-preflight/serena-index.log 2>&1
+          tail -n 60 build/agent-tools/gpu-preflight/serena-index.log
+          test -d .serena/cache
+
+          echo '=== ast-grep focused structural query ==='
+          ast-grep run \
+            --pattern 'state.poll_gpu_completions()' \
+            --lang rust \
+            --json \
+            services/uiserver/src/main.rs \
+            > build/agent-tools/gpu-preflight/ast-grep.json
+          cat build/agent-tools/gpu-preflight/ast-grep.json
+          test -s build/agent-tools/gpu-preflight/ast-grep.json
+
+          echo '=== CodeGraph focused edit context ==='
+          uri="file://$root/services/uiserver/src/gpu_runtime.rs"
+          codegraph-mcp \
+            --graph-only \
+            --workspace "$root" \
+            --exclude "$root/target" \
+            --exclude "$root/build" \
+            --exclude "$root/logs" \
+            --exclude "$root/vendor" \
+            --exclude "$root/driver-domains/linux/out" \
+            --exclude "$root/Cargo.lock" \
+            --max-files 20000 \
+            --profile all \
+            --run-tool codegraph_get_edit_context \
+            --tool-args "{\"uri\":\"$uri\",\"line\":205,\"maxTokens\":4000}" \
+            > build/agent-tools/gpu-preflight/codegraph-edit-context.json
+          sed -n '1,160p' build/agent-tools/gpu-preflight/codegraph-edit-context.json
+          grep -Eiq 'GpuCompositor|gpu|symbol|caller|context' build/agent-tools/gpu-preflight/codegraph-edit-context.json
+
+          echo '=== CodeGraph callers ==='
+          codegraph-mcp \
+            --graph-only \
+            --workspace "$root" \
+            --exclude "$root/target" \
+            --exclude "$root/build" \
+            --exclude "$root/logs" \
+            --exclude "$root/vendor" \
+            --exclude "$root/driver-domains/linux/out" \
+            --exclude "$root/Cargo.lock" \
+            --max-files 20000 \
+            --profile all \
+            --run-tool codegraph_get_callers \
+            --tool-args "{\"uri\":\"$uri\",\"line\":205}" \
+            > build/agent-tools/gpu-preflight/codegraph-callers.json
+          sed -n '1,160p' build/agent-tools/gpu-preflight/codegraph-callers.json
