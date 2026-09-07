@@ -1,0 +1,36 @@
+name: Inspect retained KVM failure
+
+on:
+  push:
+    branches: ["master"]
+    paths:
+      - ".github/workflows/inspect-last-kvm-failure.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: [self-hosted, Linux, X64]
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          clean: false
+
+      - name: Inspect retained evidence
+        shell: bash
+        run: |
+          set -uo pipefail
+          echo '=== failure summary ==='
+          cat build/kvm/failure-summary.json 2>/dev/null || true
+          echo
+          echo '=== RustOS relevant tail ==='
+          grep -E 'inputd:|uiserver:|rootd:|initd:|loaderd:|runtimed:|ipcbench:|milestone|policy|input|panic|failed|error' build/kvm/rustos-debugcon.log 2>/dev/null | tail -n 500 || true
+          echo
+          echo '=== DVM relevant tail ==='
+          grep -E 'rustos-dvm|input|ready|policy|error|fail' build/kvm/linux-dvm-serial.log 2>/dev/null | tail -n 300 || true
+          echo
+          echo '=== QEMU stderr ==='
+          tail -n 100 build/kvm/rustos-qemu.stderr.log 2>/dev/null || true
