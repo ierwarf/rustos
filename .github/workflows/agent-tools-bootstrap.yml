@@ -15,6 +15,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: rustos-agent-tools-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   bootstrap:
     runs-on: [self-hosted, Linux, X64]
