@@ -1,4 +1,4 @@
-# One-shot push trigger for the post-fix baseline; keep the path restricted to this workflow.
+# One-shot baseline after formal-profile/runtime-mode decoupling.
 name: RustOS self-hosted bench
 
 on:
