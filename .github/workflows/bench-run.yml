@@ -3,18 +3,9 @@ name: RustOS self-hosted bench
 on:
   workflow_dispatch:
   push:
-    branches:
-      - "master"
+    branches: ["master"]
     paths:
       - ".github/workflows/bench-run.yml"
-      - "compat/windows/services/winsys/**"
-      - "apps/windows/userdemo2/**"
-      - "tools/xtask/**"
-      - "kernel/**"
-      - "libs/**"
-      - "services/**"
-      - "docs/benchmarks/**"
-      - "docs/ai/performance-hardening.md"
 
 permissions:
   contents: read
@@ -94,132 +85,14 @@ jobs:
           bootstrap_pkg unzip unzip
           echo "$toolroot/usr/bin" >> "$GITHUB_PATH"
 
-      - name: Prepare Linux DVM bundle
+      - name: Verify cached Linux DVM bundle
         shell: bash
         run: |
           set -euo pipefail
           manifest="driver-domains/linux/out/artifacts/rustos-linux-dvm-x86_64.manifest"
-          if [ -f "$manifest" ]; then
-            set +e
-            cargo xtask verify-dvm > /tmp/rustos-dvm-verify.log 2>&1
-            verify_rc=$?
-            set -e
-            if [ "$verify_rc" -eq 0 ]; then
-              echo "dvm_bundle=cached_verified"
-              exit 0
-            fi
-            echo "cached DVM rejected; rebuilding"
-            tail -n 80 /tmp/rustos-dvm-verify.log
-          fi
-          make -C driver-domains/linux build-plan
-          cargo xtask build-dvm
+          test -f "$manifest"
           cargo xtask verify-dvm
-          echo "dvm_bundle=built_verified"
-
-      - name: Probe canonical loader spawn paths
-        shell: bash
-        run: |
-          set -euo pipefail
-          git restore --source=HEAD -- \
-            services/rootd/src/main.rs \
-            services/initd/src/main.rs \
-            services/runtimed/src/spawn.rs \
-            services/loaderd/src/main.rs \
-            services/vfsd/src/main.rs
-          python3 - <<'PY'
-          from pathlib import Path
-
-          def replace_once(path, old, new):
-              p = Path(path)
-              text = p.read_text()
-              count = text.count(old)
-              if count != 1:
-                  raise SystemExit(f"{path}: expected exactly one match, got {count}")
-              p.write_text(text.replace(old, new, 1))
-
-          replace_once(
-              "services/rootd/src/main.rs",
-              '''    request.requester_pid = requester_pid as u64;
-    request.scheduling_context = register_scheduling_context_authority(
-        path,
-        request.requester_pid,
-        scheduling_context_policy_for_exec(path),
-    )
-    .map_err(i64::from)?;
-    request.flags = SPAWN_FLAG_LOGICAL_ADMIN as u32 | LOADER_SPAWN_FLAG_DEFER_START;
-    request.weight_micros = weight_micros;
-    request.exec_path_len = path.len() as u32;
-    request.argv_count = 1;
-    request.argv_bytes_len = (path.len() + 1) as u32;
-    copy_bytes(path, &mut request.exec_path);
-    copy_bytes(path, &mut request.argv_bytes);
-    request.argv_bytes[path.len()] = 0;
-''',
-              '''    request.requester_pid = requester_pid as u64;
-    let mut canonical_path_storage = [0_u8; LOADER_SPAWN_EXEC_PATH_CAPACITY];
-    let canonical_path = if path.first() == Some(&b'/') {
-        path
-    } else {
-        let canonical_len = path.len() + 1;
-        if canonical_len > canonical_path_storage.len() {
-            return Err(22);
-        }
-        canonical_path_storage[0] = b'/';
-        copy_bytes(path, &mut canonical_path_storage[1..]);
-        &canonical_path_storage[..canonical_len]
-    };
-    request.scheduling_context = register_scheduling_context_authority(
-        canonical_path,
-        request.requester_pid,
-        scheduling_context_policy_for_exec(canonical_path),
-    )
-    .map_err(i64::from)?;
-    request.flags = SPAWN_FLAG_LOGICAL_ADMIN as u32 | LOADER_SPAWN_FLAG_DEFER_START;
-    request.weight_micros = weight_micros;
-    request.exec_path_len = canonical_path.len() as u32;
-    request.argv_count = 1;
-    request.argv_bytes_len = (path.len() + 1) as u32;
-    copy_bytes(canonical_path, &mut request.exec_path);
-    copy_bytes(path, &mut request.argv_bytes);
-    request.argv_bytes[path.len()] = 0;
-''')
-
-          for path in ("services/initd/src/main.rs", "services/runtimed/src/spawn.rs"):
-              replace_once(
-                  path,
-                  '''    let exec_bytes = exec_path.as_bytes();
-''',
-                  '''    let canonical_exec_path = if exec_path.starts_with('/') {
-        exec_path.to_owned()
-    } else {
-        format!("/{exec_path}")
-    };
-    let exec_bytes = canonical_exec_path.as_bytes();
-''')
-              replace_once(
-                  path,
-                  '''        scheduling_context: request_scheduling_context_authority(exec_path)?,
-''',
-                  '''        scheduling_context: request_scheduling_context_authority(canonical_exec_path.as_str())?,
-''')
-
-          replace_once(
-              "services/loaderd/src/main.rs",
-              'const UI_SERVER_EXEC_PATH: &str = "services/uiserver/uiserver.elf";',
-              'const UI_SERVER_EXEC_PATH: &str = "/services/uiserver/uiserver.elf";')
-          replace_once(
-              "services/vfsd/src/main.rs",
-              'const UI_SERVER_EXEC_PATH: &[u8] = b"services/uiserver/uiserver.elf";',
-              'const UI_SERVER_EXEC_PATH: &[u8] = b"/services/uiserver/uiserver.elf";')
-          PY
-          cargo fmt --all
-          git diff --check
-          git diff -- \
-            services/rootd/src/main.rs \
-            services/initd/src/main.rs \
-            services/runtimed/src/spawn.rs \
-            services/loaderd/src/main.rs \
-            services/vfsd/src/main.rs | sed -n '1,260p'
+          echo "dvm_bundle=cached_verified"
 
       - name: Benchmark control 1 - 1 vCPU
         shell: bash
@@ -231,8 +104,8 @@ jobs:
           rc=$?
           set -e
           echo "bench_control_1_exit=$rc"
-          grep -E -m 160 '^(tsc_khz|probe|[-]{10,}|tsc_overhead|null_syscall|sched_yield|ipc_|vmexit_|derived:|  cross-process|  round trip|anchor|comparison|error|Error|failed|FAILED)|ipcbench:' build/ci-bench/control-1.log || true
-          if [ "$rc" -ne 0 ]; then tail -n 120 build/ci-bench/control-1.log; fi
+          awk '/^probe[[:space:]]+iters/{show=1} show{print}' build/ci-bench/control-1.log | tail -n 260
+          if [ "$rc" -ne 0 ]; then tail -n 180 build/ci-bench/control-1.log; fi
           exit "$rc"
 
       - name: Benchmark control 2 - same tree 1 vCPU
@@ -244,9 +117,9 @@ jobs:
           rc=$?
           set -e
           echo "bench_control_2_exit=$rc"
-          grep -E -m 200 '^(tsc_khz|probe|[-]{10,}|tsc_overhead|null_syscall|sched_yield|ipc_|vmexit_|derived:|  cross-process|  round trip|  anchor|anchor|comparison|error|Error|failed|FAILED)|ipcbench:' build/ci-bench/control-2.log || true
+          awk '/^probe[[:space:]]+iters/{show=1} show{print}' build/ci-bench/control-2.log | tail -n 300
           if [ "$rc" -ne 0 ]; then
-            tail -n 120 build/ci-bench/control-2.log
+            tail -n 180 build/ci-bench/control-2.log
             exit "$rc"
           fi
           if ! grep -Eq '^  anchor vmexit_cpuid: [0-9]+ -> [0-9]+ \([+-]?[0-9]+\.[0-9]+%\) -- held$' build/ci-bench/control-2.log; then
@@ -264,6 +137,6 @@ jobs:
           rc=$?
           set -e
           echo "bench_8vcpu_exit=$rc"
-          grep -E -m 160 '^(tsc_khz|probe|[-]{10,}|tsc_overhead|null_syscall|sched_yield|ipc_|vmexit_|derived:|  cross-process|  round trip|anchor|comparison|error|Error|failed|FAILED)|ipcbench:' build/ci-bench/control-8vcpu.log || true
-          if [ "$rc" -ne 0 ]; then tail -n 120 build/ci-bench/control-8vcpu.log; fi
+          awk '/^probe[[:space:]]+iters/{show=1} show{print}' build/ci-bench/control-8vcpu.log | tail -n 260
+          if [ "$rc" -ne 0 ]; then tail -n 180 build/ci-bench/control-8vcpu.log; fi
           exit "$rc"
