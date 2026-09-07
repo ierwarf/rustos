@@ -1,0 +1,109 @@
+name: RustOS agent tools bootstrap
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "perf/xtask-bench-20260907"
+    paths:
+      - ".github/workflows/agent-tools-bootstrap.yml"
+      - "tools/agent/bootstrap-remote-ai-tools.sh"
+      - ".codex/config.toml"
+      - ".mcp.json"
+      - ".agents/skills/rustos-code-editing/SKILL.md"
+
+permissions:
+  contents: read
+
+jobs:
+  bootstrap:
+    runs-on: [self-hosted, Linux, X64]
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          clean: false
+
+      - name: Persist user-local tool path
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          echo "HOME=$HOME"
+          echo "workspace=$GITHUB_WORKSPACE"
+
+      - name: Install pinned Serena ast-grep and CodeGraph stack
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.local/bin:$PATH"
+          bash tools/agent/bootstrap-remote-ai-tools.sh "$GITHUB_WORKSPACE"
+
+      - name: Build Serena symbol index
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.local/bin:$PATH"
+          mkdir -p build/agent-tools
+          serena project index "$GITHUB_WORKSPACE" \
+            --log-level WARNING \
+            --timeout 20 \
+            > build/agent-tools/serena-index.log 2>&1
+          tail -n 80 build/agent-tools/serena-index.log
+          test -d .serena/cache
+
+      - name: Smoke ast-grep structural search
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.local/bin:$PATH"
+          ast-grep run \
+            --pattern 'unsafe { $$$BODY }' \
+            --lang rust \
+            --json \
+            kernel \
+            > build/agent-tools/ast-grep-smoke.json
+          test -s build/agent-tools/ast-grep-smoke.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          rows = json.loads(Path('build/agent-tools/ast-grep-smoke.json').read_text())
+          if not rows:
+              raise SystemExit('ast-grep smoke returned zero matches')
+          print(f'ast-grep matches={len(rows)} first={rows[0].get("file", "?")}')
+          PY
+          ast-grep-server --help >/dev/null
+
+      - name: Build and query CodeGraph graph-only index
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.local/bin:$PATH"
+          codegraph-mcp \
+            --graph-only \
+            --workspace "$GITHUB_WORKSPACE" \
+            --exclude "$GITHUB_WORKSPACE/target" \
+            --exclude "$GITHUB_WORKSPACE/build" \
+            --exclude "$GITHUB_WORKSPACE/logs" \
+            --exclude "$GITHUB_WORKSPACE/vendor" \
+            --exclude "$GITHUB_WORKSPACE/Cargo.lock" \
+            --profile all \
+            --run-tool codegraph_get_module_summary \
+            --tool-args '{"path":"kernel/ps"}' \
+            > build/agent-tools/codegraph-smoke.json
+          test -s build/agent-tools/codegraph-smoke.json
+          sed -n '1,80p' build/agent-tools/codegraph-smoke.json
+
+      - name: Verify RustOS AI development environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.local/bin:$PATH"
+          tools/check-dev-environment.sh --ai
+          echo '--- persistent tool footprint ---'
+          du -sh "$HOME/.local/share/rustos-agent-tools" 2>/dev/null || true
+          du -sh "$HOME/.serena" 2>/dev/null || true
+          du -sh "$HOME/.codegraph" 2>/dev/null || true
