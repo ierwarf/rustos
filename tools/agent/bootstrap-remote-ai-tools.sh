@@ -147,7 +147,12 @@ install_npm_tools() {
     # RustOS deliberately uses CodeGraph graph-only; skip the unused embedding
     # model, but do not skip the signed native analysis engine download.
     export CODEGRAPH_SKIP_MODEL_FETCH=1
+    # npm on this runner blocks dependency lifecycle scripts unless explicitly
+    # admitted. CodeGraph's pinned postinstall fetches the platform engine and
+    # verifies its published checksum; allow exactly that package, not arbitrary
+    # install scripts from the rest of the dependency graph.
     npm install --global --no-audit --no-fund \
+        --allow-scripts=@astudioplus/codegraph-mcp \
         "@astudioplus/codegraph-mcp@$CODEGRAPH_VERSION" \
         "mcp-ripgrep@$RIPGREP_MCP_VERSION"
 
