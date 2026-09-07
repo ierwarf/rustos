@@ -1,0 +1,47 @@
+name: Apply bounded SMP bench profile fix
+
+on:
+  push:
+    branches: ["master"]
+    paths:
+      - ".github/workflows/apply-bench-smp-profile-fix.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: [self-hosted, Linux, X64]
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          clean: false
+
+      - name: Apply bounded SMP benchmark profile
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 tools/ci/patch_bench_smp_iteration.py
+          cargo fmt --all
+          git diff --check
+
+      - name: Validate xtask
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -q -p xtask
+          cargo xtask check
+
+      - name: Push source-only fix
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add tools/xtask/src/bench.rs
+          git diff --cached --check
+          git config user.name "ierwarf"
+          git config user.email "64543544+ierwarf@users.noreply.github.com"
+          git commit -m "fix(bench): use bounded SMP verification profile"
+          git push origin HEAD:master
