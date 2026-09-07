@@ -1,5 +1,6 @@
 name: RustOS KVM boot smoke
 
+# This workflow is intentionally short: validate cached DVM state and one KVM boot.
 on:
   workflow_dispatch:
   push:
