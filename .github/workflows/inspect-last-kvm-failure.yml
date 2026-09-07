@@ -17,24 +17,20 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          clean: false
+          clean: true
 
-      - name: Inspect retained 8-vCPU readiness tail
+      - name: Print panic callsites
         shell: bash
         run: |
-          set -uo pipefail
-          echo '=== failure summary ==='
-          cat build/kvm/failure-summary.json 2>/dev/null || true
+          set -euo pipefail
+          echo '=== pager_vma owner site ==='
+          nl -ba kernel/ps/src/multitask/pager_vma.rs | sed -n '1080,1145p'
           echo
-          echo '=== UI / ipcbench / launch progression ==='
-          grep -nE 'uiserver:|wayclick:|ipcbench:|runtimed:|sessiond:|initd:|inputd:|gpu-compositor|first frame|first-frame|spawn|activated|ready' build/kvm/rustos-debugcon.log 2>/dev/null | tail -n 1600 || true
+          echo '=== process_table waiter site ==='
+          nl -ba kernel/ps/src/multitask/process_table.rs | sed -n '410,465p'
           echo
-          echo '=== last 500 structured RustOS records ==='
-          tail -n 500 build/kvm/rustos-debugcon.log 2>/dev/null || true
+          echo '=== process_state_lock panic site ==='
+          nl -ba kernel/ps/src/multitask/process_state_lock.rs | sed -n '125,170p'
           echo
-          echo '=== DVM tail ==='
-          tail -n 220 build/kvm/linux-dvm-serial.log 2>/dev/null || true
-          echo
-          echo '=== QEMU stderr tails ==='
-          tail -n 120 build/kvm/rustos-qemu.stderr.log 2>/dev/null || true
-          tail -n 120 build/kvm/linux-dvm-qemu.stderr.log 2>/dev/null || true
+          echo '=== tlb nested panic site ==='
+          nl -ba kernel/hal/src/arch/tlb_shootdown.rs | sed -n '490,535p'
