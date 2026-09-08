@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Codex PreToolUse hook for Read/file-access tools.
-# Blocks whole-file token bombs while allowing an explicitly bounded text read.
+# Codex PreToolUse hook for source-navigation/read tools.
+# Blocks whole-file token bombs and oversized MCP discovery payloads while
+# allowing focused reads and compact source-navigation queries.
 
 set -euo pipefail
 
@@ -12,31 +13,31 @@ mapfile -d '' -t fields < <(printf '%s' "$INPUT" | jq -jr '
   (.tool_input.start_line // .arguments.start_line // .params.start_line //
    .tool_input.offset // .arguments.offset // .params.offset // "" | tostring), "\u0000",
   (.tool_input.end_line // .arguments.end_line // .params.end_line // "" | tostring), "\u0000",
-  (.tool_input.limit // .arguments.limit // .params.limit // "" | tostring), "\u0000"
+  (.tool_input.limit // .arguments.limit // .params.limit // "" | tostring), "\u0000",
+  (.tool_name // .name // ""), "\u0000",
+  (.tool_input.max_answer_chars // .arguments.max_answer_chars // .params.max_answer_chars // "" | tostring), "\u0000",
+  (.tool_input.max_results // .arguments.max_results // .params.max_results // "" | tostring), "\u0000",
+  (if ((.tool_input.compact? == false) or (.arguments.compact? == false) or (.params.compact? == false))
+   then "false" else "true-or-unset" end), "\u0000"
 ' 2>/dev/null || true)
 
 path="${fields[0]:-}"
 range_start="${fields[1]:-}"
 range_end="${fields[2]:-}"
 range_limit="${fields[3]:-}"
-[[ -z "$path" ]] && exit 0
+tool_name="${fields[4]:-}"
+max_answer_chars="${fields[5]:-}"
+max_results="${fields[6]:-}"
+compact_state="${fields[7]:-}"
 
 max_lines="${RUSTOS_HOOK_MAX_READ_LINES:-200}"
+max_mcp_chars="${RUSTOS_HOOK_MAX_MCP_ANSWER_CHARS:-12000}"
+max_ast_results="${RUSTOS_HOOK_MAX_AST_RESULTS:-40}"
+max_codegraph_results="${RUSTOS_HOOK_MAX_CODEGRAPH_RESULTS:-30}"
 [[ "$max_lines" =~ ^[0-9]+$ ]] || max_lines=200
-bounded=0
-if [[ "$range_start" =~ ^[0-9]+$ && "$range_end" =~ ^[0-9]+$ ]] \
-  && (( range_end >= range_start && range_end - range_start < max_lines )); then
-  bounded=1
-elif [[ "$range_limit" =~ ^[0-9]+$ ]] && (( range_limit > 0 && range_limit <= max_lines )); then
-  bounded=1
-fi
-
-REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd -P)"
-case "$path" in
-  "$REPO_ROOT"/*) rel_path="${path#"$REPO_ROOT"/}" ;;
-  ./*) rel_path="${path#./}" ;;
-  *) rel_path="$path" ;;
-esac
+[[ "$max_mcp_chars" =~ ^[0-9]+$ ]] || max_mcp_chars=12000
+[[ "$max_ast_results" =~ ^[0-9]+$ ]] || max_ast_results=40
+[[ "$max_codegraph_results" =~ ^[0-9]+$ ]] || max_codegraph_results=30
 
 deny() {
   local reason="$1"
@@ -51,6 +52,43 @@ deny() {
   }'
   exit 0
 }
+
+if [[ "$max_answer_chars" =~ ^[0-9]+$ ]] && (( max_answer_chars > max_mcp_chars )); then
+  deny "MCP answer budget blocked: requested ${max_answer_chars} chars; use <=${max_mcp_chars} and narrow the query first."
+fi
+
+if [[ "$tool_name" == mcp__ast_grep__* ]] \
+  && [[ "$max_results" =~ ^[0-9]+$ ]] \
+  && (( max_results > max_ast_results )); then
+  deny "ast-grep result budget blocked: requested ${max_results}; use <=${max_ast_results} and tighten the pattern first."
+fi
+
+if [[ "$tool_name" == mcp__codegraph__codegraph_* ]] \
+  && [[ "$range_limit" =~ ^[0-9]+$ ]] \
+  && (( range_limit > max_codegraph_results )); then
+  deny "CodeGraph result budget blocked: requested ${range_limit}; use <=${max_codegraph_results} and expand one selected symbol later."
+fi
+
+if [[ "$tool_name" == *codegraph_symbol_search* && "$compact_state" == "false" ]]; then
+  deny "CodeGraph symbol search must use compact=true; expand only the selected symbol after discovery."
+fi
+
+[[ -z "$path" ]] && exit 0
+
+bounded=0
+if [[ "$range_start" =~ ^[0-9]+$ && "$range_end" =~ ^[0-9]+$ ]] \
+  && (( range_end >= range_start && range_end - range_start < max_lines )); then
+  bounded=1
+elif [[ "$range_limit" =~ ^[0-9]+$ ]] && (( range_limit > 0 && range_limit <= max_lines )); then
+  bounded=1
+fi
+
+REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd -P)"
+case "$path" in
+  "$REPO_ROOT"/*) rel_path="${path#"$REPO_ROOT"/}" ;;
+  ./*) rel_path="${path#./}" ;;
+  *) rel_path="$path" ;;
+esac
 
 case "$rel_path" in
   *.pcap|*.bin|*.iso|*.img|perf.data|*/perf.data)
