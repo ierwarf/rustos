@@ -113,11 +113,9 @@ range and volatile facts; do not replay prior evidence.
 1. Plan the evidence set before tool calls; batch known independent operations.
 2. Keep the **combined expected model-visible payload of one tool batch <=24 KiB**.
    Narrow queries before splitting a large batch into many sequential model turns.
-3. Exploratory shell reads should request `max_output_tokens <=3000`; the hard
-   interactive ceiling is **6000**. Larger command output goes to a task-local
+3. Exploratory shell reads should request `max_output_tokens <=3000`; the hard interactive ceiling is **6000**. Larger command output goes to a task-local
    file (normally under `/tmp`) and only a bounded summary returns to the model.
-4. Serena search/read calls default to `max_answer_chars=4000..8000` and must not
-   exceed **12000**. Broad substring discovery does not request full bodies;
+4. Serena search/read calls default to `max_answer_chars=4000..8000` and must not exceed **12000**. Broad substring discovery does not request full bodies;
    locate names first, then read the exact symbol body.
 5. ast-grep discovery returns at most **40** matches per call. Tighten the
    structural pattern before asking for more.
