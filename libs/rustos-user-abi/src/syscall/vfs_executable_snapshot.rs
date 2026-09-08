@@ -5,6 +5,9 @@ use super::VFS_IPC_PATH_CAPACITY;
 /// this operation is never exposed as a Linux filesystem syscall.
 pub const VFS_EXECUTABLE_SNAPSHOT_ABI_VERSION: u16 = 2;
 pub const VFS_EXECUTABLE_SNAPSHOT_OP_OPEN: u16 = 1;
+/// Stage-root basis for trusted loaderd launches that do not replace a live
+/// process and therefore have no target PID cwd namespace.
+pub const VFS_EXECUTABLE_SNAPSHOT_DIRFD_ROOT: u64 = 0;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -15,10 +18,12 @@ pub struct VfsExecutableSnapshotRequest {
     pub requester_pid: u64,
     pub requester_tid: u64,
     /// Process whose VFS namespace owns relative-path resolution. A zero value
-    /// is valid only when `path` is already absolute.
+    /// selects the trusted stage root and requires `dirfd` to be
+    /// `VFS_EXECUTABLE_SNAPSHOT_DIRFD_ROOT`.
     pub target_pid: u64,
-    /// Directory basis for resolution. Executable snapshots currently admit
-    /// only `AT_FDCWD`; vfsd, as namespace owner, interprets the value.
+    /// Directory basis for resolution. Executable snapshots admit `AT_FDCWD`
+    /// for a live target PID or the explicit stage-root basis for PID zero;
+    /// vfsd, as namespace owner, interprets the value.
     pub dirfd: u64,
     pub max_bytes: u64,
     pub path_len: u32,

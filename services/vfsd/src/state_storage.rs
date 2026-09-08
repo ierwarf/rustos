@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 
-use rustos_user_abi::syscall::ProductExecutableSnapshotEvidence;
+use rustos_user_abi::syscall::{
+    ProductExecutableSnapshotEvidence, VFS_EXECUTABLE_SNAPSHOT_DIRFD_ROOT,
+};
 use sha2::{Digest, Sha256};
 
 /// Whether an `open` metadata errno is an answer rather than a fault.
@@ -42,6 +44,7 @@ impl VfsState {
         let base = executable_snapshot_resolution_base(
             raw_path,
             request.target_pid,
+            request.dirfd == VFS_EXECUTABLE_SNAPSHOT_DIRFD_ROOT,
             is_at_fdcwd(request.dirfd),
             self.cwd.get(&request.target_pid).map(String::as_str),
         )?;

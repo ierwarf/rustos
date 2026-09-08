@@ -385,6 +385,20 @@ if ! grep -Fq 'state.resolve_executable_snapshot_request(*request)' <<<"$vfs_rec
     exit 1
 fi
 
+proc_prepare_authority="kernel/compat/src/user/syscall/linux/proc_broker_ops/authority.rs"
+proc_prepare_body="$(
+    sed -n '/^pub(super) fn syscall_linux_rustos_proc_prepare_broker(/,/^pub(super) fn syscall_linux_rustos_proc_map_file_broker(/p' \
+        kernel/compat/src/user/syscall/linux/proc_broker_ops.rs | sed '$d'
+)"
+if grep -Eq 'call_service_endpoint|IPC_SERVICE_PROCD|procd_process_prepare_policy' \
+        "$proc_prepare_authority" \
+    || grep -Eq 'call_service_endpoint|IPC_SERVICE_PROCD|procd_process_prepare_policy' \
+        <<<"$proc_prepare_body" \
+    || ! grep -Fq 'let owner_pid = loader_pid;' <<<"$proc_prepare_body"; then
+    echo 'loader prepare must consume PROCESS_LOADER authority without a procd reverse IPC cycle' >&2
+    exit 1
+fi
+
 # VFS geometry admission is an authority equality check.  Treating the signed
 # flag word as an allowed-bit mask would admit flags=0 (writable) when the
 # caller requires the exact READ_ONLY authority.

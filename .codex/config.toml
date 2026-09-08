@@ -15,6 +15,9 @@ sandbox_mode = "workspace-write"
 [features]
 hooks = true
 
+# This is the canonical Codex hook representation for the project. Claude
+# Code-specific hooks live in .claude/settings.json and must not be duplicated
+# under .codex/.
 [[hooks.PreToolUse]]
 matcher = "^(Read|mcp__.*read.*file|mcp__serena__read_file)$"
 [[hooks.PreToolUse.hooks]]

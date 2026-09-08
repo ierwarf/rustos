@@ -215,6 +215,14 @@ lock, and service restart invalidates it by advancing the epoch.
   publication into that set, so the empty set proves that no reap is possible.
   This prevents a five-second procd control deadline from serializing every
   catalog, launch, and UI owner behind an impossible reap during SMP startup.
+  Loaderd's process-prepare broker likewise performs no reverse procd IPC.
+  Loaderd already owns ELF/PE image admission and its exact `PROCESS_LOADER`
+  capability owns the bounded prepare handle; the retired format-echo request
+  added no policy. It could close `procd -> loaderd -> procd` when an exec raced
+  an ordinary spawn, holding both receive owners until the five-second control
+  deadline. The relative-exec KVM witness reproduced that cycle with
+  `reap_us=5,003,496`; after removal, the same app replaced PID 58 and exited
+  zero while the concurrent launch turn's largest observed reap was 85,270 us.
 
 - Default KVM-smoke runs keep coarse `uiserver: update tick` logs only.
 - Generic and typed slow-IPC diagnostics each emit at most one representative

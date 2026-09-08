@@ -1643,6 +1643,11 @@ policy remains with the owning service.
 
 - Runtime launches route through `loaderd` (`IPC_SERVICE_LOADERD`), not direct `SYS_RUSTOS_SPAWN_EXEC`.
 - `SYS_RUSTOS_PROC_*_BROKER` calls fail with `EACCES` unless caller owns `PROCESS_LOADER`.
+- `SYS_RUSTOS_PROC_PREPARE_BROKER` consumes loaderd's exact
+  `PROCESS_LOADER` identity without a reverse procd IPC. Loaderd already owns
+  ELF/PE image admission; the broker owns only the bounded prepare-handle
+  mechanism. The retired procd process-prepare query was a no-op format echo
+  and could deadlock as `procd -> loaderd -> procd` when exec raced spawn.
 - Loader request ABI v3 requires `requester_pid` to equal the kernel-stamped
   IPC sender. Process broker ABI v3 carries that identity into deferred
   commit: ring0 binds the suspended target PID to the exact requester in a
@@ -1671,7 +1676,10 @@ policy remains with the owning service.
   and vfsd resolves the path against that PID's authoritative cwd before it
   admits bulk I/O. Vfsd returns the canonical absolute path and the terminally
   sealed executable handle in one reply. Loaderd uses that returned path for
-  process identity and never combines a cwd string itself. If loader
+  process identity and never combines a cwd string itself. Trusted bootstrap
+  and ordinary spawn requests have no live target PID; they use the explicit
+  v2 stage-root basis and vfsd resolves their relative package path from `/`.
+  A live-target exec cannot select that basis and must use `AT_FDCWD`. If loader
   materialization fails, procd must cancel the exec ticket via
   `SYS_RUSTOS_PROC_CANCEL_EXEC_BROKER` before replying.
 - An exec ticket binds one live, non-exiting Linux `(target_pid, target_tid)` pair. Cancel and exec-target validate that exact stored pair before consuming the ticket; a mismatched request must leave it live. The successful exec-target path publishes its register handoff before replacing the target image. Normal/signal process exit, a non-final target-thread exit, and sibling retirement caused by Linux exec remove stale ticket or handoff state.

@@ -27,7 +27,7 @@ pub(super) use activation_batch::syscall_linux_rustos_proc_activate_batch_broker
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
-use authority::{current_loader_process_id, prepare_owned_by, procd_process_prepare_policy};
+use authority::{current_loader_process_id, prepare_owned_by};
 use core::sync::atomic::{AtomicU64, Ordering};
 use heapless::index_map::FnvIndexMap;
 use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
@@ -172,21 +172,16 @@ pub(super) fn syscall_linux_rustos_proc_prepare_broker(args_ptr: u64) -> u64 {
     }
     let exec_ticket =
         (args.flags & PROC_BROKER_PREPARE_FLAG_EXEC_TICKET != 0).then_some(args.reserved0);
-    let owner_pid = match exec_ticket {
-        Some(ticket) => {
-            if !EXEC_TICKETS.lock().contains_key(&ticket) {
-                return linux_errno(LINUX_EPERM);
-            }
-            // procd already minted this exact one-shot exec authority before
-            // calling loaderd. Re-entering procd here would deadlock the
-            // procd -> loaderd -> prepare call chain.
-            loader_pid
-        }
-        None => match procd_process_prepare_policy(args.format) {
-            Ok(owner_pid) => owner_pid,
-            Err(errno) => return linux_errno(errno),
-        },
-    };
+    if let Some(ticket) = exec_ticket
+        && !EXEC_TICKETS.lock().contains_key(&ticket)
+    {
+        return linux_errno(LINUX_EPERM);
+    }
+    // The PROCESS_LOADER capability is the prepare authority. Loaderd already
+    // completed image-format admission in ring3; a loaderd -> procd policy
+    // call here can close a synchronous procd -> loaderd -> procd cycle when
+    // an exec races an ordinary spawn.
+    let owner_pid = loader_pid;
     {
         let prepares = PROC_PREPARES.lock();
         if let Err(errno) = proc_prepare_publication_status(

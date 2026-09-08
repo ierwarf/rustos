@@ -979,7 +979,8 @@ pub const SERVICE_CHECKPOINT_ABI_VERSION: u16 = 1;
 pub const SERVICE_CHECKPOINT_FLAG_TOMBSTONE: u16 = 1 << 0;
 pub const SERVICE_CHECKPOINT_VALUE_CAPACITY: usize = 64;
 pub const SERVICE_CHECKPOINT_MAX_RECORDS: usize = 32 * 1024;
-pub const COMMERCIAL_MAX_PROCD_OP_PROCESS_PREPARE: u16 = 1;
+// Procd operation 1 (process-prepare) is retired. Image admission belongs to
+// loaderd and the PROCESS_LOADER-gated broker owns only prepare mechanism.
 pub const COMMERCIAL_MAX_PROCD_OP_EXEC_TICKET: u16 = 2;
 pub const COMMERCIAL_MAX_PROCD_OP_FORK_PLAN: u16 = 3;
 pub const COMMERCIAL_MAX_PROCD_OP_THREAD_PLAN: u16 = 4;

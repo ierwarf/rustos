@@ -69,6 +69,18 @@ expect_no_match() {
   pass "$name"
 }
 
+expect_absent() {
+  local name="$1"
+  local file="$2"
+
+  if [[ -e "$file" ]]; then
+    printf 'not ok - %s: unexpected duplicate representation at %s\n' "$name" "$file" >&2
+    exit 1
+  fi
+
+  pass "$name"
+}
+
 expect_deny \
   "destructive rm is denied" \
   .codex/hooks/pre_bash_destructive.sh \
@@ -228,6 +240,10 @@ expect_match \
   "unified shell tool is hook-covered" \
   .codex/config.toml \
   'Bash\|exec_command\|mcp__serena__execute_shell_command'
+
+expect_absent \
+  "Codex hooks use the TOML representation only" \
+  .codex/hooks.json
 
 expect_match \
   "Serena excludes generated output" \

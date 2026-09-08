@@ -24,10 +24,14 @@ pub const EROFS: i32 = 30;
 pub fn executable_snapshot_resolution_base<'a>(
     path: &str,
     target_pid: u64,
+    dirfd_is_root: bool,
     dirfd_is_at_fdcwd: bool,
     cwd: Option<&'a str>,
 ) -> Result<&'a str, i32> {
     if path.starts_with('/') {
+        return Ok("/");
+    }
+    if target_pid == 0 && dirfd_is_root {
         return Ok("/");
     }
     if target_pid == 0 || !dirfd_is_at_fdcwd {
@@ -738,19 +742,23 @@ mod tests {
     #[test]
     fn relative_exec_snapshot_uses_the_vfsd_owned_cwd() {
         assert_eq!(
-            executable_snapshot_resolution_base("./a", 41, true, Some("/tmp/exec-test")),
+            executable_snapshot_resolution_base("./a", 41, false, true, Some("/tmp/exec-test")),
             Ok("/tmp/exec-test")
         );
         assert_eq!(
-            executable_snapshot_resolution_base("/bin/a", 0, false, None),
+            executable_snapshot_resolution_base("/bin/a", 0, false, false, None),
             Ok("/")
         );
         assert_eq!(
-            executable_snapshot_resolution_base("./a", 0, true, Some("/tmp")),
+            executable_snapshot_resolution_base("services/initd/initd.elf", 0, true, false, None),
+            Ok("/")
+        );
+        assert_eq!(
+            executable_snapshot_resolution_base("./a", 0, false, true, Some("/tmp")),
             Err(EINVAL)
         );
         assert_eq!(
-            executable_snapshot_resolution_base("./a", 41, false, Some("/tmp")),
+            executable_snapshot_resolution_base("./a", 41, true, false, Some("/tmp")),
             Err(EINVAL)
         );
     }
