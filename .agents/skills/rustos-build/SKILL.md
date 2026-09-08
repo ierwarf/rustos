@@ -5,9 +5,9 @@ description: Build, check, compile, or stage the RustOS workspace through its si
 
 # RustOS Build
 
-For source changes, load `rustos-code-editing` first: Serena, ast-grep MCP,
-and CodeGraph must pass their preflight before source is edited, with Serena
-as the primary editor.
+For source changes, load `rustos-code-editing` first and use its
+Local/Structural/Critical routing. Do not preflight tools the change does not
+need; Serena remains the primary semantic editor.
 
 ## Routing
 

@@ -110,7 +110,7 @@ added_modes:
 
 # initial prompt for the project. It will always be given to the LLM upon activating the project
 # (contrary to the memories, which are loaded on demand).
-initial_prompt: "Read the AGENTS.md stable prefix and route through docs/ai/task-router.md. For source edits, preflight Serena, ast-grep MCP, and CodeGraph MCP; use Serena as the primary semantic navigator and editor, ast-grep for structural patterns, and CodeGraph for call/dependency/impact context. If any source-editing MCP fails, stop source edits and report it. For continued work, read docs/ai/session-handoff.md and preserve the dirty worktree."
+initial_prompt: "Use AGENTS.md + docs/ai/task-router.md. Keep context small. For source edits use Serena first; use ast-grep only for structural patterns and CodeGraph only for call/dependency impact. Do not preflight unused MCPs. If a tool selected as required fails, stop that edit. Resume via docs/ai/session-handoff.md and preserve dirty work."
 
 # time budget (seconds) per tool call for the retrieval of additional symbol information
 # such as docstrings or parameter information.

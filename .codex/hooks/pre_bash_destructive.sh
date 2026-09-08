@@ -42,8 +42,8 @@ block_destructive() {
   block "Blocked destructive command: $1. Re-issue only if the user explicitly authorized it."
 }
 
-max_shell_output_tokens="${RUSTOS_HOOK_MAX_SHELL_OUTPUT_TOKENS:-6000}"
-[[ "$max_shell_output_tokens" =~ ^[0-9]+$ ]] || max_shell_output_tokens=6000
+max_shell_output_tokens="${RUSTOS_HOOK_MAX_SHELL_OUTPUT_TOKENS:-3000}"
+[[ "$max_shell_output_tokens" =~ ^[0-9]+$ ]] || max_shell_output_tokens=3000
 read_heavy_re='(^|[[:space:];|&])(cat|sed[[:space:]]+-n|rg|grep|find|head|tail|git[[:space:]]+(diff|show|log))([[:space:]]|$)'
 if [[ "$max_output_tokens" =~ ^[0-9]+$ ]] \
   && (( max_output_tokens > max_shell_output_tokens )) \

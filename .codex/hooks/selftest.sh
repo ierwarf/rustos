@@ -237,9 +237,19 @@ expect_match \
   'mcp_servers\.codegraph'
 
 expect_match \
-  "source edits require the three MCP tools" \
+  "Codex output verbosity is low" \
+  .codex/config.toml \
+  '^model_verbosity = "low"$'
+
+expect_match \
+  "Codex compacts before context grows large" \
+  .codex/config.toml \
+  '^model_auto_compact_token_limit = 120000$'
+
+expect_match \
+  "local source edits skip unused MCP preflight" \
   AGENTS.md \
-  'preflight all three project MCP servers'
+  'Do not preflight unused MCP servers'
 
 expect_match \
   "token policy forbids full ALL_TOOLS dumps" \
@@ -259,12 +269,12 @@ expect_match \
 expect_match \
   "token policy bounds Serena answers" \
   docs/ai/token-policy.md \
-  'must not.*12000'
+  'must not.*8000'
 
 expect_match \
   "token policy bounds shell output" \
   docs/ai/token-policy.md \
-  'interactive ceiling is .*6000'
+  'interactive ceiling is .*3000'
 
 expect_match \
   "source navigation hook covers all three MCP namespaces" \

@@ -1,182 +1,113 @@
 # RustOS Agent Instructions
 
-Read this document first, then keep the working context small. This file, together with `docs/ai-map.md`, `docs/ai/token-policy.md`, and `docs/ai/task-router.md`, forms the stable reusable prefix that every agent must load. Open everything else only when required.
+Keep model context small. The stable reusable prefix is only this file plus
+`docs/ai/task-router.md`. An `AGENTS.md` supplied by the environment already
+counts as loaded; do not reread it unless it changed. Everything else is
+on-demand.
 
-## TL;DR
+## Core workflow
 
-1. Route the task through `docs/ai/task-router.md` before reading source code.
-2. After making edits, run `cargo xtask dev-plan` to separate fast checks from the one-time stable change-set gates. The plan is for routing only; it is not validation evidence.
-   Before any Linux DVM integration build, also run `make -C driver-domains/linux build-plan`.
-   If a build is interrupted, resume the same target without running `clean` or `distclean`.
-   For a cached DVM relay source package, its `dev-*` command is only the fast compilation loop. Batch the corresponding `rebuild-*` image or artifact refresh once, after the change set is stable.
-   Never clean or rebuild a toolchain for an ordinary relay edit.
-3. For every source-code change, preflight all three project MCP servers: Serena, ast-grep, and CodeGraph. Use Serena as the primary semantic navigator and editor; use ast-grep for syntax-structure searches/rules and CodeGraph for call/dependency/impact context. If any one of the three cannot be listed or cannot complete its focused probe, stop source editing and report the exact failing server/tool. Do not continue a code edit with local `rg` or a text-only fallback. Documentation-only and agent-infrastructure edits may use the normal scoped-search fallback.
-4. Sub-agents must use **GPT-5.6 terra** with `xhigh` reasoning. Do not use GPT-5.5.
-5. Never bypass hooks with `--no-verify`, `--no-gpg-sign`, or equivalent options. Treat hook output as primary evidence.
-6. RustOS is in the middle of evacuating functionality from ring0 into user services. Move policy into `rootd`, `syscalld`, `vfsd`, `loaderd`, `netd`, `inputd`, and other named services rather than moving it back into the kernel.
-7. Every bug fix must harden the violated contract and add evidence that prevents the same failure class from returning. Every source-code commit must update the applicable Markdown owner/flow contract in the same commit; a source-only commit is incomplete.
+1. Route the request through `docs/ai/task-router.md`; load the smallest focused
+   contract it names. Do not preload `docs/ai-map.md`, `docs/ai/token-policy.md`,
+   human docs, references, logs, or broad source trees.
+2. Search before opening source. Prefer exact symbols/ranges and stop searching
+   once the missing fact is known.
+3. Select the source-tool tier below. **Do not preflight unused MCP servers.**
+4. After product-source edits run `cargo xtask dev-plan`, execute its `now` lane
+   while iterating, and run relevant `stable-batch` work once after the change
+   set settles. The printed plan is routing, not evidence. Agent/docs-only edits
+   use their focused selftests instead.
+5. Never bypass hooks/signing with `--no-verify`, `--no-gpg-sign`, or equivalent
+   options. Do not use `clean`/`distclean` as ordinary build recovery.
+6. RustOS is evacuating policy from ring0 into named services (`rootd`,
+   `syscalld`, `vfsd`, `loaderd`, `netd`, `inputd`, etc.). Do not move policy
+   back into the kernel or retain obsolete compatibility merely as fallback.
 
-## Context Budget
+## Source-tool tiers
 
-See `docs/ai-map.md` for cache order and `docs/ai/token-policy.md` for the complete rules.
+**Local** — one owner/module, no public ABI, privilege, ownership, lifecycle,
+concurrency, or cross-module change. Serena is the default semantic navigator
+when symbol context helps; a scoped text search is sufficient for exact textual
+lookup. ast-grep and CodeGraph are not required.
 
-Search before opening files. Load the stable prefix first and place the task text last. Do not include logs in the stable prefix.
-An `AGENTS.md` supplied by the environment already counts as loaded. Do not read
-it again unless its contents changed. After compaction, recover only the focused
-router or handoff section needed for the next decision; do not replay the whole
-bootstrap set.
+**Structural** — signatures, several files/crates, non-trivial call structure,
+or dependency/ownership movement. Use Serena plus ast-grep only for structural
+patterns and CodeGraph only for call/dependency/blast-radius evidence.
 
-## Tool Usage
+**Critical** — scheduler, MM, IPC, security/capability, ABI, SMP/TLB, privilege,
+lifetime/concurrency, ring0/ring3 boundary, or hardware-critical behavior. Use
+Serena and the structural/graph tools that materially establish correctness;
+for broad critical changes this normally means all three. If a tool selected as
+required for the task fails its focused probe, stop that source edit and report
+the exact blocker rather than guessing.
 
-Use Serena, ast-grep, and CodeGraph together for source work. Serena owns symbol discovery, references, focused reads, and edits; ast-grep owns syntax-aware pattern/rule matching; CodeGraph owns call graph, dependency, and blast-radius checks. Use ripgrep MCP or local `rg` only for narrowly scoped text/documentation lookup. The three source-editing MCPs are a hard gate: if one fails its preflight or focused query, do not modify source and report the failure.
+Serena remains the primary semantic navigator/editor. ast-grep owns syntax-aware
+patterns; CodeGraph owns call/dependency/impact analysis. Never dump complete
+tool catalogs merely to discover a known tool.
 
-Optimize model/tool round trips before shaving individual result bytes. Batch
-three or more known independent reads, searches, diagnostics, or checks into one
-orchestrated tool call, collect the evidence set, and then reason over it. Do not
-return to the model after each symbol or file lookup.
+## Context and output discipline
 
-Never print complete `ALL_TOOLS` entries or bulk tool descriptions. The known
-project namespaces are `mcp__serena__*`, `mcp__ast_grep__*`, and
-`mcp__codegraph__codegraph_*`. If discovery is unavoidable, print matching names
-only; inspect at most two exact descriptions and cap each at 2,000 characters.
+Follow `docs/ai/token-policy.md` when a task needs detailed limits. In ordinary
+work, keep source reads to focused ranges, command output quiet on success, and
+failures to the first useful diagnostic plus a tiny tail. Avoid `logs/`,
+`target/`, `build/`, `vendor/`, `perf.data`, and `Cargo.lock` unless the routed
+task specifically requires a bounded read there.
 
-Allow project hooks to run. Do not bypass them with `--no-verify`, `--no-gpg-sign`, or equivalent options.
+Batch independent evidence when known, but do not gather evidence that cannot
+change the next decision. Do not restate the same findings after every tool
+call. At a meaningful milestone, refresh the short handoff and compact/freshen
+context rather than carrying a large history indefinitely.
 
-If a hook blocks execution or reports a tool or configuration failure, repair the hook or command path before continuing. Hook output is the primary signal.
+## Contracts and validation
 
-## Sub-Agent Use
+A bug fix must repair the violated invariant and add an appropriate regression
+witness. Update a Markdown owner/flow contract in the same change **only when**
+the behavior, public interface, invariant, ownership/lifecycle rule, registry,
+validation command, or agent routing actually changes. Mechanical/internal
+implementation edits do not require documentation churn.
 
-Use sub-agents only when doing so reduces search and read churn that would otherwise pollute the main context. Valid cases include parallel independent exploration, log triage, or a disjoint write slice.
+Use existing subsystem APIs and declared sources of truth. Fail closed at
+privilege/ABI boundaries, use bounded waits, and preserve observable application
+ABI. For enabled product topologies, ownership, recovery, authenticated/versioned
+cross-domain contracts, bounded performance, and evidence remain completion
+requirements.
 
-Do not use a sub-agent for a single focused read or edit.
+Before a Linux DVM integration build run
+`make -C driver-domains/linux build-plan`; use cached `dev-*` loops while
+iterating and one matching `rebuild-*` when stable. Resume interrupted targets.
 
-Constraints:
+## Sub-agents
 
-* Sub-agents are read-only by default. A worker may write only within an explicitly disjoint file scope.
-* Provide only narrow context: the task, relevant paths, and a clear stopping condition.
-* Do not provide secrets, signing material, or unrelated repository state.
-* Workers must return evidence rather than final decisions: file paths, line numbers, symbols, a short summary, and explicit uncertainty.
-* The main agent owns reasoning, integration, validation, and final decisions.
+Use sub-agents only when parallel independent exploration or a disjoint slice
+reduces main-context churn. Give them only the task, relevant paths, stopping
+condition, and required evidence. They are read-only unless a disjoint write
+scope is explicit. Repository policy requires sub-agents to use **GPT-5.6
+terra** with `xhigh` reasoning; the main agent owns integration and validation.
 
-### Model Selection
+## Routing pointers
 
-Repository policy, as directed by the user, requires every sub-agent to use **GPT-5.6 terra** with `xhigh` reasoning.
+- Resume prior work: `docs/ai/session-handoff.md`, then live `git status --short`.
+- Physical GPU/VFIO continuation: `docs/ai/physical-gpu-status.md` before new
+  hardware tests.
+- Source ownership/index: `docs/ai-map.md` only when the router does not already
+  name the owner.
+- Commands/build lanes: `docs/ai/commands.md`.
+- Kernel APIs: `docs/ai/kernel-api-map.md`.
+- ABI/service routing: `docs/ai/contracts-abi.md`.
+- SMP: `docs/ai/smp-contract.md`.
+- Performance: `.agents/skills/rustos-performance-optimization/SKILL.md` and the
+  measured benchmark owner.
 
-Do not use GPT-5.5 for sub-agent work.
+## External references
 
-This policy supersedes the previous mini-first guidance until the user explicitly revises it.
+External web/reference research is mandatory for a new subsystem architecture
+or when correctness depends on an unfamiliar external ABI/specification. Use
+`references/` for high-risk debugging only when local evidence is insufficient
+or a routed skill names a specific reference. Do **not** scan references before
+routine implementation, tests, mechanical refactors, or well-scoped fixes.
 
-## Do Not Inspect by Default
+## Reporting
 
-Do not inspect the following paths or files by default:
-
-* `logs/`
-* `target/`
-* `build/`
-* `vendor/`
-* `perf.data`
-* `Cargo.lock`
-
-Narrow exceptions are defined in `docs/ai/token-policy.md` §10.
-
-## Common Commands
-
-See `docs/ai/commands.md`.
-
-Commands should remain quiet on success. Treat failure output as primary context. Do not scan log directories to diagnose build failures.
-Capture verbose test/build output outside the model context. On success, return
-only the command, exit status, and bounded result summary; on failure, return the
-first relevant error plus a bounded tail. Cap log searches with match and line
-limits.
-
-## Hardening Direction
-
-### Active Refactor: Ring0 Evacuation
-
-`rootd` is the first user process. It starts `syscalld`, `vfsd`, and `loaderd`, then hands control to `initd`.
-
-Move policy into services rather than back into the kernel.
-
-Use `RING3-MIGRATION-REFERENCE` and `RING3-MIGRATION-COMMENTED-OUT` markers only as local annotations. Source ownership, broker call paths, and service contracts are the authoritative migration sources.
-
-### Product Goal
-
-RustOS is a clean, modern, dual-ABI microkernel system with the following goals:
-
-* Preserve native Linux ELF application compatibility.
-* Preserve native Windows PE64 and EXE application compatibility.
-* Isolate Linux driver stacks inside DVMs.
-* Keep policy inside named user services.
-* Keep ring0 small, fast, and capability-oriented.
-
-Do not preserve obsolete `.ko`, kernel-extension, driver-private, or undocumented compatibility merely because an older system exposed it.
-
-Migration must not break the explicitly supported observable application ABI.
-
-Removal of ring0 code must proceed through narrow, explicit broker interfaces.
-
-Source-writing, lifecycle, concurrency, commenting, and refactoring requirements are defined in `docs/ai/core-engineering-contract.md`.
-
-## Commercial Completion Bar
-
-No implementation path, document, test plan, or review may excuse a missing required property on the grounds that the system is early, experimental, transitional, or a prototype.
-
-For every enabled product topology, completion requires:
-
-* Explicit ownership and least authority.
-* Bounded failure detection and recovery.
-* Authenticated and versioned cross-domain contracts.
-* Observable latency and throughput limits.
-* Evidence that the implementation satisfies its stated invariants.
-
-A mandatory capability that is absent, unverified, or retained only behind a fallback fails the acceptance gate. It must not be treated as a caveat.
-
-After dependency proof is complete, retire replaced code, contracts, and documentation.
-
-Do not preserve a legacy route merely to make an incomplete primary route appear successful.
-
-### General Principles
-
-* Prefer hardening over symptom patches. Make ownership, timeouts, queue bounds, and ABI contracts explicit in source code, manifests, registries, or AI-readable contracts.
-* A bug fix is complete only when it names the violated invariant, repairs the root cause, and adds a regression witness for the whole failure class. Testing only the observed input or retaining an errno-only/boolean-only diagnostic does not satisfy this rule.
-* Every commit that changes source code must update at least one applicable Markdown contract in the same commit. The Markdown change must record the changed invariant, lifecycle, failure classification, or evidence; release-note filler does not count. If no owner contract exists, create it before committing.
-* Fail closed, use bounded waits, and provide direct diagnostics. Never fabricate success.
-* For display, input, driver, and compatibility paths, keep fallback providers behind real hardware or virtio providers.
-* Validate against black frames, stalls, and provider-order regressions.
-
-## Repository Entrypoints
-
-See `docs/ai-map.md`.
-
-Key entrypoints include:
-
-* `Cargo.toml`
-* `tools/xtask/src/cli.rs`
-* `kernel/src/main.rs`
-* `kernel/*/src/api.rs`
-* `libs/runtime-control/src/lib.rs`
-
-For session continuation or handoff, read `docs/ai/session-handoff.md` after loading the stable prefix. Verify all volatile state in that document against the current goal and live Git status.
-
-For physical GPU continuation, read `docs/ai/physical-gpu-status.md` before opening source code or rerunning hardware tests.
-
-## Reporting Discipline
-
-* Ask for or infer the narrow target subsystem before searching.
-* Summarize findings before opening additional files.
-* Do not paste long command output into responses.
-* Keep chat output sparse during implementation. Report only the start, completion, blockers, and decisions that materially affect the work. Do not stream search or build noise.
-* On completion, report briefly:
-
-  * What changed.
-  * Which validation commands ran.
-  * Any remaining blocker or risk.
-
-## Web and Reference Usage
-
-* When designing a new subsystem architecture, external web research is mandatory.
-* Periodically reassess whether the existing architecture remains sound, using external web research where appropriate.
-* Before beginning any task, inspect the `references` directory and acquire the relevant operating-system engineering background.
-* During the task, periodically consult narrowly selected materials from `references` when they are relevant.
-* Do not consume excessive reference material when doing so would reduce productivity or use an unreasonable amount of context.
-* When a debugging task is high-risk or technically difficult, consult relevant accepted and rejected commit examples from the `references` directory before deciding on a fix.
+Keep implementation chatter sparse. Report starts, material decisions/blockers,
+and completion. At completion state what changed, the validation commands that
+actually ran, and any remaining unverified boundary.

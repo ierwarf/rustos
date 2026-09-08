@@ -88,7 +88,7 @@ itself.
   not for moving RustOS policy into ring0. Preserve the named user-service
   owner and its ABI contract while optimizing implementation cost.
 - If measurement leads to a source edit, load `rustos-code-editing` first and
-  pass the Serena, ast-grep, and CodeGraph preflight before editing. After
+  select its smallest valid tool tier; do not preflight unused MCPs. After
   source edits run `cargo xtask dev-plan` and execute its selected lanes.
 
 ## Failure and reporting

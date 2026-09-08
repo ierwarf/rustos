@@ -30,14 +30,14 @@ max_answer_chars="${fields[5]:-}"
 max_results="${fields[6]:-}"
 compact_state="${fields[7]:-}"
 
-max_lines="${RUSTOS_HOOK_MAX_READ_LINES:-200}"
-max_mcp_chars="${RUSTOS_HOOK_MAX_MCP_ANSWER_CHARS:-12000}"
-max_ast_results="${RUSTOS_HOOK_MAX_AST_RESULTS:-40}"
-max_codegraph_results="${RUSTOS_HOOK_MAX_CODEGRAPH_RESULTS:-30}"
-[[ "$max_lines" =~ ^[0-9]+$ ]] || max_lines=200
-[[ "$max_mcp_chars" =~ ^[0-9]+$ ]] || max_mcp_chars=12000
-[[ "$max_ast_results" =~ ^[0-9]+$ ]] || max_ast_results=40
-[[ "$max_codegraph_results" =~ ^[0-9]+$ ]] || max_codegraph_results=30
+max_lines="${RUSTOS_HOOK_MAX_READ_LINES:-120}"
+max_mcp_chars="${RUSTOS_HOOK_MAX_MCP_ANSWER_CHARS:-8000}"
+max_ast_results="${RUSTOS_HOOK_MAX_AST_RESULTS:-24}"
+max_codegraph_results="${RUSTOS_HOOK_MAX_CODEGRAPH_RESULTS:-16}"
+[[ "$max_lines" =~ ^[0-9]+$ ]] || max_lines=120
+[[ "$max_mcp_chars" =~ ^[0-9]+$ ]] || max_mcp_chars=8000
+[[ "$max_ast_results" =~ ^[0-9]+$ ]] || max_ast_results=24
+[[ "$max_codegraph_results" =~ ^[0-9]+$ ]] || max_codegraph_results=16
 
 deny() {
   local reason="$1"

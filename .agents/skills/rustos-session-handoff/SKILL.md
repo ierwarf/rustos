@@ -18,8 +18,8 @@ description: Resume or prepare a RustOS development session without losing live 
 5. Re-run only the gate needed for the new request; recorded results are not
    fresh proof.
 
-For any source edit, load `rustos-code-editing`: Serena, ast-grep MCP, and
-CodeGraph must all pass before editing, with Serena as the primary editor.
+For any source edit, load `rustos-code-editing` and select its smallest
+Local/Structural/Critical tool tier; do not preflight unused MCPs.
 
 ## Prepare
 

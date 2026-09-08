@@ -93,7 +93,7 @@ rustos_compact_failure() {
   fi
 
   first="$(grep -Enm1 '(^|[^[:alpha:]])(error(\[[^]]+\])?:|fatal:|panic|FAILED|failed:|not ok -)' "$log" 2>/dev/null || true)"
-  tail="$(tail -n 12 "$log" 2>/dev/null | head -c 3072 || true)"
+  tail="$(tail -n 8 "$log" 2>/dev/null | head -c 2048 || true)"
 
   if [[ -n "$first" && "$tail" == *"$first"* ]]; then
     first=""

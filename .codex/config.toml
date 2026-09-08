@@ -10,7 +10,9 @@
 # the user config.
 
 web_search = "live"
-model_verbosity = "medium"
+model_verbosity = "low"
+model_auto_compact_token_limit = 120000
+model_auto_compact_token_limit_scope = "total"
 sandbox_mode = "workspace-write"
 [features]
 hooks = true
