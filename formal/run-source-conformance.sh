@@ -463,6 +463,56 @@ if ! grep -Fq 'published_current_identity()' <<<"$current_snapshot_body" \
     echo 'the current-task identity snapshot must read the published record before the global scheduler lock, and must keep the locked fallback' >&2
     exit 1
 fi
+# Call authorization already reads and validates the exact service publication
+# epoch. The reply-deadline path must reuse the service identity captured by
+# that transaction. Looking the endpoint up again both adds a second registry
+# read to every synchronous call and can classify a replacement publication
+# rather than the publication that granted authority.
+ipc_authorize_body="$(
+    sed -n '/^fn authorize_current_process_ipc_call(/,/^fn /p' \
+        kernel/compat/src/user/syscall/linux/ipc_ops.rs
+)"
+ipc_fast_call_body="$(
+    sed -n '/^fn try_fast_ipc_call_bytes(/,/^fn /p' \
+        kernel/compat/src/user/syscall/linux/ipc_ops.rs
+)"
+ipc_deadline_body="$(
+    sed -n '/^fn service_reply_deadline_tick_for_authorized_service(/,/^fn /p' \
+        kernel/compat/src/user/syscall/linux/ipc_ops.rs
+)"
+if ! grep -Fq 'Ok((retained_mm, Some(index as u64)))' <<<"$ipc_authorize_body" \
+    || ! grep -Fq '.map(|_| (retained_mm, None))' <<<"$ipc_authorize_body" \
+    || ! grep -Fq 'service_reply_deadline_tick_for_authorized_service(' <<<"$ipc_fast_call_body" \
+    || ! grep -Fq 'authorized_service_id,' <<<"$ipc_fast_call_body" \
+    || ! grep -Fq 'service_reply_deadline_tick_for_service(service_id, request, timeout_ms)' <<<"$ipc_deadline_body" \
+    || grep -Fq 'service_endpoint(' <<<"$ipc_deadline_body" \
+    || rg -Fq 'service_reply_deadline_tick_for_endpoint' \
+        kernel/compat/src/user/syscall/linux/ipc_ops.rs; then
+    echo 'synchronous IPC must derive its reply deadline from the exact service identity captured by authorization without a second publication lookup' >&2
+    exit 1
+fi
+# A synchronous receiver is already blocked and the caller will block in the
+# same transaction. If all dispatch constraints admit the caller's CPU, moving
+# receiver custody there avoids a remote wake plus its reverse reply IPI. The
+# previous CPU remains the exact fallback for affinity, budget, idle-owner, or
+# lifecycle rejection; the ordinary cross-CPU publication must stay present.
+ipc_fast_handoff_body="$(
+    sed -n '/^    pub(super) fn commit_fast_ipc_call_handoff(/,/^    }/p' \
+        kernel/ps/src/multitask/scheduler.rs
+)"
+if ! grep -Fq 'let previous_cpu = self.slot_dispatch_cpu(receiver_slot);' \
+        <<<"$ipc_fast_handoff_body" \
+    || ! grep -Fq 'self.context_dispatch_ineligibility_on_cpu(receiver_slot, receiver, current_cpu)' \
+        <<<"$ipc_fast_handoff_body" \
+    || ! grep -Fq 'Self::synchronous_ipc_target_cpu(' <<<"$ipc_fast_handoff_body" \
+    || ! grep -Fq 'runqueue::publish_direct_handoff(receiver_slot, current_cpu)' \
+        <<<"$ipc_fast_handoff_body" \
+    || ! grep -Fq 'runqueue::publish_remote_wake(' <<<"$ipc_fast_handoff_body" \
+    || ! grep -Fq 'super::irq::request_target_reschedule(target_cpu);' \
+        <<<"$ipc_fast_handoff_body"; then
+    echo 'synchronous IPC must prefer an eligible caller CPU while retaining the admitted previous-CPU remote wake fallback' >&2
+    exit 1
+fi
 # A bounded receive can leave the block by timer instead of by sender. A sender
 # pops the receiver it wakes; a timer does not, so a task that resumes on its
 # deadline is still published as this endpoint's next receiver. Leaving it there

@@ -964,18 +964,6 @@ impl Scheduler {
         self.cpu_dispatch[Self::current_dispatch_cpu()].lock()
     }
 
-    fn slot_dispatch_cpu(&self, slot: usize) -> usize {
-        #[cfg(not(test))]
-        if let Some(cpu) = runqueue::owner(slot).cpu {
-            return cpu;
-        }
-        let last_cpu = self.slot_last_cpu(slot);
-        if last_cpu != NO_IDLE_CPU {
-            return usize::from(last_cpu);
-        }
-        Self::current_dispatch_cpu()
-    }
-
     fn handoff_slot_ready(&self, slot: usize) -> bool {
         slot < MAX_TASK
             && !self.retired[slot]
@@ -1498,7 +1486,7 @@ impl Scheduler {
             return FastIpcCallHandoffOutcome::ReceiverMismatch;
         }
         let current_cpu = Self::current_dispatch_cpu();
-        let target_cpu = self.slot_dispatch_cpu(receiver_slot);
+        let previous_cpu = self.slot_dispatch_cpu(receiver_slot);
         let sender_task_id = self.starts[sender_slot]
             .expect("validated fast IPC sender lost identity")
             .id;
@@ -1511,16 +1499,30 @@ impl Scheduler {
             return FastIpcCallHandoffOutcome::DonationUnavailable;
         }
         #[cfg(not(test))]
-        {
-            if let Some(reason) = self.context_dispatch_ineligibility_on_cpu(
-                receiver_slot,
-                self.contexts[receiver_slot].expect("validated fast IPC receiver lost context"),
-                target_cpu,
-            ) {
+        let target_cpu = {
+            let receiver =
+                self.contexts[receiver_slot].expect("validated fast IPC receiver lost context");
+            let current_rejection =
+                self.context_dispatch_ineligibility_on_cpu(receiver_slot, receiver, current_cpu);
+            let target_cpu = Self::synchronous_ipc_target_cpu(
+                current_cpu,
+                previous_cpu,
+                current_rejection.is_none(),
+            );
+            let rejection = if target_cpu == current_cpu {
+                current_rejection
+            } else {
+                self.context_dispatch_ineligibility_on_cpu(receiver_slot, receiver, target_cpu)
+            };
+            if let Some(reason) = rejection {
                 smp::record_fast_ipc_eligibility_rejection(reason);
                 return FastIpcCallHandoffOutcome::EligibilityUnavailable;
             }
-        }
+            target_cpu
+        };
+        #[cfg(test)]
+        let target_cpu =
+            self.synchronous_ipc_test_target_cpu(receiver_slot, current_cpu, previous_cpu);
 
         if target_cpu == current_cpu {
             #[cfg(not(test))]

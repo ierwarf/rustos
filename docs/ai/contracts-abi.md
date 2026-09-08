@@ -133,6 +133,13 @@ returns to rootd admission. Caching an endpoint without those checks is
 forbidden, but re-authorizing an unchanged grant is a performance-contract
 violation because it converts a local table read into an avoidable synchronous
 boot/runtime dependency.
+Successful call authorization also returns the matched service identity as
+part of that same publication snapshot. Reply-deadline classification must use
+this captured identity; it must not translate the numeric endpoint through a
+second service-publication lookup. Private owner-local endpoints carry no
+service identity and use the generic finite deadline. This keeps authority and
+deadline policy bound to one publication epoch while avoiding a redundant
+registry read on every synchronous IPC call.
 Runtimed's Unix control socket is also an authority boundary, not a trusted
 local channel. It reads `SO_PEERCRED` and ignores caller-supplied identity.
 Snapshot, launch, and terminate require either the current live uiserver

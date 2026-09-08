@@ -658,7 +658,7 @@ fn current_process_granted_service_endpoint(service_id: u64) -> Result<Option<u6
 
 fn authorize_current_process_ipc_call(
     endpoint: u64,
-) -> Result<multitask::RetainedCurrentUserAddressSpace, i64> {
+) -> Result<(multitask::RetainedCurrentUserAddressSpace, Option<u64>), i64> {
     if endpoint == 0 {
         return Err(LINUX_EINVAL);
     }
@@ -680,7 +680,7 @@ fn authorize_current_process_ipc_call(
                 publication.epoch,
             )
         {
-            return Ok(retained_mm);
+            return Ok((retained_mm, Some(index as u64)));
         }
         let granted = {
             let grants = SERVICE_CALL_GRANTS.lock();
@@ -696,11 +696,11 @@ fn authorize_current_process_ipc_call(
         }
         SERVICE_LAST_GRANTED_EPOCH[index].store(publication.epoch, Ordering::Relaxed);
         SERVICE_LAST_GRANTED_CALLER[index].store(process_id, Ordering::Release);
-        return Ok(retained_mm);
+        return Ok((retained_mm, Some(index as u64)));
     }
     validate_endpoint_publication_owner(endpoint, process_id)
         .map_err(|_| LINUX_EACCES)
-        .map(|_| retained_mm)
+        .map(|_| (retained_mm, None))
 }
 
 fn cached_service_call_grant_matches(
@@ -1312,8 +1312,8 @@ fn syscall_linux_rustos_ipc_call_with_timeout(
     reply_capacity: u64,
     timeout_ms: u64,
 ) -> u64 {
-    let retained_mm = match authorize_current_process_ipc_call(endpoint) {
-        Ok(retained) => retained,
+    let (retained_mm, authorized_service_id) = match authorize_current_process_ipc_call(endpoint) {
+        Ok(authorized) => authorized,
         Err(errno) => return linux_errno(errno),
     };
     let endpoint = KernelEndpointHandle::from_raw(endpoint);
@@ -1345,6 +1345,7 @@ fn syscall_linux_rustos_ipc_call_with_timeout(
             reply_capacity,
             timeout_ms,
             &retained_mm,
+            authorized_service_id,
         ) {
             Ok(Some(response_len)) => return response_len as u64,
             Ok(None) => note_fast_ipc(IpcFastCounter::AdmissionFallback),
@@ -1366,8 +1367,11 @@ fn syscall_linux_rustos_ipc_call_with_timeout(
     // Sample the endpoint binding before enqueue. A provider restart after the
     // call is queued cannot replace the caller's wire end with a new relative
     // reply budget.
-    let reply_deadline =
-        service_reply_deadline_tick_for_endpoint(endpoint, request.as_slice(), timeout_ms);
+    let reply_deadline = service_reply_deadline_tick_for_authorized_service(
+        authorized_service_id,
+        request.as_slice(),
+        timeout_ms,
+    );
     cycle_mark = charge_phase(IpcCallPhase::EnqueueDeadline, cycle_mark);
     let reply = match enqueue_call_and_wake(endpoint, request.as_slice()) {
         Ok(reply) => reply,
@@ -1427,6 +1431,7 @@ fn try_fast_ipc_call(
     reply_capacity: u64,
     timeout_ms: u64,
     retained_mm: &multitask::RetainedCurrentUserAddressSpace,
+    authorized_service_id: Option<u64>,
 ) -> Result<Option<usize>, i64> {
     if request_len > kernel_ipc_runtime::api::IPC_FAST_INLINE_BYTES {
         note_fast_ipc(IpcFastCounter::FallbackShape);
@@ -1456,6 +1461,7 @@ fn try_fast_ipc_call(
         request,
         reply_capacity,
         timeout_ms,
+        authorized_service_id,
     )?
     else {
         return Ok(None);
@@ -1479,6 +1485,7 @@ fn try_fast_ipc_call_bytes(
     request: &[u8],
     reply_capacity: usize,
     timeout_ms: u64,
+    authorized_service_id: Option<u64>,
 ) -> Result<Option<FastCallResponse>, i64> {
     if request.len() > kernel_ipc_runtime::api::IPC_FAST_INLINE_BYTES
         || reply_capacity > kernel_ipc_runtime::api::IPC_FAST_INLINE_BYTES
@@ -1486,7 +1493,11 @@ fn try_fast_ipc_call_bytes(
         note_fast_ipc(IpcFastCounter::FallbackShape);
         return Ok(None);
     }
-    let deadline_tick = service_reply_deadline_tick_for_endpoint(endpoint, request, timeout_ms);
+    let deadline_tick = service_reply_deadline_tick_for_authorized_service(
+        authorized_service_id,
+        request,
+        timeout_ms,
+    );
     if reply_deadline_expired(deadline_tick) {
         return Err(LINUX_ETIMEDOUT);
     }
@@ -2721,6 +2732,7 @@ pub(super) fn call_linux_syscall_fast_endpoint(
         request,
         response_capacity,
         SERVICE_IPC_TIMEOUT_MS,
+        Some(linux_abi::IPC_SERVICE_LINUX_SYSCALLD),
     )? {
         return Ok((response.len, response.bytes));
     }
@@ -3232,22 +3244,21 @@ pub(super) fn service_reply_deadline_tick_for_service(
     relative_deadline
 }
 
-fn service_reply_deadline_tick_for_endpoint(
-    endpoint: KernelEndpointHandle,
+/// Derives the reply deadline from the service identity captured by call authorization.
+/// Re-reading the publication table here would both duplicate the hot-path lookup and
+/// risk classifying a different publication epoch than the one that granted the call.
+
+fn service_reply_deadline_tick_for_authorized_service(
+    service_id: Option<u64>,
     request: &[u8],
     timeout_ms: u64,
 ) -> u64 {
-    let relative_deadline = service_ipc_deadline_tick_after(timeout_ms);
-    if service_endpoint(linux_abi::IPC_SERVICE_NETD)
-        .is_some_and(|netd| netd.raw() == endpoint.raw())
-    {
-        return bounded_netd_reply_deadline_tick(
-            relative_deadline,
-            request,
-            crate::arch::rtc::ticks_per_second(),
-        );
+    match service_id {
+        Some(service_id) => {
+            service_reply_deadline_tick_for_service(service_id, request, timeout_ms)
+        }
+        None => service_ipc_deadline_tick_after(timeout_ms),
     }
-    relative_deadline
 }
 
 pub(super) fn reply_deadline_expired(deadline_tick: u64) -> bool {

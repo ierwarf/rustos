@@ -82,6 +82,13 @@ fn raced_wake_never_validates_a_consumed_current_frame() {
 }
 
 #[test]
+fn synchronous_ipc_prefers_the_callers_cpu_only_when_dispatch_eligible() {
+    assert_eq!(Scheduler::synchronous_ipc_target_cpu(3, 6, true), 3);
+    assert_eq!(Scheduler::synchronous_ipc_target_cpu(3, 6, false), 6);
+    assert_eq!(Scheduler::synchronous_ipc_target_cpu(3, 3, false), 3);
+}
+
+#[test]
 fn fast_ipc_commit_requires_exact_typed_waits_and_mutates_both_peers_once() {
     let mut scheduler = boxed_scheduler();
     let sender_slot = 1;
@@ -200,6 +207,8 @@ fn fast_ipc_commit_requires_exact_typed_waits_and_mutates_both_peers_once() {
         cross_receiver.test_ready = false;
         cross_receiver.block_reason = BlockReason::EndpointReceive(0xbee);
     }
+    scheduler.task_affinity_masks[sender_slot] = 1 << 1;
+    scheduler.process_affinity_masks[sender_slot] = 1 << 1;
     scheduler.task_last_cpu[sender_slot] = 1;
     scheduler.current_task = receiver_slot;
     assert!(

@@ -608,6 +608,55 @@ must re-arm); the enqueue chain's last unconditional acquisition moved
 TOCTOU guard with formal models attached. 2% of 73,760 is ~1,500 ticks, which is
 the size of everything that remains individually.
 
+**Reuse the authorization snapshot for reply-deadline classification.** The
+shipping disassembly showed that `try_fast_ipc_call_bytes` called
+`service_reply_deadline_tick_for_endpoint`, a 510-byte helper that read the
+service publication table again, called `is_process_exiting`, and sampled the
+clock. This happened after `authorize_current_process_ipc_call` had already
+scanned and validated the exact publication epoch. Authorization now returns
+the matched service identity, and both fast and slow call paths derive their
+deadline from that captured identity. A private owner-local endpoint carries
+`None`; the direct internal syscalld route supplies its known service identity.
+The source-conformance gate forbids restoring endpoint-to-service lookup in the
+deadline helper.
+
+On 2026-09-08, a same-session one-vCPU control and two candidate runs held the
+`vmexit_cpuid` minimum at 3,600 cycles. Raw cross-process syscalld `getuid`
+minimum/p50 moved from 26,400/67,920 to 23,560/60,520 and
+23,720/60,720 cycles. The derived IPC portion moved from 25,960/67,480 to
+23,120/60,040 and 23,280/60,280 cycles: 10.3-10.9% at the minimum and
+10.7-11.0% at p50. Local and fused-local minima changed by only 1-2%, within
+the declared noise floor, so no local-path claim is attached to this change.
+After rebuilding, the old 510-byte lookup helper disappeared from the image;
+the deadline selection was folded into the caller.
+
+**Prefer the caller CPU for an admitted synchronous receiver.** On SMP, the
+fast-call handoff previously used the blocked receiver's prior CPU
+unconditionally. A caller on another CPU therefore paid a directed remote wake
+and usually another directed wake on reply even though the caller blocks in the
+same transaction. The scheduler now tries the caller CPU first, using the full
+dispatch-admission predicate (affinity, scheduling-context and domain budget,
+idle ownership, lifecycle, and foreign execution ownership). A rejection uses
+the prior CPU and the unchanged remote path. This follows Linux's principle
+that wake CPU selection should match final local dispatch when possible and
+seL4 MCS's scheduler-bypass motivation for synchronous context donation, while
+retaining RustOS's exact owner-word and bounded-handoff custody.
+
+In 8-vCPU full-workload runs, controls placed cross-process syscalld `getuid`
+at p50 91,280 and 109,080 cycles with p99 15,508,480 and 15,694,160. Two
+wake-affine runs measured p50 45,160 and 73,040 cycles, a 20.0-58.6% reduction;
+p99 was 11,620,760 and 15,520,760, a 25.1% and 1.1% reduction. The second
+tail change is below the measurement threshold and does not support a p99
+claim.
+An isolated control/candidate pair moved IPC p50 from 109,360 to 44,040 cycles
+(59.7%), while p99 remained 12,789,360 versus 12,738,560 (0.4%). Its
+`vmexit_cpuid` p50 moved 3.2%, just outside the strict ~3% anchor gate, so this
+pair is corroboration rather than acceptance evidence. The supported claim
+comes from the two full-workload comparisons and is limited to p50. The p99
+floor remains dominated by rare blocked-transition and global
+scheduler-catalog stalls and needs a payload-ownership split rather than a
+placement heuristic.
+
 The published reply `message_id` hint is not a fusion and does not remove that
 TOCTOU guard. It replaces only the preliminary `IpcReply` lookup needed to
 choose message-then-reply lock order; the nested reply access still validates

@@ -6,11 +6,59 @@
 //!   lifecycle, idle ownership, and remote-running-owner admission.
 //! - **Invariant:** a local candidate may beat the same-class global minimum
 //!   by at most `SCHED_CPU_LOCALITY_LAG_NS`; exact handoffs never enter here.
+//!   A synchronous handoff may move a blocked receiver to its caller's CPU only
+//!   after the complete dispatch-admission predicate accepts that CPU.
 //! - **Failure:** slot reuse clears locality and an out-of-range CPU panics.
 
 use super::*;
 
 impl Scheduler {
+    /// Resolves the CPU that currently owns a task's dispatch custody,
+    /// falling back to its last CPU and then to the caller's CPU.
+    pub(super) fn slot_dispatch_cpu(&self, slot: usize) -> usize {
+        #[cfg(not(test))]
+        if let Some(cpu) = runqueue::owner(slot).cpu {
+            return cpu;
+        }
+        let last_cpu = self.slot_last_cpu(slot);
+        if last_cpu != NO_IDLE_CPU {
+            return usize::from(last_cpu);
+        }
+        Self::current_dispatch_cpu()
+    }
+
+    /// Prefer the caller's CPU for a synchronous server handoff when every
+    /// dispatch constraint admits it. The caller is about to block, so this
+    /// preserves one runnable task on the CPU and makes the reply eligible for
+    /// the reverse direct handoff without a remote reschedule IPI.
+    pub(super) const fn synchronous_ipc_target_cpu(
+        current_cpu: usize,
+        previous_cpu: usize,
+        current_cpu_eligible: bool,
+    ) -> usize {
+        if current_cpu_eligible {
+            current_cpu
+        } else {
+            previous_cpu
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn synchronous_ipc_test_target_cpu(
+        &self,
+        slot: usize,
+        current_cpu: usize,
+        previous_cpu: usize,
+    ) -> usize {
+        let current_bit = 1_u64 << current_cpu;
+        let (task_affinity, process_affinity, _) = self.slot_affinity_snapshot(slot);
+        Self::synchronous_ipc_target_cpu(
+            current_cpu,
+            previous_cpu,
+            task_affinity & process_affinity & current_bit != 0,
+        )
+    }
+
     fn candidate_is_local_to_current_cpu(&self, slot: usize) -> bool {
         if slot == self.current_task_slot() {
             return true;

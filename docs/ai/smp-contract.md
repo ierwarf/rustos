@@ -497,6 +497,13 @@ custody for the exact peer needed to advance it:
 - call enqueue publishes the exact waiting receiver, or the least-vruntime
   runnable worker of a process-owned endpoint, after reply-capability and
   priority-donation authority exist;
+- when that exact receiver is blocked and every affinity, scheduling-context,
+  domain-budget, idle-owner, lifecycle, and execution-owner constraint admits
+  the caller's CPU, the call transfers receiver custody to that CPU. The caller
+  blocks in the same transaction, so this preserves runnable capacity and makes
+  the reply eligible for the reverse local handoff without two directed
+  reschedule IPIs. Any failed admission retains the receiver's prior CPU and
+  the existing exact remote-wake path;
 - normal and handle-bearing reply completion releases its reply-scoped
   donation, wakes the exact caller, and captures one opaque `{slot, task ID,
   run-owner generation, target CPU}` token under the same Scheduler
@@ -1031,7 +1038,10 @@ compatibility guarantees.
   <https://docs.amd.com/v/u/en-US/40332_4.09_APM_PUB>
 - seL4 SMP and MCS scheduler material:
   <https://docs.sel4.systems/releases/sel4/6.0.0.html> and
-  <https://docs.sel4.systems/Tutorials/mcs.html>; seL4 runnable-queue FIFO
+  <https://docs.sel4.systems/Tutorials/mcs.html>, plus the scheduling-context
+  capability design's scheduler-bypass rationale:
+  <https://sel4.systems/Research/pdfs/scheduling-context-capabilities.pdf>;
+  seL4 runnable-queue FIFO
   semantics within priority:
   <https://docs.sel4.systems/Tutorials/threads.html>
 - QNX Neutrino SMP scheduling and cross-CPU rescheduling:
@@ -1052,7 +1062,9 @@ compatibility guarantees.
   <https://www.kernel.org/doc/html/latest/locking/locktypes.html>,
   <https://docs.kernel.org/5.17/locking/lockdep-design.html>, and
   <https://docs.kernel.org/dev-tools/lkmm/docs/litmus-tests.html>,
-  <https://cdn.kernel.org/doc/html/latest/scheduler/sched-domains.html>, and
+  <https://cdn.kernel.org/doc/html/latest/scheduler/sched-domains.html>,
+  <https://docs.kernel.org/scheduler/sched-ext.html> (wake CPU selection and
+  final local dispatch matching), and
   <https://docs.kernel.org/scheduler/sched-ext.html>
 - FreeBSD ULE current source and per-CPU runqueue/stealing history:
   <https://cgit.freebsd.org/src/log/sys/kern/sched_ule.c>
