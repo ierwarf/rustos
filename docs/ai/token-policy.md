@@ -111,20 +111,32 @@ range and volatile facts; do not replay prior evidence.
 ## 13. Round-Trip And Progressive-Disclosure Budget
 
 1. Plan the evidence set before tool calls; batch known independent operations.
-2. Start code/path searches at 8–20 results. Increase only when unresolved.
-3. Read symbols/ranges, not whole large files. Avoid repeatedly reopening the
+2. Keep the **combined expected model-visible payload of one tool batch <=24 KiB**.
+   Narrow queries before splitting a large batch into many sequential model turns.
+3. Exploratory shell reads should request `max_output_tokens <=3000`; the hard
+   interactive ceiling is **6000**. Larger command output goes to a task-local
+   file (normally under `/tmp`) and only a bounded summary returns to the model.
+4. Serena search/read calls default to `max_answer_chars=4000..8000` and must not
+   exceed **12000**. Broad substring discovery does not request full bodies;
+   locate names first, then read the exact symbol body.
+5. ast-grep discovery returns at most **40** matches per call. Tighten the
+   structural pattern before asking for more.
+6. CodeGraph discovery uses compact results, at most **30** entries, and expands
+   one selected symbol/module only after the graph narrows the blast radius.
+7. Start ordinary code/path searches at 8–20 results. Increase only when unresolved.
+8. Read symbols/ranges, not whole large files. Avoid repeatedly reopening the
    same unchanged range.
-4. **Never emit full `ALL_TOOLS` objects** or bulk tool descriptions. Search
+9. **Never emit full `ALL_TOOLS` objects** or bulk tool descriptions. Search
    names only, then inspect at most two exact descriptions capped at 2,000
    characters each.
-5. Known source namespaces are `mcp__serena__*`, `mcp__ast_grep__*`, and
-   `mcp__codegraph__codegraph_*`; do not rediscover their schemas mid-session.
-6. For diffs, inspect names/stat first; request only relevant hunks unless a
-   complete diff is itself the task.
-7. Do not restate the same evidence after every tool result. Keep a short delta
-   summary and carry only facts that affect the next decision.
-8. At an architectural milestone refresh the short session handoff and use a
-   fresh context when available instead of repeatedly filling huge windows.
+10. Known source namespaces are `mcp__serena__*`, `mcp__ast_grep__*`, and
+    `mcp__codegraph__codegraph_*`; do not rediscover their schemas mid-session.
+11. For diffs, inspect names/stat first; request only relevant hunks unless a
+    complete diff is itself the task.
+12. Do not restate the same evidence after every tool result. Keep a short delta
+    summary and carry only facts that affect the next decision.
+13. At an architectural milestone refresh the short session handoff and use a
+    fresh context when available instead of repeatedly filling huge windows.
 
 These limits never weaken the Serena/ast-grep/CodeGraph edit gate, formal
 validation, failure diagnosis, or required runtime acceptance.
@@ -136,6 +148,10 @@ Hooks are part of the token/latency budget:
 - allow/success paths are silent; only blocks/failures inject model-visible text;
 - failure payloads target <=4 KiB and contain one primary diagnostic plus a tiny
   tail; the full log stays out of context;
+- source-navigation hooks reject oversized MCP answer/result budgets before the
+  tool can inject a large uncached tail into the conversation;
+- exploratory shell hooks reject oversized direct-output budgets while allowing
+  long work whose verbose output is captured outside model context;
 - duplicate validation is cached by an exact content fingerprint, never by a
   time-only success stamp;
 - expensive PostToolUse checks may coalesce a short edit burst only when the
