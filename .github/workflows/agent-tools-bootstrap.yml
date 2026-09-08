@@ -17,11 +17,8 @@ on:
       - ".agents/skills/rustos-code-editing/SKILL.md"
       - "docs/ai/token-policy.md"
 
-# Temporary write permission is used only by the final cleanup step to remove
-# obsolete diagnostic branches. This is reverted to contents:read after the
-# remote validation run succeeds.
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: rustos-agent-tools-${{ github.ref }}
@@ -42,17 +39,25 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p "$HOME/.local/bin"
+          mkdir -p "$HOME/.local/bin" build/agent-tools
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          echo "HOME=$HOME"
-          echo "workspace=$GITHUB_WORKSPACE"
+          echo "runner=$(uname -n) workspace=$GITHUB_WORKSPACE"
 
-      - name: Install pinned Serena ast-grep and CodeGraph stack
+      - name: Install or verify pinned AI tool stack
         shell: bash
         run: |
           set -euo pipefail
           export PATH="$HOME/.local/bin:$PATH"
-          bash tools/agent/bootstrap-remote-ai-tools.sh "$GITHUB_WORKSPACE"
+          log=build/agent-tools/bootstrap.log
+          set +e
+          bash tools/agent/bootstrap-remote-ai-tools.sh "$GITHUB_WORKSPACE" >"$log" 2>&1
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            grep -Einm1 'error|fatal|failed|missing|mismatch' "$log" || true
+            tail -n 32 "$log"
+            exit "$rc"
+          fi
 
           manifest="$HOME/.local/share/rustos-agent-tools/manifest.env"
           test -s "$manifest"
@@ -64,42 +69,46 @@ jobs:
           serena --version | grep -q '1\.6\.0'
           ast-grep --version | grep -q '0\.45\.2'
           codegraph-mcp --help >/dev/null
+          grep -m1 'pinned AI tool stack already valid' "$log" || true
+          echo 'agent_tools_bootstrap=ok'
 
       - name: Build Serena symbol index
         shell: bash
         run: |
           set -euo pipefail
           export PATH="$HOME/.local/bin:$PATH"
-          mkdir -p build/agent-tools
-          cd "$GITHUB_WORKSPACE"
-          serena project index \
-            --log-level WARNING \
-            --timeout 60 \
-            > build/agent-tools/serena-index.log 2>&1
-          tail -n 40 build/agent-tools/serena-index.log
+          log=build/agent-tools/serena-index.log
+          set +e
+          serena project index --log-level WARNING --timeout 60 >"$log" 2>&1
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            grep -Einm1 'error|fatal|failed|timeout' "$log" || true
+            tail -n 32 "$log"
+            exit "$rc"
+          fi
           test -d .serena/cache
           find .serena/cache -type f -size +0c -print -quit | grep -q .
+          grep -E 'Indexed files per language:' "$log" | tail -n 1 || echo 'serena_index=ok'
 
       - name: Smoke ast-grep structural search
         shell: bash
         run: |
           set -euo pipefail
           export PATH="$HOME/.local/bin:$PATH"
-          cd "$GITHUB_WORKSPACE"
           ast-grep run \
             --pattern 'unsafe { $$$BODY }' \
             --lang rust \
             --json \
             kernel \
             > build/agent-tools/ast-grep-smoke.json
-          test -s build/agent-tools/ast-grep-smoke.json
           python3 - <<'PY'
           import json
           from pathlib import Path
           rows = json.loads(Path('build/agent-tools/ast-grep-smoke.json').read_text())
           if not rows:
               raise SystemExit('ast-grep smoke returned zero matches')
-          print(f'ast-grep matches={len(rows)} first={rows[0].get("file", "?")}')
+          print(f'ast_grep_matches={len(rows)}')
           PY
           ast-grep-server --help >/dev/null
 
@@ -109,7 +118,9 @@ jobs:
           set -euo pipefail
           export PATH="$HOME/.local/bin:$PATH"
           export CODEGRAPH_TELEMETRY=off
-          cd "$GITHUB_WORKSPACE"
+          out=build/agent-tools/codegraph-smoke.json
+          log=build/agent-tools/codegraph-smoke.log
+          set +e
           codegraph-mcp \
             --graph-only \
             --workspace "$GITHUB_WORKSPACE" \
@@ -123,30 +134,39 @@ jobs:
             --profile all \
             --run-tool codegraph_get_module_summary \
             --tool-args '{"path":"kernel/ps"}' \
-            > build/agent-tools/codegraph-smoke.json
-          test -s build/agent-tools/codegraph-smoke.json
-          grep -Eiq 'kernel|module|symbol|dependency|summary' build/agent-tools/codegraph-smoke.json
-          sed -n '1,40p' build/agent-tools/codegraph-smoke.json
+            >"$out" 2>"$log"
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            grep -Einm1 'error|fatal|failed|panic' "$log" || true
+            tail -n 32 "$log"
+            exit "$rc"
+          fi
+          test -s "$out"
+          grep -Eiq 'kernel|module|symbol|dependency|summary' "$out"
+          echo "codegraph_query_bytes=$(wc -c < "$out")"
 
       - name: Verify RustOS AI development environment
         shell: bash
         run: |
           set -euo pipefail
           export PATH="$HOME/.local/bin:$PATH"
-          cd "$GITHUB_WORKSPACE"
-          tools/check-dev-environment.sh --ai
-          echo '--- persistent tool footprint ---'
-          du -sh "$HOME/.local/share/rustos-agent-tools" 2>/dev/null || true
-          du -sh "$HOME/.serena" 2>/dev/null || true
-          du -sh "$HOME/.codegraph" 2>/dev/null || true
+          log=build/agent-tools/dev-environment.log
+          set +e
+          tools/check-dev-environment.sh --ai >"$log" 2>&1
+          rc=$?
+          set -e
+          if [ "$rc" -ne 0 ]; then
+            grep -Einm1 'not ok|error|fatal|failed' "$log" || true
+            tail -n 32 "$log"
+            exit "$rc"
+          fi
+          grep -F 'check-dev-environment: passed' "$log" | tail -n 1
 
-      - name: Verify hook syntax selftest cache and timeout contracts
+      - name: Verify hook syntax cache timeout and token budgets
         shell: bash
         run: |
           set -euo pipefail
-          cd "$GITHUB_WORKSPACE"
-          mkdir -p build/agent-tools
-
           for hook in \
             .agents/hooks/lib.sh \
             .agents/hooks/post_edit_rust.sh \
@@ -160,11 +180,14 @@ jobs:
             bash -n "$hook"
           done
 
-          .codex/hooks/selftest.sh > build/agent-tools/hook-selftest.log 2>&1
-          tail -n 24 build/agent-tools/hook-selftest.log
+          log=build/agent-tools/hook-selftest.log
+          .codex/hooks/selftest.sh >"$log" 2>&1 || {
+            grep -Enm1 'not ok|error|fatal|failed' "$log" || true
+            tail -n 32 "$log"
+            exit 1
+          }
+          grep -F 'RustOS Codex hook selftest passed' "$log"
 
-          # A successful post-edit check must stay silent, stamp the exact
-          # content fingerprint, and make an identical second invocation cheap.
           event="$(jq -nc '{tool_input:{file_path:"kernel/ps/src/lib.rs"}}')"
           first=build/agent-tools/post-edit-first.out
           second=build/agent-tools/post-edit-second.out
@@ -182,11 +205,9 @@ jobs:
           end_ns="$(date +%s%N)"
           test ! -s "$second"
           elapsed_ms=$(( (end_ns - start_ns) / 1000000 ))
-          echo "post_edit_cached_ms=$elapsed_ms"
           test "$elapsed_ms" -lt 3000
+          echo "post_edit_cached_ms=$elapsed_ms"
 
-          # Timeout is a distinct failure class and the visible payload remains
-          # compact even if the underlying command log is noisy.
           timeout_log="$(mktemp)"
           trap 'rm -f "$timeout_log"' EXIT
           set +e
@@ -196,32 +217,11 @@ jobs:
           test "$rc" -eq 124
           compact="$(rustos_compact_failure 'timeout-probe' "$rc" "$timeout_log")"
           printf '%s\n' "$compact" | grep -q 'timed out'
-          test "$(printf '%s' "$compact" | wc -c)" -le 4096
+          compact_bytes="$(printf '%s' "$compact" | wc -c)"
+          test "$compact_bytes" -le 4096
+          echo "timeout_payload_bytes=$compact_bytes"
 
-          # The normal shell allow path must remain silent.
           shell_event="$(jq -nc --arg cmd 'git status --short' '{tool_input:{cmd:$cmd}}')"
           shell_out="$(printf '%s' "$shell_event" | .codex/hooks/pre_bash_destructive.sh)"
           test -z "$shell_out"
-
-      - name: Remove obsolete diagnostic branches
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "$GITHUB_WORKSPACE"
-          for branch in \
-            agent/hooks-timeouts-token-20260908 \
-            diag/gpu-readiness-20260908 \
-            diag/kvm-timeout-20260907
-          do
-            if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
-              git push origin --delete "$branch"
-            fi
-          done
-
-          extras="$(git ls-remote --heads origin | awk '{sub("refs/heads/", "", $2); if ($2 != "master") print $2}')"
-          if [[ -n "$extras" ]]; then
-            echo "unexpected remote branches remain:" >&2
-            printf '%s\n' "$extras" >&2
-            exit 1
-          fi
-          echo 'remote_branches=master-only'
+          echo 'hook_allow_path=silent'

@@ -2,13 +2,18 @@
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "*",
+        "matcher": "Read|Edit|Write|Grep|Glob|mcp__serena__.*",
         "hooks": [
           {
             "type": "command",
             "command": "serena-hooks remind --client=claude-code",
             "timeout": 3
-          },
+          }
+        ]
+      },
+      {
+        "matcher": "*",
+        "hooks": [
           {
             "type": "command",
             "command": "serena-hooks auto-approve --client=claude-code",

@@ -145,20 +145,13 @@ install_npm_tools() {
     mkdir -p "$prefix"
     export npm_config_prefix="$prefix"
     export npm_config_cache="$HOME/.cache/npm"
-    # RustOS deliberately uses CodeGraph graph-only; skip the unused embedding
-    # model, but do not skip the signed native analysis engine download.
     export CODEGRAPH_SKIP_MODEL_FETCH=1
-    # A lifecycle-script-denied install can leave the JS package and wrapper
-    # behind without the native analysis engine. A later ordinary `npm install`
-    # then reports the package as up to date and never reruns postinstall, so
-    # the broken state persists forever. Remove only the pinned CodeGraph
-    # package before reinstalling it so its admitted postinstall must execute.
+
+    # This function is entered only when the persisted stack failed validation.
+    # Remove the CodeGraph package so a prior lifecycle-script-denied partial
+    # install cannot survive as an npm "up to date" false positive.
     rm -rf -- "$codegraph_root"
     rm -f -- "$prefix/bin/codegraph-mcp" "$BIN_DIR/codegraph-mcp"
-    # npm on this runner blocks dependency lifecycle scripts unless explicitly
-    # admitted. CodeGraph's pinned postinstall fetches the platform engine and
-    # verifies its published checksum; allow exactly that package, not arbitrary
-    # install scripts from the rest of the dependency graph.
     npm install --global --no-audit --no-fund \
         --allow-scripts=@astudioplus/codegraph-mcp \
         "@astudioplus/codegraph-mcp@$CODEGRAPH_VERSION" \
@@ -169,23 +162,6 @@ install_npm_tools() {
         [[ -e "$prefix/bin/$name" ]] || { echo "npm package did not expose $name" >&2; return 1; }
         ln -sfn "$prefix/bin/$name" "$BIN_DIR/$name"
     done
-
-    local actual_codegraph actual_ripgrep native_codegraph
-    actual_codegraph="$(node -p "require('$codegraph_root/package.json').version")"
-    actual_ripgrep="$(node -p "require('$prefix/lib/node_modules/mcp-ripgrep/package.json').version")"
-    [[ "$actual_codegraph" == "$CODEGRAPH_VERSION" ]] || {
-        echo "CodeGraph version mismatch: $actual_codegraph" >&2; return 1;
-    }
-    [[ "$actual_ripgrep" == "$RIPGREP_MCP_VERSION" ]] || {
-        echo "mcp-ripgrep version mismatch: $actual_ripgrep" >&2; return 1;
-    }
-    native_codegraph="$codegraph_root/bin/codegraph-server-linux-x64"
-    [[ -x "$native_codegraph" ]] || {
-        echo "CodeGraph native engine missing after admitted reinstall: $native_codegraph" >&2
-        find "$codegraph_root/bin" -maxdepth 1 -type f -printf '%f\n' 2>/dev/null || true
-        return 1
-    }
-    codegraph-mcp --help >/dev/null
 }
 
 install_project_rust_analyzer() {
@@ -205,6 +181,35 @@ RIPGREP_MCP_VERSION=$RIPGREP_MCP_VERSION
 EOF
 }
 
+pinned_stack_is_current() {
+    local prefix="$TOOLS_ROOT/npm-global"
+    local codegraph_root="$prefix/lib/node_modules/@astudioplus/codegraph-mcp"
+    local ripgrep_root="$prefix/lib/node_modules/mcp-ripgrep"
+    local native_codegraph="$codegraph_root/bin/codegraph-server-linux-x64"
+
+    [[ -s "$MANIFEST" ]] || return 1
+    grep -qx "SERENA_VERSION=$SERENA_VERSION" "$MANIFEST" || return 1
+    grep -qx "AST_GREP_VERSION=$AST_GREP_VERSION" "$MANIFEST" || return 1
+    grep -qx "AST_GREP_MCP_COMMIT=$AST_GREP_MCP_COMMIT" "$MANIFEST" || return 1
+    grep -qx "CODEGRAPH_VERSION=$CODEGRAPH_VERSION" "$MANIFEST" || return 1
+    grep -qx "RIPGREP_MCP_VERSION=$RIPGREP_MCP_VERSION" "$MANIFEST" || return 1
+
+    command -v serena >/dev/null 2>&1 || return 1
+    command -v ast-grep >/dev/null 2>&1 || return 1
+    command -v ast-grep-server >/dev/null 2>&1 || return 1
+    command -v codegraph-mcp >/dev/null 2>&1 || return 1
+    command -v mcp-ripgrep >/dev/null 2>&1 || return 1
+    [[ -f "$HOME/.serena/serena_config.yml" ]] || return 1
+    [[ -x "$native_codegraph" ]] || return 1
+
+    serena --version 2>/dev/null | grep -q "${SERENA_VERSION//./\\.}" || return 1
+    ast-grep --version 2>/dev/null | grep -q "${AST_GREP_VERSION//./\\.}" || return 1
+    [[ "$(node -p "require('$codegraph_root/package.json').version" 2>/dev/null)" == "$CODEGRAPH_VERSION" ]] || return 1
+    [[ "$(node -p "require('$ripgrep_root/package.json').version" 2>/dev/null)" == "$RIPGREP_MCP_VERSION" ]] || return 1
+    ast-grep-server --help >/dev/null 2>&1 || return 1
+    codegraph-mcp --help >/dev/null 2>&1 || return 1
+}
+
 main() {
     local root=${1:-$(git rev-parse --show-toplevel)}
     root="$(cd -- "$root" && pwd -P)"
@@ -213,15 +218,22 @@ main() {
     ensure_node_stack
     ensure_clangd
     install_project_rust_analyzer "$root"
-    install_uv_tools
-    install_npm_tools
-    write_manifest
+
+    if pinned_stack_is_current; then
+        log 'pinned AI tool stack already valid; skipping reinstall'
+    else
+        install_uv_tools
+        install_npm_tools
+        write_manifest
+        pinned_stack_is_current || {
+            echo 'pinned AI tool stack failed post-install validation' >&2
+            return 1
+        }
+    fi
 
     log 'installed versions'
     serena --version
     ast-grep --version
-    ast-grep-server --help >/dev/null
-    codegraph-mcp --help >/dev/null
     node --version
     npm --version
     clangd --version | sed -n '1p'
