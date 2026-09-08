@@ -64,7 +64,6 @@ jobs:
           grep -qx 'AST_GREP_VERSION=0.45.2' "$manifest"
           grep -qx 'AST_GREP_MCP_COMMIT=149e20d47bb7125fb0c1451feea2f48a98742034' "$manifest"
           grep -qx 'CODEGRAPH_VERSION=0.20.1' "$manifest"
-          grep -qx 'RIPGREP_MCP_VERSION=0.4.0' "$manifest"
           serena --version | grep -q '1\.6\.0'
           ast-grep --version | grep -q '0\.45\.2'
           codegraph-mcp --help >/dev/null

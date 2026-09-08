@@ -8,7 +8,6 @@ SERENA_VERSION=1.6.0
 AST_GREP_VERSION=0.45.2
 AST_GREP_MCP_COMMIT=149e20d47bb7125fb0c1451feea2f48a98742034
 CODEGRAPH_VERSION=0.20.1
-RIPGREP_MCP_VERSION=0.4.0
 
 BIN_DIR="$HOME/.local/bin"
 TOOLS_ROOT="$HOME/.local/share/rustos-agent-tools"
@@ -154,14 +153,10 @@ install_npm_tools() {
     rm -f -- "$prefix/bin/codegraph-mcp" "$BIN_DIR/codegraph-mcp"
     npm install --global --no-audit --no-fund \
         --allow-scripts=@astudioplus/codegraph-mcp \
-        "@astudioplus/codegraph-mcp@$CODEGRAPH_VERSION" \
-        "mcp-ripgrep@$RIPGREP_MCP_VERSION"
+        "@astudioplus/codegraph-mcp@$CODEGRAPH_VERSION"
 
-    local name
-    for name in codegraph-mcp mcp-ripgrep; do
-        [[ -e "$prefix/bin/$name" ]] || { echo "npm package did not expose $name" >&2; return 1; }
-        ln -sfn "$prefix/bin/$name" "$BIN_DIR/$name"
-    done
+    [[ -e "$prefix/bin/codegraph-mcp" ]] || { echo "npm package did not expose codegraph-mcp" >&2; return 1; }
+    ln -sfn "$prefix/bin/codegraph-mcp" "$BIN_DIR/codegraph-mcp"
 }
 
 install_project_rust_analyzer() {
@@ -177,14 +172,12 @@ SERENA_VERSION=$SERENA_VERSION
 AST_GREP_VERSION=$AST_GREP_VERSION
 AST_GREP_MCP_COMMIT=$AST_GREP_MCP_COMMIT
 CODEGRAPH_VERSION=$CODEGRAPH_VERSION
-RIPGREP_MCP_VERSION=$RIPGREP_MCP_VERSION
 EOF
 }
 
 pinned_stack_is_current() {
     local prefix="$TOOLS_ROOT/npm-global"
     local codegraph_root="$prefix/lib/node_modules/@astudioplus/codegraph-mcp"
-    local ripgrep_root="$prefix/lib/node_modules/mcp-ripgrep"
     local native_codegraph="$codegraph_root/bin/codegraph-server-linux-x64"
 
     [[ -s "$MANIFEST" ]] || return 1
@@ -192,20 +185,17 @@ pinned_stack_is_current() {
     grep -qx "AST_GREP_VERSION=$AST_GREP_VERSION" "$MANIFEST" || return 1
     grep -qx "AST_GREP_MCP_COMMIT=$AST_GREP_MCP_COMMIT" "$MANIFEST" || return 1
     grep -qx "CODEGRAPH_VERSION=$CODEGRAPH_VERSION" "$MANIFEST" || return 1
-    grep -qx "RIPGREP_MCP_VERSION=$RIPGREP_MCP_VERSION" "$MANIFEST" || return 1
 
     command -v serena >/dev/null 2>&1 || return 1
     command -v ast-grep >/dev/null 2>&1 || return 1
     command -v ast-grep-server >/dev/null 2>&1 || return 1
     command -v codegraph-mcp >/dev/null 2>&1 || return 1
-    command -v mcp-ripgrep >/dev/null 2>&1 || return 1
     [[ -f "$HOME/.serena/serena_config.yml" ]] || return 1
     [[ -x "$native_codegraph" ]] || return 1
 
     serena --version 2>/dev/null | grep -q "${SERENA_VERSION//./\\.}" || return 1
     ast-grep --version 2>/dev/null | grep -q "${AST_GREP_VERSION//./\\.}" || return 1
     [[ "$(node -p "require('$codegraph_root/package.json').version" 2>/dev/null)" == "$CODEGRAPH_VERSION" ]] || return 1
-    [[ "$(node -p "require('$ripgrep_root/package.json').version" 2>/dev/null)" == "$RIPGREP_MCP_VERSION" ]] || return 1
     ast-grep-server --help >/dev/null 2>&1 || return 1
     codegraph-mcp --help >/dev/null 2>&1 || return 1
 }

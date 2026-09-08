@@ -340,9 +340,10 @@ the state mutation, the violated invariant, and the terminal impact.
 
 Before changing core code:
 
-1. Read `AGENTS.md`, `docs/ai-map.md`, `token-policy.md`, and
-   `task-router.md`.
-2. Read this contract plus the exact owner contract selected by the router.
+1. Follow the already-loaded `AGENTS.md`; do not preload `docs/ai-map.md`,
+   `token-policy.md`, or `task-router.md`.
+2. Read only the relevant headings here plus the exact owner contract; consult
+   the task router only if that owner is unclear.
 3. Find the source in `formal/contracts.toml`, `formal/system-flows.tsv`, and
    `formal/run-source-conformance.sh`.
 4. Inspect the public `api.rs` before a backing module.

@@ -10,8 +10,8 @@ refactoring, recovery, and review.
 
 | File | Role |
 | --- | --- |
-| `token-policy.md` | Mandatory operating policy: context budget, forbidden paths, when to stop. |
-| `task-router.md` | Task → smallest context set. Read after `token-policy.md`. |
+| `token-policy.md` | On-demand context/tool/output budgets and stop limits. |
+| `task-router.md` | On-demand task → smallest context route when ownership or validation is unclear. |
 | `session-handoff.md` | Volatile checkout state and safe new-session resume sequence. |
 | `repo-map.md` | Source ownership and canonical entrypoints. Deeper than `docs/ai-map.md`. |
 | `commands.md` | Quiet build/check/debug commands and their failure meanings. |
@@ -33,7 +33,7 @@ refactoring, recovery, and review.
 
 ## Operating rules
 
-- Follow `token-policy.md`.
+- Follow root `AGENTS.md`; read `token-policy.md` only when detailed budget/tool limits matter.
 - Read the smallest file/range needed before scanning the repo.
 - Treat human docs (`docs/*.md` outside `docs/ai/`) as explanatory; AI docs as compact contracts.
 - Verify code truth before editing when a contract references a source path.
@@ -47,14 +47,7 @@ refactoring, recovery, and review.
 
 ## Stable cache prefix
 
-Cache exactly these, in order, then append **one** focused AI doc selected by `task-router.md`:
-
-1. Root `AGENTS.md`
-2. `docs/ai-map.md`
-3. `token-policy.md`
-4. `task-router.md`
-
-Keep task text, logs, command output, and source snippets *after* this prefix. Never cache logs or generated output.
+Cache root `AGENTS.md` only. Load the task router, AI map, token policy, and focused contracts on demand. Keep task text and volatile evidence after the stable prefix; never cache logs or generated output.
 
 ## Human docs (use only when AI contracts are missing the needed behavior)
 

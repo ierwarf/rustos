@@ -485,8 +485,8 @@ fallback.
 
 ## Fast context commands
 
-- Prefer symbol-aware search (Serena MCP) for symbols and scoped text search
-  (ripgrep MCP or `rg`) for raw `symbol_or_path` matches under `kernel`,
+- Prefer symbol-aware search (Serena MCP) for symbols and local `rg` for raw
+  `symbol_or_path` matches under `kernel`,
   `services`, `tools`, `libs`, `drivers`, and `apps`.
 - `find kernel -maxdepth 4 -name api.rs | sort`
 - `find . -name RUSTOS.package.toml | sort`

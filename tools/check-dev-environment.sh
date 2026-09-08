@@ -100,7 +100,7 @@ if test "$CHECK_AI" -eq 1; then
     require_command ast-grep
     require_command ast-grep-server
     require_command codegraph-mcp
-    grep -q 'mcp-ripgrep@0.4.0' .codex/config.toml || bad "ripgrep MCP pin missing"
+    require_command rg
     grep -q 'serena-agent==1.6.0' .codex/config.toml || bad "Serena MCP pin missing"
     grep -q 'mcp_servers.ast_grep' .codex/config.toml || bad "ast-grep MCP config missing"
     grep -q 'mcp_servers.codegraph' .codex/config.toml || bad "CodeGraph MCP config missing"

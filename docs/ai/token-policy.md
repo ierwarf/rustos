@@ -6,13 +6,10 @@ tooling, large-output, or context-budget details matter.
 
 ## 1. Minimal context
 
-The reusable prefix is exactly:
-
-1. `AGENTS.md`
-2. `docs/ai/task-router.md`
-
-Append one router-selected focused contract when needed, then task text and
-volatile evidence. `docs/ai-map.md` is an on-demand index, not bootstrap.
+The reusable repository prefix is exactly `AGENTS.md`. Read
+`docs/ai/task-router.md` only when owner/contract/validation routing is unclear;
+otherwise go directly to the focused contract/source range. `docs/ai-map.md`
+is an on-demand index, not bootstrap.
 Documents already present in live context count as read. **Do not reread unchanged bootstrap documents** after compaction; recover only the focused
 contract/handoff range and volatile facts needed next.
 

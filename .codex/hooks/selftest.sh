@@ -217,9 +217,14 @@ expect_match \
   'cross-service'
 
 expect_match \
-  "ripgrep MCP version is pinned" \
+  "root policy keeps one stable prefix" \
+  AGENTS.md \
+  'only stable repository'
+
+expect_no_match \
+  "redundant ripgrep MCP stays disabled" \
   .codex/config.toml \
-  'mcp-ripgrep@0\.4\.0'
+  'mcp-ripgrep|mcp_servers\.ripgrep'
 
 expect_match \
   "Serena MCP version is pinned" \

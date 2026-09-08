@@ -1,6 +1,6 @@
 # AI Workflows
 
-Before any workflow: read `token-policy.md`, then `task-router.md`.
+Follow `AGENTS.md`; load token policy or the task router only when their specific budget/routing detail is needed.
 
 ## Add service
 

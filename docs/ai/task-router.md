@@ -1,7 +1,8 @@
 # AI Task Router
 
-Pick the smallest context set. This file and root `AGENTS.md` are the stable
-prefix. Do not read `token-policy.md`, `ai-map.md`, or all AI docs by default.
+On-demand route table. Do not load it when `AGENTS.md` plus exact search
+already identifies the owner, contract, and validation path. Do not read
+`token-policy.md`, `ai-map.md`, or all AI docs by default.
 
 ## Source-work tier
 

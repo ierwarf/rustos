@@ -7,8 +7,7 @@ description: Resume or prepare a RustOS development session without losing live 
 
 ## Resume
 
-1. Read the root `AGENTS.md` stable prefix and route through
-   `docs/ai/task-router.md`.
+1. Use the already-loaded root `AGENTS.md`; do not preload the task router.
 2. Read only the current checkout snapshot in
    `docs/ai/session-handoff.md`; its historical session log is not current
    evidence.

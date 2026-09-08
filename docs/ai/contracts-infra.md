@@ -9,8 +9,8 @@ Package/stage schemas, runtime control, kernel API, build, fault injection, logg
   physical-GPU, and release work; it never installs tools or mutates the host.
 - Project MCP launchers in `.codex/config.toml` use exact package versions.
   Version changes are reviewed inputs, not an implicit update at agent startup.
-  Serena and ripgrep are scoped discovery accelerators; their absence falls
-  back to local `rg` and is never OS acceptance evidence.
+  Serena, ast-grep, and CodeGraph are scoped semantic/structural/impact
+  accelerators. Raw text search uses local `rg`; none is OS acceptance evidence.
 - `session-handoff.md` owns volatile continuation state. It is kept out of the
   stable prompt prefix and must not duplicate durable contracts or gate output.
 - GitHub Actions use a fixed Ubuntu image, commit-pinned actions, bounded job

@@ -72,16 +72,9 @@ statusMessage = "Loading RustOS context"
 # MCP servers are exact-version project inputs installed by
 # tools/agent/bootstrap-remote-ai-tools.sh. They resolve from PATH so a checkout
 # is portable across workstations and self-hosted runners.
-#   ripgrep   — mcp-ripgrep 0.4.0
 #   serena    — serena-agent==1.6.0
 #   ast-grep  — ast-grep CLI 0.45.2 + sg-mcp commit 149e20d47bb7125fb0c1451feea2f48a98742034
 #   codegraph — @astudioplus/codegraph-mcp 0.20.1
-
-[mcp_servers.ripgrep]
-command = "npx"
-args = ["-y", "mcp-ripgrep@0.4.0"]
-[mcp_servers.ripgrep.tools.search]
-approval_mode = "approve"
 
 [mcp_servers.serena]
 command = "serena"

@@ -1,15 +1,15 @@
 # RustOS Agent Instructions
 
-Keep model context small. The stable reusable prefix is only this file plus
-`docs/ai/task-router.md`. An `AGENTS.md` supplied by the environment already
-counts as loaded; do not reread it unless it changed. Everything else is
-on-demand.
+Keep model context small. This `AGENTS.md` is the only stable repository
+prompt prefix. If the environment already supplied it, do not reread it unless
+it changed. Everything else is on-demand.
 
 ## Core workflow
 
-1. Route the request through `docs/ai/task-router.md`; load the smallest focused
-   contract it names. Do not preload `docs/ai-map.md`, `docs/ai/token-policy.md`,
-   human docs, references, logs, or broad source trees.
+1. Search first and open the smallest focused contract/source range. Read
+   `docs/ai/task-router.md` only when the owner, contract, or validation route is
+   unclear or the task is specialized. Do not preload maps, token policy, human
+   docs, references, logs, or broad source trees.
 2. Search before opening source. Prefer exact symbols/ranges and stop searching
    once the missing fact is known.
 3. Select the source-tool tier below. **Do not preflight unused MCP servers.**

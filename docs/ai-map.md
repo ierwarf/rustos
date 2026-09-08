@@ -1,15 +1,12 @@
 # AI Map
 
 **Role:** on-demand repository index. It is not part of the stable prompt
-prefix; use it only when `docs/ai/task-router.md` does not already identify the
-owner.
+prefix; use it only when exact search and, when needed, `docs/ai/task-router.md`
+still do not identify the owner.
 
 ## Stable prefix
 
-1. `AGENTS.md`
-2. `docs/ai/task-router.md`
-
-Everything below is progressive disclosure.
+`AGENTS.md` only. Everything below is progressive disclosure.
 
 ## Focused AI docs
 

@@ -4,7 +4,7 @@
 one-screen entry index isn't enough — typically when an area needs an
 annotated entrypoint or a pre-edit checklist.
 
-Read `token-policy.md` and `task-router.md` first.
+Do not preload token policy or the task router before this map; open them only for a missing budget or routing detail.
 
 ## Core entrypoints (annotated)
 
