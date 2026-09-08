@@ -60,9 +60,6 @@ jobs:
           for key in ("sync", "commit", "push"):
               if key in data and not isinstance(data[key], bool):
                   raise SystemExit(f"{key} must be boolean")
-          if data.get("push") and not data.get("commit", False):
-              # Pushing an existing local commit is useful, so allow it.
-              pass
           message = data.get("message", "agent: remote task")
           if not isinstance(message, str) or not message.strip() or len(message) > 240:
               raise SystemExit("message must be 1..240 characters")
@@ -157,8 +154,10 @@ jobs:
           status="$RUNNER_TEMP/rustos-agent-status.env"
           cd "$worktree"
           start="$(date +%s)"
+          set +e
           timeout --signal=TERM --kill-after=10s "${timeout_sec}s" bash "$script" >"$log" 2>&1
           rc=$?
+          set -e
           end="$(date +%s)"
           {
             echo "EXEC_RC=$rc"
