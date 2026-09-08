@@ -9,11 +9,19 @@ on:
       - ".github/workflows/agent-tools-bootstrap.yml"
       - "tools/agent/bootstrap-remote-ai-tools.sh"
       - ".codex/config.toml"
+      - ".codex/hooks/**"
+      - ".codex/hooks.json"
+      - ".claude/settings.json"
+      - ".agents/hooks/**"
       - ".mcp.json"
       - ".agents/skills/rustos-code-editing/SKILL.md"
+      - "docs/ai/token-policy.md"
 
+# Temporary write permission is used only by the final cleanup step to remove
+# obsolete diagnostic branches. This is reverted to contents:read after the
+# remote validation run succeeds.
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: rustos-agent-tools-${{ github.ref }}
@@ -68,7 +76,7 @@ jobs:
             --log-level WARNING \
             --timeout 60 \
             > build/agent-tools/serena-index.log 2>&1
-          tail -n 80 build/agent-tools/serena-index.log
+          tail -n 40 build/agent-tools/serena-index.log
           test -d .serena/cache
           find .serena/cache -type f -size +0c -print -quit | grep -q .
 
@@ -118,7 +126,7 @@ jobs:
             > build/agent-tools/codegraph-smoke.json
           test -s build/agent-tools/codegraph-smoke.json
           grep -Eiq 'kernel|module|symbol|dependency|summary' build/agent-tools/codegraph-smoke.json
-          sed -n '1,80p' build/agent-tools/codegraph-smoke.json
+          sed -n '1,40p' build/agent-tools/codegraph-smoke.json
 
       - name: Verify RustOS AI development environment
         shell: bash
@@ -131,3 +139,89 @@ jobs:
           du -sh "$HOME/.local/share/rustos-agent-tools" 2>/dev/null || true
           du -sh "$HOME/.serena" 2>/dev/null || true
           du -sh "$HOME/.codegraph" 2>/dev/null || true
+
+      - name: Verify hook syntax selftest cache and timeout contracts
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          mkdir -p build/agent-tools
+
+          for hook in \
+            .agents/hooks/lib.sh \
+            .agents/hooks/post_edit_rust.sh \
+            .codex/hooks/pre_bash_destructive.sh \
+            .codex/hooks/pre_commit.sh \
+            .codex/hooks/pre_read_large_file.sh \
+            .codex/hooks/pre_edit_policy.sh \
+            .codex/hooks/user_prompt_policy.sh \
+            .codex/hooks/session_context.sh
+          do
+            bash -n "$hook"
+          done
+
+          .codex/hooks/selftest.sh > build/agent-tools/hook-selftest.log 2>&1
+          tail -n 24 build/agent-tools/hook-selftest.log
+
+          # A successful post-edit check must stay silent, stamp the exact
+          # content fingerprint, and make an identical second invocation cheap.
+          event="$(jq -nc '{tool_input:{file_path:"kernel/ps/src/lib.rs"}}')"
+          first=build/agent-tools/post-edit-first.out
+          second=build/agent-tools/post-edit-second.out
+          printf '%s' "$event" | RUSTOS_POST_EDIT_CHECK_INTERVAL_SEC=0 \
+            .agents/hooks/post_edit_rust.sh >"$first"
+          test ! -s "$first"
+
+          source .agents/hooks/lib.sh
+          root="$(rustos_repo_root)"
+          fingerprint="$(rustos_workspace_fingerprint "$root")"
+          test "$(rustos_read_check_stamp "$root")" = "$fingerprint"
+
+          start_ns="$(date +%s%N)"
+          printf '%s' "$event" | .agents/hooks/post_edit_rust.sh >"$second"
+          end_ns="$(date +%s%N)"
+          test ! -s "$second"
+          elapsed_ms=$(( (end_ns - start_ns) / 1000000 ))
+          echo "post_edit_cached_ms=$elapsed_ms"
+          test "$elapsed_ms" -lt 3000
+
+          # Timeout is a distinct failure class and the visible payload remains
+          # compact even if the underlying command log is noisy.
+          timeout_log="$(mktemp)"
+          trap 'rm -f "$timeout_log"' EXIT
+          set +e
+          rustos_run_bounded 1 "$timeout_log" bash -c 'sleep 2'
+          rc=$?
+          set -e
+          test "$rc" -eq 124
+          compact="$(rustos_compact_failure 'timeout-probe' "$rc" "$timeout_log")"
+          printf '%s\n' "$compact" | grep -q 'timed out'
+          test "$(printf '%s' "$compact" | wc -c)" -le 4096
+
+          # The normal shell allow path must remain silent.
+          shell_event="$(jq -nc --arg cmd 'git status --short' '{tool_input:{cmd:$cmd}}')"
+          shell_out="$(printf '%s' "$shell_event" | .codex/hooks/pre_bash_destructive.sh)"
+          test -z "$shell_out"
+
+      - name: Remove obsolete diagnostic branches
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE"
+          for branch in \
+            agent/hooks-timeouts-token-20260908 \
+            diag/gpu-readiness-20260908 \
+            diag/kvm-timeout-20260907
+          do
+            if git ls-remote --exit-code --heads origin "$branch" >/dev/null 2>&1; then
+              git push origin --delete "$branch"
+            fi
+          done
+
+          extras="$(git ls-remote --heads origin | awk '{sub("refs/heads/", "", $2); if ($2 != "master") print $2}')"
+          if [[ -n "$extras" ]]; then
+            echo "unexpected remote branches remain:" >&2
+            printf '%s\n' "$extras" >&2
+            exit 1
+          fi
+          echo 'remote_branches=master-only'
