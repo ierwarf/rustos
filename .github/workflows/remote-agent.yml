@@ -85,6 +85,7 @@ jobs:
           set -euo pipefail
           export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
           worktree="$RUSTOS_AGENT_WORKTREE"
+          mkdir -p "$HOME/.cache/rustos-agent/logs"
           if [ ! -d "$worktree/.git" ]; then
             rm -rf -- "$worktree"
             git clone "$RUSTOS_AGENT_REPO" "$worktree"
@@ -150,7 +151,7 @@ jobs:
           script='${{ steps.payload.outputs.script }}'
           payload='${{ steps.payload.outputs.payload }}'
           timeout_sec="$(jq -r '.timeout_sec' "$payload")"
-          log="$RUNNER_TEMP/rustos-agent-exec.log"
+          log="$HOME/.cache/rustos-agent/logs/${GITHUB_RUN_ID}.log"
           status="$RUNNER_TEMP/rustos-agent-status.env"
           cd "$worktree"
           start="$(date +%s)"
@@ -175,6 +176,16 @@ jobs:
           set -euo pipefail
           payload='${{ steps.payload.outputs.payload }}'
           [ "$(jq -r '.commit' "$payload")" = true ] || exit 0
+          status="$RUNNER_TEMP/rustos-agent-status.env"
+          if [ ! -f "$status" ]; then
+            echo 'commit_result=skipped_no_exec_status' > "$RUNNER_TEMP/rustos-agent-commit.env"
+            exit 0
+          fi
+          source "$status"
+          if [ "$EXEC_RC" != 0 ]; then
+            echo "commit_result=skipped_exec_rc_${EXEC_RC}" > "$RUNNER_TEMP/rustos-agent-commit.env"
+            exit 0
+          fi
           cd "$RUSTOS_AGENT_WORKTREE"
           git diff --check
           git add -A
@@ -197,6 +208,16 @@ jobs:
           set -euo pipefail
           payload='${{ steps.payload.outputs.payload }}'
           [ "$(jq -r '.push' "$payload")" = true ] || exit 0
+          status="$RUNNER_TEMP/rustos-agent-status.env"
+          if [ ! -f "$status" ]; then
+            echo 'push_result=skipped_no_exec_status' > "$RUNNER_TEMP/rustos-agent-push.env"
+            exit 0
+          fi
+          source "$status"
+          if [ "$EXEC_RC" != 0 ]; then
+            echo "push_result=skipped_exec_rc_${EXEC_RC}" > "$RUNNER_TEMP/rustos-agent-push.env"
+            exit 0
+          fi
           cd "$RUSTOS_AGENT_WORKTREE"
           git fetch origin master
           if ! git merge-base --is-ancestor origin/master HEAD; then
@@ -217,7 +238,7 @@ jobs:
         run: |
           set -euo pipefail
           worktree="$RUSTOS_AGENT_WORKTREE"
-          log="$RUNNER_TEMP/rustos-agent-exec.log"
+          log="$HOME/.cache/rustos-agent/logs/${GITHUB_RUN_ID}.log"
           status="$RUNNER_TEMP/rustos-agent-status.env"
           commit_status="$RUNNER_TEMP/rustos-agent-commit.env"
           push_status="$RUNNER_TEMP/rustos-agent-push.env"
