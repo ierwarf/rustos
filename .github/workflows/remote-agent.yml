@@ -5,7 +5,7 @@ on:
     types: [created]
 
 permissions:
-  contents: write
+  contents: read
   issues: write
 
 concurrency:
@@ -22,7 +22,7 @@ jobs:
     timeout-minutes: 125
     env:
       RUSTOS_AGENT_WORKTREE: /home/github-runner/rustos-agent-worktree
-      RUSTOS_AGENT_REPO: https://github.com/ierwarf/rustos.git
+      RUSTOS_AGENT_REPO: git@github-rustos-agent:ierwarf/rustos.git
 
     steps:
       - name: Parse command payload
@@ -202,8 +202,6 @@ jobs:
         if: always()
         shell: bash
         continue-on-error: true
-        env:
-          RUSTOS_PUSH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           payload='${{ steps.payload.outputs.payload }}'
@@ -224,10 +222,7 @@ jobs:
             echo 'push_result=blocked_diverged_from_origin_master' > "$RUNNER_TEMP/rustos-agent-push.env"
             exit 1
           fi
-          auth="$(printf 'x-access-token:%s' "$RUSTOS_PUSH_TOKEN" | base64 -w0)"
-          git -c credential.helper= \
-              -c http.https://github.com/.extraheader="AUTHORIZATION: basic $auth" \
-              push "$RUSTOS_AGENT_REPO" HEAD:master
+          git push "$RUSTOS_AGENT_REPO" HEAD:master
           printf 'push_result=%s\n' "$(git rev-parse --short=12 HEAD)" > "$RUNNER_TEMP/rustos-agent-push.env"
 
       - name: Publish bounded result
