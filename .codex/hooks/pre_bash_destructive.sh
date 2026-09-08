@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # Codex PreToolUse shell policy.
 #
-# One hook handles both destructive-command blocking and conditional pre-commit
-# gates. Keeping these in one process avoids paying two jq/bash startups for
-# every harmless shell command.
+# One hook handles destructive-command blocking, direct-output token budgets,
+# and conditional pre-commit gates. Harmless shell calls still pay for one
+# jq/bash startup only.
 
 set -euo pipefail
 
@@ -12,11 +12,14 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
 source "$SCRIPT_DIR/../../.agents/hooks/lib.sh"
 
 INPUT="$(cat)"
-cmd="$(printf '%s' "$INPUT" | jq -r '
-  .tool_input.command // .tool_input.cmd //
-  .arguments.command // .arguments.cmd //
-  .params.command // .params.cmd // empty
-' 2>/dev/null || true)"
+mapfile -d '' -t fields < <(printf '%s' "$INPUT" | jq -jr '
+  (.tool_input.command // .tool_input.cmd //
+   .arguments.command // .arguments.cmd //
+   .params.command // .params.cmd // ""), "\u0000",
+  (.tool_input.max_output_tokens // .arguments.max_output_tokens // .params.max_output_tokens // "" | tostring), "\u0000"
+' 2>/dev/null || true)
+cmd="${fields[0]:-}"
+max_output_tokens="${fields[1]:-}"
 
 [[ -z "$cmd" ]] && exit 0
 trimmed_cmd="${cmd#"${cmd%%[![:space:]]*}"}"
@@ -38,6 +41,17 @@ block() {
 block_destructive() {
   block "Blocked destructive command: $1. Re-issue only if the user explicitly authorized it."
 }
+
+max_shell_output_tokens="${RUSTOS_HOOK_MAX_SHELL_OUTPUT_TOKENS:-6000}"
+[[ "$max_shell_output_tokens" =~ ^[0-9]+$ ]] || max_shell_output_tokens=6000
+read_heavy_re='(^|[[:space:];|&])(cat|sed[[:space:]]+-n|rg|grep|find|head|tail|git[[:space:]]+(diff|show|log))([[:space:]]|$)'
+if [[ "$max_output_tokens" =~ ^[0-9]+$ ]] \
+  && (( max_output_tokens > max_shell_output_tokens )) \
+  && [[ "$cmd" =~ $read_heavy_re ]] \
+  && [[ "$cmd" != *">/tmp/"* ]] \
+  && [[ "$cmd" != *"> /tmp/"* ]]; then
+  block "Shell output budget blocked: requested ${max_output_tokens} tokens for exploratory output; use <=${max_shell_output_tokens} or capture verbose output under /tmp and return a bounded summary."
+fi
 
 write_protected_path_re='(^|[[:space:];|&>])(\./)?(build|target|vendor|logs)(/|[[:space:]]|$)|(^|[[:space:];|&>])(\./)?Cargo\.lock([[:space:]]|$)|(^|[[:space:];|&>])(\./)?perf\.data([[:space:]]|$)'
 

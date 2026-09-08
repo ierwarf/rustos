@@ -102,6 +102,16 @@ expect_quiet_allow \
   "$(jq -n --arg cmd 'find . -name target -print | sed -n "1,20p"' '{tool_input:{cmd:$cmd}}')"
 
 expect_deny \
+  "oversized exploratory shell output is denied" \
+  .codex/hooks/pre_bash_destructive.sh \
+  "$(jq -n --arg cmd 'cat docs/ai-map.md docs/ai/token-policy.md docs/ai/task-router.md' '{tool_input:{cmd:$cmd,max_output_tokens:12000}}')"
+
+expect_quiet_allow \
+  "bounded exploratory shell output is allowed" \
+  .codex/hooks/pre_bash_destructive.sh \
+  "$(jq -n --arg cmd 'cat docs/ai/task-router.md' '{tool_input:{cmd:$cmd,max_output_tokens:3000}}')"
+
+expect_deny \
   "whole Cargo.lock read is denied" \
   .codex/hooks/pre_read_large_file.sh \
   "$(jq -n '{tool_input:{relative_path:"Cargo.lock"}}')"
@@ -115,6 +125,31 @@ expect_deny \
   "bounded binary read is denied" \
   .codex/hooks/pre_read_large_file.sh \
   "$(jq -n '{tool_input:{relative_path:"build/probe.bin",start_line:0,end_line:10}}')"
+
+expect_deny \
+  "oversized Serena answer budget is denied" \
+  .codex/hooks/pre_read_large_file.sh \
+  "$(jq -n '{tool_name:"mcp__serena__find_symbol",tool_input:{max_answer_chars:24000}}')"
+
+expect_quiet_allow \
+  "bounded Serena answer budget is allowed" \
+  .codex/hooks/pre_read_large_file.sh \
+  "$(jq -n '{tool_name:"mcp__serena__find_symbol",tool_input:{max_answer_chars:8000}}')"
+
+expect_deny \
+  "oversized ast-grep result budget is denied" \
+  .codex/hooks/pre_read_large_file.sh \
+  "$(jq -n '{tool_name:"mcp__ast_grep__find_code",tool_input:{max_results:100}}')"
+
+expect_deny \
+  "oversized CodeGraph result budget is denied" \
+  .codex/hooks/pre_read_large_file.sh \
+  "$(jq -n '{tool_name:"mcp__codegraph__codegraph_symbol_search",tool_input:{limit:60,compact:true}}')"
+
+expect_deny \
+  "noncompact CodeGraph symbol search is denied" \
+  .codex/hooks/pre_read_large_file.sh \
+  "$(jq -n '{tool_name:"mcp__codegraph__codegraph_symbol_search",tool_input:{limit:20,compact:false}}')"
 
 expect_deny \
   "Cargo.lock edit is denied" \
@@ -220,6 +255,21 @@ expect_match \
   "token policy forbids bootstrap rereads" \
   docs/ai/token-policy.md \
   'Do not reread unchanged bootstrap documents'
+
+expect_match \
+  "token policy bounds Serena answers" \
+  docs/ai/token-policy.md \
+  'must not.*12000'
+
+expect_match \
+  "token policy bounds shell output" \
+  docs/ai/token-policy.md \
+  'interactive ceiling is .*6000'
+
+expect_match \
+  "source navigation hook covers all three MCP namespaces" \
+  .codex/config.toml \
+  'mcp__serena__\.\*.*mcp__ast_grep__\.\*.*mcp__codegraph__codegraph_\.\*'
 
 expect_match \
   "verify bounds failure output" \
