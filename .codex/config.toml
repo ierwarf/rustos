@@ -19,12 +19,12 @@ hooks = true
 # Code-specific hooks live in .claude/settings.json and must not be duplicated
 # under .codex/.
 [[hooks.PreToolUse]]
-matcher = "^(Read|mcp__.*read.*file|mcp__serena__read_file)$"
+matcher = "^(Read|mcp__serena__.*|mcp__ast_grep__.*|mcp__codegraph__codegraph_.*)$"
 [[hooks.PreToolUse.hooks]]
 type = "command"
 command = '"$(git rev-parse --show-toplevel)/.codex/hooks/pre_read_large_file.sh"'
 timeout = 3
-statusMessage = "Checking read bound"
+statusMessage = "Checking read/token bound"
 
 [[hooks.PreToolUse]]
 matcher = "^(apply_patch|Edit|Write|mcp__serena__(create_text_file|insert_after_symbol|insert_before_symbol|rename_symbol|replace_content|replace_in_files|replace_symbol_body|safe_delete_symbol))$"
@@ -34,8 +34,8 @@ command = '"$(git rev-parse --show-toplevel)/.codex/hooks/pre_edit_policy.sh"'
 timeout = 3
 statusMessage = "Checking edit policy"
 
-# One shell hook owns both destructive-command protection and commit-only
-# gates. A harmless shell call therefore pays for one hook process, not two.
+# One shell hook owns destructive-command protection, token-output budgets, and
+# commit-only gates. A harmless shell call therefore pays for one hook process.
 [[hooks.PreToolUse]]
 matcher = "^(Bash|exec_command|mcp__serena__execute_shell_command)$"
 [[hooks.PreToolUse.hooks]]
