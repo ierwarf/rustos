@@ -143,7 +143,7 @@ fi
 
 # The hook bundle/formal registry selftest is relevant only when agent policy or
 # its owned validation infrastructure is actually part of the commit.
-if printf '%s\n' "$staged" | grep -Eq '^(AGENTS\.md|\.codex/|\.claude/|\.agents/|docs/ai/|tools/agent/|formal/)'; then
+if printf '%s\n' "$staged" | grep -Eq '^(AGENTS\.md|docs/ai-map\.md|\.codex/|\.claude/|\.agents/|\.serena/|\.mcp\.json|docs/ai/|tools/agent/|tools/check-dev-environment\.sh|\.github/workflows/|formal/)'; then
   run_gate "agent hook selftest" 25 .codex/hooks/selftest.sh
 fi
 

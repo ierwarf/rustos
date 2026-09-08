@@ -81,6 +81,17 @@ expect_absent() {
   pass "$name"
 }
 
+test -x tools/agent/check-ai-context-contract.sh || {
+  printf 'not ok - AI context contract checker is not executable\n' >&2
+  exit 1
+}
+if tools/agent/check-ai-context-contract.sh >/dev/null; then
+  pass "AI context efficiency contract passes"
+else
+  printf 'not ok - AI context efficiency contract failed\n' >&2
+  exit 1
+fi
+
 expect_deny \
   "destructive rm is denied" \
   .codex/hooks/pre_bash_destructive.sh \

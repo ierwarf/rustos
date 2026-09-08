@@ -13,6 +13,12 @@ Package/stage schemas, runtime control, kernel API, build, fault injection, logg
   accelerators. Raw text search uses local `rg`; none is OS acceptance evidence.
 - `session-handoff.md` owns volatile continuation state. It is kept out of the
   stable prompt prefix and must not duplicate durable contracts or gate output.
+- `tools/agent/check-ai-context-contract.sh` is the executable low-context
+  contract. It caps stable/startup context, rejects redundant MCP/tool-policy
+  drift, and prevents read/output ceilings from silently increasing. Codex
+  commit gating, the remote-agent commit stage, and lightweight CI all run it;
+  relaxing a ceiling or adding a stable-prefix file/MCP is an explicit contract
+  change rather than incidental infrastructure cleanup.
 - GitHub Actions use a fixed Ubuntu image, commit-pinned actions, bounded job
   timeouts, and pull-request concurrency cancellation. The check job validates
   shell syntax and the hook contract before compiling RustOS.

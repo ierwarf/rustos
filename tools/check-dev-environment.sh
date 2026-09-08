@@ -105,7 +105,7 @@ if test "$CHECK_AI" -eq 1; then
     grep -q 'mcp_servers.ast_grep' .codex/config.toml || bad "ast-grep MCP config missing"
     grep -q 'mcp_servers.codegraph' .codex/config.toml || bad "CodeGraph MCP config missing"
     if .codex/hooks/selftest.sh >/dev/null; then
-        ok "Codex hooks, handoff, skill, and Serena contracts are consistent"
+        ok "Codex hooks, context guardrails, handoff, skill, and Serena contracts are consistent"
     else
         bad "Codex AI infrastructure selftest failed"
     fi

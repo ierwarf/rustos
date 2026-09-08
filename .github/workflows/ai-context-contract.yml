@@ -1,0 +1,52 @@
+name: RustOS AI context contract
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "master"
+    paths:
+      - "AGENTS.md"
+      - "docs/ai-map.md"
+      - "docs/ai/**"
+      - ".codex/**"
+      - ".agents/**"
+      - ".serena/**"
+      - ".claude/**"
+      - ".mcp.json"
+      - "tools/agent/**"
+      - "tools/check-dev-environment.sh"
+      - ".github/workflows/**"
+  pull_request:
+    paths:
+      - "AGENTS.md"
+      - "docs/ai-map.md"
+      - "docs/ai/**"
+      - ".codex/**"
+      - ".agents/**"
+      - ".serena/**"
+      - ".claude/**"
+      - ".mcp.json"
+      - "tools/agent/**"
+      - "tools/check-dev-environment.sh"
+      - ".github/workflows/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rustos-ai-context-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  context-contract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Verify low-context AI infrastructure contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n tools/agent/check-ai-context-contract.sh
+          tools/agent/check-ai-context-contract.sh

@@ -2,7 +2,10 @@
 
 Keep model context small. This `AGENTS.md` is the only stable repository
 prompt prefix. If the environment already supplied it, do not reread it unless
-it changed. Everything else is on-demand.
+it changed. Everything else is on-demand. AI-infrastructure edits must keep
+`tools/agent/check-ai-context-contract.sh` passing; adding stable-prefix files,
+MCPs, or higher context/output ceilings is an explicit contract change, never
+an incidental refactor.
 
 ## Core workflow
 

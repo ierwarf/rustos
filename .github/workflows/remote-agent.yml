@@ -193,6 +193,11 @@ jobs:
             echo 'commit_result=no_changes' > "$RUNNER_TEMP/rustos-agent-commit.env"
             exit 0
           fi
+          staged="$(git diff --cached --name-only --diff-filter=ACMR)"
+          if printf '%s\n' "$staged" | grep -Eq '^(AGENTS\.md|docs/ai-map\.md|\.codex/|\.claude/|\.agents/|\.serena/|\.mcp\.json|docs/ai/|tools/agent/|tools/check-dev-environment\.sh|\.github/workflows/)'; then
+            test -x tools/agent/check-ai-context-contract.sh
+            tools/agent/check-ai-context-contract.sh
+          fi
           message="$(jq -r '.message' "$payload")"
           git commit -m "$message"
           printf 'commit_result=%s\n' "$(git rev-parse --short=12 HEAD)" > "$RUNNER_TEMP/rustos-agent-commit.env"
