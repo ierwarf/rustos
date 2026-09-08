@@ -35,6 +35,18 @@ jobs:
           fetch-depth: 0
           clean: false
 
+      - name: Remove retired checkout-only hook shadow
+        shell: bash
+        run: |
+          set -euo pipefail
+          # clean:false intentionally preserves expensive DVM/cache output on this
+          # self-hosted runner. Remove only the obsolete untracked Codex hook
+          # representation that an older checkout may have left behind.
+          if ! git ls-files --error-unmatch .codex/hooks.json >/dev/null 2>&1; then
+            rm -f .codex/hooks.json
+          fi
+          test ! -e .codex/hooks.json
+
       - name: Persist user-local tool path
         shell: bash
         run: |
