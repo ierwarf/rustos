@@ -1,0 +1,280 @@
+name: RustOS remote agent
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: rustos-remote-agent
+  cancel-in-progress: false
+
+jobs:
+  remote-agent:
+    if: >-
+      github.event.issue.number == 3 &&
+      github.event.comment.user.login == 'ierwarf' &&
+      startsWith(github.event.comment.body, '/agent')
+    runs-on: [self-hosted, Linux, X64]
+    timeout-minutes: 125
+    env:
+      RUSTOS_AGENT_WORKTREE: /home/github-runner/rustos-agent-worktree
+      RUSTOS_AGENT_REPO: https://github.com/ierwarf/rustos.git
+
+    steps:
+      - name: Parse command payload
+        id: payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          payload="$RUNNER_TEMP/rustos-agent-payload.json"
+          script="$RUNNER_TEMP/rustos-agent-script.sh"
+          python3 - "$GITHUB_EVENT_PATH" "$payload" "$script" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          event = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          body = event["comment"]["body"]
+          if not body.startswith("/agent"):
+              raise SystemExit("missing /agent prefix")
+          raw = body[len("/agent"):].strip()
+          if not raw:
+              raise SystemExit("missing JSON payload")
+          data = json.loads(raw)
+          if not isinstance(data, dict):
+              raise SystemExit("payload must be a JSON object")
+          if data.get("op", "exec") != "exec":
+              raise SystemExit("only op=exec is supported")
+          script = data.get("script")
+          if not isinstance(script, str) or not script.strip():
+              raise SystemExit("script must be a non-empty string")
+          if len(script.encode()) > 131072:
+              raise SystemExit("script exceeds 128 KiB")
+          timeout = data.get("timeout_sec", 1800)
+          if not isinstance(timeout, int) or not 1 <= timeout <= 7200:
+              raise SystemExit("timeout_sec must be 1..7200")
+          for key in ("sync", "commit", "push"):
+              if key in data and not isinstance(data[key], bool):
+                  raise SystemExit(f"{key} must be boolean")
+          if data.get("push") and not data.get("commit", False):
+              # Pushing an existing local commit is useful, so allow it.
+              pass
+          message = data.get("message", "agent: remote task")
+          if not isinstance(message, str) or not message.strip() or len(message) > 240:
+              raise SystemExit("message must be 1..240 characters")
+          normalized = {
+              "op": "exec",
+              "script": script,
+              "timeout_sec": timeout,
+              "sync": data.get("sync", True),
+              "commit": data.get("commit", False),
+              "push": data.get("push", False),
+              "message": message,
+          }
+          pathlib.Path(sys.argv[2]).write_text(json.dumps(normalized))
+          pathlib.Path(sys.argv[3]).write_text("#!/usr/bin/env bash\nset -euo pipefail\n" + script + "\n")
+          pathlib.Path(sys.argv[3]).chmod(0o700)
+          PY
+          echo "payload=$payload" >> "$GITHUB_OUTPUT"
+          echo "script=$script" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare persistent worktree
+        shell: bash
+        run: |
+          set -euo pipefail
+          export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+          worktree="$RUSTOS_AGENT_WORKTREE"
+          if [ ! -d "$worktree/.git" ]; then
+            rm -rf -- "$worktree"
+            git clone "$RUSTOS_AGENT_REPO" "$worktree"
+          fi
+          cd "$worktree"
+          git remote set-url origin "$RUSTOS_AGENT_REPO"
+          git config user.name "RustOS Remote Agent"
+          git config user.email "64543544+ierwarf@users.noreply.github.com"
+          git config pull.ff only
+          git config rerere.enabled true
+          git config rerere.autoupdate true
+          git config gc.auto 0
+
+          sync="$(jq -r '.sync' '${{ steps.payload.outputs.payload }}')"
+          git fetch --prune origin master
+          if [ "$sync" = true ]; then
+            if git diff --quiet && git diff --cached --quiet; then
+              git switch master
+              git merge --ff-only origin/master
+            else
+              echo 'worktree_dirty=preserved; automatic ff sync skipped'
+            fi
+          fi
+
+      - name: Safety check command
+        shell: bash
+        run: |
+          set -euo pipefail
+          script='${{ steps.payload.outputs.script }}'
+          python3 - "$script" <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          text = pathlib.Path(sys.argv[1]).read_text()
+          # These are accident guards, not a hostile-code sandbox. The runner
+          # account itself intentionally remains unprivileged and non-sudo.
+          blocked = [
+              (r'(?m)(^|[;&|]\s*)(sudo|doas|pkexec|su)(\s|$)', 'privilege escalation'),
+              (r'(?m)(^|[;&|]\s*)(reboot|shutdown|poweroff|halt)(\s|$)', 'host power control'),
+              (r'(?m)(^|[;&|]\s*)(mkfs(?:\.[A-Za-z0-9_-]+)?|fdisk|sfdisk|parted|wipefs)(\s|$)', 'disk/partition mutation'),
+              (r'\bdd\b[^\n;]*\bof=/dev/', 'raw device overwrite'),
+              (r'(?m)\brm\s+-[^\n;]*r[^\n;]*f[^\n;]*(?:\s|^)(/|/home(?:/|\s|$)|~(?:/|\s|$)|\$HOME(?:/|\s|$))', 'recursive deletion outside task scope'),
+              (r'\bgit\s+push\b[^\n;]*(--force|-f(?:\s|$))', 'force push'),
+              (r'\bgit\s+reset\s+--hard\b', 'hard reset'),
+              (r'\bgit\s+clean\s+-[^\n;]*f', 'destructive git clean'),
+          ]
+          for pattern, reason in blocked:
+              if re.search(pattern, text):
+                  raise SystemExit(f'blocked dangerous command: {reason}')
+          PY
+
+      - name: Execute task
+        id: exec
+        shell: bash
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+          export CARGO_TERM_COLOR=never
+          export RUST_BACKTRACE=1
+          worktree="$RUSTOS_AGENT_WORKTREE"
+          script='${{ steps.payload.outputs.script }}'
+          payload='${{ steps.payload.outputs.payload }}'
+          timeout_sec="$(jq -r '.timeout_sec' "$payload")"
+          log="$RUNNER_TEMP/rustos-agent-exec.log"
+          status="$RUNNER_TEMP/rustos-agent-status.env"
+          cd "$worktree"
+          start="$(date +%s)"
+          timeout --signal=TERM --kill-after=10s "${timeout_sec}s" bash "$script" >"$log" 2>&1
+          rc=$?
+          end="$(date +%s)"
+          {
+            echo "EXEC_RC=$rc"
+            echo "EXEC_SECONDS=$((end-start))"
+            printf 'HEAD=%s\n' "$(git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
+          } > "$status"
+          exit 0
+
+      - name: Commit task changes
+        id: commit
+        if: always()
+        shell: bash
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          payload='${{ steps.payload.outputs.payload }}'
+          [ "$(jq -r '.commit' "$payload")" = true ] || exit 0
+          cd "$RUSTOS_AGENT_WORKTREE"
+          git diff --check
+          git add -A
+          if git diff --cached --quiet; then
+            echo 'commit_result=no_changes' > "$RUNNER_TEMP/rustos-agent-commit.env"
+            exit 0
+          fi
+          message="$(jq -r '.message' "$payload")"
+          git commit -m "$message"
+          printf 'commit_result=%s\n' "$(git rev-parse --short=12 HEAD)" > "$RUNNER_TEMP/rustos-agent-commit.env"
+
+      - name: Push master
+        id: push
+        if: always()
+        shell: bash
+        continue-on-error: true
+        env:
+          RUSTOS_PUSH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          payload='${{ steps.payload.outputs.payload }}'
+          [ "$(jq -r '.push' "$payload")" = true ] || exit 0
+          cd "$RUSTOS_AGENT_WORKTREE"
+          git fetch origin master
+          if ! git merge-base --is-ancestor origin/master HEAD; then
+            echo 'push_result=blocked_diverged_from_origin_master' > "$RUNNER_TEMP/rustos-agent-push.env"
+            exit 1
+          fi
+          auth="$(printf 'x-access-token:%s' "$RUSTOS_PUSH_TOKEN" | base64 -w0)"
+          git -c credential.helper= \
+              -c http.https://github.com/.extraheader="AUTHORIZATION: basic $auth" \
+              push "$RUSTOS_AGENT_REPO" HEAD:master
+          printf 'push_result=%s\n' "$(git rev-parse --short=12 HEAD)" > "$RUNNER_TEMP/rustos-agent-push.env"
+
+      - name: Publish bounded result
+        if: always()
+        shell: bash
+        env:
+          RUSTOS_ISSUE_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          worktree="$RUSTOS_AGENT_WORKTREE"
+          log="$RUNNER_TEMP/rustos-agent-exec.log"
+          status="$RUNNER_TEMP/rustos-agent-status.env"
+          commit_status="$RUNNER_TEMP/rustos-agent-commit.env"
+          push_status="$RUNNER_TEMP/rustos-agent-push.env"
+          summary="$RUNNER_TEMP/rustos-agent-summary.txt"
+
+          exec_rc=setup_failed
+          exec_seconds=0
+          head=unknown
+          if [ -f "$status" ]; then
+            # shellcheck disable=SC1090
+            source "$status"
+            exec_rc="$EXEC_RC"
+            exec_seconds="$EXEC_SECONDS"
+            head="$HEAD"
+          fi
+          commit_result=not_requested
+          push_result=not_requested
+          [ ! -f "$commit_status" ] || source "$commit_status"
+          [ ! -f "$push_status" ] || source "$push_status"
+
+          {
+            echo "remote-agent result"
+            echo "run=${GITHUB_RUN_ID} rc=${exec_rc} seconds=${exec_seconds} head=${head}"
+            echo "commit=${commit_result} push=${push_result}"
+            if [ -d "$worktree/.git" ]; then
+              cd "$worktree"
+              echo "branch=$(git branch --show-current)"
+              echo 'status:'
+              git status --short | head -n 40
+            fi
+            if [ -s "$log" ]; then
+              echo 'output-tail:'
+              tail -n 80 "$log"
+            fi
+          } > "$summary"
+
+          python3 - "$summary" <<'PY'
+          import pathlib
+          import sys
+          p = pathlib.Path(sys.argv[1])
+          data = p.read_bytes()
+          if len(data) > 12288:
+              data = b'[...truncated to final 12 KiB...]\n' + data[-12288:]
+          p.write_bytes(data)
+          PY
+
+          body="$(printf '```text\n%s\n```' "$(cat "$summary")")"
+          jq -n --arg body "$body" '{body:$body}' > "$RUNNER_TEMP/rustos-agent-comment.json"
+          curl -fsS \
+            -X POST \
+            -H 'Accept: application/vnd.github+json' \
+            -H "Authorization: Bearer $RUSTOS_ISSUE_TOKEN" \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            "https://api.github.com/repos/ierwarf/rustos/issues/3/comments" \
+            --data-binary @"$RUNNER_TEMP/rustos-agent-comment.json" >/dev/null
+
+          if [ "$exec_rc" != 0 ]; then
+            exit "$exec_rc"
+          fi
