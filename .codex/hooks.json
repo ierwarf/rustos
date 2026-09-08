@@ -6,11 +6,13 @@
         "hooks": [
           {
             "type": "command",
-            "command": "serena-hooks remind --client=claude-code"
+            "command": "serena-hooks remind --client=claude-code",
+            "timeout": 3
           },
           {
             "type": "command",
-            "command": "serena-hooks auto-approve --client=claude-code"
+            "command": "serena-hooks auto-approve --client=claude-code",
+            "timeout": 3
           }
         ]
       }
@@ -20,7 +22,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "serena-hooks activate --client=claude-code"
+            "command": "serena-hooks activate --client=claude-code",
+            "timeout": 3
           }
         ]
       }
@@ -30,7 +33,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "serena-hooks cleanup --client=claude-code"
+            "command": "serena-hooks cleanup --client=claude-code",
+            "timeout": 3
           }
         ]
       }

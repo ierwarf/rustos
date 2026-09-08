@@ -1,46 +1,48 @@
 #!/usr/bin/env bash
-# Codex PreToolUse hook for the Bash tool.
+# Codex PreToolUse shell policy.
 #
-# Blocks the most common destructive shell patterns and asks the user to
-# re-issue with explicit intent. This is a safety net, not a substitute
-# for sandbox_mode or approval_policy.
+# One hook handles both destructive-command blocking and conditional pre-commit
+# gates. Keeping these in one process avoids paying two jq/bash startups for
+# every harmless shell command.
 
 set -euo pipefail
 
-INPUT="$(cat)"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
+# shellcheck source=.agents/hooks/lib.sh
+source "$SCRIPT_DIR/../../.agents/hooks/lib.sh"
 
+INPUT="$(cat)"
 cmd="$(printf '%s' "$INPUT" | jq -r '
   .tool_input.command // .tool_input.cmd //
   .arguments.command // .arguments.cmd //
   .params.command // .params.cmd // empty
 ' 2>/dev/null || true)"
 
-if [[ -z "$cmd" ]]; then
-  exit 0
-fi
-
+[[ -z "$cmd" ]] && exit 0
 trimmed_cmd="${cmd#"${cmd%%[![:space:]]*}"}"
 
 block() {
   local reason="$1"
-  jq -n --arg m "Blocked destructive command: $reason. \
-Re-issue only if the user has explicitly authorized it." \
-    '{
-      hookSpecificOutput: {
-        hookEventName: "PreToolUse",
-        permissionDecision: "deny",
-        permissionDecisionReason: $m
-      },
-      decision: "block",
-      reason: $m
-    }'
+  jq -n --arg m "$reason" '{
+    hookSpecificOutput: {
+      hookEventName: "PreToolUse",
+      permissionDecision: "deny",
+      permissionDecisionReason: $m
+    },
+    decision: "block",
+    reason: $m
+  }'
   exit 0
+}
+
+block_destructive() {
+  block "Blocked destructive command: $1. Re-issue only if the user explicitly authorized it."
 }
 
 write_protected_path_re='(^|[[:space:];|&>])(\./)?(build|target|vendor|logs)(/|[[:space:]]|$)|(^|[[:space:];|&>])(\./)?Cargo\.lock([[:space:]]|$)|(^|[[:space:];|&>])(\./)?perf\.data([[:space:]]|$)'
 
-# Read-only searches often include dangerous command text as the query. Let
-# those through unless the command chains into another shell action.
+# Pure searches may contain dangerous text as their query. Avoid false blocks
+# unless the command chains into another shell action.
 if [[ "$trimmed_cmd" =~ ^(rg|grep|git[[:space:]]+grep)[[:space:]] ]] \
   && [[ "$trimmed_cmd" != *";"* ]] \
   && [[ "$trimmed_cmd" != *"&"* ]] \
@@ -50,56 +52,96 @@ if [[ "$trimmed_cmd" =~ ^(rg|grep|git[[:space:]]+grep)[[:space:]] ]] \
   exit 0
 fi
 
-# rm -rf on anything outside /tmp
 if [[ "$cmd" =~ rm[[:space:]]+-[a-zA-Z]*r[a-zA-Z]*f ]] && [[ ! "$cmd" =~ /tmp/ ]]; then
-  block "rm -rf outside /tmp"
+  block_destructive "rm -rf outside /tmp"
 fi
-
-# Direct shell writes into generated/vendor/log paths. Build tools such as
-# cargo/xtask are allowed to write these trees through their own commands.
 if [[ "$cmd" =~ (^[[:space:]]*|[[:space:];|&])[[:alnum:]_./-]*(cp|mv|install|rsync|tee|truncate)[[:space:]] ]] \
   && [[ "$cmd" =~ $write_protected_path_re ]]; then
-  block "direct shell write to generated/vendor/log path"
+  block_destructive "direct shell write to generated/vendor/log path"
 fi
 if [[ "$cmd" =~ (^[[:space:]]*|[[:space:];|&])sed[[:space:]]+(-[^[:space:]]*i[^[:space:]]*|--in-place([=[:space:]]|$)) ]] \
   && [[ "$cmd" =~ $write_protected_path_re ]]; then
-  block "in-place sed write to generated/vendor/log path"
+  block_destructive "in-place sed write to generated/vendor/log path"
 fi
 if [[ "$cmd" =~ (>|>>)[[:space:]]*(\./)?(build|target|vendor|logs|Cargo\.lock|perf\.data)(/|[[:space:]]|$) ]]; then
-  block "redirection into generated/vendor/log path"
+  block_destructive "redirection into generated/vendor/log path"
 fi
 
-# git destructive ops
 if [[ "$cmd" =~ git[[:space:]]+reset[[:space:]]+--hard ]]; then
-  block "git reset --hard"
+  block_destructive "git reset --hard"
 fi
 if [[ "$cmd" =~ git[[:space:]]+push[[:space:]].*--force ]] || [[ "$cmd" =~ git[[:space:]]+push[[:space:]].*-f([[:space:]]|$) ]]; then
-  block "git push --force"
+  block_destructive "git push --force"
 fi
 if [[ "$cmd" =~ git[[:space:]]+clean[[:space:]]+-[a-zA-Z]*f ]]; then
-  block "git clean -f"
+  block_destructive "git clean -f"
 fi
 if [[ "$cmd" =~ git[[:space:]]+branch[[:space:]]+-D ]]; then
-  block "git branch -D"
+  block_destructive "git branch -D"
 fi
 if [[ "$cmd" =~ git[[:space:]]+checkout[[:space:]]+\. ]] || [[ "$cmd" =~ git[[:space:]]+restore[[:space:]]+\. ]]; then
-  block "git checkout/restore . (mass discard)"
+  block_destructive "git checkout/restore . (mass discard)"
 fi
 if [[ "$cmd" =~ git[[:space:]]+(checkout|restore)[[:space:]].*(AGENTS\.md|docs/ai/|\.codex/) ]]; then
-  block "discarding agent policy/hook files"
+  block_destructive "discarding agent policy/hook files"
 fi
 
-# Hook / signing bypass
 if [[ "$cmd" =~ --no-verify ]] || [[ "$cmd" =~ --no-gpg-sign ]]; then
-  block "skipping hooks or signing"
+  block_destructive "skipping hooks or signing"
 fi
 if [[ "$cmd" =~ --dangerously-bypass-hook-trust ]] || [[ "$cmd" =~ --dangerously-bypass-approvals-and-sandbox ]]; then
-  block "bypassing Codex hook trust or sandbox controls"
+  block_destructive "bypassing Codex hook trust or sandbox controls"
+fi
+if [[ "$cmd" =~ ^[[:space:]]*(sudo[[:space:]]+)?(dd|mkfs|fdisk|parted|wipefs) ]]; then
+  block_destructive "raw disk command"
 fi
 
-# Filesystem nukes
-if [[ "$cmd" =~ ^[[:space:]]*(sudo[[:space:]]+)?(dd|mkfs|fdisk|parted|wipefs) ]]; then
-  block "raw disk command"
+# Everything below is commit-only. Ordinary shell calls return after one JSON
+# parse and the cheap safety regexes above.
+if [[ ! "$cmd" =~ git[[:space:]]+commit([[:space:]]|$) ]]; then
+  exit 0
+fi
+
+REPO_ROOT="$(rustos_repo_root)"
+cd "$REPO_ROOT" 2>/dev/null || exit 0
+staged="$(git diff --cached --name-only --diff-filter=ACMR 2>/dev/null || true)"
+[[ -z "$staged" ]] && exit 0
+
+log="$(mktemp)"
+trap 'rm -f "$log"' EXIT
+
+run_gate() {
+  local label="$1"
+  local seconds="$2"
+  shift 2
+  local rc
+  if rustos_run_bounded "$seconds" "$log" "$@"; then
+    return 0
+  else
+    rc=$?
+  fi
+  block "$(rustos_compact_failure "$label" "$rc" "$log")"
+}
+
+if printf '%s\n' "$staged" | grep -Eq '\.rs$'; then
+  run_gate "cargo fmt --check" 20 cargo fmt --all -- --check
+fi
+
+# The hook bundle/formal registry selftest is relevant only when agent policy or
+# its owned validation infrastructure is actually part of the commit.
+if printf '%s\n' "$staged" | grep -Eq '^(AGENTS\.md|\.codex/|\.claude/|\.agents/|docs/ai/|tools/agent/|formal/)'; then
+  run_gate "agent hook selftest" 25 .codex/hooks/selftest.sh
+fi
+
+# Post-edit checks may be intentionally coalesced. Before a source/build-system
+# commit, validate the exact current workspace fingerprint unless that same
+# state already passed. Documentation/agent-only commits avoid this cost.
+if printf '%s\n' "$staged" | grep -Eq '(^|/)(Cargo\.toml|RUSTOS\.package\.toml)$|\.rs$|^(kernel|services|libs|apps|compat|boot|tools/xtask|driver-domains)/'; then
+  fingerprint="$(rustos_workspace_fingerprint "$REPO_ROOT")"
+  if [[ "$(rustos_read_check_stamp "$REPO_ROOT")" != "$fingerprint" ]]; then
+    run_gate "cargo xtask check" 50 cargo xtask check
+    rustos_write_check_stamp "$REPO_ROOT" "$fingerprint"
+  fi
 fi
 
 exit 0

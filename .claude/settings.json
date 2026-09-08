@@ -6,11 +6,13 @@
         "hooks": [
           {
             "type": "command",
-            "command": "serena-hooks remind --client=claude-code"
+            "command": "serena-hooks remind --client=claude-code",
+            "timeout": 3
           },
           {
             "type": "command",
-            "command": "serena-hooks auto-approve --client=claude-code"
+            "command": "serena-hooks auto-approve --client=claude-code",
+            "timeout": 3
           }
         ]
       }
@@ -22,7 +24,7 @@
           {
             "type": "command",
             "command": "\"$(git rev-parse --show-toplevel)/.agents/hooks/post_edit_rust.sh\"",
-            "timeout": 120
+            "timeout": 75
           }
         ]
       }
@@ -32,7 +34,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "serena-hooks activate --client=claude-code"
+            "command": "serena-hooks activate --client=claude-code",
+            "timeout": 3
           }
         ]
       }
@@ -42,7 +45,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "serena-hooks cleanup --client=claude-code"
+            "command": "serena-hooks cleanup --client=claude-code",
+            "timeout": 3
           }
         ]
       }

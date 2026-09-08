@@ -1,36 +1,44 @@
 #!/usr/bin/env bash
-# Shared PostToolUse hook for Edit/Write, wired from both .codex/config.toml
-# and .claude/settings.json.
+# Shared PostToolUse hook for Rust edits, wired from Codex and Claude.
 #
-# After Rust source edits, run a fast type check plus the source-contract
-# header linter so the agent loop gets immediate feedback instead of
-# discovering the break, or a missing //! contract field, much later at the
-# formal PR gate. Only runs inside the RustOS workspace; no-op elsewhere.
+# Cheap contract lint runs for each new Rust workspace state. The heavier
+# `cargo xtask check` is content-cached and coalesced during edit bursts; the
+# shell pre-commit gate rechecks any state that was skipped here.
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
+# shellcheck source=.agents/hooks/lib.sh
+source "$SCRIPT_DIR/lib.sh"
+
 INPUT="$(cat)"
+path=""
+cmd=""
+field_index=0
+while IFS= read -r -d '' field; do
+  if (( field_index == 0 )); then
+    path="$field"
+  else
+    cmd="$field"
+    break
+  fi
+  field_index=$((field_index + 1))
+done < <(printf '%s' "$INPUT" | jq -jr '
+  (.tool_input.file_path // .tool_input.relative_path //
+   .arguments.file_path // .arguments.relative_path //
+   .params.file_path // .params.relative_path // ""), "\u0000",
+  (.tool_input.command // .arguments.command // .params.command // ""), "\u0000"
+' 2>/dev/null || true)
 
-path="$(printf '%s' "$INPUT" | jq -r '
-  .tool_input.file_path // .tool_input.relative_path //
-  .arguments.file_path // .arguments.relative_path //
-  .params.file_path // .params.relative_path // empty
-' 2>/dev/null || true)"
-cmd="$(printf '%s' "$INPUT" | jq -r '
-  .tool_input.command // .arguments.command // .params.command // empty
-' 2>/dev/null || true)"
-
-REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd -P)"
+REPO_ROOT="$(rustos_repo_root)"
 case "$path" in
   /*) abs_path="$path" ;;
   "") abs_path="" ;;
   *) abs_path="$REPO_ROOT/$path" ;;
 esac
 
-# Only react to *.rs edits inside this workspace. apply_patch reports the patch
-# as tool_input.command, so parse file headers when no direct file path exists.
 case "$abs_path" in
-  "$REPO_ROOT"/*.rs|"$REPO_ROOT"/**/*.rs) ;;
+  "$REPO_ROOT"/*.rs) ;;
   *)
     if ! printf '%s\n' "$cmd" | grep -Eq '^\*\*\* (Add|Update|Delete) File: .+\.rs$'; then
       exit 0
@@ -39,50 +47,51 @@ case "$abs_path" in
 esac
 
 cd "$REPO_ROOT"
-
-# Cache only an identical worktree state. A time-only global stamp can
-# incorrectly skip a second edit, another clone, or another worktree. Hash the
-# tracked, staged, and untracked content and namespace the stamp by the
-# canonical repository path instead.
-repo_key="$(printf '%s' "$REPO_ROOT" | sha256sum | awk '{print $1}')"
-STAMP="${TMPDIR:-/tmp}/rustos-post-edit-ok-${repo_key}"
-workspace_fingerprint="$({
-  git diff --no-ext-diff --binary
-  git diff --cached --no-ext-diff --binary
-  while IFS= read -r -d '' file; do
-    printf 'untracked:%q:' "$file"
-    if [[ -L "$file" ]]; then
-      printf 'symlink:%s\n' "$(readlink -- "$file")"
-    elif [[ -f "$file" ]]; then
-      sha256sum -- "$file"
-    else
-      stat --printf='special:%F:%s:%f\n' -- "$file"
-    fi
-  done < <(git ls-files --others --exclude-standard -z)
-} | sha256sum | awk '{print $1}')"
-
-if [[ -f "$STAMP" ]] && [[ "$(cat "$STAMP" 2>/dev/null || true)" == "$workspace_fingerprint" ]]; then
+fingerprint="$(rustos_workspace_fingerprint "$REPO_ROOT")"
+stamp="$(rustos_read_check_stamp "$REPO_ROOT")"
+if [[ -n "$stamp" && "$stamp" == "$fingerprint" ]]; then
   exit 0
 fi
 
 log="$(mktemp)"
 trap 'rm -f "$log"' EXIT
 
-if ! timeout 90 cargo xtask check >"$log" 2>&1; then
-  tail="$(tail -n 40 "$log")"
-  jq -n --arg m "cargo xtask check failed (tail):
-$tail" '{systemMessage:$m}'
+emit_failure() {
+  local label="$1"
+  local rc="$2"
+  local message
+  message="$(rustos_compact_failure "$label" "$rc" "$log")"
+  jq -n --arg m "$message" '{systemMessage:$m}'
   exit 0
+}
+
+# This is intentionally first: it is cheap and catches structural contract
+# drift even when the heavier type/workspace check is coalesced.
+if rustos_run_bounded 8 "$log" python3 formal/check-rust-source-contracts.py; then
+  :
+else
+  emit_failure "source-contract lint" "$?"
 fi
 
-# Cheap (well under a second for the whole tree): catches a missing //!
-# contract header field, an undocumented critical/high boundary, or a stale
-# retired-path reference immediately, instead of only at the formal PR gate.
-if ! timeout 15 python3 formal/check-rust-source-contracts.py >"$log" 2>&1; then
-  tail="$(tail -n 40 "$log")"
-  jq -n --arg m "formal/check-rust-source-contracts.py failed (tail):
-$tail" '{systemMessage:$m}'
+# Avoid making a burst of small edits pay the full workspace check each time.
+# This is only a latency optimization: pre-commit compares the same content
+# fingerprint and runs the check if this hook did not validate the final state.
+state_dir="$(rustos_hook_state_dir "$REPO_ROOT")"
+last_path="$(rustos_last_check_path "$REPO_ROOT")"
+interval="${RUSTOS_POST_EDIT_CHECK_INTERVAL_SEC:-20}"
+now="$(date +%s)"
+last="$(cat "$last_path" 2>/dev/null || echo 0)"
+if [[ "$interval" =~ ^[0-9]+$ ]] && (( interval > 0 )) \
+  && [[ "$last" =~ ^[0-9]+$ ]] && (( now - last < interval )); then
+  printf '%s\n' "$fingerprint" >"$state_dir/xtask-check.pending"
   exit 0
 fi
+printf '%s\n' "$now" >"$last_path"
 
-printf '%s\n' "$workspace_fingerprint" >"$STAMP"
+if rustos_run_bounded 50 "$log" cargo xtask check; then
+  rustos_write_check_stamp "$REPO_ROOT" "$fingerprint"
+  rm -f "$state_dir/xtask-check.pending"
+  exit 0
+else
+  emit_failure "cargo xtask check" "$?"
+fi

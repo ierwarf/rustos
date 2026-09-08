@@ -1,204 +1,152 @@
 # AI Token Policy
 
-Mandatory operating policy for AI agents in this repo. Sub-agent rules and hook
-rules live in root `AGENTS.md`; this file owns context budget, search
-discipline, and stop rules.
+Mandatory context, discovery, output, and stop policy for RustOS agents. Hook and
+sub-agent authority lives in root `AGENTS.md`.
 
 ## 1. Route Before Reading
 
-Always read `task-router.md` before broad repo exploration.
-
-Default context set:
+Read `task-router.md` before broad exploration. Default task context is:
 
 - `task-router.md`
-- one focused AI doc selected by the router
-- 1–3 source files named by that focused doc
+- one focused AI doc selected by it
+- 1–3 source files/ranges named by that doc or a search
 
-Do not preload all AI docs or all human docs.
+Do not preload the AI/human documentation set.
 
 ## 2. Human Docs vs AI Docs
 
-Human docs (`docs/` outside `docs/ai/`) are bilingual and explanatory. AI docs
-are English-only contracts.
-
-Use human docs only when:
-
-- writing or revising prose docs
-- checking user-facing wording
-- AI contracts are missing the needed behavior
-
-For implementation routing, source ownership, stable contracts, and
-verification commands, use AI docs.
+Use `docs/ai/` for routing, ownership, stable contracts, and verification. Open
+human docs only for user-facing prose or when the AI contract lacks required
+behavior.
 
 ## 3. Search Before Opening
 
-Prefer symbol-aware search (Serena MCP) and scoped text search (ripgrep MCP)
-over opening files. Read only exact line ranges or focused files after the
-search identifies them. Avoid opening files over ~500 lines from the top
-unless the task is a full-file review.
+Prefer Serena symbol search and scoped ripgrep over file dumps. For files over
+~500 lines, search first and read one focused range at a time. Default focused
+reads are <=200 lines.
 
-For files over ~500 lines: search first, open one focused range, summarize
-findings before opening another range.
+Gather known independent evidence together: **batch 3–10 independent operations**
+when possible, then reason once. Model/tool round trips usually cost more than a
+few hundred extra characters in one focused result.
 
-Gather independent evidence in batches. When three or more known searches,
-symbol reads, diagnostics, or test commands do not depend on one another, issue
-them in one orchestrated call and reason once over the combined result. Reducing
-model/tool round trips has priority over saving a few hundred characters from a
-single focused result.
+## 4. AI Docs Are Pointers
 
-## 4. AI Docs Are Pointers, Not Essays
-
-AI docs point to canonical source files and stable contracts.
-
-Do: list exact source paths, stable enum/value names, generated output paths,
-verification commands.
-
-Do not: duplicate bilingual human docs, paste large source excerpts, explain
-background architecture unless it changes routing decisions.
+Keep AI docs contractual: exact owner paths, stable symbols/values, generated
+paths, and verification commands. Do not duplicate explanatory architecture or
+large source excerpts.
 
 ## 5. Fast Implementation Over Extended Reasoning
 
-Default to a short reasoning pass, then make the smallest source change that
-satisfies the task. Do not produce broad theory, long option lists, or
-exhaustive subsystem analysis when the scope is already clear.
+When scope is clear, do a short reasoning pass, make the smallest correct edit,
+and run the narrow validation. Reserve extended reasoning for debugging,
+security/structural review, or explicit design choices.
 
-Do: identify the narrow owner file or contract, state the concrete edit target
-if needed, implement, validate with the smallest relevant command.
-
-Reserve extended reasoning for debugging, failure analysis, structural review,
-security review, or explicit design decisions. For debugging, reason from
-symptoms, command output, logs, or probes before editing.
-
-After edits, use `cargo xtask dev-plan` instead of reconstructing the
-changed-file validation matrix from prose. Run the listed `now` checks during
-the edit loop. Defer `stable-batch` DVM rebuild and KVM preparation until the
-related change set settles, then run that batch once. `dev-plan` only selects
-commands; a printed command is never evidence that the command passed.
+After edits run `cargo xtask dev-plan`; execute its `now` lanes during the edit
+loop and batch `stable-batch` work once after the change set settles. A printed
+plan is not validation evidence.
 
 ## 6. OS Debugging Stop Rule
 
-Do not drift into speculative patches. If execution is blocked by a structural
-inconsistency, missing ownership boundary, missing probe, unavailable runtime
-evidence, or a fix that would only guess at the cause — stop changing code and
-report:
-
-- observed symptom
-- last trustworthy evidence
-- structural blocker
-- exact next evidence or owner needed
-
-Do not fabricate a success path, add broad fallbacks, or harden nearby code
-just because the original path is unclear.
+Do not patch speculatively. If blocked by missing runtime evidence, ownership,
+probe coverage, or a structural inconsistency, stop and report the observed
+symptom, last trustworthy evidence, blocker, and exact next evidence/owner.
+Never invent a success path or broad fallback.
 
 ## 7. Risk-Weighted Hardening
 
-Harden highest-risk surfaces first:
-
-- app-visible ABI and Linux ELF / Windows PE compatibility
-- privilege, capability, broker, and namespace boundaries
-- memory mapping, user-copy, handle-transfer, and lifetime checks
-- scheduler, lock ordering, IRQ-off, wait, and timeout behavior
-- boot, launch, service ownership, provider ordering, driver loading
-- filesystem, network, input, display, block-device mutation paths
-
-Avoid hardening low-risk helpers, cosmetic paths, or unrelated code unless
-asked. Every hardening change should name the risk it reduces and use the
-narrowest source boundary that can enforce it.
+Prioritize app-visible ABI, privilege/capability boundaries, memory/user-copy,
+handle lifetime, scheduler/locking/timeout behavior, boot/service ordering, and
+mutable I/O paths. Avoid unrelated defensive churn. Name the risk reduced and
+enforce it at the narrowest owner boundary.
 
 ## 8. Update AI Contracts When Behavior Changes
 
-If a change modifies any of the following, update `contracts-infra.md`,
-`contracts-abi.md`, or the focused AI map in the same change:
-
-- package manifest schema
-- xtask command behavior
-- generated registry path or field contract
-- logging category/level behavior
-- kernel `api.rs` boundary
-- runtime socket/protocol behavior
-- docs navigation or AI routing
+Update the owning AI contract in the same change when package schema, xtask
+behavior, registry fields/paths, logging behavior, kernel `api.rs` boundaries,
+runtime protocols, or AI routing changes. Prefer manifests/registries/protocol
+state over ad-hoc hardcoded policy.
 
 ## 9. Avoid Ad Hoc And Hardcoded Policy
 
-Prefer manifest fields, registries, protocol state, and existing subsystem
-APIs over ad hoc branches or hardcoded names, paths, priorities, ordering. If
-a temporary hardcoded fallback is unavoidable, keep it narrow, document the
-source of truth it stands in for, and route future behavior through the
-stable contract.
+Use existing subsystem APIs and declared sources of truth. If a temporary
+hardcoded fallback is unavoidable, keep it local and document what canonical
+state will replace it.
 
 ## 10. Generated And Vendor Paths
 
-Do not inspect these unless the task explicitly involves generated output or
-external binary inputs: `build/`, `target/`, `logs/`, `vendor/`, `perf.data`,
-`Cargo.lock`.
+Do not inspect `build/`, `target/`, `logs/`, `vendor/`, `perf.data`, or
+`Cargo.lock` unless the task requires it. Narrow exceptions:
 
-Allowed exceptions (inspect the narrowest file/path possible):
+- KVM/debug failure -> focused `build/kvm/` or bounded matching log lines.
+- Stage verification -> focused `build/image/system/registry/`.
+- Firmware/module packaging -> the specific `vendor/` artifact.
+- Dependency resolution -> search `Cargo.lock`, then read only the matching range.
 
-- KVM/debug failure investigation → `build/kvm/`.
-- Stage verification → `build/image/system/registry/`.
-- Firmware/module packaging → specific `vendor/` paths.
-- Dependency resolution work → focused `Cargo.lock` snippets via `rg` first.
+## 11. Logs And Command Output
 
-## 11. Logs
+Never read whole logs. Search with both match and line bounds or use a short tail.
+Verbose commands write full output to a task-local temporary file.
 
-Never read whole log files. Preferred:
-
-- `tail -n 120 logs/debugcon.log` for approved log exceptions.
-- scoped search for `panic|error|failed|DisplayUnavailable` in the relevant log.
-- focused source reads for exact `START..END` ranges after search.
-
-Avoid opening `Cargo.lock` unless dependency resolution changed. Search for
-`crate-name` before reading a focused range.
-
-Build and test commands must use a quiet-success wrapper when their normal
-output is verbose. Capture complete output in a task-specific temporary file.
-If the command passes, expose only its exit status and bounded `test result` or
-gate summary lines. If it fails, expose the first relevant diagnostic and at
-most 120 trailing lines. Searches over KVM, serial, and debug logs must set both
-a match bound (for example `rg -m 30`) and a line/tail bound.
+On success expose only exit status plus bounded gate/test summary lines. On
+failure expose the first useful diagnostic and **at most 32 trailing lines or
+6 KiB**, whichever is smaller. If that is insufficient, search the captured log
+for the failing symbol/stage; only then expand up to the repository hard ceiling
+of 120 trailing lines. Do not dump a full build, KVM, serial, or debug log into
+model context.
 
 ## 12. Prompt Cache Hygiene
 
-Prompt caching depends on an exact reusable prefix. Treat this as the stable
-prefix, in order:
+Keep this reusable prefix exact and ordered:
 
 1. `AGENTS.md`
 2. `docs/ai-map.md`
 3. `docs/ai/token-policy.md`
 4. `docs/ai/task-router.md`
-5. one focused `docs/ai/*` file selected by the router
+5. one router-selected focused `docs/ai/*` file
 
-Put user task text, command output, logs, and file snippets *after* that
-prefix. Do not rewrite stable instruction text mid-session. Do not cache logs
-or broad source dumps.
+Task text, command output, logs, and source snippets come after it. Documents
+already supplied in live context count as read. **Do not reread unchanged bootstrap documents**. After compaction, recover only the needed router/handoff
+range and volatile facts; do not replay prior evidence.
 
-Documents already supplied in the live context count as read. In particular,
-do not reopen environment-supplied `AGENTS.md`. After compaction or continuation,
-use headings/search first and read only the relevant router, policy, or
-`session-handoff.md` range unless the file changed.
+## 13. Round-Trip And Progressive-Disclosure Budget
 
-## 13. Round-Trip And Discovery Budget
+1. Plan the evidence set before tool calls; batch known independent operations.
+2. Start code/path searches at 8–20 results. Increase only when unresolved.
+3. Read symbols/ranges, not whole large files. Avoid repeatedly reopening the
+   same unchanged range.
+4. **Never emit full `ALL_TOOLS` objects** or bulk tool descriptions. Search
+   names only, then inspect at most two exact descriptions capped at 2,000
+   characters each.
+5. Known source namespaces are `mcp__serena__*`, `mcp__ast_grep__*`, and
+   `mcp__codegraph__codegraph_*`; do not rediscover their schemas mid-session.
+6. For diffs, inspect names/stat first; request only relevant hunks unless a
+   complete diff is itself the task.
+7. Do not restate the same evidence after every tool result. Keep a short delta
+   summary and carry only facts that affect the next decision.
+8. At an architectural milestone refresh the short session handoff and use a
+   fresh context when available instead of repeatedly filling huge windows.
 
-The dominant cost in a long repository task is repeatedly reprocessing a large
-context, not the size of one small lookup. Apply these rules by default:
+These limits never weaken the Serena/ast-grep/CodeGraph edit gate, formal
+validation, failure diagnosis, or required runtime acceptance.
 
-1. Plan an evidence set before calling tools; batch 3–10 independent operations.
-2. Do not interleave one-symbol lookup and model reasoning when the next lookups
-   are already known.
-3. Never emit full `ALL_TOOLS` objects or bulk descriptions. Search names only,
-   then inspect at most two exact descriptions capped at 2,000 characters each.
-4. Call the known RustOS source tools by namespace:
-   `mcp__serena__*`, `mcp__ast_grep__*`, and
-   `mcp__codegraph__codegraph_*`.
-5. Keep success-path command output to exit status and bounded summary lines;
-   expand diagnostics only after failure.
-6. Do not reread unchanged bootstrap documents already present in context.
-7. At a completed architectural milestone, refresh the short session handoff
-   and continue in a fresh context when available instead of carrying a task to
-   repeated 200K-token windows.
-8. A compaction is not permission to rediscover known tool schemas or replay
-   earlier evidence. Resume from the compacted state and verify only volatile
-   facts.
+## 14. Hook And Timeout Budget
 
-These constraints must not weaken the Serena/ast-grep/CodeGraph source-editing
-gate, failure diagnostics, formal evidence, or required runtime acceptance.
+Hooks are part of the token/latency budget:
+
+- allow/success paths are silent; only blocks/failures inject model-visible text;
+- failure payloads target <=4 KiB and contain one primary diagnostic plus a tiny
+  tail; the full log stays out of context;
+- duplicate validation is cached by an exact content fingerprint, never by a
+  time-only success stamp;
+- expensive PostToolUse checks may coalesce a short edit burst only when the
+  pre-commit gate verifies the final fingerprint before source/build commits;
+- external hook helpers use explicit short deadlines;
+- bounded commands receive TERM first and KILL after a short grace period;
+- an inner command deadline must leave >=10 seconds of margin before its outer
+  hook deadline when the hook may do additional work;
+- report `timeout` separately from ordinary command failure so agents do not
+  waste turns diagnosing a nonexistent compiler/test error.
+
+Do not respond to a timeout by blindly increasing every deadline. First decide
+whether the command is a fast interactive gate, a stable-batch gate, or a
+runtime/benchmark lane and move long work out of synchronous hooks when needed.
