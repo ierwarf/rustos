@@ -6,14 +6,14 @@
 //! - **Lifecycle:** Admit a deduplicated slot, retain it across fairness,
 //!   dispatch FIFO, or remove it during exact slot retirement.
 //! - **Concurrency:** lifecycle publication uses the catalog guard, while each
-//!   handoff queue and fairness streak belongs to the target logical CPU.
+//!   handoff queue and execution-chain budget belongs to the target logical CPU.
 //! - **Failure:** Impossible queue capacity panics instead of losing authority.
 //! - **Forbidden:** No allocation, overwrite, class fabrication, or stale-slot
 //!   transfer.
 //! - **Evidence:** `atomic-process-activation-batch`,
 //!   `bootstrap-activation-handoff`, and `synchronous-ipc-handoff`.
 
-use super::{CpuDispatchGuard, MAX_ATOMIC_ACTIVATION_HANDOFFS, Scheduler, sync_handoff};
+use super::{CpuDispatchGuard, MAX_ATOMIC_ACTIVATION_HANDOFFS, Scheduler, runqueue, sync_handoff};
 
 impl Scheduler {
     /// Publishes the geometry and contents behind a rejected activation frame.
@@ -415,9 +415,15 @@ impl Scheduler {
     pub(super) fn take_next_synchronous_pick_hint_ready_slot(&self) -> Option<usize> {
         let cpu = Self::current_dispatch_cpu();
         #[cfg(test)]
-        return self.sync_handoff_states[cpu]
-            .lock()
-            .take_next_ready(|record| self.synchronous_handoff_record_is_ready(record));
+        {
+            let fair_competitor_ready = runqueue::local_runnable_slots(cpu)
+                .any(|slot| self.is_fair_candidate_slot(slot) && self.slot_is_runnable(slot));
+            return self.sync_handoff_states[cpu]
+                .lock()
+                .take_next_ready_with_competitor(fair_competitor_ready, |record| {
+                    self.synchronous_handoff_record_is_ready(record)
+                });
+        }
         #[cfg(not(test))]
         {
             // The guarded call below still decides; this only answers whether
@@ -430,22 +436,29 @@ impl Scheduler {
                 );
                 return None;
             }
-            sync_handoff::take_next_ready(cpu, |record| {
+            // Direct-handoff and currently-running owners are absent from the
+            // local runnable bitmap. A non-idle entry here is therefore real
+            // work outside the synchronous IPC execution chain. Only inspect
+            // it after the one-sided pending hint says a handoff exists, so
+            // ordinary dispatches do not inherit an O(local-runnable) scan.
+            let fair_competitor_ready = runqueue::local_runnable_slots(cpu)
+                .any(|slot| self.is_fair_candidate_slot(slot) && self.slot_is_runnable(slot));
+            sync_handoff::take_next_ready(cpu, fair_competitor_ready, |record| {
                 self.synchronous_handoff_record_is_ready(record)
             })
         }
     }
 
-    pub(super) fn record_synchronous_handoff(&mut self, synchronous_handoff: bool) {
+    pub(super) fn record_synchronous_handoff(&mut self, synchronous_handoff: bool, now_ticks: u64) {
         let cpu = Self::current_dispatch_cpu();
         #[cfg(test)]
         {
             self.sync_handoff_states[cpu]
                 .lock()
-                .record_dispatch(synchronous_handoff);
+                .record_dispatch(synchronous_handoff, now_ticks);
         }
         #[cfg(not(test))]
-        sync_handoff::record_dispatch(cpu, synchronous_handoff);
+        sync_handoff::record_dispatch(cpu, synchronous_handoff, now_ticks);
     }
 
     #[cfg(test)]

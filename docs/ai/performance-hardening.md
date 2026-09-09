@@ -133,10 +133,11 @@ migrations fall without unfair ready-age growth before this becomes accepted
 as a useful optimization.
 The serialized SMP scheduler returns an exact source/destination-slot token.
 When both slots are equal, the IRQ leaf retains the already-active
-CR3/TSS/syscall-stack/segment/FS/GS state; a real slot change restores all of
-it. Address-space activation also preserves the TLB for an identical
-release-published root, while AP Online admission and generation-bound
-shootdowns keep their mandatory flushes. Do not skip SIMD restore merely
+CR3/TSS/syscall-stack/segment/FS/GS state. A real slot change restores the
+task-specific stack and segment state, but reloads CR3 only when the incoming
+address-space root differs from the outgoing root. Address-space activation
+also preserves the TLB for an identical release-published root, while AP Online
+admission and generation-bound shootdowns keep their mandatory flushes. Do not skip SIMD restore merely
 because the task slot stayed equal: ring0 compiler code executes after the
 save boundary and may use vector registers.
 When software scheduler entries dominate timer, RTC, and reschedule-IPI

@@ -487,8 +487,9 @@ pub(in crate::multitask) enum SyncHandoffMissReason {
     /// caught by the fast `pending()` check before any lock is taken.
     QueueEmpty = 0,
     /// The queue may hold a ready record, but this CPU's consecutive-hit
-    /// streak already reached `MAX_CONSECUTIVE_SYNC_HANDOFFS`.
-    StreakCapped = 1,
+    /// execution-chain budget reached `MAX_SYNC_HANDOFF_CHAIN_TICKS` while a
+    /// fair competitor was ready.
+    ChainBudgetExhausted = 1,
     /// The consume loop held records and discarded every one of them as
     /// stale. See `SyncHandoffStaleReason` for which check rejected each.
     DrainedStale = 2,

@@ -72,6 +72,8 @@ fn architectural_restore_is_required_exactly_for_a_task_switch() {
 
     let switched = SchedulerDispatch::new(0x2000, 119, 7, 9);
     assert!(switched.requires_architectural_restore());
+    assert!(!switched.requires_address_space_restore(0x1234_0000, 0x1234_0000));
+    assert!(switched.requires_address_space_restore(0x1234_0000, 0x5678_0000));
 }
 
 #[test]

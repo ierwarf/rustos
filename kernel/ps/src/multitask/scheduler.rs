@@ -24,6 +24,7 @@
 //!   `syscall-simd-lifecycle`.
 mod address_space_root;
 mod affinity;
+mod architecture;
 mod block_reason;
 pub use affinity::{AffinityCommit, AffinityError, ProcessAffinitySnapshot};
 pub(in crate::multitask) use block_reason::BlockReason;
@@ -92,9 +93,7 @@ use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU8, Ordering};
 use core::{mem, ptr};
 
-use x86_64::instructions::segmentation::{DS, ES, FS, GS, Segment};
 use x86_64::registers::model_specific::FsBase;
-use x86_64::structures::gdt::SegmentSelector;
 use x86_64::{PhysAddr, VirtAddr};
 
 use kernel_object::api::identity::ObjectIdentity;
@@ -310,7 +309,12 @@ const MAX_CONSECUTIVE_SYSTEM_DISPATCHES: u8 = 2;
 /// A task that slept on a real event may bypass ready System work for one
 /// wakeup turn. Cap the burst so many sleepers cannot starve the critical lane.
 const MAX_CONSECUTIVE_LATENCY_HANDOFFS: u8 = 8;
-const MAX_CONSECUTIVE_SYNC_HANDOFFS: u8 = 8;
+/// Maximum scheduler-clock quanta that one synchronous IPC execution chain
+/// may retain direct-handoff priority while unrelated fair work is ready.
+/// Charging elapsed time rather than message count makes the bound independent
+/// of RPC granularity: tiny call/reply pairs do not manufacture artificial
+/// preemptions, while a busy chain still yields after about 7.8 ms at 1024 Hz.
+const MAX_SYNC_HANDOFF_CHAIN_TICKS: u8 = 8;
 const READY_VALIDATION_INTERVAL_TURNS: u8 = 32;
 /// An atomically published startup cohort receives one bounded first-turn
 /// prefix before the reply chain that resumes its loader/supervisor. This is
@@ -510,6 +514,19 @@ impl SchedulerDispatch {
 
     const fn requires_architectural_restore(self) -> bool {
         self.previous_slot != self.next_slot
+    }
+
+    /// A task switch only requires a CR3 activation when it also crosses an
+    /// address-space boundary. Threads in one process still need their TSS,
+    /// syscall-stack, and TLS state restored, but replaying the same CR3 is a
+    /// serializing TLB operation on every synchronous IPC handoff.
+    const fn requires_address_space_restore(
+        self,
+        previous_address_space_root: u64,
+        next_address_space_root: u64,
+    ) -> bool {
+        self.requires_architectural_restore()
+            && previous_address_space_root != next_address_space_root
     }
 }
 
@@ -3828,7 +3845,8 @@ impl Scheduler {
         //  1. The bounded first-turn prefix of one atomically activated
         //     startup cohort. The loader reply is already committed and may
         //     wait for at most the ABI-bounded eight sibling turns.
-        //  2. One synchronous IPC handoff, bounded by an eight-turn burst.
+        //  2. One synchronous IPC handoff, charged to an eight-tick execution
+        //     context budget while unrelated fair work is ready.
         //     This is either the receiver required by a newly live reply
         //     capability or the caller awakened by its completion; unrelated
         //     overdue work must not turn that transaction into inversion.
@@ -4029,7 +4047,7 @@ impl Scheduler {
                     self.record_runtime_profile_dispatch(next_idx);
                     self.record_runtime_profile_transition(current_slot, next_idx, dispatch_cpu);
                     self.record_task_dispatch_cpu(next_idx, dispatch_cpu);
-                    self.record_synchronous_handoff(sync_handoff_pick);
+                    self.record_synchronous_handoff(sync_handoff_pick, now_ticks);
                     self.set_current_task_slot(next_idx);
                     let next_task_id = self.starts[next_idx]
                         .map(|start| start.id)
@@ -4218,119 +4236,6 @@ impl Scheduler {
 
     pub(super) fn current_process_handle(&self) -> Option<ProcessHandle> {
         self.contexts[self.current_task_slot()]?.process_handle
-    }
-
-    fn install_current_task_architecture(
-        &mut self,
-        current_slot: usize,
-        current: TaskContext,
-        return_to_user: bool,
-        arch_marker: &mut u64,
-    ) {
-        crate::memory::paging::load_address_space_phys(PhysAddr::new(
-            self.slot_address_space_root(current_slot),
-        ));
-        let (_, kernel_stack_top) = self.slot_kernel_stack_bounds(current_slot);
-        self.mark_phase(SchedulerPhase::ArchAddressSpace, arch_marker);
-        if kernel_stack_top != 0 {
-            assert_eq!(
-                kernel_stack_top & 0xF,
-                0,
-                "scheduler selected a kernel stack top that violates the x86_64 SysV ABI"
-            );
-            crate::arch::gdt::set_privilege_stack(kernel_stack_top);
-            crate::user::syscall::set_kernel_stack_top(kernel_stack_top);
-        }
-
-        let fs_base = self.slot_tls_fs_base(current_slot);
-        let user_gs_base = current
-            .windows_thread_state
-            .map(|state| state.teb_address)
-            .unwrap_or(0);
-        let data_selector = if return_to_user {
-            SegmentSelector(0)
-        } else {
-            crate::arch::gdt::kernel_data_selector()
-        };
-        let data_selectors_match = DS::get_reg() == data_selector
-            && ES::get_reg() == data_selector
-            && FS::get_reg() == data_selector
-            && GS::get_reg() == data_selector;
-        if !data_selectors_match {
-            unsafe {
-                DS::set_reg(data_selector);
-                ES::set_reg(data_selector);
-                FS::set_reg(data_selector);
-                GS::set_reg(data_selector);
-            }
-        }
-        FsBase::write(VirtAddr::new(fs_base));
-        crate::user::syscall::prepare_for_context_return(return_to_user, user_gs_base);
-        self.mark_phase(SchedulerPhase::ArchSegments, arch_marker);
-    }
-
-    /// Refreshes the architectural user-return contract for a live exception
-    /// continuation after it resumes from a blocking scheduler handoff.
-    /// The continuation is already executing, so no catalog saved frame is
-    /// revalidated or consumed here.
-    pub(in crate::multitask) fn refresh_current_user_return_architecture(&mut self) {
-        let current_slot = self.current_task_slot();
-        let current = self.contexts[current_slot]
-            .expect("pager resume selected a missing current task context");
-        assert!(
-            current.user_mode,
-            "pager resume architecture refresh requires a user-owned kernel continuation"
-        );
-        let mut arch_marker = Self::phase_chain_start();
-        self.install_current_task_architecture(current_slot, current, true, &mut arch_marker);
-    }
-
-    pub(in crate::multitask) fn prepare_current_task_execution(&mut self) {
-        let mut arch_marker = Self::phase_chain_start();
-        let current_slot = self.current_task_slot();
-        let current =
-            self.contexts[current_slot].expect("scheduler selected a missing task context");
-        self.assert_current_task_affinity_allows_dispatch();
-        let (task_mask, process_mask, _) = self.slot_affinity_snapshot(current_slot);
-        self.replace_slot_affinity(current_slot, task_mask, process_mask, false);
-        let return_to_user = self.context_returns_to_user(current_slot);
-        self.validate_saved_context(
-            current_slot,
-            current.user_mode,
-            self.slot_saved_rsp(current_slot),
-        )
-        .expect("scheduler selected an invalid task context");
-        self.mark_phase(SchedulerPhase::ArchValidate, &mut arch_marker);
-        self.install_current_task_architecture(
-            current_slot,
-            current,
-            return_to_user,
-            &mut arch_marker,
-        );
-    }
-
-    /// Restore task-specific architectural state only across a real task
-    /// switch. Same-task scheduler turns retain the already-active CR3, TSS,
-    /// syscall stack, segment state, and FS/GS bases. The SIMD image remains
-    /// restored by every IRQ leaf because compiler-generated kernel code may
-    /// use vector registers after the save boundary.
-    pub(super) fn prepare_dispatched_task_execution(&mut self, dispatch: SchedulerDispatch) {
-        let mut phase_marker = Self::phase_chain_start();
-        assert_eq!(
-            self.current_task_slot(),
-            dispatch.next_slot,
-            "scheduler invariant: architecture restore token does not name current task"
-        );
-        if !dispatch.requires_architectural_restore() {
-            assert_eq!(
-                dispatch.previous_slot, dispatch.next_slot,
-                "scheduler invariant: same-task restore token changed slot identity"
-            );
-            self.mark_phase(SchedulerPhase::ArchRestore, &mut phase_marker);
-            return;
-        }
-        self.prepare_current_task_execution();
-        self.mark_phase(SchedulerPhase::ArchRestore, &mut phase_marker);
     }
 
     pub(super) fn reap_inactive_retired_slots(&mut self) -> Option<RetiredSlotReclaim> {

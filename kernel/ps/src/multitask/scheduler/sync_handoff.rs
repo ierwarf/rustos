@@ -17,13 +17,14 @@
 //! - **Failure:** stale identity/generation/CPU/state loses urgency, while
 //!   overflow or corrupt prefix fails at the exact bounded invariant.
 //! - **Forbidden:** no generic fallback, custody downgrade, second runnable
-//!   owner, remote runqueue mutation, allocation, or unbounded burst.
+//!   owner, remote runqueue mutation, allocation, or unbounded burst while a
+//!   fair competitor is ready.
 //! - **Evidence:** `synchronous-ipc-handoff/SynchronousIpcHandoff`, exact
 //!   implementation mutants, host witnesses, and the SMP KVM matrix.
 
 use nucleus_core::util::lockdep::{LockClass, MAX_TRACKED_CPUS, TrackedSpinLock};
 
-use super::{MAX_CONSECUTIVE_SYNC_HANDOFFS, MAX_TASK, runqueue};
+use super::{MAX_SYNC_HANDOFF_CHAIN_TICKS, MAX_TASK, runqueue};
 
 pub(super) type SyncHandoffLock =
     TrackedSpinLock<SyncHandoffState, { LockClass::SchedulerPolicy as u8 }>;
@@ -221,6 +222,7 @@ pub(super) struct SyncHandoffState {
     head: usize,
     len: usize,
     handoff_streak: u8,
+    last_handoff_tick: u64,
 }
 
 impl SyncHandoffState {
@@ -230,6 +232,7 @@ impl SyncHandoffState {
             head: 0,
             len: 0,
             handoff_streak: 0,
+            last_handoff_tick: 0,
         }
     }
 
@@ -258,12 +261,20 @@ impl SyncHandoffState {
 
     pub(super) fn take_next_ready(
         &mut self,
+        ready: impl FnMut(SyncHandoffRecord) -> bool,
+    ) -> Option<usize> {
+        self.take_next_ready_with_competitor(true, ready)
+    }
+
+    pub(super) fn take_next_ready_with_competitor(
+        &mut self,
+        fair_competitor_ready: bool,
         mut ready: impl FnMut(SyncHandoffRecord) -> bool,
     ) -> Option<usize> {
-        if self.handoff_streak >= MAX_CONSECUTIVE_SYNC_HANDOFFS {
+        if fair_competitor_ready && self.handoff_streak >= MAX_SYNC_HANDOFF_CHAIN_TICKS {
             #[cfg(rustos_scheduler_phase_profile)]
             super::locality::record_sync_handoff_miss(
-                super::locality::SyncHandoffMissReason::StreakCapped,
+                super::locality::SyncHandoffMissReason::ChainBudgetExhausted,
             );
             return None;
         }
@@ -294,14 +305,26 @@ impl SyncHandoffState {
         None
     }
 
-    pub(super) fn record_dispatch(&mut self, synchronous_handoff: bool) {
-        self.handoff_streak = if synchronous_handoff {
-            self.handoff_streak
-                .saturating_add(1)
-                .min(MAX_CONSECUTIVE_SYNC_HANDOFFS)
-        } else {
-            0
-        };
+    pub(super) fn record_dispatch(&mut self, synchronous_handoff: bool, now_ticks: u64) {
+        if !synchronous_handoff {
+            self.handoff_streak = 0;
+            self.last_handoff_tick = 0;
+            return;
+        }
+        let now_ticks = now_ticks.max(1);
+        if self.last_handoff_tick == 0 {
+            self.handoff_streak = 1;
+            self.last_handoff_tick = now_ticks;
+            return;
+        }
+        let elapsed = now_ticks.saturating_sub(self.last_handoff_tick);
+        if elapsed != 0 {
+            self.handoff_streak = self
+                .handoff_streak
+                .saturating_add(u8::try_from(elapsed).unwrap_or(u8::MAX))
+                .min(MAX_SYNC_HANDOFF_CHAIN_TICKS);
+            self.last_handoff_tick = now_ticks;
+        }
     }
 
     pub(super) fn remove_slot(&mut self, slot: usize) {
@@ -334,6 +357,7 @@ impl SyncHandoffState {
     #[cfg(test)]
     pub(super) fn set_handoff_streak(&mut self, handoff_streak: u8) {
         self.handoff_streak = handoff_streak;
+        self.last_handoff_tick = (handoff_streak != 0) as u64;
     }
 }
 
@@ -370,18 +394,23 @@ fn state_for_cpu(cpu: usize) -> &'static SyncHandoffLock {
 static SYNC_HANDOFF_PENDING: [core::sync::atomic::AtomicBool; MAX_TRACKED_CPUS] =
     [const { core::sync::atomic::AtomicBool::new(false) }; MAX_TRACKED_CPUS];
 
-/// Per-CPU fairness streak for the production dispatcher.
+/// Per-CPU consumed scheduling-clock quanta and last charge point for the
+/// production dispatcher's synchronous IPC execution chain.
 ///
 /// Only that CPU's interrupt-disabled scheduler transaction reads or writes
 /// its element. Keeping the scalar outside `SyncHandoffState` avoids taking
 /// the FIFO lock a second time after every selection merely to update one
 /// byte; atomics also make reset publication explicit without weakening the
-/// bounded eight-turn rule.
+/// bounded eight-tick execution-context budget.
 // ORDERING: One interrupt-disabled scheduler transaction owns each CPU-local
 // streak. Relaxed accesses preserve the local bound; reset release only
 // publishes the cleared diagnostic/scheduling state to a later owner.
 static SYNC_HANDOFF_STREAK: [core::sync::atomic::AtomicU8; MAX_TRACKED_CPUS] =
     [const { core::sync::atomic::AtomicU8::new(0) }; MAX_TRACKED_CPUS];
+// ORDERING: This timestamp is part of the same single-owner CPU-local budget
+// state as the streak above; no cross-CPU publication edge is carried by it.
+static SYNC_HANDOFF_LAST_TICK: [core::sync::atomic::AtomicU64; MAX_TRACKED_CPUS] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_TRACKED_CPUS];
 
 /// Enqueue into one target FIFO and advertise it to that CPU's dispatcher.
 fn enqueue_and_publish(target_cpu: usize, record: SyncHandoffRecord) -> bool {
@@ -459,14 +488,16 @@ pub(super) fn enqueue_reply_wake(token: ReplyWakeHandoff) -> bool {
 #[cfg(not(test))]
 pub(super) fn take_next_ready(
     cpu: usize,
+    fair_competitor_ready: bool,
     ready: impl FnMut(SyncHandoffRecord) -> bool,
 ) -> Option<usize> {
-    if SYNC_HANDOFF_STREAK[cpu].load(core::sync::atomic::Ordering::Relaxed)
-        >= MAX_CONSECUTIVE_SYNC_HANDOFFS
+    if fair_competitor_ready
+        && SYNC_HANDOFF_STREAK[cpu].load(core::sync::atomic::Ordering::Relaxed)
+            >= MAX_SYNC_HANDOFF_CHAIN_TICKS
     {
         #[cfg(rustos_scheduler_phase_profile)]
         super::locality::record_sync_handoff_miss(
-            super::locality::SyncHandoffMissReason::StreakCapped,
+            super::locality::SyncHandoffMissReason::ChainBudgetExhausted,
         );
         return None;
     }
@@ -474,7 +505,7 @@ pub(super) fn take_next_ready(
     // The production fairness owner is `SYNC_HANDOFF_STREAK`; the field in
     // `SyncHandoffState` is the identical isolated host-fixture state machine.
     debug_assert_eq!(state.handoff_streak, 0);
-    let taken = state.take_next_ready(ready);
+    let taken = state.take_next_ready_with_competitor(fair_competitor_ready, ready);
     // Clear on any queue this CPU has just seen empty under the lock,
     // including one a successful take emptied. The one-sided invariant is
     // unchanged and the proof is the same: an enqueue publishes `true` only
@@ -482,7 +513,7 @@ pub(super) fn take_next_ready(
     // has no completed insert to strand. Restricting the clear to `None`
     // results left the flag set after every take that emptied the FIFO, so the
     // next dispatch paid this lock only to read `len == 0` -- the exact
-    // acquisition `pending()` exists to avoid. A capped handoff streak still
+    // acquisition `pending()` exists to avoid. An exhausted chain budget still
     // returns with records queued, and `state.len == 0` declines to clear
     // there.
     if state.len == 0 {
@@ -497,17 +528,30 @@ pub(super) fn take_next_ready(
 }
 
 #[cfg(not(test))]
-pub(super) fn record_dispatch(cpu: usize, synchronous_handoff: bool) {
+pub(super) fn record_dispatch(cpu: usize, synchronous_handoff: bool, now_ticks: u64) {
     let streak = &SYNC_HANDOFF_STREAK[cpu];
-    let next = if synchronous_handoff {
-        streak
+    let last_tick = &SYNC_HANDOFF_LAST_TICK[cpu];
+    if !synchronous_handoff {
+        streak.store(0, core::sync::atomic::Ordering::Relaxed);
+        last_tick.store(0, core::sync::atomic::Ordering::Relaxed);
+        return;
+    }
+    let now_ticks = now_ticks.max(1);
+    let previous_tick = last_tick.load(core::sync::atomic::Ordering::Relaxed);
+    if previous_tick == 0 {
+        streak.store(1, core::sync::atomic::Ordering::Relaxed);
+        last_tick.store(now_ticks, core::sync::atomic::Ordering::Relaxed);
+        return;
+    }
+    let elapsed = now_ticks.saturating_sub(previous_tick);
+    if elapsed != 0 {
+        let next = streak
             .load(core::sync::atomic::Ordering::Relaxed)
-            .saturating_add(1)
-            .min(MAX_CONSECUTIVE_SYNC_HANDOFFS)
-    } else {
-        0
-    };
-    streak.store(next, core::sync::atomic::Ordering::Relaxed);
+            .saturating_add(u8::try_from(elapsed).unwrap_or(u8::MAX))
+            .min(MAX_SYNC_HANDOFF_CHAIN_TICKS);
+        streak.store(next, core::sync::atomic::Ordering::Relaxed);
+        last_tick.store(now_ticks, core::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 #[cfg(not(test))]
@@ -525,13 +569,14 @@ pub(super) fn reset_all_cpus() {
         // protected FIFO state is empty; subsequent relaxed local accesses
         // cannot revive a pre-reset fairness debt.
         SYNC_HANDOFF_STREAK[cpu].store(0, core::sync::atomic::Ordering::Release);
+        SYNC_HANDOFF_LAST_TICK[cpu].store(0, core::sync::atomic::Ordering::Release);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_CONSECUTIVE_SYNC_HANDOFFS, ReplyWakeHandoff, SyncHandoffRecord, SyncHandoffState,
+        MAX_SYNC_HANDOFF_CHAIN_TICKS, ReplyWakeHandoff, SyncHandoffRecord, SyncHandoffState,
         runqueue,
     };
 
@@ -545,17 +590,32 @@ mod tests {
         assert!(state.enqueue(second));
         assert_eq!(state.len(), 2);
         assert_eq!(state.take_next_ready(|_| true), Some(4));
-        state.record_dispatch(true);
+        state.record_dispatch(true, 1);
+        state.record_dispatch(true, 1);
+        assert_eq!(
+            state.handoff_streak(),
+            1,
+            "message count within one clock quantum must not consume more budget"
+        );
         assert_eq!(state.take_next_ready(|_| true), Some(5));
+        state.record_dispatch(true, u64::from(MAX_SYNC_HANDOFF_CHAIN_TICKS));
+        assert_eq!(state.handoff_streak(), MAX_SYNC_HANDOFF_CHAIN_TICKS);
 
         assert!(state.enqueue(first));
         assert!(state.enqueue(second));
-        state.set_handoff_streak(MAX_CONSECUTIVE_SYNC_HANDOFFS);
         assert_eq!(state.take_next_ready(|_| true), None);
         assert_eq!(state.len(), 2);
-        state.record_dispatch(false);
+        assert_eq!(
+            state.take_next_ready_with_competitor(false, |_| true),
+            Some(4),
+            "an uncontended IPC execution chain must remain work-conserving"
+        );
+        state.set_handoff_streak(MAX_SYNC_HANDOFF_CHAIN_TICKS);
+        assert_eq!(state.take_next_ready(|_| true), None);
+        assert_eq!(state.len(), 1);
+        state.record_dispatch(false, 1);
         assert_eq!(state.handoff_streak(), 0);
-        assert_eq!(state.take_next_ready(|_| true), Some(4));
+        assert_eq!(state.take_next_ready(|_| true), Some(5));
     }
 
     #[test]
@@ -778,16 +838,19 @@ mod tests {
     }
 
     #[test]
-    fn a_capped_handoff_streak_must_not_clear_a_queue_that_still_holds_records() {
-        // `take_next_ready` returns None on a capped streak without draining.
+    fn an_exhausted_handoff_budget_must_not_clear_a_queue_that_still_holds_records() {
+        // `take_next_ready` returns None on an exhausted budget without draining.
         // Clearing the pending hint there would strand every queued reply
         // until something else happened to enqueue again.
         let mut state = SyncHandoffState::new();
         assert!(state.enqueue(SyncHandoffRecord::new(1, 7)));
-        state.set_handoff_streak(MAX_CONSECUTIVE_SYNC_HANDOFFS);
+        state.set_handoff_streak(MAX_SYNC_HANDOFF_CHAIN_TICKS);
 
         assert_eq!(state.take_next_ready(|_| true), None);
-        assert_ne!(state.len, 0, "a capped streak must leave the record queued");
+        assert_ne!(
+            state.len, 0,
+            "an exhausted chain budget must leave the record queued"
+        );
     }
 
     #[test]

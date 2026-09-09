@@ -14,7 +14,7 @@
 
 use super::tests::boxed_scheduler;
 use super::{
-    MAX_CONSECUTIVE_SYNC_HANDOFFS, NICE_0_LOAD, SYSTEM_CLASS_WEIGHT_FLAG, SchedClass, Scheduler,
+    MAX_SYNC_HANDOFF_CHAIN_TICKS, NICE_0_LOAD, SYSTEM_CLASS_WEIGHT_FLAG, SchedClass, Scheduler,
     runqueue,
 };
 use crate::memory::paging::ProcessAddressSpace;
@@ -70,7 +70,7 @@ fn synchronous_ipc_handoff_is_fifo_deduplicated_and_fairness_bounded() {
         scheduler.take_next_synchronous_pick_hint_ready_slot(),
         Some(first)
     );
-    scheduler.record_synchronous_handoff(true);
+    scheduler.record_synchronous_handoff(true, 1);
     assert_eq!(
         scheduler.take_next_synchronous_pick_hint_ready_slot(),
         Some(second)
@@ -78,10 +78,10 @@ fn synchronous_ipc_handoff_is_fifo_deduplicated_and_fairness_bounded() {
 
     assert!(scheduler.set_next_synchronous_pick_hint(912));
     assert!(scheduler.set_next_synchronous_pick_hint(913));
-    scheduler.set_synchronous_handoff_streak_for_tests(MAX_CONSECUTIVE_SYNC_HANDOFFS);
+    scheduler.set_synchronous_handoff_streak_for_tests(MAX_SYNC_HANDOFF_CHAIN_TICKS);
     assert_eq!(scheduler.take_next_synchronous_pick_hint_ready_slot(), None);
     assert_eq!(scheduler.synchronous_handoff_len_for_tests(), 2);
-    scheduler.record_synchronous_handoff(false);
+    scheduler.record_synchronous_handoff(false, 1);
     assert_eq!(
         scheduler.take_next_synchronous_pick_hint_ready_slot(),
         Some(first)

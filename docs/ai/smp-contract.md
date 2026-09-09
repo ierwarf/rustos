@@ -298,11 +298,13 @@ non-ready until the matching process and scheduler generations are published.
 Until the per-CPU run-queue transition is complete, the serialized dispatcher
 must still avoid replaying task-specific architecture state on a same-task
 turn. A scheduling result carries its exact source and destination slots:
-different slots require CR3/TSS/syscall-stack/segment/FS/GS restoration, while
-equal slots retain the already-active state. SIMD restore remains mandatory on
-both paths because compiler-generated ring0 code may use vector registers
-after the save boundary. Address-space activation separately skips a CR3 write
-when the requested root equals the CPU's release-published active root. This
+different slots require TSS/syscall-stack/segment/FS/GS restoration, while
+equal slots retain the already-active state. A different slot reloads CR3 only
+when its address-space root differs from the outgoing root; threads in one
+address space retain the already-active translations. SIMD restore remains
+mandatory on both paths because compiler-generated ring0 code may use vector
+registers after the save boundary. Address-space activation separately skips a
+CR3 write when the requested root equals the CPU's release-published active root. This
 does not replace shootdown: every page-table mutation still flushes all exact
 generation targets, and AP Online admission still performs its mandatory CR3
 reload to close the parked translation window.
@@ -523,9 +525,10 @@ custody for the exact peer needed to advance it:
   exact stale slot, and overflow is an accounting contradiction that panics;
 - the FIFO head runs before unrelated overdue work because the peer is already
   required by a committed synchronous transaction;
-- after eight consecutive synchronous handoffs, one ordinary fairness turn is
-  mandatory without consuming or reordering the FIFO; the next dispatch
-  resumes its head;
+- when an unrelated fair competitor is runnable, a synchronous handoff chain
+  may consume at most eight scheduler-clock quanta; repeated handoffs within
+  one quantum charge once, and after the elapsed-time budget one ordinary
+  fairness turn is mandatory without consuming or reordering the FIFO;
 - speculative endpoint wake hints without a live reply capability remain
   replaceable and below the absolute overdue gate.
 
