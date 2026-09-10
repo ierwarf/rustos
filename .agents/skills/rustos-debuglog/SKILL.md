@@ -26,9 +26,8 @@ window, or a provider-side FPS number into end-to-end evidence.
 
 Return the earliest relevant failure with file and line, the five to ten
 events immediately before it, the likely owning subsystem, and the next
-focused source query. Distinguish fact from inference. If source must change,
-stop log triage and load `rustos-code-editing`; its three-MCP preflight is a
-hard gate.
+focused source query. Distinguish fact from inference. If source must change, stop log triage and use `rustos-code-editing` for the
+focused source path.
 
 Do not propose speculative fixes from a log alone. Preserve the first failure
 and its causal context instead of averaging later healthy events into success.

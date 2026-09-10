@@ -5,9 +5,8 @@ description: Build, check, compile, or stage the RustOS workspace through its si
 
 # RustOS Build
 
-For source changes, load `rustos-code-editing` first and use its
-Local/Structural/Critical routing. Do not preflight tools the change does not
-need; Serena remains the primary semantic editor.
+For source changes, use `rustos-code-editing`. Do not preflight tools the
+change does not need; prefer Serena for semantic navigation/editing when useful.
 
 ## Routing
 

@@ -17,8 +17,8 @@ description: Resume or prepare a RustOS development session without losing live 
 5. Re-run only the gate needed for the new request; recorded results are not
    fresh proof.
 
-For any source edit, load `rustos-code-editing` and select its smallest
-Local/Structural/Critical tool tier; do not preflight unused MCPs.
+For any source edit, use `rustos-code-editing` and keep navigation/editing
+focused; do not preflight unused tools.
 
 ## Prepare
 
