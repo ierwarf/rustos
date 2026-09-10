@@ -27,5 +27,6 @@ For physical GPU/VFIO work read `docs/ai/physical-gpu-status.md` first. A stable
 panel proves visual behavior only, not FPS, reset, revoke, latency, or recovery.
 Do not repeat a failure-sticky physical launch in the same boot.
 
-Never inspect all generated KVM output; use `rustos-debuglog` for bounded
-evidence.
+Never inspect all generated KVM output. Search the exact failure/acceptance
+marker first and expose only the bounded surrounding lines needed for the next
+decision; follow `docs/ai/token-policy.md` limits when more detail is required.
