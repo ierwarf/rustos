@@ -88,6 +88,9 @@ assert_max_default .codex/hooks/pre_read_large_file.sh RUSTOS_HOOK_MAX_WHOLE_REA
 assert_max_default .codex/hooks/pre_read_large_file.sh RUSTOS_HOOK_MAX_READ_LINES 120
 assert_max_default .codex/hooks/pre_read_large_file.sh RUSTOS_HOOK_MAX_MCP_ANSWER_CHARS 8000
 assert_max_default .codex/hooks/pre_bash_destructive.sh RUSTOS_HOOK_MAX_SHELL_OUTPUT_TOKENS 3000
+assert_max_default .codex/hooks/pre_bash_destructive.sh RUSTOS_HOOK_MAX_WHOLE_READ_BYTES 32768
+require_literal .codex/hooks/selftest.sh 'unbudgeted large AI document cat is denied' \
+  "shell path enforces the large AI document read ceiling"
 require_literal .agents/hooks/lib.sh 'tail -n 8' "failure tail remains <= 8 lines"
 require_literal .agents/hooks/lib.sh 'head -c 2048' "failure payload remains <= 2048 bytes"
 forbid_regex .agents/hooks/post_edit_rust.sh 'cargo[[:space:]]+xtask[[:space:]]+check' \

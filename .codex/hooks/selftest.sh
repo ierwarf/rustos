@@ -58,6 +58,10 @@ expect_deny "oversized exploratory shell output is denied" .codex/hooks/pre_bash
   "$(jq -n --arg cmd 'cat docs/ai-map.md docs/ai/token-policy.md docs/ai/task-router.md' '{tool_input:{cmd:$cmd,max_output_tokens:12000}}')"
 expect_quiet_allow "bounded exploratory shell output is allowed" .codex/hooks/pre_bash_destructive.sh \
   "$(jq -n --arg cmd 'cat docs/ai/task-router.md' '{tool_input:{cmd:$cmd,max_output_tokens:3000}}')"
+expect_deny "unbudgeted large AI document cat is denied" .codex/hooks/pre_bash_destructive.sh \
+  "$(jq -n --arg cmd 'cat docs/ai/commands.md' '{tool_input:{cmd:$cmd}}')"
+expect_quiet_allow "budgeted large AI document cat is allowed" .codex/hooks/pre_bash_destructive.sh \
+  "$(jq -n --arg cmd 'cat docs/ai/commands.md' '{tool_input:{cmd:$cmd,max_output_tokens:1500}}')"
 
 expect_deny "whole Cargo.lock read is denied" .codex/hooks/pre_read_large_file.sh \
   "$(jq -n '{tool_input:{relative_path:"Cargo.lock"}}')"
