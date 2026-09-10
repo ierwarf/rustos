@@ -20,7 +20,6 @@ Use the cheapest evidence that establishes correctness.
   clearer, or Serena is unavailable/ill-suited.
 - Read only the exact symbol/range needed; after edits prefer the changed symbol
   or `git diff -U3` over rereading a large unchanged region.
-- There is no ast-grep/CodeGraph preflight requirement.
 
 ## Correctness
 

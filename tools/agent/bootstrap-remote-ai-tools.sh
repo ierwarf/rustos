@@ -5,10 +5,6 @@ set -euo pipefail
 IFS=$'\n\t'
 
 SERENA_VERSION=1.6.0
-AST_GREP_VERSION=0.45.2
-AST_GREP_MCP_COMMIT=149e20d47bb7125fb0c1451feea2f48a98742034
-CODEGRAPH_VERSION=0.20.1
-
 BIN_DIR="$HOME/.local/bin"
 TOOLS_ROOT="$HOME/.local/share/rustos-agent-tools"
 CACHE_ROOT="$HOME/.cache/rustos-agent-tools"
@@ -32,10 +28,9 @@ extract_arch_packages() {
     command -v pacman >/dev/null 2>&1 || { echo 'pacman is required' >&2; return 1; }
     command -v bsdtar >/dev/null 2>&1 || { echo 'bsdtar is required' >&2; return 1; }
     mkdir -p "$root"
-    local urls=()
+    local urls=() url archive
     mapfile -t urls < <(pacman -Sp --print-format '%l' "$@")
     ((${#urls[@]} > 0)) || { echo "no Arch package URLs for: $*" >&2; return 1; }
-    local url archive
     for url in "${urls[@]}"; do
         archive="$CACHE_ROOT/$(basename "$url")"
         [[ -s "$archive" ]] || fetch_url "$url" "$archive"
@@ -44,7 +39,7 @@ extract_arch_packages() {
 }
 
 ensure_uv() {
-    if command -v uv >/dev/null 2>&1 && command -v uvx >/dev/null 2>&1; then
+    if command -v uv >/dev/null 2>&1; then
         log "uv=$(command -v uv)"
         return
     fi
@@ -53,48 +48,6 @@ ensure_uv() {
     mkdir -p "$root"
     extract_arch_packages "$root" uv
     install -m 0755 "$root/usr/bin/uv" "$BIN_DIR/uv"
-    if [[ -e "$root/usr/bin/uvx" ]]; then
-        install -m 0755 "$root/usr/bin/uvx" "$BIN_DIR/uvx"
-    else
-        ln -sfn uv "$BIN_DIR/uvx"
-    fi
-}
-
-ensure_node_stack() {
-    if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1 && command -v npx >/dev/null 2>&1; then
-        log "node=$(command -v node) npm=$(command -v npm) npx=$(command -v npx)"
-        return
-    fi
-
-    local root="$TOOLS_ROOT/arch-node"
-    rm -rf -- "$root"
-    mkdir -p "$root"
-    extract_arch_packages "$root" nodejs npm
-
-    local node_bin="$root/usr/bin/node"
-    local npm_cli="$root/usr/lib/node_modules/npm/bin/npm-cli.js"
-    local npx_cli="$root/usr/lib/node_modules/npm/bin/npx-cli.js"
-    [[ -x "$node_bin" && -f "$npm_cli" && -f "$npx_cli" ]] || {
-        echo "incomplete Node/npm payload under $root" >&2
-        return 1
-    }
-
-    cat >"$BIN_DIR/node" <<EOF
-#!/usr/bin/env bash
-export LD_LIBRARY_PATH="$root/usr/lib\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
-exec "$node_bin" "\$@"
-EOF
-    cat >"$BIN_DIR/npm" <<EOF
-#!/usr/bin/env bash
-export LD_LIBRARY_PATH="$root/usr/lib\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
-exec "$node_bin" "$npm_cli" "\$@"
-EOF
-    cat >"$BIN_DIR/npx" <<EOF
-#!/usr/bin/env bash
-export LD_LIBRARY_PATH="$root/usr/lib\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
-exec "$node_bin" "$npx_cli" "\$@"
-EOF
-    chmod 0755 "$BIN_DIR/node" "$BIN_DIR/npm" "$BIN_DIR/npx"
 }
 
 ensure_clangd() {
@@ -123,40 +76,12 @@ link_uv_tool() {
     [[ "$source" == "$BIN_DIR/$name" ]] || ln -sfn "$source" "$BIN_DIR/$name"
 }
 
-install_uv_tools() {
+install_serena() {
     uv tool install --force -p 3.13 "serena-agent==$SERENA_VERSION"
-    uv tool install --force -p 3.13 "ast-grep-cli==$AST_GREP_VERSION"
-    uv tool install --force -p 3.13 \
-        "git+https://github.com/ast-grep/ast-grep-mcp.git@$AST_GREP_MCP_COMMIT"
-
     link_uv_tool serena
-    link_uv_tool ast-grep
-    link_uv_tool ast-grep-server
-
     if [[ ! -f "$HOME/.serena/serena_config.yml" ]]; then
         serena init -b LSP
     fi
-}
-
-install_npm_tools() {
-    local prefix="$TOOLS_ROOT/npm-global"
-    local codegraph_root="$prefix/lib/node_modules/@astudioplus/codegraph-mcp"
-    mkdir -p "$prefix"
-    export npm_config_prefix="$prefix"
-    export npm_config_cache="$HOME/.cache/npm"
-    export CODEGRAPH_SKIP_MODEL_FETCH=1
-
-    # This function is entered only when the persisted stack failed validation.
-    # Remove the CodeGraph package so a prior lifecycle-script-denied partial
-    # install cannot survive as an npm "up to date" false positive.
-    rm -rf -- "$codegraph_root"
-    rm -f -- "$prefix/bin/codegraph-mcp" "$BIN_DIR/codegraph-mcp"
-    npm install --global --no-audit --no-fund \
-        --allow-scripts=@astudioplus/codegraph-mcp \
-        "@astudioplus/codegraph-mcp@$CODEGRAPH_VERSION"
-
-    [[ -e "$prefix/bin/codegraph-mcp" ]] || { echo "npm package did not expose codegraph-mcp" >&2; return 1; }
-    ln -sfn "$prefix/bin/codegraph-mcp" "$BIN_DIR/codegraph-mcp"
 }
 
 install_project_rust_analyzer() {
@@ -167,37 +92,16 @@ install_project_rust_analyzer() {
 }
 
 write_manifest() {
-    cat >"$MANIFEST" <<EOF
-SERENA_VERSION=$SERENA_VERSION
-AST_GREP_VERSION=$AST_GREP_VERSION
-AST_GREP_MCP_COMMIT=$AST_GREP_MCP_COMMIT
-CODEGRAPH_VERSION=$CODEGRAPH_VERSION
-EOF
+    printf 'SERENA_VERSION=%s\n' "$SERENA_VERSION" >"$MANIFEST"
 }
 
-pinned_stack_is_current() {
-    local prefix="$TOOLS_ROOT/npm-global"
-    local codegraph_root="$prefix/lib/node_modules/@astudioplus/codegraph-mcp"
-    local native_codegraph="$codegraph_root/bin/codegraph-server-linux-x64"
-
+serena_is_current() {
     [[ -s "$MANIFEST" ]] || return 1
+    [[ "$(wc -l < "$MANIFEST")" -eq 1 ]] || return 1
     grep -qx "SERENA_VERSION=$SERENA_VERSION" "$MANIFEST" || return 1
-    grep -qx "AST_GREP_VERSION=$AST_GREP_VERSION" "$MANIFEST" || return 1
-    grep -qx "AST_GREP_MCP_COMMIT=$AST_GREP_MCP_COMMIT" "$MANIFEST" || return 1
-    grep -qx "CODEGRAPH_VERSION=$CODEGRAPH_VERSION" "$MANIFEST" || return 1
-
     command -v serena >/dev/null 2>&1 || return 1
-    command -v ast-grep >/dev/null 2>&1 || return 1
-    command -v ast-grep-server >/dev/null 2>&1 || return 1
-    command -v codegraph-mcp >/dev/null 2>&1 || return 1
     [[ -f "$HOME/.serena/serena_config.yml" ]] || return 1
-    [[ -x "$native_codegraph" ]] || return 1
-
-    serena --version 2>/dev/null | grep -q "${SERENA_VERSION//./\\.}" || return 1
-    ast-grep --version 2>/dev/null | grep -q "${AST_GREP_VERSION//./\\.}" || return 1
-    [[ "$(node -p "require('$codegraph_root/package.json').version" 2>/dev/null)" == "$CODEGRAPH_VERSION" ]] || return 1
-    ast-grep-server --help >/dev/null 2>&1 || return 1
-    codegraph-mcp --help >/dev/null 2>&1 || return 1
+    serena --version 2>/dev/null | grep -q "${SERENA_VERSION//./\\.}"
 }
 
 main() {
@@ -205,30 +109,24 @@ main() {
     root="$(cd -- "$root" && pwd -P)"
 
     ensure_uv
-    ensure_node_stack
     ensure_clangd
     install_project_rust_analyzer "$root"
 
-    if pinned_stack_is_current; then
-        log 'pinned AI tool stack already valid; skipping reinstall'
+    if serena_is_current; then
+        log 'pinned Serena stack already valid; skipping reinstall'
     else
-        install_uv_tools
-        install_npm_tools
+        install_serena
         write_manifest
-        pinned_stack_is_current || {
-            echo 'pinned AI tool stack failed post-install validation' >&2
+        serena_is_current || {
+            echo 'Serena stack failed post-install validation' >&2
             return 1
         }
     fi
 
     log 'installed versions'
     serena --version
-    ast-grep --version
-    node --version
-    npm --version
     clangd --version | sed -n '1p'
     cat "$MANIFEST"
-
     log "persistent bin=$BIN_DIR"
     log "persistent tools=$TOOLS_ROOT"
 }

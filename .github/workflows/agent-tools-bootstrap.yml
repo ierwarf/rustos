@@ -8,13 +8,12 @@ on:
     paths:
       - ".github/workflows/agent-tools-bootstrap.yml"
       - "tools/agent/bootstrap-remote-ai-tools.sh"
+      - "tools/check-dev-environment.sh"
       - ".codex/config.toml"
       - ".codex/hooks/**"
-      - ".claude/settings.json"
       - ".agents/hooks/**"
       - ".mcp.json"
-      - ".agents/skills/rustos-code-editing/SKILL.md"
-      - "docs/ai/token-policy.md"
+      - ".serena/project.yml"
 
 permissions:
   contents: read
@@ -42,7 +41,7 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           echo "runner=$(uname -n) workspace=$GITHUB_WORKSPACE"
 
-      - name: Install or verify pinned AI tool stack
+      - name: Install or verify pinned Serena stack
         shell: bash
         run: |
           set -euo pipefail
@@ -57,17 +56,12 @@ jobs:
             tail -n 32 "$log"
             exit "$rc"
           fi
-
           manifest="$HOME/.local/share/rustos-agent-tools/manifest.env"
           test -s "$manifest"
           grep -qx 'SERENA_VERSION=1.6.0' "$manifest"
-          grep -qx 'AST_GREP_VERSION=0.45.2' "$manifest"
-          grep -qx 'AST_GREP_MCP_COMMIT=149e20d47bb7125fb0c1451feea2f48a98742034' "$manifest"
-          grep -qx 'CODEGRAPH_VERSION=0.20.1' "$manifest"
+          test "$(wc -l < "$manifest")" -eq 1
           serena --version | grep -q '1\.6\.0'
-          ast-grep --version | grep -q '0\.45\.2'
-          codegraph-mcp --help >/dev/null
-          grep -m1 'pinned AI tool stack already valid' "$log" || true
+          grep -m1 'pinned Serena stack already valid' "$log" || true
           echo 'agent_tools_bootstrap=ok'
 
       - name: Build Serena symbol index
@@ -88,61 +82,6 @@ jobs:
           test -d .serena/cache
           find .serena/cache -type f -size +0c -print -quit | grep -q .
           grep -E 'Indexed files per language:' "$log" | tail -n 1 || echo 'serena_index=ok'
-
-      - name: Smoke ast-grep structural search
-        shell: bash
-        run: |
-          set -euo pipefail
-          export PATH="$HOME/.local/bin:$PATH"
-          ast-grep run \
-            --pattern 'unsafe { $$$BODY }' \
-            --lang rust \
-            --json \
-            kernel \
-            > build/agent-tools/ast-grep-smoke.json
-          python3 - <<'PY'
-          import json
-          from pathlib import Path
-          rows = json.loads(Path('build/agent-tools/ast-grep-smoke.json').read_text())
-          if not rows:
-              raise SystemExit('ast-grep smoke returned zero matches')
-          print(f'ast_grep_matches={len(rows)}')
-          PY
-          ast-grep-server --help >/dev/null
-
-      - name: Build and query CodeGraph graph-only index
-        shell: bash
-        run: |
-          set -euo pipefail
-          export PATH="$HOME/.local/bin:$PATH"
-          export CODEGRAPH_TELEMETRY=off
-          out=build/agent-tools/codegraph-smoke.json
-          log=build/agent-tools/codegraph-smoke.log
-          set +e
-          codegraph-mcp \
-            --graph-only \
-            --workspace "$GITHUB_WORKSPACE" \
-            --exclude "$GITHUB_WORKSPACE/target" \
-            --exclude "$GITHUB_WORKSPACE/build" \
-            --exclude "$GITHUB_WORKSPACE/logs" \
-            --exclude "$GITHUB_WORKSPACE/vendor" \
-            --exclude "$GITHUB_WORKSPACE/driver-domains/linux/out" \
-            --exclude "$GITHUB_WORKSPACE/Cargo.lock" \
-            --max-files 20000 \
-            --profile all \
-            --run-tool codegraph_get_module_summary \
-            --tool-args '{"path":"kernel/ps"}' \
-            >"$out" 2>"$log"
-          rc=$?
-          set -e
-          if [ "$rc" -ne 0 ]; then
-            grep -Einm1 'error|fatal|failed|panic' "$log" || true
-            tail -n 32 "$log"
-            exit "$rc"
-          fi
-          test -s "$out"
-          grep -Eiq 'kernel|module|symbol|dependency|summary' "$out"
-          echo "codegraph_query_bytes=$(wc -c < "$out")"
 
       - name: Verify RustOS AI development environment
         shell: bash
@@ -169,7 +108,6 @@ jobs:
             .agents/hooks/lib.sh \
             .agents/hooks/post_edit_rust.sh \
             .codex/hooks/pre_bash_destructive.sh \
-            .codex/hooks/pre_commit.sh \
             .codex/hooks/pre_read_large_file.sh \
             .codex/hooks/pre_edit_policy.sh \
             .codex/hooks/user_prompt_policy.sh \

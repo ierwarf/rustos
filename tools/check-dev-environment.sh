@@ -19,7 +19,7 @@ Read-only RustOS development environment diagnosis. The base check validates
 the pinned Rust toolchain and common host tools. Optional modes add their own
 requirements without installing packages or changing host configuration.
 
-  --ai            require project Codex/Serena tools and auxiliary AI CLIs
+  --ai            require project Codex/Serena source-navigation tools
   --docs          require the pinned mdBook version
   --formal        require formal host tools and validate the model registry
   --physical-gpu  require QEMU 11+, KVM, IOMMUFD, and VFIO device nodes
@@ -79,17 +79,10 @@ else
 fi
 
 if test "$CHECK_AI" -eq 1; then
-    require_command npx
-    require_command uvx
     require_command serena
-    require_command ast-grep
-    require_command ast-grep-server
-    require_command codegraph-mcp
     require_command rg
     grep -q 'serena-agent==1.6.0' .codex/config.toml || bad "Serena MCP pin missing"
     grep -q 'mcp_servers.serena' .codex/config.toml || bad "Serena MCP config missing"
-    grep -q 'mcp_servers.ast_grep' .codex/config.toml && bad "ast-grep must not be exposed as a project MCP"
-    grep -q 'mcp_servers.codegraph' .codex/config.toml && bad "CodeGraph must not be exposed as a project MCP"
     if .codex/hooks/selftest.sh >/dev/null; then
         ok "Codex hooks, context guardrails, handoff, skill, and Serena contracts are consistent"
     else
