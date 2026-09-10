@@ -40,7 +40,7 @@ matcher = "^(apply_patch|Edit|Write|mcp__serena__(create_text_file|insert_after_
 [[hooks.PostToolUse.hooks]]
 type = "command"
 command = '"$(git rev-parse --show-toplevel)/.agents/hooks/post_edit_rust.sh"'
-timeout = 75
+timeout = 12
 statusMessage = "Checking Rust edit"
 
 [[hooks.UserPromptSubmit]]

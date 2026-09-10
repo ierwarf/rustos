@@ -2,17 +2,7 @@
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Read|Edit|Write|Grep|Glob|mcp__serena__.*",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "serena-hooks remind --client=claude-code",
-            "timeout": 3
-          }
-        ]
-      },
-      {
-        "matcher": "*",
+        "matcher": "mcp__serena__.*",
         "hooks": [
           {
             "type": "command",
@@ -29,7 +19,7 @@
           {
             "type": "command",
             "command": "\"$(git rev-parse --show-toplevel)/.agents/hooks/post_edit_rust.sh\"",
-            "timeout": 75
+            "timeout": 12
           }
         ]
       }

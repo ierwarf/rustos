@@ -83,6 +83,21 @@ fi
 forbid_regex .codex/config.toml 'mcp_servers\.(ast_grep|codegraph|ripgrep)|mcp-ripgrep' \
   "retired/redundant source-navigation MCPs stay disabled"
 
+# Claude keeps Serena lifecycle/approval compatibility without forcing ordinary
+# reads/searches through a reminder hook or spawning auto-approve for every tool.
+forbid_regex .claude/settings.json 'serena-hooks remind' \
+  "Claude does not inject Serena reminders into ordinary exploration"
+require_literal .claude/settings.json '"matcher": "mcp__serena__.*"' \
+  "Claude auto-approve is scoped to Serena calls"
+require_literal .claude/settings.json 'serena-hooks auto-approve --client=claude-code' \
+  "Claude retains Serena approval integration"
+forbid_regex .claude/settings.json '"matcher":[[:space:]]*"\*"' \
+  "Claude has no all-tools Serena hook"
+forbid_regex .claude/settings.json '"timeout":[[:space:]]*75' \
+  "Claude post-edit wrapper has no stale 75s timeout"
+forbid_regex .codex/config.toml '^timeout = 75$' \
+  "Codex post-edit wrapper has no stale 75s timeout"
+
 # Read/output ceilings may tighten, not silently loosen.
 assert_max_default .codex/hooks/pre_read_large_file.sh RUSTOS_HOOK_MAX_WHOLE_READ_BYTES 32768
 assert_max_default .codex/hooks/pre_read_large_file.sh RUSTOS_HOOK_MAX_READ_LINES 120
