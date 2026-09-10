@@ -309,11 +309,13 @@ Bug repair is contract work, not only a local code edit. Every bug fix MUST:
    lifecycle or authority failures into one errno, boolean, or generic log is
    forbidden when it would prevent diagnosis or recovery policy.
 
-Every commit that changes source code MUST update an applicable Markdown owner
-or flow contract in the same commit. The update must describe the changed
-invariant, lifecycle, failure/recovery rule, or evidence entry; a changelog-only
-or cosmetic edit does not satisfy the requirement. If no applicable Markdown
-contract exists, create one before committing. A source-only commit is
+Update an applicable Markdown owner or flow contract in the same commit only when
+the change alters observable behavior, a public interface, an invariant, ownership or
+lifecycle, recovery semantics, registry data, or the validation route. Mechanical
+refactors, local implementation cleanup, comment-only changes, and measured
+performance tuning that preserves those contracts do not require documentation churn.
+If a behavior-changing source edit has no applicable contract, create one before
+committing it.
 incomplete even when its tests pass.
 
 For every critical/high change:
@@ -344,9 +346,11 @@ Before changing core code:
    `token-policy.md`, or `task-router.md`.
 2. Read only the relevant headings here plus the exact owner contract; consult
    the task router only if that owner is unclear.
-3. Find the source in `formal/contracts.toml`, `formal/system-flows.tsv`, and
-   `formal/run-source-conformance.sh`.
-4. Inspect the public `api.rs` before a backing module.
+3. For critical/high or cross-owner changes, locate the relevant owner/evidence row in
+   the formal registry or system-flow map. Do not scan every formal registry for a
+   local low-risk edit whose owner and validation path are already known.
+4. Inspect a public `api.rs` when the change crosses or modifies that API boundary;
+   otherwise start from the exact owning symbol.
 5. Preserve the dirty worktree and never revive a
    `RING3-MIGRATION-COMMENTED-OUT` block as a shortcut.
 6. Treat recorded passes as history; rerun the gate needed for the new claim.
