@@ -25,8 +25,10 @@ max_answer_chars="${fields[4]:-}"
 
 max_lines="${RUSTOS_HOOK_MAX_READ_LINES:-120}"
 max_mcp_chars="${RUSTOS_HOOK_MAX_MCP_ANSWER_CHARS:-8000}"
+max_whole_read_bytes="${RUSTOS_HOOK_MAX_WHOLE_READ_BYTES:-32768}"
 [[ "$max_lines" =~ ^[0-9]+$ ]] || max_lines=120
 [[ "$max_mcp_chars" =~ ^[0-9]+$ ]] || max_mcp_chars=8000
+[[ "$max_whole_read_bytes" =~ ^[0-9]+$ ]] || max_whole_read_bytes=32768
 
 deny() {
   local reason="$1"
@@ -83,7 +85,7 @@ esac
 [[ -e "$fs_path" ]] || exit 0
 
 size="$(stat -c%s -- "$fs_path" 2>/dev/null || echo 0)"
-if (( size > 262144 && bounded == 0 )); then
+if (( size > max_whole_read_bytes && bounded == 0 )); then
   deny "Large read blocked: $rel_path (${size} bytes). Search first or request <=${max_lines} focused lines."
 fi
 

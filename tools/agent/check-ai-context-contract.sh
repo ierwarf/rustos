@@ -82,6 +82,7 @@ forbid_regex .codex/config.toml 'mcp_servers\.(ast_grep|codegraph|ripgrep)|mcp-r
   "retired/redundant source-navigation MCPs stay disabled"
 
 # Read/output ceilings may tighten, not silently loosen.
+assert_max_default .codex/hooks/pre_read_large_file.sh RUSTOS_HOOK_MAX_WHOLE_READ_BYTES 32768
 assert_max_default .codex/hooks/pre_read_large_file.sh RUSTOS_HOOK_MAX_READ_LINES 120
 assert_max_default .codex/hooks/pre_read_large_file.sh RUSTOS_HOOK_MAX_MCP_ANSWER_CHARS 8000
 assert_max_default .codex/hooks/pre_bash_destructive.sh RUSTOS_HOOK_MAX_SHELL_OUTPUT_TOKENS 3000

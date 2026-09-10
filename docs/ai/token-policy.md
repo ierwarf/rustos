@@ -12,9 +12,10 @@ decision. Human docs are not bootstrap context.
 
 ## Search and read
 
-Search before opening large files. Default source read is <=120 lines; expand
-only after a focused search identifies the missing range. Start ordinary
-searches at 6–12 results and avoid reopening unchanged ranges.
+Search before opening large files. Whole-file reads above 32 KiB are blocked;
+use a focused range instead. Default source read is <=120 lines; expand only
+after a focused search identifies the missing range. Start ordinary searches at
+6–12 results and avoid reopening unchanged ranges.
 
 Batch 3–10 known independent probes when that removes model/tool round trips.
 Keep an ordinary combined model-visible batch <=8 KiB; a justified critical

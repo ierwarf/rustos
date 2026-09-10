@@ -16,9 +16,9 @@ as far as needed to establish correctness; do not preflight extra source MCPs.
 | User task | Read first | Then only if unresolved |
 | --- | --- | --- |
 | Resume prior work / prepare session handoff | `session-handoff.md` current checkout snapshot | live goal + `git status --short`, then one owner contract |
-| Build/check issue | `commands.md` | failing diagnostic, exact xtask owner range |
-| Development-speed/tooling change | `commands.md`, relevant `token-policy.md` section | exact wrapper/hook/config range |
-| Run/KVM/debug issue | `commands.md` | exact KVM owner; bounded `build/kvm/` evidence after symptom is known |
+| Build/check issue | `.agents/skills/rustos-build/SKILL.md` or the failing diagnostic | search `commands.md` only if exact invocation remains unclear |
+| Development-speed/tooling change | relevant `token-policy.md` section + exact active hook/config | `commands.md` only if a build invocation is part of the issue |
+| Run/KVM/debug issue | `.agents/skills/rustos-kvm/SKILL.md` | exact KVM owner; bounded `build/kvm/` evidence after symptom is known |
 | Physical GPU/VFIO continuation | `physical-gpu-status.md` | `contracts-abi.md`, then exact hostd/xtask/DVM owner |
 | Package/stage/registry | `contracts-infra.md` | affected manifest and exact parser/stage range |
 | Kernel API/change | `kernel-api-map.md` | relevant `kernel/*/src/api.rs`, then backing symbol |

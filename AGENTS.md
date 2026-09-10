@@ -67,15 +67,17 @@ Resume interrupted targets instead of cleaning them.
 Use sub-agents only when independent parallel exploration or a disjoint slice
 reduces main-context churn. Give them only the task, relevant paths, stop
 condition, and required evidence. They are read-only unless a disjoint write
-scope is explicit. Repository policy uses GPT-5.6 Terra with `xhigh` reasoning;
-the main agent owns integration and validation.
+scope is explicit. Prefer a fresh minimal task packet; do not fork or inherit
+the full conversation unless it is necessary. Do not pin a repository model or
+reasoning effort; the main agent owns integration and validation.
 
 ## Routing pointers
 
 - Resume: `docs/ai/session-handoff.md`, then live `git status --short`.
 - Physical GPU/VFIO: `docs/ai/physical-gpu-status.md` before hardware tests.
 - Source ownership: `docs/ai-map.md` only if the router does not name the owner.
-- Commands/build: `docs/ai/commands.md`.
+- Build/check/KVM: use the matching small skill first; search
+  `docs/ai/commands.md` only for unresolved invocation detail.
 - Kernel APIs: `docs/ai/kernel-api-map.md`.
 - ABI/service routing: `docs/ai/contracts-abi.md`.
 - SMP: `docs/ai/smp-contract.md`.
