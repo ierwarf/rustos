@@ -3,25 +3,6 @@
     "serena": {
       "command": "serena",
       "args": ["start-mcp-server"]
-    },
-    "ast_grep": {
-      "command": "ast-grep-server",
-      "args": []
-    },
-    "codegraph": {
-      "command": "codegraph-mcp",
-      "args": [
-        "--mcp",
-        "--exclude", "target",
-        "--exclude", "build",
-        "--exclude", "logs",
-        "--exclude", "vendor",
-        "--exclude", "driver-domains/linux/out",
-        "--exclude", "Cargo.lock",
-        "--max-files", "20000",
-        "--profile", "all",
-        "--graph-only"
-      ]
     }
   }
 }

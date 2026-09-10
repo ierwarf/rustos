@@ -91,7 +91,8 @@ Before committing this change set, the fresh source hash must satisfy:
 4. `formal/verify-all.sh --profile pr`, including mutation witnesses;
 5. the 8-vCPU isolated `fork_cow_private_write` KVM probe, with its final PASS
    line and process exit code zero;
-6. Serena diagnostics plus focused ast-grep and CodeGraph impact probes;
+6. Serena diagnostics/references plus compiler and focused regression impact
+   checks for the changed boundary;
 7. a final diff audit proving every staged path belongs to this change set.
 
 The KVM probe is also the performance witness. Compare its cycle distribution

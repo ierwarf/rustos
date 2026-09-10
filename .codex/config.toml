@@ -1,27 +1,18 @@
 # Project-scoped Codex configuration for RustOS.
-#
-# Loaded in addition to ~/.codex/config.toml when the agent is run with
-# CWD inside this repo. Only applies because this project is marked
-# trust_level = "trusted" in the user config.
-#
-# Keep this file project-specific: hooks, MCP servers, and any
-# overrides that only make sense for RustOS work belong here. Personal
-# style settings (model, reasoning effort, plugins, memories) stay in
-# the user config.
+# Loaded in addition to ~/.codex/config.toml for this trusted repository.
+# Keep personal model/reasoning preferences in user config.
 
 web_search = "live"
 model_verbosity = "low"
-model_auto_compact_token_limit = 120000
-model_auto_compact_token_limit_scope = "total"
+# Intentionally do not override model_context_window or
+# model_auto_compact_token_limit. Follow the selected model/runtime defaults.
 sandbox_mode = "workspace-write"
+
 [features]
 hooks = true
 
-# This is the canonical Codex hook representation for the project. Claude
-# Code-specific hooks live in .claude/settings.json and must not be duplicated
-# under .codex/.
 [[hooks.PreToolUse]]
-matcher = "^(Read|mcp__serena__.*|mcp__ast_grep__.*|mcp__codegraph__codegraph_.*)$"
+matcher = "^(Read|mcp__serena__.*)$"
 [[hooks.PreToolUse.hooks]]
 type = "command"
 command = '"$(git rev-parse --show-toplevel)/.codex/hooks/pre_read_large_file.sh"'
@@ -36,8 +27,6 @@ command = '"$(git rev-parse --show-toplevel)/.codex/hooks/pre_edit_policy.sh"'
 timeout = 3
 statusMessage = "Checking edit policy"
 
-# One shell hook owns destructive-command protection, token-output budgets, and
-# commit-only gates. A harmless shell call therefore pays for one hook process.
 [[hooks.PreToolUse]]
 matcher = "^(Bash|exec_command|mcp__serena__execute_shell_command)$"
 [[hooks.PreToolUse.hooks]]
@@ -69,24 +58,13 @@ command = '"$(git rev-parse --show-toplevel)/.codex/hooks/session_context.sh"'
 timeout = 3
 statusMessage = "Loading RustOS context"
 
-# MCP servers are exact-version project inputs installed by
-# tools/agent/bootstrap-remote-ai-tools.sh. They resolve from PATH so a checkout
-# is portable across workstations and self-hosted runners.
-#   serena    — serena-agent==1.6.0
-#   ast-grep  — ast-grep CLI 0.45.2 + sg-mcp commit 149e20d47bb7125fb0c1451feea2f48a98742034
-#   codegraph — @astudioplus/codegraph-mcp 0.20.1
-
+# Serena is the only project source-navigation MCP. Exact text search uses local
+# rg. Ordinary editing tools remain available when they are the smaller choice.
+# Installed by tools/agent/bootstrap-remote-ai-tools.sh.
+#   serena — serena-agent==1.6.0
 [mcp_servers.serena]
 command = "serena"
 args = ["start-mcp-server"]
-
-[mcp_servers.ast_grep]
-command = "ast-grep-server"
-args = []
-
-[mcp_servers.codegraph]
-command = "codegraph-mcp"
-args = ["--mcp", "--exclude", "target", "--exclude", "build", "--exclude", "logs", "--exclude", "vendor", "--exclude", "driver-domains/linux/out", "--exclude", "Cargo.lock", "--max-files", "20000", "--profile", "all", "--graph-only"]
 
 [sandbox_workspace_write]
 network_access = true

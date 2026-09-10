@@ -1,116 +1,87 @@
 # RustOS Agent Instructions
 
-Keep model context small. This `AGENTS.md` is the only stable repository
-prompt prefix. If the environment already supplied it, do not reread it unless
-it changed. Everything else is on-demand. AI-infrastructure edits must keep
-`tools/agent/check-ai-context-contract.sh` passing; adding stable-prefix files,
-MCPs, or higher context/output ceilings is an explicit contract change, never
-an incidental refactor.
+Keep model context small. This `AGENTS.md` is the only stable repository prompt
+prefix. If already supplied, do not reread it unless it changed. Everything else
+is on demand. AI-infrastructure edits must keep
+`tools/agent/check-ai-context-contract.sh` passing.
 
 ## Core workflow
 
 1. Search first and open the smallest focused contract/source range. Read
-   `docs/ai/task-router.md` only when the owner, contract, or validation route is
-   unclear or the task is specialized. Do not preload maps, token policy, human
-   docs, references, logs, or broad source trees.
-2. Search before opening source. Prefer exact symbols/ranges and stop searching
-   once the missing fact is known.
-3. Select the source-tool tier below. **Do not preflight unused MCP servers.**
+   `docs/ai/task-router.md` only when ownership or validation routing is unclear.
+2. Use local `rg` for exact text. Prefer Serena when symbol/reference context or
+   semantic editing helps.
+3. Serena is a preference, not a mandatory gate. Once it is useful for a
+   symbol-aware task, prefer continuing with focused Serena bodies, references,
+   and edits instead of drifting back to broad raw reads or whole-file manual
+   editing from habit. Use `rg`, shell reads, or `apply_patch` when they are
+   smaller/clearer or Serena is unavailable or ill-suited.
 4. After product-source edits run `cargo xtask dev-plan`, execute its `now` lane
-   while iterating, and run relevant `stable-batch` work once after the change
-   set settles. The printed plan is routing, not evidence. Agent/docs-only edits
-   use their focused selftests instead.
+   while iterating, then relevant `stable-batch` checks once when stable.
+   Agent/docs-only edits use focused selftests.
 5. Never bypass hooks/signing with `--no-verify`, `--no-gpg-sign`, or equivalent
-   options. Do not use `clean`/`distclean` as ordinary build recovery.
-6. RustOS is evacuating policy from ring0 into named services (`rootd`,
-   `syscalld`, `vfsd`, `loaderd`, `netd`, `inputd`, etc.). Do not move policy
-   back into the kernel or retain obsolete compatibility merely as fallback.
+   flags. Do not use `clean`/`distclean` as routine build recovery.
+6. Keep policy in named userspace services (`rootd`, `syscalld`, `vfsd`,
+   `loaderd`, `netd`, `inputd`, etc.); do not move policy back into ring0 as a
+   compatibility or performance shortcut.
 
-## Source-tool tiers
+## Source work
 
-**Local** — one owner/module, no public ABI, privilege, ownership, lifecycle,
-concurrency, or cross-module change. Serena is the default semantic navigator
-when symbol context helps; a scoped text search is sufficient for exact textual
-lookup. ast-grep and CodeGraph are not required.
+For local edits, search the exact symbol/range and change the smallest owner.
+For structural or critical work (scheduler, MM, IPC, security/capability, ABI,
+SMP/TLB, privilege, lifetime/concurrency, ring boundaries, hardware), widen
+Serena/reference/compiler/test evidence only as far as correctness requires.
+There is no multi-MCP preflight gate.
 
-**Structural** — signatures, several files/crates, non-trivial call structure,
-or dependency/ownership movement. Use Serena plus ast-grep only for structural
-patterns and CodeGraph only for call/dependency/blast-radius evidence.
-
-**Critical** — scheduler, MM, IPC, security/capability, ABI, SMP/TLB, privilege,
-lifetime/concurrency, ring0/ring3 boundary, or hardware-critical behavior. Use
-Serena and the structural/graph tools that materially establish correctness;
-for broad critical changes this normally means all three. If a tool selected as
-required for the task fails its focused probe, stop that source edit and report
-the exact blocker rather than guessing.
-
-Serena remains the primary semantic navigator/editor. ast-grep owns syntax-aware
-patterns; CodeGraph owns call/dependency/impact analysis. Never dump complete
-tool catalogs merely to discover a known tool.
+For non-local changes check the applicable subset of lock order,
+IRQ/preemption, blocking/allocation, user copy/faults, publication/teardown,
+capability generation/rights, ABI/wire format, cancellation/timeouts, and
+partial initialization/hot-unplug.
 
 ## Context and output discipline
 
-Follow `docs/ai/token-policy.md` when a task needs detailed limits. In ordinary
-work, keep source reads to focused ranges, command output quiet on success, and
-failures to the first useful diagnostic plus a tiny tail. Avoid `logs/`,
-`target/`, `build/`, `vendor/`, `perf.data`, and `Cargo.lock` unless the routed
-task specifically requires a bounded read there.
+Use `docs/ai/token-policy.md` only when detailed limits matter. Keep reads
+focused, batch independent probes, keep successful command output quiet, and
+return only the first useful failure diagnostic plus a tiny tail. Avoid raw
+`logs/`, `target/`, `build/`, `vendor/`, `perf.data`, and `Cargo.lock` unless a
+routed task requires a bounded read there.
 
-Batch independent evidence when known, but do not gather evidence that cannot
-change the next decision. Do not restate the same findings after every tool
-call. At a meaningful milestone, refresh the short handoff and compact/freshen
-context rather than carrying a large history indefinitely.
+Never dump `ALL_TOOLS` or bulk tool descriptions. Do not gather evidence that
+cannot change the next decision. At meaningful milestones refresh the short
+handoff and let Codex use model-specific default compaction rather than a
+repo-pinned early threshold.
 
 ## Contracts and validation
 
-A bug fix must repair the violated invariant and add an appropriate regression
-witness. Update a Markdown owner/flow contract in the same change **only when**
-the behavior, public interface, invariant, ownership/lifecycle rule, registry,
-validation command, or agent routing actually changes. Mechanical/internal
-implementation edits do not require documentation churn.
+Fix the violated invariant and add an appropriate regression witness. Update an
+owner/flow Markdown contract only when behavior, public interface, invariant,
+ownership/lifecycle, registry, validation, or routing actually changes.
+Mechanical/internal edits do not require documentation churn.
 
-Use existing subsystem APIs and declared sources of truth. Fail closed at
-privilege/ABI boundaries, use bounded waits, and preserve observable application
-ABI. For enabled product topologies, ownership, recovery, authenticated/versioned
-cross-domain contracts, bounded performance, and evidence remain completion
-requirements.
-
-Before a Linux DVM integration build run
-`make -C driver-domains/linux build-plan`; use cached `dev-*` loops while
-iterating and one matching `rebuild-*` when stable. Resume interrupted targets.
+Before Linux DVM integration run `make -C driver-domains/linux build-plan`; use
+cached `dev-*` lanes while iterating and one matching `rebuild-*` when stable.
+Resume interrupted targets instead of cleaning them.
 
 ## Sub-agents
 
-Use sub-agents only when parallel independent exploration or a disjoint slice
-reduces main-context churn. Give them only the task, relevant paths, stopping
+Use sub-agents only when independent parallel exploration or a disjoint slice
+reduces main-context churn. Give them only the task, relevant paths, stop
 condition, and required evidence. They are read-only unless a disjoint write
-scope is explicit. Repository policy requires sub-agents to use **GPT-5.6
-terra** with `xhigh` reasoning; the main agent owns integration and validation.
+scope is explicit. Repository policy uses GPT-5.6 Terra with `xhigh` reasoning;
+the main agent owns integration and validation.
 
 ## Routing pointers
 
-- Resume prior work: `docs/ai/session-handoff.md`, then live `git status --short`.
-- Physical GPU/VFIO continuation: `docs/ai/physical-gpu-status.md` before new
-  hardware tests.
-- Source ownership/index: `docs/ai-map.md` only when the router does not already
-  name the owner.
-- Commands/build lanes: `docs/ai/commands.md`.
+- Resume: `docs/ai/session-handoff.md`, then live `git status --short`.
+- Physical GPU/VFIO: `docs/ai/physical-gpu-status.md` before hardware tests.
+- Source ownership: `docs/ai-map.md` only if the router does not name the owner.
+- Commands/build: `docs/ai/commands.md`.
 - Kernel APIs: `docs/ai/kernel-api-map.md`.
 - ABI/service routing: `docs/ai/contracts-abi.md`.
 - SMP: `docs/ai/smp-contract.md`.
 - Performance: `.agents/skills/rustos-performance-optimization/SKILL.md` and the
   measured benchmark owner.
 
-## External references
-
-External web/reference research is mandatory for a new subsystem architecture
-or when correctness depends on an unfamiliar external ABI/specification. Use
-`references/` for high-risk debugging only when local evidence is insufficient
-or a routed skill names a specific reference. Do **not** scan references before
-routine implementation, tests, mechanical refactors, or well-scoped fixes.
-
-## Reporting
-
-Keep implementation chatter sparse. Report starts, material decisions/blockers,
-and completion. At completion state what changed, the validation commands that
-actually ran, and any remaining unverified boundary.
+External research is mandatory for a new subsystem architecture or unfamiliar
+external ABI/specification. Otherwise prefer local evidence. At completion,
+briefly state what changed, validation actually run, and any unverified boundary.
