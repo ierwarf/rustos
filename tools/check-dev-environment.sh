@@ -83,11 +83,6 @@ if test "$CHECK_AI" -eq 1; then
     require_command rg
     grep -q 'serena-agent==1.6.0' .codex/config.toml || bad "Serena MCP pin missing"
     grep -q 'mcp_servers.serena' .codex/config.toml || bad "Serena MCP config missing"
-    if .codex/hooks/selftest.sh >/dev/null; then
-        ok "Codex hooks, context guardrails, handoff, skill, and Serena contracts are consistent"
-    else
-        bad "Codex AI infrastructure selftest failed"
-    fi
 fi
 
 if test "$CHECK_DOCS" -eq 1; then

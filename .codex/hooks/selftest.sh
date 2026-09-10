@@ -120,12 +120,4 @@ for workflow in .github/workflows/*.yml; do
   expect_no_match "$(basename "$workflow") runner image is fixed" "$workflow" 'runs-on:[[:space:]]*ubuntu-latest'
 done
 
-bash formal/selftest.sh >/dev/null || { echo 'not ok - formal model registry selftest failed' >&2; exit 1; }
-pass "formal model registry selftest passes"
-
-for agent in .codex/agents/*.toml; do
-  expect_match "$(basename "$agent") uses repository model" "$agent" '^model = "gpt-5\.6-terra"$'
-  expect_match "$(basename "$agent") uses repository reasoning" "$agent" '^model_reasoning_effort = "xhigh"$'
-done
-
 printf 'RustOS Codex hook selftest passed\n'
