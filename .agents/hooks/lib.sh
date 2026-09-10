@@ -51,11 +51,6 @@ rustos_check_stamp_path() {
   printf '%s/xtask-check.ok\n' "$(rustos_hook_state_dir "$root")"
 }
 
-rustos_last_check_path() {
-  local root="$1"
-  printf '%s/xtask-check.last\n' "$(rustos_hook_state_dir "$root")"
-}
-
 rustos_read_check_stamp() {
   local root="$1"
   cat "$(rustos_check_stamp_path "$root")" 2>/dev/null || true

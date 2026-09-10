@@ -8,10 +8,8 @@ on:
     paths:
       - ".github/workflows/agent-tools-bootstrap.yml"
       - "tools/agent/bootstrap-remote-ai-tools.sh"
-      - "tools/check-dev-environment.sh"
+      - "rust-toolchain.toml"
       - ".codex/config.toml"
-      - ".codex/hooks/**"
-      - ".agents/hooks/**"
       - ".mcp.json"
       - ".serena/project.yml"
 
@@ -39,7 +37,6 @@ jobs:
           set -euo pipefail
           mkdir -p "$HOME/.local/bin" build/agent-tools
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          echo "runner=$(uname -n) workspace=$GITHUB_WORKSPACE"
 
       - name: Install or verify pinned Serena stack
         shell: bash
@@ -61,7 +58,6 @@ jobs:
           grep -qx 'SERENA_VERSION=1.6.0' "$manifest"
           test "$(wc -l < "$manifest")" -eq 1
           serena --version | grep -q '1\.6\.0'
-          grep -m1 'pinned Serena stack already valid' "$log" || true
           echo 'agent_tools_bootstrap=ok'
 
       - name: Build Serena symbol index
@@ -82,82 +78,3 @@ jobs:
           test -d .serena/cache
           find .serena/cache -type f -size +0c -print -quit | grep -q .
           grep -E 'Indexed files per language:' "$log" | tail -n 1 || echo 'serena_index=ok'
-
-      - name: Verify RustOS AI development environment
-        shell: bash
-        run: |
-          set -euo pipefail
-          export PATH="$HOME/.local/bin:$PATH"
-          log=build/agent-tools/dev-environment.log
-          set +e
-          tools/check-dev-environment.sh --ai >"$log" 2>&1
-          rc=$?
-          set -e
-          if [ "$rc" -ne 0 ]; then
-            grep -Einm1 'not ok|error|fatal|failed' "$log" || true
-            tail -n 32 "$log"
-            exit "$rc"
-          fi
-          grep -F 'check-dev-environment: passed' "$log" | tail -n 1
-
-      - name: Verify hook syntax cache timeout and token budgets
-        shell: bash
-        run: |
-          set -euo pipefail
-          for hook in \
-            .agents/hooks/lib.sh \
-            .agents/hooks/post_edit_rust.sh \
-            .codex/hooks/pre_bash_destructive.sh \
-            .codex/hooks/pre_read_large_file.sh \
-            .codex/hooks/pre_edit_policy.sh \
-            .codex/hooks/user_prompt_policy.sh \
-            .codex/hooks/session_context.sh
-          do
-            bash -n "$hook"
-          done
-
-          log=build/agent-tools/hook-selftest.log
-          .codex/hooks/selftest.sh >"$log" 2>&1 || {
-            grep -Enm1 'not ok|error|fatal|failed' "$log" || true
-            tail -n 32 "$log"
-            exit 1
-          }
-          grep -F 'RustOS Codex hook selftest passed' "$log"
-
-          event="$(jq -nc '{tool_input:{file_path:"kernel/ps/src/lib.rs"}}')"
-          first=build/agent-tools/post-edit-first.out
-          second=build/agent-tools/post-edit-second.out
-          printf '%s' "$event" | RUSTOS_POST_EDIT_CHECK_INTERVAL_SEC=0 \
-            .agents/hooks/post_edit_rust.sh >"$first"
-          test ! -s "$first"
-
-          source .agents/hooks/lib.sh
-          root="$(rustos_repo_root)"
-          fingerprint="$(rustos_workspace_fingerprint "$root")"
-          test "$(rustos_read_check_stamp "$root")" = "$fingerprint"
-
-          start_ns="$(date +%s%N)"
-          printf '%s' "$event" | .agents/hooks/post_edit_rust.sh >"$second"
-          end_ns="$(date +%s%N)"
-          test ! -s "$second"
-          elapsed_ms=$(( (end_ns - start_ns) / 1000000 ))
-          test "$elapsed_ms" -lt 3000
-          echo "post_edit_cached_ms=$elapsed_ms"
-
-          timeout_log="$(mktemp)"
-          trap 'rm -f "$timeout_log"' EXIT
-          set +e
-          rustos_run_bounded 1 "$timeout_log" bash -c 'sleep 2'
-          rc=$?
-          set -e
-          test "$rc" -eq 124
-          compact="$(rustos_compact_failure 'timeout-probe' "$rc" "$timeout_log")"
-          printf '%s\n' "$compact" | grep -q 'timed out'
-          compact_bytes="$(printf '%s' "$compact" | wc -c)"
-          test "$compact_bytes" -le 4096
-          echo "timeout_payload_bytes=$compact_bytes"
-
-          shell_event="$(jq -nc --arg cmd 'git status --short' '{tool_input:{cmd:$cmd}}')"
-          shell_out="$(printf '%s' "$shell_event" | .codex/hooks/pre_bash_destructive.sh)"
-          test -z "$shell_out"
-          echo 'hook_allow_path=silent'

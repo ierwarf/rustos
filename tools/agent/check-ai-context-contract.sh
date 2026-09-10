@@ -61,6 +61,8 @@ require_literal AGENTS.md 'Serena is a preference, not a mandatory gate.' \
   "Serena stays preferred without becoming mandatory"
 require_literal docs/ai/token-policy.md 'only stable repository prefix' \
   "token policy keeps a one-file stable prefix"
+forbid_regex docs/ai/README.md 'mandatory source-writing' \
+  "AI index does not imply an extra mandatory preload"
 forbid_regex .codex/hooks/session_context.sh 'task-router|token-policy|ai-map|ALL_TOOLS|mcp__' \
   "SessionStart does not inject on-demand policy/tool catalogs"
 forbid_regex .serena/project.yml 'initial_prompt:.*(task-router|token-policy|ai-map|ALL_TOOLS|mcp__)' \
@@ -88,6 +90,12 @@ assert_max_default .codex/hooks/pre_read_large_file.sh RUSTOS_HOOK_MAX_MCP_ANSWE
 assert_max_default .codex/hooks/pre_bash_destructive.sh RUSTOS_HOOK_MAX_SHELL_OUTPUT_TOKENS 3000
 require_literal .agents/hooks/lib.sh 'tail -n 8' "failure tail remains <= 8 lines"
 require_literal .agents/hooks/lib.sh 'head -c 2048' "failure payload remains <= 2048 bytes"
+forbid_regex .agents/hooks/post_edit_rust.sh 'cargo[[:space:]]+xtask[[:space:]]+check' \
+  "PostToolUse does not run the full workspace check"
+require_literal .agents/hooks/post_edit_rust.sh 'formal/check-rust-source-contracts.py' \
+  "PostToolUse keeps the cheap source-contract lint"
+forbid_regex .github/workflows/agent-tools-bootstrap.yml '\.codex/hooks/\*\*|\.agents/hooks/\*\*|tools/check-dev-environment\.sh' \
+  "Serena bootstrap is not retriggered by unrelated hook/environment checks"
 
 # Stale policies that previously caused context/tool inflation must not reappear.
 stale_paths=(AGENTS.md .serena .agents/skills docs/ai docs/ai-map.md .codex/config.toml)

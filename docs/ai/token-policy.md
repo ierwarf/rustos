@@ -13,7 +13,8 @@ decision. Human docs are not bootstrap context.
 ## Search and read
 
 Search before opening large files. Whole-file reads above 32 KiB are blocked;
-use a focused range instead. Default source read is <=120 lines; expand only
+use a focused range instead. Do not bypass the same budget through shell `cat`
+or an oversized `sed` range. Default source read is <=120 lines; expand only
 after a focused search identifies the missing range. Start ordinary searches at
 6–12 results and avoid reopening unchanged ranges.
 
@@ -50,9 +51,12 @@ Never patch generated/vendor output as a shortcut.
 
 ## Validation and long sessions
 
-After product-source edits run `cargo xtask dev-plan`; execute `now` lanes while
-iterating and relevant `stable-batch` lanes once after the change settles.
-Agent/docs-only changes use focused selftests.
+Post-edit hooks run only the cheap source-contract lint; they do not run a full
+workspace check. After product-source edits run `cargo xtask dev-plan`; execute
+`now` lanes while iterating and relevant `stable-batch` lanes once after the
+change settles. The pre-commit gate enforces `cargo xtask check` for an
+unvalidated final source fingerprint. Agent/docs-only changes use focused
+selftests.
 
 Hooks are silent on success and should emit one primary failure diagnostic plus
 a tiny tail. Do not increase output limits/timeouts as routine recovery.
