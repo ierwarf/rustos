@@ -310,13 +310,71 @@ global_asm!(
         RESTORE_CONTEXT_AND_IRET 0x188
     .size restore_kernel_saved_context, . - restore_kernel_saved_context
 
+    // Syscall entry has already saved the full user GPR/XMM image in the
+    // normalized SavedContext layout. Dispatch that frame directly instead
+    // of entering through `int 0x30`, which would save a second kernel
+    // continuation and duplicate all sixteen XMM stores and loads.
+    .global schedule_saved_user_context
+    .type schedule_saved_user_context, @function
+    schedule_saved_user_context:
+        cli
+        mov rsp, rdi
+        mov rdi, rsp
+        and rsp, -16
+        call saved_user_context_dispatch
+        mov rsp, rax
+        // SysV returns the second word of SavedUserContextDispatch in RDX.
+        // Preserve it in a callee-saved register across the commit callback;
+        // RESTORE_CONTEXT overwrites r13 with the selected user's value.
+        mov r13, rdx
+        COMMIT_CONTEXT_SWITCH
+
+        test byte ptr [rsp + 0x190], 0x3
+        jz 13f
+        test r13, r13
+        jz 14f
+        swapgs
+14:
+        mov rax, [rsp + 0x178]
+        mov rcx, [rsp + 0x180]
+        mov rdx, [rsp + 0x188]
+        mov rsi, [rsp + 0x190]
+        mov rdi, [rsp + 0x198]
+        mov [rsp + 0x178], rdx
+        mov [rsp + 0x180], rsi
+        mov [rsp + 0x188], rdi
+        mov [rsp + 0x190], rax
+        mov [rsp + 0x198], rcx
+        RESTORE_CONTEXT_AND_IRET 0x178
+13:
+        RESTORE_CONTEXT_AND_IRET 0x188
+    .size schedule_saved_user_context, . - schedule_saved_user_context
+
     .global software_schedule_trap
     .type software_schedule_trap, @function
     software_schedule_trap:
         int 0x30
         ret
     .size software_schedule_trap, . - software_schedule_trap
-"#
+
+    .global fast_ipc_call_schedule_trap
+    .type fast_ipc_call_schedule_trap, @function
+    fast_ipc_call_schedule_trap:
+        movabs rax, {fast_ipc_call_schedule_tag}
+        int 0x30
+        ret
+    .size fast_ipc_call_schedule_trap, . - fast_ipc_call_schedule_trap
+
+    .global fast_ipc_reply_schedule_trap
+    .type fast_ipc_reply_schedule_trap, @function
+    fast_ipc_reply_schedule_trap:
+        movabs rax, {fast_ipc_reply_schedule_tag}
+        int 0x30
+        ret
+    .size fast_ipc_reply_schedule_trap, . - fast_ipc_reply_schedule_trap
+"#,
+    fast_ipc_call_schedule_tag = const kernel_lowlevel::interrupts::FAST_IPC_CALL_SCHEDULE_TAG,
+    fast_ipc_reply_schedule_tag = const kernel_lowlevel::interrupts::FAST_IPC_REPLY_SCHEDULE_TAG,
 );
 
 #[cfg(test)]
@@ -339,8 +397,26 @@ mod tests {
         );
         assert_eq!(
             source.matches("\n        COMMIT_CONTEXT_SWITCH\n").count(),
-            4,
+            5,
             "every scheduling interrupt return must commit the stack transition"
+        );
+    }
+
+    #[test]
+    fn saved_syscall_user_context_reuses_the_entry_frame() {
+        let source = include_str!("interrupt_stubs.rs");
+        let entry = source
+            .split("schedule_saved_user_context:")
+            .nth(1)
+            .and_then(|rest| rest.split(".size schedule_saved_user_context").next())
+            .expect("saved syscall context entry");
+        assert!(entry.contains("call saved_user_context_dispatch"));
+        assert!(entry.contains("mov r13, rdx"));
+        assert!(entry.contains("test r13, r13\n        jz 14f\n        swapgs"));
+        assert!(entry.contains("COMMIT_CONTEXT_SWITCH"));
+        assert!(
+            !entry.contains("SAVE_CONTEXT"),
+            "saved syscall context must not duplicate its GPR/XMM image"
         );
     }
 }

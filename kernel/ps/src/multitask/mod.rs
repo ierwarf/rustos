@@ -111,15 +111,16 @@ pub use self::scheduling_api::{SchedulingContextAdmission, SchedulingContextRunt
 /// Upper bound for schedulable task identities and cross-crate bounded registries.
 pub const MAX_SCHEDULER_TASKS: usize = scheduler::MAX_TASK;
 
-pub use self::irq::{
-    commit_block_current_task_and_yield, commit_fast_ipc_call_handoff_and_yield,
-    commit_pager_fault_block_and_yield, rtc_interrupt_handler_addr,
-    software_schedule_interrupt_handler_addr, timer_interrupt_handler_addr, yield_now,
-};
 #[allow(unused_imports)]
 pub(crate) use self::irq::{
-    cond_resched, request_deferred_reschedule, request_user_return_reschedule,
-    reschedule_deferred_from_interruptible_syscall, reschedule_if_requested,
+    claim_interruptible_syscall_reschedule, cond_resched, request_deferred_reschedule,
+    request_user_return_reschedule, reschedule_if_requested,
+};
+pub use self::irq::{
+    commit_block_current_task_and_yield, commit_block_current_task_with_fast_reply_and_yield,
+    commit_fast_ipc_call_handoff_and_yield, commit_pager_fault_block_and_yield,
+    rtc_interrupt_handler_addr, software_schedule_interrupt_handler_addr,
+    timer_interrupt_handler_addr, yield_now,
 };
 pub use self::spawn::{
     spawn_user_process_state_suspended_with_parent_reservation,

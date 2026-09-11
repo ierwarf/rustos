@@ -67,17 +67,17 @@ fn fault_termination_process(
 #[repr(C)]
 pub(crate) struct SyscallFrame {
     user_rsp: u64,
-    user_rip: u64,
-    user_rflags: u64,
     rax: u64,
-    rdi: u64,
-    rsi: u64,
+    rbx: u64,
+    user_rip: u64,
     rdx: u64,
+    rsi: u64,
+    rdi: u64,
+    rbp: u64,
     r8: u64,
     r9: u64,
     r10: u64,
-    rbx: u64,
-    rbp: u64,
+    user_rflags: u64,
     r12: u64,
     r13: u64,
     r14: u64,
@@ -93,10 +93,45 @@ struct SysretReturnContract {
 
 const _: [(); 128] = [(); core::mem::size_of::<SyscallFrame>()];
 const _: [(); 0] = [(); core::mem::size_of::<SyscallFrame>() % 16];
+// Offset the scheduler context by one word so its GPR sequence and XMM image
+// coincide with the syscall entry image. `user_rsp` occupies the leading word
+// until the HAL initializes the normalized IRET suffix.
+const SYSCALL_SCHEDULE_CONTEXT_OFFSET: usize =
+    core::mem::size_of::<SyscallFrame>() - kernel_hal::api::SAVED_CONTEXT_XMM_OFFSET;
+const _: [(); 8] = [(); SYSCALL_SCHEDULE_CONTEXT_OFFSET];
+const _: [(); 0] = [(); core::mem::offset_of!(SyscallFrame, rax) - SYSCALL_SCHEDULE_CONTEXT_OFFSET];
+const _: [(); 0] =
+    [(); core::mem::offset_of!(SyscallFrame, rbx) - SYSCALL_SCHEDULE_CONTEXT_OFFSET - 8];
+const _: [(); 0] =
+    [(); core::mem::offset_of!(SyscallFrame, user_rip) - SYSCALL_SCHEDULE_CONTEXT_OFFSET - 16];
+const _: [(); 0] =
+    [(); core::mem::offset_of!(SyscallFrame, rdx) - SYSCALL_SCHEDULE_CONTEXT_OFFSET - 24];
+const _: [(); 0] =
+    [(); core::mem::offset_of!(SyscallFrame, rsi) - SYSCALL_SCHEDULE_CONTEXT_OFFSET - 32];
+const _: [(); 0] =
+    [(); core::mem::offset_of!(SyscallFrame, rdi) - SYSCALL_SCHEDULE_CONTEXT_OFFSET - 40];
+const _: [(); 0] =
+    [(); core::mem::offset_of!(SyscallFrame, rbp) - SYSCALL_SCHEDULE_CONTEXT_OFFSET - 48];
+const _: [(); 0] =
+    [(); core::mem::offset_of!(SyscallFrame, r8) - SYSCALL_SCHEDULE_CONTEXT_OFFSET - 56];
+const _: [(); 0] =
+    [(); core::mem::offset_of!(SyscallFrame, r9) - SYSCALL_SCHEDULE_CONTEXT_OFFSET - 64];
+const _: [(); 0] =
+    [(); core::mem::offset_of!(SyscallFrame, r10) - SYSCALL_SCHEDULE_CONTEXT_OFFSET - 72];
+const _: [(); 0] =
+    [(); core::mem::offset_of!(SyscallFrame, user_rflags) - SYSCALL_SCHEDULE_CONTEXT_OFFSET - 80];
+const _: [(); 0] =
+    [(); core::mem::offset_of!(SyscallFrame, r12) - SYSCALL_SCHEDULE_CONTEXT_OFFSET - 88];
+const _: [(); 0] =
+    [(); core::mem::offset_of!(SyscallFrame, r13) - SYSCALL_SCHEDULE_CONTEXT_OFFSET - 96];
+const _: [(); 0] =
+    [(); core::mem::offset_of!(SyscallFrame, r14) - SYSCALL_SCHEDULE_CONTEXT_OFFSET - 104];
+const _: [(); 0] =
+    [(); core::mem::offset_of!(SyscallFrame, r15) - SYSCALL_SCHEDULE_CONTEXT_OFFSET - 112];
 const SYSCALL_ENTRY_XMM_BYTES: usize = 16 * 16;
 const SYSCALL_ENTRY_STACK_BYTES: usize =
-    core::mem::size_of::<SyscallFrame>() + SYSCALL_ENTRY_XMM_BYTES;
-const _: [(); 384] = [(); SYSCALL_ENTRY_STACK_BYTES];
+    (SYSCALL_SCHEDULE_CONTEXT_OFFSET + kernel_hal::api::SAVED_CONTEXT_BYTES + 15) & !15;
+const _: [(); 432] = [(); SYSCALL_ENTRY_STACK_BYTES];
 
 pub use syscall_core::{
     activate_linux_compat_cpu_local, linux_compat_current_task_offset,
@@ -127,8 +162,10 @@ global_asm!(
         # touches them brackets itself with `kernel_hal::arch::simd`'s
         # `wide_simd_section`, which the same audit enforces.
         #
-        # The complete 384-byte allocation preserves call-site alignment so
-        # Rust enters with rsp % 16 == 8 as required by the x86_64 SysV ABI.
+        # The complete 432-byte allocation contains either the ordinary
+        # SYSRET image or one normalized SavedContext, while preserving
+        # call-site alignment so Rust enters with rsp % 16 == 8 as required
+        # by the x86_64 SysV ABI.
         sub rsp, {stack_bytes}
 
         # SIMD-ENTRY-SAVE-BEGIN
@@ -150,19 +187,19 @@ global_asm!(
         movdqu [rsp + {frame_bytes} + 0xF0], xmm15
         # SIMD-ENTRY-SAVE-END
 
-        mov [rsp + 24], rax
+        mov [rsp + 8], rax
         mov rax, gs:[8]
         mov [rsp + 0], rax
-        mov [rsp + 8], rcx
-        mov [rsp + 16], r11
-        mov [rsp + 32], rdi
+        mov [rsp + 24], rcx
+        mov [rsp + 88], r11
+        mov [rsp + 48], rdi
         mov [rsp + 40], rsi
-        mov [rsp + 48], rdx
-        mov [rsp + 56], r8
-        mov [rsp + 64], r9
-        mov [rsp + 72], r10
-        mov [rsp + 80], rbx
-        mov [rsp + 88], rbp
+        mov [rsp + 32], rdx
+        mov [rsp + 64], r8
+        mov [rsp + 72], r9
+        mov [rsp + 80], r10
+        mov [rsp + 16], rbx
+        mov [rsp + 56], rbp
         mov [rsp + 96], r12
         mov [rsp + 104], r13
         mov [rsp + 112], r14
@@ -196,20 +233,21 @@ global_asm!(
         movdqu xmm15, [rsp + {frame_bytes} + 0xF0]
         # SIMD-ENTRY-RESTORE-END
 
-        mov rdi, [rsp + 32]
+        mov rdi, [rsp + 48]
         mov rsi, [rsp + 40]
-        mov rdx, [rsp + 48]
-        mov r8, [rsp + 56]
-        mov r9, [rsp + 64]
-        mov r10, [rsp + 72]
-        mov rbx, [rsp + 80]
-        mov rbp, [rsp + 88]
+        mov rdx, [rsp + 32]
+        mov r8, [rsp + 64]
+        mov r9, [rsp + 72]
+        mov r10, [rsp + 80]
+        mov rbx, [rsp + 16]
+        mov rbp, [rsp + 56]
         mov r12, [rsp + 96]
         mov r13, [rsp + 104]
         mov r14, [rsp + 112]
         mov r15, [rsp + 120]
-        mov r11, [rsp + 16]
-        mov rcx, [rsp + 8]
+        mov r11, [rsp + 88]
+        mov rcx, [rsp + 24]
+        mov rax, [rsp + 8]
         mov rsp, [rsp + 0]
         swapgs
         sysretq
@@ -254,24 +292,33 @@ extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> u64 {
     let phase = syscall_profile::charge(syscall_profile::SyscallPhase::Trace, phase);
     let result = dispatch_syscall(frame, abi);
     let phase = syscall_profile::charge(syscall_profile::SyscallPhase::Dispatch, phase);
-    // The syscall body runs with IF=1, so this software interrupt preserves
-    // an interruptible kernel continuation. The scheduler may switch here and
-    // later resume the exact syscall before restoring the entering user SIMD
-    // image. This closes hot-syscall starvation without a high-rate PIT retry.
-    multitask::reschedule_deferred_from_interruptible_syscall();
+    let schedule_user_return = multitask::claim_interruptible_syscall_reschedule();
     let phase = syscall_profile::charge(syscall_profile::SyscallPhase::RescheduleDeferred, phase);
-    // The syscall frame stayed live on the task's kernel stack across that
-    // possible continuation. Revalidate the exact SYSRET boundary after the
-    // last resume so a stale pre-schedule decision can never authorize return.
-    //
-    // The user's XMM image rode that continuation on this task's own kernel
-    // stack, so it needs no separate custody: the stack is the save area, and
-    // the scheduler's per-task XSAVE pair covers the register file across the
-    // switch.
+    // Validate after the final syscall mutation and before either SYSRET or
+    // publishing this same image as a scheduler-owned IRET context.
     let return_abi = validate_syscall_entry_or_terminate(frame);
     let phase = syscall_profile::charge(syscall_profile::SyscallPhase::Validate, phase);
     trace_syscall_exit(frame, return_abi, result);
     syscall_profile::charge(syscall_profile::SyscallPhase::Trace, phase);
+    frame.rax = result;
+    if schedule_user_return {
+        // The captured user image stays in this task's kernel stack: the
+        // scheduler consumes the existing frame instead of copying SIMD state
+        // into a manufactured software-interrupt continuation.
+        let context_addr = frame as *mut SyscallFrame as usize + SYSCALL_SCHEDULE_CONTEXT_OFFSET;
+        // SAFETY: the compile-time offset witnesses above make the initialized
+        // syscall GPR/XMM image the prefix of one SavedContext. The return
+        // fields have just passed the syscall boundary validation; HAL writes
+        // the selector/suffix fields before publishing it to the scheduler.
+        unsafe {
+            kernel_hal::api::dispatch_saved_syscall_user_context(
+                context_addr,
+                frame.user_rsp,
+                frame.user_rip,
+                frame.user_rflags,
+            )
+        }
+    }
     result
 }
 
@@ -521,22 +568,25 @@ mod tests {
     }
 
     #[test]
-    fn sysret_validation_follows_last_interruptible_resume() {
+    fn scheduled_user_return_is_validated_before_context_publication() {
         let source = include_str!("mod.rs");
         let dispatch = source
             .split("extern \"C\" fn syscall_dispatch")
             .nth(1)
             .and_then(|rest| rest.split("fn dispatch_syscall").next())
             .expect("syscall dispatch body");
-        let resume = dispatch
-            .find("multitask::reschedule_deferred_from_interruptible_syscall();")
-            .expect("interruptible scheduler tail");
+        let claim = dispatch
+            .find("multitask::claim_interruptible_syscall_reschedule();")
+            .expect("interruptible scheduler claim");
         let validation = dispatch
             .find("let return_abi = validate_syscall_entry_or_terminate(frame);")
-            .expect("post-resume SYSRET validation");
+            .expect("final user-return validation");
+        let publication = dispatch
+            .find("kernel_hal::api::dispatch_saved_syscall_user_context(")
+            .expect("saved user-context publication");
         assert!(
-            resume < validation,
-            "SYSRET validation must follow the last possible continuation resume"
+            claim < validation && validation < publication,
+            "the direct scheduler context must contain the finally validated user return"
         );
     }
 

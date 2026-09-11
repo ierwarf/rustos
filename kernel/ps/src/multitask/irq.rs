@@ -25,6 +25,8 @@ use super::{
     scheduler_initialized, scheduler_mut,
 };
 
+mod fast_ipc;
+
 #[cfg(test)]
 mod test_support;
 #[cfg(test)]
@@ -228,6 +230,7 @@ pub(crate) fn install_interrupt_dispatch_callbacks() {
     crate::lowlevel::interrupts::register_software_schedule_interrupt_dispatch(
         software_schedule_interrupt_dispatch,
     );
+    crate::lowlevel::interrupts::register_saved_user_context_dispatch(saved_user_context_dispatch);
     crate::lowlevel::interrupts::register_reschedule_ipi_interrupt_dispatch(
         reschedule_ipi_interrupt_dispatch,
     );
@@ -492,16 +495,15 @@ pub fn cond_resched() {
     reschedule_if_requested();
 }
 
-/// Consume a timer or latency-handoff request from the common syscall tail.
+/// Claim a timer or latency-handoff request from the common syscall tail.
 ///
-/// The syscall entry deliberately executes with IF=1. A software interrupt
-/// raised here therefore saves an IF-enabled kernel continuation, so the
-/// scheduler may switch away and later resume it safely. Clearing the request
-/// without switching starves peer services; programming a short periodic PIT
-/// instead creates a VM-exit storm under long syscalls.
-pub fn reschedule_deferred_from_interruptible_syscall() {
+/// A successful claim authorizes syscall entry to publish its validated user
+/// return image directly as a scheduler context. The low-level transfer still
+/// performs the ordinary scheduler dispatch and outgoing-stack ownership
+/// commit; only the redundant kernel interrupt continuation is absent.
+pub fn claim_interruptible_syscall_reschedule() -> bool {
     if nucleus_core::util::lockdep::preemption_disabled() {
-        return;
+        return false;
     }
     let logical_index = current_cpu_index();
     let reschedule_goal = super::reschedule_observation::claim_pending(logical_index);
@@ -509,7 +511,6 @@ pub fn reschedule_deferred_from_interruptible_syscall() {
         reschedule_goal.is_some(),
         user_return_reschedule_flag(logical_index),
     ) {
-        crate::lowlevel::interrupts::trigger_software_schedule_interruptible();
         if let Some(reschedule_goal) = reschedule_goal {
             super::reschedule_observation::record_consumption(
                 logical_index,
@@ -517,6 +518,9 @@ pub fn reschedule_deferred_from_interruptible_syscall() {
                 super::reschedule_observation::RescheduleRoute::SyscallTail,
             );
         }
+        true
+    } else {
+        false
     }
 }
 
@@ -739,6 +743,22 @@ extern "C" fn software_schedule_interrupt_dispatch(
     if !scheduler_initialized() {
         return context_ptr;
     }
+    // SAFETY: the software interrupt stub owns this complete frame until this
+    // callback returns its selected continuation. Reading caller-saved words
+    // does not transfer or mutate stack custody.
+    let software_frame = unsafe { &*context_ptr };
+    let fast_ipc_call = (software_frame.rax
+        == crate::lowlevel::interrupts::FAST_IPC_CALL_SCHEDULE_TAG)
+        .then_some((software_frame.rdi, software_frame.rsi, software_frame.rdx));
+    let fast_ipc_reply = (software_frame.rax
+        == crate::lowlevel::interrupts::FAST_IPC_REPLY_SCHEDULE_TAG)
+        .then_some((
+            software_frame.rdi,
+            software_frame.rsi,
+            software_frame.rdx,
+            software_frame.rcx,
+            software_frame.r8,
+        ));
     let logical_index = current_cpu_index();
     // The software interrupt is an explicit local scheduling request. Bind it
     // to the current CPU lifecycle before entering the serialized scheduler
@@ -750,14 +770,74 @@ extern "C" fn software_schedule_interrupt_dispatch(
     let reschedule_goal = super::reschedule_observation::claim_pending(logical_index)
         .expect("software scheduling request lost before dispatch");
     let current_rsp = context_ptr as usize;
-    let (next_rsp, user_dispatch, runtime_profile) = unsafe {
+    let (next_rsp, user_dispatch, runtime_profile, fast_ipc_outcome) = unsafe {
         let mut scheduler = scheduler_mut();
+        let fast_ipc_outcome = fast_ipc_call.map(|(endpoint, reply, receiver_task_id)| {
+            scheduler.commit_fast_ipc_call_handoff(endpoint, reply, receiver_task_id, true)
+        });
+        if fast_ipc_outcome.is_some_and(|outcome| {
+            !matches!(
+                outcome,
+                super::scheduler::FastIpcCallHandoffOutcome::CommittedSameCpu
+                    | super::scheduler::FastIpcCallHandoffOutcome::CommittedCrossCpu
+            )
+        }) {
+            let outcome = fast_ipc_outcome.unwrap();
+            drop(scheduler);
+            super::reschedule_observation::record_consumption(
+                logical_index,
+                reschedule_goal,
+                super::reschedule_observation::RescheduleRoute::LocalSafePoint,
+            );
+            return fast_ipc::stamp_fast_ipc_call_outcome(context_ptr, outcome);
+        }
+        let mut immediate_task_id = fast_ipc_call.and_then(|(_, _, receiver_task_id)| {
+            fast_ipc_outcome
+                .is_some_and(|outcome| {
+                    outcome == super::scheduler::FastIpcCallHandoffOutcome::CommittedSameCpu
+                })
+                .then_some(receiver_task_id)
+        });
+        if let Some((
+            reply,
+            caller_task_id,
+            context_owner_task_id,
+            context_slot,
+            context_generation,
+        )) = fast_ipc_reply
+        {
+            let scheduling_context = kernel_object::api::identity::ObjectIdentity::new(
+                kernel_object::api::identity::ObjectOwner::Ps,
+                kernel_object::api::identity::ObjectKind::SchedulingContext,
+                context_slot,
+                context_generation,
+            )
+            .expect("fast IPC reply trap carried an invalid scheduling-context identity");
+            let outcome = scheduler
+                .settle_and_complete_fast_ipc_reply_handoff(
+                    reply,
+                    caller_task_id,
+                    context_owner_task_id,
+                    scheduling_context,
+                    true,
+                )
+                .expect("fast IPC reply trap carried stale scheduling-context custody");
+            if outcome == super::scheduler::FastIpcReplyHandoffOutcome::Direct {
+                immediate_task_id = Some(caller_task_id);
+            } else if outcome == super::scheduler::FastIpcReplyHandoffOutcome::Rejected {
+                let _ = scheduler.complete_ipc_reply_wake_handoff(reply, caller_task_id);
+            }
+        }
         scheduler.record_runtime_profile_entry(super::scheduler::SchedulerEntryCause::Software);
         scheduler.save_current_simd_state();
-        // Voluntary yield: floor the vruntime charge so a sub-tick yield can't
-        // accumulate 0 vruntime and re-win CFS. Timer-driven preemption still
-        // uses the unfloored path.
-        let dispatch = scheduler.on_voluntary_yield(current_rsp);
+        // A committed same-CPU fastpath carries its exact peer directly
+        // through this scheduler transaction. Generic and cross-CPU handoffs
+        // retain the ordered FIFO path.
+        let dispatch =
+            match scheduler.dispatch_committed_fast_ipc_handoff(current_rsp, immediate_task_id) {
+                Some(dispatch) => dispatch,
+                None => scheduler.on_voluntary_yield(current_rsp),
+            };
         scheduler.prepare_dispatched_task_execution(dispatch);
         scheduler.restore_current_simd_state();
         let runtime_profile = scheduler.take_runtime_profile(crate::arch::rtc::ticks());
@@ -765,8 +845,13 @@ extern "C" fn software_schedule_interrupt_dispatch(
             dispatch.next_rsp,
             scheduler.current_task_is_user_task(),
             runtime_profile,
+            fast_ipc_outcome,
         )
     };
+
+    if let Some(outcome) = fast_ipc_outcome {
+        let _ = fast_ipc::stamp_fast_ipc_call_outcome(context_ptr, outcome);
+    }
 
     super::scheduler::publish_scheduler_runtime_profile(runtime_profile);
     super::reschedule_observation::record_consumption(
@@ -777,6 +862,60 @@ extern "C" fn software_schedule_interrupt_dispatch(
     record_first_user_dispatch(logical_index, user_dispatch);
     record_atomic_activation_dispatch(logical_index);
     next_rsp as *mut SavedContext
+}
+
+/// Dispatch a syscall-owned user image after the syscall tail has already
+/// claimed and attested the pending reschedule request.
+///
+/// Unlike the software-interrupt route this callback must not publish a new
+/// request merely to enter the scheduler. It also reports whether the
+/// scheduler skipped architecture restore for a same-task selection, allowing
+/// the assembly leaf to pair syscall entry's `swapgs` exactly once.
+extern "C" fn saved_user_context_dispatch(
+    context_ptr: *mut SavedContext,
+) -> crate::lowlevel::interrupts::SavedUserContextDispatch {
+    assert!(
+        !nucleus_core::util::lockdep::preemption_disabled(),
+        "saved user scheduler dispatch entered while raw spin lock held depth={} class={:?}",
+        nucleus_core::util::lockdep::preemption_depth(),
+        nucleus_core::util::lockdep::current_lock_class()
+    );
+    if !scheduler_initialized() {
+        return crate::lowlevel::interrupts::SavedUserContextDispatch {
+            context: context_ptr,
+            swapgs_before_iret: 1,
+        };
+    }
+
+    let logical_index = current_cpu_index();
+    let current_rsp = context_ptr as usize;
+    // SAFETY: syscall entry supplied the complete current-task user frame,
+    // interrupts are disabled by the assembly transfer, and the scheduler
+    // lock serializes every cross-CPU task-state and stack-owner transition.
+    let (next_rsp, user_dispatch, same_task, runtime_profile) = unsafe {
+        let mut scheduler = scheduler_mut();
+        scheduler.record_runtime_profile_entry(super::scheduler::SchedulerEntryCause::Software);
+        scheduler.save_current_simd_state();
+        let dispatch = scheduler.on_voluntary_yield(current_rsp);
+        let same_task = !dispatch.requires_architectural_restore();
+        scheduler.prepare_dispatched_task_execution(dispatch);
+        scheduler.restore_current_simd_state();
+        let runtime_profile = scheduler.take_runtime_profile(crate::arch::rtc::ticks());
+        (
+            dispatch.next_rsp,
+            scheduler.current_task_is_user_task(),
+            same_task,
+            runtime_profile,
+        )
+    };
+
+    super::scheduler::publish_scheduler_runtime_profile(runtime_profile);
+    record_first_user_dispatch(logical_index, user_dispatch);
+    record_atomic_activation_dispatch(logical_index);
+    crate::lowlevel::interrupts::SavedUserContextDispatch {
+        context: next_rsp as *mut SavedContext,
+        swapgs_before_iret: u64::from(same_task),
+    }
 }
 
 fn record_atomic_activation_dispatch(logical_index: usize) {
@@ -871,6 +1010,53 @@ pub fn commit_block_current_task_and_yield() -> Option<bool> {
             });
         if committed == Some(true) {
             crate::lowlevel::interrupts::trigger_software_schedule();
+        }
+        committed
+    })
+}
+
+/// Commit the server's endpoint receive block, then settle the completed reply
+/// and dispatch its exact caller in the same scheduler acquisition.
+///
+/// A wake that wins the endpoint waiter race leaves reply settlement to the
+/// caller, which can use the ordinary non-yielding path.
+pub fn commit_block_current_task_with_fast_reply_and_yield(
+    reply: u64,
+    completion: kernel_ipc_runtime::api::ReplyCompletion,
+) -> Option<bool> {
+    let custody = completion
+        .scheduling_context
+        .expect("fast reply block transition lost scheduling-context custody");
+    assert_eq!(
+        custody.caller_task_id(),
+        completion.caller_task_id,
+        "fast reply block transition names different caller identities"
+    );
+    let preemption = nucleus_core::util::lockdep::preemption_snapshot();
+    assert!(
+        preemption.depth == 0,
+        "task blocked with fast reply while raw spin lock held cpu={} apic={:#x} depth={} held_depth={} pending_depth={} class={:?}",
+        preemption.logical_cpu,
+        preemption.apic_id,
+        preemption.depth,
+        preemption.held_depth,
+        preemption.pending_depth,
+        preemption.top_class,
+    );
+    interrupts::without_interrupts(|| {
+        let committed =
+            current_wait_commit_or_fallback(super::scheduler::commit_current_wait(), || unsafe {
+                scheduler_mut().commit_block_current_task()
+            });
+        if committed == Some(true) {
+            let identity = custody.identity();
+            crate::lowlevel::interrupts::trigger_fast_ipc_reply_schedule(
+                reply,
+                completion.caller_task_id,
+                custody.context_owner_task_id(),
+                identity.slot(),
+                identity.generation(),
+            );
         }
         committed
     })
@@ -971,17 +1157,22 @@ pub fn commit_fast_ipc_call_handoff_and_yield(
         preemption.top_class,
     );
     interrupts::without_interrupts(|| {
-        let outcome = unsafe {
-            scheduler_mut().commit_fast_ipc_call_handoff(endpoint, reply, receiver_task_id)
-        };
-        if matches!(
-            outcome,
-            super::scheduler::FastIpcCallHandoffOutcome::CommittedSameCpu
-                | super::scheduler::FastIpcCallHandoffOutcome::CommittedCrossCpu
-        ) {
-            crate::lowlevel::interrupts::trigger_software_schedule();
+        let code = crate::lowlevel::interrupts::trigger_fast_ipc_call_schedule(
+            endpoint,
+            reply,
+            receiver_task_id,
+        );
+        match code {
+            0 => super::scheduler::FastIpcCallHandoffOutcome::CommittedSameCpu,
+            1 => super::scheduler::FastIpcCallHandoffOutcome::CommittedCrossCpu,
+            2 => super::scheduler::FastIpcCallHandoffOutcome::SenderMismatch,
+            3 => super::scheduler::FastIpcCallHandoffOutcome::ReceiverMismatch,
+            4 => super::scheduler::FastIpcCallHandoffOutcome::DonationUnavailable,
+            5 => super::scheduler::FastIpcCallHandoffOutcome::EligibilityUnavailable,
+            6 => super::scheduler::FastIpcCallHandoffOutcome::DirectCustodyUnavailable,
+            7 => super::scheduler::FastIpcCallHandoffOutcome::OrderingUnavailable,
+            other => panic!("fast IPC software trap returned invalid outcome {other}"),
         }
-        outcome
     })
 }
 

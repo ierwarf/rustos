@@ -57,7 +57,7 @@ static PROFILE: PhaseProfile<SYSCALL_PHASE_COUNT> = PhaseProfile::new(
 pub(super) fn now() -> u64 {
     #[cfg(rustos_syscall_phase_profile)]
     {
-        phase_now()
+        nucleus_core::debug::phase_profile::phase_now()
     }
     #[cfg(not(rustos_syscall_phase_profile))]
     {

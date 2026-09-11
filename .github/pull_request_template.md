@@ -5,7 +5,7 @@
 ## Validation
 
 - [ ] `cargo xtask dev-plan` used to select the validation lanes
-- [ ] `.codex/hooks/selftest.sh`
+- [ ] `.claude/hooks/selftest.sh`
 - [ ] `cargo fmt --all -- --check`
 - [ ] `cargo xtask check`
 - [ ] Host tests from `.github/workflows/rust.yml` when relevant

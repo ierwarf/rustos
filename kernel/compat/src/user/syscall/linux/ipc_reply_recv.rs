@@ -79,10 +79,6 @@ pub(super) fn syscall_linux_rustos_ipc_reply_recv_with_sender(args_ptr: u64) -> 
             Ok(published) => {
                 note_fast_ipc(IpcFastCounter::FusedReplyPublished);
                 let reply_ticks = crate::arch::rtc::ticks();
-                let handoff_queued = multitask::complete_fast_ipc_reply_wake_handoff_with_custody(
-                    args.reply_cap,
-                    published.completion,
-                );
                 log_slow_ipc_reply(
                     "reply-recv-fast",
                     args.reply_cap,
@@ -92,9 +88,13 @@ pub(super) fn syscall_linux_rustos_ipc_reply_recv_with_sender(args_ptr: u64) -> 
                     response_len,
                 );
                 if let Some(error) = published.terminal_error {
+                    let _ = multitask::complete_fast_ipc_reply_wake_handoff_with_custody(
+                        args.reply_cap,
+                        published.completion,
+                    );
                     return ipc_reply_recv_committed_error(ipc_error_to_linux_errno(error));
                 }
-                return finish_committed_reply_receive(
+                return finish_committed_fast_reply_receive(
                     endpoint,
                     receiver_task_id,
                     &retained_mm,
@@ -103,7 +103,8 @@ pub(super) fn syscall_linux_rustos_ipc_reply_recv_with_sender(args_ptr: u64) -> 
                     args.next_reply_cap_ptr,
                     args.sender_pid_ptr,
                     args.sender_tid_ptr,
-                    handoff_queued,
+                    args.reply_cap,
+                    published.completion,
                 );
             }
             Err(kernel_ipc_runtime::api::IpcError::InvalidHandle) => {}
@@ -192,6 +193,36 @@ fn finish_committed_reply_receive(
             }
             ipc_reply_recv_committed_error(errno)
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_committed_fast_reply_receive(
+    endpoint: KernelEndpointHandle,
+    receiver_task_id: u64,
+    retained_mm: &multitask::RetainedCurrentUserAddressSpace,
+    request_ptr: u64,
+    request_capacity: usize,
+    next_reply_cap_ptr: u64,
+    sender_pid_ptr: u64,
+    sender_tid_ptr: u64,
+    completed_reply: u64,
+    completion: kernel_ipc_runtime::api::ReplyCompletion,
+) -> u64 {
+    match recv_with_sender_blocking_prepared_after_fast_reply(
+        endpoint,
+        receiver_task_id,
+        retained_mm,
+        request_ptr,
+        request_capacity,
+        next_reply_cap_ptr,
+        sender_pid_ptr,
+        sender_tid_ptr,
+        completed_reply,
+        completion,
+    ) {
+        Ok((received, _)) => received as u64,
+        Err((errno, _)) => ipc_reply_recv_committed_error(errno),
     }
 }
 

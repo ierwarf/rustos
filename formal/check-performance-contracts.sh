@@ -716,7 +716,7 @@ rg -Fq 'const PROFILE_TOP_TASKS: usize = 4;' "$scheduler_profile" \
         echo "scheduler runtime attribution lost its bounded destructive snapshot" >&2
         exit 1
     }
-if [[ "$(rg -Fc 'publish_scheduler_runtime_profile(runtime_profile);' kernel/ps/src/multitask/irq.rs)" -ne 4 ]] \
+if [[ "$(rg -Fc 'publish_scheduler_runtime_profile(runtime_profile);' kernel/ps/src/multitask/irq.rs)" -ne 5 ]] \
     || ! rg -Fq 'ps_api::drain_scheduler_runtime_profile();' kernel/executive/src/boot.rs \
     || ! rg -Fq 'pending_runtime_profile_is_single_slot_release_acquire_custody' "$scheduler_profile"; then
     echo "scheduler runtime attribution left its IRQ-to-housekeeping custody path" >&2
@@ -727,7 +727,7 @@ rg -Uq 'let gpu_compositor = Some\(GpuCompositorRuntime::new\([\s\S]{0,900}diag_
     echo "mandatory GPU initialization no longer overlaps serial input/console/surface startup" >&2
     exit 1
 }
-if [ "$(rg -c 'record_runtime_profile_entry' kernel/ps/src/multitask/irq.rs)" -ne 4 ] \
+if [ "$(rg -c 'record_runtime_profile_entry' kernel/ps/src/multitask/irq.rs)" -ne 5 ] \
     || ! rg -Fq 'runtime_profile_entry_causes_are_exact_and_destructive' "$scheduler_profile"; then
     echo "scheduler entry-cause attribution is incomplete or lacks a destructive witness" >&2
     exit 1

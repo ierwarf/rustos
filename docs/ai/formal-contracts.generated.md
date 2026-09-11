@@ -2,7 +2,7 @@
 # Formal Contract Registry
 
 - Schema: `3`
-- Registry SHA-256: `2fec74cf68a0a5f3b52eaef96e4cff9c341c0bff1e62bd1e8a70a31fe67d78e9`
+- Registry SHA-256: `c04eab7db33cdfb3c8383a954bf5f6678534025342b4b81714cd99302f1d60bc`
 - Models: `137`
 - Whole flows: `75`
 - Transitions: `755`

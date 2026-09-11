@@ -367,6 +367,7 @@ pub fn complete_fast_ipc_reply_wake_handoff_with_custody(
             completion.caller_task_id,
             custody.context_owner_task_id(),
             custody.identity(),
+            false,
         )
     })
     .expect("fast reply returned stale scheduling-context custody");

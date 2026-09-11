@@ -61,7 +61,7 @@ selftests.
 Hooks are silent on success and should emit one primary failure diagnostic plus
 a tiny tail. Do not increase output limits/timeouts as routine recovery.
 
-Project Codex config intentionally does not override the model context window or
+Project Claude Code config intentionally does not override the model context window or
 auto-compaction threshold. Follow the selected model/runtime defaults so this
-tracks Codex model metadata rather than pinning an early repo-specific limit.
+tracks Claude Code model metadata rather than pinning an early repo-specific limit.
 At milestones update the short handoff and discard unnecessary history.

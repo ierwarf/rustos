@@ -75,5 +75,5 @@ Desktop.ini
 /settings.rs
 /kernel/to_codex
 
-# Agent/tool config is tracked: .codex/ (hooks, subagents, project config),
-# .agents/ (skills), and .cargo/ (workspace cargo config) live in-repo.
+# Agent/tool config is tracked: .claude/ (hooks and project config),
+# .agents/ (skills), and .cargo/ (workspace Cargo config) live in-repo.

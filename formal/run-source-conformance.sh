@@ -51,24 +51,31 @@ if split_block_api="$(rg -n 'pub fn commit_block_current_task\(' kernel/ps/src -
     exit 1
 fi
 
-# The syscall entry frame remains live across an interruptible scheduler tail.
-# Its SYSRET contract must be checked after the last possible resume, not
-# before publishing a continuation that may sleep and later be consumed.
+# The syscall entry frame remains live across interruptible kernel work and can
+# become the scheduler's outgoing user context at the common tail. Its return
+# contract must be checked after claiming that tail and before publishing the
+# normalized context to the scheduler.
 syscall_dispatch_body="$(
     sed -n '/^extern "C" fn syscall_dispatch(/,/^fn dispatch_syscall(/p' \
         kernel/compat/src/user/syscall/mod.rs
 )"
 tail_reschedule_line="$(
-    grep -n -m1 'multitask::reschedule_deferred_from_interruptible_syscall();' \
+    grep -n -m1 'multitask::claim_interruptible_syscall_reschedule();' \
         <<<"$syscall_dispatch_body" | cut -d: -f1
 )"
 return_validation_line="$(
     grep -n -m1 'let return_abi = validate_syscall_entry_or_terminate(frame);' \
         <<<"$syscall_dispatch_body" | cut -d: -f1
 )"
+context_publication_line="$(
+    grep -n -m1 'kernel_hal::api::dispatch_saved_syscall_user_context(' \
+        <<<"$syscall_dispatch_body" | cut -d: -f1
+)"
 if [[ -z "$tail_reschedule_line" || -z "$return_validation_line" \
-    || "$return_validation_line" -le "$tail_reschedule_line" ]]; then
-    echo 'syscall SYSRET contract must be validated after the last interruptible tail resume' >&2
+    || -z "$context_publication_line" \
+    || "$return_validation_line" -le "$tail_reschedule_line" \
+    || "$context_publication_line" -le "$return_validation_line" ]]; then
+    echo 'scheduled syscall return must be validated after claim and before context publication' >&2
     exit 1
 fi
 
@@ -522,7 +529,7 @@ fi
 # task-retirement whole-slab scan here is both unnecessary and a tail-latency
 # regression.
 bounded_recv_body="$(
-    sed -n '/^fn recv_with_sender_blocking_prepared(/,/^}/p' \
+    sed -n '/^fn recv_with_sender_blocking_prepared_inner(/,/^}/p' \
         kernel/compat/src/user/syscall/linux/ipc_ops.rs
 )"
 if ! grep -Fq 'arm_sleep_waiter_until_tick' <<<"$bounded_recv_body" \
@@ -1375,12 +1382,12 @@ syscall-simd-lifecycle/SyscallSimdLifecycle|kernel-compat|user::syscall::tests::
 syscall-simd-lifecycle/SyscallSimdLifecycle|kernel-hal|arch::simd::tests::a_wide_simd_section_covers_every_register_the_entry_stubs_leave_behind
 syscall-simd-lifecycle/SyscallSimdLifecycle|kernel-ps|multitask::scheduler::tests::scheduler_block_arm_is_exact_race_safe_and_terminally_revoked
 syscall-simd-lifecycle/SyscallSimdLifecycle|kernel-ps|multitask::scheduler::tests::raced_wake_never_validates_a_consumed_current_frame
-syscall-simd-lifecycle/SyscallSimdLifecycle|kernel-compat|user::syscall::tests::sysret_validation_follows_last_interruptible_resume
+syscall-simd-lifecycle/SyscallSimdLifecycle|kernel-compat|user::syscall::tests::scheduled_user_return_is_validated_before_context_publication
 syscall-simd-lifecycle/SyscallSimdLifecycle|kernel-compat|user::syscall::tests::sysret_contract_rejects_forbidden_rflags
 syscall-simd-lifecycle/SyscallSimdLifecycle|kernel-compat|user::syscall::tests::syscall_entry_preserves_xmm_before_any_rust_dispatch
 syscall-scheduler-continuation/SyscallSchedulerContinuation|kernel-ps|multitask::scheduler::tests::scheduler_block_arm_is_exact_race_safe_and_terminally_revoked
 syscall-scheduler-continuation/SyscallSchedulerContinuation|kernel-ps|multitask::scheduler::tests::raced_wake_never_validates_a_consumed_current_frame
-syscall-scheduler-continuation/SyscallSchedulerContinuation|kernel-compat|user::syscall::tests::sysret_validation_follows_last_interruptible_resume
+syscall-scheduler-continuation/SyscallSchedulerContinuation|kernel-compat|user::syscall::tests::scheduled_user_return_is_validated_before_context_publication
 clocksource-deadline/ClocksourceDeadline|kernel-hal|arch::acpi::tests::hpet_gas_requires_memory_qword_zero_offset_and_aligned_range
 clocksource-deadline/ClocksourceDeadline|kernel-hal|arch::rtc::tests::sleep_deadline_uses_monotonic_ticks_with_ceil_and_saturation
 clocksource-deadline/ClocksourceDeadline|kernel-hal|arch::rtc::tests::sleep_waiter_update_expiry_and_cancel_preserve_exact_task_ownership

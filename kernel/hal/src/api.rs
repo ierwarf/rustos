@@ -176,6 +176,8 @@ pub mod cpu {
 }
 
 pub mod interrupts {
+    use core::ptr;
+
     use kernel_lowlevel::interrupts::SavedContext;
 
     use crate::hooks::{
@@ -200,6 +202,9 @@ pub mod interrupts {
         );
         kernel_lowlevel::interrupts::register_software_schedule_interrupt_dispatch(
             super::software_schedule_interrupt_default_dispatch,
+        );
+        kernel_lowlevel::interrupts::register_saved_user_context_dispatch(
+            super::saved_user_context_default_dispatch,
         );
         kernel_lowlevel::interrupts::register_reschedule_ipi_interrupt_dispatch(
             super::reschedule_ipi_interrupt_default_dispatch,
@@ -231,6 +236,43 @@ pub mod interrupts {
 
         unsafe { restore_kernel_saved_context_raw(context) }
     }
+
+    /// Turn an already-saved syscall return image into the scheduler's native
+    /// user context and dispatch it without manufacturing a second interrupt
+    /// continuation and SIMD copy.
+    ///
+    /// # Safety
+    ///
+    /// `context_addr` must identify initialized GPR and XMM prefixes of a
+    /// `SavedContext` on the current task's kernel stack. `user_rsp`,
+    /// `user_rip`, and `user_rflags` must have passed the syscall-return
+    /// contract. This function initializes the remaining context fields and
+    /// does not return.
+    pub unsafe fn dispatch_saved_syscall_user_context(
+        context_addr: usize,
+        user_rsp: u64,
+        user_rip: u64,
+        user_rflags: u64,
+    ) -> ! {
+        assert_eq!(
+            context_addr & (core::mem::align_of::<SavedContext>() - 1),
+            0,
+            "saved syscall user context is misaligned"
+        );
+        let context = context_addr as *mut SavedContext;
+        unsafe {
+            ptr::addr_of_mut!((*context).rsp).write(user_rsp);
+            ptr::addr_of_mut!((*context).ss).write(crate::arch::gdt::user_data_selector().0 as u64);
+            ptr::addr_of_mut!((*context).rip).write(user_rip);
+            ptr::addr_of_mut!((*context).cs).write(crate::arch::gdt::user_code_selector().0 as u64);
+            ptr::addr_of_mut!((*context).rflags).write(user_rflags);
+            kernel_lowlevel::interrupts::dispatch_saved_user_context(context)
+        }
+    }
+
+    pub const SAVED_CONTEXT_BYTES: usize = kernel_lowlevel::interrupts::SAVED_CONTEXT_BYTES;
+    pub const SAVED_CONTEXT_XMM_OFFSET: usize =
+        kernel_lowlevel::interrupts::SAVED_CONTEXT_XMM_OFFSET;
 }
 
 pub mod time {
@@ -251,8 +293,9 @@ pub use boot::{
 };
 pub use cpu::{current_rip, init_simd, simd_mode_name};
 pub use interrupts::{
-    disable_interrupts, init_pic, register_heartbeat_hooks, register_interrupt_hooks,
-    register_task_hooks, restore_kernel_saved_context,
+    SAVED_CONTEXT_BYTES, SAVED_CONTEXT_XMM_OFFSET, disable_interrupts,
+    dispatch_saved_syscall_user_context, init_pic, register_heartbeat_hooks,
+    register_interrupt_hooks, register_task_hooks, restore_kernel_saved_context,
 };
 pub use time::init_rtc;
 
@@ -273,6 +316,17 @@ extern "C" fn software_schedule_interrupt_default_dispatch(
     context_ptr: *mut SavedContext,
 ) -> *mut SavedContext {
     context_ptr
+}
+
+extern "C" fn saved_user_context_default_dispatch(
+    context_ptr: *mut SavedContext,
+) -> kernel_lowlevel::interrupts::SavedUserContextDispatch {
+    kernel_lowlevel::interrupts::SavedUserContextDispatch {
+        context: context_ptr,
+        // Syscall entry executes `swapgs`; without a scheduler callback no
+        // architecture restore can have paired it before returning to user.
+        swapgs_before_iret: 1,
+    }
 }
 
 extern "C" fn reschedule_ipi_interrupt_default_dispatch(

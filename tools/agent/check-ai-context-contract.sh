@@ -45,7 +45,7 @@ assert_max_default() {
 max_bytes AGENTS.md 7000
 max_bytes docs/ai/token-policy.md 7000
 max_bytes docs/ai-map.md 6000
-max_bytes .codex/hooks/session_context.sh 768
+max_bytes .claude/hooks/session_context.sh 768
 
 initial_prompt_line="$(grep -E '^initial_prompt:' .serena/project.yml || true)"
 initial_prompt_bytes="$(printf '%s' "$initial_prompt_line" | wc -c)"
@@ -63,24 +63,22 @@ require_literal docs/ai/token-policy.md 'only stable repository prefix' \
   "token policy keeps a one-file stable prefix"
 forbid_regex docs/ai/README.md 'mandatory source-writing' \
   "AI index does not imply an extra mandatory preload"
-forbid_regex .codex/hooks/session_context.sh 'task-router|token-policy|ai-map|ALL_TOOLS|mcp__' \
+forbid_regex .claude/hooks/session_context.sh 'task-router|token-policy|ai-map|ALL_TOOLS|mcp__' \
   "SessionStart does not inject on-demand policy/tool catalogs"
 forbid_regex .serena/project.yml 'initial_prompt:.*(task-router|token-policy|ai-map|ALL_TOOLS|mcp__)' \
   "Serena startup does not preload on-demand policy/tool catalogs"
 
-# Let Codex derive context and compaction behavior from selected model metadata.
-require_literal .codex/config.toml 'model_verbosity = "low"' \
-  "Codex verbosity stays low"
-forbid_regex .codex/config.toml '^(model_context_window|model_auto_compact_token_limit|model_auto_compact_token_limit_scope)[[:space:]]*=' \
+# Claude Code uses runtime defaults for model context and compaction; keep its
+# project settings free of stale, provider-specific context-limit keys.
+forbid_regex .claude/settings.json '"(model_context_window|model_auto_compact_token_limit|model_auto_compact_token_limit_scope)"[[:space:]]*:' \
   "repo does not override model context or auto-compaction defaults"
 
-actual_mcp="$(sed -n 's/^\[mcp_servers\.\([^]]*\)\]$/\1/p' .codex/config.toml | sort)"
-if [[ "$actual_mcp" == "serena" ]]; then
+if jq -e '.mcpServers | keys == ["serena"] and .serena.command == "serena" and .serena.args == ["start-mcp-server"]' .mcp.json >/dev/null; then
   ok "MCP surface is Serena only"
 else
   bad "MCP surface drifted; expected Serena only"
 fi
-forbid_regex .codex/config.toml 'mcp_servers\.(ast_grep|codegraph|ripgrep)|mcp-ripgrep' \
+forbid_regex .mcp.json 'ast_grep|codegraph|ripgrep|mcp-ripgrep' \
   "retired/redundant source-navigation MCPs stay disabled"
 
 # Claude keeps Serena lifecycle/approval compatibility without forcing ordinary
@@ -95,16 +93,14 @@ forbid_regex .claude/settings.json '"matcher":[[:space:]]*"\*"' \
   "Claude has no all-tools Serena hook"
 forbid_regex .claude/settings.json '"timeout":[[:space:]]*75' \
   "Claude post-edit wrapper has no stale 75s timeout"
-forbid_regex .codex/config.toml '^timeout = 75$' \
-  "Codex post-edit wrapper has no stale 75s timeout"
 
 # Read/output ceilings may tighten, not silently loosen.
-assert_max_default .codex/hooks/pre_read_large_file.sh RUSTOS_HOOK_MAX_WHOLE_READ_BYTES 32768
-assert_max_default .codex/hooks/pre_read_large_file.sh RUSTOS_HOOK_MAX_READ_LINES 120
-assert_max_default .codex/hooks/pre_read_large_file.sh RUSTOS_HOOK_MAX_MCP_ANSWER_CHARS 8000
-assert_max_default .codex/hooks/pre_bash_destructive.sh RUSTOS_HOOK_MAX_SHELL_OUTPUT_TOKENS 3000
-assert_max_default .codex/hooks/pre_bash_destructive.sh RUSTOS_HOOK_MAX_WHOLE_READ_BYTES 32768
-require_literal .codex/hooks/selftest.sh 'unbudgeted large AI document cat is denied' \
+assert_max_default .claude/hooks/pre_read_large_file.sh RUSTOS_HOOK_MAX_WHOLE_READ_BYTES 32768
+assert_max_default .claude/hooks/pre_read_large_file.sh RUSTOS_HOOK_MAX_READ_LINES 120
+assert_max_default .claude/hooks/pre_read_large_file.sh RUSTOS_HOOK_MAX_MCP_ANSWER_CHARS 8000
+assert_max_default .claude/hooks/pre_bash_destructive.sh RUSTOS_HOOK_MAX_SHELL_OUTPUT_TOKENS 3000
+assert_max_default .claude/hooks/pre_bash_destructive.sh RUSTOS_HOOK_MAX_WHOLE_READ_BYTES 32768
+require_literal .claude/hooks/selftest.sh 'unbudgeted large AI document cat is denied' \
   "shell path enforces the large AI document read ceiling"
 require_literal .agents/hooks/lib.sh 'tail -n 8' "failure tail remains <= 8 lines"
 require_literal .agents/hooks/lib.sh 'head -c 2048' "failure payload remains <= 2048 bytes"
@@ -112,11 +108,11 @@ forbid_regex .agents/hooks/post_edit_rust.sh 'cargo[[:space:]]+xtask[[:space:]]+
   "PostToolUse does not run the full workspace check"
 require_literal .agents/hooks/post_edit_rust.sh 'formal/check-rust-source-contracts.py' \
   "PostToolUse keeps the cheap source-contract lint"
-forbid_regex .github/workflows/agent-tools-bootstrap.yml '\.codex/hooks/\*\*|\.agents/hooks/\*\*|tools/check-dev-environment\.sh' \
+forbid_regex .github/workflows/agent-tools-bootstrap.yml '\.claude/hooks/\*\*|\.agents/hooks/\*\*|tools/check-dev-environment\.sh' \
   "Serena bootstrap is not retriggered by unrelated hook/environment checks"
 
 # Stale policies that previously caused context/tool inflation must not reappear.
-stale_paths=(AGENTS.md .serena .agents/skills docs/ai docs/ai-map.md .codex/config.toml)
+stale_paths=(AGENTS.md .serena .agents/skills docs/ai docs/ai-map.md .claude/config.toml)
 stale_log="$(mktemp)"
 trap 'rm -f "$stale_log"' EXIT
 if git grep -n -E 'mcp-ripgrep|mcp_servers\.ripgrep|GPT-5\.4 mini' -- \
@@ -128,11 +124,11 @@ else
 fi
 
 # Enforcement chain.
-require_literal .codex/hooks/selftest.sh 'tools/agent/check-ai-context-contract.sh' \
+require_literal .claude/hooks/selftest.sh 'tools/agent/check-ai-context-contract.sh' \
   "hook selftest invokes context contract"
-require_literal .codex/hooks/pre_bash_destructive.sh '.serena/' \
+require_literal .claude/hooks/pre_bash_destructive.sh '.serena/' \
   "commit gate covers Serena AI infrastructure"
-require_literal .codex/hooks/pre_bash_destructive.sh 'docs/ai-map\.md' \
+require_literal .claude/hooks/pre_bash_destructive.sh 'docs/ai-map\.md' \
   "commit gate covers the root AI map"
 require_literal .github/workflows/remote-agent.yml 'tools/agent/check-ai-context-contract.sh' \
   "remote agent validates context contract before commit"

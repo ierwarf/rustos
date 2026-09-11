@@ -7,6 +7,8 @@
 //! the ownership boundary required before local runqueue locks can replace the
 //! legacy catalog lock.
 
+#[cfg(not(test))]
+use core::sync::atomic::AtomicU8;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use super::{
@@ -62,6 +64,33 @@ pub(super) fn atomic_activation_pending(cpu: usize) -> bool {
     ATOMIC_ACTIVATION_PENDING
         .get(cpu)
         .is_some_and(|pending| pending.load(Ordering::Acquire))
+}
+
+/// CPU-local fairness streaks are single-writer dispatch state. Production
+/// keeps them outside the hint lock so an otherwise exact handoff does not
+/// acquire a queue lock merely to update two bytes; host fixtures retain the
+/// fields in `CpuDispatchPolicy` for isolated state-machine tests.
+#[cfg(not(test))]
+static SYSTEM_DISPATCH_STREAK: [AtomicU8; MAX_TRACKED_CPUS] =
+    [const { AtomicU8::new(0) }; MAX_TRACKED_CPUS];
+#[cfg(not(test))]
+static LATENCY_HANDOFF_STREAK: [AtomicU8; MAX_TRACKED_CPUS] =
+    [const { AtomicU8::new(0) }; MAX_TRACKED_CPUS];
+
+#[cfg(not(test))]
+pub(super) fn system_dispatch_streak(cpu: usize) -> u8 {
+    SYSTEM_DISPATCH_STREAK[cpu].load(Ordering::Relaxed)
+}
+
+#[cfg(not(test))]
+pub(super) fn latency_handoff_streak(cpu: usize) -> u8 {
+    LATENCY_HANDOFF_STREAK[cpu].load(Ordering::Relaxed)
+}
+
+#[cfg(not(test))]
+pub(super) fn store_dispatch_streaks(cpu: usize, system: u8, latency: u8) {
+    SYSTEM_DISPATCH_STREAK[cpu].store(system, Ordering::Relaxed);
+    LATENCY_HANDOFF_STREAK[cpu].store(latency, Ordering::Relaxed);
 }
 
 pub(super) type CpuDispatchLock =

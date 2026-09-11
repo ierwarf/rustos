@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Codex PreToolUse shell policy.
+# Claude Code PreToolUse shell policy.
 #
 # One hook handles destructive-command blocking, direct-output token budgets,
 # and conditional pre-commit gates. Harmless shell calls still pay for one
@@ -119,7 +119,7 @@ fi
 if [[ "$cmd" =~ git[[:space:]]+checkout[[:space:]]+\. ]] || [[ "$cmd" =~ git[[:space:]]+restore[[:space:]]+\. ]]; then
   block_destructive "git checkout/restore . (mass discard)"
 fi
-if [[ "$cmd" =~ git[[:space:]]+(checkout|restore)[[:space:]].*(AGENTS\.md|docs/ai/|\.codex/) ]]; then
+if [[ "$cmd" =~ git[[:space:]]+(checkout|restore)[[:space:]].*(AGENTS\.md|docs/ai/|\.claude/) ]]; then
   block_destructive "discarding agent policy/hook files"
 fi
 
@@ -127,7 +127,7 @@ if [[ "$cmd" =~ --no-verify ]] || [[ "$cmd" =~ --no-gpg-sign ]]; then
   block_destructive "skipping hooks or signing"
 fi
 if [[ "$cmd" =~ --dangerously-bypass-hook-trust ]] || [[ "$cmd" =~ --dangerously-bypass-approvals-and-sandbox ]]; then
-  block_destructive "bypassing Codex hook trust or sandbox controls"
+  block_destructive "bypassing Claude Code hook trust or sandbox controls"
 fi
 if [[ "$cmd" =~ ^[[:space:]]*(sudo[[:space:]]+)?(dd|mkfs|fdisk|parted|wipefs) ]]; then
   block_destructive "raw disk command"
@@ -166,8 +166,8 @@ fi
 
 # The agent-policy selftest is relevant only when agent policy or
 # its owned validation infrastructure is actually part of the commit.
-if printf '%s\n' "$staged" | grep -Eq '^(AGENTS\.md|docs/ai-map\.md|\.codex/|\.claude/|\.agents/|\.serena/|\.mcp\.json|docs/ai/|tools/agent/|tools/check-dev-environment\.sh|\.github/workflows/)'; then
-  run_gate "agent hook selftest" 25 .codex/hooks/selftest.sh
+if printf '%s\n' "$staged" | grep -Eq '^(AGENTS\.md|docs/ai-map\.md|\.claude/|\.claude/|\.agents/|\.serena/|\.mcp\.json|docs/ai/|tools/agent/|tools/check-dev-environment\.sh|\.github/workflows/)'; then
+  run_gate "agent hook selftest" 25 .claude/hooks/selftest.sh
 fi
 
 # Before a source/build-system commit, validate the exact current workspace

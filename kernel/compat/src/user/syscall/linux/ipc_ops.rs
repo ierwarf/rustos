@@ -19,6 +19,7 @@ use super::*;
 
 #[path = "ipc_reply_diagnostics.rs"]
 mod diagnostics;
+mod fast_reply;
 #[path = "ipc_call_admission.rs"]
 mod ipc_call_admission;
 #[path = "ipc_fast_metrics.rs"]
@@ -36,6 +37,7 @@ use core::mem::size_of;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 pub(super) use diagnostics::diagnostic_rate_limit_permit;
 use diagnostics::record_ipc_reply_rejection;
+pub(super) use fast_reply::recv_with_sender_blocking_prepared_after_fast_reply;
 #[cfg(rustos_ipc_phase_profile)]
 pub(super) use ipc_fast_metrics::drain_fast_ipc_counters;
 use ipc_fast_metrics::{IpcFastCounter, note_fast_ipc, note_fast_ipc_handoff_rejection};
@@ -2022,6 +2024,33 @@ fn recv_with_sender_blocking_prepared(
     sender_tid_ptr: u64,
     deadline_tick: Option<u64>,
 ) -> Result<(usize, bool), (i64, bool)> {
+    recv_with_sender_blocking_prepared_inner(
+        endpoint,
+        task_id,
+        retained_mm,
+        request_ptr,
+        request_capacity,
+        reply_cap_ptr,
+        sender_pid_ptr,
+        sender_tid_ptr,
+        deadline_tick,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn recv_with_sender_blocking_prepared_inner(
+    endpoint: KernelEndpointHandle,
+    task_id: u64,
+    retained_mm: &multitask::RetainedCurrentUserAddressSpace,
+    request_ptr: u64,
+    request_capacity: usize,
+    reply_cap_ptr: u64,
+    sender_pid_ptr: u64,
+    sender_tid_ptr: u64,
+    deadline_tick: Option<u64>,
+    mut deferred_fast_reply: Option<fast_reply::DeferredFastReply>,
+) -> Result<(usize, bool), (i64, bool)> {
     let mut yielded = false;
     let take_mark = server_phase_mark();
     loop {
@@ -2106,7 +2135,10 @@ fn recv_with_sender_blocking_prepared(
                         return Err((LINUX_EBUSY, yielded));
                     }
                 }
-                let committed = multitask::commit_block_current_task_and_yield();
+                let committed = match deferred_fast_reply.as_mut() {
+                    Some(deferred) => deferred.commit_block_and_yield(),
+                    None => multitask::commit_block_current_task_and_yield(),
+                };
                 if deadline_tick.is_some() {
                     crate::arch::rtc::disarm_sleep_waiter(task_id);
                     // A sender that woke this task already popped it from the

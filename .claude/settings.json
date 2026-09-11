@@ -1,4 +1,5 @@
 {
+  "enabledMcpjsonServers": ["serena"],
   "hooks": {
     "PreToolUse": [
       {
@@ -10,6 +11,39 @@
             "timeout": 3
           }
         ]
+      },
+      {
+        "matcher": "Read|mcp__serena__.*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$(git rev-parse --show-toplevel)/.claude/hooks/pre_read_large_file.sh\"",
+            "timeout": 3,
+            "statusMessage": "Checking read/token bound"
+          }
+        ]
+      },
+      {
+        "matcher": "Edit|Write|mcp__serena__(create_text_file|insert_after_symbol|insert_before_symbol|rename_symbol|replace_content|replace_in_files|replace_symbol_body|safe_delete_symbol)",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$(git rev-parse --show-toplevel)/.claude/hooks/pre_edit_policy.sh\"",
+            "timeout": 3,
+            "statusMessage": "Checking edit policy"
+          }
+        ]
+      },
+      {
+        "matcher": "Bash|mcp__serena__execute_shell_command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$(git rev-parse --show-toplevel)/.claude/hooks/pre_bash_destructive.sh\"",
+            "timeout": 110,
+            "statusMessage": "Checking shell policy"
+          }
+        ]
       }
     ],
     "PostToolUse": [
@@ -19,7 +53,20 @@
           {
             "type": "command",
             "command": "\"$(git rev-parse --show-toplevel)/.agents/hooks/post_edit_rust.sh\"",
-            "timeout": 12
+            "timeout": 12,
+            "statusMessage": "Checking Rust edit"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$(git rev-parse --show-toplevel)/.claude/hooks/user_prompt_policy.sh\"",
+            "timeout": 3,
+            "statusMessage": "Checking prompt safety"
           }
         ]
       }
@@ -31,6 +78,16 @@
             "type": "command",
             "command": "serena-hooks activate --client=claude-code",
             "timeout": 3
+          }
+        ]
+      },
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$(git rev-parse --show-toplevel)/.claude/hooks/session_context.sh\"",
+            "timeout": 3,
+            "statusMessage": "Loading RustOS context"
           }
         ]
       }

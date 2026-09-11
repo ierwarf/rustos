@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Shared PostToolUse hook for Rust edits, wired from Codex and Claude.
+# Shared PostToolUse hook for Rust edits, wired from Claude Code and Claude.
 #
 # Keep the per-edit path cheap: validate structural source contracts only.
 # Workspace compilation/checks are routed explicitly by `cargo xtask dev-plan`

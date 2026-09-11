@@ -68,13 +68,14 @@ impl Scheduler {
         let Some(caller_slot) = self.find_task_slot(caller_task_id) else {
             return FastIpcReplyHandoffOutcome::Rejected;
         };
-        self.complete_fast_ipc_reply_handoff_slot(reply, caller_slot)
+        self.complete_fast_ipc_reply_handoff_slot(reply, caller_slot, false)
     }
 
     fn complete_fast_ipc_reply_handoff_slot(
         &mut self,
         reply: u64,
         caller_slot: usize,
+        immediate_same_cpu: bool,
     ) -> FastIpcReplyHandoffOutcome {
         if self.retired[caller_slot]
             || self.start_suspended[caller_slot]
@@ -105,7 +106,7 @@ impl Scheduler {
         ) {
             return FastIpcReplyHandoffOutcome::Rejected;
         }
-        let direct = self.enqueue_synchronous_handoff_slot(caller_slot);
+        let direct = immediate_same_cpu || self.enqueue_synchronous_handoff_slot(caller_slot);
         if !direct {
             #[cfg(not(test))]
             assert!(
@@ -146,6 +147,7 @@ impl Scheduler {
         caller_task_id: u64,
         context_owner_task_id: u64,
         scheduling_context: ObjectIdentity,
+        immediate_same_cpu: bool,
     ) -> Option<FastIpcReplyHandoffOutcome> {
         let context_owner_slot =
             self.scheduling_context_slot(context_owner_task_id, scheduling_context)?;
@@ -155,7 +157,7 @@ impl Scheduler {
             self.find_task_slot(caller_task_id)?
         };
         let _ = release_reply_donation(reply, ipc_donation::DonationNamespace::IpcReply);
-        Some(self.complete_fast_ipc_reply_handoff_slot(reply, caller_slot))
+        Some(self.complete_fast_ipc_reply_handoff_slot(reply, caller_slot, immediate_same_cpu))
     }
 
     pub(super) fn reply_wake_handoff(&self, slot: usize, task_id: u64) -> Option<ReplyWakeHandoff> {

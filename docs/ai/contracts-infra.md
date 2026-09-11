@@ -7,7 +7,7 @@ Package/stage schemas, runtime control, kernel API, build, fault injection, logg
 - `tools/check-dev-environment.sh` is the read-only prerequisite diagnosis
   entrypoint. Its optional modes correspond to AI, documentation, formal,
   physical-GPU, and release work; it never installs tools or mutates the host.
-- Project MCP launchers in `.codex/config.toml` use exact package versions.
+- Project MCP launchers in `.claude/config.toml` use exact package versions.
   Version changes are reviewed inputs, not an implicit update at agent startup.
   Serena is the project semantic source-navigation MCP. Raw text search uses
   local `rg`; neither source-navigation path is OS acceptance evidence.
@@ -15,7 +15,7 @@ Package/stage schemas, runtime control, kernel API, build, fault injection, logg
   stable prompt prefix and must not duplicate durable contracts or gate output.
 - `tools/agent/check-ai-context-contract.sh` is the executable low-context
   contract. It caps stable/startup context, rejects redundant MCP/tool-policy
-  drift, and prevents read/output ceilings from silently increasing. Codex
+  drift, and prevents read/output ceilings from silently increasing. Claude Code
   commit gating, the remote-agent commit stage, and lightweight CI all run it;
   relaxing a ceiling or adding a stable-prefix file/MCP is an explicit contract
   change rather than incidental infrastructure cleanup.

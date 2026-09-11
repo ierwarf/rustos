@@ -169,14 +169,14 @@ fn fast_ipc_commit_requires_exact_typed_waits_and_mutates_both_peers_once() {
     assert!(scheduler.arm_block_current_task_on_reply(0xdef));
 
     assert_eq!(
-        scheduler.commit_fast_ipc_call_handoff(0xabe, 0xdef, receiver_task_id),
+        scheduler.commit_fast_ipc_call_handoff(0xabe, 0xdef, receiver_task_id, false),
         FastIpcCallHandoffOutcome::ReceiverMismatch
     );
     assert!(!scheduler.contexts[sender_slot].expect("sender retained").blocked);
     assert!(scheduler.contexts[receiver_slot].expect("receiver retained").blocked);
 
     assert_eq!(
-        scheduler.commit_fast_ipc_call_handoff(0xabc, 0xdef, receiver_task_id),
+        scheduler.commit_fast_ipc_call_handoff(0xabc, 0xdef, receiver_task_id, false),
         FastIpcCallHandoffOutcome::CommittedSameCpu
     );
     let sender = scheduler.contexts[sender_slot].expect("sender committed");
@@ -218,7 +218,7 @@ fn fast_ipc_commit_requires_exact_typed_waits_and_mutates_both_peers_once() {
     );
     assert!(scheduler.arm_block_current_task_on_reply(0xfee));
     assert_eq!(
-        scheduler.commit_fast_ipc_call_handoff(0xbee, 0xfee, sender_task_id),
+        scheduler.commit_fast_ipc_call_handoff(0xbee, 0xfee, sender_task_id, false),
         FastIpcCallHandoffOutcome::CommittedCrossCpu
     );
     assert!(

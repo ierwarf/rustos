@@ -964,32 +964,37 @@ pub(super) fn publish_local(slot: usize, cpu: usize, weight: u32) {
 pub(super) fn publish_blocked(slot: usize, cpu: usize, weight: u32) {
     validate_cpu(cpu);
     let owner = owner(slot);
-    let mut rq = RUN_QUEUES[cpu].inner.lock();
-    if owner.state == RunOwnerState::Local {
-        assert_eq!(
-            owner.cpu,
-            Some(cpu),
-            "scheduler blocked a foreign local task"
-        );
-        rq.remove(slot, weight);
-    } else {
-        assert_eq!(
-            owner.state,
-            RunOwnerState::Running,
-            "scheduler blocked invalid owner"
-        );
-        assert_eq!(
-            owner.cpu,
-            Some(cpu),
-            "scheduler blocked a foreign running task"
-        );
+    assert_eq!(
+        owner.cpu,
+        Some(cpu),
+        "scheduler blocked a foreign task owner={owner:?}"
+    );
+    let blocked = owner.next_preserving_wait(RunOwnerState::Blocked, None);
+
+    if owner.state == RunOwnerState::Running {
+        // Running tasks are never members of the fair runqueue. Their block
+        // transition therefore changes only the authoritative owner word; a
+        // queue acquisition cannot remove or publish any additional state.
+        OWNER_WORDS[slot]
+            .compare_exchange(owner, blocked)
+            .unwrap_or_else(|observed| {
+                panic!("scheduler running block lost owner race observed={observed:?}")
+            });
+        return;
     }
-    OWNER_WORDS[slot]
-        .compare_exchange(
-            owner,
-            owner.next_preserving_wait(RunOwnerState::Blocked, None),
-        )
-        .unwrap_or_else(|observed| panic!("scheduler block lost owner race observed={observed:?}"));
+
+    assert_eq!(
+        owner.state,
+        RunOwnerState::Local,
+        "scheduler blocked invalid owner"
+    );
+    let mut rq = RUN_QUEUES[cpu].inner.lock();
+    rq.remove(slot, weight);
+    if let Err(observed) = OWNER_WORDS[slot].compare_exchange(owner, blocked) {
+        rq.insert(slot, weight);
+        RUN_QUEUES[cpu].publish_load(&rq);
+        panic!("scheduler local block lost owner race observed={observed:?}");
+    }
     RUN_QUEUES[cpu].publish_load(&rq);
 }
 

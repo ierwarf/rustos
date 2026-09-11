@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Codex PreToolUse hook for source-navigation/read tools.
+# Claude Code PreToolUse hook for source-navigation/read tools.
 # Blocks whole-file token bombs and oversized Serena answers while allowing
 # focused reads and compact symbol/navigation queries.
 

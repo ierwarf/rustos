@@ -527,6 +527,16 @@ pub(super) fn take_next_ready(
     taken
 }
 
+/// Whether an exact same-CPU handoff may bypass the FIFO without weakening
+/// the bounded chain rule. The caller still checks for a fair competitor and
+/// records the accepted dispatch through `record_dispatch`.
+#[cfg(not(test))]
+pub(super) fn immediate_handoff_allowed(cpu: usize, fair_competitor_ready: bool) -> bool {
+    !fair_competitor_ready
+        || SYNC_HANDOFF_STREAK[cpu].load(core::sync::atomic::Ordering::Relaxed)
+            < MAX_SYNC_HANDOFF_CHAIN_TICKS
+}
+
 #[cfg(not(test))]
 pub(super) fn record_dispatch(cpu: usize, synchronous_handoff: bool, now_ticks: u64) {
     let streak = &SYNC_HANDOFF_STREAK[cpu];

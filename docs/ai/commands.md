@@ -478,7 +478,7 @@ fallback.
 
 ## Docs verification
 
-- `.codex/hooks/selftest.sh` for the versioned agent/hook policy bundle.
+- `.claude/hooks/selftest.sh` for the versioned agent/hook policy bundle.
 - `mdbook build` if `mdbook` exists.
 - Inspect markdown links with pattern `\[[^]]+\]\(([^)#]+\.md)`.
 - Top-level human docs should include `[English](#english) | [한국어](#korean)`.

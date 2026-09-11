@@ -19,7 +19,7 @@ Read-only RustOS development environment diagnosis. The base check validates
 the pinned Rust toolchain and common host tools. Optional modes add their own
 requirements without installing packages or changing host configuration.
 
-  --ai            require project Codex/Serena source-navigation tools
+  --ai            require project Claude Code/Serena source-navigation tools
   --docs          require the pinned mdBook version
   --formal        require formal host tools and validate the model registry
   --physical-gpu  require QEMU 11+, KVM, IOMMUFD, and VFIO device nodes
@@ -81,8 +81,8 @@ fi
 if test "$CHECK_AI" -eq 1; then
     require_command serena
     require_command rg
-    grep -q 'serena-agent==1.6.0' .codex/config.toml || bad "Serena MCP pin missing"
-    grep -q 'mcp_servers.serena' .codex/config.toml || bad "Serena MCP config missing"
+    grep -q 'serena-agent==1.6.0' .claude/config.toml || bad "Serena MCP pin missing"
+    grep -q 'mcp_servers.serena' .claude/config.toml || bad "Serena MCP config missing"
 fi
 
 if test "$CHECK_DOCS" -eq 1; then

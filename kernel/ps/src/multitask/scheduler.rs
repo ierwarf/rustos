@@ -33,6 +33,7 @@ mod activation_batch_tests;
 mod context_validation;
 mod dispatch_policy;
 mod donation_ledger;
+mod fast_ipc;
 mod handoff_queue;
 mod handoffs;
 pub(in crate::multitask) mod ipc_donation;
@@ -512,7 +513,7 @@ impl SchedulerDispatch {
         }
     }
 
-    const fn requires_architectural_restore(self) -> bool {
+    pub(super) const fn requires_architectural_restore(self) -> bool {
         self.previous_slot != self.next_slot
     }
 
@@ -1478,6 +1479,7 @@ impl Scheduler {
         endpoint: u64,
         reply: u64,
         receiver_task_id: u64,
+        immediate_same_cpu: bool,
     ) -> FastIpcCallHandoffOutcome {
         let sender_slot = self.current_task_slot();
         let sender_matches = !self.retired[sender_slot]
@@ -1549,7 +1551,7 @@ impl Scheduler {
             ) {
                 return FastIpcCallHandoffOutcome::DirectCustodyUnavailable;
             }
-            if !self.enqueue_synchronous_handoff_slot(receiver_slot) {
+            if !immediate_same_cpu && !self.enqueue_synchronous_handoff_slot(receiver_slot) {
                 #[cfg(not(test))]
                 assert!(
                     runqueue::rollback_direct_handoff(receiver_slot, current_cpu),
@@ -1669,7 +1671,11 @@ impl Scheduler {
         &self,
         policy: &mut CpuDispatchGuard<'_>,
     ) -> Option<usize> {
-        if policy.latency_handoff_streak >= MAX_CONSECUTIVE_LATENCY_HANDOFFS {
+        #[cfg(test)]
+        let latency_streak = policy.latency_handoff_streak;
+        #[cfg(not(test))]
+        let latency_streak = dispatch_policy::latency_handoff_streak(Self::current_dispatch_cpu());
+        if latency_streak >= MAX_CONSECUTIVE_LATENCY_HANDOFFS {
             return None;
         }
         while policy.latency_pick_hint_len != 0 {
@@ -2352,34 +2358,62 @@ impl Scheduler {
     }
 
     fn user_reservation_due(policy: &CpuDispatchGuard<'_>) -> bool {
-        policy.system_dispatch_streak >= MAX_CONSECUTIVE_SYSTEM_DISPATCHES
+        #[cfg(test)]
+        {
+            policy.system_dispatch_streak >= MAX_CONSECUTIVE_SYSTEM_DISPATCHES
+        }
+        #[cfg(not(test))]
+        {
+            let _ = policy;
+            dispatch_policy::system_dispatch_streak(Self::current_dispatch_cpu())
+                >= MAX_CONSECUTIVE_SYSTEM_DISPATCHES
+        }
     }
 
-    /// Records both per-dispatch streaks in one acquisition.
+    /// Records both per-dispatch streaks without sharing ownership between CPUs.
     ///
-    /// The class lookup does not need the policy, and the two streaks are two
-    /// counters in the same structure: taking it once for each charged every
-    /// dispatch two acquisitions of a lock it holds exclusively either way.
-    /// The per-caller lock census measured this site as the most-acquired
-    /// `SchedulerPolicy` caller in the system.
+    /// Production state is one pair of relaxed atomics per logical CPU and has
+    /// exactly one interrupt-disabled writer. Host schedulers retain their
+    /// isolated lock-backed fixture fields.
     fn record_dispatch_streaks(&mut self, slot: usize, latency_handoff: bool) {
         let class = self.slot_class(slot);
-        let mut policy = self.current_dispatch_policy_mut();
-        policy.system_dispatch_streak = match class {
-            Some(SchedClass::System) => policy
-                .system_dispatch_streak
-                .saturating_add(1)
-                .min(MAX_CONSECUTIVE_SYSTEM_DISPATCHES),
-            Some(SchedClass::User | SchedClass::Idle) | None => 0,
-        };
-        policy.latency_handoff_streak = if latency_handoff {
-            policy
-                .latency_handoff_streak
-                .saturating_add(1)
-                .min(MAX_CONSECUTIVE_LATENCY_HANDOFFS)
-        } else {
-            0
-        };
+        #[cfg(test)]
+        {
+            let mut policy = self.current_dispatch_policy_mut();
+            policy.system_dispatch_streak = match class {
+                Some(SchedClass::System) => policy
+                    .system_dispatch_streak
+                    .saturating_add(1)
+                    .min(MAX_CONSECUTIVE_SYSTEM_DISPATCHES),
+                Some(SchedClass::User | SchedClass::Idle) | None => 0,
+            };
+            policy.latency_handoff_streak = if latency_handoff {
+                policy
+                    .latency_handoff_streak
+                    .saturating_add(1)
+                    .min(MAX_CONSECUTIVE_LATENCY_HANDOFFS)
+            } else {
+                0
+            };
+        }
+        #[cfg(not(test))]
+        {
+            let cpu = Self::current_dispatch_cpu();
+            let system = match class {
+                Some(SchedClass::System) => dispatch_policy::system_dispatch_streak(cpu)
+                    .saturating_add(1)
+                    .min(MAX_CONSECUTIVE_SYSTEM_DISPATCHES),
+                Some(SchedClass::User | SchedClass::Idle) | None => 0,
+            };
+            let latency = if latency_handoff {
+                dispatch_policy::latency_handoff_streak(cpu)
+                    .saturating_add(1)
+                    .min(MAX_CONSECUTIVE_LATENCY_HANDOFFS)
+            } else {
+                0
+            };
+            dispatch_policy::store_dispatch_streaks(cpu, system, latency);
+        }
     }
 
     /// Removes the current user task's *base* System-class admission and caps

@@ -48,7 +48,7 @@ routed task requires a bounded read there.
 
 Never dump `ALL_TOOLS` or bulk tool descriptions. Do not gather evidence that
 cannot change the next decision. At meaningful milestones refresh the short
-handoff and let Codex use model-specific default compaction rather than a
+handoff and let Claude Code use model-specific default compaction rather than a
 repo-pinned early threshold.
 
 ## Contracts and validation

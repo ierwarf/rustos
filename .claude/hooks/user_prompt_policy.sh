@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Codex UserPromptSubmit hook.
+# Claude Code UserPromptSubmit hook.
 # Blocks obvious secret material before it is added to the model-visible prompt.
 
 set -euo pipefail

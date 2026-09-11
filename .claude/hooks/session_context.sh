@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Codex SessionStart hook. Keep injected context tiny; detailed policy is on demand.
+# Claude Code SessionStart hook. Keep injected context tiny; detailed policy is on demand.
 
 set -euo pipefail
 

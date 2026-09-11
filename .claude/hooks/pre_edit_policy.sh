@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Codex PreToolUse hook for apply_patch/Edit/Write.
+# Claude Code PreToolUse hook for apply_patch/Edit/Write.
 # Protects generated/vendor/token-bomb paths from accidental agent edits and
 # forces broad edits to be split into reviewable slices.
 

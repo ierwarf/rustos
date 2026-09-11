@@ -9,7 +9,7 @@ on:
       - ".github/workflows/agent-tools-bootstrap.yml"
       - "tools/agent/bootstrap-remote-ai-tools.sh"
       - "rust-toolchain.toml"
-      - ".codex/config.toml"
+      - ".claude/config.toml"
       - ".mcp.json"
       - ".serena/project.yml"
 

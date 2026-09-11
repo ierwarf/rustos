@@ -1900,55 +1900,41 @@ pub fn take_fast_endpoint_request(
     endpoint: KernelEndpointHandle,
     receiver_task_id: u64,
 ) -> Result<Option<FastEndpointReceived>, IpcError> {
-    let Some(reply_id) = ENDPOINTS
-        .with(endpoint.raw(), |endpoint_object| endpoint_object.fast_reply)
-        .ok_or(IpcError::InvalidHandle)?
-    else {
-        return Ok(None);
-    };
-    let eligible = REPLIES.with(reply_id, |reply_object| {
-        reply_object.fast_frame.as_ref().is_some_and(|frame| {
-            frame.endpoint_id == endpoint.raw()
-                && frame.receiver_task_id == receiver_task_id
-                && frame.state == FastCallState::RequestReady
-        })
-    });
-    if eligible != Some(true) {
-        return Err(IpcError::PermissionDenied);
-    }
-    let taken = ENDPOINTS.with_mut(endpoint.raw(), |endpoint_object| {
-        if endpoint_object.fast_reply == Some(reply_id) {
-            endpoint_object.fast_reply.take();
-            true
-        } else {
-            false
-        }
-    });
-    if taken != Some(true) {
-        return Ok(None);
-    }
-    REPLIES
-        .with_mut(reply_id, |reply_object| {
-            let frame = reply_object
-                .fast_frame
-                .as_mut()
-                .ok_or(IpcError::InvalidHandle)?;
-            if frame.state != FastCallState::RequestReady
-                || frame.receiver_task_id != receiver_task_id
-            {
-                return Err(IpcError::InvalidHandle);
-            }
-            frame.state = FastCallState::RequestTaken;
-            Ok(FastEndpointReceived {
-                reply: KernelReplyHandle::from_raw(reply_id),
-                caller_process_id: frame.caller_process_id,
-                caller_task_id: frame.caller_task_id,
-                request_len: frame.request_len,
-                request: frame.request,
-            })
+    ENDPOINTS
+        .with_mut(endpoint.raw(), |endpoint_object| {
+            let Some(reply_id) = endpoint_object.fast_reply else {
+                return Ok(None);
+            };
+            // LOCK ORDER: IpcEndpoint precedes IpcReply. Holding both makes the
+            // endpoint reservation and reply-frame state one transaction, so a
+            // separate advisory read and later endpoint reacquisition cannot
+            // split validation from consumption.
+            let received = REPLIES
+                .with_mut(reply_id, |reply_object| {
+                    let frame = reply_object
+                        .fast_frame
+                        .as_mut()
+                        .ok_or(IpcError::InvalidHandle)?;
+                    if frame.endpoint_id != endpoint.raw()
+                        || frame.receiver_task_id != receiver_task_id
+                        || frame.state != FastCallState::RequestReady
+                    {
+                        return Err(IpcError::PermissionDenied);
+                    }
+                    frame.state = FastCallState::RequestTaken;
+                    Ok(FastEndpointReceived {
+                        reply: KernelReplyHandle::from_raw(reply_id),
+                        caller_process_id: frame.caller_process_id,
+                        caller_task_id: frame.caller_task_id,
+                        request_len: frame.request_len,
+                        request: frame.request,
+                    })
+                })
+                .ok_or(IpcError::PermissionDenied)??;
+            endpoint_object.fast_reply = None;
+            Ok(Some(received))
         })
         .ok_or(IpcError::InvalidHandle)?
-        .map(Some)
 }
 
 pub fn complete_fast_endpoint_reply_for_task(

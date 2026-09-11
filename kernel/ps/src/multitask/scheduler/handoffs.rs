@@ -449,6 +449,28 @@ impl Scheduler {
         }
     }
 
+    /// Validates one exact same-CPU handoff without publishing it through the
+    /// multi-producer FIFO. The caller still owns the scheduler transaction,
+    /// while the atomic streak gate preserves the same fair-chain ceiling.
+    pub(super) fn immediate_synchronous_handoff_ready_slot(&self, task_id: u64) -> Option<usize> {
+        let slot = self.find_task_slot(task_id)?;
+        #[cfg(not(test))]
+        let cpu = Self::current_dispatch_cpu();
+        #[cfg(not(test))]
+        {
+            let fair_competitor_ready = runqueue::local_runnable_slots(cpu).any(|candidate| {
+                self.is_fair_candidate_slot(candidate) && self.slot_is_runnable(candidate)
+            });
+            if !sync_handoff::immediate_handoff_allowed(cpu, fair_competitor_ready) {
+                let _ = runqueue::materialize_direct_handoff(slot, cpu, self.slot_weight(slot));
+                return None;
+            }
+        }
+        let record = sync_handoff::SyncHandoffRecord::new(slot, task_id);
+        self.synchronous_handoff_record_is_ready(record)
+            .then_some(slot)
+    }
+
     pub(super) fn record_synchronous_handoff(&mut self, synchronous_handoff: bool, now_ticks: u64) {
         let cpu = Self::current_dispatch_cpu();
         #[cfg(test)]
