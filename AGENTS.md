@@ -87,3 +87,24 @@ reasoning effort; the main agent owns integration and validation.
 External research is mandatory for a new subsystem architecture or unfamiliar
 external ABI/specification. Otherwise prefer local evidence. At completion,
 briefly state what changed, validation actually run, and any unverified boundary.
+
+## OMP execution policy
+
+When running under OMP:
+
+- Batch independent reads/searches/tool calls into one model turn.
+- Search before reading. Prefer symbol/selector reads and keep ordinary reads
+  at <=120 lines unless a larger contiguous range is genuinely required.
+- Never perform an unbounded repository-wide grep. Constrain by path/glob and
+  return only the small set of matches needed for the next decision.
+- Keep finite commands expected to finish within about 120 seconds in the
+  foreground. Do not background them merely to remain responsive.
+- For commands expected to run for several minutes or longer, use async/hub
+  execution with a sufficient or disabled command timeout.
+- After starting a long-running job, do not repeatedly poll status. Either
+  wait once with a realistic timeout or rely on OMP's completion delivery.
+- Never stream full build, KVM, serial, formal, or mutation logs into model
+  context. Inspect the first useful failure plus a bounded tail.
+- Do not rediscover tools whose invocation contract is already known.
+- Do not reread MCP initialization/instruction resources once loaded in the
+  current session.

@@ -47,6 +47,18 @@ max_bytes docs/ai/token-policy.md 7000
 max_bytes docs/ai-map.md 6000
 max_bytes .claude/hooks/session_context.sh 768
 
+# Native OMP settings tune execution only. Root AGENTS.md remains the sole
+# repository instruction prefix, without a second native context/rule file.
+if [[ -e .omp/AGENTS.md || -e .omp/RULES.md ]]; then
+  bad "OMP project settings add a second instruction prefix"
+else
+  ok "OMP project settings do not add an instruction prefix"
+fi
+require_literal .omp/config.yml '  - cline' "OMP disables the removed Cline provider"
+require_literal .omp/config.yml 'defaultLimit: 120' "OMP default read remains bounded"
+require_literal .omp/config.yml 'artifactSpillThreshold: 16' "OMP spills large tool output early"
+require_literal .omp/config.yml 'maxConcurrency: 8' "OMP bounds subagent fan-out"
+
 initial_prompt_line="$(grep -E '^initial_prompt:' .serena/project.yml || true)"
 initial_prompt_bytes="$(printf '%s' "$initial_prompt_line" | wc -c)"
 if [[ -n "$initial_prompt_line" ]] && (( initial_prompt_bytes <= 512 )); then
