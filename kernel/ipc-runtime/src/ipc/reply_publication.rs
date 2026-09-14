@@ -13,7 +13,18 @@ static REPLY_MESSAGE_IDS: [AtomicU64; MAX_REPLY_OBJECTS] =
 
 pub(super) fn insert_reply_object(reply_object: ReplyObject) -> Result<u64, ReplyObject> {
     let message_id = reply_object.message_id;
-    let reply_id = REPLIES.insert(reply_object)?;
+    // A synchronous caller has at most one outstanding fast call. Prefer its
+    // stable slot instead of rotating through the reply pool and writing the
+    // shared allocation cursor on every round trip. The hint is not authority:
+    // collisions and exhausted generations retain the bounded full-pool scan.
+    let hint = reply_object
+        .fast_frame
+        .as_ref()
+        .map(|frame| frame.caller_task_id);
+    let reply_id = match hint {
+        Some(hint) => REPLIES.insert_with_hint(reply_object, hint)?,
+        None => REPLIES.insert(reply_object)?,
+    };
     if let Some(index) = slab::slot_index::<MAX_REPLY_OBJECTS>(reply_id) {
         REPLY_MESSAGE_IDS[index].store(message_id, Ordering::Release);
     }

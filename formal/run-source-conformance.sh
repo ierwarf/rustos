@@ -1279,6 +1279,10 @@ authority-identity-lifecycle/AuthorityIdentityLifecycle|kernel-ps|multitask::ide
 authority-identity-lifecycle/AuthorityIdentityLifecycle|kernel-ps|multitask::process_table::tests::process_generations_fail_closed_instead_of_aliasing_stale_handles
 authority-identity-lifecycle/AuthorityIdentityLifecycle|kernel-compat|user::syscall::linux::proc_broker_ops::tests::broker_authority_identity_exhaustion_never_wraps
 authority-identity-lifecycle/AuthorityIdentityLifecycle|kernel-ipc-runtime|ipc::slab::tests::removed_handle_never_aliases_reused_slot
+authority-identity-lifecycle/AuthorityIdentityLifecycle|kernel-ipc-runtime|ipc::slab::tests::hinted_reuse_changes_generation_without_touching_global_cursor
+authority-identity-lifecycle/AuthorityIdentityLifecycle|kernel-ipc-runtime|ipc::slab::tests::hinted_collisions_use_full_capacity_and_preserve_unpublished_value
+authority-identity-lifecycle/AuthorityIdentityLifecycle|kernel-ipc-runtime|ipc::slab::tests::hinted_allocation_skips_permanently_exhausted_generation
+authority-identity-lifecycle/AuthorityIdentityLifecycle|kernel-ipc-runtime|ipc::slab::tests::concurrent_hinted_allocations_never_share_live_authority
 capability-derivation-lifecycle/CapabilityDerivationLifecycle|kernel-object|identity::tests::identity_rejects_zero_slot_or_generation
 capability-derivation-lifecycle/CapabilityDerivationLifecycle|kernel-object|identity::tests::capability_epochs_keep_lease_and_revoke_distinct
 capability-derivation-lifecycle/CapabilityDerivationLifecycle|kernel-object|handle::tests::typed_rights_attenuation_rejects_widening_and_kind_substitution
@@ -1480,6 +1484,7 @@ scheduling-context-budget/SchedulingContextBudget|kernel-executive|boot::tests::
 scheduling-context-budget/SchedulingContextBudget|rootd|tests::scheduling_policy_is_owned_by_the_immutable_service_manifest|host-test
 ipc-fast-handoff/IpcFastHandoff|kernel-ps|multitask::scheduler::runqueue::tests::direct_handoff_bypasses_the_fair_runqueue_and_is_cpu_exact
 ipc-fast-handoff/IpcFastHandoff|kernel-ipc-runtime|ipc::tests::fast_call_tests::fast_call_uses_fixed_frame_and_exact_receiver_caller_identities
+ipc-fast-handoff/IpcFastHandoff|kernel-ipc-runtime|ipc::tests::fast_call_tests::fast_calls_reuse_caller_reply_slot_without_reusing_authority
 ipc-fast-handoff/IpcFastHandoff|kernel-ipc-runtime|ipc::tests::fast_call_tests::fast_call_rollback_restores_exact_front_waiter_and_custody
 ipc-fast-handoff/IpcFastHandoff|kernel-ps|multitask::scheduler::tests::fast_ipc_commit_requires_exact_typed_waits_and_mutates_both_peers_once
 ipc-fast-handoff/IpcFastHandoff|syscalld|fast_offload::tests::compact_id_wire_is_fixed_frame_bounded_sender_exact_and_lossless

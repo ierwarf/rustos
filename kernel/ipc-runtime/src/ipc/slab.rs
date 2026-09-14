@@ -76,6 +76,32 @@ impl<T, const N: usize, const CLASS: u8> GenerationalSlab<T, N, CLASS> {
         Err(value.expect("slab insertion value disappeared without a free slot"))
     }
 
+    /// Allocates from an advisory locality hint without updating the shared
+    /// round-robin cursor. Every candidate still takes its slot lock and checks
+    /// vacancy and generation; the hint grants no object authority. Collisions
+    /// scan the full pool, so locality never partitions capacity.
+    #[track_caller]
+    pub fn insert_with_hint(&self, value: T, hint: u64) -> Result<u64, T> {
+        assert!(N != 0 && N < INDEX_MASK as usize);
+        let start = (hint % N as u64) as usize;
+        let mut value = Some(value);
+        for offset in 0..N {
+            let index = (start + offset) % N;
+            let inserted = self.with_slot(index, |slot| {
+                if slot.value.is_some() || slot.generation == 0 {
+                    return None;
+                }
+                let handle = slot.handle(index);
+                slot.value = value.take();
+                Some(handle)
+            });
+            if let Some(handle) = inserted {
+                return Ok(handle);
+            }
+        }
+        Err(value.expect("hinted slab insertion lost its unpublished value"))
+    }
+
     #[track_caller]
     pub fn with<R>(&self, handle: u64, f: impl FnOnce(&T) -> R) -> Option<R> {
         let (index, generation) = decode_handle::<N>(handle)?;
@@ -271,5 +297,72 @@ mod tests {
         let slab = GenerationalSlab::<u64, 1, TEST_CLASS>::new();
         let _ = slab.insert(1).expect("first insert");
         assert_eq!(slab.insert(2), Err(2));
+    }
+
+    #[test]
+    fn hinted_reuse_changes_generation_without_touching_global_cursor() {
+        use core::sync::atomic::Ordering;
+        let slab = GenerationalSlab::<u64, 4, TEST_CLASS>::new();
+        let mut previous = None;
+        for value in 0..128 {
+            let handle = slab.insert_with_hint(value, 2).unwrap();
+            assert_eq!(super::slot_index::<4>(handle), Some(2));
+            if let Some(stale) = previous {
+                assert_ne!(handle, stale);
+                assert_eq!(slab.with(stale, |v| *v), None);
+                assert_eq!(slab.remove(stale), None);
+            }
+            assert_eq!(slab.remove(handle), Some(value));
+            previous = Some(handle);
+        }
+        assert_eq!(slab.next_hint.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn hinted_collisions_use_full_capacity_and_preserve_unpublished_value() {
+        let slab = GenerationalSlab::<u64, 4, TEST_CLASS>::new();
+        let handles: [_; 4] =
+            core::array::from_fn(|i| slab.insert_with_hint(i as u64, u64::MAX).unwrap());
+        assert_eq!(slab.insert_with_hint(99, u64::MAX), Err(99));
+        for (i, handle) in handles.into_iter().enumerate() {
+            assert_eq!(slab.remove(handle), Some(i as u64));
+        }
+        assert!(slab.insert_with_hint(99, u64::MAX).is_ok());
+    }
+
+    #[test]
+    fn hinted_allocation_skips_permanently_exhausted_generation() {
+        let slab = GenerationalSlab::<u64, 4, TEST_CLASS>::new();
+        slab.with_slot(2, |slot| slot.generation = super::MAX_GENERATION);
+        let last = slab.insert_with_hint(11, 2).unwrap();
+        assert_eq!(super::slot_index::<4>(last), Some(2));
+        assert_eq!(slab.remove(last), Some(11));
+        let next = slab.insert_with_hint(22, 2).unwrap();
+        assert_eq!(super::slot_index::<4>(next), Some(3));
+        assert_eq!(slab.with(last, |v| *v), None);
+        assert_eq!(slab.with(next, |v| *v), Some(22));
+    }
+
+    #[test]
+    fn concurrent_hinted_allocations_never_share_live_authority() {
+        let slab = GenerationalSlab::<u64, 4, TEST_CLASS>::new();
+        let barrier = std::sync::Barrier::new(4);
+        std::thread::scope(|scope| {
+            let threads: [_; 4] = core::array::from_fn(|i| {
+                let slab = &slab;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    slab.insert_with_hint(i as u64, 0).unwrap()
+                })
+            });
+            let handles = threads.map(|thread| thread.join().unwrap());
+            for i in 0..4 {
+                assert_eq!(slab.with(handles[i], |v| *v), Some(i as u64));
+                for j in 0..i {
+                    assert_ne!(handles[i], handles[j]);
+                }
+            }
+        });
     }
 }

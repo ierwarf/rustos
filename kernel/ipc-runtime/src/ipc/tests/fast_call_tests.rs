@@ -56,6 +56,42 @@ fn fast_call_uses_fixed_frame_and_exact_receiver_caller_identities() {
 }
 
 #[test]
+fn fast_calls_reuse_caller_reply_slot_without_reusing_authority() {
+    with_isolated_ipc_test(|| {
+        use super::super::*;
+        let endpoint = create_endpoint().unwrap();
+        let mut previous = None;
+        for _ in 0..32 {
+            add_endpoint_receiver_waiter(endpoint, 11).unwrap();
+            let (reply, receiver) =
+                reserve_fast_endpoint_call(endpoint, 70, 7, b"request", None).unwrap();
+            assert_eq!(receiver, 11);
+            if let Some(stale) = previous {
+                assert_ne!(reply, stale);
+                assert_eq!(
+                    slab::slot_index::<MAX_REPLY_OBJECTS>(reply.raw()),
+                    slab::slot_index::<MAX_REPLY_OBJECTS>(stale.raw()),
+                );
+                assert_eq!(
+                    take_fast_endpoint_response(stale, 7),
+                    Err(IpcError::InvalidHandle)
+                );
+            }
+            take_fast_endpoint_request(endpoint, 11).unwrap().unwrap();
+            complete_fast_endpoint_reply_for_task(reply, 11, b"response").unwrap();
+            assert!(matches!(
+                take_fast_endpoint_response(reply, 7),
+                Ok(FastEndpointResponseTake::Response {
+                    response_len: 8,
+                    ..
+                })
+            ));
+            previous = Some(reply);
+        }
+    });
+}
+
+#[test]
 fn fast_call_rejects_oversize_and_ordinary_queue_without_partial_publication() {
     with_isolated_ipc_test(|| {
         let endpoint = super::super::create_endpoint().expect("create endpoint");

@@ -1,64 +1,43 @@
 # Session Handoff
 
-**Role:** volatile resume note for the current checkout. Live goal state, Git
-status/diff, source, and fresh command output override this file.
+Volatile resume note; live Git state and fresh tool evidence take precedence.
 
-## Current change set
+## Current task
 
-The local checkout is completing one unified address-space/COW change set and
-is intentionally dirty. Preserve every scoped tracked/untracked path; inspect
-live Git state before editing, and do not split or discard the set without
-reconstructing its contract/formal dependencies.
+Optimize scheduler/IPC structurally using external references, Serena edits,
+disassembly, and repeated real `cargo xtask bench` runs. Targets for the
+production-shaped `ipc_rt_intra_process_reply_recv`: 1 CPU p99 <10,000 ticks;
+8 CPU p50 <10,000 and p99 <20,000. **Not achieved.** Do not weaken overflow,
+SIMD isolation, timing samples, authority checks, or benchmark readiness.
 
-Target/owners:
+## Current change
 
-- `pager_vma` is the single reservation/commit authority with explicit
-  `Reserved` versus `Committed` state.
-- `frame_descriptor_ledger` owns frame roles and bounded exact
-  `(root, virtual address, frame)` aliases.
-- Anonymous-fork and private-file/section COW share that frame authority;
-  Linux `MAP_PRIVATE` and Windows `PAGE_WRITECOPY` frontends must not create a
-  parallel allocation ledger.
-- Copy/split, unmap, decommit, retirement, and reclamation reconcile PTE, VMA,
-  and frame-ledger state. Pager policy uses bounded seqlock publication.
-- Durable contracts: `address-space-lifecycle-contract.md`,
-  `fork-cow-contract.md`, `pager-protocol-contract.md`, and
-  `page-table-reclamation-contract.md`.
+Started on clean `b44fe9e8` (receive-or-wait was already committed). Uncommitted:
+- `ipc/slab.rs`: advisory hinted allocation retains slot locks, generations,
+  bounded full-pool fallback; does not update the shared allocation cursor.
+- `ipc/reply_publication.rs`: use kernel-stamped caller task ID for fast replies;
+  ordinary replies keep round-robin allocation. No per-caller reserved capacity.
+- Five regression witnesses cover hot reuse, stale/exhausted generations, full
+  capacity, concurrent authority, and real fast-call lifetime; registered in
+  source conformance. Benchmark documentation records evidence and limitations.
 
-## Critical current invariants
+## Evidence
 
-Fork publishes a child only after reservation clone, parent write downgrade,
-exact alias installation, acknowledged invalidation, and ledger reconciliation.
-Clone-internal failure restores parent downgrades. Pre-activation cancellation
-removes child aliases but may leave the sole parent alias read-only/COW; the
-next logical write may promote it in place.
+`build/bench-ipc-struct/` contains logs, exits, disassemblies and artifact hashes.
+71 IPC tests and the selected now lane (30 commands) passed. 8 CPU isolated
+control p50/p99 17,680/314,360; successful candidates 15,440/109,280 and
+15,960/188,400, min anchors 3,640/3,640/3,680. One candidate boot failed
+compositor readiness, and full 8 CPU control timed out. 1 CPU candidate p99
+77,640; control anchor drift invalidated attribution. Do not count failed boots
+or prior discarded SIMD/compiler experiments as shipping acceptance evidence.
+Stable PR validation is the next gate; consult `stable-pr.exit`/`stable-pr.log`
+for its actual result, not an assumption from this note.
 
-Exception-time COW is try-only. Kernel copyout is a logical user write: prove
-an exact live process/MM binding and committed writable private VMA, resolve
-against the retained target root, then translate/validate again. Shared,
-reserved, non-writable, device, memfd, and unknown objects fail closed. Keep the
-`pread`-into-untouched-child-COW regression plus parent/child divergence and
-rejected-authority witnesses.
+## Next
 
-## Completion gate
-
-Before committing the source change set, use fresh source state for:
-
-1. formatting and `git diff --check`;
-2. focused MM/PS/compat/pagerd/user-ABI tests;
-3. `cargo xtask check` and formal-contract registry checks;
-4. `formal/verify-all.sh --profile pr`, including mutation witnesses;
-5. the isolated 8-vCPU `fork_cow_private_write` KVM probe with PASS + exit 0;
-6. focused Serena references/diagnostics, compiler/regression impact checks;
-7. final staged-diff ownership audit.
-
-For this architectural/bug-fix set, update the applicable owner/flow contract
-and invariant-level regression witness with the source change. Treat the KVM
-probe as performance evidence only against the same-tree benchmark anchor.
-
-## Resume rules
-
-Do not edit tracked files while a KVM or sealed formal lane is running. Resume
-interrupted builds without `clean`/`distclean`; never bypass hooks/signing.
-Refresh this note when the live goal changes. If this change set is already
-committed and the local tree is clean, it has no remaining handoff work.
+Finish stable validation, investigate full-table/readiness failures separately,
+and retain only evidence-supported improvements. Global Scheduler serialization
+is still present; this is allocation-locality work, not lock-free dispatch.
+Do not edit tracked files during sealed formal/KVM runs. Do not stage or commit
+without a fresh user request; preserve unrelated changes. Previous `/tmp` logs
+were lost across environment reset, so keep summaries in the benchmark contract.
