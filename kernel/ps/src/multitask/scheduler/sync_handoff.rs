@@ -414,11 +414,17 @@ static SYNC_HANDOFF_LAST_TICK: [core::sync::atomic::AtomicU64; MAX_TRACKED_CPUS]
 
 /// Enqueue into one target FIFO and advertise it to that CPU's dispatcher.
 fn enqueue_and_publish(target_cpu: usize, record: SyncHandoffRecord) -> bool {
-    let retained = state_for_cpu(target_cpu).lock().enqueue(record);
+    // Publish the record and its advertisement as one FIFO transaction.
+    // Dropping the temporary guard before `pending = true` allowed the target
+    // CPU to observe an already-committed record as absent and miss the direct
+    // handoff for one scheduling turn.
+    let mut state = state_for_cpu(target_cpu).lock();
+    let retained = state.enqueue(record);
     if retained {
         if let Some(pending) = SYNC_HANDOFF_PENDING.get(target_cpu) {
             // ORDERING: release publishes the enqueued record before the flag
-            // that advertises it.
+            // while the FIFO guard prevents a consumer from draining and
+            // clearing the same publication between those two operations.
             pending.store(true, core::sync::atomic::Ordering::Release);
         }
     }
@@ -508,9 +514,10 @@ pub(super) fn take_next_ready(
     let taken = state.take_next_ready_with_competitor(fair_competitor_ready, ready);
     // Clear on any queue this CPU has just seen empty under the lock,
     // including one a successful take emptied. The one-sided invariant is
-    // unchanged and the proof is the same: an enqueue publishes `true` only
-    // after releasing this lock, so a queue observed empty while holding it
-    // has no completed insert to strand. Restricting the clear to `None`
+    // unchanged and the proof is the same: an enqueue publishes `true` before
+    // releasing this same FIFO lock. A consumer that observes the queue empty
+    // under the lock therefore cannot clear the flag between a committed
+    // insert and its advertisement. Restricting the clear to `None`
     // results left the flag set after every take that emptied the FIFO, so the
     // next dispatch paid this lock only to read `len == 0` -- the exact
     // acquisition `pending()` exists to avoid. An exhausted chain budget still
