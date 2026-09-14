@@ -11,10 +11,11 @@ pub use crate::ipc::{
 
 pub mod endpoint {
     pub use crate::ipc::{
-        EndpointCallPriority, EndpointWakeSet, FastEndpointReceived, FastEndpointResponseTake,
-        FastEndpointRollback, FastReplyCompletion, IpcError, KernelEndpointHandle,
-        KernelReplyHandle, KernelTransferredHandle, PreparedReplyHandleBindError, ReplyCompletion,
-        ReplySchedulingContextCustody, ReplySchedulingContextReturn,
+        EndpointCallPriority, EndpointReceive, EndpointWakeSet, FastEndpointReceived,
+        FastEndpointResponseTake, FastEndpointRollback, FastReplyCompletion, IpcError,
+        KernelEndpointHandle, KernelReplyHandle, KernelTransferredHandle,
+        PreparedReplyHandleBindError, ReplyCompletion, ReplySchedulingContextCustody,
+        ReplySchedulingContextReturn, receive_or_wait,
     };
 
     pub fn create() -> Result<KernelEndpointHandle, IpcError> {

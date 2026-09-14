@@ -418,7 +418,10 @@ stale-*hint* claim and a stale-*flag* claim can be told apart. It is gated behin
 ## Fusing a slot's decision with the retirement it authorizes (landed)
 
 `RUSTOS_LOCK_PHASE_PROFILE=true cargo xtask bench --isolate-probe <name>` renders
-a ranked per-class acquisition census whose rows are *counts*. That matters more
+a ranked per-class acquisition census whose rows are *counts*. The caller-site
+table and its atomic increments compile only in that diagnostic profile; a
+shipping scheduler acquisition does not perturb the cache lines it measures.
+That matters more
 than it looks: counts do not drift with host load, so on a host too noisy to
 resolve two percent of a round trip, the census still measures the one lever
 this file says moves the floor.

@@ -1,5 +1,6 @@
 mod fast_call_tests;
 mod receiver_waiter_tests;
+mod receive_transaction_tests;
 mod reply_publication_tests;
 
 use alloc::vec::Vec;

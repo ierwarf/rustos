@@ -1159,6 +1159,20 @@ models = [
 ]
 
 [[source_mappings]]
+path = "kernel/ipc-runtime/src/ipc/endpoint_receive.rs"
+models = [
+    "endpoint-receiver-wakeup/EndpointReceiverWakeup",
+    "ipc-fast-handoff/IpcFastHandoff",
+    "ipc-endpoint-ownership/IpcEndpointOwnership",
+    "ipc-priority-queue/IpcPriorityQueue",
+    "ipc-handle-transfer/IpcHandleTransfer",
+]
+
+[[source_mappings]]
+path = "kernel/ipc-runtime/src/ipc/tests/receive_transaction_tests.rs"
+models = ["endpoint-receiver-wakeup/EndpointReceiverWakeup"]
+
+[[source_mappings]]
 path = "kernel/ps/src/user/handles.rs"
 models = [
     "ipc-handle-transfer/IpcHandleTransfer",

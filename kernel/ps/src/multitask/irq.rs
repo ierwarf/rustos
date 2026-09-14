@@ -833,12 +833,16 @@ extern "C" fn software_schedule_interrupt_dispatch(
         // A committed same-CPU fastpath carries its exact peer directly
         // through this scheduler transaction. Generic and cross-CPU handoffs
         // retain the ordered FIFO path.
-        let dispatch =
+        let (dispatch, exact_fast_dispatch) =
             match scheduler.dispatch_committed_fast_ipc_handoff(current_rsp, immediate_task_id) {
-                Some(dispatch) => dispatch,
-                None => scheduler.on_voluntary_yield(current_rsp),
+                Some(dispatch) => (dispatch, immediate_task_id.is_some()),
+                None => (scheduler.on_voluntary_yield(current_rsp), false),
             };
-        scheduler.prepare_dispatched_task_execution(dispatch);
+        if exact_fast_dispatch {
+            scheduler.prepare_fast_ipc_dispatched_task_execution(dispatch);
+        } else {
+            scheduler.prepare_dispatched_task_execution(dispatch);
+        }
         scheduler.restore_current_simd_state();
         let runtime_profile = scheduler.take_runtime_profile(crate::arch::rtc::ticks());
         (

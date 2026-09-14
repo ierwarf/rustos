@@ -550,9 +550,16 @@ by seL4 while preserving RustOS sender identity and deadline semantics:
 - reply completion is the commit point: only a successful one-shot consume may
   release donation, wake the exact caller, and publish its synchronous FIFO
   handoff;
-- the receive half uses the existing endpoint check-arm-recheck transition. A
-  committed block performs the handoff immediately; a message already queued
-  requests one syscall-tail handoff without an intermediate ring3 receive trap;
+- the sender-stamped receive half arms the scheduler first, then under one
+  endpoint slot guard consumes the exact fast frame or priority-queue head, or
+  publishes a bounded receiver waiter. Every non-waiting result cancels the
+  arm before user copy; `Waiting` still requires scheduler commit, so a racing
+  wake withdraws the arm rather than being lost. No user copy or scheduler
+  entry occurs under the endpoint guard;
+- an expired receive still tries queued delivery but publishes no new waiter.
+  Expiry after waiter publication uses the existing timer arm and exact-endpoint
+  withdrawal. A committed block performs the handoff immediately; a message
+  already queued requests one syscall-tail handoff without another ring3 trap;
 - normal errno means pre-commit and a disjoint native error tag means the reply
   committed before receive failed. Ring3 may make one standalone recovery
   attempt only for the proven pre-commit live cap; it never retries a tagged

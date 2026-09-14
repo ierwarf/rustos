@@ -26,6 +26,7 @@ use core::ptr;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 mod endpoint_priority;
+mod endpoint_receive;
 #[cfg(test)]
 mod legacy_test_api;
 mod reply_publication;
@@ -37,6 +38,7 @@ use legacy_test_api::*;
 
 pub use endpoint_priority::EndpointCallPriority;
 use endpoint_priority::EndpointObject;
+pub use endpoint_receive::{EndpointReceive, receive_or_wait};
 pub use shared_region_hold::KernelSharedRegionMappingHold;
 
 use crate::ipc_core::SharedRegionHandle;
@@ -1753,71 +1755,59 @@ pub fn reserve_fast_endpoint_call_with_response_capacity(
     if request.is_empty() || request.len() > IPC_FAST_INLINE_BYTES {
         return Err(IpcError::InvalidArgument);
     }
-    let (receiver_owner, receiver_waiter) = ENDPOINTS
-        .with(endpoint.raw(), |endpoint_object| {
+
+    ENDPOINTS
+        .with_mut(endpoint.raw(), |endpoint_object| {
             if endpoint_object.has_pending() {
-                return None;
+                return Err(IpcError::NoMemory);
             }
-            endpoint_object
+            let receiver_waiter = endpoint_object
                 .waiting_receivers
                 .front()
                 .copied()
                 .filter(|waiter| {
                     waiter.task_id != caller_task_id && request.len() <= waiter.request_capacity
                 })
-                .map(|waiter| (endpoint_object.owner, waiter))
+                .ok_or(IpcError::NoMemory)?;
+
+            let mut frame = FastCallFrame {
+                endpoint_id: endpoint.raw(),
+                caller_process_id,
+                caller_task_id,
+                receiver_task_id: receiver_waiter.task_id,
+                receiver_request_capacity: receiver_waiter.request_capacity,
+                caller_response_capacity: response_capacity,
+                request_len: request.len(),
+                response_len: 0,
+                state: FastCallState::RequestReady,
+                terminal_error: None,
+                request: [0; IPC_FAST_INLINE_BYTES],
+                response: [0; IPC_FAST_INLINE_BYTES],
+            };
+            frame.request[..request.len()].copy_from_slice(request);
+
+            // LOCK ORDER: IpcEndpoint precedes IpcReply, matching request
+            // consumption below. One endpoint transaction binds the exact
+            // front waiter to the reply frame; no advisory read/reacquisition
+            // can race a receiver cancellation between selection and publish.
+            let reply_id = insert_reply_object(ReplyObject {
+                message_id: 0,
+                receiver_owner: endpoint_object.owner,
+                used: false,
+                consumed: false,
+                scheduling_context,
+                fast_frame: Some(frame),
+            })
+            .map_err(|_| IpcError::NoMemory)?;
+
+            endpoint_object.waiting_receivers.pop_front();
+            endpoint_object.fast_reply = Some(reply_id);
+            Ok((
+                KernelReplyHandle::from_raw(reply_id),
+                receiver_waiter.task_id,
+            ))
         })
-        .flatten()
-        .ok_or(IpcError::NoMemory)?;
-    let receiver_task_id = receiver_waiter.task_id;
-
-    let mut frame = FastCallFrame {
-        endpoint_id: endpoint.raw(),
-        caller_process_id,
-        caller_task_id,
-        receiver_task_id,
-        receiver_request_capacity: receiver_waiter.request_capacity,
-        caller_response_capacity: response_capacity,
-        request_len: request.len(),
-        response_len: 0,
-        state: FastCallState::RequestReady,
-        terminal_error: None,
-        request: [0; IPC_FAST_INLINE_BYTES],
-        response: [0; IPC_FAST_INLINE_BYTES],
-    };
-    frame.request[..request.len()].copy_from_slice(request);
-    let reply_id = insert_reply_object(ReplyObject {
-        message_id: 0,
-        receiver_owner,
-        used: false,
-        consumed: false,
-        scheduling_context,
-        fast_frame: Some(frame),
-    })
-    .map_err(|_| IpcError::NoMemory)?;
-
-    let published = ENDPOINTS.with_mut(endpoint.raw(), |endpoint_object| {
-        if endpoint_object.has_pending()
-            || endpoint_object
-                .waiting_receivers
-                .front()
-                .is_none_or(|waiter| waiter.task_id != receiver_task_id)
-        {
-            return false;
-        }
-        endpoint_object.waiting_receivers.pop_front();
-        endpoint_object.fast_reply = Some(reply_id);
-        true
-    });
-    if published != Some(true) {
-        drop(REPLIES.remove(reply_id));
-        return if ENDPOINTS.with(endpoint.raw(), |_| ()).is_some() {
-            Err(IpcError::NoMemory)
-        } else {
-            Err(IpcError::InvalidHandle)
-        };
-    }
-    Ok((KernelReplyHandle::from_raw(reply_id), receiver_task_id))
+        .ok_or(IpcError::InvalidHandle)?
 }
 
 /// Removes an unpublished-to-userspace fast rendezvous and restores the exact
@@ -1902,37 +1892,12 @@ pub fn take_fast_endpoint_request(
 ) -> Result<Option<FastEndpointReceived>, IpcError> {
     ENDPOINTS
         .with_mut(endpoint.raw(), |endpoint_object| {
-            let Some(reply_id) = endpoint_object.fast_reply else {
-                return Ok(None);
-            };
-            // LOCK ORDER: IpcEndpoint precedes IpcReply. Holding both makes the
-            // endpoint reservation and reply-frame state one transaction, so a
-            // separate advisory read and later endpoint reacquisition cannot
-            // split validation from consumption.
-            let received = REPLIES
-                .with_mut(reply_id, |reply_object| {
-                    let frame = reply_object
-                        .fast_frame
-                        .as_mut()
-                        .ok_or(IpcError::InvalidHandle)?;
-                    if frame.endpoint_id != endpoint.raw()
-                        || frame.receiver_task_id != receiver_task_id
-                        || frame.state != FastCallState::RequestReady
-                    {
-                        return Err(IpcError::PermissionDenied);
-                    }
-                    frame.state = FastCallState::RequestTaken;
-                    Ok(FastEndpointReceived {
-                        reply: KernelReplyHandle::from_raw(reply_id),
-                        caller_process_id: frame.caller_process_id,
-                        caller_task_id: frame.caller_task_id,
-                        request_len: frame.request_len,
-                        request: frame.request,
-                    })
-                })
-                .ok_or(IpcError::PermissionDenied)??;
-            endpoint_object.fast_reply = None;
-            Ok(Some(received))
+            endpoint_receive::take_fast_request(
+                endpoint_object,
+                endpoint,
+                receiver_task_id,
+                IPC_FAST_INLINE_BYTES,
+            )
         })
         .ok_or(IpcError::InvalidHandle)?
 }
@@ -2203,57 +2168,12 @@ pub fn recv_endpoint_with_sender_and_limits(
 ) -> Result<Option<EndpointReceivedWithSender>, IpcError> {
     ENDPOINTS
         .with_mut(endpoint.raw(), |endpoint_object| {
-            // A stale queue identity is consumed so it cannot wedge the
-            // endpoint. A live request that exceeds the receiver's byte
-            // capacity remains at the head so the receiver can retry. A
-            // handle-capacity rejection retains the handles in the caller's
-            // cancellable message object but consumes the lane entry: a
-            // byte-only server must not spin forever on authority it cannot
-            // accept or silently receive that authority.
-            loop {
-                let Some((lane, message_id)) = endpoint_object.next_pending() else {
-                    return Ok(None);
-                };
-
-                #[cfg(test)]
-                inject_endpoint_recv_stale_head_fault(message_id);
-                let outcome = ENDPOINT_MESSAGES.with_mut(message_id, |message| {
-                    if message.endpoint_id != endpoint.raw() {
-                        return (Err(IpcError::InvalidHandle), false);
-                    }
-                    let request_too_large = message.request.len() > request_capacity;
-                    if request_too_large || message.attached_handles.len() > handle_capacity {
-                        return (Err(IpcError::BufferTooSmall), request_too_large);
-                    }
-                    let request = core::mem::take(&mut message.request);
-                    let attached_handles = core::mem::take(&mut message.attached_handles);
-                    (
-                        Ok((
-                            KernelReplyHandle::from_raw(message.reply_id),
-                            request,
-                            attached_handles,
-                            message.caller_task_id,
-                        )),
-                        false,
-                    )
-                });
-
-                let Some((outcome, preserve_queue)) = outcome else {
-                    // The message object is gone - a cancelled call whose
-                    // caller reclaimed it, or an owner that exited. The lane
-                    // entry is stale, not a request; drop it and look at the
-                    // next one rather than reporting a failure the receiver
-                    // cannot act on.
-                    endpoint_object.consume_pending(lane, message_id);
-                    continue;
-                };
-
-                if preserve_queue {
-                    return outcome.map(Some);
-                }
-                endpoint_object.consume_pending(lane, message_id);
-                return outcome.map(Some);
-            }
+            endpoint_receive::take_queued_request(
+                endpoint_object,
+                endpoint,
+                request_capacity,
+                handle_capacity,
+            )
         })
         .ok_or(IpcError::InvalidHandle)?
 }
@@ -2318,23 +2238,7 @@ pub fn add_endpoint_receiver_waiter_with_capacity(
             if endpoint_object.has_pending() {
                 return Ok(true);
             }
-            let already_waiting = endpoint_object
-                .waiting_receivers
-                .iter_mut()
-                .find(|waiter| waiter.task_id == task_id);
-            if let Some(waiter) = already_waiting {
-                waiter.request_capacity = request_capacity;
-            } else {
-                if endpoint_object.waiting_receivers.len() >= MAX_ENDPOINT_WAITERS {
-                    return Err(IpcError::NoMemory);
-                }
-                endpoint_object.waiting_receivers.push_back(
-                    endpoint_priority::EndpointReceiverWaiter {
-                        task_id,
-                        request_capacity,
-                    },
-                );
-            }
+            endpoint_receive::register_receiver(endpoint_object, task_id, request_capacity)?;
             Ok(false)
         })
         .ok_or(IpcError::InvalidHandle)?

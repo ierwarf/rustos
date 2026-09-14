@@ -49,9 +49,15 @@ pub(super) fn preserve_test_cpu_publication(logical_index: usize) -> TestCpuPubl
         transition_from: TRANSITION_FROM_SLOTS[logical_index].load(Ordering::Acquire),
         transition_active: TRANSITION_ACTIVE[logical_index].load(Ordering::Acquire),
         scheduler_owner_cpu: SCHEDULER_OWNER_CPU.load(Ordering::Acquire),
-        scheduler_owner_slot: SCHEDULER_OWNER_SLOT.load(Ordering::Acquire),
-        scheduler_owner_acquired_ns: SCHEDULER_OWNER_ACQUIRED_NS.load(Ordering::Acquire),
-        scheduler_owner_caller: SCHEDULER_OWNER_CALLER.load(Ordering::Acquire),
+        scheduler_owner_slot: SCHEDULER_OWNER_DIAGNOSTICS[logical_index]
+            .slot
+            .load(Ordering::Acquire),
+        scheduler_owner_acquired_ns: SCHEDULER_OWNER_DIAGNOSTICS[logical_index]
+            .acquired_ns
+            .load(Ordering::Acquire),
+        scheduler_owner_caller: SCHEDULER_OWNER_DIAGNOSTICS[logical_index]
+            .caller
+            .load(Ordering::Acquire),
     }
 }
 
@@ -74,9 +80,16 @@ impl Drop for TestCpuPublicationRestore {
         TRANSITION_FROM_SLOTS[self.logical_index].store(self.transition_from, Ordering::Release);
         TRANSITION_ACTIVE[self.logical_index].store(self.transition_active, Ordering::Release);
         CURRENT_TASK_ACTIVE[self.logical_index].store(self.active, Ordering::Release);
-        SCHEDULER_OWNER_SLOT.store(self.scheduler_owner_slot, Ordering::Release);
-        SCHEDULER_OWNER_ACQUIRED_NS.store(self.scheduler_owner_acquired_ns, Ordering::Release);
-        SCHEDULER_OWNER_CALLER.store(self.scheduler_owner_caller, Ordering::Release);
+        let owner_diagnostic = &SCHEDULER_OWNER_DIAGNOSTICS[self.logical_index];
+        owner_diagnostic
+            .slot
+            .store(self.scheduler_owner_slot, Ordering::Release);
+        owner_diagnostic
+            .acquired_ns
+            .store(self.scheduler_owner_acquired_ns, Ordering::Release);
+        owner_diagnostic
+            .caller
+            .store(self.scheduler_owner_caller, Ordering::Release);
         SCHEDULER_OWNER_CPU.store(self.scheduler_owner_cpu, Ordering::Release);
     }
 }

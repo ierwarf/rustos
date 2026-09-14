@@ -2051,11 +2051,31 @@ fn recv_with_sender_blocking_prepared_inner(
     deadline_tick: Option<u64>,
     mut deferred_fast_reply: Option<fast_reply::DeferredFastReply>,
 ) -> Result<(usize, bool), (i64, bool)> {
+    use kernel_ipc_runtime::api::endpoint::EndpointReceive;
+
     let mut yielded = false;
     let take_mark = server_phase_mark();
     loop {
-        match take_fast_endpoint_request(endpoint, task_id) {
-            Ok(Some(received)) => {
+        // Arm first. The endpoint then decides receive vs waiter publication
+        // under one guard; a sender after publication still withdraws this arm
+        // before commit, exactly as in the split check-arm-recheck protocol.
+        if !multitask::arm_block_current_task_on_endpoint(endpoint.raw()) {
+            return Err((LINUX_EINVAL, yielded));
+        }
+        let may_wait = deadline_tick.is_none_or(|deadline| crate::arch::rtc::ticks() < deadline);
+        let received = kernel_ipc_runtime::api::endpoint::receive_or_wait(
+            endpoint,
+            task_id,
+            request_capacity,
+            0,
+            may_wait,
+        );
+        if !matches!(&received, Ok(EndpointReceive::Waiting)) {
+            let _ = multitask::cancel_block_current_task();
+        }
+        match received {
+            Ok(EndpointReceive::Fast(received)) => {
+                note_fast_ipc(IpcFastCounter::ReceiverTaken);
                 let write_mark = charge_server_phase(IpcServerPhase::RecvTake, take_mark);
                 let result = write_fast_endpoint_request_with_sender(
                     received,
@@ -2069,15 +2089,7 @@ fn recv_with_sender_blocking_prepared_inner(
                 let _ = charge_server_phase(IpcServerPhase::RecvWrite, write_mark);
                 return result.map(|received| (received, yielded));
             }
-            Ok(None) => {}
-            Err(errno) => return Err((errno, yielded)),
-        }
-        match kernel_ipc_runtime::api::recv_endpoint_with_sender_and_limits(
-            endpoint,
-            request_capacity,
-            0,
-        ) {
-            Ok(Some((reply, request, _handles, caller_task_id))) => {
+            Ok(EndpointReceive::Queued((reply, request, _handles, caller_task_id))) => {
                 let write_mark = charge_server_phase(IpcServerPhase::RecvTake, take_mark);
                 let (sender_pid, sender_tid) =
                     multitask::user_log_ids_for_task(caller_task_id).unwrap_or((0, 0));
@@ -2097,33 +2109,10 @@ fn recv_with_sender_blocking_prepared_inner(
                 let _ = multitask::inherit_ipc_priority(reply.raw(), caller_task_id, task_id);
                 return Ok((request.len(), yielded));
             }
-            Ok(None) => {
-                // The queue is empty. A bounded receive that is already out of
-                // budget answers here, *after* the receive attempt above, so a
-                // request that landed in the final tick is still delivered
-                // rather than discarded by an expiry test that ran first.
-                if deadline_tick.is_some_and(|deadline| crate::arch::rtc::ticks() >= deadline) {
-                    return Err((LINUX_EAGAIN, yielded));
-                }
-                if !multitask::arm_block_current_task_on_endpoint(endpoint.raw()) {
-                    return Err((LINUX_EINVAL, yielded));
-                }
-                let pending =
-                    match kernel_ipc_runtime::api::add_endpoint_receiver_waiter_with_capacity(
-                        endpoint,
-                        task_id,
-                        request_capacity,
-                    ) {
-                        Ok(pending) => pending,
-                        Err(err) => {
-                            let _ = multitask::cancel_block_current_task();
-                            return Err((ipc_error_to_linux_errno(err), yielded));
-                        }
-                    };
-                if pending {
-                    let _ = multitask::cancel_block_current_task();
-                    continue;
-                }
+            // Expiry disables waiter publication, not delivery of a request
+            // already queued. The non-waiting branch above withdrew the arm.
+            Ok(EndpointReceive::Empty) => return Err((LINUX_EAGAIN, yielded)),
+            Ok(EndpointReceive::Waiting) => {
                 if let Some(deadline) = deadline_tick {
                     if !crate::arch::rtc::arm_sleep_waiter_until_tick(task_id, deadline) {
                         // Leaving the receiver waiter published while abandoning
@@ -2150,7 +2139,11 @@ fn recv_with_sender_blocking_prepared_inner(
                 match committed {
                     Some(true) => yielded = true,
                     Some(false) => continue,
-                    None => return Err((LINUX_EINVAL, yielded)),
+                    None => {
+                        kernel_ipc_runtime::api::remove_endpoint_waiter_for_task(endpoint, task_id);
+                        let _ = multitask::cancel_block_current_task();
+                        return Err((LINUX_EINVAL, yielded));
+                    }
                 }
             }
             Err(err) => return Err((ipc_error_to_linux_errno(err), yielded)),

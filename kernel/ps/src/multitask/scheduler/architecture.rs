@@ -1,7 +1,7 @@
 //! Architectural state restoration after a scheduler ownership transfer.
 
 use x86_64::instructions::segmentation::{DS, ES, FS, GS, Segment};
-use x86_64::registers::model_specific::FsBase;
+use x86_64::registers::model_specific::{FsBase, KernelGsBase};
 use x86_64::structures::gdt::SegmentSelector;
 use x86_64::{PhysAddr, VirtAddr};
 
@@ -106,6 +106,78 @@ impl Scheduler {
             restore_address_space,
             &mut arch_marker,
         );
+    }
+    /// Installs the architectural delta for an exact same-CPU IPC handoff.
+    ///
+    /// Fast IPC admission and `dispatch_committed_fast_ipc_handoff` already
+    /// validate the incoming frame, affinity, lifecycle, execution ownership,
+    /// and scheduling budget while the scheduler catalog remains locked. When
+    /// both continuations share an address space and are suspended inside a
+    /// syscall, replaying those checks plus all four segment selectors and the
+    /// unchanged GS pair adds work without strengthening the decision.
+    pub(in crate::multitask) fn prepare_fast_ipc_dispatched_task_execution(
+        &mut self,
+        dispatch: SchedulerDispatch,
+    ) {
+        let mut phase_marker = Self::phase_chain_start();
+        assert_eq!(
+            self.current_task_slot(),
+            dispatch.next_slot,
+            "fast IPC architecture token does not name current task"
+        );
+        if !dispatch.requires_architectural_restore() {
+            self.mark_phase(SchedulerPhase::ArchRestore, &mut phase_marker);
+            return;
+        }
+
+        let previous_root = self.slot_address_space_root(dispatch.previous_slot);
+        let next_root = self.slot_address_space_root(dispatch.next_slot);
+        if dispatch.requires_address_space_restore(previous_root, next_root)
+            || self.context_returns_to_user(dispatch.next_slot)
+        {
+            self.prepare_current_task_execution_with_address_space_restore(
+                previous_root != next_root,
+            );
+            self.mark_phase(SchedulerPhase::ArchRestore, &mut phase_marker);
+            return;
+        }
+
+        let (_, kernel_stack_top) = self.slot_kernel_stack_bounds(dispatch.next_slot);
+        assert_ne!(
+            kernel_stack_top, 0,
+            "fast IPC selected a task without a kernel continuation stack"
+        );
+        assert_eq!(
+            kernel_stack_top & 0xF,
+            0,
+            "fast IPC selected a kernel stack top that violates the x86_64 SysV ABI"
+        );
+        self.mark_phase(SchedulerPhase::ArchAddressSpace, &mut phase_marker);
+        crate::arch::gdt::set_privilege_stack(kernel_stack_top);
+        crate::user::syscall::set_kernel_stack_top(kernel_stack_top);
+
+        let previous_fs_base = self.slot_tls_fs_base(dispatch.previous_slot);
+        let next_fs_base = self.slot_tls_fs_base(dispatch.next_slot);
+        if previous_fs_base != next_fs_base {
+            FsBase::write(VirtAddr::new(next_fs_base));
+        }
+
+        let user_gs_base = |slot: usize| {
+            self.contexts[slot]
+                .and_then(|context| context.windows_thread_state)
+                .map(|state| state.teb_address)
+                .unwrap_or(0)
+        };
+        let previous_user_gs_base = user_gs_base(dispatch.previous_slot);
+        let next_user_gs_base = user_gs_base(dispatch.next_slot);
+        if previous_user_gs_base != next_user_gs_base {
+            // This path entered from a kernel syscall continuation, so GS
+            // already names the CPU-local kernel record. Only the swapped-out
+            // user half changes across different Windows thread identities.
+            KernelGsBase::write(VirtAddr::new(next_user_gs_base));
+        }
+        self.mark_phase(SchedulerPhase::ArchSegments, &mut phase_marker);
+        self.mark_phase(SchedulerPhase::ArchRestore, &mut phase_marker);
     }
 
     /// Restore task-specific architectural state only across a real task

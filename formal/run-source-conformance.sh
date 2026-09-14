@@ -1714,6 +1714,11 @@ ipc-endpoint-ownership/IpcEndpointOwnership|kernel-compat|user::syscall::linux::
 ipc-endpoint-ownership/IpcEndpointOwnership|kernel-ps|multitask::scheduler::tests::retirement_revokes_task_and_process_ipc_authority
 ipc-endpoint-ownership/IpcEndpointOwnership|kernel-ps|multitask::process_table::tests::leader_thread_retirement_does_not_mark_live_process_exited
 endpoint-receiver-wakeup/EndpointReceiverWakeup|kernel-ipc-runtime|ipc::tests::receiver_waiter_tests::endpoint_pending_message_does_not_publish_stale_receiver_waiter
+endpoint-receiver-wakeup/EndpointReceiverWakeup|kernel-ipc-runtime|ipc::tests::receive_transaction_tests::receive_or_wait_is_one_endpoint_transaction_for_empty_queued_and_fast
+endpoint-receiver-wakeup/EndpointReceiverWakeup|kernel-ipc-runtime|ipc::tests::receive_transaction_tests::concurrent_enqueue_and_receive_have_no_unowned_empty_window
+endpoint-receiver-wakeup/EndpointReceiverWakeup|kernel-ipc-runtime|ipc::tests::receive_transaction_tests::receive_rejection_preserves_exact_fast_frame_and_publishes_no_waiter
+endpoint-receiver-wakeup/EndpointReceiverWakeup|kernel-ipc-runtime|ipc::tests::receive_transaction_tests::receive_expiry_still_delivers_queued_request_without_registering_waiter
+endpoint-receiver-wakeup/EndpointReceiverWakeup|kernel-ipc-runtime|ipc::tests::receive_transaction_tests::receiver_registration_is_bounded_deduplicated_and_refreshes_capacity
 ipc-handle-transfer/IpcHandleTransfer|kernel-ps|multitask::scheduler::tests::retirement_revokes_task_and_process_ipc_authority
 proc-broker-session/ProcBrokerSession|kernel-compat|user::syscall::linux::proc_broker_ops::tests::exited_prepare_owner_cannot_republish_after_cleanup
 rootd-restart-backoff/RootdRestartBackoff|rootd|tests::failed_restart_activation_retires_exact_suspended_child|host-test

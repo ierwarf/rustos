@@ -42,6 +42,7 @@ pub mod arch {
         pub use crate::arch::simd::*;
     }
 
+
     pub mod tlb {
         pub use crate::arch::tlb_shootdown::{
             AddressSpaceMutationGuard, FlushedAddressSpaceMutationGuard, activate_address_space,
@@ -165,6 +166,7 @@ pub mod cpu {
     pub fn init_simd() {
         crate::arch::simd::init();
     }
+
 
     pub fn simd_mode_name() -> &'static str {
         crate::arch::simd::mode_name()

@@ -2,12 +2,14 @@
 EXTENDS Naturals
 
 (*******************************************************************************
-Models the endpoint receive poll -> scheduler arm -> endpoint waiter publish ->
-block handshake.
+Models the endpoint receive arm -> receive-or-wait -> block handshake,
+including the standalone poll -> arm -> recheck path.
 
 Concrete owners:
+  * kernel/ipc-runtime/src/ipc/endpoint_receive.rs
+    `receive_or_wait`: one guard consumes a request or publishes a waiter
   * kernel/ipc-runtime/src/ipc/mod.rs
-    `recv_endpoint_with_sender_and_limits`, `add_endpoint_receiver_waiter`
+    standalone receive and waiter registration wrappers
   * kernel/compat/src/user/syscall/linux/ipc_ops.rs
     blocking receive syscall loops
   * kernel/ps/src/multitask/scheduler.rs
@@ -56,7 +58,6 @@ Receive ==
 
 Arm ==
     /\ receiverState = Running
-    /\ pending = 0
     /\ receiverState' = Armed
     /\ UNCHANGED <<pending, waiterPublished, received>>
 
@@ -68,6 +69,16 @@ RegisterWithPending ==
     /\ receiverState' = Running
     /\ waiterPublished' = FALSE
     /\ UNCHANGED <<pending, received>>
+
+\* Atomic composition of RegisterWithPending and Receive: the combined
+\* endpoint transaction consumes the request; compat then cancels its arm.
+ReceiveArmed ==
+    /\ receiverState = Armed
+    /\ pending > 0
+    /\ pending' = pending - 1
+    /\ received' = received + 1
+    /\ receiverState' = Running
+    /\ waiterPublished' = FALSE
 
 RegisterWaiter ==
     /\ receiverState = Armed
@@ -91,6 +102,7 @@ Next ==
     \/ Receive
     \/ Arm
     \/ RegisterWithPending
+    \/ ReceiveArmed
     \/ RegisterWaiter
     \/ CommitBlock
     \/ Terminal

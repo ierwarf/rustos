@@ -84,9 +84,31 @@ const NO_SCHEDULER_OWNER: usize = usize::MAX;
 // scratch. These atomics never grant scheduler authority; the tracked guard
 // remains the sole exclusion authority.
 static SCHEDULER_OWNER_CPU: AtomicUsize = AtomicUsize::new(NO_SCHEDULER_OWNER);
-static SCHEDULER_OWNER_SLOT: AtomicUsize = AtomicUsize::new(0);
-static SCHEDULER_OWNER_ACQUIRED_NS: AtomicU64 = AtomicU64::new(0);
-static SCHEDULER_OWNER_CALLER: AtomicPtr<Location<'static>> = AtomicPtr::new(ptr::null_mut());
+
+#[repr(align(64))]
+struct SchedulerOwnerDiagnostic {
+    slot: AtomicUsize,
+    acquired_ns: AtomicU64,
+    caller: AtomicPtr<Location<'static>>,
+}
+
+const _: () = assert!(core::mem::align_of::<SchedulerOwnerDiagnostic>() == 64);
+
+impl SchedulerOwnerDiagnostic {
+    const fn new() -> Self {
+        Self {
+            slot: AtomicUsize::new(0),
+            acquired_ns: AtomicU64::new(0),
+            caller: AtomicPtr::new(ptr::null_mut()),
+        }
+    }
+}
+
+// Each CPU writes only its own cache line before publishing SCHEDULER_OWNER_CPU.
+// Waiters read the published owner's line solely for fail-stop diagnostics.
+static SCHEDULER_OWNER_DIAGNOSTICS: [SchedulerOwnerDiagnostic;
+    nucleus_core::util::lockdep::MAX_TRACKED_CPUS] =
+    [const { SchedulerOwnerDiagnostic::new() }; nucleus_core::util::lockdep::MAX_TRACKED_CPUS];
 
 // Per-site acquisition census.
 //
@@ -96,22 +118,25 @@ static SCHEDULER_OWNER_CALLER: AtomicPtr<Location<'static>> = AtomicPtr::new(ptr
 // behind, so the per-CPU migration has to be aimed with a per-caller count
 // rather than with the dispatch total.
 //
-// This is an atomic side table, not lock state: it is updated before the guard
-// exists and adds a bounded linear probe, never an allocation or a second lock.
+// This diagnostic-profile-only atomic side table is not lock state: it is
+// updated before the guard and adds no allocation or second lock.
 const ACQUIRE_SITE_SLOTS: usize = 64;
+#[cfg(rustos_lock_phase_profile)]
 static ACQUIRE_SITE_CALLERS: [AtomicPtr<Location<'static>>; ACQUIRE_SITE_SLOTS] =
     [const { AtomicPtr::new(ptr::null_mut()) }; ACQUIRE_SITE_SLOTS];
+#[cfg(rustos_lock_phase_profile)]
 static ACQUIRE_SITE_COUNTS: [AtomicU64; ACQUIRE_SITE_SLOTS] =
     [const { AtomicU64::new(0) }; ACQUIRE_SITE_SLOTS];
+#[cfg(rustos_lock_phase_profile)]
 static ACQUIRE_SITE_OVERFLOW: AtomicU64 = AtomicU64::new(0);
 
 /// Spreads a caller's static address over the census table.
 ///
 /// The probe below started at slot zero for every site, so an acquisition
 /// walked the whole registered prefix before finding its own counter: about
-/// ten shared cache lines touched per acquisition, on every CPU, in the
-/// shipping build. Hashing the address makes the common case one line, which
-/// matters most at eight vCPUs where those lines are the ones bouncing.
+/// ten shared cache lines touched per profiled acquisition, on every CPU.
+/// Hashing the address makes the diagnostic common case one line.
+#[cfg(rustos_lock_phase_profile)]
 #[inline]
 fn acquire_site_bucket(key: *mut Location<'static>) -> usize {
     // Fibonacci hashing of the pointer; `Location` allocations are aligned, so
@@ -121,7 +146,8 @@ fn acquire_site_bucket(key: *mut Location<'static>) -> usize {
     (mixed >> 32) as usize & (ACQUIRE_SITE_SLOTS - 1)
 }
 
-/// Charges one acquisition to its caller.
+/// Charges one acquisition to its caller only in the diagnostic profile.
+#[cfg(rustos_lock_phase_profile)]
 fn record_acquire_site(caller: &'static Location<'static>) {
     let key = caller as *const Location<'static> as *mut Location<'static>;
     let first = acquire_site_bucket(key);
@@ -147,11 +173,20 @@ fn record_acquire_site(caller: &'static Location<'static>) {
     ACQUIRE_SITE_OVERFLOW.fetch_add(1, Ordering::Relaxed);
 }
 
+#[cfg(not(rustos_lock_phase_profile))]
+#[inline(always)]
+fn record_acquire_site(_caller: &'static Location<'static>) {}
+
 /// Takes the census so far, clearing counts for the next window.
 ///
 /// Called outside the scheduler owner; it never blocks a dispatch.
 pub(super) fn take_acquire_site_census() -> ([(&'static str, u32, u64); ACQUIRE_SITE_SLOTS], u64) {
+    #[cfg(not(rustos_lock_phase_profile))]
+    return ([("", 0_u32, 0_u64); ACQUIRE_SITE_SLOTS], 0);
+
+    #[cfg(rustos_lock_phase_profile)]
     let mut census = [("", 0_u32, 0_u64); ACQUIRE_SITE_SLOTS];
+    #[cfg(rustos_lock_phase_profile)]
     for slot in 0..ACQUIRE_SITE_SLOTS {
         let count = ACQUIRE_SITE_COUNTS[slot].swap(0, Ordering::Relaxed);
         if count == 0 {
@@ -167,7 +202,8 @@ pub(super) fn take_acquire_site_census() -> ([(&'static str, u32, u64); ACQUIRE_
         let caller = unsafe { &*caller };
         census[slot] = (caller.file(), caller.line(), count);
     }
-    (census, ACQUIRE_SITE_OVERFLOW.swap(0, Ordering::Relaxed))
+    #[cfg(rustos_lock_phase_profile)]
+    return (census, ACQUIRE_SITE_OVERFLOW.swap(0, Ordering::Relaxed));
 }
 
 pub(super) fn scheduler_initialized() -> bool {
@@ -357,11 +393,18 @@ pub(super) unsafe fn scheduler_mut() -> SchedulerAccessGuard {
             // ORDERING: Acquire of the owner CPU observes the diagnostic
             // fields published before that CPU entered the protected body.
             let owner_cpu = SCHEDULER_OWNER_CPU.load(Ordering::Acquire);
-            let owner_slot = SCHEDULER_OWNER_SLOT.load(Ordering::Relaxed);
-            let owner_acquired_ns = SCHEDULER_OWNER_ACQUIRED_NS.load(Ordering::Relaxed);
+            let owner_diagnostic = SCHEDULER_OWNER_DIAGNOSTICS.get(owner_cpu);
+            let owner_slot = owner_diagnostic
+                .map(|diagnostic| diagnostic.slot.load(Ordering::Relaxed))
+                .unwrap_or(0);
+            let owner_acquired_ns = owner_diagnostic
+                .map(|diagnostic| diagnostic.acquired_ns.load(Ordering::Relaxed))
+                .unwrap_or(now);
             // ORDERING: the owner CPU acquire above covers this final relaxed
-            // field in the diagnostic publication.
-            let owner_caller = SCHEDULER_OWNER_CALLER.load(Ordering::Relaxed);
+            // field in the selected CPU's diagnostic publication.
+            let owner_caller = owner_diagnostic
+                .map(|diagnostic| diagnostic.caller.load(Ordering::Relaxed))
+                .unwrap_or(ptr::null_mut());
             let (owner_file, owner_line) = if owner_caller.is_null() {
                 ("<unpublished>", 0)
             } else {
@@ -397,11 +440,16 @@ pub(super) unsafe fn scheduler_mut() -> SchedulerAccessGuard {
     set_scheduler_current_task_scratch_for_cpu(logical_index, original_task);
     // ORDERING: prepare every relaxed diagnostic field before release
     // publishing the owner CPU below.
-    SCHEDULER_OWNER_SLOT.store(original_task, Ordering::Relaxed);
-    SCHEDULER_OWNER_ACQUIRED_NS.store(acquired_at_ns, Ordering::Relaxed);
+    let owner_diagnostic = &SCHEDULER_OWNER_DIAGNOSTICS[logical_index];
+    owner_diagnostic
+        .slot
+        .store(original_task, Ordering::Relaxed);
+    owner_diagnostic
+        .acquired_ns
+        .store(acquired_at_ns, Ordering::Relaxed);
     // ORDERING: this final relaxed field is also covered by the owner CPU's
     // following release publication.
-    SCHEDULER_OWNER_CALLER.store(
+    owner_diagnostic.caller.store(
         caller as *const Location<'static> as *mut Location<'static>,
         Ordering::Relaxed,
     );
