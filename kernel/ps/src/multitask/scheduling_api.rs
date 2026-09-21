@@ -24,6 +24,9 @@ pub struct SchedulingContextRuntimeSnapshot {
     pub context_identity_generation: u64,
     pub domain: u64,
     pub policy_epoch: u64,
+    /// Monotonic runtime-cell lifetime, required with the domain slot/policy
+    /// to reject slot-reuse ABA in lock-free observations.
+    pub domain_generation: u64,
     pub budget_ns: u64,
     pub period_ns: u64,
     pub context_available_ns: u64,

@@ -448,11 +448,13 @@ lock, and service restart invalidates it by advancing the epoch.
   Advertising an idle second RustOS vCPU cannot improve guest throughput and
   steals host scheduling capacity from the Linux DVM on low-end machines.
 
-- The scheduler keeps a fixed 128-slot task table. A normal or
-  voluntary-yield pick performs one table scan and records the best candidate
-  for System, User, and Idle simultaneously. This preserves strict class
-  ordering and vruntime tie behavior while avoiding two extra full-table plus
-  IPC-donation classification passes when no System task is ready.
+- The scheduler keeps a fixed 128-slot task table, but ordinary fair dispatch is
+  selected from the current CPU's published runnable bitmap. The local picker
+  records System/User global and same-CPU candidates in one pass, validates the
+  complete publication epoch, and becomes authoritative only for that coherent
+  fair decision. Atomic activation, exact IPC FIFO custody, or any incomplete
+  candidate observation uses the already-computed catalog fallback. Legacy
+  picker divergence is diagnostic policy telemetry, not a release failure.
 - At most two consecutive System dispatches may run while User work is ready;
   the next ordinary dispatch is reserved for the lowest-vruntime User task.
   Every ready System task has a 2 ms recovery rail, while User work has no

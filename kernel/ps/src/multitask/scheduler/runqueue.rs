@@ -24,11 +24,15 @@ use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering, fence};
 
 use nucleus_core::util::lockdep::{LockClass, MAX_TRACKED_CPUS, TrackedSpinLock};
 
-use super::MAX_TASK;
+use super::{MAX_TASK, frame_publication};
 use validation::{bitmap_location, validate_cpu};
 
 pub(super) mod address_space;
 pub(super) mod affinity_payload;
+mod execution_time;
+pub(super) use execution_time::{set as set_exec_start_local_ns, value as exec_start_local_ns};
+mod idle;
+pub(super) use idle::{is_idle as is_idle_slot, set as set_idle_slot};
 mod ipc_handoff;
 pub(super) mod simd_tls;
 mod validation;
@@ -87,7 +91,6 @@ static VRUNTIME_NS: [AtomicU64; MAX_TASK] = [const { AtomicU64::new(0) }; MAX_TA
 /// Per-slot execution-accounting baseline. Zero means that the slot is not
 /// currently charging a running interval.
 static EXEC_START_TICKS: [AtomicU64; MAX_TASK] = [const { AtomicU64::new(0) }; MAX_TASK];
-
 /// Per-slot saved execution-frame pointer. The owner-word generation bounds
 /// its lifetime: admission installs it before publication, only the execution
 /// owner replaces it at a trap boundary, and terminal release clears it.
@@ -363,6 +366,8 @@ impl RunQueueInner {
 struct PerCpuRunQueue {
     inner: TrackedSpinLock<RunQueueInner, { LockClass::SchedulerRunQueue as u8 }>,
     published_load: AtomicU64,
+    /// Even/odd publication epoch bracketing the multiword runnable bitmap.
+    published_sequence: AtomicU64,
     /// Read-only mirror of `inner.runnable`, published with the load beside it.
     ///
     /// Every candidate scan wants the membership bitmap and nothing else, and
@@ -377,11 +382,17 @@ impl PerCpuRunQueue {
         Self {
             inner: TrackedSpinLock::new(RunQueueInner::new()),
             published_load: AtomicU64::new(0),
+            published_sequence: AtomicU64::new(0),
             published_runnable: [const { AtomicU64::new(0) }; BITMAP_WORDS],
         }
     }
 
     fn publish_load(&self, inner: &RunQueueInner) {
+        // A local-authority scan must not silently combine membership words
+        // from opposite sides of a wake/removal. Writers are serialized by
+        // `inner`; odd means publication is in progress and the following even
+        // value commits the bitmap and load as one observation epoch.
+        self.published_sequence.fetch_add(1, Ordering::AcqRel);
         let count = u64::try_from(inner.runnable_count).unwrap_or(u64::MAX) & 0xffff;
         let weight = inner.runnable_weight.min((1_u64 << 48) - 1);
         for (published, word) in self
@@ -400,6 +411,7 @@ impl PerCpuRunQueue {
         // exact rq membership and weight accounting are complete.
         self.published_load
             .store((weight << 16) | count, Ordering::Release);
+        self.published_sequence.fetch_add(1, Ordering::AcqRel);
     }
 }
 
@@ -502,6 +514,7 @@ fn reset_test_local_migrating_owner() {
 }
 
 pub(super) fn reset_before_publication() {
+    frame_publication::reset_before_publication();
     for (
         (((((owner, vruntime), exec_start), saved_rsp), stack_base), alternate_version),
         alternate_base,
@@ -522,6 +535,8 @@ pub(super) fn reset_before_publication() {
         alternate_version.store(0, Ordering::Release);
         alternate_base.store(0, Ordering::Release);
     }
+    execution_time::reset_before_publication();
+    idle::reset_before_publication();
     for stack_top in &KERNEL_STACK_TOP {
         stack_top.store(0, Ordering::Release);
     }
@@ -536,6 +551,9 @@ pub(super) fn reset_before_publication() {
     for cpu in 0..MAX_TRACKED_CPUS {
         let mut rq = RUN_QUEUES[cpu].inner.lock();
         *rq = RunQueueInner::new();
+        RUN_QUEUES[cpu]
+            .published_sequence
+            .store(0, Ordering::Release);
         RUN_QUEUES[cpu].publish_load(&rq);
         drop(rq);
         let mut mailbox = REMOTE_WAKE_MAILBOXES[cpu].lock();
@@ -570,6 +588,7 @@ pub(super) fn initialize_exec_start_ticks(slot: usize, value: u64) {
         "scheduler execution baseline initialized after owner publication"
     );
     EXEC_START_TICKS[slot].store(value, Ordering::Release);
+    execution_time::clear(slot);
 }
 
 #[inline]
@@ -958,6 +977,10 @@ pub(super) fn publish_local(slot: usize, cpu: usize, weight: u32) {
         RUN_QUEUES[cpu].publish_load(&rq);
         panic!("scheduler local publication lost owner race observed={observed:?}");
     }
+    // The owner CAS is the custody linearization point. Bind the already
+    // complete frame only afterwards, so a local reader can never accept a
+    // frame for the preceding owner generation.
+    frame_publication::bind_local_owner_generation(slot, next.generation);
     RUN_QUEUES[cpu].publish_load(&rq);
 }
 
@@ -996,6 +1019,11 @@ pub(super) fn publish_blocked(slot: usize, cpu: usize, weight: u32) {
         panic!("scheduler local block lost owner race observed={observed:?}");
     }
     RUN_QUEUES[cpu].publish_load(&rq);
+}
+
+pub(super) fn local_runnable_sequence(cpu: usize) -> u64 {
+    validate_cpu(cpu);
+    RUN_QUEUES[cpu].published_sequence.load(Ordering::Acquire)
 }
 
 fn local_runnable_snapshot(cpu: usize) -> [u64; BITMAP_WORDS] {
@@ -1219,15 +1247,18 @@ pub(super) fn release_retired(slot: usize) {
         });
     VRUNTIME_NS[slot].store(0, Ordering::Release);
     EXEC_START_TICKS[slot].store(0, Ordering::Release);
+    execution_time::clear(slot);
+    idle::clear(slot);
+    weight::clear(slot);
     address_space::clear(slot);
     wait::clear(slot);
-    weight::clear(slot);
     SAVED_RSP[slot].store(0, Ordering::Release);
     simd_tls::clear_tls_fs_base(slot);
     affinity_payload::reset_affinity(slot);
     KERNEL_STACK_BASE[slot].store(0, Ordering::Release);
     KERNEL_STACK_TOP[slot].store(0, Ordering::Release);
     clear_alternate_kernel_stack_bounds(slot);
+    frame_publication::clear(slot);
 }
 
 pub(super) fn least_loaded_cpu(eligible_mask: u64, fallback_cpu: usize) -> usize {

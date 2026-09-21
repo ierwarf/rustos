@@ -191,6 +191,15 @@ pub fn current_source() -> Option<ClockSourceInfo> {
     }
 }
 
+/// Returns a CPU-local scheduler timestamp when an invariant TSC rate was
+/// admitted. This is intentionally not global monotonic authority: callers
+/// may only subtract two readings taken during one non-migratable execution
+/// interval on the same CPU.
+pub fn scheduler_local_nanos() -> Option<u64> {
+    let hz = invariant_tsc_frequency_hz()?;
+    Some(nanos_from_tsc_delta(read_tsc_ordered(), hz))
+}
+
 pub fn invariant_tsc_frequency_hz() -> Option<u64> {
     // The rate is separately admitted for CPU-local TSC-deadline clockevents;
     // global monotonic time may deliberately remain on HPET under SMP.

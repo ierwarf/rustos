@@ -155,7 +155,7 @@ mod tests {
         let resident = 0x6101;
         let stranger = resident + MAX_TASK as u64;
         crate::multitask::current_identity::clear(slot);
-        crate::multitask::current_identity::publish(
+        crate::multitask::current_identity::publish_test_identity(
             slot,
             crate::multitask::current_identity::TaskIdentity {
                 task_id: Some(resident),

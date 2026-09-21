@@ -926,7 +926,7 @@ mod current_donation_tests {
         super::super::runqueue::reset_before_publication();
         for (slot, task_id) in [(DONOR_SLOT, donor_task), (RECEIVER_SLOT, receiver_task)] {
             current_identity::clear(slot);
-            current_identity::publish(slot, user_identity(task_id));
+            current_identity::publish_test_identity(slot, user_identity(task_id));
             super::super::task_directory::record(task_id, slot);
         }
         super::super::runqueue::weight::initialize(DONOR_SLOT, weight);

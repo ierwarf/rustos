@@ -41,6 +41,56 @@ const ABI_NONE: u32 = 0;
 const ABI_LINUX: u32 = 1;
 const ABI_WINDOWS: u32 = 2;
 
+const DISPATCH_RETIRED: u32 = 1 << 0;
+const DISPATCH_SUSPENDED: u32 = 1 << 1;
+const DISPATCH_JOB_STOPPED: u32 = 1 << 2;
+const DISPATCH_EXEC_QUIESCED: u32 = 1 << 3;
+const DISPATCH_INELIGIBLE: u32 =
+    DISPATCH_RETIRED | DISPATCH_SUSPENDED | DISPATCH_JOB_STOPPED | DISPATCH_EXEC_QUIESCED;
+
+/// Lifecycle state published with an identity in one seqlock commit.
+///
+/// This is a read view, never a second dispatch authority: readers that catch
+/// an unavailable publication must retain their locked fallback.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct DispatchPublication {
+    pub(super) task_id: Option<u64>,
+    pub(super) user_mode: bool,
+    pub(super) process_id: Option<u64>,
+    pub(super) pager_charge: Option<PagerChargeStamp>,
+    dispatch_flags: u32,
+}
+
+impl DispatchPublication {
+    #[inline]
+    pub(super) const fn lifecycle_dispatchable(self) -> bool {
+        self.dispatch_flags & DISPATCH_INELIGIBLE == 0
+    }
+}
+
+/// Authoritative lifecycle fields copied into `DispatchPublication`.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct DispatchLifecycle {
+    pub(super) retired: bool,
+    pub(super) suspended: bool,
+    pub(super) job_stopped: bool,
+    pub(super) exec_quiesced: bool,
+}
+
+impl DispatchLifecycle {
+    const fn flags(self) -> u32 {
+        (self.retired as u32 * DISPATCH_RETIRED)
+            | (self.suspended as u32 * DISPATCH_SUSPENDED)
+            | (self.job_stopped as u32 * DISPATCH_JOB_STOPPED)
+            | (self.exec_quiesced as u32 * DISPATCH_EXEC_QUIESCED)
+    }
+
+    #[inline]
+    pub(super) const fn dispatchable(self) -> bool {
+        self.flags() & DISPATCH_INELIGIBLE == 0
+    }
+}
+
 /// Immutable scheduling authority copied into the slot publication record.
 /// A faulting task resolves IPC donation first, then reads the selected owner's
 /// stamp without taking the scheduler lock.
@@ -49,6 +99,7 @@ pub(super) struct PagerChargeStamp {
     pub(super) context_slot: u64,
     pub(super) context_generation: u64,
     pub(super) scheduling_domain: u64,
+    pub(super) domain_generation: u64,
     pub(super) policy_epoch: u64,
     pub(super) period_ns: u64,
 }
@@ -112,9 +163,11 @@ struct PublishedIdentity {
     pager_context_slot: AtomicU64,
     pager_context_generation: AtomicU64,
     pager_scheduling_domain: AtomicU64,
+    pager_domain_generation: AtomicU64,
     pager_policy_epoch: AtomicU64,
     pager_period_ns: AtomicU64,
     flags: AtomicU32,
+    dispatch_flags: AtomicU32,
 }
 
 impl PublishedIdentity {
@@ -128,9 +181,11 @@ impl PublishedIdentity {
             pager_context_slot: AtomicU64::new(0),
             pager_context_generation: AtomicU64::new(0),
             pager_scheduling_domain: AtomicU64::new(0),
+            pager_domain_generation: AtomicU64::new(0),
             pager_policy_epoch: AtomicU64::new(0),
             pager_period_ns: AtomicU64::new(0),
             flags: AtomicU32::new(0),
+            dispatch_flags: AtomicU32::new(0),
         }
     }
 }
@@ -219,9 +274,15 @@ fn decode_abi(flags: u32) -> Option<UserAbi> {
     }
 }
 
-/// Publishes `identity` for `slot`. Callers must hold the scheduler lock, which
-/// is what makes the single-writer requirement of the seqlock hold.
-pub(super) fn publish(slot: usize, identity: TaskIdentity) {
+/// Test-only compatibility helper. Production code must commit the explicit
+/// lifecycle with `publish_state`; an implicit all-clear lifecycle is unsafe.
+#[cfg(test)]
+pub(super) fn publish_test_identity(slot: usize, identity: TaskIdentity) {
+    publish_state(slot, identity, DispatchLifecycle::default());
+}
+
+/// Publishes identity and lifecycle state in the same even-version commit.
+pub(super) fn publish_state(slot: usize, identity: TaskIdentity, lifecycle: DispatchLifecycle) {
     let Some(cell) = IDENTITIES.get(slot) else {
         return;
     };
@@ -267,10 +328,14 @@ pub(super) fn publish(slot: usize, identity: TaskIdentity) {
         .store(pager_charge.context_generation, Ordering::Relaxed);
     cell.pager_scheduling_domain
         .store(pager_charge.scheduling_domain, Ordering::Relaxed);
+    cell.pager_domain_generation
+        .store(pager_charge.domain_generation, Ordering::Relaxed);
     cell.pager_policy_epoch
         .store(pager_charge.policy_epoch, Ordering::Relaxed);
     cell.pager_period_ns
         .store(pager_charge.period_ns, Ordering::Relaxed);
+    cell.dispatch_flags
+        .store(lifecycle.flags(), Ordering::Relaxed);
     cell.flags.store(flags, Ordering::Relaxed);
     // ORDERING: Release publishes every field store above to any reader that
     // observes this even version.
@@ -302,8 +367,10 @@ pub(super) fn clear(slot: usize) {
     cell.pager_context_slot.store(0, Ordering::Relaxed);
     cell.pager_context_generation.store(0, Ordering::Relaxed);
     cell.pager_scheduling_domain.store(0, Ordering::Relaxed);
+    cell.pager_domain_generation.store(0, Ordering::Relaxed);
     cell.pager_policy_epoch.store(0, Ordering::Relaxed);
     cell.pager_period_ns.store(0, Ordering::Relaxed);
+    cell.dispatch_flags.store(0, Ordering::Relaxed);
     cell.flags.store(0, Ordering::Relaxed);
     cell.version
         .store(version.wrapping_add(2), Ordering::Release);
@@ -312,6 +379,11 @@ pub(super) fn clear(slot: usize) {
 /// Reads the published identity for `slot`, or `None` when the slot was never
 /// published or a writer is mid-update.
 pub(super) fn read(slot: usize) -> Option<TaskIdentity> {
+    read_state(slot).map(|(identity, _)| identity)
+}
+
+/// Reads the immutable identity and lifecycle state from one stable commit.
+fn read_state(slot: usize) -> Option<(TaskIdentity, u32)> {
     let cell = IDENTITIES.get(slot)?;
     // ORDERING: Acquire pairs with the publishing Release store and orders the
     // field loads below after this version observation.
@@ -327,37 +399,62 @@ pub(super) fn read(slot: usize) -> Option<TaskIdentity> {
     let pager_context_slot = cell.pager_context_slot.load(Ordering::Relaxed);
     let pager_context_generation = cell.pager_context_generation.load(Ordering::Relaxed);
     let pager_scheduling_domain = cell.pager_scheduling_domain.load(Ordering::Relaxed);
+    let pager_domain_generation = cell.pager_domain_generation.load(Ordering::Relaxed);
     let pager_policy_epoch = cell.pager_policy_epoch.load(Ordering::Relaxed);
     let pager_period_ns = cell.pager_period_ns.load(Ordering::Relaxed);
+    let dispatch_flags = cell.dispatch_flags.load(Ordering::Relaxed);
     // ORDERING: this fence keeps the field loads above from being reordered
     // after the version re-read that validates them.
     fence(Ordering::Acquire);
     if cell.version.load(Ordering::Relaxed) != before || flags & FLAG_PUBLISHED == 0 {
         return None;
     }
-    Some(TaskIdentity {
-        task_id: (flags & FLAG_TASK_ID != 0).then_some(task_id),
-        user_mode: flags & FLAG_USER_MODE != 0,
-        abi: decode_abi(flags),
-        process_handle: decode_process(process, flags),
-        process_id: (flags & FLAG_PROCESS_ID != 0).then_some(process_id),
-        console_session: ConsoleSessionHandle::from_raw(console),
-        pager_charge: (flags & FLAG_PAGER_CHARGE != 0).then_some(PagerChargeStamp {
-            context_slot: pager_context_slot,
-            context_generation: pager_context_generation,
-            scheduling_domain: pager_scheduling_domain,
-            policy_epoch: pager_policy_epoch,
-            period_ns: pager_period_ns,
-        }),
+    Some((
+        TaskIdentity {
+            task_id: (flags & FLAG_TASK_ID != 0).then_some(task_id),
+            user_mode: flags & FLAG_USER_MODE != 0,
+            abi: decode_abi(flags),
+            process_handle: decode_process(process, flags),
+            process_id: (flags & FLAG_PROCESS_ID != 0).then_some(process_id),
+            console_session: ConsoleSessionHandle::from_raw(console),
+            pager_charge: (flags & FLAG_PAGER_CHARGE != 0).then_some(PagerChargeStamp {
+                context_slot: pager_context_slot,
+                context_generation: pager_context_generation,
+                scheduling_domain: pager_scheduling_domain,
+                domain_generation: pager_domain_generation,
+                policy_epoch: pager_policy_epoch,
+                period_ns: pager_period_ns,
+            }),
+        },
+        dispatch_flags,
+    ))
+}
+
+/// Reads the dispatch-relevant subset of a stable publication. `None` means
+/// callers must use their existing locked authority rather than treating the
+/// slot as ineligible.
+pub(super) fn read_dispatch(slot: usize) -> Option<DispatchPublication> {
+    read_state(slot).map(|(identity, dispatch_flags)| DispatchPublication {
+        task_id: identity.task_id,
+        user_mode: identity.user_mode,
+        process_id: identity.process_id,
+        pager_charge: identity.pager_charge,
+        dispatch_flags,
     })
 }
 
 /// Compares the published record for `slot` against the authority the
 /// scheduler holds, returning `false` on divergence. The caller must hold the
 /// scheduler lock so that `authority` is a stable observation.
-pub(super) fn matches_authority(slot: usize, authority: Option<TaskIdentity>) -> bool {
-    match (read(slot), authority) {
-        (Some(published), Some(authority)) => published == authority,
+pub(super) fn matches_authority(
+    slot: usize,
+    authority: Option<TaskIdentity>,
+    lifecycle: DispatchLifecycle,
+) -> bool {
+    match (read_state(slot), authority) {
+        (Some((published, dispatch_flags)), Some(authority)) => {
+            published == authority && dispatch_flags == lifecycle.flags()
+        }
         (None, None) => true,
         // A cleared slot that the scheduler still binds is a missed
         // publication; a published slot the scheduler no longer binds is a
@@ -384,12 +481,18 @@ mod tests {
                 context_slot: 4,
                 context_generation: 42,
                 scheduling_domain: 43,
+                domain_generation: 46,
                 policy_epoch: 47,
                 period_ns: 53,
             }),
         };
-        publish(slot, identity);
+        publish_test_identity(slot, identity);
         assert_eq!(read(slot), Some(identity));
+        assert!(
+            read_dispatch(slot)
+                .expect("published dispatch state")
+                .lifecycle_dispatchable()
+        );
         assert_eq!(
             read(slot).and_then(|read| read.complete_user_log_ids()),
             Some(Some((23, 41)))
@@ -411,9 +514,40 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_lifecycle_is_committed_with_identity() {
+        let slot = 6;
+        let identity = TaskIdentity {
+            task_id: Some(91),
+            user_mode: true,
+            abi: Some(UserAbi::Linux),
+            process_handle: Some(ProcessHandle::new(4, 7)),
+            process_id: Some(12),
+            console_session: ConsoleSessionHandle::from_raw(3),
+            pager_charge: None,
+        };
+        publish_state(
+            slot,
+            identity,
+            DispatchLifecycle {
+                retired: false,
+                suspended: true,
+                job_stopped: false,
+                exec_quiesced: false,
+            },
+        );
+        assert_eq!(read(slot), Some(identity));
+        assert!(
+            !read_dispatch(slot)
+                .expect("published dispatch state")
+                .lifecycle_dispatchable()
+        );
+        clear(slot);
+    }
+
+    #[test]
     fn kernel_task_publishes_no_user_binding() {
         let slot = 4;
-        publish(
+        publish_test_identity(
             slot,
             TaskIdentity {
                 task_id: Some(12),
@@ -449,7 +583,7 @@ mod tests {
             console_session: ConsoleSessionHandle::from_raw(7),
             pager_charge: None,
         };
-        publish(slot, incomplete);
+        publish_test_identity(slot, incomplete);
         assert_eq!(
             read(slot).and_then(|identity| identity.complete_user_log_ids()),
             None
@@ -459,7 +593,7 @@ mod tests {
             process_id: Some(31),
             ..incomplete
         };
-        publish(slot, complete);
+        publish_test_identity(slot, complete);
         let cell = &IDENTITIES[slot];
         let stable_version = cell.version.load(Ordering::Relaxed);
         cell.version

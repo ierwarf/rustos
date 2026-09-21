@@ -147,9 +147,9 @@ model = "scheduler-cpu-ownership/SchedulerCpuOwnership"
 source = "kernel/ps/src/multitask/cpu_local.rs"
 source_symbol = "drop"
 source_anchors = [
-  "TRANSITION_FROM_SLOTS[self.logical_index].store(self.original_task, Ordering::Release)",
-  "TRANSITION_ACTIVE[self.logical_index].store(true, Ordering::Release)",
-  "CURRENT_TASK_SLOTS[self.logical_index].store(selected_task, Ordering::Release)",
+  "TRANSITION_FROM_SLOTS[self.cpu].store(self.from, Ordering::Release)",
+  "TRANSITION_ACTIVE[self.cpu].store(true, Ordering::Release)",
+  "CURRENT_TASK_SLOTS[self.cpu].store(self.to, Ordering::Release)",
   "TRANSITION_ACTIVE[logical_index].store(false, Ordering::Release)",
 ]
 invariant = "an observed incoming current or active pre-commit phase retains the exact outgoing stack slot; active may clear only at assembly commit"

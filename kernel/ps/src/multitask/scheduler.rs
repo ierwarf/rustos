@@ -34,10 +34,12 @@ mod context_validation;
 mod dispatch_policy;
 mod donation_ledger;
 mod fast_ipc;
+mod frame_publication;
 mod handoff_queue;
 mod handoffs;
 pub(in crate::multitask) mod ipc_donation;
 mod linux_thread_state;
+mod local_dispatch;
 mod locality;
 mod pager_handoff;
 pub use pager_handoff::PagerFaultHandoffOutcome;
@@ -46,6 +48,7 @@ mod runqueue;
 mod runqueue_policy;
 mod runtime_profile;
 mod scheduling_context;
+mod scheduling_runtime;
 mod sync_handoff;
 mod task_bindings;
 mod task_directory;
@@ -114,7 +117,9 @@ use super::current_identity::{self, PagerChargeStamp, TaskIdentity};
 use super::process_table::{self, ProcessHandle};
 use super::run_authority;
 use super::{UserFaultDisposition, UserStackState, UserTaskBootstrap, initial_task_rflags};
-use context_validation::context_validation_reason_code;
+use context_validation::{
+    PublishedFrameView, context_validation_reason_code, validate_published_saved_context,
+};
 use dispatch_policy::{CpuDispatchGuard, CpuDispatchLock, CpuDispatchPolicy};
 use handoff_queue::SlotHandoffQueue;
 #[cfg(test)]
@@ -517,6 +522,10 @@ impl SchedulerDispatch {
         self.previous_slot != self.next_slot
     }
 
+    const fn next_slot(self) -> usize {
+        self.next_slot
+    }
+
     /// A task switch only requires a CR3 activation when it also crosses an
     /// address-space boundary. Threads in one process still need their TSS,
     /// syscall-stack, and TLS state restored, but replaying the same CR3 is a
@@ -762,36 +771,45 @@ impl Scheduler {
     fn scheduling_domain_is_eligible(
         &self,
         domain_slot: usize,
+        domain_generation: u32,
         policy: scheduling_context::SchedulingContextPolicy,
         now_ns: u64,
     ) -> bool {
         self.scheduling_domains
             .get(domain_slot)
             .and_then(|domain| *domain)
-            .is_some_and(|domain| domain.policy() == policy && domain.is_eligible(now_ns))
+            .is_some_and(|domain| {
+                domain.policy() == policy
+                    && domain.generation() == domain_generation
+                    && scheduling_runtime::domain_is_eligible(
+                        domain_slot,
+                        domain_generation,
+                        policy,
+                        now_ns,
+                    )
+            })
     }
 
     fn prepare_scheduling_domain_dispatch(
         &mut self,
         domain_slot: usize,
+        domain_generation: u32,
         policy: scheduling_context::SchedulingContextPolicy,
         now_ns: u64,
     ) -> bool {
         self.scheduling_domains
-            .get_mut(domain_slot)
-            .and_then(Option::as_mut)
-            .is_some_and(|domain| domain.policy() == policy && domain.prepare_dispatch(now_ns))
-    }
-
-    fn charge_scheduling_domain_runtime(
-        &mut self,
-        domain_slot: usize,
-        policy: scheduling_context::SchedulingContextPolicy,
-        now_ns: u64,
-        elapsed_ns: u64,
-    ) -> Option<scheduling_context::ChargeOutcome> {
-        let domain = self.scheduling_domains.get_mut(domain_slot)?.as_mut()?;
-        (domain.policy() == policy).then(|| domain.charge_runtime(now_ns, elapsed_ns))?
+            .get(domain_slot)
+            .and_then(|domain| *domain)
+            .is_some_and(|domain| {
+                domain.policy() == policy
+                    && domain.generation() == domain_generation
+                    && scheduling_runtime::prepare_domain_dispatch(
+                        domain_slot,
+                        domain_generation,
+                        policy,
+                        now_ns,
+                    )
+            })
     }
 
     fn charge_effective_scheduling_context_runtime(
@@ -814,18 +832,23 @@ impl Scheduler {
             .scheduling_context
             .domain_slot()
             .expect("budgeted scheduling context lost its domain slot");
+        let domain_generation = owner
+            .scheduling_context
+            .domain_generation()
+            .expect("budgeted scheduling context lost its domain generation");
         let owner_task_id = self.starts[context_owner_slot]
             .map(|start| start.id)
             .expect("budgeted scheduling context lost its owner task");
-        let context_outcome = self.contexts[context_owner_slot]
-            .as_mut()
-            .expect("accounted scheduling-context owner disappeared")
-            .scheduling_context
-            .charge_runtime(now_ns, elapsed_ns)
-            .expect("scheduling-context accounting violated budget conservation");
-        let domain_outcome = self
-            .charge_scheduling_domain_runtime(domain_slot, policy, now_ns, elapsed_ns)
-            .expect("scheduling-domain accounting lost admitted policy");
+        let (context_outcome, domain_outcome) = scheduling_runtime::charge_pair(
+            context_owner_slot,
+            owner.scheduling_context.identity(),
+            policy,
+            domain_slot,
+            domain_generation,
+            now_ns,
+            elapsed_ns,
+        )
+        .expect("paired scheduling budget accounting lost exact runtime authority");
         if (context_outcome.exhausted || domain_outcome.exhausted)
             && context_outcome.charged_ns != 0
         {
@@ -857,11 +880,13 @@ impl Scheduler {
         let policy = owner.scheduling_context.policy()?;
         let context = owner.scheduling_context.runtime_snapshot()?;
         let domain_slot = owner.scheduling_context.domain_slot()?;
+        let domain_generation = owner.scheduling_context.domain_generation()?;
         let domain = self.scheduling_domains.get(domain_slot)?.as_ref()?;
-        if domain.policy() != policy {
+        if domain.policy() != policy || domain.generation() != domain_generation {
             return None;
         }
-        let domain_budget = domain.runtime_snapshot()?;
+        let domain_budget =
+            scheduling_runtime::domain_snapshot(domain_slot, domain_generation, policy)?;
         let identity = owner.scheduling_context.identity();
         Some(super::SchedulingContextRuntimeSnapshot {
             executing_task_id,
@@ -870,6 +895,7 @@ impl Scheduler {
             context_identity_generation: identity.generation(),
             domain: policy.domain,
             policy_epoch: policy.policy_epoch,
+            domain_generation: u64::from(domain_generation),
             budget_ns: policy.budget_ns,
             period_ns: policy.period_ns,
             context_available_ns: context.available_ns,
@@ -983,11 +1009,15 @@ impl Scheduler {
     }
 
     fn handoff_slot_ready(&self, slot: usize) -> bool {
+        // An odd or absent seqlock record is not negative dispatch authority:
+        // retain the catalog check until a future local dispatcher can fall
+        // back to this locked path. Stable publications are checked against
+        // the same lifecycle gates below by the divergence witness.
+        let published_lifecycle = current_identity::read_dispatch(slot)
+            .map(|state| state.lifecycle_dispatchable())
+            .unwrap_or_else(|| self.slot_dispatch_lifecycle(slot).dispatchable());
         slot < MAX_TASK
-            && !self.retired[slot]
-            && !self.start_suspended[slot]
-            && !self.job_stopped[slot]
-            && !self.exec_target_quiesced[slot]
+            && published_lifecycle
             && self.deferred_retire_reasons[slot].is_none()
             // Queue membership replaces the legacy test readiness bit, but `!blocked` stays.
             //
@@ -1074,6 +1104,42 @@ impl Scheduler {
     }
 
     #[inline]
+    fn slot_exec_start_local_ns(&self, slot: usize) -> u64 {
+        #[cfg(not(test))]
+        {
+            runqueue::exec_start_local_ns(slot)
+        }
+        #[cfg(test)]
+        {
+            let _ = slot;
+            0
+        }
+    }
+
+    #[inline]
+    fn set_slot_exec_start_local_ns(&mut self, slot: usize, value: u64) {
+        #[cfg(not(test))]
+        if value != 0 {
+            let owner = runqueue::owner(slot);
+            assert_eq!(
+                owner.state,
+                runqueue::RunOwnerState::Running,
+                "scheduler local execution baseline set outside Running ownership slot={slot}"
+            );
+            assert!(
+                owner.cpu.is_some(),
+                "scheduler local execution baseline lacks CPU owner slot={slot}"
+            );
+        }
+        #[cfg(not(test))]
+        runqueue::set_exec_start_local_ns(slot, value);
+        #[cfg(test)]
+        {
+            let _ = (slot, value);
+        }
+    }
+
+    #[inline]
     fn slot_saved_rsp(&self, slot: usize) -> usize {
         #[cfg(not(test))]
         {
@@ -1100,7 +1166,13 @@ impl Scheduler {
     #[inline]
     fn set_slot_saved_rsp(&mut self, slot: usize, value: usize) {
         #[cfg(not(test))]
-        runqueue::set_saved_rsp(slot, value);
+        {
+            runqueue::set_saved_rsp(slot, value);
+            // A trapped continuation may have a new saved stack pointer. The
+            // owner remains Running until it is republished Local, so this
+            // refresh cannot grant local frame authority by itself.
+            self.publish_slot_frame(slot);
+        }
         #[cfg(test)]
         if let Some(context) = self.contexts[slot].as_mut() {
             context.saved_rsp = value;
@@ -1897,16 +1969,19 @@ impl Scheduler {
         if self.starts[slot].is_some() {
             runqueue::release_retired(slot);
         }
+        if let Some(context) = context {
+            scheduling_runtime::release(slot, context.scheduling_context.identity());
+        }
         self.contexts[slot] = None;
         self.install_linux_thread_state(slot, None, None);
         self.remove_slot_from_dispatch_policies(slot);
-        self.retired[slot] = false;
+        self.set_slot_retired(slot, false);
         self.retirement_cleanup[slot] = None;
         self.retirement_cleanup_claimed[slot] = false;
         self.deferred_retire_reasons[slot] = None;
-        self.exec_target_quiesced[slot] = false;
-        self.start_suspended[slot] = false;
-        self.job_stopped[slot] = false;
+        self.set_slot_exec_target_quiesced(slot, false);
+        self.set_slot_start_suspended(slot, false);
+        self.set_slot_job_stopped(slot, false);
         self.retire_reasons[slot] = None;
         self.reset_slot_simd_state(slot);
         self.starts[slot] = None;
@@ -2184,6 +2259,8 @@ impl Scheduler {
 
     pub(super) fn mark_root_idle(&mut self) {
         self.root_idle = true;
+        #[cfg(not(test))]
+        runqueue::set_idle_slot(ROOT_TASK_SLOT, true);
     }
 
     /// Accumulates vruntime for the currently-running slot up to `now_ticks`
@@ -2210,11 +2287,17 @@ impl Scheduler {
         if start == 0 {
             return;
         }
-        let elapsed_ns = if now_ticks > start {
-            Self::ticks_elapsed_ns(start, now_ticks)
-        } else {
-            0
-        };
+        let local_start_ns = self.slot_exec_start_local_ns(slot);
+        let elapsed_ns = crate::arch::clock::scheduler_local_nanos()
+            .filter(|now_ns| local_start_ns != 0 && *now_ns >= local_start_ns)
+            .map(|now_ns| now_ns - local_start_ns)
+            .unwrap_or_else(|| {
+                if now_ticks > start {
+                    Self::ticks_elapsed_ns(start, now_ticks)
+                } else {
+                    0
+                }
+            });
         self.account_runtime_profile(slot, elapsed_ns);
         let mut budget_marker = Self::phase_chain_start();
         if elapsed_ns != 0 {
@@ -2249,12 +2332,14 @@ impl Scheduler {
         };
         if elapsed_ns == 0 {
             self.set_slot_exec_start_ticks(slot, 0);
+            self.set_slot_exec_start_local_ns(slot, 0);
             return;
         }
         let weight = self.slot_weight(slot);
         let delta = Self::weighted_vruntime_delta(elapsed_ns, weight);
         self.add_slot_vruntime(slot, delta);
         self.set_slot_exec_start_ticks(slot, 0);
+        self.set_slot_exec_start_local_ns(slot, 0);
     }
 
     /// Returns the lowest-vruntime User task only after the class-wide System
@@ -2616,7 +2701,10 @@ impl Scheduler {
         // state. If the target's published frame is also corrupted, its
         // retirement must not transfer the same signal back here and recurse
         // indefinitely through two invalid contexts.
-        self.retired[slot] = true;
+        // Publish retirement before any side effect can hand this identity to
+        // another task. A lock-free reader that sees this commit must reject
+        // the slot; an odd record continues through its locked fallback.
+        self.set_slot_retired(slot, true);
         self.pending_reap = true;
         self.transfer_pending_process_sigchld(slot);
         if let Some(task_id) = task_id {
@@ -2767,22 +2855,6 @@ impl Scheduler {
         (base, base + mem::size_of::<Self>())
     }
 
-    fn scheduler_storage_contains(&self, addr: usize) -> bool {
-        let (base, end) = self.scheduler_storage_bounds();
-        if addr >= base && addr < end {
-            return true;
-        }
-
-        let virt_offset = crate::memory::paging::KERNEL_VIRT_OFFSET as usize;
-        if base >= virt_offset {
-            let low_base = base - virt_offset;
-            let low_end = end - virt_offset;
-            return addr >= low_base && addr < low_end;
-        }
-
-        false
-    }
-
     fn stack_bounds(&self, slot: usize) -> (usize, usize) {
         let base = self.stack_storage(slot).as_ptr() as usize;
         (
@@ -2840,46 +2912,43 @@ impl Scheduler {
         }
     }
 
-    fn is_valid_saved_rsp(&self, slot: usize, saved_rsp: usize) -> bool {
-        if saved_rsp == 0 {
-            return false;
-        }
-
-        let align_mask = mem::align_of::<SavedContext>() - 1;
-        if (saved_rsp & align_mask) != 0 {
-            return false;
-        }
-
-        if slot >= MAX_TASK {
-            return false;
-        }
-
-        let Some(frame_end) = saved_rsp.checked_add(SAVED_CONTEXT_BYTES) else {
-            return false;
-        };
-
-        self.context_stack_contains(slot, saved_rsp, frame_end)
-    }
-
-    fn context_stack_contains(&self, slot: usize, start: usize, end: usize) -> bool {
-        let Some(_context) = self.contexts.get(slot).and_then(|context| *context) else {
-            return false;
-        };
-        let (kernel_stack_base, kernel_stack_top) = self.slot_kernel_stack_bounds(slot);
-        stack_range_contains(kernel_stack_base, kernel_stack_top, start, end) || {
-            let (alternate_base, alternate_top) = self.slot_alternate_kernel_stack_bounds(slot);
-            stack_range_contains(alternate_base, alternate_top, start, end)
-        }
-    }
-
     fn context_validation_error(
         &self,
         slot: usize,
         context: TaskContext,
         saved_rsp: usize,
     ) -> Option<&'static str> {
-        self.validate_saved_context(slot, context.user_mode, saved_rsp)
-            .err()
+        validate_published_saved_context(
+            slot,
+            saved_rsp,
+            self.published_frame_view(slot, context.user_mode),
+        )
+        .err()
+    }
+
+    fn published_frame_view(&self, slot: usize, user_mode_task: bool) -> PublishedFrameView {
+        let (kernel_stack_base, kernel_stack_top) = self.slot_kernel_stack_bounds(slot);
+        let (alternate_stack_base, alternate_stack_top) =
+            self.slot_alternate_kernel_stack_bounds(slot);
+        let (scheduler_storage_base, scheduler_storage_end) = self.scheduler_storage_bounds();
+        PublishedFrameView {
+            user_mode_task,
+            kernel_process_task: self
+                .contexts
+                .get(slot)
+                .and_then(|context| *context)
+                .is_some_and(|context| !context.user_mode && context.process_handle.is_some()),
+            kernel_stack_base,
+            kernel_stack_top,
+            alternate_stack_base,
+            alternate_stack_top,
+            // Root does not own an allocated guard. The validator only
+            // observes this value for non-root slots, preserving the prior
+            // short-circuit rather than inventing a root-stack assertion.
+            stack_canary_intact: slot == ROOT_TASK_SLOT || self.stack_canary_intact(slot),
+            scheduler_storage_base,
+            scheduler_storage_end,
+        }
     }
 
     fn saved_context_ref(saved_rsp: usize) -> Option<&'static SavedContext> {
@@ -2910,93 +2979,17 @@ impl Scheduler {
         bytes.iter().all(|byte| *byte == 0)
     }
 
-    fn is_canonical_address(addr: u64) -> bool {
-        let upper = addr >> 48;
-        if ((addr >> 47) & 1) == 0 {
-            upper == 0
-        } else {
-            upper == 0xFFFF
-        }
-    }
-
     fn validate_saved_context(
         &self,
         slot: usize,
         user_mode_task: bool,
         saved_rsp: usize,
     ) -> Result<(), &'static str> {
-        if !self.is_valid_saved_rsp(slot, saved_rsp) {
-            return Err("saved context pointer is outside the task stack");
-        }
-        if slot != 0 && !self.stack_canary_intact(slot) {
-            return Err("kernel stack guard was corrupted");
-        }
-
-        let saved = Self::saved_context_ref(saved_rsp).ok_or("saved context pointer is invalid")?;
-        if (saved.rflags & RFLAGS_RESERVED_BIT_1) == 0 {
-            return Err("saved rflags lost the reserved bit");
-        }
-
-        let user_cs = crate::arch::gdt::user_code_selector().0 as u64;
-        let user_ss = crate::arch::gdt::user_data_selector().0 as u64;
-        let kernel_cs = crate::arch::gdt::kernel_code_selector().0 as u64;
-        let kernel_ss = crate::arch::gdt::kernel_data_selector().0 as u64;
-        let kernel_process_task = self
-            .contexts
-            .get(slot)
-            .and_then(|context| *context)
-            .map(|context| !context.user_mode && context.process_handle.is_some())
-            .unwrap_or(false);
-
-        if saved.cs == user_cs {
-            if !user_mode_task {
-                return Err("kernel task cannot return directly to user mode");
-            }
-            if saved.ss != user_ss {
-                return Err("user return frame carries an unexpected stack selector");
-            }
-            if !Self::is_canonical_address(saved.rip)
-                || !Self::is_canonical_address(saved.rsp)
-                || saved.rip >= crate::memory::paging::USER_SPACE_END_EXCLUSIVE
-                || saved.rsp < crate::memory::paging::USER_SPACE_BASE
-                || saved.rsp >= crate::memory::paging::USER_SPACE_END_EXCLUSIVE
-            {
-                return Err("user return frame points outside user space");
-            }
-            return Ok(());
-        }
-
-        if saved.cs != kernel_cs {
-            return Err("saved code selector does not match any supported return mode");
-        }
-        if !Self::is_canonical_address(saved.rip) {
-            return Err("kernel return RIP is not canonical");
-        }
-        if saved.rip >= crate::memory::paging::USER_SPACE_BASE
-            && saved.rip < crate::memory::paging::USER_SPACE_END_EXCLUSIVE
-            && !kernel_process_task
-        {
-            return Err("kernel return RIP points into user space");
-        }
-        if self.scheduler_storage_contains(saved.rip as usize) {
-            return Err("kernel return RIP points into scheduler storage");
-        }
-
-        let kernel_interrupt_frame = saved.rsp == 1 && saved.ss == 0;
-        let initial_kernel_frame =
-            saved.ss == kernel_ss && Self::is_canonical_address(saved.rsp) && saved.rsp != 0;
-        if !kernel_interrupt_frame && !initial_kernel_frame {
-            return Err("kernel return frame has an invalid stack layout");
-        }
-
-        if initial_kernel_frame {
-            let rsp = saved.rsp as usize;
-            if !self.context_stack_contains(slot, rsp, rsp) {
-                return Err("kernel return RSP does not belong to the task stack");
-            }
-        }
-
-        Ok(())
+        validate_published_saved_context(
+            slot,
+            saved_rsp,
+            self.published_frame_view(slot, user_mode_task),
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3169,6 +3162,12 @@ impl Scheduler {
             Some(policy) => Some(self.admit_scheduling_domain(policy)?),
             None => None,
         };
+        let scheduling_domain_generation = scheduling_domain_slot.and_then(|slot| {
+            self.scheduling_domains
+                .get(slot)
+                .and_then(|domain| *domain)
+                .map(|domain| domain.generation())
+        });
         let admitted_task_mask = scheduling_policy
             .map(|policy| inherited_process_mask & policy.cpu_mask)
             .unwrap_or(inherited_process_mask);
@@ -3225,6 +3224,8 @@ impl Scheduler {
                         policy,
                         scheduling_domain_slot
                             .expect("budgeted context lost admitted scheduling domain"),
+                        scheduling_domain_generation
+                            .expect("budgeted context lost admitted domain generation"),
                     )
                 {
                     unreachable!("validated scheduling-context policy failed admission");
@@ -3303,14 +3304,13 @@ impl Scheduler {
                     entry: idle_entry,
                     id,
                 });
-                self.publish_slot_identity(slot);
                 self.install_linux_thread_state(
                     slot,
                     bootstrap.linux_thread_state.map(|_| id),
                     bootstrap.linux_thread_state,
                 );
                 self.initialize_slot_affinity(slot, admitted_task_mask, inherited_process_mask);
-                self.start_suspended[slot] = start_suspended;
+                self.set_slot_start_suspended(slot, start_suspended);
                 #[cfg(not(test))]
                 self.admit_runqueue_slot(slot, !start_suspended);
                 return Some(slot);
@@ -3351,6 +3351,12 @@ impl Scheduler {
             Some(policy) => Some(self.admit_scheduling_domain(policy)?),
             None => None,
         };
+        let scheduling_domain_generation = scheduling_domain_slot.and_then(|slot| {
+            self.scheduling_domains
+                .get(slot)
+                .and_then(|domain| *domain)
+                .map(|domain| domain.generation())
+        });
         let admitted_task_mask = scheduling_policy
             .map(|policy| inherited_process_mask & policy.cpu_mask)
             .unwrap_or(inherited_process_mask);
@@ -3377,6 +3383,8 @@ impl Scheduler {
                         policy,
                         scheduling_domain_slot
                             .expect("forked context lost admitted scheduling domain"),
+                        scheduling_domain_generation
+                            .expect("forked context lost admitted domain generation"),
                     )
                 {
                     unreachable!("inherited scheduling-context policy failed admission");
@@ -3455,14 +3463,13 @@ impl Scheduler {
                     entry: idle_entry,
                     id,
                 });
-                self.publish_slot_identity(slot);
                 self.install_linux_thread_state(
                     slot,
                     bootstrap.linux_thread_state.map(|_| id),
                     bootstrap.linux_thread_state,
                 );
                 self.initialize_slot_affinity(slot, admitted_task_mask, inherited_process_mask);
-                self.start_suspended[slot] = start_suspended;
+                self.set_slot_start_suspended(slot, start_suspended);
                 #[cfg(not(test))]
                 self.admit_runqueue_slot(slot, !start_suspended);
                 return Some(slot);
@@ -3589,7 +3596,7 @@ impl Scheduler {
                 .map(|_| self.slot_weight(slot))
                 .unwrap_or(NICE_0_LOAD),
         );
-        self.retired[slot] = true;
+        self.set_slot_retired(slot, true);
         self.pending_reap = true;
         self.retire_reasons[slot] = Some(reason);
         self.deferred_retire_reasons[slot] = Some(reason);
@@ -3618,7 +3625,7 @@ impl Scheduler {
                 continue;
             };
             if self.contexts[slot].is_none() {
-                self.retired[slot] = false;
+                self.set_slot_retired(slot, false);
                 self.retire_reasons[slot] = None;
                 continue;
             }
@@ -3742,10 +3749,19 @@ impl Scheduler {
             .expect("running task missing scheduler identity");
         let now_ticks = crate::arch::rtc::ticks();
         let current_runtime_ns = self.contexts[current_slot]
-            .map(|_| self.slot_exec_start_ticks(current_slot))
-            .filter(|start| *start != 0 && now_ticks > *start)
-            .map(|start| Self::ticks_elapsed_ns(start, now_ticks))
-            .unwrap_or(0);
+            .and_then(|_| {
+                let local_start_ns = self.slot_exec_start_local_ns(current_slot);
+                crate::arch::clock::scheduler_local_nanos()
+                    .filter(|now_ns| local_start_ns != 0 && *now_ns >= local_start_ns)
+                    .map(|now_ns| now_ns - local_start_ns)
+            })
+            .unwrap_or_else(|| {
+                self.contexts[current_slot]
+                    .map(|_| self.slot_exec_start_ticks(current_slot))
+                    .filter(|start| *start != 0 && now_ticks > *start)
+                    .map(|start| Self::ticks_elapsed_ns(start, now_ticks))
+                    .unwrap_or(0)
+            });
 
         // Account vruntime for the outgoing slot first, regardless of what we
         // do with it next. This makes the CFS-like fairness accounting see
@@ -4028,6 +4044,50 @@ impl Scheduler {
 
         drop(policy);
 
+        // The generation-bound local picker owns ordinary fair dispatch when
+        // every required publication is coherent. Exact activation and IPC
+        // FIFO custody remain catalog-owned; any incomplete revalidation also
+        // fails closed to the catalog decision computed above. Do not pay for
+        // a clock read or publication snapshots when exact custody already
+        // excludes local fair authority. Taking ordinary snapshots here also
+        // shortens their validation window past the catalog-only handoff work.
+        let local_dispatch_choice = {
+            let (eligibility_now_ns, queue_sequence, class_sequence) =
+                if atomic_activation_pending || ipc_handoff {
+                    (0, 0, 0)
+                } else {
+                    (
+                        crate::arch::clock::monotonic_nanos(),
+                        runqueue::local_runnable_sequence(dispatch_cpu),
+                        donation_ledger::class_publication_sequence(),
+                    )
+                };
+            let choice = local_dispatch::choose_local_next(
+                dispatch_cpu,
+                current_slot,
+                voluntary_yield,
+                current_runtime_ns,
+                eligibility_now_ns,
+                queue_sequence,
+                class_sequence,
+                atomic_activation_pending,
+                ipc_handoff,
+            );
+            match choice {
+                Ok(slot)
+                    if self.contexts[slot]
+                        .is_some_and(|context| self.context_is_schedulable(slot, context)) =>
+                {
+                    Some(slot)
+                }
+                Ok(_) => {
+                    let _ = local_dispatch::catalog_revalidation_fallback();
+                    None
+                }
+                Err(_) => None,
+            }
+        };
+
         self.mark_phase(SchedulerPhase::SelectHandoff, &mut phase_marker);
 
         // Apply min-granularity guard: if the CFS pick differs from current
@@ -4035,11 +4095,20 @@ impl Scheduler {
         // a slice of at least SCHED_MIN_GRANULARITY_NS, keep current to avoid
         // context-switch ping-pong. This is the same heuristic Linux uses to
         // damp wake-preempt thrash.
-        let next_idx = if ipc_handoff || voluntary_yield || reserved_user_pick.is_some() {
+        let catalog_next_idx = if ipc_handoff || voluntary_yield || reserved_user_pick.is_some() {
             next_idx
         } else {
             self.maybe_keep_current(current_slot, next_idx, current_runtime_ns)
         };
+        #[cfg(rustos_scheduler_phase_profile)]
+        local_dispatch::record_policy_choice(
+            dispatch_cpu,
+            current_slot,
+            catalog_next_idx,
+            voluntary_yield,
+            local_dispatch_choice,
+        );
+        let next_idx = local_dispatch_choice.unwrap_or(catalog_next_idx);
         self.mark_phase(SchedulerPhase::SelectPick, &mut phase_marker);
         if let Some(next) = self.contexts[next_idx] {
             let next_saved_rsp = self.slot_saved_rsp(next_idx);
@@ -4077,6 +4146,10 @@ impl Scheduler {
                     }
                     self.set_slot_ready_since_ticks(next_idx, 0);
                     self.set_slot_exec_start_ticks(next_idx, now_ticks);
+                    self.set_slot_exec_start_local_ns(
+                        next_idx,
+                        crate::arch::clock::scheduler_local_nanos().unwrap_or(0),
+                    );
                     self.record_dispatch_streaks(next_idx, latency_handoff_pick);
                     self.record_runtime_profile_dispatch(next_idx);
                     self.record_runtime_profile_transition(current_slot, next_idx, dispatch_cpu);
@@ -4140,6 +4213,10 @@ impl Scheduler {
         // non-zero baseline.
         if self.contexts[fallback_idx].is_some() {
             self.set_slot_exec_start_ticks(fallback_idx, now_ticks);
+            self.set_slot_exec_start_local_ns(
+                fallback_idx,
+                crate::arch::clock::scheduler_local_nanos().unwrap_or(0),
+            );
         }
         let fallback_task_id = if fallback_idx == current_slot {
             current_task_id
@@ -4296,7 +4373,7 @@ impl Scheduler {
             }
 
             let Some(context) = self.contexts[slot] else {
-                self.retired[slot] = false;
+                self.set_slot_retired(slot, false);
                 continue;
             };
 
@@ -4377,7 +4454,33 @@ impl Scheduler {
     /// `divergent_published_identity` re-derives the whole table under the
     /// lock and names the first slot that disagrees instead of leaving the
     /// completeness of these call sites to inspection.
+    fn publish_slot_frame(&self, slot: usize) {
+        let Some(context) = self.contexts.get(slot).and_then(|context| *context) else {
+            frame_publication::clear(slot);
+            return;
+        };
+        let (kernel_stack_base, kernel_stack_top) = self.slot_kernel_stack_bounds(slot);
+        let (alternate_stack_base, alternate_stack_top) =
+            self.slot_alternate_kernel_stack_bounds(slot);
+        let (scheduler_storage_base, scheduler_storage_end) = self.scheduler_storage_bounds();
+        frame_publication::publish(
+            slot,
+            self.slot_saved_rsp(slot),
+            kernel_stack_base,
+            kernel_stack_top,
+            alternate_stack_base,
+            alternate_stack_top,
+            context.user_mode,
+            !context.user_mode && context.process_handle.is_some(),
+            slot == ROOT_TASK_SLOT || self.stack_canary_intact(slot),
+            scheduler_storage_base,
+            scheduler_storage_end,
+        );
+    }
+
     pub(super) fn publish_slot_identity(&self, slot: usize) {
+        self.publish_slot_frame(slot);
+        let lifecycle = self.slot_dispatch_lifecycle(slot);
         match self.slot_identity(slot) {
             Some(identity) => {
                 // Warm the shared directory in the identity-publication
@@ -4386,9 +4489,44 @@ impl Scheduler {
                 if let Some(task_id) = identity.task_id {
                     task_directory::record(task_id, slot);
                 }
-                current_identity::publish(slot, identity);
+                current_identity::publish_state(slot, identity, lifecycle);
             }
             None => current_identity::clear(slot),
+        }
+    }
+
+    /// Changes one lifecycle gate and commits the complete lifecycle snapshot
+    /// before the caller may perform wake, reschedule, cleanup, or reuse side
+    /// effects. These are the only production writers for dispatch gates.
+    fn set_slot_start_suspended(&mut self, slot: usize, value: bool) {
+        self.start_suspended[slot] = value;
+        self.publish_slot_identity(slot);
+    }
+
+    fn set_slot_job_stopped(&mut self, slot: usize, value: bool) {
+        self.job_stopped[slot] = value;
+        self.publish_slot_identity(slot);
+    }
+
+    fn set_slot_exec_target_quiesced(&mut self, slot: usize, value: bool) {
+        self.exec_target_quiesced[slot] = value;
+        self.publish_slot_identity(slot);
+    }
+
+    fn set_slot_retired(&mut self, slot: usize, value: bool) {
+        self.retired[slot] = value;
+        self.publish_slot_identity(slot);
+    }
+
+    fn slot_dispatch_lifecycle(&self, slot: usize) -> current_identity::DispatchLifecycle {
+        current_identity::DispatchLifecycle {
+            // An out-of-bounds slot is conservatively non-dispatchable. It
+            // cannot have a valid identity record, but this makes the fallback
+            // safe if a future reader reaches it first.
+            retired: self.retired.get(slot).copied().unwrap_or(true),
+            suspended: self.start_suspended.get(slot).copied().unwrap_or(true),
+            job_stopped: self.job_stopped.get(slot).copied().unwrap_or(true),
+            exec_quiesced: self.exec_target_quiesced.get(slot).copied().unwrap_or(true),
         }
     }
 
@@ -4406,6 +4544,12 @@ impl Scheduler {
                 context_slot: identity.slot(),
                 context_generation: identity.generation(),
                 scheduling_domain: policy.domain,
+                domain_generation: u64::from(
+                    context
+                        .scheduling_context
+                        .domain_generation()
+                        .expect("budgeted context lost domain generation"),
+                ),
                 policy_epoch: policy.policy_epoch,
                 period_ns: policy.period_ns,
             }
@@ -4566,8 +4710,13 @@ impl Scheduler {
     }
 
     pub(super) fn divergent_published_identity(&self) -> Option<usize> {
-        (0..MAX_TASK)
-            .find(|&slot| !current_identity::matches_authority(slot, self.slot_identity(slot)))
+        (0..MAX_TASK).find(|&slot| {
+            !current_identity::matches_authority(
+                slot,
+                self.slot_identity(slot),
+                self.slot_dispatch_lifecycle(slot),
+            )
+        })
     }
 
     pub(super) fn current_linux_thread_state(&self) -> Option<LinuxThreadState> {
@@ -4716,7 +4865,7 @@ impl Scheduler {
         self.set_slot_ready_since_ticks(slot, 0);
         self.set_slot_address_space_root(slot, new_root);
 
-        self.exec_target_quiesced[slot] = false;
+        self.set_slot_exec_target_quiesced(slot, false);
         self.reset_slot_simd_state(slot);
         self.starts[slot] = Some(TaskStart {
             entry: super::noop_task_entry,
@@ -4787,7 +4936,7 @@ impl Scheduler {
         self.set_slot_ready_since_ticks(slot, Self::ready_since_now_ticks());
         self.set_slot_address_space_root(slot, new_root);
         self.set_slot_saved_rsp(slot, saved_rsp);
-        self.exec_target_quiesced[slot] = false;
+        self.set_slot_exec_target_quiesced(slot, false);
         self.reset_slot_simd_state(slot);
         self.starts[slot] = Some(TaskStart {
             entry: super::noop_task_entry,
@@ -5228,7 +5377,7 @@ impl Scheduler {
         if self.retire_reasons[slot].is_none() {
             self.retire_slot(slot, TaskRetireReason::Exited);
         } else {
-            self.retired[slot] = true;
+            self.set_slot_retired(slot, true);
             self.pending_reap = true;
         }
     }
@@ -5394,13 +5543,6 @@ fn saved_context_rip(saved_rsp: usize) -> Option<u64> {
     }
     let context = saved_rsp as *const SavedContext;
     Some(unsafe { (*context).rip })
-}
-
-fn stack_range_contains(base: u64, top: u64, start: usize, end: usize) -> bool {
-    if base == 0 || top <= base || end < start {
-        return false;
-    }
-    start >= base as usize && end <= top as usize
 }
 
 fn should_validate_published_ready_frame(

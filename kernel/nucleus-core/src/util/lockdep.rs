@@ -141,6 +141,12 @@ pub enum LockClass {
     PagerFrameGrant = 46,
     /// Serializes pager VMA writers; exception-time readers never acquire it.
     PagerVmaPublication = 47,
+    /// Per-context mutable budget/refill runtime, acquired after catalog or
+    /// runqueue custody and before a shared scheduling-domain budget.
+    SchedulerContextBudget = 48,
+    /// Shared domain mutable budget/refill runtime; never acquired before a
+    /// context budget runtime lock.
+    SchedulerDomainBudget = 49,
 }
 
 #[cfg(rustos_boot_image)]

@@ -197,7 +197,7 @@ impl Scheduler {
             let slot = self
                 .find_user_task_slot(task_id)
                 .expect("scheduler activation preflight target disappeared");
-            self.start_suspended[slot] = false;
+            self.set_slot_start_suspended(slot, false);
             assert!(
                 self.wake_task_slot(slot),
                 "scheduler activation invariant: preflighted task {task_id} could not wake"

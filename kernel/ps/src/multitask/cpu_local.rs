@@ -24,7 +24,7 @@ use core::panic::Location;
 use core::ptr;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 
-use nucleus_core::util::lockdep::{LockClass, TrackedSpinGuard, TrackedSpinLock};
+use nucleus_core::util::lockdep::{LockClass, MAX_TRACKED_CPUS, TrackedSpinGuard, TrackedSpinLock};
 
 use super::MAX_SCHEDULER_TASKS;
 use super::scheduler::Scheduler;
@@ -255,37 +255,63 @@ impl DerefMut for SchedulerAccessGuard {
     }
 }
 
-/// The release-published ownership edge of one scheduler guard.
+/// The publication edge immediately before a scheduler returns to assembly.
 ///
-/// Keeping this narrow operation separate from lock profiling makes its
-/// release/acquire contract directly testable while `SchedulerAccessGuard`
-/// still owns its only production call site and ordering.
-struct SchedulerGuardReleasePublication {
-    logical_index: usize,
-    original_task: usize,
+/// It deliberately owns no lock and changes no scheduling policy. The
+/// assembly commit still clears the outgoing transition only after installing
+/// the incoming RSP. Keeping that edge reusable is the prerequisite for a
+/// future local dispatcher to preserve the same stack-lifetime protocol.
+pub(super) struct CpuSwitchPublication {
+    cpu: usize,
+    from: usize,
+    to: usize,
+    to_idle: bool,
 }
 
-impl SchedulerGuardReleasePublication {
-    fn publish(self, selected_task: usize, selected_task_is_idle: bool) {
-        if selected_task != self.original_task {
+impl CpuSwitchPublication {
+    /// Constructs the sole pre-return CPU-switch publication sequence.
+    /// Both the global guard and a future local dispatcher must use this
+    /// constructor instead of copying its Release stores.
+    pub(super) fn new(cpu: usize, from: usize, to: usize, to_idle: bool) -> Self {
+        assert!(
+            cpu < MAX_TRACKED_CPUS,
+            "scheduler CPU exceeds publication capacity"
+        );
+        assert!(
+            from < MAX_SCHEDULER_TASKS,
+            "outgoing scheduler slot exceeds capacity"
+        );
+        assert!(
+            to < MAX_SCHEDULER_TASKS,
+            "incoming scheduler slot exceeds capacity"
+        );
+        Self {
+            cpu,
+            from,
+            to,
+            to_idle,
+        }
+    }
+
+    pub(super) fn publish_before_return(self) {
+        if self.to != self.from {
             // ORDERING: Publish the outgoing slot before activating the
             // transition. Remote lifetime and selection paths must retain its
             // stack until assembly has installed the incoming `rsp`.
-            TRANSITION_FROM_SLOTS[self.logical_index].store(self.original_task, Ordering::Release);
+            TRANSITION_FROM_SLOTS[self.cpu].store(self.from, Ordering::Release);
             // ORDERING: Release activates the transition only after the
             // outgoing slot is published.
-            TRANSITION_ACTIVE[self.logical_index].store(true, Ordering::Release);
+            TRANSITION_ACTIVE[self.cpu].store(true, Ordering::Release);
         }
         // ORDERING: Release publishes the exact task slot selected for this
         // CPU. A changed handoff already published the outgoing transition,
         // so both stacks remain owned until the assembly commit callback.
-        CURRENT_TASK_SLOTS[self.logical_index].store(selected_task, Ordering::Release);
+        CURRENT_TASK_SLOTS[self.cpu].store(self.to, Ordering::Release);
         // ORDERING: Release publishes the selected slot's scheduler-derived
         // Idle class after the slot itself. Periodic interrupt leaves may use
         // this one bit only to retain an idle continuation when every local
         // and foreign runqueue publication is empty.
-        // ORDERING: the following Release is the derived-class publication.
-        CURRENT_TASK_IDLE[self.logical_index].store(selected_task_is_idle, Ordering::Release);
+        CURRENT_TASK_IDLE[self.cpu].store(self.to_idle, Ordering::Release);
     }
 }
 
@@ -323,11 +349,13 @@ impl Drop for SchedulerAccessGuard {
             !TRANSITION_ACTIVE[self.logical_index].load(Ordering::Acquire),
             "scheduler invariant: CPU entered scheduler before prior stack handoff committed"
         );
-        SchedulerGuardReleasePublication {
-            logical_index: self.logical_index,
-            original_task: self.original_task,
-        }
-        .publish(selected_task, guard.current_task_is_idle_task());
+        CpuSwitchPublication::new(
+            self.logical_index,
+            self.original_task,
+            selected_task,
+            guard.current_task_is_idle_task(),
+        )
+        .publish_before_return();
         // ORDERING: turn metadata is not lock authority. Release-clear its
         // publication immediately before the tracked guard releases the real
         // lock, after the final scratch access above.
@@ -806,7 +834,7 @@ mod tests {
         test_scheduler_guard_for_release,
     };
     use super::{
-        AtomicBool, AtomicUsize, Ordering, SchedulerGuardReleasePublication, TaskExecutionOwner,
+        AtomicBool, AtomicUsize, CpuSwitchPublication, Ordering, TaskExecutionOwner,
         slot_has_owner_in, slot_is_running_in, task_execution_owner, task_execution_owner_in,
         test_publication_lock,
     };
@@ -1005,11 +1033,13 @@ mod tests {
         let incoming_slot = super::MAX_SCHEDULER_TASKS - 6;
         let publication = install_test_current_owner(logical_index, outgoing_slot);
 
-        SchedulerGuardReleasePublication {
-            logical_index,
-            original_task: outgoing_slot,
+        CpuSwitchPublication {
+            cpu: logical_index,
+            from: outgoing_slot,
+            to: incoming_slot,
+            to_idle: false,
         }
-        .publish(incoming_slot, false);
+        .publish_before_return();
 
         assert_eq!(
             task_execution_owner(outgoing_slot),

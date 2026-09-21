@@ -1,14 +1,12 @@
 //! Bounded scheduler runtime attribution for acceptance and field diagnosis.
-//!
 //! The scheduler owns accounting and emits no diagnostics while holding its
 //! global raw lock. The first eligible CPU takes one fixed-size snapshot per
 //! second; the timer path renders it only after releasing the scheduler owner.
-
 use super::*;
 use core::cell::UnsafeCell;
 use core::panic::Location;
 use core::sync::atomic::{AtomicU8, Ordering};
-
+mod local_shadow;
 mod lock_census;
 use lock_census::{acquire_site_is_reportable, fnv1a32};
 
@@ -169,6 +167,7 @@ pub(in crate::multitask) struct SchedulerRuntimeProfile {
     /// exists so removing the global lock is preceded by proof that the owner
     /// word already means what the legacy tables mean.
     pub(in crate::multitask) run_authority_divergence: Option<(u64, u64, u64)>,
+    pub(in crate::multitask) local_dispatch_shadow: (u64, [u64; 7], u64, u64, u64, u64),
     pub(in crate::multitask) top: [SchedulerRuntimeProfileEntry; PROFILE_TOP_TASKS],
 }
 
@@ -713,6 +712,8 @@ pub fn drain_scheduler_runtime_profile() -> usize {
             0,
         );
     }
+    #[cfg(rustos_scheduler_phase_profile)]
+    local_shadow::emit_milestones(&profile);
     // Milestones, not level-filtered logs: the ordinary info channel does not
     // reach the debug transport in the product configuration, and a diagnostic
     // that cannot be read is not evidence.
@@ -969,6 +970,7 @@ impl Scheduler {
                 }
             },
             divergent_identity_slot: self.divergent_published_identity().unwrap_or(usize::MAX),
+            local_dispatch_shadow: local_shadow::take_observations(),
             run_authority_divergence: {
                 // Sweep before taking the window so a position no publication
                 // site reached is charged to this window rather than the next.
@@ -1148,6 +1150,7 @@ mod tests {
             live_ipc_donations: 0,
             divergent_identity_slot: usize::MAX,
             run_authority_divergence: None,
+            local_dispatch_shadow: (0, [0; 7], 0, 0, 0, 0),
             top: [SchedulerRuntimeProfileEntry::default(); PROFILE_TOP_TASKS],
         };
         assert!(pending.publish(profile));

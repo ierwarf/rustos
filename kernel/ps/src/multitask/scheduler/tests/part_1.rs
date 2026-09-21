@@ -36,6 +36,7 @@ impl Drop for RunqueuePublicationReset {
 pub(super) struct SchedulerTestFixture {
     scheduler: Box<Scheduler>,
     _runqueue_reset: RunqueuePublicationReset,
+    _runtime_serial: std::sync::MutexGuard<'static, ()>,
     _runqueue_serial: std::sync::MutexGuard<'static, ()>,
     _cpu_publication: std::sync::MutexGuard<'static, ()>,
     _process_table: process_table::tests::ProcessTableTestIsolation,
@@ -194,7 +195,10 @@ fn nested_passive_server_runtime_is_billed_to_the_root_caller_context() {
         } else {
             (server_policy, server_domain)
         };
-        assert!(context.scheduling_context.admit(policy, domain));
+        let generation = scheduler.scheduling_domains[domain]
+            .expect("admitted test domain")
+            .generation();
+        assert!(context.scheduling_context.admit(policy, domain, generation));
         scheduler.contexts[slot] = Some(context);
         scheduler.starts[slot] = Some(TaskStart {
             entry: noop_task_entry,
@@ -204,9 +208,19 @@ fn nested_passive_server_runtime_is_billed_to_the_root_caller_context() {
 
     let outer = scheduler.reserve_ipc_call_donation(601);
     assert!(outer.donation_reserved);
-    assert!(scheduler.bind_reserved_ipc_priority(10, crate::multitask::scheduler::ipc_donation::DonationNamespace::IpcReply, 601, 602));
+    assert!(scheduler.bind_reserved_ipc_priority(
+        10,
+        crate::multitask::scheduler::ipc_donation::DonationNamespace::IpcReply,
+        601,
+        602
+    ));
     assert!(
-        scheduler.bind_reserved_ipc_priority(10, crate::multitask::scheduler::ipc_donation::DonationNamespace::IpcReply, 601, 603),
+        scheduler.bind_reserved_ipc_priority(
+            10,
+            crate::multitask::scheduler::ipc_donation::DonationNamespace::IpcReply,
+            601,
+            603
+        ),
         "sender commit must accept the receiver's earlier exact bind"
     );
     assert_eq!(scheduler.effective_scheduling_context_owner_slot(2), 1);
@@ -218,7 +232,12 @@ fn nested_passive_server_runtime_is_billed_to_the_root_caller_context() {
     let nested = scheduler.reserve_ipc_call_donation(602);
     assert_eq!(nested.scheduling_context, outer.scheduling_context);
     assert_eq!(nested.scheduling_context_owner_task_id, Some(601));
-    assert!(scheduler.bind_reserved_ipc_priority(11, crate::multitask::scheduler::ipc_donation::DonationNamespace::IpcReply, 602, 603));
+    assert!(scheduler.bind_reserved_ipc_priority(
+        11,
+        crate::multitask::scheduler::ipc_donation::DonationNamespace::IpcReply,
+        602,
+        603
+    ));
     assert_eq!(scheduler.effective_scheduling_context_owner_slot(3), 1);
 
     let (owner, donated) = scheduler
@@ -246,7 +265,10 @@ fn nested_passive_server_runtime_is_billed_to_the_root_caller_context() {
     assert_eq!(borrowed.timeout_endpoint_cap, 0);
     assert_eq!(borrowed.timeout_fault_action, 1);
 
-    assert!(scheduler.release_ipc_priority(11, crate::multitask::scheduler::ipc_donation::DonationNamespace::IpcReply));
+    assert!(scheduler.release_ipc_priority(
+        11,
+        crate::multitask::scheduler::ipc_donation::DonationNamespace::IpcReply
+    ));
     assert_eq!(scheduler.effective_scheduling_context_owner_slot(3), 3);
     let (owner, native) = scheduler
         .charge_effective_scheduling_context_runtime(3, 200, 4_500)
@@ -298,9 +320,7 @@ fn deadline_domains_require_per_cpu_utilization_headroom() {
 fn production_user_slot_publication_rejects_an_unbudgeted_context() {
     let production = include_str!("../../scheduler.rs");
     assert_eq!(
-        production
-            .matches("if scheduling_policy.is_none()")
-            .count(),
+        production.matches("if scheduling_policy.is_none()").count(),
         2
     );
     assert!(production.contains("return None;"));
@@ -309,8 +329,10 @@ fn production_user_slot_publication_rejects_an_unbudgeted_context() {
 pub(super) fn boxed_scheduler() -> SchedulerTestFixture {
     let process_table = process_table::tests::isolate_process_table();
     let cpu_publication = super::super::cpu_local::test_publication_lock();
+    let runtime_serial = super::scheduling_runtime::test_serial_guard();
     let runqueue_serial = super::runqueue::test_serial_guard();
     super::runqueue::reset_before_publication();
+    super::scheduling_runtime::reset_for_test();
     let mut scheduler = Box::<Scheduler>::new_uninit();
     unsafe {
         // The const template owns no heap allocation: every Vec-bearing
@@ -325,6 +347,7 @@ pub(super) fn boxed_scheduler() -> SchedulerTestFixture {
         SchedulerTestFixture {
             scheduler: scheduler.assume_init(),
             _runqueue_reset: RunqueuePublicationReset,
+            _runtime_serial: runtime_serial,
             _runqueue_serial: runqueue_serial,
             _cpu_publication: cpu_publication,
             _process_table: process_table,
@@ -334,9 +357,8 @@ pub(super) fn boxed_scheduler() -> SchedulerTestFixture {
 
 pub(super) fn test_user_context(handle: process_table::ProcessHandle) -> TaskContext {
     TaskContext {
-        scheduling_context: crate::multitask::scheduler::scheduling_context::SchedulingContext::bind(
-            0, 1,
-        ),
+        scheduling_context:
+            crate::multitask::scheduler::scheduling_context::SchedulingContext::bind(0, 1),
         saved_rsp: 0,
         test_ready: true,
         ready_since_ticks: 0,
@@ -935,10 +957,16 @@ fn synchronous_ipc_donation_promotes_and_revokes_a_transitive_user_chain() {
     // A completed outer reply immediately restores both servers to their
     // manifest-derived class; no priority boost can leak past capability
     // lifetime.
-    assert!(scheduler.release_ipc_priority(10, crate::multitask::scheduler::ipc_donation::DonationNamespace::IpcReply));
+    assert!(scheduler.release_ipc_priority(
+        10,
+        crate::multitask::scheduler::ipc_donation::DonationNamespace::IpcReply
+    ));
     assert_eq!(scheduler.slot_class(2), Some(SchedClass::User));
     assert_eq!(scheduler.slot_class(3), Some(SchedClass::User));
-    assert!(scheduler.release_ipc_priority(11, crate::multitask::scheduler::ipc_donation::DonationNamespace::IpcReply));
+    assert!(scheduler.release_ipc_priority(
+        11,
+        crate::multitask::scheduler::ipc_donation::DonationNamespace::IpcReply
+    ));
     assert_eq!(scheduler.slot_class(3), Some(SchedClass::User));
 
     // A process-owned endpoint without a sleeping receiver must select an
@@ -1013,7 +1041,10 @@ fn synchronous_ipc_donation_promotes_and_revokes_a_transitive_user_chain() {
         Some(target)
     );
     assert_eq!(scheduler.synchronous_handoff_len_for_tests(), 0);
-    assert!(scheduler.release_ipc_priority(12, crate::multitask::scheduler::ipc_donation::DonationNamespace::IpcReply));
+    assert!(scheduler.release_ipc_priority(
+        12,
+        crate::multitask::scheduler::ipc_donation::DonationNamespace::IpcReply
+    ));
     assert_eq!(scheduler.slot_class(target), Some(SchedClass::User));
     assert!(
         scheduler.handoff_slot_ready(target),
@@ -1033,7 +1064,11 @@ fn synchronous_ipc_donation_promotes_and_revokes_a_transitive_user_chain() {
             .bind_ipc_priority_to_process_worker(13, 601, 62)
             .is_none()
     );
-    assert!(scheduler.attach_reserved_ipc_priority(13, crate::multitask::scheduler::ipc_donation::DonationNamespace::IpcReply, 601));
+    assert!(scheduler.attach_reserved_ipc_priority(
+        13,
+        crate::multitask::scheduler::ipc_donation::DonationNamespace::IpcReply,
+        601
+    ));
     assert!(
         scheduler
             .ipc_priority_donations
@@ -1044,14 +1079,24 @@ fn synchronous_ipc_donation_promotes_and_revokes_a_transitive_user_chain() {
             })
     );
     assert_eq!(scheduler.slot_class(2), Some(SchedClass::User));
-    assert!(scheduler.release_ipc_priority(13, crate::multitask::scheduler::ipc_donation::DonationNamespace::IpcReply));
+    assert!(scheduler.release_ipc_priority(
+        13,
+        crate::multitask::scheduler::ipc_donation::DonationNamespace::IpcReply
+    ));
     assert_eq!(scheduler.slot_class(2), Some(SchedClass::User));
 
     assert!(scheduler.reserve_ipc_priority(601));
-    assert!(scheduler.attach_reserved_ipc_priority(14, crate::multitask::scheduler::ipc_donation::DonationNamespace::IpcReply, 601));
+    assert!(scheduler.attach_reserved_ipc_priority(
+        14,
+        crate::multitask::scheduler::ipc_donation::DonationNamespace::IpcReply,
+        601
+    ));
     assert!(scheduler.inherit_ipc_priority(14, 601, 602));
     assert_eq!(scheduler.slot_class(2), Some(SchedClass::System));
-    assert!(scheduler.release_ipc_priority(14, crate::multitask::scheduler::ipc_donation::DonationNamespace::IpcReply));
+    assert!(scheduler.release_ipc_priority(
+        14,
+        crate::multitask::scheduler::ipc_donation::DonationNamespace::IpcReply
+    ));
     assert_eq!(scheduler.slot_class(2), Some(SchedClass::User));
 }
 

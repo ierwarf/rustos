@@ -137,7 +137,7 @@ impl Scheduler {
         if self.contexts[target_slot]?.process_handle != Some(process_handle) {
             return None;
         }
-        self.exec_target_quiesced[target_slot] = true;
+        self.set_slot_exec_target_quiesced(target_slot, true);
 
         let target_running_cpu = super::super::cpu_local::task_running_cpu(target_slot);
         let mut waiting_for_remote = remote_task_requires_quiescence(
@@ -186,7 +186,7 @@ impl Scheduler {
         if self.contexts[slot].and_then(|context| context.process_handle) != Some(process_handle) {
             return false;
         }
-        self.exec_target_quiesced[slot] = false;
+        self.set_slot_exec_target_quiesced(slot, false);
         true
     }
 
@@ -226,8 +226,14 @@ impl Scheduler {
             if !scheduling_context
                 .policy()
                 .zip(scheduling_context.domain_slot())
-                .is_some_and(|(policy, domain_slot)| {
-                    self.scheduling_domain_is_eligible(domain_slot, policy, now_ns)
+                .zip(scheduling_context.domain_generation())
+                .is_some_and(|((policy, domain_slot), domain_generation)| {
+                    self.scheduling_domain_is_eligible(
+                        domain_slot,
+                        domain_generation,
+                        policy,
+                        now_ns,
+                    )
                 })
             {
                 return Some(FastIpcEligibilityRejection::DomainBudget);
@@ -436,6 +442,8 @@ impl Scheduler {
         self.starts[slot] = Some(TaskStart { entry, id });
         self.publish_slot_identity(slot);
         self.idle_cpu[slot] = logical_index;
+        #[cfg(not(test))]
+        runqueue::set_idle_slot(slot, true);
         let idle_mask = 1_u64 << logical_index;
         self.initialize_slot_affinity(slot, idle_mask, idle_mask);
         #[cfg(not(test))]

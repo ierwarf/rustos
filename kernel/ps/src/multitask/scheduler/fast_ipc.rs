@@ -74,6 +74,10 @@ impl Scheduler {
         }
         self.set_slot_ready_since_ticks(next_idx, 0);
         self.set_slot_exec_start_ticks(next_idx, now_ticks);
+        self.set_slot_exec_start_local_ns(
+            next_idx,
+            crate::arch::clock::scheduler_local_nanos().unwrap_or(0),
+        );
         self.record_dispatch_streaks(next_idx, false);
         self.record_runtime_profile_dispatch(next_idx);
         self.record_runtime_profile_transition(current_slot, next_idx, dispatch_cpu);

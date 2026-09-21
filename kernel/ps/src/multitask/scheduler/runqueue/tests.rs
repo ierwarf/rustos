@@ -38,6 +38,18 @@ impl Drop for RunQueueTestScope {
     }
 }
 
+#[test]
+fn idle_classification_is_cleared_before_slot_reuse() {
+    let _scope = RunQueueTestScope::new();
+    let slot = 41;
+    set_idle_slot(slot, true);
+    assert!(is_idle_slot(slot));
+    admit_blocked(slot);
+    retire(slot, 100);
+    release_retired(slot);
+    assert!(!is_idle_slot(slot));
+}
+
 /// The lock-free membership mirror is what every candidate scan reads, so
 /// a mutation that forgets to publish would hide a runnable task from
 /// dispatch, or keep naming one that left. Walk the full local lifecycle
@@ -62,6 +74,12 @@ fn published_membership_mirrors_the_locked_bitmap_through_the_local_lifecycle() 
     assert!(SLOT >= 64 && SLOT < MAX_TASK);
 
     assert_mirrored(CPU, "reset");
+    let reset_sequence = local_runnable_sequence(CPU);
+    assert_eq!(
+        reset_sequence & 1,
+        0,
+        "published queue epoch must be stable"
+    );
     admit_blocked(SLOT);
     assert!(matches!(
         publish_remote_wake(SLOT, CPU, 1024),
@@ -70,6 +88,12 @@ fn published_membership_mirrors_the_locked_bitmap_through_the_local_lifecycle() 
     assert_mirrored(CPU, "remote wake published");
     assert_eq!(drain_remote_wakes(CPU), 1);
     assert_mirrored(CPU, "remote wake drained");
+    let admitted_sequence = local_runnable_sequence(CPU);
+    assert_eq!(admitted_sequence & 1, 0, "committed epoch must be even");
+    assert_ne!(
+        admitted_sequence, reset_sequence,
+        "membership mutation must advance the publication epoch"
+    );
     let (word, bit) = bitmap_location(SLOT);
     assert_ne!(
         RUN_QUEUES[CPU].published_runnable[word].load(Ordering::Acquire) & bit,

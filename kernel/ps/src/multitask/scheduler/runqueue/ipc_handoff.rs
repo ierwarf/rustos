@@ -24,6 +24,7 @@
 
 use core::sync::atomic::Ordering;
 
+use super::super::frame_publication;
 use super::*;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -118,14 +119,13 @@ pub(in crate::multitask::scheduler) fn materialize_direct_handoff(
     }
     let mut rq = RUN_QUEUES[cpu].inner.lock();
     rq.insert(slot, weight);
-    if OWNER_WORDS[slot]
-        .compare_exchange(owner, owner.next(RunOwnerState::Local, Some(cpu)))
-        .is_err()
-    {
+    let next = owner.next(RunOwnerState::Local, Some(cpu));
+    if OWNER_WORDS[slot].compare_exchange(owner, next).is_err() {
         rq.remove(slot, weight);
         RUN_QUEUES[cpu].publish_load(&rq);
         return false;
     }
+    frame_publication::bind_local_owner_generation(slot, next.generation);
     RUN_QUEUES[cpu].publish_load(&rq);
     true
 }
@@ -226,11 +226,13 @@ pub(in crate::multitask::scheduler) fn drain_remote_wakes(cpu: usize) -> usize {
             );
         }
         rq.insert(record.slot, record.weight);
+        let next = observed.next(RunOwnerState::Local, Some(cpu));
         OWNER_WORDS[record.slot]
-            .compare_exchange(observed, observed.next(RunOwnerState::Local, Some(cpu)))
+            .compare_exchange(observed, next)
             .unwrap_or_else(|winner| {
                 panic!("scheduler mailbox adoption lost owner race observed={winner:?}")
             });
+        frame_publication::bind_local_owner_generation(record.slot, next.generation);
     }
     RUN_QUEUES[cpu].publish_load(&rq);
     count

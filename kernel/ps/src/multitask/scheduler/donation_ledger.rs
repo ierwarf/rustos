@@ -80,6 +80,7 @@ impl DonationLedger {
 static DONATION_LEDGER: TrackedSpinLock<DonationLedger, { LockClass::SchedulerDonation as u8 }> =
     TrackedSpinLock::new(DonationLedger::new());
 static INHERITED_SYSTEM: [AtomicU8; MAX_TASK] = [const { AtomicU8::new(0) }; MAX_TASK];
+static CLASS_PUBLICATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const NO_BORROWED_CONTEXT: u16 = u16::MAX;
 static BORROWED_CONTEXT_OWNER: [AtomicU16; MAX_TASK] =
     [const { AtomicU16::new(NO_BORROWED_CONTEXT) }; MAX_TASK];
@@ -110,6 +111,7 @@ fn bind_entry_to_receiver(entry: &mut LedgerEntry, receiver_task_id: u64, receiv
 
 pub(super) fn reset() {
     let mut ledger = DONATION_LEDGER.lock();
+    CLASS_PUBLICATION_SEQUENCE.fetch_add(1, Ordering::AcqRel);
     *ledger = DonationLedger::new();
     for inherited in &INHERITED_SYSTEM {
         inherited.store(0, Ordering::Release);
@@ -123,6 +125,7 @@ pub(super) fn reset() {
     for reply in &BORROWED_CONTEXT_REPLY {
         reply.store(0, Ordering::Release);
     }
+    CLASS_PUBLICATION_SEQUENCE.fetch_add(1, Ordering::AcqRel);
 }
 
 pub(super) fn reserve(
@@ -377,6 +380,10 @@ pub(super) fn inherited_system(slot: usize) -> bool {
         .is_some_and(|inherited| inherited.load(Ordering::Acquire) != 0)
 }
 
+pub(super) fn class_publication_sequence() -> u64 {
+    CLASS_PUBLICATION_SEQUENCE.load(Ordering::Acquire)
+}
+
 #[inline]
 pub(super) fn borrowed_context_owner_slot(slot: usize) -> Option<usize> {
     let encoded = BORROWED_CONTEXT_OWNER.get(slot)?.load(Ordering::Acquire);
@@ -398,16 +405,20 @@ pub(super) fn live_len() -> usize {
 }
 
 fn increment_receiver(slot: usize) {
+    CLASS_PUBLICATION_SEQUENCE.fetch_add(1, Ordering::AcqRel);
     let previous = INHERITED_SYSTEM[slot].fetch_add(1, Ordering::Release);
     assert!(
         previous != u8::MAX,
         "scheduler donation receiver count overflow"
     );
+    CLASS_PUBLICATION_SEQUENCE.fetch_add(1, Ordering::AcqRel);
 }
 
 fn decrement_receiver(slot: usize) {
+    CLASS_PUBLICATION_SEQUENCE.fetch_add(1, Ordering::AcqRel);
     let previous = INHERITED_SYSTEM[slot].fetch_sub(1, Ordering::Release);
     assert!(previous != 0, "scheduler donation receiver count underflow");
+    CLASS_PUBLICATION_SEQUENCE.fetch_add(1, Ordering::AcqRel);
 }
 
 fn release_entry(ledger: &DonationLedger, entry: LedgerEntry) {

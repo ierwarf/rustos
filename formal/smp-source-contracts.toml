@@ -704,8 +704,39 @@ tokens = [
     "latest.eligible_ns = latest.eligible_ns.max(refill.eligible_ns);",
     "let charged_ns = elapsed_ns.min(self.available_ns);",
     "self.available_ns -= charged_ns;",
-    "if !self.prepare_scheduling_domain_dispatch(domain_slot, policy, now_ns) {",
+    "if !self.prepare_scheduling_domain_dispatch(",
     ".prepare_dispatch(now_ns)",
+]
+
+# A catalog-free frame observation is usable only after exact Local custody,
+# an even coherent publication, and a final epoch recheck. The transition from
+# Local to Running must bind a fresh owner generation, and retirement clears
+# the publication before reuse.
+[[required_sequences]]
+path = "kernel/ps/src/multitask/scheduler/frame_publication.rs"
+tokens = [
+    "if owner.state != RunOwnerState::Local || owner.cpu != Some(cpu) || !owner.runnable {",
+    "if cpu_local::task_execution_owner(slot).is_some() {",
+    "let token = read(slot)?;",
+    "if token.owner_generation != owner.generation {",
+    "if runqueue::owner(slot) != owner || cpu_local::task_execution_owner(slot).is_some() {",
+]
+
+[[required_sequences]]
+path = "kernel/ps/src/multitask/scheduler/runqueue.rs"
+tokens = [
+    "let next = owner.next(RunOwnerState::Local, Some(cpu));",
+    "frame_publication::bind_local_owner_generation(slot, next.generation);",
+    "RUN_QUEUES[cpu].publish_load(&rq);",
+    "frame_publication::clear(slot);",
+]
+
+[[required_sequences]]
+path = "kernel/ps/src/multitask/scheduler/local_dispatch.rs"
+tokens = [
+    "let Some(frame) = frame_publication::local_frame_token(slot, cpu) else {",
+    "context_validation::validate_published_saved_context(frame.slot, frame.saved_rsp, frame.view)",
+    "frame_publication::token_is_current(frame, cpu)",
 ]
 
 [[forbidden_patterns]]
@@ -756,9 +787,9 @@ reason = "kernel wide-SIMD crypto is reachable only through the bracketed dvm-bl
 [[admit_commit_pairs]]
 name = "scheduling-domain-budget"
 admit_path = "kernel/ps/src/multitask/scheduler/smp.rs"
-admit_token = "self.scheduling_domain_is_eligible(domain_slot, policy, now_ns)"
+admit_token = "self.scheduling_domain_is_eligible("
 commit_path = "kernel/ps/src/multitask/scheduler/scheduling_context.rs"
-commit_token = "if !self.prepare_scheduling_domain_dispatch(domain_slot, policy, now_ns) {"
+commit_token = "if !self.prepare_scheduling_domain_dispatch("
 commit_call = "commit_scheduling_budget_for_dispatch("
 
 # The balance phase may publish the current task `Blocked` or rehome it after

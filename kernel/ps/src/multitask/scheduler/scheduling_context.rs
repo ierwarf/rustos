@@ -139,7 +139,7 @@ struct BoundedRefillQueue {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum BudgetCounterScope {
+pub(super) enum BudgetCounterScope {
     Context,
     Domain,
 }
@@ -290,7 +290,7 @@ pub(super) struct ChargeOutcome {
 }
 
 impl BudgetState {
-    fn admitted(
+    pub(super) fn admitted(
         policy: SchedulingContextPolicy,
         counter_scope: BudgetCounterScope,
     ) -> Option<Self> {
@@ -311,6 +311,10 @@ impl BudgetState {
     }
 
     pub(super) fn replenish(&mut self, now_ns: u64) -> bool {
+        self.replenish_inner(now_ns, true)
+    }
+
+    fn replenish_inner(&mut self, now_ns: u64, record_counters: bool) -> bool {
         let counters = self.counter_scope.counters();
         while let Some(refill) = self.refills.pop_eligible(now_ns) {
             let Some(available_ns) = self.available_ns.checked_add(refill.amount_ns) else {
@@ -321,14 +325,33 @@ impl BudgetState {
             }
             self.available_ns = available_ns;
             self.refill_count = self.refill_count.saturating_add(1);
-            saturating_add(&counters.refill_ns, refill.amount_ns);
-            saturating_add(&counters.refills, 1);
+            if record_counters {
+                saturating_add(&counters.refill_ns, refill.amount_ns);
+                saturating_add(&counters.refills, 1);
+            }
         }
         true
     }
 
+    /// Checks the complete bounded charge transaction without mutating this
+    /// budget or its diagnostic counters. Paired context/domain charging uses
+    /// this to reject before either side is committed.
+    pub(super) fn can_charge(&self, now_ns: u64, elapsed_ns: u64) -> bool {
+        let mut planned = *self;
+        planned.charge_inner(now_ns, elapsed_ns, false).is_some()
+    }
+
     pub(super) fn charge(&mut self, now_ns: u64, elapsed_ns: u64) -> Option<ChargeOutcome> {
-        if !self.replenish(now_ns) {
+        self.charge_inner(now_ns, elapsed_ns, true)
+    }
+
+    fn charge_inner(
+        &mut self,
+        now_ns: u64,
+        elapsed_ns: u64,
+        record_counters: bool,
+    ) -> Option<ChargeOutcome> {
+        if !self.replenish_inner(now_ns, record_counters) {
             return None;
         }
         let charged_ns = elapsed_ns.min(self.available_ns);
@@ -347,16 +370,22 @@ impl BudgetState {
             }
             if was_full {
                 self.overflow_merge_count = self.overflow_merge_count.saturating_add(1);
-                saturating_add(&counters.overflow_merges, 1);
+                if record_counters {
+                    saturating_add(&counters.overflow_merges, 1);
+                }
             }
         }
         let exhausted = self.available_ns == 0;
         if exhausted && charged_ns != 0 {
             self.exhaustion_count = self.exhaustion_count.saturating_add(1);
-            saturating_add(&counters.exhaustions, 1);
+            if record_counters {
+                saturating_add(&counters.exhaustions, 1);
+            }
         }
-        saturating_add(&counters.charged_ns, charged_ns);
-        saturating_add(&counters.overrun_ns, overrun_ns);
+        if record_counters {
+            saturating_add(&counters.charged_ns, charged_ns);
+            saturating_add(&counters.overrun_ns, overrun_ns);
+        }
         Some(ChargeOutcome {
             charged_ns,
             overrun_ns,
@@ -368,11 +397,22 @@ impl BudgetState {
         self.available_ns.checked_add(self.refills.total_ns()?)
     }
 
-    fn next_eligible_ns(&self) -> Option<u64> {
+    pub(super) fn next_eligible_ns(&self) -> Option<u64> {
         self.refills.next_eligible_ns()
     }
 
-    fn snapshot(&self) -> Option<BudgetSnapshot> {
+    pub(super) fn is_eligible(&self, now_ns: u64) -> bool {
+        self.available_ns != 0
+            || self
+                .next_eligible_ns()
+                .is_some_and(|eligible_ns| eligible_ns <= now_ns)
+    }
+
+    pub(super) fn available(&self) -> bool {
+        self.available_ns != 0
+    }
+
+    pub(super) fn snapshot(&self) -> Option<BudgetSnapshot> {
         Some(BudgetSnapshot {
             available_ns: self.available_ns,
             pending_refill_ns: self.refills.total_ns()?,
@@ -388,7 +428,7 @@ impl BudgetState {
         })
     }
 
-    fn record_timeout_fault(&mut self, reply: u64) {
+    pub(super) fn record_timeout_fault(&mut self, reply: u64) {
         self.timeout_fault = TimeoutFaultState {
             count: self.timeout_fault.count.saturating_add(1),
             consumed_ns: self.consumed_ns,
@@ -421,15 +461,12 @@ fn deadline_utilization_ppm(policy: SchedulingContextPolicy) -> Option<u64> {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct SchedulingDomainState {
     policy: SchedulingContextPolicy,
-    budget: BudgetState,
+    generation: u32,
 }
 
 impl SchedulingDomainState {
-    pub(super) fn admitted(policy: SchedulingContextPolicy) -> Option<Self> {
-        Some(Self {
-            policy,
-            budget: BudgetState::admitted(policy, BudgetCounterScope::Domain)?,
-        })
+    pub(super) fn admitted(policy: SchedulingContextPolicy, generation: u32) -> Option<Self> {
+        (policy.is_valid() && generation != 0).then_some(Self { policy, generation })
     }
 
     pub(super) const fn domain(self) -> u64 {
@@ -440,16 +477,8 @@ impl SchedulingDomainState {
         self.policy
     }
 
-    pub(super) fn is_eligible(self, now_ns: u64) -> bool {
-        self.budget.available_ns != 0
-            || self
-                .budget
-                .next_eligible_ns()
-                .is_some_and(|eligible_ns| eligible_ns <= now_ns)
-    }
-
-    pub(super) fn prepare_dispatch(&mut self, now_ns: u64) -> bool {
-        self.budget.replenish(now_ns) && self.budget.available_ns != 0
+    pub(super) const fn generation(self) -> u32 {
+        self.generation
     }
 
     /// Names why this domain would refuse a dispatch, without mutating it.
@@ -473,22 +502,11 @@ impl SchedulingDomainState {
                 DomainRefusalCause::Policy
             };
         }
-        if self.budget.available_ns != 0 {
-            return DomainRefusalCause::RefillRefused;
-        }
-        match self.budget.next_eligible_ns() {
-            None => DomainRefusalCause::EmptyNoRefill,
-            Some(eligible_ns) if eligible_ns > now_ns => DomainRefusalCause::EmptyRefillPending,
-            Some(_) => DomainRefusalCause::ConservationRefused,
-        }
-    }
-
-    pub(super) fn charge_runtime(&mut self, now_ns: u64, elapsed_ns: u64) -> Option<ChargeOutcome> {
-        self.budget.charge(now_ns, elapsed_ns)
-    }
-
-    pub(super) fn runtime_snapshot(&self) -> Option<BudgetSnapshot> {
-        self.budget.snapshot()
+        // Runtime budget state is keyed by catalog slot in scheduling_runtime;
+        // callers with that slot use its refusal helper after this metadata
+        // policy check.
+        let _ = now_ns;
+        DomainRefusalCause::ConservationRefused
     }
 }
 
@@ -572,8 +590,12 @@ impl super::Scheduler {
         let domain_slot = context
             .domain_slot()
             .expect("budgeted scheduling context lost its domain slot");
-        if !self.prepare_scheduling_domain_dispatch(domain_slot, policy, now_ns) {
-            self.note_domain_budget_refusal(slot, domain_slot, policy, now_ns);
+        let domain_generation = context
+            .domain_generation()
+            .expect("budgeted scheduling context lost its domain generation");
+        if !self.prepare_scheduling_domain_dispatch(domain_slot, domain_generation, policy, now_ns)
+        {
+            self.note_domain_budget_refusal(slot, domain_slot, domain_generation, policy, now_ns);
             return false;
         }
         self.contexts[owner_slot]
@@ -596,6 +618,7 @@ impl super::Scheduler {
         &self,
         slot: usize,
         domain_slot: usize,
+        domain_generation: u32,
         policy: SchedulingContextPolicy,
         now_ns: u64,
     ) {
@@ -604,7 +627,16 @@ impl super::Scheduler {
             .get(domain_slot)
             .and_then(|domain| *domain)
             .map_or(DomainRefusalCause::NoDomain, |domain| {
-                domain.dispatch_refusal(policy, now_ns)
+                if domain.policy() != policy || domain.generation() != domain_generation {
+                    domain.dispatch_refusal(policy, now_ns)
+                } else {
+                    super::scheduling_runtime::domain_dispatch_refusal(
+                        domain_slot,
+                        domain_generation,
+                        policy,
+                        now_ns,
+                    )
+                }
             });
         latch_domain_budget_refusal(slot, domain_slot, cause);
     }
@@ -624,7 +656,12 @@ impl super::Scheduler {
             let current = self.scheduling_domains[index]
                 .expect("located scheduling domain disappeared under scheduler owner");
             if current.policy() == policy {
-                return Some(index);
+                return super::scheduling_runtime::domain_matches(
+                    index,
+                    current.generation(),
+                    policy,
+                )
+                .then_some(index);
             }
             let has_live_member = self.contexts.iter().flatten().any(|context| {
                 context
@@ -635,12 +672,24 @@ impl super::Scheduler {
             if has_live_member {
                 return None;
             }
-            self.scheduling_domains[index] = SchedulingDomainState::admitted(policy);
-            return self.scheduling_domains[index].is_some().then_some(index);
+            // The runtime replacement is prepared and committed before the
+            // catalog points at it. There are no live members at this point,
+            // so the old policy cannot be charged during the swap.
+            let generation = super::scheduling_runtime::replace_domain(
+                index,
+                current.policy(),
+                current.generation(),
+                policy,
+            )?;
+            self.scheduling_domains[index] = SchedulingDomainState::admitted(policy, generation);
+            return Some(index);
         }
         let slot = self.scheduling_domains.iter().position(Option::is_none)?;
-        self.scheduling_domains[slot] = SchedulingDomainState::admitted(policy);
-        self.scheduling_domains[slot].is_some().then_some(slot)
+        // Do not publish catalog metadata until its fixed runtime cell was
+        // fully initialized. This makes domain admission all-or-nothing.
+        let generation = super::scheduling_runtime::initialize_domain(slot, policy)?;
+        self.scheduling_domains[slot] = SchedulingDomainState::admitted(policy, generation);
+        Some(slot)
     }
 
     fn deadline_domain_admitted(&self, policy: SchedulingContextPolicy) -> bool {
@@ -683,8 +732,9 @@ impl super::Scheduler {
 pub(super) struct SchedulingContext {
     identity: ObjectIdentity,
     bound_task: u64,
-    budget: Option<BudgetState>,
+    policy: Option<SchedulingContextPolicy>,
     domain_slot: Option<u8>,
+    domain_generation: Option<u32>,
 }
 
 impl SchedulingContext {
@@ -713,33 +763,56 @@ impl SchedulingContext {
             // the same transaction.  Keeping identity construction separate
             // prevents the legacy weight field from being reinterpreted as
             // temporal authority while the versioned rootd ABI is connected.
-            budget: None,
+            policy: None,
             domain_slot: None,
+            domain_generation: None,
         }
     }
 
-    pub(super) fn admit(&mut self, policy: SchedulingContextPolicy, domain_slot: usize) -> bool {
-        let Some(budget) = BudgetState::admitted(policy, BudgetCounterScope::Context) else {
-            return false;
-        };
+    pub(super) fn admit(
+        &mut self,
+        policy: SchedulingContextPolicy,
+        domain_slot: usize,
+        domain_generation: u32,
+    ) -> bool {
         let Ok(domain_slot) = u8::try_from(domain_slot) else {
             return false;
         };
-        self.budget = Some(budget);
+        let Some(slot) = self
+            .identity
+            .slot()
+            .checked_sub(1)
+            .and_then(|slot| usize::try_from(slot).ok())
+        else {
+            return false;
+        };
+        if domain_generation == 0
+            || !super::scheduling_runtime::initialize(
+                slot,
+                self.identity,
+                policy,
+                domain_slot,
+                domain_generation,
+            )
+        {
+            return false;
+        }
+        self.policy = Some(policy);
         self.domain_slot = Some(domain_slot);
+        self.domain_generation = Some(domain_generation);
         true
     }
 
     pub(super) const fn is_budgeted(self) -> bool {
-        self.budget.is_some()
+        self.policy.is_some()
     }
 
     pub(super) fn allows_cpu(self, cpu: usize) -> bool {
-        self.budget.is_none_or(|budget| {
+        self.policy.is_none_or(|policy| {
             u32::try_from(cpu)
                 .ok()
                 .and_then(|cpu| 1_u64.checked_shl(cpu))
-                .is_some_and(|bit| budget.policy.cpu_mask & bit != 0)
+                .is_some_and(|bit| policy.cpu_mask & bit != 0)
         })
     }
 
@@ -747,38 +820,39 @@ impl SchedulingContext {
     /// considered eligible here and is committed only after the scheduler has
     /// selected the exact slot under its owner lock.
     pub(super) fn is_eligible(self, now_ns: u64) -> bool {
-        self.budget.is_none_or(|budget| {
-            budget.available_ns != 0
-                || budget
-                    .next_eligible_ns()
-                    .is_some_and(|eligible_ns| eligible_ns <= now_ns)
-        })
-    }
-
-    pub(super) fn prepare_dispatch(&mut self, now_ns: u64) -> bool {
-        let Some(budget) = self.budget.as_mut() else {
+        let Some(policy) = self.policy else {
             return true;
         };
-        budget.replenish(now_ns) && budget.available_ns != 0
+        super::scheduling_runtime::is_eligible(
+            usize::try_from(self.identity.slot() - 1).expect("context slot exceeds usize"),
+            self.identity,
+            policy,
+            now_ns,
+        )
     }
 
-    pub(super) fn charge_runtime(&mut self, now_ns: u64, elapsed_ns: u64) -> Option<ChargeOutcome> {
-        let Some(budget) = self.budget.as_mut() else {
-            return Some(ChargeOutcome {
-                charged_ns: elapsed_ns,
-                overrun_ns: 0,
-                exhausted: false,
-            });
+    pub(super) fn prepare_dispatch(self, now_ns: u64) -> bool {
+        let Some(policy) = self.policy else {
+            return true;
         };
-        budget.charge(now_ns, elapsed_ns)
+        super::scheduling_runtime::prepare_dispatch(
+            usize::try_from(self.identity.slot() - 1).expect("context slot exceeds usize"),
+            self.identity,
+            policy,
+            now_ns,
+        )
     }
 
-    pub(super) fn record_timeout_fault(&mut self, reply: u64) -> bool {
-        let Some(budget) = self.budget.as_mut() else {
+    pub(super) fn record_timeout_fault(self, reply: u64) -> bool {
+        let Some(policy) = self.policy else {
             return false;
         };
-        budget.record_timeout_fault(reply);
-        true
+        super::scheduling_runtime::record_timeout_fault(
+            usize::try_from(self.identity.slot() - 1).expect("context slot exceeds usize"),
+            self.identity,
+            policy,
+            reply,
+        )
     }
 
     pub(super) const fn identity(self) -> ObjectIdentity {
@@ -786,15 +860,24 @@ impl SchedulingContext {
     }
 
     pub(super) fn policy(self) -> Option<SchedulingContextPolicy> {
-        self.budget.map(|budget| budget.policy)
+        self.policy
     }
 
     pub(super) fn domain_slot(self) -> Option<usize> {
         self.domain_slot.map(usize::from)
     }
 
+    pub(super) const fn domain_generation(self) -> Option<u32> {
+        self.domain_generation
+    }
+
     pub(super) fn runtime_snapshot(self) -> Option<BudgetSnapshot> {
-        self.budget?.snapshot()
+        let policy = self.policy?;
+        super::scheduling_runtime::runtime_snapshot(
+            usize::try_from(self.identity.slot() - 1).expect("context slot exceeds usize"),
+            self.identity,
+            policy,
+        )
     }
 
     pub(super) const fn is_bound_to(self, task_id: u64) -> bool {
@@ -827,8 +910,8 @@ mod exhaustion_latch_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        BudgetCounterScope, BudgetState, Refill, SchedulingContext, SchedulingContextPolicy,
-        SchedulingDomainState,
+        BudgetCounterScope, BudgetRuntimeCounters, BudgetState, Refill, SchedulingContext,
+        SchedulingContextPolicy, drain_runtime_counters,
     };
 
     /// The unlocked custody and call-admission readers reconstruct a bound
@@ -982,31 +1065,134 @@ mod tests {
 
     #[test]
     fn domain_budget_is_shared_across_independent_task_charges() {
-        let mut domain = SchedulingDomainState::admitted(policy(4)).expect("valid domain");
-        assert_eq!(domain.budget.counter_scope, BudgetCounterScope::Domain);
-        let first = domain.charge_runtime(100, 2_500).expect("first charge");
-        let second = domain.charge_runtime(200, 2_500).expect("second charge");
+        let _runtime = super::super::scheduling_runtime::test_serial_guard();
+        super::super::scheduling_runtime::reset_for_test();
+        let _ = drain_runtime_counters();
+        let policy = policy(4);
+        let generation = super::super::scheduling_runtime::initialize_domain(63, policy)
+            .expect("domain admission");
+        let first = super::super::scheduling_runtime::charge_domain_runtime(
+            63, generation, policy, 100, 2_500,
+        )
+        .expect("first charge");
+        let second = super::super::scheduling_runtime::charge_domain_runtime(
+            63, generation, policy, 200, 2_500,
+        )
+        .expect("second charge");
         assert_eq!(first.charged_ns, 2_500);
         assert_eq!(second.charged_ns, 1_500);
         assert_eq!(second.overrun_ns, 1_000);
         assert!(second.exhausted);
-        assert!(!domain.is_eligible(10_099));
-        assert!(domain.is_eligible(10_100));
+        let counters = drain_runtime_counters();
+        assert_eq!(counters.context, BudgetRuntimeCounters::default());
+        assert_eq!(counters.domain.charged_ns, 4_000);
+        assert_eq!(counters.domain.overrun_ns, 1_000);
+        assert_eq!(counters.domain.exhaustions, 1);
+        assert!(!super::super::scheduling_runtime::domain_is_eligible(
+            63, generation, policy, 10_099
+        ));
+        assert!(super::super::scheduling_runtime::domain_is_eligible(
+            63, generation, policy, 10_100
+        ));
+    }
+
+    #[test]
+    fn paired_context_domain_charge_commits_the_same_interval_to_both_cells() {
+        let _runtime = super::super::scheduling_runtime::test_serial_guard();
+        super::super::scheduling_runtime::reset_for_test();
+        let context_slot = 60;
+        let domain_slot = 61;
+        let policy = policy(2);
+        let domain_generation =
+            super::super::scheduling_runtime::initialize_domain(domain_slot, policy)
+                .expect("domain admission");
+        let mut context = SchedulingContext::bind(context_slot, 0xabc);
+        assert!(context.admit(policy, domain_slot, domain_generation));
+        let (context_outcome, domain_outcome) = super::super::scheduling_runtime::charge_pair(
+            context_slot,
+            context.identity(),
+            policy,
+            domain_slot,
+            domain_generation,
+            100,
+            1_500,
+        )
+        .expect("paired charge");
+        assert_eq!(context_outcome, domain_outcome);
+        assert_eq!(
+            context
+                .runtime_snapshot()
+                .expect("context snapshot")
+                .consumed_ns,
+            super::super::scheduling_runtime::domain_snapshot(
+                domain_slot,
+                domain_generation,
+                policy,
+            )
+            .expect("domain snapshot")
+            .consumed_ns,
+        );
+    }
+
+    #[test]
+    fn stale_domain_generation_cannot_charge_a_reused_runtime_cell() {
+        let _runtime = super::super::scheduling_runtime::test_serial_guard();
+        super::super::scheduling_runtime::reset_for_test();
+        let slot = 62;
+        let old_policy = policy(2);
+        let old_generation = super::super::scheduling_runtime::initialize_domain(slot, old_policy)
+            .expect("old domain admission");
+        let mut replacement = old_policy;
+        replacement.policy_epoch = old_policy.policy_epoch + 1;
+        let new_generation = super::super::scheduling_runtime::replace_domain(
+            slot,
+            old_policy,
+            old_generation,
+            replacement,
+        )
+        .expect("domain replacement");
+        assert_ne!(old_generation, new_generation);
+        assert!(
+            super::super::scheduling_runtime::charge_domain_runtime(
+                slot,
+                old_generation,
+                old_policy,
+                100,
+                1,
+            )
+            .is_none()
+        );
+        assert!(
+            super::super::scheduling_runtime::domain_snapshot(slot, old_generation, old_policy,)
+                .is_none()
+        );
+        assert!(
+            super::super::scheduling_runtime::charge_domain_runtime(
+                slot,
+                new_generation,
+                replacement,
+                100,
+                1,
+            )
+            .is_some()
+        );
     }
 
     #[test]
     fn context_admission_is_explicit_and_versioned() {
+        let _runtime = super::super::scheduling_runtime::test_serial_guard();
+        super::super::scheduling_runtime::reset_for_test();
         let mut context = SchedulingContext::bind(2, 9);
-        assert!(context.budget.is_none());
+        assert!(context.policy().is_none());
         assert!(!context.is_budgeted());
-        assert!(context.admit(policy(3), 1));
+        assert!(context.admit(policy(3), 1, 1));
         assert!(context.is_budgeted());
         assert_eq!(context.domain_slot(), Some(1));
         assert!(context.allows_cpu(0));
         assert!(!context.allows_cpu(1));
-        let budget = context.budget.expect("admitted budget");
-        assert_eq!(budget.counter_scope, BudgetCounterScope::Context);
-        assert_eq!(budget.policy.policy_epoch, 3);
+        let budget = context.runtime_snapshot().expect("admitted budget");
+        assert_eq!(budget.available_ns, policy(3).budget_ns);
+        assert_eq!(context.policy().expect("admitted policy").policy_epoch, 3);
         assert_eq!(SchedulingContextPolicy::ABI_VERSION, 1);
     }
 }

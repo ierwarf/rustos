@@ -270,8 +270,8 @@ impl Scheduler {
             }
             let slot_changed = !self.job_stopped[slot];
             changed |= slot_changed;
-            self.job_stopped[slot] = true;
             if slot_changed {
+                self.set_slot_job_stopped(slot, true);
                 self.request_runqueue_owner_reschedule(slot);
             }
         }
@@ -303,8 +303,8 @@ impl Scheduler {
             }
             let slot_changed = self.job_stopped[slot];
             changed |= slot_changed;
-            self.job_stopped[slot] = false;
             if slot_changed {
+                self.set_slot_job_stopped(slot, false);
                 self.request_runqueue_owner_reschedule(slot);
             }
         }

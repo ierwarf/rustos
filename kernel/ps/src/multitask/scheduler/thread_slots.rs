@@ -18,6 +18,7 @@ pub(in crate::multitask) struct UserThreadSlotReservation {
     vruntime_ns: u64,
     scheduling_policy: Option<scheduling_context::SchedulingContextPolicy>,
     scheduling_domain_slot: Option<usize>,
+    scheduling_domain_generation: Option<u32>,
 }
 
 impl Scheduler {
@@ -54,6 +55,7 @@ impl Scheduler {
                     weight: self.slot_weight(self.current_task_slot()),
                     scheduling_policy: current.scheduling_context.policy(),
                     scheduling_domain_slot: current.scheduling_context.domain_slot(),
+                    scheduling_domain_generation: current.scheduling_context.domain_generation(),
                     vruntime_ns: self
                         .slot_vruntime(self.current_task_slot())
                         .saturating_add(SCHED_NEW_TASK_VRUNTIME_PENALTY_NS),
@@ -91,14 +93,15 @@ impl Scheduler {
         match (
             reservation.scheduling_policy,
             reservation.scheduling_domain_slot,
+            reservation.scheduling_domain_generation,
         ) {
-            (Some(policy), Some(domain_slot)) => {
-                if !scheduling_context.admit(policy, domain_slot) {
+            (Some(policy), Some(domain_slot), Some(domain_generation)) => {
+                if !scheduling_context.admit(policy, domain_slot, domain_generation) {
                     self.cancel_user_thread_slot(reservation);
                     return None;
                 }
             }
-            (None, None) => {}
+            (None, None, None) => {}
             _ => {
                 self.cancel_user_thread_slot(reservation);
                 return None;
@@ -162,12 +165,11 @@ impl Scheduler {
         );
         self.initialize_slot_alternate_kernel_stack_bounds(slot);
         self.initialize_slot_simd_state(slot);
-        self.start_suspended[slot] = true;
         self.starts[slot] = Some(TaskStart {
             entry: super::super::noop_task_entry,
             id: reservation.id,
         });
-        self.publish_slot_identity(slot);
+        self.set_slot_start_suspended(slot, true);
         self.install_linux_thread_state(
             slot,
             bootstrap.linux_thread_state.map(|_| reservation.id),

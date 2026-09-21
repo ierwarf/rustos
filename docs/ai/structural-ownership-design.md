@@ -129,11 +129,12 @@ remaining scheduling-context budget/custody and per-task lifecycle arrays —
 address-space root, blocked state, ready/block timing, arm, and exact reason)
 are per-slot storage and no longer reside in that catalog.
 
-**The remaining work for `V5-SCHED-GLOBAL-001` is therefore a data-structure
-split, not a scheduling-algorithm change.** The per-task fields only the owning
-CPU mutates have to leave the globally locked struct for per-slot storage whose
-writer is that CPU, exactly as the writer table in 2.4 states. The scheduling
-policy above them is already per-CPU and does not move.
+**The remaining ownership work for `V5-SCHED-GLOBAL-001` is a data-structure
+split; ordinary fair selection now also has an explicit local-policy owner.**
+Per-task fields only the owning CPU mutates still leave the globally locked
+struct for per-slot storage exactly as the writer table in 2.4 states. The
+policy cutover is separate: generation-bound local publication owns ordinary
+fair choices, while exact activation and IPC FIFO custody stay catalog-owned.
 
 The former `TaskContext.ready` duplicate has already been removed. The split
 must instead preserve the existing run-owner transition as the sole runnable
@@ -416,10 +417,57 @@ tick scan.
 budget and period, which is the seL4 framing. Deadline and critical work is
 admitted by utilization, which is the Zircon framing.
 
+### 2.6a Authoritative fair-policy contract
+
+The local picker is an independent policy, not a bit-for-bit legacy emulator.
+Its acceptance properties are:
+
+1. **Eligibility before preference.** Lifecycle generation, CPU ownership,
+   affinity, stable saved frame, effective donation class, and both context and
+   domain budget must all be current. An unstable runnable/class publication or
+   one failed candidate revalidation rejects the whole local observation.
+2. **Exact custody wins.** Atomic activation and synchronous IPC FIFO handoffs
+   retain catalog authority. Local fairness cannot reorder them.
+3. **Bounded class service.** System work is preferred, but after at most
+   `MAX_CONSECUTIVE_SYSTEM_DISPATCHES` while User work is eligible, the least
+   virtual-runtime User choice is reserved. A reservation that finds no User
+   candidate does not alter the following ordinary fair choice.
+4. **Weighted fair order.** Within a class, the least weight-normalized
+   `vruntime` wins. Equal keys are deterministic; voluntary yield excludes the
+   current task on its first pass, and a task at maximum burst yields to an
+   eligible same-class alternate.
+5. **Bounded locality.** A same-CPU candidate may replace the class minimum only
+   within `SCHED_CPU_LOCALITY_LAG_NS`; locality never crosses a class, budget,
+   affinity, lifecycle, or custody boundary.
+6. **Progress, not wall-clock fiction.** User progress is guaranteed by the
+   bounded System/handoff bursts and virtual-runtime accounting. No unadmitted
+   hard completion deadline is claimed. System recovery retains its existing
+   bounded ready-age rail.
+7. **Fail closed.** If no complete local decision exists, use the already
+   computed catalog decision. A fallback is an authority boundary, not a policy
+   mismatch.
+
+This follows Linux EEVDF's separation of eligibility from virtual deadline/lag
+(`docs.kernel.org/scheduler/sched-eevdf.html`), CFS's weight-normalized virtual
+runtime (`docs.kernel.org/scheduler/sched-design-CFS.html`), FreeBSD ULE's
+per-CPU queues and affinity/topology awareness (`sched_ule(4)`), and Zircon's
+single-CPU competition invariant. RustOS deliberately retains its explicit
+bounded System reservation and exact IPC custody instead of importing any one
+scheduler wholesale.
+
+Acceptance is property-based: no dual owner, no ineligible dispatch, bounded
+User service under sustained System load, deterministic equal-key choice,
+bounded locality lag, exact voluntary-yield exclusion, budget conservation, and
+forward progress at 1/2/4/8 vCPU. Legacy disagreement is reported for diagnosis
+and performance interpretation but is not itself failure.
+
 ### 2.7 Cutover, and the model that has to come with it
 
-Restated for what the tree actually is. The policy layer does not move; the
-per-task state does.
+Restated for what the tree actually is: ownership-state refinement and fair
+policy selection are separate obligations. State may cut over only when its
+single-authority invariant holds. A new fair policy need not reproduce every
+legacy tie-break, but every differing result must satisfy the policy contract
+below.
 
 1. **Prove the two authorities agree** while the global lock still serializes
    both. Done: `run_authority::compare` sweeps every slot once per drain and
@@ -462,7 +510,13 @@ per-task state does.
    `Running` before activation clears the flag, and admission publishes the
    payload before the owner word. Every one keeps the locked path as its
    fallback, so a slot the reader cannot decide for is still decided.
-5. **Split scheduling-context budget/custody from lifecycle directory rows, then
+5. **Make coherent local publication authoritative for ordinary fair picks.**
+   A local result may intentionally differ from the catalog's legacy tie-break.
+   It is accepted only after lifecycle generation, owner custody, stable frame,
+   affinity, donation class, runnable-set epoch, and context/domain budget are
+   revalidated as one observation. Any unavailable member falls back to the
+   catalog. Atomic activation and exact IPC FIFO handoffs always fall back.
+6. **Split scheduling-context budget/custody from lifecycle directory rows, then
    delete the global guard** from ordinary dispatch/wake/block/accounting paths.
    Delete the legacy formal guard only after the source cutover and runtime
    acquisition counter both read zero.
@@ -546,6 +600,47 @@ intermittent to two-for-two here, and a change that reliably provokes a
 pre-existing race is not therefore safe. And `context.ready` cannot become
 diagnostic-only until this site is understood, because it is the last predicate
 where "queued" and "not blocked" genuinely differ.
+
+### Dispatch lifecycle publication (Phase 1)
+
+The earlier rejected `handoff_slot_ready` experiment changed runqueue/readiness
+meaning. Phase 1 deliberately does **not** repeat that change: it publishes
+only the existing `retired`, `start_suspended`, `job_stopped`, and
+`exec_target_quiesced` gates with the immutable task identity in one seqlock
+even-version commit. `handoff_slot_ready` may consume a stable publication for
+those four gates, but preserves its owner-word, blocked, runnable, and deferred
+retirement checks unchanged. An odd, absent, or invalid publication takes the
+same locked catalog evaluation rather than becoming a negative answer.
+
+Every lifecycle writer republishes after its flag mutation and before its
+corresponding wake/reschedule or retirement side effect: admission publishes
+after suspension is initialized; activation, job stop/continue, and exec
+quiesce publish before scheduling can observe the change; retirement publishes
+before cleanup. `divergent_published_identity` compares both identity and all
+four lifecycle gates under the scheduler lock. This publication is a read view,
+not a second lifecycle or dispatch authority. Conversion of any runqueue or
+readiness predicate remains blocked on the prior 1/2/4/8-vCPU evidence.
+
+### Scheduler runtime and local-clock boundaries (Phases 3–8)
+
+Scheduling-context catalog entries retain immutable identity, policy, and domain
+membership. Mutable context and domain budgets live in fixed-capacity runtime
+cells keyed by exact identity/policy; context runtime is acquired before domain
+runtime and stale slot generations fail closed. Retirement clears a context
+cell only when its live identity still matches.
+
+The Phase-5 local picker is authoritative for a qualified ordinary fair choice.
+Legacy divergence is retained as policy telemetry, not a correctness gate.
+Qualification requires a stable complete candidate set plus exact lifecycle,
+owner, frame, affinity, donation-class, and budget evidence. Exact
+activation/bootstrap/IPC FIFO choices and every incomplete observation remain
+catalog fallbacks; the mere presence of a local candidate grants no authority.
+
+Scheduler execution intervals may use `scheduler_local_nanos()` only by
+subtracting a start/end pair from one non-migratable same-CPU Running interval.
+It is not cross-CPU ordering authority. Each slot keeps the RTC-compatible tick
+baseline as fallback, and publication/reclaim clears the local baseline before
+slot reuse. The minimum-charge fairness policy remains unchanged.
 
 `V5-FORMAL-SCHED-019` closes with a refinement model whose variables are the
 owner word, the per-CPU queues, the transfer token, `current`, and the transition
