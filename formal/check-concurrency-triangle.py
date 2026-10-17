@@ -33,7 +33,7 @@ def require(condition: bool, message: str) -> None:
 
 
 def function_exists(source: str, function: str) -> bool:
-    return re.search(rf"\bfn\s+{re.escape(function)}\s*\(", source) is not None
+    return re.search(rf"\bfn\s+{re.escape(function)}(?:<[^>\n]+>)?\s*\(", source) is not None
 
 
 def proof_function_count(source: str, function: str) -> int:

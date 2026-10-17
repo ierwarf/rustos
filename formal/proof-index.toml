@@ -138,6 +138,75 @@ lemmas = [
 depends_on = ["runtime-response"]
 
 [[proof]]
+id = "scheduler-activation-claim"
+kind = "kani"
+package = "rustos-scheduler-frame-gate"
+source = "libs/rustos-scheduler-frame-gate/src/lib.rs"
+symbol = "first_turn_claim_custody"
+formal_model = "scheduler-local-authority/SchedulerLocalAuthority"
+scope = "bounded exact committed child identity and Local owner generation/cpu/runnability at cohort selection; final CAS, frame validity, queue and budgets are separate obligations"
+harnesses = ["activation_never_claims_a_reused_child_or_republished_owner"]
+depends_on = ["scheduler-frame-custody"]
+
+[[proof]]
+id = "scheduler-budget-identity"
+kind = "kani"
+package = "rustos-scheduler-frame-gate"
+source = "libs/rustos-scheduler-frame-gate/src/lib.rs"
+symbol = "published_budget_identity_custody"
+formal_model = "scheduling-context-budget/SchedulingContextBudget"
+scope = "bounded published context/domain generation and CPU-policy custody; locked policy epoch, refill ordering, donation-token lifetime, and dispatch claim remain separate"
+harnesses = ["published_budget_never_prepares_a_recycled_cell_or_disallowed_cpu"]
+depends_on = []
+
+[[proof]]
+id = "scheduler-early-policy-negative"
+kind = "kani"
+package = "rustos-scheduler-frame-gate"
+source = "libs/rustos-scheduler-frame-gate/src/lib.rs"
+symbol = "early_policy_may_continue"
+formal_model = "scheduler-local-authority/SchedulerLocalAuthority"
+scope = "bounded early-class gate: only a complete no-peer observation releases later policy, not the full multi-candidate scan or eventual progress under odd epochs"
+harnesses = ["unresolved_early_policy_never_releases_a_later_class"]
+depends_on = []
+
+[[proof]]
+id = "scheduler-frame-custody"
+kind = "kani"
+package = "rustos-scheduler-frame-gate"
+source = "libs/rustos-scheduler-frame-gate/src/lib.rs"
+symbol = "local_frame_custody"
+formal_model = "scheduler-cpu-ownership/SchedulerCpuOwnership"
+scope = "bounded generation and local non-executing custody predicate used by stable-frame reader; not seqlock or dispatch-claim proof"
+harnesses = [
+  "accepted_frame_has_exact_generation_local_cpu_and_no_execution_owner",
+  "stale_generation_and_execution_owner_always_reject",
+]
+depends_on = []
+
+[[proof]]
+id = "scheduler-retained-current-frame"
+kind = "kani"
+package = "rustos-scheduler-frame-gate"
+source = "libs/rustos-scheduler-frame-gate/src/lib.rs"
+symbol = "retained_current_frame_custody"
+formal_model = "scheduler-local-authority/SchedulerLocalAuthority"
+scope = "bounded exact Local generation plus runnable and exact Current CPU custody; excludes frame bytes/seqlock, budget writers, lifecycle teardown and guard-removal equivalence"
+harnesses = ["retained_current_frame_requires_exact_published_generation_and_cpu_custody"]
+depends_on = ["scheduler-frame-custody"]
+
+[[proof]]
+id = "scheduler-running-frame-geometry"
+kind = "kani"
+package = "rustos-scheduler-frame-gate"
+source = "libs/rustos-scheduler-frame-gate/src/lib.rs"
+symbol = "running_frame_geometry_custody"
+formal_model = "scheduler-local-authority/SchedulerLocalAuthority"
+scope = "bounded same-Running or immediately prior Local/Direct generation on the exact current CPU; frame seqlock, live stack guard and context bytes remain separate"
+harnesses = ["running_frame_geometry_never_inherits_a_distant_generation_or_foreign_cpu"]
+depends_on = ["scheduler-frame-custody"]
+
+[[proof]]
 id = "smp-qualification-bind-wire"
 kind = "kani"
 package = "rustos-user-abi"
@@ -162,6 +231,17 @@ harnesses = [
   "packed_worker_round_trips_every_cpu_and_worker_word",
   "admitted_worker_has_every_exact_intrinsic_bound",
 ]
+depends_on = []
+
+[[proof]]
+id = "task-retirement-cleanup-ack"
+kind = "kani"
+package = "rustos-scheduler-frame-gate"
+source = "libs/rustos-scheduler-frame-gate/src/lib.rs"
+symbol = "retirement_cleanup_ack_custody"
+formal_model = "task-retirement-cleanup-owner/TaskRetirementCleanupOwner"
+scope = "bounded exact claimed task and full-payload comparison gate; the cell lock, struct comparison, monotonic identity allocator, external cleanup and execution/process/TLB/stack lifetime remain separate"
+harnesses = ["retirement_cleanup_ack_never_settles_an_unclaimed_or_foreign_task"]
 depends_on = []
 
 [[proof]]

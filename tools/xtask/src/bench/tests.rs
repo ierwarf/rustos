@@ -1,11 +1,12 @@
 use super::*;
 
 #[test]
-fn benchmark_timeout_distinguishes_short_control_from_smp_and_isolation() {
-    assert_eq!(benchmark_timeout_seconds(1, false), 30);
-    assert_eq!(benchmark_timeout_seconds(8, false), 60);
-    assert_eq!(benchmark_timeout_seconds(1, true), 60);
-    assert_eq!(benchmark_timeout_seconds(8, true), 90);
+fn benchmark_readiness_budget_is_25_seconds_for_every_topology() {
+    for vcpus in [1, 2, 4, 8] {
+        for isolated in [false, true] {
+            assert_eq!(benchmark_timeout_seconds(vcpus, isolated), 25);
+        }
+    }
 }
 
 #[test]

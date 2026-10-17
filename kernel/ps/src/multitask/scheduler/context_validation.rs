@@ -27,7 +27,7 @@ pub(super) struct PublishedFrameView {
 }
 
 impl PublishedFrameView {
-    fn context_stack_contains(self, start: usize, end: usize) -> bool {
+    pub(super) fn context_stack_contains(self, start: usize, end: usize) -> bool {
         stack_range_contains(self.kernel_stack_base, self.kernel_stack_top, start, end)
             || stack_range_contains(
                 self.alternate_stack_base,
@@ -53,7 +53,7 @@ impl PublishedFrameView {
     }
 }
 
-fn stack_range_contains(base: u64, top: u64, start: usize, end: usize) -> bool {
+pub(super) fn stack_range_contains(base: u64, top: u64, start: usize, end: usize) -> bool {
     if base == 0 || top <= base || end < start {
         return false;
     }
@@ -69,15 +69,15 @@ fn is_canonical_address(addr: u64) -> bool {
     }
 }
 
-fn saved_context_ref(saved_rsp: usize) -> Option<&'static SavedContext> {
+/// Copy POD frame data; no borrowed reference can escape storage custody.
+/// # Safety
+/// Caller must prove complete initialized bounds, allocation lifetime and byte
+/// stability (IRQ-stabilized Current/Prepared or existing claim exclusion).
+pub(super) unsafe fn copy_saved_context(saved_rsp: usize) -> Option<SavedContext> {
     if saved_rsp == 0 || (saved_rsp & (mem::align_of::<SavedContext>() - 1)) != 0 {
         return None;
     }
-
-    // The caller validates complete frame bounds before dereferencing this
-    // pointer. Keeping dereference here makes every validator entry share one
-    // explicit unsafe boundary.
-    Some(unsafe { &*(saved_rsp as *const SavedContext) })
+    Some(unsafe { ptr::read(saved_rsp as *const SavedContext) })
 }
 
 /// Validates a stable saved context using only the supplied frame view.
@@ -104,7 +104,10 @@ pub(super) fn validate_published_saved_context(
         return Err("kernel stack guard was corrupted");
     }
 
-    let saved = saved_context_ref(saved_rsp).ok_or("saved context pointer is invalid")?;
+    // SAFETY: bounds were checked above; the caller retains frame currency,
+    // allocation custody and byte stability for this validator invocation.
+    let saved =
+        unsafe { copy_saved_context(saved_rsp) }.ok_or("saved context pointer is invalid")?;
     if (saved.rflags & RFLAGS_RESERVED_BIT_1) == 0 {
         return Err("saved rflags lost the reserved bit");
     }
@@ -187,57 +190,6 @@ pub(super) fn context_validation_reason_code(reason: &'static str) -> u8 {
     }
 }
 
-impl Scheduler {
-    pub(super) fn retire_invalid_ready_tasks(&mut self) {
-        let current_cpu = nucleus_core::util::lockdep::current_cpu_index();
-        for slot in runqueue::local_runnable_slots(current_cpu) {
-            if slot == ROOT_TASK_SLOT {
-                continue;
-            }
-            // Only a published runnable frame is immutable scheduler state.
-            // The current task's saved frame is the live kernel stack and may
-            // be overwritten until interrupt/syscall entry finishes saving
-            // it. Blocked, suspended, and retired slots are validated at their
-            // own transition; a foreign running slot is never inspected.
-            if !published_frame_is_stable(
-                slot,
-                self.current_task_slot(),
-                super::super::task_slot_is_running(slot),
-            ) {
-                continue;
-            }
-            let Some(context) = self.contexts[slot] else {
-                continue;
-            };
-            if !should_validate_published_ready_frame(
-                slot,
-                self.current_task_slot(),
-                self.retired[slot],
-                self.start_suspended[slot],
-                self.slot_is_runnable(slot),
-                self.slot_blocked(slot),
-            ) {
-                continue;
-            }
-            let saved_rsp = self.slot_saved_rsp(slot);
-            if let Err(reason) = self.validate_saved_context(slot, context.user_mode, saved_rsp) {
-                self.log_invalid_context(slot, saved_rsp, reason, "ready-scan");
-                self.retire_slot_due_to_invalid_context(slot, saved_rsp, reason);
-            }
-        }
-    }
-
-    pub(super) fn periodic_ready_validation_due(&mut self) -> bool {
-        // One acquisition, not two. This runs on every dispatch, and the read
-        // and the write were separate acquisitions of the same CPU-private
-        // policy lock; the turn counter is the only state either touched.
-        let mut policy = self.current_dispatch_policy_mut();
-        let turn = policy.ready_validation_turn.saturating_add(1);
-        let due = turn >= READY_VALIDATION_INTERVAL_TURNS;
-        policy.ready_validation_turn = if due { 0 } else { turn };
-        due
-    }
-}
 
 #[cfg(test)]
 mod tests {

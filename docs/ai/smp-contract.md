@@ -83,6 +83,16 @@ No state may be skipped. Publication is release-ordered; observers use acquire
 loads. A stale generation can never acknowledge startup, IPI, TLB, task, or
 retirement work.
 
+Scheduler image startup is a one-shot BSP owner, not the runtime global
+scheduler guard. Exact OnlineParked generations qualify BSP/AP construction;
+per-CPU Publishing admission precedes initial bank effects, complete bank ACKs
+precede the single Ready image Release, and AP hardware entry consumes a unique
+SchedulerReady-generation producer. Initial Current banks precede Current/active
+publication and BSP Current-only SIMD save. Runtime directory entry cannot
+manufacture a bootstrap Current. Poison forbids retry/restart of a partial image.
+These are mechanism/custody guarantees, not physical RSP/CR3/TSS/funding acceptance;
+commercial runtime acceptance and complete runtime guard deletion remain open.
+
 CPU hot-unplug and in-boot restart are not implemented. `Quarantined -> Failed`
 is terminal for that boot, and an attempted transition out of `Failed`, reuse
 of generation 1, or a stale-generation transition panics. A future restart
@@ -616,24 +626,31 @@ kernel-stamped sender; ring0 owns only the bounded atomic publication:
 - a cohort contains 1..=8 unique nonzero PIDs and has a zeroed unused tail;
 - every target must carry the exact requester's unconsumed deferred-start
   capability and a valid suspended scheduler context;
-- `ProcBrokerRegistry -> Scheduler` is the only lock order;
+- the caller retains ProcBrokerRegistry policy custody, while kernel activation
+  captures exact binding Cohort before a qualified facade; it never acquires
+  the Scheduler directory or holds Identity51/Resources53/Policy42 across the
+  bounded authority callback;
 - all capability and scheduler preflight completes before any runnable bit,
   spawn FIFO entry, or capability consumption changes;
-- after both preflights, exact one-shot capability consumption runs while both
-  owners remain held and strictly before scheduler publication; failure during
-  this bounded commit leaves every target suspended and panics fail-closed;
+- after both preflights, exact one-shot capability consumption precedes task
+  effects and the group's one admission Release; callback failure leaves targets
+  suspended and panics fail-closed. A concurrent terminal stop may hide identity
+  metadata, but cannot erase the captured binding or be reawakened;
 - the capability-registry guard is released before milestone or diagnostic
   output, so newly runnable siblings cannot contend on a preempted logging
   owner;
-- successful publication queues every sibling in cohort order before the
-  loader reply; the scheduler gives exactly that bounded cohort its FIFO
-  first-turn prefix before resuming the synchronous loader reply chain;
+- successful publication completes every surviving member before loader reply;
+  where latency priority is admitted, the bounded exact cohort FIFO gives its
+  first-turn prefix before the synchronous loader reply chain;
 - atomic-cohort custody is a dedicated bounded FIFO and must never alias the
   ordinary single-spawn FIFO: pre-existing or later thread-spawn handoffs
   neither disable nor extend the committed cohort prefix;
-- only one multi-task atomic cohort may own that dedicated FIFO at a time;
-  overlap is an internal loader/scheduler protocol contradiction and panics;
-  rejection changes none;
+- empty-queue polling is only a priority hint. Competing disjoint activations
+  arbitrate insertion/count under each Policy42 leaf; saturation/duplicate or
+  exhausted priority count degrades to ordinary spawn custody, never ring0 panic
+  or execution permission. Per-slot suspension/affinity seal publication shares
+  Identity51: a conflicting unowned mask replacement refuses before epoch/masks;
+  the syscall returns existing MissingTask rather than racing a cold-owner assert;
 - impossible failure after preflight is a kernel invariant violation and
   panics, because partial startup publication has no safe userspace repair.
 
@@ -715,8 +732,51 @@ queues, timers, IPC donation, and current/ready ownership on every CPU.
 - Exit first seals admission, then requests remote task retirement, waits with
   a bounded generation-matched protocol, clears wait/timer/donation authority,
   performs final shootdown, and only then reclaims the address space.
-- Exec uses the same sibling-retirement barrier before replacing mappings or
-  ABI state.
+- Group exit freezes exact `(slot, UID)` membership under Class55 after pending
+  creation joins drain. Its checked exit nonce/record is independent of exec's
+  epoch: pending-exit rollback must not erase an existing census or admit new
+  creators. Desired retired bindings acknowledge withdrawal, not physical
+  quiescence or consumer completion; missing/recycled bindings never ACK.
+  Production group collection no longer scans Scheduler contexts. Actual
+  effects still use the directory, including self-exit's drained-join guarantee;
+  final joined thread publication cannot move out until that guarantee is replaced.
+- Initial user-thread reservation and TEB-failure cancellation use own-CPU
+  preemption/IRQ plus exact creator pin/unpublished Ticket, not directory admission.
+  Creator pin ends before sleepable TEB work; final commit remains guarded with
+  exact Join, MM activation and constructor ACK. Class55 waits enter standalone
+  preemption before acquisition and mask protected IRQs afterward.
+- Last-live authority comes from Class55's pinned per-process terminal turn,
+  not Scheduler context enumeration. Pending creation joins refuse before turn
+  nonce spend; roots/joins/mask replacement/new exec census and live member
+  detach stay closed through exact Class50 producer publication. Complete
+  desired-stop observation authorizes exit sealing separately from final
+  committed-stop election. Missing/recycled bindings are not retired negatives.
+  Identity51 stop precedes committed membership stop; detached rows preserve
+  handle/epoch through a non-Copy publication receipt. Effects abandonment
+  retains poisoned occupancy, not implicit reopen. Existing frozen exec census
+  can retire an exact sibling without admitting new creators. These are not
+  full creation/publication/group-exit/image/IRQ/MM/RSP replacement grants.
+- Production terminal withdrawal first borrows an exact Class50 producer loan,
+  then authenticates hidden UID through Identity51 -> Resources53 outside the
+  terminal leaf. Checked claim nonces preserve original reason/detach custody;
+  duplicate claims refuse, untouched rollback restores exact deferred ownership,
+  and effect abandonment poisons. Final external cleanup and kernel-revocation
+  publication consumes the loan together; both consumer ACKs precede reuse.
+  Neither a copied reason nor an empty deferred queue grants reset or teardown.
+  Constructor/image-writer/close/reuse prefixes refuse terminal binding. These
+  loans do not arbitrate process-last-live, exclude future exec images, or grant
+  CPU/IRQ/MM/RSP authority; enclosing genuine directory transactions remain.
+- Exec captures `ExecMembership`'s exact process/intent/member census under
+  Class55 with outstanding creation joins drained, and retains its checked
+  epoch/process pin through image completion or exact cancellation. This phase
+  excludes new root/child membership and process-mask publication; removal does
+  not discard captured UIDs or reopen creation. Already-retired captured siblings
+  still wait for real Running/execution-reference drain, without republishing
+  terminal tokens. Recycled UIDs and the external request's live caller cannot
+  be retired by this census. Independent input admission replaces directory
+  lookup, not terminal or CPU/MM return custody: those genuine guards and the
+  sibling/HAL inactive-root/shootdown barrier remain required. Post-stage
+  abandonment quarantines, rather than implicitly reopening the process.
 - The release stack profile eagerly maps every usable stack page above one
   permanent guard page before the task becomes runnable. Consequently a valid
   stack access does not enter `ProcessStateLock` from page-fault context. No

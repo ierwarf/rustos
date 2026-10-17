@@ -2,13 +2,14 @@ mod context;
 mod cpu_local;
 mod current;
 mod user_copy;
-pub(crate) use current::with_current_user_copy_mm;
-pub(crate) use user_copy::UserCopyAddressSpace;
+pub(crate) use {current::with_current_user_copy_mm, user_copy::UserCopyAddressSpace};
 mod current_identity;
 mod deferred_wake;
 mod irq;
+mod irq_leaf;
 mod pager_fault;
 mod pager_vma;
+mod process_placement;
 mod process_state_lock;
 mod process_table;
 mod reschedule_observation;
@@ -27,8 +28,7 @@ use x86_64::registers::rflags::RFlags;
 use x86_64::registers::segmentation::{CS, SS, Segment};
 
 use self::cpu_local::{
-    current_cpu_task_slot_admitted, publish_cpu_current_task, publish_scheduler_initialized,
-    scheduler_initialized, scheduler_mut, scheduler_ref, task_slot_is_running,
+    current_cpu_task_slot_admitted, scheduler_initialized, task_slot_is_running,
 };
 use self::task_id::{NEXT_TASK_ID, allocate_task_id};
 use crate::io::session::ConsoleSessionHandle;
@@ -43,10 +43,10 @@ use crate::user::process_state::{
 
 pub use self::current::{
     PagerChargeSnapshot, activate_suspended_user_task, activate_suspended_user_tasks,
-    activate_suspended_user_tasks_with_commit, any_user_process_state, arm_block_current_task,
+    activate_suspended_user_tasks_with_commit, arm_block_current_task,
     arm_block_current_task_on_endpoint, arm_block_current_task_on_pager_fault,
     arm_block_current_task_on_pager_service, arm_block_current_task_on_reply,
-    attach_reserved_ipc_priority, bind_ipc_priority_to_process_worker, bind_reserved_ipc_priority,
+    attach_reserved_ipc_priority, bind_reserved_ipc_priority,
     cancel_block_current_task, cancel_ipc_priority_reservation, commit_ipc_call_handoff,
     complete_fast_ipc_reply_wake_handoff_with_custody, complete_ipc_reply_wake_handoff,
     complete_ipc_reply_wake_handoff_with_custody, complete_pager_fault_wake_handoff,
@@ -65,13 +65,13 @@ pub use self::current::{
     mark_user_process_exiting_once, next_retired_task_cleanup, note_process_exit_status,
     pager_vma_regions_for_process, parent_process_id_of, publish_current_pager_vma,
     publish_inherited_pager_vma_for_process, publish_pager_vma_for_process,
-    queue_linux_process_sigchld, queue_linux_signal, release_ipc_priorities_for_process,
+    queue_linux_process_sigchld, queue_linux_signal,
     release_ipc_priority, release_pager_fault_priority, reserve_ipc_call_donation,
     reserve_ipc_priority, retain_current_user_process_state, retire_current_user_task_due_to_fault,
     revoke_current_pager_vma, revoke_pager_vma_for_process, service_deferred_work,
     set_current_linux_tls_fs_base, set_linux_task_affinity, set_next_latency_pick_hint,
     set_next_pick_hint, set_next_process_pick_hint, set_next_spawn_pick_hint,
-    set_next_synchronous_pick_hint, set_windows_current_thread_affinity,
+    set_windows_current_thread_affinity,
     set_windows_process_affinity, settle_cancelled_ipc_reply_scheduling_context,
     settle_ipc_reply_scheduling_context, stop_current_linux_process,
     task_has_system_scheduling_class, terminate_user_process, terminate_user_task,
@@ -152,9 +152,7 @@ pub fn is_initialized() -> bool {
 }
 
 pub fn mark_root_idle() {
-    interrupts::without_interrupts(|| unsafe {
-        scheduler_mut().mark_root_idle();
-    });
+    assert!(scheduler::current_observation::mark_root_idle(), "root idle lost original Current custody");
     crate::debug::record_milestone(crate::debug::LogCategory::Sched, "smp-cpu-idle-enter", 0, 1);
 }
 
@@ -190,10 +188,6 @@ pub struct RetainedCurrentUserAddressSpace {
     process: process_table::ProcessRef,
 }
 
-pub struct CurrentKernelStackScope {
-    previous: (u64, u64),
-}
-
 pub enum WaitChildResult {
     Exited { pid: u64, status: i32 },
     StateChanged { pid: u64, status: i32 },
@@ -220,23 +214,6 @@ impl RetainedCurrentUserProcessState {
         self.process
             .with_visible_state(|_, state| f(state.address_space()))
             .expect("retained current address space crossed an exec staging boundary")
-    }
-}
-
-impl CurrentKernelStackScope {
-    pub fn enter(base: u64, top: u64) -> Option<Self> {
-        let previous = interrupts::without_interrupts(|| unsafe {
-            scheduler_mut().set_current_alternate_kernel_stack(base, top)
-        })?;
-        Some(Self { previous })
-    }
-}
-
-impl Drop for CurrentKernelStackScope {
-    fn drop(&mut self) {
-        interrupts::without_interrupts(|| unsafe {
-            scheduler_mut().restore_current_alternate_kernel_stack(self.previous);
-        });
     }
 }
 
@@ -409,30 +386,6 @@ impl Thread {
             slot: Cell::new(None),
         }
     }
-
-    pub fn start(&self) {
-        interrupts::without_interrupts(|| unsafe {
-            if self.slot.get().is_some() {
-                return;
-            }
-
-            let cs = CS::get_reg().0 as u64;
-            let ss = SS::get_reg().0 as u64;
-            let rflags = initial_task_rflags().bits();
-            let slot = scheduler_mut()
-                .allocate_kernel_slot(
-                    self.entry,
-                    self.id,
-                    self.pit_divisor,
-                    cs,
-                    ss,
-                    rflags,
-                    kernel_task_entry_trampoline_addr(),
-                )
-                .expect("No free task slot");
-            self.slot.set(Some(slot));
-        });
-    }
 }
 
 #[cfg(test)]
@@ -483,11 +436,11 @@ fn noop_task_entry(_id: u64) {
     }
 }
 
-// ASSEMBLY: Initial task stacks name this trampoline by address; there is no
-// ordinary Rust call edge for dead-code analysis to observe.
+// ASSEMBLY: Initial frames address this trampoline; no ordinary Rust call edge exists.
 #[allow(dead_code)]
 extern "C" fn task_entry_trampoline() -> ! {
-    let task = interrupts::without_interrupts(|| unsafe { scheduler_ref().current_task_start() });
+    let task =
+        interrupts::without_interrupts(scheduler::stack_resources::task_start::current_entry);
     let Some(task) = task else {
         current::exit_current_task();
     };

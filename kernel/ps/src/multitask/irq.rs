@@ -21,8 +21,9 @@ use kernel_hal::api::cpu;
 use x86_64::instructions::interrupts;
 
 use super::{
-    USER_RETURN_RESCHEDULE_ARMED, context::SavedContext, scheduler::Scheduler,
-    scheduler_initialized, scheduler_mut,
+    USER_RETURN_RESCHEDULE_ARMED, context::SavedContext,
+    cpu_local::irq_entry::DispatchEntry,
+    scheduler_initialized,
 };
 
 mod fast_ipc;
@@ -288,12 +289,12 @@ extern "C" fn timer_interrupt_dispatch(context_ptr: *mut SavedContext) -> *mut S
     // live. The eventual explicit scheduler handoff below the lock remains the
     // sole transition point.
     let current_rsp = context_ptr as usize;
-    // SAFETY: the interrupt stub supplied a complete CPU-local frame, IRQ
-    // exclusion prevents same-CPU nested scheduling, and the scheduler lock
-    // serializes all cross-CPU task-state mutation.
+    // SAFETY: the interrupt stub supplied a complete CPU-local frame. The
+    // original masked turn retains Current/Transition and physical banks;
+    // independent owner leaves serialize their bounded cross-CPU effects.
     let (next_rsp, user_dispatch, runtime_profile, reschedule_goal) = unsafe {
-        let mut scheduler = scheduler_mut();
-        if timer_interrupted_kernel_frame(context_ptr, &scheduler) {
+        let mut entry = DispatchEntry::enter();
+        if timer_interrupted_kernel_frame(context_ptr, &entry) {
             complete_clockevent(logical_index);
             return context_ptr;
         }
@@ -311,25 +312,14 @@ extern "C" fn timer_interrupt_dispatch(context_ptr: *mut SavedContext) -> *mut S
         // ORDERING: Release completes same-CPU request consumption before the
         // selected continuation is restored.
         user_return_reschedule_flag(logical_index).store(0, Ordering::Release);
-        scheduler.record_runtime_profile_entry(super::scheduler::SchedulerEntryCause::Timer);
-        scheduler.save_current_simd_state();
-        let dispatch = scheduler.on_timer_interrupt(current_rsp);
+        super::scheduler::runtime_profile::record_entry(super::scheduler::SchedulerEntryCause::Timer);
+        let runtime_profile = super::scheduler::runtime_profile::take_owned(entry.turn(), crate::arch::rtc::ticks());
+        let (dispatch, _) = entry.dispatch(current_rsp, false, None);
         if logical_index == 0 {
             crate::arch::pit::set_divisor(0, dispatch.tick_divisor);
         }
-        scheduler.prepare_dispatched_task_execution(dispatch);
-        scheduler.restore_current_simd_state();
-        // The BSP may stay in its kernel idle continuation while an AP owns
-        // all user work. The global scheduler owner already serializes and
-        // destructively gates the one-second snapshot, so any CPU that traps
-        // a user frame may claim the due profile without duplicate output.
-        let runtime_profile = scheduler.take_runtime_profile(crate::arch::rtc::ticks());
-        (
-            dispatch.next_rsp,
-            scheduler.current_task_is_user_task(),
-            runtime_profile,
-            reschedule_goal,
-        )
+        let user = entry.install(dispatch, false);
+        (dispatch.next_rsp, user, runtime_profile, reschedule_goal)
     };
 
     super::scheduler::publish_scheduler_runtime_profile(runtime_profile);
@@ -418,9 +408,10 @@ extern "C" fn rtc_interrupt_dispatch(context_ptr: *mut SavedContext) -> *mut Sav
     // Matches Linux's `tick_sched_timer` -> `update_process_times` -> wake
     // ordering, and the Fuchsia Zircon "wake then reschedule" pattern.
     let current_rsp = context_ptr as usize;
+    // One original turn survives probe, wake/profile, dispatch and return.
+    let mut entry = DispatchEntry::enter();
     let interrupted_kernel_frame = unsafe {
-        let scheduler = scheduler_mut();
-        timer_interrupted_kernel_frame(context_ptr, &scheduler)
+        timer_interrupted_kernel_frame(context_ptr, &entry)
     };
     if interrupted_kernel_frame {
         crate::arch::pic::send_eoi(crate::arch::pic::PIC_2_OFFSET);
@@ -434,19 +425,14 @@ extern "C" fn rtc_interrupt_dispatch(context_ptr: *mut SavedContext) -> *mut Sav
     );
     let reschedule_goal = super::reschedule_observation::claim_pending(logical_index)
         .expect("RTC request lost before same-CPU scheduling safe point");
-    let (next_rsp, user_dispatch, runtime_profile) = unsafe {
-        let mut scheduler = scheduler_mut();
-        scheduler.record_runtime_profile_entry(super::scheduler::SchedulerEntryCause::Rtc);
-        scheduler.save_current_simd_state();
-        let dispatch = scheduler.on_timer_interrupt(current_rsp);
-        scheduler.prepare_dispatched_task_execution(dispatch);
-        scheduler.restore_current_simd_state();
-        let runtime_profile = scheduler.take_runtime_profile(crate::arch::rtc::ticks());
-        (
-            dispatch.next_rsp,
-            scheduler.current_task_is_user_task(),
-            runtime_profile,
-        )
+    let (next_rsp, user_dispatch, runtime_profile) = {
+        super::scheduler::runtime_profile::record_entry(super::scheduler::SchedulerEntryCause::Rtc);
+        let runtime_profile = super::scheduler::runtime_profile::take_owned(entry.turn(), crate::arch::rtc::ticks());
+        let (dispatch, _) = entry.dispatch(current_rsp, false, None);
+        let user = entry.install(dispatch, false);
+        let result = (dispatch.next_rsp, user, runtime_profile);
+        drop(entry);
+        result
     };
 
     super::scheduler::publish_scheduler_runtime_profile(runtime_profile);
@@ -461,19 +447,14 @@ extern "C" fn rtc_interrupt_dispatch(context_ptr: *mut SavedContext) -> *mut Sav
     next_rsp as *mut SavedContext
 }
 
-fn timer_interrupted_kernel_frame(context_ptr: *const SavedContext, scheduler: &Scheduler) -> bool {
-    let context = unsafe { &*context_ptr };
-    if context.cs == crate::arch::gdt::user_code_selector().0 as u64 {
-        return false;
-    }
-    if scheduler.current_task_is_retired() || scheduler.current_task_is_blocked() {
-        return false;
-    }
-    if scheduler.current_task_is_user_task() {
-        set_local_deferred_reschedule();
-        return true;
-    }
-    false
+unsafe fn timer_interrupted_kernel_frame(context_ptr: *const SavedContext, entry: &DispatchEntry) -> bool {
+    // SAFETY: IRQ stub owns this complete frame and the original masked entry
+    // excludes local reentry. The borrowed Current bank, not this pointer, owns
+    // task backing; no raw owner crosses this scalar interrupt-frame read.
+    let cs = unsafe { (*context_ptr).cs };
+    if !entry.kernel_continuation(cs) { return false; }
+    set_local_deferred_reschedule();
+    true
 }
 
 pub fn reschedule_if_requested() {
@@ -691,27 +672,20 @@ extern "C" fn reschedule_ipi_interrupt_dispatch(
     );
 
     let current_rsp = context_ptr as usize;
-    // SAFETY: the IPI stub supplied a complete CPU-local frame, IRQ exclusion
-    // prevents same-CPU nested scheduling, and the global scheduler lock
-    // serializes cross-CPU task-state mutation.
+    // SAFETY: the IPI stub supplied a complete CPU-local frame. Original
+    // masked CPU custody excludes nesting; bounded independent owner leaves
+    // serialize cross-CPU publication without lending the directory guard.
     let (next_rsp, user_dispatch, runtime_profile) = unsafe {
-        let mut scheduler = scheduler_mut();
-        if timer_interrupted_kernel_frame(context_ptr, &scheduler) {
+        let mut entry = DispatchEntry::enter();
+        if timer_interrupted_kernel_frame(context_ptr, &entry) {
             crate::arch::msi::local_apic_eoi();
             return context_ptr;
         }
-        scheduler
-            .record_runtime_profile_entry(super::scheduler::SchedulerEntryCause::RescheduleIpi);
-        scheduler.save_current_simd_state();
-        let dispatch = scheduler.on_voluntary_yield(current_rsp);
-        scheduler.prepare_dispatched_task_execution(dispatch);
-        scheduler.restore_current_simd_state();
-        let runtime_profile = scheduler.take_runtime_profile(crate::arch::rtc::ticks());
-        (
-            dispatch.next_rsp,
-            scheduler.current_task_is_user_task(),
-            runtime_profile,
-        )
+        super::scheduler::runtime_profile::record_entry(super::scheduler::SchedulerEntryCause::RescheduleIpi);
+        let runtime_profile = super::scheduler::runtime_profile::take_owned(entry.turn(), crate::arch::rtc::ticks());
+        let (dispatch, _) = entry.dispatch(current_rsp, true, None);
+        let user = entry.install(dispatch, false);
+        (dispatch.next_rsp, user, runtime_profile)
     };
     super::scheduler::publish_scheduler_runtime_profile(runtime_profile);
     super::reschedule_observation::record_consumption(
@@ -761,8 +735,8 @@ extern "C" fn software_schedule_interrupt_dispatch(
         ));
     let logical_index = current_cpu_index();
     // The software interrupt is an explicit local scheduling request. Bind it
-    // to the current CPU lifecycle before entering the serialized scheduler
-    // transaction, then attest consumption after the selected frame is ready.
+    // to the current CPU lifecycle before opening its independent original turn,
+    // then attest consumption after the selected frame is ready.
     let _ = super::reschedule_observation::publish_request(
         logical_index,
         cpu_lifecycle_generation(logical_index),
@@ -770,10 +744,18 @@ extern "C" fn software_schedule_interrupt_dispatch(
     let reschedule_goal = super::reschedule_observation::claim_pending(logical_index)
         .expect("software scheduling request lost before dispatch");
     let current_rsp = context_ptr as usize;
-    let (next_rsp, user_dispatch, runtime_profile, fast_ipc_outcome) = unsafe {
-        let mut scheduler = scheduler_mut();
+    let (next_rsp, user_dispatch, runtime_profile, fast_ipc_outcome) = {
+        let mut entry = DispatchEntry::enter();
+        entry.save_simd();
+        super::scheduler::runtime_profile::record_entry(super::scheduler::SchedulerEntryCause::Software);
+        let runtime_profile = super::scheduler::runtime_profile::take_owned(entry.turn(), crate::arch::rtc::ticks());
         let fast_ipc_outcome = fast_ipc_call.map(|(endpoint, reply, receiver_task_id)| {
-            scheduler.commit_fast_ipc_call_handoff(endpoint, reply, receiver_task_id, true)
+            // Direct custody must be recorded in the sole FIFO before the
+            // independent dispatcher can consume it. The scalar peer ID is
+            // only a hint; it cannot replace the original record generation.
+            super::scheduler::ipc_publication::call(
+                entry.preemption(), endpoint, reply, receiver_task_id,
+            )
         });
         if fast_ipc_outcome.is_some_and(|outcome| {
             !matches!(
@@ -783,7 +765,7 @@ extern "C" fn software_schedule_interrupt_dispatch(
             )
         }) {
             let outcome = fast_ipc_outcome.unwrap();
-            drop(scheduler);
+            drop(entry);
             super::reschedule_observation::record_consumption(
                 logical_index,
                 reschedule_goal,
@@ -813,44 +795,26 @@ extern "C" fn software_schedule_interrupt_dispatch(
                 context_generation,
             )
             .expect("fast IPC reply trap carried an invalid scheduling-context identity");
-            let outcome = scheduler
-                .settle_and_complete_fast_ipc_reply_handoff(
+            let outcome = super::scheduler::ipc_publication::reply(
+                    entry.preemption(),
                     reply,
                     caller_task_id,
                     context_owner_task_id,
                     scheduling_context,
-                    true,
                 )
                 .expect("fast IPC reply trap carried stale scheduling-context custody");
             if outcome == super::scheduler::FastIpcReplyHandoffOutcome::Direct {
                 immediate_task_id = Some(caller_task_id);
-            } else if outcome == super::scheduler::FastIpcReplyHandoffOutcome::Rejected {
-                let _ = scheduler.complete_ipc_reply_wake_handoff(reply, caller_task_id);
             }
+            // Rejection has already consumed/refused its ORIGINAL typed loan;
+            // a generic fresh lookup must not clear a later wait incarnation.
         }
-        scheduler.record_runtime_profile_entry(super::scheduler::SchedulerEntryCause::Software);
-        scheduler.save_current_simd_state();
         // A committed same-CPU fastpath carries its exact peer directly
         // through this scheduler transaction. Generic and cross-CPU handoffs
         // retain the ordered FIFO path.
-        let (dispatch, exact_fast_dispatch) =
-            match scheduler.dispatch_committed_fast_ipc_handoff(current_rsp, immediate_task_id) {
-                Some(dispatch) => (dispatch, immediate_task_id.is_some()),
-                None => (scheduler.on_voluntary_yield(current_rsp), false),
-            };
-        if exact_fast_dispatch {
-            scheduler.prepare_fast_ipc_dispatched_task_execution(dispatch);
-        } else {
-            scheduler.prepare_dispatched_task_execution(dispatch);
-        }
-        scheduler.restore_current_simd_state();
-        let runtime_profile = scheduler.take_runtime_profile(crate::arch::rtc::ticks());
-        (
-            dispatch.next_rsp,
-            scheduler.current_task_is_user_task(),
-            runtime_profile,
-            fast_ipc_outcome,
-        )
+        let (dispatch, exact_fast_dispatch) = entry.dispatch(current_rsp, true, immediate_task_id);
+        let user = entry.install(dispatch, exact_fast_dispatch);
+        (dispatch.next_rsp, user, runtime_profile, fast_ipc_outcome)
     };
 
     if let Some(outcome) = fast_ipc_outcome {
@@ -896,21 +860,15 @@ extern "C" fn saved_user_context_dispatch(
     // SAFETY: syscall entry supplied the complete current-task user frame,
     // interrupts are disabled by the assembly transfer, and the scheduler
     // lock serializes every cross-CPU task-state and stack-owner transition.
-    let (next_rsp, user_dispatch, same_task, runtime_profile) = unsafe {
-        let mut scheduler = scheduler_mut();
-        scheduler.record_runtime_profile_entry(super::scheduler::SchedulerEntryCause::Software);
-        scheduler.save_current_simd_state();
-        let dispatch = scheduler.on_voluntary_yield(current_rsp);
+    let (next_rsp, user_dispatch, same_task, runtime_profile) = {
+        let mut entry = DispatchEntry::enter();
+        entry.save_simd();
+        super::scheduler::runtime_profile::record_entry(super::scheduler::SchedulerEntryCause::Software);
+        let runtime_profile = super::scheduler::runtime_profile::take_owned(entry.turn(), crate::arch::rtc::ticks());
+        let (dispatch, _) = entry.dispatch(current_rsp, true, None);
         let same_task = !dispatch.requires_architectural_restore();
-        scheduler.prepare_dispatched_task_execution(dispatch);
-        scheduler.restore_current_simd_state();
-        let runtime_profile = scheduler.take_runtime_profile(crate::arch::rtc::ticks());
-        (
-            dispatch.next_rsp,
-            scheduler.current_task_is_user_task(),
-            same_task,
-            runtime_profile,
-        )
+        let user = entry.install(dispatch, false);
+        (dispatch.next_rsp, user, same_task, runtime_profile)
     };
 
     super::scheduler::publish_scheduler_runtime_profile(runtime_profile);
@@ -1008,10 +966,9 @@ pub fn commit_block_current_task_and_yield() -> Option<bool> {
         preemption.top_class,
     );
     interrupts::without_interrupts(|| {
-        let committed =
-            current_wait_commit_or_fallback(super::scheduler::commit_current_wait(), || unsafe {
-                scheduler_mut().commit_block_current_task()
-            });
+        // SAFETY: original masked CPU scope contains the backing loan; it is
+        // dropped before entering the scheduling trap below.
+        let committed = unsafe { super::scheduler::commit_current_wait() };
         if committed == Some(true) {
             crate::lowlevel::interrupts::trigger_software_schedule();
         }
@@ -1048,10 +1005,9 @@ pub fn commit_block_current_task_with_fast_reply_and_yield(
         preemption.top_class,
     );
     interrupts::without_interrupts(|| {
-        let committed =
-            current_wait_commit_or_fallback(super::scheduler::commit_current_wait(), || unsafe {
-                scheduler_mut().commit_block_current_task()
-            });
+        // SAFETY: original masked CPU scope contains the backing loan; it is
+        // dropped before entering the exact reply scheduling trap below.
+        let committed = unsafe { super::scheduler::commit_current_wait() };
         if committed == Some(true) {
             let identity = custody.identity();
             crate::lowlevel::interrupts::trigger_fast_ipc_reply_schedule(
@@ -1066,78 +1022,52 @@ pub fn commit_block_current_task_with_fast_reply_and_yield(
     })
 }
 
-/// Fuses an exact pager wait commit, fault-slot publication, and schedule trap.
-///
-/// Unlike a generic task wait, exception ingress may not acquire the scheduler
-/// catalog as a fallback. A cancellation that removes the slot between the
-/// owner-word commit and slot publication is repaired by restoring this CPU's
-/// exact pager wait before the trap, so no stale token can strand the task.
+/// Fuse exact Current pager commit, fixed fault publication and worker handoff.
+/// Original masked Current loan survives the worker's LAST effect, but MUST
+/// drop before the trap can reschedule. Resume borrows the then-actual Current
+/// MM/stack custody, not a saved-frame or a newly manufactured execution claim.
 pub fn commit_pager_fault_block_and_yield(token: u64) -> Option<bool> {
-    if token == 0 {
-        return Some(false);
-    }
-    let preemption = nucleus_core::util::lockdep::preemption_snapshot();
-    assert!(
-        preemption.depth == 0,
-        "pager fault blocked while raw spin lock held cpu={} apic={:#x} depth={} held_depth={} pending_depth={} class={:?}",
-        preemption.logical_cpu,
-        preemption.apic_id,
-        preemption.depth,
-        preemption.held_depth,
-        preemption.pending_depth,
-        preemption.top_class,
-    );
+    if token == 0 { return Some(false); }
+    let raw = nucleus_core::util::lockdep::preemption_snapshot();
+    assert_eq!(raw.depth, 0, "pager fault blocked during raw lock acquisition or ownership");
     interrupts::without_interrupts(|| {
-        let committed = super::scheduler::commit_current_wait();
-        if committed != Some(true) {
-            return committed;
-        }
-
+        let mut scope = nucleus_core::util::lockdep::DispatchPreemption::enter();
+        scope.mask_irqs();
+        // SAFETY: this ORIGINAL mask and actual physical Current bank enclose
+        // commit, rollback and all worker effects; neither survives the trap.
+        let wait = unsafe { super::scheduler::CurrentWait::capture() }?;
+        if !wait.commit() { return Some(false); }
         let published = super::pager_fault::mark_pager_fault_blocked(token).is_ok();
-        if !published && super::scheduler::wake_current_pager_fault_wait(token) != Some(true) {
+        if !published && !wait.restore_pager(token) {
             panic!("pager fault block rollback lost exact current wait token={token:#x}");
         }
-
         if published
-            && let Some(pager_task_id) = super::pager_fault::take_pager_fault_waiter_for(token)
+            && let Some(worker_id) = super::pager_fault::take_pager_fault_waiter_for(token)
         {
-            // SAFETY: interrupts are masked, this exception still owns the
-            // committed faulting slot, and the waiter came from the fixed
-            // atomic rendezvous table. The scheduler path therefore touches
-            // neither generic endpoint state nor a process catalog fallback.
-            let _ = unsafe { scheduler_mut().handoff_pager_fault_to_waiter(token, pager_task_id) };
+            let _ = super::scheduler::pager_handoff::handoff(&scope, &wait, token, worker_id);
         }
-
-        // The owner word committed non-runnable above. Even when cancellation
-        // restored run intent, the trap must publish a fresh continuation
-        // before Rust can safely return to the interrupted user frame.
+        drop(wait);
+        drop(scope);
+        // Outer original exception IRQ mask survives; no physical loan or raw
+        // leaf crosses the blocking trap. Publish a fresh continuation even
+        // when fault-slot cancellation restored the exact wait intent.
         crate::lowlevel::interrupts::trigger_software_schedule();
 
-        // A blocked exception continuation can resume through a direct wake
-        // handoff whose scheduler token classifies the final turn as
-        // same-task. Housekeeping may have installed a kernel-task GS pair in
-        // between, so refresh the exact ordinary user-dispatch architecture
-        // contract before this exception frame returns to ring3. This is the
-        // same CR3/TSS/syscall-stack/FS/GS preparation used for every real
-        // user dispatch, not a pager-specific GS write.
-        //
-        // SAFETY: this runs on the exception path that owns the current task
-        // and is about to return to ring3, so the scheduler's current-slot
-        // custody is exactly this task and no other CPU may publish over the
-        // architecture state being refreshed.
-        unsafe {
-            scheduler_mut().refresh_current_user_return_architecture();
-        }
+        // Earlier dispatch/RSP already installed this actual Current. Borrow
+        // its ORIGINAL allocation/context MM through CR3/TSS/FS/GS effects;
+        // same-task dispatch may have left the kernel GS pair in place.
+        let mut resumed = nucleus_core::util::lockdep::DispatchPreemption::enter();
+        resumed.mask_irqs();
+        // SAFETY: resumed owns the actual same-CPU Current through last effect.
+        let current = unsafe { super::scheduler::CurrentWait::capture() }
+            .expect("pager continuation lost actual Current custody");
+        super::scheduler::return_architecture::CurrentArchitecture::capture(&resumed, &current)
+            .expect("pager continuation lost original user MM/stack custody")
+            .install();
+        drop(current);
+        drop(resumed);
         Some(published)
     })
-}
-
-#[inline]
-fn current_wait_commit_or_fallback(
-    fast: Option<bool>,
-    fallback: impl FnOnce() -> Option<bool>,
-) -> Option<bool> {
-    fast.map(Some).unwrap_or_else(fallback)
 }
 
 /// Linearizes the Phase-5 same-CPU call transfer with the schedule trap.
@@ -1185,31 +1115,10 @@ mod tests {
     use core::sync::atomic::{AtomicU64, Ordering};
 
     use super::{
-        RescheduleIpiGate, consume_syscall_tail_reschedule, current_wait_commit_or_fallback,
+        RescheduleIpiGate, consume_syscall_tail_reschedule,
         periodic_idle_continuation_is_local, periodic_user_continuation_is_local,
         remote_notification_required, reschedule_ipi_gate,
     };
-
-    #[test]
-    fn current_wait_commit_uses_catalog_only_when_owner_publication_cannot_answer() {
-        let mut fallbacks = 0;
-        assert_eq!(
-            current_wait_commit_or_fallback(Some(true), || {
-                fallbacks += 1;
-                Some(false)
-            }),
-            Some(true)
-        );
-        assert_eq!(fallbacks, 0, "ordinary commit reopened the catalog");
-        assert_eq!(
-            current_wait_commit_or_fallback(None, || {
-                fallbacks += 1;
-                Some(false)
-            }),
-            Some(false)
-        );
-        assert_eq!(fallbacks, 1, "unpublished owner lost its safe fallback");
-    }
 
     #[test]
     fn periodic_tick_stays_local_only_without_any_dispatch_authority() {

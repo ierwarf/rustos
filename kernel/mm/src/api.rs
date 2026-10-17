@@ -36,7 +36,10 @@ pub mod heap {
 }
 
 pub mod address_space {
-    pub use crate::memory::address_space::ValidatedUserWrite;
+    pub use crate::memory::address_space::{
+        ActivationPin, ExecutionPin, RetirementOwner, ValidatedUserWrite,
+        drain_retired_address_spaces,
+    };
     pub use crate::memory::paging::ProcessAddressSpace;
     pub use x86_64::structures::paging::PageTableFlags;
 

@@ -1,7 +1,8 @@
 //! Bounded reply-edge custody outside the scheduler task catalog.
 //!
 //! - **Owner:** this ledger owns one pending or live IPC donation edge per
-//!   donor task; the scheduler owns only task identity resolution.
+//!   donor task; original participant loans independently qualify new Current entries.
+//!   Remaining legacy worker/handoff adapters still resolve through Scheduler.
 //! - **Lifecycle:** reserve -> attach/bind -> release. A bound edge increments
 //!   exactly one receiver-slot inheritance count and terminal release removes
 //!   it before forgetting the reply identity.
@@ -9,11 +10,15 @@
 //!   reads only an Acquire receiver-slot counter and never scans this ledger.
 //! - **Failure:** duplicate reservation, stale reply, capacity exhaustion, and
 //!   unmatched terminal release fail closed without changing a receiver class.
+//!   Owned publication revalidates original source custody under this same leaf;
+//!   candidate snapshots are never execution/interval grants. Legacy adapters
+//!   remain distinct and are not covered by that owned admission claim.
 //! - **Evidence:** `ipc-priority-inheritance` and the focused ledger tests.
 
 use core::sync::atomic::{AtomicU8, AtomicU16, AtomicU64, Ordering};
 
-use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
+use nucleus_core::util::lockdep::LockClass;
+use crate::multitask::irq_leaf::IrqLeaf;
 
 use super::{
     MAX_TASK,
@@ -24,6 +29,31 @@ use super::{
 struct LedgerEntry {
     donation: IpcPriorityDonation,
     receiver_slot: Option<usize>,
+    funding: Option<FundingBasis>,
+}
+
+/// A candidate for original participant capture, never an execution grant.
+/// Commit revalidates the exact originating reply edge under the ledger leaf.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(super) struct FundingBasis {
+    donor_slot: usize,
+    donor_id: u64,
+    root_slot: usize,
+    root_id: u64,
+    source: Option<FundingSource>,
+}
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct FundingSource {
+    reply: u64,
+    namespace: DonationNamespace,
+    donor_id: u64,
+    receiver_id: u64,
+    receiver_slot: usize,
+    root_id: u64,
+    root_slot: usize,
+}
+impl FundingBasis {
+    pub(super) fn root(&self) -> (usize, u64) { (self.root_slot, self.root_id) }
 }
 
 struct DonationLedger {
@@ -77,8 +107,8 @@ impl DonationLedger {
     }
 }
 
-static DONATION_LEDGER: TrackedSpinLock<DonationLedger, { LockClass::SchedulerDonation as u8 }> =
-    TrackedSpinLock::new(DonationLedger::new());
+static DONATION_LEDGER: IrqLeaf<DonationLedger, { LockClass::SchedulerDonation as u8 }> =
+    IrqLeaf::new(DonationLedger::new());
 static INHERITED_SYSTEM: [AtomicU8; MAX_TASK] = [const { AtomicU8::new(0) }; MAX_TASK];
 static CLASS_PUBLICATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const NO_BORROWED_CONTEXT: u16 = u16::MAX;
@@ -128,16 +158,66 @@ pub(super) fn reset() {
     CLASS_PUBLICATION_SEQUENCE.fetch_add(1, Ordering::AcqRel);
 }
 
-pub(super) fn reserve(
+fn source_live(ledger: &DonationLedger, source: FundingSource) -> bool {
+    ledger.find_reply(source.reply, source.namespace).is_some_and(|index| {
+        let entry = ledger.entries[index].expect("original funding source vanished");
+        entry.donation.custody_active
+            && entry.donation.donor_task_id == source.donor_id
+            && entry.donation.context_owner_task_id == source.root_id
+            && entry.donation.context_owner_slot == source.root_slot
+            && entry.receiver_slot == Some(source.receiver_slot)
+            && entry.donation.target == IpcDonationTarget::BoundWorker(source.receiver_id)
+    })
+}
+fn basis_locked(ledger: &DonationLedger, slot: usize, id: u64) -> Option<FundingBasis> {
+    let Some((root_slot, reply)) = borrowed_context_charge_token(slot) else {
+        return Some(FundingBasis { donor_slot: slot, donor_id: id,
+            root_slot: slot, root_id: id, source: None });
+    };
+    let tag = BORROWED_CONTEXT_NAMESPACE.get(slot)?.load(Ordering::Acquire);
+    let namespace = match tag { 1 => DonationNamespace::IpcReply,
+        2 => DonationNamespace::PagerFault, _ => return None };
+    let entry = ledger.entries[ledger.find_reply(reply, namespace)?]?;
+    let source = FundingSource { reply, namespace,
+        donor_id: entry.donation.donor_task_id, receiver_id: id, receiver_slot: slot,
+        root_slot, root_id: entry.donation.context_owner_task_id };
+    source_live(ledger, source).then_some(FundingBasis { donor_slot: slot,
+        donor_id: id, root_slot, root_id: source.root_id, source: Some(source) })
+}
+pub(super) fn funding_basis(slot: usize, id: u64) -> Option<FundingBasis> {
+    basis_locked(&DONATION_LEDGER.lock(), slot, id)
+}
+fn basis_live(ledger: &DonationLedger, basis: &FundingBasis) -> bool {
+    match basis.source {
+        Some(source) => source_live(ledger, source),
+        None => basis.root_slot == basis.donor_slot && basis.root_id == basis.donor_id,
+    }
+}
+fn current_basis_live(ledger: &DonationLedger, basis: &FundingBasis) -> bool {
+    basis_live(ledger, basis)
+        && basis_locked(ledger, basis.donor_slot, basis.donor_id).as_ref() == Some(basis)
+}
+pub(super) fn reserve_owned(loans: &super::donation_publication::Loans,
+    priority: bool) -> bool {
+    let basis = loans.basis();
+    let mut ledger = DONATION_LEDGER.lock();
+    if !current_basis_live(&ledger, basis) { return false; }
+    reserve_locked(&mut ledger, basis.donor_id, basis.root_id, basis.root_slot,
+        priority, Some(*basis))
+}
+
+
+fn reserve_locked(
+    ledger: &mut DonationLedger,
     donor_task_id: u64,
     context_owner_task_id: u64,
     context_owner_slot: usize,
     priority_donated: bool,
+    funding: Option<FundingBasis>,
 ) -> bool {
     if context_owner_slot >= MAX_TASK {
         return false;
     }
-    let mut ledger = DONATION_LEDGER.lock();
     if ledger.find_reservation(donor_task_id).is_some() {
         return false;
     }
@@ -153,6 +233,7 @@ pub(super) fn reserve(
             target: IpcDonationTarget::AwaitingReceiver,
         },
         receiver_slot: None,
+        funding,
     })
 }
 
@@ -194,7 +275,60 @@ pub(super) fn attach(reply: u64, namespace: DonationNamespace, donor_task_id: u6
     true
 }
 
-pub(super) fn bind_reserved(
+fn bind_basis_locked(ledger: &DonationLedger, reply: u64, namespace: DonationNamespace,
+    slot: usize, id: u64) -> Result<Option<FundingBasis>, ()> {
+    let Some(index) = ledger.find_reply(reply, namespace).or_else(|| ledger.find_reservation(id))
+    else { return Ok(None); };
+    let entry = ledger.entries[index].ok_or(())?;
+    if entry.donation.donor_task_id != id { return Err(()); }
+    let basis = match entry.funding {
+        Some(basis) => basis,
+        None if entry.donation.context_owner_task_id == id
+            && entry.donation.context_owner_slot == slot => FundingBasis {
+                donor_slot: slot, donor_id: id, root_slot: slot, root_id: id, source: None },
+        None => return Err(()),
+    };
+    if basis.donor_slot != slot || basis.donor_id != id { return Err(()); }
+    Ok(Some(basis))
+}
+pub(super) fn bind_basis(reply: u64, namespace: DonationNamespace,
+    slot: usize, id: u64) -> Result<Option<FundingBasis>, ()> {
+    bind_basis_locked(&DONATION_LEDGER.lock(), reply, namespace, slot, id)
+}
+pub(super) fn bind_owned(loans: &super::donation_publication::ReceiveLoans,
+    reply: u64, namespace: DonationNamespace) -> bool {
+    let basis = loans.donor.basis();
+    let mut ledger = DONATION_LEDGER.lock();
+    if !basis_live(&ledger, basis)
+        || bind_basis_locked(&ledger, reply, namespace, basis.donor_slot, basis.donor_id)
+            != Ok(Some(*basis))
+    { return false; }
+    bind_reserved_locked(&mut ledger, reply, namespace, basis.donor_id,
+        loans.receiver.id(), loans.receiver.slot())
+}
+pub(super) fn upsert_owned(loans: &super::donation_publication::ReceiveLoans,
+    reply: u64, namespace: DonationNamespace) -> bool {
+    let basis = loans.donor.basis();
+    let mut ledger = DONATION_LEDGER.lock();
+    if !current_basis_live(&ledger, basis) { return false; }
+    // A racing receive/attach owns the original reservation; a fresh upsert
+    // must never overwrite that admitted worker or revive cancelled source custody.
+    if namespace == DonationNamespace::IpcReply
+        && (ledger.find_reply(reply, namespace).is_some()
+            || ledger.find_reservation(basis.donor_id).is_some())
+    { return false; }
+    if let Some(index) = ledger.find_reply(reply, namespace) {
+        if ledger.entries[index].is_none_or(|entry| entry.donation.donor_task_id != basis.donor_id)
+        { return false; }
+    }
+    upsert_locked(&mut ledger, reply, namespace, basis.donor_id,
+        loans.receiver.id(), loans.receiver.slot(), basis.root_id, basis.root_slot,
+        loans.donor.system_class(), Some(*basis))
+}
+
+
+fn bind_reserved_locked(
+    ledger: &mut DonationLedger,
     reply: u64,
     namespace: DonationNamespace,
     donor_task_id: u64,
@@ -204,7 +338,6 @@ pub(super) fn bind_reserved(
     if reply == 0 || donor_task_id == receiver_task_id || receiver_slot >= MAX_TASK {
         return false;
     }
-    let mut ledger = DONATION_LEDGER.lock();
     if let Some(index) = ledger.find_reply(reply, namespace) {
         // The receiver can consume a just-published request on another CPU
         // before the sender commits its wake/handoff. That receive path binds
@@ -236,7 +369,9 @@ pub(super) fn bind_reserved(
     true
 }
 
-pub(super) fn upsert(
+
+fn upsert_locked(
+    ledger: &mut DonationLedger,
     reply: u64,
     namespace: DonationNamespace,
     donor_task_id: u64,
@@ -245,6 +380,7 @@ pub(super) fn upsert(
     context_owner_task_id: u64,
     context_owner_slot: usize,
     priority_donated: bool,
+    funding: Option<FundingBasis>,
 ) -> bool {
     if reply == 0
         || donor_task_id == receiver_task_id
@@ -253,13 +389,13 @@ pub(super) fn upsert(
     {
         return false;
     }
-    let mut ledger = DONATION_LEDGER.lock();
     if let Some(index) = ledger.find_reply(reply, namespace) {
         let previous = ledger.entries[index].expect("scheduler donation reply disappeared");
         let entry = ledger.entries[index]
             .as_mut()
             .expect("scheduler donation reply disappeared");
         entry.receiver_slot = Some(receiver_slot);
+        entry.funding = funding;
         entry.donation.donor_task_id = donor_task_id;
         entry.donation.context_owner_task_id = context_owner_task_id;
         entry.donation.context_owner_slot = context_owner_slot;
@@ -296,6 +432,7 @@ pub(super) fn upsert(
             target: IpcDonationTarget::BoundWorker(receiver_task_id),
         },
         receiver_slot: Some(receiver_slot),
+        funding,
     }) {
         return false;
     }
@@ -382,6 +519,34 @@ pub(super) fn inherited_system(slot: usize) -> bool {
 
 pub(super) fn class_publication_sequence() -> u64 {
     CLASS_PUBLICATION_SEQUENCE.load(Ordering::Acquire)
+}
+
+/// Observation is NOT lifetime custody. The caller must retain its original
+/// turn/frame/funder and borrow this leaf only for the bounded final claim.
+/// All live base-class and inherited-class producers serialize here.
+pub(super) fn with_class_claim<T>(
+    expected: u64, claim: impl FnOnce() -> Option<T>,
+) -> Option<T> {
+    let _ledger = DONATION_LEDGER.lock();
+    if expected & 1 != 0 || class_publication_sequence() != expected {
+        return None;
+    }
+    claim()
+}
+
+#[cfg(test)]
+pub(super) fn test_class_excluded() -> bool {
+    DONATION_LEDGER.try_lock().is_none()
+}
+
+/// Self-demotion participates in the SAME class exclusion as ledger edges.
+/// Unpublished initialization and drained terminal clearing are not live
+/// class replacements; their existing physical publication seals remain owners.
+pub(super) fn publish_base_class(effect: impl FnOnce()) {
+    let _ledger = DONATION_LEDGER.lock();
+    CLASS_PUBLICATION_SEQUENCE.fetch_add(1, Ordering::AcqRel);
+    effect();
+    CLASS_PUBLICATION_SEQUENCE.fetch_add(1, Ordering::AcqRel);
 }
 
 #[inline]
@@ -490,248 +655,45 @@ fn restore_context_owner_after_release(
     }
 }
 
+/// Negative native teardown observation: all actual publication words must be
+/// empty, not merely masked by an empty owner. Confers no funding authority.
+#[cfg(test)]
+pub(super) fn test_charge_publication_is_empty(slot: usize) -> bool {
+    let _ledger = DONATION_LEDGER.lock();
+    BORROWED_CONTEXT_OWNER[slot].load(Ordering::Acquire) == NO_BORROWED_CONTEXT
+        && BORROWED_CONTEXT_NAMESPACE[slot].load(Ordering::Acquire) == 0
+        && BORROWED_CONTEXT_REPLY[slot].load(Ordering::Acquire) == 0
+}
+
 #[cfg(test)]
 mod tests {
-    use super::DonationNamespace;
-
-    static TEST_GUARD: Mutex<()> = Mutex::new(());
-
-    /// A pager fault token and an IPC reply handle can be the same number.
-    ///
-    /// Reply handles are `(generation << 16) | (index + 1)` and fault tokens
-    /// are `(generation << 8) | slot`, so the smallest reply handle `0x1_0001`
-    /// is also the fault token for slot 1 at generation 256 - and slot 1 is
-    /// reused on almost every fault. When the ledger was keyed by the number
-    /// alone, the second binding found the first entry and the reply's
-    /// scheduling-context settlement panicked with "cancelled reply returned
-    /// stale scheduling-context custody". The key is the pair.
+    use super::super::donation_publication::tests::{ledger_witnesses as owned, legacy_witnesses};
     #[test]
     fn a_fault_token_never_aliases_an_equal_reply_handle() {
-        let _guard = TEST_GUARD
-            .lock()
-            .expect("donation ledger test lock poisoned");
-        reset();
-        const COLLIDING_KEY: u64 = (1 << 16) | 1;
-
-        assert!(reserve(41, 41, 4, true));
-        assert!(bind_reserved(
-            COLLIDING_KEY,
-            DonationNamespace::IpcReply,
-            41,
-            52,
-            5
-        ));
-        assert!(reserve(42, 42, 6, true));
-        assert!(bind_reserved(
-            COLLIDING_KEY,
-            DonationNamespace::PagerFault,
-            42,
-            53,
-            7
-        ));
-
-        // Each namespace releases exactly its own edge, and neither can settle
-        // or consume the other's.
-        assert!(release_reply(COLLIDING_KEY, DonationNamespace::PagerFault));
-        assert!(!release_reply(COLLIDING_KEY, DonationNamespace::PagerFault));
-        assert!(release_reply(COLLIDING_KEY, DonationNamespace::IpcReply));
-        assert!(!release_reply(COLLIDING_KEY, DonationNamespace::IpcReply));
+        owned::namespaces(true);
     }
-
-    /// The lock-free per-worker charge publication is part of the same key.
-    /// Releasing an equal numeric key in another namespace must not clear the
-    /// worker's newer custody stamp.
     #[test]
     fn colliding_namespace_cannot_clear_worker_charge_publication() {
-        let _guard = TEST_GUARD
-            .lock()
-            .expect("donation ledger test lock poisoned");
-        reset();
-        const COLLIDING_KEY: u64 = (1 << 16) | 1;
-        const WORKER_SLOT: usize = 9;
-
-        assert!(reserve(61, 61, 6, true));
-        assert!(bind_reserved(
-            COLLIDING_KEY,
-            DonationNamespace::IpcReply,
-            61,
-            70,
-            WORKER_SLOT,
-        ));
-        assert!(reserve(62, 62, 7, true));
-        assert!(bind_reserved(
-            COLLIDING_KEY,
-            DonationNamespace::PagerFault,
-            62,
-            70,
-            WORKER_SLOT,
-        ));
-        assert_eq!(
-            borrowed_context_charge_token(WORKER_SLOT),
-            Some((7, COLLIDING_KEY))
-        );
-
-        assert!(release_reply(COLLIDING_KEY, DonationNamespace::IpcReply));
-        assert_eq!(
-            borrowed_context_charge_token(WORKER_SLOT),
-            Some((7, COLLIDING_KEY))
-        );
-        assert!(release_reply(COLLIDING_KEY, DonationNamespace::PagerFault));
-        assert_eq!(borrowed_context_charge_token(WORKER_SLOT), None);
+        owned::namespaces(false);
     }
-    use core::sync::atomic::Ordering;
-    use std::sync::Mutex;
-
-    use super::{
-        attach, bind_reserved, borrowed_context_charge_token, borrowed_context_owner_slot,
-        inherited_system, release_reply, release_task, reserve, reset, upsert,
-    };
-
     #[test]
     fn bound_reply_inheritance_is_exactly_once_and_rebinds_without_leak() {
-        let _guard = TEST_GUARD
-            .lock()
-            .expect("donation ledger test lock poisoned");
-        reset();
-
-        assert!(reserve(41, 41, 4, true));
-        assert!(
-            !reserve(41, 41, 4, true),
-            "a donor may reserve only one live reply edge"
-        );
-        assert!(bind_reserved(700, DonationNamespace::IpcReply, 41, 52, 5));
-        assert!(!bind_reserved(700, DonationNamespace::IpcReply, 42, 53, 6));
-        assert!(inherited_system(5));
-        assert!(!inherited_system(6));
-
-        assert!(
-            bind_reserved(700, DonationNamespace::IpcReply, 41, 53, 6),
-            "the sender must accept a reply the receiver already bound"
-        );
-        assert!(
-            inherited_system(5),
-            "a stale sender waiter replaced the actual receiver"
-        );
-        assert!(!inherited_system(6));
-
-        assert!(upsert(
-            700,
-            DonationNamespace::IpcReply,
-            41,
-            53,
-            6,
-            41,
-            4,
-            true
-        ));
-        assert!(
-            !inherited_system(5),
-            "rebind retained the old receiver boost"
-        );
-        assert!(inherited_system(6));
-        assert!(release_reply(700, DonationNamespace::IpcReply));
-        assert!(!inherited_system(6));
-        assert!(
-            !release_reply(700, DonationNamespace::IpcReply),
-            "terminal reply release must be idempotent"
-        );
+        owned::exact_bind();
     }
-
     #[test]
     fn attached_reply_releases_when_either_endpoint_task_retires() {
-        let _guard = TEST_GUARD
-            .lock()
-            .expect("donation ledger test lock poisoned");
-        reset();
-
-        assert!(reserve(61, 61, 6, true));
-        assert!(attach(701, DonationNamespace::IpcReply, 61));
-        assert!(
-            !attach(701, DonationNamespace::IpcReply, 62),
-            "another donor claimed the reply edge"
-        );
-        assert!(
-            attach(701, DonationNamespace::IpcReply, 61),
-            "exact attach must be idempotent"
-        );
-        assert!(bind_reserved(701, DonationNamespace::IpcReply, 61, 62, 7));
-        assert!(inherited_system(7));
-        release_task(62);
-        assert!(!inherited_system(7));
-        assert!(!release_reply(701, DonationNamespace::IpcReply));
+        owned::endpoint_retire();
     }
-
     #[test]
     fn ordinary_nested_calls_borrow_one_root_context_without_system_promotion() {
-        let _guard = TEST_GUARD
-            .lock()
-            .expect("donation ledger test lock poisoned");
-        reset();
-
-        assert!(reserve(71, 71, 4, false));
-        assert!(bind_reserved(710, DonationNamespace::IpcReply, 71, 72, 5));
-        assert_eq!(borrowed_context_owner_slot(5), Some(4));
-        assert!(!inherited_system(5));
-
-        assert!(reserve(72, 71, 4, false));
-        assert!(bind_reserved(711, DonationNamespace::IpcReply, 72, 73, 6));
-        assert_eq!(borrowed_context_owner_slot(6), Some(4));
-        assert!(!inherited_system(6));
-
-        assert!(release_reply(710, DonationNamespace::IpcReply));
-        assert_eq!(borrowed_context_owner_slot(5), None);
-        assert_eq!(borrowed_context_owner_slot(6), None);
-        assert!(
-            release_reply(711, DonationNamespace::IpcReply),
-            "revoked descendant reply must retain one terminal identity"
-        );
-        assert!(!release_reply(711, DonationNamespace::IpcReply));
+        owned::ordinary();
     }
-
     #[test]
     fn root_reply_revokes_every_nested_priority_boost_exactly_once() {
-        let _guard = TEST_GUARD
-            .lock()
-            .expect("donation ledger test lock poisoned");
-        reset();
-
-        assert!(reserve(91, 91, 4, true));
-        assert!(bind_reserved(910, DonationNamespace::IpcReply, 91, 92, 5));
-        assert!(reserve(92, 91, 4, true));
-        assert!(bind_reserved(911, DonationNamespace::IpcReply, 92, 93, 6));
-        assert!(inherited_system(5));
-        assert!(inherited_system(6));
-
-        assert!(release_reply(910, DonationNamespace::IpcReply));
-        assert!(!inherited_system(5));
-        assert!(!inherited_system(6));
-        assert!(release_reply(911, DonationNamespace::IpcReply));
-        assert!(!release_reply(911, DonationNamespace::IpcReply));
+        legacy_witnesses::transitive();
     }
-
     #[test]
     fn multithreaded_server_charge_tokens_restore_the_previous_live_reply() {
-        let _guard = TEST_GUARD
-            .lock()
-            .expect("donation ledger test lock poisoned");
-        reset();
-
-        assert!(reserve(81, 81, 4, false));
-        assert!(bind_reserved(810, DonationNamespace::IpcReply, 81, 90, 9));
-        assert_eq!(borrowed_context_owner_slot(9), Some(4));
-        assert_eq!(borrowed_context_charge_token(9), Some((4, 810)));
-
-        assert!(reserve(82, 82, 6, false));
-        assert!(bind_reserved(811, DonationNamespace::IpcReply, 82, 90, 9));
-        assert_eq!(borrowed_context_owner_slot(9), Some(6));
-        assert_eq!(borrowed_context_charge_token(9), Some((6, 811)));
-
-        assert!(release_reply(810, DonationNamespace::IpcReply));
-        assert_eq!(borrowed_context_owner_slot(9), Some(6));
-        assert_eq!(borrowed_context_charge_token(9), Some((6, 811)));
-        assert!(release_reply(811, DonationNamespace::IpcReply));
-        assert_eq!(borrowed_context_owner_slot(9), None);
-        assert_eq!(borrowed_context_charge_token(9), None);
-        assert_eq!(super::BORROWED_CONTEXT_REPLY[9].load(Ordering::Acquire), 0);
+        owned::restore_previous();
     }
 }

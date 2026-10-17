@@ -87,7 +87,7 @@ pub(super) fn wait_for_reply_with_deadline(
             }
         }
         cycle_mark = phase_mark();
-        if !multitask::arm_block_current_task() {
+        if !multitask::arm_block_current_task_on_reply(reply.raw()) {
             cancel_reply_wait(reply, caller_task_id, ReplyCancelReason::InvalidArm);
             return Err(LINUX_EINVAL);
         }
@@ -98,7 +98,7 @@ pub(super) fn wait_for_reply_with_deadline(
         }
         cycle_mark = charge_phase(IpcCallPhase::WaitArm, cycle_mark);
         // Re-poll after arming. If the replier completed the response between our
-        // first take and arming, the wake_task call landed before arm_block, so
+        // first take and arming, the exact reply wake landed before arm_block, so
         // wake_armed would be set but no further wake arrives; re-checking the
         // queue here picks up that response without sleeping.
         let expired_before_take = reply_deadline_expired(deadline_tick);
@@ -237,8 +237,10 @@ mod tests {
 
         let first_poll = body.find("polls += 1;").expect("pre-arm poll");
         let arm = body
-            .find("multitask::arm_block_current_task()")
-            .expect("block arm");
+            .find("multitask::arm_block_current_task_on_reply(reply.raw())")
+            .expect("exact reply arm, shared by ordinary byte and handle RPC waits");
+        assert!(!body.contains("multitask::arm_block_current_task()"),
+            "a Generic wait cannot be completed by the exact typed reply producer");
         assert!(
             first_poll < arm,
             "the turn polls before it arms: an already completed reply must not \

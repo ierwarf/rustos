@@ -234,17 +234,21 @@ if rg -Fq 'USER_READY_LATENCY_BOUND_MS' kernel/ps/src/multitask/scheduler.rs; th
     echo "unadmitted User wall-clock deadline bypasses fair-share accounting" >&2
     exit 1
 fi
-reserved_user_signature=$(sed -n \
-    '/fn reserved_user_pick(/,/-> Option<usize>/p' \
-    kernel/ps/src/multitask/scheduler.rs)
-grep -Fq 'current: usize' <<<"$reserved_user_signature" || {
-    echo "User reservation lost its current-slot argument" >&2
+reserved_user_gate=$(sed -n \
+    '/pub(super) fn user_reservation_due(cpu: usize) -> bool {/,/^}/p' \
+    kernel/ps/src/multitask/scheduler/local_dispatch.rs)
+grep -Fq 'dispatch_policy::system_dispatch_streak(cpu) >= MAX_CONSECUTIVE_SYSTEM_DISPATCHES' <<<"$reserved_user_gate" || {
+    echo "independent User reservation lost its exact CPU burst gate" >&2
     exit 1
 }
-if grep -Eq 'ticks|now|deadline|latency' <<<"$reserved_user_signature"; then
+if grep -Eq 'ticks|now|deadline|latency|ready_since' <<<"$reserved_user_gate"; then
     echo "User reservation is no longer isolated from wall-clock ready age" >&2
     exit 1
 fi
+rg -Fq 'current_slot: usize,' kernel/ps/src/multitask/scheduler/local_dispatch.rs || {
+    echo "independent fair decision lost its current-slot input" >&2
+    exit 1
+}
 rg -Fq 'background_probe_rank' services/runtimed/src/catalog.rs || {
     echo "background network probe can block the interactive launch path" >&2
     exit 1
@@ -346,8 +350,8 @@ rg -Fq 'const GPU_INITIALIZATION_RETAINS_BOOT_CLASS: bool = true;' \
     echo "mandatory GPU initialization can be demoted before its boot result" >&2
     exit 1
 }
-rg -Fq 'self.set_slot_weight(slot, (weight & LOAD_WEIGHT_MASK).min(NICE_0_LOAD));' \
-    kernel/ps/src/multitask/scheduler.rs || {
+rg -Fq 'runqueue::weight::replace(pin.slot(), (weight & LOAD_WEIGHT_MASK).min(NICE_0_LOAD));' \
+    kernel/ps/src/multitask/scheduler/current_class.rs || {
     echo "scheduler self-demotion no longer caps inherited permanent fair weight" >&2
     exit 1
 }
@@ -382,11 +386,24 @@ if rg -n 'static (BLOCKED|ARM_STATE):' \
     echo "scheduler wait state escaped the authoritative owner word" >&2
     exit 1
 fi
-rg -Uq 'current_wait_commit_or_fallback\([[:space:]]*super::scheduler::commit_current_wait\(\),[[:space:]]*\|\| unsafe \{[[:space:]]*scheduler_mut\(\)\.commit_block_current_task\(\)[[:space:]]*\}' \
+rg -Uq 'interrupts::without_interrupts\(\|\| \{[\s\S]{0,350}let committed = unsafe \{ super::scheduler::commit_current_wait\(\) \};' \
     kernel/ps/src/multitask/irq.rs || {
-    echo "ordinary block commit no longer prefers owner-word authority before catalog fallback" >&2
+    echo "ordinary block commit lost its original masked Current-loan path" >&2
     exit 1
 }
+for witness in 'cpu_leases::owns_current(cpu, slot)' \
+    'identity::execution::pin_current(cpu, slot, id)' \
+    'binding: identity::execution::BindingPin'; do
+    rg -Fq "$witness" kernel/ps/src/multitask/scheduler/current_wait.rs || {
+        echo "Current wait lost its physical bank/backing loan: $witness" >&2
+        exit 1
+    }
+done
+if rg -q 'current_wait_commit_or_fallback|scheduler_mut\(\)\.commit_block_current_task' \
+    kernel/ps/src/multitask/irq.rs; then
+    echo "Current block commit regained legacy catalog fallback" >&2
+    exit 1
+fi
 rg -Uq 'let reply = unsafe \{[\s\S]{0,700}rustos_svc_runtime::ipc::reply\([\s\S]{0,700}completion_demotion_due\(reply, handled\.demote_after_reply\)' \
     services/loaderd/src/main.rs || {
     echo "loaderd can demote before its terminal UI spawn reply completes" >&2
@@ -649,54 +666,48 @@ rg -Fq 'static SYNC_HANDOFFS: [SyncHandoffLock; MAX_TRACKED_CPUS]' \
     echo "synchronous IPC peers no longer have complete bounded FIFO custody" >&2
     exit 1
 }
-scheduler_source=kernel/ps/src/multitask/scheduler.rs
-rg -Uq 'let atomic_activation_pending =\n[[:space:]]*dispatch_policy::atomic_activation_pending\(Self::current_dispatch_cpu\(\)\);' \
-    "$scheduler_source" || {
-    echo "atomic activation pending authority no longer guards early synchronous handoff selection" >&2
-    exit 1
-}
-rg -Uq 'let sync_handoff = \(!atomic_activation_pending\)\n[[:space:]]*\.then\(\|\| self\.take_next_synchronous_pick_hint_ready_slot\(\)\)' \
-    "$scheduler_source" || {
-    echo "atomic activation or synchronous IPC handoff no longer precedes unrelated overdue work" >&2
-    exit 1
-}
-atomic_handoff_line=$(rg -n -m1 'let atomic_activation_pending =' "$scheduler_source" | cut -d: -f1)
-sync_handoff_line=$(rg -n -m1 'let sync_handoff = \(!atomic_activation_pending\)' "$scheduler_source" | cut -d: -f1)
-overdue_pick_line=$(rg -n -m1 'self\.mandatory_overdue_system_pick\(current_slot, now_ticks\)' \
-    "$scheduler_source" | cut -d: -f1)
-if [ -z "$atomic_handoff_line" ] || [ -z "$sync_handoff_line" ] || \
-    [ -z "$overdue_pick_line" ] || [ "$atomic_handoff_line" -ge "$sync_handoff_line" ] || \
-    [ "$sync_handoff_line" -ge "$overdue_pick_line" ]; then
-    echo "atomic activation or synchronous IPC handoff no longer precedes unrelated overdue work" >&2
-    exit 1
-fi
+# The original legacy dispatch body is deleted. Audit the ACTUAL independent
+# priority/fair/Direct path, including incomplete-prefix refusal and generation
+# retention; a stale source string in Scheduler is no longer evidence.
+python3 formal/check-dispatch-source-contracts.py
 if [ "$(rg -c 'complete_ipc_reply_wake_handoff_with_custody\(' \
     kernel/compat/src/user/syscall/linux/{ipc_ops.rs,ipc_reply_recv.rs} | \
     awk -F: '{ total += $2 } END { print total + 0 }')" -ne 3 ]; then
     echo "one terminal IPC reply ABI bypasses the combined scheduling-context return/donation/wake handoff" >&2
     exit 1
 fi
-# The call path arms the L4-style direct handoff hint for the exact receiver.
-# The bind, the wake, and the hint were three separate acquisitions of the
-# global scheduler; they are now one, so custody is pinned across the fusion:
-# the ABI must pass the exact receiver into the combined commit, and the
-# combined commit must still be what arms the hint.
+# Cold enqueue passes the exact endpoint AND receiver to the original owner
+# producer, not the deleted global fused transaction. Its single typed pending
+# phase admits funding before wake and retains physical loans through optional
+# FIFO urgency; full FIFO may refuse a hint, never undo successful receiver wake.
+# Sender wait remains a later wait_for_reply transaction.
 rg -Fq 'commit_ipc_call_handoff(' \
     kernel/compat/src/user/syscall/linux/ipc_ops.rs || {
     echo "IPC call enqueue bypasses exact receiver handoff custody" >&2
     exit 1
 }
-rg -Uq 'commit_ipc_call_handoff\(\n[[:space:]]*reply\.raw\(\),\n[[:space:]]*task_id,\n[[:space:]]*receiver_task_id,' \
+rg -Uq 'commit_ipc_call_handoff\([[:space:]]*endpoint\.raw\(\),[[:space:]]*reply\.raw\(\),[[:space:]]*task_id,[[:space:]]*receiver_task_id,' \
     kernel/compat/src/user/syscall/linux/ipc_ops.rs || {
     echo "IPC call enqueue no longer commits handoff for the exact receiver task" >&2
     exit 1
 }
-for handoff_source in kernel/ps/src/multitask/scheduler.rs kernel/ps/src/multitask/current.rs; do
-    rg -Fq 'set_next_synchronous_pick_hint(receiver_task_id)' "$handoff_source" || {
-        echo "combined IPC call handoff stopped arming the exact receiver pick hint in $handoff_source" >&2
+rg -Fq 'super::scheduler::ipc_publication::call_before_arm(' \
+    kernel/ps/src/multitask/current.rs || {
+    echo "cold IPC adapter bypasses original Current/typed receiver producer" >&2
+    exit 1
+}
+for original in 'receive_call(receiver, endpoint,' 'binding.original_pin()' \
+    'sync_handoff::publish_original(target,' 'binding.slot(), binding.id()' \
+    'drop(loans)' 'drop(sender)'; do
+    rg -Fq "$original" kernel/ps/src/multitask/scheduler/ipc_publication.rs || {
+        echo "cold IPC producer lost original funding/receiver/FIFO custody: $original" >&2
         exit 1
     }
 done
+if rg -Fq 'fn commit_ipc_call_handoff(' kernel/ps/src/multitask/scheduler.rs; then
+    echo "deleted legacy fused IPC authority regained" >&2
+    exit 1
+fi
 rg -Fq 'set_next_process_pick_hint(receiver_process_id)' \
     kernel/compat/src/user/syscall/linux/ipc_ops.rs || {
     echo "process-owned IPC call enqueue bypasses runnable receiver custody" >&2
@@ -708,9 +719,16 @@ rg -Fq 'synchronous_ipc_handoff_is_fifo_deduplicated_and_fairness_bounded' \
     exit 1
 }
 scheduler_profile=kernel/ps/src/multitask/scheduler/runtime_profile.rs
+scheduler_profile_owner=kernel/ps/src/multitask/scheduler/runtime_profile/owner.rs
+scheduler_profile_report=kernel/ps/src/multitask/scheduler/runtime_profile/report.rs
 rg -Fq 'const PROFILE_TOP_TASKS: usize = 4;' "$scheduler_profile" \
-    && rg -Fq 'self.runtime_profile_ns.fill(0);' "$scheduler_profile" \
-    && rg -Fq 'self.runtime_profile_entry_counts.fill(0);' "$scheduler_profile" \
+    && rg -Fq 'let window = owner::take(now, period)?;' "$scheduler_profile" \
+    && rg -Fq 'observe_original_current(turn);' "$scheduler_profile" \
+    && rg -Fq 'window: owner::Counters' "$scheduler_profile_report" \
+    && rg -Fq 'report.top[index..].rotate_right(1);' "$scheduler_profile_report" \
+    && rg -Fq 'core::mem::replace(self, Self::new())' "$scheduler_profile_owner" \
+    && rg -Fq 'window.merge(cell.with(Counters::take));' "$scheduler_profile_owner" \
+    && rg -Fq 'self.phase_lifetime_ns = window.phase_lifetime_ns;' "$scheduler_profile_owner" \
     && rg -Fq 'kernel-scheduler-entry' "$scheduler_profile" \
     && rg -Fq 'runtime_profile_is_windowed_ranked_and_destructive' "$scheduler_profile" || {
         echo "scheduler runtime attribution lost its bounded destructive snapshot" >&2
@@ -727,7 +745,8 @@ rg -Uq 'let gpu_compositor = Some\(GpuCompositorRuntime::new\([\s\S]{0,900}diag_
     echo "mandatory GPU initialization no longer overlaps serial input/console/surface startup" >&2
     exit 1
 }
-if [ "$(rg -c 'record_runtime_profile_entry' kernel/ps/src/multitask/irq.rs)" -ne 5 ] \
+irq_entry_count="$(rg -Fc 'runtime_profile::record_entry(' kernel/ps/src/multitask/irq.rs || true)"
+if [[ "${irq_entry_count:-0}" -ne 5 ]] \
     || ! rg -Fq 'runtime_profile_entry_causes_are_exact_and_destructive' "$scheduler_profile"; then
     echo "scheduler entry-cause attribution is incomplete or lacks a destructive witness" >&2
     exit 1
@@ -774,7 +793,7 @@ rg -Fq 'pub unsafe fn reply_recv_with_sender(' libs/rustos-svc-runtime/src/ipc.r
 # hold total. The event is latched and rendered by the profile drain instead,
 # which already runs outside every tracked lock.
 # See `rustos_user_abi::performance::SCHEDULER_GUARD_MAX_DEBUG_SINK_RECORDS`.
-accounting_body="$(sed -n '/fn account_current_runtime(/,/^    fn /p' kernel/ps/src/multitask/scheduler.rs)"
+accounting_body="$(sed -n '/fn account(/,/fn validate(/p' kernel/ps/src/multitask/scheduler/current_return.rs)"
 if rg -Fq 'record_milestone' <<<"$accounting_body"; then
     echo 'scheduler runtime accounting renders a debug-sink record inside the global guard' >&2
     exit 1
@@ -866,14 +885,16 @@ for witness in \
     }
 done
 
-# A running thread already pins its own process object, so the hot path takes
-# no reference count: a retain plus its release are two acquisitions of the one
-# global process table, and the census measured roughly ten per synchronous
-# round trip. The pin re-reads the published state pointer rather than caching
-# it, which is what keeps it sound across an exec.
+# Own-process access keeps the zero process-table acquisition ceiling, but its
+# physical lifetime is now an exact atomic allocation pin, not task membership.
+# Pin before pointer capture; cached state-lock allocation survives retirement.
+# MM generation/visibility checks still reject an exec-stale mapping.
 for witness in \
     'pub(in crate::multitask) fn own_process_ref(' \
-    'ProcessRefPin::OwnThread => NonNull::new(' \
+    'let allocation = pin_process_object(handle, process_id)?;' \
+    'let state = published_process_state(handle)?;' \
+    '_allocation: allocation,' \
+    'ProcessRefPin::OwnThread { state, .. } => Some(*state),' \
     'if matches!(self.pin, ProcessRefPin::Counted(_)) {' ; do
     rg -Fq "$witness" kernel/ps/src/multitask/process_table/identity.rs || {
         echo "own-thread process pin witness missing: $witness" >&2

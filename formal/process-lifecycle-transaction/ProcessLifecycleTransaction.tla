@@ -6,6 +6,12 @@ Spawn, exec, exit, and reap use one non-reusable transaction namespace while
 process-slot and MM generations remain separate. Partial frame acquisition is
 unpublished and must roll back exactly; published frames remain owned until
 all tasks/references/reply/fault/TLB authorities reach zero and reap commits.
+
+Group worker refinement: the original census/process pin transfers from a
+queued row to effects and back to suspension without reopening joins or
+recollecting a replacement census. Desired withdrawal does not ACK external
+terminal consumers. This component does not model physical frame/MM/RSP or
+complete source-refining joint dispatcher/terminal/reuse behavior.
 ***************************************************************************)
 
 CONSTANT MaxTxn, TotalFrames
@@ -26,8 +32,10 @@ VARIABLES phase, processGeneration, mmGeneration, nextTxn, activeTxn,
           tasks, references, replyCaps, faultTokens, tlbTargets,
           attachOpen, oldBundleLive, exitRequested, rollbackCount,
           completedTxn
+VARIABLES groupPhase, groupPin, groupCensus, groupGeneration, groupEffects
 
-vars == <<phase, processGeneration, mmGeneration, nextTxn, activeTxn,
+groupVars == <<groupPhase, groupPin, groupCensus, groupGeneration, groupEffects>>
+lifecycleVars == <<phase, processGeneration, mmGeneration, nextTxn, activeTxn,
           tokenLive, unpublishedFrames, publishedFrames, freeFrames,
           tasks, references, replyCaps, faultTokens, tlbTargets,
           attachOpen, oldBundleLive, exitRequested, rollbackCount,
@@ -35,7 +43,9 @@ vars == <<phase, processGeneration, mmGeneration, nextTxn, activeTxn,
 
 CanAllocateTxn == nextTxn \in 1..MaxTxn
 
-Init ==
+vars == <<lifecycleVars, groupVars>>
+
+LifecycleInit ==
     /\ phase = Idle
     /\ processGeneration = 1
     /\ mmGeneration = 0
@@ -274,6 +284,7 @@ QueueReap ==
     /\ replyCaps = 0
     /\ faultTokens = 0
     /\ tlbTargets = 0
+    /\ ~groupPin
     /\ phase' = ReapQueued
     /\ UNCHANGED <<processGeneration, mmGeneration, nextTxn, activeTxn,
                     tokenLive, unpublishedFrames, publishedFrames, freeFrames,
@@ -315,11 +326,58 @@ Terminal ==
            /\ ~CanAllocateTxn
     /\ UNCHANGED vars
 
-Next == ReserveSpawn \/ AcquireSpawnFrame \/ PublishSpawn \/ AbortSpawn
+LifecycleNext == ReserveSpawn \/ AcquireSpawnFrame \/ PublishSpawn \/ AbortSpawn
         \/ AttachThread \/ DetachThread \/ ReserveExec \/ AcquireExecFrame
         \/ AbortExec \/ PublishExec \/ RequestExitDuringExec \/ CancelExecForExit \/ BeginExit
         \/ PublishAuthority
         \/ SettleAuthority \/ QueueReap \/ Reap \/ ReuseSlot \/ Terminal
+
+Init ==
+    /\ LifecycleInit
+    /\ groupPhase = "vacant"
+    /\ groupPin = FALSE
+    /\ groupCensus = {}
+    /\ groupGeneration = 0
+    /\ groupEffects = FALSE
+
+GroupSubmit ==
+    /\ phase = Exiting
+    /\ groupPhase = "vacant"
+    /\ groupPhase' = "queued"
+    /\ groupPin' = TRUE
+    /\ groupGeneration' = processGeneration
+    /\ groupCensus' = {processGeneration}
+    /\ UNCHANGED <<lifecycleVars, groupEffects>>
+
+GroupClaim ==
+    /\ phase = Exiting
+    /\ groupPhase = "queued"
+    /\ groupPhase' = "claimed"
+    /\ groupEffects' = TRUE
+    /\ UNCHANGED <<lifecycleVars, groupPin, groupCensus, groupGeneration>>
+
+GroupSuspend ==
+    /\ groupPhase = "claimed"
+    /\ groupPhase' = "suspended"
+    /\ UNCHANGED <<lifecycleVars, groupPin, groupCensus, groupGeneration, groupEffects>>
+
+GroupResume ==
+    /\ phase = Exiting
+    /\ groupPhase = "suspended"
+    /\ groupPhase' = "claimed"
+    /\ UNCHANGED <<lifecycleVars, groupPin, groupCensus, groupGeneration, groupEffects>>
+
+GroupAck ==
+    /\ phase = Exiting
+    /\ groupPhase = "claimed"
+    /\ tasks = 0
+    /\ groupPhase' = "done"
+    /\ groupPin' = FALSE
+    /\ UNCHANGED <<lifecycleVars, groupCensus, groupGeneration, groupEffects>>
+
+Next ==
+    \/ (LifecycleNext /\ UNCHANGED groupVars)
+    \/ GroupSubmit \/ GroupClaim \/ GroupSuspend \/ GroupResume \/ GroupAck
 
 Spec == Init /\ [][Next]_vars
 
@@ -363,5 +421,24 @@ AttachmentSealedOutsideRunning == attachOpen => phase = Running
 LiveTokenOwnsExactTransaction == tokenLive => activeTxn > completedTxn
 GenerationNeverAliases == activeTxn = 0 \/ activeTxn < nextTxn
 ExecPublicationIsWhole == mmGeneration > 0 => oldBundleLive \/ phase = Dead
+
+GroupTypeOK ==
+    /\ groupPhase \in {"vacant", "queued", "claimed", "suspended", "done"}
+    /\ groupPin \in BOOLEAN
+    /\ groupCensus \subseteq 1..2
+    /\ groupGeneration \in 0..2
+    /\ groupEffects \in BOOLEAN
+
+OriginalGroupCensusRetained ==
+    groupPhase \in {"queued", "claimed", "suspended"} =>
+        /\ groupPin
+        /\ groupCensus = {groupGeneration}
+        /\ groupGeneration = processGeneration
+
+SuspendedGroupEffectsRetained ==
+    groupPhase \in {"claimed", "suspended", "done"} => groupEffects
+
+ReapRequiresOriginalGroupPinClosed ==
+    phase \in {ReapQueued, Dead} => ~groupPin
 
 =============================================================================

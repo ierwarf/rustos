@@ -1,10 +1,7 @@
-use alloc::boxed::Box;
-use core::ops::{Deref, DerefMut};
-
 use super::{
     BlockReason, ConsoleSessionHandle, FastIpcCallHandoffOutcome, FastIpcReplyHandoffOutcome,
-    IpcDonationTarget, MAX_CONSECUTIVE_SYSTEM_DISPATCHES, MAX_TASK, MIN_LOAD_WEIGHT, NICE_0_LOAD,
-    SCHED_CPU_LOCALITY_LAG_NS, SYSTEM_CLASS_WEIGHT_FLAG, SchedClass, Scheduler, SchedulerDispatch,
+    MAX_CONSECUTIVE_SYSTEM_DISPATCHES, MAX_TASK, MIN_LOAD_WEIGHT, NICE_0_LOAD,
+    SCHED_CPU_LOCALITY_LAG_NS, SYSTEM_CLASS_WEIGHT_FLAG, SchedClass, SchedulerDispatch,
     TaskContext, TaskStart, align_kernel_stack_top,
 };
 use crate::memory::paging::ProcessAddressSpace;
@@ -14,7 +11,16 @@ use crate::user::linux::LinuxThreadState;
 use crate::user::process_state::UserProcessState;
 use kernel_ipc_runtime::api::{EndpointResponseTake, IpcError};
 
-static TEST_SCHEDULER_TEMPLATE: Scheduler = Scheduler::new();
+/// Explicit earlier membership input for scalar catalog-policy projections.
+/// The actual iterator always reads its published bitmap, even in native.
+/// This grants no physical frame/MM/UID execution or hardware evidence.
+pub(super) fn model_earlier_queue_membership(slots: &[usize]) {
+    for &slot in slots {
+        super::runqueue::admit_blocked(slot);
+        assert!(matches!(super::runqueue::publish_local_wake(slot, 0, NICE_0_LOAD),
+            super::runqueue::RemoteWakeOutcome::Published { cpu: 0, .. }));
+    }
+}
 
 /// Restores the shared runqueue witness even when one scheduler assertion
 /// fails, so this test's exact custody records cannot leak into another
@@ -24,36 +30,18 @@ struct RunqueuePublicationReset;
 impl Drop for RunqueuePublicationReset {
     fn drop(&mut self) {
         super::runqueue::reset_before_publication();
+        crate::multitask::process_placement::reset_for_tests();
     }
 }
 
-/// One host scheduler fixture owns the globally published runqueue and
-/// CPU-local execution witnesses for its complete lifetime.  Production uses
-/// per-CPU ownership; unit schedulers deliberately share these backing words
-/// so their white-box proof must serialize and reset them as one custody
-/// domain.  Keeping the guard with the heap scheduler prevents a later test
-/// from clearing a live fixture between allocation and its final assertion.
+/// Native namespace isolation only. This owns no task/catalog, copied backend,
+/// frame or execution permission. Actual born resources supply every authority.
 pub(super) struct SchedulerTestFixture {
-    scheduler: Box<Scheduler>,
     _runqueue_reset: RunqueuePublicationReset,
     _runtime_serial: std::sync::MutexGuard<'static, ()>,
     _runqueue_serial: std::sync::MutexGuard<'static, ()>,
     _cpu_publication: std::sync::MutexGuard<'static, ()>,
     _process_table: process_table::tests::ProcessTableTestIsolation,
-}
-
-impl Deref for SchedulerTestFixture {
-    type Target = Scheduler;
-
-    fn deref(&self) -> &Self::Target {
-        &self.scheduler
-    }
-}
-
-impl DerefMut for SchedulerTestFixture {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.scheduler
-    }
 }
 
 #[test]
@@ -79,251 +67,35 @@ fn architectural_restore_is_required_exactly_for_a_task_switch() {
 
 #[test]
 fn slot_identity_keeps_exact_user_pid_and_tid_together() {
-    let mut scheduler = boxed_scheduler();
-    let process = test_process(0x1a2b);
-    let slot = 1;
-    scheduler.contexts[slot] = Some(test_user_context(process));
-    scheduler.starts[slot] = Some(TaskStart {
-        entry: noop_task_entry,
-        id: 0x3c4d,
-    });
-
-    assert_eq!(
-        scheduler
-            .slot_identity(slot)
-            .and_then(|identity| identity.complete_user_log_ids()),
-        Some(Some((0x1a2b, 0x3c4d)))
-    );
+    catalog_witnesses::identity();
 }
 
 #[test]
 fn task_slot_hint_collisions_and_stale_entries_fall_back_to_exact_identity() {
-    let mut scheduler = boxed_scheduler();
-    let process = test_process(0x1a2c);
-    let first_slot = 2;
-    let second_slot = 3;
-    let first_task = 5;
-    let second_task = first_task + MAX_TASK as u64;
-    scheduler.contexts[first_slot] = Some(test_user_context(process));
-    scheduler.contexts[second_slot] = Some(test_user_context(process));
-    scheduler.starts[first_slot] = Some(TaskStart {
-        entry: noop_task_entry,
-        id: first_task,
-    });
-    scheduler.starts[second_slot] = Some(TaskStart {
-        entry: noop_task_entry,
-        id: second_task,
-    });
-
-    assert_eq!(scheduler.find_task_slot(first_task), Some(first_slot));
-    assert_eq!(scheduler.find_task_slot(second_task), Some(second_slot));
-    assert_eq!(scheduler.find_task_slot(first_task), Some(first_slot));
-    scheduler.retired[first_slot] = true;
-    assert_eq!(scheduler.find_task_slot(first_task), None);
-    assert_eq!(scheduler.find_task_slot(second_task), Some(second_slot));
+    catalog_witnesses::hint_collision();
 }
 
 #[test]
 fn ipc_admission_exports_only_the_live_bound_scheduling_context() {
-    let mut scheduler = boxed_scheduler();
-    let process = test_process(0x510);
-    let slot = 3;
-    let task_id = 0x611;
-    let mut context = test_user_context(process);
-    context.scheduling_context =
-        crate::multitask::scheduler::scheduling_context::SchedulingContext::bind(slot, task_id);
-    scheduler.contexts[slot] = Some(context);
-    scheduler.starts[slot] = Some(TaskStart {
-        entry: noop_task_entry,
-        id: task_id,
-    });
-
-    let admission = scheduler.reserve_ipc_call_donation(task_id);
-    let identity = admission
-        .scheduling_context
-        .expect("live task scheduling context");
-    assert_eq!(identity.slot(), u64::try_from(slot).unwrap() + 1);
-    assert_eq!(identity.generation(), task_id + 1);
-
-    scheduler.contexts[slot]
-        .as_mut()
-        .unwrap()
-        .scheduling_context =
-        crate::multitask::scheduler::scheduling_context::SchedulingContext::bind(slot, task_id + 1);
-    assert!(
-        scheduler
-            .reserve_ipc_call_donation(task_id)
-            .scheduling_context
-            .is_none(),
-        "stale task/context binding must fail closed"
-    );
+    super::donation_publication::tests::actual_noncurrent_donor_requires_original_bound_resource_and_full_context();
+    super::donation_publication::tests::actual_participant_loans_survive_capture_and_terminal_seal_denies_new_admission();
 }
 
 #[test]
 fn nested_passive_server_runtime_is_billed_to_the_root_caller_context() {
-    let mut scheduler = boxed_scheduler();
-    let root_policy = super::scheduling_context::SchedulingContextPolicy {
-        budget_ns: 4_000,
-        period_ns: 10_000,
-        refill_capacity: 4,
-        cpu_mask: u64::MAX,
-        criticality: 2,
-        domain: 0x41,
-        policy_epoch: 1,
-        timeout_endpoint_cap: 0,
-    };
-    let server_policy = super::scheduling_context::SchedulingContextPolicy {
-        budget_ns: 7_000,
-        criticality: 1,
-        domain: 0x42,
-        ..root_policy
-    };
-    let root_domain = scheduler
-        .admit_scheduling_domain(root_policy)
-        .expect("root caller domain");
-    let server_domain = scheduler
-        .admit_scheduling_domain(server_policy)
-        .expect("server domain");
-
-    for (slot, task_id, process_id) in [(1, 601, 61), (2, 602, 62), (3, 603, 63)] {
-        let process = test_process(process_id);
-        let mut context = test_user_context(process);
-        context.scheduling_context =
-            super::scheduling_context::SchedulingContext::bind(slot, task_id);
-        let (policy, domain) = if slot == 1 {
-            (root_policy, root_domain)
-        } else {
-            (server_policy, server_domain)
-        };
-        let generation = scheduler.scheduling_domains[domain]
-            .expect("admitted test domain")
-            .generation();
-        assert!(context.scheduling_context.admit(policy, domain, generation));
-        scheduler.contexts[slot] = Some(context);
-        scheduler.starts[slot] = Some(TaskStart {
-            entry: noop_task_entry,
-            id: task_id,
-        });
-    }
-
-    let outer = scheduler.reserve_ipc_call_donation(601);
-    assert!(outer.donation_reserved);
-    assert!(scheduler.bind_reserved_ipc_priority(
-        10,
-        crate::multitask::scheduler::ipc_donation::DonationNamespace::IpcReply,
-        601,
-        602
-    ));
-    assert!(
-        scheduler.bind_reserved_ipc_priority(
-            10,
-            crate::multitask::scheduler::ipc_donation::DonationNamespace::IpcReply,
-            601,
-            603
-        ),
-        "sender commit must accept the receiver's earlier exact bind"
-    );
-    assert_eq!(scheduler.effective_scheduling_context_owner_slot(2), 1);
-    assert_eq!(
-        scheduler.effective_scheduling_context_owner_slot(3),
-        3,
-        "a stale sender waiter must not replace the actual receiver"
-    );
-    let nested = scheduler.reserve_ipc_call_donation(602);
-    assert_eq!(nested.scheduling_context, outer.scheduling_context);
-    assert_eq!(nested.scheduling_context_owner_task_id, Some(601));
-    assert!(scheduler.bind_reserved_ipc_priority(
-        11,
-        crate::multitask::scheduler::ipc_donation::DonationNamespace::IpcReply,
-        602,
-        603
-    ));
-    assert_eq!(scheduler.effective_scheduling_context_owner_slot(3), 1);
-
-    let (owner, donated) = scheduler
-        .charge_effective_scheduling_context_runtime(3, 100, 4_500)
-        .expect("nested server borrowed caller budget");
-    assert_eq!(owner, 601);
-    assert_eq!(donated.charged_ns, 4_000);
-    assert_eq!(donated.overrun_ns, 500);
-    scheduler.current_task = 3;
-    let borrowed = scheduler
-        .current_scheduling_context_runtime_snapshot()
-        .expect("borrowed context snapshot");
-    assert_eq!(borrowed.executing_task_id, 603);
-    assert_eq!(borrowed.context_owner_task_id, 601);
-    assert_eq!(borrowed.domain, root_policy.domain);
-    assert_eq!(borrowed.context_available_ns, 0);
-    assert_eq!(borrowed.context_pending_refill_ns, root_policy.budget_ns);
-    assert_eq!(borrowed.domain_available_ns, 0);
-    assert_eq!(borrowed.domain_pending_refill_ns, root_policy.budget_ns);
-    assert_eq!(borrowed.timeout_fault_count, 1);
-    assert_eq!(borrowed.timeout_fault_consumed_ns, root_policy.budget_ns);
-    assert_eq!(borrowed.timeout_fault_budget_ns, root_policy.budget_ns);
-    assert_eq!(borrowed.timeout_fault_period_ns, root_policy.period_ns);
-    assert_eq!(borrowed.timeout_fault_reply, 11);
-    assert_eq!(borrowed.timeout_endpoint_cap, 0);
-    assert_eq!(borrowed.timeout_fault_action, 1);
-
-    assert!(scheduler.release_ipc_priority(
-        11,
-        crate::multitask::scheduler::ipc_donation::DonationNamespace::IpcReply
-    ));
-    assert_eq!(scheduler.effective_scheduling_context_owner_slot(3), 3);
-    let (owner, native) = scheduler
-        .charge_effective_scheduling_context_runtime(3, 200, 4_500)
-        .expect("server native context restored");
-    assert_eq!(owner, 603);
-    assert_eq!(native.charged_ns, 4_500);
-    assert_eq!(native.overrun_ns, 0);
+    super::donation_publication::tests::legacy_witnesses::nested_interval();
 }
 
 #[test]
 fn deadline_domains_require_per_cpu_utilization_headroom() {
-    let mut scheduler = boxed_scheduler();
-    let base = super::scheduling_context::SchedulingContextPolicy {
-        budget_ns: 6_000_000,
-        period_ns: 10_000_000,
-        refill_capacity: 4,
-        cpu_mask: 1,
-        criticality: 2,
-        domain: 0x700,
-        policy_epoch: 1,
-        timeout_endpoint_cap: 0,
-    };
-    assert!(scheduler.admit_scheduling_domain(base).is_some());
-
-    let overlapping = super::scheduling_context::SchedulingContextPolicy {
-        budget_ns: 3_000_001,
-        domain: 0x701,
-        ..base
-    };
-    assert!(scheduler.admit_scheduling_domain(overlapping).is_none());
-
-    let exact_limit = super::scheduling_context::SchedulingContextPolicy {
-        budget_ns: 3_000_000,
-        domain: 0x702,
-        ..base
-    };
-    assert!(scheduler.admit_scheduling_domain(exact_limit).is_some());
-
-    let disjoint_cpu = super::scheduling_context::SchedulingContextPolicy {
-        budget_ns: 9_000_000,
-        cpu_mask: 2,
-        domain: 0x703,
-        ..base
-    };
-    assert!(scheduler.admit_scheduling_domain(disjoint_cpu).is_some());
+    super::domain_admission::tests::deadline_quota_sums_exact_overlapping_cpu_masks_and_rounds_up_without_partial_replacement();
 }
 
 #[test]
 fn production_user_slot_publication_rejects_an_unbudgeted_context() {
-    let production = include_str!("../../scheduler.rs");
-    assert_eq!(
-        production.matches("if scheduling_policy.is_none()").count(),
-        2
-    );
-    assert!(production.contains("return None;"));
+    // Exercise actual independent admission with a genuine kernel Executor /
+    // Current bank, rather than count deleted facade source branches.
+    super::root_creation::tests::unbudgeted_refused();
 }
 
 pub(super) fn boxed_scheduler() -> SchedulerTestFixture {
@@ -333,25 +105,13 @@ pub(super) fn boxed_scheduler() -> SchedulerTestFixture {
     let runqueue_serial = super::runqueue::test_serial_guard();
     super::runqueue::reset_before_publication();
     super::scheduling_runtime::reset_for_test();
-    let mut scheduler = Box::<Scheduler>::new_uninit();
-    unsafe {
-        // The const template owns no heap allocation: every Vec-bearing
-        // field is `None`. Copy it directly into the heap allocation so
-        // debug test threads never materialize the large SIMD arrays on
-        // their small harness stack.
-        core::ptr::copy_nonoverlapping(
-            core::ptr::addr_of!(TEST_SCHEDULER_TEMPLATE),
-            scheduler.as_mut_ptr(),
-            1,
-        );
-        SchedulerTestFixture {
-            scheduler: scheduler.assume_init(),
-            _runqueue_reset: RunqueuePublicationReset,
-            _runtime_serial: runtime_serial,
-            _runqueue_serial: runqueue_serial,
-            _cpu_publication: cpu_publication,
-            _process_table: process_table,
-        }
+    crate::multitask::process_placement::reset_for_tests();
+    SchedulerTestFixture {
+        _runqueue_reset: RunqueuePublicationReset,
+        _runtime_serial: runtime_serial,
+        _runqueue_serial: runqueue_serial,
+        _cpu_publication: cpu_publication,
+        _process_table: process_table,
     }
 }
 
@@ -400,45 +160,6 @@ pub(super) fn test_process(id: u64) -> process_table::ProcessHandle {
     .expect("process handle")
 }
 
-#[derive(Debug, Eq, PartialEq)]
-struct TerminalRejectionSnapshot {
-    ready: bool,
-    blocked: bool,
-    wake_armed: bool,
-    current_task: usize,
-    retired: bool,
-    start_suspended: bool,
-    job_stopped: bool,
-    exec_target_quiesced: bool,
-    retire_reason_present: bool,
-    retirement_side_effect_present: bool,
-    pending_reap: bool,
-    task_id: Option<u64>,
-    execution_owner: Option<super::super::cpu_local::TaskExecutionOwner>,
-}
-
-/// Captures every scheduler-owned state a terminal block/wake rejection
-/// must leave untouched. CPU-local execution ownership is independently
-/// published, so the caller holds `test_publication_lock` while comparing
-/// this snapshot.
-fn terminal_rejection_snapshot(scheduler: &Scheduler, slot: usize) -> TerminalRejectionSnapshot {
-    let context = scheduler.contexts[slot].expect("terminal test context");
-    TerminalRejectionSnapshot {
-        ready: context.test_ready,
-        blocked: context.blocked,
-        wake_armed: context.wake_armed,
-        current_task: scheduler.current_task,
-        retired: scheduler.retired[slot],
-        start_suspended: scheduler.start_suspended[slot],
-        job_stopped: scheduler.job_stopped[slot],
-        exec_target_quiesced: scheduler.exec_target_quiesced[slot],
-        retire_reason_present: scheduler.retire_reasons[slot].is_some(),
-        retirement_side_effect_present: scheduler.retirement_side_effects[slot].is_some(),
-        pending_reap: scheduler.pending_reap,
-        task_id: scheduler.starts[slot].map(|start| start.id),
-        execution_owner: super::super::cpu_local::task_execution_owner(slot),
-    }
-}
 
 #[test]
 fn ready_validation_accepts_only_immutable_published_frames() {
@@ -476,762 +197,82 @@ fn live_noncurrent_task_must_retain_one_scheduler_state_owner() {
 
 #[test]
 fn collect_process_sibling_slots_returns_matching_user_slots_only() {
-    let mut scheduler = boxed_scheduler();
-    let owner = test_process(1);
-    let other = test_process(2);
-
-    scheduler.contexts[1] = Some(test_user_context(owner));
-    scheduler.contexts[2] = Some(test_user_context(owner));
-    scheduler.contexts[3] = Some(test_user_context(other));
-    scheduler.contexts[4] = Some(TaskContext {
-        user_mode: false,
-        process_handle: Some(owner),
-        ..test_user_context(owner)
-    });
-
-    scheduler.retired[2] = true;
-    scheduler.contexts[5] = Some(test_user_context(owner));
-
-    let (slots, count) = scheduler.collect_live_process_sibling_slots(1, owner);
-    assert_eq!(count, 1);
-    assert_eq!(slots[0], 5);
-    assert!(slots[1..MAX_TASK].iter().all(|slot| *slot == 0));
+    super::exec_transaction::quiescence::tests::actual_exec_census_retired_borrower_defers_same_detach_then_retries_to_both_consumer_publications();
+    super::exec_transaction::quiescence::tests::legacy_witnesses::recycled_uid();
 }
 
 #[test]
 fn process_stop_is_scheduler_wide_and_sigcont_resumes_before_delivery() {
-    let mut scheduler = boxed_scheduler();
-    let process = test_process(48);
-    process_table::attach_task(process).expect("second thread");
-    let leader = test_user_context(process);
-    let worker = test_user_context(process);
-    scheduler.contexts[1] = Some(leader);
-    scheduler.contexts[2] = Some(worker);
-    scheduler.starts[1] = Some(TaskStart {
-        entry: noop_task_entry,
-        id: 48,
-    });
-    scheduler.starts[2] = Some(TaskStart {
-        entry: noop_task_entry,
-        id: 49,
-    });
-    scheduler.install_linux_thread_state(1, Some(48), Some(LinuxThreadState::default()));
-    scheduler.install_linux_thread_state(2, Some(49), Some(LinuxThreadState::default()));
-    scheduler.current_task = 1;
-
-    assert!(scheduler.stop_current_linux_process(19));
-    assert!(scheduler.job_stopped[1]);
-    assert!(scheduler.job_stopped[2]);
-    assert!(!scheduler.stop_current_linux_process(19));
-
-    assert!(scheduler.queue_linux_signal(48, 48, rustos_user_abi::linux::SIGCONT));
-    assert!(!scheduler.job_stopped[1]);
-    assert!(!scheduler.job_stopped[2]);
-    let pending = scheduler
-        .linux_thread_state(1)
-        .map(|state| state.pending_signals)
-        .unwrap_or(0);
-    assert_ne!(
-        pending
-            & crate::user::sysops::linux::linux_signal_bit(rustos_user_abi::linux::SIGCONT)
-                .unwrap(),
-        0
-    );
-
-    process_table::note_process_exit_status(48, 0).expect("record exit");
-    process_table::detach_task(process).expect("detach leader");
-    process_table::detach_task(process).expect("detach worker");
-    assert_eq!(process_table::reap_exited_processes(), 1);
+    crate::multitask::scheduler::linux_thread_state::signals::tests::group_witness();
 }
 
 #[test]
 fn unmasked_signal_revokes_a_pending_block_arm() {
-    let mut scheduler = boxed_scheduler();
-    let process = test_process(52);
-    let mut context = test_user_context(process);
-    context.test_ready = false;
-    scheduler.contexts[1] = Some(context);
-    scheduler.starts[1] = Some(TaskStart {
-        entry: noop_task_entry,
-        id: 52,
-    });
-    scheduler.install_linux_thread_state(1, Some(52), Some(LinuxThreadState::default()));
-    scheduler.current_task = 1;
-
-    assert!(scheduler.arm_block_current_task());
-    assert!(scheduler.contexts[1].expect("armed context").wake_armed);
-    assert!(scheduler.queue_linux_signal(52, 52, 15));
-    let context = scheduler.contexts[1].expect("signalled context");
-    assert!(!context.wake_armed);
-    assert!(!context.blocked);
-    assert!(!context.test_ready);
-    assert_eq!(scheduler.commit_block_current_task(), Some(false));
-
-    process_table::note_process_exit_status(52, 0).expect("record exit");
-    process_table::detach_task(process).expect("detach thread");
-    assert_eq!(process_table::reap_exited_processes(), 1);
+    crate::multitask::scheduler::linux_thread_state::signals::tests::arm_witness();
 }
 
 #[test]
 fn process_sigchld_prefers_leader_and_retains_exact_coalesced_causes() {
-    let mut scheduler = boxed_scheduler();
-    let process = test_process(50);
-    process_table::attach_task(process).expect("second thread");
-    let leader = test_user_context(process);
-    let worker = test_user_context(process);
-    scheduler.contexts[1] = Some(leader);
-    scheduler.contexts[2] = Some(worker);
-    scheduler.starts[1] = Some(TaskStart {
-        entry: noop_task_entry,
-        id: 50,
-    });
-    scheduler.starts[2] = Some(TaskStart {
-        entry: noop_task_entry,
-        id: 51,
-    });
-    scheduler.install_linux_thread_state(1, Some(50), Some(LinuxThreadState::default()));
-    scheduler.install_linux_thread_state(2, Some(51), Some(LinuxThreadState::default()));
-    scheduler.current_task = 1;
-
-    assert!(
-        scheduler
-            .queue_linux_process_sigchld(50, rustos_user_abi::syscall::PROCD_SIGCHLD_EVENT_STOP)
-    );
-    assert_eq!(
-        scheduler
-            .linux_thread_state(1)
-            .map(|state| state.pending_sigchld_events),
-        Some(rustos_user_abi::syscall::PROCD_SIGCHLD_EVENT_STOP)
-    );
-
-    scheduler.current_task = 2;
-    scheduler.transfer_pending_process_sigchld(1);
-    assert_eq!(
-        scheduler
-            .linux_thread_state(1)
-            .map(|state| state.pending_sigchld_events),
-        Some(0)
-    );
-    assert_eq!(
-        scheduler
-            .linux_thread_state(2)
-            .map(|state| state.pending_sigchld_events),
-        Some(rustos_user_abi::syscall::PROCD_SIGCHLD_EVENT_STOP)
-    );
-
-    scheduler.retired[1] = true;
-    assert!(
-        scheduler.queue_linux_process_sigchld(
-            50,
-            rustos_user_abi::syscall::PROCD_SIGCHLD_EVENT_CONTINUE
-        )
-    );
-    assert_eq!(
-        scheduler
-            .linux_thread_state(2)
-            .map(|state| state.pending_sigchld_events),
-        Some(
-            rustos_user_abi::syscall::PROCD_SIGCHLD_EVENT_STOP
-                | rustos_user_abi::syscall::PROCD_SIGCHLD_EVENT_CONTINUE
-        )
-    );
-
-    process_table::note_process_exit_status(50, 0).expect("record exit");
-    process_table::detach_task(process).expect("detach leader");
-    process_table::detach_task(process).expect("detach worker");
-    assert_eq!(process_table::reap_exited_processes(), 1);
+    crate::multitask::scheduler::linux_thread_state::signals::tests::sigchld_witness();
 }
 
 #[test]
 fn terminate_user_process_retires_every_live_sibling() {
-    let mut scheduler = boxed_scheduler();
-    let owner = test_process(41);
-    let other = test_process(42);
-
-    scheduler.contexts[1] = Some(test_user_context(owner));
-    scheduler.contexts[2] = Some(test_user_context(owner));
-    scheduler.contexts[3] = Some(test_user_context(other));
-    scheduler.starts[1] = Some(TaskStart {
-        entry: noop_task_entry,
-        id: 41,
-    });
-    scheduler.starts[2] = Some(TaskStart {
-        entry: noop_task_entry,
-        id: 43,
-    });
-    scheduler.starts[3] = Some(TaskStart {
-        entry: noop_task_entry,
-        id: 42,
-    });
-
-    assert!(scheduler.terminate_user_process(41, Some(7)));
-    assert_eq!(process_table::is_process_exiting(41), Some(true));
-    assert!(scheduler.retired[1]);
-    assert!(scheduler.retired[2]);
-    assert!(!scheduler.retired[3]);
+    crate::multitask::scheduler::current_terminal::tests::group_witness();
 }
 
 #[test]
 fn terminating_the_last_task_marks_its_process_exiting() {
-    let mut scheduler = boxed_scheduler();
-    let owner = test_process(45);
-    scheduler.contexts[1] = Some(test_user_context(owner));
-    scheduler.starts[1] = Some(TaskStart {
-        entry: noop_task_entry,
-        id: 451,
-    });
-
-    assert!(scheduler.terminate_user_task(451, Some(7)));
-    assert_eq!(process_table::is_process_exiting(45), Some(true));
-    assert!(scheduler.retired[1]);
+    crate::multitask::scheduler::current_terminal::tests::last_task_witness();
 }
 
 #[test]
 fn retirement_revokes_task_and_process_ipc_authority() {
-    let mut scheduler = boxed_scheduler();
-    let owner = test_process(94);
-    scheduler.contexts[1] = Some(test_user_context(owner));
-    scheduler.starts[1] = Some(TaskStart {
-        entry: noop_task_entry,
-        id: 941,
-    });
-
-    let task_endpoint =
-        kernel_ipc_runtime::api::create_endpoint_for_task(941).expect("task-owned endpoint");
-    let process_endpoint =
-        kernel_ipc_runtime::api::create_endpoint_for_process(94).expect("process-owned endpoint");
-    let (task_reply, _) =
-        kernel_ipc_runtime::api::enqueue_endpoint_call(task_endpoint, 951, b"task")
-            .expect("task call");
-    let (process_reply, _) =
-        kernel_ipc_runtime::api::enqueue_endpoint_call(process_endpoint, 952, b"process")
-            .expect("process call");
-
-    scheduler.retire_slot(
-        1,
-        super::TaskRetireReason::Terminated {
-            requested_by_pid: None,
-        },
-    );
-    scheduler
-        .take_retirement_side_effect()
-        .expect("retirement side effects")
-        .complete(|task_id| {
-            let _ = scheduler.wake_task(task_id);
-        });
-
-    assert!(matches!(
-        kernel_ipc_runtime::api::take_endpoint_response_detailed(task_reply, 0),
-        Ok(EndpointResponseTake::Error {
-            error: IpcError::PeerClosed,
-            discarded_request_handles,
-        }) if discarded_request_handles.is_empty()
-    ));
-    assert!(matches!(
-        kernel_ipc_runtime::api::take_endpoint_response_detailed(process_reply, 0),
-        Ok(EndpointResponseTake::Error {
-            error: IpcError::PeerClosed,
-            discarded_request_handles,
-        }) if discarded_request_handles.is_empty()
-    ));
-    assert_eq!(
-        kernel_ipc_runtime::api::enqueue_endpoint_call(task_endpoint, 953, b"late-task"),
-        Err(IpcError::InvalidHandle)
-    );
-    assert_eq!(
-        kernel_ipc_runtime::api::enqueue_endpoint_call(process_endpoint, 954, b"late-process"),
-        Err(IpcError::InvalidHandle)
-    );
+    catalog_witnesses::endpoint_revocation();
 }
 
 #[test]
 fn retired_user_slot_waits_for_exact_runtime_cleanup_ack() {
-    let mut scheduler = boxed_scheduler();
-    let owner = test_process(96);
-    scheduler.contexts[1] = Some(test_user_context(owner));
-    scheduler.starts[1] = Some(TaskStart {
-        entry: noop_task_entry,
-        id: 961,
-    });
-
-    scheduler.retire_slot(1, super::TaskRetireReason::Exited);
-    let cleanup = scheduler
-        .next_retired_task_cleanup()
-        .expect("retired user task cleanup");
-    assert_eq!(cleanup.task_id(), 961);
-    assert_eq!(cleanup.process_id(), 96);
-    assert!(cleanup.process_terminal());
-    assert_eq!(
-        scheduler.next_retired_task_cleanup(),
-        None,
-        "an in-flight cleanup token must have exactly one SMP owner"
-    );
-    // Retain the external side-effect token locally so this assertion
-    // isolates the runtime-cleanup acknowledgement gate. If that gate is
-    // removed, the retired stack becomes reclaimable before its exact
-    // userspace cleanup acknowledgement.
-    let side_effect = scheduler
-        .take_retirement_side_effect()
-        .expect("retirement side effects");
-    assert!(scheduler.reap_inactive_retired_slots().is_none());
-    assert!(scheduler.contexts[1].is_some());
-
-    assert!(
-        !scheduler.complete_retired_task_cleanup(crate::multitask::RetiredTaskCleanup {
-            task_id: 962,
-            process_id: 96,
-            process_terminal: true,
-            clear_child_tid: 0,
-            robust_list_head: 0,
-            robust_list_len: 0,
-        })
-    );
-    assert!(scheduler.complete_retired_task_cleanup(cleanup));
-    side_effect.complete(|task_id| {
-        let _ = scheduler.wake_task(task_id);
-    });
-    let reclaim = scheduler
-        .reap_inactive_retired_slots()
-        .expect("retired slot reclaim");
-    assert!(scheduler.contexts[1].is_none());
-    assert_eq!(process_table::thread_count_by_pid(96), Some(1));
-    reclaim.complete();
-    assert_eq!(process_table::thread_count_by_pid(96), Some(0));
-    assert_eq!(process_table::reap_exited_processes(), 1);
+    catalog_witnesses::exact_cleanup();
 }
 
 #[test]
 fn retirement_cleanup_stamps_process_terminal_only_on_last_live_thread() {
-    let mut scheduler = boxed_scheduler();
-    let owner = test_process(97);
-    scheduler.contexts[1] = Some(test_user_context(owner));
-    scheduler.contexts[2] = Some(test_user_context(owner));
-    scheduler.starts[1] = Some(TaskStart {
-        entry: noop_task_entry,
-        id: 971,
-    });
-    scheduler.starts[2] = Some(TaskStart {
-        entry: noop_task_entry,
-        id: 972,
-    });
-
-    scheduler.retire_slot(1, super::TaskRetireReason::Exited);
-    let first = scheduler
-        .next_retired_task_cleanup()
-        .expect("first thread cleanup");
-    assert_eq!(first.task_id(), 971);
-    assert!(!first.process_terminal());
-    assert!(scheduler.complete_retired_task_cleanup(first));
-
-    scheduler.retire_slot(2, super::TaskRetireReason::Exited);
-    let last = scheduler
-        .next_retired_task_cleanup()
-        .expect("last thread cleanup");
-    assert_eq!(last.task_id(), 972);
-    assert!(last.process_terminal());
+    super::terminal_publication::tests::actual_terminal_process_donations_retire_by_original_members_without_catalog_rescan();
 }
 
 #[test]
 fn exec_sibling_slot_stays_quarantined_until_runtime_cleanup() {
-    let mut scheduler = boxed_scheduler();
-    let owner = test_process(98);
-    scheduler.contexts[1] = Some(test_user_context(owner));
-    scheduler.contexts[2] = Some(test_user_context(owner));
-    scheduler.starts[1] = Some(TaskStart {
-        entry: noop_task_entry,
-        id: 981,
-    });
-    scheduler.starts[2] = Some(TaskStart {
-        entry: noop_task_entry,
-        id: 982,
-    });
-
-    scheduler.retire_exec_sibling_slot(2);
-    assert!(scheduler.retired[2]);
-    assert!(scheduler.contexts[2].is_some());
-    assert_eq!(scheduler.contexts[2].unwrap().process_handle, None);
-    assert_eq!(
-        scheduler
-            .next_retired_task_cleanup()
-            .map(|cleanup| cleanup.task_id()),
-        Some(982)
-    );
-    let _ = scheduler.reap_inactive_retired_slots();
-    assert!(scheduler.contexts[2].is_some());
+    catalog_witnesses::exact_cleanup();
+    super::exec_transaction::quiescence::tests::actual_exec_census_retired_borrower_defers_same_detach_then_retries_to_both_consumer_publications();
+    super::reaper::tests::pending_external_terminal_ack_refuses_reaper_before_metadata_or_resource_effects();
 }
 
 #[test]
 fn exec_rejects_slot_with_unconsumed_side_effect_token() {
-    let mut scheduler = boxed_scheduler();
-    let owner = test_process(0xeca1);
-    let slot = 1;
-    let task_id = 0xec01;
-    let mut context = test_user_context(owner);
-    context.address_space_root = 0x1234_5000;
-    context.test_ready = true;
-    scheduler.contexts[slot] = Some(context);
-    scheduler.starts[slot] = Some(TaskStart {
-        entry: noop_task_entry,
-        id: task_id,
-    });
-    scheduler.current_task = slot;
-    scheduler.retirement_side_effects[slot] =
-        Some(super::RetirementSideEffect::new(Some(task_id), None));
-    let before = scheduler.contexts[slot].expect("live exec target");
-    let before_start = scheduler.starts[slot].expect("live exec identity");
-    let base = crate::memory::paging::USER_SPACE_BASE;
-    let mut replacement = UserTaskBootstrap::new(
-        UserAbi::Linux,
-        x86_64::VirtAddr::new(base + 0x8_000),
-        x86_64::VirtAddr::new(base + 0xa_000),
-    );
+    super::exec_transaction::quiescence::tests::legacy_witnesses::pending_kernel();
+}
 
-    assert_eq!(
-        scheduler.exec_current_user_process(0x9876_5000, &mut replacement),
-        None,
-        "unconsumed retirement side effects must reject exec admission"
-    );
-    let after = scheduler.contexts[slot].expect("rejected exec target remains live");
-    assert_eq!(after.address_space_root, before.address_space_root);
-    assert_eq!(after.user_abi, before.user_abi);
-    assert_eq!(after.test_ready, before.test_ready);
-    assert_eq!(after.blocked, before.blocked);
-    assert_eq!(
-        scheduler.starts[slot].expect("identity preserved").id,
-        before_start.id
-    );
-    assert!(!scheduler.retired[slot]);
-    assert!(
-        scheduler.retirement_side_effects[slot].is_some(),
-        "rejected exec must retain its unconsumed retirement token"
-    );
+#[test]
+fn exec_cannot_rebind_a_live_thread_to_its_process_identity() {
+    super::exec_transaction::quiescence::tests::legacy_witnesses::live_identity();
+    super::stack_resources::context::intent_tests::independent_exec_candidate_claim_rechecks_exact_uid_handle_pid_tid_and_mode_before_producer();
 }
 
 #[test]
 fn rejected_thread_attachment_releases_unpublished_stack() {
-    let mut scheduler = boxed_scheduler();
-    let owner = test_process(95);
-    scheduler.current_task = 1;
-    scheduler.contexts[1] = Some(test_user_context(owner));
-    process_table::mark_process_exiting(95).expect("mark exiting");
-    assert!(scheduler.reserve_user_thread_slot(951).is_none());
-    assert!(scheduler.contexts[2].is_none());
-    assert!(scheduler.stacks[2].is_none());
+    super::thread_creation::tests::rejected_attachment();
 }
 
 #[test]
 fn synchronous_ipc_donation_promotes_and_revokes_a_transitive_user_chain() {
-    let mut scheduler = boxed_scheduler();
-    let interactive = test_process(61);
-    let broker = test_process(62);
-    let policy = test_process(63);
-
-    let mut interactive_context = test_user_context(interactive);
-    interactive_context.weight = SYSTEM_CLASS_WEIGHT_FLAG | NICE_0_LOAD;
-    scheduler.contexts[1] = Some(interactive_context);
-    scheduler.contexts[2] = Some(test_user_context(broker));
-    scheduler.contexts[3] = Some(test_user_context(policy));
-    scheduler.starts[1] = Some(TaskStart {
-        entry: noop_task_entry,
-        id: 601,
-    });
-    scheduler.starts[2] = Some(TaskStart {
-        entry: noop_task_entry,
-        id: 602,
-    });
-    scheduler.starts[3] = Some(TaskStart {
-        entry: noop_task_entry,
-        id: 603,
-    });
-
-    assert_eq!(scheduler.slot_class(2), Some(SchedClass::User));
-    assert_eq!(scheduler.slot_class(3), Some(SchedClass::User));
-    assert!(scheduler.inherit_ipc_priority(10, 601, 602));
-    assert_eq!(scheduler.slot_class(2), Some(SchedClass::System));
-
-    // The broker's nested synchronous call must pass the original
-    // interactive class through to the final policy server.
-    assert!(scheduler.inherit_ipc_priority(11, 602, 603));
-    assert_eq!(scheduler.slot_class(3), Some(SchedClass::System));
-
-    // A completed outer reply immediately restores both servers to their
-    // manifest-derived class; no priority boost can leak past capability
-    // lifetime.
-    assert!(scheduler.release_ipc_priority(
-        10,
-        crate::multitask::scheduler::ipc_donation::DonationNamespace::IpcReply
-    ));
-    assert_eq!(scheduler.slot_class(2), Some(SchedClass::User));
-    assert_eq!(scheduler.slot_class(3), Some(SchedClass::User));
-    assert!(scheduler.release_ipc_priority(
-        11,
-        crate::multitask::scheduler::ipc_donation::DonationNamespace::IpcReply
-    ));
-    assert_eq!(scheduler.slot_class(3), Some(SchedClass::User));
-
-    // A process-owned endpoint without a sleeping receiver must select an
-    // exact eligible worker before installing a System-class donation.
-    // Use saved contexts created by the real allocation path: apply must
-    // reject an invalid frame, so a copied test context cannot observe the
-    // live application site below.
-    scheduler.contexts[1]
-        .as_mut()
-        .expect("released interactive context")
-        .weight = NICE_0_LOAD;
-    let base = crate::memory::paging::USER_SPACE_BASE;
-    let user_cs = crate::arch::gdt::user_code_selector().0 as u64;
-    let user_ss = crate::arch::gdt::user_data_selector().0 as u64;
-    let allocate = |scheduler: &mut Scheduler, task_id, offset| {
-        scheduler
-            .allocate_user_slot(
-                task_id,
-                ProcessAddressSpace::empty_for_tests(),
-                UserTaskBootstrap::new(
-                    UserAbi::Linux,
-                    x86_64::VirtAddr::new(base + offset),
-                    x86_64::VirtAddr::new(base + offset + 0x1_000),
-                ),
-                None,
-                crate::arch::pit::divisor_from_micros(100),
-                user_cs,
-                user_ss,
-                super::RFLAGS_RESERVED_BIT_1,
-                false,
-                noop_task_entry,
-            )
-            .expect("donation task")
-    };
-    let caller = allocate(&mut scheduler, 604, 0x10_000);
-    let target = allocate(&mut scheduler, 605, 0x14_000);
-    scheduler.current_task = caller;
-    scheduler.contexts[caller]
-        .as_mut()
-        .expect("interactive caller context")
-        .weight = SYSTEM_CLASS_WEIGHT_FLAG | NICE_0_LOAD;
-    scheduler.contexts[caller]
-        .as_mut()
-        .expect("interactive caller context")
-        .vruntime_ns = 10_000_000;
-    scheduler.contexts[target]
-        .as_mut()
-        .expect("target worker context")
-        .vruntime_ns = 50_000_000;
-
-    assert_eq!(scheduler.slot_class(caller), Some(SchedClass::System));
-    assert_eq!(scheduler.slot_class(target), Some(SchedClass::User));
-    assert!(scheduler.reserve_ipc_priority(604));
-    let selected = scheduler
-        .bind_ipc_priority_to_process_worker(12, 604, 605)
-        .expect("eligible process worker");
-    assert_eq!(selected, 605);
-    assert_eq!(scheduler.slot_class(target), Some(SchedClass::System));
-    assert_eq!(
-        scheduler.contexts[target]
-            .expect("donated broker context")
-            .vruntime_ns,
-        8_000_000,
-        "the exact reply/worker bind must immediately donate dispatch vruntime"
-    );
-    assert!(
-        scheduler.handoff_slot_ready(target),
-        "the exact bound worker must remain dispatch-eligible"
-    );
-    assert_eq!(
-        scheduler.take_next_synchronous_pick_hint_ready_slot(),
-        Some(target)
-    );
-    assert_eq!(scheduler.synchronous_handoff_len_for_tests(), 0);
-    assert!(scheduler.release_ipc_priority(
-        12,
-        crate::multitask::scheduler::ipc_donation::DonationNamespace::IpcReply
-    ));
-    assert_eq!(scheduler.slot_class(target), Some(SchedClass::User));
-    assert!(
-        scheduler.handoff_slot_ready(target),
-        "reply revocation must restore the worker's manifest-derived class without revoking its runnable state"
-    );
-    scheduler.contexts[1]
-        .as_mut()
-        .expect("interactive caller context")
-        .weight = SYSTEM_CLASS_WEIGHT_FLAG | NICE_0_LOAD;
-
-    // If the server is executing between receive calls, the reservation
-    // follows the reply until that exact worker dequeues the request.
-    scheduler.contexts[2].as_mut().unwrap().test_ready = false;
-    assert!(scheduler.reserve_ipc_priority(601));
-    assert!(
-        scheduler
-            .bind_ipc_priority_to_process_worker(13, 601, 62)
-            .is_none()
-    );
-    assert!(scheduler.attach_reserved_ipc_priority(
-        13,
-        crate::multitask::scheduler::ipc_donation::DonationNamespace::IpcReply,
-        601
-    ));
-    assert!(
-        scheduler
-            .ipc_priority_donations
-            .iter()
-            .flatten()
-            .any(|entry| {
-                entry.reply == 13 && matches!(entry.target, IpcDonationTarget::AwaitingReceiver)
-            })
-    );
-    assert_eq!(scheduler.slot_class(2), Some(SchedClass::User));
-    assert!(scheduler.release_ipc_priority(
-        13,
-        crate::multitask::scheduler::ipc_donation::DonationNamespace::IpcReply
-    ));
-    assert_eq!(scheduler.slot_class(2), Some(SchedClass::User));
-
-    assert!(scheduler.reserve_ipc_priority(601));
-    assert!(scheduler.attach_reserved_ipc_priority(
-        14,
-        crate::multitask::scheduler::ipc_donation::DonationNamespace::IpcReply,
-        601
-    ));
-    assert!(scheduler.inherit_ipc_priority(14, 601, 602));
-    assert_eq!(scheduler.slot_class(2), Some(SchedClass::System));
-    assert!(scheduler.release_ipc_priority(
-        14,
-        crate::multitask::scheduler::ipc_donation::DonationNamespace::IpcReply
-    ));
-    assert_eq!(scheduler.slot_class(2), Some(SchedClass::User));
+    super::dispatcher::fifo_witnesses::synchronous_fifo();
+    super::ordering_publication::tests::actual_original_ordering_preserves_spawn_fifo_and_current_floor_without_funding_transfer();
+    super::donation_publication::tests::legacy_witnesses::transitive();
 }
 
 #[test]
 fn scheduler_block_arm_is_exact_race_safe_and_terminally_revoked() {
-    let mut scheduler = boxed_scheduler();
-    let base = crate::memory::paging::USER_SPACE_BASE;
-    let user_cs = crate::arch::gdt::user_code_selector().0 as u64;
-    let user_ss = crate::arch::gdt::user_data_selector().0 as u64;
-
-    // Root, retired, and start-suspended are independent terminal gates.
-    // Populate a normally armable root-shaped context so the root gate is
-    // the only reason this attempt is rejected.
-    scheduler.contexts[super::ROOT_TASK_SLOT] = Some(test_user_context(test_process(689)));
-    scheduler.starts[super::ROOT_TASK_SLOT] = Some(TaskStart {
-        entry: noop_task_entry,
-        id: 689,
-    });
-    scheduler.current_task = super::ROOT_TASK_SLOT;
-    let root_before = terminal_rejection_snapshot(&scheduler, super::ROOT_TASK_SLOT);
-    assert!(!scheduler.arm_block_current_task());
-    assert_eq!(
-        terminal_rejection_snapshot(&scheduler, super::ROOT_TASK_SLOT),
-        root_before,
-        "root preflight rejection must not change task or execution ownership"
-    );
-
-    let slot = scheduler
-        .allocate_user_slot(
-            690,
-            ProcessAddressSpace::empty_for_tests(),
-            UserTaskBootstrap::new(
-                UserAbi::Linux,
-                x86_64::VirtAddr::new(base + 0x2_000),
-                x86_64::VirtAddr::new(base + 0x4_000),
-            ),
-            None,
-            crate::arch::pit::divisor_from_micros(100),
-            user_cs,
-            user_ss,
-            super::RFLAGS_RESERVED_BIT_1,
-            false,
-            noop_task_entry,
-        )
-        .expect("user slot");
-    scheduler.current_task = slot;
-    scheduler.contexts[slot]
-        .as_mut()
-        .expect("dispatched context")
-        .test_ready = false;
-
-    assert!(scheduler.arm_block_current_task());
-    assert!(scheduler.contexts[slot].expect("context").wake_armed);
-    assert!(scheduler.wake_task(690));
-    assert!(!scheduler.contexts[slot].expect("context").wake_armed);
-    assert_eq!(scheduler.commit_block_current_task(), Some(false));
-    assert!(!scheduler.contexts[slot].expect("context").test_ready);
-
-    assert!(scheduler.arm_block_current_task());
-    assert_eq!(scheduler.commit_block_current_task(), Some(true));
-    let blocked = scheduler.contexts[slot].expect("context");
-    assert!(blocked.blocked);
-    assert!(!blocked.test_ready);
-    assert!(!scheduler.arm_block_current_task());
-    assert!(!scheduler.cancel_block_current_task());
-
-    scheduler.current_task = super::ROOT_TASK_SLOT;
-    assert!(scheduler.wake_task(690));
-    assert!(scheduler.contexts[slot].expect("context").test_ready);
-    scheduler.contexts[slot]
-        .as_mut()
-        .expect("redispatched context")
-        .test_ready = false;
-    scheduler.current_task = slot;
-    assert!(scheduler.arm_block_current_task());
-    scheduler.retire_slot(slot, super::TaskRetireReason::Exited);
-    let retired = scheduler.contexts[slot].expect("retired context");
-    assert!(scheduler.retired[slot]);
-    assert!(!retired.wake_armed);
-    assert!(!scheduler.start_suspended[slot]);
-    let retired_before = terminal_rejection_snapshot(&scheduler, slot);
-    assert!(!scheduler.arm_block_current_task());
-    assert_eq!(
-        terminal_rejection_snapshot(&scheduler, slot),
-        retired_before,
-        "retired-only block rejection must preserve lifecycle and run ownership"
-    );
-
-    scheduler.current_task = super::ROOT_TASK_SLOT;
-    let retired_wake_before = terminal_rejection_snapshot(&scheduler, slot);
-    assert!(!scheduler.wake_task(690));
-    assert_eq!(
-        terminal_rejection_snapshot(&scheduler, slot),
-        retired_wake_before,
-        "retired-only wake rejection must preserve lifecycle and run ownership"
-    );
-
-    // `start_suspended` is a separate preflight bit. Keep this context
-    // otherwise armable so the suspended gate itself is required for both
-    // rejection paths rather than being masked by `blocked` state.
-    let suspended_slot = scheduler
-        .allocate_user_slot(
-            691,
-            ProcessAddressSpace::empty_for_tests(),
-            UserTaskBootstrap::new(
-                UserAbi::Linux,
-                x86_64::VirtAddr::new(base + 0x6_000),
-                x86_64::VirtAddr::new(base + 0x8_000),
-            ),
-            None,
-            crate::arch::pit::divisor_from_micros(100),
-            user_cs,
-            user_ss,
-            super::RFLAGS_RESERVED_BIT_1,
-            false,
-            noop_task_entry,
-        )
-        .expect("suspended user slot");
-    scheduler.start_suspended[suspended_slot] = true;
-    assert!(!scheduler.retired[suspended_slot]);
-    scheduler.current_task = suspended_slot;
-    let suspended_before = terminal_rejection_snapshot(&scheduler, suspended_slot);
-    assert!(!scheduler.arm_block_current_task());
-    assert_eq!(
-        terminal_rejection_snapshot(&scheduler, suspended_slot),
-        suspended_before,
-        "suspended-only block rejection must preserve lifecycle and run ownership"
-    );
-
-    scheduler.current_task = super::ROOT_TASK_SLOT;
-    let suspended_wake_before = terminal_rejection_snapshot(&scheduler, suspended_slot);
-    assert!(!scheduler.wake_task(691));
-    assert_eq!(
-        terminal_rejection_snapshot(&scheduler, suspended_slot),
-        suspended_wake_before,
-        "suspended-only wake rejection must preserve lifecycle and run ownership"
-    );
+    super::current_wait::tests::legacy_witnesses::race_and_typed_cancel();
+    super::current_wait::tests::legacy_witnesses::independent_terminal_gates();
 }

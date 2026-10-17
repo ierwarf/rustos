@@ -11,10 +11,14 @@ schema = "rustos-tla-mutation-corpus-v1"
 
 required_models = [
     "acceptance-profile-publication/AcceptanceProfilePublication",
+    "affinity-claim-admission/AffinityClaimAdmission",
     "atomic-process-activation-batch/AtomicProcessActivationBatch",
+    "bootstrap-activation-handoff/BootstrapActivationHandoff",
     "capability-derivation-lifecycle/CapabilityDerivationLifecycle",
     "clocksource-deadline/ClocksourceDeadline",
+    "cold-exec-intent/ColdExecIntent",
     "cow-frame-lifecycle/CowFrameLifecycle",
+    "cpu-dispatch-preemption/CpuDispatchPreemption",
     "cpu-online-lifecycle/CpuOnlineLifecycle",
     "cross-cpu-task-retirement/CrossCpuTaskRetirement",
     "dvm-block-startup/DvmBlockStartup",
@@ -23,13 +27,17 @@ required_models = [
     "dvm-transport-lifecycle/DvmTransportLifecycle",
     "exception-retirement-lifecycle/ExceptionRetirementLifecycle",
     "exec-address-space-transaction/ExecAddressSpaceTransaction",
+    "frame-reader-claim/FrameReaderClaim",
     "gpu-submit-transaction/GpuSubmitTransaction",
     "input-ingestion-worker/InputIngestionWorker",
+    "ipc-fast-handoff/IpcFastHandoff",
     "ipc-priority-inheritance/IpcPriorityInheritance",
     "ipc-priority-queue/IpcPriorityQueue",
     "ipc-reply-deadline/IpcReplyDeadline",
     "ipc-reply-recv-transaction/IpcReplyRecvTransaction",
     "ipc-transfer-authority/IpcTransferAuthority",
+    "lifecycle-execution-claim/LifecycleExecutionClaim",
+    "mm-activation-close/MmActivationClose",
     "msi-vector-lifecycle/MsiVectorLifecycle",
     "netd-deferred-reply/NetdDeferredReply",
     "page-cache-lifecycle/PageCacheLifecycle",
@@ -45,12 +53,15 @@ required_models = [
     "scheduler-active-balance/SchedulerActiveBalance",
     "scheduler-cpu-distribution/SchedulerCpuDistribution",
     "scheduler-cpu-ownership/SchedulerCpuOwnership",
+    "scheduler-local-authority/SchedulerLocalAuthority",
     "scheduler-thread-demotion/SchedulerThreadDemotion",
     "scheduler-wakeup/SchedulerWakeup",
+    "sigchld-notification/SigchldNotification",
     "smp-reschedule-ipi/SmpRescheduleIpi",
     "smp-ring3-qualification/SmpRing3Qualification",
     "synchronous-ipc-handoff-concurrency/SynchronousIpcHandoffConcurrency",
     "synchronous-ipc-handoff/SynchronousIpcHandoff",
+    "task-retirement-cleanup-owner/TaskRetirementCleanupOwner",
     "tlb-shootdown-lifecycle/TlbShootdownLifecycle",
     "user-stack-growth/UserStackGrowth",
     "userspace-wait-set/UserspaceWaitSet",
@@ -135,6 +146,41 @@ invariant = "TargetIdentityReplacementCannotActivate"
 min_counterexample_states = 2
 
 [[mutation]]
+id = "affinity-claim-process-mask-bypass"
+kind = "transition-effect"
+severity = "critical"
+model = "affinity-claim-admission/AffinityClaimAdmission"
+flow = "scheduler-dispatch"
+find = '''Eligible == taskAllows /\ processAllows /\ binding = uid'''
+replace = '''Eligible == taskAllows /\ TRUE /\ binding = uid'''
+occurrence = 1
+invariant = "ClaimHasCurrentAffinity"
+min_counterexample_states = 4
+
+[[mutation]]
+id = "affinity-claim-reset-before-drain"
+kind = "transition-effect"
+severity = "critical"
+model = "affinity-claim-admission/AffinityClaimAdmission"
+flow = "scheduler-dispatch"
+find = '''Reset == /\ leaf = "Writer" /\ refs = 0 /\ phase = "Retired"'''
+replace = '''Reset == /\ leaf = "Writer" /\ phase = "Retired"'''
+occurrence = 1
+invariant = "ResetWaitsExecution"
+min_counterexample_states = 4
+[[mutation]]
+id = "affinity-claim-task-mask-bypass"
+kind = "transition-effect"
+severity = "critical"
+model = "affinity-claim-admission/AffinityClaimAdmission"
+flow = "scheduler-dispatch"
+find = '''Eligible == taskAllows /\ processAllows /\ binding = uid'''
+replace = '''Eligible == TRUE /\ processAllows /\ binding = uid'''
+occurrence = 1
+invariant = "ClaimHasCurrentAffinity"
+min_counterexample_states = 4
+
+[[mutation]]
 id = "capability-derivation-lease-drift"
 kind = "transition-guard-removal"
 severity = "critical"
@@ -187,6 +233,53 @@ replace = "    /\\ TRUE"
 occurrence = 1
 invariant = "RawTscRequiresUniprocessorTopology"
 min_counterexample_states = 2
+
+[[mutation]]
+id = "cold-exec-intent-release-before-writer"
+kind = "transition-effect"
+severity = "critical"
+model = "cold-exec-intent/ColdExecIntent"
+flow = "scheduler-dispatch"
+find = '''/\ phase = "Published" /\ finalized /\ ~writer'''
+replace = '''/\ phase = "Published" /\ finalized'''
+occurrence = 1
+invariant = "ReceiptBeforeReopen"
+min_counterexample_states = 6
+
+[[mutation]]
+id = "cold-exec-intent-reset-owned-slot"
+kind = "transition-effect"
+severity = "critical"
+model = "cold-exec-intent/ColdExecIntent"
+flow = "scheduler-dispatch"
+find = '''Reset == /\ phase = "Idle" /\ ~reserved /\ ~oldGrant /\ uid = 1'''
+replace = '''Reset == /\ TRUE /\ ~oldGrant /\ uid = 1'''
+occurrence = 1
+invariant = "NoResetWithOwner"
+min_counterexample_states = 3
+[[mutation]]
+id = "cold-exec-intent-stale-cancel-bypass"
+kind = "transition-effect"
+severity = "critical"
+model = "cold-exec-intent/ColdExecIntent"
+flow = "scheduler-dispatch"
+find = '''IF expected = gen'''
+replace = '''IF TRUE'''
+occurrence = 1
+invariant = "StaleCommandsHaveNoEffect"
+min_counterexample_states = 6
+
+[[mutation]]
+id = "cold-exec-intent-terminal-cancel-reopens"
+kind = "transition-effect"
+severity = "critical"
+model = "cold-exec-intent/ColdExecIntent"
+flow = "scheduler-dispatch"
+find = '''/\ phase' = "Idle" /\ gate' = exiting /\ cancelled' = FALSE'''
+replace = '''/\ phase' = "Idle" /\ gate' = FALSE /\ cancelled' = FALSE'''
+occurrence = 1
+invariant = "TerminalNeverReopens"
+min_counterexample_states = 5
 
 [[mutation]]
 id = "cow-cancelled-child-alias-retained"
@@ -286,6 +379,65 @@ replace = '''    /\ perm' = [perm EXCEPT ![r] = "writable"]'''
 occurrence = 1
 invariant = "SharedMappingsStayWriteProtected"
 min_counterexample_states = 2
+
+[[mutation]]
+id = "cpu-dispatch-preemption-ack-without-incoming-rsp"
+kind = "transition-effect"
+severity = "critical"
+model = "cpu-dispatch-preemption/CpuDispatchPreemption"
+flow = "scheduler-dispatch"
+find = '''/\ phase = "AwaitingRsp" /\ phase' = "Committing" /\ incomingRsp' = TRUE'''
+replace = '''/\ phase = "AwaitingRsp" /\ phase' = "Committing" /\ incomingRsp' = FALSE'''
+occurrence = 1
+invariant = "NoReleaseBeforeIncomingRsp"
+min_counterexample_states = 8
+[[mutation]]
+id = "cpu-dispatch-preemption-completion-before-unlock"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "cpu-dispatch-preemption/CpuDispatchPreemption"
+flow = "scheduler-dispatch"
+find = '/\ phase = "Publishing" /\ ~changed /\ ~rawHeld /\ ~rawPending'
+replace = '/\ phase = "Publishing" /\ ~changed /\ TRUE /\ ~rawPending'
+occurrence = 1
+invariant = "DirectoryCannotOutliveScope"
+min_counterexample_states = 5
+
+[[mutation]]
+id = "cpu-dispatch-preemption-outgoing-if-restored"
+kind = "transition-effect"
+severity = "critical"
+model = "cpu-dispatch-preemption/CpuDispatchPreemption"
+flow = "scheduler-dispatch"
+find = '''/\ phase' = "AwaitingRsp" /\ location' = "Parked" /\ savedIF' = FALSE'''
+replace = '''/\ phase' = "AwaitingRsp" /\ location' = "Parked" /\ savedIF' = savedIF'''
+occurrence = 1
+invariant = "NoIrqAcrossProtectedDispatchOrCommit"
+min_counterexample_states = 8
+
+[[mutation]]
+id = "cpu-dispatch-priority-choice-before-original-mask"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "cpu-dispatch-preemption/CpuDispatchPreemption"
+flow = "scheduler-dispatch"
+find = '/\ phase = "Open" /\ owned /\ ~irqEnabled /\ ~rawPending /\ ~rawHeld'
+replace = '/\ phase = "Open" /\ owned /\ TRUE /\ ~rawPending /\ ~rawHeld'
+occurrence = 1
+invariant = "OriginalChoiceRetainsScope"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "cpu-dispatch-priority-release-before-current-pair"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "cpu-dispatch-preemption/CpuDispatchPreemption"
+flow = "scheduler-dispatch"
+find = '/\ phase = "Publishing" /\ owned /\ priority = "Choosing" /\ pairPublished'
+replace = '/\ phase \in {"Open", "Publishing"} /\ owned /\ priority = "Choosing"'
+occurrence = 1
+invariant = "NoChoiceReleaseBeforePair"
+min_counterexample_states = 4
 
 [[mutation]]
 id = "cpu-online-ap-cache-enable-before-mtrr-restore"
@@ -475,6 +627,54 @@ replace = '''Replace ==
 occurrence = 1
 invariant = "ReplacementRequiresAllOldExecutionStopped"
 min_counterexample_states = 3
+
+[[mutation]]
+id = "current-observation-donor-relookup"
+kind = "transition-effect"
+severity = "critical"
+model = "lifecycle-execution-claim/LifecycleExecutionClaim"
+flow = "scheduler-dispatch"
+find = '''snapshotOwner' = originalOwner'''
+replace = '''snapshotOwner' = donationOwner'''
+occurrence = 1
+invariant = "OriginalFundingObservation"
+min_counterexample_states = 8
+
+[[mutation]]
+id = "current-terminal-original-interval-borrow-omitted"
+kind = "transition-effect"
+severity = "critical"
+model = "lifecycle-execution-claim/LifecycleExecutionClaim"
+flow = "scheduler-dispatch"
+find = '''BorrowCurrent == /\ current /\ physicalCurrent /\ originalFunding /\ activeInterval'''
+replace = '''BorrowCurrent == /\ current /\ physicalCurrent'''
+occurrence = 1
+invariant = "CurrentOriginalUnits"
+min_counterexample_states = 7
+
+[[mutation]]
+id = "current-terminal-original-mm-bank-omitted"
+kind = "transition-effect"
+severity = "critical"
+model = "lifecycle-execution-claim/LifecycleExecutionClaim"
+flow = "scheduler-dispatch"
+find = '''PublishOriginalBanks == /\ Publish /\ physicalCurrent' = TRUE'''
+replace = '''PublishOriginalBanks == /\ Publish /\ physicalCurrent' = FALSE'''
+occurrence = 1
+invariant = "OriginalMmThroughRsp"
+min_counterexample_states = 5
+
+[[mutation]]
+id = "current-terminal-settle-before-last-effect"
+kind = "transition-effect"
+severity = "critical"
+model = "lifecycle-execution-claim/LifecycleExecutionClaim"
+flow = "scheduler-dispatch"
+find = '''SettleOriginal == /\ current /\ activeInterval /\ ~currentBorrow'''
+replace = '''SettleOriginal == /\ current /\ activeInterval'''
+occurrence = 1
+invariant = "LastEffectBeforeSettlement"
+min_counterexample_states = 6
 
 [[mutation]]
 id = "dvm-block-install-prefetchable-wb-gate-removed"
@@ -774,6 +974,61 @@ invariant = "NoCommitAfterRetire"
 min_counterexample_states = 3
 
 [[mutation]]
+id = "first-turn-earlier-claim-keeps-stale-promise"
+severity = "critical"
+kind = "transition-effect"
+flow = "bootstrap-activation-handoff"
+model = "bootstrap-activation-handoff/BootstrapActivationHandoff"
+find = '''DispatchPendingOverdueTurn(task) ==
+    /\ overdue
+    /\ status[task] = Pending
+    /\ status' = [status EXCEPT ![task] = Dispatched]
+    /\ queue' = SelectSeq(queue, LAMBDA candidate: candidate # task)'''
+replace = '''DispatchPendingOverdueTurn(task) ==
+    /\ overdue
+    /\ status[task] = Pending
+    /\ status' = [status EXCEPT ![task] = Dispatched]
+    /\ queue' = queue'''
+occurrence = 1
+invariant = "QueueMatchesPendingAuthority"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "frame-reader-admission-without-claim-leaf"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "frame-reader-claim/FrameReaderClaim"
+flow = "scheduler-dispatch"
+find = '''    /\ leaf = "None" /\ r \notin readers'''
+replace = '''    /\ TRUE /\ r \notin readers'''
+occurrence = 1
+invariant = "NoRunningDuringNonexecutingRead"
+min_counterexample_states = 5
+
+[[mutation]]
+id = "frame-reader-claim-generation-bypass"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "frame-reader-claim/FrameReaderClaim"
+flow = "scheduler-dispatch"
+find = '''    /\ owner = expectedOwner /\ generation = expectedGeneration'''
+replace = '''    /\ owner = expectedOwner /\ TRUE'''
+occurrence = 1
+invariant = "ExactClaimHasExclusiveBytes"
+min_counterexample_states = 6
+[[mutation]]
+id = "frame-reader-claim-reader-bypass"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "frame-reader-claim/FrameReaderClaim"
+flow = "scheduler-dispatch"
+find = '''    /\ admitted' = (readers = {} /\ ~writer /\ ~closing)'''
+replace = '''    /\ admitted' = (TRUE /\ ~writer /\ ~closing)'''
+occurrence = 1
+invariant = "NoRunningDuringNonexecutingRead"
+min_counterexample_states = 5
+
+[[mutation]]
 id = "futex-kernel-wake-forced-private"
 kind = "transition-effect"
 severity = "critical"
@@ -795,6 +1050,59 @@ find = "    /\\ nextSubmit' = checkpoint /\\ timelineAdmitted' = FALSE"
 replace = "    /\\ nextSubmit' = nextSubmit /\\ timelineAdmitted' = FALSE"
 occurrence = 1
 invariant = "RejectedSubmitRestoresExactCheckpoint"
+min_counterexample_states = 4
+
+[[mutation]]
+id = "initial-image-physical-bank-omitted"
+kind = "transition-effect"
+severity = "critical"
+model = "cpu-online-lifecycle/CpuOnlineLifecycle"
+flow = "cpu-online-lifecycle"
+find = "    /\\ physicalCurrent' = [physicalCurrent EXCEPT ![cpu] = TRUE]"
+replace = "    /\\ physicalCurrent' = [physicalCurrent EXCEPT ![cpu] = FALSE]"
+occurrence = 1
+invariant = "InitialBanksPrecedeLogicalCurrent"
+min_counterexample_states = 4
+
+[[mutation]]
+id = "initial-image-producer-release-before-banks"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "cpu-online-lifecycle/CpuOnlineLifecycle"
+flow = "cpu-online-lifecycle"
+find = '''ReleaseInitialProducer(cpu) ==
+    /\ initialPhase[cpu] = 8 /\ initialProducer[cpu]
+    /\ physicalCurrent[cpu] /\ uidCurrent[cpu]'''
+replace = '''ReleaseInitialProducer(cpu) ==
+    /\ initialPhase[cpu] = 3 /\ initialProducer[cpu]
+    /\ TRUE'''
+occurrence = 1
+invariant = "OriginalProducerOverlapsBanks"
+min_counterexample_states = 4
+
+[[mutation]]
+id = "initial-image-ready-before-every-cpu"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "cpu-online-lifecycle/CpuOnlineLifecycle"
+flow = "cpu-online-lifecycle"
+find = '''    /\ \A cpu \in Cpus : state[cpu] = OnlineParked /\ initialPhase[cpu] = 8
+                          /\ ~initialProducer[cpu]'''
+replace = '''    /\ TRUE'''
+occurrence = 1
+invariant = "ReadyImageIncludesEveryCpuAndBspArchitecture"
+min_counterexample_states = 4
+
+[[mutation]]
+id = "initial-image-running-foreign-cpu"
+kind = "transition-effect"
+severity = "critical"
+model = "cpu-online-lifecycle/CpuOnlineLifecycle"
+flow = "cpu-online-lifecycle"
+find = "    /\\ initialOwner' = [initialOwner EXCEPT ![cpu] = cpu]"
+replace = "    /\\ initialOwner' = [initialOwner EXCEPT ![cpu] = InitialNoCpu]"
+occurrence = 1
+invariant = "InitialRunningIsCpuExact"
 min_counterexample_states = 4
 
 [[mutation]]
@@ -831,6 +1139,66 @@ replace = '''           sleepBudget == AuthorityRetryBackoff
 occurrence = 1
 invariant = "TypeOK"
 min_counterexample_states = 7
+
+[[mutation]]
+id = "ipc-cold-fresh-sender-arm"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "ipc-fast-handoff/IpcFastHandoff"
+flow = "scheduler-dispatch"
+find = "/\\ ~cold /\\ sender = SenderRunning /\\ ~wakeWon"
+replace = "/\\ sender = SenderRunning /\\ ~wakeWon"
+occurrence = 1
+invariant = "ColdNeverCommitsSender"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "ipc-cold-loans-drop-before-reader-fifo"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "ipc-fast-handoff/IpcFastHandoff"
+flow = "scheduler-dispatch"
+find = "/\\ cold /\\ joined /\\ loans /\\ pending /\\ ~reader /\\ ~coldFinished"
+replace = "/\\ cold /\\ joined /\\ loans /\\ pending /\\ ~coldFinished"
+occurrence = 1
+invariant = "ColdFinishAfterOriginalEffect"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "ipc-original-bounded-custody-omitted"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "ipc-fast-handoff/IpcFastHandoff"
+flow = "scheduler-dispatch"
+find = "/\\ loans /\\ reader /\\ pending /\\ capacity"
+replace = "/\\ loans /\\ reader /\\ pending"
+occurrence = 1
+invariant = "OriginalJoinRequiresBoundedCustody"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "ipc-original-loans-drop-before-sender-commit"
+kind = "transition-order"
+severity = "critical"
+model = "ipc-fast-handoff/IpcFastHandoff"
+flow = "scheduler-dispatch"
+find = "/\\ senderCommitted /\\ loans /\\ ~reader"
+replace = "/\\ joined /\\ loans /\\ ~reader"
+occurrence = 1
+invariant = "OriginalLoansUntilFinalEffect"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "ipc-original-sender-wake-won-overwritten"
+kind = "transition-effect"
+severity = "critical"
+model = "ipc-fast-handoff/IpcFastHandoff"
+flow = "scheduler-dispatch"
+find = "sender' = IF wakeWon THEN SenderRunning ELSE SenderBlockedReply"
+replace = "sender' = SenderBlockedReply"
+occurrence = 1
+invariant = "WakeWonNeverOverwritten"
+min_counterexample_states = 2
 
 [[mutation]]
 id = "ipc-priority-capacity-admission-removed"
@@ -1092,6 +1460,185 @@ invariant = "AcceptedBytesOwnTheFrontier"
 min_counterexample_states = 2
 
 [[mutation]]
+id = "job-control-original-recipient-omitted"
+kind = "transition-effect"
+severity = "critical"
+model = "sigchld-notification/SigchldNotification"
+flow = "process-signal-lifecycle"
+find = """    /\\ jobRecipient' = TRUE"""
+replace = """    /\\ jobRecipient' = FALSE"""
+occurrence = 1
+invariant = "OriginalJobUnitsThroughLastEffect"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "job-control-partial-admission-open"
+kind = "transition-effect"
+severity = "critical"
+model = "sigchld-notification/SigchldNotification"
+flow = "process-signal-lifecycle"
+find = """    /\\ jobOpen' = FALSE"""
+replace = """    /\\ jobOpen' = TRUE"""
+occurrence = 1
+invariant = "NoPartialJobAdmission"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "job-control-partial-gates-as-complete"
+kind = "transition-effect"
+severity = "critical"
+model = "sigchld-notification/SigchldNotification"
+flow = "process-signal-lifecycle"
+find = """    /\\ jobUpdated' = jobUpdated \\cup {m}"""
+replace = """    /\\ jobUpdated' = JobMembers"""
+occurrence = 1
+invariant = "AllJobGatesBeforeRelease"
+min_counterexample_states = 5
+
+[[mutation]]
+id = "joint-claim-class-publication-unlocked"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "frame-reader-claim/FrameReaderClaim"
+flow = "scheduler-dispatch"
+find = '''    /\ leaf = "None" /\ classEpoch < MaxGeneration'''
+replace = '''    /\ TRUE /\ classEpoch < MaxGeneration'''
+occurrence = 1
+invariant = "ExactJointAdmissionAtCAS"
+min_counterexample_states = 5
+
+[[mutation]]
+id = "joint-claim-context-close-unlocked"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "frame-reader-claim/FrameReaderClaim"
+flow = "scheduler-dispatch"
+find = '''    /\ leaf = "None" /\ ~fundingClosed /\ fundingClosed' = TRUE'''
+replace = '''    /\ TRUE /\ ~fundingClosed /\ fundingClosed' = TRUE'''
+occurrence = 1
+invariant = "ExactJointAdmissionAtCAS"
+min_counterexample_states = 5
+
+[[mutation]]
+id = "joint-claim-context-debit-unlocked"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "frame-reader-claim/FrameReaderClaim"
+flow = "scheduler-dispatch"
+find = '''    /\ leaf = "None" /\ contextCredit /\ contextCredit' = FALSE'''
+replace = '''    /\ TRUE /\ contextCredit /\ contextCredit' = FALSE'''
+occurrence = 1
+invariant = "ExactJointAdmissionAtCAS"
+min_counterexample_states = 5
+
+[[mutation]]
+id = "joint-claim-domain-debit-unlocked"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "frame-reader-claim/FrameReaderClaim"
+flow = "scheduler-dispatch"
+find = '''    /\ leaf = "None" /\ domainCredit /\ domainCredit' = FALSE'''
+replace = '''    /\ TRUE /\ domainCredit /\ domainCredit' = FALSE'''
+occurrence = 1
+invariant = "ExactJointAdmissionAtCAS"
+min_counterexample_states = 5
+
+[[mutation]]
+id = "joint-claim-original-selection-replaced"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "frame-reader-claim/FrameReaderClaim"
+flow = "scheduler-dispatch"
+find = '''classEpoch = selectedClassEpoch /\ contextCredit'''
+replace = '''TRUE /\ contextCredit'''
+occurrence = 1
+invariant = "ExactJointAdmissionAtCAS"
+min_counterexample_states = 5
+
+[[mutation]]
+id = "lifecycle-execution-claim-ignores-stop"
+kind = "transition-effect"
+severity = "critical"
+model = "lifecycle-execution-claim/LifecycleExecutionClaim"
+flow = "scheduler-dispatch"
+find = '''Capture == /\ phase = "Local" /\ visible /\ ~stopped'''
+replace = '''Capture == /\ phase = "Local" /\ visible'''
+occurrence = 1
+invariant = "ClaimIntentSerialized"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "lifecycle-execution-release-before-ack"
+kind = "transition-effect"
+severity = "critical"
+model = "lifecycle-execution-claim/LifecycleExecutionClaim"
+flow = "scheduler-dispatch"
+find = '''/\ phase' = "AwaitingRsp" /\ current' = FALSE /\ outgoing' = TRUE'''
+replace = '''/\ phase' = "AwaitingRsp" /\ current' = FALSE /\ outgoing' = FALSE'''
+occurrence = 1
+invariant = "BankConservation"
+min_counterexample_states = 6
+[[mutation]]
+id = "lifecycle-execution-reset-before-drain"
+kind = "transition-effect"
+severity = "critical"
+model = "lifecycle-execution-claim/LifecycleExecutionClaim"
+flow = "scheduler-dispatch"
+find = '''Reset == /\ ~writer /\ Refs = 0'''
+replace = '''Reset == /\ ~writer'''
+occurrence = 1
+invariant = "IdentityResetDrained"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "mm-activation-close-local-bypass"
+kind = "transition-effect"
+severity = "critical"
+model = "mm-activation-close/MmActivationClose"
+flow = "scheduler-dispatch"
+find = '''    /\ ~closed /\ ~grant /\ ~remoteGrant /\ closed' = TRUE'''
+replace = '''    /\ ~closed /\ TRUE /\ ~remoteGrant /\ closed' = TRUE'''
+occurrence = 1
+invariant = "CloseExcludesAllGrants"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "mm-activation-close-remote-bypass"
+kind = "transition-effect"
+severity = "critical"
+model = "mm-activation-close/MmActivationClose"
+flow = "scheduler-dispatch"
+find = '''    /\ ~closed /\ ~grant /\ ~remoteGrant /\ closed' = TRUE'''
+replace = '''    /\ ~closed /\ ~grant /\ TRUE /\ closed' = TRUE'''
+occurrence = 1
+invariant = "CloseExcludesAllGrants"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "mm-activation-release-before-rsp"
+kind = "transition-effect"
+severity = "critical"
+model = "mm-activation-close/MmActivationClose"
+flow = "scheduler-dispatch"
+find = '''    /\ phase = "Publishing" /\ phase' = "AwaitingRsp" /\ grant' = grant'''
+replace = '''    /\ phase = "Publishing" /\ phase' = "AwaitingRsp" /\ grant' = FALSE'''
+occurrence = 1
+invariant = "CpuPhasesRetainGrant"
+min_counterexample_states = 4
+
+[[mutation]]
+id = "mm-activation-return-generation-bypass"
+kind = "transition-effect"
+severity = "critical"
+model = "mm-activation-close/MmActivationClose"
+flow = "scheduler-dispatch"
+find = '''    /\ phase = "Architecture" /\ snapshot = gen /\ ~closed'''
+replace = '''    /\ phase = "Architecture" /\ TRUE /\ ~closed'''
+occurrence = 1
+invariant = "PublicationHasExactCurrency"
+min_counterexample_states = 4
+
+[[mutation]]
 id = "msi-committed-rollback-handler-retained"
 kind = "transition-revocation"
 severity = "critical"
@@ -1193,6 +1740,44 @@ replace = '''    /\ interruptedLockHeld' = lockHeld
 occurrence = 1
 invariant = "NmiTakesNoTrackedLock"
 min_counterexample_states = 2
+
+[[mutation]]
+id = "ordering-consume-stale-hint-uid"
+severity = "critical"
+kind = "transition-guard-removal"
+flow = "bootstrap-activation-handoff"
+model = "bootstrap-activation-handoff/BootstrapActivationHandoff"
+find = '''/\ hintUid # 0 /\ hintUid = targetUid'''
+replace = '''/\ hintUid # 0 /\ TRUE'''
+occurrence = 1
+invariant = "HintConsumeExactUID"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "ordering-original-pin-missing-at-capture"
+severity = "critical"
+kind = "transition-guard-removal"
+flow = "bootstrap-activation-handoff"
+model = "bootstrap-activation-handoff/BootstrapActivationHandoff"
+find = '''/\ capturedUid' = targetUid /\ hintPin' = TRUE'''
+replace = '''/\ capturedUid' = targetUid /\ hintPin' = FALSE'''
+occurrence = 1
+invariant = "HintPublishRequiresOriginal"
+min_counterexample_states = 2
+
+
+[[mutation]]
+id = "ordering-target-reuse-before-original-drop"
+severity = "critical"
+kind = "transition-guard-removal"
+flow = "bootstrap-activation-handoff"
+model = "bootstrap-activation-handoff/BootstrapActivationHandoff"
+find = '''/\ ~hintPin /\ targetUid = 1'''
+replace = '''/\ TRUE /\ targetUid = 1'''
+occurrence = 1
+invariant = "OriginalOrderingTarget"
+min_counterexample_states = 2
+
 
 [[mutation]]
 id = "page-cache-cow-dirties-shared-source"
@@ -1711,6 +2296,46 @@ invariant = "ApOnlineRequiresProgrammedDeadline"
 min_counterexample_states = 2
 
 [[mutation]]
+id = "process-lifecycle-group-resume-loses-effects"
+kind = "transition-effect"
+severity = "critical"
+model = "process-lifecycle-transaction/ProcessLifecycleTransaction"
+flow = "process-lifecycle-transaction"
+find = '''GroupResume ==
+    /\ phase = Exiting
+    /\ groupPhase = "suspended"
+    /\ groupPhase' = "claimed"
+    /\ UNCHANGED <<lifecycleVars, groupPin, groupCensus, groupGeneration, groupEffects>>'''
+replace = '''GroupResume ==
+    /\ phase = Exiting
+    /\ groupPhase = "suspended"
+    /\ groupPhase' = "claimed"
+    /\ groupEffects' = FALSE
+    /\ UNCHANGED <<lifecycleVars, groupPin, groupCensus, groupGeneration>>'''
+occurrence = 1
+invariant = "SuspendedGroupEffectsRetained"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "process-lifecycle-group-suspension-loses-original-pin"
+kind = "transition-effect"
+severity = "critical"
+model = "process-lifecycle-transaction/ProcessLifecycleTransaction"
+flow = "process-lifecycle-transaction"
+find = '''GroupSuspend ==
+    /\ groupPhase = "claimed"
+    /\ groupPhase' = "suspended"
+    /\ UNCHANGED <<lifecycleVars, groupPin, groupCensus, groupGeneration, groupEffects>>'''
+replace = '''GroupSuspend ==
+    /\ groupPhase = "claimed"
+    /\ groupPhase' = "suspended"
+    /\ groupPin' = FALSE
+    /\ UNCHANGED <<lifecycleVars, groupCensus, groupGeneration, groupEffects>>'''
+occurrence = 1
+invariant = "OriginalGroupCensusRetained"
+min_counterexample_states = 3
+
+[[mutation]]
 id = "process-lifecycle-partial-frame-rollback-dropped"
 kind = "transition-effect"
 severity = "critical"
@@ -1786,6 +2411,461 @@ invariant = "PresentedHasCompleteAuthorityChain"
 min_counterexample_states = 2
 
 [[mutation]]
+id = "return-cycle-blocked-header-stale"
+kind = "transition-effect"
+severity = "critical"
+model = "lifecycle-execution-claim/LifecycleExecutionClaim"
+flow = "scheduler-dispatch"
+find = '''!.blockedHeader = IF c.turn = 1 THEN 2 ELSE @'''
+replace = '''!.blockedHeader = @'''
+occurrence = 1
+invariant = "CycleBlockedHeader"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "return-cycle-donor-metadata-relookup"
+kind = "transition-effect"
+severity = "critical"
+model = "lifecycle-execution-claim/LifecycleExecutionClaim"
+flow = "scheduler-dispatch"
+find = '''!.badCharge = (@ \/ c.funder # CycleAccountOwner)'''
+replace = '''!.badCharge = (@ \/ c.metadata # CycleAccountOwner)'''
+occurrence = 1
+invariant = "CycleOriginalFunding"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "return-cycle-kernel-process-activation"
+kind = "transition-effect"
+severity = "critical"
+model = "lifecycle-execution-claim/LifecycleExecutionClaim"
+flow = "scheduler-dispatch"
+find = '''!.activation = (c.to # 0)'''
+replace = '''!.activation = TRUE'''
+occurrence = 1
+invariant = "CycleOriginalEffects"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "return-cycle-ready-before-last-effect"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "lifecycle-execution-claim/LifecycleExecutionClaim"
+flow = "scheduler-dispatch"
+find = '''CReady == /\ c.phase = "Installing" /\ c.effects = 5'''
+replace = '''CReady == /\ c.phase = "Installing" /\ c.effects <= 5'''
+occurrence = 1
+invariant = "CycleOriginalEffects"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "return-foreign-census-before-rsp"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "lifecycle-execution-claim/LifecycleExecutionClaim"
+flow = "scheduler-dispatch"
+find = '''FDetach == /\ f.phase = "KernelCurrent" /\ f.census /\ f.stopped
+           /\ f.current # 2 /\ f.outgoing # 2 /\ f.uidCurrent # 2 /\ f.uidOutgoing # 2 /\ ~f.peerPin'''
+replace = '''FDetach == /\ f.phase \in {"LeavingAwait", "KernelCurrent"} /\ f.census /\ f.stopped'''
+occurrence = 1
+invariant = "ForeignCensusDrain"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "return-foreign-class-leaf-through-cas"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "lifecycle-execution-claim/LifecycleExecutionClaim"
+flow = "scheduler-dispatch"
+find = '''FClassPublish == /\ f.phase = "Remote" /\ ~f.claimLeaf /\ f.classEpoch = 0'''
+replace = '''FClassPublish == /\ f.phase = "Remote" /\ TRUE /\ f.classEpoch = 0'''
+occurrence = 1
+invariant = "ForeignSelectionJoin"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "return-foreign-constructor-affinity-before-uid"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "lifecycle-execution-claim/LifecycleExecutionClaim"
+flow = "scheduler-dispatch"
+find = '''FBirthAffinity == /\ f.phase = "BirthReserved" /\ f.birthTicket /\ f.birthAffinity = 0
+                  /\ f.birthIdentity = 3'''
+replace = '''FBirthAffinity == /\ f.phase = "BirthReserved" /\ f.birthTicket /\ f.birthAffinity = 0
+                  /\ TRUE'''
+occurrence = 1
+invariant = "ForeignConstructorPublication"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "return-foreign-constructor-blocked-before-affinity"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "lifecycle-execution-claim/LifecycleExecutionClaim"
+flow = "scheduler-dispatch"
+find = '''/\ f.birthIdentity = 3 /\ f.birthAffinity = 3'''
+replace = '''/\ f.birthIdentity = 3 /\ TRUE'''
+occurrence = 1
+invariant = "ForeignConstructorPublication"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "return-foreign-final-class-stamp"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "lifecycle-execution-claim/LifecycleExecutionClaim"
+flow = "scheduler-dispatch"
+find = '''/\ f.classEpoch = f.observedClass /\ f.queueGeneration = f.observedGeneration'''
+replace = '''/\ TRUE /\ f.queueGeneration = f.observedGeneration'''
+occurrence = 1
+invariant = "ForeignSelectionJoin"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "return-foreign-final-context-credit"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "lifecycle-execution-claim/LifecycleExecutionClaim"
+flow = "scheduler-dispatch"
+find = '''/\ f.contextCredit /\ f.domainCredit /\ f.originalContext = 2'''
+replace = '''/\ TRUE /\ f.domainCredit /\ f.originalContext = 2'''
+occurrence = 1
+invariant = "ForeignSelectionJoin"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "return-foreign-final-domain-credit"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "lifecycle-execution-claim/LifecycleExecutionClaim"
+flow = "scheduler-dispatch"
+find = '''/\ f.contextCredit /\ f.domainCredit /\ f.originalContext = 2'''
+replace = '''/\ f.contextCredit /\ TRUE /\ f.originalContext = 2'''
+occurrence = 1
+invariant = "ForeignSelectionJoin"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "return-foreign-final-lifecycle-stop"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "lifecycle-execution-claim/LifecycleExecutionClaim"
+flow = "scheduler-dispatch"
+find = '''FAdmission == f.selectPin /\ ~f.reader /\ f.fundingGrant /\ ~f.stopped'''
+replace = '''FAdmission == f.selectPin /\ ~f.reader /\ f.fundingGrant /\ TRUE'''
+occurrence = 1
+invariant = "ForeignSelectionJoin"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "return-foreign-final-owner-generation"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "lifecycle-execution-claim/LifecycleExecutionClaim"
+flow = "scheduler-dispatch"
+find = '''/\ f.classEpoch = f.observedClass /\ f.queueGeneration = f.observedGeneration'''
+replace = '''/\ f.classEpoch = f.observedClass /\ TRUE'''
+occurrence = 1
+invariant = "ForeignSelectionJoin"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "return-foreign-independent-peer-runtime-ack"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "lifecycle-execution-claim/LifecycleExecutionClaim"
+flow = "scheduler-dispatch"
+find = '''FPeerReset == /\ f.phase = "Finalized" /\ ~f.census /\ f.kernelAck /\ f.runtimeAck /\ ~f.peerPin'''
+replace = '''FPeerReset == /\ f.phase = "Finalized" /\ ~f.census /\ f.kernelAck /\ TRUE /\ ~f.peerPin'''
+occurrence = 1
+invariant = "ForeignSealedReuse"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "return-foreign-independent-source-kernel-ack"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "lifecycle-execution-claim/LifecycleExecutionClaim"
+flow = "scheduler-dispatch"
+find = '''FSourceReset == /\ f.phase = "SourceKernel" /\ ~f.sourceActive /\ ~f.sourceBank
+                /\ f.sourceRuntimeAck /\ f.sourceKernelAck'''
+replace = '''FSourceReset == /\ f.phase = "SourceKernel" /\ ~f.sourceActive /\ ~f.sourceBank
+                /\ f.sourceRuntimeAck /\ TRUE'''
+occurrence = 1
+invariant = "ForeignSealedReuse"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "return-foreign-independent-source-runtime-ack"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "lifecycle-execution-claim/LifecycleExecutionClaim"
+flow = "scheduler-dispatch"
+find = '''FSourceReset == /\ f.phase = "SourceKernel" /\ ~f.sourceActive /\ ~f.sourceBank
+                /\ f.sourceRuntimeAck /\ f.sourceKernelAck'''
+replace = '''FSourceReset == /\ f.phase = "SourceKernel" /\ ~f.sourceActive /\ ~f.sourceBank
+                /\ TRUE /\ f.sourceKernelAck'''
+occurrence = 1
+invariant = "ForeignSealedReuse"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "return-foreign-kernel-ack-without-detach"
+kind = "transition-effect"
+severity = "critical"
+model = "lifecycle-execution-claim/LifecycleExecutionClaim"
+flow = "scheduler-dispatch"
+find = '''!.phase = "ExecImage", !.kernelAck = TRUE'''
+replace = '''!.phase = "ExecImage", !.kernelAck = TRUE, !.detached = FALSE'''
+occurrence = 1
+invariant = "ForeignCensusDrain"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "return-foreign-kernel-executor-before-source-rsp"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "lifecycle-execution-claim/LifecycleExecutionClaim"
+flow = "scheduler-dispatch"
+find = '''FSourceKernelAck == /\ f.phase = "SourceKernel" /\ f.sourcePublished /\ ~f.sourceKernelAck
+                    /\ f.kernel0Active /\ ~f.sourceBank'''
+replace = '''FSourceKernelAck == /\ f.sourcePublished /\ ~f.sourceKernelAck
+                    /\ f.kernel0Active'''
+occurrence = 1
+invariant = "ForeignSealedReuse"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "return-foreign-new-donor-metadata-relookup"
+kind = "transition-effect"
+severity = "critical"
+model = "lifecycle-execution-claim/LifecycleExecutionClaim"
+flow = "scheduler-dispatch"
+find = '''!.chargedContext = f.originalContext'''
+replace = '''!.chargedContext = IF f.borrowedContext = 0 THEN f.originalContext ELSE f.borrowedContext'''
+occurrence = 1
+invariant = "ForeignOriginalFunding"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "return-foreign-original-funding"
+kind = "transition-effect"
+severity = "critical"
+model = "lifecycle-execution-claim/LifecycleExecutionClaim"
+flow = "scheduler-dispatch"
+find = '''!.sourceCharged = @ + 1'''
+replace = '''!.sourceCharged = @ + 2'''
+occurrence = 1
+invariant = "ForeignOriginalFunding"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "return-foreign-original-funding-grant"
+kind = "transition-effect"
+severity = "critical"
+model = "lifecycle-execution-claim/LifecycleExecutionClaim"
+flow = "scheduler-dispatch"
+find = '''!.selection = "Funded", !.fundingGrant = TRUE'''
+replace = '''!.selection = "Funded", !.fundingGrant = FALSE'''
+occurrence = 1
+invariant = "ForeignSelectionJoin"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "return-foreign-ready-before-last-effect"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "lifecycle-execution-claim/LifecycleExecutionClaim"
+flow = "scheduler-dispatch"
+find = '''FReady == /\ f.phase \in {"IncomingEffects", "LeavingEffects", "SourceEffects"}
+          /\ f.effects = 5'''
+replace = '''FReady == /\ f.phase \in {"IncomingEffects", "LeavingEffects", "SourceEffects"}
+          /\ f.effects <= 5'''
+occurrence = 1
+invariant = "ForeignOriginalEffects"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "return-foreign-rebirth-kernel-ack"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "lifecycle-execution-claim/LifecycleExecutionClaim"
+flow = "scheduler-dispatch"
+find = '''FRebornReset == /\ f.phase = "NewTerminal" /\ f.newExternal /\ f.newKernel'''
+replace = '''FRebornReset == /\ f.phase = "NewTerminal" /\ f.newExternal /\ TRUE'''
+occurrence = 1
+invariant = "ForeignNewIncarnation"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "return-foreign-rebirth-old-cleanup-ack"
+kind = "transition-effect"
+severity = "critical"
+model = "lifecycle-execution-claim/LifecycleExecutionClaim"
+flow = "scheduler-dispatch"
+find = '''!.newExternal = IF f.birthNonce = 1 THEN TRUE ELSE @,
+                        !.ackNonce = IF f.birthNonce = 1 THEN 1 ELSE @'''
+replace = '''!.newExternal = TRUE,
+                        !.ackNonce = 1'''
+occurrence = 1
+invariant = "ForeignNewIncarnation"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "return-foreign-rebirth-original-ticket"
+kind = "transition-effect"
+severity = "critical"
+model = "lifecycle-execution-claim/LifecycleExecutionClaim"
+flow = "scheduler-dispatch"
+find = '''!.phase = "BirthReserved", !.birthTicket = TRUE'''
+replace = '''!.phase = "BirthReserved", !.birthTicket = FALSE'''
+occurrence = 1
+invariant = "ForeignNewIncarnation"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "return-foreign-rebirth-runtime-ack"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "lifecycle-execution-claim/LifecycleExecutionClaim"
+flow = "scheduler-dispatch"
+find = '''FRebornReset == /\ f.phase = "NewTerminal" /\ f.newExternal /\ f.newKernel'''
+replace = '''FRebornReset == /\ f.phase = "NewTerminal" /\ TRUE /\ f.newKernel'''
+occurrence = 1
+invariant = "ForeignNewIncarnation"
+min_counterexample_states = 2
+
+# --- Cost invariants ------------------------------------------------------
+#
+# Everything else in this corpus mutates a guard whose absence produces a wrong
+# answer. These three mutate a guard whose absence produces the *right* answer
+# more slowly, which is the defect class this kernel kept shipping: an
+# eight-bind receive, a per-dispatch scan for a value read only at spawn, a
+# CPUID triple exit per IPI. All three were correct and none tripped an
+# assertion. A cost invariant that no mutation kills is decoration, so each of
+# the three has one here.
+[[mutation]]
+id = "return-foreign-reuse-before-old-mm-retired"
+kind = "transition-effect"
+severity = "critical"
+model = "lifecycle-execution-claim/LifecycleExecutionClaim"
+flow = "scheduler-dispatch"
+find = '''!.phase = "Finalized", !.census = FALSE, !.oldRetired = TRUE'''
+replace = '''!.phase = "Finalized", !.census = FALSE, !.oldRetired = FALSE'''
+occurrence = 1
+invariant = "ForeignSealedReuse"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "return-foreign-selection-original-pin"
+kind = "transition-effect"
+severity = "critical"
+model = "lifecycle-execution-claim/LifecycleExecutionClaim"
+flow = "scheduler-dispatch"
+find = '''!.selection = "Reading", !.selectPin = TRUE, !.reader = TRUE'''
+replace = '''!.selection = "Reading", !.selectPin = FALSE, !.reader = TRUE'''
+occurrence = 1
+invariant = "ForeignSelectionJoin"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "return-foreign-terminal-while-selection-owned"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "lifecycle-execution-claim/LifecycleExecutionClaim"
+flow = "scheduler-dispatch"
+find = '''/\ f.selection \in {"Empty", "Refused"} /\ ~f.selectPin /\ ~f.reader /\ ~f.fundingGrant
+                    /\ ~f.claimLeaf'''
+replace = '''/\ TRUE'''
+occurrence = 1
+invariant = "ForeignCensusDrain"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "return-foreign-uid-release-before-rsp"
+kind = "transition-effect"
+severity = "critical"
+model = "lifecycle-execution-claim/LifecycleExecutionClaim"
+flow = "scheduler-dispatch"
+find = '''!.outgoing = 2, !.uidOutgoing = 2'''
+replace = '''!.outgoing = 2, !.uidOutgoing = 3'''
+occurrence = 1
+invariant = "ForeignOriginalBanks"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "return-joint-donor-metadata-relookup"
+kind = "transition-effect"
+severity = "critical"
+model = "lifecycle-execution-claim/LifecycleExecutionClaim"
+flow = "scheduler-dispatch"
+find = '''!.badCharge = (@ \/ j.donor # 1)'''
+replace = '''!.badCharge = (@ \/ j.metadataDonor # 1)'''
+occurrence = 1
+invariant = "JointOriginalFunding"
+min_counterexample_states = 11
+
+[[mutation]]
+id = "return-joint-outgoing-release-before-rsp"
+kind = "transition-effect"
+severity = "critical"
+model = "lifecycle-execution-claim/LifecycleExecutionClaim"
+flow = "scheduler-dispatch"
+find = '''!.outgoing = ~j.same'''
+replace = '''!.outgoing = FALSE'''
+occurrence = 1
+invariant = "JointOriginalBanks"
+min_counterexample_states = 10
+
+[[mutation]]
+id = "return-joint-ready-before-last-effect"
+kind = "transition-effect"
+severity = "critical"
+model = "lifecycle-execution-claim/LifecycleExecutionClaim"
+flow = "scheduler-dispatch"
+find = '''/\ j.effects = RequiredEffects'''
+replace = '''/\ j.effects <= RequiredEffects'''
+occurrence = 1
+invariant = "JointLastEffect"
+min_counterexample_states = 7
+
+[[mutation]]
+id = "return-joint-reuse-before-funding-settled"
+kind = "transition-effect"
+severity = "critical"
+model = "lifecycle-execution-claim/LifecycleExecutionClaim"
+flow = "scheduler-dispatch"
+find = '''/\ ~j.sourceBank /\ ~j.outgoing /\ ~j.funding /\ ~j.reused'''
+replace = '''/\ ~j.sourceBank /\ ~j.outgoing /\ ~j.reused'''
+occurrence = 1
+invariant = "JointSealedReuse"
+min_counterexample_states = 15
+
+[[mutation]]
+id = "scheduler-activation-final-claim-ignores-generation"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "scheduler-local-authority/SchedulerLocalAuthority"
+flow = "scheduler-dispatch"
+find = '''    /\ LET valid == owner = "local" /\ ownerGen = tokenGen /\ runnable'''
+replace = '''    /\ LET valid == owner = "local" /\ TRUE /\ runnable'''
+occurrence = 1
+invariant = "ActivationClaimBindsConsumedGeneration"
+min_counterexample_states = 4
+
+[[mutation]]
+id = "scheduler-activation-reused-child-admitted"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "scheduler-local-authority/SchedulerLocalAuthority"
+flow = "scheduler-dispatch"
+find = '''           eligible == mode \notin {"activation-reuse", "spawn-reuse", "generic-reuse"}'''
+replace = '''           eligible == TRUE'''
+occurrence = 1
+invariant = "ActivationStaleOrReusedTokenCannotClaim"
+min_counterexample_states = 3
+
+[[mutation]]
 id = "scheduler-active-balance-due-guard-removed"
 kind = "transition-guard-removal"
 severity = "critical"
@@ -1855,6 +2935,214 @@ invariant = "SystemBurstIsBounded"
 min_counterexample_states = 3
 
 [[mutation]]
+id = "scheduler-cutover-empty-fair-dispatches-peer"
+kind = "transition-effect"
+severity = "critical"
+model = "scheduler-local-authority/SchedulerLocalAuthority"
+flow = "scheduler-dispatch"
+find = '''    ELSE IF m = "empty-fair" THEN IdleTask'''
+replace = '''    ELSE IF m = "empty-fair" THEN Peer'''
+occurrence = 1
+invariant = "EmptyFairClaimsOnlyExactIdle"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "scheduler-cutover-exact-budget-denial-peer-admitted"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "scheduler-local-authority/SchedulerLocalAuthority"
+flow = "scheduler-dispatch"
+find = '''StableNegativePeer(m) == m \in {"stable-affinity-skipped", "stable-lifecycle-skipped", "stable-budget-skipped"}'''
+replace = '''StableNegativePeer(m) == m \in {"stable-affinity-skipped", "stable-lifecycle-skipped"}'''
+occurrence = 1
+invariant = "ExactBudgetDenialSkipsOnlyPeer"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "scheduler-cutover-excluded-arm-granted"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "scheduler-local-authority/SchedulerLocalAuthority"
+flow = "scheduler-dispatch"
+find = '''Qualified ==
+    /\ ~Excluded(mode)
+    /\ mode \notin ExactModes
+    /\ ~Incomplete(mode)'''
+replace = '''Qualified ==
+    /\ TRUE
+    /\ mode \notin ExactModes
+    /\ ~Incomplete(mode)'''
+occurrence = 1
+invariant = "ExcludedArmsNeverAcquireLocalAuthority"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "scheduler-cutover-failed-local-claim-uses-catalog"
+kind = "transition-effect"
+severity = "critical"
+model = "scheduler-local-authority/SchedulerLocalAuthority"
+flow = "scheduler-dispatch"
+find = '''          /\ decision' = IF valid THEN "committed" ELSE "fallback"'''
+replace = '''          /\ decision' = IF valid THEN "committed" ELSE "catalog"'''
+occurrence = 1
+invariant = "FailedBoundClaimUsesFallback"
+min_counterexample_states = 5
+
+[[mutation]]
+id = "scheduler-cutover-forbidden-affinity-claims-local"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "scheduler-local-authority/SchedulerLocalAuthority"
+flow = "scheduler-dispatch"
+find = '''    "empty-idle-invalid", "overdue-invalid", "reservation-invalid",
+    "affinity-refused"'''
+replace = '''    "empty-idle-invalid", "overdue-invalid", "reservation-invalid"'''
+occurrence = 1
+invariant = "ForbiddenAffinityCannotClaimLocal"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "scheduler-cutover-invalid-reservation-claims-local"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "scheduler-local-authority/SchedulerLocalAuthority"
+flow = "scheduler-dispatch"
+find = '''                   ELSE IF mode \in {"overdue-invalid", "reservation-invalid"}
+                        THEN "guarded" ELSE "catalog"'''
+replace = '''                   ELSE "catalog"'''
+occurrence = 1
+invariant = "IncompleteEarlyPolicyUsesGuardedCustody"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "scheduler-cutover-metadata-race-claimed"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "scheduler-local-authority/SchedulerLocalAuthority"
+flow = "scheduler-dispatch"
+find = '''    /\ LET valid == owner = "local" /\ ownerGen = frameGen
+                     /\ runnable'''
+replace = '''    /\ LET valid == owner = "local" /\ ownerGen = frameGen
+                     /\ TRUE'''
+occurrence = 1
+invariant = "ExactClaimOrSafeFallback"
+min_counterexample_states = 5
+
+[[mutation]]
+id = "scheduler-cutover-overdue-defers-to-fair-current"
+kind = "transition-effect"
+severity = "critical"
+model = "scheduler-local-authority/SchedulerLocalAuthority"
+flow = "scheduler-dispatch"
+find = '''    ELSE IF m = "overdue-system" THEN Peer'''
+replace = '''    ELSE IF m = "overdue-system" THEN LocalFairPick(m)'''
+occurrence = 1
+invariant = "OverdueSystemMustPreemptFairCurrent"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "scheduler-cutover-partial-scan-granted"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "scheduler-local-authority/SchedulerLocalAuthority"
+flow = "scheduler-dispatch"
+find = '''Qualified ==
+    /\ ~Excluded(mode)
+    /\ mode \notin ExactModes
+    /\ ~Incomplete(mode)'''
+replace = '''Qualified ==
+    /\ ~Excluded(mode)
+    /\ mode \notin ExactModes
+    /\ TRUE'''
+occurrence = 1
+invariant = "IncompleteScanFallsBack"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "scheduler-cutover-reservation-ignores-user-priority"
+kind = "transition-effect"
+severity = "critical"
+model = "scheduler-local-authority/SchedulerLocalAuthority"
+flow = "scheduler-dispatch"
+find = '''LocalPolicyPick(m) ==
+    IF m = "reservation" THEN Peer
+    ELSE IF m = "empty-fair" THEN IdleTask
+    ELSE IF m = "overdue-system" THEN Peer
+    ELSE LocalFairPick(m)'''
+replace = '''LocalPolicyPick(m) ==
+    IF m = "reservation" THEN LocalFairPick(m)
+    ELSE IF m = "empty-fair" THEN IdleTask
+    ELSE IF m = "overdue-system" THEN Peer
+    ELSE LocalFairPick(m)'''
+occurrence = 1
+invariant = "ReservationPrefersUserBeforeOrdinarySystem"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "scheduler-cutover-stable-negative-peer-blocks-current"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "scheduler-local-authority/SchedulerLocalAuthority"
+flow = "scheduler-dispatch"
+find = '''LET first == IF StableNegativePeer(m) THEN Current'''
+replace = '''LET first == IF FALSE THEN Current'''
+occurrence = 1
+invariant = "StableNegativePeerDoesNotBlockCurrent"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "scheduler-cutover-stale-local-generation-claimed"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "scheduler-local-authority/SchedulerLocalAuthority"
+flow = "scheduler-dispatch"
+find = '''    /\ LET valid == owner = "local" /\ ownerGen = frameGen
+                     /\ runnable
+                     /\ queueEpoch = seenQueue /\ classEpoch = seenClass'''
+replace = '''    /\ LET valid == owner = "local" /\ TRUE
+                     /\ runnable
+                     /\ queueEpoch = seenQueue /\ classEpoch = seenClass'''
+occurrence = 1
+invariant = "ExactClaimOrSafeFallback"
+min_counterexample_states = 5
+
+[[mutation]]
+id = "scheduler-cutover-system-peer-preference-reversed"
+kind = "transition-effect"
+severity = "critical"
+model = "scheduler-local-authority/SchedulerLocalAuthority"
+flow = "scheduler-dispatch"
+find = '''    ELSE IF t = Peer /\ m \in {"class-peer", "overdue-system"} THEN "system"'''
+replace = '''    ELSE IF t = Peer /\ m = "overdue-system" THEN "system"'''
+occurrence = 1
+invariant = "FairPickMatchesIndependentScenarioExpectation"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "scheduler-cutover-third-candidate-ignored"
+kind = "transition-effect"
+severity = "critical"
+model = "scheduler-local-authority/SchedulerLocalAuthority"
+flow = "scheduler-dispatch"
+find = '''    IN IF HasThird(m) /\ Better(Third, first, m) THEN Third ELSE first'''
+replace = '''    IN first'''
+occurrence = 1
+invariant = "FairPickMatchesIndependentScenarioExpectation"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "scheduler-cutover-validated-borrowed-owner-rejected"
+kind = "transition-effect"
+severity = "critical"
+model = "scheduler-local-authority/SchedulerLocalAuthority"
+flow = "scheduler-dispatch"
+find = '''    "borrowed", "budget-refused", "frame-refused", "lifecycle-refused"'''
+replace = '''    "borrowed", "borrowed-valid", "budget-refused", "frame-refused", "lifecycle-refused"'''
+occurrence = 1
+invariant = "ValidatedBorrowedOwnerMayClaim"
+min_counterexample_states = 3
+
+[[mutation]]
 id = "scheduler-demotion-low-weight-promotion"
 kind = "transition-effect"
 severity = "critical"
@@ -1881,6 +3169,18 @@ replace = '''    /\ baseWeight' = baseWeight'''
 occurrence = 1
 invariant = "DemotionCapsPermanentWeight"
 min_counterexample_states = 2
+
+[[mutation]]
+id = "scheduler-direct-fifo-final-claim-ignores-token-generation"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "scheduler-local-authority/SchedulerLocalAuthority"
+flow = "scheduler-dispatch"
+find = '''    /\ LET valid == owner = "direct" /\ ownerGen = tokenGen /\ runnable'''
+replace = '''    /\ LET valid == owner = "direct" /\ TRUE /\ runnable'''
+occurrence = 1
+invariant = "DirectRecordClaimBindsConsumedGeneration"
+min_counterexample_states = 4
 
 [[mutation]]
 id = "scheduler-dispatch-exact-queue-cpu-guard-removed"
@@ -2029,6 +3329,32 @@ replace = '''       /\ ready' = ready'''
 occurrence = 1
 invariant = "LegacyReadyHasPublishedCustody"
 min_counterexample_states = 3
+
+[[mutation]]
+id = "scheduler-retained-current-admission-bypass"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "scheduler-local-authority/SchedulerLocalAuthority"
+flow = "scheduler-dispatch"
+find = 'RetainedCurrentPublishedAdmission == mode \notin {"current-cpu-lost", "current-budget-empty", "current-lifecycle-unavailable"}'
+replace = 'RetainedCurrentPublishedAdmission == TRUE'
+occurrence = 1
+invariant = "RetainedCurrentRefusalCannotGainAuthority"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "scheduler-retained-current-generation-bypass"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "scheduler-local-authority/SchedulerLocalAuthority"
+flow = "scheduler-dispatch"
+find = '''    /\ LET valid == RetainedCurrentPublishedAdmission /\ owner = "local"
+                    /\ ownerGen = tokenGen /\ runnable'''
+replace = '''    /\ LET valid == RetainedCurrentPublishedAdmission /\ owner = "local"
+                    /\ TRUE /\ runnable'''
+occurrence = 1
+invariant = "RetainedCurrentCommitHasExactFrameAndAdmission"
+min_counterexample_states = 5
 
 [[mutation]]
 id = "scheduler-transition-legacy-ready-before-custody"
@@ -3202,6 +4528,49 @@ invariant = "StaleRecordNeverDispatches"
 min_counterexample_states = 5
 
 [[mutation]]
+id = "task-retirement-cleanup-bad-ack-accepted"
+kind = "transition-effect"
+severity = "critical"
+model = "task-retirement-cleanup-owner/TaskRetirementCleanupOwner"
+flow = "scheduler-lifecycle"
+find = '''BadAck(returned, exactPayload) ==
+    /\ (state # "claimed" \/ returned # task \/ ~exactPayload)
+    /\ UNCHANGED vars'''
+replace = '''BadAck(returned, exactPayload) ==
+    /\ (state # "claimed" \/ returned # task \/ ~exactPayload)
+    /\ state' = "complete"
+    /\ acks' = [acks EXCEPT ![task] = @ + 1]
+    /\ ackTask' = returned /\ ackPayload' = exactPayload
+    /\ UNCHANGED <<task, terminalReady, claims>>'''
+occurrence = 1
+invariant = "CompleteRequiresExactClaimedAck"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "task-retirement-cleanup-published-before-terminal"
+kind = "transition-effect"
+severity = "critical"
+model = "task-retirement-cleanup-owner/TaskRetirementCleanupOwner"
+flow = "scheduler-lifecycle"
+find = "    /\\ terminalReady' = TRUE"
+replace = "    /\\ terminalReady' = FALSE"
+occurrence = 1
+invariant = "PublicationFollowsTerminalMetadata"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "task-retirement-cleanup-reset-before-ack"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "task-retirement-cleanup-owner/TaskRetirementCleanupOwner"
+flow = "scheduler-lifecycle"
+find = '    /\ state = "complete" /\ task = 1'
+replace = '    /\ state # "vacant" /\ task = 1'
+occurrence = 1
+invariant = "NoReuseBeforeExactAck"
+min_counterexample_states = 3
+
+[[mutation]]
 id = "tlb-active-root-target-filter-removed"
 kind = "transition-effect"
 severity = "critical"
@@ -3395,12 +4764,5 @@ occurrence = 1
 invariant = "AcceptRequiresPublishedReadiness"
 min_counterexample_states = 2
 
-# --- Cost invariants ------------------------------------------------------
-#
-# Everything else in this corpus mutates a guard whose absence produces a wrong
-# answer. These three mutate a guard whose absence produces the *right* answer
-# more slowly, which is the defect class this kernel kept shipping: an
-# eight-bind receive, a per-dispatch scan for a value read only at spawn, a
-# CPUID triple exit per IPI. All three were correct and none tripped an
-# assertion. A cost invariant that no mutation kills is decoration, so each of
-# the three has one here.
+# Same foreign-CPU protocol: original selection/admission through shared-MM
+# exec/terminal/dual ACK/rebirth. Earlier component mutants remain unchanged.

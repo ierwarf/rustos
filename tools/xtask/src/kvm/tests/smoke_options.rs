@@ -11,6 +11,11 @@
 
     #[test]
     fn smoke_timeout_is_bounded() {
+        let default = parse_smoke_options(Vec::<String>::new().into_iter()).unwrap();
+        assert_eq!(default.timeout.as_secs(), DEFAULT_SMOKE_TIMEOUT);
+        // The isolated multi-vCPU bench passes this explicit bound to the
+        // very same parser. Rejecting it prevents the guest from booting.
+        assert_eq!(MAX_SMOKE_TIMEOUT, 180);
         let options =
             parse_smoke_options(vec!["--timeout".into(), "30".into()].into_iter()).unwrap();
         assert_eq!(options.timeout.as_secs(), 30);

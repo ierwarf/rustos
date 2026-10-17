@@ -26,9 +26,13 @@ use x86_64::structures::paging::{PageTable, PageTableFlags};
 use kernel_hal::api::arch::tlb::{AddressSpaceMutationGuard, begin_address_space_mutation};
 
 mod atomic_user;
+mod execution_lifetime;
 mod frame_release;
 mod pager_fault_mapping;
 mod retirement;
+pub use execution_lifetime::{
+    ActivationPin, ExecutionPin, RetirementOwner, drain_retired_address_spaces,
+};
 mod rollback;
 mod user_copy;
 use frame_release::{
@@ -122,6 +126,7 @@ impl UserRegion {
 pub struct ProcessAddressSpace {
     pml4_frame_phys: u64,
     next_user_addr: u64,
+    execution: Option<execution_lifetime::Owner>,
 }
 
 impl ProcessAddressSpace {
@@ -149,6 +154,7 @@ impl ProcessAddressSpace {
         Ok(Self {
             pml4_frame_phys: pml4_phys.as_u64(),
             next_user_addr: USER_SPACE_BASE,
+            execution: Some(execution_lifetime::Owner::new(pml4_phys.as_u64(), true)),
         })
     }
 
@@ -156,11 +162,44 @@ impl ProcessAddressSpace {
         PhysAddr::new(self.pml4_frame_phys)
     }
 
+    /// Retains the complete owned root/PTE/frame ledger, not mutable mappings.
+    pub fn pin_execution(&self) -> Option<ExecutionPin> {
+        self.execution.as_ref()?.pin()
+    }
+    pub fn into_retirement_owner(mut self) -> RetirementOwner {
+        RetirementOwner {
+            owner: self
+                .execution
+                .take()
+                .expect("MM retirement owner transferred twice"),
+        }
+    }
+
+    /// Irreversible: captured execution refs survive, new activation refs refuse.
+    /// Refuses without closing while claim/architecture/RSP activation custody
+    /// is outstanding. The cold caller must cancel/retry before image effects.
+    pub fn seal_execution(&self) -> bool {
+        self.execution
+            .as_ref()
+            .expect("MM lacks root owner")
+            .try_seal_activation()
+    }
+
+    #[cfg(not(rustos_boot_image))]
+    pub fn modeled_root_for_host(root: u64) -> Self {
+        Self {
+            pml4_frame_phys: root,
+            next_user_addr: USER_SPACE_BASE,
+            execution: Some(execution_lifetime::Owner::new(root, false)),
+        }
+    }
+
     #[cfg(any(test, debug_assertions))]
     pub fn empty_for_tests() -> Self {
         Self {
             pml4_frame_phys: 0,
             next_user_addr: USER_SPACE_BASE,
+            execution: Some(execution_lifetime::Owner::new(0, false)),
         }
     }
 

@@ -1,623 +1,76 @@
-//! Scheduler-owned CPU-affinity state and migration admission.
-//!
-//! - **Owner:** scheduler task slots own effective per-thread masks; Windows
-//!   process masks are mirrored across every live task in the exact process.
-//! - **Boundary:** policy services admit identity and requested masks before
-//!   these methods perform the allocation-free scheduler commit.
-//! - **Lifecycle:** fork/clone inherits, exec preserves, retirement clears, and
-//!   a mask excluding a running CPU creates one mandatory reschedule edge.
-//! - **Concurrency:** the global scheduler raw lock serializes every mask
-//!   snapshot and mutation with dispatch and task publication.
-//! - **Failure:** empty/offline masks and foreign targets return bounded
-//!   errors; dispatch outside the committed mask is an invariant panic.
-//! - **Forbidden:** no best-effort widening, raw APIC bit, partial Windows
-//!   process update, or user return while migration remains pending.
-//! - **Evidence:** `task-affinity-lifecycle`.
-
-use super::*;
+//! Owner: affinity result types; original thread/process owners implement mutations.
+//! Boundary: caller and target physical loans, complete membership and full process handle.
+//! Lifecycle: original cohorts span mask publication, queue effects and exact membership ACK.
+//! Concurrency: no global catalog or raw leaf spans rehome/reschedule work.
+//! Failure: offline/empty/foreign/terminal requests refuse before authority effects.
+//! Forbidden: scalar UID rechecks or copied process masks as lifetime or partial group commit.
+//! Evidence: historical IDs use the same independent production owners with actual births.
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum AffinityError {
-    InvalidMask,
-    MissingTask,
-    PermissionDenied,
-    WrongAbi,
-}
-
+pub enum AffinityError { InvalidMask, MissingTask, PermissionDenied, WrongAbi }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AffinityCommit {
     pub previous_mask: u64,
     pub reschedule_required: bool,
 }
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProcessAffinitySnapshot {
     pub process_mask: u64,
     pub system_mask: u64,
 }
 
-impl Scheduler {
-    fn admitted_mask(stored_mask: u64, online_mask: u64) -> Option<u64> {
-        let effective = stored_mask & online_mask;
-        (online_mask != 0 && effective != 0).then_some(effective)
-    }
-
-    fn validate_requested_mask(
-        requested_mask: u64,
-        online_mask: u64,
-        container_mask: u64,
-    ) -> Result<u64, AffinityError> {
-        (online_mask != 0
-            && requested_mask != 0
-            && requested_mask & !online_mask == 0
-            && requested_mask & !container_mask == 0)
-            .then_some(requested_mask)
-            .ok_or(AffinityError::InvalidMask)
-    }
-
-    fn migration_required(&self, slot: usize, requested_mask: u64) -> bool {
-        #[cfg(not(test))]
-        let owner_cpu = runqueue::owner(slot).cpu;
-        #[cfg(test)]
-        let owner_cpu = super::super::cpu_local::task_running_cpu(slot)
-            // Boxed scheduler tests have no global CPU-slot publication. In
-            // production, a scheduler guard's scratch `current_task` is the
-            // exact calling CPU slot loaded by `cpu_local::scheduler_mut`.
-            .or_else(|| {
-                (slot == self.current_task_slot())
-                    .then(nucleus_core::util::lockdep::current_cpu_index)
-            });
-        owner_cpu.is_some_and(|cpu| requested_mask & (1_u64 << cpu) == 0)
-    }
-
-    fn resolve_current_process_task(
-        &self,
-        target_task_id: u64,
-        required_abi: UserAbi,
-    ) -> Result<usize, AffinityError> {
-        let current = self.contexts[self.current_task_slot()].ok_or(AffinityError::MissingTask)?;
-        if !current.user_mode || current.user_abi != Some(required_abi) {
-            return Err(AffinityError::WrongAbi);
-        }
-        let target_slot = if target_task_id == 0 {
-            self.current_task_slot()
-        } else {
-            self.find_user_task_slot(target_task_id)
-                .ok_or(AffinityError::MissingTask)?
-        };
-        let target = self.contexts[target_slot].ok_or(AffinityError::MissingTask)?;
-        if target.user_abi != Some(required_abi) {
-            return Err(AffinityError::WrongAbi);
-        }
-        if target.process_handle != current.process_handle {
-            return Err(AffinityError::PermissionDenied);
-        }
-        Ok(target_slot)
-    }
-
-    pub(in crate::multitask) fn linux_task_affinity(
-        &self,
-        target_task_id: u64,
-        online_mask: u64,
-    ) -> Result<u64, AffinityError> {
-        let slot = self.resolve_current_process_task(target_task_id, UserAbi::Linux)?;
-        Self::admitted_mask(self.slot_affinity_snapshot(slot).0, online_mask)
-            .ok_or(AffinityError::InvalidMask)
-    }
-
-    pub(in crate::multitask) fn set_linux_task_affinity(
-        &mut self,
-        target_task_id: u64,
-        requested_mask: u64,
-        online_mask: u64,
-    ) -> Result<AffinityCommit, AffinityError> {
-        let slot = self.resolve_current_process_task(target_task_id, UserAbi::Linux)?;
-        let requested = Self::validate_requested_mask(requested_mask, online_mask, online_mask)?;
-        let (_, process_mask, _) = self.slot_affinity_snapshot(slot);
-        let previous_mask = Self::admitted_mask(self.slot_affinity_snapshot(slot).0, online_mask)
-            .ok_or(AffinityError::InvalidMask)?;
-        let reschedule_required = self.migration_required(slot, requested);
-        self.replace_slot_affinity(slot, requested, process_mask, reschedule_required);
-        #[cfg(not(test))]
-        if reschedule_required {
-            self.rehome_runqueue_slot(slot);
-        }
-        Ok(AffinityCommit {
-            previous_mask,
-            reschedule_required,
-        })
-    }
-
-    pub(in crate::multitask) fn windows_process_affinity(
-        &self,
-        online_mask: u64,
-    ) -> Result<ProcessAffinitySnapshot, AffinityError> {
-        let slot = self.resolve_current_process_task(0, UserAbi::Windows)?;
-        let process_mask = Self::admitted_mask(self.slot_affinity_snapshot(slot).1, online_mask)
-            .ok_or(AffinityError::InvalidMask)?;
-        Ok(ProcessAffinitySnapshot {
-            process_mask,
-            system_mask: online_mask,
-        })
-    }
-
-    pub(in crate::multitask) fn set_windows_process_affinity(
-        &mut self,
-        requested_mask: u64,
-        online_mask: u64,
-    ) -> Result<AffinityCommit, AffinityError> {
-        let current_slot = self.resolve_current_process_task(0, UserAbi::Windows)?;
-        let process_handle = self.contexts[current_slot]
-            .and_then(|context| context.process_handle)
-            .ok_or(AffinityError::MissingTask)?;
-        let requested = Self::validate_requested_mask(requested_mask, online_mask, online_mask)?;
-        let previous_mask =
-            Self::admitted_mask(self.slot_affinity_snapshot(current_slot).1, online_mask)
-                .ok_or(AffinityError::InvalidMask)?;
-
-        let mut reschedule_required = false;
-        let mut matched = 0usize;
-        for slot in FIRST_DYNAMIC_TASK_SLOT..MAX_TASK {
-            let Some(context) = self.contexts[slot] else {
-                continue;
-            };
-            if context.process_handle != Some(process_handle) {
-                continue;
-            }
-            assert_eq!(
-                context.user_abi,
-                Some(UserAbi::Windows),
-                "scheduler invariant: one process mixes Linux and Windows task ABI"
-            );
-            matched += 1;
-            let migrate = self.migration_required(slot, requested);
-            self.replace_slot_affinity(slot, requested, requested, migrate);
-            #[cfg(not(test))]
-            if migrate {
-                self.rehome_runqueue_slot(slot);
-            }
-            reschedule_required |= migrate;
-        }
-        assert_ne!(
-            matched, 0,
-            "scheduler invariant: current Windows process has no live task"
-        );
-        Ok(AffinityCommit {
-            previous_mask,
-            reschedule_required,
-        })
-    }
-
-    pub(in crate::multitask) fn set_windows_current_thread_affinity(
-        &mut self,
-        requested_mask: u64,
-        online_mask: u64,
-    ) -> Result<AffinityCommit, AffinityError> {
-        let slot = self.resolve_current_process_task(0, UserAbi::Windows)?;
-        let (_, stored_process_mask, _) = self.slot_affinity_snapshot(slot);
-        let process_mask = Self::admitted_mask(stored_process_mask, online_mask)
-            .ok_or(AffinityError::InvalidMask)?;
-        let requested = Self::validate_requested_mask(requested_mask, online_mask, process_mask)?;
-        let previous_mask = Self::admitted_mask(self.slot_affinity_snapshot(slot).0, online_mask)
-            .ok_or(AffinityError::InvalidMask)?;
-        let reschedule_required = self.migration_required(slot, requested);
-        self.replace_slot_affinity(slot, requested, stored_process_mask, reschedule_required);
-        #[cfg(not(test))]
-        if reschedule_required {
-            self.rehome_runqueue_slot(slot);
-        }
-        Ok(AffinityCommit {
-            previous_mask,
-            reschedule_required,
-        })
-    }
-
-    pub(super) fn initialize_slot_affinity(
-        &mut self,
-        slot: usize,
-        task_mask: u64,
-        process_mask: u64,
-    ) {
-        assert!(
-            slot < MAX_TASK && task_mask != 0 && process_mask != 0,
-            "scheduler invariant: invalid initial affinity publication"
-        );
-        assert!(
-            task_mask & !process_mask == 0,
-            "scheduler invariant: initial task affinity escapes process mask"
-        );
-        self.initialize_slot_affinity_payload(slot, task_mask, process_mask);
-    }
-
-    pub(super) fn inherited_process_affinity(&self, parent_process_id: Option<u64>) -> u64 {
-        let Some(parent_process_id) = parent_process_id else {
-            return UNRESTRICTED_CPU_MASK;
-        };
-        self.contexts
-            .iter()
-            .enumerate()
-            .find_map(|(slot, context)| {
-                context
-                    .filter(|context| context.process_id == Some(parent_process_id))
-                    .map(|_| self.slot_affinity_snapshot(slot).1)
-            })
-            .unwrap_or(UNRESTRICTED_CPU_MASK)
-    }
-
-    pub(super) fn current_affinity_for_child_thread(&self) -> (u64, u64) {
-        let (task_mask, process_mask, _) = self.slot_affinity_snapshot(self.current_task_slot());
-        (task_mask, process_mask)
-    }
-
-    pub(super) fn exec_affinity_snapshot(&self, slot: usize) -> (u64, u64, bool) {
-        let (task_mask, process_mask, migration_pending) = self.slot_affinity_snapshot(slot);
-        assert!(
-            task_mask != 0 && process_mask != 0 && task_mask & !process_mask == 0,
-            "scheduler invariant: exec target has invalid affinity state"
-        );
-        (task_mask, process_mask, migration_pending)
-    }
-
-    pub(super) fn assert_exec_affinity_preserved(&self, slot: usize, expected: (u64, u64, bool)) {
-        assert_eq!(
-            self.exec_affinity_snapshot(slot),
-            expected,
-            "scheduler invariant: exec changed task/process affinity authority"
-        );
-    }
-
-    pub(super) fn assert_current_task_affinity_allows_dispatch(&self) {
-        let logical_cpu = nucleus_core::util::lockdep::current_cpu_index();
-        let bit = 1_u64
-            .checked_shl(u32::try_from(logical_cpu).expect("logical CPU index overflow"))
-            .expect("logical CPU index exceeds affinity mask");
-        let (task_mask, _, migration_pending) =
-            self.slot_affinity_snapshot(self.current_task_slot());
-        assert!(
-            task_mask & bit != 0,
-            "scheduler invariant: task {} dispatched on excluded logical CPU {} mask={:#x} migration_pending={}",
-            self.starts[self.current_task_slot()]
-                .map(|start| start.id)
-                .unwrap_or(0),
-            logical_cpu,
-            task_mask,
-            migration_pending,
-        );
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use std::panic::{AssertUnwindSafe, catch_unwind};
-
-    use super::super::tests::{boxed_scheduler, test_process, test_user_context};
-    use super::*;
-
-    fn install_task(
-        scheduler: &mut Scheduler,
-        slot: usize,
-        task_id: u64,
-        process_handle: process_table::ProcessHandle,
-        abi: UserAbi,
-        task_mask: u64,
-        process_mask: u64,
-    ) {
-        let mut context = test_user_context(process_handle);
-        context.user_abi = Some(abi);
-        scheduler.contexts[slot] = Some(context);
-        scheduler.starts[slot] = Some(TaskStart {
-            entry: |_| {},
-            id: task_id,
-        });
-        scheduler.initialize_slot_affinity(slot, task_mask, process_mask);
-    }
-
+    use super::super::{process_affinity::tests as process, thread_affinity::tests as thread};
     #[test]
     fn task_affinity_snapshot_is_exact_and_online_bounded() {
-        assert_eq!(Scheduler::admitted_mask(u64::MAX, 0b1111), Some(0b1111));
-        assert_eq!(Scheduler::admitted_mask(0b1010, 0b1111), Some(0b1010));
-        assert_eq!(Scheduler::admitted_mask(0b10000, 0b1111), None);
+        thread::linux_query_and_peer_set_preserve_process_mask_and_other_thread();
+        thread::invalid_online_or_empty_mask_refuses_before_any_effect();
     }
-
     #[test]
     fn linux_thread_affinity_commits_exact_mask_and_previous_value() {
-        // Affinity tests attach real processes to the one global process
-        // table, so they must hold the same exclusive test isolation as every
-        // other scheduler test or a concurrent test observes a foreign process.
-        let mut scheduler = boxed_scheduler();
-        let process = test_process(0xaff1_0001);
-        let slot = FIRST_DYNAMIC_TASK_SLOT;
-        install_task(
-            &mut scheduler,
-            slot,
-            0xaff1_1001,
-            process,
-            UserAbi::Linux,
-            0b1111,
-            0b1111,
-        );
-        scheduler.current_task = slot;
-
-        assert_eq!(scheduler.linux_task_affinity(0, 0b1111), Ok(0b1111));
-        let commit = scheduler
-            .set_linux_task_affinity(0, 0b1010, 0b1111)
-            .expect("valid Linux affinity commit");
-        assert_eq!(commit.previous_mask, 0b1111);
-        assert_eq!(scheduler.linux_task_affinity(0, 0b1111), Ok(0b1010));
+        thread::linux_query_and_peer_set_preserve_process_mask_and_other_thread();
+        thread::windows_self_alias_owns_two_physical_refs_and_changes_only_thread_mask();
     }
-
     #[test]
     fn invalid_affinity_changes_leave_all_authority_unchanged() {
-        // Affinity tests attach real processes to the one global process
-        // table, so they must hold the same exclusive test isolation as every
-        // other scheduler test or a concurrent test observes a foreign process.
-        let mut scheduler = boxed_scheduler();
-        let process = test_process(0xaff1_0002);
-        let slot = FIRST_DYNAMIC_TASK_SLOT;
-        install_task(
-            &mut scheduler,
-            slot,
-            0xaff1_1002,
-            process,
-            UserAbi::Linux,
-            0b0011,
-            0b1111,
-        );
-        scheduler.current_task = slot;
-        for invalid in [0, 0b1_0000] {
-            assert_eq!(
-                scheduler.set_linux_task_affinity(0, invalid, 0b1111),
-                Err(AffinityError::InvalidMask)
-            );
-            assert_eq!(scheduler.task_affinity_masks[slot], 0b0011);
-        }
-        assert!(Scheduler::validate_requested_mask(0b1000, 0b1111, 0b0111).is_err());
-        // Isolate the online-mask condition from the container-mask one: a
-        // request for an offline CPU must be rejected even when the
-        // container would otherwise have admitted it.
-        assert!(Scheduler::validate_requested_mask(0b1_0000, 0b1111, 0b1_1111).is_err());
+        thread::invalid_online_or_empty_mask_refuses_before_any_effect();
+        thread::process_mask_escape_refuses_after_actual_complete_group_change_without_effects();
+        process::invalid_requested_mask_and_foreign_full_handle_or_caller_uid_cannot_spend_real_membership();
     }
-
     #[test]
     fn foreign_task_affinity_is_permission_denied() {
-        // Both task identities are attached to the global process table, so
-        // retain its test isolation through the complete rejected request.
-        let mut scheduler = boxed_scheduler();
-        let caller_process = test_process(0xaff1_0101);
-        let foreign_process = test_process(0xaff1_0102);
-        let caller = FIRST_DYNAMIC_TASK_SLOT;
-        let foreign = caller + 1;
-        install_task(
-            &mut scheduler,
-            caller,
-            0xaff1_1101,
-            caller_process,
-            UserAbi::Linux,
-            0b0011,
-            0b0111,
-        );
-        install_task(
-            &mut scheduler,
-            foreign,
-            0xaff1_1102,
-            foreign_process,
-            UserAbi::Linux,
-            0b0101,
-            0b0111,
-        );
-        scheduler.current_task = caller;
-        scheduler.affinity_migration_pending[caller] = true;
-        scheduler.affinity_migration_pending[foreign] = false;
-
-        let before = (
-            scheduler.task_affinity_masks[caller],
-            scheduler.process_affinity_masks[caller],
-            scheduler.affinity_migration_pending[caller],
-            scheduler.task_affinity_masks[foreign],
-            scheduler.process_affinity_masks[foreign],
-            scheduler.affinity_migration_pending[foreign],
-        );
-        assert_eq!(
-            scheduler.set_linux_task_affinity(0xaff1_1102, 0b0010, 0b0111),
-            Err(AffinityError::PermissionDenied)
-        );
-        assert_eq!(
-            (
-                scheduler.task_affinity_masks[caller],
-                scheduler.process_affinity_masks[caller],
-                scheduler.affinity_migration_pending[caller],
-                scheduler.task_affinity_masks[foreign],
-                scheduler.process_affinity_masks[foreign],
-                scheduler.affinity_migration_pending[foreign],
-            ),
-            before,
-            "foreign affinity rejection must not commit masks or migration state"
-        );
+        thread::foreign_physical_process_refuses_after_pin_without_spending_either_binding();
     }
-
     #[test]
     fn dispatch_panics_when_current_mask_excludes_cpu() {
-        let mut scheduler = boxed_scheduler();
-        let process = test_process(0xaff1_0103);
-        let slot = FIRST_DYNAMIC_TASK_SLOT;
-        let current_cpu = nucleus_core::util::lockdep::current_cpu_index();
-        let permitted_elsewhere = if current_cpu == 0 { 1 } else { 0 };
-        let excluded_current_mask = 1_u64 << permitted_elsewhere;
-        install_task(
-            &mut scheduler,
-            slot,
-            0xaff1_1103,
-            process,
-            UserAbi::Linux,
-            excluded_current_mask,
-            excluded_current_mask,
-        );
-        scheduler.current_task = slot;
-
-        assert!(
-            catch_unwind(AssertUnwindSafe(|| {
-                scheduler.assert_current_task_affinity_allows_dispatch();
-            }))
-            .is_err(),
-            "dispatch outside the committed affinity mask must fail-stop"
-        );
+        // Independent final admission refuses BEFORE claim; this is not a
+        // native catalog assertion or a claim of hardware return acceptance.
+        super::super::dispatch_claim::tests::actual_selected_affinity_exclusion_refuses_real_claim_and_original_funding_releases();
     }
-
     #[test]
     fn excluded_running_cpu_requires_remote_reschedule() {
-        // Affinity tests attach real processes to the one global process
-        // table, so they must hold the same exclusive test isolation as every
-        // other scheduler test or a concurrent test observes a foreign process.
-        let mut scheduler = boxed_scheduler();
-        let process = test_process(0xaff1_0006);
-        let slot = FIRST_DYNAMIC_TASK_SLOT;
-        install_task(
-            &mut scheduler,
-            slot,
-            0xaff1_1007,
-            process,
-            UserAbi::Linux,
-            0b0011,
-            0b0011,
-        );
-        scheduler.current_task = slot;
-
-        let commit = scheduler
-            .set_linux_task_affinity(0, 0b0010, 0b0011)
-            .expect("affinity commit excluding the running CPU");
-        assert_eq!(commit.previous_mask, 0b0011);
-        assert!(commit.reschedule_required);
-        assert!(scheduler.affinity_migration_pending[slot]);
-        assert!(!scheduler.context_is_schedulable(
-            slot,
-            scheduler.contexts[slot].expect("installed task context")
-        ));
+        thread::actual_running_target_keeps_current_custody_and_notifies_owner_cpu();
+        process::running_affinity_never_steals_current_custody_but_marks_exclusion_and_requests_reschedule();
     }
-
     #[test]
     fn child_task_inherits_effective_parent_affinity() {
-        // Affinity tests attach real processes to the one global process
-        // table, so they must hold the same exclusive test isolation as every
-        // other scheduler test or a concurrent test observes a foreign process.
-        let mut scheduler = boxed_scheduler();
-        let process_id = 0xaff1_0003;
-        let process = test_process(process_id);
-        let slot = FIRST_DYNAMIC_TASK_SLOT;
-        install_task(
-            &mut scheduler,
-            slot,
-            0xaff1_1003,
-            process,
-            UserAbi::Linux,
-            0b0101,
-            0b0111,
-        );
-        scheduler.current_task = slot;
-        assert_eq!(
-            scheduler.current_affinity_for_child_thread(),
-            (0b0101, 0b0111)
-        );
-        assert_eq!(
-            scheduler.inherited_process_affinity(Some(process_id)),
-            0b0111
-        );
+        super::super::thread_creation::tests::publication_inherits_new_complete_process_mask_after_reservation_not_old_snapshot();
     }
-
     #[test]
     fn exec_preserves_task_and_process_affinity() {
-        // Affinity tests attach real processes to the one global process
-        // table, so they must hold the same exclusive test isolation as every
-        // other scheduler test or a concurrent test observes a foreign process.
-        let mut scheduler = boxed_scheduler();
-        let process = test_process(0xaff1_0007);
-        let slot = FIRST_DYNAMIC_TASK_SLOT;
-        install_task(
-            &mut scheduler,
-            slot,
-            0xaff1_1008,
-            process,
-            UserAbi::Linux,
-            0b0011,
-            0b0111,
-        );
-        scheduler.current_task = slot;
-        scheduler.affinity_migration_pending[slot] = true;
-        let before = scheduler.exec_affinity_snapshot(slot);
-
-        // These are representative exec resets. Affinity is intentionally
-        // absent from the reset set and the production exec paths enforce the
-        // same snapshot after committing the replacement image.
-        scheduler.retired[slot] = false;
-        scheduler.exec_target_quiesced[slot] = false;
-        scheduler.retire_reasons[slot] = None;
-        scheduler.assert_exec_affinity_preserved(slot, before);
+        super::super::exec_transaction::publication::tests::actual_peer_exec_publishes_owned_frame_metadata_tls_and_staged_mm_before_finalization();
+        super::super::exec_transaction::publication::tests::actual_self_exec_never_rewrites_consumed_frame_or_publishes_ready_and_retains_original_bank();
     }
-
     #[test]
     fn windows_process_affinity_updates_every_live_thread_atomically() {
-        // Affinity tests attach real processes to the one global process
-        // table, so they must hold the same exclusive test isolation as every
-        // other scheduler test or a concurrent test observes a foreign process.
-        let mut scheduler = boxed_scheduler();
-        let process = test_process(0xaff1_0004);
-        let first = FIRST_DYNAMIC_TASK_SLOT;
-        let second = first + 1;
-        install_task(
-            &mut scheduler,
-            first,
-            0xaff1_1004,
-            process,
-            UserAbi::Windows,
-            0b1111,
-            0b1111,
-        );
-        install_task(
-            &mut scheduler,
-            second,
-            0xaff1_1005,
-            process,
-            UserAbi::Windows,
-            0b0011,
-            0b1111,
-        );
-        scheduler.current_task = first;
-        let commit = scheduler
-            .set_windows_process_affinity(0b0101, 0b1111)
-            .expect("valid Windows process affinity commit");
-        assert_eq!(commit.previous_mask, 0b1111);
-        for slot in [first, second] {
-            assert_eq!(scheduler.process_affinity_masks[slot], 0b0101);
-            assert_eq!(scheduler.task_affinity_masks[slot], 0b0101);
-        }
+        process::actual_group_capture_owns_every_live_binding_and_excludes_reuse_until_queue_and_membership_ack();
+        process::queued_rehome_keeps_old_process_mask_and_closed_admission_until_actual_owner_effect_returns();
+        process::terminal_stop_during_queue_effect_cannot_reuse_or_reanimate_captured_peer_and_survives_final_affinity_ack();
     }
-
     #[test]
     fn windows_thread_affinity_returns_previous_and_rejects_process_escape() {
-        // Affinity tests attach real processes to the one global process
-        // table, so they must hold the same exclusive test isolation as every
-        // other scheduler test or a concurrent test observes a foreign process.
-        let mut scheduler = boxed_scheduler();
-        let process = test_process(0xaff1_0005);
-        let slot = FIRST_DYNAMIC_TASK_SLOT;
-        install_task(
-            &mut scheduler,
-            slot,
-            0xaff1_1006,
-            process,
-            UserAbi::Windows,
-            0b0011,
-            0b0111,
-        );
-        scheduler.current_task = slot;
-        let commit = scheduler
-            .set_windows_current_thread_affinity(0b0010, 0b1111)
-            .expect("valid Windows thread affinity commit");
-        assert_eq!(commit.previous_mask, 0b0011);
-        assert_eq!(scheduler.task_affinity_masks[slot], 0b0010);
-        assert_eq!(
-            scheduler.set_windows_current_thread_affinity(0b1000, 0b1111),
-            Err(AffinityError::InvalidMask)
-        );
-        assert_eq!(scheduler.task_affinity_masks[slot], 0b0010);
+        thread::windows_self_alias_owns_two_physical_refs_and_changes_only_thread_mask();
+        thread::process_mask_escape_refuses_after_actual_complete_group_change_without_effects();
     }
 }

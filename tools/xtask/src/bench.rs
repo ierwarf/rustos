@@ -731,10 +731,10 @@ pub(crate) fn bench(
         "--dvm-network-shmem".to_owned(),
         "--dvm-block-shmem".to_owned(),
         "--timeout".to_owned(),
-        // SMP and isolated attribution can legitimately finish after the
-        // ordinary 30-second desktop deadline while host scheduling is noisy.
-        // Keep the diagnostic run bounded without turning that noise into a
-        // false benchmark failure.
+        // Bound guest readiness and the required end marker to 25 seconds.
+        // kvm::run_one_smoke starts this clock only after both guests spawn;
+        // building and host-side launch preparation are outside the budget.
+        // Missing markers still fail, never yielding partial benchmark data.
         timeout_seconds.to_string(),
         // Lock contention is invisible on one CPU: `lock-phase-spin` only
         // moves when two CPUs actually want the same word. Comparing a
@@ -838,14 +838,8 @@ pub(crate) fn bench(
     Ok(())
 }
 
-const fn benchmark_timeout_seconds(rustos_vcpus: u8, isolated: bool) -> u64 {
-    if rustos_vcpus > 1 && isolated {
-        90
-    } else if rustos_vcpus > 1 || isolated {
-        60
-    } else {
-        30
-    }
+const fn benchmark_timeout_seconds(_rustos_vcpus: u8, _isolated: bool) -> u64 {
+    25
 }
 
 #[cfg(test)]

@@ -21,7 +21,7 @@ if [[ "${FORMAL_PROOF_INDEX_ALREADY_PASSED:-0}" != 1 ]]; then
     bash formal/run-proof-index.sh
 fi
 
-packages=(runtime-control rustos-image-admission driver-domain-protocol rustos-user-abi)
+packages=(runtime-control rustos-image-admission driver-domain-protocol rustos-user-abi rustos-scheduler-frame-gate)
 cache_key_args=()
 for package in "${packages[@]}"; do
     cache_key_args+=(--package "$package")

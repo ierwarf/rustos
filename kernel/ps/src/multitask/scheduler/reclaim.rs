@@ -21,7 +21,7 @@ use crate::multitask::process_table::{self, ProcessHandle};
 
 use super::TaskRetireReason;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::multitask) struct RetirementSideEffect {
     task_id: Option<u64>,
     terminal_process_id: Option<u64>,
@@ -37,6 +37,15 @@ impl RetirementSideEffect {
         }
     }
 
+    pub(super) const fn task_id(&self) -> Option<u64> {
+        self.task_id
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_detach_payload(&self) -> Option<ProcessHandle> {
+        self.detach_process_handle
+    }
+
     pub(super) fn defer_process_detach(&mut self, process_handle: ProcessHandle) {
         assert!(
             self.detach_process_handle.replace(process_handle).is_none(),
@@ -44,7 +53,24 @@ impl RetirementSideEffect {
         );
     }
 
-    pub(in crate::multitask) fn complete(self, mut wake_task: impl FnMut(u64)) {
+    pub(in crate::multitask) fn complete(self, wake_task: impl FnMut(u64)) {
+        self.complete_external_with(|effects| effects.revoke_external(wake_task));
+    }
+
+    /// One owner for process detach after external revocation. Native supplies
+    /// ONLY RTC/IPC completion; it cannot replace process detach or row ACK.
+    pub(super) fn complete_external_with(self, external: impl FnOnce(&Self)) {
+        assert!(
+            !nucleus_core::util::lockdep::preemption_disabled(),
+            "scheduler retirement side effects require released raw ownership"
+        );
+        external(&self);
+        if let Some(process_handle) = self.detach_process_handle {
+            let _ = process_table::detach_task(process_handle);
+        }
+    }
+
+    fn revoke_external(&self, mut wake_task: impl FnMut(u64)) {
         assert!(
             !nucleus_core::util::lockdep::preemption_disabled(),
             "scheduler retirement side effects require released raw ownership"
@@ -86,9 +112,6 @@ impl RetirementSideEffect {
             wake_tasks(wake_set.callers(), &mut wake_task);
             wake_tasks(wake_set.receivers(), &mut wake_task);
         }
-        if let Some(process_handle) = self.detach_process_handle {
-            let _ = process_table::detach_task(process_handle);
-        }
     }
 }
 
@@ -107,8 +130,9 @@ fn wake_tasks(task_ids: &[u64], wake_task: &mut impl FnMut(u64)) {
     }
 }
 
-/// Ownership detached under the scheduler lock and destroyed only after that
-/// lock and local interrupt exclusion have been released.
+/// Detached stack/process payload. Production retired reaping retains exact
+/// terminal/resource seals through completion; unpublished rollback has separate
+/// producer custody. Destruction occurs outside raw owners and IRQ exclusion.
 pub(in crate::multitask) struct RetiredSlotReclaim {
     process_handle: Option<ProcessHandle>,
     stack: Option<Vec<u8>>,

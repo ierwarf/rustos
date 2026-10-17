@@ -101,7 +101,15 @@ fn try_handle_current_user_page_fault(
         // has learned nothing about this address, so it must not conclude the
         // address is unmapped. Restart the instruction and read again.
         Err(ps_api::PagerVmaError::Unstable) => return hal_api::UserFaultDisposition::Resumed,
-        Err(_) => return hal_api::UserFaultDisposition::Unhandled,
+        Err(error) => {
+            nucleus_core::debug::record_milestone(
+                nucleus_core::debug::LogCategory::Compat,
+                "pager-user-fault-vma-rejected",
+                cr2,
+                error as u64,
+            );
+            return hal_api::UserFaultDisposition::Unhandled;
+        }
     };
     if vma.task_id == 0 {
         return hal_api::UserFaultDisposition::Unhandled;
@@ -181,6 +189,12 @@ fn try_handle_current_user_page_fault(
                 hal_api::UserFaultDisposition::Resumed
             }
             compat_api::pager::AnonymousFaultOutcome::Refused => {
+                nucleus_core::debug::record_milestone(
+                    nucleus_core::debug::LogCategory::Compat,
+                    "pager-user-anon-fault-refused",
+                    cr2,
+                    u64::from(access) | (u64::from(fault_flags) << 32),
+                );
                 hal_api::UserFaultDisposition::Unhandled
             }
         };

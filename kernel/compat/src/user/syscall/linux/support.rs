@@ -151,8 +151,14 @@ pub(super) fn deliver_pending_signals_if_needed(frame: &mut SyscallFrame) -> boo
             multitask::exit_current_user_process();
         }
         PROCD_SELECT_SIGNAL_STOP => {
+            // A competing original census/creation/exec owner has not performed
+            // any stop effects. Keep the exact pending cause for a later entry;
+            // consuming first would lose STOP under cold-owner contention.
+            let Some(changed) = multitask::stop_current_linux_process(signal) else {
+                return false;
+            };
             clear_current_pending_signal(signal, response.reserved0);
-            if multitask::stop_current_linux_process(signal) {
+            if changed {
                 // The current task remains stopped until SIGCONT or SIGKILL
                 // clears the process-wide job-control state. The scheduler
                 // preserves its pre-stop ready/block state across this yield.

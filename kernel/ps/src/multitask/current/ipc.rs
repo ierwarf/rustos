@@ -24,7 +24,6 @@
 
 use x86_64::instructions::interrupts;
 
-use super::super::cpu_local::{scheduler_mut, scheduler_ref};
 use super::super::{deferred_wake, scheduler};
 
 /// Arms a race-free block on the current task; must be paired with
@@ -61,28 +60,21 @@ pub fn arm_block_current_task_on_pager_service() -> bool {
     arm_current_wait(scheduler::BlockReason::PagerService)
 }
 
-/// The wait payload is owner-generation-bound per slot, and the arm plus its
-/// exact reason are one store, so this CPU's own execution ownership is the
-/// whole precondition. Only a task the owner word does not place `Running`
-/// here needs the catalog guard's lifetime tables.
+/// The original masked CPU scope retains its physical Current bank; the exact
+/// backing loan is consumed before IRQ restoration. No catalog fallback can
+/// manufacture Current custody from a scalar slot or Running word.
 fn arm_current_wait(reason: scheduler::BlockReason) -> bool {
     interrupts::without_interrupts(|| {
-        if let Some(armed) = scheduler::arm_current_wait(reason) {
-            return armed;
-        }
-        // SAFETY: interrupts are masked and no scheduler-owned reference escapes.
-        unsafe { scheduler_mut().arm_block_current_task_with_reason(reason) }
+        // SAFETY: original same-CPU IRQ/Current scope contains the full loan.
+        unsafe { scheduler::arm_current_wait(reason) }.unwrap_or(false)
     })
 }
 
 /// Cancels a previously armed block without marking the current task blocked.
 pub fn cancel_block_current_task() -> bool {
     interrupts::without_interrupts(|| {
-        if let Some(cancelled) = scheduler::cancel_current_wait() {
-            return cancelled;
-        }
-        // SAFETY: interrupts are masked and no scheduler-owned reference escapes.
-        unsafe { scheduler_mut().cancel_block_current_task() }
+        // SAFETY: original same-CPU IRQ/Current scope contains the full loan.
+        unsafe { scheduler::cancel_current_wait() }.unwrap_or(false)
     })
 }
 
@@ -90,21 +82,15 @@ pub fn wake_task(task_id: u64) -> bool {
     if nucleus_core::util::lockdep::preemption_disabled() {
         return deferred_wake::defer_current_cpu(task_id);
     }
-    // SAFETY: interrupts are masked and the scheduler access guard retains the
-    // task catalog for the duration of the wake; no reference escapes.
-    interrupts::without_interrupts(|| unsafe { scheduler_mut().wake_task(task_id) })
+    // Original masked CPU owner, exact binding/frame and queue arbitration;
+    // no Scheduler directory is acquired for this wake producer.
+    scheduler::wake_publication::wake_task(task_id)
 }
 
-/// Permanently removes the current user task's base System-class admission and
-/// caps its permanent fair weight without ever increasing a lower weight. A
-/// reply-scoped IPC priority donation, if any, remains owned by that reply
-/// capability and therefore remains effective until the normal release path.
+/// Irreversible base-class/fair-weight self-demotion under the original masked
+/// CPU and actual physical Current loan. Reply-scoped donations are untouched.
 pub fn demote_current_user_task_to_user_class() -> bool {
-    // SAFETY: interrupts are masked and the scheduler access guard exclusively
-    // owns the current task's class mutation; no reference escapes.
-    interrupts::without_interrupts(|| unsafe {
-        scheduler_mut().demote_current_user_task_to_user_class()
-    })
+    scheduler::current_class::demote()
 }
 
 /// Reports whether `task_id` currently carries the kernel's effective System
@@ -112,42 +98,19 @@ pub fn demote_current_user_task_to_user_class() -> bool {
 /// endpoint enqueue; the reply capability remains the authoritative donation
 /// lifetime after publication.
 pub fn task_has_system_scheduling_class(task_id: u64) -> bool {
-    // SAFETY: interrupts are masked and the scheduler access guard keeps the
-    // queried task binding live for this snapshot; no reference escapes.
-    interrupts::without_interrupts(|| unsafe {
-        scheduler_ref().task_has_system_scheduling_class(task_id)
-    })
+    scheduler::donation_publication::system_class(task_id)
 }
 
 /// Associates a live synchronous IPC reply with a caller-to-server priority
 /// donation. The reply/cancellation paths revoke it before waking the caller.
 pub fn inherit_ipc_priority(reply: u64, donor_task_id: u64, receiver_task_id: u64) -> bool {
-    interrupts::without_interrupts(|| {
-        // The receive commit that binds a reserved edge is the common case and
-        // its receiver is this CPU's current task.
-        if let Some(bound) =
-            scheduler::bind_current_receiver_call_donation(reply, donor_task_id, receiver_task_id)
-        {
-            return bound;
-        }
-        // SAFETY: interrupts are masked and no scheduler-owned reference escapes.
-        unsafe { scheduler_mut().inherit_ipc_priority(reply, donor_task_id, receiver_task_id) }
-    })
+    scheduler::donation_publication::bind(reply, donor_task_id, receiver_task_id, true)
 }
 
-/// Wakes the pager out of its fixed-rendezvous wait because a control request
-/// arrived on its service endpoint. Returns the woken pager task, if any.
-///
-/// The IPC enqueue path calls this only when no endpoint receiver was parked;
-/// see [`scheduler::Scheduler::wake_pager_service_waiter_for_process`] for why
-/// the rendezvous wait is invisible to that path.
+/// Wakes an exact pager-service rendezvous from actual bound process resources.
+/// The original typed wait phase, not a hint or scan, owns publication.
 pub fn wake_pager_service_waiter_for_process(process_id: u64) -> Option<u64> {
-    // SAFETY: interrupt exclusion and the scheduler access guard make the
-    // bounded scan and its single wake one atomic scheduler mutation; no
-    // scheduler-owned reference escapes the closure.
-    interrupts::without_interrupts(|| unsafe {
-        scheduler_mut().wake_pager_service_waiter_for_process(process_id)
-    })
+    scheduler::wake_publication::pager_service(process_id)
 }
 
 /// Binds one dispatched fault token to the fault owner's effective scheduling
@@ -158,35 +121,17 @@ pub fn inherit_pager_fault_priority(
     donor_task_id: u64,
     receiver_task_id: u64,
 ) -> bool {
-    // SAFETY: interrupt exclusion and the scheduler access guard make the
-    // donation upsert an atomic scheduler mutation; no scheduler-owned
-    // reference escapes the closure.
-    interrupts::without_interrupts(|| unsafe {
-        scheduler_mut().inherit_pager_fault_priority(fault_token, donor_task_id, receiver_task_id)
-    })
+    scheduler::donation_publication::pager(fault_token, donor_task_id, receiver_task_id)
 }
 
-/// One scheduler acquisition for the class query and the reservation an IPC
-/// call needs before it can enqueue. See [`scheduler::IpcCallAdmission`].
+/// Original donor/root loans and revalidated reply funding, including non-Current
+/// donors. No scalar Current shortcut or Scheduler fallback grants custody.
 pub fn reserve_ipc_call_donation(donor_task_id: u64) -> scheduler::IpcCallAdmission {
-    interrupts::without_interrupts(|| {
-        // Every input is published per slot for the task this CPU is running,
-        // which is the donor in every syscall admission.
-        if let Some(admission) = scheduler::reserve_current_call_donation(donor_task_id) {
-            return admission;
-        }
-        // SAFETY: interrupt exclusion and the scheduler access guard serialize
-        // the exact class query and donor reservation; no borrow escapes.
-        unsafe { scheduler_mut().reserve_ipc_call_donation(donor_task_id) }
-    })
+    scheduler::donation_publication::reserve_call(donor_task_id)
 }
 
 pub fn reserve_ipc_priority(donor_task_id: u64) -> bool {
-    // SAFETY: interrupt exclusion and the scheduler access guard serialize the
-    // exact donor reservation; no scheduler-owned reference escapes.
-    interrupts::without_interrupts(|| unsafe {
-        scheduler_mut().reserve_ipc_priority(donor_task_id)
-    })
+    scheduler::donation_publication::reserve_priority(donor_task_id)
 }
 
 pub fn cancel_ipc_priority_reservation(donor_task_id: u64) -> bool {
@@ -202,34 +147,7 @@ pub fn attach_reserved_ipc_priority(reply: u64, donor_task_id: u64) -> bool {
 }
 
 pub fn bind_reserved_ipc_priority(reply: u64, donor_task_id: u64, receiver_task_id: u64) -> bool {
-    // SAFETY: interrupt exclusion and the scheduler access guard make binding
-    // the reserved donor to one reply/receiver an atomic scheduler mutation.
-    interrupts::without_interrupts(|| unsafe {
-        scheduler_mut().bind_reserved_ipc_priority(
-            reply,
-            scheduler::ipc_donation::DonationNamespace::IpcReply,
-            donor_task_id,
-            receiver_task_id,
-        )
-    })
-}
-
-/// Selects and binds one exact worker for a process-owned endpoint in the same
-/// scheduler transaction that reserves its reply-scoped donation.
-pub fn bind_ipc_priority_to_process_worker(
-    reply: u64,
-    donor_task_id: u64,
-    receiver_process_id: u64,
-) -> Option<u64> {
-    // SAFETY: interrupts are masked and the scheduler access guard makes the
-    // worker selection and reply donation one catalog transaction.
-    interrupts::without_interrupts(|| unsafe {
-        scheduler_mut().bind_ipc_priority_to_process_worker(
-            reply,
-            donor_task_id,
-            receiver_process_id,
-        )
-    })
+    scheduler::donation_publication::bind(reply, donor_task_id, receiver_task_id, false)
 }
 
 /// Releases a pager-fault donation from the pager-fault key space.
@@ -278,24 +196,10 @@ fn settle_reply_scheduling_context(
     let identity = custody.identity();
     let owner_task_id = custody.context_owner_task_id();
     let settlement = interrupts::without_interrupts(|| {
-        // Custody is decided by the live slot/task binding the identity
-        // encodes, which the per-slot publication already carries. Only an
-        // unresolved or mismatched binding needs the catalog guard.
-        if let Some(published) =
-            scheduler::published_scheduling_context_matches(owner_task_id, identity)
-        {
-            return if published {
-                ReplySchedulingContextSettlement::Returned
-            } else {
-                ReplySchedulingContextSettlement::IdentityMismatch
-            };
-        }
-        // SAFETY: interrupts are masked and no scheduler-owned reference escapes.
-        let scheduler = unsafe { scheduler_ref() };
-        classify_unpublished_reply_custody(
-            scheduler.scheduling_context_matches(owner_task_id, identity),
-            scheduler.scheduling_context_owner_is_live(owner_task_id),
-        )
+        // ONE original identity/resource scalar comparison. Hints are only
+        // candidates; no Scheduler fallback or execution/funding grant escapes.
+        let (matches, live) = scheduler::reply_context_custody(owner_task_id, identity);
+        classify_unpublished_reply_custody(matches, live)
     });
     let _ = interrupts::without_interrupts(|| {
         scheduler::release_reply_donation(
@@ -307,8 +211,9 @@ fn settle_reply_scheduling_context(
 }
 
 /// Returns the exact caller scheduling-context custody carried by one normal
-/// reply. A live task with a mismatched object identity is always corruption;
-/// normal reply completion also requires the owner itself to remain live.
+/// reply. A mismatched live object is corruption. A retained exact object can
+/// return custody after stop, as before; this is NOT a live execution/funding
+/// grant, and the subsequent wake still requires its own lifetime admission.
 pub fn settle_ipc_reply_scheduling_context(
     reply: u64,
     custody: kernel_ipc_runtime::api::ReplySchedulingContextCustody,
@@ -359,72 +264,31 @@ pub fn complete_fast_ipc_reply_wake_handoff_with_custody(
         completion.caller_task_id,
         "fast reply returned scheduling-context custody to a different caller"
     );
-    // SAFETY: interrupts are masked and the scheduler access guard owns the
-    // custody settlement plus exact reply-wake publication transaction.
-    let outcome = interrupts::without_interrupts(|| unsafe {
-        scheduler_mut().settle_and_complete_fast_ipc_reply_handoff(
-            reply,
-            completion.caller_task_id,
-            custody.context_owner_task_id(),
-            custody.identity(),
-            false,
-        )
-    })
-    .expect("fast reply returned stale scheduling-context custody");
-    match outcome {
-        scheduler::FastIpcReplyHandoffOutcome::Direct
-        | scheduler::FastIpcReplyHandoffOutcome::LocalFallback => true,
-        scheduler::FastIpcReplyHandoffOutcome::Rejected => {
-            complete_ipc_reply_wake_handoff(reply, completion.caller_task_id)
-        }
-    }
+    let mut scope = nucleus_core::util::lockdep::DispatchPreemption::enter();
+    scope.mask_irqs();
+    let outcome = scheduler::ipc_publication::reply(
+        &scope,
+        reply,
+        completion.caller_task_id,
+        custody.context_owner_task_id(),
+        custody.identity(),
+    ).expect("fast reply returned stale scheduling-context custody");
+    #[cfg(not(test))]
+    crate::multitask::irq::flush_deferred_target_reschedules();
+    // No generic fresh-lookup fallback after ORIGINAL typed-wait refusal.
+    outcome != scheduler::FastIpcReplyHandoffOutcome::Rejected
 }
 
-/// Completes the scheduling side of a terminal reply with one Scheduler
-/// acquisition, then publishes only its opaque exact wake token to the
-/// target CPU's handoff owner.  A stale token deliberately loses urgency; it
-/// never falls back to the catalog hint path and cannot create execution
-/// authority.
+/// Withdraws exact reply donation and retains the original wake lifetime loan
+/// through exact per-CPU FIFO publication. No legacy guard or lookup after wake.
 pub fn complete_ipc_reply_wake_handoff(reply: u64, task_id: u64) -> bool {
-    let _ = interrupts::without_interrupts(|| {
-        scheduler::release_reply_donation(
-            reply,
-            scheduler::ipc_donation::DonationNamespace::IpcReply,
-        )
-    });
-    // SAFETY: interrupts are masked and the scheduler access guard validates
-    // the exact terminal reply and task before producing an opaque wake token.
-    let token = interrupts::without_interrupts(|| unsafe {
-        scheduler_mut().complete_ipc_reply_wake_handoff(reply, task_id)
-    });
-    interrupts::without_interrupts(|| token.is_some_and(scheduler::enqueue_reply_wake_handoff))
+    scheduler::wake_publication::reply(reply, task_id)
 }
 
-/// Returns a completed pager reply directly to the exact token-blocked fault
-/// owner. Donation release and wake publication use the pager namespace; no
-/// generic wake or best-effort pick hint can target a later wait generation.
+/// Returns only the exact original pager wait epoch; a pending publication
+/// excludes later arms through actual queue effects and binding/FIFO lifetime.
 pub fn complete_pager_fault_wake_handoff(fault_token: u64, task_id: u64) -> bool {
-    let _ = interrupts::without_interrupts(|| {
-        scheduler::release_reply_donation(
-            fault_token,
-            scheduler::ipc_donation::DonationNamespace::PagerFault,
-        )
-    });
-    // SAFETY: interrupt exclusion and the scheduler access guard make the
-    // token check and wake one atomic scheduler mutation. The returned proof
-    // is an opaque post-wake runqueue snapshot, not a scheduler reference.
-    let token = interrupts::without_interrupts(|| unsafe {
-        scheduler_mut().complete_pager_fault_wake_handoff(fault_token, task_id)
-    });
-    interrupts::without_interrupts(|| token.is_some_and(scheduler::enqueue_reply_wake_handoff))
-}
-
-pub fn release_ipc_priorities_for_process(process_id: u64) {
-    // SAFETY: interrupts are masked and the scheduler access guard exclusively
-    // owns the process-wide donation retirement; no reference escapes.
-    interrupts::without_interrupts(|| unsafe {
-        scheduler_mut().release_ipc_priorities_for_process(process_id)
-    });
+    scheduler::wake_publication::pager_reply(fault_token, task_id)
 }
 
 #[cfg(test)]

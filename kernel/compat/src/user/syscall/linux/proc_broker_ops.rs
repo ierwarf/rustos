@@ -900,7 +900,7 @@ pub(super) fn syscall_linux_rustos_proc_activate_broker(args_ptr: u64) -> u64 {
     }
     drop(activations);
     // One-shot capability consumption precedes runnable publication inside
-    // one ProcBrokerRegistry -> Scheduler critical section. Requester cleanup
+    // the registry's scope with exact pinned activation Cohort. Requester cleanup
     // can win before it or observe the committed child after it, never between.
     nucleus_core::debug::record_milestone(
         nucleus_core::debug::LogCategory::Compat,
@@ -1253,10 +1253,10 @@ pub(super) fn syscall_linux_rustos_proc_signal_queue_broker(args_ptr: u64) -> u6
     {
         return linux_errno(LINUX_EINVAL);
     }
-    if multitask::queue_linux_signal(args.target_pid, args.target_tid, args.signal as u64) {
-        0
-    } else {
-        linux_errno(LINUX_ESRCH)
+    match multitask::queue_linux_signal(args.target_pid, args.target_tid, args.signal as u64) {
+        Ok(true) => 0,
+        Ok(false) => linux_errno(LINUX_ESRCH),
+        Err(()) => linux_errno(LINUX_EAGAIN),
     }
 }
 

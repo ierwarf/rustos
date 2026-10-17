@@ -1,15 +1,19 @@
 //! Bounded scheduler runtime attribution for acceptance and field diagnosis.
-//! The scheduler owns accounting and emits no diagnostics while holding its
-//! global raw lock. The first eligible CPU takes one fixed-size snapshot per
-//! second; the timer path renders it only after releasing the scheduler owner.
+//! Owner: CPU counters/pending report; boundary: no resource/rendering in leaves.
+//! Lifecycle: destructive due windows; concurrency: CPU leaves/UID history/CAS.
+//! Failure: busy reports refuse/drop; forbidden: execution/billing/lifetime grants.
+//! Evidence: native window/custody witnesses; no hardware/guard-deletion proof.
 use super::*;
 use core::cell::UnsafeCell;
 use core::panic::Location;
 use core::sync::atomic::{AtomicU8, Ordering};
 mod local_shadow;
 mod lock_census;
+mod report;
+use report::project_window;
 use lock_census::{acquire_site_is_reportable, fnv1a32};
 
+pub(in crate::multitask) mod owner;
 const PROFILE_TOP_TASKS: usize = 4;
 pub(super) const SCHEDULER_ENTRY_CAUSE_COUNT: usize = 4;
 pub(super) const SCHEDULER_PHASE_COUNT: usize = 18;
@@ -90,7 +94,7 @@ pub(in crate::multitask) struct SchedulerRuntimeProfileEntry {
     pub(in crate::multitask) dispatches: u64,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub(in crate::multitask) struct SchedulerRuntimeProfile {
     pub(in crate::multitask) elapsed_ms: u64,
     pub(in crate::multitask) total_runtime_ns: u64,
@@ -167,7 +171,7 @@ pub(in crate::multitask) struct SchedulerRuntimeProfile {
     /// exists so removing the global lock is preceded by proof that the owner
     /// word already means what the legacy tables mean.
     pub(in crate::multitask) run_authority_divergence: Option<(u64, u64, u64)>,
-    pub(in crate::multitask) local_dispatch_shadow: (u64, [u64; 7], u64, u64, u64, u64),
+    pub(in crate::multitask) local_dispatch_shadow: (u64, [u64; 7], u64, u64, u64, u64, u64, u64),
     pub(in crate::multitask) top: [SchedulerRuntimeProfileEntry; PROFILE_TOP_TASKS],
 }
 
@@ -196,6 +200,7 @@ impl PendingSchedulerRuntimeProfile {
             .compare_exchange(
                 PROFILE_EMPTY,
                 PROFILE_BUSY,
+                // ORDERING: claim exclusive producer custody after prior consumer release.
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
@@ -206,6 +211,7 @@ impl PendingSchedulerRuntimeProfile {
         // SAFETY: the successful transition above gives this producer
         // exclusive ownership until READY is release-published.
         unsafe { *self.profile.get() = Some(profile) };
+        // ORDERING: publish the complete non-atomic payload to the consumer.
         self.state.store(PROFILE_READY, Ordering::Release);
         true
     }
@@ -215,6 +221,7 @@ impl PendingSchedulerRuntimeProfile {
             .compare_exchange(
                 PROFILE_READY,
                 PROFILE_BUSY,
+                // ORDERING: observe READY payload while excluding another consumer.
                 Ordering::Acquire,
                 Ordering::Relaxed,
             )
@@ -222,6 +229,7 @@ impl PendingSchedulerRuntimeProfile {
         // SAFETY: Acquire above observes the complete producer write and BUSY
         // excludes another producer until the consumer clears EMPTY.
         let profile = unsafe { (*self.profile.get()).take() };
+        // ORDERING: payload removal precedes reopening exclusive producer custody.
         self.state.store(PROFILE_EMPTY, Ordering::Release);
         profile
     }
@@ -777,328 +785,99 @@ pub fn drain_scheduler_runtime_profile() -> usize {
     work + 1
 }
 
-impl Scheduler {
-    pub(super) fn account_runtime_profile(&mut self, slot: usize, elapsed_ns: u64) {
-        self.runtime_profile_ns[slot] = self.runtime_profile_ns[slot].saturating_add(elapsed_ns);
-    }
-
-    pub(super) fn record_runtime_profile_dispatch(&mut self, slot: usize) {
-        self.runtime_profile_dispatches[slot] =
-            self.runtime_profile_dispatches[slot].saturating_add(1);
-    }
-
-    /// Record the exact outcome of one serialized dispatch. Locality history
-    /// is diagnostic only: policy must not consume these counters because a
-    /// profiler may be reset or disabled without changing scheduling.
-    pub(super) fn record_runtime_profile_transition(
-        &mut self,
-        previous_slot: usize,
-        next_slot: usize,
-        logical_cpu: usize,
-    ) {
-        if previous_slot == next_slot {
-            self.runtime_profile_same_task_dispatches =
-                self.runtime_profile_same_task_dispatches.saturating_add(1);
-        } else {
-            self.runtime_profile_task_switches =
-                self.runtime_profile_task_switches.saturating_add(1);
-            let previous_root = self.contexts[previous_slot]
-                .map(|_| self.slot_address_space_root(previous_slot))
-                .expect("profiled outgoing task missing context");
-            let next_root = self.contexts[next_slot]
-                .map(|_| self.slot_address_space_root(next_slot))
-                .expect("profiled incoming task missing context");
-            if previous_root != next_root {
-                self.runtime_profile_address_space_switches = self
-                    .runtime_profile_address_space_switches
-                    .saturating_add(1);
-            }
-        }
-
-        let logical_cpu = u8::try_from(logical_cpu)
-            .expect("profiled logical CPU index exceeds diagnostic capacity");
-        let task_id = self.starts[next_slot]
-            .map(|start| start.id)
-            .expect("profiled incoming task missing identity");
-        if self.runtime_profile_last_task_id[next_slot] != task_id {
-            self.runtime_profile_last_task_id[next_slot] = task_id;
-            self.runtime_profile_last_cpu[next_slot] = NO_IDLE_CPU;
-        }
-        let previous_cpu = self.runtime_profile_last_cpu[next_slot];
-        if previous_cpu != NO_IDLE_CPU && previous_cpu != logical_cpu {
-            self.runtime_profile_cross_cpu_migrations =
-                self.runtime_profile_cross_cpu_migrations.saturating_add(1);
-        }
-        self.runtime_profile_last_cpu[next_slot] = logical_cpu;
-    }
-
-    pub(in crate::multitask) fn record_runtime_profile_lock_wait(&mut self, elapsed_ns: u64) {
-        self.runtime_profile_lock_acquisitions =
-            self.runtime_profile_lock_acquisitions.saturating_add(1);
-        self.runtime_profile_lock_wait_ns =
-            self.runtime_profile_lock_wait_ns.saturating_add(elapsed_ns);
-        self.runtime_profile_lock_wait_max_ns =
-            self.runtime_profile_lock_wait_max_ns.max(elapsed_ns);
-    }
-
-    /// Charges one complete owner turn.
-    ///
-    /// `attributed_ns` is how much of this turn the in-owner segments claimed.
-    /// It is carried alongside the maximum rather than only summed, because the
-    /// window total cannot say whether the single worst turn was work or a
-    /// host-descheduled vCPU, and that distinction decides whether shortening
-    /// the critical section can help at all.
-    pub(in crate::multitask) fn record_runtime_profile_lock_hold(
-        &mut self,
-        elapsed_ns: u64,
-        attributed_ns: u64,
-        caller: &'static Location<'static>,
-    ) {
-        self.runtime_profile_lock_hold_ns =
-            self.runtime_profile_lock_hold_ns.saturating_add(elapsed_ns);
-        if elapsed_ns > self.runtime_profile_lock_hold_max_ns {
-            self.runtime_profile_lock_hold_max_ns = elapsed_ns;
-            self.runtime_profile_lock_hold_max_caller = Some(caller);
-            self.runtime_profile_lock_hold_max_attributed_ns = attributed_ns;
-        }
-    }
-
-    /// Total in-owner segment time so far, which is the baseline a single owner
-    /// turn is measured against.
-    #[inline]
-    pub(in crate::multitask) fn runtime_profile_phase_total_ns(&self) -> u64 {
-        self.runtime_profile_phase_ns
-            .iter()
-            .copied()
-            .fold(0_u64, u64::saturating_add)
-    }
-
-    /// Charges one acquisition prologue and the deferred wakes it drained.
-    pub(in crate::multitask) fn record_runtime_profile_prologue(
-        &mut self,
-        deferred_wakes: u64,
-        elapsed_ns: u64,
-    ) {
-        self.runtime_profile_deferred_wakes = self
-            .runtime_profile_deferred_wakes
-            .saturating_add(deferred_wakes);
-        self.record_runtime_profile_phase(SchedulerPhase::Prologue, elapsed_ns);
-    }
-
-    /// Charges one disjoint scheduling segment. The caller already holds the
-    /// scheduler owner, so this is an allocation-free counter update and never
-    /// a second time source or diagnostic emission.
-    pub(in crate::multitask) fn record_runtime_profile_phase(
-        &mut self,
-        phase: SchedulerPhase,
-        elapsed_ns: u64,
-    ) {
-        let total = &mut self.runtime_profile_phase_ns[phase as usize];
-        *total = total.saturating_add(elapsed_ns);
-    }
-
-    pub(in crate::multitask) fn record_runtime_profile_entry(
-        &mut self,
-        cause: SchedulerEntryCause,
-    ) {
-        let count = &mut self.runtime_profile_entry_counts[cause as usize];
-        *count = count.saturating_add(1);
-    }
-
-    pub(in crate::multitask) fn take_runtime_profile(
-        &mut self,
-        now_ticks: u64,
-    ) -> Option<SchedulerRuntimeProfile> {
-        if self.runtime_profile_started_ticks == 0 {
-            self.runtime_profile_started_ticks = now_ticks;
-            return None;
-        }
-        let elapsed_ticks = now_ticks.saturating_sub(self.runtime_profile_started_ticks);
-        if elapsed_ticks < crate::arch::rtc::ticks_per_second() {
-            return None;
-        }
-
-        let mut pick_scan_calls = 0_u64;
-        let mut handoff_scan_calls = 0_u64;
-        let mut profile = SchedulerRuntimeProfile {
-            elapsed_ms: Scheduler::ticks_elapsed_ms(self.runtime_profile_started_ticks, now_ticks),
-            total_runtime_ns: 0,
-            total_dispatches: 0,
-            entry_causes: self.runtime_profile_entry_counts,
-            same_task_dispatches: self.runtime_profile_same_task_dispatches,
-            task_switches: self.runtime_profile_task_switches,
-            address_space_switches: self.runtime_profile_address_space_switches,
-            cross_cpu_migrations: self.runtime_profile_cross_cpu_migrations,
-            lock_acquisitions: self.runtime_profile_lock_acquisitions,
-            lock_wait_ns: self.runtime_profile_lock_wait_ns,
-            lock_hold_ns: self.runtime_profile_lock_hold_ns,
-            lock_wait_max_ns: self.runtime_profile_lock_wait_max_ns,
-            lock_hold_max_ns: self.runtime_profile_lock_hold_max_ns,
-            lock_hold_max_caller: self.runtime_profile_lock_hold_max_caller,
-            lock_hold_max_attributed_ns: self.runtime_profile_lock_hold_max_attributed_ns,
-            deferred_wakes: self.runtime_profile_deferred_wakes,
-            pick_scan_ns: {
-                let (ns, calls) = super::locality::take_pick_scan_window();
-                pick_scan_calls = calls;
-                ns
-            },
-            pick_scan_calls,
-            handoff_scan_ns: {
-                let (ns, calls) = super::locality::take_handoff_scan_window();
-                handoff_scan_calls = calls;
-                ns
-            },
-            handoff_scan_calls,
-            sync_handoff_hits: super::locality::take_sync_handoff_hit_window(),
-            sync_handoff_misses: super::locality::take_sync_handoff_miss_window(),
-            sync_handoff_stale: super::locality::take_sync_handoff_stale_window(),
-            sync_handoff_arms: super::locality::take_sync_handoff_arm_window(),
-            sync_handoff_reply_custody_fail:
-                super::locality::take_sync_handoff_reply_custody_fail_window(),
-            sync_handoff_generation_fail_state:
-                super::locality::take_sync_handoff_generation_fail_state_window(),
-            phase_ns: self.runtime_profile_phase_ns,
-            runnable_samples: self.runtime_profile_runnable_samples,
-            live_ipc_donations: {
-                #[cfg(not(test))]
-                {
-                    super::donation_ledger::live_len() as u64
-                }
-                #[cfg(test)]
-                {
-                    self.ipc_priority_donation_len as u64
-                }
-            },
-            divergent_identity_slot: self.divergent_published_identity().unwrap_or(usize::MAX),
-            local_dispatch_shadow: local_shadow::take_observations(),
-            run_authority_divergence: {
-                // Sweep before taking the window so a position no publication
-                // site reached is charged to this window rather than the next.
-                self.sweep_run_authority();
-                super::super::run_authority::take_window().map(|(first, count)| {
-                    // Resolve the slot to its task while the lock is still
-                    // held. A slot number alone forces the reader to guess
-                    // which service it was, and guessing from a slot number is
-                    // how the previous misattributions started.
-                    let slot = ((first >> 32) & 0xFFFF) as usize;
-                    let task_id = self
-                        .starts
-                        .get(slot)
-                        .and_then(|start| *start)
-                        .map(|start| start.id)
-                        .unwrap_or(0);
-                    (first, count, task_id)
-                })
-            },
-            top: [SchedulerRuntimeProfileEntry::default(); PROFILE_TOP_TASKS],
-        };
-        for slot in 0..MAX_TASK {
-            let runtime_ns = self.runtime_profile_ns[slot];
-            let dispatches = self.runtime_profile_dispatches[slot];
-            profile.total_runtime_ns = profile.total_runtime_ns.saturating_add(runtime_ns);
-            profile.total_dispatches = profile.total_dispatches.saturating_add(dispatches);
-            let entry = SchedulerRuntimeProfileEntry {
-                task_id: self.starts[slot].map(|start| start.id).unwrap_or(0),
-                process_id: self.contexts[slot]
-                    .and_then(|context| context.process_id)
-                    .unwrap_or(0),
-                runtime_ns,
-                dispatches,
-            };
-            if let Some(index) = profile.top.iter().position(|current| {
-                (entry.runtime_ns, entry.dispatches) > (current.runtime_ns, current.dispatches)
-            }) {
-                profile.top[index..].rotate_right(1);
-                profile.top[index] = entry;
-            }
-        }
-        self.runtime_profile_ns.fill(0);
-        self.runtime_profile_dispatches.fill(0);
-        self.runtime_profile_entry_counts.fill(0);
-        self.runtime_profile_same_task_dispatches = 0;
-        self.runtime_profile_task_switches = 0;
-        self.runtime_profile_address_space_switches = 0;
-        self.runtime_profile_cross_cpu_migrations = 0;
-        self.runtime_profile_lock_acquisitions = 0;
-        self.runtime_profile_lock_wait_ns = 0;
-        self.runtime_profile_lock_hold_ns = 0;
-        self.runtime_profile_lock_wait_max_ns = 0;
-        self.runtime_profile_lock_hold_max_ns = 0;
-        self.runtime_profile_lock_hold_max_caller = None;
-        self.runtime_profile_lock_hold_max_attributed_ns = 0;
-        self.runtime_profile_deferred_wakes = 0;
-        self.runtime_profile_phase_ns.fill(0);
-        self.runtime_profile_runnable_samples = 0;
-        self.runtime_profile_started_ticks = now_ticks;
-        Some(profile)
-    }
+/// Consume an original independent counter window. Attribution is telemetry,
+/// not a frame/funding/dispatch grant; it may observe later UID publication.
+pub(in crate::multitask) fn take_owned(
+    turn: &crate::multitask::cpu_local::dispatch_turn::CpuDispatchTurn<'static>, now: u64,
+) -> Option<SchedulerRuntimeProfile> {
+    let period = crate::arch::rtc::ticks_per_second();
+    observe_original_current(turn);
+    let window = owner::take(now, period)?;
+    let divergent = (0..MAX_TASK).find(|&slot| current_identity::binding_publication_diverges(slot));
+    Some(project_window(window, now, period, &|slot| {
+        let p = current_identity::read_dispatch(slot);
+        (p.and_then(|p| p.task_id).unwrap_or(0), p.and_then(|p| p.process_id).unwrap_or(0))
+    }, super::donation_ledger::live_len() as u64, divergent))
 }
+/// Independent diagnostic of this CPU's ORIGINAL pre-selection Current.
+/// Remote CPU tables are not a coherent snapshot once the directory is gone;
+/// do not reconstruct a remote execution grant or label in-flight halves bad.
+/// Each entering CPU samples its own retained original bank BEFORE the shared
+/// report epoch decides which collector can drain. This is not a remote-table
+/// sweep or proof of agreement for CPUs taking the periodic continuation path.
+/// Identity publication is separately checked under its original writer leaf.
+pub(super) fn observe_original_current(
+    turn: &crate::multitask::cpu_local::dispatch_turn::CpuDispatchTurn<'static>,
+) {
+    assert!(!turn.owns_priority_choice(), "diagnostic must precede selection");
+    let (cpu, slot) = turn.original_current().expect("diagnostic lacks original Current bank");
+    let owner = super::runqueue::owner(slot);
+    use super::super::run_authority::{self, Mismatch};
+    let mismatch = if !current_identity::execution::banks::owns_current(cpu, slot) {
+        Some(Mismatch::CurrentPermitMissing)
+    } else if owner.state == super::runqueue::RunOwnerState::Running {
+        (owner.cpu != Some(cpu)).then_some(Mismatch::RunningOnDifferentCpus)
+    } else if owner.state.is_terminal() {
+        // Desired stop may win while original physical Current still executes
+        // its last kernel continuation. Bank/permit persist through final ACK.
+        None
+    } else {
+        Some(Mismatch::LegacyRunningQueueNot)
+    };
+    if let Some(kind) = mismatch { run_authority::record(slot, kind); }
+}
+
+pub(in crate::multitask) fn record_entry(cause: SchedulerEntryCause) {
+    owner::local(|window| window.entry(cause));
+}
+
+/// Count work in the independent IRQ entry without lending counter mutation
+/// authority to its caller. No diagnostic counter is a scheduling grant.
+pub(in crate::multitask) fn record_prologue(wakes: usize, elapsed: u64) {
+    owner::local(|row| {
+        row.runtime_profile_deferred_wakes = row.runtime_profile_deferred_wakes.saturating_add(wakes as u64);
+        row.phase(SchedulerPhase::Prologue, elapsed);
+    });
+}
+
+
 
 #[cfg(test)]
 mod tests {
+    // Earlier native counter input, not a production Scheduler authority.
+    // Both fixtures and the actual independent drain use the SAME projector.
+    fn take_counter_fixture(counters: &mut super::owner::Counters, now: u64)
+        -> Option<super::SchedulerRuntimeProfile> {
+        let period = crate::arch::rtc::ticks_per_second();
+        if counters.runtime_profile_started_ticks == 0 {
+            counters.runtime_profile_started_ticks = now;
+            return None;
+        }
+        if now.saturating_sub(counters.runtime_profile_started_ticks) < period { return None; }
+        let started = counters.runtime_profile_started_ticks;
+        let mut window = counters.take();
+        window.runtime_profile_started_ticks = started;
+        counters.runtime_profile_started_ticks = now;
+        Some(super::project_window(window, now, period, &|_| (0, 0), 0, None))
+    }
     use alloc::boxed::Box;
 
     use super::*;
 
-    static TEST_SCHEDULER_TEMPLATE: Scheduler = Scheduler::new();
-
-    fn boxed_scheduler() -> Box<Scheduler> {
-        let mut scheduler = Box::<Scheduler>::new_uninit();
-        unsafe {
-            // SAFETY: the immutable template is fully initialized and the
-            // destination is one disjoint allocation of the exact same type.
-            core::ptr::copy_nonoverlapping(
-                core::ptr::addr_of!(TEST_SCHEDULER_TEMPLATE),
-                scheduler.as_mut_ptr(),
-                1,
-            );
-            scheduler.assume_init()
-        }
-    }
-
-    fn profile_context(address_space_root: u64) -> TaskContext {
-        TaskContext {
-            scheduling_context: scheduling_context::SchedulingContext::bind(0, 1),
-            saved_rsp: 0,
-            #[cfg(test)]
-            test_ready: true,
-            ready_since_ticks: 0,
-            blocked: false,
-            blocked_since_ticks: 0,
-            #[cfg(test)]
-            wake_armed: false,
-            #[cfg(test)]
-            block_reason: BlockReason::None,
-            weight: NICE_0_LOAD,
-            #[cfg(test)]
-            vruntime_ns: 0,
-            #[cfg(test)]
-            exec_start_ticks: 0,
-            address_space_root,
-            kernel_stack_base: 0,
-            kernel_stack_top: 0,
-            alternate_kernel_stack_base: 0,
-            alternate_kernel_stack_top: 0,
-            user_mode: false,
-            user_abi: None,
-            console_session: ConsoleSessionHandle::SYSTEM,
-            process_handle: None,
-            process_id: None,
-            user_stack: None,
-            windows_thread_state: None,
-        }
+    fn boxed_counters() -> Box<owner::Counters> {
+        Box::new(owner::Counters::new())
     }
 
     #[test]
     fn runtime_profile_is_windowed_ranked_and_destructive() {
-        let mut scheduler = boxed_scheduler();
+        let mut scheduler = boxed_counters();
         scheduler.runtime_profile_started_ticks = 1;
         scheduler.runtime_profile_ns[3] = 7_000_000;
         scheduler.runtime_profile_dispatches[3] = 4;
         scheduler.runtime_profile_ns[9] = 11_000_000;
         scheduler.runtime_profile_dispatches[9] = 2;
         let now = 1 + crate::arch::rtc::ticks_per_second();
-        let profile = scheduler.take_runtime_profile(now).expect("profile window");
+        let profile = take_counter_fixture(&mut scheduler, now).expect("profile window");
         assert_eq!(profile.total_runtime_ns, 18_000_000);
         assert_eq!(profile.total_dispatches, 6);
         assert_eq!(profile.top[0].runtime_ns, 11_000_000);
@@ -1110,7 +889,7 @@ mod tests {
                 .iter()
                 .all(|value| *value == 0)
         );
-        assert!(scheduler.take_runtime_profile(now).is_none());
+        assert!(take_counter_fixture(&mut scheduler, now).is_none());
     }
 
     #[test]
@@ -1150,7 +929,7 @@ mod tests {
             live_ipc_donations: 0,
             divergent_identity_slot: usize::MAX,
             run_authority_divergence: None,
-            local_dispatch_shadow: (0, [0; 7], 0, 0, 0, 0),
+            local_dispatch_shadow: (0, [0; 7], 0, 0, 0, 0, 0, 0),
             top: [SchedulerRuntimeProfileEntry::default(); PROFILE_TOP_TASKS],
         };
         assert!(pending.publish(profile));
@@ -1169,7 +948,7 @@ mod tests {
 
     #[test]
     fn runtime_profile_entry_causes_are_exact_and_destructive() {
-        let mut scheduler = boxed_scheduler();
+        let mut scheduler = boxed_counters();
         scheduler.runtime_profile_started_ticks = 1;
         for (cause, count) in [
             (SchedulerEntryCause::Timer, 2),
@@ -1178,66 +957,59 @@ mod tests {
             (SchedulerEntryCause::Software, 5),
         ] {
             for _ in 0..count {
-                scheduler.record_runtime_profile_entry(cause);
+                scheduler.entry(cause);
             }
         }
         let now = 1 + crate::arch::rtc::ticks_per_second();
-        let profile = scheduler.take_runtime_profile(now).expect("profile window");
+        let profile = take_counter_fixture(&mut scheduler, now).expect("profile window");
         assert_eq!(profile.entry_causes, [2, 3, 4, 5]);
         assert_eq!(scheduler.runtime_profile_entry_counts, [0; 4]);
     }
 
     #[test]
     fn runtime_profile_distinguishes_switches_roots_and_migrations() {
-        let mut scheduler = boxed_scheduler();
-        scheduler.contexts[1] = Some(profile_context(0x1000));
-        scheduler.contexts[2] = Some(profile_context(0x2000));
-        scheduler.starts[1] = Some(TaskStart {
-            entry: |_| {},
-            id: 41,
-        });
-        scheduler.starts[2] = Some(TaskStart {
-            entry: |_| {},
-            id: 42,
-        });
-
-        scheduler.record_runtime_profile_transition(1, 1, 0);
-        scheduler.record_runtime_profile_transition(1, 2, 0);
-        scheduler.record_runtime_profile_transition(1, 2, 1);
-
-        assert_eq!(scheduler.runtime_profile_same_task_dispatches, 1);
-        assert_eq!(scheduler.runtime_profile_task_switches, 2);
-        assert_eq!(scheduler.runtime_profile_address_space_switches, 2);
-        assert_eq!(scheduler.runtime_profile_cross_cpu_migrations, 1);
-
-        scheduler.runtime_profile_started_ticks = 1;
+        let _namespace = crate::multitask::scheduler::tests::boxed_scheduler();
+        // Earlier switch/root samples are modeled diagnostic inputs, not
+        // execution permission. Migration history and destructive projection
+        // execute the SAME independent production owners, without a catalog.
+        owner::clear_history(2);
+        assert!(!owner::migration(2, 42, 0));
+        assert!(owner::migration(2, 42, 1));
+        let mut counters = boxed_counters();
+        counters.runtime_profile_same_task_dispatches = 1;
+        counters.runtime_profile_task_switches = 2;
+        counters.runtime_profile_address_space_switches = 2;
+        counters.runtime_profile_cross_cpu_migrations = 1;
+        counters.runtime_profile_started_ticks = 1;
         let now = 1 + crate::arch::rtc::ticks_per_second();
-        let profile = scheduler.take_runtime_profile(now).expect("profile window");
+        let profile = take_counter_fixture(&mut counters, now).unwrap();
         assert_eq!(profile.same_task_dispatches, 1);
         assert_eq!(profile.task_switches, 2);
         assert_eq!(profile.address_space_switches, 2);
         assert_eq!(profile.cross_cpu_migrations, 1);
-        assert_eq!(scheduler.runtime_profile_same_task_dispatches, 0);
-        assert_eq!(scheduler.runtime_profile_task_switches, 0);
-        assert_eq!(scheduler.runtime_profile_address_space_switches, 0);
-        assert_eq!(scheduler.runtime_profile_cross_cpu_migrations, 0);
-        assert_eq!(scheduler.runtime_profile_last_cpu[2], 1);
-        assert_eq!(scheduler.runtime_profile_last_task_id[2], 42);
+        assert_eq!(counters.runtime_profile_same_task_dispatches, 0);
+        assert_eq!(counters.runtime_profile_task_switches, 0);
+        assert_eq!(counters.runtime_profile_address_space_switches, 0);
+        assert_eq!(counters.runtime_profile_cross_cpu_migrations, 0);
+        // The original per-slot history is NOT spent with a report window.
+        assert!(!owner::migration(2, 42, 1));
+        assert!(!owner::migration(2, 43, 0));
+        owner::clear_history(2);
     }
 
     #[test]
     fn runtime_profile_lock_totals_and_maxima_are_destructive() {
-        let mut scheduler = boxed_scheduler();
-        scheduler.record_runtime_profile_lock_wait(300);
-        scheduler.record_runtime_profile_lock_wait(700);
+        let mut scheduler = boxed_counters();
+        scheduler.wait(300);
+        scheduler.wait(700);
         let worst = Location::caller();
         let lesser = Location::caller();
-        scheduler.record_runtime_profile_lock_hold(2_000, 1_500, worst);
-        scheduler.record_runtime_profile_lock_hold(1_000, 900, lesser);
+        scheduler.hold(2_000, 1_500, worst);
+        scheduler.hold(1_000, 900, lesser);
         scheduler.runtime_profile_started_ticks = 1;
 
         let now = 1 + crate::arch::rtc::ticks_per_second();
-        let profile = scheduler.take_runtime_profile(now).expect("profile window");
+        let profile = take_counter_fixture(&mut scheduler, now).expect("profile window");
         assert_eq!(profile.lock_wait_ns, 1_000);
         assert_eq!(profile.lock_wait_max_ns, 700);
         assert_eq!(profile.lock_hold_ns, 3_000);
@@ -1258,20 +1030,22 @@ mod tests {
 
     #[test]
     fn acquisition_prologue_is_a_disjoint_segment_with_its_wake_count() {
-        let mut scheduler = boxed_scheduler();
-        scheduler.record_runtime_profile_prologue(0, 40);
-        scheduler.record_runtime_profile_prologue(3, 260);
-        assert_eq!(
-            scheduler.runtime_profile_phase_ns[SchedulerPhase::Prologue as usize],
-            300
-        );
-        assert_eq!(scheduler.runtime_profile_phase_total_ns(), 300);
-        scheduler.runtime_profile_started_ticks = 1;
+        let _namespace = crate::multitask::scheduler::tests::boxed_scheduler();
+        owner::local(|row| *row = owner::Counters::new());
+        record_prologue(0, 40);
+        record_prologue(3, 260);
+        let mut window = owner::local(|row| {
+            assert_eq!(row.runtime_profile_phase_ns[SchedulerPhase::Prologue as usize], 300);
+            assert_eq!(row.runtime_profile_phase_ns.iter().copied().sum::<u64>(), 300);
+            row.take()
+        });
+        // Projection is outside the original diagnostic leaf, never nested work.
+        window.runtime_profile_started_ticks = 1;
         let now = 1 + crate::arch::rtc::ticks_per_second();
-        let profile = scheduler.take_runtime_profile(now).expect("profile window");
+        let profile = take_counter_fixture(&mut window, now).unwrap();
         assert_eq!(profile.deferred_wakes, 3);
         assert_eq!(profile.phase_ns[SchedulerPhase::Prologue as usize], 300);
-        assert_eq!(scheduler.runtime_profile_deferred_wakes, 0);
+        assert_eq!(owner::local(|row| row.runtime_profile_deferred_wakes), 0);
     }
 
     #[test]

@@ -22,12 +22,13 @@
 //! - **Evidence:** `synchronous-ipc-handoff/SynchronousIpcHandoff`, exact
 //!   implementation mutants, host witnesses, and the SMP KVM matrix.
 
-use nucleus_core::util::lockdep::{LockClass, MAX_TRACKED_CPUS, TrackedSpinLock};
+use nucleus_core::util::lockdep::{LockClass, MAX_TRACKED_CPUS};
+use crate::multitask::irq_leaf::IrqLeaf;
 
 use super::{MAX_SYNC_HANDOFF_CHAIN_TICKS, MAX_TASK, runqueue};
 
 pub(super) type SyncHandoffLock =
-    TrackedSpinLock<SyncHandoffState, { LockClass::SchedulerPolicy as u8 }>;
+    IrqLeaf<SyncHandoffState, { LockClass::SchedulerPolicy as u8 }>;
 
 /// An ordering record is keyed by the monotonic task identity as well as its
 /// storage slot.  A stale record therefore cannot prioritize a later task
@@ -37,6 +38,9 @@ pub(super) struct SyncHandoffRecord {
     slot: usize,
     task_id: u64,
     custody: SyncHandoffCustody,
+    // Bound only after taking a Generic FIFO record (or at an immediate
+    // handoff). Queued Generic records remain ordering-only and refreshable.
+    selected_local_owner: Option<(u64, usize)>,
 }
 
 /// Generic handoffs establish ordering only. Reply-derived handoffs retain the
@@ -45,6 +49,10 @@ pub(super) struct SyncHandoffRecord {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SyncHandoffCustody {
     Generic,
+    Direct {
+        owner_generation: u64,
+        target_cpu: usize,
+    },
     ReplyWake {
         owner_generation: u64,
         target_cpu: usize,
@@ -57,6 +65,7 @@ impl SyncHandoffRecord {
             slot,
             task_id,
             custody: SyncHandoffCustody::Generic,
+            selected_local_owner: None,
         }
     }
 
@@ -73,6 +82,7 @@ impl SyncHandoffRecord {
                 owner_generation,
                 target_cpu,
             },
+            selected_local_owner: None,
         }
     }
 
@@ -84,10 +94,69 @@ impl SyncHandoffRecord {
         self.task_id
     }
 
+    pub(super) fn bound_direct_generation(self) -> Option<u64> {
+        match self.custody {
+            SyncHandoffCustody::Direct { owner_generation, .. } => Some(owner_generation),
+            _ => None,
+        }
+    }
+
+    /// Exact FIFO proofs and consumed Generic records bound to a Local owner
+    /// carry one generation through final frame validation and claim.
+    pub(super) fn claim_generation(self) -> Option<u64> {
+        match self.custody {
+            SyncHandoffCustody::Generic => self.selected_local_owner.map(|(generation, _)| generation),
+            SyncHandoffCustody::Direct {
+                owner_generation, ..
+            }
+            | SyncHandoffCustody::ReplyWake {
+                owner_generation, ..
+            } => Some(owner_generation),
+        }
+    }
+
+    /// A direct IPC receiver has no fair membership, so its FIFO urgency
+    /// belongs to the exact owner generation observed at enqueue. Other
+    /// generic hints keep their existing catalog-validated semantics.
+    pub(super) fn bind_direct_owner(
+        mut self,
+        owner: runqueue::RunOwnerSnapshot,
+        target_cpu: usize,
+    ) -> Self {
+        if matches!(self.custody, SyncHandoffCustody::Generic)
+            && owner.state == runqueue::RunOwnerState::DirectHandoff
+            && owner.cpu == Some(target_cpu)
+            && owner.runnable
+        {
+            self.custody = SyncHandoffCustody::Direct {
+                owner_generation: owner.generation,
+                target_cpu,
+            };
+        }
+        self
+    }
+
+    /// Bind a *consumed* Generic hint to the exact Local owner observed at
+    /// selection. Never attach this token while the record is still queued.
+    pub(super) fn bind_selected_local_owner(
+        mut self,
+        owner: runqueue::RunOwnerSnapshot,
+        cpu: usize,
+    ) -> Self {
+        if matches!(self.custody, SyncHandoffCustody::Generic)
+            && owner.state == runqueue::RunOwnerState::Local
+            && owner.cpu == Some(cpu)
+            && owner.runnable
+        {
+            self.selected_local_owner = Some((owner.generation, cpu));
+        }
+        self
+    }
+
     fn reply_target_cpu(self) -> usize {
         match self.custody {
             SyncHandoffCustody::ReplyWake { target_cpu, .. } => target_cpu,
-            SyncHandoffCustody::Generic => {
+            SyncHandoffCustody::Generic | SyncHandoffCustody::Direct { .. } => {
                 panic!("generic synchronous handoff cannot be used as a reply token")
             }
         }
@@ -98,7 +167,21 @@ impl SyncHandoffRecord {
     /// after their wake. This predicate is also the selection-time check.
     fn matches_dispatch_owner(self, owner: runqueue::RunOwnerSnapshot) -> bool {
         match self.custody {
-            SyncHandoffCustody::Generic => true,
+            SyncHandoffCustody::Generic => self.selected_local_owner.is_none_or(|(generation, cpu)| {
+                owner.state == runqueue::RunOwnerState::Local
+                    && owner.cpu == Some(cpu)
+                    && owner.generation == generation
+                    && owner.runnable
+            }),
+            SyncHandoffCustody::Direct {
+                owner_generation,
+                target_cpu,
+            } => {
+                owner.state == runqueue::RunOwnerState::DirectHandoff
+                    && owner.cpu == Some(target_cpu)
+                    && owner.generation == owner_generation
+                    && owner.runnable
+            }
             SyncHandoffCustody::ReplyWake {
                 owner_generation,
                 target_cpu,
@@ -155,6 +238,16 @@ impl SyncHandoffRecord {
     fn refreshes(self, existing: Self) -> bool {
         match (self.custody, existing.custody) {
             (
+                SyncHandoffCustody::Direct {
+                    owner_generation: incoming,
+                    ..
+                },
+                SyncHandoffCustody::Direct {
+                    owner_generation: existing,
+                    ..
+                },
+            ) => incoming >= existing,
+            (
                 SyncHandoffCustody::ReplyWake {
                     owner_generation: incoming,
                     ..
@@ -162,13 +255,20 @@ impl SyncHandoffRecord {
                 SyncHandoffCustody::ReplyWake {
                     owner_generation: existing,
                     ..
+                }
+                | SyncHandoffCustody::Direct {
+                    owner_generation: existing,
+                    ..
                 },
             ) => incoming >= existing,
             (SyncHandoffCustody::ReplyWake { .. }, SyncHandoffCustody::Generic) => true,
+            (SyncHandoffCustody::Direct { .. }, SyncHandoffCustody::Generic) => true,
             // A generic hint has no runqueue generation to prove it is newer.
             // It may deduplicate at the same FIFO position, but must never
             // weaken an exact reply handoff into task-id-only urgency.
-            (SyncHandoffCustody::Generic, SyncHandoffCustody::ReplyWake { .. })
+            (SyncHandoffCustody::Direct { .. }, SyncHandoffCustody::ReplyWake { .. })
+            | (SyncHandoffCustody::Generic, SyncHandoffCustody::Direct { .. })
+            | (SyncHandoffCustody::Generic, SyncHandoffCustody::ReplyWake { .. })
             | (SyncHandoffCustody::Generic, SyncHandoffCustody::Generic) => false,
         }
     }
@@ -211,7 +311,7 @@ impl ReplyWakeHandoff {
         self.record.matches_dispatch_owner(owner)
     }
 
-    fn target_cpu(self) -> usize {
+    pub(super) fn target_cpu(self) -> usize {
         self.record.reply_target_cpu()
     }
 }
@@ -237,6 +337,20 @@ impl SyncHandoffState {
     }
 
     pub(super) fn enqueue(&mut self, record: SyncHandoffRecord) -> bool {
+        self.enqueue_with_direct_owner(record, None)
+    }
+
+    /// A fresh, exact DirectHandoff owner may supersede a stale reply-wake
+    /// record at the same FIFO position. A generic hint without that owner
+    /// proof must never downgrade an exact live reply generation.
+    fn enqueue_with_direct_owner(
+        &mut self,
+        record: SyncHandoffRecord,
+        direct_owner: Option<(runqueue::RunOwnerSnapshot, usize)>,
+    ) -> bool {
+        let record = direct_owner
+            .map(|(owner, cpu)| record.bind_direct_owner(owner, cpu))
+            .unwrap_or(record);
         if let Some(index) = (0..self.len).find_map(|offset| {
             let index = (self.head + offset) % MAX_TASK;
             self.records[index]
@@ -245,7 +359,17 @@ impl SyncHandoffState {
         }) {
             let existing = self.records[index]
                 .expect("scheduler synchronous handoff prefix contains an empty entry");
-            if record.refreshes(existing) {
+            let supersedes_stale_reply =
+                matches!(record.custody, SyncHandoffCustody::Direct { .. })
+                    && matches!(existing.custody, SyncHandoffCustody::ReplyWake { .. })
+                    && direct_owner.is_some_and(|(owner, target_cpu)| {
+                        owner.state == runqueue::RunOwnerState::DirectHandoff
+                            && owner.runnable
+                            && owner.cpu == Some(target_cpu)
+                            && (existing.slot != record.slot
+                                || !existing.matches_dispatch_owner(owner))
+                    });
+            if record.refreshes(existing) || supersedes_stale_reply {
                 self.records[index] = Some(record);
             }
             return true;
@@ -269,8 +393,19 @@ impl SyncHandoffState {
     pub(super) fn take_next_ready_with_competitor(
         &mut self,
         fair_competitor_ready: bool,
-        mut ready: impl FnMut(SyncHandoffRecord) -> bool,
+        ready: impl FnMut(SyncHandoffRecord) -> bool,
     ) -> Option<usize> {
+        self.take_next_ready_record_with_competitor(fair_competitor_ready, ready)
+            .map(SyncHandoffRecord::slot)
+    }
+
+    /// Preserve the exact FIFO proof through selection. Returning only a slot
+    /// discards the generation that a final dispatch claim must compare.
+    pub(super) fn take_next_ready_record_with_competitor(
+        &mut self,
+        fair_competitor_ready: bool,
+        mut ready: impl FnMut(SyncHandoffRecord) -> bool,
+    ) -> Option<SyncHandoffRecord> {
         if fair_competitor_ready && self.handoff_streak >= MAX_SYNC_HANDOFF_CHAIN_TICKS {
             #[cfg(rustos_scheduler_phase_profile)]
             super::locality::record_sync_handoff_miss(
@@ -279,8 +414,6 @@ impl SyncHandoffState {
             return None;
         }
         if self.len == 0 {
-            // Nothing was discarded, so charging `DrainedStale` here would
-            // attribute a stale *flag* to stale *records*.
             #[cfg(rustos_scheduler_phase_profile)]
             super::locality::record_sync_handoff_miss(
                 super::locality::SyncHandoffMissReason::StartedEmpty,
@@ -295,7 +428,7 @@ impl SyncHandoffState {
             self.head = (index + 1) % MAX_TASK;
             self.len -= 1;
             if ready(record) {
-                return Some(record.slot);
+                return Some(record);
             }
         }
         #[cfg(rustos_scheduler_phase_profile)]
@@ -361,14 +494,6 @@ impl SyncHandoffState {
     }
 }
 
-/// Host scheduler fixtures must remain isolated, but they execute the same
-/// FIFO, identity, and fairness state machine as the production per-CPU
-/// backend.  Only the storage owner differs under `cfg(test)`.
-#[cfg(test)]
-pub(super) const fn per_scheduler_locks() -> [SyncHandoffLock; MAX_TRACKED_CPUS] {
-    [const { SyncHandoffLock::new(SyncHandoffState::new()) }; MAX_TRACKED_CPUS]
-}
-
 static SYNC_HANDOFFS: [SyncHandoffLock; MAX_TRACKED_CPUS] =
     [const { SyncHandoffLock::new(SyncHandoffState::new()) }; MAX_TRACKED_CPUS];
 
@@ -419,7 +544,13 @@ fn enqueue_and_publish(target_cpu: usize, record: SyncHandoffRecord) -> bool {
     // CPU to observe an already-committed record as absent and miss the direct
     // handoff for one scheduling turn.
     let mut state = state_for_cpu(target_cpu).lock();
-    let retained = state.enqueue(record);
+    // Under Scheduler, a newly published direct owner is newer than a
+    // queued reply-wake proof for the same task. Compare its *current* owner
+    // generation inside this FIFO transaction; otherwise generic dedup keeps
+    // the stale reply, whose later rejection silently drops the sole direct
+    // ordering token while the task has no fair-runqueue membership.
+    let owner = runqueue::owner(record.slot());
+    let retained = state.enqueue_with_direct_owner(record, Some((owner, target_cpu)));
     if retained {
         if let Some(pending) = SYNC_HANDOFF_PENDING.get(target_cpu) {
             // ORDERING: release publishes the enqueued record before the flag
@@ -431,16 +562,56 @@ fn enqueue_and_publish(target_cpu: usize, record: SyncHandoffRecord) -> bool {
     retained
 }
 
-/// Whether taking the FIFO lock can find anything. Test schedulers drive
-/// isolated `SyncHandoffState`s rather than these statics, so they always take
-/// the guarded path.
-pub(super) fn pending(cpu: usize) -> bool {
-    #[cfg(test)]
-    {
-        let _ = cpu;
-        true
+/// Short leaf join for an ORIGINAL IPC receiver. Capacity precedes its exact
+/// owner CAS/wait clear, under the same FIFO leaf; no rollback or incomplete
+/// prefix is exposed. `commit` may acquire only Wait58 and perform scalar CAS.
+/// Physical reader/binding loans and masked CPU custody remain outside leaves.
+pub(super) fn publish_original(
+    target_cpu: usize,
+    record: SyncHandoffRecord,
+    commit: impl FnOnce() -> Option<runqueue::RunOwnerSnapshot>,
+) -> Option<runqueue::RunOwnerSnapshot> {
+    let mut state = state_for_cpu(target_cpu).lock();
+    let duplicate = (0..state.len).any(|offset| {
+        state.records[(state.head + offset) % MAX_TASK]
+            .is_some_and(|queued| queued.task_id == record.task_id)
+    });
+    if !duplicate && state.len == MAX_TASK {
+        return None;
     }
-    #[cfg(not(test))]
+    let owner = commit()?;
+    assert!(state.enqueue_with_direct_owner(record, Some((owner, target_cpu))));
+    // ORDERING: publish the committed FIFO prefix before any pending consumer.
+    SYNC_HANDOFF_PENDING[target_cpu].store(true, core::sync::atomic::Ordering::Release);
+    Some(owner)
+}
+
+/// Explicit native exhausted-capacity input only. No UID/record is backing,
+/// funding or execution permission; the actual caller still owns real loans.
+#[cfg(test)]
+pub(super) fn with_full_fifo_model<R>(cpu: usize, f: impl FnOnce() -> R) -> R {
+    let mut full = SyncHandoffState::new();
+    for slot in 0..MAX_TASK {
+        full.enqueue(SyncHandoffRecord::new(slot, 900000 + slot as u64));
+    }
+    let saved = core::mem::replace(&mut *state_for_cpu(cpu).lock(), full);
+    // ORDERING: fixture takes and replaces the previous pending publication.
+    let pending = SYNC_HANDOFF_PENDING[cpu].swap(true, core::sync::atomic::Ordering::AcqRel);
+    struct Restore(usize, Option<SyncHandoffState>, bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            *state_for_cpu(self.0).lock() = self.1.take().unwrap();
+            // ORDERING: restore FIFO contents before their original pending flag.
+            SYNC_HANDOFF_PENDING[self.0].store(self.2, core::sync::atomic::Ordering::Release);
+        }
+    }
+    let _restore = Restore(cpu, Some(saved), pending);
+    f()
+}
+
+/// Whether taking the FIFO leaf can find anything. Production and native
+/// owner witnesses observe the SAME pending publication and queue.
+pub(super) fn pending(cpu: usize) -> bool {
     SYNC_HANDOFF_PENDING.get(cpu).is_some_and(|pending| {
         // ORDERING: acquire pairs with the enqueueing CPU's release, so
         // observing the flag also observes the record it advertises.
@@ -448,10 +619,9 @@ pub(super) fn pending(cpu: usize) -> bool {
     })
 }
 
-/// Enqueues a catalog-validated generic handoff while the caller still holds
-/// the scheduler lock.  This is the only production publisher for non-reply
-/// synchronous handoffs.
-#[cfg(not(test))]
+/// Publishes an original caller-qualified handoff into the actual per-CPU
+/// FIFO. Exact Direct owner generation is bound before publication; neither
+/// the scalar peer hint nor a native fixture queue can substitute for it.
 pub(super) fn enqueue(target_cpu: usize, record: SyncHandoffRecord) -> bool {
     enqueue_and_publish(target_cpu, record)
 }
@@ -489,14 +659,14 @@ pub(super) fn enqueue_reply_wake(token: ReplyWakeHandoff) -> bool {
     accepted
 }
 
-/// Consumes this CPU's FIFO while the scheduler catalog validates each exact
-/// identity and local runqueue custody.
-#[cfg(not(test))]
+/// Consumes this CPU's FIFO while the independent dispatcher qualifies exact
+/// published identity and runqueue custody. Preserve the consumed record's owner
+/// generation for the original physical claim.
 pub(super) fn take_next_ready(
     cpu: usize,
     fair_competitor_ready: bool,
     ready: impl FnMut(SyncHandoffRecord) -> bool,
-) -> Option<usize> {
+) -> Option<SyncHandoffRecord> {
     if fair_competitor_ready
         && SYNC_HANDOFF_STREAK[cpu].load(core::sync::atomic::Ordering::Relaxed)
             >= MAX_SYNC_HANDOFF_CHAIN_TICKS
@@ -508,26 +678,14 @@ pub(super) fn take_next_ready(
         return None;
     }
     let mut state = state_for_cpu(cpu).lock();
-    // The production fairness owner is `SYNC_HANDOFF_STREAK`; the field in
-    // `SyncHandoffState` is the identical isolated host-fixture state machine.
     debug_assert_eq!(state.handoff_streak, 0);
-    let taken = state.take_next_ready_with_competitor(fair_competitor_ready, ready);
-    // Clear on any queue this CPU has just seen empty under the lock,
-    // including one a successful take emptied. The one-sided invariant is
-    // unchanged and the proof is the same: an enqueue publishes `true` before
-    // releasing this same FIFO lock. A consumer that observes the queue empty
-    // under the lock therefore cannot clear the flag between a committed
-    // insert and its advertisement. Restricting the clear to `None`
-    // results left the flag set after every take that emptied the FIFO, so the
-    // next dispatch paid this lock only to read `len == 0` -- the exact
-    // acquisition `pending()` exists to avoid. An exhausted chain budget still
-    // returns with records queued, and `state.len == 0` declines to clear
-    // there.
+    let taken = state.take_next_ready_record_with_competitor(fair_competitor_ready, ready);
+    // Clear on any queue this CPU has just seen empty under the lock. An
+    // enqueue publishes `true` before releasing this same FIFO lock.
     if state.len == 0 {
         if let Some(pending) = SYNC_HANDOFF_PENDING.get(cpu) {
-            // ORDERING: release keeps the clear behind the drain that
-            // justified it, so a producer that observes `false` has already
-            // had its record consumed rather than merely enqueued.
+            // ORDERING: release keeps the clear behind the locked drain so a
+            // producer observing false cannot miss an unconsumed record.
             pending.store(false, core::sync::atomic::Ordering::Release);
         }
     }
@@ -544,7 +702,6 @@ pub(super) fn immediate_handoff_allowed(cpu: usize, fair_competitor_ready: bool)
             < MAX_SYNC_HANDOFF_CHAIN_TICKS
 }
 
-#[cfg(not(test))]
 pub(super) fn record_dispatch(cpu: usize, synchronous_handoff: bool, now_ticks: u64) {
     let streak = &SYNC_HANDOFF_STREAK[cpu];
     let last_tick = &SYNC_HANDOFF_LAST_TICK[cpu];
@@ -571,14 +728,18 @@ pub(super) fn record_dispatch(cpu: usize, synchronous_handoff: bool, now_ticks: 
     }
 }
 
-#[cfg(not(test))]
 pub(super) fn remove_slot_all_cpus(slot: usize) {
     for state in &SYNC_HANDOFFS {
         state.lock().remove_slot(slot);
     }
 }
 
-#[cfg(not(test))]
+/// Read-only native witness of the actual shared FIFO, not execution permission.
+#[cfg(test)]
+pub(super) fn model_len(cpu: usize) -> usize {
+    state_for_cpu(cpu).lock().len()
+}
+
 pub(super) fn reset_all_cpus() {
     for (cpu, state) in SYNC_HANDOFFS.iter().enumerate() {
         *state.lock() = SyncHandoffState::new();
@@ -805,6 +966,191 @@ mod tests {
             state.take_next_ready(|record| record.matches_dispatch_owner(changed_owner)),
             None,
             "a generic handoff must not strip reply generation custody"
+        );
+    }
+
+    #[test]
+    fn fresh_direct_owner_replaces_only_a_stale_reply_token_at_the_same_fifo_position() {
+        let reply = SyncHandoffRecord::reply_wake(12, 121, 7, 2);
+        let generic = SyncHandoffRecord::new(12, 121);
+        let owner = runqueue::RunOwnerSnapshot {
+            state: runqueue::RunOwnerState::DirectHandoff,
+            cpu: Some(2),
+            generation: 7,
+            runnable: true,
+            wait_reason_kind: 0,
+            wait_armed: false,
+        };
+        let mut state = SyncHandoffState::new();
+        assert!(state.enqueue(reply));
+        assert!(state.enqueue_with_direct_owner(generic, Some((owner, 2))));
+        assert_eq!(
+            state.records[state.head],
+            Some(reply),
+            "live exact reply cannot be downgraded"
+        );
+        let newer = runqueue::RunOwnerSnapshot {
+            generation: 8,
+            ..owner
+        };
+        assert!(state.enqueue_with_direct_owner(generic, Some((newer, 1))));
+        assert_eq!(
+            state.records[state.head],
+            Some(reply),
+            "wrong-CPU proof is not authority"
+        );
+        assert!(state.enqueue_with_direct_owner(generic, Some((newer, 2))));
+        assert_eq!(state.len(), 1, "replacement retains one FIFO position");
+        assert_eq!(
+            state.records[state.head],
+            Some(generic.bind_direct_owner(newer, 2))
+        );
+        assert_eq!(
+            state.take_next_ready_with_competitor(false, |record| {
+                record.matches_dispatch_owner(newer)
+            }),
+            Some(12),
+            "the fresh DirectHandoff must not be discarded with the old reply generation"
+        );
+    }
+
+    #[test]
+    fn consumed_fifo_record_retains_exact_generation_for_final_claim() {
+        let mut state = SyncHandoffState::new();
+        let direct = runqueue::RunOwnerSnapshot {
+            state: runqueue::RunOwnerState::DirectHandoff,
+            cpu: Some(2),
+            generation: 8,
+            runnable: true,
+            wait_reason_kind: 0,
+            wait_armed: false,
+        };
+        assert!(
+            state.enqueue_with_direct_owner(SyncHandoffRecord::new(12, 121), Some((direct, 2)),)
+        );
+        let record = state
+            .take_next_ready_record_with_competitor(false, |record| {
+                record.matches_dispatch_owner(direct)
+            })
+            .expect("current direct owner must retain FIFO custody");
+        assert_eq!(record.slot(), 12);
+        assert_eq!(record.claim_generation(), Some(8));
+        assert_eq!(record.bound_direct_generation(), Some(8));
+        assert_eq!(state.len(), 0);
+        assert_eq!(
+            SyncHandoffRecord::new(12, 121).bound_direct_generation(),
+            None
+        );
+        assert_eq!(SyncHandoffRecord::new(12, 121).claim_generation(), None);
+    }
+
+    #[test]
+    fn consumed_generic_fifo_binds_only_the_exact_local_owner() {
+        let mut state = SyncHandoffState::new();
+        let local = runqueue::RunOwnerSnapshot {
+            state: runqueue::RunOwnerState::Local,
+            cpu: Some(2),
+            generation: 8,
+            runnable: true,
+            wait_reason_kind: 0,
+            wait_armed: false,
+        };
+        let generic = SyncHandoffRecord::new(12, 121);
+        assert!(state.enqueue(generic));
+        assert_eq!(
+            generic.claim_generation(),
+            None,
+            "queued hint is ordering only"
+        );
+        let consumed = state
+            .take_next_ready_record_with_competitor(false, |_| true)
+            .expect("live generic hint");
+        assert_eq!(consumed.claim_generation(), None);
+        let bound = consumed.bind_selected_local_owner(local, 2);
+        assert_eq!(bound.claim_generation(), Some(8));
+        assert!(bound.matches_dispatch_owner(local));
+        assert!(!bound.matches_dispatch_owner(runqueue::RunOwnerSnapshot {
+            generation: 9,
+            ..local
+        }));
+        assert!(!bound.matches_dispatch_owner(runqueue::RunOwnerSnapshot {
+            cpu: Some(3),
+            ..local
+        }));
+        assert!(!bound.matches_dispatch_owner(runqueue::RunOwnerSnapshot {
+            state: runqueue::RunOwnerState::RemoteQueued,
+            ..local
+        }));
+        assert_eq!(
+            consumed
+                .bind_selected_local_owner(
+                    runqueue::RunOwnerSnapshot {
+                        runnable: false,
+                        ..local
+                    },
+                    2
+                )
+                .claim_generation(),
+            None,
+        );
+        assert_eq!(
+            consumed
+                .bind_selected_local_owner(local, 3)
+                .claim_generation(),
+            None
+        );
+    }
+
+    #[test]
+    fn direct_handoff_record_cannot_reclaim_a_republished_owner_generation() {
+        let mut state = SyncHandoffState::new();
+        let owner = runqueue::RunOwnerSnapshot {
+            state: runqueue::RunOwnerState::DirectHandoff,
+            cpu: Some(2),
+            generation: 8,
+            runnable: true,
+            wait_reason_kind: 0,
+            wait_armed: false,
+        };
+        let generic = SyncHandoffRecord::new(12, 121);
+        assert!(state.enqueue_with_direct_owner(generic, Some((owner, 2))));
+        assert_eq!(state.len(), 1);
+        assert_eq!(
+            state.take_next_ready(|record| record.matches_dispatch_owner(
+                runqueue::RunOwnerSnapshot {
+                    generation: 9,
+                    ..owner
+                }
+            )),
+            None,
+            "a later direct handoff cannot inherit the previous FIFO record"
+        );
+        assert!(state.enqueue_with_direct_owner(generic, Some((owner, 2))));
+        assert_eq!(
+            state.take_next_ready(|record| record.matches_dispatch_owner(
+                runqueue::RunOwnerSnapshot {
+                    state: runqueue::RunOwnerState::Local,
+                    ..owner
+                }
+            )),
+            None,
+            "materialized fair custody must not retain direct FIFO urgency"
+        );
+        assert!(state.enqueue_with_direct_owner(generic, Some((owner, 2))));
+        assert_eq!(
+            state.take_next_ready(|record| record.matches_dispatch_owner(
+                runqueue::RunOwnerSnapshot {
+                    cpu: Some(1),
+                    ..owner
+                }
+            )),
+            None,
+            "a migrated direct owner cannot inherit the previous CPU's FIFO urgency"
+        );
+        assert!(state.enqueue_with_direct_owner(generic, Some((owner, 2))));
+        assert_eq!(
+            state.take_next_ready(|record| record.matches_dispatch_owner(owner)),
+            Some(12)
         );
     }
 

@@ -128,59 +128,50 @@ impl PublishedPagerVma {
         }
     }
 
-    /// Cheap address filter for the linear scan.
-    ///
-    /// The scan rejects almost every slot, and the full `snapshot` it used to
-    /// call for each one reads twenty-one atomics to build a region it then
-    /// throws away. This reads the three fields an *address* rejection can be
-    /// decided from.
-    ///
-    /// It filters on address extent and nothing else, deliberately. An earlier
-    /// version also compared the process and MM generations here, which looks
-    /// like a free win and is not: duplicating an authority check means the
-    /// duplicate keeps rejecting when the real one is broken, so the
-    /// registered mutant for `identityExact` survived. A filter that can mask
-    /// a security check is no longer a filter. Every authority decision stays
-    /// in the single validated path below.
-    /// Cheap extent-overlap filter, the range counterpart of [`may_cover`].
-    ///
-    /// Same contract: address extent only, never authority, conservative when
-    /// a writer holds the slot. Its job is to size an exact allocation before
-    /// the expensive full snapshots run.
-    fn may_overlap(&self, start: u64, end: u64) -> bool {
-        // ORDERING: Acquire observes the writer's even commit before the
-        // Relaxed payload reads below, exactly as `snapshot` does.
-        if self.sequence.load(Ordering::Acquire) & 1 != 0 {
-            return true;
-        }
-        let slot_start = self.start.load(Ordering::Relaxed);
-        let slot_end = self.end.load(Ordering::Relaxed);
-        slot_start != 0 && start < slot_end && slot_start < end
-    }
-
-    /// Conservative extent filter that also retains immediate neighbours for
-    /// post-edit coalescing.
-    fn may_overlap_or_touch(&self, start: u64, end: u64) -> bool {
-        // ORDERING: acquire rejects a concurrent odd writer before extent reads.
-        if self.sequence.load(Ordering::Acquire) & 1 != 0 {
-            return true;
-        }
-        let slot_start = self.start.load(Ordering::Relaxed);
-        let slot_end = self.end.load(Ordering::Relaxed);
-        slot_start != 0 && start <= slot_end && slot_start <= end
-    }
-
-    fn may_cover(&self, address: u64) -> bool {
-        // ORDERING: Acquire observes the writer's even commit before the
-        // Relaxed payload reads below, exactly as `snapshot` does.
+    /// An extent prefilter may reject an address only from one unchanged, even
+    /// publication. Otherwise let the full snapshot decide; filtering from
+    /// stale bounds can turn an in-flight valid first touch into `Stale`.
+    fn stable_extent(&self) -> Option<(u64, u64)> {
+        // ORDERING: the final Acquire rechecks the writer's odd invalidation
+        // or next even Release after both Relaxed bounds reads. The first
+        // Acquire alone cannot authorize an early negative result.
         let before = self.sequence.load(Ordering::Acquire);
         if before & 1 != 0 {
-            // A writer holds this slot. Let the full snapshot decide.
-            return true;
+            return None;
         }
         let start = self.start.load(Ordering::Relaxed);
         let end = self.end.load(Ordering::Relaxed);
-        start != 0 && address >= start && address < end
+        // ORDERING: this Acquire must see the same even publication sampled
+        // before the bounds, or the filter cannot discard the slot.
+        let after = self.sequence.load(Ordering::Acquire);
+        Self::stable_extent_from_samples(before, after, start, end)
+    }
+
+    #[inline]
+    fn stable_extent_from_samples(
+        before: u64,
+        after: u64,
+        start: u64,
+        end: u64,
+    ) -> Option<(u64, u64)> {
+        (before == after && before & 1 == 0).then_some((start, end))
+    }
+
+    fn may_overlap(&self, start: u64, end: u64) -> bool {
+        self.stable_extent().is_none_or(|(slot_start, slot_end)| {
+            slot_start != 0 && start < slot_end && slot_start < end
+        })
+    }
+
+    fn may_overlap_or_touch(&self, start: u64, end: u64) -> bool {
+        self.stable_extent().is_none_or(|(slot_start, slot_end)| {
+            slot_start != 0 && start <= slot_end && slot_start <= end
+        })
+    }
+
+    fn may_cover(&self, address: u64) -> bool {
+        self.stable_extent()
+            .is_none_or(|(start, end)| start != 0 && address >= start && address < end)
     }
 
     fn snapshot(&self) -> Result<Option<PagerVmRegionWire>, PagerVmaError> {

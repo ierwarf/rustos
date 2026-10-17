@@ -171,9 +171,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustos-scheduler-frame-gate"
+version = "0.1.0"
+
+[[package]]
 name = "rustos-shuttle-proof-kernel"
 version = "0.1.0"
 dependencies = [
+ "rustos-scheduler-frame-gate",
  "shuttle",
 ]
 

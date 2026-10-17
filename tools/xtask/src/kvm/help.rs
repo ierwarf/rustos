@@ -11,7 +11,7 @@ framed virtual input transport. It does not synthesize QMP input.
 
 options:
   --timeout <seconds>  bound boot, readiness, and active proof collection
-                       (1..={MAX_SMOKE_TIMEOUT}, default {MAX_SMOKE_TIMEOUT})
+                       (1..={MAX_SMOKE_TIMEOUT}, default {DEFAULT_SMOKE_TIMEOUT})
   --expect <marker>    require an additional RustOS debugcon marker (repeatable)
   --expect-dvm <marker>
                        require an additional Linux-DVM serial marker (repeatable)

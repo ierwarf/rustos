@@ -5,9 +5,10 @@
 //! - **Boundary:** `scheduler/runqueue.rs` owns the authoritative
 //!   `RunOwnerWord` per slot. The old readiness mirror, the
 //!   published current/transition pair, and the retire flag — are the second
-//!   source. Both are mutated under the global scheduler lock today.
-//! - **Lifecycle:** swept once per profile drain while the lock is held, so
-//!   both sources are one stable observation.
+//!   source. Production publishers have independent identity/queue owners;
+//!   the historical native catalog supplies only a policy projection.
+//! - **Lifecycle:** an observational profile sweep, never a dispatch grant or
+//!   an atomic cross-owner lifetime snapshot.
 //! - **Concurrency:** read-only.
 //! - **Failure:** a disagreement is reported, never fatal.
 //! - **Forbidden:** no third owner word. A shadow copy of `RunOwnerWord` is
@@ -23,13 +24,10 @@
 //! first attempt at this module shadowed those owner words in a second table,
 //! which was redundant on arrival.
 //!
-//! What actually remains is narrower and harder. Every one of those transitions
-//! still runs while the single global `SCHEDULER` lock is held, so the queue is
-//! per-CPU and the *authority* is not. Removing that lock makes the owner word
-//! the only synchronisation between CPUs, and before that can be safe the two
-//! sources have to be proven to agree while the lock is still there — because
-//! after the cutover a disagreement stops being a diagnostic and becomes a task
-//! running on two CPUs.
+//! The actual global lock is now deleted. Exact original frame, funding,
+//! lifecycle and CPU banks independently own execution; this diagnostic cannot
+//! replace any of them. Historical guarded agreement is not proof of the
+//! complete owner/claim/return/terminal/reuse join after deletion.
 //!
 //! `V5-FORMAL-SCHED-019` asks for this and names the mutant it must kill: dual
 //! divergence between the legacy state and the per-CPU state.
@@ -81,6 +79,9 @@ pub(super) enum Mismatch {
     /// preempted task returns to its queue or is published blocked, so a stale
     /// bit either strands a runnable task or re-queues a blocked one.
     RunningRunnableBit = 7,
+    /// Independent physical Current lacks its original UID execution permit.
+    /// This observer owns only telemetry, never execution admission.
+    CurrentPermitMissing = 8,
 }
 
 /// The runqueue owner states this check distinguishes.
@@ -179,8 +180,8 @@ const MISMATCH_PRESENT: u64 = 1 << 63;
 pub(super) fn record(slot: usize, kind: Mismatch) {
     MISMATCH_COUNT.fetch_add(1, Ordering::Relaxed);
     let packed = MISMATCH_PRESENT | ((slot as u64 & 0xFFFF) << 32) | (kind as u64);
-    // ORDERING: Relaxed. The scheduler lock already orders every writer and the
-    // value is read only for reporting.
+    // ORDERING: Relaxed diagnostic scalar only; neither field grants authority.
+    // The count and first code may straddle drains on another CPU.
     let _ = FIRST_MISMATCH.compare_exchange(0, packed, Ordering::Relaxed, Ordering::Relaxed);
 }
 

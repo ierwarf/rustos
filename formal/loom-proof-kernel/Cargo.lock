@@ -137,7 +137,12 @@ name = "rustos-loom-proof-kernel"
 version = "0.1.0"
 dependencies = [
  "loom",
+ "rustos-scheduler-frame-gate",
 ]
+
+[[package]]
+name = "rustos-scheduler-frame-gate"
+version = "0.1.0"
 
 [[package]]
 name = "rustversion"

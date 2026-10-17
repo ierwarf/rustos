@@ -641,18 +641,20 @@ pub(crate) enum UiThreadRole {
     DisplayPolicy,
     Watchdog,
     BootstrapGpu,
+    BootstrapDesktop,
 }
 
 impl UiThreadRole {
     const fn retains_boot_class(self) -> bool {
-        matches!(self, Self::BootstrapGpu)
+        matches!(self, Self::BootstrapGpu | Self::BootstrapDesktop)
     }
 }
 
 /// The only production thread-spawn boundary in uiserver. A role is selected
 /// before the child can execute service work, so inherited process priority
-/// never becomes implicit authority. Only the bounded GPU bootstrap worker may
-/// retain boot class; every other role self-demotes before invoking its body.
+/// never becomes implicit authority. Only the bounded GPU initializer and
+/// first-scene desktop seed may retain boot class; the desktop seed explicitly
+/// self-demotes before the optional full background build.
 pub(crate) fn spawn_ui_thread<F, T>(
     role: UiThreadRole,
     name: impl Into<String>,
@@ -1548,7 +1550,7 @@ mod tests {
     }
 
     #[test]
-    fn only_bootstrap_gpu_role_retains_inherited_boot_class() {
+    fn only_bounded_bootstrap_roles_retain_inherited_boot_class() {
         for role in [
             UiThreadRole::Background,
             UiThreadRole::Protocol,
@@ -1558,6 +1560,7 @@ mod tests {
             assert!(!role.retains_boot_class(), "unexpected boot role {role:?}");
         }
         assert!(UiThreadRole::BootstrapGpu.retains_boot_class());
+        assert!(UiThreadRole::BootstrapDesktop.retains_boot_class());
     }
 }
 

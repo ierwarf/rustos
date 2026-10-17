@@ -1,49 +1,111 @@
-//! Per-slot SIMD and TLS payloads kept outside the scheduler catalog.
-//!
-//! The owner word in the parent module remains the lifecycle authority. This
-//! module holds only architecture-facing state: a lock-free FS-base cache and
-//! one owner-bound raw SIMD image for every task slot.
-
+//! Per-slot SIMD and TLS execution payloads, outside Scheduler.
+//! SIMD bytes have an exact immutable task binding and a consume-once exclusive
+//! access guard. Current/Prepared allocation custody qualifies live access;
+//! cold construction/exec/terminal commands retain their enclosing transaction.
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use super::super::stack_resources::{cpu_leases, task_start};
 use super::{MAX_TASK, RunOwnerState, owner};
 use crate::arch::simd::{SimdState, restore_state, save_state};
 
-/// Per-slot Linux FS base used on every return to user mode. The complete
-/// Linux thread state remains behind its generation-bound lock; this is only
-/// the architectural hot field that dispatch must load without taking it.
 static TLS_FS_BASE: [AtomicU64; MAX_TASK] = [const { AtomicU64::new(0) }; MAX_TASK];
 
-/// One SIMD image for each task slot, deliberately outside the scheduler
-/// catalog. A SIMD save/restore is issued only by the exact execution owner;
-/// admission/reset runs before owner publication or after terminal release.
-/// Those lifecycle rules make the raw cell single-writer even though it is
-/// shared across CPUs.
-struct SlotSimdState(UnsafeCell<SimdState>);
-
-// SAFETY: callers are limited to the owner-word/lifecycle transitions above.
-// No two CPUs may execute, save, restore, or reset one live slot concurrently.
+struct SimdImage {
+    task_id: Option<u64>,
+    state: SimdState,
+}
+struct SlotSimdState {
+    busy: AtomicBool,
+    image: UnsafeCell<SimdImage>,
+}
+// SAFETY: all image access is enclosed by the exclusive atomic guard. Its
+// production callers additionally exclude local IRQs throughout access.
 unsafe impl Sync for SlotSimdState {}
-
+struct SimdAccess<'a>(&'a SlotSimdState);
+impl Drop for SimdAccess<'_> {
+    fn drop(&mut self) {
+        self.0.busy.store(false, Ordering::Release);
+    }
+}
 impl SlotSimdState {
     const fn new() -> Self {
-        Self(UnsafeCell::new(SimdState::new()))
+        Self {
+            busy: AtomicBool::new(false),
+            image: UnsafeCell::new(SimdImage {
+                task_id: None,
+                state: SimdState::new(),
+            }),
+        }
+    }
+    fn claim(&self) -> SimdAccess<'_> {
+        assert!(
+            self.busy
+                .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok(),
+            "overlapping live SIMD access"
+        );
+        SimdAccess(self)
+    }
+    fn with<R>(&self, f: impl FnOnce(&mut SimdImage) -> R) -> R {
+        let _access = self.claim();
+        // SAFETY: only this consume-once guard can expose the image.
+        f(unsafe { &mut *self.image.get() })
+    }
+    fn initialize(&self, task_id: u64) {
+        self.with(|image| {
+            assert!(
+                image.task_id.is_none(),
+                "live SIMD image rebound without terminal release"
+            );
+            image.state = SimdState::new();
+            image.task_id = Some(task_id);
+        });
+    }
+    fn bound<R>(&self, task_id: u64, f: impl FnOnce(&mut SimdState) -> R) -> R {
+        self.with(|image| {
+            assert_eq!(image.task_id, Some(task_id), "foreign SIMD task identity");
+            f(&mut image.state)
+        })
+    }
+    fn replace(&self, task_id: u64, terminal: bool) {
+        self.with(|image| {
+            assert_eq!(
+                image.task_id,
+                Some(task_id),
+                "foreign SIMD replacement identity"
+            );
+            image.state = SimdState::new();
+            if terminal {
+                image.task_id = None;
+            }
+        });
     }
 }
-
 static SIMD_STATES: [SlotSimdState; MAX_TASK] = [const { SlotSimdState::new() }; MAX_TASK];
 
-pub(crate) fn reset_before_publication() {
-    for tls_fs_base in &TLS_FS_BASE {
-        tls_fs_base.store(0, Ordering::Release);
+fn irq_excluded<R>(f: impl FnOnce() -> R) -> R {
+    #[cfg(not(test))]
+    {
+        x86_64::instructions::interrupts::without_interrupts(f)
     }
-    for state in &SIMD_STATES {
-        // SAFETY: reset runs before scheduler/AP publication.
-        unsafe { *state.0.get() = SimdState::new() };
+    #[cfg(test)]
+    {
+        f()
     }
 }
 
+pub(crate) fn reset_before_publication() {
+    for tls in &TLS_FS_BASE {
+        tls.store(0, Ordering::Release);
+    }
+    for state in &SIMD_STATES {
+        state.with(|image| {
+            image.state = SimdState::new();
+            image.task_id = None;
+        });
+    }
+}
 #[inline]
 pub(crate) fn tls_fs_base(slot: usize) -> u64 {
     TLS_FS_BASE
@@ -51,10 +113,6 @@ pub(crate) fn tls_fs_base(slot: usize) -> u64 {
         .expect("scheduler TLS FS base slot exceeds capacity")
         .load(Ordering::Acquire)
 }
-
-/// Updates the hot TLS cache after the generation-bound Linux-thread authority
-/// has accepted its new FS base. Release makes that state visible to the next
-/// dispatch that acquires this slot's owner publication.
 #[inline]
 pub(crate) fn set_tls_fs_base(slot: usize, value: u64) {
     TLS_FS_BASE
@@ -62,47 +120,65 @@ pub(crate) fn set_tls_fs_base(slot: usize, value: u64) {
         .expect("scheduler TLS FS base slot exceeds capacity")
         .store(value, Ordering::Release);
 }
-
 pub(crate) fn clear_tls_fs_base(slot: usize) {
     TLS_FS_BASE[slot].store(0, Ordering::Release);
 }
 
-/// Installs the architectural default SIMD image before this slot receives an
-/// owner publication.
-pub(crate) fn initialize_simd_state(slot: usize) {
-    assert_eq!(
-        owner(slot).state,
-        RunOwnerState::Dormant,
-        "scheduler SIMD state initialized after owner publication"
-    );
-    reset_simd_state(slot);
+pub(crate) fn initialize_simd_state(slot: usize, task_id: u64) {
+    irq_excluded(|| {
+        assert_eq!(
+            owner(slot).state,
+            RunOwnerState::Dormant,
+            "scheduler SIMD state initialized after owner publication"
+        );
+        assert!(
+            cpu_leases::simd_unpublished_custody(slot),
+            "SIMD construction has live CPU references"
+        );
+        SIMD_STATES[slot].initialize(task_id);
+    });
 }
 
-/// Restores the architectural default image for a slot whose current owner
-/// has replaced its execution image (exec) or has terminally released it.
 pub(crate) fn reset_simd_state(slot: usize) {
-    let state = SIMD_STATES
-        .get(slot)
-        .expect("scheduler SIMD state slot exceeds capacity");
-    // SAFETY: see `SlotSimdState`; callers retain exact execution or terminal
-    // lifecycle ownership of `slot` for this complete replacement.
-    unsafe { *state.0.get() = SimdState::new() };
+    irq_excluded(|| {
+        let task_id = task_start::read(slot)
+            .expect("SIMD reset lacks task descriptor")
+            .id;
+        let terminal = cpu_leases::simd_reset_custody(slot)
+            .expect("SIMD reset lacks exclusive lifecycle custody");
+        SIMD_STATES[slot].replace(task_id, terminal);
+    });
 }
 
+fn access_has_custody(current: bool, prepared: bool, restoring: bool) -> bool {
+    current || (restoring && prepared)
+}
+
+fn live_identity(slot: usize, restoring: bool) -> u64 {
+    let cpu = nucleus_core::util::lockdep::current_cpu_index();
+    let current = cpu_leases::owns_current(cpu, slot);
+    let prepared = cpu_leases::owns_prepared(cpu, slot);
+    assert!(
+        access_has_custody(current, prepared, restoring),
+        "SIMD access lacks CPU execution/selection custody"
+    );
+    task_start::read(slot)
+        .expect("SIMD access lacks task descriptor")
+        .id
+}
 #[inline]
 pub(crate) fn save_simd_state(slot: usize) {
-    let state = SIMD_STATES
-        .get(slot)
-        .expect("scheduler SIMD state slot exceeds capacity");
-    // SAFETY: the exact CPU executing `slot` saves into its owner-bound image.
-    unsafe { save_state(&mut *state.0.get()) };
+    irq_excluded(|| {
+        let task_id = live_identity(slot, false);
+        SIMD_STATES[slot].bound(task_id, |state| unsafe { save_state(state) });
+    });
 }
-
 #[inline]
 pub(crate) fn restore_simd_state(slot: usize) {
-    let state = SIMD_STATES
-        .get(slot)
-        .expect("scheduler SIMD state slot exceeds capacity");
-    // SAFETY: the exact CPU executing `slot` restores its owner-bound image.
-    unsafe { restore_state(&*state.0.get()) };
+    irq_excluded(|| {
+        let task_id = live_identity(slot, true);
+        SIMD_STATES[slot].bound(task_id, |state| unsafe { restore_state(state) });
+    });
 }
+#[cfg(test)]
+mod tests;

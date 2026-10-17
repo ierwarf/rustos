@@ -795,6 +795,7 @@ dependencies = [
  "kernel-object",
  "lazy_static",
  "nucleus-core",
+ "rustos-scheduler-frame-gate",
  "rustos-user-abi",
  "spin 0.10.0",
  "trace-loc-macro",
@@ -1210,6 +1211,10 @@ version = "0.1.0"
 
 [[package]]
 name = "rustos-observability"
+version = "0.1.0"
+
+[[package]]
+name = "rustos-scheduler-frame-gate"
 version = "0.1.0"
 
 [[package]]

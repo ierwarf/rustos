@@ -210,7 +210,11 @@ CompleteReply(server, reply) ==
 The first poll handles a reply that arrived before arm; the second poll is
 represented by the fact that CompleteReply clears Armed before CommitBlock can
 fire.  CommitBlock is therefore enabled only for a still-live request with its
-matching timer armed.
+matching timer armed. The concrete ordinary byte/handle RPC wait must use
+arm_block_current_task_on_reply(reply.raw()), not Generic arm: waitFor is the
+SAME exact live reply and the typed completion deliberately refuses other waits.
+The source binder and Generic-arm regression mutation refine this existing
+exact-reply assumption; they do not add a new disjoint successful wait model.
 *******************************************************************************)
 ArmBlock(caller) ==
     /\ caller \in Tasks

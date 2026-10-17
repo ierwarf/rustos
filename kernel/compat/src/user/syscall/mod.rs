@@ -43,6 +43,17 @@ pub(crate) fn retire_current_linux_task_due_to_fault(
             (process_id << 32) | (faulting_thread & u32::MAX as u64),
             ((vector as u64) << 56) | (rip & 0x00ff_ffff_ffff_ffff),
         );
+        if vector == 14 {
+            // A bare RIP cannot distinguish an absent VMA from an anonymous
+            // frame refusal or a protected access. Preserve CR2 and x86's
+            // page-fault bits for the exact terminal fault, not every retry.
+            debug::record_milestone(
+                debug::LogCategory::Compat,
+                "linux-user-page-fault-address",
+                cr2,
+                error_code.unwrap_or(u64::MAX),
+            );
+        }
     }
     let final_process_thread = faulting_process.and_then(|process_id| {
         (multitask::current_user_process_thread_count().unwrap_or(1) <= 1).then_some(process_id)

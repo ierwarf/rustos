@@ -140,6 +140,211 @@ herd_mutant = "formal/litmus/x86_64/reschedule_request_publication.mutant.litmus
 herd_cat = "x86tso-mixed.cat"
 
 [[scenario]]
+id = "scheduler-activation-claim"
+severity = "critical"
+flow = "scheduler-dispatch"
+model = "scheduler-local-authority/SchedulerLocalAuthority"
+source = "kernel/ps/src/multitask/scheduler/dispatcher.rs"
+source_symbol = "first_turn"
+source_anchors = [
+  "p.task_id != Some(task_id)",
+  "DispatchFrame::capture_selected(turn, slot, task_id, candidate.generation",
+  "frame.prepare().is_some_and(|funded| funded.claim())",
+  "if matches!(decision, Decision::Incomplete) { return decision; }",
+  "policy.atomic_activation_pick_hints.pop()",
+]
+invariant = "exact committed child identity and selected Local generation must survive until final owner CAS; queue/fallback and frame validity are separately bounded"
+loom_test = "activation_claim_rejects_republish_and_slot_reuse"
+shuttle_test = "activation_claim_rejects_republish_and_slot_reuse_pct"
+herd_not_applicable = "the activation FIFO, original physical frame/funding, published identity and owner-word CAS form a multi-object protocol; an ISA publication litmus cannot express the exact first-turn identity"
+
+[[scenario]]
+id = "scheduler-budget-published-commit"
+severity = "critical"
+flow = "scheduler-dispatch"
+model = "scheduling-context-budget/SchedulingContextBudget"
+source = "kernel/ps/src/multitask/scheduler/scheduling_runtime.rs"
+source_symbol = "with_published_budget_pair"
+source_anchors = [
+  "let mut context = cell(context_slot)?.lock();",
+  "rustos_scheduler_frame_gate::published_budget_identity_custody(",
+  "let mut domain = domain_cell(usize::from(domain_slot))?.lock();",
+  "if domain.generation != domain_generation || domain.policy != Some(policy) {",
+  "Some(use_pair(context.budget.as_mut()?, domain.budget.as_mut()?))",
+]
+invariant = "one exact published context/domain generation and CPU policy must own both runtime cells before dispatch preparation; the bounded cell-race model excludes live donor token changes, policy content and final claim"
+loom_test = "published_budget_prepare_never_touches_a_recycled_runtime_cell"
+shuttle_test = "published_budget_prepare_never_touches_a_recycled_runtime_cell_pct"
+herd_not_applicable = "nested tracked locks, generational policy objects and refill accounting cannot be represented by a single ISA publication litmus"
+
+[[scenario]]
+id = "scheduler-budget-published-runtime-charge"
+severity = "critical"
+flow = "scheduler-dispatch"
+model = "scheduling-context-budget/SchedulingContextBudget"
+source = "kernel/ps/src/multitask/scheduler/scheduling_runtime.rs"
+source_symbol = "charge_published_stamp_pair"
+source_anchors = [
+  "rustos_scheduler_frame_gate::published_budget_identity_custody(",
+  "let mut domain = domain_cell(usize::from(domain_slot))?.lock();",
+  "if domain.generation != domain_generation || domain.policy != Some(policy) {",
+  "!context_budget.can_charge(now_ns, elapsed_ns)",
+  "!domain_budget.can_charge(now_ns, elapsed_ns)",
+  "context_budget.record_timeout_fault(reply);",
+]
+invariant = "only the exact published context/domain pair may debit an elapsed interval and latch its timeout reply; a recycled cell cannot inherit either debit, even if the CPU mask changed after execution"
+loom_test = "published_charge_never_debits_a_recycled_pair_or_leaks_its_reply"
+shuttle_test = "published_charge_never_debits_a_recycled_pair_or_leaks_its_reply_pct"
+herd_not_applicable = "paired tracked locks, policy generations and accounting state cannot be expressed as a single ISA publication litmus"
+
+[[scenario]]
+id = "scheduler-consumed-generic-local-claim"
+severity = "critical"
+flow = "scheduler-dispatch"
+model = "scheduler-local-authority/SchedulerLocalAuthority"
+source = "kernel/ps/src/multitask/scheduler/dispatcher.rs"
+source_symbol = "synchronous"
+source_anchors = [
+  "sync_handoff::take_next_ready(cpu, local_dispatch::local_fair_competitor_ready(cpu), |record| {",
+  "record.bind_selected_local_owner(runqueue::owner(record.slot()), cpu)",
+  "record.claim_generation()",
+]
+invariant = "queued Generic hints are ordering-only; consumption binds a Local generation which an exact final claim cannot inherit across a republish; the bounded Local model excludes physical FIFO interleavings"
+loom_test = "consumed_generic_local_generation_rejects_republication"
+shuttle_test = "consumed_generic_local_generation_rejects_republication_pct"
+herd_not_applicable = "the consumed FIFO, exact owner CAS, published identity, and original frame validation form a multi-object protocol; an ISA publication litmus cannot express the transaction"
+
+[[scenario]]
+id = "scheduler-early-policy-retry-guard"
+severity = "critical"
+flow = "scheduler-dispatch"
+model = "scheduler-local-authority/SchedulerLocalAuthority"
+source = "kernel/ps/src/multitask/scheduler/local_dispatch/fair_retry.rs"
+source_symbol = "retry_incomplete_policy"
+source_anchors = [
+  "for _ in 0..MAX_LOCAL_FAIR_OBSERVATIONS {",
+  "Ok(choice) => return Ok(choice),",
+  "Err(LocalFallbackReason::CustodyUnavailable) // unresolved earlier class",
+]
+invariant = "a torn strict-System/User reservation publication cannot become proof of no eligible peer: a stable epoch can claim its exact System owner, while exhaustion remains guarded and never grants later-class work"
+loom_test = "incomplete_early_policy_never_authorizes_a_later_class"
+shuttle_test = "incomplete_early_policy_never_authorizes_a_later_class_pct"
+herd_not_applicable = "bounded queue/class epoch sampling, policy priority and owner CAS cross independent objects and cannot be reduced to a single publication litmus"
+
+[[scenario]]
+id = "scheduler-fair-retry-local-custody"
+severity = "critical"
+flow = "scheduler-dispatch"
+model = "scheduler-local-authority/SchedulerLocalAuthority"
+source = "kernel/ps/src/multitask/scheduler/local_dispatch/fair_retry.rs"
+source_symbol = "retry_incomplete_fair"
+source_anchors = [
+  "for _ in 0..MAX_LOCAL_FAIR_OBSERVATIONS {",
+  "Ok(choice) => return choice,",
+  "Err(LocalFallbackReason::NoLocalCandidate) => return None,",
+  "Err(_) => continue,",
+]
+invariant = "a torn ordinary fair observation can retry but grants no partial catalog authority; only a stable Local generation can be claimed, and a republish before its owner CAS loses the stale claim"
+loom_test = "incomplete_fair_retry_only_claims_its_observed_generation"
+shuttle_test = "incomplete_fair_retry_only_claims_its_observed_generation_pct"
+herd_not_applicable = "the per-CPU queue and class epochs, multi-candidate scan and owner CAS are a multi-object transaction beyond one ISA litmus"
+
+[[scenario]]
+id = "scheduler-fifo-incomplete-identity"
+severity = "critical"
+flow = "scheduler-dispatch"
+model = "scheduler-local-authority/SchedulerLocalAuthority"
+source = "kernel/ps/src/multitask/scheduler/dispatcher.rs"
+source_symbol = "materialize"
+source_anchors = [
+  "if let Some(generation) = record.claim_generation()",
+  "runqueue::materialize_direct_handoff_with_generation(",
+  "Some(generation)",
+  "current_identity::read_dispatch(slot).is_some_and(|p| p.task_id == Some(record.task_id()) && p.lifecycle_dispatchable())",
+  "!record.has_current_dispatch_custody()",
+  "materialize(record, cpu);",
+]
+invariant = "a missing FIFO task publication cannot grant dispatch; rejecting the consumed Direct record restores only its own generation, never a republished Direct owner (the bounded race excludes arbitrary identity writers and budget admission)"
+loom_test = "incomplete_fifo_identity_restores_only_its_direct_generation"
+shuttle_test = "incomplete_fifo_identity_restores_only_its_direct_generation_pct"
+herd_not_applicable = "the FIFO record, identity publication, queue insertion/rollback and owner CAS form a multi-object protocol rather than one ISA publication litmus"
+
+[[scenario]]
+id = "scheduler-final-local-frame"
+severity = "critical"
+flow = "scheduler-dispatch"
+model = "scheduler-local-authority/SchedulerLocalAuthority"
+source = "kernel/ps/src/multitask/scheduler/dispatch_claim.rs"
+source_symbol = "capture_selected"
+source_anchors = [
+  "FrameCustody::Local => frame_publication::local_frame_token(slot, cpu)",
+  "rustos_scheduler_frame_gate::selected_local_frame_identity(",
+  "let Some(pin) = frame_publication::pin_for_identity(token, id)",
+  "let validation = context_validation::validate_published_saved_context(",
+  "Self::token_current(token, cpu, custody)",
+]
+invariant = "a selected fair frame cannot dispatch a republished Local generation or a different saved RSP; bounded writer withdraws Local custody before republishing, and the model excludes arbitrary writer overlap, catalog/final claim equivalence and stack-content validation or allocation-pin/assembly-switch lifetime"
+loom_test = "selected_local_frame_republish_cannot_claim_the_old_saved_rsp"
+shuttle_test = "selected_local_frame_republish_cannot_claim_the_old_saved_rsp_pct"
+herd_not_applicable = "saved-frame seqlock version, owner generation, saved RSP and lock-serialized claim are a multi-object protocol rather than a single ISA publication litmus"
+
+[[scenario]]
+id = "scheduler-local-frame-custody"
+severity = "critical"
+flow = "scheduler-cpu-ownership"
+model = "scheduler-cpu-ownership/SchedulerCpuOwnership"
+source = "kernel/ps/src/multitask/scheduler/frame_publication.rs"
+source_symbol = "local_frame_token"
+source_anchors = [
+  "let owner = runqueue::owner(slot);",
+  "let token = read(slot)?;",
+  "token.owner_generation,",
+  "if runqueue::owner(slot) != owner || cpu_local::task_execution_owner(slot).is_some() {",
+]
+invariant = "the bounded reader must reject a stale frame generation or transition owner before the exact owner claim; neither model proves the entire local picker"
+loom_test = "local_frame_claim_never_uses_stale_owner_generation"
+shuttle_test = "local_frame_claim_never_uses_stale_owner_generation_pct"
+herd_not_applicable = "this claim combines generation-bound frame publication, queue owner identity, execution-stack custody, and the serialized dispatch claim; a single ISA publication litmus cannot represent the owner and claim protocol"
+
+[[scenario]]
+id = "scheduler-retained-current-frame"
+severity = "critical"
+flow = "scheduler-dispatch"
+model = "scheduler-local-authority/SchedulerLocalAuthority"
+source = "kernel/ps/src/multitask/scheduler/frame_publication.rs"
+source_symbol = "current_local_token_is_current"
+source_anchors = [
+  "rustos_scheduler_frame_gate::retained_current_frame_custody(",
+  "owner.state == RunOwnerState::Local && owner.cpu == Some(cpu)",
+  "owner.runnable,",
+  "runqueue::owner(token.slot) == owner",
+]
+invariant = "the bounded final retained-current gate rejects a Local republish or released Current CPU custody; excludes frame seqlock/content, admission writers, budget preparation, final owner claim and teardown"
+loom_test = "retained_current_frame_never_authorizes_a_republished_or_released_owner"
+shuttle_test = "retained_current_frame_never_authorizes_a_republished_or_released_owner_pct"
+herd_not_applicable = "generation-bound frame publication and per-CPU execution custody require a multi-object protocol; the bounded lock model is not one ISA-visible publication edge"
+
+[[scenario]]
+id = "scheduler-spawn-first-turn-claim"
+severity = "critical"
+flow = "scheduler-dispatch"
+model = "scheduler-local-authority/SchedulerLocalAuthority"
+source = "kernel/ps/src/multitask/scheduler/dispatcher.rs"
+source_symbol = "first_turn"
+source_anchors = [
+  "if atomic { policy.atomic_activation_pick_hints.front() } else { policy.spawn_pick_hints.front() }",
+  "p.task_id != Some(task_id)",
+  "DispatchFrame::capture_selected(turn, slot, task_id, candidate.generation",
+  "frame.prepare().is_some_and(|funded| funded.claim())",
+  "if matches!(decision, Decision::Incomplete) { return decision; }",
+  "policy.spawn_pick_hints.pop()",
+]
+invariant = "ordinary spawn uses the same original frame/funding and exact first-turn identity and generation-bound claim as activation before FIFO consumption; the bounded shared owner-CAS race excludes queue, admission and saved-frame internals"
+loom_test = "activation_claim_rejects_republish_and_slot_reuse"
+shuttle_test = "activation_claim_rejects_republish_and_slot_reuse_pct"
+herd_not_applicable = "the shared first-turn FIFO, published identity, original frame/funding and owner-word CAS form a multi-object protocol; one ISA publication litmus cannot express their custody"
+
+[[scenario]]
 id = "scheduler-transition-publication"
 severity = "critical"
 flow = "scheduler-cpu-ownership"
@@ -164,14 +369,14 @@ id = "scheduler-transition-wake-owner"
 severity = "critical"
 flow = "scheduler-cpu-ownership"
 model = "scheduler-cpu-ownership/SchedulerCpuOwnership"
-source = "kernel/ps/src/multitask/scheduler.rs"
-source_symbol = "wake_task_slot"
+source = "kernel/ps/src/multitask/scheduler/wake_publication.rs"
+source_symbol = "retained_wake_admitted"
 source_anchors = [
-  "TaskExecutionOwner::Transition(transition_cpu)",
-  "match self.publish_runqueue_wake_to(slot, transition_cpu)",
-  "context.test_ready = true;",
+  "TaskExecutionOwner::Transition(target)",
+  "publish(slot, target, cpu)",
+  "runqueue::wait::set_ready_since_ticks(slot, crate::arch::rtc::ticks().max(1));",
 ]
-invariant = "a blocked transition wake publishes one durable target mailbox owner before the test adapter changes, cannot dispatch before assembly commit, and is claimed at most once after commit"
+invariant = "an original physical binding spans transition wake mailbox publication and wait clear; the durable target owner precedes return ACK, duplicate wake cannot renew it, and actual drain precedes the once-only original frame/funding claim; earlier Transition and RSP arrival remain native inputs"
 loom_test = "scheduler_transition_wake_has_one_queued_owner_until_commit"
 shuttle_test = "scheduler_transition_wake_has_one_mailbox_owner_until_commit"
 herd_not_applicable = "the decisive property composes assembly transition state, an owner-word CAS, and a lock-protected mailbox drain; the atomic transition publication already has a separate x86_64 litmus, while an ISA-only wake litmus would omit queue identity and one-shot dispatch"
@@ -208,6 +413,25 @@ invariant = "after phase admission, evidence may publish only if the post-admiss
 loom_test = "smp_qualification_phase_revalidation_terminalizes_on_sessiond_epoch_change"
 shuttle_test = "smp_qualification_phase_revalidation_terminalizes_on_sessiond_epoch_change"
 herd_not_applicable = "the decisive edge spans endpoint owner identity, endpoint epoch, a lock-protected qualification FSM, and debug emission; reducing it to raw loads would omit terminalization and output suppression"
+
+[[scenario]]
+id = "task-retirement-cleanup-owner"
+severity = "critical"
+flow = "scheduler-lifecycle"
+model = "task-retirement-cleanup-owner/TaskRetirementCleanupOwner"
+source = "kernel/ps/src/multitask/scheduler/retirement_cleanup.rs"
+source_symbol = "complete"
+source_anchors = [
+  "let CleanupState::Claimed(expected) = *state else",
+  "rustos_scheduler_frame_gate::retirement_cleanup_ack_custody(",
+  "expected == cleanup,",
+  "*state = CleanupState::Complete;",
+  "CleanupState::Vacant | CleanupState::Complete",
+]
+invariant = "one per-slot cleanup lock owns exactly one claim and matching full-payload ACK before reset/reuse; bounded two-consumer/reuser races assume external cleanup and execution/process/TLB/stack quiescence, not global guard removal"
+loom_test = "cleanup_claim_ack_and_reuse_have_one_exact_slot_owner"
+shuttle_test = "cleanup_claim_ack_and_reuse_have_one_exact_slot_owner_pct"
+herd_not_applicable = "the decisive transition is a tracked per-slot cleanup lock and immutable ACK identity, not an ISA-visible lock-free publication edge"
 
 [[scenario]]
 id = "tlb-ack-reclaim"

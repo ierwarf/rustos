@@ -3,17 +3,25 @@
 #[cfg(rustos_scheduler_phase_profile)]
 use super::{SchedulerRuntimeProfile, pack_u32_pair};
 
-pub(super) fn take_observations() -> (u64, [u64; 7], u64, u64, u64, u64) {
+pub(super) fn take_observations() -> (u64, [u64; 7], u64, u64, u64, u64, u64, u64) {
     #[cfg(rustos_scheduler_phase_profile)]
     return super::super::local_dispatch::drain_shadow_observations();
     #[cfg(not(rustos_scheduler_phase_profile))]
-    (0, [0; 7], 0, 0, 0, 0)
+    (0, [0; 7], 0, 0, 0, 0, 0, 0)
 }
 
 #[cfg(rustos_scheduler_phase_profile)]
 pub(super) fn emit_milestones(profile: &SchedulerRuntimeProfile) {
-    let (qualified, reasons, matches, mismatches, catalog_fallbacks, mismatch_witness) =
-        profile.local_dispatch_shadow;
+    let (
+        qualified,
+        reasons,
+        matches,
+        mismatches,
+        catalog_fallbacks,
+        mismatch_witness,
+        local_vruntime,
+        catalog_vruntime,
+    ) = profile.local_dispatch_shadow;
     crate::debug::record_milestone(
         crate::debug::LogCategory::Sched,
         "kernel-scheduler-local-shadow",
@@ -26,6 +34,12 @@ pub(super) fn emit_milestones(profile: &SchedulerRuntimeProfile) {
             "kernel-scheduler-local-shadow-mismatch",
             mismatch_witness,
             0,
+        );
+        crate::debug::record_milestone(
+            crate::debug::LogCategory::Sched,
+            "kernel-scheduler-local-shadow-mismatch-vruntime",
+            local_vruntime,
+            catalog_vruntime,
         );
     }
     if reasons.iter().any(|count| *count != 0) {

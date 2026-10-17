@@ -15,7 +15,7 @@
 //!   `process-address-space-lifecycle`, `syscall-simd-lifecycle`, and
 //!   `user-memory-access`.
 pub use crate::multitask::{
-    AffinityCommit, AffinityError, CurrentKernelStackScope, CurrentUserSnapshot,
+    AffinityCommit, AffinityError, CurrentUserSnapshot,
     DEFAULT_USER_TASK_WEIGHT_MICROS, FastIpcCallHandoffOutcome, MAX_SCHEDULER_TASKS,
     PagerChargeSnapshot, PagerFaultReservation, PagerFaultSlotError, PagerFaultState,
     PagerVmaError, PagerVmaSnapshot, ProcessAffinitySnapshot, RetainedCurrentUserAddressSpace,
@@ -29,7 +29,7 @@ pub use crate::multitask::{
     activate_suspended_user_tasks_with_commit, arm_block_current_task,
     arm_block_current_task_on_endpoint, arm_block_current_task_on_pager_fault,
     arm_block_current_task_on_pager_service, arm_block_current_task_on_reply,
-    attach_reserved_ipc_priority, bind_ipc_priority_to_process_worker, bind_reserved_ipc_priority,
+    attach_reserved_ipc_priority, bind_reserved_ipc_priority,
     cancel_block_current_task, cancel_ipc_priority_reservation, cancel_pager_fault,
     cancel_process_spawn, claim_pager_fault_reply_from_pager, commit_block_current_task_and_yield,
     commit_block_current_task_with_fast_reply_and_yield, commit_fast_ipc_call_handoff_and_yield,
@@ -50,12 +50,12 @@ pub use crate::multitask::{
     pager_fault_snapshot, pager_vma_regions_for_process, protect_pager_vma_for_process,
     publish_current_pager_vma, publish_inherited_pager_vma_for_process,
     publish_pager_vma_for_process, queue_linux_process_sigchld, queue_linux_signal,
-    register_pager_fault_waiter, release_ipc_priorities_for_process, release_ipc_priority,
+    register_pager_fault_waiter, release_ipc_priority,
     release_pager_fault_priority, reserve_ipc_call_donation, reserve_ipc_priority,
     reserve_pager_fault_with_dispatch_grant, reserve_process_spawn, revoke_current_pager_vma,
     revoke_pager_vma_for_process, set_current_linux_tls_fs_base, set_linux_task_affinity,
     set_next_latency_pick_hint, set_next_pick_hint, set_next_process_pick_hint,
-    set_next_spawn_pick_hint, set_next_synchronous_pick_hint,
+    set_next_spawn_pick_hint,
     set_pager_vma_commit_state_for_process, set_windows_current_thread_affinity,
     set_windows_process_affinity, settle_cancelled_ipc_reply_scheduling_context,
     settle_ipc_reply_scheduling_context,
@@ -358,10 +358,6 @@ pub mod snapshot {
         crate::multitask::with_process_state_by_pid_mut(process_id, f)
     }
 
-    pub fn any_user_process_state(f: impl FnMut(u64, &UserProcessState) -> bool) -> bool {
-        crate::multitask::any_user_process_state(f)
-    }
-
     pub fn with_current_process_credentials<R>(
         f: impl FnOnce(ProcessSecurityContext) -> R,
     ) -> Option<R> {
@@ -422,7 +418,7 @@ pub use crate::user::sysops::{drain_user_copy_profile, force_drain_user_copy_pro
 pub use boot::{is_initialized, service_deferred_work, start, start_secondary_cpu};
 pub use fault::{halt_current_retired_task, retire_current_user_task_due_to_fault};
 pub use snapshot::{
-    any_user_process_state, current_scheduling_context_runtime_snapshot, current_task_id,
+    current_scheduling_context_runtime_snapshot, current_task_id,
     current_user_abi, current_user_id, current_user_log_ids, current_user_process_id,
     current_user_snapshot, parent_process_id_of, retain_current_user_process_state,
     user_log_ids_for_task, with_current_process_credentials, with_current_user_process_state_mut,

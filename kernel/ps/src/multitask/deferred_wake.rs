@@ -82,6 +82,16 @@ pub(super) fn defer_current_cpu(task_id: u64) -> bool {
     })
 }
 
+/// Consume only this original masked CPU's mailbox; the scope, not a caller's
+/// scalar CPU index, excludes nested writers through the entire take.
+pub(super) fn take_masked(scope: &nucleus_core::util::lockdep::DispatchPreemption<'_>) -> DeferredWakeBatch {
+    assert!(scope.is_masked(), "deferred wake take requires original masked scope");
+    let cpu = scope.cpu();
+    assert!(cpu < CPU_COUNT, "deferred wake take CPU exceeds capacity");
+    // SAFETY: original same-CPU masked custody excludes local queue writers.
+    take_queue(unsafe { &mut *DEFERRED_WAKES.0[cpu].get() })
+}
+
 pub(super) fn take_current_cpu(logical_index: usize) -> DeferredWakeBatch {
     assert!(
         logical_index < CPU_COUNT,

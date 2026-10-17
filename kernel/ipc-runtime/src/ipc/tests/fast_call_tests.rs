@@ -92,6 +92,61 @@ fn fast_calls_reuse_caller_reply_slot_without_reusing_authority() {
 }
 
 #[test]
+fn alternating_queued_and_fast_replies_preserve_exact_caller_custody() {
+    with_isolated_ipc_test(|| {
+        use super::super::*;
+
+        let endpoint = create_endpoint().expect("create endpoint");
+        for seq in 0..64_u8 {
+            if seq % 2 == 0 {
+                // The server has returned from reply but not re-entered recv:
+                // the next call must stay queued, not borrow a stale waiter.
+                let (reply, receiver) =
+                    enqueue_endpoint_call(endpoint, 7, &[seq]).expect("queue slow call");
+                assert_eq!(receiver, None);
+                let EndpointReceive::Queued((taken, request, handles, caller)) =
+                    receive_or_wait(endpoint, 11, 256, 0, true).expect("take queued call")
+                else {
+                    panic!("queued call lost its receiver");
+                };
+                assert_eq!((taken, caller), (reply, 7));
+                assert_eq!(request, [seq]);
+                assert!(handles.is_empty());
+                assert_eq!(complete_endpoint_reply(reply, &[seq]).expect("reply"), 7);
+                assert_eq!(
+                    take_endpoint_response(reply).expect("take reply"),
+                    Some(alloc::vec![seq])
+                );
+            } else {
+                assert!(matches!(
+                    receive_or_wait(endpoint, 11, 256, 0, true),
+                    Ok(EndpointReceive::Waiting)
+                ));
+                let (reply, receiver) = reserve_fast_endpoint_call(endpoint, 70, 7, &[seq], None)
+                    .expect("reserve exact waiter");
+                assert_eq!(receiver, 11);
+                let EndpointReceive::Fast(taken) =
+                    receive_or_wait(endpoint, 11, 256, 0, true).expect("take fast call")
+                else {
+                    panic!("fast call lost its receiver");
+                };
+                assert_eq!((taken.reply, taken.caller_task_id), (reply, 7));
+                assert_eq!(&taken.request[..taken.request_len], &[seq]);
+                complete_fast_endpoint_reply_for_task(reply, 11, &[seq]).expect("fast reply");
+                assert!(matches!(
+                    take_fast_endpoint_response(reply, 7),
+                    Ok(FastEndpointResponseTake::Response {
+                        response_len: 1,
+                        ..
+                    })
+                ));
+            }
+            assert_eq!(remove_endpoint_waiter_for_task(endpoint, 11), 0);
+        }
+    });
+}
+
+#[test]
 fn fast_call_rejects_oversize_and_ordinary_queue_without_partial_publication() {
     with_isolated_ipc_test(|| {
         let endpoint = super::super::create_endpoint().expect("create endpoint");

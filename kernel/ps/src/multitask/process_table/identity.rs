@@ -7,8 +7,9 @@
 //! - **Publication:** writers revoke the committed word, update pointer/PID
 //!   payloads, then release-store one generation word. Readers validate that
 //!   word before and after reading the payload.
-//! - **Lifetime:** counted references keep any process alive; an own-thread pin
-//!   is valid only while that process still owns the calling task.
+//! - **Lifetime:** counted references or exact atomic allocation pins retain
+//!   the state-lock box independently of directory guards/task membership.
+//!   MM generation and visibility still gate every retained mapping access.
 //! - **Failure:** an absent, stale, or torn publication falls back to the
 //!   locked lifecycle authority. It is never interpreted as an exited process.
 //! - **Forbidden:** this publication must not become a second lifecycle
@@ -109,10 +110,12 @@ pub struct ProcessRef {
 }
 
 /// What keeps a ProcessRef object reachable.
-#[derive(Clone, Copy)]
 enum ProcessRefPin {
     Counted(NonNull<ProcessStateLock<UserProcessState>>),
-    OwnThread,
+    OwnThread {
+        state: NonNull<ProcessStateLock<UserProcessState>>,
+        _allocation: super::pin_owner::ProcessObjectPin,
+    },
 }
 
 /// Payload published with one process-table slot.
@@ -156,6 +159,9 @@ pub(super) fn publish_slot_visibility(
     generation: u32,
     publication: Option<SlotPublication>,
 ) {
+    if publication.is_some() {
+        super::pin_owner::bind(index, generation);
+    }
     PROCESS_IDENTITY[index].store(0, Ordering::Release);
     let (process_id, state, committed) =
         publication.map_or((0, core::ptr::null_mut(), 0), |publication| {
@@ -290,13 +296,9 @@ impl ProcessRef {
     }
 
     fn state(&self) -> Option<NonNull<ProcessStateLock<UserProcessState>>> {
-        match self.pin {
-            ProcessRefPin::Counted(state) => Some(state),
-            ProcessRefPin::OwnThread => NonNull::new(
-                PROCESS_STATE_PTR
-                    .get(self.handle.index())?
-                    .load(Ordering::Acquire),
-            ),
+        match &self.pin {
+            ProcessRefPin::Counted(state) => Some(*state),
+            ProcessRefPin::OwnThread { state, .. } => Some(*state),
         }
     }
 
@@ -391,16 +393,32 @@ pub fn retain_process(handle: ProcessHandle) -> Option<ProcessRef> {
     })
 }
 
-/// The current task's own process, without taking a reference count.
+/// Exact physical object lifetime, independent of task membership. Acquisition
+/// precedes reading any state pointer; generation and PID cannot be rebound
+/// while the atomic pin lives. Publication may be hidden during exec.
+pub(in crate::multitask) fn pin_process_object(
+    handle: ProcessHandle,
+    process_id: u64,
+) -> Option<super::pin_owner::ProcessObjectPin> {
+    let allocation = super::pin_owner::pin(handle)?;
+    (PROCESS_ID.get(handle.index())?.load(Ordering::Acquire) == process_id).then_some(allocation)
+}
+
+/// The current task's process, with independent atomic allocation custody and
+/// no process-table acquisition. MM/visibility validation is still separate.
 pub(in crate::multitask) fn own_process_ref(
     handle: ProcessHandle,
     process_id: u64,
 ) -> Option<ProcessRef> {
-    published_process_state(handle)?;
+    let allocation = pin_process_object(handle, process_id)?;
+    let state = published_process_state(handle)?;
     Some(ProcessRef {
         handle,
         process_id,
-        pin: ProcessRefPin::OwnThread,
+        pin: ProcessRefPin::OwnThread {
+            state,
+            _allocation: allocation,
+        },
     })
 }
 
@@ -452,19 +470,21 @@ pub(in crate::multitask) fn with_own_visible_state<R>(
     handle: ProcessHandle,
     f: impl FnOnce(&UserProcessState) -> R,
 ) -> Option<R> {
+    let _allocation = super::pin_owner::pin(handle)?;
     let state = published_process_state(handle)?;
     let state = unsafe { state.as_ref() }.lock();
     process_state_is_visible(handle).then(|| f(&state))
 }
 
-/// Exact-generation counterpart for a running task. The task pins the state
-/// pointer; the post-lock publication comparison closes exec/reuse without
+/// Exact-generation counterpart for a running task. An atomic pin retains the
+/// state-lock box; post-lock publication comparison closes exec/reuse without
 /// recursively acquiring the global process table.
 pub(in crate::multitask) fn with_own_exact_visible_state<R>(
     handle: ProcessHandle,
     expected: ProcessIdentity,
     f: impl FnOnce(&UserProcessState) -> R,
 ) -> Option<R> {
+    let _allocation = super::pin_owner::pin(handle)?;
     let state = published_process_state(handle)?;
     let state = unsafe { state.as_ref() }.lock();
     (published_live_process_identity(handle) == Some(expected)).then(|| f(&state))

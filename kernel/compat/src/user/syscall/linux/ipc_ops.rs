@@ -2990,6 +2990,13 @@ fn enqueue_call_and_wake_with_handles_for_task(
     // scheduling-context custody. Ordinary callers do not receive a priority
     // boost, but every synchronous call must retain exact budget/domain
     // billing through its reply lifetime.
+    // This producer must own an original masked CPU, never acquire nested
+    // dispatch custody under a raw leaf. Refuse BEFORE reservation or IPC
+    // publication so no receiver is stranded by a bare-ID deferred wake.
+    if nucleus_core::util::lockdep::preemption_disabled()
+        || nucleus_core::util::lockdep::held_spin_lock_depth() != 0 {
+        return Err(LINUX_ENOSPC);
+    }
     let admission = ipc_call_admission::reserve(task_id)?;
     let priority = admission.priority;
     let scheduling_context = admission.scheduling_context;
@@ -3080,17 +3087,25 @@ fn enqueue_call_and_wake_with_handles_for_task(
         // directly needed by a System caller is eligible for the very next
         // pick, rather than being indefinitely deferred by unrelated System
         // pollers.
-        // Bind, wake, and the L4-style direct handoff hint are one scheduler
-        // mutation. The hint is why the caller still returns to arm its reply
-        // wait before yielding: a fast service reply must not race a
-        // not-yet-armed waiter, so `wait_for_reply` performs the actual yield
-        // after the wait state is committed.
-        let handoff = multitask::commit_ipc_call_handoff(
-            reply.raw(),
-            task_id,
-            receiver_task_id,
-            donation_required,
-        );
+        // Original caller funding and exact endpoint receive pending phase
+        // span bind/wake/FIFO without a directory guard. This cold producer
+        // leaves the sender Running/unarmed; wait_for_reply arbitrates a fast
+        // reverse reply and performs the later wait commit and yield.
+        let handoff = match multitask::commit_ipc_call_handoff(
+            endpoint.raw(), reply.raw(), task_id, receiver_task_id,
+        ) {
+            Ok(handoff) => handoff,
+            Err(_) => {
+                // A peer may already have replied while the exact original
+                // typed phase refused. Only runtime's exact settled reply is
+                // success; otherwise withdraw this published request/custody.
+                if kernel_ipc_runtime::api::endpoint_reply_custody_returned(reply, task_id) {
+                    return Ok(reply);
+                }
+                cancel_reply_wait(reply, task_id, ReplyCancelReason::SchedulingCustody);
+                return Err(LINUX_ENOSPC);
+            }
+        };
         donation_admitted |= handoff.inherited;
         ipc_trace!(
             "ipc call wake: endpoint={} receiver_task={} woke={} inherited={}",

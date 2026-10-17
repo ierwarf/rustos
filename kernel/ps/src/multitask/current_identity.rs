@@ -8,8 +8,8 @@
 //! from `current`, FreeBSD from `curthread`, and Zircon from
 //! `Thread::Current::Get()` — a published cell, never the run-queue lock.
 //!
-//! Each task slot owns a seqlock-protected record. Writes happen only under
-//! the scheduler lock, so there is never more than one writer per slot; reads
+//! Each task slot owns identity/lifecycle writer custody under a separate
+//! lock. Its seqlock-protected atomic record is a read-only publication; reads
 //! run with interrupts masked, so the asking CPU's current slot cannot change
 //! underneath the observation. A reader that catches a writer mid-update, or
 //! that finds a slot which was never published, returns `None` and its caller
@@ -18,9 +18,9 @@
 //! Publication is not optional. A write site that mutates identity without
 //! republishing leaves a stale record, which is a correctness fault and not
 //! merely a slow path, so `matches_authority` re-derives each slot from the
-//! authoritative scheduler tables while the lock is held and reports any
-//! divergence rather than trusting the write sites to be complete by
-//! inspection.
+//! directory metadata and independently owned lifecycle while directory
+//! custody stabilizes metadata. This detects missed publication; it does not
+//! confer frame/process lifetime or license removing the directory guard.
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering, fence};
 
@@ -28,6 +28,7 @@ use super::MAX_SCHEDULER_TASKS;
 use super::process_table::ProcessHandle;
 use crate::io::session::ConsoleSessionHandle;
 use crate::user::abi::UserAbi;
+use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
 
 const FLAG_PUBLISHED: u32 = 1 << 0;
 const FLAG_TASK_ID: u32 = 1 << 1;
@@ -65,6 +66,14 @@ impl DispatchPublication {
     #[inline]
     pub(super) const fn lifecycle_dispatchable(self) -> bool {
         self.dispatch_flags & DISPATCH_INELIGIBLE == 0
+    }
+
+    pub(super) const fn job_stopped(self) -> bool {
+        self.dispatch_flags & DISPATCH_JOB_STOPPED != 0
+    }
+
+    pub(super) const fn exec_quiesced(self) -> bool {
+        self.dispatch_flags & DISPATCH_EXEC_QUIESCED != 0
     }
 }
 
@@ -150,6 +159,343 @@ impl TaskIdentity {
     }
 }
 
+/// Serialized identity/lifecycle writer custody. Atomic cells below are a
+/// read-only publication, not a second lifecycle authority.
+struct IdentityWriter {
+    bound_task_id: Option<u64>,
+    exec_generation: u64,
+    kernel_executors: usize,
+    exec_intent: Option<exec_intent::Record>,
+    identity: Option<TaskIdentity>,
+    lifecycle: DispatchLifecycle,
+}
+
+impl IdentityWriter {
+    const fn empty() -> Self {
+        Self {
+            bound_task_id: None,
+            exec_generation: 0,
+            kernel_executors: 0,
+            exec_intent: None,
+            identity: None,
+            lifecycle: DispatchLifecycle {
+                retired: false,
+                suspended: false,
+                job_stopped: false,
+                exec_quiesced: false,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum LifecycleGate {
+    Retired,
+    Suspended,
+    JobStopped,
+    ExecQuiesced,
+}
+
+impl DispatchLifecycle {
+    fn set(&mut self, gate: LifecycleGate, value: bool) {
+        match gate {
+            LifecycleGate::Retired => self.retired = value,
+            LifecycleGate::Suspended => self.suspended = value,
+            LifecycleGate::JobStopped => self.job_stopped = value,
+            LifecycleGate::ExecQuiesced => self.exec_quiesced = value,
+        }
+    }
+}
+
+static WRITERS: [TrackedSpinLock<IdentityWriter, { LockClass::TaskIdentityLifecycle as u8 }>;
+    MAX_SCHEDULER_TASKS] =
+    [const { TrackedSpinLock::new(IdentityWriter::empty()) }; MAX_SCHEDULER_TASKS];
+
+fn with_writer<R>(slot: usize, f: impl FnOnce(&mut IdentityWriter) -> R) -> Option<R> {
+    let cell = WRITERS.get(slot)?;
+    #[cfg(not(test))]
+    {
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            let mut writer = cell.lock();
+            Some(f(&mut writer))
+        })
+    }
+    #[cfg(test)]
+    {
+        let mut writer = cell.lock();
+        Some(f(&mut writer))
+    }
+}
+
+/// Scalar liveness at this writer-leaf linearization point, NOT a backing,
+/// execution or wake grant. Transient exec/cohort admission refusal is not
+/// death: waiter registries must not replace a still-live user on that basis.
+pub(in crate::multitask) fn observe_user_liveness(slot: usize, id: u64) -> bool {
+    with_writer(slot, |writer| {
+        writer.bound_task_id == Some(id)
+            && writer.identity.is_some_and(|entry| entry.task_id == Some(id) && entry.user_mode)
+            && !writer.lifecycle.retired
+    }).unwrap_or(false)
+}
+
+/// Original Identity51 custody for one scalar reply/object comparison only.
+/// No execution/funding grant, allocation or hardware callback may escape f.
+pub(in crate::multitask) fn with_reply_custody(
+    slot: usize,
+    id: u64,
+    f: impl FnOnce(bool) -> Option<(bool, bool)>,
+) -> Option<(bool, bool)> {
+    with_writer(slot, |writer| {
+        writer.identity.filter(|identity| identity.task_id == Some(id))?;
+        f(!writer.lifecycle.retired)
+    })?
+}
+
+/// Join a constructor's exact published UID to its scalar Resources53 ACK.
+/// No callback, queue, allocation, hardware or cross-owner destruction in f.
+pub(in crate::multitask) fn with_exact_publication<R>(
+    slot: usize,
+    id: u64,
+    f: impl FnOnce() -> R,
+) -> Option<R> {
+    with_writer(slot, |writer| {
+        writer
+            .identity
+            .filter(|identity| identity.task_id == Some(id))?;
+        Some(f())
+    })?
+}
+
+/// A complete exact desired-stop observation; hidden metadata preserves the
+/// binding. False includes missing/foreign binding and is never absence proof.
+pub(in crate::multitask) fn terminal_retired_matches(slot: usize, id: u64) -> bool {
+    with_writer(slot, |writer| {
+        writer.bound_task_id == Some(id) && writer.lifecycle.retired
+    })
+    .unwrap_or(false)
+}
+
+/// Only a scalar Resources53 binding check may run while Identity51 is held.
+/// Terminal producer custody remains in Class50, never nested with this leaf.
+pub(in crate::multitask) fn with_terminal_binding<R>(
+    slot: usize,
+    id: u64,
+    f: impl FnOnce() -> Option<R>,
+) -> Option<R> {
+    with_writer(slot, |writer| {
+        if writer.bound_task_id != Some(id) || writer.kernel_executors != 0 {
+            return None;
+        }
+        f()
+    })?
+}
+
+/// Identity51 joins exact descriptor UID and cold cohort seal to scalar Affinity54 writes.
+/// Refusal precedes masks/epochs; no observations, queue/process work or Drop inside f.
+pub(in crate::multitask) fn with_affinity_replacement<R>(
+    slot: usize,
+    id: Option<u64>,
+    owner: Option<&cohort::Cohort>,
+    f: impl FnOnce() -> R,
+) -> Option<R> {
+    with_writer(slot, |writer| {
+        #[cfg(test)]
+        let fixture = writer.bound_task_id.is_none() && writer.identity.is_none();
+        #[cfg(not(test))]
+        let fixture = false;
+        if !fixture && (id.is_none() || writer.bound_task_id != id) {
+            return None;
+        }
+        let granted = match owner {
+            Some(cohort) => id.is_some_and(|id| cohort.owns_affinity(slot, id)),
+            None => !cohort::busy(slot),
+        };
+        if !granted {
+            return None;
+        }
+        Some(f())
+    })?
+}
+
+/// ORIGINAL pinned IPC receiver joins exact UID/lifecycle and cohort exclusion
+/// to Affinity54 -> FIFO56 -> Wait58 scalar publication. The caller retains its
+/// physical binding and reader OUTSIDE these leaves. No resource/frame/budget,
+/// allocation, process, destruction or notification work may enter `publish`.
+pub(in crate::multitask) fn with_ipc_handoff_binding<R>(
+    slot: usize,
+    id: u64,
+    publish: impl FnOnce() -> R,
+) -> Option<R> {
+    with_writer(slot, |writer| {
+        if writer.bound_task_id != Some(id)
+            || !writer.lifecycle.dispatchable()
+            || writer.exec_intent.is_some()
+            || cohort::busy(slot)
+        {
+            return None;
+        }
+        Some(publish())
+    })?
+}
+
+/// Exact hidden-or-visible lifetime binding for producer-last reclaim/reuse.
+/// f only joins the scalar resource leaf; no external work or destruction.
+pub(in crate::multitask) fn with_reclaim_binding<R>(
+    slot: usize,
+    expected: Option<u64>,
+    f: impl FnOnce() -> R,
+) -> Option<R> {
+    with_reclaim_binding_qualified(slot, expected, false, f)
+}
+
+/// Retired reapers are distinct from unpublished constructor rollback.
+/// Desired stop and all execution custody are checked in this exact identity turn.
+pub(in crate::multitask) fn with_reclaim_binding_qualified<R>(
+    slot: usize,
+    expected: Option<u64>,
+    retired: bool,
+    f: impl FnOnce() -> R,
+) -> Option<R> {
+    with_writer(slot, |writer| {
+        if writer.bound_task_id != expected
+            || writer.exec_intent.is_some()
+            || execution::count(slot) != 0
+            || cohort::busy(slot)
+            || (retired
+                && (expected.is_none()
+                    || !writer.lifecycle.retired
+                    || writer.kernel_executors != 0))
+        {
+            return None;
+        }
+        Some(f())
+    })?
+}
+
+/// Explicit old lifetime clear after owned resource drain, before reuse ACK.
+/// validate only authenticates the exact drained Resources53 receipt.
+pub(in crate::multitask) fn clear_reclaimed(
+    slot: usize,
+    expected: Option<u64>,
+    validate: impl FnOnce() -> bool,
+) -> Option<()> {
+    with_writer(slot, |writer| {
+        if writer.bound_task_id != expected
+            || writer.exec_intent.is_some()
+            || execution::count(slot) != 0
+            || cohort::busy(slot)
+            || !validate()
+        {
+            return None;
+        }
+        let generation = writer.exec_generation;
+        *writer = IdentityWriter::empty();
+        writer.exec_generation = generation;
+        clear_publication(slot);
+        Some(())
+    })?
+}
+
+/// Metadata writers cannot replay an obsolete lifecycle snapshot. Directory
+/// admission/rebind still owns constructing identity and stack geometry.
+pub(super) fn publish_metadata(slot: usize, identity: Option<TaskIdentity>) {
+    with_writer(slot, |writer| {
+        if let Some(task_id) = writer.bound_task_id {
+            assert!(
+                identity.is_none_or(|next| next.task_id == Some(task_id)),
+                "bound execution identity changed before clear"
+            );
+        }
+        check_binding(writer.identity, identity);
+        execution::kernel_executor::check_metadata(writer, identity);
+        writer.identity = identity;
+        commit_writer(slot, writer);
+    });
+}
+
+/// Cold-directory adapter: flags and the current identity (including absence
+/// during partial initialization/teardown) become visible in one transaction.
+pub(super) fn publish_lifecycle_change(
+    slot: usize,
+    identity: Option<TaskIdentity>,
+    gate: LifecycleGate,
+    value: bool,
+) {
+    with_writer(slot, |writer| {
+        if let Some(task_id) = writer.bound_task_id {
+            assert!(
+                identity.is_none_or(|next| next.task_id == Some(task_id)),
+                "bound execution identity changed before clear"
+            );
+        }
+        check_binding(writer.identity, identity);
+        execution::kernel_executor::check_metadata(writer, identity);
+        assert!(
+            writer.kernel_executors == 0 || !value,
+            "lifecycle stop crossed live kernel executor custody"
+        );
+        exec_intent::check_unowned_gate(writer, gate, value);
+        cohort::check_unowned_gate(slot, gate);
+        writer.lifecycle.set(gate, value);
+        writer.identity = identity;
+        commit_writer(slot, writer);
+    });
+}
+
+/// An exact live-identity command never rebinds metadata or modifies a recycled
+/// task. Owner locks are dropped before wake/reschedule/other external work.
+pub(super) fn update_live_lifecycle(
+    slot: usize,
+    task_id: u64,
+    gate: LifecycleGate,
+    value: bool,
+) -> bool {
+    with_writer(slot, |writer| {
+        if writer.identity.and_then(|identity| identity.task_id) != Some(task_id)
+            || (writer.kernel_executors != 0 && value)
+        {
+            return false;
+        }
+        exec_intent::check_unowned_gate(writer, gate, value);
+        cohort::check_unowned_gate(slot, gate);
+        writer.lifecycle.set(gate, value);
+        commit_writer(slot, writer);
+        true
+    })
+    .unwrap_or(false)
+}
+
+pub(super) fn lifecycle(slot: usize) -> DispatchLifecycle {
+    with_writer(slot, |writer| writer.lifecycle).unwrap_or(DispatchLifecycle {
+        retired: true,
+        suspended: true,
+        job_stopped: true,
+        exec_quiesced: true,
+    })
+}
+
+fn check_binding(previous: Option<TaskIdentity>, next: Option<TaskIdentity>) {
+    if let (Some(previous), Some(next)) = (previous, next) {
+        if let Some(task_id) = previous.task_id {
+            assert_eq!(next.task_id, Some(task_id), "identity rebind before clear");
+        }
+    }
+}
+
+fn commit_writer(slot: usize, writer: &mut IdentityWriter) {
+    if let Some(task_id) = writer.identity.and_then(|identity| identity.task_id) {
+        assert!(
+            writer.bound_task_id.is_none_or(|old| old == task_id),
+            "execution identity rebound without explicit drained reset"
+        );
+        writer.bound_task_id = Some(task_id);
+    }
+    match writer.identity {
+        Some(identity) => commit_identity(slot, identity, writer.lifecycle),
+        None => clear_publication(slot),
+    }
+}
+
 struct PublishedIdentity {
     /// Even when stable, odd while a writer is between the two halves of an
     /// update. Readers that observe an odd or changed value take the lock.
@@ -221,8 +567,9 @@ pub(super) fn raise_signal_pending(slot: usize) {
     }
 }
 
-/// Re-derives the hint for `slot` from authoritative state. Callers must hold
-/// the scheduler lock, which is what excludes a concurrent raise.
+/// Re-derives the hint for `slot` from authoritative thread state. Production
+/// callers hold the Linux-thread leaf through mutation/snapshot and this
+/// store, which serializes every raise without the Scheduler guard.
 pub(super) fn sync_signal_pending(slot: usize, pending: bool) {
     if let Some(flag) = SIGNAL_PENDING.get(slot) {
         flag.store(pending, Ordering::Release);
@@ -281,13 +628,31 @@ pub(super) fn publish_test_identity(slot: usize, identity: TaskIdentity) {
     publish_state(slot, identity, DispatchLifecycle::default());
 }
 
-/// Publishes identity and lifecycle state in the same even-version commit.
+/// Isolated host fixture publisher. Production metadata cannot supply flags.
+#[cfg(test)]
 pub(super) fn publish_state(slot: usize, identity: TaskIdentity, lifecycle: DispatchLifecycle) {
+    with_writer(slot, |writer| {
+        if writer.bound_task_id != identity.task_id {
+            assert_eq!(
+                execution::count(slot),
+                0,
+                "fixture rebind discards execution custody"
+            );
+            writer.bound_task_id = None;
+        }
+        writer.identity = Some(identity);
+        writer.lifecycle = lifecycle;
+        commit_writer(slot, writer);
+    });
+}
+
+/// Called only with the matching per-slot writer lock held.
+fn commit_identity(slot: usize, identity: TaskIdentity, lifecycle: DispatchLifecycle) {
     let Some(cell) = IDENTITIES.get(slot) else {
         return;
     };
-    // ORDERING: Relaxed is sufficient because the scheduler lock already
-    // excludes every other writer of this slot.
+    // ORDERING: the per-slot writer owner excludes every other writer; the
+    // global scheduler directory is not publication custody.
     let version = cell.version.load(Ordering::Relaxed);
     assert_eq!(
         version & 1,
@@ -343,9 +708,27 @@ pub(super) fn publish_state(slot: usize, identity: TaskIdentity, lifecycle: Disp
         .store(version.wrapping_add(2), Ordering::Release);
 }
 
-/// Clears `slot` so readers fall back to the locked query until it is bound
-/// again. Used when a slot is retired rather than rebound.
+/// Explicit admission/reset boundary; normal absent-metadata publication must
+/// preserve pending suspension/stop intent instead of silently clearing it.
 pub(super) fn clear(slot: usize) {
+    with_writer(slot, |writer| {
+        assert_eq!(
+            execution::count(slot),
+            0,
+            "identity reset discards CPU execution custody"
+        );
+        assert!(
+            writer.exec_intent.is_none(),
+            "identity reset discards cold exec intent custody"
+        );
+        let generation = writer.exec_generation;
+        *writer = IdentityWriter::empty();
+        writer.exec_generation = generation;
+        clear_publication(slot);
+    });
+}
+
+fn clear_publication(slot: usize) {
     let Some(cell) = IDENTITIES.get(slot) else {
         return;
     };
@@ -443,9 +826,13 @@ pub(super) fn read_dispatch(slot: usize) -> Option<DispatchPublication> {
     })
 }
 
-/// Compares the published record for `slot` against the authority the
-/// scheduler holds, returning `false` on divergence. The caller must hold the
-/// scheduler lock so that `authority` is a stable observation.
+/// Independent telemetry compares the published scalar descriptor against
+/// its ORIGINAL Identity51 writer in one bounded leaf. No descriptor value
+/// authorizes backing, execution or a new loan; no raw leaf crosses sampling.
+pub(super) fn binding_publication_diverges(slot: usize) -> bool {
+    with_writer(slot, |writer| !matches_authority(slot, writer.identity, writer.lifecycle))
+        .unwrap_or(false)
+}
 pub(super) fn matches_authority(
     slot: usize,
     authority: Option<TaskIdentity>,
@@ -463,12 +850,18 @@ pub(super) fn matches_authority(
     }
 }
 
+pub(in crate::multitask) mod cohort;
+pub(in crate::multitask) mod exec_intent;
+pub(in crate::multitask) mod execution;
+#[cfg(test)]
+mod owner_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn published_identity_round_trips_and_clears() {
+        let _namespace = crate::multitask::scheduler::execution_test_serial_guard();
         let slot = 3;
         let identity = TaskIdentity {
             task_id: Some(41),
@@ -515,6 +908,7 @@ mod tests {
 
     #[test]
     fn dispatch_lifecycle_is_committed_with_identity() {
+        let _namespace = crate::multitask::scheduler::execution_test_serial_guard();
         let slot = 6;
         let identity = TaskIdentity {
             task_id: Some(91),
@@ -541,11 +935,32 @@ mod tests {
                 .expect("published dispatch state")
                 .lifecycle_dispatchable()
         );
+        publish_state(
+            slot,
+            identity,
+            DispatchLifecycle {
+                job_stopped: true,
+                exec_quiesced: true,
+                ..DispatchLifecycle::default()
+            },
+        );
+        let dispatch = read_dispatch(slot).expect("complete lifecycle publication");
+        assert!(dispatch.job_stopped() && dispatch.exec_quiesced());
+        assert!(!dispatch.lifecycle_dispatchable());
+        assert!(!binding_publication_diverges(slot));
+        // Model a missing final descriptor publication, not backing permission.
+        // The actual original writer changes while its last published scalar
+        // still describes the old lifecycle; telemetry must expose that split.
+        with_writer(slot, |writer| writer.lifecycle.job_stopped = false).unwrap();
+        assert!(binding_publication_diverges(slot));
+        with_writer(slot, |writer| writer.lifecycle.job_stopped = true).unwrap();
+        assert!(!binding_publication_diverges(slot));
         clear(slot);
     }
 
     #[test]
     fn kernel_task_publishes_no_user_binding() {
+        let _namespace = crate::multitask::scheduler::execution_test_serial_guard();
         let slot = 4;
         publish_test_identity(
             slot,
@@ -567,6 +982,7 @@ mod tests {
 
     #[test]
     fn incomplete_user_or_odd_publication_requires_locked_log_lookup() {
+        let _namespace = crate::multitask::scheduler::execution_test_serial_guard();
         let slot = 5;
         clear(slot);
         assert_eq!(
@@ -608,6 +1024,10 @@ mod tests {
 
     #[test]
     fn unpublished_slot_reads_as_absent() {
+        let _process = crate::multitask::process_table::tests::isolate_process_table();
+        let _cpu = crate::multitask::cpu_local::test_publication_lock();
+        let _runtime = crate::multitask::scheduler::execution_test_serial_guard();
+        clear(MAX_SCHEDULER_TASKS - 1);
         assert_eq!(read(MAX_SCHEDULER_TASKS - 1), None);
         assert_eq!(read(MAX_SCHEDULER_TASKS), None);
     }

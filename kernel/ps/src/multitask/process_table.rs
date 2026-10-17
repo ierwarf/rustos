@@ -85,12 +85,32 @@ impl ExecReservation {
 
 pub struct StagedExec {
     reservation: ExecReservation,
+    new_root: u64,
+    new_mm: MmExecutionPin,
     process_id: u64,
     closed: alloc::vec::Vec<crate::user::handles::KernelHandle>,
     old_state: UserProcessState,
 }
 
+impl StagedExec {
+    pub(in crate::multitask) fn pin_execution_mm(
+        &self,
+        reservation: ExecReservation,
+        root: u64,
+    ) -> MmExecutionPin {
+        assert_eq!(
+            self.reservation, reservation,
+            "foreign staged MM reservation"
+        );
+        assert_eq!(self.new_root, root, "foreign staged MM root");
+        self.new_mm
+            .try_clone()
+            .expect("staged MM closed before image publication")
+    }
+}
+
 pub struct ExecFinalize {
+    intent: Option<super::current_identity::exec_intent::Credential>,
     process_id: u64,
     exit_pending: bool,
     closed: alloc::vec::Vec<crate::user::handles::KernelHandle>,
@@ -98,6 +118,14 @@ pub struct ExecFinalize {
 }
 
 impl ExecFinalize {
+    pub(in crate::multitask) fn intent(
+        &self,
+    ) -> Option<super::current_identity::exec_intent::Credential> {
+        self.intent
+    }
+    pub(in crate::multitask) fn exit_pending(&self) -> bool {
+        self.exit_pending
+    }
     pub fn into_parts(
         self,
     ) -> (
@@ -121,6 +149,7 @@ struct ProcessObject {
     ref_count: usize,
     thread_count: usize,
     mm_generation: u32,
+    mm_execution: kernel_mm::api::address_space::ExecutionPin,
     lifecycle_transaction_id: u32,
     pending_exit_transaction_id: Option<u32>,
     exec_in_progress: bool,
@@ -148,6 +177,10 @@ impl ProcessObject {
             ref_count: 1,
             thread_count: 1,
             mm_generation: 1,
+            mm_execution: state
+                .address_space()
+                .pin_execution()
+                .expect("new process missing MM execution owner"),
             lifecycle_transaction_id,
             pending_exit_transaction_id: None,
             exec_in_progress: false,
@@ -172,6 +205,7 @@ struct ProcessSlot {
     generation: u32,
     object: Option<Box<ProcessObject>>,
     spawn_transaction_id: Option<u32>,
+    root_spawn: Option<spawn::RootSpawnKey>,
 }
 
 impl ProcessSlot {
@@ -180,6 +214,7 @@ impl ProcessSlot {
             generation: 1,
             object: None,
             spawn_transaction_id: None,
+            root_spawn: None,
         }
     }
 }
@@ -225,6 +260,8 @@ impl ProcessTable {
 }
 
 mod identity;
+mod mm_execution;
+pub(in crate::multitask) mod pin_owner;
 pub(super) use identity::published_live_process_identity;
 pub use identity::{
     ProcessHandle, ProcessIdentity, ProcessRef, live_process_identity,
@@ -232,7 +269,10 @@ pub use identity::{
 };
 #[cfg(test)]
 use identity::{clear_publication_for_test, process_state_is_visible};
-pub(super) use identity::{own_process_ref, publication_divergence_count, with_own_visible_state};
+pub(super) use identity::{
+    own_process_ref, pin_process_object, publication_divergence_count, with_own_visible_state,
+};
+pub(in crate::multitask) use mm_execution::{MmActivationPin, MmExecutionPin, pin_process_mm};
 
 /// Keep the exact-state lock bridge as an explicit process-table API instead
 /// of leaking the private identity module through a re-export.
@@ -244,7 +284,7 @@ pub(super) fn with_own_exact_visible_state<R>(
     identity::with_own_exact_visible_state(handle, expected, f)
 }
 
-mod spawn;
+pub(in crate::multitask) mod spawn;
 pub use spawn::{SpawnReservation, cancel_spawn, publish_spawn, reserve_spawn};
 
 static PROCESS_TABLE: ProcessTableLock = ProcessTableLock::new(ProcessTable::new());
@@ -323,6 +363,11 @@ fn reclaim_slot(index: usize, slot: &mut ProcessSlot) -> Option<Box<ProcessObjec
         return None;
     }
 
+    // Close-before-zero prevents a lock-free reader from entering between
+    // the reaper's last reference observation and pointer revocation.
+    if !pin_owner::close(index, slot.generation) {
+        return None;
+    }
     let object = slot.object.take()?;
     // Generation exhaustion permanently retires this slot. Reusing generation
     // one would let a stale ProcessHandle alias a new process.
@@ -352,6 +397,9 @@ pub fn create_process_with_parent(
 
 pub fn attach_task(handle: ProcessHandle) -> Option<()> {
     let mut table = PROCESS_TABLE.lock();
+    if !pin_owner::is_open(handle) {
+        return None;
+    }
     let object = table.lookup_object_mut(handle)?;
     if object.exiting || object.exec_in_progress {
         return None;
@@ -485,6 +533,12 @@ pub fn stage_exec_state(
     linux_runtime_profile: crate::user::linux::LinuxRuntimeProfile,
     exec_path: &str,
 ) -> Option<StagedExec> {
+    let new_root = address_space.root_phys().as_u64();
+    let new_mm = MmExecutionPin::new(
+        reservation.handle,
+        reservation.next_mm_generation,
+        address_space.pin_execution()?,
+    );
     let process = retain_process(reservation.handle)?;
     let staged = process.with_state_mut(|process_id, state| {
         {
@@ -495,6 +549,9 @@ pub fn stage_exec_state(
             }
         }
 
+        if !state.address_space().seal_execution() {
+            return None;
+        }
         let (closed, old_state) = state.replace_for_exec(
             address_space,
             linux_process_state,
@@ -512,6 +569,7 @@ pub fn stage_exec_state(
                 exec_commit_may_transfer(object, reservation),
                 "authorized exec reservation changed before generation publication"
             );
+            object.mm_execution = new_mm.pin_for_publication();
             object.mm_generation = reservation.next_mm_generation;
             object.exec_state_staged = true;
             let index = reservation.handle.index();
@@ -520,6 +578,8 @@ pub fn stage_exec_state(
         }
         Some(StagedExec {
             reservation,
+            new_root,
+            new_mm,
             process_id,
             closed,
             old_state,
@@ -536,11 +596,11 @@ pub fn stage_exec_state(
     staged
 }
 
-pub fn finalize_exec_state(staged: StagedExec, published_handle: ProcessHandle) -> ExecFinalize {
-    assert_eq!(
-        published_handle, staged.reservation.handle,
-        "exec scheduler publication changed process generation"
-    );
+pub(super) fn finalize_exec_state(
+    staged: StagedExec,
+    publication: super::scheduler::exec_transaction::ExecPublication,
+) -> ExecFinalize {
+    publication.assert_matches(staged.reservation, staged.new_root);
     let exit_pending = {
         let mut table = PROCESS_TABLE.lock();
         let object = table
@@ -550,6 +610,7 @@ pub fn finalize_exec_state(staged: StagedExec, published_handle: ProcessHandle) 
             object.exec_in_progress
                 && object.exec_commit_authorized
                 && object.exec_state_staged
+                && object.lifecycle_transaction_id == staged.reservation.transaction_id
                 && object.mm_generation == staged.reservation.next_mm_generation,
             "published exec transaction lost exact generation ownership"
         );
@@ -579,6 +640,7 @@ pub fn finalize_exec_state(staged: StagedExec, published_handle: ProcessHandle) 
         staged.reservation.transaction_id,
     );
     ExecFinalize {
+        intent: publication.intent(),
         process_id: staged.process_id,
         exit_pending,
         closed: staged.closed,
@@ -656,12 +718,31 @@ pub fn authorize_exec(reservation: ExecReservation) -> bool {
 }
 
 pub fn cancel_exec(reservation: ExecReservation) -> bool {
+    cancel_exec_owned(reservation).is_some()
+}
+
+/// Non-Copy evidence that this exact process reservation was cancelled.
+pub(in crate::multitask) struct ExecCancellation {
+    reservation: ExecReservation,
+    terminal: bool,
+}
+impl ExecCancellation {
+    pub(in crate::multitask) fn terminal(&self) -> bool {
+        self.terminal
+    }
+    pub(in crate::multitask) fn matches(&self, reservation: ExecReservation) -> bool {
+        self.reservation == reservation
+    }
+}
+pub(in crate::multitask) fn cancel_exec_owned(
+    reservation: ExecReservation,
+) -> Option<ExecCancellation> {
     let mut table = PROCESS_TABLE.lock();
     let Some(object) = table.lookup_object_mut(reservation.handle) else {
-        return false;
+        return None;
     };
     if !exec_reservation_matches(object, reservation) {
-        return false;
+        return None;
     }
     if object.exec_state_staged {
         panic!("exec invariant: staged process state cannot be cancelled after commit began");
@@ -680,6 +761,7 @@ pub fn cancel_exec(reservation: ExecReservation) -> bool {
     } else {
         None
     };
+    let terminal = object.exiting;
     publish_slot_visibility(
         reservation.handle.index(),
         &table.slots[reservation.handle.index()],
@@ -699,7 +781,20 @@ pub fn cancel_exec(reservation: ExecReservation) -> bool {
             transaction_id,
         );
     }
-    true
+    Some(ExecCancellation {
+        reservation,
+        terminal,
+    })
+}
+
+#[cfg(test)]
+pub(in crate::multitask) fn test_exec_cancellation(
+    reservation: ExecReservation,
+) -> ExecCancellation {
+    ExecCancellation {
+        reservation,
+        terminal: false,
+    }
 }
 
 pub fn note_process_exit_status(process_id: u64, status: i32) -> Option<()> {
@@ -717,40 +812,62 @@ pub fn note_process_exit_status(process_id: u64, status: i32) -> Option<()> {
     Some(())
 }
 
-pub fn note_process_stopped(process_id: u64, signal: u64) -> Option<()> {
-    let signal = u8::try_from(signal).ok()?;
+/// Record child state under the original census' physical process pin. The
+/// parent PID is a notification hint, not authority over a parent allocation.
+/// No process-table leaf spans recipient acquisition or signal/wake work.
+pub(in crate::multitask) fn note_job_control(
+    pin: &pin_owner::ProcessObjectPin,
+    process_id: u64,
+    stop_signal: Option<u8>,
+) -> Option<Option<u64>> {
+    let handle = pin.handle();
     let mut table = PROCESS_TABLE.lock();
-    let object = table
-        .slots
-        .iter_mut()
-        .filter_map(|slot| slot.object.as_deref_mut())
-        .find(|object| object.process_id == process_id && !object.exiting)?;
-    object.child_state_change = Some(ChildStateChange::Stopped(signal));
-    Some(())
-}
-
-pub fn note_process_continued(process_id: u64) -> Option<()> {
-    let mut table = PROCESS_TABLE.lock();
-    let object = table
-        .slots
-        .iter_mut()
-        .filter_map(|slot| slot.object.as_deref_mut())
-        .find(|object| object.process_id == process_id && !object.exiting)?;
-    object.child_state_change = Some(ChildStateChange::Continued);
-    Some(())
+    let slot = table.slots.get_mut(handle.index())?;
+    if slot.generation != handle.generation() { return None; }
+    let object = slot.object.as_deref_mut()?;
+    if object.process_id != process_id || object.exiting { return None; }
+    object.child_state_change = Some(match stop_signal {
+        Some(signal) => ChildStateChange::Stopped(signal),
+        None => ChildStateChange::Continued,
+    });
+    Some(object.parent_process_id)
 }
 
 /// Mark a process as exiting before callers tear down resources that it owns.
-///
-/// The process object remains available until its tasks retire and its parent
-/// reaps it, but new authority publication must fail once this bit is set.
+/// The object stays available until its tasks retire and its parent reaps it.
 pub fn mark_process_exiting(process_id: u64) -> Option<()> {
+    mark_process_exiting_inner(process_id, None)
+}
+
+/// Captured group commands must name the exact physical process generation,
+/// not silently recover a foreign allocation through a copied PID.
+pub(in crate::multitask) fn mark_process_exiting_for_handle(
+    handle: ProcessHandle,
+    process_id: u64,
+) -> Option<()> {
+    mark_process_exiting_inner(process_id, Some(handle))
+}
+
+fn mark_process_exiting_inner(process_id: u64, expected: Option<ProcessHandle>) -> Option<()> {
     let mut table = PROCESS_TABLE.lock();
-    let index = table.slots.iter().position(|slot| {
-        slot.object
-            .as_deref()
-            .is_some_and(|object| object.process_id == process_id)
-    })?;
+    let index = if let Some(handle) = expected {
+        let slot = table.slots.get(handle.index())?;
+        if slot.generation != handle.generation()
+            || !slot
+                .object
+                .as_deref()
+                .is_some_and(|o| o.process_id == process_id)
+        {
+            return None;
+        }
+        handle.index()
+    } else {
+        table.slots.iter().position(|slot| {
+            slot.object
+                .as_deref()
+                .is_some_and(|object| object.process_id == process_id)
+        })?
+    };
     let handle = ProcessHandle::new(index, table.slots[index].generation);
     let object = table.slots[index].object.as_deref_mut()?;
     if object.exec_in_progress {
@@ -940,6 +1057,9 @@ pub fn wait_for_child(
 }
 
 pub fn reap_exited_processes() -> usize {
+    // Consume before scanning: a concurrent last-pin release survives for
+    // this scan or the next one, never gets erased after the scan.
+    let pin_reap_pending = pin_owner::take_reap_notification();
     let mut reaped = 0usize;
     let mut reclaimed: [Option<Box<ProcessObject>>; MAX_PROCESS_OBJECTS] =
         [const { None }; MAX_PROCESS_OBJECTS];
@@ -951,7 +1071,7 @@ pub fn reap_exited_processes() -> usize {
         let mut table = PROCESS_TABLE.lock();
         let queue = core::mem::replace(&mut table.reap_queue, [None; MAX_PROCESS_OBJECTS]);
         let queue_len = core::mem::replace(&mut table.reap_len, 0);
-        let scan_all = core::mem::replace(&mut table.reap_scan_pending, false);
+        let scan_all = core::mem::replace(&mut table.reap_scan_pending, false) || pin_reap_pending;
         for handle in queue.into_iter().take(queue_len).flatten() {
             let index = handle.index();
             let Some(slot) = table.lookup_slot_mut(handle) else {
@@ -1002,6 +1122,7 @@ pub fn reap_exited_processes() -> usize {
         );
     }
     drop(reclaimed);
+    kernel_mm::api::address_space::drain_retired_address_spaces(16);
     reaped
 }
 
@@ -1010,6 +1131,7 @@ fn reset_for_tests() {
     NEXT_LIFECYCLE_TRANSACTION_ID.store(1, Ordering::Relaxed);
     let retired = {
         let mut table = PROCESS_TABLE.lock();
+        pin_owner::reset_for_tests();
         let retired = core::mem::replace(&mut *table, ProcessTable::new());
         // The unlocked visibility words mirror the table, so a reset that left
         // them behind would let one test read another's slot as live.
@@ -1024,6 +1146,32 @@ fn reset_for_tests() {
     drop(retired);
 }
 
+/// Fixture stamps carry no live process authority; production still uses begin_exec.
+#[cfg(test)]
+pub(super) fn test_exec_stamp(generation: u32, mm: u32, transaction: u32) -> ExecReservation {
+    ExecReservation {
+        handle: ProcessHandle::new(0, generation),
+        expected_mm_generation: mm,
+        next_mm_generation: mm + 1,
+        transaction_id: transaction,
+    }
+}
+
+/// Host-only image fixture; no live table/MM-generation publication authority.
+#[cfg(test)]
+pub(in crate::multitask) fn test_execution_mm(
+    reservation: ExecReservation,
+    mm: &ProcessAddressSpace,
+) -> MmExecutionPin {
+    MmExecutionPin::new(
+        reservation.handle,
+        reservation.next_mm_generation,
+        mm.pin_execution().unwrap(),
+    )
+}
+#[cfg(test)]
+#[path = "process_table/exec_tests.rs"]
+mod exec_tests;
 #[cfg(test)]
 pub(crate) mod tests {
     use core::sync::atomic::AtomicU64;
@@ -1032,7 +1180,7 @@ pub(crate) mod tests {
         ExecReservation, LockClass, ProcessHandle, ProcessObject, ProcessTable, WaitResult,
         attach_task, begin_exec, cancel_exec, clear_publication_for_test, create_process,
         create_process_with_parent, detach_task, is_process_exiting, mark_process_exiting,
-        note_process_continued, note_process_exit_status, note_process_stopped, own_process_ref,
+        note_job_control, note_process_exit_status, own_process_ref,
         process_state_is_visible, reap_exited_processes, retain_process, thread_count_by_pid,
         try_with_process_state_mut, wait_for_child,
     };
@@ -1078,7 +1226,7 @@ pub(crate) mod tests {
         ProcessTableTestIsolation { _guard: guard }
     }
 
-    fn new_state() -> UserProcessState {
+    pub(super) fn new_state() -> UserProcessState {
         UserProcessState::new(
             ProcessAddressSpace::empty_for_tests(),
             None,
@@ -1386,7 +1534,10 @@ pub(crate) mod tests {
         let child =
             create_process_with_parent(47, Some(46), new_state()).expect("child process handle");
 
-        note_process_stopped(47, 19).expect("record stopped");
+        let pin = super::pin_owner::pin(child).unwrap();
+        assert_eq!(note_job_control(&pin, 999, Some(19)), None);
+        note_job_control(&pin, 47, Some(19)).expect("record stopped");
+        drop(pin);
         assert!(matches!(
             wait_for_child(46, 47, false, false),
             WaitResult::Pending
@@ -1399,7 +1550,9 @@ pub(crate) mod tests {
             }
         ));
 
-        note_process_continued(47).expect("record continued");
+        let pin = super::pin_owner::pin(child).unwrap();
+        note_job_control(&pin, 47, None).expect("record continued");
+        drop(pin);
         assert!(matches!(
             wait_for_child(46, 47, true, false),
             WaitResult::Pending

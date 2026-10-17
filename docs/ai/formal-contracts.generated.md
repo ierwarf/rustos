@@ -2,20 +2,20 @@
 # Formal Contract Registry
 
 - Schema: `3`
-- Registry SHA-256: `610e1531a49222249567a5e2b55baf98cd41a8e164d4ce2967b74e3cb1850261`
-- Models: `137`
+- Registry SHA-256: `74137b74339f140ec7e5d460e42ea221c6bb27b201ad002362bb90795c25f713`
+- Models: `145`
 - Whole flows: `75`
-- Transitions: `755`
+- Transitions: `878`
 - Product runtime scenarios: `3`
-- Exact source witnesses: `666`
+- Exact source witnesses: `1304`
 - Apalache pilots: `3`
 - TLAPS theorem models: `2`
 - Runtime-traced models: `7`
 - Intentional-terminal exceptions: `92` (ceiling `92`)
-- Cyclic strongly connected components: `48`
-- Supporting model bindings: `109`
-- Explicit critical/high risk surfaces: `118`
-- Additional source mappings: `202`
+- Cyclic strongly connected components: `49`
+- Supporting model bindings: `117`
+- Explicit critical/high risk surfaces: `231`
+- Additional source mappings: `357`
 
 | Flow | Severity | Owners | Models | Requirements | Hazards | Sinks |
 | --- | --- | --- | --- | ---: | ---: | --- |
@@ -23,7 +23,7 @@
 | `atomic-process-activation-batch` | `critical` | initd, kernel-compat, kernel-ps, loaderd | atomic-process-activation-batch/AtomicProcessActivationBatch | 13 | 13 | handed-off, rejected, retired |
 | `boot-info-admission` | `critical` | boot-protocol | early-system-admission/EarlySystemAdmission | 3 | 3 | admitted, rejected |
 | `boot-storage-handoff` | `critical` | hostd, storage-dvm, storaged, xtask | boot-storage-handoff/BootStorageHandoff | 14 | 14 | host-restored, proven, quarantined |
-| `bootstrap-activation-handoff` | `critical` | kernel-ps | bootstrap-activation-handoff/BootstrapActivationHandoff | 6 | 6 | first-turn, revoked |
+| `bootstrap-activation-handoff` | `critical` | kernel-ps | bootstrap-activation-handoff/BootstrapActivationHandoff | 12 | 12 | first-turn, revoked |
 | `bootstrap-content-admission` | `critical` | kernel-io-manager | filesystem-content-integrity/FilesystemContentIntegrity | 2 | 2 | admitted, rejected |
 | `capability-derivation-lifecycle` | `critical` | kernel-ipc-runtime, kernel-object, kernel-ps | capability-derivation-lifecycle/CapabilityDerivationLifecycle | 10 | 10 | rejected, revoked |
 | `commercial-envelope` | `critical` | caller, kernel-ipc, netd, service | commercial-service-envelope/CommercialServiceEnvelope | 6 | 6 | admitted, malformed-replied, peer-closed, reply-rejected, timed-out |
@@ -69,14 +69,14 @@
 | `post-init-bootstrap-barrier` | `critical` | initd | post-init-bootstrap-barrier/PostInitBootstrapBarrier | 5 | 5 | barrier-failed, consumer-started |
 | `post-init-service-authority` | `critical` | kernel-compat, loaderd, rootd | post-init-leases/PostInitLeases | 6 | 6 | denied, revoked |
 | `process-address-space-lifecycle` | `critical` | kernel-ps | exec-address-space-transaction/ExecAddressSpaceTransaction, process-address-space-lifetime/ProcessAddressSpaceLifetime | 15 | 15 | live, reclaimed, rejected |
-| `process-lifecycle-transaction` | `critical` | kernel-mm, kernel-ps | process-lifecycle-transaction/ProcessLifecycleTransaction | 10 | 10 | dead, rejected, rolled-back |
+| `process-lifecycle-transaction` | `critical` | kernel-mm, kernel-ps | process-lifecycle-transaction/ProcessLifecycleTransaction | 15 | 15 | dead, rejected, rolled-back |
 | `process-signal-lifecycle` | `critical` | kernel-compat, kernel-executive, kernel-ps, procd | process-signal-delivery/ProcessSignalDelivery, sigchld-notification/SigchldNotification | 15 | 15 | delivered, frame-installed, lifecycle-committed, process-terminated, rejected, reported, runtime-preserved |
 | `remote-file-map` | `critical` | kernel-compat, vfsd | remote-file-mapping/RemoteFileMapping | 9 | 9 | aborted, mapped |
 | `root-authority` | `critical` | kernel-compat, kernel-ipc-runtime, rootd | root-authority-publication/RootAuthorityPublication | 6 | 6 | denied, service-published |
 | `runtime-control-ingress` | `critical` | runtimed | runtime-control-authority/RuntimeControlAuthority | 5 | 5 | admitted, denied |
-| `scheduler-cpu-ownership` | `critical` | kernel-hal, kernel-ps, nucleus-core | scheduler-cpu-ownership/SchedulerCpuOwnership | 13 | 13 | invariant-panic |
-| `scheduler-dispatch` | `critical` | inputd, kernel-compat, kernel-ipc-runtime, kernel-ps, loaderd, rootd, runtimed, syscalld, uiserver, vfsd | ipc-fast-handoff/IpcFastHandoff, ipc-priority-inheritance/IpcPriorityInheritance, ipc-priority-queue/IpcPriorityQueue, ipc-reply-recv-transaction/IpcReplyRecvTransaction, scheduler-active-balance/SchedulerActiveBalance, scheduler-admission/SchedulerAdmission, scheduler-cpu-distribution/SchedulerCpuDistribution, scheduler-thread-demotion/SchedulerThreadDemotion, scheduling-context-budget/SchedulingContextBudget, synchronous-ipc-handoff/SynchronousIpcHandoff | 56 | 56 | context-revoked, peer-dispatched, reply-token-dropped, revoked, system-dispatched, user-dispatched |
-| `scheduler-lifecycle` | `critical` | kernel-compat, kernel-hal, kernel-ps | scheduler-wakeup/SchedulerWakeup | 18 | 18 | retired |
+| `scheduler-cpu-ownership` | `critical` | kernel-hal, kernel-ps, nucleus-core | scheduler-cpu-ownership/SchedulerCpuOwnership | 15 | 15 | invariant-panic |
+| `scheduler-dispatch` | `critical` | inputd, kernel-compat, kernel-ipc-runtime, kernel-ps, loaderd, rootd, runtimed, syscalld, uiserver, vfsd | authority-identity-lifecycle/AuthorityIdentityLifecycle, cpu-dispatch-preemption/CpuDispatchPreemption, cpu-online-lifecycle/CpuOnlineLifecycle, cross-cpu-task-retirement/CrossCpuTaskRetirement, frame-reader-claim/FrameReaderClaim, ipc-fast-handoff/IpcFastHandoff, ipc-priority-inheritance/IpcPriorityInheritance, ipc-priority-queue/IpcPriorityQueue, ipc-reply-recv-transaction/IpcReplyRecvTransaction, lifecycle-execution-claim/LifecycleExecutionClaim, mm-activation-close/MmActivationClose, pager-fault-slot-lifecycle/PagerFaultSlotLifecycle, process-lifecycle-transaction/ProcessLifecycleTransaction, scheduler-active-balance/SchedulerActiveBalance, scheduler-admission/SchedulerAdmission, scheduler-cpu-distribution/SchedulerCpuDistribution, scheduler-local-authority/SchedulerLocalAuthority, scheduler-thread-demotion/SchedulerThreadDemotion, scheduler-wakeup/SchedulerWakeup, scheduling-context-budget/SchedulingContextBudget, sigchld-notification/SigchldNotification, synchronous-ipc-handoff/SynchronousIpcHandoff | 163 | 163 | context-revoked, peer-dispatched, reply-token-dropped, revoked, system-dispatched, user-dispatched |
+| `scheduler-lifecycle` | `critical` | kernel-compat, kernel-hal, kernel-ps | scheduler-wakeup/SchedulerWakeup, task-retirement-cleanup-owner/TaskRetirementCleanupOwner | 21 | 21 | cleanup-acked |
 | `service-bootstrap` | `critical` | initd, kernel-compat, rootd | service-bootstrap-lifecycle/ServiceBootstrapLifecycle | 10 | 10 | denied, entry-rejected, ready |
 | `service-call-authority` | `critical` | kernel-compat, kernel-ipc-runtime | service-call-authority/ServiceCallAuthority | 6 | 6 | admitted, cleared, denied, stale |
 | `service-heap-lifecycle` | `critical` | rootd, svc-runtime, syscalld, xtask-kvm | service-heap-lifecycle/ServiceHeapLifecycle | 12 | 12 | failed |

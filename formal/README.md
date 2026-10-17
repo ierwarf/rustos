@@ -42,7 +42,14 @@ bind a live production `source` independently to one executable
 `witness_source`; test-module extraction cannot silently replace the production
 boundary being proved. The durability fault also requires the bounded
 storage-DVM negative KVM gate. `recovery-scenarios.tsv` uses the same explicit
-production/witness split and hashes both inputs into its evidence.
+production/witness split and hashes both inputs into its evidence. The
+recovery runner compiles each unique Cargo package/feature/target test binary
+once using Cargo's JSON artifact paths; the registry's `max_ms` applies to
+executing the witness binaries, **not** waiting on Cargo compilation or another
+parallel formal lane's build lock. Missing test artifacts, empty test filters,
+execution timeouts, and nonzero test exits remain terminal failures. The
+artifact-path binding follows Cargo's [JSON compiler-artifact format](https://doc.rust-lang.org/cargo/reference/external-tools.html#json-messages),
+which reports each built test executable; it is not a guess at `target/deps`.
 `abi-divergences.tsv`, `recovery-scenarios.tsv`,
 `spec-mutations.toml`, `implementation-mutations.tsv`,
 `sanitizer-targets.tsv`, and `concurrency-triangle.toml` close six
@@ -58,6 +65,14 @@ counterexample-trace protocol.
 Shuttle PCT, and x86_64 herd7 lanes. It requires a source/model/flow binding
 and rejects both TLA+ and litmus survivors, so a green checker cannot be
 credited for an empty property or a non-sensitive order assertion.
+The scheduler local-frame entry runs Kani on the production custody predicate
+in `rustos-scheduler-frame-gate`, and source-anchored Loom/Shuttle tests on a
+single reader racing a generation change and owner claim. The separately
+registered `scheduler-local-authority` TLA+ model checks two-candidate fair
+selection, fail-closed partial observations, excluded policy arms, and one
+owner-generation republish before the exact claim. These do not prove the full
+local picker, multiple writers,
+or catalog equivalence.
 `proof-index.toml` is a closed proof-retrieval graph for the selected Kani and
 Verus kernels. It binds an executable source symbol to a registered TLA+ model,
 the exact harness or lemma, its companion test, and any dependency edge. The
@@ -68,7 +83,7 @@ of the index and all indexed inputs, which the PR seal consumes. It is not an
 LLM, proof generator, or claim that the source has been fully verified; see
 `PROOF_INDEX_CONTRACT.md` for the precise boundaries.
 The PR TLC profile is deliberately a 120-second, risk-weighted pre-QEMU set:
-it retains the exact finite configurations of 32 critical ownership, CPU,
+it retains the exact finite configurations of 33 critical ownership, CPU,
 TLB, wake, ABI, and product-boot models rather than quietly reducing their
 state depth. The complete registered inventory is the nightly qualification
 lane. Any changed model is still run directly by `dev-plan` before either
@@ -147,6 +162,15 @@ The full formal gate also runs the Rust implementation proofs:
     bash formal/setup-herdtools.sh # once, with documented OCaml prerequisites
     bash formal/verify-all.sh --profile pr
 
+The isolated Loom workspace optimizes its dev/test profile at level 2 while
+explicitly retaining debug assertions and integer overflow checks. This follows
+[Loom's optimized-test guidance](https://docs.rs/loom/0.7.2/loom/), without the
+unchecked defaults of `--release`; [Cargo test inherits the dev profile](https://doc.rust-lang.org/cargo/reference/profiles.html#test).
+Exploration bounds, seeds, workers, test selection and evidence/cache policy are
+unchanged. Warm matched four-CPU runs of the activation-claim witness (three
+samples each) improved median wall time from 36.52s to 11.12s. First compilation
+and complete-gate timings have separate cache/lock costs, not this speed ratio.
+
 The Kani lane retains successful package logs in
 `build/formal/kani-cache-v1/`. A cache key covers the pinned Kani version,
 proof policy/scripts, workspace lock/configuration, and every non-ignored file
@@ -208,6 +232,7 @@ and counterexamples are retained under `build/formal/`.
 | deferred-process-activation/DeferredProcessActivation | loaderd deferred spawn and kernel process broker | a suspended target is bound to the exact kernel-stamped requester; loader restart preserves the binding; activation consumes it once; foreign use, replay, and requester-exit orphans fail closed |
 | atomic-process-activation-batch/AtomicProcessActivationBatch | initd cohort policy, loaderd sender binding, kernel process broker, and kernel-ps scheduler | one 1..=8 unique cohort is completely shape/capability/context preflighted before publication; every target PID/process-generation/MM-generation snapshot is revalidated under the final registry lock, so PID-equal replacement is rejected unchanged; success consumes every one-shot capability while the complete cohort remains suspended, then publishes every runnable sibling in one registry-to-scheduler critical section; FIFO first turns drain before the loader reply resumes; requester exit revokes the still-suspended cohort |
 | cpu-affinity-observation/CpuAffinityObservation | HAL CPU lifecycle, kernel-compat Linux/Windows syscall boundaries, syscalld affinity policy, and shared ABI | only a versioned kernel-stamped nonempty bounded Online bitmap whose popcount matches and, for Linux, an exact same-process effective task mask may become topology ABI; stale, forged, empty, oversized, foreign-owner, or reserved-bearing observations publish nothing |
+| task-retirement-cleanup-owner/TaskRetirementCleanupOwner | `kernel-ps` independent per-slot retirement cleanup owner | terminal producer publishes last; one immutable cleanup can be claimed and ACKed exactly once before reset/reuse; stale, altered, unclaimed or repeated ACKs cannot settle another task. Two-task TLC and bounded Kani/Loom/Shuttle exclude actual external cleanup, allocator namespace, process/TLB/stack quiescence and global guard removal |
 | task-affinity-lifecycle/TaskAffinityLifecycle | kernel-ps scheduler affinity owner, Linux/Windows compat adapters, syscalld policy, and winsys exports | Linux thread and Windows process/thread masks remain nonempty Online subsets; process mutation is atomic across live threads; excluded running CPUs must migrate before user dispatch; previous-mask, fork inheritance, exec preservation, pseudo-handle admission, and current-processor observation remain exact |
 | loader-request-authority/LoaderRequestAuthority | initd identity publication, loaderd ingress, process commit and exec-target brokers | privileged spawn is rootd/initd/sessiond-only and exec replacement is procd-only; both ingress and terminal ring0 commit require the current kernel-owned service identity, so guessed PIDs and service restart/revoke cannot retain authority |
 | boot-storage-handoff/BootStorageHandoff | hostd storage admission/supervision plus durable VFIO lease | whole-device and every partition must be idle before bounded host flush; host-driver and VFIO authority are exclusive; VFIO assignment requires a durable binding to the exact signed epoch identity; DVM launch requires a durable exact runtime record and live generation-bound aperture; readiness binds that exact generation and epoch identity; active recovery observes the exact QEMU process exit before aperture revoke; repeated revoke preserves the signed immutable read-only flag while clearing all live state; the host driver is restored only after revoke and failure retains quarantine |
@@ -260,6 +285,10 @@ and counterexamples are retained under `build/formal/`.
 | network-payload-session/NetworkPayloadSession | DVM Ethernet transport plus netd | only bounded ARP/IPv4 payloads from an active authenticated epoch are delivered; malformed frames are dropped while advancing the sole consumer cursor |
 | scheduler-active-balance/SchedulerActiveBalance | `kernel-ps` active balance | a per-source counter makes the first and each eighth loaded opportunity due without RTC residue; only a runnable queued Local(source) continuation without current/transition custody and with target affinity may move once through the exact target mailbox/request, drain, and dispatch chain; continuously eligible queued work eventually reaches the target under explicit action fairness |
 | scheduler-cpu-distribution/SchedulerCpuDistribution | `kernel-ps` scheduler | each CPU owns its System/User burst, virtual timeline, and bounded handoff FIFO; two local System turns reserve that CPU's next ordinary User turn, ordinary User selection admits only a least-runtime fair peer, idle stealing transfers through single-owner mailbox custody, process-owned server boost targets the worker's actual CPU, repeated rehome generations coalesce by slot, and only System recovery has an absolute ready-age rail because User wall-clock guarantees require explicit bandwidth admission |
+| scheduler-local-authority/SchedulerLocalAuthority | `kernel-ps` published CPU-local dispatch authority | Bounded fair/overdue/reservation ordering and exact frame/generation claims, first-turn/FIFO identity, complete-negative early-policy gate and retained-current custody. Unknown evidence grants no catalog authority; stale claims defer safely. Canonical production rules are in design §2.6b–2.7. This is not full-picker/production equivalence, arbitrary writer/teardown proof, persistent-odd-epoch liveness, performance evidence or guard-removal authority |
+| frame-reader-claim/FrameReaderClaim | `kernel-ps` resource-leaf saved-header reader and Running CAS owner | Nonexecuting byte readers register under the same leaf that checks reader/writer exclusion and executes exact Local/Direct owner CAS; refusal preserves queue/handoff custody. Six real-resource/CAS native witnesses and three spec mutants cover this boundary, not executing IRQ reads, MM backing, CPU banks/hardware, cold arbitration or global-guard deletion |
+| cpu-dispatch-preemption/CpuDispatchPreemption | `nucleus-core` independent non-lock CPU unit and `kernel-ps` return owner | CPU/IRQ custody precedes directory wait; raw and standalone units are separate, completion follows unlock, changed returns retain one parked unit through incoming RSP and never restore outgoing IF. Five core/four scope native witnesses and three spec mutants isolate this boundary, not physical IF/APIC, MM close, complete hardware/bank refinement or guard deletion |
+| mm-activation-close/MmActivationClose | `kernel-mm` atomic activation/close gate and `kernel-ps` exact resource/CPU return grant | Local/Direct claim or architecture-only capture retains MM admission through publication/RSP ACK; provisional CAS failure releases, owner/UID republish refuses, poison quarantines. Five MM/six real process/resource/turn witnesses and four spec mutants isolate this boundary; no weak-memory, physical retirement, full lifecycle/quiescence, hardware/TLB or guard-removal claim |
 | scheduler-thread-demotion/SchedulerThreadDemotion | `kernel-ps` scheduler, uiserver helper threads, loaderd, and vfsd | self-demotion cannot discard a live reply-scoped donation; completion-bound bootstrap servers cannot demote before their exact terminal UI reply; untrusted or blocking UI helpers lose inherited System class before entering their loops, while input/present authority remains explicit |
 | ipc-fast-handoff/IpcFastHandoff | fixed kernel IPC frame, per-CPU direct/remote scheduler custody, and syscalld compact identity wrapper | one exact blocked receiver owns a bounded allocation-free request; successful same-CPU and cross-CPU transfers each publish one custody, while any failed admission rolls back completely before the ordinary bounded IPC path restarts. Exact caller process/task identity and scheduling-context custody survive request, reply, cancellation, timeout, and endpoint failure. |
 | synchronous-ipc-handoff/SynchronousIpcHandoff | kernel IPC call/reply transfer and `kernel-ps` per-CPU scheduler handoff FIFO | a terminal reply atomically releases its donation, wakes the exact caller, and captures one `{slot, task_id, owner_generation, target_cpu}` token under Scheduler; after Scheduler drops, only that captured CPU may retain it while task ID, generation, CPU, runnability, and Local/RemoteQueued custody still match. Selection additionally requires exact Local custody; a live RemoteQueued head is consumed as non-authoritative unless its mailbox was drained first. Deduplication, in-place generation refresh, and the bounded burst/fairness turn are local to each CPU FIFO, so an old-CPU stale record may coexist with new-CPU custody but cannot dispatch there or suppress the fresh enqueue. |
@@ -620,3 +649,9 @@ APIC/PIC use; generic high-window maps reject below-limit physical addresses.
 Raw direct-map cache inspection/update is whitelisted to kernel-mm, its paging
 facade, and io-manager's ownership transaction. Display pixels remain on the
 io-manager WC mapper and are not admitted as atomic shared RAM.
+
+| lifecycle-execution-claim/LifecycleExecutionClaim | `kernel-ps` identity writer, claim/resource join and execution banks | Desired lifecycle intent linearizes with exact Running CAS; captured UID survives stop and hidden metadata through Prepared/Current/Outgoing. Twelve lifecycle and three admitted-ACK native witnesses; excludes weak memory, full hardware/funding/affinity and directory deletion |
+
+| cold-exec-intent/ColdExecIntent | `kernel-ps` cold exec intent, process receipts and owned image coordinator | Exact nonce/UID custody through Sealed/Cancelling/Image/Published; only typed cancellation/finalization opens, terminal and poison stay closed. Self remains schedulable until bounded image scope. No hardware/full cold-directory equivalence claim |
+
+| affinity-claim-admission/AffinityClaimAdmission | exact affinity UID/mask replacement versus Local/Direct Running CAS | Affinity54 leaf and empty reset; admitted prior holders survive desired mask changes. No group-wide/hardware/guard-deletion claim |

@@ -9,7 +9,7 @@
 use std::sync::mpsc::{self, Receiver};
 
 use crate::canvas::{Rect, SurfaceCanvas};
-use crate::sys::{spawn_ui_thread, UiThreadRole};
+use crate::sys::{require_background_thread_class, spawn_ui_thread, UiThreadRole};
 
 use super::colors::{
     COLOR_AURORA_CYAN, COLOR_AURORA_MINT, COLOR_AURORA_VIOLET, COLOR_BG_DEEP, COLOR_BG_MID,
@@ -24,21 +24,68 @@ pub(crate) struct DesktopBackground {
     pub(crate) pixels: Vec<u32>,
 }
 
+impl DesktopBackground {
+    pub(crate) fn fits(&self, width: usize, height: usize) -> bool {
+        width != 0
+            && height != 0
+            && self.width == width
+            && self.height == height
+            && width.checked_mul(height) == Some(self.pixels.len())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_fast_desktop_background, DesktopBackground};
+
+    #[test]
+    fn bootstrap_scene_is_complete_without_waiting_for_optional_worker() {
+        let bootstrap = DesktopBackground {
+            width: 16,
+            height: 10,
+            pixels: build_fast_desktop_background(16, 10),
+        };
+        assert!(bootstrap.fits(16, 10));
+        assert!(bootstrap.pixels.iter().any(|pixel| *pixel != 0));
+        assert!(!bootstrap.fits(16, 11));
+        let truncated = DesktopBackground {
+            pixels: bootstrap.pixels[..159].to_vec(),
+            ..bootstrap
+        };
+        assert!(!truncated.fits(16, 10));
+    }
+}
+
+/// The first GPU frame requires a complete gradient before its strict
+/// activation deadline. This one-shot worker retains boot class only until
+/// it publishes that scene; the optional full Aurora pass self-demotes before
+/// doing any work. Neither stage grants a CPU compositor fallback.
 pub(crate) fn start_desktop_background_loader(
     width: usize,
     height: usize,
 ) -> Receiver<DesktopBackground> {
     let (sender, receiver) = mpsc::sync_channel(1);
     spawn_ui_thread(
-        UiThreadRole::Background,
+        UiThreadRole::BootstrapDesktop,
         "uiserver-desktop-background",
         move || {
+            crate::sys::debug_line("uiserver: first desktop seed worker started");
             let fast_pixels = build_fast_desktop_background(width, height);
-            let _ = sender.send(DesktopBackground {
-                width,
-                height,
-                pixels: fast_pixels,
-            });
+            crate::sys::debug_line("uiserver: first desktop seed built");
+            if sender
+                .send(DesktopBackground {
+                    width,
+                    height,
+                    pixels: fast_pixels,
+                })
+                .is_err()
+            {
+                return;
+            }
+            crate::sys::debug_line("uiserver: first desktop seed queued");
+            // Once the first-frame seed has been handed off, the expensive
+            // background is unrelated long-lived work, not boot authority.
+            require_background_thread_class();
             let pixels = build_desktop_background(width, height);
             let _ = sender.send(DesktopBackground {
                 width,
@@ -53,6 +100,7 @@ pub(crate) fn start_desktop_background_loader(
 
 fn build_fast_desktop_background(width: usize, height: usize) -> Vec<u32> {
     let mut pixels = vec![0; width.saturating_mul(height)];
+    crate::sys::debug_line("uiserver: first desktop seed allocated");
     if pixels.is_empty() {
         return pixels;
     }

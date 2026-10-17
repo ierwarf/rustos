@@ -1,4 +1,5 @@
 # model	class	deadlock_policy	deadlock_reason	pr_timeout_s	nightly_timeout_s	nightly_mode	apalache	tlaps	trace
+task-retirement-cleanup-owner/TaskRetirementCleanupOwner	safety	check	vacant and complete cells stutter while exact claim ACK and two-task reset remain explicit	30	120	exhaustive	no	no	no
 authority-identity-lifecycle/AuthorityIdentityLifecycle	safety	intentional-terminal	bounded identity namespace may exhaust	30	120	exhaustive	no	no	no
 capability-derivation-lifecycle/CapabilityDerivationLifecycle	safety	check	explicit rejection and terminal revoke states stutter while typed rights attenuation and independent epochs remain explicit	30	120	exhaustive	no	no	no
 atomic-process-activation-batch/AtomicProcessActivationBatch	safety	check	committed rejected and requester-exit terminals stutter while full target identities and all-or-nothing activation remain explicit	30	120	exhaustive	no	no	no
@@ -115,6 +116,7 @@ scheduler-active-balance/SchedulerActiveBalance	temporal	check	loaded opportunit
 scheduler-admission/SchedulerAdmission	temporal	intentional-terminal	admission decision is terminal	120	900	exhaustive	no	no	no
 scheduling-context-budget/SchedulingContextBudget	safety	intentional-terminal	bounded clock and reply namespace may terminate	120	900	exhaustive	no	no	no
 scheduler-cpu-distribution/SchedulerCpuDistribution	temporal	intentional-terminal	bounded schedule may stop	120	900	exhaustive+simulate	no	no	no
+scheduler-local-authority/SchedulerLocalAuthority	safety	check	bounded fair and DirectHandoff record generation claims commit or reject stale generation without dispatching stale candidate; pre-claim exclusions use catalog (DirectHandoff final record generation is wired in production; catalog admission remains)	30	120	exhaustive	no	no	no
 scheduler-thread-demotion/SchedulerThreadDemotion	safety	intentional-terminal	thread restoration may terminate	120	900	exhaustive	no	no	no
 scheduler-wakeup/SchedulerWakeup	temporal	intentional-terminal	retired task outcome is terminal	120	900	exhaustive	no	no	no
 smp-release-admission/SmpReleaseAdmission	safety	check	terminal admission states stutter so deadlock checking remains enabled	30	120	exhaustive	no	no	no
@@ -136,3 +138,9 @@ process-lifecycle-transaction/ProcessLifecycleTransaction	safety	check	dead and 
 gpu-submit-transaction/GpuSubmitTransaction	safety	check	accepted submit stutters while rejected submits retain an explicit retry transition	30	120	exhaustive	no	no	no
 user-stack-growth/UserStackGrowth	temporal	check	committed and retired terminals stutter while the cross-lock transaction settles	30	120	exhaustive	no	no	no
 cow-frame-lifecycle/CowFrameLifecycle	safety	check	terminal address spaces stutter while fork rollback COW copy promotion and unmap retain explicit acknowledgement steps	30	120	exhaustive	no	no	no
+frame-reader-claim/FrameReaderClaim	safety	check	finite Running or closed resources explicitly stutter; no eventual drain or CPU progress claim	30	120	exhaustive	no	no	no
+cpu-dispatch-preemption/CpuDispatchPreemption	safety	check	Idle and poisoned dispatch states explicitly stutter; no progress or MM/hardware equivalence claim	30	120	exhaustive	no	no	no
+mm-activation-close/MmActivationClose	safety	check	All finite phases explicitly stutter; excludes physical MM/hardware and complete lifecycle arbitration	30	120	exhaustive	no	no	no
+lifecycle-execution-claim/LifecycleExecutionClaim	safety	check	Finite lifecycle and CPU bank phases explicitly stutter; no hardware or full cold arbitration refinement	30	120	exhaustive	no	no	no
+cold-exec-intent/ColdExecIntent	safety	check	Finite cold ownership phases explicitly stutter; no weak-memory or hardware refinement	30	120	exhaustive	no	no	no
+affinity-claim-admission/AffinityClaimAdmission	safety	check	Finite masks and slot identities explicitly stutter; no hardware/return refinement	30	120	exhaustive	no	no	no

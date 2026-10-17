@@ -12,6 +12,8 @@
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use kernel_object::api::identity::{ObjectIdentity, ObjectKind, ObjectOwner};
 
+pub(super) mod dispatch;
+
 struct RuntimeCounterBank {
     charged_ns: AtomicU64,
     overrun_ns: AtomicU64,
@@ -450,9 +452,9 @@ pub(super) const MAX_SCHEDULING_DOMAINS: usize = 64;
 /// Leave at least ten percent of every admitted CPU for ordinary work,
 /// interrupt service, and bounded accounting overhead. Deadline admission is
 /// conservative: each domain ratio is rounded upward before summation.
-const DEADLINE_UTILIZATION_LIMIT_PPM: u64 = 900_000;
+pub(super) const DEADLINE_UTILIZATION_LIMIT_PPM: u64 = 900_000;
 
-fn deadline_utilization_ppm(policy: SchedulingContextPolicy) -> Option<u64> {
+pub(super) fn deadline_utilization_ppm(policy: SchedulingContextPolicy) -> Option<u64> {
     let scaled = u128::from(policy.budget_ns).checked_mul(1_000_000)?;
     let rounded = scaled.checked_add(u128::from(policy.period_ns).checked_sub(1)?)?;
     u64::try_from(rounded / u128::from(policy.period_ns)).ok()
@@ -515,7 +517,7 @@ impl SchedulingDomainState {
 /// A discriminant rather than a message: the refusal is latched inside the
 /// scheduler guard and rendered outside it, and a `&'static str` would have to
 /// survive that boundary in a static slot for no gain over one number.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum DomainRefusalCause {
     NoDomain = 0,
     Policy = 1,
@@ -557,176 +559,6 @@ pub(in crate::multitask) fn take_domain_budget_refusal_window() -> Option<(u64, 
     })
 }
 
-impl super::Scheduler {
-    /// Commits the selected slot's domain and context budgets for this turn,
-    /// reporting whether the funding actually admitted the dispatch.
-    ///
-    /// Selection admits a candidate with a read-only eligibility check that
-    /// accepts a refill which is merely *due*; this is where that refill is
-    /// applied and the budget is really spent. The two therefore disagree
-    /// whenever the funding state moves between them -- a charge on the same
-    /// domain pops the due refill and re-arms it a period later, so the exact
-    /// state the scan admitted is gone by the time the commit looks.
-    ///
-    /// That is a policy outcome, not an invariant break: it is the same answer
-    /// the admission scan itself would have produced one instant later, and the
-    /// caller must treat a refusal exactly as it treats a candidate the scan
-    /// rejected. Failing the dispatch here instead made a lost race fatal, and
-    /// it only ever reproduced at 8 vCPU, where charges on a shared domain are
-    /// frequent enough to land inside that window.
-    #[must_use = "a refused budget must not be dispatched"]
-    pub(super) fn commit_scheduling_budget_for_dispatch(&mut self, slot: usize) -> bool {
-        let owner_slot = self.effective_scheduling_context_owner_slot(slot);
-        let Some(context) = self.contexts[owner_slot].map(|owner| owner.scheduling_context) else {
-            return true;
-        };
-        if !context.is_budgeted() {
-            return true;
-        }
-        let now_ns = crate::arch::clock::monotonic_nanos();
-        let policy = context
-            .policy()
-            .expect("budgeted scheduling context lost its policy");
-        let domain_slot = context
-            .domain_slot()
-            .expect("budgeted scheduling context lost its domain slot");
-        let domain_generation = context
-            .domain_generation()
-            .expect("budgeted scheduling context lost its domain generation");
-        if !self.prepare_scheduling_domain_dispatch(domain_slot, domain_generation, policy, now_ns)
-        {
-            self.note_domain_budget_refusal(slot, domain_slot, domain_generation, policy, now_ns);
-            return false;
-        }
-        self.contexts[owner_slot]
-            .as_mut()
-            .expect("selected scheduling context disappeared")
-            .scheduling_context
-            .prepare_dispatch(now_ns)
-    }
-
-    /// Latches one budget refusal for rendering after the scheduler guard.
-    ///
-    /// The refusal is rare and self-correcting, but a *rise* in it means the
-    /// admission scan and the commit are disagreeing more often, so it must
-    /// stay visible rather than become a silent reselect. Debugcon inside the
-    /// guard is a VM exit per byte, so this only records; the profile drain
-    /// renders it.
-    #[cold]
-    #[inline(never)]
-    fn note_domain_budget_refusal(
-        &self,
-        slot: usize,
-        domain_slot: usize,
-        domain_generation: u32,
-        policy: SchedulingContextPolicy,
-        now_ns: u64,
-    ) {
-        let cause = self
-            .scheduling_domains
-            .get(domain_slot)
-            .and_then(|domain| *domain)
-            .map_or(DomainRefusalCause::NoDomain, |domain| {
-                if domain.policy() != policy || domain.generation() != domain_generation {
-                    domain.dispatch_refusal(policy, now_ns)
-                } else {
-                    super::scheduling_runtime::domain_dispatch_refusal(
-                        domain_slot,
-                        domain_generation,
-                        policy,
-                        now_ns,
-                    )
-                }
-            });
-        latch_domain_budget_refusal(slot, domain_slot, cause);
-    }
-
-    pub(super) fn admit_scheduling_domain(
-        &mut self,
-        policy: SchedulingContextPolicy,
-    ) -> Option<usize> {
-        if !self.deadline_domain_admitted(policy) {
-            return None;
-        }
-        if let Some(index) = self
-            .scheduling_domains
-            .iter()
-            .position(|state| state.is_some_and(|state| state.domain() == policy.domain))
-        {
-            let current = self.scheduling_domains[index]
-                .expect("located scheduling domain disappeared under scheduler owner");
-            if current.policy() == policy {
-                return super::scheduling_runtime::domain_matches(
-                    index,
-                    current.generation(),
-                    policy,
-                )
-                .then_some(index);
-            }
-            let has_live_member = self.contexts.iter().flatten().any(|context| {
-                context
-                    .scheduling_context
-                    .policy()
-                    .is_some_and(|member| member.domain == policy.domain)
-            });
-            if has_live_member {
-                return None;
-            }
-            // The runtime replacement is prepared and committed before the
-            // catalog points at it. There are no live members at this point,
-            // so the old policy cannot be charged during the swap.
-            let generation = super::scheduling_runtime::replace_domain(
-                index,
-                current.policy(),
-                current.generation(),
-                policy,
-            )?;
-            self.scheduling_domains[index] = SchedulingDomainState::admitted(policy, generation);
-            return Some(index);
-        }
-        let slot = self.scheduling_domains.iter().position(Option::is_none)?;
-        // Do not publish catalog metadata until its fixed runtime cell was
-        // fully initialized. This makes domain admission all-or-nothing.
-        let generation = super::scheduling_runtime::initialize_domain(slot, policy)?;
-        self.scheduling_domains[slot] = SchedulingDomainState::admitted(policy, generation);
-        Some(slot)
-    }
-
-    fn deadline_domain_admitted(&self, policy: SchedulingContextPolicy) -> bool {
-        if policy.criticality != 2 {
-            return true;
-        }
-        let Some(candidate_ppm) = deadline_utilization_ppm(policy) else {
-            return false;
-        };
-        for cpu in 0..u64::BITS {
-            let bit = 1_u64 << cpu;
-            if policy.cpu_mask & bit == 0 {
-                continue;
-            }
-            let Some(total_ppm) = self
-                .scheduling_domains
-                .iter()
-                .flatten()
-                .filter(|domain| {
-                    let admitted = domain.policy();
-                    admitted.domain != policy.domain
-                        && admitted.criticality == 2
-                        && admitted.cpu_mask & bit != 0
-                })
-                .try_fold(candidate_ppm, |total, domain| {
-                    total.checked_add(deadline_utilization_ppm(domain.policy())?)
-                })
-            else {
-                return false;
-            };
-            if total_ppm > DEADLINE_UTILIZATION_LIMIT_PPM {
-                return false;
-            }
-        }
-        true
-    }
-}
 
 #[derive(Clone, Copy)]
 pub(super) struct SchedulingContext {
@@ -843,6 +675,7 @@ impl SchedulingContext {
         )
     }
 
+    #[cfg(test)]
     pub(super) fn record_timeout_fault(self, reply: u64) -> bool {
         let Some(policy) = self.policy else {
             return false;
@@ -910,8 +743,8 @@ mod exhaustion_latch_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        BudgetCounterScope, BudgetRuntimeCounters, BudgetState, Refill, SchedulingContext,
-        SchedulingContextPolicy, drain_runtime_counters,
+        BudgetCounterScope, BudgetRuntimeCounters, BudgetState, DomainRefusalCause, Refill,
+        SchedulingContext, SchedulingContextPolicy, drain_runtime_counters,
     };
 
     /// The unlocked custody and call-admission readers reconstruct a bound
@@ -957,6 +790,8 @@ mod tests {
         }
     }
 
+    include!("scheduling_context/published_budget_tests.rs");
+
     #[test]
     fn boot_task_zero_label_receives_nonzero_object_generation() {
         let context = SchedulingContext::bind(0, 0);
@@ -980,6 +815,7 @@ mod tests {
 
     #[test]
     fn consumption_and_refill_conserve_exact_budget() {
+        let _runtime = super::super::scheduling_runtime::test_serial_guard();
         let mut state =
             BudgetState::admitted(policy(4), BudgetCounterScope::Context).expect("valid policy");
         let outcome = state.charge(100, 1_500).expect("bounded charge");
@@ -995,7 +831,47 @@ mod tests {
     }
 
     #[test]
+    fn abandoned_dispatch_preparation_only_matures_due_refills() {
+        let _runtime = super::super::scheduling_runtime::test_serial_guard();
+        for scope in [BudgetCounterScope::Context, BudgetCounterScope::Domain] {
+            let mut state = BudgetState::admitted(policy(4), scope).expect("valid policy");
+            assert!(state.charge(100, 4_000).is_some());
+            assert_eq!(state.available_ns, 0);
+            assert_eq!(state.next_eligible_ns(), Some(10_100));
+
+            // A selected owner may be republished before the final claim.
+            // The scheduler then abandons this choice for current/idle; the
+            // budget preparation must not charge unexecuted runtime or make
+            // repeated preparation grow the available budget.
+            assert!(state.replenish(10_100));
+            assert_eq!(state.available_ns, 4_000);
+            assert_eq!(state.conserved_ns(), Some(4_000));
+            assert!(state.replenish(10_100));
+            assert_eq!(state.available_ns, 4_000);
+            assert_eq!(state.conserved_ns(), Some(4_000));
+        }
+    }
+
+    #[test]
+    fn immutable_budget_refill_cannot_reverse_an_earlier_and_later_admission() {
+        let _runtime = super::super::scheduling_runtime::test_serial_guard();
+        let mut state =
+            BudgetState::admitted(policy(4), BudgetCounterScope::Context).expect("valid policy");
+        assert!(state.charge(100, 4_000).is_some());
+        assert_eq!(state.available_ns, 0);
+        assert_eq!(state.next_eligible_ns(), Some(10_100));
+        // A due refill can make a *later* catalog scan eligible after an
+        // earlier local scan refused it, not the opposite. An observed later
+        // ContextBudget denial with earlier local admission therefore needs
+        // changed state, different context ownership, or a stale trace.
+        assert!(!state.is_eligible(10_099));
+        assert!(state.is_eligible(10_100));
+        assert!(!state.is_eligible(10_099));
+    }
+
+    #[test]
     fn refill_overflow_moves_authority_later_without_creating_time() {
+        let _runtime = super::super::scheduling_runtime::test_serial_guard();
         let mut state =
             BudgetState::admitted(policy(2), BudgetCounterScope::Context).expect("valid policy");
         assert!(state.charge(100, 1_000).is_some());
@@ -1026,6 +902,7 @@ mod tests {
 
     #[test]
     fn exhaustion_reports_tick_overrun_without_refunding_it() {
+        let _runtime = super::super::scheduling_runtime::test_serial_guard();
         let mut state =
             BudgetState::admitted(policy(2), BudgetCounterScope::Context).expect("valid policy");
         let outcome = state.charge(55, 5_000).expect("bounded charge");
@@ -1038,6 +915,7 @@ mod tests {
 
     #[test]
     fn timeout_fault_is_one_shot_observable_and_never_retried() {
+        let _runtime = super::super::scheduling_runtime::test_serial_guard();
         let mut state =
             BudgetState::admitted(policy(2), BudgetCounterScope::Context).expect("valid policy");
         assert!(state.charge(55, 5_000).is_some());
@@ -1185,7 +1063,10 @@ mod tests {
         let mut context = SchedulingContext::bind(2, 9);
         assert!(context.policy().is_none());
         assert!(!context.is_budgeted());
-        assert!(context.admit(policy(3), 1, 1));
+        assert!(!context.admit(policy(3), 1, 1)); // absent domain is not membership
+        let generation = super::super::scheduling_runtime::initialize_domain(1, policy(3))
+            .expect("real domain admission");
+        assert!(context.admit(policy(3), 1, generation));
         assert!(context.is_budgeted());
         assert_eq!(context.domain_slot(), Some(1));
         assert!(context.allows_cpu(0));

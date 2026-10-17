@@ -153,10 +153,16 @@ if ! grep -Fq 'USER_STACK_INITIAL_COMMIT_PAGES: usize = USER_STACK_RESERVE_PAGES
 fi
 
 exec_scheduler_body="$(
-    sed -n '/pub(super) fn exec_current_user_process(/,/pub(super) fn linux_thread_snapshot_by_ids(/p' \
-        kernel/ps/src/multitask/scheduler.rs
+    sed -n '/^pub(in crate::multitask::scheduler) fn commit(/,/^fn install_current_architecture(/p' \
+        kernel/ps/src/multitask/scheduler/exec_transaction/publication.rs
 )"
-if ! grep -Fq 'exec_slot_admission_valid' <<<"$exec_scheduler_body"; then
+exec_retire_line="$(grep -n -m1 'if lifecycle.retired' <<<"$exec_scheduler_body" | cut -d: -f1)"
+exec_root_line="$(grep -n -m1 'runqueue::address_space::replace(slot, lease.root)' <<<"$exec_scheduler_body" | cut -d: -f1)"
+if [[ -z "$exec_retire_line" || -z "$exec_root_line" || "$exec_retire_line" -ge "$exec_root_line" ]] \
+    || ! grep -Fq 'retirement_cleanup::deferred(slot).is_some()' <<<"$exec_scheduler_body" \
+    || ! grep -Fq 'retirement_cleanup::pending(slot)' <<<"$exec_scheduler_body" \
+    || ! grep -Fq 'retirement_cleanup::kernel_pending(slot)' <<<"$exec_scheduler_body" \
+    || ! grep -Fq 'retirement_cleanup::reason(slot).is_some()' <<<"$exec_scheduler_body"; then
     echo 'exec must reject retirement before installing a new address-space root' >&2
     exit 1
 fi
@@ -165,7 +171,7 @@ if grep -Eq 'retired\[[^]]+\][[:space:]]*=[[:space:]]*false|retirement_cleanup\[
     exit 1
 fi
 exec_stage_body="$(
-    sed -n '/^pub fn stage_exec_state(/,/^pub fn finalize_exec_state(/p' \
+    sed -n '/^pub fn stage_exec_state(/,/^pub(super) fn finalize_exec_state(/p' \
         kernel/ps/src/multitask/process_table.rs
 )"
 if ! grep -Fq 'exec_commit_may_transfer(object, reservation)' <<<"$exec_stage_body" \
@@ -175,16 +181,17 @@ if ! grep -Fq 'exec_commit_may_transfer(object, reservation)' <<<"$exec_stage_bo
 fi
 exec_transfer_body="$(
     sed -n '/^pub fn exec_current_user_process(/,/^pub fn exec_user_process_by_pid(/p' \
-        kernel/ps/src/multitask/current.rs
+        kernel/ps/src/multitask/current/exec.rs
 )"
+exec_image_line="$(grep -n -m1 'exec_transaction::with_census_image(' <<<"$exec_transfer_body" | cut -d: -f1)"
 exec_state_line="$(grep -n -m1 'process_table::stage_exec_state(' <<<"$exec_transfer_body" | cut -d: -f1)"
-exec_publish_line="$(grep -n -m1 'scheduler_mut().exec_current_user_process' <<<"$exec_transfer_body" | cut -d: -f1)"
-exec_retain_line="$(grep -n -m1 'process_table::finalize_exec_state(staged, published)' <<<"$exec_transfer_body" | cut -d: -f1)"
-exec_drop_line="$(grep -n -m1 'drop(old_state);' <<<"$exec_transfer_body" | cut -d: -f1)"
-if [[ -z "$exec_state_line" || -z "$exec_publish_line" || -z "$exec_retain_line" || -z "$exec_drop_line" \
-    || "$exec_state_line" -ge "$exec_publish_line" || "$exec_publish_line" -ge "$exec_retain_line" \
+exec_publish_line="$(grep -n -m1 'lease.commit_image(&mut bootstrap, None)' <<<"$exec_transfer_body" | cut -d: -f1)"
+exec_retain_line="$(grep -n -m1 'process_table::finalize_exec_state(' <<<"$exec_transfer_body" | cut -d: -f1)"
+exec_drop_line="$(grep -n -m1 'old_state.retire_execution_state();' <<<"$exec_transfer_body" | cut -d: -f1)"
+if [[ -z "$exec_image_line" || -z "$exec_state_line" || -z "$exec_publish_line" || -z "$exec_retain_line" || -z "$exec_drop_line" \
+    || "$exec_image_line" -ge "$exec_state_line" || "$exec_state_line" -ge "$exec_publish_line" || "$exec_publish_line" -ge "$exec_retain_line" \
     || "$exec_retain_line" -ge "$exec_drop_line" ]]; then
-    echo 'exec must stage process state, publish scheduler root, finalize generation, then retire the old bundle' >&2
+    echo 'exec must acquire image custody before staging, publish root with receipt, finalize generation, then retire the old bundle' >&2
     exit 1
 fi
 
@@ -200,7 +207,7 @@ fault_entry_line="$(grep -n -m1 'publish_user_table_entry' <<<"$fault_table_body
 fault_publish_line="$(grep -n -m1 'publish_lazy_table_record' <<<"$fault_table_body" | cut -d: -f1)"
 fault_loser_body="$(sed -n '/Ok((child, false)) => {/,/^                    }/p' <<<"$fault_table_body")"
 fault_error_body="$(sed -n '/Err(error) => {/,/^                    }/p' <<<"$fault_table_body")"
-retirement_body="$(sed -n '/^impl Drop for ProcessAddressSpace {/,/^}/p' \
+retirement_body="$(sed -n '/^pub(super) fn reclaim_root(/,/^}/p' \
     kernel/mm/src/memory/address_space/retirement.rs)"
 retire_barrier_line="$(grep -n -m1 'begin_address_space_retirement' <<<"$retirement_body" | cut -d: -f1)"
 retire_drain_line="$(grep -n -m1 'drain_lazy_table_records' <<<"$retirement_body" | cut -d: -f1)"
@@ -248,24 +255,11 @@ if ! grep -Fq 'super::reschedule_observation::publish_request(' <<<"$reschedule_
     exit 1
 fi
 
-# Busy-CPU balancing is driven by loaded opportunities, never by a global RTC
-# residue that one CPU's scheduling cadence may fail to visit. Candidate
-# selection must also retain the source-migration predicate: it excludes
-# current/transition stack owners before the existing owner-CAS/mailbox move.
-active_balance_body="$(
-    sed -n '/pub(super) fn rebalance_one_from_busy_cpu(/,/pub(super) fn request_runqueue_owner_reschedule/p' \
-        kernel/ps/src/multitask/scheduler/runqueue_policy.rs
-)"
-if ! grep -Fq 'ACTIVE_BALANCE_OPPORTUNITIES[source_cpu].fetch_add(1, Ordering::Relaxed)' \
-        <<<"$active_balance_body" \
-    || ! grep -Fq 'active_balance_opportunity_due(previous_opportunities)' \
-        <<<"$active_balance_body" \
-    || ! grep -Fq 'context_is_migratable_from_source(slot, context, source_cpu, target_cpu)' \
-        <<<"$active_balance_body" \
-    || grep -Fq 'context_is_schedulable(slot, context)' <<<"$active_balance_body"; then
-    echo 'active balance must use loaded-opportunity cadence and exclude every execution owner' >&2
-    exit 1
-fi
+# Busy/idle migration now retains an ORIGINAL physical reader through exact
+# Local CAS and mailbox. Loaded-opportunity cadence and Current/Transition
+# exclusion remain obligations of the actual independent implementation.
+python3 formal/check-dispatch-source-contracts.py
+python3 formal/test-dispatch-namespace-contract.py
 
 input_drain_body="$(
     sed -n '/^pub(crate) fn service_pending(/,/^pub(crate) fn has_pending_records()/p' \
@@ -459,17 +453,25 @@ fi
 # Asking for the identity of the task already running on the asking CPU is a
 # per-CPU question. Answering it through the exclusive global scheduler lock
 # cost 7,197 acquisitions/s at 8 vCPU from this one site while two sibling
-# functions in the same file already read the published seqlock record. The
-# locked call must remain as the fallback: a `None` publication means "retry
-# under authority", never "there is no user task".
+# functions in the same file already read the published seqlock record. An
+# unavailable publication now requires an independently joined Current/context
+# owner fallback; it cannot recover authority from a legacy directory.
 current_snapshot_body="$(
     sed -n '/^pub fn current_user_snapshot(/,/^}/p' kernel/ps/src/multitask/current.rs
 )"
 if ! grep -Fq 'published_current_identity()' <<<"$current_snapshot_body" \
-    || ! grep -Fq 'scheduler_ref().current_user_process_binding()' <<<"$current_snapshot_body"; then
-    echo 'the current-task identity snapshot must read the published record before the global scheduler lock, and must keep the locked fallback' >&2
+    || ! grep -Fq 'owned_current_user_binding()' <<<"$current_snapshot_body"; then
+    echo 'current-task snapshot must retain published identity and exact owned Current fallback' >&2
     exit 1
 fi
+python3 - <<'PY'
+from pathlib import Path
+source = Path('kernel/ps/src/multitask/current.rs').read_text()
+body = source.split('pub fn current_user_snapshot()', 1)[1].split('\n}', 1)[0]
+assert body.index('published_current_identity()') < body.index('owned_current_user_binding()')
+owned = Path('kernel/ps/src/multitask/current/owner_bindings.rs').read_text()
+assert 'super::super::scheduler::stack_resources::context::current_user_binding()' in owned
+PY
 # Call authorization already reads and validates the exact service publication
 # epoch. The reply-deadline path must reuse the service identity captured by
 # that transaction. Looking the endpoint up again both adds a second registry
@@ -503,20 +505,14 @@ fi
 # receiver custody there avoids a remote wake plus its reverse reply IPI. The
 # previous CPU remains the exact fallback for affinity, budget, idle-owner, or
 # lifecycle rejection; the ordinary cross-CPU publication must stay present.
-ipc_fast_handoff_body="$(
-    sed -n '/^    pub(super) fn commit_fast_ipc_call_handoff(/,/^    }/p' \
-        kernel/ps/src/multitask/scheduler.rs
-)"
-if ! grep -Fq 'let previous_cpu = self.slot_dispatch_cpu(receiver_slot);' \
-        <<<"$ipc_fast_handoff_body" \
-    || ! grep -Fq 'self.context_dispatch_ineligibility_on_cpu(receiver_slot, receiver, current_cpu)' \
-        <<<"$ipc_fast_handoff_body" \
-    || ! grep -Fq 'Self::synchronous_ipc_target_cpu(' <<<"$ipc_fast_handoff_body" \
-    || ! grep -Fq 'runqueue::publish_direct_handoff(receiver_slot, current_cpu)' \
-        <<<"$ipc_fast_handoff_body" \
-    || ! grep -Fq 'runqueue::publish_remote_wake(' <<<"$ipc_fast_handoff_body" \
-    || ! grep -Fq 'super::irq::request_target_reschedule(target_cpu);' \
-        <<<"$ipc_fast_handoff_body"; then
+ipc_fast_handoff_body="$(cat kernel/ps/src/multitask/scheduler/ipc_publication.rs)"
+if ! grep -Fq 'let previous = receiver_owner.cpu.unwrap_or_else' <<<"$ipc_fast_handoff_body" \
+    || ! grep -Fq 'runqueue::affinity_payload::last_cpu(binding.slot())' <<<"$ipc_fast_handoff_body" \
+    || ! grep -Fq 'if eligible(&binding, cpu) { cpu } else { previous }' <<<"$ipc_fast_handoff_body" \
+    || ! grep -Fq 'if !eligible(&binding, target)' <<<"$ipc_fast_handoff_body" \
+    || ! grep -Fq 'runqueue::claim_blocked_handoff(slot, expected, target, local)' <<<"$ipc_fast_handoff_body" \
+    || ! grep -Fq 'runqueue::publish_handoff_mailbox(slot, original,' <<<"$ipc_fast_handoff_body" \
+    || ! grep -Fq 'request_target_reschedule(target)' <<<"$ipc_fast_handoff_body"; then
     echo 'synchronous IPC must prefer an eligible caller CPU while retaining the admitted previous-CPU remote wake fallback' >&2
     exit 1
 fi
@@ -1139,27 +1135,75 @@ if [[ -z "$join_line" || -z "$complete_line" || "$complete_line" -le "$join_line
     exit 1
 fi
 
-# A terminal reply crosses the global scheduler catalog exactly once.  That
-# transaction revokes donation, wakes the exact task, and mints one opaque
-# owner-generation token; publication happens only after the catalog guard is
-# gone, and selection revalidates the same custody with no generic fallback.
-reply_current_body="$(sed -n '/^pub fn complete_ipc_reply_wake_handoff(/,/^pub fn release_ipc_priorities_for_process/p' kernel/ps/src/multitask/current/ipc.rs)"
+# The old catalog dispatch/fallback body is deleted. Qualify the ACTUAL
+# independent fair, strict overdue, due User reservation, incomplete fallback
+# and exact Direct FIFO path together; original native/mutation witnesses below
+# remain required and are not replaced by these source anchors (checked above).
+
+# Under Scheduler, a borrowed worker is admitted only against the exact
+# donor publication and its still-current reply/owner token; the worker's
+# own stamp cannot silently stand in for a missing donor publication.
+borrowed_local_body="$(sed -n '/^pub(super) fn effective_charge_stamp(/,/^const fn ordinary_voluntary_pick/p' kernel/ps/src/multitask/scheduler/local_dispatch.rs)"
+if ! grep -Fq 'let borrowed = token.map(|(owner_slot, _)| current_identity::read_dispatch(owner_slot));' <<<"$borrowed_local_body" \
+    || ! grep -Fq 'donation_ledger::borrowed_context_charge_token(slot) == token' <<<"$borrowed_local_body" \
+    || ! grep -Fq '&& effective_charge_is_eligible(slot, publication.pager_charge, cpu, now_ns)' <<<"$borrowed_local_body" \
+    || ! grep -Fq 'match effective_charge_admission(slot, publication.pager_charge, cpu, now_ns) {' <<<"$borrowed_local_body" \
+    || ! grep -Fq 'Some(false) => Ok(false),' <<<"$borrowed_local_body" \
+    || ! grep -Fq 'None => Err(LocalFallbackReason::LifecycleIneligible),' <<<"$borrowed_local_body" \
+    || ! grep -Fq 'if !published_candidate_admission(slot, cpu, now_ns)? {' <<<"$borrowed_local_body" \
+    || ! grep -Fq 'scheduling_runtime::published_stamp_admission(stamp, cpu, now_ns)' <<<"$borrowed_local_body" \
+    || ! grep -Fq 'rustos_scheduler_frame_gate::budget_admission_after_token_check(' <<<"$borrowed_local_body" \
+    || ! grep -Fq 'policy.cpu_mask & cpu_bit != 0,' kernel/ps/src/multitask/scheduler/scheduling_runtime.rs \
+    || ! grep -Fq '&& cpu_allowed' libs/rustos-scheduler-frame-gate/src/lib.rs; then
+    echo 'borrowed local admission must validate donor charge and exact live reply token' >&2
+    exit 1
+fi
+
+# Production per-CPU handoff and reservation queues must live outside the
+# lifecycle catalog. No host duplicate backend remains either; actual production
+# callers select the same static policy owner on every CPU.
+python3 - <<'PY'
+from pathlib import Path
+
+scheduler = Path('kernel/ps/src/multitask/scheduler.rs').read_text()
+policy = Path('kernel/ps/src/multitask/scheduler/dispatch_policy.rs').read_text()
+initial = Path('kernel/ps/src/multitask/scheduler/bootstrap/initial_tasks.rs').read_text()
+dispatcher = Path('kernel/ps/src/multitask/scheduler/dispatcher.rs').read_text()
+if ('cpu_dispatch:' in scheduler
+    or 'self.cpu_dispatch' in scheduler
+    or 'dispatch_policy::lock(cpu)' not in dispatcher
+    or 'dispatch_policy::reset();' not in initial
+    or 'fn reset(' in scheduler
+    or 'static CPU_DISPATCH_POLICY: [CpuDispatchLock; MAX_TRACKED_CPUS]' not in policy
+    or 'CPU_DISPATCH_POLICY[cpu].lock()' not in policy):
+    raise SystemExit('production CPU dispatch policy must be stored outside Scheduler catalog')
+PY
+
+# Current terminal reply owns original masked CPU and actual wake binding
+# through donation withdrawal, wake and exact FIFO publication. IRQ fallback
+# borrows its SAME original CPU owner; full fast settlement/dispatch is separate.
+# Both paths retain generation-qualified tokens; selection never gains a grant.
+reply_current_body="$(sed -n '/^pub fn complete_ipc_reply_wake_handoff(/,/^}/p' kernel/ps/src/multitask/current/ipc.rs)"
 reply_custody_body="$(sed -n '/^pub fn settle_ipc_reply_scheduling_context(/,/^pub fn complete_ipc_reply_wake_handoff(/p' kernel/ps/src/multitask/current/ipc.rs)"
-reply_scheduler_body="$(cat kernel/ps/src/multitask/scheduler/wake_handoff.rs)"
+reply_scheduler_body="$(cat kernel/ps/src/multitask/scheduler/ipc_publication.rs)"
 reply_enqueue_body="$(sed -n '/^fn enqueue_reply_wake_after_catalog(/,/^pub(super) fn enqueue_reply_wake/p' kernel/ps/src/multitask/scheduler/sync_handoff.rs)"
-reply_selection_body="$(sed -n '/^    fn synchronous_handoff_record_is_ready(/,/^    pub(super) fn take_next_synchronous_pick_hint_ready_slot/p' kernel/ps/src/multitask/scheduler/handoffs.rs)"
+reply_selection_body="$(sed -n '/^fn synchronous(/,/^fn latency(/p' kernel/ps/src/multitask/scheduler/dispatcher.rs)"
 plain_reply_body="$(sed -n '/^pub(super) fn syscall_linux_rustos_ipc_reply(/,/^pub(super) fn syscall_linux_rustos_ipc_call_with_handles/p' kernel/compat/src/user/syscall/linux/ipc_ops.rs)"
 handle_reply_body="$(sed -n '/^pub(super) fn syscall_linux_rustos_ipc_reply_with_handles/,/^pub(super) fn call_linux_syscall_endpoint/p' kernel/compat/src/user/syscall/linux/ipc_ops.rs)"
 reply_recv_body="$(sed -n '/^pub(super) fn syscall_linux_rustos_ipc_reply_recv_with_sender/,$p' kernel/compat/src/user/syscall/linux/ipc_reply_recv.rs)"
-if ! grep -Fq 'scheduler_mut().complete_ipc_reply_wake_handoff(reply, task_id)' <<<"$reply_current_body" \
-    || ! grep -Fq 'token.is_some_and(scheduler::enqueue_reply_wake_handoff)' <<<"$reply_current_body" \
-    || ! grep -Fq 'let _ = self.release_ipc_priority(reply, ipc_donation::DonationNamespace::IpcReply);' <<<"$reply_scheduler_body" \
-    || ! grep -Fq 'if !self.wake_task_slot(slot)' <<<"$reply_scheduler_body" \
-    || ! grep -Fq 'ReplyWakeHandoff::from_owner(slot, task_id, owner)' <<<"$reply_scheduler_body" \
+reply_owned_body="$(cat kernel/ps/src/multitask/scheduler/wake_publication.rs)"
+if ! grep -Fq 'scheduler::wake_publication::reply(reply, task_id)' <<<"$reply_current_body" \
+    || grep -Eq 'scheduler_(mut|ref)' <<<"$reply_current_body" \
+    || ! grep -Fq 'Some((runqueue::wait::REASON_ENDPOINT_REPLY, reply))' <<<"$reply_owned_body" \
+    || ! grep -Fq 'sync_handoff::enqueue_reply_wake(token)' <<<"$reply_owned_body" \
+    || ! grep -Fq 'dispatch_priority::Publication::begin(scope, token.target_cpu())' <<<"$reply_owned_body" \
+    || ! grep -Fq 'donation_ledger::release_reply(reply, ipc_donation::DonationNamespace::IpcReply)' <<<"$reply_owned_body" \
+    || grep -Fq 'fn complete_ipc_reply_wake_handoff(' <<<"$reply_scheduler_body" \
+    || ! grep -Fq 'wake_publication::reply_with(scope, reply, caller, eligible_cpus)' <<<"$reply_scheduler_body" \
     || ! grep -Fq 'if !owner_still_matches(token)' <<<"$reply_enqueue_body" \
     || ! grep -Fq 'owner_still_matches(token) && retained' <<<"$reply_enqueue_body" \
     || ! grep -Fq 'record.has_current_dispatch_custody()' <<<"$reply_selection_body" \
-    || ! grep -Fq 'self.pick_hint_candidate_slot(Some(record.slot())).is_some()' <<<"$reply_selection_body" \
+    || ! grep -Fq 'record.bind_selected_local_owner(runqueue::owner(record.slot()), cpu)' <<<"$reply_selection_body" \
     || ! grep -Fq 'settle_ipc_reply_scheduling_context(reply, custody)' <<<"$reply_custody_body" \
     || ! grep -Fq 'complete_ipc_reply_wake_handoff(reply, completion.caller_task_id)' <<<"$reply_custody_body" \
     || ! grep -Fq 'multitask::complete_ipc_reply_wake_handoff_with_custody(reply, completion)' <<<"$plain_reply_body" \
@@ -1168,7 +1212,7 @@ if ! grep -Fq 'scheduler_mut().complete_ipc_reply_wake_handoff(reply, task_id)' 
     || grep -Eq 'release_ipc_priority|wake_task|set_next_synchronous_pick_hint' <<<"$plain_reply_body" \
     || grep -Eq 'release_ipc_priority|wake_task|set_next_synchronous_pick_hint' <<<"$handle_reply_body" \
     || grep -Eq 'release_ipc_priority|wake_task|set_next_synchronous_pick_hint' <<<"$reply_recv_body"; then
-    echo 'terminal IPC replies must return exact scheduling-context custody and retain one exact post-catalog per-CPU handoff token without legacy fallback' >&2
+    echo 'Current terminal IPC replies must return exact scheduling-context custody and retain original binding through exact FIFO publication without legacy fallback' >&2
     exit 1
 fi
 
@@ -1273,9 +1317,63 @@ while IFS='|' read -r model package test_name features; do
     fi
     group_rows["$group"]+="$witness_key"$'\n'
 done <<'EOF'
+pager-fault-slot-lifecycle/PagerFaultSlotLifecycle|kernel-ps|multitask::scheduler::pager_handoff::tests::actual_pager_full_fifo_preserves_original_worker_wait_and_faulting_current
+pager-fault-slot-lifecycle/PagerFaultSlotLifecycle|kernel-ps|multitask::scheduler::pager_handoff::tests::actual_pager_does_not_clear_an_unrelated_rearmed_worker_wait
+frame-reader-claim/FrameReaderClaim|kernel-ps|multitask::scheduler::pager_handoff::tests::actual_pager_last_floor_effect_keeps_original_reader_binding_and_typed_phase
+scheduler-wakeup/SchedulerWakeup|kernel-ps|multitask::scheduler::pager_handoff::tests::actual_pager_precommit_current_worker_wake_never_reads_consumed_frame_or_reblocks
+mm-activation-close/MmActivationClose|kernel-ps|multitask::scheduler::pager_handoff::tests::actual_pager_resume_borrows_original_current_mm_without_claim_or_frame_read
+synchronous-ipc-handoff/SynchronousIpcHandoff|kernel-ps|multitask::scheduler::pager_handoff::tests::actual_pager_remote_worker_publication_binds_exact_fifo_and_mailbox_generation
+cpu-dispatch-preemption/CpuDispatchPreemption|kernel-ps|multitask::scheduler::irq_entry_tests::actual_irq_control_probe_keeps_original_current_bank_without_directory
+cpu-dispatch-preemption/CpuDispatchPreemption|kernel-ps|multitask::scheduler::irq_entry_tests::actual_irq_unmasked_scope_refuses_before_current_or_frame_effects
+cpu-dispatch-preemption/CpuDispatchPreemption|kernel-ps|multitask::scheduler::irq_entry_tests::actual_irq_dispatch_uses_original_claim_interval_and_ignores_return_scratch
+cpu-dispatch-preemption/CpuDispatchPreemption|kernel-ps|multitask::scheduler::irq_entry_tests::actual_irq_fast_producer_claim_and_changed_return_keep_both_born_banks_until_rsp_ack
+cpu-dispatch-preemption/CpuDispatchPreemption|kernel-ps|multitask::scheduler::irq_entry_tests::actual_irq_diagnostic_compares_original_physical_bank_and_uid_permit
+ipc-fast-handoff/IpcFastHandoff|kernel-ps|multitask::scheduler::ipc_publication::tests::actual_call_reverse_wake_before_original_sender_commit_cannot_be_overwritten
+ipc-fast-handoff/IpcFastHandoff|kernel-ps|multitask::scheduler::ipc_publication::tests::actual_call_unmasked_or_closed_receiver_refuses_before_any_wait_or_fifo_effect
+ipc-fast-handoff/IpcFastHandoff|kernel-ps|multitask::scheduler::ipc_publication::tests::actual_reply_foreign_context_and_wrong_wait_refuse_without_generic_fallback
+ipc-fast-handoff/IpcFastHandoff|kernel-ps|multitask::scheduler::ipc_publication::tests::actual_cross_cpu_call_keeps_original_funding_wait_fifo_and_mailbox_generation
+ipc-fast-handoff/IpcFastHandoff|kernel-ps|multitask::scheduler::ipc_publication::tests::actual_reverse_reply_uses_original_typed_wait_fair_owner_and_exact_fifo
+ipc-fast-handoff/IpcFastHandoff|kernel-ps|multitask::scheduler::ipc_publication::tests::actual_full_fifo_refuses_original_call_before_owner_wait_or_sender_commit
+ipc-fast-handoff/IpcFastHandoff|kernel-ps|multitask::scheduler::ipc_publication::tests::actual_raced_owner_cannot_be_reacquired_by_original_typed_handoff_cas
+ipc-fast-handoff/IpcFastHandoff|kernel-ps|multitask::scheduler::ipc_publication::tests::actual_cold_call_keeps_sender_unarmed_and_original_loans_through_receiver_fifo
+ipc-fast-handoff/IpcFastHandoff|kernel-ps|multitask::scheduler::ipc_publication::tests::actual_cold_call_cross_cpu_keeps_exact_receive_funding_and_remote_queue
+ipc-fast-handoff/IpcFastHandoff|kernel-ps|multitask::scheduler::ipc_publication::tests::actual_cold_call_full_fifo_keeps_typed_wake_and_original_unarmed_sender
+ipc-fast-handoff/IpcFastHandoff|kernel-ps|multitask::scheduler::ipc_publication::tests::actual_cold_call_foreign_endpoint_or_sender_wait_refuses_before_bind_and_wake
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::scheduler::group_exit::tests::actual_group_worker_transfers_original_member_loan_to_terminal_and_acks_without_catalog
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::scheduler::group_exit::tests::actual_competing_terminal_reservation_suspends_original_census_and_resumes_same_request
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::scheduler::group_exit::tests::actual_group_desired_ack_does_not_complete_terminal_consumers_before_original_borrower_drains
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::process_placement::exit_membership::tests::queued::explicit_suspension_retains_original_census_nonce_effects_and_pin_without_reopening_join
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::process_placement::exit_membership::tests::queued::suspended_effects_retain_captured_detached_uid_instead_of_recollecting_recycled_live_member
+cpu-dispatch-preemption/CpuDispatchPreemption|kernel-ps|multitask::scheduler::dispatch_priority::tests::actual_publication_borrows_original_masked_scope_through_release
+synchronous-ipc-handoff/SynchronousIpcHandoff|kernel-ps|multitask::scheduler::dispatcher::tests::actual_direct_fifo_selection_retains_consumed_generation_through_original_claim
+cpu-dispatch-preemption/CpuDispatchPreemption|kernel-ps|multitask::scheduler::dispatcher::tests::actual_dispatch_owns_choice_frame_funding_interval_and_return_without_catalog
+cpu-dispatch-preemption/CpuDispatchPreemption|kernel-ps|multitask::scheduler::dispatcher::tests::actual_failed_fast_probe_reuses_one_original_choice_and_outgoing_interval
+bootstrap-activation-handoff/BootstrapActivationHandoff|kernel-ps|multitask::scheduler::dispatcher::tests::actual_earlier_claim_discharges_only_its_exact_spawn_first_turn
+frame-reader-claim/FrameReaderClaim|kernel-ps|multitask::scheduler::dispatcher::tests::actual_incomplete_first_turn_retains_fifo_and_pending_while_original_reader_excludes_claim
+scheduler-active-balance/SchedulerActiveBalance|kernel-ps|multitask::scheduler::dispatcher::maintenance::tests::original_migration_reader_spans_exact_owner_cas_and_target_mailbox
+scheduler-active-balance/SchedulerActiveBalance|kernel-ps|multitask::scheduler::dispatcher::maintenance::tests::raced_block_refuses_migration_without_reacquiring_generation_or_waking
+scheduling-context-budget/SchedulingContextBudget|kernel-ps|multitask::scheduler::dispatch_claim::tests::actual_claim_opens_original_interval_before_return_without_scalar_identity_reacquisition
+scheduling-context-budget/SchedulingContextBudget|kernel-ps|multitask::scheduler::dispatch_claim::tests::actual_prepared_original_funder_cannot_be_rebound_from_a_later_scalar_charge_publication
+scheduling-context-budget/SchedulingContextBudget|kernel-ps|multitask::scheduler::dispatch_claim::tests::actual_unused_original_funding_refusal_releases_final_closing_funder_outside_cpu_leaf
+scheduling-context-budget/SchedulingContextBudget|kernel-ps|multitask::scheduler::dispatch_claim::tests::actual_claimed_funding_survives_terminal_until_original_interval_settlement
+scheduling-context-budget/SchedulingContextBudget|kernel-ps|multitask::scheduler::return_architecture::tests::actual_settled_original_grant_cannot_admit_architecture_with_retained_frame_banks
+scheduler-wakeup/SchedulerWakeup|kernel-ps|multitask::scheduler::wake_publication::typed_tests::actual_typed_concurrent_arm_and_capture_have_one_winner_without_runowner_generation_change
+cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::scheduler::wake_publication::typed_tests::actual_typed_terminal_after_capture_cannot_clear_or_resurrect_and_keeps_original_reuse_fence
+scheduler-wakeup/SchedulerWakeup|kernel-ps|multitask::scheduler::wake_publication::typed_tests::actual_typed_phase_excludes_same_payload_rearm_until_original_publication_releases
+scheduler-wakeup/SchedulerWakeup|kernel-ps|multitask::scheduler::wake_publication::typed_tests::actual_typed_cancel_invalidates_original_match_without_clearing_or_rearming_a_new_wait
+scheduler-wakeup/SchedulerWakeup|kernel-ps|multitask::scheduler::wake_publication::typed_tests::actual_typed_original_phase_survives_current_wake_through_last_effect_not_just_clear
+pager-fault-slot-lifecycle/PagerFaultSlotLifecycle|kernel-ps|multitask::scheduler::wake_publication::typed_tests::actual_typed_pager_matches_exact_key_and_keeps_original_loan_through_real_fifo
+pager-fault-slot-lifecycle/PagerFaultSlotLifecycle|kernel-ps|multitask::scheduler::wake_publication::typed_tests::actual_typed_service_requires_original_process_and_wait_kind_and_rejects_foreign_scope
+scheduler-wakeup/SchedulerWakeup|kernel-ps|multitask::scheduler::wake_publication::typed_tests::actual_typed_refused_running_arm_preserves_original_blocked_payload_and_current_return_wake
+scheduler-wakeup/SchedulerWakeup|kernel-ps|multitask::scheduler::runqueue::wait::epoch::tests::actual_exhausted_wait_epoch_refuses_capture_and_arm_before_payload_or_pending_effects
 process-address-space-lifetime/ProcessAddressSpaceLifetime|kernel-ps|multitask::process_table::tests::process_address_space_and_exec_exit_are_serialized
 authority-identity-lifecycle/AuthorityIdentityLifecycle|kernel-ps|user::handles::transfer_registry::transfer_registry_tests::authority_identity_exhaustion_fails_closed_before_wrap
 authority-identity-lifecycle/AuthorityIdentityLifecycle|kernel-ps|multitask::identity_tests::task_identity_exhaustion_never_wraps_to_a_live_id
+authority-identity-lifecycle/AuthorityIdentityLifecycle|kernel-ps|multitask::current_identity::tests::dispatch_lifecycle_is_committed_with_identity
+authority-identity-lifecycle/AuthorityIdentityLifecycle|kernel-ps|multitask::current_identity::owner_tests::metadata_republication_cannot_erase_newer_lifecycle_intent
+authority-identity-lifecycle/AuthorityIdentityLifecycle|kernel-ps|multitask::current_identity::owner_tests::absent_partial_metadata_preserves_pending_start_and_stop_intent
+authority-identity-lifecycle/AuthorityIdentityLifecycle|kernel-ps|multitask::current_identity::owner_tests::stale_live_command_cannot_stop_or_resume_a_recycled_identity
+authority-identity-lifecycle/AuthorityIdentityLifecycle|kernel-ps|multitask::current_identity::owner_tests::concurrent_metadata_and_gate_writers_do_not_lose_each_others_fields
 authority-identity-lifecycle/AuthorityIdentityLifecycle|kernel-ps|multitask::process_table::tests::process_generations_fail_closed_instead_of_aliasing_stale_handles
 authority-identity-lifecycle/AuthorityIdentityLifecycle|kernel-compat|user::syscall::linux::proc_broker_ops::tests::broker_authority_identity_exhaustion_never_wraps
 authority-identity-lifecycle/AuthorityIdentityLifecycle|kernel-ipc-runtime|ipc::slab::tests::removed_handle_never_aliases_reused_slot
@@ -1418,10 +1516,18 @@ smp-reschedule-ipi/SmpRescheduleIpi|kernel-ps|multitask::reschedule_observation:
 smp-reschedule-ipi/SmpRescheduleIpi|kernel-ps|multitask::reschedule_observation::tests::publication_after_claim_must_create_a_new_pending_edge
 smp-reschedule-ipi/SmpRescheduleIpi|kernel-ps|multitask::irq::tests::reschedule_ipi_gate_retains_locked_work_and_dispatches_only_at_safe_point
 scheduler-cpu-ownership/SchedulerCpuOwnership|kernel-hal|interrupt_stubs::tests::scheduler_commit_call_aligns_and_restores_incoming_rsp
+scheduler-cpu-ownership/SchedulerCpuOwnership|kernel-ps|multitask::cpu_local::dispatch_turn::tests::unique_turn_refuses_overlap_and_commit_cannot_release_a_live_producer
+scheduler-cpu-ownership/SchedulerCpuOwnership|kernel-ps|multitask::cpu_local::dispatch_turn::tests::switched_return_stays_closed_until_rsp_commit_and_duplicate_cannot_spend_next_turn
+scheduler-cpu-ownership/SchedulerCpuOwnership|kernel-ps|multitask::cpu_local::dispatch_turn::tests::abandoned_or_partial_publication_poison_cannot_be_reopened_by_commit
+scheduler-cpu-ownership/SchedulerCpuOwnership|kernel-ps|multitask::cpu_local::dispatch_turn::tests::concurrent_cpu_entry_has_one_unique_winner_not_a_global_writer_hint
+scheduler-cpu-ownership/SchedulerCpuOwnership|kernel-ps|multitask::cpu_local::dispatch_turn::tests::production_return_publishes_under_local_lease_and_waits_for_assembly_ack
+scheduler-cpu-ownership/SchedulerCpuOwnership|kernel-ps|multitask::cpu_local::dispatch_turn::tests::return_lease_refuses_replaced_current_and_remote_custody_before_publication
 scheduler-cpu-ownership/SchedulerCpuOwnership|kernel-ps|multitask::cpu_local::tests::current_task_ownership_ignores_offline_slots_and_is_cpu_distinct
 scheduler-cpu-ownership/SchedulerCpuOwnership|kernel-ps|multitask::irq::tests::reschedule_ipi_gate_retains_locked_work_and_dispatches_only_at_safe_point
+scheduler-cpu-ownership/SchedulerCpuOwnership|kernel-ps|multitask::scheduler::frame_publication::tests::executing_or_transition_stack_owners_reject_a_matching_local_frame
 scheduler-cpu-ownership/SchedulerCpuOwnership|kernel-ps|multitask::scheduler::tests::architectural_restore_is_required_exactly_for_a_task_switch
 scheduler-cpu-ownership/SchedulerCpuOwnership|kernel-ps|multitask::scheduler::tests::wake_transition_publishes_one_owner_before_commit_and_claims_once_after
+scheduler-cpu-ownership/SchedulerCpuOwnership|kernel-ps|multitask::scheduler::smp::tests::secondary_idle_slot_layout_is_cpu_exact_and_outside_the_root
 scheduler-cpu-ownership/SchedulerCpuOwnership|kernel-ps|multitask::scheduler::smp::tests::remote_or_transition_owned_task_is_not_schedulable
 scheduler-cpu-ownership/SchedulerCpuOwnership|nucleus-core|util::lockdep::tests::tracked_guard_release_requires_same_cpu_apic_and_positive_depth
 scheduler-cpu-ownership/SchedulerCpuOwnership|nucleus-core|util::lockdep::tests::pending_acquire_units_cannot_consume_a_held_guard_pin
@@ -1431,7 +1537,230 @@ tlb-shootdown-lifecycle/TlbShootdownLifecycle|kernel-hal|arch::tlb_shootdown::te
 tlb-shootdown-lifecycle/TlbShootdownLifecycle|kernel-mm|memory::address_space::tests::unmap_descriptor_plan_is_complete_before_first_pte_remove
 cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::process_table::tests::exec_seal_rejects_thread_attachment_until_cancel
 cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::process_table::tests::process_address_space_and_exec_exit_are_serialized
+cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::scheduler::stack_resources::context::tests::frame_and_descriptor_custody_keep_process_backing_after_terminal_detach
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::process_table::pin_owner::tests::closing_keeps_old_readers_and_refuses_rebind_until_last_release
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::process_table::pin_owner::tests::metadata_republication_never_reopens_closing_or_resets_readers
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::process_table::pin_owner::tests::foreign_generation_saturation_and_duplicate_release_fail_closed
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::process_table::pin_owner::tests::concurrent_close_cannot_observe_zero_then_admit_a_new_reader
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::process_table::pin_owner::tests::descriptor_and_syscall_pins_delay_real_reap_and_notify_without_table_release
+process-signal-delivery/ProcessSignalDelivery|kernel-ps|multitask::scheduler::linux_thread_state::owner_tests::static_thread_binding_rejects_recycled_owner_before_any_callback
+process-signal-delivery/ProcessSignalDelivery|kernel-ps|multitask::scheduler::linux_thread_state::owner_tests::pending_hint_tracks_bounded_mutation_under_the_same_thread_leaf
+cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::scheduler::stack_resources::context::tests::pinned_context_cannot_be_cleared_replaced_or_detached_with_its_allocation
+cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::scheduler::stack_resources::context::tests::terminal_detach_is_exact_and_cannot_be_replayed_from_an_old_snapshot
+cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::scheduler::stack_resources::context::tests::metadata_cannot_install_a_context_identity_from_a_foreign_slot
+cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::scheduler::stack_resources::context::tests::start_identity_must_match_the_installed_funding_handle
+cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::scheduler::stack_resources::frame_access::tests::unpublished_writer_owns_bytes_outside_leaf_and_blocks_detach_and_reentry
+cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::scheduler::stack_resources::frame_access::tests::writer_unwind_releases_admission_without_losing_allocation_custody
+cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::scheduler::stack_resources::frame_access::tests::closing_defers_reap_until_the_exclusive_writer_releases
+cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::scheduler::stack_resources::frame_access::tests::remote_close_and_reader_cannot_cross_an_active_byte_writer
+exec-address-space-transaction/ExecAddressSpaceTransaction|kernel-ps|multitask::scheduler::exec_transaction::publication::tests::actual_peer_exec_publishes_owned_frame_metadata_tls_and_staged_mm_before_finalization
+cold-exec-intent/ColdExecIntent|kernel-ps|multitask::scheduler::exec_transaction::publication::tests::actual_peer_exec_foreign_pid_tid_and_mode_refuse_before_original_bytes_and_authority
+cpu-dispatch-preemption/CpuDispatchPreemption|kernel-ps|multitask::scheduler::exec_transaction::publication::tests::actual_exec_copied_current_without_original_bank_refuses_before_frame_and_mm_effects
+mm-activation-close/MmActivationClose|kernel-ps|multitask::scheduler::exec_transaction::publication::tests::actual_self_exec_never_rewrites_consumed_frame_or_publishes_ready_and_retains_original_bank
+exec-address-space-transaction/ExecAddressSpaceTransaction|kernel-ps|multitask::scheduler::exec_transaction::tests::image_custody_spans_staging_root_publication_and_finalization_not_just_directory_commit
+exec-address-space-transaction/ExecAddressSpaceTransaction|kernel-ps|multitask::scheduler::exec_transaction::tests::image_lease_credentials_cannot_publish_a_foreign_slot_identity_handle_root_or_mode
+exec-address-space-transaction/ExecAddressSpaceTransaction|kernel-ps|multitask::scheduler::exec_transaction::tests::incomplete_joined_target_refuses_before_process_staging_callback
+process-address-space-lifetime/ProcessAddressSpaceLifetime|kernel-ps|multitask::scheduler::exec_transaction::tests::publication_receipt_rejects_old_mm_transaction_foreign_process_generation_and_wrong_root
+process-address-space-lifetime/ProcessAddressSpaceLifetime|kernel-ps|multitask::process_table::exec_tests::real_staging_hides_new_mm_until_exact_receipt_finalizes_and_preserves_pending_exit
+process-address-space-lifetime/ProcessAddressSpaceLifetime|kernel-ps|multitask::process_table::exec_tests::real_finalization_refuses_changed_live_transaction_before_visibility_or_old_mm_release
+exec-address-space-transaction/ExecAddressSpaceTransaction|kernel-ps|multitask::scheduler::stack_resources::frame_access::tests::self_exec_requires_sole_exact_current_before_any_image_side_effect
+exec-address-space-transaction/ExecAddressSpaceTransaction|kernel-ps|multitask::scheduler::stack_resources::frame_access::tests::self_exec_cannot_spend_prepared_custody_as_current_or_leak_writer_after_unwind
+cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::scheduler::frame_observation::tests::copied_local_observation_never_escapes_backing_or_classifies_unknown_as_zero
+scheduler-cpu-ownership/SchedulerCpuOwnership|kernel-ps|multitask::scheduler::frame_observation::tests::executing_observation_needs_exact_cpu_current_or_prepared_and_refuses_foreign_current
+scheduler-cpu-ownership/SchedulerCpuOwnership|kernel-ps|multitask::scheduler::frame_observation::tests::observed_epoch_and_identity_cannot_recover_replaced_or_writing_frame_authority
+scheduler-admission/SchedulerAdmission|kernel-ps|multitask::scheduler::stack_resources::admission::tests::cancellation_retains_slot_through_external_release_and_stale_generation_cannot_spend_reuse
+scheduler-admission/SchedulerAdmission|kernel-ps|multitask::scheduler::stack_resources::admission::tests::ordinary_allocation_and_detachment_cannot_cross_a_reserved_slot
+cpu-online-lifecycle/CpuOnlineLifecycle|kernel-ps|multitask::scheduler::bootstrap::tests::boot_image_refuses_empty_zero_generation_capacity_and_competing_bsp_without_reopening_poison
+cpu-online-lifecycle/CpuOnlineLifecycle|kernel-ps|multitask::scheduler::bootstrap::tests::every_cpu_bank_ack_precedes_one_ready_release_and_incomplete_prefix_preserves_other_producer
+scheduler-cpu-ownership/SchedulerCpuOwnership|kernel-ps|multitask::scheduler::bootstrap::tests::initial_producer_binds_cpu_slot_uid_generation_and_wrong_alias_refuses_before_effects
+scheduler-cpu-ownership/SchedulerCpuOwnership|kernel-ps|multitask::scheduler::bootstrap::tests::duplicate_publication_cannot_spend_bank_or_ack_and_abandonment_retains_poisoned_image
+cpu-online-lifecycle/CpuOnlineLifecycle|kernel-ps|multitask::scheduler::bootstrap::tests::ap_entry_is_generation_exact_unique_and_poisoned_entry_never_reuses_next_cpu
+cpu-online-lifecycle/CpuOnlineLifecycle|kernel-ps|multitask::scheduler::bootstrap::tests::concurrent_bsp_claims_have_one_winner_without_global_directory_or_callback_lock
+cpu-online-lifecycle/CpuOnlineLifecycle|kernel-ps|multitask::scheduler::bootstrap::initial_tasks::tests::actual_initial_image_ack_joins_hidden_descriptor_running_interval_and_original_backing
+cpu-online-lifecycle/CpuOnlineLifecycle|kernel-ps|multitask::scheduler::bootstrap::initial_tasks::tests::actual_ap_initial_image_owns_only_its_cpu_and_never_reads_a_synthetic_saved_rsp
+cpu-online-lifecycle/CpuOnlineLifecycle|kernel-ps|multitask::scheduler::bootstrap::initial_tasks::tests::actual_boot_architecture_borrows_original_image_current_and_interval_not_scalar_rsp
+cpu-online-lifecycle/CpuOnlineLifecycle|kernel-ps|multitask::scheduler::bootstrap::initial_tasks::tests::actual_boot_owner_reset_refuses_existing_physical_lifetime_instead_of_tearing_it_down
+scheduler-cpu-ownership/SchedulerCpuOwnership|kernel-ps|multitask::scheduler::bootstrap::tests::duplicate_task_uid_cannot_bind_two_physical_cpu_banks
+scheduler-admission/SchedulerAdmission|kernel-ps|multitask::scheduler::execution_image::tests::reserved_kernel_entry_frame_keeps_exact_rsp_trailer_registers_flags_and_canary_under_producer
+scheduler-admission/SchedulerAdmission|kernel-ps|multitask::scheduler::root_creation::tests::actual_root_construct_owns_pinned_process_and_complete_blocked_slot_ack_before_wake
+scheduler-admission/SchedulerAdmission|kernel-ps|multitask::scheduler::root_creation::tests::suspended_root_finishes_both_real_acks_without_wake_or_fresh_dispatch_permission
+cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::scheduler::root_creation::tests::terminal_after_root_ack_cannot_reuse_child_before_wake_or_resurrect_retired_owner
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::scheduler::root_creation::tests::prepared_root_is_invisible_and_copied_spawn_receipt_cannot_publish_or_cancel_real_seal
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::scheduler::root_creation::tests::exhausted_root_nonce_refuses_before_pid_visibility_and_returns_exact_reserved_slot_for_cancel
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::scheduler::root_creation::tests::actual_windows_materialization_error_cancels_all_unpublished_process_and_slot_custody
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::scheduler::root_creation::tests::newly_visible_root_abandonment_retains_actual_process_pin_and_poisoned_join_without_registration
+affinity-claim-admission/AffinityClaimAdmission|kernel-ps|multitask::scheduler::root_creation::tests::actual_fork_parent_cohort_retains_original_policy_and_mask_through_child_root_ack
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::scheduler::root_creation::tests::same_uid_root_reuse_requires_new_process_transaction_and_actual_ticket_epoch
+affinity-claim-admission/AffinityClaimAdmission|kernel-ps|multitask::scheduler::root_creation::tests::original_user_actor_fork_retains_two_real_parent_loans_without_double_cohort_capture
+scheduler-admission/SchedulerAdmission|kernel-ps|multitask::scheduler::root_creation::tests::actual_orphan_runtime_refusal_does_not_publish_pid_or_release_foreign_funding
+scheduler-admission/SchedulerAdmission|kernel-ps|multitask::scheduler::root_creation::tests::actual_kernel_actor_does_not_grant_unbudgeted_or_missing_parent_admission
+scheduler-admission/SchedulerAdmission|kernel-ps|multitask::scheduler::kernel_creation::tests::actual_kernel_publication_keeps_physical_child_through_blocked_ack_and_runnable_frame_publication
+scheduler-admission/SchedulerAdmission|kernel-ps|multitask::scheduler::kernel_creation::tests::exact_kernel_zero_uid_is_complete_publication_not_absence_or_resume_permission
+cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::scheduler::kernel_creation::tests::stop_after_slot_ack_cannot_reuse_child_before_wake_and_never_resurrects_terminal_owner
+scheduler-admission/SchedulerAdmission|kernel-ps|multitask::scheduler::kernel_creation::tests::uncommitted_ticket_cannot_create_publication_backing_loan
+scheduler-admission/SchedulerAdmission|kernel-ps|multitask::scheduler::execution_image::tests::reserved_kernel_writer_refuses_unqualified_boot_writer_and_nested_producer_without_byte_effect
+scheduler-admission/SchedulerAdmission|kernel-ps|multitask::scheduler::execution_image::tests::complete_kernel_uid_zero_descriptor_is_not_admission_until_reserved_blocked_ack
+scheduler-admission/SchedulerAdmission|kernel-ps|multitask::scheduler::root_slots::tests::root_reservation_owns_initialized_canary_before_bytes_and_second_creator_cannot_spend_it
+scheduler-admission/SchedulerAdmission|kernel-ps|multitask::scheduler::root_slots::tests::root_descriptor_prefix_stays_closed_until_exact_blocked_ack_without_directory_authority
+scheduler-admission/SchedulerAdmission|kernel-ps|multitask::scheduler::root_slots::tests::root_publication_refuses_reserved_phase_before_queue_effect_and_returns_original_producer
+scheduler-admission/SchedulerAdmission|kernel-ps|multitask::scheduler::root_slots::tests::root_cancellation_cannot_cross_commit_or_destroy_published_binding_before_ack
+scheduler-admission/SchedulerAdmission|kernel-ps|multitask::scheduler::root_slots::tests::competing_root_reservations_have_one_real_stack_producer_without_global_scheduler_guard
+scheduler-admission/SchedulerAdmission|kernel-ps|multitask::scheduler::stack_resources::admission::tests::cancellation_ack_cannot_reopen_before_storage_release
+scheduler-admission/SchedulerAdmission|kernel-ps|multitask::scheduler::stack_resources::admission::tests::concurrent_reservations_have_one_slot_owner_without_a_directory_guard
+scheduler-admission/SchedulerAdmission|kernel-ps|multitask::scheduler::stack_resources::admission::tests::abandoned_reservation_poison_is_not_implicit_rollback_or_slot_reopening
+scheduler-admission/SchedulerAdmission|kernel-ps|multitask::scheduler::stack_resources::admission::tests::context_and_descriptor_installation_require_the_exact_committing_ticket
+scheduler-admission/SchedulerAdmission|kernel-ps|multitask::scheduler::stack_resources::admission::tests::publication_ack_refuses_a_foreign_published_identity_even_after_blocked_admission
+scheduler-admission/SchedulerAdmission|kernel-ps|multitask::scheduler::stack_resources::admission::tests::publication_ack_follows_exact_context_descriptor_and_blocked_identity_admission
+scheduler-admission/SchedulerAdmission|kernel-ps|multitask::scheduler::stack_resources::admission::tests::partial_commit_cannot_ack_or_reopen_before_runqueue_publication
+scheduling-context-budget/SchedulingContextBudget|kernel-ps|multitask::scheduler::scheduling_runtime::domain_tests::domain_descriptor_tracks_the_budget_owner_not_a_stale_catalog_copy
+scheduling-context-budget/SchedulingContextBudget|kernel-ps|multitask::scheduler::scheduling_runtime::domain_tests::captured_interval_without_member_or_catalog_still_refuses_domain_replacement
+scheduling-context-budget/SchedulingContextBudget|kernel-ps|multitask::scheduler::scheduling_runtime::domain_tests::incomplete_domain_budget_cannot_be_projected_as_reusable_absence
+process-address-space-lifetime/ProcessAddressSpaceLifetime|kernel-mm|memory::address_space::execution_lifetime::tests::sealing_refuses_new_execution_but_captured_refs_retain_the_root_until_cold_drain
+process-address-space-lifetime/ProcessAddressSpaceLifetime|kernel-mm|memory::address_space::execution_lifetime::tests::owner_drop_and_pin_release_never_run_finalization_inline
+process-address-space-lifetime/ProcessAddressSpaceLifetime|kernel-mm|memory::address_space::execution_lifetime::tests::old_mapping_backing_payload_survives_until_last_execution_ref_and_cold_finalizer
+process-address-space-lifetime/ProcessAddressSpaceLifetime|kernel-mm|memory::address_space::execution_lifetime::tests::concurrent_last_releases_enqueue_once_and_pin_cannot_cross_close
+process-address-space-lifetime/ProcessAddressSpaceLifetime|kernel-mm|memory::address_space::execution_lifetime::tests::bounded_single_consumer_drain_survives_reentry_and_concurrent_producers
+process-address-space-lifetime/ProcessAddressSpaceLifetime|kernel-mm|memory::address_space::execution_lifetime::tests::checked_reference_saturation_refuses_without_spending_owner_custody
+frame-reader-claim/FrameReaderClaim|kernel-ps|multitask::scheduler::stack_resources::frame_readers::tests::local_reader_refusal_preserves_owner_queue_and_membership_until_last_read_release
+frame-reader-claim/FrameReaderClaim|kernel-ps|multitask::scheduler::stack_resources::frame_readers::tests::direct_reader_refusal_retains_exact_handoff_and_cannot_spend_a_republished_generation
+frame-reader-claim/FrameReaderClaim|kernel-ps|multitask::scheduler::stack_resources::frame_readers::tests::concurrent_reader_and_owner_cas_cannot_both_acquire_saved_header_authority
+frame-reader-claim/FrameReaderClaim|kernel-ps|multitask::scheduler::stack_resources::frame_readers::tests::running_reader_requires_own_current_or_prepared_bank_not_merely_a_running_owner
+frame-reader-claim/FrameReaderClaim|kernel-ps|multitask::scheduler::stack_resources::frame_readers::tests::reader_saturation_and_writer_conflict_refuse_without_spending_any_custody
+frame-reader-claim/FrameReaderClaim|kernel-ps|multitask::scheduler::stack_resources::frame_readers::tests::reader_unwind_releases_only_its_borrow_and_reopens_exact_claim_admission
+lifecycle-execution-claim/LifecycleExecutionClaim|kernel-ps|multitask::scheduler::irq_entry_tests::actual_dispatch_return_terminal_and_rsp_ack_keep_original_banks_until_real_reuse_seals
+lifecycle-execution-claim/LifecycleExecutionClaim|kernel-ps|multitask::scheduler::irq_entry_tests::actual_native_resource_publication_refuses_missing_architecture_or_settled_original_interval
+lifecycle-execution-claim/LifecycleExecutionClaim|kernel-ps|multitask::scheduler::irq_entry_tests::foreign_shared::actual_foreign_shared_mm_returns_drain_frozen_exec_census_before_self_exec_and_terminal_reuse
+lifecycle-execution-claim/LifecycleExecutionClaim|kernel-ps|multitask::scheduler::irq_entry_tests::cross_root::actual_cross_root_ipc_roundtrip_and_terminal_returns_withdraw_every_born_bank_before_real_reuse
+lifecycle-execution-claim/LifecycleExecutionClaim|kernel-ps|multitask::current_identity::execution::tests::all_lifecycle_gates_refuse_before_claim_callback_and_resume_preserves_existing_holder
+lifecycle-execution-claim/LifecycleExecutionClaim|kernel-ps|multitask::current_identity::execution::tests::captured_execution_blocks_clear_and_absent_metadata_cannot_rebind_its_uid
+lifecycle-execution-claim/LifecycleExecutionClaim|kernel-ps|multitask::current_identity::execution::tests::writer_and_claim_have_one_lifecycle_linearization_point_without_directory
+lifecycle-execution-claim/LifecycleExecutionClaim|kernel-ps|multitask::current_identity::execution::tests::saturation_refuses_callback_and_unwind_leaves_no_unparked_permit
+affinity-claim-admission/AffinityClaimAdmission|kernel-ps|multitask::scheduler::runqueue::affinity_payload::admission_tests::each_mask_uid_and_cpu_bound_refuses_before_callback_including_root_uid_zero
+affinity-claim-admission/AffinityClaimAdmission|kernel-ps|multitask::scheduler::runqueue::affinity_payload::admission_tests::concurrent_affinity_writer_waits_until_admitted_cas_callback_has_left_leaf
+affinity-claim-admission/AffinityClaimAdmission|kernel-ps|multitask::scheduler::runqueue::affinity_payload::admission_tests::overlapping_writers_publish_only_complete_commits_and_unwind_releases_admission
+affinity-claim-admission/AffinityClaimAdmission|kernel-ps|multitask::scheduler::runqueue::affinity_payload::admission_tests::reset_is_empty_authority_not_unrestricted_permission_and_old_uid_cannot_rebind
+affinity-claim-admission/AffinityClaimAdmission|kernel-ps|multitask::scheduler::runqueue::affinity_payload::admission_tests::invalid_mask_writer_cannot_modify_binding_version_or_previous_commit
+affinity-claim-admission/AffinityClaimAdmission|kernel-ps|multitask::scheduler::stack_resources::lifecycle_tests::affinity_change_refuses_real_local_claim_without_directory_and_preserves_queue_generation
+affinity-claim-admission/AffinityClaimAdmission|kernel-ps|multitask::scheduler::stack_resources::lifecycle_tests::affinity_change_refuses_real_direct_claim_without_consuming_handoff_custody
+affinity-claim-admission/AffinityClaimAdmission|kernel-ps|multitask::scheduler::stack_resources::lifecycle_tests::affinity_reset_cannot_discard_captured_execution_and_same_uid_exec_preserves_binding
+affinity-claim-admission/AffinityClaimAdmission|kernel-ps|multitask::scheduler::runqueue::affinity_payload::admission_tests::exhausted_affinity_epoch_refuses_before_any_mask_or_migration_effect
+cpu-dispatch-preemption/CpuDispatchPreemption|kernel-ps|multitask::scheduler::stack_resources::lifecycle_tests::captured_placement_survives_new_exclusion_and_unchanged_ack_cannot_erase_new_migration
+cpu-dispatch-preemption/CpuDispatchPreemption|kernel-ps|multitask::scheduler::stack_resources::lifecycle_tests::current_only_placement_capture_acknowledges_only_its_exact_migration_version
+cpu-dispatch-preemption/CpuDispatchPreemption|kernel-ps|multitask::scheduler::stack_resources::lifecycle_tests::changed_rsp_ack_keeps_late_affinity_request_and_releases_only_outgoing_identity
+cpu-dispatch-preemption/CpuDispatchPreemption|kernel-ps|multitask::scheduler::stack_resources::lifecycle_tests::placement_owner_republication_refuses_return_before_any_placement_ack
+cold-exec-intent/ColdExecIntent|kernel-ps|multitask::scheduler::stack_resources::context::intent_tests::staged_self_exec_keeps_captured_placement_through_receipt_and_late_migration_until_cpu_ack
+mm-activation-close/MmActivationClose|kernel-ps|multitask::scheduler::stack_resources::context::mm_tests::unpublished_thread_mm_capture_retains_old_root_and_closed_exec_cannot_reactivate_it
+mm-activation-close/MmActivationClose|kernel-ps|multitask::scheduler::stack_resources::context::mm_tests::unpublished_thread_commit_mm_admission_excludes_exec_staging_until_commit_releases
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::scheduler::thread_slots::tests::sleepable_windows_thread_commit_joins_new_process_mask_not_obsolete_inheritance
+cold-exec-intent/ColdExecIntent|kernel-ps|multitask::current_identity::exec_intent::tests::exact_cancel_then_new_reservation_rejects_old_image_cancel_and_drop_without_reopening
+cold-exec-intent/ColdExecIntent|kernel-ps|multitask::current_identity::exec_intent::tests::unqualified_gate_and_identity_reset_cannot_spend_owned_cold_intent
+cold-exec-intent/ColdExecIntent|kernel-ps|multitask::current_identity::exec_intent::tests::image_refusal_returns_to_same_sealed_owner_but_abandonment_and_publication_never_cancel
+cold-exec-intent/ColdExecIntent|kernel-ps|multitask::current_identity::exec_intent::tests::full_qualifiers_refuse_before_any_gate_effect_and_generation_survives_uid_reset
+cold-exec-intent/ColdExecIntent|kernel-ps|multitask::scheduler::stack_resources::context::intent_tests::self_cancellation_closes_before_process_wait_and_pins_cpu_until_matching_receipt
+cold-exec-intent/ColdExecIntent|kernel-ps|multitask::scheduler::stack_resources::context::intent_tests::owned_peer_image_retains_gate_through_real_receipt_finalization_and_writer_release
+cold-exec-intent/ColdExecIntent|kernel-ps|multitask::scheduler::stack_resources::context::intent_tests::owned_intent_refuses_unqualified_writer_and_resource_teardown_before_any_effect
+cold-exec-intent/ColdExecIntent|kernel-ps|multitask::scheduler::stack_resources::context::intent_tests::failed_image_admission_can_cancel_exact_process_but_old_credential_cannot_enter_next_exec
+cold-exec-intent/ColdExecIntent|kernel-ps|multitask::scheduler::stack_resources::context::intent_tests::pending_exit_cancel_receipt_never_reopens_target_and_preserves_unrelated_stop
+cold-exec-intent/ColdExecIntent|kernel-ps|multitask::scheduler::stack_resources::context::intent_tests::real_finalization_pending_exit_cannot_reopen_dispatch_after_owned_image_completion
+cold-exec-intent/ColdExecIntent|kernel-ps|multitask::scheduler::stack_resources::context::intent_tests::self_intent_does_not_suspend_reschedulable_sibling_barrier_and_only_image_closes_gate
+cold-exec-intent/ColdExecIntent|kernel-ps|multitask::scheduler::stack_resources::context::intent_tests::completed_self_image_opens_only_after_writer_drop_inside_completion_scope
+lifecycle-execution-claim/LifecycleExecutionClaim|kernel-ps|multitask::current_identity::execution::tests::root_uid_zero_is_bound_authority_not_an_empty_sentinel
+lifecycle-execution-claim/LifecycleExecutionClaim|kernel-ps|multitask::cpu_local::dispatch_turn::tests::assembly_ack_refusal_cannot_clear_a_new_open_producers_transition
+lifecycle-execution-claim/LifecycleExecutionClaim|kernel-ps|multitask::cpu_local::dispatch_turn::tests::abandoned_admitted_rsp_consumer_quarantines_instead_of_reopening
+lifecycle-execution-claim/LifecycleExecutionClaim|kernel-ps|multitask::cpu_local::dispatch_turn::tests::rsp_consumer_is_admitted_before_bank_ack_and_stays_closed_until_final_release
+lifecycle-execution-claim/LifecycleExecutionClaim|kernel-ps|multitask::current_identity::execution::tests::user_identity_requires_each_abi_handle_and_pid_qualifier_before_claim
+lifecycle-execution-claim/LifecycleExecutionClaim|kernel-ps|multitask::current_identity::execution::banks::tests::incoming_and_outgoing_identity_cannot_reset_until_exact_rsp_release
+lifecycle-execution-claim/LifecycleExecutionClaim|kernel-ps|multitask::current_identity::execution::banks::tests::same_task_refresh_and_replaced_selection_never_release_current_identity
+lifecycle-execution-claim/LifecycleExecutionClaim|kernel-ps|multitask::current_identity::execution::banks::tests::desired_stop_denies_new_admission_but_cannot_spend_captured_current_or_outgoing
+lifecycle-execution-claim/LifecycleExecutionClaim|kernel-ps|multitask::scheduler::stack_resources::lifecycle_tests::initial_execution_and_physical_pins_refuse_every_constructor_phase_independently_before_bank_effects
+lifecycle-execution-claim/LifecycleExecutionClaim|kernel-ps|multitask::scheduler::stack_resources::lifecycle_tests::initial_execution_and_physical_pins_refuse_writer_and_close_separately_without_spending_next_owner
+lifecycle-execution-claim/LifecycleExecutionClaim|kernel-ps|multitask::scheduler::stack_resources::lifecycle_tests::lifecycle_stop_and_resume_gate_real_local_cas_without_directory_and_preserve_membership
+lifecycle-execution-claim/LifecycleExecutionClaim|kernel-ps|multitask::scheduler::stack_resources::lifecycle_tests::direct_handoff_refusal_preserves_exact_owner_and_failed_resource_admission_releases_permit
+lifecycle-execution-claim/LifecycleExecutionClaim|kernel-ps|multitask::scheduler::stack_resources::lifecycle_tests::claimed_lifecycle_excludes_peer_writer_even_before_stack_selection_is_parked
+mm-activation-close/MmActivationClose|kernel-mm|memory::address_space::execution_lifetime::activation_tests::activation_refuses_close_without_partial_sealing_until_last_grant
+mm-activation-close/MmActivationClose|kernel-mm|memory::address_space::execution_lifetime::activation_tests::concurrent_activation_and_close_have_one_admission_winner
+mm-activation-close/MmActivationClose|kernel-mm|memory::address_space::execution_lifetime::activation_tests::owner_drop_retains_activation_backing_and_hot_release_only_enqueues
+mm-activation-close/MmActivationClose|kernel-mm|memory::address_space::execution_lifetime::activation_tests::activation_saturation_and_unwind_preserve_exact_existing_custody
+mm-activation-close/MmActivationClose|kernel-mm|memory::address_space::execution_lifetime::activation_tests::closed_activation_gate_refuses_even_before_physical_close_publication
+mm-activation-close/MmActivationClose|kernel-ps|multitask::scheduler::stack_resources::context::activation_tests::local_and_direct_mm_grant_block_real_staging_through_publication_until_rsp_ack
+mm-activation-close/MmActivationClose|kernel-ps|multitask::scheduler::stack_resources::context::activation_tests::architecture_only_capture_blocks_mm_close_without_a_fresh_runqueue_claim
+mm-activation-close/MmActivationClose|kernel-ps|multitask::scheduler::stack_resources::context::activation_tests::failed_cas_releases_provisional_mm_grant_without_committing_owner_or_membership
+mm-activation-close/MmActivationClose|kernel-ps|multitask::scheduler::stack_resources::context::activation_tests::republished_owner_cannot_spend_same_uid_mm_grant_and_poison_keeps_close_excluded
+mm-activation-close/MmActivationClose|kernel-ps|multitask::scheduler::stack_resources::context::activation_tests::replaced_uid_cannot_spend_unchanged_owner_and_mm_activation_identity
+mm-activation-close/MmActivationClose|kernel-ps|multitask::scheduler::stack_resources::context::activation_tests::staged_exec_activation_spans_direct_hardware_receipt_and_cpu_return_completion
+cpu-dispatch-preemption/CpuDispatchPreemption|nucleus-core|util::lockdep::preemption::dispatch::tests::independent_dispatch_unit_is_unique_and_refusal_cannot_release_its_owner
+cpu-dispatch-preemption/CpuDispatchPreemption|nucleus-core|util::lockdep::preemption::dispatch::tests::switched_dispatch_cannot_restore_outgoing_irq_flags
+cpu-dispatch-preemption/CpuDispatchPreemption|nucleus-core|util::lockdep::preemption::dispatch::tests::scoped_unwind_releases_one_unit_and_duplicate_release_refuses
+cpu-dispatch-preemption/CpuDispatchPreemption|nucleus-core|util::lockdep::preemption::dispatch::tests::concurrent_dispatch_admission_has_one_non_lock_preemption_owner
+cpu-dispatch-preemption/CpuDispatchPreemption|nucleus-core|util::lockdep::preemption::dispatch::tests::effective_preemption_counts_dispatch_without_inventing_a_raw_guard
+cpu-dispatch-preemption/CpuDispatchPreemption|kernel-ps|multitask::cpu_local::dispatch_turn::preemption_tests::independent_preemption_stays_owned_across_directory_wait_not_after_raw_acquire
+cpu-dispatch-preemption/CpuDispatchPreemption|kernel-ps|multitask::cpu_local::dispatch_turn::preemption_tests::completion_keeps_preemption_until_rsp_and_duplicate_cannot_spend_next_turn
+cpu-dispatch-preemption/CpuDispatchPreemption|kernel-ps|multitask::cpu_local::dispatch_turn::preemption_tests::abandoned_completion_poison_preserves_published_current_and_releases_only_its_scope
+cpu-dispatch-preemption/CpuDispatchPreemption|kernel-ps|multitask::cpu_local::dispatch_turn::preemption_tests::fixture_reset_acknowledges_parked_scope_rather_than_erasing_its_ownership
+exec-address-space-transaction/ExecAddressSpaceTransaction|kernel-ps|multitask::scheduler::stack_resources::context::mm_tests::staged_mm_closes_old_selection_but_cpu_bank_retains_old_root_until_context_release
+exec-address-space-transaction/ExecAddressSpaceTransaction|kernel-ps|multitask::scheduler::stack_resources::context::mm_tests::exec_receipt_moves_mm_generation_after_root_publication_and_before_old_state_release
+exec-address-space-transaction/ExecAddressSpaceTransaction|kernel-ps|multitask::scheduler::stack_resources::frame_access::tests::exec_writer_requires_exact_quiesced_identity_and_drained_readers
+exec-address-space-transaction/ExecAddressSpaceTransaction|kernel-ps|multitask::scheduler::stack_resources::frame_access::tests::exec_revokes_old_frame_epoch_before_bytes_and_keeps_readers_out_through_publication
+scheduler-cpu-ownership/SchedulerCpuOwnership|kernel-ps|multitask::scheduler::runqueue::simd_tls::tests::simd_binding_requires_explicit_terminal_release_before_uid_reuse
+scheduler-cpu-ownership/SchedulerCpuOwnership|kernel-ps|multitask::scheduler::runqueue::simd_tls::tests::only_restore_may_use_prepared_custody_and_outgoing_is_never_current
+scheduler-cpu-ownership/SchedulerCpuOwnership|kernel-ps|multitask::scheduler::runqueue::simd_tls::tests::exclusive_token_refuses_overlap_before_any_raw_image_is_borrowed
+scheduler-cpu-ownership/SchedulerCpuOwnership|kernel-ps|multitask::scheduler::runqueue::simd_tls::tests::exclusive_simd_guard_survives_refusal_and_unwind_without_leaking_access
+scheduler-cpu-ownership/SchedulerCpuOwnership|kernel-ps|multitask::scheduler::runqueue::simd_tls::tests::remote_simd_access_never_aliases_a_live_mutable_image
+scheduler-cpu-ownership/SchedulerCpuOwnership|kernel-ps|multitask::scheduler::stack_resources::cpu_leases::tests::simd_replacement_requires_exclusive_current_or_terminal_custody
+scheduler-cpu-ownership/SchedulerCpuOwnership|kernel-ps|multitask::scheduler::stack_resources::context::tests::current_scalar_snapshot_requires_joined_descriptor_and_current_custody
+exec-address-space-transaction/ExecAddressSpaceTransaction|kernel-ps|multitask::scheduler::stack_resources::context::tests::exec_patch_requires_exact_identity_and_preserves_non_exec_fields
+exec-address-space-transaction/ExecAddressSpaceTransaction|kernel-ps|multitask::scheduler::stack_resources::context::tests::exec_cannot_use_a_process_label_to_bypass_the_task_binding
+exec-address-space-transaction/ExecAddressSpaceTransaction|kernel-ps|multitask::scheduler::stack_resources::context::tests::concurrent_readers_observe_complete_exec_metadata_without_catalog_borrows
+cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::scheduler::stack_resources::task_start::tests::running_entry_requires_current_custody_and_exact_complete_identity
+cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::scheduler::stack_resources::task_start::tests::execution_pin_blocks_descriptor_clear_and_recycled_identity
+cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::scheduler::stack_resources::task_start::tests::same_identity_exec_changes_entry_without_spending_a_reference
+cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::scheduler::stack_resources::task_start::tests::live_descriptor_and_allocation_binding_cannot_be_rebound_without_reset
+cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::scheduler::stack_resources::task_start::tests::descriptor_identity_is_immutable_even_before_frame_binding
+cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::scheduler::stack_resources::task_start::tests::concurrent_entry_refresh_never_changes_the_monotonic_task_binding
+exec-address-space-transaction/ExecAddressSpaceTransaction|kernel-ps|multitask::scheduler::tests::exec_cannot_rebind_a_live_thread_to_its_process_identity
+cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::scheduler::stack_resources::cpu_leases::tests::claim_to_assembly_commit_retains_both_allocations
+cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::scheduler::stack_resources::cpu_leases::tests::replaced_selection_releases_only_its_prepared_reference
+cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::scheduler::stack_resources::cpu_leases::tests::retained_current_refresh_never_releases_its_final_reference
+cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::scheduler::stack_resources::cpu_leases::tests::foreign_selection_cannot_replace_current_custody
+cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::scheduler::stack_resources::cpu_leases::tests::publication_and_remote_close_cannot_free_the_outgoing_rsp_early
+cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::scheduler::stack_resources::tests::allocation_pin_prevents_reset_release_and_identity_reuse
+cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::scheduler::stack_resources::tests::exact_geometry_and_owned_canary_do_not_follow_foreign_publications
+cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::scheduler::stack_resources::tests::concurrent_readers_keep_allocation_until_the_last_pin_is_released
+cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::scheduler::stack_resources::tests::closing_cannot_be_undone_by_metadata_republication
 cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::scheduler::smp::tests::remote_retirement_waits_only_for_another_cpus_running_slot
+atomic-process-activation-batch/AtomicProcessActivationBatch|kernel-ps|multitask::scheduler::activation::publication::tests::actual_activation_holds_original_frame_and_binding_through_callback_before_queue_and_ack
+cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::scheduler::activation::publication::tests::actual_terminal_during_callback_keeps_hidden_original_retired_member_and_wakes_only_peer
+frame-reader-claim/FrameReaderClaim|kernel-ps|multitask::scheduler::activation::publication::tests::actual_callback_unwind_leaves_all_suspended_and_releases_frame_loans_for_exact_retry
+frame-reader-claim/FrameReaderClaim|kernel-ps|multitask::scheduler::activation::publication::tests::actual_invalid_suspended_frame_panics_before_consuming_authority_without_releasing_suspension
+atomic-process-activation-batch/AtomicProcessActivationBatch|kernel-ps|multitask::scheduler::activation::publication::tests::actual_activation_exact_capacity_commits_all_first_turn_records_without_overflow_or_replay
+atomic-process-activation-batch/AtomicProcessActivationBatch|kernel-ps|multitask::scheduler::activation::publication::tests::actual_priority_saturation_degrades_to_original_spawn_fifo_not_atomic_count_overflow
+affinity-claim-admission/AffinityClaimAdmission|kernel-ps|multitask::scheduler::activation::publication::tests::actual_remote_activation_publishes_original_mailbox_before_complete_ack_and_bound_frame
+atomic-process-activation-batch/AtomicProcessActivationBatch|kernel-ps|multitask::scheduler::activation::publication::tests::actual_activation_preserves_strict_class_sleeper_floor_without_priority_donation_shortcut
+frame-reader-claim/FrameReaderClaim|kernel-ps|multitask::scheduler::activation::publication::tests::actual_activation_refuses_copied_current_slot_without_original_physical_cpu_bank_before_callback
+atomic-process-activation-batch/AtomicProcessActivationBatch|kernel-ps|multitask::scheduler::activation::publication::tests::actual_single_activation_recomputes_same_band_floor_after_wake_for_original_spawn_donation
+atomic-process-activation-batch/AtomicProcessActivationBatch|kernel-ps|multitask::scheduler::activation::publication::tests::actual_stop_gates_remain_ineligible_after_owned_activation_without_queue_or_priority_records
+atomic-process-activation-batch/AtomicProcessActivationBatch|kernel-ps|multitask::scheduler::activation::tests::exact_activation_capture_denies_bounds_uid_alias_duplicate_replay_and_unsuspended_binding_before_callback
+atomic-process-activation-batch/AtomicProcessActivationBatch|kernel-ps|multitask::scheduler::activation::tests::shared_commit_retains_every_binding_and_suspend_through_authority_callback_and_one_release
+atomic-process-activation-batch/AtomicProcessActivationBatch|kernel-ps|multitask::scheduler::activation::tests::terminal_stop_and_hidden_metadata_during_callback_never_reawaken_or_consume_next_binding
+atomic-process-activation-batch/AtomicProcessActivationBatch|kernel-ps|multitask::scheduler::activation::tests::callback_unwind_before_task_effects_keeps_targets_suspended_and_releases_only_captured_refs
+atomic-process-activation-batch/AtomicProcessActivationBatch|kernel-ps|multitask::scheduler::activation::tests::concurrent_task_affinity_refuses_under_same_identity_seal_without_spending_mask_epoch_or_callback
+atomic-process-activation-batch/AtomicProcessActivationBatch|kernel-ps|multitask::scheduler::activation::tests::hint_capacity_duplicate_and_counter_exhaustion_refuse_before_spending_queue_or_remaining
+atomic-process-activation-batch/AtomicProcessActivationBatch|kernel-ps|multitask::scheduler::activation::tests::competing_disjoint_cohorts_cannot_overflow_one_cpu_priority_queue_after_same_empty_observation
+task-retirement-cleanup-owner/TaskRetirementCleanupOwner|kernel-ps|multitask::scheduler::retirement_cleanup::reuse::tests::sealed_terminal_row_denies_foreign_unowned_reset_and_deferred_producer_until_complete_ack
+task-retirement-cleanup-owner/TaskRetirementCleanupOwner|kernel-ps|multitask::scheduler::retirement_cleanup::reuse::tests::each_terminal_custody_independently_refuses_seal_without_spending_nonce
+task-retirement-cleanup-owner/TaskRetirementCleanupOwner|kernel-ps|multitask::scheduler::retirement_cleanup::reuse::tests::abandoned_effects_keep_terminal_row_quarantined_and_nonce_exhaustion_never_wraps
+task-retirement-cleanup-owner/TaskRetirementCleanupOwner|kernel-ps|multitask::scheduler::retirement_cleanup::reuse::tests::before_effect_rollback_is_exact_and_old_seal_cannot_release_next_producer_nonce
+scheduler-admission/SchedulerAdmission|kernel-ps|multitask::scheduler::stack_resources::reuse::tests::detached_metadata_prefix_keeps_new_creator_closed_until_exact_reuse_ack_and_clears_hidden_binding
+scheduler-admission/SchedulerAdmission|kernel-ps|multitask::scheduler::stack_resources::reuse::tests::foreign_pristine_or_old_uid_cannot_close_live_slot_and_epoch_exhaustion_has_no_partial_gate
+scheduler-admission/SchedulerAdmission|kernel-ps|multitask::scheduler::stack_resources::reuse::tests::unowned_storage_detach_and_early_ack_cannot_spend_owned_reclaim_or_reopen_constructor
+scheduler-admission/SchedulerAdmission|kernel-ps|multitask::scheduler::stack_resources::reuse::tests::abandoned_detached_reclaim_quarantines_even_empty_storage_and_next_nonce_cannot_be_spent_by_old_key
+scheduler-admission/SchedulerAdmission|kernel-ps|multitask::scheduler::stack_resources::reuse::tests::close_refuses_all_constructor_phases_without_partial_close_or_spending_creator
+scheduler-admission/SchedulerAdmission|kernel-ps|multitask::scheduler::stack_resources::reuse::tests::pristine_descriptor_absence_cannot_discard_unowned_close_or_reader_custody_on_reservation
+task-retirement-cleanup-owner/TaskRetirementCleanupOwner|kernel-ps|multitask::scheduler::retirement_cleanup::tests::cleanup_requires_exact_claim_and_ack_before_slot_reset_or_reuse
+task-retirement-cleanup-owner/TaskRetirementCleanupOwner|kernel-ps|multitask::scheduler::retirement_cleanup::tests::concurrent_consumers_claim_exactly_once_without_directory_serialization
+task-retirement-cleanup-owner/TaskRetirementCleanupOwner|kernel-ps|multitask::scheduler::retirement_cleanup::tests::claimed_cleanup_cannot_be_reset_before_ack
+task-retirement-cleanup-owner/TaskRetirementCleanupOwner|kernel-ps|multitask::scheduler::retirement_cleanup::tests::pending_cleanup_cannot_be_reset_before_claim
+task-retirement-cleanup-owner/TaskRetirementCleanupOwner|kernel-ps|multitask::scheduler::retirement_cleanup::tests::acknowledged_cleanup_must_be_reset_before_new_publication
 cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-hal|arch::tlb_shootdown::tests::reclaim_requires_every_target_to_acknowledge_the_exact_generation
 robust-futex-owner-death/RobustFutexOwnerDeath|kernel-mm|memory::address_space::atomic_user::tests::atomic_user_u32_requires_aligned_complete_user_word
 robust-futex-owner-death/RobustFutexOwnerDeath|kernel-compat|user::syscall::linux::service_ops::futex_thread::tests::robust_owner_death_preserves_waiters_and_rejects_foreign_owner
@@ -1465,17 +1794,66 @@ scheduler-cpu-distribution/SchedulerCpuDistribution|kernel-ps|multitask::schedul
 scheduler-cpu-distribution/SchedulerCpuDistribution|kernel-ps|multitask::irq::tests::syscall_tail_consumes_every_deferred_or_handoff_request_exactly_once
 scheduler-cpu-distribution/SchedulerCpuDistribution|kernel-ps|multitask::scheduler::runtime_profile::tests::runtime_profile_distinguishes_switches_roots_and_migrations
 scheduler-cpu-distribution/SchedulerCpuDistribution|kernel-ps|multitask::scheduler::runtime_profile::tests::runtime_profile_lock_totals_and_maxima_are_destructive
+scheduler-local-authority/SchedulerLocalAuthority|kernel-ps|multitask::scheduler::local_dispatch::tests::eligible_user_reservation_preempts_the_ordinary_system_candidate
+scheduler-local-authority/SchedulerLocalAuthority|kernel-ps|multitask::scheduler::local_dispatch::tests::borrowed_context_selects_published_owner_stamp_or_fails_closed
+scheduler-local-authority/SchedulerLocalAuthority|kernel-ps|multitask::scheduler::local_dispatch::tests::local_affinity_admits_only_the_intersection_and_a_representable_cpu
+scheduler-local-authority/SchedulerLocalAuthority|rustos-scheduler-frame-gate|tests::only_stable_negative_publications_can_be_skipped
+scheduler-local-authority/SchedulerLocalAuthority|rustos-scheduler-frame-gate|tests::budget_denial_requires_exact_unreplaced_reply_custody
+scheduler-local-authority/SchedulerLocalAuthority|rustos-scheduler-frame-gate|tests::selected_frame_must_match_both_owner_and_saved_stack
+scheduler-local-authority/SchedulerLocalAuthority|kernel-ps|multitask::scheduler::local_dispatch::tests::final_local_frame_rechecks_exact_generation_rsp_and_validated_payload
+scheduler-local-authority/SchedulerLocalAuthority|kernel-ps|multitask::scheduler::local_dispatch::tests::empty_fair_scan_claims_only_the_exact_local_idle_generation
+scheduler-local-authority/SchedulerLocalAuthority|kernel-ps|multitask::scheduler::local_dispatch::tests::overdue_system_prefers_oldest_age_then_vruntime_without_reordering_ties
+scheduler-local-authority/SchedulerLocalAuthority|kernel-ps|multitask::scheduler::local_dispatch::tests::deferred_catalog_fair_scan_runs_only_for_incomplete_local_observations
+scheduler-local-authority/SchedulerLocalAuthority|kernel-ps|multitask::scheduler::local_dispatch::fair_retry::tests::torn_fair_observations_retry_without_authorizing_a_partial_candidate
+scheduler-local-authority/SchedulerLocalAuthority|kernel-ps|multitask::scheduler::local_dispatch::fair_retry::tests::incomplete_early_policy_never_means_no_due_peer
+scheduler-local-authority/SchedulerLocalAuthority|kernel-ps|multitask::scheduler::local_dispatch::hint_priority::tests::incomplete_system_presence_cannot_release_a_user_hint
+scheduler-local-authority/SchedulerLocalAuthority|kernel-ps|multitask::scheduler::local_dispatch::hint_priority::tests::latency_class_requires_a_stable_user_publication
+scheduler-local-authority/SchedulerLocalAuthority|kernel-ps|multitask::scheduler::dispatch_policy::tests::latency_hint_does_not_transfer_user_budget_to_a_recycled_slot
+scheduler-local-authority/SchedulerLocalAuthority|kernel-ps|multitask::scheduler::frame_publication::tests::retained_current_frame_requires_exact_local_and_execution_generation
+scheduler-local-authority/SchedulerLocalAuthority|kernel-ps|multitask::scheduler::local_dispatch::current_frame::tests::retained_current_frame_rejects_foreign_cpu_changed_rsp_and_republished_owner
+scheduler-local-authority/SchedulerLocalAuthority|kernel-ps|multitask::scheduler::local_dispatch::tests::complete_yield_prefers_an_eligible_peer_before_reusing_current
+scheduler-local-authority/SchedulerLocalAuthority|kernel-ps|multitask::scheduler::local_dispatch::tests::unstable_epoch_rejects_before_candidate_scan
+scheduler-local-authority/SchedulerLocalAuthority|kernel-ps|multitask::scheduler::local_dispatch::tests::fair_shadow_uses_vruntime_then_requested_tie_break
+scheduler-local-authority/SchedulerLocalAuthority|kernel-ps|multitask::scheduler::local_dispatch::tests::three_candidate_fair_order_is_permutation_invariant
+scheduler-local-authority/SchedulerLocalAuthority|kernel-ps|multitask::scheduler::runqueue::tests::activation_token_cannot_claim_a_republished_local_generation
+scheduler-local-authority/SchedulerLocalAuthority|kernel-ps|multitask::scheduler::activation_batch_tests::spawn_handoff_is_fifo_deduplicated_and_precedes_ipc_handoff
+scheduler-local-authority/SchedulerLocalAuthority|kernel-ps|multitask::scheduler::handoffs::published_identity_tests::first_turn_cannot_steal_identity_after_a_slot_reuse
+scheduler-local-authority/SchedulerLocalAuthority|kernel-ps|multitask::scheduler::sync_handoff::tests::consumed_generic_fifo_binds_only_the_exact_local_owner
+scheduler-local-authority/SchedulerLocalAuthority|kernel-ps|multitask::scheduler::runqueue::tests::local_dispatch_claim_rejects_republished_generation_without_consuming_queue
+scheduler-local-authority/SchedulerLocalAuthority|kernel-ps|multitask::scheduler::runqueue::tests::local_claim_losing_lock_free_owner_update_leaves_queue_and_fallback_custody_intact
+scheduler-local-authority/SchedulerLocalAuthority|kernel-ps|multitask::scheduler::runqueue_policy::tests::a_failed_current_claim_never_resolves_back_to_the_current_slot
+scheduler-local-authority/SchedulerLocalAuthority|kernel-ps|multitask::scheduler::scheduling_context::tests::abandoned_dispatch_preparation_only_matures_due_refills
+scheduler-local-authority/SchedulerLocalAuthority|kernel-ps|multitask::scheduler::donation_ledger::tests::ordinary_nested_calls_borrow_one_root_context_without_system_promotion
 scheduler-active-balance/SchedulerActiveBalance|kernel-ps|multitask::scheduler::runqueue_policy::tests::active_balance_is_due_first_then_every_eighth_loaded_opportunity
 scheduler-active-balance/SchedulerActiveBalance|kernel-ps|multitask::scheduler::smp::tests::source_migration_requires_exact_runnable_local_owner_and_target_affinity
-scheduler-thread-demotion/SchedulerThreadDemotion|kernel-ps|multitask::scheduler::tests::self_demotion_removes_base_system_class_and_caps_fair_weight
+scheduler-thread-demotion/SchedulerThreadDemotion|kernel-ps|multitask::scheduler::current_class::tests::actual_current_self_demotion_caps_base_weight_without_revoking_original_reply_class
 scheduler-thread-demotion/SchedulerThreadDemotion|vfsd|tests::ui_bootstrap_demotion_requires_successful_terminal_snapshot_reply
 scheduler-thread-demotion/SchedulerThreadDemotion|loaderd|tests::ui_bootstrap_demotion_is_custodied_until_terminal_reply
-scheduler-thread-demotion/SchedulerThreadDemotion|uiserver|sys::tests::only_bootstrap_gpu_role_retains_inherited_boot_class
+scheduler-thread-demotion/SchedulerThreadDemotion|uiserver|sys::tests::only_bounded_bootstrap_roles_retain_inherited_boot_class
 scheduling-context-budget/SchedulingContextBudget|kernel-ps|multitask::scheduler::tests::ipc_admission_exports_only_the_live_bound_scheduling_context
 scheduling-context-budget/SchedulingContextBudget|kernel-ps|multitask::scheduler::tests::nested_passive_server_runtime_is_billed_to_the_root_caller_context
 scheduling-context-budget/SchedulingContextBudget|kernel-ps|multitask::scheduler::tests::deadline_domains_require_per_cpu_utilization_headroom
+scheduling-context-budget/SchedulingContextBudget|kernel-ps|multitask::scheduler::domain_admission::tests::captured_domain_selection_excludes_replacement_before_context_and_duplicate_grants_drain_once
+scheduling-context-budget/SchedulingContextBudget|kernel-ps|multitask::scheduler::domain_admission::tests::live_context_member_blocks_policy_reuse_after_capture_drop_and_close_until_exact_release
+scheduling-context-budget/SchedulingContextBudget|kernel-ps|multitask::scheduler::domain_admission::tests::context_admission_refuses_foreign_domain_generation_policy_and_identity_without_spending_members
+scheduling-context-budget/SchedulingContextBudget|kernel-ps|multitask::scheduler::domain_admission::tests::deadline_quota_sums_exact_overlapping_cpu_masks_and_rounds_up_without_partial_replacement
+scheduling-context-budget/SchedulingContextBudget|kernel-ps|multitask::scheduler::domain_admission::tests::competing_deadline_domains_cannot_both_spend_one_cpu_utilization_capacity
+scheduling-context-budget/SchedulingContextBudget|kernel-ps|multitask::scheduler::domain_admission::tests::exhausted_domain_generation_refuses_before_descriptor_publication_and_never_wraps
+scheduling-context-budget/SchedulingContextBudget|kernel-ps|multitask::scheduler::domain_admission::tests::full_registry_refuses_new_domain_without_spending_existing_capture_or_policy_generation
 scheduling-context-budget/SchedulingContextBudget|kernel-ps|multitask::scheduler::tests::production_user_slot_publication_rejects_an_unbudgeted_context
 scheduling-context-budget/SchedulingContextBudget|kernel-ps|multitask::scheduler::scheduling_context::tests::timeout_fault_is_one_shot_observable_and_never_retried
+scheduling-context-budget/SchedulingContextBudget|kernel-ps|multitask::scheduler::scheduling_context::tests::immutable_budget_refill_cannot_reverse_an_earlier_and_later_admission
+scheduling-context-budget/SchedulingContextBudget|kernel-ps|multitask::scheduler::scheduling_context::tests::published_budget_stamp_rejects_a_cpu_outside_its_live_policy_mask
+scheduling-context-budget/SchedulingContextBudget|kernel-ps|multitask::scheduler::execution_interval::tests::return_cancels_unused_grant_and_notifies_final_closing_funder
+scheduling-context-budget/SchedulingContextBudget|kernel-ps|multitask::scheduler::execution_interval::tests::cancellation_cannot_settle_active_funding_or_clear_a_foreign_cpu_grant
+scheduling-context-budget/SchedulingContextBudget|kernel-ps|multitask::scheduler::execution_interval::tests::changed_return_requires_exact_running_identity_generation_and_active_interval
+scheduling-context-budget/SchedulingContextBudget|kernel-ps|multitask::scheduler::execution_interval::tests::bootstrap_running_work_has_an_interval_before_it_becomes_idle
+scheduling-context-budget/SchedulingContextBudget|kernel-ps|multitask::scheduler::execution_interval::tests::captured_funding_survives_close_and_blocks_context_and_domain_reuse
+scheduling-context-budget/SchedulingContextBudget|kernel-ps|multitask::scheduler::execution_interval::tests::prepared_grant_keeps_its_funder_after_donation_publication_changes
+scheduling-context-budget/SchedulingContextBudget|kernel-ps|multitask::scheduler::execution_interval::tests::pinned_exhaustion_keeps_the_captured_reply_not_a_replacement_donation
+scheduling-context-budget/SchedulingContextBudget|kernel-ps|multitask::scheduler::execution_interval::tests::a_cpu_interval_is_consumed_once_and_uses_only_its_own_clock_domain
+scheduling-context-budget/SchedulingContextBudget|kernel-ps|multitask::scheduler::execution_interval::tests::grant_pin_cannot_authorize_credit_drained_after_preparation
+scheduling-context-budget/SchedulingContextBudget|kernel-ps|multitask::scheduler::execution_interval::tests::funding_pin_rejects_wrong_owner_cpu_and_identity_without_leaking_custody
 scheduling-context-budget/SchedulingContextBudget|kernel-ps|multitask::scheduler::donation_ledger::tests::ordinary_nested_calls_borrow_one_root_context_without_system_promotion
 scheduling-context-budget/SchedulingContextBudget|kernel-ps|multitask::scheduler::donation_ledger::tests::multithreaded_server_charge_tokens_restore_the_previous_live_reply
 scheduling-context-budget/SchedulingContextBudget|kernel-compat|user::syscall::linux::service_ops::ipc_helpers::tests::direct_bootstrap_consumes_exact_rootd_scheduling_authority_before_spawn
@@ -1485,15 +1863,18 @@ scheduling-context-budget/SchedulingContextBudget|rootd|tests::scheduling_policy
 ipc-fast-handoff/IpcFastHandoff|kernel-ps|multitask::scheduler::runqueue::tests::direct_handoff_bypasses_the_fair_runqueue_and_is_cpu_exact
 ipc-fast-handoff/IpcFastHandoff|kernel-ipc-runtime|ipc::tests::fast_call_tests::fast_call_uses_fixed_frame_and_exact_receiver_caller_identities
 ipc-fast-handoff/IpcFastHandoff|kernel-ipc-runtime|ipc::tests::fast_call_tests::fast_calls_reuse_caller_reply_slot_without_reusing_authority
+ipc-fast-handoff/IpcFastHandoff|kernel-ipc-runtime|ipc::tests::fast_call_tests::alternating_queued_and_fast_replies_preserve_exact_caller_custody
 ipc-fast-handoff/IpcFastHandoff|kernel-ipc-runtime|ipc::tests::fast_call_tests::fast_call_rollback_restores_exact_front_waiter_and_custody
 ipc-fast-handoff/IpcFastHandoff|kernel-ps|multitask::scheduler::tests::fast_ipc_commit_requires_exact_typed_waits_and_mutates_both_peers_once
+ipc-fast-handoff/IpcFastHandoff|kernel-ps|multitask::scheduler::runqueue::tests::budget_refusal_after_consuming_a_direct_handoff_retains_claimable_custody
 ipc-fast-handoff/IpcFastHandoff|syscalld|fast_offload::tests::compact_id_wire_is_fixed_frame_bounded_sender_exact_and_lossless
 synchronous-ipc-handoff/SynchronousIpcHandoff|kernel-ps|multitask::scheduler::synchronous_handoff_tests::synchronous_ipc_handoff_is_fifo_deduplicated_and_fairness_bounded
 synchronous-ipc-handoff/SynchronousIpcHandoff|kernel-ps|multitask::scheduler::synchronous_handoff_tests::reply_wake_token_mint_requires_exact_task_and_dispatch_custody
-synchronous-ipc-handoff/SynchronousIpcHandoff|kernel-ps|multitask::scheduler::synchronous_handoff_tests::terminal_reply_releases_donation_and_wakes_exact_caller_in_one_scheduler_operation
+synchronous-ipc-handoff/SynchronousIpcHandoff|kernel-ps|multitask::scheduler::donation_publication::tests::actual_normal_reply_withdraws_only_original_reply_namespace_before_wake_or_refusal
 synchronous-ipc-handoff/SynchronousIpcHandoff|kernel-ps|multitask::scheduler::sync_handoff::tests::reply_wake_token_rejects_stale_owner_generation_migration_and_retirement
 synchronous-ipc-handoff/SynchronousIpcHandoff|kernel-ps|multitask::scheduler::sync_handoff::tests::reply_generation_refresh_replaces_in_place_and_stale_generation_loses_urgency
 synchronous-ipc-handoff/SynchronousIpcHandoff|kernel-ps|multitask::scheduler::sync_handoff::tests::generic_handoff_cannot_downgrade_reply_generation_custody
+synchronous-ipc-handoff/SynchronousIpcHandoff|kernel-ps|multitask::scheduler::sync_handoff::tests::fresh_direct_owner_replaces_only_a_stale_reply_token_at_the_same_fifo_position
 synchronous-ipc-handoff/SynchronousIpcHandoff|kernel-ps|multitask::scheduler::sync_handoff::tests::stale_reply_enqueue_has_no_scheduler_or_global_fallback
 synchronous-ipc-handoff/SynchronousIpcHandoff|kernel-ps|multitask::scheduler::sync_handoff::tests::reply_enqueue_rechecks_owner_after_the_exact_target_queue_mutation
 synchronous-ipc-handoff/SynchronousIpcHandoff|kernel-ps|multitask::scheduler::runqueue::tests::direct_handoff_predicate_rejects_running_and_migrating_even_if_runnable
@@ -1745,6 +2126,307 @@ post-init-bootstrap-barrier/PostInitBootstrapBarrier|initd|boot_order::tests::ru
 post-init-bootstrap-barrier/PostInitBootstrapBarrier|initd|tests::endpoint_barrier_wait_is_exact_pid_bound_and_bounded
 bootstrap-activation-handoff/BootstrapActivationHandoff|kernel-ps|multitask::scheduler::activation_batch_tests::spawn_handoff_is_fifo_deduplicated_and_precedes_ipc_handoff
 bootstrap-activation-handoff/BootstrapActivationHandoff|kernel-ps|multitask::scheduler::tests::overdue_system_continuation_precedes_a_fresh_latency_handoff
+atomic-process-activation-batch/AtomicProcessActivationBatch|kernel-ps|multitask::current_identity::cohort::tests::cohort_admission_is_closed_through_every_partial_publication_and_one_release_opens_all
+atomic-process-activation-batch/AtomicProcessActivationBatch|kernel-ps|multitask::current_identity::cohort::tests::complete_release_opens_every_member_before_slow_per_slot_unseal_without_a_global_claim_lock
+lifecycle-execution-claim/LifecycleExecutionClaim|kernel-ps|multitask::current_identity::cohort::tests::failed_member_and_duplicate_preflight_roll_back_only_exact_binding_pins_and_epoch_never_replays
+lifecycle-execution-claim/LifecycleExecutionClaim|kernel-ps|multitask::current_identity::cohort::tests::callback_failure_before_effects_can_abort_but_partial_effects_quarantine_binding_and_admission
+affinity-claim-admission/AffinityClaimAdmission|kernel-ps|multitask::scheduler::stack_resources::lifecycle_tests::owned_cohort_gate_refuses_real_local_and_direct_cas_until_commit_preserving_exact_custody
+lifecycle-execution-claim/LifecycleExecutionClaim|kernel-ps|multitask::scheduler::stack_resources::lifecycle_tests::cold_binding_pin_refuses_active_writer_closing_and_foreign_resource_uid_before_any_seal
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::process_placement::tests::creation_grant_freezes_process_mask_and_registers_child_before_writer_can_capture_membership
+atomic-process-activation-batch/AtomicProcessActivationBatch|kernel-ps|multitask::process_placement::tests::committed_query_stays_old_during_partial_masks_and_joins_open_only_after_published_unseal
+atomic-process-activation-batch/AtomicProcessActivationBatch|kernel-ps|multitask::process_placement::tests::activation_credential_cannot_publish_process_mask_or_spend_pending_affinity_transaction
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::process_placement::tests::process_membership_and_mask_survive_same_uid_exec_abi_change_without_old_abi_creation_permission
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::process_placement::tests::process_and_creator_generations_abi_terminal_and_duplicate_members_refuse_without_spending_join
+affinity-claim-admission/AffinityClaimAdmission|kernel-ps|multitask::process_placement::tests::exhausted_transaction_and_partial_failure_never_reopen_or_alias_next_process_generation
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::process_placement::exec_membership::tests::exec_census_freezes_new_join_root_and_mask_change_before_member_publication_until_exact_finish
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::process_placement::exec_membership::tests::pending_creation_reader_refuses_exec_census_without_spending_epoch_and_drained_child_is_in_snapshot
+cold-exec-intent/ColdExecIntent|kernel-ps|multitask::process_placement::exec_membership::tests::retired_member_removal_preserves_captured_uid_and_seal_while_recycled_slot_is_not_new_member
+cold-exec-intent/ColdExecIntent|kernel-ps|multitask::process_placement::exec_membership::tests::missing_target_foreign_handle_and_exhausted_epoch_refuse_before_partial_exec_gate
+cold-exec-intent/ColdExecIntent|kernel-ps|multitask::process_placement::exec_membership::tests::before_image_drop_releases_only_exact_census_and_old_epoch_cannot_spend_next_owner
+cold-exec-intent/ColdExecIntent|kernel-ps|multitask::process_placement::exec_membership::tests::staged_abandonment_retains_process_census_quarantine_instead_of_reopening_creators
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::process_placement::exec_membership::tests::census_retains_actual_process_object_pin_until_release_outside_leaf_and_cancel_keeps_masks
+lifecycle-execution-claim/LifecycleExecutionClaim|kernel-ps|multitask::scheduler::exec_transaction::tests::census::retired_captured_sibling_with_execution_refs_is_not_quiescent_and_is_never_retired_twice
+cold-exec-intent/ColdExecIntent|kernel-ps|multitask::scheduler::exec_transaction::tests::census::recycled_catalog_uid_cannot_be_retired_by_old_census_and_peer_request_cannot_retire_own_live_caller
+cold-exec-intent/ColdExecIntent|kernel-ps|multitask::scheduler::stack_resources::context::intent_tests::independent_exec_candidate_claim_rechecks_exact_uid_handle_pid_tid_and_mode_before_producer
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::process_placement::terminal::tests::terminal_turn_freezes_root_join_mask_and_competing_vote_before_effects_and_untouched_drop_releases_only_owner
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::process_placement::exit_membership::tests::waiting_seal_closes_new_creation_but_original_join_finishes_and_late_child_is_captured_only_after_final_ack
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::process_placement::exit_membership::tests::cancelled_captured_join_leaves_no_phantom_child_and_waiting_rollback_preserves_live_members
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::process_placement::exit_membership::tests::reserved_exit_committed_detach_retains_exact_negative_through_reuse_until_owned_finish
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::process_placement::exit_membership::tests::waiting_exit_retains_committed_detached_uid_through_binding_clear_and_recycled_slot_without_spending_new_task
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::process_placement::exit_membership::tests::waiting_rollback_prunes_only_committed_detached_tombstones_not_live_or_stopped_attached_members
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::process_placement::exit_membership::tests::waiting_seal_rejects_foreign_target_and_nonce_exhaustion_and_stale_row_record_phase_independently
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::process_placement::exit_membership::tests::captured_join_cannot_register_into_reserved_census_even_if_counter_is_forged_to_look_active
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::process_placement::exit_membership::tests::queued::queued_exit_waits_for_real_join_ack_not_visible_membership_prefix
+cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::process_placement::exit_membership::tests::queued::durable_request_outlives_requester_binding_detach_and_reuse_without_spending_replacement
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::process_placement::exit_membership::tests::queued::duplicate_receipt_keeps_original_reason_and_only_exact_effect_ack_completes
+cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::process_placement::exit_membership::tests::queued::terminal_turn_drains_before_claim_and_seal_publication_does_not_steal_its_ack
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::process_placement::exit_membership::tests::queued::exec_owner_and_process_exec_refusal_preserve_durable_work_until_actual_cancel
+cold-exec-intent/ColdExecIntent|kernel-ps|multitask::process_placement::exit_membership::tests::queued::actual_exec_census_release_precedes_cancel_and_durable_exit_claim_after_pending_exit
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::process_placement::exit_membership::tests::queued::placement_busy_or_poison_never_grants_exit_claim_from_process_marker_alone
+cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::process_placement::exit_membership::tests::queued::abandoned_queued_claim_even_before_effects_returns_process_pin_to_poison_custody
+cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::process_placement::exit_membership::tests::queued::abandoned_queued_effects_preserve_work_pin_and_never_ack_stopped_metadata
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::process_placement::exit_membership::tests::queued::completion_watermark_survives_row_release_but_absence_and_next_unfinished_nonce_do_not_ack
+bootstrap-activation-handoff/BootstrapActivationHandoff|kernel-ps|multitask::scheduler::ordering_publication::tests::actual_original_ordering_preserves_spawn_fifo_and_current_floor_without_funding_transfer
+bootstrap-activation-handoff/BootstrapActivationHandoff|kernel-ps|multitask::scheduler::ordering_publication::tests::actual_latency_and_process_ordering_use_exact_live_original_targets_without_waking
+bootstrap-activation-handoff/BootstrapActivationHandoff|kernel-ps|multitask::scheduler::ordering_publication::tests::actual_missing_current_cannot_supply_latency_floor_and_foreign_uid_cannot_publish
+bootstrap-activation-handoff/BootstrapActivationHandoff|kernel-ps|multitask::scheduler::wake_publication::tests::actual_user_qualified_wake_preserves_kernel_wait_and_wakes_exact_original_user
+bootstrap-activation-handoff/BootstrapActivationHandoff|kernel-ps|multitask::scheduler::activation::publication::tests::actual_single_activation_uses_spawn_fifo_and_rejects_foreign_duplicate_or_retired_members
+bootstrap-activation-handoff/BootstrapActivationHandoff|kernel-ps|multitask::scheduler::activation::publication::tests::actual_over_capacity_activation_refuses_before_callback_with_all_real_members_suspended
+lifecycle-execution-claim/LifecycleExecutionClaim|kernel-ps|multitask::scheduler::current_observation::tests::actual_current_runtime_retains_original_pair_through_close_and_last_snapshot
+lifecycle-execution-claim/LifecycleExecutionClaim|kernel-ps|multitask::scheduler::current_observation::tests::actual_current_tls_requires_same_banks_linux_cell_and_accepted_value
+lifecycle-execution-claim/LifecycleExecutionClaim|kernel-ps|multitask::scheduler::current_observation::tests::actual_target_snapshot_retains_original_uid_and_refuses_foreign_pid_or_closed_lookup
+lifecycle-execution-claim/LifecycleExecutionClaim|kernel-ps|multitask::scheduler::bootstrap::initial_tasks::tests::actual_root_idle_requires_original_initial_current_banks_and_unconsumed_interval
+lifecycle-execution-claim/LifecycleExecutionClaim|kernel-ps|multitask::scheduler::execution_interval::tests::original_current_snapshot_retains_exact_timeout_reply_and_pair_after_shared_exhaustion
+lifecycle-execution-claim/LifecycleExecutionClaim|kernel-ps|multitask::scheduler::execution_interval::tests::prepared_grant_keeps_its_funder_after_donation_publication_changes
+sigchld-notification/SigchldNotification|kernel-ps|multitask::scheduler::linux_thread_state::signals::tests::actual_group_job_control_seals_all_members_and_resumes_before_signal_delivery
+sigchld-notification/SigchldNotification|kernel-ps|multitask::scheduler::linux_thread_state::signals::tests::actual_group_contention_returns_retry_without_signal_or_partial_stop_effects
+sigchld-notification/SigchldNotification|kernel-ps|multitask::scheduler::linux_thread_state::signals::tests::actual_signal_original_recipient_revokes_block_arm_without_consumed_frame_read
+sigchld-notification/SigchldNotification|kernel-ps|multitask::scheduler::linux_thread_state::signals::tests::actual_process_sigchld_prefers_leader_then_transfers_and_qualifies_leaderless_original
+sigchld-notification/SigchldNotification|kernel-ps|multitask::scheduler::linux_thread_state::signals::tests::actual_signal_wrong_pid_generation_and_mask_refuse_or_preserve_exact_wait
+sigchld-notification/SigchldNotification|kernel-ps|multitask::scheduler::linux_thread_state::signals::tests::actual_signal_retained_target_delays_terminal_effect_and_reuse_until_original_drop
+sigchld-notification/SigchldNotification|kernel-ps|multitask::current_identity::cohort::tests::job_control_original_cohort_excludes_dispatch_through_each_gate_and_cannot_spend_affinity
+sigchld-notification/SigchldNotification|kernel-ps|multitask::process_placement::tests::job_control_and_affinity_credentials_cannot_spend_each_others_original_process_turn
+lifecycle-execution-claim/LifecycleExecutionClaim|kernel-ps|multitask::scheduler::current_terminal::tests::actual_current_terminal_keeps_original_mm_uid_and_funding_until_last_effect
+lifecycle-execution-claim/LifecycleExecutionClaim|kernel-ps|multitask::scheduler::current_terminal::tests::actual_current_fault_preserves_first_reason_and_terminal_current_without_fresh_admission
+lifecycle-execution-claim/LifecycleExecutionClaim|kernel-ps|multitask::scheduler::current_terminal::tests::actual_current_terminal_refuses_missing_uid_alias_and_settled_interval
+lifecycle-execution-claim/LifecycleExecutionClaim|kernel-ps|multitask::scheduler::current_terminal::tests::actual_current_terminal_excludes_overlapping_effect_borrow_until_release
+lifecycle-execution-claim/LifecycleExecutionClaim|kernel-ps|multitask::scheduler::current_terminal::tests::actual_target_terminal_transfers_original_binding_and_marks_last_process
+lifecycle-execution-claim/LifecycleExecutionClaim|kernel-ps|multitask::scheduler::current_terminal::tests::actual_group_request_marks_exit_before_original_census_worker_effects
+lifecycle-execution-claim/LifecycleExecutionClaim|kernel-ps|multitask::scheduler::current_terminal::tests::actual_target_terminal_leaves_original_sibling_alive_until_separate_group_request
+lifecycle-execution-claim/LifecycleExecutionClaim|kernel-ps|multitask::scheduler::stack_resources::kernel_executor_tests::kernel_executor_refuses_terminal_and_every_stop_gate_but_retains_real_dispatch_admission
+lifecycle-execution-claim/LifecycleExecutionClaim|kernel-ps|multitask::scheduler::stack_resources::kernel_executor_tests::kernel_executor_is_not_an_ordinary_backing_pin_and_last_scope_release_reopens_exact_stop
+lifecycle-execution-claim/LifecycleExecutionClaim|kernel-ps|multitask::scheduler::stack_resources::kernel_executor_tests::active_kernel_executor_refuses_metadata_withdrawal_unowned_stop_and_qualified_cohort_seal
+lifecycle-execution-claim/LifecycleExecutionClaim|kernel-ps|multitask::scheduler::stack_resources::kernel_executor_tests::kernel_executor_refuses_user_metadata_user_context_foreign_uid_and_unpublished_context_independently
+lifecycle-execution-claim/LifecycleExecutionClaim|kernel-ps|multitask::scheduler::stack_resources::kernel_executor_tests::kernel_executor_refuses_constructor_writer_and_closing_without_spending_a_backing_reference
+lifecycle-execution-claim/LifecycleExecutionClaim|kernel-ps|multitask::scheduler::stack_resources::kernel_executor_tests::exact_kernel_uid_zero_is_executor_authority_not_an_empty_slot_or_user_projection
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::scheduler::stack_resources::reuse::census_tests::actual_terminal_census_refuses_stopped_member_reclaim_and_logical_detach_until_original_turn_release
+cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::scheduler::stack_resources::reuse::census_tests::actual_reclaim_first_refuses_terminal_census_until_original_physical_unregistration
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::scheduler::stack_resources::reuse::census_tests::actual_overlapping_exec_and_terminal_censuses_keep_logical_tombstone_until_both_original_releases
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::scheduler::stack_resources::reuse::census_tests::actual_concurrent_terminal_census_and_reclaim_admission_have_exactly_one_winner
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::scheduler::stack_resources::reuse::census_tests::actual_final_terminal_withdraws_original_stopped_member_donation_without_directory_scan
+cold-exec-intent/ColdExecIntent|kernel-ps|multitask::scheduler::stack_resources::reuse::census_tests::actual_frozen_census_refuses_zero_borrower_reclaim_without_partial_close_or_nonce_and_denies_physical_clear
+cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::scheduler::stack_resources::reuse::census_tests::actual_reclaim_first_refuses_census_until_physical_unregistration_while_original_reuse_stays_closed
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::scheduler::stack_resources::reuse::census_tests::actual_logical_unregister_cannot_erase_frozen_member_reclaim_exclusion
+cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::scheduler::stack_resources::reuse::census_tests::actual_abandoned_reclaim_keeps_census_closed_without_new_execution_refs
+cold-exec-intent/ColdExecIntent|kernel-ps|multitask::scheduler::stack_resources::reuse::census_tests::actual_concurrent_census_and_reclaim_admission_have_exactly_one_winner
+cold-exec-intent/ColdExecIntent|kernel-ps|multitask::scheduler::stack_resources::reuse::census_tests::actual_exhausted_resource_nonce_does_not_install_a_process_reclaim_reservation
+cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::scheduler::stack_resources::reuse::census_tests::actual_physical_clear_requires_original_reclaim_nonce_before_releasing_process_or_mm
+cpu-dispatch-preemption/CpuDispatchPreemption|kernel-ps|multitask::scheduler::return_architecture::tests::actual_copied_dispatch_without_successful_claim_refuses_architecture
+mm-activation-close/MmActivationClose|kernel-ps|multitask::scheduler::return_architecture::tests::actual_same_current_retains_exact_claim_and_mm_without_architectural_replay
+mm-activation-close/MmActivationClose|kernel-ps|multitask::scheduler::return_architecture::tests::actual_local_peer_plan_uses_original_frame_mm_and_placement_banks
+affinity-claim-admission/AffinityClaimAdmission|kernel-ps|multitask::scheduler::return_architecture::tests::actual_direct_peer_plan_requires_original_fifo_claim_not_result_scalar
+frame-reader-claim/FrameReaderClaim|kernel-ps|multitask::scheduler::return_architecture::tests::actual_foreign_return_rsp_prior_or_selected_slot_refuses_original_claim
+frame-reader-claim/FrameReaderClaim|kernel-ps|multitask::scheduler::return_architecture::tests::actual_claimed_frame_republication_refuses_without_reading_a_new_header
+frame-reader-claim/FrameReaderClaim|kernel-ps|multitask::scheduler::return_architecture::tests::actual_claimed_return_requires_original_physical_prepared_bank
+cpu-dispatch-preemption/CpuDispatchPreemption|kernel-ps|multitask::scheduler::return_architecture::tests::actual_claimed_return_refuses_replaced_scalar_current_with_retained_banks
+mm-activation-close/MmActivationClose|kernel-ps|multitask::scheduler::return_architecture::tests::actual_terminal_after_claim_cannot_reopen_architecture_or_drop_original_backing
+frame-reader-claim/FrameReaderClaim|kernel-ps|multitask::scheduler::return_architecture::tests::actual_retained_architecture_refuses_foreign_uid_and_frame_geometry
+cpu-dispatch-preemption/CpuDispatchPreemption|kernel-ps|multitask::scheduler::return_architecture::tests::actual_original_architecture_phase_admits_once_and_ready_is_not_a_fresh_claim
+scheduling-context-budget/SchedulingContextBudget|kernel-ps|multitask::scheduler::dispatch_claim::tests::actual_current_claim_retains_original_funding_and_moves_allocation_once
+frame-reader-claim/FrameReaderClaim|kernel-ps|multitask::scheduler::dispatch_claim::tests::actual_selected_same_generation_frame_republication_refuses_final_leaf_cas_and_releases_funding
+frame-reader-claim/FrameReaderClaim|kernel-ps|multitask::scheduler::dispatch_claim::tests::actual_selected_republished_owner_refuses_without_membership_or_bank_changes
+frame-reader-claim/FrameReaderClaim|kernel-ps|multitask::scheduler::dispatch_claim::tests::actual_selected_other_reader_blocks_claim_until_reader_releases_without_funding_stage
+affinity-claim-admission/AffinityClaimAdmission|kernel-ps|multitask::scheduler::dispatch_claim::tests::actual_selected_affinity_exclusion_refuses_real_claim_and_original_funding_releases
+frame-reader-claim/FrameReaderClaim|kernel-ps|multitask::scheduler::dispatch_claim::tests::actual_selected_terminal_after_funding_refuses_and_drops_original_grant
+frame-reader-claim/FrameReaderClaim|kernel-ps|multitask::scheduler::dispatch_claim::tests::actual_selected_custody_and_saved_rsp_are_not_interchangeable_grants
+scheduling-context-budget/SchedulingContextBudget|kernel-ps|multitask::scheduler::dispatch_claim::tests::actual_current_fallback_uses_same_frame_funding_and_claim_engine
+mm-activation-close/MmActivationClose|kernel-ps|multitask::scheduler::dispatch_claim::tests::actual_selected_local_peer_uses_real_allocation_mm_placement_and_funding_banks
+mm-activation-close/MmActivationClose|kernel-ps|multitask::scheduler::dispatch_claim::tests::actual_selected_direct_peer_claims_exact_fifo_generation_without_fair_membership
+frame-reader-claim/FrameReaderClaim|kernel-ps|multitask::scheduler::dispatch_claim::tests::actual_selected_direct_same_generation_frame_republication_refuses_final_leaf_cas
+cpu-dispatch-preemption/CpuDispatchPreemption|kernel-ps|multitask::scheduler::dispatch_claim::tests::actual_selected_original_scope_replacement_refuses_under_final_leaf_before_cas
+scheduling-context-budget/SchedulingContextBudget|kernel-ps|multitask::scheduler::dispatch_claim::tests::actual_selected_budget_close_refuses_without_prepared_cpu_grant
+scheduling-context-budget/SchedulingContextBudget|kernel-ps|multitask::scheduler::dispatch_claim::tests::actual_selected_original_funding_close_after_preparation_retains_pin_but_refuses_new_execution
+scheduling-context-budget/SchedulingContextBudget|kernel-ps|multitask::scheduler::dispatch_claim::tests::actual_selected_original_funding_exhausted_after_preparation_refuses_before_queue_cas
+frame-reader-claim/FrameReaderClaim|kernel-ps|multitask::scheduler::dispatch_claim::tests::actual_selected_foreign_expected_uid_refuses_before_frame_and_funding_admission
+frame-reader-claim/FrameReaderClaim|kernel-ps|multitask::scheduler::dispatch_claim::tests::actual_selected_live_guard_corruption_refuses_old_published_canary_snapshot
+frame-reader-claim/FrameReaderClaim|kernel-ps|multitask::scheduler::dispatch_claim::tests::actual_joint_refused_placement_returns_original_mm_and_uid_loans_before_any_drop
+frame-reader-claim/FrameReaderClaim|kernel-ps|multitask::scheduler::dispatch_claim::tests::actual_joint_fixed_idle_borrows_real_kernel_frame_without_late_class_or_funding_authority
+frame-reader-claim/FrameReaderClaim|kernel-ps|multitask::scheduler::dispatch_claim::tests::actual_joint_local_claim_keeps_original_budget_and_class_leaves_through_owner_cas
+frame-reader-claim/FrameReaderClaim|kernel-ps|multitask::scheduler::dispatch_claim::tests::actual_joint_direct_claim_keeps_original_budget_and_class_leaves_through_owner_cas
+frame-reader-claim/FrameReaderClaim|kernel-ps|multitask::scheduler::dispatch_claim::tests::actual_joint_base_class_change_after_preparation_refuses_without_queue_or_bank_effects
+frame-reader-claim/FrameReaderClaim|kernel-ps|multitask::scheduler::dispatch_claim::tests::actual_joint_original_selection_class_is_not_recaptured_after_frame_admission
+frame-reader-claim/FrameReaderClaim|kernel-ps|multitask::scheduler::dispatch_claim::tests::actual_joint_original_donation_producer_invalidates_selected_peer_before_claim
+scheduling-context-budget/SchedulingContextBudget|kernel-ps|multitask::scheduler::current_return::tests::actual_original_return_failed_peer_fallback_reuses_interval_frame_and_queue_receipt_once
+scheduler-wakeup/SchedulerWakeup|kernel-ps|multitask::scheduler::current_return::tests::actual_original_return_raced_completed_wait_is_not_cleared_and_publishes_local
+scheduler-wakeup/SchedulerWakeup|kernel-ps|multitask::scheduler::current_return::tests::actual_original_return_terminal_after_capture_keeps_original_bank_and_refuses_resurrection
+cpu-dispatch-preemption/CpuDispatchPreemption|kernel-ps|multitask::scheduler::current_return::tests::actual_original_return_already_terminal_borrows_old_bank_not_a_new_post_stop_pin
+cpu-dispatch-preemption/CpuDispatchPreemption|kernel-ps|multitask::scheduler::current_return::tests::actual_original_return_scalar_running_without_physical_bank_refuses_before_effects
+cpu-dispatch-preemption/CpuDispatchPreemption|kernel-ps|multitask::scheduler::current_return::tests::actual_original_return_physical_bank_without_running_or_terminal_custody_refuses
+cpu-dispatch-preemption/CpuDispatchPreemption|kernel-ps|multitask::scheduler::current_return::tests::actual_original_return_replaced_scalar_current_refuses_even_with_retained_original_bank
+frame-reader-claim/FrameReaderClaim|kernel-ps|multitask::scheduler::current_return::tests::actual_original_return_foreign_frame_geometry_refuses_before_any_byte_read_or_effect
+frame-reader-claim/FrameReaderClaim|kernel-ps|multitask::scheduler::current_return::tests::actual_original_return_blocked_frame_refresh_observes_live_guard_not_old_snapshot
+lifecycle-execution-claim/LifecycleExecutionClaim|kernel-ps|multitask::scheduler::current_wait::tests::actual_current_wait_arm_cancel_retains_original_bank_uid_and_exact_reason
+scheduler-wakeup/SchedulerWakeup|kernel-ps|multitask::scheduler::current_wait::tests::actual_current_wait_pager_commit_rollback_uses_same_original_loan_and_exact_token
+scheduler-wakeup/SchedulerWakeup|kernel-ps|multitask::scheduler::current_wait::tests::actual_current_wait_raced_wake_withdraws_arm_and_refuses_commit_without_catalog
+scheduler-wakeup/SchedulerWakeup|kernel-ps|multitask::scheduler::current_wait::tests::actual_current_wait_terminal_after_capture_refuses_arm_and_acknowledges_cancelled_pager_without_wake
+scheduler-cpu-ownership/SchedulerCpuOwnership|kernel-ps|multitask::scheduler::current_wait::tests::actual_current_wait_scalar_running_without_original_physical_bank_refuses_before_arm
+scheduler-cpu-ownership/SchedulerCpuOwnership|kernel-ps|multitask::scheduler::current_wait::tests::actual_current_wait_physical_bank_without_running_queue_custody_refuses_before_arm
+scheduler-wakeup/SchedulerWakeup|kernel-ps|multitask::scheduler::current_wait::tests::actual_current_wait_already_committed_wait_refuses_another_arm_or_cancel
+scheduler-wakeup/SchedulerWakeup|kernel-ps|multitask::scheduler::wake_publication::tests::actual_wake_blocked_return_publishes_queue_while_original_current_bank_retains_consumed_frame
+scheduler-wakeup/SchedulerWakeup|kernel-ps|multitask::scheduler::runqueue::return_publication::tests::actual_return_raced_wake_recomputes_run_intent_and_publishes_once
+scheduler-local-authority/SchedulerLocalAuthority|kernel-ps|multitask::scheduler::runqueue::return_publication::tests::actual_return_raced_wait_rolls_back_only_its_provisional_membership
+cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::scheduler::runqueue::return_publication::tests::actual_return_terminal_wins_without_resurrection_or_neighbour_withdrawal
+cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::scheduler::runqueue::return_publication::tests::actual_blocked_wake_terminal_wins_and_rolls_back_same_queue_turn
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::scheduler::exec_transaction::quiescence::tests::actual_exec_census_busy_terminal_election_is_not_quiescent_even_with_zero_execution_refs
+cold-exec-intent/ColdExecIntent|kernel-ps|multitask::scheduler::exec_transaction::quiescence::tests::actual_exec_census_unmasked_or_foreign_cpu_scope_refuses_before_original_sibling_effects
+cpu-dispatch-preemption/CpuDispatchPreemption|kernel-ps|multitask::scheduler::wake_publication::tests::actual_wake_unmasked_or_foreign_cpu_scope_refuses_before_binding_and_wait_effects
+scheduler-wakeup/SchedulerWakeup|kernel-ps|multitask::scheduler::wake_publication::tests::actual_wake_stale_directory_hint_is_only_candidate_and_never_uid_authority
+scheduling-context-budget/SchedulingContextBudget|kernel-ps|multitask::scheduler::donation_publication::tests::actual_normal_reply_withdraws_only_original_reply_namespace_before_wake_or_refusal
+synchronous-ipc-handoff/SynchronousIpcHandoff|kernel-ps|multitask::scheduler::wake_publication::tests::actual_reply_wake_retains_original_binding_through_fifo_and_rejects_replaced_generation
+cpu-dispatch-preemption/CpuDispatchPreemption|kernel-ps|multitask::scheduler::wake_publication::tests::actual_reply_wake_scope_and_foreign_identity_refuse_without_wait_or_fifo_effects
+cpu-dispatch-preemption/CpuDispatchPreemption|kernel-ps|multitask::scheduler::current_class::tests::actual_self_demotion_refuses_unmasked_foreign_cpu_and_sealed_or_missing_identity
+scheduler-thread-demotion/SchedulerThreadDemotion|kernel-ps|multitask::scheduler::current_class::tests::actual_self_demotion_refuses_kernel_and_scalar_current_without_original_physical_bank
+scheduling-context-budget/SchedulingContextBudget|kernel-ps|multitask::scheduler::donation_publication::tests::actual_reply_attachment_never_selects_a_runnable_process_worker_before_exact_receive
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::scheduler::terminal_publication::tests::actual_terminal_process_donations_retire_by_original_members_without_catalog_rescan
+scheduling-context-budget/SchedulingContextBudget|kernel-ps|multitask::scheduler::donation_publication::tests::actual_noncurrent_donor_requires_original_bound_resource_and_full_context
+scheduling-context-budget/SchedulingContextBudget|kernel-ps|multitask::scheduler::donation_publication::tests::actual_class_admission_uses_trusted_bit_and_preserves_ordinary_custody
+scheduling-context-budget/SchedulingContextBudget|kernel-ps|multitask::scheduler::donation_publication::tests::actual_participant_loans_survive_capture_and_terminal_seal_denies_new_admission
+scheduling-context-budget/SchedulingContextBudget|kernel-ps|multitask::scheduler::donation_publication::tests::actual_cancelled_original_source_refuses_after_capture_before_reservation_insert
+scheduling-context-budget/SchedulingContextBudget|kernel-ps|multitask::scheduler::donation_publication::tests::actual_changed_still_live_source_refuses_stale_new_reservation_basis
+scheduling-context-budget/SchedulingContextBudget|kernel-ps|multitask::scheduler::donation_publication::tests::actual_reservation_retains_original_source_when_a_newer_reply_changes_current_funding
+scheduling-context-budget/SchedulingContextBudget|kernel-ps|multitask::scheduler::donation_publication::tests::actual_root_cancellation_cannot_revive_a_reserved_nested_edge_or_replace_it_with_self_funding
+scheduling-context-budget/SchedulingContextBudget|kernel-ps|multitask::scheduler::donation_publication::tests::actual_pager_and_reply_equal_numbers_have_distinct_owned_edges_and_exact_receivers
+cpu-dispatch-preemption/CpuDispatchPreemption|kernel-ps|multitask::scheduler::donation_publication::tests::actual_unmasked_or_foreign_cpu_scope_refuses_all_donation_effects
+scheduling-context-budget/SchedulingContextBudget|kernel-ps|multitask::scheduler::task_directory::tests::actual_reply_custody_exact_resource_object_and_foreign_identity_are_one_scalar_result
+scheduling-context-budget/SchedulingContextBudget|kernel-ps|multitask::scheduler::task_directory::tests::actual_reply_custody_stale_or_absent_hint_cannot_substitute_another_resource_binding
+cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::scheduler::task_directory::tests::actual_reply_custody_retained_terminal_object_returns_only_exact_custody_not_live_authority
+cold-exec-intent/ColdExecIntent|kernel-ps|multitask::scheduler::exec_transaction::quiescence::tests::actual_exec_census_retired_borrower_defers_same_detach_then_retries_to_both_consumer_publications
+cold-exec-intent/ColdExecIntent|kernel-ps|multitask::scheduler::exec_transaction::quiescence::tests::actual_exec_census_cannot_retire_its_live_caller_before_spending_any_sibling_producer
+exec-address-space-transaction/ExecAddressSpaceTransaction|kernel-ps|multitask::scheduler::exec_transaction::quiescence::tests::actual_exec_census_foreign_mode_refuses_without_queue_stop_or_terminal_payload
+scheduler-wakeup/SchedulerWakeup|kernel-ps|multitask::scheduler::wake_publication::tests::actual_wake_current_ignores_consumed_frame_and_retains_original_bank_and_uid
+scheduler-wakeup/SchedulerWakeup|kernel-ps|multitask::scheduler::wake_publication::tests::actual_wake_foreign_uid_and_original_terminal_reservation_refuse_before_effects
+cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::scheduler::wake_publication::tests::actual_wake_binding_pins_before_stop_and_excludes_reuse_until_original_drop
+frame-reader-claim/FrameReaderClaim|kernel-ps|multitask::scheduler::wake_publication::tests::actual_wake_nonexecuting_validates_real_frame_and_publishes_queue_without_catalog
+task-retirement-cleanup-owner/TaskRetirementCleanupOwner|kernel-ps|multitask::scheduler::terminal_publication::tests::actual_terminal_effects_publish_both_consumers_last_and_retain_current_backing_until_ack
+cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::scheduler::terminal_publication::tests::actual_terminal_preexisting_wake_borrower_defers_original_reason_before_signal_and_consumer_effects
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::scheduler::terminal_publication::tests::actual_terminal_busy_process_election_defers_without_spending_original_detach_then_retries
+scheduler-wakeup/SchedulerWakeup|kernel-ps|multitask::scheduler::terminal_publication::tests::actual_terminal_sigchld_transfers_exact_sibling_events_to_leader_with_mask_and_consumed_current_frame
+frame-reader-claim/FrameReaderClaim|kernel-ps|multitask::scheduler::terminal_publication::tests::actual_invalid_wake_transfers_same_producer_after_reader_release_and_publishes_terminal_cleanup
+task-retirement-cleanup-owner/TaskRetirementCleanupOwner|kernel-ps|multitask::scheduler::terminal_quarantine::tests::actual_stop_retained_owner_closes_all_fresh_binding_and_cohort_admission_without_claim_gap
+cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::scheduler::terminal_quarantine::tests::actual_stop_withdraws_queue_and_wait_before_deferred_reason_without_detaching_resources
+task-retirement-cleanup-owner/TaskRetirementCleanupOwner|kernel-ps|multitask::scheduler::terminal_quarantine::tests::actual_stop_foreign_uid_refuses_before_lifecycle_queue_or_terminal_reservation
+task-retirement-cleanup-owner/TaskRetirementCleanupOwner|kernel-ps|multitask::scheduler::terminal_quarantine::tests::actual_stop_preserves_first_reason_and_detach_through_repeat_and_claim_abandonment
+task-retirement-cleanup-owner/TaskRetirementCleanupOwner|kernel-ps|multitask::scheduler::stack_resources::kernel_executor_tests::kernel_executor_and_admitted_terminal_producer_exclude_each_other_before_effects
+task-retirement-cleanup-owner/TaskRetirementCleanupOwner|kernel-ps|multitask::scheduler::stack_resources::kernel_executor_tests::queued_kernel_stop_preserves_original_request_dispatch_and_nested_executor_until_last_release
+task-retirement-cleanup-owner/TaskRetirementCleanupOwner|kernel-ps|multitask::scheduler::stack_resources::kernel_executor_tests::last_executor_release_between_terminal_refusal_and_wait_publication_never_loses_exact_stop
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::scheduler::root_slots::tests::membership::actual_root_capsule_publishes_membership_only_with_final_slot_ack_then_opens_child_creation
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::scheduler::root_slots::tests::membership::root_join_waits_through_visible_prefix_and_blocked_slot_ack_until_actual_membership_release
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::scheduler::root_slots::tests::membership::exec_intent_after_slot_ack_cannot_capture_root_census_before_owned_membership_ack
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::scheduler::root_slots::tests::membership::root_factory_early_mask_refusal_returns_original_ticket_without_process_gate_or_resource_effect
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::scheduler::root_slots::tests::membership::untouched_root_join_rollback_preserves_actual_ticket_and_only_owned_empty_process_gate_reopens
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::scheduler::root_slots::tests::membership::root_factory_refuses_committing_producer_without_spending_or_cancelling_original_binding
+cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::scheduler::root_slots::tests::membership::registered_root_join_abandonment_keeps_process_sealed_even_after_independent_slot_ack
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::scheduler::root_slots::tests::membership::exhausted_root_nonce_returns_real_ticket_without_partial_membership_or_epoch_wrap
+cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::scheduler::reaper::tests::actual_detached_prefix_keeps_both_seals_and_hidden_uid_until_external_completion_returns
+cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::scheduler::reaper::tests::physical_retired_grant_independently_requires_desired_stop_and_exact_terminal_run_owner
+cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::scheduler::reaper::tests::pending_external_terminal_ack_refuses_reaper_before_metadata_or_resource_effects
+lifecycle-execution-claim/LifecycleExecutionClaim|kernel-ps|multitask::scheduler::reaper::tests::captured_backing_and_lifecycle_custody_refuse_then_release_into_same_exact_retired_grant
+cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::scheduler::reaper::tests::hidden_metadata_keeps_exact_retired_binding_without_using_absence_as_drain_evidence
+cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::scheduler::reaper::tests::two_real_retired_slots_own_disjoint_seals_and_first_ack_cannot_reopen_second
+cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::scheduler::reaper::tests::funded_interval_is_closed_not_discarded_and_last_charge_release_precedes_retired_detachment
+cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::scheduler::reaper::tests::abandoned_external_completion_keeps_terminal_and_physical_reuse_quarantined_even_after_empty_metadata
+cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::scheduler::reaper::tests::saved_frame_backing_without_lifecycle_count_independently_delays_the_real_reaper
+cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::scheduler::reaper::tests::physical_all_cpu_policy_withdrawal_removes_only_the_owned_slot_before_external_ack
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::scheduler::process_affinity::tests::actual_group_capture_owns_every_live_binding_and_excludes_reuse_until_queue_and_membership_ack
+affinity-claim-admission/AffinityClaimAdmission|kernel-ps|multitask::scheduler::process_affinity::tests::queued_rehome_keeps_old_process_mask_and_closed_admission_until_actual_owner_effect_returns
+lifecycle-execution-claim/LifecycleExecutionClaim|kernel-ps|multitask::scheduler::process_affinity::tests::running_affinity_never_steals_current_custody_but_marks_exclusion_and_requests_reschedule
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::scheduler::process_affinity::tests::untouched_grant_rollback_releases_all_exact_pins_without_masks_queue_or_membership_effects
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::scheduler::process_affinity::tests::post_pin_physical_abi_refusal_rolls_back_complete_group_before_any_effect
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::scheduler::process_affinity::tests::invalid_requested_mask_and_foreign_full_handle_or_caller_uid_cannot_spend_real_membership
+cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::scheduler::process_affinity::tests::desired_stop_without_terminal_ack_refuses_instead_of_treating_missing_member_as_drained
+cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::scheduler::process_affinity::tests::exact_terminal_membership_ack_excludes_stopped_peer_without_rewriting_or_waking_its_slot
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::scheduler::process_affinity::tests::foreign_physical_process_binding_refuses_after_exact_cohort_capture_without_spending_either_process
+cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::scheduler::process_affinity::tests::terminal_stop_during_queue_effect_cannot_reuse_or_reanimate_captured_peer_and_survives_final_affinity_ack
+affinity-claim-admission/AffinityClaimAdmission|kernel-ps|multitask::scheduler::process_affinity::tests::peer_block_between_affinity_masks_and_queue_effect_never_spends_affinity_as_a_wake
+cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::scheduler::runqueue::tests::terminal_stop_between_migrating_cas_and_mailbox_publication_refuses_without_reanimation
+scheduler-admission/SchedulerAdmission|kernel-ps|multitask::scheduler::thread_creation::tests::actual_reservation_and_cancel_retain_ticket_mm_and_attachment_until_complete_ack
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::scheduler::thread_creation::tests::retired_creator_cannot_capture_physical_reservation_input
+scheduler-admission/SchedulerAdmission|kernel-ps|multitask::scheduler::thread_creation::tests::actual_publication_keeps_parent_mm_and_ticket_through_blocked_frame_membership_and_slot_ack
+affinity-claim-admission/AffinityClaimAdmission|kernel-ps|multitask::scheduler::thread_creation::tests::publication_inherits_new_complete_process_mask_after_reservation_not_old_snapshot
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::scheduler::thread_creation::tests::final_retired_creator_or_wrong_abi_refusal_cancels_real_unpublished_ticket_and_attachment
+mm-activation-close/MmActivationClose|kernel-ps|multitask::scheduler::thread_creation::work::tests::original_mm_qualification_refuses_wrong_root_and_retains_actual_activation_through_bytes
+mm-activation-close/MmActivationClose|kernel-ps|multitask::scheduler::thread_creation::work::tests::equal_root_different_original_mm_generation_refuses_materialization_and_final_membership
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::scheduler::thread_creation::work::tests::exhausted_durable_nonce_cannot_transfer_or_drop_actual_reserved_ticket
+cold-exec-intent/ColdExecIntent|kernel-ps|multitask::scheduler::thread_creation::work::tests::abandoned_actual_kernel_claim_quarantines_capsule_without_reopen_or_implied_ack
+scheduler-admission/SchedulerAdmission|kernel-ps|multitask::scheduler::thread_creation::work::tests::real_kernel_worker_publishes_slot_before_durable_ack_and_duplicate_claim_or_stale_receipt_refuses
+scheduler-admission/SchedulerAdmission|kernel-ps|multitask::scheduler::thread_creation::work::tests::same_uid_slot_reuse_spends_new_ticket_and_durable_nonce_and_old_receipt_cannot_observe_next_ack
+mm-activation-close/MmActivationClose|kernel-ps|multitask::scheduler::thread_creation::work::tests::actual_windows_materialization_error_cancels_reserved_storage_and_attachment_before_receipt_ack
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::scheduler::thread_creation::work::tests::dying_original_user_cannot_orphan_real_capsule_and_kernel_cancels_before_failed_ack
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::scheduler::thread_affinity::tests::linux_query_and_peer_set_preserve_process_mask_and_other_thread
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::scheduler::thread_affinity::tests::windows_self_alias_owns_two_physical_refs_and_changes_only_thread_mask
+lifecycle-execution-claim/LifecycleExecutionClaim|kernel-ps|multitask::scheduler::thread_affinity::tests::caller_and_target_pins_exclude_reuse_and_target_admission_until_untouched_release
+lifecycle-execution-claim/LifecycleExecutionClaim|kernel-ps|multitask::scheduler::stack_resources::context::tests::actual_current_bank_owns_entry_log_and_wait_namespace_until_physical_pin_release
+lifecycle-execution-claim/LifecycleExecutionClaim|kernel-ps|multitask::scheduler::stack_resources::context::tests::prepared_or_foreign_current_bank_cannot_authorize_scalar_fallback
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::scheduler::thread_affinity::tests::invalid_online_or_empty_mask_refuses_before_any_effect
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::scheduler::thread_affinity::tests::process_mask_escape_refuses_after_actual_complete_group_change_without_effects
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::scheduler::thread_affinity::tests::foreign_physical_process_refuses_after_pin_without_spending_either_binding
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::scheduler::thread_affinity::tests::physical_peer_abi_and_caller_abi_mismatch_cannot_spend_target_masks
+cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::scheduler::thread_affinity::tests::wrong_uid_missing_target_and_retired_caller_or_target_refuse_exact_physical_capture
+affinity-claim-admission/AffinityClaimAdmission|kernel-ps|multitask::scheduler::thread_affinity::tests::queued_transfer_borrows_exact_target_cohort_until_real_queue_ack_without_process_publication
+lifecycle-execution-claim/LifecycleExecutionClaim|kernel-ps|multitask::scheduler::thread_affinity::tests::actual_running_target_keeps_current_custody_and_notifies_owner_cpu
+affinity-claim-admission/AffinityClaimAdmission|kernel-ps|multitask::scheduler::thread_affinity::tests::block_during_owned_thread_queue_effect_is_not_an_affinity_wake
+cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::scheduler::thread_affinity::tests::terminal_overlap_remains_retired_and_pinned_through_thread_affinity_ack
+task-retirement-cleanup-owner/TaskRetirementCleanupOwner|kernel-ps|multitask::scheduler::retirement_cleanup::executor::tests::captured_kernel_fence_waits_for_exact_ack_not_claim_or_empty_payload
+task-retirement-cleanup-owner/TaskRetirementCleanupOwner|kernel-ps|multitask::scheduler::retirement_cleanup::executor::tests::kernel_fence_completion_persists_through_reset_but_identical_reuse_needs_a_new_ack
+task-retirement-cleanup-owner/TaskRetirementCleanupOwner|kernel-ps|multitask::scheduler::retirement_cleanup::executor::tests::copied_fence_drop_cannot_abandon_claim_and_foreign_slot_ack_cannot_complete_it
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::process_placement::exit_membership::tests::queued::exact_process_exit_marker_refuses_foreign_pid_without_setting_exit_on_original_object
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::scheduler::stack_resources::context::intent_tests::commit_grant_captures_real_ticket_epoch_parent_membership_and_original_mm_before_effects_and_stale_ticket_cannot_spend_it
+cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::scheduler::stack_resources::context::intent_tests::waiting_binding_retains_backing_but_terminal_stop_denies_fresh_admission_and_cannot_prove_drain_progress
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::process_placement::exit_membership::tests::group_freeze_denies_duplicate_root_join_and_mask_before_effects_and_reopens_only_exact_untouched_owner
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::process_placement::exit_membership::tests::pending_join_refuses_census_before_nonce_spend_then_registered_child_is_in_frozen_membership
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::process_placement::exit_membership::tests::wrong_target_foreign_ledger_generation_and_exhausted_nonce_refuse_without_partial_membership_gate
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::process_placement::exit_membership::tests::exact_retired_uid_not_hidden_metadata_absence_or_recycled_slot_is_required_for_withdrawal_ack
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::process_placement::exit_membership::tests::captured_members_survive_stop_and_removal_while_effect_abandonment_never_reopens_creation
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::process_placement::exit_membership::tests::exit_scope_does_not_spend_or_reopen_existing_exec_epoch_on_pending_exit_rollback
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::process_placement::exit_membership::tests::original_process_object_is_retained_until_owner_drops_outside_leaf_even_after_last_attach_detaches
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::process_placement::exit_membership::tests::stale_credential_cannot_begin_effects_for_next_same_uid_owner_and_row_record_epochs_are_independent
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::scheduler::stack_resources::context::intent_tests::independent_thread_creator_capture_requires_exact_context_start_and_live_unsealed_binding_before_facade
+cold-exec-intent/ColdExecIntent|kernel-ps|multitask::process_placement::exec_membership::tests::group_membership_freeze_blocks_new_exec_but_pending_exit_does_not_erase_existing_census_epoch_or_reopen_join
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::process_placement::terminal::tests::pending_creation_excludes_vote_without_spending_epoch_and_registered_child_is_live_before_creator_ack
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::process_placement::terminal::tests::committed_stop_election_has_one_last_member_while_desired_retired_peer_is_not_final_election_or_absence
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::process_placement::terminal::tests::hidden_exact_retired_binding_counts_for_exit_authorization_but_missing_or_recycled_uid_never_counts_negative
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::process_placement::terminal::tests::missing_target_foreign_process_generation_and_nonce_exhaustion_refuse_before_partial_creation_gate
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::process_placement::terminal::tests::exact_lifecycle_stop_is_required_before_committed_vote_and_before_real_producer_publication
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::process_placement::terminal::tests::actual_dual_publication_receipt_not_fixture_or_copied_uid_releases_stopped_member_and_creation_gate
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::process_placement::terminal::tests::detached_stopped_member_keeps_exact_handle_epoch_and_turn_until_producer_ack_then_releases_empty_row_without_nonce_reset
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::process_placement::terminal::tests::live_peer_unregister_cannot_discard_potential_last_member_during_another_turn_but_exact_stopped_removal_can
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::process_placement::terminal::tests::abandoned_stopped_turn_quarantines_even_after_member_detach_instead_of_reopening_creator_or_next_process_generation
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::process_placement::terminal::tests::old_reserved_turn_credential_cannot_publish_next_same_uid_turn_despite_valid_class50_owner_and_stopped_lifecycle
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::process_placement::terminal::tests::terminal_turn_holds_real_process_object_until_exact_leaf_release_and_disjoint_process_votes_are_independent
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::process_placement::terminal::tests::committed_stop_cannot_admit_creation_or_mask_replacement_even_if_other_metadata_looks_live_again
+cold-exec-intent/ColdExecIntent|kernel-ps|multitask::process_placement::exec_membership::tests::terminal_turn_excludes_new_exec_census_but_frozen_exec_allows_exact_sibling_stop_without_reopening_creators
+cold-exec-intent/ColdExecIntent|kernel-ps|multitask::process_placement::exec_membership::tests::committed_terminal_target_refuses_exec_census_independently_of_live_metadata_intent_and_open_placement_phase
+task-retirement-cleanup-owner/TaskRetirementCleanupOwner|kernel-ps|multitask::scheduler::retirement_cleanup::producer::tests::producer_reserves_before_effects_excludes_duplicates_consumers_and_reset_without_reclaiming_uid
+task-retirement-cleanup-owner/TaskRetirementCleanupOwner|kernel-ps|multitask::scheduler::retirement_cleanup::producer::tests::payload_visibility_is_one_last_producer_operation_and_both_exact_consumer_acks_precede_reuse
+task-retirement-cleanup-owner/TaskRetirementCleanupOwner|kernel-ps|multitask::scheduler::retirement_cleanup::producer::tests::deferred_loan_keeps_original_reason_detach_and_uid_and_two_claimants_cannot_spend_one_effect_owner
+task-retirement-cleanup-owner/TaskRetirementCleanupOwner|kernel-ps|multitask::scheduler::retirement_cleanup::producer::tests::checked_reserve_generation_and_nonce_and_deferred_claim_nonce_exhaust_independently_without_effects
+task-retirement-cleanup-owner/TaskRetirementCleanupOwner|kernel-ps|multitask::scheduler::retirement_cleanup::producer::tests::abandoned_effects_quarantine_even_with_empty_deferred_queue_and_no_consumer_payload
+task-retirement-cleanup-owner/TaskRetirementCleanupOwner|kernel-ps|multitask::scheduler::retirement_cleanup::producer::tests::stale_claim_rollback_cannot_begin_effects_or_erase_next_claim_nonce_despite_same_uid_and_lifetime_generation
+task-retirement-cleanup-owner/TaskRetirementCleanupOwner|kernel-ps|multitask::scheduler::retirement_cleanup::producer::tests::producer_key_independently_blocks_reuse_pending_and_consumers_when_compatibility_bits_or_payloads_are_misleading
+task-retirement-cleanup-owner/TaskRetirementCleanupOwner|kernel-ps|multitask::scheduler::retirement_cleanup::producer::tests::unowned_terminal_deferred_take_reset_and_abort_cannot_spend_real_producer
+task-retirement-cleanup-owner/TaskRetirementCleanupOwner|kernel-ps|multitask::scheduler::retirement_cleanup::producer::tests::unqualified_publication_rolls_back_but_foreign_payload_quarantines_effects_before_consumer_visibility
+task-retirement-cleanup-owner/TaskRetirementCleanupOwner|kernel-ps|multitask::scheduler::retirement_cleanup::producer::tests::kernel_uid_zero_is_an_exact_producer_not_absence_and_reset_never_rewinds_next_admission_epoch
+cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::scheduler::stack_resources::context::intent_tests::terminal_producer_binding_retains_hidden_exact_uid_and_independently_denies_writer_close_and_physical_reuse_receipt
+scheduler-admission/SchedulerAdmission|kernel-ps|multitask::scheduler::root_slots::tests::terminal_binding_admission_refuses_complete_constructor_prefix_until_exact_blocked_ack
+scheduler-admission/SchedulerAdmission|kernel-ps|multitask::irq_leaf::tests::failed_try_and_unwind_restore_only_the_original_mask_after_unlock
+scheduler-admission/SchedulerAdmission|kernel-ps|multitask::irq_leaf::tests::shared_leaf_preserves_outer_cpu_owner_and_original_irq_state_through_nested_release
+scheduler-admission/SchedulerAdmission|kernel-ps|multitask::scheduler::scheduling_runtime::namespace_tests::original_birth_holds_the_same_namespace_as_standalone_identity_witnesses
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::process_table::pin_owner::tests::process_placement_transaction_retains_real_object_until_refusal_releases_without_rebinding
+scheduler-cpu-distribution/SchedulerCpuDistribution|kernel-ps|multitask::scheduler::runtime_profile::owner::tests::cpu_cells_drain_independently_and_merge_saturates_without_spending_next_window
+scheduler-cpu-distribution/SchedulerCpuDistribution|kernel-ps|multitask::scheduler::runtime_profile::owner::tests::remote_window_drain_preserves_open_turn_phase_baseline_and_new_window_segments
+scheduler-cpu-distribution/SchedulerCpuDistribution|kernel-ps|multitask::scheduler::runtime_profile::owner::tests::worst_turn_merge_keeps_caller_and_attribution_with_exact_maximum_not_other_cpu
+scheduler-cpu-distribution/SchedulerCpuDistribution|kernel-ps|multitask::scheduler::runtime_profile::owner::tests::per_slot_migration_history_distinguishes_root_uid_zero_reuse_and_cpus
+scheduler-cpu-distribution/SchedulerCpuDistribution|kernel-ps|multitask::scheduler::runtime_profile::owner::tests::busy_reporter_refuses_without_consuming_cpu_counters_or_reopening_custody
+scheduler-cpu-distribution/SchedulerCpuDistribution|kernel-ps|multitask::scheduler::runtime_profile::owner::tests::report_epoch_admits_one_due_consumer_and_preserves_partial_period_on_every_cpu
+scheduler-cpu-distribution/SchedulerCpuDistribution|kernel-ps|multitask::scheduler::runqueue::idle::admitted_tag_binds_fixed_ap_cpu_and_clear_removes_mapping_without_turning_root_into_ap
+scheduler-cpu-distribution/SchedulerCpuDistribution|kernel-ps|multitask::scheduler::boot_execution::boot_tick_roundtrips_raw_zero_and_full_pit_encoding_without_task_weight_state
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::scheduler::stack_resources::admission::tests::reservation_blocks_cold_binding_in_every_phase_even_when_descriptor_and_identity_are_complete
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::scheduler::stack_resources::admission::tests::borrowed_binding_and_exec_intent_refuse_reservation_before_any_nonce_or_storage_effect
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::scheduler::stack_resources::admission::tests::reserved_frame_bytes_require_exact_live_ticket_and_cannot_reenter_or_replay_generation
+cold-exec-intent/ColdExecIntent|kernel-ps|multitask::scheduler::stack_resources::admission::tests::reserved_descriptor_cannot_acquire_exec_seal_or_spend_next_exec_generation_before_ack
+lifecycle-execution-claim/LifecycleExecutionClaim|kernel-ps|multitask::scheduler::stack_resources::lifecycle_tests::reserved_slot_refuses_real_local_and_direct_cas_in_every_phase_without_spending_queue_or_uid
+frame-reader-claim/FrameReaderClaim|kernel-ps|multitask::scheduler::local_dispatch::tests::actual_selection_refuses_published_frame_without_original_allocation
+frame-reader-claim/FrameReaderClaim|kernel-ps|multitask::scheduler::stack_resources::frame_readers::tests::reserved_descriptor_never_becomes_frame_observation_authority_before_publication_ack
 atomic-process-activation-batch/AtomicProcessActivationBatch|initd|activation::tests::activation_batch_is_exact_bounded_and_zero_tailed
 atomic-process-activation-batch/AtomicProcessActivationBatch|rustos-user-abi|syscall::activation_batch::tests::requester_identity_is_bound_to_the_kernel_sender
 atomic-process-activation-batch/AtomicProcessActivationBatch|kernel-compat|user::syscall::linux::proc_broker_ops::activation_batch::tests::activation_batch_keeps_preflight_and_commit_under_registry_lock

@@ -11,7 +11,6 @@ kernel/ipc-runtime/src/ipc/mod.rs	3170	ipc-runtime	Extract the fixed FastCallFra
 kernel/ipc-runtime/src/ipc/tests.rs	1306	ipc-runtime	Split endpoint call/reply tests, shared-region tests, and handle-transfer tests into sibling modules under ipc/tests/, alongside the existing reply_publication_tests.rs.
 kernel/mm/src/memory/kernel_vm.rs	1435	memory-kernel-vm	Split PAT/cache policy, direct-map transactions, high-window mappings, and tests.
 kernel/ps/src/multitask/process_table.rs	1806	process-table	Split lifecycle transaction state and markers into process_table/lifecycle.rs, then the own-thread pin, retained exact-MM generation access, and identity adapters into process_table/identity.rs.
-kernel/ps/src/multitask/scheduler.rs	5509	scheduler	The terminal reply/pager wake-handoff layer now lives in scheduler/wake_handoff.rs. Next: split run queues, wakeup, deadlines, switching, accounting, and tests.
 libs/driver-domain-host/src/lib.rs	5441	driver-domain-host	Split manifest, lease, QMP, recovery, input-ring publication, and process supervision.
 libs/driver-domain-protocol/src/lib.rs	4149	driver-domain-protocol	Split block, network, input, display, and control wire modules.
 libs/runtime-control/src/lib.rs	1402	runtime-control	Split codec, authority, command lifecycle, and tests.

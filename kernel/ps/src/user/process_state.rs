@@ -669,6 +669,42 @@ impl UserProcessState {
         self.sync_linux_mapping_cursor();
     }
 
+    pub fn retire_execution_state(self) {
+        // Destructure exhaustively: adding an owned field must decide its cold
+        // retirement custody, not silently drop shared backing during execution.
+        let Self {
+            address_space,
+            futex_namespace_id,
+            linux_process_state,
+            linux_memory_map,
+            linux_runtime_profile,
+            linux_sigactions,
+            windows_runtime,
+            handles,
+            security,
+            mapping_cursor,
+            shared_memfd_mappings,
+            shared_region_mappings,
+            exec_path,
+            exec_path_len,
+        } = self;
+        address_space.into_retirement_owner().retire((
+            futex_namespace_id,
+            linux_process_state,
+            linux_memory_map,
+            linux_runtime_profile,
+            linux_sigactions,
+            windows_runtime,
+            handles,
+            security,
+            mapping_cursor,
+            shared_memfd_mappings,
+            shared_region_mappings,
+            exec_path,
+            exec_path_len,
+        ));
+    }
+
     pub fn replace_for_exec(
         &mut self,
         address_space: ProcessAddressSpace,

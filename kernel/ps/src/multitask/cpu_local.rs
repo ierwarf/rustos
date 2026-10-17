@@ -1,7 +1,7 @@
 //! CPU-local scheduler ownership publication.
 //!
-//! - **Owner:** `kernel-ps` owns the global scheduler lock and every dense
-//!   CPU's current-task publication.
+//! - **Owner:** independent dispatch turns own every dense CPU's Current and
+//!   Transition publication; no global scheduler lock exists.
 //! - **Boundary:** a private CPU-local dispatch scratch slot is loaded from
 //!   and returned to the invoking CPU's published current slot.  The
 //!   `Scheduler` catalog never stores a shared mutable current-task field.
@@ -9,8 +9,8 @@
 //!   later handoff reserves the incoming slot while retaining the outgoing
 //!   stack, then assembly releases the outgoing owner only after switching
 //!   `rsp` to the selected frame.
-//! - **Concurrency:** one global raw lock serializes selection while active
-//!   current and stack-transition slots provide lock-free remote ownership.
+//! - **Concurrency:** CPU-local reentry exclusion, original claims and physical
+//!   banks retain switch custody; scalar slots are remote observations only.
 //! - **Failure:** duplicate publication, overlapping transition, inactive AP
 //!   entry, or one task on two CPUs is an immediate scheduler panic.
 //! - **Forbidden:** remote lifetime code must not infer ownership from the
@@ -19,18 +19,11 @@
 //! - **Evidence:** `cpu-online-lifecycle`, `scheduler-lifecycle`, and
 //!   `scheduler-cpu-ownership`.
 
-use core::ops::{Deref, DerefMut};
-use core::panic::Location;
-use core::ptr;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use nucleus_core::util::lockdep::{LockClass, MAX_TRACKED_CPUS, TrackedSpinGuard, TrackedSpinLock};
+use nucleus_core::util::lockdep::MAX_TRACKED_CPUS;
 
 use super::MAX_SCHEDULER_TASKS;
-use super::scheduler::Scheduler;
-
-static SCHEDULER: TrackedSpinLock<Scheduler, { LockClass::Scheduler as u8 }> =
-    TrackedSpinLock::new(Scheduler::new());
 // ORDERING: This is a one-way scheduler publication. Interrupt leaves need
 // only know whether the fully initialized scheduler may be entered; taking the
 // global lock merely to read its root slot doubled every SMP timer/IPI
@@ -61,149 +54,14 @@ mod test_support;
 #[cfg(test)]
 pub(super) use test_support::{
     TestCpuPublicationRestore, install_test_current_owner, install_test_transition_owner,
-    test_publication_lock,
+    with_test_current_scalar, with_initialized_fixture,
+    test_publication_lock, with_test_activation_return, with_test_rejected_activation_return,
 };
 
-// This remains a dead-owner fail-stop, not a scheduling latency budget. A KVM
-// vCPU can be descheduled by the host while it owns an otherwise bounded raw
-// scheduler transaction; treating a 100 ms host pause as a kernel deadlock
-// made healthy 8-vCPU boots panic. Match the existing TLB/reclaim fail-stop
-// horizon while lock wait/hold profiles continue to reject this global path
-// as a scalability architecture.
-const SCHEDULER_LOCK_TIMEOUT_NS: u64 = 2_000_000_000;
-// A dead-owner deadline must not be sampled on every spin iteration. The
-// global monotonic source is an MMIO counter until the multiprocessor TSC
-// admission promotes it, and under a virtualized product topology each such
-// read is an exit serialized against the other CPUs. Polling it per iteration
-// made every waiter actively slow the owner it was waiting for. The horizon is
-// two seconds, so a fixed spin batch costs no useful detection resolution.
-const SCHEDULER_LOCK_DEADLINE_POLL_SPINS: u32 = 1_024;
-const NO_SCHEDULER_OWNER: usize = usize::MAX;
-// ORDERING: the owner CPU is the release/acquire publication word for the
-// remaining diagnostic fields and selects the owning CPU's private turn
-// scratch. These atomics never grant scheduler authority; the tracked guard
-// remains the sole exclusion authority.
-static SCHEDULER_OWNER_CPU: AtomicUsize = AtomicUsize::new(NO_SCHEDULER_OWNER);
-
-#[repr(align(64))]
-struct SchedulerOwnerDiagnostic {
-    slot: AtomicUsize,
-    acquired_ns: AtomicU64,
-    caller: AtomicPtr<Location<'static>>,
-}
-
-const _: () = assert!(core::mem::align_of::<SchedulerOwnerDiagnostic>() == 64);
-
-impl SchedulerOwnerDiagnostic {
-    const fn new() -> Self {
-        Self {
-            slot: AtomicUsize::new(0),
-            acquired_ns: AtomicU64::new(0),
-            caller: AtomicPtr::new(ptr::null_mut()),
-        }
-    }
-}
-
-// Each CPU writes only its own cache line before publishing SCHEDULER_OWNER_CPU.
-// Waiters read the published owner's line solely for fail-stop diagnostics.
-static SCHEDULER_OWNER_DIAGNOSTICS: [SchedulerOwnerDiagnostic;
-    nucleus_core::util::lockdep::MAX_TRACKED_CPUS] =
-    [const { SchedulerOwnerDiagnostic::new() }; nucleus_core::util::lockdep::MAX_TRACKED_CPUS];
-
-// Per-site acquisition census.
-//
-// The lock is acquired far more often than it dispatches, and the excess is
-// non-dispatch traffic: wake, pick hints, donation, affinity, and lifecycle.
-// Sharding only the dispatch path would therefore leave most acquisitions
-// behind, so the per-CPU migration has to be aimed with a per-caller count
-// rather than with the dispatch total.
-//
-// This diagnostic-profile-only atomic side table is not lock state: it is
-// updated before the guard and adds no allocation or second lock.
-const ACQUIRE_SITE_SLOTS: usize = 64;
-#[cfg(rustos_lock_phase_profile)]
-static ACQUIRE_SITE_CALLERS: [AtomicPtr<Location<'static>>; ACQUIRE_SITE_SLOTS] =
-    [const { AtomicPtr::new(ptr::null_mut()) }; ACQUIRE_SITE_SLOTS];
-#[cfg(rustos_lock_phase_profile)]
-static ACQUIRE_SITE_COUNTS: [AtomicU64; ACQUIRE_SITE_SLOTS] =
-    [const { AtomicU64::new(0) }; ACQUIRE_SITE_SLOTS];
-#[cfg(rustos_lock_phase_profile)]
-static ACQUIRE_SITE_OVERFLOW: AtomicU64 = AtomicU64::new(0);
-
-/// Spreads a caller's static address over the census table.
-///
-/// The probe below started at slot zero for every site, so an acquisition
-/// walked the whole registered prefix before finding its own counter: about
-/// ten shared cache lines touched per profiled acquisition, on every CPU.
-/// Hashing the address makes the diagnostic common case one line.
-#[cfg(rustos_lock_phase_profile)]
-#[inline]
-fn acquire_site_bucket(key: *mut Location<'static>) -> usize {
-    // Fibonacci hashing of the pointer; `Location` allocations are aligned, so
-    // the low bits alone would collide across every site.
-    const _: () = assert!(ACQUIRE_SITE_SLOTS.is_power_of_two());
-    let mixed = (key as usize as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-    (mixed >> 32) as usize & (ACQUIRE_SITE_SLOTS - 1)
-}
-
-/// Charges one acquisition to its caller only in the diagnostic profile.
-#[cfg(rustos_lock_phase_profile)]
-fn record_acquire_site(caller: &'static Location<'static>) {
-    let key = caller as *const Location<'static> as *mut Location<'static>;
-    let first = acquire_site_bucket(key);
-    for probe in 0..ACQUIRE_SITE_SLOTS {
-        let slot = (first + probe) % ACQUIRE_SITE_SLOTS;
-        // ORDERING: Acquire observes a claim published by whichever CPU first
-        // registered this site.
-        let current = ACQUIRE_SITE_CALLERS[slot].load(Ordering::Acquire);
-        if current == key {
-            ACQUIRE_SITE_COUNTS[slot].fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-        if current.is_null()
-            // ORDERING: Release publishes the claim before its count is used.
-            && ACQUIRE_SITE_CALLERS[slot]
-                .compare_exchange(ptr::null_mut(), key, Ordering::Release, Ordering::Acquire)
-                .is_ok()
-        {
-            ACQUIRE_SITE_COUNTS[slot].fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-    }
-    ACQUIRE_SITE_OVERFLOW.fetch_add(1, Ordering::Relaxed);
-}
-
-#[cfg(not(rustos_lock_phase_profile))]
-#[inline(always)]
-fn record_acquire_site(_caller: &'static Location<'static>) {}
-
-/// Takes the census so far, clearing counts for the next window.
-///
-/// Called outside the scheduler owner; it never blocks a dispatch.
-pub(super) fn take_acquire_site_census() -> ([(&'static str, u32, u64); ACQUIRE_SITE_SLOTS], u64) {
-    #[cfg(not(rustos_lock_phase_profile))]
-    return ([("", 0_u32, 0_u64); ACQUIRE_SITE_SLOTS], 0);
-
-    #[cfg(rustos_lock_phase_profile)]
-    let mut census = [("", 0_u32, 0_u64); ACQUIRE_SITE_SLOTS];
-    #[cfg(rustos_lock_phase_profile)]
-    for slot in 0..ACQUIRE_SITE_SLOTS {
-        let count = ACQUIRE_SITE_COUNTS[slot].swap(0, Ordering::Relaxed);
-        if count == 0 {
-            continue;
-        }
-        // ORDERING: Acquire pairs with the claim publication above.
-        let caller = ACQUIRE_SITE_CALLERS[slot].load(Ordering::Acquire);
-        if caller.is_null() {
-            continue;
-        }
-        // SAFETY: `Location::caller` returns a static allocation that outlives
-        // every observer of this table.
-        let caller = unsafe { &*caller };
-        census[slot] = (caller.file(), caller.line(), count);
-    }
-    #[cfg(rustos_lock_phase_profile)]
-    return (census, ACQUIRE_SITE_OVERFLOW.swap(0, Ordering::Relaxed));
+/// Compatibility telemetry for the deleted global lock. There are no global
+/// scheduler acquisitions in any profile; CPU-local owners report separately.
+pub(super) fn take_acquire_site_census() -> ([(&'static str, u32, u64); 64], u64) {
+    ([("", 0, 0); 64], 0)
 }
 
 pub(super) fn scheduler_initialized() -> bool {
@@ -212,7 +70,8 @@ pub(super) fn scheduler_initialized() -> bool {
     SCHEDULER_INITIALIZED.load(Ordering::Acquire)
 }
 
-pub(super) fn publish_scheduler_initialized() {
+pub(super) fn publish_scheduler_initialized(image: &super::scheduler::bootstrap::ReadyImage<'_>) {
+    image.assert_complete();
     // ORDERING: Release publishes the fully initialized image exactly once.
     // The scheduler has no supported teardown; duplicate initialization is a
     // lifecycle violation rather than a state transition that can be retried.
@@ -225,35 +84,8 @@ pub(super) fn publish_scheduler_initialized() {
     );
 }
 
-pub(super) struct SchedulerAccessGuard {
-    guard: Option<TrackedSpinGuard<'static, Scheduler, { LockClass::Scheduler as u8 }>>,
-    logical_index: usize,
-    original_task: usize,
-    acquired_at_ns: u64,
-    /// Carried so the window's worst hold can name the site that produced it.
-    caller: &'static Location<'static>,
-    /// In-owner segment total observed at acquisition. The difference against
-    /// the same total at release is what this turn actually attributed.
-    phase_total_at_acquire_ns: u64,
-}
-
-impl Deref for SchedulerAccessGuard {
-    type Target = Scheduler;
-
-    fn deref(&self) -> &Self::Target {
-        self.guard
-            .as_deref()
-            .expect("scheduler guard missing before release")
-    }
-}
-
-impl DerefMut for SchedulerAccessGuard {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.guard
-            .as_deref_mut()
-            .expect("scheduler guard missing before release")
-    }
-}
+pub(super) mod dispatch_turn;
+pub(super) mod irq_entry;
 
 /// The publication edge immediately before a scheduler returns to assembly.
 ///
@@ -270,9 +102,9 @@ pub(super) struct CpuSwitchPublication {
 
 impl CpuSwitchPublication {
     /// Constructs the sole pre-return CPU-switch publication sequence.
-    /// Both the global guard and a future local dispatcher must use this
-    /// constructor instead of copying its Release stores.
-    pub(super) fn new(cpu: usize, from: usize, to: usize, to_idle: bool) -> Self {
+    /// The original CPU-local turn uses this constructor instead of copying
+    /// its Release stores.
+    fn new(cpu: usize, from: usize, to: usize, to_idle: bool) -> Self {
         assert!(
             cpu < MAX_TRACKED_CPUS,
             "scheduler CPU exceeds publication capacity"
@@ -293,7 +125,23 @@ impl CpuSwitchPublication {
         }
     }
 
-    pub(super) fn publish_before_return(self) {
+    fn publish_before_return(self) {
+        super::current_identity::execution::banks::publish(self.cpu, self.from, self.to);
+        // Allocation custody crosses this edge before publication can expose
+        // the outgoing task's absence. No leaf lock enters assembly.
+        super::scheduler::stack_resources::cpu_leases::publish(self.cpu, self.from, self.to);
+        self.publish_scalars();
+    }
+
+    /// Integer-only protocol projection, explicitly selected by its fixture;
+    /// real native resource turns execute publish_before_return unchanged.
+    #[cfg(test)]
+    fn publish_phase_model(self) {
+        super::current_identity::execution::banks::publish(self.cpu, self.from, self.to);
+        self.publish_scalars();
+    }
+
+    fn publish_scalars(self) {
         if self.to != self.from {
             // ORDERING: Publish the outgoing slot before activating the
             // transition. Remote lifetime and selection paths must retain its
@@ -315,211 +163,57 @@ impl CpuSwitchPublication {
     }
 }
 
-impl Drop for SchedulerAccessGuard {
-    fn drop(&mut self) {
-        let guard = self
-            .guard
-            .as_mut()
-            .expect("scheduler guard missing during release");
-        let selected_task = scheduler_current_task_scratch_for_cpu(self.logical_index);
-        assert!(
-            selected_task < MAX_SCHEDULER_TASKS,
-            "scheduler invariant: CPU-local dispatch scratch slot exceeds capacity"
-        );
-        let attributed_ns = guard
-            .runtime_profile_phase_total_ns()
-            .saturating_sub(self.phase_total_at_acquire_ns);
-        guard.record_runtime_profile_lock_hold(
-            crate::arch::clock::monotonic_nanos().saturating_sub(self.acquired_at_ns),
-            attributed_ns,
-            self.caller,
-        );
-        // ORDERING: Acquire proves this CPU completed initial slot admission.
-        assert!(
-            CURRENT_TASK_ACTIVE[self.logical_index].load(Ordering::Acquire),
-            "scheduler invariant: CPU returned a task before current-slot admission"
-        );
-        assert!(
-            !slot_has_remote_owner(self.logical_index, selected_task),
-            "scheduler invariant: one task selected concurrently on two CPUs"
-        );
-        // ORDERING: Acquire rejects a second scheduler return before assembly
-        // has release-cleared the previous outgoing stack transition.
-        assert!(
-            !TRANSITION_ACTIVE[self.logical_index].load(Ordering::Acquire),
-            "scheduler invariant: CPU entered scheduler before prior stack handoff committed"
-        );
-        CpuSwitchPublication::new(
-            self.logical_index,
-            self.original_task,
-            selected_task,
-            guard.current_task_is_idle_task(),
-        )
-        .publish_before_return();
-        // ORDERING: turn metadata is not lock authority. Release-clear its
-        // publication immediately before the tracked guard releases the real
-        // lock, after the final scratch access above.
-        SCHEDULER_OWNER_CPU.store(NO_SCHEDULER_OWNER, Ordering::Release);
-        // Drop the tracked guard explicitly so the raw lock and its
-        // preemption unit are gone before any remote IPI is emitted.
-        drop(
-            self.guard
-                .take()
-                .expect("scheduler guard disappeared before unlock"),
-        );
-        super::irq::flush_deferred_target_reschedules();
-    }
+pub(super) fn assert_initial_image_absent() {
+    assert!(
+        CURRENT_TASK_ACTIVE
+            .iter()
+            // ORDERING: Acquire observes producer admission before consuming its immutable tuple or published Current.
+            .all(|active| !active.load(Ordering::Acquire)),
+        "bootstrap overlaps published Current"
+    );
 }
 
-#[inline(always)]
-#[track_caller]
-// SAFETY: callers must exclude same-CPU scheduler reentry for the complete
-// guard lifetime; the tracked global lock serializes every other CPU.
-pub(super) unsafe fn scheduler_mut() -> SchedulerAccessGuard {
-    let caller = Location::caller();
-    assert_ne!(
-        nucleus_core::util::lockdep::current_lock_class(),
-        Some(LockClass::Scheduler as u8),
-        "scheduler invariant: recursive scheduler entry caller={}:{}",
-        caller.file(),
-        caller.line()
-    );
-    let logical_index = nucleus_core::util::lockdep::current_cpu_index();
-    assert!(
-        logical_index < CURRENT_TASK_SLOTS.len(),
-        "scheduler invariant: logical CPU index exceeds capacity"
-    );
-    // ORDERING: Acquire observes a prior BSP bootstrap-slot admission.
-    if logical_index == 0 && !CURRENT_TASK_ACTIVE[0].load(Ordering::Acquire) {
-        // ORDERING: BSP slot zero is the pre-scheduler bootstrap owner.
-        CURRENT_TASK_SLOTS[0].store(0, Ordering::Release);
-        // ORDERING: Release publishes the bootstrap slot after its value.
-        assert!(
-            CURRENT_TASK_ACTIVE[0]
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok(),
-            "scheduler invariant: concurrent BSP current-task admission"
-        );
-    }
-    // ORDERING: Acquire proves AP current-slot publication precedes entry.
-    assert!(
-        logical_index == 0 || CURRENT_TASK_ACTIVE[logical_index].load(Ordering::Acquire),
-        "scheduler invariant: AP entered before current-task admission"
-    );
-    record_acquire_site(caller);
-    let started_at = crate::arch::clock::monotonic_nanos();
-    let mut deadline_poll_spins: u32 = 0;
-    let mut guard = SCHEDULER
-        .lock_scheduler_bounded(|| {
-            deadline_poll_spins = deadline_poll_spins.wrapping_add(1);
-            deadline_poll_spins.is_multiple_of(SCHEDULER_LOCK_DEADLINE_POLL_SPINS)
-                && crate::arch::clock::monotonic_nanos().saturating_sub(started_at)
-                    >= SCHEDULER_LOCK_TIMEOUT_NS
-        })
-        .unwrap_or_else(|| {
-            let now = crate::arch::clock::monotonic_nanos();
-            // ORDERING: Acquire of the owner CPU observes the diagnostic
-            // fields published before that CPU entered the protected body.
-            let owner_cpu = SCHEDULER_OWNER_CPU.load(Ordering::Acquire);
-            let owner_diagnostic = SCHEDULER_OWNER_DIAGNOSTICS.get(owner_cpu);
-            let owner_slot = owner_diagnostic
-                .map(|diagnostic| diagnostic.slot.load(Ordering::Relaxed))
-                .unwrap_or(0);
-            let owner_acquired_ns = owner_diagnostic
-                .map(|diagnostic| diagnostic.acquired_ns.load(Ordering::Relaxed))
-                .unwrap_or(now);
-            // ORDERING: the owner CPU acquire above covers this final relaxed
-            // field in the selected CPU's diagnostic publication.
-            let owner_caller = owner_diagnostic
-                .map(|diagnostic| diagnostic.caller.load(Ordering::Relaxed))
-                .unwrap_or(ptr::null_mut());
-            let (owner_file, owner_line) = if owner_caller.is_null() {
-                ("<unpublished>", 0)
-            } else {
-                // SAFETY: `Location::caller` returns a static allocation and
-                // its pointer remains valid after diagnostic publication.
-                let owner_caller = unsafe { &*owner_caller };
-                (owner_caller.file(), owner_caller.line())
-            };
-            panic!(
-                "scheduler invariant: global scheduler lock acquisition timed out waiter_cpu={} waiter={}:{} waited_ns={} owner_cpu={} owner_slot={} owner={}:{} held_ns={}",
-                logical_index,
-                caller.file(),
-                caller.line(),
-                now.saturating_sub(started_at),
-                owner_cpu,
-                owner_slot,
-                owner_file,
-                owner_line,
-                now.saturating_sub(owner_acquired_ns),
-            );
-        });
-    let acquired_at_ns = crate::arch::clock::monotonic_nanos();
-    guard.record_runtime_profile_lock_wait(acquired_at_ns.saturating_sub(started_at));
-    // ORDERING: Acquire restores this CPU's last published current-task slot
-    // into the lock-protected scheduler scratch field.
-    let original_task = CURRENT_TASK_SLOTS[logical_index].load(Ordering::Acquire);
-    // ORDERING: Acquire rejects Rust reentry until the post-RSP assembly
-    // callback has release-cleared the prior outgoing stack owner.
-    assert!(
-        !TRANSITION_ACTIVE[logical_index].load(Ordering::Acquire),
-        "scheduler invariant: Rust reentry preceded assembly stack-handoff commit"
-    );
-    set_scheduler_current_task_scratch_for_cpu(logical_index, original_task);
-    // ORDERING: prepare every relaxed diagnostic field before release
-    // publishing the owner CPU below.
-    let owner_diagnostic = &SCHEDULER_OWNER_DIAGNOSTICS[logical_index];
-    owner_diagnostic
-        .slot
-        .store(original_task, Ordering::Relaxed);
-    owner_diagnostic
-        .acquired_ns
-        .store(acquired_at_ns, Ordering::Relaxed);
-    // ORDERING: this final relaxed field is also covered by the owner CPU's
-    // following release publication.
-    owner_diagnostic.caller.store(
-        caller as *const Location<'static> as *mut Location<'static>,
-        Ordering::Relaxed,
-    );
-    // ORDERING: Release publishes one complete diagnostic owner record after
-    // the tracked scheduler lock has been acquired.
-    SCHEDULER_OWNER_CPU.store(logical_index, Ordering::Release);
-    // A wake raised by an IRQ that interrupted any raw owner cannot enter the
-    // scheduler at that point. Consume those exact task identities only after
-    // this CPU has safely acquired scheduler ownership.
-    let phase_total_at_acquire_ns = guard.runtime_profile_phase_total_ns();
-    let deferred_wakes = super::deferred_wake::take_current_cpu(logical_index);
-    let deferred_wake_count = deferred_wakes.len();
-    for task_id in deferred_wakes.iter() {
-        let _ = guard.wake_task(task_id);
-    }
-    // Charged unconditionally: the drain runs on every acquisition whether or
-    // not it finds work, and an unattributed prologue would read as a
-    // descheduled owner in the hold-maximum record.
-    guard.record_runtime_profile_prologue(
-        deferred_wake_count as u64,
-        crate::arch::clock::monotonic_nanos().saturating_sub(acquired_at_ns),
-    );
-    SchedulerAccessGuard {
-        guard: Some(guard),
-        logical_index,
-        original_task,
-        acquired_at_ns,
-        caller,
-        phase_total_at_acquire_ns,
-    }
+/// Exact image scope qualifies this turn; no directory is acquired or renamed.
+pub(super) fn with_bootstrap_turn<R>(
+    preemption: nucleus_core::util::lockdep::DispatchPreemption<'static>,
+    scope: &super::scheduler::bootstrap::HardwareScope<'_>,
+    idle: bool,
+    install: impl FnOnce(&dispatch_turn::CpuDispatchTurn<'static>) -> R,
+) -> R {
+    let cpu = preemption.cpu();
+    scope.assert_current(cpu);
+    let slot = scope.slot();
+    let mut turn = dispatch_turn::begin(preemption, slot);
+    turn.mask_irqs();
+    let result = install(&turn);
+    scope.assert_current(cpu);
+    turn.publish_return(slot, idle).after_directory_unlock();
+    result
 }
 
-#[inline(always)]
-#[track_caller]
-// SAFETY: identical to `scheduler_mut`; the returned guard retains exclusive
-// scheduler access even when the caller only reads.
-pub(super) unsafe fn scheduler_ref() -> SchedulerAccessGuard {
-    // SAFETY: the caller of this function supplied the required exclusion.
-    unsafe { scheduler_mut() }
+/// Exact exec image owns this unchanged-Current control return. No directory,
+/// next-task scratch or fresh selection authority participates.
+pub(super) fn with_exec_image_turn<R>(
+    preemption: nucleus_core::util::lockdep::DispatchPreemption<'static>,
+    image: &super::scheduler::exec_transaction::ExecImageLease<'_>,
+    install: impl FnOnce(&nucleus_core::util::lockdep::DispatchPreemption<'static>) -> R,
+) -> Option<R> {
+    let cpu = preemption.cpu();
+    let slot = image.cpu_actor(cpu)?;
+    let mut turn = dispatch_turn::begin(preemption, slot);
+    turn.mask_irqs();
+    let result = install(turn.preemption());
+    let idle = image.finish_cpu_actor(cpu, slot);
+    let completion = turn.publish_return(slot, idle);
+    super::irq::flush_deferred_target_reschedules();
+    completion.after_directory_unlock();
+    Some(result)
 }
 
-pub(super) fn publish_cpu_current_task(logical_index: usize, slot: usize) {
+pub(super) fn publish_cpu_current_task(image: &super::scheduler::bootstrap::InitialCpu<'_>) {
+    image.assert_publication();
+    let logical_index = image.cpu();
+    let slot = image.slot();
     assert!(
         logical_index < CURRENT_TASK_SLOTS.len() && slot < MAX_SCHEDULER_TASKS,
         "scheduler invariant: invalid per-CPU current-task publication"
@@ -533,6 +227,10 @@ pub(super) fn publish_cpu_current_task(logical_index: usize, slot: usize) {
         !slot_has_remote_owner(logical_index, slot),
         "scheduler invariant: initial task already runs on another CPU"
     );
+    #[cfg(not(test))]
+    {
+        super::scheduler::stack_resources::cpu_leases::initialize(image);
+    }
     // ORDERING: Release makes the initialized idle context visible before the
     // AP is allowed to enter scheduler code.
     CURRENT_TASK_SLOTS[logical_index].store(slot, Ordering::Release);
@@ -562,7 +260,7 @@ pub(super) fn scheduler_current_task_scratch() -> usize {
 /// Replaces the caller CPU's private scheduler-turn scratch slot.
 ///
 /// Callers hold the exact CPU's scheduler dispatch exclusion.  Publication to
-/// remote observers remains deferred to `SchedulerAccessGuard::drop`, after
+/// remote observers remains deferred to the original CPU turn's return, after
 /// the outgoing stack-transition owner is installed.
 #[inline]
 pub(super) fn set_scheduler_current_task_scratch(slot: usize) {
@@ -570,25 +268,48 @@ pub(super) fn set_scheduler_current_task_scratch(slot: usize) {
     set_scheduler_current_task_scratch_for_cpu(logical_index, slot);
 }
 
-/// Returns the CPU already bound to the live global-scheduler turn.
-///
-/// `scheduler_mut` derives this identity before acquiring the guard and
-/// release-publishes it before any `Scheduler` method can inspect the private
-/// scratch slot.  The tracked guard keeps preemption disabled until the owner
-/// word is cleared, so re-deriving the same identity on every
-/// `current_task_slot` call only repeats an architectural CPU-token read.  This
-/// word still grants no scheduler authority: callers must already hold the
-/// guard, and an absent owner fails closed.
+/// Exact private scratch authority belongs to this CPU's unique local turn.
+/// The global owner CPU is diagnostic publication only; a foreign CPU can no
+/// longer derive scratch permission from whichever directory writer holds it.
 #[inline]
-fn scheduler_turn_logical_index() -> usize {
-    // ORDERING: Acquire observes the live turn record published after the
-    // tracked guard acquired the scheduler and before any method can run.
-    let logical_index = SCHEDULER_OWNER_CPU.load(Ordering::Acquire);
-    assert!(
-        logical_index < SCHEDULER_CURRENT_TASK_SCRATCH.len(),
-        "scheduler invariant: scratch accessed outside a live scheduler turn"
-    );
-    logical_index
+pub(super) fn scheduler_turn_logical_index() -> usize {
+    dispatch_turn::current_cpu()
+}
+
+pub(in crate::multitask) fn has_placement(cpu: usize, slot: usize) -> bool {
+    dispatch_turn::has_placement(cpu, slot)
+}
+
+pub(in crate::multitask) fn current_placement_scope(
+    cpu: usize,
+    slot: usize,
+) -> Option<Option<super::scheduler::PlacementGrant>> {
+    dispatch_turn::current_placement_scope(cpu, slot)
+}
+pub(in crate::multitask) fn retain_placement(cpu: usize, grant: super::scheduler::PlacementGrant) {
+    dispatch_turn::retain_placement(cpu, grant);
+}
+
+pub(super) fn can_retain_mm_activation(
+    cpu: usize,
+    incoming: &super::scheduler::stack_resources::activation::ActivationCredential,
+) -> bool {
+    dispatch_turn::can_retain_activation(cpu, incoming)
+}
+
+pub(super) fn can_retain_mm_identity(
+    cpu: usize,
+    slot: usize,
+    task_id: u64,
+    mm: &super::process_table::MmExecutionPin,
+) -> bool {
+    dispatch_turn::can_retain_identity(cpu, slot, task_id, mm)
+}
+pub(super) fn retain_mm_activation(
+    cpu: usize,
+    incoming: super::scheduler::stack_resources::activation::ActivationCredential,
+) {
+    dispatch_turn::retain_activation(cpu, incoming);
 }
 
 #[inline]
@@ -603,7 +324,7 @@ fn scheduler_current_task_scratch_for_cpu(logical_index: usize) -> usize {
 }
 
 #[inline]
-fn set_scheduler_current_task_scratch_for_cpu(logical_index: usize, slot: usize) {
+pub(in crate::multitask) fn set_scheduler_current_task_scratch_for_cpu(logical_index: usize, slot: usize) {
     assert!(
         logical_index < SCHEDULER_CURRENT_TASK_SCRATCH.len() && slot < MAX_SCHEDULER_TASKS,
         "scheduler invariant: invalid CPU-local dispatch scratch publication"
@@ -685,9 +406,19 @@ pub(super) extern "C" fn commit_context_switch() {
         logical_index < TRANSITION_ACTIVE.len(),
         "scheduler invariant: stack-handoff commit CPU exceeds capacity"
     );
+    let Some(commit) = dispatch_turn::begin_commit(logical_index) else {
+        return;
+    };
     // ORDERING: Release makes the completed architectural stack switch happen
     // before remote scheduler/lifetime readers may observe transition clear.
     TRANSITION_ACTIVE[logical_index].store(false, Ordering::Release);
+    if commit.physical_banks() {
+        super::scheduler::stack_resources::cpu_leases::commit(logical_index);
+    }
+    super::current_identity::execution::banks::commit(logical_index);
+    // Keep local reentry closed until the outgoing allocation has also been
+    // released on the incoming RSP. A duplicate cannot spend a producer turn.
+    commit.finish();
 }
 
 pub(super) fn task_slot_is_running(slot: usize) -> bool {
@@ -831,7 +562,6 @@ mod tests {
     use super::super::irq;
     use super::test_support::{
         install_test_current_owner, install_test_transition_owner_with_admission,
-        test_scheduler_guard_for_release,
     };
     use super::{
         AtomicBool, AtomicUsize, CpuSwitchPublication, Ordering, TaskExecutionOwner,
@@ -920,7 +650,7 @@ mod tests {
         ));
 
         // ORDERING: Publish the outgoing stack transition before the incoming
-        // current slot, exactly as `SchedulerAccessGuard::drop` does.
+        // current slot, exactly as the original CPU turn's publication does.
         transition_slots[1].store(17, Ordering::Release);
         transition_active[1].store(true, Ordering::Release);
         slots[1].store(23, Ordering::Release);
@@ -1000,29 +730,30 @@ mod tests {
 
     #[test]
     fn scheduler_guard_release_flushes_deferred_target_notification() {
-        let _serial = test_publication_lock();
-        let _flush_reset = DeferredTargetFlushReset::new();
-        let logical_index = 0;
-        let original_task = super::MAX_SCHEDULER_TASKS - 5;
-        let selected_task = super::MAX_SCHEDULER_TASKS - 4;
-        let _publication = install_test_current_owner(logical_index, original_task);
-        let target_cpu = 1;
-        irq::prepare_test_deferred_target_reschedule(target_cpu);
+        // Keep the historical mutation witness ID, but exercise the actual
+        // independent IRQ owner. No global-lock fixture or scalar Current can
+        // stand in for this born allocation's original physical/UID banks.
+        super::super::scheduler::irq_entry_tests::current(|_| {
+            let _flush_reset = DeferredTargetFlushReset::new();
+            let mut scope = nucleus_core::util::lockdep::DispatchPreemption::enter();
+            scope.mask_irqs();
+            let entry = super::irq_entry::DispatchEntry::from_scope(scope);
+            let target_cpu = 1;
+            irq::prepare_test_deferred_target_reschedule(target_cpu);
+            drop(entry);
 
-        let guard = test_scheduler_guard_for_release(logical_index, original_task, selected_task);
-        drop(guard);
-
-        assert_eq!(irq::test_deferred_target_reschedule_pending_mask(), 0);
-        assert_eq!(
-            irq::test_deferred_target_reschedule_sent_mask(),
-            1_u64 << target_cpu,
-            "the release path must claim and validate the exact remote target"
-        );
-        assert_eq!(
-            irq::test_deferred_target_reschedule_flush_epoch(),
-            1,
-            "the live SchedulerAccessGuard release must send one validated target notification"
-        );
+            assert_eq!(irq::test_deferred_target_reschedule_pending_mask(), 0);
+            assert_eq!(
+                irq::test_deferred_target_reschedule_sent_mask(),
+                1_u64 << target_cpu,
+                "the release path must claim and validate the exact remote target"
+            );
+            assert_eq!(
+                irq::test_deferred_target_reschedule_flush_epoch(),
+                1,
+                "the original IRQ turn must send one validated target notification"
+            );
+        });
     }
 
     #[test]
@@ -1039,7 +770,7 @@ mod tests {
             to: incoming_slot,
             to_idle: false,
         }
-        .publish_before_return();
+        .publish_phase_model();
 
         assert_eq!(
             task_execution_owner(outgoing_slot),

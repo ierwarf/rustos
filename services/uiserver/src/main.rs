@@ -258,22 +258,25 @@ fn prepare_drawable_update(
     drawable_update
 }
 
+fn install_desktop_background(state: &mut AppState, background: render::DesktopBackground) -> bool {
+    if !background.fits(state.surface.width as usize, state.surface.height as usize) {
+        return false;
+    }
+    state.desktop_cache.width = background.width;
+    state.desktop_cache.height = background.height;
+    state.desktop_cache.background_pixels = background.pixels;
+    state.desktop_cache.background_valid = true;
+    state.desktop_cache.chrome_valid = false;
+    true
+}
+
 fn apply_ready_desktop_backgrounds(
     state: &mut AppState,
     backgrounds: &std::sync::mpsc::Receiver<render::DesktopBackground>,
 ) -> bool {
     let mut ready = false;
     while let Ok(background) = backgrounds.try_recv() {
-        if background.width == state.surface.width as usize
-            && background.height == state.surface.height as usize
-        {
-            state.desktop_cache.width = background.width;
-            state.desktop_cache.height = background.height;
-            state.desktop_cache.background_pixels = background.pixels;
-            state.desktop_cache.background_valid = true;
-            state.desktop_cache.chrome_valid = false;
-            ready = true;
-        }
+        ready |= install_desktop_background(state, background);
     }
     ready
 }

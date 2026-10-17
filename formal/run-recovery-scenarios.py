@@ -159,31 +159,77 @@ def read_registry(root: Path) -> list[dict[str, str]]:
     return scenarios
 
 
-def run_scenario(root: Path, artifact_dir: Path, scenario: dict[str, str]) -> dict:
+def build_key(scenario: dict[str, str]) -> tuple[str, str, str]:
+    return scenario["package"], scenario["features"], scenario["target"]
+
+
+def build_witnesses(root: Path, scenario: dict[str, str]) -> list[Path]:
+    """Compile once per Cargo configuration, outside the witness run deadline.
+
+    Cargo JSON artifact paths are the exact binaries built with the requested
+    feature and target flags. Reuse them for every witness with that key; do
+    not infer paths from target/deps or trust a stale binary from another cfg.
+    """
     command = ["cargo", "test", "-q", "-p", scenario["package"]]
     if scenario["features"] != "-":
         command.extend(["--features", scenario["features"]])
     if scenario["target"] == "lib":
         command.append("--lib")
-    command.append(scenario["test"])
+    command.extend(["--no-run", "--message-format=json"])
+    result = subprocess.run(command, cwd=root, text=True, capture_output=True, check=False)
+    if result.returncode:
+        print("\n".join(result.stderr.splitlines()[-20:]), file=sys.stderr)
+        raise SystemExit(f"{scenario['id']}: witness build failed")
+    binaries = [
+        Path(path)
+        for line in result.stdout.splitlines()
+        if (artifact := json.loads(line)).get("reason") == "compiler-artifact"
+        if artifact.get("profile", {}).get("test")
+        if (path := artifact.get("executable"))
+    ]
+    if not binaries or any(not binary.is_file() for binary in binaries):
+        raise SystemExit(f"{scenario['id']}: no complete Cargo test artifact")
+    return list(dict.fromkeys(binaries))
+
+
+def run_scenario(
+    root: Path, artifact_dir: Path, scenario: dict[str, str], binaries: list[Path]
+) -> dict:
     started = time.monotonic()
-    result = subprocess.run(
-        command,
-        cwd=root,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        timeout=int(scenario["max_ms"]) / 1000,
-        env=os.environ.copy(),
-        check=False,
-    )
+    deadline = started + int(scenario["max_ms"]) / 1000
+    outputs = []
+    passed = False
+    for binary in binaries:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise SystemExit(f"{scenario['id']}: witness execution exceeded deadline")
+        try:
+            result = subprocess.run(
+                [str(binary), scenario["test"]],
+                cwd=root,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=remaining,
+                env=os.environ.copy(),
+                check=False,
+            )
+        except subprocess.TimeoutExpired as error:
+            partial = error.stdout or b""
+            if isinstance(partial, bytes):
+                partial = partial.decode("utf-8", errors="replace")
+            outputs.append(partial)
+            (artifact_dir / f"{scenario['id']}.log").write_text("\n".join(outputs), encoding="utf-8")
+            raise SystemExit(f"{scenario['id']}: witness execution timed out") from error
+        outputs.append(result.stdout)
+        if result.returncode != 0:
+            (artifact_dir / f"{scenario['id']}.log").write_text("\n".join(outputs), encoding="utf-8")
+            print("\n".join(result.stdout.splitlines()[-100:]), file=sys.stderr)
+            raise SystemExit(f"{scenario['id']}: witness command failed")
+        passed |= bool(re.search(r"test result: ok\. [1-9][0-9]* passed;", result.stdout))
     elapsed_ms = round((time.monotonic() - started) * 1000)
-    log = artifact_dir / f"{scenario['id']}.log"
-    log.write_text(result.stdout, encoding="utf-8")
-    if result.returncode != 0:
-        print("\n".join(result.stdout.splitlines()[-100:]), file=sys.stderr)
-        raise SystemExit(f"{scenario['id']}: witness command failed")
-    if not re.search(r"test result: ok\. [1-9][0-9]* passed;", result.stdout):
+    (artifact_dir / f"{scenario['id']}.log").write_text("\n".join(outputs), encoding="utf-8")
+    if not passed:
         raise SystemExit(f"{scenario['id']}: test filter executed no witness")
     return {
         **scenario,
@@ -207,7 +253,15 @@ def main() -> int:
     scenarios = read_registry(root)
     artifact_dir = root / "build/formal/recovery-scenarios"
     artifact_dir.mkdir(parents=True, exist_ok=True)
-    results = [run_scenario(root, artifact_dir, scenario) for scenario in scenarios]
+    binaries = {}
+    for scenario in scenarios:
+        key = build_key(scenario)
+        if key not in binaries:
+            binaries[key] = build_witnesses(root, scenario)
+    results = [
+        run_scenario(root, artifact_dir, scenario, binaries[build_key(scenario)])
+        for scenario in scenarios
+    ]
     registry = root / "formal/recovery-scenarios.tsv"
     summary = {
         "schema": "rustos-recovery-scenario-evidence-v1",

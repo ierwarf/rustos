@@ -842,8 +842,11 @@ policy remains with the owning service.
   optimization target and a 5-second hard acceptance limit. The KVM harness
   starts this clock only after both guests exist and fails independently of the
   broader 30-second readiness budget when
-  `uiserver: gpu-compositor active contract=3` is late. Storage-only validation
-  is excluded because it intentionally launches no UI.
+  `uiserver: gpu-compositor active contract=3` is late. The required first
+  retained-scene gradient is published by a bounded `uiserver` bootstrap
+  worker before that worker self-demotes for the optional full background;
+  the GPU marker may not be synthesized from a CPU-only frame. Storage-only
+  validation is excluded because it intentionally launches no UI.
 - A service dependency is checked once per publication epoch. Supervisors use
   deferred-start plus exact-PID endpoint wait when they own the child. A child
   activated behind an already-proven dependency performs at most one admitted
@@ -1010,8 +1013,27 @@ policy remains with the owning service.
   slot unreapable. Executive housekeeping then removes every task-scoped
   futex, wait-set, service-discovery, input, block, bootstrap-TTY, and proc
   broker record; terminal-process cleanup also closes provider references and
-  revokes service publications. Only an exact cleanup acknowledgement permits
-  slot reuse. A wait-lock unlock skips retired queue heads until it wakes one
+  revokes service publications. The directory publishes the immutable cleanup
+  token only after all terminal metadata is complete. An independently locked
+  Identity/lifecycle publication has an independent per-slot class-51 writer
+  (IRQ-excluded leaf); metadata writers cannot supply lifecycle flags. Pending
+  suspend/stop intent survives missing partial-initialization metadata; exact
+  live commands reject a reused task ID. Four Scheduler gate arrays are
+  test-only, not production authority. Cross-owner admission/exec/frame lifetime
+  still belongs to the remaining directory/resource boundary. The
+  per-slot `SchedulerRetirementCleanup` owner holds deferred producer custody
+  and both cleanup/kernel Pending→Claimed→Complete transactions. Exec freezes
+  process-detach metadata before either token becomes visible. Kernel claims
+  are private, non-Copy and generation-bound; their final ACK follows all
+  revocation/wake/detach work. Claim/ACK APIs do not acquire Scheduler and
+  release the cell before external
+  cleanup, user copy/faults or other subsystem locks. Only an exact claimed
+  task and full-payload cleanup ACK plus kernel ACK permits reset/reuse;
+  Pending/Claimed and deferred/in-progress producers remain unreapable. Reset
+  precedes runtime/slot identity teardown; reaper notification is atomic
+  consume-before-scan, not a lost-wakeup final false store. Producer and
+  execution/process/TLB/stack quiescence still require their existing owners.
+  A wait-lock unlock skips retired queue heads until it wakes one
   live task, so a stale identity cannot consume the only wakeup.
   A hardware-IRQ context validator may only quarantine the fixed task slot and
   record one allocation-free deferred reason. It must not scan the live
@@ -1666,15 +1688,20 @@ policy remains with the owning service.
   and every reserved field are zero. Loaderd rebinds the requester to the
   kernel-stamped sender before invoking
   `SYS_RUSTOS_PROC_ACTIVATE_BATCH_BROKER`. Ring0 holds the deferred-activation
-  registry and then the scheduler lock, preflights every exact capability and
-  suspended saved context, publishes the complete cohort, and consumes all
-  capabilities before releasing either owner. For a multi-target batch
-  admitted into an empty spawn FIFO, kernel-ps gives exactly those 2..=8
-  members their FIFO first turns before the synchronous loader reply resumes.
+  registry while capturing an exact suspended binding Cohort, without the
+  Scheduler directory. Full capability/frame preflight precedes bounded
+  authority consumption; no identity/resource/policy leaf spans that callback.
+  Task effects precede one group admission Release. A concurrent terminal stop
+  wins without revival, including hidden metadata. For a multi-target batch
+  admitted into available atomic-cohort priority custody, kernel-ps gives those
+  surviving members FIFO first turns before the synchronous loader reply resumes;
+  competing priority saturation degrades to ordinary spawn custody, not panic.
   Later single spawns cannot extend that prefix, so reply delay remains ABI
-  bounded. Any validation failure changes no member. A post-preflight mismatch
-  is ring0 corruption and panics instead of exposing a partially runnable
-  startup cohort.
+  bounded. Any validation failure before authority consumption changes no member.
+  Lost exact binding/suspension or impossible post-effect mismatch is ring0
+  corruption; desired terminal stop is not corruption. Concurrent task-affinity
+  replacement shares the Identity51 cohort leaf and refuses before masks/epoch,
+  returning the existing MissingTask error; there is no new wire/errno enum.
 - `SYS_RUSTOS_SPAWN_EXEC` restricted to `rootd` spawning the fixed bootstrap allowlist (`syscalld`, `vfsd`, `loaderd`, `procd`, `initd`). Fails closed for `initd`, generic apps, broad service restarts. rootd may use direct spawn only during fixed bootstrap + `loaderd` recovery; post-bootstrap restarts of other leases must call loaderd.
 - Linux `execve` → `procd` (target auth) → `loaderd` (image materialization)
   → `vfsd` (namespace resolution and immutable executable snapshot). Kernel
@@ -1957,7 +1984,7 @@ does not satisfy the 55 FPS gate.
 
 procd owns Linux `execve`, `fork`/`clone`, `wait4`, `rt_sigaction`, `rt_sigprocmask`, `sigaltstack`, `tgkill`, signal selection. Procd IPC ABI v4 removes the copied cwd payload from exec requests: the raw path and `AT_FDCWD` basis continue through loaderd to vfsd, which resolves them against the target PID's namespace. It retains v3's distinct default-stop disposition and exact coalesced SIGCHLD cause snapshot; ring0 rejects a stop signal mapped to termination, a non-stop signal mapped to stop, and every stale or out-of-mask cause selection.
 
-`wait4` routes through procd for ownership validation; kernel still performs narrow process-table wait + status/rusage copyout. `WUNTRACED` consumes one exact `(signal << 8) | 0x7f` child stop state and `WCONTINUED` consumes `0xffff`; without the matching option the state remains pending. A default stop gates every Linux task in the process while preserving its ready/block state. SIGCONT resumes all of them before its own disposition or mask is considered, and SIGKILL also removes the stop gate before termination delivery. Stop, continue, and exit queue process-directed SIGCHLD with exact coalesced cause bits. A receiving thread transfers those causes to a live sibling before retirement. Procd applies `SA_NOCLDSTOP` only when no exit cause coalesced, while ring0 revalidates and removes only the selected snapshot so a cause queued during the policy round trip remains pending.
+`wait4` routes through procd for ownership validation; kernel still performs narrow process-table wait + status/rusage copyout. `WUNTRACED` consumes one exact `(signal << 8) | 0x7f` child stop state and `WCONTINUED` consumes `0xffff`; without the matching option the state remains pending. A default stop gates every Linux task in the process while preserving its ready/block state. SIGCONT resumes all of them before its own disposition or mask is considered, and SIGKILL also removes the stop gate before termination delivery. Transient membership/job-control contention returns `EAGAIN` before signal publication; a refused Current stop preserves its pending cause for retry rather than acknowledging an uncommitted stop. Stop, continue, and exit queue process-directed SIGCHLD with exact coalesced cause bits. A receiving thread transfers those causes to a live sibling before retirement. Procd applies `SA_NOCLDSTOP` only when no exit cause coalesced, while ring0 revalidates and removes only the selected snapshot so a cause queued during the policy round trip remains pending.
 
 Kernel keeps only: user-copy, address-space replacement, scheduler mutation, pending-signal wakeup, Linux x86_64 `rt_sigframe`/`rt_sigreturn`.
 

@@ -27,6 +27,7 @@ impl RunQueueTestScope {
         let serial = TEST_GUARD.lock().unwrap();
         reset_before_publication();
         reset_test_local_migrating_owner();
+        claim::reset_claim_cas_race();
         Self { _serial: serial }
     }
 }
@@ -35,6 +36,7 @@ impl Drop for RunQueueTestScope {
     fn drop(&mut self) {
         reset_before_publication();
         reset_test_local_migrating_owner();
+        claim::reset_claim_cas_race();
     }
 }
 
@@ -117,6 +119,7 @@ fn published_membership_mirrors_the_locked_bitmap_through_the_local_lifecycle() 
 #[test]
 fn remote_wake_has_one_mailbox_and_one_local_owner() {
     let _guard = TEST_GUARD.lock().unwrap();
+    crate::multitask::current_identity::clear(7); // pure queue fixture, not a published task
     reset_before_publication();
     admit_blocked(7);
     assert_eq!(
@@ -377,6 +380,123 @@ fn dispatch_rejects_wrong_cpu_without_changing_owner() {
 }
 
 #[test]
+fn local_dispatch_claim_rejects_republished_generation_without_consuming_queue() {
+    let _scope = RunQueueTestScope::new();
+    let slot = 12;
+    let cpu = 3;
+    let weight = 220;
+    admit_blocked(slot);
+    publish_local(slot, cpu, weight);
+    let observed = owner(slot);
+    publish_blocked(slot, cpu, weight);
+    publish_local(slot, cpu, weight);
+    let republished = owner(slot);
+    assert_eq!(republished.state, RunOwnerState::Local);
+    assert!(republished.runnable);
+    assert_ne!(republished.generation, observed.generation);
+    assert!(!claim_dispatch_with_owner_generation(
+        slot,
+        cpu,
+        weight,
+        Some(observed.generation),
+    ));
+    assert_eq!(owner(slot), republished);
+    assert_eq!(published_runnable_count(cpu), 1);
+    // The failed local claim must not consume this candidate or prevent a
+    // different, freshly claimed current/idle continuation on the same CPU.
+    let continuation = 13;
+    admit_blocked(continuation);
+    publish_local(continuation, cpu, weight);
+    assert!(claim_dispatch(continuation, cpu, weight));
+    assert_eq!(owner(continuation).state, RunOwnerState::Running);
+    assert_eq!(owner(slot), republished);
+    assert_eq!(published_runnable_count(cpu), 1);
+    assert!(claim_dispatch_with_owner_generation(
+        slot,
+        cpu,
+        weight,
+        Some(republished.generation),
+    ));
+    assert_eq!(owner(slot).state, RunOwnerState::Running);
+}
+
+#[test]
+fn activation_token_cannot_claim_a_republished_local_generation() {
+    let _scope = RunQueueTestScope::new();
+    let (slot, cpu, weight) = (12, 3, 220);
+    admit_blocked(slot);
+    publish_local(slot, cpu, weight);
+    let selected = owner(slot);
+    assert!(rustos_scheduler_frame_gate::first_turn_claim_custody(
+        802,
+        802,
+        selected.generation,
+        selected.generation,
+        true,
+        true,
+        selected.runnable,
+    ));
+    publish_blocked(slot, cpu, weight);
+    publish_local(slot, cpu, weight);
+    let fresh = owner(slot);
+    assert_ne!(selected.generation, fresh.generation);
+    assert!(!rustos_scheduler_frame_gate::first_turn_claim_custody(
+        802,
+        802,
+        selected.generation,
+        fresh.generation,
+        true,
+        true,
+        fresh.runnable,
+    ));
+    assert!(!claim_dispatch_with_owner_generation(
+        slot,
+        cpu,
+        weight,
+        Some(selected.generation),
+    ));
+    assert_eq!(owner(slot), fresh);
+    assert_eq!(published_runnable_count(cpu), 1);
+}
+
+#[test]
+fn local_claim_losing_lock_free_owner_update_leaves_queue_and_fallback_custody_intact() {
+    let _scope = RunQueueTestScope::new();
+    let slot = 12;
+    let cpu = 3;
+    let weight = 220;
+    admit_blocked(slot);
+    publish_local(slot, cpu, weight);
+    let expected_generation = owner(slot).generation;
+    let before_sequence = local_runnable_sequence(cpu);
+    claim::force_claim_cas_race(slot);
+    assert!(!claim_dispatch_with_owner_generation(
+        slot,
+        cpu,
+        weight,
+        Some(expected_generation),
+    ));
+    let observed = owner(slot);
+    assert_eq!(observed.state, RunOwnerState::Local);
+    assert_eq!(observed.generation, expected_generation);
+    assert!(!observed.runnable);
+    assert_eq!(local_runnable_sequence(cpu), before_sequence);
+    assert_eq!(published_runnable_count(cpu), 1);
+
+    // The rejected candidate is still queued for an exact later block/wake;
+    // a separate continuation can be freshly claimed without consuming it.
+    let continuation = 13;
+    admit_blocked(continuation);
+    publish_local(continuation, cpu, weight);
+    assert!(claim_dispatch(continuation, cpu, weight));
+    assert_eq!(owner(continuation).state, RunOwnerState::Running);
+    assert_eq!(owner(slot), observed);
+    assert_eq!(published_runnable_count(cpu), 1);
+    publish_blocked(slot, cpu, weight);
+    assert_eq!(published_runnable_count(cpu), 0);
+}
+
+#[test]
 fn nonrunnable_local_slot_cannot_be_claimed_until_its_exact_wake() {
     let _scope = RunQueueTestScope::new();
     let slot = 12;
@@ -559,6 +679,123 @@ fn rejected_direct_ordering_can_restore_exactly_one_local_owner() {
 }
 
 #[test]
+fn consumed_direct_fifo_generation_cannot_claim_or_materialize_a_new_direct_owner() {
+    let _scope = RunQueueTestScope::new();
+    let slot = 25;
+    let cpu = 2;
+    let weight = 144;
+    admit_blocked(slot);
+    assert!(matches!(
+        publish_direct_handoff(slot, cpu),
+        RemoteWakeOutcome::Published { .. }
+    ));
+    let consumed_generation = owner(slot).generation;
+    assert!(rollback_direct_handoff(slot, cpu));
+    assert!(matches!(
+        publish_direct_handoff(slot, cpu),
+        RemoteWakeOutcome::Published { .. }
+    ));
+    let fresh = owner(slot);
+    assert_ne!(fresh.generation, consumed_generation);
+    assert!(!claim_dispatch_with_owner_generation(
+        slot,
+        cpu,
+        weight,
+        Some(consumed_generation),
+    ));
+    assert!(!materialize_direct_handoff_with_generation(
+        slot,
+        cpu,
+        weight,
+        Some(consumed_generation),
+    ));
+    assert!(preserve_budget_refused_handoff_generation(
+        slot,
+        cpu,
+        weight,
+        consumed_generation,
+    ));
+    assert_eq!(owner(slot), fresh, "old FIFO proof cannot edit a new owner");
+    assert_eq!(published_runnable_count(cpu), 0);
+    assert!(claim_dispatch_with_owner_generation(
+        slot,
+        cpu,
+        weight,
+        Some(fresh.generation),
+    ));
+}
+
+#[test]
+fn consumed_generic_local_budget_refusal_never_republishes_an_owner() {
+    let _scope = RunQueueTestScope::new();
+    let (slot, cpu, weight) = (26, 2, 144);
+    admit_blocked(slot);
+    publish_local(slot, cpu, weight);
+    let local = owner(slot);
+    assert!(preserve_budget_refused_handoff_generation(
+        slot,
+        cpu,
+        weight,
+        local.generation,
+    ));
+    assert_eq!(owner(slot), local);
+    assert_eq!(published_runnable_count(cpu), 1);
+    publish_blocked(slot, cpu, weight);
+    assert!(matches!(
+        publish_direct_handoff(slot, cpu),
+        RemoteWakeOutcome::Published { .. }
+    ));
+    let fresh = owner(slot);
+    assert!(preserve_budget_refused_handoff_generation(
+        slot,
+        cpu,
+        weight,
+        local.generation,
+    ));
+    assert_eq!(
+        owner(slot),
+        fresh,
+        "an old generic hint cannot materialize a new Direct owner"
+    );
+}
+
+#[test]
+fn budget_refusal_after_consuming_a_direct_handoff_retains_claimable_custody() {
+    let _scope = RunQueueTestScope::new();
+    let slot = 25;
+    let cpu = 2;
+    let weight = 144;
+    let mut fifo = super::super::sync_handoff::SyncHandoffState::new();
+    assert!(
+        fifo.enqueue(super::super::sync_handoff::SyncHandoffRecord::new(
+            slot, 7025
+        ))
+    );
+    admit_blocked(slot);
+    assert!(matches!(
+        publish_direct_handoff(slot, cpu),
+        RemoteWakeOutcome::Published { .. }
+    ));
+    assert_eq!(published_runnable_count(cpu), 0);
+    assert_eq!(
+        fifo.take_next_ready_with_competitor(false, |_| true),
+        Some(slot)
+    );
+    assert_eq!(fifo.len(), 0, "the sole ordering token was consumed");
+
+    // Model the later budget-commit refusal in dispatch_schedule. No dispatch
+    // occurred, so that path must make the consumed direct owner fair-claimable.
+    assert!(preserve_budget_refused_handoff(slot, cpu, weight));
+    assert_eq!(owner(slot).state, RunOwnerState::Local);
+    assert_eq!(published_runnable_count(cpu), 1);
+    assert!(preserve_budget_refused_handoff(slot, cpu, weight));
+    assert_eq!(published_runnable_count(cpu), 1, "no duplicate insertion");
+    assert!(claim_dispatch(slot, cpu, weight));
+    assert!(!claim_dispatch(slot, cpu, weight));
+    assert!(!preserve_budget_refused_handoff(slot, cpu, weight));
+}
+
+#[test]
 fn rejected_fast_transaction_restores_exact_blocked_owner() {
     let _scope = RunQueueTestScope::new();
     let slot = 26;
@@ -640,6 +877,30 @@ fn migrating_owner_remains_runnable_until_mailbox_admission() {
     assert!(is_local_dispatchable(slot, target_cpu));
     retire(slot, 125);
     release_retired(slot);
+    reset_before_publication();
+}
+
+#[test]
+fn terminal_stop_between_migrating_cas_and_mailbox_publication_refuses_without_reanimation() {
+    let _serial = test_serial_guard();
+    reset_before_publication();
+    let slot = 119;
+    let target = 4;
+    admit_blocked(slot);
+    let blocked = owner(slot);
+    let migrating = blocked.next(RunOwnerState::Migrating, Some(target));
+    OWNER_WORDS[slot]
+        .compare_exchange(blocked, migrating)
+        .unwrap();
+    retire(slot, 100);
+    let stopped = owner(slot);
+    assert!(stopped.state.is_terminal());
+    assert_eq!(
+        publish_migrating_record(slot, migrating, target, 100),
+        RemoteWakeOutcome::Rejected
+    );
+    assert_eq!(owner(slot), stopped);
+    assert_eq!(drain_remote_wakes(target), 0);
     reset_before_publication();
 }
 

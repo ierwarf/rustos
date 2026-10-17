@@ -8,3 +8,4 @@ publish = false
 
 [dev-dependencies]
 shuttle = "=0.9.1"
+rustos-scheduler-frame-gate = { path = "../../libs/rustos-scheduler-frame-gate" }

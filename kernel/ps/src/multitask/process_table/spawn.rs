@@ -49,7 +49,10 @@ pub fn reserve_spawn() -> Option<SpawnReservation> {
     let transaction_id = allocate_lifecycle_transaction_id()?;
     let mut table = PROCESS_TABLE.lock();
     let (index, slot) = table.slots.iter_mut().enumerate().find(|(_, slot)| {
-        slot.object.is_none() && slot.spawn_transaction_id.is_none() && slot.generation != 0
+        slot.object.is_none()
+            && slot.spawn_transaction_id.is_none()
+            && slot.root_spawn.is_none()
+            && slot.generation != 0
     })?;
     let handle = ProcessHandle::new(index, slot.generation);
     slot.spawn_transaction_id = Some(transaction_id);
@@ -62,16 +65,120 @@ pub fn reserve_spawn() -> Option<SpawnReservation> {
 }
 
 /// Consume one exact pre-publication reservation by installing the fully
-/// constructed process. This is the sole transition that makes a reserved
-/// slot visible to PID/process-generation lookup.
+/// constructed process. A reservation sealed by an actual root producer cannot
+/// be spent by this copied-receipt entry; the root owner publishes with its key.
 pub fn publish_spawn(
     reservation: SpawnReservation,
     process_id: u64,
     parent_process_id: Option<u64>,
     state: UserProcessState,
 ) -> Option<ProcessHandle> {
-    // Heap construction stays outside the raw table critical section; if it
-    // fails, the caller still owns the reservation and must cancel it.
+    publish_inner(reservation, process_id, parent_process_id, state, None).map(|v| v.0)
+}
+
+/// Process-table half of an actual non-Copy root constructor. This snapshot
+/// alone does not authorize publication: it must match the live reserved row.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct RootSpawnKey {
+    reservation: SpawnReservation,
+    member: (usize, u64),
+    slot_generation: u64,
+    nonce: u64,
+}
+
+/// Actual non-Copy process-reservation loan. The row stores a key snapshot;
+/// only this live owner can publish/release it. Abandonment never clears a seal.
+pub(in crate::multitask) struct RootSpawnLoan {
+    key: RootSpawnKey,
+    live: bool,
+}
+impl RootSpawnLoan {
+    pub(in crate::multitask) fn reservation(&self) -> SpawnReservation {
+        self.key.reservation
+    }
+}
+
+pub(in crate::multitask) fn seal_root_spawn(
+    reservation: SpawnReservation,
+    member: (usize, u64),
+    slot_generation: u64,
+    nonce: u64,
+) -> Option<RootSpawnLoan> {
+    if slot_generation == 0 || nonce == 0 {
+        return None;
+    }
+    let key = RootSpawnKey {
+        reservation,
+        member,
+        slot_generation,
+        nonce,
+    };
+    let mut table = PROCESS_TABLE.lock();
+    let slot = table.lookup_slot_mut(reservation.handle)?;
+    if slot.object.is_some()
+        || slot.spawn_transaction_id != Some(reservation.transaction_id)
+        || slot.root_spawn.is_some()
+    {
+        return None;
+    }
+    slot.root_spawn = Some(key);
+    Some(RootSpawnLoan { key, live: true })
+}
+
+/// Untouched rollback only, before any PID visibility. Atomically cancel the
+/// original transaction with its seal: no unsealed receipt-publication gap may
+/// open before slot rollback. Release no foreign or already-visible process.
+pub(in crate::multitask) fn release_root_spawn(loan: &mut RootSpawnLoan) -> bool {
+    if !loan.live {
+        return false;
+    }
+    let key = loan.key;
+    let mut table = PROCESS_TABLE.lock();
+    let Some(slot) = table.lookup_slot_mut(key.reservation.handle) else {
+        return false;
+    };
+    if slot.object.is_some()
+        || slot.root_spawn != Some(key)
+        || slot.spawn_transaction_id != Some(key.reservation.transaction_id)
+    {
+        return false;
+    }
+    slot.spawn_transaction_id = None;
+    slot.root_spawn = None;
+    loan.live = false;
+    drop(table);
+    record_lifecycle_marker(
+        "lifecycle-spawn-cancel",
+        key.reservation.handle,
+        0,
+        key.reservation.transaction_id,
+    );
+    true
+}
+
+pub(in crate::multitask) fn publish_root_spawn(
+    loan: &mut RootSpawnLoan,
+    parent: Option<u64>,
+    state: UserProcessState,
+) -> Option<pin_owner::ProcessObjectPin> {
+    if !loan.live {
+        return None;
+    }
+    let key = loan.key;
+    let (_, pin) = publish_inner(key.reservation, key.member.1, parent, state, Some(key))?;
+    loan.live = false;
+    Some(pin.expect("root process publication lost pre-visibility pin"))
+}
+
+fn publish_inner(
+    reservation: SpawnReservation,
+    process_id: u64,
+    parent_process_id: Option<u64>,
+    state: UserProcessState,
+    root: Option<RootSpawnKey>,
+) -> Option<(ProcessHandle, Option<pin_owner::ProcessObjectPin>)> {
+    // Heap construction and failed-state destruction stay outside the table
+    // leaf. The table guard drops before this earlier-declared object on refusal.
     let object = Box::new(ProcessObject::new(
         process_id,
         parent_process_id,
@@ -80,11 +187,21 @@ pub fn publish_spawn(
     ));
     let mut table = PROCESS_TABLE.lock();
     let slot = table.lookup_slot_mut(reservation.handle)?;
-    if slot.object.is_some() || slot.spawn_transaction_id != Some(reservation.transaction_id) {
+    if slot.object.is_some()
+        || slot.spawn_transaction_id != Some(reservation.transaction_id)
+        || slot.root_spawn != root
+    {
         return None;
     }
     slot.object = Some(object);
     slot.spawn_transaction_id = None;
+    // Acquire actual backing BEFORE the release that admits live PID lookup;
+    // no capture-after-publication gap and no Class55 leaf spans this Class54.
+    let pin = root.map(|_| {
+        pin_owner::bind(reservation.handle.index(), reservation.handle.generation());
+        pin_owner::pin(reservation.handle).expect("new root process pin admission failed")
+    });
+    slot.root_spawn = None;
     publish_slot_visibility(reservation.handle.index(), slot);
     drop(table);
     record_lifecycle_marker(
@@ -93,7 +210,7 @@ pub fn publish_spawn(
         1,
         reservation.transaction_id,
     );
-    Some(reservation.handle)
+    Some((reservation.handle, pin))
 }
 
 /// Abort an unpublished spawn transaction. Nothing can observe the reserved
@@ -104,7 +221,10 @@ pub fn cancel_spawn(reservation: SpawnReservation) -> bool {
     let Some(slot) = table.lookup_slot_mut(reservation.handle) else {
         return false;
     };
-    if slot.object.is_some() || slot.spawn_transaction_id != Some(reservation.transaction_id) {
+    if slot.object.is_some()
+        || slot.spawn_transaction_id != Some(reservation.transaction_id)
+        || slot.root_spawn.is_some()
+    {
         return false;
     }
     slot.spawn_transaction_id = None;

@@ -6,7 +6,6 @@ use super::{
     MAIN_THREAD_SLICE_MICROS, NEXT_TASK_ID, SchedulingContextAdmission, SpawnReservation,
     SpawnTaskError, UserTaskBootstrap, allocate_task_id, cancel_process_spawn,
     checked_thread_pit_divisor, initial_task_rflags, kernel_task_entry_trampoline_addr,
-    noop_task_entry, publish_cpu_current_task, publish_scheduler_initialized, scheduler_mut,
 };
 use crate::memory::paging::ProcessAddressSpace;
 use crate::user::process_state::UserProcessState;
@@ -89,27 +88,21 @@ fn spawn_user_process_inner(
     let user_cs = crate::arch::gdt::user_code_selector().0 as u64;
     let user_ss = crate::arch::gdt::user_data_selector().0 as u64;
     let rflags = initial_task_rflags().bits();
-    let allocation = interrupts::without_interrupts(|| unsafe {
-        let mut scheduler = scheduler_mut();
-        let current_is_user = scheduler.current_task_is_user_task();
-        let slot = scheduler
-            .allocate_user_slot_with_scheduling_context(
-                id,
-                address_space,
-                bootstrap,
-                parent_process_id,
-                pit_divisor,
-                user_cs,
-                user_ss,
-                rflags,
-                start_suspended,
-                noop_task_entry,
-                scheduling_context,
-                spawn_reservation,
-            )
-            .ok_or(SpawnTaskError::NoFreeTaskSlot)?;
-        Ok((current_is_user, slot))
-    });
+    let allocation = super::scheduler::root_creation::allocate(
+        id,
+        super::scheduler::root_creation::Input::AddressSpace(address_space),
+        bootstrap,
+        parent_process_id,
+        pit_divisor,
+        user_cs,
+        user_ss,
+        rflags,
+        start_suspended,
+        scheduling_context,
+        spawn_reservation,
+    )
+    .ok_or(SpawnTaskError::NoFreeTaskSlot);
+
     let (spawned_from_user, slot) = match allocation {
         Ok(allocation) => allocation,
         Err(error) => {
@@ -202,26 +195,21 @@ fn spawn_user_process_state_inner(
     let user_cs = crate::arch::gdt::user_code_selector().0 as u64;
     let user_ss = crate::arch::gdt::user_data_selector().0 as u64;
     let rflags = initial_task_rflags().bits();
-    let allocation = interrupts::without_interrupts(|| unsafe {
-        let mut scheduler = scheduler_mut();
-        let current_is_user = scheduler.current_task_is_user_task();
-        let slot = scheduler
-            .allocate_user_process_state_slot(
-                id,
-                process_state,
-                bootstrap,
-                parent_process_id,
-                pit_divisor,
-                user_cs,
-                user_ss,
-                rflags,
-                start_suspended,
-                noop_task_entry,
-                spawn_reservation,
-            )
-            .ok_or(SpawnTaskError::NoFreeTaskSlot)?;
-        Ok((current_is_user, slot))
-    });
+    let allocation = super::scheduler::root_creation::allocate(
+        id,
+        super::scheduler::root_creation::Input::State(process_state),
+        bootstrap,
+        parent_process_id,
+        pit_divisor,
+        user_cs,
+        user_ss,
+        rflags,
+        start_suspended,
+        None,
+        spawn_reservation,
+    )
+    .ok_or(SpawnTaskError::NoFreeTaskSlot);
+
     let (spawned_from_user, slot) = match allocation {
         Ok(allocation) => allocation,
         Err(error) => {
@@ -249,130 +237,53 @@ fn spawn_milestone_arg(slot: usize, spawned_from_user: bool, weight_micros: u64)
 
 pub fn spawn_user_thread_suspended(bootstrap: UserTaskBootstrap) -> Result<u64, SpawnTaskError> {
     let id = allocate_task_id().ok_or(SpawnTaskError::NoFreeTaskSlot)?;
-    let user_cs = crate::arch::gdt::user_code_selector().0 as u64;
-    let user_ss = crate::arch::gdt::user_data_selector().0 as u64;
-    let rflags = initial_task_rflags().bits();
-
-    let reservation =
-        interrupts::without_interrupts(|| unsafe { scheduler_mut().reserve_user_thread_slot(id) })
-            .ok_or(SpawnTaskError::NoFreeTaskSlot)?;
-
-    // The scheduler reservation keeps the slot non-runnable while the
-    // sleepable ProcessState owner initializes Windows TEB identifiers. No raw
-    // scheduler guard is nested with ProcessStateLock in either direction.
-    if let Some(thread_state) = bootstrap.windows_thread_state {
-        let initialized = super::process_table::with_process_state_mut(
-            reservation.process_handle,
-            |_, process_state| {
-                crate::user::process::initialize_windows_thread_identifiers(
-                    process_state.address_space_mut(),
-                    thread_state.teb_address,
-                    reservation.process_id,
-                    id,
-                )
-            },
-        );
-        let Some(initialized) = initialized else {
-            interrupts::without_interrupts(|| unsafe {
-                scheduler_mut().cancel_user_thread_slot(reservation);
-            });
-            return Err(SpawnTaskError::NoFreeTaskSlot);
-        };
-        if let Err(error) = initialized {
-            interrupts::without_interrupts(|| unsafe {
-                scheduler_mut().cancel_user_thread_slot(reservation);
-            });
-            panic!("failed to initialize windows thread ids: {:?}", error);
+    let selectors = (
+        crate::arch::gdt::user_code_selector().0 as u64,
+        crate::arch::gdt::user_data_selector().0 as u64,
+        initial_task_rflags().bits(),
+    );
+    // Only a scalar receipt survives the first safe point on a killable user.
+    // The durable row and then an actual kernel Executor own the real Ticket,
+    // original MM and sleepable TEB effects through complete Slot/cancel ACK.
+    let receipt = super::scheduler::thread_creation::work::submit(id, bootstrap, selectors)
+        .ok_or(SpawnTaskError::NoFreeTaskSlot)?;
+    loop {
+        match super::scheduler::thread_creation::work::poll(receipt) {
+            Some(true) => return Ok(id),
+            Some(false) => return Err(SpawnTaskError::NoFreeTaskSlot),
+            None => {
+                // Kernel callers can help under their own kill-safe Executor;
+                // user callers may only yield and observe, never claim work.
+                if let Some(executor) =
+                    super::scheduler::retirement_cleanup::executor::capture_current()
+                {
+                    super::scheduler::thread_creation::work::service(&executor);
+                }
+                super::irq::yield_now();
+            }
         }
     }
-
-    interrupts::without_interrupts(|| unsafe {
-        scheduler_mut()
-            .commit_user_thread_slot(reservation, bootstrap, user_cs, user_ss, rflags)
-            .ok_or(SpawnTaskError::NoFreeTaskSlot)
-    })?;
-
-    Ok(id)
 }
 
 pub fn start(entry: fn(u64)) -> ! {
     super::irq::install_interrupt_dispatch_callbacks();
-
-    let saved_rsp = interrupts::without_interrupts(|| unsafe {
+    let saved_rsp = interrupts::without_interrupts(|| {
+        let mut image = super::scheduler::bootstrap::Bootstrap::begin();
         NEXT_TASK_ID.store(1, core::sync::atomic::Ordering::Relaxed);
-        let mut scheduler = scheduler_mut();
-        scheduler.reset(
+        image.reset_root(
             crate::arch::pit::divisor_from_micros(MAIN_THREAD_SLICE_MICROS),
             entry,
-            0,
             crate::arch::gdt::kernel_code_selector().0 as u64,
             crate::arch::gdt::kernel_data_selector().0 as u64,
             initial_task_rflags().bits(),
             kernel_task_entry_trampoline_addr(),
         );
-        let cpu_count = cpu::discovered_count();
-        assert!(
-            (1..=nucleus_core::util::lockdep::MAX_TRACKED_CPUS).contains(&cpu_count),
-            "scheduler invariant: admitted CPU count is outside capacity"
-        );
-        let mut generations = [0_u64; nucleus_core::util::lockdep::MAX_TRACKED_CPUS];
-        for logical_index in 0..cpu_count {
-            let logical_index =
-                u8::try_from(logical_index).expect("scheduler CPU index exceeds u8 capacity");
-            let snapshot = cpu::lifecycle_snapshot(logical_index)
-                .expect("scheduler invariant: admitted CPU has no lifecycle slot");
-            assert_eq!(
-                snapshot.state,
-                cpu::CpuLifecycleState::OnlineParked,
-                "scheduler invariant: CPU admitted before OnlineParked"
-            );
-            generations[usize::from(logical_index)] = snapshot.generation;
-            if logical_index == 0 {
-                continue;
-            }
+        for index in 1..cpu::discovered_count() {
             let id = allocate_task_id().expect("secondary idle task identity exhausted");
-            let (raw_stack_base, stack_top) =
-                cpu::ap_bootstrap_stack_bounds(logical_index, snapshot.generation);
-            let slot = scheduler.initialize_secondary_idle(
-                logical_index,
-                secondary_idle_entry,
-                id,
-                raw_stack_base,
-                stack_top,
-            );
-            publish_cpu_current_task(usize::from(logical_index), slot);
+            image.initialize_ap(index as u8, secondary_idle_entry, id);
         }
-        scheduler.prepare_current_task_execution();
-        let saved_rsp = scheduler.current_saved_rsp();
-        drop(scheduler);
-        // ORDERING: publish the complete BSP/AP scheduler image before any
-        // CPU lifecycle becomes SchedulerReady and before timer/IPI leaves may
-        // enter without a redundant global-lock readiness probe.
-        publish_scheduler_initialized();
-        for (logical_index, generation) in generations[..cpu_count].iter().copied().enumerate() {
-            cpu::transition_lifecycle(
-                u8::try_from(logical_index).expect("scheduler CPU index exceeds u8 capacity"),
-                generation,
-                cpu::CpuLifecycleState::SchedulerReady,
-            );
-            crate::debug::record_milestone(
-                crate::debug::LogCategory::Boot,
-                "smp-cpu-scheduler-ready",
-                logical_index as u64,
-                generation,
-            );
-        }
-        crate::arch::tlb::admit_current_cpu_online();
-        cpu::transition_lifecycle(0, generations[0], cpu::CpuLifecycleState::Online);
-        crate::debug::record_milestone(
-            crate::debug::LogCategory::Boot,
-            "smp-cpu-online",
-            0,
-            generations[0],
-        );
-        saved_rsp
+        image.prepare_and_publish()
     });
-
     crate::arch::pit::start_micros(0, MAIN_THREAD_SLICE_MICROS);
     crate::debug::info!(
         sched,
@@ -394,52 +305,7 @@ fn secondary_idle_entry(_arg: u64) {
 
 pub fn start_secondary_cpu() -> ! {
     interrupts::disable();
-    let logical_index = nucleus_core::util::lockdep::current_cpu_index();
-    assert!(
-        logical_index > 0 && logical_index < nucleus_core::util::lockdep::MAX_TRACKED_CPUS,
-        "secondary scheduler entry executed on an invalid CPU"
-    );
-    let logical_index =
-        u8::try_from(logical_index).expect("secondary scheduler CPU index exceeds u8 capacity");
-    let snapshot = cpu::lifecycle_snapshot(logical_index)
-        .expect("secondary scheduler entry has no lifecycle slot");
-    assert_eq!(
-        snapshot.state,
-        cpu::CpuLifecycleState::SchedulerReady,
-        "secondary scheduler entry occurred outside SchedulerReady"
-    );
-    unsafe {
-        scheduler_mut().prepare_secondary_idle_execution(logical_index);
-    }
-    crate::arch::tlb::admit_current_cpu_online();
-    assert!(
-        crate::arch::timer::init_current_cpu(),
-        "secondary scheduler entry could not arm its local clockevent"
-    );
-    cpu::transition_lifecycle(
-        logical_index,
-        snapshot.generation,
-        cpu::CpuLifecycleState::Online,
-    );
-    crate::debug::record_milestone(
-        crate::debug::LogCategory::Boot,
-        "smp-ap-online",
-        u64::from(logical_index),
-        snapshot.generation,
-    );
-    crate::debug::record_milestone(
-        crate::debug::LogCategory::Boot,
-        "smp-cpu-online",
-        u64::from(logical_index),
-        snapshot.generation,
-    );
-    crate::debug::record_milestone(
-        crate::debug::LogCategory::Sched,
-        "smp-cpu-idle-enter",
-        u64::from(logical_index),
-        snapshot.generation,
-    );
-
+    super::scheduler::bootstrap::enter_secondary();
     loop {
         interrupts::enable_and_hlt();
     }
@@ -478,8 +344,8 @@ mod tests {
     #[test]
     fn process_state_spawn_has_no_unreserved_production_alias() {
         let spawn_source = include_str!("spawn.rs")
-            .split_once("#[cfg(test)]")
-            .expect("spawn tests remain below production")
+            .split_once("mod tests {")
+            .expect("spawn tests remain below production entries")
             .0;
         let scheduler_source = include_str!("scheduler.rs");
         assert!(!spawn_source.contains("spawn_user_process_state_with_parent("));
@@ -489,9 +355,12 @@ mod tests {
             !scheduler_source
                 .contains("spawn_reservation: Option<process_table::SpawnReservation>")
         );
-        assert!(scheduler_source.contains(
-            "process_table::publish_spawn(\n                    spawn_reservation,\n                    id,\n                    parent_process_id,\n                    process_state,"
-        ));
+        let owner = include_str!("scheduler/root_creation.rs");
+        assert!(spawn_source.contains("root_creation::Input::State(process_state)"));
+        assert!(owner.contains("reservation: process_table::SpawnReservation"));
+        assert!(owner.contains("RootPublication::prepare(reservation, ticket"));
+        assert!(owner.contains("root.publish_process(parent, state)"));
+        assert!(owner.contains("root.cancel()"));
         assert!(!scheduler_source.contains("process_table::create_process_with_parent("));
     }
 }

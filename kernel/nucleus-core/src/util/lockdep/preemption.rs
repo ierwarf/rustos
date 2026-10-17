@@ -1,4 +1,6 @@
-//! Per-CPU preemption-depth accounting for tracked raw guards.
+//! Per-CPU raw-guard accounting and independent dispatch preemption custody.
+//! Raw units remain held + pending; effective depth additionally includes the
+//! unique non-lock dispatch unit, retained across directory unlock/RSP commit.
 //!
 //! - **Owner:** this module owns the disable/enable depth and the pending
 //!   reservation that a raw acquisition holds between its admission check and
@@ -28,6 +30,14 @@ use super::*;
 #[cfg(rustos_boot_image)]
 use core::sync::atomic::Ordering;
 
+mod dispatch;
+pub use dispatch::DispatchPreemption;
+
+fn effective_depth(raw: usize, cpu: usize) -> usize {
+    raw.checked_add(dispatch::depth_on(cpu))
+        .expect("effective CPU preemption depth overflow")
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PreemptionSnapshot {
     pub logical_cpu: usize,
@@ -35,6 +45,7 @@ pub struct PreemptionSnapshot {
     pub depth: usize,
     pub pending_depth: usize,
     pub held_depth: usize,
+    pub dispatch_depth: usize,
     pub top_class: Option<u8>,
 }
 
@@ -95,12 +106,12 @@ pub fn preemption_depth() -> usize {
             let cpu = current_cpu_index();
             // ORDERING: Acquire observes completed guard/pending transitions
             // before a scheduler gate consumes this depth.
-            PREEMPT_DISABLE_DEPTH[cpu].load(Ordering::Acquire)
+            effective_depth(PREEMPT_DISABLE_DEPTH[cpu].load(Ordering::Acquire), cpu)
         })
     }
     #[cfg(not(rustos_boot_image))]
     {
-        0
+        effective_depth(0, 0)
     }
 }
 
@@ -135,12 +146,14 @@ pub fn preemption_snapshot() -> PreemptionSnapshot {
                 pending_depth,
                 top_class
             );
+            let dispatch_depth = dispatch::depth_on(logical_cpu);
             PreemptionSnapshot {
                 logical_cpu,
                 apic_id,
-                depth,
+                depth: effective_depth(depth, logical_cpu),
                 pending_depth,
                 held_depth,
+                dispatch_depth,
                 top_class,
             }
         });
@@ -150,9 +163,10 @@ pub fn preemption_snapshot() -> PreemptionSnapshot {
         PreemptionSnapshot {
             logical_cpu: 0,
             apic_id: 0,
-            depth: 0,
+            depth: effective_depth(0, 0),
             pending_depth: 0,
             held_depth: 0,
+            dispatch_depth: dispatch::depth_on(0),
             top_class: None,
         }
     }

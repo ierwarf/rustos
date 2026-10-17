@@ -2,11 +2,9 @@
 //!
 //! The tracker records observed class ordering before a spin acquisition and
 //! rejects recursion or a dependency edge that closes a cycle. Raw-spin state
-//! is CPU-owned and interrupt-atomic. Sleepable state is keyed by scheduler
-//! task identity so it survives blocking and resumption without leaking into
-//! the next task dispatched on that CPU. Logical CPU identity is a dense,
-//! release-published map from architectural APIC ID; raw APIC IDs never index
-//! arrays.
+//! is CPU-owned and interrupt-atomic. Sleepable state follows task identity
+//! across blocking/resumption, never leaking into the next dispatched task.
+//! Dense release-published CPU identities index arrays; raw APIC IDs never do.
 //!
 //! - **Owner:** `nucleus-core` owns raw/sleepable lock-class accounting and
 //!   the dense CPU/APIC identity used by ring0 lock diagnostics.
@@ -52,21 +50,21 @@ mod scheduler_diag;
 #[cfg(any(rustos_boot_image, test))]
 mod spin_budget;
 pub mod work_budget;
-
 pub use lock_profile::drain_lock_profile;
 pub use preemption::{
-    PreemptionSnapshot, preemption_depth, preemption_disabled, preemption_snapshot,
+    DispatchPreemption, PreemptionSnapshot, preemption_depth, preemption_disabled,
+    preemption_snapshot,
 };
 #[cfg(rustos_boot_image)]
 use preemption::{
     cancel_pending_acquire_and_enable, disable_preemption, enable_preemption, enable_preemption_on,
 };
-// Only the anchored unit tests reach these directly; the production callers
-// moved into `preemption` with the functions that use them.
+// Anchored tests reach these directly; production callers moved into `preemption`.
 pub use cpu_identity::{
     bind_current_cpu_identity, current_apic_id, current_cpu_index, finalize_cpu_identities,
-    hardware_apic_id, register_cpu_identity,
-};
+    hardware_apic_id, register_cpu_identity};
+#[cfg(all(not(rustos_boot_image), feature = "native-cpu-model"))]
+pub use cpu_identity::with_native_cpu;
 #[cfg(test)]
 use preemption::{preemption_release_is_admissible, preemption_units_match};
 pub use scheduler_diag::{
@@ -132,23 +130,27 @@ pub enum LockClass {
     SchedulerPolicy = 42,
     PciConfigTransaction = 43,
     DeviceIoctlRouteMemo = 44,
-    /// Reply-edge lifecycle ledger; distinct from the scheduler catalog so
-    /// dispatch may consume per-slot inheritance without serializing on task
-    /// directory state.
+    /// Reply-edge ledger: inheritance independent of task-directory state.
     SchedulerDonation = 45,
     /// One-shot pager frame capability custody. Never nests inside the
     /// physical allocator or page-table owners.
     PagerFrameGrant = 46,
     /// Serializes pager VMA writers; exception-time readers never acquire it.
     PagerVmaPublication = 47,
-    /// Per-context mutable budget/refill runtime, acquired after catalog or
-    /// runqueue custody and before a shared scheduling-domain budget.
+    /// Context budget/refill runtime: catalog/runqueue → context → domain.
     SchedulerContextBudget = 48,
-    /// Shared domain mutable budget/refill runtime; never acquired before a
-    /// context budget runtime lock.
-    SchedulerDomainBudget = 49,
+    SchedulerDomainBudget = 49, // shared domain budget/refill; after context budget
+    /// Per-slot terminal custody: directory → cell; no external work/user copy.
+    SchedulerRetirementCleanup = 50,
+    TaskIdentityLifecycle = 51, // lifecycle leaf; no allocation/user copy/external work
+    CpuExecutionInterval = 52,
+    TaskStackResources = 53,
+    TaskAffinityAdmission = 54, // exact affinity versus Running CAS; no nested work
+    ProcessPlacement = 55,      // scalar group leaf; only atomic cohort release may join
+    SchedulerDiagnostics = 56,  // per-CPU counters/per-slot history; never nested
+    SchedulerDomainAdmission = 57, // cold registry → context48 → domain49; IDs are not rank
+    TaskWaitEpoch = 58, // per-slot payload/arm arbitration; no frame/queue/hardware work
 }
-
 #[cfg(rustos_boot_image)]
 #[derive(Clone, Copy)]
 struct HeldLockStack {

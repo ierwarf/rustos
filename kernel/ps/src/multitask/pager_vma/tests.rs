@@ -60,6 +60,36 @@ fn process_state() -> UserProcessState {
 }
 
 #[test]
+fn extent_prefilter_cannot_reject_from_bounds_republished_during_its_read() {
+    let _guard = guard();
+    let slot = PublishedPagerVma::empty();
+    let address = 0x8_000;
+    assert!(!slot.may_cover(address));
+    assert!(!slot.may_overlap(address, address + PAGER_PAGE_BYTES));
+    assert!(!slot.may_overlap_or_touch(address, address + PAGER_PAGE_BYTES));
+
+    // Deterministic interleaving: the reader sampled an empty *even* slot;
+    // the writer committed the VMA before the reader checked its sequence.
+    // Old one-sided filters concluded the address was absent and returned
+    // Stale despite the later full snapshot being able to see this region.
+    let before = slot.sequence.load(Ordering::Acquire);
+    let old_start = slot.start.load(Ordering::Relaxed);
+    let old_end = slot.end.load(Ordering::Relaxed);
+    slot.publish(Some(template(address))).unwrap();
+    let after = slot.sequence.load(Ordering::Acquire);
+    assert_ne!(before, after);
+    assert_eq!(
+        PublishedPagerVma::stable_extent_from_samples(before, after, old_start, old_end),
+        None,
+        "stale bounds may not reject a concurrently published VMA"
+    );
+    assert!(slot.may_cover(address));
+    assert!(slot.may_overlap(address, address + PAGER_PAGE_BYTES));
+    assert!(slot.may_overlap_or_touch(address, address + PAGER_PAGE_BYTES));
+    assert!(!slot.may_cover(address + PAGER_PAGE_BYTES * 2));
+}
+
+#[test]
 fn publication_stamps_exact_process_mm_and_nonzero_vma_generation() {
     let _guard = guard();
     let handle = ProcessHandle::new(29, 43);

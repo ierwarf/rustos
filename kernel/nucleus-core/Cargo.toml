@@ -3,6 +3,11 @@ name = "nucleus-core"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# Native verification supplies architectural CPU identity only; never ships in
+# the boot image and never replaces a scheduler owner or permission.
+native-cpu-model = []
+
 [dependencies]
 boot-protocol = { path = "../../boot/boot-protocol" }
 boot-random = { path = "../../libs/boot-random" }

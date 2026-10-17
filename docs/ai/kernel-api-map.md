@@ -31,7 +31,10 @@ writers publish/revoke exact generations, while exception-time readers perform
 only bounded atomic lookup and never acquire `ProcessStateLock`.  The public
 target-process publish/revoke APIs retain the exact PID slot and stamp its live
 process/MM generation before accepting an unbound region template; they are
-broker-time only and never appear in the fault path.
+broker-time only and never appear in the fault path. The bounded extent
+prefilters recheck the same even per-slot sequence after reading relaxed
+bounds; an odd or changed sequence delegates to the full snapshot instead of
+returning a false negative from stale bounds.
 
 ## Boot order
 
@@ -60,7 +63,28 @@ Do not reorder without reading `kernel/src/main.rs` and
   Exec uses the staged lifecycle APIs: reserve the exact scheduler target,
   stage under ProcessState alone, publish under Scheduler alone, then finalize
   visibility. No caller may nest either lock or retire an exec-reserved target;
-  exit is latched as `exit_pending`.
+  exit is latched as `exit_pending`. In-place image replacement cannot rebind
+  a live thread's kernel task ID to its process ID; mismatched identity refuses
+  admission before sibling retirement or privileged image work. Exec/group
+  policy remains in userspace.
+- **CPU return custody:** `cpu_local/dispatch_turn.rs` owns unique non-migrating
+  CPU/from tokens. Private scratch requires that CPU's Open cell, never the
+  global diagnostic owner word. The return producer validates original Current,
+  admission and remote exclusion; changed returns require exact slot/UID/Running
+  generation in the active interval and stable Running custody. Unused prepared
+  funding is cancelled outside the leaf; active/foreign funding remains owned.
+  Changed publication keeps the local gate closed until assembly installs RSP,
+  clears Transition and releases Outgoing. Duplicate commits cannot spend an
+  Open producer; abandoned publication poisons instead of unsafe rollback.
+  Independent `DispatchPreemption` pins CPU before the directory wait without
+  blocking caller-enabled TLB/device IPIs; protected dispatch then masks IRQs
+  continuously. Its unit is separate from raw held+pending accounting. Completion runs
+  after raw unlock/deferred IPI, then restores caller IF only for unchanged
+  returns. Changed returns park the unique unit until post-RSP Committing releases
+  it without restoring outgoing IF. Cold directory/MM transactions still remain.
+  Architecture consumes `ExecutionRootLease`: exact bank/context/MM-root capture
+  retained outside leaves through hardware work, not a sampled boolean. A closed
+  root refuses fresh capture; backing pins do not replace MM close arbitration.
 - **Scheduler wait primitives:** use `current_task_id`,
   `arm_block_current_task`, condition publication/recheck,
   `commit_block_current_task_and_yield`, and `wake_task`. The commit and
@@ -75,6 +99,118 @@ Do not reorder without reading `kernel/src/main.rs` and
   housekeeping completes the exact
   `RetiredTaskCleanup`/`cleanup_retired_task_runtime_state` handshake; new
   task-scoped waiter registries must join that cleanup boundary. The retirement
+  Identity/lifecycle writes now use class-51 per-slot `current_identity`
+  owners; metadata refresh cannot overwrite their newer gates. Four Scheduler
+  flag arrays are test-only. Class-53 resource cells now own context metadata
+  as well as ID/entry and allocations; production `contexts` is test-only.
+  Readers copy records; narrow exact-ID exec/handle detach patches cannot replay
+  unrelated fields. Cold frame/process/budget construction transactions and
+  cross-owner execution/MM lifetime remain separate responsibilities. Exact
+  context process-generation/PID pins now retain the physical state-lock box
+  through descriptor/assembly custody; syscall own refs and direct callbacks
+  acquire independent atomic pins before pointer reads. Reap closes admission
+  before zero/detach and last release requests a rescan. Old exec MM/CR3/TLB
+  quiescence is not proved by this allocation pin.
+  Claim/ACK is now owned by independent per-slot `SchedulerRetirementCleanup`
+  cells, not the Scheduler guard. The terminal directory producer freezes
+  exec detach metadata and atomically publishes cleanup/kernel tokens last.
+  Deferred/in-progress producers and either Pending/Claimed token prohibit
+  reset. External ACK matches the full payload; the private non-Copy kernel
+  claim ACKs its exact generation only after revocation/wake/detach finishes. No cell lock crosses external cleanup or user copy. The
+  class-53 allocation owner also owns task ID/entry descriptors; production
+  `starts` and stack Vec arrays are test-only. Exact allocation pins survive
+  final claim and CPU Current/Outgoing publication; assembly releases the
+  outgoing pin after installing RSP. Closing/references prohibit descriptor
+  reset or UID reuse, and same-ID exec replaces entry only. Production kernel
+  entry lookup is Scheduler-free: IRQ-excluded exact published identity/live
+  lifecycle plus CPU allocation-bank Current, never Prepared/Outgoing or a
+  catalog fallback. Scalar ABI fallback, stack-layout and console-session reads
+  now use IRQ-excluded joined Current/context/start/funding identity, without
+  Scheduler; copied metadata is not a retained process/MM reference. Cold runtime
+  snapshots retain the SAME original Current funding interval across paired
+  Context/Domain reads, even after close or donation metadata replacement. TLS
+  cache and root-idle writes retain original Current banks through their last
+  effect. Exact noncurrent snapshots retain an original UID loan. The unused
+  `CurrentKernelStackScope` export and scalar-only setter/restore pair are removed;
+  new alternate-stack users must supply original backing lifetime, not revive
+  that API. Hint APIs now use independent original-binding ordering publication,
+  with optional SAME Current interval loan for a non-raising floor. Process
+  selection retains the original winning target; generic hints carry exact UID.
+  Latency hints neither wake blocked work nor transfer class/funding. User wake
+  retains its original user-qualified binding through the wake protocol. Actual
+  activation uses the original Cohort/publication owner in native tests too;
+  the second legacy Scheduler activation implementation is removed. Complete
+  admission/exec transactions, process/MM quiescence and final slot release
+  still need directory custody. Prepublication thread slots now use non-Copy
+  exact UID/generation/phase resource tickets; ordinary storage/context/start
+  operations cannot cross reservations. Cancel ACK follows process detach and
+  storage destruction; commit ACK follows exact metadata and Blocked admission.
+  Abandonment quarantines, never implicitly reopens. Production reservation and
+  domain catalog arrays are gone; domain descriptors come from budget cells.
+  Cross-domain/cold lifecycle arbitration remains guarded. Linux thread-state locks now have static
+  owner storage; joined Current and exact TID bind callbacks. Signal hint
+  synchronization remains inside that IRQ-excluded class-39 leaf, not Scheduler.
+  Header diagnostics now return copied POD snapshots joined to exact published
+  RSP/epoch, UID, allocation pin and bounds. Architecture return-mode inspection
+  requires own Current/Prepared; unknown fails stop. Saved-header readers now
+  register under the resource leaf that also executes the exact Local/Direct
+  Running CAS. Nonexecuting primary observations need no directory byte-read
+  exclusion; guarded reads retain allocation and final token checks. Own-CPU
+  executing reads still require IRQ/preemption exclusion, and alternate boot
+  backing still requires its external owner. No leaf spans copying, hardware or
+  queue acquisition; a read-count check released before CAS is not exclusion.
+  Affinity admission additionally joins exact descriptor UID, task/process masks
+  and CPU bounds to Running CAS under Affinity54, after Identity51/Resources53.
+  Writers/reset share that leaf; reset needs drained execution/no cold exec and
+  removes UID authority. Provisional refusal releases custody outside leaves.
+  Pending migration allows an included destination, never an excluded old CPU.
+  Process-group atomic update and post-claim return/hardware arbitration remain
+  genuinely directory-owned; this is not a guard-removal proof.
+  Self exec requires sole exact IRQ-stabilized Current image custody before
+  scheduler side effects, through new metadata and CR3/FS installation. Custody
+  now extends through process-state staging and finalization in
+  `scheduler/exec_transaction.rs`, coordinated by `current/exec.rs`. A non-Copy
+  once-issued receipt binds the complete reservation and staged root, checks
+  published root/Current CR3, and is consumed before final visibility and
+  old-state release. `current_identity/exec_intent::Intent` separately binds
+  slot/UID/full reservation/monotonic generation across sibling quiescence,
+  image publication and typed cancellation/finalization. Unqualified gate/reset/
+  image commands cannot spend it; abandonment poisons. Self stays schedulable
+  through its sibling barrier, then completes after writer release before IRQ
+  restoration. Cancellation closes with standalone CPU preemption while keeping
+  caller-enabled IPIs serviceable during process-owner waits. Pending exit never
+  reopens dispatch and consumes existing terminal retirement work.
+  By-PID Current uses self exec rather than live-frame rewrite.
+  Existing sibling quiescence, directory claim/admission and HAL inactive-root/
+  shootdown ownership remain; the receipt alone is not an MM execution lifetime pin.
+  `ProcessAddressSpace::{pin_execution,seal_execution,into_retirement_owner}`
+  own checked root refs, cold close admission and payload transfer.
+  `ExecutionPin::try_activate` returns a non-Copy `ActivationPin`; the shared
+  atomic gate makes `seal_execution() -> bool` refuse without partial close
+  while any CPU grant exists. Resource claim/architecture capture binds exact
+  slot/UID/process/MM/owner currency and transfers activation to the CPU turn
+  through publication/RSP ACK (or permanent poison), not just lexical CR3 work.
+  Failed claim drops provisional custody outside leaves; exec staging refusal
+  precedes state replacement and callers cancel the exact reservation.
+  Exact process/MM-generation pins reside in resource contexts; selection and
+  Current/Prepared/Outgoing retain them until context release. Architecture
+  returns require bank-qualified exact open roots. Exec binds staged MM custody
+  and transfers it after root/CR3 checks. Old state retires with the original
+  owner so shared backing survives captured refs. Atomic last release queues
+  only; the bounded IRQ-enabled drain runs HAL/ledger retirement before payload
+  destruction. Existing directory/quiescence and complete claim/switch proof
+  remain required; modeled host roots do not establish hardware acceptance.
+  SIMD image bytes now use exact UID and exclusive RAII access independently
+  of Scheduler. Save requires Current; restore additionally accepts Prepared.
+  Replacement rejects Prepared/Outgoing/foreign Current and requires exact
+  self or quiesced/terminal zero-reference custody. Frame-byte mutation and
+  complete cross-owner CPU/image transactions remain guarded. Owned-primary
+  frame construction/exec now use exclusive slot/UID-qualified writer leases;
+  resource acquisition excludes frame pins and teardown, and byte callbacks
+  run outside the leaf with IRQs excluded. Peer exec holds its lease through
+  image/identity/TLS/MM publication and gate release. Old epochs are revoked
+  before writing; frame pins recheck epoch before any byte read. Borrowed
+  alternate/boot backing and old-MM quiescence retain their existing owners. The cleanup
   value also freezes `clear_child_tid` and the Linux robust-list head/length so
   forced and exec-sibling cleanup does not depend on current-task state.
   RustOS now boots admitted APs, publishes disjoint per-CPU scheduler/syscall

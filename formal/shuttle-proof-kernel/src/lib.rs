@@ -13,6 +13,13 @@ mod tests {
     use shuttle::sync::{Arc, Mutex};
     use shuttle::thread;
 
+    include!("frame_token_tests.rs");
+    include!("retirement_cleanup_tests.rs");
+    include!("fifo_identity_tests.rs");
+    include!("fair_retry_tests.rs");
+    include!("activation_claim_tests.rs");
+    include!("budget_dispatch_tests.rs");
+
     const DEFAULT_ITERATIONS: usize = 128;
     const DEFAULT_PCT_DEPTH: usize = 3;
 

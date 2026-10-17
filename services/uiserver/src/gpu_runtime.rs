@@ -510,6 +510,9 @@ impl GpuCompositor {
                 errno
             })?;
         let atlas_pixels = logical_bytes / size_of::<u32>();
+        let atlas = vec![0_u32; atlas_pixels];
+        let scratch_atlas = vec![0_u32; atlas_pixels];
+        debug_line("uiserver: GPU initialization stage=atlas-buffers done");
         Ok(Some(GpuInitialization {
             display: current_display,
             compositor: Self {
@@ -517,8 +520,8 @@ impl GpuCompositor {
                 info,
                 slots,
                 compiler,
-                atlas: vec![0_u32; atlas_pixels],
-                scratch_atlas: vec![0_u32; atlas_pixels],
+                atlas,
+                scratch_atlas,
                 layers: Vec::new(),
                 cursor_source_rect: None,
                 cursor_motion: CursorMotion::stationary(),

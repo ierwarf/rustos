@@ -157,7 +157,62 @@ fn token_outside_topology(aux: u32) -> ! {
 
 #[cfg(not(rustos_boot_image))]
 pub fn current_cpu_index() -> usize {
-    0
+    #[cfg(feature = "native-cpu-model")]
+    { native::CPU.with(core::cell::Cell::get) }
+    #[cfg(not(feature = "native-cpu-model"))]
+    { 0 }
+}
+
+// Architectural input adapter ONLY. The existing CPU-private scheduler banks,
+// raw leaves, claims, intervals and return callbacks are not simulated here.
+// Thread-local identity lets independently scheduled native actors interleave
+// without changing another test thread's CPU. A parked turn remains on its
+// ORIGINAL CPU; selecting another actor never moves or destroys that owner.
+#[cfg(all(not(rustos_boot_image), feature = "native-cpu-model"))]
+mod native {
+    extern crate std;
+    std::thread_local! {
+        pub(super) static CPU: core::cell::Cell<usize> = const { core::cell::Cell::new(0) };
+    }
+    struct Restore(usize);
+    impl Drop for Restore {
+        fn drop(&mut self) { CPU.with(|cpu| cpu.set(self.0)); }
+    }
+    pub(super) fn on<R>(cpu: usize, f: impl FnOnce() -> R) -> R {
+        assert!(cpu < super::super::MAX_TRACKED_CPUS, "native CPU exceeds admitted capacity");
+        let _restore = Restore(CPU.with(|old| old.replace(cpu)));
+        f()
+    }
+    #[cfg(test)]
+    #[test]
+    fn native_actor_identity_is_thread_local_nested_and_unwind_safe() {
+        assert_eq!(super::current_cpu_index(), 0);
+        on(2, || {
+            assert_eq!(super::current_cpu_index(), 2);
+            let scope = super::super::DispatchPreemption::enter();
+            assert_eq!(scope.cpu(), 2);
+            assert!(scope.is_masked());
+            drop(scope);
+            on(3, || assert_eq!(super::current_cpu_index(), 3));
+            assert_eq!(super::current_cpu_index(), 2);
+            std::thread::spawn(|| assert_eq!(super::current_cpu_index(), 0)).join().unwrap();
+            let failed = std::panic::catch_unwind(|| on(4, || panic!("modeled actor fault")));
+            assert!(failed.is_err());
+            assert_eq!(super::current_cpu_index(), 2);
+        });
+        assert_eq!(super::current_cpu_index(), 0);
+        assert!(std::panic::catch_unwind(|| on(super::super::MAX_TRACKED_CPUS, || ())).is_err());
+        assert_eq!(super::current_cpu_index(), 0);
+    }
+}
+
+/// Run one native actor with explicit earlier architectural CPU identity.
+/// This is NOT topology admission, IRQ masking, raw/dispatch exclusion, bank
+/// publication or an RSP ACK. All such production owners must still succeed.
+/// No non-Copy CPU-affine owner may be used by a different actor after return.
+#[cfg(all(not(rustos_boot_image), feature = "native-cpu-model"))]
+pub fn with_native_cpu<R>(cpu: usize, f: impl FnOnce() -> R) -> R {
+    native::on(cpu, f)
 }
 
 /// Returns the calling CPU's admitted architectural APIC identity.
@@ -361,6 +416,7 @@ pub fn finalize_cpu_identities(cpu_count: usize) {
 pub fn bind_current_cpu_identity(logical_index: u8, expected_apic_id: u32) {
     #[cfg(rustos_boot_image)]
     {
+        // ORDERING: Acquire observes the immutable dense topology before its payload.
         assert!(
             CPU_IDENTITIES_PUBLISHED.load(Ordering::Acquire),
             "lockdep invariant: CPU token bound before topology publication"
@@ -381,6 +437,7 @@ pub fn bind_current_cpu_identity(logical_index: u8, expected_apic_id: u32) {
             expected_apic_id,
             "lockdep invariant: CPU token bound on the wrong APIC"
         );
+        // ORDERING: Acquire observes token admission before writing this CPU's AUX.
         if !RDTSCP_CPU_TOKEN_ADMITTED.load(Ordering::Acquire) {
             return;
         }

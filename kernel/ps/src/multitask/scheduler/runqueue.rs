@@ -22,17 +22,28 @@
 
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering, fence};
 
-use nucleus_core::util::lockdep::{LockClass, MAX_TRACKED_CPUS, TrackedSpinLock};
+use nucleus_core::util::lockdep::{LockClass, MAX_TRACKED_CPUS};
+use crate::multitask::irq_leaf::IrqLeaf;
 
 use super::{MAX_TASK, frame_publication};
 use validation::{bitmap_location, validate_cpu};
 
+mod admission;
+pub(super) use admission::{admit_blocked, admit_initial, admit_running};
 pub(super) mod address_space;
 pub(super) mod affinity_payload;
+pub(super) mod claim;
+mod return_publication;
+pub(super) use return_publication::{ReturnPublication, publish_return};
+#[cfg(test)]
+pub(super) use return_publication::{test_blocked_return, test_running_claim};
+pub(super) use claim::{claim_dispatch, claim_dispatch_with_owner_generation, claim_validated_dispatch};
 mod execution_time;
 pub(super) use execution_time::{set as set_exec_start_local_ns, value as exec_start_local_ns};
 mod idle;
-pub(super) use idle::{is_idle as is_idle_slot, set as set_idle_slot};
+pub(super) use idle::{
+    cpu_for_slot as idle_cpu_for_slot, is_idle as is_idle_slot, set as set_idle_slot,
+};
 mod ipc_handoff;
 pub(super) mod simd_tls;
 mod validation;
@@ -42,8 +53,11 @@ pub(super) mod weight;
 #[cfg(test)]
 use ipc_handoff::publish_migrating_record;
 pub(super) use ipc_handoff::{
-    RemoteWakeOutcome, drain_remote_wakes, materialize_direct_handoff, publish_direct_handoff,
-    publish_local_wake, publish_remote_wake, rehome_queued, rollback_direct_handoff,
+    RemoteWakeOutcome, claim_blocked_handoff, publish_handoff_mailbox,
+    drain_remote_wakes, materialize_direct_handoff,
+    materialize_direct_handoff_with_generation, preserve_budget_refused_handoff,
+    preserve_budget_refused_handoff_generation, publish_direct_handoff, publish_local_wake,
+    publish_remote_wake, rehome_queued, rehome_queued_frame, rehome_queued_owned, rollback_direct_handoff,
 };
 
 const OWNER_STATE_BITS: u64 = 4;
@@ -364,7 +378,7 @@ impl RunQueueInner {
 
 #[repr(C, align(64))]
 struct PerCpuRunQueue {
-    inner: TrackedSpinLock<RunQueueInner, { LockClass::SchedulerRunQueue as u8 }>,
+    inner: IrqLeaf<RunQueueInner, { LockClass::SchedulerRunQueue as u8 }>,
     published_load: AtomicU64,
     /// Even/odd publication epoch bracketing the multiword runnable bitmap.
     published_sequence: AtomicU64,
@@ -380,7 +394,7 @@ struct PerCpuRunQueue {
 impl PerCpuRunQueue {
     const fn new() -> Self {
         Self {
-            inner: TrackedSpinLock::new(RunQueueInner::new()),
+            inner: IrqLeaf::new(RunQueueInner::new()),
             published_load: AtomicU64::new(0),
             published_sequence: AtomicU64::new(0),
             published_runnable: [const { AtomicU64::new(0) }; BITMAP_WORDS],
@@ -486,10 +500,10 @@ impl RemoteWakeMailbox {
 static OWNER_WORDS: [RunOwnerWord; MAX_TASK] = [const { RunOwnerWord::new() }; MAX_TASK];
 static RUN_QUEUES: [PerCpuRunQueue; MAX_TRACKED_CPUS] =
     [const { PerCpuRunQueue::new() }; MAX_TRACKED_CPUS];
-static REMOTE_WAKE_MAILBOXES: [TrackedSpinLock<
+static REMOTE_WAKE_MAILBOXES: [IrqLeaf<
     RemoteWakeMailbox,
     { LockClass::SchedulerMailbox as u8 },
->; MAX_TRACKED_CPUS] = [const { TrackedSpinLock::new(RemoteWakeMailbox::new()) }; MAX_TRACKED_CPUS];
+>; MAX_TRACKED_CPUS] = [const { IrqLeaf::new(RemoteWakeMailbox::new()) }; MAX_TRACKED_CPUS];
 static MAILBOX_PENDING: [AtomicU64; MAX_TRACKED_CPUS] =
     [const { AtomicU64::new(0) }; MAX_TRACKED_CPUS];
 #[cfg(test)]
@@ -504,7 +518,7 @@ fn record_test_local_migrating_owner(owner: RunOwnerSnapshot) {
 }
 
 #[cfg(test)]
-fn take_test_local_migrating_owner() -> Option<RunOwnerSnapshot> {
+pub(super) fn take_test_local_migrating_owner() -> Option<RunOwnerSnapshot> {
     TEST_LOCAL_MIGRATING_OWNER.lock().unwrap().take()
 }
 
@@ -896,6 +910,12 @@ pub(super) fn commit_wait(slot: usize) -> WaitCommitOutcome {
 /// Clears any wait epoch and, while the task still owns this CPU, restores its
 /// run intent in the same CAS that defeats a pending block commit.
 pub(super) fn wake_wait(slot: usize) {
+    wait::wake(slot);
+}
+
+// Called only while the SAME wait-payload epoch leaf is retained. Queue/owner
+// CAS arbitration remains atomic; this leaf never crosses queue locks or work.
+fn wake_wait_locked(slot: usize) {
     let word = &OWNER_WORDS[slot];
     loop {
         let observed = word.load();
@@ -929,33 +949,6 @@ pub(super) fn wait_blocked(owner: RunOwnerSnapshot) -> bool {
                     | RunOwnerState::Migrating
                     | RunOwnerState::DirectHandoff
             ))
-}
-
-pub(super) fn admit_blocked(slot: usize) {
-    let owner = owner(slot);
-    assert_eq!(
-        owner.state,
-        RunOwnerState::Dormant,
-        "scheduler slot admitted twice"
-    );
-    OWNER_WORDS[slot]
-        .compare_exchange(owner, owner.next(RunOwnerState::Blocked, None))
-        .unwrap_or_else(|observed| panic!("scheduler slot admission raced observed={observed:?}"));
-}
-
-pub(super) fn admit_running(slot: usize, cpu: usize) {
-    validate_cpu(cpu);
-    let owner = owner(slot);
-    assert_eq!(
-        owner.state,
-        RunOwnerState::Dormant,
-        "scheduler slot admitted twice"
-    );
-    OWNER_WORDS[slot]
-        .compare_exchange(owner, owner.next(RunOwnerState::Running, Some(cpu)))
-        .unwrap_or_else(|observed| {
-            panic!("scheduler running admission raced observed={observed:?}")
-        });
 }
 
 pub(super) fn publish_local(slot: usize, cpu: usize, weight: u32) {
@@ -1026,20 +1019,30 @@ pub(super) fn local_runnable_sequence(cpu: usize) -> u64 {
     RUN_QUEUES[cpu].published_sequence.load(Ordering::Acquire)
 }
 
+/// Native custody witnesses must read the actual mirror, not the fixture
+/// all-slots candidate enumeration in local_runnable_snapshot.
+#[cfg(test)]
+pub(super) fn published_local_member_for_test(cpu: usize, slot: usize) -> bool {
+    RUN_QUEUES[cpu].published_runnable[slot / 64].load(Ordering::Acquire) & (1_u64 << (slot % 64))
+        != 0
+}
+
+/// Native evidence reads the REAL publication, not the legacy all-slots
+/// candidate-enumeration fixture below. Read-only; never an owner/claim grant.
+#[cfg(test)]
+pub(super) fn published_local_membership(slot: usize, cpu: usize) -> bool {
+    validate_cpu(cpu);
+    assert!(slot < MAX_TASK);
+    RUN_QUEUES[cpu].published_runnable[slot / 64].load(Ordering::Acquire)
+        & (1_u64 << (slot % 64)) != 0
+}
+
 fn local_runnable_snapshot(cpu: usize) -> [u64; BITMAP_WORDS] {
-    #[cfg(test)]
-    {
-        let _ = cpu;
-        return [u64::MAX; BITMAP_WORDS];
-    }
-    #[cfg(not(test))]
-    {
-        validate_cpu(cpu);
-        let published = &RUN_QUEUES[cpu].published_runnable;
-        // ORDERING: Acquire observes each word's publication and orders the
-        // caller's later reads of the slots it names after it.
-        core::array::from_fn(|word| published[word].load(Ordering::Acquire))
-    }
+    validate_cpu(cpu);
+    let published = &RUN_QUEUES[cpu].published_runnable;
+    // ORDERING: Acquire observes each word's publication and orders the
+    // caller's later reads of the slots it names after it.
+    core::array::from_fn(|word| published[word].load(Ordering::Acquire))
 }
 
 pub(super) struct LocalRunnableSlots {
@@ -1162,38 +1165,6 @@ pub(super) const fn wake_is_already_runnable(
 /// snapshot, so a just-blocked or migrating slot cannot be selected.
 pub(super) fn is_handoff_dispatchable(slot: usize) -> bool {
     is_handoff_dispatchable_owner(owner(slot))
-}
-
-pub(super) fn claim_dispatch(slot: usize, cpu: usize, weight: u32) -> bool {
-    validate_cpu(cpu);
-    let owner = owner(slot);
-    if owner.state == RunOwnerState::DirectHandoff {
-        if owner.cpu != Some(cpu) || !owner.runnable {
-            return false;
-        }
-        return OWNER_WORDS[slot]
-            .compare_exchange(owner, owner.next(RunOwnerState::Running, Some(cpu)))
-            .is_ok();
-    }
-    if owner.state != RunOwnerState::Local || owner.cpu != Some(cpu) || !owner.runnable {
-        return false;
-    }
-    let mut rq = RUN_QUEUES[cpu].inner.lock();
-    if !rq.contains(slot) {
-        panic!("scheduler owner says Local but rq omits slot={slot} cpu={cpu}");
-    }
-    rq.remove(slot, weight);
-    let next = owner.next(RunOwnerState::Running, Some(cpu));
-    if let Err(observed) = OWNER_WORDS[slot].compare_exchange(owner, next) {
-        rq.insert(slot, weight);
-        RUN_QUEUES[cpu].publish_load(&rq);
-        if observed.state.is_terminal() {
-            return false;
-        }
-        panic!("scheduler dispatch lost owner race observed={observed:?}");
-    }
-    RUN_QUEUES[cpu].publish_load(&rq);
-    true
 }
 
 pub(super) fn retire(slot: usize, weight: u32) {

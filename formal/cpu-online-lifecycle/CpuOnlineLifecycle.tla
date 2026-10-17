@@ -16,9 +16,12 @@ Concrete owner:
   * kernel/hal/src/arch/smp.rs
   * kernel/mm/src/memory/cache_attributes.rs
   * kernel/mm/src/memory/kernel_vm.rs
+  * kernel/ps/src/multitask/scheduler/bootstrap{.rs,/initial_tasks.rs}
+  * kernel/ps/src/multitask/scheduler/{kernel_creation,return_architecture}.rs
 ***************************************************************************)
 
 CONSTANTS Cpus, Bsp
+InitialNoCpu == 2 \* Outside this registered 0/1 bounded configuration.
 
 Discovered == "discovered"
 Starting == "starting"
@@ -49,13 +52,25 @@ VARIABLES state, generation, privateReady, schedulerReady, dispatchAuthority,
           initialPatSlot0, patSlot0Validated, patProgrammed, patReadback,
           sharedMemoryWbMapped,
           sharedMemorySelector, bspMemoryTypeBaselineCaptured,
-          mtrrBaselineRestored, cacheState
+          mtrrBaselineRestored, cacheState,
+          imagePhase, initialPhase, initialProducer, initialOwner,
+          physicalCurrent, uidCurrent, initialArchitecture
 
 vars == <<state, generation, privateReady, schedulerReady, dispatchAuthority,
           failedSeen, staleGenerationAttempted, restartAttempted, panicRaised,
           initialPatSlot0, patSlot0Validated, patProgrammed, patReadback,
           sharedMemoryWbMapped,
           sharedMemorySelector, bspMemoryTypeBaselineCaptured,
+          mtrrBaselineRestored, cacheState,
+          imagePhase, initialPhase, initialProducer, initialOwner,
+          physicalCurrent, uidCurrent, initialArchitecture>>
+
+initialVars == <<imagePhase, initialPhase, initialProducer, initialOwner,
+                 physicalCurrent, uidCurrent, initialArchitecture>>
+baseVars == <<state, generation, privateReady, schedulerReady, dispatchAuthority,
+          failedSeen, staleGenerationAttempted, restartAttempted, panicRaised,
+          initialPatSlot0, patSlot0Validated, patProgrammed, patReadback,
+          sharedMemoryWbMapped, sharedMemorySelector, bspMemoryTypeBaselineCaptured,
           mtrrBaselineRestored, cacheState>>
 
 PatKernelCacheContractReady(cpu) ==
@@ -91,6 +106,13 @@ Init ==
     /\ mtrrBaselineRestored = [cpu \in Cpus |-> FALSE]
     /\ cacheState = [cpu \in Cpus |->
           IF cpu = Bsp THEN CacheEnabled ELSE ResetCacheDisabled]
+    /\ imagePhase = "vacant"
+    /\ initialPhase = [cpu \in Cpus |-> 0]
+    /\ initialProducer = [cpu \in Cpus |-> FALSE]
+    /\ initialOwner = [cpu \in Cpus |-> InitialNoCpu]
+    /\ physicalCurrent = [cpu \in Cpus |-> FALSE]
+    /\ uidCurrent = [cpu \in Cpus |-> FALSE]
+    /\ initialArchitecture = [cpu \in Cpus |-> FALSE]
 
 Start(cpu) ==
     /\ state[cpu] = Discovered
@@ -240,6 +262,8 @@ PublishPrivateState(cpu) ==
 PublishScheduler(cpu) ==
     /\ state[cpu] = OnlineParked
     /\ privateReady[cpu]
+    /\ imagePhase = "ready"
+    /\ physicalCurrent[cpu] /\ uidCurrent[cpu]
     /\ state' = [state EXCEPT ![cpu] = SchedulerReady]
     /\ schedulerReady' = [schedulerReady EXCEPT ![cpu] = TRUE]
     /\ UNCHANGED <<generation, privateReady, dispatchAuthority, failedSeen,
@@ -250,6 +274,7 @@ PublishScheduler(cpu) ==
                    mtrrBaselineRestored, cacheState>>
 
 AdmitDispatch(cpu) ==
+    /\ initialArchitecture[cpu]
     /\ state[cpu] = SchedulerReady
     /\ privateReady[cpu]
     /\ schedulerReady[cpu]
@@ -315,7 +340,7 @@ PanicTerminal ==
     /\ panicRaised
     /\ UNCHANGED vars
 
-Next ==
+BaseNext ==
     IF panicRaised
     THEN PanicTerminal
     ELSE
@@ -338,6 +363,121 @@ Next ==
         \/ CaptureBspMemoryTypeBaseline
         \/ RejectStaleGeneration
         \/ Terminal
+
+(***************************************************************************
+Bounded initial source join: bootstrap InitialCpu -> shared Ticket descriptor ->
+Blocked producer ACK -> image-qualified Running -> original initial interval ->
+physical allocation bank -> UID bank -> logical Current -> initial architecture.
+The original producer overlaps both banks. AP remains on its live HAL RSP;
+only BSP has a constructed frame. Earlier HAL memory-type inputs remain modeled.
+This is NOT full selected funding/frame/MM/RSP/terminal/reuse refinement.
+***************************************************************************)
+BeginImage ==
+    /\ imagePhase = "vacant"
+    /\ \A cpu \in Cpus : state[cpu] = OnlineParked
+    /\ imagePhase' = "building"
+    /\ UNCHANGED <<initialPhase, initialProducer, initialOwner,
+                   physicalCurrent, uidCurrent, initialArchitecture, baseVars>>
+
+ReserveInitial(cpu) ==
+    /\ imagePhase = "building" /\ state[cpu] = OnlineParked
+    /\ initialPhase[cpu] = 0
+    /\ initialPhase' = [initialPhase EXCEPT ![cpu] = 1]
+    /\ initialProducer' = [initialProducer EXCEPT ![cpu] = TRUE]
+    /\ UNCHANGED <<imagePhase, initialOwner, physicalCurrent, uidCurrent,
+                   initialArchitecture, baseVars>>
+
+MaterializeInitial(cpu) ==
+    /\ imagePhase = "building" /\ initialPhase[cpu] = 1
+    /\ initialProducer[cpu]
+    /\ initialPhase' = [initialPhase EXCEPT ![cpu] = 2]
+    /\ UNCHANGED <<imagePhase, initialProducer, initialOwner,
+                   physicalCurrent, uidCurrent, initialArchitecture, baseVars>>
+
+BlockedInitialAck(cpu) ==
+    /\ imagePhase = "building" /\ initialPhase[cpu] = 2
+    /\ initialProducer[cpu]
+    /\ initialPhase' = [initialPhase EXCEPT ![cpu] = 3]
+    /\ UNCHANGED <<imagePhase, initialProducer, initialOwner,
+                   physicalCurrent, uidCurrent, initialArchitecture, baseVars>>
+
+AdmitInitialRunning(cpu) ==
+    /\ imagePhase = "building" /\ state[cpu] = OnlineParked
+    /\ initialPhase[cpu] = 3 /\ initialProducer[cpu]
+    /\ initialPhase' = [initialPhase EXCEPT ![cpu] = 4]
+    /\ initialOwner' = [initialOwner EXCEPT ![cpu] = cpu]
+    /\ UNCHANGED <<imagePhase, initialProducer, physicalCurrent,
+                   uidCurrent, initialArchitecture, baseVars>>
+
+OpenInitialInterval(cpu) ==
+    /\ imagePhase = "building" /\ initialPhase[cpu] = 4
+    /\ initialProducer[cpu] /\ initialOwner[cpu] = cpu
+    /\ initialPhase' = [initialPhase EXCEPT ![cpu] = 5]
+    /\ UNCHANGED <<imagePhase, initialProducer, initialOwner,
+                   physicalCurrent, uidCurrent, initialArchitecture, baseVars>>
+
+PublishPhysicalCurrent(cpu) ==
+    /\ imagePhase = "building" /\ initialPhase[cpu] = 5
+    /\ initialProducer[cpu] /\ initialOwner[cpu] = cpu
+    /\ initialPhase' = [initialPhase EXCEPT ![cpu] = 6]
+    /\ physicalCurrent' = [physicalCurrent EXCEPT ![cpu] = TRUE]
+    /\ UNCHANGED <<imagePhase, initialProducer, initialOwner,
+                   uidCurrent, initialArchitecture, baseVars>>
+
+PublishUidCurrent(cpu) ==
+    /\ imagePhase = "building" /\ initialPhase[cpu] = 6
+    /\ initialProducer[cpu] /\ physicalCurrent[cpu]
+    /\ initialPhase' = [initialPhase EXCEPT ![cpu] = 7]
+    /\ uidCurrent' = [uidCurrent EXCEPT ![cpu] = TRUE]
+    /\ UNCHANGED <<imagePhase, initialProducer, initialOwner,
+                   physicalCurrent, initialArchitecture, baseVars>>
+
+PublishInitialCurrent(cpu) ==
+    /\ imagePhase = "building" /\ initialPhase[cpu] = 7
+    /\ initialProducer[cpu] /\ physicalCurrent[cpu] /\ uidCurrent[cpu]
+    /\ initialPhase' = [initialPhase EXCEPT ![cpu] = 8]
+    /\ UNCHANGED <<imagePhase, initialProducer, initialOwner,
+                   physicalCurrent, uidCurrent, initialArchitecture, baseVars>>
+
+ReleaseInitialProducer(cpu) ==
+    /\ initialPhase[cpu] = 8 /\ initialProducer[cpu]
+    /\ physicalCurrent[cpu] /\ uidCurrent[cpu]
+    /\ initialProducer' = [initialProducer EXCEPT ![cpu] = FALSE]
+    /\ UNCHANGED <<imagePhase, initialPhase, initialOwner,
+                   physicalCurrent, uidCurrent, initialArchitecture, baseVars>>
+
+PrepareInitialArchitecture(cpu) ==
+    /\ initialPhase[cpu] = 8 /\ physicalCurrent[cpu] /\ uidCurrent[cpu]
+    /\ initialOwner[cpu] = cpu /\ ~initialArchitecture[cpu]
+    /\ IF cpu = Bsp THEN imagePhase = "building" /\ state[cpu] = OnlineParked
+       ELSE imagePhase = "ready" /\ state[cpu] = SchedulerReady
+    /\ initialArchitecture' = [initialArchitecture EXCEPT ![cpu] = TRUE]
+    /\ UNCHANGED <<imagePhase, initialPhase, initialProducer, initialOwner,
+                   physicalCurrent, uidCurrent, baseVars>>
+
+SealInitialImage ==
+    /\ imagePhase = "building" /\ initialArchitecture[Bsp]
+    /\ \A cpu \in Cpus : state[cpu] = OnlineParked /\ initialPhase[cpu] = 8
+                          /\ ~initialProducer[cpu]
+    /\ imagePhase' = "ready"
+    /\ UNCHANGED <<initialPhase, initialProducer, initialOwner,
+                   physicalCurrent, uidCurrent, initialArchitecture, baseVars>>
+
+PoisonInitialImage ==
+    /\ imagePhase = "building"
+    /\ \E cpu \in Cpus : state[cpu] = Failed
+    /\ imagePhase' = "poison"
+    /\ UNCHANGED <<initialPhase, initialProducer, initialOwner,
+                   physicalCurrent, uidCurrent, initialArchitecture, baseVars>>
+
+Next ==
+    \/ BaseNext /\ UNCHANGED initialVars
+    \/ ~panicRaised /\ (BeginImage \/ SealInitialImage \/ PoisonInitialImage
+        \/ \E cpu \in Cpus : ReserveInitial(cpu) \/ MaterializeInitial(cpu)
+           \/ BlockedInitialAck(cpu) \/ AdmitInitialRunning(cpu)
+           \/ OpenInitialInterval(cpu) \/ PublishPhysicalCurrent(cpu)
+           \/ PublishUidCurrent(cpu) \/ PublishInitialCurrent(cpu)
+           \/ ReleaseInitialProducer(cpu) \/ PrepareInitialArchitecture(cpu))
 
 Spec == Init /\ [][Next]_vars
 
@@ -363,6 +503,14 @@ TypeOK ==
     /\ bspMemoryTypeBaselineCaptured \in BOOLEAN
     /\ mtrrBaselineRestored \in [Cpus -> BOOLEAN]
     /\ cacheState \in [Cpus -> CacheStates]
+    /\ imagePhase \in {"vacant", "building", "ready", "poison"}
+    /\ initialPhase \in [Cpus -> 0..8]
+    /\ initialProducer \in [Cpus -> BOOLEAN]
+    /\ InitialNoCpu \notin Cpus
+    /\ initialOwner \in [Cpus -> Cpus \cup {InitialNoCpu}]
+    /\ physicalCurrent \in [Cpus -> BOOLEAN]
+    /\ uidCurrent \in [Cpus -> BOOLEAN]
+    /\ initialArchitecture \in [Cpus -> BOOLEAN]
 
 BootEpochGenerationIsFixed ==
     \A cpu \in Cpus : generation[cpu] = 1
@@ -434,5 +582,23 @@ FailedStateIsTerminalForBoot ==
 InvalidGenerationFailsClosed == staleGenerationAttempted => panicRaised
 
 RestartFailsClosed == restartAttempted => panicRaised
+
+InitialRunningIsCpuExact ==
+    \A cpu \in Cpus : initialPhase[cpu] >= 4 => initialOwner[cpu] = cpu
+InitialBanksPrecedeLogicalCurrent ==
+    \A cpu \in Cpus :
+        /\ (initialPhase[cpu] >= 6 => physicalCurrent[cpu])
+        /\ (initialPhase[cpu] >= 7 => uidCurrent[cpu])
+OriginalProducerOverlapsBanks ==
+    \A cpu \in Cpus : initialPhase[cpu] \in 1..7 => initialProducer[cpu]
+InitialArchitectureRetainsBothBanks ==
+    \A cpu \in Cpus : initialArchitecture[cpu] =>
+        initialPhase[cpu] = 8 /\ physicalCurrent[cpu] /\ uidCurrent[cpu]
+ReadyImageIncludesEveryCpuAndBspArchitecture ==
+    imagePhase = "ready" => initialArchitecture[Bsp]
+        /\ \A cpu \in Cpus : initialPhase[cpu] = 8 /\ ~initialProducer[cpu]
+DispatchRequiresOriginalInitialArchitecture ==
+    \A cpu \in Cpus : dispatchAuthority[cpu] =>
+        imagePhase = "ready" /\ initialArchitecture[cpu]
 
 =============================================================================

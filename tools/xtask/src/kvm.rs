@@ -170,10 +170,11 @@ const SMP_QUALIFICATION_WORK_MASK: u64 = (1_u64 << SMP_QUALIFICATION_WORK_BITS) 
 const NETPROBE_QEMU_REACHABLE_MARKER: &str = "netprobe: qemu gateway reachable";
 const MIN_DVM_GUEST_CID: u32 = 3;
 const VHOST_VSOCK_DEVICE: &str = "/dev/vhost-vsock";
-// Readiness plus a 60-window performance proof needs headroom for boot. This
-// is only the host runner's hard process deadline; guest service waits retain
-// their narrower class-specific bounds.
-const MAX_SMOKE_TIMEOUT: u64 = 120;
+// Keep the ordinary boot deadline unchanged. Isolated SMP benchmarks need
+// 180 seconds of host headroom, but still fail when readiness or end markers
+// are absent; guest service waits retain their narrower class-specific bounds.
+const DEFAULT_SMOKE_TIMEOUT: u64 = 120;
+const MAX_SMOKE_TIMEOUT: u64 = 180;
 const PHYSICAL_GPU_REQUIRED_MEMLOCK: u64 = 4 * 1024 * 1024 * 1024;
 const ACPI_VFCT_HEADER_BYTES: usize = 0x4c;
 const ACPI_VFCT_VBIOS_OFFSET: usize = 0x34;

@@ -12,10 +12,12 @@ kernel-ipc-runtime = { path = "../ipc-runtime" }
 kernel-object = { path = "../object" }
 trace-loc-macro = { path = "../../libs/trace-loc-macro" }
 rustos-user-abi = { path = "../../libs/rustos-user-abi", features = ["linux-compat-state"] }
+rustos-scheduler-frame-gate = { path = "../../libs/rustos-scheduler-frame-gate" }
 lazy_static = { version = "1.4", features = ["spin_no_std"] }
 spin = "0.10.0"
 x86_64 = { version = "0.15.4", default-features = false, features = ["instructions", "abi_x86_interrupt"] }
 
 [dev-dependencies]
+nucleus-core = { path = "../nucleus-core", features = ["native-cpu-model"] }
 boot-random = { path = "../../libs/boot-random", features = ["deterministic-test-seed"] }
 kernel-ipc-runtime = { path = "../ipc-runtime", features = ["host-test"] }

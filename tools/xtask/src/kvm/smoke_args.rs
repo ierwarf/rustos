@@ -102,7 +102,7 @@ where
         min_ui_fps: None,
         ui_proof_windows: DEFAULT_UI_FPS_ACTIVE_WINDOWS,
         recovery_probe: RecoveryProbe::None,
-        timeout: Duration::from_secs(MAX_SMOKE_TIMEOUT),
+        timeout: Duration::from_secs(DEFAULT_SMOKE_TIMEOUT),
         repeat: 1,
         build_image: true,
         auto_verify: true,

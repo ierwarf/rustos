@@ -1,10 +1,19 @@
 use super::*;
 
+pub(in crate::multitask) fn with_initialized_fixture(f: impl FnOnce()) {
+    let previous = super::SCHEDULER_INITIALIZED.swap(true, Ordering::AcqRel);
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            // ORDERING: restore the explicitly modeled earlier boot ACK.
+            super::SCHEDULER_INITIALIZED.store(self.0, Ordering::Release);
+        }
+    }
+    let _restore = Restore(previous);
+    f();
+}
+
 static TEST_PUBLICATION_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-static TEST_SCHEDULER_FOR_GUARD_RELEASE: TrackedSpinLock<
-    Scheduler,
-    { LockClass::Scheduler as u8 },
-> = TrackedSpinLock::new(Scheduler::new());
 
 /// Serializes tests that temporarily install synthetic per-CPU publication.
 ///
@@ -29,10 +38,8 @@ pub(in super::super) struct TestCpuPublicationRestore {
     scratch: usize,
     transition_from: usize,
     transition_active: bool,
-    scheduler_owner_cpu: usize,
-    scheduler_owner_slot: usize,
-    scheduler_owner_acquired_ns: u64,
-    scheduler_owner_caller: *mut Location<'static>,
+    turn_phase: u8,
+    execution_banks: Option<super::super::current_identity::execution::banks::FixtureRestore>,
 }
 
 pub(super) fn preserve_test_cpu_publication(logical_index: usize) -> TestCpuPublicationRestore {
@@ -48,23 +55,28 @@ pub(super) fn preserve_test_cpu_publication(logical_index: usize) -> TestCpuPubl
         scratch: SCHEDULER_CURRENT_TASK_SCRATCH[logical_index].load(Ordering::Acquire),
         transition_from: TRANSITION_FROM_SLOTS[logical_index].load(Ordering::Acquire),
         transition_active: TRANSITION_ACTIVE[logical_index].load(Ordering::Acquire),
-        scheduler_owner_cpu: SCHEDULER_OWNER_CPU.load(Ordering::Acquire),
-        scheduler_owner_slot: SCHEDULER_OWNER_DIAGNOSTICS[logical_index]
-            .slot
-            .load(Ordering::Acquire),
-        scheduler_owner_acquired_ns: SCHEDULER_OWNER_DIAGNOSTICS[logical_index]
-            .acquired_ns
-            .load(Ordering::Acquire),
-        scheduler_owner_caller: SCHEDULER_OWNER_DIAGNOSTICS[logical_index]
-            .caller
-            .load(Ordering::Acquire),
+        turn_phase: dispatch_turn::test_phase(logical_index),
+        execution_banks: Some(super::super::current_identity::execution::banks::isolate(
+            logical_index,
+        )),
     }
 }
 
 impl TestCpuPublicationRestore {
     /// Models the assembly-side commit boundary for a synthetic transition.
     pub(in super::super) fn commit_assembly(&self) {
-        TRANSITION_ACTIVE[self.logical_index].store(false, Ordering::Release);
+        if let Some(commit) = dispatch_turn::begin_commit(self.logical_index) {
+            TRANSITION_ACTIVE[self.logical_index].store(false, Ordering::Release);
+            if commit.physical_banks() {
+                super::super::scheduler::stack_resources::cpu_leases::commit(self.logical_index);
+            }
+            super::super::current_identity::execution::banks::commit(self.logical_index);
+            commit.finish();
+        } else {
+            // Queue-only transition fixture has no dispatch producer token.
+            assert_eq!(dispatch_turn::test_phase(self.logical_index), 0);
+            TRANSITION_ACTIVE[self.logical_index].store(false, Ordering::Release);
+        }
     }
 }
 
@@ -80,17 +92,8 @@ impl Drop for TestCpuPublicationRestore {
         TRANSITION_FROM_SLOTS[self.logical_index].store(self.transition_from, Ordering::Release);
         TRANSITION_ACTIVE[self.logical_index].store(self.transition_active, Ordering::Release);
         CURRENT_TASK_ACTIVE[self.logical_index].store(self.active, Ordering::Release);
-        let owner_diagnostic = &SCHEDULER_OWNER_DIAGNOSTICS[self.logical_index];
-        owner_diagnostic
-            .slot
-            .store(self.scheduler_owner_slot, Ordering::Release);
-        owner_diagnostic
-            .acquired_ns
-            .store(self.scheduler_owner_acquired_ns, Ordering::Release);
-        owner_diagnostic
-            .caller
-            .store(self.scheduler_owner_caller, Ordering::Release);
-        SCHEDULER_OWNER_CPU.store(self.scheduler_owner_cpu, Ordering::Release);
+        dispatch_turn::test_restore_phase(self.logical_index, self.turn_phase);
+        drop(self.execution_banks.take());
     }
 }
 
@@ -128,8 +131,8 @@ pub(super) fn install_test_transition_owner_with_admission(
     restore
 }
 
-/// Installs a synthetic current owner before a test drives the real guard
-/// release publication. The caller retains `test_publication_lock` until the
+/// Installs a scalar-only current owner for protocol and negative witnesses.
+/// The caller retains `test_publication_lock` until the
 /// restore guard drops.
 pub(in super::super) fn install_test_current_owner(
     logical_index: usize,
@@ -149,33 +152,57 @@ pub(in super::super) fn install_test_current_owner(
     restore
 }
 
-/// Produces an actual `SchedulerAccessGuard` backed by isolated test scheduler
-/// storage, so its production `Drop` path can be witnessed without touching
-/// IRQ/MMIO-backed boot state.
-#[track_caller]
-pub(super) fn test_scheduler_guard_for_release(
-    logical_index: usize,
-    original_task: usize,
-    selected_task: usize,
-) -> SchedulerAccessGuard {
-    assert!(logical_index < CURRENT_TASK_SLOTS.len());
-    assert!(original_task < MAX_SCHEDULER_TASKS && selected_task < MAX_SCHEDULER_TASKS);
-    assert_eq!(
-        CURRENT_TASK_SLOTS[logical_index].load(Ordering::Acquire),
-        original_task,
-        "test guard original slot must match the installed CPU owner"
-    );
-    let guard = TEST_SCHEDULER_FOR_GUARD_RELEASE
-        .lock_scheduler_bounded(|| false)
-        .expect("test scheduler guard acquisition cannot time out");
-    let phase_total_at_acquire_ns = guard.runtime_profile_phase_total_ns();
-    set_scheduler_current_task_scratch_for_cpu(logical_index, selected_task);
-    SchedulerAccessGuard {
-        guard: Some(guard),
-        logical_index,
-        original_task,
-        acquired_at_ns: crate::arch::clock::monotonic_nanos(),
-        caller: Location::caller(),
-        phase_total_at_acquire_ns,
+/// Changes ONLY the scalar Current for a negative witness; actual allocation,
+/// execution, MM and placement banks remain retained. Caller owns the native
+/// publication fixture lock. Drop restores even on a failed assertion.
+pub(in super::super) fn with_test_current_scalar<R>(cpu: usize, slot: usize, f: impl FnOnce() -> R) -> R {
+    struct Restore(usize, usize);
+    impl Drop for Restore {
+        fn drop(&mut self) { CURRENT_TASK_SLOTS[self.0].store(self.1, Ordering::Release); }
     }
+    let _restore = Restore(cpu, CURRENT_TASK_SLOTS[cpu].swap(slot, Ordering::AcqRel));
+    f()
+}
+
+/// Host-only phase witness; no physical CR3/RSP/IRQ or funding refinement.
+pub(crate) fn with_test_activation_return(
+    cpu: usize,
+    from: usize,
+    to: usize,
+    mut inspect: impl FnMut(u8),
+) {
+    let restore = install_test_current_owner(cpu, from);
+    let turn = dispatch_turn::begin_phase_model(
+        nucleus_core::util::lockdep::DispatchPreemption::enter_model(cpu),
+        from,
+    );
+    inspect(0);
+    let completion = turn.publish_return(to, false);
+    inspect(1);
+    completion.after_directory_unlock();
+    inspect(2);
+    restore.commit_assembly();
+    inspect(3);
+}
+
+pub(crate) fn with_test_rejected_activation_return(
+    cpu: usize,
+    from: usize,
+    to: usize,
+    prepare: impl FnOnce(),
+    inspect_poison: impl FnOnce(),
+) {
+    extern crate std;
+    let _restore = install_test_current_owner(cpu, from);
+    let turn = dispatch_turn::begin_phase_model(
+        nucleus_core::util::lockdep::DispatchPreemption::enter_model(cpu),
+        from,
+    );
+    prepare();
+    let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        turn.publish_return(to, false)
+    }));
+    assert!(rejected.is_err());
+    assert_eq!(dispatch_turn::test_phase(cpu), 4);
+    inspect_poison(); // fixture recovery has not released quarantined custody
 }

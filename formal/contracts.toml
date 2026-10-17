@@ -8,6 +8,305 @@ witnesses = "formal/run-source-conformance.sh"
 generated_doc = "docs/ai/formal-contracts.generated.md"
 
 [[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/current_observation.rs"
+severity = "critical"
+flows = ["scheduler-dispatch"]
+reason = "Real cold Current runtime/TLS/root-idle entries borrow the same physical/MM/UID/interval through final reads and writes. Runtime observes original retained FundingPin, not a new donor resolution; Interval leaf ends before paired Context/Domain reads. Target snapshots retain an original exact UID through metadata and refuse closing admission; missing/colliding hints trigger bounded full qualification, also for signal/terminal recipients. Scalar registry liveness observes the exact identity writer rather than confusing transient exec refusal with death. Unused scalar-only alternate-stack scope and eight legacy methods are deleted. Native topology/ACK inputs are not hardware or full joint acceptance."
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/current_observation.rs"
+models = ["lifecycle-execution-claim/LifecycleExecutionClaim", "cpu-online-lifecycle/CpuOnlineLifecycle", "scheduling-context-budget/SchedulingContextBudget"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/current_observation/tests.rs"
+severity = "high"
+flows = ["scheduler-dispatch"]
+reason = "Born Current bank, original UID/funding/close and TLS metadata witnesses; wrong Current aliases, Linux cell, accepted value and target PID refuse. Retained target survives close but denies replacement. Earlier CPU admission and external ACK remain explicit native inputs."
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/current_observation/tests.rs"
+models = ["lifecycle-execution-claim/LifecycleExecutionClaim", "scheduling-context-budget/SchedulingContextBudget"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/linux_thread_state/signals.rs"
+severity = "critical"
+flows = ["process-signal-lifecycle", "scheduler-dispatch", "process-lifecycle-transaction"]
+reason = "Whole signal and process job-control family retains original recipient binding through group, Linux cell and final wake. Original process Change census plus purpose-qualified Cohort retain every member through all gates/reschedule/exact process event/parent SIGCHLD before one admission release. Job control cannot spend affinity rights and post-stop joins refuse. Untouched group contention returns EAGAIN and preserves the Current pending STOP cause until commit. Bounded cold coalescing refinement is not MM/RSP or full dispatcher joint/hardware acceptance."
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/linux_thread_state/signals.rs"
+models = ["sigchld-notification/SigchldNotification", "process-lifecycle-transaction/ProcessLifecycleTransaction", "lifecycle-execution-claim/LifecycleExecutionClaim"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/linux_thread_state/signals/tests.rs"
+severity = "high"
+flows = ["process-signal-lifecycle", "scheduler-dispatch"]
+reason = "Actual born descriptors/MM/UID resources, process census/cohort, exact recipient and original terminal transfer. Tests distinguish blocked admission, masks, arm cancellation, leaderless fallback and closing target from legacy catalogs. Native CPU/topology admission and external ACKs remain explicit inputs, not physical QEMU evidence."
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/linux_thread_state/signals/tests.rs"
+models = ["sigchld-notification/SigchldNotification", "process-lifecycle-transaction/ProcessLifecycleTransaction", "lifecycle-execution-claim/LifecycleExecutionClaim"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/current_terminal.rs"
+severity = "critical"
+flows = ["scheduler-dispatch", "exception-retirement", "cross-cpu-task-retirement"]
+reason = "Whole fault/exit/target terminal family owns original masked Current physical/MM bank, parked UID permit and unique active interval through LAST effects, or transfers original target binding to exact terminal Producer before drain. Terminal close does not require fresh MM/UID/funding admission. Target exact-handle last-process mark precedes election; no leaf spans recipient work. Bounded Current refinement is not full selection/architecture/MM/terminal/RSP joint acceptance."
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/current_terminal.rs"
+models = ["lifecycle-execution-claim/LifecycleExecutionClaim", "exception-retirement-lifecycle/ExceptionRetirementLifecycle", "process-lifecycle-transaction/ProcessLifecycleTransaction", "cross-cpu-task-retirement/CrossCpuTaskRetirement"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/current_terminal/tests.rs"
+severity = "high"
+flows = ["scheduler-dispatch", "exception-retirement", "cross-cpu-task-retirement"]
+reason = "Actual born descriptor/MM/funding/terminal and group request witnesses preserve first reason, reject missing UID/alias/settled interval and overlapping effect loans, exclude early settlement/reuse, transfer target binding before drain, and mark exact group exit before any worker retirement. Earlier CPU selection/admission and external consumer ACK are explicit native inputs, not hardware acceptance."
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/current_terminal/tests.rs"
+models = ["lifecycle-execution-claim/LifecycleExecutionClaim", "exception-retirement-lifecycle/ExceptionRetirementLifecycle", "process-lifecycle-transaction/ProcessLifecycleTransaction", "cross-cpu-task-retirement/CrossCpuTaskRetirement"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/pager_handoff.rs"
+severity = "critical"
+flows = ["scheduler-dispatch", "pager-fault-slot-lifecycle"]
+reason = "Actual exception ingress retains original faulting Current/MM and exact fixed worker physical binding through typed service epoch, shared frame reader, bounded original CAS/FIFO/mailbox and latency floor. Precommit Current wake never reads a consumed frame or clears another epoch. No ledger mutation, generic fallback, rollback or scalar donor reacquisition. Both actual IRQ Scheduler bridges deleted; full joint/hardware refinement remains open."
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/pager_handoff.rs"
+models = ["pager-fault-slot-lifecycle/PagerFaultSlotLifecycle", "scheduler-wakeup/SchedulerWakeup", "frame-reader-claim/FrameReaderClaim", "synchronous-ipc-handoff/SynchronousIpcHandoff"]
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/pager_handoff/tests.rs"
+severity = "high"
+flows = ["scheduler-dispatch", "pager-fault-slot-lifecycle"]
+reason = "New actual born-resource original-fault/service/floor traces preserve the original public pager witness and both original mutation obligations; capacity, unrelated epoch, consumed Current precommit, last-effect reader/phase, remote mailbox/FIFO and resumed original MM loan are distinct witnesses. Earlier IRQ/topology/remote Current ACK modeled; no privileged register/trap/RSP or full joint acceptance."
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/pager_handoff/tests.rs"
+models = ["pager-fault-slot-lifecycle/PagerFaultSlotLifecycle", "scheduler-wakeup/SchedulerWakeup", "frame-reader-claim/FrameReaderClaim", "mm-activation-close/MmActivationClose", "synchronous-ipc-handoff/SynchronousIpcHandoff"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/dispatcher.rs"
+severity = "critical"
+flows = ["scheduler-dispatch"]
+reason = "Independent production selection and exact original frame/funding claim open one interval; incomplete earlier priority cannot consume the first-turn prefix or authorize a later arm. Original CPU choice and claim receipts span fast refusal, fallback, MM and return. Native architecture/IRQ/ACK are modeled; enclosing legacy IRQ/control and full joint deletion refinement remain open."
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/dispatcher.rs"
+models = ["cpu-dispatch-preemption/CpuDispatchPreemption", "scheduler-local-authority/SchedulerLocalAuthority", "frame-reader-claim/FrameReaderClaim", "scheduling-context-budget/SchedulingContextBudget"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/dispatcher/maintenance.rs"
+severity = "critical"
+flows = ["scheduler-dispatch"]
+reason = "Original physical pin/FrameReader and CPU turn span exact Local->Migrating CAS, source removal and target mailbox; raced Blocked is never a wake or a replacement owner generation. Target topology is earlier modeled native input, not hardware acceptance."
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/dispatcher/maintenance.rs"
+models = ["scheduler-active-balance/SchedulerActiveBalance", "frame-reader-claim/FrameReaderClaim", "task-affinity-lifecycle/TaskAffinityLifecycle"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/dispatch_priority.rs"
+severity = "critical"
+flows = ["scheduler-dispatch"]
+reason = "Original non-Copy CPU choice excludes activation FIFO publication without retaining a raw leaf; only actual Current/Transition publication releases it, abandonment poisons. This is ordering custody, never task/MM/funding lifetime or full hardware refinement."
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/dispatch_priority.rs"
+models = ["cpu-dispatch-preemption/CpuDispatchPreemption", "atomic-process-activation-batch/AtomicProcessActivationBatch"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/dispatcher/tests.rs"
+severity = "high"
+flows = ["scheduler-dispatch"]
+reason = "Actual born allocation, frame reader, original interval and new production dispatch witnesses; earlier Current/IRQ/topology and final hardware ACK are explicitly native models, not a full switch or reuse certificate."
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/dispatcher/tests.rs"
+models = ["cpu-dispatch-preemption/CpuDispatchPreemption", "frame-reader-claim/FrameReaderClaim", "scheduling-context-budget/SchedulingContextBudget", "synchronous-ipc-handoff/SynchronousIpcHandoff"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/dispatcher/maintenance/tests.rs"
+severity = "high"
+flows = ["scheduler-dispatch"]
+reason = "Actual physical original reader, source publication and remote mailbox/drain witnesses include raced Blocked refusal. Native earlier topology/entry remain modeled."
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/dispatcher/maintenance/tests.rs"
+models = ["scheduler-active-balance/SchedulerActiveBalance", "frame-reader-claim/FrameReaderClaim"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/current_class.rs"
+severity = "critical"
+flows = ["scheduler-dispatch"]
+reason = "Original masked same-CPU and physical Current bank retain exact binding through irreversible user base-class/weight demotion; scalar Current cannot grant lifetime and reply funding is not revoked. Native entry/ACK remain modeled, not joint guard-deletion proof."
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/current_class/tests.rs"
+severity = "high"
+flows = ["scheduler-dispatch"]
+reason = "Actual born Current resources, original bank/binding and reply ledger witness monotonic cap and missing/sealed/scalar-only/kernel refusal; native CPU/IRQ and cleanup ACK explicitly modeled."
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/current_class.rs"
+models = ["scheduler-thread-demotion/SchedulerThreadDemotion", "cpu-dispatch-preemption/CpuDispatchPreemption"]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/current_class/tests.rs"
+models = ["scheduler-thread-demotion/SchedulerThreadDemotion", "cpu-dispatch-preemption/CpuDispatchPreemption"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/donation_publication.rs"
+severity = "critical"
+flows = ["scheduler-dispatch"]
+reason = "Original masked CPU and non-Copy donor/root/receiver Resource53 lifetime loans retain exact physical participants through source-qualified ledger publication; original reservation source survives newest-source changes but cannot survive cancellation. Scalar Current/hints are not grants. Native ACK/topology remain modeled; whole dispatch/guard deletion is not claimed."
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/donation_publication/tests.rs"
+severity = "high"
+flows = ["scheduler-dispatch"]
+reason = "Actual born-resource/participant/ledger witnesses execute shared production engines; reply attachment leaves all runnable process workers unfunded until exact IPC_RECV worker binding despite queue-policy changes. Obsolete arbitrary process-worker bind API and guarded process-cancellation scan are deleted, not renamed. CPU entry/topology and physical cleanup ACK remain explicit native models, not full concurrent hardware refinement."
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/donation_publication.rs"
+models = ["scheduling-context-budget/SchedulingContextBudget", "cpu-dispatch-preemption/CpuDispatchPreemption"]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/donation_publication/tests.rs"
+models = ["scheduling-context-budget/SchedulingContextBudget", "cpu-dispatch-preemption/CpuDispatchPreemption"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/task_directory.rs"
+severity = "high"
+flows = ["scheduler-dispatch", "cross-cpu-task-retirement"]
+reason = "Reply custody joins original Identity51 metadata/lifecycle with exact Resources53 UID/start/bound object in one scalar comparison. Hints/absence/retained terminal objects cannot grant execution or funding; actual witnesses model metadata withdrawal and external terminal ACK explicitly."
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/task_directory.rs"
+models = ["scheduling-context-budget/SchedulingContextBudget", "cross-cpu-task-retirement/CrossCpuTaskRetirement"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/runtime_profile/report.rs"
+severity = "high"
+flows = ["scheduler-dispatch"]
+reason = "Consumed independent counter window projects immutable telemetry, preserving original schema and ranking. Scalar attribution never grants frame, funding, execution or reuse."
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/runtime_profile/report.rs"
+models = ["scheduler-cpu-distribution/SchedulerCpuDistribution"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/cpu_local/irq_entry.rs"
+severity = "critical"
+flows = ["scheduler-dispatch", "cross-cpu-task-retirement"]
+reason = "All five actual IRQ entries independently retain original masked turn, physical Current, SIMD, choice, successful claim, architecture and interval through receipt-based return and parked RSP. No directory or scratch grant. Earlier native register/RSP acknowledgements remain models, not full joint MM/terminal/reuse or hardware proof."
+[[source_mappings]]
+path = "kernel/ps/src/multitask/cpu_local/irq_entry.rs"
+models = ["cpu-dispatch-preemption/CpuDispatchPreemption", "frame-reader-claim/FrameReaderClaim", "scheduling-context-budget/SchedulingContextBudget", "mm-activation-close/MmActivationClose", "cross-cpu-task-retirement/CrossCpuTaskRetirement"]
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/irq_entry_tests.rs"
+severity = "high"
+flows = ["scheduler-dispatch", "cross-cpu-task-retirement"]
+reason = "Real born producer/FIFO/claim/funding executes the shared architecture state machine with only register/SIMD effects intercepted. Native real turns now execute strict architecture/interval qualification, BOTH actual bank publications and the actual RSP consumer. Original deferred terminal stop excludes reuse until both outgoing banks drain; the incoming interval settles its SAME original donor after terminal donation revocation; external/kernel ACKs and exact reset/resource/MM seals complete source reuse. Same Current restores SIMD only; missing architecture or a settled interval refuses before publication. Earlier topology, privileged effects and RSP arrival remain modeled, as does teardown of the final incoming Current bank; not full foreign-CPU/shared-MM exec/census or hardware/global-deletion acceptance."
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/irq_entry_tests.rs"
+models = ["cpu-dispatch-preemption/CpuDispatchPreemption", "ipc-fast-handoff/IpcFastHandoff", "frame-reader-claim/FrameReaderClaim", "scheduling-context-budget/SchedulingContextBudget", "cross-cpu-task-retirement/CrossCpuTaskRetirement", "lifecycle-execution-claim/LifecycleExecutionClaim"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/irq_entry_tests/cross_root.rs"
+severity = "high"
+flows = ["scheduler-dispatch"]
+reason = "Four actual born-resource returns cross independent process roots then return to the original kernel executor. The same physical/MM, UID and funding banks survive every architecture effect and real publication/RSP callback; reply revocation cannot replace original funding, Blocked frame generation remains usable, and both born banks drain before real reset and new UID/MM birth under retained kernel Current. Native roots, register effects, topology, RSP arrival and external ACK are modeled inputs, not foreign-CPU/shared-MM exec/census or hardware/global-deletion acceptance."
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/irq_entry_tests/cross_root.rs"
+models = ["lifecycle-execution-claim/LifecycleExecutionClaim"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/irq_entry_tests/foreign_shared.rs"
+severity = "high"
+flows = ["scheduler-dispatch"]
+reason = "Actual CPU1 remote claim, both original bank publications and unique RSP acknowledgements join CPU0 frozen shared-MM exec census. Pending first RSP, foreign Current and outgoing custody all refuse quiescence. Original kernel executor performs common process detach before exact row ACK, then original source image lease publishes and finalizes exec before sealed sibling reset and source terminal return. Only native CPU identity, earlier kernel admission, privileged effects, RSP arrival and external RTC/IPC completion are modeled inputs; not hardware or full global-deletion acceptance."
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/irq_entry_tests/foreign_shared.rs"
+models = ["lifecycle-execution-claim/LifecycleExecutionClaim"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/ipc_publication.rs"
+severity = "critical"
+flows = ["scheduler-dispatch", "cross-cpu-task-retirement"]
+reason = "Original masked Current wait, physical donor/root/receiver and reader survive exact bounded FIFO/typed-owner join, mailbox and WakeWon-aware sender commit. Cold enqueue independently borrows the original executing sender WITHOUT arming it: exact receiver pending phase admits funding before wake and retains original loans through optional FIFO urgency; full FIFO never rolls back successful wake. Raw/overlapping callers refuse before IPC publication, later refusal cancels exact reply, and corruption transfers terminal work rather than draining caller loans. Reverse reply uses original typed fair/FIFO path. No scalar lifetime or execution grant; bounded hot/cold model is NOT full architecture/MM/reuse or hardware joint proof."
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/ipc_publication.rs"
+models = ["ipc-fast-handoff/IpcFastHandoff", "frame-reader-claim/FrameReaderClaim", "scheduler-wakeup/SchedulerWakeup", "cpu-dispatch-preemption/CpuDispatchPreemption", "cross-cpu-task-retirement/CrossCpuTaskRetirement"]
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/ipc_publication/tests.rs"
+severity = "high"
+flows = ["scheduler-dispatch", "cross-cpu-task-retirement"]
+reason = "Actual born-resource hot/cold call/reply, typed phase, reader, funding loans and FIFO/mailbox witnesses. Cold sender stays Running/unarmed through receiver FIFO and later reverse-reply wait arbitration; foreign endpoint or armed sender refuses before bind, cross-CPU fair queue and exhausted urgency FIFO preserve funded typed wake. Earlier topology/IRQ/loader and capacity are modeled inputs, not hardware or complete grant/claim/return/terminal/reuse refinement."
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/ipc_publication/tests.rs"
+models = ["ipc-fast-handoff/IpcFastHandoff", "frame-reader-claim/FrameReaderClaim", "scheduler-wakeup/SchedulerWakeup", "cpu-dispatch-preemption/CpuDispatchPreemption", "cross-cpu-task-retirement/CrossCpuTaskRetirement"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/wake_publication.rs"
+severity = "critical"
+flows = ["scheduler-dispatch", "cross-cpu-task-retirement"]
+reason = "Original masked CPU, exact physical Binding and Resource53 FrameReader own Current/Transition or nonexecuting wake effects. Typed pager/service publication retains one Wait58 pending phase through queue/FIFO, refusing later arms and stale keys; no raw leaf crosses frame/queue work. Reply namespace withdrawal and failed-wake semantics persist. Complete guarded dispatch remains separate; no whole-kernel deletion or hardware refinement is claimed."
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/wake_publication.rs"
+models = ["scheduler-wakeup/SchedulerWakeup", "frame-reader-claim/FrameReaderClaim", "cross-cpu-task-retirement/CrossCpuTaskRetirement", "cpu-dispatch-preemption/CpuDispatchPreemption", "synchronous-ipc-handoff/SynchronousIpcHandoff"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/wake_publication/tests.rs"
+severity = "high"
+flows = ["scheduler-dispatch", "cross-cpu-task-retirement"]
+reason = "Actual root/frame/binding/terminal rows witness consumed Current frame exclusion, foreign UID and sealed admission, retained borrowers and real nonexecuting queue publication; Current/topology entry remain modeled inputs."
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/wake_publication/tests.rs"
+models = ["scheduler-wakeup/SchedulerWakeup", "frame-reader-claim/FrameReaderClaim", "cross-cpu-task-retirement/CrossCpuTaskRetirement", "cpu-dispatch-preemption/CpuDispatchPreemption", "synchronous-ipc-handoff/SynchronousIpcHandoff"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/runqueue/wait.rs"
+severity = "critical"
+flows = ["scheduler-dispatch"]
+reason = "Same per-slot epoch leaf qualifies payload/arm CAS and exact typed clear. Refused Running arms roll back scalar payload; pending wake excludes rearm without changing RunOwner generation or holding a leaf through frame/queue work."
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/runqueue/wait.rs"
+models = ["scheduler-wakeup/SchedulerWakeup", "pager-fault-slot-lifecycle/PagerFaultSlotLifecycle"]
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/runqueue/wait/epoch.rs"
+severity = "critical"
+flows = ["scheduler-dispatch", "cross-cpu-task-retirement"]
+reason = "Non-Copy typed pending phase borrows original physical Binding through last publication effect; exact serial/payload and terminal qualification precede clear. Exhausted nonce refuses capture/arm; reset cannot pass pending phase or original backing loan. Native exhausted input recovery and CPU entry are explicit models, not hardware/joint refinement."
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/runqueue/wait/epoch.rs"
+models = ["scheduler-wakeup/SchedulerWakeup", "pager-fault-slot-lifecycle/PagerFaultSlotLifecycle", "cross-cpu-task-retirement/CrossCpuTaskRetirement"]
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/wake_publication/typed_tests.rs"
+severity = "high"
+flows = ["scheduler-dispatch", "cross-cpu-task-retirement"]
+reason = "Actual physical root/binding/Current/frame/queue/FIFO witnesses exercise typed pending phase, two-thread arm/capture arbitration, terminal and payload rollback. Native earlier claim, caller IRQ/topology, negative nonce input and external cleanup ACK remain models, not complete dispatch/MM/hardware joint refinement."
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/wake_publication/typed_tests.rs"
+models = ["scheduler-wakeup/SchedulerWakeup", "pager-fault-slot-lifecycle/PagerFaultSlotLifecycle", "cross-cpu-task-retirement/CrossCpuTaskRetirement", "cpu-dispatch-preemption/CpuDispatchPreemption", "synchronous-ipc-handoff/SynchronousIpcHandoff"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/terminal_publication.rs"
+severity = "critical"
+flows = ["cross-cpu-task-retirement", "exception-retirement"]
+reason = "Original producer closes fresh identity/Cohort/execution admission before borrower drain without defer/reclaim gap, retains process election through SIGCHLD/donation and detach payload, publishes both consumers last; external ACK and joint dispatch/hardware arbitration remain distinct."
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/terminal_publication.rs"
+models = ["task-retirement-cleanup-owner/TaskRetirementCleanupOwner", "cross-cpu-task-retirement/CrossCpuTaskRetirement", "process-lifecycle-transaction/ProcessLifecycleTransaction", "scheduler-wakeup/SchedulerWakeup", "exception-retirement-lifecycle/ExceptionRetirementLifecycle"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/terminal_publication/tests.rs"
+severity = "high"
+flows = ["cross-cpu-task-retirement", "exception-retirement"]
+reason = "Actual producer/turn/root/thread/activation and Linux leaf witnesses retain own Current bank, defer real borrowers/busy election, preserve exact cleanup and detach, transfer masked/unmasked SIGCHLD, and final-publish invalid wake after reader release. Complete born process-family donation witness retires original members, retains other live sibling edges, publishes final process consumers before any member backing ACK, then reclaims after physical Current bank Drop without a catalog PID scan. Native external ACK is injected after bank drop, not hardware acceptance."
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/terminal_publication/tests.rs"
+models = ["task-retirement-cleanup-owner/TaskRetirementCleanupOwner", "cross-cpu-task-retirement/CrossCpuTaskRetirement", "process-lifecycle-transaction/ProcessLifecycleTransaction", "scheduler-wakeup/SchedulerWakeup", "exception-retirement-lifecycle/ExceptionRetirementLifecycle"]
+
+[[risk_surfaces]]
 path = "kernel/src/main.rs"
 severity = "critical"
 flows = ["cpu-online-lifecycle", "kernel-memory-protection", "physical-frame-lifecycle", "entropy-boundary", "service-bootstrap"]
@@ -302,6 +601,46 @@ flows = ["bootstrap-activation-handoff"]
 reason = "Committed child first-turn authority remains bounded, FIFO, deduplicated, and retirement-safe."
 
 [[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/activation.rs"
+severity = "critical"
+flows = ["atomic-process-activation-batch"]
+reason = "Exact immutable suspended members and original Cohort precede shared physical publication/callback; actual bank and frame loans span all effects and one admission release. Native catalog projections remain explicit, not complete joint refinement."
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/activation.rs"
+models = ["atomic-process-activation-batch/AtomicProcessActivationBatch"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/activation/publication.rs"
+severity = "critical"
+flows = ["atomic-process-activation-batch", "scheduler-dispatch"]
+reason = "Independent complete producer retains original Current bank, captured member frame readers/pins through authority callback, terminal skipping, strict class sleeper/spawn donation and actual local/remote wake plus checked priority advertisement before one admission ACK. No global facade; component projections are not joint hardware refinement."
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/activation/publication.rs"
+models = ["atomic-process-activation-batch/AtomicProcessActivationBatch", "frame-reader-claim/FrameReaderClaim", "affinity-claim-admission/AffinityClaimAdmission", "cross-cpu-task-retirement/CrossCpuTaskRetirement"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/activation/publication/tests.rs"
+severity = "high"
+flows = ["atomic-process-activation-batch", "scheduler-dispatch"]
+reason = "Actual root-born frame, callback loan, hidden terminal, unwind, bank rejection, stop gate, exact capacity/FIFO, remote mailbox and class/donation floor witnesses use modeled native Current/MM/HAL inputs and explicit terminal cleanup, not physical switch or external ACK proof."
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/activation/publication/tests.rs"
+models = ["atomic-process-activation-batch/AtomicProcessActivationBatch", "frame-reader-claim/FrameReaderClaim", "affinity-claim-admission/AffinityClaimAdmission", "cross-cpu-task-retirement/CrossCpuTaskRetirement"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/activation/tests.rs"
+severity = "high"
+flows = ["atomic-process-activation-batch"]
+reason = "Native shared commit/cold refs/hidden terminal binding and competing bounded Class42 hint witnesses are not complete service policy, process exit or physical hardware refinement."
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/activation/tests.rs"
+models = ["atomic-process-activation-batch/AtomicProcessActivationBatch"]
+
+[[risk_surfaces]]
 path = "kernel/ps/src/multitask/scheduler/handoffs.rs"
 severity = "critical"
 flows = ["atomic-process-activation-batch", "bootstrap-activation-handoff"]
@@ -324,6 +663,36 @@ path = "kernel/ps/src/multitask/cpu_local.rs"
 severity = "critical"
 flows = ["cpu-online-lifecycle", "scheduler-lifecycle", "scheduler-cpu-ownership", "smp-reschedule-ipi-lifecycle"]
 reason = "Per-CPU current-task publication is the unique running-task and cross-CPU lifetime authority."
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/boot_execution.rs"
+severity = "high"
+flows = ["scheduler-dispatch", "cpu-online-lifecycle"]
+reason = "Boot tick publication retains the raw PIT encoding independently of task weights and the Scheduler facade."
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/runtime_profile.rs"
+severity = "high"
+flows = ["scheduler-dispatch"]
+reason = "Diagnostic rendering observes task resources only after counter leaves are released; telemetry cannot grant dispatch or billing."
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/runtime_profile/owner.rs"
+severity = "high"
+flows = ["scheduler-dispatch"]
+reason = "Per-CPU destructive counter windows and per-slot UID history preserve open-turn baselines and exact worst-turn tuples without a hot global telemetry guard; bounded native evidence is not hardware or guard-deletion refinement."
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/runtime_profile/owner/tests.rs"
+severity = "high"
+flows = ["scheduler-dispatch"]
+reason = "Independent counter cells, consume-once drain, stable lifetime baseline, UID-zero/reuse history, due epoch, and busy reporter witnesses exercise the real diagnostic owner."
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/runqueue/idle.rs"
+severity = "high"
+flows = ["scheduler-dispatch", "cpu-online-lifecycle"]
+reason = "Published idle tags bind the fixed AP slot mapping; root idle classification is not AP CPU ownership or an execution grant."
 
 [[risk_surfaces]]
 path = "kernel/ps/src/multitask/scheduler/smp.rs"
@@ -1229,14 +1598,7 @@ models = [
 
 [[source_mappings]]
 path = "kernel/ps/src/multitask/process_table.rs"
-models = [
-    "cross-cpu-task-retirement/CrossCpuTaskRetirement",
-    "exec-address-space-transaction/ExecAddressSpaceTransaction",
-    "kernel-resource-accounting/KernelResourceAccounting",
-    "process-address-space-lifetime/ProcessAddressSpaceLifetime",
-    "process-lifecycle-transaction/ProcessLifecycleTransaction",
-    "user-stack-growth/UserStackGrowth",
-]
+models = ["cold-exec-intent/ColdExecIntent", "cross-cpu-task-retirement/CrossCpuTaskRetirement", "exec-address-space-transaction/ExecAddressSpaceTransaction", "kernel-resource-accounting/KernelResourceAccounting", "process-address-space-lifetime/ProcessAddressSpaceLifetime", "process-lifecycle-transaction/ProcessLifecycleTransaction", "user-stack-growth/UserStackGrowth"]
 
 [[source_mappings]]
 path = "services/initd/src/main.rs"
@@ -1336,7 +1698,7 @@ models = ["scheduling-context-budget/SchedulingContextBudget"]
 
 [[source_mappings]]
 path = "kernel/ps/src/multitask/cpu_local.rs"
-models = [
+models = ["cpu-dispatch-preemption/CpuDispatchPreemption",
     "cpu-online-lifecycle/CpuOnlineLifecycle",
     "scheduler-cpu-ownership/SchedulerCpuOwnership",
     "scheduler-wakeup/SchedulerWakeup",
@@ -1353,6 +1715,7 @@ models = [
     "ipc-fast-handoff/IpcFastHandoff",
     "pager-fault-slot-lifecycle/PagerFaultSlotLifecycle",
     "scheduler-cpu-ownership/SchedulerCpuOwnership",
+    "scheduler-local-authority/SchedulerLocalAuthority",
     "scheduling-context-budget/SchedulingContextBudget",
     "scheduler-thread-demotion/SchedulerThreadDemotion",
     "smp-reschedule-ipi/SmpRescheduleIpi",
@@ -1362,13 +1725,238 @@ models = [
     "user-stack-growth/UserStackGrowth",
 ]
 
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/domain_admission.rs"
+severity = "critical"
+flows = ["scheduler-dispatch"]
+reason = "Cold cross-domain utilization and descriptor allocation no longer rely on Scheduler scans; captured membership bridges constructor selection to exact context publication. Existing budget model coverage is limited; native witnesses do not prove complete creation or hardware return."
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/domain_admission/tests.rs"
+severity = "high"
+flows = ["scheduler-dispatch"]
+reason = "Real registry/member witnesses cover captures, exact release, quota overlap, stale policy/generation and checked exhaustion without treating catalog fixtures as authority."
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/scheduling_runtime.rs"
+severity = "critical"
+flows = ["scheduler-dispatch"]
+reason = "Exact budget owner retains domain members for captures and initialized contexts; closing is not release and replacement requires drained intervals and members. Checked generations never wrap."
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/scheduling_runtime/domain_tests.rs"
+severity = "high"
+flows = ["scheduler-dispatch"]
+reason = "Incomplete budget and orphan interval fault witnesses independently qualify refusal, so member protection cannot hide a missing captured-interval replacement gate; native recovery is not production ACK."
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/scheduling_runtime/domain_tests.rs"
+models = ["scheduling-context-budget/SchedulingContextBudget"]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/scheduling_runtime.rs"
+models = ["scheduling-context-budget/SchedulingContextBudget"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/kernel_creation.rs"
+severity = "critical"
+flows = ["scheduler-dispatch"]
+reason = "Independent actual Ticket/FrameWriter/kernel publication replaces facade construction; exact pre-ACK committing epoch/UID/geometry/MM bank loan spans Slot ACK, terminal overlap and queue wake before release. Observational qualified fair floor preserves policy, not dispatch/billing permission. Native topology/root are namespace fixtures, not joint hardware refinement."
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/kernel_creation.rs"
+models = ["scheduler-admission/SchedulerAdmission", "frame-reader-claim/FrameReaderClaim", "cross-cpu-task-retirement/CrossCpuTaskRetirement"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/kernel_creation/tests.rs"
+severity = "high"
+flows = ["scheduler-dispatch", "cross-cpu-task-retirement"]
+reason = "Shared actual producer/frame/queue/bank component witnesses cover Blocked ACK and wake generation, exact zero UID, terminal overlap and pin-denied reuse, reserved prefix refusal and qualified fair observations; native cleanup and topology/root inputs do not establish external/hardware completion."
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/kernel_creation/tests.rs"
+models = ["scheduler-admission/SchedulerAdmission", "frame-reader-claim/FrameReaderClaim", "cross-cpu-task-retirement/CrossCpuTaskRetirement"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/process_placement/reclaim.rs"
+severity = "critical"
+flows = ["process-address-space-lifecycle", "cross-cpu-task-retirement"]
+reason = "Actual Resource53-borrowed checked nonce seals Class55 member against exec and terminal census capture; original frozen censuses and retained logical tombstones refuse physical destruction without new execution/MM pins. Final process donations use that original complete census, but IRQ/recipient wake/global dispatch authority remain separate."
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/process_placement/reclaim.rs"
+models = ["cold-exec-intent/ColdExecIntent", "exec-address-space-transaction/ExecAddressSpaceTransaction", "process-lifecycle-transaction/ProcessLifecycleTransaction", "cross-cpu-task-retirement/CrossCpuTaskRetirement"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/stack_resources/reuse/census_tests.rs"
+severity = "high"
+flows = ["process-address-space-lifecycle", "cross-cpu-task-retirement"]
+reason = "Actual born root/thread/Resource/Class55 witnesses cover exec and terminal admission orders, concurrent one-winner, original complete final donation census, logical tombstones, physical clear nonce and abandonment. Terminal consumer ACK and fixture recovery remain explicit native models, not hardware or joint guard-deletion proof."
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/stack_resources/reuse/census_tests.rs"
+models = ["cold-exec-intent/ColdExecIntent", "exec-address-space-transaction/ExecAddressSpaceTransaction", "process-lifecycle-transaction/ProcessLifecycleTransaction", "cross-cpu-task-retirement/CrossCpuTaskRetirement"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/stack_resources/reuse.rs"
+severity = "critical"
+flows = ["cross-cpu-task-retirement"]
+reason = "Exact hidden binding/checked reuse nonce seals physical vacancy through metadata reset, owned storage detach and explicit identity clear; abandonment retains quarantine, not complete exit/hardware proof."
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/stack_resources/reuse.rs"
+models = ["cross-cpu-task-retirement/CrossCpuTaskRetirement", "scheduler-admission/SchedulerAdmission"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/stack_resources/reuse/tests.rs"
+severity = "high"
+flows = ["cross-cpu-task-retirement"]
+reason = "Real slot resources/identity/tickets prove detached prefix, hidden UID drain, poisoned occupancy and nonce refusal; native recovery/incomplete-state injection does not establish production reopen or group teardown."
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/stack_resources/reuse/tests.rs"
+models = ["cross-cpu-task-retirement/CrossCpuTaskRetirement", "scheduler-admission/SchedulerAdmission"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/retirement_cleanup/reuse.rs"
+severity = "critical"
+flows = ["cross-cpu-task-retirement"]
+reason = "Producer/deferred/external/kernel custody must drain before exact terminal reset seal; release follows owned reset and precedes physical vacancy ACK, not full process-exit arbitration."
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/retirement_cleanup/reuse.rs"
+models = ["task-retirement-cleanup-owner/TaskRetirementCleanupOwner", "cross-cpu-task-retirement/CrossCpuTaskRetirement"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/retirement_cleanup/reuse/tests.rs"
+severity = "high"
+flows = ["cross-cpu-task-retirement"]
+reason = "Independent row predicates, exact rollback, post-effect quarantine and checked nonce witnesses are not complete process publication/hardware teardown refinement."
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/retirement_cleanup/reuse/tests.rs"
+models = ["task-retirement-cleanup-owner/TaskRetirementCleanupOwner", "cross-cpu-task-retirement/CrossCpuTaskRetirement"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/bootstrap.rs"
+severity = "critical"
+flows = ["cpu-online-lifecycle"]
+reason = "One-shot BSP/AP execution replaces all legacy reset/idle/initial architecture bodies. Original image joins shared Ticket descriptor, Blocked ACK, exact CPU Running, typed interval, physical/UID Current banks and borrowed initial hardware turn before Ready. Partial images poison; no full selected funding/MM/RSP/terminal/reuse hardware refinement."
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/bootstrap/tests.rs"
+severity = "high"
+flows = ["cpu-online-lifecycle"]
+reason = "Bounded real state witnesses cover competing boot producers, exact tuple/stages, prefix refusal, unique AP entry and poison; mock ACKs are not physical banks or architectural acceptance."
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/bootstrap.rs"
+models = ["cpu-online-lifecycle/CpuOnlineLifecycle", "scheduler-cpu-ownership/SchedulerCpuOwnership"]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/bootstrap/tests.rs"
+models = ["cpu-online-lifecycle/CpuOnlineLifecycle", "scheduler-cpu-ownership/SchedulerCpuOwnership"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/runqueue/admission.rs"
+severity = "critical"
+flows = ["cpu-online-lifecycle", "scheduler-dispatch"]
+reason = "Constructor owner ACK is separate from wake/claim. Exact original InitialCpu alone joins hidden Blocked descriptor to same-CPU Running and bound frame generation; duplicate, live reservation or typed wait refuses before CAS."
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/runqueue/admission.rs"
+models = ["cpu-online-lifecycle/CpuOnlineLifecycle", "scheduler-cpu-ownership/SchedulerCpuOwnership"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/bootstrap/initial_tasks.rs"
+severity = "critical"
+flows = ["cpu-online-lifecycle", "scheduler-dispatch"]
+reason = "Original InitialCpu retains sole hidden kernel descriptor Ticket/backing through exact initial Running, interval and both Current banks; empty-prefix refusal is not teardown, BSP owns frame reader and AP owns only parked HAL static stack without synthetic RSP. Same original hardware turn borrows architecture through last register."
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/bootstrap/initial_tasks.rs"
+models = ["cpu-online-lifecycle/CpuOnlineLifecycle", "scheduler-cpu-ownership/SchedulerCpuOwnership"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/bootstrap/initial_tasks/tests.rs"
+severity = "high"
+flows = ["cpu-online-lifecycle", "scheduler-dispatch"]
+reason = "Born descriptor/initial interval/physical Current witnesses cover duplicate or foreign CPU admission, original bank architecture capture and refusing live-resource reset. Earlier HAL, static AP stack and logical Current inputs are explicitly native models, not privileged register/RSP or joint teardown acceptance."
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/bootstrap/initial_tasks/tests.rs"
+models = ["cpu-online-lifecycle/CpuOnlineLifecycle", "scheduler-cpu-ownership/SchedulerCpuOwnership"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/root_slots.rs"
+severity = "critical"
+flows = ["scheduler-dispatch"]
+reason = "Dynamic kernel/root construction reserves exact slot/UID/generation; RootPublication preclaims the original process transaction and checked root nonce before visibility, cancels unpublished owners outside leaves, and retains real physical backing before Slot/Join ACK through wake. Not complete group lifecycle or boot/hardware arbitration."
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/root_creation.rs"
+severity = "critical"
+flows = ["scheduler-dispatch"]
+reason = "Independent complete root/fork constructor retains original Current actor, parent binding/Cohort and domain admission through materialization, previsibility process pin, exact descriptor/metadata and dual ACK plus backed wake; visible abandonment poisons and uninitialized runtime never grants funding. Component projections are not joint CPU/MM/hardware refinement."
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/root_creation/tests.rs"
+severity = "high"
+flows = ["scheduler-dispatch"]
+reason = "Actual shared root constructor, process/slot reservation, parent/executor loans, funding, terminal overlap and same-UID reuse witnesses use an explicitly modeled MM/Current namespace and external terminal ACK, not hardware grants."
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/root_creation.rs"
+models = ["process-lifecycle-transaction/ProcessLifecycleTransaction", "scheduler-admission/SchedulerAdmission", "affinity-claim-admission/AffinityClaimAdmission", "frame-reader-claim/FrameReaderClaim", "mm-activation-close/MmActivationClose"]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/root_creation/tests.rs"
+models = ["process-lifecycle-transaction/ProcessLifecycleTransaction", "scheduler-admission/SchedulerAdmission", "affinity-claim-admission/AffinityClaimAdmission", "cross-cpu-task-retirement/CrossCpuTaskRetirement"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/root_slots/tests.rs"
+severity = "high"
+flows = ["scheduler-dispatch"]
+reason = "Real root preparation/ticket witnesses include UID zero, competing producers, actual canaries, complete descriptor/membership prefix refusal and exact Blocked ACK; metadata/physical pins are not CPU/hardware grants."
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/root_slots.rs"
+models = ["scheduler-admission/SchedulerAdmission"]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/root_slots/tests.rs"
+models = ["scheduler-admission/SchedulerAdmission"]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/domain_admission.rs"
+models = ["scheduling-context-budget/SchedulingContextBudget"]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/domain_admission/tests.rs"
+models = ["scheduling-context-budget/SchedulingContextBudget"]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/scheduling_context.rs"
+models = ["scheduling-context-budget/SchedulingContextBudget"]
+
 [[source_mappings]]
 path = "kernel/ps/src/multitask/scheduler/ipc_donation.rs"
 models = ["scheduling-context-budget/SchedulingContextBudget"]
 
 [[source_mappings]]
 path = "kernel/ps/src/multitask/scheduler/donation_ledger.rs"
-models = ["scheduling-context-budget/SchedulingContextBudget"]
+models = [
+    "scheduler-local-authority/SchedulerLocalAuthority",
+    "scheduling-context-budget/SchedulingContextBudget",
+]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/local_dispatch.rs"
+models = ["scheduler-local-authority/SchedulerLocalAuthority"]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/frame_publication.rs"
+models = ["scheduler-local-authority/SchedulerLocalAuthority"]
 
 [[source_mappings]]
 path = "kernel/ps/src/multitask/scheduler/runqueue_policy.rs"
@@ -1379,9 +1967,14 @@ path = "kernel/ps/src/multitask/scheduler/runqueue.rs"
 models = [
     "ipc-fast-handoff/IpcFastHandoff",
     "scheduler-cpu-distribution/SchedulerCpuDistribution",
+    "scheduler-local-authority/SchedulerLocalAuthority",
     "synchronous-ipc-handoff-concurrency/SynchronousIpcHandoffConcurrency",
     "synchronous-ipc-handoff/SynchronousIpcHandoff",
 ]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/runqueue/claim.rs"
+models = ["scheduler-local-authority/SchedulerLocalAuthority", "frame-reader-claim/FrameReaderClaim", "mm-activation-close/MmActivationClose"]
 
 [[source_mappings]]
 path = "kernel/ps/src/multitask/scheduler/reclaim.rs"
@@ -1406,17 +1999,22 @@ path = "kernel/ps/src/multitask/scheduler/activation_batch_tests.rs"
 models = [
     "atomic-process-activation-batch/AtomicProcessActivationBatch",
     "bootstrap-activation-handoff/BootstrapActivationHandoff",
+    "scheduler-local-authority/SchedulerLocalAuthority",
 ]
 
 [[source_mappings]]
 path = "kernel/ps/src/multitask/scheduler/handoff_queue.rs"
-models = ["bootstrap-activation-handoff/BootstrapActivationHandoff"]
+models = [
+    "bootstrap-activation-handoff/BootstrapActivationHandoff",
+    "scheduler-local-authority/SchedulerLocalAuthority",
+]
 
 [[source_mappings]]
 path = "kernel/ps/src/multitask/scheduler/handoffs.rs"
 models = [
     "atomic-process-activation-batch/AtomicProcessActivationBatch",
     "bootstrap-activation-handoff/BootstrapActivationHandoff",
+    "scheduler-local-authority/SchedulerLocalAuthority",
     "synchronous-ipc-handoff-concurrency/SynchronousIpcHandoffConcurrency",
     "synchronous-ipc-handoff/SynchronousIpcHandoff",
 ]
@@ -1437,14 +2035,27 @@ models = [
 
 [[source_mappings]]
 path = "kernel/ps/src/multitask/scheduler/smp.rs"
-models = [
-    "cpu-online-lifecycle/CpuOnlineLifecycle",
-    "cross-cpu-task-retirement/CrossCpuTaskRetirement",
-    "scheduler-wakeup/SchedulerWakeup",
-    "smp-reschedule-ipi/SmpRescheduleIpi",
-    "synchronous-ipc-handoff-concurrency/SynchronousIpcHandoffConcurrency",
-    "synchronous-ipc-handoff/SynchronousIpcHandoff",
-]
+models = ["cold-exec-intent/ColdExecIntent", "cpu-online-lifecycle/CpuOnlineLifecycle", "cross-cpu-task-retirement/CrossCpuTaskRetirement", "scheduler-wakeup/SchedulerWakeup", "smp-reschedule-ipi/SmpRescheduleIpi", "synchronous-ipc-handoff-concurrency/SynchronousIpcHandoffConcurrency", "synchronous-ipc-handoff/SynchronousIpcHandoff"]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/boot_execution.rs"
+models = ["scheduler-cpu-distribution/SchedulerCpuDistribution", "cpu-online-lifecycle/CpuOnlineLifecycle"]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/runtime_profile.rs"
+models = ["scheduler-cpu-distribution/SchedulerCpuDistribution"]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/runtime_profile/owner.rs"
+models = ["scheduler-cpu-distribution/SchedulerCpuDistribution"]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/runtime_profile/owner/tests.rs"
+models = ["scheduler-cpu-distribution/SchedulerCpuDistribution"]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/runqueue/idle.rs"
+models = ["scheduler-cpu-distribution/SchedulerCpuDistribution", "cpu-online-lifecycle/CpuOnlineLifecycle"]
 
 [[source_mappings]]
 path = "kernel/ps/src/multitask/mod.rs"
@@ -1879,6 +2490,7 @@ required_models = [
     "product-boot/ProductBoot",
     "robust-futex-owner-death/RobustFutexOwnerDeath",
     "scheduler-cpu-ownership/SchedulerCpuOwnership",
+    "scheduler-local-authority/SchedulerLocalAuthority",
     "scheduling-context-budget/SchedulingContextBudget",
     "smp-ring3-qualification/SmpRing3Qualification",
     "smp-release-admission/SmpReleaseAdmission",
@@ -1929,6 +2541,7 @@ required_models = [
     "cpu-online-lifecycle/CpuOnlineLifecycle",
     "smp-reschedule-ipi/SmpRescheduleIpi",
     "scheduler-cpu-ownership/SchedulerCpuOwnership",
+    "scheduler-local-authority/SchedulerLocalAuthority",
     "tlb-shootdown-lifecycle/TlbShootdownLifecycle",
     "cross-cpu-task-retirement/CrossCpuTaskRetirement",
     "endpoint-receiver-wakeup/EndpointReceiverWakeup",
@@ -2154,3 +2767,612 @@ reason = "Only a present user write with live writable VMA authority may enter t
 [[source_mappings]]
 path = "kernel/executive/src/hal_hooks.rs"
 models = ["cow-frame-lifecycle/CowFrameLifecycle"]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/stack_resources/frame_readers.rs"
+models = ["affinity-claim-admission/AffinityClaimAdmission", "frame-reader-claim/FrameReaderClaim"]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/stack_resources/frame_readers/tests.rs"
+models = ["frame-reader-claim/FrameReaderClaim"]
+
+[[risk_surfaces]]
+path = "kernel/nucleus-core/src/util/lockdep/cpu_identity.rs"
+severity = "high"
+flows = ["scheduler-dispatch"]
+reason = "Native-only feature supplies thread-local architectural CPU input with bounded nested unwind-safe restoration; no topology, claim, masked owner or bank ACK is manufactured. Boot identity remains architectural and never uses the native adapter."
+[[source_mappings]]
+path = "kernel/nucleus-core/src/util/lockdep/cpu_identity.rs"
+models = ["cpu-dispatch-preemption/CpuDispatchPreemption", "lifecycle-execution-claim/LifecycleExecutionClaim"]
+
+[[source_mappings]]
+path = "kernel/nucleus-core/src/util/lockdep/preemption/dispatch.rs"
+models = ["cpu-dispatch-preemption/CpuDispatchPreemption"]
+
+[[source_mappings]]
+path = "kernel/nucleus-core/src/util/lockdep/preemption/dispatch/tests.rs"
+models = ["cpu-dispatch-preemption/CpuDispatchPreemption"]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/cpu_local/dispatch_turn/preemption_tests.rs"
+models = ["cpu-dispatch-preemption/CpuDispatchPreemption"]
+
+[[source_mappings]]
+path = "kernel/nucleus-core/src/util/lockdep/preemption.rs"
+models = ["cpu-dispatch-preemption/CpuDispatchPreemption"]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/cpu_local/dispatch_turn.rs"
+models = ["cpu-dispatch-preemption/CpuDispatchPreemption", "mm-activation-close/MmActivationClose", "lifecycle-execution-claim/LifecycleExecutionClaim"]
+
+[[source_mappings]]
+path = "kernel/mm/src/memory/address_space/execution_lifetime.rs"
+models = ["mm-activation-close/MmActivationClose"]
+
+[[source_mappings]]
+path = "kernel/mm/src/memory/address_space/execution_lifetime/activation_tests.rs"
+models = ["mm-activation-close/MmActivationClose"]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/stack_resources/activation.rs"
+models = ["mm-activation-close/MmActivationClose"]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/stack_resources/context/activation_tests.rs"
+models = ["mm-activation-close/MmActivationClose"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/return_architecture.rs"
+severity = "critical"
+flows = ["scheduler-dispatch"]
+reason = "Original successful selected-frame claim receipt remains owned by unique masked CPU turn through exact bank/UID/epoch/MM/placement architecture and SIMD install and before Current publication. No fresh post-claim MM/frame admission, scalar scratch authority or copied dispatch grant. Pager resume now independently borrows its already executing original Current allocation/context MM pin and IRQ mask through final CR3/TSS/FS/GS, with no saved frame, fresh MM activation or execution claim. Production and resource-owning native witnesses share install_with, including branch selection, original receipt loans through EACH effect and ready only after SIMD. Only register/SIMD effects are modeled; native capture/terminal-admission witnesses are not privileged hardware or full joint guard-deletion acceptance."
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/return_architecture.rs"
+models = ["cpu-dispatch-preemption/CpuDispatchPreemption", "frame-reader-claim/FrameReaderClaim", "mm-activation-close/MmActivationClose", "affinity-claim-admission/AffinityClaimAdmission", "syscall-simd-lifecycle/SyscallSimdLifecycle", "lifecycle-execution-claim/LifecycleExecutionClaim"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/return_architecture/tests.rs"
+severity = "high"
+flows = ["scheduler-dispatch"]
+reason = "Actual root/turn/MM/placement/allocation/claim receipts qualify borrowed architecture plans for Current, Local and Direct. Missing claim, foreign copy fields, replaced frame/bank/scalar/UID/geometry/terminal and duplicate architecture scope refuse. Earlier IRQ input, native phase/bank cleanup and completion are explicitly models, not register/RSP ACK or joint guard-deletion evidence."
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/return_architecture/tests.rs"
+models = ["cpu-dispatch-preemption/CpuDispatchPreemption", "frame-reader-claim/FrameReaderClaim", "mm-activation-close/MmActivationClose", "affinity-claim-admission/AffinityClaimAdmission", "syscall-simd-lifecycle/SyscallSimdLifecycle"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/execution_interval.rs"
+severity = "critical"
+flows = ["scheduler-dispatch"]
+reason = "Successful original-turn frame claim moves original non-Copy funding directly to its CPU interval under retained allocation/execution banks. Architecture and final Current publication borrow that same turn/receipt and require the exact still-active grant. No scalar-keyed preparation, postclaim donor resolution or legacy Scheduler opening/cancellation authority; initial boot admission remains a separate cold boundary. Native projections are not joint hardware evidence."
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/execution_interval.rs"
+models = ["cpu-dispatch-preemption/CpuDispatchPreemption", "scheduling-context-budget/SchedulingContextBudget", "frame-reader-claim/FrameReaderClaim", "lifecycle-execution-claim/LifecycleExecutionClaim"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/dispatch_claim.rs"
+severity = "critical"
+flows = ["scheduler-dispatch"]
+reason = "Actual original-turn-bound selected frame retains exact UID/epoch/allocation and original Context-Domain funding. Final frame qualification shares BOTH claim resource leaves with reader/writer exclusion and owner CAS. Original preselection class joins ledger45 and live base-class replacement; SAME original non-Copy funding borrows Context48/Domain49 continuously through the exact CAS, after rq40 and before Terminal/Identity/Resources/Placement. All leaves end before CPU banks/interval/architecture; no credit check-then-claim gap. Refused original provisional MM/UID loans leave admission in non-Copy ClaimAttempt, and Local drops rq before original refusal loans. Fixed idle retains original physical frame/UID/placement, but is neither funding nor a class-policy winner; Current fallback retains the original selection class. Success directly opens the original funded interval before claim returns; no scalar preparation mailbox or Scheduler opener remains. Current/idle fallback uses same engine. Complete arbitration/IRQ and joint guard deletion remain separate."
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/dispatch_claim.rs"
+models = ["cpu-dispatch-preemption/CpuDispatchPreemption", "scheduling-context-budget/SchedulingContextBudget", "frame-reader-claim/FrameReaderClaim", "mm-activation-close/MmActivationClose", "affinity-claim-admission/AffinityClaimAdmission"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/dispatch_claim/tests.rs"
+severity = "high"
+flows = ["scheduler-dispatch"]
+reason = "Actual root/turn/bank/resource/MM/funding/claim witnesses cover Current, Local and Direct preparation, same-generation epoch replacement, original UID/RSP, owner/reader/terminal/affinity races, original credit exhaustion/close and fallback, plus actual final CAS probes of the SAME context/domain/class mutex exclusion in Local/Direct and original preselection class invalidation by live base/donation producers. Original refused-placement MM/UID loans survive actual admission return before Drop; actual born kernel fixed idle keeps exact physical custody despite unrelated late class change, with deliberate refused CAS and no fabricated Current/RSP ACK. Mutex probes are native (lockdep disabled); IRQ input, bank refresh and native phase recovery are modeled, not hardware ACK or full joint lifetime proof."
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/dispatch_claim/tests.rs"
+models = ["cpu-dispatch-preemption/CpuDispatchPreemption", "scheduling-context-budget/SchedulingContextBudget", "frame-reader-claim/FrameReaderClaim", "mm-activation-close/MmActivationClose", "affinity-claim-admission/AffinityClaimAdmission"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/current_return.rs"
+severity = "critical"
+flows = ["scheduler-dispatch"]
+reason = "Original borrowed masked CPU turn retains exact physical Current binding through once captured funding/account, live frame refresh and actual queue return CAS. Failed fast IPC peer claim carries the same non-Copy receipt into ordinary fallback; Blocked/Local recapture is denied. Incoming hardware/dispatch and joint guard deletion remain separate."
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/current_return.rs"
+models = ["cpu-dispatch-preemption/CpuDispatchPreemption", "scheduling-context-budget/SchedulingContextBudget", "frame-reader-claim/FrameReaderClaim", "scheduler-wakeup/SchedulerWakeup"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/current_return/tests.rs"
+severity = "high"
+flows = ["scheduler-dispatch"]
+reason = "Actual root/backing/CPU-turn and captured funding witnesses cover original failed-peer fallback, once frame/queue/fairness, wake preservation, live canary, terminal old-bank borrowing and missing bank/foreign geometry/custody refusal. Earlier IRQ/queue/MM and native phase restoration are explicit projections, not physical return or joint proof."
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/current_return/tests.rs"
+models = ["cpu-dispatch-preemption/CpuDispatchPreemption", "scheduling-context-budget/SchedulingContextBudget", "frame-reader-claim/FrameReaderClaim", "scheduler-wakeup/SchedulerWakeup"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/current_wait.rs"
+severity = "critical"
+flows = ["scheduler-dispatch"]
+reason = "Original masked same-CPU Current bank authenticates a non-transferable exact UID/backing loan before wait effects. Terminal closes new loans, while the original fused pager loan survives commit/rollback, entire worker publication and one-shot floor, then is dropped before trap. Resumed user architecture borrows the same newly actual Current loan through its last hardware effect. No Running/scalar fallback or fresh execution permission."
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/current_wait.rs"
+models = ["lifecycle-execution-claim/LifecycleExecutionClaim", "scheduler-wakeup/SchedulerWakeup", "scheduler-cpu-ownership/SchedulerCpuOwnership"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/current_wait/tests.rs"
+severity = "high"
+flows = ["scheduler-dispatch"]
+reason = "Actual root/bank/UID loan and atomic wait operations witness exact arm/cancel, wake, pager token, retained terminal refusal, and missing physical or Running custody. Earlier queue claim and IRQ entry are modeled; no full process detach or hardware return proof."
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/current_wait/tests.rs"
+models = ["lifecycle-execution-claim/LifecycleExecutionClaim", "scheduler-wakeup/SchedulerWakeup", "scheduler-cpu-ownership/SchedulerCpuOwnership"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/runqueue/return_publication.rs"
+severity = "critical"
+flows = ["scheduler-dispatch"]
+reason = "Actual outgoing Running return and Blocked wake arbitrate wait/wake/terminal CAS, roll back only provisional membership, and publish exact queue and generation. Caller retains physical bank/frame/IRQ and enclosing dispatch serializer; owner word is not execution or reuse authority."
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/runqueue/return_publication.rs"
+models = ["scheduler-local-authority/SchedulerLocalAuthority", "scheduler-wakeup/SchedulerWakeup", "cross-cpu-task-retirement/CrossCpuTaskRetirement"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/runqueue/return_publication/tests.rs"
+severity = "high"
+flows = ["scheduler-dispatch"]
+reason = "Native queue projections inject actual raced wait/wake/retire at CAS and check original published bitmap plus neighbour weight. They do not grant physical Current, MM, stack or joint hardware return custody."
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/runqueue/return_publication/tests.rs"
+models = ["scheduler-local-authority/SchedulerLocalAuthority", "scheduler-wakeup/SchedulerWakeup", "cross-cpu-task-retirement/CrossCpuTaskRetirement"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/exec_transaction/quiescence.rs"
+severity = "critical"
+flows = ["scheduler-dispatch", "cross-cpu-task-retirement"]
+reason = "Original immutable exec membership fences physical reap while each independent retry borrows original masked CPU custody and transfers exact sibling terminal producer through stop, drain, process election and detach. Retired is not quiescent; no directory or fresh post-stop observation pin is acquired, and no hardware ACK is fabricated."
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/exec_transaction/quiescence.rs"
+models = ["cold-exec-intent/ColdExecIntent", "exec-address-space-transaction/ExecAddressSpaceTransaction", "cross-cpu-task-retirement/CrossCpuTaskRetirement", "process-lifecycle-transaction/ProcessLifecycleTransaction"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/exec_transaction/quiescence/tests.rs"
+severity = "high"
+flows = ["scheduler-dispatch", "cross-cpu-task-retirement"]
+reason = "Actual root/thread/census/terminal rows now borrow the original CPU owner, witness retired borrower retry, detach and both consumers, caller-stack/mode and unmasked/foreign-CPU refusal. IRQ state/topology and external ACK are explicit native models, not physical return or whole-kernel guard-deletion proof."
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/exec_transaction/quiescence/tests.rs"
+models = ["cold-exec-intent/ColdExecIntent", "exec-address-space-transaction/ExecAddressSpaceTransaction", "cross-cpu-task-retirement/CrossCpuTaskRetirement", "process-lifecycle-transaction/ProcessLifecycleTransaction"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/exec_transaction/publication.rs"
+severity = "critical"
+flows = ["scheduler-dispatch"]
+reason = "Independent complete self/peer image producer authenticates original Current bank, frozen intent/census, exact FrameWriter and staged MM; preserves funding, mask and consumed-self bytes while publishing physical frame/metadata/Linux/TLS before MM/CPU ACK. No facade; native architecture namespace is not hardware refinement."
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/exec_transaction/publication.rs"
+models = ["cold-exec-intent/ColdExecIntent", "exec-address-space-transaction/ExecAddressSpaceTransaction", "mm-activation-close/MmActivationClose", "cpu-dispatch-preemption/CpuDispatchPreemption", "frame-reader-claim/FrameReaderClaim"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/exec_transaction/publication/tests.rs"
+severity = "high"
+flows = ["scheduler-dispatch"]
+reason = "Actual root-born producer, staged/finalized process MM and CPU control-turn witnesses cover physical peer bytes, Linux/TLS, exact funding/masks, tuple/bank refusal and no consumed-self writes/Ready grants. Native Current/HAL and initial topology remain explicit models, not physical executing-bank/CR3/FS/RSP proof."
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/exec_transaction/publication/tests.rs"
+models = ["cold-exec-intent/ColdExecIntent", "exec-address-space-transaction/ExecAddressSpaceTransaction", "mm-activation-close/MmActivationClose", "cpu-dispatch-preemption/CpuDispatchPreemption", "frame-reader-claim/FrameReaderClaim"]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/exec_transaction.rs"
+models = ["cold-exec-intent/ColdExecIntent", "mm-activation-close/MmActivationClose"]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/current_identity/execution.rs"
+models = ["lifecycle-execution-claim/LifecycleExecutionClaim", "atomic-process-activation-batch/AtomicProcessActivationBatch"]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/current_identity/cohort.rs"
+models = ["atomic-process-activation-batch/AtomicProcessActivationBatch", "affinity-claim-admission/AffinityClaimAdmission", "lifecycle-execution-claim/LifecycleExecutionClaim"]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/current_identity/cohort/tests.rs"
+models = ["atomic-process-activation-batch/AtomicProcessActivationBatch", "lifecycle-execution-claim/LifecycleExecutionClaim"]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/current_identity/execution/tests.rs"
+models = ["lifecycle-execution-claim/LifecycleExecutionClaim"]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/current_identity/execution/banks.rs"
+models = ["lifecycle-execution-claim/LifecycleExecutionClaim"]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/current_identity/execution/banks/tests.rs"
+models = ["lifecycle-execution-claim/LifecycleExecutionClaim"]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/stack_resources/lifecycle_tests.rs"
+models = ["affinity-claim-admission/AffinityClaimAdmission", "lifecycle-execution-claim/LifecycleExecutionClaim"]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/current_identity/exec_intent.rs"
+models = ["cold-exec-intent/ColdExecIntent"]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/current_identity/exec_intent/tests.rs"
+models = ["cold-exec-intent/ColdExecIntent"]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/stack_resources/context/intent_tests.rs"
+models = ["cold-exec-intent/ColdExecIntent", "cross-cpu-task-retirement/CrossCpuTaskRetirement"]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/current_identity.rs"
+models = ["cold-exec-intent/ColdExecIntent", "authority-identity-lifecycle/AuthorityIdentityLifecycle"]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/current/exec.rs"
+models = ["cold-exec-intent/ColdExecIntent"]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/stack_resources/frame_access.rs"
+models = ["cold-exec-intent/ColdExecIntent"]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/stack_resources.rs"
+models = ["cold-exec-intent/ColdExecIntent"]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/stack_resources/context.rs"
+models = ["cold-exec-intent/ColdExecIntent", "lifecycle-execution-claim/LifecycleExecutionClaim"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/stack_resources/context/tests.rs"
+severity = "high"
+flows = ["scheduler-dispatch"]
+reason = "Context/MM scalar tests include actual Ticket-backed Current allocation-bank witnesses for entry/log/wait namespace fallback and reject absent, Prepared or foreign Current custody. Existing mixed-record native projections and modeled MM roots do not prove physical switch/CR3/RSP or the complete joint guard-deletion boundary."
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/stack_resources/context/tests.rs"
+models = ["cold-exec-intent/ColdExecIntent", "lifecycle-execution-claim/LifecycleExecutionClaim"]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/stack_resources/task_start.rs"
+models = ["cold-exec-intent/ColdExecIntent"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/execution_image/tests.rs"
+severity = "high"
+flows = ["scheduler-dispatch"]
+reason = "Actual reserved kernel writer witnesses authenticate owned entry/trailer geometry and exclusion; complete kernel UID zero metadata is not admission before producer ACK. Native bytes are not hardware return or funding/class proof."
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/execution_image/tests.rs"
+models = ["scheduler-admission/SchedulerAdmission"]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/execution_image.rs"
+models = ["cold-exec-intent/ColdExecIntent", "scheduler-admission/SchedulerAdmission"]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/runqueue/affinity_payload.rs"
+models = ["affinity-claim-admission/AffinityClaimAdmission"]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/runqueue/affinity_payload/admission_tests.rs"
+models = ["affinity-claim-admission/AffinityClaimAdmission"]
+
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/runqueue/affinity_payload/placement.rs"
+models = ["affinity-claim-admission/AffinityClaimAdmission", "cpu-dispatch-preemption/CpuDispatchPreemption", "lifecycle-execution-claim/LifecycleExecutionClaim"]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/thread_slots.rs"
+models = ["affinity-claim-admission/AffinityClaimAdmission", "mm-activation-close/MmActivationClose", "process-lifecycle-transaction/ProcessLifecycleTransaction"]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/process_placement.rs"
+models = ["process-lifecycle-transaction/ProcessLifecycleTransaction", "atomic-process-activation-batch/AtomicProcessActivationBatch", "affinity-claim-admission/AffinityClaimAdmission"]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/process_placement/tests.rs"
+models = ["process-lifecycle-transaction/ProcessLifecycleTransaction", "atomic-process-activation-batch/AtomicProcessActivationBatch", "affinity-claim-admission/AffinityClaimAdmission"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/process_placement/exit_membership.rs"
+severity = "critical"
+flows = ["process-lifecycle-transaction", "cross-cpu-task-retirement"]
+reason = "Durable per-process exit work retains exact object pin across requester retirement; checked nonce seals joins before queued capture after final creator ACK and independent exec/terminal release. Copy receipt is advanced only by desired-stop ACK. Independent worker suspends by moving the original captured census/effect phase/process pin to the same row; resume never recollects. No CPU/MM/image or complete cleanup grant."
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/process_placement/exit_membership/tests.rs"
+severity = "high"
+flows = ["process-lifecycle-transaction", "cross-cpu-task-retirement"]
+reason = "Actual ledger/identity/pin component witnesses and explicit native predicate/poison injections do not refine full group-exit/hardware behavior."
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/thread_creation.rs"
+severity = "critical"
+flows = ["process-lifecycle-transaction"]
+reason = "Independent common Ticket/MM/funding/frame/descriptor and parent physical Cohort plus final C55 Join retain suspended Blocked publication through actual Slot ACK without a facade. Materialization work transfers original custody before caller safe points; final membership/MM capture follows TEB. Root/fork, dispatch and joint hardware refinement remain open."
+[[source_mappings]]
+path = "kernel/ps/src/multitask/process_placement/exit_membership.rs"
+models = ["process-lifecycle-transaction/ProcessLifecycleTransaction", "cross-cpu-task-retirement/CrossCpuTaskRetirement"]
+[[source_mappings]]
+path = "kernel/ps/src/multitask/process_placement/exit_membership/tests.rs"
+models = ["process-lifecycle-transaction/ProcessLifecycleTransaction", "cross-cpu-task-retirement/CrossCpuTaskRetirement"]
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/thread_creation.rs"
+models = ["process-lifecycle-transaction/ProcessLifecycleTransaction", "scheduler-admission/SchedulerAdmission", "mm-activation-close/MmActivationClose", "affinity-claim-admission/AffinityClaimAdmission"]
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/thread_creation/tests.rs"
+severity = "high"
+flows = ["process-lifecycle-transaction", "cross-cpu-task-retirement"]
+reason = "Real Ticket/MM/physical parent Cohort, runtime/frame bytes and complete membership/Blocked Slot ACK witnesses. Native terminal consumer ACK and modeled MM do not prove external hardware teardown."
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/thread_creation/tests.rs"
+models = ["process-lifecycle-transaction/ProcessLifecycleTransaction", "scheduler-admission/SchedulerAdmission", "mm-activation-close/MmActivationClose", "affinity-claim-admission/AffinityClaimAdmission", "cross-cpu-task-retirement/CrossCpuTaskRetirement"]
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/thread_creation/work.rs"
+severity = "critical"
+flows = ["process-lifecycle-transaction", "cross-cpu-task-retirement"]
+reason = "Distinct per-slot Class50 row transfers actual Ticket/original MM before user safe points. Exclusive kernel Executor claim spans sleepable state lock, exact original/current MM generation qualification before TEB bytes, cancellation/Slot publication and durable ACK. Copy receipts never authorize effects; checked nonce and poison survive reuse. These component mappings are not joint hardware/source refinement."
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/thread_creation/work.rs"
+models = ["process-lifecycle-transaction/ProcessLifecycleTransaction", "scheduler-admission/SchedulerAdmission", "mm-activation-close/MmActivationClose", "cold-exec-intent/ColdExecIntent", "cross-cpu-task-retirement/CrossCpuTaskRetirement"]
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/thread_creation/work/tests.rs"
+severity = "high"
+flows = ["process-lifecycle-transaction", "cross-cpu-task-retirement"]
+reason = "Actual Ticket/MM/kernel Executor/resource Current bank/row and complete worker witnesses include dead original user, duplicate claim, poison, nonce exhaustion and equal-root foreign MM generation. Native Current and negative generation injection are not assembly/physical TEB proofs; injected abandonment recovery is never production reopening."
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/thread_creation/work/tests.rs"
+models = ["process-lifecycle-transaction/ProcessLifecycleTransaction", "scheduler-admission/SchedulerAdmission", "mm-activation-close/MmActivationClose", "cold-exec-intent/ColdExecIntent", "cross-cpu-task-retirement/CrossCpuTaskRetirement"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/current/group_exit.rs"
+severity = "critical"
+flows = ["process-lifecycle-transaction", "cross-cpu-task-retirement"]
+reason = "Non-yielding admission transfers process pin to durable row; wait holds only Copy receipt, never backing-as-resume permission. Independent masked CPU scope spans original-census worker effects and handback; neither directory nor member pins cross wait safe points. No physical completion claim."
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/group_exit.rs"
+severity = "critical"
+flows = ["process-lifecycle-transaction", "cross-cpu-task-retirement"]
+reason = "Independent group worker borrows original census and physical member backing through exact terminal producer admission; drops its own loan before borrower drain. Competing producer retains same census/pin/nonce/effects in durable suspension, own Current is ordered last. Desired-stop ACK is not terminal consumers or hardware completion."
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/process_placement/exit_membership/tests/queued.rs"
+severity = "high"
+flows = ["process-lifecycle-transaction", "cross-cpu-task-retirement"]
+reason = "Actual durable row/process pin/mark/Join/exec census/terminal witnesses; injected busy phases are independent refusal checks, not whole-system liveness or hardware proofs."
+[[source_mappings]]
+path = "kernel/ps/src/multitask/current/group_exit.rs"
+models = ["process-lifecycle-transaction/ProcessLifecycleTransaction", "cross-cpu-task-retirement/CrossCpuTaskRetirement"]
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/group_exit.rs"
+models = ["process-lifecycle-transaction/ProcessLifecycleTransaction", "cross-cpu-task-retirement/CrossCpuTaskRetirement"]
+[[source_mappings]]
+path = "kernel/ps/src/multitask/process_placement/exit_membership/tests/queued.rs"
+models = ["process-lifecycle-transaction/ProcessLifecycleTransaction", "cross-cpu-task-retirement/CrossCpuTaskRetirement"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/group_exit/tests.rs"
+severity = "high"
+flows = ["process-lifecycle-transaction", "cross-cpu-task-retirement"]
+reason = "Actual born resource/Current bank/process/census/member loan/terminal producer pipeline and competing reservation suspension; preexisting borrower separates desired ACK from terminal consumers. Native scope/IRQ and external cleanup ACKs remain modeled, not joint hardware proof."
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/group_exit/tests.rs"
+models = ["process-lifecycle-transaction/ProcessLifecycleTransaction", "cross-cpu-task-retirement/CrossCpuTaskRetirement"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/process_placement/terminal.rs"
+severity = "critical"
+flows = ["cross-cpu-task-retirement", "process-lifecycle-transaction"]
+reason = "Exact pinned per-process turn drains creation, freezes membership, separates complete desired-stop exit authorization from committed final election, and retains stopped/detached UID through actual Class50 publication receipt. It does not grant image/CPU/MM/RSP or complete process visibility/group-exit authority."
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/process_placement/terminal/tests.rs"
+severity = "high"
+flows = ["cross-cpu-task-retirement", "process-lifecycle-transaction"]
+reason = "Real process pin/join/lifecycle/terminal publication/reset witnesses and isolated UID/nonce/prefix injections are component projections, not full lifecycle or hardware refinement. Native recovery is not production reopening."
+[[source_mappings]]
+path = "kernel/ps/src/multitask/process_placement/terminal.rs"
+models = ["process-lifecycle-transaction/ProcessLifecycleTransaction", "task-retirement-cleanup-owner/TaskRetirementCleanupOwner", "cross-cpu-task-retirement/CrossCpuTaskRetirement"]
+[[source_mappings]]
+path = "kernel/ps/src/multitask/process_placement/terminal/tests.rs"
+models = ["process-lifecycle-transaction/ProcessLifecycleTransaction", "task-retirement-cleanup-owner/TaskRetirementCleanupOwner", "cross-cpu-task-retirement/CrossCpuTaskRetirement"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/process_placement/exec_membership.rs"
+severity = "critical"
+flows = ["process-address-space-lifecycle", "process-lifecycle-transaction"]
+reason = "Exact process census denies late creation and mask publication through staged exec; it does not grant terminal or CPU authority."
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/process_placement/exec_membership/tests.rs"
+severity = "high"
+flows = ["process-address-space-lifecycle", "process-lifecycle-transaction"]
+reason = "Real process pin, drained join, nonce and abandonment witnesses exclude full MM/hardware/group-exit refinement."
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/exec_transaction/tests/census.rs"
+severity = "high"
+flows = ["process-address-space-lifecycle", "cross-cpu-task-retirement"]
+reason = "Native catalog and real execution refs witness retired-not-drained and exact captured UID, not physical RSP/CR3 completion."
+[[source_mappings]]
+path = "kernel/ps/src/multitask/process_placement/exec_membership.rs"
+models = ["cold-exec-intent/ColdExecIntent", "process-lifecycle-transaction/ProcessLifecycleTransaction", "exec-address-space-transaction/ExecAddressSpaceTransaction"]
+[[source_mappings]]
+path = "kernel/ps/src/multitask/process_placement/exec_membership/tests.rs"
+models = ["cold-exec-intent/ColdExecIntent", "process-lifecycle-transaction/ProcessLifecycleTransaction", "exec-address-space-transaction/ExecAddressSpaceTransaction"]
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/exec_transaction/tests/census.rs"
+models = ["cold-exec-intent/ColdExecIntent", "lifecycle-execution-claim/LifecycleExecutionClaim", "cross-cpu-task-retirement/CrossCpuTaskRetirement", "exec-address-space-transaction/ExecAddressSpaceTransaction"]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/process_table/pin_owner/tests.rs"
+models = ["process-lifecycle-transaction/ProcessLifecycleTransaction"]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/stack_resources/admission.rs"
+models = ["process-lifecycle-transaction/ProcessLifecycleTransaction", "lifecycle-execution-claim/LifecycleExecutionClaim"]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/stack_resources/admission/tests.rs"
+models = ["process-lifecycle-transaction/ProcessLifecycleTransaction", "lifecycle-execution-claim/LifecycleExecutionClaim", "cold-exec-intent/ColdExecIntent"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/terminal_quarantine.rs"
+severity = "critical"
+flows = ["cross-cpu-task-retirement"]
+reason = "Independent complete deferred stop producer claims original checked terminal loan and resource binding, withdraws actual queue/lifecycle/wait state before transferring original reason/detach; never detaches or ACKs live storage. Final terminal effects, process election and CPU/MM return remain separate obligations."
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/terminal_quarantine/tests.rs"
+severity = "high"
+flows = ["cross-cpu-task-retirement"]
+reason = "Actual root-born resources, queue, lifecycle, deferred claims and physical Current bank witness refusal, stop ordering and retained funding/MM/context. Native external completion is injected and is not hardware retirement or joint refinement."
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/terminal_quarantine.rs"
+models = ["task-retirement-cleanup-owner/TaskRetirementCleanupOwner", "cross-cpu-task-retirement/CrossCpuTaskRetirement"]
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/terminal_quarantine/tests.rs"
+models = ["task-retirement-cleanup-owner/TaskRetirementCleanupOwner", "cross-cpu-task-retirement/CrossCpuTaskRetirement"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/retirement_cleanup/producer.rs"
+severity = "critical"
+flows = ["cross-cpu-task-retirement"]
+reason = "Real checked UID/generation/claim-nonce loan reserves terminal custody before withdrawal, retains detach/reason through deferred ownership, and admits final dual-consumer publication. Partial effects poison. It is not process-last-live, exec image, CPU/MM/RSP or complete directory replacement authority."
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/retirement_cleanup/producer/tests.rs"
+severity = "high"
+flows = ["cross-cpu-task-retirement"]
+reason = "Real row/producer/consumer/reset methods and independent predicate injections witness stale loans, duplicate consumption, poison and checked epochs, not complete lifecycle or physical retirement."
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/retirement_cleanup/producer.rs"
+models = ["task-retirement-cleanup-owner/TaskRetirementCleanupOwner", "cross-cpu-task-retirement/CrossCpuTaskRetirement"]
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/retirement_cleanup/producer/tests.rs"
+models = ["task-retirement-cleanup-owner/TaskRetirementCleanupOwner", "cross-cpu-task-retirement/CrossCpuTaskRetirement"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/current_identity/execution/kernel_executor.rs"
+severity = "critical"
+flows = ["cross-cpu-task-retirement"]
+reason = "Exact kernel-only logical resume loan plus physical BindingPin: terminal, stop, metadata withdrawal and cohort exclude live scopes. Existing terminal row serializes admission; no user continuation or global serializer. Kernel stop remains durable until loan drains."
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/retirement_cleanup/executor.rs"
+severity = "critical"
+flows = ["cross-cpu-task-retirement"]
+reason = "Actual Current joins terminal/identity/resource permission before external cleanup; user caller owns only Copy ACK fence. Fresh scope refuses durable stop, existing nested scope may finish. Watermark, never absence, acknowledges revocation across reuse. Independent reaper now holds exact terminal/resource seals through external completion; enclosing cold producers and full joint hardware refinement remain open."
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/retirement_cleanup/executor/tests.rs"
+severity = "high"
+flows = ["cross-cpu-task-retirement"]
+reason = "Actual row claim/ACK/reset/watermark fixtures; no physical Current or external revocation execution claim."
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/stack_resources/kernel_executor_tests.rs"
+severity = "high"
+flows = ["cross-cpu-task-retirement"]
+reason = "Actual terminal/identity/resources and Local Running CAS witnesses, including durable stop and nested lifetime; native final row ACK projects effects and cannot prove hardware cleanup."
+[[source_mappings]]
+path = "kernel/ps/src/multitask/current_identity/execution/kernel_executor.rs"
+models = ["lifecycle-execution-claim/LifecycleExecutionClaim", "task-retirement-cleanup-owner/TaskRetirementCleanupOwner", "cross-cpu-task-retirement/CrossCpuTaskRetirement"]
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/retirement_cleanup/executor.rs"
+models = ["task-retirement-cleanup-owner/TaskRetirementCleanupOwner", "cross-cpu-task-retirement/CrossCpuTaskRetirement"]
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/retirement_cleanup/executor/tests.rs"
+models = ["task-retirement-cleanup-owner/TaskRetirementCleanupOwner", "cross-cpu-task-retirement/CrossCpuTaskRetirement"]
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/stack_resources/kernel_executor_tests.rs"
+models = ["lifecycle-execution-claim/LifecycleExecutionClaim", "task-retirement-cleanup-owner/TaskRetirementCleanupOwner", "cross-cpu-task-retirement/CrossCpuTaskRetirement"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/process_placement/root_membership.rs"
+severity = "critical"
+flows = ["process-lifecycle-transaction", "cross-cpu-task-retirement"]
+reason = "Actual root Ticket tuple joins existing process row with real process pin until actual slot and membership ACK. Negative root-pending exclusion prevents dispatch/cold/wake/terminal admission in ACK gap. Registered abandonment retains pin/poison. Not complete spawn/input/MM/user continuation or guard deletion authority."
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/root_slots/tests/membership.rs"
+severity = "high"
+flows = ["process-lifecycle-transaction", "cross-cpu-task-retirement"]
+reason = "Actual constructor/Ticket/process pin/receipt and census/intent/admission witnesses; native nonce injection and poison recovery do not prove hardware completion or production reopening."
+[[source_mappings]]
+path = "kernel/ps/src/multitask/process_placement/root_membership.rs"
+models = ["process-lifecycle-transaction/ProcessLifecycleTransaction", "scheduler-admission/SchedulerAdmission", "lifecycle-execution-claim/LifecycleExecutionClaim", "cross-cpu-task-retirement/CrossCpuTaskRetirement"]
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/root_slots/tests/membership.rs"
+models = ["process-lifecycle-transaction/ProcessLifecycleTransaction", "scheduler-admission/SchedulerAdmission", "lifecycle-execution-claim/LifecycleExecutionClaim", "cross-cpu-task-retirement/CrossCpuTaskRetirement"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/reaper.rs"
+severity = "critical"
+flows = ["cross-cpu-task-retirement", "process-lifecycle-transaction"]
+reason = "Actual retired resource/terminal reset grant drains desired stop, run owner, lifecycle/frame/backing and funding before direct metadata detachment. Borrowed kill-safe kernel Current and both seals survive external completion; abandonment quarantines. Not unpublished rollback or complete hardware/group/cold authority deletion."
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/reaper/tests.rs"
+severity = "high"
+flows = ["cross-cpu-task-retirement", "process-lifecycle-transaction"]
+reason = "Real Ticket/context/queue/terminal/resource seals, funding charge and separated external completion witnesses. Native abandoned fixture recovery is not external ACK or production reopening; full physical user MM and CPU switch refinement remain open."
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/reaper.rs"
+models = ["cross-cpu-task-retirement/CrossCpuTaskRetirement", "task-retirement-cleanup-owner/TaskRetirementCleanupOwner", "lifecycle-execution-claim/LifecycleExecutionClaim", "process-lifecycle-transaction/ProcessLifecycleTransaction"]
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/reaper/tests.rs"
+models = ["cross-cpu-task-retirement/CrossCpuTaskRetirement", "task-retirement-cleanup-owner/TaskRetirementCleanupOwner", "lifecycle-execution-claim/LifecycleExecutionClaim", "process-lifecycle-transaction/ProcessLifecycleTransaction"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/process_affinity.rs"
+severity = "critical"
+flows = ["process-lifecycle-transaction", "cross-cpu-task-retirement"]
+reason = "Independent non-yielding actual process Change + all-live Cohort pins qualify full physical process/ABI tuple after capture, then retain it through mask/rehome/publication/unseal. Exact stopped ACK snapshot, not absence, excludes tombstones. Concurrent terminal stop cannot reanimate/reuse pinned peer. Existing models are component projections, not joint CPU/MM/hardware or full guard-deletion refinement."
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/process_affinity/tests.rs"
+severity = "high"
+flows = ["process-lifecycle-transaction", "cross-cpu-task-retirement"]
+reason = "Real Ticket/resource/process/cohort/queue witnesses include MM claim in actual native Open CPU turn and terminal overlap. Modeled roots use native cursor fixture; no physical page-table walk, HAL topology/IPI, TEB, RSP/CR3 or full syscall lifetime claim."
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/process_affinity.rs"
+models = ["process-lifecycle-transaction/ProcessLifecycleTransaction", "affinity-claim-admission/AffinityClaimAdmission", "lifecycle-execution-claim/LifecycleExecutionClaim", "cross-cpu-task-retirement/CrossCpuTaskRetirement"]
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/process_affinity/tests.rs"
+models = ["process-lifecycle-transaction/ProcessLifecycleTransaction", "affinity-claim-admission/AffinityClaimAdmission", "lifecycle-execution-claim/LifecycleExecutionClaim", "cross-cpu-task-retirement/CrossCpuTaskRetirement"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/thread_affinity.rs"
+severity = "critical"
+flows = ["process-lifecycle-transaction", "cross-cpu-task-retirement"]
+reason = "Independent non-yielding Linux query/set and Windows thread owner retains original caller BindingPin and actual target Cohort through physical ABI/full-process qualification, masks and borrowed queue ACK. Single-target seal excludes complete group writers and ordinary source CAS; terminal/block overlap never wakes or reuses captured target. Component model mappings are not complete CPU/MM/hardware guard-deletion refinement."
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/thread_affinity/tests.rs"
+severity = "high"
+flows = ["process-lifecycle-transaction", "cross-cpu-task-retirement"]
+reason = "Shared actual Ticket/physical binding/process/queue factory tests caller and target pin retention, exact errors, unchanged process mask, real Open CPU turn and terminal/block overlap. Native modeled MM cursor and CPU phase are not physical HAL/IPI/CR3/RSP or reschedulable user continuation proof."
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/thread_affinity.rs"
+models = ["process-lifecycle-transaction/ProcessLifecycleTransaction", "affinity-claim-admission/AffinityClaimAdmission", "lifecycle-execution-claim/LifecycleExecutionClaim", "cross-cpu-task-retirement/CrossCpuTaskRetirement"]
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/thread_affinity/tests.rs"
+models = ["process-lifecycle-transaction/ProcessLifecycleTransaction", "affinity-claim-admission/AffinityClaimAdmission", "lifecycle-execution-claim/LifecycleExecutionClaim", "cross-cpu-task-retirement/CrossCpuTaskRetirement"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/ordering_publication.rs"
+severity = "critical"
+flows = ["scheduler-dispatch"]
+reason = "Original masked Current interval and target BindingPin survive floor and qualified bounded FIFO publication; hints never grant execution or funding. Winning process comparison retains the original target. Native born-resource/earlier wait/class inputs are not complete dispatcher, MM/RSP, terminal-reuse or hardware joint refinement."
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/ordering_publication.rs"
+models = ["bootstrap-activation-handoff/BootstrapActivationHandoff", "lifecycle-execution-claim/LifecycleExecutionClaim"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/ordering_publication/tests.rs"
+severity = "high"
+flows = ["scheduler-dispatch"]
+reason = "Original masked Current interval and target BindingPin survive floor and qualified bounded FIFO publication; hints never grant execution or funding. Winning process comparison retains the original target. Native born-resource/earlier wait/class inputs are not complete dispatcher, MM/RSP, terminal-reuse or hardware joint refinement."
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/ordering_publication/tests.rs"
+models = ["bootstrap-activation-handoff/BootstrapActivationHandoff", "lifecycle-execution-claim/LifecycleExecutionClaim"]
