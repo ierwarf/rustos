@@ -674,15 +674,16 @@ scope = "kernel/hal/src/arch/smp.rs"
 regex = '\(Self::Failed,\s*Self::Starting\)'
 reason = "the boot-static CPU lifecycle cannot reuse generation one after failure"
 
-# xAPIC MMIO and IA32_TSC_DEADLINE are not mutually serializing. The local LVT
-# must be unmasked and fenced before the first deadline is armed, or a vCPU
-# descheduled in the masked window can permanently lose its first clockevent.
+# Neither xAPIC MMIO nor an x2APIC LVT WRMSR is serializing against
+# IA32_TSC_DEADLINE. The local LVT must be unmasked and fenced before the first
+# deadline is armed, or a vCPU descheduled in the masked window can permanently
+# lose its first clockevent.
 [[required_sequences]]
 path = "kernel/hal/src/arch/timer.rs"
 tokens = [
-    "lvt.write_volatile(",
+    "super::msi::write_lvt_timer_for_current_cpu(",
     "APIC_LVT_TSC_DEADLINE,",
-    "_mm_mfence();",
+    "_mm_mfence()",
     "NEXT_DEADLINE[logical_index].store(deadline, Ordering::Release);",
     "write_deadline(deadline);",
 ]
@@ -1377,7 +1378,7 @@ tokens = [
     "!= Some(stamp.context_slot)",
     "scheduling_runtime::prepare_published_stamp_dispatch_status(",
     "PublishedDispatchPreparation::DomainRefused => {",
-    "scheduling_runtime::published_domain_refusal_cause(stamp, now_ns)",
+    "scheduling_runtime::published_domain_refusal_cause(stamp, cpu, now_ns)",
     "super::latch_domain_budget_refusal(slot, domain_slot, cause);",
     "scheduling_runtime::pin_published_funding(",
     "if donation_ledger::borrowed_context_charge_token(slot) != token",
@@ -1411,7 +1412,7 @@ tokens = [
     "if identity.slot() != stamp.context_slot",
     "|| policy.policy_epoch != stamp.policy_epoch",
     "drop(context);",
-    "domain_dispatch_refusal(domain_slot, domain_generation, policy, now_ns)",
+    "domain_dispatch_refusal(domain_slot, domain_generation, policy, cpu, now_ns)",
 ]
 
 [[required_sequences]]
@@ -2764,7 +2765,7 @@ tokens = ["fn reserve_with(", "stack_resources::admission::reserve(slot, id)", "
 path = "kernel/ps/src/multitask/scheduler/scheduling_runtime.rs"
 tokens = [
     "fn domain_descriptor(", "let runtime = domain_cell(slot)?.lock()",
-    "let policy = runtime.policy?", "runtime.generation != 0 && runtime.budget.is_some()",
+    "let policy = runtime.policy?", "runtime.generation != 0 && runtime.banks.is_some()",
     "SchedulingDomainState::admitted(policy, runtime.generation)",
 ]
 
@@ -3335,7 +3336,7 @@ path = "kernel/ps/src/multitask/scheduler/runqueue/wait.rs"
 tokens = ["fn reason(slot:", "epoch::with(slot, |_| reason_locked(slot))", "fn try_publish_arm(", "epoch::with(slot, |state|", "!state.can_arm() || !state.advance()", "REASON_ID[slot].swap(id, Ordering::AcqRel)", "super::publish_wait_arm(slot, kind)", "REASON_ID[slot].store(previous_id, Ordering::Release)", "fn clear_arm(", "epoch::with", "super::clear_wait_arm(slot)", "fn clear_wake_locked(", "super::wake_wait_locked(slot)", "fn clear_wake(", "epoch::with", "clear_wake_locked(slot)"]
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/wake_publication.rs"
-tokens = ["fn pager_reply_with(", "!typed_scope_valid(scope) || token == 0", "release_reply(token, ipc_donation::DonationNamespace::PagerFault)", "Binding::resolve(task_id)", "retained_wake_matching(", "REASON_PAGER_FAULT, token", "publish_reply_binding(scope, binding)", "drop(binding)", "fn pager_service_with(", "!typed_scope_valid(scope) || process_id == 0", "Binding::capture(slot, id)", "binding.context.process_id != Some(process_id)", "retained_wake_matching(", "REASON_PAGER_SERVICE, 0", "fn retained_wake_matching(", "TypedWake::capture(&binding, kind, id)", "clear_wait(slot, typed.as_ref())", "on_wake(&binding)", "drop(typed)", "Ok(binding)"]
+tokens = ["fn pager_reply_with(", "!typed_scope_valid(scope) || token == 0", "release_reply(token, ipc_donation::DonationNamespace::PagerFault)", "Binding::resolve(task_id)", "retained_wake_matching_sync(", "REASON_PAGER_FAULT, token", "publish_reply_binding(scope, binding)", "drop(binding)", "fn pager_service_with(", "!typed_scope_valid(scope) || process_id == 0", "Binding::capture(slot, id)", "binding.context.process_id != Some(process_id)", "retained_wake_matching(", "REASON_PAGER_SERVICE, 0", "fn retained_wake_matching(", "TypedWake::capture(&binding, kind, id)", "clear_wait(slot, typed.as_ref())", "on_wake(&binding)", "drop(typed)", "Ok(binding)"]
 [[forbidden_patterns]]
 scope = "kernel/ps/src/multitask/scheduler/task_wait.rs"
 regex = 'fn wake_pager_service_waiter_for_process'
@@ -3392,7 +3393,7 @@ reason = "Actual legacy normal-reply method is deleted after IRQ fallback transf
 # Original reply binding survives both exact FIFO generation checks; no recapture.
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/wake_publication.rs"
-tokens = ["fn reply(", "DispatchPreemption::enter()", "preemption.mask_irqs()", "reply_with(", "flush_deferred_target_reschedules()", "fn reply_with(", "!preemption.is_masked()", "preemption.cpu() != nucleus_core::util::lockdep::current_cpu_index()", "release_reply(reply, ipc_donation::DonationNamespace::IpcReply)", "Binding::resolve(task_id)", "retained_wake_matching(", "REASON_ENDPOINT_REPLY, reply", "publish_reply_binding(preemption, binding)", "drop(binding)", "fn publish_reply_binding(", "cpu_leases::owns_current", "ReplyWakeHandoff::from_owner(", "binding.slot()", "binding.id()", "runqueue::owner(binding.slot())", "Publication::begin(scope, token.target_cpu())", "sync_handoff::enqueue_reply_wake(token)", "fn retained_wake(", "Result<Binding, bool>", "Ok(binding)"]
+tokens = ["fn reply(", "DispatchPreemption::enter()", "preemption.mask_irqs()", "reply_with(", "flush_deferred_target_reschedules()", "fn reply_with(", "!preemption.is_masked()", "preemption.cpu() != nucleus_core::util::lockdep::current_cpu_index()", "release_reply(reply, ipc_donation::DonationNamespace::IpcReply)", "Binding::resolve(task_id)", "retained_wake_matching_sync(", "REASON_ENDPOINT_REPLY, reply", "publish_reply_binding(preemption, binding)", "drop(binding)", "fn publish_reply_binding(", "cpu_leases::owns_current", "ReplyWakeHandoff::from_owner(", "binding.slot()", "binding.id()", "runqueue::owner(binding.slot())", "Publication::begin(scope, token.target_cpu())", "sync_handoff::enqueue_reply_wake(token)", "fn retained_wake(", "Result<Binding, bool>", "Ok(binding)"]
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/current_class.rs"
 tokens = ["fn demote()", "DispatchPreemption::enter()", "scope.mask_irqs()", "demote_with(&scope)", "fn demote_with(", "!scope.is_masked()", "scope.cpu() != nucleus_core::util::lockdep::current_cpu_index()", "current_cpu_task_slot()", "cpu_leases::owns_current(scope.cpu(), slot)", "task_start::read(slot)", "pin_current(scope.cpu(), slot, start.id)", "context::read(pin.slot())", "!context.user_mode", "runqueue::weight::value(pin.slot())", "runqueue::weight::replace(pin.slot(), (weight & LOAD_WEIGHT_MASK).min(NICE_0_LOAD))"]

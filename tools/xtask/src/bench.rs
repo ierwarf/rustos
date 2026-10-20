@@ -785,7 +785,8 @@ pub(crate) fn bench(
         "--dvm-network-shmem".to_owned(),
         "--dvm-block-shmem".to_owned(),
         "--timeout".to_owned(),
-        // Bound guest readiness and the required end marker to 25 seconds.
+        // Bound guest readiness and the required end marker (25 seconds, plus
+        // the isolated probe's settle sleep).
         // kvm::run_one_smoke starts this clock only after both guests spawn;
         // building and host-side launch preparation are outside the budget.
         // Missing markers still fail, never yielding partial benchmark data.
@@ -896,8 +897,18 @@ pub(crate) fn bench(
     Ok(())
 }
 
-const fn benchmark_timeout_seconds(_rustos_vcpus: u8, _isolated: bool) -> u64 {
-    25
+/// Readiness plus the full probe table, for every topology.
+const BENCHMARK_READINESS_SECONDS: u64 = 25;
+/// `apps/ipcbench` `ISOLATE_SETTLE`: an isolated run sleeps this long before
+/// measuring, so it must not come out of the probe's own budget.
+const ISOLATE_SETTLE_SECONDS: u64 = 5;
+
+const fn benchmark_timeout_seconds(_rustos_vcpus: u8, isolated: bool) -> u64 {
+    if isolated {
+        BENCHMARK_READINESS_SECONDS + ISOLATE_SETTLE_SECONDS
+    } else {
+        BENCHMARK_READINESS_SECONDS
+    }
 }
 
 #[cfg(test)]

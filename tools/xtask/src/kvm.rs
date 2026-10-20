@@ -136,16 +136,17 @@ const DVM_INPUT_FIRST_PEER_TIMEOUT: Duration = Duration::from_secs(5);
 // duration. Keep it at the product's finite 30-second service ceiling even
 // when the host runner collects a longer sequence of performance samples.
 const DVM_INPUT_POLICY_READY_TIMEOUT: Duration = Duration::from_secs(30);
-// The RustOS MSI-X receive substrate deliberately rejects x2APIC until an
-// interrupt-remapping implementation can supply a non-truncated destination
-// ID. The KVM validation topology therefore pins the guest to xAPIC instead of
-// weakening the kernel with a guessed x2APIC message format.
+// x2APIC is exposed: RustOS runs it in physical mode without interrupt
+// remapping, which architecturally addresses APIC IDs below 256 with the same
+// 8-bit MSI destination format as xAPIC, and fails closed on any larger ID.
+// MSR-based EOI/ICR access avoids the xAPIC MMIO exits and ICR polling on
+// every interrupt and IPI.
 // RustOS admits TSC as a clocksource only when CPUID advertises invariant TSC.
 // QEMU masks `invtsc` by default because it constrains live migration, even on
 // a constant/nonstop-TSC KVM host. This local validation topology is not live
 // migrated, so expose the host guarantee explicitly; HPET remains the guest's
 // independent calibration/watchdog reference.
-const RUSTOS_DVM_KVM_CPU: &str = "host,-x2apic,+invtsc";
+const RUSTOS_DVM_KVM_CPU: &str = "host,+x2apic,+invtsc";
 const DVM_NET_REGION_BYTES: u64 = DVM_NET_APERTURE_BYTES;
 // Private acceptance state must not rewrite signed early-system registries:
 // vfsd intentionally serves those immutable bootstrap copies before the DVM

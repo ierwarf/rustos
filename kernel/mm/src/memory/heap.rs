@@ -104,8 +104,11 @@ impl FreedAllocEntry {
 enum ActiveAllocState {
     Empty = 0,
     Occupied = 1,
-    Tombstone = 2,
 }
+
+/// `log2(ACTIVE_ALLOCATION_SLOTS)`; the table size is a power of two.
+const ACTIVE_ALLOCATION_INDEX_BITS: u32 = ACTIVE_ALLOCATION_SLOTS.trailing_zeros();
+const _: () = assert!(ACTIVE_ALLOCATION_SLOTS.is_power_of_two());
 
 struct AllocationTracker {
     active: [ActiveAllocEntry; ACTIVE_ALLOCATION_SLOTS],
@@ -156,47 +159,51 @@ impl AllocationTracker {
         }
 
         self.active_count = self.active_count.saturating_sub(1);
-        self.active[slot] = ActiveAllocEntry {
-            state: ActiveAllocState::Tombstone,
-            ..ActiveAllocEntry::EMPTY
-        };
+        self.close_deletion_hole(slot);
         self.record_freed(ptr, entry.size, entry.align);
         Ok(())
     }
 
     fn insert_active(&mut self, ptr: usize, size: usize, align: usize) -> bool {
-        let mut slot = hash_ptr(ptr) & (ACTIVE_ALLOCATION_SLOTS - 1);
-        let mut first_tombstone = None;
+        let mut slot = home_slot(ptr);
         for _ in 0..ACTIVE_ALLOCATION_SLOTS {
             match self.active[slot].state {
                 ActiveAllocState::Empty => {
-                    let slot = first_tombstone.unwrap_or(slot);
                     self.insert_new_active(slot, ptr, size, align);
                     return true;
                 }
-                ActiveAllocState::Tombstone => {
-                    if first_tombstone.is_none() {
-                        first_tombstone = Some(slot);
-                    }
+                ActiveAllocState::Occupied if self.active[slot].ptr == ptr => {
+                    self.active[slot].size = size;
+                    self.active[slot].align = align;
+                    return true;
                 }
-                ActiveAllocState::Occupied => {
-                    if self.active[slot].ptr == ptr {
-                        self.active[slot].size = size;
-                        self.active[slot].align = align;
-                        return true;
-                    }
-                }
+                ActiveAllocState::Occupied => {}
             }
             slot = (slot + 1) & (ACTIVE_ALLOCATION_SLOTS - 1);
         }
-
-        if let Some(slot) = first_tombstone {
-            self.insert_new_active(slot, ptr, size, align);
-            return true;
-        }
-
         self.tracker_overflow_count = self.tracker_overflow_count.saturating_add(1);
         false
+    }
+
+    /// Backward-shift deletion for linear probing. Removal leaves no
+    /// tombstone, so probe chains stay as short as the live load allows.
+    /// Tombstones were never reclaimed: over a long run they consumed every
+    /// empty slot and turned each allocation into a full-table scan with
+    /// interrupts disabled under the global tracker lock.
+    fn close_deletion_hole(&mut self, mut hole: usize) {
+        self.active[hole] = ActiveAllocEntry::EMPTY;
+        let mut scan = (hole + 1) & (ACTIVE_ALLOCATION_SLOTS - 1);
+        while self.active[scan].state == ActiveAllocState::Occupied {
+            let home = home_slot(self.active[scan].ptr);
+            let scan_distance = scan.wrapping_sub(home) & (ACTIVE_ALLOCATION_SLOTS - 1);
+            let hole_distance = hole.wrapping_sub(home) & (ACTIVE_ALLOCATION_SLOTS - 1);
+            if hole_distance < scan_distance {
+                self.active[hole] = self.active[scan];
+                self.active[scan] = ActiveAllocEntry::EMPTY;
+                hole = scan;
+            }
+            scan = (scan + 1) & (ACTIVE_ALLOCATION_SLOTS - 1);
+        }
     }
 
     fn insert_new_active(&mut self, slot: usize, ptr: usize, size: usize, align: usize) {
@@ -211,12 +218,12 @@ impl AllocationTracker {
     }
 
     fn find_active_slot(&self, ptr: usize) -> Option<usize> {
-        let mut slot = hash_ptr(ptr) & (ACTIVE_ALLOCATION_SLOTS - 1);
+        let mut slot = home_slot(ptr);
         for _ in 0..ACTIVE_ALLOCATION_SLOTS {
             match self.active[slot].state {
                 ActiveAllocState::Empty => return None,
                 ActiveAllocState::Occupied if self.active[slot].ptr == ptr => return Some(slot),
-                ActiveAllocState::Occupied | ActiveAllocState::Tombstone => {}
+                ActiveAllocState::Occupied => {}
             }
             slot = (slot + 1) & (ACTIVE_ALLOCATION_SLOTS - 1);
         }
@@ -251,12 +258,10 @@ impl AllocationTracker {
 
     fn occupancy(&self) -> TrackerOccupancy {
         let mut occupied = 0usize;
-        let mut tombstones = 0usize;
         let mut empty = 0usize;
         for entry in &self.active {
             match entry.state {
                 ActiveAllocState::Occupied => occupied += 1,
-                ActiveAllocState::Tombstone => tombstones += 1,
                 ActiveAllocState::Empty => empty += 1,
             }
         }
@@ -264,7 +269,6 @@ impl AllocationTracker {
             active_count: self.active_count,
             peak_active_count: self.peak_active_count,
             occupied_slots: occupied,
-            tombstone_slots: tombstones,
             empty_slots: empty,
             overflow_count: self.tracker_overflow_count,
         }
@@ -278,15 +282,18 @@ struct TrackerOccupancy {
     active_count: usize,
     peak_active_count: usize,
     occupied_slots: usize,
-    tombstone_slots: usize,
     empty_slots: usize,
     overflow_count: usize,
 }
 
+/// Fibonacci hashing of the 16-byte allocation granule, keeping the HIGH bits
+/// of the product. The previous form masked the LOW bits of a product taken
+/// over `ptr.rotate_right(17)`; those depend only on pointer bits 17..33, so
+/// every allocation inside one 128 KiB window shared a single home slot.
 #[inline]
-const fn hash_ptr(ptr: usize) -> usize {
-    ptr.rotate_right(17)
-        .wrapping_mul(0x9E37_79B9_7F4A_7C15usize)
+const fn home_slot(ptr: usize) -> usize {
+    ((((ptr >> 4) as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)) >> (64 - ACTIVE_ALLOCATION_INDEX_BITS))
+        as usize
 }
 
 pub struct KernelAllocator;
@@ -411,8 +418,6 @@ fn heap_tracker_overflow_log(ptr: usize, layout: Layout, occupancy: TrackerOccup
         write_hex(&mut port, occupancy.peak_active_count as u64);
         write_literal(&mut port, b" occupied=");
         write_hex(&mut port, occupancy.occupied_slots as u64);
-        write_literal(&mut port, b" tombstones=");
-        write_hex(&mut port, occupancy.tombstone_slots as u64);
         write_literal(&mut port, b" empty=");
         write_hex(&mut port, occupancy.empty_slots as u64);
         write_literal(&mut port, b"\r\n");
@@ -562,7 +567,6 @@ mod tests {
         assert_eq!(occupancy.active_count, 1);
         assert_eq!(occupancy.peak_active_count, 1);
         assert_eq!(occupancy.occupied_slots, 1);
-        assert_eq!(occupancy.tombstone_slots, 0);
         assert_eq!(occupancy.empty_slots, ACTIVE_ALLOCATION_SLOTS - 1);
         assert_eq!(occupancy.overflow_count, 0);
         assert_eq!(tracker.begin_dealloc(0x3000, layout), Ok(()));
@@ -578,17 +582,49 @@ mod tests {
     }
 
     #[test]
-    fn tracker_reuses_tombstones_after_table_wraps() {
+    fn tracker_churn_returns_every_slot_to_empty() {
         let mut tracker = AllocationTracker::new();
         let layout = Layout::from_size_align(32, 8).unwrap();
-        for index in 0..ACTIVE_ALLOCATION_SLOTS {
-            let ptr = 0x10_0000 + index * 0x40;
-            assert!(tracker.record_alloc(ptr, layout));
-        }
-        for index in 0..ACTIVE_ALLOCATION_SLOTS {
-            let ptr = 0x10_0000 + index * 0x40;
-            assert_eq!(tracker.begin_dealloc(ptr, layout), Ok(()));
+        for round in 0..4 {
+            for index in 0..ACTIVE_ALLOCATION_SLOTS {
+                let ptr = 0x10_0000 + round * 0x10_0000 + index * 0x40;
+                assert!(tracker.record_alloc(ptr, layout));
+            }
+            for index in 0..ACTIVE_ALLOCATION_SLOTS {
+                let ptr = 0x10_0000 + round * 0x10_0000 + index * 0x40;
+                assert_eq!(tracker.begin_dealloc(ptr, layout), Ok(()));
+            }
+            // Deletion leaves no residue: a later lookup or insert terminates
+            // at its first empty slot instead of scanning the whole table.
+            assert_eq!(tracker.occupancy().empty_slots, ACTIVE_ALLOCATION_SLOTS);
         }
         assert!(tracker.record_alloc(0x20_0000, layout));
+    }
+
+    #[test]
+    fn tracker_spreads_pointers_from_one_small_window() {
+        // Half the table filled from one 8 KiB window. The previous hash gave
+        // every pointer below 128 KiB the same home slot, so the last insert
+        // probed past every earlier one.
+        let mut tracker = AllocationTracker::new();
+        let layout = Layout::from_size_align(16, 16).unwrap();
+        let count = ACTIVE_ALLOCATION_SLOTS / 2;
+        let mut max_displacement = 0;
+        for index in 0..count {
+            let ptr = 0x40_0000 + index * 0x40;
+            assert!(tracker.record_alloc(ptr, layout));
+            let slot = tracker.find_active_slot(ptr).unwrap();
+            let displacement = slot.wrapping_sub(home_slot(ptr)) & (ACTIVE_ALLOCATION_SLOTS - 1);
+            max_displacement = max_displacement.max(displacement);
+        }
+        assert!(max_displacement < count / 4, "max displacement {max_displacement}");
+        // Removing from the middle of a cluster keeps every survivor reachable.
+        for index in (0..count).step_by(3) {
+            assert_eq!(tracker.begin_dealloc(0x40_0000 + index * 0x40, layout), Ok(()));
+        }
+        for index in 0..count {
+            let live = tracker.find_active_slot(0x40_0000 + index * 0x40).is_some();
+            assert_eq!(live, index % 3 != 0);
+        }
     }
 }

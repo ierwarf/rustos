@@ -23,6 +23,7 @@
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering, fence};
 
 use nucleus_core::util::lockdep::{LockClass, MAX_TRACKED_CPUS};
+use nucleus_core::util::cache_padded::CachePadded;
 use crate::multitask::irq_leaf::IrqLeaf;
 
 use super::{MAX_TASK, frame_publication};
@@ -100,15 +101,18 @@ const MAILBOX_CAPACITY: usize = MAX_TASK;
 /// published queue owner also sees the initial key for that generation.  The
 /// compare-and-exchange updates preserve donation and accounting changes if a
 /// remote scheduling action races a local fair-share update.
-static VRUNTIME_NS: [AtomicU64; MAX_TASK] = [const { AtomicU64::new(0) }; MAX_TASK];
+static VRUNTIME_NS: [CachePadded<AtomicU64>; MAX_TASK] =
+    [const { CachePadded::new(AtomicU64::new(0)) }; MAX_TASK];
 
 /// Per-slot execution-accounting baseline. Zero means that the slot is not
 /// currently charging a running interval.
-static EXEC_START_TICKS: [AtomicU64; MAX_TASK] = [const { AtomicU64::new(0) }; MAX_TASK];
+static EXEC_START_TICKS: [CachePadded<AtomicU64>; MAX_TASK] =
+    [const { CachePadded::new(AtomicU64::new(0)) }; MAX_TASK];
 /// Per-slot saved execution-frame pointer. The owner-word generation bounds
 /// its lifetime: admission installs it before publication, only the execution
 /// owner replaces it at a trap boundary, and terminal release clears it.
-static SAVED_RSP: [AtomicUsize; MAX_TASK] = [const { AtomicUsize::new(0) }; MAX_TASK];
+static SAVED_RSP: [CachePadded<AtomicUsize>; MAX_TASK] =
+    [const { CachePadded::new(AtomicUsize::new(0)) }; MAX_TASK];
 
 /// Immutable-for-one-generation usable kernel-stack bounds. They are written
 /// before owner publication and cleared only after terminal owner release, so
@@ -272,6 +276,9 @@ impl RunOwnerSnapshot {
     }
 }
 
+/// One cache line per task: owner CASes from different CPUs on neighbouring
+/// slots no longer invalidate each other.
+#[repr(align(64))]
 struct RunOwnerWord(AtomicU64);
 
 impl RunOwnerWord {
@@ -377,6 +384,7 @@ impl RunQueueInner {
 }
 
 #[repr(C, align(64))]
+#[repr(align(64))]
 struct PerCpuRunQueue {
     inner: IrqLeaf<RunQueueInner, { LockClass::SchedulerRunQueue as u8 }>,
     published_load: AtomicU64,
@@ -504,8 +512,8 @@ static REMOTE_WAKE_MAILBOXES: [IrqLeaf<
     RemoteWakeMailbox,
     { LockClass::SchedulerMailbox as u8 },
 >; MAX_TRACKED_CPUS] = [const { IrqLeaf::new(RemoteWakeMailbox::new()) }; MAX_TRACKED_CPUS];
-static MAILBOX_PENDING: [AtomicU64; MAX_TRACKED_CPUS] =
-    [const { AtomicU64::new(0) }; MAX_TRACKED_CPUS];
+static MAILBOX_PENDING: [CachePadded<AtomicU64>; MAX_TRACKED_CPUS] =
+    [const { CachePadded::new(AtomicU64::new(0)) }; MAX_TRACKED_CPUS];
 #[cfg(test)]
 static TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[cfg(test)]

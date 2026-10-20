@@ -6,70 +6,64 @@ no staging or commit has been requested.
 
 ## Current objective
 
-Fix bug-induced bottlenecks and UI failures while running QEMU with eight
-RustOS vCPUs. Remove unnecessary legacy code, split oversized documentation and
-source owners, repair references, validate, then write a diff-based commit
-message. Historical goals and their numeric IPC targets are not this goal's
-acceptance contract.
+Stabilize eight-vCPU RustOS first, then optimize the scheduler/IPC bottlenecks
+found by static review. Per-CPU domain budgets are committed (`65adf2d1`); the
+remaining fixes below are uncommitted and have no staging request.
 
 ## Fresh evidence — 2026-10-20
 
-- Baseline command: `cargo xtask kvm-smoke --timeout 30 --rustos-vcpus 8
-  --smp-iteration --gui-dvm-surfaces --dvm-network-shmem --dvm-block-shmem`.
-  Failed: DVM GPU primed, but RustOS GPU admission and WayClick first frame
-  missing. Later initd rootd lease query failed with errno 28.
-  Baseline logs are in `/tmp/rustos-goal-ui8-control/`; command result is
-  `/tmp/rustos-goal-ui8-baseline.txt`. This is failure evidence, not acceptance.
-- Root cause found in display transport: invitation was created only by a CPU
-  frame, while mandatory GPU UI waits for prime proof before any frame. Initial
-  invitation now belongs to the exclusive install transaction, before installed
-  publication. It creates no frame slot or presented-frame evidence; exact
-  context/epoch/fence admission is unchanged. Do not move it to an unsynchronized
-  GET_INFO check/use pair: review identified a newer-invitation overwrite race.
-- Runtimed loader, lease, grant, endpoint-wait and qualification calls interpreted
-  libc `-1/errno` as raw `-errno`. Normalize immediately after libc. Real native
-  endpoint lookup regression failed old code; runtimed 59 tests now pass.
-- Actual GPU preflight native regression first failed old invitation 0 vs 2;
-  installation-order plus actual MMIO witness now covers the serialized fix.
-  IO manager's full native suite passes 52 tests (before final source checks).
-- Second root cause (8-vCPU boot stall after initd `launch order`): a cold
-  call's enqueue popped the receive waiter, the scheduler refused the wake
-  (`ReceiverMismatch`, receiver still between arm and block commit), and the
-  caller cancelled without republishing it. The receiver then slept outside
-  the waiter list and every later vfsd call timed out. Refusal now restores a
-  receiver that still holds its endpoint receive phase (same as fast-path
-  rollback). Witness: ipc-runtime
-  `refused_wake_restores_the_popped_receiver_for_the_next_call`.
-- A later run showed the refusal itself failing vfsd->storaged with ENOSPC
-  (UI never started). `ReceiverMismatch` is effect-free, so the cold call now
-  retries the same handoff (bounded, `RECEIVER_REFUSAL_RETRIES`) while the
-  receiver still waits on the endpoint. Next two 8-vCPU runs: zero refusals.
-- initd lease queries now retry transient capacity/overlap refusals within the
-  first query's 5 s deadline (`lease_reconciliation.rs`); permanent errors stay
-  fatal.
-- Post-fix 8-vCPU UI smoke passed four times (exit 0, authenticated L0 input
-  relay, terminal 5118-5790 ms). Advisory overshoots remain: input-policy 1617>1500 ms,
-  display-provider 2644>2500 ms, with sampled 100 ms bounded service-call
-  timeouts from inputd/uiserver; their target services are not yet attributed.
+- Baseline at `a0a7de16`: `cargo xtask bench --rustos-vcpus 8` failed twice
+  (ipcbench never ended within 25 s; one run lost initd to a 5 s rootd lease
+  query timeout). The 1-vCPU bench passed.
+- Root causes, in the order found:
+  1. Domain budgets were one bank for all CPUs while `budget <= period`, so a
+     multi-task domain (all user apps share one) could use one CPU's share in
+     total. Domains now keep a per-CPU bank (`scheduling_runtime.rs`); witness
+     `domain_budget_is_a_per_cpu_share_not_one_cpu_for_the_whole_domain`.
+     The executing-funding snapshot reports the executing CPU's bank;
+     `domain_snapshot` sums all banks.
+  2. Lost receive wakeups: an enqueue popped a parked receiver, the handoff
+     left the request queued without waking it (`woke=false` or a refusal that
+     kept the reply), and the receiver stayed blocked outside the parked list;
+     repeated calls stranded a whole worker pool (netd, vfsd). Fixed by
+     `recover_unwoken_receiver` (re-park + generic wake).
+  3. Refused exact reply/pager wakes now expedite the caller's armed deadline
+     (`expedite_sleep_waiter`), so a refusal costs one clockevent, not the
+     100 ms–30 s reply deadline.
+  4. The ordinary-app share was 2 ms/10 ms (20% of one CPU, idling CPUs while
+     tasks waited for refill); rootd now grants 8 ms/10 ms.
+- Static-review fixes in the same set: heap tracker (high-bit hash,
+  backward-shift deletion; the old hash put every pointer in a 128 KiB window
+  on one slot and tombstones were never reclaimed), TTAS spin + cache-padded
+  per-CPU lockdep state, padded run-queue/owner/mailbox words, x2APIC
+  (MSR EOI/ICR/LVT, no ICR polling; KVM profile now `+x2apic`), RTC sleeper
+  due-point skip, seqlock HAL hooks, 4-way packed service-grant cache, per-CPU
+  slab cursor, PIT divisor rewrite skip, sync-wake (`WF_SYNC`) placement for
+  reply/receive wakes, raw-spin panic bound 1e9 cycles, rate-limited runtimed
+  slow-pass log, isolated bench settle 5 s with matching xtask budget.
+- New stall diagnostics: `kernel-scheduler-long-blocked[-reply|-endpoint|
+  -receiver|-age]`, `ipc-reply-wake-refused`, `ipc-fast-reply-wake-refused`,
+  `pager-fault-wake-refused`, `ipc-unwoken-receiver-wake-refused`,
+  `local-apic-mode`.
+- After: 8-vCPU bench passed in four consecutive runs (last with x2APIC
+  active); 8-vCPU `kvm-smoke --smp-iteration --gui-dvm-surfaces ...` passed
+  twice (authenticated L0 input relay). 1-vCPU compare against the same-session
+  baseline held its anchor (`vmexit_cpuid` 4400 → 4400): minimum costs within
+  the 2% noise floor, means sharply lower (`ipc_rt_intra_process` 1.29 M →
+  0.38 M cycles). `dev-plan` now lane: 681/681 passed.
 
 ## Ownership and validation
 
-- Display substrate is split into `dvm_display.rs`, `dvm_display/installation.rs`
-  and `dvm_display/peer.rs`; public API and fixed wire format stay unchanged.
-- Runtimed launch tests live in `spawn_tests.rs`. Retired AMD-specific xtask
-  option aliases are removed; canonical GPU/firmware options remain.
-- Run `cargo xtask dev-plan` after product edits, selected now lanes, then the
-  stable full PR gate and KVM dry-run when source is stable. Fresh eight-vCPU
-  UI runs require real pointer ingress and first-frame evidence, not log-only
-  GPU readiness. Do not edit bound source during a verification/boot lane.
-- Do not claim a quantitative speedup from the control-handshake fix or compare
-  diagnostic-profile timing with shipping performance. Existing component
-  reports remain diagnostic only; use same-topology/workload controls.
-- Validation speed: mutation cache seals only `KILL_SEMANTICS` bodies, kills
-  checkpoint to `summary.partial.jsonl`, shards scale to cores/3; warm
-  `verify-all --profile pr` dropped from ~25 min to ~65 s.
-- Still open: attributing the residual 100 ms bounded service-call timeouts
-  and ~110 test-only dead-code warnings in kernel-ps (kept, not deleted).
+- Run `cargo xtask dev-plan` after product edits, its now lane, then the
+  stable batch (`bash formal/verify-all.sh --profile pr`, `cargo xtask
+  kvm-smoke --dry-run`). Bench comparisons need a same-session control.
+- `cargo test -p rootd` segfaults on unmodified HEAD as well (host harness);
+  it is not evidence about this change set.
+- Still open: the DONATION_LEDGER class claim remains one global leaf per
+  non-idle dispatch; several `monotonic_nanos()` samples per dispatch; plain
+  `ipc_rt_intra_process` (separate reply then recv) is ~4x the fused
+  reply-recv path; advisory boot overshoots (display-provider ~2.9–3.9 s >
+  2.5 s, input-policy ~1.7 s > 1.5 s) are dominated by Linux DVM readiness.
 
 ## Historical evidence
 

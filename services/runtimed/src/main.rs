@@ -392,6 +392,8 @@ struct LoopPassTiming {
     started: Instant,
     phase_started: Instant,
     phases: [Duration; LoopPhase::COUNT],
+    last_report: Option<Instant>,
+    suppressed_reports: u32,
 }
 
 impl Default for LoopPassTiming {
@@ -401,6 +403,8 @@ impl Default for LoopPassTiming {
             started: now,
             phase_started: now,
             phases: [Duration::ZERO; LoopPhase::COUNT],
+            last_report: None,
+            suppressed_reports: 0,
         }
     }
 }
@@ -410,6 +414,10 @@ impl LoopPassTiming {
     /// parked callers belong to, so it is worth a line.
     const SLOW_PASS: Duration =
         Duration::from_millis(rustos_user_abi::performance::IPC_READINESS_QUERY_HARD_LIMIT_MS);
+    /// Each report is a few hundred debugcon bytes, one hypervisor exit per
+    /// byte. Reporting every slow pass made an overloaded broker slower still,
+    /// so consecutive reports are spaced and the gap is counted instead.
+    const REPORT_INTERVAL: Duration = Duration::from_millis(250);
 
     fn begin(&mut self) {
         let now = Instant::now();
@@ -424,13 +432,23 @@ impl LoopPassTiming {
         self.phase_started = now;
     }
 
-    fn report_if_slow(&self, outcome: &str) {
+    fn report_if_slow(&mut self, outcome: &str) {
         let elapsed = self.started.elapsed();
         if elapsed < Self::SLOW_PASS {
             return;
         }
+        let now = Instant::now();
+        if self
+            .last_report
+            .is_some_and(|last| now.saturating_duration_since(last) < Self::REPORT_INTERVAL)
+        {
+            self.suppressed_reports = self.suppressed_reports.saturating_add(1);
+            return;
+        }
+        self.last_report = Some(now);
+        let suppressed = core::mem::take(&mut self.suppressed_reports);
         let mut line = format!(
-            "runtimed: slow broker pass outcome={outcome} total_us={}",
+            "runtimed: slow broker pass outcome={outcome} total_us={} suppressed={suppressed}",
             elapsed.as_micros()
         );
         for (index, duration) in self.phases.iter().enumerate() {

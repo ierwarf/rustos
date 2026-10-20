@@ -102,15 +102,21 @@ static SERVICE_ENDPOINT_CAPS: [AtomicU64; MAX_SERVICE_ENDPOINTS] =
     [const { AtomicU64::new(0) }; MAX_SERVICE_ENDPOINTS];
 static SERVICE_ENDPOINT_EPOCHS: [AtomicU64; MAX_SERVICE_ENDPOINTS] =
     [const { AtomicU64::new(0) }; MAX_SERVICE_ENDPOINTS];
-// Read-mostly authorization cache for the last process granted each service.
-// The service epoch is the revocation generation, so a restart invalidates a
-// cached hit without a writer-side broadcast. This removes the global grant
-// table lock and 512-entry scan from the common service-call path while the
-// exact grant table remains the source of truth on a miss.
-static SERVICE_LAST_GRANTED_CALLER: [AtomicU64; MAX_SERVICE_ENDPOINTS] =
-    [const { AtomicU64::new(0) }; MAX_SERVICE_ENDPOINTS];
-static SERVICE_LAST_GRANTED_EPOCH: [AtomicU64; MAX_SERVICE_ENDPOINTS] =
-    [const { AtomicU64::new(0) }; MAX_SERVICE_ENDPOINTS];
+// Read-mostly authorization cache of recently granted callers per service.
+// Each entry packs `(epoch << 32) | process_id` into one word, so a reader can
+// never pair one caller with another grant's epoch. The service epoch is the
+// revocation generation, so a restart invalidates a cached hit without a
+// writer-side broadcast. Several ways per service keep the common path off the
+// global grant table lock and its 512-entry scan when more than one client
+// process calls the same service; one slot thrashed between any two of them.
+const SERVICE_GRANT_CACHE_WAYS: usize = 4;
+static SERVICE_GRANT_CACHE: [nucleus_core::util::cache_padded::CachePadded<
+    [AtomicU64; SERVICE_GRANT_CACHE_WAYS],
+>; MAX_SERVICE_ENDPOINTS] = [const {
+    nucleus_core::util::cache_padded::CachePadded::new(
+        [const { AtomicU64::new(0) }; SERVICE_GRANT_CACHE_WAYS],
+    )
+}; MAX_SERVICE_ENDPOINTS];
 const SERVICE_ENDPOINT_STABLE_READ_ATTEMPTS: usize = 3;
 // Rootd is the root of the service authority graph. The first successful
 // publication permanently seals its process identity for this boot. Process
@@ -372,11 +378,7 @@ pub(crate) fn cleanup_service_endpoints_for_process(process_id: u64) {
         let mut grants = SERVICE_CALL_GRANTS.lock();
         clear_service_call_grants(grants.as_mut_slice(), process_id);
     }
-    for last_granted_caller in SERVICE_LAST_GRANTED_CALLER.iter() {
-        if last_granted_caller.load(Ordering::Acquire) == process_id {
-            last_granted_caller.store(0, Ordering::Release);
-        }
-    }
+    forget_cached_service_grants(process_id);
     if SERVICE_ENDPOINT_OWNERS[linux_abi::IPC_SERVICE_LINUX_SYSCALLD as usize]
         .load(Ordering::Acquire)
         == process_id
@@ -625,11 +627,7 @@ fn grant_current_process_service_call(
         let mut grants = SERVICE_CALL_GRANTS.lock();
         record_service_call_grant(grants.as_mut_slice(), process_id, service_id, epoch)?;
     }
-    // Publish the epoch before the caller. A reader that observes the caller
-    // with Acquire also observes the exact grant generation. Same-caller
-    // republish is safe: the old epoch can only cause a conservative miss.
-    SERVICE_LAST_GRANTED_EPOCH[index].store(epoch, Ordering::Relaxed);
-    SERVICE_LAST_GRANTED_CALLER[index].store(process_id, Ordering::Release);
+    cache_service_grant(index, process_id, epoch);
     Ok(endpoint)
 }
 
@@ -640,12 +638,7 @@ fn current_process_granted_service_endpoint(service_id: u64) -> Result<Option<u6
         return Err(LINUX_ENOSYS);
     };
     if publication.owner == process_id
-        || cached_service_call_grant_matches(
-            SERVICE_LAST_GRANTED_CALLER[index].load(Ordering::Acquire),
-            SERVICE_LAST_GRANTED_EPOCH[index].load(Ordering::Relaxed),
-            process_id,
-            publication.epoch,
-        )
+        || service_grant_cached(index, process_id, publication.epoch)
     {
         return Ok(Some(publication.endpoint));
     }
@@ -656,8 +649,7 @@ fn current_process_granted_service_endpoint(service_id: u64) -> Result<Option<u6
     if !granted {
         return Ok(None);
     }
-    SERVICE_LAST_GRANTED_EPOCH[index].store(publication.epoch, Ordering::Relaxed);
-    SERVICE_LAST_GRANTED_CALLER[index].store(process_id, Ordering::Release);
+    cache_service_grant(index, process_id, publication.epoch);
     Ok(Some(publication.endpoint))
 }
 
@@ -678,12 +670,7 @@ fn authorize_current_process_ipc_call(
             continue;
         }
         if publication.owner == process_id
-            || cached_service_call_grant_matches(
-                SERVICE_LAST_GRANTED_CALLER[index].load(Ordering::Acquire),
-                SERVICE_LAST_GRANTED_EPOCH[index].load(Ordering::Relaxed),
-                process_id,
-                publication.epoch,
-            )
+            || service_grant_cached(index, process_id, publication.epoch)
         {
             return Ok((retained_mm, Some(index as u64)));
         }
@@ -699,8 +686,7 @@ fn authorize_current_process_ipc_call(
         if !granted {
             return Err(LINUX_EACCES);
         }
-        SERVICE_LAST_GRANTED_EPOCH[index].store(publication.epoch, Ordering::Relaxed);
-        SERVICE_LAST_GRANTED_CALLER[index].store(process_id, Ordering::Release);
+        cache_service_grant(index, process_id, publication.epoch);
         return Ok((retained_mm, Some(index as u64)));
     }
     validate_endpoint_publication_owner(endpoint, process_id)
@@ -708,16 +694,49 @@ fn authorize_current_process_ipc_call(
         .map(|_| (retained_mm, None))
 }
 
-fn cached_service_call_grant_matches(
-    cached_process_id: u64,
-    cached_epoch: u64,
-    process_id: u64,
-    endpoint_epoch: u64,
-) -> bool {
-    process_id != 0
-        && endpoint_epoch != 0
-        && cached_process_id == process_id
-        && cached_epoch == endpoint_epoch
+/// One cache word for an exact `(process, epoch)` grant; `None` when either is
+/// zero or does not fit, in which case the grant table stays the only path.
+const fn packed_service_grant(process_id: u64, endpoint_epoch: u64) -> Option<u64> {
+    if process_id == 0
+        || endpoint_epoch == 0
+        || process_id > u32::MAX as u64
+        || endpoint_epoch > u32::MAX as u64
+    {
+        return None;
+    }
+    Some((endpoint_epoch << 32) | process_id)
+}
+
+fn service_grant_cached(index: usize, process_id: u64, endpoint_epoch: u64) -> bool {
+    let Some(key) = packed_service_grant(process_id, endpoint_epoch) else {
+        return false;
+    };
+    // ORDERING: Acquire pairs with the Release publication of a recorded grant.
+    SERVICE_GRANT_CACHE[index]
+        .iter()
+        .any(|way| way.load(Ordering::Acquire) == key)
+}
+
+/// Called only after the exact grant table admitted this tuple.
+fn cache_service_grant(index: usize, process_id: u64, endpoint_epoch: u64) {
+    if let Some(key) = packed_service_grant(process_id, endpoint_epoch) {
+        // Direct-mapped by process: distinct concurrent clients of one service
+        // land in different ways instead of evicting each other.
+        let way = (process_id as usize) % SERVICE_GRANT_CACHE_WAYS;
+        // ORDERING: Release publishes the admitted tuple as one word.
+        SERVICE_GRANT_CACHE[index][way].store(key, Ordering::Release);
+    }
+}
+
+/// Called with the registry mutation lock held on process exit.
+fn forget_cached_service_grants(process_id: u64) {
+    for row in &SERVICE_GRANT_CACHE {
+        for way in row.iter() {
+            if way.load(Ordering::Acquire) & u64::from(u32::MAX) == process_id {
+                way.store(0, Ordering::Release);
+            }
+        }
+    }
 }
 
 /// Called only while `SERVICE_ENDPOINT_REGISTRY_MUTATION` is held.
@@ -3115,6 +3134,7 @@ fn enqueue_call_and_wake_with_handles_for_task(
                 if ipc_call_admission::refused_wake_can_keep_delivered_reply(
                     reply, task_id, donation_admitted,
                 ) {
+                    recover_unwoken_receiver(endpoint, receiver_task_id);
                     return Ok(reply);
                 }
                 // Failure-only, after every scheduler loan returned. Preserve
@@ -3132,6 +3152,9 @@ fn enqueue_call_and_wake_with_handles_for_task(
             }
         };
         donation_admitted |= handoff.inherited;
+        if !handoff.woke {
+            recover_unwoken_receiver(endpoint, receiver_task_id);
+        }
         ipc_trace!(
             "ipc call wake: endpoint={} receiver_task={} woke={} inherited={}",
             endpoint.raw(),
@@ -3185,6 +3208,30 @@ fn enqueue_call_and_wake_with_handles_for_task(
 fn restore_refused_receiver(endpoint: KernelEndpointHandle, receiver: u64) {
     if multitask::endpoint_receiver_still_waiting(receiver, endpoint.raw()) {
         let _ = kernel_ipc_runtime::api::restore_endpoint_receiver_waiter(endpoint, receiver);
+    }
+}
+
+/// The enqueue popped `receiver` from the endpoint's parked list, but the
+/// handoff left the request queued without waking it (a withdrawn receive
+/// phase, a racing receiver, or a refused wake that kept the delivered reply).
+/// A receiver that still holds its receive phase is then blocked outside the
+/// parked list with work pending, and no later call can reach it: each
+/// subsequent enqueue popped the next receiver the same way until a service's
+/// whole worker pool was stranded at eight vCPUs. Re-park it and wake it; its
+/// receive loop re-polls the queue and re-registers, so a spurious wake costs
+/// one poll.
+fn recover_unwoken_receiver(endpoint: KernelEndpointHandle, receiver: u64) {
+    if !multitask::endpoint_receiver_still_waiting(receiver, endpoint.raw()) {
+        return;
+    }
+    let _ = kernel_ipc_runtime::api::restore_endpoint_receiver_waiter(endpoint, receiver);
+    if !multitask::wake_task(receiver) {
+        debug::record_milestone(
+            debug::LogCategory::Compat,
+            "ipc-unwoken-receiver-wake-refused",
+            endpoint.raw(),
+            receiver,
+        );
     }
 }
 

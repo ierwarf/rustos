@@ -52,8 +52,11 @@ const EXEC_REPLACE_WARMUP: usize = 2;
 /// at roughly the same wall-clock moment this program does, so without a
 /// settle the one-time startup burst of every other session program lands
 /// inside the measured window just from launch order, not from anything the
-/// isolated probe did.
-const ISOLATE_SETTLE: Duration = Duration::from_secs(15);
+/// isolated probe did. The burst ends with the first desktop frame, which the
+/// boot-to-UI rail bounds; fifteen seconds left only five of the harness's
+/// readiness budget for the probe itself, so no isolated run could finish.
+/// `tools/xtask/src/bench.rs` adds exactly this settle to its budget.
+const ISOLATE_SETTLE: Duration = Duration::from_secs(5);
 
 // ---------------------------------------------------------------- syscalls
 

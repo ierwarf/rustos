@@ -1,12 +1,20 @@
 use super::*;
 
 #[test]
-fn benchmark_readiness_budget_is_25_seconds_for_every_topology() {
+fn benchmark_readiness_budget_is_25_seconds_plus_the_isolated_settle() {
     for vcpus in [1, 2, 4, 8] {
-        for isolated in [false, true] {
-            assert_eq!(benchmark_timeout_seconds(vcpus, isolated), 25);
-        }
+        assert_eq!(benchmark_timeout_seconds(vcpus, false), 25);
+        assert_eq!(benchmark_timeout_seconds(vcpus, true), 25 + ISOLATE_SETTLE_SECONDS);
     }
+}
+
+#[test]
+fn isolated_settle_budget_matches_the_ipcbench_sleep() {
+    let source = include_str!("../../../../apps/ipcbench/src/main.rs");
+    let expected = format!(
+        "const ISOLATE_SETTLE: Duration = Duration::from_secs({ISOLATE_SETTLE_SECONDS});"
+    );
+    assert!(source.contains(&expected), "ipcbench settle drifted from the xtask budget");
 }
 
 #[test]

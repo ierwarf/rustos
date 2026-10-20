@@ -1,5 +1,7 @@
 use nucleus_core::user_abi::UserAbi;
-use spin::RwLock;
+use core::cell::UnsafeCell;
+use core::ops::{Deref, DerefMut};
+use core::sync::atomic::{AtomicU64, Ordering, fence};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UserFaultDisposition {
@@ -82,7 +84,95 @@ struct HookRegistry {
     heartbeat: HeartbeatHooks,
 }
 
-static HOOKS: RwLock<HookRegistry> = RwLock::new(HookRegistry {
+/// Seqlock-published hook table. Hooks are registered a handful of times at
+/// boot but read on every page fault, sleep and deadline wake on every CPU.
+/// A `spin::RwLock` read is an atomic RMW on one shared counter, so those reads
+/// bounced its cache line between all CPUs; a seqlock read is two loads and a
+/// copy. Writers stay serialized by `writer`.
+struct HookCell {
+    seq: AtomicU64,
+    writer: spin::Mutex<()>,
+    value: UnsafeCell<HookRegistry>,
+}
+
+// SAFETY: `value` is written only while `writer` is held and `seq` is odd;
+// readers copy it volatilely and retry unless `seq` was even and unchanged.
+unsafe impl Sync for HookCell {}
+
+struct HookWriteGuard<'a> {
+    cell: &'a HookCell,
+    _writer: spin::MutexGuard<'a, ()>,
+}
+
+impl HookCell {
+    const fn new(value: HookRegistry) -> Self {
+        Self {
+            seq: AtomicU64::new(0),
+            writer: spin::Mutex::new(()),
+            value: UnsafeCell::new(value),
+        }
+    }
+
+    fn read(&self) -> HookRegistry {
+        loop {
+            // ORDERING: Acquire pairs with the writer's final Release store.
+            let before = self.seq.load(Ordering::Acquire);
+            if before & 1 == 0 {
+                // SAFETY: a torn copy is discarded by the sequence recheck; the
+                // fields are plain function pointers with no drop glue.
+                let value = unsafe { core::ptr::read_volatile(self.value.get()) };
+                // ORDERING: the copy completes before the recheck load.
+                fence(Ordering::Acquire);
+                if self.seq.load(Ordering::Relaxed) == before {
+                    return value;
+                }
+            }
+            core::hint::spin_loop();
+        }
+    }
+
+    fn begin_write<'a>(&'a self, writer: spin::MutexGuard<'a, ()>) -> HookWriteGuard<'a> {
+        let seq = self.seq.load(Ordering::Relaxed);
+        self.seq.store(seq.wrapping_add(1), Ordering::Relaxed);
+        // ORDERING: the odd sequence is visible before any field write.
+        fence(Ordering::Release);
+        HookWriteGuard { cell: self, _writer: writer }
+    }
+
+    fn write(&self) -> HookWriteGuard<'_> {
+        self.begin_write(self.writer.lock())
+    }
+
+    #[cfg(test)]
+    fn try_write(&self) -> Option<HookWriteGuard<'_>> {
+        self.writer.try_lock().map(|writer| self.begin_write(writer))
+    }
+}
+
+impl Deref for HookWriteGuard<'_> {
+    type Target = HookRegistry;
+    fn deref(&self) -> &HookRegistry {
+        // SAFETY: the writer lock is held; no other writer exists.
+        unsafe { &*self.cell.value.get() }
+    }
+}
+
+impl DerefMut for HookWriteGuard<'_> {
+    fn deref_mut(&mut self) -> &mut HookRegistry {
+        // SAFETY: the writer lock is held and the sequence is odd.
+        unsafe { &mut *self.cell.value.get() }
+    }
+}
+
+impl Drop for HookWriteGuard<'_> {
+    fn drop(&mut self) {
+        let seq = self.cell.seq.load(Ordering::Relaxed);
+        // ORDERING: Release publishes every field write with the even sequence.
+        self.cell.seq.store(seq.wrapping_add(1), Ordering::Release);
+    }
+}
+
+static HOOKS: HookCell = HookCell::new(HookRegistry {
     task: TaskHooks {
         try_handle_current_user_page_fault: None,
         retire_current_user_task_due_to_fault: None,

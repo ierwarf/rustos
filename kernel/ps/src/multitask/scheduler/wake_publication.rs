@@ -169,7 +169,7 @@ pub(super) fn reply_with(
     };
     // SAFETY: the original borrowed masked CPU survives the returned loan.
     let Ok(binding) = (unsafe {
-        retained_wake_matching(
+        retained_wake_matching_sync(
             binding,
             Some((runqueue::wait::REASON_ENDPOINT_REPLY, reply)),
             eligible_cpus,
@@ -240,7 +240,7 @@ pub(super) fn pager_reply_with(
     };
     // SAFETY: SAME original masked CPU and binding survive typed phase and FIFO.
     let Ok(binding) = (unsafe {
-        retained_wake_matching(
+        retained_wake_matching_sync(
             binding,
             Some((runqueue::wait::REASON_PAGER_FAULT, token)),
             eligible_cpus,
@@ -345,7 +345,28 @@ pub(super) unsafe fn retained_wake_matching(
     on_wake: impl FnOnce(&Binding) -> bool,
 ) -> Result<Binding, bool> {
     // SAFETY: forward the original caller custody without additional admission.
-    unsafe { retained_wake_admitted(binding, expected, eligible_cpus, |_| true, on_wake, false) }
+    unsafe {
+        retained_wake_admitted(binding, expected, eligible_cpus, |_| true, on_wake, false, false)
+    }
+}
+
+/// `retained_wake_matching` for a synchronous completion: the waker is about
+/// to block (a server returning to its receive), so the woken task is placed
+/// on this CPU when nothing else is queued here, instead of on its last CPU.
+/// Each such cross-CPU wake cost a reschedule IPI and a halted-vCPU wakeup,
+/// which dominated an eight-vCPU IPC round trip.
+/// # Safety
+/// Same as `retained_wake_matching`.
+pub(super) unsafe fn retained_wake_matching_sync(
+    binding: Binding,
+    expected: Option<(u8, u64)>,
+    eligible_cpus: &dyn Fn(usize) -> u64,
+    on_wake: impl FnOnce(&Binding) -> bool,
+) -> Result<Binding, bool> {
+    // SAFETY: forwarded unchanged from the caller's obligations.
+    unsafe {
+        retained_wake_admitted(binding, expected, eligible_cpus, |_| true, on_wake, false, true)
+    }
 }
 
 /// Exact receive phase encloses donation admission BEFORE any runnable effect.
@@ -364,7 +385,7 @@ pub(super) unsafe fn receive_call(
     // its sender/funding loans until this same phase and last effect end.
     unsafe { retained_wake_admitted(binding,
         Some((runqueue::wait::REASON_ENDPOINT_RECEIVE, endpoint)), eligible_cpus,
-        before_wake, on_wake, true) }
+        before_wake, on_wake, true, true) }
 }
 
 /// Sole physical wake implementation; admission is inside the original typed
@@ -376,6 +397,7 @@ unsafe fn retained_wake_admitted(
     before_wake: impl FnOnce(&Binding) -> bool,
     on_wake: impl FnOnce(&Binding) -> bool,
     defer_terminal: bool,
+    sync_wake: bool,
 ) -> Result<Binding, bool> {
     let typed = if let Some((kind, id)) = expected {
         let Some(loan) = runqueue::wait::TypedWake::capture(&binding, kind, id) else {
@@ -530,7 +552,11 @@ unsafe fn retained_wake_admitted(
     let lifecycle = identity::lifecycle(slot);
     let runnable = !lifecycle.retired && !lifecycle.job_stopped && !lifecycle.exec_quiesced;
     if runnable {
-        let target = runqueue_policy::affinity_target_cpu(slot, eligible_cpus(slot));
+        let target = if sync_wake {
+            runqueue_policy::sync_wake_target_cpu(slot, eligible_cpus(slot))
+        } else {
+            runqueue_policy::affinity_target_cpu(slot, eligible_cpus(slot))
+        };
         let outcome = publish(slot, target, cpu);
         if matches!(outcome, runqueue::RemoteWakeOutcome::Rejected) {
             return Err(false);

@@ -866,7 +866,7 @@ pub(super) fn observe_current_funding(
         return None;
     }
     let budget = context.budget.as_ref()?.snapshot()?;
-    let domain_budget = domain.aggregate_snapshot()?;
+    let domain_budget = domain.bank(original.cpu())?.snapshot()?;
     Some(crate::multitask::SchedulingContextRuntimeSnapshot {
         executing_task_id, context_owner_task_id,
         context_identity_slot: identity.slot(), context_identity_generation: identity.generation(),

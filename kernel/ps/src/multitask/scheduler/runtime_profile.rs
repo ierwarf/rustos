@@ -321,6 +321,113 @@ fn record_census_row(name: &'static str, count: u64, total: u64) {
     crate::debug::record_milestone(crate::debug::LogCategory::Sched, name, count, total);
 }
 
+/// A reply or pager wait unchanged for this long is reported.
+const LONG_BLOCKED_REPORT_TICKS: u64 = 2 * crate::arch::rtc::ticks_per_second();
+/// Bounds the debugcon cost of the report (one VM exit per byte under KVM).
+const LONG_BLOCKED_REPORT_LIMIT: usize = 8;
+/// Owner generation each slot had when this drain last saw it blocked, and
+/// the tick of that first sighting. The generation advances on every owner
+/// transition, so an unchanged one means the same wait never completed.
+static LONG_BLOCKED_GENERATION: [core::sync::atomic::AtomicU64; super::MAX_TASK] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; super::MAX_TASK];
+static LONG_BLOCKED_SINCE: [core::sync::atomic::AtomicU64; super::MAX_TASK] =
+    [const { core::sync::atomic::AtomicU64::new(0) }; super::MAX_TASK];
+
+/// Names tasks whose reply or pager wait has not moved for seconds, with the
+/// wait object (reply or pager token). A lost wakeup otherwise shows up only as
+/// an idle machine and a service-level timeout far from the wait that was
+/// never completed. Receive waits are idle servers and generic waits are
+/// sleeps; neither is reported.
+/// Read-only over published owner words and wait payloads; grants nothing.
+fn report_long_blocked_tasks() {
+    use core::sync::atomic::Ordering::Relaxed;
+    let now = crate::arch::rtc::ticks();
+    let mut reported = 0;
+    for slot in 0..super::MAX_TASK {
+        let owner = super::runqueue::owner(slot);
+        let (kind, object) = super::runqueue::wait::reason(slot);
+        let watched = owner.state == super::runqueue::RunOwnerState::Blocked
+            && matches!(
+                kind,
+                super::runqueue::wait::REASON_ENDPOINT_REPLY
+                    | super::runqueue::wait::REASON_PAGER_FAULT
+            );
+        if !watched {
+            LONG_BLOCKED_GENERATION[slot].store(0, Relaxed);
+            continue;
+        }
+        if LONG_BLOCKED_GENERATION[slot].swap(owner.generation, Relaxed) != owner.generation {
+            LONG_BLOCKED_SINCE[slot].store(now, Relaxed);
+            continue;
+        }
+        let age = now.saturating_sub(LONG_BLOCKED_SINCE[slot].load(Relaxed));
+        if age < LONG_BLOCKED_REPORT_TICKS || reported == LONG_BLOCKED_REPORT_LIMIT {
+            continue;
+        }
+        let task_id = current_identity::read_dispatch(slot)
+            .and_then(|publication| publication.task_id)
+            .unwrap_or(0);
+        crate::debug::record_milestone(
+            crate::debug::LogCategory::Sched,
+            "kernel-scheduler-long-blocked",
+            ((slot as u64) << 48) | (task_id & 0xffff_ffff_ffff),
+            (u64::from(kind) << 56) | (object & 0x00ff_ffff_ffff_ffff),
+        );
+        if kind == super::runqueue::wait::REASON_ENDPOINT_REPLY
+            && let Some((endpoint, receiver, bits)) = kernel_ipc_runtime::api::endpoint::reply_diagnostic(
+                kernel_ipc_runtime::api::KernelReplyHandle::from_raw(object),
+            )
+        {
+            crate::debug::record_milestone(
+                crate::debug::LogCategory::Sched,
+                "kernel-scheduler-long-blocked-reply",
+                endpoint,
+                (bits << 56) | (receiver & 0x00ff_ffff_ffff_ffff),
+            );            if let Some((pending, parked, first, fast)) =
+                kernel_ipc_runtime::api::endpoint::endpoint_diagnostic(endpoint)
+            {
+                crate::debug::record_milestone(
+                    crate::debug::LogCategory::Sched,
+                    "kernel-scheduler-long-blocked-endpoint",
+                    pack_u32_pair(pending, parked) | (u64::from(fast) << 63),
+                    first,
+                );
+                report_endpoint_receivers(endpoint);
+            }
+        }
+        crate::debug::record_milestone(
+            crate::debug::LogCategory::Sched,
+            "kernel-scheduler-long-blocked-age",
+            age,
+            pack_u32_pair(u64::from(owner.wait_armed), owner.cpu.map_or(u64::MAX, |cpu| cpu as u64)),
+        );
+        reported += 1;
+    }
+}
+
+/// Every task blocked in a receive on `endpoint`, with its owner state.
+fn report_endpoint_receivers(endpoint: u64) {
+    for slot in 0..super::MAX_TASK {
+        let (kind, object) = super::runqueue::wait::reason(slot);
+        if kind != super::runqueue::wait::REASON_ENDPOINT_RECEIVE || object != endpoint {
+            continue;
+        }
+        let owner = super::runqueue::owner(slot);
+        let task_id = current_identity::read_dispatch(slot)
+            .and_then(|publication| publication.task_id)
+            .unwrap_or(0);
+        crate::debug::record_milestone(
+            crate::debug::LogCategory::Sched,
+            "kernel-scheduler-long-blocked-receiver",
+            ((slot as u64) << 48) | (task_id & 0xffff_ffff_ffff),
+            (owner.state as u64) << 32
+                | u64::from(owner.runnable) << 2
+                | u64::from(owner.wait_armed) << 1
+                | u64::from(super::runqueue::wait::blocked(slot)),
+        );
+    }
+}
+
 pub fn drain_scheduler_runtime_profile() -> usize {
     // Budget counters share the scheduler's one-second profile window.  They
     // used to be drained before this readiness check, so the fast
@@ -349,6 +456,7 @@ pub fn drain_scheduler_runtime_profile() -> usize {
     // enable the rotating per-site census.
     #[cfg(rustos_lock_phase_profile)]
     lock_census::drain_class_and_site_census();
+    report_long_blocked_tasks();
     let scheduling_context = super::scheduling_context::drain_runtime_counters();
     // Rendered here, outside the scheduler guard, for the reason
     // `latch_budget_exhaustion` documents.

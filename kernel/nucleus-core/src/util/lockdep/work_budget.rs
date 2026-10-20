@@ -286,8 +286,8 @@ pub const LOCK_ACQUIRE_MAX_EXTRA_CPU_IDENTITY_DERIVATIONS: u32 = 0;
 /// Per-CPU count of logical-identity derivations. Unlike the class census,
 /// identity ceilings cover generic acquire/release paths, so this stays
 /// monotonic and free-running and is read as a delta.
-static IDENTITY_DERIVATIONS: [AtomicU32; MAX_TRACKED_CPUS] =
-    [const { AtomicU32::new(0) }; MAX_TRACKED_CPUS];
+static IDENTITY_DERIVATIONS: [crate::util::cache_padded::CachePadded<AtomicU32>; MAX_TRACKED_CPUS] =
+    [const { crate::util::cache_padded::CachePadded::new(AtomicU32::new(0)) }; MAX_TRACKED_CPUS];
 
 /// Where each CPU last derived its index.
 ///

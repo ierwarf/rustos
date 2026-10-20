@@ -50,8 +50,15 @@ const fn scheduling_policy(
     )
 }
 
+/// Ordinary applications: best-effort criticality with an 80% per-CPU share.
+/// User-class selection already yields to every System service, so this
+/// budget only bounds how long one application can hold a CPU without a gap.
+/// The former 2 ms (20%) share throttled a CPU-bound application to a fifth of
+/// an otherwise idle CPU: the kernel parked the CPU on idle while the task
+/// waited for its refill, which made every ordinary workload, ipcbench
+/// included, five times slower than its own cost.
 pub(super) const USER_WORKLOAD_SCHEDULING_POLICY: RustosSchedulingContextPolicy =
-    scheduling_policy(USER_WORKLOAD_DOMAIN, 2_000_000, 0);
+    scheduling_policy(USER_WORKLOAD_DOMAIN, 8_000_000, 0);
 
 #[derive(Clone, Copy)]
 pub(super) struct BootstrapServiceSpec {

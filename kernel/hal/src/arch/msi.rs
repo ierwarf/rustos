@@ -23,7 +23,7 @@
 
 use core::arch::x86_64::__cpuid;
 use core::hint::spin_loop;
-use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 
 use x86_64::instructions::interrupts;
 use x86_64::registers::model_specific::Msr;
@@ -39,6 +39,7 @@ const APIC_BASE_ENABLE: u64 = 1 << 11;
 const APIC_BASE_X2APIC: u64 = 1 << 10;
 const APIC_SPURIOUS_VECTOR_OFFSET: usize = 0x0f0;
 const APIC_EOI_OFFSET: usize = 0x0b0;
+const APIC_LVT_TIMER_OFFSET: usize = 0x320;
 const APIC_ICR_LOW_OFFSET: usize = 0x300;
 const APIC_ICR_HIGH_OFFSET: usize = 0x310;
 const APIC_SPURIOUS_ENABLE: u32 = 1 << 8;
@@ -50,6 +51,15 @@ const APIC_DELIVERY_MODE_FIXED: u32 = 0b000 << 8;
 const APIC_DELIVERY_MODE_INIT: u32 = 0b101 << 8;
 const APIC_DELIVERY_MODE_STARTUP: u32 = 0b110 << 8;
 const CPUID_FEATURE_APIC: u32 = 1 << 9;
+const CPUID_FEATURE_X2APIC: u32 = 1 << 21;
+const X2APIC_MSR_ID: u32 = 0x802;
+const X2APIC_MSR_EOI: u32 = 0x80b;
+const X2APIC_MSR_SPURIOUS_VECTOR: u32 = 0x80f;
+const X2APIC_MSR_ICR: u32 = 0x830;
+const X2APIC_MSR_LVT_TIMER: u32 = 0x832;
+const LOCAL_APIC_MODE_UNSET: u8 = 0;
+const LOCAL_APIC_MODE_XAPIC: u8 = 1;
+const LOCAL_APIC_MODE_X2APIC: u8 = 2;
 /// Legacy INIT settle wait, required only by pre-P4 era parts.
 const LEGACY_INIT_SETTLE_NS: u64 = 10_000_000;
 const CPUID_VENDOR_INTEL: [u32; 3] = [0x756e_6547, 0x4965_6e69, 0x6c65_746e];
@@ -129,6 +139,59 @@ static LOCAL_APIC_BASE: AtomicUsize = AtomicUsize::new(0);
 static LOCAL_APIC_PHYSICAL_BASE: AtomicU64 = AtomicU64::new(0);
 static LOCAL_APIC_READY: [AtomicBool; MAX_SUPPORTED_CPUS] =
     [const { AtomicBool::new(false) }; MAX_SUPPORTED_CPUS];
+/// Register interface chosen by the first CPU to initialize its local APIC and
+/// followed by every later one. x2APIC turns EOI, ICR and LVT accesses into
+/// MSR writes: no ICR delivery-status polling, and one write per IPI instead
+/// of a high/low MMIO pair, each of which is a VM exit under KVM without full
+/// APIC virtualization.
+static LOCAL_APIC_MODE: AtomicU8 = AtomicU8::new(LOCAL_APIC_MODE_UNSET);
+
+fn x2apic_mode() -> bool {
+    // ORDERING: Acquire observes the first initializer's mode publication.
+    LOCAL_APIC_MODE.load(Ordering::Acquire) == LOCAL_APIC_MODE_X2APIC
+}
+
+/// Chooses the register interface for this CPU. The first caller decides for
+/// the whole system: x2APIC when CPUID advertises it (or firmware already
+/// enabled it), otherwise xAPIC. A later CPU that cannot follow fails closed.
+fn select_local_apic_mode(cpu_supports_x2apic: bool, already_x2apic: bool) -> Option<bool> {
+    let wanted = if cpu_supports_x2apic || already_x2apic {
+        LOCAL_APIC_MODE_X2APIC
+    } else {
+        LOCAL_APIC_MODE_XAPIC
+    };
+    let chosen = match LOCAL_APIC_MODE.compare_exchange(
+        LOCAL_APIC_MODE_UNSET,
+        wanted,
+        // ORDERING: AcqRel publishes or observes the single system-wide choice;
+        // a losing CPU acquires the winner's publication.
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => wanted,
+        Err(existing) => existing,
+    };
+    match chosen {
+        LOCAL_APIC_MODE_X2APIC if cpu_supports_x2apic || already_x2apic => Some(true),
+        LOCAL_APIC_MODE_XAPIC if !already_x2apic => Some(false),
+        _ => None,
+    }
+}
+
+/// `mfence; lfence`: WRMSR to an x2APIC register is not serializing, so a
+/// store that publishes work for the IPI target must be globally visible
+/// before the ICR write can deliver the interrupt (Linux `weak_wrmsr_fence`).
+#[inline(always)]
+fn x2apic_wrmsr_fence() {
+    // SAFETY: fences have no operands and no side effects beyond ordering.
+    unsafe { core::arch::asm!("mfence", "lfence", options(nostack, preserves_flags)) };
+}
+
+fn x2apic_write(msr: u32, value: u64) {
+    // SAFETY: callers use only architectural x2APIC registers after this CPU
+    // switched its local APIC into x2APIC mode.
+    unsafe { Msr::new(msr).write(value) };
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StartupIpiError {
@@ -166,9 +229,8 @@ pub fn physical_base() -> Option<u64> {
         return None;
     }
     let apic_base = unsafe { Msr::new(IA32_APIC_BASE).read() };
-    if apic_base & APIC_BASE_X2APIC != 0 {
-        return None;
-    }
+    // The base field stays architecturally valid in x2APIC mode; the MMIO
+    // mapping is then simply unused.
     let physical_base = apic_base & APIC_BASE_ADDRESS_MASK;
     (physical_base != 0).then_some(physical_base)
 }
@@ -232,46 +294,95 @@ pub fn init() -> bool {
 
     let mut apic_base_msr = Msr::new(IA32_APIC_BASE);
     let mut apic_base = unsafe { apic_base_msr.read() };
-    if apic_base & APIC_BASE_X2APIC != 0 {
-        return false;
-    }
-    if apic_base & APIC_BASE_ENABLE == 0 {
-        apic_base |= APIC_BASE_ENABLE;
-        unsafe {
-            apic_base_msr.write(apic_base);
-        }
-    }
     let physical_base = apic_base & APIC_BASE_ADDRESS_MASK;
     // ORDERING: Acquire observes the admitted physical/virtual mapping pair
     // before this CPU accesses the local register page.
     if physical_base == 0 || LOCAL_APIC_PHYSICAL_BASE.load(Ordering::Acquire) != physical_base {
         return false;
     }
-    let base = LOCAL_APIC_BASE.load(Ordering::Acquire);
-    if base == 0 {
+    let already_x2apic = apic_base & APIC_BASE_X2APIC != 0;
+    let Some(use_x2apic) =
+        select_local_apic_mode(leaf1.ecx & CPUID_FEATURE_X2APIC != 0, already_x2apic)
+    else {
         return false;
+    };
+    if apic_base & APIC_BASE_ENABLE == 0 {
+        // xAPIC must be enabled first; disabled -> x2APIC is an invalid step.
+        apic_base |= APIC_BASE_ENABLE;
+        unsafe {
+            apic_base_msr.write(apic_base);
+        }
     }
-    // SAFETY: kernel-mm admitted this exact uncacheable page, and this CPU has
-    // architectural ownership of its local APIC register view.
-    unsafe {
-        let spurious = (base + APIC_SPURIOUS_VECTOR_OFFSET) as *mut u32;
-        let current = spurious.read_volatile();
-        spurious.write_volatile((current & !0xff) | APIC_SPURIOUS_ENABLE | APIC_SPURIOUS_VECTOR);
+    if use_x2apic {
+        if !already_x2apic {
+            apic_base |= APIC_BASE_X2APIC;
+            // SAFETY: CPUID advertised x2APIC and the APIC is enabled, so the
+            // xAPIC -> x2APIC transition is architecturally valid.
+            unsafe {
+                apic_base_msr.write(apic_base);
+            }
+        }
+        // Without interrupt remapping, MSI and the 8-bit IPI destinations used
+        // here can address only IDs below 256 (x2APIC physical mode, as Linux
+        // runs it without IR). Fail closed on any CPU outside that range.
+        // SAFETY: this CPU's local APIC is now in x2APIC mode.
+        let x2apic_id = unsafe { Msr::new(X2APIC_MSR_ID).read() };
+        if x2apic_id > u64::from(u8::MAX) {
+            return false;
+        }
+        // SAFETY: this CPU's local APIC is now in x2APIC mode.
+        let current = unsafe { Msr::new(X2APIC_MSR_SPURIOUS_VECTOR).read() } as u32;
+        x2apic_write(
+            X2APIC_MSR_SPURIOUS_VECTOR,
+            u64::from((current & !0xff) | APIC_SPURIOUS_ENABLE | APIC_SPURIOUS_VECTOR),
+        );
+    } else {
+        let base = LOCAL_APIC_BASE.load(Ordering::Acquire);
+        if base == 0 {
+            return false;
+        }
+        // SAFETY: kernel-mm admitted this exact uncacheable page, and this CPU
+        // has architectural ownership of its local APIC register view.
+        unsafe {
+            let spurious = (base + APIC_SPURIOUS_VECTOR_OFFSET) as *mut u32;
+            let current = spurious.read_volatile();
+            spurious
+                .write_volatile((current & !0xff) | APIC_SPURIOUS_ENABLE | APIC_SPURIOUS_VECTOR);
+        }
+    }
+    if logical_index == 0 {
+        crate::debug::record_milestone(
+            crate::debug::LogCategory::Boot,
+            "local-apic-mode",
+            u64::from(LOCAL_APIC_MODE.load(Ordering::Relaxed)),
+            0,
+        );
     }
     // ORDERING: Release publishes completed SVR programming for this CPU.
     LOCAL_APIC_READY[logical_index].store(true, Ordering::Release);
     true
 }
 
-pub(super) fn local_apic_base_for_current_cpu() -> Option<usize> {
+/// Programs this CPU's LVT timer register. False when the local APIC is not
+/// initialized here.
+pub(super) fn write_lvt_timer_for_current_cpu(value: u32) -> bool {
     let logical_index = nucleus_core::util::lockdep::current_cpu_index();
     if logical_index >= MAX_SUPPORTED_CPUS
         || !LOCAL_APIC_READY[logical_index].load(Ordering::Acquire)
     {
-        return None;
+        return false;
+    }
+    if x2apic_mode() {
+        x2apic_write(X2APIC_MSR_LVT_TIMER, u64::from(value));
+        return true;
     }
     let base = LOCAL_APIC_BASE.load(Ordering::Acquire);
-    (base != 0).then_some(base)
+    if base == 0 {
+        return false;
+    }
+    // SAFETY: local APIC admission owns this executing CPU's MMIO view.
+    unsafe { ((base + APIC_LVT_TIMER_OFFSET) as *mut u32).write_volatile(value) };
+    true
 }
 
 /// Send the architected INIT-SIPI-SIPI sequence from the BSP to one admitted
@@ -314,7 +425,10 @@ pub fn start_application_processor(
         u64::from(apic_id),
         0,
     );
-    write_icr(destination, init_deassert)?;
+    // INIT level de-assert is not supported in x2APIC mode (SDM 10.12.10).
+    if !x2apic_mode() {
+        write_icr(destination, init_deassert)?;
+    }
     crate::debug::record_milestone(
         crate::debug::LogCategory::Boot,
         "smp-init-deassert-complete",
@@ -409,6 +523,15 @@ fn fixed_icr_words(apic_id: u32, vector: u8) -> Option<(u32, u32)> {
 }
 
 fn write_icr(destination: u32, command: u32) -> Result<(), StartupIpiError> {
+    if x2apic_mode() {
+        // xAPIC destination field (ICR-high bits 31:24) -> x2APIC ID in ICR
+        // bits 63:32. Callers admit only 8-bit IDs. No delivery-status wait:
+        // x2APIC ICR writes have none.
+        let apic_id = u64::from(destination >> 24);
+        x2apic_wrmsr_fence();
+        x2apic_write(X2APIC_MSR_ICR, (apic_id << 32) | u64::from(command));
+        return Ok(());
+    }
     wait_for_icr_idle()?;
     // ORDERING: Acquire observes the immutable admitted MMIO base before the
     // volatile high/low ICR transaction.
@@ -626,6 +749,10 @@ pub fn local_apic_eoi() {
             && LOCAL_APIC_READY[logical_index].load(Ordering::Acquire),
         "local APIC EOI attempted before per-CPU initialization"
     );
+    if x2apic_mode() {
+        x2apic_write(X2APIC_MSR_EOI, 0);
+        return;
+    }
     // ORDERING: Acquire observes the immutable MMIO mapping paired with the
     // per-CPU readiness publication.
     let base = LOCAL_APIC_BASE.load(Ordering::Acquire);
@@ -663,6 +790,26 @@ mod tests {
         assert!(legacy_init_settle_required(CPUID_VENDOR_HYGON, 0x17));
         // An unknown vendor must not be given the fast path.
         assert!(legacy_init_settle_required([0, 0, 0], 6));
+    }
+
+    #[test]
+    fn local_apic_mode_is_chosen_once_and_followed_or_refused() {
+        use super::{LOCAL_APIC_MODE, LOCAL_APIC_MODE_UNSET, select_local_apic_mode};
+        let reset = || {
+            // ORDERING: native fixture reset; no concurrent initializer exists.
+            LOCAL_APIC_MODE.store(LOCAL_APIC_MODE_UNSET, core::sync::atomic::Ordering::Release)
+        };
+        reset();
+        assert_eq!(select_local_apic_mode(true, false), Some(true));
+        // A later CPU must follow; one without x2APIC fails closed.
+        assert_eq!(select_local_apic_mode(true, false), Some(true));
+        assert_eq!(select_local_apic_mode(false, false), None);
+        reset();
+        assert_eq!(select_local_apic_mode(false, false), Some(false));
+        assert_eq!(select_local_apic_mode(true, false), Some(false));
+        // Firmware-enabled x2APIC cannot return to xAPIC.
+        assert_eq!(select_local_apic_mode(false, true), None);
+        reset();
     }
 
     #[test]

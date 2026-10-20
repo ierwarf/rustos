@@ -24,7 +24,6 @@ use super::acpi::MAX_SUPPORTED_CPUS;
 
 const IA32_TSC_DEADLINE: u32 = 0x6e0;
 const CPUID_TSC_DEADLINE: u32 = 1 << 24;
-const APIC_LVT_TIMER_OFFSET: usize = 0x320;
 const APIC_LVT_TSC_DEADLINE: u32 = 2 << 17;
 // Match the BSP fair-class quantum. A private one-millisecond deadline on
 // every AP multiplied periodic scheduler entries by the CPU count and made an
@@ -50,9 +49,6 @@ pub fn init_current_cpu() -> bool {
     let Some(tsc_hz) = super::clock::invariant_tsc_frequency_hz() else {
         return false;
     };
-    let Some(base) = super::msi::local_apic_base_for_current_cpu() else {
-        return false;
-    };
     let Some(interval) = tick_interval(tsc_hz) else {
         return false;
     };
@@ -61,16 +57,15 @@ pub fn init_current_cpu() -> bool {
     // write to become visible before the IA32_TSC_DEADLINE WRMSR.  Keeping the
     // LVT masked while arming can lose the only first edge if a heavily
     // oversubscribed vCPU is descheduled until after that deadline.
-    // SAFETY: local APIC admission owns this executing CPU's MMIO view.
-    unsafe {
-        let lvt = (base + APIC_LVT_TIMER_OFFSET) as *mut u32;
-        lvt.write_volatile(
-            (u32::from(super::idt::LOCAL_TIMER_VECTOR) & 0xff) | APIC_LVT_TSC_DEADLINE,
-        );
-        // SAFETY: MFENCE is available in the x86_64 baseline. Intel specifies
-        // it to serialize the xAPIC MMIO LVT write with the following WRMSR.
-        _mm_mfence();
+    if !super::msi::write_lvt_timer_for_current_cpu(
+        (u32::from(super::idt::LOCAL_TIMER_VECTOR) & 0xff) | APIC_LVT_TSC_DEADLINE,
+    ) {
+        return false;
     }
+    // SAFETY: MFENCE is in the x86_64 baseline. Intel specifies it to order
+    // the LVT write (MMIO in xAPIC mode, a non-serializing WRMSR in x2APIC
+    // mode) before the following IA32_TSC_DEADLINE WRMSR.
+    unsafe { _mm_mfence() };
     // SAFETY: `_rdtsc` is available after invariant-TSC and deadline admission.
     let now = unsafe { _rdtsc() };
     let deadline = now

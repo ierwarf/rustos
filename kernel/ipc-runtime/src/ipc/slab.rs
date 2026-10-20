@@ -1,6 +1,7 @@
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use nucleus_core::util::lockdep::TrackedSpinLock;
+use nucleus_core::util::cache_padded::CachePadded;
+use nucleus_core::util::lockdep::{MAX_TRACKED_CPUS, TrackedSpinLock, current_cpu_index};
 
 const INDEX_BITS: u32 = 16;
 const INDEX_MASK: u64 = (1_u64 << INDEX_BITS) - 1;
@@ -39,23 +40,44 @@ impl<T> Slot<T> {
 
 /// Fixed-capacity object registry with generation-bound handles and one lock
 /// per slot. Allocation scans from a rotating hint and never allocates memory.
+///
+/// The rotating cursor is CPU-private: each CPU starts in its own region of
+/// the pool. One shared cursor took a contended RMW on a single cache line for
+/// every insertion from every CPU, and steered concurrent inserters onto the
+/// same slot locks. Every scan still covers the whole pool.
 pub(super) struct GenerationalSlab<T, const N: usize, const CLASS: u8> {
     slots: [CacheAligned<TrackedSpinLock<Slot<T>, CLASS>>; N],
-    next_hint: AtomicUsize,
+    next_hint: [CachePadded<AtomicUsize>; MAX_TRACKED_CPUS],
 }
 
 impl<T, const N: usize, const CLASS: u8> GenerationalSlab<T, N, CLASS> {
     pub const fn new() -> Self {
         Self {
             slots: [const { CacheAligned(TrackedSpinLock::new(Slot::new())) }; N],
-            next_hint: AtomicUsize::new(0),
+            next_hint: Self::initial_hints(),
         }
+    }
+
+    const fn initial_hints() -> [CachePadded<AtomicUsize>; MAX_TRACKED_CPUS] {
+        let mut hints = [const { CachePadded::new(AtomicUsize::new(0)) }; MAX_TRACKED_CPUS];
+        let mut cpu = 0;
+        while cpu < MAX_TRACKED_CPUS {
+            hints[cpu] = CachePadded::new(AtomicUsize::new(cpu * N / MAX_TRACKED_CPUS));
+            cpu += 1;
+        }
+        hints
+    }
+
+    fn cpu_hint(&self) -> &AtomicUsize {
+        &self.next_hint[current_cpu_index() % MAX_TRACKED_CPUS]
     }
 
     #[track_caller]
     pub fn insert(&self, value: T) -> Result<u64, T> {
         assert!(N != 0 && N < INDEX_MASK as usize);
-        let start = self.next_hint.fetch_add(1, Ordering::Relaxed) % N;
+        let hint = self.cpu_hint();
+        // ORDERING: Relaxed; the cursor is a CPU-private placement hint only.
+        let start = hint.load(Ordering::Relaxed) % N;
         let mut value = Some(value);
         for offset in 0..N {
             let index = (start + offset) % N;
@@ -70,7 +92,7 @@ impl<T, const N: usize, const CLASS: u8> GenerationalSlab<T, N, CLASS> {
             let Some(handle) = inserted else {
                 continue;
             };
-            self.next_hint.store((index + 1) % N, Ordering::Relaxed);
+            hint.store((index + 1) % N, Ordering::Relaxed);
             return Ok(handle);
         }
         Err(value.expect("slab insertion value disappeared without a free slot"))
@@ -235,7 +257,9 @@ impl<T, const N: usize, const CLASS: u8> GenerationalSlab<T, N, CLASS> {
             });
             drop(value);
         }
-        self.next_hint.store(0, Ordering::Relaxed);
+        for (cpu, hint) in self.next_hint.iter().enumerate() {
+            hint.store(cpu * N / MAX_TRACKED_CPUS, Ordering::Relaxed);
+        }
     }
 
     /// `TrackedSpinLock` disables task preemption while held, so callers must
@@ -315,7 +339,7 @@ mod tests {
             assert_eq!(slab.remove(handle), Some(value));
             previous = Some(handle);
         }
-        assert_eq!(slab.next_hint.load(Ordering::Relaxed), 0);
+        assert_eq!(slab.next_hint[0].load(Ordering::Relaxed), 0);
     }
 
     #[test]

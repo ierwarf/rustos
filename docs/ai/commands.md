@@ -348,9 +348,11 @@ fallback.
   UVM/CUDA; redistribution authorization remains a separate release gate.
   This KVM command does not imply physical GPU passthrough; the separate signed
   `rustos-hostd supervise` lifecycle owns that evidence.
-  This KVM validation profile explicitly disables guest x2APIC because the
-  current RustOS MSI-X receiver requires an xAPIC destination until a complete
-  interrupt-remapping substrate exists; the kernel fails closed on x2APIC.
+  This KVM validation profile exposes guest x2APIC. RustOS runs it in
+  physical mode without interrupt remapping, which addresses APIC IDs below
+  256 with the same 8-bit MSI destination format as xAPIC; a CPU with a larger
+  x2APIC ID fails local-APIC admission. The `local-apic-mode` boot milestone
+  records the chosen mode (1 xAPIC, 2 x2APIC).
 - `--exercise-input` is the explicit exception for bounded integration tests.
   It adds a DVM kernel command-line flag; the DVM agent then creates a local
   `uinput` device and consumes it through its ordinary evdev relay. RustOS

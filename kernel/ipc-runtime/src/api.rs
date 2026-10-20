@@ -93,6 +93,17 @@ pub mod endpoint {
         crate::ipc::endpoint_receiver_process_for_reply(reply)
     }
 
+    /// Stall diagnostics only: `(endpoint, receiver owner, state bits)`.
+    pub fn reply_diagnostic(reply: KernelReplyHandle) -> Option<(u64, u64, u64)> {
+        crate::ipc::reply_diagnostic(reply)
+    }
+
+    /// Stall diagnostics only: `(pending, parked receivers, first parked
+    /// receiver task, fast reply present)`.
+    pub fn endpoint_diagnostic(endpoint: u64) -> Option<(u64, u64, u64, bool)> {
+        crate::ipc::endpoint_diagnostic(endpoint)
+    }
+
     pub fn reserve_fast_call(
         endpoint: KernelEndpointHandle,
         caller_process_id: u64,

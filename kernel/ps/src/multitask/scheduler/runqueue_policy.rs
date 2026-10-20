@@ -84,6 +84,21 @@ pub(in crate::multitask) fn online_affinity_mask(slot: usize) -> u64 {
     current_bit
 }
 
+/// Placement for a synchronous wake (`WF_SYNC`): the waker blocks next, so
+/// the wakee runs here when this CPU is eligible and has nothing queued.
+/// Otherwise the ordinary affinity placement applies.
+pub(super) fn sync_wake_target_cpu(slot: usize, eligible: u64) -> usize {
+    let current = nucleus_core::util::lockdep::current_cpu_index();
+    if sync_wake_may_stay_local(current, eligible, runqueue::local_dispatch_work_pending(current)) {
+        return current;
+    }
+    affinity_target_cpu(slot, eligible)
+}
+
+const fn sync_wake_may_stay_local(current: usize, eligible: u64, local_work_pending: bool) -> bool {
+    current < u64::BITS as usize && eligible & (1_u64 << current) != 0 && !local_work_pending
+}
+
 pub(super) fn affinity_target_cpu(slot: usize, eligible: u64) -> usize {
     assert_ne!(eligible, 0, "affinity placement lacks eligible CPU");
     let current = nucleus_core::util::lockdep::current_cpu_index();
@@ -175,7 +190,18 @@ pub(in crate::multitask) fn take_fallback_idle_dispatch_window() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{active_balance_opportunity_due, placement_target_cpu, runqueue_is_imbalanced};
+    use super::{
+        active_balance_opportunity_due, placement_target_cpu, runqueue_is_imbalanced,
+        sync_wake_may_stay_local,
+    };
+
+    #[test]
+    fn synchronous_wake_stays_local_only_on_an_idle_eligible_cpu() {
+        assert!(sync_wake_may_stay_local(2, 0b0100, false));
+        assert!(!sync_wake_may_stay_local(2, 0b0100, true));
+        assert!(!sync_wake_may_stay_local(2, 0b1011, false));
+        assert!(!sync_wake_may_stay_local(64, u64::MAX, false));
+    }
 
     #[test]
     fn active_balance_requires_more_than_one_excess_runnable() {

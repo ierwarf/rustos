@@ -103,7 +103,8 @@ anchor held and `null_syscall_getpid` flat at 680 in all three runs:
 is what makes the middle column a measurement rather than a pair of runs.
 
 `cargo xtask bench --isolate-probe <name>` reboots with `ipcbench` restricted
-to one probe, with a 15-second post-readiness settle and an explicit
+to one probe, with a 5-second post-readiness settle (added to the 25-second
+readiness budget, not taken from it) and an explicit
 mid-boot phase-counter drain (`SYS_RUSTOS_PHASE_PROFILE_DRAIN`), so the
 counters describe that probe rather than every probe summed across the boot.
 The four syscall-path phases charged exactly once per call

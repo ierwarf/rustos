@@ -885,7 +885,7 @@ ordered(body((base / 'execution_interval.rs').read_text(), 'runtime_snapshot'), 
 ordered(body((base / 'scheduling_runtime.rs').read_text(), 'observe_current_funding'), [
     'original.metadata()', 'cell(slot)?.lock()', 'context.active_intervals == 0',
     'domain_cell(domain_slot)?.lock()', 'domain.active_intervals == 0',
-    'context.budget.as_ref()?.snapshot()', 'domain.aggregate_snapshot()'],
+    'context.budget.as_ref()?.snapshot()', 'domain.bank(original.cpu())?.snapshot()'],
     'original paired read preserves Context before Domain order without raw interval leaf')
 ordering = (base / 'ordering_publication.rs').read_text()
 legacy_files = {name: (base / name).read_text() for name in ('handoffs.rs', 'ipc_donation.rs', 'activation.rs', 'thread_slots.rs',

@@ -202,8 +202,10 @@ strictly after publication.
 
 AP preemption is refined by
 `formal/per-cpu-clockevent-lifecycle/PerCpuClockeventLifecycle.tla`. CPU 0
-retains the admitted PIT clockevent during this stage; every AP requires local
-xAPIC, invariant-TSC calibration, and CPUID TSC-deadline support. Its LVT is
+retains the admitted PIT clockevent during this stage (its rate-generator
+divisor is written only when it changes); every AP requires a local APIC (x2APIC
+MSRs when supported, otherwise xAPIC MMIO), invariant-TSC calibration, and
+CPUID TSC-deadline support. Its LVT is
 programmed masked, the first future deadline is published, and only then is the
 vector unmasked and the CPU allowed Online. Interrupt entry rearms a strictly
 future deadline before scheduler work, never changes the BSP PIT divisor, and

@@ -2032,6 +2032,50 @@ pub fn endpoint_receiver_process_for_reply(reply: KernelReplyHandle) -> Option<u
 }
 
 
+/// Read-only diagnostic summary of a reply: `(endpoint id, receiver owner,
+/// state bits)`. Bits: 1 live message published to the endpoint queue, 2
+/// request taken by a receiver (`used`), 4 response present, 8 consumed,
+/// 16 fast frame. Grants nothing; for stall reports only.
+pub fn reply_diagnostic(reply: KernelReplyHandle) -> Option<(u64, u64, u64)> {
+    let (message_id, receiver, mut bits) = REPLIES.with(reply.raw(), |object| {
+        let receiver = match object.receiver_owner {
+            Some(EndpointOwner::Process(id)) => id,
+            Some(EndpointOwner::Task(id)) => id | (1 << 63),
+            None => 0,
+        };
+        let bits = u64::from(object.used) << 1
+            | u64::from(object.consumed) << 3
+            | u64::from(object.fast_frame.is_some()) << 4;
+        (object.message_id, receiver, bits)
+    })?;
+    let endpoint = if let Some(frame_endpoint) =
+        REPLIES.with(reply.raw(), |object| object.fast_frame.as_ref().map(|frame| frame.endpoint_id)).flatten()
+    {
+        frame_endpoint
+    } else {
+        ENDPOINT_MESSAGES
+            .with(message_id, |message| {
+                bits |= u64::from(message.published) | u64::from(message.response.is_some()) << 2;
+                message.endpoint_id
+            })
+            .unwrap_or(0)
+    };
+    Some((endpoint, receiver, bits))
+}
+
+/// Read-only endpoint summary for stall reports: `(pending messages,
+/// parked receivers, first parked receiver task, fast reply present)`.
+pub fn endpoint_diagnostic(endpoint: u64) -> Option<(u64, u64, u64, bool)> {
+    ENDPOINTS.with(endpoint, |object| {
+        (
+            object.pending_len() as u64,
+            object.waiting_receivers.len() as u64,
+            object.waiting_receivers.front().map_or(0, |waiter| waiter.task_id),
+            object.fast_reply.is_some(),
+        )
+    })
+}
+
 /// Confirms that the exact live reply already crossed its terminal reply
 /// transition and returned scheduling-context custody to `caller_task_id`.
 ///

@@ -168,7 +168,10 @@ pub(in crate::multitask::scheduler) fn nested_interval() {
         assert_eq!((snapshot.available_ns, snapshot.pending_refill_ns), (0, 4000));
         assert_eq!((snapshot.timeout_fault_count, snapshot.timeout_fault_consumed_ns, snapshot.timeout_fault_reply, snapshot.timeout_fault_action), (1, 4000, 11, 1));
         let domain = scheduling_runtime::domain_snapshot(usize::from(caller.domain_slot().unwrap()), caller.domain_generation().unwrap(), caller.policy().unwrap()).unwrap();
-        assert_eq!((domain.available_ns, domain.pending_refill_ns), (0, 4000));
+        // CPU 0's domain bank funded the interval; the other per-CPU banks of
+        // the whole-domain ledger keep their full share.
+        let untouched_banks = (nucleus_core::util::lockdep::MAX_TRACKED_CPUS as u64 - 1) * 4000;
+        assert_eq!((domain.available_ns, domain.pending_refill_ns, domain.consumed_ns), (untouched_banks, 4000, 4000));
         // A later modeled interval must use the worker's OWN independent 7us
         // context/domain. It cannot re-spend the cancelled old 4us root.
         execution_interval::test_open_captured(slots[2], 2);

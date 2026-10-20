@@ -297,8 +297,9 @@ Do not reorder without reading `kernel/src/main.rs` and
   `hal_api::arch::msi`, register a lock-free leaf callback once, and program a
   masked PCI MSI-X table before enabling it. The IRQ callback may set pending
   state only; display/input/network policy and buffer work stay in their
-  owning service/broker turn. x2APIC or interrupt-remapping absence fails
-  closed rather than truncating a destination ID.
+  owning service/broker turn. Without interrupt remapping the local APIC
+  (x2APIC or xAPIC) admits only APIC IDs below 256, so an 8-bit MSI
+  destination is never truncated.
 - **VFS mount/unmount/open path helpers:** require current process context.
 
 ## Docs

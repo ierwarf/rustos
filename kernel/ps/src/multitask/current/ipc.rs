@@ -290,19 +290,52 @@ pub fn complete_fast_ipc_reply_wake_handoff_with_custody(
     #[cfg(not(test))]
     crate::multitask::irq::flush_deferred_target_reschedules();
     // No generic fresh-lookup fallback after ORIGINAL typed-wait refusal.
-    outcome != scheduler::FastIpcReplyHandoffOutcome::Rejected
+    let woken = outcome != scheduler::FastIpcReplyHandoffOutcome::Rejected;
+    if !woken {
+        record_refused_reply_wake("ipc-fast-reply-wake-refused", reply, completion.caller_task_id);
+    }
+    woken
 }
 
 /// Withdraws exact reply donation and retains the original wake lifetime loan
 /// through exact per-CPU FIFO publication. No legacy guard or lookup after wake.
 pub fn complete_ipc_reply_wake_handoff(reply: u64, task_id: u64) -> bool {
-    scheduler::wake_publication::reply(reply, task_id)
+    let woken = scheduler::wake_publication::reply(reply, task_id);
+    if !woken {
+        record_refused_reply_wake("ipc-reply-wake-refused", reply, task_id);
+    }
+    woken
+}
+
+/// A refused reply wake leaves the caller to its deadline. Recording it ties
+/// a later caller-side timeout or a long-blocked report to the exact reply.
+/// Bounded to the first occurrences and then exponentially spaced counts.
+fn record_refused_reply_wake(name: &'static str, reply: u64, task_id: u64) {
+    use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    // A refused exact wake can leave the caller blocked with its response
+    // already queued (the refusal paths give up before clearing the wait when
+    // the caller's frame is between publications). Make its armed reply
+    // deadline due now, so the next clockevent wakes it to re-poll instead of
+    // leaving it parked for the full 100 ms-30 s deadline. Harmless when the
+    // caller was not blocked yet: it re-polls after arming anyway.
+    #[cfg(not(test))]
+    let _ = crate::arch::rtc::expedite_sleep_waiter(task_id);
+    static REFUSED: AtomicU64 = AtomicU64::new(0);
+    let total = REFUSED.fetch_add(1, Relaxed) + 1;
+    if total > 16 && !total.is_power_of_two() {
+        return;
+    }
+    crate::debug::record_milestone(crate::debug::LogCategory::Sched, name, task_id, reply);
 }
 
 /// Returns only the exact original pager wait epoch; a pending publication
 /// excludes later arms through actual queue effects and binding/FIFO lifetime.
 pub fn complete_pager_fault_wake_handoff(fault_token: u64, task_id: u64) -> bool {
-    scheduler::wake_publication::pager_reply(fault_token, task_id)
+    let woken = scheduler::wake_publication::pager_reply(fault_token, task_id);
+    if !woken {
+        record_refused_reply_wake("pager-fault-wake-refused", fault_token, task_id);
+    }
+    woken
 }
 
 #[cfg(test)]

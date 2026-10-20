@@ -32,6 +32,8 @@ use core::{
 
 use spin::{Mutex, MutexGuard};
 
+#[cfg(rustos_boot_image)] use super::cache_padded::CachePadded;
+
 mod cpu_identity;
 #[cfg(any(rustos_boot_image, test))]
 mod dependency_graph;
@@ -169,7 +171,7 @@ impl HeldLockStack {
 }
 
 #[cfg(rustos_boot_image)]
-struct PerCpuHeldStacks([UnsafeCell<HeldLockStack>; MAX_TRACKED_CPUS]);
+struct PerCpuHeldStacks([CachePadded<UnsafeCell<HeldLockStack>>; MAX_TRACKED_CPUS]);
 
 #[cfg(rustos_boot_image)]
 // SAFETY: each UnsafeCell has one dense CPU owner, and accessors validate that
@@ -199,7 +201,7 @@ unsafe impl Sync for TaskHeldStack {}
 
 #[cfg(rustos_boot_image)]
 static HELD_STACKS: PerCpuHeldStacks =
-    PerCpuHeldStacks([const { UnsafeCell::new(HeldLockStack::new()) }; MAX_TRACKED_CPUS]);
+    PerCpuHeldStacks([const { CachePadded::new(UnsafeCell::new(HeldLockStack::new())) }; MAX_TRACKED_CPUS]);
 #[cfg(rustos_boot_image)]
 static TASK_HELD_STACKS: [TaskHeldStack; MAX_TRACKED_TASK_LOCK_STACKS] =
     [const { TaskHeldStack::new() }; MAX_TRACKED_TASK_LOCK_STACKS];
@@ -225,20 +227,20 @@ static TASK_STACK_OCCUPANCY: [AtomicU64; TASK_STACK_OCCUPANCY_WORDS] =
 /// changes twice across that window, so the scope declines to judge instead of
 /// charging itself another task's work.
 #[cfg(rustos_boot_image)]
-static CURRENT_TASK_EPOCH: [AtomicU32; MAX_TRACKED_CPUS] =
-    [const { AtomicU32::new(0) }; MAX_TRACKED_CPUS];
+static CURRENT_TASK_EPOCH: [CachePadded<AtomicU32>; MAX_TRACKED_CPUS] =
+    [const { CachePadded::new(AtomicU32::new(0)) }; MAX_TRACKED_CPUS];
 #[cfg(rustos_boot_image)]
-static PREEMPT_DISABLE_DEPTH: [AtomicUsize; MAX_TRACKED_CPUS] =
-    [const { AtomicUsize::new(0) }; MAX_TRACKED_CPUS];
+static PREEMPT_DISABLE_DEPTH: [CachePadded<AtomicUsize>; MAX_TRACKED_CPUS] =
+    [const { CachePadded::new(AtomicUsize::new(0)) }; MAX_TRACKED_CPUS];
 #[cfg(rustos_boot_image)]
-static PREEMPT_PENDING_DEPTH: [AtomicUsize; MAX_TRACKED_CPUS] =
-    [const { AtomicUsize::new(0) }; MAX_TRACKED_CPUS];
+static PREEMPT_PENDING_DEPTH: [CachePadded<AtomicUsize>; MAX_TRACKED_CPUS] =
+    [const { CachePadded::new(AtomicUsize::new(0)) }; MAX_TRACKED_CPUS];
 #[cfg(rustos_boot_image)]
-static IRQ_CONTEXT_DEPTH: [AtomicUsize; MAX_TRACKED_CPUS] =
-    [const { AtomicUsize::new(0) }; MAX_TRACKED_CPUS];
+static IRQ_CONTEXT_DEPTH: [CachePadded<AtomicUsize>; MAX_TRACKED_CPUS] =
+    [const { CachePadded::new(AtomicUsize::new(0)) }; MAX_TRACKED_CPUS];
 #[cfg(rustos_boot_image)]
-static CURRENT_TASK_OWNER: [AtomicU64; MAX_TRACKED_CPUS] =
-    [const { AtomicU64::new(0) }; MAX_TRACKED_CPUS];
+static CURRENT_TASK_OWNER: [CachePadded<AtomicU64>; MAX_TRACKED_CPUS] =
+    [const { CachePadded::new(AtomicU64::new(0)) }; MAX_TRACKED_CPUS];
 #[cfg(rustos_boot_image)]
 static CPU_APIC_IDENTITIES: [AtomicU64; MAX_TRACKED_CPUS] =
     [const { AtomicU64::new(0) }; MAX_TRACKED_CPUS];
@@ -640,7 +642,11 @@ impl<T: ?Sized, const CLASS: u8> TrackedSpinLock<T, CLASS> {
             let mut wait_start_tsc = 0_u64;
             let mut spins = 0usize;
             loop {
-                if let Some(guard) = self.inner.try_lock() {
+                // TTAS: a waiter retries the CAS only once a shared read shows
+                // the word free, instead of pulling the line exclusive per spin.
+                if (spins == 0 || !self.inner.is_locked())
+                    && let Some(guard) = self.inner.try_lock()
+                {
                     break guard;
                 }
                 if spins == 0 {

@@ -255,7 +255,11 @@ ABI (version 2). It copies the calling thread's executing identity and the exact
 scheduling-context owner, object identity, admitted budget/period, bounded
 refill state, exhaustion counters, and shared-domain ledger. During a nested
 passive-server call, the executing task remains the server but the reported
-context owner and both ledgers are the root caller's. The syscall returns
+context owner and both ledgers are the root caller's. A domain's
+`budget/period` is a per-CPU share, matching deadline admission's per-CPU
+utilization ceiling: the domain keeps one budget bank per logical CPU, and an
+interval is admitted and charged against the bank of the CPU that runs it. The
+snapshot reports the executing CPU's domain bank. The syscall returns
 `EAGAIN` when no admitted effective context exists and never grants mutation,
 donation, endpoint, or scheduling authority. Context and domain runtime
 milestones use distinct counter banks so domain billing is not double-counted

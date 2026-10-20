@@ -109,6 +109,10 @@ impl FundingObservation<'_, '_, '_> {
         self.original.check();
         (self.stamp, self.original.id, self.owner)
     }
+    /// CPU whose domain bank funds this interval.
+    pub(super) fn cpu(&self) -> usize {
+        self.original.scope.cpu()
+    }
 }
 
 impl<'scope, 'irq> CurrentInterval<'scope, 'irq> {

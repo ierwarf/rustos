@@ -159,11 +159,25 @@ fn stable_service_endpoint_snapshot_rejects_revoked_owners() {
 
 #[test]
 fn cached_service_call_grant_is_exact_process_and_epoch() {
-    assert!(cached_service_call_grant_matches(41, 7, 41, 7));
-    assert!(!cached_service_call_grant_matches(41, 7, 42, 7));
-    assert!(!cached_service_call_grant_matches(41, 7, 41, 8));
-    assert!(!cached_service_call_grant_matches(0, 7, 0, 7));
-    assert!(!cached_service_call_grant_matches(41, 0, 41, 0));
+    const INDEX: usize = MAX_SERVICE_ENDPOINTS - 1;
+    assert_eq!(packed_service_grant(0, 7), None);
+    assert_eq!(packed_service_grant(41, 0), None);
+    assert_eq!(packed_service_grant(u64::from(u32::MAX) + 1, 7), None);
+    cache_service_grant(INDEX, 41, 7);
+    assert!(service_grant_cached(INDEX, 41, 7));
+    assert!(!service_grant_cached(INDEX, 42, 7));
+    assert!(!service_grant_cached(INDEX, 41, 8));
+    // A second and third client of the same service keep the first cached.
+    cache_service_grant(INDEX, 42, 7);
+    cache_service_grant(INDEX, 43, 7);
+    assert!(service_grant_cached(INDEX, 41, 7));
+    assert!(service_grant_cached(INDEX, 42, 7));
+    assert!(service_grant_cached(INDEX, 43, 7));
+    forget_cached_service_grants(42);
+    assert!(!service_grant_cached(INDEX, 42, 7));
+    assert!(service_grant_cached(INDEX, 41, 7));
+    forget_cached_service_grants(41);
+    forget_cached_service_grants(43);
 }
 
 #[test]

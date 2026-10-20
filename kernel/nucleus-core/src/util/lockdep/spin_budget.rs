@@ -2,8 +2,16 @@
 
 /// Conservative wall-clock proxy for early boot, before a calibrated
 /// nanosecond clock is available to nucleus-core.
-pub(super) const RAW_SPIN_CYCLE_LIMIT: u64 = 250_000_000;
-const RAW_SPIN_FALLBACK_LIMIT: usize = 10_000_000;
+///
+/// About a quarter second at 4 GHz. A raw-spin critical section is
+/// microseconds long, so this still turns a real deadlock into a prompt
+/// fail-stop; the former 62 ms bound could be exceeded by an ordinary
+/// host-side deschedule of the vCPU holding the lock on an overcommitted
+/// eight-vCPU guest, and turned that into a kernel panic.
+pub(super) const RAW_SPIN_CYCLE_LIMIT: u64 = 1_000_000_000;
+/// Iteration backstop when the TSC reading cannot advance. Each iteration is
+/// at least one `pause`, so this stays above the cycle bound on current parts.
+const RAW_SPIN_FALLBACK_LIMIT: usize = 40_000_000;
 
 #[inline]
 pub(super) const fn raw_spin_wait_exceeded(wait_cycles: u64, spins: usize) -> bool {
