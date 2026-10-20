@@ -226,21 +226,24 @@ static TASK_STACK_OCCUPANCY: [AtomicU64; TASK_STACK_OCCUPANCY_WORDS] =
 /// sides while the counters in between belong to whoever ran. This epoch
 /// changes twice across that window, so the scope declines to judge instead of
 /// charging itself another task's work.
+/// One CPU's lock bookkeeping in one private cache line: dense per-word arrays
+/// false-shared each line across CPUs; one padded line per word made every
+/// lock operation touch five lines.
 #[cfg(rustos_boot_image)]
-static CURRENT_TASK_EPOCH: [CachePadded<AtomicU32>; MAX_TRACKED_CPUS] =
-    [const { CachePadded::new(AtomicU32::new(0)) }; MAX_TRACKED_CPUS];
+#[repr(align(64))]
+struct CpuLockState {
+    preempt_disable_depth: AtomicUsize,
+    preempt_pending_depth: AtomicUsize,
+    irq_context_depth: AtomicUsize,
+    current_task_owner: AtomicU64,
+    current_task_epoch: AtomicU32,
+}
 #[cfg(rustos_boot_image)]
-static PREEMPT_DISABLE_DEPTH: [CachePadded<AtomicUsize>; MAX_TRACKED_CPUS] =
-    [const { CachePadded::new(AtomicUsize::new(0)) }; MAX_TRACKED_CPUS];
-#[cfg(rustos_boot_image)]
-static PREEMPT_PENDING_DEPTH: [CachePadded<AtomicUsize>; MAX_TRACKED_CPUS] =
-    [const { CachePadded::new(AtomicUsize::new(0)) }; MAX_TRACKED_CPUS];
-#[cfg(rustos_boot_image)]
-static IRQ_CONTEXT_DEPTH: [CachePadded<AtomicUsize>; MAX_TRACKED_CPUS] =
-    [const { CachePadded::new(AtomicUsize::new(0)) }; MAX_TRACKED_CPUS];
-#[cfg(rustos_boot_image)]
-static CURRENT_TASK_OWNER: [CachePadded<AtomicU64>; MAX_TRACKED_CPUS] =
-    [const { CachePadded::new(AtomicU64::new(0)) }; MAX_TRACKED_CPUS];
+static CPU_LOCK_STATE: [CpuLockState; MAX_TRACKED_CPUS] = [const { CpuLockState {
+    preempt_disable_depth: AtomicUsize::new(0), preempt_pending_depth: AtomicUsize::new(0),
+    irq_context_depth: AtomicUsize::new(0), current_task_owner: AtomicU64::new(0),
+    current_task_epoch: AtomicU32::new(0),
+} }; MAX_TRACKED_CPUS];
 #[cfg(rustos_boot_image)]
 static CPU_APIC_IDENTITIES: [AtomicU64; MAX_TRACKED_CPUS] =
     [const { AtomicU64::new(0) }; MAX_TRACKED_CPUS];
@@ -318,7 +321,7 @@ pub fn enter_irq_context() -> IrqContextGuard {
         let entry_identity_count = work_budget::identity_count_on(cpu);
         // ORDERING: AcqRel publishes this CPU's IRQ nesting before any handler
         // lock acquisition and pairs with the final AcqRel guard release.
-        let previous = IRQ_CONTEXT_DEPTH[cpu].fetch_add(1, Ordering::AcqRel);
+        let previous = CPU_LOCK_STATE[cpu].irq_context_depth.fetch_add(1, Ordering::AcqRel);
         assert!(
             previous < MAX_HELD_LOCK_DEPTH,
             "interrupt-context nesting exceeded bound"
@@ -361,7 +364,7 @@ pub fn irq_context_depth() -> usize {
 pub fn irq_context_depth_on(cpu: usize) -> usize {
     // ORDERING: Acquire observes the CPU-local entry/release transition
     // before deciding whether task-owned lock state may be consulted.
-    IRQ_CONTEXT_DEPTH[cpu].load(Ordering::Acquire)
+    CPU_LOCK_STATE[cpu].irq_context_depth.load(Ordering::Acquire)
 }
 
 #[cfg(not(rustos_boot_image))]
@@ -415,15 +418,15 @@ pub fn set_current_task_owner(owner: u64) {
         // The epoch moves on every publication, including a republication of
         // the same owner, which is what makes a switched-away-and-back scope
         // detectable at all.
-        CURRENT_TASK_EPOCH[cpu].store(
-            CURRENT_TASK_EPOCH[cpu]
+        CPU_LOCK_STATE[cpu].current_task_epoch.store(
+            CPU_LOCK_STATE[cpu].current_task_epoch
                 .load(Ordering::Relaxed)
                 .wrapping_add(1),
             Ordering::Relaxed,
         );
         // ORDERING: Release publishes scheduler current-task ownership before
         // subsequent lock acquisitions load it with Acquire.
-        CURRENT_TASK_OWNER[cpu].store(owner, Ordering::Release);
+        CPU_LOCK_STATE[cpu].current_task_owner.store(owner, Ordering::Release);
     }
     #[cfg(not(rustos_boot_image))]
     {
@@ -438,7 +441,7 @@ pub fn current_task_owner() -> Option<u64> {
     {
         // ORDERING: Acquire observes the scheduler's Release publication
         // before an invariant report attributes the fault to a task.
-        let owner = CURRENT_TASK_OWNER[current_cpu_index()].load(Ordering::Acquire);
+        let owner = CPU_LOCK_STATE[current_cpu_index()].current_task_owner.load(Ordering::Acquire);
         return (owner != 0).then_some(owner);
     }
     #[cfg(not(rustos_boot_image))]
@@ -591,7 +594,7 @@ impl Drop for IrqContextGuard {
         {
             // ORDERING: AcqRel publishes the completed IRQ handler before the
             // CPU-local nesting depth becomes observable as one level lower.
-            let previous = IRQ_CONTEXT_DEPTH[self.cpu].fetch_sub(1, Ordering::AcqRel);
+            let previous = CPU_LOCK_STATE[self.cpu].irq_context_depth.fetch_sub(1, Ordering::AcqRel);
             assert!(previous != 0, "interrupt-context depth underflow");
             // Every identity derivation this handler made belongs to the
             // handler, not to whatever it interrupted.
@@ -642,8 +645,7 @@ impl<T: ?Sized, const CLASS: u8> TrackedSpinLock<T, CLASS> {
             let mut wait_start_tsc = 0_u64;
             let mut spins = 0usize;
             loop {
-                // TTAS: a waiter retries the CAS only once a shared read shows
-                // the word free, instead of pulling the line exclusive per spin.
+                // TTAS: retry the CAS only after a shared read shows the word free.
                 if (spins == 0 || !self.inner.is_locked())
                     && let Some(guard) = self.inner.try_lock()
                 {
@@ -701,7 +703,7 @@ impl<T: ?Sized, const CLASS: u8> TrackedSpinLock<T, CLASS> {
             // ORDERING: Acquire observes completed guard/pending transitions
             // before the depth this guard must match on release is recorded.
             #[cfg(rustos_boot_image)]
-            acquire_preemption_depth: PREEMPT_DISABLE_DEPTH[acquire_cpu].load(Ordering::Acquire),
+            acquire_preemption_depth: CPU_LOCK_STATE[acquire_cpu].preempt_disable_depth.load(Ordering::Acquire),
         }
     }
 
@@ -862,7 +864,7 @@ impl<T: ?Sized, const CLASS: u8> Drop for TrackedSpinGuard<'_, T, CLASS> {
                 let release_apic_id = cpu_identity::apic_id_for_index(release_cpu);
                 // ORDERING: Acquire observes completed guard/pending
                 // transitions before the release admissibility comparison.
-                let depth = PREEMPT_DISABLE_DEPTH[release_cpu].load(Ordering::Acquire);
+                let depth = CPU_LOCK_STATE[release_cpu].preempt_disable_depth.load(Ordering::Acquire);
                 let admissible = guard_release_is_admissible(
                     self.owner_cpu,
                     self.owner_apic_id,
@@ -982,7 +984,7 @@ pub fn current_task_sleepable_lock_class() -> Option<u8> {
     {
         // ORDERING: Acquire observes the scheduler's Release publication of
         // the exact task whose sleepable stack may be inspected.
-        let owner = CURRENT_TASK_OWNER[current_cpu_index()].load(Ordering::Acquire);
+        let owner = CPU_LOCK_STATE[current_cpu_index()].current_task_owner.load(Ordering::Acquire);
         if owner == 0 {
             return None;
         }
@@ -1071,10 +1073,10 @@ fn before_acquire_with_irq_tracking(
     let profile_irq = lock_profile::charge(lock_profile::LockPhase::BeforeIrqUsage, profile_entry);
     // ORDERING: Acquire observes the CPU-local entry/release transition before
     // deciding whether task-owned lock state may be consulted.
-    if IRQ_CONTEXT_DEPTH[cpu].load(Ordering::Acquire) == 0 {
+    if CPU_LOCK_STATE[cpu].irq_context_depth.load(Ordering::Acquire) == 0 {
         // ORDERING: Acquire observes the scheduler's task-owner publication
         // before attributing any sleepable-to-raw dependency.
-        let owner = CURRENT_TASK_OWNER[cpu].load(Ordering::Acquire);
+        let owner = CPU_LOCK_STATE[cpu].current_task_owner.load(Ordering::Acquire);
         if owner != 0 {
             with_task_stack(owner, false, |stack| {
                 for held in &stack.classes[..stack.len] {
@@ -1166,7 +1168,7 @@ fn after_acquire_on(cpu: usize, pending: PendingAcquire) {
             stack.classes[stack.len] = pending.class;
             stack.len += 1;
         });
-        let previous = PREEMPT_PENDING_DEPTH[cpu].fetch_sub(1, Ordering::Relaxed);
+        let previous = CPU_LOCK_STATE[cpu].preempt_pending_depth.fetch_sub(1, Ordering::Relaxed);
         assert!(previous != 0, "raw-spin pending-acquire depth underflow");
     }
 }

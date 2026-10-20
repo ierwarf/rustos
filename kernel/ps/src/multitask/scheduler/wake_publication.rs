@@ -270,6 +270,14 @@ pub(super) fn pager_service_with(
         return None;
     }
     for slot in 0..MAX_TASK {
+        // Advisory pre-filter: pinning a binding for every slot just to read
+        // its process id dominated this search. The captured binding's exact
+        // process id below remains the authority.
+        if !super::super::current_identity::read_dispatch(slot)
+            .is_some_and(|publication| publication.process_id == Some(process_id))
+        {
+            continue;
+        }
         let Some(id) = stack_resources::task_start::read(slot).map(|s| s.id) else {
             continue;
         };

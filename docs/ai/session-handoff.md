@@ -7,8 +7,9 @@ no staging or commit has been requested.
 ## Current objective
 
 Stabilize eight-vCPU RustOS first, then optimize the scheduler/IPC bottlenecks
-found by static review. Per-CPU domain budgets are committed (`65adf2d1`); the
-remaining fixes below are uncommitted and have no staging request.
+found by static review. Per-CPU domain budgets (`65adf2d1`) and the wakeup,
+lock, heap and APIC fixes (`be14d6c2`) are committed; the follow-up round
+below is uncommitted and has no staging request.
 
 ## Fresh evidence — 2026-10-20
 
@@ -59,11 +60,22 @@ remaining fixes below are uncommitted and have no staging request.
   kvm-smoke --dry-run`). Bench comparisons need a same-session control.
 - `cargo test -p rootd` segfaults on unmodified HEAD as well (host harness);
   it is not evidence about this change set.
-- Still open: the DONATION_LEDGER class claim remains one global leaf per
-  non-idle dispatch; several `monotonic_nanos()` samples per dispatch; plain
-  `ipc_rt_intra_process` (separate reply then recv) is ~4x the fused
-  reply-recv path; advisory boot overshoots (display-provider ~2.9–3.9 s >
-  2.5 s, input-policy ~1.7 s > 1.5 s) are dominated by Linux DVM readiness.
+- Follow-up round (uncommitted): the dispatch class claim no longer takes
+  the global `DONATION_LEDGER` leaf (per-CPU claim section + odd-sequence
+  publisher wait; witnesses `class_claims_on_different_cpus_do_not_wait_for_each_other`,
+  `class_publication_waits_for_an_in_progress_claim`); one monotonic sample per
+  selection turn; the process pick-hint and pager-service searches pre-filter
+  on the published process id before pinning bindings (split reply/recv p50
+  251k -> 114k cycles at 1 vCPU); one cache line of lock bookkeeping per CPU
+  (`CPU_LOCK_STATE`); executable snapshot rail 2 s -> 4 s (DVM block reads of a
+  ~1 MB image take 1.1–1.3 s at 8 vCPUs, ~75 ms per 64 KiB request).
+- Still open: DVM block bulk-read latency (~75 ms per 64 KiB) dominates app
+  launch; split reply-then-recv still hands the CPU to the caller before the
+  server re-parks, so the next call takes the slow path (fused reply-recv is
+  the production path); advisory boot overshoots (display-provider ~2.8–3.9 s
+  > 2.5 s, input-policy ~1.6–1.7 s > 1.5 s) are dominated by Linux DVM
+  readiness; 1-vCPU fused reply-recv minimum sits +1.9–2.3% over the
+  same-session baseline (noise floor ~2%).
 
 ## Historical evidence
 

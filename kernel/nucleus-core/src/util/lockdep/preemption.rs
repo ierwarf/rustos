@@ -106,7 +106,7 @@ pub fn preemption_depth() -> usize {
             let cpu = current_cpu_index();
             // ORDERING: Acquire observes completed guard/pending transitions
             // before a scheduler gate consumes this depth.
-            effective_depth(PREEMPT_DISABLE_DEPTH[cpu].load(Ordering::Acquire), cpu)
+            effective_depth(CPU_LOCK_STATE[cpu].preempt_disable_depth.load(Ordering::Acquire), cpu)
         })
     }
     #[cfg(not(rustos_boot_image))]
@@ -132,8 +132,8 @@ pub fn preemption_snapshot() -> PreemptionSnapshot {
             let apic_id = super::cpu_identity::apic_id_for_index(logical_cpu);
             // ORDERING: Acquire observes completed guard/pending transitions
             // before a scheduler gate consumes this coherent snapshot.
-            let depth = PREEMPT_DISABLE_DEPTH[logical_cpu].load(Ordering::Acquire);
-            let pending_depth = PREEMPT_PENDING_DEPTH[logical_cpu].load(Ordering::Relaxed);
+            let depth = CPU_LOCK_STATE[logical_cpu].preempt_disable_depth.load(Ordering::Acquire);
+            let pending_depth = CPU_LOCK_STATE[logical_cpu].preempt_pending_depth.load(Ordering::Relaxed);
             let held_depth = held_spin_lock_depth_on(logical_cpu);
             let top_class = current_lock_class_on(logical_cpu);
             assert!(
@@ -185,9 +185,9 @@ pub(super) fn disable_preemption() -> usize {
         let cpu = current_cpu_index();
         // ORDERING: Acquire observes the last same-CPU guard release before
         // checking the held plus pending ownership correspondence.
-        let depth = PREEMPT_DISABLE_DEPTH[cpu].load(Ordering::Acquire);
+        let depth = CPU_LOCK_STATE[cpu].preempt_disable_depth.load(Ordering::Acquire);
         let held_depth = with_current_stack_on(cpu, |stack| stack.len);
-        let pending_depth = PREEMPT_PENDING_DEPTH[cpu].load(Ordering::Relaxed);
+        let pending_depth = CPU_LOCK_STATE[cpu].preempt_pending_depth.load(Ordering::Relaxed);
         assert!(
             preemption_units_match(depth, held_depth, pending_depth),
             "raw-spin preemption acquire mismatch cpu={} apic={:#x} depth={} held_depth={} pending_depth={} top_class={:?}",
@@ -203,12 +203,12 @@ pub(super) fn disable_preemption() -> usize {
         );
         // ORDERING: AcqRel publishes guard entry before protected raw state can
         // be observed and serializes depth with the matching decrement.
-        let previous = PREEMPT_DISABLE_DEPTH[cpu].fetch_add(1, Ordering::AcqRel);
+        let previous = CPU_LOCK_STATE[cpu].preempt_disable_depth.fetch_add(1, Ordering::AcqRel);
         assert!(
             previous < MAX_HELD_LOCK_DEPTH,
             "raw-spin preemption depth exceeded bound"
         );
-        PREEMPT_PENDING_DEPTH[cpu].fetch_add(1, Ordering::Relaxed);
+        CPU_LOCK_STATE[cpu].preempt_pending_depth.fetch_add(1, Ordering::Relaxed);
         cpu
     })
 }
@@ -226,11 +226,11 @@ pub(super) fn enable_preemption_on(cpu: usize, class: u8) {
     // The architectural identity is only rendered in the failure messages
     // below. Deriving it eagerly cost a `CPUID` VM exit on every lock release.
     let held_depth = with_current_stack_on(cpu, |stack| stack.len);
-    let pending_depth = PREEMPT_PENDING_DEPTH[cpu].load(Ordering::Relaxed);
+    let pending_depth = CPU_LOCK_STATE[cpu].preempt_pending_depth.load(Ordering::Relaxed);
     // ORDERING: AcqRel publishes every protected write before the final depth
     // decrement; Acquire failure ordering reports the exact observed depth.
     let previous =
-        PREEMPT_DISABLE_DEPTH[cpu].fetch_update(Ordering::AcqRel, Ordering::Acquire, |depth| {
+        CPU_LOCK_STATE[cpu].preempt_disable_depth.fetch_update(Ordering::AcqRel, Ordering::Acquire, |depth| {
             depth.checked_sub(1)
         });
     match previous {
@@ -269,7 +269,7 @@ pub(super) fn enable_preemption_on(cpu: usize, class: u8) {
 #[cfg(rustos_boot_image)]
 pub(super) fn cancel_pending_acquire() {
     let cpu = current_cpu_index();
-    let previous = PREEMPT_PENDING_DEPTH[cpu].fetch_sub(1, Ordering::Relaxed);
+    let previous = CPU_LOCK_STATE[cpu].preempt_pending_depth.fetch_sub(1, Ordering::Relaxed);
     assert!(previous != 0, "raw-spin pending-acquire depth underflow");
 }
 

@@ -1239,10 +1239,7 @@ capacity = "MAX_TRACKED_CPUS"
 [[per_cpu_statics]]
 path = "kernel/nucleus-core/src/util/lockdep.rs"
 names = [
-    "PREEMPT_DISABLE_DEPTH",
-    "PREEMPT_PENDING_DEPTH",
-    "IRQ_CONTEXT_DEPTH",
-    "CURRENT_TASK_OWNER",
+    "CPU_LOCK_STATE",
     "CPU_APIC_IDENTITIES",
 ]
 capacity = "MAX_TRACKED_CPUS"

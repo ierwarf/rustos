@@ -345,7 +345,12 @@ Its acceptance properties are:
 1. **Eligibility before preference.** Lifecycle generation, CPU ownership,
    affinity, stable saved frame, effective donation class, and both context and
    domain budget must all be current. An unstable runnable/class publication or
-   one failed candidate revalidation rejects the whole local observation.
+   one failed candidate revalidation rejects the whole local observation. The
+   final claim runs inside a per-CPU class-claim section: it raises its CPU's
+   indicator and revalidates the class sequence, while every class publisher
+   (under the donation ledger) makes the sequence odd and waits for all raised
+   indicators before changing a class. Claims on different CPUs never wait for
+   each other. Selection arms share one monotonic sample per turn.
 2. **Exact custody wins.** Atomic activation and synchronous IPC FIFO handoffs
    retain catalog authority. Local fairness cannot reorder them.
 3. **Bounded class service.** System work is preferred, but after at most

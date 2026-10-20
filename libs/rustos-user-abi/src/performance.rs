@@ -44,7 +44,13 @@ pub const IPC_BOOT_CONTROL_HARD_LIMIT_MS: u64 = 5_000;
 /// One immutable executable snapshot on an interactive launch path. The
 /// remaining boot/launch budget must still cover image validation, mapping,
 /// activation, Wayland configure, and the first presented frame.
-pub const EXECUTABLE_SNAPSHOT_HARD_LIMIT_MS: u64 = 2_000;
+///
+/// A ~1 MB application image read through the DVM block transport measured
+/// 1.06-1.30 s at eight vCPUs (64 KiB bulk reads at ~75 ms each), so the former
+/// 2 s rail failed a launch whenever boot-time contention stretched one read.
+/// 4 s keeps 3x headroom over that cost and stays inside the boot-control and
+/// boot-to-UI rails.
+pub const EXECUTABLE_SNAPSHOT_HARD_LIMIT_MS: u64 = 4_000;
 /// One shared absolute deadline covers DVM block readiness and its first
 /// generation-bound flush proof during product boot.
 pub const DVM_STORAGE_BOOT_READY_HARD_LIMIT_MS: u64 = 4_000;

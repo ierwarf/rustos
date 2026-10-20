@@ -469,14 +469,24 @@ ordered(body(claim, 'capture_selected'), ['class_sequence: u64',
 ordered(body(claim, 'with_admission'), ['runqueue::is_idle_slot(self.token.slot)',
     'if funding.is_some() { return None; }', 'return claim()', 'with_class_claim(self.class_sequence,',
     'match funding', 'Some(pin) => pin.with_dispatch_admission(self.cpu,', 'None => claim()'],
-    'class45 before original funding48/49')
+    'class claim section before original funding48/49')
 ledger = (base / 'donation_ledger.rs').read_text()
-ordered(body(ledger, 'with_class_claim'), ['DONATION_LEDGER.lock()',
-    'expected & 1 != 0 || class_publication_sequence() != expected', 'return None', 'claim()'],
-    'original class leaf through bounded claim')
+ordered(body(ledger, 'with_class_claim'), ['expected & 1 != 0', 'return None',
+    'indicator.fetch_add(1, Ordering::SeqCst)',
+    'CLASS_PUBLICATION_SEQUENCE.load(Ordering::SeqCst) != expected',
+    'indicator.fetch_sub(1, Ordering::Release)', 'return None', 'claim()',
+    'indicator.fetch_sub(1, Ordering::Release)'],
+    'per-CPU class claim section validates the sequence after raising its indicator')
+ordered(body(ledger, 'begin_class_publication'), [
+    'CLASS_PUBLICATION_SEQUENCE.fetch_add(1, Ordering::SeqCst)', 'for indicator in &CLASS_CLAIMS',
+    'while indicator.load(Ordering::Acquire) != 0'],
+    'class publisher makes the sequence odd before waiting out every claim section')
 ordered(body(ledger, 'publish_base_class'), ['DONATION_LEDGER.lock()',
-    'CLASS_PUBLICATION_SEQUENCE.fetch_add(1, Ordering::AcqRel)', 'effect()',
-    'CLASS_PUBLICATION_SEQUENCE.fetch_add(1, Ordering::AcqRel)'], 'live base-class producer join')
+    'begin_class_publication()', 'effect()', 'end_class_publication()'],
+    'live base-class producer join')
+for class_producer in ('increment_receiver', 'decrement_receiver'):
+    ordered(body(ledger, class_producer), ['begin_class_publication()', 'INHERITED_SYSTEM[slot]',
+        'end_class_publication()'], 'inherited-class producer join')
 runtime = (base / 'scheduling_runtime.rs').read_text()
 ordered(body(runtime, 'with_dispatch_admission'), ['with_published_budget_pair(self.stamp, cpu,',
     '!context.is_eligible(now_ns) || !domain.is_eligible(now_ns)', 'return None', 'claim()'],

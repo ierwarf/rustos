@@ -7,15 +7,21 @@
 //!   it before forgetting the reply identity.
 //! - **Concurrency:** `SchedulerDonation` serializes edge mutation. Dispatch
 //!   reads only an Acquire receiver-slot counter and never scans this ledger.
+//!   Class claims exclude class publication without this leaf: each claim
+//!   raises its CPU's indicator and revalidates the sequence; each publisher
+//!   (always under the leaf) makes the sequence odd and waits for every raised
+//!   indicator before changing a class. Claims on different CPUs therefore no
+//!   longer serialize on one global lock per dispatch.
 //! - **Failure:** duplicate reservation, stale reply, capacity exhaustion, and
 //!   unmatched terminal release fail closed without changing a receiver class.
 //!   Owned publication revalidates original source custody under this same leaf;
 //!   candidate snapshots are never execution/interval grants.
 //! - **Evidence:** `ipc-priority-inheritance` and the focused ledger tests.
 
-use core::sync::atomic::{AtomicU8, AtomicU16, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
 
-use nucleus_core::util::lockdep::LockClass;
+use nucleus_core::util::cache_padded::CachePadded;
+use nucleus_core::util::lockdep::{LockClass, MAX_TRACKED_CPUS};
 use crate::multitask::irq_leaf::IrqLeaf;
 
 use super::{
@@ -109,6 +115,14 @@ static DONATION_LEDGER: IrqLeaf<DonationLedger, { LockClass::SchedulerDonation a
     IrqLeaf::new(DonationLedger::new());
 static INHERITED_SYSTEM: [AtomicU8; MAX_TASK] = [const { AtomicU8::new(0) }; MAX_TASK];
 static CLASS_PUBLICATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+/// Read side of the class exclusion: claims in progress on each CPU. A count
+/// rather than a flag only so native fixtures, which run many test threads as
+/// one modeled CPU, cannot clear each other's section.
+static CLASS_CLAIMS: [CachePadded<AtomicU32>; MAX_TRACKED_CPUS] =
+    [const { CachePadded::new(AtomicU32::new(0)) }; MAX_TRACKED_CPUS];
+/// A claim is a bounded critical section; a publisher that waits longer than
+/// this on one is a deadlock, not contention.
+const CLASS_CLAIM_WAIT_SPINS: u64 = 1 << 28;
 const NO_BORROWED_CONTEXT: u16 = u16::MAX;
 static BORROWED_CONTEXT_OWNER: [AtomicU16; MAX_TASK] =
     [const { AtomicU16::new(NO_BORROWED_CONTEXT) }; MAX_TASK];
@@ -139,7 +153,7 @@ fn bind_entry_to_receiver(entry: &mut LedgerEntry, receiver_task_id: u64, receiv
 
 pub(super) fn reset() {
     let mut ledger = DONATION_LEDGER.lock();
-    CLASS_PUBLICATION_SEQUENCE.fetch_add(1, Ordering::AcqRel);
+    begin_class_publication();
     *ledger = DonationLedger::new();
     for inherited in &INHERITED_SYSTEM {
         inherited.store(0, Ordering::Release);
@@ -153,7 +167,7 @@ pub(super) fn reset() {
     for reply in &BORROWED_CONTEXT_REPLY {
         reply.store(0, Ordering::Release);
     }
-    CLASS_PUBLICATION_SEQUENCE.fetch_add(1, Ordering::AcqRel);
+    end_class_publication();
 }
 
 fn source_live(ledger: &DonationLedger, source: FundingSource) -> bool {
@@ -582,21 +596,75 @@ pub(super) fn class_publication_sequence() -> u64 {
 }
 
 /// Observation is NOT lifetime custody. The caller must retain its original
-/// turn/frame/funder and borrow this leaf only for the bounded final claim.
-/// All live base-class and inherited-class producers serialize here.
+/// turn/frame/funder and run only the bounded final claim here. Every live
+/// base-class and inherited-class producer is excluded for the claim's whole
+/// duration: either this claim observes the producer's odd/advanced sequence
+/// and refuses, or the producer observes this CPU's raised indicator and waits
+/// for the claim to finish before changing any class (SeqCst store-then-load
+/// on both sides). Claims on other CPUs proceed concurrently.
 pub(super) fn with_class_claim<T>(
     expected: u64, claim: impl FnOnce() -> Option<T>,
 ) -> Option<T> {
-    let _ledger = DONATION_LEDGER.lock();
-    if expected & 1 != 0 || class_publication_sequence() != expected {
+    if expected & 1 != 0 {
         return None;
     }
-    claim()
+    let indicator = &CLASS_CLAIMS[nucleus_core::util::lockdep::current_cpu_index()];
+    // A publisher must never preempt a claim on its own CPU and then wait on
+    // that CPU's indicator, so the claim runs with local interrupts excluded.
+    let excluded = || {
+        // ORDERING: SeqCst indicator raise before the SeqCst sequence load,
+        // pairing with the publisher's SeqCst bump before its indicator scan.
+        indicator.fetch_add(1, Ordering::SeqCst);
+        // ORDERING: SeqCst; see the indicator raise above.
+        if CLASS_PUBLICATION_SEQUENCE.load(Ordering::SeqCst) != expected {
+            // ORDERING: Release ends this CPU's (empty) read section.
+            indicator.fetch_sub(1, Ordering::Release);
+            return None;
+        }
+        let claimed = claim();
+        // ORDERING: Release publishes the claim's effects before a waiting
+        // publisher may change a class.
+        indicator.fetch_sub(1, Ordering::Release);
+        claimed
+    };
+    #[cfg(rustos_boot_image)]
+    {
+        x86_64::instructions::interrupts::without_interrupts(excluded)
+    }
+    #[cfg(not(rustos_boot_image))]
+    {
+        excluded()
+    }
+}
+
+/// Write side of the class exclusion; the caller holds `DONATION_LEDGER`.
+fn begin_class_publication() {
+    // ORDERING: SeqCst bump to odd before scanning claim indicators (Dekker
+    // pair with `with_class_claim`).
+    CLASS_PUBLICATION_SEQUENCE.fetch_add(1, Ordering::SeqCst);
+    for indicator in &CLASS_CLAIMS {
+        let mut spins = 0_u64;
+        // ORDERING: Acquire joins the claim's Release end-of-section update.
+        while indicator.load(Ordering::Acquire) != 0 {
+            spins += 1;
+            assert!(spins < CLASS_CLAIM_WAIT_SPINS, "class publication waited on a stalled claim");
+            core::hint::spin_loop();
+        }
+    }
+}
+
+/// Ends a class publication; the caller still holds `DONATION_LEDGER`.
+fn end_class_publication() {
+    // ORDERING: AcqRel publishes the class change with the even sequence.
+    CLASS_PUBLICATION_SEQUENCE.fetch_add(1, Ordering::AcqRel);
 }
 
 #[cfg(test)]
 pub(super) fn test_class_excluded() -> bool {
-    DONATION_LEDGER.try_lock().is_none()
+    CLASS_CLAIMS
+        .iter()
+        // ORDERING: native observation of the read side only.
+        .any(|indicator| indicator.load(Ordering::Acquire) != 0)
 }
 
 /// Self-demotion participates in the SAME class exclusion as ledger edges.
@@ -604,9 +672,9 @@ pub(super) fn test_class_excluded() -> bool {
 /// class replacements; their existing physical publication seals remain owners.
 pub(super) fn publish_base_class(effect: impl FnOnce()) {
     let _ledger = DONATION_LEDGER.lock();
-    CLASS_PUBLICATION_SEQUENCE.fetch_add(1, Ordering::AcqRel);
+    begin_class_publication();
     effect();
-    CLASS_PUBLICATION_SEQUENCE.fetch_add(1, Ordering::AcqRel);
+    end_class_publication();
 }
 
 #[inline]
@@ -630,20 +698,20 @@ pub(super) fn live_len() -> usize {
 }
 
 fn increment_receiver(slot: usize) {
-    CLASS_PUBLICATION_SEQUENCE.fetch_add(1, Ordering::AcqRel);
+    begin_class_publication();
     let previous = INHERITED_SYSTEM[slot].fetch_add(1, Ordering::Release);
     assert!(
         previous != u8::MAX,
         "scheduler donation receiver count overflow"
     );
-    CLASS_PUBLICATION_SEQUENCE.fetch_add(1, Ordering::AcqRel);
+    end_class_publication();
 }
 
 fn decrement_receiver(slot: usize) {
-    CLASS_PUBLICATION_SEQUENCE.fetch_add(1, Ordering::AcqRel);
+    begin_class_publication();
     let previous = INHERITED_SYSTEM[slot].fetch_sub(1, Ordering::Release);
     assert!(previous != 0, "scheduler donation receiver count underflow");
-    CLASS_PUBLICATION_SEQUENCE.fetch_add(1, Ordering::AcqRel);
+    end_class_publication();
 }
 
 fn release_entry(ledger: &DonationLedger, entry: LedgerEntry) {
@@ -728,6 +796,65 @@ pub(super) fn test_charge_publication_is_empty(slot: usize) -> bool {
 #[cfg(test)]
 mod tests {
     use super::super::donation_publication::tests::{ledger_witnesses as owned, legacy_witnesses};
+
+    #[test]
+    fn class_claims_on_different_cpus_do_not_wait_for_each_other() {
+        use nucleus_core::util::lockdep::with_native_cpu;
+        // A single global claim lock made the second CPU's claim wait for the
+        // first one's entire callback; it must now return while the first is
+        // still inside its claim.
+        let returned_inside = with_native_cpu(0, || loop {
+            let expected = super::class_publication_sequence();
+            let outcome = super::with_class_claim(expected, || {
+                let (sender, receiver) = std::sync::mpsc::channel();
+                let peer = std::thread::spawn(move || {
+                    with_native_cpu(1, || {
+                        let _ = super::with_class_claim(expected, || Some(()));
+                        sender.send(()).unwrap();
+                    })
+                });
+                let returned = receiver
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .is_ok();
+                peer.join().unwrap();
+                Some(returned)
+            });
+            if let Some(returned) = outcome {
+                break returned;
+            }
+        });
+        assert!(returned_inside);
+    }
+
+    #[test]
+    fn class_publication_waits_for_an_in_progress_claim() {
+        use core::sync::atomic::{AtomicBool, Ordering::SeqCst};
+        use nucleus_core::util::lockdep::with_native_cpu;
+        use std::sync::Arc;
+        // Publishing advances the shared class sequence; exclude the fixtures
+        // whose claims validate it, in their own guard order.
+        let _runtime = super::super::scheduling_runtime::test_serial_guard();
+        let _queue = super::super::runqueue::test_serial_guard();
+        let published = Arc::new(AtomicBool::new(false));
+        with_native_cpu(2, || loop {
+            let expected = super::class_publication_sequence();
+            let claimed = super::with_class_claim(expected, || {
+                let observed = Arc::clone(&published);
+                let publisher = std::thread::spawn(move || {
+                    with_native_cpu(3, || super::publish_base_class(|| observed.store(true, SeqCst)))
+                });
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                // The class may not change under a claim that validated it.
+                assert!(!published.load(SeqCst));
+                Some(publisher)
+            });
+            if let Some(publisher) = claimed {
+                publisher.join().unwrap();
+                break;
+            }
+        });
+        assert!(published.load(SeqCst));
+    }
     #[test]
     fn a_fault_token_never_aliases_an_equal_reply_handle() {
         owned::namespaces(true);

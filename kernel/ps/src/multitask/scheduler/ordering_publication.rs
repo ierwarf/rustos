@@ -112,7 +112,14 @@ pub(in crate::multitask) fn process(pid: u64) -> Option<u64> { scoped(|scope| pr
 fn process_in(scope: &DispatchPreemption<'_>, pid: u64) -> Option<u64> {
     // Keep the winning ORIGINAL target across the entire bounded comparison;
     // never remember its scalar slot then reacquire a potentially different task.
-    let target = (0..MAX_TASK).filter_map(|slot| {
+    // The published process id is an advisory pre-filter only: capturing a
+    // binding pins the task, and doing that for every slot on every call
+    // with no parked receiver cost ~150k cycles. The captured binding's exact
+    // process id below remains the authority.
+    let target = (0..MAX_TASK).filter(|&slot| {
+        super::super::current_identity::read_dispatch(slot)
+            .is_some_and(|publication| publication.process_id == Some(pid))
+    }).filter_map(|slot| {
         let id = stack_resources::task_start::read(slot)?.id;
         let target = Target::from_binding(wake_publication::Binding::capture(slot, id)?)?;
         (target.binding.context().process_id == Some(pid)).then_some(target)

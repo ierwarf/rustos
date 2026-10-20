@@ -22,6 +22,8 @@ use super::{
     SchedulerDispatch, TaskRetireReason, ROOT_TASK_SLOT, MAX_TASK, MAX_LATENCY_HANDOFF_HINTS,
     MAX_CONSECUTIVE_LATENCY_HANDOFFS,
 };
+use core::sync::atomic::{AtomicU64, Ordering};
+use nucleus_core::util::{cache_padded::CachePadded, lockdep::MAX_TRACKED_CPUS};
 
 pub(in crate::multitask::scheduler) mod maintenance;
 
@@ -32,7 +34,7 @@ struct Candidate { slot: usize, id: u64, generation: u64, custody: FrameCustody,
 enum Decision { Selected(Candidate), Claimed(Urgency), Empty, Incomplete }
 
 fn local_candidate(slot: usize, cpu: usize, urgency: Urgency) -> Decision {
-    match local_dispatch::qualified_local_handoff_generation(slot, cpu, crate::arch::clock::monotonic_nanos()) {
+    match local_dispatch::qualified_local_handoff_generation(slot, cpu, selection_now(cpu)) {
         Ok(Some(generation)) => match current_identity::read_dispatch(slot).and_then(|p| p.task_id) {
             Some(id) => Decision::Selected(Candidate { slot, id, generation, custody: FrameCustody::Local, urgency }),
             None => Decision::Incomplete,
@@ -123,9 +125,9 @@ fn synchronous(cpu: usize) -> Decision {
             return false;
         }
         let qualification = if record.bound_direct_generation().is_some() {
-            local_dispatch::qualified_direct_handoff_generation(slot, cpu, crate::arch::clock::monotonic_nanos())
+            local_dispatch::qualified_direct_handoff_generation(slot, cpu, selection_now(cpu))
         } else {
-            local_dispatch::qualified_local_handoff_generation(slot, cpu, crate::arch::clock::monotonic_nanos())
+            local_dispatch::qualified_local_handoff_generation(slot, cpu, selection_now(cpu))
         };
         if qualification.ok().flatten().is_none_or(|g| record.bound_direct_generation().is_some_and(|expected| expected != g)) {
             materialize(record, cpu);
@@ -187,12 +189,12 @@ fn hint(cpu: usize, current: usize) -> Decision {
     }
     let slot = hint.slot;
     if local_dispatch::refuse_unproven_hint_priority(local_dispatch::user_hint_blocked_by_system(
-        slot, current, cpu, crate::arch::clock::monotonic_nanos())) { return Decision::Empty; }
+        slot, current, cpu, selection_now(cpu))) { return Decision::Empty; }
     local_candidate(slot, cpu, Urgency::Hint)
 }
 fn fair(cpu: usize, current: usize, voluntary: bool, runtime: u64) -> Result<Option<Candidate>, local_dispatch::LocalFallbackReason> {
     let result = local_dispatch::choose_local_next(cpu, current, voluntary, runtime,
-        crate::arch::clock::monotonic_nanos(), runqueue::local_runnable_sequence(cpu),
+        selection_now(cpu), runqueue::local_runnable_sequence(cpu),
         donation_ledger::class_publication_sequence(), false, false);
     match result {
         Ok((slot, generation)) => {
@@ -222,8 +224,45 @@ pub(super) fn test_policy_choice(turn: &crate::multitask::cpu_local::dispatch_tu
     }
 }
 
+/// One monotonic sample per selection turn. Each priority arm used to read
+/// the clock (an `lfence; rdtsc`) for its own eligibility check, three or four
+/// times per dispatch; within one turn they now share the turn's sample.
+/// Outside `choose` (direct callers and native fixtures) the clock is read.
+static SELECTION_NOW: [CachePadded<AtomicU64>; MAX_TRACKED_CPUS] =
+    [const { CachePadded::new(AtomicU64::new(0)) }; MAX_TRACKED_CPUS];
+
+fn selection_now(cpu: usize) -> u64 {
+    // ORDERING: Relaxed; a CPU-private value written and read by this turn.
+    match SELECTION_NOW.get(cpu).map_or(0, |now| now.load(Ordering::Relaxed)) {
+        0 => crate::arch::clock::monotonic_nanos(),
+        now => now,
+    }
+}
+
+struct SelectionTurn(usize);
+
+impl SelectionTurn {
+    fn begin(cpu: usize) -> Self {
+        if let Some(now) = SELECTION_NOW.get(cpu) {
+            // ORDERING: Relaxed; see `selection_now`.
+            now.store(crate::arch::clock::monotonic_nanos().max(1), Ordering::Relaxed);
+        }
+        Self(cpu)
+    }
+}
+
+impl Drop for SelectionTurn {
+    fn drop(&mut self) {
+        if let Some(now) = SELECTION_NOW.get(self.0) {
+            // ORDERING: Relaxed; see `selection_now`.
+            now.store(0, Ordering::Relaxed);
+        }
+    }
+}
+
 fn choose(turn: &crate::multitask::cpu_local::dispatch_turn::CpuDispatchTurn<'static>, cpu: usize, current: usize, voluntary: bool, runtime: u64, ticks: u64, class_sequence: u64) -> Decision {
     if class_sequence & 1 != 0 { return Decision::Incomplete; }
+    let _turn_clock = SelectionTurn::begin(cpu);
     // Receive the original generation-bound mailbox before any priority arm
     // can return Incomplete. A remote activation prefix is not a Local frame
     // yet; putting this behind that prefix strands its own admission forever.
@@ -234,7 +273,7 @@ fn choose(turn: &crate::multitask::cpu_local::dispatch_turn::CpuDispatchTurn<'st
     match synchronous(cpu) { Decision::Empty => {}, result => return result }
     maintenance::service(turn, cpu, current, voluntary);
     let overdue = local_dispatch::retry_incomplete_policy(|| local_dispatch::choose_overdue_system(
-        cpu, current, ticks, crate::arch::clock::monotonic_nanos(),
+        cpu, current, ticks, selection_now(cpu),
         runqueue::local_runnable_sequence(cpu), donation_ledger::class_publication_sequence()));
     match overdue {
         Ok(Some((slot, generation))) => {

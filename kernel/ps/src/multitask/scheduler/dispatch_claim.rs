@@ -31,8 +31,9 @@ pub(super) struct DispatchFrame<'a> {
     token: frame_publication::StableFrameToken,
     custody: FrameCustody,
     return_to_user: bool,
-    // Original selection observation, qualified only under the ledger leaf
-    // with this non-Copy frame/allocation and original funding, never a pin.
+    // Original selection observation, qualified only inside the per-CPU class
+    // claim section with this non-Copy frame/allocation and original funding,
+    // never a pin.
     class_sequence: u64,
     pin: stack_resources::StackPin,
 }
@@ -166,7 +167,7 @@ impl<'a> DispatchFrame<'a> {
         })
     }
 
-    /// rq40 -> original class45 -> original Context48/Domain49 -> exact
+    /// rq40 -> per-CPU class claim section -> original Context48/Domain49 -> exact
     /// Terminal/Identity/Resources/Placement claim. No raw leaf escapes this
     /// callback; retained non-Copy grants are published only AFTER it returns.
     pub(super) fn with_admission<T>(

@@ -562,9 +562,9 @@ fn acquire_count(cpu: usize, class_index: usize) -> u32 {
 fn running_owner(cpu: usize) -> u64 {
     #[cfg(rustos_boot_image)]
     {
-        super::CURRENT_TASK_OWNER
+        super::CPU_LOCK_STATE
             .get(cpu)
-            .map(|owner| owner.load(Ordering::Acquire))
+            .map(|state| state.current_task_owner.load(Ordering::Acquire))
             .unwrap_or(0)
     }
     #[cfg(not(rustos_boot_image))]
@@ -582,9 +582,9 @@ fn running_owner(cpu: usize) -> u64 {
 fn running_epoch(cpu: usize) -> u32 {
     #[cfg(rustos_boot_image)]
     {
-        super::CURRENT_TASK_EPOCH
+        super::CPU_LOCK_STATE
             .get(cpu)
-            .map(|epoch| epoch.load(Ordering::Relaxed))
+            .map(|state| state.current_task_epoch.load(Ordering::Relaxed))
             .unwrap_or(0)
     }
     #[cfg(not(rustos_boot_image))]
