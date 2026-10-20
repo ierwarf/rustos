@@ -83,7 +83,8 @@ fn transfer(turn: &CpuDispatchTurn<'static>, slot: usize, source: usize, target:
 
 pub(super) fn service(turn: &CpuDispatchTurn<'static>, cpu: usize, current: usize, voluntary: bool) {
     assert!(turn.owns_priority_choice(), "maintenance lacks original choice");
-    let _ = runqueue::drain_remote_wakes(cpu);
+    // Dispatcher already received remote mailboxes before priority selection.
+    // Balance/validation may be deferred by a first-turn prefix, ingress may not.
     let mut selected = None;
     let idle = runqueue::is_idle_slot(current);
     if idle && !local_dispatch::local_fair_competitor_ready(cpu) {

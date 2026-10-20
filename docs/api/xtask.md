@@ -74,8 +74,8 @@ path, and no retired CPU-frame or zero-atlas relay is accepted as a fallback.
 The explicitly non-commercial `--physical-gpu <BDF> --gpu-firmware <TABLE>`
 variant replaces the virtual GPU with one already-bound VFIO function selected
 through the sealed profile registry and disables QEMU networking. The current
-registered profile is AMD `1002:1900`; `--physical-amdgpu` and `--amd-vfct` are
-compatibility aliases. The runner never changes a driver binding or resets the
+registered profile is AMD `1002:1900`. Only the profile-neutral option names
+above are supported. The runner never changes a driver binding or resets the
 device. Readiness still requires a completed real `uiserver` scene submission,
 DVM GPU rendering, DMA-BUF acquire, and physical atomic KMS page-flip; DRM
 initialization or a test pattern is insufficient. QEMU 11.0 or newer, direct
@@ -163,7 +163,7 @@ scanout 증거로 간주하지 않으며, 폐기한 CPU-frame/zero-atlas relay�
 명시적인 비상용 진단 옵션인 `--physical-gpu <BDF> --gpu-firmware <TABLE>`은
 가상 GPU 대신 sealed profile registry가 선택한 이미 `vfio-pci`에 바인딩된 장치를
 연결하고 QEMU 네트워크를 끕니다. 현재 등록된 profile은 AMD `1002:1900`이며
-`--physical-amdgpu`와 `--amd-vfct`는 호환 alias입니다. 실행기는 드라이버 바인딩과
+위의 profile-neutral 옵션만 지원합니다. 실행기는 드라이버 바인딩과
 reset을 변경하지 않습니다. 통과하려면 실제 `uiserver` 장면 제출 완료, DVM GPU
 렌더링, DMA-BUF acquire, 물리 atomic KMS page-flip이 모두 관측되어야 하며 DRM
 초기화나 테스트 패턴만으로는 통과하지 않습니다. QEMU 11.0 이상, 직접 읽기/쓰기가

@@ -80,11 +80,24 @@ fn actual_cross_root_ipc_roundtrip_and_terminal_returns_withdraw_every_born_bank
         let snapshot = original.runtime_snapshot().unwrap();
         assert_eq!((snapshot.executing_task_id, snapshot.context_owner_task_id), (ID + 1, ID));
         drop(original);
+        // The actual fused reply trap commits the server's receive wait BEFORE
+        // entering IRQ dispatch. Use that same original Current CAS here;
+        // leaving the peer runnable would test only generic dispatch again.
+        // SAFETY: entry retains the SAME masked CPU and original Current bank.
+        let wait = unsafe { current_wait::CurrentWait::capture() }.unwrap();
+        assert!(wait.arm(BlockReason::EndpointReceive(ENDPOINT)));
+        assert!(wait.commit());
+        drop(wait);
         // The same reply engine receives explicit earlier Online-CPU input;
         // native has no admitted HAL topology. No owner/claim path is replaced.
-        assert_eq!(ipc_publication::reply_with(entry.preemption(), REPLY, ID, ID,
-            source_context.scheduling_context.identity(), &|_| 1), Some(FastIpcReplyHandoffOutcome::LocalFallback));
-        let (dispatch, fast) = entry.dispatch(runqueue::saved_rsp(peer), true, Some(ID));
+        let outcome = ipc_publication::reply_with(entry.preemption(), REPLY, ID, ID,
+            source_context.scheduling_context.identity(), &|_| 1).unwrap();
+        assert_eq!(outcome, FastIpcReplyHandoffOutcome::LocalFallback);
+        // Derive the hint from the SAME production outcome as the actual trap,
+        // never manually inject Some(ID) and hide a missing hardware route.
+        let (dispatch, fast) = entry.dispatch(runqueue::saved_rsp(peer), true, outcome.dispatch_hint(ID));
+        assert!(fast, "actual successful reverse reply lost its FIFO fast attempt");
+        assert_eq!(FastIpcReplyHandoffOutcome::Rejected.dispatch_hint(ID), None);
         assert_eq!(dispatch.next_slot, source);
         changed(&mut entry, dispatch, fast, 0x4000);
         drop(entry);
@@ -94,6 +107,12 @@ fn actual_cross_root_ipc_roundtrip_and_terminal_returns_withdraw_every_born_bank
         // Terminal source still owns its current interval and banks. Its real
         // dispatch prologue settles that interval; no consume()/fixture reset.
         let mut entry = DispatchEntry::from_scope(scope());
+        // Model an earlier ordinary notification by executing the real wake
+        // engine, not scalar runnable publication. The fused server is now
+        // genuinely blocked, unlike the old split-reply fixture.
+        // SAFETY: entry retains its original masked CPU; the wake engine pins
+        // this exact born peer's binding before changing its wait or queue.
+        assert!(unsafe { wake_publication::guarded(peer, ID + 1, &|_| 1) });
         let stop = terminal_quarantine::begin(source, Some(ID), TaskRetireReason::Exited, false).unwrap();
         // SAFETY: same original entry retains Current and the IRQ mask.
         unsafe { terminal_publication::guarded(stop, &|_| 1); }

@@ -31,6 +31,11 @@ pub const PRODUCT_MILESTONE_SMP_QUALIFICATION_READY: u64 = 7;
 pub const PRODUCT_MILESTONE_SMP_QUALIFICATION_START: u64 = 8;
 pub const PRODUCT_MILESTONE_SMP_QUALIFICATION_FINISH: u64 = 9;
 pub const PRODUCT_MILESTONE_SMP_QUALIFICATION_COMPLETE: u64 = 10;
+/// Supplementary HECS report, bound to the same private Started worker. Value
+/// 11 belongs to bootstrap executable-snapshot sealing, not qualification.
+pub const PRODUCT_MILESTONE_HECS_REGISTERS: u64 = 12;
+pub const SMP_QUALIFICATION_HECS_CHECKS_PER_PATH: u64 = 256;
+pub const SMP_QUALIFICATION_HECS_REGISTER_CHECKS: u64 = 4 * SMP_QUALIFICATION_HECS_CHECKS_PER_PATH;
 pub const SMP_QUALIFICATION_MAX_WORKERS: u32 = 8;
 pub const SMP_QUALIFICATION_MAX_WORK_UNITS: u64 = 10_000_000;
 /// The KVM qualification evidence window is deliberately short and fixed by

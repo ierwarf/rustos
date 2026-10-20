@@ -186,7 +186,7 @@ impl Input {
 pub(in crate::multitask) fn allocate(
     id: u64,
     input: Input,
-    mut bootstrap: UserTaskBootstrap,
+    bootstrap: UserTaskBootstrap,
     parent: Option<u64>,
     pit: u16,
     cs: u64,

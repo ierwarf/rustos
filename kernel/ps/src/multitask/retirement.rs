@@ -12,6 +12,7 @@ pub struct RetiredTaskCleanup {
     pub(super) task_id: u64,
     pub(super) process_id: u64,
     pub(super) process_terminal: bool,
+    pub(super) user_fault_vector: Option<u8>,
     pub(super) clear_child_tid: u64,
     pub(super) robust_list_head: u64,
     pub(super) robust_list_len: u64,
@@ -28,6 +29,11 @@ impl RetiredTaskCleanup {
 
     pub const fn process_terminal(self) -> bool {
         self.process_terminal
+    }
+
+    /// Original terminal producer's fault, not a later lookup of the task.
+    pub const fn user_fault_vector(self) -> Option<u8> {
+        self.user_fault_vector
     }
 
     pub const fn clear_child_tid(self) -> u64 {

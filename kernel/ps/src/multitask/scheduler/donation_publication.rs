@@ -38,17 +38,14 @@ impl Loans {
         } else {
             Some(identity::execution::pin_donation(root_slot, root_id)?)
         };
-        let context = stack_resources::context::read(root_slot)?;
-        if stack_resources::task_start::read(root_slot).map(|start| start.id) != Some(root_id)
-            || !context.scheduling_context.is_bound_to(root_id)
-        {
-            return None;
-        }
+        let context = stack_resources::context::retained_scheduling_context(
+            root.as_ref().unwrap_or(&donor),
+        )?;
         Some(Self {
             donor,
             _root: root,
             basis,
-            context: context.scheduling_context.identity(),
+            context,
         })
     }
     pub(super) fn system_class(&self) -> bool {
@@ -170,7 +167,9 @@ pub(super) fn bind_original(
     let basis = basis.or_else(|| donation_ledger::funding_basis(donor.slot(), donor.id()))?;
     let donor = Loans::from_original(donor, basis)?;
     let loans = ReceiveLoans { donor: &donor, receiver };
-    let bound = if reserved {
+    let bound = if reserved && inherit {
+        donation_ledger::bind_received_owned(&loans, reply, IpcReply)
+    } else if reserved {
         donation_ledger::bind_owned(&loans, reply, IpcReply)
     } else {
         donation_ledger::upsert_owned(&loans, reply, IpcReply)

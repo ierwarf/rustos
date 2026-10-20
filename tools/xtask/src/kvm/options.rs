@@ -379,6 +379,16 @@ fn run_one_smoke(
         }
         .run(&mut rustos, &mut dvm, probe)
     })();
+    let result = failure_snapshot::after_failed_probe(result, || {
+        // Diagnostic HMP is never used for acceptance or physical-device runs.
+        // Preserve the already-latched failure, then stop both guests as usual.
+        if options.physical_gpu_bdf.is_none() {
+            match failure_snapshot::capture(config, &layout, options.rustos_vcpus) {
+                Ok(path) => eprintln!("xtask: failure-only CPU snapshot (possibly partial): {}", path.display()),
+                Err(error) => eprintln!("xtask: could not capture failed guest CPU state: {error:#}"),
+            }
+        }
+    });
     stop_guest(&mut rustos);
     stop_guest(&mut dvm);
     let probe = result?;

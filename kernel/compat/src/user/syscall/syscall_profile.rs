@@ -37,6 +37,7 @@ pub(super) enum SyscallPhase {
 // `Syscall` is compiled out by `config/rustos.toml` (`syscall = "off"`), which
 // silently drops every record in that category. These live under `Compat`,
 // which is where the code is and which the build leaves on.
+#[cfg(rustos_syscall_phase_profile)]
 static PROFILE: PhaseProfile<SYSCALL_PHASE_COUNT> = PhaseProfile::new(
     LogCategory::Compat,
     [

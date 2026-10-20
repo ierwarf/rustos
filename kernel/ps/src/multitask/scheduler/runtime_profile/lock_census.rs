@@ -17,6 +17,7 @@
 //! - **Evidence:** `scheduler-dispatch`; focused threshold and hash witnesses
 //!   are owned by `runtime_profile::tests`.
 
+#[cfg(rustos_lock_phase_profile)]
 const LOCK_CLASS_NAMES: [&str; 6] = [
     "kernel-lock-class-0",
     "kernel-lock-class-1",
@@ -26,6 +27,7 @@ const LOCK_CLASS_NAMES: [&str; 6] = [
     "kernel-lock-class-5",
 ];
 
+#[cfg(rustos_lock_phase_profile)]
 const LOCK_SITE_NAMES: [&str; 6] = [
     "kernel-lock-site-0",
     "kernel-lock-site-1",
@@ -51,6 +53,7 @@ pub(super) fn fnv1a32(value: &str) -> u32 {
     hash
 }
 
+#[cfg(rustos_lock_phase_profile)]
 /// Drains and renders the lock-class census outside scheduler custody.
 pub(super) fn drain_class_and_site_census() {
     let lock_classes = nucleus_core::util::lockdep::work_budget::take_class_census();

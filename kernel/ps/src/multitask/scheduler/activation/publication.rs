@@ -21,11 +21,11 @@ fn caller(turn: &DispatchPreemption, original: usize) {
 
 /// Non-Copy Cohort and physical frame loans survive the callback and every
 /// queue/policy effect. FrameReader holds a count, never a raw Resources leaf.
-pub(super) fn commit(
+pub(super) fn commit<G>(
     mut owner: Activation,
     turn: &DispatchPreemption,
     eligible_cpus: impl Fn(usize) -> u64,
-    commit_authority: impl FnOnce(),
+    commit_authority: impl FnOnce() -> Option<G>,
 ) -> bool {
     let current = super::super::current_terminal::OriginalCurrent::borrow(turn)
         .expect("activation lacks original Current banks/interval");
@@ -93,7 +93,9 @@ pub(super) fn commit(
     }
     // No raw owner leaf is held. These real loans exclude image writes/reclaim
     // and fresh execution, rather than relying on a copied preflight result.
-    commit_authority();
+    let Some(authority) = commit_authority() else { return false; };
+    assert_eq!(nucleus_core::util::lockdep::held_spin_lock_depth(), 0,
+        "activation authority callback retained a raw registry guard");
     current.check();
     caller(turn, original);
     for &(slot, id) in members {
@@ -193,6 +195,9 @@ pub(super) fn commit(
     drop(readers);
     drop(pins);
     current.check();
+    // The original non-Copy grant, like Current and Cohort custody, survives
+    // every queue/prefix effect. No scalar relookup replaces its lifetime.
+    drop(authority);
     true
 }
 

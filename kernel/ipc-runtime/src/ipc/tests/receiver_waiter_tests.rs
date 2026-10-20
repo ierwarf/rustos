@@ -75,3 +75,25 @@ fn endpoint_system_calls_bypass_backlog_without_starving_ordinary_lane() {
         );
     });
 }
+
+#[test]
+fn refused_wake_restores_the_popped_receiver_for_the_next_call() {
+    with_isolated_ipc_test(|| {
+        let endpoint = super::super::create_endpoint().expect("create endpoint");
+        super::super::add_endpoint_receiver_waiter(endpoint, 99).expect("add waiter");
+        let (reply, receiver) =
+            super::super::enqueue_endpoint_call(endpoint, 1, b"refused").expect("enqueue call");
+        assert_eq!(receiver, Some(99));
+        // The scheduler refused that wake; the caller withdraws its request.
+        super::super::cancel_endpoint_call_with_transfers(reply, 1).expect("cancel");
+        let (_lost, receiver) =
+            super::super::enqueue_endpoint_call(endpoint, 2, b"lost").expect("enqueue lost");
+        assert_eq!(receiver, None, "the popped receiver is no longer published");
+
+        assert_eq!(super::super::restore_endpoint_receiver_waiter(endpoint, 99), Ok(true));
+        assert_eq!(super::super::restore_endpoint_receiver_waiter(endpoint, 99), Ok(false));
+        let (_reply, receiver) =
+            super::super::enqueue_endpoint_call(endpoint, 3, b"next").expect("enqueue next");
+        assert_eq!(receiver, Some(99), "the next call must wake the restored receiver");
+    });
+}

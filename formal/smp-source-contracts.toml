@@ -191,14 +191,14 @@ tokens = ["fn prepare_exec", "writer.exec_stack_top(slot, id)", "LINUX_THREAD_ST
 # Activation and mask replacement join the same per-slot admission leaf.
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/activation.rs"
-tokens = ["struct Activation", "members: [(usize, u64); CAP]", "fn capture(", "Cohort::begin_activation(members)?", "captured[..members.len()].copy_from_slice(members)", "members: captured", "fn commit_owned(", "publication::commit(self, turn, eligible_cpus, commit_authority)"]
+tokens = ["struct Activation", "members: [(usize, u64); CAP]", "fn capture(", "Cohort::begin_activation(members)?", "captured[..members.len()].copy_from_slice(members)", "members: captured", "fn commit_owned(", "publication::commit(self, turn, eligible_cpus, || Some(commit_authority()))"]
 [[forbidden_patterns]]
 scope = "kernel/ps/src/multitask/scheduler/activation/publication.rs"
 regex = '(Scheduler::|scheduler_mut|scheduler_ref|SCHEDULER|TrackedSpinLock|find_user_task_slot|find_task_slot)'
 reason = "Complete activation uses immutable captured physical members/frame loans and existing per-CPU leaves, not a facade, ID rescan or global serializer."
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/activation/publication.rs"
-tokens = ["fn caller(", "turn.cpu()", "current_cpu_task_slot()", "assert!(stack_resources::cpu_leases::owns_current(", "turn.cpu(),", "original", "fn commit(", "caller(turn, original)", "&owner.members[..owner.len]", "lifecycle.retired || !lifecycle.suspended", "task_slot_is_running(slot)", "context::read(slot)", "scheduling_context.is_bound_to(id)", "observed_frame_token(slot, turn.cpu(), false)", "pin_for_identity(token, id)", "pins[i] = Some(pin)", "let mut readers", "frame_readers::acquire(", "current.frame_epoch != token.frame_epoch", "context_validation::validate_published_saved_context(", "readers[i] = Some(reader)", "commit_authority()", "caller(turn, original)", "identity::lifecycle(slot).suspended", "task_slot_is_running(slot)", "owner.cohort.begin_effects()", "atomic_activation_handoff_remaining == 0", "owner.cohort.unsuspend(slot, id)", "if lifecycle.retired", "kernel_creation::ready_floor(turn.cpu(), Some(system))", "raise_vruntime_floor(", "SLEEPER_LATENCY_BONUS_NS", "set_blocked(slot, false)", "set_armed(slot, false)", "lifecycle.job_stopped || lifecycle.exec_quiesced", "affinity_target_cpu(slot, eligible_cpus(slot))", "publish_local_wake(", "publish_remote_wake(", "identity::lifecycle(slot).retired", "runqueue::owner(slot).runnable", "request_target_reschedule(", "enqueue_priority(&mut policy, record)", "publish_atomic_activation_pending(target)", "spawn_pick_hints", "donate_floor(slot, &current, turn.cpu(), system)", "owner.cohort.complete()", "caller(turn, original)", "drop(readers)", "drop(pins)", "fn donate_floor(", "published_candidate_admission(", "ready_floor(cpu, Some(system))", "caller_floor.min(class_floor.saturating_sub(IPC_DONATION_BONUS_NS))", "lower_vruntime_ceiling("]
+tokens = ["fn caller(", "turn.cpu()", "current_cpu_task_slot()", "assert!(stack_resources::cpu_leases::owns_current(", "turn.cpu(),", "original", "fn commit<G>(", "caller(turn, original)", "&owner.members[..owner.len]", "lifecycle.retired || !lifecycle.suspended", "task_slot_is_running(slot)", "context::read(slot)", "scheduling_context.is_bound_to(id)", "observed_frame_token(slot, turn.cpu(), false)", "pin_for_identity(token, id)", "pins[i] = Some(pin)", "let mut readers", "frame_readers::acquire(", "current.frame_epoch != token.frame_epoch", "context_validation::validate_published_saved_context(", "readers[i] = Some(reader)", "commit_authority()", "caller(turn, original)", "identity::lifecycle(slot).suspended", "task_slot_is_running(slot)", "owner.cohort.begin_effects()", "atomic_activation_handoff_remaining == 0", "owner.cohort.unsuspend(slot, id)", "if lifecycle.retired", "kernel_creation::ready_floor(turn.cpu(), Some(system))", "raise_vruntime_floor(", "SLEEPER_LATENCY_BONUS_NS", "set_blocked(slot, false)", "set_armed(slot, false)", "lifecycle.job_stopped || lifecycle.exec_quiesced", "affinity_target_cpu(slot, eligible_cpus(slot))", "publish_local_wake(", "publish_remote_wake(", "identity::lifecycle(slot).retired", "runqueue::owner(slot).runnable", "request_target_reschedule(", "enqueue_priority(&mut policy, record)", "publish_atomic_activation_pending(target)", "spawn_pick_hints", "donate_floor(slot, &current, turn.cpu(), system)", "owner.cohort.complete()", "caller(turn, original)", "drop(readers)", "drop(pins)", "fn donate_floor(", "published_candidate_admission(", "ready_floor(cpu, Some(system))", "caller_floor.min(class_floor.saturating_sub(IPC_DONATION_BONUS_NS))", "lower_vruntime_ceiling("]
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/kernel_creation.rs"
 tokens = ["fn creation_floor(", "ready_floor(cpu, None).saturating_add(SCHED_NEW_TASK_VRUNTIME_PENALTY_NS)", "fn ready_floor(", "runqueue::local_runnable_slots(cpu)", "SYSTEM_CLASS_WEIGHT_FLAG", "donation_ledger::inherited_system(slot)", "system.is_some_and(|expected| expected != candidate_system)", "published_candidate_admission(", "local_frame_token(", "pin_for_identity(token, id)", "frame_readers::acquire(", "validate_published_saved_context(", "token_is_current(", "floor.unwrap_or(0)"]
@@ -208,7 +208,7 @@ tokens = ["fn with_affinity_replacement", "with_writer(slot", "writer.bound_task
 
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/activation.rs"
-tokens = ["fn activate<F>", "scheduler_initialized()", "DispatchPreemption::enter()", "turn.mask_irqs()", "current_identity::read(slot)", "Activation::capture", "owner.commit_owned(", "&turn", "runqueue_policy::online_affinity_mask", "flush_deferred_target_reschedules()"]
+tokens = ["fn activate<G, F>", "scheduler_initialized()", "DispatchPreemption::enter()", "turn.mask_irqs()", "current_identity::read(slot)", "Activation::capture", "publication::commit(", "owner,", "&turn", "runqueue_policy::online_affinity_mask", "flush_deferred_target_reschedules()"]
 
 [[forbidden_patterns]]
 scope = "kernel/ps/src/multitask/scheduler/activation.rs"
@@ -772,9 +772,10 @@ tokens = [
 ]
 
 [[required_sequences]]
-path = "kernel/io-manager/src/io/dvm_display.rs"
+path = "kernel/io-manager/src/io/dvm_display/installation.rs"
 tokens = [
     "let Some(interrupt_install) = arm_gui_dvm_interrupts(pool.device)",
+    "signal_gui_dvm(2);",
     "INSTALLED.store(true, Ordering::Release);",
     "interrupt_install.retain_permanent();",
 ]
@@ -1106,9 +1107,15 @@ tokens = [
     "let authority = DeferredActivationAuthority {",
     "qualification_required,",
     "pub(super) fn syscall_linux_rustos_proc_activate_broker",
-    "prepare_smp_qualification_activation(",
-    "authority.qualification_required,",
     "activate_suspended_user_tasks_with_commit(",
+    "let mut activations = DEFERRED_ACTIVATIONS.lock();",
+    "deferred_spawn_authority_matches(&activations, args.target_pid, owner, target)",
+    "activations.get(&args.target_pid).unwrap().qualification_required",
+    "prepare_smp_qualification_activation(",
+    "owner, target, required,",
+    "deferred_activation::take_exact::<1, _, MAX_DEFERRED_ACTIVATIONS>(",
+    "drop(activations);",
+    "Some(grant)",
     "abort_smp_qualification_activation(target);",
 ]
 
@@ -1139,9 +1146,12 @@ tokens = [
     "&& deferred_authority_is_batch_eligible(qualification_required)",
     "syscall_linux_rustos_proc_activate_batch_broker",
     "let mut exact_targets = [None; LOADER_ACTIVATE_BATCH_MAX_TARGETS];",
-    "let mut activations = DEFERRED_ACTIVATIONS.lock();",
-    "deferred_authority_matches_exact_batch_request(",
     "activate_suspended_user_tasks_with_commit(targets, ||",
+    "let mut activations = DEFERRED_ACTIVATIONS.lock();",
+    "deferred_activation::take_exact::<LOADER_ACTIVATE_BATCH_MAX_TARGETS, _, MAX_DEFERRED_ACTIVATIONS>(",
+    "deferred_authority_matches_exact_batch_request(",
+    "drop(activations);",
+    "grant",
 ]
 
 [[required_sequences]]
@@ -1351,7 +1361,7 @@ tokens = ["fn first_turn(", "FirstTurnHandoff { slot, task_id }", "local_candida
 # Exact original claim separately revalidates physical CPU/frame/funding custody.
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/local_dispatch.rs"
-tokens = ["fn published_candidate_admission(", "current_identity::read_dispatch(slot)", "LocalFallbackReason::PublicationUnavailable", "publication.task_id.is_none()", "published_affinity_admission(slot, cpu)", "stable_local_admission_rejected(", "publication.lifecycle_dispatchable()", "return Ok(false)", "affinity_admission.is_none()", "LocalFallbackReason::CustodyUnavailable", "effective_charge_admission(slot, publication.pager_charge, cpu, now_ns)", "None => Err(LocalFallbackReason::LifecycleIneligible)"]
+tokens = ["fn published_candidate_admission(", "current_identity::read_dispatch(slot)", "LocalFallbackReason::PublicationUnavailable", "publication.task_id.is_none()", "published_affinity_admission(slot, cpu, false)", "stable_local_admission_rejected(", "publication.lifecycle_dispatchable()", "return Ok(false)", "affinity_admission.is_none()", "LocalFallbackReason::CustodyUnavailable", "effective_charge_admission(slot, publication.pager_charge, cpu, now_ns)", "None => Err(LocalFallbackReason::LifecycleIneligible)"]
 
 # Production budget preparation binds the selected task's published context
 # identity (or exact borrowed donor token) to the live Context -> Domain
@@ -1573,7 +1583,7 @@ tokens = [
 # current/idle owner (or marks an unavailable idle frame stale).
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/dispatcher.rs"
-tokens = ["fn choose(", "dispatch_policy::atomic_activation_pending(cpu)", "first_turn(turn, cpu, true, class_sequence)", "match synchronous(cpu)", "let overdue = local_dispatch::retry_incomplete_policy(|| local_dispatch::choose_overdue_system(", "runqueue::local_runnable_sequence(cpu), donation_ledger::class_publication_sequence()", "Err(_) => return Decision::Incomplete", "first_turn(turn, cpu, false, class_sequence)", "match latency(cpu)", "local_dispatch::user_reservation_due(cpu)", "class_sequence & 1 != 0", "match retry_fair(", "donation_ledger::class_publication_sequence() != class_sequence", "Ok(local_dispatch::LocalClass::User) => return Decision::Selected(candidate)", "Err(_) => return Decision::Incomplete", "match hint(cpu, current)", "match retry_fair("]
+tokens = ["fn choose(", "runqueue::drain_remote_wakes(cpu)", "dispatch_policy::atomic_activation_pending(cpu)", "first_turn(turn, cpu, true, class_sequence)", "match synchronous(cpu)", "let overdue = local_dispatch::retry_incomplete_policy(|| local_dispatch::choose_overdue_system(", "runqueue::local_runnable_sequence(cpu), donation_ledger::class_publication_sequence()", "Err(_) => return Decision::Incomplete", "first_turn(turn, cpu, false, class_sequence)", "match latency(cpu)", "local_dispatch::user_reservation_due(cpu)", "class_sequence & 1 != 0", "match retry_fair(", "donation_ledger::class_publication_sequence() != class_sequence", "Ok(local_dispatch::LocalClass::User) => return Decision::Selected(candidate)", "Err(_) => return Decision::Incomplete", "match hint(cpu, current)", "match retry_fair("]
 
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/local_dispatch/fair_retry.rs"
@@ -1754,7 +1764,12 @@ tokens = [
     "stack_resources::cpu_leases::initialize(image)",
     "CURRENT_TASK_ACTIVE[logical_index].store(true, Ordering::Release)",
     "pub(super) extern \"C\" fn commit_context_switch()",
+    'asm!("mov {}, rsp"',
+    "let observed_rsp = Some(rsp)",
+    "commit_context_switch_at_rsp(logical_index, observed_rsp)",
+    "fn commit_context_switch_at_rsp(",
     "dispatch_turn::begin_commit(logical_index)",
+    "commit.assert_arrived(logical_index, rsp)",
     "TRANSITION_ACTIVE[logical_index].store(false, Ordering::Release)",
     "stack_resources::cpu_leases::commit(logical_index)",
     "current_identity::execution::banks::commit(logical_index)",
@@ -1965,16 +1980,16 @@ tokens = [
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/local_dispatch.rs"
 tokens = [
-    "fn published_affinity_admission(slot: usize, cpu: usize) -> Option<bool> {",
-    "if migration_pending {",
+    "fn published_affinity_admission(slot: usize, cpu: usize, retain_current: bool) -> Option<bool> {",
+    "if task_mask == 0 || process_mask == 0 || (retain_current && migration_pending) {",
     "return None;",
     "affinity_masks_allow_cpu(task_mask, process_mask, cpu)",
     "fn current_can_keep_running(slot: usize, cpu: usize, now_ns: u64) -> bool {",
-    "&& published_affinity_admission(slot, cpu) == Some(true)",
+    "&& published_affinity_admission(slot, cpu, true) == Some(true)",
     "fn published_candidate_admission(",
     "if publication.task_id.is_none() {",
     "return Err(LocalFallbackReason::PublicationUnavailable);",
-    "let affinity_admission = published_affinity_admission(slot, cpu);",
+    "let affinity_admission = published_affinity_admission(slot, cpu, false);",
     "rustos_scheduler_frame_gate::stable_local_admission_rejected(",
     "return Ok(false);",
     "if affinity_admission.is_none() {",
@@ -2353,11 +2368,11 @@ tokens = ["fn complete(mut self)", "self.publish_admission();", "self.unseal();"
 
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/activation.rs"
-tokens = ["members.len() > CAP", "distinct_nonzero_ids(members.iter()", "Cohort::begin_activation(members)?", "fn commit_owned(", "publication::commit(self, turn, eligible_cpus, commit_authority)"]
+tokens = ["members.len() > CAP", "distinct_nonzero_ids(members.iter()", "Cohort::begin_activation(members)?", "fn commit_owned(", "publication::commit(self, turn, eligible_cpus, || Some(commit_authority()))"]
 
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/activation/publication.rs"
-tokens = ["OriginalCurrent::borrow(turn)", "let original = current.member().0", "frame_publication::pin_for_identity(token, id)", "stack_resources::frame_readers::acquire(pin.as_ref().unwrap(), turn.cpu())", "commit_authority();", "current.check();", "owner.cohort.begin_effects();", "owner.cohort.unsuspend(slot, id)", "runqueue::publish_local_wake(slot, target, weight)", "handoff_queue::FirstTurnHandoff { slot, task_id: id }", "Publication::begin(turn, target)", "super::enqueue_priority(&mut policy, record)", ".spawn_pick_hints", ".enqueue(record)", "donate_floor(slot, &current, turn.cpu(), system)", "owner.cohort.complete();", "drop(readers);", "drop(pins);", "current.check();"]
+tokens = ["OriginalCurrent::borrow(turn)", "let original = current.member().0", "frame_publication::pin_for_identity(token, id)", "stack_resources::frame_readers::acquire(pin.as_ref().unwrap(), turn.cpu())", "let Some(authority) = commit_authority() else { return false; };", "held_spin_lock_depth()", "current.check();", "owner.cohort.begin_effects();", "owner.cohort.unsuspend(slot, id)", "runqueue::publish_local_wake(slot, target, weight)", "handoff_queue::FirstTurnHandoff { slot, task_id: id }", "Publication::begin(turn, target)", "super::enqueue_priority(&mut policy, record)", ".spawn_pick_hints", ".enqueue(record)", "donate_floor(slot, &current, turn.cpu(), system)", "owner.cohort.complete();", "drop(readers);", "drop(pins);", "current.check();"]
 
 [[required_sequences]]
 path = "kernel/ps/src/multitask/process_placement.rs"
@@ -3330,6 +3345,15 @@ scope = "kernel/ps/src/multitask/scheduler*.rs"
 regex = 'fn complete_pager_fault_wake_handoff'
 reason = "Actual pager reply borrows one original typed wait phase through queue/FIFO, not legacy reason-check plus generic wake."
 
+# Ordinary kernel workers park their continuation, never halt a CPU with ready work.
+[[required_sequences]]
+path = "kernel/executive/src/tasks.rs"
+tokens = ["fn nucleus_housekeeping_task", "finish_background_turn(work, ps_api::yield_now, idle_tick_wait);", "fn nucleus_pager_fault_refill_task", "finish_background_turn(work, ps_api::yield_now, idle_tick_wait);", "fn idle_tick_wait()", "kernel_hal::api::arch::rtc::sleep(1);", "fn finish_background_turn", "if work == 0", "idle_wait();", "else", "yield_now();"]
+[[forbidden_patterns]]
+scope = "kernel/executive/src/tasks.rs"
+regex = 'enable_and_hlt|instructions::hlt'
+reason = "Only the CPU idle owner may halt; ordinary housekeeping/refill tasks use original RTC block/wake custody instead of a post-yield CPU halt."
+
 # Original CPU owner, not legacy mutex/counter snapshot, protects these entries.
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/exec_transaction/quiescence.rs"
@@ -3409,13 +3433,19 @@ path = "kernel/ps/src/multitask/current_identity/execution.rs"
 tokens = ["fn pin_donation(", "retirement_cleanup::with_wake_binding(slot", "with_writer(slot, |writer|", "writer.lifecycle.retired || writer.exec_intent.is_some()", "return None", "pin_binding(slot, writer, id)"]
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/donation_publication.rs"
-tokens = ["struct Loans", "donor: identity::execution::BindingPin", "_root: Option<identity::execution::BindingPin>", "fn capture(", "participant(id)?", "funding_basis(donor.slot(), donor.id())?", "Self::from_original(donor, basis)", "fn from_original(", "basis.root()", "pin_donation(root_slot, root_id)?", "context::read(root_slot)?", "task_start::read(root_slot)", "is_bound_to(root_id)", "scheduling_context.identity()", "fn participant(", "pin_donation(slot, id)", "task_directory::hint(id)", "(0..MAX_TASK).find_map(inspect)", "fn scope_valid(", "scope.is_masked()", "scope.cpu() == nucleus_core::util::lockdep::current_cpu_index()"]
+tokens = ["struct Loans", "donor: identity::execution::BindingPin", "_root: Option<identity::execution::BindingPin>", "fn capture(", "participant(id)?", "funding_basis(donor.slot(), donor.id())?", "Self::from_original(donor, basis)", "fn from_original(", "basis.root()", "pin_donation(root_slot, root_id)?", "context::retained_scheduling_context(", "root.as_ref().unwrap_or(&donor)", "_root: root", "context,", "fn participant(", "pin_donation(slot, id)", "task_directory::hint(id)", "(0..MAX_TASK).find_map(inspect)", "fn scope_valid(", "scope.is_masked()", "scope.cpu() == nucleus_core::util::lockdep::current_cpu_index()"]
+[[required_sequences]]
+path = "kernel/ps/src/multitask/scheduler/stack_resources/context.rs"
+tokens = ["fn retained_scheduling_context(", "pin: &crate::multitask::current_identity::execution::BindingPin", "RESOURCES.get(pin.slot())?.with", "resources.start?.id != pin.id()", "resources.context?", "!context.scheduling_context.is_bound_to(pin.id())", "Some(context.scheduling_context.identity())"]
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/donation_ledger.rs"
 tokens = ["struct FundingBasis", "source: Option<FundingSource>", "fn source_live(", "find_reply(source.reply, source.namespace)", "entry.donation.custody_active", "context_owner_task_id == source.root_id", "context_owner_slot == source.root_slot", "receiver_slot == Some(source.receiver_slot)", "BoundWorker(source.receiver_id)", "fn current_basis_live(", "basis_live(ledger, basis)", "basis_locked(ledger, basis.donor_slot, basis.donor_id).as_ref() == Some(basis)", "fn reserve_owned(loans: &super::donation_publication::Loans", "loans.basis()", "DONATION_LEDGER.lock()", "!current_basis_live(&ledger, basis)", "Some(*basis)", "fn bind_owned(loans: &super::donation_publication::ReceiveLoans", "!basis_live(&ledger, basis)", "!= Ok(Some(*basis))", "bind_reserved_locked", "loans.receiver.id()", "loans.receiver.slot()"]
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/donation_publication.rs"
-tokens = ["fn bind_with(", "participant(donor_id)", "participant(receiver_id)", "bind_original(scope, reply, donor, &receiver, inherit)", "fn bind_original(", "receiver: &identity::execution::BindingPin", "!scope_valid(scope)", "bind_basis(reply, IpcReply, donor.slot(), donor.id())", "Ok(Some(basis))", "Ok(None) if inherit", "_ => return None", "let reserved = basis.is_some()", "Loans::from_original(donor, basis)", "ReceiveLoans { donor: &donor, receiver }", "if reserved", "bind_owned(&loans, reply, IpcReply)", "upsert_owned(&loans, reply, IpcReply)", "bound.then_some(donor)"]
+tokens = ["fn bind_with(", "participant(donor_id)", "participant(receiver_id)", "bind_original(scope, reply, donor, &receiver, inherit)", "fn bind_original(", "receiver: &identity::execution::BindingPin", "!scope_valid(scope)", "bind_basis(reply, IpcReply, donor.slot(), donor.id())", "Ok(Some(basis))", "Ok(None) if inherit", "_ => return None", "let reserved = basis.is_some()", "Loans::from_original(donor, basis)", "ReceiveLoans { donor: &donor, receiver }", "if reserved && inherit", "bind_received_owned(&loans, reply, IpcReply)", "else if reserved", "bind_owned(&loans, reply, IpcReply)", "upsert_owned(&loans, reply, IpcReply)", "bound.then_some(donor)"]
+[[required_sequences]]
+path = "kernel/ps/src/multitask/scheduler/donation_ledger.rs"
+tokens = ["fn bind_received_owned(", "loans.donor.basis()", "DONATION_LEDGER.lock()", "!basis_live(&ledger, basis)", "bind_basis_locked(", "!= Ok(Some(*basis))", "previous.donation.custody_active", "loans.receiver.slot()", "loans.receiver.id()", "upsert_locked(", "basis.root_id, basis.root_slot", "previous.donation.priority_donated, Some(*basis)", "bind_reserved_locked("]
 [[forbidden_patterns]]
 scope = "kernel/ps/src/multitask/scheduler/donation_publication.rs"
 regex = 'scheduler_(?:mut|ref)|Scheduler::|current_cpu_task_slot|derived_identity|preemption_snapshot'

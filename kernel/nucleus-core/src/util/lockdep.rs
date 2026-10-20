@@ -1262,14 +1262,6 @@ fn with_task_stack<R>(
     Some(f(unsafe { &mut *entry.stack.get() }))
 }
 
-#[cfg(rustos_boot_image)]
-fn task_stack_depth(owner: u64) -> usize {
-    if owner == 0 {
-        return 0;
-    }
-    with_task_stack(owner, false, |stack| stack.len).unwrap_or(0)
-}
-
 /// Deregisters the slot the caller already located.
 #[cfg(rustos_boot_image)]
 fn release_task_stack_at(index: usize, entry: &'static TaskHeldStack) {

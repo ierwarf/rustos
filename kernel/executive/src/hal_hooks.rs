@@ -364,7 +364,9 @@ pub fn register() {
         arm_block_current_task: Some(ps_api::arm_block_current_task),
         cancel_block_current_task: Some(ps_api::cancel_block_current_task),
         commit_block_current_task_and_yield: Some(ps_api::commit_block_current_task_and_yield),
-        wake_user_task: Some(ps_api::wake_user_task),
+        // RTC records current_task_id, not a user-qualified identity. Kernel
+        // reply consumers need the same exact-deadline recovery notification.
+        wake_task: Some(ps_api::wake_task),
         yield_now: Some(ps_api::yield_now),
     });
     hal_api::register_interrupt_hooks(hal_api::InterruptHooks {

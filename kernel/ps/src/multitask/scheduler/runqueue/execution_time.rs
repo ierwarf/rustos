@@ -10,13 +10,6 @@ pub(super) fn clear(slot: usize) {
     set(slot, 0);
 }
 
-pub(in crate::multitask) fn value(slot: usize) -> u64 {
-    EXEC_START_LOCAL_NS
-        .get(slot)
-        .expect("scheduler local execution baseline slot exceeds capacity")
-        .load(Ordering::Acquire)
-}
-
 pub(in crate::multitask) fn set(slot: usize, value: u64) {
     EXEC_START_LOCAL_NS
         .get(slot)

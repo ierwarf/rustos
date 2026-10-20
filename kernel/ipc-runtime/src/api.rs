@@ -170,6 +170,12 @@ pub mod endpoint {
         crate::ipc::endpoint_reply_custody_returned(reply, caller_task_id)
     }
 
+    /// Observes actual queued-request consumption with the original live
+    /// caller custody; this does not bind a worker or grant execution.
+    pub fn received_request_retains_custody(reply: KernelReplyHandle, caller_task_id: u64) -> bool {
+        crate::ipc::received_request_retains_custody(reply, caller_task_id)
+    }
+
     /// Binds broker-prepared descriptors to one live reply owned by the exact
     /// receiving process.  On error, the returned error retains descriptor
     /// ownership for the broker's unpublished-object rollback path.
@@ -370,6 +376,15 @@ pub mod endpoint {
         crate::ipc::remove_endpoint_waiter_for_task(endpoint, task_id)
     }
 
+    /// Republishes a receiver popped by a call whose wake was refused; see
+    /// `crate::ipc::restore_endpoint_receiver_waiter`.
+    pub fn restore_receiver_waiter(
+        endpoint: KernelEndpointHandle,
+        task_id: u64,
+    ) -> Result<bool, IpcError> {
+        crate::ipc::restore_endpoint_receiver_waiter(endpoint, task_id)
+    }
+
     pub fn fail_owned_by_task(task_id: u64, err: IpcError) -> EndpointWakeSet {
         crate::ipc::fail_endpoints_owned_by_task(task_id, err)
     }
@@ -441,6 +456,7 @@ pub use endpoint::{
     recv_with_sender_and_limits as recv_endpoint_with_sender_and_limits,
     remove_waiter_for_task as remove_endpoint_waiter_for_task,
     remove_waiters_for_task as remove_endpoint_waiters_for_task, reply as complete_endpoint_reply,
+    restore_receiver_waiter as restore_endpoint_receiver_waiter,
     reply_custody_returned as endpoint_reply_custody_returned,
     reply_for_process as complete_endpoint_reply_for_process,
     reply_for_process_with_custody as complete_endpoint_reply_for_process_with_custody,

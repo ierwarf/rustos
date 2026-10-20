@@ -151,6 +151,7 @@ fn actual_irq_unmasked_scope_refuses_before_current_or_frame_effects() {
 #[test]
 fn actual_irq_fast_producer_claim_and_changed_return_keep_both_born_banks_until_rsp_ack() {
     current_with_peer(true, |slot, peer| {
+        let hardware_arrivals = rsp_handoff::hardware_rsp_arrivals(0);
         let peer = peer.unwrap();
         runqueue::wait::set_reason(peer, runqueue::wait::REASON_ENDPOINT_RECEIVE, 131000);
         runqueue::wait::set_blocked(peer, true);
@@ -189,6 +190,23 @@ fn actual_irq_fast_producer_claim_and_changed_return_keep_both_born_banks_until_
         assert_eq!(dispatch_turn::test_phase(0), 3, "original scope must park until incoming RSP");
         assert!(stack_resources::cpu_leases::owns_current(0, peer));
         assert!(!stack_resources::cpu_leases::owns_prepared(0, peer));
+        // Actual callback algorithm, with invalid machine observations supplied
+        // explicitly by this native model. Neither original bank may be ACKed.
+        for wrong_rsp in [0, runqueue::saved_rsp(slot), usize::MAX] {
+            let rejected = std::panic::catch_unwind(|| {
+                commit_context_switch_at_rsp(0, Some(wrong_rsp));
+            });
+            assert!(rejected.is_err(), "old/foreign RSP must fail before lifetime ACK");
+            assert_eq!(dispatch_turn::test_phase(0), 4, "refusal quarantines the turn");
+            assert!(stack_resources::cpu_leases::owns_outgoing(0, slot));
+            assert!(stack_resources::cpu_leases::owns_current(0, peer));
+            assert!(current_identity::execution::banks::owns_outgoing(0, slot));
+            assert!(current_identity::execution::banks::owns_current(0, peer));
+            assert_eq!(task_execution_owner(slot), Some(TaskExecutionOwner::Transition(0)));
+            // Isolated model retry retains the SAME parked MM/placement/scope
+            // and seal. Production has no poison recovery.
+            dispatch_turn::test_retry_refused_arrival(0);
+        }
         // Only arrival on incoming RSP is an external native input. The actual
         // ACK callback now drains the real outgoing allocation/UID banks.
         commit_context_switch();
@@ -196,6 +214,8 @@ fn actual_irq_fast_producer_claim_and_changed_return_keep_both_born_banks_until_
         assert!(task_execution_owner(slot).is_none());
         assert_eq!(dispatch_turn::test_phase(0), 0);
         assert!(matches!(execution_interval::consume(0, peer, ID + 1), execution_interval::ConsumedInterval::Active(_)));
+        assert_eq!(rsp_handoff::hardware_rsp_arrivals(0), hardware_arrivals,
+            "modeled native RSP must never increase hardware execution evidence");
         donation_ledger::release_task(ID);
         donation_ledger::release_task(ID + 1);
         sync_handoff::remove_slot_all_cpus(peer);

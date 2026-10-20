@@ -59,7 +59,7 @@ impl Activation {
         eligible_cpus: impl Fn(usize) -> u64,
         commit_authority: impl FnOnce(),
     ) -> bool {
-        publication::commit(self, turn, eligible_cpus, commit_authority)
+        publication::commit(self, turn, eligible_cpus, || Some(commit_authority()))
     }
 }
 // Bounded input preflight, NOT binding or execution authority. Both entrances
@@ -74,10 +74,12 @@ fn distinct_nonzero_ids(ids: impl Iterator<Item = u64>) -> bool {
     }
     true
 }
-pub(in crate::multitask) fn activate<F>(ids: &[u64], commit_authority: F) -> bool
+pub(in crate::multitask) fn activate<G, F>(ids: &[u64], commit_authority: F) -> bool
 where
-    F: FnOnce(),
+    F: FnOnce() -> Option<G>,
 {
+    // Bound the public ID list before indexing the fixed original-member array.
+    if ids.len() > CAP { return false; }
     assert!(
         crate::multitask::cpu_local::scheduler_initialized(),
         "activation preceded complete initial image"
@@ -102,7 +104,8 @@ where
     let Some(owner) = Activation::capture(&members[..ids.len()]) else {
         return false;
     };
-    let activated = owner.commit_owned(
+    let activated = publication::commit(
+        owner,
         &turn,
         super::runqueue_policy::online_affinity_mask,
         commit_authority,

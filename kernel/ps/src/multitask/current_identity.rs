@@ -981,6 +981,48 @@ mod tests {
     }
 
     #[test]
+    fn actual_current_pager_fault_keeps_original_bank_identity_during_metadata_publication() {
+        use crate::multitask::{current, scheduler::root_creation};
+        use rustos_user_abi::pager::*;
+        let resolved = core::cell::Cell::new(false);
+        let id = 132001;
+        root_creation::tests::exec_root(id, true,
+            root_creation::tests::bootstrap(UserAbi::Linux), |slot, handle| {
+                let (task_id, bound_handle, process) = current::test_current_pager_binding().unwrap();
+                assert_eq!((task_id, bound_handle), (id, handle));
+                let start = crate::memory::paging::USER_SPACE_BASE + 0x60_000;
+                let template = PagerVmRegionWire {
+                    start, end: start + PAGER_PAGE_BYTES,
+                    object: PagerObjectIdentityWire {
+                        object_type: VM_OBJECT_ANONYMOUS, rights: VM_PROT_READ | VM_PROT_WRITE,
+                        slot: 17, generation: 19, pager_epoch: 23, backing_generation: 29,
+                        ..PagerObjectIdentityWire::default()
+                    },
+                    prot: VM_PROT_READ | VM_PROT_WRITE, sharing: VM_SHARING_PRIVATE,
+                    commit_state: VM_COMMIT_COMMITTED,
+                    fault_endpoint: PagerEndpointCapabilityWire { slot: 31, generation: 37, rights: 1 },
+                    ..PagerVmRegionWire::default()
+                };
+                let region = super::super::pager_vma::publish(handle, process, template, 1).unwrap();
+                assert!(super::super::pager_vma::lookup(handle, process, start, VM_ACCESS_WRITE).is_ok());
+                let cell = &IDENTITIES[slot];
+                let before = cell.version.load(Ordering::Relaxed);
+                // Native input models the earlier metadata writer interval;
+                // the actual born Current bank, process/MM and VMA stay owned.
+                cell.version.store(before + 1, Ordering::Release);
+                assert!(read(slot).is_none());
+                let observed = current::test_current_pager_binding().and_then(|(task, handle, process)| {
+                    super::super::pager_vma::lookup(handle, process, start, VM_ACCESS_WRITE)
+                        .ok().map(|fault| (task, fault))
+                });
+                cell.version.store(before, Ordering::Release);
+                resolved.set(observed == Some((id, region)));
+                super::super::pager_vma::revoke(handle, process, start, region.vma_generation).unwrap();
+            });
+        assert!(resolved.get(), "odd metadata publication is not an unmapped user page");
+    }
+
+    #[test]
     fn incomplete_user_or_odd_publication_requires_locked_log_lookup() {
         let _namespace = crate::multitask::scheduler::execution_test_serial_guard();
         let slot = 5;

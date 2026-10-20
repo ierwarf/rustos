@@ -41,7 +41,7 @@ pub(crate) fn soak(
     let mut outcomes = Vec::with_capacity(runs);
     for index in 1..=runs {
         let before = newest_archive(&history);
-        let result = crate::bench::bench(config, None, None, rustos_vcpus, isolate_probe);
+        let result = crate::bench::bench(config, None, None, rustos_vcpus, isolate_probe, None);
         let failure = result.err().map(|error| {
             let archived = newest_archive(&history).filter(|path| Some(path) != before.as_ref());
             match archived.as_deref().and_then(guest_panic) {

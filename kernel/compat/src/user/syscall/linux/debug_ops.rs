@@ -68,6 +68,7 @@ fn product_milestone_name(milestone: u64) -> Option<(&'static str, bool)> {
         linux_abi::PRODUCT_MILESTONE_SMP_QUALIFICATION_COMPLETE => {
             Some((SMP_QUALIFICATION_COMPLETE_MILESTONE_NAME, false))
         }
+        linux_abi::PRODUCT_MILESTONE_HECS_REGISTERS => Some(("hecs-registers", false)),
         _ => None,
     }
 }
@@ -86,6 +87,7 @@ pub(super) fn syscall_linux_rustos_product_milestone(milestone: u64, arg0: u64, 
             | linux_abi::PRODUCT_MILESTONE_SMP_QUALIFICATION_START
             | linux_abi::PRODUCT_MILESTONE_SMP_QUALIFICATION_FINISH
             | linux_abi::PRODUCT_MILESTONE_SMP_QUALIFICATION_COMPLETE
+            | linux_abi::PRODUCT_MILESTONE_HECS_REGISTERS
     );
     let recorded_arg1 = if qualification_phase {
         match admit_smp_qualification_milestone(milestone, arg0, arg1, current_cpu) {

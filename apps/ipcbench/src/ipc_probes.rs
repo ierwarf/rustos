@@ -24,7 +24,7 @@ use rustos_user_abi::syscall::{
 };
 
 use crate::{
-    measure, report, skip, summarize, syscall0, syscall1, syscall3, syscall4, syscall5, syscall6,
+    measure, measure_stamped, report, skip, summarize, syscall0, syscall1, syscall3, syscall4, syscall5, syscall6,
     tsc, IPC_ITERS, SYSCALL_ITERS, SYS_LINUX_GETUID, WARMUP,
 };
 
@@ -37,6 +37,153 @@ struct BenchMsg {
 
 const BENCH_OP_PING: u64 = 0;
 const BENCH_OP_STOP: u64 = 1;
+const _: [(); 16] = [(); size_of::<BenchMsg>()];
+
+fn valid_round_trip_reply(status: i64, request: &BenchMsg, response: &BenchMsg) -> bool {
+    status == size_of::<BenchMsg>() as i64
+        && response.op == request.op
+        && response.seq == request.seq
+}
+
+fn round_trip_transcript_complete(
+    warmup_ok: bool,
+    stop_verified: bool,
+    joined: bool,
+    samples: usize,
+) -> bool {
+    warmup_ok && stop_verified && joined && samples == IPC_ITERS
+}
+
+#[inline(always)]
+fn validated_round_trip_sample(
+    request: &BenchMsg,
+    response: &mut BenchMsg,
+    call: &mut impl FnMut(&BenchMsg, &mut BenchMsg) -> i64,
+    mut stamp: impl FnMut() -> u64,
+) -> Option<(u64, u64)> {
+    let start = stamp();
+    let status = call(request, response);
+    let end = stamp();
+    // Validation is outside the measured interval. No invalid transaction may
+    // contribute a latency sample, including a success with stale/short bytes.
+    valid_round_trip_reply(status, request, response).then_some((start, end))
+}
+
+fn empty_receive_status_valid(status: i64, reply_cap: u64) -> bool {
+    status == -(libc::EAGAIN as i64) && reply_cap == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_receive_requires_exact_would_block_and_no_reply_capability() {
+        assert!(empty_receive_status_valid(-11, 0));
+        for status in [-38, -22, -9, -1, 0, 16] {
+            assert!(!empty_receive_status_valid(status, 0), "status {status} is not an empty receive");
+        }
+        assert!(!empty_receive_status_valid(-11, 0x10001));
+    }
+
+    #[test]
+    fn incomplete_warmup_stop_join_or_sample_set_never_becomes_a_result() {
+        assert!(round_trip_transcript_complete(true, true, true, IPC_ITERS));
+        assert!(!round_trip_transcript_complete(
+            false, true, true, IPC_ITERS
+        ));
+        assert!(!round_trip_transcript_complete(
+            true, false, true, IPC_ITERS
+        ));
+        assert!(!round_trip_transcript_complete(
+            true, true, false, IPC_ITERS
+        ));
+        assert!(!round_trip_transcript_complete(
+            true,
+            true,
+            true,
+            IPC_ITERS - 1
+        ));
+        assert!(!round_trip_transcript_complete(
+            true,
+            true,
+            true,
+            IPC_ITERS + 1
+        ));
+    }
+
+    #[test]
+    fn actual_sample_path_stamps_call_before_validating_and_never_records_bad_echo() {
+        use std::cell::Cell;
+        let request = BenchMsg {
+            op: BENCH_OP_PING,
+            seq: 91,
+        };
+        for fault in 0..5 {
+            let order = Cell::new(0);
+            let mut response = BenchMsg::default();
+            let mut call = |sent: &BenchMsg, received: &mut BenchMsg| {
+                assert_eq!(order.replace(2), 1);
+                *received = *sent;
+                match fault {
+                    1 => received.seq -= 1,
+                    2 => received.op = BENCH_OP_STOP,
+                    _ => {}
+                }
+                match fault {
+                    3 => 0,
+                    4 => -110,
+                    _ => 16,
+                }
+            };
+            let result = validated_round_trip_sample(&request, &mut response, &mut call, || {
+                let old = order.get();
+                assert!(old == 0 || old == 2);
+                order.set(old + 1);
+                if old == 0 {
+                    100
+                } else {
+                    300
+                }
+            });
+            assert_eq!(order.get(), 3);
+            assert_eq!(result, (fault == 0).then_some((100, 300)));
+        }
+    }
+
+    #[test]
+    fn actual_round_trip_reply_requires_exact_bytes_operation_and_sequence() {
+        let request = BenchMsg {
+            op: BENCH_OP_PING,
+            seq: 0x1234_5678_9abc_def0,
+        };
+        let response = request;
+        assert!(valid_round_trip_reply(16, &request, &response));
+        for status in [-110, -1, 0, 15, 17, i64::MAX] {
+            assert!(
+                !valid_round_trip_reply(status, &request, &response),
+                "status={status}"
+            );
+        }
+        assert!(!valid_round_trip_reply(
+            16,
+            &request,
+            &BenchMsg {
+                op: BENCH_OP_STOP,
+                ..response
+            }
+        ));
+        assert!(!valid_round_trip_reply(
+            16,
+            &request,
+            &BenchMsg {
+                seq: response.seq - 1,
+                ..response
+            }
+        ));
+        assert!(!valid_round_trip_reply(16, &request, &BenchMsg::default()));
+    }
+}
 
 /// Timestamps the server stamps inside one round trip.
 ///
@@ -48,7 +195,6 @@ static REPLY_TSC: AtomicU64 = AtomicU64::new(0);
 
 fn bench_server(endpoint: u64) {
     let mut request = BenchMsg::default();
-    let response = BenchMsg::default();
     loop {
         let mut reply_cap: u64 = 0;
         let mut sender_pid: u64 = 0;
@@ -64,10 +210,11 @@ fn bench_server(endpoint: u64) {
                 (&mut sender_tid as *mut u64) as u64,
             )
         };
-        if received < 0 {
+        if received != size_of::<BenchMsg>() as i64 {
             return;
         }
         RECV_TSC.store(tsc(), Ordering::Relaxed);
+        let response = request;
         let stop = request.op == BENCH_OP_STOP;
         REPLY_TSC.store(tsc(), Ordering::Release);
         unsafe {
@@ -96,7 +243,6 @@ fn bench_server(endpoint: u64) {
 /// averaging them.
 fn bench_server_reply_recv(endpoint: u64) {
     let mut request = BenchMsg::default();
-    let response = BenchMsg::default();
     let mut reply_cap: u64 = 0;
     let mut sender_pid: u64 = 0;
     let mut sender_tid: u64 = 0;
@@ -112,11 +258,12 @@ fn bench_server_reply_recv(endpoint: u64) {
             (&mut sender_tid as *mut u64) as u64,
         )
     };
-    if received < 0 {
+    if received != size_of::<BenchMsg>() as i64 {
         return;
     }
     loop {
         RECV_TSC.store(tsc(), Ordering::Relaxed);
+        let response = request;
         let stop = request.op == BENCH_OP_STOP;
         REPLY_TSC.store(tsc(), Ordering::Release);
         if stop {
@@ -151,7 +298,7 @@ fn bench_server_reply_recv(endpoint: u64) {
                 (&args as *const IpcReplyRecvWithSenderArgs) as u64,
             )
         };
-        if result < 0 {
+        if result != size_of::<BenchMsg>() as i64 {
             return;
         }
     }
@@ -210,8 +357,8 @@ fn measure_intra_process_round_trip(
         seq: 0,
     };
     let mut response = BenchMsg::default();
-    let call = |request: &BenchMsg, response: &mut BenchMsg| -> bool {
-        let status = unsafe {
+    let mut call = |request: &BenchMsg, response: &mut BenchMsg| -> i64 {
+        unsafe {
             syscall5(
                 SYS_RUSTOS_IPC_CALL,
                 endpoint,
@@ -220,8 +367,7 @@ fn measure_intra_process_round_trip(
                 (response as *mut BenchMsg) as u64,
                 size_of::<BenchMsg>() as u64,
             )
-        };
-        status >= 0
+        }
     };
 
     // Split the round trip with the server's own timestamps. This needs no
@@ -235,17 +381,19 @@ fn measure_intra_process_round_trip(
     let mut ok = true;
     for _ in 0..WARMUP {
         request.seq = request.seq.wrapping_add(1);
-        ok &= call(&request, &mut response);
-    }
-    for _ in 0..IPC_ITERS {
-        request.seq = request.seq.wrapping_add(1);
-        let start = tsc();
-        let sent = call(&request, &mut response);
-        let end = tsc();
-        if !sent {
+        if !valid_round_trip_reply(call(&request, &mut response), &request, &response) {
             ok = false;
             break;
         }
+    }
+    for _ in 0..IPC_ITERS {
+        request.seq = request.seq.wrapping_add(1);
+        let Some((start, end)) =
+            validated_round_trip_sample(&request, &mut response, &mut call, tsc)
+        else {
+            ok = false;
+            break;
+        };
         let recv_at = RECV_TSC.load(Ordering::Relaxed);
         let reply_at = REPLY_TSC.load(Ordering::Acquire);
         total.push(end.wrapping_sub(start));
@@ -257,25 +405,15 @@ fn measure_intra_process_round_trip(
             to_return.push(end - reply_at);
         }
     }
-    let result = if ok { Some(total) } else { None };
-
     request.op = BENCH_OP_STOP;
-    unsafe {
-        syscall5(
-            SYS_RUSTOS_IPC_CALL,
-            endpoint,
-            (&request as *const BenchMsg) as u64,
-            size_of::<BenchMsg>() as u64,
-            (&mut response as *mut BenchMsg) as u64,
-            size_of::<BenchMsg>() as u64,
-        );
+    request.seq = request.seq.wrapping_add(1);
+    let stopped = valid_round_trip_reply(call(&request, &mut response), &request, &response);
+    let joined = server.join().is_ok();
+    if !round_trip_transcript_complete(ok, stopped, joined, total.len()) {
+        skip(name, "ipc-transcript-invalid");
+        return;
     }
-    let _ = server.join();
-
-    match result {
-        Some(mut samples) => report(name, &summarize(&mut samples), tsc_khz),
-        None => skip(name, "ipc-call-failed"),
-    }
+    report(name, &summarize(&mut total), tsc_khz);
     for (split, samples) in
         split_names
             .into_iter()
@@ -294,6 +432,10 @@ fn measure_intra_process_round_trip(
 /// walks, but never blocks and never reschedules, so it separates the IPC
 /// object cost from the scheduler cost that a round trip also pays.
 pub(crate) fn probe_ipc_mechanism_only(tsc_khz: u64) {
+    probe_ipc_mechanism_with_iterations(tsc_khz, SYSCALL_ITERS);
+}
+
+pub(crate) fn probe_ipc_mechanism_with_iterations(tsc_khz: u64, iterations: usize) {
     let endpoint = unsafe { syscall0(SYS_RUSTOS_IPC_ENDPOINT_CREATE) };
     if endpoint < 0 {
         skip("ipc_try_recv_empty", "endpoint-create-failed");
@@ -302,19 +444,21 @@ pub(crate) fn probe_ipc_mechanism_only(tsc_khz: u64) {
     let endpoint = endpoint as u64;
     let mut buffer = BenchMsg::default();
     let mut reply_cap: u64 = 0;
-    // An empty endpoint answers with an errno rather than a length, so the
-    // probe only requires that the call returns, not that it succeeds.
-    let result = measure(SYSCALL_ITERS, WARMUP, || {
-        unsafe {
+    // Wrong-handle/unsupported/permission failures must never become cheap
+    // samples. Validate the exact empty result after the ending timestamp.
+    let result = measure_stamped(iterations, WARMUP, || {
+        let start = tsc();
+        let status = unsafe {
             syscall4(
                 SYS_RUSTOS_IPC_TRY_RECV,
                 endpoint,
                 (&mut buffer as *mut BenchMsg) as u64,
                 size_of::<BenchMsg>() as u64,
                 (&mut reply_cap as *mut u64) as u64,
-            );
-        }
-        true
+            )
+        };
+        let end = tsc();
+        empty_receive_status_valid(status, reply_cap).then_some(end.wrapping_sub(start))
     });
     match result {
         Some(mut samples) => report("ipc_try_recv_empty", &summarize(&mut samples), tsc_khz),

@@ -55,24 +55,10 @@ pub(crate) fn retire_current_linux_task_due_to_fault(
             );
         }
     }
-    let final_process_thread = faulting_process.and_then(|process_id| {
-        (multitask::current_user_process_thread_count().unwrap_or(1) <= 1).then_some(process_id)
-    });
-    let disposition =
-        multitask::retire_current_user_task_due_to_fault(vector, error_code, cr2, rip, rsp);
-    if let Some(process_id) = fault_termination_process(disposition, final_process_thread) {
-        linux::record_linux_process_fault_termination(process_id, vector);
-    }
-    disposition
-}
-
-fn fault_termination_process(
-    disposition: multitask::UserFaultDisposition,
-    final_process_thread: Option<u64>,
-) -> Option<u64> {
-    (disposition == multitask::UserFaultDisposition::Retired)
-        .then_some(final_process_thread)
-        .flatten()
+    // IF is still clear in the exception callback. The original terminal
+    // producer carries the fault to the runtime cleanup consumer, which may
+    // close service handles and notify policy only from interruptible context.
+    multitask::retire_current_user_task_due_to_fault(vector, error_code, cr2, rip, rsp)
 }
 
 #[repr(C)]
@@ -139,7 +125,6 @@ const _: [(); 0] =
     [(); core::mem::offset_of!(SyscallFrame, r14) - SYSCALL_SCHEDULE_CONTEXT_OFFSET - 104];
 const _: [(); 0] =
     [(); core::mem::offset_of!(SyscallFrame, r15) - SYSCALL_SCHEDULE_CONTEXT_OFFSET - 112];
-const SYSCALL_ENTRY_XMM_BYTES: usize = 16 * 16;
 const SYSCALL_ENTRY_STACK_BYTES: usize =
     (SYSCALL_SCHEDULE_CONTEXT_OFFSET + kernel_hal::api::SAVED_CONTEXT_BYTES + 15) & !15;
 const _: [(); 432] = [(); SYSCALL_ENTRY_STACK_BYTES];
@@ -499,32 +484,10 @@ fn trace_syscall_exit(_frame: &SyscallFrame, _abi: UserAbi, _result: u64) {}
 #[cfg(test)]
 mod tests {
     use super::{
-        SyscallFrame, fault_termination_process, syscall_return_contract,
-        user_address_is_sysret_safe, user_rflags_are_sysret_safe,
+        SyscallFrame, syscall_return_contract, user_address_is_sysret_safe,
+        user_rflags_are_sysret_safe,
     };
     use crate::memory::paging;
-    use crate::multitask::UserFaultDisposition;
-
-    #[test]
-    fn only_retired_final_thread_commits_fault_termination() {
-        assert_eq!(
-            fault_termination_process(UserFaultDisposition::Resumed, Some(41)),
-            None
-        );
-        assert_eq!(
-            fault_termination_process(UserFaultDisposition::Unhandled, Some(41)),
-            None
-        );
-        assert_eq!(
-            fault_termination_process(UserFaultDisposition::Retired, None),
-            None
-        );
-        assert_eq!(
-            fault_termination_process(UserFaultDisposition::Retired, Some(41)),
-            Some(41)
-        );
-    }
-
     fn valid_frame() -> SyscallFrame {
         SyscallFrame {
             user_rsp: paging::USER_SPACE_BASE + 0x4000,

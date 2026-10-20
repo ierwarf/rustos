@@ -483,33 +483,6 @@ impl SchedulingDomainState {
         self.generation
     }
 
-    /// Names why this domain would refuse a dispatch, without mutating it.
-    ///
-    /// Selection admits a slot through `is_eligible` and dispatch commits it
-    /// through `prepare_dispatch`. The two are deliberately different -- the
-    /// first accepts a due refill that the second must actually apply -- so
-    /// when they disagree the panic has to say which of several possible
-    /// disagreements happened. One message covering an absent domain, a policy
-    /// epoch mismatch, a refused refill, and a plain empty budget alike is what
-    /// made the 8-vCPU report unactionable.
-    pub(super) fn dispatch_refusal(
-        self,
-        policy: SchedulingContextPolicy,
-        now_ns: u64,
-    ) -> DomainRefusalCause {
-        if self.policy() != policy {
-            return if self.policy().policy_epoch != policy.policy_epoch {
-                DomainRefusalCause::PolicyEpoch
-            } else {
-                DomainRefusalCause::Policy
-            };
-        }
-        // Runtime budget state is keyed by catalog slot in scheduling_runtime;
-        // callers with that slot use its refusal helper after this metadata
-        // policy check.
-        let _ = now_ns;
-        DomainRefusalCause::ConservationRefused
-    }
 }
 
 /// Why a domain refused to fund a dispatch it had already been admitted for.

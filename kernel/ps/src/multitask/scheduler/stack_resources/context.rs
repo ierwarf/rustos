@@ -10,6 +10,20 @@ pub(in crate::multitask::scheduler) fn read(slot: usize) -> Option<TaskContext> 
     RESOURCES.get(slot)?.with(|resources| resources.context)
 }
 
+/// Qualifies the original participant's start and funding in ONE resource leaf.
+/// The caller retains this non-Copy pin through the final donation publication;
+/// this observation grants neither worker execution nor a new participant loan.
+pub(in crate::multitask::scheduler) fn retained_scheduling_context(
+    pin: &crate::multitask::current_identity::execution::BindingPin,
+) -> Option<kernel_object::api::identity::ObjectIdentity> {
+    RESOURCES.get(pin.slot())?.with(|resources| {
+        if resources.start?.id != pin.id() { return None; }
+        let context = resources.context?;
+        if !context.scheduling_context.is_bound_to(pin.id()) { return None; }
+        Some(context.scheduling_context.identity())
+    })
+}
+
 /// Scalar reply custody ONLY: same actual resource binding/start/context leaf.
 /// No execution, funding, frame or MM loan escapes this comparison. Caller
 /// joins the original Identity51 publication before this Resources53 read.

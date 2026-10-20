@@ -95,6 +95,7 @@ mod tests {
     const CLASS: u8 = nucleus_core::util::lockdep::LockClass::SchedulerRetirementCleanup as u8;
     #[test]
     fn shared_leaf_preserves_outer_cpu_owner_and_original_irq_state_through_nested_release() {
+        let _namespace = super::super::scheduler::execution_test_serial_guard();
         let mut cpu = nucleus_core::util::lockdep::DispatchPreemption::enter();
         cpu.mask_irqs();
         let first = IrqLeaf::<_, CLASS>::new(1);

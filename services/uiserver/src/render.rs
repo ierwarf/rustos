@@ -1153,28 +1153,6 @@ pub(crate) fn render_boot_frame(state: &mut AppState) {
     background::paint_sky_gradient(&mut canvas, width as usize, height as usize);
 }
 
-pub(crate) fn render_debug_white_box(state: &mut AppState) {
-    render_boot_frame(state);
-
-    let width = state.surface.width;
-    let height = state.surface.height;
-    let stride_pixels = state.surface.stride_bytes as usize / 4;
-    let pixels = state.frame.pixels_mut();
-    let mut canvas = SurfaceCanvas::new(pixels, width, height, stride_pixels);
-
-    let box_width = ((width as usize) / 3).clamp(160, 400);
-    let box_height = ((height as usize) / 3).clamp(120, 320);
-    canvas.fill_rect(
-        Rect {
-            x: 0,
-            y: 0,
-            width: box_width,
-            height: box_height,
-        },
-        0x00ff_ffff,
-    );
-}
-
 pub(crate) fn render_rect(state: &mut AppState, rect: Rect) {
     if rect.is_empty() {
         return;

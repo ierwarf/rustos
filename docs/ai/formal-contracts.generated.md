@@ -2,20 +2,20 @@
 # Formal Contract Registry
 
 - Schema: `3`
-- Registry SHA-256: `74137b74339f140ec7e5d460e42ea221c6bb27b201ad002362bb90795c25f713`
+- Registry SHA-256: `c405d023418ba6843ae573ff5a272d180abf8a63ad29f6eba97b79fefdd2b555`
 - Models: `145`
 - Whole flows: `75`
-- Transitions: `878`
+- Transitions: `880`
 - Product runtime scenarios: `3`
-- Exact source witnesses: `1304`
+- Exact source witnesses: `1324`
 - Apalache pilots: `3`
 - TLAPS theorem models: `2`
 - Runtime-traced models: `7`
 - Intentional-terminal exceptions: `92` (ceiling `92`)
 - Cyclic strongly connected components: `49`
 - Supporting model bindings: `117`
-- Explicit critical/high risk surfaces: `231`
-- Additional source mappings: `357`
+- Explicit critical/high risk surfaces: `233`
+- Additional source mappings: `359`
 
 | Flow | Severity | Owners | Models | Requirements | Hazards | Sinks |
 | --- | --- | --- | --- | ---: | ---: | --- |
@@ -75,7 +75,7 @@
 | `root-authority` | `critical` | kernel-compat, kernel-ipc-runtime, rootd | root-authority-publication/RootAuthorityPublication | 6 | 6 | denied, service-published |
 | `runtime-control-ingress` | `critical` | runtimed | runtime-control-authority/RuntimeControlAuthority | 5 | 5 | admitted, denied |
 | `scheduler-cpu-ownership` | `critical` | kernel-hal, kernel-ps, nucleus-core | scheduler-cpu-ownership/SchedulerCpuOwnership | 15 | 15 | invariant-panic |
-| `scheduler-dispatch` | `critical` | inputd, kernel-compat, kernel-ipc-runtime, kernel-ps, loaderd, rootd, runtimed, syscalld, uiserver, vfsd | authority-identity-lifecycle/AuthorityIdentityLifecycle, cpu-dispatch-preemption/CpuDispatchPreemption, cpu-online-lifecycle/CpuOnlineLifecycle, cross-cpu-task-retirement/CrossCpuTaskRetirement, frame-reader-claim/FrameReaderClaim, ipc-fast-handoff/IpcFastHandoff, ipc-priority-inheritance/IpcPriorityInheritance, ipc-priority-queue/IpcPriorityQueue, ipc-reply-recv-transaction/IpcReplyRecvTransaction, lifecycle-execution-claim/LifecycleExecutionClaim, mm-activation-close/MmActivationClose, pager-fault-slot-lifecycle/PagerFaultSlotLifecycle, process-lifecycle-transaction/ProcessLifecycleTransaction, scheduler-active-balance/SchedulerActiveBalance, scheduler-admission/SchedulerAdmission, scheduler-cpu-distribution/SchedulerCpuDistribution, scheduler-local-authority/SchedulerLocalAuthority, scheduler-thread-demotion/SchedulerThreadDemotion, scheduler-wakeup/SchedulerWakeup, scheduling-context-budget/SchedulingContextBudget, sigchld-notification/SigchldNotification, synchronous-ipc-handoff/SynchronousIpcHandoff | 163 | 163 | context-revoked, peer-dispatched, reply-token-dropped, revoked, system-dispatched, user-dispatched |
+| `scheduler-dispatch` | `critical` | inputd, kernel-compat, kernel-ipc-runtime, kernel-ps, loaderd, rootd, runtimed, syscalld, uiserver, vfsd | authority-identity-lifecycle/AuthorityIdentityLifecycle, cpu-dispatch-preemption/CpuDispatchPreemption, cpu-online-lifecycle/CpuOnlineLifecycle, cross-cpu-task-retirement/CrossCpuTaskRetirement, endpoint-receiver-wakeup/EndpointReceiverWakeup, frame-reader-claim/FrameReaderClaim, ipc-fast-handoff/IpcFastHandoff, ipc-priority-inheritance/IpcPriorityInheritance, ipc-priority-queue/IpcPriorityQueue, ipc-reply-recv-transaction/IpcReplyRecvTransaction, lifecycle-execution-claim/LifecycleExecutionClaim, mm-activation-close/MmActivationClose, pager-fault-slot-lifecycle/PagerFaultSlotLifecycle, process-lifecycle-transaction/ProcessLifecycleTransaction, scheduler-active-balance/SchedulerActiveBalance, scheduler-admission/SchedulerAdmission, scheduler-cpu-distribution/SchedulerCpuDistribution, scheduler-local-authority/SchedulerLocalAuthority, scheduler-thread-demotion/SchedulerThreadDemotion, scheduler-wakeup/SchedulerWakeup, scheduling-context-budget/SchedulingContextBudget, sigchld-notification/SigchldNotification, synchronous-ipc-handoff/SynchronousIpcHandoff | 165 | 165 | context-revoked, peer-dispatched, reply-token-dropped, revoked, system-dispatched, user-dispatched |
 | `scheduler-lifecycle` | `critical` | kernel-compat, kernel-hal, kernel-ps | scheduler-wakeup/SchedulerWakeup, task-retirement-cleanup-owner/TaskRetirementCleanupOwner | 21 | 21 | cleanup-acked |
 | `service-bootstrap` | `critical` | initd, kernel-compat, rootd | service-bootstrap-lifecycle/ServiceBootstrapLifecycle | 10 | 10 | denied, entry-rejected, ready |
 | `service-call-authority` | `critical` | kernel-compat, kernel-ipc-runtime | service-call-authority/ServiceCallAuthority | 6 | 6 | admitted, cleared, denied, stale |

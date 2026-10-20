@@ -237,6 +237,27 @@ fn actual_wake_binding_pins_before_stop_and_excludes_reuse_until_original_drop()
 }
 
 #[test]
+fn actual_generic_deadline_wake_admits_original_kernel_wait_without_user_reclassification() {
+    root(true, |_slot| {
+        let mut scope = nucleus_core::util::lockdep::DispatchPreemption::enter_model(0);
+        scope.mask_irqs();
+        let kernel = 121;
+        let kernel_id = stack_resources::task_start::read(kernel).unwrap().id;
+        runqueue::wait::set_blocked(kernel, true);
+        runqueue::wait::set_reason(kernel, runqueue::wait::REASON_GENERIC, 0);
+        let before = runqueue::owner(kernel);
+        assert!(!wake_user_in(&scope, kernel_id, &|_| 1));
+        assert_eq!(runqueue::owner(kernel), before);
+        // SAME born kernel allocation/identity/frame, not a manufactured user
+        // identity or permission to skip frame/queue/physical-bank validation.
+        assert!(wake(&scope, kernel_id, &|_| 1));
+        assert!(!runqueue::wait::blocked(kernel));
+        assert_eq!(stack_resources::task_start::read(kernel).unwrap().id, kernel_id);
+        assert!(!stack_resources::context::read(kernel).unwrap().user_mode);
+    });
+}
+
+#[test]
 fn actual_user_qualified_wake_preserves_kernel_wait_and_wakes_exact_original_user() {
     root(true, |slot| {
         let mut scope = nucleus_core::util::lockdep::DispatchPreemption::enter_model(0);

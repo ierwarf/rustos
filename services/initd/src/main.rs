@@ -50,6 +50,7 @@ use rustos_user_abi::syscall::{
 };
 
 mod activation;
+mod lease_reconciliation;
 mod scheduling_context;
 
 use scheduling_context::request_scheduling_context_authority;
@@ -120,12 +121,6 @@ struct RetryState {
     failures: u32,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct RootdLeaseRecovery {
-    pid: i32,
-    deadline: Instant,
-}
-
 fn main() {
     boot_line("initd: main enter");
     if let Err(errno) = publish_init_identity() {
@@ -164,7 +159,7 @@ fn main() {
     let mut running = BTreeMap::<i32, RunningService>::new();
     let mut launched_once_packages = BTreeSet::new();
     let mut retry_state = BTreeMap::<String, RetryState>::new();
-    let mut rootd_lease_recovery = BTreeMap::<u64, RootdLeaseRecovery>::new();
+    let mut rootd_lease_recovery = lease_reconciliation::RootdLeaseReconciler::default();
     let mut defer_secondary_services_until = None::<Instant>;
     let mut next_rootd_lease_reconciliation = Instant::now();
     let mut initial_lease_reconciliation = true;
@@ -177,12 +172,11 @@ fn main() {
             if initial_lease_reconciliation {
                 boot_line("initd: initial lease reconciliation begin");
             }
-            reconcile_rootd_post_init_leases(
+            rootd_lease_recovery.reconcile(
                 &startup_entries,
                 &mut running,
                 &mut launched_once_packages,
                 &mut retry_state,
-                &mut rootd_lease_recovery,
                 now,
             );
             if initial_lease_reconciliation {
@@ -252,7 +246,7 @@ fn main() {
             }
 
             if rootd_service_id_for_exec(entry.exec.as_str())
-                .is_some_and(|service_id| rootd_lease_recovery.contains_key(&service_id))
+                .is_some_and(|service_id| rootd_lease_recovery.recovering(service_id))
             {
                 // rootd has an older admitted PID whose exact endpoint is
                 // still within the bounded adoption window.  Do not create a
@@ -360,6 +354,7 @@ fn publish_init_identity() -> Result<u64, i32> {
     // SAFETY: The endpoint-create syscall takes no user pointers; its signed
     // return is validated before it becomes publication authority.
     let endpoint = unsafe { libc::syscall(SYS_RUSTOS_IPC_ENDPOINT_CREATE as libc::c_long) as i64 };
+    let endpoint = libc_syscall_status(endpoint);
     if endpoint <= 0 {
         return Err(if endpoint < 0 {
             (-endpoint) as i32
@@ -376,6 +371,7 @@ fn publish_init_identity() -> Result<u64, i32> {
             endpoint as u64,
         ) as i64
     };
+    let registered = libc_syscall_status(registered);
     if registered < 0 {
         return Err((-registered) as i32);
     }
@@ -551,12 +547,12 @@ fn foundation_policy_services_ready() -> bool {
 fn service_ready_status(service_id: u64) -> i64 {
     // SAFETY: The lookup ABI accepts one scalar service identity and returns
     // a signed endpoint/status value without dereferencing user memory.
-    unsafe {
+    libc_syscall_status(unsafe {
         libc::syscall(
             SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT as libc::c_long,
             service_id,
         ) as i64
-    }
+    })
 }
 
 fn service_ready(service_id: u64) -> bool {
@@ -636,112 +632,6 @@ fn report_rootd_service_lease(exec_path: &str, pid: i32) -> Result<(), i32> {
     }
 }
 
-fn reconcile_rootd_post_init_leases(
-    startup_entries: &[StartupLaunchEntry],
-    running: &mut BTreeMap<i32, RunningService>,
-    launched_once_packages: &mut BTreeSet<String>,
-    retry_state: &mut BTreeMap<String, RetryState>,
-    recovery: &mut BTreeMap<u64, RootdLeaseRecovery>,
-    now: Instant,
-) {
-    for entry in startup_entries {
-        let Some(service_id) = rootd_service_id_for_exec(entry.exec.as_str()) else {
-            continue;
-        };
-        let (pid, state) = rootd_post_init_lease_query(service_id).unwrap_or_else(|errno| {
-            fail_closed(&format!(
-                "initd: fatal rootd post-init lease query failed service_id={service_id} errno={errno}"
-            ))
-        });
-        match state {
-            ROOTD_LEASE_STATE_EMPTY => {
-                recovery.remove(&service_id);
-            }
-            ROOTD_LEASE_STATE_RUNNING => {
-                let pid = i32::try_from(pid).unwrap_or_else(|_| {
-                    fail_closed(&format!(
-                        "initd: fatal rootd lease pid overflow service_id={service_id} pid={pid}"
-                    ))
-                });
-                if running.contains_key(&pid) {
-                    recovery.remove(&service_id);
-                    continue;
-                }
-                let state = recovery.entry(service_id).or_insert(RootdLeaseRecovery {
-                    pid,
-                    deadline: now + ROOTD_LEASE_RECOVERY_TIMEOUT,
-                });
-                if state.pid != pid {
-                    *state = RootdLeaseRecovery {
-                        pid,
-                        deadline: now + ROOTD_LEASE_RECOVERY_TIMEOUT,
-                    };
-                }
-                match wait_reported_service_endpoint_with_timeout(entry.exec.as_str(), pid, 1) {
-                    Ok(()) => {
-                        running.insert(
-                            pid,
-                            RunningService {
-                                package_id: entry.package_id.clone(),
-                                exec: entry.exec.clone(),
-                                restart: entry.restart,
-                                endpoint_ready: true,
-                            },
-                        );
-                        if !entry.restart {
-                            launched_once_packages.insert(entry.package_id.clone());
-                        }
-                        recovery.remove(&service_id);
-                        boot_line(&format!(
-                            "initd: adopted rootd lease exec={} pid={pid}",
-                            entry.exec
-                        ));
-                    }
-                    Err(errno) if errno == libc::ETIMEDOUT && now < state.deadline => {}
-                    Err(errno) if errno == libc::ETIMEDOUT || errno == libc::ESRCH => {
-                        reclaim_rootd_post_init_lease(service_id, pid as u64).unwrap_or_else(
-                            |reclaim_errno| {
-                                fail_closed(&format!(
-                                    "initd: fatal rootd stale lease reclaim failed service_id={service_id} pid={pid} errno={reclaim_errno}"
-                                ))
-                            },
-                        );
-                        recovery.remove(&service_id);
-                    }
-                    Err(errno) => fail_closed(&format!(
-                        "initd: fatal rootd lease endpoint probe failed service_id={service_id} pid={pid} errno={errno}"
-                    )),
-                }
-            }
-            ROOTD_LEASE_STATE_EXITED => {
-                recovery.remove(&service_id);
-                if let Some(service) = running.remove(&i32::try_from(pid).unwrap_or(-1)) {
-                    if service.restart {
-                        record_launch_failure(retry_state, service.exec.as_str(), "rootd-exit", 0);
-                    }
-                }
-                if pid != 0 {
-                    reclaim_rootd_post_init_lease(service_id, pid).unwrap_or_else(|errno| {
-                        fail_closed(&format!(
-                            "initd: fatal rootd exited lease reclaim failed service_id={service_id} pid={pid} errno={errno}"
-                        ))
-                    });
-                }
-            }
-            _ => {
-                recovery.remove(&service_id);
-                if pid != 0 {
-                    reclaim_rootd_post_init_lease(service_id, pid).unwrap_or_else(|errno| {
-                        fail_closed(&format!(
-                            "initd: fatal rootd terminal lease reclaim failed service_id={service_id} pid={pid} errno={errno}"
-                        ))
-                    });
-                }
-            }
-        }
-    }
-}
-
 fn wait_reported_service_endpoint(exec_path: &str, pid: i32) -> Result<(), i32> {
     wait_reported_service_endpoint_with_timeout(exec_path, pid, IPC_BOOT_CONTROL_HARD_LIMIT_MS)
 }
@@ -762,6 +652,7 @@ fn wait_reported_service_endpoint_with_timeout(
             (&args as *const RustosIpcWaitServiceEndpointArgs) as u64,
         ) as i64
     };
+    let status = libc_syscall_status(status);
     if status < 0 {
         return Err((-status) as i32);
     }
@@ -792,9 +683,13 @@ fn endpoint_wait_args(
     }))
 }
 
-fn rootd_post_init_lease_query(service_id: u64) -> Result<(u64, u16), i32> {
-    let response =
-        call_rootd_supervisor(COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_QUERY, service_id, 0)?;
+fn rootd_post_init_lease_query(service_id: u64, timeout_ms: u64) -> Result<(u64, u16), i32> {
+    let response = call_rootd_supervisor(
+        COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_QUERY,
+        service_id,
+        0,
+        timeout_ms,
+    )?;
     u16::try_from(response.value1)
         .map(|state| (response.value0, state))
         .map_err(|_| libc::EINVAL)
@@ -808,6 +703,7 @@ fn reclaim_rootd_post_init_lease(service_id: u64, pid: u64) -> Result<(), i32> {
         COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_RECLAIM,
         service_id,
         pid,
+        IPC_BOOT_CONTROL_HARD_LIMIT_MS,
     )?;
     Ok(())
 }
@@ -816,6 +712,7 @@ fn call_rootd_supervisor(
     op: u16,
     arg0: u64,
     arg1: u64,
+    timeout_ms: u64,
 ) -> Result<CommercialMaxProtocolResponse, i32> {
     let endpoint = lookup_service_endpoint(IPC_SERVICE_ROOTD)?;
     let mut request = CommercialMaxProtocolRequest::default();
@@ -837,9 +734,10 @@ fn call_rootd_supervisor(
             size_of::<CommercialMaxProtocolRequest>() as u64,
             (&mut response as *mut CommercialMaxProtocolResponse) as u64,
             size_of::<CommercialMaxProtocolResponse>() as u64,
-            IPC_BOOT_CONTROL_HARD_LIMIT_MS,
+            timeout_ms,
         ) as i64
     };
+    let call = libc_syscall_status(call);
     if call < 0 {
         return Err((-call) as i32);
     }
@@ -908,6 +806,7 @@ fn report_rootd_service_lease_inner(service_id: u64, exec_path: &str, pid: u64) 
             IPC_BOOT_CONTROL_HARD_LIMIT_MS,
         ) as i64
     };
+    let call = libc_syscall_status(call);
     if call < 0 {
         return Err((-call) as i32);
     }
@@ -935,6 +834,7 @@ fn lookup_service_endpoint(service_id: u64) -> Result<u64, i32> {
             service_id,
         ) as i64
     };
+    let endpoint = libc_syscall_status(endpoint);
     if endpoint < 0 {
         Err((-endpoint) as i32)
     } else if endpoint == 0 {
@@ -1112,6 +1012,7 @@ fn spawn_exec_via_loaderd(exec_path: &str, env: &[CString]) -> Result<i32, i32> 
             IPC_BOOT_CONTROL_HARD_LIMIT_MS,
         ) as i64
     };
+    let call = libc_syscall_status(call);
     if call < 0 {
         LOADER_ENDPOINT_CACHE.store(0, Ordering::Relaxed);
         return Err((-call) as i32);
@@ -1200,6 +1101,7 @@ fn lookup_loader_endpoint() -> Result<u64, i32> {
             IPC_SERVICE_LOADERD,
         ) as i64
     };
+    let endpoint = libc_syscall_status(endpoint);
     if endpoint < 0 {
         return Err((-endpoint) as i32);
     }
@@ -1217,6 +1119,13 @@ fn exec_weight_micros(exec_path: &str) -> u64 {
         RUNTIMED_EXEC_PATH => TASK_WEIGHT_INTERACTIVE_FLAG | DISPLAY_CRITICAL_TASK_WEIGHT_MICROS,
         _ => DEFAULT_INIT_TASK_WEIGHT_MICROS,
     }
+}
+
+// libc::syscall translates the kernel's -errno into -1 plus thread-local
+// errno. Internal readiness/envelope consumers use raw negative errno values;
+// restore that representation immediately, before logging or another syscall.
+fn libc_syscall_status(status: i64) -> i64 {
+    if status == -1 { -i64::from(last_errno()) } else { status }
 }
 
 fn last_errno() -> i32 {
@@ -1246,6 +1155,23 @@ mod tests {
         classify_service_ready_status, cleanup_spawned_service, endpoint_wait_args,
         exec_weight_micros, POLL_INTERVAL, RUNTIMED_EXEC_PATH, TASK_WEIGHT_INTERACTIVE_FLAG,
     };
+
+    #[test]
+    fn libc_errno_is_not_misreported_as_eperm_at_the_readiness_or_rpc_boundary() {
+        // SAFETY: -1 is not a Linux syscall number; it has no pointer arguments
+        // or host effects. Exercise real libc's -1/errno conversion, not a mock.
+        let status = unsafe { libc::syscall(-1 as libc::c_long) as i64 };
+        assert_eq!(status, -1);
+        let raw = super::libc_syscall_status(status);
+        assert_eq!(raw, -i64::from(libc::ENOSYS));
+        assert_eq!(classify_service_ready_status(raw), Ok(false));
+        assert_eq!(super::libc_syscall_status(123), 123);
+        assert_eq!(super::libc_syscall_status(0), 0);
+        assert_eq!(
+            super::libc_syscall_status(-i64::from(libc::ETIMEDOUT)),
+            -i64::from(libc::ETIMEDOUT)
+        );
+    }
 
     #[test]
     fn steady_supervisor_poll_is_bounded_without_two_millisecond_churn() {

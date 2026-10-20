@@ -5,6 +5,7 @@ mod shared {
 }
 
 fn main() {
+    println!("cargo:rustc-check-cfg=cfg(rustos_boot_image)");
     let logging_path = PathBuf::from("../../config/rustos.toml");
     let log_cfg_path = PathBuf::from("../../tools/build_log_cfg.rs");
     shared::emit_project_config_rerun(&logging_path);

@@ -29,6 +29,45 @@ fn capture(roots: &[(usize, u64, process_table::ProcessHandle)]) -> Activation {
     Activation::capture(&members).unwrap()
 }
 #[test]
+fn actual_fallible_original_grant_refuses_before_effects_and_survives_final_batch_publication() {
+    roots(&[ID, ID + 1], 1, |roots, turn| {
+        assert!(!super::commit(capture(roots), turn, |_| 1, || None::<()>));
+        for &(slot, _, _) in roots {
+            assert!(identity::lifecycle(slot).suspended);
+            assert_eq!(runqueue::owner(slot).state, runqueue::RunOwnerState::Blocked);
+            assert!(!identity::cohort::busy(slot));
+            assert_eq!(stack_resources::frame_readers::test_count(slot), 0);
+        }
+        assert_eq!(dispatch_policy::lock(0).atomic_activation_handoff_remaining, 0);
+        struct Grant<'a> {
+            members: &'a [(usize, u64, process_table::ProcessHandle)],
+            dropped: &'a Cell<bool>,
+        }
+        impl Drop for Grant<'_> {
+            fn drop(&mut self) {
+                for &(slot, _, _) in self.members {
+                    assert!(!identity::lifecycle(slot).suspended,
+                        "original registry grant must survive all unsuspend effects");
+                    assert!(!identity::cohort::busy(slot), "grant precedes complete batch ACK");
+                    assert_eq!(runqueue::owner(slot).state, runqueue::RunOwnerState::Local);
+                }
+                let policy = dispatch_policy::lock(0);
+                assert_eq!(policy.atomic_activation_handoff_remaining, 2);
+                assert_eq!(policy.atomic_activation_pick_hints.len(), 2);
+                self.dropped.set(true);
+            }
+        }
+        let dropped = Cell::new(false);
+        assert!(super::commit(capture(roots), turn, |_| 1, || {
+            assert_eq!(nucleus_core::util::lockdep::held_spin_lock_depth(), 0);
+            assert!(super::super::super::current_terminal::OriginalCurrent::borrow(turn).is_none());
+            Some(Grant { members: roots, dropped: &dropped })
+        }));
+        assert!(dropped.get());
+    });
+}
+
+#[test]
 pub(in crate::multitask::scheduler) fn actual_activation_holds_original_frame_and_binding_through_callback_before_queue_and_ack() {
     roots(&[ID, ID + 1], 1, |roots, turn| {
         let owner = capture(roots);
@@ -208,6 +247,12 @@ pub(in crate::multitask::scheduler) fn actual_over_capacity_activation_refuses_b
     roots(&ids, 1, |roots, _| {
         let members: Vec<_> = roots.iter().map(|&(slot, id, _)| (slot, id)).collect();
         assert!(Activation::capture(&members).is_none());
+        let mut callbacks = 0;
+        assert!(!super::super::activate(&ids, || {
+            callbacks += 1;
+            Some(())
+        }), "the production ID-list entry must refuse before indexing its fixed member array");
+        assert_eq!(callbacks, 0);
         for &(slot, _, _) in roots {
             assert!(identity::lifecycle(slot).suspended);
             assert_eq!(identity::execution::count(slot), 0);

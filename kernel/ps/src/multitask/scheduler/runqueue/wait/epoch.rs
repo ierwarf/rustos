@@ -49,6 +49,20 @@ pub(in crate::multitask::scheduler) struct TypedWake<'a> {
     cleared: core::cell::Cell<bool>,
 }
 impl<'a> TypedWake<'a> {
+    /// Negative receive observation only: a timer/other original wake already
+    /// withdrew the endpoint arm while its runtime waiter was still published.
+    /// This does NOT wake, bind funding or grant execution. The caller can keep
+    /// its exact queued reply AwaitingReceiver for a later actual receive.
+    pub(in crate::multitask::scheduler) fn receive_was_withdrawn(binding: &Binding) -> bool {
+        with(binding.slot(), |state| {
+            let owner = owner(binding.slot());
+            state.pending.is_none()
+                && super::reason_locked(binding.slot()) == (REASON_NONE, 0)
+                && !owner.wait_armed && !super::super::wait_blocked(owner)
+                && owner.runnable && !owner.state.is_terminal()
+        })
+    }
+
     pub(in crate::multitask::scheduler) fn capture(
         binding: &'a Binding,
         kind: u8,

@@ -137,6 +137,13 @@ require_literal .github/workflows/remote-agent.yml 'tools/agent/check-ai-context
 require_literal .github/workflows/ai-context-contract.yml 'tools/agent/check-ai-context-contract.sh' \
   "CI validates context contract"
 
+if python3 tools/agent/check-doc-layout.py --selftest >/dev/null && \
+   python3 tools/agent/check-doc-layout.py; then
+  ok "owner documentation budgets and local references"
+else
+  bad "owner documentation layout validation failed"
+fi
+
 if (( failures != 0 )); then
   printf 'ai-context-contract: %d failure(s)\n' "$failures" >&2
   exit 1

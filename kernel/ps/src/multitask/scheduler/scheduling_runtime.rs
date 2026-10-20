@@ -680,21 +680,6 @@ pub(super) fn prepare_published_stamp_dispatch(
         == PublishedDispatchPreparation::Ready
 }
 
-pub(super) fn prepare_domain_dispatch(
-    slot: usize,
-    generation: u32,
-    policy: SchedulingContextPolicy,
-    now_ns: u64,
-) -> bool {
-    let Some(mut runtime) = domain_budget_for(slot, generation, policy) else {
-        return false;
-    };
-    runtime
-        .budget
-        .as_mut()
-        .is_some_and(|budget| budget.replenish(now_ns) && budget.available())
-}
-
 pub(super) fn charge_domain_runtime(
     slot: usize,
     generation: u32,

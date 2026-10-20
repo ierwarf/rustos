@@ -25,28 +25,6 @@ const FAST_IPC_ELIGIBILITY_REJECTION_COUNT: usize = 10;
 static FAST_IPC_ELIGIBILITY_REJECTIONS: [AtomicU64; FAST_IPC_ELIGIBILITY_REJECTION_COUNT] =
     [const { AtomicU64::new(0) }; FAST_IPC_ELIGIBILITY_REJECTION_COUNT];
 
-#[repr(usize)]
-#[derive(Clone, Copy)]
-pub(super) enum FastIpcEligibilityRejection {
-    BudgetCpu = 0,
-    ContextBudget = 1,
-    DomainBudget = 2,
-    ForeignExecutionOwner = 3,
-    RootCpu = 4,
-    IdleCpu = 5,
-    Affinity = 6,
-    JobStopped = 7,
-    ExecQuiesced = 8,
-    InvalidContext = 9,
-}
-
-pub(super) fn record_fast_ipc_eligibility_rejection(reason: FastIpcEligibilityRejection) {
-    #[cfg(rustos_ipc_phase_profile)]
-    FAST_IPC_ELIGIBILITY_REJECTIONS[reason as usize].fetch_add(1, Ordering::Relaxed);
-    #[cfg(not(rustos_ipc_phase_profile))]
-    let _ = reason;
-}
-
 pub fn drain_fast_ipc_eligibility_rejections() -> [u64; FAST_IPC_ELIGIBILITY_REJECTION_COUNT] {
     #[cfg(rustos_ipc_phase_profile)]
     {

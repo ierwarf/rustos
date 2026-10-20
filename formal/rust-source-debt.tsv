@@ -202,7 +202,9 @@ kernel/compat/src/user/syscall/windows/dispatch.rs	0	0
 kernel/io-manager/src/io/dvm_block.rs	15	47
 kernel/io-manager/src/io/dvm_network.rs	6	12
 kernel/io-manager/src/input/dvm_ring.rs	10	76
-kernel/io-manager/src/io/dvm_display.rs	13	219
+kernel/io-manager/src/io/dvm_display.rs	3	132
+kernel/io-manager/src/io/dvm_display/installation.rs	7	43
+kernel/io-manager/src/io/dvm_display/peer.rs	3	41
 kernel/io-manager/src/api.rs	0	0
 services/rootd/src/main.rs	20	27
 services/initd/src/main.rs	0	0

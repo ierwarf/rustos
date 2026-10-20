@@ -32,7 +32,9 @@ use super::process_table::MAX_PROCESS_OBJECTS;
 use super::process_table::{ProcessHandle, ProcessIdentity};
 
 mod fork_hold;
+mod rewrite_epoch;
 pub(super) use fork_hold::with_fork_held_regions;
+use rewrite_epoch::{RangeRewrite, read_rewrite_epoch};
 
 /// Ring0's per-process pager VMA table, taken from the shared ABI.
 ///
@@ -689,24 +691,25 @@ pub(super) fn lookup_slot(
     }
     let process = handle.object_identity().ok_or(PagerVmaError::Stale)?;
     let slots = process_slots(handle).ok_or(PagerVmaError::Stale)?;
-    for (index, slot) in slots.iter().enumerate() {
-        if !slot.may_cover(address) {
-            continue;
+    read_rewrite_epoch(handle, || {
+        for (index, slot) in slots.iter().enumerate() {
+            if !slot.may_cover(address) {
+                continue;
+            }
+            let Some(region) = slot.snapshot()? else {
+                continue;
+            };
+            // Extent filtering is not authority. This candidate still needs
+            // the same exact process/MM, VMA, protection and commit checks.
+            if !region_matches_identity(region, process.slot(), identity) {
+                continue;
+            }
+            if region.contains(address) {
+                return admit_access(region, access).map(|region| (index, region));
+            }
         }
-        let Some(region) = slot.snapshot()? else {
-            continue;
-        };
-        // The locals above exist for `may_cover`, which runs per slot and
-        // decides on address extent only. This runs once per candidate and is
-        // the authority decision, so it goes through the single definition.
-        if !region_matches_identity(region, process.slot(), identity) {
-            continue;
-        }
-        if region.contains(address) {
-            return admit_access(region, access).map(|region| (index, region));
-        }
-    }
-    Err(PagerVmaError::Stale)
+        Err(PagerVmaError::Stale)
+    })
 }
 
 /// Acquires one exact VMA publication permit for an IRQ-off prepared-leaf
@@ -1027,6 +1030,11 @@ where
             return Err(PagerVmaError::Pressure);
         }
     }
+
+    // A stable empty per-slot publication during withdrawal is NOT a real
+    // unmap. Retain the whole-set odd interval through mutate and all rollback
+    // or replacement publications so fault-time misses are restartable.
+    let _rewrite = RangeRewrite::begin(handle)?;
 
     // Withdrawal is all-or-nothing across the overlapping slots.
     //

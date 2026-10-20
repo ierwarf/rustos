@@ -20,7 +20,7 @@ use super::{
     donation_ledger, frame_publication, handoff_queue::FirstTurnHandoff, local_dispatch,
     runqueue, runqueue_policy, runtime_profile, smp, stack_resources, sync_handoff, terminal_quarantine,
     SchedulerDispatch, TaskRetireReason, ROOT_TASK_SLOT, MAX_TASK, MAX_LATENCY_HANDOFF_HINTS,
-    MAX_CONSECUTIVE_LATENCY_HANDOFFS, MAX_CONSECUTIVE_SYSTEM_DISPATCHES,
+    MAX_CONSECUTIVE_LATENCY_HANDOFFS,
 };
 
 pub(in crate::multitask::scheduler) mod maintenance;
@@ -113,6 +113,7 @@ fn materialize(record: sync_handoff::SyncHandoffRecord, cpu: usize) {
     }
 }
 fn synchronous(cpu: usize) -> Decision {
+    let _phase = super::runtime_profile::phase_scope(super::SchedulerPhase::SelectHandoff);
     if !sync_handoff::pending(cpu) { return Decision::Empty; }
     let record = sync_handoff::take_next_ready(cpu, local_dispatch::local_fair_competitor_ready(cpu), |record| {
         let slot = record.slot();
@@ -223,6 +224,10 @@ pub(super) fn test_policy_choice(turn: &crate::multitask::cpu_local::dispatch_tu
 
 fn choose(turn: &crate::multitask::cpu_local::dispatch_turn::CpuDispatchTurn<'static>, cpu: usize, current: usize, voluntary: bool, runtime: u64, ticks: u64, class_sequence: u64) -> Decision {
     if class_sequence & 1 != 0 { return Decision::Incomplete; }
+    // Receive the original generation-bound mailbox before any priority arm
+    // can return Incomplete. A remote activation prefix is not a Local frame
+    // yet; putting this behind that prefix strands its own admission forever.
+    let _ = runqueue::drain_remote_wakes(cpu);
     if dispatch_policy::atomic_activation_pending(cpu) {
         match first_turn(turn, cpu, true, class_sequence) { Decision::Empty => {}, result => return result }
     }
@@ -278,6 +283,7 @@ fn quarantine(slot: usize, id: u64, rsp: usize, reason: &'static str) {
     });
 }
 fn prologue(outgoing: &mut CurrentReturn<'_>, rsp: usize, voluntary: bool) -> u64 {
+    let _phase = super::runtime_profile::phase_scope(super::SchedulerPhase::Account);
     let slot = outgoing.slot();
     let runtime = outgoing.account(crate::arch::rtc::ticks(), voluntary);
     let ready = current_identity::read_dispatch(slot).is_some_and(|p| p.lifecycle_dispatchable()) && !runqueue::wait::blocked(slot);

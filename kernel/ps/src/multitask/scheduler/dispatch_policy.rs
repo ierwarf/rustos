@@ -201,7 +201,6 @@ pub(super) struct CpuDispatchPolicy {
     pub(super) atomic_activation_pick_hints:
         SlotHandoffQueue<MAX_ATOMIC_ACTIVATION_HANDOFFS, FirstTurnHandoff>,
     pub(super) atomic_activation_handoff_remaining: usize,
-    pub(super) latency_handoff_streak: u8,
     pub(super) ready_validation_turn: u8,
 }
 
@@ -215,7 +214,6 @@ impl CpuDispatchPolicy {
             spawn_pick_hints: SlotHandoffQueue::new(),
             atomic_activation_pick_hints: SlotHandoffQueue::new(),
             atomic_activation_handoff_remaining: 0,
-            latency_handoff_streak: 0,
             ready_validation_turn: 0,
         }
     }

@@ -20,6 +20,8 @@ use std::time::Duration;
 
 use rustos_user_abi::syscall::{SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_PHASE_PROFILE_DRAIN};
 
+mod component_contract;
+mod components;
 mod cow_probe;
 mod ipc_probes;
 mod scheduling_context_probe;
@@ -205,9 +207,11 @@ fn debug_line(message: &str) {
 
 // -------------------------------------------------------------------- TSC
 
-/// `lfence` before the read keeps earlier work from drifting past the sample.
-/// The measured regions are all syscalls, which serialize on their own, so a
-/// full `cpuid` barrier would only add its own cost to every sample.
+/// Bound both sides of the sample: RDTSC is not itself serializing, so a
+/// preceding LFENCE alone cannot stop later instructions from starting early.
+/// The asm also clobbers memory: response validation must not be hoisted across
+/// the end stamp by the compiler. Stores need not drain globally for a return
+/// latency measurement; this is not a memory-persistence benchmark.
 #[inline(always)]
 fn tsc() -> u64 {
     let lo: u32;
@@ -216,9 +220,10 @@ fn tsc() -> u64 {
         asm!(
             "lfence",
             "rdtsc",
+            "lfence",
             out("eax") lo,
             out("edx") hi,
-            options(nomem, nostack),
+            options(nostack),
         );
     }
     ((hi as u64) << 32) | (lo as u64)
@@ -1027,6 +1032,7 @@ fn run_all_probes(tsc_khz: u64) {
 /// which would defeat the isolation this exists for.
 fn run_single_probe(name: &str, tsc_khz: u64) {
     match name {
+        component_contract::FILTER => components::run(tsc_khz),
         "tsc_overhead" => probe_tsc_overhead(tsc_khz),
         "null_syscall_getpid" => probe_null_syscall(tsc_khz),
         "vmexit_cpuid" => probe_vmexit_cpuid(tsc_khz),
@@ -1089,7 +1095,7 @@ fn run_single_probe(name: &str, tsc_khz: u64) {
 /// counters, while making a same-session target-only A-B-A comparison capable
 /// of rejecting host clock drift instead of trusting equal-looking TSC rates.
 fn run_isolated_probe(name: &str, tsc_khz: u64) {
-    if name != "vmexit_cpuid" {
+    if name != "vmexit_cpuid" && name != component_contract::FILTER {
         probe_vmexit_cpuid(tsc_khz);
     }
     run_single_probe(name, tsc_khz);

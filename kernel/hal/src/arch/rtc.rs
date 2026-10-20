@@ -684,6 +684,18 @@ pub fn disarm_sleep_waiter(task_id: u64) -> bool {
 }
 
 fn wake_ready_sleepers(now: u64) {
+    if !notify_ready_sleepers(&RTC_SLEEP_WAITERS, now, crate::hooks::wake_task)
+        && RTC_SLEEP_LOCK_MISSES.fetch_add(1, Ordering::Relaxed) == 0
+    {
+        crate::debug::println!("rtc: sleep-waiter lock collision deferred");
+    }
+}
+
+fn notify_ready_sleepers(
+    waiters: &RtcSleepWaiterLock,
+    now: u64,
+    mut wake: impl FnMut(u64) -> bool,
+) -> bool {
     // Clockevent handlers must never spin on state owned by the interrupted
     // context. Registration/cancellation mask interrupts while mutating the
     // table, so a transient collision is safely retried by the next PIT/RTC
@@ -695,13 +707,8 @@ fn wake_ready_sleepers(now: u64) {
         task_id: 0,
         notification_count: 0,
     }; RTC_SLEEP_WAITER_CAPACITY];
-    let Some(ready_len) =
-        try_snapshot_ready_sleep_waiters(&RTC_SLEEP_WAITERS, now, &mut ready_tasks)
-    else {
-        if RTC_SLEEP_LOCK_MISSES.fetch_add(1, Ordering::Relaxed) == 0 {
-            crate::debug::println!("rtc: sleep-waiter lock collision deferred");
-        }
-        return;
+    let Some(ready_len) = try_snapshot_ready_sleep_waiters(waiters, now, &mut ready_tasks) else {
+        return false;
     };
     for notification in ready_tasks.into_iter().take(ready_len) {
         let task_id = notification.task_id;
@@ -715,13 +722,16 @@ fn wake_ready_sleepers(now: u64) {
                 notification.notification_count
             );
         }
-        if !crate::hooks::wake_user_task(task_id) {
-            crate::debug::println!("rtc: expired sleep waiter had no live task task={task_id}");
-            if let Some(mut waiters) = RTC_SLEEP_WAITERS.try_lock() {
-                waiters.remove_task(task_id);
-            }
+        // Refusal is not a death certificate: original frame/CPU publication
+        // may temporarily exclude a wake. Neither refusal nor notification
+        // relinquishes this exact task's deadline; resume/cancel/retirement
+        // disarms it. In particular, no new lock is taken after the callback.
+        let admitted = wake(task_id);
+        if !admitted && notification.notification_count.is_power_of_two() {
+            crate::debug::println!("rtc: sleep wake deferred task={task_id} now={now}");
         }
     }
+    true
 }
 
 /// `None` means the table is transiently owned by process context and the
@@ -934,6 +944,47 @@ mod tests {
         for task_id in RTC_SLEEP_WAITER_CAPACITY as u64..(RTC_SLEEP_WAITER_CAPACITY as u64 * 2) {
             assert!(waiters.remove_task(task_id));
         }
+    }
+
+    #[test]
+    fn actual_clockevent_refusal_and_notification_keep_deadline_until_exact_ack() {
+        let waiters = RtcSleepWaiterLock::new(SleepWaiterTable::new());
+        assert!(waiters.lock().insert_or_update(SleepWaiter {
+            task_id: 77,
+            wake_tick: 4,
+            last_notify_tick: RTC_SLEEP_UNNOTIFIED_TICK,
+            notification_count: 0,
+        }));
+        let mut notifications = 0;
+        let mut wake = |id| {
+            assert_eq!(id, 77);
+            notifications += 1;
+            notifications > 2 // Two transient refusals, then admitted notification.
+        };
+        assert!(notify_ready_sleepers(&waiters, 4, &mut wake));
+        assert_eq!(waiters.lock().slots.iter().flatten().count(), 1);
+        // No busy polling between clockevents, and success is not an ACK either.
+        assert!(notify_ready_sleepers(
+            &waiters,
+            4 + RTC_SLEEP_RENOTIFY_TICKS - 1,
+            &mut wake
+        ));
+        for retry in 1..=3 {
+            assert!(notify_ready_sleepers(
+                &waiters,
+                4 + retry * RTC_SLEEP_RENOTIFY_TICKS,
+                &mut wake
+            ));
+        }
+        assert_eq!(notifications, 4);
+        let original = *waiters.lock().slots.iter().flatten().next().unwrap();
+        assert_eq!(original.task_id, 77);
+        assert_eq!(original.wake_tick, 4);
+        assert_eq!(original.notification_count, 4);
+        assert!(waiters.lock().remove_task(77));
+        assert!(notify_ready_sleepers(&waiters, 100, |_| panic!(
+            "ACKed waiter was re-notified"
+        )));
     }
 
     #[test]

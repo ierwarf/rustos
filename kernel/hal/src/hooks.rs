@@ -60,7 +60,8 @@ pub struct TaskHooks {
     pub arm_block_current_task: Option<fn() -> bool>,
     pub cancel_block_current_task: Option<fn() -> bool>,
     pub commit_block_current_task_and_yield: Option<fn() -> Option<bool>>,
-    pub wake_user_task: Option<fn(u64) -> bool>,
+    /// Deadline waiters are exact scheduler tasks, including kernel consumers.
+    pub wake_task: Option<fn(u64) -> bool>,
     pub yield_now: Option<fn()>,
 }
 
@@ -92,7 +93,7 @@ static HOOKS: RwLock<HookRegistry> = RwLock::new(HookRegistry {
         arm_block_current_task: None,
         cancel_block_current_task: None,
         commit_block_current_task_and_yield: None,
-        wake_user_task: None,
+        wake_task: None,
         yield_now: None,
     },
     interrupt: InterruptHooks {
@@ -195,9 +196,9 @@ pub fn commit_block_current_task_and_yield() -> Option<bool> {
         .and_then(|hook| hook())
 }
 
-pub fn wake_user_task(task_id: u64) -> bool {
+pub fn wake_task(task_id: u64) -> bool {
     task_hooks()
-        .wake_user_task
+        .wake_task
         .map(|hook| hook(task_id))
         .unwrap_or(false)
 }
@@ -224,10 +225,15 @@ pub fn heartbeat_snapshot() -> HeartbeatSnapshot {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
     use super::*;
-    use core::sync::atomic::{AtomicBool, Ordering};
+    use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+    // These tests temporarily replace the same live registry; save/restore
+    // alone does not exclude another native test's callback installation.
+    static REGISTRY_TEST: std::sync::Mutex<()> = std::sync::Mutex::new(());
     static CALLBACK_OBSERVED_UNLOCKED_REGISTRY: AtomicBool = AtomicBool::new(false);
+    static LAST_WAKE_TASK: AtomicU64 = AtomicU64::new(0);
 
     fn inspect_registry_from_commit_callback() -> Option<bool> {
         CALLBACK_OBSERVED_UNLOCKED_REGISTRY.store(HOOKS.try_write().is_some(), Ordering::SeqCst);
@@ -245,6 +251,7 @@ mod tests {
 
     #[test]
     fn page_fault_hook_is_optional_and_its_disposition_is_preserved() {
+        let _serial = REGISTRY_TEST.lock().unwrap();
         assert_eq!(
             try_handle_current_user_page_fault(Some(0), 0x4000, 0x5000, 0x6000),
             UserFaultDisposition::Unhandled
@@ -267,6 +274,7 @@ mod tests {
 
     #[test]
     fn scheduler_callback_runs_after_hook_registry_read_guard_is_released() {
+        let _serial = REGISTRY_TEST.lock().unwrap();
         CALLBACK_OBSERVED_UNLOCKED_REGISTRY.store(false, Ordering::SeqCst);
         let saved = {
             let mut registry = HOOKS.write();
@@ -279,6 +287,31 @@ mod tests {
         assert_eq!(commit_block_current_task_and_yield(), Some(false));
         assert!(CALLBACK_OBSERVED_UNLOCKED_REGISTRY.load(Ordering::SeqCst));
 
+        HOOKS.write().task = saved;
+    }
+
+    fn inspect_registry_from_wake_callback(task_id: u64) -> bool {
+        CALLBACK_OBSERVED_UNLOCKED_REGISTRY.store(HOOKS.try_write().is_some(), Ordering::SeqCst);
+        LAST_WAKE_TASK.store(task_id, Ordering::SeqCst);
+        task_id == 4
+    }
+
+    #[test]
+    fn deadline_wake_hook_forwards_exact_task_outside_registry_guard() {
+        let _serial = REGISTRY_TEST.lock().unwrap();
+        let saved = {
+            let mut registry = HOOKS.write();
+            let saved = registry.task;
+            registry.task.wake_task = None;
+            saved
+        };
+        assert!(!wake_task(4));
+        HOOKS.write().task.wake_task = Some(inspect_registry_from_wake_callback);
+        assert!(wake_task(4));
+        assert_eq!(LAST_WAKE_TASK.load(Ordering::SeqCst), 4);
+        assert!(!wake_task(5));
+        assert_eq!(LAST_WAKE_TASK.load(Ordering::SeqCst), 5);
+        assert!(CALLBACK_OBSERVED_UNLOCKED_REGISTRY.load(Ordering::SeqCst));
         HOOKS.write().task = saved;
     }
 }

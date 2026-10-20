@@ -12,9 +12,7 @@ mod fair_retry;
 #[cfg(test)]
 pub(super) mod policy_witnesses;
 mod hint_priority;
-pub(super) use fair_retry::{
-    complete_hint_generation, retry_incomplete_fair, retry_incomplete_policy,
-};
+pub(super) use fair_retry::retry_incomplete_policy;
 #[cfg(not(test))]
 pub(super) use fair_retry::{current_after_incomplete, incomplete_policy_fallback};
 pub(super) use hint_priority::{
@@ -75,12 +73,6 @@ fn fallback<T>(reason: LocalFallbackReason) -> Result<T, LocalFallbackReason> {
     #[cfg(rustos_scheduler_phase_profile)]
     SHADOW_FALLBACKS[reason as usize].fetch_add(1, Ordering::Relaxed);
     Err(reason)
-}
-
-/// A failed generation-bound claim abandons the stale local selection for the
-/// existing current/idle fallback; it is not a catalog fair rescan.
-pub(super) fn local_claim_lost_fallback() -> Result<usize, LocalFallbackReason> {
-    fallback(LocalFallbackReason::CustodyUnavailable)
 }
 
 pub(super) fn user_reservation_due(cpu: usize) -> bool {
@@ -172,12 +164,13 @@ fn affinity_masks_allow_cpu(task_mask: u64, process_mask: u64, cpu: usize) -> bo
         .is_some_and(|bit| task_mask & process_mask & bit != 0)
 }
 
-/// `None` represents a transitioning affinity publication, not a stable
-/// CPU exclusion. It must never be used to discard a runnable fair candidate.
-fn published_affinity_admission(slot: usize, cpu: usize) -> Option<bool> {
+/// A zero-mask snapshot is an overlapping/reset publication, not stable
+/// exclusion. Migration intent survives until the exact placement/RSP ACK:
+/// it vetoes retained Current, never a fresh claim on an included destination.
+fn published_affinity_admission(slot: usize, cpu: usize, retain_current: bool) -> Option<bool> {
     let (task_mask, process_mask, migration_pending) =
         runqueue::affinity_payload::affinity_snapshot(slot);
-    if migration_pending {
+    if task_mask == 0 || process_mask == 0 || (retain_current && migration_pending) {
         return None;
     }
     Some(
@@ -195,7 +188,7 @@ fn current_can_keep_running(slot: usize, cpu: usize, now_ns: u64) -> bool {
     };
     let owner = runqueue::owner(slot);
     publication.lifecycle_dispatchable()
-        && published_affinity_admission(slot, cpu) == Some(true)
+        && published_affinity_admission(slot, cpu, true) == Some(true)
         && effective_charge_is_eligible(slot, publication.pager_charge, cpu, now_ns)
         && owner.cpu == Some(cpu)
         && runqueue::owner_has_run_intent(owner)
@@ -215,7 +208,7 @@ pub(super) fn published_candidate_admission(
     if publication.task_id.is_none() {
         return Err(LocalFallbackReason::PublicationUnavailable);
     }
-    let affinity_admission = published_affinity_admission(slot, cpu);
+    let affinity_admission = published_affinity_admission(slot, cpu, false);
     if rustos_scheduler_frame_gate::stable_local_admission_rejected(
         publication.lifecycle_dispatchable(),
         affinity_admission,

@@ -5,10 +5,15 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import json
+import os
+import select
+import signal
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 
 RUNNER = Path(__file__).with_name("run-implementation-mutations.py")
@@ -161,20 +166,26 @@ def restore_touches_every_registered_source() -> None:
 
 
 def checkout_mirror_has_a_no_rsync_path() -> None:
-    """The source seal must not depend on an optional host binary."""
+    """Both mirror implementations retain dirty nested build source, not artifacts."""
     with tempfile.TemporaryDirectory(prefix="rustos-mutation-mirror-") as temporary:
         root = Path(temporary) / "source"
-        checkout = Path(temporary) / "checkout"
         root.mkdir()
         subprocess.run(["git", "init", "-q", str(root)], check=True)
         subprocess.run(["git", "-C", str(root), "config", "user.email", "test@example.invalid"], check=True)
         subprocess.run(["git", "-C", str(root), "config", "user.name", "Mutation Test"], check=True)
         (root / "tracked.rs").write_text("initial\n", encoding="utf-8")
         (root / "removed.rs").write_text("remove me\n", encoding="utf-8")
+        nested_build = root / "tools/xtask/src/build"
+        nested_build.mkdir(parents=True)
+        (nested_build / "mod.rs").write_text("committed builder\n", encoding="utf-8")
         subprocess.run(["git", "-C", str(root), "add", "."], check=True)
         subprocess.run(["git", "-C", str(root), "commit", "-q", "-m", "initial"], check=True)
 
         (root / "tracked.rs").write_text("dirty source\n", encoding="utf-8")
+        (nested_build / "mod.rs").write_text("dirty builder\n", encoding="utf-8")
+        (nested_build / "untracked.rs").write_text("new builder\n", encoding="utf-8")
+        (root / "build").mkdir()
+        (root / "build/artifact").write_text("ignore\n", encoding="utf-8")
         (root / "removed.rs").unlink()
         (root / "untracked.rs").write_text("live source\n", encoding="utf-8")
         (root / "target").mkdir()
@@ -183,18 +194,215 @@ def checkout_mirror_has_a_no_rsync_path() -> None:
         (root / "driver-domains/linux/out/artifact").write_text("ignore\n", encoding="utf-8")
 
         original_which = runner.shutil.which
-        runner.shutil.which = lambda name: None if name == "rsync" else original_which(name)
-        try:
-            runner.prepare_checkout(root, checkout)
-        finally:
-            runner.shutil.which = original_which
+        modes = ["fallback"] + (["rsync"] if original_which("rsync") else [])
+        for mode in modes:
+            checkout = Path(temporary) / f"checkout-{mode}"
+            which = (lambda name: None if name == "rsync" else original_which(name)) \
+                if mode == "fallback" else original_which
+            with patch.object(runner.shutil, "which", which):
+                runner.prepare_checkout(root, checkout)
 
-        assert (checkout / ".git").is_dir()
-        assert (checkout / "tracked.rs").read_text(encoding="utf-8") == "dirty source\n"
-        assert (checkout / "untracked.rs").read_text(encoding="utf-8") == "live source\n"
-        assert not (checkout / "removed.rs").exists()
-        assert not (checkout / "target").exists()
-        assert not (checkout / "driver-domains/linux/out").exists()
+            assert (checkout / ".git").is_dir()
+            assert (checkout / "tracked.rs").read_text(encoding="utf-8") == "dirty source\n"
+            assert (checkout / "untracked.rs").read_text(encoding="utf-8") == "live source\n"
+            assert (checkout / "tools/xtask/src/build/mod.rs").read_text() == "dirty builder\n"
+            assert (checkout / "tools/xtask/src/build/untracked.rs").read_text() == "new builder\n"
+            assert not (checkout / "removed.rs").exists()
+            assert not (checkout / "target").exists()
+            assert not (checkout / "build").exists()
+            assert not (checkout / "driver-domains/linux/out").exists()
+
+
+def assert_process_exited(pid: int) -> None:
+    # pidfds signal actual exit, not merely a signal sent; no sleep/poll loop
+    # or dependence on how quickly the host's init reaps an orphan zombie.
+    try:
+        fd = os.pidfd_open(pid)
+    except ProcessLookupError:
+        return
+    try:
+        event = select.poll()
+        event.register(fd, select.POLLIN)
+        assert event.poll(2000), f"witness descendant still running: {pid}"
+    finally:
+        os.close(fd)
+
+
+def timeout_and_interruption_kill_real_cargo_descendants() -> None:
+    if os.name != "posix" or not hasattr(os, "pidfd_open"):
+        return
+    for interrupt in [False, True]:
+        with tempfile.TemporaryDirectory(prefix="rustos-mutation-process-group-") as temporary:
+            root = Path(temporary)
+            child_file = root / "child.pid"
+            child = "import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"
+            script = (
+                "import os,subprocess,sys,time; from pathlib import Path; "
+                f"child=subprocess.Popen([sys.executable,'-c',{child!r}]); "
+                f"Path({str(child_file)!r}).write_text(str(child.pid)); "
+                "print('exact-witness-started',flush=True); time.sleep(60)"
+            )
+            original = runner.subprocess.Popen.communicate
+            interrupted = False
+
+            def communicate(process, *args, **kwargs):
+                nonlocal interrupted
+                if interrupt and not interrupted:
+                    interrupted = True
+                    assert process.stdout.readline().strip() == "exact-witness-started"
+                    raise KeyboardInterrupt
+                return original(process, *args, **kwargs)
+
+            try:
+                with patch.object(runner.subprocess.Popen, "communicate", communicate):
+                    try:
+                        result, _ = runner.run_cargo_command(root, root / "target",
+                            [sys.executable, "-c", script], 1000)
+                    except KeyboardInterrupt:
+                        assert interrupt
+                    else:
+                        assert not interrupt
+                        assert result.returncode == runner.TIMEOUT_RETURNCODE
+                        assert "exact-witness-started" in result.stdout
+                        assert "exceeded max_ms=1000" in result.stdout
+                assert_process_exited(int(child_file.read_text()))
+            finally:
+                # A failed regression must not itself leak the exact defect.
+                if child_file.exists():
+                    try:
+                        os.kill(int(child_file.read_text()), signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+
+
+def completed_commands_preserve_status_environment_and_merged_output() -> None:
+    with tempfile.TemporaryDirectory(prefix="rustos-mutation-command-") as temporary:
+        root = Path(temporary)
+        script = ("import os,sys; print(os.environ['CARGO_TARGET_DIR'],flush=True); "
+                  "print('stderr-kept',file=sys.stderr,flush=True); sys.exit(7)")
+        result, _ = runner.run_cargo_command(root, root / "target", [sys.executable, "-c", script], 5000)
+        assert result.returncode == 7
+        assert str(root / "target") in result.stdout
+        assert "stderr-kept" in result.stdout
+
+
+def cache_seals_literal_external_witness_inputs() -> None:
+    with tempfile.TemporaryDirectory(prefix="rustos-mutation-inputs-") as temporary:
+        root = Path(temporary)
+        package = root / "sample"
+        package.mkdir()
+        (package / "Cargo.toml").write_text('[package]\nname="sample"\nversion="0.1.0"\n')
+        source = ('#[test]\nfn witness() { let limit = 1; '
+                  'let _ = include_str!("probe.S"); '
+                  'let _ = include_bytes!("driver.c"); }\n')
+        (package / "lib.rs").write_text(source)
+        probe = package / "probe.S"
+        driver = package / "driver.c"
+        probe.write_text("original assembly")
+        driver.write_text("original driver")
+        policy = root / "runner.py"
+        policy.write_text("test policy")
+        row = mutation_row("include-input", "sample", "sample/lib.rs", "witness",
+                           "limit = 1", "limit = 2", source)
+        row.update(anchor_spec="1", anchor_context_sha256="anchor")
+        with patch.object(runner, "__file__", str(policy)):
+            first = runner.mutation_cache_key(root, row)
+            probe.write_text("changed assembly")
+            second = runner.mutation_cache_key(root, row)
+            assert first != second, "assembly change reused stale witness evidence"
+            driver.write_text("changed comparator")
+            assert second != runner.mutation_cache_key(root, row)
+            driver.unlink()
+            try:
+                runner.mutation_cache_key(root, row)
+            except FileNotFoundError:
+                pass
+            else:
+                raise AssertionError("missing included comparator admitted")
+            # A symlink cannot smuggle a host-side witness into repo evidence.
+            driver.symlink_to(root.parent / "outside-witness.c")
+            try:
+                runner.mutation_cache_key(root, row)
+            except ValueError as error:
+                assert "escapes repository" in str(error)
+            else:
+                raise AssertionError("external witness include admitted")
+        runner.witness_context_index.cache_clear()
+
+
+def mismatched_cache_key_never_falls_back_to_legacy_source_match() -> None:
+    row = mutation_row("cached", "sample", "sample/lib.rs", "witness",
+                       "limit = 1", "limit = 2", "let limit = 1;")
+    row["anchor_context_sha256"] = "anchor"
+    with tempfile.TemporaryDirectory(prefix="rustos-mutation-cache-") as temporary:
+        root = Path(temporary)
+        summary = root / "summary.json"
+        for present, key, expected_reuse in (
+            (True, "old-key", False), (True, None, False),
+            (True, "new-key", True), (False, None, True),
+        ):
+            old = {**row, "status": "killed"}
+            if present:
+                old["cache_key"] = key
+            summary.write_text(json.dumps({"registry_sha256": "registry", "mutations": [old]}))
+            with patch.object(runner, "mutation_cache_key", return_value="new-key"), \
+                    patch.dict(os.environ, {"RUSTOS_IMPLEMENTATION_MUTATION_CACHE": "on"}):
+                reused, pending = runner.reusable_mutation_outcomes(
+                    root, [dict(row)], summary, "registry")
+            assert bool(reused) == expected_reuse, (present, key, reused)
+            assert bool(pending) != expected_reuse, (present, key, pending)
+
+
+def cache_key_ignores_runner_edits_outside_kill_semantics() -> None:
+    with tempfile.TemporaryDirectory(prefix="rustos-mutation-semantics-") as temporary:
+        root = Path(temporary)
+        package = root / "sample"
+        package.mkdir()
+        (package / "Cargo.toml").write_text('[package]\nname="sample"\nversion="0.1.0"\n')
+        source = "#[test]\nfn witness() { let limit = 1; }\n"
+        (package / "lib.rs").write_text(source)
+        row = mutation_row("semantics", "sample", "sample/lib.rs", "witness",
+                           "limit = 1", "limit = 2", source)
+        row.update(anchor_spec="1", anchor_context_sha256="anchor")
+        policy = root / "runner.py"
+        policy.write_text("runner bytes before a logging-only edit")
+        with patch.object(runner, "__file__", str(policy)):
+            first = runner.mutation_cache_key(root, row)
+            policy.write_text("runner bytes after a logging-only edit")
+            assert runner.mutation_cache_key(root, row) == first, \
+                "a non-semantic runner edit discarded every cached kill"
+            runner.kill_semantics_digest.cache_clear()
+            with patch.object(runner, "KILL_SEMANTICS",
+                              (*runner.KILL_SEMANTICS, "checkpoint_path")):
+                assert runner.mutation_cache_key(root, row) != first, \
+                    "a kill-semantics change reused stale evidence"
+            runner.kill_semantics_digest.cache_clear()
+        runner.witness_context_index.cache_clear()
+    for name in runner.KILL_SEMANTICS:
+        assert callable(getattr(runner, name)), name
+
+
+def interrupted_lane_resumes_from_exact_key_checkpoint() -> None:
+    row = mutation_row("checkpointed", "sample", "sample/lib.rs", "witness",
+                       "limit = 1", "limit = 2", "let limit = 1;")
+    row["anchor_context_sha256"] = "anchor"
+    with tempfile.TemporaryDirectory(prefix="rustos-mutation-checkpoint-") as temporary:
+        root = Path(temporary)
+        summary = root / "summary.json"
+        checkpoint = runner.Checkpoint(runner.checkpoint_path(summary))
+        checkpoint.record({**row, "status": "survived", "cache_key": "new-key"})
+        checkpoint.record({**row, "status": "killed", "cache_key": "old-key"})
+        with patch.dict(os.environ, {"RUSTOS_IMPLEMENTATION_MUTATION_CACHE": "on"}), \
+                patch.object(runner, "mutation_cache_key", return_value="new-key"):
+            reused, pending = runner.reusable_mutation_outcomes(
+                root, [dict(row)], summary, "registry")
+            assert not reused and pending, "survivor or stale-key checkpoint reused"
+            checkpoint.record({**row, "status": "killed", "cache_key": "new-key"})
+            with runner.checkpoint_path(summary).open("a") as stream:
+                stream.write('{"id": "torn')
+            reused, pending = runner.reusable_mutation_outcomes(
+                root, [dict(row)], summary, "registry")
+            assert reused and not pending, "exact-key checkpointed kill was not resumed"
 
 
 def main() -> int:
@@ -229,6 +437,12 @@ def main() -> int:
     pristine_work_is_established_once_per_witness()
     restore_touches_every_registered_source()
     checkout_mirror_has_a_no_rsync_path()
+    timeout_and_interruption_kill_real_cargo_descendants()
+    completed_commands_preserve_status_environment_and_merged_output()
+    cache_seals_literal_external_witness_inputs()
+    mismatched_cache_key_never_falls_back_to_legacy_source_match()
+    cache_key_ignores_runner_edits_outside_kill_semantics()
+    interrupted_lane_resumes_from_exact_key_checkpoint()
 
     print("implementation mutation runner selftest passed")
     return 0

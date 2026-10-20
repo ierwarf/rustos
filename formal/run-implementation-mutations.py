@@ -7,14 +7,17 @@ import argparse
 import concurrent.futures
 import functools
 import hashlib
+import inspect
 import json
 import os
 import re
 import shutil
 import shlex
+import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import tomllib
 from dataclasses import dataclass
@@ -294,30 +297,48 @@ def run_cargo_command(
     env["CARGO_TARGET_DIR"] = str(target_dir)
     env["CARGO_INCREMENTAL"] = "1"
     started = time.monotonic()
-    try:
-        result = subprocess.run(
-            command,
-            cwd=checkout,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            timeout=timeout_ms / 1000,
-            env=env,
-            check=False,
-        )
-    except subprocess.TimeoutExpired as expired:
-        # Preserve timeouts as an explicit result. Evaluation treats a timeout
-        # from the mutant's exact witness as a kill, while a baseline/listing
-        # timeout remains a failed precondition.
-        captured = expired.output or b""
-        if isinstance(captured, bytes):
-            captured = captured.decode("utf-8", "replace")
-        result = subprocess.CompletedProcess(
-            expired.cmd,
-            returncode=TIMEOUT_RETURNCODE,
-            stdout=captured + f"\nrustos: witness exceeded max_ms={timeout_ms}\n",
-        )
+    # Cargo launches libtest as a child. subprocess.run(timeout=...) kills
+    # Cargo alone: a spinning mutant can then survive for hours, consuming a
+    # host CPU and perturbing every later KVM measurement. Own one isolated
+    # process group and reap it on timeout AND runner interruption.
+    with subprocess.Popen(
+        command,
+        cwd=checkout,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        env=env,
+        start_new_session=(os.name == "posix"),
+    ) as process:
+        try:
+            output, _ = process.communicate(timeout=timeout_ms / 1000)
+            result = subprocess.CompletedProcess(command, process.returncode, stdout=output)
+        except subprocess.TimeoutExpired:
+            kill_witness_group(process)
+            output, _ = process.communicate()
+            # Timeout is a kill only after the EXACT mutant witness started;
+            # baseline/listing/compile timeouts remain failed preconditions.
+            result = subprocess.CompletedProcess(
+                command,
+                returncode=TIMEOUT_RETURNCODE,
+                stdout=output + f"\nrustos: witness exceeded max_ms={timeout_ms}\n",
+            )
+        except BaseException:
+            kill_witness_group(process)
+            process.communicate()
+            raise
     return result, round((time.monotonic() - started) * 1000)
+
+
+def kill_witness_group(process: subprocess.Popen[str]) -> None:
+    """Terminate only this runner-owned session, including Cargo descendants."""
+    try:
+        if os.name == "posix":
+            os.killpg(process.pid, signal.SIGKILL)
+        else:
+            process.kill()
+    except ProcessLookupError:
+        pass
 
 
 def list_cargo_tests(
@@ -493,7 +514,9 @@ def prepare_checkout(root: Path, destination: Path) -> None:
         "driver-domains/linux/out",
     )
     command = ["rsync", "-a", "--delete"]
-    command.extend(f"--exclude={value}" for value in excludes)
+    # These are repository-root artifacts, not arbitrary source directories
+    # named build/target/logs (e.g. tools/xtask/src/build is product source).
+    command.extend(f"--exclude=/{value}" for value in excludes)
     command.extend([f"{root}/", f"{destination}/"])
     if shutil.which("rsync") is not None:
         subprocess.run(command, check=True)
@@ -543,8 +566,34 @@ def witness_context_index(package_root_raw: str) -> dict[str, tuple[tuple[str, b
     return {name: tuple(contexts) for name, contexts in indexed.items()}
 
 
+# Functions whose source decides what an anchor, a witness run and a kill mean.
+# The cache seals these bodies instead of the whole runner file, so logging,
+# sharding, checkpoint or comment edits no longer discard ~1400 already-killed
+# decisions. Approximation: kill semantics introduced OUTSIDE these functions
+# must be added here (or bump the cache tag); cache-disabled runs re-audit.
+KILL_SEMANTICS = (
+    "parse_occurrence", "anchor_offsets", "resolve_anchor", "cargo_test_base_command",
+    "resolve_listed_witness", "run_exact_witness", "exact_witness_executed",
+    "exact_witness_failed", "mutation_was_killed", "replace_resolved_anchor",
+    "witness_context_index",
+)
+
+
+@functools.lru_cache(maxsize=None)
+def kill_semantics_digest() -> str:
+    digest = hashlib.sha256()
+    for name in KILL_SEMANTICS:
+        function = globals()[name]
+        function = getattr(function, "__wrapped__", function)
+        digest.update(name.encode())
+        digest.update(b"\0")
+        digest.update(inspect.getsource(function).encode())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
 def mutation_cache_key(root: Path, mutation: dict[str, str | int]) -> str:
-    """Seal one anchor, its exact witness body, and build policy inputs.
+    """Seal one anchor, its witness and literal includes, and build policy inputs.
 
     Mutation evidence is deliberately cached at the decision witness rather
     than the containing package. Rust compiles a package as one unit, but a
@@ -560,7 +609,7 @@ def mutation_cache_key(root: Path, mutation: dict[str, str | int]) -> str:
     if package_root == root:
         raise ValueError(f"no package root for {mutation['source']}")
     digest = hashlib.sha256()
-    digest.update(b"rustos-implementation-mutation-cache-v2\0")
+    digest.update(b"rustos-implementation-mutation-cache-v4\0")
     semantic_fields = (
         "id", "source", "find", "replace", "anchor_spec", "package",
         "features", "target", "test", "max_ms",
@@ -586,18 +635,27 @@ def mutation_cache_key(root: Path, mutation: dict[str, str | int]) -> str:
             for path in package_root.rglob("*.rs")
             if "target" not in path.relative_to(package_root).parts
         ]
+    inputs = [package_root / "Cargo.toml"]
+    literal_include = re.compile(rb'\binclude_(?:str|bytes)!\s*\(\s*"([^"\\\r\n]+)"\s*\)')
     for path, context in sorted(witness_contexts, key=lambda item: item[0]):
         digest.update(path.relative_to(root).as_posix().encode())
         digest.update(b"\0")
         digest.update(context)
         digest.update(b"\0")
+        # Assembly/comparator data included by a literal witness must invalidate
+        # its evidence even if the Rust body and mutation anchor are unchanged.
+        for match in literal_include.finditer(context):
+            included = (path.parent / match.group(1).decode("utf-8")).resolve()
+            if not included.is_relative_to(root.resolve()):
+                raise ValueError(f"witness include escapes repository: {included}")
+            inputs.append(included)
 
-    inputs = [package_root / "Cargo.toml"]
     for name in ("Cargo.toml", "Cargo.lock", ".cargo/config.toml", "rust-toolchain.toml"):
         path = root / name
         if path.is_file():
             inputs.append(path)
-    inputs.append(Path(__file__))
+    digest.update(kill_semantics_digest().encode())
+    digest.update(b"\0")
     for path in sorted(set(inputs)):
         relative = path.relative_to(root)
         digest.update(relative.as_posix().encode())
@@ -627,6 +685,12 @@ def reusable_mutation_outcomes(
         for entry in previous_summary.get("mutations", [])
         if isinstance(entry, dict) and entry.get("status") == "killed"
     }
+    # Kills checkpointed by an interrupted run. Each line carries its own exact
+    # cache key, so it is reused under the same exact-key rule as the summary.
+    for entry in read_checkpoint(checkpoint_path(summary_path)):
+        previous[str(entry.get("id"))] = {
+            key: value for key, value in entry.items() if key != "cache_reused"
+        }
     same_registry = previous_summary.get("registry_sha256") == registry_sha256
     reused: list[dict[str, str | int]] = []
     pending: list[dict[str, str | int]] = []
@@ -636,9 +700,10 @@ def reusable_mutation_outcomes(
         exact = old is not None and old.get("cache_key") == cache_key
         # Migration path for evidence written before witness-scoped cache keys
         # existed. Exact registry, source, anchor, and witness semantics must
-        # still match; after one run every entry carries the v2 key.
+        # still match. A present but mismatched key must NEVER use this fallback.
         legacy = (
             old is not None
+            and "cache_key" not in old
             and same_registry
             and old.get("source_sha256") == mutation.get("source_sha256")
             and old.get("anchor_context_sha256")
@@ -659,6 +724,47 @@ def reusable_mutation_outcomes(
             mutation["cache_key"] = cache_key
             pending.append(mutation)
     return reused, pending
+
+
+def checkpoint_path(summary_path: Path) -> Path:
+    return summary_path.with_name(summary_path.stem + ".partial.jsonl")
+
+
+def read_checkpoint(path: Path) -> list[dict[str, str | int]]:
+    entries = []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return entries
+    for line in lines:
+        try:
+            entry = json.loads(line)
+        except json.JSONDecodeError:
+            continue  # a torn final line from an interrupted append
+        if isinstance(entry, dict) and entry.get("status") == "killed" and entry.get("cache_key"):
+            entries.append(entry)
+    return entries
+
+
+class Checkpoint:
+    """Append each exact-key kill as it lands so an interrupted lane resumes."""
+
+    def __init__(self, path: Path | None) -> None:
+        self.path = path
+        self._lock = threading.Lock()
+
+    def record(self, outcome: dict[str, str | int]) -> None:
+        if self.path is None or outcome.get("status") != "killed":
+            return
+        line = json.dumps(
+            {key: value for key, value in outcome.items() if key != "detail"},
+            sort_keys=True,
+        )
+        with self._lock, self.path.open("a", encoding="utf-8") as stream:
+            stream.write(line + "\n")
+
+
+CHECKPOINT = Checkpoint(None)
 
 
 @dataclass(frozen=True)
@@ -882,6 +988,7 @@ def evaluate_mutation(
 
 # A shard's own `CARGO_TARGET_DIR` measured ~1.4 GiB warm, plus its checkout.
 SHARD_DISK_BUDGET_BYTES = 3 * 1024 * 1024 * 1024
+SHARD_MEMORY_BUDGET_BYTES = 3 * 1024 * 1024 * 1024
 
 
 def shard_count(mutation_count: int, artifact_dir: Path) -> int:
@@ -902,7 +1009,13 @@ def shard_count(mutation_count: int, artifact_dir: Path) -> int:
     except OSError:
         return 1
     affordable = 1 + int(free // SHARD_DISK_BUDGET_BYTES)
-    return max(1, min(4, (os.cpu_count() or 1) // 4, mutation_count, affordable))
+    # One kernel-crate rustc/link per shard; keep that resident set in RAM.
+    try:
+        available = os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+        memory = max(1, int(available // SHARD_MEMORY_BUDGET_BYTES))
+    except (ValueError, OSError):
+        memory = 4
+    return max(1, min(6, (os.cpu_count() or 1) // 3, mutation_count, affordable, memory))
 
 
 def run_bucket_mutations(
@@ -918,7 +1031,12 @@ def run_bucket_mutations(
     )
     baselines = PristineBaselines(checkout, target_dir, artifact_dir, originals)
     baselines.establish(ordered)
-    return [evaluate_mutation(baselines, mutation) for mutation in ordered]
+    outcomes = []
+    for mutation in ordered:
+        outcome = evaluate_mutation(baselines, mutation)
+        CHECKPOINT.record(outcome)
+        outcomes.append(outcome)
+    return outcomes
 
 
 def run_shards(
@@ -1022,6 +1140,8 @@ def main() -> int:
         root, mutations, summary_path, registry_sha256
     )
     outcomes = list(reused)
+    if pending and os.environ.get("RUSTOS_IMPLEMENTATION_MUTATION_CACHE", "on") != "off":
+        CHECKPOINT.path = checkpoint_path(summary_path)
     if pending:
         with tempfile.TemporaryDirectory(prefix="rustos-implementation-mutations-") as temp:
             checkout = Path(temp) / "checkout"
@@ -1080,12 +1200,13 @@ def main() -> int:
         "cache": {
             "reused": len(reused),
             "executed": len(pending),
-            "approximation": "anchor-and-exact-witness-body-v2",
+            "approximation": "anchor-and-exact-witness-body-literal-includes-kill-semantics-v4",
         },
     }
     summary_path.write_text(
         json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
+    checkpoint_path(summary_path).unlink(missing_ok=True)
     scope = "focused" if focused_ids else "complete"
     print(
         f"implementation mutations passed scope={scope} "

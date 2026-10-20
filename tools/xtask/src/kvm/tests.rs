@@ -768,6 +768,17 @@ uiserver profile: elapsed_ms=1000 frame_hz_milli=60000 input_events=60 input_gap
     }
 
     #[test]
+    fn kernel_emergency_panic_is_fatal_even_when_other_cpus_keep_running() {
+        for failure in [
+            "!PANIC-SITE:00000203:kernel/hal/src/arch/tlb_shootdown.rs",
+            "[PANIC]",
+        ] {
+            assert!(runtime_stall_or_crash_observed(failure), "{failure}");
+        }
+        assert!(!runtime_stall_or_crash_observed("uiserver: panic hook installed"));
+    }
+
+    #[test]
     fn failure_evidence_keeps_only_bounded_causal_records() {
         let rustos = "unrelated payload\n\
 milestone: name=product-root-core-ready pid=1 tid=1 ts_us=100\n\
@@ -1061,6 +1072,17 @@ uiserver: slow loop iter_ms=51 wayland_ms=0 present_ms=51 console_windows=1 wayl
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn retired_gpu_aliases_are_unknown_even_in_a_valid_display_topology() {
+        for alias in ["--physical-amdgpu", "--amd-vfct"] {
+            let error = parse_smoke_options(
+                vec!["--gui-dvm-surfaces".into(), alias.into(), "unused".into()].into_iter(),
+            )
+            .unwrap_err();
+            assert_eq!(error.to_string(), format!("unknown KVM smoke option: {alias}"));
+        }
     }
 
     #[test]

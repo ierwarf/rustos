@@ -803,9 +803,11 @@ extern "C" fn software_schedule_interrupt_dispatch(
                     scheduling_context,
                 )
                 .expect("fast IPC reply trap carried stale scheduling-context custody");
-            if outcome == super::scheduler::FastIpcReplyHandoffOutcome::Direct {
-                immediate_task_id = Some(caller_task_id);
-            }
+            // The producer publishes typed fair/FIFO custody, not a Direct
+            // execution grant. Its successful outcome may request an attempt
+            // through that SAME FIFO; requiring the removed Direct producer
+            // here made every real reverse reply miss the fast return path.
+            immediate_task_id = outcome.dispatch_hint(caller_task_id);
             // Rejection has already consumed/refused its ORIGINAL typed loan;
             // a generic fresh lookup must not clear a later wait incarnation.
         }

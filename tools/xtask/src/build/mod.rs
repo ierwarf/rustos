@@ -1006,15 +1006,37 @@ fn build_c_demo_manifest(config: &Config, manifest: &PackageManifest) -> Result<
         .map(String::as_str)
         .collect::<Vec<_>>();
     let output = manifest.artifact_path(config);
-    if output_is_fresh(&output, &[source.clone(), manifest.manifest_path.clone()])? {
+    let sources = c_demo_sources(source, &manifest.package_root, &manifest.build.extra_sources)?;
+    let inputs = c_demo_inputs(&sources, &manifest.manifest_path);
+    if output_is_fresh(&output, &inputs)? {
         return Ok(());
     }
-    build_c_demo(&config.cc, &source, &output, &extra_args)
+    build_c_demo(&config.cc, &sources, &output, &extra_args)
+}
+
+fn c_demo_sources(source: PathBuf, package_root: &Path, extra: &[String]) -> Result<Vec<PathBuf>> {
+    let mut sources = vec![source];
+    for name in extra {
+        if name.is_empty() || !Path::new(name).components().all(|part|
+            matches!(part, std::path::Component::Normal(_))) {
+            bail!("C package extra source is not a package-relative file: {name}");
+        }
+        let path = package_root.join(name);
+        if sources.contains(&path) {
+            bail!("duplicate C package translation unit: {}", path.display());
+        }
+        sources.push(path);
+    }
+    Ok(sources)
+}
+
+fn c_demo_inputs(sources: &[PathBuf], manifest: &Path) -> Vec<PathBuf> {
+    sources.iter().cloned().chain(core::iter::once(manifest.to_path_buf())).collect()
 }
 
 fn build_c_demo(
     cc: &std::ffi::OsString,
-    source: &Path,
+    sources: &[PathBuf],
     output: &Path,
     extra_args: &[&str],
 ) -> Result<()> {
@@ -1024,7 +1046,7 @@ fn build_c_demo(
     fs::create_dir_all(parent)?;
 
     let mut command = Command::new(cc);
-    command.arg(source);
+    command.args(sources);
     for arg in extra_args {
         command.arg(arg);
     }
@@ -1355,118 +1377,4 @@ fn canonical_forward_dll_name(name: &str) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{
-        canonical_forward_dll_name, parse_def_exports, parse_objdump_imports, reject_contract_token,
-    };
-    use fs_err as fs;
-    use std::path::Path;
-
-    #[test]
-    fn retired_dvm_display_path_guard_fails_closed() {
-        let path = Path::new("rustos-dvm-display.c");
-        assert!(reject_contract_token("active GPU path", path, "render_legacy").is_ok());
-        let error = reject_contract_token("render_legacy", path, "render_legacy")
-            .expect_err("retired renderer must be rejected");
-        assert!(
-            error
-                .to_string()
-                .contains("retired DVM display path returned")
-        );
-    }
-
-    #[test]
-    fn parse_objdump_imports_stops_after_import_tables() {
-        let text = r#"
-The Import Tables (interpreted .idata section contents)
- vma:            Hint    Time      Forward  DLL       First
-                 Table   Stamp     Chain    Name      Thunk
- 0000d000	0000d040 00000000 00000000 0000d62c 0000d1c8
-
-	DLL Name: KERNEL32.dll
-	vma:  Hint/Ord Member-Name Bound-To
-	d350	  281  DeleteCriticalSection
-	d368	  317  EnterCriticalSection
-
- 0000d014	0000d0b0 00000000 00000000 0000d6c4 0000d238
-
-	DLL Name: msvcrt.dll
-	vma:  Hint/Ord Member-Name Bound-To
-	d568	  953  fprintf
-	d572	  955  fputc
-
-The Function Table (interpreted .pdata section contents)
-vma:			BeginAddress	 EndAddress	  UnwindData
- 000000000040a000:	0000000000401000 0000000000401001 000000000040b000
-"#;
-
-        let imports = parse_objdump_imports(text);
-        assert_eq!(
-            imports,
-            vec![
-                (
-                    String::from("kernel32.dll"),
-                    String::from("DeleteCriticalSection"),
-                ),
-                (
-                    String::from("kernel32.dll"),
-                    String::from("EnterCriticalSection"),
-                ),
-                (String::from("msvcrt.dll"), String::from("fprintf")),
-                (String::from("msvcrt.dll"), String::from("fputc")),
-            ]
-        );
-    }
-
-    #[test]
-    fn parse_objdump_imports_ignores_text_before_import_tables() {
-        let text = r#"
-There is an import table in .idata at 0x40d000
- 000000000040a000:	0000000000401000 0000000000401001 000000000040b000
-The Import Tables (interpreted .idata section contents)
-
-	DLL Name: KERNEL32.dll
-	vma:  Hint/Ord Member-Name Bound-To
-	d40c	 1407  Sleep
-"#;
-
-        let imports = parse_objdump_imports(text);
-        assert_eq!(
-            imports,
-            vec![(String::from("kernel32.dll"), String::from("Sleep"))]
-        );
-    }
-
-    #[test]
-    fn parse_def_exports_recognizes_forwarders() {
-        let temp_dir =
-            std::env::temp_dir().join(format!("rustos-xtask-def-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&temp_dir);
-        fs::create_dir_all(&temp_dir).unwrap();
-        let path = temp_dir.join("exports.def");
-        fs::write(
-            &path,
-            "LIBRARY kernel32.dll\nEXPORTS\n    GetProcAddress=KERNELBASE.GetProcAddress\n    Sleep\n",
-        )
-        .unwrap();
-
-        let exports = parse_def_exports(&path).unwrap();
-        assert_eq!(exports.len(), 2);
-        assert_eq!(exports[0].name, "GetProcAddress");
-        assert_eq!(exports[0].forward_dll.as_deref(), Some("kernelbase.dll"));
-        assert_eq!(exports[0].forward_symbol.as_deref(), Some("GetProcAddress"));
-        assert_eq!(exports[1].name, "Sleep");
-        assert_eq!(exports[1].forward_dll, None);
-
-        let _ = fs::remove_dir_all(&temp_dir);
-    }
-
-    #[test]
-    fn canonical_forward_dll_name_adds_missing_suffix() {
-        assert_eq!(canonical_forward_dll_name("KERNELBASE"), "kernelbase.dll");
-        assert_eq!(
-            canonical_forward_dll_name("vcruntime140.dll"),
-            "vcruntime140.dll"
-        );
-    }
-}
+mod tests;

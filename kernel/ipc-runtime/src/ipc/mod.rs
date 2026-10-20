@@ -38,7 +38,7 @@ use legacy_test_api::*;
 
 pub use endpoint_priority::EndpointCallPriority;
 use endpoint_priority::EndpointObject;
-pub use endpoint_receive::{EndpointReceive, receive_or_wait};
+pub use endpoint_receive::{EndpointReceive, receive_or_wait, received_request_retains_custody};
 pub use shared_region_hold::KernelSharedRegionMappingHold;
 
 use crate::ipc_core::SharedRegionHandle;
@@ -2031,6 +2031,7 @@ pub fn endpoint_receiver_process_for_reply(reply: KernelReplyHandle) -> Option<u
         .flatten()
 }
 
+
 /// Confirms that the exact live reply already crossed its terminal reply
 /// transition and returned scheduling-context custody to `caller_task_id`.
 ///
@@ -2895,6 +2896,34 @@ pub fn remove_endpoint_waiter_for_task(endpoint: KernelEndpointHandle, task_id: 
             before.saturating_sub(endpoint_object.waiting_receivers.len())
         })
         .unwrap_or(0)
+}
+
+/// Republishes a receive waiter that this call's own enqueue popped when the
+/// scheduler then refused to wake it. Mirrors `rollback_fast_endpoint_call`:
+/// without it the receiver commits its block outside the waiter list and no
+/// later call can ever wake it. Capacity 0 keeps the fast path off this entry
+/// until the receiver re-registers its real capacity on its next receive.
+pub fn restore_endpoint_receiver_waiter(
+    endpoint: KernelEndpointHandle,
+    task_id: u64,
+) -> Result<bool, IpcError> {
+    ENDPOINTS
+        .with_mut(endpoint.raw(), |object| {
+            if object.waiting_receivers.iter().any(|w| w.task_id == task_id) {
+                return Ok(false);
+            }
+            if object.waiting_receivers.len() >= MAX_ENDPOINT_WAITERS {
+                return Err(IpcError::NoMemory);
+            }
+            object
+                .waiting_receivers
+                .push_front(endpoint_priority::EndpointReceiverWaiter {
+                    task_id,
+                    request_capacity: 0,
+                });
+            Ok(true)
+        })
+        .ok_or(IpcError::InvalidHandle)?
 }
 
 pub fn remove_endpoint_waiters_for_task(task_id: u64) -> usize {

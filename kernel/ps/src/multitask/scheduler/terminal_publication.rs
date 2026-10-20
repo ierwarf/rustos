@@ -128,6 +128,10 @@ pub(super) unsafe fn guarded(mut owner: Producer, eligible_cpus: &dyn Fn(usize) 
                 .process_id
                 .expect("live user task retirement requires a process identity"),
             process_terminal,
+            user_fault_vector: match owner.reason() {
+                TaskRetireReason::UserFault { vector, .. } => Some(vector),
+                _ => None,
+            },
             clear_child_tid: linux.map(|state| state.clear_child_tid).unwrap_or(0),
             robust_list_head: linux.map(|state| state.robust_list_head).unwrap_or(0),
             robust_list_len: linux.map(|state| state.robust_list_len).unwrap_or(0),

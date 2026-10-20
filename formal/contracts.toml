@@ -893,6 +893,18 @@ flows = ["dvm-display-ingress"]
 reason = "Display snapshots and damage bounds cross an untrusted shared-memory boundary."
 
 [[risk_surfaces]]
+path = "kernel/io-manager/src/io/dvm_display/installation.rs"
+severity = "critical"
+flows = ["dvm-display-ingress"]
+reason = "Transactional PCI/MSI-X installation publishes the exact display apertures and initial prime invitation."
+
+[[risk_surfaces]]
+path = "kernel/io-manager/src/io/dvm_display/peer.rs"
+severity = "critical"
+flows = ["dvm-display-ingress"]
+reason = "Generation-qualified peer readiness, completion and revoke cross an untrusted shared-memory boundary."
+
+[[risk_surfaces]]
 path = "kernel/io-manager/src/api.rs"
 severity = "critical"
 flows = ["input-delivery-lifecycle"]
@@ -2159,6 +2171,20 @@ models = [
 
 [[source_mappings]]
 path = "kernel/io-manager/src/io/dvm_display.rs"
+models = [
+    "dvm-display-readiness/DvmDisplayReadiness",
+    "dvm-transport-lifecycle/DvmTransportLifecycle",
+]
+
+[[source_mappings]]
+path = "kernel/io-manager/src/io/dvm_display/installation.rs"
+models = [
+    "dvm-display-readiness/DvmDisplayReadiness",
+    "dvm-transport-lifecycle/DvmTransportLifecycle",
+]
+
+[[source_mappings]]
+path = "kernel/io-manager/src/io/dvm_display/peer.rs"
 models = [
     "dvm-display-readiness/DvmDisplayReadiness",
     "dvm-transport-lifecycle/DvmTransportLifecycle",

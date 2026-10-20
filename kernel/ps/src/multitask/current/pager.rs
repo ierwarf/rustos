@@ -1,7 +1,9 @@
-//! Lock-free current-task pager authority and normal-context VMA publication.
+//! Current-task pager authority and normal-context VMA publication.
 //!
-//! Exception entry consumes only the CPU-local identity and atomic VMA
-//! publication. Mapping publication and revocation retain the target process
+//! Exception entry uses CPU-local identity and atomic VMA publication, with
+//! original Current-bank metadata as the fallback for an overlapping identity
+//! publication. It never takes ProcessStateLock. Mapping publication and
+//! revocation retain the target process
 //! in normal syscall context, but publication no longer builds page tables:
 //! it reserves address space and proves the range is free.
 
@@ -9,7 +11,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use x86_64::{VirtAddr, instructions::interrupts};
 
-use super::{current_user_process_id, published_current_identity};
+use super::{current_user_process_id, owned_current_user_binding, published_current_identity};
 use crate::multitask::{cpu_local, process_table};
 
 /// Anonymous pages admitted by reservation, and the intermediate page-table
@@ -50,13 +52,20 @@ fn record_reservation(page_count: u64) {
     }
 }
 
-fn published_current_pager_binding() -> Option<(
+pub(in crate::multitask) fn published_current_pager_binding() -> Option<(
     u64,
     process_table::ProcessHandle,
     process_table::ProcessIdentity,
 )> {
-    let identity = published_current_identity()?;
-    let (task_id, _, handle, _) = identity.user_binding()?;
+    let (task_id, _, handle, _) = if let Some(identity) = published_current_identity() {
+        identity.user_binding()?
+    } else {
+        // Caller retains this CPU's masked exception/Current scope. An odd
+        // metadata publication is not absence: only the original physical bank
+        // may supply the same joined task/process binding, never a catalog or
+        // scalar slot fallback. A missing/foreign bank still refuses.
+        owned_current_user_binding()?
+    };
     let process = process_table::published_live_process_identity(handle)?;
     Some((task_id, handle, process))
 }

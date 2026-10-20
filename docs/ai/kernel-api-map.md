@@ -34,7 +34,18 @@ process/MM generation before accepting an unbound region template; they are
 broker-time only and never appear in the fault path. The bounded extent
 prefilters recheck the same even per-slot sequence after reading relaxed
 bounds; an odd or changed sequence delegates to the full snapshot instead of
-returning a false negative from stale bounds.
+returning a false negative from stale bounds. Range rewrites also retain a
+per-process, non-wrapping consistency epoch from first withdrawal through PTE
+mutation and every replacement or original rollback. Fault lookup encloses the
+whole scan (including misses/permission errors) in that epoch; an odd/changed
+interval returns `Unstable`, not a terminal `Stale` page fault. Readers do not
+spin or acquire the writer lock. This follows the complete-read-interval rule
+in Linux's [sequence counter documentation](https://docs.kernel.org/locking/seqlock.html).
+An overlapping task-identity publication may use only the same CPU's original
+Current-bank joined binding, as ordinary user copy already does; neither an
+absent publication nor a scalar slot grants process/MM authority. Native tests
+model the earlier masked IRQ entry and exercise the actual binding/VMA bodies,
+not privileged CLI/STI hardware execution.
 
 ## Boot order
 
@@ -93,8 +104,15 @@ Do not reorder without reading `kernel/src/main.rs` and
   snapshots registered function pointers and releases its hook-registry guard
   before invoking any callback. An expired RTC waiter remains published and is
   re-notified on later ticks until the resumed task disarms its exact task
-  record; notification alone never destroys the last deadline authority. Direct
-  `block_current_task`/`block_current_user_task` entry points do not exist.
+  record; notification alone never destroys the last deadline authority. A
+  refused wake is also only a notification attempt, not proof of task death:
+  frame/CPU publication may be transient. HAL's `TaskHooks::wake_task` routes
+  the same scheduler task-ID domain as deadline registration, including kernel
+  reply consumers; user-qualified wake remains a separate PS API. No extra
+  timer-table lock is acquired after invoking the callback. This follows the
+  [condition/recheck separation of wait queues](https://docs.kernel.org/driver-api/basics.html#wait-queues-and-wake-events),
+  not a claim that the abstract clock model proves CPU scheduling fairness.
+  Direct `block_current_task`/`block_current_user_task` entry points do not exist.
   Retired user slots are intentionally unreapable until executive
   housekeeping completes the exact
   `RetiredTaskCleanup`/`cleanup_retired_task_runtime_state` handshake; new

@@ -77,6 +77,21 @@ static IRQ_SAFE_CLASSES: AtomicU64 = AtomicU64::new(0);
 #[cfg(rustos_boot_image)]
 static IRQ_UNSAFE_CLASSES: AtomicU64 = AtomicU64::new(0);
 
+/// Publish before rechecking the opposite classification. Both CPUs may have
+/// observed an empty opposite set before either publication; using that earlier
+/// snapshot would admit the same class as both IRQ-safe and IRQ-unsafe. In the
+/// single SeqCst order, at least the later publisher must see the conflict.
+/// The fresh snapshot also closes classification-versus-new-edge races.
+fn publish_irq_usage(own: &AtomicU64, opposite: &AtomicU64, bit: u64) -> u64 {
+    // ORDERING: the publication precedes the opposite load in the SAME global
+    // order used by new dependency edges and classification reachability.
+    own.fetch_or(bit, Ordering::SeqCst);
+    let opposite_classes = opposite.load(Ordering::SeqCst);
+    assert_eq!(opposite_classes & bit, 0,
+        "lock-class concurrent IRQ-safe/IRQ-unsafe classification conflict");
+    opposite_classes
+}
+
 #[cfg(rustos_boot_image)]
 pub(super) fn record_irq_usage(cpu: usize, class: usize, acquire_site: &'static Location<'static>) {
     let bit = 1_u64 << class;
@@ -100,7 +115,7 @@ pub(super) fn record_irq_usage(cpu: usize, class: usize, acquire_site: &'static 
         if IRQ_SAFE_CLASSES.load(Ordering::SeqCst) & bit == 0 {
             // ORDERING: SeqCst publishes IRQ-safe use before dependency queries
             // or a process-context unsafe admission can proceed.
-            IRQ_SAFE_CLASSES.fetch_or(bit, Ordering::SeqCst);
+            let unsafe_classes = publish_irq_usage(&IRQ_SAFE_CLASSES, &IRQ_UNSAFE_CLASSES, bit);
             assert!(
                 !class_reaches_any(class, unsafe_classes),
                 "IRQ-safe lock class reaches an IRQ-unsafe class class={}",
@@ -126,7 +141,7 @@ pub(super) fn record_irq_usage(cpu: usize, class: usize, acquire_site: &'static 
         if IRQ_UNSAFE_CLASSES.load(Ordering::SeqCst) & bit == 0 {
             // ORDERING: SeqCst publishes the unsafe classification before the
             // global reachability query and every future IRQ acquisition.
-            IRQ_UNSAFE_CLASSES.fetch_or(bit, Ordering::SeqCst);
+            let safe_classes = publish_irq_usage(&IRQ_UNSAFE_CLASSES, &IRQ_SAFE_CLASSES, bit);
             assert!(
                 !any_class_reaches(safe_classes, class),
                 "IRQ-unsafe lock class is reachable from an IRQ-safe class class={}",
@@ -203,4 +218,55 @@ pub(super) fn graph_reaches(
         frontier |= edges(node) & !visited;
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+    use super::*;
+
+    #[test]
+    fn stale_opposite_observations_cannot_admit_conflicting_irq_classifications() {
+        for reverse in [false, true] {
+            let safe = AtomicU64::new(0);
+            let unsafe_ = AtomicU64::new(0);
+            let bit = 1 << 42;
+            // BOTH actual record_irq_usage prechecks may run before either
+            // publication. Replay that exact cross-CPU interleaving, without
+            // timing assumptions or changes to the global production graph.
+            assert_eq!(safe.load(Ordering::SeqCst) & bit, 0);
+            assert_eq!(unsafe_.load(Ordering::SeqCst) & bit, 0);
+            let (first, second) = if reverse { (&unsafe_, &safe) } else { (&safe, &unsafe_) };
+            assert_eq!(publish_irq_usage(first, second, bit), 0);
+            assert!(std::panic::catch_unwind(|| publish_irq_usage(second, first, bit)).is_err());
+        }
+    }
+
+    #[test]
+    fn simultaneous_irq_classification_publishers_cannot_both_succeed() {
+        let safe = AtomicU64::new(0);
+        let unsafe_ = AtomicU64::new(0);
+        let ready = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            let a = scope.spawn(|| {
+                assert_eq!(unsafe_.load(Ordering::SeqCst), 0);
+                ready.wait();
+                std::panic::catch_unwind(|| publish_irq_usage(&safe, &unsafe_, 1 << 51)).is_ok()
+            });
+            let b = scope.spawn(|| {
+                assert_eq!(safe.load(Ordering::SeqCst), 0);
+                ready.wait();
+                std::panic::catch_unwind(|| publish_irq_usage(&unsafe_, &safe, 1 << 51)).is_ok()
+            });
+            assert!(!(a.join().unwrap() && b.join().unwrap()));
+        });
+    }
+
+    #[test]
+    fn new_irq_classification_returns_fresh_opposite_set_for_transitive_checks() {
+        let own = AtomicU64::new(0);
+        let opposite = AtomicU64::new((1 << 7) | (1 << 54));
+        assert_eq!(publish_irq_usage(&own, &opposite, 1 << 42), (1 << 7) | (1 << 54));
+        assert_eq!(own.load(Ordering::SeqCst), 1 << 42);
+    }
 }

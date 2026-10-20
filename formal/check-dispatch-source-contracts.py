@@ -50,6 +50,46 @@ def ordered(source, anchors, boundary):
         after = found + len(anchor)
 
 
+current_ipc = Path('kernel/ps/src/multitask/current/ipc.rs').read_text()
+ordered(body(current_ipc, 'settle_reply_scheduling_context'), [
+    'DispatchPreemption::enter()', 'scope.mask_irqs()', 'reply_context_custody(owner_task_id, identity)',
+    'classify_unpublished_reply_custody(matches, live)', 'release_reply_donation('],
+    'one original masked CPU encloses reply attribution and exact ledger release')
+ordered(body(current_ipc, 'settle_terminal_ipc_reply_scheduling_context'), [
+    'settle_reply_scheduling_context(reply, custody)',
+    '!= ReplySchedulingContextSettlement::IdentityMismatch'],
+    'terminal completion/cancel permits retired original owner but not live foreign context')
+ordered(body(current_ipc, 'complete_ipc_reply_wake_handoff_with_custody'), [
+    'custody.caller_task_id()', 'completion.caller_task_id',
+    'settle_terminal_ipc_reply_scheduling_context(reply, custody)',
+    'complete_ipc_reply_wake_handoff(reply, completion.caller_task_id)'],
+    'late slow reply still uses exact original typed caller wake, never replacement funding')
+
+# A per-slot stable empty record is not a committed unmap while a whole range
+# rewrite withdraws/moves/replaces its original publications. These are bounded
+# observations only, not a new process/frame grant or an IRQ-off spinning lock.
+pager_vma = Path('kernel/ps/src/multitask/pager_vma.rs').read_text()
+ordered(body(pager_vma, 'lookup_slot'), ['read_rewrite_epoch(handle, ||',
+    'for (index, slot)', 'slot.may_cover(address)', 'slot.snapshot()?',
+    'region_matches_identity(', 'admit_access(region, access)'],
+    'complete VMA scan is enclosed by one whole-rewrite observation')
+rewrite_epoch = Path('kernel/ps/src/multitask/pager_vma/rewrite_epoch.rs').read_text()
+ordered(pager_vma, ['mod rewrite_epoch;', 'use rewrite_epoch::{RangeRewrite, read_rewrite_epoch};'],
+    'actual lookup links the split whole-rewrite reader and original writer interval')
+ordered(body(rewrite_epoch, 'read_rewrite_epoch'), ['load(Ordering::Acquire)',
+    'before & 1 != 0', 'PagerVmaError::Unstable', 'let result = scan()',
+    'fence(Ordering::Acquire)', 'sequence.load(Ordering::Relaxed) != before',
+    'PagerVmaError::Unstable', 'result'], 'VMA fault scan retries, never trusts a temporary hole')
+ordered(body(pager_vma, 'rewrite_range'), ['let _rewrite = RangeRewrite::begin(handle)?',
+    'slots[slot_index].publish(None)', 'if let Err(error) = mutate()',
+    'slots[targets[index]].publish(Some(rewritten[index]))'],
+    'whole-rewrite interval survives withdrawal, PTE callback and all replacement/rollback effects')
+ordered(body(Path('kernel/ps/src/multitask/current/pager.rs').read_text(),
+    'published_current_pager_binding'), ['published_current_identity()',
+    'identity.user_binding()?', 'owned_current_user_binding()?',
+    'published_live_process_identity(handle)'],
+    'overlapping current identity publication retains only original Current-bank binding')
+
 # Shared ordinary byte/handle RPC waits refine ArmBlock with the SAME reply
 # handle. A generic wait cannot be completed by the exact typed reply producer.
 rpc_wait = body(Path('kernel/compat/src/user/syscall/linux/ipc_ops/reply_wait.rs').read_text(),
@@ -60,6 +100,29 @@ ordered(rpc_wait, ['take_endpoint_response_for_wait(reply, handle_capacity)',
     'multitask::commit_block_current_task_and_yield()'], 'exact typed ordinary RPC reply wait')
 if 'multitask::arm_block_current_task()' in rpc_wait:
     raise SystemExit('ordinary RPC reply reverted to an unwakeable Generic wait')
+
+# Deferred registry permission is transferred AFTER physical preflight, never
+# retained as a raw guard across Current/Cohort capture or queue effects.
+activation_commit = body((base / 'activation/publication.rs').read_text(), 'commit')
+ordered(activation_commit, ['OriginalCurrent::borrow(turn)', 'let members =',
+    'frame_readers::acquire(', 'readers[i] = Some(reader)',
+    'let Some(authority) = commit_authority() else { return false; };',
+    'held_spin_lock_depth()', 'owner.cohort.begin_effects()', 'owner.cohort.unsuspend(slot, id)',
+    'owner.cohort.complete()', 'drop(readers)', 'drop(pins)', 'current.check()', 'drop(authority)'],
+    'original activation grant survives final publication without raw registry lock')
+proc_broker = Path('kernel/compat/src/user/syscall/linux/proc_broker_ops.rs').read_text()
+for text, name in [(proc_broker, 'syscall_linux_rustos_proc_activate_broker'),
+        (Path('kernel/compat/src/user/syscall/linux/proc_broker_ops/activation_batch.rs').read_text(),
+         'syscall_linux_rustos_proc_activate_batch_broker')]:
+    ordered(body(text, name), ['activate_suspended_user_tasks_with_commit(',
+        'let mut activations = DEFERRED_ACTIVATIONS.lock()', 'deferred_activation::take_exact::<',
+        'drop(activations)', 'grant'], 'original permission transfer callback: ' + name)
+if re.search(r'#\[derive\([^\]]*\b(?:Copy|Clone)\b[^\]]*\)\]\s*struct DeferredActivationAuthority', proc_broker):
+    raise SystemExit('deferred activation permission became copyable')
+original_grant = Path('kernel/compat/src/user/syscall/linux/proc_broker_ops/deferred_activation.rs').read_text()
+ordered(body(original_grant, 'take_exact'), ['targets.is_empty()', 'targets.len() > N',
+    'targets[..index].contains(&pid)', 'registry.get(&pid).is_none_or', 'return None',
+    'let mut grant', 'registry.remove(pid)', 'Some(grant)'], 'whole batch original grant transfer')
 
 # Atomic first turn and synchronous FIFO must finish/refuse before overdue,
 # spawn and later policy arms; an incomplete arm never authorizes a later peer.
@@ -184,6 +247,13 @@ ordered(body(dispatch, 'claim'), ['frame_publication::direct_handoff_frame_token
     'materialize_direct_handoff_with_generation(candidate.slot', 'Some(candidate.generation)'],
     'exact Direct original physical claim')
 sync = (base / 'sync_handoff.rs').read_text()
+sync_consumer = body(sync[sync.index("/// Consumes this CPU's FIFO"):], 'take_next_ready')
+ordered(sync_consumer, ['SYNC_HANDOFF_STREAK[cpu]', 'for attempt in 0..MAX_TASK',
+    'let taken = {', 'state_for_cpu(cpu).lock()',
+    'take_next_ready_record_with_competitor(false, |_| true)',
+    'if state.len == 0', 'pending.store(false,', 'taken\n        };',
+    'let Some(record) = taken', 'if ready(record)', 'return Some(record)'],
+    'bounded exact FIFO pop ends raw leaf before original frame qualification')
 ordered(body(sync, 'enqueue_and_publish'), ['state.enqueue_with_direct_owner(record, Some((owner, target_cpu)))'],
     'refresh stale Direct record')
 if not any(anchor in sync for anchor in ['record.bind_direct_owner(owner, cpu)',
@@ -209,6 +279,7 @@ ordered(body(irq, 'software_schedule_interrupt_dispatch'), [
     'entry.preemption()',
     'scheduler::ipc_publication::reply(',
     'entry.preemption()',
+    'immediate_task_id = outcome.dispatch_hint(caller_task_id)',
     'entry.dispatch(current_rsp, true, immediate_task_id)',
     'entry.install(dispatch, exact_fast_dispatch)'],
     'actual fast producers cannot bypass the sole Direct FIFO')
@@ -251,8 +322,12 @@ ordered(body(maintenance, 'mobile'), ['slot != ROOT_TASK_SLOT',
     'runqueue::is_local_dispatchable(slot, source)',
     'runqueue::weight::observe(slot).is_some()', 'p.lifecycle_dispatchable()'],
     'migration excludes every published execution owner')
+ordered(body(dispatch, 'choose'), ['class_sequence & 1 != 0',
+    'runqueue::drain_remote_wakes(cpu)', 'dispatch_policy::atomic_activation_pending(cpu)',
+    'first_turn(turn, cpu, true, class_sequence)', 'match synchronous(cpu)',
+    'maintenance::service(turn, cpu, current, voluntary)'],
+    'remote mailbox admission precedes every priority early return, not deferred balance')
 ordered(body(maintenance, 'service'), ['turn.owns_priority_choice()',
-    'runqueue::drain_remote_wakes(cpu)',
     '!idle && !voluntary && runqueue::published_runnable_count(cpu) >= 2',
     'OPPORTUNITIES[cpu].fetch_add(1, Ordering::Relaxed)',
     'runqueue_policy::active_balance_opportunity_due(previous)',
@@ -302,6 +377,16 @@ ordered(body(pager, 'latency_floor'), ['sender.original_pin()', 'worker.original
     '!sender.committed_pager(token)', 'ready_floor(cpu,', 'lower_vruntime_ceiling('],
     'same physical donor/worker through latency effect')
 producer = (base / 'ipc_publication.rs').read_text()
+ordered(body(producer, 'call_before_arm_with'), ['call_before_arm_observing(',
+    'eligible_cpus, || {}, last_effect)'], 'production uses same raced receive engine')
+ordered(body(producer, 'call_before_arm_observing'), [
+    'CurrentWait::capture()', 'donation_publication::participant(sender.id())',
+    'reply_already_dispatched(sender.original_pin(), reply)',
+    'wake_publication::Binding::from_original', 'TypedWake::receive_was_withdrawn(&receiver)',
+    'donation_ledger::retains_awaiting_reply(donor.as_ref().unwrap(), reply)',
+    'last_effect.take().unwrap()()', 'inherited: false, woke: false, hinted: false',
+    'before_receive()', 'wake_publication::receive_call(receiver, endpoint,'],
+    'withdrawn receive retains only exact original queued custody, never grants worker execution')
 ordered(body(producer, 'publish_with'), ['frame_readers::acquire(&pin, cpu)',
     'Publication::begin(scope, target)', 'sync_handoff::publish_original(',
     'typed.publish_and_clear(', 'claim_blocked_handoff(slot, expected, target, local)',
@@ -348,10 +433,26 @@ ordered(body(original_install, 'install'), ['self.install_with(fast_ipc, hardwar
 cpu_source = (base.parent / 'cpu_local.rs').read_text()
 ordered(body(cpu_source, 'publish_before_return'), ['execution::banks::publish(',
     'cpu_leases::publish(', 'self.publish_scalars()'], 'both original banks before scalar publication')
-ordered(body(cpu_source, 'commit_context_switch'), ['dispatch_turn::begin_commit(',
+ordered(body(cpu_source, 'commit_context_switch'), ['asm!("mov {}, rsp"',
+    'let observed_rsp = Some(rsp)', 'commit_context_switch_at_rsp(logical_index, observed_rsp)'],
+    'hardware callback observes actual machine RSP before shared ACK algorithm')
+ordered(body(cpu_source, 'commit_context_switch_at_rsp'), ['dispatch_turn::begin_commit(',
+    'commit.assert_arrived(logical_index, rsp)',
     'TRANSITION_ACTIVE[logical_index].store(false', 'commit.physical_banks()',
     'cpu_leases::commit(logical_index)', 'execution::banks::commit(logical_index)',
-    'commit.finish()'], 'real admitted RSP drains both original banks before reopening')
+    'commit.finish()'], 'checked actual RSP precedes both original bank ACKs and reopening')
+rsp_handoff = (base / 'rsp_handoff.rs').read_text()
+ordered(body(rsp_handoff, 'capture'), ['turn.original_current()', 'turn.claimed_return()',
+    'frame_publication::return_view(from)', 'current_return_binding(cpu, from, old)',
+    'owns_prepared(cpu, to)', 'receipt.token.saved_rsp', 'receipt.token.view'],
+    'RSP seal borrows original outgoing and claimed incoming allocation geometry')
+ordered(body(rsp_handoff, 'assert_arrived'), ['self.cpu == cpu', 'self.incoming.contains(rsp)',
+    '!self.outgoing.contains(rsp)', 'cpu_leases::owns_current(cpu, self.to)',
+    'cpu_leases::owns_outgoing(cpu, self.from)', 'execution::banks::owns_current(cpu, self.to)',
+    'execution::banks::owns_outgoing(cpu, self.from)'], 'RSP and both exact original bank roles')
+ordered(publication, ['let handoff = RspHandoff::capture(&self)', '*bank = Some(handoff)',
+    'execution_interval::finish_return(&self, to)', 'self.seal()', 'publication.publish_before_return()'],
+    'original producer seals geometry before publication and bank transfer')
 # Joint final admission is not the earlier independent funding observation.
 # Each leaf borrows the SAME non-Copy grant; all leaves end before CPU banks.
 ordered(body(dispatch, 'dispatch'), ['prologue(outgoing, rsp, voluntary)',
@@ -421,16 +522,52 @@ if 'scheduler_mut(' in cold_adapter or 'scheduler_ref(' in cold_adapter:
     raise SystemExit('cold IPC producer regained global authority')
 if 'fn commit_ipc_call_handoff(' in Path('kernel/ps/src/multitask/scheduler.rs').read_text():
     raise SystemExit('legacy fused IPC transaction regained')
-ordered(body(producer, 'call_before_arm_with'), ['!scoped(scope)',
+ordered(body(producer, 'call_before_arm_observing'), ['!scoped(scope)',
     'CurrentWait::capture()', 'sender.id() != donor_id',
     'runqueue::wait::armed(sender.slot())', 'participant(sender.id())',
     'participant(receiver_id)', 'Binding::from_original', 'receive_call(receiver, endpoint,',
     'donation_publication::bind_original(scope, reply,', 'binding.original_pin()',
     'Publication::begin(scope, target)', 'sync_handoff::publish_original(target,',
-    'last_effect()', 'drop(result)', 'drop(loans)', 'drop(donor)', 'drop(sender)'],
+    'last_effect.take().unwrap()()',
+    '!woke && !inherited && donation_ledger::reply_already_dispatched(sender.original_pin(), reply)',
+    'if let Some(last_effect) = last_effect.take()',
+    'drop(result)', 'drop(loans)', 'drop(donor)', 'drop(sender)'],
     'same cold sender/funder/receiver through typed admission and final FIFO')
-if 'sender.arm(' in body(producer, 'call_before_arm_with') or 'sender.commit(' in body(producer, 'call_before_arm_with'):
+if 'sender.arm(' in body(producer, 'call_before_arm_observing') or 'sender.commit(' in body(producer, 'call_before_arm_observing'):
     raise SystemExit('cold producer armed/committed sender before wait_for_reply')
+ordered(body((base / 'stack_resources/context.rs').read_text(), 'retained_scheduling_context'), [
+    'BindingPin', 'RESOURCES.get(pin.slot())?.with', 'resources.start?.id != pin.id()',
+    'resources.context?', '!context.scheduling_context.is_bound_to(pin.id())',
+    'Some(context.scheduling_context.identity())'],
+    'one original participant resource leaf qualifies start and context without scalar lifetime replacement')
+ordered(body((base / 'donation_publication.rs').read_text(), 'from_original'), [
+    'pin_donation(root_slot, root_id)', 'retained_scheduling_context(',
+    'root.as_ref().unwrap_or(&donor)', 'donor,', '_root: root,', 'context,'],
+    'exact original donor or root loan survives joint resource observation and publication')
+ordered(body((base / 'donation_publication.rs').read_text(), 'bind_original'), [
+    'Loans::from_original(donor, basis)', 'ReceiveLoans { donor: &donor, receiver }',
+    'if reserved && inherit', 'bind_received_owned(&loans, reply, IpcReply)',
+    'else if reserved', 'bind_owned(&loans, reply, IpcReply)'],
+    'actual received request and sender wake candidate use distinct original funding effects')
+received_bind = body((base / 'donation_ledger.rs').read_text(), 'bind_received_owned')
+ordered(received_bind, ['loans.donor.basis()', 'DONATION_LEDGER.lock()',
+    '!basis_live(&ledger, basis)', 'bind_basis_locked(', '!= Ok(Some(*basis))',
+    'previous.donation.custody_active', 'loans.receiver.slot()', 'loans.receiver.id()',
+    'upsert_locked(', 'basis.root_id, basis.root_slot',
+    'previous.donation.priority_donated, Some(*basis)', 'bind_reserved_locked('],
+    'actual consumer receives only the same original root source and trusted priority')
+if 'funding_basis(' in received_bind or 'upsert_owned(' in received_bind:
+    raise SystemExit('actual received request cannot replace its original reserved funding')
+ordered(body((base / 'donation_ledger.rs').read_text(), 'reply_already_dispatched'), [
+    'reply == 0', 'DONATION_LEDGER.lock()', 'find_reply(reply, DonationNamespace::IpcReply)',
+    'entry.donation.donor_task_id == donor.id()', 'entry.donation.custody_active',
+    'entry.receiver_slot.is_some()', 'IpcDonationTarget::BoundWorker(_)',
+    'basis.donor_slot == donor.slot()', 'basis.donor_id == donor.id()',
+    'current_basis_live(&ledger, basis)'],
+    'already dispatched is only an exact original donor-bound live reply observation')
+ordered(body(Path('services/initd/src/main.rs').read_text(), 'libc_syscall_status'), [
+    'status == -1', '-i64::from(last_errno())', 'else { status }'],
+    'libc syscall -1 is normalized from TLS errno, not misreported as EPERM')
 wake = (base / 'wake_publication.rs').read_text()
 ordered(body(wake, 'receive_call'), ['retained_wake_admitted(binding,',
     'REASON_ENDPOINT_RECEIVE, endpoint', 'before_wake, on_wake, true'],
@@ -446,9 +583,21 @@ enqueue = body(Path('kernel/compat/src/user/syscall/linux/ipc_ops.rs').read_text
 ordered(enqueue, ['preemption_disabled()', 'held_spin_lock_depth()',
     'ipc_call_admission::reserve(task_id)?', 'enqueue_endpoint_call_with_handles_priority_and_custody(',
     'multitask::commit_ipc_call_handoff(', 'endpoint.raw(), reply.raw(), task_id, receiver_task_id',
-    'endpoint_reply_custody_returned(reply, task_id)',
+    'ipc_call_admission::refused_wake_can_keep_delivered_reply(', 'reply, task_id, donation_admitted',
     'cancel_reply_wait(reply, task_id, ReplyCancelReason::SchedulingCustody)'],
-    'actual IPC caller prepublication raw refusal and exact bounded cancellation after typed refusal')
+    'actual IPC caller prepublication raw refusal, independent receipt proof or exact bounded cancellation')
+ordered(body(Path('kernel/compat/src/user/syscall/linux/ipc_call_admission.rs').read_text(),
+    'refused_wake_can_keep_delivered_reply'), [
+    'endpoint_reply_custody_returned(reply, caller)', '|| (donation_admitted',
+    'endpoint::received_request_retains_custody(reply, caller)'],
+    'failed wake keeps only an independently completed reply or an admitted actually received request')
+ordered(body(Path('kernel/ipc-runtime/src/ipc/endpoint_receive.rs').read_text(),
+    'received_request_retains_custody'), ['REPLIES.with(reply.raw()', 'object.message_id',
+    'ENDPOINT_MESSAGES.with(message_id', 'message.reply_id != reply.raw()',
+    'message.caller_task_id != caller', '!message.published', '!message.request.is_empty()',
+    'REPLIES.with(reply.raw()', 'object.message_id == message_id', '!object.used', '!object.consumed',
+    'object.fast_frame.is_none()', 'custody.caller_task_id() == caller'],
+    'receipt is a read-only exact Message-to-Reply observation, never an own funding bind or stale caller')
 terminal = (base / 'terminal_publication.rs').read_text()
 ordered(body(terminal, 'guarded'), ['terminal::Turn::begin(handle, (slot, id))',
     'turn.mark_stopped()', 'donation_ledger::release_task(id)',
@@ -589,6 +738,25 @@ for name, anchor in [('terminate_user_task', 'current_terminal::terminate(task_i
     entry = body(current_api, name)
     if anchor not in entry or 'scheduler_mut(' in entry or 'scheduler_ref(' in entry:
         raise SystemExit('terminal API did not transfer complete authority: ' + name)
+fault_callback = body(current_api, 'retire_current_user_task_due_to_fault')
+if 'complete_retirement_side_effects(' in fault_callback or 'Fence::' in fault_callback:
+    raise SystemExit('exception terminal callback waits with IF clear and can suppress its cleanup executor TLB ACK')
+compat_fault = body(Path('kernel/compat/src/user/syscall/mod.rs').read_text(),
+    'retire_current_linux_task_due_to_fault')
+if any(token in compat_fault for token in ['record_linux_process_fault_termination(',
+        'current_user_process_thread_count(', 'cleanup_retired_task_runtime_state(',
+        'complete_retirement_side_effects(']):
+    raise SystemExit('compat exception callback performs external cleanup or reelects the final process member')
+ordered(body(terminal, 'guarded'), ['user_fault_vector: match owner.reason()',
+    'TaskRetireReason::UserFault { vector, .. } => Some(vector)', 'owner.begin_effects()',
+    'owner.publish(cleanup, effects)'], 'original terminal fault sealed before effects and consumers')
+lifecycle_cleanup = body(Path('kernel/compat/src/user/syscall/linux/lifecycle_broker_ops.rs').read_text(),
+    'service_retired_task_runtime_cleanup')
+ordered(lifecycle_cleanup, ['multitask::next_retired_task_cleanup()',
+    'retired_process_fault_vector(', 'cleanup.process_terminal(), cleanup.user_fault_vector()',
+    'super::record_linux_process_fault_termination(cleanup.process_id(), vector)',
+    'cleanup_retired_task_runtime_state(', 'multitask::complete_retired_task_cleanup(cleanup)'],
+    'interruptible runtime consumer records exact original final fault before cleanup ACK')
 original = current_terminal[current_terminal.index("impl<'scope, 'irq> OriginalCurrent"):current_terminal.index('pub(in crate::multitask) fn fault')]
 ordered(body(original, 'borrow'), ['CurrentAllocation::borrow(scope)',
     'current_cpu_task_slot() != Some(slot)', 'CurrentPermit::borrow(scope, slot)',
@@ -1016,5 +1184,65 @@ for path, names in [
 ordered((base / 'scheduling_runtime/namespace_tests.rs').read_text(),
     ['exec_root(97101, true', 'identity::read(slot)', 'scope.spawn(', 'TEST_GUARD.try_lock()',
      'Err(TryLockError::WouldBlock)', 'identity::read(slot), Some(before)',
-     'TEST_GUARD.try_lock().expect'], 'deterministic actual birth/Identity namespace exclusion and release')
-print('independent dispatch source contracts passed: whole Scheduler deletion, original dispatch/FIFO, foreign shared-MM census and executor ACK')
+     'TEST_GUARD.lock().unwrap_or_else'], 'deterministic actual birth/Identity namespace exclusion and release')
+# HECS uses the SAME actual arrival checker and the existing authenticated
+# private-workload/archive boundary, not a native-model or user-print PASS.
+ordered(body(rsp_handoff, 'assert_arrived'), ['self.incoming.contains(rsp)',
+    '!self.outgoing.contains(rsp)', 'execution::banks::owns_outgoing(cpu, self.from)',
+    '#[cfg(not(test))]', 'HARDWARE_ARRIVALS[cpu].0.fetch_add(1, Ordering::Relaxed)'],
+    'only actual machine callback observations increment HECS arrival evidence')
+hecs_host = (base.parents[4] / 'tools/xtask/src/kvm/hecs.rs').read_text()
+ordered(body(hecs_host, 'is_complete'), ['evidence(log, workers).is_ok()'],
+    'actual HECS readiness uses the tested full evidence validator')
+hecs_guest = (base.parents[4] / 'tools/xtask/src/kvm/guest.rs').read_text()
+ordered(hecs_guest, ['let smp_ring3_qualification_ready',
+    'smp_ring3_qualification_is_complete(&rustos_log, options.rustos_vcpus)',
+    'hecs::is_complete(&rustos_log, options.rustos_vcpus)',
+    '&& smp_ring3_qualification_ready'], 'actual KVM readiness requires both independent obligations')
+hecs_archive = (base.parents[4] / 'tools/xtask/src/kvm/evidence.rs').read_text()
+ordered(body(hecs_archive, 'write_kvm_success_summary'), ['hecs::evidence(&rustos_log, options.rustos_vcpus)',
+    'hardware_execution,', 'publish_success_summary('], 'archived exact-image evidence retains HECS observations')
+failure_snapshot = Path('tools/xtask/src/kvm/failure_snapshot.rs').read_text()
+ordered(body(failure_snapshot, 'after_failed_probe'), ['if result.is_err()', 'diagnostic();'],
+    'only a latched failure may invoke CPU snapshot diagnostics')
+smoke = body(Path('tools/xtask/src/kvm/options.rs').read_text(), 'run_one_smoke')
+ordered(smoke, ['let result: Result<ProbeResult>', 'wait_for_parallel_boot(',
+    'failure_snapshot::after_failed_probe(result, ||', 'options.physical_gpu_bdf.is_none()',
+    'failure_snapshot::capture(config, &layout, options.rustos_vcpus)',
+    'stop_guest(&mut rustos)', 'stop_guest(&mut dvm)', 'let probe = result?',
+    'write_kvm_success_summary('], 'failure-only diagnostic before teardown cannot retry acceptance')
+if 'command("cont")' in failure_snapshot or 'collection=partial' not in failure_snapshot:
+    raise SystemExit('failure-only snapshot resumes a failed guest or hides partial collection')
+rtc = Path('kernel/hal/src/arch/rtc.rs').read_text()
+ordered(body(rtc, 'wake_ready_sleepers'), ['notify_ready_sleepers(&RTC_SLEEP_WAITERS, now, crate::hooks::wake_task)',
+    'RTC_SLEEP_LOCK_MISSES.fetch_add'], 'exact task deadline notification with nonblocking clockevent retry')
+notify = body(rtc, 'notify_ready_sleepers')
+ordered(notify, ['try_snapshot_ready_sleep_waiters(waiters, now, &mut ready_tasks)',
+    'let admitted = wake(task_id);', 'true'], 'actual tested timer notification path')
+if 'remove_task(' in notify or 'no live task' in notify:
+    raise SystemExit('clockevent notification/refusal destroyed the original deadline authority')
+if 'wake_task: Some(ps_api::wake_task)' not in Path('kernel/executive/src/hal_hooks.rs').read_text():
+    raise SystemExit('exact task deadlines cannot route through user-qualified scheduler wake')
+tsc_sample = body(Path('apps/ipcbench/src/main.rs').read_text(), 'tsc')
+ordered(tsc_sample, ['asm!(', '"lfence",', '"rdtsc",', '"lfence",', 'options(nostack)'],
+    'TSC sample has both hardware ordering edges and a compiler memory clobber')
+if 'nomem' in tsc_sample:
+    raise SystemExit('compiler may move response validation across a sample boundary')
+ipcbench = Path('apps/ipcbench/src/ipc_probes.rs').read_text()
+for server in ['bench_server', 'bench_server_reply_recv']:
+    ordered(body(ipcbench, server), ['received != size_of::<BenchMsg>() as i64',
+        'let response = request;', 'SYS_RUSTOS_IPC_REPLY'], 'actual 16-byte echo server: ' + server)
+ordered(body(ipcbench, 'validated_round_trip_sample'), ['let start = stamp();',
+    'let status = call(request, response);', 'let end = stamp();',
+    'valid_round_trip_reply(status, request, response).then_some((start, end))'],
+    'actual sample verifies the exact reply outside the measured interval')
+ordered(body(ipcbench, 'measure_intra_process_round_trip'), ['for _ in 0..WARMUP',
+    'valid_round_trip_reply(call(&request, &mut response), &request, &response)',
+    'for _ in 0..IPC_ITERS', 'validated_round_trip_sample(&request, &mut response, &mut call, tsc)',
+    'total.push(end.wrapping_sub(start))', 'request.op = BENCH_OP_STOP;',
+    'let stopped = valid_round_trip_reply(', 'let joined = server.join().is_ok();',
+    'if !round_trip_transcript_complete(ok, stopped, joined, total.len())',
+    'skip(name, "ipc-transcript-invalid")', 'return;',
+    'report(name, &summarize(&mut total), tsc_khz)'],
+    'warmup, every sample, stop and join form one complete production transcript')
+print('independent dispatch source contracts passed: whole Scheduler deletion, original dispatch/FIFO, foreign shared-MM census, executor ACK and HECS')

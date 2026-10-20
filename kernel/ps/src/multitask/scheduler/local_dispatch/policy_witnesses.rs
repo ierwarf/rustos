@@ -51,6 +51,47 @@ fn system(slot: usize) {
     runqueue::weight::replace(slot, super::super::SYSTEM_CLASS_WEIGHT_FLAG | super::super::NICE_0_LOAD);
 }
 
+#[test]
+fn pending_migration_selects_exact_destination_without_early_placement_ack() {
+    let mut observed = None;
+    family(|root, target, _| {
+        let (root_mask, process_mask, _) = runqueue::affinity_payload::affinity_snapshot(root);
+        runqueue::affinity_payload::set_affinity(root, root_mask, process_mask, true);
+        let retained = current_can_keep_running(root, 0, crate::arch::clock::monotonic_nanos());
+        runqueue::affinity_payload::set_affinity(root, root_mask, process_mask, false);
+
+        let (_, process_mask, _) = runqueue::affinity_payload::affinity_snapshot(target);
+        runqueue::affinity_payload::set_affinity(target, 1, process_mask, true);
+        let original = runqueue::owner(target);
+        let now = crate::arch::clock::monotonic_nanos();
+        let admission = published_candidate_admission(target, 0, now);
+        let excluded = published_candidate_admission(target, 1, now);
+        let qualified = qualified_local_handoff_generation(target, 0, now);
+        system(target);
+        let selected = choose_local_next(
+            0, root, false, super::super::SCHED_MAX_BURST_NS,
+            crate::arch::clock::monotonic_nanos(), runqueue::local_runnable_sequence(0),
+            donation_ledger::class_publication_sequence(), false, false,
+        );
+        observed = Some((
+            retained, admission, excluded, qualified, original.generation,
+            selected, target, runqueue::owner(target) == original,
+            runqueue::affinity_payload::affinity_snapshot(target).2,
+        ));
+    });
+    // Assert only after original MM/resource/UID teardown, including for a
+    // deliberately refused mutant; a witness failure must not abort its RAII.
+    let (retained, admission, excluded, qualified, generation, selected, target,
+        unchanged, pending) = observed.unwrap();
+    assert!(!retained, "pending intent must not become retained Current permission");
+    assert_eq!(admission, Ok(true), "stable intent must reach the included destination claim");
+    assert_eq!(excluded, Ok(false), "migration intent must never bypass the actual mask");
+    assert_eq!(qualified, Ok(Some(generation)));
+    assert_eq!(selected, Ok((target, generation)), "actual fair scan must select the born frame");
+    assert!(unchanged);
+    assert!(pending, "selection must not spend the later RSP placement ACK");
+}
+
 pub(in crate::multitask::scheduler) fn bounded_system_burst_reserves_a_ready_user_turn() {
     let _serial = scheduler::execution_test_serial_guard();
     dispatch_policy::store_dispatch_streaks(0, super::super::MAX_CONSECUTIVE_SYSTEM_DISPATCHES - 1, 0);

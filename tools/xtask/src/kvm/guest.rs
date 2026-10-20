@@ -531,7 +531,8 @@ fn wait_for_parallel_boot(
         let smp_runtime_ready =
             smp_runtime_missing_markers(&rustos_log, options.rustos_vcpus).is_empty();
         let smp_ring3_qualification_ready = !options.smp_ring3_qualification
-            || smp_ring3_qualification_is_complete(&rustos_log, options.rustos_vcpus);
+            || (smp_ring3_qualification_is_complete(&rustos_log, options.rustos_vcpus)
+                && hecs::is_complete(&rustos_log, options.rustos_vcpus));
         let dvm_ready = options
             .expected_dvm_markers
             .iter()

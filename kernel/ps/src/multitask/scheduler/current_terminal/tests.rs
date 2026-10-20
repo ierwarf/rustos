@@ -105,6 +105,57 @@ fn actual_current_fault_preserves_first_reason_and_terminal_current_without_fres
 }
 
 #[test]
+fn actual_fault_callback_returns_without_waiting_for_original_kernel_cleanup() {
+    let mut observed = None;
+    root(true, |slot, _| {
+        // Model only the earlier installation; the actual public callback
+        // must acquire its own unique dispatch scope, not overlap a fixture's.
+        let banks = identity::execution::banks::isolate(0);
+        identity::execution::banks::initialize(0, identity::execution::initial(slot, ID).unwrap());
+        runqueue::test_running_claim(slot, 0, runqueue::weight::value(slot));
+        execution_interval::test_open_captured(slot, 10);
+        let disposition = crate::multitask::retire_current_user_task_due_to_fault(
+            14, Some(6), 0xdead, 0xbeef, 0xfeed,
+        );
+        let repeated = crate::multitask::retire_current_user_task_due_to_fault(
+            13, None, 0, 0, 0,
+        );
+        let fence = retirement_cleanup::executor::Fence::capture();
+        observed = Some((
+            matches!(disposition, UserFaultDisposition::Retired),
+            retirement_cleanup::kernel_pending(slot),
+            !fence.complete(),
+            stack_resources::cpu_leases::owns_current(0, slot),
+            identity::execution::banks::owns_current(0, slot),
+            retirement_cleanup::reason(slot),
+            matches!(repeated, UserFaultDisposition::Retired),
+            retirement_cleanup::test_cleanup_payload(slot),
+        ));
+        let scope = DispatchPreemption::enter_model(0);
+        if !identity::lifecycle(slot).retired {
+            let _ = fault_in(&scope, 14, Some(6), 0xdead, 0xbeef);
+        }
+        match execution_interval::consume(0, slot, ID) {
+            execution_interval::ConsumedInterval::Active(interval) => { let _ = interval.charge(0, 1); }
+            execution_interval::ConsumedInterval::AlreadySettled => {}
+            execution_interval::ConsumedInterval::Absent => panic!("original interval vanished"),
+        }
+        drop(scope);
+        drop(banks);
+    });
+    // The real external consumer ACKs only in fixture teardown, after the
+    // original banks leave Current. The exception API must have returned first.
+    let (retired, pending, incomplete, physical, uid, reason, repeated, cleanup) = observed.unwrap();
+    assert!(retired && pending && incomplete && physical && uid && repeated);
+    let cleanup = cleanup.expect("original runtime cleanup payload vanished");
+    assert_eq!((cleanup.task_id(), cleanup.process_id(), cleanup.process_terminal()), (ID, ID, true));
+    assert_eq!(cleanup.user_fault_vector(), Some(14));
+    assert_eq!(reason, Some(TaskRetireReason::UserFault {
+        vector: 14, error_code: Some(6), cr2: 0xdead, rip: 0xbeef,
+    }));
+}
+
+#[test]
 fn actual_current_terminal_refuses_missing_uid_alias_and_settled_interval() {
     current(|slot, scope| {
         let missing = identity::execution::banks::isolate(0);

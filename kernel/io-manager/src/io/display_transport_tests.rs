@@ -97,8 +97,65 @@ fn full_width_snapshot_uses_one_bounded_bulk_copy() {
     assert_eq!(contiguous_snapshot_copy_len(partial, 1600, 1600 * 4), None);
 }
 
+static TRANSPORT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[test]
+fn installation_invites_the_gpu_peer_before_publication_without_a_cpu_frame() {
+    use super::*;
+
+    let _serial = TRANSPORT_TEST_LOCK.lock().unwrap();
+    let mut header = alloc::vec![0_u8; 4096];
+    let mut doorbell = alloc::vec![0_u32; 4];
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            INSTALLED.store(false, Ordering::Release);
+            TRANSPORT_REVOKED.store(false, Ordering::Release);
+            SHARED_HEADER_ADDR.store(0, Ordering::Release);
+            SHARED_DOORBELL_ADDR.store(0, Ordering::Release);
+            GUI_DVM_EXPECTED_INVITATION.store(0, Ordering::Release);
+        }
+    }
+    let _restore = Restore;
+    SHARED_HEADER_ADDR.store(header.as_mut_ptr() as usize, Ordering::Release);
+    SHARED_DOORBELL_ADDR.store(doorbell.as_mut_ptr() as usize, Ordering::Release);
+    INSTALLED.store(true, Ordering::Release);
+
+    // The exclusive install transaction must advertise before consumers can
+    // publish a competing invitation. Exercise its actual MMIO helper below.
+    let installation = include_str!("dvm_display/installation.rs");
+    let invite = installation.find("    signal_gui_dvm(2);").expect("initial prime invitation");
+    let publish = installation.find("    INSTALLED.store(true,").expect("transport publication");
+    assert!(invite < publish, "initial invitation must precede consumer admission");
+    signal_gui_dvm(2);
+    assert!(gpu_atlas_info().is_none(), "invitation alone is not readiness");
+    assert_eq!(read_u64(DVM_GUI_SURFACE_POOL_INVITATION_OFFSET), 2);
+    assert_eq!(GUI_DVM_EXPECTED_INVITATION.load(Ordering::Acquire), 2);
+    assert_eq!(doorbell[IVSHMEM_DOORBELL_OFFSET / 4], (GUI_DVM_PEER_ID << 16) as u32);
+    assert_eq!(PUBLISHED_GENERATION.load(Ordering::Acquire), 0);
+    assert!(SLOT_STATE.iter().all(|state| state.load(Ordering::Acquire) == GUI_SLOT_FREE));
+    assert_eq!(read_u64(DVM_GUI_SURFACE_POOL_READY_CONFIRMATION_OFFSET), 0);
+
+    // A later exact invitation is not rewritten by repeated discovery.
+    write_u64(DVM_GUI_SURFACE_POOL_INVITATION_OFFSET, 6);
+    GUI_DVM_EXPECTED_INVITATION.store(6, Ordering::Release);
+    assert!(gpu_atlas_info().is_none());
+    assert_eq!(read_u64(DVM_GUI_SURFACE_POOL_INVITATION_OFFSET), 6);
+
+    GUI_DVM_EXPECTED_INVITATION.store(0, Ordering::Release);
+    write_u64(DVM_GUI_SURFACE_POOL_INVITATION_OFFSET, 0);
+    TRANSPORT_REVOKED.store(true, Ordering::Release);
+    assert!(gpu_atlas_info().is_none());
+    assert_eq!(read_u64(DVM_GUI_SURFACE_POOL_INVITATION_OFFSET), 0);
+    TRANSPORT_REVOKED.store(false, Ordering::Release);
+    INSTALLED.store(false, Ordering::Release);
+    assert!(gpu_atlas_info().is_none());
+    assert_eq!(read_u64(DVM_GUI_SURFACE_POOL_INVITATION_OFFSET), 0);
+}
+
 #[test]
 fn missing_gui_dvm_is_unavailable_not_a_fallback_provider() {
+    let _serial = TRANSPORT_TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
     assert_eq!(
         try_publish_full(core::ptr::null(), 1, 1, 4),
         DvmPresentOutcome::Unavailable

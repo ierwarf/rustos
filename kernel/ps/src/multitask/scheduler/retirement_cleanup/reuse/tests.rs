@@ -66,6 +66,7 @@ fn each_terminal_custody_independently_refuses_seal_without_spending_nonce() {
                         task_id: ID,
                         process_id: ID,
                         process_terminal: false,
+                        user_fault_vector: None,
                         clear_child_tid: 0,
                         robust_list_head: 0,
                         robust_list_len: 0,

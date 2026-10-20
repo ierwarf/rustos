@@ -150,13 +150,13 @@ where
                 validate_smp_evidence_cohort(&cohort)?;
                 options.smp_evidence_cohort = Some(cohort);
             }
-            "--physical-gpu" | "--physical-amdgpu" => {
+            "--physical-gpu" => {
                 if options.physical_gpu_bdf.is_some() {
                     bail!("physical GPU BDF was supplied more than once");
                 }
                 options.physical_gpu_bdf = Some(next_value(&mut args, &arg)?);
             }
-            "--gpu-firmware" | "--amd-vfct" => {
+            "--gpu-firmware" => {
                 if options.physical_gpu_firmware.is_some() {
                     bail!("physical GPU firmware was supplied more than once");
                 }

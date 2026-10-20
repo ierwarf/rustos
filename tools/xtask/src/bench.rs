@@ -20,8 +20,11 @@ use crate::Result;
 use crate::config::Config;
 use crate::kvm;
 
+mod component_disassembly;
+mod components;
 mod lifecycle;
 mod local_shadow;
+pub(crate) use components::bench_components;
 use lifecycle::{
     LifecycleTotal, lifecycle_trace_holds, parse_lifecycle_milestone, render_lifecycle,
     required_lifecycle_stages,
@@ -132,6 +135,7 @@ struct BenchResult {
     min: u64,
     p50: u64,
     p99: u64,
+    max: u64,
     mean: u64,
     min_ns: u64,
     p50_ns: u64,
@@ -220,16 +224,24 @@ fn parse_result(line: &str) -> Option<BenchResult> {
         .split_whitespace()
         .find_map(|token| token.strip_prefix("name="))?
         .to_owned();
-    Some(BenchResult {
+    let result = BenchResult {
         name,
         iters: field(line, "iters=")?,
         min: field(line, "min=")?,
         p50: field(line, "p50=")?,
         p99: field(line, "p99=")?,
+        max: field(line, "max=")?,
         mean: field(line, "mean=")?,
         min_ns: field(line, "min_ns=")?,
         p50_ns: field(line, "p50_ns=")?,
-    })
+    };
+    // A clipped/malformed distribution is not worst-case evidence.
+    (result.iters != 0
+        && result.min <= result.p50
+        && result.p50 <= result.p99
+        && result.p99 <= result.max
+        && (result.min..=result.max).contains(&result.mean))
+        .then_some(result)
 }
 
 /// The guest writes through a debugcon envelope, so a result line arrives
@@ -277,17 +289,27 @@ fn parse_log(log: &str) -> Result<ParsedRun> {
         if line.starts_with(BEGIN_MARKER) {
             local_policy_window = true;
         } else if let Some(rest) = line.strip_prefix(TSC_PREFIX) {
-            tsc_khz = rest.trim().parse().unwrap_or(0);
+            anyhow::ensure!(!inside_run && !saw_end && tsc_khz == 0,
+                "ipcbench reported multiple or out-of-order TSC records");
+            tsc_khz = rest.trim().parse().context("invalid ipcbench TSC frequency")?;
+            anyhow::ensure!(tsc_khz != 0, "ipcbench TSC frequency is zero");
             local_policy_window = true;
             inside_run = true;
         } else if let Some(rest) = line.strip_prefix(RESULT_PREFIX) {
+            anyhow::ensure!(inside_run, "ipcbench result outside its measurement window");
             match parse_result(rest) {
-                Some(result) => results.push(result),
+                Some(result) => {
+                    anyhow::ensure!(!results.iter().any(|old: &BenchResult| old.name == result.name),
+                        "duplicate ipcbench result: {}", result.name);
+                    results.push(result);
+                },
                 None => bail!("malformed ipcbench result line: {rest}"),
             }
         } else if let Some(rest) = line.strip_prefix(SKIP_PREFIX) {
+            anyhow::ensure!(inside_run, "ipcbench skip outside its measurement window");
             skipped.push(rest.trim().to_owned());
-        } else if line.starts_with(END_MARKER) {
+        } else if line == END_MARKER {
+            anyhow::ensure!(inside_run, "ipcbench end outside its measurement window");
             saw_end = true;
             inside_run = false;
         } else if local_policy_window && parse_local_shadow_milestone(line, &mut local_shadow) {
@@ -642,19 +664,20 @@ fn render(tsc_khz: u64, results: &[BenchResult], skipped: &[String]) -> String {
     let mut out = String::new();
     out.push_str(&format!("tsc_khz={tsc_khz}\n\n"));
     out.push_str(&format!(
-        "{:<40} {:>8} {:>10} {:>10} {:>10} {:>10} {:>9} {:>9}\n",
-        "probe", "iters", "min_cyc", "p50_cyc", "p99_cyc", "mean_cyc", "min_ns", "p50_ns"
+        "{:<40} {:>8} {:>10} {:>10} {:>10} {:>10} {:>10} {:>9} {:>9}\n",
+        "probe", "iters", "min_cyc", "p50_cyc", "p99_cyc", "max_cyc", "mean_cyc", "min_ns", "p50_ns"
     ));
-    out.push_str(&"-".repeat(112));
+    out.push_str(&"-".repeat(123));
     out.push('\n');
     for result in results {
         out.push_str(&format!(
-            "{:<40} {:>8} {:>10} {:>10} {:>10} {:>10} {:>9} {:>9}\n",
+            "{:<40} {:>8} {:>10} {:>10} {:>10} {:>10} {:>10} {:>9} {:>9}\n",
             result.name,
             result.iters,
             result.min,
             result.p50,
             result.p99,
+            result.max,
             result.mean,
             result.min_ns,
             result.p50_ns,
@@ -705,13 +728,44 @@ fn render_derived(results: &[BenchResult]) -> String {
     out
 }
 
+/// Validate the actual unnormalised maximum, never min/p99 or a host-adjusted
+/// value. Keep the production sample counts and exact isolated primary/anchor.
+fn validate_ipc_max(run: &ParsedRun, probe: &str, limit: u64) -> Result<()> {
+    anyhow::ensure!(limit != 0 && probe.starts_with("ipc_rt_"),
+        "IPC maximum gate requires an isolated IPC round-trip probe and a nonzero limit");
+    anyhow::ensure!(isolated_primary_result_holds(run, probe),
+        "IPC maximum gate requires exactly one primary result and hardware anchor, without a skip");
+    let primary = run.results.iter().find(|result| result.name == probe).unwrap();
+    let anchor = run.results.iter().find(|result| result.name == HARDWARE_ANCHOR).unwrap();
+    anyhow::ensure!(primary.iters == 20_000 && anchor.iters == 50_000,
+        "IPC maximum gate requires all 20000 IPC and 50000 anchor samples");
+    anyhow::ensure!(primary.max <= limit,
+        "IPC worst-case gate FAILED probe={probe} raw_max={} limit={limit} samples={} (no outliers removed)",
+        primary.max, primary.iters);
+    Ok(())
+}
+
 pub(crate) fn bench(
     config: &Config,
     baseline: Option<&Path>,
     compare: Option<&Path>,
     rustos_vcpus: u8,
     isolate_probe: Option<&str>,
+    ipc_max_cycles: Option<u64>,
 ) -> Result<()> {
+    if ipc_max_cycles.is_some() {
+        anyhow::ensure!(isolate_probe.is_some(), "IPC maximum gate requires --isolate-probe");
+        let project = &config.project;
+        anyhow::ensure!(
+            !project.ipc_telemetry.phase_profile
+                && !project.scheduler_telemetry.phase_profile
+                && !project.lock_telemetry.phase_profile
+                && !project.syscall_telemetry.phase_profile
+                && !project.usermem_telemetry.phase_profile
+                && !project.lifecycle_telemetry.phase_profile,
+            "IPC maximum gate refuses diagnostic profiles; use the shipping configuration"
+        );
+    }
     // Unconditional, and this is the second measurement bug this lane has had.
     // Building was opt-in, so a run that forgot the flag booted whatever image
     // was last built and reported it without complaint: two runs across a
@@ -807,6 +861,10 @@ pub(crate) fn bench(
             "kernel-stamped semantic proof; the primary result is emitted only after every probe invariant passes".to_owned()
         };
         println!("{}", render_isolated(&run, probe, rustos_vcpus, &check));
+        if let Some(limit) = ipc_max_cycles {
+            validate_ipc_max(&run, probe, limit)?;
+            println!("IPC worst-case gate PASS rustos_vcpus={rustos_vcpus} raw_max<={limit} samples=20000");
+        }
         return Ok(());
     }
 

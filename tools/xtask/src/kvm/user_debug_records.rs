@@ -17,7 +17,7 @@
 /// escapes, so an escaped trailing newline is the end of a ring 3 line and
 /// anything before it is a continuation. The join is bounded so a producer that
 /// somehow omits the terminator cannot swallow the rest of the log.
-fn rejoin_user_debug_records(log: &str) -> String {
+pub(crate) fn rejoin_user_debug_records(log: &str) -> String {
     const PREFIX: &str = "user-debug payload=";
     const ESCAPED_NEWLINE: &str = "\\n";
     const MAX_JOINED_RECORDS: usize = 16;

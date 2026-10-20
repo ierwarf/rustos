@@ -699,14 +699,6 @@ fn clamp_pointer_coordinate(value: i64, max: u32) -> u32 {
     value.min(max) as u32
 }
 
-pub(crate) fn sleep_until(deadline: Instant) {
-    if let Some(duration) = deadline.checked_duration_since(Instant::now()) {
-        if !duration.is_zero() {
-            thread::sleep(duration);
-        }
-    }
-}
-
 pub(crate) fn sleep_until_input_or(
     events: &InputReader,
     deadline: Instant,

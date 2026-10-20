@@ -82,49 +82,27 @@ pub(in crate::user::syscall::linux) fn syscall_linux_rustos_proc_activate_batch_
     }
     let exact_targets = &exact_targets[..target_count];
 
-    let mut activations = DEFERRED_ACTIVATIONS.lock();
-    if targets
-        .iter()
-        .copied()
-        .zip(exact_targets.iter().copied())
-        .any(|(target_pid, exact_target)| {
-            let exact_target = exact_target
-                .expect("proc activation batch invariant: validated target identity disappeared");
-            activations.get(&target_pid).is_none_or(|authority| {
-                !deferred_authority_matches_exact_batch_request(
-                    &authority.owner,
-                    &authority.target,
-                    authority.qualification_required,
-                    &owner,
-                    &exact_target,
-                )
-            })
-        })
-    {
-        return linux_errno(LINUX_EPERM);
-    }
+    let mut failure = LINUX_ESRCH;
     if !multitask::activate_suspended_user_tasks_with_commit(targets, || {
-        for (target_pid, exact_target) in targets.iter().copied().zip(exact_targets.iter().copied())
-        {
-            let exact_target = exact_target
-                .expect("proc activation batch invariant: validated target identity disappeared");
-            let authority = activations.remove(&target_pid).expect(
-                "proc activation batch invariant: preflighted authority disappeared while locked",
-            );
-            assert_eq!(authority.owner, owner);
-            assert_eq!(authority.target, exact_target);
-            assert!(deferred_authority_matches_exact_batch_request(
-                &authority.owner,
-                &authority.target,
-                authority.qualification_required,
-                &owner,
-                &exact_target,
-            ));
-        }
+        // PS already owns original Current/Cohort/frame loans. Only permission
+        // transfer holds this raw leaf; no scheduler work or PID lookup does.
+        let mut activations = DEFERRED_ACTIVATIONS.lock();
+        let grant = deferred_activation::take_exact::<LOADER_ACTIVATE_BATCH_MAX_TARGETS, _, MAX_DEFERRED_ACTIVATIONS>(
+            &mut activations, targets, |pid, authority| {
+                let index = targets.iter().position(|target| *target == pid).unwrap();
+                let exact_target = exact_targets[index].expect("validated target identity disappeared");
+                deferred_authority_matches_exact_batch_request(
+                    &authority.owner, &authority.target, authority.qualification_required,
+                    &owner, &exact_target,
+                )
+            },
+        );
+        if grant.is_none() { failure = LINUX_EPERM; }
+        drop(activations);
+        grant
     }) {
-        return linux_errno(LINUX_ESRCH);
+        return linux_errno(failure);
     }
-    drop(activations);
     for target_pid in targets.iter().copied() {
         nucleus_core::debug::record_milestone(
             nucleus_core::debug::LogCategory::Compat,
@@ -186,8 +164,8 @@ mod tests {
             .expect("activation registry lock");
         let authority = lock
             + source[lock..]
-                .find("activations.get(&target_pid)")
-                .expect("generation-bound authority preflight under registry lock");
+                .find("deferred_activation::take_exact::<")
+                .expect("all-or-none original grant transfer under registry lock");
         let publish = source
             .find("multitask::activate_suspended_user_tasks_with_commit")
             .expect("atomic scheduler transaction");
@@ -197,12 +175,12 @@ mod tests {
         let evidence = source
             .find("nucleus_core::debug::record_milestone")
             .expect("post-transaction evidence");
+        assert!(publish < lock, "no raw registry guard may enter scheduler preflight");
         assert!(lock < authority);
-        assert!(authority < publish);
-        assert!(publish < unlock);
+        assert!(authority < unlock);
         assert!(unlock < evidence);
-        assert!(source.contains("activations.remove(&target_pid)"));
-        assert!(source.contains("preflighted authority disappeared while locked"));
+        assert!(source[unlock..evidence].contains("grant"), "transfer original grant to PS, not a scalar success");
+        assert!(source.contains("deferred_authority_matches_exact_batch_request("));
         assert!(source.contains("targets[..index].contains(&target_pid)"));
         assert!(source.contains("args.target_pids[target_count..]"));
         assert!(source[..lock].contains("live_user_process_identity_by_pid"));

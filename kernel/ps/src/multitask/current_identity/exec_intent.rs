@@ -215,7 +215,7 @@ impl Intent {
     /// Consume only after the exact process reservation was cancelled. Owned
     /// IMAGE/PUBLISHED transactions cannot be rolled back or reopened.
     pub(in crate::multitask) fn cancel(
-        mut self,
+        self,
         cancellation: crate::multitask::process_table::ExecCancellation,
     ) {
         assert!(

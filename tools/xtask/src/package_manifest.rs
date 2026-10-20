@@ -83,6 +83,10 @@ pub(crate) struct BuildSpec {
     pub(crate) source: Option<String>,
     #[serde(default)]
     pub(crate) extra_args: Vec<String>,
+    /// Additional C/assembly translation units, relative to this package.
+    /// The C builder tracks these as freshness inputs, not opaque CLI flags.
+    #[serde(default)]
+    pub(crate) extra_sources: Vec<String>,
     /// Per-package linkage override. Currently understood values:
     /// - `None` / `Some("dynamic")`: link as a dynamic Linux ELF (default).
     /// - `Some("static-pie")`: link as a static PIE with no `PT_INTERP`. Used
@@ -498,6 +502,7 @@ mod tests {
                 package: Some(id.to_string()),
                 source: None,
                 extra_args: Vec::new(),
+                extra_sources: Vec::new(),
                 linkage: None,
             },
             install: InstallSpec {

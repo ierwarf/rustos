@@ -133,6 +133,56 @@ fn receiver_registration_is_bounded_deduplicated_and_refreshes_capacity() {
 }
 
 #[test]
+fn received_request_custody_observation_requires_actual_dequeue_and_exact_live_reply() {
+    with_isolated_ipc_test(|| {
+        let endpoint = create_endpoint_for_process(10).unwrap();
+        let custody = super::test_scheduling_custody(41);
+        let (reply, _) = enqueue_endpoint_call_with_handles_priority_and_custody(
+            endpoint, 41, b"original", &[], EndpointCallPriority::Ordinary, custody).unwrap();
+        assert!(!received_request_retains_custody(reply, 41));
+        assert_eq!(receive_or_wait(endpoint, 10, 1, 0, false).unwrap_err(), IpcError::BufferTooSmall);
+        assert!(!received_request_retains_custody(reply, 41));
+        assert!(matches!(receive_or_wait(endpoint, 10, 16, 0, false).unwrap(), EndpointReceive::Queued(_)));
+        assert!(received_request_retains_custody(reply, 41));
+        assert!(!received_request_retains_custody(reply, 42));
+        assert!(!received_request_retains_custody(KernelReplyHandle::from_raw(reply.raw() ^ (1 << 48)), 41));
+
+        let (other, _) = enqueue_endpoint_call_with_handles_priority_and_custody(
+            endpoint, 41, b"other", &[], EndpointCallPriority::Ordinary, custody).unwrap();
+        assert!(matches!(receive_or_wait(endpoint, 10, 16, 0, false).unwrap(), EndpointReceive::Queued(_)));
+        let original_message = REPLIES.with(reply.raw(), |object| object.message_id).unwrap();
+        let other_message = REPLIES.with(other.raw(), |object| object.message_id).unwrap();
+        // Explicit earlier malformed-candidate input for a NEGATIVE observer
+        // test, never a transport/SC grant. Restore before real cancellation.
+        REPLIES.with_mut(reply.raw(), |object| object.message_id = other_message).unwrap();
+        assert!(!received_request_retains_custody(reply, 41));
+        REPLIES.with_mut(reply.raw(), |object| object.message_id = original_message).unwrap();
+        cancel_endpoint_call_with_transfers(other, 41).unwrap();
+        assert!(!received_request_retains_custody(other, 41));
+
+        // Exercise the SAME production cancel mark before physical removal.
+        assert!(mark_endpoint_call_consumed(original_message, reply.raw(), 41));
+        assert!(!received_request_retains_custody(reply, 41));
+        drop(ENDPOINT_MESSAGES.remove(original_message));
+        drop(REPLIES.remove(reply.raw()));
+        assert!(!received_request_retains_custody(reply, 41));
+
+        // Enqueue itself refuses a foreign SC caller. Inject that malformed
+        // earlier input only into the NEGATIVE read-only observer fixture,
+        // after a real, valid enqueue/dequeue, then restore before cancellation.
+        let (mismatched, _) = enqueue_endpoint_call_with_handles_priority_and_custody(
+            endpoint, 41, b"mismatch", &[], EndpointCallPriority::Ordinary, custody).unwrap();
+        assert!(matches!(receive_or_wait(endpoint, 10, 16, 0, false).unwrap(), EndpointReceive::Queued(_)));
+        REPLIES.with_mut(mismatched.raw(), |object|
+            object.scheduling_context = Some(super::test_scheduling_custody(42))).unwrap();
+        assert!(!received_request_retains_custody(mismatched, 41));
+        assert!(!received_request_retains_custody(mismatched, 42));
+        REPLIES.with_mut(mismatched.raw(), |object| object.scheduling_context = Some(custody)).unwrap();
+        cancel_endpoint_call_with_transfers(mismatched, 41).unwrap();
+    });
+}
+
+#[test]
 fn concurrent_enqueue_and_receive_have_no_unowned_empty_window() {
     with_isolated_ipc_test(|| {
         for _ in 0..64 {

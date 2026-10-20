@@ -67,6 +67,20 @@ pub(in crate::multitask) fn wake_task(task_id: u64) -> bool {
     result
 }
 
+/// Observation only, after a refused call wake: does `task_id` still hold an
+/// armed or committed receive phase for exactly `endpoint`? Grants no wake,
+/// funding, frame or queue custody; the caller only republishes the endpoint
+/// waiter entry its own enqueue consumed.
+pub(in crate::multitask) fn receive_phase_on_endpoint(task_id: u64, endpoint: u64) -> bool {
+    endpoint != 0
+        && task_directory::candidates(task_id)
+            .find(|&slot| stack_resources::task_start::read(slot).map(|s| s.id) == Some(task_id))
+            .is_some_and(|slot| {
+                runqueue::wait::reason(slot) == (runqueue::wait::REASON_ENDPOINT_RECEIVE, endpoint)
+                    && (runqueue::wait::armed(slot) || runqueue::wait::blocked(slot))
+            })
+}
+
 /// User-qualified entry retains the SAME original binding through every wake
 /// effect. A task-directory candidate cannot turn a kernel task into a user wake.
 pub(in crate::multitask) fn wake_user(task_id: u64) -> bool {

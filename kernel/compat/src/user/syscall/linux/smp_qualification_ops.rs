@@ -14,7 +14,9 @@ use rustos_user_abi::syscall::{
     SMP_QUALIFICATION_WORK_MASK,
 };
 
-const SMP_QUALIFICATION_EXEC_PATH: &str = "apps/smpqual/smpqual.elf";
+// loaderd commits the absolute path returned by the immutable VFS snapshot,
+// not the manifest's relative archive/install key. Never normalize aliases here.
+const SMP_QUALIFICATION_EXEC_PATH: &str = "/apps/smpqual/smpqual.elf";
 const SMP_QUALIFICATION_BINDING_ID_MAX: u64 = u64::MAX >> SMP_QUALIFICATION_WORK_BITS;
 
 static NEXT_SMP_QUALIFICATION_BINDING_ID: AtomicU64 = AtomicU64::new(1);
@@ -61,6 +63,8 @@ struct WorkerBinding {
     tid: u64,
     cpu: u32,
     phase: WorkerPhase,
+    rsp_arrivals_at_start: u64,
+    hecs_rsp_delta: Option<u64>,
 }
 
 impl WorkerBinding {
@@ -68,6 +72,8 @@ impl WorkerBinding {
         tid: 0,
         cpu: 0,
         phase: WorkerPhase::Empty,
+        rsp_arrivals_at_start: 0,
+        hecs_rsp_delta: None,
     };
 }
 
@@ -190,6 +196,7 @@ impl SmpQualificationBinding {
         current_cpu: u32,
         current_tid: u64,
         now_tick: u64,
+        rsp_arrivals: u64,
     ) -> Result<u64, i64> {
         if self.target_pid_matches(target.process_id) && !self.target_matches(target) {
             self.terminate();
@@ -211,11 +218,14 @@ impl SmpQualificationBinding {
             self.terminate();
             return Err(LINUX_ETIMEDOUT);
         }
+        let expected_work = if milestone == linux_abi::PRODUCT_MILESTONE_HECS_REGISTERS {
+            linux_abi::SMP_QUALIFICATION_HECS_REGISTER_CHECKS
+        } else { self.work_units };
         if !linux_abi::smp_qualification_worker_shape_valid(
             packed_worker,
             supplied_work_units,
             current_cpu,
-        ) || supplied_work_units != self.work_units
+        ) || supplied_work_units != expected_work
             || current_tid == 0
         {
             return Err(LINUX_EINVAL);
@@ -238,6 +248,7 @@ impl SmpQualificationBinding {
                     tid: current_tid,
                     cpu: observed_cpu,
                     phase: WorkerPhase::Ready,
+                    ..WorkerBinding::EMPTY
                 };
             }
             linux_abi::PRODUCT_MILESTONE_SMP_QUALIFICATION_START => {
@@ -248,7 +259,21 @@ impl SmpQualificationBinding {
                 {
                     return Err(LINUX_EINVAL);
                 }
+                self.worker[worker_index].rsp_arrivals_at_start = rsp_arrivals;
                 self.worker[worker_index].phase = WorkerPhase::Started;
+            }
+            linux_abi::PRODUCT_MILESTONE_HECS_REGISTERS => {
+                let worker = &mut self.worker[worker_index];
+                if worker.phase != WorkerPhase::Started || worker.tid != current_tid
+                    || worker.cpu != observed_cpu || worker.hecs_rsp_delta.is_some() {
+                    return Err(LINUX_EINVAL);
+                }
+                // Per-CPU system-wide observation only. Native tests supply an
+                // explicit counter model; only the actual callback increments.
+                let delta = rsp_arrivals.checked_sub(worker.rsp_arrivals_at_start)
+                    .filter(|delta| *delta != 0 && *delta <= SMP_QUALIFICATION_WORK_MASK)
+                    .ok_or(LINUX_EINVAL)?;
+                worker.hecs_rsp_delta = Some(delta);
             }
             linux_abi::PRODUCT_MILESTONE_SMP_QUALIFICATION_FINISH => {
                 if self.worker[worker_index].phase != WorkerPhase::Started
@@ -272,7 +297,7 @@ impl SmpQualificationBinding {
             }
             _ => return Err(LINUX_EINVAL),
         }
-        encode_binding_work(self.binding_id, self.work_units).ok_or(LINUX_EINVAL)
+        encode_binding_work(self.binding_id, expected_work).ok_or(LINUX_EINVAL)
     }
 
     fn ready_barrier_complete(&self) -> bool {
@@ -339,6 +364,7 @@ fn qualification_phase(milestone: u64) -> bool {
             | linux_abi::PRODUCT_MILESTONE_SMP_QUALIFICATION_START
             | linux_abi::PRODUCT_MILESTONE_SMP_QUALIFICATION_FINISH
             | linux_abi::PRODUCT_MILESTONE_SMP_QUALIFICATION_COMPLETE
+            | linux_abi::PRODUCT_MILESTONE_HECS_REGISTERS
     )
 }
 
@@ -512,7 +538,7 @@ pub(super) fn admit_smp_qualification_milestone(
         return Err(LINUX_EPERM);
     };
     let target = QualificationIdentity::from(target);
-    let (encoded_work, binding_id, owner) = {
+    let (encoded_work, binding_id, owner, hecs_rsp_delta) = {
         let mut registry = SMP_QUALIFICATION_BINDING.lock();
         let Some(binding) = registry.binding.as_mut() else {
             return Err(LINUX_EPERM);
@@ -531,12 +557,21 @@ pub(super) fn admit_smp_qualification_milestone(
             current_cpu,
             current_tid,
             now_tick,
+            multitask::hardware_rsp_arrivals(current_cpu as usize).ok_or(LINUX_EINVAL)?,
         )?;
-        (encoded_work, binding.binding_id, binding.owner)
+        let worker_id = linux_abi::unpack_smp_qualification_worker(packed_worker).1 as usize;
+        (encoded_work, binding.binding_id, binding.owner, binding.worker[worker_id].hecs_rsp_delta)
     };
     if !live_sessiond_endpoint_matches(owner, endpoint_epoch) {
         terminalize_binding_after_endpoint_revalidation(binding_id, target);
         return Err(LINUX_EPERM);
+    }
+    if milestone == linux_abi::PRODUCT_MILESTONE_HECS_REGISTERS {
+        let encoded_delta = encode_binding_work(binding_id, hecs_rsp_delta.ok_or(LINUX_EINVAL)?)
+            .ok_or(LINUX_EINVAL)?;
+        // Same live binding/endpoint/worker admission, after all locks dropped.
+        // This count is kernel-observed, NOT supplied by the private app.
+        debug::record_milestone(debug::LogCategory::Compat, "hecs-rsp-arrivals", packed_worker, encoded_delta);
     }
     Ok(encoded_work)
 }
@@ -604,21 +639,26 @@ mod tests {
             identity(1),
             3,
             linux_abi::pack_smp_qualification_worker(worker, worker),
-            WORK,
+            if milestone == linux_abi::PRODUCT_MILESTONE_HECS_REGISTERS {
+                linux_abi::SMP_QUALIFICATION_HECS_REGISTER_CHECKS
+            } else { WORK },
             worker,
             tid,
             now,
+            if milestone == linux_abi::PRODUCT_MILESTONE_SMP_QUALIFICATION_START { 10 } else { 11 },
         )
     }
 
     #[test]
     fn private_exec_and_missing_binding_activation_are_fail_closed() {
         assert!(smp_qualification_exec_path_matches(
-            "apps/smpqual/smpqual.elf"
-        ));
-        assert!(!smp_qualification_exec_path_matches(
             "/apps/smpqual/smpqual.elf"
         ));
+        for alias in ["apps/smpqual/smpqual.elf", "//apps/smpqual/smpqual.elf",
+            "/apps/./smpqual/smpqual.elf", "/apps/other/../smpqual/smpqual.elf",
+            "/apps/smpqual/smpqual.elf/", "/apps/smpqual/smpqual.elf.other"] {
+            assert!(!smp_qualification_exec_path_matches(alias));
+        }
         assert_eq!(activation_without_matching_binding(true), Err(LINUX_EPERM));
         assert_eq!(activation_without_matching_binding(false), Ok(false));
 
@@ -638,6 +678,34 @@ mod tests {
             .find("published_service_endpoint_owner_and_epoch")
             .expect("qualification endpoint check");
         assert!(ordinary_guard < endpoint_lookup);
+    }
+
+    #[test]
+    fn hecs_report_requires_exact_started_worker_complete_checks_and_actual_counter_progress() {
+        let mut binding = active_binding(1);
+        assert!(admit(&mut binding, linux_abi::PRODUCT_MILESTONE_SMP_QUALIFICATION_READY, 0, 100, 101).is_ok());
+        let report = linux_abi::PRODUCT_MILESTONE_HECS_REGISTERS;
+        let ready = binding.clone();
+        assert_eq!(admit(&mut binding, report, 0, 100, 102), Err(LINUX_EINVAL));
+        assert_eq!(binding, ready);
+        assert!(admit(&mut binding, linux_abi::PRODUCT_MILESTONE_SMP_QUALIFICATION_START, 0, 100, 102).is_ok());
+        let started = binding.clone();
+        // Explicit native counter inputs, never machine-execution evidence.
+        for (checks, counter, tid) in [(0, 11, 100), (1023, 11, 100), (1025, 11, 100),
+            (1024, 0, 100), (1024, 9, 100), (1024, 10, 100), (1024, u64::MAX, 100),
+            (1024, 11, 101)] {
+            assert_eq!(binding.admit_phase(report, identity(41), identity(1), 3,
+                linux_abi::pack_smp_qualification_worker(0, 0), checks, 0, tid, 103, counter),
+                Err(LINUX_EINVAL));
+            assert_eq!(binding, started);
+        }
+        assert_eq!(admit(&mut binding, report, 0, 100, 103), encode_binding_work(9, 1024).ok_or(LINUX_EINVAL));
+        assert_eq!(binding.worker[0].hecs_rsp_delta, Some(1));
+        let observed = binding.clone();
+        assert_eq!(admit(&mut binding, report, 0, 100, 103), Err(LINUX_EINVAL));
+        assert_eq!(binding, observed);
+        assert!(admit(&mut binding, linux_abi::PRODUCT_MILESTONE_SMP_QUALIFICATION_FINISH, 0, 100, 104).is_ok());
+        assert_eq!(admit(&mut binding, report, 0, 100, 105), Err(LINUX_EINVAL));
     }
 
     #[test]
@@ -799,6 +867,7 @@ mod tests {
                 1,
                 101,
                 102,
+                11, // explicit native hardware-counter model
             ),
             Err(LINUX_EINVAL)
         );
@@ -820,6 +889,7 @@ mod tests {
                 0,
                 100,
                 101,
+                11,
             ),
             Err(LINUX_EINVAL)
         );
@@ -835,6 +905,7 @@ mod tests {
                 0,
                 100,
                 101,
+                11,
             ),
             Err(LINUX_EPERM)
         );
@@ -872,6 +943,7 @@ mod tests {
                 0,
                 100,
                 101,
+                11,
             ),
             Err(LINUX_EPERM)
         );
@@ -893,6 +965,7 @@ mod tests {
                 0,
                 100,
                 101,
+                11,
             ),
             Err(LINUX_EPERM)
         );
@@ -1024,7 +1097,7 @@ mod tests {
         let source = include_str!("smp_qualification_ops.rs");
         assert!(
             source.contains(
-                "const SMP_QUALIFICATION_EXEC_PATH: &str = \"apps/smpqual/smpqual.elf\";"
+                "const SMP_QUALIFICATION_EXEC_PATH: &str = \"/apps/smpqual/smpqual.elf\";"
             )
         );
         let bind = source

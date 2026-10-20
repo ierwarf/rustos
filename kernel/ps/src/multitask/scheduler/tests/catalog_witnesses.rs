@@ -108,7 +108,7 @@ pub(super) fn exact_cleanup() {
         assert!(s::reaper::claim_next(&executor).is_none());
         assert!(s::stack_resources::context::read(slot).is_some());
         let foreign = crate::multitask::RetiredTaskCleanup { task_id: PID + 1,
-            process_id: PID, process_terminal: true, clear_child_tid: 0,
+            process_id: PID, process_terminal: true, user_fault_vector: None, clear_child_tid: 0,
             robust_list_head: 0, robust_list_len: 0 };
         assert!(!retirement_cleanup::complete(foreign));
         assert!(s::reaper::claim_next(&executor).is_none());

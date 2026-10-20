@@ -6,6 +6,7 @@ fn token(task_id: u64) -> RetiredTaskCleanup {
         task_id,
         process_id: 71,
         process_terminal: false,
+        user_fault_vector: None,
         clear_child_tid: 0x1000,
         robust_list_head: 0x2000,
         robust_list_len: 24,
@@ -30,6 +31,10 @@ fn cleanup_requires_exact_claim_and_ack_before_slot_reset_or_reuse() {
         },
         RetiredTaskCleanup {
             process_terminal: true,
+            ..old
+        },
+        RetiredTaskCleanup {
+            user_fault_vector: Some(14),
             ..old
         },
         RetiredTaskCleanup {

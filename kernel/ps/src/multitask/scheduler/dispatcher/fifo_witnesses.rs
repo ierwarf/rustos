@@ -22,6 +22,34 @@ fn empty(atomic: bool) -> bool {
     else { policy.spawn_pick_hints.is_empty() }
 }
 
+#[test]
+fn actual_remote_activation_mailbox_is_admitted_before_atomic_first_turn_qualification() {
+    dispatch_claim::tests::fixture(false, |slot, turn| {
+        turn.begin_priority_choice();
+        // Earlier foreign activation input on the receiving modeled CPU. The
+        // root/frame/UID/funding are real; only physical CPU ingress is modeled.
+        let weight = runqueue::weight::value(slot);
+        runqueue::test_blocked_return(slot, 0, weight);
+        assert!(matches!(runqueue::publish_remote_wake(slot, 0, weight),
+            runqueue::RemoteWakeOutcome::Published { .. }));
+        assert_eq!(runqueue::owner(slot).state, runqueue::RunOwnerState::RemoteQueued);
+        assert!(frame_publication::local_frame_token(slot, 0).is_none());
+        enqueue(slot, ID, true);
+        // Do NOT manually drain the mailbox as the old remote activation
+        // component witness did: the real production priority chain must do it.
+        let decision = choose(turn, 0, 121, false, 0, crate::arch::rtc::ticks(),
+            donation_ledger::class_publication_sequence());
+        assert!(matches!(decision, Decision::Claimed(Urgency::Atomic)),
+            "atomic prefix must not starve its own remote mailbox behind Incomplete");
+        assert_eq!(turn.claimed_return().unwrap().id, ID);
+        assert!(execution_interval::original_claim_is_active(turn));
+        assert!(empty(true));
+        assert_eq!(dispatch_policy::lock(0).atomic_activation_handoff_remaining, 0);
+        assert!(!dispatch_policy::atomic_activation_pending(0));
+        dispatch_claim::tests::finish_modeled_preparation(slot, 121);
+    });
+}
+
 pub(in crate::multitask::scheduler) fn first_turn_fifo() {
     for atomic in [true, false] {
         dispatch_claim::tests::fixture(false, |slot, turn| {

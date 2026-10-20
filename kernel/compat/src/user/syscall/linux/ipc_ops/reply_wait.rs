@@ -257,3 +257,84 @@ mod tests {
         );
     }
 }
+
+pub(super) fn arm_reply_deadline_waiter(task_id: u64, deadline_tick: u64) -> bool {
+    crate::arch::rtc::arm_sleep_waiter_until_tick(task_id, deadline_tick)
+}
+
+pub(super) fn disarm_reply_deadline_waiter(task_id: u64) {
+    crate::arch::rtc::disarm_sleep_waiter(task_id);
+}
+
+#[repr(u64)]
+#[derive(Clone, Copy)]
+pub(super) enum ReplyCancelReason {
+    DeadlineBeforeArm = 1,
+    InvalidArm = 2,
+    DeadlineAfterArm = 3,
+    InvalidCommit = 4,
+    TransferCapacity = 5,
+    SchedulingCustody = 6,
+}
+
+pub(super) fn cancel_reply_wait(reply: KernelReplyHandle, caller_task_id: u64, reason: ReplyCancelReason) {
+    let result =
+        kernel_ipc_runtime::api::cancel_endpoint_call_with_transfers(reply, caller_task_id);
+    let mut in_flight = false;
+    if let Ok(cancelled) = &result {
+        if let Some(custody) = cancelled.scheduling_context {
+            assert!(
+                multitask::settle_cancelled_ipc_reply_scheduling_context(reply.raw(), custody),
+                "cancelled reply returned stale scheduling-context custody"
+            );
+        } else {
+            let _ = multitask::release_ipc_priority(reply.raw());
+        }
+        drop_transfer_descriptors(cancelled.transfers.as_slice());
+        in_flight =
+            cancelled.disposition == kernel_ipc_runtime::api::CancelledCallDisposition::InFlight;
+        if in_flight {
+            diagnostics::note_reply_abandoned_in_flight(reply.raw());
+        }
+    }
+    let status = u64::from(result.is_err());
+    let milestone = match reason {
+        ReplyCancelReason::DeadlineBeforeArm | ReplyCancelReason::DeadlineAfterArm => {
+            "ipc-reply-timeout"
+        }
+        ReplyCancelReason::InvalidArm
+        | ReplyCancelReason::InvalidCommit
+        | ReplyCancelReason::TransferCapacity
+        | ReplyCancelReason::SchedulingCustody => "ipc-reply-cancelled",
+    };
+    debug::record_milestone(
+        debug::LogCategory::Compat,
+        milestone,
+        reply.raw(),
+        // Bit 0 is the cancellation's own success; bit 1 says the service was
+        // already holding the request. Only the second costs a round trip that
+        // nobody will accept, so the two must be separable in the record - a
+        // run where every cancellation is `in_flight` is a service that cannot
+        // catch up, not a caller that is merely impatient.
+        ((caller_task_id & 0xffff_ffff) << 32)
+            | ((reason as u64) << 2)
+            | (u64::from(in_flight) << 1)
+            | status,
+    );
+    ipc_trace!(
+        "ipc reply cancellation: reply={} caller={} reason={} cancel={:?}",
+        reply.raw(),
+        caller_task_id,
+        reason as u64,
+        result
+    );
+}
+
+pub(super) fn record_ipc_reply_wait_failure(reply: KernelReplyHandle, caller_task_id: u64, errno: i64) {
+    debug::record_milestone(
+        debug::LogCategory::Compat,
+        "ipc-reply-wait-failed",
+        reply.raw(),
+        ((caller_task_id & 0xffff_ffff) << 32) | (errno.unsigned_abs() & 0xffff_ffff),
+    );
+}

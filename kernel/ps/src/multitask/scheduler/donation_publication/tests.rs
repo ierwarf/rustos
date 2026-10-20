@@ -68,6 +68,18 @@ pub(in crate::multitask::scheduler) fn actual_noncurrent_donor_requires_original
     born(|slots| {
         let scope = masked();
         task_directory::record(ID + 1, slots[0]);
+        let original = participant(ID + 1).unwrap();
+        let expected = stack_resources::context::read(slots[1]).unwrap().scheduling_context.identity();
+        {
+            use nucleus_core::util::lockdep::{LockClass, work_budget};
+            let budget = work_budget::declare(LockClass::TaskStackResources, 1);
+            assert_eq!(stack_resources::context::retained_scheduling_context(&original), Some(expected));
+            assert_eq!(budget.used(), Some(1), "one original participant qualification is one resource leaf");
+        }
+        stack_resources::task_start::test_mismatched_start(slots[1], ID + 99, || {
+            assert!(stack_resources::context::retained_scheduling_context(&original).is_none());
+        });
+        drop(original);
         let admission = reserve_call_with(&scope, ID + 1);
         assert!(admission.donation_reserved);
         assert!(!admission.system_class);
@@ -92,6 +104,9 @@ pub(in crate::multitask::scheduler) fn actual_noncurrent_donor_requires_original
         assert!(!reserve_call_with(&scope, ID + 1).donation_reserved);
         identity::publish_metadata(slots[1], Some(original));
         stack_resources::context::test_mismatched_context(slots[1], ID + 99, || {
+            let original = participant(ID + 1).unwrap();
+            assert!(stack_resources::context::retained_scheduling_context(&original).is_none());
+            drop(original);
             let refused = reserve_call_with(&scope, ID + 1);
             assert!(!refused.donation_reserved);
             assert!(refused.scheduling_context.is_none());
@@ -277,6 +292,49 @@ fn actual_reply_attachment_never_selects_a_runnable_process_worker_before_exact_
         assert_eq!(donation_ledger::borrowed_context_owner_slot(slots[2]), None);
         assert!(!donation_ledger::inherited_system(slots[2]));
     });
+}
+
+#[test]
+fn actual_queued_receive_moves_original_reply_funding_from_wake_candidate_to_consumer() {
+    use kernel_ipc_runtime::api::{self as ipc, endpoint, ReplySchedulingContextCustody};
+    let observed = core::cell::Cell::new(None);
+    born(|slots| {
+        let scope = masked();
+        runqueue::weight::replace(slots[0], SYSTEM_CLASS_WEIGHT_FLAG | super::super::NICE_0_LOAD);
+        let admission = reserve_call_with(&scope, ID);
+        assert!(admission.donation_reserved);
+        assert!(admission.system_class);
+        let custody = ReplySchedulingContextCustody::new_with_owner(
+            admission.scheduling_context.unwrap(), ID, ID).unwrap();
+        let endpoint = endpoint::create_for_process(ID).unwrap();
+        assert!(!ipc::add_endpoint_receiver_waiter_with_capacity(endpoint, ID + 1, 16).unwrap());
+        let (reply, candidate) = endpoint::enqueue_call_with_handles_priority_and_custody(
+            endpoint, ID, &[0xa7; 16], &[], ipc::EndpointCallPriority::System, custody).unwrap();
+        assert_eq!(candidate, Some(ID + 1));
+        assert!(donation_ledger::attach(reply.raw(), IpcReply, ID));
+        // The SAME real sender-side bind also occurs before a fallible wake.
+        // A sibling may actually dequeue before that selected waiter resumes.
+        assert!(bind_with(&scope, reply.raw(), ID, ID + 1, false));
+        let received = endpoint::receive_or_wait(endpoint, ID + 2, 16, 0, false).unwrap();
+        assert!(matches!(received, endpoint::EndpointReceive::Queued((actual, ref bytes, _, caller))
+            if actual == reply && bytes == &[0xa7; 16] && caller == ID));
+        assert!(bind_with(&scope, reply.raw(), ID, ID + 2, true));
+        // A late sender hint must not move authority back off the consumer.
+        assert!(bind_with(&scope, reply.raw(), ID, ID + 1, false));
+        observed.set(Some((slots[0], reply.raw(),
+            donation_ledger::borrowed_context_charge_token(slots[1]),
+            donation_ledger::borrowed_context_charge_token(slots[2]),
+            donation_ledger::inherited_system(slots[1]),
+            donation_ledger::inherited_system(slots[2]))));
+        let cancelled = ipc::cancel_endpoint_call_with_transfers(reply, ID).unwrap();
+        assert!(cancelled.scheduling_context.is_some());
+        assert!(donation_ledger::release_reply(reply.raw(), IpcReply));
+        let _ = ipc::fail_endpoints_owned_by_process(ID, ipc::IpcError::PeerClosed);
+    });
+    let (root, reply, candidate, consumer, candidate_system, consumer_system) = observed.get().unwrap();
+    assert_eq!((candidate, consumer, candidate_system, consumer_system),
+        (None, Some((root, reply)), false, true),
+        "only the actual dequeuing worker may spend the original caller's budget");
 }
 
 #[test]

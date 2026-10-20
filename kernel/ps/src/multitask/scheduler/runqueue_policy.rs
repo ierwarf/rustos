@@ -109,16 +109,6 @@ pub(super) fn affinity_target_cpu(slot: usize, eligible: u64) -> usize {
     )
 }
 
-/// Queue effects only; the caller must retain its exact binding/lifecycle owner.
-pub(super) fn rehome_on_mask(slot: usize, eligible: u64, weight: u32) -> Option<usize> {
-    let target = affinity_target_cpu(slot, eligible);
-    match runqueue::rehome_queued(slot, target, weight) {
-        runqueue::RemoteWakeOutcome::Rejected => None,
-        runqueue::RemoteWakeOutcome::AlreadyOwned { cpu } => cpu,
-        runqueue::RemoteWakeOutcome::Published { cpu, notify } => notify.then_some(cpu),
-    }
-}
-
 #[cfg(not(test))]
 pub(super) fn rehome_committed_affinity(
     slot: usize,

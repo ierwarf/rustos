@@ -665,7 +665,7 @@ pub(super) fn enqueue_reply_wake(token: ReplyWakeHandoff) -> bool {
 pub(super) fn take_next_ready(
     cpu: usize,
     fair_competitor_ready: bool,
-    ready: impl FnMut(SyncHandoffRecord) -> bool,
+    mut ready: impl FnMut(SyncHandoffRecord) -> bool,
 ) -> Option<SyncHandoffRecord> {
     if fair_competitor_ready
         && SYNC_HANDOFF_STREAK[cpu].load(core::sync::atomic::Ordering::Relaxed)
@@ -677,29 +677,49 @@ pub(super) fn take_next_ready(
         );
         return None;
     }
-    let mut state = state_for_cpu(cpu).lock();
-    debug_assert_eq!(state.handoff_streak, 0);
-    let taken = state.take_next_ready_record_with_competitor(fair_competitor_ready, ready);
-    // Clear on any queue this CPU has just seen empty under the lock. An
-    // enqueue publishes `true` before releasing this same FIFO lock.
-    if state.len == 0 {
-        if let Some(pending) = SYNC_HANDOFF_PENDING.get(cpu) {
-            // ORDERING: release keeps the clear behind the locked drain so a
-            // producer observing false cannot miss an unconsumed record.
-            pending.store(false, core::sync::atomic::Ordering::Release);
+    // Qualification may borrow original task identity/frame backing and may
+    // materialize a stale Direct owner. Neither belongs under the ordering
+    // leaf. Consume one exact record, release the leaf, then qualify it; the
+    // dispatcher still owns the physical turn and final generation claim.
+    // Bound work even if concurrent producers continuously replenish the FIFO.
+    for attempt in 0..MAX_TASK {
+        let taken = {
+            let mut state = state_for_cpu(cpu).lock();
+            debug_assert_eq!(state.handoff_streak, 0);
+            let taken = if state.len != 0 {
+                state.take_next_ready_record_with_competitor(false, |_| true)
+            } else {
+                None
+            };
+            // Enqueue publishes true under this same leaf. Clear only after
+            // observing empty there, never after running external qualification.
+            if state.len == 0 {
+                if let Some(pending) = SYNC_HANDOFF_PENDING.get(cpu) {
+                    // ORDERING: release pairs with the locked empty observation.
+                    pending.store(false, core::sync::atomic::Ordering::Release);
+                }
+            }
+            taken
+        };
+        let Some(record) = taken else {
+            #[cfg(rustos_scheduler_phase_profile)]
+            super::locality::record_sync_handoff_miss(if attempt == 0 {
+                super::locality::SyncHandoffMissReason::StartedEmpty
+            } else {
+                super::locality::SyncHandoffMissReason::DrainedStale
+            });
+            let _ = attempt;
+            return None;
+        };
+        if ready(record) {
+            return Some(record);
         }
     }
-    taken
-}
-
-/// Whether an exact same-CPU handoff may bypass the FIFO without weakening
-/// the bounded chain rule. The caller still checks for a fair competitor and
-/// records the accepted dispatch through `record_dispatch`.
-#[cfg(not(test))]
-pub(super) fn immediate_handoff_allowed(cpu: usize, fair_competitor_ready: bool) -> bool {
-    !fair_competitor_ready
-        || SYNC_HANDOFF_STREAK[cpu].load(core::sync::atomic::Ordering::Relaxed)
-            < MAX_SYNC_HANDOFF_CHAIN_TICKS
+    #[cfg(rustos_scheduler_phase_profile)]
+    super::locality::record_sync_handoff_miss(
+        super::locality::SyncHandoffMissReason::DrainedStale,
+    );
+    None
 }
 
 pub(super) fn record_dispatch(cpu: usize, synchronous_handoff: bool, now_ticks: u64) {

@@ -31,6 +31,7 @@ pub use ipc::{
     arm_block_current_task_on_reply, attach_reserved_ipc_priority,
     bind_reserved_ipc_priority, cancel_block_current_task,
     cancel_ipc_priority_reservation, complete_fast_ipc_reply_wake_handoff_with_custody,
+    endpoint_receiver_still_waiting,
     complete_ipc_reply_wake_handoff, complete_ipc_reply_wake_handoff_with_custody,
     complete_pager_fault_wake_handoff, demote_current_user_task_to_user_class,
     inherit_ipc_priority, inherit_pager_fault_priority,
@@ -45,6 +46,10 @@ pub use pager::{
     publish_inherited_pager_vma_for_process, publish_pager_vma_for_process,
     revoke_current_pager_vma, revoke_pager_vma_for_process,
 };
+
+// Native witnesses model the earlier masked IRQ entry, not privileged CLI/STI.
+#[cfg(test)]
+pub(in crate::multitask) use pager::published_current_pager_binding as test_current_pager_binding;
 
 use super::cpu_local;
 use super::{
@@ -470,17 +475,19 @@ pub fn activate_suspended_user_task(task_id: u64) -> bool {
 }
 
 pub fn activate_suspended_user_tasks(task_ids: &[u64]) -> bool {
-    activate_suspended_user_tasks_with_commit(task_ids, || {})
+    activate_suspended_user_tasks_with_commit(task_ids, || Some(()))
 }
 
-/// Runs bounded authority consumption under exact pinned activation Cohort,
-/// not the global directory. Caller retains its outer service registry guard;
-/// no identity/resource/policy leaf spans this callback. It must be infallible,
-/// allocation-free and must never log, block or acquire another lock. Exact
-/// targets remain suspended until publication; concurrent terminal stop wins.
-pub fn activate_suspended_user_tasks_with_commit<F>(task_ids: &[u64], commit_authority: F) -> bool
+/// Preflight retains original Current, Cohort, target allocations and readers
+/// BEFORE bounded authority consumption. Enter with NO raw registry guard.
+/// The callback may take bounded registry leaves but must release them before
+/// returning the original owned grant. `None` refuses before any runnable effect;
+/// `Some` consumes permission once and retains that SAME grant through the final
+/// queue/prefix publication. It must not allocate, log or block. Exact target
+/// backing survives even if concurrent terminal stop wins after consumption.
+pub fn activate_suspended_user_tasks_with_commit<G, F>(task_ids: &[u64], commit_authority: F) -> bool
 where
-    F: FnOnce(),
+    F: FnOnce() -> Option<G>,
 {
     super::scheduler::activation::activate(task_ids, commit_authority)
 }
@@ -513,6 +520,7 @@ pub fn wake_user_task(task_id: u64) -> bool {
 pub fn set_next_pick_hint(task_id: u64) {
     super::scheduler::ordering_publication::target(task_id)
 }
+
 
 /// Cold synchronous call: exact endpoint receive phase, original Current and
 /// caller funding survive bind -> typed wake -> FIFO. Sender reply wait is NOT
@@ -870,9 +878,12 @@ pub fn retire_current_user_task_due_to_fault(
     // would silently reactivate that bug if stack reservation policy changed.
     // A future lazy profile must introduce an explicit deferred-fault owner
     // and generation-bound retry before this exception path may resume faults.
-    let disposition = super::scheduler::current_terminal::fault(vector, error_code, cr2, rip, rsp);
-    complete_retirement_side_effects();
-    disposition
+    // This callback still runs on the exception stack with IF clear. Never
+    // wait for the independent kernel cleanup executor here: its MM teardown
+    // can need this CPU's TLB ACK. Return so compat records the terminal status
+    // and HAL reaches the interruptible retired-task halt. The original banks
+    // and durable cleanup rows remain owned until their separate RSP/worker ACKs.
+    super::scheduler::current_terminal::fault(vector, error_code, cr2, rip, rsp)
 }
 
 pub fn halt_current_retired_task() -> ! {

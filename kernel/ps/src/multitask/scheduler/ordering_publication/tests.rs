@@ -146,6 +146,38 @@ pub(in crate::multitask::scheduler) fn actual_latency_and_process_ordering_use_e
     });
 }
 #[test]
+pub(in crate::multitask::scheduler) fn actual_fifo_qualification_releases_ordering_leaf_before_original_binding_and_replenishment() {
+    family(|root, child, scope| {
+        runqueue::raise_vruntime_floor(root, 8 * IPC_DONATION_BONUS_NS);
+        assert_eq!(process_in(scope, PARENT), Some(CHILD));
+        let mut original = None;
+        let taken = sync_handoff::take_next_ready(0, false, |record| {
+            assert_eq!(nucleus_core::util::lockdep::held_spin_lock_depth(), 0,
+                "FIFO cannot retain a raw leaf across original identity/frame qualification");
+            let target = Target::capture(CHILD).unwrap();
+            assert_eq!(target.binding.slot(), child);
+            assert_eq!((record.slot(), record.task_id()), (child, CHILD));
+            assert!(!sync_handoff::pending(0), "empty was observed under the leaf");
+            assert!(sync_handoff::enqueue(0, record));
+            original = Some(record);
+            true
+        }).unwrap();
+        assert_eq!(taken, original.unwrap(), "the consumed exact record survives qualification");
+        assert!(sync_handoff::pending(0), "a callback's later producer cannot be cleared by an earlier consumer");
+        let mut callbacks = 0;
+        assert!(sync_handoff::take_next_ready(0, false, |record| {
+            assert_eq!(nucleus_core::util::lockdep::held_spin_lock_depth(), 0);
+            callbacks += 1;
+            assert!(sync_handoff::enqueue(0, record));
+            false
+        }).is_none());
+        assert_eq!(callbacks, MAX_TASK, "continuous producers cannot make one dispatch drain unbounded");
+        assert!(sync_handoff::pending(0));
+        assert_eq!(sync_handoff::take_next_ready(0, false, |_| true), Some(taken));
+        assert!(!sync_handoff::pending(0));
+    });
+}
+#[test]
 pub(in crate::multitask::scheduler) fn actual_missing_current_cannot_supply_latency_floor_and_foreign_uid_cannot_publish() {
     family(|_, child, scope| {
         runqueue::raise_vruntime_floor(child, 8 * IPC_DONATION_BONUS_NS);

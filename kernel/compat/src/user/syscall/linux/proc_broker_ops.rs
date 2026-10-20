@@ -18,6 +18,7 @@
 use super::*;
 
 mod activation_batch;
+mod deferred_activation;
 mod authority;
 mod fork;
 mod scheduling_context_grants;
@@ -121,7 +122,7 @@ struct ExecTransitionState {
 type ProcPrepareRegistry = FnvIndexMap<u64, ProcPrepareState, MAX_PROC_PREPARES>;
 type ExecTicketRegistry = FnvIndexMap<u64, ExecTicketState, MAX_EXEC_TICKETS>;
 type ExecTransitionRegistry = FnvIndexMap<u64, ExecTransitionState, MAX_EXEC_TRANSITIONS>;
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 struct DeferredActivationAuthority {
     owner: multitask::ProcessIdentity,
     target: multitask::ProcessIdentity,
@@ -840,73 +841,72 @@ pub(super) fn syscall_linux_rustos_proc_activate_broker(args_ptr: u64) -> u64 {
         Ok(args) => args,
         Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
     };
-    if args.abi_version != PROC_BROKER_ABI_VERSION
-        || args.reserved0 != 0
-        || args.flags != 0
-        || args.target_pid == 0
-        || args.requester_pid == 0
-    {
+    if args.abi_version != PROC_BROKER_ABI_VERSION || args.reserved0 != 0
+        || args.flags != 0 || args.target_pid == 0 || args.requester_pid == 0 {
         return linux_errno(LINUX_EINVAL);
     }
-    // This syscall runs in loaderd's service context, but activation authority
-    // belongs to the original requester captured at deferred-spawn commit.
-    // Re-resolve that requester as a live, generation-bound identity so a
-    // restarted loaderd neither denies a valid request nor adopts its owner.
+    // Requester policy identity is not loaderd's identity. These observations
+    // do not replace the original physical Cohort/readers retained by PS.
     let (owner, target) = match resolve_deferred_activation_identities(
-        args.requester_pid,
-        args.target_pid,
-        multitask::live_user_process_identity_by_pid,
+        args.requester_pid, args.target_pid, multitask::live_user_process_identity_by_pid,
     ) {
         Ok(identities) => identities,
         Err(errno) => return linux_errno(errno),
     };
-    let mut activations = DEFERRED_ACTIVATIONS.lock();
-    if !deferred_spawn_authority_matches(&activations, args.target_pid, owner, target) {
-        return linux_errno(LINUX_EPERM);
-    }
-    let authority = *activations
-        .get(&args.target_pid)
-        .expect("preflighted deferred activation authority");
-    let qualification_armed =
-        match super::smp_qualification_ops::prepare_smp_qualification_activation(
-            owner,
-            target,
-            authority.qualification_required,
-        ) {
-            Ok(armed) => armed,
-            Err(errno) => return linux_errno(errno),
-        };
-    if !multitask::activate_suspended_user_tasks_with_commit(
-        core::slice::from_ref(&args.target_pid),
-        || {
-            assert_eq!(
-                activations.remove(&args.target_pid),
-                Some(authority),
-                "proc activation invariant: preflighted authority disappeared while locked"
-            );
+    let mut qualification_armed = false;
+    let mut callback_seen = false;
+    let mut failure = LINUX_ESRCH;
+    let activated = multitask::activate_suspended_user_tasks_with_commit(
+        core::slice::from_ref(&args.target_pid), || {
+            // Bounded permission transfer AFTER PS retains the original caller
+            // and targets. Cleanup competes at this SAME registry leaf, not in
+            // an unprotected gap between copied preflight and consumption.
+            callback_seen = true;
+            let mut activations = DEFERRED_ACTIVATIONS.lock();
+            if !deferred_spawn_authority_matches(&activations, args.target_pid, owner, target) {
+                failure = LINUX_EPERM;
+                return None;
+            }
+            let required = activations.get(&args.target_pid).unwrap().qualification_required;
+            qualification_armed = match super::smp_qualification_ops::prepare_smp_qualification_activation(
+                owner, target, required,
+            ) {
+                Ok(armed) => armed,
+                Err(errno) => { failure = errno; return None; },
+            };
+            let grant = deferred_activation::take_exact::<1, _, MAX_DEFERRED_ACTIVATIONS>(
+                &mut activations, core::slice::from_ref(&args.target_pid),
+                |_, authority| deferred_activation_identities_match(
+                    &authority.owner, &authority.target, &owner, &target),
+            ).expect("validated single activation lost its original grant");
+            drop(activations);
+            Some(grant)
         },
-    ) {
-        // Scheduler preflight failed before the callback consumed the
-        // authority. Retire both records; a bound child must never remain
-        // eligible after a failed runnable publication.
-        let removed = activations.remove(&args.target_pid);
-        drop(activations);
+    );
+    if !activated {
+        // Registry/qualification refusal did not consume any authority.
+        if callback_seen { return linux_errno(failure); }
+        // No runnable effect preceded refusal. Remove only OUR still-pending
+        // original record; cleanup or another accepted activation may have won.
+        let removed = {
+            let mut activations = DEFERRED_ACTIVATIONS.lock();
+            let removed = if deferred_spawn_authority_matches(&activations, args.target_pid, owner, target) {
+                activations.remove(&args.target_pid)
+            } else { None };
+            drop(activations);
+            removed
+        };
         if qualification_armed {
             super::smp_qualification_ops::abort_smp_qualification_activation(target);
         }
-        let _ = removed;
-        let _ = multitask::terminate_user_process(args.target_pid);
-        return linux_errno(LINUX_ESRCH);
+        if removed.is_some() { let _ = multitask::terminate_user_process(args.target_pid); }
+        return linux_errno(failure);
     }
-    drop(activations);
-    // One-shot capability consumption precedes runnable publication inside
-    // the registry's scope with exact pinned activation Cohort. Requester cleanup
-    // can win before it or observe the committed child after it, never between.
+    // Permission was moved once, not copied; the SAME grant and original PS
+    // Cohort survived all runnable publication. No registry raw lock crossed PS.
     nucleus_core::debug::record_milestone(
         nucleus_core::debug::LogCategory::Compat,
-        "proc-activate-committed",
-        args.target_pid,
-        args.requester_pid,
+        "proc-activate-committed", args.target_pid, args.requester_pid,
     );
     0
 }

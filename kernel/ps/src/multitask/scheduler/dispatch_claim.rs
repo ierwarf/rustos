@@ -60,6 +60,7 @@ impl<'a> DispatchFrame<'a> {
         turn: &'a CpuDispatchTurn<'static>, slot: usize, expected_id: u64,
         generation: u64, rsp: usize, custody: FrameCustody, class_sequence: u64,
     ) -> FrameCapture<'a> {
+        let _phase = super::runtime_profile::phase_scope(super::SchedulerPhase::ClaimCapture);
         let Some((cpu, original)) = turn.original_current() else {
             return FrameCapture::Stale;
         };
@@ -149,6 +150,7 @@ impl<'a> DispatchFrame<'a> {
     }
 
     pub(super) fn prepare(self) -> Option<FundedFrame<'a>> {
+        let _phase = super::runtime_profile::phase_scope(super::SchedulerPhase::ClaimFunding);
         if !self.is_current() {
             return None;
         }
@@ -203,6 +205,7 @@ impl FundedFrame<'_> {
     /// funding move into execution under THIS turn before claim returns. No
     /// later scalar Scheduler lookup can open or replace the interval.
     pub(super) fn claim(self) -> bool {
+        let _phase = super::runtime_profile::phase_scope(super::SchedulerPhase::ClaimCommit);
         let slot = self.frame.slot();
         let cpu = self.frame.cpu();
         if !runqueue::claim_validated_dispatch(&self.frame, runqueue::weight::value(slot),

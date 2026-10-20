@@ -474,7 +474,7 @@ fn build_process_bootstrap(
 ) -> Result<multitask::UserTaskBootstrap, ProcessLoadError> {
     let (
         stack_pointer,
-        mut linux_process_state,
+        linux_process_state,
         linux_memory_map,
         linux_runtime_profile,
         linux_thread_state,

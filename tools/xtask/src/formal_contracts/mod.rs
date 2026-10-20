@@ -13,7 +13,7 @@ use crate::cli::FormalContractsCommand;
 #[cfg(test)]
 pub(crate) use evidence::validated_smp_launch_evidence_for_tests;
 pub(crate) use evidence::{
-    ValidatedSmpLaunchEvidence, ensure_smp_launch_evidence, validate_smp_launch_evidence,
+    ValidatedSmpLaunchEvidence, ensure_smp_launch_evidence, source_tree_hash, validate_smp_launch_evidence,
 };
 pub(crate) use registry::{ContractImpact, ContractRegistry};
 pub(crate) use runtime_trace::{KvmRuntimeObservation, record_kvm_runtime_trace};

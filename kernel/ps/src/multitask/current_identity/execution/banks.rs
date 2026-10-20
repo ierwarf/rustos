@@ -122,6 +122,10 @@ pub(in crate::multitask) fn owns_current(cpu: usize, slot: usize) -> bool {
         .get(cpu)
         .is_some_and(|bank| bank.current.load(Ordering::Acquire) == slot + 1)
 }
+/// Observe the original outgoing role without reconstructing its owned permit.
+pub(in crate::multitask) fn owns_outgoing(cpu: usize, slot: usize) -> bool {
+    BANKS.get(cpu).is_some_and(|bank| bank.outgoing.load(Ordering::Acquire) == slot + 1)
+}
 pub(in crate::multitask) fn image_custody(slot: usize, current: Option<usize>) -> bool {
     match current {
         None => count(slot) == 0,

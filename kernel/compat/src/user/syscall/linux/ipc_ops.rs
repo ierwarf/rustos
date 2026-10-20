@@ -17,6 +17,15 @@
 //!   `input-delivery-lifecycle`.
 use super::*;
 
+// Textually before the child modules so they can trace too.
+macro_rules! ipc_trace {
+    ($($arg:tt)*) => {
+        if IPC_TRACE_VERBOSE {
+            debug::println_serialized(format_args!($($arg)*));
+        }
+    };
+}
+
 #[path = "ipc_reply_diagnostics.rs"]
 mod diagnostics;
 mod fast_reply;
@@ -41,7 +50,9 @@ pub(super) use fast_reply::recv_with_sender_blocking_prepared_after_fast_reply;
 #[cfg(rustos_ipc_phase_profile)]
 pub(super) use ipc_fast_metrics::drain_fast_ipc_counters;
 use ipc_fast_metrics::{IpcFastCounter, note_fast_ipc, note_fast_ipc_handoff_rejection};
-use reply_wait::wait_for_reply_with_deadline;
+use reply_wait::{
+    arm_reply_deadline_waiter, cancel_reply_wait, disarm_reply_deadline_waiter, wait_for_reply_with_deadline, ReplyCancelReason,
+};
 pub(super) use subject::{
     current_process_has_service_capability, current_process_with_service_capability,
 };
@@ -60,14 +71,6 @@ use super::ipc_profile::{IpcCallPhase, charge as charge_phase, now as phase_mark
 use super::ipc_server_profile::{
     IpcServerPhase, charge as charge_server_phase, now as server_phase_mark,
 };
-
-macro_rules! ipc_trace {
-    ($($arg:tt)*) => {
-        if IPC_TRACE_VERBOSE {
-            debug::println_serialized(format_args!($($arg)*));
-        }
-    };
-}
 
 const IPC_TRACE_VERBOSE: bool = false;
 const MAX_SERVICE_ENDPOINTS: usize = 16;
@@ -1495,6 +1498,7 @@ fn try_fast_ipc_call_bytes(
         note_fast_ipc(IpcFastCounter::FallbackShape);
         return Ok(None);
     }
+    let mut fast_mark = phase_mark();
     let deadline_tick = service_reply_deadline_tick_for_authorized_service(
         authorized_service_id,
         request,
@@ -1503,7 +1507,9 @@ fn try_fast_ipc_call_bytes(
     if reply_deadline_expired(deadline_tick) {
         return Err(LINUX_ETIMEDOUT);
     }
+    fast_mark = charge_phase(IpcCallPhase::FastDeadline, fast_mark);
     let admission = ipc_call_admission::reserve(task_id)?;
+    fast_mark = charge_phase(IpcCallPhase::FastAdmission, fast_mark);
     let (reply, receiver_task_id) =
         match kernel_ipc_runtime::api::endpoint::reserve_fast_call_with_response_capacity(
             endpoint,
@@ -1524,6 +1530,7 @@ fn try_fast_ipc_call_bytes(
                 return Err(ipc_error_to_linux_errno(error));
             }
         };
+    fast_mark = charge_phase(IpcCallPhase::FastRuntime, fast_mark);
     note_fast_ipc(IpcFastCounter::ReservationPublished);
 
     if !multitask::arm_block_current_task_on_reply(reply.raw()) {
@@ -1536,11 +1543,13 @@ fn try_fast_ipc_call_bytes(
         note_fast_ipc(IpcFastCounter::FallbackDeadlineArm);
         return Ok(None);
     }
+    fast_mark = charge_phase(IpcCallPhase::FastArm, fast_mark);
     let handoff = multitask::commit_fast_ipc_call_handoff_and_yield(
         endpoint.raw(),
         reply.raw(),
         receiver_task_id,
     );
+    fast_mark = charge_phase(IpcCallPhase::FastHandoff, fast_mark);
     disarm_reply_deadline_waiter(task_id);
     if !matches!(
         handoff,
@@ -1564,6 +1573,7 @@ fn try_fast_ipc_call_bytes(
                 return Err(ipc_error_to_linux_errno(error));
             }
         };
+        fast_mark = charge_phase(IpcCallPhase::FastTake, fast_mark);
         match response {
             kernel_ipc_runtime::api::FastEndpointResponseTake::Response {
                 response_len,
@@ -3091,18 +3101,33 @@ fn enqueue_call_and_wake_with_handles_for_task(
         // span bind/wake/FIFO without a directory guard. This cold producer
         // leaves the sender Running/unarmed; wait_for_reply arbitrates a fast
         // reverse reply and performs the later wait commit and yield.
-        let handoff = match multitask::commit_ipc_call_handoff(
-            endpoint.raw(), reply.raw(), task_id, receiver_task_id,
+        let handoff = match ipc_call_admission::retry_transient_receiver_refusal(
+            || multitask::commit_ipc_call_handoff(
+                endpoint.raw(), reply.raw(), task_id, receiver_task_id,
+            ),
+            || multitask::endpoint_receiver_still_waiting(receiver_task_id, endpoint.raw()),
         ) {
             Ok(handoff) => handoff,
-            Err(_) => {
-                // A peer may already have replied while the exact original
-                // typed phase refused. Only runtime's exact settled reply is
-                // success; otherwise withdraw this published request/custody.
-                if kernel_ipc_runtime::api::endpoint_reply_custody_returned(reply, task_id) {
+            Err(refusal) => {
+                // Classify the exact original transport edge only after all
+                // scheduler loans returned. This observation is not a wake or
+                // permission to replace the original scheduling context.
+                if ipc_call_admission::refused_wake_can_keep_delivered_reply(
+                    reply, task_id, donation_admitted,
+                ) {
                     return Ok(reply);
                 }
+                // Failure-only, after every scheduler loan returned. Preserve
+                // exact reply/receiver and the refusal; no success-path output
+                // or new scheduling authority is introduced by this record.
+                debug::record_milestone(
+                    debug::LogCategory::Compat,
+                    "ipc-donation-handoff-refused",
+                    reply.raw(),
+                    ((receiver_task_id & 0xffff_ffff) << 32) | refusal as u64,
+                );
                 cancel_reply_wait(reply, task_id, ReplyCancelReason::SchedulingCustody);
+                restore_refused_receiver(endpoint, receiver_task_id);
                 return Err(LINUX_ENOSPC);
             }
         };
@@ -3150,6 +3175,17 @@ fn enqueue_call_and_wake_with_handles_for_task(
         return Err(LINUX_ENOSPC);
     }
     Ok(reply)
+}
+
+/// Enqueue popped `receiver` from the endpoint's waiter list before the
+/// scheduler refused its wake (for example while it was still running between
+/// its receive arm and block commit). Like the fast-path rollback, put it back
+/// while it still holds that receive phase; otherwise it commits its block
+/// outside the waiter list and every later call to the endpoint times out.
+fn restore_refused_receiver(endpoint: KernelEndpointHandle, receiver: u64) {
+    if multitask::endpoint_receiver_still_waiting(receiver, endpoint.raw()) {
+        let _ = kernel_ipc_runtime::api::restore_endpoint_receiver_waiter(endpoint, receiver);
+    }
 }
 
 fn wait_for_service_reply(reply: KernelReplyHandle) -> Result<Vec<u8>, i64> {
@@ -3303,87 +3339,6 @@ fn service_reply_deadline_tick_for_authorized_service(
 
 pub(super) fn reply_deadline_expired(deadline_tick: u64) -> bool {
     crate::arch::rtc::ticks() >= deadline_tick
-}
-
-fn arm_reply_deadline_waiter(task_id: u64, deadline_tick: u64) -> bool {
-    crate::arch::rtc::arm_sleep_waiter_until_tick(task_id, deadline_tick)
-}
-
-fn disarm_reply_deadline_waiter(task_id: u64) {
-    crate::arch::rtc::disarm_sleep_waiter(task_id);
-}
-
-#[repr(u64)]
-#[derive(Clone, Copy)]
-enum ReplyCancelReason {
-    DeadlineBeforeArm = 1,
-    InvalidArm = 2,
-    DeadlineAfterArm = 3,
-    InvalidCommit = 4,
-    TransferCapacity = 5,
-    SchedulingCustody = 6,
-}
-
-fn cancel_reply_wait(reply: KernelReplyHandle, caller_task_id: u64, reason: ReplyCancelReason) {
-    let result =
-        kernel_ipc_runtime::api::cancel_endpoint_call_with_transfers(reply, caller_task_id);
-    let mut in_flight = false;
-    if let Ok(cancelled) = &result {
-        if let Some(custody) = cancelled.scheduling_context {
-            assert!(
-                multitask::settle_cancelled_ipc_reply_scheduling_context(reply.raw(), custody),
-                "cancelled reply returned stale scheduling-context custody"
-            );
-        } else {
-            let _ = multitask::release_ipc_priority(reply.raw());
-        }
-        drop_transfer_descriptors(cancelled.transfers.as_slice());
-        in_flight =
-            cancelled.disposition == kernel_ipc_runtime::api::CancelledCallDisposition::InFlight;
-        if in_flight {
-            diagnostics::note_reply_abandoned_in_flight(reply.raw());
-        }
-    }
-    let status = u64::from(result.is_err());
-    let milestone = match reason {
-        ReplyCancelReason::DeadlineBeforeArm | ReplyCancelReason::DeadlineAfterArm => {
-            "ipc-reply-timeout"
-        }
-        ReplyCancelReason::InvalidArm
-        | ReplyCancelReason::InvalidCommit
-        | ReplyCancelReason::TransferCapacity
-        | ReplyCancelReason::SchedulingCustody => "ipc-reply-cancelled",
-    };
-    debug::record_milestone(
-        debug::LogCategory::Compat,
-        milestone,
-        reply.raw(),
-        // Bit 0 is the cancellation's own success; bit 1 says the service was
-        // already holding the request. Only the second costs a round trip that
-        // nobody will accept, so the two must be separable in the record - a
-        // run where every cancellation is `in_flight` is a service that cannot
-        // catch up, not a caller that is merely impatient.
-        ((caller_task_id & 0xffff_ffff) << 32)
-            | ((reason as u64) << 2)
-            | (u64::from(in_flight) << 1)
-            | status,
-    );
-    ipc_trace!(
-        "ipc reply cancellation: reply={} caller={} reason={} cancel={:?}",
-        reply.raw(),
-        caller_task_id,
-        reason as u64,
-        result
-    );
-}
-
-fn record_ipc_reply_wait_failure(reply: KernelReplyHandle, caller_task_id: u64, errno: i64) {
-    debug::record_milestone(
-        debug::LogCategory::Compat,
-        "ipc-reply-wait-failed",
-        reply.raw(),
-        ((caller_task_id & 0xffff_ffff) << 32) | (errno.unsigned_abs() & 0xffff_ffff),
-    );
 }
 
 fn export_current_fds_for_ipc(
@@ -3568,13 +3523,6 @@ fn cancel_received_handle_reservations(reservation_id: u64, slots: &[u64]) {
             .handles_mut()
             .cancel_reservations(reservation_id, slots);
     });
-}
-
-pub(super) fn install_transfer_descriptors_for_current_process(
-    descriptors: &[KernelTransferredHandle],
-) -> Result<Vec<i32>, i64> {
-    let entries = take_transfer_entries(descriptors)?;
-    install_transfer_entries_for_current_process(entries)
 }
 
 pub(super) fn transfer_tickets_for_descriptors(

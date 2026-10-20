@@ -16,7 +16,7 @@ use lock_census::{acquire_site_is_reportable, fnv1a32};
 pub(in crate::multitask) mod owner;
 const PROFILE_TOP_TASKS: usize = 4;
 pub(super) const SCHEDULER_ENTRY_CAUSE_COUNT: usize = 4;
-pub(super) const SCHEDULER_PHASE_COUNT: usize = 18;
+pub(super) const SCHEDULER_PHASE_COUNT: usize = 24;
 const PROFILE_EMPTY: u8 = 0;
 const PROFILE_BUSY: u8 = 1;
 const PROFILE_READY: u8 = 2;
@@ -84,6 +84,46 @@ pub(in crate::multitask) enum SchedulerPhase {
     ArchAddressSpace = 16,
     /// Data-segment reloads and the FS/GS base writes.
     ArchSegments = 17,
+    /// Original typed call/reply publication, before dispatcher selection.
+    IpcCallPublication = 18,
+    IpcReplyPublication = 19,
+    /// Actual original frame capture, funding admission, and final claim.
+    ClaimCapture = 20,
+    ClaimFunding = 21,
+    ClaimCommit = 22,
+    /// Borrowing the outgoing original Current/frame binding.
+    ReturnCapture = 23,
+}
+
+/// Diagnostic-only wall time of the actual production boundary. No clock,
+/// lock, allocation or telemetry instruction remains in shipping builds.
+#[must_use]
+pub(in crate::multitask) struct PhaseScope {
+    #[cfg(rustos_scheduler_phase_profile)]
+    phase: SchedulerPhase,
+    #[cfg(rustos_scheduler_phase_profile)]
+    started: u64,
+}
+#[inline(always)]
+pub(in crate::multitask) fn phase_scope(phase: SchedulerPhase) -> PhaseScope {
+    #[cfg(not(rustos_scheduler_phase_profile))]
+    let _ = phase;
+    PhaseScope {
+        #[cfg(rustos_scheduler_phase_profile)]
+        phase,
+        #[cfg(rustos_scheduler_phase_profile)]
+        started: crate::arch::clock::monotonic_nanos(),
+    }
+}
+impl Drop for PhaseScope {
+    #[inline(always)]
+    fn drop(&mut self) {
+        #[cfg(rustos_scheduler_phase_profile)]
+        {
+            let elapsed = crate::arch::clock::monotonic_nanos().saturating_sub(self.started);
+            owner::local(|row| row.phase(self.phase, elapsed));
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -250,6 +290,22 @@ fn pack_u32_pair(high: u64, low: u64) -> u64 {
     let high = high.min(u64::from(u32::MAX));
     let low = low.min(u64::from(u32::MAX));
     (high << 32) | low
+}
+
+// Formatting and transporting a zero row is still guest work. Default builds
+// omit only empty phase rows; real values and explicit profiling's zero
+// observations remain intact. No budget, error, census, or task row uses this.
+#[inline(always)]
+fn emit_phase_row(profile_enabled: bool, arg0: u64, arg1: u64, emit: impl FnOnce(u64, u64)) {
+    if profile_enabled || arg0 != 0 || arg1 != 0 {
+        emit(arg0, arg1);
+    }
+}
+
+fn record_phase_row(name: &'static str, arg0: u64, arg1: u64) {
+    emit_phase_row(cfg!(rustos_scheduler_phase_profile), arg0, arg1, |arg0, arg1| {
+        crate::debug::record_milestone(crate::debug::LogCategory::Sched, name, arg0, arg1);
+    });
 }
 
 /// Emits one census row, skipping rows that carry no information.
@@ -567,16 +623,14 @@ pub fn drain_scheduler_runtime_profile() -> usize {
     }
     // Owner publication plus the deferred wake drain, which every acquisition
     // pays before its caller runs. arg0=prologue us, arg1=wakes drained.
-    crate::debug::record_milestone(
-        crate::debug::LogCategory::Sched,
+    record_phase_row(
         "kernel-scheduler-phase-prologue",
         profile.phase_ns[SchedulerPhase::Prologue as usize] / 1_000,
         profile.deferred_wakes,
     );
     // The three disjoint jobs inside `Account`, which is the dominant in-owner
     // segment. arg0=(charge us, validate us), arg1=(ready us, 0).
-    crate::debug::record_milestone(
-        crate::debug::LogCategory::Sched,
+    record_phase_row(
         "kernel-scheduler-phase-account",
         pack_u32_pair(
             profile.phase_ns[SchedulerPhase::AccountCharge as usize] / 1_000,
@@ -588,8 +642,7 @@ pub fn drain_scheduler_runtime_profile() -> usize {
         ),
     );
     // arg0=(preamble us, budget us). Both are inside `AccountCharge`.
-    crate::debug::record_milestone(
-        crate::debug::LogCategory::Sched,
+    record_phase_row(
         "kernel-scheduler-phase-account-charge",
         pack_u32_pair(
             profile.phase_ns[SchedulerPhase::AccountPreamble as usize] / 1_000,
@@ -599,8 +652,7 @@ pub fn drain_scheduler_runtime_profile() -> usize {
     );
     // Disjoint in-owner segments in microseconds.
     // arg0=(account, balance), arg1=(validate, select).
-    crate::debug::record_milestone(
-        crate::debug::LogCategory::Sched,
+    record_phase_row(
         "kernel-scheduler-phase",
         pack_u32_pair(
             profile.phase_ns[SchedulerPhase::Account as usize] / 1_000,
@@ -616,8 +668,7 @@ pub fn drain_scheduler_runtime_profile() -> usize {
     );
     // arg0=(select vruntime, select handoff), arg1=(select pick, guard
     // acquisitions across the window).
-    crate::debug::record_milestone(
-        crate::debug::LogCategory::Sched,
+    record_phase_row(
         "kernel-scheduler-phase-select",
         pack_u32_pair(
             profile.phase_ns[SchedulerPhase::SelectVruntime as usize] / 1_000,
@@ -631,8 +682,7 @@ pub fn drain_scheduler_runtime_profile() -> usize {
     // The four disjoint jobs inside `ArchRestore`, the largest segment of a
     // real task switch. arg0=(simd us, validate us), arg1=(address space us,
     // segments us).
-    crate::debug::record_milestone(
-        crate::debug::LogCategory::Sched,
+    record_phase_row(
         "kernel-scheduler-phase-arch",
         pack_u32_pair(
             profile.phase_ns[SchedulerPhase::ArchSimd as usize] / 1_000,
@@ -653,8 +703,7 @@ pub fn drain_scheduler_runtime_profile() -> usize {
         0,
     );
     // arg0=(commit, architectural restore), arg1=(attributed total, hold total).
-    crate::debug::record_milestone(
-        crate::debug::LogCategory::Sched,
+    record_phase_row(
         "kernel-scheduler-phase-tail",
         pack_u32_pair(
             profile.phase_ns[SchedulerPhase::Commit as usize] / 1_000,
@@ -721,7 +770,18 @@ pub fn drain_scheduler_runtime_profile() -> usize {
         );
     }
     #[cfg(rustos_scheduler_phase_profile)]
-    local_shadow::emit_milestones(&profile);
+    {
+        local_shadow::emit_milestones(&profile);
+        for (name, first, second) in [
+            ("kernel-dispatch-phase-ipc-us", SchedulerPhase::IpcCallPublication, SchedulerPhase::IpcReplyPublication),
+            ("kernel-dispatch-phase-claim-us", SchedulerPhase::ClaimCapture, SchedulerPhase::ClaimFunding),
+            ("kernel-dispatch-phase-commit-us", SchedulerPhase::ClaimCommit, SchedulerPhase::ReturnCapture),
+        ] {
+            crate::debug::record_milestone(crate::debug::LogCategory::Sched, name,
+                profile.phase_ns[first as usize] / 1_000,
+                profile.phase_ns[second as usize] / 1_000);
+        }
+    }
     // Milestones, not level-filtered logs: the ordinary info channel does not
     // reach the debug transport in the product configuration, and a diagnostic
     // that cannot be read is not evidence.
@@ -844,6 +904,18 @@ pub(in crate::multitask) fn record_prologue(wakes: usize, elapsed: u64) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn actual_phase_emitter_omits_only_disabled_empty_rows_and_keeps_real_observations() {
+        for (enabled, a, b, expected) in [
+            (false, 0, 0, false), (false, 1, 0, true),
+            (false, 0, 1, true), (false, u64::MAX, u64::MAX, true),
+            (true, 0, 0, true), (true, 1, 0, true), (true, 0, 1, true),
+        ] {
+            let mut observed = None;
+            super::emit_phase_row(enabled, a, b, |a, b| observed = Some((a, b)));
+            assert_eq!(observed, expected.then_some((a, b)), "enabled={enabled}, args=({a},{b})");
+        }
+    }
     // Earlier native counter input, not a production Scheduler authority.
     // Both fixtures and the actual independent drain use the SAME projector.
     fn take_counter_fixture(counters: &mut super::owner::Counters, now: u64)

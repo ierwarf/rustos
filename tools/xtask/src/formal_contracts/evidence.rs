@@ -480,7 +480,7 @@ fn binding_exempt_paths(root: &Path) -> Result<Vec<String>> {
         .collect())
 }
 
-pub(super) fn source_tree_hash(root: &Path) -> Result<String> {
+pub(crate) fn source_tree_hash(root: &Path) -> Result<String> {
     let exempt = binding_exempt_paths(root)?;
     let output = Command::new("git")
         .args([

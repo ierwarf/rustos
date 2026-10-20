@@ -397,6 +397,12 @@ fn causal_record(line: &str) -> bool {
         "inputd: DVM",
         "rustos-dvm-",
         "watchdog",
+        "!PANIC-SITE:",
+        "[PANIC]",
+        "location: kernel/",
+        "message: ",
+        "name=linux-user-fault ",
+        "name=linux-user-page-fault-address ",
         "scheduler long ready wait:",
         "memory allocation of ",
         "fatal service endpoint not ready",
@@ -537,6 +543,10 @@ fn write_kvm_success_summary(
     } else {
         None
     };
+    let hardware_execution = if options.smp_ring3_qualification {
+        Some(hecs::evidence(&rustos_log, options.rustos_vcpus)
+            .context("refusing SMP evidence without complete hardware-execution witnesses")?)
+    } else { None };
     let archive = SmpEvidenceArchive::new(
         &config.root_dir,
         &layout.run_dir,
@@ -551,12 +561,10 @@ fn write_kvm_success_summary(
         .as_deref()
         .map(|contract| archive.artifact_for_bytes("smp-qualification.env", contract));
     let summary = KvmSuccessSummary {
-        // v6 adds the exact DVM-attached block-disk artifact and authenticated
-        // SMP qualification ELF digest to the launch snapshot. v5 readers
-        // must not infer that the runtime source image names the bytes QEMU
-        // attached to the DVM.
-        schema: "rustos-kvm-smp-correctness-evidence-v6",
-        predecessor_schema: "rustos-kvm-smp-correctness-evidence-v5",
+        // v7 requires supplementary actual RSP and assembly register witnesses
+        // for private Ring3 qualification. v6 lifecycle alone is not HECS.
+        schema: "rustos-kvm-smp-correctness-evidence-v7",
+        predecessor_schema: "rustos-kvm-smp-correctness-evidence-v6",
         status: "passed",
         smp_evidence_cohort: snapshot.run.cohort.clone(),
         run_id: snapshot.run.run_id.clone(),
@@ -592,6 +600,7 @@ fn write_kvm_success_summary(
         smp_runtime_markers,
         smp_runtime_events,
         smp_ring3_qualification_events,
+        hardware_execution,
         ui_minimum_fps: options.min_ui_fps,
         ui_proof_windows: options.ui_proof_windows,
     };
@@ -971,6 +980,8 @@ fn uiserver_profile_input_pipeline_healthy(
 
 fn runtime_stall_or_crash_observed(log: &str) -> bool {
     const FAILURES: &[&str] = &[
+        "!PANIC-SITE:",
+        "[PANIC]",
         "uiserver watchdog panic:",
         "uiserver input watchdog panic:",
         "uiserver panic:",

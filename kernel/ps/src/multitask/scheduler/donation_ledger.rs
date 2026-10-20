@@ -2,7 +2,6 @@
 //!
 //! - **Owner:** this ledger owns one pending or live IPC donation edge per
 //!   donor task; original participant loans independently qualify new Current entries.
-//!   Remaining legacy worker/handoff adapters still resolve through Scheduler.
 //! - **Lifecycle:** reserve -> attach/bind -> release. A bound edge increments
 //!   exactly one receiver-slot inheritance count and terminal release removes
 //!   it before forgetting the reply identity.
@@ -11,8 +10,7 @@
 //! - **Failure:** duplicate reservation, stale reply, capacity exhaustion, and
 //!   unmatched terminal release fail closed without changing a receiver class.
 //!   Owned publication revalidates original source custody under this same leaf;
-//!   candidate snapshots are never execution/interval grants. Legacy adapters
-//!   remain distinct and are not covered by that owned admission claim.
+//!   candidate snapshots are never execution/interval grants.
 //! - **Evidence:** `ipc-priority-inheritance` and the focused ledger tests.
 
 use core::sync::atomic::{AtomicU8, AtomicU16, AtomicU64, Ordering};
@@ -250,6 +248,41 @@ pub(super) fn cancel_reservation(donor_task_id: u64) -> bool {
     true
 }
 
+/// Exact original queued-reply custody, not permission to bind any worker.
+/// A stale receiver waiter may be ignored only while THIS reply still awaits
+/// a receiver and is funded by this retained original donor's live basis.
+pub(super) fn retains_awaiting_reply(
+    donor: &super::super::current_identity::execution::BindingPin, reply: u64,
+) -> bool {
+    if reply == 0 { return false; }
+    let ledger = DONATION_LEDGER.lock();
+    let Some(index) = ledger.find_reply(reply, DonationNamespace::IpcReply) else { return false; };
+    let entry = ledger.entries[index].as_ref().unwrap();
+    entry.donation.donor_task_id == donor.id()
+        && entry.receiver_slot.is_none() && !entry.donation.custody_active
+        && matches!(entry.donation.target, IpcDonationTarget::AwaitingReceiver)
+        && entry.funding.as_ref().is_some_and(|basis| basis.donor_slot == donor.slot()
+            && basis.donor_id == donor.id() && current_basis_live(&ledger, basis))
+}
+
+/// Observation for the original sender's reply wait only. An actual receiver
+/// may already have bound this published reply on another CPU. This confirms
+/// that exact admission, never rebinds/wakes the stale waiter or lends a worker
+/// frame/execution right. The caller retains its original Current/binding loan.
+pub(super) fn reply_already_dispatched(
+    donor: &super::super::current_identity::execution::BindingPin, reply: u64,
+) -> bool {
+    if reply == 0 { return false; }
+    let ledger = DONATION_LEDGER.lock();
+    let Some(index) = ledger.find_reply(reply, DonationNamespace::IpcReply) else { return false; };
+    let entry = ledger.entries[index].as_ref().unwrap();
+    entry.donation.donor_task_id == donor.id()
+        && entry.donation.custody_active && entry.receiver_slot.is_some()
+        && matches!(entry.donation.target, IpcDonationTarget::BoundWorker(_))
+        && entry.funding.as_ref().is_some_and(|basis| basis.donor_slot == donor.slot()
+            && basis.donor_id == donor.id() && current_basis_live(&ledger, basis))
+}
+
 pub(super) fn attach(reply: u64, namespace: DonationNamespace, donor_task_id: u64) -> bool {
     if reply == 0 {
         return false;
@@ -306,6 +339,33 @@ pub(super) fn bind_owned(loans: &super::donation_publication::ReceiveLoans,
     bind_reserved_locked(&mut ledger, reply, namespace, basis.donor_id,
         loans.receiver.id(), loans.receiver.slot())
 }
+/// A successful IPC_RECV, unlike a sender's wake candidate, identifies the
+/// actual consumer. Move ONLY the retained reservation's original context and
+/// priority to that worker; a later sender hint remains idempotent and cannot
+/// move it back. The original donor/root/receiver loans enclose this leaf.
+pub(super) fn bind_received_owned(loans: &super::donation_publication::ReceiveLoans,
+    reply: u64, namespace: DonationNamespace) -> bool {
+    let basis = loans.donor.basis();
+    let mut ledger = DONATION_LEDGER.lock();
+    if !basis_live(&ledger, basis)
+        || bind_basis_locked(&ledger, reply, namespace, basis.donor_slot, basis.donor_id)
+            != Ok(Some(*basis))
+    { return false; }
+    if let Some(index) = ledger.find_reply(reply, namespace) {
+        let previous = ledger.entries[index].expect("received reply lost its original reservation");
+        if previous.donation.custody_active
+            && (previous.receiver_slot != Some(loans.receiver.slot())
+                || previous.donation.target != IpcDonationTarget::BoundWorker(loans.receiver.id()))
+        {
+            return upsert_locked(&mut ledger, reply, namespace, basis.donor_id,
+                loans.receiver.id(), loans.receiver.slot(), basis.root_id, basis.root_slot,
+                previous.donation.priority_donated, Some(*basis));
+        }
+    }
+    bind_reserved_locked(&mut ledger, reply, namespace, basis.donor_id,
+        loans.receiver.id(), loans.receiver.slot())
+}
+
 pub(super) fn upsert_owned(loans: &super::donation_publication::ReceiveLoans,
     reply: u64, namespace: DonationNamespace) -> bool {
     let basis = loans.donor.basis();

@@ -20,7 +20,7 @@ use nucleus_core::debug::LogCategory;
 use nucleus_core::debug::phase_profile::{PhaseProfile, phase_now};
 
 #[cfg(any(test, rustos_ipc_phase_profile))]
-pub(super) const IPC_CALL_PHASE_COUNT: usize = 12;
+pub(super) const IPC_CALL_PHASE_COUNT: usize = 18;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum IpcCallPhase {
@@ -51,6 +51,18 @@ pub(super) enum IpcCallPhase {
     /// Receiver wake, donation bind, and the synchronous pick hint, split out
     /// of `Enqueue`.
     EnqueueWake = 11,
+    /// Fast path only: deadline derivation and expiry check.
+    FastDeadline = 12,
+    /// Original sender funding reservation, before runtime publication.
+    FastAdmission = 13,
+    /// Runtime inline request and exact reply reservation.
+    FastRuntime = 14,
+    /// Typed reply arm and its bounded deadline registration.
+    FastArm = 15,
+    /// Commit/yield/resume, INCLUDING server and any intervening scheduling.
+    FastHandoff = 16,
+    /// Response take after the original handoff returns.
+    FastTake = 17,
 }
 
 #[cfg(rustos_ipc_phase_profile)]
@@ -69,6 +81,12 @@ static PROFILE: PhaseProfile<IPC_CALL_PHASE_COUNT> = PhaseProfile::new(
         "ipc-call-phase-copy-alloc",
         "ipc-call-phase-enqueue-runtime",
         "ipc-call-phase-enqueue-wake",
+        "ipc-call-phase-fast-deadline",
+        "ipc-call-phase-fast-admission",
+        "ipc-call-phase-fast-runtime",
+        "ipc-call-phase-fast-arm",
+        "ipc-call-phase-fast-handoff",
+        "ipc-call-phase-fast-take",
     ],
     "ipc-call-phase-discarded",
 );
@@ -152,6 +170,12 @@ mod tests {
             (IpcCallPhase::CopyAlloc, 9),
             (IpcCallPhase::EnqueueRuntime, 10),
             (IpcCallPhase::EnqueueWake, 11),
+            (IpcCallPhase::FastDeadline, 12),
+            (IpcCallPhase::FastAdmission, 13),
+            (IpcCallPhase::FastRuntime, 14),
+            (IpcCallPhase::FastArm, 15),
+            (IpcCallPhase::FastHandoff, 16),
+            (IpcCallPhase::FastTake, 17),
         ];
         for (phase, index) in phases {
             assert_eq!(phase as usize, index, "phase {phase:?} moved slot");

@@ -84,6 +84,9 @@ fn acceptance_milestones_retry_the_contended_debug_sink() {
         "dvm-block-first-completion",
         "task-context-corrupted",
         "linux-user-fault",
+        "linux-user-page-fault-address",
+        "pager-user-fault-vma-rejected",
+        "pager-user-anon-fault-refused",
         "linux-thread-clone-rejected",
     ] {
         assert_eq!(milestone_output_class(name), MilestoneOutputClass::Required);
@@ -235,6 +238,8 @@ fn qualification_output_class_is_exact_and_scheduler_is_measurement() {
         "smp-qualification-start",
         "smp-qualification-finish",
         "smp-qualification-complete",
+        "hecs-registers",
+        "hecs-rsp-arrivals",
     ] {
         assert_eq!(
             milestone_output_class(name),

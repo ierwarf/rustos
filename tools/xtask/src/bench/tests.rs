@@ -41,6 +41,7 @@ fn a_host_clock_shift_is_reported_as_drift_rather_than_as_an_improvement() {
             min: 40,
             p50: 40,
             p99: 80,
+            max: 80,
             mean: 58,
             min_ns: 10,
             p50_ns: 10,
@@ -51,6 +52,7 @@ fn a_host_clock_shift_is_reported_as_drift_rather_than_as_an_improvement() {
             min: 3_960,
             p50: 4_040,
             p99: 6_840,
+            max: 6_840,
             mean: 9_072,
             min_ns: 992,
             p50_ns: 1_012,
@@ -61,6 +63,7 @@ fn a_host_clock_shift_is_reported_as_drift_rather_than_as_an_improvement() {
             min: 97_680,
             p50: 100_000,
             p99: 200_000,
+            max: 200_000,
             mean: 150_000,
             min_ns: 24_474,
             p50_ns: 25_000,
@@ -102,6 +105,7 @@ fn a_delta_inside_the_instrument_spread_is_labelled_noise() {
             min: 4_760,
             p50: 4_800,
             p99: 5_120,
+            max: 5_120,
             mean: 6_919,
             min_ns: 1_192,
             p50_ns: 1_202,
@@ -113,6 +117,7 @@ fn a_delta_inside_the_instrument_spread_is_labelled_noise() {
             min: 119_340,
             p50: 122_000,
             p99: 400_000,
+            max: 400_000,
             mean: 200_000,
             min_ns: 29_900,
             p50_ns: 30_500,
@@ -142,6 +147,7 @@ fn a_comparison_without_the_anchor_refuses_to_report_deltas() {
         min: 97_680,
         p50: 100_000,
         p99: 200_000,
+        max: 200_000,
         mean: 150_000,
         min_ns: 24_474,
         p50_ns: 25_000,
@@ -164,6 +170,7 @@ fn a_held_anchor_reports_the_raw_delta_without_a_drift_warning() {
             min: 4_800,
             p50: 4_840,
             p99: 5_120,
+            max: 5_120,
             mean: 6_919,
             min_ns: 1_202,
             p50_ns: 1_212,
@@ -174,6 +181,7 @@ fn a_held_anchor_reports_the_raw_delta_without_a_drift_warning() {
             min: 106_344,
             p50: 110_000,
             p99: 200_000,
+            max: 200_000,
             mean: 150_000,
             min_ns: 26_646,
             p50_ns: 27_000,
@@ -198,6 +206,63 @@ const MILESTONE: &str = "seq=316 ts_us=3238281 tick=3316 lvl=info cat=compat mod
 const FAST_COUNTER: &str = "seq=317 ts_us=3238282 tick=3317 lvl=info cat=compat mod=nucleus_core::debug line=0 pid=- tid=- msg=\"milestone-begin v=1 output_seq=317 seq=282 ts_us=3238282 tick=3317 cat=compat name=ipc-fastpath-counter arg0=0xd arg1=0x20 pid=- tid=- dropped=0 discarded_bytes=0 checksum=0 milestone-end\"";
 const LIFECYCLE_MILESTONE: &str = "seq=318 ts_us=3238283 tick=3318 lvl=info cat=process mod=nucleus_core::debug line=0 pid=- tid=- msg=\"milestone-begin v=1 output_seq=318 seq=283 ts_us=3238283 tick=3318 cat=process name=lifecycle-exec-publish arg0=0x700000003 arg1=0x90000000b pid=- tid=- dropped=0 discarded_bytes=0 checksum=0 milestone-end\"";
 const LOCAL_DISPATCH_MILESTONE: &str = "seq=319 ts_us=3238284 tick=3319 lvl=info cat=sched mod=nucleus_core::debug line=0 pid=- tid=- msg=\"milestone-begin v=1 output_seq=319 seq=284 ts_us=3238284 tick=3319 cat=sched name=kernel-scheduler-local-shadow arg0=0x0000000200000003 arg1=0x0000000400000005 pid=- tid=- dropped=0 discarded_bytes=0 checksum=0 milestone-end\"";
+
+#[test]
+fn worst_case_is_preserved_without_substituting_a_percentile_or_default() {
+    let line = "name=ipc_rt_intra_process iters=20000 min=4000 p50=8000 p99=12000 max=900000 mean=10000 min_ns=1 p50_ns=2";
+    let result = parse_result(line).unwrap();
+    assert_eq!(result.max, 900000);
+    let report = render(4000000, &[result], &[]);
+    let header: Vec<_> = report.lines().nth(2).unwrap().split_whitespace().collect();
+    let values: Vec<_> = report.lines().nth(4).unwrap().split_whitespace().collect();
+    let index = header.iter().position(|value| *value == "max_cyc").unwrap();
+    assert_eq!(values[index], "900000");
+    assert!(parse_result(&line.replace(" max=900000", "")).is_none());
+}
+#[test]
+fn ipc_maximum_gate_keeps_outliers_sample_counts_and_inclusive_limit() {
+    let line = "ipcbench: result name=ipc_rt_intra_process_reply_recv iters=20000 min=4000 p50=8000 p99=12000 max=15000 mean=10000 min_ns=1 p50_ns=2";
+    let log = SAMPLE.replace("ipcbench: end", &format!("{line}\\n\nipcbench: end"));
+    let run = parse_log(&log).unwrap();
+    let probe = "ipc_rt_intra_process_reply_recv";
+    validate_ipc_max(&run, probe, 15_000).unwrap();
+    assert!(validate_ipc_max(&run, probe, 14_999).is_err());
+    assert!(validate_ipc_max(&run, probe, 0).is_err());
+    assert!(validate_ipc_max(&run, "vmexit_cpuid", 15_000).is_err());
+    for (old, new) in [("max=15000", "max=15001"),
+        ("max=15000", "max=900000"), ("iters=20000", "iters=19999"),
+        ("iters=50000", "iters=49999"),
+    ] {
+        let changed = parse_log(&log.replace(old, new)).unwrap();
+        assert!(validate_ipc_max(&changed, probe, 15_000).is_err(), "{old} -> {new}");
+    }
+    let missing = parse_log(SAMPLE).unwrap();
+    assert!(validate_ipc_max(&missing, probe, 15_000).is_err());
+    let skipped = log.replace("ipcbench: end", &format!("ipcbench: skip name={probe} reason=unavailable\\n\nipcbench: end"));
+    assert!(validate_ipc_max(&parse_log(&skipped).unwrap(), probe, 15_000).is_err());
+}
+
+#[test]
+fn malformed_distributions_and_replayed_measurement_windows_fail_closed() {
+    let line = "name=ipc_rt_intra_process iters=20000 min=4000 p50=8000 p99=12000 max=15000 mean=10000 min_ns=1 p50_ns=2";
+    for (old, new) in [("iters=20000", "iters=0"), ("min=4000", "min=8001"),
+        ("p50=8000", "p50=12001"), ("p99=12000", "p99=15001"),
+        ("mean=10000", "mean=15001"), ("mean=10000", "mean=3999"),
+    ] {
+        assert!(parse_result(&line.replace(old, new)).is_none(), "{old} -> {new}");
+    }
+    for log in [
+        SAMPLE.replace("3990809", "0"),
+        SAMPLE.replace("3990809", "invalid"),
+        format!("ipcbench: result {line}\n{SAMPLE}"),
+        format!("{SAMPLE}\nipcbench: result {line}\n"),
+        format!("{SAMPLE}{SAMPLE}"),
+        SAMPLE.replace("ipcbench: end", "ipcbench: end-not-really"),
+        SAMPLE.replace("ipcbench: end", &format!("ipcbench: result {line}\\n\nipcbench: result {line}\\n\nipcbench: end")),
+    ] {
+        assert!(parse_log(&log).is_err(), "accepted invalid log: {log}");
+    }
+}
 
 #[test]
 fn parses_wrapped_debugcon_payload_lines() {
@@ -414,7 +479,7 @@ fn a_run_without_the_unit_phase_claims_no_attribution_at_all() {
 fn phase_milestones_inside_the_run_are_summed_per_name() {
     let log = format!(
         "user-debug payload=ipcbench: tsc_khz=3990809\n{MILESTONE}\n{MILESTONE}\n\
-             user-debug payload=ipcbench: result name=null_syscall_getpid iters=1 min=1 p50=1 p99=1 mean=1 min_ns=1 p50_ns=1\n\
+             user-debug payload=ipcbench: result name=null_syscall_getpid iters=1 min=1 p50=1 p99=1 max=1 mean=1 min_ns=1 p50_ns=1\n\
              user-debug payload=ipcbench: end\n"
     );
     let run = parse_log(&log).expect("run parses");
@@ -431,7 +496,7 @@ fn a_phase_milestone_before_the_run_is_not_attributed_to_it() {
     // report a cost the benchmark never provoked.
     let log = format!(
         "{MILESTONE}\nuser-debug payload=ipcbench: tsc_khz=3990809\n\
-             user-debug payload=ipcbench: result name=null_syscall_getpid iters=1 min=1 p50=1 p99=1 mean=1 min_ns=1 p50_ns=1\n\
+             user-debug payload=ipcbench: result name=null_syscall_getpid iters=1 min=1 p50=1 p99=1 max=1 mean=1 min_ns=1 p50_ns=1\n\
              user-debug payload=ipcbench: end\n"
     );
     let run = parse_log(&log).expect("run parses");
@@ -443,7 +508,7 @@ fn a_milestone_outside_the_profile_families_is_ignored() {
     let unrelated = MILESTONE.replace("ipc-call-phase-wait-take", "kernel-scheduler-hold-max");
     let log = format!(
         "user-debug payload=ipcbench: tsc_khz=3990809\n{unrelated}\n\
-             user-debug payload=ipcbench: result name=null_syscall_getpid iters=1 min=1 p50=1 p99=1 mean=1 min_ns=1 p50_ns=1\n\
+             user-debug payload=ipcbench: result name=null_syscall_getpid iters=1 min=1 p50=1 p99=1 max=1 mean=1 min_ns=1 p50_ns=1\n\
              user-debug payload=ipcbench: end\n"
     );
     let run = parse_log(&log).expect("run parses");
@@ -454,7 +519,7 @@ fn a_milestone_outside_the_profile_families_is_ignored() {
 fn fast_path_reason_counters_are_named_and_summed_inside_the_run() {
     let log = format!(
         "user-debug payload=ipcbench: tsc_khz=3990809\n{FAST_COUNTER}\n{FAST_COUNTER}\n\
-             user-debug payload=ipcbench: result name=null_syscall_getpid iters=1 min=1 p50=1 p99=1 mean=1 min_ns=1 p50_ns=1\n\
+             user-debug payload=ipcbench: result name=null_syscall_getpid iters=1 min=1 p50=1 p99=1 max=1 mean=1 min_ns=1 p50_ns=1\n\
              user-debug payload=ipcbench: end\n"
     );
     let run = parse_log(&log).expect("run parses");

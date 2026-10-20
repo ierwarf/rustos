@@ -753,7 +753,7 @@ dvm_block_flush_read_body="$(sed -n '/^fn valid_flush_completion_keeps_transport
 dvm_block_cache_source="$(cat kernel/io-manager/src/io/dvm_block.rs)"
 dvm_input_cache_source="$(cat kernel/io-manager/src/input/dvm_ring.rs)"
 dvm_network_cache_source="$(cat kernel/io-manager/src/io/dvm_network.rs)"
-dvm_display_cache_source="$(cat kernel/io-manager/src/io/dvm_display.rs)"
+dvm_display_cache_source="$(cat kernel/io-manager/src/io/dvm_display.rs kernel/io-manager/src/io/dvm_display/{installation,peer}.rs)"
 kernel_vm_cache_source="$(cat kernel/mm/src/memory/kernel_vm.rs)"
 input_ring_atomic_production="$(sed '/^#\[cfg(test)\]/,$d' kernel/io-manager/src/input/dvm_ring.rs)"
 host_input_ring_atomic_production="$(sed '/^#\[cfg(test)\]/,$d' libs/driver-domain-host/src/lib.rs)"
@@ -992,11 +992,11 @@ if [[ -z "$dvm_revoke_guard_line" || -z "$dvm_revoke_observation_line" || -z "$d
     exit 1
 fi
 
-# Only the four closed qualification names may use qualification-local loss
+# Only the six closed SMP/HECS names may use qualification-local loss
 # counters.  Scheduler records stay one-attempt measurements, while the host
 # parser rejects any nonzero local evidence loss before accepting a workload.
 debug_qualification_class_failed=0
-for debug_qualification_name in smp-qualification-ready smp-qualification-start smp-qualification-finish smp-qualification-complete; do
+for debug_qualification_name in smp-qualification-ready smp-qualification-start smp-qualification-finish smp-qualification-complete hecs-registers hecs-rsp-arrivals; do
     grep -Fq "\"$debug_qualification_name\"" <<<"$debug_milestone_class_body" || debug_qualification_class_failed=1
 done
 if [[ "$debug_qualification_class_failed" != 0 ]] \
@@ -1012,7 +1012,7 @@ if [[ "$debug_qualification_class_failed" != 0 ]] \
     || ! grep -Fq 'qualification_discarded_bytes.fetch_add(discarded_bytes, Ordering::Relaxed);' <<<"$debug_milestone_drop_body" \
     || ! rg -Fq 'event.milestones_dropped != 0' tools/xtask/src/kvm.rs \
     || ! rg -Fq '|| event.debug_bytes_discarded != 0' tools/xtask/src/kvm.rs; then
-    echo 'qualification debug evidence must use its exact four classes, local fail-closed loss counters, a one-attempt scheduler measurement, Required DVM revoke, and parser loss rejection' >&2
+    echo 'qualification debug evidence must use its exact six SMP/HECS classes, local fail-closed loss counters, a one-attempt scheduler measurement, Required DVM revoke, and parser loss rejection' >&2
     exit 1
 fi
 
@@ -1060,13 +1060,13 @@ if [[ -z "$join_line" || -z "$complete_line" || "$complete_line" -le "$join_line
     || ! grep -Fq 'let now_tick = crate::arch::rtc::ticks();' <<<"$smp_phase_body" \
     || ! grep -Fq 'binding.admit_phase(' <<<"$smp_phase_body" \
     || ! grep -Fq 'terminalize_binding_after_endpoint_revalidation(binding_id, target);' <<<"$smp_phase_body" \
-    || ! grep -Fq 'authority.qualification_required,' <<<"$proc_activate_body" \
+    || ! grep -Fq 'activations.get(&args.target_pid).unwrap().qualification_required' <<<"$proc_activate_body" \
     || ! grep -Fq 'activate_suspended_user_tasks_with_commit(' <<<"$proc_activate_body" \
     || ! rg -Fq 'const fn deferred_authority_is_batch_eligible(qualification_required: bool) -> bool' kernel/compat/src/user/syscall/linux/proc_broker_ops/activation_batch.rs \
     || ! rg -Fq '&& deferred_authority_is_batch_eligible(qualification_required)' kernel/compat/src/user/syscall/linux/proc_broker_ops/activation_batch.rs \
     || ! rg -Fq 'let mut exact_targets = [None; LOADER_ACTIVATE_BATCH_MAX_TARGETS];' kernel/compat/src/user/syscall/linux/proc_broker_ops/activation_batch.rs \
     || ! rg -Fq 'deferred_authority_matches_exact_batch_request(' kernel/compat/src/user/syscall/linux/proc_broker_ops/activation_batch.rs \
-    || ! rg -Fq 'assert_eq!(authority.target, exact_target);' kernel/compat/src/user/syscall/linux/proc_broker_ops/activation_batch.rs \
+    || ! rg -Fq '&authority.owner, &authority.target, authority.qualification_required,' kernel/compat/src/user/syscall/linux/proc_broker_ops/activation_batch.rs \
     || ! rg -Fq 'revoke_smp_qualification_for_process(process_id);' kernel/compat/src/user/syscall/linux/proc_broker_ops.rs \
     || ! rg -Fq 'admit_smp_qualification_milestone(milestone, arg0, arg1, current_cpu)' kernel/compat/src/user/syscall/linux/debug_ops.rs \
     || ! rg -Fq 'debug::write_user_bytes_serialized(&chunk[..chunk_len]);' kernel/compat/src/user/syscall/linux/debug_ops.rs \
@@ -1076,8 +1076,13 @@ if [[ -z "$join_line" || -z "$complete_line" || "$complete_line" -le "$join_line
     || rg -q 'fn write_bytes' kernel/nucleus-core/src/debug/mod.rs \
     || ! rg -Fq 'let expected_events = usize::from(workers) * 3 + 1;' tools/xtask/src/kvm.rs \
     || ! rg -Fq 'SMP Ring3 qualification requires one terminal completion record' tools/xtask/src/kvm.rs \
-    || ! rg -Fq 'schema: "rustos-kvm-smp-correctness-evidence-v6"' tools/xtask/src/kvm/evidence.rs \
-    || ! rg -Fq 'predecessor_schema: "rustos-kvm-smp-correctness-evidence-v5"' tools/xtask/src/kvm/evidence.rs \
+    || ! rg -Fq 'schema: "rustos-kvm-smp-correctness-evidence-v7"' tools/xtask/src/kvm/evidence.rs \
+    || ! rg -Fq 'predecessor_schema: "rustos-kvm-smp-correctness-evidence-v6"' tools/xtask/src/kvm/evidence.rs \
+    || ! rg -Fq 'hecs::is_complete(&rustos_log, options.rustos_vcpus)' tools/xtask/src/kvm/guest.rs \
+    || ! rg -Fq 'hecs::evidence(&rustos_log, options.rustos_vcpus)' tools/xtask/src/kvm/evidence.rs \
+    || ! rg -Fq 'hardware_execution,' tools/xtask/src/kvm/evidence.rs \
+    || ! rg -Fq 'multitask::hardware_rsp_arrivals(current_cpu as usize)' kernel/compat/src/user/syscall/linux/smp_qualification_ops.rs \
+    || ! rg -Fq 'run_register_probes(shared, worker_id, observed_cpu)' apps/smpqual/smpqual.c \
     || ! rg -Fq 'smp_evidence_cohort: snapshot.run.cohort.clone()' tools/xtask/src/kvm/evidence.rs \
     || ! rg -Fq -- '--smp-ring3-qualification requires --smp-evidence-cohort' tools/xtask/src/kvm/smoke_args.rs \
     || ! grep -Fq 'options.dvm_block_shmem = true;' <<<"$smp_ring3_option_body" \
@@ -1131,7 +1136,7 @@ if [[ -z "$join_line" || -z "$complete_line" || "$complete_line" -le "$join_line
     || ! rg -Fq 'verify_dvm_attached_block_disk_matches_runtime(snapshot)?;' tools/xtask/src/kvm/evidence/smp_qualification.rs \
     || ! rg -Fq 'let observed = capture_smpqual_early_system_executable(&runtime_disk)?;' tools/xtask/src/kvm/evidence/smp_qualification.rs \
     || ! rg -Fq 'fs::hard_link(&self.temporary_path, &self.final_path)' tools/xtask/src/kvm/evidence/smp_qualification.rs; then
-    echo 'SMP Ring3 qualification source no longer preserves UI-independent private injection, the closed pre-UI exception, bind-before-activate cleanup, generation-bound kernel FSM admission, escaped user debug, join-before-complete, 3N+1 evidence, v6 pre-spawn DVM and early-system executable attestations, durable snapshot-before-signing order, QEMU readonly ATAPI/header/Linux-relay agreement with built-in sr at exact 2048-byte FLUSH-only media geometry, exact media-barrier authority path, exact successor-generation recovery, publication-time drift rejection, or non-overwriting archive publication' >&2
+    echo 'SMP Ring3 qualification source no longer preserves UI-independent private injection, the closed pre-UI exception, bind-before-activate cleanup, generation-bound kernel FSM admission, escaped user debug, join-before-complete, 3N+1 lifecycle plus 2N HECS records, v7 actual-execution and pre-spawn DVM/early-system executable attestations, durable snapshot-before-signing order, QEMU readonly ATAPI/header/Linux-relay agreement with built-in sr at exact 2048-byte FLUSH-only media geometry, exact media-barrier authority path, exact successor-generation recovery, publication-time drift rejection, or non-overwriting archive publication' >&2
     exit 1
 fi
 
@@ -1204,7 +1209,7 @@ if ! grep -Fq 'scheduler::wake_publication::reply(reply, task_id)' <<<"$reply_cu
     || ! grep -Fq 'owner_still_matches(token) && retained' <<<"$reply_enqueue_body" \
     || ! grep -Fq 'record.has_current_dispatch_custody()' <<<"$reply_selection_body" \
     || ! grep -Fq 'record.bind_selected_local_owner(runqueue::owner(record.slot()), cpu)' <<<"$reply_selection_body" \
-    || ! grep -Fq 'settle_ipc_reply_scheduling_context(reply, custody)' <<<"$reply_custody_body" \
+    || ! grep -Fq 'settle_terminal_ipc_reply_scheduling_context(reply, custody)' <<<"$reply_custody_body" \
     || ! grep -Fq 'complete_ipc_reply_wake_handoff(reply, completion.caller_task_id)' <<<"$reply_custody_body" \
     || ! grep -Fq 'multitask::complete_ipc_reply_wake_handoff_with_custody(reply, completion)' <<<"$plain_reply_body" \
     || ! grep -Fq 'multitask::complete_ipc_reply_wake_handoff_with_custody(args.reply_cap, completion)' <<<"$handle_reply_body" \
@@ -1336,6 +1341,9 @@ ipc-fast-handoff/IpcFastHandoff|kernel-ps|multitask::scheduler::ipc_publication:
 ipc-fast-handoff/IpcFastHandoff|kernel-ps|multitask::scheduler::ipc_publication::tests::actual_full_fifo_refuses_original_call_before_owner_wait_or_sender_commit
 ipc-fast-handoff/IpcFastHandoff|kernel-ps|multitask::scheduler::ipc_publication::tests::actual_raced_owner_cannot_be_reacquired_by_original_typed_handoff_cas
 ipc-fast-handoff/IpcFastHandoff|kernel-ps|multitask::scheduler::ipc_publication::tests::actual_cold_call_keeps_sender_unarmed_and_original_loans_through_receiver_fifo
+ipc-fast-handoff/IpcFastHandoff|kernel-ps|multitask::scheduler::ipc_publication::tests::actual_withdrawn_receive_retains_exact_queued_reply_without_wake_or_early_worker_bind
+ipc-fast-handoff/IpcFastHandoff|kernel-ps|multitask::scheduler::ipc_publication::tests::actual_cold_publication_raced_receive_preserves_exact_bound_reply_and_newer_foreign_wait
+ipc-fast-handoff/IpcFastHandoff|kernel-ps|multitask::scheduler::ipc_publication::tests::actual_cold_call_own_funding_bind_cannot_certify_a_refused_receiver_wake
 ipc-fast-handoff/IpcFastHandoff|kernel-ps|multitask::scheduler::ipc_publication::tests::actual_cold_call_cross_cpu_keeps_exact_receive_funding_and_remote_queue
 ipc-fast-handoff/IpcFastHandoff|kernel-ps|multitask::scheduler::ipc_publication::tests::actual_cold_call_full_fifo_keeps_typed_wake_and_original_unarmed_sender
 ipc-fast-handoff/IpcFastHandoff|kernel-ps|multitask::scheduler::ipc_publication::tests::actual_cold_call_foreign_endpoint_or_sender_wait_refuses_before_bind_and_wake
@@ -1370,6 +1378,7 @@ process-address-space-lifetime/ProcessAddressSpaceLifetime|kernel-ps|multitask::
 authority-identity-lifecycle/AuthorityIdentityLifecycle|kernel-ps|user::handles::transfer_registry::transfer_registry_tests::authority_identity_exhaustion_fails_closed_before_wrap
 authority-identity-lifecycle/AuthorityIdentityLifecycle|kernel-ps|multitask::identity_tests::task_identity_exhaustion_never_wraps_to_a_live_id
 authority-identity-lifecycle/AuthorityIdentityLifecycle|kernel-ps|multitask::current_identity::tests::dispatch_lifecycle_is_committed_with_identity
+authority-identity-lifecycle/AuthorityIdentityLifecycle|kernel-ps|multitask::current_identity::tests::actual_current_pager_fault_keeps_original_bank_identity_during_metadata_publication
 authority-identity-lifecycle/AuthorityIdentityLifecycle|kernel-ps|multitask::current_identity::owner_tests::metadata_republication_cannot_erase_newer_lifecycle_intent
 authority-identity-lifecycle/AuthorityIdentityLifecycle|kernel-ps|multitask::current_identity::owner_tests::absent_partial_metadata_preserves_pending_start_and_stop_intent
 authority-identity-lifecycle/AuthorityIdentityLifecycle|kernel-ps|multitask::current_identity::owner_tests::stale_live_command_cannot_stop_or_resume_a_recycled_identity
@@ -1474,6 +1483,9 @@ dvm-block-startup/DvmBlockStartup|storaged|block::tests::generation_mismatch_is_
 dvm-block-startup/DvmBlockStartup|storaged|tests::dvm_block_e2e_marker_names_the_complete_authority_path
 deferred-process-activation/DeferredProcessActivation|kernel-compat|user::syscall::linux::proc_broker_ops::tests::deferred_activation_authority_is_exact_one_shot_and_nontransferable
 deferred-process-activation/DeferredProcessActivation|kernel-compat|user::syscall::linux::proc_broker_ops::tests::single_activation_resolves_claimed_requester_identity_not_loaderd_context
+deferred-process-activation/DeferredProcessActivation|kernel-compat|user::syscall::linux::proc_broker_ops::deferred_activation::tests::original_grants_move_once_and_whole_batch_refusals_preserve_every_record
+deferred-process-activation/DeferredProcessActivation|kernel-compat|user::syscall::linux::proc_broker_ops::deferred_activation::tests::cleanup_winning_before_the_transfer_refuses_without_consuming_the_survivor
+deferred-process-activation/DeferredProcessActivation|kernel-ps|multitask::scheduler::activation::publication::tests::actual_fallible_original_grant_refuses_before_effects_and_survives_final_batch_publication
 loader-request-authority/LoaderRequestAuthority|rustos-user-abi|syscall::syscall_tests::privileged_loader_operations_have_an_explicit_service_role_matrix
 loader-request-authority/LoaderRequestAuthority|initd|tests::init_identity_is_published_before_any_loader_request_and_is_marked_requestless
 loader-request-authority/LoaderRequestAuthority|kernel-compat|user::syscall::linux::proc_broker_ops::tests::loader_commit_revalidates_live_requester_role_before_consuming_authority
@@ -1494,6 +1506,9 @@ clocksource-deadline/ClocksourceDeadline|kernel-hal|arch::acpi::tests::hpet_gas_
 clocksource-deadline/ClocksourceDeadline|kernel-hal|arch::rtc::tests::sleep_deadline_uses_monotonic_ticks_with_ceil_and_saturation
 clocksource-deadline/ClocksourceDeadline|kernel-hal|arch::rtc::tests::sleep_waiter_update_expiry_and_cancel_preserve_exact_task_ownership
 clocksource-deadline/ClocksourceDeadline|kernel-hal|arch::rtc::tests::sleep_waiter_clockevent_collision_is_nonblocking_and_retryable
+clocksource-deadline/ClocksourceDeadline|kernel-hal|arch::rtc::tests::actual_clockevent_refusal_and_notification_keep_deadline_until_exact_ack
+clocksource-deadline/ClocksourceDeadline|kernel-hal|hooks::tests::deadline_wake_hook_forwards_exact_task_outside_registry_guard
+clocksource-deadline/ClocksourceDeadline|kernel-ps|multitask::scheduler::wake_publication::tests::actual_generic_deadline_wake_admits_original_kernel_wait_without_user_reclassification
 clocksource-deadline/ClocksourceDeadline|kernel-compat|user::syscall::linux::service_ops::process_time::tests::time_hot_path_admission_is_local_and_complete
 clocksource-deadline/ClocksourceDeadline|kernel-compat|user::syscall::linux::service_ops::process_time::tests::a_monotonic_instant_between_two_ticks_keeps_its_own_resolution
 clocksource-deadline/ClocksourceDeadline|kernel-ps|multitask::scheduler::tests::scheduler_block_arm_is_exact_race_safe_and_terminally_revoked
@@ -1877,12 +1892,15 @@ synchronous-ipc-handoff/SynchronousIpcHandoff|kernel-ps|multitask::scheduler::sy
 synchronous-ipc-handoff/SynchronousIpcHandoff|kernel-ps|multitask::scheduler::sync_handoff::tests::fresh_direct_owner_replaces_only_a_stale_reply_token_at_the_same_fifo_position
 synchronous-ipc-handoff/SynchronousIpcHandoff|kernel-ps|multitask::scheduler::sync_handoff::tests::stale_reply_enqueue_has_no_scheduler_or_global_fallback
 synchronous-ipc-handoff/SynchronousIpcHandoff|kernel-ps|multitask::scheduler::sync_handoff::tests::reply_enqueue_rechecks_owner_after_the_exact_target_queue_mutation
+synchronous-ipc-handoff/SynchronousIpcHandoff|kernel-ps|multitask::scheduler::ordering_publication::tests::actual_fifo_qualification_releases_ordering_leaf_before_original_binding_and_replenishment
+atomic-process-activation-batch/AtomicProcessActivationBatch|kernel-ps|multitask::scheduler::dispatcher::fifo_witnesses::actual_remote_activation_mailbox_is_admitted_before_atomic_first_turn_qualification
 synchronous-ipc-handoff/SynchronousIpcHandoff|kernel-ps|multitask::scheduler::runqueue::tests::direct_handoff_predicate_rejects_running_and_migrating_even_if_runnable
 synchronous-ipc-handoff-concurrency/SynchronousIpcHandoffConcurrency|kernel-ps|multitask::scheduler::sync_handoff::tests::reply_wake_token_rejects_stale_owner_generation_migration_and_retirement
 synchronous-ipc-handoff-concurrency/SynchronousIpcHandoffConcurrency|kernel-ps|multitask::scheduler::sync_handoff::tests::stale_reply_enqueue_has_no_scheduler_or_global_fallback
 synchronous-ipc-handoff-concurrency/SynchronousIpcHandoffConcurrency|kernel-ps|multitask::scheduler::sync_handoff::tests::reply_enqueue_rechecks_owner_after_the_exact_target_queue_mutation
 synchronous-ipc-handoff-concurrency/SynchronousIpcHandoffConcurrency|kernel-ps|multitask::scheduler::runqueue::tests::direct_handoff_predicate_rejects_running_and_migrating_even_if_runnable
 ipc-priority-inheritance/IpcPriorityInheritance|kernel-ps|multitask::scheduler::tests::synchronous_ipc_donation_promotes_and_revokes_a_transitive_user_chain
+ipc-priority-inheritance/IpcPriorityInheritance|kernel-ps|multitask::scheduler::donation_publication::tests::actual_queued_receive_moves_original_reply_funding_from_wake_candidate_to_consumer
 ipc-priority-queue/IpcPriorityQueue|kernel-ipc-runtime|ipc::tests::receiver_waiter_tests::endpoint_system_calls_bypass_backlog_without_starving_ordinary_lane
 pci-bar-discovery/PciBarDiscovery|kernel-hal|arch::pci::tests::mem64_bar_size_uses_the_lowest_implemented_mask_bit
 dvm-volume-io/DvmVolumeIo|vfsd|tests::dvm_block_range_rejects_empty_overflow_and_end_overrun
@@ -1926,6 +1944,9 @@ pager-region-agreement/PagerRegionAgreement|kernel-ps|multitask::pager_vma::test
 pager-region-agreement/PagerRegionAgreement|pagerd|tests::an_interior_release_keeps_both_remainders_and_they_still_fault
 pager-region-agreement/PagerRegionAgreement|pagerd|tests::a_split_that_cannot_fit_refuses_and_keeps_the_region_whole
 pager-region-agreement/PagerRegionAgreement|pagerd|tests::an_interior_protect_narrows_only_the_edited_span
+pager-vma-publication/PagerVmaPublication|kernel-ps|multitask::pager_vma::tests::actual_range_rewrite_gap_is_retryable_until_commit_or_original_rollback
+pager-vma-publication/PagerVmaPublication|kernel-ps|multitask::pager_vma::tests::actual_lookup_rechecks_whole_rewrite_epoch_after_the_scan
+pager-vma-publication/PagerVmaPublication|kernel-ps|multitask::pager_vma::tests::actual_exhausted_range_rewrite_epoch_refuses_before_withdrawal_or_pte_mutation
 pager-vma-publication/PagerVmaPublication|kernel-ps|multitask::pager_vma::tests::publication_stamps_exact_process_mm_and_nonzero_vma_generation
 pager-vma-publication/PagerVmaPublication|kernel-ps|multitask::pager_vma::tests::overlap_and_permission_escalation_fail_closed
 pager-vma-publication/PagerVmaPublication|kernel-ps|multitask::pager_vma::tests::exec_generation_change_and_revoked_region_never_match
@@ -1975,7 +1996,7 @@ sigchld-notification/SigchldNotification|kernel-ps|multitask::scheduler::tests::
 sigchld-notification/SigchldNotification|rustos-user-abi|syscall::syscall_tests::nocldstop_suppresses_only_nonterminal_child_state_changes
 sigchld-notification/SigchldNotification|kernel-compat|user::syscall::linux::support::tests::sigchld_selection_cannot_clear_unselected_or_future_causes
 exception-retirement-lifecycle/ExceptionRetirementLifecycle|kernel-hal|arch::idt::handlers::tests::general_exception_bridge_aligns_every_rust_call_boundary
-exception-retirement-lifecycle/ExceptionRetirementLifecycle|kernel-compat|user::syscall::tests::only_retired_final_thread_commits_fault_termination
+exception-retirement-lifecycle/ExceptionRetirementLifecycle|kernel-compat|user::syscall::linux::broker_ops::lifecycle_broker_ops::tests::only_original_final_fault_token_commits_process_termination
 exception-retirement-lifecycle/ExceptionRetirementLifecycle|kernel-ps|multitask::scheduler::tests::retirement_revokes_task_and_process_ipc_authority
 futex-waiter-lifecycle/FutexWaiterLifecycle|kernel-compat|user::syscall::linux::service_ops::futex_thread::tests::task_identity_cleanup_removes_a_requeued_waiter
 futex-waiter-lifecycle/FutexWaiterLifecycle|kernel-compat|user::syscall::linux::service_ops::futex_thread::tests::supported_futex_admission_is_local_and_complete
@@ -2072,7 +2093,7 @@ ipc-handle-transfer/IpcHandleTransfer|kernel-compat|user::syscall::linux::servic
 process-signal-delivery/ProcessSignalDelivery|kernel-compat|user::syscall::linux::support::tests::signal_selection_revalidates_pending_mask_and_uncatchable_policy
 process-signal-delivery/ProcessSignalDelivery|kernel-compat|user::syscall::linux::support::tests::restored_signal_mask_cannot_block_kill_or_stop
 process-signal-delivery/ProcessSignalDelivery|kernel-compat|user::syscall::linux::process_termination_tests::x86_user_faults_have_linux_wait_signal_status
-process-signal-delivery/ProcessSignalDelivery|kernel-compat|user::syscall::tests::only_retired_final_thread_commits_fault_termination
+process-signal-delivery/ProcessSignalDelivery|kernel-compat|user::syscall::linux::broker_ops::lifecycle_broker_ops::tests::only_original_final_fault_token_commits_process_termination
 process-signal-delivery/ProcessSignalDelivery|kernel-executive|hal_hooks::tests::linux_fault_policy_is_not_applied_to_windows_abi
 memfd-seal-lifecycle/MemfdSealLifecycle|kernel-ps|user::memfd::tests::memfd_seals_reject_growth_and_mapping_counter_overflow
 dvm-gpu-compositor/DvmGpuCompositor|driver-domain-protocol|tests::gpu_render_contract_is_fixed_bounded_and_address_free
@@ -2105,6 +2126,8 @@ endpoint-receiver-wakeup/EndpointReceiverWakeup|kernel-ipc-runtime|ipc::tests::r
 endpoint-receiver-wakeup/EndpointReceiverWakeup|kernel-ipc-runtime|ipc::tests::receive_transaction_tests::receive_rejection_preserves_exact_fast_frame_and_publishes_no_waiter
 endpoint-receiver-wakeup/EndpointReceiverWakeup|kernel-ipc-runtime|ipc::tests::receive_transaction_tests::receive_expiry_still_delivers_queued_request_without_registering_waiter
 endpoint-receiver-wakeup/EndpointReceiverWakeup|kernel-ipc-runtime|ipc::tests::receive_transaction_tests::receiver_registration_is_bounded_deduplicated_and_refreshes_capacity
+endpoint-receiver-wakeup/EndpointReceiverWakeup|kernel-ipc-runtime|ipc::tests::receive_transaction_tests::received_request_custody_observation_requires_actual_dequeue_and_exact_live_reply
+endpoint-receiver-wakeup/EndpointReceiverWakeup|kernel-compat|user::syscall::linux::ipc_ops::ipc_call_admission::tests::actual_received_call_survives_a_refused_sender_wake_without_certifying_queued_or_uncustodied_requests
 ipc-handle-transfer/IpcHandleTransfer|kernel-ps|multitask::scheduler::tests::retirement_revokes_task_and_process_ipc_authority
 proc-broker-session/ProcBrokerSession|kernel-compat|user::syscall::linux::proc_broker_ops::tests::exited_prepare_owner_cannot_republish_after_cleanup
 rootd-restart-backoff/RootdRestartBackoff|rootd|tests::failed_restart_activation_retires_exact_suspended_child|host-test
@@ -2119,6 +2142,7 @@ service-bootstrap-lifecycle/ServiceBootstrapLifecycle|rootd|tests::loader_worker
 service-bootstrap-lifecycle/ServiceBootstrapLifecycle|rootd|tests::initd_lookup_authority_includes_every_declared_bootstrap_dependency|host-test
 service-bootstrap-lifecycle/ServiceBootstrapLifecycle|kernel-compat|user::syscall::linux::process_termination_tests::single_thread_exit_is_never_invented_from_missing_process_state
 service-bootstrap-lifecycle/ServiceBootstrapLifecycle|initd|tests::service_readiness_retries_only_an_unpublished_endpoint
+service-bootstrap-lifecycle/ServiceBootstrapLifecycle|initd|tests::libc_errno_is_not_misreported_as_eperm_at_the_readiness_or_rpc_boundary
 post-init-bootstrap-barrier/PostInitBootstrapBarrier|initd|bootstrap_barrier::tests::independent_bootstrap_activation_overlaps_only_before_consumer_barriers
 post-init-bootstrap-barrier/PostInitBootstrapBarrier|initd|bootstrap_barrier::tests::dependency_packages_exclude_spawned_but_unadmitted_endpoints
 post-init-bootstrap-barrier/PostInitBootstrapBarrier|initd|bootstrap_barrier::tests::bootstrap_barrier_requires_every_exact_endpoint_admission
@@ -2290,6 +2314,7 @@ cpu-dispatch-preemption/CpuDispatchPreemption|kernel-ps|multitask::scheduler::do
 scheduling-context-budget/SchedulingContextBudget|kernel-ps|multitask::scheduler::task_directory::tests::actual_reply_custody_exact_resource_object_and_foreign_identity_are_one_scalar_result
 scheduling-context-budget/SchedulingContextBudget|kernel-ps|multitask::scheduler::task_directory::tests::actual_reply_custody_stale_or_absent_hint_cannot_substitute_another_resource_binding
 cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::scheduler::task_directory::tests::actual_reply_custody_retained_terminal_object_returns_only_exact_custody_not_live_authority
+cross-cpu-task-retirement/CrossCpuTaskRetirement|kernel-ps|multitask::current::ipc::tests::actual_slow_reply_to_reclaimed_original_context_is_terminal_not_kernel_panic
 cold-exec-intent/ColdExecIntent|kernel-ps|multitask::scheduler::exec_transaction::quiescence::tests::actual_exec_census_retired_borrower_defers_same_detach_then_retries_to_both_consumer_publications
 cold-exec-intent/ColdExecIntent|kernel-ps|multitask::scheduler::exec_transaction::quiescence::tests::actual_exec_census_cannot_retire_its_live_caller_before_spending_any_sibling_producer
 exec-address-space-transaction/ExecAddressSpaceTransaction|kernel-ps|multitask::scheduler::exec_transaction::quiescence::tests::actual_exec_census_foreign_mode_refuses_without_queue_stop_or_terminal_payload

@@ -37,6 +37,9 @@ use crate::Result;
 use crate::config::Config;
 use crate::util::{resolve_command_path, run_command};
 
+mod failure_snapshot;
+mod hecs;
+
 const DVM_KERNEL: &str = "rustos-linux-dvm-x86_64.bzImage";
 const DVM_ROOTFS: &str = "rustos-linux-dvm-x86_64.rootfs.cpio.zst";
 const DVM_BLOCK_MEDIA_BLOCK_BYTES: u32 = 2048;
@@ -225,7 +228,7 @@ struct SmpRuntimeEvent {
 /// consumer applies its own narrow category/name/argument contract after the
 /// transport record has been integrity-checked against byte interleaving and
 /// partial writes. The FNV checksum is framing evidence, not authentication.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 struct VerifiedMilestoneFrame {
     source_line: usize,
     output_seq: u64,

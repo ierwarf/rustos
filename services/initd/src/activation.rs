@@ -50,6 +50,7 @@ fn activate_spawned_services(pids: &[i32]) -> Result<(), i32> {
             IPC_BOOT_CONTROL_HARD_LIMIT_MS,
         ) as i64
     };
+    let call = super::libc_syscall_status(call);
     if call < 0 {
         LOADER_ENDPOINT_CACHE.store(0, Ordering::Relaxed);
         return Err((-call) as i32);

@@ -90,6 +90,79 @@ fn extent_prefilter_cannot_reject_from_bounds_republished_during_its_read() {
 }
 
 #[test]
+fn actual_range_rewrite_gap_is_retryable_until_commit_or_original_rollback() {
+    let _guard = guard();
+    let handle = ProcessHandle::new(27, 91);
+    let identity = identity(91, 97);
+    for refuse_mutation in [false, true] {
+        let region = publish(handle, identity, template(0x30_000), MAX_PAGER_VMAS_PER_PROCESS)
+            .unwrap();
+        let untouched_page = region.start + PAGER_PAGE_BYTES;
+        let mut during = None;
+        let result = rewrite_attenuated_range(handle, identity, region.start, untouched_page,
+            Some(0), || {
+                // Execute the production lookup at the real withdrawal/PTE
+                // callback boundary. This page is OUTSIDE the edited range;
+                // its original VMA is temporarily absent, not unmapped.
+                during = Some(lookup(handle, identity, untouched_page, VM_ACCESS_WRITE));
+                if refuse_mutation { Err(PagerVmaError::Pressure) } else { Ok(()) }
+            });
+        assert_eq!(result, if refuse_mutation { Err(PagerVmaError::Pressure) } else { Ok(true) });
+        let retained = lookup(handle, identity, untouched_page, VM_ACCESS_WRITE).unwrap();
+        assert_eq!(retained.vma_generation, region.vma_generation);
+        assert_eq!(lookup(handle, identity, region.start, VM_ACCESS_WRITE).is_ok(), refuse_mutation);
+        for live in snapshot_regions(handle, identity).unwrap() {
+            revoke(handle, identity, live.start, live.vma_generation).unwrap();
+        }
+        assert_eq!(during, Some(Err(PagerVmaError::Unstable)),
+            "a temporary publication hole must not terminate a valid first touch");
+        assert_eq!(lookup(handle, identity, untouched_page, VM_ACCESS_WRITE),
+            Err(PagerVmaError::Stale), "a committed real unmap must still fail");
+    }
+}
+
+#[test]
+fn actual_lookup_rechecks_whole_rewrite_epoch_after_the_scan() {
+    let _guard = guard();
+    let handle = ProcessHandle::new(27, 93);
+    let identity = identity(93, 99);
+    let original = publish(handle, identity, template(0x34_000), MAX_PAGER_VMAS_PER_PROCESS)
+        .unwrap();
+    for old_result in [Ok(original), Err(PagerVmaError::Stale), Err(PagerVmaError::Denied)] {
+        let observed = read_rewrite_epoch(handle, || {
+            // The same production read envelope is used around lookup_slot's
+            // entire scan. Complete a real range edit between its two samples.
+            assert_eq!(rewrite_attenuated_range(handle, identity, original.start,
+                original.end, Some(VM_PROT_READ | VM_PROT_WRITE), || Ok(())), Ok(true));
+            old_result
+        });
+        assert_eq!(observed, Err(PagerVmaError::Unstable));
+        assert_eq!(lookup(handle, identity, original.start, VM_ACCESS_WRITE), Ok(original));
+    }
+    revoke(handle, identity, original.start, original.vma_generation).unwrap();
+}
+
+#[test]
+fn actual_exhausted_range_rewrite_epoch_refuses_before_withdrawal_or_pte_mutation() {
+    let _guard = guard();
+    let handle = ProcessHandle::new(27, 95);
+    let identity = identity(95, 101);
+    let original = publish(handle, identity, template(0x38_000), MAX_PAGER_VMAS_PER_PROCESS)
+        .unwrap();
+    // Native exhausted-counter input only, not a production reset/reuse path.
+    let sequence = &rewrite_epoch::REWRITE_EPOCHS[handle.index()];
+    let before = sequence.swap(u64::MAX - 1, Ordering::AcqRel);
+    let mut mutated = false;
+    let result = rewrite_attenuated_range(handle, identity, original.start, original.end,
+        Some(0), || { mutated = true; Ok(()) });
+    sequence.store(before, Ordering::Release);
+    assert_eq!(result, Err(PagerVmaError::Pressure));
+    assert!(!mutated);
+    assert_eq!(lookup(handle, identity, original.start, VM_ACCESS_WRITE), Ok(original));
+    revoke(handle, identity, original.start, original.vma_generation).unwrap();
+}
+
+#[test]
 fn publication_stamps_exact_process_mm_and_nonzero_vma_generation() {
     let _guard = guard();
     let handle = ProcessHandle::new(29, 43);

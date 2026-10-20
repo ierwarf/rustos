@@ -21,6 +21,28 @@ pub enum EndpointReceive {
     Empty,
 }
 
+/// Read-only observation of an already consumed QUEUED request, not a wake or
+/// funding grant. A nonempty request was required at enqueue; only actual recv
+/// takes it. The advisory message id never authorizes a recycled reply: both
+/// exact objects are rejoined under Message -> Reply leaves before accepting.
+pub fn received_request_retains_custody(reply: KernelReplyHandle, caller: u64) -> bool {
+    let Some(message_id) = REPLIES.with(reply.raw(), |object| object.message_id) else {
+        return false;
+    };
+    ENDPOINT_MESSAGES.with(message_id, |message| {
+        if message.reply_id != reply.raw() || message.caller_task_id != caller
+            || !message.published || !message.request.is_empty()
+        {
+            return false;
+        }
+        REPLIES.with(reply.raw(), |object| {
+            object.message_id == message_id && !object.used && !object.consumed
+                && object.fast_frame.is_none()
+                && object.scheduling_context.is_some_and(|custody| custody.caller_task_id() == caller)
+        }).unwrap_or(false)
+    }).unwrap_or(false)
+}
+
 /// The receiver must arm its scheduler wait before calling with `may_wait`.
 /// A queued request is considered even when `may_wait` is false (e.g. expiry).
 /// All output bytes remain kernel-owned until the endpoint guard has dropped.

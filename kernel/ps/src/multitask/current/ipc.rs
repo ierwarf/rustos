@@ -78,6 +78,12 @@ pub fn cancel_block_current_task() -> bool {
     })
 }
 
+/// Whether a receiver whose call wake was refused still waits on `endpoint`.
+/// Observation only; see `wake_publication::receive_phase_on_endpoint`.
+pub fn endpoint_receiver_still_waiting(task_id: u64, endpoint: u64) -> bool {
+    scheduler::wake_publication::receive_phase_on_endpoint(task_id, endpoint)
+}
+
 pub fn wake_task(task_id: u64) -> bool {
     if nucleus_core::util::lockdep::preemption_disabled() {
         return deferred_wake::defer_current_cpu(task_id);
@@ -195,18 +201,16 @@ fn settle_reply_scheduling_context(
 ) -> ReplySchedulingContextSettlement {
     let identity = custody.identity();
     let owner_task_id = custody.context_owner_task_id();
-    let settlement = interrupts::without_interrupts(|| {
-        // ONE original identity/resource scalar comparison. Hints are only
-        // candidates; no Scheduler fallback or execution/funding grant escapes.
-        let (matches, live) = scheduler::reply_context_custody(owner_task_id, identity);
-        classify_unpublished_reply_custody(matches, live)
-    });
-    let _ = interrupts::without_interrupts(|| {
-        scheduler::release_reply_donation(
-            reply,
-            scheduler::ipc_donation::DonationNamespace::IpcReply,
-        )
-    });
+    let mut scope = nucleus_core::util::lockdep::DispatchPreemption::enter();
+    scope.mask_irqs();
+    // ONE original masked CPU scope encloses both the exact resource/identity
+    // comparison and ledger release. Hints are candidates, never authority.
+    let (matches, live) = scheduler::reply_context_custody(owner_task_id, identity);
+    let settlement = classify_unpublished_reply_custody(matches, live);
+    let _ = scheduler::release_reply_donation(
+        reply,
+        scheduler::ipc_donation::DonationNamespace::IpcReply,
+    );
     settlement
 }
 
@@ -229,6 +233,16 @@ pub fn settle_cancelled_ipc_reply_scheduling_context(
     reply: u64,
     custody: kernel_ipc_runtime::api::ReplySchedulingContextCustody,
 ) -> bool {
+    settle_terminal_ipc_reply_scheduling_context(reply, custody)
+}
+
+// Both cancellation and completion own a terminal transport edge. A downstream
+// reply can outlive its original budget owner just as a timeout can; neither
+// may borrow a replacement context, or excuse a live owner's wrong generation.
+fn settle_terminal_ipc_reply_scheduling_context(
+    reply: u64,
+    custody: kernel_ipc_runtime::api::ReplySchedulingContextCustody,
+) -> bool {
     settle_reply_scheduling_context(reply, custody)
         != ReplySchedulingContextSettlement::IdentityMismatch
 }
@@ -246,7 +260,7 @@ pub fn complete_ipc_reply_wake_handoff_with_custody(
         "reply returned scheduling-context custody to a different caller"
     );
     assert!(
-        settle_ipc_reply_scheduling_context(reply, custody),
+        settle_terminal_ipc_reply_scheduling_context(reply, custody),
         "reply returned stale scheduling-context custody"
     );
     complete_ipc_reply_wake_handoff(reply, completion.caller_task_id)
@@ -294,6 +308,54 @@ pub fn complete_pager_fault_wake_handoff(fault_token: u64, task_id: u64) -> bool
 #[cfg(test)]
 mod tests {
     use super::{ReplySchedulingContextSettlement, classify_unpublished_reply_custody};
+
+    #[test]
+    fn actual_slow_reply_to_reclaimed_original_context_is_terminal_not_kernel_panic() {
+        use crate::multitask::scheduler::{self, root_creation};
+        use crate::user::abi::UserAbi;
+        use kernel_ipc_runtime::api::{ReplyCompletion, ReplySchedulingContextCustody};
+        let id = 132301;
+        let custody = core::cell::Cell::new(None);
+        let foreign_refused = core::cell::Cell::new(false);
+        root_creation::tests::exec_root(id, true,
+            root_creation::tests::bootstrap(UserAbi::Linux), |_, _| {
+                let mut scope = nucleus_core::util::lockdep::DispatchPreemption::enter_model(0);
+                scope.mask_irqs();
+                let admission = scheduler::donation_publication::reserve_call_with(&scope, id);
+                assert!(admission.donation_reserved);
+                let identity = admission.scheduling_context.unwrap();
+                assert!(scheduler::reply_context_custody(id, identity).0);
+                custody.set(ReplySchedulingContextCustody::new_with_owner(identity, id, id));
+                assert!(scheduler::cancel_reply_donation_reservation(id));
+                let foreign_identity = kernel_object::api::ObjectIdentity::new(identity.owner(),
+                    identity.kind(), identity.slot(), identity.generation() + 1).unwrap();
+                let foreign = ReplySchedulingContextCustody::new_with_owner(foreign_identity, id, id).unwrap();
+                assert_eq!(scheduler::reply_context_custody(id, foreign_identity), (false, true));
+                // Completion must enter its OWN original scope. A nested-scope
+                // refusal (or a later wake panic) is not identity validation.
+                drop(scope);
+                let refusal = std::panic::catch_unwind(|| {
+                    super::complete_ipc_reply_wake_handoff_with_custody(0x9797,
+                        ReplyCompletion { caller_task_id: id, scheduling_context: Some(foreign) })
+                });
+                foreign_refused.set(refusal.err().is_some_and(|payload| {
+                    payload.downcast_ref::<&str>().copied()
+                        .or_else(|| payload.downcast_ref::<std::string::String>().map(|text| text.as_str()))
+                        == Some("reply returned stale scheduling-context custody")
+                }));
+            });
+        assert!(foreign_refused.get(), "a live owner's different context must still fail closed");
+        let _namespace = scheduler::execution_test_serial_guard();
+        let custody = custody.get().unwrap();
+        // The SAME born context and its owner have actually crossed physical
+        // retirement/reclaim. Only earlier IRQ/topology/external ACKs are modeled.
+        assert_eq!(scheduler::reply_context_custody(id, custody.identity()), (false, false));
+        let outcome = std::panic::catch_unwind(|| {
+            super::complete_ipc_reply_wake_handoff_with_custody(0x9797,
+                ReplyCompletion { caller_task_id: id, scheduling_context: Some(custody) })
+        });
+        assert_eq!(outcome.ok(), Some(false), "a late reply cannot panic or revive its retired caller");
+    }
 
     #[test]
     fn cancelled_custody_accepts_only_exact_return_or_retired_owner() {

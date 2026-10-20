@@ -46,8 +46,8 @@ registered="$({
         fi
         model_slug="$(dirname "$model")"
         rg -q "$model_slug|$module" formal/CONFORMANCE.md || { echo "missing conformance mapping for $model" >&2; exit 1; }
-        rg -q "$model_slug|$module" formal/COVERAGE.md || { echo "missing coverage mapping for $model" >&2; exit 1; }
-        rg -q "$model_slug|$module" formal/README.md || { echo "missing README mapping for $model" >&2; exit 1; }
+        rg -q "$model_slug|$module" formal/COVERAGE.md formal/coverage/ || { echo "missing coverage mapping for $model" >&2; exit 1; }
+        rg -q "$model_slug|$module" formal/README.md formal/models.md || { echo "missing README mapping for $model" >&2; exit 1; }
         if [[ "$apalache" == yes ]]; then
             [[ -f "formal/apalache-pilots/${module}Pilot.tla" ]] || { echo "missing Apalache pilot for $model" >&2; exit 1; }
         fi

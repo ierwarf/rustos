@@ -92,19 +92,6 @@ pub(super) fn take_masked(scope: &nucleus_core::util::lockdep::DispatchPreemptio
     take_queue(unsafe { &mut *DEFERRED_WAKES.0[cpu].get() })
 }
 
-pub(super) fn take_current_cpu(logical_index: usize) -> DeferredWakeBatch {
-    assert!(
-        logical_index < CPU_COUNT,
-        "deferred scheduler wake drain CPU exceeds capacity"
-    );
-    interrupts::without_interrupts(|| {
-        // SAFETY: the indexed CPU is the caller and local interrupts are
-        // excluded across the complete take-and-clear transition.
-        let queue = unsafe { &mut *DEFERRED_WAKES.0[logical_index].get() };
-        take_queue(queue)
-    })
-}
-
 #[cfg(test)]
 static TEST_DEFERRED_WAKE_QUEUES_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 

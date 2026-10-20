@@ -25,6 +25,7 @@ pub(in crate::multitask) struct CurrentReturn<'a> {
 }
 impl<'a> CurrentReturn<'a> {
     pub(in crate::multitask) fn capture(turn: &'a CpuDispatchTurn<'static>) -> Option<Self> {
+        let _phase = runtime_profile::phase_scope(super::SchedulerPhase::ReturnCapture);
         let (cpu, slot) = turn.original_current()?;
         let view = frame_publication::return_view(slot)?;
         let id = stack_resources::current_return_binding(cpu, slot, view)?;

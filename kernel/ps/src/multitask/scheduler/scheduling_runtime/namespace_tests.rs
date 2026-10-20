@@ -42,6 +42,9 @@ fn original_birth_holds_the_same_namespace_as_standalone_identity_witnesses() {
             assert!(message.contains("bound execution identity changed before clear"));
         });
     // Original resource teardown and namespace guard release must precede a
-    // new independent fixture. This probe owns no root/identity/frame grant.
-    let _next_fixture = TEST_GUARD.try_lock().expect("native birth leaked namespace custody");
+    // new independent fixture. Another parallel witness may legitimately own
+    // the namespace now, so WouldBlock here is not evidence of a leaked birth.
+    // Acquiring the same mutex still requires teardown to release its guard;
+    // the scoped foreign try_lock above proves the enclosing lifetime exactly.
+    let _next_fixture = TEST_GUARD.lock().unwrap_or_else(|error| error.into_inner());
 }

@@ -10,6 +10,7 @@ const POISONED: u8 = 4;
 const COMMITTING: u8 = 5;
 use super::super::scheduler::PlacementGrant;
 use super::super::scheduler::stack_resources::activation::ActivationCredential;
+use super::super::scheduler::rsp_handoff::RspHandoff;
 use core::cell::UnsafeCell;
 use nucleus_core::util::lockdep::{DispatchPreemption, LockClass};
 
@@ -19,6 +20,7 @@ struct TurnCell {
     activation: UnsafeCell<Option<ActivationCredential>>,
     placement: UnsafeCell<Option<PlacementGrant>>,
     installed_placement: UnsafeCell<Option<PlacementGrant>>,
+    rsp_handoff: UnsafeCell<Option<RspHandoff>>,
     // Only explicit scalar protocol fixtures may omit resource custody. Real
     // native IRQ turns use exactly the production bank/interval checks.
     #[cfg(test)]
@@ -38,6 +40,7 @@ impl TurnCell {
             activation: UnsafeCell::new(None),
             placement: UnsafeCell::new(None),
             installed_placement: UnsafeCell::new(None),
+            rsp_handoff: UnsafeCell::new(None),
             #[cfg(test)]
             phase_model: core::sync::atomic::AtomicBool::new(false),
         }
@@ -119,6 +122,20 @@ pub(super) struct CpuRspCommit<'a> {
 }
 impl CpuRspCommit<'_> {
     pub(super) fn physical_banks(&self) -> bool { !self.cell.models_only_phases() }
+    pub(super) fn assert_arrived(&self, cpu: usize, rsp: usize) {
+        if self.physical_banks() {
+            // SAFETY: unique same-CPU Committing consumer; the original Open
+            // producer sealed this geometry before Current/Transition Release.
+            unsafe { &*self.cell.rsp_handoff.get() }.as_ref()
+                .expect("RSP commit lacks original geometry seal").assert_arrived(cpu, rsp);
+        }
+    }
+    #[cfg(test)]
+    pub(super) fn modeled_rsp(&self) -> usize {
+        // SAFETY: same unique Committing consumer. Native earlier RSP arrival
+        // is explicit model input, never evidence that assembly changed RSP.
+        unsafe { &*self.cell.rsp_handoff.get() }.as_ref().map_or(0, RspHandoff::modeled_rsp)
+    }
     pub(super) fn finish(mut self) {
         // SAFETY: Awaiting-RSP -> Committing CAS gave this guard sole access.
         let preemption = unsafe { (&mut *self.cell.parked.get()).take() };
@@ -133,6 +150,9 @@ impl CpuRspCommit<'_> {
         if let Some(grant) = placement {
             self.cell.complete_placement(grant);
         }
+        // SAFETY: this unique consumer has checked arrival and the caller has
+        // drained BOTH outgoing banks; no geometry seal crosses into reuse.
+        drop(unsafe { (&mut *self.cell.rsp_handoff.get()).take() });
         drop(preemption);
         self.live = false;
         self.cell.phase.store(VACANT, Ordering::Release);
@@ -357,6 +377,14 @@ impl<'a> CpuDispatchTurn<'a> {
             if let Some(receipt) = self.claimed_return() {
                 assert!(self.architecture_phase.get() == 2 && receipt.slot() == to,
                     "CPU publication preceded exact claimed architecture/SIMD preparation");
+            }
+            if self.from != to {
+                let handoff = RspHandoff::capture(&self);
+                // SAFETY: original own-CPU Open producer exclusively owns this
+                // empty bank until the later Awaiting-RSP Release publication.
+                let bank = unsafe { &mut *self.cell.rsp_handoff.get() };
+                assert!(bank.is_none(), "RSP seal overlaps an earlier return");
+                *bank = Some(handoff);
             }
             // Qualify the exact grant while THIS original Open turn still owns
             // its receipt/banks. Sealing first would force scalar reconstruction.
@@ -591,6 +619,18 @@ pub(in crate::multitask) fn with_original_current_model(
 pub(in crate::multitask) fn test_phase(cpu: usize) -> u8 {
     TURNS[cpu].phase.load(Ordering::Acquire)
 }
+/// Resume only an isolated native refused-arrival fixture. Retain every parked
+/// owner and both original banks: this is NOT production poison recovery or an ACK.
+#[cfg(test)]
+pub(in crate::multitask) fn test_retry_refused_arrival(cpu: usize) {
+    let cell = &TURNS[cpu];
+    // SAFETY: the isolated native fixture owns this poisoned turn exclusively.
+    assert!(unsafe { &*cell.parked.get() }.is_some());
+    assert!(unsafe { &*cell.rsp_handoff.get() }.is_some());
+    assert_eq!(cell.phase.compare_exchange(POISONED, AWAITING_RSP,
+        Ordering::AcqRel, Ordering::Acquire), Ok(POISONED));
+}
+
 #[cfg(test)]
 pub(super) fn test_restore_phase(cpu: usize, phase: u8) {
     // Synthetic fixture cleanup must ACK parked custody, not erase its owner.
@@ -603,6 +643,8 @@ pub(super) fn test_restore_phase(cpu: usize, phase: u8) {
     // SAFETY: isolated native fixture recovery, not a production ACK.
     drop(unsafe { (&mut *TURNS[cpu].placement.get()).take() });
     drop(unsafe { (&mut *TURNS[cpu].installed_placement.get()).take() });
+    // SAFETY: isolated native teardown, never production ACK or poison recovery.
+    drop(unsafe { (&mut *TURNS[cpu].rsp_handoff.get()).take() });
     super::super::scheduler::dispatch_priority::reset_model(cpu);
     TURNS[cpu].phase.store(phase, Ordering::Release);
 }

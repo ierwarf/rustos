@@ -34,7 +34,9 @@ pub(super) fn milestone_output_class(name: &str) -> MilestoneOutputClass {
         "smp-qualification-ready"
         | "smp-qualification-start"
         | "smp-qualification-finish"
-        | "smp-qualification-complete" => MilestoneOutputClass::QualificationCritical,
+        | "smp-qualification-complete"
+        | "hecs-registers"
+        | "hecs-rsp-arrivals" => MilestoneOutputClass::QualificationCritical,
         _ if name.starts_with("kernel-scheduler-") => MilestoneOutputClass::Measurement,
         _ if name.starts_with("smp-")
             || name.starts_with("product-")
@@ -43,6 +45,9 @@ pub(super) fn milestone_output_class(name: &str) -> MilestoneOutputClass {
             || name == "dvm-block-transport-revoked"
             || name == "task-context-corrupted"
             || name == "linux-user-fault"
+            || name == "linux-user-page-fault-address"
+            || name == "pager-user-fault-vma-rejected"
+            || name == "pager-user-anon-fault-refused"
             || name == "linux-thread-clone-rejected"
             || name.starts_with("ipc-donation-")
             || name.starts_with("dvm-input-") =>

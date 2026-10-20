@@ -47,6 +47,7 @@ pub(super) mod donation_publication;
 pub(in crate::multitask) mod ipc_publication;
 mod frame_observation;
 mod frame_publication;
+pub(in crate::multitask) mod rsp_handoff;
 mod handoff_queue;
 mod handoffs;
 pub(in crate::multitask) mod ipc_donation;
@@ -54,7 +55,6 @@ pub(in crate::multitask) mod linux_thread_state;
 mod local_dispatch;
 mod locality;
 pub(in crate::multitask) mod pager_handoff;
-pub use pager_handoff::PagerFaultHandoffOutcome;
 pub(super) mod exec_transaction;
 mod execution_image;
 pub(in crate::multitask) mod execution_interval;
@@ -89,9 +89,10 @@ pub(in crate::multitask) use runtime_profile::{
     SchedulerEntryCause, publish_scheduler_runtime_profile,
 };
 pub(super) use task_weight::{
-    INTERACTIVE_PIT_DIVISOR_FLAG, LOAD_WEIGHT_MASK, MIN_LOAD_WEIGHT, NICE_0_LOAD,
+    LOAD_WEIGHT_MASK, MIN_LOAD_WEIGHT, NICE_0_LOAD,
     SYSTEM_CLASS_WEIGHT_FLAG,
 };
+
 pub(in crate::multitask) fn local_dispatch_work_pending(cpu: usize) -> bool {
     // A direct synchronous handoff deliberately has no fair-runqueue entry.
     // Its FIFO publication is therefore an independent durable source of
@@ -108,12 +109,6 @@ pub(in crate::multitask) fn local_dispatch_work_pending(cpu: usize) -> bool {
 /// the lock-free custody ledger. Native execution deliberately returns `None`.
 pub(in crate::multitask) fn borrowed_context_charge_token(slot: usize) -> Option<(usize, u64)> {
     donation_ledger::borrowed_context_charge_token(slot)
-}
-/// Enqueue the opaque post-reply token only after the scheduler catalog guard
-/// that issued it has dropped.  The target owner validates its runqueue
-/// generation without re-entering Scheduler.
-pub(super) fn enqueue_reply_wake_handoff(token: ReplyWakeHandoff) -> bool {
-    sync_handoff::enqueue_reply_wake(token)
 }
 
 pub(crate) mod smp;
@@ -135,7 +130,6 @@ use kernel_object::api::identity::ObjectIdentity;
 
 #[cfg(test)]
 use crate::arch::simd::SimdState;
-use crate::debug;
 use crate::io::session::ConsoleSessionHandle;
 use crate::memory::paging::ProcessAddressSpace;
 use crate::user::abi::UserAbi;
@@ -146,12 +140,10 @@ use crate::user::process_state::{UserProcessState, WindowsThreadRuntimeState};
 use super::context::{SAVED_CONTEXT_BYTES, SavedContext};
 use super::current_identity::{self, PagerChargeStamp, TaskIdentity};
 use super::process_table::{self, ProcessHandle};
-use super::run_authority;
 use super::{UserStackState, UserTaskBootstrap, initial_task_rflags};
 use context_validation::{
-    PublishedFrameView, context_validation_reason_code, validate_published_saved_context,
+    PublishedFrameView, context_validation_reason_code,
 };
-use dispatch_policy::{CpuDispatchGuard, CpuDispatchLock, CpuDispatchPolicy};
 use handoff_queue::SlotHandoffQueue;
 pub(super) use linux_thread_state::CurrentLinuxThreadBinding;
 #[cfg(test)]
@@ -266,9 +258,7 @@ const TASK_STACK_SIZE: usize = 2 * 1024 * 1024;
 const TASK_STACK_GUARD_BYTES: usize = 256;
 const STACK_CANARY_WORD: u64 = 0x5343_4844_554c_4552;
 const TASK_ENTRY_STACK_RESERVE_QWORDS: usize = 3;
-const PAGE_FAULT_VECTOR: u8 = 14;
 const RFLAGS_RESERVED_BIT_1: u64 = 1 << 1;
-const LONG_READY_WAIT_THRESHOLD_MS: u64 = 50;
 const LONG_BLOCKED_WAIT_THRESHOLD_MS: u64 = 250;
 
 // Latency credit applied when a sleeper wakes: their vruntime is bounded by
@@ -337,7 +327,6 @@ const READY_VALIDATION_INTERVAL_TURNS: u8 = 32;
 /// capped by the activation ABI and never applies to ordinary single spawns.
 const MAX_ATOMIC_ACTIVATION_HANDOFFS: usize = 8;
 const MAX_LATENCY_HANDOFF_HINTS: usize = 16;
-const UNRESTRICTED_CPU_MASK: u64 = u64::MAX;
 
 /// Priority bands. System work wins latency-sensitive selection until its
 /// bounded consecutive-dispatch reservation is exhausted; then one ready User
@@ -493,9 +482,17 @@ pub enum FastIpcCallHandoffOutcome {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum FastIpcReplyHandoffOutcome {
-    Direct,
     LocalFallback,
     Rejected,
+}
+impl FastIpcReplyHandoffOutcome {
+    /// Request a fast attempt after the actual typed wake/FIFO publication.
+    /// This copied hint grants nothing: the dispatcher still consumes the sole
+    /// FIFO, checks chain/atomic priority, and claims the original frame/funding.
+    /// Remote custody, early Current wake or refusal falls back normally.
+    pub(in crate::multitask) fn dispatch_hint(self, caller: u64) -> Option<u64> {
+        (self != Self::Rejected).then_some(caller)
+    }
 }
 
 /// Exact result of one serialized scheduling decision.

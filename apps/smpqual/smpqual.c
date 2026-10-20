@@ -27,6 +27,9 @@
 #define PRODUCT_MILESTONE_SMPQUAL_START 8UL
 #define PRODUCT_MILESTONE_SMPQUAL_FINISH 9UL
 #define PRODUCT_MILESTONE_SMPQUAL_COMPLETE 10UL
+#define PRODUCT_MILESTONE_HECS_REGISTERS 12UL
+#define HECS_CHECKS_PER_PATH 256ULL
+extern unsigned long hecs_register_probe(uint64_t seed, unsigned long operation);
 
 struct smpqual_config {
     unsigned int workers;
@@ -185,6 +188,39 @@ static bool rdtscp_is_supported(void) {
            (edx & (1U << 27)) != 0;
 }
 
+/* Only the assembly island seeds/checks machine registers. Ordinary C calls
+ * may clobber caller-saved registers and cannot substitute for this witness.
+ * The no-call spin checks asynchronous preservation but by itself does not
+ * establish that an IRQ occurred inside each spin, nor YMM/XSAVE coverage. */
+static int run_register_probes(struct smpqual_shared *shared, unsigned int worker_id,
+                               unsigned int observed_cpu) {
+    const unsigned long operations[] = { SYS_gettid, SYS_sched_yield, SYS_nanosleep, 0 };
+    uint64_t completed = 0;
+    for (unsigned int path = 0; path < sizeof(operations) / sizeof(operations[0]); ++path) {
+        for (uint64_t iteration = 0; iteration < HECS_CHECKS_PER_PATH; ++iteration) {
+            if (atomic_load_explicit(&shared->failed, memory_order_acquire) ||
+                deadline_expired(&shared->deadline)) {
+                return -1;
+            }
+            /* Vary low bits too: otherwise MXCSR rounding is never challenged. */
+            uint64_t seed = UINT64_C(0x123456789abcdef0) ^ ((uint64_t)worker_id << 48) ^
+                            ((uint64_t)path << 32) ^ iteration;
+            unsigned long mismatch = hecs_register_probe(seed, operations[path]);
+            if (mismatch != 0) {
+                debug_line("hecs: worker=%u cpu=%u tid=%ld operation=%lu iteration=%llu seed=%llx mismatch=%lu",
+                           worker_id, observed_cpu, syscall(SYS_gettid), operations[path],
+                           (unsigned long long)iteration, (unsigned long long)seed, mismatch);
+                return -1;
+            }
+            ++completed;
+        }
+    }
+    if (completed != 4 * HECS_CHECKS_PER_PATH || deadline_expired(&shared->deadline)) {
+        return -1;
+    }
+    return emit_milestone(PRODUCT_MILESTONE_HECS_REGISTERS, observed_cpu, worker_id, completed);
+}
+
 static void *run_worker(void *opaque) {
     struct worker_context *context = opaque;
     struct smpqual_shared *shared = context->shared;
@@ -219,6 +255,11 @@ static void *run_worker(void *opaque) {
         return NULL;
     }
 
+    if (run_register_probes(shared, worker_id, observed_cpu) != 0) {
+        debug_line("smpqual: worker=%u hardware-register-probe-failed", worker_id);
+        mark_failed(shared);
+        return NULL;
+    }
     uint64_t accumulator = ((uint64_t)worker_id << 32) | 1U;
     for (uint64_t completed = 0; completed < shared->config.work_units; ++completed) {
         /* Volatile publication makes every bounded iteration observable to the compiler. */

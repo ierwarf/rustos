@@ -76,8 +76,6 @@ options:
                        profile-specific owner-private firmware table. The
                        currently certified AMD profile requires a relocated
                        VFCT produced by rustos-hostd prepare-amd-vfct
-  --physical-amdgpu <BDF>, --amd-vfct <path>
-                       compatibility aliases for the current AMD profile
   --repeat <count>     boot this exact topology 1..=64 times and report the
                        pass rate, naming each failed run's panic line and
                        archived debugcon log. A defect that appears in one boot

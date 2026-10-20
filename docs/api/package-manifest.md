@@ -52,6 +52,12 @@ console_hosted = false
 | `c-demo` | Host C demo/smoke artifact. |
 | `winsys-dll-bundle` | Windows system DLL bundle. |
 
+For `c-demo`, optional `build.extra_sources = ["registers.S"]` adds explicit
+package-relative translation units alongside `build.source`. Every unit and the
+manifest participate in artifact freshness; source-file paths are not opaque
+`extra_args`. Empty, absolute, dot/parent-component and duplicate units are
+rejected.
+
 ### Install Section
 
 | Field | Meaning |
@@ -124,6 +130,10 @@ console_hosted = false
 | `mingw-c-exe` | Windows PE executable demo |
 | `c-demo` | host C demo/smoke artifact |
 | `winsys-dll-bundle` | Windows system DLL bundle |
+
+`c-demo`의 `build.extra_sources = ["registers.S"]`는 package 상대 경로의 추가
+translation unit입니다. 모든 source와 manifest를 freshness 입력으로 검사합니다.
+경로를 `extra_args`에 숨기지 않으며 빈 경로·절대 경로·dot/parent component·중복은 거부합니다.
 
 ### Install Section
 

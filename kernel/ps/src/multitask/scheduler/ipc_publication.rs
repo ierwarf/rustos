@@ -35,7 +35,17 @@ fn call_before_arm_with(
     donor_id: u64, receiver_id: u64, eligible_cpus: &dyn Fn(usize) -> u64,
     last_effect: impl FnOnce(),
 ) -> Result<IpcCallHandoffOutcome, FastIpcCallHandoffOutcome> {
+    call_before_arm_observing(scope, endpoint, reply, donor_id, receiver_id,
+        eligible_cpus, || {}, last_effect)
+}
+
+fn call_before_arm_observing(
+    scope: &DispatchPreemption<'_>, endpoint: u64, reply: u64,
+    donor_id: u64, receiver_id: u64, eligible_cpus: &dyn Fn(usize) -> u64,
+    before_receive: impl FnOnce(), last_effect: impl FnOnce(),
+) -> Result<IpcCallHandoffOutcome, FastIpcCallHandoffOutcome> {
     use FastIpcCallHandoffOutcome as Failure;
+    let mut last_effect = Some(last_effect);
     if !scoped(scope) || endpoint == 0 || reply == 0 || donor_id == receiver_id {
         return Err(Failure::SenderMismatch);
     }
@@ -48,9 +58,28 @@ fn call_before_arm_with(
     }
     let mut donor = Some(donation_publication::participant(sender.id())
         .ok_or(Failure::DonationUnavailable)?);
+    if donation_ledger::reply_already_dispatched(sender.original_pin(), reply) {
+        last_effect.take().unwrap()();
+        return Ok(IpcCallHandoffOutcome { inherited: false, woke: false, hinted: false });
+    }
     let receiver = donation_publication::participant(receiver_id)
-        .and_then(wake_publication::Binding::from_original)
-        .ok_or(Failure::ReceiverMismatch)?;
+        .and_then(wake_publication::Binding::from_original);
+    if receiver.is_none() && donation_ledger::reply_already_dispatched(sender.original_pin(), reply) {
+        last_effect.take().unwrap()();
+        return Ok(IpcCallHandoffOutcome { inherited: false, woke: false, hinted: false });
+    }
+    let receiver = receiver.ok_or(Failure::ReceiverMismatch)?;
+    if runqueue::wait::TypedWake::receive_was_withdrawn(&receiver)
+        && donation_ledger::retains_awaiting_reply(donor.as_ref().unwrap(), reply) {
+        // An earlier timer/ordinary wake already withdrew this exact receive
+        // phase, but runtime has not yet removed its endpoint waiter. Keep the
+        // original published message/custody queued. Only an actual later recv
+        // may bind its worker: no generic wake, funding transfer, FIFO or frame
+        // claim is authorized by this negative observation.
+        last_effect.take().unwrap()();
+        return Ok(IpcCallHandoffOutcome { inherited: false, woke: false, hinted: false });
+    }
+    before_receive();
     let mut loans = None;
     let mut hinted = false;
     // SAFETY: the sole wake engine holds ONE original typed pending phase from
@@ -73,12 +102,21 @@ fn call_before_arm_with(
             }
             // All original sender/donor/root/receiver and typed loans survive
             // this last effect, including successful wake with a full FIFO.
-            last_effect();
+            last_effect.take().unwrap()();
             // Full FIFO may refuse urgency, never undo a successful typed wake.
             true
         }) };
     let inherited = loans.is_some();
     let woke = result.is_ok();
+    if !woke && !inherited && donation_ledger::reply_already_dispatched(sender.original_pin(), reply) {
+        // Only an independent receive may explain this refused typed phase.
+        // Our own before_wake bind precedes fallible frame/queue admission and
+        // therefore cannot certify delivery after that admission refused.
+        // Leave an independently bound worker's newer wait phase untouched;
+        // otherwise the sender must cancel the exact published request/custody.
+        if let Some(last_effect) = last_effect.take() { last_effect(); }
+        return Ok(IpcCallHandoffOutcome { inherited: false, woke: false, hinted: false });
+    }
     drop(result);
     drop(loans);
     drop(donor);
@@ -197,6 +235,7 @@ pub(super) fn publish_with(
 pub(in crate::multitask) fn call(
     scope: &DispatchPreemption<'_>, endpoint: u64, reply: u64, receiver_id: u64,
 ) -> FastIpcCallHandoffOutcome {
+    let _phase = super::runtime_profile::phase_scope(super::SchedulerPhase::IpcCallPublication);
     call_before_sender_commit(scope, endpoint, reply, receiver_id, || {})
 }
 
@@ -261,6 +300,7 @@ pub(in crate::multitask) fn reply(
     scope: &DispatchPreemption<'_>, reply: u64, caller: u64, context_owner: u64,
     context: ObjectIdentity,
 ) -> Option<FastIpcReplyHandoffOutcome> {
+    let _phase = super::runtime_profile::phase_scope(super::SchedulerPhase::IpcReplyPublication);
     reply_with(scope, reply, caller, context_owner, context,
         &runqueue_policy::online_affinity_mask)
 }

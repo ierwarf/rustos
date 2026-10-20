@@ -10,7 +10,6 @@
 //!   after the complete dispatch-admission predicate accepts that CPU.
 //! - **Failure:** slot reuse clears locality and an out-of-range CPU panics.
 
-use super::*;
 
 
 // Per-CPU diagnostic storage. The scheduler reads the first scan's reason
@@ -44,13 +43,6 @@ pub(super) fn yield_admission_reason(cpu: usize, slot: usize) -> u8 {
 static PICK_SCAN_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static PICK_SCAN_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
-fn charge_pick_scan(elapsed_ns: u64) {
-    // ORDERING: Relaxed. Diagnostic counters with no other state attached, read
-    // only by the once-per-second drain.
-    PICK_SCAN_NS.fetch_add(elapsed_ns, core::sync::atomic::Ordering::Relaxed);
-    PICK_SCAN_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-}
-
 /// Self-timed cost of the handoff chain's own scans.
 ///
 /// Charged by the overdue-class and reserved-user scans, which are the other
@@ -59,29 +51,6 @@ fn charge_pick_scan(elapsed_ns: u64) {
 /// turned out to be 29 ms of a 216 ms segment, so it is not the one.
 static HANDOFF_SCAN_NS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static HANDOFF_SCAN_CALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-
-/// The scan stopwatch's clock, or zero when dispatch is not instrumented.
-///
-/// Both pick scans run on every dispatch and each was bracketed by two
-/// `lfence; rdtsc` reads plus two globally shared atomic adds -- to time a walk
-/// over a handful of slots. See `Scheduler::mark_phase`.
-#[inline]
-fn scan_clock() -> u64 {
-    #[cfg(rustos_scheduler_phase_profile)]
-    {
-        crate::arch::clock::monotonic_nanos()
-    }
-    #[cfg(not(rustos_scheduler_phase_profile))]
-    {
-        0
-    }
-}
-
-pub(in crate::multitask) fn charge_handoff_scan(elapsed_ns: u64) {
-    // ORDERING: Relaxed; diagnostic counters drained once per second.
-    HANDOFF_SCAN_NS.fetch_add(elapsed_ns, core::sync::atomic::Ordering::Relaxed);
-    HANDOFF_SCAN_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-}
 
 /// Takes the window's handoff-scan cost, clearing it for the next window.
 pub(in crate::multitask) fn take_handoff_scan_window() -> (u64, u64) {
@@ -132,11 +101,6 @@ pub(in crate::multitask) fn take_pick_scan_window() -> (u64, u64) {
 /// validate/select/commit/arch_restore/prologue) whether or not this hits.
 /// It only sizes the FIFO/scan trade at the specific step the trade lives in.
 static SYNC_HANDOFF_HITS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-
-pub(in crate::multitask) fn record_sync_handoff_hit() {
-    // ORDERING: Relaxed; diagnostic counter drained once per second.
-    SYNC_HANDOFF_HITS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-}
 
 /// Takes the window's sync-handoff hit count, clearing it for the next window.
 pub(in crate::multitask) fn take_sync_handoff_hit_window() -> u64 {
@@ -210,11 +174,6 @@ pub(in crate::multitask) enum SyncHandoffStaleReason {
 
 static SYNC_HANDOFF_STALE: [core::sync::atomic::AtomicU64; SYNC_HANDOFF_STALE_REASON_COUNT] =
     [const { core::sync::atomic::AtomicU64::new(0) }; SYNC_HANDOFF_STALE_REASON_COUNT];
-
-pub(in crate::multitask) fn record_sync_handoff_stale(reason: SyncHandoffStaleReason) {
-    // ORDERING: Relaxed; diagnostic counter drained once per second.
-    SYNC_HANDOFF_STALE[reason as usize].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-}
 
 /// Takes the window's stale-discard breakdown, clearing it for the next
 /// window. Indexed by `SyncHandoffStaleReason`.

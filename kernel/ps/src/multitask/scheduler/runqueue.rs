@@ -39,10 +39,10 @@ pub(super) use return_publication::{ReturnPublication, publish_return};
 pub(super) use return_publication::{test_blocked_return, test_running_claim};
 pub(super) use claim::{claim_dispatch, claim_dispatch_with_owner_generation, claim_validated_dispatch};
 mod execution_time;
-pub(super) use execution_time::{set as set_exec_start_local_ns, value as exec_start_local_ns};
+pub(super) use execution_time::set as set_exec_start_local_ns;
 mod idle;
 pub(super) use idle::{
-    cpu_for_slot as idle_cpu_for_slot, is_idle as is_idle_slot, set as set_idle_slot,
+    is_idle as is_idle_slot, set as set_idle_slot,
 };
 mod ipc_handoff;
 pub(super) mod simd_tls;

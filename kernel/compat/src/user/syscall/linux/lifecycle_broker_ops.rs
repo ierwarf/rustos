@@ -68,6 +68,14 @@ pub(crate) fn service_retired_task_runtime_cleanup(limit: usize) -> usize {
         let Some(cleanup) = multitask::next_retired_task_cleanup() else {
             break;
         };
+        // The exact producer elected the last process member and sealed its
+        // first fault. Do not infer this from a racy exception-time census or
+        // execute potentially blocking close/policy work with exception IF=0.
+        if let Some(vector) = retired_process_fault_vector(
+            cleanup.process_terminal(), cleanup.user_fault_vector(),
+        ) {
+            super::record_linux_process_fault_termination(cleanup.process_id(), vector);
+        }
         work += cleanup_retired_task_runtime_state(
             cleanup.task_id(),
             cleanup.process_id(),
@@ -86,6 +94,10 @@ pub(crate) fn service_retired_task_runtime_cleanup(limit: usize) -> usize {
         work += 1;
     }
     work
+}
+
+fn retired_process_fault_vector(process_terminal: bool, user_fault_vector: Option<u8>) -> Option<u8> {
+    if process_terminal { user_fault_vector } else { None }
 }
 
 fn rootd_wait_delay_is_valid(millis: u64) -> bool {
@@ -195,12 +207,22 @@ pub(super) fn syscall_linux_rustos_rootd_terminate_broker(args_ptr: u64) -> u64 
 #[cfg(test)]
 mod tests {
     use super::{
-        lifecycle_drain_args_are_valid, rootd_terminate_args_are_valid, rootd_wait_delay_is_valid,
+        lifecycle_drain_args_are_valid, retired_process_fault_vector,
+        rootd_terminate_args_are_valid, rootd_wait_delay_is_valid,
     };
     use rustos_user_abi::syscall::{
         LIFECYCLE_DRAIN_BROKER_ABI_VERSION, LifecycleDrainBrokerArgs,
         ROOTD_TERMINATE_BROKER_ABI_VERSION, RustosRootdTerminateBrokerArgs,
     };
+
+    #[test]
+    fn only_original_final_fault_token_commits_process_termination() {
+        assert_eq!(retired_process_fault_vector(false, None), None);
+        assert_eq!(retired_process_fault_vector(false, Some(14)), None);
+        assert_eq!(retired_process_fault_vector(true, None), None);
+        assert_eq!(retired_process_fault_vector(true, Some(14)), Some(14));
+        assert_eq!(retired_process_fault_vector(true, Some(13)), Some(13));
+    }
 
     #[test]
     fn lifecycle_drain_requires_exact_version_zero_reserved_envelope() {

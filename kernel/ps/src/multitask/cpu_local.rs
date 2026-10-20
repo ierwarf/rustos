@@ -257,17 +257,6 @@ pub(super) fn scheduler_current_task_scratch() -> usize {
     scheduler_current_task_scratch_for_cpu(logical_index)
 }
 
-/// Replaces the caller CPU's private scheduler-turn scratch slot.
-///
-/// Callers hold the exact CPU's scheduler dispatch exclusion.  Publication to
-/// remote observers remains deferred to the original CPU turn's return, after
-/// the outgoing stack-transition owner is installed.
-#[inline]
-pub(super) fn set_scheduler_current_task_scratch(slot: usize) {
-    let logical_index = scheduler_turn_logical_index();
-    set_scheduler_current_task_scratch_for_cpu(logical_index, slot);
-}
-
 /// Exact private scratch authority belongs to this CPU's unique local turn.
 /// The global owner CPU is diagnostic publication only; a foreign CPU can no
 /// longer derive scratch permission from whichever directory writer holds it.
@@ -406,9 +395,31 @@ pub(super) extern "C" fn commit_context_switch() {
         logical_index < TRANSITION_ACTIVE.len(),
         "scheduler invariant: stack-handoff commit CPU exceeds capacity"
     );
+    #[cfg(not(test))]
+    let rsp: usize;
+    #[cfg(not(test))]
+    // SAFETY: read the ACTUAL incoming machine RSP before any lifetime ACK.
+    // This instruction changes no stack, flags or memory.
+    unsafe { core::arch::asm!("mov {}, rsp", out(reg) rsp, options(nomem, nostack, preserves_flags)); }
+    #[cfg(not(test))]
+    let observed_rsp = Some(rsp);
+    // Native fixtures explicitly model earlier arrival, never machine RSP.
+    #[cfg(test)]
+    let observed_rsp = None;
+    commit_context_switch_at_rsp(logical_index, observed_rsp);
+}
+
+pub(super) fn commit_context_switch_at_rsp(logical_index: usize, observed_rsp: Option<usize>) {
     let Some(commit) = dispatch_turn::begin_commit(logical_index) else {
         return;
     };
+    #[cfg(not(test))]
+    let rsp = observed_rsp.expect("hardware RSP commit requires actual machine observation");
+    #[cfg(test)]
+    let rsp = observed_rsp.unwrap_or_else(|| commit.modeled_rsp());
+    // Check original geometry and BOTH pin-bank roles before either ACK. No
+    // lock, allocation, output, frame read or new permission occurs here.
+    commit.assert_arrived(logical_index, rsp);
     // ORDERING: Release makes the completed architectural stack switch happen
     // before remote scheduler/lifetime readers may observe transition clear.
     TRANSITION_ACTIVE[logical_index].store(false, Ordering::Release);
@@ -425,10 +436,6 @@ pub(super) fn task_slot_is_running(slot: usize) -> bool {
     task_execution_owner(slot).is_some()
 }
 
-pub(super) fn task_running_cpu(slot: usize) -> Option<usize> {
-    task_execution_owner(slot).map(TaskExecutionOwner::cpu)
-}
-
 /// Identifies why a task slot is still owned by a CPU.
 ///
 /// `Transition` is deliberately distinct from `Current`: the outgoing task
@@ -440,14 +447,6 @@ pub(super) fn task_running_cpu(slot: usize) -> Option<usize> {
 pub(super) enum TaskExecutionOwner {
     Current(usize),
     Transition(usize),
-}
-
-impl TaskExecutionOwner {
-    const fn cpu(self) -> usize {
-        match self {
-            Self::Current(cpu) | Self::Transition(cpu) => cpu,
-        }
-    }
 }
 
 pub(super) fn task_execution_owner(slot: usize) -> Option<TaskExecutionOwner> {

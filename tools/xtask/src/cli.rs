@@ -106,6 +106,22 @@ enum XtaskCommand {
         /// probe-timing table needs the unrestricted run.
         #[arg(long = "isolate-probe")]
         isolate_probe: Option<String>,
+        /// Fail unless the isolated IPC round trip's raw maximum (all 20,000
+        /// samples, including outliers) is at most this many invariant-TSC ticks.
+        /// Diagnostic profiles cannot provide shipping acceptance evidence.
+        #[arg(long = "ipc-max-cycles", requires = "isolate_probe", value_parser = clap::value_parser!(u64).range(1..))]
+        ipc_max_cycles: Option<u64>,
+    },
+    /// Diagnose syscall/IPC components with exact-ELF disassembly. UI readiness
+    /// failures may leave usable closed component windows, never shipping proof.
+    #[command(name = "bench-components")]
+    BenchComponents {
+        #[arg(long = "rustos-vcpus", default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=8))]
+        rustos_vcpus: u8,
+        /// Diagnostic suite only: includes settle and multiple full IPC runs.
+        /// Does not change the ordinary bench or SMP acceptance timeouts.
+        #[arg(long, default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..=120))]
+        timeout: u64,
     },
     /// Repeat the bench lane to reproduce a defect that is rare per boot.
     ///
@@ -257,13 +273,18 @@ pub(crate) fn run() -> Result<()> {
             compare,
             rustos_vcpus,
             isolate_probe,
+            ipc_max_cycles,
         }) => crate::bench::bench(
             &config,
             baseline.as_deref(),
             compare.as_deref(),
             rustos_vcpus,
             isolate_probe.as_deref(),
+            ipc_max_cycles,
         ),
+        Some(XtaskCommand::BenchComponents { rustos_vcpus, timeout }) => {
+            crate::bench::bench_components(&config, rustos_vcpus, timeout)
+        }
         Some(XtaskCommand::Soak {
             runs,
             rustos_vcpus,

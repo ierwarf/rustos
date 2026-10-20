@@ -25,7 +25,6 @@ use core::{cell::Cell, mem, sync::atomic::AtomicU64};
 use x86_64::VirtAddr;
 use x86_64::instructions::{hlt, interrupts};
 use x86_64::registers::rflags::RFlags;
-use x86_64::registers::segmentation::{CS, SS, Segment};
 
 use self::cpu_local::{
     current_cpu_task_slot_admitted, scheduler_initialized, task_slot_is_running,
@@ -48,6 +47,7 @@ pub use self::current::{
     arm_block_current_task_on_pager_service, arm_block_current_task_on_reply,
     attach_reserved_ipc_priority, bind_reserved_ipc_priority,
     cancel_block_current_task, cancel_ipc_priority_reservation, commit_ipc_call_handoff,
+    endpoint_receiver_still_waiting,
     complete_fast_ipc_reply_wake_handoff_with_custody, complete_ipc_reply_wake_handoff,
     complete_ipc_reply_wake_handoff_with_custody, complete_pager_fault_wake_handoff,
     complete_retired_task_cleanup, current_console_session, current_linux_thread_state,
@@ -102,6 +102,7 @@ pub use self::process_table::{
 };
 pub use self::retirement::UserFaultDisposition;
 pub use self::scheduler::smp::drain_fast_ipc_eligibility_rejections;
+pub use self::scheduler::rsp_handoff::hardware_rsp_arrivals;
 pub use self::scheduler::{
     AffinityCommit, AffinityError, FastIpcCallHandoffOutcome, ProcessAffinitySnapshot,
     drain_scheduler_runtime_profile,
@@ -142,7 +143,6 @@ const MAX_THREAD_WEIGHT_MICROS: u64 = 10_000;
 const INTERACTIVE_PIT_DIVISOR_FLAG: u16 = 1 << 15;
 pub const DEFAULT_USER_TASK_WEIGHT_MICROS: u64 = 100;
 const USER_TASK_EXEC_PATH_CAPACITY: usize = 192;
-const USER_STACK_PAGE_SIZE: u64 = 4096;
 
 static USER_RETURN_RESCHEDULE_ARMED: [AtomicU64; nucleus_core::util::lockdep::MAX_TRACKED_CPUS] =
     [const { AtomicU64::new(0) }; nucleus_core::util::lockdep::MAX_TRACKED_CPUS];

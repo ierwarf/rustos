@@ -212,6 +212,10 @@ pub(in crate::multitask) fn owns_current(cpu: usize, slot: usize) -> bool {
         .is_some_and(|bank| bank.owns_current(slot))
 }
 
+pub(in crate::multitask::scheduler) fn owns_outgoing(cpu: usize, slot: usize) -> bool {
+    CPU_LEASES.get(cpu).is_some_and(|bank| bank.outgoing.load(Ordering::Acquire) == slot + 1)
+}
+
 pub(in crate::multitask::scheduler) fn owns_prepared(cpu: usize, slot: usize) -> bool {
     CPU_LEASES
         .get(cpu)

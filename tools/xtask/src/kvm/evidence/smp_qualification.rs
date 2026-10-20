@@ -82,6 +82,7 @@ pub(super) struct KvmSuccessSummary {
     pub(super) smp_runtime_markers: usize,
     pub(super) smp_runtime_events: Vec<SmpRuntimeEvent>,
     pub(super) smp_ring3_qualification_events: Option<Vec<SmpQualificationEvent>>,
+    pub(super) hardware_execution: Option<super::hecs::HecsEvidence>,
     pub(super) ui_minimum_fps: Option<u32>,
     pub(super) ui_proof_windows: usize,
 }
@@ -597,8 +598,8 @@ mod tests {
             latest_guest_ts_us: None,
         };
         KvmSuccessSummary {
-            schema: "rustos-kvm-smp-correctness-evidence-v6",
-            predecessor_schema: "rustos-kvm-smp-correctness-evidence-v5",
+            schema: "rustos-kvm-smp-correctness-evidence-v7",
+            predecessor_schema: "rustos-kvm-smp-correctness-evidence-v6",
             status: "passed",
             smp_evidence_cohort: snapshot.run.cohort.clone(),
             run_id: snapshot.run.run_id.clone(),
@@ -634,6 +635,7 @@ mod tests {
             smp_runtime_markers: 0,
             smp_runtime_events: Vec::new(),
             smp_ring3_qualification_events: None,
+            hardware_execution: None,
             ui_minimum_fps: None,
             ui_proof_windows: 0,
         }
@@ -761,13 +763,13 @@ mod tests {
         );
         assert_eq!(
             summary.get("schema").and_then(serde_json::Value::as_str),
-            Some("rustos-kvm-smp-correctness-evidence-v6")
+            Some("rustos-kvm-smp-correctness-evidence-v7")
         );
         assert_eq!(
             summary
                 .get("predecessor_schema")
                 .and_then(serde_json::Value::as_str),
-            Some("rustos-kvm-smp-correctness-evidence-v5")
+            Some("rustos-kvm-smp-correctness-evidence-v6")
         );
         assert_eq!(
             summary

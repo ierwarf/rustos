@@ -98,6 +98,120 @@ pub(in crate::multitask::scheduler) fn actual_cold_call_keeps_sender_unarmed_and
 }
 
 #[test]
+fn actual_withdrawn_receive_retains_exact_queued_reply_without_wake_or_early_worker_bind() {
+    peers(|sender, receiver, scope| {
+        assert!(donation_publication::reserve_call_with(scope, SENDER).donation_reserved);
+        // Real original ordinary wake models the timer winning before runtime
+        // withdraws its receiver waiter. No scalar wait/owner reset is used.
+        // SAFETY: the fixture retains the original masked CPU scope and born
+        // Current/receiver allocation through the entire production wake.
+        assert!(unsafe { wake_publication::guarded(receiver, RECEIVER, &|_| 1) });
+        let receiver_owner = runqueue::owner(receiver);
+        assert_eq!(runqueue::wait::reason(receiver), (runqueue::wait::REASON_NONE, 0));
+        assert_eq!(call_before_arm_with(scope, ENDPOINT, REPLY, SENDER, RECEIVER, &|_| 1, || {}).err(),
+            Some(FastIpcCallHandoffOutcome::DonationUnavailable),
+            "withdrawn waiter is not proof of a published exact reply");
+        assert!(donation_ledger::attach(REPLY, ipc_donation::DonationNamespace::IpcReply, SENDER));
+        assert_eq!(call_before_arm_with(scope, ENDPOINT, REPLY + 1, SENDER, RECEIVER, &|_| 1, || {}).err(),
+            Some(FastIpcCallHandoffOutcome::DonationUnavailable));
+        let result = call_before_arm_with(scope, ENDPOINT, REPLY, SENDER, RECEIVER, &|_| 1, || {
+            assert!(!runqueue::wait::armed(sender));
+            assert_eq!(runqueue::owner(receiver), receiver_owner);
+            assert!(donation_ledger::borrowed_context_owner_slot(receiver).is_none());
+            assert!(!sync_handoff::pending(0));
+        }).unwrap();
+        assert!(!result.woke && !result.inherited && !result.hinted);
+        assert_eq!(runqueue::owner(receiver), receiver_owner);
+        assert!(!sync_handoff::pending(0));
+        assert!(donation_ledger::borrowed_context_owner_slot(receiver).is_none());
+        // The actual receive-side producer, not the stale endpoint waiter,
+        // binds the SAME reserved root funding later and releases it once.
+        assert!(donation_publication::bind_with(scope, REPLY, SENDER, RECEIVER, false));
+        assert_eq!(donation_ledger::borrowed_context_owner_slot(receiver), Some(sender));
+        assert!(donation_ledger::release_reply(REPLY, ipc_donation::DonationNamespace::IpcReply));
+        assert!(!donation_ledger::release_reply(REPLY, ipc_donation::DonationNamespace::IpcReply));
+    });
+}
+
+#[test]
+fn actual_cold_publication_raced_receive_preserves_exact_bound_reply_and_newer_foreign_wait() {
+    for late in [false, true] {
+        peers(|sender, receiver, scope| {
+            assert!(donation_publication::reserve_call_with(scope, SENDER).donation_reserved);
+            assert!(donation_ledger::attach(REPLY, ipc_donation::DonationNamespace::IpcReply, SENDER));
+            let bind_and_rearm = || {
+                // Actual receive-side original funding admission. Only the
+                // earlier foreign CPU's newer wait phase is a native input;
+                // this does not manufacture Current or frame execution custody.
+                assert!(donation_publication::bind_with(scope, REPLY, SENDER, RECEIVER, false));
+                runqueue::wait::set_reason(receiver, runqueue::wait::REASON_ENDPOINT_RECEIVE, ENDPOINT + 1);
+            };
+            if !late { bind_and_rearm(); }
+            let owner = runqueue::owner(receiver);
+            let effects = core::cell::Cell::new(0);
+            let outcome = call_before_arm_observing(scope, ENDPOINT, REPLY, SENDER, RECEIVER,
+                &|_| 1, || { if late { bind_and_rearm(); } }, || {
+                    effects.set(effects.get() + 1);
+                    assert!(!runqueue::wait::armed(sender));
+                    assert_eq!(runqueue::owner(receiver), owner);
+                    assert_eq!(runqueue::wait::reason(receiver),
+                        (runqueue::wait::REASON_ENDPOINT_RECEIVE, ENDPOINT + 1));
+                    assert_eq!(donation_ledger::borrowed_context_owner_slot(receiver), Some(sender));
+                    assert!(!sync_handoff::pending(0));
+                }).unwrap();
+            assert!(!outcome.inherited && !outcome.woke && !outcome.hinted);
+            assert_eq!(effects.get(), 1);
+            let foreign = donation_publication::participant(RECEIVER).unwrap();
+            assert!(!donation_ledger::reply_already_dispatched(&foreign, REPLY));
+            drop(foreign);
+            assert!(call_before_arm_with(scope, ENDPOINT, REPLY + 1, SENDER, RECEIVER,
+                &|_| 1, || {}).is_err(), "another reply cannot borrow this dispatch proof");
+            assert!(donation_ledger::release_reply(REPLY, ipc_donation::DonationNamespace::IpcReply));
+            assert!(!donation_ledger::release_reply(REPLY, ipc_donation::DonationNamespace::IpcReply));
+            assert!(call_before_arm_with(scope, ENDPOINT, REPLY, SENDER, RECEIVER,
+                &|_| 1, || {}).is_err(), "released custody cannot certify a later pending call");
+            assert_eq!(runqueue::owner(receiver), owner);
+            assert!(!sync_handoff::pending(0));
+        });
+    }
+}
+
+#[test]
+fn actual_cold_call_own_funding_bind_cannot_certify_a_refused_receiver_wake() {
+    let refused = core::cell::Cell::new(false);
+    let effects = core::cell::Cell::new(0);
+    peers(|sender, receiver, scope| {
+        assert!(donation_publication::reserve_call_with(scope, SENDER).donation_reserved);
+        assert!(donation_ledger::attach(REPLY, ipc_donation::DonationNamespace::IpcReply, SENDER));
+        let sender_owner = runqueue::owner(sender);
+        let receiver_owner = runqueue::owner(receiver);
+        // Negative native input: model the earlier owner/frame publication
+        // overlap, NOT hardware execution or a frame grant. Both original born
+        // allocations and the actual typed wait/funding producer remain real.
+        frame_publication::bind_local_owner_generation(receiver, receiver_owner.generation + 1);
+        assert!(frame_publication::observed_frame_token(receiver, 0, false).is_none());
+        let outcome = call_before_arm_with(scope, ENDPOINT, REPLY, SENDER, RECEIVER, &|_| 1,
+            || effects.set(effects.get() + 1));
+        frame_publication::bind_local_owner_generation(receiver, receiver_owner.generation);
+        // This producer bound funding BEFORE its frame admission refused. That
+        // side effect is not evidence that another CPU actually took a request.
+        assert_eq!(donation_ledger::borrowed_context_owner_slot(receiver), Some(sender));
+        assert_eq!(runqueue::owner(sender), sender_owner);
+        assert_eq!(runqueue::owner(receiver), receiver_owner);
+        assert_eq!(runqueue::wait::reason(receiver),
+            (runqueue::wait::REASON_ENDPOINT_RECEIVE, ENDPOINT));
+        assert!(!runqueue::wait::armed(sender));
+        assert!(!sync_handoff::pending(0));
+        assert!(donation_ledger::release_reply(REPLY, ipc_donation::DonationNamespace::IpcReply));
+        assert!(!donation_ledger::release_reply(REPLY, ipc_donation::DonationNamespace::IpcReply));
+        refused.set(outcome.err() == Some(FastIpcCallHandoffOutcome::ReceiverMismatch));
+    });
+    // Check after normal fixture teardown, including the negative/mutant case.
+    assert!(refused.get(), "the sender must cancel, not sleep on its own failed wake's binding");
+    assert_eq!(effects.get(), 0, "refused wake must not publish final effects");
+}
+
+#[test]
 fn actual_cold_call_cross_cpu_keeps_exact_receive_funding_and_remote_queue() {
     peers_with_policy(true, 3, |sender, receiver, scope| {
         runqueue::affinity_payload::set_affinity(receiver, 2, u64::MAX, false);

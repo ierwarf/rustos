@@ -15,10 +15,7 @@ pub(super) fn nucleus_housekeeping_task(_id: u64) {
     loop {
         x86_64::instructions::interrupts::enable();
         let work = boot::housekeeping_once();
-        ps_api::yield_now();
-        if work == 0 {
-            x86_64::instructions::interrupts::enable_and_hlt();
-        }
+        finish_background_turn(work, ps_api::yield_now, idle_tick_wait);
     }
 }
 
@@ -43,9 +40,54 @@ pub(super) fn nucleus_pager_fault_refill_task(_id: u64) {
         if passes.is_multiple_of(256) {
             kernel_compat::api::pager::record_anonymous_fault_census();
         }
-        ps_api::yield_now();
-        if work == 0 {
-            x86_64::instructions::interrupts::enable_and_hlt();
-        }
+        finish_background_turn(work, ps_api::yield_now, idle_tick_wait);
+    }
+}
+
+fn idle_tick_wait() {
+    // This is an ordinary runnable worker, not the CPU's idle owner. HLT here
+    // can stop a CPU with eligible user work, and the halted interval is billed
+    // to this worker's System context. The existing exact RTC arm/commit/wake
+    // parks only this continuation, leaving the processor to the scheduler.
+    kernel_hal::api::arch::rtc::sleep(1);
+}
+
+fn finish_background_turn(work: usize, yield_now: impl FnOnce(), idle_wait: impl FnOnce()) {
+    if work == 0 {
+        idle_wait();
+    } else {
+        yield_now();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::finish_background_turn;
+    use core::cell::Cell;
+
+    #[test]
+    fn background_idle_wait_is_the_only_idle_action_not_a_post_yield_cpu_halt() {
+        let actions = Cell::new(0_u8);
+        finish_background_turn(
+            0,
+            || actions.set(actions.get() * 10 + 1),
+            || actions.set(actions.get() * 10 + 2),
+        );
+        assert_eq!(
+            actions.get(),
+            2,
+            "idle continuation must park without an earlier runnable yield"
+        );
+        actions.set(0);
+        finish_background_turn(
+            1,
+            || actions.set(actions.get() * 10 + 1),
+            || actions.set(actions.get() * 10 + 2),
+        );
+        assert_eq!(
+            actions.get(),
+            1,
+            "a productive worker yields instead of sleeping"
+        );
     }
 }

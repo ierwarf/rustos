@@ -4,7 +4,8 @@ VARIABLES uid,binding,taskAllows,processAllows,pending,phase,queued,refs,leaf,
           version,snapshot,race,badClaim,badReset
 vars == <<uid,binding,taskAllows,processAllows,pending,phase,queued,refs,leaf,version,snapshot,race,badClaim,badReset>>
 Init == /\ uid = 1 /\ binding = 1 /\ taskAllows = TRUE /\ processAllows = TRUE
-        /\ pending = FALSE /\ phase \in {"Local","Direct"} /\ queued = (phase = "Local")
+        \* A destination can still carry intent awaiting its own placement ACK.
+        /\ pending \in BOOLEAN /\ phase \in {"Local","Direct"} /\ queued = (phase = "Local")
         /\ refs = 0 /\ leaf = "None" /\ version = 1 /\ snapshot = 1 /\ race = FALSE
         /\ badClaim = FALSE /\ badReset = FALSE
 Capture == /\ snapshot # version /\ snapshot' = version

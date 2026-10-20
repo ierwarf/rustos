@@ -36,6 +36,7 @@ pub(super) fn request_scheduling_context_authority(
             IPC_BOOT_CONTROL_HARD_LIMIT_MS,
         ) as i64
     };
+    let call = libc_syscall_status(call);
     if call < 0 {
         return Err((-call) as i32);
     }
