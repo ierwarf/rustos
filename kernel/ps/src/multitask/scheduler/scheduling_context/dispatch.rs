@@ -47,7 +47,7 @@ pub(in crate::multitask::scheduler) fn prepare_grant(slot: usize, cpu: usize) ->
             PublishedDispatchPreparation::Ready => {}
             PublishedDispatchPreparation::DomainRefused => {
                 if let Some((domain_slot, cause)) =
-                    scheduling_runtime::published_domain_refusal_cause(stamp, now_ns)
+                    scheduling_runtime::published_domain_refusal_cause(stamp, cpu, now_ns)
                 {
                     super::latch_domain_budget_refusal(slot, domain_slot, cause);
                 }

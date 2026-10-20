@@ -50,9 +50,9 @@ fn incomplete_domain_budget_cannot_be_projected_as_reusable_absence() {
     let _serial = test_serial_guard();
     reset_for_test();
     initialize_domain(SLOT, policy(3)).unwrap();
-    let budget = domain_cell(SLOT).unwrap().lock().budget.take();
+    let banks = domain_cell(SLOT).unwrap().lock().banks.take();
     assert!(std::panic::catch_unwind(|| domain_descriptor(SLOT)).is_err());
-    domain_cell(SLOT).unwrap().lock().budget = budget;
+    domain_cell(SLOT).unwrap().lock().banks = banks;
     assert!(domain_descriptor(SLOT).is_some());
     reset_for_test();
 }
@@ -79,5 +79,33 @@ fn captured_interval_without_member_or_catalog_still_refuses_domain_replacement(
     let replacement = super::super::domain_admission::admit(next).unwrap();
     assert_ne!(replacement.generation(), generation);
     drop(replacement);
+    reset_for_test();
+}
+
+#[test]
+fn domain_budget_is_a_per_cpu_share_not_one_cpu_for_the_whole_domain() {
+    let _serial = test_serial_guard();
+    reset_for_test();
+    let policy = policy(3);
+    let generation = initialize_domain(SLOT, policy).unwrap();
+    // Exhaust CPU 0's share. A single shared bank refused every other CPU
+    // here too, which capped a whole user domain at one CPU's budget.
+    let spent = charge_domain_runtime(SLOT, generation, policy, 0, 1, policy.budget_ns).unwrap();
+    assert!(spent.exhausted);
+    assert!(!domain_is_eligible(SLOT, generation, policy, 0, 2));
+    assert!(domain_is_eligible(SLOT, generation, policy, 1, 2));
+    let other = charge_domain_runtime(SLOT, generation, policy, 1, 2, 1_000).unwrap();
+    assert_eq!((other.charged_ns, other.exhausted), (1_000, false));
+    // The whole-domain ledger sums every bank's monotonic counters.
+    let total = domain_snapshot(SLOT, generation, policy).unwrap();
+    assert_eq!(total.consumed_ns, policy.budget_ns + 1_000);
+    assert_eq!(total.exhaustion_count, 1);
+    assert_eq!(
+        total.available_ns,
+        policy.budget_ns * (MAX_TRACKED_CPUS as u64) - policy.budget_ns - 1_000
+    );
+    // A CPU outside the tracked set has no bank and fails closed.
+    assert!(charge_domain_runtime(SLOT, generation, policy, MAX_TRACKED_CPUS, 3, 1).is_none());
+    assert!(!domain_is_eligible(SLOT, generation, policy, MAX_TRACKED_CPUS, 3));
     reset_for_test();
 }

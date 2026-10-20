@@ -62,6 +62,7 @@
             domain_slot,
             domain_generation,
             policy,
+            0,
             1,
             policy.budget_ns,
         )
@@ -75,7 +76,7 @@
             super::super::scheduling_runtime::PublishedDispatchPreparation::DomainRefused,
         );
         assert_eq!(
-            super::super::scheduling_runtime::published_domain_refusal_cause(stamp, 1),
+            super::super::scheduling_runtime::published_domain_refusal_cause(stamp, 0, 1),
             Some((domain_slot, DomainRefusalCause::EmptyRefillPending)),
         );
         assert_eq!(
@@ -84,6 +85,7 @@
                     context_generation: stamp.context_generation.wrapping_add(1),
                     ..stamp
                 },
+                0,
                 1,
             ),
             None,
@@ -102,6 +104,7 @@
         };
         assert!(super::super::scheduling_runtime::charge_published_stamp_pair(
             stale_context,
+            0,
             policy.period_ns + 1,
             policy.budget_ns,
             76,
@@ -113,6 +116,7 @@
         };
         assert!(super::super::scheduling_runtime::charge_published_stamp_pair(
             stale,
+            0,
             policy.period_ns + 1,
             policy.budget_ns,
             77,
@@ -122,6 +126,7 @@
         let (context_charge, domain_charge) =
             super::super::scheduling_runtime::charge_published_stamp_pair(
                 stamp,
+                0,
                 policy.period_ns + 1,
                 policy.budget_ns,
                 77,

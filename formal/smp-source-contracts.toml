@@ -1397,7 +1397,7 @@ tokens = [
     "policy.cpu_mask & cpu_bit != 0,",
     "let mut domain = domain_cell(usize::from(domain_slot))?.lock();",
     "if domain.generation != domain_generation || domain.policy != Some(policy) {",
-    "Some(use_pair(context.budget.as_mut()?, domain.budget.as_mut()?))",
+    "Some(use_pair(context.budget.as_mut()?, domain.bank_mut(cpu)?))",
     "pub(super) fn prepare_published_stamp_dispatch_status(",
     "if !domain.replenish(now_ns) || !domain.available() {",
     "if !context.replenish(now_ns) || !context.available() {",
@@ -1969,7 +1969,7 @@ tokens = [
     "let mut context = cell(context_slot)?.lock();",
     "rustos_scheduler_frame_gate::published_budget_identity_custody(",
     "let mut domain = domain_cell(usize::from(domain_slot))?.lock();",
-    "Some(use_pair(context.budget.as_mut()?, domain.budget.as_mut()?))",
+    "Some(use_pair(context.budget.as_mut()?, domain.bank_mut(cpu)?))",
     "pub(super) fn published_stamp_admission(",
     "context.is_eligible(now_ns) && domain.is_eligible(now_ns)",
 ]

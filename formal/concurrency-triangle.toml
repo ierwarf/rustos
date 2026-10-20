@@ -170,7 +170,7 @@ source_anchors = [
   "rustos_scheduler_frame_gate::published_budget_identity_custody(",
   "let mut domain = domain_cell(usize::from(domain_slot))?.lock();",
   "if domain.generation != domain_generation || domain.policy != Some(policy) {",
-  "Some(use_pair(context.budget.as_mut()?, domain.budget.as_mut()?))",
+  "Some(use_pair(context.budget.as_mut()?, domain.bank_mut(cpu)?))",
 ]
 invariant = "one exact published context/domain generation and CPU policy must own both runtime cells before dispatch preparation; the bounded cell-race model excludes live donor token changes, policy content and final claim"
 loom_test = "published_budget_prepare_never_touches_a_recycled_runtime_cell"

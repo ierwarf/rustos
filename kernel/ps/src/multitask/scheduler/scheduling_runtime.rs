@@ -4,6 +4,13 @@
 //! domain number and policy epoch are reusable metadata; neither may identify
 //! mutable budget authority after the catalog slot has been recycled.
 //!
+//! A domain policy's `budget/period` is a per-CPU share, matching deadline
+//! admission (`DEADLINE_UTILIZATION_LIMIT_PPM` of every admitted CPU). Each
+//! domain therefore keeps one budget bank per logical CPU: an interval is
+//! admitted and charged against the bank of the CPU that executes it. A single
+//! shared bank capped a whole multi-task domain at one CPU's share no matter
+//! how many CPUs were online, which starved user workloads at eight vCPUs.
+//!
 //! Owner: exact context/domain mutable budgets and retained domain members.
 //! Boundary: policy copies are observations; this is not CPU/return custody.
 //! Lifecycle: captures and initialized contexts block replacement through release;
@@ -16,7 +23,7 @@
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use kernel_object::api::identity::ObjectIdentity;
-use nucleus_core::util::lockdep::LockClass;
+use nucleus_core::util::lockdep::{LockClass, MAX_TRACKED_CPUS};
 use crate::multitask::irq_leaf::IrqLeaf;
 
 use super::super::current_identity::PagerChargeStamp;
@@ -195,7 +202,8 @@ pub(super) fn runtime_snapshot(
 struct DomainBudgetRuntime {
     generation: u32,
     policy: Option<SchedulingContextPolicy>,
-    budget: Option<BudgetState>,
+    /// One bank per logical CPU; see the module comment.
+    banks: Option<[BudgetState; MAX_TRACKED_CPUS]>,
     active_intervals: u32,
     // Captured cold grants and initialized context runtimes, not catalog reads.
     members: u32,
@@ -206,11 +214,50 @@ impl DomainBudgetRuntime {
         Self {
             generation: 0,
             policy: None,
-            budget: None,
+            banks: None,
             active_intervals: 0,
             members: 0,
         }
     }
+
+    fn bank(&self, cpu: usize) -> Option<&BudgetState> {
+        self.banks.as_ref()?.get(cpu)
+    }
+
+    fn bank_mut(&mut self, cpu: usize) -> Option<&mut BudgetState> {
+        self.banks.as_mut()?.get_mut(cpu)
+    }
+
+    /// Whole-domain ledger: monotonic counters and credit summed over every
+    /// CPU bank, earliest pending refill across banks.
+    fn aggregate_snapshot(&self) -> Option<BudgetSnapshot> {
+        let mut total = BudgetSnapshot::default();
+        for bank in self.banks.as_ref()? {
+            let snapshot = bank.snapshot()?;
+            total.available_ns = total.available_ns.saturating_add(snapshot.available_ns);
+            total.pending_refill_ns =
+                total.pending_refill_ns.saturating_add(snapshot.pending_refill_ns);
+            if snapshot.next_eligible_ns != 0
+                && (total.next_eligible_ns == 0 || snapshot.next_eligible_ns < total.next_eligible_ns)
+            {
+                total.next_eligible_ns = snapshot.next_eligible_ns;
+            }
+            total.consumed_ns = total.consumed_ns.saturating_add(snapshot.consumed_ns);
+            total.exhaustion_count =
+                total.exhaustion_count.saturating_add(snapshot.exhaustion_count);
+            total.refill_count = total.refill_count.saturating_add(snapshot.refill_count);
+            total.overflow_merge_count =
+                total.overflow_merge_count.saturating_add(snapshot.overflow_merge_count);
+            total.timeout_fault_count =
+                total.timeout_fault_count.saturating_add(snapshot.timeout_fault_count);
+        }
+        Some(total)
+    }
+}
+
+fn admitted_domain_banks(policy: SchedulingContextPolicy) -> Option<[BudgetState; MAX_TRACKED_CPUS]> {
+    let bank = BudgetState::admitted(policy, BudgetCounterScope::Domain)?;
+    Some([bank; MAX_TRACKED_CPUS])
 }
 
 type DomainBudgetLock =
@@ -277,7 +324,7 @@ pub(super) fn initialize_domain_owned(
     slot: usize,
     policy: SchedulingContextPolicy,
 ) -> Option<u32> {
-    let budget = BudgetState::admitted(policy, BudgetCounterScope::Domain)?;
+    let banks = admitted_domain_banks(policy)?;
     let mut runtime = domain_cell(slot)?.lock();
     if runtime.policy.is_some() {
         return None;
@@ -286,7 +333,7 @@ pub(super) fn initialize_domain_owned(
     *runtime = DomainBudgetRuntime {
         generation,
         policy: Some(policy),
-        budget: Some(budget),
+        banks: Some(banks),
         active_intervals: 0,
         members: 0,
     };
@@ -311,7 +358,7 @@ pub(super) fn replace_domain_owned(
     expected_generation: u32,
     replacement: SchedulingContextPolicy,
 ) -> Option<u32> {
-    let budget = BudgetState::admitted(replacement, BudgetCounterScope::Domain)?;
+    let banks = admitted_domain_banks(replacement)?;
     let mut runtime = domain_cell(slot)?.lock();
     if runtime.policy != Some(expected)
         || runtime.generation != expected_generation
@@ -324,7 +371,7 @@ pub(super) fn replace_domain_owned(
     *runtime = DomainBudgetRuntime {
         generation,
         policy: Some(replacement),
-        budget: Some(budget),
+        banks: Some(banks),
         active_intervals: 0,
         members: 0,
     };
@@ -340,7 +387,7 @@ pub(super) fn retain_domain_member(
     if generation == 0
         || domain.generation != generation
         || domain.policy != Some(policy)
-        || domain.budget.is_none()
+        || domain.banks.is_none()
     {
         return None;
     }
@@ -368,7 +415,7 @@ pub(super) fn domain_descriptor(
     let runtime = domain_cell(slot)?.lock();
     let policy = runtime.policy?;
     assert!(
-        runtime.generation != 0 && runtime.budget.is_some(),
+        runtime.generation != 0 && runtime.banks.is_some(),
         "incomplete scheduling domain authority"
     );
     super::scheduling_context::SchedulingDomainState::admitted(policy, runtime.generation)
@@ -406,10 +453,11 @@ pub(super) fn domain_is_eligible(
     slot: usize,
     generation: u32,
     policy: SchedulingContextPolicy,
+    cpu: usize,
     now_ns: u64,
 ) -> bool {
     domain_budget_for(slot, generation, policy)
-        .and_then(|runtime| runtime.budget)
+        .and_then(|runtime| runtime.bank(cpu).copied())
         .is_some_and(|budget| budget.is_eligible(now_ns))
 }
 
@@ -420,6 +468,8 @@ pub(super) struct FundingPin {
     stamp: PagerChargeStamp,
     context_slot: usize,
     domain_slot: usize,
+    /// CPU whose domain bank admitted this interval and is charged for it.
+    cpu: usize,
     owner_task_id: u64,
     reply: u64,
 }
@@ -457,7 +507,7 @@ impl FundingPin {
 impl FundingPin {
     pub(super) fn charge(self, now_ns: u64, elapsed_ns: u64) -> (u64, ChargeOutcome) {
         let (context, domain) =
-            charge_published_stamp_pair(self.stamp, now_ns, elapsed_ns, self.reply)
+            charge_published_stamp_pair(self.stamp, self.cpu, now_ns, elapsed_ns, self.reply)
                 .expect("pinned execution funding lost exact runtime authority");
         (
             self.owner_task_id,
@@ -550,7 +600,7 @@ pub(super) fn pin_published_funding(
     }
     // Preparation and pin acquisition may be separated by another CPU's
     // debit. Authorize a grant only while both exact banks still have credit.
-    if !context.budget.as_ref()?.available() || !domain.budget.as_ref()?.available() {
+    if !context.budget.as_ref()?.available() || !domain.bank(cpu)?.available() {
         return None;
     }
     let context_refs = context
@@ -567,6 +617,7 @@ pub(super) fn pin_published_funding(
         stamp,
         context_slot,
         domain_slot,
+        cpu,
         owner_task_id,
         reply,
     })
@@ -614,7 +665,7 @@ fn with_published_budget_pair<T>(
     if domain.generation != domain_generation || domain.policy != Some(policy) {
         return None;
     }
-    Some(use_pair(context.budget.as_mut()?, domain.budget.as_mut()?))
+    Some(use_pair(context.budget.as_mut()?, domain.bank_mut(cpu)?))
 }
 
 /// `None` means a stale stamp, unavailable cell or disallowed CPU, not a
@@ -684,11 +735,12 @@ pub(super) fn charge_domain_runtime(
     slot: usize,
     generation: u32,
     policy: SchedulingContextPolicy,
+    cpu: usize,
     now_ns: u64,
     elapsed_ns: u64,
 ) -> Option<ChargeOutcome> {
     let mut runtime = domain_budget_for(slot, generation, policy)?;
-    runtime.budget.as_mut()?.charge(now_ns, elapsed_ns)
+    runtime.bank_mut(cpu)?.charge(now_ns, elapsed_ns)
 }
 
 /// Charges a scheduling context and its shared domain as one transaction.
@@ -704,13 +756,14 @@ pub(super) fn charge_pair(
     policy: SchedulingContextPolicy,
     domain_slot: usize,
     domain_generation: u32,
+    cpu: usize,
     now_ns: u64,
     elapsed_ns: u64,
 ) -> Option<(ChargeOutcome, ChargeOutcome)> {
     let mut context = budget_for(context_slot, identity, policy)?;
     let context_budget = context.budget.as_mut()?;
     let mut domain = domain_budget_for(domain_slot, domain_generation, policy)?;
-    let domain_budget = domain.budget.as_mut()?;
+    let domain_budget = domain.bank_mut(cpu)?;
     if !context_budget.can_charge(now_ns, elapsed_ns)
         || !domain_budget.can_charge(now_ns, elapsed_ns)
     {
@@ -732,6 +785,7 @@ pub(super) fn charge_pair(
 /// timeout fault in that same context cell before releasing the pair.
 pub(super) fn charge_published_stamp_pair(
     stamp: PagerChargeStamp,
+    cpu: usize,
     now_ns: u64,
     elapsed_ns: u64,
     reply: u64,
@@ -766,7 +820,7 @@ pub(super) fn charge_published_stamp_pair(
         return None;
     }
     let context_budget = context.budget.as_mut()?;
-    let domain_budget = domain.budget.as_mut()?;
+    let domain_budget = domain.bank_mut(cpu)?;
     if !context_budget.can_charge(now_ns, elapsed_ns)
         || !domain_budget.can_charge(now_ns, elapsed_ns)
     {
@@ -812,7 +866,7 @@ pub(super) fn observe_current_funding(
         return None;
     }
     let budget = context.budget.as_ref()?.snapshot()?;
-    let domain_budget = domain.budget.as_ref()?.snapshot()?;
+    let domain_budget = domain.aggregate_snapshot()?;
     Some(crate::multitask::SchedulingContextRuntimeSnapshot {
         executing_task_id, context_owner_task_id,
         context_identity_slot: identity.slot(), context_identity_generation: identity.generation(),
@@ -845,21 +899,20 @@ pub(super) fn domain_snapshot(
     generation: u32,
     policy: SchedulingContextPolicy,
 ) -> Option<BudgetSnapshot> {
-    domain_budget_for(slot, generation, policy)?
-        .budget?
-        .snapshot()
+    domain_budget_for(slot, generation, policy)?.aggregate_snapshot()
 }
 
 pub(super) fn domain_dispatch_refusal(
     slot: usize,
     generation: u32,
     policy: SchedulingContextPolicy,
+    cpu: usize,
     now_ns: u64,
 ) -> super::scheduling_context::DomainRefusalCause {
     let Some(runtime) = domain_budget_for(slot, generation, policy) else {
         return super::scheduling_context::DomainRefusalCause::Policy;
     };
-    let Some(budget) = runtime.budget else {
+    let Some(budget) = runtime.bank(cpu).copied() else {
         return super::scheduling_context::DomainRefusalCause::ConservationRefused;
     };
     if budget.available() {
@@ -880,6 +933,7 @@ pub(super) fn domain_dispatch_refusal(
 /// never grant dispatch or charge another generation.
 pub(super) fn published_domain_refusal_cause(
     stamp: PagerChargeStamp,
+    cpu: usize,
     now_ns: u64,
 ) -> Option<(usize, super::scheduling_context::DomainRefusalCause)> {
     let context_slot = stamp
@@ -904,7 +958,7 @@ pub(super) fn published_domain_refusal_cause(
     let domain_slot = usize::from(domain_slot);
     Some((
         domain_slot,
-        domain_dispatch_refusal(domain_slot, domain_generation, policy, now_ns),
+        domain_dispatch_refusal(domain_slot, domain_generation, policy, cpu, now_ns),
     ))
 }
 

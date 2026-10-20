@@ -35,7 +35,7 @@ fn retained_current_frame_rejects_foreign_cpu_changed_rsp_and_republished_owner(
         let policy = context.policy().unwrap();
         let domain = context.domain_slot().unwrap();
         let domain_generation = context.domain_generation().unwrap();
-        assert!(scheduling_runtime::charge_domain_runtime(domain, domain_generation, policy, 1, policy.budget_ns).is_some());
+        assert!(scheduling_runtime::charge_domain_runtime(domain, domain_generation, policy, 0, 1, policy.budget_ns).is_some());
         let FrameCapture::Ready(frame) = capture(fresh, rsp) else { panic!("lost budget-refused frame"); };
         assert!(frame.prepare().is_none());
         // Retained Current fallback cannot bypass budget just because its

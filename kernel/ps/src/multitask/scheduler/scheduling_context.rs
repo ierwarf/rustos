@@ -923,11 +923,11 @@ mod tests {
         let generation = super::super::scheduling_runtime::initialize_domain(63, policy)
             .expect("domain admission");
         let first = super::super::scheduling_runtime::charge_domain_runtime(
-            63, generation, policy, 100, 2_500,
+            63, generation, policy, 0, 100, 2_500,
         )
         .expect("first charge");
         let second = super::super::scheduling_runtime::charge_domain_runtime(
-            63, generation, policy, 200, 2_500,
+            63, generation, policy, 0, 200, 2_500,
         )
         .expect("second charge");
         assert_eq!(first.charged_ns, 2_500);
@@ -940,10 +940,10 @@ mod tests {
         assert_eq!(counters.domain.overrun_ns, 1_000);
         assert_eq!(counters.domain.exhaustions, 1);
         assert!(!super::super::scheduling_runtime::domain_is_eligible(
-            63, generation, policy, 10_099
+            63, generation, policy, 0, 10_099
         ));
         assert!(super::super::scheduling_runtime::domain_is_eligible(
-            63, generation, policy, 10_100
+            63, generation, policy, 0, 10_100
         ));
     }
 
@@ -965,6 +965,7 @@ mod tests {
             policy,
             domain_slot,
             domain_generation,
+            0,
             100,
             1_500,
         )
@@ -1008,6 +1009,7 @@ mod tests {
                 slot,
                 old_generation,
                 old_policy,
+                0,
                 100,
                 1,
             )
@@ -1022,6 +1024,7 @@ mod tests {
                 slot,
                 new_generation,
                 replacement,
+                0,
                 100,
                 1,
             )
