@@ -407,7 +407,7 @@ const NANOS_TO_TICKS_MULT: u64 = {
 };
 
 pub fn ticks() -> u64 {
-    let nanos = crate::arch::clock::monotonic_nanos();
+    let nanos = crate::arch::clock::monotonic_nanos_coarse();
     if nanos == 0 && crate::arch::clock::current_source().is_none() {
         return RTC_TICKS.load(Ordering::Acquire);
     }

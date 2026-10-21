@@ -259,7 +259,12 @@ context owner and both ledgers are the root caller's. A domain's
 `budget/period` is a per-CPU share, matching deadline admission's per-CPU
 utilization ceiling: the domain keeps one budget bank per logical CPU, and an
 interval is admitted and charged against the bank of the CPU that runs it. The
-snapshot reports the executing CPU's domain bank. The syscall returns
+snapshot reports the executing CPU's domain bank. A refill is dated one period
+after the consumption it returns began, and contiguous consumption merges into
+one refill that keeps the run's start; consumption after a gap merges at the
+later point. Ordinary applications are granted budget equal to period, so a
+continuous run is refilled exactly when it would exhaust and never idles a CPU
+that has nothing else to run (System services still win by class). The syscall returns
 `EAGAIN` when no admitted effective context exists and never grants mutation,
 donation, endpoint, or scheduling authority. Context and domain runtime
 milestones use distinct counter banks so domain billing is not double-counted

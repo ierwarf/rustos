@@ -3,9 +3,50 @@
 //! Cold construction/exec still uses the enclosing directory transaction;
 //! these leaf operations never hold a lock across construction or entry calls.
 
-use super::super::TaskStart;
+use super::super::{MAX_TASK, TaskStart};
 use super::RESOURCES;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering, fence};
+
+/// Lock-free mirror of `Resources::start`, one seqlock per slot.
+///
+/// The descriptor is two immutable words (entry, task id) written only under
+/// the slot's resource leaf, yet `read` is a task-identity check taken dozens
+/// of times per synchronous IPC round trip (SIMD image binding, wake binding,
+/// every capture). Taking the leaf only to copy it was the largest single
+/// source of `TaskStackResources` acquisitions. Writers are serialized by that
+/// leaf with IRQs masked, so the sequence is never odd across a preemption and
+/// a reader's retry is bounded by one store pair. An empty slot is entry 0.
+struct StartMirror {
+    seq: AtomicU32,
+    id: AtomicU64,
+    entry: AtomicUsize,
+}
+static START_MIRROR: [StartMirror; MAX_TASK] = [const {
+    StartMirror {
+        seq: AtomicU32::new(0),
+        id: AtomicU64::new(0),
+        entry: AtomicUsize::new(0),
+    }
+}; MAX_TASK];
+
+/// Publishes `start` into the mirror.
+///
+/// The caller holds `slot`'s resource leaf, which is the sole writer exclusion.
+pub(super) fn mirror_store(slot: usize, start: Option<TaskStart>) {
+    let mirror = &START_MIRROR[slot];
+    let sequence = mirror.seq.load(Ordering::Relaxed);
+    mirror.seq.store(sequence.wrapping_add(1), Ordering::Relaxed);
+    // ORDERING: the odd sequence is visible before either data word changes.
+    fence(Ordering::Release);
+    let (id, entry) = match start {
+        Some(start) => (start.id, start.entry as usize),
+        None => (0, 0),
+    };
+    mirror.id.store(id, Ordering::Relaxed);
+    mirror.entry.store(entry, Ordering::Relaxed);
+    // ORDERING: Release publishes both words before the even sequence.
+    mirror.seq.store(sequence.wrapping_add(2), Ordering::Release);
+}
 
 /// Negative native fault injection only: original physical/census loans remain
 /// retained. A corrupted copied descriptor is NOT a replacement UID or grant.
@@ -18,12 +59,16 @@ pub(in crate::multitask::scheduler) fn test_mismatched_start<R>(
     struct Restore(usize, TaskStart);
     impl Drop for Restore {
         fn drop(&mut self) {
-            RESOURCES[self.0].with(|resources| resources.start = Some(self.1));
+            RESOURCES[self.0].with(|resources| {
+                resources.start = Some(self.1);
+                mirror_store(self.0, resources.start);
+            });
         }
     }
     let original = RESOURCES[slot].with(|resources| {
         let original = resources.start.expect("negative probe needs original start");
         resources.start = Some(TaskStart { id, ..original });
+        mirror_store(slot, resources.start);
         original
     });
     let _restore = Restore(slot, original);
@@ -32,7 +77,28 @@ pub(in crate::multitask::scheduler) fn test_mismatched_start<R>(
 }
 
 pub(in crate::multitask::scheduler) fn read(slot: usize) -> Option<TaskStart> {
-    RESOURCES.get(slot)?.with(|resources| resources.start)
+    let mirror = START_MIRROR.get(slot)?;
+    loop {
+        // ORDERING: Acquire pairs with the writer's closing Release store.
+        let before = mirror.seq.load(Ordering::Acquire);
+        if before & 1 != 0 {
+            core::hint::spin_loop();
+            continue;
+        }
+        let id = mirror.id.load(Ordering::Relaxed);
+        let entry = mirror.entry.load(Ordering::Relaxed);
+        // ORDERING: the data loads complete before the sequence is re-read.
+        fence(Ordering::Acquire);
+        if mirror.seq.load(Ordering::Relaxed) != before {
+            continue;
+        }
+        return (entry != 0).then(|| TaskStart {
+            // SAFETY: a nonzero entry word is only ever stored from a valid
+            // `fn(u64)` by `mirror_store`.
+            entry: unsafe { core::mem::transmute::<usize, fn(u64)>(entry) },
+            id,
+        });
+    }
 }
 
 pub(in crate::multitask::scheduler) fn publish(slot: usize, start: TaskStart) {
@@ -69,6 +135,7 @@ pub(super) fn publish_with_reservation(
         // Same-identity exec may replace the entry, never the task identity or
         // any outstanding allocation reference. Readers receive owned copies.
         resources.start = Some(start);
+        mirror_store(slot, resources.start);
     });
 }
 
@@ -126,6 +193,7 @@ pub(in crate::multitask::scheduler) fn clear(slot: usize) {
             "descriptor reset with frozen exec census custody"
         );
         resources.start = None;
+        mirror_store(slot, None);
     });
 }
 

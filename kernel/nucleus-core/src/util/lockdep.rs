@@ -37,6 +37,7 @@ use spin::{Mutex, MutexGuard};
 mod cpu_counter;
 mod cpu_identity;
 mod guard_release;
+mod lean_acquire;
 #[cfg(any(rustos_boot_image, test))]
 mod dependency_graph;
 #[cfg(test)]
@@ -289,6 +290,10 @@ pub struct TrackedSpinGuard<'a, T: ?Sized, const CLASS: u8> {
     /// release knows IF without reading it.
     #[cfg(rustos_boot_image)]
     irqs_masked: bool,
+    /// Acquired through the IRQ-masked lean path: release is the matching
+    /// minimal pop, not the full admissibility proof.
+    #[cfg(rustos_boot_image)]
+    lean: bool,
 }
 
 /// An interrupt handler's entry into IRQ context.
@@ -619,7 +624,14 @@ impl<T: ?Sized, const CLASS: u8> TrackedSpinLock<T, CLASS> {
     #[track_caller]
     pub fn lock(&self) -> TrackedSpinGuard<'_, T, CLASS> {
         #[cfg(rustos_boot_image)]
-        return self.lock_with(x86_64::instructions::interrupts::are_enabled());
+        {
+            let irq_enabled = x86_64::instructions::interrupts::are_enabled();
+            // IF clear: nothing can interleave with the bookkeeping.
+            if !irq_enabled {
+                return self.lock_lean();
+            }
+            return self.lock_with(irq_enabled);
+        }
         #[cfg(not(rustos_boot_image))]
         self.lock_with(false)
     }
@@ -633,8 +645,12 @@ impl<T: ?Sized, const CLASS: u8> TrackedSpinLock<T, CLASS> {
     /// guard is dropped (an `IrqLeaf` mask or an enclosing masked closure).
     #[track_caller]
     pub unsafe fn lock_masked(&self) -> TrackedSpinGuard<'_, T, CLASS> {
+        #[cfg(rustos_boot_image)]
+        return self.lock_lean();
+        #[cfg(not(rustos_boot_image))]
         self.lock_with(false)
     }
+
 
     #[track_caller]
     fn lock_with(&self, irq_enabled: bool) -> TrackedSpinGuard<'_, T, CLASS> {
@@ -735,6 +751,8 @@ impl<T: ?Sized, const CLASS: u8> TrackedSpinLock<T, CLASS> {
             acquire_preemption_depth: CPU_LOCK_STATE[acquire_cpu].preempt_disable_depth.load(Ordering::Acquire),
             #[cfg(rustos_boot_image)]
             irqs_masked: !irq_enabled,
+            #[cfg(rustos_boot_image)]
+            lean: false,
         }
     }
 
@@ -765,6 +783,8 @@ impl<T: ?Sized, const CLASS: u8> TrackedSpinLock<T, CLASS> {
                 acquire_preemption_depth: preemption_depth(),
                 #[cfg(rustos_boot_image)]
                 irqs_masked: false,
+                #[cfg(rustos_boot_image)]
+                lean: false,
             })
         } else {
             #[cfg(rustos_boot_image)]
@@ -842,6 +862,8 @@ impl<T: ?Sized, const CLASS: u8> TrackedSpinLock<T, CLASS> {
                         acquire_preemption_depth: preemption_depth(),
                         #[cfg(rustos_boot_image)]
                         irqs_masked: false,
+                        #[cfg(rustos_boot_image)]
+                        lean: false,
                     });
                 }
                 if timed_out() {

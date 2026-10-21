@@ -68,9 +68,7 @@ pub(super) fn syscall_linux_rustos_ipc_reply_recv_with_sender(args_ptr: u64) -> 
     {
         return linux_errno(address_space_error_to_linux_errno(error));
     }
-    let start_ticks = crate::arch::rtc::ticks();
     if inline {
-        let copy_ticks = crate::arch::rtc::ticks();
         match kernel_ipc_runtime::api::endpoint::complete_fast_reply_for_task(
             KernelReplyHandle::from_raw(args.reply_cap),
             receiver_task_id,
@@ -78,15 +76,6 @@ pub(super) fn syscall_linux_rustos_ipc_reply_recv_with_sender(args_ptr: u64) -> 
         ) {
             Ok(published) => {
                 note_fast_ipc(IpcFastCounter::FusedReplyPublished);
-                let reply_ticks = crate::arch::rtc::ticks();
-                log_slow_ipc_reply(
-                    "reply-recv-fast",
-                    args.reply_cap,
-                    start_ticks,
-                    copy_ticks,
-                    reply_ticks,
-                    response_len,
-                );
                 if let Some(error) = published.terminal_error {
                     let _ = multitask::complete_fast_ipc_reply_wake_handoff_with_custody(
                         args.reply_cap,
@@ -111,6 +100,9 @@ pub(super) fn syscall_linux_rustos_ipc_reply_recv_with_sender(args_ptr: u64) -> 
             Err(error) => return linux_errno(ipc_error_to_linux_errno(error)),
         }
     }
+    // The fast branch above publishes in-kernel without a user copy and cannot
+    // be slow; only this path pays for the slow-call timing reads.
+    let start_ticks = crate::arch::rtc::ticks();
     let response = match copy_request_from_user(args.response_ptr, args.response_len) {
         Ok(response) => response,
         Err(errno) => return linux_errno(errno),

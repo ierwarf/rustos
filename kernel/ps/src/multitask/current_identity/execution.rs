@@ -52,6 +52,29 @@ impl BindingPin {
     pub(in crate::multitask) fn id(&self) -> u64 {
         self.id
     }
+    /// A second donation-class reference to the slot this pin already holds.
+    ///
+    /// `pin_donation` takes three nested leaves to prove the identity, then adds
+    /// one reference. A caller that already owns a pin on the same identity
+    /// (the executing sender of a synchronous call) needs only the reference:
+    /// the held pin keeps the count above zero, so the identity and its backing
+    /// cannot be cleared or reused while this one is taken. The admission gates
+    /// `pin_donation` checks under the writer (retired, cold exec intent) are
+    /// read from their lock-free publications and refuse identically.
+    pub(in crate::multitask) fn duplicate_donation(&self) -> Option<BindingPin> {
+        let slot = self.slot();
+        let published = super::read_dispatch(slot)?;
+        if published.task_id != Some(self.id)
+            || published.retired()
+            || super::exec_intent::busy(slot)
+        {
+            return None;
+        }
+        acquire(slot).map(|permit| BindingPin {
+            permit,
+            id: self.id,
+        })
+    }
 }
 pub(in crate::multitask) fn pin_creation(
     slot: usize,

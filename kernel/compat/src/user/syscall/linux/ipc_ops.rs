@@ -1349,7 +1349,6 @@ fn syscall_linux_rustos_ipc_call_with_timeout(
         reply_ptr,
         reply_capacity
     );
-    let start_ticks = crate::arch::rtc::ticks();
     let mut cycle_mark = phase_mark();
     // The first live fast-path tranche covers the ordinary synchronous ABI.
     // Bounded control calls retain the mature slow-path deadline transaction
@@ -1377,6 +1376,7 @@ fn syscall_linux_rustos_ipc_call_with_timeout(
         }
         cycle_mark = phase_mark();
     }
+    let start_ticks = crate::arch::rtc::ticks();
     let request = match copy_request_from_user(request_ptr, request_len) {
         Ok(request) => request,
         Err(errno) => return linux_errno(errno),

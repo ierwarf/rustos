@@ -10,6 +10,32 @@ impl<T: ?Sized, const CLASS: u8> Drop for TrackedSpinGuard<'_, T, CLASS> {
     fn drop(&mut self) {
         let profile_entry = lock_profile::now();
         #[cfg(rustos_boot_image)]
+        if self.lean {
+            let cpu = self.owner_cpu;
+            // IRQs are still masked, so the index cannot have changed.
+            assert_eq!(
+                current_cpu_index(),
+                cpu,
+                "raw-spin guard released on another CPU class={}",
+                CLASS
+            );
+            drop(self.guard.take());
+            with_current_stack_on(cpu, |stack| {
+                assert!(stack.len != 0, "lock-class release without acquisition");
+                let top = stack.classes[stack.len - 1];
+                assert_eq!(
+                    top, CLASS,
+                    "lock-class release order violation held={} released={}",
+                    top, CLASS
+                );
+                stack.len -= 1;
+                stack.classes[stack.len] = 0;
+            });
+            let observed = cpu_counter::dec(&CPU_LOCK_STATE[cpu].preempt_disable_depth);
+            assert!(observed != 0, "raw-spin preemption depth underflow");
+            return;
+        }
+        #[cfg(rustos_boot_image)]
         {
             // A `lock_masked` guard is released inside the same masked scope.
             let irq_enabled = !self.irqs_masked && x86_64::instructions::interrupts::are_enabled();

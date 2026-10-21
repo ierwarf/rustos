@@ -416,6 +416,24 @@ fn ticks_from_nanos(nanos: u64, hz: u64) -> u64 {
     .unwrap_or(u64::MAX)
 }
 
+/// [`monotonic_nanos`] for tick-resolution consumers: identical source,
+/// base and scaling, with an unordered TSC read on the invariant-TSC source.
+pub fn monotonic_nanos_coarse() -> u64 {
+    // ORDERING: Acquire pairs with the clocksource promotion exactly as in
+    // `monotonic_nanos`; the rate and base below were stored before it.
+    if SOURCE.load(Ordering::Acquire) == SOURCE_INVARIANT_TSC {
+        // ORDERING: Relaxed; published before the source (see above).
+        let hz = TSC_HZ.load(Ordering::Relaxed);
+        if hz == 0 {
+            return 0;
+        }
+        // ORDERING: Relaxed; published before the source (see above).
+        let delta = read_tsc_unordered().saturating_sub(TSC_BASE.load(Ordering::Relaxed));
+        return nanos_from_tsc_delta(delta, hz);
+    }
+    monotonic_nanos()
+}
+
 pub fn monotonic_nanos() -> u64 {
     match SOURCE.load(Ordering::Acquire) {
         SOURCE_INVARIANT_TSC => {
@@ -520,6 +538,30 @@ fn cpuid_tsc_frequency_hz() -> Option<u64> {
 
 fn read_hpet_counter(base: u64) -> u64 {
     unsafe { read_volatile((base as usize + HPET_MAIN_COUNTER_OFFSET) as *const u64) }
+}
+
+/// `rdtsc` without the leading `lfence`.
+///
+/// The fence waits for every earlier instruction to retire, which costs tens of
+/// ticks and drains the out-of-order window. Callers that sample at scheduler
+/// tick resolution (about a millisecond) cannot observe the few nanoseconds of
+/// reordering it prevents; the cross-CPU warp admission and nanosecond budget
+/// accounting keep the ordered read.
+#[inline]
+fn read_tsc_unordered() -> u64 {
+    let low: u32;
+    let high: u32;
+    // SAFETY: `rdtsc` reads the counter into two registers; it touches no
+    // memory and is permitted at CPL0 and, here, at CPL3 by CR4.TSD clear.
+    unsafe {
+        asm!(
+            "rdtsc",
+            out("eax") low,
+            out("edx") high,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    (u64::from(high) << 32) | u64::from(low)
 }
 
 fn read_tsc_ordered() -> u64 {

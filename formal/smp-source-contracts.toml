@@ -23,7 +23,7 @@ reason = "The entire legacy fault worker/floor/resume authority bodies are genui
 # loans/reader/CPU phase precede a bounded leaf join, never a fresh owner retry.
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/ipc_publication.rs"
-tokens = ["fn publish(", "let expected = runqueue::owner(slot)", "frame_publication::read_for_identity(token, binding.id(), cpu)", "context_validation::validate_published_saved_context(", "terminal_quarantine::publish(stop)", "dispatch_priority::Publication::begin(scope, target)", "current_identity::with_ipc_handoff_binding(slot, binding.id()", "runqueue::affinity_payload::with_placement_admission(", "sync_handoff::publish_original(", "typed.publish_and_clear(", "runqueue::claim_blocked_handoff(slot, expected, target, local)", "frame_publication::bind_local_owner_generation(slot, original.generation)", "runqueue::publish_handoff_mailbox(slot, original,", "drop(publication)", "drop(reader)", "request_target_reschedule(target)", "fn call_before_sender_commit(", "current_wait::CurrentWait::capture()", "sender.matches_armed_reply(reply)", "donation_publication::participant(sender.id())", "donation_publication::participant(receiver_id)", "wake_publication::Binding::from_original(receiver)", "runqueue::wait::TypedWake::capture(", "donation_publication::bind_original(", "publish(scope, &binding, &typed, target)", "before_commit()", "sender.commit()", "drop(typed)", "drop(binding)", "drop(donor)", "drop(sender)"]
+tokens = ["fn publish(", "let expected = runqueue::owner(slot)", "frame_publication::read_for_identity(token, binding.id(), cpu)", "context_validation::validate_published_saved_context(", "terminal_quarantine::publish(stop)", "dispatch_priority::Publication::begin(scope, target)", "current_identity::with_ipc_handoff_binding(slot, binding.id()", "runqueue::affinity_payload::with_placement_admission(", "sync_handoff::publish_original(", "typed.publish_and_clear(", "runqueue::claim_blocked_handoff(slot, expected, target, local)", "frame_publication::bind_local_owner_generation(slot, original.generation)", "runqueue::publish_handoff_mailbox(slot, original,", "drop(publication)", "drop(reader)", "request_target_reschedule(target)", "fn call_before_sender_commit(", "current_wait::CurrentWait::capture()", "sender.matches_armed_reply(reply)", "sender.original_pin().duplicate_donation()", "donation_publication::participant(receiver_id)", "wake_publication::Binding::from_original(receiver)", "runqueue::wait::TypedWake::capture(", "donation_publication::bind_original(", "publish(scope, &binding, &typed, target)", "before_commit()", "sender.commit()", "drop(typed)", "drop(binding)", "drop(donor)", "drop(sender)"]
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/runqueue/ipc_handoff.rs"
 tokens = ["fn claim_blocked_handoff(", "expected.state != RunOwnerState::Blocked || expected.wait_armed", "expected.next_preserving_wait(state, Some(cpu))", "OWNER_WORDS[slot].compare_exchange(expected, next).ok()?", "Some(next.with_wait(false, 0).with_runnable(true))", "fn publish_handoff_mailbox(", "generation: original.generation"]
@@ -1711,17 +1711,23 @@ reason = "test-only duplicate catalog banks and facade dereferences are also del
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/stack_resources/task_start.rs"
 tokens = [
+    "fn mirror_store(slot: usize, start: Option<TaskStart>)",
+    "mirror.seq.store(sequence.wrapping_add(2), Ordering::Release)",
     "fn read(slot: usize) -> Option<TaskStart>",
-    "RESOURCES.get(slot)?.with(|resources| resources.start)",
+    "START_MIRROR.get(slot)?",
+    "mirror.seq.load(Ordering::Acquire)",
+    "mirror.seq.load(Ordering::Relaxed) != before",
     "fn publish(slot: usize, start: TaskStart)",
     "!resources.closing",
     "resources.start.is_none_or(|old| old.id == start.id)",
     "resources.binding.is_none_or(|(id, _)| id == start.id)",
     "resources.start = Some(start)",
+    "mirror_store(slot, resources.start)",
     "fn clear(slot: usize)",
     "RESOURCES[slot].pins.load(Ordering::Acquire)",
     "resources.start.is_none() || resources.closing",
     "resources.start = None",
+    "mirror_store(slot, None)",
 ]
 
 [[required_sequences]]

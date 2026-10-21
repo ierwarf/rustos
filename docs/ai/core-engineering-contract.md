@@ -136,6 +136,11 @@ waits still use finite provider calls and remain interruptible/revocable.
 - Sleepable locks may not be acquired in IRQ context or while a raw class is
   held. Lock order must be visible to lockdep; do not bypass it with an
   untracked lock or hand-written spinning.
+- Lock-order, IRQ-class and recursion validation (`lock_with`) runs in host,
+  test and hardening builds. Shipping images acquire an IRQ-masked class through
+  the lean path (`lockdep/lean_acquire.rs`), which keeps preemption depth, the
+  held-class stack, release order and CPU affinity but not the dependency graph.
+  A new lock still declares its class so the full validation can prove it.
 - Never split an atomic scheduler transition into “commit now, yield later.”
 - Never conflate a task that is still executing with an outgoing
   stack-transition owner: their wake publication rules differ. Never expose a

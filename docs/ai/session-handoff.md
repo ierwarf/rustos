@@ -49,6 +49,50 @@ benefits require matched original-tree controls.
   RustOS's guards. This larger redesign is only a proposal, NOT implemented;
   avoid a blind all-at-once atomic/RCU conversion.
 
+### IPC budget stalls, lean locks, lock-free task start (uncommitted) — 2026-10-21
+- Files: `scheduler/scheduling_context.rs`, `stack_resources.rs`,
+  `stack_resources/task_start.rs`, `ipc_publication.rs`,
+  `current_identity/execution.rs`, `current_identity.rs`,
+  `nucleus-core/src/util/lockdep.rs` + `lockdep/{lean_acquire,guard_release}.rs`,
+  `hal/src/arch/{clock,rtc}.rs`, `compat/.../ipc_ops.rs`, `ipc_reply_recv.rs`,
+  `services/rootd/src/service_manifest.rs`, `formal/{implementation-mutations.tsv,
+  smp-source-contracts.toml,run-source-conformance.sh}`. New file:
+  `lockdep/lean_acquire.rs` (add it to the commit).
+- Budget stalls (13 ms, 55% of the old 8-vCPU mean): refills were dated from
+  settlement and a full 8-entry queue merged a burst into its newest entry.
+  Refills are now dated one period after usage began; contiguous usage keeps its
+  run start. Ordinary-app share is 10/10 ms (work-conserving; System still wins).
+  Witnesses include a randomized windowed-consumption property test
+  (`refill_queue_conserves_credit_and_never_hands_out_early_authority`); its
+  bound is budget + one settled interval (settlement-time replenish).
+- Lean locks: in shipping images `lock_masked`, and `lock()` with IF clear, use
+  a minimal acquire (CPU-private depth, held-class push, spin) and a matching
+  release that keeps the CPU-affinity and class-order assertions. Lock-order
+  graph, IRQ classification, recursion scan and guard identity capture remain in
+  host, test and hardening paths (`lock_with`). The owner approved turning these
+  off in shipping images. Measured: tracked leaf lock 158 ticks; 1-vCPU fused
+  round trip p50 59.2k -> 43.4k.
+- Smaller: `task_start::read` is a seqlock mirror (torn-read test + 2 anchors);
+  duplicate `eligible()` removed; the sender donor loan comes from the held pin
+  (`duplicate_donation`, 2 tests + anchor); `rtc::ticks()` uses an unordered TSC
+  read (`monotonic_nanos_coarse`); slow-call clock reads moved off fast paths.
+- 8-vCPU full bench, session start -> final clean run (cpuid anchor 4,400), mean
+  ticks: `reply_recv` 270,698 -> 45,300 (p50 44.5k, max 275k); intra_process
+  331,543 -> 62,543; cross-process getuid 287,699 -> 55,208; sched_yield 18,360
+  -> 12,745. Host anchor noise is large (cpuid min 4,400-7,320): compare
+  same-session. The 1-vCPU unisolated bench carries background desktop tasks and
+  is not comparable; use `--isolate-probe`.
+- Validation: native tests (nucleus-core, hal, kernel-ps 958, compat, rootd),
+  dev-plan now lane 611/611, PR gate sealed, 8-vCPU `kvm-smoke --smp-iteration
+  --gui-dvm-surfaces --exercise-input` passed twice.
+- Remaining ~43k (1 vCPU): two sync handoffs ~16k each. Per handoff: publication
+  ~4.5k, prologue ~1.7k, FIFO select ~1.3k, claim ~3.6k, complete ~0.6k, trap +
+  SIMD save/restore + install ~4.5k; non-dispatch syscall layers ~11k. A masked
+  leaf lock is now far cheaper; a pin (3 leaves) ~300, a clock read ~50-85 (about
+  30 per round trip, 7 per dispatch). Next session: the direct-switch path
+  (carry the publication reader/binding into selection and claim, keep funding
+  across a call/reply pair, fuse publication/select/claim), lazy SIMD.
+
 ## Open questions at the snapshot boundary
 
 - An earlier 8-vCPU cold-boot series saw two

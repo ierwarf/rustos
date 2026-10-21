@@ -505,6 +505,7 @@ fn take_storage_with_reservation(
             "task descriptor detached without closing"
         );
         resources.start = None;
+        task_start::mirror_store(slot, None);
         resources.binding = None;
         resources.closing = resources.reclaim.is_some();
         RESOURCES[slot]

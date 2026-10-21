@@ -131,8 +131,10 @@ struct Refill {
 
 /// Time-ordered sporadic-server replenishments.
 ///
-/// When full, a new refill is merged into the latest eligibility point.  This
-/// can delay execution authority, but cannot move it earlier or create time.
+/// A refill is dated one period after its usage began. When full, usage that
+/// continues the newest entry's contiguous run joins it and keeps the run's
+/// start; usage after a gap is merged at the later eligibility point. Neither
+/// creates time, and a gap can only delay execution authority.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct BoundedRefillQueue {
     entries: [Refill; MAX_SCHEDULING_CONTEXT_REFILLS],
@@ -196,6 +198,18 @@ impl BoundedRefillQueue {
         let Some(amount_ns) = latest.amount_ns.checked_add(refill.amount_ns) else {
             return false;
         };
+        // Usage that begins inside the newest entry's own usage window
+        // [eligible - period, eligible - period + amount) continues that
+        // window: the union is one contiguous run, and a sporadic server
+        // returns a contiguous run as one refill one period after the run
+        // began. Moving the run's start later instead (the rule for usage
+        // after a gap, below) delayed a whole IPC burst by its own length:
+        // thousands of handoff charges overflow eight entries, and everything
+        // after the eighth waited a period past the end of the burst.
+        if refill.eligible_ns <= latest.eligible_ns.saturating_add(latest.amount_ns) {
+            latest.amount_ns = amount_ns;
+            return true;
+        }
         latest.eligible_ns = latest.eligible_ns.max(refill.eligible_ns);
         latest.amount_ns = amount_ns;
         true
@@ -362,8 +376,16 @@ impl BudgetState {
         self.available_ns -= charged_ns;
         self.consumed_ns = self.consumed_ns.checked_add(charged_ns)?;
         if charged_ns != 0 {
+            // Sporadic-server rule: consumed time returns one period after the
+            // consumption BEGAN. Charges settle at scheduler turns, and a
+            // synchronous IPC handoff chain makes one interval span many
+            // milliseconds; dating the refill from the settlement instead made
+            // every such interval wait an extra interval, a full period of
+            // forced idleness after each exhaustion.
             let refill = Refill {
-                eligible_ns: now_ns.checked_add(self.policy.period_ns)?,
+                eligible_ns: now_ns
+                    .saturating_sub(elapsed_ns)
+                    .checked_add(self.policy.period_ns)?,
                 amount_ns: charged_ns,
             };
             let was_full = self.refills.len == self.refills.capacity;
@@ -791,7 +813,7 @@ mod tests {
         let _runtime = super::super::scheduling_runtime::test_serial_guard();
         let mut state =
             BudgetState::admitted(policy(4), BudgetCounterScope::Context).expect("valid policy");
-        let outcome = state.charge(100, 1_500).expect("bounded charge");
+        let outcome = state.charge(1_600, 1_500).expect("bounded charge");
         assert_eq!(outcome.charged_ns, 1_500);
         assert_eq!(outcome.overrun_ns, 0);
         assert_eq!(state.conserved_ns(), Some(4_000));
@@ -808,7 +830,7 @@ mod tests {
         let _runtime = super::super::scheduling_runtime::test_serial_guard();
         for scope in [BudgetCounterScope::Context, BudgetCounterScope::Domain] {
             let mut state = BudgetState::admitted(policy(4), scope).expect("valid policy");
-            assert!(state.charge(100, 4_000).is_some());
+            assert!(state.charge(4_100, 4_000).is_some());
             assert_eq!(state.available_ns, 0);
             assert_eq!(state.next_eligible_ns(), Some(10_100));
 
@@ -830,7 +852,7 @@ mod tests {
         let _runtime = super::super::scheduling_runtime::test_serial_guard();
         let mut state =
             BudgetState::admitted(policy(4), BudgetCounterScope::Context).expect("valid policy");
-        assert!(state.charge(100, 4_000).is_some());
+        assert!(state.charge(4_100, 4_000).is_some());
         assert_eq!(state.available_ns, 0);
         assert_eq!(state.next_eligible_ns(), Some(10_100));
         // A due refill can make a *later* catalog scan eligible after an
@@ -842,14 +864,140 @@ mod tests {
         assert!(!state.is_eligible(10_099));
     }
 
+    /// A CPU-bound task that runs whenever it holds budget and settles in
+    /// random-sized intervals, with random idle gaps. Whatever the refill queue
+    /// merges: credit is conserved, the queue stays time-ordered, and no window
+    /// of one period contains more consumption than the budget plus one settled
+    /// interval. That slack is the tick-granular enforcement point itself: a
+    /// settlement replenishes at the interval's end, so a refill that became
+    /// eligible mid-interval funds the tail that ran after the previous budget
+    /// was spent. Consumption is counted where it happened -- the charged part
+    /// of a settled interval is its first part; the rest is uncredited overrun.
+    #[test]
+    fn refill_queue_conserves_credit_and_never_hands_out_early_authority() {
+        let _runtime = super::super::scheduling_runtime::test_serial_guard();
+        const BUDGET: u64 = 4_000;
+        const PERIOD: u64 = 10_000;
+        const MAX_INTERVAL: u64 = 1_500;
+        for capacity in [1_u8, 2, 3, 8] {
+            for seed in 1_u64..=12 {
+                let mut state = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) | 1;
+                let mut next = move || {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    state
+                };
+                let mut budget = BudgetState::admitted(policy(capacity), BudgetCounterScope::Context)
+                    .expect("valid policy");
+                let mut now = 0_u64;
+                // Where the credited consumption actually ran: [start, start + charged).
+                let mut consumed = [(0_u64, 0_u64); 1_500];
+                let mut consumed_len = 0;
+                for _ in 0..1_500 {
+                    assert!(budget.replenish(now));
+                    if budget.available_ns == 0 {
+                        // Idle until the next refill is eligible.
+                        now = budget.next_eligible_ns().expect("empty budget has a refill").max(now);
+                        continue;
+                    }
+                    if next() % 4 == 0 {
+                        now += next() % 3_000;
+                        assert!(budget.replenish(now));
+                    }
+                    let elapsed = 1 + next() % MAX_INTERVAL;
+                    let start = now;
+                    now += elapsed;
+                    let outcome = budget.charge(now, elapsed).expect("bounded charge");
+                    assert!(outcome.charged_ns <= elapsed);
+                    if outcome.charged_ns != 0 {
+                        consumed[consumed_len] = (start, start + outcome.charged_ns);
+                        consumed_len += 1;
+                    }
+                    assert_eq!(budget.conserved_ns(), Some(BUDGET), "credit not conserved");
+                    let entries = &budget.refills.entries[..usize::from(budget.refills.len)];
+                    assert!(
+                        entries.windows(2).all(|pair| pair[0].eligible_ns <= pair[1].eligible_ns),
+                        "refill queue lost time order: {entries:?}"
+                    );
+                }
+                let consumed = &consumed[..consumed_len];
+                for &(_, window_end) in consumed {
+                    let window_start = window_end.saturating_sub(PERIOD);
+                    let in_window: u64 = consumed
+                        .iter()
+                        .map(|&(lo, hi)| hi.min(window_end).saturating_sub(lo.max(window_start)))
+                        .sum();
+                    assert!(
+                        in_window <= BUDGET + MAX_INTERVAL,
+                        "capacity {capacity} seed {seed}: {in_window} ns consumed in one period"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn long_settlement_interval_replenishes_from_its_start() {
+        let _runtime = super::super::scheduling_runtime::test_serial_guard();
+        let mut state =
+            BudgetState::admitted(policy(4), BudgetCounterScope::Context).expect("valid policy");
+        // A synchronous IPC handoff chain settles one interval of 12_000 ns
+        // against a 4_000 ns budget and a 10_000 ns period. The consumption
+        // began at time 0, so it returns at 10_000, not one period after the
+        // settlement at 22_000.
+        let outcome = state.charge(12_000, 12_000).expect("bounded charge");
+        assert_eq!(outcome.charged_ns, 4_000);
+        assert_eq!(outcome.overrun_ns, 8_000);
+        assert!(outcome.exhausted);
+        assert_eq!(state.next_eligible_ns(), Some(10_000));
+        assert!(state.is_eligible(12_000));
+        assert!(!state.is_eligible(9_999));
+        assert_eq!(state.conserved_ns(), Some(4_000));
+    }
+
+    #[test]
+    fn contiguous_overflow_keeps_the_run_start_but_a_gap_still_moves_authority_later() {
+        let _runtime = super::super::scheduling_runtime::test_serial_guard();
+        let mut state =
+            BudgetState::admitted(policy(2), BudgetCounterScope::Context).expect("valid policy");
+        // Back-to-back usage [0,1000), [1000,2000), [2000,3000): one run.
+        assert!(state.charge(1_000, 1_000).is_some());
+        assert!(state.charge(2_000, 1_000).is_some());
+        assert!(state.charge(3_000, 1_000).is_some());
+        assert_eq!(state.refills.len, 2);
+        assert_eq!(
+            state.refills.entries[1],
+            Refill {
+                eligible_ns: 11_000,
+                amount_ns: 2_000
+            }
+        );
+        // Usage after a gap [5000,6000) starts outside the run [1000,3000).
+        let mut gapped =
+            BudgetState::admitted(policy(2), BudgetCounterScope::Context).expect("valid policy");
+        assert!(gapped.charge(1_000, 1_000).is_some());
+        assert!(gapped.charge(2_000, 1_000).is_some());
+        assert!(gapped.charge(6_000, 1_000).is_some());
+        assert_eq!(
+            gapped.refills.entries[1],
+            Refill {
+                eligible_ns: 15_000,
+                amount_ns: 2_000
+            }
+        );
+        assert_eq!(gapped.conserved_ns(), Some(4_000));
+    }
+
     #[test]
     fn refill_overflow_moves_authority_later_without_creating_time() {
         let _runtime = super::super::scheduling_runtime::test_serial_guard();
         let mut state =
             BudgetState::admitted(policy(2), BudgetCounterScope::Context).expect("valid policy");
-        assert!(state.charge(100, 1_000).is_some());
-        assert!(state.charge(200, 1_000).is_some());
-        assert!(state.charge(300, 1_000).is_some());
+        assert!(state.charge(1_100, 1_000).is_some());
+        assert!(state.charge(1_200, 1_000).is_some());
+        // Usage after a gap starts outside the newest run.
+        assert!(state.charge(5_300, 1_000).is_some());
         assert_eq!(state.refills.len, 2);
         assert_eq!(
             state.refills.entries[0],
@@ -861,7 +1009,7 @@ mod tests {
         assert_eq!(
             state.refills.entries[1],
             Refill {
-                eligible_ns: 10_300,
+                eligible_ns: 14_300,
                 amount_ns: 2_000
             }
         );
@@ -869,7 +1017,8 @@ mod tests {
         assert_eq!(state.conserved_ns(), Some(4_000));
         assert!(state.replenish(10_200));
         assert_eq!(state.available_ns, 2_000);
-        assert!(state.replenish(10_300));
+        assert_eq!(state.available_ns, 2_000);
+        assert!(state.replenish(14_300));
         assert_eq!(state.available_ns, 4_000);
     }
 
@@ -923,11 +1072,11 @@ mod tests {
         let generation = super::super::scheduling_runtime::initialize_domain(63, policy)
             .expect("domain admission");
         let first = super::super::scheduling_runtime::charge_domain_runtime(
-            63, generation, policy, 0, 100, 2_500,
+            63, generation, policy, 0, 2_600, 2_500,
         )
         .expect("first charge");
         let second = super::super::scheduling_runtime::charge_domain_runtime(
-            63, generation, policy, 0, 200, 2_500,
+            63, generation, policy, 0, 2_700, 2_500,
         )
         .expect("second charge");
         assert_eq!(first.charged_ns, 2_500);

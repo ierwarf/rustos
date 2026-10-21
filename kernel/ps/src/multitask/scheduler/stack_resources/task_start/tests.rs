@@ -205,3 +205,47 @@ fn concurrent_entry_refresh_never_changes_the_monotonic_task_binding() {
     clear(slot);
     drop(take_storage(slot));
 }
+
+fn tear_a(x: u64) {
+    core::hint::black_box(x.wrapping_add(1));
+}
+fn tear_b(x: u64) {
+    core::hint::black_box(x.wrapping_add(2));
+}
+
+/// The lock-free mirror pairs one task id with its own entry: a reader racing a
+/// writer that alternates two descriptors (and an empty state) never observes
+/// the id of one with the entry of the other.
+#[test]
+fn mirror_read_never_tears_id_and_entry_under_a_racing_writer() {
+    use core::sync::atomic::AtomicBool;
+    let _serial = super::super::super::scheduling_runtime::test_serial_guard();
+    let slot = 93;
+    let a = TaskStart { entry: tear_a, id: 1 };
+    let b = TaskStart { entry: tear_b, id: 2 };
+    let done = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            for i in 0..200_000_u32 {
+                mirror_store(slot, Some(if i % 2 == 0 { a } else { b }));
+                if i % 7 == 0 {
+                    mirror_store(slot, None);
+                }
+            }
+            done.store(true, Ordering::Release);
+        });
+        for _ in 0..2 {
+            scope.spawn(|| {
+                while !done.load(Ordering::Acquire) {
+                    if let Some(start) = read(slot) {
+                        let consistent = (start.id == 1 && start.entry as *const () as usize == tear_a as *const () as usize)
+                            || (start.id == 2 && start.entry as *const () as usize == tear_b as *const () as usize);
+                        assert!(consistent, "torn descriptor id={} ", start.id);
+                    }
+                }
+            });
+        }
+    });
+    mirror_store(slot, None);
+    assert!(read(slot).is_none());
+}

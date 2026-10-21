@@ -48,6 +48,46 @@ fn actual_current_wait_reuses_original_custody_without_resource_reacquisition() 
 }
 
 #[test]
+fn actual_donor_loan_duplicates_the_held_pin_without_resource_reacquisition() {
+    use nucleus_core::util::lockdep::{LockClass, work_budget};
+    root(true, |slot| {
+        let wait = capture().unwrap();
+        let refs = identity::execution::count(slot);
+        let budget = work_budget::declare(LockClass::TaskStackResources, 0);
+        let duplicate = wait
+            .original_pin()
+            .duplicate_donation()
+            .expect("a live executing sender duplicates its own pin");
+        assert_eq!((duplicate.slot(), duplicate.id()), (slot, ID));
+        assert_eq!(identity::execution::count(slot), refs + 1);
+        assert_eq!(budget.used(), Some(0), "duplicate must not take a resource leaf");
+        drop(duplicate);
+        assert_eq!(identity::execution::count(slot), refs);
+    });
+}
+#[test]
+fn actual_donor_loan_duplicate_refuses_a_retired_task_like_a_fresh_donation_pin() {
+    root(true, |slot| {
+        let wait = capture().unwrap();
+        let refs = identity::execution::count(slot);
+        assert!(identity::update_live_lifecycle(
+            slot,
+            ID,
+            identity::LifecycleGate::Retired,
+            true
+        ));
+        assert!(wait.original_pin().duplicate_donation().is_none());
+        assert!(identity::execution::pin_donation(slot, ID).is_none());
+        assert_eq!(identity::execution::count(slot), refs, "a refusal spends no reference");
+        assert!(identity::update_live_lifecycle(
+            slot,
+            ID,
+            identity::LifecycleGate::Retired,
+            false
+        ));
+    });
+}
+#[test]
 fn actual_current_wait_arm_cancel_retains_original_bank_uid_and_exact_reason() {
     root(true, |slot| {
         let refs = identity::execution::count(slot);

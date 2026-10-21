@@ -50,15 +50,18 @@ const fn scheduling_policy(
     )
 }
 
-/// Ordinary applications: best-effort criticality with an 80% per-CPU share.
-/// User-class selection already yields to every System service, so this
-/// budget only bounds how long one application can hold a CPU without a gap.
-/// The former 2 ms (20%) share throttled a CPU-bound application to a fifth of
-/// an otherwise idle CPU: the kernel parked the CPU on idle while the task
-/// waited for its refill, which made every ordinary workload, ipcbench
-/// included, five times slower than its own cost.
+/// Ordinary applications: best-effort criticality with a full per-CPU share.
+/// User-class selection already yields to every System service, so this budget
+/// only accounts for how long one application holds a CPU; it must never idle
+/// a CPU that has nothing else to run. A general-purpose scheduler is
+/// work-conserving: the former 2 ms (20%) share and then the 8 ms (80%) share
+/// parked the CPU on idle while the task waited for its refill, which made
+/// every ordinary workload, ipcbench included, slower than its own cost (a
+/// fifth of the CPU at 2 ms, and a forced 2 ms gap per 10 ms at 8 ms).
+/// Budget equal to period is a valid policy: a continuous run is refilled one
+/// period after it began, which is exactly when it would exhaust.
 pub(super) const USER_WORKLOAD_SCHEDULING_POLICY: RustosSchedulingContextPolicy =
-    scheduling_policy(USER_WORKLOAD_DOMAIN, 8_000_000, 0);
+    scheduling_policy(USER_WORKLOAD_DOMAIN, SCHEDULING_PERIOD_NS, 0);
 
 #[derive(Clone, Copy)]
 pub(super) struct BootstrapServiceSpec {

@@ -509,7 +509,7 @@ ipc_fast_handoff_body="$(cat kernel/ps/src/multitask/scheduler/ipc_publication.r
 if ! grep -Fq 'let previous = receiver_owner.cpu.unwrap_or_else' <<<"$ipc_fast_handoff_body" \
     || ! grep -Fq 'runqueue::affinity_payload::last_cpu(binding.slot())' <<<"$ipc_fast_handoff_body" \
     || ! grep -Fq 'if eligible(&binding, cpu) { cpu } else { previous }' <<<"$ipc_fast_handoff_body" \
-    || ! grep -Fq 'if !eligible(&binding, target)' <<<"$ipc_fast_handoff_body" \
+    || ! grep -Fq 'if target != cpu && !eligible(&binding, target)' <<<"$ipc_fast_handoff_body" \
     || ! grep -Fq 'runqueue::claim_blocked_handoff(slot, expected, target, local)' <<<"$ipc_fast_handoff_body" \
     || ! grep -Fq 'runqueue::publish_handoff_mailbox(slot, original,' <<<"$ipc_fast_handoff_body" \
     || ! grep -Fq 'request_target_reschedule(target)' <<<"$ipc_fast_handoff_body"; then

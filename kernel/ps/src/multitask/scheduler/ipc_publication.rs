@@ -249,7 +249,9 @@ fn call_before_sender_commit(
     if !sender.matches_armed_reply(reply) || sender.id() == receiver_id {
         return Outcome::SenderMismatch;
     }
-    let Some(donor) = donation_publication::participant(sender.id()) else {
+    // The sender already holds an executing-bank pin; take the donor loan from
+    // it instead of re-proving the same identity through three leaves.
+    let Some(donor) = sender.original_pin().duplicate_donation() else {
         return Outcome::DonationUnavailable;
     };
     let Some(receiver) = donation_publication::participant(receiver_id) else {
@@ -275,8 +277,10 @@ fn call_before_sender_commit(
         let last = runqueue::affinity_payload::last_cpu(binding.slot());
         if last == NO_IDLE_CPU { cpu } else { usize::from(last) }
     });
+    // The local CPU is the common target; its eligibility was just proven, so
+    // only a different (previous) CPU needs its own check.
     let target = if eligible(&binding, cpu) { cpu } else { previous };
-    if !eligible(&binding, target) { return Outcome::EligibilityUnavailable; }
+    if target != cpu && !eligible(&binding, target) { return Outcome::EligibilityUnavailable; }
     if let Err(outcome) = publish(scope, &binding, &typed, target) { return outcome; }
     // A racing reverse reply may already have won. NEVER overwrite WakeWon
     // with scalar set_blocked; the original Current wait CAS arbitrates once.
