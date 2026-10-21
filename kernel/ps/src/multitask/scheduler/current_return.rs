@@ -163,9 +163,11 @@ impl<'a> CurrentReturn<'a> {
         runtime_profile::owner::local(|row| row.account(self.slot, elapsed));
         #[cfg(rustos_scheduler_phase_profile)]
         let budget_start = crate::arch::clock::monotonic_nanos();
-        if let Some((id, outcome)) = interval
-            .and_then(|interval| interval.charge(crate::arch::clock::monotonic_nanos(), elapsed))
-        {
+        if let Some((id, outcome)) = interval.and_then(|interval| {
+            let span = interval.charge_elapsed_ns(
+                now_ticks, crate::arch::clock::scheduler_local_nanos(), ticks_to_ns);
+            interval.charge(crate::arch::clock::monotonic_nanos(), span)
+        }) {
             if outcome.exhausted && outcome.charged_ns != 0 {
                 scheduling_context::latch_budget_exhaustion(id, outcome.charged_ns);
             }

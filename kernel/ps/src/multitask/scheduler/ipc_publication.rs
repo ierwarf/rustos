@@ -141,26 +141,42 @@ pub(super) fn eligible(binding: &wake_publication::Binding, cpu: usize) -> bool 
     })
 }
 
-/// The ORIGINAL receiver and pending phase survive validation, the leaf join,
-/// exact frame generation publication, remote mailbox and final notification.
-fn publish(
-    scope: &DispatchPreemption<'_>,
-    binding: &wake_publication::Binding,
-    typed: &runqueue::wait::TypedWake<'_>,
-    target: usize,
-) -> Result<(), FastIpcCallHandoffOutcome> {
-    publish_with(scope, binding, typed, target, || {})
-}
-
-/// Common exact typed receiver producer. The original receiver reader, pending
-/// wait phase and publication custody also enclose the caller's last effect.
-/// This is not endpoint or donation-ledger admission.
+/// Common exact typed receiver producer. The ORIGINAL receiver reader, pending
+/// wait phase and publication custody survive validation, the leaf join, exact
+/// frame generation publication, remote mailbox and final notification, and
+/// also enclose the caller's last effect. This is not endpoint or
+/// donation-ledger admission.
 pub(super) fn publish_with(
     scope: &DispatchPreemption<'_>,
     binding: &wake_publication::Binding,
     typed: &runqueue::wait::TypedWake<'_>,
     target: usize,
     last_effect: impl FnOnce(),
+) -> Result<(), FastIpcCallHandoffOutcome> {
+    publish_switching(scope, binding, typed, target, last_effect, None)
+}
+
+/// A same-CPU handoff may skip the FIFO record only when selection would take
+/// it first anyway: nothing older is queued for this CPU, no activation prefix
+/// outranks it, and the bounded chain does not owe a fair competitor a turn.
+/// All of this is CPU-private state of the SAME masked scheduler transaction.
+pub(super) fn direct_switch_admitted(cpu: usize) -> bool {
+    !sync_handoff::pending(cpu) && !dispatch_policy::atomic_activation_pending(cpu)
+        && !(sync_handoff::chain::chain_exhausted(cpu) && local_dispatch::local_fair_competitor_ready(cpu))
+}
+
+/// `publish_with` that may hand its receiver reader to the dispatcher instead
+/// of a FIFO record: a same-CPU receiver is committed DirectHandoff and the
+/// still-held reader, not a re-captured one, becomes its selected frame.
+/// Nothing fails after the owner CAS: if the switch cannot be built, the
+/// ordinary FIFO record is published for it.
+pub(super) fn publish_switching(
+    scope: &DispatchPreemption<'_>,
+    binding: &wake_publication::Binding,
+    typed: &runqueue::wait::TypedWake<'_>,
+    target: usize,
+    last_effect: impl FnOnce(),
+    switch: Option<&mut Option<dispatch_claim::DirectSwitch>>,
 ) -> Result<(), FastIpcCallHandoffOutcome> {
     use FastIpcCallHandoffOutcome as Outcome;
     let cpu = scope.cpu();
@@ -182,9 +198,9 @@ pub(super) fn publish_with(
     }) {
         return Err(Outcome::DirectCustodyUnavailable);
     }
-    if let Err(reason) = context_validation::validate_published_saved_context(
-        slot, token.saved_rsp, token.view,
-    ) {
+    let (validation, return_to_user) = dispatch_claim::validate_held_frame(
+        slot, token.saved_rsp, token.view, &reader);
+    if let Err(reason) = validation {
         let stop = terminal_quarantine::begin(slot, Some(binding.id()),
             TaskRetireReason::CorruptedContext { saved_rsp: token.saved_rsp, reason,
                 reason_code: context_validation_reason_code(reason) }, false);
@@ -195,12 +211,19 @@ pub(super) fn publish_with(
         return Err(Outcome::DirectCustodyUnavailable);
     }
     let local = target == cpu;
+    let fused = local && switch.is_some() && direct_switch_admitted(cpu);
     // Priority publication waits OUTSIDE every raw leaf, retaining this SAME
     // original CPU scope and reader. A choice already in flight publishes its
-    // Current/Transition pair before this FIFO may become visible.
-    let publication = dispatch_priority::Publication::begin(scope, target);
+    // Current/Transition pair before this FIFO may become visible. A fused
+    // switch makes nothing visible to any dispatcher but this CPU's own.
+    let publication = (!fused).then(|| dispatch_priority::Publication::begin(scope, target));
     let original = current_identity::with_ipc_handoff_binding(slot, binding.id(), || {
         runqueue::affinity_payload::with_placement_admission(slot, Some(binding.id()), target, || {
+            if fused {
+                return typed.publish_and_clear(|| {
+                    runqueue::claim_blocked_handoff(slot, expected, target, local)
+                });
+            }
             sync_handoff::publish_original(target,
                 sync_handoff::SyncHandoffRecord::new(slot, binding.id()), || {
                     typed.publish_and_clear(|| {
@@ -218,7 +241,31 @@ pub(super) fn publish_with(
     runqueue::wait::set_blocked_since_ticks(slot, 0);
     last_effect();
     drop(publication);
-    drop(reader);
+    match switch.filter(|_| fused) {
+        Some(out) => {
+            // SAFETY: this reader was acquired for this receiver on this masked
+            // CPU, never released, and validated just above at the same RSP.
+            let adopted = match frame_publication::direct_handoff_frame_token(slot, cpu) {
+                Some(now) => unsafe {
+                    dispatch_claim::FrameSelection::from_held(cpu, binding.id(), now,
+                        token.saved_rsp, return_to_user, reader)
+                },
+                None => Err(reader),
+            };
+            match adopted {
+                Ok(selection) => *out = Some(dispatch_claim::DirectSwitch::new(selection)),
+                Err(reader) => {
+                    // Ordinary FIFO custody for the committed owner; the dispatcher
+                    // re-captures this frame exactly as for any other handoff.
+                    let _publication = dispatch_priority::Publication::begin(scope, target);
+                    let _ = sync_handoff::enqueue(target,
+                        sync_handoff::SyncHandoffRecord::new(slot, binding.id()));
+                    drop(reader);
+                }
+            }
+        }
+        None => drop(reader),
+    }
     #[cfg(not(test))]
     if notify { crate::multitask::irq::request_target_reschedule(target); }
     #[cfg(test)]
@@ -235,9 +282,26 @@ pub(in crate::multitask) fn call(
     call_before_sender_commit(scope, endpoint, reply, receiver_id, || {})
 }
 
+/// Call trap entry that lets a committed same-CPU handoff carry its receiver
+/// frame loan straight into this turn's selection through `switch`.
+pub(in crate::multitask) fn call_switching(
+    scope: &DispatchPreemption<'_>, endpoint: u64, reply: u64, receiver_id: u64,
+    switch: &mut Option<dispatch_claim::DirectSwitch>,
+) -> FastIpcCallHandoffOutcome {
+    let _phase = super::runtime_profile::phase_scope(super::SchedulerPhase::IpcCallPublication);
+    call_published(scope, endpoint, reply, receiver_id, || {}, Some(switch))
+}
+
 fn call_before_sender_commit(
     scope: &DispatchPreemption<'_>, endpoint: u64, reply: u64, receiver_id: u64,
     before_commit: impl FnOnce(),
+) -> FastIpcCallHandoffOutcome {
+    call_published(scope, endpoint, reply, receiver_id, before_commit, None)
+}
+
+fn call_published(
+    scope: &DispatchPreemption<'_>, endpoint: u64, reply: u64, receiver_id: u64,
+    before_commit: impl FnOnce(), switch: Option<&mut Option<dispatch_claim::DirectSwitch>>,
 ) -> FastIpcCallHandoffOutcome {
     use FastIpcCallHandoffOutcome as Outcome;
     if !scoped(scope) || endpoint == 0 || reply == 0 { return Outcome::SenderMismatch; }
@@ -281,7 +345,9 @@ fn call_before_sender_commit(
     // only a different (previous) CPU needs its own check.
     let target = if eligible(&binding, cpu) { cpu } else { previous };
     if target != cpu && !eligible(&binding, target) { return Outcome::EligibilityUnavailable; }
-    if let Err(outcome) = publish(scope, &binding, &typed, target) { return outcome; }
+    if let Err(outcome) = publish_switching(scope, &binding, &typed, target, || {}, switch) {
+        return outcome;
+    }
     // A racing reverse reply may already have won. NEVER overwrite WakeWon
     // with scalar set_blocked; the original Current wait CAS arbitrates once.
     before_commit();
@@ -309,12 +375,66 @@ pub(super) fn reply_with(
     scope: &DispatchPreemption<'_>, reply: u64, caller: u64, context_owner: u64,
     context: ObjectIdentity, eligible_cpus: &dyn Fn(usize) -> u64,
 ) -> Option<FastIpcReplyHandoffOutcome> {
+    reply_published(scope, reply, caller, context_owner, context, eligible_cpus, None)
+}
+
+/// Reply trap entry that lets a recently blocked same-CPU caller's frame loan
+/// travel straight into this turn's selection through `switch`.
+pub(in crate::multitask) fn reply_switching(
+    scope: &DispatchPreemption<'_>, reply: u64, caller: u64, context_owner: u64,
+    context: ObjectIdentity, switch: &mut Option<dispatch_claim::DirectSwitch>,
+) -> Option<FastIpcReplyHandoffOutcome> {
+    let _phase = super::runtime_profile::phase_scope(super::SchedulerPhase::IpcReplyPublication);
+    reply_published(scope, reply, caller, context_owner, context,
+        &runqueue_policy::online_affinity_mask, Some(switch))
+}
+
+pub(super) fn reply_published(
+    scope: &DispatchPreemption<'_>, reply: u64, caller: u64, context_owner: u64,
+    context: ObjectIdentity, eligible_cpus: &dyn Fn(usize) -> u64,
+    switch: Option<&mut Option<dispatch_claim::DirectSwitch>>,
+) -> Option<FastIpcReplyHandoffOutcome> {
     if !scoped(scope) { return None; }
     let (exact, live) = task_directory::reply_context_custody(context_owner, context);
     if !exact && live { return None; }
-    Some(if wake_publication::reply_with(scope, reply, caller, eligible_cpus) {
+    Some(if wake_publication::reply_switching(scope, reply, caller, eligible_cpus, switch) {
         FastIpcReplyHandoffOutcome::LocalFallback
     } else { FastIpcReplyHandoffOutcome::Rejected })
+}
+
+/// Blocked within the last millisecond; `since == 0` means no commit time was
+/// recorded, which the ordinary wake must interpret.
+pub(super) const fn recent_sleeper(since: u64, now: u64, ticks_per_second: u64) -> bool {
+    since != 0 && now.saturating_sub(since) <= ticks_per_second / 1000
+}
+
+/// Wake the caller blocked on `reply` straight into DirectHandoff custody. The
+/// ordinary reply wake additionally lifts a long sleeper's virtual-time floor
+/// and files blocked-wait telemetry, so only a caller that blocked within the
+/// last millisecond on this CPU, which the synchronous wake policy would keep
+/// here, qualifies. Everything else, and any refusal before the owner CAS
+/// (which preserves the wait), returns false and takes the ordinary wake.
+pub(super) fn reply_direct(
+    scope: &DispatchPreemption<'_>, reply: u64, binding: &wake_publication::Binding,
+    eligible_cpus: &dyn Fn(usize) -> u64, switch: &mut Option<dispatch_claim::DirectSwitch>,
+) -> bool {
+    let cpu = scope.cpu();
+    let slot = binding.slot();
+    let owner = runqueue::owner(slot);
+    if owner.state != runqueue::RunOwnerState::Blocked || owner.wait_armed
+        || owner.cpu.is_some_and(|owner_cpu| owner_cpu != cpu) || !direct_switch_admitted(cpu) {
+        return false;
+    }
+    if !recent_sleeper(runqueue::wait::blocked_since_ticks(slot), crate::arch::rtc::ticks(),
+        crate::arch::rtc::ticks_per_second()) {
+        return false;
+    }
+    if runqueue_policy::sync_wake_target_cpu(slot, eligible_cpus(slot)) != cpu || !eligible(binding, cpu) {
+        return false;
+    }
+    let Some(typed) = runqueue::wait::TypedWake::capture(binding,
+        runqueue::wait::REASON_ENDPOINT_REPLY, reply) else { return false; };
+    publish_switching(scope, binding, &typed, cpu, || {}, Some(switch)).is_ok()
 }
 
 #[cfg(test)]

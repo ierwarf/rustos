@@ -72,7 +72,7 @@ benefits require matched original-tree controls.
   RustOS's guards. This larger redesign is only a proposal, NOT implemented;
   avoid a blind all-at-once atomic/RCU conversion.
 
-### IPC budget stalls, lean locks, lock-free task start (uncommitted) — 2026-10-21
+### IPC budget stalls, lean locks, lock-free task start — 2026-10-21 (committed as 6292ac42)
 - Files: `scheduler/scheduling_context.rs`, `stack_resources.rs`,
   `stack_resources/task_start.rs`, `ipc_publication.rs`,
   `current_identity/execution.rs`, `current_identity.rs`,
@@ -115,6 +115,76 @@ benefits require matched original-tree controls.
   30 per round trip, 7 per dispatch). Next session: the direct-switch path
   (carry the publication reader/binding into selection and claim, keep funding
   across a call/reply pair, fuse publication/select/claim), lazy SIMD.
+
+### Same-CPU frame-loan handoff (`DirectSwitch`) — 2026-10-21, uncommitted
+- Files: `scheduler/{ipc_publication,wake_publication,dispatch_claim,dispatcher,
+  sync_handoff}.rs`, `sync_handoff/chain.rs` (new), `cpu_local/irq_entry.rs`,
+  `irq.rs`, tests `irq_entry_tests/switch.rs` (new), and in `formal/`:
+  `check-dispatch-source-contracts.py`, `smp-source-contracts.toml`,
+  `run-source-conformance.sh`, `implementation-mutations.tsv`. Contract text:
+  `docs/ai/smp/scheduler.md` §7.5, `docs/ai/ownership/claim-return.md`.
+- What: a same-CPU call or reply no longer publishes a FIFO record and
+  re-captures the receiver frame. `publish_switching` keeps the receiver's
+  pinned reader, commits `DirectHandoff` and returns it as a `DirectSwitch`;
+  `dispatcher::fast_switch` runs the SAME prologue/claim/complete. Admission
+  (`direct_switch_admitted`): nothing queued on the CPU, no activation prefix,
+  chain not owed to a ready fair competitor. A reply also needs a caller blocked
+  on this CPU for under 1 ms whose sync-wake target is this CPU. Failure is
+  safe: an unadoptable loan publishes the FIFO record, and an unused
+  `DirectSwitch` calls `materialize_direct_handoff_with_generation` on drop.
+- Measured (1 vCPU isolated reply_recv, same session, cpuid p50 3,720, two runs
+  each): shortcut off p50 36,040/35,680 (min 33,360/33,200); on p50
+  31,920/31,960 (min 31,040/30,920), about -4.0k p50 (-11%). Session start
+  (cpuid 4,480): p50 41,880, min 40,200. 8-vCPU `bench`: reply_recv p50 36,720,
+  mean 43,024 (three samples over 10M ticks carry ~6k of that mean; cpuid 3,800).
+- Fresh scope profile (kit extensions `instrument3_trap.py`,
+  `instrument4_syscall.py`, `profdecode3.py` in the profiler kit): per trap
+  ~12.7k = publication ~3.3, `fast_switch` ~5.7 (prologue 1.6, claim 3.5,
+  complete .5), install 1.4, drop .7. About 103 lean and 10 full-path lock
+  acquisitions and ~296 CPU-index derivations per trap. Hot lean pair 24 ticks,
+  full-validation pair ~120, derivation ~7, clock read ~60.
+- Remaining candidates, each needing an owner decision (not done): drop the lean
+  release `current_cpu_index()` assertion (-0.85k, measured); lock-free
+  `CurrentWait::capture` pin on the executing bank (~6 per round trip at .3k);
+  lean acquire for IF-set `lock()` callers (19 full-path locks per round trip,
+  ~-1.5k); funding lease reuse across a call/reply pair (~-0.5k per handoff).
+  10k is not reachable without rewriting the claim/funding protocol.
+- Validation: `cargo test -p kernel-ps --lib` 963, `nucleus-core` 65, dev-plan
+  `now` lane 619/619, 8-vCPU `kvm-smoke --smp-iteration --gui-dvm-surfaces
+  --exercise-input` passed, source conformance and SMP assumptions pass,
+  implementation-mutation registry preflight passes (1482).
+
+### IPC lane: resident same-CPU call/reply switch — 2026-10-21, uncommitted
+- Contract and status: `docs/ai/performance/ipc-lane.md`; custody text in
+  `docs/ai/smp/scheduler.md` §7.5. Files: `scheduler/{ipc_lane,resident}.rs`,
+  `runqueue/lane.rs`, `irq_entry_tests/{lane,switch}.rs` (new); hooks in `irq.rs`
+  (lane before `DispatchEntry::enter`), `cpu_local.rs` (lane ACK), `runqueue.rs`
+  (owner CAS eviction hook), `execution_interval.rs` (forward/charge span),
+  `return_architecture.rs` (`lane_effects`, `note_installed`).
+- What changed: a task that blocks in an endpoint receive/reply wait parks its
+  allocation pin and execution permit in a per-slot cell at the RSP ACK; the cell
+  is valid for one owner generation and ANY other owner CAS evicts it. A call or
+  reply between two parked/Current tasks on one CPU runs `ipc_lane` in the trap
+  with no dispatch turn: declines change nothing, the receiver's claim CAS is the
+  point of no return, the interval and its funder are forwarded and charged once
+  when the chain ends. `CurrentWait::capture` pins through one cleanup leaf.
+- Shipping lock fast paths (owner-approved validation removal, P5 in the
+  contract): IF-set `TrackedSpinLock::lock` -> `lock_lean_irq`; lean release
+  without CPU re-derivation; `ProcessStateLock` one-CAS take/swap release with a
+  `waiting` count gating the waiter queue; service-endpoint authorize prefilter.
+  Full validation stays in host/test/`rustos_lock_phase_profile` builds.
+- Measured: 1 vCPU p50 41.9k -> 13.1-13.4k; 8 vCPU reply_recv p50 13.6-14.4k,
+  mean 14.6-14.8k (was 43.0k; 18.8k before P5), cross-process getuid mean 27.8k
+  at P4. The split recv/reply probe still takes the generic reply wake (p50
+  ~47k): next target. The 10k goal is not reached; ~5k of the remaining ~13k is
+  the two lane traps, ~2.5k user copies, ~2k endpoint/admission, ~2k wait arm.
+- Validation: `kernel-ps` 968 + compat 181 + ipc-runtime 77 + nucleus-core 65
+  tests, dev-plan `now` lane 773/773, `verify-all --profile pr` and
+  `verify-smp-iteration` sealed, 8-vCPU `kvm-smoke --smp-iteration
+  --gui-dvm-surfaces --exercise-input` passed after the last edit.
+- Next structural steps: request delivery into the receiver context from the
+  lane, `int`-free frame build (the stub saves 16 XMM + 15 GPR per trap), lane
+  the split recv/reply path, fewer ledger lock operations (5 per round trip).
 
 ## Open questions at the snapshot boundary
 

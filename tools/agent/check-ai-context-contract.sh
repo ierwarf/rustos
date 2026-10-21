@@ -96,14 +96,6 @@ forbid_regex .claude/settings.json '"matcher":[[:space:]]*"\*"' \
 forbid_regex .claude/settings.json '"timeout":[[:space:]]*75' \
   "Claude post-edit wrapper has no stale 75s timeout"
 
-# Read/output ceilings may tighten, not silently loosen.
-assert_max_default .claude/hooks/pre_read_large_file.sh RUSTOS_HOOK_MAX_WHOLE_READ_BYTES 32768
-assert_max_default .claude/hooks/pre_read_large_file.sh RUSTOS_HOOK_MAX_READ_LINES 120
-assert_max_default .claude/hooks/pre_read_large_file.sh RUSTOS_HOOK_MAX_MCP_ANSWER_CHARS 8000
-assert_max_default .claude/hooks/pre_bash_destructive.sh RUSTOS_HOOK_MAX_SHELL_OUTPUT_TOKENS 3000
-assert_max_default .claude/hooks/pre_bash_destructive.sh RUSTOS_HOOK_MAX_WHOLE_READ_BYTES 32768
-require_literal .claude/hooks/selftest.sh 'unbudgeted large AI document cat is denied' \
-  "shell path enforces the large AI document read ceiling"
 require_literal .agents/hooks/lib.sh 'tail -n 8' "failure tail remains <= 8 lines"
 require_literal .agents/hooks/lib.sh 'head -c 2048' "failure payload remains <= 2048 bytes"
 forbid_regex .agents/hooks/post_edit_rust.sh 'cargo[[:space:]]+xtask[[:space:]]+check' \

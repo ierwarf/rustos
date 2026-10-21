@@ -145,6 +145,14 @@ pub mod endpoint {
         crate::ipc::take_fast_endpoint_request(endpoint, receiver_task_id)
     }
 
+    pub fn take_fast_request_within(
+        endpoint: KernelEndpointHandle,
+        receiver_task_id: u64,
+        request_capacity: usize,
+    ) -> Result<Option<FastEndpointReceived>, IpcError> {
+        crate::ipc::take_fast_endpoint_request_within(endpoint, receiver_task_id, request_capacity)
+    }
+
     pub fn rollback_fast_call(
         endpoint: KernelEndpointHandle,
         reply: KernelReplyHandle,

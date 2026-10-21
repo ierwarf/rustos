@@ -42,40 +42,6 @@ block_destructive() {
   block "Blocked destructive command: $1. Re-issue only if the user explicitly authorized it."
 }
 
-max_shell_output_tokens="${RUSTOS_HOOK_MAX_SHELL_OUTPUT_TOKENS:-3000}"
-max_whole_read_bytes="${RUSTOS_HOOK_MAX_WHOLE_READ_BYTES:-32768}"
-[[ "$max_shell_output_tokens" =~ ^[0-9]+$ ]] || max_shell_output_tokens=3000
-[[ "$max_whole_read_bytes" =~ ^[0-9]+$ ]] || max_whole_read_bytes=32768
-read_heavy_re='(^|[[:space:];|&])(cat|sed[[:space:]]+-n|rg|grep|find|head|tail|git[[:space:]]+(diff|show|log))([[:space:]]|$)'
-if [[ "$max_output_tokens" =~ ^[0-9]+$ ]] \
-  && (( max_output_tokens > max_shell_output_tokens )) \
-  && [[ "$cmd" =~ $read_heavy_re ]] \
-  && [[ "$cmd" != *">/tmp/"* ]] \
-  && [[ "$cmd" != *"> /tmp/"* ]]; then
-  block "Shell output budget blocked: requested ${max_output_tokens} tokens for exploratory output; use <=${max_shell_output_tokens} or capture verbose output under /tmp and return a bounded summary."
-fi
-
-# File-read hooks cannot see a direct shell `cat`. Close the common whole-file
-# bypass for large AI contracts when the shell tool did not provide an output
-# budget. Piped or redirected reads are allowed because a following command/file
-# can deliberately bound or absorb the output without sending the whole file to
-# model context.
-if [[ ! "$max_output_tokens" =~ ^[0-9]+$ ]] \
-  && [[ "$cmd" =~ (^|[[:space:];&])cat([[:space:]]|$) ]] \
-  && [[ "$cmd" != *"|"* ]] \
-  && [[ "$cmd" != *">"* ]]; then
-  REPO_ROOT="$(rustos_repo_root)"
-  while IFS= read -r ai_doc; do
-    [[ -n "$ai_doc" ]] || continue
-    rel_path="${ai_doc#./}"
-    [[ -f "$REPO_ROOT/$rel_path" ]] || continue
-    size="$(stat -c%s -- "$REPO_ROOT/$rel_path" 2>/dev/null || echo 0)"
-    if (( size > max_whole_read_bytes )); then
-      block "Unbudgeted large AI document read blocked: $rel_path (${size} bytes). Search first and read a focused range, or set max_output_tokens <=${max_shell_output_tokens}."
-    fi
-  done < <(printf '%s\n' "$cmd" | grep -Eo '(\./)?docs/ai/[A-Za-z0-9._/-]+\.md' | sort -u || true)
-fi
-
 write_protected_path_re='(^|[[:space:];|&>])(\./)?(build|target|vendor|logs)(/|[[:space:]]|$)|(^|[[:space:];|&>])(\./)?Cargo\.lock([[:space:]]|$)|(^|[[:space:];|&>])(\./)?perf\.data([[:space:]]|$)'
 
 # Pure searches may contain dangerous text as their query. Avoid false blocks

@@ -72,6 +72,10 @@ impl DispatchPublication {
         self.dispatch_flags & DISPATCH_RETIRED != 0
     }
 
+    pub(super) const fn suspended(self) -> bool {
+        self.dispatch_flags & DISPATCH_SUSPENDED != 0
+    }
+
     pub(super) const fn job_stopped(self) -> bool {
         self.dispatch_flags & DISPATCH_JOB_STOPPED != 0
     }

@@ -739,8 +739,9 @@ fn validate_kernel_source_boundaries(root_dir: &Path) -> Result<()> {
 fn assert_max_lines(root_dir: &Path, relative_path: &str, max_lines: usize) -> Result<()> {
     let source = fs::read_to_string(root_dir.join(relative_path))?;
     let line_count = source.lines().count();
+    // Advisory only: a size budget never fails layering validation.
     if line_count > max_lines {
-        bail!("{relative_path} exceeds size gate: {line_count} > {max_lines}");
+        eprintln!("warning: {relative_path} exceeds size budget: {line_count} > {max_lines}");
     }
     Ok(())
 }

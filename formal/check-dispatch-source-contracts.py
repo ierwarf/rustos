@@ -280,12 +280,12 @@ for anchor in ['fn direct_handoff_frame_token(', 'fn direct_handoff_token_is_cur
 irq = Path('kernel/ps/src/multitask/irq.rs').read_text()
 ordered(body(irq, 'software_schedule_interrupt_dispatch'), [
     'DispatchEntry::enter()', 'entry.save_simd()',
-    'scheduler::ipc_publication::call(',
+    'let mut switch = None', 'scheduler::ipc_publication::call_switching(',
     'entry.preemption()',
-    'scheduler::ipc_publication::reply(',
+    'scheduler::ipc_publication::reply_switching(',
     'entry.preemption()',
     'immediate_task_id = outcome.dispatch_hint(caller_task_id)',
-    'entry.dispatch(current_rsp, true, immediate_task_id)',
+    'entry.dispatch_switching(current_rsp, true, immediate_task_id, switch)',
     'entry.install(dispatch, exact_fast_dispatch)'],
     'actual fast producers cannot bypass the sole Direct FIFO')
 for entry_name in ['timer_interrupt_dispatch', 'rtc_interrupt_dispatch',
@@ -293,7 +293,9 @@ for entry_name in ['timer_interrupt_dispatch', 'rtc_interrupt_dispatch',
         'saved_user_context_dispatch']:
     actual_entry = body(irq, entry_name)
     ordered(actual_entry, ['DispatchEntry::enter()', 'runtime_profile::record_entry(',
-        'runtime_profile::take_owned(entry.turn()', 'entry.dispatch(', 'entry.install('],
+        'runtime_profile::take_owned(entry.turn()',
+        'entry.dispatch_switching(' if entry_name == 'software_schedule_interrupt_dispatch'
+        else 'entry.dispatch(', 'entry.install('],
         'actual independent IRQ ' + entry_name)
     if re.search(r'scheduler_(?:mut|ref)\(|SchedulerAccessGuard|release_dispatch_directory', actual_entry):
         raise SystemExit('IRQ entry regained directory authority: ' + entry_name)
@@ -309,9 +311,12 @@ ordered(body(entry, 'from_scope'), ['scope.is_masked()', 'scheduler_initialized(
     'cpu_task_slot_admitted(cpu)', 'CURRENT_TASK_SLOTS[cpu].load(Ordering::Acquire)',
     'dispatch_turn::begin(scope, from)', 'turn.original_current().is_some()',
     'deferred_wake::take_masked(entry.preemption())'], 'original IRQ admission and own deferred mailbox')
-ordered(body(entry, 'dispatch'), ['self.save_simd()', 'CurrentReturn::capture_dispatch(self.turn())',
-    'dispatcher::fast(&mut outgoing', 'dispatcher::dispatch(&mut outgoing'],
+ordered(body(entry, 'dispatch_switching'), ['self.save_simd()', 'CurrentReturn::capture_dispatch(self.turn())',
+    'dispatcher::fast_switch(&mut outgoing', 'dispatcher::fast(&mut outgoing',
+    'dispatcher::dispatch(&mut outgoing'],
     'one original Current SIMD and failed fast fallback')
+ordered(body(entry, 'dispatch'), ['self.dispatch_switching(rsp, voluntary, immediate, None)'],
+    'plain dispatch carries no frame loan')
 ordered(body(entry, 'accept_installed_return'), ['turn.architecture_ready()',
     'execution_interval::original_claim_is_active(turn)', 'turn.claimed_return()',
     'receipt.returns_to_user()', 'receipt.slot()', 'self.selected = Some('],
@@ -392,12 +397,32 @@ ordered(body(producer, 'call_before_arm_observing'), [
     'last_effect.take().unwrap()()', 'inherited: false, woke: false, hinted: false',
     'before_receive()', 'wake_publication::receive_call(receiver, endpoint,'],
     'withdrawn receive retains only exact original queued custody, never grants worker execution')
-ordered(body(producer, 'publish_with'), ['frame_publication::read_for_identity(token, binding.id(), cpu)',
+ordered(body(producer, 'publish_with'), ['publish_switching(scope, binding, typed, target, last_effect, None)'],
+    'plain publication carries no frame loan')
+ordered(body(producer, 'publish_switching'), ['frame_publication::read_for_identity(token, binding.id(), cpu)',
+    'dispatch_claim::validate_held_frame(', 'direct_switch_admitted(cpu)',
     'Publication::begin(scope, target)', 'sync_handoff::publish_original(',
     'typed.publish_and_clear(', 'claim_blocked_handoff(slot, expected, target, local)',
     'bind_local_owner_generation(slot, original.generation)',
     'publish_handoff_mailbox(slot, original,', 'last_effect()',
-    'drop(publication)', 'drop(reader)'], 'reader/phase/FIFO through pager floor')
+    'drop(publication)', 'direct_handoff_frame_token(slot, cpu)', 'FrameSelection::from_held(',
+    'sync_handoff::enqueue(target', 'drop(reader)'], 'reader/phase/FIFO through pager floor')
+ordered(body(producer, 'direct_switch_admitted'), ['!sync_handoff::pending(cpu)',
+    '!dispatch_policy::atomic_activation_pending(cpu)', 'sync_handoff::chain::chain_exhausted(cpu)',
+    'local_dispatch::local_fair_competitor_ready(cpu)'],
+    'frame-loan shortcut only when FIFO selection would take the handoff first')
+ordered(body(producer, 'reply_direct'), ['RunOwnerState::Blocked', 'direct_switch_admitted(cpu)',
+    'recent_sleeper(', 'sync_wake_target_cpu(slot, eligible_cpus(slot))', 'eligible(binding, cpu)',
+    'TypedWake::capture(binding', 'REASON_ENDPOINT_REPLY', 'publish_switching('],
+    'reply shortcut is the exact typed receiver wake of a recent same-CPU sleeper')
+ordered(body(dispatch, 'fast_switch'), ['runqueue::wait::blocked(current)',
+    'dispatch_policy::atomic_activation_pending(cpu)', 'prologue(outgoing, rsp, true)',
+    'donation_ledger::class_publication_sequence()', 'switch.take()',
+    'claim(outgoing, candidate, class_sequence)', 'complete(outgoing, Urgency::Sync)'],
+    'frame-loan selection shares the FIFO selection prologue, claim and completion')
+ordered(body((base / 'dispatch_claim.rs').read_text(), 'drop'), ['self.selection.take()',
+    'materialize_direct_handoff_with_generation(', 'Some(generation)'],
+    'unused frame-loan switch restores fair custody')
 architecture = (base / 'return_architecture.rs').read_text()
 if "current: &'a super::CurrentWait" not in architecture or "scope: &'a" not in architecture:
     raise SystemExit('resumed architecture lost borrowed original Current/mask')
@@ -443,9 +468,14 @@ ordered(body(cpu_source, 'commit_context_switch'), ['asm!("mov {}, rsp"',
     'hardware callback observes actual machine RSP before shared ACK algorithm')
 ordered(body(cpu_source, 'commit_context_switch_at_rsp'), ['dispatch_turn::begin_commit(',
     'commit.assert_arrived(logical_index, rsp)',
-    'TRANSITION_ACTIVE[logical_index].store(false', 'commit.physical_banks()',
-    'cpu_leases::commit(logical_index)', 'execution::banks::commit(logical_index)',
+    'TRANSITION_ACTIVE[logical_index].store(false',
+    'resident::commit_outgoing(logical_index, outgoing, commit.physical_banks())',
     'commit.finish()'], 'checked actual RSP precedes both original bank ACKs and reopening')
+resident_source = (base / 'resident.rs').read_text()
+ordered(body(resident_source, 'commit_outgoing'), ['cpu_leases::take_outgoing(cpu)',
+    'banks::take_outgoing(cpu)', 'parkable(from, &pin, &permit)', 'kernel_frame_rsp(cpu, from, generation)',
+    'outgoing_arch(cpu, from)', 'park(from, generation'],
+    'the RSP ACK parks both outgoing loans together or releases both')
 rsp_handoff = (base / 'rsp_handoff.rs').read_text()
 ordered(body(rsp_handoff, 'capture'), ['turn.original_current()', 'turn.claimed_return()',
     'turn.outgoing_image()', 'old.cpu == cpu && old.slot == from',
@@ -489,9 +519,15 @@ ordered(body(dispatch, 'first_turn'), ['DispatchFrame::from_selection(turn, cand
 selection_image = claim[:claim.index("pub(super) struct DispatchFrame")]
 ordered(body(selection_image, 'capture'), ['selected_local_frame_identity(',
     'id != expected_id', 'frame_publication::read_for_identity(token, id, cpu)',
-    'reader.owned_canary_intact()', 'validate_published_saved_context(',
+    'validate_held_frame(slot, rsp, token.view, &reader)',
     'DispatchFrame::token_current(token, cpu, custody)', 'validation.map_err(Invalid)?',
     'return_to_user, reader'], 'selected original pin/reader and live allocated header')
+ordered(body(selection_image, 'validate_held_frame'), ['reader.owned_canary_intact()',
+    'validate_published_saved_context(', 'user_code_selector()'],
+    'held reader validates the live allocated header before any return decision')
+ordered(body(selection_image, 'from_held'), ['now.saved_rsp != saved_rsp',
+    'DispatchFrame::token_current(now, cpu, custody)', 'p.task_id == Some(id)', 'Err(reader)',
+    'return_to_user, reader'], 'adopted publication reader keeps exact RSP, generation and UID')
 ordered(body(claim, 'from_selection'), ['class_sequence: u64', 'turn.original_current()',
     'cpu != selection.cpu', 'Self::token_current(selection.token, cpu, selection.custody)',
     'FrameSelection { cpu, id, token, custody, return_to_user, reader } = selection',
@@ -1303,4 +1339,39 @@ ordered(body(ipcbench, 'measure_intra_process_round_trip'), ['for _ in 0..WARMUP
     'skip(name, "ipc-transcript-invalid")', 'return;',
     'report(name, &summarize(&mut total), tsc_khz)'],
     'warmup, every sample, stop and join form one complete production transcript')
+lane = (base / 'ipc_lane.rs').read_text()
+ordered(body(irq, 'software_schedule_interrupt_dispatch'), ['let mut lane_generic = false',
+    'ipc_lane::call(', 'lane_scope.retain_irq_mask()', 'ipc_lane::reply(',
+    'lane_scope.retain_irq_mask()', 'DispatchEntry::enter()'],
+    'lane switches before any dispatch turn opens and keeps the IRQ mask through the RSP ACK')
+ordered(body(lane, 'call'), ['cpu_local::lane_idle(cpu)', 'resident::parked_cpu(s, generation)',
+    'direct_switch_admitted(cpu)', 'bind_original(scope, reply, donor, &receiver, false)',
+    'runqueue::simd_tls::save_simd_state(c)', 'runqueue::commit_wait(c)',
+    'finish(cpu, from, to, rsp, generic)'],
+    'lane call declines before the donation bind and is committed after it')
+ordered(body(lane, 'reply'), ['cpu_local::lane_idle(cpu)', 'reply_context_custody(context_owner, context)',
+    'resident::parked_cpu(c, generation)', 'recent_sleeper(', 'direct_switch_admitted(cpu)',
+    'release_reply(reply', 'runqueue::simd_tls::save_simd_state(s)', 'finish(cpu, from, to, rsp, generic)'],
+    'lane reply releases the donation only after every decline check')
+ordered(body(lane, 'finish'), ['funding_label(to.slot, to.id)', 'can_forward(', 'settle(cpu, from.slot, from.id)',
+    'prepare_grant(to.slot, cpu)', 'with_placement_admission(', 'lane_wake_clear(', 'lane_cas(',
+    'resident::take(to.slot, generation)', 'cpu_leases::prepare(cpu, loans.pin)',
+    'banks::prepare_lane(cpu, loans.permit)', 'execution_interval::forward(', 'open_lane(',
+    'publish_blocked(cpu, from.slot, rsp)', 'lane_install(', 'note_installed(', 'cpu_local::lane_publish(',
+    'lane_install_placement(', 'complete(cpu, from.slot'],
+    'lane claim CAS is the point of no return; every move after it is infallible')
+ordered(body(resident_source, 'park'), ['cell.pin.store(', 'cell.permit.store(',
+    'cell.generation.store(generation, Ordering::Release)', 'fence(Ordering::SeqCst)',
+    'runqueue::owner(slot)', 'take(slot, generation)'],
+    'a parked cell is published before the owner re-read that revokes it')
+ordered(body(resident_source, 'take'), ['compare_exchange(generation, 0', 'cell.drain()'],
+    'the generation swap decides who owns the parked loans')
+runq = (base / 'runqueue.rs').read_text()
+ordered(body(runq, 'compare_exchange'), ['self.compare_exchange_raw(expected, next)?',
+    'expected.generation != next.generation', 'resident::on_owner_transition(self.slot(), expected.generation)'],
+    'every owner transition out of a generation revokes its parked cell')
+ordered(body(cpu_source, 'commit_context_switch_at_rsp'), ['LANE_ACK_FROM[logical_index].swap(',
+    'TRANSITION_ACTIVE[logical_index].store(false', 'resident::commit_outgoing(logical_index, lane_from, true)',
+    'return;', 'dispatch_turn::begin_commit('],
+    'a lane ACK clears Transition and parks or releases the outgoing loans without a turn')
 print('independent dispatch source contracts passed: whole Scheduler deletion, original dispatch/FIFO, foreign shared-MM census, executor ACK and HECS')

@@ -12,10 +12,10 @@ decision. Human docs are not bootstrap context.
 
 ## Search and read
 
-Search before opening large files. Whole-file reads above 32 KiB are blocked;
-use a focused range instead. Do not bypass the same budget through shell `cat`
-or an oversized `sed` range. Default source read is <=120 lines; expand only
-after a focused search identifies the missing range. Start ordinary searches at
+Search before opening large files. Only binary artifacts and whole-file reads
+of log/build/vendor output or text above 1 MiB are blocked; symbol navigation
+and ranged reads are never limited. Default source read is a focused range;
+expand when a search identifies the missing context. Start ordinary searches at
 6–12 results and avoid reopening unchanged ranges.
 
 Batch 3–10 known independent probes when that removes model/tool round trips.
@@ -35,8 +35,7 @@ only the exact tool needed and keep its description bounded.
 
 ## Shell, logs, and diffs
 
-Exploratory shell reads should request `max_output_tokens <=1500`; the hard
-interactive ceiling is 3000. Capture larger output to a file and return a
+Exploratory shell reads should stay small (guidance, not enforced). Capture larger output to a file and return a
 bounded summary. Successful commands expose exit status plus <=1 KiB of useful
 summary.
 

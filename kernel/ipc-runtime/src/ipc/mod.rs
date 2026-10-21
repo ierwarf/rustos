@@ -1909,13 +1909,23 @@ pub fn take_fast_endpoint_request(
     endpoint: KernelEndpointHandle,
     receiver_task_id: u64,
 ) -> Result<Option<FastEndpointReceived>, IpcError> {
+    take_fast_endpoint_request_within(endpoint, receiver_task_id, IPC_FAST_INLINE_BYTES)
+}
+
+/// `take_fast_endpoint_request` for a receiver whose buffer holds
+/// `request_capacity` bytes: a larger request is refused without being consumed.
+pub fn take_fast_endpoint_request_within(
+    endpoint: KernelEndpointHandle,
+    receiver_task_id: u64,
+    request_capacity: usize,
+) -> Result<Option<FastEndpointReceived>, IpcError> {
     ENDPOINTS
         .with_mut(endpoint.raw(), |endpoint_object| {
             endpoint_receive::take_fast_request(
                 endpoint_object,
                 endpoint,
                 receiver_task_id,
-                IPC_FAST_INLINE_BYTES,
+                request_capacity.min(IPC_FAST_INLINE_BYTES),
             )
         })
         .ok_or(IpcError::InvalidHandle)?

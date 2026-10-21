@@ -442,6 +442,13 @@ CurrentWait, physical donor/root/receiver loans and typed pending wait survive
 the final sender commit; reverse WakeWon cannot be overwritten by scalar block.
 The donation ledger borrows these SAME participants, never replacements.
 
+A committed same-CPU handoff may carry that receiver reader to selection as a
+`DirectSwitch` (`dispatch_claim.rs`) instead of a FIFO record; see
+`docs/ai/smp/scheduler.md` §7.5. The reader is validated once by
+`validate_held_frame`, adopted by `FrameSelection::from_held` against the
+post-CAS token, and consumed by the SAME prologue/claim/complete as FIFO
+selection (`dispatcher::fast_switch`).
+
 Original receiver binding and stack pin/reader own validation and frame bytes.
 Priority publication waits outside raw leaves. Identity51 -> Affinity54 ->
 FIFO56 -> Wait58 joins exact live UID/admission, bounded FIFO capacity, original

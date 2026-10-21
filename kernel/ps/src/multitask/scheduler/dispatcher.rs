@@ -486,6 +486,26 @@ pub(in crate::multitask) fn fast(outgoing: &mut CurrentReturn<'_>, rsp: usize, i
     }
 }
 
+/// `fast` for a handoff whose publication kept the receiver's frame loan: the
+/// FIFO round trip and the frame re-capture are skipped, nothing else. Every
+/// refusal drops `switch` (or lets `claim` materialize it), which restores fair
+/// custody; a DirectHandoff receiver is never left without a dispatcher.
+pub(in crate::multitask) fn fast_switch(
+    outgoing: &mut CurrentReturn<'_>, rsp: usize, switch: dispatch_claim::DirectSwitch,
+) -> Option<SchedulerDispatch> {
+    let turn = outgoing.original_turn();
+    if !turn.owns_priority_choice() { turn.begin_priority_choice(); }
+    let (cpu, current) = turn.original_current()?;
+    if !runqueue::wait::blocked(current) || dispatch_policy::atomic_activation_pending(cpu) { return None; }
+    prologue(outgoing, rsp, true);
+    let class_sequence = donation_ledger::class_publication_sequence();
+    if class_sequence & 1 != 0 { return None; }
+    let frame = switch.take();
+    let candidate = Candidate { slot: frame.slot(), id: frame.id(), generation: frame.generation(),
+        custody: frame.custody(), urgency: Urgency::Sync, frame };
+    if claim(outgoing, candidate, class_sequence) { Some(complete(outgoing, Urgency::Sync)) } else { None }
+}
+
 pub(in crate::multitask) fn selected_is_idle(slot: usize) -> bool { runqueue::is_idle_slot(slot) }
 
 #[cfg(test)]

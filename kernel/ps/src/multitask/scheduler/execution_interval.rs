@@ -18,6 +18,11 @@ pub(super) struct ExecutionInterval {
     running_generation: u64,
     start_ticks: u64,
     start_local_ns: u64,
+    /// Where the funder's charge span begins. It equals the start above except
+    /// across IPC lane hops, which forward one funding along a donation chain
+    /// and let the whole span be charged once when the chain ends.
+    charge_from_ticks: u64,
+    charge_from_local_ns: u64,
     funding: Option<FundingPin>,
 }
 
@@ -34,6 +39,30 @@ impl ExecutionInterval {
             .unwrap_or_else(|| {
                 if now_ticks > self.start_ticks {
                     ticks_to_ns(self.start_ticks, now_ticks)
+                } else {
+                    0
+                }
+            })
+    }
+
+    /// The funding this interval holds, for a lane switch that hands it on.
+    pub(super) fn take_funding(&mut self) -> Option<FundingPin> {
+        self.funding.take()
+    }
+
+    /// Elapsed time of the funder's whole charge span (see `charge_from_*`).
+    pub(super) fn charge_elapsed_ns(
+        &self,
+        now_ticks: u64,
+        now_local_ns: Option<u64>,
+        ticks_to_ns: impl FnOnce(u64, u64) -> u64,
+    ) -> u64 {
+        now_local_ns
+            .filter(|now| self.charge_from_local_ns != 0 && *now >= self.charge_from_local_ns)
+            .map(|now| now - self.charge_from_local_ns)
+            .unwrap_or_else(|| {
+                if now_ticks > self.charge_from_ticks {
+                    ticks_to_ns(self.charge_from_ticks, now_ticks)
                 } else {
                     0
                 }
@@ -219,14 +248,82 @@ pub(super) fn open_claimed(
         "claimed interval lost original allocation bank");
     assert!(crate::multitask::current_identity::execution::banks::owns_execution(cpu, slot),
         "claimed interval lost original execution bank");
+    open_interval(cpu, slot, receipt.id, receipt.running_generation, funding);
+}
+
+/// Whether the Current interval can be handed straight to the next task of its
+/// donation chain: it is `slot`/`task_id`'s, and its funding is rooted at
+/// `owner`. Read-only; the lane forwards it after its claim succeeds.
+pub(super) fn can_forward(cpu: usize, slot: usize, task_id: u64, owner: u64) -> bool {
+    with_interval(cpu, |cell| {
+        !cell.current_borrowed
+            && cell.active.as_ref().is_some_and(|interval| {
+                interval.slot == slot
+                    && interval.task_id == task_id
+                    && interval.funding.as_ref().is_none_or(|pin| pin.label().0 == owner)
+            })
+    })
+}
+
+/// Hand the Current interval to `slot`/`task_id` for the next hop of a chain:
+/// the funding (relabeled to `reply`) and its charge span continue, while the
+/// hop's own start moves, so the outgoing task's elapsed time is returned for
+/// its virtual-time accounting and the funder is charged once when the chain
+/// ends. Requires `can_forward` to have held on this masked CPU.
+pub(super) fn forward(
+    cpu: usize, from: (usize, u64), to: (usize, u64, u64), reply: u64,
+) -> u64 {
+    let now_ticks = crate::arch::rtc::ticks();
+    let now_local_ns = crate::arch::clock::scheduler_local_nanos();
+    let hop = with_interval(cpu, |cell| {
+        let interval = cell.active.as_mut().expect("forwarded interval vanished");
+        assert_eq!((interval.slot, interval.task_id), from, "lane forwarded a foreign interval");
+        let hop = interval.elapsed_ns(now_ticks, now_local_ns, |start, end| {
+            end.saturating_sub(start).saturating_mul(1_000_000_000)
+                .saturating_div(crate::arch::rtc::ticks_per_second().max(1))
+        });
+        interval.slot = to.0;
+        interval.task_id = to.1;
+        interval.running_generation = to.2;
+        interval.start_ticks = now_ticks;
+        interval.start_local_ns = now_local_ns.unwrap_or(0);
+        if let Some(pin) = interval.funding.take() {
+            interval.funding = Some(pin.relabeled(reply));
+        }
+        cell.settled = None;
+        hop
+    });
+    // These are diagnostic baselines, never funding or interval authority.
+    runqueue::set_exec_start_ticks(from.0, 0);
+    runqueue::set_exec_start_local_ns(from.0, 0);
+    runqueue::set_exec_start_ticks(to.0, now_ticks);
+    runqueue::set_exec_start_local_ns(to.0, now_local_ns.unwrap_or(0));
+    hop
+}
+
+/// Open the incoming task's interval for a lane switch. The lane's claim CAS is
+/// the successful claim; its prepared funding moves here exactly as above.
+pub(super) fn open_lane(
+    cpu: usize, slot: usize, task_id: u64, running_generation: u64, funding: Option<FundingPin>,
+) {
+    assert!(super::stack_resources::cpu_leases::owns_prepared(cpu, slot),
+        "lane interval lost its prepared allocation bank");
+    open_interval(cpu, slot, task_id, running_generation, funding);
+}
+
+fn open_interval(
+    cpu: usize, slot: usize, task_id: u64, running_generation: u64, funding: Option<FundingPin>,
+) {
     let start_ticks = crate::arch::rtc::ticks();
     let start_local_ns = crate::arch::clock::scheduler_local_nanos().unwrap_or(0);
     install(cpu, ExecutionInterval {
         slot,
-        task_id: receipt.id,
-        running_generation: receipt.running_generation,
+        task_id,
+        running_generation,
         start_ticks,
         start_local_ns,
+        charge_from_ticks: start_ticks,
+        charge_from_local_ns: start_local_ns,
         funding,
     });
     // These are diagnostic baselines, never funding or interval authority.
@@ -318,7 +415,8 @@ pub(super) fn begin_bootstrap(image: &super::bootstrap::InitialCpu<'_>, start_ti
         "bootstrap interval acquired budget authority");
     install(cpu, ExecutionInterval {
         slot, task_id, running_generation: owner.generation,
-        start_ticks, start_local_ns: 0, funding: None,
+        start_ticks, start_local_ns: 0, charge_from_ticks: start_ticks, charge_from_local_ns: 0,
+        funding: None,
     });
 }
 
@@ -371,7 +469,7 @@ pub(super) fn test_open_captured(slot: usize, start_ticks: u64) {
     let funding = capture_funding(slot, cpu).expect("actual root funding capture refused");
     install(cpu, ExecutionInterval {
         slot, task_id: id, running_generation: owner.generation,
-        start_ticks, start_local_ns: 0, funding,
+        start_ticks, start_local_ns: 0, charge_from_ticks: start_ticks, charge_from_local_ns: 0, funding,
     });
 }
 

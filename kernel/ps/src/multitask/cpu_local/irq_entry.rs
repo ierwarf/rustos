@@ -82,10 +82,22 @@ impl DispatchEntry {
     pub(in crate::multitask) fn dispatch(
         &self, rsp: usize, voluntary: bool, immediate: Option<u64>,
     ) -> (SchedulerDispatch, bool) {
+        self.dispatch_switching(rsp, voluntary, immediate, None)
+    }
+    /// `dispatch` for a producer that kept its receiver frame loan. An unused
+    /// loan restores the receiver's ordinary fair custody when it drops.
+    pub(in crate::multitask) fn dispatch_switching(
+        &self, rsp: usize, voluntary: bool, immediate: Option<u64>,
+        switch: Option<scheduler::dispatch_claim::DirectSwitch>,
+    ) -> (SchedulerDispatch, bool) {
         self.save_simd();
         let mut outgoing = scheduler::current_return::CurrentReturn::capture_dispatch(self.turn())
             .expect("IRQ dispatch lacks original post-producer Current image");
-        if immediate.is_some() {
+        if let Some(switch) = switch {
+            if let Some(result) = scheduler::dispatcher::fast_switch(&mut outgoing, rsp, switch) {
+                return (result, true);
+            }
+        } else if immediate.is_some() {
             if let Some(result) = scheduler::dispatcher::fast(&mut outgoing, rsp, immediate) {
                 return (result, true);
             }

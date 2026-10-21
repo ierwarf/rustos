@@ -136,6 +136,8 @@ impl<'a> ReturnArchitecture<'a> {
             }
             phase(SchedulerPhase::ArchSegments, &mut marker);
         }
+        super::ipc_lane::note_installed(self.turn.original_current().map_or(0, |(cpu, _)| cpu),
+            self.receipt.token.slot, self.incoming);
         let mut simd_marker = phase_start();
         // Even same-task returns restore the SIMD image: compiled kernel code
         // may use vectors after the IRQ save. This uses the SAME exact receipt.
@@ -145,6 +147,48 @@ impl<'a> ReturnArchitecture<'a> {
         self.turn.mark_architecture_ready();
     }
 }
+/// The register effects of a changed fast-IPC return from `previous` to `next`,
+/// the same sequence `install_with` emits. Kernel-mode incoming frames only.
+pub(in crate::multitask::scheduler) fn lane_effects(
+    previous: ArchitectureState, next: ArchitectureState, to_slot: usize,
+    mut effect: impl FnMut(ArchitectureEffect),
+) {
+    if previous.root != next.root {
+        effect(ArchitectureEffect::AddressSpace(next.root));
+    }
+    assert_ne!(next.stack_top, 0, "lane return has no kernel stack");
+    assert_eq!(next.stack_top & 0xf, 0, "lane return stack is unaligned");
+    effect(ArchitectureEffect::PrivilegeStack(next.stack_top));
+    effect(ArchitectureEffect::SyscallStack(next.stack_top));
+    if previous.root == next.root {
+        if previous.fs != next.fs {
+            effect(ArchitectureEffect::FsBase(next.fs));
+        }
+        if previous.gs != next.gs {
+            effect(ArchitectureEffect::KernelGsBase(next.gs));
+        }
+    } else {
+        effect(ArchitectureEffect::Segments(next, false));
+    }
+    effect(ArchitectureEffect::Simd(to_slot));
+}
+
+pub(in crate::multitask::scheduler) fn lane_install(
+    previous: ArchitectureState, next: ArchitectureState, to_slot: usize,
+) {
+    #[cfg(not(test))]
+    lane_effects(previous, next, to_slot, hardware_effect);
+    // Native tests model the privileged effects, as `install_model` does.
+    #[cfg(test)]
+    lane_effects(previous, next, to_slot, |effect| LANE_EFFECTS.with(|log| log.borrow_mut().push(effect)));
+}
+
+#[cfg(test)]
+std::thread_local! {
+    pub(in crate::multitask::scheduler) static LANE_EFFECTS:
+        core::cell::RefCell<std::vec::Vec<ArchitectureEffect>> = const { core::cell::RefCell::new(std::vec::Vec::new()) };
+}
+
 /// Scalar descriptions of effects, never execution or lifetime credentials.
 /// The only producer holds ReturnArchitecture's original borrowed turn/receipt
 /// across EACH effect, including SIMD and the final ready transition.

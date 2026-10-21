@@ -240,6 +240,23 @@ impl Drop for StackPin {
         RESOURCES[self.slot].unpin();
     }
 }
+impl StackPin {
+    /// Encode this unit for a parking cell (`slot + 1`; zero is empty). The cell
+    /// owns exactly this reference until `from_raw` rebuilds the unique pin.
+    pub(super) fn into_raw(self) -> usize {
+        let encoded = self.slot.checked_add(1).expect("resident pin slot overflow");
+        core::mem::forget(self);
+        encoded
+    }
+    /// Rebuild the unique pin from a cell the caller exclusively drained.
+    pub(super) fn from_raw(encoded: usize) -> Self {
+        assert_ne!(encoded, 0, "resident cell lost its allocation pin");
+        Self { slot: encoded - 1 }
+    }
+    pub(super) fn slot(&self) -> usize {
+        self.slot
+    }
+}
 
 pub(super) fn pin_view(slot: usize, task_id: u64, view: PublishedFrameView) -> Option<StackPin> {
     RESOURCES

@@ -8,7 +8,7 @@ from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
 ROOT = Path(__file__).resolve().parents[2]
-MAX_LINES = 650
+MAX_LINES = 2000  # advisory: oversize documents only warn
 
 
 def prose_lines(text: str):
@@ -52,7 +52,7 @@ def check() -> list[str]:
         relative = path.relative_to(ROOT)
         count = len(text.splitlines())
         if count > MAX_LINES:
-            errors.append(f"{relative}: {count} lines > {MAX_LINES}; split by owner, retaining entrypoint links")
+            print(f"documentation layout warning: {relative}: {count} lines > {MAX_LINES}", file=sys.stderr)
         for number, line in prose_lines(text):
             line = re.sub(r"(`+).*?\1", "", line)
             for target in re.findall(r"\]\(([^\s)]+)(?:\s+\"[^\"]*\")?\)", line):

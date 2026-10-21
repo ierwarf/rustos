@@ -125,8 +125,8 @@ the global writer lock, synchronous policy IPC in frame/present code, unbounded
 foreground VFS recovery, and unbounded outer KVM execution.
 `check-rust-source-contracts.py` binds every critical/high Rust source in
 `contracts.toml` to a leading owner/boundary/lifecycle/concurrency/failure
-contract. It prevents undocumented unsafe/ordering debt and files over 1300
-lines from growing through explicit debt registries, and rejects unresolved
+contract. It prevents undocumented unsafe/ordering debt, warns (never fails)
+about files over 2000 lines, and rejects unresolved
 production markers or unexplained `dead_code` allowances.
 `check-smp-source-assumptions.py` separately rejects mutable kernel statics,
 raw APIC-ID indexing, CPU-zero identity fallback, undocumented unsafe

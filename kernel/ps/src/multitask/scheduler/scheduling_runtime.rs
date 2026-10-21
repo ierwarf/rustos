@@ -505,6 +505,37 @@ impl FundingPin {
 }
 
 impl FundingPin {
+    /// Charge `elapsed_ns` to this still-held funding and report whether both
+    /// exact budgets stay available to a successor interval on the SAME funding
+    /// (the IPC lane's shuttle). The pin is neither dropped nor re-pinned.
+    pub(super) fn charge_in_place(
+        &self, now_ns: u64, elapsed_ns: u64,
+    ) -> Option<(u64, ChargeOutcome, bool)> {
+        let (context, domain, continues) =
+            charge_published_stamp_pair_continuing(self.stamp, self.cpu, now_ns, elapsed_ns, self.reply)?;
+        Some((
+            self.owner_task_id,
+            ChargeOutcome {
+                charged_ns: context.charged_ns.min(domain.charged_ns),
+                overrun_ns: context.overrun_ns.max(domain.overrun_ns),
+                exhausted: context.exhausted || domain.exhausted,
+            },
+            continues,
+        ))
+    }
+
+    /// Hand this funding to the next interval of the same donation chain, whose
+    /// reply label is `reply`. Identity, stamp and counts are untouched.
+    pub(super) fn relabeled(mut self, reply: u64) -> Self {
+        self.reply = reply;
+        self
+    }
+
+    /// Root owner task and reply label this funding is currently labeled with.
+    pub(super) fn label(&self) -> (u64, u64) {
+        (self.owner_task_id, self.reply)
+    }
+
     pub(super) fn charge(self, now_ns: u64, elapsed_ns: u64) -> (u64, ChargeOutcome) {
         let (context, domain) =
             charge_published_stamp_pair(self.stamp, self.cpu, now_ns, elapsed_ns, self.reply)
@@ -790,6 +821,19 @@ pub(super) fn charge_published_stamp_pair(
     elapsed_ns: u64,
     reply: u64,
 ) -> Option<(ChargeOutcome, ChargeOutcome)> {
+    charge_published_stamp_pair_continuing(stamp, cpu, now_ns, elapsed_ns, reply)
+        .map(|(context, domain, _)| (context, domain))
+}
+
+/// `charge_published_stamp_pair` that also reports, under the same paired
+/// locks, whether both budgets still have credit for a successor on this funding.
+fn charge_published_stamp_pair_continuing(
+    stamp: PagerChargeStamp,
+    cpu: usize,
+    now_ns: u64,
+    elapsed_ns: u64,
+    reply: u64,
+) -> Option<(ChargeOutcome, ChargeOutcome, bool)> {
     let context_slot = stamp
         .context_slot
         .checked_sub(1)
@@ -835,7 +879,8 @@ pub(super) fn charge_published_stamp_pair(
     if (context_outcome.exhausted || domain_outcome.exhausted) && context_outcome.charged_ns != 0 {
         context_budget.record_timeout_fault(reply);
     }
-    Some((context_outcome, domain_outcome))
+    let continues = context_budget.available() && domain_budget.available();
+    Some((context_outcome, domain_outcome, continues))
 }
 
 /// Observation of an ORIGINAL still-borrowed interval, including borrowed donor

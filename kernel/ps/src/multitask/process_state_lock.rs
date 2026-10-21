@@ -17,6 +17,8 @@ use x86_64::instructions::interrupts;
 
 use nucleus_core::util::lockdep::{self, LockClass};
 
+/// Guard owner token of a shipping fast-path acquisition (no recorded owner).
+const FAST_OWNER: usize = 0;
 const UNLOCKED: usize = 0;
 const LOCKED: usize = 1;
 const PRE_BLOCK_SPINS: usize = 256;
@@ -25,6 +27,9 @@ const MAX_WAITERS: usize = super::MAX_SCHEDULER_TASKS;
 
 pub(super) struct ProcessStateLock<T: ?Sized> {
     state: AtomicUsize,
+    /// Tasks inside `block_until_woken_or_acquired`; lets an uncontended unlock
+    /// skip the waiter queue entirely.
+    waiting: AtomicUsize,
     owner: AtomicUsize,
     owner_acquire_file_ptr: AtomicUsize,
     owner_acquire_file_len: AtomicUsize,
@@ -36,6 +41,14 @@ pub(super) struct ProcessStateLock<T: ?Sized> {
 pub(super) struct ProcessStateGuard<'a, T: ?Sized> {
     lock: &'a ProcessStateLock<T>,
     owner: usize,
+}
+
+struct WaitingGuard<'a>(&'a AtomicUsize);
+
+impl Drop for WaitingGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 struct WaitQueue {
@@ -100,6 +113,7 @@ impl<T> ProcessStateLock<T> {
     pub(super) const fn new(value: T) -> Self {
         Self {
             state: AtomicUsize::new(UNLOCKED),
+            waiting: AtomicUsize::new(0),
             owner: AtomicUsize::new(0),
             owner_acquire_file_ptr: AtomicUsize::new(0),
             owner_acquire_file_len: AtomicUsize::new(0),
@@ -131,6 +145,17 @@ impl<T: ?Sized> ProcessStateLock<T> {
         &self,
         acquire_site: &'static Location<'static>,
     ) -> ProcessStateGuard<'_, T> {
+        // Shipping images take the word with one CAS: ownership metadata,
+        // recursion proof, context assertions and the sleepable-class registry
+        // are validation and live in host, test and phase-profile builds.
+        #[cfg(all(rustos_boot_image, not(rustos_lock_phase_profile)))]
+        if self
+            .state
+            .compare_exchange(UNLOCKED, LOCKED, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            return ProcessStateGuard { lock: self, owner: FAST_OWNER };
+        }
         let owner = current_owner_token();
         self.assert_not_recursive(owner, acquire_site);
         let mut spins = 0usize;
@@ -170,6 +195,13 @@ impl<T: ?Sized> ProcessStateLock<T> {
 
     #[track_caller]
     pub(super) fn try_lock(&self) -> Option<ProcessStateGuard<'_, T>> {
+        #[cfg(all(rustos_boot_image, not(rustos_lock_phase_profile)))]
+        return self
+            .state
+            .compare_exchange(UNLOCKED, LOCKED, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+            .then_some(ProcessStateGuard { lock: self, owner: FAST_OWNER });
+        #[allow(unreachable_code)]
         let acquire_site = Location::caller();
         let owner = current_owner_token();
         if self.try_acquire(owner, acquire_site) {
@@ -217,6 +249,9 @@ impl<T: ?Sized> ProcessStateLock<T> {
         let Some(task_id) = super::current_task_id() else {
             return false;
         };
+        // SeqCst pairs with the unlock swap; see `unlock`.
+        self.waiting.fetch_add(1, Ordering::SeqCst);
+        let _waiting = WaitingGuard(&self.waiting);
         let mut acquired = false;
         let mut waiter_published = false;
 
@@ -260,15 +295,27 @@ impl<T: ?Sized> ProcessStateLock<T> {
     }
 
     fn unlock(&self, owner: usize) {
+        #[cfg(all(rustos_boot_image, not(rustos_lock_phase_profile)))]
+        if owner == FAST_OWNER {
+            // The swap is a full barrier: either a blocker's CAS sees UNLOCKED
+            // or this load sees its `waiting` increment (published before it).
+            self.state.swap(UNLOCKED, Ordering::AcqRel);
+            if self.waiting.load(Ordering::Acquire) != 0 {
+                wake_first_live_waiter(&self.waiters);
+            }
+            return;
+        }
         assert_eq!(
             self.owner.load(Ordering::Acquire),
             owner,
             "ProcessStateLock released by foreign task"
         );
         self.clear_owner();
-        self.state.store(UNLOCKED, Ordering::Release);
+        self.state.swap(UNLOCKED, Ordering::AcqRel);
         lockdep::release_sleepable_lock(owner as u64, LockClass::ProcessState as u8);
-        wake_first_live_waiter(&self.waiters);
+        if self.waiting.load(Ordering::Acquire) != 0 {
+            wake_first_live_waiter(&self.waiters);
+        }
     }
 
     fn record_owner(&self, owner: usize, acquire_site: &'static Location<'static>) {

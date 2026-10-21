@@ -13,6 +13,8 @@ use crate::user::abi::UserAbi;
 const ID: u64 = 130900;
 mod cross_root;
 mod foreign_shared;
+mod lane;
+mod switch;
 pub(in crate::multitask) fn current(f: impl FnOnce(usize)) {
     current_with_peer(false, |slot, _| f(slot));
 }

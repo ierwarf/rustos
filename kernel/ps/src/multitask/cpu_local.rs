@@ -389,6 +389,35 @@ pub(super) fn published_current_slot(cpu: usize) -> Option<usize> {
 /// Releases the outgoing stack only after the interrupt stub has changed
 /// `rsp` to the incoming saved frame. This callback must remain allocation-
 /// free, lock-free, and callable with interrupts disabled.
+/// Slot whose lane switch awaits its RSP ACK on this CPU (`usize::MAX` = none).
+/// Only that CPU's masked trap writes it, and only its commit callback reads it.
+static LANE_ACK_FROM: [AtomicUsize; MAX_TRACKED_CPUS] =
+    [const { AtomicUsize::new(usize::MAX) }; MAX_TRACKED_CPUS];
+
+/// No dispatch turn, uncommitted RSP handoff or missing Current on this CPU:
+/// the preconditions for a lane switch, which never opens a `CpuDispatchTurn`.
+pub(in crate::multitask) fn lane_idle(cpu: usize) -> bool {
+    // ORDERING: Acquire pairs with the Release stores of the RSP commit and of
+    // the current-slot publication, so a vacant observation is a settled CPU.
+    dispatch_turn::lane_vacant(cpu)
+        && !TRANSITION_ACTIVE[cpu].load(Ordering::Acquire)
+        && CURRENT_TASK_ACTIVE[cpu].load(Ordering::Acquire)
+        // ORDERING: Relaxed; only this CPU's masked trap and commit callback touch it.
+        && LANE_ACK_FROM[cpu].load(Ordering::Relaxed) == usize::MAX
+}
+
+/// Publish a lane switch exactly as a dispatch turn does (banks, Transition,
+/// Current) and arm the ACK that releases or parks the outgoing loans.
+pub(in crate::multitask) fn lane_publish(cpu: usize, from: usize, to: usize) {
+    CpuSwitchPublication::new(cpu, from, to, false).publish_before_return();
+    // ORDERING: Relaxed; see `lane_idle`. The Release stores above publish the switch.
+    LANE_ACK_FROM[cpu].store(from, Ordering::Relaxed);
+}
+
+pub(in crate::multitask) fn lane_install_placement(cpu: usize, grant: super::scheduler::PlacementGrant) {
+    dispatch_turn::install_lane_placement(cpu, grant);
+}
+
 pub(super) extern "C" fn commit_context_switch() {
     let logical_index = nucleus_core::util::lockdep::current_cpu_index();
     assert!(
@@ -410,6 +439,16 @@ pub(super) extern "C" fn commit_context_switch() {
 }
 
 pub(super) fn commit_context_switch_at_rsp(logical_index: usize, observed_rsp: Option<usize>) {
+    // ORDERING: Relaxed; see `lane_idle`.
+    let lane_from = LANE_ACK_FROM[logical_index].swap(usize::MAX, Ordering::Relaxed);
+    if lane_from != usize::MAX {
+        // A lane switch has no turn to commit: the RSP is already the incoming
+        // task's. Release Transition, then release or park the outgoing loans.
+        // ORDERING: Release makes the stack switch precede the transition clear.
+        TRANSITION_ACTIVE[logical_index].store(false, Ordering::Release);
+        super::scheduler::resident::commit_outgoing(logical_index, lane_from, true);
+        return;
+    }
     let Some(commit) = dispatch_turn::begin_commit(logical_index) else {
         return;
     };
@@ -420,13 +459,14 @@ pub(super) fn commit_context_switch_at_rsp(logical_index: usize, observed_rsp: O
     // Check original geometry and BOTH pin-bank roles before either ACK. No
     // lock, allocation, output, frame read or new permission occurs here.
     commit.assert_arrived(logical_index, rsp);
+    // ORDERING: Acquire reads the slot this CPU published with its Transition.
+    let outgoing = TRANSITION_FROM_SLOTS[logical_index].load(Ordering::Acquire);
     // ORDERING: Release makes the completed architectural stack switch happen
     // before remote scheduler/lifetime readers may observe transition clear.
     TRANSITION_ACTIVE[logical_index].store(false, Ordering::Release);
-    if commit.physical_banks() {
-        super::scheduler::stack_resources::cpu_leases::commit(logical_index);
-    }
-    super::current_identity::execution::banks::commit(logical_index);
+    // A blocking IPC return parks its loans for the lane; every other outgoing
+    // task releases them exactly as before.
+    super::scheduler::resident::commit_outgoing(logical_index, outgoing, commit.physical_banks());
     // Keep local reentry closed until the outgoing allocation has also been
     // released on the incoming RSP. A duplicate cannot spend a producer turn.
     commit.finish();

@@ -58,16 +58,7 @@ impl FrameSelection {
         if id != expected_id { return Err(Stale); }
         // SAFETY: the caller retains the original masked CPU scope.
         let reader = unsafe { frame_publication::read_for_identity(token, id, cpu) }.ok_or(Stale)?;
-        let mut view = token.view;
-        if let Some(intact) = reader.owned_canary_intact() {
-            view.stack_canary_intact &= intact;
-        }
-        let validation = context_validation::validate_published_saved_context(slot, rsp, view);
-        // SAFETY: original backing and reader exclusion span the validated POD
-        // header. No producer may execute/write it before this loan is consumed.
-        let return_to_user = validation.is_ok() && unsafe {
-            (*(rsp as *const super::SavedContext)).cs == crate::arch::gdt::user_code_selector().0 as u64
-        };
+        let (validation, return_to_user) = validate_held_frame(slot, rsp, token.view, &reader);
         if !DispatchFrame::token_current(token, cpu, custody)
             || !current_identity::read_dispatch(slot).is_some_and(|p| p.task_id == Some(id)) {
             return Err(Stale);
@@ -75,11 +66,76 @@ impl FrameSelection {
         validation.map_err(Invalid)?;
         Ok(Self { cpu, id, token, custody, return_to_user, reader })
     }
+    /// Adopt the reader a same-CPU publication already pinned and validated
+    /// with `validate_held_frame`, instead of pinning and validating again.
+    /// `now` is the post-publication token: it names the committed
+    /// DirectHandoff owner generation but must describe the same saved RSP.
+    /// A refusal returns the reader so the caller keeps it alive while it
+    /// falls back to the ordinary FIFO record.
+    ///
+    /// # Safety
+    /// `reader` was acquired for this `id` on this `cpu` under the caller's
+    /// masked scope, was never released, and `return_to_user` came from
+    /// `validate_held_frame` on that same reader and saved RSP.
+    pub(super) unsafe fn from_held(
+        cpu: usize, id: u64, now: frame_publication::StableFrameToken, saved_rsp: usize,
+        return_to_user: bool, reader: stack_resources::frame_readers::PinnedFrameReader,
+    ) -> Result<Self, stack_resources::frame_readers::PinnedFrameReader> {
+        let custody = FrameCustody::Direct;
+        if now.saved_rsp != saved_rsp || !DispatchFrame::token_current(now, cpu, custody)
+            || !current_identity::read_dispatch(now.slot).is_some_and(|p| p.task_id == Some(id)) {
+            return Err(reader);
+        }
+        Ok(Self { cpu, id, token: now, custody, return_to_user, reader })
+    }
     pub(super) fn slot(&self) -> usize { self.token.slot }
     pub(super) fn id(&self) -> u64 { self.id }
     pub(super) fn generation(&self) -> u64 { self.token.owner_generation }
     pub(super) fn custody(&self) -> FrameCustody { self.custody }
     pub(super) fn saved_rsp(&self) -> usize { self.token.saved_rsp }
+}
+
+/// Validate the saved context behind a reader this CPU already holds, exactly
+/// as selection would, and report whether it returns to user mode.
+pub(super) fn validate_held_frame(
+    slot: usize, rsp: usize, published: context_validation::PublishedFrameView,
+    reader: &stack_resources::frame_readers::PinnedFrameReader,
+) -> (Result<(), &'static str>, bool) {
+    let mut view = published;
+    if let Some(intact) = reader.owned_canary_intact() {
+        view.stack_canary_intact &= intact;
+    }
+    let validation = context_validation::validate_published_saved_context(slot, rsp, view);
+    // SAFETY: original backing and reader exclusion span the validated POD
+    // header. No producer may execute/write it before this loan is consumed.
+    let return_to_user = validation.is_ok() && unsafe {
+        (*(rsp as *const super::SavedContext)).cs == crate::arch::gdt::user_code_selector().0 as u64
+    };
+    (validation, return_to_user)
+}
+
+/// A committed same-CPU synchronous handoff: the publication kept the
+/// receiver's exact frame loan, so selection consumes it instead of a FIFO
+/// record. The receiver is DirectHandoff with neither FIFO record nor fair
+/// queue membership, so dropping this unconsumed restores fair custody.
+#[must_use]
+pub(in crate::multitask) struct DirectSwitch { selection: Option<FrameSelection> }
+impl DirectSwitch {
+    pub(super) fn new(selection: FrameSelection) -> Self { Self { selection: Some(selection) } }
+    /// Hand the loan to selection; claim failure materializes it there.
+    pub(super) fn take(mut self) -> FrameSelection {
+        self.selection.take().expect("direct switch consumed twice")
+    }
+}
+impl Drop for DirectSwitch {
+    fn drop(&mut self) {
+        if let Some(selection) = self.selection.take() {
+            let (slot, cpu, generation) = (selection.slot(), selection.cpu, selection.generation());
+            let _ = runqueue::materialize_direct_handoff_with_generation(
+                slot, cpu, runqueue::weight::value(slot), Some(generation));
+            drop(selection);
+        }
+    }
 }
 
 pub(super) struct DispatchFrame<'a> {

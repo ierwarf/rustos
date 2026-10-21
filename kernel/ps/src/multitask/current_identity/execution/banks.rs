@@ -75,11 +75,21 @@ pub(in crate::multitask) fn prepare(cpu: usize, pin: ExecutionPermit) {
     );
     drop(Banks::put(&BANKS[cpu].prepared, pin));
 }
+/// `prepare` for a lane switch, which has no dispatch turn to name the CPU: the
+/// lane's own masked scope is the CPU custody.
+pub(in crate::multitask) fn prepare_lane(cpu: usize, pin: ExecutionPermit) {
+    drop(Banks::put(&BANKS[cpu].prepared, pin));
+}
 pub(in crate::multitask) fn publish(cpu: usize, from: usize, to: usize) {
     BANKS[cpu].publish(from, to);
 }
 pub(in crate::multitask) fn commit(cpu: usize) {
     BANKS[cpu].commit();
+}
+
+/// The outgoing execution permit, for an ACK that parks it instead of releasing.
+pub(in crate::multitask) fn take_outgoing(cpu: usize) -> Option<ExecutionPermit> {
+    Banks::take(&BANKS[cpu].outgoing)
 }
 
 pub(in crate::multitask) fn owns_execution(cpu: usize, slot: usize) -> bool {

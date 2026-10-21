@@ -66,6 +66,34 @@ pub(in crate::multitask::scheduler) fn wait_instance(slot: usize) -> WaitInstanc
     })
 }
 
+/// The typed receive wake of a parked task, fused: capture, publish and clear
+/// under the one epoch leaf, without a `Binding` or a pending phase.
+///
+/// The IPC lane holds the target's resident loans (a pin and a permit keep its
+/// identity and backing alive), and the leaf is held across the owner CAS, so
+/// nothing can arm, capture or clear this wait in between. A refusal changes
+/// nothing; success advances the epoch and clears the wait payload exactly as
+/// `TypedWake::publish_and_clear` does.
+pub(in crate::multitask::scheduler) fn lane_wake_clear<R>(
+    slot: usize,
+    kind: u8,
+    id: u64,
+    publish: impl FnOnce() -> Option<R>,
+) -> Option<R> {
+    with(slot, |state| {
+        if state.pending.is_some()
+            || super::reason_locked(slot) != (kind, id)
+            || owner(slot).state.is_terminal()
+        {
+            return None;
+        }
+        let result = publish()?;
+        assert!(state.advance(), "scheduler wait epoch exhausted during lane wake");
+        super::clear_wake_locked(slot);
+        Some(result)
+    })
+}
+
 /// Non-Copy pending publication borrows the ORIGINAL actual wake binding.
 /// A nonce/payload alone is not wake, frame, execution or reuse permission.
 pub(in crate::multitask::scheduler) struct TypedWake<'a> {

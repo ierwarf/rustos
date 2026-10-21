@@ -630,6 +630,12 @@ impl<T: ?Sized, const CLASS: u8> TrackedSpinLock<T, CLASS> {
             if !irq_enabled {
                 return self.lock_lean();
             }
+            // Shipping images keep only the enforcement state (preemption depth,
+            // held-class stack, the spin); the order graph and IRQ-usage
+            // classification run in host, test and phase-profile builds.
+            #[cfg(not(rustos_lock_phase_profile))]
+            return self.lock_lean_irq();
+            #[cfg(rustos_lock_phase_profile)]
             return self.lock_with(irq_enabled);
         }
         #[cfg(not(rustos_boot_image))]
@@ -653,6 +659,8 @@ impl<T: ?Sized, const CLASS: u8> TrackedSpinLock<T, CLASS> {
 
 
     #[track_caller]
+    // DIAGNOSTIC: the full-validation acquire; shipping images use the lean paths.
+    #[cfg_attr(all(rustos_boot_image, not(rustos_lock_phase_profile)), allow(dead_code))]
     fn lock_with(&self, irq_enabled: bool) -> TrackedSpinGuard<'_, T, CLASS> {
         #[cfg(not(rustos_boot_image))]
         let _ = irq_enabled;

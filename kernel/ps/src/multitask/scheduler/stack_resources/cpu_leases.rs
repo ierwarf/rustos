@@ -148,7 +148,7 @@ impl<'scope, 'irq> CurrentAllocation<'scope, 'irq> {
 }
 
 /// Independent physical pin qualifier; no CPU bank effects on refusal.
-pub(super) fn pin_initial(slot: usize, task_id: u64) -> Option<StackPin> {
+pub(in crate::multitask::scheduler) fn pin_initial(slot: usize, task_id: u64) -> Option<StackPin> {
     let cell = RESOURCES.get(slot)?;
     let acquired = cell.with(|resources| {
         if resources.closing
@@ -272,6 +272,11 @@ pub(in crate::multitask::scheduler) fn simd_reset_custody(slot: usize) -> Option
 
 pub(in crate::multitask) fn commit(cpu: usize) {
     CPU_LEASES[cpu].commit();
+}
+
+/// The outgoing allocation pin, for an ACK that parks it instead of releasing.
+pub(in crate::multitask::scheduler) fn take_outgoing(cpu: usize) -> Option<StackPin> {
+    CpuLeases::take(&CPU_LEASES[cpu].outgoing)
 }
 
 #[cfg(test)]

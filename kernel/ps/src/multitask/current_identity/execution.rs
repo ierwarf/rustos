@@ -11,16 +11,16 @@ pub(in crate::multitask) struct ExecutionPermit {
     slot: usize,
 }
 impl ExecutionPermit {
-    pub(super) fn slot(&self) -> usize {
+    pub(in crate::multitask) fn slot(&self) -> usize {
         self.slot
     }
-    pub(super) fn park(self) -> usize {
+    pub(in crate::multitask) fn park(self) -> usize {
         let encoded = self.slot + 1;
         core::mem::forget(self);
         encoded
     }
     /// Only an atomic bank that consumed a parked unit may reconstruct it.
-    pub(super) fn take(encoded: usize) -> Option<Self> {
+    pub(in crate::multitask) fn take(encoded: usize) -> Option<Self> {
         (encoded != 0).then(|| Self { slot: encoded - 1 })
     }
 }
@@ -37,8 +37,13 @@ impl Drop for ExecutionPermit {
     }
 }
 pub(in crate::multitask) fn count(slot: usize) -> u32 {
-    REFS.get(slot)
-        .map_or(u32::MAX, |cell| cell.load(Ordering::Acquire))
+    // A resident Blocked task parks its permit in the scheduler's cell. That
+    // unit is not execution: observers asking whether the slot is quiescent
+    // must not count it, and anyone about to mutate evicts it first.
+    REFS.get(slot).map_or(u32::MAX, |cell| {
+        cell.load(Ordering::Acquire)
+            .saturating_sub(scheduler::resident_permit_units(slot))
+    })
 }
 /// UID lifetime only, never CPU execution/architecture authority.
 pub(in crate::multitask) struct BindingPin {
@@ -75,6 +80,17 @@ impl BindingPin {
             id: self.id,
         })
     }
+}
+/// One more reference to a task whose identity the caller already keeps alive
+/// through a parked or banked execution unit (the count cannot reach zero, so
+/// nothing can clear or reuse the slot while this is taken). The admission
+/// gates it checks are the lock-free publications `duplicate_donation` reads.
+pub(in crate::multitask) fn pin_held(slot: usize, id: u64) -> Option<BindingPin> {
+    let published = super::read_dispatch(slot)?;
+    if published.task_id != Some(id) || published.retired() || super::exec_intent::busy(slot) {
+        return None;
+    }
+    acquire(slot).map(|permit| BindingPin { permit, id })
 }
 pub(in crate::multitask) fn pin_creation(
     slot: usize,
@@ -135,11 +151,18 @@ pub(in crate::multitask) unsafe fn pin_current(cpu: usize, slot: usize, id: u64)
     if !crate::multitask::scheduler::stack_resources::cpu_leases::owns_current(cpu, slot) {
         return None;
     }
+    // The executing bank's own permit keeps the count above zero, so the
+    // identity and its backing cannot be cleared or reused while this extra
+    // reference is taken; the lifecycle gates are read from their lock-free
+    // publication, as `duplicate_donation` does. Terminal50 still closes new
+    // loans, through its one cleanup leaf; the identity and resource leaves a
+    // fresh wake needs prove nothing further for a task this CPU is running.
     crate::multitask::scheduler::retirement_cleanup::with_wake_binding(slot, || {
-        with_writer(slot, |writer| {
-            if writer.lifecycle.retired || writer.lifecycle.suspended { return None; }
-            pin_binding(slot, writer, id)
-        })?
+        let published = super::read_dispatch(slot)?;
+        if published.task_id != Some(id) || published.retired() || published.suspended() {
+            return None;
+        }
+        acquire(slot).map(|permit| BindingPin { permit, id })
     })?
 }
 

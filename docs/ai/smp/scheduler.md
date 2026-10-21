@@ -320,7 +320,19 @@ custody for the exact peer needed to advance it:
   one quantum charge once, and after the elapsed-time budget one ordinary
   fairness turn is mandatory without consuming or reordering the FIFO;
 - speculative endpoint wake hints without a live reply capability remain
-  replaceable and below the absolute overdue gate.
+  replaceable and below the absolute overdue gate;
+- a same-CPU call or reply may skip the FIFO record. `publish_switching`
+  keeps the receiver's pinned frame reader from publication, commits the
+  `DirectHandoff` owner and hands that reader to `dispatcher::fast_switch` as a
+  `DirectSwitch`, which runs the same prologue, original claim and completion
+  as FIFO selection. It is taken only when selection would take this handoff
+  first: no older record is queued on the CPU, no activation prefix is pending,
+  and an exhausted chain (`sync_handoff::chain::chain_exhausted`) is not owed to
+  a ready fair competitor. A reply additionally requires a caller that blocked
+  on this CPU within the last millisecond; a longer sleeper takes the ordinary
+  wake, which lifts its virtual-time floor. Nothing fails after the owner CAS:
+  an unadoptable loan publishes the ordinary FIFO record, and an unused
+  `DirectSwitch` materializes the receiver back into fair custody on drop.
 
 This follows QNX synchronous message passing, where execution transfers
 directly through send/receive/reply and the reply makes the client ready, and

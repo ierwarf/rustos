@@ -58,6 +58,13 @@ impl TurnCell {
             *self.installed_placement.get() = Some(grant);
         }
     }
+    fn complete_placement_vacant(&self, grant: PlacementGrant) {
+        grant.acknowledge();
+        // SAFETY: Vacant turn on this masked CPU; the lane is the sole actor.
+        unsafe {
+            *self.installed_placement.get() = Some(grant);
+        }
+    }
     fn begin(&self, cpu: usize, from: usize) -> Option<CpuDispatchTurn<'_>> {
         self.phase
             .compare_exchange(VACANT, OPEN, Ordering::AcqRel, Ordering::Acquire)
@@ -618,6 +625,18 @@ pub(super) fn current_cpu() -> usize {
     );
     cpu
 }
+/// No turn is open or awaiting its RSP on this CPU.
+pub(super) fn lane_vacant(cpu: usize) -> bool {
+    TURNS.get(cpu).is_some_and(|cell| cell.phase.load(Ordering::Acquire) == VACANT)
+}
+
+/// A lane switch installs the incoming task's placement as the CPU's Current
+/// permission, where a turn's ACK would. Requires a vacant turn cell.
+pub(super) fn install_lane_placement(cpu: usize, grant: PlacementGrant) {
+    assert_eq!(TURNS[cpu].phase.load(Ordering::Acquire), VACANT, "lane placement over a live turn");
+    TURNS[cpu].complete_placement_vacant(grant);
+}
+
 pub(super) fn begin_commit(cpu: usize) -> Option<CpuRspCommit<'static>> {
     TURNS[cpu].begin_commit()
 }

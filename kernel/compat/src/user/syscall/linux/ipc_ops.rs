@@ -663,6 +663,11 @@ fn authorize_current_process_ipc_call(
         usermem::current_user_address_space().map_err(address_space_error_to_linux_errno)?;
     let process_id = retained_mm.process_id();
     for index in 0..MAX_SERVICE_ENDPOINTS {
+        // Cheap prefilter: the stable snapshot below also checks the owner's
+        // exit state, which only matters for the slot that names this endpoint.
+        if SERVICE_ENDPOINTS[index].load(Ordering::Relaxed) != endpoint {
+            continue;
+        }
         let Some(publication) = stable_published_service_endpoint(index) else {
             continue;
         };
@@ -2126,6 +2131,22 @@ fn recv_with_sender_blocking_prepared_inner(
     let mut yielded = false;
     let take_mark = server_phase_mark();
     loop {
+        // Just woken by a handoff: the sender's request is already addressed to
+        // this task, so take it directly instead of arming, searching and
+        // cancelling. Anything else (no request, wrong size) takes the full path.
+        if yielded
+            && let Ok(Some(received)) = kernel_ipc_runtime::api::endpoint::take_fast_request_within(
+                endpoint, task_id, request_capacity)
+        {
+            note_fast_ipc(IpcFastCounter::ReceiverTaken);
+            let write_mark = charge_server_phase(IpcServerPhase::RecvTake, take_mark);
+            let result = write_fast_endpoint_request_with_sender(
+                received, retained_mm, request_ptr, reply_cap_ptr, sender_pid_ptr, sender_tid_ptr,
+            )
+            .map_err(|errno| (errno, yielded));
+            let _ = charge_server_phase(IpcServerPhase::RecvWrite, write_mark);
+            return result.map(|received| (received, yielded));
+        }
         // Arm first. The endpoint then decides receive vs waiter publication
         // under one guard; a sender after publication still withdraws this arm
         // before commit, exactly as in the split check-arm-recheck protocol.

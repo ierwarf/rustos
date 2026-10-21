@@ -169,6 +169,18 @@ pub(super) fn reply_with(
     task_id: u64,
     eligible_cpus: &dyn Fn(usize) -> u64,
 ) -> bool {
+    reply_switching(preemption, reply, task_id, eligible_cpus, None)
+}
+
+/// `reply_with` that may hand a same-CPU caller's frame loan to the dispatcher
+/// through `switch`; any condition it cannot prove leaves the ordinary wake.
+pub(super) fn reply_switching(
+    preemption: &nucleus_core::util::lockdep::DispatchPreemption<'_>,
+    reply: u64,
+    task_id: u64,
+    eligible_cpus: &dyn Fn(usize) -> u64,
+    switch: Option<&mut Option<dispatch_claim::DirectSwitch>>,
+) -> bool {
     if !preemption.is_masked()
         || preemption.cpu() != nucleus_core::util::lockdep::current_cpu_index()
     {
@@ -178,6 +190,11 @@ pub(super) fn reply_with(
     let Some(binding) = Binding::resolve(task_id) else {
         return false;
     };
+    if let Some(switch) = switch {
+        if ipc_publication::reply_direct(preemption, reply, &binding, eligible_cpus, switch) {
+            return true;
+        }
+    }
     // SAFETY: the original borrowed masked CPU survives the returned loan.
     let Ok(binding) = (unsafe {
         retained_wake_matching_sync(

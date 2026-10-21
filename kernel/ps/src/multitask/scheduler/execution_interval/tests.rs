@@ -113,7 +113,7 @@ fn a_cpu_interval_is_consumed_once_and_uses_only_its_own_clock_domain() {
             task_id: 91_004,
             running_generation: 3,
             start_ticks: 0,
-            start_local_ns: 100,
+            start_local_ns: 100, charge_from_ticks: 0, charge_from_local_ns: 100,
             funding: None,
         },
     );
@@ -136,7 +136,7 @@ fn a_cpu_interval_is_consumed_once_and_uses_only_its_own_clock_domain() {
             task_id: 91_005,
             running_generation: 4,
             start_ticks: 2,
-            start_local_ns: 0,
+            start_local_ns: 0, charge_from_ticks: 2, charge_from_local_ns: 0,
             funding: None,
         },
     );
@@ -195,7 +195,7 @@ fn prepared_grant_keeps_its_funder_after_donation_publication_changes() {
     super::super::super::current_identity::publish_metadata(receiver, Some(own));
     let original = ExecutionInterval {
         slot: receiver, task_id: 93002, running_generation: 1,
-        start_ticks: 1, start_local_ns: 0, funding: Some(pin),
+        start_ticks: 1, start_local_ns: 0, charge_from_ticks: 1, charge_from_local_ns: 0, funding: Some(pin),
     };
     assert!(!scheduling_runtime::close_for_reclaim(61, lender_identity));
     // Current publication has no borrowed donor. Opening must consume the
@@ -247,7 +247,7 @@ fn original_current_snapshot_retains_exact_timeout_reply_and_pair_after_shared_e
     let peer = scheduling_runtime::pin_published_funding(stamp, 0, 93011, 0xdef).unwrap();
     runqueue::admit_running(60, 0);
     install(0, ExecutionInterval { slot: 60, task_id: 93012, running_generation: 1,
-        start_ticks: 1, start_local_ns: 0, funding: Some(original) });
+        start_ticks: 1, start_local_ns: 0, charge_from_ticks: 1, charge_from_local_ns: 0, funding: Some(original) });
     // Another admitted charge can exhaust shared credit; this existing original
     // interval still owns the pair. It must observe the exact fault, not re-admit.
     assert_eq!(peer.charge(100, 4500).1.overrun_ns, 500);
@@ -318,13 +318,13 @@ fn cancellation_cannot_settle_active_funding_or_clear_a_foreign_cpu_grant() {
             task_id: 94012,
             running_generation: 9,
             start_ticks: 1,
-            start_local_ns: 0,
+            start_local_ns: 0, charge_from_ticks: 1, charge_from_local_ns: 0,
             funding: Some(active),
         },
     );
     let foreign = ExecutionInterval {
         slot: 63, task_id: 94014, running_generation: 10,
-        start_ticks: 1, start_local_ns: 0, funding: None,
+        start_ticks: 1, start_local_ns: 0, charge_from_ticks: 1, charge_from_local_ns: 0, funding: None,
     };
     install(1, foreign);
     drop(unused);
@@ -377,7 +377,7 @@ fn changed_return_requires_exact_running_identity_generation_and_active_interval
                 task_id: id,
                 running_generation: saved_generation,
                 start_ticks: 0,
-                start_local_ns: 0,
+                start_local_ns: 0, charge_from_ticks: 0, charge_from_local_ns: 0,
                 funding: None,
             },
         );
@@ -395,7 +395,7 @@ fn changed_return_requires_exact_running_identity_generation_and_active_interval
             task_id: 94022,
             running_generation: generation,
             start_ticks: 0,
-            start_local_ns: 0,
+            start_local_ns: 0, charge_from_ticks: 0, charge_from_local_ns: 0,
             funding: None,
         },
     );

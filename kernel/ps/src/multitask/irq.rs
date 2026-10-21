@@ -744,19 +744,69 @@ extern "C" fn software_schedule_interrupt_dispatch(
     let reschedule_goal = super::reschedule_observation::claim_pending(logical_index)
         .expect("software scheduling request lost before dispatch");
     let current_rsp = context_ptr as usize;
+    // A call between two resident tasks on this CPU switches here, without a
+    // dispatch turn. Declining changes nothing; `Generic` has already committed
+    // the caller and woken the receiver, so only the ordinary pick remains.
+    let mut lane_generic = false;
+    if let Some((endpoint, reply, receiver_task_id)) = fast_ipc_call {
+        let mut lane_scope = nucleus_core::util::lockdep::DispatchPreemption::enter();
+        lane_scope.mask_irqs();
+        match super::scheduler::ipc_lane::call(&lane_scope, endpoint, reply, receiver_task_id, current_rsp) {
+            super::scheduler::ipc_lane::Outcome::Switched(next_rsp) => {
+                // The mask outlives this scope until the stub's iretq restores flags.
+                lane_scope.retain_irq_mask();
+                drop(lane_scope);
+                let _ = fast_ipc::stamp_fast_ipc_call_outcome(
+                    context_ptr, super::scheduler::FastIpcCallHandoffOutcome::CommittedSameCpu);
+                return next_rsp as *mut SavedContext;
+            }
+            super::scheduler::ipc_lane::Outcome::Generic => lane_generic = true,
+            super::scheduler::ipc_lane::Outcome::Declined => {}
+        }
+    }
+    let mut lane_reply_woke = false;
+    if let Some((reply, caller_task_id, context_owner_task_id, context_slot, context_generation)) =
+        fast_ipc_reply
+    {
+        let scheduling_context = kernel_object::api::identity::ObjectIdentity::new(
+            kernel_object::api::identity::ObjectOwner::Ps,
+            kernel_object::api::identity::ObjectKind::SchedulingContext,
+            context_slot,
+            context_generation,
+        )
+        .expect("fast IPC reply trap carried an invalid scheduling-context identity");
+        let mut lane_scope = nucleus_core::util::lockdep::DispatchPreemption::enter();
+        lane_scope.mask_irqs();
+        match super::scheduler::ipc_lane::reply(&lane_scope, reply, caller_task_id,
+            context_owner_task_id, scheduling_context, current_rsp)
+        {
+            super::scheduler::ipc_lane::Outcome::Switched(next_rsp) => {
+                lane_scope.retain_irq_mask();
+                drop(lane_scope);
+                return next_rsp as *mut SavedContext;
+            }
+            super::scheduler::ipc_lane::Outcome::Generic => lane_reply_woke = true,
+            super::scheduler::ipc_lane::Outcome::Declined => {}
+        }
+    }
     let (next_rsp, user_dispatch, runtime_profile, fast_ipc_outcome) = {
         let mut entry = DispatchEntry::enter();
         entry.save_simd();
         super::scheduler::runtime_profile::record_entry(super::scheduler::SchedulerEntryCause::Software);
         let runtime_profile = super::scheduler::runtime_profile::take_owned(entry.turn(), crate::arch::rtc::ticks());
-        let fast_ipc_outcome = fast_ipc_call.map(|(endpoint, reply, receiver_task_id)| {
-            // Direct custody must be recorded in the sole FIFO before the
-            // independent dispatcher can consume it. The scalar peer ID is
-            // only a hint; it cannot replace the original record generation.
-            super::scheduler::ipc_publication::call(
-                entry.preemption(), endpoint, reply, receiver_task_id,
-            )
-        });
+        // A committed same-CPU handoff may carry its receiver frame loan to the
+        // dispatcher in `switch`; otherwise direct custody is recorded in the
+        // sole FIFO. The scalar peer ID is only a hint either way.
+        let mut switch = None;
+        let fast_ipc_outcome = if lane_generic {
+            Some(super::scheduler::FastIpcCallHandoffOutcome::CommittedSameCpu)
+        } else {
+            fast_ipc_call.map(|(endpoint, reply, receiver_task_id)| {
+                super::scheduler::ipc_publication::call_switching(
+                    entry.preemption(), endpoint, reply, receiver_task_id, &mut switch,
+                )
+            })
+        };
         if fast_ipc_outcome.is_some_and(|outcome| {
             !matches!(
                 outcome,
@@ -765,6 +815,7 @@ extern "C" fn software_schedule_interrupt_dispatch(
             )
         }) {
             let outcome = fast_ipc_outcome.unwrap();
+            drop(switch);
             drop(entry);
             super::reschedule_observation::record_consumption(
                 logical_index,
@@ -773,7 +824,7 @@ extern "C" fn software_schedule_interrupt_dispatch(
             );
             return fast_ipc::stamp_fast_ipc_call_outcome(context_ptr, outcome);
         }
-        let mut immediate_task_id = fast_ipc_call.and_then(|(_, _, receiver_task_id)| {
+        let mut immediate_task_id = fast_ipc_call.filter(|_| !lane_generic).and_then(|(_, _, receiver_task_id)| {
             fast_ipc_outcome
                 .is_some_and(|outcome| {
                     outcome == super::scheduler::FastIpcCallHandoffOutcome::CommittedSameCpu
@@ -795,14 +846,20 @@ extern "C" fn software_schedule_interrupt_dispatch(
                 context_generation,
             )
             .expect("fast IPC reply trap carried an invalid scheduling-context identity");
-            let outcome = super::scheduler::ipc_publication::reply(
+            let outcome = if lane_reply_woke {
+                // The lane already woke the caller through the ordinary reply wake.
+                super::scheduler::FastIpcReplyHandoffOutcome::LocalFallback
+            } else {
+                super::scheduler::ipc_publication::reply_switching(
                     entry.preemption(),
                     reply,
                     caller_task_id,
                     context_owner_task_id,
                     scheduling_context,
+                    &mut switch,
                 )
-                .expect("fast IPC reply trap carried stale scheduling-context custody");
+                .expect("fast IPC reply trap carried stale scheduling-context custody")
+            };
             // The producer publishes typed fair/FIFO custody, not a Direct
             // execution grant. Its successful outcome may request an attempt
             // through that SAME FIFO; requiring the removed Direct producer
@@ -814,7 +871,8 @@ extern "C" fn software_schedule_interrupt_dispatch(
         // A committed same-CPU fastpath carries its exact peer directly
         // through this scheduler transaction. Generic and cross-CPU handoffs
         // retain the ordered FIFO path.
-        let (dispatch, exact_fast_dispatch) = entry.dispatch(current_rsp, true, immediate_task_id);
+        let (dispatch, exact_fast_dispatch) =
+            entry.dispatch_switching(current_rsp, true, immediate_task_id, switch);
         let user = entry.install(dispatch, exact_fast_dispatch);
         (dispatch.next_rsp, user, runtime_profile, fast_ipc_outcome)
     };

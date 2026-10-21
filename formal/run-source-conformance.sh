@@ -1204,7 +1204,7 @@ if ! grep -Fq 'scheduler::wake_publication::reply(reply, task_id)' <<<"$reply_cu
     || ! grep -Fq 'dispatch_priority::Publication::begin(scope, token.target_cpu())' <<<"$reply_owned_body" \
     || ! grep -Fq 'donation_ledger::release_reply(reply, ipc_donation::DonationNamespace::IpcReply)' <<<"$reply_owned_body" \
     || grep -Fq 'fn complete_ipc_reply_wake_handoff(' <<<"$reply_scheduler_body" \
-    || ! grep -Fq 'wake_publication::reply_with(scope, reply, caller, eligible_cpus)' <<<"$reply_scheduler_body" \
+    || ! grep -Fq 'wake_publication::reply_switching(scope, reply, caller, eligible_cpus, switch)' <<<"$reply_scheduler_body" \
     || ! grep -Fq 'if !owner_still_matches(token)' <<<"$reply_enqueue_body" \
     || ! grep -Fq 'owner_still_matches(token) && retained' <<<"$reply_enqueue_body" \
     || ! grep -Fq 'record.has_current_dispatch_custody()' <<<"$reply_selection_body" \

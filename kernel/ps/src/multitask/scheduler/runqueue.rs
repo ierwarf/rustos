@@ -61,6 +61,9 @@ pub(super) use ipc_handoff::{
     publish_remote_wake, rehome_queued, rehome_queued_frame, rehome_queued_owned, rollback_direct_handoff,
 };
 
+mod lane;
+pub(super) use lane::lane_cas;
+
 const OWNER_STATE_BITS: u64 = 4;
 const OWNER_CPU_BITS: u64 = 8;
 const OWNER_STATE_MASK: u64 = (1 << OWNER_STATE_BITS) - 1;
@@ -303,8 +306,25 @@ impl RunOwnerWord {
         expected: RunOwnerSnapshot,
         next: RunOwnerSnapshot,
     ) -> Result<(), RunOwnerSnapshot> {
-        // ORDERING: AcqRel is the task-ownership linearization point. Failure
-        // uses Acquire so the loser can act idempotently on the winning state.
+        self.compare_exchange_raw(expected, next)?;
+        if expected.generation != next.generation {
+            // Every transition out of a generation revokes a cell parked for
+            // it; only `compare_exchange_taking` may keep the loans.
+            super::resident::on_owner_transition(self.slot(), expected.generation);
+        }
+        Ok(())
+    }
+
+    /// The CAS without the residency hook. The caller promises to settle the
+    /// resident cell of `expected.generation` itself (take it or evict it).
+    fn compare_exchange_raw(
+        &self,
+        expected: RunOwnerSnapshot,
+        next: RunOwnerSnapshot,
+    ) -> Result<(), RunOwnerSnapshot> {
+        // ORDERING: AcqRel is the task-ownership linearization point; failure
+        // uses Acquire so the loser acts on the winning state. On x86 the
+        // lock-prefixed RMW also pairs with the parker's fence in `resident::park`.
         self.0
             .compare_exchange(
                 expected.encode(),
@@ -314,6 +334,10 @@ impl RunOwnerWord {
             )
             .map(|_| ())
             .map_err(RunOwnerSnapshot::decode)
+    }
+
+    fn slot(&self) -> usize {
+        (self as *const Self as usize - OWNER_WORDS.as_ptr() as usize) / size_of::<RunOwnerWord>()
     }
 
     fn store_reset(&self) {
@@ -506,6 +530,7 @@ impl RemoteWakeMailbox {
 }
 
 static OWNER_WORDS: [RunOwnerWord; MAX_TASK] = [const { RunOwnerWord::new() }; MAX_TASK];
+
 static RUN_QUEUES: [PerCpuRunQueue; MAX_TRACKED_CPUS] =
     [const { PerCpuRunQueue::new() }; MAX_TRACKED_CPUS];
 static REMOTE_WAKE_MAILBOXES: [IrqLeaf<

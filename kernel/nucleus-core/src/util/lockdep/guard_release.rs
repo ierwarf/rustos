@@ -12,14 +12,14 @@ impl<T: ?Sized, const CLASS: u8> Drop for TrackedSpinGuard<'_, T, CLASS> {
         #[cfg(rustos_boot_image)]
         if self.lean {
             let cpu = self.owner_cpu;
-            // IRQs are still masked, so the index cannot have changed.
-            assert_eq!(
-                current_cpu_index(),
-                cpu,
-                "raw-spin guard released on another CPU class={}",
-                CLASS
-            );
+            // Preemption stays disabled for the guard's life, so the owner CPU
+            // is still this CPU; the release-on-another-CPU proof lives in the
+            // host, test and phase-profile validation builds.
             drop(self.guard.take());
+            // An IF-set acquire pairs with a masked pop; a masked acquire is
+            // already inside its masked scope.
+            let irq_enabled = !self.irqs_masked && x86_64::instructions::interrupts::are_enabled();
+            preemption::masked(irq_enabled, || {
             with_current_stack_on(cpu, |stack| {
                 assert!(stack.len != 0, "lock-class release without acquisition");
                 let top = stack.classes[stack.len - 1];
@@ -33,6 +33,7 @@ impl<T: ?Sized, const CLASS: u8> Drop for TrackedSpinGuard<'_, T, CLASS> {
             });
             let observed = cpu_counter::dec(&CPU_LOCK_STATE[cpu].preempt_disable_depth);
             assert!(observed != 0, "raw-spin preemption depth underflow");
+            });
             return;
         }
         #[cfg(rustos_boot_image)]

@@ -27,6 +27,7 @@ use nucleus_core::util::lockdep::{LockClass, MAX_TRACKED_CPUS};
 use crate::multitask::irq_leaf::IrqLeaf;
 
 use super::{MAX_SYNC_HANDOFF_CHAIN_TICKS, MAX_TASK, runqueue};
+pub(super) mod chain;
 
 pub(super) type SyncHandoffLock =
     IrqLeaf<SyncHandoffState, { LockClass::SchedulerPolicy as u8 }>;

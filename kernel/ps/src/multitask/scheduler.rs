@@ -45,6 +45,7 @@ pub(in crate::multitask) mod dispatch_priority;
 mod donation_ledger;
 pub(super) mod donation_publication;
 pub(in crate::multitask) mod ipc_publication;
+pub(in crate::multitask) mod ipc_lane;
 mod frame_observation;
 mod frame_publication;
 pub(in crate::multitask) mod rsp_handoff;
@@ -63,6 +64,7 @@ pub(super) mod reaper;
 mod reclaim;
 pub(super) mod retirement_cleanup;
 mod runqueue;
+pub(in crate::multitask) mod resident;
 mod terminal_quarantine;
 pub(super) mod wake_publication;
 pub(super) mod wake_retry;
@@ -84,7 +86,7 @@ mod current_wait;
 pub(super) mod current_class;
 pub(in crate::multitask) mod current_return;
 pub(in crate::multitask) mod outgoing_image;
-mod dispatch_claim;
+pub(in crate::multitask) mod dispatch_claim;
 mod task_weight;
 pub use runtime_profile::drain_scheduler_runtime_profile;
 pub(in crate::multitask) use runtime_profile::{
@@ -109,6 +111,11 @@ pub(in crate::multitask) fn local_dispatch_work_pending(cpu: usize) -> bool {
 }
 /// Reads the effective scheduling-context owner and live donation reply from
 /// the lock-free custody ledger. Native execution deliberately returns `None`.
+/// Permit units a parked resident cell holds for `slot` (see `resident`).
+pub(in crate::multitask) fn resident_permit_units(slot: usize) -> u32 {
+    resident::permit_units(slot)
+}
+
 pub(in crate::multitask) fn borrowed_context_charge_token(slot: usize) -> Option<(usize, u64)> {
     donation_ledger::borrowed_context_charge_token(slot)
 }
