@@ -38,7 +38,11 @@ cargo xtask fuzz-host --target all
 
 ### KVM parallel boot smoke
 
-Run the following on a host with `/dev/kvm` access and `qemu-system-x86_64`:
+Runtime smoke requires `qemu-system-x86_64`, read/write access to `/dev/kvm`
+and `/dev/vhost-vsock`, and, for the ordinary virtual display, exactly one
+accessible `/dev/dri/renderD*` node owned by the `amdgpu` driver (PCI vendor
+`0x1002`). Intel/NVIDIA render nodes do not satisfy this admission contract.
+`--dry-run` prepares inputs without these runtime device-admission checks.
 
 ```bash
 cargo xtask build-dvm
@@ -99,7 +103,11 @@ release key는 repository 밖에 둡니다.
 
 ### KVM 병렬 부팅 smoke
 
-`/dev/kvm` 접근과 `qemu-system-x86_64`가 있는 host에서 실행합니다.
+실제 smoke에는 `qemu-system-x86_64`, read/write `/dev/kvm` 및
+`/dev/vhost-vsock` 접근이 필요합니다. 기본 가상 display에는 `amdgpu` driver
+소유(PCI vendor `0x1002`)의 접근 가능한 `/dev/dri/renderD*` node가 정확히
+하나 있어야 합니다. Intel/NVIDIA node는 이 조건을 충족하지 않습니다.
+`--dry-run`은 이 실행 시점 장치 admission 없이 입력만 준비합니다.
 
 ```bash
 cargo xtask build-dvm

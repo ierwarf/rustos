@@ -36,6 +36,19 @@
   queue discard, peer exit, and service-epoch replacement release every queued
   batch. Destination FD numbers remain invisible reservations until data,
   control, and message-header copyout all succeed, then publish atomically.
+  Local `recvmsg` snapshots options/credentials, sizes the complete reply,
+  dequeues and encodes under one netd state transaction; bounds rejection must
+  precede byte/control movement. Ancillary admission charges aligned segment
+  lengths against a 16 KiB socket budget and a shared 16 KiB budget for each
+  listener's unaccepted sockets, including in-flight accepts. Exceeding either
+  returns `EAGAIN` without consuming bytes or sender authority. Successful
+  accept publication ends listener-budget custody without dropping control.
+  Final listener close retires queued unpublished sockets and marks clients
+  peer-closed. An in-flight failed accept requeues if the listener is live;
+  otherwise its cleanup-only error reply returns its unpublished peer's queued
+  authority once. Compat validates the full wire envelope and consumes release
+  trailers before returning errno. ACCEPT permits a trailer only on error and
+  only when `reserved0 == payload_len`; successful ACCEPT permits none.
 - Supervisor services draining independent brokers must use `SYS_RUSTOS_IPC_TRY_RECV`, not blocking `SYS_RUSTOS_IPC_RECV`. Their *idle* wait is `SYS_RUSTOS_IPC_RECV_WITH_SENDER_BOUNDED`, not a timer; see the IPC Wait Discipline section.
 - FD-table transfer goes through `kernel_ps::api::TransferredHandleEntry` + `HandleTable::{duplicate_for_transfer, install_transferred}`. Source class + rights must permit descriptor transfer; directory FDs are file capabilities and transferable for VFS migration.
 - Userspace handle-aware IPC: `SYS_RUSTOS_IPC_{CALL,RECV,REPLY}_WITH_HANDLES` with `Ipc*WithHandlesArgs`. Send handles = Linux fd arrays; received handles install into receiver fd table and return as `i32` fd arrays + `u16` count. `recv_fd_count_ptr` mandatory even when no handles returned. Counts bounded by `IPC_MAX_TRANSFER_HANDLES`.
@@ -274,13 +287,13 @@
   to foreground I/O, and the deadline must exceed a normal SMP IPC round trip
   so cancellation cannot amplify retries into revoked-reply queue pressure.
 - Deferred netd reference reconciliation follows the same one-attempt,
-  housekeeping-owned 100 ms control bound. A foreground dup/close divides one
-  16 ms total operation deadline across its retries and always defers the
-  acknowledgement; operation replay and acknowledgement are separate
-  housekeeping turns.
-  Eight-entry operation-plus-ack bursts and three independent 16 ms retries
-  are forbidden because their cumulative wait is not bounded by the caller's
-  advertised deadline.
+  housekeeping-owned 100 ms control bound. A foreground netd DUP/final CLOSE
+  owns one complete 100 ms interactive-control deadline; only early transport
+  failures may retry within its remaining time, never a real timeout. It
+  defers the acknowledgement; exact operation replay and acknowledgement are
+  separate housekeeping turns. The 16 ms rail is for non-consuming readiness
+  queries, not reference mutations. Eight-entry operation-plus-ack bursts or
+  retries that restart the caller's deadline are forbidden.
 - Performance diagnostics are bounded evidence: early-call samples and
   threshold crossings only. They may not print per request, hold a policy
   lock, allocate an unbounded record, or become a prerequisite for forward

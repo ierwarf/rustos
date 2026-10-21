@@ -72,8 +72,10 @@ cargo xtask build
 cargo xtask kvm-smoke --dry-run
 ```
 
-For the Linux driver-domain smoke path on a host with `/dev/kvm` and
-`qemu-system-x86_64`:
+For the Linux driver-domain smoke path, use `qemu-system-x86_64` with
+read/write `/dev/kvm` and `/dev/vhost-vsock` access. The virtual display also
+requires exactly one accessible AMDGPU render node; see the full
+[host prerequisites](docs/getting-started.md#kvm-parallel-boot-smoke).
 
 ```bash
 cargo xtask build-dvm
@@ -190,8 +192,10 @@ cargo xtask build
 cargo xtask kvm-smoke --dry-run
 ```
 
-`/dev/kvm`과 `qemu-system-x86_64`를 사용할 수 있는 host에서 Linux DVM smoke
-경로를 실행하려면:
+Linux DVM smoke에는 `qemu-system-x86_64`, read/write `/dev/kvm` 및
+`/dev/vhost-vsock`, 가상 display용 접근 가능한 AMDGPU render node 정확히
+하나가 필요합니다. 전체 조건은 [시작 안내](docs/getting-started.md#kvm-병렬-부팅-smoke)를
+참고하세요.
 
 ```bash
 cargo xtask build-dvm

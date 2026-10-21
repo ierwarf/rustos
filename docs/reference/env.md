@@ -33,8 +33,10 @@
 | `RUSTOS_WAYCLICK_PROFILE` | disabled | Enable WayClick frame-lifecycle profiling; `xtask kvm-smoke --min-ui-fps` changes only its private KVM disk copy. |
 
 Most build variables are parsed by `tools/xtask/src/config/mod.rs`. KVM
-execution is in `tools/xtask/src/kvm.rs`; it requires `/dev/kvm` access and a
-QEMU binary, and never changes the host hypervisor configuration.
+execution is in `tools/xtask/src/kvm.rs`; runtime admission requires QEMU,
+read/write KVM/vhost-vsock, and the virtual display's exact AMDGPU render node
+([host prerequisites](../getting-started.md#kvm-parallel-boot-smoke)). It never
+changes the host hypervisor configuration; dry-run does not admit devices.
 
 <a id="korean"></a>
 
@@ -67,5 +69,7 @@ QEMU binary, and never changes the host hypervisor configuration.
 | `RUSTOS_WAYCLICK_PROFILE` | disabled | WayClick frame lifecycle profile 활성화. `xtask kvm-smoke --min-ui-fps`는 private KVM disk copy만 변경 |
 
 대부분의 build variable은 `tools/xtask/src/config/mod.rs`에서 읽습니다. KVM
-실행은 `tools/xtask/src/kvm.rs`에 있으며 `/dev/kvm` 접근과 QEMU가 필요합니다.
+실행은 `tools/xtask/src/kvm.rs`에 있으며 QEMU, read/write KVM/vhost-vsock,
+가상 display용 정확한 AMDGPU render node가 필요합니다
+([host 조건](../getting-started.md#kvm-병렬-부팅-smoke)). Dry-run은 장치를 admission하지 않습니다.
 xtask가 host hypervisor 설정을 바꾸지는 않습니다.

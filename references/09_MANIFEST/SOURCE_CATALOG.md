@@ -1,6 +1,9 @@
 # Source catalog
 
-이 목록은 공식 저장소·공식 문서 우선이다. `mode=fetch` 항목은 전체 소스를 ZIP에 복제하지 않고 공식 원본에서 재현 가능하게 받는다.
+이 목록은 공식 저장소·공식 문서 우선이다. `mode=fetch` 항목은 전체 소스를
+ZIP에 복제하지 않고 공식 원본의 현재 revision을 받아 commit을 기록한다.
+`Ref`의 branch 이름은 움직일 수 있으므로 과거 snapshot의 정확한 재현에는
+기록된 commit으로 별도 checkout해야 한다.
 
 | Name | URL | Ref | Focus | Mode |
 |---|---|---|---|---|

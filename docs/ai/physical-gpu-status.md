@@ -52,11 +52,12 @@ virtual result does not change the user-deferred physical-GPU FPS/reset gate.
 Ring0 must continue to avoid inspecting inputd, netd, vfsd, or uiserver private
 queues.
 
-The existing uiserver input reader remains a safe bounded bridge. It performs a
-zero-time poll whose inputd `STATS` request has a 16 ms deadline before starting
-an authorized `READ`, preventing an empty-queue read from freezing uiserver. Do
-not remove it until the common wait-set path has equivalent runtime lost-wake
-and restart evidence.
+The demoted uiserver input reader now registers its input descriptions with
+the common epoll wait set and blocks in `epoll_wait(..., -1)`. It fails closed
+on provider error/revoke and performs an authorized read after positive
+readiness; periodic zero-time poll/`STATS` probes are retired. Source/model
+coverage does not by itself close runtime lost-wake or live service-crash
+injection/recovery evidence.
 
 ## Continuation rules
 

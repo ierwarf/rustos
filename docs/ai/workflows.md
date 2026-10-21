@@ -1,6 +1,9 @@
 # AI Workflows
 
 Follow `AGENTS.md`; load token policy or the task router only when their specific budget/routing detail is needed.
+After product-source edits, run `cargo xtask dev-plan`, execute its `now` lane
+while iterating, and run relevant `stable-batch` checks once stable. The source
+recipes below use that plan for check/build selection, not ad hoc substitutes.
 
 ## Add service
 
@@ -9,7 +12,7 @@ Follow `AGENTS.md`; load token policy or the task router only when their specifi
 3. Add crate under `services/<name>`.
 4. Add workspace member.
 5. Add manifest with `kind = "service"`, `execution_domain = "user"`.
-6. Run `cargo xtask check`.
+6. Run the dev-plan `now` lane, then relevant `stable-batch` checks once stable.
 7. Update docs only if manifest/runtime behavior changes.
 
 ## Add app
@@ -18,7 +21,7 @@ Follow `AGENTS.md`; load token policy or the task router only when their specifi
 2. Inspect `apps/wayclick/RUSTOS.package.toml` or `apps/shell/RUSTOS.package.toml`.
 3. Choose Rust/C/Windows app path.
 4. Add manifest and desktop entry.
-5. Run `cargo xtask check`.
+5. Run the dev-plan `now` lane, then relevant `stable-batch` checks once stable.
 6. Update docs only if launch policy or app workflow changes.
 
 ## Add a DVM driver capability
@@ -27,24 +30,28 @@ Follow `AGENTS.md`; load token policy or the task router only when their specifi
 2. Define a fixed, versioned transport contract before RustOS-side code.
 3. Keep RustOS changes to bounded transport validation and the owning service
    (`inputd`, `netd`, or `uiserver`); do not add a direct hardware fallback.
-4. Run `make -C driver-domains/linux build-plan` first; reuse the appropriate
-   cached rebuild lane if available, then `cargo xtask verify-dvm` and a
-   focused KVM smoke command. Use a full `build-dvm` only when the plan needs it.
+4. Run `make -C driver-domains/linux build-plan` first; use its cached `dev-*`
+   lane while iterating and one matching `rebuild-*` lane once stable, then
+   `cargo xtask verify-dvm` and a focused KVM smoke command. RustOS source
+   edits also follow dev-plan. Use a full `build-dvm` only when the plan needs it.
 
 ## Modify kernel API
 
-1. Read `task-router.md`, `contracts-infra.md`, and the relevant `kernel/*/src/api.rs`.
+1. Read the relevant `kernel/*/src/api.rs`; search the exact API-map or infra
+   heading only if ownership, boot order, or validation routing is unresolved.
 2. Preserve `api.rs` as the cross-crate boundary.
 3. Update `docs/api/kernel.md` only for public API surface or boot/order changes.
-4. Run focused `cargo check` where possible; otherwise `cargo xtask check`.
+4. Run dev-plan and its `now` lane; use focused checks only when selected by
+   that plan, then relevant `stable-batch` checks once stable.
 
 ## Modify logging
 
-1. Read `contracts-infra.md` (Logging section). Human `docs/logging.md` only for prose updates.
+1. Search `contracts-infra.md` for the Logging heading and read that range.
+   Human `docs/logging.md` only for prose updates.
 2. Update `config/rustos.toml` `[logging]`.
 3. If adding a category, update `libs/rustos-observability/src/lib.rs`,
    `tools/build_log_cfg.rs`, and AI contracts.
-4. Rebuild affected crates; prefer `cargo xtask build` for kernel logging.
+4. Follow dev-plan's `now` and relevant `stable-batch` lanes for affected crates.
 
 ## Update docs
 
@@ -52,7 +59,8 @@ Follow `AGENTS.md`; load token policy or the task router only when their specifi
 2. AI docs: English only, dense, no repeated bilingual prose.
 3. Update `docs/SUMMARY.md` for new human or AI pages.
 4. If behavior contracts changed, update `contracts-infra.md` or `contracts-abi.md`.
-5. Run mdBook / link sanity checks.
+5. Run focused docs/agent selftests or link checks for the affected contract;
+   use mdBook validation when the task changes the book/navigation.
 
 ## Debug KVM lifecycle
 

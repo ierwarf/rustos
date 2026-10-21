@@ -82,7 +82,8 @@ flag**. Two locks on that path are contracted to be entered with interrupts
 So the rule is:
 
 > **Anonymous fault entry stays `IF=0`.** It may acquire the exact atomic VMA
-> publication permit, take already-zeroed frames from the wired reserve, publish
+> publication permit, take already-zeroed frames from the wired reserve (with
+> IRQ-safe physical allocation and zeroing as fallback), publish
 > the intermediate page tables its leaf needs by CAS, and perform
 > zero-to-present CAS installs in 4 KiB leaves. It may not enable interrupts,
 > acquire `ProcessStateLock`, enter `begin_address_space_mutation`, or wait for
@@ -95,7 +96,7 @@ that argument and what it costs.
 The permit is the writer/read-side boundary: `munmap`, `mprotect`, `exec`, and
 other writers first publish the VMA as absent, wait for already-acquired leaf
 permits to drain, then perform their ordinary locked PTE mutation and TLB
-reclamation. A CAS loser returns its unused reserve frame; a CAS winner marks
+reclamation. A CAS loser returns its unused supplied frame; a CAS winner marks
 the entry with a software ownership bit — bit 9 for an address-space-owned
 leaf, bit 10 for an intermediate table. Every winner also claims the exact
 role in the boot-sized physical frame descriptor before PTE publication.
@@ -104,12 +105,18 @@ the descriptor catalog rather than trusting either source alone (§1c).
 
 What is still forbidden regardless of the interrupt flag:
 
-- **The physical allocator may not be the source of the page a fault is
-  obliged to produce.** That page comes from the wired reserve (§2.2). Only
-  best-effort fault-around pages may allocate.
-- **No unbounded wait.** The exception path has no lock acquisition and every
-  refusal returns `UserFaultDisposition::Unhandled`, which retires the thread
-  — so a refusal must be counted and named, never silent.
+- **No sleepable allocator or shootdown dependency.** Anonymous obligatory
+  pages, required intermediate tables, and optional fault-around pages use
+  reserve-first supply with `allocate_zeroed_frame` fallback. The physical
+  allocator takes an IRQ-safe leaf spinlock, not a lock-free path. Its holders
+  reach it after completing TLB reclamation, so they do not wait for a
+  shootdown acknowledgement from the IRQ-off faulting CPU while holding it.
+  This is the source's lock-order rationale, not hardware qualification.
+- **No unbounded wait or cross-CPU handshake.** `ProcessStateLock` and the TLB
+  mutation protocol remain forbidden. If both frame sources fail for an
+  obligatory anonymous page or required table, the fault is refused and the
+  thread retires; optional surplus pages simply stop. Refusals must be counted
+  and named, never silent.
 
 The symptom shape to recognize: a service that logs its own start line and then
 never registers its endpoint, while the kernel keeps scheduling normally. That
@@ -153,8 +160,9 @@ reach the forbidden state, and the herd gate rejects a mutant that survives.
 Both installers can now reach one absent directory entry with nothing
 serializing them. The mapping transaction's `AddressSpaceMutationGuard`
 excludes other **normal-time** writers; it does not exclude a fault on another
-CPU, and the fault path takes no lock at all. A pager VMA and an eager mapping
-can be neighbours inside the same 2 MiB block, so both may need the same table.
+CPU; reserve consumption is lock-free but allocator fallback is not. A pager
+VMA and an eager mapping can be neighbours inside the same 2 MiB block, so both
+may need the same table.
 `ensure_next_table` therefore publishes by the same CAS the fault path uses, and
 the loser returns its frame — a frame no root ever named, so returning it owes
 no shootdown either.

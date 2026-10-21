@@ -81,8 +81,17 @@ fi
 if test "$CHECK_AI" -eq 1; then
     require_command serena
     require_command rg
-    grep -q 'serena-agent==1.6.0' .claude/config.toml || bad "Serena MCP pin missing"
-    grep -q 'mcp_servers.serena' .claude/config.toml || bad "Serena MCP config missing"
+    serena_version=$(serena --version 2>/dev/null || true)
+    if [[ "$serena_version" =~ ^Serena[[:space:]]+1\.6\.0$ ]]; then
+        ok "Serena version is 1.6.0"
+    else
+        bad "Serena version is not 1.6.0: $serena_version"
+    fi
+    if jq -e '.mcpServers.serena | .command == "serena" and .args == ["start-mcp-server"]' .mcp.json >/dev/null; then
+        ok "Serena MCP launcher matches the installed-tool contract"
+    else
+        bad "Serena MCP launcher missing or malformed"
+    fi
 fi
 
 if test "$CHECK_DOCS" -eq 1; then

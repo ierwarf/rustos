@@ -73,16 +73,13 @@ Kernel keeps only: user-copy, address-space replacement, scheduler mutation, pen
 ## Syscalld Residual Surface
 
 - Per-process credentials + `RLIMIT_STACK` policy DB: source of truth for Linux-visible `get*id`, `set*id`, `prlimit64`. Kernel process credentials = gated bootstrap/security primitive; **must not** be mutated by Linux `set*id`.
-- Linux time admission policy for `nanosleep`, `clock_gettime`,
-  `clock_nanosleep`, and `ppoll` timespec validation belongs to `syscalld`.
-  Ring0 keeps only current-task user-copy plus RTC/tick sleep and clock
-  substrate. Successful immutable time-policy keys are cached per process and
-  reset on fork/exec; `clock_nanosleep` keys include the exact clock ID and
-  `TIMER_ABSTIME` bit, so malformed or previously unseen combinations cannot
-  reuse a grant. The live syscalld owner performs exact structural validation
-  and self-admits its own receive-loop backoff instead of synchronously calling
-  its own endpoint. This capability-bound self path is required to prevent a
-  30-second self-deadlock from surfacing as `ETIMEDOUT` to libc `nanosleep`.
+- Linux `nanosleep`, `clock_gettime`, and `clock_nanosleep` use local
+  fixed-envelope validation in compat's timer substrate, not syscalld policy
+  IPC or per-process cached grants. Clock IDs, timespec bounds, and
+  `TIMER_ABSTIME` are validated before sleep/clock work. Syscalld operations
+  51–53 are retired; this hot path must not acquire shared process state or
+  synchronously call a policy service (see `core.md`). `ppoll` likewise
+  validates its relative timespec locally before composing the wait.
 - Linux `sched_getaffinity` and `sched_setaffinity` are versioned two-owner
   operations. Ring0 resolves the target TID inside the authenticated caller
   process, snapshots its effective task mask and the exact dense commercial
@@ -272,9 +269,10 @@ do not admit a service, a module-loading path, or a future ABI reuse.
 - The current SMP correctness substrate includes AP bring-up, a CPU-online
   state machine, CPU-local architectural/lockdep/current-task state,
   reschedule IPI, TLB shootdown, cross-CPU lifetime barriers, and translated
-  atomic robust-futex cleanup. It still uses one serialized scheduler state
-  and the retired broadcast reschedule fan-out rather than the required per-CPU run queues
-  and targeted load balancing. `RUSTOS_SMP_READINESS` is therefore a
+  atomic robust-futex cleanup. Independent per-CPU run queues, targeted
+  reschedule IPIs, and bounded balancing now own dispatch; the global
+  `Scheduler` catalog, guard, and consumers are deleted. Source deletion is
+  not hardware or performance qualification. `RUSTOS_SMP_READINESS` remains a
   source-bound admission gate, not a release claim: multi-vCPU commercial
   acceptance remains closed until the full contract and 1/2/4/8-vCPU
   qualification matrix in `smp-contract.md` pass.

@@ -119,6 +119,9 @@ pub(super) fn serve(endpoint: u64) {
             )
         } else if request_size == size_of::<InputdIpcRequest>() {
             let request = read_unaligned::<InputdIpcRequest>(&request_buf);
+            // Keep timekeeping outside the queue critical section and use one
+            // monotonic request-admission timestamp for grant expiry.
+            let now = Instant::now();
             if request.op == INPUTD_IPC_OP_READ {
                 let mut response = InputdReadResponse {
                     version: INPUTD_IPC_ABI_VERSION,
@@ -138,7 +141,7 @@ pub(super) fn serve(endpoint: u64) {
                     }
                     Ok(()) => {
                         let mut queue = lock_input_queue(&queue);
-                        dispatch_read(&request, &mut response, &mut queue)
+                        dispatch_read(&request, &mut response, &mut queue, now)
                     }
                     Err(errno) => errno,
                 };
@@ -172,7 +175,7 @@ pub(super) fn serve(endpoint: u64) {
                     }
                     Ok(()) => {
                         let mut queue = lock_input_queue(&queue);
-                        dispatch(&request, &mut response, &mut queue)
+                        dispatch(&request, &mut response, &mut queue, now)
                     }
                     Err(errno) => errno,
                 };

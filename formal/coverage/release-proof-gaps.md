@@ -102,29 +102,24 @@ The signal proof now includes SIGSTOP alongside the scheduler-level stop,
 SIGCONT resume, and wait-status lifecycle that `process-signal-delivery` and
 `sigchld-notification` audit as matched in `CONFORMANCE.md`.
 
-Scheduler retirement now closes generic task/process IPC authority for normal,
-forced, invalid-context, and fault exits. Linux forced/fault termination still
-lacks a complete per-thread `clear_child_tid` plus robust-futex owner-death walk
-for every retired sibling. That requires a bounded target-thread user-memory
-cleanup protocol rather than calling the current-thread helper on foreign
-contexts, so it remains a separate unimplemented Linux-compatibility gate.
+Historical retirement gaps (superseded at source level): scheduler retirement
+revoked generic IPC authority, but forced/fault/invalid-context paths lacked
+exact target-thread `clear_child_tid`, robust-owner-death, waiter removal, and
+deferred terminal-notification cleanup. The earlier current-thread-only futex
+proof did not cover those paths, and long-deadline retirements could retain
+bounded waiter-table slots.
 
-Scheduler-internal saved-context validation can retire a corrupted Linux task
-without crossing the ABI-aware compatibility layer that publishes the terminal
-wait status to rootd/procd. IPC authority is revoked by the common scheduler
-retirement primitive, but lifecycle evidence for this path remains incomplete.
-Closing it requires a bounded deferred retirement-notification channel rather
-than calling service IPC while holding scheduler state, so it remains an
-explicit unimplemented gate.
-
-The futex lifecycle proof covers the compatibility layer's current-thread
-cleanup, not arbitrary scheduler retirement. Forced, fault, and invalid-context
-retirement can bypass exact target-task removal from the compatibility futex
-table and RTC sleep-wait table until opportunistic scavenging or the deadline.
-Repeated long-deadline forced retirements can therefore retain bounded table
-slots. Closing this requires the same deferred target-thread retirement
-notification protocol as `clear_child_tid`/robust-futex cleanup; it remains an
-explicit unimplemented gate and is not claimed by the passing futex model.
+The current `futex-waiter-lifecycle` contract in [CONFORMANCE.md](../CONFORMANCE.md)
+records exact deferred cleanup identities and Linux-thread snapshots for every
+retirement, with acknowledgement before slot reuse. The bounded consumer in
+`kernel/compat/src/user/syscall/linux/lifecycle_broker_ops.rs` removes runtime
+registrations and handles scheduler-stamped terminal fault notification outside
+scheduler state; executive housekeeping services that consumer. The
+`thread-exit-futex-cleanup` contract records translated bounded atomic
+compare-exchange for robust owner death and release-store `clear_child_tid`
+cleanup. These mechanisms supersede the missing-protocol and missing-atomic
+implementation claims, not the independent runtime, SMP, or hardware evidence
+gates. No such qualification is inferred from source or the finite model.
 
 The virtual compositor topology now intentionally uses one staged upload into
 virtio-GPU and labels it `source-path=staged-copy zero-copy=0`; it cannot close

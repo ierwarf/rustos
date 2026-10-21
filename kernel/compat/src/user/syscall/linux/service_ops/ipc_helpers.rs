@@ -1827,11 +1827,20 @@ fn call_netd_ipc_request_impl(
         response.len() as i64,
         None,
     );
-    let mut decoded = decode_netd_ipc_response(request, response.as_slice())?;
+    let decoded = decode_netd_ipc_response(request, response.as_slice())?;
+    finish_netd_ipc_response(decoded, super::vfs_meta::consume_netd_release_payload)
+}
+
+fn finish_netd_ipc_response(
+    mut decoded: NetdIpcResponse,
+    release: impl FnOnce(&mut NetdIpcResponse) -> Result<(), i64>,
+) -> Result<NetdIpcResponse, i64> {
+    // A failed accept may retire an unpublished peer after its listener closed.
+    // Its validated cleanup trailer still owns transfer custody on an error.
+    release(&mut decoded)?;
     if decoded.status != 0 {
         return Err(decoded.status.unsigned_abs() as i64);
     }
-    super::vfs_meta::consume_netd_release_payload(&mut decoded)?;
     // The scheduling hint is consumed at the kernel IPC boundary and is not
     // part of the Linux socket result exposed to compatibility callers.
     decoded.reserved1 = 0;
@@ -1870,7 +1879,10 @@ fn decode_netd_ipc_response(
             && !matches!(
                 request.op,
                 SYSCALL_OFFLOAD_OP_LINUX_CLOSE | SYSCALL_OFFLOAD_OP_LINUX_RECVFROM
-            ))
+            )
+            && !(request.op == SYSCALL_OFFLOAD_OP_LINUX_ACCEPT
+                && decoded.status != 0
+                && decoded.reserved0 == decoded.payload_len))
         || decoded.reserved1 & !NETD_IPC_RESPONSE_FLAG_LATENCY_HANDOFF != 0
     {
         return Err(LINUX_EINVAL);

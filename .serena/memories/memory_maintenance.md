@@ -3,11 +3,11 @@
 ## Discovery Model
 
 - Core principle: progressive discovery through references, building a graph of memories.
-- Initially, agents are provided with the list of all memories (names only).
-- Agents should read `mem:core` as the top-level entry point (graph root).
-  This memory should contain references to other memories covering major project domains.
-  The referenced memories shall, in turn, shall contain references to even more specific memories, and so on.
-  The depth of the graph shall depend on the project complexity.
+- Discover available memory names on demand; runtime provisioning may vary.
+- Use `mem:core` as a graph root only if it exists and the task needs memory
+  discovery. This checkout has no core memory: follow root `AGENTS.md` and
+  focused owner discovery instead. Memories are not an additional stable
+  prompt prefix. Existing graph roots may link to narrower topic memories.
 - Use topics/folders to group related memories in order to make the content structure explicit.
   Folders can mirror project structure (e.g. modules like frontend/backend) or topics like debugging, architecture, etc.
 - Memory references must use a mem: prefix inside backticks, e.g. `mem:frontend/core`.

@@ -80,7 +80,8 @@ SchedulerReady-generation producer. Initial Current banks precede Current/active
 publication and BSP Current-only SIMD save. Runtime directory entry cannot
 manufacture a bootstrap Current. Poison forbids retry/restart of a partial image.
 These are mechanism/custody guarantees, not physical RSP/CR3/TSS/funding acceptance;
-commercial runtime acceptance and complete runtime guard deletion remain open.
+the runtime global guard is deleted, while commercial runtime and hardware
+acceptance remain open.
 
 CPU hot-unplug and in-boot restart are not implemented. `Quarantined -> Failed`
 is terminal for that boot, and an attempted transition out of `Failed`, reuse

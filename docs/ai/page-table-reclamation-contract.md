@@ -21,8 +21,8 @@ The target is the normal general-OS shape:
 2. own every page-table frame through a distinct role in the common physical
    frame descriptor catalog;
 3. remove an empty subtree only after withdrawing the parent entry;
-4. defer physical reuse until exact CPU TLB acknowledgement and every
-   lock-free table walker that could have observed the old entry has left; and
+4. defer physical reuse until exact CPU TLB acknowledgement, which also
+   excludes IRQ-off walkers under the active-root/PCID-disabled contract; and
 5. account table pages against a bounded root and system budget.
 
 Linux has the same broad split: it dynamically allocates missing levels,
@@ -55,7 +55,6 @@ The descriptor's fixed metadata includes at least:
 
 - root physical identity and table level;
 - `Prepared`, `Live`, `Closing`, `Unlinked`, or `Dead` state;
-- a bounded mutation-pin count;
 - root-list links and exact table-frame identity;
 - the TLB generation that protects an unlinked frame; and
 - per-root/system accounting state.
@@ -70,17 +69,19 @@ writeback policy; bounded per-root records retain exact shared mappings.
 Reserved descriptor + zeroed frame
   -> Prepared                 (not reachable from CR3)
   -> Live                     (parent entry published)
-  -> Closing                  (new table mutations rejected)
-  -> Unlinked(tlb_generation) (parent entry clear; no new hardware walk)
-  -> GracePending             (TLB ACK and walker pins still settle)
+  -> Closing                  (VMA withdrawn; existing installers drained)
+  -> Unlinked(tlb_generation) (empty table proven; parent entry clear)
+  -> GracePending             (exact TLB ACK pending; excludes IRQ-off walkers)
   -> Dead                     (descriptor clear; frame returned to phys)
 ```
 
 Failure before `Live` clears the descriptor and returns the unpublished
 frame.  `Live` has one root owner.  A descriptor cannot return to `Prepared`
-or be reused by another root until its list link, state, pins, and TLB
-generation are all clear.  Root reuse retains the existing explicit ABA
-check.
+or be reused by another root until its list link, state, and TLB generation
+are all clear. Root reuse retains the existing explicit ABA check. The active
+target sequence is withdraw/drain → prove empty → unlink → exact shootdown →
+free, as specified by `address-space-lifecycle-contract.md` §6; no hazard
+references or mutation pins are required under that contract.
 
 ## 4. Lock-free fault walk versus normal-time reclamation
 
@@ -128,8 +129,8 @@ table walk can reach a recycled table frame.
 ## 5. Capacity and pressure
 
 The descriptor catalog is boot-sized from the physical frame domain, so fault
-entry allocates neither descriptor nor hazard state.  There are two distinct
-limits:
+entry allocates no descriptor metadata. There is no separate hazard state.
+There are two distinct limits:
 
 - a root's live table-page budget, bound at process/address-space admission;
 - a system table-page reserve/low-water mark, so one sparse process cannot

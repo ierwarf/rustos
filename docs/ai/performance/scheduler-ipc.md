@@ -4,21 +4,24 @@
 
 ## Scheduler Dispatch
 
-- The KVM proof assigns RustOS one vCPU until SMP scheduling is implemented.
+- KVM supports source-admitted RustOS topologies from one through eight vCPUs.
   `tools/xtask/src/kvm/guest.rs::RUSTOS_SMP_READINESS` is the executable
   enablement gate: more than one RustOS vCPU requires per-CPU scheduler and
   syscall state, a CPU-online state machine, reschedule IPI, TLB shootdown, and
-  atomic robust-futex cleanup. The Linux DVM remains independently multi-vCPU.
-  Advertising an idle second RustOS vCPU cannot improve guest throughput and
-  steals host scheduling capacity from the Linux DVM on low-end machines.
+  atomic robust-futex cleanup. Independent per-CPU owners are implemented and
+  the global scheduler catalog is deleted; full-matrix hardware/performance
+  and commercial acceptance remain separate. The Linux DVM's topology is
+  independent; choose both topologies with host scheduling capacity in mind.
 
 - The scheduler keeps a fixed 128-slot task table, but ordinary fair dispatch is
   selected from the current CPU's published runnable bitmap. The local picker
   records System/User global and same-CPU candidates in one pass, validates the
   complete publication epoch, and becomes authoritative only for that coherent
-  fair decision. Atomic activation, exact IPC FIFO custody, or any incomplete
-  candidate observation uses the already-computed catalog fallback. Legacy
-  picker divergence is diagnostic policy telemetry, not a release failure.
+  fair decision. Atomic activation and exact IPC FIFO handoffs retain their
+  independent custody owners. Incomplete evidence permits bounded fresh
+  retries, then independently qualified current/fixed-idle custody, never a
+  catalog peer. Historical legacy-picker divergence is diagnostic telemetry,
+  not current authority or a release failure.
 - At most two consecutive System dispatches may run while User work is ready;
   the next ordinary dispatch is reserved for the lowest-vruntime User task.
   Every ready System task has a 2 ms recovery rail, while User work has no
@@ -42,7 +45,8 @@
   ready-wait rail therefore covers causal core servers without making dynamic
   applications strict-priority work.
 
-- **Size a global-lock change against acquisitions per scheduler entry, never
+- **Historical catalog-measurement rule (the catalog is now deleted): size a
+  global-lock change against acquisitions per scheduler entry, never
   against acquisitions per second or against hold time.** Acquisitions per
   second move with how fast the probe itself runs, and hold time under KVM
   includes host descheduling of the owning vCPU, which is why one window can

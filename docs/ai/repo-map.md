@@ -69,4 +69,6 @@ Do not preload token policy or the task router before this map; open them only f
 - `perf.data` — binary profiling output; never inspect as text.
 - Full `docs/logging.md` or `docs/api/kernel.md` — use AI contracts first.
 
-Allowed generated-path exceptions are defined in `token-policy.md`.
+The generated-path rule is in `token-policy.md` (“Shell, logs, and diffs”);
+bounded task-specific exceptions are listed in `commands.md` (“Generated path
+exceptions”).

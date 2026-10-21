@@ -1,6 +1,67 @@
 use super::*;
 
 #[test]
+fn netd_failed_accept_settles_cleanup_before_returning_the_error() {
+    let response = NetdIpcResponse {
+        status: LINUX_EAGAIN as i32,
+        payload_len: 16,
+        reserved0: 16,
+        ..NetdIpcResponse::default()
+    };
+    let mut releases = 0;
+    let result = finish_netd_ipc_response(response, |decoded| {
+        releases += 1;
+        assert_eq!(decoded.reserved0, 16);
+        decoded.reserved0 = 0;
+        decoded.payload_len = 0;
+        Ok(())
+    });
+    assert!(matches!(result, Err(LINUX_EAGAIN)));
+    assert_eq!(releases, 1);
+}
+
+#[test]
+fn netd_accept_cleanup_is_allowed_only_for_a_complete_error_trailer() {
+    let request = NetdIpcRequest {
+        op: SYSCALL_OFFLOAD_OP_LINUX_ACCEPT,
+        ..NetdIpcRequest::default()
+    };
+    let mut response = NetdIpcResponse {
+        version: NETD_IPC_ABI_VERSION,
+        op: request.op,
+        status: LINUX_EAGAIN as i32,
+        payload_len: 16,
+        reserved0: 16,
+        ..NetdIpcResponse::default()
+    };
+    let decode = |response: &NetdIpcResponse| {
+        // Same fixed wire envelope as the service, with no handle dereference.
+        let bytes = unsafe { core::slice::from_raw_parts(
+            (response as *const NetdIpcResponse).cast::<u8>(),
+            NETD_IPC_RESPONSE_HEADER_SIZE + response.payload_len as usize,
+        ) };
+        decode_netd_ipc_response(&request, bytes)
+    };
+    assert!(decode(&response).is_ok());
+    response.status = 0;
+    assert!(matches!(decode(&response), Err(LINUX_EINVAL)));
+    response.status = LINUX_EAGAIN as i32;
+    response.reserved0 = 8;
+    assert!(matches!(decode(&response), Err(LINUX_EINVAL)));
+    response.reserved0 = 17;
+    assert!(matches!(decode(&response), Err(LINUX_EINVAL)));
+}
+
+#[test]
+fn netd_invalid_cleanup_cannot_be_hidden_by_an_operation_error() {
+    let response = NetdIpcResponse {
+        status: LINUX_EAGAIN as i32,
+        ..NetdIpcResponse::default()
+    };
+    assert!(matches!(finish_netd_ipc_response(response, |_| Err(LINUX_EINVAL)), Err(LINUX_EINVAL)));
+}
+
+#[test]
 fn direct_bootstrap_consumes_exact_rootd_scheduling_authority_before_spawn() {
     let source = include_str!("bootstrap_spawn.rs");
     let direct = source

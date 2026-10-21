@@ -144,17 +144,17 @@ acceptance contracts, not tuning defaults:
 | UI CPU frame preparation | 8 ms | 16.667 ms completed frame | 0 |
 | First local DVM GPU activation after CPU boot frame | 750 ms | Included in 10 s boot ceiling | 0 |
 | Input arrival to visible cursor | One frame | 50 ms | 0 in frame/present |
-
-The first GPU completion is governed by the five-second activation deadline,
-not the 50 ms steady-state recovery bound. Once the epoch is active, every
-later completion again uses the 50 ms hard limit; the 16.667 ms target remains
-an independent performance failure rather than provider-revocation timing.
 | Deferred VFS maintenance per foreground turn | 1 ms | 1 ms | 1 replay |
 | Deferred netd reference maintenance per turn | 1 ms | 1 ms | 1 replay or ACK |
 | Readiness observation | 1 frame | 16 ms | 1 per deduplicated provider |
 | Interactive policy-only control | 16 ms | 100 ms | 1; service drains at most 32 already-queued controls per turn |
 | Boot/control transaction | 100 ms | 5 s | 1 |
 | Bulk external-device data | 5 s | 30 s | 1 |
+
+The first GPU completion is governed by the five-second activation deadline,
+not the 50 ms steady-state recovery bound. Once the epoch is active, every
+later completion again uses the 50 ms hard limit; the 16.667 ms target remains
+an independent performance failure rather than provider-revocation timing.
 
 Every kernel-owned service call names one class in source. A shorter caller
 deadline is allowed; widening the class is not. Repeated endpoint lookup with

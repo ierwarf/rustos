@@ -339,11 +339,12 @@ fallback.
   was unreachable under the mandatory nonzero V3 atlas header and has been
   retired. QEMU validates staged atlas upload plus fixed GLES composition and
   must report `source-path=staged-copy zero-copy=0`. Physical AMD read-only
-  atlas import, GPU composition, and atomic scanout now have an explicit
-  authenticated physical-AMD relay mode, but remain failed hardware gates
-  until captured on the assigned GPU; this KVM command must not bind a physical
-  GPU or claim their evidence. V2, polling, synchronous `DirtyFB`, a CPU-frame
-  renderer, and a native-GPU fallback are rejected. The NVIDIA
+  atlas import, GPU composition, and atomic scanout have an explicit
+  authenticated physical-AMD relay mode. `physical-gpu-status.md` records the
+  observed physical run and remaining unaccepted performance/lifecycle gates;
+  this KVM command must not bind a physical GPU or claim their evidence. V2,
+  polling, synchronous `DirtyFB`, a CPU-frame renderer, and a native-GPU
+  fallback are rejected. The NVIDIA
   package admits only the exact 580.173.02 open-module/GSP pair and excludes
   UVM/CUDA; redistribution authorization remains a separate release gate.
   This KVM command does not imply physical GPU passthrough; the separate signed
@@ -420,8 +421,8 @@ fallback.
   runs `bash formal/verify-smp-iteration.sh` and revalidates before claiming a
   layout, doorbell, or relay. Admission still comes only from that second
   validation, so a failed verification refuses the launch; `--no-auto-verify`
-  restores the plain refusal. `kvm-smoke` is unchanged and still requires the
-  seal up front.
+  restores the plain refusal. `kvm-smoke` likewise auto-seals before its repeat
+  loop unless `--no-auto-verify` requests plain refusal.
 - A defect that appears in roughly one boot of ten is a reproduction question,
   not a measurement one: `cargo xtask soak --runs 25 --rustos-vcpus 8` repeats
   the bench lane, keeps going past a failure, and names every failed run with
@@ -532,6 +533,8 @@ fallback.
 
 ## Generated path exceptions
 
-See `token-policy.md` §10 for the canonical list. Summary: `logs/` only for
-run/debug failures, `build/image/system/registry/` only for stage/registry
-verification, `vendor/` only for firmware/module packaging.
+Follow `token-policy.md` (“Shell, logs, and diffs”): avoid generated/vendor
+paths by default and read only a bounded range required by the task. The
+exceptions here are limited to `logs/` for run/debug failures,
+`build/image/system/registry/` for stage/registry verification, and `vendor/`
+for firmware/module packaging; none permits editing generated/vendor output.

@@ -33,6 +33,7 @@ fn connected_socket(peer: u64) -> UnixSocket {
             incoming: VecDeque::new(),
             incoming_bytes: 0,
             incoming_control_bytes: 0,
+            pending_listener: None,
             channel_id: 1,
             peer,
             peer_closed: false,

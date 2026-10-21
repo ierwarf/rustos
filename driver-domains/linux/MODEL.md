@@ -324,7 +324,7 @@ installed `.ko`, then ask OpenSSL CMS to verify the detached module payload
 against the bound X.509 certificate. A trailer-shaped but invalid or
 foreign-signed module therefore cannot pass the artifact gate.
 The AMD `1002:1900` image additionally prunes the broad upstream AMDGPU firmware
-package to the 12 regular files named by the sealed board profile. Verification
+package to the 13 regular files named by the sealed board profile. Verification
 requires that exact filename set and the per-file SHA-256 values in
 `sources.lock`; an extra firmware blob is a supply-contract failure, not benign
 payload. The kernel feature envelope requires ZONE_DEVICE page ownership,

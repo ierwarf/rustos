@@ -1,9 +1,10 @@
 # RustOS Commercial SMP Contract
 
 **Status:** normative design and release contract. AP startup, CPU-local
-execution ownership, serialized multicore dispatch, IPI/TLB/lifetime/futex,
-and AP clockevents are implemented. Per-CPU run queues, targeted load
-balancing, compatibility completion, and the full runtime/qualification ladder
+execution ownership, independent per-CPU run queues, directed reschedule IPIs,
+bounded balancing, TLB/lifetime/futex, and AP clockevents are implemented.
+The global scheduler catalog and guard are deleted. Compatibility completion,
+hardware/performance qualification, and the full 1/2/4/8-vCPU validation ladder
 remain open; commercial SMP acceptance is closed. A QEMU `-smp` value is
 configuration, not SMP evidence.
 

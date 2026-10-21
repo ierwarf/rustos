@@ -1,6 +1,10 @@
 # 15만 LOC급 OS에서 이 팩을 쓰는 방법
 
-## 항상 컨텍스트에 넣을 것
+RustOS에서는 root `AGENTS.md`의 on-demand routing을 따른다. 아래는 일반
+참고 조합이며 모든 항목을 상시 로드하라는 뜻이 아니다. 이 팩은 추가 stable
+prompt prefix가 아니고 작업과 관련된 부분만 선택한다.
+
+## 작업에 맞춰 선택할 컨텍스트
 
 - `LLM_SYSTEM_PROMPT_KO.md`
 - 현재 작업 subsystem의 설계·불변식 문서

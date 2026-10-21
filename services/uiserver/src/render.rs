@@ -1477,6 +1477,41 @@ mod tests {
         GpuTextureCapability, GpuTextureRegion, Rect, WaylandWindowSnapshot,
     };
 
+    #[test]
+    fn shell_echo_updates_retained_atlas_without_dragging_the_window() {
+        use crate::app::{ConsoleWindow, VisualUpdate};
+        let frame = Rect { x: 40, y: 60, width: 320, height: 180 };
+        let mut window = ConsoleWindow::new(7, String::from("Shell"), frame, 1);
+        window.output_cache.extend_from_slice(b"prompt> ");
+        super::chrome::rebuild_console_window_surface(&mut window, true);
+        let mut atlas = window.surface_cache.pixels.clone();
+        let before = atlas.clone();
+        let source_rect = Rect { x: 0, y: 0, width: frame.width, height: frame.height };
+        let mut bindings = [super::ConsoleAtlasBinding {
+            session_handle: 7,
+            content_version: window.surface_cache.content_version,
+            source_rect,
+            layer_index: 0,
+            focused: true,
+        }];
+
+        window.output_cache.push(b'a');
+        window.terminal_dirty = true;
+        window.invalidate_surface();
+        let mut update = VisualUpdate::default();
+        update.add_partial_rect(super::console_window_dirty_rect(frame));
+        let mut damage = Vec::new();
+        if update.scene_dirty() {
+            assert!(super::update_console_gpu_texture(
+                &mut window, true, &mut atlas, frame.width,
+                &mut bindings, &mut 0, &mut damage,
+            ).unwrap());
+        }
+        assert_eq!(window.frame, frame, "echo must not depend on window motion");
+        assert_eq!(damage, vec![source_rect]);
+        assert_ne!(atlas, before, "new glyph must reach the retained GPU atlas");
+    }
+
     fn snapshot(pixels: Vec<u32>, damage: Rect) -> WaylandWindowSnapshot {
         WaylandWindowSnapshot {
             surface_id: 7,

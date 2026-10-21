@@ -352,7 +352,8 @@ Its acceptance properties are:
    indicators before changing a class. Claims on different CPUs never wait for
    each other. Selection arms share one monotonic sample per turn.
 2. **Exact custody wins.** Atomic activation and synchronous IPC FIFO handoffs
-   retain catalog authority. Local fairness cannot reorder them.
+   retain their independent `dispatch_policy` FIFO and original frame/funding
+   custody. Local fairness cannot reorder them; no catalog consumer remains.
 3. **Bounded class service.** System work is preferred, but after at most
    `MAX_CONSECUTIVE_SYSTEM_DISPATCHES` while User work is eligible, the least
    virtual-runtime User choice is reserved. A reservation that finds no User
@@ -360,10 +361,9 @@ Its acceptance properties are:
 4. **Weighted fair order.** Within a class, the least weight-normalized
    `vruntime` wins. Equal keys are deterministic; voluntary yield excludes the
    current task on its first pass, and a task at maximum burst yields to an
-   eligible same-class alternate. The catalog-owned User-reservation and
-   voluntary-yield arms were temporary authority boundaries: once the catalog
-   has selected a reserved User slot, or when the current task yields, local
-   fairness falls back rather than replaying a possibly stale policy epoch.
+   eligible same-class alternate. User reservation and voluntary-yield
+   selection require complete CPU-local policy evidence; the former catalog
+   arms and their fallback authority are deleted.
 5. **Bounded locality.** A same-CPU candidate may replace the class minimum only
    within `SCHED_CPU_LOCALITY_LAG_NS`; locality never crosses a class, budget,
    affinity, lifecycle, or custody boundary.
@@ -371,9 +371,10 @@ Its acceptance properties are:
    bounded System/handoff bursts and virtual-runtime accounting. No unadmitted
    hard completion deadline is claimed. System recovery retains its existing
    bounded ready-age rail.
-7. **Fail closed.** If no complete local decision exists, use the already
-   computed catalog decision. A fallback is an authority boundary, not a policy
-   mismatch.
+7. **Fail closed.** Incomplete local evidence retries only bounded fresh
+   observations, then permits independently qualified current/fixed-idle
+   custody, never a catalog peer. A fallback is an authority boundary, not a
+   policy mismatch (see §2.6b in `execution.md`).
 
 This follows Linux EEVDF's separation of eligibility from virtual deadline/lag
 (`docs.kernel.org/scheduler/sched-eevdf.html`), CFS's weight-normalized virtual

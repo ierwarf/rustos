@@ -31,12 +31,14 @@ surfaces or sockets they expose.
 
 ### Bootstrap-launched vs Catalog-launched
 
-The first thing `runtimed` does is **bootstrap_ui_server**. That path reads the
-uiserver desktop entry synchronously and honors manifest args/env on the very
-first run. It then uses the same suspended-create, lease-admit, activate, and
+Before full catalog discovery, `runtimed` runs **bootstrap_ui_server**. It
+reads the signed Init environment registry and merges its sealed service-local
+UI defaults; catalog admission later checks those defaults against generated
+metadata. It uses the same suspended-create, lease-admit, activate, and
 exact-endpoint transaction as initd.
 
-All other services and apps are launched from the catalog. The catalog is
+Remaining catalog-managed services and apps are launched from the catalog;
+rootd/initd-managed bootstrap services are not delayed until UI readiness. The catalog is
 materialized on runtimed's main loop after UI readiness. Desktop metadata and
 runtime-launch policy are cached separately so one registry can never be
 mistaken for the other.
@@ -79,12 +81,14 @@ ELF, 그리고 staged registry에 한 줄을 함께 가집니다. 아래 표는 
 
 ### 부트스트랩 launch vs catalog launch
 
-`runtimed`가 가장 먼저 하는 일은 **bootstrap_ui_server** 입니다. 이 경로는
-uiserver desktop entry를 동기적으로 읽어 manifest args/env를 첫 실행부터
-반영하고, initd와 같은 suspended-create, lease-admit, activate, exact-endpoint
+`runtimed`는 전체 catalog 검색 전에 **bootstrap_ui_server**를 실행합니다.
+서명된 Init environment registry에 봉인된 service-local UI 기본값을 합치고,
+catalog admission 때 생성 metadata와 이 기본값이 일치하는지 확인합니다.
+initd와 같은 suspended-create, lease-admit, activate, exact-endpoint
 transaction을 사용합니다.
 
-다른 모든 service와 app은 catalog에서 launch 됩니다. UI ready 뒤 runtimed의
+나머지 catalog-managed service와 app은 catalog에서 launch 됩니다.
+rootd/initd가 관리하는 bootstrap service는 UI readiness를 기다리지 않습니다. UI ready 뒤 runtimed의
 main loop가 catalog를 구성하며 desktop metadata와 runtime-launch policy는 별도
 cache를 사용하므로 서로 다른 registry가 뒤섞이지 않습니다.
 

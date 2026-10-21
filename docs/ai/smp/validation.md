@@ -216,9 +216,10 @@ RustOS therefore keeps these distinct acceptance statements:
 - CPU-owned fairness/handoff state, idle stealing, staggered one-task active
   balancing, cross-CPU server boost, and directed reschedule IPIs are the
   current scalable dispatch boundary;
-- the remaining global `Scheduler` guard is still a lifecycle/catalog and task
-  payload serializer, so `R3-PERF-SCHED-011` is not closed until normal local
-  selection and accounting stop acquiring it;
+- the global `Scheduler` catalog, guard, and consumers are deleted; independent
+  owners now provide local selection, accounting, lifecycle, and task payload
+  custody. That source deletion does not close `R3-PERF-SCHED-011` runtime or
+  hardware/performance qualification;
 - hard realtime or temporal-isolation claims remain forbidden without explicit
   capacity admission, replenishment, and request-budget custody comparable to
   seL4 MCS or QNX adaptive partitions;
@@ -226,12 +227,11 @@ RustOS therefore keeps these distinct acceptance statements:
   scheduling are outside the current boot-static eight-CPU product envelope
   and must remain rejected rather than partially advertised.
 
-The next lock split must move mutable task scheduling payload beside its exact
-runqueue/task owner. Adding multiple locks around the existing monolithic
-`Scheduler` would create unsynchronised aliases and is forbidden. The global
-catalog may remain for rare create/exec/exit operations, matching XNU/Xen-style
-domain serialization, but a timer, local wake, selection, accounting turn, or
-idle steal must not require it in the completed backend.
+Mutable scheduling payload now resides with its exact independent owner;
+`ownership/execution.md` and `ownership/publication-deletion.md` record the
+current deletion inventory. No renamed global catalog or copied native backend
+may replace it. The required runtime ladder and commercial 1/2/4/8-vCPU matrix
+remain separate acceptance work, not consequences of source deletion.
 
 ## 15. Primary design references
 

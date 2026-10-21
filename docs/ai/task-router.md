@@ -19,7 +19,7 @@ Do not start at line 1 merely because the route names the file.
 
 | User task | Read first | Then only if unresolved |
 | --- | --- | --- |
-| Resume prior work / prepare session handoff | `session-handoff.md` current checkout snapshot | live goal + `git status --short`, then one owner contract |
+| Resume prior work / prepare session handoff | `session-handoff.md` dated snapshot | live goal + `git status --short`, then one owner contract |
 | Build/check issue | `.agents/skills/rustos-build/SKILL.md` or the failing diagnostic | search `commands.md` only if exact invocation remains unclear |
 | Development-speed/tooling change | relevant `token-policy.md` section + exact active hook/config | search `commands.md` only if a build invocation is part of the issue |
 | Run/KVM/debug issue | `.agents/skills/rustos-kvm/SKILL.md` | exact KVM owner; bounded `build/kvm/` evidence after symptom is known |
@@ -47,6 +47,7 @@ Do not start at line 1 merely because the route names the file.
 - Before a fourth source file or second large range, name the exact missing fact.
 - For clear ownership, patch the smallest viable slice.
 - Do not patch runtime failures without evidence.
-- `session-handoff.md` stores live state, not closed narrative.
+- `session-handoff.md` is a dated snapshot; verify its claims against the live
+  goal, checkout, and `git status --short` before resuming.
 - Search large contracts by owning heading; never read them from the top merely
   because the subsystem appears somewhere in the task.

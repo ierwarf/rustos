@@ -33,6 +33,8 @@ the broker actually arbitrates.
 
 ## Validation During Refactor
 
-Per root `AGENTS.md`, compile/QEMU validation may be intentionally deferred
-when the task is structural removal. Do not paper over a half-removed
-module with a fake success path — leave the build broken and flag it.
+Follow root `AGENTS.md`: after product-source edits run `cargo xtask dev-plan`,
+execute its `now` lane while iterating, then the relevant `stable-batch` checks
+once stable. Do not hide a half-removed module behind a fake success path.
+Report a blocked or failing validation explicitly; a broken build is not a
+validated completion.

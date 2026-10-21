@@ -23,7 +23,7 @@ use std::slice;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 mod dvm_protocol;
 mod dvm_session_sync;
@@ -63,6 +63,10 @@ use rustos_user_abi::syscall::{
 // requests still own reader authorization and event serialization; no polling
 // client is allowed to become the liveness dependency for transport progress.
 const INPUTD_QUEUE_MAX_EVENTS: usize = 4096;
+const INPUTD_MAX_READ_AUTHORIZATIONS: usize = 256;
+const INPUTD_READ_AUTHORIZATION_LIFETIME: Duration = Duration::from_millis(
+    rustos_user_abi::performance::IPC_BOOT_CONTROL_HARD_LIMIT_MS,
+);
 static REPLY_FAILURE_DIAGNOSTICS: rustos_svc_runtime::ipc::ReplyFailureDiagnostics =
     rustos_svc_runtime::ipc::ReplyFailureDiagnostics::new();
 const INPUTD_MAX_NATIVE_READ_BYTES: u64 = input_evdev::MAX_NATIVE_READ_BYTES as u64;
@@ -215,6 +219,7 @@ struct InputReadAuthorization {
     fd: u64,
     access: u16,
     approved_len: u64,
+    expires_at: Instant,
 }
 
 impl InputQueue {
@@ -884,6 +889,7 @@ mod tests {
 
     #[test]
     fn inputd_read_authorization_is_bound_to_pid_tid_fd_and_access() {
+        let now = std::time::Instant::now();
         let mut queue = InputQueue::default();
         queue
             .read_authorizations
@@ -893,6 +899,7 @@ mod tests {
                 fd: 3,
                 access: rustos_user_abi::syscall::INPUTD_ACCESS_EVDEV,
                 approved_len: 64,
+                expires_at: now + super::INPUTD_READ_AUTHORIZATION_LIFETIME,
             });
 
         let wrong_fd = InputdIpcRequest {
@@ -903,19 +910,86 @@ mod tests {
             ..InputdIpcRequest::default()
         };
         assert_eq!(
-            super::consume_read_authorization(&mut queue, &wrong_fd),
+            super::consume_read_authorization(&mut queue, &wrong_fd, now),
             None
         );
 
         let matching = InputdIpcRequest { fd: 3, ..wrong_fd };
         assert_eq!(
-            super::consume_read_authorization(&mut queue, &matching),
+            super::consume_read_authorization(&mut queue, &matching, now),
             Some(64)
         );
         assert_eq!(
-            super::consume_read_authorization(&mut queue, &matching),
+            super::consume_read_authorization(&mut queue, &matching, now),
             None
         );
+    }
+
+    #[test]
+    fn inputd_read_authorization_failed_preparation_publishes_nothing() {
+        let mut queue = InputQueue::default();
+        let request = InputdIpcRequest {
+            pid: 10, tid: 11, fd: 3, access: super::INPUTD_ACCESS_NATIVE,
+            requested_len: 64, ..InputdIpcRequest::default()
+        };
+        let mut response = super::InputdIpcResponse::default();
+        assert_eq!(super::authorize_read_with_stats(
+            &request, &mut response, &mut queue, std::time::Instant::now(),
+            |_| Err(libc::EIO),
+        ), libc::EIO);
+        assert!(queue.read_authorizations.is_empty());
+        assert_eq!(response.approved_len, 0);
+    }
+
+    #[test]
+    fn inputd_read_authorization_retries_replace_and_abandoned_grants_expire() {
+        let now = std::time::Instant::now();
+        let mut queue = InputQueue::default();
+        let request = InputdIpcRequest {
+            pid: 10, tid: 11, fd: 3, access: super::INPUTD_ACCESS_NATIVE,
+            requested_len: 64, ..InputdIpcRequest::default()
+        };
+        let mut response = super::InputdIpcResponse::default();
+        for _ in 0..super::INPUTD_MAX_READ_AUTHORIZATIONS * 2 {
+            assert_eq!(super::authorize_read_with_stats(
+                &request, &mut response, &mut queue, now,
+                |_| Ok(super::InputStatsWire::default()),
+            ), 0);
+        }
+        assert_eq!(queue.read_authorizations.len(), 1);
+        assert_eq!(super::consume_read_authorization(
+            &mut queue, &request, now + super::INPUTD_READ_AUTHORIZATION_LIFETIME,
+        ), None);
+        assert!(queue.read_authorizations.is_empty());
+    }
+
+    #[test]
+    fn inputd_read_authorization_quota_recovers_after_abandoned_callers_expire() {
+        let now = std::time::Instant::now();
+        let mut queue = InputQueue::default();
+        let mut request = InputdIpcRequest {
+            pid: 10, tid: 11, fd: 3, access: super::INPUTD_ACCESS_NATIVE,
+            requested_len: 64, ..InputdIpcRequest::default()
+        };
+        for tid in 1..=super::INPUTD_MAX_READ_AUTHORIZATIONS as u64 {
+            request.tid = tid;
+            assert_eq!(super::authorize_read_with_stats(
+                &request, &mut super::InputdIpcResponse::default(), &mut queue, now,
+                |_| Ok(super::InputStatsWire::default()),
+            ), 0);
+        }
+        request.tid += 1;
+        assert_eq!(super::authorize_read_with_stats(
+            &request, &mut super::InputdIpcResponse::default(), &mut queue, now,
+            |_| Ok(super::InputStatsWire::default()),
+        ), libc::EAGAIN);
+        assert_eq!(queue.read_authorizations.len(), super::INPUTD_MAX_READ_AUTHORIZATIONS);
+        assert_eq!(super::authorize_read_with_stats(
+            &request, &mut super::InputdIpcResponse::default(), &mut queue,
+            now + super::INPUTD_READ_AUTHORIZATION_LIFETIME,
+            |_| Ok(super::InputStatsWire::default()),
+        ), 0);
+        assert_eq!(queue.read_authorizations.len(), 1);
     }
 
     #[test]
@@ -1124,6 +1198,7 @@ fn dispatch(
     request: &InputdIpcRequest,
     response: &mut InputdIpcResponse,
     queue: &mut InputQueue,
+    now: Instant,
 ) -> i32 {
     match request.op {
         INPUTD_IPC_OP_PING => {
@@ -1137,7 +1212,7 @@ fn dispatch(
             }
             Err(errno) => errno,
         },
-        INPUTD_IPC_OP_AUTHORIZE_READ => authorize_read(request, response, queue),
+        INPUTD_IPC_OP_AUTHORIZE_READ => authorize_read_with_stats(request, response, queue, now, fetch_stats),
         _ => libc::EINVAL,
     }
 }
@@ -1163,11 +1238,12 @@ fn dispatch_read(
     request: &InputdIpcRequest,
     response: &mut InputdReadResponse,
     queue: &mut InputQueue,
+    now: Instant,
 ) -> i32 {
     if request.pid == 0 || request.tid == 0 || request.fd > i32::MAX as u64 {
         return libc::EINVAL;
     }
-    let Some(approved_len) = consume_read_authorization(queue, request) else {
+    let Some(approved_len) = consume_read_authorization(queue, request, now) else {
         return libc::EACCES;
     };
     let requested = request
@@ -1408,10 +1484,12 @@ fn fill_evdev_payload(
     Ok(bytes_len)
 }
 
-fn authorize_read(
+fn authorize_read_with_stats(
     request: &InputdIpcRequest,
     response: &mut InputdIpcResponse,
     queue: &mut InputQueue,
+    now: Instant,
+    stats: impl FnOnce(&InputQueue) -> Result<InputStatsWire, i32>,
 ) -> i32 {
     if request.pid == 0 || request.tid == 0 || request.fd > i32::MAX as u64 {
         return libc::EINVAL;
@@ -1421,27 +1499,52 @@ fn authorize_read(
         INPUTD_ACCESS_EVDEV => INPUTD_MAX_EVDEV_READ_BYTES,
         _ => return libc::EINVAL,
     };
-    response.approved_len = request.requested_len.min(max_len);
+    // Failed preparation must not publish a grant the caller never received.
+    let stats = match stats(queue) {
+        Ok(stats) => stats,
+        Err(errno) => return errno,
+    };
+    // A thread cannot issue two reads concurrently. A retry replaces its exact
+    // subject's previous grant; abandoned callers retain no authority past the
+    // finite lifetime and cannot grow this queue without bound.
+    queue.read_authorizations.retain(|auth| {
+        auth.expires_at > now && !read_authorization_matches(auth, request)
+    });
+    if queue.read_authorizations.len() >= INPUTD_MAX_READ_AUTHORIZATIONS {
+        return libc::EAGAIN;
+    }
+    if queue.read_authorizations.try_reserve(1).is_err() {
+        return libc::ENOMEM;
+    }
+    let approved_len = request.requested_len.min(max_len);
     queue.read_authorizations.push_back(InputReadAuthorization {
         pid: request.pid,
         tid: request.tid,
         fd: request.fd,
         access: request.access,
-        approved_len: response.approved_len,
+        approved_len,
+        expires_at: now + INPUTD_READ_AUTHORIZATION_LIFETIME,
     });
-    match fetch_stats(queue) {
-        Ok(stats) => response.stats = stats,
-        Err(errno) => return errno,
-    }
+    response.approved_len = approved_len;
+    response.stats = stats;
     0
 }
 
-fn consume_read_authorization(queue: &mut InputQueue, request: &InputdIpcRequest) -> Option<u64> {
+fn read_authorization_matches(auth: &InputReadAuthorization, request: &InputdIpcRequest) -> bool {
+    auth.pid == request.pid
+        && auth.tid == request.tid
+        && auth.fd == request.fd
+        && auth.access == request.access
+}
+
+fn consume_read_authorization(
+    queue: &mut InputQueue,
+    request: &InputdIpcRequest,
+    now: Instant,
+) -> Option<u64> {
+    queue.read_authorizations.retain(|auth| auth.expires_at > now);
     let index = queue.read_authorizations.iter().position(|auth| {
-        auth.pid == request.pid
-            && auth.tid == request.tid
-            && auth.fd == request.fd
-            && auth.access == request.access
+        read_authorization_matches(auth, request)
     })?;
     queue
         .read_authorizations

@@ -5,11 +5,12 @@
 ## 7. Scheduler and task ownership
 
 Each online CPU owns one run queue, one remote-wake mailbox, and at most one
-current task. The owner word is the queue/execution authority; the global
-`Scheduler` catalog lock and legacy per-context lifecycle fields remain a
-serialized control-plane seam, so this is not yet the final scalability
-acceptance point. It must nevertheless satisfy the same exact-one state
-partition. Each live task is in exactly one state:
+current task. The owner word is the queue/execution authority. The global
+`Scheduler` catalog, guard, and consumers are deleted; lifecycle, frame,
+funding, and cleanup custody belong to independent owners (see
+`ownership/execution.md` in the AI docs). This source boundary does not close
+hardware, performance, or full-matrix qualification. Each live task is in
+exactly one state:
 
 ```text
 Running(cpu, generation)
@@ -30,9 +31,8 @@ One acquire snapshot authorizes a local dispatch only when it says
 `Local(exact_cpu) && runnable`. `claim_dispatch` applies the same predicate
 before touching queue membership or attempting an owner CAS, so a blocked task
 that temporarily retains local queue custody cannot consume a dispatch turn.
-Legacy `context.ready` and pick hints may narrow policy order but cannot create
-execution authority. A foreign idle-steal scan uses a distinct source-
-migration predicate: it requires `Local(source_cpu) && runnable`, no current or
+Pick hints may narrow policy order but cannot create execution authority. A
+foreign idle-steal scan uses a distinct source-migration predicate: it requires `Local(source_cpu) && runnable`, no current or
 transition execution owner, target task-and-process affinity, handoff
 admission, and a valid immutable frame before the existing source-owner CAS
 publishes the target mailbox. Applying the local target-dispatch predicate to a

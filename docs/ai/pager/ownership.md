@@ -41,10 +41,11 @@ Model: `formal/pager-fault-slot-lifecycle/PagerFaultSlotLifecycle.tla`.
 | Admission | `FaultFramePool::reserve`, from exception context |
 | Refusal code | `PAGER_PRESSURE_FAULT_FRAME_RESERVE_EMPTY` |
 
-A reserve frame is pre-zeroed at boot so **the page a fault is obliged to
-produce never requires the physical allocator at exception entry.** That is
-the whole purpose of the pool, and it is the one invariant the split does not
-change.
+A reserve frame is pre-zeroed at boot, providing a lock-free latency fast
+path. It is not the only anonymous-fault supply: obligatory anonymous pages,
+required intermediate tables, and optional fault-around pages fall back to
+IRQ-safe physical allocation and zeroing when it is empty (§1). Pager-backed
+grants retain their separate reserve admission and refusal semantics.
 
 The two paths draw from it differently:
 
@@ -60,14 +61,15 @@ The two paths draw from it differently:
 Reserve consumption at or below the 75% low-water mark sets only a lock-free
 request bit. The next timer that interrupted a complete user frame takes a
 safe scheduler boundary and runs the dedicated pager-frame producer task; that
-task refills the full bounded pool before yielding. The fault which set the bit
-has already resumed through its CAS, so this is neither fault deferral nor
-generic housekeeping, and the allocator never runs in exception context.
+task attempts a bounded refill, retaining the request for a later pass if
+allocation pressure leaves empty slots. The fault which set the bit has already
+resumed through its CAS, so this is neither fault deferral nor generic
+housekeeping. Allocator fallback may still run in exception context.
 
 Pages populated *around* the fault (§4.5) draw from this pool too, and so do
 the intermediate page tables the fault path publishes (§1c) - a zeroed reserve
 frame is exactly what an empty page table is. Restricting fault-around to the
-allocator alone was tried and reverted: the reserve is emptiest when the fault
+reserve alone was tried and reverted: the reserve is emptiest when the fault
 rate is highest, so the run went dead precisely when it was worth most. The run
 must degrade with supply, not switch off.
 
@@ -114,9 +116,11 @@ Exactly one of `consume` or `cancel` wins per token; `OneShotReplyClaim` pins
 it. A delayed reply cannot wake a later wait, because the wake is matched on
 the exact token.
 
-**Known open:** `BORROWED_CONTEXT_REPLY[receiver_slot]` is still keyed by a
-bare reply number. It is a second, narrower aliasing surface of the same shape
-as §2.4 and is deliberately not yet closed. Do not treat custody as settled.
+Borrowed-context charge publication binds the receiver slot to the context
+owner, namespace tag, and reply/fault number. Restore or clear requires all
+three to match; a numerically equal IPC reply and pager fault cannot settle
+each other's charge. This source rule does not itself establish complete
+concurrency or hardware acceptance.
 
 ---
 

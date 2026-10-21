@@ -79,12 +79,14 @@ do not replace runtime fault evidence. Multi-block native loader corpora, target
 non-identity VT-d/IOMMU fault-and-revoke captures, corrupted-media recovery,
 network saturation/cancellation/backpressure plus physical-NIC captures, and
 multicore CPU-time measurements remain failed release gates until their
-evidence artifacts pass. The composite 30-second KVM GUI/input/netprobe gate is
-currently failed: the standard Linux 6.12 virtio-gpu cannot import the foreign
-SG-table DMA-BUF used by the physical zero-copy source path, while QEMU's
-legacy VMware SVGA device cannot bind current vmwgfx. The enabled AMD profile
-can close that runtime gate only with the physical amdgpu assignment; a
-CPU-copy validation fallback is forbidden. The current Blackwell target uses the exact
+evidence artifacts pass. The virtual KVM GUI/input/network workload has recorded
+successful staged-atlas upload, GPU composition, and balanced WayClick windows
+(see `physical-gpu-status.md`). It must report
+`source-path=staged-copy zero-copy=0`; this is the explicit virtual transport,
+not a CPU renderer or evidence of physical read-only DMA-BUF import. The
+physical zero-copy, sustained FPS, reset/revoke, and host-recovery gates remain
+separate; virtual success cannot close them. The current Blackwell target uses
+the exact
 580.173.02 open-module/GSP pair and requires kernel-enforced signatures bound
 with their certificate and enforcement configuration to artifact-manifest
 schema 9. The manifest and seven named payload files must be admitted as one
@@ -98,11 +100,12 @@ observable. RustOS already compiles bounded scene layers into the private fixed
 contract, and the Linux DVM executes the identical command vocabulary through
 virgl or AMDGPU GLES with explicit fences, pixel verification, a frame hash,
 bounded one-time pipeline-prime latency, and measured steady-state completion
-latency. The KVM proof must explicitly report that no
-public ABI, live RustOS UI connection, or scanout handoff exists. Therefore it
-cannot close the still-failed private submit transport, AppState layer adapter,
-GPU-output KMS handoff, foreign DMA-BUF zero-copy, application 3D ABI, or
-physical AMD capture gates.
+latency. That original isolated proof did not establish a public ABI, live
+RustOS UI connection, or scanout handoff. Current virtual source and workload
+evidence additionally cover the private submit transport, AppState layer
+adapter, and GPU-output handoff via staged copy; they do not establish foreign
+DMA-BUF zero-copy, an application 3D ABI, or physical AMD performance/lifecycle
+acceptance. These proof scopes must be reported separately.
 
 For the enabled AMD `1002:1900` slice, source admission now additionally
 requires the signed schema-3 `amdgpu` identity and five authenticated fresh
@@ -111,8 +114,10 @@ explicit fence, a separate three-buffer atomic-KMS output pool, zero relay CPU
 copy, no staged damage upload, at least the 59,000 mHz measurement floor around
 a nominal 60 Hz mode, at most 25 ms commit-to-page-flip latency, and at most 2
 ms nonblocking atomic-commit time.
-This instrumentation and its finite model do not close the physical gate while
-the only available AMD function remains the active L0 boot display.
+This instrumentation and its finite model do not close the physical gate.
+`physical-gpu-status.md` records a physical run and operator-visible regression
+resolution, not accepted sustained FPS, latency distributions, reset/revoke,
+or host-recovery evidence; those quantitative/lifecycle gates remain open.
 
 The current implementation slice intentionally excludes trusted UI/multi-DVM
 focus authority and physical network DVM assignment. Physical block-DVM

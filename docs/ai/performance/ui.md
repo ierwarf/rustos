@@ -6,8 +6,12 @@
 
 - Rootd's early and steady-state supervisor loops and runtimed's session-owner
   loop drain up to the shared 32-request already-queued control budget per
-  turn. Rootd's 250 ms readiness/backoff delay is permitted only when its
-  early turn made no control-plane progress. Lifecycle/restart and runtimed's
+  turn. An early rootd turn with no control-plane progress may wait within a
+  250 ms readiness-supervision window, but rechecks exact core endpoints every
+  10 ms and stops as soon as they are ready. Twenty unready windows retain the
+  existing bounded supervision budget; active control turns can also spend a
+  poll, so this is not a five-second wall-clock guarantee. Restart backoff is
+  separate and is never shortened by readiness publication. Lifecycle/restart and runtimed's
   catalog/launch/socket owners run after each bounded burst. Sleeping or
   re-entering those slower owners after every single registration, checkpoint,
   or session request serializes a synchronous dependency chain; draining
@@ -44,9 +48,10 @@
   an unbounded trace. The synchronous debug sink cannot
   become an overload amplifier; aggregate counters and milestones retain the
   dropped volume.
-- Immutable successful syscalld time admissions are process-local cached
-  exact keys. In particular, syscalld never routes its own receive-loop
-  backoff through its own IPC endpoint.
+- Fixed-envelope sleep/clock validation is local compat timer substrate;
+  retired syscalld time-policy operations and per-process admission caches are
+  not on these hot paths. A service never routes its own timer backoff through
+  its own IPC endpoint.
 - Detailed `uiserver profile: ...` and cursor/render pipeline diagnostics stay
   behind `RUSTOS_UI_PROFILE=1`.
 - Profile and once-per-second heartbeat summaries are emitted after accounting
@@ -64,16 +69,19 @@
   drop/slow/error/backlog, no input gap or age over 50 ms,
   exact logical/presented cursor agreement, and at least 96 pixels of travel on
   both axes. It also requires three DVM samples at or above 60 FPS with
-  publish-to-page-flip time no greater than 12 ms. The DVM relay imports the
-  three immutable, page-aligned source slots as DMA-BUF KMS framebuffers. It
+  publish-to-page-flip time no greater than 12 ms. On the physical direct-import
+  acceptance path, the DVM relay imports the three immutable, page-aligned
+  source slots as DMA-BUF KMS framebuffers. It
   submits the chosen slot in a nonblocking atomic page flip without a relay CPU
   copy, keeps the new front pinned, and releases only the old front after the
   replacement page-flip event. An accepted DMA-BUF import or atomic ioctl is
   never a presentation claim; only the page-flip event completes scanout.
-  The standard Linux 6.12 virtio-gpu cannot import these foreign SG tables, so
-  this proof is intentionally failed on the virtual KVM GPU. It must pass on an
-  assigned i915/xe/amdgpu device or the pinned NVIDIA-open `nvidia-drm` path;
-  no CPU-copy or shadow-buffer substitute is accepted as performance evidence.
+  The virtual KVM path instead uses the explicit
+  `source-path=staged-copy zero-copy=0` GPU-composition contract because standard
+  virtio-gpu cannot import the foreign SG tables. Its virtual acceptance is not
+  physical direct-import, zero-copy, or sustained physical performance proof.
+  The physical contract must pass on an admitted assigned GPU; no CPU-copy or
+  shadow-buffer substitute qualifies as physical zero-copy evidence.
   For NVIDIA, the open modules and both requested GSP images must have the same
   release identity, KMS must report the assigned PCI function as its DRM owner,
   and only page-flip events on the physical connector count as presentation.
@@ -113,8 +121,11 @@
   force full damage. A profile-only callback commit with no content change
   carries no fabricated damage.
 - Retained GPU console layers are versioned independently from scene topology.
-  Terminal output refreshes only that layer's atlas rectangle; it must not
-  change the structural scene signature and trigger a 2048x2048 rebuild.
+  Any nonempty content damage, including a default update extended by console
+  refresh, marks the retained scene dirty. Terminal output refreshes only that
+  layer's atlas rectangle without requiring window motion; it must not change
+  the structural scene signature and trigger a 2048x2048 rebuild. Cursor-only
+  damage preserves the texture-reuse fast path until content damage is added.
 - Window position is command metadata, not atlas topology. A drag updates the
   exact capability-bound texture layer's destination rectangle without
   allocating, rasterizing, comparing, or copying the 2048x2048 atlas. Identity,

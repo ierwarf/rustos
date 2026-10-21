@@ -6,7 +6,30 @@ owners, and fresh validation. Root `AGENTS.md` is the only stable prompt
 prefix. This page does not authorize reusing stale evidence, speculative
 changes, or old uncommitted-work claims.
 
-## Latest established implementation and validation
+## Current continuation — 2026-10-21 (in progress)
+
+- Task: review all tracked Markdown, optimize matched 8-vCPU KVM desktop boot,
+  repair shell echo without dragging, harden other Ring3 services, then commit.
+  Initial HEAD `6292ac42`, initially clean. All 141 initial tracked Markdown
+  files were fully read across disjoint audit manifests; external links and
+  every implementation assertion were not exhaustively requalified.
+- Parent checkout owns UI content-damage invalidation, rootd's early-ready
+  10 ms subchecks inside unchanged 250 ms supervision windows, inputd's
+  256 bounded/expiring grants, and compat error-response cleanup. Native tests:
+  UI 70, inputd 29, rootd 26 passed; the added shell-atlas witness and nine
+  compat `netd_` tests passed. Full now/stable lanes are still pending.
+- Isolated netd writer owns recvmsg ancillary atomicity and pending-listener
+  teardown. AI/formal documentation writers have separate `/tmp` worktrees;
+  integrate their diffs only after handoff, then independently review netd.
+- Control topology: 8 RustOS / 2 DVM vCPUs, 30 s SMP-iteration desktop/input
+  smoke. First control passed; the following four passed 2/4 (DVM initial
+  render budget failure and missing WayClick first-frame marker). Preserve
+  failures; no boot-speed/reliability improvement is established yet.
+- Next: finish integration and review, run dev-plan now and stable lanes,
+  measure identical candidate boots without competing builds, inspect final
+  diff, refresh this continuation, and commit without bypassing checks.
+
+## Historical implementation and validation
 
 The October 20–21 rounds covered per-CPU domain budgets, precise wake and
 reply refusal recovery, x2APIC, SMP scheduler claims, IPC frame custody, and

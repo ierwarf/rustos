@@ -255,7 +255,10 @@ pub extern "C" fn __rustos_rootd_start() -> ! {
         );
         supervise_core_readiness(&mut leases);
         if !service_dependencies_ready(INITD_LEASE_INDEX) && served == 0 {
-            wait_for_restart_backoff(CORE_READINESS_POLL_INTERVAL_MS);
+            wait_for_core_readiness_with(
+                || service_dependencies_ready(INITD_LEASE_INDEX),
+                wait_for_restart_backoff,
+            );
         } else if !service_dependencies_ready(INITD_LEASE_INDEX) {
             yield_now();
         }
@@ -1882,6 +1885,20 @@ fn cleanup_failed_initial_activation(
     Ok(())
 }
 
+/// Observe endpoint publication inside one existing readiness-budget window.
+/// Only bootstrap readiness may end this wait early; restart backoff remains
+/// indivisible. The outer supervisor still charges at most one poll per window.
+fn wait_for_core_readiness_with(mut ready: impl FnMut() -> bool, mut wait: impl FnMut(u32)) {
+    let mut remaining = CORE_READINESS_POLL_INTERVAL_MS;
+    while remaining != 0 && !ready() {
+        let slice = remaining.min(
+            rustos_user_abi::performance::ROOTD_SUPERVISOR_IDLE_POLL_MS as u32,
+        );
+        wait(slice);
+        remaining -= slice;
+    }
+}
+
 /// Apply the rootd-owned retry delay with a capability-gated timer substrate.
 /// A rejected wait would make the published restart contract unenforceable, so
 /// it is a supervisor-fatal condition rather than a busy-loop fallback.
@@ -2889,6 +2906,30 @@ mod tests {
         assert_eq!(initial.pid, 0);
         assert_eq!(initial.state, ROOTD_LEASE_STATE_FAILED);
         assert_eq!(initial.exit_status, -11);
+    }
+
+    #[test]
+    fn core_readiness_wait_observes_publication_without_spending_the_full_window() {
+        let elapsed = core::cell::Cell::new(0_u32);
+        wait_for_core_readiness_with(
+            || elapsed.get() >= 30,
+            |millis| elapsed.set(elapsed.get() + millis),
+        );
+        assert_eq!(elapsed.get(), 30);
+
+        wait_for_core_readiness_with(|| true, |_| panic!("ready services must not sleep"));
+    }
+
+    #[test]
+    fn core_readiness_wait_preserves_the_unready_supervision_window() {
+        let mut elapsed = 0_u32;
+        wait_for_core_readiness_with(|| false, |millis| {
+            assert!(millis > 0);
+            assert!(u64::from(millis) <= rustos_user_abi::performance::IPC_READINESS_QUERY_HARD_LIMIT_MS);
+            elapsed += millis;
+        });
+        assert_eq!(elapsed, CORE_READINESS_POLL_INTERVAL_MS);
+        assert_eq!(u64::from(elapsed) * u64::from(CORE_READINESS_POLL_MAX), 5_000);
     }
 
     #[test]

@@ -212,8 +212,8 @@ Quiet default:
 
 ```toml
 enabled = true
-boot_trace_enabled = true
-serial_mirror = true
+boot_trace_enabled = false
+serial_mirror = false
 ring_buffer_bytes = 16384
 min_level = "info"
 
@@ -505,8 +505,8 @@ RustOS debugcon이 비어 있다고 boot 성공으로 판단하면 안 됩니다
 
 ```toml
 enabled = true
-boot_trace_enabled = true
-serial_mirror = true
+boot_trace_enabled = false
+serial_mirror = false
 ring_buffer_bytes = 16384
 min_level = "info"
 

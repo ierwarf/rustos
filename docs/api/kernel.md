@@ -19,7 +19,7 @@ API modules over reaching into private subsystem modules.
 | `kernel-object` | `kernel/object/src/api.rs` | typed object/handle/session rights shared by kernel subsystems. |
 | `kernel-ipc-runtime` | `kernel/ipc-runtime/src/api.rs` | kernel shared region creation, descriptor/mapping lifetime, mapping, frame export. |
 | `kernel-ps` | `kernel/ps/src/api.rs` | scheduler, process/thread state, user task lifecycle, waits, snapshots. |
-| `kernel-io-manager` | `kernel/io-manager/src/api.rs` | block, boot volume, console, device, tty, input, USB, VFS, drivers. |
+| `kernel-io-manager` | `kernel/io-manager/src/api.rs` | block, boot volume, console, device, tty, DVM input transport, VFS. |
 | `kernel-compat` | `kernel/compat/src/api.rs` | Linux/Windows compatibility syscall and console host API. |
 | `kernel-executive` | `kernel/executive/src/lib.rs` | boot orchestration and cross-subsystem hook registration. |
 | `nucleus-core` | `kernel/nucleus-core/src/debug/mod.rs` | structured logging, panic/debug output, boot trace helpers. |
@@ -81,20 +81,18 @@ Use `kernel_ps::api` for task scheduling and user process state.
 
 ### IO Manager API
 
-Use `kernel_io_manager::api` for devices, boot volume state, VFS, console, and
-driver integration.
+Use `kernel_io_manager::api` for bounded device transport, boot volume state,
+VFS, and console mechanisms. Driver execution remains in the Linux DVM.
 
 | Group | Key APIs | Notes |
 | --- | --- | --- |
 | `boot` | `init_gui`, `init_boot_info`, `boot_volume_identity`, `enter_kernel_vfs_runtime`, `enter_userspace_runtime` | Boot volume and runtime phase transitions. |
 | `block` | `dvm_info`, `submit_dvm_read`, `submit_dvm_write`, `submit_dvm_flush`, `poll_dvm`, `cancel_dvm`, `finish_dvm` | Bounded storage-DVM transport; no physical block registry. |
-| `console` | `init_console`, `init_tty`, `write_console`, `service_console` | Kernel console and TTY service. |
-| `device` | `open`, `read_to_current_user`, `read_to_user`, `ioctl_from_user` | `/dev`-style device access from kernel/syscall paths. |
+| `console` | `init_tty`, `write` | Kernel console and TTY mechanism. |
+| `device` | `ioctl_from_user`, `ioctl_display_from_user` | Bounded device ioctl/user-copy substrate; policy remains in services. |
 | `tty` | session input/output and termios helpers | Console session IO. |
-| `driver` | `initialize_loadable_modules_for_class`, Linux runtime hooks | Driver load/service integration. |
-| `input` | `init_input`, interrupt handlers, service pending counters | Keyboard/mouse/HID input. |
-| `usb` | `init_usb`, debug counters | USB host path. |
-| `vfs` | `init_vfs`, `normalize_kernel_path`, mount/open/metadata/access/readlink helpers | Current-process VFS operations. |
+| `input` | `init`, `service_dvm_input_pending`, `mark_dvm_policy_consumer_ready` | Fixed DVM record copy/wake substrate; inputd owns framing and policy. |
+| `vfs` | `init`, `normalize_kernel_path`, mount/open/metadata/access/readlink helpers | Current-process VFS operations. |
 
 ### Object And IPC APIs
 
@@ -144,7 +142,7 @@ kernel crate에서 private subsystem module을 직접 참조하기보다 이 API
 | `kernel-object` | `kernel/object/src/api.rs` | kernel subsystem이 공유하는 typed object/handle/session rights |
 | `kernel-ipc-runtime` | `kernel/ipc-runtime/src/api.rs` | kernel shared region 생성, descriptor/mapping 수명주기, mapping, frame export |
 | `kernel-ps` | `kernel/ps/src/api.rs` | scheduler, process/thread state, user task lifecycle, wait, snapshot |
-| `kernel-io-manager` | `kernel/io-manager/src/api.rs` | block, boot volume, console, device, tty, input, USB, VFS, driver |
+| `kernel-io-manager` | `kernel/io-manager/src/api.rs` | block, boot volume, console, device, tty, DVM input transport, VFS |
 | `kernel-compat` | `kernel/compat/src/api.rs` | Linux/Windows compatibility syscall과 console host API |
 | `kernel-executive` | `kernel/executive/src/lib.rs` | boot orchestration과 cross-subsystem hook registration |
 | `nucleus-core` | `kernel/nucleus-core/src/debug/mod.rs` | structured logging, panic/debug output, boot trace helper |
@@ -206,18 +204,18 @@ task scheduling과 user process state는 `kernel_ps::api`를 사용합니다.
 
 ### IO Manager API
 
-device, boot volume state, VFS, console, driver integration은
-`kernel_io_manager::api`를 사용합니다.
+제한된 device transport, boot volume state, VFS, console mechanism은
+`kernel_io_manager::api`를 사용합니다. Driver 실행은 Linux DVM 소유입니다.
 
 | Group | Key APIs | Notes |
 | --- | --- | --- |
 | `boot` | `init_gui`, `init_boot_info`, `boot_volume_identity`, `enter_kernel_vfs_runtime`, `enter_userspace_runtime` | boot volume과 runtime phase transition |
 | `block` | `dvm_info`, `submit_dvm_read`, `submit_dvm_write`, `submit_dvm_flush`, `poll_dvm`, `cancel_dvm`, `finish_dvm` | 제한된 storage-DVM 전송 경계이며 물리 block registry는 없음 |
-| `console` | `init_console`, `init_tty`, `write_console`, `service_console` | kernel console과 TTY service |
-| `device` | `open`, `read_to_current_user`, `read_to_user`, `ioctl_from_user` | kernel/syscall path의 `/dev` style device access |
+| `console` | `init_tty`, `write` | kernel console과 TTY mechanism |
+| `device` | `ioctl_from_user`, `ioctl_display_from_user` | 제한된 ioctl/user-copy substrate; policy는 service 소유 |
 | `tty` | session input/output and termios helpers | console session IO |
 | `input` | `init`, `service_dvm_input_pending`, `mark_dvm_policy_consumer_ready` | 고정 DVM record copy/wake substrate; framing과 input policy는 inputd 소유 |
-| `vfs` | `init_vfs`, `normalize_kernel_path`, mount/open/metadata/access/readlink helpers | current-process VFS operation |
+| `vfs` | `init`, `normalize_kernel_path`, mount/open/metadata/access/readlink helpers | current-process VFS operation |
 
 ### Object And IPC APIs
 

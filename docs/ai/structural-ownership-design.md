@@ -343,10 +343,12 @@ See [Publication ownership and guard deletion requirements](ownership/publicatio
 
 QNX's rule is the whole design: a server should always have a RECEIVE-blocked
 thread, and a kernel boost that compensates for the absence of one is working
-around a badly built server. vfsd currently has one serve loop that performs
-snapshot reads, which is exactly the shape QNX names.
+around a badly built server. The historical single serve loop performed
+snapshot reads itself. Current source resolves then enqueues executable
+snapshot work into the bounded worker pool instead; control-lane runtime
+residence evidence is still owed.
 
-Four owners:
+The design separates four owner roles (not necessarily four named types):
 
 - `VfsEndpointReceiver` — always receive-capable. Validates the envelope and
   produces an immutable `RequestTicket`. Performs no I/O.
@@ -546,10 +548,12 @@ this document is a tuning change.
 4. Section 2, the per-CPU scheduler, staged exactly as 2.7 describes.
 5. Section 4, the uiserver split, gated on the frame records not regressing.
 
-Sections 6, 7, 8, and 9 are done. Only sections 2 and 4 remain, and both are
-staged migrations rather than single changes: landing either without the
-validation each describes would repeat the per-slot owner-word failure, which
-passed every unit test and only broke in KVM.
+This ordering records the migration plan, not a current closure inventory.
+Section 2's source deletion is complete; hardware/performance qualification
+remains separate. Sections 3 and 8 still owe their runtime evidence, and
+sections 4 and 5 retain the owner/trace work listed above. Source structure
+alone cannot close those gates: the earlier per-slot owner-word failure passed
+every unit test and only broke in KVM.
 
 A per-item claim of closure requires the construct to exist in source *and* a
 mutant that fails without it. Source inspection alone is what produced the
@@ -596,6 +600,7 @@ slot reuse or missing identity drops only one-shot priority. The latency excepti
 matching task ID, carries `{slot, task_id}` in its fixed FIFO, and rechecks
 both identity and User class on consumption. Slot recycling replaces the old
 record for that slot without growing capacity; missing/changed identity or a
-torn class publication cannot spend that queue's budget. The lifecycle producer still
-constructs first-turn records under the global guard, which continues to
-serialize donation and teardown, so deletion remains unsafe.
+torn class publication cannot spend that queue's budget. The former global-guard
+first-turn producer, donation serialization, and teardown path were intermediate
+migration premises, now superseded by the independent-owner deletion inventory
+in §2.6b–2.7. Their source deletion does not establish hardware acceptance.

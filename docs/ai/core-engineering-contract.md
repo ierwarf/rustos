@@ -72,9 +72,11 @@ continue to require:
 - per-CPU run queues with bounded targeted wake and load balancing;
 - multicore memory-order litmus, stress, and recovery evidence.
 
-The current serialized global scheduler remains correctness scaffolding, not
-completion of the per-CPU run-queue contract. The former broadcast reschedule
-fan-out is retired; ordinary local work cannot create remote IPI authority.
+Independent per-CPU run queues and exact lifecycle/frame/funding owners now
+replace the deleted global scheduler catalog and guard. Source deletion does
+not complete hardware/performance qualification. The former broadcast
+reschedule fan-out is retired; ordinary local work cannot create remote IPI
+authority.
 No document, launcher flag, or readiness marker may advertise commercial SMP
 until the 1/2/4/8-vCPU qualification matrix passes.
 
@@ -321,7 +323,6 @@ refactors, local implementation cleanup, comment-only changes, and measured
 performance tuning that preserves those contracts do not require documentation churn.
 If a behavior-changing source edit has no applicable contract, create one before
 committing it.
-incomplete even when its tests pass.
 
 For every critical/high change:
 

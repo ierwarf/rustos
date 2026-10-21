@@ -2,11 +2,20 @@
 
 [Contract index](../README.md).
 
-## Current results
+<a id="current-results"></a>
 
-One vCPU, the unrestricted probe table, from two consecutive runs of the
-current tree. The anchor moved -2.2%, inside the 3% admission bound; both
-columns are `min` readings, so their spread is the instrument's own:
+## Historical results
+
+This file preserves historical unqualified snapshots, not current-tree
+performance or release evidence. Exact revision/date provenance and full configuration are
+unavailable for these snapshots; retain only the configuration and controls
+explicitly recorded below. Current source ownership is documented in
+`docs/ai/ownership/execution.md`; new performance claims need fresh anchored,
+same-session measurements of the named binary and configuration.
+
+One vCPU, the unrestricted probe table, from two consecutive runs of that
+historical tree. The recorded anchor moved -2.2%, inside the 3% admission
+bound; both columns are `min` readings:
 
 | probe | min cycles | repeat |
 | --- | ---: | ---: |
@@ -27,8 +36,8 @@ fused-reply-recv fastpath hits 100% of calls). Traced with
 state is 33–150us at two sites — `kernel/ps/src/multitask/irq.rs`'s timer
 and voluntary-yield dispatch entries — both ordinary dispatch turns, not a
 defect. This corroborates rather than explains away the standing conclusion
-below: the remaining tail is fair-scheduling contention from the live
-desktop's other runnable tasks (uiserver, WayClick, netd), which is correct
+below: the remaining tail was attributed to fair-scheduling contention from
+the live desktop's other runnable tasks (uiserver, WayClick, netd), which is correct
 scheduler behavior, not a bug. The one confirmed exception:
 
 **The debugcon-in-lock tail fix.** A milestone (`scheduling-budget-exhausted`)
@@ -43,14 +52,14 @@ a hot lock is a tail cause; per-operation cost reduction is a min/p50 cause.
 Look for the former, not more of the latter, before attempting `p99` work
 here again.
 
-**What sets the current 17,480-cycle production-shaped local floor** is still
-the tracked-lock path, but the old absolute attribution is retired. The
-pre-relocation profile counted about forty-two acquisitions per round trip at
+**The historical 17,480-cycle production-shaped local floor** was attributed
+to the tracked-lock path; it is not a current-tree floor, and the old absolute
+attribution is retired. The pre-relocation profile counted about forty-two acquisitions per round trip at
 ~735 *instrumented* ticks each. After the GOT fix, a fresh isolated diagnostic
 run reads ~440 ticks per acquisition: `before-acquire` 162 + `spin` 31 +
 `after-acquire` 32 + `release` 215. The diagnostic build itself raises the
 probe from 17,600 to 31,040, so those 440 ticks are not shipping attribution
-and must not be multiplied into the current floor. They establish only that
+and must not be multiplied into that historical floor. They establish only that
 the GOT removal changed the cost shape and that the former 735/91% split is
 stale.
 
@@ -161,22 +170,21 @@ server, not just the synthetic bench pair). Both controls
 
 ## `V5-SCHED-GLOBAL-001` and the scheduler catalog
 
-Current status and the full measurement trail: `docs/ai/structural-ownership-design.md`
-§2. Summary as of the source check in this file's last revision: the per-CPU
-runqueue, owner-word state machine, and remote-wake mailboxes are lock-free
-and already do not scan a global ready set; the global `SCHEDULER` lock now
-protects lifecycle/catalog bookkeeping, not dispatch selection. Catalog
-acquisitions per scheduler entry (the stable normalizer — comparable across
-boots whose absolute round-trip rate differs, unlike acquisitions per
-second) moved 4.65 → 2.59 → **1.99** at one vCPU and 3.27 → **2.02** at eight,
-by giving per-slot published answers to questions that used to require the
-global lock (own-task identity, IPC priority reservation, wait-arm/cancel).
-What still enters the guard on the ordinary path: dispatch itself, the
-reply-wake handoff, pick hints, and retired-task cleanup — reducing that
-further is "ordinary-path acquisition-zero," open, and is a data-structure
-split, not a scheduling-algorithm change or a lock removal. Do not restate
-the measurement trail here; it is kept current in the design doc, not this
-one.
+Current source status is in `docs/ai/ownership/execution.md` and
+`docs/ai/structural-ownership-design.md`: the global `Scheduler` catalog, guard,
+and consumers are deleted. Independent per-CPU and lifecycle/frame/funding
+owners replace them; runtime/hardware/performance acceptance remains separate.
+
+The following is an intermediate migration measurement, not a live backend
+inventory. Catalog acquisitions per scheduler entry moved
+4.65 → 2.59 → **1.99** at one vCPU and 3.27 → **2.02** at eight, by publishing
+per-slot answers for own-task identity, IPC priority reservation, and wait-arm/
+cancel. Dispatch, reply-wake handoff, hints, and cleanup still entered the
+guard at that checkpoint. Its then-open “ordinary-path acquisition-zero”
+target is superseded by the source deletion inventory, not newly qualified by
+these old numbers. The runqueue uses owner-word custody plus per-CPU queue/
+mailbox locks; absence of a global ready scan is not a claim that the entire
+backend is lock-free.
 
 ## Phase 6 process-lifecycle and frame-settlement checkpoint
 
@@ -190,8 +198,8 @@ and last records retained distinct process generations and non-reused
 lifecycle transactions; the measured 32 children also carried `reap-queued`.
 Trace-enabled latency is diagnostic and is not compared with shipping builds.
 
-Fresh shipping one-vCPU results after the exact pre-map spawn reservation and
-batched frame return:
+Historical shipping one-vCPU results after the exact pre-map spawn reservation
+and batched frame return:
 
 | probe | min cycles | p50 cycles | p99 cycles |
 | --- | ---: | ---: | ---: |
@@ -210,7 +218,8 @@ weakening ownership checks — reporting min/p50 6,002,880/6,384,800 cycles at
 one vCPU and 6,149,960/6,477,200 at eight, both 41,058 frames in 642 bounded
 operations. Both SMP runs passed the kernel-stamped semantic isolation gate.
 
-**These distributions establish the Phase-6 closure; they do not claim that
-desktop-contention p99 is stable.** `p99` ordering across A-B-A controls was
-not repeatable and makes no tail claim.
+**These distributions were recorded as the Phase-6 checkpoint; unavailable
+revision/date provenance prevents treating them as current closure evidence.
+They do not claim that desktop-contention p99 is stable.** `p99` ordering across
+A-B-A controls was not repeatable and makes no tail claim.
 

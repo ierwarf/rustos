@@ -79,14 +79,13 @@ relationship.
 | `PAGER_MIN_FULLY_TRACKED_PROCESSES >= 2` | `region_edit.rs` |
 | ring0 `MAX_PAGER_VMAS_PER_PROCESS` **is** `PAGER_MAX_VMAS_PER_PROCESS` | `pager_vma.rs` |
 
-**Why the reserve is sized to the slot table.** A fault slot holds one reserve
-frame from reservation until its reply consumes or cancels it. A reserve
-smaller than the slot table can therefore run dry *while slots are still free*
-— an exhaustion with no admission point to refuse at. Ring0 then returns
-`UserFaultDisposition::Unhandled` for a valid non-present fault and the process
-dies with a SIGSEGV that names nothing. With this relation the reserve can only
-be empty after fault-slot admission has already refused, and that refusal is
-counted.
+**Why the reserve is sized to the slot table.** Each pager-backed fault slot
+holds one frame grant until its reply consumes or cancels it. The relation
+covers those concurrent grants only: anonymous faults consume no fault slots,
+and anonymous leaves, intermediate tables, and fault-around can also draw
+from the reserve. It therefore does not prove an empty reserve unreachable
+before slot refusal. Anonymous supply falls back to the IRQ-safe allocator;
+pager-backed reserve admission has its own counted refusal.
 
 **Growth per edit.** An edit is one contiguous interval and regions never
 overlap, so only the region an edit lies strictly inside can split:
@@ -111,19 +110,20 @@ mapping linearly used to pay one per 4 KiB.
 - **Ring0 computes the offer** in `offered_run_pages`, clipped to the VMA's own
   remaining extent and to `PAGER_FAULT_RUN_PAGES_MAX` (16 pages, 64 KiB).
   Never less than the faulting page.
-- **Anonymous takes the whole offer.** Ring0 owns both halves now, and
-  anonymous first touch is overwhelmingly sequential.
+- **Anonymous attempts the whole offer.** Ring0 owns both halves now, and
+  anonymous first touch is overwhelmingly sequential; surplus remains best effort.
 - **Pager-backed asks** for `PagerFaultReplyWire::map_run_pages`, never more
   than `map_run_pages_offered`. That split keeps mechanism in ring0 and policy
   in the pager.
 - **Ring0 populates** the surplus pages *after* the faulting page is mapped,
-  from the ordinary allocator — never from the wired reserve. The reserve
-  exists so a fault's obligatory page never allocates; spending it on
-  best-effort pages would trade a guarantee for throughput.
+  using the wired reserve first and the IRQ-safe allocator as fallback.
+  Exhausting both supplies stops the optional run, not the already-answered
+  fault.
 
 Every surplus page is strictly best effort. The run stops at the first page it
-cannot serve — a short allocator, a racing unmap, an already-present leaf — and
-no failure is reported, because the fault itself is already answered. Each page
+cannot serve — both frame sources empty, a racing unmap, an already-present
+leaf — and no failure is reported, because the fault itself is already answered.
+Each page
 revalidates process, MM, VMA and object generations independently, so a
 concurrent `exec` or `munmap` between two pages of one run ends the run rather
 than mapping into an address space that no longer owns the range.
@@ -223,27 +223,29 @@ a fault-time shootdown path exists for another reason.
 
 ## 5. Progress condition
 
-> After a fault completes, the next fault must be admissible.
+> Completion returns owned protocol resources; frame supply is replenished
+> independently, not synchronously before every resume or wake.
 
-For an **anonymous** fault, that is one clause, because it is the only bounded
-resource the path touches:
+An **anonymous** fault consumes no fault slot, grant, or donation. Its leaf and
+required tables use reserve-first supply with IRQ-safe allocator fallback.
+Failure of both supplies for an obligatory frame is terminal memory exhaustion;
+a reserve dip alone is not a failed fault.
 
-1. The wired reserve is non-empty — replenished at completion, before the
-   faulting task resumes.
+For a **pager-backed** fault, completion must return the fault slot and consume
+or cancel its grant on every exit, releasing donation before waking the owner.
+Its reserve admission can refuse independently of slot capacity.
 
-For a **pager-backed** fault, all of:
+Reserve consumption at the low-water mark requests the dedicated producer.
+The next safe user-frame timer boundary schedules it; partial refill retains
+the request for a later pass. Neither anonymous resume nor pager wake waits for
+a full refill. The capacity relations in §4 cover pager-backed grants, not all
+anonymous and table consumption.
 
-1. The fault slot is `Free` — `consume_pager_fault_reply` ran on every exit.
-2. The wired reserve is non-empty — replenished at completion, before the wake.
-3. The grant slot is `Free` — taken or cancelled on every exit.
-4. The donation is released — before the wake, on both paths.
-
-Observability: `pager_fault_reserve_low_watermark()` is the check. It is a
-low-water mark rather than an average on purpose — a reserve that reached zero
-once has already failed a fault, and an average hides that. A boot in which it
-reaches `0` has violated the progress condition regardless of whether anything
-else looks wrong. `pager-ring0-anon-reserve-empty` names the anonymous case
-directly.
+Observability: `pager_fault_reserve_low_watermark()` records supply pressure.
+Zero is a useful diagnostic, not proof of a failed fault or violated slot bound.
+`pager-ring0-anon-reserve-empty` records anonymous reserve misses, including
+those successfully served by allocator fallback. Distinguish those from actual
+both-source exhaustion and from pager-backed reserve-admission refusal.
 
 ---
 
@@ -261,7 +263,7 @@ one log name.
 | `REGION_SPLIT_NO_SLOT` | a split has no slot for its second fragment | **yes** — the pager keeps the whole region |
 | `VMA_SLOTS_FULL` | ring0's per-process VMA table is full | no — eager fallback |
 | `FAULT_SLOTS_FULL` | ring0's fault-slot table is full | no |
-| `FAULT_FRAME_RESERVE_EMPTY` | the wired reserve is empty at exception time | no — §4 makes it unreachable first |
+| `FAULT_FRAME_RESERVE_EMPTY` | pager-backed grant admission found no reserve frame | no — counted admission refusal; not an anonymous fallback miss |
 | `GRANT_TABLE_FULL` | no free opaque grant slot | no |
 | `RELEASE_QUEUE_FULL` | reserved; no ring0 caller produces it since anonymous stopped notifying a pager | — |
 | `SEQUENCE_EXHAUSTED` | a publication sequence hit its terminal value | no |

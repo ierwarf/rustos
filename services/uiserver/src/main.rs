@@ -221,9 +221,9 @@ fn cursor_move_update(
         state.surface.width,
         state.surface.height,
     ));
-    update.add_partial_rect(
+    update.absorb(VisualUpdate::cursor(
         state.cursor_visual_dirty_rect(state.surface.width, state.surface.height),
-    );
+    ));
     update
 }
 

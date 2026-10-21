@@ -240,10 +240,13 @@ Moving the fallback into a `#[cold] #[inline(never)]`
 `derive_cpu_index_by_apic` and the token panic into `token_outside_topology`
 left a hot body LLVM inlines: seven out-of-line copies became one.
 
-Confirmed by a same-session A-B-A. The anchor moved on the B runs, so the raw
-column is not directly attributable -- but `null_syscall_getpid` read exactly
-400 on every run in both directions, which is what rules out a uniform guest
-speedup, and the A-control reproduces the loss when the change is removed:
+The linked-code copy removal is structural evidence. The timing below is a
+historical unqualified snapshot (exact revision/date provenance unavailable):
+the same-session A-B-A anchor moved on the B runs, so latency improvement is
+not attributable under the benchmark admission rule. Flat
+`null_syscall_getpid` readings do not replace the `vmexit_cpuid` anchor. Keep
+these observations as corroborative history; an anchored same-session A-B-A
+is required before attributing a latency gain:
 
 | probe | A (static only) | B | B repeat | A control |
 | --- | ---: | ---: | ---: | ---: |
@@ -253,8 +256,8 @@ speedup, and the A-control reproduces the loss when the change is removed:
 | `ipc_try_recv_empty` | 1,480 | 1,440 | 1,360 | 1,480 |
 | `null_syscall_getpid` | 400 | 400 | 400 | 400 |
 
-`null_syscall_getpid` is unmoved at 400 in every column: that probe has reached
-a floor this class of change no longer touches.
+`null_syscall_getpid` was unmoved at 400 in every column, but it is not a
+hardware-speed control and cannot qualify this comparison.
 
 ## Shipping cost budgets without a free-running census
 

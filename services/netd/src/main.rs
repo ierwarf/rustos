@@ -1337,7 +1337,10 @@ enum UnixSocketState {
 struct ConnectedState {
     incoming: VecDeque<UnixStreamSegment>,
     incoming_bytes: usize,
+    /// Aligned wire charge, including padding needed when controls are joined.
     incoming_control_bytes: usize,
+    /// Listener custody survives queue removal until accept publication settles.
+    pending_listener: Option<u64>,
     channel_id: u64,
     peer: u64,
     peer_closed: bool,
@@ -1744,6 +1747,7 @@ fn handle_socketpair(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -
                 incoming: VecDeque::new(),
                 incoming_bytes: 0,
                 incoming_control_bytes: 0,
+                pending_listener: None,
                 channel_id: 0,
                 peer: right,
                 peer_closed: false,
@@ -1769,6 +1773,7 @@ fn handle_socketpair(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -
                 incoming: VecDeque::new(),
                 incoming_bytes: 0,
                 incoming_control_bytes: 0,
+                pending_listener: None,
                 channel_id: 0,
                 peer: left,
                 peer_closed: false,
@@ -1823,41 +1828,68 @@ fn handle_close(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32
         response.value = socket.refs as u64;
         return 0;
     }
-    let Some(socket) = state.sockets.remove(&request.socket_token) else {
-        return libc::EBADF;
-    };
-    if let Some(path) = socket.bound_path {
-        if state.bindings.get(&path).copied() == Some(request.socket_token) {
-            state.bindings.remove(&path);
-        }
-    }
-    if let UnixSocketState::Connected(mut connected) = socket.state {
-        let mut released = Vec::new();
-        while let Some(segment) = connected.incoming.pop_front() {
-            if segment.control.is_empty() {
-                continue;
-            }
-            let start = cmsg_align(released.len());
-            released.resize(start, 0);
-            released.extend_from_slice(segment.control.as_slice());
-        }
-        if released.len() > response.payload.len() {
-            debug_line("netd: ancillary release bound violated");
-            std::process::exit(134);
-        }
-        response.payload[..released.len()].copy_from_slice(released.as_slice());
-        response.payload_len = released.len() as u32;
-        response.reserved0 = released.len() as u32;
-        if let Some(peer) = state.sockets.get_mut(&connected.peer) {
-            if let UnixSocketState::Connected(peer_connected) = &mut peer.state {
-                peer_connected.peer_closed = true;
-                peer_connected.peer_read_closed = true;
-                peer_connected.peer_write_closed = true;
-            }
-        }
-    }
+    let (retired, peers) = retire_unix_socket(&mut state, request.socket_token);
     drop(state);
+    encode_retired_socket_release(retired, response);
+    // Pending clients are not in the dispatcher's pre-close target snapshot.
+    advance_readiness_generation(&peers);
     0
+}
+
+/// Withdraw identities and notify peers atomically; backing and authority are
+/// carried out of the state lock for destruction and the kernel release trailer.
+fn retire_unix_socket(state: &mut NetState, token: u64) -> (Vec<UnixSocket>, Vec<u64>) {
+    let mut tokens = vec![token];
+    let mut retired = Vec::new();
+    let mut peers = Vec::new();
+    while let Some(token) = tokens.pop() {
+        let Some(mut socket) = state.sockets.remove(&token) else {
+            continue;
+        };
+        if let Some(path) = &socket.bound_path {
+            if state.bindings.get(path).copied() == Some(token) {
+                state.bindings.remove(path);
+            }
+        }
+        match &mut socket.state {
+            UnixSocketState::Listening { pending, .. } => {
+                tokens.extend(pending.drain(..));
+            }
+            UnixSocketState::Connected(connected) => {
+                peers.push(connected.peer);
+                if let Some(peer) = state.sockets.get_mut(&connected.peer) {
+                    if let UnixSocketState::Connected(peer_connected) = &mut peer.state {
+                        peer_connected.peer_closed = true;
+                        peer_connected.peer_read_closed = true;
+                        peer_connected.peer_write_closed = true;
+                    }
+                }
+            }
+            UnixSocketState::Idle => {}
+        }
+        retired.push(socket);
+    }
+    (retired, peers)
+}
+
+fn encode_retired_socket_release(retired: Vec<UnixSocket>, response: &mut NetdIpcResponse) {
+    let mut released = Vec::new();
+    for socket in retired {
+        if let UnixSocketState::Connected(connected) = socket.state {
+            for segment in connected.incoming {
+                if !segment.control.is_empty() {
+                    released.resize(cmsg_align(released.len()), 0);
+                    released.extend_from_slice(&segment.control);
+                }
+            }
+        }
+    }
+    // Admission charges aligned controls against one bounded custody budget,
+    // including all of a listener's queued and in-flight accepted sockets.
+    assert!(released.len() <= response.payload.len());
+    response.payload[..released.len()].copy_from_slice(&released);
+    response.payload_len = released.len() as u32;
+    response.reserved0 = released.len() as u32;
 }
 
 /// Performs the final under-lock admission immediately before smoltcp gains a
@@ -1973,6 +2005,7 @@ fn handle_connect(request: &NetdIpcRequest) -> i32 {
         incoming: VecDeque::new(),
         incoming_bytes: 0,
         incoming_control_bytes: 0,
+        pending_listener: None,
         channel_id,
         peer: accepted,
         peer_closed: false,
@@ -2009,6 +2042,7 @@ fn handle_connect(request: &NetdIpcRequest) -> i32 {
                 incoming: VecDeque::new(),
                 incoming_bytes: 0,
                 incoming_control_bytes: 0,
+                pending_listener: Some(listener_token),
                 channel_id,
                 peer: request.socket_token,
                 peer_closed: false,
@@ -2163,46 +2197,72 @@ fn handle_accept(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i3
             _ => return libc::EINVAL,
         }
     };
-    let channel_id = {
-        let state = net_state().lock().unwrap();
-        let Some(socket) = state.sockets.get(&accepted) else {
-            return libc::ECONNABORTED;
+    let result = (|| {
+        let channel_id = {
+            let state = net_state().lock().unwrap();
+            let Some(socket) = state.sockets.get(&accepted) else {
+                return libc::ECONNABORTED;
+            };
+            let UnixSocketState::Connected(connected) = &socket.state else {
+                return libc::ECONNABORTED;
+            };
+            connected.channel_id
         };
-        let UnixSocketState::Connected(connected) = &socket.state else {
-            return libc::ECONNABORTED;
-        };
-        connected.channel_id
-    };
-    if channel_id == 0 {
-        return libc::EPROTO;
-    }
-    if request.arg1 != 0 && request.arg2 != 0 {
-        let state = net_state().lock().unwrap();
-        if let Some(socket) = state.sockets.get(&accepted) {
-            if let Err(errno) =
-                sockaddr_payload(socket.peer_path.as_deref().unwrap_or(""), response)
-            {
-                return errno;
-            }
+        if channel_id == 0 {
+            return libc::EPROTO;
         }
-    }
-    let result = call_net_broker(request, response, 0, accepted, channel_id, false);
-    if result != 0 {
-        // The kernel did not publish the accepted open description. Restore
-        // the listener's ownership so a transient broker failure cannot lose
-        // a connection that is still live in netd.
-        let mut state = net_state().lock().unwrap();
-        if state.sockets.contains_key(&accepted) {
-            if let Some(listener) = state.sockets.get_mut(&request.socket_token) {
-                if let UnixSocketState::Listening { pending, .. } = &mut listener.state {
-                    if !pending.contains(&accepted) {
-                        pending.push_front(accepted);
-                    }
+        if request.arg1 != 0 && request.arg2 != 0 {
+            let state = net_state().lock().unwrap();
+            if let Some(socket) = state.sockets.get(&accepted) {
+                if let Err(errno) =
+                    sockaddr_payload(socket.peer_path.as_deref().unwrap_or(""), response)
+                {
+                    return errno;
                 }
             }
         }
+        call_net_broker(request, response, 0, accepted, channel_id, false)
+    })();
+    let (retired, peers) = {
+        let mut state = net_state().lock().unwrap();
+        settle_unix_accept(&mut state, request.socket_token, accepted, result == 0)
+    };
+    if !retired.is_empty() {
+        // Failed accept after listener retirement still owns one unpublished
+        // reference. Error replies carry its release trailer too; the compat
+        // consumer must retire that authority before returning the errno.
+        encode_retired_socket_release(retired, response);
     }
+    advance_readiness_generation(&peers);
     result
+}
+
+fn settle_unix_accept(
+    state: &mut NetState,
+    listener_token: u64,
+    accepted: u64,
+    published: bool,
+) -> (Vec<UnixSocket>, Vec<u64>) {
+    if published {
+        if let Some(socket) = state.sockets.get_mut(&accepted) {
+            if let UnixSocketState::Connected(connected) = &mut socket.state {
+                connected.pending_listener = None;
+            }
+        }
+        return (Vec::new(), Vec::new());
+    }
+    if !state.sockets.contains_key(&accepted) {
+        return (Vec::new(), Vec::new());
+    }
+    if let Some(listener) = state.sockets.get_mut(&listener_token) {
+        if let UnixSocketState::Listening { pending, .. } = &mut listener.state {
+            if !pending.contains(&accepted) {
+                pending.push_front(accepted);
+            }
+            return (Vec::new(), Vec::new());
+        }
+    }
+    retire_unix_socket(state, accepted)
 }
 
 fn is_wayland_path(path: &str) -> bool {
@@ -2292,25 +2352,42 @@ fn handle_recv(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 
 }
 
 fn handle_recvmsg(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {
-    let requested = request.payload_len as usize;
-    let control_len = match pending_recvmsg_control_len(request, requested) {
-        Ok(control_len) => control_len,
-        Err(errno) => return errno,
+    let mut state = net_state().lock().unwrap();
+    recvmsg_in_state(&mut state, request, response)
+}
+
+fn recvmsg_in_state(
+    state: &mut NetState,
+    request: &NetdIpcRequest,
+    response: &mut NetdIpcResponse,
+) -> i32 {
+    let Some(socket) = state.sockets.get_mut(&request.socket_token) else {
+        return libc::EBADF;
     };
-    let available = response
+    let UnixSocketState::Connected(connected) = &mut socket.state else {
+        return libc::ENOTCONN;
+    };
+    let requested = request.payload_len as usize;
+    let credentials = socket
+        .options
+        .passcred
+        .then_some(connected.peer_credentials);
+    let control_len = pending_recvmsg_control_len(connected, requested, credentials.is_some());
+    // Preflight the whole reply before moving bytes or ancillary custody. The
+    // same state transaction owns options, queue selection, dequeue and encode.
+    let Some(available) = response
         .payload
         .len()
-        .saturating_sub(NETD_RECVMSG_PAYLOAD_HEADER_SIZE)
-        .saturating_sub(control_len);
-    let data_len = requested.min(available);
+        .checked_sub(NETD_RECVMSG_PAYLOAD_HEADER_SIZE)
+        .and_then(|room| room.checked_sub(control_len))
+    else {
+        return libc::EMSGSIZE;
+    };
     let data_start = NETD_RECVMSG_PAYLOAD_HEADER_SIZE;
-    let data_end = data_start + data_len;
-    match recv_socket_bytes(request, &mut response.payload[data_start..data_end], true) {
+    let data_end = data_start + requested.min(available);
+    match recv_connected_bytes(connected, &mut response.payload[data_start..data_end], true) {
         Ok(received) => {
-            let control = match append_recvmsg_credentials(request, received.control) {
-                Ok(control) => control,
-                Err(errno) => return errno,
-            };
+            let control = append_recvmsg_credentials(credentials, received.control);
             let control_start = data_start + received.read;
             let control_end = control_start + control.len();
             response.payload[control_start..control_end].copy_from_slice(&control);
@@ -2686,6 +2763,18 @@ fn send_socket_message(
         return Ok(0);
     }
     let mut state = net_state().lock().unwrap();
+    send_socket_message_in_state(&mut state, request, bytes, control)
+}
+
+fn send_socket_message_in_state(
+    state: &mut NetState,
+    request: &NetdIpcRequest,
+    bytes: &[u8],
+    control: &[u8],
+) -> Result<usize, i32> {
+    if bytes.is_empty() {
+        return Ok(0);
+    }
     let peer = {
         let socket = state
             .sockets
@@ -2699,6 +2788,33 @@ fn send_socket_message(
         }
         connected.peer
     };
+    let control_charge = cmsg_align(control.len());
+    if control_charge != 0 {
+        if let Some(owner) = state
+            .sockets
+            .get(&peer)
+            .and_then(|socket| match &socket.state {
+                UnixSocketState::Connected(connected) => connected.pending_listener,
+                _ => None,
+            })
+        {
+            let pending_charge: usize = state
+                .sockets
+                .values()
+                .filter_map(|socket| match &socket.state {
+                    UnixSocketState::Connected(connected)
+                        if connected.pending_listener == Some(owner) =>
+                    {
+                        Some(connected.incoming_control_bytes)
+                    }
+                    _ => None,
+                })
+                .sum();
+            if pending_charge.saturating_add(control_charge) > SOCKET_CONTROL_BUFFER_CAPACITY {
+                return Err(libc::EAGAIN);
+            }
+        }
+    }
     let peer_socket = state.sockets.get_mut(&peer).ok_or(libc::EPIPE)?;
     let UnixSocketState::Connected(peer_connected) = &mut peer_socket.state else {
         return Err(libc::ENOTCONN);
@@ -2716,7 +2832,7 @@ fn send_socket_message(
     if !control.is_empty()
         && peer_connected
             .incoming_control_bytes
-            .saturating_add(control.len())
+            .saturating_add(control_charge)
             > SOCKET_CONTROL_BUFFER_CAPACITY
     {
         return Err(libc::EAGAIN);
@@ -2726,13 +2842,12 @@ fn send_socket_message(
     if !control.is_empty() {
         peer_connected.incoming_control_bytes = peer_connected
             .incoming_control_bytes
-            .saturating_add(control.len());
+            .saturating_add(control_charge);
     }
     peer_connected.incoming.push_back(UnixStreamSegment {
         bytes: bytes[..write_len].iter().copied().collect(),
         control: control.to_vec(),
     });
-    drop(state);
     Ok(write_len)
 }
 
@@ -2762,6 +2877,21 @@ fn recv_socket_bytes(
     let UnixSocketState::Connected(connected) = &mut socket.state else {
         return Err(libc::ENOTCONN);
     };
+    recv_connected_bytes(connected, dest, collect_control)
+}
+
+fn recv_connected_bytes(
+    connected: &mut ConnectedState,
+    dest: &mut [u8],
+    collect_control: bool,
+) -> Result<SocketReceive, i32> {
+    if dest.is_empty() {
+        return Ok(SocketReceive {
+            read: 0,
+            control: Vec::new(),
+            discarded: Vec::new(),
+        });
+    }
     if connected.incoming_bytes == 0 {
         if connected.peer_closed || connected.peer_write_closed {
             return Ok(SocketReceive {
@@ -2786,7 +2916,7 @@ fn recv_socket_bytes(
             let ancillary = core::mem::take(&mut segment.control);
             connected.incoming_control_bytes = connected
                 .incoming_control_bytes
-                .saturating_sub(ancillary.len());
+                .saturating_sub(cmsg_align(ancillary.len()));
             if collect_control {
                 control = ancillary;
             } else {
@@ -2809,7 +2939,6 @@ fn recv_socket_bytes(
         }
     }
     connected.recv_drain_handoff_armed = true;
-    drop(state);
     Ok(SocketReceive {
         read,
         control,
@@ -2817,15 +2946,11 @@ fn recv_socket_bytes(
     })
 }
 
-fn pending_recvmsg_control_len(request: &NetdIpcRequest, requested: usize) -> Result<usize, i32> {
-    let state = net_state().lock().unwrap();
-    let socket = state
-        .sockets
-        .get(&request.socket_token)
-        .ok_or(libc::EBADF)?;
-    let UnixSocketState::Connected(connected) = &socket.state else {
-        return Err(libc::ENOTCONN);
-    };
+fn pending_recvmsg_control_len(
+    connected: &ConnectedState,
+    requested: usize,
+    passcred: bool,
+) -> usize {
     let mut remaining = requested;
     let mut queued_len = 0usize;
     for segment in &connected.incoming {
@@ -2838,32 +2963,22 @@ fn pending_recvmsg_control_len(request: &NetdIpcRequest, requested: usize) -> Re
         }
         remaining = remaining.saturating_sub(segment.bytes.len());
     }
-    let credentials_len = if socket.options.passcred {
+    let credentials_len = if passcred {
         size_of::<linux_abi::LinuxCmsghdr>() + size_of::<linux_abi::LinuxUCred>()
     } else {
         0
     };
-    Ok(cmsg_align(queued_len) + credentials_len)
+    if passcred {
+        cmsg_align(queued_len) + credentials_len
+    } else {
+        queued_len
+    }
 }
 
-fn append_recvmsg_credentials(
-    request: &NetdIpcRequest,
-    mut control: Vec<u8>,
-) -> Result<Vec<u8>, i32> {
-    let state = net_state().lock().unwrap();
-    let socket = state
-        .sockets
-        .get(&request.socket_token)
-        .ok_or(libc::EBADF)?;
-    let passcred = socket.options.passcred;
-    let UnixSocketState::Connected(connected) = &socket.state else {
-        return Err(libc::ENOTCONN);
+fn append_recvmsg_credentials(credentials: Option<Credentials>, mut control: Vec<u8>) -> Vec<u8> {
+    let Some(peer_credentials) = credentials else {
+        return control;
     };
-    let peer_credentials = connected.peer_credentials;
-    drop(state);
-    if !passcred {
-        return Ok(control);
-    }
     let cmsg_len = size_of::<linux_abi::LinuxCmsghdr>() + size_of::<linux_abi::LinuxUCred>();
     let start = cmsg_align(control.len());
     control.resize(start + cmsg_align(cmsg_len), 0);
@@ -2886,7 +3001,7 @@ fn append_recvmsg_credentials(
         &credentials,
     );
     control.truncate(start + cmsg_len);
-    Ok(control)
+    control
 }
 
 fn validate_sendmsg_control(control: &[u8]) -> Result<(), i32> {
@@ -3252,6 +3367,10 @@ mod packet_provider_state_tests;
 #[cfg(test)]
 #[path = "tests/local_socket_poll_tests.rs"]
 mod local_socket_poll_tests;
+
+#[cfg(test)]
+#[path = "tests/unix_socket_lifecycle_tests.rs"]
+mod unix_socket_lifecycle_tests;
 
 fn packet_tx(frame: &[u8]) -> Result<usize, i32> {
     call_packet_broker(

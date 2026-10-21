@@ -49,8 +49,11 @@ cargo xtask verify-dvm
 cargo xtask kvm-smoke --expect 'runtimed: bootstrap ui done'
 ```
 
-It requires a usable `qemu-system-x86_64` and `/dev/kvm` access, and writes
-runtime inputs and captures to `build/kvm/`:
+Runtime device requirements are listed in
+[getting started](../getting-started.md#kvm-parallel-boot-smoke): QEMU,
+read/write KVM/vhost-vsock, and the virtual display's exact AMDGPU render-node
+admission. `--dry-run` does not launch guests or require runtime devices.
+The runner writes runtime inputs and captures to `build/kvm/`:
 
 - a private writable RustOS disk copied from `build/rustos-boot.img`;
 - RustOS debugcon and serial captures;
@@ -143,7 +146,9 @@ cargo xtask verify-dvm
 cargo xtask kvm-smoke --expect 'runtimed: bootstrap ui done'
 ```
 
-`qemu-system-x86_64`와 read/write `/dev/kvm`, `/dev/vhost-vsock` 접근이 필요합니다. 생성 입력과 log는
+실행 장치 조건은 [시작 안내](../getting-started.md#kvm-병렬-부팅-smoke)를 따릅니다:
+QEMU, read/write KVM/vhost-vsock, 가상 display용 정확한 AMDGPU render-node
+admission이 필요합니다. `--dry-run`은 guest를 실행하지 않고 실행 장치도 요구하지 않습니다. 생성 입력과 log는
 `build/kvm/`에 기록됩니다. RustOS disk는 `build/rustos-boot.img`를 복사한
 private writable image이며, 저장소에 고정된 OVMF를 QEMU에 명시 경로로
 연결합니다. bootstrap disk는 staged raw FAT image를 emulated IDE controller에

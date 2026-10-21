@@ -93,17 +93,14 @@ impl VisualUpdate {
     }
 
     pub(crate) fn partial(rect: canvas::Rect) -> Self {
-        let mut update = Self {
-            scene_dirty: !rect.is_empty(),
-            ..Self::default()
-        };
+        let mut update = Self::default();
         update.add_partial_rect(rect);
         update
     }
 
     pub(crate) fn cursor(rect: canvas::Rect) -> Self {
         let mut update = Self::default();
-        update.add_partial_rect(rect);
+        update.merge_partial_rect(rect);
         update
     }
 
@@ -124,6 +121,9 @@ impl VisualUpdate {
     }
 
     pub(crate) fn add_partial_rect(&mut self, rect: canvas::Rect) {
+        // Content damage must refresh retained textures even when no window
+        // moved. Cursor-only damage uses `cursor` and never enters this path.
+        self.scene_dirty |= !rect.is_empty();
         if self.needs_full_redraw {
             return;
         }
@@ -662,5 +662,49 @@ impl AppState {
     pub(crate) fn wayland_visual_dirty_rect(&self) -> canvas::Rect {
         self.wayland_stack_dirty_rect()
             .union(self.wayland_taskbar_dirty_rect())
+    }
+}
+
+#[cfg(test)]
+mod visual_update_tests {
+    use super::{canvas::Rect, VisualUpdate};
+
+    fn damage() -> Rect {
+        Rect { x: 40, y: 60, width: 80, height: 20 }
+    }
+
+    #[test]
+    fn console_content_damage_refreshes_retained_scene_without_window_motion() {
+        // apply_console_refresh starts with a default update and adds damage.
+        let mut update = VisualUpdate::default();
+        update.add_partial_rect(damage());
+        assert!(update.scene_dirty());
+        assert!(!update.needs_full_redraw);
+        assert_eq!(update.partial_rects(), &[damage()]);
+
+        let mut pending = VisualUpdate::default();
+        pending.absorb(update);
+        assert!(pending.scene_dirty());
+        pending.clear();
+        assert!(!pending.scene_dirty());
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn cursor_only_damage_keeps_retained_scene_fast_path() {
+        let mut update = VisualUpdate::cursor(damage());
+        update.absorb(VisualUpdate::cursor(damage()));
+        assert!(!update.scene_dirty());
+        assert!(!update.is_empty());
+        update.add_partial_rect(damage());
+        assert!(update.scene_dirty(), "content after cursor motion must not be lost");
+    }
+
+    #[test]
+    fn empty_damage_never_invalidates_the_scene() {
+        let mut update = VisualUpdate::default();
+        update.add_partial_rect(Rect::empty());
+        assert!(update.is_empty());
+        assert!(!update.scene_dirty());
     }
 }

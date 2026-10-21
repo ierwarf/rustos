@@ -8,6 +8,12 @@
 - Compat input-device reads call `INPUTD_IPC_OP_AUTHORIZE_READ` before
   `INPUTD_IPC_OP_READ`; inputd consumes the authorization by `(pid, tid, fd,
   access)` so raw reads are not accepted as standalone event-drain authority.
+  At most 256 grants may be outstanding; an exact-subject retry replaces its
+  previous grant. Each expires after the five-second boot-control budget,
+  checked at monotonic request admission before the queue mutex is acquired.
+  Abandoned/cancelled callers therefore retain only bounded, expiring state.
+  Failed stats preparation publishes no grant, and a full live quota returns
+  `EAGAIN` without silently evicting another reader's authority.
 - inputd owns a single System-class `inputd-dvm-ingress` worker. It waits in
   `SYS_RUSTOS_INPUT_WAIT_BROKER`, which arms before sleeping and rechecks raw
   producer/consumer cursors after registration; the MSI-X leaf only wakes that
@@ -35,9 +41,11 @@
   shared policy queue. Session start/end may require a bounded netd authority
   transition, but inputd releases the queue lock before service discovery or
   synchronous IPC. Events from a newly granted epoch are not published until
-  that transition succeeds. A failed transition resets the decoder and input
-  provider state while the worker continues draining the fixed ring, so a
-  bounded authority failure cannot become an unbounded producer-credit stall.
+  that transition succeeds. A transient failure retains the decoded batch,
+  decoder epoch and unacknowledged transition suffix for retry outside the
+  mutex; later records are not drained past that one-shot marker. Expiry of the
+  five-second authority deadline exits inputd fail-closed, and owner-exit
+  cleanup withdraws readiness before a replacement may rearm.
 - Inputd endpoint-owner exit withdraws the ring's separate policy-consumer
   lease in the same kernel cleanup turn. RustOS clears policy readiness before
   retiring old-owner records and publishes a reset barrier. A replacement

@@ -7,8 +7,10 @@ Package/stage schemas, runtime control, kernel API, build, fault injection, logg
 - `tools/check-dev-environment.sh` is the read-only prerequisite diagnosis
   entrypoint. Its optional modes correspond to AI, documentation, formal,
   physical-GPU, and release work; it never installs tools or mutates the host.
-- Project MCP launchers in `.claude/config.toml` use exact package versions.
-  Version changes are reviewed inputs, not an implicit update at agent startup.
+- `.mcp.json` owns the project MCP launcher (`serena start-mcp-server`).
+  `agent-tools-bootstrap.yml` pins and verifies the installed Serena version;
+  the launcher itself does not select a package version. Version changes are
+  reviewed inputs, not an implicit update at agent startup.
   Serena is the project semantic source-navigation MCP. Raw text search uses
   local `rg`; neither source-navigation path is OS acceptance evidence.
 - `session-handoff.md` owns volatile continuation state. It is kept out of the
