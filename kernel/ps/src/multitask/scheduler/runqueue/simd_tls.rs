@@ -115,12 +115,14 @@ pub(crate) fn tls_fs_base(slot: usize) -> u64 {
 }
 #[inline]
 pub(crate) fn set_tls_fs_base(slot: usize, value: u64) {
+    super::super::outgoing_image::assert_mutable(slot);
     TLS_FS_BASE
         .get(slot)
         .expect("scheduler TLS FS base slot exceeds capacity")
         .store(value, Ordering::Release);
 }
 pub(crate) fn clear_tls_fs_base(slot: usize) {
+    super::super::outgoing_image::assert_mutable(slot);
     TLS_FS_BASE[slot].store(0, Ordering::Release);
 }
 

@@ -1553,36 +1553,59 @@ fn try_fast_ipc_call_bytes(
     note_fast_ipc(IpcFastCounter::ReservationPublished);
 
     if !multitask::arm_block_current_task_on_reply(reply.raw()) {
-        rollback_fast_call(endpoint, reply, task_id, receiver_task_id)?;
+        if rollback_fast_call(endpoint, reply, task_id, receiver_task_id)?
+            == FastRollback::ReceiverOwnsRequest
+        {
+            // The server is executing the request; nobody can wait for its
+            // answer, so cancel it exactly as the slow path does.
+            cancel_reply_wait(reply, task_id, ReplyCancelReason::InvalidArm);
+        }
         return Err(LINUX_EINVAL);
     }
-    if !arm_reply_deadline_waiter(task_id, deadline_tick) {
+    let handed_off = if !arm_reply_deadline_waiter(task_id, deadline_tick) {
         let _ = multitask::cancel_block_current_task();
-        rollback_fast_call(endpoint, reply, task_id, receiver_task_id)?;
-        note_fast_ipc(IpcFastCounter::FallbackDeadlineArm);
-        return Ok(None);
+        if rollback_fast_call(endpoint, reply, task_id, receiver_task_id)?
+            == FastRollback::RolledBack
+        {
+            note_fast_ipc(IpcFastCounter::FallbackDeadlineArm);
+            return Ok(None);
+        }
+        // A receiver already took the request: falling back to the slow path
+        // would send it a second time. Wait for this request's response.
+        false
+    } else {
+        fast_mark = charge_phase(IpcCallPhase::FastArm, fast_mark);
+        let handoff = multitask::commit_fast_ipc_call_handoff_and_yield(
+            endpoint.raw(),
+            reply.raw(),
+            receiver_task_id,
+        );
+        fast_mark = charge_phase(IpcCallPhase::FastHandoff, fast_mark);
+        disarm_reply_deadline_waiter(task_id);
+        let committed = matches!(
+            handoff,
+            multitask::FastIpcCallHandoffOutcome::CommittedSameCpu
+                | multitask::FastIpcCallHandoffOutcome::CommittedCrossCpu
+        );
+        if !committed {
+            note_fast_ipc(IpcFastCounter::HandoffRejected);
+            note_fast_ipc_handoff_rejection(handoff);
+            let _ = multitask::cancel_block_current_task();
+            if rollback_fast_call(endpoint, reply, task_id, receiver_task_id)?
+                == FastRollback::RolledBack
+            {
+                note_fast_ipc(IpcFastCounter::FallbackScheduler);
+                return Ok(None);
+            }
+            // The receiver took the request while the handoff was refused
+            // (it was between its receive arm and block commit). Its reply is
+            // coming: wait for it instead of resending via the slow path.
+        }
+        committed
+    };
+    if handed_off {
+        note_fast_ipc(IpcFastCounter::HandoffCommitted);
     }
-    fast_mark = charge_phase(IpcCallPhase::FastArm, fast_mark);
-    let handoff = multitask::commit_fast_ipc_call_handoff_and_yield(
-        endpoint.raw(),
-        reply.raw(),
-        receiver_task_id,
-    );
-    fast_mark = charge_phase(IpcCallPhase::FastHandoff, fast_mark);
-    disarm_reply_deadline_waiter(task_id);
-    if !matches!(
-        handoff,
-        multitask::FastIpcCallHandoffOutcome::CommittedSameCpu
-            | multitask::FastIpcCallHandoffOutcome::CommittedCrossCpu
-    ) {
-        note_fast_ipc(IpcFastCounter::HandoffRejected);
-        note_fast_ipc_handoff_rejection(handoff);
-        note_fast_ipc(IpcFastCounter::FallbackScheduler);
-        let _ = multitask::cancel_block_current_task();
-        rollback_fast_call(endpoint, reply, task_id, receiver_task_id)?;
-        return Ok(None);
-    }
-    note_fast_ipc(IpcFastCounter::HandoffCommitted);
 
     loop {
         let response = match kernel_ipc_runtime::api::endpoint::take_fast_response(reply, task_id) {
@@ -1669,20 +1692,38 @@ fn try_fast_ipc_call_bytes(
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FastRollback {
+    /// The unpublished request was withdrawn and the receiver re-parked.
+    RolledBack,
+    /// A receiver already took the request; its response will still arrive.
+    ReceiverOwnsRequest,
+}
+
 fn rollback_fast_call(
     endpoint: KernelEndpointHandle,
     reply: KernelReplyHandle,
     caller_task_id: u64,
     receiver_task_id: u64,
-) -> Result<(), i64> {
+) -> Result<FastRollback, i64> {
     note_fast_ipc(IpcFastCounter::Rollback);
-    let rollback = kernel_ipc_runtime::api::endpoint::rollback_fast_call(
+    let rollback = match kernel_ipc_runtime::api::endpoint::rollback_fast_call(
         endpoint,
         reply,
         caller_task_id,
         receiver_task_id,
-    )
-    .map_err(ipc_error_to_linux_errno)?;
+    ) {
+        Ok(rollback) => rollback,
+        Err(_)
+            if kernel_ipc_runtime::api::endpoint::fast_request_owned_by_receiver(
+                reply,
+                caller_task_id,
+            ) =>
+        {
+            return Ok(FastRollback::ReceiverOwnsRequest);
+        }
+        Err(error) => return Err(ipc_error_to_linux_errno(error)),
+    };
     if let Some(custody) = rollback.scheduling_context {
         assert!(
             multitask::settle_ipc_reply_scheduling_context(reply.raw(), custody),
@@ -1690,7 +1731,7 @@ fn rollback_fast_call(
         );
     }
     let _ = multitask::cancel_ipc_priority_reservation(caller_task_id);
-    Ok(())
+    Ok(FastRollback::RolledBack)
 }
 
 pub(super) fn syscall_linux_rustos_ipc_recv(
@@ -3140,11 +3181,23 @@ fn enqueue_call_and_wake_with_handles_for_task(
                 // Failure-only, after every scheduler loan returned. Preserve
                 // exact reply/receiver and the refusal; no success-path output
                 // or new scheduling authority is introduced by this record.
+                // Bits 8..10 record which keep-delivered-reply proof failed:
+                // donation admitted, custody already returned, request taken
+                // with custody retained. One failed 8-vCPU boot cancelled an
+                // in-flight request here and nothing said which proof missed.
+                let proofs = u64::from(donation_admitted) << 8
+                    | u64::from(kernel_ipc_runtime::api::endpoint_reply_custody_returned(reply, task_id)) << 9
+                    | u64::from(kernel_ipc_runtime::api::endpoint::received_request_retains_custody(
+                        reply, task_id,
+                    )) << 10
+                    | u64::from(kernel_ipc_runtime::api::endpoint::received_request_custody_conditions(
+                        reply, task_id,
+                    )) << 12;
                 debug::record_milestone(
                     debug::LogCategory::Compat,
                     "ipc-donation-handoff-refused",
                     reply.raw(),
-                    ((receiver_task_id & 0xffff_ffff) << 32) | refusal as u64,
+                    ((receiver_task_id & 0xffff_ffff) << 32) | proofs | refusal as u64,
                 );
                 cancel_reply_wait(reply, task_id, ReplyCancelReason::SchedulingCustody);
                 restore_refused_receiver(endpoint, receiver_task_id);

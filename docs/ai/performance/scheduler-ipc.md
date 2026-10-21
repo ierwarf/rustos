@@ -232,6 +232,29 @@ pending detailed-response polls at one reply acquisition instead of two. The
 shipping timing remained below the two-percent floor, so the count is the
 claim.
 
+**Admit saved-frame backing and reader custody in one resource leaf.**
+`frame_readers::pin_and_acquire` creates an owned `PinnedFrameReader` rather
+than acquiring Resource53 separately for an allocation pin and a borrowed
+reader. Selection, final frame capture, exact IPC receiver publication and
+copied frame diagnostics use this admission. UID/geometry, closing/MM state,
+reservation, writer, CPU bank and execution-owner checks remain authoritative;
+publication epoch and final owner/RSP checks still surround byte access. The
+same registration helper serves borrowed readers. Refusal and unwind release
+custody, and `into_pin` keeps the original backing for final claim, never
+re-resolves it. No resource leaf spans byte access, allocation or hardware work.
+
+The counted native control takes two leaves; owned admission plus release or
+pin transfer takes exactly one (`FRAME_READ_MAX_RESOURCE_ACQUISITIONS`). This
+is a per-admission acquisition claim, not a 50% IPC latency claim, and does not
+remove the reply/message TOCTOU guard discussed above. No extra shipping
+telemetry is enabled. External design references:
+[seL4 IPC fastpath](https://docs.sel4.systems/Tutorials/ipc#fastpath) motivates a
+strictly admitted fast path rather than skipping safety checks;
+[Linux refcount ordering](https://docs.kernel.org/core-api/refcount-vs-atomic.html)
+explains the Release/Acquire distinction retained by reader release and
+zero-reader claim admission. Neither reference proves RustOS's protocol; the
+owner contract, original-resource race tests and mutation witnesses do.
+
 The later Phase-3 ownership cut is not another fusion. Wait reason kind, arm,
 block intent, and runnable intent now share `RunOwnerWord`; the ordinary commit
 is a single CAS and a wake either clears the arm first (commit refuses sleep)

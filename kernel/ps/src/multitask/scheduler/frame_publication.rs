@@ -55,10 +55,32 @@ pub(super) fn pin_for_identity(
     task_id: u64,
 ) -> Option<super::stack_resources::StackPin> {
     let pin = super::stack_resources::pin_view(token.slot, task_id, token.view)?;
-    if read(token.slot)?.frame_epoch != token.frame_epoch {
-        return None;
-    }
+    recheck_pin_epoch(token)?;
     Some(pin)
+}
+
+/// Same own-CPU IRQ/preemption contract as frame_readers::acquire. The owned
+/// reader retains backing and byte exclusion after this helper returns.
+pub(super) unsafe fn read_for_identity(
+    token: StableFrameToken, task_id: u64, cpu: usize,
+) -> Option<super::stack_resources::frame_readers::PinnedFrameReader> {
+    let reader = unsafe {
+        super::stack_resources::frame_readers::pin_and_acquire(token.slot, task_id, token.view, cpu)
+    }?;
+    recheck_pin_epoch(token)?;
+    Some(reader)
+}
+
+pub(super) unsafe fn read_allocation(
+    token: StableFrameToken, cpu: usize,
+) -> Option<super::stack_resources::frame_readers::PinnedFrameReader> {
+    let task_id = super::current_identity::read_dispatch(token.slot)?.task_id?;
+    unsafe { read_for_identity(token, task_id, cpu) }
+}
+
+fn recheck_pin_epoch(token: StableFrameToken) -> Option<()> {
+    if read(token.slot)?.frame_epoch != token.frame_epoch { return None; }
+    Some(())
 }
 
 fn begin_write(slot: usize) -> u64 {

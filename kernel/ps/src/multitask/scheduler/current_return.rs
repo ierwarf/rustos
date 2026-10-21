@@ -6,7 +6,7 @@
 //! Forbidden: recapture from Blocked/Local, new post-stop pins or telemetry as billing authority.
 //! Evidence: original bank/resources and captured funding interval; incoming dispatch remains separate.
 use super::{
-    ROOT_TASK_SLOT, SCHED_MIN_GRANULARITY_NS, context_validation, current_identity,
+    SCHED_MIN_GRANULARITY_NS, context_validation, current_identity,
     donation_ledger, execution_interval, frame_publication, runqueue, runtime_profile,
     scheduling_context, stack_resources, task_weight,
 };
@@ -22,6 +22,7 @@ pub(in crate::multitask) struct CurrentReturn<'a> {
     frame_published: bool,
     return_rsp: Option<usize>,
     publication: Option<runqueue::ReturnPublication>,
+    canary: core::cell::Cell<Option<bool>>,
 }
 impl<'a> CurrentReturn<'a> {
     pub(in crate::multitask) fn capture(turn: &'a CpuDispatchTurn<'static>) -> Option<Self> {
@@ -29,6 +30,15 @@ impl<'a> CurrentReturn<'a> {
         let (cpu, slot) = turn.original_current()?;
         let view = frame_publication::return_view(slot)?;
         let id = stack_resources::current_return_binding(cpu, slot, view)?;
+        Self::captured(turn, cpu, slot, id, view)
+    }
+    /// Called after IPC/terminal/image producers, never by early SIMD/probes.
+    pub(in crate::multitask) fn capture_dispatch(turn: &'a CpuDispatchTurn<'static>) -> Option<Self> {
+        let image = turn.outgoing_image()?;
+        Self::captured(turn, image.cpu, image.slot, image.id, image.view)
+    }
+    fn captured(turn: &'a CpuDispatchTurn<'static>, cpu: usize, slot: usize, id: u64,
+        view: context_validation::PublishedFrameView) -> Option<Self> {
         let owner = runqueue::owner(slot);
         if !(owner.state == runqueue::RunOwnerState::Running && owner.cpu == Some(cpu))
             && !owner.state.is_terminal()
@@ -45,6 +55,7 @@ impl<'a> CurrentReturn<'a> {
             frame_published: false,
             return_rsp: None,
             publication: None,
+            canary: core::cell::Cell::new(None),
         })
     }
     /// Probe only while THIS original Current bank/frame binding is borrowed.
@@ -62,28 +73,45 @@ impl<'a> CurrentReturn<'a> {
     /// No scalar task lookup or directory serializer participates in this effect.
     pub(in crate::multitask) fn save_simd(&self) {
         self.check();
+        // Phase timing is diagnosis-build only, like every `PhaseScope`: two
+        // clock reads and a counter leaf on each switch are not shipping cost.
+        #[cfg(rustos_scheduler_phase_profile)]
         let start = crate::arch::clock::monotonic_nanos();
         runqueue::simd_tls::save_simd_state(self.slot);
-        let elapsed = crate::arch::clock::monotonic_nanos().saturating_sub(start);
-        super::runtime_profile::owner::local(|row| {
-            row.phase(super::runtime_profile::SchedulerPhase::ArchSimd, elapsed);
-            row.phase(super::runtime_profile::SchedulerPhase::ArchRestore, elapsed);
-        });
+        #[cfg(rustos_scheduler_phase_profile)]
+        {
+            let elapsed = crate::arch::clock::monotonic_nanos().saturating_sub(start);
+            super::runtime_profile::owner::local(|row| {
+                row.phase(super::runtime_profile::SchedulerPhase::ArchSimd, elapsed);
+                row.phase(super::runtime_profile::SchedulerPhase::ArchRestore, elapsed);
+            });
+        }
     }
+    /// The binding was proven at capture, and the physical Current bank this
+    /// loan borrows is what keeps it: no reset or rebinding can reach a slot
+    /// that is still some CPU's Current. So each effect re-proves the bank
+    /// (two CPU-local loads). Byte validation borrows the post-producer frozen
+    /// image, qualified once on this turn; metadata mutators refuse after that
+    /// boundary. Early SIMD/probe capture deliberately does not freeze it.
     fn check(&self) {
         assert_eq!(
             self.turn.original_current(),
             Some((self.cpu, self.slot)),
             "return loan lost original masked Current bank"
         );
-        assert_eq!(
-            stack_resources::current_return_binding(self.cpu, self.slot, self.view),
-            Some(self.id),
-            "return loan lost original UID/frame binding"
+        assert!(
+            stack_resources::cpu_leases::owns_current(self.cpu, self.slot),
+            "return loan lost original physical Current bank"
         );
     }
-    pub(super) fn original_turn(&self) -> &'a CpuDispatchTurn<'static> {
+    fn check_binding(&self) {
         self.check();
+        let image = self.turn.outgoing_image().expect("return lost original frozen image");
+        assert!(image.cpu == self.cpu && image.slot == self.slot && image.id == self.id
+            && image.matches_view(self.view), "return loan lost original UID/frame binding");
+    }
+    pub(super) fn original_turn(&self) -> &'a CpuDispatchTurn<'static> {
+        self.check_binding();
         self.turn
     }
     pub(in crate::multitask) fn slot(&self) -> usize {
@@ -167,7 +195,7 @@ impl<'a> CurrentReturn<'a> {
     }
 
     pub(in crate::multitask) fn validate(&self, rsp: usize) -> Option<&'static str> {
-        self.check();
+        self.check_binding();
         if self.frame_published {
             // Only THIS producer's exact original IRQ frame was published.
             // A different pointer is not a fresh byte-validation grant.
@@ -179,26 +207,23 @@ impl<'a> CurrentReturn<'a> {
         }
         context_validation::validate_published_saved_context(self.slot, rsp, self.live_view()).err()
     }
+    /// The outgoing task does not run between `validate` and `publish_frame`,
+    /// so its guard words cannot change between them: read them once.
     fn live_view(&self) -> context_validation::PublishedFrameView {
         let mut view = self.view;
-        view.stack_canary_intact = self.slot == ROOT_TASK_SLOT || {
-            stack_resources::owned_canary_intact(self.slot).unwrap_or_else(|| {
-                let Some(base) = view
-                    .kernel_stack_base
-                    .checked_sub(super::TASK_STACK_GUARD_BYTES as u64)
-                else {
-                    return false;
-                };
-                (0..super::TASK_STACK_GUARD_BYTES / core::mem::size_of::<u64>()).all(|i| {
-                    // SAFETY: unique borrowed turn retains original Current physical bank;
-                    // exact binding above retains admitted external idle stack geometry.
-                    unsafe {
-                        core::ptr::read((base as *const u64).add(i)) == super::STACK_CANARY_WORD
-                    }
-                })
-            })
+        view.stack_canary_intact = match self.canary.get() {
+            Some(intact) => intact,
+            None => {
+                let intact = self.read_canary();
+                self.canary.set(Some(intact));
+                intact
+            }
         };
         view
+    }
+    fn read_canary(&self) -> bool {
+        self.check_binding();
+        self.turn.outgoing_image().expect("canary lost original image").canary_intact()
     }
 
     /// Publish fresh IRQ frame before releasing Running queue custody. No

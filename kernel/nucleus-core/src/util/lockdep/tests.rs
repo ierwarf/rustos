@@ -105,7 +105,7 @@ fn the_raw_acquire_path_never_rederives_the_cpu_index() {
         "the raw acquire path derived its own index again:\n{body}"
     );
     assert!(
-        body.contains("record_irq_usage(cpu, class_index, acquire_site)"),
+        body.contains("record_irq_usage(cpu, class_index, acquire_site, irq_enabled)"),
         "the IRQ-usage record must be handed the index, not derive it"
     );
 

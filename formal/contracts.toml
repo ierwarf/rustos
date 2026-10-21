@@ -2898,6 +2898,16 @@ path = "kernel/ps/src/multitask/scheduler/dispatch_claim/tests.rs"
 models = ["cpu-dispatch-preemption/CpuDispatchPreemption", "scheduling-context-budget/SchedulingContextBudget", "frame-reader-claim/FrameReaderClaim", "mm-activation-close/MmActivationClose", "affinity-claim-admission/AffinityClaimAdmission"]
 
 [[risk_surfaces]]
+path = "kernel/ps/src/multitask/scheduler/outgoing_image.rs"
+severity = "critical"
+flows = ["scheduler-dispatch"]
+reason = "Post-producer narrow outgoing image belongs to the original masked turn. One joined resource qualification retains UID/geometry/architecture comparison and actual guard range. Frame/MM/context/geometry/root/FS mutators fence replacement; terminal defers its same producer before effects. Fence releases before IRQ restoration; physical Outgoing persists to actual RSP ACK. Native counted and mutation witnesses cover this component. Mapped CPU/MM models abstract original lifetime only, not this complete fence or hardware transaction."
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/outgoing_image.rs"
+models = ["cpu-dispatch-preemption/CpuDispatchPreemption", "mm-activation-close/MmActivationClose"]
+
+[[risk_surfaces]]
 path = "kernel/ps/src/multitask/scheduler/current_return.rs"
 severity = "critical"
 flows = ["scheduler-dispatch"]

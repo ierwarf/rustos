@@ -380,9 +380,9 @@ fn publish(
         process_handle: Some(handle),
         process_id: Some(id),
         user_stack: bootstrap.user_stack,
-        windows_thread_state: bootstrap.windows_thread_state.map(|mut state| {
-            state.thread_id = id;
-            state
+        windows_thread_state: bootstrap.windows_thread_state.map(|state| WindowsThreadIdentity {
+            thread_id: id,
+            teb_address: state.teb_address,
         }),
     };
     root.install_context(context);

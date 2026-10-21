@@ -478,10 +478,12 @@
   revalidates live DVM geometry and the exact caller generation on every
   request. A hit must be wholly contained in one exact-generation window. A
   first or noncontiguous miss submits one forward window. Only a later miss at
-  that exact window boundary may submit up to eight contiguous forward windows,
+  that exact window boundary may submit up to two contiguous forward windows,
   each no larger than one fixed DVM slot, before waiting for the first
-  completion. This uses the transport's bounded queue for proven sequential
-  demand without turning random FAT metadata probes into 512-KiB reads. No
+  completion. The batch leaves headroom in the eight-window cache for
+  interleaved FAT metadata and limits each completion batch to 128 KiB.
+  This uses the transport's bounded queue for proven sequential demand without
+  turning random FAT metadata probes into full-cache speculative reads. No
   window is published to the cache until the complete batch succeeds; submit
   failure cancels every issued ticket and completion failure cancels the
   remaining tickets and clears the cache epoch.

@@ -95,6 +95,61 @@ pub(in crate::multitask::scheduler) fn finish_modeled_preparation(slot: usize, o
     stack_resources::cpu_leases::commit(0);
 }
 #[test]
+fn actual_selection_consumes_same_guard_with_one_resource_admission() {
+    use nucleus_core::util::lockdep::{LockClass, work_budget};
+    use rustos_user_abi::performance::FRAME_READ_MAX_RESOURCE_ACQUISITIONS;
+    fixture(true, |slot, turn| {
+        let budget = work_budget::declare(LockClass::TaskStackResources, FRAME_READ_MAX_RESOURCE_ACQUISITIONS);
+        // SAFETY: the same original modeled masked turn spans the full loan.
+        let selection = unsafe { FrameSelection::capture(0, slot, ID,
+            runqueue::owner(slot).generation, runqueue::saved_rsp(slot), FrameCustody::Current) }
+            .unwrap_or_else(|_| panic!("original selection refused"));
+        assert_eq!(stack_resources::frame_readers::test_count(slot), 1);
+        let FrameCapture::Ready(frame) = DispatchFrame::from_selection(turn, selection,
+            super::super::donation_ledger::class_publication_sequence()) else {
+            panic!("original selection was not consumed");
+        };
+        assert_eq!(stack_resources::frame_readers::test_count(slot), 1);
+        drop(frame);
+        assert_eq!(stack_resources::frame_readers::test_count(slot), 0);
+        assert_eq!(budget.used(), Some(1), "live guard validation and consumption cannot reopen resources");
+    });
+}
+#[test]
+fn actual_selection_promotes_only_its_own_reader_after_final_owner_cas() {
+    fixture(true, |slot, turn| {
+        let funded = capture(slot, turn, FrameCustody::Current).prepare().unwrap();
+        assert_eq!(stack_resources::frame_readers::test_count(slot), 1);
+        let before = runqueue::owner(slot);
+        // Raw callers must not acquire execution through the selected reader.
+        assert!(!runqueue::claim_dispatch_with_owner_generation(slot, 0,
+            runqueue::weight::value(slot), Some(before.generation)));
+        assert_eq!(runqueue::owner(slot), before);
+        assert!(!stack_resources::cpu_leases::owns_prepared(0, slot));
+        assert!(funded.claim());
+        assert_eq!(stack_resources::frame_readers::test_count(slot), 0);
+        assert_eq!(runqueue::owner(slot).state, runqueue::RunOwnerState::Running);
+        finish_modeled_preparation(slot, slot);
+    });
+}
+#[test]
+fn actual_selection_stale_owner_refuses_before_consumption_without_bank_effects() {
+    fixture(true, |slot, turn| {
+        // SAFETY: the original modeled masked turn retains this exact backing.
+        let selection = unsafe { FrameSelection::capture(0, slot, ID,
+            runqueue::owner(slot).generation, runqueue::saved_rsp(slot), FrameCustody::Current) }
+            .unwrap_or_else(|_| panic!("original selection refused"));
+        runqueue::publish_blocked(slot, 0, runqueue::weight::value(slot));
+        runqueue::publish_local(slot, 0, runqueue::weight::value(slot));
+        let before = runqueue::owner(slot);
+        assert!(matches!(DispatchFrame::from_selection(turn, selection,
+            super::super::donation_ledger::class_publication_sequence()), FrameCapture::Stale));
+        assert_eq!(stack_resources::frame_readers::test_count(slot), 0);
+        assert_eq!(runqueue::owner(slot), before);
+        no_preparation(slot);
+    });
+}
+#[test]
 fn actual_current_claim_retains_original_funding_and_moves_allocation_once() {
     fixture(true, |slot, turn| {
         let funded = capture(slot, turn, FrameCustody::Current)
@@ -567,7 +622,8 @@ fn actual_joint_fixed_idle_borrows_real_kernel_frame_without_late_class_or_fundi
         // physical RSP is manufactured. The real UID/resource/placement callback
         // must still be reached despite unrelated class publication.
         let attempted = funded.frame.with_admission(None, || {
-            stack_resources::frame_readers::with_claim_activation(idle, 0, || Err::<(), ()>(()))
+            stack_resources::frame_readers::with_claim_activation_for_reader(idle, 0,
+                Some(funded.frame.original_reader()), || Err::<(), ()>(()))
         }).unwrap().into_claimed().unwrap();
         assert!(attempted.0.is_err());
         assert!(attempted.1.is_none());
@@ -587,7 +643,8 @@ fn actual_joint_refused_placement_returns_original_mm_and_uid_loans_before_any_d
         runqueue::affinity_payload::set_affinity(slot, 2, 2, false);
         let refs = crate::multitask::current_identity::execution::count(slot);
         let attempt = funded.frame.with_admission(funded.funding.funding.as_ref(), || {
-            stack_resources::frame_readers::with_claim_activation(slot, 0, || {
+            stack_resources::frame_readers::with_claim_activation_for_reader(slot, 0,
+                Some(funded.frame.original_reader()), || {
                 panic!("refused placement reached final owner CAS");
             })
         }).expect("refused original loans were dropped under admission leaves");

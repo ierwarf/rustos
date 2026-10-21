@@ -203,6 +203,13 @@ fn real_kernel_worker_publishes_slot_before_durable_ack_and_duplicate_claim_or_s
         kernel(|executor| {
             let claim = claim_next(executor).unwrap();
             assert!(claim_next(executor).is_none());
+            // A concurrent enqueue elsewhere makes the scan run while this row
+            // is Executing; the scan must still refuse the claimed row.
+            // ORDERING: Release models the enqueue publication the scan pairs with.
+            PENDING_ROWS.fetch_add(1, Ordering::Release);
+            assert!(claim_next(executor).is_none());
+            // ORDERING: restores the modeled count; no row was published.
+            PENDING_ROWS.fetch_sub(1, Ordering::Release);
             assert_eq!(poll(receipt), None);
             assert!(stack_resources::admission::is_reserved(receipt.slot));
             claim.complete();

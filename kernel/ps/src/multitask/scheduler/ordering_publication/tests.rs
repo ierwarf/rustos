@@ -178,6 +178,32 @@ pub(in crate::multitask::scheduler) fn actual_fifo_qualification_releases_orderi
     });
 }
 #[test]
+fn actual_handoff_checks_competitors_only_at_the_budget_limit() {
+    family(|_, child, _| {
+        assert!(sync_handoff::take_next_ready(0, false, |_| false).is_none());
+        sync_handoff::record_dispatch(0, false, 0);
+        let record = sync_handoff::SyncHandoffRecord::new(child, CHILD);
+        let calls = core::cell::Cell::new(0);
+        let competitor = || {
+            calls.set(calls.get() + 1);
+            assert_eq!(nucleus_core::util::lockdep::held_spin_lock_depth(), 0);
+            true
+        };
+        assert!(sync_handoff::enqueue(0, record));
+        assert_eq!(sync_handoff::take_next_ready_with(0, competitor, |_| true), Some(record));
+        assert_eq!(calls.get(), 0, "an unused competitor scan must stay lazy");
+        sync_handoff::record_dispatch(0, true, 1);
+        sync_handoff::record_dispatch(0, true, 1 + u64::from(MAX_SYNC_HANDOFF_CHAIN_TICKS));
+        assert!(sync_handoff::enqueue(0, record));
+        assert_eq!(sync_handoff::take_next_ready_with(0, competitor, |_| true), None);
+        assert_eq!(calls.get(), 1);
+        assert!(sync_handoff::pending(0), "fairness refusal cannot consume the FIFO");
+        assert_eq!(sync_handoff::take_next_ready_with(0, || false, |_| true), Some(record),
+            "without a fair competitor, the exhausted chain can still progress");
+        sync_handoff::record_dispatch(0, false, 0);
+    });
+}
+#[test]
 pub(in crate::multitask::scheduler) fn actual_missing_current_cannot_supply_latency_floor_and_foreign_uid_cannot_publish() {
     family(|_, child, scope| {
         runqueue::raise_vruntime_floor(child, 8 * IPC_DONATION_BONUS_NS);

@@ -292,7 +292,7 @@ pub fn complete_fast_ipc_reply_wake_handoff_with_custody(
     // No generic fresh-lookup fallback after ORIGINAL typed-wait refusal.
     let woken = outcome != scheduler::FastIpcReplyHandoffOutcome::Rejected;
     if !woken {
-        record_refused_reply_wake("ipc-fast-reply-wake-refused", reply, completion.caller_task_id);
+        record_refused_reply_wake("ipc-fast-reply-wake-refused", reply, completion.caller_task_id, REPLY_WAIT);
     }
     woken
 }
@@ -302,7 +302,7 @@ pub fn complete_fast_ipc_reply_wake_handoff_with_custody(
 pub fn complete_ipc_reply_wake_handoff(reply: u64, task_id: u64) -> bool {
     let woken = scheduler::wake_publication::reply(reply, task_id);
     if !woken {
-        record_refused_reply_wake("ipc-reply-wake-refused", reply, task_id);
+        record_refused_reply_wake("ipc-reply-wake-refused", reply, task_id, REPLY_WAIT);
     }
     woken
 }
@@ -310,8 +310,20 @@ pub fn complete_ipc_reply_wake_handoff(reply: u64, task_id: u64) -> bool {
 /// A refused reply wake leaves the caller to its deadline. Recording it ties
 /// a later caller-side timeout or a long-blocked report to the exact reply.
 /// Bounded to the first occurrences and then exponentially spaced counts.
-fn record_refused_reply_wake(name: &'static str, reply: u64, task_id: u64) {
+const REPLY_WAIT: fn(u64, u64) -> bool = scheduler::wake_retry::record_refused_reply;
+const PAGER_FAULT_WAIT: fn(u64, u64) -> bool = scheduler::wake_retry::record_refused_pager_fault;
+
+fn record_refused_reply_wake(
+    name: &'static str,
+    reply: u64,
+    task_id: u64,
+    retry: fn(u64, u64) -> bool,
+) {
     use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    // Retry this exact reply/fault wait at this CPU's next scheduler entry.
+    // A pager-fault wait has no deadline waiter, so without this a refused
+    // fault completion parked the faulting task indefinitely.
+    let _ = retry(task_id, reply);
     // A refused exact wake can leave the caller blocked with its response
     // already queued (the refusal paths give up before clearing the wait when
     // the caller's frame is between publications). Make its armed reply
@@ -333,7 +345,7 @@ fn record_refused_reply_wake(name: &'static str, reply: u64, task_id: u64) {
 pub fn complete_pager_fault_wake_handoff(fault_token: u64, task_id: u64) -> bool {
     let woken = scheduler::wake_publication::pager_reply(fault_token, task_id);
     if !woken {
-        record_refused_reply_wake("pager-fault-wake-refused", fault_token, task_id);
+        record_refused_reply_wake("pager-fault-wake-refused", fault_token, task_id, PAGER_FAULT_WAIT);
     }
     woken
 }

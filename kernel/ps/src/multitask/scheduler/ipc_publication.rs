@@ -172,11 +172,9 @@ pub(super) fn publish_with(
     let token = frame_publication::observed_frame_token(slot, cpu, false)
         .filter(|token| token.owner_generation == expected.generation)
         .ok_or(Outcome::DirectCustodyUnavailable)?;
-    let pin = frame_publication::pin_for_identity(token, binding.id())
-        .ok_or(Outcome::DirectCustodyUnavailable)?;
-    // SAFETY: SAME original masked CPU and physical receiver pin remain live
-    // through all effects. Actual reader excludes claims, not the copied token.
-    let reader = unsafe { stack_resources::frame_readers::acquire(&pin, cpu) }
+    // SAFETY: SAME original masked CPU and owned physical receiver pin remain
+    // live through all effects. Actual reader excludes claims, not the token.
+    let reader = unsafe { frame_publication::read_for_identity(token, binding.id(), cpu) }
         .ok_or(Outcome::DirectCustodyUnavailable)?;
     if frame_publication::observed_frame_token(slot, cpu, false).is_none_or(|now| {
         now.owner_generation != token.owner_generation || now.frame_epoch != token.frame_epoch
@@ -193,7 +191,6 @@ pub(super) fn publish_with(
         // Never synchronously drain while our sender/donor/root/receiver loans
         // remain live. Transfer the SAME producer to durable quarantine instead.
         drop(reader);
-        drop(pin);
         if let Some(stop) = stop { terminal_quarantine::publish(stop); }
         return Err(Outcome::DirectCustodyUnavailable);
     }
@@ -222,7 +219,6 @@ pub(super) fn publish_with(
     last_effect();
     drop(publication);
     drop(reader);
-    drop(pin);
     #[cfg(not(test))]
     if notify { crate::multitask::irq::request_target_reschedule(target); }
     #[cfg(test)]

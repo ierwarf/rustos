@@ -181,7 +181,28 @@ pub fn preemption_snapshot() -> PreemptionSnapshot {
 /// rest of the acquire reuse the answer instead of deriving it four more times.
 #[cfg(rustos_boot_image)]
 pub(super) fn disable_preemption() -> usize {
-    x86_64::instructions::interrupts::without_interrupts(|| {
+    disable_preemption_with(x86_64::instructions::interrupts::are_enabled())
+}
+
+/// `without_interrupts` for a caller that already read IF: the same
+/// conditional `cli`/`sti`, without another `pushf`.
+#[cfg(rustos_boot_image)]
+#[inline(always)]
+pub(super) fn masked<R>(irq_enabled: bool, f: impl FnOnce() -> R) -> R {
+    if irq_enabled {
+        x86_64::instructions::interrupts::disable();
+    }
+    let result = f();
+    if irq_enabled {
+        x86_64::instructions::interrupts::enable();
+    }
+    result
+}
+
+/// `disable_preemption` for a caller that already read IF.
+#[cfg(rustos_boot_image)]
+pub(super) fn disable_preemption_with(irq_enabled: bool) -> usize {
+    masked(irq_enabled, || {
         let cpu = current_cpu_index();
         // ORDERING: Acquire observes the last same-CPU guard release before
         // checking the held plus pending ownership correspondence.
@@ -201,14 +222,15 @@ pub(super) fn disable_preemption() -> usize {
                 .checked_sub(1)
                 .map(|index| stack.classes[index]))
         );
-        // ORDERING: AcqRel publishes guard entry before protected raw state can
-        // be observed and serializes depth with the matching decrement.
-        let previous = CPU_LOCK_STATE[cpu].preempt_disable_depth.fetch_add(1, Ordering::AcqRel);
+        // ORDERING: the depth is CPU-private (only this CPU reads it to make a
+        // decision); program order publishes guard entry before protected raw
+        // state, and the lock word's own CAS orders it against other CPUs.
+        let previous = super::cpu_counter::add_usize(&CPU_LOCK_STATE[cpu].preempt_disable_depth, 1);
         assert!(
             previous < MAX_HELD_LOCK_DEPTH,
             "raw-spin preemption depth exceeded bound"
         );
-        CPU_LOCK_STATE[cpu].preempt_pending_depth.fetch_add(1, Ordering::Relaxed);
+        super::cpu_counter::add_usize(&CPU_LOCK_STATE[cpu].preempt_pending_depth, 1);
         cpu
     })
 }
@@ -227,12 +249,11 @@ pub(super) fn enable_preemption_on(cpu: usize, class: u8) {
     // below. Deriving it eagerly cost a `CPUID` VM exit on every lock release.
     let held_depth = with_current_stack_on(cpu, |stack| stack.len);
     let pending_depth = CPU_LOCK_STATE[cpu].preempt_pending_depth.load(Ordering::Relaxed);
-    // ORDERING: AcqRel publishes every protected write before the final depth
-    // decrement; Acquire failure ordering reports the exact observed depth.
-    let previous =
-        CPU_LOCK_STATE[cpu].preempt_disable_depth.fetch_update(Ordering::AcqRel, Ordering::Acquire, |depth| {
-            depth.checked_sub(1)
-        });
+    // ORDERING: CPU-private depth; the lock word's release store already
+    // published every protected write. Underflow is fatal below, so the
+    // wrapped value is never observed by a continuing kernel.
+    let observed = super::cpu_counter::dec(&CPU_LOCK_STATE[cpu].preempt_disable_depth);
+    let previous = Some(observed).filter(|&depth| depth != 0).ok_or(observed);
     match previous {
         Ok(observed) if preemption_release_is_admissible(observed, held_depth, pending_depth) => {}
         Ok(observed) => panic!(
@@ -269,7 +290,7 @@ pub(super) fn enable_preemption_on(cpu: usize, class: u8) {
 #[cfg(rustos_boot_image)]
 pub(super) fn cancel_pending_acquire() {
     let cpu = current_cpu_index();
-    let previous = CPU_LOCK_STATE[cpu].preempt_pending_depth.fetch_sub(1, Ordering::Relaxed);
+    let previous = super::cpu_counter::dec(&CPU_LOCK_STATE[cpu].preempt_pending_depth);
     assert!(previous != 0, "raw-spin pending-acquire depth underflow");
 }
 

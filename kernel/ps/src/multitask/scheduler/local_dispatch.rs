@@ -242,14 +242,35 @@ fn candidate_is_qualified(
     // The token is only an observation. Retain exact allocation lifetime AND
     // reader/claim exclusion through the unsafe copy and final token check in
     // native witnesses just as in production; generations cannot replace pins.
-    let _allocation_pin = frame_publication::pin_allocation(frame).ok_or(LocalFallbackReason::FrameUnavailable)?;
-    let _frame_reader = unsafe { super::stack_resources::frame_readers::acquire(&_allocation_pin, cpu) }
+    // SAFETY: selection runs under the original CPU's dispatch exclusion.
+    let _frame_reader = unsafe { frame_publication::read_allocation(frame, cpu) }
         .ok_or(LocalFallbackReason::FrameUnavailable)?;
     context_validation::validate_published_saved_context(frame.slot, frame.saved_rsp, frame.view)
         .map_err(|_| LocalFallbackReason::FrameUnavailable)?;
     frame_publication::token_is_current(frame, cpu)
         .then_some(Some(frame.owner_generation))
         .ok_or(LocalFallbackReason::FrameUnavailable)
+}
+
+/// Ordering admission for one fair-scan candidate: the same published
+/// lifecycle/affinity/budget answer and Local frame token as
+/// `candidate_is_qualified`, without the allocation pin, frame reader and saved
+/// context copy. Only the scan's winner can be dispatched, and it is re-proven
+/// through `candidate_is_qualified` before the scan returns it; a corrupt frame
+/// behind a non-winner is the periodic ready-frame sweep's to quarantine.
+/// Qualifying every runnable candidate cost three resource-leaf acquisitions
+/// per candidate on every fair dispatch, most of a round trip's leaf traffic.
+fn candidate_is_admitted(
+    slot: usize,
+    cpu: usize,
+    now_ns: u64,
+) -> Result<Option<u64>, LocalFallbackReason> {
+    match published_candidate_admission(slot, cpu, now_ns)? {
+        false => Ok(None),
+        true => frame_publication::local_frame_token(slot, cpu)
+            .map(|frame| Some(frame.owner_generation))
+            .ok_or(LocalFallbackReason::FrameUnavailable),
+    }
 }
 
 /// A hinted Local owner may bypass the catalog's second schedulability
@@ -318,11 +339,9 @@ pub(super) fn direct_handoff_frame_generation(
 ) -> Result<u64, LocalFallbackReason> {
     let frame = frame_publication::direct_handoff_frame_token(slot, cpu)
         .ok_or(LocalFallbackReason::FrameUnavailable)?;
-    let _allocation_pin =
-        frame_publication::pin_allocation(frame).ok_or(LocalFallbackReason::FrameUnavailable)?;
-    let _frame_reader =
-        unsafe { super::stack_resources::frame_readers::acquire(&_allocation_pin, cpu) }
-            .ok_or(LocalFallbackReason::FrameUnavailable)?;
+    // SAFETY: selection runs under the original CPU's dispatch exclusion.
+    let _frame_reader = unsafe { frame_publication::read_allocation(frame, cpu) }
+        .ok_or(LocalFallbackReason::FrameUnavailable)?;
     context_validation::validate_published_saved_context(frame.slot, frame.saved_rsp, frame.view)
         .map_err(|_| LocalFallbackReason::FrameUnavailable)?;
     frame_publication::direct_handoff_token_is_current(frame, cpu)
@@ -403,15 +422,23 @@ fn select_class_candidate(
 /// the catalog; normal System/User fair ordering, the user reservation, and
 /// voluntary-yield exclusion are shadowed here.
 pub(super) fn choose_local_next(
-    cpu: usize,
-    current_slot: usize,
-    voluntary_yield: bool,
-    current_runtime_ns: u64,
-    eligibility_now_ns: u64,
-    expected_queue_sequence: u64,
-    expected_class_sequence: u64,
-    atomic_activation_pending: bool,
-    synchronous_handoff_pending: bool,
+    cpu: usize, current_slot: usize, voluntary_yield: bool, current_runtime_ns: u64,
+    eligibility_now_ns: u64, expected_queue_sequence: u64, expected_class_sequence: u64,
+    atomic_activation_pending: bool, synchronous_handoff_pending: bool,
+) -> Result<(usize, u64), LocalFallbackReason> {
+    choose_local_next_with(cpu, current_slot, voluntary_yield, current_runtime_ns,
+        eligibility_now_ns, expected_queue_sequence, expected_class_sequence,
+        atomic_activation_pending, synchronous_handoff_pending, candidate_is_qualified)
+}
+
+/// The production consumer retains its winner's actual frame loan through
+/// final claim. Observational callers use the SAME ordering/admission engine
+/// above but discard their scoped reader, never manufacturing execution.
+pub(super) fn choose_local_next_with(
+    cpu: usize, current_slot: usize, voluntary_yield: bool, current_runtime_ns: u64,
+    eligibility_now_ns: u64, expected_queue_sequence: u64, expected_class_sequence: u64,
+    atomic_activation_pending: bool, synchronous_handoff_pending: bool,
+    mut qualify: impl FnMut(usize, usize, u64) -> Result<Option<u64>, LocalFallbackReason>,
 ) -> Result<(usize, u64), LocalFallbackReason> {
     if atomic_activation_pending {
         return fallback(LocalFallbackReason::AtomicActivationPending);
@@ -461,7 +488,7 @@ pub(super) fn choose_local_next(
         let qualification = if slot == current_slot && current_is_live {
             Ok(Some(runqueue::owner(slot).generation))
         } else {
-            candidate_is_qualified(slot, cpu, eligibility_now_ns)
+            candidate_is_admitted(slot, cpu, eligibility_now_ns)
         };
         match qualification {
             Ok(Some(_)) => {}
@@ -593,7 +620,7 @@ pub(super) fn choose_local_next(
             }
             runqueue::owner(slot).generation
         } else {
-            match candidate_is_qualified(slot, cpu, eligibility_now_ns) {
+            match qualify(slot, cpu, eligibility_now_ns) {
                 Ok(Some(generation)) => generation,
                 Ok(None) => return fallback(LocalFallbackReason::LifecycleIneligible),
                 Err(reason) => return fallback(reason),
@@ -854,6 +881,9 @@ mod tests {
         let token = super::frame_publication::local_frame_token(slot, cpu).unwrap();
         assert!(super::frame_publication::pin_allocation(token).is_none());
         assert_eq!(super::candidate_is_qualified(slot, cpu, 0), Err(super::LocalFallbackReason::FrameUnavailable));
+        // The fair scan orders on admission and the token alone; only the
+        // winner's re-proof above pins the allocation and reads the frame.
+        assert_eq!(super::candidate_is_admitted(slot, cpu, 0), Ok(Some(token.owner_generation)));
         super::runqueue::publish_blocked(slot, cpu, 100);
         assert!(matches!(super::runqueue::publish_direct_handoff(slot, cpu),
             super::runqueue::RemoteWakeOutcome::Published { .. }));

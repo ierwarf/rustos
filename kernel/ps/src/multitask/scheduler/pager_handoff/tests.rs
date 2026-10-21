@@ -82,6 +82,57 @@ fn actual_pager_full_fifo_preserves_original_worker_wait_and_faulting_current() 
     });
 }
 #[test]
+fn refused_pager_handoff_retries_the_stranded_worker_wait() {
+    peers(|_, worker, scope, wait| {
+        let _ = wake_retry::service_with(scope, &|_| 1);
+        let queued = wake_retry::pending_on(scope);
+        sync_handoff::with_full_fifo_model(scope.cpu(), || {
+            let outcome = handoff(scope, wait, TOKEN, WORKER);
+            assert_eq!(outcome, PagerFaultHandoffOutcome::DirectCustodyUnavailable);
+            assert!(super::retry_stranded_worker(scope, outcome, WORKER));
+            assert_eq!(wake_retry::pending_on(scope), queued + 1);
+            assert!(runqueue::wait::blocked(worker));
+        });
+        // The worker already left the waiter registry; the retry, not a later
+        // fault, wakes its exact PagerService wait once custody is available.
+        let _ = wake_retry::service_with(scope, &|_| 1);
+        assert!(!runqueue::wait::blocked(worker));
+        assert_eq!(runqueue::wait::reason(worker), (runqueue::wait::REASON_NONE, 0));
+        assert_eq!(wake_retry::pending_on(scope), queued);
+    });
+}
+#[test]
+fn refused_pager_service_wake_retries_the_parked_worker() {
+    peers(|_, worker, scope, _| {
+        let process = wake_publication::Binding::capture(worker, WORKER)
+            .and_then(|binding| binding.context().process_id)
+            .unwrap();
+        let _ = wake_retry::service_with(scope, &|_| 1);
+        let queued = wake_retry::pending_on(scope);
+        // The worker's frame is not yet published for its owner generation
+        // (the window between its block commit and frame publication).
+        let generation = runqueue::owner(worker).generation;
+        frame_publication::bind_local_owner_generation(worker, generation + 7);
+        assert_eq!(wake_publication::pager_service_with(scope, process, &|_| 1), None);
+        assert!(runqueue::wait::blocked(worker));
+        assert_eq!(wake_retry::pending_on(scope), queued + 1);
+        frame_publication::bind_local_owner_generation(worker, generation);
+        let _ = wake_retry::service_with(scope, &|_| 1);
+        assert!(!runqueue::wait::blocked(worker));
+        assert_eq!(wake_retry::pending_on(scope), queued);
+    });
+}
+#[test]
+fn refused_pager_handoff_never_retries_an_unrelated_worker_wait() {
+    peers(|_, worker, scope, wait| {
+        runqueue::wait::set_reason(worker, runqueue::wait::REASON_ENDPOINT_REPLY, 0x99);
+        let outcome = handoff(scope, wait, TOKEN, WORKER);
+        assert_eq!(outcome, PagerFaultHandoffOutcome::ReceiverMismatch);
+        assert!(!super::retry_stranded_worker(scope, outcome, WORKER));
+        assert_eq!(runqueue::wait::reason(worker), (runqueue::wait::REASON_ENDPOINT_REPLY, 0x99));
+    });
+}
+#[test]
 fn actual_pager_remote_worker_publication_binds_exact_fifo_and_mailbox_generation() {
     ipc_publication::tests::peers_with_policy(true, 3, |sender, worker, scope| {
         // Earlier typed service wait/topology input; actual born worker/funding

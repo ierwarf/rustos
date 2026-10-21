@@ -117,7 +117,6 @@ struct Resources {
     binding: Option<(u64, Geometry)>,
     closing: bool,
     frame_writing: bool,
-    frame_readers: u32,
     reservation: Option<admission::Reservation>,
     reservation_generation: u64,
     reclaim: Option<reuse::Key>,
@@ -151,6 +150,11 @@ impl ReclaimAdmission<'_> {
 struct ResourceCell {
     inner: TrackedSpinLock<Resources, { LockClass::TaskStackResources as u8 }>,
     pins: AtomicU32,
+    /// Registered saved-frame readers. Like `pins`: every increment happens
+    /// under the cell leaf after its admission checks, and a reader releases
+    /// with one atomic decrement instead of a second leaf acquisition. Claims
+    /// and writers read it under the leaf, where no new reader can register.
+    readers: AtomicU32,
     closing_notice: AtomicBool,
 }
 
@@ -166,12 +170,12 @@ impl ResourceCell {
                 binding: None,
                 closing: false,
                 frame_writing: false,
-                frame_readers: 0,
                 reservation: None,
                 reservation_generation: 0,
                 reclaim: None,
             }),
             pins: AtomicU32::new(0),
+            readers: AtomicU32::new(0),
             closing_notice: AtomicBool::new(false),
         }
     }
@@ -179,7 +183,12 @@ impl ResourceCell {
     fn with<R>(&self, f: impl FnOnce(&mut Resources) -> R) -> R {
         #[cfg(not(test))]
         {
-            x86_64::instructions::interrupts::without_interrupts(|| f(&mut self.inner.lock()))
+            // SAFETY: the closure runs with IRQs masked and drops the guard
+            // before `without_interrupts` restores IF.
+            x86_64::instructions::interrupts::without_interrupts(|| {
+                let mut guard = unsafe { self.inner.lock_masked() };
+                f(&mut guard)
+            })
         }
         #[cfg(test)]
         {
@@ -188,24 +197,25 @@ impl ResourceCell {
     }
 
     fn pin(&self, task_id: u64, view: PublishedFrameView) -> bool {
-        self.with(|resources| {
-            if resources.closing
-                || resources.frame_writing
-                || resources.mm_pin.as_ref().is_some_and(|pin| !pin.is_open())
-                || resources.start.is_none_or(|start| start.id != task_id)
-                || resources.binding != Some((task_id, Geometry::from_view(view)))
-            {
-                return false;
-            }
-            // Every increment is serialized by the cell. Drops can only lower
-            // this count; checked CAS cannot wrap on a concurrent decrement.
-            self.pins
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-                    count.checked_add(1)
-                })
-                .expect("stack resource pin overflow");
-            true
-        })
+        self.with(|resources| self.pin_locked(resources, task_id, view))
+    }
+
+    /// The caller holds this cell's leaf, including combined frame admission.
+    fn pin_locked(&self, resources: &Resources, task_id: u64, view: PublishedFrameView) -> bool {
+        if resources.closing
+            || resources.frame_writing
+            || resources.mm_pin.as_ref().is_some_and(|pin| !pin.is_open())
+            || resources.start.is_none_or(|start| start.id != task_id)
+            || resources.binding != Some((task_id, Geometry::from_view(view)))
+        {
+            return false;
+        }
+        // Every increment is serialized by the cell. Drops can only lower
+        // this count; checked CAS cannot wrap on a concurrent decrement.
+        self.pins
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| count.checked_add(1))
+            .expect("stack resource pin overflow");
+        true
     }
 
     fn unpin(&self) {
@@ -343,8 +353,25 @@ pub(super) fn current_return_binding(
     })
 }
 
+/// One joined post-producer qualification. No raw leaf spans guard/header reads.
+pub(super) fn capture_outgoing_image(
+    cpu: usize, slot: usize, view: PublishedFrameView,
+) -> Option<(u64, super::return_architecture::ArchitectureState, Option<core::ptr::NonNull<u8>>)> {
+    if !cpu_leases::owns_current(cpu, slot) { return None; }
+    let cell = RESOURCES.get(slot)?;
+    cell.with(|resources| {
+        let id = resources.start?.id;
+        let architecture = context::architecture_locked(cell, resources, slot, id, view)?;
+        let guard = resources.stack.as_ref().and_then(|stack|
+            stack.get(..super::TASK_STACK_GUARD_BYTES))
+            .and_then(|guard| core::ptr::NonNull::new(guard.as_ptr() as *mut u8));
+        Some((id, architecture, guard))
+    })
+}
+
 pub(super) fn publish_binding(slot: usize, task_id: u64, view: PublishedFrameView) {
     RESOURCES[slot].with(|resources| {
+        super::outgoing_image::assert_mutable(slot);
         assert!(
             resources.start.is_some_and(|start| start.id == task_id),
             "frame binding lacks exact task descriptor"
@@ -403,7 +430,7 @@ pub(in crate::multitask::scheduler) fn assert_boot_vacant() {
             assert!(r.context.is_none() && r.start.is_none() && r.stack.is_none()
                 && r.binding.is_none() && r.process_pin.is_none() && r.mm_pin.is_none()
                 && r.reservation.is_none() && r.reclaim.is_none()
-                && !r.closing && !r.frame_writing && r.frame_readers == 0
+                && !r.closing && !r.frame_writing && cell.readers.load(Ordering::Acquire) == 0
                 && cell.pins.load(Ordering::Acquire) == 0
                 && crate::multitask::current_identity::execution::count(slot) == 0,
                 "boot owner initialization overlaps physical task lifetime");

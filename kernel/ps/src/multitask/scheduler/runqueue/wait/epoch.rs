@@ -39,6 +39,33 @@ pub(super) fn with<R>(slot: usize, f: impl FnOnce(&mut State) -> R) -> R {
     f(&mut EPOCHS[slot].lock())
 }
 
+/// What a refused wake observed about the target's wait, for a later retry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::multitask::scheduler) enum WaitInstance {
+    /// No wait is published (or the owner is terminal): nothing to wake.
+    Idle,
+    /// Another typed wake currently owns this wait's publication phase.
+    WakePending,
+    /// The exact wait instance: arm epoch plus reason kind and object.
+    Waiting { serial: u64, kind: u8, id: u64 },
+}
+
+/// Read-only observation of the slot's current wait instance. The epoch serial
+/// advances on every arm, cancel and wake, so an equal serial with the same
+/// reason is the same, still-uncompleted wait. Grants no wake or custody.
+pub(in crate::multitask::scheduler) fn wait_instance(slot: usize) -> WaitInstance {
+    with(slot, |state| {
+        let (kind, id) = super::reason_locked(slot);
+        if kind == REASON_NONE || owner(slot).state.is_terminal() {
+            WaitInstance::Idle
+        } else if matches!(state.pending, Some(_)) {
+            WaitInstance::WakePending
+        } else {
+            WaitInstance::Waiting { serial: state.serial, kind, id }
+        }
+    })
+}
+
 /// Non-Copy pending publication borrows the ORIGINAL actual wake binding.
 /// A nonce/payload alone is not wake, frame, execution or reuse permission.
 pub(in crate::multitask::scheduler) struct TypedWake<'a> {

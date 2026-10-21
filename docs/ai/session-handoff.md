@@ -1,16 +1,19 @@
 # Session Handoff
 
 Live goal, `git status --short`, exact source hashes and fresh runtime evidence
-win. The user requested F5 verification and a commit of this runtime-memory
-optimization and formal-registry repair. Do not include unrelated changes.
+win. The current request is structural IPC round-trip lock reduction, using
+web references and benchmark evidence, followed by a question about larger
+custody-protocol redesign feasibility; no commit was requested in this round.
+The earlier 8-vCPU fused IPC mean target (<80,000 ticks) is not achieved.
 
 ## Current objective
 
 Stabilize eight-vCPU RustOS first, then optimize the scheduler/IPC bottlenecks
 found by static review. Per-CPU domain budgets (`65adf2d1`) and the wakeup,
 lock, heap and APIC fixes (`be14d6c2`) and the class-claim/IPC follow-up
-(`d6f27b11`) are committed. The current round optimizes the service runtime's
-byte-at-a-time memory primitives and restores the matching validation anchors.
+(`d6f27b11`) and runtime memory primitives (`172bbf26`) are committed.
+The current uncommitted round reduces DVM read-ahead amplification, removes
+unused handoff scans and CPU-state false sharing, and adds raw tail evidence.
 
 ## Fresh evidence — 2026-10-20
 
@@ -121,6 +124,119 @@ byte-at-a-time memory primitives and restores the matching validation anchors.
   read controls (1 vCPU 861 ms; 8 vCPUs 948 ms) overlap candidate ranges
   (837–993 ms; 930–1,059 ms). Do not infer an app-launch gain from the earlier
   slower controls or treat the primitive speedup as a transport fix.
+
+## Current DVM / IPC tail round — in progress
+
+- Scratch evidence: `/tmp/rustos-ipc80/`; no benchmark baseline committed.
+  Read-only scout/review found no correctness blocker in the initial lazy-scan /
+  two-window batch changes. Their review is not runtime or throughput proof.
+- Aggregate diagnostic evidence refutes the earlier “75 ms per 64 KiB is pure
+  transport” estimate: by read call 128, 79 hits / 49 misses requested 1,007,616
+  bytes but submitted 9,633,792 bytes; WAIT accumulated 1,173,803 us. WAIT
+  includes transport plus scheduling. FAT also issues many 2-KiB RPCs.
+- Storaged now speculates two windows, not eight, keeping the eight-window LRU
+  and all generation/range/cancel/all-or-nothing publication rules. First
+  instrumented WayClick read: 1,078,659 -> 190,720 us. Three noninstrumented
+  candidate reads: 147,602 / 132,047 / 152,955 us. Same-session unmodified
+  controls and stable validation are still required before final attribution;
+  large sequential-throughput effects remain unmeasured.
+- Lazy competitor scan keeps the exact eight-tick handoff bound, FIFO order and
+  final identity/custody checks. Native tests 932/932 and storaged 16/16 passed;
+  the full `dev-plan` now lane passed 346/346. General 8-vCPU benchmarks passed
+  3/3, fused means 177,336 / 173,854 / 231,785 ticks; CPUID minima 4,880 / 7,320 /
+  7,120 drift, so no IPC speedup is established. Initial baseline mean 184,873.
+- Follow-up packs each CPU's handoff budget into one padded line and isolates
+  pending flags. Native tests, formal selftest, check and one 8-vCPU bench pass,
+  but that run's fused mean 260,244 / p50 120,960 is not an improvement. Do not
+  retain or claim this experiment without anchored controls and tail evidence.
+- New measurement code (not yet guest-validated): p99.9 / p99.99, strict raw
+  >80k / >1M / >10M counts, top-1% elapsed-time share, and eight correlated
+  worst-request leg spans. Extra text is deferred until all probes end; no new
+  timed syscall or clock read. The host rejects malformed/clipped evidence and
+  keeps legacy logs/baseline parsing compatible. Native ipcbench 15 tests and
+  42 host bench tests passed before the final parser-bound tests were added.
+- Shipping kernel profilers are off. One combined heavy diagnostic boot timed
+  out before DVM readiness (archived); isolated profiled IPC and service-only
+  diagnostic boot passed. Host `perf` task-clock/context-switch permission is
+  available; no host/guest clock correlation or per-request host-cause proof yet.
+- Next: finish tail-native tests, ordinary + isolated 8-vCPU tail runs, matched
+  original-source controls, reject regressing experiments, execute final now /
+  PR formal / UI smoke, update this entry with verified results, then commit.
+
+## Lost-wakeup hardening and IPC path-length round — 2026-10-21
+
+Uncommitted, separate from the DVM/IPC tail round above (do not mix files).
+
+- Hardening: `scheduler/wake_retry.rs` retries a refused wake for its exact
+  wait instance (task, slot, wait epoch, reason) from deferred/generic/user
+  wakes, refused reply/pager-fault wakes, pager-service and pager-handoff
+  refusals, and refused signal wakes; fast-call rollback/handoff no longer
+  resend or fail a request its receiver already took. A refused call handoff
+  now keeps a fast frame its receiver took or answered
+  (`fast_request_owned_by_receiver`); the refusal milestone records which
+  keep-reply proof failed (bits 8..10) and every
+  `received_request_custody_conditions` bit (from bit 12).
+- Open: 2 of 18 eight-vCPU boots cancelled an in-flight cold-path call with
+  `ipc-donation-handoff-refused` (admitted=1, returned=0, retained=0); one
+  such cancel killed `storaged` at launch (std `stack_overflow.rs:240`) and
+  failed boot. Not reproduced in the last 6 boots; decode bit 12+ on the next
+  occurrence before changing the fail-closed policy.
+- Path length: one 1-vCPU isolated `reply_recv` round trip takes ~226 tracked
+  lock acquisitions (Resources53 ~90, most from frame pin + reader acquire +
+  release); an uncontended tracked lock pair is ~134 TSC ticks vs ~8 raw, and
+  `pushf` ~17. Bisect (1 vCPU, isolated, raw min): `6f629add` 28,760,
+  `d2f0d72c` 36,640, `c11ab261` 70,720 (`f9b497cb` does not boot), current
+  ~62,000. The regression is the per-slot custody protocol, not one bug.
+- Landed static wins: CPU-owned lockdep counters use non-`lock` `xadd` after
+  CPU-map publication; IF read once per acquisition and `lock_masked` for
+  IRQ-masked owners; APIC lookup skipped after publication; kernel
+  `memcpy`/`memset`; retirement scanners use a busy-row bitmap; thread-work
+  pending count; set-associative task hints; slimmer `TaskContext`; no empty
+  1 KiB deferred-wake copy; `CurrentReturn` rechecks the bank, not the leaf;
+  fair scan validates only its winner's frame; shipping-build phase clocks off.
+- Validation: native ps 940 / ipc-runtime 76 / compat 178 / nucleus-core 65,
+  `verify-smp-iteration`, PR formal sealed, `kvm-smoke --dry-run`.
+- Next: consolidate the frame reader triple (pin+acquire in one leaf,
+  lock-free release like `pins`) and other per-dispatch custody leaves; that
+  is a contract change (SMP sequences and mutation anchors name them).
+
+## Owned frame-reader admission round — 2026-10-21
+
+- Preserved the pre-existing dirty tree; pre-round file copies and bounded
+  evidence are in `/tmp/rustos-ipc-locks/` (scratch, not durable baselines).
+- `PinnedFrameReader` joins exact backing pin and saved-frame reader admission
+  under one Resource53 leaf. Selection, final capture, IPC receiver publication
+  and copied observations use it. Borrowed readers share the same checks;
+  epoch/UID/geometry/IRQ/bank/writer/claim invariants remain in force. Drop
+  releases reader then backing; `into_pin` retains original final-claim backing.
+- Counted host control: two resource leaves -> one per combined admission,
+  zero on release/transfer. Four new regression tests; native ps 944/944,
+  four new exact mutation witnesses killed 4/4, focused selftest/check/contracts
+  passed. Independent read-only review found no introduced defect.
+- First shipping 1-vCPU isolated 20,000-round-trip run passed; control/candidate
+  CPUID minimum 4,400/4,400, IPC minimum 61,200/60,640 and p50 63,640/63,920.
+  Candidate overlapped host validation and the change is below the 2% floor:
+  this is NOT a measured IPC latency improvement. No 8-vCPU control completed.
+- The complete dev-plan now lane passed all 943 selected commands; final PR
+  stable batch sealed successfully (45 artifacts). KVM dry-run and bounded
+  8-vCPU UI/input smoke exited 0 with authenticated L0 input relay. Its input
+  and display advisory deadlines still overshoot (1,752/1,500 ms and
+  2,821/2,500 ms); evidence remains under `smp-evidence/unqualified/`, not a
+  release boot-budget or complete SMP qualification claim.
+- Two shipping repeats after host validation passed with 20,000 round trips
+  each: CPUID minima 4,400/4,440, IPC minima 60,600/60,520 and p50
+  63,040/63,240. Versus the same-session control, both deltas remain below 2%:
+  only the per-admission lock reduction is established, NOT IPC latency/tail
+  improvement. Maxima were 42,592,560 and 62,668,680 ticks; none were trimmed.
+  Logs: `/tmp/rustos-ipc-locks/{pr,candidate-1b,candidate-1c,smoke-8}.log`.
+- Follow-up feasibility answer: large cuts should carry the SAME selected-frame
+  lease through validation/funding/final claim, consuming reader custody into
+  the existing CPU banks instead of dropping and reacquiring it. Reuse immutable
+  facts, retain final revocation/epoch/MM/placement/budget checks and outgoing
+  RSP ACK. seL4 fastpath's checked commit boundary and Linux `context_switch`
+  custody handoff are references, not drop-in proofs or permission to delete
+  RustOS's guards. This larger redesign is only a proposal, NOT implemented;
+  avoid a blind all-at-once atomic/RCU conversion.
 
 ## Historical evidence
 

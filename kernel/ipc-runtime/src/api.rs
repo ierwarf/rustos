@@ -154,6 +154,10 @@ pub mod endpoint {
         crate::ipc::rollback_fast_endpoint_call(endpoint, reply, caller_task_id, receiver_task_id)
     }
 
+    pub fn fast_request_owned_by_receiver(reply: KernelReplyHandle, caller_task_id: u64) -> bool {
+        crate::ipc::fast_endpoint_request_owned_by_receiver(reply, caller_task_id)
+    }
+
     pub fn complete_fast_reply_for_task(
         reply: KernelReplyHandle,
         receiver_task_id: u64,
@@ -185,6 +189,15 @@ pub mod endpoint {
     /// caller custody; this does not bind a worker or grant execution.
     pub fn received_request_retains_custody(reply: KernelReplyHandle, caller_task_id: u64) -> bool {
         crate::ipc::received_request_retains_custody(reply, caller_task_id)
+    }
+
+    pub fn queued_request_retains_custody(reply: KernelReplyHandle, caller_task_id: u64) -> bool {
+        crate::ipc::published_request_retains_custody(reply, caller_task_id)
+    }
+
+    /// Failure-only evidence bits for `received_request_retains_custody`.
+    pub fn received_request_custody_conditions(reply: KernelReplyHandle, caller_task_id: u64) -> u16 {
+        crate::ipc::received_request_custody_conditions(reply, caller_task_id)
     }
 
     /// Binds broker-prepared descriptors to one live reply owned by the exact

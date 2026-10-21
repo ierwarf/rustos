@@ -38,7 +38,9 @@ impl<T, const CLASS: u8> IrqLeaf<T, CLASS> {
     #[track_caller]
     pub(super) fn lock(&self) -> Guard<'_, T, CLASS> {
         let mask = Mask::enter();
-        let inner = self.inner.lock();
+        // SAFETY: `mask` disabled local IRQs and, by field order, outlives the
+        // raw guard, so IF stays clear from acquisition through release.
+        let inner = unsafe { self.inner.lock_masked() };
         Guard { inner, _mask: mask }
     }
     #[track_caller]

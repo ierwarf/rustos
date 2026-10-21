@@ -1,12 +1,12 @@
 ----------------------------- MODULE FrameReaderClaim -----------------------------
 EXTENDS Naturals, FiniteSets
 CONSTANTS Readers, MaxGeneration
-\* Source-refining bounded selection/class/original-funding/resource CAS join.
-\* ClaimObserve retains the original physical frame/funding pins. ClaimLock
-\* abstracts rq40 -> class45 -> Context48/Domain49 -> claim leaves50..54;
-\* the exact owner CAS occurs while ALL admission leaves are still held.
-\* ClassPublish abstracts both live base-weight replacement and ledger edges;
-\* ContextDebit/DomainDebit/CloseFunding are independent competing producers.
+\* The distinguished Selection reader is a non-Copy original validated loan.
+\* ClaimObserve captures its physical/reader custody; ClaimLock abstracts
+\* rq40 -> class section -> original Context48/Domain49 -> leaves50..54.
+\* Only that SAME reader may be promoted at the exact owner CAS. Independent
+\* readers still refuse. Promotion ends byte reads; ClaimRelease abstracts its
+\* outside-leaf conversion into the Prepared allocation pin (not hardware run).
 \* This is NOT MM/Current/Transition/register/RSP/settlement/terminal/reuse proof.
 VARIABLES owner, generation, queued, readers, leaf, phase, expectedOwner,
           expectedGeneration, admitted, writer, closing, badClaim,
@@ -35,16 +35,18 @@ ReaderRelease(r) ==
     /\ UNCHANGED <<owner, generation, queued, leaf, phase, expectedOwner,
                     expectedGeneration, admitted, writer, closing, badClaim, joint>>
 ClaimObserve ==
-    /\ phase = "Idle" /\ owner \in {"Local", "Direct"}
+    /\ phase = "Idle" /\ leaf = "None" /\ owner \in {"Local", "Direct"}
+    /\ ~writer /\ ~closing
     /\ phase' = "Seen" /\ expectedOwner' = owner /\ expectedGeneration' = generation
+    /\ readers' = readers \cup {"Selection"}
     /\ selectedClassEpoch' = classEpoch /\ pinned' = TRUE
-    /\ UNCHANGED <<owner, generation, queued, readers, leaf, admitted, writer, closing,
+    /\ UNCHANGED <<owner, generation, queued, leaf, admitted, writer, closing,
                     badClaim, classEpoch, contextCredit, domainCredit, fundingClosed,
                     jointAdmitted, badAdmission>>
 ClaimLock ==
     /\ phase = "Seen" /\ leaf = "None"
     /\ leaf' = "Claim" /\ phase' = "Locked"
-    /\ admitted' = (readers = {} /\ ~writer /\ ~closing)
+    /\ admitted' = (readers = {"Selection"} /\ ~writer /\ ~closing)
     /\ jointAdmitted' = (classEpoch = selectedClassEpoch /\ contextCredit
                          /\ domainCredit /\ ~fundingClosed /\ pinned)
     /\ UNCHANGED <<owner, generation, queued, readers, expectedOwner,
@@ -55,26 +57,32 @@ ClaimCommit ==
     /\ phase = "Locked" /\ leaf = "Claim" /\ admitted /\ jointAdmitted
     /\ owner = expectedOwner /\ generation = expectedGeneration
     /\ generation < MaxGeneration
-    /\ badClaim' = (readers # {} \/ writer \/ closing
+    /\ badClaim' = (readers # {"Selection"} \/ writer \/ closing
                     \/ owner # expectedOwner \/ generation # expectedGeneration)
     /\ badAdmission' = (~contextCredit \/ ~domainCredit \/ fundingClosed
                         \/ classEpoch # selectedClassEpoch \/ ~pinned)
     /\ owner' = "Running" /\ generation' = generation + 1 /\ queued' = FALSE
-    /\ leaf' = "None" /\ phase' = "Idle"
+    /\ leaf' = "None" /\ phase' = "Promoted"
     /\ UNCHANGED <<readers, expectedOwner, expectedGeneration, admitted, writer, closing,
                     classEpoch, selectedClassEpoch, contextCredit, domainCredit,
                     fundingClosed, jointAdmitted, pinned>>
+ClaimRelease ==
+    /\ phase = "Promoted" /\ leaf = "None"
+    /\ readers' = readers \ {"Selection"} /\ phase' = "Idle"
+    /\ UNCHANGED <<owner, generation, queued, leaf, expectedOwner, expectedGeneration,
+                    admitted, writer, closing, badClaim, joint>>
 ClaimRefuse ==
     /\ phase = "Locked" /\ leaf = "Claim"
     /\ ~admitted \/ ~jointAdmitted \/ owner # expectedOwner \/ generation # expectedGeneration
         \/ generation = MaxGeneration
     /\ leaf' = "None" /\ phase' = "Idle" /\ pinned' = FALSE
-    /\ UNCHANGED <<owner, generation, queued, readers, expectedOwner,
+    /\ readers' = readers \ {"Selection"}
+    /\ UNCHANGED <<owner, generation, queued, expectedOwner,
                     expectedGeneration, admitted, writer, closing, badClaim,
                     classEpoch, selectedClassEpoch, contextCredit, domainCredit,
                     fundingClosed, jointAdmitted, badAdmission>>
-\* An independent owner-word writer can republish while the resource leaf is
-\* held. The CAS must compare the old exact word, not replay a fresh generation.
+\* Owner-word producers may republish while the resource leaf is held. Only
+\* the original expected generation may be spent; do not reacquire a new one.
 Republish ==
     /\ owner \in {"Local", "Direct"} /\ generation < MaxGeneration
     /\ owner' = IF owner = "Local" THEN "Direct" ELSE "Local"
@@ -122,13 +130,13 @@ CloseFunding ==
 TerminalStutter == /\ (owner = "Running" \/ closing)
                    /\ phase = "Idle" /\ leaf = "None" /\ UNCHANGED vars
 Next == (\E r \in Readers: ReaderAcquire(r) \/ ReaderRelease(r))
-        \/ ClaimObserve \/ ClaimLock \/ ClaimCommit \/ ClaimRefuse
+        \/ ClaimObserve \/ ClaimLock \/ ClaimCommit \/ ClaimRelease \/ ClaimRefuse
         \/ Republish \/ WriterStart \/ WriterFinish \/ Close
         \/ ClassPublish \/ ContextDebit \/ DomainDebit \/ CloseFunding \/ TerminalStutter
 TypeOK == /\ owner \in {"Local", "Direct", "Running"}
           /\ generation \in 0..MaxGeneration /\ queued \in BOOLEAN
-          /\ readers \subseteq Readers /\ leaf \in {"None", "Claim"}
-          /\ phase \in {"Idle", "Seen", "Locked"}
+          /\ readers \subseteq Readers \cup {"Selection"} /\ leaf \in {"None", "Claim"}
+          /\ phase \in {"Idle", "Seen", "Locked", "Promoted"}
           /\ expectedOwner \in {"Local", "Direct"}
           /\ expectedGeneration \in 0..MaxGeneration
           /\ admitted \in BOOLEAN /\ writer \in BOOLEAN /\ closing \in BOOLEAN
@@ -137,12 +145,14 @@ TypeOK == /\ owner \in {"Local", "Direct", "Running"}
           /\ contextCredit \in BOOLEAN /\ domainCredit \in BOOLEAN
           /\ fundingClosed \in BOOLEAN /\ jointAdmitted \in BOOLEAN
           /\ pinned \in BOOLEAN /\ badAdmission \in BOOLEAN
-NoRunningDuringNonexecutingRead == readers # {} => owner # "Running"
+NoRunningDuringNonexecutingRead == owner = "Running" => readers \subseteq {"Selection"}
+PromotedReaderCannotBeObserved == owner = "Running" /\ "Selection" \in readers => phase = "Promoted"
+SelectionSpansJoin == phase \in {"Seen", "Locked", "Promoted"} => "Selection" \in readers
 NoWriterDuringRead == writer => readers = {}
 ExactClaimHasExclusiveBytes == ~badClaim
 MembershipMatchesOwner == queued = (owner = "Local")
 LeafMatchesClaimPhase == (leaf = "Claim") = (phase = "Locked")
-OriginalPinsSurviveJoin == phase \in {"Seen", "Locked"} => pinned
+OriginalPinsSurviveJoin == phase \in {"Seen", "Locked", "Promoted"} => pinned
 ExactJointAdmissionAtCAS == ~badAdmission
 Spec == Init /\ [][Next]_vars
 ===================================================================================

@@ -148,7 +148,7 @@ source = "kernel/ps/src/multitask/scheduler/dispatcher.rs"
 source_symbol = "first_turn"
 source_anchors = [
   "p.task_id != Some(task_id)",
-  "DispatchFrame::capture_selected(turn, slot, task_id, candidate.generation",
+  "DispatchFrame::from_selection(turn, candidate.frame, class_sequence)",
   "frame.prepare().is_some_and(|funded| funded.claim())",
   "if matches!(decision, Decision::Incomplete) { return decision; }",
   "policy.atomic_activation_pick_hints.pop()",
@@ -205,7 +205,7 @@ model = "scheduler-local-authority/SchedulerLocalAuthority"
 source = "kernel/ps/src/multitask/scheduler/dispatcher.rs"
 source_symbol = "synchronous"
 source_anchors = [
-  "sync_handoff::take_next_ready(cpu, local_dispatch::local_fair_competitor_ready(cpu), |record| {",
+  "sync_handoff::take_next_ready_with(cpu, || local_dispatch::local_fair_competitor_ready(cpu), |record| {",
   "record.bind_selected_local_owner(runqueue::owner(record.slot()), cpu)",
   "record.claim_generation()",
 ]
@@ -275,13 +275,13 @@ severity = "critical"
 flow = "scheduler-dispatch"
 model = "scheduler-local-authority/SchedulerLocalAuthority"
 source = "kernel/ps/src/multitask/scheduler/dispatch_claim.rs"
-source_symbol = "capture_selected"
+source_symbol = "capture"
 source_anchors = [
   "FrameCustody::Local => frame_publication::local_frame_token(slot, cpu)",
   "rustos_scheduler_frame_gate::selected_local_frame_identity(",
-  "let Some(pin) = frame_publication::pin_for_identity(token, id)",
+  "frame_publication::read_for_identity(token, id, cpu)",
   "let validation = context_validation::validate_published_saved_context(",
-  "Self::token_current(token, cpu, custody)",
+  "DispatchFrame::token_current(token, cpu, custody)",
 ]
 invariant = "a selected fair frame cannot dispatch a republished Local generation or a different saved RSP; bounded writer withdraws Local custody before republishing, and the model excludes arbitrary writer overlap, catalog/final claim equivalence and stack-content validation or allocation-pin/assembly-switch lifetime"
 loom_test = "selected_local_frame_republish_cannot_claim_the_old_saved_rsp"
@@ -334,7 +334,7 @@ source_symbol = "first_turn"
 source_anchors = [
   "if atomic { policy.atomic_activation_pick_hints.front() } else { policy.spawn_pick_hints.front() }",
   "p.task_id != Some(task_id)",
-  "DispatchFrame::capture_selected(turn, slot, task_id, candidate.generation",
+  "DispatchFrame::from_selection(turn, candidate.frame, class_sequence)",
   "frame.prepare().is_some_and(|funded| funded.claim())",
   "if matches!(decision, Decision::Incomplete) { return decision; }",
   "policy.spawn_pick_hints.pop()",

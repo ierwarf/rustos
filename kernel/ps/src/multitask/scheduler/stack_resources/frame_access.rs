@@ -45,9 +45,11 @@ impl FrameWriter {
             {
                 return None;
             }
-            if resources.closing
+            if super::super::outgoing_image::frozen(slot)
+                || resources.closing
                 || resources.frame_writing
-                || resources.frame_readers != 0
+                // ORDERING: Acquire pairs with lock-free reader release.
+                || cell.readers.load(Ordering::Acquire) != 0
                 || cell.pins.load(Ordering::Acquire) != u32::from(current)
             {
                 return None;

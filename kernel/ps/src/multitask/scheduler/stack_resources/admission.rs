@@ -82,7 +82,8 @@ pub(in crate::multitask::scheduler) fn reserve(slot: usize, task_id: u64) -> Opt
             || resources.reclaim.is_some()
             || resources.closing
             || resources.mm_pin.is_some()
-            || resources.frame_readers != 0
+            // ORDERING: Acquire pairs with lock-free reader release.
+            || cell.readers.load(Ordering::Acquire) != 0
             || resources.context.is_some()
             || resources.process_pin.is_some()
             || resources.start.is_some()

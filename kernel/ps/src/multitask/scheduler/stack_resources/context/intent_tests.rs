@@ -122,14 +122,16 @@ fn failed_image_admission_can_cancel_exact_process_but_old_credential_cannot_ent
     let first = process::begin_exec(handle).unwrap();
     let intent = exec_intent::begin(SLOT, PID, first, false).unwrap();
     let old = intent.credential();
-    RESOURCES[SLOT].with(|r| r.frame_readers = 1);
+    // ORDERING: native fixture models reader custody on the real counter.
+    RESOURCES[SLOT].readers.store(1, Ordering::Release);
     assert!(
         exec_transaction::with_intent_image(&intent, first, 0x3000, false, |_| panic!(
             "reader admitted image"
         ))
         .is_none()
     );
-    RESOURCES[SLOT].with(|r| r.frame_readers = 0);
+    // ORDERING: native fixture models reader custody on the real counter.
+    RESOURCES[SLOT].readers.store(0, Ordering::Release);
     intent.prepare_cancel();
     intent.cancel(process::cancel_exec_owned(first).unwrap());
     let next = process::begin_exec(handle).unwrap();

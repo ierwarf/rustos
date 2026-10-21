@@ -32,16 +32,29 @@ impl DispatchEntry {
         let entry = Self { turn: Some(turn), selected: None, simd_saved: core::cell::Cell::new(false) };
         // Exact deferred identities own no backing. Each independent wake
         // captures its own original binding, outside every raw leaf.
+        #[cfg(rustos_scheduler_phase_profile)]
         let started = crate::arch::clock::monotonic_nanos();
         let wakes = super::super::deferred_wake::take_masked(entry.preemption());
-        let count = wakes.len();
-        for id in wakes.iter() {
-            let _ = scheduler::wake_publication::wake(
+        let count = wakes.as_ref().map_or(0, |wakes| wakes.len());
+        for id in wakes.iter().flat_map(|wakes| wakes.iter()) {
+            // A refused deferred wake used to be dropped here, leaving its
+            // waiter parked until an unrelated event; retry its exact wait.
+            if !scheduler::wake_publication::wake(
                 entry.preemption(), id, &scheduler::runqueue_policy::online_affinity_mask,
-            );
+            ) {
+                let _ = scheduler::wake_retry::record_in(entry.preemption(), id, None);
+            }
         }
+        let _ = scheduler::wake_retry::service(entry.preemption());
+        // Prologue wall time is a diagnosis-build phase; shipping keeps only
+        // the deferred-wake count, and only when there was one.
+        #[cfg(rustos_scheduler_phase_profile)]
         scheduler::runtime_profile::record_prologue(count,
             crate::arch::clock::monotonic_nanos().saturating_sub(started));
+        #[cfg(not(rustos_scheduler_phase_profile))]
+        if count != 0 {
+            scheduler::runtime_profile::record_prologue(count, 0);
+        }
         entry
     }
     pub(in crate::multitask) fn turn(&self) -> &dispatch_turn::CpuDispatchTurn<'static> {
@@ -70,8 +83,8 @@ impl DispatchEntry {
         &self, rsp: usize, voluntary: bool, immediate: Option<u64>,
     ) -> (SchedulerDispatch, bool) {
         self.save_simd();
-        let mut outgoing = scheduler::current_return::CurrentReturn::capture(self.turn())
-            .expect("IRQ dispatch lacks original physical Current");
+        let mut outgoing = scheduler::current_return::CurrentReturn::capture_dispatch(self.turn())
+            .expect("IRQ dispatch lacks original post-producer Current image");
         if immediate.is_some() {
             if let Some(result) = scheduler::dispatcher::fast(&mut outgoing, rsp, immediate) {
                 return (result, true);

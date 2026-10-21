@@ -26,6 +26,24 @@ pub enum EndpointReceive {
 /// takes it. The advisory message id never authorizes a recycled reply: both
 /// exact objects are rejoined under Message -> Reply leaves before accepting.
 pub fn received_request_retains_custody(reply: KernelReplyHandle, caller: u64) -> bool {
+    // A fast frame is received once its receiver took it (`RequestTaken` or
+    // later) and is still owed a response while the reply is neither used nor
+    // consumed. Without this, a call handed off through a fast frame whose
+    // receiver had already taken it read as "custody lost" and was cancelled
+    // under that receiver; a service launch failing this way stalled boot.
+    let fast = REPLIES
+        .with(reply.raw(), |object| {
+            object.fast_frame.as_ref().map(|frame| {
+                frame.caller_task_id == caller
+                    && frame.state != FastCallState::RequestReady
+                    && !(object.used || object.consumed)
+                    && object.scheduling_context.is_some_and(|held| held.caller_task_id() == caller)
+            })
+        })
+        .flatten();
+    if let Some(fast) = fast {
+        return fast;
+    }
     let Some(message_id) = REPLIES.with(reply.raw(), |object| object.message_id) else {
         return false;
     };
@@ -41,6 +59,54 @@ pub fn received_request_retains_custody(reply: KernelReplyHandle, caller: u64) -
                 && object.scheduling_context.is_some_and(|custody| custody.caller_task_id() == caller)
         }).unwrap_or(false)
     }).unwrap_or(false)
+}
+
+/// Read-only observation of a request still QUEUED on its endpoint with this
+/// caller's scheduling-context custody on the live reply. A refused directed
+/// handoff leaves such a request exactly where an enqueue with no parked
+/// receiver leaves it: the next receive takes it and binds that custody, so the
+/// caller waits for its reply instead of cancelling it. The check and the
+/// eventual take race only toward `received_request_retains_custody`.
+pub fn published_request_retains_custody(reply: KernelReplyHandle, caller: u64) -> bool {
+    let Some(message_id) = REPLIES.with(reply.raw(), |object| object.message_id) else {
+        return false;
+    };
+    ENDPOINT_MESSAGES.with(message_id, |message| {
+        message.reply_id == reply.raw() && message.caller_task_id == caller && message.published
+            // Bytes still present: queued, or received by a copying receive.
+            // A taking receive is `received_request_retains_custody`'s case.
+            && message.request.len() != 0
+    }).unwrap_or(false)
+        && REPLIES.with(reply.raw(), |object| {
+            object.message_id == message_id
+                && !(object.used || object.consumed)
+                && object.fast_frame.is_none()
+                && object.scheduling_context.is_some_and(|held| held.caller_task_id() == caller)
+        }).unwrap_or(false)
+}
+
+/// Failure-only evidence: which `received_request_retains_custody` condition
+/// held, one bit each (message found, identity, published, taken, reply joined,
+/// unused, unconsumed, not fast, custody caller). Never an authority.
+pub fn received_request_custody_conditions(reply: KernelReplyHandle, caller: u64) -> u16 {
+    let Some(message_id) = REPLIES.with(reply.raw(), |object| object.message_id) else {
+        return 0;
+    };
+    let message = ENDPOINT_MESSAGES.with(message_id, |message| {
+        (message.reply_id == reply.raw() && message.caller_task_id == caller,
+            message.published, message.request.is_empty())
+    });
+    let Some((identity, published, taken)) = message else {
+        return 0;
+    };
+    let reply_bits = REPLIES.with(reply.raw(), |object| {
+        u16::from(object.message_id == message_id) << 4
+            | u16::from(!object.used) << 5
+            | u16::from(!(object.consumed)) << 6
+            | u16::from(object.fast_frame.is_none()) << 7
+            | u16::from(object.scheduling_context.is_some_and(|c| c.caller_task_id() == caller)) << 8
+    }).unwrap_or(0);
+    1 | u16::from(identity) << 1 | u16::from(published) << 2 | u16::from(taken) << 3 | reply_bits
 }
 
 /// The receiver must arm its scheduler wait before calling with `may_wait`.

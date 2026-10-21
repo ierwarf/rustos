@@ -349,3 +349,91 @@ fn withdrawing_one_waiter_touches_only_its_own_endpoint() {
         );
     });
 }
+
+#[test]
+fn rollback_after_the_receiver_took_the_request_reports_receiver_ownership() {
+    // A refused handoff races a receiver that re-polled between its receive
+    // arm and block commit. Once it took the frame, rollback must fail and
+    // the caller must wait for the response: neither report the executing
+    // request as failed nor resend it through the slow path.
+    with_isolated_ipc_test(|| {
+        let endpoint = super::super::create_endpoint().expect("create endpoint");
+        super::super::add_endpoint_receiver_waiter(endpoint, 31).expect("park receiver");
+        let (reply, receiver) =
+            super::super::reserve_fast_endpoint_call(endpoint, 70, 7, b"op", None)
+                .expect("reserve fast frame");
+        assert!(!super::super::fast_endpoint_request_owned_by_receiver(reply, 7));
+        super::super::take_fast_endpoint_request(endpoint, receiver)
+            .expect("take")
+            .expect("published request");
+        assert!(super::super::fast_endpoint_request_owned_by_receiver(reply, 7));
+        assert!(!super::super::fast_endpoint_request_owned_by_receiver(reply, 8));
+        assert!(super::super::rollback_fast_endpoint_call(endpoint, reply, 7, receiver).is_err());
+        // The response still reaches the waiting caller.
+        super::super::complete_fast_endpoint_reply_for_task(reply, receiver, b"done")
+            .expect("receiver completes the executed request");
+        assert!(super::super::fast_endpoint_request_owned_by_receiver(reply, 7));
+    });
+}
+
+#[test]
+fn received_fast_request_retains_custody_until_its_response() {
+    // A refused call handoff races a receiver that took the fast frame on its
+    // own. The caller must keep waiting for that in-flight request instead of
+    // cancelling it as lost custody (a service launch died this way).
+    with_isolated_ipc_test(|| {
+        let endpoint = super::super::create_endpoint().expect("create endpoint");
+        super::super::add_endpoint_receiver_waiter(endpoint, 31).expect("park receiver");
+        let custody = super::test_scheduling_custody(7);
+        let (reply, receiver) =
+            super::super::reserve_fast_endpoint_call(endpoint, 70, 7, b"op", Some(custody))
+                .expect("reserve fast frame");
+        // Published but not yet taken: not a received request.
+        assert!(!super::super::received_request_retains_custody(reply, 7));
+        super::super::take_fast_endpoint_request(endpoint, receiver)
+            .expect("take")
+            .expect("published request");
+        assert!(super::super::received_request_retains_custody(reply, 7));
+        assert!(!super::super::received_request_retains_custody(reply, 8));
+        super::super::complete_fast_endpoint_reply_for_task(reply, receiver, b"done")
+            .expect("receiver completes the executed request");
+        // Answered: no longer a pending received request, but still the
+        // caller's to collect, which the receiver-ownership proof keeps.
+        assert!(!super::super::received_request_retains_custody(reply, 7));
+        assert!(super::super::fast_endpoint_request_owned_by_receiver(reply, 7));
+    });
+}
+
+#[test]
+fn queued_request_keeps_custody_from_publication_until_its_reply() {
+    // A refused directed handoff leaves the request queued with admitted
+    // custody, served by the next receive; it must not read as lost custody.
+    with_isolated_ipc_test(|| {
+        let endpoint = super::super::create_endpoint_for_process(10).expect("create endpoint");
+        let (uncustodied, _) = super::super::enqueue_endpoint_call(endpoint, 40, b"ordinary")
+            .expect("enqueue ordinary call without custody");
+        assert!(!super::super::published_request_retains_custody(uncustodied, 40));
+        let custody = super::test_scheduling_custody(41);
+        let (reply, _) = super::super::enqueue_endpoint_call_with_handles_priority_and_custody(
+            endpoint,
+            41,
+            b"request",
+            &[],
+            super::super::EndpointCallPriority::Ordinary,
+            custody,
+        )
+        .expect("enqueue call with custody");
+        assert!(super::super::published_request_retains_custody(reply, 41));
+        assert!(!super::super::published_request_retains_custody(reply, 42));
+        assert!(!super::super::received_request_retains_custody(reply, 41));
+        // `recv_endpoint` copies rather than takes the request bytes, so the
+        // taken-bytes proof cannot see this receive; the live-request proof
+        // still holds across it.
+        let _ = super::super::recv_endpoint(endpoint).expect("receive request");
+        assert!(super::super::published_request_retains_custody(reply, 41));
+        super::super::complete_endpoint_reply_for_process_with_custody(reply, 10, b"response")
+            .expect("complete reply with custody");
+        assert!(!super::super::published_request_retains_custody(reply, 41));
+        assert!(super::super::endpoint_reply_custody_returned(reply, 41));
+    });
+}

@@ -21,55 +21,81 @@
 //! or reused entry can only cost a bounded fallback. Reply custody resolves
 //! candidates under original identity/resource leaves, never a catalog guard.
 
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::runqueue;
 use super::{MAX_TASK, current_identity};
 use kernel_object::api::identity::ObjectIdentity;
 
-/// No slot is currently hinted for this residue class.
-const EMPTY: u8 = u8::MAX;
+/// Four-way set-associative `(task id, slot)` pairs, each packed in one word
+/// as `(id + 1) << 8 | slot` so a reader can never pair one task's id with
+/// another's slot; zero is an empty way. The previous direct-mapped byte per
+/// `id % MAX_TASK` silently aliased two live tasks with the same residue, and
+/// every lookup of the evicted one became a full resource-leaf walk.
+const WAYS: usize = 4;
+const SETS: usize = MAX_TASK;
+const _: () = assert!(SETS.is_power_of_two());
+const _: () = assert!(MAX_TASK <= u8::MAX as usize);
 
-/// One bucket per residue class of the monotonic task id. `MAX_TASK` is a
-/// power of two, so the index is a mask rather than a division.
-const _: () = assert!(MAX_TASK.is_power_of_two());
-const _: () = assert!(MAX_TASK < EMPTY as usize);
-
-static HINTS: [AtomicU8; MAX_TASK] = [const { AtomicU8::new(EMPTY) }; MAX_TASK];
+static HINTS: [AtomicU64; SETS * WAYS] = [const { AtomicU64::new(0) }; SETS * WAYS];
 
 #[inline]
-const fn bucket(task_id: u64) -> usize {
-    task_id as usize & (MAX_TASK - 1)
+fn set(task_id: u64) -> &'static [AtomicU64] {
+    let index = (task_id.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 32) as usize & (SETS - 1);
+    &HINTS[index * WAYS..(index + 1) * WAYS]
+}
+
+#[inline]
+fn tag(task_id: u64) -> u64 {
+    task_id.wrapping_add(1) << 8
 }
 
 /// The slot last observed to hold `task_id`, if any. Callers must revalidate.
 #[inline]
 pub(super) fn hint(task_id: u64) -> Option<usize> {
+    let tag = tag(task_id);
     // ORDERING: Relaxed is exact. The value is a hint that every caller
     // revalidates against authoritative identity before use, so no other
-    // memory is published through it.
-    let slot = usize::from(HINTS[bucket(task_id)].load(Ordering::Relaxed));
-    (slot < MAX_TASK).then_some(slot)
+    // memory is published through it; the packed word cannot tear.
+    set(task_id).iter().map(|way| way.load(Ordering::Relaxed))
+        .find(|&entry| entry != 0 && entry & !0xff == tag)
+        .map(|entry| (entry & 0xff) as usize)
+        .filter(|&slot| slot < MAX_TASK)
 }
 
 /// Records `slot` as the accelerator for `task_id`.
 #[inline]
 pub(super) fn record(task_id: u64, slot: usize) {
     let slot = u8::try_from(slot).expect("scheduler slot exceeds task hint capacity");
-    // ORDERING: see `hint`; repair is equally non-authoritative.
-    HINTS[bucket(task_id)].store(slot, Ordering::Relaxed);
+    let tag = tag(task_id);
+    let entry = tag | u64::from(slot);
+    let ways = set(task_id);
+    // ORDERING: see `hint`; repair is equally non-authoritative. Prefer this
+    // task's own way, then an empty one, then a way chosen by the id.
+    let way = ways.iter().find(|way| way.load(Ordering::Relaxed) & !0xff == tag)
+        .or_else(|| ways.iter().find(|way| way.load(Ordering::Relaxed) == 0))
+        .unwrap_or(&ways[task_id as usize % WAYS]);
+    way.store(entry, Ordering::Relaxed);
 }
 
 /// Forgets the accelerator for `task_id` after an authoritative miss.
 #[inline]
 pub(super) fn forget(task_id: u64) {
-    HINTS[bucket(task_id)].store(EMPTY, Ordering::Relaxed);
+    let tag = tag(task_id);
+    for way in set(task_id) {
+        let entry = way.load(Ordering::Relaxed);
+        if entry != 0 && entry & !0xff == tag {
+            // ORDERING: see `hint`. Only this exact entry is cleared; a racing
+            // record of another task keeps its own word.
+            let _ = way.compare_exchange(entry, 0, Ordering::Relaxed, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Clears every hint. Boot-time scheduler reset only.
 pub(super) fn reset() {
     for hint in &HINTS {
-        hint.store(EMPTY, Ordering::Relaxed);
+        hint.store(0, Ordering::Relaxed);
     }
 }
 
@@ -260,10 +286,11 @@ mod tests {
             Some(Some((0x901, resident)))
         );
 
-        // Same bucket, different task: the hint hits and the identity check is
-        // the only thing that can reject it.
-        assert_eq!(bucket(stranger), bucket(resident));
+        // A stale hint naming the resident's slot for a different task: the
+        // identity check is the only thing that can reject it.
+        record(stranger, slot);
         assert_eq!(live_slot(stranger), None);
+        forget(stranger);
         assert_eq!(published_user_log_ids(stranger), None);
 
         // A cleared slot leaves the hint behind and must still not answer.
@@ -273,16 +300,31 @@ mod tests {
     }
 
     #[test]
-    fn colliding_task_ids_share_one_bucket_and_never_alias_a_slot() {
+    fn colliding_task_ids_keep_their_own_slots_and_never_alias() {
         let _serial = serialized();
+        // Ids that shared the old direct-mapped residue each keep their own way.
         let first = 4_098;
         let second = first + MAX_TASK as u64;
-        assert_eq!(bucket(first), bucket(second));
         record(first, 3);
         record(second, 11);
-        // The loser reads the winner's slot, which is why every caller
-        // revalidates the exact task identity before using it.
-        assert_eq!(hint(first), Some(11));
+        assert_eq!(hint(first), Some(3));
+        assert_eq!(hint(second), Some(11));
+        // Forgetting one never clears or redirects the other.
         forget(first);
+        assert_eq!(hint(first), None);
+        assert_eq!(hint(second), Some(11));
+        forget(second);
+        // A full set evicts a way; an evicted id misses rather than aliasing.
+        let ids: [u64; WAYS + 1] = core::array::from_fn(|i| {
+            (0..).map(|n: u64| 9_000 + n).filter(|id| core::ptr::eq(set(*id), set(9_000)))
+                .nth(i).unwrap()
+        });
+        for (slot, id) in ids.iter().enumerate() {
+            record(*id, slot);
+        }
+        for (slot, id) in ids.iter().enumerate() {
+            assert!(hint(*id).is_none_or(|hinted| hinted == slot));
+            forget(*id);
+        }
     }
 }

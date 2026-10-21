@@ -245,9 +245,9 @@ fn publish(
         process_handle: Some(r.handle),
         process_id: Some(r.pid),
         user_stack: bootstrap.user_stack,
-        windows_thread_state: bootstrap.windows_thread_state.map(|mut state| {
-            state.thread_id = id;
-            state
+        windows_thread_state: bootstrap.windows_thread_state.map(|state| WindowsThreadIdentity {
+            thread_id: id,
+            teb_address: state.teb_address,
         }),
     };
     r.ticket().install_context(context);

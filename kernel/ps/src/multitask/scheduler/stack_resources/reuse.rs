@@ -51,7 +51,8 @@ pub(in crate::multitask::scheduler) fn recover_detached_fixture(slot: usize, id:
                 && r.process_pin.is_none()
                 && r.reservation.is_none()
                 && !r.frame_writing
-                && r.frame_readers == 0
+                // ORDERING: Acquire pairs with lock-free reader release.
+                && RESOURCES[slot].readers.load(Ordering::Acquire) == 0
         );
         key.phase = Phase::Detached;
         r.reclaim = Some(key);
@@ -76,7 +77,8 @@ fn begin_qualified(slot: usize, id: Option<u64>, retired: bool) -> Option<Reuse>
             if r.reclaim.is_some()
                 || r.reservation.is_some()
                 || r.frame_writing
-                || r.frame_readers != 0
+                // ORDERING: Acquire pairs with lock-free reader release.
+                || cell.readers.load(Ordering::Acquire) != 0
                 // ORDERING: acquire observes pin release under the exact resource/identity admission turn.
                 || cell.pins.load(Ordering::Acquire) != 0
                 || r.binding.map(|(uid, _)| uid) != id
@@ -150,7 +152,8 @@ impl Reuse {
                     && r.process_pin.is_none()
                     && r.reservation.is_none()
                     && !r.frame_writing
-                    && r.frame_readers == 0
+                    // ORDERING: Acquire pairs with lock-free reader release.
+                    && RESOURCES[self.slot].readers.load(Ordering::Acquire) == 0
             })
         })
         .expect("reclaim identity clear lacks exact drain receipt");
@@ -166,7 +169,8 @@ impl Reuse {
                         && r.process_pin.is_none()
                         && r.reservation.is_none()
                         && !r.frame_writing
-                        && r.frame_readers == 0
+                        // ORDERING: Acquire pairs with lock-free reader release.
+                        && RESOURCES[self.slot].readers.load(Ordering::Acquire) == 0
                         // ORDERING: acquire observes pin release under the exact resource/identity admission turn.
                         && RESOURCES[self.slot].pins.load(Ordering::Acquire) == 0,
                     "reclaim ACK preceded complete metadata drain"

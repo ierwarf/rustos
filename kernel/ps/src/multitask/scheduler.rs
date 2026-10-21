@@ -65,6 +65,7 @@ pub(super) mod retirement_cleanup;
 mod runqueue;
 mod terminal_quarantine;
 pub(super) mod wake_publication;
+pub(super) mod wake_retry;
 mod terminal_publication;
 pub(super) mod current_terminal;
 pub(super) mod current_observation;
@@ -82,6 +83,7 @@ mod task_wait;
 mod current_wait;
 pub(super) mod current_class;
 pub(in crate::multitask) mod current_return;
+pub(in crate::multitask) mod outgoing_image;
 mod dispatch_claim;
 mod task_weight;
 pub use runtime_profile::drain_scheduler_runtime_profile;
@@ -400,6 +402,18 @@ enum TaskRetireReason {
     Exited,
 }
 
+/// The part of a Windows thread's runtime state the scheduler needs after
+/// creation: its identity and TEB (the GS base). The TLS slot values are
+/// materialized into the TEB once and are never read back from here; holding
+/// them made every task context 528 bytes larger, and a context is copied on
+/// every wake binding.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct WindowsThreadIdentity {
+    thread_id: u64,
+    teb_address: u64,
+}
+
+
 #[derive(Clone, Copy)]
 struct TaskContext {
     scheduling_context: scheduling_context::SchedulingContext,
@@ -460,7 +474,7 @@ struct TaskContext {
     process_handle: Option<ProcessHandle>,
     process_id: Option<u64>,
     user_stack: Option<UserStackState>,
-    windows_thread_state: Option<WindowsThreadRuntimeState>,
+    windows_thread_state: Option<WindowsThreadIdentity>,
 }
 
 #[derive(Clone, Copy)]

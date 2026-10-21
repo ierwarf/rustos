@@ -1022,7 +1022,7 @@ kind = "transition-guard-removal"
 severity = "critical"
 model = "frame-reader-claim/FrameReaderClaim"
 flow = "scheduler-dispatch"
-find = '''    /\ admitted' = (readers = {} /\ ~writer /\ ~closing)'''
+find = '''    /\ admitted' = (readers = {"Selection"} /\ ~writer /\ ~closing)'''
 replace = '''    /\ admitted' = (TRUE /\ ~writer /\ ~closing)'''
 occurrence = 1
 invariant = "NoRunningDuringNonexecutingRead"

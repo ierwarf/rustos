@@ -34,7 +34,9 @@ use spin::{Mutex, MutexGuard};
 
 #[cfg(rustos_boot_image)] use super::cache_padded::CachePadded;
 
+mod cpu_counter;
 mod cpu_identity;
+mod guard_release;
 #[cfg(any(rustos_boot_image, test))]
 mod dependency_graph;
 #[cfg(test)]
@@ -283,6 +285,10 @@ pub struct TrackedSpinGuard<'a, T: ?Sized, const CLASS: u8> {
     acquire_line: u32,
     #[cfg(rustos_boot_image)]
     acquire_preemption_depth: usize,
+    /// Acquired through `lock_masked`: IRQs stay masked until release, so the
+    /// release knows IF without reading it.
+    #[cfg(rustos_boot_image)]
+    irqs_masked: bool,
 }
 
 /// An interrupt handler's entry into IRQ context.
@@ -319,9 +325,8 @@ pub fn enter_irq_context() -> IrqContextGuard {
         // inside the interrupted scope's delta.
         let cpu = cpu_identity::current_cpu_index_uncharged();
         let entry_identity_count = work_budget::identity_count_on(cpu);
-        // ORDERING: AcqRel publishes this CPU's IRQ nesting before any handler
-        // lock acquisition and pairs with the final AcqRel guard release.
-        let previous = CPU_LOCK_STATE[cpu].irq_context_depth.fetch_add(1, Ordering::AcqRel);
+        // ORDERING: CPU-private nesting; same-CPU program order publishes it.
+        let previous = cpu_counter::add_usize(&CPU_LOCK_STATE[cpu].irq_context_depth, 1);
         assert!(
             previous < MAX_HELD_LOCK_DEPTH,
             "interrupt-context nesting exceeded bound"
@@ -592,9 +597,8 @@ impl Drop for IrqContextGuard {
     fn drop(&mut self) {
         #[cfg(rustos_boot_image)]
         {
-            // ORDERING: AcqRel publishes the completed IRQ handler before the
-            // CPU-local nesting depth becomes observable as one level lower.
-            let previous = CPU_LOCK_STATE[self.cpu].irq_context_depth.fetch_sub(1, Ordering::AcqRel);
+            // ORDERING: CPU-private nesting; see the matching entry increment.
+            let previous = cpu_counter::dec(&CPU_LOCK_STATE[self.cpu].irq_context_depth);
             assert!(previous != 0, "interrupt-context depth underflow");
             // Every identity derivation this handler made belongs to the
             // handler, not to whatever it interrupted.
@@ -615,6 +619,28 @@ impl<T: ?Sized, const CLASS: u8> TrackedSpinLock<T, CLASS> {
     #[track_caller]
     pub fn lock(&self) -> TrackedSpinGuard<'_, T, CLASS> {
         #[cfg(rustos_boot_image)]
+        return self.lock_with(x86_64::instructions::interrupts::are_enabled());
+        #[cfg(not(rustos_boot_image))]
+        self.lock_with(false)
+    }
+
+    /// `lock` for a caller whose local IRQs are already masked. Reading IF is
+    /// a `pushf`, measured at seventeen TSC ticks in the guest, and an IRQ
+    /// leaf paid three of them per acquisition and release to rediscover it.
+    ///
+    /// # Safety
+    /// Local interrupts are disabled now and stay disabled until the returned
+    /// guard is dropped (an `IrqLeaf` mask or an enclosing masked closure).
+    #[track_caller]
+    pub unsafe fn lock_masked(&self) -> TrackedSpinGuard<'_, T, CLASS> {
+        self.lock_with(false)
+    }
+
+    #[track_caller]
+    fn lock_with(&self, irq_enabled: bool) -> TrackedSpinGuard<'_, T, CLASS> {
+        #[cfg(not(rustos_boot_image))]
+        let _ = irq_enabled;
+        #[cfg(rustos_boot_image)]
         let acquire_site = Location::caller();
         #[cfg(not(rustos_boot_image))]
         let acquire_site = ();
@@ -622,13 +648,16 @@ impl<T: ?Sized, const CLASS: u8> TrackedSpinLock<T, CLASS> {
         // derived here is stable until release -- the invariant the release
         // admissibility check independently confirms. Deriving it once is what
         // keeps the acquire cheap.
+        // IF is read once by the caller and threaded through every masked step
+        // below; each step used to read it again with its own `pushf`.
         #[cfg(rustos_boot_image)]
-        let acquire_cpu = disable_preemption();
+        let acquire_cpu = preemption::disable_preemption_with(irq_enabled);
         #[cfg(rustos_boot_image)]
         work_budget::charge_acquire_for_class::<CLASS>(acquire_cpu);
         let profile_entry = lock_profile::now();
         #[cfg(rustos_boot_image)]
-        let pending = before_acquire_with_irq_tracking(acquire_cpu, CLASS, acquire_site, true);
+        let pending =
+            before_acquire_with_irq_tracking(acquire_cpu, CLASS, acquire_site, true, irq_enabled);
         #[cfg(not(rustos_boot_image))]
         let pending = before_acquire(CLASS, acquire_site);
         let profile_checked =
@@ -679,9 +708,9 @@ impl<T: ?Sized, const CLASS: u8> TrackedSpinLock<T, CLASS> {
         let guard = self.inner.lock();
         let profile_taken = lock_profile::charge(lock_profile::LockPhase::Spin, profile_checked);
         #[cfg(rustos_boot_image)]
-        let owner_apic_id = x86_64::instructions::interrupts::without_interrupts(|| {
+        let owner_apic_id = preemption::masked(irq_enabled, || {
             after_acquire_on(acquire_cpu, pending);
-            cpu_identity::apic_id_for_index(acquire_cpu)
+            cpu_identity::guard_apic_id(acquire_cpu)
         });
         #[cfg(not(rustos_boot_image))]
         after_acquire(pending);
@@ -704,6 +733,8 @@ impl<T: ?Sized, const CLASS: u8> TrackedSpinLock<T, CLASS> {
             // before the depth this guard must match on release is recorded.
             #[cfg(rustos_boot_image)]
             acquire_preemption_depth: CPU_LOCK_STATE[acquire_cpu].preempt_disable_depth.load(Ordering::Acquire),
+            #[cfg(rustos_boot_image)]
+            irqs_masked: !irq_enabled,
         }
     }
 
@@ -732,6 +763,8 @@ impl<T: ?Sized, const CLASS: u8> TrackedSpinLock<T, CLASS> {
                 acquire_line: acquire_site.line(),
                 #[cfg(rustos_boot_image)]
                 acquire_preemption_depth: preemption_depth(),
+                #[cfg(rustos_boot_image)]
+                irqs_masked: false,
             })
         } else {
             #[cfg(rustos_boot_image)]
@@ -788,7 +821,8 @@ impl<T: ?Sized, const CLASS: u8> TrackedSpinLock<T, CLASS> {
             let acquire_cpu = disable_preemption();
             work_budget::charge_acquire_for_class::<CLASS>(acquire_cpu);
             let pending =
-                before_acquire_with_irq_tracking(acquire_cpu, CLASS, acquire_site, !irq_context);
+                before_acquire_with_irq_tracking(acquire_cpu, CLASS, acquire_site, !irq_context,
+                    x86_64::instructions::interrupts::are_enabled());
             loop {
                 while self.inner.is_locked() {
                     if timed_out() {
@@ -806,6 +840,8 @@ impl<T: ?Sized, const CLASS: u8> TrackedSpinLock<T, CLASS> {
                         acquire_file: acquire_site.file(),
                         acquire_line: acquire_site.line(),
                         acquire_preemption_depth: preemption_depth(),
+                        #[cfg(rustos_boot_image)]
+                        irqs_masked: false,
                     });
                 }
                 if timed_out() {
@@ -845,81 +881,6 @@ impl<T: ?Sized, const CLASS: u8> DerefMut for TrackedSpinGuard<'_, T, CLASS> {
         self.guard
             .as_deref_mut()
             .expect("tracked spin guard missing before drop")
-    }
-}
-
-impl<T: ?Sized, const CLASS: u8> Drop for TrackedSpinGuard<'_, T, CLASS> {
-    fn drop(&mut self) {
-        let profile_entry = lock_profile::now();
-        #[cfg(rustos_boot_image)]
-        {
-            x86_64::instructions::interrupts::without_interrupts(|| {
-                let profile_masked = lock_profile::now();
-                // Interrupts are masked for this whole block, so the logical
-                // index cannot change inside it. Deriving it once and passing
-                // it down is what makes the release cheap: the identity step
-                // used to derive the same answer six times, and the actual
-                // lock-word handoff below is thirty-six cycles.
-                let release_cpu = current_cpu_index();
-                let release_apic_id = cpu_identity::apic_id_for_index(release_cpu);
-                // ORDERING: Acquire observes completed guard/pending
-                // transitions before the release admissibility comparison.
-                let depth = CPU_LOCK_STATE[release_cpu].preempt_disable_depth.load(Ordering::Acquire);
-                let admissible = guard_release_is_admissible(
-                    self.owner_cpu,
-                    self.owner_apic_id,
-                    release_cpu,
-                    release_apic_id,
-                    depth,
-                ) && depth == self.acquire_preemption_depth;
-                if !admissible {
-                    raw_diag::write_guard_release_marker(
-                        CLASS,
-                        self.owner_cpu,
-                        release_cpu,
-                        self.owner_apic_id,
-                        release_apic_id,
-                        self.acquire_preemption_depth,
-                        depth,
-                        with_current_stack_on(release_cpu, |stack| stack.len),
-                    );
-                    panic!(
-                        "raw-spin guard release invariant class={} acquired_at={}:{} owner_cpu={} owner_apic={:#x} release_cpu={} release_apic={:#x} acquire_depth={} release_depth={} held_depth={} top_class={:?}",
-                        CLASS,
-                        self.acquire_file,
-                        self.acquire_line,
-                        self.owner_cpu,
-                        self.owner_apic_id,
-                        release_cpu,
-                        release_apic_id,
-                        self.acquire_preemption_depth,
-                        depth,
-                        with_current_stack_on(release_cpu, |stack| stack.len),
-                        with_current_stack_on(release_cpu, |stack| stack
-                            .len
-                            .checked_sub(1)
-                            .map(|index| stack.classes[index]))
-                    );
-                }
-                let profile_checked =
-                    lock_profile::charge(lock_profile::LockPhase::ReleaseIdentity, profile_masked);
-                drop(self.guard.take());
-                let profile_unlocked =
-                    lock_profile::charge(lock_profile::LockPhase::ReleaseUnlock, profile_checked);
-                release_on(release_cpu, CLASS);
-                let profile_popped =
-                    lock_profile::charge(lock_profile::LockPhase::ReleaseStack, profile_unlocked);
-                enable_preemption_on(release_cpu, CLASS);
-                lock_profile::charge(lock_profile::LockPhase::ReleaseEnable, profile_popped);
-            });
-        }
-        #[cfg(not(rustos_boot_image))]
-        {
-            drop(self.guard.take());
-            release(CLASS);
-            let _ = (self.owner_cpu, self.owner_apic_id);
-        }
-        lock_profile::charge(lock_profile::LockPhase::Release, profile_entry);
     }
 }
 
@@ -1046,7 +1007,8 @@ fn before_acquire(class: u8, acquire_site: &'static Location<'static>) -> Pendin
     let cpu = current_cpu_index();
     let class_index = validate_class(class);
     work_budget::charge_acquire(cpu, class_index);
-    before_acquire_with_irq_tracking(cpu, class, acquire_site, true)
+    before_acquire_with_irq_tracking(cpu, class, acquire_site, true,
+        x86_64::instructions::interrupts::are_enabled())
 }
 
 #[cfg(rustos_boot_image)]
@@ -1057,6 +1019,7 @@ fn before_acquire_with_irq_tracking(
     class: u8,
     acquire_site: &'static Location<'static>,
     track_irq_usage: bool,
+    irq_enabled: bool,
 ) -> PendingAcquire {
     // `cpu` was derived once by the caller and is stable for the guard's whole
     // lifetime; everything below takes it as an argument, and `record_irq_usage`
@@ -1068,7 +1031,7 @@ fn before_acquire_with_irq_tracking(
     work_budget::charge_site(class_index, acquire_site);
     let profile_entry = lock_profile::now();
     if track_irq_usage {
-        record_irq_usage(cpu, class_index, acquire_site);
+        record_irq_usage(cpu, class_index, acquire_site, irq_enabled);
     }
     let profile_irq = lock_profile::charge(lock_profile::LockPhase::BeforeIrqUsage, profile_entry);
     // ORDERING: Acquire observes the CPU-local entry/release transition before
@@ -1168,7 +1131,7 @@ fn after_acquire_on(cpu: usize, pending: PendingAcquire) {
             stack.classes[stack.len] = pending.class;
             stack.len += 1;
         });
-        let previous = CPU_LOCK_STATE[cpu].preempt_pending_depth.fetch_sub(1, Ordering::Relaxed);
+        let previous = cpu_counter::dec(&CPU_LOCK_STATE[cpu].preempt_pending_depth);
         assert!(previous != 0, "raw-spin pending-acquire depth underflow");
     }
 }

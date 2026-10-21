@@ -132,7 +132,7 @@ ordered(choose, ['dispatch_policy::atomic_activation_pending(cpu)',
     'synchronous(cpu)', 'result => return result',
     'local_dispatch::retry_incomplete_policy(|| local_dispatch::choose_overdue_system(',
     'runqueue::local_runnable_sequence(cpu)', 'donation_ledger::class_publication_sequence()',
-    'slot, id, generation', 'Err(_) => return Decision::Incomplete',
+    'selected_candidate(slot, cpu, id, generation', 'Err(_) => return Decision::Incomplete',
     'first_turn(turn, cpu, false, class_sequence)', 'latency(cpu)'], 'complete early priority')
 ordered(choose, ['local_dispatch::user_reservation_due(cpu)',
     'let class_sequence = donation_ledger::class_publication_sequence()',
@@ -143,10 +143,12 @@ ordered(choose, ['local_dispatch::user_reservation_due(cpu)',
     'return Decision::Incomplete', 'Ok(local_dispatch::LocalClass::User) => return Decision::Selected(candidate)',
     'Err(_) => return Decision::Incomplete', 'match hint(cpu, current)',
     'match retry_fair(cpu, current, voluntary, runtime)'], 'due User reservation')
-ordered(body(dispatch, 'fair'), ['local_dispatch::choose_local_next(',
+ordered(body(dispatch, 'fair'), ['local_dispatch::choose_local_next_with(',
     'runqueue::local_runnable_sequence(cpu)', 'donation_ledger::class_publication_sequence()',
+    'local_candidate(slot, cpu, Urgency::Fair)', 'selected = Some(candidate)',
     'Ok((slot, generation))', 'current_identity::read_dispatch(slot)',
-    'Candidate { slot, id, generation'], 'complete generation-bound fair observation')
+    'candidate.slot != slot || candidate.generation != generation',
+    'Ok(Some(candidate))'], 'fair winner retains its exact original physical loan')
 ordered(body(dispatch, 'retry_fair'), ['local_dispatch::retry_incomplete_policy(|| fair('],
     'shared bounded fair retry')
 ordered(body(dispatch, 'dispatch'), ['turn.begin_priority_choice()',
@@ -164,7 +166,7 @@ local = (base / 'local_dispatch.rs').read_text()
 for name, final_token in [('candidate_is_qualified', 'token_is_current'),
         ('direct_handoff_frame_generation', 'direct_handoff_token_is_current')]:
     selected = body(local, name)
-    ordered(selected, ['pin_allocation(frame)', 'frame_readers::acquire(&_allocation_pin, cpu)',
+    ordered(selected, ['frame_publication::read_allocation(frame, cpu)',
         'validate_published_saved_context(', final_token + '(frame, cpu)'],
         'native and production original selection reader: ' + name)
     if '#[cfg' in selected or 'cfg!' in selected:
@@ -236,19 +238,22 @@ ordered(body(dispatch, 'materialize'), ['record.claim_generation()',
     'materialize_direct_handoff_with_generation(record.slot()', 'Some(generation)'],
     'consumed Direct refusal')
 ordered(body(dispatch, 'synchronous'), ['record.has_current_dispatch_custody()',
-    'local_dispatch::qualified_direct_handoff_generation(',
-    'record.bound_direct_generation().is_some_and(|expected| expected != g)',
-    'record.bind_selected_local_owner(runqueue::owner(record.slot()), cpu)',
-    'record.claim_generation()', 'id: record.task_id(), generation'],
-    'exact Direct FIFO selection')
-ordered(body(dispatch, 'claim'), ['frame_publication::direct_handoff_frame_token(',
-    'DispatchFrame::capture_selected(', 'candidate.id', 'candidate.generation',
+    'local_dispatch::published_candidate_admission(',
+    'record.bound_direct_generation().unwrap_or_else',
+    'selected_candidate(slot, cpu, record.task_id(), generation, custody',
+    'selected = Some(candidate)', 'record.bind_selected_local_owner(runqueue::owner(record.slot()), cpu)',
+    'record.slot() == candidate.slot && record.task_id() == candidate.id',
+    'record.claim_generation() == Some(candidate.generation)'],
+    'exact Direct FIFO selection retains its original physical reader')
+ordered(body(dispatch, 'claim'), ['candidate.frame.saved_rsp()',
+    'DispatchFrame::from_selection(outgoing.original_turn(), candidate.frame, class_sequence)',
     'FrameCapture::Ready(frame) => frame.prepare().is_some_and(|funded| funded.claim())',
     'materialize_direct_handoff_with_generation(candidate.slot', 'Some(candidate.generation)'],
     'exact Direct original physical claim')
 sync = (base / 'sync_handoff.rs').read_text()
-sync_consumer = body(sync[sync.index("/// Consumes this CPU's FIFO"):], 'take_next_ready')
-ordered(sync_consumer, ['SYNC_HANDOFF_STREAK[cpu]', 'for attempt in 0..MAX_TASK',
+sync_consumer = body(sync[sync.index("/// Consumes this CPU's FIFO"):], 'take_next_ready_with')
+ordered(sync_consumer, ['SYNC_HANDOFF_BUDGET[cpu].streak', '>= MAX_SYNC_HANDOFF_CHAIN_TICKS',
+    '&& fair_competitor_ready()', 'for attempt in 0..MAX_TASK',
     'let taken = {', 'state_for_cpu(cpu).lock()',
     'take_next_ready_record_with_competitor(false, |_| true)',
     'if state.len == 0', 'pending.store(false,', 'taken\n        };',
@@ -304,7 +309,7 @@ ordered(body(entry, 'from_scope'), ['scope.is_masked()', 'scheduler_initialized(
     'cpu_task_slot_admitted(cpu)', 'CURRENT_TASK_SLOTS[cpu].load(Ordering::Acquire)',
     'dispatch_turn::begin(scope, from)', 'turn.original_current().is_some()',
     'deferred_wake::take_masked(entry.preemption())'], 'original IRQ admission and own deferred mailbox')
-ordered(body(entry, 'dispatch'), ['self.save_simd()', 'CurrentReturn::capture(self.turn())',
+ordered(body(entry, 'dispatch'), ['self.save_simd()', 'CurrentReturn::capture_dispatch(self.turn())',
     'dispatcher::fast(&mut outgoing', 'dispatcher::dispatch(&mut outgoing'],
     'one original Current SIMD and failed fast fallback')
 ordered(body(entry, 'accept_installed_return'), ['turn.architecture_ready()',
@@ -387,12 +392,12 @@ ordered(body(producer, 'call_before_arm_observing'), [
     'last_effect.take().unwrap()()', 'inherited: false, woke: false, hinted: false',
     'before_receive()', 'wake_publication::receive_call(receiver, endpoint,'],
     'withdrawn receive retains only exact original queued custody, never grants worker execution')
-ordered(body(producer, 'publish_with'), ['frame_readers::acquire(&pin, cpu)',
+ordered(body(producer, 'publish_with'), ['frame_publication::read_for_identity(token, binding.id(), cpu)',
     'Publication::begin(scope, target)', 'sync_handoff::publish_original(',
     'typed.publish_and_clear(', 'claim_blocked_handoff(slot, expected, target, local)',
     'bind_local_owner_generation(slot, original.generation)',
     'publish_handoff_mailbox(slot, original,', 'last_effect()',
-    'drop(publication)', 'drop(reader)', 'drop(pin)'], 'reader/phase/FIFO through pager floor')
+    'drop(publication)', 'drop(reader)'], 'reader/phase/FIFO through pager floor')
 architecture = (base / 'return_architecture.rs').read_text()
 if "current: &'a super::CurrentWait" not in architecture or "scope: &'a" not in architecture:
     raise SystemExit('resumed architecture lost borrowed original Current/mask')
@@ -443,7 +448,7 @@ ordered(body(cpu_source, 'commit_context_switch_at_rsp'), ['dispatch_turn::begin
     'commit.finish()'], 'checked actual RSP precedes both original bank ACKs and reopening')
 rsp_handoff = (base / 'rsp_handoff.rs').read_text()
 ordered(body(rsp_handoff, 'capture'), ['turn.original_current()', 'turn.claimed_return()',
-    'frame_publication::return_view(from)', 'current_return_binding(cpu, from, old)',
+    'turn.outgoing_image()', 'old.cpu == cpu && old.slot == from',
     'owns_prepared(cpu, to)', 'receipt.token.saved_rsp', 'receipt.token.view'],
     'RSP seal borrows original outgoing and claimed incoming allocation geometry')
 ordered(body(rsp_handoff, 'assert_arrived'), ['self.cpu == cpu', 'self.incoming.contains(rsp)',
@@ -453,19 +458,48 @@ ordered(body(rsp_handoff, 'assert_arrived'), ['self.cpu == cpu', 'self.incoming.
 ordered(publication, ['let handoff = RspHandoff::capture(&self)', '*bank = Some(handoff)',
     'execution_interval::finish_return(&self, to)', 'self.seal()', 'publication.publish_before_return()'],
     'original producer seals geometry before publication and bank transfer')
+# A post-producer image is frozen once, not an IRQ-entry TaskContext cache.
+outgoing_image = (base / 'outgoing_image.rs').read_text()
+ordered(body(outgoing_image, 'capture'), ['owns_current(cpu, slot)',
+    'compare_exchange(false, true', 'let freeze = Freeze(slot)', 'return_view(slot)?',
+    'capture_outgoing_image(cpu, slot, view)?', '_freeze: freeze'], 'original image freeze and joined admission')
+ordered(body(turn_source, 'outgoing_image'), ['self.original_current()?', 'is_none()',
+    'OriginalOutgoingImage::capture(cpu, slot)?', '*self.outgoing_image.get() = Some(image)',
+    'image.get() }.as_ref()'], 'original turn retains one non-Copy image')
+ordered(body(turn_source[turn_source.index("impl<'a> CpuDispatchTurn"):], 'finish'), ['drop(self.outgoing_image.get_mut().take())',
+    'if changed', 'drop(self.preemption.take())'], 'image fence releases before IRQ restoration')
+ordered(body(architecture, 'original'), ['turn.outgoing_image()?.architecture'], 'original comparison uses retained image')
+for path, functions in [('runqueue/address_space.rs', ['replace', 'clear']),
+                        ('runqueue/simd_tls.rs', ['set_tls_fs_base', 'clear_tls_fs_base'])]:
+    text = (base / path).read_text()
+    for function in functions:
+        ordered(body(text, function), ['outgoing_image::assert_mutable(slot)', '.store('],
+            f'{function} cannot mutate frozen outgoing image')
+if 'outgoing_image::frozen(slot)' not in body((base / 'terminal_publication.rs').read_text(), 'quiescent'):
+    raise SystemExit('terminal finalization bypasses frozen outgoing image')
 # Joint final admission is not the earlier independent funding observation.
 # Each leaf borrows the SAME non-Copy grant; all leaves end before CPU banks.
 ordered(body(dispatch, 'dispatch'), ['prologue(outgoing, rsp, voluntary)',
     'let class_sequence = donation_ledger::class_publication_sequence()',
     'match choose(', 'class_sequence)', 'claim(outgoing, candidate, class_sequence)'],
     'original preselection class through claim')
-ordered(body(dispatch, 'first_turn'), ['DispatchFrame::capture_selected(',
-    'FrameCustody::Local, class_sequence)', 'funded.claim()',
+ordered(body(dispatch, 'first_turn'), ['DispatchFrame::from_selection(turn, candidate.frame, class_sequence)',
+    'funded.claim()',
     'policy.atomic_activation_pick_hints.pop()'], 'first-turn original class before FIFO pop')
-ordered(body(claim, 'capture_selected'), ['class_sequence: u64',
-    'frame_publication::pin_for_identity(token, id)', 'frame_readers::acquire(&pin, cpu)',
-    'drop(reader)', 'FrameCapture::Ready(Self', 'class_sequence,', 'pin,'],
-    'original class observation qualified by original physical frame')
+selection_image = claim[:claim.index("pub(super) struct DispatchFrame")]
+ordered(body(selection_image, 'capture'), ['selected_local_frame_identity(',
+    'id != expected_id', 'frame_publication::read_for_identity(token, id, cpu)',
+    'reader.owned_canary_intact()', 'validate_published_saved_context(',
+    'DispatchFrame::token_current(token, cpu, custody)', 'validation.map_err(Invalid)?',
+    'return_to_user, reader'], 'selected original pin/reader and live allocated header')
+ordered(body(claim, 'from_selection'), ['class_sequence: u64', 'turn.original_current()',
+    'cpu != selection.cpu', 'Self::token_current(selection.token, cpu, selection.custody)',
+    'FrameSelection { cpu, id, token, custody, return_to_user, reader } = selection',
+    'FrameCapture::Ready(Self', 'class_sequence, reader'],
+    'original selected reader and class observation move into final physical frame')
+for forbidden in ('read_for_identity(', 'pin_allocation(', 'into_pin()', 'validate_published_saved_context('):
+    if forbidden in body(claim, 'from_selection'):
+        raise SystemExit('selection consumption re-admitted or discarded original custody: ' + forbidden)
 ordered(body(claim, 'with_admission'), ['runqueue::is_idle_slot(self.token.slot)',
     'if funding.is_some() { return None; }', 'return claim()', 'with_class_claim(self.class_sequence,',
     'match funding', 'Some(pin) => pin.with_dispatch_admission(self.cpu,', 'None => claim()'],
@@ -493,20 +527,34 @@ ordered(body(runtime, 'with_dispatch_admission'), ['with_published_budget_pair(s
     'original pinned budget admission and claim in SAME leaf callback')
 queue_claim = (base / 'runqueue/claim.rs').read_text()
 ordered(body(queue_claim, 'claim_dispatch_inner'), ['RunOwnerState::DirectHandoff',
-    'admitted_claim(frame, funding,', 'with_claim_activation(slot, cpu,',
+    'admitted_claim(frame, funding,', 'with_claim_activation_for_reader(slot, cpu,',
+    'frame.map(|frame| frame.original_reader())',
     'frame.is_current()', 'compare_exchange(owner, owner.next(',
     'retain_mm_activation(cpu, activation)', 'RUN_QUEUES[cpu].inner.lock()',
-    'admitted_claim(frame, funding,', 'with_claim_activation(slot, cpu,',
+    'admitted_claim(frame, funding,', 'with_claim_activation_for_reader(slot, cpu,',
+    'frame.map(|frame| frame.original_reader())',
     'frame.is_current()', 'compare_exchange(owner, next)', 'drop(rq)',
     'retain_mm_activation(cpu, activation)'], 'rq40 before admission and exact CAS before bank publication')
 frame_readers = (base / 'stack_resources/frame_readers.rs').read_text()
-ordered(body(frame_readers, 'with_claim_activation'), [
+ordered(body(frame, 'read_for_identity'), ['frame_readers::pin_and_acquire(',
+    'recheck_pin_epoch(token)?', 'Some(reader)'], 'owned physical reader revalidates original epoch')
+owned_admission = body(frame_readers, 'pin_and_acquire')
+ordered(owned_admission, ['caller_irq_state(cpu)?', 'cell.with(|resources|',
+    'cell.pin_locked(resources, task_id, view)', 'pin = Some(StackPin { slot })',
+    'register(cell, resources, slot, cpu, caller_irq_disabled)',
+    'Some(PinnedFrameReader'], 'single original physical pin and reader admission')
+if owned_admission.count('cell.with(') != 1:
+    raise SystemExit('combined physical reader reopened its resource leaf')
+ordered(frame_readers, ['struct PinnedFrameReader', 'registration: ReaderRegistration',
+    'pin: StackPin', 'fn into_pin(self)', 'drop(registration)', 'pin\n'],
+    'owned reader drops exclusion before backing or retains exact backing')
+ordered(body(frame_readers, 'with_claim_activation_for_reader'), [
     'execution::with_claim', 'RESOURCES.get(slot)?', 'activation::capture',
     'affinity_payload::with_placement_admission', 'Some((claimed, activation))',
     'Some((None, activation)) => Some(ClaimAttempt::Refused { activation, permit })',
     'None => Some(ClaimAttempt::Refused { activation: None, permit })'],
     'original refused MM/UID loans leave admission callback without Drop')
-if 'drop(' in body(frame_readers, 'with_claim_activation'):
+if 'drop(' in body(frame_readers, 'with_claim_activation_for_reader'):
     raise SystemExit('provisional refusal Drop regained enclosing admission leaves')
 ordered(body(queue_claim, 'claim_dispatch_inner'), [
     'admitted_claim(frame, funding,', '.and_then(|attempt| attempt.into_claimed())',
@@ -644,11 +692,11 @@ ordered(irq_leaf, ["pub(super) struct Guard<'a, T, const CLASS: u8>",
     'PhantomData<*mut ()>'], 'raw guard drops before original IRQ mask, non-migratable lifetime')
 ordered(body(irq_leaf, 'enter'), ['let restore = enabled()', 'disable()', 'Self { restore'],
     'IRQ mask before raw acquisition without another dispatch unit')
-ordered(body(irq_leaf, 'lock'), ['let mask = Mask::enter()', 'self.inner.lock()',
+ordered(body(irq_leaf, 'lock'), ['let mask = Mask::enter()', 'self.inner.lock_masked()',
     'Guard { inner, _mask: mask }'], 'unchanged ranked raw acquisition retains mask')
 ordered(body(irq_leaf, 'try_lock'), ['let mask = Mask::enter()', 'self.inner.try_lock()?',
     'Some(Guard { inner, _mask: mask })'], 'failed try restores only original mask')
-for leaf_path in ['retirement_cleanup.rs', 'thread_creation/work.rs', 'scheduling_runtime.rs',
+for leaf_path in ['retirement_cleanup/busy.rs', 'thread_creation/work.rs', 'scheduling_runtime.rs',
         'donation_ledger.rs', 'runqueue.rs', 'sync_handoff.rs', 'dispatch_policy.rs',
         'runqueue/affinity_payload.rs', 'runqueue/wait/epoch.rs', 'runtime_profile/owner.rs',
         'linux_thread_state.rs', 'execution_interval.rs']:

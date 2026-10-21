@@ -116,14 +116,25 @@ fn process_in(scope: &DispatchPreemption<'_>, pid: u64) -> Option<u64> {
     // binding pins the task, and doing that for every slot on every call
     // with no parked receiver cost ~150k cycles. The captured binding's exact
     // process id below remains the authority.
-    let target = (0..MAX_TASK).filter(|&slot| {
-        super::super::current_identity::read_dispatch(slot)
-            .is_some_and(|publication| publication.process_id == Some(pid))
-    }).filter_map(|slot| {
+    let published = |slot: usize| super::super::current_identity::read_dispatch(slot)
+        .is_some_and(|publication| publication.process_id == Some(pid));
+    let capture = |slot: usize| {
         let id = stack_resources::task_start::read(slot)?.id;
         let target = Target::from_binding(wake_publication::Binding::capture(slot, id)?)?;
         (target.binding.context().process_id == Some(pid)).then_some(target)
-    }).min_by_key(|target| (runqueue::vruntime(target.binding.slot()), target.binding.slot()))?;
+    };
+    // Rank on the advisory publication first and pin only the winner: each
+    // pinned candidate copied a full task context twice, on every call. When
+    // the winner cannot be pinned, fall back to pinning every candidate.
+    let key = |slot: usize| (runqueue::vruntime(slot), slot);
+    let target = match (0..MAX_TASK).filter(|&slot| published(slot)).min_by_key(|&slot| key(slot)) {
+        Some(slot) => match capture(slot) {
+            Some(target) => target,
+            None => (0..MAX_TASK).filter(|&slot| published(slot)).filter_map(capture)
+                .min_by_key(|target| key(target.binding.slot()))?,
+        },
+        None => return None,
+    };
     let current = current_terminal::OriginalCurrent::borrow(scope);
     let _publication = dispatch_priority::Publication::begin(scope, target.cpu);
     if !target.ready() { return None; }

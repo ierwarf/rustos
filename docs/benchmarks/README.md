@@ -75,6 +75,34 @@ Those two layers are tightly bounded; they do **not** prove where the
 remaining ~93% goes — treating that residue as "the scheduler" is an
 inference the in-kernel phase profile below refutes.
 
+## Raw tail evidence
+
+Each sample-backed result also reports p99.9, p99.99, strict counts above
+80,000 / 1,000,000 / 10,000,000 raw TSC ticks, and the fraction of total
+elapsed time in the slowest `ceil(N/100)` samples. Quantiles use the existing
+`floor(N*q)` index capped at `N-1`; 20,000 samples leave only about 20 samples
+at p99.9 and two at p99.99. Repeat complete runs, report every maximum, and
+never trim outliers or substitute a minimum for a worst-case result.
+
+The two intra-process round trips retain the eight worst **same-request**
+records, with sequence, start/end TSC and paired call-to-receive / server-body /
+reply-to-return spans. Independent leg percentiles cannot reconstruct a slow
+round trip. An unpaired outlier stays in the complete distribution and worst
+set, labelled unpaired rather than assigned invented leg times. A slow leg
+locates wall time, not its cause: guest queue/budget waits, IRQ work and host
+vCPU descheduling need separate evidence. CPUID tails are a host-exit control,
+not proof that an IPC outlier had the same cause.
+
+Tail collection adds no clock read or syscall inside the timed call. The
+bounded top-eight update runs between requests; keep the same measurement
+infrastructure on both sides of an A/B comparison because pacing can still
+change. Extra text is buffered until all probes finish, before the end marker,
+so diagnostic printing cannot contaminate the next probe. The host validates
+versions, sample counts, quantile order, duplicate identity, exact maximum and
+paired sums. Legacy logs without tail records remain readable but do not
+acquire fabricated tail evidence. `tail/` and `worst/` table prefixes keep the
+new rows out of legacy baseline-minimum parsing.
+
 ## The in-kernel phase profile
 
 `cargo xtask bench` decodes the `ipc-call-phase-*`, `usermem-phase-*`, and

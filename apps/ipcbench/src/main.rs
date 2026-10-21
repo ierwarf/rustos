@@ -25,6 +25,7 @@ mod components;
 mod cow_probe;
 mod ipc_probes;
 mod scheduling_context_probe;
+mod tails;
 use cow_probe::probe_fork_cow_private_write;
 
 const SYS_LINUX_GETPID: u64 = 39;
@@ -286,6 +287,7 @@ struct Stats {
     p99: u64,
     max: u64,
     mean: u64,
+    tail: tails::Summary,
 }
 
 fn summarize(samples: &mut [u64]) -> Stats {
@@ -301,10 +303,12 @@ fn summarize(samples: &mut [u64]) -> Stats {
         p99: pick(99),
         max: samples[len - 1],
         mean: (sum / len as u128) as u64,
+        tail: tails::Summary::from_sorted(samples),
     }
 }
 
 fn report(name: &str, stats: &Stats, tsc_khz: u64) {
+    stats.tail.defer(name, stats.iters);
     let ns = |cycles: u64| -> u64 {
         if tsc_khz == 0 {
             0
@@ -1222,5 +1226,6 @@ fn main() {
         None => run_all_probes(tsc_khz),
     }
 
+    tails::flush();
     debug_line("ipcbench: end");
 }

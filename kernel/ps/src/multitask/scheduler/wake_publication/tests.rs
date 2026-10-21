@@ -246,8 +246,12 @@ fn actual_generic_deadline_wake_admits_original_kernel_wait_without_user_reclass
         runqueue::wait::set_blocked(kernel, true);
         runqueue::wait::set_reason(kernel, runqueue::wait::REASON_GENERIC, 0);
         let before = runqueue::owner(kernel);
+        let queued = super::super::wake_retry::pending_on(&scope);
         assert!(!wake_user_in(&scope, kernel_id, &|_| 1));
         assert_eq!(runqueue::owner(kernel), before);
+        // A user-qualified refusal of a kernel wait records no retry: the
+        // retry path must never widen user-wake authority to kernel waits.
+        assert_eq!(super::super::wake_retry::pending_on(&scope), queued);
         // SAME born kernel allocation/identity/frame, not a manufactured user
         // identity or permission to skip frame/queue/physical-bank validation.
         assert!(wake(&scope, kernel_id, &|_| 1));

@@ -56,6 +56,25 @@ close new admission while this original bank still lends its old binding; no
 fresh post-stop pin is acquired. Rust borrowing keeps Current publication from
 consuming the turn until this non-Send loan drops.
 
+The post-producer dispatch boundary captures `outgoing_image.rs` once in the
+original turn, not at IRQ entry. Early continuation/SIMD probes remain separate
+and do not freeze pre-producer metadata. The one joined Resources53 qualification
+retains only UID, geometry, architecture comparison values and the actual owned
+guard range, never whole TaskContext, ABI, process handle, run intent or funding.
+`OUTGOING_IMAGE_MAX_RESOURCE_ACQUISITIONS = 1` covers capture plus repeated
+validation/comparison reuse, not the whole return transaction. Canary contents
+are read lazily outside the leaf; no old intact boolean substitutes for bytes.
+
+A per-slot image fence excludes frame writer admission and resource geometry,
+exec-MM/context/detach, root and FS mutations after capture. Low-level root/FS
+setters still require their existing own-CPU/exec transaction: the fence is not
+a new remote-mutation authority. Terminal finalization defers its SAME producer
+before effects while frozen; closing alone does not revoke the old return.
+Architecture comparison and changed-RSP sealing borrow this original image.
+Incoming resource/MM/placement qualification remains separate and unchanged.
+The turn releases its fence after geometry sealing, before IRQ restoration;
+physical Outgoing backing still survives until the actual RSP ACK.
+
 Production outgoing accounting is removed from Scheduler. The loan consumes
 its original captured funding interval once, preserves budget-before-fairness
 and the minimum voluntary charge, and refreshes the live canary under retained
@@ -85,16 +104,25 @@ component refinements do NOT authorize deleting the remaining global guard.
 
 #### Exact selected frame, funding and queue claim transaction
 
-`dispatch_claim.rs::DispatchFrame` independently borrows the original masked
-CPU turn and retains the selected expected UID, exact saved RSP, owner generation,
-frame epoch and real allocation pin. Its actual FrameReader precedes header
-validation, including the live allocated canary rather than only the old published
-flag. Local, consumed Direct FIFO and retained original Current are distinct
-custody modes. The reader drops after validation; **both** actual owner-CAS branches
-requalify that original token INSIDE Identity/Resources/placement claim exclusion.
-A same-owner-generation frame replacement between validation and claim therefore
-refuses. An allocation reference alone or an earlier discarded validation boolean
-is not this final frame grant.
+`dispatch_claim.rs::FrameSelection` retains the selected expected UID, exact
+saved RSP, owner generation, frame epoch and real allocation/reader custody.
+Admission qualifies backing and reader in one resource leaf; header and live
+allocated canary reads occur outside the leaf while the actual backing and reader remain
+held. Fair selection and consumed Direct FIFO transfer this SAME non-Copy loan
+into `DispatchFrame`, borrowing the original masked CPU turn, without another
+pin admission or header read. The unsafe selection boundary requires continuous
+same-CPU IRQ/preemption exclusion; it is not a compiler-proved turn lifetime.
+Local, consumed Direct FIFO and retained original Current remain distinct modes.
+
+Both owner-CAS branches requalify the exact token INSIDE the joint
+Identity/Resources/placement claim. They require zero independent readers and
+recognize only the selected loan's own exact-resource reader. That sole reader
+is logically promoted by successful CAS, performs no later byte read, and is
+consumed outside all claim leaves into the SAME Prepared allocation pin. Raw
+claims still require zero readers; any independent reader or writer refuses.
+There is no reader-free interval between validation and claim. A stale epoch or
+owner refuses without staging a bank. An allocation reference alone or an
+earlier discarded validation boolean is not this final frame grant.
 
 `DispatchFunding` retains the original Context→Domain/reply pin in the selected
 transaction, not a CPU scratch cell. Preparation matures refills without debiting
@@ -115,8 +143,9 @@ remaining Current/IPC lifecycle arbitration still enter the genuine global
 guard. The claimed architecture/SIMD return below has its independent original
 receipt, but the enclosing dispatcher remains guarded: this is NOT complete
 legacy deletion.
-Seventeen actual root/bank/turn/resource/funding/claim witnesses cover these
-boundaries; prior IRQ/loader VA inputs and native bank/phase recovery are explicit
+Actual root/bank/turn/resource/funding/claim witnesses include counted single
+admission, original-reader promotion, independent-reader refusal and stale
+selection consumption; prior IRQ/loader VA inputs and native bank/phase recovery are explicit
 models, not hardware RSP acceptance. Component source mappings and mutations do
 not substitute for the complete joint refinements required below.
 

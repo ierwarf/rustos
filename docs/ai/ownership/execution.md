@@ -509,9 +509,22 @@ restoration; unavailable telemetry is not a zero-frame classification.
 Saved-header byte readers now have independent resource-leaf admission in
 `stack_resources/frame_readers.rs`. A non-Copy, CPU-local guard borrows an
 allocation pin, registers under the same class-53 leaf and spans validation or
-POD copying plus final token recheck. Both Local and Direct→Running CAS paths
-execute under that same leaf with no admitted reader/writer; a pre-CAS count
-check followed by leaf release would be insufficient. Refusal preserves the
+POD copying plus final token recheck. The owned `PinnedFrameReader` admits the
+exact UID/geometry allocation pin and reader together under one leaf; epoch
+revalidation still happens before any byte access. Refused registration drops
+the provisional pin after leaving the leaf. Both reader forms use the same
+registration checks and release counter; owned Drop releases reader exclusion
+before its backing pin, and `into_pin` releases only exclusion while preserving
+backing. Release/transfer acquire no resource leaf.
+`FRAME_READ_MAX_RESOURCE_ACQUISITIONS` bounds one combined admission at one,
+not a whole IPC transaction. Selection retains the original reader through
+funding and final Local or Direct→Running CAS. Under that same leaf, raw claims
+require zero readers; selected claims permit ONLY their own sole reader with
+exact ResourceCell provenance and no writer. CAS promotes that reader to
+execution custody: no byte access follows, and outside-leaf consumption moves
+the original pin into Prepared before architecture activation. Another reader
+always refuses. A pre-CAS count check followed by leaf release would be
+insufficient. Refusal preserves the
 exact owner, queue membership and handoff generation. No leaf spans the byte
 read, allocation, queue acquisition or hardware work; the local claim acquires
 RunQueue before the resource leaf and publishes queue removal only after CAS.
@@ -520,6 +533,22 @@ unwind preserve allocation custody; banks remain a separate lifetime owner.
 Running/retained-Current reads require own Current/Prepared and continuous
 own-CPU IRQ/preemption exclusion; boot admission checks caller IRQ state before
 entering the leaf, not the temporarily disabled state inside it.
+Captured `CurrentWait` accessors retain their original BindingPin, physical
+Current bank and continuous masked scope; they do not re-read TaskStart under
+Resources53 (`CURRENT_WAIT_MAX_RESOURCE_REACQUISITIONS = 0`). Capture still
+performs Terminal/Identity/Resources admission. Closing rejects new loans;
+mutable wait/terminal predicates still guard every actual effect.
+
+The original turn's narrow outgoing image is frozen only AFTER IPC/image/terminal
+producers. One joined resource read qualifies UID, geometry, retained-MM/root
+comparison and actual canary location. Frame writers and image metadata mutators
+observe its fence; terminal detach defers the SAME producer before effects.
+No whole TaskContext is cached, and early SIMD/continuation capture does not
+freeze an image before self-exec/TLS/geometry changes. Validation, outgoing
+architecture comparison and RSP sealing reuse it; incoming admission remains
+independent. Fence release precedes IRQ restoration, whereas original Outgoing
+physical/MM/UID banks still await real RSP ACK. Native counted/mutation witnesses
+cover this component; it is not complete hardware or joint guard-deletion proof.
 
 Non-executing primary diagnostics therefore no longer use directory claim
 exclusion for byte stability. Borrowed alternate/boot backing still requires its

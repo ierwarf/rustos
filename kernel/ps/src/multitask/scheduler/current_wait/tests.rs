@@ -26,6 +26,28 @@ fn capture() -> Option<CurrentWait> {
     unsafe { CurrentWait::capture() }
 }
 #[test]
+fn actual_current_wait_reuses_original_custody_without_resource_reacquisition() {
+    use nucleus_core::util::lockdep::{LockClass, work_budget};
+    root(true, |slot| {
+        let wait = capture().unwrap();
+        let refs = identity::execution::count(slot);
+        let budget = work_budget::declare(LockClass::TaskStackResources,
+            rustos_user_abi::performance::CURRENT_WAIT_MAX_RESOURCE_REACQUISITIONS);
+        for _ in 0..32 {
+            assert_eq!(wait.slot(), slot);
+            assert_eq!(wait.id(), ID);
+            assert_eq!(wait.cpu(), 0);
+            assert_eq!(wait.original_pin().id(), ID);
+            assert!(wait.arm(BlockReason::EndpointReply(0x4242)));
+            assert!(wait.matches_armed_reply(0x4242));
+            assert!(wait.cancel());
+        }
+        assert_eq!(identity::execution::count(slot), refs);
+        assert_eq!(budget.used(), Some(0));
+    });
+}
+
+#[test]
 fn actual_current_wait_arm_cancel_retains_original_bank_uid_and_exact_reason() {
     root(true, |slot| {
         let refs = identity::execution::count(slot);

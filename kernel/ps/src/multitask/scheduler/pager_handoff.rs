@@ -45,7 +45,26 @@ fn latency_floor(sender: &CurrentWait, token: u64, worker: &wake_publication::Bi
 pub(in crate::multitask) fn handoff(
     scope: &DispatchPreemption<'_>, sender: &CurrentWait, token: u64, worker_id: u64,
 ) -> PagerFaultHandoffOutcome {
-    handoff_with(scope, sender, token, worker_id, &runqueue_policy::online_affinity_mask)
+    let outcome =
+        handoff_with(scope, sender, token, worker_id, &runqueue_policy::online_affinity_mask);
+    let _ = retry_stranded_worker(scope, outcome, worker_id);
+    outcome
+}
+
+/// A refusal after the worker left the waiter registry leaves the fault
+/// published but nothing to wake the worker, whose PagerService wait has no
+/// deadline. Retry that exact wait so the worker wakes and claims the fault.
+fn retry_stranded_worker(
+    scope: &DispatchPreemption<'_>, outcome: PagerFaultHandoffOutcome, worker_id: u64,
+) -> bool {
+    use PagerFaultHandoffOutcome as Outcome;
+    matches!(
+        outcome,
+        Outcome::ReceiverMismatch
+            | Outcome::EligibilityUnavailable
+            | Outcome::DirectCustodyUnavailable
+            | Outcome::OrderingUnavailable
+    ) && wake_retry::record_in(scope, worker_id, Some((runqueue::wait::REASON_PAGER_SERVICE, 0)))
 }
 
 fn handoff_with(

@@ -112,6 +112,27 @@ pub(in crate::multitask::scheduler) fn actual_terminal_process_donations_retire_
 }
 
 #[test]
+fn actual_terminal_frozen_outgoing_defers_same_producer_before_detach_or_consumers() {
+    root(true, |slot, handle| {
+        crate::multitask::cpu_local::dispatch_turn::with_original_current_model(slot, |turn| {
+            assert!(turn.outgoing_image().is_some());
+            let owner = terminal_quarantine::begin(slot, Some(ID), TaskRetireReason::Exited, true).unwrap();
+            // SAFETY: the real original modeled masked Current turn is retained.
+            unsafe { guarded(owner, &|_| 1); }
+            assert!(retirement_cleanup::deferred(slot).is_some());
+            assert_eq!(retirement_cleanup::test_consumer_publication(slot), (false, false));
+            assert_eq!(stack_resources::context::read(slot).unwrap().process_handle, Some(handle));
+        });
+        assert!(!outgoing_image::frozen(slot));
+        // Native turn drop, not a hardware RSP ACK. Retry the SAME producer.
+        // SAFETY: the outer fixture still retains original modeled own-CPU
+        // custody; the first attempt retained this exact terminal producer.
+        unsafe { drain_guarded(&|_| 1); }
+        assert_eq!(retirement_cleanup::test_consumer_publication(slot), (true, true));
+        assert_eq!(stack_resources::context::read(slot).unwrap().process_handle, None);
+    });
+}
+#[test]
 fn actual_terminal_effects_publish_both_consumers_last_and_retain_current_backing_until_ack() {
     root(true, |slot, handle| {
         let rsp = runqueue::saved_rsp(slot);

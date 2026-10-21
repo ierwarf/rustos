@@ -123,7 +123,7 @@ fn activate_budget(cpu: usize, class_index: usize) {
     else {
         return;
     };
-    let previous = active_depth.fetch_add(1, Ordering::Relaxed);
+    let previous = super::cpu_counter::add_u32(active_depth, 1);
     assert!(previous != u32::MAX, "lock budget nesting overflow");
 }
 
@@ -135,7 +135,7 @@ fn deactivate_budget(cpu: usize, class_index: usize) {
     else {
         return;
     };
-    let previous = active_depth.fetch_sub(1, Ordering::Relaxed);
+    let previous = super::cpu_counter::add_u32(active_depth, u32::MAX);
     assert!(previous != 0, "lock budget nesting underflow");
 }
 

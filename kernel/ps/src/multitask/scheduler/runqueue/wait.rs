@@ -26,7 +26,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use super::{MAX_TASK, RunOwnerState, owner};
 
 mod epoch;
-pub(in crate::multitask::scheduler) use epoch::TypedWake;
+pub(in crate::multitask::scheduler) use epoch::{TypedWake, WaitInstance, wait_instance};
 
 pub(in crate::multitask) const REASON_NONE: u8 = 0;
 pub(in crate::multitask) const REASON_GENERIC: u8 = 1;

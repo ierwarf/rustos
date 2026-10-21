@@ -94,7 +94,8 @@ fn claim_dispatch_inner(
         }
         let Some((claim, activation, execution, mut placement)) =
             admitted_claim(frame, funding, || {
-                super::super::stack_resources::frame_readers::with_claim_activation(slot, cpu, || {
+                super::super::stack_resources::frame_readers::with_claim_activation_for_reader(slot, cpu,
+                    frame.map(|frame| frame.original_reader()), || {
                     #[cfg(test)]
                     observe_claim_admission(slot, funding);
                     if frame.is_some_and(|frame| !frame.is_current()) { return Err(owner); }
@@ -154,7 +155,8 @@ fn claim_dispatch_inner(
     // publishes a spurious membership epoch and may restore a stale slot.
     let Some(attempt) =
         admitted_claim(frame, funding, || {
-            super::super::stack_resources::frame_readers::with_claim_activation(slot, cpu, || {
+            super::super::stack_resources::frame_readers::with_claim_activation_for_reader(slot, cpu,
+                frame.map(|frame| frame.original_reader()), || {
                 #[cfg(test)]
                 observe_claim_admission(slot, funding);
                 if frame.is_some_and(|frame| !frame.is_current()) { return Err(owner); }

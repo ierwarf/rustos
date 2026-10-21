@@ -241,6 +241,27 @@ pub fn current_apic_id() -> u32 {
     apic_id_for_index(current_cpu_index())
 }
 
+/// Recorded by a guard whose CPU is identified by its logical index alone.
+/// No x2APIC identity is all-ones (that is the broadcast destination).
+#[cfg(rustos_boot_image)]
+pub const INDEX_AUTHORITATIVE: u32 = u32::MAX;
+
+/// The identity a raw guard records at acquisition. Once the dense map is
+/// published it is immutable and injective, so the identity is a pure function
+/// of the logical index the guard already records and compares on release;
+/// looking it up on both sides decided nothing the index equality did not.
+/// Before publication every CPU derives index zero, and the real identity is
+/// what tells them apart.
+#[cfg(rustos_boot_image)]
+pub fn guard_apic_id(index: usize) -> u32 {
+    // ORDERING: Acquire pairs with the topology publication, as below.
+    if CPU_IDENTITIES_PUBLISHED.load(Ordering::Acquire) {
+        INDEX_AUTHORITATIVE
+    } else {
+        apic_id_for_index(index)
+    }
+}
+
 /// The admitted architectural identity for an already-derived logical index.
 ///
 /// Callers that hold interrupts masked have a stable index in hand; deriving it

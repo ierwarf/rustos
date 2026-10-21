@@ -16,7 +16,7 @@
 //!   and architecture are explicitly distinct from hardware execution.
 use super::{
     boot_execution, context_validation_reason_code, current_identity, current_return::CurrentReturn,
-    dispatch_claim::{self, DispatchFrame, FrameCapture, FrameCustody}, dispatch_policy,
+    dispatch_claim::{self, DispatchFrame, FrameCapture, FrameCustody, FrameSelection, FrameSelectionError}, dispatch_policy,
     donation_ledger, frame_publication, handoff_queue::FirstTurnHandoff, local_dispatch,
     runqueue, runqueue_policy, runtime_profile, smp, stack_resources, sync_handoff, terminal_quarantine,
     SchedulerDispatch, TaskRetireReason, ROOT_TASK_SLOT, MAX_TASK, MAX_LATENCY_HANDOFF_HINTS,
@@ -29,17 +29,41 @@ pub(in crate::multitask::scheduler) mod maintenance;
 
 #[derive(Clone, Copy)]
 enum Urgency { Atomic, Sync, Overdue, Spawn, Latency, Hint, Fair }
-/// Selection is only an observation; DispatchFrame must acquire actual backing.
-struct Candidate { slot: usize, id: u64, generation: u64, custody: FrameCustody, urgency: Urgency }
+/// The selected original reader/backing is consumed, never reconstructed from
+/// these copied ordering fields. No new execution authority is granted here.
+struct Candidate { slot: usize, id: u64, generation: u64, custody: FrameCustody, urgency: Urgency, frame: FrameSelection }
 enum Decision { Selected(Candidate), Claimed(Urgency), Empty, Incomplete }
 
+fn selected_candidate(slot: usize, cpu: usize, id: u64, generation: u64, custody: FrameCustody, urgency: Urgency) -> Decision {
+    let token = match custody {
+        FrameCustody::Local => frame_publication::local_frame_token(slot, cpu),
+        FrameCustody::Direct => frame_publication::direct_handoff_frame_token(slot, cpu),
+        FrameCustody::Current => frame_publication::current_local_frame_token(slot, cpu),
+    };
+    let Some(token) = token else { return Decision::Incomplete; };
+    // SAFETY: the dispatcher's original masked selecting CPU scope spans this
+    // non-Send loan through final claim or refusal; native policy fixtures model it.
+    match unsafe { FrameSelection::capture(cpu, slot, id, generation, token.saved_rsp, custody) } {
+        Ok(frame) => Decision::Selected(Candidate {
+            slot: frame.slot(), id: frame.id(), generation: frame.generation(),
+            custody: frame.custody(), urgency, frame,
+        }),
+        Err(FrameSelectionError::Stale) => Decision::Incomplete,
+        Err(FrameSelectionError::Invalid(reason)) => {
+            quarantine(slot, id, token.saved_rsp, reason);
+            Decision::Empty
+        },
+    }
+}
+
 fn local_candidate(slot: usize, cpu: usize, urgency: Urgency) -> Decision {
-    match local_dispatch::qualified_local_handoff_generation(slot, cpu, selection_now(cpu)) {
-        Ok(Some(generation)) => match current_identity::read_dispatch(slot).and_then(|p| p.task_id) {
-            Some(id) => Decision::Selected(Candidate { slot, id, generation, custody: FrameCustody::Local, urgency }),
+    if runqueue::is_idle_slot(slot) && smp::idle_slot_for_cpu(cpu) != Some(slot) { return Decision::Empty; }
+    match local_dispatch::published_candidate_admission(slot, cpu, selection_now(cpu)) {
+        Ok(true) => match current_identity::read_dispatch(slot).and_then(|p| p.task_id) {
+            Some(id) => selected_candidate(slot, cpu, id, runqueue::owner(slot).generation, FrameCustody::Local, urgency),
             None => Decision::Incomplete,
         },
-        Ok(None) => Decision::Empty,
+        Ok(false) => Decision::Empty,
         Err(_) => Decision::Incomplete,
     }
 }
@@ -74,15 +98,14 @@ fn first_turn(turn: &crate::multitask::cpu_local::dispatch_turn::CpuDispatchTurn
             // Retain the SAME original allocation through FIFO consumption and
             // final claim. Busy original Cohort/reader means no pop, no decrement,
             // and no later arm; a scalar generation cannot replace this loan.
-            let Some(token) = frame_publication::local_frame_token(slot, cpu) else { return Decision::Incomplete; };
-            decision = match DispatchFrame::capture_selected(turn, slot, task_id, candidate.generation,
-                token.saved_rsp, FrameCustody::Local, class_sequence) {
+            let rsp = candidate.frame.saved_rsp();
+            decision = match DispatchFrame::from_selection(turn, candidate.frame, class_sequence) {
                 FrameCapture::Ready(frame) => {
                     if frame.prepare().is_some_and(|funded| funded.claim()) { Decision::Claimed(candidate.urgency) }
                     else { Decision::Incomplete }
                 },
                 FrameCapture::Stale => Decision::Incomplete,
-                FrameCapture::Invalid(reason) => { quarantine(slot, task_id, token.saved_rsp, reason); Decision::Empty },
+                FrameCapture::Invalid(reason) => { quarantine(slot, task_id, rsp, reason); Decision::Empty },
             };
         }
         if matches!(decision, Decision::Incomplete) { return decision; }
@@ -117,29 +140,32 @@ fn materialize(record: sync_handoff::SyncHandoffRecord, cpu: usize) {
 fn synchronous(cpu: usize) -> Decision {
     let _phase = super::runtime_profile::phase_scope(super::SchedulerPhase::SelectHandoff);
     if !sync_handoff::pending(cpu) { return Decision::Empty; }
-    let record = sync_handoff::take_next_ready(cpu, local_dispatch::local_fair_competitor_ready(cpu), |record| {
+    let mut selected = None;
+    let record = sync_handoff::take_next_ready_with(cpu, || local_dispatch::local_fair_competitor_ready(cpu), |record| {
+        selected = None; // discard an unconsumed original if the FIFO raced
         let slot = record.slot();
         if !current_identity::read_dispatch(slot).is_some_and(|p| p.task_id == Some(record.task_id()) && p.lifecycle_dispatchable())
             || !record.has_current_dispatch_custody() {
             materialize(record, cpu);
             return false;
         }
-        let qualification = if record.bound_direct_generation().is_some() {
-            local_dispatch::qualified_direct_handoff_generation(slot, cpu, selection_now(cpu))
-        } else {
-            local_dispatch::qualified_local_handoff_generation(slot, cpu, selection_now(cpu))
-        };
-        if qualification.ok().flatten().is_none_or(|g| record.bound_direct_generation().is_some_and(|expected| expected != g)) {
+        if (runqueue::is_idle_slot(slot) && smp::idle_slot_for_cpu(cpu) != Some(slot))
+            || local_dispatch::published_candidate_admission(slot, cpu, selection_now(cpu)) != Ok(true) {
             materialize(record, cpu);
             return false;
         }
-        true
+        let custody = if record.bound_direct_generation().is_some() { FrameCustody::Direct } else { FrameCustody::Local };
+        let generation = record.bound_direct_generation().unwrap_or_else(|| runqueue::owner(slot).generation);
+        match selected_candidate(slot, cpu, record.task_id(), generation, custody, Urgency::Sync) {
+            Decision::Selected(candidate) => { selected = Some(candidate); true },
+            _ => { materialize(record, cpu); false },
+        }
     }).map(|record| record.bind_selected_local_owner(runqueue::owner(record.slot()), cpu));
     match record {
-        Some(record) => match record.claim_generation() {
-            Some(generation) => Decision::Selected(Candidate { slot: record.slot(), id: record.task_id(), generation,
-                custody: if record.bound_direct_generation().is_some() { FrameCustody::Direct } else { FrameCustody::Local }, urgency: Urgency::Sync }),
-            None => Decision::Incomplete,
+        Some(record) => match selected {
+            Some(candidate) if record.slot() == candidate.slot && record.task_id() == candidate.id
+                && record.claim_generation() == Some(candidate.generation) => Decision::Selected(candidate),
+            _ => { materialize(record, cpu); Decision::Incomplete },
         },
         None => Decision::Empty,
     }
@@ -193,13 +219,35 @@ fn hint(cpu: usize, current: usize) -> Decision {
     local_candidate(slot, cpu, Urgency::Hint)
 }
 fn fair(cpu: usize, current: usize, voluntary: bool, runtime: u64) -> Result<Option<Candidate>, local_dispatch::LocalFallbackReason> {
-    let result = local_dispatch::choose_local_next(cpu, current, voluntary, runtime,
+    let mut selected = None;
+    let result = local_dispatch::choose_local_next_with(cpu, current, voluntary, runtime,
         selection_now(cpu), runqueue::local_runnable_sequence(cpu),
-        donation_ledger::class_publication_sequence(), false, false);
+        donation_ledger::class_publication_sequence(), false, false, |slot, cpu, _now| {
+            match local_candidate(slot, cpu, Urgency::Fair) {
+                Decision::Selected(candidate) => {
+                    let generation = candidate.generation;
+                    selected = Some(candidate);
+                    Ok(Some(generation))
+                },
+                Decision::Empty => Ok(None),
+                _ => Err(local_dispatch::LocalFallbackReason::FrameUnavailable),
+            }
+        });
     match result {
         Ok((slot, generation)) => {
             let id = current_identity::read_dispatch(slot).and_then(|p| p.task_id).ok_or(local_dispatch::LocalFallbackReason::CustodyUnavailable)?;
-            Ok(Some(Candidate { slot, id, generation, custody: if slot == current { FrameCustody::Current } else { FrameCustody::Local }, urgency: Urgency::Fair }))
+            if let Some(candidate) = selected {
+                if candidate.slot != slot || candidate.generation != generation {
+                    return Err(local_dispatch::LocalFallbackReason::CustodyUnavailable);
+                }
+                Ok(Some(candidate))
+            } else {
+                match selected_candidate(slot, cpu, id, generation,
+                    if slot == current { FrameCustody::Current } else { FrameCustody::Local }, Urgency::Fair) {
+                    Decision::Selected(candidate) => Ok(Some(candidate)),
+                    _ => Err(local_dispatch::LocalFallbackReason::FrameUnavailable),
+                }
+            }
         }
         Err(local_dispatch::LocalFallbackReason::NoLocalCandidate) => Ok(None),
         Err(reason) => Err(reason),
@@ -278,7 +326,7 @@ fn choose(turn: &crate::multitask::cpu_local::dispatch_turn::CpuDispatchTurn<'st
     match overdue {
         Ok(Some((slot, generation))) => {
             let Some(id) = current_identity::read_dispatch(slot).and_then(|p| p.task_id) else { return Decision::Incomplete; };
-            return Decision::Selected(Candidate { slot, id, generation, custody: FrameCustody::Local, urgency: Urgency::Overdue });
+            return selected_candidate(slot, cpu, id, generation, FrameCustody::Local, Urgency::Overdue);
         }
         Err(_) => return Decision::Incomplete,
         Ok(None) => {},
@@ -348,19 +396,12 @@ fn prologue(outgoing: &mut CurrentReturn<'_>, rsp: usize, voluntary: bool) -> u6
 }
 fn claim(outgoing: &CurrentReturn<'_>, candidate: Candidate, class_sequence: u64) -> bool {
     let cpu = outgoing.original_turn().original_current().expect("claim lost original Current").0;
-    let token = match candidate.custody {
-        FrameCustody::Local => frame_publication::local_frame_token(candidate.slot, cpu),
-        FrameCustody::Direct => frame_publication::direct_handoff_frame_token(candidate.slot, cpu),
-        FrameCustody::Current => frame_publication::current_local_frame_token(candidate.slot, cpu),
+    let rsp = candidate.frame.saved_rsp();
+    let success = match DispatchFrame::from_selection(outgoing.original_turn(), candidate.frame, class_sequence) {
+        FrameCapture::Ready(frame) => frame.prepare().is_some_and(|funded| funded.claim()),
+        FrameCapture::Invalid(reason) => { quarantine(candidate.slot, candidate.id, rsp, reason); false },
+        FrameCapture::Stale => false,
     };
-    let success = token.is_some_and(|token| {
-        match DispatchFrame::capture_selected(outgoing.original_turn(), candidate.slot, candidate.id,
-            candidate.generation, token.saved_rsp, candidate.custody, class_sequence) {
-            FrameCapture::Ready(frame) => frame.prepare().is_some_and(|funded| funded.claim()),
-            FrameCapture::Invalid(reason) => { quarantine(candidate.slot, candidate.id, token.saved_rsp, reason); false },
-            FrameCapture::Stale => false,
-        }
-    });
     if !success && matches!(candidate.custody, FrameCustody::Direct) {
         let _ = runqueue::materialize_direct_handoff_with_generation(candidate.slot, cpu,
             runqueue::weight::value(candidate.slot), Some(candidate.generation));

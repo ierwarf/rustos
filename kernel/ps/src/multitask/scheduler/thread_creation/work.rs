@@ -7,6 +7,7 @@
 //! Evidence: actual shared reservation, MM activation, frame and membership owners.
 use super::super::retirement_cleanup::executor::Executor;
 use super::*;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use nucleus_core::util::lockdep::LockClass;
 use crate::multitask::irq_leaf::IrqLeaf;
 
@@ -45,6 +46,11 @@ impl Row {
 // No operation nests these leaves with cleanup, identity, resource or MM leaves.
 static ROWS: [IrqLeaf<Row, { LockClass::SchedulerRetirementCleanup as u8 }>; MAX_TASK] =
     [const { IrqLeaf::new(Row::new()) }; MAX_TASK];
+/// Rows in `Pending`, changed only under the row leaf that makes or consumes
+/// that phase. An observation, never a claim: a zero lets housekeeping skip a
+/// leaf acquisition on every row, which every futex call and housekeeping
+/// turn used to pay with nothing queued.
+static PENDING_ROWS: AtomicUsize = AtomicUsize::new(0);
 #[derive(Clone, Copy)]
 pub(in crate::multitask) struct Receipt {
     slot: usize,
@@ -72,6 +78,9 @@ fn enqueue_into(row: &mut Row, work: Work) -> Result<Receipt, Work> {
     row.succeeded = false;
     row.work = Some(work);
     row.phase = Phase::Pending;
+    // ORDERING: Release, under the row leaf, after the row became Pending; a
+    // scanner that observes the count then takes the same leaf.
+    PENDING_ROWS.fetch_add(1, Ordering::Release);
     Ok(Receipt { slot, id, nonce })
 }
 /// One non-yielding capture/transfer: never expose an actual reservation on a
@@ -145,11 +154,17 @@ impl Drop for Claim<'_> {
 }
 fn claim_next(executor: &Executor) -> Option<Claim<'_>> {
     executor.assert_current();
+    // ORDERING: Acquire pairs with the enqueue increment; a row enqueued after
+    // this load is found by the next housekeeping turn.
+    if PENDING_ROWS.load(Ordering::Acquire) == 0 {
+        return None;
+    }
     for (slot, cell) in ROWS.iter().enumerate().skip(FIRST_DYNAMIC_TASK_SLOT) {
         let mut row = cell.lock();
         if row.phase != Phase::Pending {
             continue;
         }
+        PENDING_ROWS.fetch_sub(1, Ordering::Relaxed);
         let receipt = Receipt {
             slot,
             id: row.id,

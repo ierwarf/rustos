@@ -22,6 +22,7 @@
 //! - **Evidence:** `synchronous-ipc-handoff/SynchronousIpcHandoff`, exact
 //!   implementation mutants, host witnesses, and the SMP KVM matrix.
 
+use nucleus_core::util::cache_padded::CachePadded;
 use nucleus_core::util::lockdep::{LockClass, MAX_TRACKED_CPUS};
 use crate::multitask::irq_leaf::IrqLeaf;
 
@@ -516,8 +517,8 @@ fn state_for_cpu(cpu: usize) -> &'static SyncHandoffLock {
 /// dispatch paid before. A stale `false` would strand a committed reply, and
 /// cannot arise, because a successful enqueue always publishes and the
 /// consumer only clears on an empty queue it has seen under the lock.
-static SYNC_HANDOFF_PENDING: [core::sync::atomic::AtomicBool; MAX_TRACKED_CPUS] =
-    [const { core::sync::atomic::AtomicBool::new(false) }; MAX_TRACKED_CPUS];
+static SYNC_HANDOFF_PENDING: [CachePadded<core::sync::atomic::AtomicBool>; MAX_TRACKED_CPUS] =
+    [const { CachePadded::new(core::sync::atomic::AtomicBool::new(false)) }; MAX_TRACKED_CPUS];
 
 /// Per-CPU consumed scheduling-clock quanta and last charge point for the
 /// production dispatcher's synchronous IPC execution chain.
@@ -530,12 +531,17 @@ static SYNC_HANDOFF_PENDING: [core::sync::atomic::AtomicBool; MAX_TRACKED_CPUS] 
 // ORDERING: One interrupt-disabled scheduler transaction owns each CPU-local
 // streak. Relaxed accesses preserve the local bound; reset release only
 // publishes the cleared diagnostic/scheduling state to a later owner.
-static SYNC_HANDOFF_STREAK: [core::sync::atomic::AtomicU8; MAX_TRACKED_CPUS] =
-    [const { core::sync::atomic::AtomicU8::new(0) }; MAX_TRACKED_CPUS];
-// ORDERING: This timestamp is part of the same single-owner CPU-local budget
-// state as the streak above; no cross-CPU publication edge is carried by it.
-static SYNC_HANDOFF_LAST_TICK: [core::sync::atomic::AtomicU64; MAX_TRACKED_CPUS] =
-    [const { core::sync::atomic::AtomicU64::new(0) }; MAX_TRACKED_CPUS];
+struct SyncHandoffBudget {
+    streak: core::sync::atomic::AtomicU8,
+    last_tick: core::sync::atomic::AtomicU64,
+}
+// Keep one CPU's charge fields together, isolated from other CPUs' writes and
+// from remote producers updating its FIFO advertisement.
+static SYNC_HANDOFF_BUDGET: [CachePadded<SyncHandoffBudget>; MAX_TRACKED_CPUS] =
+    [const { CachePadded::new(SyncHandoffBudget {
+        streak: core::sync::atomic::AtomicU8::new(0),
+        last_tick: core::sync::atomic::AtomicU64::new(0),
+    }) }; MAX_TRACKED_CPUS];
 
 /// Enqueue into one target FIFO and advertise it to that CPU's dispatcher.
 fn enqueue_and_publish(target_cpu: usize, record: SyncHandoffRecord) -> bool {
@@ -662,14 +668,25 @@ pub(super) fn enqueue_reply_wake(token: ReplyWakeHandoff) -> bool {
 /// Consumes this CPU's FIFO while the independent dispatcher qualifies exact
 /// published identity and runqueue custody. Preserve the consumed record's owner
 /// generation for the original physical claim.
+#[cfg(test)]
 pub(super) fn take_next_ready(
     cpu: usize,
     fair_competitor_ready: bool,
+    ready: impl FnMut(SyncHandoffRecord) -> bool,
+) -> Option<SyncHandoffRecord> {
+    take_next_ready_with(cpu, || fair_competitor_ready, ready)
+}
+
+// The CPU-owned budget is stable during this masked dispatch turn. Inspect
+// competitors only when they can affect the decision, before taking the leaf.
+pub(super) fn take_next_ready_with(
+    cpu: usize,
+    fair_competitor_ready: impl FnOnce() -> bool,
     mut ready: impl FnMut(SyncHandoffRecord) -> bool,
 ) -> Option<SyncHandoffRecord> {
-    if fair_competitor_ready
-        && SYNC_HANDOFF_STREAK[cpu].load(core::sync::atomic::Ordering::Relaxed)
-            >= MAX_SYNC_HANDOFF_CHAIN_TICKS
+    if SYNC_HANDOFF_BUDGET[cpu].streak.load(core::sync::atomic::Ordering::Relaxed)
+        >= MAX_SYNC_HANDOFF_CHAIN_TICKS
+        && fair_competitor_ready()
     {
         #[cfg(rustos_scheduler_phase_profile)]
         super::locality::record_sync_handoff_miss(
@@ -723,8 +740,8 @@ pub(super) fn take_next_ready(
 }
 
 pub(super) fn record_dispatch(cpu: usize, synchronous_handoff: bool, now_ticks: u64) {
-    let streak = &SYNC_HANDOFF_STREAK[cpu];
-    let last_tick = &SYNC_HANDOFF_LAST_TICK[cpu];
+    let streak = &SYNC_HANDOFF_BUDGET[cpu].streak;
+    let last_tick = &SYNC_HANDOFF_BUDGET[cpu].last_tick;
     if !synchronous_handoff {
         streak.store(0, core::sync::atomic::Ordering::Relaxed);
         last_tick.store(0, core::sync::atomic::Ordering::Relaxed);
@@ -766,8 +783,8 @@ pub(super) fn reset_all_cpus() {
         // ORDERING: Reset publishes the cleared CPU-local streak after the
         // protected FIFO state is empty; subsequent relaxed local accesses
         // cannot revive a pre-reset fairness debt.
-        SYNC_HANDOFF_STREAK[cpu].store(0, core::sync::atomic::Ordering::Release);
-        SYNC_HANDOFF_LAST_TICK[cpu].store(0, core::sync::atomic::Ordering::Release);
+        SYNC_HANDOFF_BUDGET[cpu].streak.store(0, core::sync::atomic::Ordering::Release);
+        SYNC_HANDOFF_BUDGET[cpu].last_tick.store(0, core::sync::atomic::Ordering::Release);
     }
 }
 
@@ -778,6 +795,13 @@ mod tests {
         runqueue,
     };
 
+    #[test]
+    fn cpu_handoff_words_have_separate_cache_lines() {
+        for cells in [&super::SYNC_HANDOFF_BUDGET as *const _ as usize,
+            &super::SYNC_HANDOFF_PENDING as *const _ as usize] { assert_eq!(cells % 64, 0); }
+        assert_eq!(core::mem::size_of_val(&super::SYNC_HANDOFF_BUDGET[0]), 64);
+        assert_eq!(core::mem::size_of_val(&super::SYNC_HANDOFF_PENDING[0]), 64);
+    }
     #[test]
     fn sync_handoff_state_is_fifo_deduplicated_identity_keyed_and_fairness_bounded() {
         let mut state = SyncHandoffState::new();

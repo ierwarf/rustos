@@ -375,6 +375,7 @@ fn measure_intra_process_round_trip(
     // server's (near-zero) work, which is the part the in-kernel phase
     // instrumentation cannot see.
     let mut total = Vec::with_capacity(IPC_ITERS);
+    let mut worst = crate::tails::Worst::new();
     let mut to_recv = Vec::with_capacity(IPC_ITERS);
     let mut server_body = Vec::with_capacity(IPC_ITERS);
     let mut to_return = Vec::with_capacity(IPC_ITERS);
@@ -399,11 +400,13 @@ fn measure_intra_process_round_trip(
         total.push(end.wrapping_sub(start));
         // A stamp outside the interval means the server lapped this sample;
         // drop it rather than record a wrapped difference as a cost.
-        if recv_at > start && reply_at >= recv_at && end >= reply_at {
+        let parts = if recv_at > start && reply_at >= recv_at && end >= reply_at {
             to_recv.push(recv_at - start);
             server_body.push(reply_at - recv_at);
             to_return.push(end - reply_at);
-        }
+            Some([recv_at - start, reply_at - recv_at, end - reply_at])
+        } else { None };
+        worst.observe(crate::tails::Sample { seq: request.seq, start, end, parts });
     }
     request.op = BENCH_OP_STOP;
     request.seq = request.seq.wrapping_add(1);
@@ -414,6 +417,7 @@ fn measure_intra_process_round_trip(
         return;
     }
     report(name, &summarize(&mut total), tsc_khz);
+    worst.defer(name);
     for (split, samples) in
         split_names
             .into_iter()

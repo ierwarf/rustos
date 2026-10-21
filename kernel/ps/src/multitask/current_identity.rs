@@ -216,7 +216,8 @@ fn with_writer<R>(slot: usize, f: impl FnOnce(&mut IdentityWriter) -> R) -> Opti
     #[cfg(not(test))]
     {
         x86_64::instructions::interrupts::without_interrupts(|| {
-            let mut writer = cell.lock();
+            // SAFETY: IRQs stay masked until the guard drops inside this closure.
+            let mut writer = unsafe { cell.lock_masked() };
             Some(f(&mut writer))
         })
     }

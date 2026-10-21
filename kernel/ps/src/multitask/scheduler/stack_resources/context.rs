@@ -56,7 +56,13 @@ pub(in crate::multitask::scheduler) fn retained_architecture(
         return None;
     }
     let cell = RESOURCES.get(slot)?;
-    cell.with(|r| {
+    cell.with(|r| architecture_locked(cell, r, slot, id, view))
+}
+
+pub(super) fn architecture_locked(
+    cell: &super::ResourceCell, r: &super::Resources, slot: usize, id: u64,
+    view: super::super::PublishedFrameView,
+) -> Option<super::super::return_architecture::ArchitectureState> {
         let c = r.context?;
         if cell.pins.load(Ordering::Acquire) == 0
             || (r.start?.id, r.binding?) != (id, (id, super::Geometry::from_view(view)))
@@ -78,7 +84,6 @@ pub(in crate::multitask::scheduler) fn retained_architecture(
             gs: c.windows_thread_state.map(|s| s.teb_address).unwrap_or(0),
             process: c.process_handle.is_some(),
         })
-    })
 }
 
 /// Physical old-MM backing across a sleepable unpublished thread reservation.
@@ -282,6 +287,7 @@ pub(in crate::multitask::scheduler) fn replace_exec_mm(
     );
     let mut incoming = Some(incoming);
     let old = RESOURCES[slot].with(|resources| {
+        super::super::outgoing_image::assert_mutable(slot);
         assert!(
             resources.frame_writing
                 && resources.start.is_some_and(|start| start.id == task_id)
@@ -419,6 +425,7 @@ pub(in crate::multitask::scheduler) fn replace_exec(
     stack: Option<UserStackState>,
 ) -> Option<()> {
     RESOURCES[slot].with(|resources| {
+        if super::super::outgoing_image::frozen(slot) { return None; }
         if resources.closing || resources.start.is_none_or(|start| start.id != task_id) {
             return None;
         }
@@ -441,6 +448,7 @@ pub(in crate::multitask::scheduler) fn detach_process(
     expected: ProcessHandle,
 ) -> Option<()> {
     RESOURCES[slot].with(|resources| {
+        if super::super::outgoing_image::frozen(slot) { return None; }
         if resources.closing || resources.start.is_none_or(|start| start.id != task_id) {
             return None;
         }

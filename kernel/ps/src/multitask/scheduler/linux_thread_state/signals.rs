@@ -53,8 +53,15 @@ impl Recipient {
         if !wake { return Ok(true); }
         // Transfer the SAME original unit, never resolve a new PID/UID loan.
         let Some(binding) = wake_publication::Binding::from_original(self.pin) else { return Ok(false); };
+        let id = binding.id();
         // SAFETY: same masked CPU; owned binding covers Linux through final wake effects.
-        Ok(unsafe { wake_publication::guarded_owned(binding, eligible_cpus) })
+        let woken = unsafe { wake_publication::guarded_owned(binding, eligible_cpus) };
+        if !woken {
+            // The signal stays pending; a target parked without a deadline
+            // would otherwise never observe it.
+            let _ = super::super::wake_retry::record_in(scope, id, None);
+        }
+        Ok(woken)
     }
 }
 

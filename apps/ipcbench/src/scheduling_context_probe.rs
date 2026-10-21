@@ -51,6 +51,7 @@ fn report_one(name: &str, cycles: u64, tsc_khz: u64) {
             p99: cycles,
             max: cycles,
             mean: cycles,
+            tail: crate::tails::Summary::from_sorted(&[cycles]),
         },
         tsc_khz,
     );

@@ -59,16 +59,15 @@ impl RspHandoff {
         let receipt = turn.claimed_return().expect("RSP seal lacks original claim");
         let to = receipt.slot();
         assert_ne!(from, to, "unchanged return needs no outgoing RSP seal");
-        let old = frame_publication::return_view(from).expect("RSP seal lacks outgoing frame geometry");
-        assert!(stack_resources::current_return_binding(cpu, from, old).is_some(),
-            "RSP seal lost original outgoing allocation binding");
+        let old = turn.outgoing_image().expect("RSP seal lacks original frozen outgoing image");
+        assert!(old.cpu == cpu && old.slot == from, "RSP seal lost original outgoing allocation binding");
         assert!(stack_resources::cpu_leases::owns_prepared(cpu, to),
             "RSP seal lacks original incoming allocation");
         Self {
             cpu, from, to, id: receipt.id, generation: receipt.running_generation,
             expected_rsp: receipt.token.saved_rsp,
             incoming: StackRanges::from_view(receipt.token.view),
-            outgoing: StackRanges::from_view(old),
+            outgoing: StackRanges::from_view(old.view),
         }
     }
     pub(in crate::multitask) fn assert_arrived(&self, cpu: usize, rsp: usize) {

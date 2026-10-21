@@ -29,6 +29,66 @@ fn begin_account(slot: usize, outgoing: &mut CurrentReturn<'_>) -> u64 {
     elapsed
 }
 #[test]
+fn actual_post_producer_image_uses_one_leaf_through_validation_and_architecture_reuse() {
+    use nucleus_core::util::lockdep::{LockClass, work_budget};
+    use rustos_user_abi::performance::OUTGOING_IMAGE_MAX_RESOURCE_ACQUISITIONS;
+    root(true, true, |slot, turn| {
+        let early = CurrentReturn::capture(turn).unwrap();
+        assert!(!super::super::outgoing_image::frozen(slot));
+        // Early probes/SIMD must not freeze pre-producer TLS or geometry.
+        runqueue::simd_tls::set_tls_fs_base(slot, 0x1234);
+        stack_resources::publish_binding(slot, ID, early.view);
+        drop(early);
+        let budget = work_budget::declare(LockClass::TaskStackResources, OUTGOING_IMAGE_MAX_RESOURCE_ACQUISITIONS);
+        let outgoing = CurrentReturn::capture_dispatch(turn).unwrap();
+        for _ in 0..32 {
+            outgoing.check_binding();
+            let _ = outgoing.validate(runqueue::saved_rsp(slot));
+            let state = super::super::return_architecture::ArchitectureState::original(outgoing.original_turn()).unwrap();
+            assert_eq!(state.fs, 0x1234);
+        }
+        assert_eq!(budget.used(), Some(1));
+    });
+}
+#[test]
+fn actual_post_producer_image_bad_mm_refuses_without_leaking_freeze_or_custody() {
+    root(true, true, |slot, turn| {
+        let root = runqueue::address_space::root(slot);
+        let owner = runqueue::owner(slot);
+        // Native metadata fault injection, not hardware CR3 replacement.
+        runqueue::address_space::replace(slot, root + 4096);
+        assert!(CurrentReturn::capture_dispatch(turn).is_none());
+        assert!(!super::super::outgoing_image::frozen(slot));
+        assert_eq!(runqueue::owner(slot), owner);
+        assert!(stack_resources::cpu_leases::owns_current(0, slot));
+        runqueue::address_space::replace(slot, root);
+        assert!(CurrentReturn::capture_dispatch(turn).is_some());
+    });
+}
+#[test]
+fn actual_post_producer_image_refuses_real_mutators_until_original_turn_drops() {
+    let used = core::cell::Cell::new(super::super::MAX_TASK);
+    root(true, true, |slot, turn| {
+        used.set(slot);
+        let context = stack_resources::context::read(slot).unwrap();
+        let root = runqueue::address_space::root(slot);
+        let outgoing = CurrentReturn::capture_dispatch(turn).unwrap();
+        for effect in [0, 1, 2] {
+            assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match effect {
+                0 => runqueue::simd_tls::set_tls_fs_base(slot, 0x4321),
+                1 => runqueue::address_space::replace(slot, root),
+                _ => stack_resources::publish_binding(slot, ID, outgoing.view),
+            })).is_err());
+        }
+        assert_eq!(stack_resources::context::detach_process(slot, ID, context.process_handle.unwrap()), None);
+        assert_eq!(stack_resources::context::replace_exec(slot, ID, UserAbi::Linux, context.console_session, None), None);
+        assert_eq!(stack_resources::frame_access::with_current_exec(slot, ID, |_| ()), None);
+        assert_eq!(runqueue::address_space::root(slot), root);
+        assert!(turn.outgoing_image().is_some());
+    });
+    assert!(!super::super::outgoing_image::frozen(used.get()));
+}
+#[test]
 fn actual_original_return_failed_peer_fallback_reuses_interval_frame_and_queue_receipt_once() {
     root(true, true, |slot, turn| {
         let mut outgoing = CurrentReturn::capture(turn).unwrap();

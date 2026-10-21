@@ -36,6 +36,7 @@ pub(in crate::multitask) fn root(slot: usize) -> u64 {
 
 #[inline]
 pub(in crate::multitask) fn replace(slot: usize, value: u64) {
+    super::super::outgoing_image::assert_mutable(slot);
     assert_ne!(value, 0, "scheduler address-space root is zero");
     ROOTS
         .get(slot)
@@ -44,5 +45,6 @@ pub(in crate::multitask) fn replace(slot: usize, value: u64) {
 }
 
 pub(in crate::multitask) fn clear(slot: usize) {
+    super::super::outgoing_image::assert_mutable(slot);
     ROOTS[slot].store(0, Ordering::Release);
 }

@@ -49,10 +49,11 @@ impl CurrentWait {
         assert_eq!(nucleus_core::util::lockdep::current_cpu_index(), self.cpu);
         assert_eq!(cpu_local::current_cpu_task_slot(), Some(slot));
         assert!(stack_resources::cpu_leases::owns_current(self.cpu, slot));
-        assert_eq!(
-            stack_resources::task_start::read(slot).map(|s| s.id),
-            Some(self.binding.id())
-        );
+        // This SAME BindingPin retains UID/backing, and the physical Current
+        // bank plus the caller's continuous masked scope excludes replacement.
+        // TaskStart may change its entry for same-UID exec, never its UID until
+        // both loans drain. Do not reacquire Resources53 to re-prove that fact.
+        // Mutable terminal/wait state is still checked at each actual effect.
         slot
     }
     pub(super) fn id(&self) -> u64 {

@@ -73,6 +73,7 @@ impl TurnCell {
             claimed_return: UnsafeCell::new(None),
             priority_choice: UnsafeCell::new(None),
             architecture_phase: core::cell::Cell::new(0),
+            outgoing_image: UnsafeCell::new(None),
             affinity: PhantomData,
         })
     }
@@ -172,6 +173,8 @@ pub(in crate::multitask) struct CpuDispatchTurn<'a> {
     cpu: usize,
     from: usize,
     live: bool,
+    // Field order releases the image fence BEFORE IRQ/preemption can reopen.
+    outgoing_image: UnsafeCell<Option<super::super::scheduler::outgoing_image::OriginalOutgoingImage>>,
     preemption: Option<DispatchPreemption<'static>>,
     claimed_return: UnsafeCell<Option<super::super::scheduler::return_architecture::ClaimedReturn>>,
     priority_choice: UnsafeCell<Option<super::super::scheduler::dispatch_priority::Choice>>,
@@ -200,6 +203,24 @@ impl<'a> CpuDispatchTurn<'a> {
             return None;
         }
         Some((self.cpu, self.from))
+    }
+
+    /// Freeze ONLY at the post-producer dispatch boundary. Early continuation
+    /// and SIMD probes must not call this. Once initialized, image mutators
+    /// refuse until this same original turn has published/dropped its image.
+    pub(in crate::multitask) fn outgoing_image(
+        &self,
+    ) -> Option<&super::super::scheduler::outgoing_image::OriginalOutgoingImage> {
+        let (cpu, slot) = self.original_current()?;
+        // SAFETY: non-Send/non-Sync original Open turn, masked on its CPU;
+        // no callbacks occur during initialization. Immutable after insertion.
+        if unsafe { &*self.outgoing_image.get() }.is_none() {
+            let image = super::super::scheduler::outgoing_image::OriginalOutgoingImage::capture(cpu, slot)?;
+            // No existing shared image borrower can precede first insertion.
+            unsafe { *self.outgoing_image.get() = Some(image); }
+        }
+        // SAFETY: shared only once initialized; never replaced on this turn.
+        unsafe { &*self.outgoing_image.get() }.as_ref()
     }
 
     /// Admit priority BEFORE observing any prefix or selecting a peer. The
@@ -300,6 +321,9 @@ impl<'a> CpuDispatchTurn<'a> {
             Some(LockClass::Scheduler as u8),
             "CPU completion preceded directory unlock"
         );
+        // RSP geometry is already sealed. Release the image fence while still
+        // masked, before parking/restoring the original preemption scope.
+        drop(self.outgoing_image.get_mut().take());
         if changed {
             if let Some(preemption) = self.preemption.as_mut() {
                 preemption.retain_irq_mask();

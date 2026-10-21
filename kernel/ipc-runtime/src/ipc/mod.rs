@@ -38,7 +38,10 @@ use legacy_test_api::*;
 
 pub use endpoint_priority::EndpointCallPriority;
 use endpoint_priority::EndpointObject;
-pub use endpoint_receive::{EndpointReceive, receive_or_wait, received_request_retains_custody};
+pub use endpoint_receive::{
+    EndpointReceive, published_request_retains_custody, receive_or_wait,
+    received_request_custody_conditions, received_request_retains_custody,
+};
 pub use shared_region_hold::KernelSharedRegionMappingHold;
 
 use crate::ipc_core::SharedRegionHandle;
@@ -1884,6 +1887,22 @@ pub fn rollback_fast_endpoint_call(
         .ok_or(IpcError::InvalidHandle)??;
     drop(REPLIES.remove(reply.raw()));
     Ok(rollback)
+}
+
+/// True when a receiver already took (or answered) the caller's fast request,
+/// so it can no longer be rolled back and its response will still arrive.
+/// The caller must then wait for that response rather than report a failure
+/// for a request that the server is executing.
+pub fn fast_endpoint_request_owned_by_receiver(reply: KernelReplyHandle, caller_task_id: u64) -> bool {
+    REPLIES
+        .with(reply.raw(), |reply_object| {
+            !reply_object.consumed
+                && reply_object.fast_frame.as_ref().is_some_and(|frame| {
+                    frame.caller_task_id == caller_task_id
+                        && frame.state != FastCallState::RequestReady
+                })
+        })
+        .unwrap_or(false)
 }
 
 pub fn take_fast_endpoint_request(

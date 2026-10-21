@@ -38,6 +38,7 @@ kernel/ps/src/multitask/scheduler/dispatch_claim.rs	0	0
 kernel/ps/src/multitask/scheduler/execution_interval.rs	0	0
 kernel/ps/src/multitask/scheduler/dispatch_claim/tests.rs	0	0
 kernel/ps/src/multitask/scheduler/current_return.rs	0	0
+kernel/ps/src/multitask/scheduler/outgoing_image.rs	0	0
 kernel/ps/src/multitask/scheduler/current_return/tests.rs	0	0
 kernel/ps/src/multitask/scheduler/current_wait.rs	0	0
 kernel/ps/src/multitask/scheduler/current_wait/tests.rs	0	0

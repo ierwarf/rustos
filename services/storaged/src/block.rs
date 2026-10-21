@@ -30,7 +30,10 @@ use rustos_user_abi::syscall::{
 const COMPLETION_TIMEOUT: Duration = Duration::from_secs(15);
 const WAIT_SLICE_MILLIS: u64 = 1_000;
 const READ_CACHE_WINDOW_LIMIT: usize = 8;
-const READ_AHEAD_IN_FLIGHT_LIMIT: usize = READ_CACHE_WINDOW_LIMIT;
+// A full-cache speculative batch evicts interleaved FAT metadata and delays
+// the demanded read until every unused window settles. Leave cache headroom.
+const READ_AHEAD_IN_FLIGHT_LIMIT: usize = 2;
+const _: () = assert!(READ_AHEAD_IN_FLIGHT_LIMIT < READ_CACHE_WINDOW_LIMIT);
 static READ_CACHE: Mutex<ReadCacheSet> = Mutex::new(ReadCacheSet::new());
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -774,6 +777,31 @@ mod tests {
         assert!(windows
             .windows(2)
             .all(|pair| pair[0].lba + pair[0].block_count == pair[1].lba));
+    }
+
+    #[test]
+    fn sequential_batch_preserves_recent_interleaved_metadata() {
+        let mut caches = ReadCacheSet::new();
+        let geometry = info();
+        for lba in 0..READ_CACHE_WINDOW_LIMIT as u64 {
+            caches.insert(ReadCache {
+                generation: geometry.generation, lba, block_count: 1,
+                block_size: 4_096, bytes: vec![7; 4_096],
+            }).unwrap();
+        }
+        let metadata = READ_CACHE_WINDOW_LIMIT as u64 - 1;
+        assert!(caches.slice(geometry.generation, metadata, 1, 4_096).unwrap().is_some());
+        let windows = read_ahead_plan(geometry, 100, 2, READ_AHEAD_IN_FLIGHT_LIMIT).unwrap();
+        assert_eq!(windows.len(), 2, "speculation must leave cache headroom");
+        for window in windows {
+            caches.insert(ReadCache {
+                generation: geometry.generation, lba: window.lba,
+                block_count: window.block_count, block_size: 4_096,
+                bytes: vec![0; window.byte_len],
+            }).unwrap();
+        }
+        assert_eq!(caches.entries.len(), READ_CACHE_WINDOW_LIMIT);
+        assert_eq!(caches.slice(geometry.generation, metadata, 1, 4_096), Ok(Some(vec![7; 4_096])));
     }
 
     #[test]

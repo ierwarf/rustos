@@ -204,44 +204,30 @@ struct History {
     id: Option<u64>,
     cpu: u8,
 }
-static HISTORY: [Leaf<History>; MAX_TASK] = [const {
-    Leaf::new(History {
-        id: None,
-        cpu: NO_IDLE_CPU,
-    })
-}; MAX_TASK];
-pub(in crate::multitask::scheduler) fn migration(slot: usize, id: u64, cpu: u8) -> bool {
-    let f = || {
-        let mut row = HISTORY[slot].lock();
-        let migrated = row.id == Some(id) && row.cpu != NO_IDLE_CPU && row.cpu != cpu;
-        row.id = Some(id);
-        row.cpu = cpu;
-        migrated
-    };
-    #[cfg(not(test))]
-    {
-        x86_64::instructions::interrupts::without_interrupts(f)
+impl History {
+    /// `(id + 1) << 8 | cpu` in one word; zero is the empty row. One word
+    /// swap replaces the per-slot leaf every dispatch used to take: the row is
+    /// a diagnostic tuple, and the swap keeps its id and CPU together.
+    fn encode(&self) -> u64 {
+        self.id.map_or(0, |id| (id.wrapping_add(1) << 8) | u64::from(self.cpu))
     }
-    #[cfg(test)]
-    {
-        f()
+    fn decode(word: u64) -> Self {
+        match word {
+            0 => Self { id: None, cpu: NO_IDLE_CPU },
+            word => Self { id: Some((word >> 8).wrapping_sub(1)), cpu: word as u8 },
+        }
     }
 }
+static HISTORY: [AtomicU64; MAX_TASK] = [const { AtomicU64::new(0) }; MAX_TASK];
+pub(in crate::multitask::scheduler) fn migration(slot: usize, id: u64, cpu: u8) -> bool {
+    let next = History { id: Some(id), cpu }.encode();
+    // ORDERING: Relaxed; a diagnostic tuple published and consumed as one word.
+    let row = History::decode(HISTORY[slot].swap(next, Ordering::Relaxed));
+    row.id == Some(id) && row.cpu != NO_IDLE_CPU && row.cpu != cpu
+}
 pub(in crate::multitask::scheduler) fn clear_history(slot: usize) {
-    let f = || {
-        *HISTORY[slot].lock() = History {
-            id: None,
-            cpu: NO_IDLE_CPU,
-        }
-    };
-    #[cfg(not(test))]
-    {
-        x86_64::instructions::interrupts::without_interrupts(f);
-    }
-    #[cfg(test)]
-    {
-        f();
-    }
+    // ORDERING: Relaxed; see `migration`.
+    HISTORY[slot].store(0, Ordering::Relaxed);
 }
 fn due(now: u64, started: u64, period: u64) -> bool {
     now.saturating_sub(started) >= period

@@ -93,7 +93,13 @@ fn publish_irq_usage(own: &AtomicU64, opposite: &AtomicU64, bit: u64) -> u64 {
 }
 
 #[cfg(rustos_boot_image)]
-pub(super) fn record_irq_usage(cpu: usize, class: usize, acquire_site: &'static Location<'static>) {
+/// `irq_enabled` is the caller's IF, read once for the whole acquisition.
+pub(super) fn record_irq_usage(
+    cpu: usize,
+    class: usize,
+    acquire_site: &'static Location<'static>,
+    irq_enabled: bool,
+) {
     let bit = 1_u64 << class;
     if irq_context_depth_on(cpu) != 0 {
         // ORDERING: SeqCst observes every prior unsafe classification before
@@ -122,7 +128,7 @@ pub(super) fn record_irq_usage(cpu: usize, class: usize, acquire_site: &'static 
                 class
             );
         }
-    } else if x86_64::instructions::interrupts::are_enabled() {
+    } else if irq_enabled {
         // ORDERING: SeqCst observes all IRQ-safe publications before admitting
         // an interruptible process-context acquisition.
         let safe_classes = IRQ_SAFE_CLASSES.load(Ordering::SeqCst);

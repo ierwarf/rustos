@@ -12,6 +12,9 @@
 
 
 
+#[cfg(rustos_scheduler_phase_profile)]
+use super::MAX_TASK;
+
 // Per-CPU diagnostic storage. The scheduler reads the first scan's reason
 // before a diagnostic rescan can overwrite it. Never used for dispatch.
 #[cfg(rustos_scheduler_phase_profile)]

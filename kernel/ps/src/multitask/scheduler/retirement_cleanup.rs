@@ -10,11 +10,11 @@
 
 use core::sync::atomic::{AtomicBool, Ordering};
 use nucleus_core::util::lockdep::LockClass;
-use crate::multitask::irq_leaf::IrqLeaf;
 
 use super::{FIRST_DYNAMIC_TASK_SLOT, MAX_TASK, TaskRetireReason, reclaim::RetirementSideEffect};
 use crate::multitask::RetiredTaskCleanup;
 
+mod busy;
 pub(in crate::multitask) mod executor;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CleanupState {
@@ -116,13 +116,13 @@ pub(in crate::multitask) fn with_wake_binding<R>(
 }
 
 struct CleanupCell {
-    state: IrqLeaf<SlotState, { LockClass::SchedulerRetirementCleanup as u8 }>,
+    state: busy::StateLeaf<{ LockClass::SchedulerRetirementCleanup as u8 }>,
 }
 
 impl CleanupCell {
     const fn new() -> Self {
         Self {
-            state: IrqLeaf::new(SlotState::new()),
+            state: busy::StateLeaf::new(),
         }
     }
 
@@ -394,7 +394,13 @@ pub(super) fn test_cleanup_payload(slot: usize) -> Option<RetiredTaskCleanup> {
 }
 
 pub(in crate::multitask) fn claim_next() -> Option<RetiredTaskCleanup> {
-    (FIRST_DYNAMIC_TASK_SLOT..MAX_TASK).find_map(|slot| CELLS[slot].claim())
+    busy_slots().find_map(|slot| CELLS[slot].claim())
+}
+
+/// Dynamic slots whose retirement row is not idle: the only rows any
+/// retirement scanner can claim. An observation; claims re-check under the leaf.
+pub(super) fn busy_slots() -> impl Iterator<Item = usize> {
+    busy::slots().filter(|&slot| (FIRST_DYNAMIC_TASK_SLOT..MAX_TASK).contains(&slot))
 }
 
 pub(in crate::multitask) fn complete(cleanup: RetiredTaskCleanup) -> bool {
@@ -452,7 +458,7 @@ pub(in crate::multitask) fn claim_next_kernel(
     executor: &executor::Executor,
 ) -> Option<KernelClaim<'_>> {
     executor.assert_current();
-    (FIRST_DYNAMIC_TASK_SLOT..MAX_TASK).find_map(|slot| {
+    busy_slots().find_map(|slot| {
         CELLS[slot]
             .claim_kernel()
             .map(|(generation, effects)| KernelClaim {

@@ -22,10 +22,7 @@ pub(in crate::multitask) struct ArchitectureState {
 }
 impl ArchitectureState {
     pub(super) fn original(turn: &CpuDispatchTurn<'static>) -> Option<Self> {
-        let (cpu, slot) = turn.original_current()?;
-        let view = frame_publication::return_view(slot)?;
-        let id = stack_resources::current_return_binding(cpu, slot, view)?;
-        stack_resources::context::retained_architecture(cpu, slot, id, view)
+        Some(turn.outgoing_image()?.architecture)
     }
 }
 

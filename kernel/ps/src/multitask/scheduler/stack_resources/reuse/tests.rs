@@ -206,20 +206,18 @@ fn pristine_descriptor_absence_cannot_discard_unowned_close_or_reader_custody_on
     let _fixture = scheduler::tests::boxed_scheduler();
     let old = RESOURCES[SLOT].with(|r| r.reservation_generation);
     for (closing, readers) in [(true, 0), (false, 1)] {
-        RESOURCES[SLOT].with(|r| {
-            r.closing = closing;
-            r.frame_readers = readers;
-        });
+        RESOURCES[SLOT].with(|r| r.closing = closing);
+        // ORDERING: native fixture models reader custody on the real counter.
+        RESOURCES[SLOT].readers.store(readers, Ordering::Release);
         assert!(admission::reserve(SLOT, ID).is_none());
         RESOURCES[SLOT].with(|r| {
             assert_eq!(r.reservation_generation, old);
             assert!(r.reservation.is_none());
         });
     }
-    RESOURCES[SLOT].with(|r| {
-        r.closing = false;
-        r.frame_readers = 0;
-    });
+    RESOURCES[SLOT].with(|r| r.closing = false);
+    // ORDERING: native fixture models reader custody on the real counter.
+    RESOURCES[SLOT].readers.store(0, Ordering::Release);
     let ticket = admission::reserve(SLOT, ID).unwrap();
     assert!(ticket.begin_cancel());
     ticket.finish_cancel();

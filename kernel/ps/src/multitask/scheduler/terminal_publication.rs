@@ -10,6 +10,9 @@ use crate::multitask::{cpu_local, current_identity as identity};
 use retirement_cleanup::producer::Producer;
 
 fn quiescent(slot: usize) -> bool {
+    // Preserve the SAME terminal producer until the outgoing image has been
+    // sealed/published. Detaching its process metadata mid-return is forbidden.
+    if outgoing_image::frozen(slot) { return false; }
     let cpu = nucleus_core::util::lockdep::current_cpu_index();
     let own_current = cpu_local::task_execution_owner(slot)
         == Some(cpu_local::TaskExecutionOwner::Current(cpu))
@@ -192,7 +195,8 @@ pub(super) unsafe fn drain_guarded(eligible_cpus: &dyn Fn(usize) -> u64) {
         0,
         "deferred task retirement drained from interrupt context"
     );
-    for slot in FIRST_DYNAMIC_TASK_SLOT..MAX_TASK {
+    // Only a non-idle retirement row can hold a deferred producer to claim.
+    for slot in super::retirement_cleanup::busy_slots() {
         let id = stack_resources::task_start::read(slot).map(|s| s.id);
         let Some(owner) = terminal_quarantine::claim(slot, id) else {
             continue;

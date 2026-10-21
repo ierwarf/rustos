@@ -24,6 +24,64 @@ pub(super) enum FrameCapture<'a> {
     Invalid(&'static str),
 }
 
+pub(super) enum FrameSelectionError { Stale, Invalid(&'static str) }
+
+/// Original validated frame custody, not a scalar selection result. Reader
+/// exclusion and backing survive policy selection, funding and the final CAS.
+/// Non-Send via its owned reader; IRQ exclusion must span capture to consume.
+pub(super) struct FrameSelection {
+    cpu: usize,
+    id: u64,
+    token: frame_publication::StableFrameToken,
+    custody: FrameCustody,
+    return_to_user: bool,
+    reader: stack_resources::frame_readers::PinnedFrameReader,
+}
+impl FrameSelection {
+    /// # Safety
+    /// The original selecting CPU remains IRQ/preemption-excluded until this
+    /// loan is dropped or consumed into a DispatchFrame of that SAME turn.
+    pub(super) unsafe fn capture(
+        cpu: usize, slot: usize, expected_id: u64, generation: u64,
+        rsp: usize, custody: FrameCustody,
+    ) -> Result<Self, FrameSelectionError> {
+        use FrameSelectionError::{Stale, Invalid};
+        let token = match custody {
+            FrameCustody::Local => frame_publication::local_frame_token(slot, cpu),
+            FrameCustody::Direct => frame_publication::direct_handoff_frame_token(slot, cpu),
+            FrameCustody::Current => frame_publication::current_local_frame_token(slot, cpu),
+        }.ok_or(Stale)?;
+        if !rustos_scheduler_frame_gate::selected_local_frame_identity(
+            generation, token.owner_generation, rsp, token.saved_rsp,
+        ) { return Err(Stale); }
+        let id = current_identity::read_dispatch(slot).and_then(|p| p.task_id).ok_or(Stale)?;
+        if id != expected_id { return Err(Stale); }
+        // SAFETY: the caller retains the original masked CPU scope.
+        let reader = unsafe { frame_publication::read_for_identity(token, id, cpu) }.ok_or(Stale)?;
+        let mut view = token.view;
+        if let Some(intact) = reader.owned_canary_intact() {
+            view.stack_canary_intact &= intact;
+        }
+        let validation = context_validation::validate_published_saved_context(slot, rsp, view);
+        // SAFETY: original backing and reader exclusion span the validated POD
+        // header. No producer may execute/write it before this loan is consumed.
+        let return_to_user = validation.is_ok() && unsafe {
+            (*(rsp as *const super::SavedContext)).cs == crate::arch::gdt::user_code_selector().0 as u64
+        };
+        if !DispatchFrame::token_current(token, cpu, custody)
+            || !current_identity::read_dispatch(slot).is_some_and(|p| p.task_id == Some(id)) {
+            return Err(Stale);
+        }
+        validation.map_err(Invalid)?;
+        Ok(Self { cpu, id, token, custody, return_to_user, reader })
+    }
+    pub(super) fn slot(&self) -> usize { self.token.slot }
+    pub(super) fn id(&self) -> u64 { self.id }
+    pub(super) fn generation(&self) -> u64 { self.token.owner_generation }
+    pub(super) fn custody(&self) -> FrameCustody { self.custody }
+    pub(super) fn saved_rsp(&self) -> usize { self.token.saved_rsp }
+}
+
 pub(super) struct DispatchFrame<'a> {
     turn: &'a CpuDispatchTurn<'static>,
     cpu: usize,
@@ -35,7 +93,7 @@ pub(super) struct DispatchFrame<'a> {
     // claim section with this non-Copy frame/allocation and original funding,
     // never a pin.
     class_sequence: u64,
-    pin: stack_resources::StackPin,
+    reader: stack_resources::frame_readers::PinnedFrameReader,
 }
 
 pub(super) struct FundedFrame<'a> {
@@ -68,62 +126,29 @@ impl<'a> DispatchFrame<'a> {
         if matches!(custody, FrameCustody::Current) && slot != original {
             return FrameCapture::Stale;
         }
-        let token = match custody {
-            FrameCustody::Local => frame_publication::local_frame_token(slot, cpu),
-            FrameCustody::Direct => frame_publication::direct_handoff_frame_token(slot, cpu),
-            FrameCustody::Current => frame_publication::current_local_frame_token(slot, cpu),
-        };
-        let Some(token) = token else {
-            return FrameCapture::Stale;
-        };
-        if !rustos_scheduler_frame_gate::selected_local_frame_identity(
-            generation, token.owner_generation, rsp, token.saved_rsp,
-        ) {
+        // SAFETY: this same original turn excludes local IRQ/preemption.
+        match unsafe { FrameSelection::capture(cpu, slot, expected_id, generation, rsp, custody) } {
+            Ok(selection) => Self::from_selection(turn, selection, class_sequence),
+            Err(FrameSelectionError::Stale) => FrameCapture::Stale,
+            Err(FrameSelectionError::Invalid(reason)) => FrameCapture::Invalid(reason),
+        }
+    }
+
+    /// Consume the original selected loan, never reacquire backing or validate
+    /// a second image. Mutable owner/identity/class/funding admission still
+    /// runs here and at the final CAS while the SAME reader excludes writers.
+    pub(super) fn from_selection(
+        turn: &'a CpuDispatchTurn<'static>, selection: FrameSelection, class_sequence: u64,
+    ) -> FrameCapture<'a> {
+        let Some((cpu, original)) = turn.original_current() else { return FrameCapture::Stale; };
+        if cpu != selection.cpu
+            || (matches!(selection.custody, FrameCustody::Current) && selection.slot() != original)
+            || !Self::token_current(selection.token, cpu, selection.custody)
+            || !current_identity::read_dispatch(selection.slot()).is_some_and(|p| p.task_id == Some(selection.id)) {
             return FrameCapture::Stale;
         }
-        let Some(id) = current_identity::read_dispatch(slot).and_then(|p| p.task_id) else {
-            return FrameCapture::Stale;
-        };
-        if id != expected_id {
-            return FrameCapture::Stale;
-        }
-        let Some(pin) = frame_publication::pin_for_identity(token, id) else {
-            return FrameCapture::Stale;
-        };
-        // SAFETY: the borrowed original turn excludes local IRQ/preemption;
-        // this real allocation pin precedes reader admission and any byte read.
-        let Some(reader) = (unsafe { stack_resources::frame_readers::acquire(&pin, cpu) }) else {
-            return FrameCapture::Stale;
-        };
-        let mut view = token.view;
-        if let Some(intact) = stack_resources::owned_canary_intact(slot) {
-            view.stack_canary_intact &= intact;
-        }
-        let validation = context_validation::validate_published_saved_context(slot, rsp, view);
-        // SAFETY: the exact allocation pin and actual FrameReader still retain
-        // immutable bytes; successful header validation proves this RSP's bounds.
-        let return_to_user = validation.is_ok() && unsafe {
-            (*(rsp as *const super::SavedContext)).cs == crate::arch::gdt::user_code_selector().0 as u64
-        };
-        let exact = Self::token_current(token, cpu, custody)
-            && current_identity::read_dispatch(slot).is_some_and(|p| p.task_id == Some(id));
-        drop(reader);
-        if !exact {
-            return FrameCapture::Stale;
-        }
-        if let Err(reason) = validation {
-            return FrameCapture::Invalid(reason);
-        }
-        FrameCapture::Ready(Self {
-            turn,
-            cpu,
-            id,
-            token,
-            custody,
-            return_to_user,
-            class_sequence,
-            pin,
-        })
+        let FrameSelection { cpu, id, token, custody, return_to_user, reader } = selection;
+        FrameCapture::Ready(Self { turn, cpu, id, token, custody, return_to_user, class_sequence, reader })
     }
 
     fn token_current(
@@ -190,6 +215,10 @@ impl<'a> DispatchFrame<'a> {
         })
     }
 
+    pub(super) fn original_reader(&self) -> &stack_resources::frame_readers::PinnedFrameReader {
+        &self.reader
+    }
+
     pub(super) fn slot(&self) -> usize {
         self.token.slot
     }
@@ -213,7 +242,9 @@ impl FundedFrame<'_> {
             self.funding.funding.as_ref()) {
             return false;
         }
-        stack_resources::cpu_leases::prepare(cpu, self.frame.pin);
+        // The same admitted reader spans validation, funding and owner CAS;
+        // consume it only now, outside every claim leaf, into the CPU bank.
+        stack_resources::cpu_leases::prepare(cpu, self.frame.reader.into_pin());
         self.frame.turn.retain_claimed_return(super::return_architecture::ClaimedReturn {
             id: self.frame.id,
             token: self.frame.token,

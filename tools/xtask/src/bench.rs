@@ -24,6 +24,7 @@ mod component_disassembly;
 mod components;
 mod lifecycle;
 mod local_shadow;
+mod tails;
 pub(crate) use components::bench_components;
 use lifecycle::{
     LifecycleTotal, lifecycle_trace_holds, parse_lifecycle_milestone, render_lifecycle,
@@ -264,6 +265,7 @@ struct ParsedRun {
     counters: Vec<CounterTotal>,
     local_shadow: LocalShadowTotal,
     lifecycle: Vec<LifecycleTotal>,
+    tails: tails::Data,
 }
 
 fn parse_log(log: &str) -> Result<ParsedRun> {
@@ -274,6 +276,7 @@ fn parse_log(log: &str) -> Result<ParsedRun> {
     let mut counters: Vec<CounterTotal> = Vec::new();
     let mut local_shadow = LocalShadowTotal::default();
     let mut lifecycle: Vec<LifecycleTotal> = Vec::new();
+    let mut tails = tails::Data::default();
     let mut saw_end = false;
     // Scheduler policy is system-wide too, but IPC bench writes its TSC record
     // only after its isolate-settle interval. Its explicit begin marker is the
@@ -305,6 +308,9 @@ fn parse_log(log: &str) -> Result<ParsedRun> {
                 },
                 None => bail!("malformed ipcbench result line: {rest}"),
             }
+        } else if line.starts_with(tails::PREFIX) || line.starts_with(tails::SAMPLE_PREFIX) {
+            anyhow::ensure!(inside_run, "ipcbench tail outside its measurement window");
+            tails.record(line)?;
         } else if let Some(rest) = line.strip_prefix(SKIP_PREFIX) {
             anyhow::ensure!(inside_run, "ipcbench skip outside its measurement window");
             skipped.push(rest.trim().to_owned());
@@ -369,6 +375,7 @@ fn parse_log(log: &str) -> Result<ParsedRun> {
     if results.is_empty() {
         bail!("ipcbench finished but reported no results");
     }
+    tails.validate(&results)?;
     phases.sort_by(|left, right| right.per_sample().cmp(&left.per_sample()));
     counters.sort_by(|left, right| left.name.cmp(&right.name));
     lifecycle.sort_by(|left, right| left.name.cmp(&right.name));
@@ -380,6 +387,7 @@ fn parse_log(log: &str) -> Result<ParsedRun> {
         counters,
         local_shadow,
         lifecycle,
+        tails,
     })
 }
 
@@ -695,9 +703,10 @@ fn render_isolated(run: &ParsedRun, probe: &str, rustos_vcpus: u8, check: &str) 
     let counters = render_counters(&run.counters);
     let local_shadow = render_local_shadow(&run.local_shadow);
     let lifecycle = render_lifecycle(&run.lifecycle);
+    let tails = run.tails.render();
     format!(
         "\n=== ipcbench (isolated: {probe}, rustos_vcpus={rustos_vcpus}) ===\n\
-         {table}{phases}{counters}{local_shadow}{lifecycle}\nisolation check: PASS ({check})\n"
+         {table}{tails}{phases}{counters}{local_shadow}{lifecycle}\nisolation check: PASS ({check})\n"
     )
 }
 
@@ -875,7 +884,8 @@ pub(crate) fn bench(
     let counters = render_counters(&run.counters);
     let local_shadow = render_local_shadow(&run.local_shadow);
     let lifecycle = render_lifecycle(&run.lifecycle);
-    println!("\n=== ipcbench ===\n{table}{derived}{phases}{counters}{local_shadow}{lifecycle}");
+    let tails = run.tails.render();
+    println!("\n=== ipcbench ===\n{table}{tails}{derived}{phases}{counters}{local_shadow}{lifecycle}");
 
     if let Some(path) = compare {
         let previous = fs::read_to_string(path)
@@ -889,7 +899,7 @@ pub(crate) fn bench(
         }
         fs::write(
             path,
-            format!("{table}{derived}{phases}{counters}{lifecycle}"),
+            format!("{table}{tails}{derived}{phases}{counters}{lifecycle}"),
         )
         .with_context(|| format!("write baseline {}", path.display()))?;
         println!("baseline written to {}", path.display());

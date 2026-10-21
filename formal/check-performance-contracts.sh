@@ -538,9 +538,9 @@ if rg -Fq 'linux_clock_nanosleep_admission_cached' \
     exit 1
 fi
 storaged_block=services/storaged/src/block.rs
-rg -Fq 'const READ_AHEAD_IN_FLIGHT_LIMIT: usize = READ_CACHE_WINDOW_LIMIT;' \
+rg -Fq 'const _: () = assert!(READ_AHEAD_IN_FLIGHT_LIMIT < READ_CACHE_WINDOW_LIMIT);' \
     "$storaged_block" || {
-    echo "storaged read-ahead pipeline lost its cache-budget bound" >&2
+    echo "storaged read-ahead pipeline lost its cache headroom bound" >&2
     exit 1
 }
 rg -Fq 'let mut in_flight = Vec::with_capacity(windows.len());' \
@@ -864,6 +864,40 @@ rg -Fq 'work_budget::charge_acquire_for_class::<CLASS>(acquire_cpu);' \
     echo 'const-generic tracked-lock acquisition no longer routes through the shipping budget gate' >&2
     exit 1
 }
+
+# Pin + saved-header reader admission is one resource leaf, with a real counted
+# host witness. The owned guard must not reacquire the leaf on release/transfer.
+for witness in \
+    'FRAME_READ_MAX_RESOURCE_ACQUISITIONS: u32 = 1' \
+    'unsafe fn pin_and_acquire(' \
+    'cell.pin_locked(resources, task_id, view)' \
+    'impl Drop for ReaderRegistration' \
+    'fn owned_reader_uses_one_leaf_and_release_or_pin_transfer_use_none()' ; do
+    rg -Fq "$witness" libs/rustos-user-abi/src/performance.rs \
+        kernel/ps/src/multitask/scheduler/stack_resources/frame_readers.rs \
+        kernel/ps/src/multitask/scheduler/stack_resources/frame_readers/tests.rs || {
+        echo "combined frame-reader resource budget witness missing: $witness" >&2
+        exit 1
+    }
+done
+
+# Captured wait custody keeps its original UID/backing; accessor effects must
+# not reopen Resources53. Selected frame consumption likewise keeps one reader.
+for witness in \
+    'CURRENT_WAIT_MAX_RESOURCE_REACQUISITIONS: u32 = 0' \
+    'OUTGOING_IMAGE_MAX_RESOURCE_ACQUISITIONS: u32 = 1' \
+    'fn actual_post_producer_image_uses_one_leaf_through_validation_and_architecture_reuse()' \
+    'fn actual_current_wait_reuses_original_custody_without_resource_reacquisition()' \
+    'fn actual_selection_consumes_same_guard_with_one_resource_admission()' \
+    'fn actual_selection_promotes_only_its_own_reader_after_final_owner_cas()' ; do
+    rg -Fq "$witness" libs/rustos-user-abi/src/performance.rs \
+        kernel/ps/src/multitask/scheduler/current_wait/tests.rs \
+        kernel/ps/src/multitask/scheduler/current_return/tests.rs \
+        kernel/ps/src/multitask/scheduler/dispatch_claim/tests.rs || {
+        echo "original custody acquisition budget witness missing: $witness" >&2
+        exit 1
+    }
+done
 
 # Detailed reply polling needs the endpoint-message lock before the reply lock.
 # The published message id is only a lock-order hint: insertion publishes it,

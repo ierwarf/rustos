@@ -134,6 +134,19 @@ pub const SCHEDULER_DISPATCH_MAX_CATALOG_ACQUISITIONS: u32 = 1;
 /// path answers from the published per-slot state instead.
 pub const IPC_SYSCALL_MAX_PROCESS_TABLE_ACQUISITIONS: u32 = 2;
 
+/// Resource-leaf acquisitions to pin exact backing AND admit a saved-frame
+/// reader. Releasing the reader, or retaining only its pin, takes no leaf.
+/// This bounds one admission, not an entire IPC round trip.
+pub const FRAME_READ_MAX_RESOURCE_ACQUISITIONS: u32 = 1;
+
+/// An original masked Current wait loan already retains UID and physical
+/// backing. Its accessors/atomic wait effects must not re-admit that custody.
+pub const CURRENT_WAIT_MAX_RESOURCE_REACQUISITIONS: u32 = 0;
+
+/// One post-producer outgoing image qualification; validation, architecture
+/// comparison and RSP sealing borrow that SAME image without another leaf.
+pub const OUTGOING_IMAGE_MAX_RESOURCE_ACQUISITIONS: u32 = 1;
+
 /// Global process-table acquisitions required to validate one already-pinned
 /// process against an exact published process/MM generation.
 ///

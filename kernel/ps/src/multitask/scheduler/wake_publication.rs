@@ -62,6 +62,11 @@ pub(in crate::multitask) fn wake_task(task_id: u64) -> bool {
     let mut preemption = nucleus_core::util::lockdep::DispatchPreemption::enter();
     preemption.mask_irqs();
     let result = wake(&preemption, task_id, &runqueue_policy::online_affinity_mask);
+    if !result {
+        // Refused while the target still waits: keep that exact wait for a
+        // retry at this CPU's next scheduler entry instead of losing it.
+        let _ = super::wake_retry::record_in(&preemption, task_id, None);
+    }
     #[cfg(not(test))]
     crate::multitask::irq::flush_deferred_target_reschedules();
     result
@@ -100,7 +105,13 @@ fn wake_user_in(
         else { return false; };
     if !binding.context().user_mode { return false; }
     // SAFETY: original masked CPU and original user BindingPin survive all effects.
-    unsafe { guarded_owned(binding, eligible) }
+    let woken = unsafe { guarded_owned(binding, eligible) };
+    if !woken {
+        // Only a user target reaches here, so the retry cannot widen the
+        // user-wake authority; it replays exactly the refused wait instance.
+        let _ = super::wake_retry::record_in(scope, id, None);
+    }
+    woken
 }
 
 pub(in crate::multitask) fn wake(
@@ -269,6 +280,10 @@ pub(super) fn pager_service_with(
     if !typed_scope_valid(scope) || process_id == 0 {
         return None;
     }
+    // A pager-service wait has no deadline: a wake refused in a transient
+    // window would leave pagerd parked with the control request unserved.
+    let mut refused = [0_u64; 4];
+    let mut refused_len = 0;
     for slot in 0..MAX_TASK {
         // Advisory pre-filter: pinning a binding for every slot just to read
         // its process id dominated this search. The captured binding's exact
@@ -288,7 +303,7 @@ pub(super) fn pager_service_with(
             continue;
         }
         // SAFETY: original masked CPU survives SAME physical binding and typed phase.
-        if let Ok(binding) = unsafe {
+        match unsafe {
             retained_wake_matching(
                 binding,
                 Some((runqueue::wait::REASON_PAGER_SERVICE, 0)),
@@ -296,11 +311,24 @@ pub(super) fn pager_service_with(
                 |_| true,
             )
         } {
-            let id = binding.id();
-            drop(binding);
-            return Some(id);
+            Ok(binding) => {
+                let id = binding.id();
+                drop(binding);
+                return Some(id);
+            }
+            Err(false) if refused_len < refused.len() => {
+                refused[refused_len] = id;
+                refused_len += 1;
+            }
+            Err(_) => {}
         }
     }
+    // No worker woke: retry the first one still parked on this exact wait.
+    // `record_in` ignores candidates that were refused for not waiting.
+    let pager_service = Some((runqueue::wait::REASON_PAGER_SERVICE, 0));
+    let _ = refused[..refused_len]
+        .iter()
+        .any(|&id| super::wake_retry::record_in(scope, id, pager_service));
     None
 }
 

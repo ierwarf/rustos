@@ -190,9 +190,8 @@ fn actual_direct_fifo_selection_retains_consumed_generation_through_original_cla
         // so it cannot manufacture a CurrentReturn. Drive the SAME production
         // DispatchFrame engine from the actual consumed Candidate and turn;
         // whole outgoing/architecture/ACK remains covered separately/modeled.
-        let token = frame_publication::direct_handoff_frame_token(slot, 0).unwrap();
-        let FrameCapture::Ready(frame) = DispatchFrame::capture(turn, candidate.slot,
-            candidate.id, candidate.generation, token.saved_rsp, candidate.custody)
+        let FrameCapture::Ready(frame) = DispatchFrame::from_selection(turn, candidate.frame,
+            donation_ledger::class_publication_sequence())
             else { panic!("consumed Direct generation lost physical frame"); };
         assert!(frame.prepare().unwrap().claim());
         assert!(super::super::execution_interval::original_claim_is_active(turn));

@@ -189,7 +189,11 @@ pub(super) unsafe fn transfer_terminal_sigchld(
         };
         // SAFETY: original caller custody; same original target loan survives
         // signal bits through queue effects, even if terminal begins meanwhile.
+        let id = binding.id();
         if wake && !unsafe { super::wake_publication::guarded_owned(binding, eligible_cpus) } {
+            // SIGCHLD stays pending on the recipient; retry its parked wait.
+            // SAFETY: the caller retains this CPU's original masked scope.
+            let _ = unsafe { super::wake_retry::record_under_caller_scope(id, None) };
             return;
         }
         let mut source = LINUX_THREAD_STATES[retiring].lock();

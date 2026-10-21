@@ -18,7 +18,16 @@ pub(super) fn refused_wake_can_keep_delivered_reply(
 ) -> bool {
     kernel_ipc_runtime::api::endpoint_reply_custody_returned(reply, caller)
         || (donation_admitted
-            && kernel_ipc_runtime::api::endpoint::received_request_retains_custody(reply, caller))
+            && (kernel_ipc_runtime::api::endpoint::received_request_retains_custody(reply, caller)
+                // A fast frame its receiver already took or answered: the
+                // request is executing (or done) under that receiver, and
+                // cancelling it lost a service launch at eight vCPUs.
+                || kernel_ipc_runtime::api::endpoint::fast_request_owned_by_receiver(reply, caller)
+                // Still queued with admitted custody: exactly the state an
+                // enqueue with no parked receiver leaves, served by the next
+                // receive. Cancelling it raced that receive and killed a
+                // service launch at eight vCPUs.
+                || kernel_ipc_runtime::api::endpoint::queued_request_retains_custody(reply, caller)))
 }
 
 /// Bounded retries of a cold call handoff refused with `ReceiverMismatch`.
@@ -140,8 +149,13 @@ mod tests {
         let (reply, candidate) = endpoint::enqueue_call_with_handles_priority_and_custody(
             endpoint, CALLER, b"request", &[], ipc::EndpointCallPriority::Ordinary, custody).unwrap();
         assert_eq!(candidate, Some(RECEIVER));
-        assert!(!refused_wake_can_keep_delivered_reply(reply, CALLER, true),
-            "the sender's own bind cannot prove delivery of a still-queued request");
+        // Still queued with admitted custody is the no-parked-receiver state:
+        // the next receive serves it. Cancelling it here raced that receive
+        // and killed a service launch at eight vCPUs.
+        assert!(refused_wake_can_keep_delivered_reply(reply, CALLER, true),
+            "a queued request with admitted custody waits for the next receive");
+        assert!(!refused_wake_can_keep_delivered_reply(reply, CALLER, false),
+            "without admitted donation a queued request is still cancelled");
         assert!(matches!(endpoint::receive_or_wait(endpoint, RECEIVER, 16, 0, false).unwrap(),
             endpoint::EndpointReceive::Queued((actual, _, _, caller)) if actual == reply && caller == CALLER));
         let delivered = refused_wake_can_keep_delivered_reply(reply, CALLER, true);

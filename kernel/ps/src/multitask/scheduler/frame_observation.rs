@@ -83,9 +83,8 @@ unsafe fn observe_inner(
         return None;
     }
     let task_id = current_identity::read_dispatch(slot)?.task_id?;
-    let allocation = frame_publication::pin_for_identity(token, task_id)?;
     // SAFETY: observe() retains own-CPU IRQ exclusion throughout this copy.
-    let frame_reader = unsafe { stack_resources::frame_readers::acquire(&allocation, cpu) }?;
+    let frame_reader = unsafe { frame_publication::read_for_identity(token, task_id, cpu) }?;
     if !same_observation(
         token,
         frame_publication::observed_frame_token(slot, cpu, executing)?,
@@ -103,7 +102,6 @@ unsafe fn observe_inner(
         return None;
     }
     drop(frame_reader);
-    drop(allocation);
     Some(snapshot)
 }
 

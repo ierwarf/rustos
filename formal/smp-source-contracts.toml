@@ -6,7 +6,7 @@ path = "kernel/ps/src/multitask/scheduler/pager_handoff.rs"
 tokens = ["fn latency_floor(", "sender.original_pin()", "worker.original_pin()", "!sender.committed_pager(token)", "ready_floor(cpu,", "lower_vruntime_ceiling(receiver, donor_floor.min(class_floor))", "fn handoff(", "handoff_with(scope, sender, token, worker_id", "fn handoff_with(", "!ipc_publication::scoped(scope)", "!sender.committed_pager(token)", "Binding::resolve(worker_id)", "retained_wake_matching(worker,", "Some((runqueue::wait::REASON_PAGER_SERVICE, 0))", "latency_floor(sender, token, worker, scope.cpu())", "TypedWake::capture(&worker,", "REASON_PAGER_SERVICE, 0", "ipc_publication::eligible(&worker, target)", "ipc_publication::publish_with(scope, &worker, &typed, target", "latency_floor(sender, token, &worker, target)", "drop(typed)", "drop(worker)"]
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/ipc_publication.rs"
-tokens = ["fn publish_with(", "frame_readers::acquire(&pin, cpu)", "Publication::begin(scope, target)", "sync_handoff::publish_original(", "typed.publish_and_clear(", "claim_blocked_handoff(slot, expected, target, local)", "bind_local_owner_generation(slot, original.generation)", "publish_handoff_mailbox(slot, original,", "last_effect()", "drop(publication)", "drop(reader)", "drop(pin)"]
+tokens = ["fn publish_with(", "frame_publication::read_for_identity(token, binding.id(), cpu)", "Publication::begin(scope, target)", "sync_handoff::publish_original(", "typed.publish_and_clear(", "claim_blocked_handoff(slot, expected, target, local)", "bind_local_owner_generation(slot, original.generation)", "publish_handoff_mailbox(slot, original,", "last_effect()", "drop(publication)", "drop(reader)"]
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/return_architecture.rs"
 tokens = ["struct CurrentArchitecture<'a>", "current: &'a super::CurrentWait", "scope: &'a", "!super::ipc_publication::scoped(scope)", "current.original_pin()", "return_view(pin.slot())", "!view.user_mode_task", "retained_architecture(", "pin.slot(), pin.id(), view", "Some(Self { current, scope, state })", "fn install(self)", "self.current.cpu()", "self.scope.is_masked()", "load_address_space_phys(PhysAddr::new(self.state.root))", "set_privilege_stack(self.state.stack_top)", "set_kernel_stack_top(self.state.stack_top)", "install_segments(self.state, true)", "fn install_segments(", "DS::set_reg(selector)", "FsBase::write(VirtAddr::new(state.fs))", "prepare_for_context_return(user, state.gs)"]
@@ -23,7 +23,7 @@ reason = "The entire legacy fault worker/floor/resume authority bodies are genui
 # loans/reader/CPU phase precede a bounded leaf join, never a fresh owner retry.
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/ipc_publication.rs"
-tokens = ["fn publish(", "let expected = runqueue::owner(slot)", "frame_publication::pin_for_identity(token, binding.id())", "stack_resources::frame_readers::acquire(&pin, cpu)", "context_validation::validate_published_saved_context(", "terminal_quarantine::publish(stop)", "dispatch_priority::Publication::begin(scope, target)", "current_identity::with_ipc_handoff_binding(slot, binding.id()", "runqueue::affinity_payload::with_placement_admission(", "sync_handoff::publish_original(", "typed.publish_and_clear(", "runqueue::claim_blocked_handoff(slot, expected, target, local)", "frame_publication::bind_local_owner_generation(slot, original.generation)", "runqueue::publish_handoff_mailbox(slot, original,", "drop(publication)", "drop(reader)", "drop(pin)", "request_target_reschedule(target)", "fn call_before_sender_commit(", "current_wait::CurrentWait::capture()", "sender.matches_armed_reply(reply)", "donation_publication::participant(sender.id())", "donation_publication::participant(receiver_id)", "wake_publication::Binding::from_original(receiver)", "runqueue::wait::TypedWake::capture(", "donation_publication::bind_original(", "publish(scope, &binding, &typed, target)", "before_commit()", "sender.commit()", "drop(typed)", "drop(binding)", "drop(donor)", "drop(sender)"]
+tokens = ["fn publish(", "let expected = runqueue::owner(slot)", "frame_publication::read_for_identity(token, binding.id(), cpu)", "context_validation::validate_published_saved_context(", "terminal_quarantine::publish(stop)", "dispatch_priority::Publication::begin(scope, target)", "current_identity::with_ipc_handoff_binding(slot, binding.id()", "runqueue::affinity_payload::with_placement_admission(", "sync_handoff::publish_original(", "typed.publish_and_clear(", "runqueue::claim_blocked_handoff(slot, expected, target, local)", "frame_publication::bind_local_owner_generation(slot, original.generation)", "runqueue::publish_handoff_mailbox(slot, original,", "drop(publication)", "drop(reader)", "request_target_reschedule(target)", "fn call_before_sender_commit(", "current_wait::CurrentWait::capture()", "sender.matches_armed_reply(reply)", "donation_publication::participant(sender.id())", "donation_publication::participant(receiver_id)", "wake_publication::Binding::from_original(receiver)", "runqueue::wait::TypedWake::capture(", "donation_publication::bind_original(", "publish(scope, &binding, &typed, target)", "before_commit()", "sender.commit()", "drop(typed)", "drop(binding)", "drop(donor)", "drop(sender)"]
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/runqueue/ipc_handoff.rs"
 tokens = ["fn claim_blocked_handoff(", "expected.state != RunOwnerState::Blocked || expected.wait_armed", "expected.next_preserving_wait(state, Some(cpu))", "OWNER_WORDS[slot].compare_exchange(expected, next).ok()?", "Some(next.with_wait(false, 0).with_runnable(true))", "fn publish_handoff_mailbox(", "generation: original.generation"]
@@ -89,7 +89,7 @@ path = "kernel/ps/src/multitask/cpu_local/dispatch_turn.rs"
 tokens = ["fn retain_claimed_return(", "self.original_current().is_some()", "self.claimed_return.get()", "bank.is_none()", "*bank = Some(receipt)", "fn claimed_return(", "self.original_current()?", "fn begin_architecture(", "self.architecture_pending()", "self.architecture_phase.set(1)", "fn mark_architecture_ready(", "self.architecture_phase.get(), 1", "self.architecture_phase.set(2)", "fn publish_return(", "self.architecture_phase.get() == 2 && receipt.slot() == to", "self.seal()", "publish_before_return()"]
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/dispatch_claim.rs"
-tokens = ["let validation =", "let return_to_user = validation.is_ok() && unsafe", "(*(rsp as *const super::SavedContext)).cs", "drop(reader)", "fn claim(", "claim_validated_dispatch", "cpu_leases::prepare", "retain_claimed_return", "token: self.frame.token", "return_to_user: self.frame.return_to_user", "previous: self.previous", "execution_interval::open_claimed(self.frame.turn, self.funding.funding)"]
+tokens = ["let validation =", "let return_to_user = validation.is_ok() && unsafe", "(*(rsp as *const super::SavedContext)).cs", "fn claim(", "claim_validated_dispatch", "cpu_leases::prepare(cpu, self.frame.reader.into_pin())", "retain_claimed_return", "token: self.frame.token", "return_to_user: self.frame.return_to_user", "previous: self.previous", "execution_interval::open_claimed(self.frame.turn, self.funding.funding)"]
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/stack_resources/context.rs"
 tokens = ["fn retained_architecture(", "owns_current(cpu, slot)", "owns_prepared(cpu, slot)", "RESOURCES.get(slot)?", "cell.with(|r|", "cell.pins.load(Ordering::Acquire) == 0", "(r.start?.id, r.binding?) != (id, (id, super::Geometry::from_view(view)))", "r.frame_writing", "view.user_mode_task != c.user_mode", "mm.matches(handle, root)", "ArchitectureState"]
@@ -129,10 +129,10 @@ tokens = ["fn rehome_queued_frame(", "frame: &super::super::dispatcher::maintena
 # component refinements, not a joint architecture/guard deletion certificate.
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/dispatch_claim.rs"
-tokens = ["struct DispatchFrame<'a>", "turn: &'a CpuDispatchTurn<'static>", "token: frame_publication::StableFrameToken", "pin: stack_resources::StackPin", "fn capture(", "turn.original_current()", "slot != original", "rustos_scheduler_frame_gate::selected_local_frame_identity(", "generation, token.owner_generation, rsp, token.saved_rsp,", "id != expected_id", "frame_publication::pin_for_identity(token, id)", "frame_readers::acquire(&pin, cpu)", "owned_canary_intact(slot)", "view.stack_canary_intact &= intact", "validate_published_saved_context(slot, rsp, view)", "Self::token_current(token, cpu, custody)", "drop(reader)", "fn is_current(", "self.turn.original_current()", "Self::token_current(self.token, self.cpu, self.custody)", "p.task_id == Some(self.id)", "fn prepare(", "prepare_grant(self.token.slot, self.cpu)", "funding.task_id != self.id || !self.is_current()", "fn with_admission", "with_class_claim(self.class_sequence", "pin.with_dispatch_admission(self.cpu", "fn claim(", "claim_validated_dispatch(&self.frame", "cpu_leases::prepare(cpu, self.frame.pin)", "retain_claimed_return", "id: self.frame.id", "token: self.frame.token", "running_generation: self.frame.token.owner_generation.checked_add(1)", "execution_interval::open_claimed(self.frame.turn, self.funding.funding)"]
+tokens = ["struct FrameSelection", "reader: stack_resources::frame_readers::PinnedFrameReader", "unsafe fn capture(", "rustos_scheduler_frame_gate::selected_local_frame_identity(", "generation, token.owner_generation, rsp, token.saved_rsp,", "id != expected_id", "frame_publication::read_for_identity(token, id, cpu)", "reader.owned_canary_intact()", "view.stack_canary_intact &= intact", "validate_published_saved_context(slot, rsp, view)", "DispatchFrame::token_current(token, cpu, custody)", "validation.map_err(Invalid)?", "struct DispatchFrame<'a>", "turn: &'a CpuDispatchTurn<'static>", "reader: stack_resources::frame_readers::PinnedFrameReader", "fn capture_selected(", "turn.original_current()", "slot != original", "FrameSelection::capture(", "fn from_selection(", "cpu != selection.cpu", "Self::token_current(selection.token, cpu, selection.custody)", "FrameSelection { cpu, id, token, custody, return_to_user, reader } = selection", "class_sequence, reader", "fn is_current(", "self.turn.original_current()", "Self::token_current(self.token, self.cpu, self.custody)", "p.task_id == Some(self.id)", "fn prepare(", "prepare_grant(self.token.slot, self.cpu)", "funding.task_id != self.id || !self.is_current()", "fn with_admission", "with_class_claim(self.class_sequence", "pin.with_dispatch_admission(self.cpu", "fn claim(", "claim_validated_dispatch(&self.frame", "cpu_leases::prepare(cpu, self.frame.reader.into_pin())", "retain_claimed_return", "id: self.frame.id", "token: self.frame.token", "running_generation: self.frame.token.owner_generation.checked_add(1)", "execution_interval::open_claimed(self.frame.turn, self.funding.funding)"]
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/runqueue/claim.rs"
-tokens = ["fn claim_validated_dispatch(", "Some(frame.generation()), Some(frame), funding", "fn admitted_claim", "frame.with_admission(funding, claim)", "fn claim_dispatch_inner(", "with_claim_activation(slot, cpu, || {", "if frame.is_some_and(|frame| !frame.is_current())", "compare_exchange(owner, owner.next(RunOwnerState::Running, Some(cpu)))", "with_claim_activation(slot, cpu, || {", "if frame.is_some_and(|frame| !frame.is_current())", "compare_exchange(owner, next)"]
+tokens = ["fn claim_validated_dispatch(", "Some(frame.generation()), Some(frame), funding", "fn admitted_claim", "frame.with_admission(funding, claim)", "fn claim_dispatch_inner(", "with_claim_activation_for_reader(slot, cpu,", "frame.map(|frame| frame.original_reader())", "if frame.is_some_and(|frame| !frame.is_current())", "compare_exchange(owner, owner.next(RunOwnerState::Running, Some(cpu)))", "with_claim_activation_for_reader(slot, cpu,", "frame.map(|frame| frame.original_reader())", "if frame.is_some_and(|frame| !frame.is_current())", "compare_exchange(owner, next)"]
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/scheduling_runtime.rs"
 tokens = ["impl FundingPin {", "fn with_dispatch_admission", "with_published_budget_pair(self.stamp, cpu", "!context.is_eligible(now_ns) || !domain.is_eligible(now_ns)", "claim()"]
@@ -150,10 +150,10 @@ path = "kernel/ps/src/multitask/scheduler/stack_resources.rs"
 tokens = ["fn current_return_binding(", "cpu_leases::owns_current(cpu, slot)", "RESOURCES.get(slot)?", "resources.start?.id", "resources.context?", "view.user_mode_task != context.user_mode", "cell.pins.load(Ordering::Acquire) == 0", "resources.reservation.is_some()", "resources.frame_writing", "resources.binding != Some((id, Geometry::from_view(view)))", "Some(id)"]
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/current_return.rs"
-tokens = ["struct CurrentReturn<'a>", "turn: &'a CpuDispatchTurn<'static>", "fn capture(", "turn.original_current()?", "frame_publication::return_view(slot)?", "current_return_binding(cpu, slot, view)?", "RunOwnerState::Running && owner.cpu == Some(cpu)", "!owner.state.is_terminal()", "fn check(", "self.turn.original_current()", "Some(self.id)", "fn account(", "if let Some(elapsed) = self.accounted", "execution_interval::consume(self.cpu, self.slot, self.id)", "fn validate(", "if self.frame_published", "self.return_rsp == Some(rsp)", "self.live_view()", "fn live_view(", "owned_canary_intact", "fn publish_frame(", "if self.frame_published", "self.publication.is_none()", "set_saved_rsp(self.slot, rsp)", "let v = self.live_view()", "frame_publication::publish(", "self.return_rsp = Some(rsp)", "self.frame_published = true", "fn publish_queue(", "if let Some(publication) = self.publication", "self.accounted.is_some() && self.frame_published", "runqueue::publish_return(", "self.publication = Some(publication)"]
+tokens = ["struct CurrentReturn<'a>", "turn: &'a CpuDispatchTurn<'static>", "fn capture(", "turn.original_current()?", "frame_publication::return_view(slot)?", "current_return_binding(cpu, slot, view)?", "RunOwnerState::Running && owner.cpu == Some(cpu)", "!owner.state.is_terminal()", "fn check(", "self.turn.original_current()", "self.turn.outgoing_image()", "image.id == self.id", "image.matches_view(self.view)", "fn account(", "if let Some(elapsed) = self.accounted", "execution_interval::consume(self.cpu, self.slot, self.id)", "fn validate(", "if self.frame_published", "self.return_rsp == Some(rsp)", "self.live_view()", "fn live_view(", "canary_intact()", "fn publish_frame(", "if self.frame_published", "self.publication.is_none()", "set_saved_rsp(self.slot, rsp)", "let v = self.live_view()", "frame_publication::publish(", "self.return_rsp = Some(rsp)", "self.frame_published = true", "fn publish_queue(", "if let Some(publication) = self.publication", "self.accounted.is_some() && self.frame_published", "runqueue::publish_return(", "self.publication = Some(publication)"]
 [[required_sequences]]
 path = "kernel/ps/src/multitask/cpu_local/irq_entry.rs"
-tokens = ["fn dispatch(", "self.save_simd()", "let mut outgoing", "CurrentReturn::capture(self.turn())", "dispatcher::fast(&mut outgoing", "return (result, true)", "dispatcher::dispatch(&mut outgoing"]
+tokens = ["fn dispatch(", "self.save_simd()", "let mut outgoing", "CurrentReturn::capture_dispatch(self.turn())", "dispatcher::fast(&mut outgoing", "return (result, true)", "dispatcher::dispatch(&mut outgoing"]
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/dispatcher.rs"
 tokens = ["fn prologue(", "outgoing.slot()", "outgoing.account(", "outgoing.publish_frame(rsp, false)", "outgoing.publish_queue(local)", "fn claim(", "FrameCapture::Ready(frame) => frame.prepare().is_some_and(|funded| funded.claim())", "pub(in crate::multitask) fn fast(", "if !turn.owns_priority_choice()", "prologue(outgoing, rsp, true)", "let class_sequence = donation_ledger::class_publication_sequence()", "if claim(outgoing, candidate, class_sequence)", "else { None }"]
@@ -171,7 +171,7 @@ reason = "Fast IPC must publish through original return CAS and carry its receip
 
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/dispatcher.rs"
-tokens = ["fn fair(", "local_dispatch::choose_local_next(cpu, current, voluntary, runtime", "runqueue::local_runnable_sequence(cpu)", "donation_ledger::class_publication_sequence()", "Ok((slot, generation))", "current_identity::read_dispatch(slot).and_then(|p| p.task_id).ok_or", "Candidate { slot, id, generation", "fn retry_fair(", "local_dispatch::retry_incomplete_policy(|| fair("]
+tokens = ["fn fair(", "local_dispatch::choose_local_next_with(cpu, current, voluntary, runtime", "runqueue::local_runnable_sequence(cpu)", "donation_ledger::class_publication_sequence()", "local_candidate(slot, cpu, Urgency::Fair)", "selected = Some(candidate)", "Ok((slot, generation))", "current_identity::read_dispatch(slot).and_then(|p| p.task_id).ok_or", "candidate.slot != slot || candidate.generation != generation", "Ok(Some(candidate))", "fn retry_fair(", "local_dispatch::retry_incomplete_policy(|| fair("]
 
 # Complete exec image producer owns exact physical fields and unchanged Current return.
 [[forbidden_patterns]]
@@ -235,7 +235,7 @@ tokens = ["fn capture(", "retirement_cleanup::reuse::begin(slot, Some(id))?", "s
 
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/stack_resources/admission.rs"
-tokens = ["fn reserve(", "resources.reclaim.is_some()", "resources.closing", "resources.mm_pin.is_some()", "resources.frame_readers != 0", "reservation_generation.checked_add(1)?"]
+tokens = ["fn reserve(", "resources.reclaim.is_some()", "resources.closing", "resources.mm_pin.is_some()", "cell.readers.load(Ordering::Acquire) != 0", "reservation_generation.checked_add(1)?"]
 
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/stack_resources/reuse.rs"
@@ -324,7 +324,7 @@ tokens = ["fn admit_initial(", "image: &super::super::bootstrap::InitialCpu", "i
 
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/stack_resources.rs"
-tokens = ["fn assert_boot_vacant()", "r.context.is_none()", "r.reservation.is_none()", "r.frame_readers == 0", "cell.pins.load(Ordering::Acquire) == 0", "execution::count(slot) == 0"
+tokens = ["fn assert_boot_vacant()", "r.context.is_none()", "r.reservation.is_none()", "cell.readers.load(Ordering::Acquire) == 0", "cell.pins.load(Ordering::Acquire) == 0", "execution::count(slot) == 0"
 ]
 
 [[required_sequences]]
@@ -1296,7 +1296,7 @@ tokens = [
 # The fallback's own fresh claim is a separate guard, not refined here.
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/dispatcher.rs"
-tokens = ["fn claim(", "candidate.generation, token.saved_rsp, candidate.custody", "FrameCapture::Ready(frame) => frame.prepare().is_some_and(|funded| funded.claim())", "if !success && matches!(candidate.custody, FrameCustody::Direct)", "Some(candidate.generation)", "pub(in crate::multitask) fn dispatch(", "if claim(outgoing, candidate, class_sequence) { return complete(outgoing, urgency); }", "Decision::Claimed(urgency) => return complete", "Decision::Empty | Decision::Incomplete", "dispatch_claim::claim_fallback(turn, idle, class_sequence)", "complete(outgoing, Urgency::Fair)"]
+tokens = ["fn claim(", "DispatchFrame::from_selection(outgoing.original_turn(), candidate.frame, class_sequence)", "FrameCapture::Ready(frame) => frame.prepare().is_some_and(|funded| funded.claim())", "if !success && matches!(candidate.custody, FrameCustody::Direct)", "Some(candidate.generation)", "pub(in crate::multitask) fn dispatch(", "if claim(outgoing, candidate, class_sequence) { return complete(outgoing, urgency); }", "Decision::Claimed(urgency) => return complete", "Decision::Empty | Decision::Incomplete", "dispatch_claim::claim_fallback(turn, idle, class_sequence)", "complete(outgoing, Urgency::Fair)"]
 
 [[forbidden_patterns]]
 scope = "kernel/ps/src/multitask/scheduler/handoffs.rs"
@@ -1335,7 +1335,7 @@ tokens = [
     "fn first_turn(",
     "if atomic { policy.atomic_activation_pick_hints.front() } else { policy.spawn_pick_hints.front() }",
     "current_identity::read_dispatch(slot).is_some_and(|p| p.task_id != Some(task_id)",
-    "DispatchFrame::capture_selected(turn, slot, task_id, candidate.generation",
+    "DispatchFrame::from_selection(turn, candidate.frame, class_sequence)",
     "frame.prepare().is_some_and(|funded| funded.claim())",
     "if matches!(decision, Decision::Incomplete) { return decision; }",
     "policy.atomic_activation_pick_hints.pop()",
@@ -1353,7 +1353,7 @@ tokens = ["fn first_turn_fifo()", "for atomic in [true, false]", "dispatch_claim
 
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/dispatcher.rs"
-tokens = ["fn first_turn(", "FirstTurnHandoff { slot, task_id }", "local_candidate(slot, cpu, if atomic", "if let Decision::Selected(candidate)", "DispatchFrame::capture_selected(turn, slot, task_id, candidate.generation", "FrameCustody::Local", "funded.claim()", "Decision::Claimed(candidate.urgency)", "if matches!(decision, Decision::Incomplete) { return decision; }", "policy.atomic_activation_pick_hints.pop()", "checked_sub(1)"]
+tokens = ["fn first_turn(", "FirstTurnHandoff { slot, task_id }", "local_candidate(slot, cpu, if atomic", "if let Decision::Selected(candidate)", "DispatchFrame::from_selection(turn, candidate.frame, class_sequence)", "funded.claim()", "Decision::Claimed(candidate.urgency)", "if matches!(decision, Decision::Incomplete) { return decision; }", "policy.atomic_activation_pick_hints.pop()", "checked_sub(1)"]
 
 # Positive budget/lifecycle admission has NO negative/missing catalog fallback.
 # Exact original claim separately revalidates physical CPU/frame/funding custody.
@@ -1414,7 +1414,7 @@ tokens = [
 
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/dispatcher.rs"
-tokens = ["fn synchronous(", "sync_handoff::take_next_ready(", "record.has_current_dispatch_custody()", "record.bound_direct_generation().is_some()", "local_dispatch::qualified_direct_handoff_generation(", "local_dispatch::qualified_local_handoff_generation(", "expected != g", "materialize(record, cpu)", "record.bind_selected_local_owner(", "record.claim_generation()", "FrameCustody::Direct", "FrameCustody::Local", "None => Decision::Incomplete"]
+tokens = ["fn synchronous(", "sync_handoff::take_next_ready_with(", "record.has_current_dispatch_custody()", "local_dispatch::published_candidate_admission(", "record.bound_direct_generation().is_some()", "FrameCustody::Direct", "FrameCustody::Local", "record.bound_direct_generation().unwrap_or_else", "selected_candidate(slot, cpu, record.task_id(), generation, custody", "selected = Some(candidate)", "materialize(record, cpu)", "record.bind_selected_local_owner(", "record.slot() == candidate.slot && record.task_id() == candidate.id", "record.claim_generation() == Some(candidate.generation)"]
 
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/local_dispatch/fair_retry.rs"
@@ -1490,7 +1490,7 @@ tokens = [
 # carries a fresh Local owner generation or abandons the consumed hint.
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/dispatcher.rs"
-tokens = ["fn local_candidate(", "local_dispatch::qualified_local_handoff_generation(", "Ok(Some(generation))", "current_identity::read_dispatch(slot).and_then(|p| p.task_id)", "Candidate { slot, id, generation, custody: FrameCustody::Local", "None => Decision::Incomplete", "fn hint(", "next_pick_hint.take()", "local_dispatch::refuse_unproven_hint_priority(", "local_dispatch::user_hint_blocked_by_system(", "local_candidate(slot, cpu, Urgency::Hint)"]
+tokens = ["fn local_candidate(", "local_dispatch::published_candidate_admission(", "Ok(true)", "current_identity::read_dispatch(slot).and_then(|p| p.task_id)", "selected_candidate(slot, cpu, id, runqueue::owner(slot).generation, FrameCustody::Local", "None => Decision::Incomplete", "fn hint(", "next_pick_hint.take()", "local_dispatch::refuse_unproven_hint_priority(", "local_dispatch::user_hint_blocked_by_system(", "local_candidate(slot, cpu, Urgency::Hint)"]
 
 # The executing frame has a fresh IRQ RSP, not the old published saved RSP.
 # Its published geometry is bound to this CPU's Running owner and the same
@@ -1543,12 +1543,12 @@ tokens = [
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/dispatch_claim.rs"
 tokens = [
-    "fn capture_selected(", "turn.original_current()",
-    "FrameCustody::Current) && slot != original", "frame_publication::current_local_frame_token(slot, cpu)",
-    "rustos_scheduler_frame_gate::selected_local_frame_identity(",
-    "pin_for_identity(token, id)", "frame_readers::acquire(&pin, cpu)",
+    "unsafe fn capture(", "FrameCustody::Current => frame_publication::current_local_frame_token(slot, cpu)",
+    "rustos_scheduler_frame_gate::selected_local_frame_identity(", "read_for_identity(token, id, cpu)",
     "context_validation::validate_published_saved_context(slot, rsp, view)",
-    "Self::token_current(token, cpu, custody)", "drop(reader)",
+    "DispatchFrame::token_current(token, cpu, custody)", "fn capture_selected(", "turn.original_current()",
+    "FrameCustody::Current) && slot != original", "fn from_selection(",
+    "cpu != selection.cpu", "Self::token_current(selection.token, cpu, selection.custody)",
     "fn prepare(self)", "self.is_current()", "scheduling_context::dispatch::prepare_grant",
     "funding.task_id != self.id || !self.is_current()",
 ]
@@ -1565,7 +1565,7 @@ tokens = [
 
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/dispatcher.rs"
-tokens = ["fn synchronous(", "p.task_id == Some(record.task_id()) && p.lifecycle_dispatchable()", "record.has_current_dispatch_custody()", "record.bound_direct_generation().is_some()", "qualified_direct_handoff_generation(", "qualified_local_handoff_generation(", "materialize(record, cpu)", "Some(record) => match record.claim_generation()", "id: record.task_id(), generation", "FrameCustody::Direct", "FrameCustody::Local"]
+tokens = ["fn synchronous(", "p.task_id == Some(record.task_id()) && p.lifecycle_dispatchable()", "record.has_current_dispatch_custody()", "published_candidate_admission(", "record.bound_direct_generation().is_some()", "FrameCustody::Direct", "FrameCustody::Local", "selected_candidate(slot, cpu, record.task_id(), generation, custody", "selected = Some(candidate)", "materialize(record, cpu)", "Some(record) => match selected", "record.slot() == candidate.slot && record.task_id() == candidate.id", "record.claim_generation() == Some(candidate.generation)"]
 
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/handoffs.rs"
@@ -1597,7 +1597,7 @@ tokens = [
 # only a generation-bound Local candidate or the guarded idle/current fallback.
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/dispatcher.rs"
-tokens = ["fn fair(", "local_dispatch::choose_local_next(", "runqueue::local_runnable_sequence(cpu)", "donation_ledger::class_publication_sequence()", "Ok((slot, generation))", "FrameCustody::Current", "FrameCustody::Local", "fn retry_fair(", "local_dispatch::retry_incomplete_policy(|| fair(", "pub(in crate::multitask) fn dispatch(", "Decision::Empty | Decision::Incomplete", "dispatch_claim::claim_fallback(turn, idle, class_sequence)"]
+tokens = ["fn fair(", "local_dispatch::choose_local_next_with(", "runqueue::local_runnable_sequence(cpu)", "donation_ledger::class_publication_sequence()", "Ok((slot, generation))", "FrameCustody::Current", "FrameCustody::Local", "fn retry_fair(", "local_dispatch::retry_incomplete_policy(|| fair(", "pub(in crate::multitask) fn dispatch(", "Decision::Empty | Decision::Incomplete", "dispatch_claim::claim_fallback(turn, idle, class_sequence)"]
 
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/local_dispatch/fair_retry.rs"
@@ -1615,7 +1615,7 @@ tokens = [
 
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/dispatcher.rs"
-tokens = ["fn claim(", "match candidate.custody", "frame_publication::local_frame_token", "frame_publication::direct_handoff_frame_token", "frame_publication::current_local_frame_token", "DispatchFrame::capture_selected(outgoing.original_turn(), candidate.slot, candidate.id", "candidate.generation, token.saved_rsp, candidate.custody", "FrameCapture::Ready(frame) => frame.prepare().is_some_and(|funded| funded.claim())", "FrameCapture::Invalid(reason)", "FrameCapture::Stale => false", "fn complete(", "dispatch_policy::record_completed_choice(cpu,"]
+tokens = ["fn claim(", "candidate.frame.saved_rsp()", "DispatchFrame::from_selection(outgoing.original_turn(), candidate.frame, class_sequence)", "FrameCapture::Ready(frame) => frame.prepare().is_some_and(|funded| funded.claim())", "FrameCapture::Invalid(reason)", "FrameCapture::Stale => false", "if !success && matches!(candidate.custody, FrameCustody::Direct)", "Some(candidate.generation)", "fn complete(", "dispatch_policy::record_completed_choice(cpu,"]
 
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/dispatcher.rs"
@@ -1915,7 +1915,7 @@ tokens = ["fn defer(owner: Producer)", "terminal_quarantine::publish(owner)", "f
 # generation through its final claim; losing that CAS cannot execute the peer.
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/dispatcher.rs"
-tokens = ["fn synchronous(", "record.claim_generation()", "Candidate { slot: record.slot(), id: record.task_id(), generation", "None => Decision::Incomplete", "fn claim(", "candidate.generation, token.saved_rsp, candidate.custody", "funded.claim()", "if !success && matches!(candidate.custody, FrameCustody::Direct)", "Some(candidate.generation)", "pub(in crate::multitask) fn fast(", "if claim(outgoing, candidate, class_sequence)", "else { None }"]
+tokens = ["fn synchronous(", "selected = Some(candidate)", "record.claim_generation() == Some(candidate.generation)", "Decision::Selected(candidate)", "fn claim(", "DispatchFrame::from_selection(outgoing.original_turn(), candidate.frame, class_sequence)", "funded.claim()", "if !success && matches!(candidate.custody, FrameCustody::Direct)", "Some(candidate.generation)", "pub(in crate::multitask) fn fast(", "if claim(outgoing, candidate, class_sequence)", "else { None }"]
 
 # A catalog-free frame observation is usable only after exact Local or
 # DirectHandoff custody, an even coherent publication, and a final epoch
@@ -2021,13 +2021,13 @@ tokens = [
     "let mut first_revalidation_failure = None;",
     "Ok(None) => continue,",
     "if let Some(reason) = first_revalidation_failure {",
-    "match candidate_is_qualified(slot, cpu, eligibility_now_ns) {",
+    "match qualify(slot, cpu, eligibility_now_ns) {",
     "Ok(None) => return fallback(LocalFallbackReason::LifecycleIneligible),",
 ]
 
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/dispatcher.rs"
-tokens = ["local_dispatch::user_reservation_due(cpu)", "let class_sequence = donation_ledger::class_publication_sequence()", "class_sequence & 1 != 0", "match retry_fair(", "let class = local_dispatch::observed_class(candidate.slot)", "donation_ledger::class_publication_sequence() != class_sequence", "return Decision::Incomplete", "Ok(local_dispatch::LocalClass::User) => return Decision::Selected(candidate)", "Err(_) => return Decision::Incomplete", "fn claim(", "DispatchFrame::capture_selected(", "funded.claim()"]
+tokens = ["local_dispatch::user_reservation_due(cpu)", "let class_sequence = donation_ledger::class_publication_sequence()", "class_sequence & 1 != 0", "match retry_fair(", "let class = local_dispatch::observed_class(candidate.slot)", "donation_ledger::class_publication_sequence() != class_sequence", "return Decision::Incomplete", "Ok(local_dispatch::LocalClass::User) => return Decision::Selected(candidate)", "Err(_) => return Decision::Incomplete", "fn claim(", "DispatchFrame::from_selection(", "funded.claim()"]
 
 # A complete Local fair/overdue/reservation, first-turn or empty-fair idle
 # frame is checked again at final dispatch. A bound DirectHandoff uses its
@@ -2037,17 +2037,17 @@ tokens = ["local_dispatch::user_reservation_due(cpu)", "let class_sequence = don
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/dispatch_claim.rs"
 tokens = [
-    "fn capture_selected(", "FrameCustody::Local => frame_publication::local_frame_token(slot, cpu)",
+    "unsafe fn capture(", "FrameCustody::Local => frame_publication::local_frame_token(slot, cpu)",
     "rustos_scheduler_frame_gate::selected_local_frame_identity(",
-    "let Some(pin) = frame_publication::pin_for_identity(token, id)",
-    "frame_readers::acquire(&pin, cpu)", "context_validation::validate_published_saved_context(",
-    "Self::token_current(token, cpu, custody)", "drop(reader)",
-    "return FrameCapture::Invalid(reason)", "FrameCapture::Ready(Self {", "pin,",
+    "frame_publication::read_for_identity(token, id, cpu)", "reader.owned_canary_intact()",
+    "context_validation::validate_published_saved_context(", "DispatchFrame::token_current(token, cpu, custody)",
+    "validation.map_err(Invalid)?", "fn from_selection(", "FrameSelection { cpu, id, token, custody, return_to_user, reader } = selection",
+    "FrameCapture::Ready(Self {", "class_sequence, reader",
 ]
 
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/dispatcher.rs"
-tokens = ["struct Candidate { slot: usize, id: u64, generation: u64, custody: FrameCustody", "fn first_turn(", "DispatchFrame::capture_selected(turn, slot, task_id, candidate.generation", "FrameCustody::Local", "funded.claim()", "Decision::Claimed(candidate.urgency)", "fn claim(", "FrameCustody::Local => frame_publication::local_frame_token", "FrameCustody::Direct => frame_publication::direct_handoff_frame_token", "FrameCustody::Current => frame_publication::current_local_frame_token", "DispatchFrame::capture_selected(outgoing.original_turn(), candidate.slot, candidate.id", "candidate.generation, token.saved_rsp, candidate.custody", "funded.claim()", "pub(in crate::multitask) fn dispatch(", "dispatch_claim::claim_fallback(turn, idle, class_sequence)"]
+tokens = ["struct Candidate { slot: usize, id: u64, generation: u64, custody: FrameCustody", "frame: FrameSelection", "fn selected_candidate(", "FrameCustody::Local => frame_publication::local_frame_token", "FrameCustody::Direct => frame_publication::direct_handoff_frame_token", "FrameCustody::Current => frame_publication::current_local_frame_token", "FrameSelection::capture(cpu, slot, id, generation, token.saved_rsp, custody)", "fn first_turn(", "DispatchFrame::from_selection(turn, candidate.frame, class_sequence)", "funded.claim()", "Decision::Claimed(candidate.urgency)", "fn claim(", "DispatchFrame::from_selection(outgoing.original_turn(), candidate.frame, class_sequence)", "funded.claim()", "pub(in crate::multitask) fn dispatch(", "dispatch_claim::claim_fallback(turn, idle, class_sequence)"]
 
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/local_dispatch.rs"
@@ -2067,32 +2067,33 @@ tokens = ["fn claim_fallback(", "frame_publication::current_local_frame_token(or
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/dispatch_claim.rs"
 tokens = [
-    "fn capture_selected(", "FrameCustody::Direct => frame_publication::direct_handoff_frame_token(slot, cpu)",
+    "unsafe fn capture(", "FrameCustody::Direct => frame_publication::direct_handoff_frame_token(slot, cpu)",
     "rustos_scheduler_frame_gate::selected_local_frame_identity(",
-    "let Some(pin) = frame_publication::pin_for_identity(token, id)",
-    "frame_readers::acquire(&pin, cpu)", "context_validation::validate_published_saved_context(",
-    "Self::token_current(token, cpu, custody)", "drop(reader)",
-    "return FrameCapture::Invalid(reason)", "FrameCapture::Ready(Self {", "pin,",
+    "frame_publication::read_for_identity(token, id, cpu)", "reader.owned_canary_intact()",
+    "context_validation::validate_published_saved_context(", "DispatchFrame::token_current(token, cpu, custody)",
+    "validation.map_err(Invalid)?", "fn from_selection(", "FrameSelection { cpu, id, token, custody, return_to_user, reader } = selection",
+    "FrameCapture::Ready(Self {", "class_sequence, reader",
 ]
 
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/dispatcher.rs"
-tokens = ["fn synchronous(", "record.claim_generation()", "FrameCustody::Direct", "FrameCustody::Local", "None => Decision::Incomplete", "fn claim(", "FrameCustody::Direct => frame_publication::direct_handoff_frame_token", "FrameCapture::Stale => false", "if !success && matches!(candidate.custody, FrameCustody::Direct)", "runqueue::materialize_direct_handoff_with_generation(", "Some(candidate.generation)"]
+tokens = ["fn synchronous(", "FrameCustody::Direct", "FrameCustody::Local", "selected_candidate(", "selected = Some(candidate)", "record.claim_generation() == Some(candidate.generation)", "Decision::Incomplete", "fn claim(", "DispatchFrame::from_selection(outgoing.original_turn(), candidate.frame, class_sequence)", "FrameCapture::Stale => false", "if !success && matches!(candidate.custody, FrameCustody::Direct)", "runqueue::materialize_direct_handoff_with_generation(", "Some(candidate.generation)"]
 
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/dispatcher.rs"
-tokens = ["fn materialize(", "record.claim_generation()", "runqueue::materialize_direct_handoff_with_generation(", "Some(generation)", "fn synchronous(", "qualified_direct_handoff_generation(", "qualified_local_handoff_generation(", "fn claim(", "candidate.generation, token.saved_rsp, candidate.custody", "FrameCapture::Ready(frame) => frame.prepare().is_some_and(|funded| funded.claim())", "if !success && matches!(candidate.custody, FrameCustody::Direct)", "Some(candidate.generation)", "pub(in crate::multitask) fn fast(", "immediate.is_none()", "if claim(outgoing, candidate, class_sequence)"]
+tokens = ["fn materialize(", "record.claim_generation()", "runqueue::materialize_direct_handoff_with_generation(", "Some(generation)", "fn synchronous(", "published_candidate_admission(", "record.bound_direct_generation().unwrap_or_else", "selected_candidate(", "selected = Some(candidate)", "record.claim_generation() == Some(candidate.generation)", "fn claim(", "DispatchFrame::from_selection(outgoing.original_turn(), candidate.frame, class_sequence)", "FrameCapture::Ready(frame) => frame.prepare().is_some_and(|funded| funded.claim())", "if !success && matches!(candidate.custody, FrameCustody::Direct)", "Some(candidate.generation)", "pub(in crate::multitask) fn fast(", "immediate.is_none()", "if claim(outgoing, candidate, class_sequence)"]
 
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/dispatcher.rs"
 tokens = ["fn synchronous(", "sync_handoff::pending(cpu)",
-    "sync_handoff::take_next_ready(cpu, local_dispatch::local_fair_competitor_ready(cpu)",
+    "sync_handoff::take_next_ready_with(cpu, || local_dispatch::local_fair_competitor_ready(cpu)",
     "p.task_id == Some(record.task_id()) && p.lifecycle_dispatchable()",
     "!record.has_current_dispatch_custody()", "materialize(record, cpu)",
-    "record.bound_direct_generation().is_some()", "qualified_direct_handoff_generation(",
-    "qualified_local_handoff_generation(", "qualification.ok().flatten().is_none_or(",
+    "published_candidate_admission(", "record.bound_direct_generation().is_some()",
+    "record.bound_direct_generation().unwrap_or_else", "selected_candidate(", "selected = Some(candidate)",
     "materialize(record, cpu)", "record.bind_selected_local_owner(runqueue::owner(record.slot()), cpu)",
-    "record.claim_generation()", "None => Decision::Incomplete"]
+    "record.slot() == candidate.slot && record.task_id() == candidate.id",
+    "record.claim_generation() == Some(candidate.generation)"]
 
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/local_dispatch.rs"
@@ -2123,9 +2124,10 @@ tokens = [
 
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/dispatcher.rs"
-tokens = ["fn local_candidate(", "local_dispatch::qualified_local_handoff_generation(",
-    "Ok(Some(generation))", "current_identity::read_dispatch(slot).and_then(|p| p.task_id)",
-    "Decision::Selected(Candidate", "None => Decision::Incomplete", "Ok(None) => Decision::Empty", "Err(_) => Decision::Incomplete"]
+tokens = ["fn local_candidate(", "local_dispatch::published_candidate_admission(",
+    "Ok(true)", "current_identity::read_dispatch(slot).and_then(|p| p.task_id)",
+    "selected_candidate(slot, cpu, id, runqueue::owner(slot).generation, FrameCustody::Local",
+    "None => Decision::Incomplete", "Ok(false) => Decision::Empty", "Err(_) => Decision::Incomplete"]
 
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/sync_handoff.rs"
@@ -2144,11 +2146,11 @@ tokens = [
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/dispatcher.rs"
 tokens = ["fn synchronous(",
-    "sync_handoff::take_next_ready(cpu, local_dispatch::local_fair_competitor_ready(cpu), |record| {",
+    "sync_handoff::take_next_ready_with(cpu, || local_dispatch::local_fair_competitor_ready(cpu), |record| {",
+    "FrameCustody::Direct", "FrameCustody::Local", "selected_candidate(", "selected = Some(candidate)",
     "record.bind_selected_local_owner(runqueue::owner(record.slot()), cpu)",
-    "record.claim_generation()", "FrameCustody::Direct", "FrameCustody::Local",
-    "fn claim(", "FrameCustody::Direct => frame_publication::direct_handoff_frame_token",
-    "candidate.generation, token.saved_rsp, candidate.custody",
+    "record.claim_generation() == Some(candidate.generation)",
+    "fn claim(", "DispatchFrame::from_selection(outgoing.original_turn(), candidate.frame, class_sequence)",
     "FrameCapture::Ready(frame) => frame.prepare().is_some_and(|funded| funded.claim())"]
 
 [[required_sequences]]
@@ -2195,7 +2197,7 @@ tokens = [
 path = "kernel/ps/src/multitask/scheduler/local_dispatch.rs"
 tokens = [
     "let generation = if slot == current_slot && current_is_live {",
-    "candidate_is_qualified(slot, cpu, eligibility_now_ns)",
+    "qualify(slot, cpu, eligibility_now_ns)",
     "Ok((slot, generation))",
 ]
 
@@ -2471,12 +2473,12 @@ tokens = [
     "saved_rsp.checked_add(SAVED_CONTEXT_BYTES)?",
     "token.view.context_stack_contains(saved_rsp, end)",
     "current_identity::read_dispatch(slot)?.task_id?",
-    "frame_publication::pin_for_identity(token, task_id)?",
+    "frame_publication::read_for_identity(token, task_id, cpu)",
     "same_observation(",
     "context_validation::copy_saved_context(saved_rsp)",
     "FrameSnapshot::from_saved(saved)",
     "same_observation(",
-    "drop(allocation)",
+    "drop(frame_reader)",
     "Some(snapshot)",
 ]
 
@@ -2511,8 +2513,10 @@ tokens = [
     "pin_for_identity(token, task_id)",
     "fn pin_for_identity(",
     "super::stack_resources::pin_view(token.slot, task_id, token.view)?",
-    "read(token.slot)?.frame_epoch != token.frame_epoch",
-    "Some(pin)",
+    "recheck_pin_epoch(token)?", "Some(pin)",
+    "unsafe fn read_for_identity(", "frame_readers::pin_and_acquire(token.slot, task_id, token.view, cpu)",
+    "recheck_pin_epoch(token)?", "Some(reader)",
+    "fn recheck_pin_epoch(", "read(token.slot)?.frame_epoch != token.frame_epoch",
     "fn invalidate_before_image_write(",
     "begin_write(slot)",
     "finish_write(slot, version)",
@@ -2728,7 +2732,7 @@ tokens = ["fn begin(", "let key = Credential", "stack_resources::with_cold_bindi
 
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/stack_resources/frame_readers.rs"
-tokens = ["fn acquire", "resources.reservation.is_some()", "resources.frame_readers.checked_add(1)?", "fn claim_eligible", "resources.reservation.is_some()", "fn with_claim_activation", "if !claim_eligible(resources)", "with_placement_admission"]
+tokens = ["fn acquire", "resources.reservation.is_some()", "count.checked_add(1)).ok()?", "fn claim_eligible", "let allowed = u32::from(original.is_some())", "core::ptr::eq(cell, &RESOURCES[reader.pin.slot])", "resources.reservation.is_some()", "readers != allowed", "fn with_claim_activation_for_reader", "if !claim_eligible(&RESOURCES[slot], resources, original)", "with_placement_admission"]
 
 # Prepublication thread tickets own exact slot/UID/nonce and quarantine
 # abandonment. Cross-owner process/MM and cold arbitration still retain guard.
@@ -2816,27 +2820,31 @@ tokens = [
 path = "kernel/ps/src/multitask/scheduler/stack_resources/frame_readers.rs"
 tokens = [
     "unsafe fn acquire", "caller_irq_disabled", "cell.with(|resources|",
-    "resources.frame_writing", "let owner = runqueue::owner(pin.slot)",
-    "owns_current(cpu, pin.slot)", "owns_prepared(cpu, pin.slot)",
-    "!caller_irq_disabled", "owner.cpu != Some(cpu) || !bank", "task_execution_owner(pin.slot)",
-    "resources.frame_readers.checked_add(1)", "impl Drop for FrameReader", ".checked_sub(1)",
-    "fn claim_eligible", "resources.frame_readers != 0 || resources.frame_writing",
-    "resources.closing", "fn with_claim_activation", "RESOURCES.get(slot)?.with(|resources|",
-    "if !claim_eligible(resources)", "activation::capture(resources, slot, cpu)", "affinity_payload::with_placement_admission(", "Some((claimed, activation))",
+    "unsafe fn pin_and_acquire", "caller_irq_state(cpu)?", "cell.with(|resources|",
+    "cell.pin_locked(resources, task_id, view)", "pin = Some(StackPin { slot })",
+    "register(cell, resources, slot, cpu, caller_irq_disabled)",
+    "fn register(", "resources.frame_writing", "let owner = runqueue::owner(slot)",
+    "owns_current(cpu, slot)", "owns_prepared(cpu, slot)",
+    "!caller_irq_disabled", "owner.cpu != Some(cpu) || !bank", "task_execution_owner(slot)",
+    "count.checked_add(1)", "impl Drop for ReaderRegistration", ".checked_sub(1)",
+    "fn claim_eligible", "readers != allowed || resources.frame_writing",
+    "resources.closing", "fn with_claim_activation_for_reader", "RESOURCES.get(slot)?.with(|resources|",
+    "if !claim_eligible(&RESOURCES[slot], resources, original)", "activation::capture(resources, slot, cpu)", "affinity_payload::with_placement_admission(", "Some((claimed, activation))",
 ]
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/runqueue/claim.rs"
 tokens = [
-    "owner.state == RunOwnerState::DirectHandoff", "with_claim_activation(slot, cpu, ||",
-    "OWNER_WORDS[slot]", ".compare_exchange(owner, owner.next(RunOwnerState::Running, Some(cpu)))",
-    "let mut rq = RUN_QUEUES[cpu].inner.lock()", "with_claim_activation(slot, cpu, ||",
+    "owner.state == RunOwnerState::DirectHandoff", "with_claim_activation_for_reader(slot, cpu,",
+    "frame.map(|frame| frame.original_reader())", "OWNER_WORDS[slot]", ".compare_exchange(owner, owner.next(RunOwnerState::Running, Some(cpu)))",
+    "let mut rq = RUN_QUEUES[cpu].inner.lock()", "with_claim_activation_for_reader(slot, cpu,",
+    "frame.map(|frame| frame.original_reader())",
     "OWNER_WORDS[slot].compare_exchange(owner, next)", "if let Err(observed) = claim", "rq.remove(slot, weight)",
 ]
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/frame_observation.rs"
 tokens = [
-    "pin_for_identity(token, task_id)", "frame_readers::acquire(&allocation, cpu)",
-    "same_observation(", "copy_saved_context(saved_rsp)", "same_observation(", "drop(frame_reader)", "drop(allocation)",
+    "read_for_identity(token, task_id, cpu)",
+    "same_observation(", "copy_saved_context(saved_rsp)", "same_observation(", "drop(frame_reader)",
 ]
 
 # A non-lock CPU unit owns admission, Current and IRQ/preemption through return.
@@ -2994,7 +3002,7 @@ tokens = ["fn with_claim", "with_writer(slot", "eligible(writer)", "acquire(slot
 
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/stack_resources/frame_readers.rs"
-tokens = ["fn with_claim_activation", "execution::with_claim", "RESOURCES.get(slot)?", "claim_eligible(resources)", "Some(start.id) != identity.task_id", "activation::capture", "affinity_payload::with_placement_admission(", "resources.start.map(|start| start.id)", "Some((claimed, activation))", "Some((None, activation)) => Some(ClaimAttempt::Refused { activation, permit })", "None => Some(ClaimAttempt::Refused { activation: None, permit })"]
+tokens = ["fn with_claim_activation_for_reader", "execution::with_claim", "RESOURCES.get(slot)?", "claim_eligible(&RESOURCES[slot], resources, original)", "Some(start.id) != identity.task_id", "activation::capture", "affinity_payload::with_placement_admission(", "resources.start.map(|start| start.id)", "Some((claimed, activation))", "Some((None, activation)) => Some(ClaimAttempt::Refused { activation, permit })", "None => Some(ClaimAttempt::Refused { activation: None, permit })"]
 
 [[required_sequences]]
 path = "kernel/ps/src/multitask/current_identity/execution/banks.rs"
@@ -3016,7 +3024,7 @@ path = "kernel/ps/src/multitask/scheduler/exec_transaction/quiescence.rs"
 tokens = ["census.assert_matches(intent)", "intent.mode_matches(target == current)", "retirement_cleanup::kernel_pending(target)", "stack_resources::task_start::read(target).map(|s| s.id) != Some(intent.task_id())", "for &(slot, id) in census.members()", "stack_resources::task_start::read(slot).map(|s| s.id) != Some(id)", "terminal_quarantine::begin(slot, Some(id)", "terminal_publication::guarded(owner", "let executing = cpu_local::task_execution_owner(slot).is_some()", "identity::execution::count(slot) != 0", "Some(!waiting)"]
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/current_wait.rs"
-tokens = ["struct CurrentWait", "binding: identity::execution::BindingPin", "PhantomData<*mut ()>", "unsafe fn capture(", "cpu_local::current_cpu_task_slot()?", "cpu_leases::owns_current(cpu, slot)", "task_start::read(slot)?.id", "identity::execution::pin_current(cpu, slot, id)", "owner.state != runqueue::RunOwnerState::Running || owner.cpu != Some(cpu)", "fn slot(&self)", "self.binding.slot()", "current_cpu_index(), self.cpu", "cpu_leases::owns_current(self.cpu, slot)", "Some(self.binding.id())", "fn arm(", "try_publish_arm(slot, kind, id)", "fn commit(", "runqueue::wait::commit(slot)", "fn restore_pager(", "self.pager_token.get() != Some(token)", "owner.state.is_terminal()", "return true", "REASON_PAGER_FAULT && id == token", "runqueue::wake_wait(slot)"]
+tokens = ["struct CurrentWait", "binding: identity::execution::BindingPin", "PhantomData<*mut ()>", "unsafe fn capture(", "cpu_local::current_cpu_task_slot()?", "cpu_leases::owns_current(cpu, slot)", "task_start::read(slot)?.id", "identity::execution::pin_current(cpu, slot, id)", "owner.state != runqueue::RunOwnerState::Running || owner.cpu != Some(cpu)", "fn slot(&self)", "self.binding.slot()", "current_cpu_index(), self.cpu", "cpu_leases::owns_current(self.cpu, slot)", "fn arm(", "try_publish_arm(slot, kind, id)", "fn commit(", "runqueue::wait::commit(slot)", "fn restore_pager(", "self.pager_token.get() != Some(token)", "owner.state.is_terminal()", "return true", "REASON_PAGER_FAULT && id == token", "runqueue::wake_wait(slot)"]
 [[required_sequences]]
 path = "kernel/ps/src/multitask/current_identity/execution.rs"
 tokens = ["unsafe fn pin_current(", "cpu_leases::owns_current(cpu, slot)", "retirement_cleanup::with_wake_binding(slot", "with_writer(slot", "writer.lifecycle.retired || writer.lifecycle.suspended", "pin_binding(slot, writer, id)"]
