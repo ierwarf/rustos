@@ -272,9 +272,10 @@ pub(super) fn can_forward(cpu: usize, slot: usize, task_id: u64, owner: u64) -> 
 /// ends. Requires `can_forward` to have held on this masked CPU.
 pub(super) fn forward(
     cpu: usize, from: (usize, u64), to: (usize, u64, u64), reply: u64,
+    clock: &crate::arch::rtc::ClockSample,
 ) -> u64 {
-    let now_ticks = crate::arch::rtc::ticks();
-    let now_local_ns = crate::arch::clock::scheduler_local_nanos();
+    let now_ticks = clock.ticks;
+    let now_local_ns = clock.local_nanos;
     let hop = with_interval(cpu, |cell| {
         let interval = cell.active.as_mut().expect("forwarded interval vanished");
         assert_eq!((interval.slot, interval.task_id), from, "lane forwarded a foreign interval");
@@ -305,10 +306,12 @@ pub(super) fn forward(
 /// the successful claim; its prepared funding moves here exactly as above.
 pub(super) fn open_lane(
     cpu: usize, slot: usize, task_id: u64, running_generation: u64, funding: Option<FundingPin>,
+    clock: &crate::arch::rtc::ClockSample,
 ) {
     assert!(super::stack_resources::cpu_leases::owns_prepared(cpu, slot),
         "lane interval lost its prepared allocation bank");
-    open_interval(cpu, slot, task_id, running_generation, funding);
+    open_interval_at(cpu, slot, task_id, running_generation, funding,
+        clock.ticks, clock.local_nanos.unwrap_or(0));
 }
 
 fn open_interval(
@@ -316,6 +319,13 @@ fn open_interval(
 ) {
     let start_ticks = crate::arch::rtc::ticks();
     let start_local_ns = crate::arch::clock::scheduler_local_nanos().unwrap_or(0);
+    open_interval_at(cpu, slot, task_id, running_generation, funding, start_ticks, start_local_ns);
+}
+
+fn open_interval_at(
+    cpu: usize, slot: usize, task_id: u64, running_generation: u64, funding: Option<FundingPin>,
+    start_ticks: u64, start_local_ns: u64,
+) {
     install(cpu, ExecutionInterval {
         slot,
         task_id,

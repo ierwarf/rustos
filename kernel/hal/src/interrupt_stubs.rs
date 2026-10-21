@@ -91,6 +91,26 @@ global_asm!(
         iretq
     .endm
 
+    // The software-schedule trap without the `int` microcode: build the same
+    // five-word frame the CPU pushes (RSP aligned down first, the pre-alignment
+    // RSP recorded), clear IF as the interrupt gate does, and enter the handler.
+    // The handler's `iretq` resumes at the resume label. Clobbers only r10/r11, which
+    // no trap argument occupies.
+    .macro SOFTWARE_TRAP resume
+        mov r11, rsp
+        and rsp, -16
+        mov r10d, ss
+        push r10
+        push r11
+        pushfq
+        mov r10d, cs
+        push r10
+        lea r10, [rip + \resume]
+        push r10
+        cli
+        jmp software_schedule_interrupt_handler
+    .endm
+
     .macro COMMIT_CONTEXT_SWITCH
         // A kernel-frame pointer may be only 8-byte aligned. Preserve the
         // exact incoming frame in callee-saved r12 while establishing the
@@ -353,24 +373,24 @@ global_asm!(
     .global software_schedule_trap
     .type software_schedule_trap, @function
     software_schedule_trap:
-        int 0x30
-        ret
+        SOFTWARE_TRAP 1f
+    1:  ret
     .size software_schedule_trap, . - software_schedule_trap
 
     .global fast_ipc_call_schedule_trap
     .type fast_ipc_call_schedule_trap, @function
     fast_ipc_call_schedule_trap:
         movabs rax, {fast_ipc_call_schedule_tag}
-        int 0x30
-        ret
+        SOFTWARE_TRAP 1f
+    1:  ret
     .size fast_ipc_call_schedule_trap, . - fast_ipc_call_schedule_trap
 
     .global fast_ipc_reply_schedule_trap
     .type fast_ipc_reply_schedule_trap, @function
     fast_ipc_reply_schedule_trap:
         movabs rax, {fast_ipc_reply_schedule_tag}
-        int 0x30
-        ret
+        SOFTWARE_TRAP 1f
+    1:  ret
     .size fast_ipc_reply_schedule_trap, . - fast_ipc_reply_schedule_trap
 "#,
     fast_ipc_call_schedule_tag = const kernel_lowlevel::interrupts::FAST_IPC_CALL_SCHEDULE_TAG,

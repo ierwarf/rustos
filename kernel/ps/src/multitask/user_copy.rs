@@ -12,7 +12,7 @@
 //! - **Evidence:** `fork-cow-contract.md`; copyout authority unit tests and KVM pread.
 
 use core::ops::Deref;
-use kernel_mm::api::{address_space::ValidatedUserWrite, paging, phys::CowFrameKind};
+use kernel_mm::api::{address_space, address_space::ValidatedUserWrite, paging, phys::CowFrameKind};
 use rustos_user_abi::pager::{
     PagerVmRegionWire, VM_ACCESS_WRITE, VM_COMMIT_COMMITTED, VM_OBJECT_ANONYMOUS,
     VM_OBJECT_FILE_PRIVATE, VM_OBJECT_IMAGE_SECTION, VM_PROT_WRITE, VM_SHARING_PRIVATE,
@@ -64,19 +64,32 @@ impl<'a> UserCopyAddressSpace<'a> {
         len: usize,
     ) -> Result<ValidatedUserWrite<'_>, paging::AddressSpaceError> {
         self.address_space
-            .validate_user_write_resolving_cow(start, len, |page| {
-                // This is the slow path only. Ordinary writable copyout retains
-                // the single-walk fast path and does not scan the VMA table.
-                let (_, region) = pager_vma::lookup_slot(
-                    self.handle,
-                    self.identity,
-                    page.as_u64(),
-                    VM_ACCESS_WRITE,
-                )
-                .map_err(|_| paging::AddressSpaceError::ProtectionViolation)?;
-                let kind = copyout_cow_kind(region)?;
-                self.address_space.resolve_cow_write_for_copyout(page, kind)
-            })
+            .validate_user_write_resolving_cow(start, len, |page| self.resolve_cow_for_copyout(page))
+    }
+
+    /// `validate_user_write` that reuses `memo` for pages this bind already walked.
+    pub(crate) fn validate_user_write_memo(
+        &self,
+        start: VirtAddr,
+        len: usize,
+        memo: &mut address_space::UserTranslationMemo,
+    ) -> Result<ValidatedUserWrite<'_>, paging::AddressSpaceError> {
+        self.address_space
+            .validate_user_write_memo(start, len, memo, |page| self.resolve_cow_for_copyout(page))
+    }
+
+    fn resolve_cow_for_copyout(&self, page: VirtAddr) -> Result<(), paging::AddressSpaceError> {
+        // This is the slow path only. Ordinary writable copyout retains the
+        // single-walk fast path and does not scan the VMA table.
+        let (_, region) = pager_vma::lookup_slot(
+            self.handle,
+            self.identity,
+            page.as_u64(),
+            VM_ACCESS_WRITE,
+        )
+        .map_err(|_| paging::AddressSpaceError::ProtectionViolation)?;
+        let kind = copyout_cow_kind(region)?;
+        self.address_space.resolve_cow_write_for_copyout(page, kind)
     }
 
     pub(crate) fn validate_user_write_buffer(

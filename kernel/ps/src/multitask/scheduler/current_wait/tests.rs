@@ -199,6 +199,26 @@ fn actual_current_wait_physical_bank_without_running_queue_custody_refuses_befor
 }
 
 #[test]
+fn actual_current_slot_wait_operations_refuse_without_running_queue_custody() {
+    super::super::root_creation::tests::exec_root(
+        ID,
+        true,
+        super::super::root_creation::tests::bootstrap(UserAbi::Linux),
+        |slot, _| {
+            assert!(stack_resources::cpu_leases::owns_current(0, slot));
+            assert_eq!(runqueue::owner(slot).state, runqueue::RunOwnerState::Local);
+            // SAFETY: the fixture keeps this CPU's Current bank and IRQ scope.
+            unsafe {
+                assert_eq!(super::arm_current_wait(BlockReason::Generic), None);
+                assert_eq!(super::cancel_current_wait(), None);
+                assert_eq!(super::commit_current_wait(), None);
+            }
+            assert!(!runqueue::wait::armed(slot));
+        },
+    );
+}
+
+#[test]
 fn actual_current_wait_already_committed_wait_refuses_another_arm_or_cancel() {
     root(true, |slot| {
         let wait = capture().unwrap();

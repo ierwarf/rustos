@@ -1014,17 +1014,19 @@ pub fn yield_now() {
 /// matching the formal `CommitCurrentBlock` transition where a blocked task
 /// ceases to own the CPU at the same linearization point.
 pub fn commit_block_current_task_and_yield() -> Option<bool> {
-    let preemption = nucleus_core::util::lockdep::preemption_snapshot();
-    assert!(
-        preemption.depth == 0,
-        "task blocked while raw spin lock held cpu={} apic={:#x} depth={} held_depth={} pending_depth={} class={:?}",
-        preemption.logical_cpu,
-        preemption.apic_id,
-        preemption.depth,
-        preemption.held_depth,
-        preemption.pending_depth,
-        preemption.top_class,
-    );
+    if nucleus_core::util::lockdep::preemption_depth() != 0 {
+        // The six-field snapshot is only the failure report; the gate is one load.
+        let preemption = nucleus_core::util::lockdep::preemption_snapshot();
+        panic!(
+            "task blocked while raw spin lock held cpu={} apic={:#x} depth={} held_depth={} pending_depth={} class={:?}",
+            preemption.logical_cpu,
+            preemption.apic_id,
+            preemption.depth,
+            preemption.held_depth,
+            preemption.pending_depth,
+            preemption.top_class,
+        );
+    }
     interrupts::without_interrupts(|| {
         // SAFETY: original masked CPU scope contains the backing loan; it is
         // dropped before entering the scheduling trap below.
@@ -1053,17 +1055,19 @@ pub fn commit_block_current_task_with_fast_reply_and_yield(
         completion.caller_task_id,
         "fast reply block transition names different caller identities"
     );
-    let preemption = nucleus_core::util::lockdep::preemption_snapshot();
-    assert!(
-        preemption.depth == 0,
-        "task blocked with fast reply while raw spin lock held cpu={} apic={:#x} depth={} held_depth={} pending_depth={} class={:?}",
-        preemption.logical_cpu,
-        preemption.apic_id,
-        preemption.depth,
-        preemption.held_depth,
-        preemption.pending_depth,
-        preemption.top_class,
-    );
+    if nucleus_core::util::lockdep::preemption_depth() != 0 {
+        // The six-field snapshot is only the failure report; the gate is one load.
+        let preemption = nucleus_core::util::lockdep::preemption_snapshot();
+        panic!(
+            "task blocked with fast reply while raw spin lock held cpu={} apic={:#x} depth={} held_depth={} pending_depth={} class={:?}",
+            preemption.logical_cpu,
+            preemption.apic_id,
+            preemption.depth,
+            preemption.held_depth,
+            preemption.pending_depth,
+            preemption.top_class,
+        );
+    }
     interrupts::without_interrupts(|| {
         // SAFETY: original masked CPU scope contains the backing loan; it is
         // dropped before entering the exact reply scheduling trap below.
@@ -1139,17 +1143,19 @@ pub fn commit_fast_ipc_call_handoff_and_yield(
     reply: u64,
     receiver_task_id: u64,
 ) -> super::scheduler::FastIpcCallHandoffOutcome {
-    let preemption = nucleus_core::util::lockdep::preemption_snapshot();
-    assert!(
-        preemption.depth == 0,
-        "fast IPC committed while raw spin lock held cpu={} apic={:#x} depth={} held_depth={} pending_depth={} class={:?}",
-        preemption.logical_cpu,
-        preemption.apic_id,
-        preemption.depth,
-        preemption.held_depth,
-        preemption.pending_depth,
-        preemption.top_class,
-    );
+    if nucleus_core::util::lockdep::preemption_depth() != 0 {
+        // The six-field snapshot is only the failure report; the gate is one load.
+        let preemption = nucleus_core::util::lockdep::preemption_snapshot();
+        panic!(
+            "fast IPC committed while raw spin lock held cpu={} apic={:#x} depth={} held_depth={} pending_depth={} class={:?}",
+            preemption.logical_cpu,
+            preemption.apic_id,
+            preemption.depth,
+            preemption.held_depth,
+            preemption.pending_depth,
+            preemption.top_class,
+        );
+    }
     interrupts::without_interrupts(|| {
         let code = crate::lowlevel::interrupts::trigger_fast_ipc_call_schedule(
             endpoint,

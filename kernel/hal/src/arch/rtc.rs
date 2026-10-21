@@ -414,6 +414,30 @@ pub fn ticks() -> u64 {
     crate::arch::clock::scale_by_nanos_mult(nanos, NANOS_TO_TICKS_MULT)
 }
 
+/// One observation of the clock for a path that needs its tick, monotonic and
+/// scheduler-local views together (one ordered TSC read instead of four).
+#[derive(Clone, Copy, Debug)]
+pub struct ClockSample {
+    pub ticks: u64,
+    pub monotonic_nanos: u64,
+    pub local_nanos: Option<u64>,
+}
+
+pub fn sample() -> ClockSample {
+    if let Some((monotonic_nanos, local_nanos)) = crate::arch::clock::tsc_views() {
+        return ClockSample {
+            ticks: crate::arch::clock::scale_by_nanos_mult(monotonic_nanos, NANOS_TO_TICKS_MULT),
+            monotonic_nanos,
+            local_nanos: Some(local_nanos),
+        };
+    }
+    ClockSample {
+        ticks: ticks(),
+        monotonic_nanos: monotonic_nanos(),
+        local_nanos: crate::arch::clock::scheduler_local_nanos(),
+    }
+}
+
 pub const fn ticks_per_second() -> u64 {
     RTC_TICKS_PER_SEC
 }

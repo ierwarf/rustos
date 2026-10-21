@@ -173,18 +173,23 @@ benefits require matched original-tree controls.
   without CPU re-derivation; `ProcessStateLock` one-CAS take/swap release with a
   `waiting` count gating the waiter queue; service-endpoint authorize prefilter.
   Full validation stays in host/test/`rustos_lock_phase_profile` builds.
-- Measured: 1 vCPU p50 41.9k -> 13.1-13.4k; 8 vCPU reply_recv p50 13.6-14.4k,
-  mean 14.6-14.8k (was 43.0k; 18.8k before P5), cross-process getuid mean 27.8k
-  at P4. The split recv/reply probe still takes the generic reply wake (p50
-  ~47k): next target. The 10k goal is not reached; ~5k of the remaining ~13k is
-  the two lane traps, ~2.5k user copies, ~2k endpoint/admission, ~2k wait arm.
-- Validation: `kernel-ps` 968 + compat 181 + ipc-runtime 77 + nucleus-core 65
-  tests, dev-plan `now` lane 773/773, `verify-all --profile pr` and
-  `verify-smp-iteration` sealed, 8-vCPU `kvm-smoke --smp-iteration
+- P6 (2026-10-22): direct fault-recoverable user copies (`kernel-hal`
+  `user_access`, vector-14 fixup entry, validated fallback, `uaccess-recovery`
+  self-test in ipcbench), int-free software trap, pin-free Current wait,
+  one-sample lane clock, lane SIMD/bind/park trims, memoised page walks. Host
+  frequency drifts between sessions: compare only A/B runs from one window.
+- Measured: 1 vCPU p50 41.9k -> 9.7-10.0k (same-window A/B: direct user access
+  alone is -0.5..-0.9k, int-free trap -0.25k); 8 vCPU reply_recv p50 9.8-10.9k,
+  mean 10.6-11.2k (was 43.0k), cross-process getuid mean 17.2-17.6k (was 55k).
+  The split recv/reply probe (`ipc_rt_intra_process`, p50 ~44k) still takes the
+  generic reply wake by design (it measures the unfused fallback).
+- Validation: `kernel-ps` 969 + compat 181 + ipc-runtime 77 + nucleus-core 65 +
+  hal 73 + mm 72 tests, dev-plan `now` lane 708/708, `verify-all --profile pr`
+  and `verify-smp-iteration` sealed, 8-vCPU `kvm-smoke --smp-iteration
   --gui-dvm-surfaces --exercise-input` passed after the last edit.
-- Next structural steps: request delivery into the receiver context from the
-  lane, `int`-free frame build (the stub saves 16 XMM + 15 GPR per trap), lane
-  the split recv/reply path, fewer ledger lock operations (5 per round trip).
+- Next: convert vfsd/procd/pagerd loops to `reply_recv`; a single-slot fast
+  rendezvous mailbox (<0.5k); `iretq`-free resume for lane frames; remaining
+  per-call re-derivations (~54 tracked lock pairs per round trip).
 
 ## Open questions at the snapshot boundary
 

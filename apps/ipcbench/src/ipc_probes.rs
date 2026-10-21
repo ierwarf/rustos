@@ -304,6 +304,44 @@ fn bench_server_reply_recv(endpoint: u64) {
     }
 }
 
+/// The kernel reads and writes user memory in place and recovers from a fault by
+/// re-running on the validated path. This proves that recovery from ring 3: a
+/// bad request pointer, an unmapped reply buffer, a read-only reply buffer and a
+/// kernel-half pointer must each come back as EFAULT, never a kernel fault.
+pub(crate) fn user_access_recovery_selftest() -> bool {
+    static READ_ONLY: [u8; 4096] = [0; 4096];
+    const EFAULT: i64 = -14;
+    let endpoint = unsafe { syscall0(SYS_RUSTOS_IPC_ENDPOINT_CREATE) };
+    if endpoint < 0 {
+        return false;
+    }
+    let endpoint = endpoint as u64;
+    let mut good = BenchMsg::default();
+    let good_ptr = (&mut good as *mut BenchMsg) as u64;
+    let len = size_of::<BenchMsg>() as u64;
+    let call = |request: u64, reply: u64| unsafe {
+        syscall5(SYS_RUSTOS_IPC_CALL, endpoint, request, len, reply, len)
+    };
+    // Unmapped and read-only user ranges are a fault (EFAULT); a range outside
+    // the user half is rejected before any access (EINVAL).
+    const EINVAL: i64 = -22;
+    // The user half is one PML4 slot starting at 512 GiB; this sits inside it.
+    const UNMAPPED: u64 = 0x0000_0090_0000_0000;
+    let results = [
+        call(UNMAPPED, good_ptr),
+        call(good_ptr, UNMAPPED),
+        call(good_ptr, READ_ONLY.as_ptr() as u64),
+        call(0xffff_8000_0000_0000, good_ptr),
+        call(good_ptr, 0xffff_8000_0000_0000),
+    ];
+    let expected = [EFAULT, EFAULT, EFAULT, EINVAL, EINVAL];
+    if results != expected {
+        crate::debug_line(&format!("ipcbench: uaccess-recovery results {results:?}"));
+        return false;
+    }
+    true
+}
+
 /// Same-address-space round trip: this isolates the kernel IPC mechanism from
 /// the address-space switch, so the gap against the cross-process probe is the
 /// switch and the second process's scheduling cost.

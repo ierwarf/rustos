@@ -37,7 +37,7 @@ pub mod heap {
 
 pub mod address_space {
     pub use crate::memory::address_space::{
-        ActivationPin, ExecutionPin, RetirementOwner, ValidatedUserWrite,
+        ActivationPin, ExecutionPin, RetirementOwner, UserTranslationMemo, ValidatedUserWrite,
         drain_retired_address_spaces,
     };
     pub use crate::memory::paging::ProcessAddressSpace;

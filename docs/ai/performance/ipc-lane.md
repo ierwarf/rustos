@@ -90,16 +90,38 @@ Policy stays in userspace services.
   registry) and skips the waiter queue unless a task is blocking (`waiting`
   count, ordered by the full barriers of the swap and the blocker's `fetch_add`);
   service-endpoint authorization prefilters slots on the raw endpoint word.
-- P6 architecture trim (int-free frame build, lazy SIMD, request delivery from
-  the lane): not started. Lazy SIMD is not planned: it needs cross-CPU FPU
-  ownership flushes and was removed from Linux for that reason.
+- P6 (2026-10-22, owner-approved check removal and a new kernel-hal contract):
+  - `kernel-hal` `user_access`: the calling task's own user memory is read and
+    written in place with `rep movsb`, writes are proven with an atomic no-op
+    `lock cmpxchg` probe, and a kernel-mode fault inside one of the three routines
+    resumes at its fixup through a dedicated vector-14 entry (a table of
+    relative insn/fixup pairs). Any fault re-runs the operation once on the
+    validated software-walk path, which resolves COW and returns the exact errno;
+    CR0.WP is forced on every CPU first. `ipcbench` proves the recovery at start
+    (`uaccess-recovery pass`: unmapped, read-only and out-of-range ranges).
+  - `UserAccess` runs a syscall's argument read, range admission and request copy
+    under one bind (or none), with a per-bind page-translation memo.
+  - The software-schedule trap no longer executes `int`: the same five-word frame
+    is built by `SOFTWARE_TRAP` and the unchanged handler is entered (~0.1k each).
+  - `CurrentSlot` arms, cancels and commits the executing task's wait without a
+    pin; lane clock reads are one `ClockSample`; the lane bind and the SIMD
+    save/restore skip re-proofs the lane already holds; the RSP-ACK parking no
+    longer re-validates the frame bytes; admission pins the Current donor lock-free.
+  - Not done: request delivery from the lane (the remaining endpoint/reply
+    transport is ~1.3k spread over four small critical sections, so a mailbox
+    rewrite would save well under 0.5k), `iretq` replacement (~95 ticks each),
+    the split recv/reply probe (it measures the unfused fallback by design; only
+    `vfsd`, `procd` and `pagerd` use it - converting them to `reply_recv` is the
+    effective fix).
 
 Measured (1 vCPU isolated `ipc_rt_intra_process_reply_recv`, p50 ticks):
 session start 41.9k -> DirectSwitch 31.9k -> lane call+reply 19.2k -> funding
 shuttle 17.9k -> lock-light CurrentWait pin 16.9k -> interval forwarding 15.1k ->
 direct request take on wake 14.4k (min 14.0k).
 8 vCPU: p50 16.6-16.9k, mean 18.8k (was 36.7k / 43.0k) before P5; with P5 1 vCPU p50
-13.1-13.4k (min 12.5k) and 8 vCPU p50 13.6-14.4k, mean 14.6-14.8k; cross-process getuid
+13.1-13.4k (min 12.5k) and 8 vCPU p50 13.6-14.4k, mean 14.6-14.8k; with P6 1 vCPU p50
+9.7-10.0k (min 9.4k, same host window) and 8 vCPU p50 9.8-10.9k, mean 10.6-11.2k,
+cross-process getuid mean 17.2-17.6k; cross-process getuid
 mean 27.8k (was 55k). The split recv/reply probe `ipc_rt_intra_process` still
 uses the generic reply path and is unchanged (p50 ~52k).
 

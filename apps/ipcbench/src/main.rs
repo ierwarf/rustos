@@ -1188,6 +1188,11 @@ fn main() {
         _ => {}
     }
     debug_line("ipcbench: begin");
+    debug_line(if ipc_probes::user_access_recovery_selftest() {
+        "ipcbench: uaccess-recovery pass"
+    } else {
+        "ipcbench: uaccess-recovery FAIL"
+    });
 
     let filter = probe_filter();
     if filter.is_some() {

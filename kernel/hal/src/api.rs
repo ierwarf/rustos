@@ -42,6 +42,16 @@ pub mod arch {
         pub use crate::arch::simd::*;
     }
 
+    pub mod user_access {
+        pub use crate::arch::user_access::{
+            copy_from_user, copy_to_user, enabled, probe_write,
+        };
+        #[cfg(rustos_boot_image)]
+        pub use crate::arch::user_access::{
+            enable_if_write_protected, ensure_write_protect_on_this_cpu,
+        };
+    }
+
 
     pub mod tlb {
         pub use crate::arch::tlb_shootdown::{

@@ -759,8 +759,8 @@ rg -Fq 'SYS_RUSTOS_IPC_REPLY_RECV_WITH_SENDER' \
 }
 for witness in \
     'ipc_reply_recv_shape_valid(&args)' \
-    'prepare_recv_identity(' \
-    'copy_from_retained_user_and_validate_writes(' \
+    'authorize_endpoint_receiver_for_process(' \
+    'with_retained_user_access(' \
     'complete_endpoint_reply_for_process_with_custody(' \
     'recv_with_sender_blocking_prepared(' \
     'IPC_REPLY_RECV_COMMITTED_ERROR_BASE + errno'; do
@@ -769,7 +769,7 @@ for witness in \
         exit 1
     }
 done
-rg -Uq 'prepare_recv_identity\([\s\S]{0,3600}copy_request_from_user\([\s\S]{0,1800}complete_endpoint_reply_for_process_with_custody\([\s\S]{0,2600}finish_committed_reply_receive\(' \
+rg -Uq 'authorize_endpoint_receiver_for_process\([\s\S]{0,3600}copy_request_from_user\([\s\S]{0,1800}complete_endpoint_reply_for_process_with_custody\([\s\S]{0,2600}finish_committed_reply_receive\(' \
     "$reply_recv_kernel" \
     && rg -Uq 'fn finish_committed_reply_receive\([\s\S]{0,1200}recv_with_sender_blocking_prepared\(' \
     "$reply_recv_kernel" || {

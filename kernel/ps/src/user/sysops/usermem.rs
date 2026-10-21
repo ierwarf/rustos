@@ -16,6 +16,7 @@ use nucleus_core::util::lockdep::{self, LockClass};
 use x86_64::VirtAddr;
 
 use super::usermem_profile;
+use crate::arch::user_access;
 use crate::memory::paging;
 use crate::multitask;
 
@@ -81,20 +82,130 @@ pub fn copy_from_retained_user_and_validate_writes(
     dest: &mut [u8],
     write_buffers: &[(u64, usize)],
 ) -> Result<(), paging::AddressSpaceError> {
+    // Direct path: probe every output page, then read the input in place. A
+    // probe writes nothing, so any fault leaves the validated path a clean start.
+    if user_access::enabled() {
+        let outputs_writable = write_buffers.iter().copied().all(|(write_ptr, write_len)| {
+            write_len == 0
+                || user_virt_addr(write_ptr, write_len)
+                    .is_ok_and(|start| user_access::probe_write(start.as_u64(), write_len))
+        });
+        if outputs_writable
+            && let Ok(start) = user_virt_addr(read_ptr, dest.len())
+            && user_access::copy_from_user(dest, start.as_u64())
+        {
+            return Ok(());
+        }
+    }
     retained
         .try_with_user_copy_address_space(|address_space| {
+            let mut memo = kernel_mm::api::address_space::UserTranslationMemo::new();
             for (write_ptr, write_len) in write_buffers.iter().copied() {
                 if write_len != 0 {
                     let write_start = user_virt_addr(write_ptr, write_len)?;
-                    address_space.validate_user_write_buffer(write_start, write_len)?;
+                    address_space.validate_user_write_memo(write_start, write_len, &mut memo)?;
                 }
             }
             let read_start = user_virt_addr(read_ptr, dest.len())?;
             address_space
-                .validate_user_read(read_start, dest.len())?
+                .validate_user_read_memo(read_start, dest.len(), &mut memo)?
                 .copy_into(dest)
         })
         .ok_or(paging::AddressSpaceError::NotMapped)?
+}
+
+/// Several user-memory operations under ONE exact-MM bind. The binding (state
+/// lock plus identity check) is most of a small copy's cost, so a syscall that
+/// reads and admits several ranges before any publication does them in one
+/// closure. The closure must not call a service or block.
+pub struct UserAccess<'a, 'b> {
+    /// `None` is the direct mode: the calling task's own live address space is
+    /// accessed through the fault-recoverable copy routines, with no bind.
+    space: Option<&'a multitask::UserCopyAddressSpace<'b>>,
+    memo: core::cell::Cell<kernel_mm::api::address_space::UserTranslationMemo>,
+    /// A direct access faulted; the closure result is discarded and the whole
+    /// closure re-runs under the validated bind.
+    faulted: core::cell::Cell<bool>,
+}
+
+impl UserAccess<'_, '_> {
+    pub fn read_exact(&self, user_ptr: u64, dest: &mut [u8]) -> Result<(), paging::AddressSpaceError> {
+        let start = user_virt_addr(user_ptr, dest.len())?;
+        let Some(space) = self.space else {
+            if user_access::copy_from_user(dest, start.as_u64()) {
+                return Ok(());
+            }
+            self.faulted.set(true);
+            return Err(paging::AddressSpaceError::NotMapped);
+        };
+        let mut memo = self.memo.get();
+        let proof = space.validate_user_read_memo(start, dest.len(), &mut memo);
+        self.memo.set(memo);
+        proof?.copy_into(dest)
+    }
+
+    pub fn read_struct<T: Copy + Default>(&self, user_ptr: u64) -> Result<T, paging::AddressSpaceError> {
+        let mut value = T::default();
+        // SAFETY: `value` is live and uniquely borrowed for exactly
+        // `size_of::<T>()` bytes; the copy initializes only that allocation.
+        let bytes = unsafe {
+            core::slice::from_raw_parts_mut(
+                core::ptr::addr_of_mut!(value).cast::<u8>(),
+                core::mem::size_of::<T>(),
+            )
+        };
+        self.read_exact(user_ptr, bytes)?;
+        Ok(value)
+    }
+
+    pub fn validate_write(&self, user_ptr: u64, len: usize) -> Result<(), paging::AddressSpaceError> {
+        if len == 0 {
+            return Ok(());
+        }
+        let start = user_virt_addr(user_ptr, len)?;
+        let Some(space) = self.space else {
+            if user_access::probe_write(start.as_u64(), len) {
+                return Ok(());
+            }
+            self.faulted.set(true);
+            return Err(paging::AddressSpaceError::NotMapped);
+        };
+        let mut memo = self.memo.get();
+        let proof = space.validate_user_write_memo(start, len, &mut memo);
+        self.memo.set(memo);
+        proof.map(drop)
+    }
+}
+
+/// Runs `f` against the caller's user memory. When the direct path is enabled
+/// the closure first runs with no bind at all; if any direct access faults its
+/// result is dropped and it re-runs once under the exact-MM bind, so the answer
+/// (including COW resolution and the precise errno) is always the validated
+/// one. The closure must therefore be idempotent and must not block.
+pub fn with_retained_user_access<R>(
+    retained: &multitask::RetainedCurrentUserAddressSpace,
+    mut f: impl FnMut(&UserAccess<'_, '_>) -> R,
+) -> Result<R, paging::AddressSpaceError> {
+    if user_access::enabled() {
+        let direct = UserAccess {
+            space: None,
+            memo: core::cell::Cell::new(Default::default()),
+            faulted: core::cell::Cell::new(false),
+        };
+        let result = f(&direct);
+        if !direct.faulted.get() {
+            return Ok(result);
+        }
+    }
+    retained
+        .try_with_user_copy_address_space(|address_space| {
+            f(&UserAccess {
+                space: Some(address_space),
+                memo: core::cell::Cell::new(Default::default()),
+                faulted: core::cell::Cell::new(false),
+            })
+        })
+        .ok_or(paging::AddressSpaceError::NotMapped)
 }
 
 pub fn copy_from_retained_user_exact(
@@ -102,6 +213,12 @@ pub fn copy_from_retained_user_exact(
     user_ptr: u64,
     dest: &mut [u8],
 ) -> Result<(), paging::AddressSpaceError> {
+    if user_access::enabled()
+        && let Ok(start) = user_virt_addr(user_ptr, dest.len())
+        && user_access::copy_from_user(dest, start.as_u64())
+    {
+        return Ok(());
+    }
     retained
         .try_with_address_space(|address_space| {
             let start = user_virt_addr(user_ptr, dest.len())?;
@@ -165,6 +282,13 @@ pub fn write_retained_user_bytes(
     user_ptr: u64,
     bytes: &[u8],
 ) -> Result<(), paging::AddressSpaceError> {
+    if user_access::enabled()
+        && !bytes.is_empty()
+        && let Ok(start) = user_virt_addr(user_ptr, bytes.len())
+        && user_access::copy_to_user(start.as_u64(), bytes)
+    {
+        return Ok(());
+    }
     retained
         .try_with_user_copy_address_space(|address_space| {
             let start = user_virt_addr(user_ptr, bytes.len())?;
@@ -282,15 +406,26 @@ pub fn write_retained_user_bytes_batch(
     retained: &multitask::RetainedCurrentUserAddressSpace,
     writes: &[(u64, &[u8])],
 ) -> Result<(), paging::AddressSpaceError> {
+    if user_access::enabled() {
+        let direct = writes.iter().copied().all(|(user_ptr, bytes)| {
+            bytes.is_empty()
+                || user_virt_addr(user_ptr, bytes.len())
+                    .is_ok_and(|start| user_access::copy_to_user(start.as_u64(), bytes))
+        });
+        if direct {
+            return Ok(());
+        }
+    }
     retained
         .try_with_user_copy_address_space(|address_space| {
+            let mut memo = kernel_mm::api::address_space::UserTranslationMemo::new();
             for (user_ptr, bytes) in writes.iter().copied() {
                 if bytes.is_empty() {
                     continue;
                 }
                 let start = user_virt_addr(user_ptr, bytes.len())?;
                 address_space
-                    .validate_user_write(start, bytes.len())?
+                    .validate_user_write_memo(start, bytes.len(), &mut memo)?
                     .copy_from(bytes)?;
             }
             Ok(())

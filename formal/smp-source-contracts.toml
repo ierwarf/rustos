@@ -3034,7 +3034,10 @@ path = "kernel/ps/src/multitask/scheduler/exec_transaction/quiescence.rs"
 tokens = ["census.assert_matches(intent)", "intent.mode_matches(target == current)", "retirement_cleanup::kernel_pending(target)", "stack_resources::task_start::read(target).map(|s| s.id) != Some(intent.task_id())", "for &(slot, id) in census.members()", "stack_resources::task_start::read(slot).map(|s| s.id) != Some(id)", "terminal_quarantine::begin(slot, Some(id)", "terminal_publication::guarded(owner", "let executing = cpu_local::task_execution_owner(slot).is_some()", "identity::execution::count(slot) != 0", "Some(!waiting)"]
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/current_wait.rs"
-tokens = ["struct CurrentWait", "binding: identity::execution::BindingPin", "PhantomData<*mut ()>", "unsafe fn capture(", "cpu_local::current_cpu_task_slot()?", "cpu_leases::owns_current(cpu, slot)", "task_start::read(slot)?.id", "identity::execution::pin_current(cpu, slot, id)", "owner.state != runqueue::RunOwnerState::Running || owner.cpu != Some(cpu)", "fn slot(&self)", "self.binding.slot()", "current_cpu_index(), self.cpu", "cpu_leases::owns_current(self.cpu, slot)", "fn arm(", "try_publish_arm(slot, kind, id)", "fn commit(", "runqueue::wait::commit(slot)", "fn restore_pager(", "self.pager_token.get() != Some(token)", "owner.state.is_terminal()", "return true", "REASON_PAGER_FAULT && id == token", "runqueue::wake_wait(slot)"]
+tokens = ["struct CurrentWait", "binding: identity::execution::BindingPin", "PhantomData<*mut ()>", "unsafe fn capture(", "cpu_local::current_cpu_task_slot()?", "cpu_leases::owns_current(cpu, slot)", "task_start::read(slot)?.id", "identity::execution::pin_current(cpu, slot, id)", "owner.state != runqueue::RunOwnerState::Running || owner.cpu != Some(cpu)", "fn slot(&self)", "self.binding.slot()", "current_cpu_index(), self.cpu", "cpu_leases::owns_current(self.cpu, slot)", "fn arm(", "CurrentSlot { slot: self.slot() }.arm(reason)", "fn commit(", "CurrentSlot { slot: self.slot() }.commit()", "fn restore_pager(", "self.pager_token.get() != Some(token)", "owner.state.is_terminal()", "return true", "REASON_PAGER_FAULT && id == token", "runqueue::wake_wait(slot)"]
+[[required_sequences]]
+path = "kernel/ps/src/multitask/scheduler/current_wait.rs"
+tokens = ["struct CurrentSlot", "unsafe fn capture(", "cpu_local::current_cpu_task_slot()?", "cpu_leases::owns_current(cpu, slot)", "owner.state != runqueue::RunOwnerState::Running || owner.cpu != Some(cpu)", "fn arm(", "runqueue::wait::try_publish_arm(self.slot, kind, id)", "fn cancel(", "runqueue::wait::clear_arm(self.slot)", "fn commit(", "runqueue::wait::commit(self.slot)", "WaitCommitOutcome::InvalidOwner => false"]
 [[required_sequences]]
 path = "kernel/ps/src/multitask/current_identity/execution.rs"
 tokens = ["unsafe fn pin_current(", "cpu_leases::owns_current(cpu, slot)", "retirement_cleanup::with_wake_binding(slot", "super::read_dispatch(slot)?", "published.retired() || published.suspended()", "acquire(slot)"]
@@ -3530,10 +3533,10 @@ path = "kernel/ps/src/multitask/scheduler/ipc_lane.rs"
 tokens = [
     "pub(in crate::multitask) fn call(", "cpu_local::lane_idle(cpu)", "resident::parked_cpu(s, generation)",
     "direct_switch_admitted(cpu)", "bind_original(scope, reply, donor, &receiver, false)",
-    "runqueue::commit_wait(c)", "finish(cpu, from, to, rsp, generic)",
+    "runqueue::commit_wait(c)", "finish(cpu, from, to, rsp, &clock, generic)",
     "pub(in crate::multitask) fn reply(", "reply_context_custody(context_owner, context)",
-    "recent_sleeper(", "release_reply(reply", "finish(cpu, from, to, rsp, generic)",
-    "fn finish(", "can_forward(", "settle(cpu, from.slot, from.id)", "prepare_grant(to.slot, cpu)",
+    "recent_sleeper(", "release_reply(reply", "finish(cpu, from, to, rsp, &clock, generic)",
+    "fn finish(", "can_forward(", "settle(cpu, from.slot, from.id, clock)", "prepare_grant(to.slot, cpu)",
     "lane_wake_clear(", "lane_cas(", "resident::take(to.slot, generation)", "banks::prepare_lane(cpu, loans.permit)",
     "execution_interval::forward(", "publish_blocked(cpu, from.slot, rsp)", "lane_install(", "cpu_local::lane_publish(",
 ]

@@ -84,45 +84,25 @@ impl CurrentWait {
             && runqueue::wait::reason(slot) == (runqueue::wait::REASON_ENDPOINT_REPLY, reply)
     }
     pub(in crate::multitask) fn arm(&self, reason: BlockReason) -> bool {
-        let slot = self.slot();
-        if runqueue::wait::blocked(slot) {
-            return false;
-        }
-        let (kind, id) = task_wait::encoded_reason(reason);
-        runqueue::wait::set_ready_since_ticks(slot, 0);
-        let armed = runqueue::wait::try_publish_arm(slot, kind, id);
+        let armed = CurrentSlot { slot: self.slot() }.arm(reason);
         if armed {
+            let (kind, id) = task_wait::encoded_reason(reason);
             self.pager_token
                 .set((kind == runqueue::wait::REASON_PAGER_FAULT).then_some(id));
         }
         armed
     }
     pub(in crate::multitask) fn cancel(&self) -> bool {
-        let slot = self.slot();
-        if !runqueue::wait::armed(slot) || runqueue::wait::blocked(slot) {
-            return false;
+        let cancelled = CurrentSlot { slot: self.slot() }.cancel();
+        if cancelled {
+            self.pager_token.set(None);
         }
-        runqueue::wait::set_ready_since_ticks(slot, 0);
-        runqueue::wait::clear_arm(slot);
-        self.pager_token.set(None);
-        true
+        cancelled
     }
     pub(in crate::multitask) fn commit(&self) -> bool {
-        let slot = self.slot();
-        match runqueue::wait::commit(slot) {
-            runqueue::WaitCommitOutcome::Committed => {
-                runqueue::wait::set_ready_since_ticks(slot, 0);
-                runqueue::wait::set_blocked_since_ticks(slot, crate::arch::rtc::ticks());
-                true
-            }
-            runqueue::WaitCommitOutcome::WakeWon => {
-                runqueue::wait::set_ready_since_ticks(slot, 0);
-                false
-            }
-            // The same original bank/backing is still retained: terminal or
-            // an already committed wait refuses, not a catalog fallback grant.
-            runqueue::WaitCommitOutcome::InvalidOwner => false,
-        }
+        // The same original bank/backing is still retained: terminal or an
+        // already committed wait refuses, not a catalog fallback grant.
+        CurrentSlot { slot: self.slot() }.commit()
     }
     pub(in crate::multitask) fn restore_pager(&self, token: u64) -> bool {
         if token == 0 || self.pager_token.get() != Some(token) {
@@ -144,24 +124,79 @@ impl CurrentWait {
     }
 }
 
+/// The executing task's wait word, authenticated against the physical Current
+/// bank but not pinned. Arm, cancel and commit touch only the run-owner wait
+/// word, never the task's backing, so a pin (a cleanup-leaf acquisition plus a
+/// permit pair) would only be re-proving what the bank already holds.
+struct CurrentSlot {
+    slot: usize,
+}
+impl CurrentSlot {
+    /// # Safety
+    /// Caller retains this CPU's masked IRQ scope and its physical Current bank
+    /// for the whole operation.
+    unsafe fn capture() -> Option<Self> {
+        let cpu = nucleus_core::util::lockdep::current_cpu_index();
+        let slot = cpu_local::current_cpu_task_slot()?;
+        if slot == super::ROOT_TASK_SLOT || !stack_resources::cpu_leases::owns_current(cpu, slot) {
+            return None;
+        }
+        let owner = runqueue::owner(slot);
+        if owner.state != runqueue::RunOwnerState::Running || owner.cpu != Some(cpu) {
+            return None;
+        }
+        Some(Self { slot })
+    }
+    fn arm(&self, reason: BlockReason) -> bool {
+        if runqueue::wait::blocked(self.slot) {
+            return false;
+        }
+        let (kind, id) = task_wait::encoded_reason(reason);
+        runqueue::wait::set_ready_since_ticks(self.slot, 0);
+        runqueue::wait::try_publish_arm(self.slot, kind, id)
+    }
+    fn cancel(&self) -> bool {
+        if !runqueue::wait::armed(self.slot) || runqueue::wait::blocked(self.slot) {
+            return false;
+        }
+        runqueue::wait::set_ready_since_ticks(self.slot, 0);
+        runqueue::wait::clear_arm(self.slot);
+        true
+    }
+    fn commit(&self) -> bool {
+        match runqueue::wait::commit(self.slot) {
+            runqueue::WaitCommitOutcome::Committed => {
+                runqueue::wait::set_ready_since_ticks(self.slot, 0);
+                runqueue::wait::set_blocked_since_ticks(self.slot, crate::arch::rtc::ticks());
+                true
+            }
+            runqueue::WaitCommitOutcome::WakeWon => {
+                runqueue::wait::set_ready_since_ticks(self.slot, 0);
+                false
+            }
+            runqueue::WaitCommitOutcome::InvalidOwner => false,
+        }
+    }
+}
+
 /// # Safety
 /// Original masked same-CPU IRQ/Current scope lasts through this operation.
 pub(in crate::multitask) unsafe fn arm_current_wait(reason: BlockReason) -> Option<bool> {
-    // SAFETY: loan is consumed entirely inside the caller's original scope.
-    unsafe { CurrentWait::capture() }.map(|wait| wait.arm(reason))
+    // SAFETY: the caller's original scope and Current bank enclose this call.
+    unsafe { CurrentSlot::capture() }.map(|wait| wait.arm(reason))
 }
 /// # Safety
 /// Original masked same-CPU IRQ/Current scope lasts through this operation.
 pub(in crate::multitask) unsafe fn cancel_current_wait() -> Option<bool> {
-    // SAFETY: loan is consumed entirely inside the caller's original scope.
-    unsafe { CurrentWait::capture() }.map(|wait| wait.cancel())
+    // SAFETY: the caller's original scope and Current bank enclose this call.
+    unsafe { CurrentSlot::capture() }.map(|wait| wait.cancel())
 }
 /// # Safety
 /// Original masked same-CPU IRQ/Current scope lasts through this operation;
 /// caller drops every loan before entering a scheduling trap.
 pub(in crate::multitask) unsafe fn commit_current_wait() -> Option<bool> {
-    // SAFETY: original loan is released before caller's possible trap.
-    unsafe { CurrentWait::capture() }.map(|wait| wait.commit())
+    // SAFETY: the caller's original scope and Current bank enclose this call.
+    unsafe { CurrentSlot::capture() }.map(|wait| wait.commit())
 }
 
 #[cfg(test)]

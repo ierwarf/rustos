@@ -1265,6 +1265,8 @@ fi
 # reaches frames through the direct map. Every usermem writer must enter the
 # exact-generation wrapper; the slow path checks logical VMA authority, splits
 # against the retained root, then retranslates before constructing its proof.
+# The direct fast path (kernel-hal `user_access`) writes through the live CR3 with
+# CR0.WP set, so a read-only COW leaf faults and re-enters this same wrapper.
 copyout_ps_source=kernel/ps/src/multitask/user_copy.rs
 copyout_mm_source=kernel/mm/src/memory/address_space/user_copy.rs
 copyout_cow_source=kernel/mm/src/memory/address_space/pager_fault_mapping.rs
@@ -1272,7 +1274,7 @@ usermem_source=kernel/ps/src/user/sysops/usermem.rs
 cow_probe_source=apps/ipcbench/src/cow_probe.rs
 if ! rg -Uq 'fn with_current_write_address_space<R>\([^)]*UserCopyAddressSpace' "$usermem_source" \
     || [ "$(rg -c 'with_current_write_address_space' "$usermem_source")" -ne 5 ] \
-    || [ "$(rg -c 'try_with_user_copy_address_space' "$usermem_source")" -ne 4 ] \
+    || [ "$(rg -c 'try_with_user_copy_address_space' "$usermem_source")" -ne 5 ] \
     || ! rg -Fq 'validate_user_write_resolving_cow' "$copyout_ps_source" \
     || ! rg -Fq 'region.commit_state != VM_COMMIT_COMMITTED' "$copyout_ps_source" \
     || ! rg -Fq 'region.prot & VM_PROT_WRITE == 0' "$copyout_ps_source" \

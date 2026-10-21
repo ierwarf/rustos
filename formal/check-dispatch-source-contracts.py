@@ -1346,14 +1346,14 @@ ordered(body(irq, 'software_schedule_interrupt_dispatch'), ['let mut lane_generi
     'lane switches before any dispatch turn opens and keeps the IRQ mask through the RSP ACK')
 ordered(body(lane, 'call'), ['cpu_local::lane_idle(cpu)', 'resident::parked_cpu(s, generation)',
     'direct_switch_admitted(cpu)', 'bind_original(scope, reply, donor, &receiver, false)',
-    'runqueue::simd_tls::save_simd_state(c)', 'runqueue::commit_wait(c)',
-    'finish(cpu, from, to, rsp, generic)'],
+    'runqueue::simd_tls::save_simd_state_lane(c, c_id)', 'runqueue::commit_wait(c)',
+    'finish(cpu, from, to, rsp, &clock, generic)'],
     'lane call declines before the donation bind and is committed after it')
 ordered(body(lane, 'reply'), ['cpu_local::lane_idle(cpu)', 'reply_context_custody(context_owner, context)',
     'resident::parked_cpu(c, generation)', 'recent_sleeper(', 'direct_switch_admitted(cpu)',
-    'release_reply(reply', 'runqueue::simd_tls::save_simd_state(s)', 'finish(cpu, from, to, rsp, generic)'],
+    'release_reply(reply', 'runqueue::simd_tls::save_simd_state_lane(s, s_id)', 'finish(cpu, from, to, rsp, &clock, generic)'],
     'lane reply releases the donation only after every decline check')
-ordered(body(lane, 'finish'), ['funding_label(to.slot, to.id)', 'can_forward(', 'settle(cpu, from.slot, from.id)',
+ordered(body(lane, 'finish'), ['funding_label(to.slot, to.id)', 'can_forward(', 'settle(cpu, from.slot, from.id, clock)',
     'prepare_grant(to.slot, cpu)', 'with_placement_admission(', 'lane_wake_clear(', 'lane_cas(',
     'resident::take(to.slot, generation)', 'cpu_leases::prepare(cpu, loans.pin)',
     'banks::prepare_lane(cpu, loans.permit)', 'execution_interval::forward(', 'open_lane(',

@@ -28,6 +28,15 @@ lazy_static! {
             msi_interrupt_handler,
             crate::arch::msi::MSI_VECTOR_FIRST..=crate::arch::msi::MSI_VECTOR_LAST
         );
+        #[cfg(rustos_boot_image)]
+        unsafe {
+            // Kernel-mode faults inside the direct user-copy routines resume at
+            // their fixups; everything else reaches the handler installed above.
+            let original = idt.page_fault.handler_addr().as_u64();
+            idt.page_fault.set_handler_addr(VirtAddr::new(
+                crate::arch::user_access::page_fault_entry_addr(original),
+            ));
+        }
         unsafe {
             idt.non_maskable_interrupt
                 .set_handler_fn(non_maskable_interrupt_handler)
@@ -61,6 +70,13 @@ lazy_static! {
 
 pub fn init() {
     IDT.load();
+    // Direct user copies rely on CR0.WP so a supervisor write still honours a
+    // read-only copy-on-write leaf; every CPU makes it so before tasks run.
+    #[cfg(rustos_boot_image)]
+    {
+        crate::arch::user_access::ensure_write_protect_on_this_cpu();
+        crate::arch::user_access::enable_if_write_protected();
+    }
 }
 
 mod handlers;

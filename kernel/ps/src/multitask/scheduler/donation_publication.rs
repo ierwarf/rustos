@@ -23,6 +23,17 @@ impl Loans {
     pub(super) fn basis(&self) -> &donation_ledger::FundingBasis {
         &self.basis
     }
+    /// `capture` for the task this CPU is executing: its allocation bank is the
+    /// proof, so the pin is the lock-free held pin instead of two leaf locks.
+    fn capture_current(cpu: usize, id: u64) -> Option<Self> {
+        let slot = task_directory::hint(id)?;
+        if !stack_resources::cpu_leases::owns_current(cpu, slot) {
+            return None;
+        }
+        let donor = identity::execution::pin_held(slot, id)?;
+        let basis = donation_ledger::funding_basis(donor.slot(), donor.id())?;
+        Self::from_original(donor, basis)
+    }
     fn capture(id: u64) -> Option<Self> {
         let donor = participant(id)?;
         let basis = donation_ledger::funding_basis(donor.slot(), donor.id())?;
@@ -86,7 +97,7 @@ pub(in crate::multitask) fn reserve_call_with(
     if !scope_valid(scope) {
         return refused();
     }
-    let Some(loans) = Loans::capture(id) else {
+    let Some(loans) = Loans::capture_current(scope.cpu(), id).or_else(|| Loans::capture(id)) else {
         return refused();
     };
     let system_class = loans.system_class();
@@ -143,6 +154,20 @@ pub(in crate::multitask) fn bind_with(
         return false;
     };
     bind_original(scope, reply, donor, &receiver, inherit).is_some()
+}
+
+/// Lane bind for a donor funded by its own context: one ledger acquisition and
+/// no root pin or context re-read. `None` leaves the decision to `bind_original`.
+pub(super) fn bind_lane(
+    scope: &DispatchPreemption<'_>,
+    reply: u64,
+    donor: &identity::execution::BindingPin,
+    receiver: &identity::execution::BindingPin,
+) -> Option<bool> {
+    if !scope_valid(scope) || reply == 0 || donor.id() == receiver.id() {
+        return Some(false);
+    }
+    donation_ledger::bind_own_funding(reply, donor.slot(), donor.id(), receiver.slot(), receiver.id())
 }
 
 /// Transfer the original participants to the producer, which retains donor,

@@ -48,7 +48,7 @@ pub use pager_fault_mapping::{
     resolve_current_cow_write_at,
 };
 use rollback::{rollback_external_user_pages, rollback_user_pages};
-pub use user_copy::{ValidatedUserRead, ValidatedUserWrite};
+pub use user_copy::{UserTranslationMemo, ValidatedUserRead, ValidatedUserWrite};
 
 use crate::memory::{kernel_vm, phys};
 

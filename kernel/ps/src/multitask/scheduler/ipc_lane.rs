@@ -82,24 +82,20 @@ fn ticks_to_ns(start: u64, end: u64) -> u64 {
 /// held is returned when the charge left credit, for the successor to continue
 /// on (one pin shuttles along a call/reply chain instead of being dropped and
 /// re-pinned at every hop).
-fn settle(cpu: usize, slot: usize, id: u64) -> Option<FundingPin> {
+fn settle(cpu: usize, slot: usize, id: u64, clock: &crate::arch::rtc::ClockSample) -> Option<FundingPin> {
     use super::execution_interval::{ConsumedInterval, consume};
     let mut interval = match consume(cpu, slot, id) {
         ConsumedInterval::Active(interval) => interval,
         ConsumedInterval::AlreadySettled | ConsumedInterval::Absent => return None,
     };
-    let elapsed = interval.elapsed_ns(
-        crate::arch::rtc::ticks(),
-        crate::arch::clock::scheduler_local_nanos(),
-        ticks_to_ns,
-    );
+    let elapsed = interval.elapsed_ns(clock.ticks, clock.local_nanos, ticks_to_ns);
     runtime_profile::owner::local(|row| row.account(slot, elapsed));
     let mut carried = None;
     if let Some(pin) = interval.take_funding() {
         if elapsed == 0 {
             carried = Some(pin);
         } else if let Some((funder, outcome, continues)) =
-            pin.charge_in_place(crate::arch::clock::monotonic_nanos(), elapsed)
+            pin.charge_in_place(clock.monotonic_nanos, elapsed)
         {
             if outcome.exhausted && outcome.charged_ns != 0 {
                 scheduling_context::latch_budget_exhaustion(funder, outcome.charged_ns);
@@ -156,6 +152,7 @@ pub(in crate::multitask) fn call(
     use runqueue::RunOwnerState::{Blocked, Running};
     let declined = Outcome::Declined;
     let cpu = scope.cpu();
+    let clock = crate::arch::rtc::sample();
     if !ipc_publication::scoped(scope) || endpoint == 0 || reply == 0 || !cpu_local::lane_idle(cpu) {
         return declined;
     }
@@ -194,22 +191,31 @@ pub(in crate::multitask) fn call(
     let (Some(donor), Some(receiver)) =
         (identity_execution::pin_held(c, c_id), identity_execution::pin_held(s, receiver_id))
     else { return declined };
-    let Some(_donation) = donation_publication::bind_original(scope, reply, donor, &receiver, false)
-    else { return declined };
+    // A donor funded by its own context binds in one ledger acquisition; a
+    // borrowed basis takes the full two-step bind with its root loan.
+    let _donation = match donation_publication::bind_lane(scope, reply, &donor, &receiver) {
+        Some(true) => None,
+        Some(false) => return declined,
+        None => match donation_publication::bind_original(scope, reply, donor, &receiver, false) {
+            Some(loans) => Some(loans),
+            None => return declined,
+        },
+    };
 
     // Committed from here: every failure is `Generic`.
     let generic = || {
         let _ = wake_publication::wake(scope, receiver_id, &super::runqueue_policy::online_affinity_mask);
     };
-    runqueue::simd_tls::save_simd_state(c);
+    // SAFETY: masked lane scope; `c` is Current on this CPU (checked above).
+    unsafe { runqueue::simd_tls::save_simd_state_lane(c, c_id) };
     if runqueue::commit_wait(c) != runqueue::WaitCommitOutcome::Committed {
         generic();
         return Outcome::Generic;
     }
-    runqueue::wait::set_blocked_since_ticks(c, crate::arch::rtc::ticks());
+    runqueue::wait::set_blocked_since_ticks(c, clock.ticks);
     let from = Party { slot: c, id: c_id, arch: prev_arch };
     let to = Target { slot: s, id: receiver_id, owner: s_owner, wait: (RECEIVE, endpoint) };
-    finish(cpu, from, to, rsp, generic)
+    finish(cpu, from, to, rsp, &clock, generic)
 }
 
 /// The reply-direction lane: the committed server `S` (Current, blocked on its
@@ -222,6 +228,7 @@ pub(in crate::multitask) fn reply(
     use runqueue::RunOwnerState::{Blocked, Running};
     let declined = Outcome::Declined;
     let cpu = scope.cpu();
+    let clock = crate::arch::rtc::sample();
     if !ipc_publication::scoped(scope) || reply == 0 || !cpu_local::lane_idle(cpu) {
         return declined;
     }
@@ -250,7 +257,7 @@ pub(in crate::multitask) fn reply(
         || resident::parked_cpu(c, generation) != Some(cpu)
         || runqueue::wait::reason(c) != (REPLY, reply)
         || !ipc_publication::recent_sleeper(runqueue::wait::blocked_since_ticks(c),
-            crate::arch::rtc::ticks(), crate::arch::rtc::ticks_per_second())
+            clock.ticks, crate::arch::rtc::ticks_per_second())
         || !ipc_publication::direct_switch_admitted(cpu)
         || donation_ledger::class_publication_sequence() & 1 != 0
     {
@@ -267,10 +274,11 @@ pub(in crate::multitask) fn reply(
         let _ = wake_publication::reply_with(scope, reply, caller_id,
             &super::runqueue_policy::online_affinity_mask);
     };
-    runqueue::simd_tls::save_simd_state(s);
+    // SAFETY: masked lane scope; `s` is Current on this CPU (checked above).
+    unsafe { runqueue::simd_tls::save_simd_state_lane(s, s_id) };
     let from = Party { slot: s, id: s_id, arch: prev_arch };
     let to = Target { slot: c, id: caller_id, owner: c_owner, wait: (REPLY, reply) };
-    finish(cpu, from, to, rsp, generic)
+    finish(cpu, from, to, rsp, &clock, generic)
 }
 
 /// Whether `slot` may run on `cpu`: published lifecycle dispatchable and the
@@ -300,7 +308,10 @@ struct Target {
 /// Settle the committed outgoing task, claim the parked incoming one and move
 /// to it. `generic` runs if the claim loses a race, leaving the incoming task
 /// awake for the ordinary dispatcher.
-fn finish(cpu: usize, from: Party, to: Target, rsp: usize, generic: impl FnOnce()) -> Outcome {
+fn finish(
+    cpu: usize, from: Party, to: Target, rsp: usize, clock: &crate::arch::rtc::ClockSample,
+    generic: impl FnOnce(),
+) -> Outcome {
     // A donation chain keeps one funder end to end: when the Current interval is
     // already rooted at the incoming task's owner it is forwarded as it stands
     // and the funder is charged once for the whole span when the chain ends.
@@ -312,7 +323,7 @@ fn finish(cpu: usize, from: Party, to: Target, rsp: usize, generic: impl FnOnce(
     let (funding, shuttled) = if forward {
         (None, true)
     } else {
-        let carried = settle(cpu, from.slot, from.id);
+        let carried = settle(cpu, from.slot, from.id, clock);
         match (carried, label) {
             (Some(pin), Some((owner, reply))) if pin.label().0 == owner => {
                 (Some(pin.relabeled(reply)), true)
@@ -341,7 +352,7 @@ fn finish(cpu: usize, from: Party, to: Target, rsp: usize, generic: impl FnOnce(
         })
         .and_then(|(claimed, grant)| claimed.map(|()| grant))
     };
-    let now = crate::arch::clock::monotonic_nanos();
+    let now = clock.monotonic_nanos;
     let grant = match (funding.as_ref(), shuttled) {
         (Some(pin), false) => pin.with_dispatch_admission(cpu, now, claim),
         _ => claim(),
@@ -358,7 +369,7 @@ fn finish(cpu: usize, from: Party, to: Target, rsp: usize, generic: impl FnOnce(
     identity_execution::banks::prepare_lane(cpu, loans.permit);
     if forward {
         let hop = super::execution_interval::forward(
-            cpu, (from.slot, from.id), (to.slot, to.id, running.generation), label.map_or(0, |(_, reply)| reply));
+            cpu, (from.slot, from.id), (to.slot, to.id, running.generation), label.map_or(0, |(_, reply)| reply), clock);
         runtime_profile::owner::local(|row| row.account(from.slot, hop));
         runqueue::add_vruntime(
             from.slot,
@@ -366,24 +377,24 @@ fn finish(cpu: usize, from: Party, to: Target, rsp: usize, generic: impl FnOnce(
                 hop.max(super::SCHED_MIN_GRANULARITY_NS), runqueue::weight::value(from.slot)),
         );
     } else {
-        super::execution_interval::open_lane(cpu, to.slot, to.id, running.generation, funding);
+        super::execution_interval::open_lane(cpu, to.slot, to.id, running.generation, funding, clock);
     }
     assert!(publish_blocked(cpu, from.slot, rsp), "lane outgoing task lost Running custody");
     let next_arch = fresh(to.slot, loans.arch);
-    super::return_architecture::lane_install(from.arch, next_arch, to.slot);
+    super::return_architecture::lane_install(from.arch, next_arch, to.slot, to.id);
     note_installed(cpu, to.slot, next_arch);
     cpu_local::lane_publish(cpu, from.slot, to.slot);
     cpu_local::lane_install_placement(cpu, grant);
-    complete(cpu, from.slot, from.id, to.slot, to.id, loans.saved_rsp, from.arch.root != next_arch.root);
+    complete(cpu, from.slot, from.id, to.slot, to.id, loans.saved_rsp, from.arch.root != next_arch.root, clock.ticks);
     Outcome::Switched(loans.saved_rsp)
 }
 
 /// The side effects `dispatcher::complete` records for a synchronous dispatch.
-fn complete(cpu: usize, from: usize, from_id: u64, to: usize, to_id: u64, next_rsp: usize, new_root: bool) {
+fn complete(cpu: usize, from: usize, from_id: u64, to: usize, to_id: u64, next_rsp: usize, new_root: bool, ticks: u64) {
     runqueue::wait::set_ready_since_ticks(to, 0);
     dispatch_policy::record_completed_choice(
         cpu, !runqueue::is_idle_slot(to) && !local_dispatch::is_user_class(to), false);
-    sync_handoff::record_dispatch(cpu, true, crate::arch::rtc::ticks());
+    sync_handoff::record_dispatch(cpu, true, ticks);
     runtime_profile::owner::local(|row| {
         row.dispatch(to);
         row.runtime_profile_task_switches = row.runtime_profile_task_switches.saturating_add(1);

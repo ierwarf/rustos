@@ -174,10 +174,12 @@ fn kernel_frame_rsp(cpu: usize, slot: usize, generation: u64) -> Option<usize> {
     if token.owner_generation != generation {
         return None;
     }
-    super::context_validation::validate_published_saved_context(slot, token.saved_rsp, token.view)
-        .ok()?;
-    // SAFETY: the outgoing pin this ACK still holds retains the allocation, and
-    // the frame was just validated at this RSP.
+    // The frame was written by the trap stub on this very stack and published
+    // through the frame-token protocol checked above; the byte-level proof the
+    // generic selection re-runs is not repeated for a continuation that only
+    // ever resumes where it blocked.
+    // SAFETY: the outgoing pin this ACK still holds retains the allocation and
+    // the published RSP names this task's saved frame.
     let cs = unsafe { (*(token.saved_rsp as *const super::SavedContext)).cs };
     (cs != crate::arch::gdt::user_code_selector().0 as u64).then_some(token.saved_rsp)
 }

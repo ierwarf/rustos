@@ -30,6 +30,34 @@ use super::{
     align_up, higher_half_ptr, is_user_addr, validate_user_page_access,
 };
 
+/// The last page translation a bind resolved. Within one retained MM bind the
+/// page tables cannot change (every mutation holds the same state lock), so a
+/// later range on the same page reuses the walk instead of repeating it.
+#[derive(Clone, Copy)]
+pub struct UserTranslationMemo {
+    page: u64,
+    phys: u64,
+    flags: x86_64::structures::paging::PageTableFlags,
+    valid: bool,
+}
+
+impl Default for UserTranslationMemo {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl UserTranslationMemo {
+    pub const fn new() -> Self {
+        Self {
+            page: 0,
+            phys: 0,
+            flags: x86_64::structures::paging::PageTableFlags::empty(),
+            valid: false,
+        }
+    }
+}
+
 /// Proof that one exact user range was admitted for reading against this
 /// address-space snapshot.  Keeping the proof tied to `&ProcessAddressSpace`
 /// lets a caller copy without walking the same page tables a second time.
@@ -137,6 +165,32 @@ impl ProcessAddressSpace {
             byte_len,
             first_phys,
         })
+    }
+
+    /// `validate_user_write_resolving_cow` that reuses and refreshes `memo`.
+    pub fn validate_user_write_memo(
+        &self,
+        start: VirtAddr,
+        byte_len: usize,
+        memo: &mut UserTranslationMemo,
+        resolve: impl FnMut(VirtAddr) -> Result<(), AddressSpaceError>,
+    ) -> Result<ValidatedUserWrite<'_>, AddressSpaceError> {
+        let first_phys = self.validate_user_buffer_access_memo(
+            start, byte_len, UserBufferAccess::Write, memo, resolve)?;
+        Ok(ValidatedUserWrite { address_space: self, start, byte_len, first_phys })
+    }
+
+    /// `validate_user_read` that reuses and refreshes `memo`.
+    pub fn validate_user_read_memo(
+        &self,
+        start: VirtAddr,
+        byte_len: usize,
+        memo: &mut UserTranslationMemo,
+    ) -> Result<ValidatedUserRead<'_>, AddressSpaceError> {
+        let first_phys = self.validate_user_buffer_access_memo(
+            start, byte_len, UserBufferAccess::Read, memo,
+            |_| Err(AddressSpaceError::ProtectionViolation))?;
+        Ok(ValidatedUserRead { address_space: self, start, byte_len, first_phys })
     }
 
     pub fn validate_user_read_buffer(
@@ -336,6 +390,18 @@ impl ProcessAddressSpace {
         start: VirtAddr,
         byte_len: usize,
         access: UserBufferAccess,
+        resolve: impl FnMut(VirtAddr) -> Result<(), AddressSpaceError>,
+    ) -> Result<Option<PhysAddr>, AddressSpaceError> {
+        self.validate_user_buffer_access_memo(
+            start, byte_len, access, &mut UserTranslationMemo::new(), resolve)
+    }
+
+    fn validate_user_buffer_access_memo(
+        &self,
+        start: VirtAddr,
+        byte_len: usize,
+        access: UserBufferAccess,
+        memo: &mut UserTranslationMemo,
         mut resolve: impl FnMut(VirtAddr) -> Result<(), AddressSpaceError>,
     ) -> Result<Option<PhysAddr>, AddressSpaceError> {
         if byte_len == 0 {
@@ -365,9 +431,12 @@ impl ProcessAddressSpace {
 
         let mut first_page_phys = None;
         while cursor < end_exclusive {
-            let (mut phys, mut flags) = self
-                .translate_user_with_flags(VirtAddr::new(cursor))
-                .ok_or(AddressSpaceError::NotMapped)?;
+            let (mut phys, mut flags) = if memo.valid && memo.page == cursor {
+                (PhysAddr::new(memo.phys), memo.flags)
+            } else {
+                self.translate_user_with_flags(VirtAddr::new(cursor))
+                    .ok_or(AddressSpaceError::NotMapped)?
+            };
             if matches!(access, UserBufferAccess::Write)
                 && flags.contains(super::COW_USER_LEAF)
                 && !flags.contains(x86_64::structures::paging::PageTableFlags::WRITABLE)
@@ -377,6 +446,7 @@ impl ProcessAddressSpace {
                     .translate_user_with_flags(VirtAddr::new(cursor))
                     .ok_or(AddressSpaceError::NotMapped)?;
             }
+            *memo = UserTranslationMemo { page: cursor, phys: phys.as_u64(), flags, valid: true };
             validate_user_page_access(flags, access)?;
             if first_page_phys.is_none() {
                 first_page_phys = Some(phys);

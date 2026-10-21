@@ -12,3 +12,4 @@ pub mod simd;
 pub mod smp;
 pub mod timer;
 pub mod tlb_shootdown;
+pub mod user_access;

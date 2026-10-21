@@ -342,6 +342,24 @@ pub(super) fn bind_basis(reply: u64, namespace: DonationNamespace,
     slot: usize, id: u64) -> Result<Option<FundingBasis>, ()> {
     bind_basis_locked(&DONATION_LEDGER.lock(), reply, namespace, slot, id)
 }
+/// `bind_basis` + `bind_owned` for a donor whose funding is its own context
+/// (no borrowed source, so no root pin or revalidation beyond the entry itself),
+/// in one ledger acquisition. `None` means the full two-step bind must decide:
+/// a borrowed basis, a missing reservation or a mismatch.
+pub(super) fn bind_own_funding(reply: u64, donor_slot: usize, donor_id: u64,
+    receiver_slot: usize, receiver_id: u64) -> Option<bool> {
+    let mut ledger = DONATION_LEDGER.lock();
+    let basis = match bind_basis_locked(&ledger, reply, DonationNamespace::IpcReply, donor_slot, donor_id) {
+        Ok(Some(basis)) => basis,
+        _ => return None,
+    };
+    if basis.source.is_some() || basis.root_slot != donor_slot || basis.root_id != donor_id {
+        return None;
+    }
+    Some(bind_reserved_locked(&mut ledger, reply, DonationNamespace::IpcReply, donor_id,
+        receiver_id, receiver_slot))
+}
+
 pub(super) fn bind_owned(loans: &super::donation_publication::ReceiveLoans,
     reply: u64, namespace: DonationNamespace) -> bool {
     let basis = loans.donor.basis();

@@ -182,5 +182,35 @@ pub(crate) fn restore_simd_state(slot: usize) {
         SIMD_STATES[slot].bound(task_id, |state| unsafe { restore_state(state) });
     });
 }
+/// Lane variants of the two accessors above for a caller that already holds
+/// the masked IRQ scope and the slot's Current (save) or Prepared (restore)
+/// allocation bank, and knows the task id: they skip the per-call CPU-index
+/// derivation, bank-ownership assertion, descriptor read and busy-flag CAS.
+///
+/// # Safety
+/// IRQs are masked on this CPU, this CPU's Current/Prepared bank is `slot`'s,
+/// and `task_id` is `slot`'s bound task. No other CPU touches the image while
+/// a bank covers it.
+#[inline]
+pub(crate) unsafe fn save_simd_state_lane(slot: usize, task_id: u64) {
+    // SAFETY: caller contract; the bank excludes every other accessor.
+    let image = unsafe { &mut *SIMD_STATES[slot].image.get() };
+    debug_assert!(image.task_id == Some(task_id), "lane SIMD image names another task");
+    let _ = task_id;
+    // SAFETY: the area is the slot's own image and IRQs are masked.
+    unsafe { save_state(&mut image.state) };
+}
+/// # Safety
+/// As [`save_simd_state_lane`].
+#[inline]
+pub(crate) unsafe fn restore_simd_state_lane(slot: usize, task_id: u64) {
+    // SAFETY: caller contract; the bank excludes every other accessor.
+    let image = unsafe { &mut *SIMD_STATES[slot].image.get() };
+    debug_assert!(image.task_id == Some(task_id), "lane SIMD image names another task");
+    let _ = task_id;
+    // SAFETY: the area is the slot's own image and IRQs are masked.
+    unsafe { restore_state(&image.state) };
+}
+
 #[cfg(test)]
 mod tests;

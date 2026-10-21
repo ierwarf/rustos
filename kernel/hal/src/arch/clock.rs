@@ -195,6 +195,23 @@ pub fn current_source() -> Option<ClockSourceInfo> {
 /// admitted. This is intentionally not global monotonic authority: callers
 /// may only subtract two readings taken during one non-migratable execution
 /// interval on the same CPU.
+/// Both nanosecond views of one ordered TSC read, or `None` when the invariant
+/// TSC is not the clock source. `(monotonic, scheduler_local)` are exactly what
+/// `monotonic_nanos` and `scheduler_local_nanos` return for that reading.
+pub(crate) fn tsc_views() -> Option<(u64, u64)> {
+    // ORDERING: Acquire pairs with the clocksource promotion, as `monotonic_nanos`.
+    if SOURCE.load(Ordering::Acquire) != SOURCE_INVARIANT_TSC {
+        return None;
+    }
+    let hz = TSC_HZ.load(Ordering::Relaxed);
+    if hz == 0 {
+        return None;
+    }
+    let tsc = read_tsc_ordered();
+    let delta = tsc.saturating_sub(TSC_BASE.load(Ordering::Relaxed));
+    Some((nanos_from_tsc_delta(delta, hz), nanos_from_tsc_delta(tsc, hz)))
+}
+
 pub fn scheduler_local_nanos() -> Option<u64> {
     let hz = invariant_tsc_frequency_hz()?;
     Some(nanos_from_tsc_delta(read_tsc_ordered(), hz))

@@ -174,10 +174,19 @@ pub(in crate::multitask::scheduler) fn lane_effects(
 }
 
 pub(in crate::multitask::scheduler) fn lane_install(
-    previous: ArchitectureState, next: ArchitectureState, to_slot: usize,
+    previous: ArchitectureState, next: ArchitectureState, to_slot: usize, to_id: u64,
 ) {
     #[cfg(not(test))]
-    lane_effects(previous, next, to_slot, hardware_effect);
+    lane_effects(previous, next, to_slot, |effect| match effect {
+        // SAFETY: the lane holds the masked IRQ scope and the incoming task's
+        // Prepared bank, and names its bound task id.
+        ArchitectureEffect::Simd(slot) => unsafe {
+            runqueue::simd_tls::restore_simd_state_lane(slot, to_id)
+        },
+        other => hardware_effect(other),
+    });
+    #[cfg(test)]
+    let _ = to_id;
     // Native tests model the privileged effects, as `install_model` does.
     #[cfg(test)]
     lane_effects(previous, next, to_slot, |effect| LANE_EFFECTS.with(|log| log.borrow_mut().push(effect)));
