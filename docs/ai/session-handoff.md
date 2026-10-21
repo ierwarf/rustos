@@ -187,9 +187,16 @@ benefits require matched original-tree controls.
   hal 73 + mm 72 tests, dev-plan `now` lane 708/708, `verify-all --profile pr`
   and `verify-smp-iteration` sealed, 8-vCPU `kvm-smoke --smp-iteration
   --gui-dvm-surfaces --exercise-input` passed after the last edit.
-- Next: convert vfsd/procd/pagerd loops to `reply_recv`; a single-slot fast
-  rendezvous mailbox (<0.5k); `iretq`-free resume for lane frames; remaining
-  per-call re-derivations (~54 tracked lock pairs per round trip).
+- 2026-10-22 later: fixed the reaped-child SIGCHLD tax (every syscall of a process
+  that had a child exit cost ~99k ticks), procd and vfsd now use `reply_then_recv`,
+  `sched_yield` skips the dispatcher when idle, `uaccess_selftest` covers COW and
+  remap races. Gates after the last edit: lib tests (kernel-ps 969, compat 182),
+  `verify-all --profile pr`, `verify-smp-iteration`, 8-vCPU kvm-smoke.
+- Not started: idle-aware wake placement and SMT/LLC topology in
+  `runqueue_policy::affinity_target_cpu`; dead-code sweep (147 kernel-ps warnings);
+  a doc-vs-code consistency sweep; fork/exec latency (fork+COW ~1.2 ms).
+- Next structural: fastcall register ABI, single-slot rendezvous, `iretq`-free lane
+  resume, fewer lock pairs (see ipc-lane.md).
 
 ## Open questions at the snapshot boundary
 

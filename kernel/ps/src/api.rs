@@ -117,6 +117,10 @@ pub fn request_deferred_reschedule() {
     crate::multitask::request_deferred_reschedule();
 }
 
+pub fn request_yield_reschedule() {
+    crate::multitask::request_yield_reschedule();
+}
+
 pub fn request_user_return_reschedule() {
     crate::multitask::request_user_return_reschedule();
 }

@@ -26,6 +26,7 @@ mod cow_probe;
 mod ipc_probes;
 mod scheduling_context_probe;
 mod tails;
+mod uaccess_selftest;
 use cow_probe::probe_fork_cow_private_write;
 
 const SYS_LINUX_GETPID: u64 = 39;
@@ -1188,7 +1189,7 @@ fn main() {
         _ => {}
     }
     debug_line("ipcbench: begin");
-    debug_line(if ipc_probes::user_access_recovery_selftest() {
+    debug_line(if uaccess_selftest::run() {
         "ipcbench: uaccess-recovery pass"
     } else {
         "ipcbench: uaccess-recovery FAIL"

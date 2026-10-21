@@ -115,7 +115,7 @@ pub const MAX_SCHEDULER_TASKS: usize = scheduler::MAX_TASK;
 #[allow(unused_imports)]
 pub(crate) use self::irq::{
     claim_interruptible_syscall_reschedule, cond_resched, request_deferred_reschedule,
-    request_user_return_reschedule, reschedule_if_requested,
+    request_user_return_reschedule, request_yield_reschedule, reschedule_if_requested,
 };
 pub use self::irq::{
     commit_block_current_task_and_yield, commit_block_current_task_with_fast_reply_and_yield,

@@ -248,9 +248,16 @@ fn validate_procd_response_envelope(
     request_op: u16,
     response: &ProcdIpcResponse,
 ) -> Result<(), i64> {
+    // SELECT_SIGNAL carries the selected SIGCHLD event bits in `reserved0`; the
+    // signal path revalidates them against the thread's pending snapshot. Every
+    // other reply must leave the field zero. Rejecting it here left a reaped
+    // child's SIGCHLD pending forever, and each later syscall of that process
+    // re-issued a failing procd call.
+    let reserved0_admitted =
+        response.reserved0 == 0 || request_op == rustos_user_abi::syscall::PROCD_OP_SELECT_SIGNAL;
     if response.version != rustos_user_abi::syscall::PROCD_IPC_ABI_VERSION
         || response.op != request_op
-        || response.reserved0 != 0
+        || !reserved0_admitted
         || response.reserved1 != 0
         || response.payload_len as usize > response.payload.len()
     {

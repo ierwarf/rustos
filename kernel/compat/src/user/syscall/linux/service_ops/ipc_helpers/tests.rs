@@ -323,6 +323,40 @@ fn procd_response_envelope_rejects_cross_op_and_oversized_payload() {
     );
 }
 
+/// A reaped child leaves SIGCHLD pending with its event bits; procd echoes the
+/// selected events in `reserved0`. Only SELECT_SIGNAL may carry them - rejecting
+/// the reply made every later syscall of that process repeat a failing call.
+#[test]
+fn procd_select_signal_reply_may_carry_sigchld_events_but_no_other_op_may() {
+    let response = ProcdIpcResponse {
+        op: PROCD_OP_SELECT_SIGNAL,
+        reserved0: 1,
+        ..ProcdIpcResponse::default()
+    };
+    assert_eq!(
+        validate_procd_response_envelope(PROCD_OP_SELECT_SIGNAL, &response),
+        Ok(())
+    );
+    let other = ProcdIpcResponse {
+        op: PROCD_OP_EXECVE,
+        reserved0: 1,
+        ..ProcdIpcResponse::default()
+    };
+    assert_eq!(
+        validate_procd_response_envelope(PROCD_OP_EXECVE, &other),
+        Err(LINUX_EINVAL)
+    );
+    let reserved1 = ProcdIpcResponse {
+        op: PROCD_OP_SELECT_SIGNAL,
+        reserved1: 1,
+        ..ProcdIpcResponse::default()
+    };
+    assert_eq!(
+        validate_procd_response_envelope(PROCD_OP_SELECT_SIGNAL, &reserved1),
+        Err(LINUX_EINVAL)
+    );
+}
+
 /// A memoized routing answer must be discarded the moment a different devmgrd
 /// could be the one answering. The table is compiled into that service, so an
 /// entry recorded under a superseded registration is a guess about a binary

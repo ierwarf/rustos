@@ -639,6 +639,19 @@ pub(crate) fn request_user_return_reschedule() {
     user_return_reschedule_flag(current_cpu_index()).store(1, Ordering::Release);
 }
 
+/// `sched_yield`: a voluntary switch only when something else can run here.
+/// Running tasks are absent from the runnable bitmap, so an empty queue, mailbox,
+/// synchronous FIFO and activation window mean the dispatcher could only pick the
+/// caller again; the common syscall tail then returns straight to user mode
+/// instead of entering the scheduler (the periodic clockevent applies the same rule).
+pub(crate) fn request_yield_reschedule() {
+    let cpu = current_cpu_index();
+    if super::scheduler::other_dispatch_work_pending(cpu) {
+        // ORDERING: Release publishes the request to this CPU's syscall tail.
+        user_return_reschedule_flag(cpu).store(1, Ordering::Release);
+    }
+}
+
 extern "C" fn reschedule_ipi_interrupt_dispatch(
     context_ptr: *mut SavedContext,
 ) -> *mut SavedContext {

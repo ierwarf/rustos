@@ -94,23 +94,15 @@ fn service_main() {
 }
 
 fn serve(endpoint: u64) {
+    let mut request = [0_u8; IPC_MAX_INLINE_BYTES];
+    let mut reply_cap = 0_u64;
+    let mut sender_pid = 0_u64;
+    let mut sender_tid = 0_u64;
+    let mut received = receive_request(endpoint, &mut request, &mut reply_cap, &mut sender_pid, &mut sender_tid);
     loop {
-        let mut request = [0_u8; IPC_MAX_INLINE_BYTES];
-        let mut reply_cap = 0_u64;
-        let mut sender_pid = 0_u64;
-        let mut sender_tid = 0_u64;
-        let received = unsafe {
-            ipc::recv_with_sender(
-                endpoint,
-                request.as_mut_ptr(),
-                request.len(),
-                &mut reply_cap as *mut u64,
-                &mut sender_pid as *mut u64,
-                &mut sender_tid as *mut u64,
-            )
-        };
         if received < 0 {
             rustos_svc_runtime::syscall::sleep_millis(1);
+            received = receive_request(endpoint, &mut request, &mut reply_cap, &mut sender_pid, &mut sender_tid);
             continue;
         }
 
@@ -119,10 +111,49 @@ fn serve(endpoint: u64) {
         // rootd, so it cannot recreate the bootstrap authorization cycle.
         drain_lifecycle_events();
         let response = handle_wire_request(received as usize, &request, sender_pid, sender_tid);
-        let reply = unsafe { ipc::reply(reply_cap, response.as_ptr(), response.len()) };
-        if reply < 0 {
-            ipc::debug_line("procd: reply failed");
-        }
+        // Reply and receive in one syscall: a receiver already parked on the
+        // endpoint is what lets the kernel's same-CPU lane switch directly.
+        // SAFETY: request and response storage are live and disjoint until the
+        // fused call returns; every output is exclusively borrowed.
+        let next = unsafe {
+            ipc::reply_then_recv(
+                endpoint,
+                reply_cap,
+                response.as_ptr(),
+                response.len(),
+                request.as_mut_ptr(),
+                request.len(),
+                &mut reply_cap as *mut u64,
+                &mut sender_pid as *mut u64,
+                &mut sender_tid as *mut u64,
+                ipc::debug_line_static,
+            )
+        };
+        received = if next < 0 {
+            receive_request(endpoint, &mut request, &mut reply_cap, &mut sender_pid, &mut sender_tid)
+        } else {
+            next
+        };
+    }
+}
+
+fn receive_request(
+    endpoint: u64,
+    request: &mut [u8; IPC_MAX_INLINE_BYTES],
+    reply_cap: &mut u64,
+    sender_pid: &mut u64,
+    sender_tid: &mut u64,
+) -> i64 {
+    // SAFETY: every output is exclusive and live for the whole blocking receive.
+    unsafe {
+        ipc::recv_with_sender(
+            endpoint,
+            request.as_mut_ptr(),
+            request.len(),
+            reply_cap as *mut u64,
+            sender_pid as *mut u64,
+            sender_tid as *mut u64,
+        )
     }
 }
 

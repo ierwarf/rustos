@@ -109,6 +109,11 @@ pub(in crate::multitask) fn local_dispatch_work_pending(cpu: usize) -> bool {
     #[cfg(test)]
     false
 }
+/// Whether the dispatcher could pick something other than the caller on `cpu`:
+/// queued or mailboxed work, a synchronous handoff, or an atomic activation.
+pub(in crate::multitask) fn other_dispatch_work_pending(cpu: usize) -> bool {
+    local_dispatch_work_pending(cpu) || dispatch_policy::atomic_activation_pending(cpu)
+}
 /// Reads the effective scheduling-context owner and live donation reply from
 /// the lock-free custody ledger. Native execution deliberately returns `None`.
 /// Permit units a parked resident cell holds for `slot` (see `resident`).

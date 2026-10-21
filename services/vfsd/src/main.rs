@@ -281,122 +281,173 @@ fn service_main() {
     serve(endpoint as u64, state);
 }
 
+/// What one request left to do on the wire.
+enum Served {
+    /// The reply (or its deferred owner) was already settled; the status feeds
+    /// the failure counter and the next request needs a plain receive.
+    Settled(i64),
+    /// Reply with these bytes and receive the next request in one syscall.
+    Reply(*const u8, usize),
+}
+
+fn receive_request(
+    endpoint: u64,
+    request: &mut MaybeUninit<VfsRecvBuffer>,
+    reply_cap: &mut u64,
+    sender_pid: &mut u64,
+    sender_tid: &mut u64,
+) -> i64 {
+    // SAFETY: every output is exclusive and live for the whole blocking receive.
+    unsafe {
+        ipc::recv_with_sender(
+            endpoint,
+            request.as_mut_ptr().cast::<u8>(),
+            VFS_RECV_BYTES,
+            reply_cap as *mut u64,
+            sender_pid as *mut u64,
+            sender_tid as *mut u64,
+        )
+    }
+}
+
 fn serve(endpoint: u64, mut state: VfsState) {
     let mut reply_failures = 0_u64;
+    let mut request = MaybeUninit::<VfsRecvBuffer>::uninit();
+    let mut reply_cap = 0_u64;
+    let mut sender_pid = 0_u64;
+    let mut sender_tid = 0_u64;
+    // Replies that are built locally live here so the fused reply-and-receive
+    // can send them after the request buffer is reused for the next message.
+    let mut commercial_response = CommercialMaxProtocolResponse::default();
+    let mut linux_response = LinuxSyscallOffloadResponse::default();
+    let mut received =
+        receive_request(endpoint, &mut request, &mut reply_cap, &mut sender_pid, &mut sender_tid);
     loop {
-        let mut request = MaybeUninit::<VfsRecvBuffer>::uninit();
-        let mut reply_cap = 0_u64;
-        let mut sender_pid = 0_u64;
-        let mut sender_tid = 0_u64;
-        let received = unsafe {
-            ipc::recv_with_sender(
-                endpoint,
-                request.as_mut_ptr().cast::<u8>(),
-                VFS_RECV_BYTES,
-                &mut reply_cap as *mut u64,
-                &mut sender_pid as *mut u64,
-                &mut sender_tid as *mut u64,
-            )
-        };
         if received < 0 {
             rustos_svc_runtime::syscall::sleep_millis(1);
+            received = receive_request(
+                endpoint, &mut request, &mut reply_cap, &mut sender_pid, &mut sender_tid);
             continue;
         }
 
-        let request = unsafe {
-            core::slice::from_raw_parts(request.as_ptr() as *const u8, received as usize)
-        };
-        let reply = if received as usize == size_of::<VfsExecutableSnapshotRequest>() {
-            let request = unsafe { &*request.as_ptr().cast::<VfsExecutableSnapshotRequest>() };
-            if request.requester_pid != sender_pid
-                || request.requester_tid != sender_tid
-                || rustos_svc_runtime::ipc::validate_service_owner(IPC_SERVICE_LOADERD, sender_pid)
-                    < 0
-            {
-                reply_snapshot_status(reply_cap, EACCES)
-            } else {
-                match state.resolve_executable_snapshot_request(*request) {
-                    Ok(resolved) => {
-                        enqueue_executable_snapshot(reply_cap, sender_pid, sender_tid, resolved)
-                    }
-                    Err(errno) => reply_snapshot_status(reply_cap, errno),
-                }
-            }
-        } else if received as usize == size_of::<VfsIpcRequest>() {
-            let request = unsafe { &*request.as_ptr().cast::<VfsIpcRequest>() };
-            let response = reset_vfs_response_slot(request.op);
-            if request.pid != sender_pid || request.tid != sender_tid {
-                unsafe { (*response).status = EACCES };
-            } else {
-                state.handle_vfs_request(request, unsafe { &mut *response });
-            }
-            unsafe {
-                ipc::reply(
-                    reply_cap,
-                    response.cast::<u8>(),
-                    size_of::<VfsIpcResponse>(),
-                )
-            }
-        } else if received as usize == size_of::<CommercialMaxProtocolRequest>() {
-            let request = unsafe { &*request.as_ptr().cast::<CommercialMaxProtocolRequest>() };
-            let response = if request.header.subject_pid != sender_pid
-                || request.header.subject_tid != sender_tid
-            {
-                CommercialMaxProtocolResponse {
-                    header: request.header,
-                    status: EACCES,
-                    ..CommercialMaxProtocolResponse::default()
-                }
-            } else {
-                state.handle_commercial_request(request)
+        let served = {
+            let request = unsafe {
+                core::slice::from_raw_parts(request.as_ptr() as *const u8, received as usize)
             };
-            unsafe {
-                ipc::reply(
-                    reply_cap,
-                    (&response as *const CommercialMaxProtocolResponse).cast::<u8>(),
+            if received as usize == size_of::<VfsExecutableSnapshotRequest>() {
+                let request = unsafe { &*request.as_ptr().cast::<VfsExecutableSnapshotRequest>() };
+                // The snapshot reply carries handles or is completed by the
+                // snapshot worker, so it never joins the fused turn.
+                Served::Settled(
+                    if request.requester_pid != sender_pid
+                        || request.requester_tid != sender_tid
+                        || rustos_svc_runtime::ipc::validate_service_owner(
+                            IPC_SERVICE_LOADERD,
+                            sender_pid,
+                        ) < 0
+                    {
+                        reply_snapshot_status(reply_cap, EACCES)
+                    } else {
+                        match state.resolve_executable_snapshot_request(*request) {
+                            Ok(resolved) => {
+                                enqueue_executable_snapshot(reply_cap, sender_pid, sender_tid, resolved)
+                            }
+                            Err(errno) => reply_snapshot_status(reply_cap, errno),
+                        }
+                    },
+                )
+            } else if received as usize == size_of::<VfsIpcRequest>() {
+                let request = unsafe { &*request.as_ptr().cast::<VfsIpcRequest>() };
+                let response = reset_vfs_response_slot(request.op);
+                if request.pid != sender_pid || request.tid != sender_tid {
+                    unsafe { (*response).status = EACCES };
+                } else {
+                    state.handle_vfs_request(request, unsafe { &mut *response });
+                }
+                Served::Reply(response.cast::<u8>(), size_of::<VfsIpcResponse>())
+            } else if received as usize == size_of::<CommercialMaxProtocolRequest>() {
+                let request = unsafe { &*request.as_ptr().cast::<CommercialMaxProtocolRequest>() };
+                commercial_response = if request.header.subject_pid != sender_pid
+                    || request.header.subject_tid != sender_tid
+                {
+                    CommercialMaxProtocolResponse {
+                        header: request.header,
+                        status: EACCES,
+                        ..CommercialMaxProtocolResponse::default()
+                    }
+                } else {
+                    state.handle_commercial_request(request)
+                };
+                Served::Reply(
+                    (&commercial_response as *const CommercialMaxProtocolResponse).cast::<u8>(),
                     size_of::<CommercialMaxProtocolResponse>(),
                 )
-            }
-        } else if received as usize == size_of::<LinuxSyscallOffloadRequest>() {
-            let request = unsafe { &*request.as_ptr().cast::<LinuxSyscallOffloadRequest>() };
-            let response = if request.pid != sender_pid || request.tid != sender_tid {
-                LinuxSyscallOffloadResponse {
-                    op: request.op,
-                    status: EACCES,
-                    ..LinuxSyscallOffloadResponse::default()
-                }
-            } else {
-                state.handle_linux_request(request)
-            };
-            unsafe {
-                ipc::reply(
-                    reply_cap,
-                    (&response as *const LinuxSyscallOffloadResponse).cast::<u8>(),
+            } else if received as usize == size_of::<LinuxSyscallOffloadRequest>() {
+                let request = unsafe { &*request.as_ptr().cast::<LinuxSyscallOffloadRequest>() };
+                linux_response = if request.pid != sender_pid || request.tid != sender_tid {
+                    LinuxSyscallOffloadResponse {
+                        op: request.op,
+                        status: EACCES,
+                        ..LinuxSyscallOffloadResponse::default()
+                    }
+                } else {
+                    state.handle_linux_request(request)
+                };
+                Served::Reply(
+                    (&linux_response as *const LinuxSyscallOffloadResponse).cast::<u8>(),
                     size_of::<LinuxSyscallOffloadResponse>(),
                 )
-            }
-        } else {
-            let response = LinuxSyscallOffloadResponse {
-                status: EINVAL,
-                ..LinuxSyscallOffloadResponse::default()
-            };
-            unsafe {
-                ipc::reply(
-                    reply_cap,
-                    (&response as *const LinuxSyscallOffloadResponse).cast::<u8>(),
+            } else {
+                linux_response = LinuxSyscallOffloadResponse {
+                    status: EINVAL,
+                    ..LinuxSyscallOffloadResponse::default()
+                };
+                Served::Reply(
+                    (&linux_response as *const LinuxSyscallOffloadResponse).cast::<u8>(),
                     size_of::<LinuxSyscallOffloadResponse>(),
                 )
             }
         };
-        if reply < 0 {
-            reply_failures = reply_failures.saturating_add(1);
-            if reply_failure_diagnostic_due(reply_failures) {
-                ipc::debug_line(&format!(
-                    "vfsd: reply failed errno={} total={reply_failures}",
-                    -reply
-                ));
+        received = match served {
+            Served::Settled(reply) => {
+                if reply < 0 {
+                    reply_failures = reply_failures.saturating_add(1);
+                    if reply_failure_diagnostic_due(reply_failures) {
+                        ipc::debug_line(&format!(
+                            "vfsd: reply failed errno={} total={reply_failures}",
+                            -reply
+                        ));
+                    }
+                }
+                receive_request(
+                    endpoint, &mut request, &mut reply_cap, &mut sender_pid, &mut sender_tid)
             }
-        }
+            Served::Reply(response, response_len) => {
+                // SAFETY: the response lives in a static slot or a local that
+                // outlives this call; the request buffer is disjoint and every
+                // output is exclusively borrowed.
+                let next = unsafe {
+                    ipc::reply_then_recv(
+                        endpoint,
+                        reply_cap,
+                        response,
+                        response_len,
+                        request.as_mut_ptr().cast::<u8>(),
+                        VFS_RECV_BYTES,
+                        &mut reply_cap as *mut u64,
+                        &mut sender_pid as *mut u64,
+                        &mut sender_tid as *mut u64,
+                        ipc::debug_line_static,
+                    )
+                };
+                if next < 0 {
+                    receive_request(
+                        endpoint, &mut request, &mut reply_cap, &mut sender_pid, &mut sender_tid)
+                } else {
+                    next
+                }
+            }
+        };
     }
 }
 

@@ -246,6 +246,62 @@ pub unsafe fn reply_recv_with_sender(
     )
 }
 
+/// One turn of a single-endpoint service loop: reply to `reply_cap` and receive
+/// the next request in a single syscall.
+///
+/// Returns the next request length, or a negative value when no request was
+/// received (the caller then falls back to a plain receive). The reply is
+/// retried once through the plain reply path only when the fused call proved it
+/// did not consume the capability; a failure after the reply committed is never
+/// retried. A result outside the native partition is a protocol violation.
+///
+/// # Safety
+/// `response` and `request_buf` must stay live and disjoint for the call, and
+/// every output pointer must be exclusively borrowed by the caller.
+#[inline]
+pub unsafe fn reply_then_recv(
+    endpoint: u64,
+    reply_cap: u64,
+    response: *const u8,
+    response_len: usize,
+    request_buf: *mut u8,
+    request_capacity: usize,
+    next_reply_cap_out: *mut u64,
+    sender_pid_out: *mut u64,
+    sender_tid_out: *mut u64,
+    on_failure: fn(&'static str),
+) -> i64 {
+    let result = unsafe {
+        reply_recv_with_sender(
+            endpoint,
+            reply_cap,
+            response,
+            response_len,
+            request_buf,
+            request_capacity,
+            next_reply_cap_out,
+            sender_pid_out,
+            sender_tid_out,
+        )
+    };
+    match reply_recv_result_kind(result) {
+        IpcReplyRecvResultKind::Success => {}
+        IpcReplyRecvResultKind::PostCommitError(_) => on_failure("reply-recv receive failed"),
+        IpcReplyRecvResultKind::PreCommitError(_) => {
+            on_failure("reply-recv reply failed");
+            // Only the pre-commit partition reaches here, so the old capability
+            // and the immutable response are live for exactly one recovery try.
+            if unsafe { reply(reply_cap, response, response_len) } < 0 {
+                on_failure("reply-recv recovery failed");
+            }
+        }
+        IpcReplyRecvResultKind::Invalid => {
+            panic!("invalid reply-recv result outside native ABI partition")
+        }
+    }
+    result
+}
+
 /// Returns the underlying receive errno only when `result` proves that the
 /// reply phase committed.  `None` means either success or a pre-commit errno.
 #[inline]
@@ -262,6 +318,11 @@ pub fn reply_recv_committed_errno(result: i64) -> Option<i64> {
 #[inline]
 pub const fn reply_recv_result_kind(result: i64) -> IpcReplyRecvResultKind {
     rustos_user_abi::syscall::ipc_reply_recv_result_kind(result)
+}
+
+/// `debug_line` for a `fn(&'static str)` callback slot (see [`reply_then_recv`]).
+pub fn debug_line_static(message: &'static str) {
+    debug_line(message);
 }
 
 /// Emit a debug line via `SYS_RUSTOS_DEBUG_PRINT`. Always-on; equivalent to

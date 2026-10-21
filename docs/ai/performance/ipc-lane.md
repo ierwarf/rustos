@@ -141,3 +141,28 @@ endpoint reserve 0.6k, response write 0.7k, request copy 0.4k; server syscall
 layer: args read + retain 0.7k, copy-and-validate 0.55k, output write 0.8k, recv
 arm/commit ~1.4k; 54 tracked lock pairs per round trip at ~45 ticks. A null
 syscall is ~480 ticks, so entry/exit is not the remaining cost.
+
+## Other paths found after P6 (2026-10-22)
+
+- **Reaped child tax (fixed).** The kernel rejected procd's `SELECT_SIGNAL` reply
+  because it carries the selected SIGCHLD events in `reserved0`, so a parent whose
+  child exited kept SIGCHLD pending and every later syscall re-issued a failing
+  procd call (`getpid` 480 -> ~99k ticks forever after one fork+wait; fused IPC
+  9.9k -> 107k). Only `SELECT_SIGNAL` may carry `reserved0` now;
+  `uaccess_selftest` fails if a post-fork syscall exceeds 20k ticks.
+- **Direct-copy safety net.** `ipcbench` starts with `uaccess_selftest`: fault
+  recovery (unmapped/read-only/out-of-range), COW copyout across a fork (the other
+  side keeps its bytes), and a bounded map/unmap race against a calling thread.
+- **Service loops.** `procd` and `vfsd` now reply-and-receive in one syscall through
+  `rustos_svc_runtime::ipc::reply_then_recv` (shared recovery rules); snapshot
+  replies stay on the plain path. `pagerd` interleaves a fault rendezvous with
+  `try_recv`, so it cannot be fused. `rootd`, `storaged`, `devmgrd`, `netd` and
+  `uiserver` still use plain replies (per-request work dwarfs the IPC path).
+- **`sched_yield`.** Returns without entering the dispatcher when nothing else can
+  run on the CPU (`other_dispatch_work_pending`); the benchmark keeps background
+  services runnable, so its number does not show the idle-CPU case.
+- **Tail (8 vCPU).** Fused IPC p99 ~18k vs p50 ~10k; the >1M samples are debug-port
+  milestone lines (one VM exit per byte) landing inside a call, the >80k ones match
+  the host noise `vmexit_cpuid` shows. Not yet addressed: wake placement is not
+  idle-aware (`affinity_target_cpu` keeps a busy last CPU unless the queue is
+  deeper by two), and topology (SMT/LLC) is not modelled.
