@@ -1,19 +1,20 @@
 # Session Handoff
 
-Live goal, `git status --short`, exact source hashes and fresh runtime evidence
-win. The current request is structural IPC round-trip lock reduction, using
-web references and benchmark evidence, followed by a question about larger
-custody-protocol redesign feasibility; no commit was requested in this round.
-The earlier 8-vCPU fused IPC mean target (<80,000 ticks) is not achieved.
+This is a dated engineering handoff, **not** live working-tree state. Always
+check `git status --short`, `git rev-parse HEAD`, source contracts, and fresh
+runtime evidence before continuing. The 2026-10-20/21 experiments below are
+historical observations; they do not imply any current uncommitted changes,
+completed physical-hardware qualifications, or performance regressions.
 
-## Current objective
+## Dated objective snapshot
 
 Stabilize eight-vCPU RustOS first, then optimize the scheduler/IPC bottlenecks
 found by static review. Per-CPU domain budgets (`65adf2d1`) and the wakeup,
 lock, heap and APIC fixes (`be14d6c2`) and the class-claim/IPC follow-up
 (`d6f27b11`) and runtime memory primitives (`172bbf26`) are committed.
-The current uncommitted round reduces DVM read-ahead amplification, removes
-unused handoff scans and CPU-state false sharing, and adds raw tail evidence.
+The 2026-10-20 working-tree round targeted DVM read-ahead amplification,
+unused handoff scans, CPU-state false sharing, and raw tail evidence. Verify
+current code before assuming any item remains outstanding.
 
 ## Fresh evidence — 2026-10-20
 
@@ -81,7 +82,7 @@ unused handoff scans and CPU-state false sharing, and adds raw tail evidence.
   readiness; 1-vCPU fused reply-recv minimum sits +1.9–2.3% over the
   same-session baseline (noise floor ~2%).
 
-## Current runtime-memory round — 2026-10-20
+## Runtime-memory round — 2026-10-20
 
 - Fresh clean-tree control at `d6f27b11`: `kvm-smoke --dry-run` and full
   `bench` at both 8 and 1 vCPUs passed. Same-session control tables and raw
@@ -125,7 +126,7 @@ unused handoff scans and CPU-state false sharing, and adds raw tail evidence.
   (837–993 ms; 930–1,059 ms). Do not infer an app-launch gain from the earlier
   slower controls or treat the primitive speedup as a transport fix.
 
-## Current DVM / IPC tail round — in progress
+## DVM / IPC tail round — 2026-10-20 snapshot
 
 - Scratch evidence: `/tmp/rustos-ipc80/`; no benchmark baseline committed.
   Read-only scout/review found no correctness blocker in the initial lazy-scan /
@@ -240,9 +241,6 @@ Uncommitted, separate from the DVM/IPC tail round above (do not mix files).
 
 ## Historical evidence
 
-The obsolete 3,330-line chronology was removed from the live entrypoint. Its
-exact pre-cleanup working copy is retained locally at
-`/home/hongii2/.cache/rustos-goal-414e2125/session-handoff-before-cleanup.md`
-(SHA-256 `49ac055658e7a42a79f59c0a8c2f34331359315d65f6d9ba9ee75dd92864438b`).
-It is historical context only, not a current instruction or fresh proof.
-Detailed ownership and wire invariants remain in their linked owner contracts.
+Older experiment chronology belongs in Git history; local scratch paths are
+not portable handoff references. Detailed ownership and wire invariants
+remain in their linked owner contracts.

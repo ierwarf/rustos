@@ -6,8 +6,9 @@
 
 ## English
 
-RustOS is a Rust-built **hybrid microkernel** with native binary
-compatibility for Linux ELF and Windows PE programs. The kernel keeps only
+RustOS is a Rust-built **hybrid microkernel** targeting native binary
+compatibility for Linux ELF and Windows PE programs. The two compatibility
+paths are still under development. The kernel keeps only
 the mechanisms that require ring0 — trap entry, paging, scheduling,
 IRQ/MMIO/DMA bridges, and a small set of gated brokers — and pushes
 everything else into userspace services. A built-in Wayland compositor in

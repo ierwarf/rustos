@@ -95,9 +95,9 @@ Native Wayland clients in the tree:
 - Prefer extending a userspace service over carving a new kernel broker.
 - Manifests, registries, and brokers are stable contracts. Wire new policy
   through them; do not lean on filenames or paths.
-- Hardening fallback providers (kernel boot framebuffer for display, scalar SIMD for blend)
-  must stay behind the real provider so a regression in the real provider is
-  observable, not masked.
+- Software-only computational fallbacks (such as scalar blending) may be
+  used behind the accelerated path. Do not revive a kernel/firmware display
+  fallback: the DVM owns display hardware and a missing transport fails closed.
 
 <a id="korean"></a>
 
@@ -193,6 +193,6 @@ alias를 추가하세요.
   우선합니다.
 - manifest, registry, broker는 안정적인 contract 입니다. 새 정책은 이들을
   통해 연결하고, file name이나 path에 의존하지 않습니다.
-- 강화용 fallback provider (display의 kernel boot framebuffer, blend의 scalar SIMD)는
-  실제 provider 뒤에 두어 실제 provider regression이 가려지지 않게
-  합니다.
+- scalar blending 같은 계산용 software fallback은 가속 경로 뒤에 둘 수 있지만,
+  kernel/firmware display fallback은 되살리지 않습니다. 화면 하드웨어 소유자는
+  DVM이며, transport가 없으면 해당 경로는 fail closed 됩니다.

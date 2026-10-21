@@ -1,135 +1,90 @@
 # Build Artifacts and Disk
 
-A RustOS checkout's source is small — under 40M tracked, with a `.git` around
-110M. Everything else on the device is regenerable output, and left alone it
-grows without bound: this tree reached 87G, of which 86G was build product.
+[English](#english) | [한국어](#korean)
 
-None of it was ever a source-control problem. `.gitignore` already covered
-every generated path and `git status` was clean throughout. Rewriting history
-would have reclaimed nothing.
+<a id="english"></a>
 
-## Where the space goes
+## English
 
-| Path | What it is | Rebuild cost |
-| --- | --- | --- |
-| `target/` | Workspace compilation. `debug/incremental` alone held 29G across 1733 session directories. | Minutes |
-| `driver-domains/linux/out/buildroot-output/` | The Buildroot appliance tree, Mesa included. | Hours |
-| `driver-domains/linux/out/{dl,ccache}/` | Download cache and compiler cache. | Re-download |
-| `build/formal/` | Formal lane output. 14G, of which the sealed evidence is under 10M. | Per lane |
+Build outputs, caches, and formal scratch directories are **not source files**.
+Use the targeted cleanup modes only when disk pressure warrants it. Avoid
+`clean`/`distclean` as routine recovery from an interrupted build: resume the
+same command first.
 
-The asymmetry in that last row is the important one. Every log, summary,
-detached signature, and proof index a seal depends on fits in ten megabytes;
-the rest is mutation shards' cargo trees and the ABI differential's Wine
-prefix. Reclaiming the scratch never touches the evidence.
+| Path | Purpose |
+| --- | --- |
+| `target/` | Cargo compilation and incremental artifacts. |
+| `build/artifacts/`, `build/image/` | Built artifacts and staged boot volume. |
+| `build/kvm/` | Private guest disk, serial/debug logs, and smoke evidence. |
+| `build/formal/` | Generated proof evidence and rebuildable scratch. |
+| `driver-domains/linux/out/` | Buildroot outputs, download and compiler caches. |
 
-## Reclaiming
+### Targeted cleanup
 
 ```bash
-cargo xtask clean --dry-run --stale 7 --scratch   # report only
-cargo xtask clean --stale 7                       # aged compilation residue
-cargo xtask clean --scratch                       # formal lanes' regenerable trees
+cargo xtask clean --dry-run --stale 7 --scratch
+cargo xtask clean --stale 7
+cargo xtask clean --scratch
 ```
 
-`--stale <DAYS>` is the one to reach for. Cargo keys an incremental session
-directory by crate and fingerprint and never revisits a session whose
-fingerprint has moved on, so an aged session is unreachable by any future
-build — deleting it costs nothing and 1372 of the 1733 sessions here held 24G.
-The warm cache is left intact.
+`--stale <DAYS>` targets aged compilation residue; `--scratch` removes
+regenerable formal scratch. Check the dry-run output before deleting. A bare
+`cargo xtask clean` performs a much wider wipe. Never remove current proof
+evidence or a DVM bundle needed for validation just to reclaim space.
 
-Bare `cargo xtask clean` is still the full wipe. AGENTS.md asks an interrupted
-build to resume rather than clean, and that guidance stands: the tiers exist so
-that reclaiming space does not mean discarding a working cache.
+### Building the workspace
 
-`.cargo/config.toml` also sets `gc = true`, which lets Cargo age out unused
-registry sources under `CARGO_HOME` on its own. That governs the Cargo home
-cache, not `target/`.
+Use `cargo xtask check` to validate workspace contracts and
+`cargo xtask build` for the staged RustOS image. Plain
+`cargo build --workspace` is not the OS build contract: mixing freestanding
+`no_std` binaries with host/`std` members in one Cargo feature-unified
+invocation can produce duplicate panic-handler/linking failures.
+Targeted host Cargo checks remain useful, but do not replace `xtask`.
 
-## Keeping it small
+See [xtask API](../api/xtask.md) for commands and
+[Paths Reference](../reference/paths.md) for generated locations. Historical
+per-machine disk sizes, build timings, and discarded optimization experiments
+belong in benchmark evidence or Git history, not evergreen build guidance.
 
-`[profile.dev]` in the workspace manifest carries the settings that stop the
-regrowth: line tables instead of full DWARF, no debug info for dependencies or
-build scripts, and debug info left unpacked in object files rather than copied
-into every binary. Backtraces keep their file and line numbers; what is dropped
-is the variable-inspection data a source debugger would want from a dependency.
+<a id="korean"></a>
 
-`release` is deliberately excluded. It is the profile the nucleus, the image,
-and every `cargo xtask bench` baseline are built under, and a codegen change
-there silently reprices every recorded cycle count.
+## 한국어
 
-## Build speed
+빌드 결과물, cache, formal scratch는 **소스 파일이 아닙니다**. 디스크 공간이
+부족할 때만 범위를 좁힌 정리 명령을 사용하세요. 중단된 빌드를 복구하려고
+`clean`/`distclean`부터 실행하지 말고, 먼저 같은 명령을 재실행하세요.
 
-The size settings pay a little speed as a side effect — there is less debug info
-to emit and less for the linker to move — but only a little. Measured serially
-on cold builds into a scratch target directory, against the tree as it stood
-before these settings:
+| 경로 | 용도 |
+| --- | --- |
+| `target/` | Cargo 컴파일 및 incremental 산출물 |
+| `build/artifacts/`, `build/image/` | 빌드 산출물과 stage된 boot volume |
+| `build/kvm/` | 게스트 전용 디스크, serial/debug log, smoke 증거 |
+| `build/formal/` | 생성된 검증 증거 및 재생성 가능한 scratch |
+| `driver-domains/linux/out/` | Buildroot 결과물, download/compiler cache |
 
-| Build | Before | After |
-| --- | --- | --- |
-| `xtask` dependency closure | 10.68s, 498M | 10.20s, 253M |
-| `cargo test -p kernel-ps --no-run` | 7.82s, 464M | 7.52s, 299M |
+### 범위를 좁힌 정리
 
-Roughly 4% off the clock and 40-50% off the disk. Do not expect more from this
-change; the disk is what it was for.
+```bash
+cargo xtask clean --dry-run --stale 7 --scratch
+cargo xtask clean --stale 7
+cargo xtask clean --scratch
+```
 
-Three further levers were tried and rejected. Do not re-add them without
-re-testing:
+`--stale <DAYS>`는 오래된 컴파일 잔여물, `--scratch`는 재생성 가능한 formal
+scratch를 정리합니다. 삭제 전에 `--dry-run` 결과를 확인하세요. 인자 없는
+`cargo xtask clean`은 훨씬 넓은 범위를 삭제합니다. 현재 검증에 필요한 증거나
+DVM bundle을 공간 확보 목적으로 지우지 마세요.
 
-- `opt-level = 1` for build scripts/proc macros: made the `xtask` dependency
-  closure slower, not faster (10.96s -> 13.01s).
-- `-Clink-arg=-fuse-ld=lld`: this target already links with the toolchain's
-  own `rust-lld` (`linker-flavor = gnu-lld-cc`); the flag only swaps in
-  whatever external `ld.lld` sits on `PATH`.
-- `-Zthreads=8` (parallel front-end): miscompiled `wayclick` (dropped a
-  monomorphized instance, undefined `From<WaylandError>` at link time) and
-  poisoned the target tree until it was removed. `cargo xtask check` can't
-  catch this because checking never links. If retried, test with
-  `cargo build -p wayclick` in a fresh target directory first.
+### Workspace 빌드
 
-## Why `--workspace` does not build
+workspace 계약은 `cargo xtask check`, stage된 RustOS image는
+`cargo xtask build`로 검증·생성하세요. `cargo build --workspace`는 공식 OS
+빌드 경로가 아닙니다. 하나의 Cargo feature-unified 호출에 freestanding
+`no_std` binary와 host/`std` member를 섞으면 panic handler 중복이나
+link 오류가 생길 수 있습니다. 개별 host Cargo 검사는 유용하지만
+`xtask` 검증을 대신하지 않습니다.
 
-`cargo build --workspace` fails on a duplicate `panic_impl` lang item, and no
-dependency pin fixes it. The workspace holds 28 `no_std` members and 17 host
-members. The `no_std` service binaries define their own panic handler; the host
-members pull shared dependencies — `fatfs`, `bitflags`, and others behind them —
-with the `std` feature on. Cargo unifies features across whatever one invocation
-is asked to build, so the union links `std` into a freestanding binary and rustc
-rejects the second lang item.
-
-The split is not tools-versus-RustOS. `uiserver` and `netd` are std services;
-`vfsd` and `syscalld` are not. Any fix that keeps both halves in one cargo
-invocation would have to repartition the services themselves.
-
-Each half builds cleanly alone, so `default-members` in the workspace manifest
-pins the default to the host half. Plain `cargo build`, `cargo test`, and
-`cargo clippy` work at the repo root; the freestanding half is built per
-package, with its own target and link line, by `cargo xtask build`.
-`cargo xtask check` remains the whole-tree gate. `cargo build --workspace`
-explicitly asks for the union and still fails — that is the invocation to avoid.
-
-## What this means for the formal gate
-
-`verify-all.sh` runs its lanes concurrently, so the gate's wall clock is the
-slowest lane, not their sum. That lane is `implementation-mutations` at 248s,
-against 159s for `kani` and under 80s for everything else — speeding up any
-other lane moves nothing until it passes 159s.
-
-The mutation lane is compile-bound: it shards across four checkouts and, for
-each of 484 mutants, compiles and runs one witness test under the `dev`
-profile. 184 of those mutants target `kernel-ps`, whose test build is the
-second row of the table above, so the profile change lands directly on that
-inner loop — at about 4%, which is honest but small. Nothing here makes the
-formal gate substantially faster.
-
-Three things that look like levers are not:
-
-- sccache is installed but unused: enabling it disables incremental
-  compilation, which the shard layout is built around.
-- Shard count is `min(4, cpu_count / 4, mutants, affordable)`; on 16 cores
-  that's already 4, so freeing disk space buys nothing here.
-- The parallel front-end would help most but miscompiles — see above.
-
-TLC is left as it is. It runs first and alone, because its budgets are wall
-clocks that only mean what they say when the lane is not competing for cores,
-and it already uses `-workers auto`. Its `-coverage 1` is not diagnostic
-output: `run-tlc.sh` fails the model on any operator with a zero count, so
-reducing coverage reporting would weaken a gate rather than speed one up.
+자세한 명령은 [xtask API](../api/xtask.md), 생성 경로는
+[Paths Reference](../reference/paths.md)를 참고하세요. 특정 개발 PC의
+과거 용량·빌드 시간과 폐기된 최적화 실험 기록은 Git history나 벤치마크
+증거에 두고, 일반 빌드 가이드에는 유지하지 않습니다.

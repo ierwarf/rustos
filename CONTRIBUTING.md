@@ -18,8 +18,9 @@ Before opening a pull request:
 4. Run `mdbook build` when changing `docs/`, `README.md`, or `book.toml`.
 5. Update `CHANGELOG.md` for user-visible, workflow-visible, or repository
    structure changes.
-6. Update `docs/ai/` when a change affects commands, stable paths, manifests,
-   runtime contracts, logging, or common agent workflows.
+6. Update the relevant AI owner contract only when the corresponding command,
+   interface, invariant, lifecycle, or workflow actually changes; avoid
+   mechanical documentation churn.
 
 Pull request expectations:
 
@@ -45,8 +46,8 @@ Pull request를 열기 전:
 4. `docs/`, `README.md`, `book.toml`을 수정했다면 `mdbook build`를 실행합니다.
 5. 사용자에게 보이는 변경, workflow 변경, repository 구조 변경은
    `CHANGELOG.md`에 기록합니다.
-6. command, stable path, manifest, runtime contract, logging, agent workflow에
-   영향이 있으면 `docs/ai/`도 갱신합니다.
+6. command, interface, 불변식, lifecycle 또는 workflow가 실제로 바뀐 경우에만
+   관련 AI owner contract를 갱신합니다. 기계적인 문서 변경은 피합니다.
 
 Pull request 기준:
 

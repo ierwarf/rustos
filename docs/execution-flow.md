@@ -21,8 +21,9 @@ cargo xtask build
 ```
 
 `cargo xtask kvm-smoke` is the bounded parallel-boot diagnostic path. It does
-not rebuild the image and does not claim an authenticated RustOS↔Linux-DVM
-transport.
+not rebuild the image. It verifies a hash-bound host-to-DVM control handshake;
+explicit exercise flags additionally validate selected authenticated RustOS↔DVM
+shared-memory relay paths. Virtual smoke is not physical-device qualification.
 
 ### Staged Image Flow
 
@@ -106,8 +107,10 @@ cargo xtask build
   -> generated registries 작성
 ```
 
-`cargo xtask kvm-smoke`는 bounded 병렬 부팅 진단 경로입니다. image를 다시
-빌드하지 않으며 인증된 RustOS↔Linux-DVM transport를 주장하지 않습니다.
+`cargo xtask kvm-smoke`는 bounded 병렬 부팅 진단 경로로 image를 다시 빌드하지
+않습니다. 해시로 검증되는 host-to-DVM control handshake를 확인하고, 명시적
+exercise 플래그로 일부 인증된 RustOS↔DVM shared-memory relay를 검증합니다.
+가상 smoke는 물리 장치 검증과 다릅니다.
 
 ### Staged Image Flow
 

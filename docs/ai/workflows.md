@@ -27,8 +27,9 @@ Follow `AGENTS.md`; load token policy or the task router only when their specifi
 2. Define a fixed, versioned transport contract before RustOS-side code.
 3. Keep RustOS changes to bounded transport validation and the owning service
    (`inputd`, `netd`, or `uiserver`); do not add a direct hardware fallback.
-4. Run `cargo xtask build-dvm`, `cargo xtask verify-dvm`, then the focused KVM
-   smoke command.
+4. Run `make -C driver-domains/linux build-plan` first; reuse the appropriate
+   cached rebuild lane if available, then `cargo xtask verify-dvm` and a
+   focused KVM smoke command. Use a full `build-dvm` only when the plan needs it.
 
 ## Modify kernel API
 
@@ -56,7 +57,8 @@ Follow `AGENTS.md`; load token policy or the task router only when their specifi
 ## Debug KVM lifecycle
 
 1. Ensure `cargo xtask build` completed.
-2. Build and verify the DVM: `cargo xtask build-dvm` then `verify-dvm`.
+2. Reuse a verified DVM or follow its `build-plan` when Linux-side inputs
+   changed; run `cargo xtask verify-dvm` before smoke.
 3. Run `cargo xtask kvm-smoke --expect '<milestone>'`. It boots RustOS and the
    DVM concurrently, then checks both readiness signals.
 4. Inspect focused lines in `build/kvm/rustos-debugcon.log` and

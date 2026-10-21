@@ -17,7 +17,7 @@ is defined in `tools/xtask/src/cli.rs`.
 | `cargo xtask build-user` | Build every current Rust ELF, C ABI app, Windows PE, and Windows DLL userspace artifact. |
 | `cargo xtask stage` | Stage already-built artifacts into the boot image. |
 | `cargo xtask build-dvm` | Build and hash-verify the pinned Buildroot Linux DVM. |
-| `cargo xtask verify-dvm` | Verify DVM artifact and pre-transport contract hashes. |
+| `cargo xtask verify-dvm` | Verify the pinned DVM artifact bundle and host-control contract hashes. |
 | `cargo xtask kvm-smoke` | Concurrently boot the Linux DVM and RustOS through QEMU/KVM. |
 | `cargo xtask selftest` / `fuzz-host` | Run host contract tests and deterministic parser fuzzing, including hostd launch plans. |
 | `cargo xtask clean` | Reclaim build artifacts. `--stale <DAYS>` drops only aged compilation residue, `--scratch` drops the formal lanes' regenerable trees, `--dry-run` reports without deleting. Bare `clean` is the full wipe. |

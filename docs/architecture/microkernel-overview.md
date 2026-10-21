@@ -15,12 +15,13 @@ UEFI/GRUB -> nucleus -> rootd -> core services -> initd -> runtimed/uiserver
                              input: RDI3 over L0-owned MSI-X input ring
                              display: validated ivshmem framebuffer
                              network: validated ivshmem frame ring
+                             storage: generation-bound DVM block ring
                          |
                          +-> Linux DVM owns DRM/KMS, evdev, virtio-net, modules
 ```
 
 Ring0 owns boot, scheduler, page tables, user-copy, capability enforcement,
-boot-volume I/O, and fixed transport validation. It does not load Linux
+bounded bootstrap admission, and fixed transport validation. It does not load Linux
 modules, enumerate a direct virtio network device, or provide USB/PS2/display
 fallbacks. If a DVM transport is missing or invalid, the affected device fails
 closed.
@@ -44,12 +45,13 @@ UEFI/GRUB -> nucleus -> rootd -> core service -> initd -> runtimed/uiserver
                              input: L0 소유 MSI-X input ring 위 RDI3
                              display: 검증된 ivshmem framebuffer
                              network: 검증된 ivshmem frame ring
+                             storage: generation-bound DVM block ring
                          |
                          +-> Linux DVM이 DRM/KMS, evdev, virtio-net, module 소유
 ```
 
 Ring0는 boot, scheduler, page table, user-copy, capability enforcement,
-boot-volume I/O, 고정 transport 검증만 담당합니다. Linux module을 load하지 않고,
+제한된 bootstrap admission, 고정 transport 검증만 담당합니다. Linux module을 load하지 않고,
 direct virtio network device나 USB/PS2/display fallback도 제공하지 않습니다.
 DVM transport가 없거나 잘못되면 해당 device는 fail closed 됩니다.
 

@@ -43,9 +43,9 @@ the desktop surface for native and compatibility clients.
   surface.
 - **Manifest-driven images** — `cargo xtask` validates, builds, stages, and
   assembles the UEFI boot image.
-- **Linux driver domain** — KVM smoke testing can boot RustOS together with a
-  pinned Buildroot Linux DVM and exercise its bounded authenticated control
-  probe.
+- **Linux driver domain** — KVM smoke testing boots the pinned Buildroot Linux
+  DVM alongside RustOS and can exercise its authenticated input, display,
+  network, and read-only block test transports.
 
 ### Build flow
 
@@ -80,11 +80,11 @@ cargo xtask build-dvm
 cargo xtask kvm-smoke --expect 'runtimed: bootstrap ui done'
 ```
 
-The DVM currently exposes the authenticated `agent-v1-control` smoke path for
-health/PCI inventory and a bounded synthetic-key probe. This validates the
-control/smoke path only; a general RustOS↔DVM device data plane, arbitrary key
-forwarding, NIC/storage transport, and passthrough validation are separate
-work.
+The DVM exposes a hash-bound `agent-v1-control` handshake and bounded
+input, display, network, and read-only block transports. The base smoke test
+checks boot and control readiness; optional KVM flags exercise the individual
+relay paths. Virtual-device evidence does not establish physical GPU,
+storage passthrough, host input capture, or commercial release readiness.
 
 ### Architecture at a glance
 
@@ -95,7 +95,7 @@ work.
 | Userspace | OS policy and higher-level services |
 | UI | `uiserver` Wayland compositor and desktop surface |
 | Compatibility | Linux ELF and Windows PE compatibility work |
-| Driver domain | Buildroot Linux DVM plus authenticated control smoke path |
+| Driver domain | Buildroot Linux DVM with authenticated control and bounded device relays |
 | Tooling | `cargo xtask`, manifests, staging, verification, and KVM orchestration |
 
 ### Project status
@@ -110,7 +110,7 @@ work.
 | Linux ELF compatibility | In progress |
 | Windows PE compatibility | In progress |
 | Linux DVM control smoke path | Present |
-| General RustOS↔DVM device data plane | In progress |
+| DVM input/display/network/read-only block test paths | Present in bounded KVM topologies |
 | Public release artifacts | Planned |
 
 ### Documentation
@@ -162,8 +162,9 @@ compatibility를 목표로 합니다. `uiserver`에는 native/compatibility clie
   담당합니다.
 - **Manifest 기반 image pipeline** — `cargo xtask`가 검증, 빌드, staging,
   UEFI boot image 생성을 담당합니다.
-- **Linux driver domain** — KVM smoke에서 RustOS와 고정된 Buildroot Linux
-  DVM을 함께 부팅하고 제한된 인증 control probe를 검증할 수 있습니다.
+- **Linux driver domain** — KVM smoke에서 고정된 Buildroot Linux DVM과
+  RustOS를 함께 부팅해 인증된 입력·화면·네트워크·읽기 전용 블록 전송 경로를
+  선택적으로 검증할 수 있습니다.
 
 ### 빌드 흐름
 
@@ -197,10 +198,11 @@ cargo xtask build-dvm
 cargo xtask kvm-smoke --expect 'runtimed: bootstrap ui done'
 ```
 
-현재 DVM은 health/PCI inventory와 제한된 synthetic-key probe를 위한 인증된
-`agent-v1-control` smoke 경로를 제공합니다. 이는 control/smoke 경로만
-검증합니다. 범용 RustOS↔DVM device data plane, 임의 키 forwarding,
-NIC/storage transport, passthrough 검증은 별도의 진행 항목입니다.
+DVM에는 해시로 묶인 `agent-v1-control` handshake와 제한된 입력·화면·
+네트워크·읽기 전용 블록 transport가 있습니다. 기본 smoke는 부팅과 control
+readiness를, 선택적 KVM 플래그는 각 relay 경로를 검증합니다. 가상 장치에서의
+성공은 물리 GPU·스토리지 passthrough, 호스트 키보드 수집 또는 상용
+릴리스 준비가 완료되었다는 뜻이 아닙니다.
 
 ### 아키텍처 한눈에 보기
 
@@ -211,7 +213,7 @@ NIC/storage transport, passthrough 검증은 별도의 진행 항목입니다.
 | Userspace | OS 정책과 상위 service |
 | UI | `uiserver` Wayland compositor와 desktop surface |
 | Compatibility | Linux ELF / Windows PE 호환 경로 |
-| Driver domain | Buildroot Linux DVM과 인증된 control smoke path |
+| Driver domain | Buildroot Linux DVM의 인증 control 및 제한된 장치 relay |
 | Tooling | `cargo xtask`, manifest, staging, verification, KVM orchestration |
 
 ### 현재 상태
@@ -226,7 +228,7 @@ NIC/storage transport, passthrough 검증은 별도의 진행 항목입니다.
 | Linux ELF compatibility | 진행 중 |
 | Windows PE compatibility | 진행 중 |
 | Linux DVM control smoke path | 구현됨 |
-| 범용 RustOS↔DVM device data plane | 진행 중 |
+| DVM 입력·화면·네트워크·읽기 전용 블록 시험 경로 | 제한된 KVM 구성에서 구현됨 |
 | Public release artifacts | 예정 |
 
 ### 문서

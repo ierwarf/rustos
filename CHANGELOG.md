@@ -17,13 +17,15 @@ short; detailed design and API notes live in `docs/`.
 
 ### Changed
 
+- Human onboarding and AI handoff docs now distinguish implemented virtual-DVM
+  relays from unverified physical-device release paths, and remove stale
+  build-machine anecdotes and contradictory fallback instructions.
+
 - README now acts as a product landing page and points to the full manual.
 - CI uses the RustOS `cargo xtask check` path instead of a generic workspace
   build.
-- GRUB Multiboot2 boot no longer requests a boot framebuffer, avoiding firmware
-  video-mode failures before native display drivers are available.
-- GRUB Multiboot2 boot now requests a 32-bit linear framebuffer for the KVM
-  virtio display path.
+- The Multiboot2 header requests a 32-bit linear framebuffer for boot
+  compatibility; this is not an authorized runtime display fallback.
 - The Multiboot2 kernel link layout now includes ELF headers in the first
   loadable segment so kernel VM setup can derive executable protections.
 - The kernel build script now tracks the Multiboot2 linker script for reliable
@@ -58,12 +60,13 @@ API 설명은 `docs/`에 둡니다.
 
 ### 변경
 
+- 일반 사용자 문서와 AI 인수인계에서 검증된 가상 DVM relay와 미검증 물리 장치
+  릴리스 경계를 구분하고, 낡은 개인 빌드 기록과 모순된 fallback 지침을 정리
+
 - README를 전체 매뉴얼이 아닌 product landing page로 정리
 - CI가 일반 workspace build 대신 RustOS 전용 `cargo xtask check` 경로 사용
-- native display driver가 준비되기 전 firmware video mode 실패를 피하도록 GRUB
-  Multiboot2 boot에서 boot framebuffer 요청을 제거
-- GRUB Multiboot2 boot가 KVM virtio display path용 32-bit linear framebuffer를
-  요청
+- Multiboot2 header가 부팅 호환성을 위해 32-bit linear framebuffer를 요청합니다.
+  이는 runtime display fallback을 허용한다는 뜻이 아닙니다.
 - kernel VM setup이 executable protection을 계산할 수 있도록 Multiboot2
   kernel link layout의 첫 loadable segment에 ELF header 포함
 - boot layout 수정 후 stale binary가 남지 않도록 kernel build script가

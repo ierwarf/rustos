@@ -24,7 +24,7 @@ surfaces or sockets they expose.
 | Linux DVM | Linux driver lifecycle, DRM/KMS, evdev, and virtio-net. | Fixed RDI3/ivshmem transports. |
 | `devmgrd` | RustOS device namespace and hotplug policy. | `IPC_SERVICE_DEVMGRD`. |
 | `inputd` | Authenticated DVM input routing into Wayland and console clients. | Wayland seat + console focus. |
-| `storaged` | Block device policy and partition mapping over AHCI/NVMe. | Block API. |
+| `storaged` | Generation-bound block policy over the authenticated Linux-DVM transport. | DVM-backed block API. |
 | `netd` | Network stack policy over DVM Ethernet transport. | netprobe socket. |
 | `procd` | Process accounting, signal delivery, kernel ↔ runtime bridges for `ps`-style listings. | Pairs with `runtimed`. |
 | `uiserver` | Display surface, compositor, Wayland server, console renderer. Profiling stays opt-in via `RUSTOS_UI_PROFILE`. | `/run/user/1000/wayland-0`, runtime client. |
@@ -44,8 +44,8 @@ mistaken for the other.
 ### Linux Driver Domain
 
 Linux modules execute only in the isolated DVM. RustOS receives keyboard and
-pointer records through authenticated RDI3 over an L0-owned MSI-X input ring, and display/network through
-fixed validated ivshmem regions. `inputd`, `uiserver`, and `netd` own RustOS
+pointer records through authenticated RDI3 over an L0-owned MSI-X input ring;
+display, network, and block traffic use separately validated fixed transports. `inputd`, `uiserver`, and `netd` own RustOS
 policy above those transports. A missing DVM transport disables its device;
 there is no direct hardware, firmware-display, or RustOS module fallback.
 
@@ -71,7 +71,7 @@ ELF, 그리고 staged registry에 한 줄을 함께 가집니다. 아래 표는 
 | Linux DVM | Linux driver lifecycle, DRM/KMS, evdev, virtio-net. | 고정 RDI3/ivshmem transport. |
 | `devmgrd` | RustOS device namespace와 hotplug policy. | `IPC_SERVICE_DEVMGRD`. |
 | `inputd` | 인증된 DVM input을 Wayland와 console client로 route. | Wayland seat + console focus. |
-| `storaged` | AHCI/NVMe 위 block device policy와 partition mapping. | Block API. |
+| `storaged` | 인증된 Linux DVM transport 위 generation-bound block policy. | DVM 기반 block API. |
 | `netd` | DVM Ethernet transport 위 network stack policy. | netprobe socket. |
 | `procd` | process accounting, signal 전달, ps-style listing용 kernel ↔ runtime bridge. | `runtimed`와 쌍. |
 | `uiserver` | display surface, compositor, Wayland server, console renderer. profiling은 `RUSTOS_UI_PROFILE`로 필요할 때만 켭니다. | `/run/user/1000/wayland-0`, runtime client. |

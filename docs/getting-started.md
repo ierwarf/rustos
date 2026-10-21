@@ -55,13 +55,13 @@ RustOS concurrently, requires the RustOS readiness marker plus the validated
 host-to-DVM control probe, then stops only the QEMU children it created. It
 preserves their debugcon, serial, and stderr captures for inspection.
 
-The DVM currently advertises `agent-v1-control`: L0 makes an authenticated
-vsock health/PCI-inventory probe and a bounded synthetic-key probe. QEMU
-injects `A` into the DVM's virtio keyboard, the DVM must report Linux evdev
-code `30`, then RustOS must show that `inputd` consumed a newly injected `A`.
-This proves only the smoke path; RustOS still has no vsock endpoint or usable
-device data plane. It is not physical host-keyboard capture, arbitrary-key
-forwarding, NIC, storage, or passthrough validation.
+The DVM advertises a hash-bound `agent-v1-control` handshake. The synthetic
+keyboard smoke injects `A` into the DVM virtio keyboard and verifies Linux
+evdev code `30` plus a newly consumed `inputd` event. Separate bounded
+DVM input, display, Ethernet, and read-only block relays are exercised by
+explicit KVM options (see [xtask API](api/xtask.md)). This virtual smoke
+is not proof of physical host-keyboard capture, hardware passthrough,
+production driver lifecycle, or data durability.
 
 <a id="korean"></a>
 
@@ -116,10 +116,9 @@ cargo xtask kvm-smoke --expect 'runtimed: bootstrap ui done'
 요구하며 자신이 만든 QEMU child만 종료합니다. debugcon, serial, stderr capture는
 분석용으로 유지합니다.
 
-현재 DVM은 `agent-v1-control`을 알립니다. L0는 인증된 vsock health/PCI
-inventory probe와 제한된 합성 키 probe를 수행합니다. QEMU가 DVM의 virtio
-keyboard에 `A`를 주입하면 DVM은 Linux evdev code `30`을 보고해야 하며,
-그 뒤 RustOS는 새로 주입된 `A`를 `inputd`가 소비했음을 보여야 합니다. 이는
-smoke 경로만 증명합니다. RustOS↔DVM vsock endpoint나 usable device data plane,
-물리 host keyboard capture, 임의 키 forwarding, NIC, storage, passthrough
-검증을 뜻하지 않습니다.
+DVM은 해시로 검증되는 `agent-v1-control` handshake를 제공합니다. 합성
+keyboard smoke는 DVM virtio keyboard에 `A`를 주입하고 Linux evdev code
+`30` 및 `inputd`의 새 이벤트 소비를 검증합니다. 입력·화면·Ethernet·읽기 전용
+블록 relay는 별도 KVM 옵션으로 검증하며(참고: [xtask API](api/xtask.md)),
+이 가상 smoke가 물리 host keyboard capture, 하드웨어 passthrough, 상용
+드라이버 lifecycle 또는 데이터 내구성을 증명하지는 않습니다.
