@@ -45,8 +45,9 @@ mistaken for the other.
 
 Linux modules execute only in the isolated DVM. RustOS receives keyboard and
 pointer records through authenticated RDI3 over an L0-owned MSI-X input ring;
-display, network, and block traffic use separately validated fixed transports. `inputd`, `uiserver`, and `netd` own RustOS
-policy above those transports. A missing DVM transport disables its device;
+display, network, and block traffic use separately validated fixed
+transports. `inputd`, `uiserver`, `netd`, and `storaged` own policy above
+those transports. A missing DVM transport disables its device;
 there is no direct hardware, firmware-display, or RustOS module fallback.
 
 <a id="korean"></a>
@@ -90,7 +91,7 @@ cache를 사용하므로 서로 다른 registry가 뒤섞이지 않습니다.
 ### Linux Driver Domain
 
 Linux module은 격리된 DVM에서만 실행합니다. RustOS는 keyboard/pointer를
-인증된 L0 소유 MSI-X input ring의 RDI3로 받고, display/network은 고정 크기와 버전이 검증된
-ivshmem transport로 받습니다. 그 위의 정책은 `inputd`, `uiserver`, `netd`가
-소유합니다. DVM transport가 없거나 검증에 실패하면 해당 장치는 사용할 수
+인증된 L0 소유 MSI-X input ring의 RDI3로 받고, display/network/block은 각각
+검증된 고정 transport로 받습니다. 그 위의 정책은 `inputd`, `uiserver`, `netd`,
+`storaged`가 소유합니다. DVM transport가 없거나 검증에 실패하면 해당 장치는 사용할 수
 없으며, direct hardware·firmware display·RustOS module fallback은 없습니다.

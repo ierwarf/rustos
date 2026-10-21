@@ -71,15 +71,17 @@ Follow `AGENTS.md`; load token policy or the task router only when their specifi
    KVM firmware or disk inputs.
 2. Keep GRUB on serial/firmware text consoles; RustOS owns graphical output
    after the nucleus starts.
-3. Check `kernel/nucleus-core/src/multiboot2_entry.S` for the Multiboot2
-   framebuffer request tag.
-4. Confirm the kernel log prints a nonzero `boot framebuffer addr`.
-5. Confirm GUI bootstrap registers the validated firmware framebuffer before
-   any optional provider; it must not be packaged as a loadable driver.
-6. Confirm `display-primary` provider decisions use active provider-group
-   state and do not replace an active DVM/hardware provider with a fallback.
-7. For KVM virtual GPU profiles, require the Linux DVM DRM/KMS relay. Any
-   RustOS direct-GPU initialization is a regression.
+3. Check `kernel/nucleus-core/src/multiboot2_entry.S` when the Multiboot2
+   framebuffer request or an early boot diagnostic is suspected.
+4. Treat GRUB/firmware framebuffer data as early-console or diagnostic input,
+   never as a normal `uiserver` presentation provider.
+5. Require the validated DVM primary provider with DVM-scanout provenance;
+   absent or invalid transport must fail closed.
+6. For KVM virtual GPU profiles, require the Linux DVM DRM/KMS relay and the
+   current-epoch GUI-DVM aperture. Direct RustOS GPU initialization or any
+   kernel/firmware presentation fallback is a regression.
+7. Keep virtual readiness distinct from physical atomic-KMS, DMA-BUF, fence,
+   FPS, reset, and recovery evidence; qualify those gates separately.
 
 ## Reduce context mid-task
 

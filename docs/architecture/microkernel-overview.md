@@ -26,7 +26,8 @@ modules, enumerate a direct virtio network device, or provide USB/PS2/display
 fallbacks. If a DVM transport is missing or invalid, the affected device fails
 closed.
 
-`inputd`, `uiserver`, and `netd` own input, display, and networking policy.
+`inputd`, `uiserver`, `netd`, and `storaged` own input, display, network,
+and block policy.
 The kernel validates sizes, versions, sequence/state transitions, and memory
 bounds before handing a record or frame to those services.
 
@@ -55,6 +56,7 @@ Ring0는 boot, scheduler, page table, user-copy, capability enforcement,
 direct virtio network device나 USB/PS2/display fallback도 제공하지 않습니다.
 DVM transport가 없거나 잘못되면 해당 device는 fail closed 됩니다.
 
-Input/display/network policy는 `inputd`, `uiserver`, `netd`가 소유합니다.
+Input/display/network/block policy는 각각 `inputd`, `uiserver`, `netd`,
+`storaged`가 소유합니다.
 Kernel은 record/frame을 service에 넘기기 전에 size, version, sequence/state,
 memory bounds를 검증합니다.
