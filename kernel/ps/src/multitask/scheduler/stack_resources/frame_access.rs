@@ -21,23 +21,32 @@ impl FrameWriter {
     ) -> Option<Self> {
         let cell = RESOURCES.get(slot)?;
         let cpu = current.then(nucleus_core::util::lockdep::current_cpu_index);
+        // Exec refusal telemetry: only the sealed exec transaction passes an intent.
+        let fail = |reason| {
+            if intent.is_some() {
+                crate::multitask::scheduler::exec_transaction::refuse(reason)
+            } else {
+                None
+            }
+        };
+        use crate::multitask::scheduler::exec_transaction::ImageRefusal as Why;
         cell.with(|resources| {
             if match ticket {
                 Some(ticket) => task_id.is_some() || !ticket.admits_image(slot, resources),
                 None => resources.reservation.is_some(),
             } {
-                return None;
+                return fail(Why::WriterReservation);
             }
             let owned = match intent {
                 Some(intent) => task_id.is_some_and(|id| intent.admits_image(slot, id)),
                 None => !crate::multitask::current_identity::exec_intent::busy(slot),
             };
             if !owned {
-                return None;
+                return fail(Why::WriterIntent);
             }
             #[cfg(not(test))]
             if !crate::multitask::current_identity::execution::banks::image_custody(slot, cpu) {
-                return None;
+                return fail(Why::WriterBankCustody);
             }
             #[cfg(test)]
             if crate::multitask::current_identity::execution::count(slot) != 0
@@ -45,21 +54,28 @@ impl FrameWriter {
             {
                 return None;
             }
-            if super::super::outgoing_image::frozen(slot)
-                || resources.closing
-                || resources.frame_writing
-                // ORDERING: Acquire pairs with lock-free reader release.
-                || cell.readers.load(Ordering::Acquire) != 0
-                || cell.pins.load(Ordering::Acquire) != u32::from(current)
-            {
-                return None;
+            if super::super::outgoing_image::frozen(slot) {
+                return fail(Why::WriterFrozen);
+            }
+            if resources.closing {
+                return fail(Why::WriterClosing);
+            }
+            if resources.frame_writing {
+                return fail(Why::WriterBusyWriting);
+            }
+            // ORDERING: Acquire pairs with lock-free reader release.
+            if cell.readers.load(Ordering::Acquire) != 0 {
+                return fail(Why::WriterReaders);
+            }
+            if cell.pins.load(Ordering::Acquire) != u32::from(current) {
+                return fail(Why::WriterPins);
             }
             match task_id {
                 None if resources.start.is_none() && resources.binding.is_none() => {}
                 Some(id)
                     if resources.start.is_some_and(|start| start.id == id)
                         && resources.binding.is_some_and(|(bound, _)| bound == id) => {}
-                _ => return None,
+                _ => return fail(Why::WriterBinding),
             }
             let stack = resources.stack.as_mut()?;
             assert!(
@@ -227,13 +243,20 @@ pub(in crate::multitask::scheduler) fn with_owned_exec<R>(
 ) -> Option<R> {
     irq_excluded(|| {
         let cpu = nucleus_core::util::lockdep::current_cpu_index();
-        let actual = cpu_leases::exclusive_image_bank_custody(slot, cpu)?;
-        if actual != current
-            || (!current && !crate::multitask::current_identity::lifecycle(slot).exec_quiesced)
-        {
-            return None;
+        use crate::multitask::scheduler::exec_transaction::{ImageRefusal, refuse};
+        let Some(actual) = cpu_leases::exclusive_image_bank_custody(slot, cpu) else {
+            return refuse(ImageRefusal::BankBusy);
+        };
+        if actual != current {
+            return refuse(ImageRefusal::CurrentMismatch);
         }
-        let writer = FrameWriter::acquire(slot, Some(task_id), current, Some(intent), None)?;
+        if !current && !crate::multitask::current_identity::lifecycle(slot).exec_quiesced {
+            return refuse(ImageRefusal::NotQuiesced);
+        }
+        let Some(writer) = FrameWriter::acquire(slot, Some(task_id), current, Some(intent), None)
+        else {
+            return refuse(ImageRefusal::WriterAcquire);
+        };
         frame_publication::invalidate_before_image_write(slot);
         Some(f(&writer))
     })

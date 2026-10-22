@@ -1,12 +1,54 @@
 # Session Handoff
 
-**Dated snapshot (2026-10-21), not live working-tree state.** On resume, first
+**Dated snapshot (2026-10-22), not live working-tree state.** On resume, first
 inspect `git status --short`, `git rev-parse HEAD`, the relevant source
 owners, and fresh validation. Root `AGENTS.md` is the only stable prompt
 prefix. This page does not authorize reusing stale evidence, speculative
 changes, or old uncommitted-work claims.
 
-## Current continuation — 2026-10-21 (in progress)
+## Current continuation — 2026-10-22 core-path goal (in progress)
+
+- Latest live Goal contract governs the full objective; do not reduce completion
+  to the benchmark slice. No commits allowed. Initial HEAD `f6f618c7`, clean tree.
+- Parent is the sole writer. No product optimization yet; benchmark edits now
+  include opt-in UI consumption→validated DVM completion instrumentation.
+  Core syscall/MM/lifecycle/data/scheduler/state suites, same-ELF Linux KVM
+  runner, source/ELF-bound archives and strict evidence checks are implemented;
+  runtime failures and boot/Linux-GUI coverage remain open.
+  Requirements/status: `docs/benchmarks/core-paths-progress.md`; commands/meaning:
+  `docs/benchmarks/core-path-bundle.md`; owner rail:
+  `docs/ai/performance/core-paths.md`.
+- Default bench now includes null/real fused-IPC checks after lifecycle changes.
+  A pristine null distribution precedes uaccess preflight, preventing its own
+  fork/map/thread transitions from inflating the reference. Safety failure emits
+  no end marker. Linux never emulates RustOS IPC. New files remain untracked.
+- Actual checks before latest GUI review fixes: ipcbench 20, xtask 189, UI 76,
+  Python 2; GUI dev-plan now passed all 95 commands. SMP iteration formal passed
+  and auto-sealed the GUI tree. PR stable batch and full requested area/smoke
+  gates have NOT run. Earlier stale COW stamps, failed Linux imports and partial
+  IPC splits were fixed/reviewed. GUI review found idle provider reset preserving
+  warmup and a late submit timestamp; fixes/witness passed six focused tests
+  and targeted source-only re-review (OK). Full validation/captures must rerun.
+- Actual KVM: initial ordinary 1/8 controls passed. All six portable suites
+  were attempted on both guests/topologies; see progress ledger for failures.
+  pipe2=ENOSYS, regular-file creation/write=EROFS, blocking socket consumer
+  read=EAGAIN, repeated fork=EAGAIN; state rail passes through thread but exec
+  reports loader commit ESRCH. No valid Linux ratio yet (host CPUID drifts).
+  Scheduler 8-vCPU collected all 2048 placements; tail/balance targets fail.
+- GUI first 1/8-vCPU batches each collected 128 receipts; total p50/p99 were
+  4.055/38.172 ms and 13.214/23.859 ms, respectively (both tail FAIL). These are
+  preliminary old-harness results, not optimization/ABAB or Linux parity proof.
+  Archives are linked by `/tmp/rustos-core-path-evidence/gui-{1,8}.log`.
+- Next: validate/review the two GUI accounting fixes, rerun source-frozen GUI
+  captures, complete boot and matched Linux GUI evidence, diagnose uncovered
+  ABI/exec/resource-reclamation paths, then one product optimization at a time
+  with same-session ABAB. Remaining full-goal
+  service/SMP/data/process/GUI optimization, broad validation and cleanup are
+  explicitly open. A read-only five-service fusion audit is retained in the
+  supervisor artifacts; rootd/netd bounded maintenance and devmgrd transferred
+  replies must not be blindly fused into indefinite receives.
+
+## Prior continuation — 2026-10-21 (historical)
 
 - Task: review all tracked Markdown, optimize matched 8-vCPU KVM desktop boot,
   repair shell echo without dragging, harden other Ring3 services, then commit.
@@ -211,6 +253,38 @@ benefits require matched original-tree controls.
 - Virtual DVM input/UI smoke, model-checker passes, and control handshake
   observations do not qualify physical GPU FPS, reset/revoke, boot-time
   budgets, full SMP, or commercial recovery.
+
+## Non-core path stabilization (lifecycle), 2026-10-22
+
+Done and measured (`cargo xtask bench --suite core_lifecycle`, 1 and 8 vCPU, all probes
+collect): housekeeping kick + bounded batch reap, exit/exec/group-exit waits yield
+instead of spinning a quantum, blocking `wait4` rendezvous (`child_wait.rs`),
+spawner waits for reclaim (`reserve_spawn_after_reclaim`), exec fixes (resident-lane
+eviction before the image write, stale pager-VMA incarnation reclaim). Evidence and
+open items: `docs/ai/performance/core-paths-gaps.md`, numbers in
+`docs/benchmarks/core-paths-progress.md`.
+
+Open, in priority order:
+
+- `core_state` 8 vCPU: persistent-state rail rejects `state_thread_null` p50 960 vs 600
+  (>1.5x) after thread create/join; 1 vCPU passes. Find what a joined thread leaves behind.
+- fork+wait / fork+exec absolute latency (9 ms / 40+ ms) with a 0.7-1.2 ms floor: a
+  tick-sized wait remains; `spawn_activation_to_first_turn` is ~5 ms even with idle CPUs.
+- One 17 s `fork_exit_wait` outlier on 8 vCPU (not reproduced in 5 reruns): host stall or a
+  lost `wait4` wakeup; check the arm/register/recheck/commit order in
+  `syscalld_ops.rs::park_for_child_event` first if it recurs.
+- Rejected experiments, do not retry blindly: System-class housekeeping (fixes fork but
+  thread join p50 1.5M -> 127M ticks); idle-CPU-first placement in `affinity_target_cpu`
+  (no change in spawn-to-first-turn).
+- Dead-code warnings (~164) are clusters (`sync_handoff`, `locality`, `ipc_handoff`)
+  referenced by tests and formal pins; delete them together with the pins/mutation rows.
+- Untouched on purpose: pipe/pipe2, eventfd, writable FS, SOCK_SEQPACKET/SCM_RIGHTS,
+  `/proc`, blocking sockets. Design for the blocking path:
+  `docs/ai/performance/blocking-io-design.md`.
+
+New files need `git add`: `kernel/ps/src/multitask/{child_wait,housekeeping_kick}.rs`,
+`docs/ai/performance/{core-paths-gaps,blocking-io-design}.md` (plus the earlier untracked
+bench files).
 
 ## Canonical sources
 

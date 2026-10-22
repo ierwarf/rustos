@@ -77,7 +77,7 @@ Use `kernel_ps::api` for task scheduling and user process state.
 | `process` | `spawn_user_process`, `spawn_kernel_process` | Process creation. |
 | `snapshot` | `current_user_snapshot`, `current_user_process_id`, `retain_current_user_process_state`, `with_current_user_process_state_mut` | Current/process state access. |
 | `task` | `yield_now`, interrupt handler addresses, console session setters, runtime hooks | Scheduling and interrupt integration. |
-| `wait` | `wait_for_child` | Wait/child status handling. |
+| `wait` | `wait_for_child`, `register_child_waiter`, `unregister_child_waiter`, `wake_child_waiters` | Wait/child status handling and the blocking `wait4` rendezvous. |
 
 ### IO Manager API
 
@@ -200,7 +200,7 @@ task scheduling과 user process state는 `kernel_ps::api`를 사용합니다.
 | `process` | `spawn_user_process`, `spawn_kernel_process` | process creation |
 | `snapshot` | `current_user_snapshot`, `current_user_process_id`, `retain_current_user_process_state`, `with_current_user_process_state_mut` | current/process state access |
 | `task` | `yield_now`, interrupt handler addresses, console session setters, runtime hooks | scheduling과 interrupt integration |
-| `wait` | `wait_for_child` | wait/child status handling |
+| `wait` | `wait_for_child`, `register_child_waiter`, `unregister_child_waiter`, `wake_child_waiters` | wait/child status handling and blocking `wait4` rendezvous |
 
 ### IO Manager API
 

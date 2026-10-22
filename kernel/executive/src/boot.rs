@@ -722,6 +722,10 @@ pub fn finalize_kernel_initialization() {
     flow_info(13, "kernel finalize: kernel vfs runtime active");
     flow_info(14, "kernel finalize: DVM-only driver topology active");
 
+    // Fair class on purpose: a System-class housekeeping task starved thread
+    // exit/join behind its own strict-band turns (p50 1.5M -> 127M ticks).
+    // Slot shortage is handled by the spawner, which kicks this task and sleeps
+    // so that it gets the CPU (see `reserve_spawn_after_reclaim`).
     let service_thread = ps_api::Thread::new(tasks::nucleus_housekeeping_task, 100);
     service_thread.start();
     flow_info(21, "kernel finalize: housekeeping task started");

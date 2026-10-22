@@ -16,6 +16,7 @@ use runtime_control::read_bounded_config_snapshot;
 use crate::sys::{diag_line, running_on_rustos, spawn_ui_thread, UiThreadRole};
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
+static INPUT_COMPLETION: AtomicBool = AtomicBool::new(false);
 static ANNOUNCED: AtomicBool = AtomicBool::new(false);
 static INITIALIZED: OnceLock<()> = OnceLock::new();
 
@@ -33,6 +34,24 @@ pub(crate) fn enabled() -> bool {
         ENABLED.store(enabled, Ordering::Release);
     });
     ENABLED.load(Ordering::Acquire)
+}
+
+pub(crate) fn input_completion_enabled() -> bool {
+    INPUT_COMPLETION.load(Ordering::Acquire)
+}
+
+fn exact_input_completion_contract(contents: &str) -> bool {
+    contents == "contract=rustos-ipcbench-probe-v1\nprobe=core_gui\n"
+}
+
+fn publish_input_completion_selector() {
+    let enabled = read_bounded_config_snapshot(
+        "/system/registry/system/ipcbench-probe-v1.env",
+        CONTRACT_MAX_BYTES,
+    )
+    .ok()
+    .is_some_and(|contents| exact_input_completion_contract(&contents));
+    INPUT_COMPLETION.store(enabled, Ordering::Release);
 }
 
 pub(crate) fn announce_if_enabled() {
@@ -66,7 +85,13 @@ fn exact_contract_enables_profile(contents: &str) -> bool {
 /// Watch only during that bounded publication window; render/profile hot paths
 /// remain a single atomic load and never cache an early negative result.
 pub(crate) fn start_late_watcher() {
-    if !running_on_rustos() || enabled() {
+    if !running_on_rustos() {
+        return;
+    }
+    if enabled() {
+        // Runtimed may already have admitted the private profile contract and
+        // supplied RUSTOS_UI_PROFILE=1 before this process starts.
+        publish_input_completion_selector();
         return;
     }
     let _ = spawn_ui_thread(UiThreadRole::Background, "ui-acceptance-watch", || {
@@ -76,6 +101,7 @@ pub(crate) fn start_late_watcher() {
                 .ok()
                 .is_some_and(|contents| exact_contract_enables_profile(&contents));
             if enabled {
+                publish_input_completion_selector();
                 ENABLED.store(true, Ordering::Release);
                 announce_if_enabled();
                 return;
@@ -87,7 +113,20 @@ pub(crate) fn start_late_watcher() {
 
 #[cfg(test)]
 mod tests {
-    use super::exact_contract_enables_profile;
+    use super::{exact_contract_enables_profile, exact_input_completion_contract};
+
+    #[test]
+    fn input_completion_requires_the_exact_private_benchmark_selector() {
+        assert!(exact_input_completion_contract(
+            "contract=rustos-ipcbench-probe-v1\nprobe=core_gui\n"
+        ));
+        assert!(!exact_input_completion_contract(
+            "contract=rustos-ipcbench-probe-v1\nprobe=core_gui\nextra=1\n"
+        ));
+        assert!(!exact_input_completion_contract(
+            "contract=rustos-ipcbench-probe-v1\nprobe=core_state\n"
+        ));
+    }
 
     #[test]
     fn late_acceptance_profile_requires_the_exact_complete_contract() {

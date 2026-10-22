@@ -1,5 +1,24 @@
 // SPDX-License-Identifier: MIT
 
+fn private_ui_profile_requested(options: &SmokeOptions) -> bool {
+    options.min_ui_fps.is_some() || options.ipcbench_probe.as_deref() == Some("core_gui")
+}
+
+#[cfg(test)]
+mod input_completion_bench_tests {
+    use super::*;
+
+    #[test]
+    fn only_gui_completion_selector_or_explicit_fps_requests_ui_profile() {
+        for (probe, expected) in [("core_gui", true), ("core_state", false), ("core_gui_extra", false)] {
+            let options = parse_smoke_options(["--ipcbench-probe", probe].map(str::to_owned).into_iter()).unwrap();
+            assert_eq!(private_ui_profile_requested(&options), expected);
+        }
+        let options = parse_smoke_options(std::iter::empty()).unwrap();
+        assert!(!private_ui_profile_requested(&options));
+    }
+}
+
 fn prepare_layout(config: &Config, options: &SmokeOptions) -> Result<KvmLayout> {
     if !config.boot_disk_image.is_file() {
         bail!(
@@ -45,10 +64,8 @@ fn prepare_layout(config: &Config, options: &SmokeOptions) -> Result<KvmLayout> 
     if needs_private_contracts {
         write_private_kvm_contracts(
             &runtime_disk,
-            options
-                .min_ui_fps
-                .is_some()
-                .then_some((options.min_ui_fps.is_some(), options.exercise_network)),
+            private_ui_profile_requested(options)
+                .then_some((true, options.exercise_network)),
             options
                 .smp_ring3_qualification
                 .then_some(options.rustos_vcpus),

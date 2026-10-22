@@ -104,8 +104,16 @@ enum XtaskCommand {
         /// alone for the whole boot instead of being summed across every probe
         /// the harness runs. Prints the isolated phase table only; the ordinary
         /// probe-timing table needs the unrestricted run.
-        #[arg(long = "isolate-probe")]
+        #[arg(long = "isolate-probe", alias = "suite")]
         isolate_probe: Option<String>,
+        /// Run the exact ipcbench ELF in a same-host Linux KVM guest instead.
+        /// Requires a core_* suite; never reuses or modifies the DVM rootfs.
+        #[arg(long, requires = "isolate_probe", conflicts_with_all = ["ipc_max_cycles", "baseline", "compare", "linux_baseline"])]
+        linux_guest: bool,
+        /// Compare core-suite p50/p99/mean with an archived Linux guest log.
+        /// Requires matching host boot, vCPU count, ELF and CPUID anchor.
+        #[arg(long, requires = "isolate_probe")]
+        linux_baseline: Option<PathBuf>,
         /// Fail unless the isolated IPC round trip's raw maximum (all 20,000
         /// samples, including outliers) is at most this many invariant-TSC ticks.
         /// Diagnostic profiles cannot provide shipping acceptance evidence.
@@ -274,14 +282,18 @@ pub(crate) fn run() -> Result<()> {
             rustos_vcpus,
             isolate_probe,
             ipc_max_cycles,
-        }) => crate::bench::bench(
-            &config,
-            baseline.as_deref(),
-            compare.as_deref(),
-            rustos_vcpus,
-            isolate_probe.as_deref(),
-            ipc_max_cycles,
-        ),
+            linux_guest,
+            linux_baseline,
+        }) => {
+            if linux_guest {
+                crate::bench::linux_guest(&config, isolate_probe.as_deref().expect("required suite"), rustos_vcpus)
+            } else {
+                crate::bench::bench(
+                    &config, baseline.as_deref(), compare.as_deref(), rustos_vcpus,
+                    isolate_probe.as_deref(), ipc_max_cycles, linux_baseline.as_deref(),
+                )
+            }
+        },
         Some(XtaskCommand::BenchComponents { rustos_vcpus, timeout }) => {
             crate::bench::bench_components(&config, rustos_vcpus, timeout)
         }

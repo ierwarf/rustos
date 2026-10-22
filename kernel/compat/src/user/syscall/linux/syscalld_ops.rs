@@ -394,8 +394,12 @@ pub(super) fn syscall_linux_wait4(pid: i64, status_ptr: u64, options: u64, rusag
     let nohang = options & linux_abi::WNOHANG as u64 != 0;
     let include_stopped = options & linux_abi::WUNTRACED as u64 != 0;
     let include_continued = options & linux_abi::WCONTINUED as u64 != 0;
+    let mut carried = None;
     loop {
-        match multitask::wait_for_child(parent_pid, pid, include_stopped, include_continued) {
+        let result = carried.take().unwrap_or_else(|| {
+            multitask::wait_for_child(parent_pid, pid, include_stopped, include_continued)
+        });
+        match result {
             multitask::WaitChildResult::Exited {
                 pid: child_pid,
                 status,
@@ -426,7 +430,11 @@ pub(super) fn syscall_linux_wait4(pid: i64, status_ptr: u64, options: u64, rusag
             }
             multitask::WaitChildResult::Pending if nohang => return 0,
             multitask::WaitChildResult::Pending => {
-                multitask::yield_now();
+                match park_for_child_event(parent_pid, pid, include_stopped, include_continued) {
+                    ChildParking::Resumed => {}
+                    ChildParking::Settled(settled) => carried = Some(settled),
+                    ChildParking::Unavailable => multitask::yield_now(),
+                }
                 if let Some(state) = multitask::current_linux_thread_state()
                     && state.pending_signals & !state.signal_mask != 0
                 {
@@ -436,6 +444,57 @@ pub(super) fn syscall_linux_wait4(pid: i64, status_ptr: u64, options: u64, rusag
             multitask::WaitChildResult::NoMatchingChild if nohang => return 0,
             multitask::WaitChildResult::NoMatchingChild => return linux_errno(LINUX_ECHILD),
         }
+    }
+}
+
+/// Outcome of one attempt to sleep until a child changes state.
+enum ChildParking {
+    /// Slept and was woken (child event, signal or spurious wake); re-check.
+    Resumed,
+    /// The child table changed between the first check and the block; the
+    /// result is already consumed and must be handled by the caller.
+    Settled(multitask::WaitChildResult),
+    /// No wait slot or block authority; the caller polls with a yield instead.
+    Unavailable,
+}
+
+/// Blocks the calling thread until `ps` reports a child state change for its
+/// process. Producers publish the state and then wake registered parents, so
+/// the order arm -> register -> re-check -> commit cannot lose a wakeup.
+fn park_for_child_event(
+    parent_pid: u64,
+    pid: i64,
+    include_stopped: bool,
+    include_continued: bool,
+) -> ChildParking {
+    let Some(task_id) = multitask::current_task_id() else {
+        return ChildParking::Unavailable;
+    };
+    if !multitask::arm_block_current_task() {
+        return ChildParking::Unavailable;
+    }
+    if !multitask::register_child_waiter(parent_pid, task_id) {
+        let _ = multitask::cancel_block_current_task();
+        return ChildParking::Unavailable;
+    }
+    let settled = multitask::wait_for_child(parent_pid, pid, include_stopped, include_continued);
+    let signal_pending = multitask::current_linux_thread_state()
+        .is_some_and(|state| state.pending_signals & !state.signal_mask != 0);
+    if !matches!(settled, multitask::WaitChildResult::Pending) || signal_pending {
+        let _ = multitask::cancel_block_current_task();
+        multitask::unregister_child_waiter(task_id);
+        return if matches!(settled, multitask::WaitChildResult::Pending) {
+            ChildParking::Resumed
+        } else {
+            ChildParking::Settled(settled)
+        };
+    }
+    let committed = multitask::commit_block_current_task_and_yield();
+    multitask::unregister_child_waiter(task_id);
+    if committed.is_some() {
+        ChildParking::Resumed
+    } else {
+        ChildParking::Unavailable
     }
 }
 

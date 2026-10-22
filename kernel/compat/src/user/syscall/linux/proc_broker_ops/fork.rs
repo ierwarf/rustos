@@ -17,6 +17,24 @@
 
 use super::*;
 
+/// Process slots are returned by the housekeeping reap pass. A full table with
+/// exited children pending is transient, so kick the pass and wait for it in
+/// short sleeps (it may run on another CPU) before reporting EAGAIN.
+fn reserve_spawn_after_reclaim() -> Option<multitask::SpawnReservation> {
+    const RECLAIM_WAIT_MS: usize = 100;
+    if let Some(reservation) = multitask::reserve_process_spawn() {
+        return Some(reservation);
+    }
+    for _ in 0..RECLAIM_WAIT_MS {
+        multitask::kick_housekeeping();
+        crate::arch::rtc::sleep(1);
+        if let Some(reservation) = multitask::reserve_process_spawn() {
+            return Some(reservation);
+        }
+    }
+    None
+}
+
 pub(super) fn syscall_linux_rustos_proc_fork_broker(args_ptr: u64) -> u64 {
     if !current_process_can_policy() {
         return linux_errno(LINUX_EPERM);
@@ -39,7 +57,7 @@ pub(super) fn syscall_linux_rustos_proc_fork_broker(args_ptr: u64) -> u64 {
     else {
         return linux_errno(LINUX_ESRCH);
     };
-    let spawn_reservation = match multitask::reserve_process_spawn() {
+    let spawn_reservation = match reserve_spawn_after_reclaim() {
         Some(reservation) => reservation,
         None => return linux_errno(LINUX_EAGAIN),
     };

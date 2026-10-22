@@ -54,13 +54,26 @@
   its own IPC endpoint.
 - Detailed `uiserver profile: ...` and cursor/render pipeline diagnostics stay
   behind `RUSTOS_UI_PROFILE=1`.
-- Profile and once-per-second heartbeat summaries are emitted after accounting
-  completes, through the kernel's try-lock debugcon path. They never wait for
-  an observability relay: strict-priority scheduling may legitimately starve a
-  User-class relay, which cannot be the sole evidence path for a live
-  interactive System-class loop. A contended debugcon attempt is dropped and a
-  later one-second window retries; insufficient samples are a conservative KVM
-  gate failure, never a fabricated FPS success.
+- Profile summaries are emitted after accounting through the bounded,
+  nonblocking diagnostics queue (`sys::profile_line`). Queue saturation may
+  lose records and must fail the host's sample gate. Once-per-second liveness
+  heartbeats instead use the kernel's try-lock debugcon path and never wait for
+  a User-class observability relay that strict-priority scheduling can starve.
+  A contended debugcon attempt is dropped; insufficient evidence is a
+  conservative KVM failure, never fabricated FPS success.
+- `cargo xtask bench --suite core_gui` additionally requires the exact private
+  probe selector before enabling fixed-capacity input/completion accounting.
+  After 16 completed warmup input-bearing GPU frames, it records all 128
+  measured frames without formatting or output. Cursor-moving input drains
+  retain their oldest consumption time through backpressure; several drains
+  may coalesce into the latest cursor scene. A ticket attaches to the actual
+  pending frame before any synchronous first-frame retirement and completes
+  only after both compiler render/present receipts validate. Export begins
+  after the batch freezes. Missing/duplicate/reversed records, input loss,
+  cancellation or provider changes reject collection. This measures UI
+  consumption to observed DVM completion including polling delay, not CPU
+  submission, key echo, physical scanout, Linux parity or a shipping gate.
+  See [the complete benchmark contract](../../benchmarks/core-path-bundle.md).
 - The KVM-only self-test publishes its axis-aligned 192-pixel square source on
   a cumulative 15 ms cadence and sends it through the L0-owned input ring. The
   end-to-end contract uses exact aggregate rates across three consecutive

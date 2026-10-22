@@ -95,6 +95,7 @@ impl Producer {
             });
             key
         };
+        crate::multitask::kick_housekeeping();
         Some(Self {
             slot,
             key,

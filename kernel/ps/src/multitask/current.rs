@@ -564,7 +564,10 @@ pub fn current_console_session() -> Option<ConsoleSessionHandle> {
 }
 
 mod exec;
-pub use exec::{exec_current_user_process, exec_user_process_by_pid};
+pub use exec::{
+    ExecRefusal, exec_current_user_process, exec_user_process_by_pid,
+    exec_user_process_by_pid_checked,
+};
 
 pub fn linux_thread_snapshot_by_ids(
     process_id: u64,
@@ -922,20 +925,32 @@ pub fn service_deferred_work() -> usize {
         return group_exit;
     };
     let materialized_thread = super::scheduler::thread_creation::work::service(&executor);
-    let retirement_side_effect =
-        interrupts::without_interrupts(|| retirement_cleanup::claim_next_kernel(&executor));
-    let completed_side_effect = usize::from(retirement_side_effect.is_some());
-    if let Some(retirement_side_effect) = retirement_side_effect {
+    // A burst of exits (fork/wait loops, thread pools) retires many tasks
+    // between two housekeeping turns. Draining a bounded batch per turn keeps
+    // reclaim rate independent of how often this low-weight task is scheduled.
+    const RETIREMENT_BATCH: usize = 16;
+    let mut completed_side_effect = 0;
+    while completed_side_effect < RETIREMENT_BATCH {
+        let retirement_side_effect =
+            interrupts::without_interrupts(|| retirement_cleanup::claim_next_kernel(&executor));
+        let Some(retirement_side_effect) = retirement_side_effect else {
+            break;
+        };
+        completed_side_effect += 1;
         retirement_side_effect.complete(|task_id| {
             let _ = wake_task(task_id);
         });
     }
     // Actual per-slot reset/resource seals, not the directory, own detachment.
     // The borrowed executor and both seals survive external completion.
-    let retired_slot =
-        interrupts::without_interrupts(|| super::scheduler::reaper::claim_next(&executor));
-    let reaped_slot = usize::from(retired_slot.is_some());
-    if let Some(retired_slot) = retired_slot {
+    let mut reaped_slot = 0;
+    while reaped_slot < RETIREMENT_BATCH {
+        let retired_slot =
+            interrupts::without_interrupts(|| super::scheduler::reaper::claim_next(&executor));
+        let Some(retired_slot) = retired_slot else {
+            break;
+        };
+        reaped_slot += 1;
         executor.assert_current();
         retired_slot.complete();
         executor.assert_current();
@@ -965,8 +980,11 @@ fn complete_retirement_side_effects() {
     // while the independent kernel executor owns every external effect loan.
     let fence = interrupts::without_interrupts(executor::Fence::capture);
     while !interrupts::without_interrupts(|| fence.complete()) {
-        super::cond_resched();
-        core::hint::spin_loop();
+        // A real yield: the executor is a task on this CPU, and a spin that only
+        // honours already-requested reschedules burns the whole quantum on a
+        // single-CPU system before the executor can run.
+        super::kick_housekeeping();
+        super::yield_now();
     }
 }
 

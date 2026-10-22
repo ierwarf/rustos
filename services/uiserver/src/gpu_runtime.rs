@@ -122,6 +122,7 @@ struct PendingGpuFrame {
     slot_index: usize,
     surface_handle: u32,
     submitted_at: Instant,
+    input_completion: Option<crate::input_completion::Ticket>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -778,8 +779,11 @@ impl GpuCompositor {
             self.force_full_snapshot = true;
             return Err(err);
         }
+        // The diagnostic split ends at successful ioctl return, before slow
+        // logging/formatting or pending-frame bookkeeping can run.
+        let submit_accepted = Instant::now();
         self.force_full_snapshot = false;
-        let submit_elapsed = submit_started.elapsed();
+        let submit_elapsed = submit_accepted.duration_since(submit_started);
         let total_elapsed = total_started.elapsed();
         if total_elapsed >= GPU_SLOW_SUBMIT_THRESHOLD
             && GPU_SLOW_SUBMIT_LOG_COUNT.fetch_add(1, Ordering::Relaxed) < MAX_GPU_SLOW_SUBMIT_LOGS
@@ -816,7 +820,12 @@ impl GpuCompositor {
         self.pending.push(PendingGpuFrame {
             slot_index,
             surface_handle,
-            submitted_at: Instant::now(),
+            submitted_at: submit_accepted,
+            // Attach before the first-frame blocking retirement: it can
+            // complete synchronously before this present call returns.
+            input_completion: crate::input_completion::submitted(
+                submit_accepted, self.info.generation, self.next_content_epoch, surface_handle,
+            ),
         });
         self.damage_history.push_back(AtlasDamageEpoch {
             epoch: self.next_content_epoch,
@@ -960,6 +969,8 @@ impl GpuCompositor {
                         .present(completion.present)
                         .map_err(gpu_scene_errno)?;
                     self.pending.remove(0);
+                    // Both exact render and present receipts validated above.
+                    crate::input_completion::completed(frame.input_completion);
                     return Ok(true);
                 }
                 Err(EAGAIN) if !blocking && !timed_out => {
@@ -972,6 +983,14 @@ impl GpuCompositor {
                 Err(err) => return Err(err),
             }
         }
+    }
+}
+
+impl Drop for GpuCompositor {
+    fn drop(&mut self) {
+        // Even an idle provider reset after warmup invalidates the cohort;
+        // limiting cancellation to outstanding tickets would miss that case.
+        crate::input_completion::provider_lost();
     }
 }
 

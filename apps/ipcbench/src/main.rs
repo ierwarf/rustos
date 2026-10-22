@@ -22,6 +22,10 @@ use rustos_user_abi::syscall::{SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_PHASE_PROFILE_
 
 mod component_contract;
 mod components;
+mod core_contract;
+mod core_paths;
+mod state_probes;
+mod scheduler_probes;
 mod cow_probe;
 mod ipc_probes;
 mod scheduling_context_probe;
@@ -197,7 +201,37 @@ fn force_drain_phase_profiles() {
     }
 }
 
+static LINUX_OUTPUT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static BUFFERED_OUTPUT: std::sync::Mutex<Option<Vec<String>>> = std::sync::Mutex::new(None);
+static PRISTINE_NULL: std::sync::Mutex<Option<Vec<u64>>> = std::sync::Mutex::new(None);
+
+fn linux_output() -> bool {
+    LINUX_OUTPUT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn benchmark_executable() -> CString {
+    if linux_output() {
+        use std::os::unix::ffi::OsStrExt;
+        CString::new(std::env::current_exe().expect("Linux executable path").as_os_str().as_bytes())
+            .expect("executable path has no NUL")
+    } else {
+        CString::new("apps/ipcbench/ipcbench.elf").expect("fixed exec path")
+    }
+}
+
 fn debug_line(message: &str) {
+    if let Some(buffer) = BUFFERED_OUTPUT.lock().unwrap().as_mut() {
+        buffer.push(message.to_owned());
+        return;
+    }
+    emit_line(message);
+}
+
+fn emit_line(message: &str) {
+    if linux_output() {
+        println!("{message}");
+        return;
+    }
     let mut line = Vec::with_capacity(message.len() + 1);
     line.extend_from_slice(message.as_bytes());
     line.push(b'\n');
@@ -520,6 +554,10 @@ impl Drop for LifecycleStampMapping {
     }
 }
 
+fn valid_lifecycle_window(parent_begin: u64, parent_end: u64, child_begin: u64, child_end: u64) -> bool {
+    parent_begin > 0 && parent_begin <= child_begin && child_begin <= child_end && child_end <= parent_end
+}
+
 fn last_errno() -> i32 {
     std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
 }
@@ -581,7 +619,7 @@ fn probe_fork_exit_wait(tsc_khz: u64) {
 /// transfer. The child mode exits before reading the benchmark probe contract,
 /// preventing recursive benchmark execution after replacement.
 fn probe_fork_exec_exit_wait(tsc_khz: u64) {
-    let path = CString::new("apps/ipcbench/ipcbench.elf").expect("fixed exec path");
+    let path = benchmark_executable();
     let child_arg = CString::new("--lifecycle-child").expect("fixed child argument");
     let argv = [path.as_ptr(), child_arg.as_ptr(), ptr::null()];
     let envp = [ptr::null()];
@@ -691,6 +729,7 @@ fn probe_spawn_activation_to_first_turn(tsc_khz: u64) {
             failure = "wait";
             return None;
         }
+        let parent_end = tsc();
         let (_, after) = match mapping.read() {
             Ok(stamp) => stamp,
             Err(_) => {
@@ -698,7 +737,7 @@ fn probe_spawn_activation_to_first_turn(tsc_khz: u64) {
                 return None;
             }
         };
-        if !child_exited_successfully(status) || after < start {
+        if !child_exited_successfully(status) || !valid_lifecycle_window(start, parent_end, after, after) {
             failure = "child-status-or-tsc-order";
             return None;
         }
@@ -734,6 +773,7 @@ fn probe_exit_retire_to_reap(tsc_khz: u64) {
             failure = "rewind-stamp";
             return None;
         }
+        let parent_begin = tsc();
         let pid = linux_fork_syscall();
         if pid == 0 {
             let exit_started = tsc();
@@ -759,7 +799,8 @@ fn probe_exit_retire_to_reap(tsc_khz: u64) {
                 return None;
             }
         };
-        if !child_exited_successfully(status) || exit_started == 0 || reaped_at < exit_started {
+        if !child_exited_successfully(status)
+            || !valid_lifecycle_window(parent_begin, reaped_at, exit_started, exit_started) {
             failure = "child-status-or-tsc-order";
             return None;
         }
@@ -787,7 +828,7 @@ fn probe_exec_replace_single_thread(tsc_khz: u64) {
             return;
         }
     };
-    let path = CString::new("apps/ipcbench/ipcbench.elf").expect("fixed exec path");
+    let path = benchmark_executable();
     let child_mode = CString::new("--exec-replace-child").expect("fixed child mode");
     let envp = [ptr::null()];
     let mut failure = "unknown";
@@ -796,6 +837,7 @@ fn probe_exec_replace_single_thread(tsc_khz: u64) {
             failure = "rewind-stamp";
             return None;
         }
+        let parent_begin = tsc();
         let pid = linux_fork_syscall();
         if pid == 0 {
             let before = tsc();
@@ -820,6 +862,7 @@ fn probe_exec_replace_single_thread(tsc_khz: u64) {
             failure = "wait";
             return None;
         }
+        let parent_end = tsc();
         let (before, after) = match mapping.read() {
             Ok(stamp) => stamp,
             Err(_) => {
@@ -827,7 +870,7 @@ fn probe_exec_replace_single_thread(tsc_khz: u64) {
                 return None;
             }
         };
-        if !child_exited_successfully(status) || before == 0 || after < before {
+        if !child_exited_successfully(status) || !valid_lifecycle_window(parent_begin, parent_end, before, after) {
             failure = "child-status-or-tsc-order";
             return None;
         }
@@ -1033,6 +1076,10 @@ fn run_all_probes(tsc_khz: u64) {
     // rather than producing a slow number. Three pages and 64 iterations, so
     // the default lane pays a few hundred microseconds for it.
     measure_split_mapping_survives("mmap_split_survives_3_pages", 3, 64, tsc_khz);
+    // The default bench always checks persistent syscall/IPC cost after each
+    // lifecycle change, not only when a diagnostic suite is explicitly selected.
+    *BUFFERED_OUTPUT.lock().unwrap() = Some(Vec::new());
+    state_probes::run(tsc_khz);
 }
 
 /// A closed vocabulary rather than a dispatch table keyed by the report name:
@@ -1041,6 +1088,13 @@ fn run_all_probes(tsc_khz: u64) {
 fn run_single_probe(name: &str, tsc_khz: u64) {
     match name {
         component_contract::FILTER => components::run(tsc_khz),
+        core_contract::STATE => state_probes::run(tsc_khz),
+        // uiserver owns the exact GPU receipt samples. Keep only our CPUID
+        // anchor and safety preflight; never substitute a syscall for a frame.
+        core_contract::GUI => {},
+        core_contract::SCHEDULER => scheduler_probes::run(tsc_khz),
+        core_contract::LIFECYCLE => state_probes::lifecycle(tsc_khz),
+        suite if core_contract::probes(suite).is_some() => core_paths::run(suite, tsc_khz),
         "tsc_overhead" => probe_tsc_overhead(tsc_khz),
         "null_syscall_getpid" => probe_null_syscall(tsc_khz),
         "vmexit_cpuid" => probe_vmexit_cpuid(tsc_khz),
@@ -1179,6 +1233,29 @@ fn main() {
     let mut args = std::env::args();
     let _program = args.next();
     match args.next().as_deref() {
+        Some("--linux-baseline") => {
+            let suite = args.next().expect("--linux-baseline requires a core suite name");
+            assert!(core_contract::is_suite(&suite), "unknown Linux baseline suite");
+            LINUX_OUTPUT.store(true, std::sync::atomic::Ordering::Relaxed);
+            debug_line("ipcbench: begin");
+            let khz = calibrate_tsc_khz();
+            debug_line(&format!("ipcbench: tsc_khz={khz}"));
+            *BUFFERED_OUTPUT.lock().unwrap() = Some(Vec::new());
+            probe_vmexit_cpuid(khz);
+            probe_tsc_overhead(khz);
+            // Linux has no RustOS safety preflight. Take its pristine sample
+            // after calibration's sleep/host warmup, immediately before state
+            // transitions, rather than confusing startup clock drift with tax.
+            if suite == core_contract::STATE {
+                *PRISTINE_NULL.lock().unwrap() = core_paths::identity_samples();
+            }
+            run_single_probe(&suite, khz);
+            tails::flush();
+            let lines = BUFFERED_OUTPUT.lock().unwrap().take().unwrap();
+            for line in lines { emit_line(&line); }
+            debug_line("ipcbench: end");
+            return;
+        }
         Some("--lifecycle-child") => return,
         Some("--exec-replace-child") => {
             let (Some(fd), Some(before)) = (args.next(), args.next()) else {
@@ -1189,11 +1266,15 @@ fn main() {
         _ => {}
     }
     debug_line("ipcbench: begin");
-    debug_line(if uaccess_selftest::run() {
-        "ipcbench: uaccess-recovery pass"
-    } else {
-        "ipcbench: uaccess-recovery FAIL"
-    });
+    // Save a warm null distribution BEFORE the safety preflight itself forks,
+    // maps and creates threads, or a tax introduced there could mask every
+    // later checkpoint by inflating the comparison baseline.
+    *PRISTINE_NULL.lock().unwrap() = core_paths::identity_samples();
+    if !uaccess_selftest::run() {
+        debug_line("ipcbench: uaccess-recovery FAIL");
+        std::process::exit(1); // No end marker: failed safety cannot yield evidence.
+    }
+    debug_line("ipcbench: uaccess-recovery pass");
 
     let filter = probe_filter();
     if filter.is_some() {
@@ -1221,6 +1302,11 @@ fn main() {
 
     match filter {
         Some(name) => {
+            if core_contract::is_suite(&name) {
+                // No debug-port VM exits from this app between suite probes.
+                // Other services/interrupts remain part of the raw distribution.
+                *BUFFERED_OUTPUT.lock().unwrap() = Some(Vec::new());
+            }
             run_isolated_probe(&name, tsc_khz);
             // Flush the probe's own tail charges before the log capture can
             // see "end": the ordinary once-per-second drain cadence is not
@@ -1233,5 +1319,9 @@ fn main() {
     }
 
     tails::flush();
+    let buffered = BUFFERED_OUTPUT.lock().unwrap().take();
+    if let Some(lines) = buffered {
+        for line in lines { emit_line(&line); }
+    }
     debug_line("ipcbench: end");
 }

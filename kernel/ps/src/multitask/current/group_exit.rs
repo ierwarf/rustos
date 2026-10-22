@@ -92,7 +92,8 @@ fn wait(receipt: Receipt) {
             crate::arch::clock::monotonic_nanos().saturating_sub(start) < 2_000_000_000,
             "group exit timed out; durable process-row ownership retained"
         );
-        super::super::cond_resched();
-        core::hint::spin_loop();
+        // The ACK comes from tasks on this or another CPU; spinning on an
+        // already-requested reschedule would hold a single CPU for a quantum.
+        super::super::yield_now();
     }
 }

@@ -369,6 +369,68 @@ pub(in crate::multitask) fn with_image<R>(
     )
 }
 
+/// Stage at which `with_image_inner` refused. Diagnostic telemetry for the exec
+/// committer; it grants nothing and is overwritten by the next transaction.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(in crate::multitask::scheduler) enum ImageRefusal {
+    None = 0,
+    ContextMissing = 1,
+    IdentityMismatch = 2,
+    NotCurrent = 3,
+    StillExecuting = 4,
+    Placement = 5,
+    IntentImage = 6,
+    IntentMismatch = 7,
+    FrameAccess = 8,
+    BankBusy = 9,
+    CurrentMismatch = 10,
+    NotQuiesced = 11,
+    WriterAcquire = 12,
+    WriterReservation = 13,
+    WriterIntent = 14,
+    WriterBankCustody = 15,
+    WriterFrozen = 16,
+    WriterClosing = 17,
+    WriterBusyWriting = 18,
+    WriterReaders = 19,
+    WriterPins = 20,
+    WriterBinding = 21,
+}
+static LAST_IMAGE_REFUSAL: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+pub(in crate::multitask::scheduler) fn refuse<T>(reason: ImageRefusal) -> Option<T> {
+    // ORDERING: Relaxed; diagnostic only. The first refusal of a transaction wins.
+    let _ = LAST_IMAGE_REFUSAL.compare_exchange(
+        0,
+        reason as u8,
+        core::sync::atomic::Ordering::Relaxed,
+        core::sync::atomic::Ordering::Relaxed,
+    );
+    None
+}
+/// A quiesced target that blocked in an IPC wait can still be parked in the
+/// resident lane, which keeps its stack pin and execution permit. The image
+/// writer needs both gone, so settle the cell as any other owner transition
+/// would: whoever wins the cell's generation swap owns and drops the loans.
+pub(in crate::multitask) fn evict_parked_target(slot: usize) {
+    let generation = runqueue::owner(slot).generation;
+    super::resident::on_owner_transition(slot, generation);
+}
+
+/// Whether the target's image bank is still published as the prepared or
+/// outgoing side of a CPU switch (or current on another CPU). The image
+/// transaction refuses such a target until a scheduler entry settles the
+/// switch; observation only, never custody.
+pub(in crate::multitask) fn image_bank_busy(slot: usize) -> bool {
+    let cpu = nucleus_core::util::lockdep::current_cpu_index();
+    stack_resources::cpu_leases::exclusive_image_bank_custody(slot, cpu).is_none()
+}
+
+/// Takes and clears the refusal recorded by the last image transaction.
+pub(in crate::multitask) fn take_image_refusal() -> u8 {
+    LAST_IMAGE_REFUSAL.swap(0, core::sync::atomic::Ordering::Relaxed)
+}
+
 /// Callback includes staging and finalization, not merely scheduler mutation.
 /// Refusal occurs before the callback can replace process state. Current must
 /// be this CPU's exact task; stopped-peer quiescence remains externally owned.
@@ -393,31 +455,39 @@ fn with_image_inner<R>(
     let mut completion = Some(after_image);
     #[allow(unused_mut)] // host branch invokes FnMut directly; boot consumes it
     let mut body = || {
-        let context = stack_resources::context::read(slot)?;
-        let start = stack_resources::task_start::read(slot)?;
+        let Some(context) = stack_resources::context::read(slot) else {
+            return refuse(ImageRefusal::ContextMissing);
+        };
+        let Some(start) = stack_resources::task_start::read(slot) else {
+            return refuse(ImageRefusal::ContextMissing);
+        };
         if !context.user_mode
             || context.process_handle != Some(reservation.process_handle())
             || context.process_id != Some(task_id)
             || start.id != task_id
         {
-            return None;
+            return refuse(ImageRefusal::IdentityMismatch);
         }
         if current && super::super::cpu_local::current_cpu_task_slot() != Some(slot) {
-            return None;
+            return refuse(ImageRefusal::NotCurrent);
         }
         if !current && super::super::cpu_local::task_execution_owner(slot).is_some() {
-            return None;
+            return refuse(ImageRefusal::StillExecuting);
         }
         let invoke = |writer: &stack_resources::frame_access::FrameWriter| {
             // Close copied admission's gap with resource writer acquisition.
-            let bound = stack_resources::context::read(slot)?;
-            let bound_start = stack_resources::task_start::read(slot)?;
+            let (Some(bound), Some(bound_start)) = (
+                stack_resources::context::read(slot),
+                stack_resources::task_start::read(slot),
+            ) else {
+                return refuse(ImageRefusal::ContextMissing);
+            };
             if !bound.user_mode
                 || bound.process_handle != Some(reservation.process_handle())
                 || bound.process_id != Some(task_id)
                 || bound_start.id != task_id
             {
-                return None;
+                return refuse(ImageRefusal::IdentityMismatch);
             }
             #[cfg(test)]
             let fixture_mm = ProcessAddressSpace::modeled_root_for_host(root);
@@ -439,10 +509,13 @@ fn with_image_inner<R>(
             };
             #[cfg(not(test))]
             if current && placement.is_none() {
-                return None;
+                return refuse(ImageRefusal::Placement);
             }
             let intent_image = match intent {
-                Some(intent) => Some(intent.image(reservation)?),
+                Some(intent) => match intent.image(reservation) {
+                    Some(image) => Some(image),
+                    None => return refuse(ImageRefusal::IntentImage),
+                },
                 None => None,
             };
             if let Some(census) = census {
@@ -474,7 +547,7 @@ fn with_image_inner<R>(
         };
         let outcome = if let Some(intent) = intent {
             if !intent.matches(slot, reservation) || intent.task_id() != task_id {
-                return None;
+                return refuse(ImageRefusal::IntentMismatch);
             }
             stack_resources::frame_access::with_owned_exec(
                 slot,
@@ -484,6 +557,7 @@ fn with_image_inner<R>(
                 invoke,
             )
             .flatten()
+            .or_else(|| refuse(ImageRefusal::FrameAccess))
         } else if current {
             stack_resources::frame_access::with_current_exec(slot, task_id, invoke).flatten()
         } else {

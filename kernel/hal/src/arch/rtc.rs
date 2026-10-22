@@ -608,6 +608,13 @@ fn emit_heartbeat_log(current_second: u64) {
 }
 
 pub fn sleep(milliseconds: u64) {
+    sleep_unless(milliseconds, || false);
+}
+
+/// `sleep` that also ends as soon as `abort` holds. A non-deadline wake of the
+/// sleeping task makes the loop re-evaluate `abort`, so an event producer can
+/// cut the nap short instead of waiting for the next tick.
+pub fn sleep_unless(milliseconds: u64, abort: impl Fn() -> bool) {
     if milliseconds == 0 {
         return;
     }
@@ -615,7 +622,7 @@ pub fn sleep(milliseconds: u64) {
     let target = sleep_deadline_from_ticks(ticks(), milliseconds);
 
     let restore_disabled = !interrupts::are_enabled();
-    while ticks() < target {
+    while ticks() < target && !abort() {
         if !restore_disabled && block_current_user_until(target) {
             continue;
         }

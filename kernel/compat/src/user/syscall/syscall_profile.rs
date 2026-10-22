@@ -15,8 +15,6 @@
 //! IPC ones included, so it is worth knowing which step of the common path
 //! spends it rather than inferring from the call graph.
 
-use nucleus_core::debug::LogCategory;
-use nucleus_core::debug::phase_profile::PhaseProfile;
 
 pub(super) const SYSCALL_PHASE_COUNT: usize = 4;
 

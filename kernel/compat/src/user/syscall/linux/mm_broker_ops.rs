@@ -92,8 +92,28 @@ pub(super) fn syscall_linux_rustos_mm_broker(args_ptr: u64) -> u64 {
 
     match result {
         Ok(()) => 0,
-        Err(errno) => linux_errno(errno),
+        Err(errno) => {
+            record_mm_broker_refusal(&args, errno);
+            linux_errno(errno)
+        }
     }
+}
+
+/// Names a refused mapping operation. A failed `mmap` otherwise reaches the
+/// guest as a bare errno from a service call; this keeps the target, the
+/// operation and the errno together. Bounded so a refusal storm stays cheap.
+fn record_mm_broker_refusal(args: &RustosMmBrokerArgs, errno: i64) {
+    static RECORDED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    // ORDERING: Relaxed; a counter bounding telemetry volume.
+    if RECORDED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) >= 64 {
+        return;
+    }
+    nucleus_core::debug::record_milestone(
+        nucleus_core::debug::LogCategory::Compat,
+        "mm-broker-refused",
+        (u64::from(args.op) << 32) | (args.target_pid & 0xffff_ffff),
+        errno.unsigned_abs(),
+    );
 }
 
 fn broker_query_layout(args: &RustosMmBrokerArgs) -> Result<(), i64> {
@@ -515,7 +535,15 @@ fn broker_protect(args: &RustosMmBrokerArgs) -> Result<(), i64> {
             return Err(LINUX_ENOMEM);
         }
         Err(multitask::PagerVmaError::Malformed) => return Err(LINUX_EINVAL),
-        Err(_) => return Err(LINUX_EFAULT),
+        Err(refusal) => {
+            nucleus_core::debug::record_milestone(
+                nucleus_core::debug::LogCategory::Compat,
+                "pager-vma-unmap-refused",
+                args.target_pid,
+                refusal as u64,
+            );
+            return Err(LINUX_EFAULT);
+        }
     }
 
     let Some(result) = multitask::with_process_state_by_pid_mut(args.target_pid, |process_state| {
@@ -580,7 +608,15 @@ fn broker_unmap(args: &RustosMmBrokerArgs) -> Result<(), i64> {
         Ok(None) => {}
         Err(multitask::PagerVmaError::Pressure) => return Err(LINUX_ENOMEM),
         Err(multitask::PagerVmaError::Malformed) => return Err(LINUX_EINVAL),
-        Err(_) => return Err(LINUX_EFAULT),
+        Err(refusal) => {
+            nucleus_core::debug::record_milestone(
+                nucleus_core::debug::LogCategory::Compat,
+                "pager-vma-unmap-refused",
+                args.target_pid,
+                refusal as u64,
+            );
+            return Err(LINUX_EFAULT);
+        }
     }
     let Some(result) = multitask::with_process_state_by_pid_mut(args.target_pid, |process_state| {
         let mut external_segments = Vec::new();

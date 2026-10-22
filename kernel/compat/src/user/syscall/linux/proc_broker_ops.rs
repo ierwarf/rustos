@@ -1158,12 +1158,22 @@ pub(super) fn syscall_linux_rustos_proc_exec_target_broker(args_ptr: u64) -> u64
             return linux_errno(LINUX_EAGAIN);
         }
     }
-    if let Some(closed_handles) = multitask::exec_user_process_by_pid(
+    let exec_outcome = multitask::exec_user_process_by_pid_checked(
         args.target_pid,
         args.target_tid,
         prepared.address_space,
         prepared.bootstrap,
-    ) {
+    );
+    if let Err(refusal) = &exec_outcome {
+        // Names the refusing stage; every refusal still surfaces as ESRCH.
+        nucleus_core::debug::record_milestone(
+            nucleus_core::debug::LogCategory::Compat,
+            "proc-exec-refused",
+            args.target_pid,
+            refusal.code(),
+        );
+    }
+    if let Ok(closed_handles) = exec_outcome {
         // The process-table commit has already removed CLOEXEC descriptors.
         // Derive cleanup from the exact handles retired by that commit, never
         // from an earlier fd snapshot that a sibling can close/reuse before

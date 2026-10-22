@@ -42,7 +42,8 @@ pub use crate::multitask::{
     current_thread_may_have_pending_signals, current_user_address_space,
     current_user_process_identity, current_user_process_thread_count, current_user_stack_state,
     current_user_thread_id, current_user_wait_binding, demote_current_user_task_to_user_class,
-    drain_scheduler_runtime_profile, exec_current_user_process, exec_user_process_by_pid,
+    drain_scheduler_runtime_profile, exec_current_user_process, exec_user_process_by_pid, exec_user_process_by_pid_checked,
+    ExecRefusal,
     exit_current_user_process, exit_current_user_task, inherit_ipc_priority,
     inherit_pager_fault_priority, hardware_rsp_arrivals, is_user_process_exiting, is_user_task_alive, linux_task_affinity,
     linux_thread_snapshot_by_ids, live_user_process_identity_by_pid,
@@ -116,6 +117,13 @@ pub fn claim_interruptible_syscall_reschedule() -> bool {
 pub fn request_deferred_reschedule() {
     crate::multitask::request_deferred_reschedule();
 }
+
+pub use crate::multitask::{
+    register_child_waiter, unregister_child_waiter, wake_child_waiters,
+};
+pub use crate::multitask::{
+    housekeeping_kicked, kick_housekeeping, register_housekeeping_task, take_housekeeping_kick,
+};
 
 pub fn request_yield_reschedule() {
     crate::multitask::request_yield_reschedule();

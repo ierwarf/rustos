@@ -1,4 +1,10 @@
 mod context;
+mod child_wait;
+pub use self::child_wait::{register_child_waiter, unregister_child_waiter, wake_child_waiters};
+mod housekeeping_kick;
+pub use self::housekeeping_kick::{
+    housekeeping_kicked, kick_housekeeping, register_housekeeping_task, take_housekeeping_kick,
+};
 mod cpu_local;
 mod current;
 mod user_copy;
@@ -57,7 +63,8 @@ pub use self::current::{
     current_user_id, current_user_log_ids, current_user_process_id, current_user_process_identity,
     current_user_process_thread_count, current_user_snapshot, current_user_stack_state,
     current_user_thread_id, current_user_wait_binding, demote_current_user_task_to_user_class,
-    exec_current_user_process, exec_user_process_by_pid, exit_current_user_process,
+    ExecRefusal, exec_current_user_process, exec_user_process_by_pid,
+    exec_user_process_by_pid_checked, exit_current_user_process,
     exit_current_user_task, halt_current_retired_task, inherit_ipc_priority,
     inherit_pager_fault_priority, is_user_process_exiting, is_user_task_alive, linux_task_affinity,
     linux_thread_snapshot_by_ids, live_user_process_identity_by_pid,

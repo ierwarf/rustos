@@ -111,7 +111,14 @@ They compile to no instrumentation in the shipping configuration.
 
 Housekeeping and anonymous-frame refill are ordinary kernel workers, not CPU
 idle owners. A zero-work turn parks its own continuation through the existing
-RTC arm/register/recheck/commit and exact task wake; a productive turn yields.
+RTC arm/register/recheck/commit and exact task wake (`rtc::sleep_unless`); a
+productive turn yields. Producers of reclaimable work (task retirement, a queued
+reap, a process-table slot shortage) call `kick_housekeeping`, which wakes the
+worker out of its nap instead of waiting for the next timer edge. Housekeeping
+stays in the fair class (a System-band worker starved thread exit/join behind
+its own turns); a spawner that finds the process table full kicks it and sleeps
+in one-millisecond steps so it runs. Its turns stay bounded (sixteen retirement
+and sixteen reaper records per turn).
 They must not yield and then execute HLT when selected again: eligible user
 work may have appeared meanwhile, and the halted interval would be billed to
 the worker's System context. RTC admission refusal falls back to scheduler

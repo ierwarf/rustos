@@ -30,7 +30,6 @@ const MADT_PROCESSOR_ONLINE_CAPABLE: u32 = 2;
 const ACPI_ADDRESS_SPACE_SYSTEM_MEMORY: u8 = 0;
 const ACPI_GAS_ACCESS_QWORD: u8 = 4;
 const MAX_MCFG_REGIONS: usize = 8;
-const MAX_RSDP_BYTES: usize = 4096;
 const MAX_ACPI_SDT_BYTES: usize = 1024 * 1024;
 pub const MAX_SUPPORTED_CPUS: usize = 8;
 const PCI_ECAM_BUS_BYTES: u64 = 1 << 20;

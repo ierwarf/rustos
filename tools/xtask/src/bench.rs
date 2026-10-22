@@ -21,11 +21,14 @@ use crate::config::Config;
 use crate::kvm;
 
 mod component_disassembly;
+mod core_paths;
+mod gui;
 mod components;
 mod lifecycle;
 mod local_shadow;
 mod tails;
 pub(crate) use components::bench_components;
+pub(crate) use core_paths::linux_guest;
 use lifecycle::{
     LifecycleTotal, lifecycle_trace_holds, parse_lifecycle_milestone, render_lifecycle,
     required_lifecycle_stages,
@@ -266,6 +269,7 @@ struct ParsedRun {
     local_shadow: LocalShadowTotal,
     lifecycle: Vec<LifecycleTotal>,
     tails: tails::Data,
+    placements: core_paths::Placements,
 }
 
 fn parse_log(log: &str) -> Result<ParsedRun> {
@@ -277,6 +281,7 @@ fn parse_log(log: &str) -> Result<ParsedRun> {
     let mut local_shadow = LocalShadowTotal::default();
     let mut lifecycle: Vec<LifecycleTotal> = Vec::new();
     let mut tails = tails::Data::default();
+    let mut placements = core_paths::Placements::default();
     let mut saw_end = false;
     // Scheduler policy is system-wide too, but IPC bench writes its TSC record
     // only after its isolate-settle interval. Its explicit begin marker is the
@@ -308,6 +313,9 @@ fn parse_log(log: &str) -> Result<ParsedRun> {
                 },
                 None => bail!("malformed ipcbench result line: {rest}"),
             }
+        } else if let Some(rest) = line.strip_prefix("ipcbench: placement ") {
+            anyhow::ensure!(inside_run, "ipcbench placement outside its measurement window");
+            core_paths::record_placement(&mut placements, rest)?;
         } else if line.starts_with(tails::PREFIX) || line.starts_with(tails::SAMPLE_PREFIX) {
             anyhow::ensure!(inside_run, "ipcbench tail outside its measurement window");
             tails.record(line)?;
@@ -376,6 +384,7 @@ fn parse_log(log: &str) -> Result<ParsedRun> {
         bail!("ipcbench finished but reported no results");
     }
     tails.validate(&results)?;
+    core_paths::validate_placements(&placements, &results)?;
     phases.sort_by(|left, right| right.per_sample().cmp(&left.per_sample()));
     counters.sort_by(|left, right| left.name.cmp(&right.name));
     lifecycle.sort_by(|left, right| left.name.cmp(&right.name));
@@ -388,6 +397,7 @@ fn parse_log(log: &str) -> Result<ParsedRun> {
         local_shadow,
         lifecycle,
         tails,
+        placements,
     })
 }
 
@@ -761,9 +771,20 @@ pub(crate) fn bench(
     rustos_vcpus: u8,
     isolate_probe: Option<&str>,
     ipc_max_cycles: Option<u64>,
+    linux_baseline: Option<&Path>,
 ) -> Result<()> {
+    if isolate_probe == Some(core_paths::contract::GUI) {
+        anyhow::ensure!(baseline.is_none() && compare.is_none() && linux_baseline.is_none()
+            && ipc_max_cycles.is_none(), "core_gui has its own completion distributions; Linux GUI parity is not yet implemented");
+        return gui::bench(config, rustos_vcpus);
+    }
+    if linux_baseline.is_some() {
+        anyhow::ensure!(isolate_probe.is_some_and(core_paths::contract::is_suite),
+            "--linux-baseline requires a core_* suite");
+    }
     if ipc_max_cycles.is_some() {
-        anyhow::ensure!(isolate_probe.is_some(), "IPC maximum gate requires --isolate-probe");
+        anyhow::ensure!(isolate_probe.is_some_and(|name| name.starts_with("ipc_rt_")),
+            "IPC maximum gate requires an isolated IPC round-trip probe, not a suite");
         let project = &config.project;
         anyhow::ensure!(
             !project.ipc_telemetry.phase_profile
@@ -788,7 +809,12 @@ pub(crate) fn bench(
     // interactive topology an ordinary desktop launch brings up. Requiring the
     // end marker is what bounds the run: a guest that never finished must not
     // fall through to parsing a stale log.
-    let timeout_seconds = benchmark_timeout_seconds(rustos_vcpus, isolate_probe.is_some());
+    let core_suite = isolate_probe.filter(|name| core_paths::contract::is_suite(name));
+    let core_capture = core_suite.map(|suite| core_paths::Capture::begin(config, suite, rustos_vcpus)).transpose()?;
+    // Multi-workload collection is diagnostic, not a relaxed product boot gate.
+    // Ordinary isolated/IPC acceptance retains its existing readiness budget.
+    let timeout_seconds = if core_suite.is_some() { 120 }
+        else { benchmark_timeout_seconds(rustos_vcpus, isolate_probe.is_some()) };
     let mut kvm_args = vec![
         "--gui-dvm-surfaces".to_owned(),
         "--dvm-network-shmem".to_owned(),
@@ -831,10 +857,24 @@ pub(crate) fn bench(
     if let Err(error) = kvm::archive_run_log(&log_path) {
         eprintln!("xtask: could not archive the debugcon log: {error:#}");
     }
+    if let Some(capture) = core_capture {
+        capture.finish(config, &log_path, launch.is_ok())?;
+    }
     launch?;
     let log = fs::read_to_string(&log_path)
         .with_context(|| format!("read debugcon log {}", log_path.display()))?;
     let run = parse_log(&log)?;
+
+    if let Some(suite) = core_suite {
+        println!("\n=== ipcbench core paths (suite={suite}, rustos_vcpus={rustos_vcpus}) ===\n{}{}{}",
+            render(run.tsc_khz, &run.results, &run.skipped), run.tails.render(), core_paths::render_quality(&run));
+        core_paths::validate(&run, suite, false)?;
+        if let Some(path) = linux_baseline {
+            println!("{}", core_paths::compare_linux(config, &run, suite, rustos_vcpus, path)?);
+        }
+        println!("core-path suite collection COMPLETE (not optimization or tail-target acceptance)");
+        return Ok(());
+    }
 
     if let Some(probe) = isolate_probe {
         if !isolated_primary_result_holds(&run, probe) {
@@ -886,6 +926,8 @@ pub(crate) fn bench(
     let lifecycle = render_lifecycle(&run.lifecycle);
     let tails = run.tails.render();
     println!("\n=== ipcbench ===\n{table}{tails}{derived}{phases}{counters}{local_shadow}{lifecycle}");
+    core_paths::validate(&run, core_paths::contract::STATE, false)?;
+    println!("persistent-state null/IPC regression rail PASS (p50 <= pristine-null / before-IPC x 1.5)");
 
     if let Some(path) = compare {
         let previous = fs::read_to_string(path)

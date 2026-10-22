@@ -910,8 +910,18 @@ where
     empty_slots
         .try_reserve_exact(slots.len())
         .map_err(|_| PagerVmaError::Pressure)?;
+    let live_process = handle.object_identity().ok_or(PagerVmaError::Stale)?;
     for (slot_index, slot) in slots.iter().enumerate() {
         match slot.snapshot()? {
+            // A completed exec or a reaped process slot leaves the previous
+            // incarnation's regions in this fixed array, and a new image maps
+            // the same addresses again. Such a region carries no authority for
+            // this identity, so it is not part of the range being rewritten;
+            // reclaim it exactly as `publish` does under the same writer lock.
+            Some(region) if !region_matches_identity(region, live_process.slot(), identity) => {
+                slot.publish(None)?;
+                empty_slots.push(slot_index);
+            }
             Some(region)
                 if start < region.end && region.start < end
                     || region.end == start

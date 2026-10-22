@@ -821,3 +821,30 @@ fn a_split_with_no_free_vma_slot_refuses_and_keeps_every_region() {
         revoke(handle, identity, region.start, region.vma_generation).unwrap();
     }
 }
+
+#[test]
+fn rewrite_reclaims_previous_exec_incarnation_instead_of_mutating_its_range() {
+    let _guard = guard();
+    let handle = ProcessHandle::new(27, 101);
+    let before_exec = identity(101, 103);
+    let after_exec = identity(101, 104);
+    let stale = publish(handle, before_exec, template(0x50_000), MAX_PAGER_VMAS_PER_PROCESS)
+        .unwrap();
+
+    // The new image maps the same addresses again. The old incarnation's region
+    // has no authority over them, so unmapping must neither run the PTE
+    // mutation for it nor report the range as a pager-managed edit.
+    let mut mutated = false;
+    let result = rewrite_attenuated_range(handle, after_exec, stale.start, stale.end, None, || {
+        mutated = true;
+        Err(PagerVmaError::Stale)
+    });
+    assert_eq!(result, Ok(false));
+    assert!(!mutated, "a previous incarnation's region must not drive the mutation");
+
+    // The residue was reclaimed, so the new incarnation can publish the range.
+    let fresh = publish(handle, after_exec, template(0x50_000), MAX_PAGER_VMAS_PER_PROCESS)
+        .unwrap();
+    assert_ne!(fresh.mm_generation, stale.mm_generation);
+    revoke(handle, after_exec, fresh.start, fresh.vma_generation).unwrap();
+}

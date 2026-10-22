@@ -335,6 +335,13 @@ pub(crate) fn probe_ipc_intra_process_reply_recv(tsc_khz: u64) {
     );
 }
 
+pub(crate) fn probe_state_checkpoint(name: &str, tsc_khz: u64) {
+    let legs = [format!("{name}_to_recv"), format!("{name}_body"), format!("{name}_to_return")];
+    measure_intra_process_round_trip(
+        tsc_khz, name, [&legs[0], &legs[1], &legs[2]], bench_server_reply_recv,
+    );
+}
+
 fn measure_intra_process_round_trip(
     tsc_khz: u64,
     name: &str,

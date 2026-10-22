@@ -110,6 +110,7 @@ impl Group {
                     rustos_user_abi::syscall::PROCD_SIGCHLD_EVENT_STOP
                 } else { rustos_user_abi::syscall::PROCD_SIGCHLD_EVENT_CONTINUE };
                 let _ = process_sigchld_in(scope, parent, event, eligible_cpus);
+                crate::multitask::wake_child_waiters(parent);
             }
         }
         before_publish(&self);

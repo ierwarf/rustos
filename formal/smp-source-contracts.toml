@@ -826,7 +826,7 @@ tokens = [
     "exec_transaction::quiescence::retry(&intent, &census)",
     "authorize_exec(exec_reservation)",
     "exec_transaction::with_census_image(",
-    "process_table::stage_exec_state(",
+    "process_table::stage_exec_state_checked(",
     "census.mark_staged();",
     "lease.commit_image(&mut bootstrap, Some((process_id, thread_id)))",
     "process_table::finalize_exec_state(",
@@ -2430,8 +2430,8 @@ tokens = [
     "ExecPublication {",
     "fn with_image",
     "let mut callback = Some(f)",
-    "stack_resources::context::read(slot)?",
-    "stack_resources::task_start::read(slot)?",
+    "let Some(context) = stack_resources::context::read(slot)",
+    "let Some(start) = stack_resources::task_start::read(slot)",
     "context.process_handle != Some(reservation.process_handle())",
     "context.process_id != Some(task_id)",
     "start.id != task_id",
@@ -2797,7 +2797,7 @@ tokens = [
 [[required_sequences]]
 path = "kernel/ps/src/multitask/process_table.rs"
 tokens = [
-    "fn stage_exec_state(", "address_space.pin_execution()?", "exec_commit_may_transfer(object, reservation)",
+    "fn stage_exec_state_checked(", ".pin_execution()", "exec_commit_may_transfer(object, reservation)",
     "state.address_space().seal_execution()", "state.replace_for_exec(",
     "object.mm_execution = new_mm.pin_for_publication()", "object.mm_generation = reservation.next_mm_generation",
     "fn reap_exited_processes()", "drop(reclaimed)", "drain_retired_address_spaces(16)",
@@ -2929,10 +2929,10 @@ tokens = [
 [[required_sequences]]
 path = "kernel/ps/src/multitask/process_table.rs"
 tokens = [
-    "fn stage_exec_state",
+    "fn stage_exec_state_checked",
     "exec_commit_may_transfer(object, reservation)",
     "if !state.address_space().seal_execution()",
-    "return None",
+    "return Err(StageRefusal::SealBusy)",
     "state.replace_for_exec",
     "object.mm_generation = reservation.next_mm_generation",
 ]
@@ -3024,7 +3024,7 @@ tokens = ["fn cancel_with(", "let preemption = Some(preemption)", "self.prepare_
 
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/exec_transaction.rs"
-tokens = ["fn with_census_image(", "intent.mode_matches(current)", "census.assert_matches(intent)", "with_image_inner(", "intent.complete(finalized)", "fn with_image_inner", "intent.image(reservation)?", "callback.take().expect", "drop(lease)", "intent_image.finish(published)", "with_owned_exec(", "completion.take().expect", "without_interrupts(body)"]
+tokens = ["fn with_census_image(", "intent.mode_matches(current)", "census.assert_matches(intent)", "with_image_inner(", "intent.complete(finalized)", "fn with_image_inner", "intent.image(reservation)", "callback.take().expect", "drop(lease)", "intent_image.finish(published)", "with_owned_exec(", "completion.take().expect", "without_interrupts(body)"]
 
 [[required_sequences]]
 path = "kernel/ps/src/multitask/process_placement/exec_membership.rs"
@@ -3240,7 +3240,7 @@ path = "kernel/ps/src/multitask/scheduler/thread_creation.rs"
 tokens = ["impl Publication", "fn capture(", "CommitGrant::capture_ticket(", "Cohort::begin(&[r.parent])?", "context.user_abi != Some(abi)", "fn publish(", "scheduling_context.admit(", "publication.parent.begin_effects()", "execution_image::reserved_user_entry(", "r.ticket().begin_commit()", "r.ticket().install_context(context)", "initialize_simd_state(slot, id)", "r.ticket().publish_start(", "stack_resources::publish_binding(", "identity::publish_metadata(", "linux_thread_state::install_reserved(", "publication.membership.register(r.ticket())", "runqueue::admit_blocked(slot)", "frame_publication::bind_local_owner_generation(", "before_ack(&r, &publication)", "finish_commit()", "r.live = false", "publication.parent.complete()", "fn commit(", "DispatchPreemption::enter()", "Publication::capture(&reservation, bootstrap.abi)", "cancel_owned(reservation, &preemption)", "flush_deferred_target_reschedules()"]
 [[required_sequences]]
 path = "kernel/ps/src/multitask/current/group_exit.rs"
-tokens = ["fn request(", "held_spin_lock_depth()", "target_by_pid(pid)", "queued_for(handle)", "PendingExit::begin(handle, member)", "mark_process_exiting_for_handle(handle, pid)?", "pending.publish(pid, Reason::Terminated", "fn terminate(", "DispatchPreemption::enter()", "request(&preemption, pid, super::current_user_id())", "wait(receipt)", "fn exit_current()", "DispatchPreemption::enter()", "owned_current_user_binding()", "PendingExit::begin(handle, (slot, tid))", "mark_process_exiting_for_handle(handle, pid)", "pending.publish(", "wait(receipt)", "halt_current_retired_task()", "fn wait(", "receipt.complete()", "DispatchPreemption::enter()", "scope.mask_irqs()", "group_exit::service(&scope)", "drop(scope)", "if receipt.complete()", "cond_resched()"]
+tokens = ["fn request(", "held_spin_lock_depth()", "target_by_pid(pid)", "queued_for(handle)", "PendingExit::begin(handle, member)", "mark_process_exiting_for_handle(handle, pid)?", "pending.publish(pid, Reason::Terminated", "fn terminate(", "DispatchPreemption::enter()", "request(&preemption, pid, super::current_user_id())", "wait(receipt)", "fn exit_current()", "DispatchPreemption::enter()", "owned_current_user_binding()", "PendingExit::begin(handle, (slot, tid))", "mark_process_exiting_for_handle(handle, pid)", "pending.publish(", "wait(receipt)", "halt_current_retired_task()", "fn wait(", "receipt.complete()", "DispatchPreemption::enter()", "scope.mask_irqs()", "group_exit::service(&scope)", "drop(scope)", "if receipt.complete()", "yield_now()"]
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/group_exit.rs"
 tokens = ["struct MemberLoan<'census>", "census: &'census ExitMembership", "BindingPin", "fn capture(", "census.members().contains(&(slot, id))", "pin_donation(slot, id)?", "context::read(pin.slot())?", "Some(census.handle())", "fn stop(", "terminal_quarantine::begin(self.pin.slot(), Some(self.pin.id())", "drop(self)", "fn service(", "scope.is_masked()", "held_spin_lock_depth()", "exit_membership::claim_next()", "published_current_slot(scope.cpu())", "census.effects_started()", "census.begin_effects()", "for current_pass in [false, true]", "MemberLoan::capture(&census, member.0, member.1)", "census.suspend()", "loan.observe(reason)", "loan.stop(retire_reason)", "census.suspend()", "terminal_publication::guarded(producer", "census.finish()", "fn service_deferred(", "service(scope)", "terminal_publication::drain_guarded"]
@@ -3277,7 +3277,7 @@ path = "kernel/ps/src/multitask/scheduler/retirement_cleanup/producer.rs"
 tokens = ["fn claim(", "Phase::Deferred | Phase::WaitingExecutor", "record.phase == Phase::WaitingExecutor", "stack_resources::terminal_binding_matches(slot, task_id)", "row.producer_nonce.checked_add(1)?", "fn wait_for_executor(", "self.exact(&row)", "kernel_executor::admit_stop_wait(", "phase = Phase::WaitingExecutor", "row.deferred = Some(self.reason)", "self.live = false", "mark_reap_pending()", "impl Drop for Producer", "else if self.claimed", "self.waited_for_executor", "Phase::WaitingExecutor"]
 [[required_sequences]]
 path = "kernel/ps/src/multitask/current.rs"
-tokens = ["fn service_deferred_work()", "DispatchPreemption::enter()", "scope.mask_irqs()", "group_exit::service_deferred(&scope)", "executor::capture_current()", "return group_exit", "claim_next_kernel(&executor)", "fn complete_retirement_side_effects()", "executor::capture_current()", "claim_next_kernel(&executor)", "executor::Fence::capture", "fence.complete()", "super::cond_resched()"]
+tokens = ["fn service_deferred_work()", "DispatchPreemption::enter()", "scope.mask_irqs()", "group_exit::service_deferred(&scope)", "executor::capture_current()", "return group_exit", "claim_next_kernel(&executor)", "fn complete_retirement_side_effects()", "executor::capture_current()", "claim_next_kernel(&executor)", "executor::Fence::capture", "fence.complete()", "super::yield_now()"]
 
 # Root metadata visibility and even slot ACK remain sealed until actual membership ACK.
 # This negative exclusion query is not permission inferred from an absent record.
@@ -3367,7 +3367,7 @@ reason = "Actual pager reply borrows one original typed wait phase through queue
 # Ordinary kernel workers park their continuation, never halt a CPU with ready work.
 [[required_sequences]]
 path = "kernel/executive/src/tasks.rs"
-tokens = ["fn nucleus_housekeeping_task", "finish_background_turn(work, ps_api::yield_now, idle_tick_wait);", "fn nucleus_pager_fault_refill_task", "finish_background_turn(work, ps_api::yield_now, idle_tick_wait);", "fn idle_tick_wait()", "kernel_hal::api::arch::rtc::sleep(1);", "fn finish_background_turn", "if work == 0", "idle_wait();", "else", "yield_now();"]
+tokens = ["fn nucleus_housekeeping_task", "finish_background_turn(work, ps_api::yield_now, housekeeping_idle_wait);", "fn nucleus_pager_fault_refill_task", "finish_background_turn(work, ps_api::yield_now, idle_tick_wait);", "fn housekeeping_idle_wait()", "kernel_hal::api::arch::rtc::sleep_unless(1, ps_api::housekeeping_kicked);", "fn idle_tick_wait()", "kernel_hal::api::arch::rtc::sleep(1);", "fn finish_background_turn", "if work == 0", "idle_wait();", "else", "yield_now();"]
 [[forbidden_patterns]]
 scope = "kernel/executive/src/tasks.rs"
 regex = 'enable_and_hlt|instructions::hlt'

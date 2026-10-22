@@ -7,6 +7,7 @@ mod font;
 mod gpu_runtime;
 mod gpu_scene;
 mod input_loop;
+mod input_completion;
 mod keytrace;
 mod layout;
 mod loop_timing;
@@ -642,6 +643,7 @@ fn run() -> Result<(), i32> {
         }
 
         let input_started = Instant::now();
+        let cursor_before_input = (state.cursor_x, state.cursor_y);
         watchdog.enter(UI_PHASE_INPUT);
         let input = phase_result(
             "input",
@@ -660,6 +662,13 @@ fn run() -> Result<(), i32> {
                     .max(previous.elapsed().as_millis().min(u128::from(u64::MAX)) as u64);
             }
             last_input_processed_at = Some(now);
+        }
+        if cursor_before_input != (state.cursor_x, state.cursor_y) {
+            input_completion::input(
+                input_started,
+                input.pointer_motion_events.saturating_add(input.pointer_position_events),
+                state.cursor_x, state.cursor_y,
+            );
         }
         processed_input_events_total =
             processed_input_events_total.saturating_add(input.input_events);
@@ -920,6 +929,7 @@ fn run() -> Result<(), i32> {
         }
 
         let input_reader = input_events.snapshot();
+        input_completion::health(input_reader.queue_drops, input_reader.errors);
         profile::record_input_health(
             input_reader.last_delivery_age_ms,
             input_reader.queue_drops,
@@ -932,6 +942,9 @@ fn run() -> Result<(), i32> {
             state.cursor_x == presented_cursor_x && state.cursor_y == presented_cursor_y,
         );
 
+        // The batch is frozen before synchronous export; no debug-port writes
+        // from this benchmark occur inside any collected input/frame interval.
+        input_completion::maybe_emit();
         let summary_now = Instant::now();
         if summary_now >= next_loop_summary {
             let heartbeat_elapsed_ms = summary_now

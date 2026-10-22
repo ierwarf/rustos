@@ -22,6 +22,14 @@ is cited by `formal/CONFORMANCE.md` as phase-closure evidence — this file is
 seal, and that section specifically must keep stating a closure, not just a
 number.
 
+## Core-path expansion
+
+The broader syscall/memory/data/scheduling and persistent-state collection lane
+is documented in [Core-path bundle](core-path-bundle.md). Its
+[progress ledger](core-paths-progress.md) separates actual evidence, incomplete
+coverage, and optimization acceptance; a collected suite is not a performance
+pass. The ordinary bench now also checks null/IPC cost after lifecycle changes.
+
 ## Probes
 
 | probe | what it costs |

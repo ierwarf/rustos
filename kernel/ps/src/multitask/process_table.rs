@@ -252,10 +252,12 @@ impl ProcessTable {
     fn push_reap_handle(&mut self, handle: ProcessHandle) {
         if self.reap_len >= self.reap_queue.len() {
             self.reap_scan_pending = true;
+            super::kick_housekeeping();
             return;
         }
         self.reap_queue[self.reap_len] = Some(handle);
         self.reap_len += 1;
+        super::kick_housekeeping();
     }
 }
 
@@ -525,6 +527,21 @@ pub fn with_process_state_by_pid<R>(
     process.with_visible_state(|_, state| f(state))
 }
 
+/// Why staging a new exec image was refused. `SealBusy` is transient: the old
+/// address space still has an activation grant in flight and closing it would
+/// strand the process, so the caller must cancel before any image effect.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StageRefusal {
+    /// The new address space could not take an execution pin.
+    NewImagePin,
+    /// The process generation is no longer retainable.
+    ProcessGone,
+    /// The exec reservation no longer authorizes the transfer.
+    Transfer,
+    /// The old address space refused to close admission (grant in flight).
+    SealBusy,
+}
+
 pub fn stage_exec_state(
     reservation: ExecReservation,
     address_space: ProcessAddressSpace,
@@ -533,24 +550,47 @@ pub fn stage_exec_state(
     linux_runtime_profile: crate::user::linux::LinuxRuntimeProfile,
     exec_path: &str,
 ) -> Option<StagedExec> {
+    stage_exec_state_checked(
+        reservation,
+        address_space,
+        linux_process_state,
+        linux_memory_map,
+        linux_runtime_profile,
+        exec_path,
+    )
+    .ok()
+}
+
+pub fn stage_exec_state_checked(
+    reservation: ExecReservation,
+    address_space: ProcessAddressSpace,
+    linux_process_state: crate::user::linux::LinuxProcessState,
+    linux_memory_map: crate::user::linux::LinuxMemoryMapState,
+    linux_runtime_profile: crate::user::linux::LinuxRuntimeProfile,
+    exec_path: &str,
+) -> Result<StagedExec, StageRefusal> {
     let new_root = address_space.root_phys().as_u64();
     let new_mm = MmExecutionPin::new(
         reservation.handle,
         reservation.next_mm_generation,
-        address_space.pin_execution()?,
+        address_space
+            .pin_execution()
+            .ok_or(StageRefusal::NewImagePin)?,
     );
-    let process = retain_process(reservation.handle)?;
+    let process = retain_process(reservation.handle).ok_or(StageRefusal::ProcessGone)?;
     let staged = process.with_state_mut(|process_id, state| {
         {
             let mut table = PROCESS_TABLE.lock();
-            let object = table.lookup_object_mut(reservation.handle)?;
+            let Some(object) = table.lookup_object_mut(reservation.handle) else {
+                return Err(StageRefusal::ProcessGone);
+            };
             if !exec_commit_may_transfer(object, reservation) {
-                return None;
+                return Err(StageRefusal::Transfer);
             }
         }
 
         if !state.address_space().seal_execution() {
-            return None;
+            return Err(StageRefusal::SealBusy);
         }
         let (closed, old_state) = state.replace_for_exec(
             address_space,
@@ -576,7 +616,7 @@ pub fn stage_exec_state(
             let slot = &table.slots[index];
             publish_slot_visibility(index, slot);
         }
-        Some(StagedExec {
+        Ok(StagedExec {
             reservation,
             new_root,
             new_mm,
@@ -585,7 +625,7 @@ pub fn stage_exec_state(
             old_state,
         })
     });
-    if staged.is_some() {
+    if staged.is_ok() {
         record_lifecycle_marker(
             "lifecycle-exec-stage",
             reservation.handle,
@@ -808,7 +848,14 @@ pub fn note_process_exit_status(process_id: u64, status: i32) -> Option<()> {
     object.exit_status = Some(status);
     object.child_state_change = None;
     object.exiting = true;
+    let parent = object.parent_process_id;
     publish_slot_visibility(index, &table.slots[index]);
+    drop(table);
+    // Publish first, wake second: a parent parked in `wait4` re-runs
+    // `wait_for_child` and finds this status.
+    if let Some(parent) = parent {
+        super::wake_child_waiters(parent);
+    }
     Some(())
 }
 

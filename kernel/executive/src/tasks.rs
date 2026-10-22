@@ -12,10 +12,13 @@ pub(super) fn init_bootstrap_task(_id: u64) {
 
 pub(super) fn nucleus_housekeeping_task(_id: u64) {
     flow_debug(60, "housekeeping task entered");
+    ps_api::register_housekeeping_task();
     loop {
         x86_64::instructions::interrupts::enable();
+        // Clear before scanning: work published after this point re-arms it.
+        ps_api::take_housekeeping_kick();
         let work = boot::housekeeping_once();
-        finish_background_turn(work, ps_api::yield_now, idle_tick_wait);
+        finish_background_turn(work, ps_api::yield_now, housekeeping_idle_wait);
     }
 }
 
@@ -42,6 +45,12 @@ pub(super) fn nucleus_pager_fault_refill_task(_id: u64) {
         }
         finish_background_turn(work, ps_api::yield_now, idle_tick_wait);
     }
+}
+
+fn housekeeping_idle_wait() {
+    // Sleep a tick, or less when a producer kicks: retirement, reap and thread
+    // join work should not wait for the next timer edge.
+    kernel_hal::api::arch::rtc::sleep_unless(1, ps_api::housekeeping_kicked);
 }
 
 fn idle_tick_wait() {

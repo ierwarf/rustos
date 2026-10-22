@@ -89,7 +89,8 @@ contracts.
    registries and acknowledges that cleanup back to the scheduler.
    Scheduler-aware locks use this same arm-before-publication transition and
    remove a waiter after any unrelated wake. Housekeeping completes no more
-   than four retirement records and one deferred transfer release per turn;
+   than sixteen retirement records, sixteen reaper records and one deferred
+   transfer release per turn;
    provider replay and acknowledgement are separate, 100 ms-bounded
    housekeeping turns rather than a synchronous foreground backlog drain.
    IPC object handles additionally bind a slot generation. Endpoint teardown
