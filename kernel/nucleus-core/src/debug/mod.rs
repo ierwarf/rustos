@@ -9,7 +9,10 @@ mod milestone_frame;
 pub mod phase_profile;
 pub mod product_snapshot_evidence;
 #[cfg(rustos_debug_print_enabled)]
-use milestone_class::{milestone_loss_snapshot, milestone_output_class, MilestoneOutputClass};
+use milestone_class::{
+    lifecycle_sample_admits, milestone_loss_snapshot, milestone_output_class,
+    per_process_lifecycle, MilestoneOutputClass,
+};
 
 use alloc::string::String;
 use alloc::vec;
@@ -708,6 +711,13 @@ fn emit_milestone_debugcon_line(record: MilestoneRecord) {
     }
     if !milestone_debugcon_visible(record.name) {
         return;
+    }
+    if per_process_lifecycle(record.name) {
+        static LIFECYCLE_EMISSIONS: AtomicU64 = AtomicU64::new(0);
+        // ORDERING: Relaxed; the counter only thins diagnostics.
+        if !lifecycle_sample_admits(LIFECYCLE_EMISSIONS.fetch_add(1, Ordering::Relaxed) + 1) {
+            return;
+        }
     }
     let user_context = current_user_context();
     let output_class = milestone_output_class(record.name);

@@ -251,9 +251,6 @@ pub fn halt_current_retired_task() -> ! {
     panic!("HAL retired-task halt hook is not registered");
 }
 
-pub fn current_user_snapshot() -> Option<CurrentUserSnapshot> {
-    task_hooks().current_user_snapshot.and_then(|hook| hook())
-}
 
 pub fn is_scheduler_initialized() -> bool {
     task_hooks()

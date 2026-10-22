@@ -535,10 +535,10 @@ fn independent_thread_creator_capture_requires_exact_context_start_and_live_unse
     let reservation = process::begin_exec(handle).unwrap();
     let intent = exec_intent::begin(SLOT, PID, reservation, false).unwrap();
     assert!(crate::multitask::scheduler::thread_creation::capture_creator(SLOT).is_none());
-    drop(intent.cancel_with(
+    let _ = intent.cancel_with(
         nucleus_core::util::lockdep::DispatchPreemption::enter_model(0),
         process::cancel_exec_owned,
-    ));
+    );
     identity::publish_lifecycle_change(
         SLOT,
         Some(metadata(handle)),

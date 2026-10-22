@@ -319,9 +319,12 @@ benefits require matched original-tree controls.
   `sched_yield` skips the dispatcher when idle, `uaccess_selftest` covers COW and
   remap races. Gates after the last edit: lib tests (kernel-ps 969, compat 182),
   `verify-all --profile pr`, `verify-smp-iteration`, 8-vCPU kvm-smoke.
-- Not started: idle-aware wake placement and SMT/LLC topology in
-  `runqueue_policy::affinity_target_cpu`; dead-code sweep (147 kernel-ps warnings);
-  a doc-vs-code consistency sweep; fork/exec latency (fork+COW ~1.2 ms).
+- 2026-10-22 final: idle-aware wake placement landed (`affinity_target_cpu`); dead-code
+  sweep reached zero warnings in both real configs (boot image and `cargo test`);
+  lifecycle milestone/spawn-line sampling; doc sweep done. Gates: lib tests (kernel-ps 973),
+  `verify-all --profile pr`, `verify-smp-iteration`, 8-vCPU kvm-smoke; numbers in
+  `docs/benchmarks/core-paths-progress.md`. Open: SMT/LLC topology placement, fork+exec
+  startup (~96M ticks at 1 vCPU), 8-vCPU exec_replace/thread_clone tails.
 - Next structural: fastcall register ABI, single-slot rendezvous, `iretq`-free lane
   resume, fewer lock pairs (see ipc-lane.md).
 

@@ -106,6 +106,7 @@ pub(crate) fn charge_acquire(cpu: usize, class_index: usize) {
 /// classes that have no shipping cost budget. Diagnostic builds still census
 /// every class.
 #[inline]
+#[cfg(not(test))]
 pub(crate) fn charge_acquire_for_class<const CLASS: u8>(cpu: usize) {
     #[cfg(rustos_lock_phase_profile)]
     charge_acquire(cpu, usize::from(CLASS));
@@ -178,6 +179,7 @@ pub fn select_site_census_class(class_index: usize) {
 /// Charges one acquisition of `class_index` to `caller` when that class is the
 /// selected one. A direct-mapped bucket keeps the common case one line.
 #[inline]
+#[cfg(not(test))]
 pub(crate) fn charge_site(class_index: usize, caller: &'static Location<'static>) {
     if !cfg!(rustos_lock_phase_profile) {
         return;
@@ -321,7 +323,7 @@ pub(crate) fn charge_identity_derivation_count(cpu: usize) {
 }
 
 #[cfg_attr(
-    not(rustos_lock_phase_profile),
+    not(any(rustos_lock_phase_profile, test)),
     expect(dead_code, reason = "diagnosis build only")
 )]
 pub(crate) fn charge_identity_derivation(cpu: usize, site: &'static Location<'static>) {

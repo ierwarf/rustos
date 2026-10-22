@@ -31,6 +31,7 @@ pub(in crate::multitask) fn is_idle(slot: usize) -> bool {
 
 /// The admitted tag authenticates fixed boot placement, not a scan of a
 /// mutable catalog. Root classification is separate from AP CPU ownership.
+#[cfg(test)]
 pub(in crate::multitask) fn cpu_for_slot(slot: usize) -> u8 {
     use super::super::{MAX_TASK, NO_IDLE_CPU, ROOT_TASK_SLOT};
     if slot == ROOT_TASK_SLOT || !is_idle(slot) {

@@ -44,6 +44,7 @@ impl<T, const CLASS: u8> IrqLeaf<T, CLASS> {
         Guard { inner, _mask: mask }
     }
     #[track_caller]
+    #[cfg(test)]
     pub(super) fn try_lock(&self) -> Option<Guard<'_, T, CLASS>> {
         let mask = Mask::enter();
         let inner = self.inner.try_lock()?;

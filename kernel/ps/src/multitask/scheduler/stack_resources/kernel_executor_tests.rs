@@ -6,7 +6,7 @@
 //! Forbidden: absence projection, backing alone as user continuation, or native reset as reopen.
 //! Evidence: actual capture_binding, lifecycle, terminal reservation and Local Running claim.
 use super::super::{
-    BlockReason, TaskContext, current_identity as identity, retirement_cleanup, runqueue,
+    TaskContext, current_identity as identity, retirement_cleanup, runqueue,
     scheduling_context, scheduling_runtime,
 };
 use super::*;
@@ -23,22 +23,7 @@ fn metadata(id: u64) -> identity::TaskIdentity {
 fn context(id: u64) -> TaskContext {
     TaskContext {
         scheduling_context: scheduling_context::SchedulingContext::bind(SLOT, id),
-        saved_rsp: 0,
-        test_ready: false,
-        ready_since_ticks: 0,
-        blocked: true,
-        blocked_since_ticks: 0,
-        wake_armed: false,
-        block_reason: BlockReason::None,
-        weight: 100,
-        vruntime_ns: 0,
-        exec_start_ticks: 0,
-        address_space_root: 0,
-        kernel_stack_base: 0,
-        kernel_stack_top: 0,
-        alternate_kernel_stack_base: 0,
-        alternate_kernel_stack_top: 0,
-        user_mode: false,
+        saved_rsp: 0,        address_space_root: 0,        user_mode: false,
         user_abi: None,
         console_session: crate::io::session::ConsoleSessionHandle::SYSTEM,
         process_handle: None,

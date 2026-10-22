@@ -211,6 +211,7 @@ impl<R> ClaimAttempt<R> {
     }
 }
 
+#[cfg(test)]
 pub(in crate::multitask::scheduler) fn with_claim_activation<R>(
     slot: usize, cpu: usize, claim: impl FnOnce() -> R,
 ) -> Option<ClaimAttempt<R>> {

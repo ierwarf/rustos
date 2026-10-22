@@ -328,6 +328,7 @@ pub(in crate::multitask) struct Entry<'a> {
     affinity: PhantomData<*mut ()>,
 }
 impl Entry<'_> {
+    #[cfg(test)]
     pub(in crate::multitask) fn cpu(&self) -> usize {
         self.cpu
     }

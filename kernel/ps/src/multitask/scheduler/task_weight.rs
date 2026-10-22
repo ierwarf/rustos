@@ -1,8 +1,5 @@
 //! Scheduler adapters for per-slot fair-share weights.
 
-#[cfg(not(test))]
-use super::runqueue;
-
 // CFS-like fairness constants (mirrors Linux kernel/sched/fair.c).
 // NICE_0_LOAD is the nominal weight; vruntime delta = elapsed * NICE_0_LOAD / weight.
 // Smaller weight -> larger vruntime per real-time unit -> less CPU share.

@@ -53,7 +53,7 @@ static TRANSITION_ACTIVE: [AtomicBool; nucleus_core::util::lockdep::MAX_TRACKED_
 mod test_support;
 #[cfg(test)]
 pub(super) use test_support::{
-    TestCpuPublicationRestore, install_test_current_owner, install_test_transition_owner,
+    install_test_current_owner, install_test_transition_owner,
     with_test_current_scalar, with_initialized_fixture,
     test_publication_lock, with_test_activation_return, with_test_rejected_activation_return,
 };
@@ -252,6 +252,7 @@ pub(super) fn publish_cpu_current_task(image: &super::scheduler::bootstrap::Init
 /// deliberately not a substitute for `CURRENT_TASK_SLOTS`: only the latter,
 /// together with `TRANSITION_*`, grants remote execution/lifetime authority.
 #[inline]
+#[cfg(test)]
 pub(super) fn scheduler_current_task_scratch() -> usize {
     let logical_index = scheduler_turn_logical_index();
     scheduler_current_task_scratch_for_cpu(logical_index)
@@ -265,6 +266,7 @@ pub(super) fn scheduler_turn_logical_index() -> usize {
     dispatch_turn::current_cpu()
 }
 
+#[cfg(test)]
 pub(in crate::multitask) fn has_placement(cpu: usize, slot: usize) -> bool {
     dispatch_turn::has_placement(cpu, slot)
 }
@@ -279,6 +281,7 @@ pub(in crate::multitask) fn retain_placement(cpu: usize, grant: super::scheduler
     dispatch_turn::retain_placement(cpu, grant);
 }
 
+#[cfg(test)]
 pub(super) fn can_retain_mm_activation(
     cpu: usize,
     incoming: &super::scheduler::stack_resources::activation::ActivationCredential,
@@ -302,6 +305,7 @@ pub(super) fn retain_mm_activation(
 }
 
 #[inline]
+#[cfg(test)]
 fn scheduler_current_task_scratch_for_cpu(logical_index: usize) -> usize {
     assert!(
         logical_index < SCHEDULER_CURRENT_TASK_SCRATCH.len(),

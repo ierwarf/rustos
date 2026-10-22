@@ -30,8 +30,11 @@ mod diagnostics;
 mod netd_socket_reply;
 pub use bootstrap_spawn::syscall_linux_loader_spawn_exec;
 use netd_socket_reply::{
-    call_netd_socket_ipc_request_impl, install_prepared_netd_socket_response,
-    netd_reply_uses_prepared_socket, prepared_netd_socket_response_matches,
+    call_netd_socket_ipc_request_impl, netd_reply_uses_prepared_socket,
+};
+#[cfg(test)]
+use netd_socket_reply::{
+    install_prepared_netd_socket_response, prepared_netd_socket_response_matches,
 };
 
 // A readiness probe cannot consume an event: it only transfers authenticated

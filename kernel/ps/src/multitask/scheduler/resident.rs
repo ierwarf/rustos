@@ -110,6 +110,7 @@ pub(super) fn take(slot: usize, generation: u64) -> Option<Loans> {
 }
 
 /// Observation for admission decisions; grants nothing.
+#[cfg(test)]
 pub(super) fn is_resident(slot: usize, generation: u64) -> bool {
     CELLS[slot].generation.load(Ordering::Acquire) == generation
 }

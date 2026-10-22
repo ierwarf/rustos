@@ -326,3 +326,24 @@ fn qualification_drop_is_visible_only_to_following_critical_evidence() {
     assert_eq!(critical.load(Ordering::Relaxed), 20);
     assert_eq!(discarded.load(Ordering::Relaxed), 52);
 }
+
+#[test]
+fn per_process_lifecycle_milestones_are_sampled_after_boot() {
+    use super::milestone_class::{lifecycle_sample_admits, per_process_lifecycle};
+    for name in [
+        "spawn-user-process",
+        "linux-process-termination",
+        "proc-map-file-batch",
+        "lifecycle-spawn-reserve",
+    ] {
+        assert!(per_process_lifecycle(name), "{name}");
+    }
+    // Failure evidence and unrelated milestones stay unconditional.
+    for name in ["proc-exec-refused", "pager-vma-unmap-refused", "mm-broker-refused", "boot"] {
+        assert!(!per_process_lifecycle(name), "{name}");
+    }
+    assert!((1..=256).all(lifecycle_sample_admits));
+    assert!(!lifecycle_sample_admits(257));
+    assert!(lifecycle_sample_admits(512));
+    assert!(!lifecycle_sample_admits(1000));
+}

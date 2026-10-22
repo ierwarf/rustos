@@ -115,6 +115,13 @@ pub(super) fn affinity_target_cpu(slot: usize, eligible: u64) -> usize {
             .nth(spread)
             .unwrap_or(current)
     };
+    // A woken task should not queue behind a running one while an eligible CPU
+    // sits idle: the preferred CPU keeps the task only when it is idle itself.
+    if !cpu_is_idle(preferred)
+        && let Some(idle) = idle_eligible_cpu(eligible, preferred)
+    {
+        return idle;
+    }
     let least_loaded = runqueue::least_loaded_cpu(eligible, preferred);
     placement_target_cpu(
         preferred,
@@ -122,6 +129,32 @@ pub(super) fn affinity_target_cpu(slot: usize, eligible: u64) -> usize {
         runqueue::published_runnable_count(preferred),
         runqueue::published_runnable_count(least_loaded),
     )
+}
+
+/// A CPU is idle when nothing is queued or mailboxed for it and the task it runs
+/// is its own idle task. A remote wake lands in the mailbox first, so counting
+/// only the run queue would hand a burst of wakes to the same idle CPU. Both
+/// inputs are published hints; the owner CAS stays the authority.
+fn cpu_is_idle(cpu: usize) -> bool {
+    !runqueue::local_dispatch_work_pending(cpu)
+        && super::super::cpu_local::published_current_slot(cpu).is_some_and(runqueue::is_idle_slot)
+}
+
+/// First idle eligible CPU after `preferred` in CPU order, wrapping, so a burst
+/// of placements spreads across idle CPUs instead of piling onto the lowest.
+fn idle_eligible_cpu(eligible: u64, preferred: usize) -> Option<usize> {
+    first_idle_after(eligible, preferred, cpu_is_idle)
+}
+
+fn first_idle_after(
+    eligible: u64,
+    preferred: usize,
+    is_idle: impl Fn(usize) -> bool,
+) -> Option<usize> {
+    let max = nucleus_core::util::lockdep::MAX_TRACKED_CPUS;
+    (1..max)
+        .map(|offset| (preferred + offset) % max)
+        .find(|cpu| eligible & (1_u64 << cpu) != 0 && is_idle(*cpu))
 }
 
 #[cfg(not(test))]
@@ -160,6 +193,7 @@ pub(super) fn rehome_owned_on_mask(
 /// that host unit schedulers do not model, but the rule it feeds is the whole
 /// defect: a *failed* claim must never resolve back to the current slot, which
 /// is what asserting custody there amounted to.
+#[cfg(test)]
 pub(super) const fn fallback_slot_for(
     current_slot: usize,
     idle_slot: usize,
@@ -191,9 +225,20 @@ pub(in crate::multitask) fn take_fallback_idle_dispatch_window() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        active_balance_opportunity_due, placement_target_cpu, runqueue_is_imbalanced,
-        sync_wake_may_stay_local,
+        active_balance_opportunity_due, first_idle_after, placement_target_cpu,
+        runqueue_is_imbalanced, sync_wake_may_stay_local,
     };
+
+    #[test]
+    fn idle_cpu_search_wraps_skips_ineligible_and_never_returns_the_preferred_cpu() {
+        let idle = |cpu: usize| cpu == 1 || cpu == 3 || cpu == 6;
+        assert_eq!(first_idle_after(0b1111_1111, 2, idle), Some(3));
+        assert_eq!(first_idle_after(0b1111_1111, 6, idle), Some(1));
+        // CPU 3 is idle but not eligible.
+        assert_eq!(first_idle_after(0b1111_0111, 2, idle), Some(6));
+        assert_eq!(first_idle_after(0b0100, 2, |cpu| cpu == 2), None);
+        assert_eq!(first_idle_after(u64::MAX, 0, |_| false), None);
+    }
 
     #[test]
     fn synchronous_wake_stays_local_only_on_an_idle_eligible_cpu() {

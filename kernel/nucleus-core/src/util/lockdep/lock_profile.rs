@@ -24,9 +24,11 @@ use crate::debug::LogCategory;
 use crate::debug::phase_profile::{PhaseProfile, phase_now};
 
 #[cfg(rustos_lock_phase_profile)]
-pub(super) const LOCK_PHASE_COUNT: usize = 17;
+pub(super) const LOCK_PHASE_COUNT: usize = 16;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+// DIAGNOSTIC: phase code table; charge sites exist only in the boot image.
+#[cfg_attr(not(rustos_boot_image), allow(dead_code))]
 pub(super) enum LockPhase {
     /// The lockdep graph work before the lock word is touched: IRQ usage
     /// recording, task-owner dependency edges, and the held-class scan.
@@ -58,24 +60,17 @@ pub(super) enum LockPhase {
     ReleaseStack = 10,
     /// The preemption depth decrement and its ownership correspondence check.
     ReleaseEnable = 11,
-    /// One `current_cpu_index` derivation, counted but not timed.
-    ///
-    /// Timing it was tried and rejected: the derivation is cheap and called
-    /// often enough that two counter reads per call pushed guest boot past the
-    /// display provider's 2500 ms deadline. The sample count still gives the
-    /// multiplier the timed phases are paying.
-    CpuIndex = 12,
     /// `current_cpu_index` fell back to `CPUID` because this CPU's TSC_AUX
     /// token was unwritten or the token was never admitted.
-    ApicFallbackToken = 13,
+    ApicFallbackToken = 12,
     /// An APIC-identity query ran before topology publication.
-    ApicFallbackUnpublished = 14,
+    ApicFallbackUnpublished = 13,
     /// An APIC-identity query named a logical index outside the admitted
     /// topology.
-    ApicFallbackRange = 15,
+    ApicFallbackRange = 14,
     /// An APIC-identity query found the never-published sentinel in the dense
     /// map.
-    ApicFallbackSentinel = 16,
+    ApicFallbackSentinel = 15,
 }
 
 #[cfg(rustos_lock_phase_profile)]
@@ -94,7 +89,6 @@ static PROFILE: PhaseProfile<LOCK_PHASE_COUNT> = PhaseProfile::new(
         "lock-phase-release-unlock",
         "lock-phase-release-stack",
         "lock-phase-release-enable",
-        "lock-phase-cpu-index",
         "lock-phase-apic-fallback-token",
         "lock-phase-apic-fallback-unpublished",
         "lock-phase-apic-fallback-range",

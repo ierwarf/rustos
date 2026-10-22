@@ -245,6 +245,7 @@ pub(super) struct SchedulingContextPolicy {
 }
 
 impl SchedulingContextPolicy {
+    #[cfg(test)]
     pub(super) const ABI_VERSION: u16 = 1;
 
     pub(super) const fn is_valid(self) -> bool {
@@ -417,6 +418,7 @@ impl BudgetState {
         })
     }
 
+    #[cfg(test)]
     fn conserved_ns(&self) -> Option<u64> {
         self.available_ns.checked_add(self.refills.total_ns()?)
     }
@@ -514,9 +516,7 @@ impl SchedulingDomainState {
 /// survive that boundary in a static slot for no gain over one number.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum DomainRefusalCause {
-    NoDomain = 0,
     Policy = 1,
-    PolicyEpoch = 2,
     RefillRefused = 3,
     EmptyNoRefill = 4,
     EmptyRefillPending = 5,
@@ -630,10 +630,12 @@ impl SchedulingContext {
         true
     }
 
+    #[cfg(test)]
     pub(super) const fn is_budgeted(self) -> bool {
         self.policy.is_some()
     }
 
+    #[cfg(test)]
     pub(super) fn allows_cpu(self, cpu: usize) -> bool {
         self.policy.is_none_or(|policy| {
             u32::try_from(cpu)
@@ -643,45 +645,8 @@ impl SchedulingContext {
         })
     }
 
-    /// Read-only admission check used by candidate scans. A due refill is
-    /// considered eligible here and is committed only after the scheduler has
-    /// selected the exact slot under its owner lock.
-    pub(super) fn is_eligible(self, now_ns: u64) -> bool {
-        let Some(policy) = self.policy else {
-            return true;
-        };
-        super::scheduling_runtime::is_eligible(
-            usize::try_from(self.identity.slot() - 1).expect("context slot exceeds usize"),
-            self.identity,
-            policy,
-            now_ns,
-        )
-    }
 
-    pub(super) fn prepare_dispatch(self, now_ns: u64) -> bool {
-        let Some(policy) = self.policy else {
-            return true;
-        };
-        super::scheduling_runtime::prepare_dispatch(
-            usize::try_from(self.identity.slot() - 1).expect("context slot exceeds usize"),
-            self.identity,
-            policy,
-            now_ns,
-        )
-    }
 
-    #[cfg(test)]
-    pub(super) fn record_timeout_fault(self, reply: u64) -> bool {
-        let Some(policy) = self.policy else {
-            return false;
-        };
-        super::scheduling_runtime::record_timeout_fault(
-            usize::try_from(self.identity.slot() - 1).expect("context slot exceeds usize"),
-            self.identity,
-            policy,
-            reply,
-        )
-    }
 
     pub(super) const fn identity(self) -> ObjectIdentity {
         self.identity
@@ -699,6 +664,7 @@ impl SchedulingContext {
         self.domain_generation
     }
 
+    #[cfg(test)]
     pub(super) fn runtime_snapshot(self) -> Option<BudgetSnapshot> {
         let policy = self.policy?;
         super::scheduling_runtime::runtime_snapshot(

@@ -10,7 +10,7 @@ use crate::multitask::scheduler::{
 };
 use core::mem;
 use scheduler::{
-    BlockReason, ConsoleSessionHandle, NICE_0_LOAD, SavedContext, TaskContext, TaskStart,
+    ConsoleSessionHandle, SavedContext, TaskContext, TaskStart,
 };
 use std::panic::{AssertUnwindSafe, catch_unwind};
 const SLOT: usize = 110;
@@ -28,22 +28,7 @@ fn frame(ticket: &stack_resources::admission::Ticket, rsp: usize) -> SavedContex
 fn kernel_metadata(id: u64, rsp: usize) -> TaskContext {
     TaskContext {
         scheduling_context: scheduler::scheduling_context::SchedulingContext::bind(SLOT, id),
-        saved_rsp: rsp,
-        test_ready: true,
-        ready_since_ticks: 0,
-        blocked: false,
-        blocked_since_ticks: 0,
-        wake_armed: false,
-        block_reason: BlockReason::None,
-        weight: NICE_0_LOAD,
-        vruntime_ns: 0,
-        exec_start_ticks: 0,
-        address_space_root: 0,
-        kernel_stack_base: 0,
-        kernel_stack_top: 0,
-        alternate_kernel_stack_base: 0,
-        alternate_kernel_stack_top: 0,
-        user_mode: false,
+        saved_rsp: rsp,        address_space_root: 0,        user_mode: false,
         user_abi: None,
         console_session: ConsoleSessionHandle::SYSTEM,
         process_handle: None,

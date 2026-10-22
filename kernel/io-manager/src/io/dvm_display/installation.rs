@@ -157,7 +157,7 @@ pub(super) fn try_install_serialized() -> bool {
 
 /// Program exactly two host receive vectors: control/ready and offline. The
 /// device cannot turn them into a generic guest-selected interrupt allocator.
-struct GuiInterruptInstall {
+pub(super) struct GuiInterruptInstall {
     capability: crate::arch::pci::MsixCapability,
     /// Exclusive claim on the function, held for the transaction's whole life
     /// so no other driver can reprogram the interrupts this one armed.

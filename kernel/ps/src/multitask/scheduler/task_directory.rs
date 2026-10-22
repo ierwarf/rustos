@@ -80,6 +80,7 @@ pub(super) fn record(task_id: u64, slot: usize) {
 
 /// Forgets the accelerator for `task_id` after an authoritative miss.
 #[inline]
+#[cfg(test)]
 pub(super) fn forget(task_id: u64) {
     let tag = tag(task_id);
     for way in set(task_id) {
@@ -125,6 +126,7 @@ fn live_published_slot(task_id: u64) -> Option<(usize, current_identity::TaskIde
 }
 
 /// The live slot holding `task_id`, or `None` when the guard must answer.
+#[cfg(test)]
 pub(super) fn live_slot(task_id: u64) -> Option<usize> {
     live_published_slot(task_id).map(|(slot, _)| slot)
 }

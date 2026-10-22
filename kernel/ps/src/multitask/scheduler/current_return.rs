@@ -267,7 +267,7 @@ impl<'a> CurrentReturn<'a> {
         self.return_rsp = Some(rsp);
         self.frame_published = true;
     }
-    pub(in crate::multitask) fn publish_queue(
+    pub(in crate::multitask::scheduler) fn publish_queue(
         &mut self,
         allow_local: bool,
     ) -> runqueue::ReturnPublication {

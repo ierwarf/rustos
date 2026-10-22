@@ -373,8 +373,9 @@ pub(in crate::multitask) fn with_image<R>(
 /// committer; it grants nothing and is overwritten by the next transaction.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
+// DIAGNOSTIC: refusal code table; the refusing sites are compiled out of tests.
+#[cfg_attr(test, allow(dead_code))]
 pub(in crate::multitask::scheduler) enum ImageRefusal {
-    None = 0,
     ContextMissing = 1,
     IdentityMismatch = 2,
     NotCurrent = 3,

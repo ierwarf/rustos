@@ -45,6 +45,7 @@ pub(super) struct StableFrameToken {
 
 /// Pin backing storage and recheck publication before any byte read. A stale
 /// token cannot borrow an image replaced between observation and pinning.
+#[cfg(test)]
 pub(super) fn pin_allocation(token: StableFrameToken) -> Option<super::stack_resources::StackPin> {
     let task_id = super::current_identity::read_dispatch(token.slot)?.task_id?;
     pin_for_identity(token, task_id)
@@ -300,6 +301,7 @@ pub(super) fn direct_handoff_frame_token(slot: usize, cpu: usize) -> Option<Stab
 /// rather than comparing it to the old suspended-frame token. The token may
 /// name the Local/Direct generation immediately before the Running claim or
 /// the same Running generation after the current CPU published its frame.
+#[cfg(test)]
 pub(super) fn running_frame_view(slot: usize, cpu: usize) -> Option<PublishedFrameView> {
     let owner = runqueue::owner(slot);
     if owner.state != RunOwnerState::Running || owner.cpu != Some(cpu) {

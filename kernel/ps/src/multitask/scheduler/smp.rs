@@ -38,6 +38,7 @@ pub fn drain_fast_ipc_eligibility_rejections() -> [u64; FAST_IPC_ELIGIBILITY_REJ
     [0; FAST_IPC_ELIGIBILITY_REJECTION_COUNT]
 }
 
+#[cfg(test)]
 fn candidate_has_foreign_execution_owner(
     candidate_slot: usize,
     current_slot: usize,
@@ -55,6 +56,7 @@ pub(super) const fn idle_slot_for_cpu(cpu: usize) -> Option<usize> {
     if cpu == 0 { Some(ROOT_TASK_SLOT) } else { MAX_TASK.checked_sub(cpu) }
 }
 
+#[cfg(test)]
 pub(super) fn remote_task_requires_quiescence(
     slot: usize,
     current_slot: usize,
@@ -69,9 +71,6 @@ mod tests {
     use super::{
         candidate_has_foreign_execution_owner, idle_slot_for_cpu, remote_task_requires_quiescence,
     };
-    use crate::memory::paging::ProcessAddressSpace;
-    use crate::multitask::{UserTaskBootstrap, noop_task_entry};
-    use crate::user::abi::UserAbi;
 
     #[test]
     fn secondary_idle_slot_layout_is_cpu_exact_and_outside_the_root() {

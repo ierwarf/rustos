@@ -105,6 +105,7 @@ pub(in crate::multitask::scheduler) fn publish_handoff_mailbox(
 /// Transfers a blocked task directly to the current CPU's synchronous IPC
 /// handoff owner without inserting it into the fair runqueue. The caller must
 /// publish the matching bounded handoff record before releasing Scheduler.
+#[cfg(test)]
 pub(in crate::multitask::scheduler) fn publish_direct_handoff(
     slot: usize,
     cpu: usize,
@@ -134,6 +135,7 @@ pub(in crate::multitask::scheduler) fn publish_direct_handoff(
 /// Restores fair-runqueue custody when the bounded synchronous-handoff FIFO
 /// cannot retain a freshly published direct transfer. Scheduler serialization
 /// guarantees the task has not been selected between publication and rollback.
+#[cfg(test)]
 pub(in crate::multitask::scheduler) fn materialize_direct_handoff(
     slot: usize,
     cpu: usize,
@@ -177,6 +179,7 @@ pub(in crate::multitask::scheduler) fn materialize_direct_handoff_with_generatio
 /// Returns a not-yet-dispatched direct receiver to exact blocked custody.
 /// No runqueue or mailbox entry exists while `DirectHandoff` is owned, so one
 /// owner-word CAS restores the pre-reservation representation.
+#[cfg(test)]
 pub(in crate::multitask::scheduler) fn rollback_direct_handoff(slot: usize, cpu: usize) -> bool {
     validate_cpu(cpu);
     let owner = owner(slot);
@@ -321,6 +324,7 @@ pub(in crate::multitask::scheduler) fn rehome_queued_frame(
     publish_migrating_record(slot, migrating, target_cpu, weight)
 }
 
+#[cfg(test)]
 pub(in crate::multitask::scheduler) fn rehome_queued(
     slot: usize,
     target_cpu: usize,

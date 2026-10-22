@@ -67,6 +67,7 @@ pub fn reserve_spawn() -> Option<SpawnReservation> {
 /// Consume one exact pre-publication reservation by installing the fully
 /// constructed process. A reservation sealed by an actual root producer cannot
 /// be spent by this copied-receipt entry; the root owner publishes with its key.
+#[cfg(test)]
 pub fn publish_spawn(
     reservation: SpawnReservation,
     process_id: u64,

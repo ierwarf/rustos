@@ -51,6 +51,7 @@ pub(in crate::multitask::scheduler) fn admit_initial(
     frame_publication::bind_local_owner_generation(slot, running.generation);
 }
 
+#[cfg(test)]
 pub(in crate::multitask::scheduler) fn admit_running(slot: usize, cpu: usize) {
     validate_cpu(cpu);
     let owner = owner(slot);

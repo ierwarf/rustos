@@ -41,6 +41,7 @@ fn observe_claim_admission(slot: usize, funding: Option<&super::super::schedulin
     }
 }
 
+#[cfg(test)]
 pub(in crate::multitask::scheduler) fn claim_dispatch(
     slot: usize,
     cpu: usize,
@@ -51,6 +52,7 @@ pub(in crate::multitask::scheduler) fn claim_dispatch(
 
 /// A local picker must claim the exact validated owner generation. Catalog
 /// and exact-handoff claims retain their existing owner-specific admission.
+#[cfg(test)]
 pub(in crate::multitask::scheduler) fn claim_dispatch_with_owner_generation(
     slot: usize,
     cpu: usize,

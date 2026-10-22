@@ -114,36 +114,10 @@ pub(in crate::multitask) fn take_sync_handoff_hit_window() -> u64 {
 /// three are the whole attempt count.
 pub(in crate::multitask) const SYNC_HANDOFF_MISS_REASON_COUNT: usize = 4;
 
-#[derive(Clone, Copy)]
-pub(in crate::multitask) enum SyncHandoffMissReason {
-    /// Nothing was armed for this CPU's queue (or it already drained) —
-    /// caught by the fast `pending()` check before any lock is taken.
-    QueueEmpty = 0,
-    /// The queue may hold a ready record, but this CPU's consecutive-hit
-    /// execution-chain budget reached `MAX_SYNC_HANDOFF_CHAIN_TICKS` while a
-    /// fair competitor was ready.
-    ChainBudgetExhausted = 1,
-    /// The consume loop held records and discarded every one of them as
-    /// stale. See `SyncHandoffStaleReason` for which check rejected each.
-    DrainedStale = 2,
-    /// The FIFO was already empty when the lock was taken, so nothing was
-    /// discarded and no `SyncHandoffStaleReason` applies: the lock-free
-    /// `pending()` flag said "may hold a record" and did not.
-    ///
-    /// This was folded into `DrainedStale` and measured at 98% of it — 8.2% of
-    /// every attempt — which made the stale sub-reasons look like they
-    /// accounted for a bucket they explained 2% of. Splitting it is what lets
-    /// a stale-hint claim and a stale-flag claim be told apart.
-    StartedEmpty = 3,
-}
 
 static SYNC_HANDOFF_MISSES: [core::sync::atomic::AtomicU64; SYNC_HANDOFF_MISS_REASON_COUNT] =
     [const { core::sync::atomic::AtomicU64::new(0) }; SYNC_HANDOFF_MISS_REASON_COUNT];
 
-pub(in crate::multitask) fn record_sync_handoff_miss(reason: SyncHandoffMissReason) {
-    // ORDERING: Relaxed; diagnostic counter drained once per second.
-    SYNC_HANDOFF_MISSES[reason as usize].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-}
 
 /// Takes the window's sync-handoff miss breakdown, clearing it for the next
 /// window. Indexed by `SyncHandoffMissReason`.
@@ -161,19 +135,6 @@ pub(in crate::multitask) fn take_sync_handoff_miss_window() -> [u64; SYNC_HANDOF
 /// proportion within `DrainedStale`, not a per-dispatch partition of it.
 pub(in crate::multitask) const SYNC_HANDOFF_STALE_REASON_COUNT: usize = 3;
 
-#[derive(Clone, Copy)]
-pub(in crate::multitask) enum SyncHandoffStaleReason {
-    /// The slot's published start either disappeared or no longer names the
-    /// queued task id — the queued task retired or the slot was reused.
-    Identity = 0,
-    /// The record's dispatch custody no longer matches — a migration or a
-    /// generation change since the record was enqueued.
-    Custody = 1,
-    /// The slot no longer passes `pick_hint_candidate_slot` — armed, but not
-    /// presently schedulable (e.g. already dispatched through another entry
-    /// point).
-    NotCandidate = 2,
-}
 
 static SYNC_HANDOFF_STALE: [core::sync::atomic::AtomicU64; SYNC_HANDOFF_STALE_REASON_COUNT] =
     [const { core::sync::atomic::AtomicU64::new(0) }; SYNC_HANDOFF_STALE_REASON_COUNT];
@@ -194,26 +155,12 @@ pub(in crate::multitask) fn take_sync_handoff_stale_window()
 /// one-sided, independent of anything on the consume side above.
 pub(in crate::multitask) const SYNC_HANDOFF_ARM_SITE_COUNT: usize = 2;
 
-#[derive(Clone, Copy)]
-pub(in crate::multitask) enum SyncHandoffArmSite {
-    Call = 0,
-    Reply = 1,
-}
 
 static SYNC_HANDOFF_ARM_ACCEPTED: [core::sync::atomic::AtomicU64; SYNC_HANDOFF_ARM_SITE_COUNT] =
     [const { core::sync::atomic::AtomicU64::new(0) }; SYNC_HANDOFF_ARM_SITE_COUNT];
 static SYNC_HANDOFF_ARM_REJECTED: [core::sync::atomic::AtomicU64; SYNC_HANDOFF_ARM_SITE_COUNT] =
     [const { core::sync::atomic::AtomicU64::new(0) }; SYNC_HANDOFF_ARM_SITE_COUNT];
 
-pub(in crate::multitask) fn record_sync_handoff_arm(site: SyncHandoffArmSite, accepted: bool) {
-    // ORDERING: Relaxed; diagnostic counter drained once per second.
-    let table = if accepted {
-        &SYNC_HANDOFF_ARM_ACCEPTED
-    } else {
-        &SYNC_HANDOFF_ARM_REJECTED
-    };
-    table[site as usize].fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-}
 
 /// Takes the window's arm accepted/rejected counts, clearing it for the next
 /// window. Indexed by `SyncHandoffArmSite`; `(accepted, rejected)` per site.
@@ -241,29 +188,11 @@ pub(in crate::multitask) fn take_sync_handoff_arm_window()
 /// independently confirmed rather than assumed.
 pub(in crate::multitask) const SYNC_HANDOFF_REPLY_CUSTODY_FAIL_REASON_COUNT: usize = 4;
 
-#[derive(Clone, Copy)]
-pub(in crate::multitask) enum SyncHandoffReplyCustodyFailReason {
-    /// The runqueue owner generation moved since the reply token captured it.
-    Generation = 0,
-    /// The owner's current CPU no longer matches the token's target CPU.
-    Cpu = 1,
-    /// The owner is not currently runnable.
-    NotRunnable = 2,
-    /// The owner's state left `Local`/`RemoteQueued`.
-    State = 3,
-}
 
 static SYNC_HANDOFF_REPLY_CUSTODY_FAIL: [core::sync::atomic::AtomicU64;
     SYNC_HANDOFF_REPLY_CUSTODY_FAIL_REASON_COUNT] =
     [const { core::sync::atomic::AtomicU64::new(0) }; SYNC_HANDOFF_REPLY_CUSTODY_FAIL_REASON_COUNT];
 
-pub(in crate::multitask) fn record_sync_handoff_reply_custody_fail(
-    reason: SyncHandoffReplyCustodyFailReason,
-) {
-    // ORDERING: Relaxed; diagnostic counter drained once per second.
-    SYNC_HANDOFF_REPLY_CUSTODY_FAIL[reason as usize]
-        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-}
 
 /// Takes the window's reply-custody-failure breakdown, clearing it for the
 /// next window. Indexed by `SyncHandoffReplyCustodyFailReason`.
@@ -287,12 +216,6 @@ static SYNC_HANDOFF_GENERATION_FAIL_STATE: [core::sync::atomic::AtomicU64;
     SYNC_HANDOFF_GENERATION_FAIL_STATE_COUNT] =
     [const { core::sync::atomic::AtomicU64::new(0) }; SYNC_HANDOFF_GENERATION_FAIL_STATE_COUNT];
 
-pub(in crate::multitask) fn record_sync_handoff_generation_fail_state(state_index: usize) {
-    if let Some(counter) = SYNC_HANDOFF_GENERATION_FAIL_STATE.get(state_index) {
-        // ORDERING: Relaxed; diagnostic counter drained once per second.
-        counter.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
-    }
-}
 
 /// Takes the window's generation-fail-state breakdown, clearing it for the
 /// next window.

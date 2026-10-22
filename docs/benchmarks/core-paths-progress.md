@@ -207,3 +207,25 @@ p99/p50 목표 미달).
 8 vCPU p50 ticks: fork_exit_wait 35.2M, fork_exec_exit_wait 164M, thread_clone_exit_join 14.9M,
 exec_replace_single_thread 162M, spawn_activation_to_first_turn 19.2M, exit_retire_to_reap 16.7M,
 fork_cow_private_write 39.7M.
+
+## 비코어 지연 개선 + idle 인지 배치 + 데드코드 정리 후 (2026-10-22)
+
+per-process 수명주기 마일스톤 샘플링(처음 256건 뒤 샘플), loaderd spawn 완료 줄 샘플링,
+housekeeping kick, idle 인지 wake 배치 적용 뒤의 `core_lifecycle` p50 cycles (TSC):
+
+| 프로브 | 1 vCPU | 8 vCPU |
+|---|---:|---:|
+| fork_exit_wait | 2.69M | 3.18M |
+| fork_exec_exit_wait | 96.0M | 137M |
+| thread_clone_exit_join | 1.43M | 7.76M |
+| exec_replace_single_thread | 29.0M | 89.2M |
+| spawn_activation_to_first_turn | 2.56M | 2.39M |
+| exit_retire_to_reap | 0.35M | 0.34M |
+| fork_cow_private_write | 3.24M | 2.62M |
+
+모든 프로브 수집 성공. p99/p50 꼬리 목표는 대부분 미달(`FAIL` 표기)이며 지연 목표 달성이
+아니다. 남은 큰 항목은 fork+exec 약 96M(동적 새 이미지 시작 지연, 커널 exec 자체가 아님)과
+8 vCPU의 exec_replace/thread_clone 꼬리다. IPC 기본 스위트는 회귀 없음
+(cross-process IPC round trip p50 17.96k cyc, null/IPC 회귀 레일 PASS).
+검증: 두 구성 경고 0, 단위 테스트, `verify-all --profile pr`, `verify-smp-iteration`,
+`kvm-smoke --smp-iteration --rustos-vcpus 8` 통과.

@@ -176,6 +176,7 @@ pub(in crate::multitask) fn set_reason(slot: usize, kind: u8, id: u64) {
 ///
 /// The identity is stored first, so any reader that observes the published
 /// kind also observes the identity that belongs to it.
+#[cfg(test)]
 pub(in crate::multitask) fn publish_arm(slot: usize, kind: u8, id: u64) {
     assert!(
         try_publish_arm(slot, kind, id),

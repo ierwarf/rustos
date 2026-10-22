@@ -109,7 +109,6 @@ fn exec_intent_after_slot_ack_cannot_capture_root_census_before_owned_membership
         crate::multitask::process_table::cancel_exec_owned,
     );
     assert!(!cancelled.2);
-    drop(cancelled);
     assert!(placement::Join::begin(process, (SLOT, ID), UserAbi::Linux).is_some());
     cleanup();
 }

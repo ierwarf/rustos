@@ -87,12 +87,14 @@ impl Counters {
         *n = n.saturating_add(ns);
         self.phase_lifetime_ns = self.phase_lifetime_ns.saturating_add(ns);
     }
+    #[cfg(test)]
     pub fn wait(&mut self, ns: u64) {
         self.runtime_profile_lock_acquisitions =
             self.runtime_profile_lock_acquisitions.saturating_add(1);
         self.runtime_profile_lock_wait_ns = self.runtime_profile_lock_wait_ns.saturating_add(ns);
         self.runtime_profile_lock_wait_max_ns = self.runtime_profile_lock_wait_max_ns.max(ns);
     }
+    #[cfg(test)]
     pub fn hold(&mut self, ns: u64, attributed: u64, caller: &'static Location<'static>) {
         self.runtime_profile_lock_hold_ns = self.runtime_profile_lock_hold_ns.saturating_add(ns);
         if ns > self.runtime_profile_lock_hold_max_ns {
@@ -102,6 +104,7 @@ impl Counters {
         }
     }
     pub(super) fn take(&mut self) -> Self {
+        #[cfg_attr(not(test), allow(unused_mut))]
         let mut window = core::mem::replace(self, Self::new());
         self.phase_lifetime_ns = window.phase_lifetime_ns;
         #[cfg(test)]

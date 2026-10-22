@@ -159,6 +159,7 @@ impl PublishedPagerVma {
         (before == after && before & 1 == 0).then_some((start, end))
     }
 
+    #[cfg(test)]
     fn may_overlap(&self, start: u64, end: u64) -> bool {
         self.stable_extent().is_none_or(|(slot_start, slot_end)| {
             slot_start != 0 && start < slot_end && slot_start < end

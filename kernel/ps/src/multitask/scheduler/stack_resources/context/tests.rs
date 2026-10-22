@@ -6,7 +6,7 @@
 //! Forbidden: copied boolean/metadata as a production lifetime grant or external ACK.
 //! Evidence: actual bank/pin fallback plus focused scalar/MM owner tests.
 use super::super::super::{
-    BlockReason, NICE_0_LOAD, TaskStart, scheduling_context, scheduling_runtime,
+    TaskStart, scheduling_context, scheduling_runtime,
 };
 use super::super::tests::admit_context;
 use super::super::{close_for_reclaim, pin_view, take_storage, task_start};
@@ -15,22 +15,7 @@ use super::*;
 pub(in crate::multitask::scheduler) fn metadata(slot: usize, id: u64) -> TaskContext {
     TaskContext {
         scheduling_context: scheduling_context::SchedulingContext::bind(slot, id),
-        saved_rsp: 0,
-        test_ready: true,
-        ready_since_ticks: 0,
-        blocked: false,
-        blocked_since_ticks: 0,
-        wake_armed: false,
-        block_reason: BlockReason::None,
-        weight: NICE_0_LOAD,
-        vruntime_ns: 0,
-        exec_start_ticks: 0,
-        address_space_root: 0,
-        kernel_stack_base: 0,
-        kernel_stack_top: 0,
-        alternate_kernel_stack_base: 0,
-        alternate_kernel_stack_top: 0,
-        user_mode: true,
+        saved_rsp: 0,        address_space_root: 0,        user_mode: true,
         user_abi: Some(UserAbi::Linux),
         console_session: ConsoleSessionHandle::SYSTEM,
         process_handle: None,

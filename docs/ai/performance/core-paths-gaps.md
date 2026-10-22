@@ -31,20 +31,26 @@
 
 ## C. SMP 배치
 
-`runqueue_policy::affinity_target_cpu`: 마지막 CPU 또는 `slot % online` 잔여로 선호 CPU를
-정하고 큐 길이가 2 이상 차이날 때만 least-loaded로 바꾼다.
-idle CPU 우선, SMT/LLC 토폴로지(CPUID 0xB/0x1F), wake_affine, CPU 용량 고려가 없다.
-`least_loaded_cpu`도 큐 길이(`published_load`)만 본다. 설계 참고: Zircon CPU 선택 사다리,
-Linux `select_idle_sibling`/`wake_affine`.
+완료(idle 인지): `runqueue_policy::affinity_target_cpu`는 선호 CPU(마지막 CPU 또는
+`slot % online`)가 idle이 아니면 큐와 mailbox가 비고 current 슬롯이 idle인 온라인 CPU를
+`idle_eligible_cpu`/`first_idle_after`로 먼저 찾고, 없을 때만 큐 길이 2 이상 차이로
+least-loaded를 고른다. 단위 witness:
+`idle_cpu_search_wraps_skips_ineligible_and_never_returns_the_preferred_cpu`.
+남은 것(후속, 정확성 위험 아님): SMT/LLC 토폴로지(CPUID 0xB/0x1F) 계층, wake_affine, CPU 용량.
+설계 참고: Zircon CPU 선택 사다리, Linux `select_idle_sibling`/`wake_affine`.
 
 ## D. 정리 대상
 
-- kernel-ps/compat/executive/hal/mm 컴파일 경고 169건(미사용 함수 91, 메서드 약 30,
-  enum 6, const 6, 미사용 import 약 20). 모델 고정용 코드와 실제 죽은 코드를 구분해 삭제.
-- 문서 불일치 정리 중: 진행표/핸드오프의 과거 실패를 현재 결과와 구분한다.
-  `formal/rust-large-files.tsv`의 숫자는 실측 행수가 아니라 허용 부채 상한이다.
-  현재 등록 파일 중 600행 이하가 되어 삭제할 stale 행은 없다. 선행 변경에서
-  상한을 넘은 파일은 경고로 남으며, 검증을 조용하게 하려고 상한을 올리지 않는다.
+완료(2026-10-22): 두 실제 구성(부팅 이미지 `--cfg rustos_boot_image`, `cargo test` 단위)에서
+kernel-ps/compat/executive/hal/mm/nucleus-core/io-manager 경고 0. 호스트 비테스트 빌드는
+실제 구성이 아니므로 기준에서 제외한다. 양 구성에서 죽은 항목은 삭제했고, 한쪽에서만
+쓰이는 항목은 `#[cfg(test)]`/`#[cfg(not(test))]`로 구성을 명시했다. 구성별로 생성 지점이
+다른 진단 코드표(`LockPhase`, `ImageRefusal`)만 `DIAGNOSTIC:` 근거로 `allow(dead_code)`를 둔다.
+삭제로 필요 없어진 SMP 소스 핀, 변이 행(`run_authority` 구 비교 3행, 앵커 개수 조정)은 함께
+정리했다. 테스트 전용으로 남은 local-dispatch 정책 함수(`choose_local_next` 등)는
+독립 dispatch 소스 계약의 witness이며 운영 경로가 아니다.
+- `formal/rust-large-files.tsv`의 숫자는 실측 행수가 아니라 허용 부채 상한이다.
+  선행 변경에서 상한을 넘은 파일은 경고로 남으며, 검증을 조용하게 하려고 상한을 올리지 않는다.
 
 ## E. 현재 수집 상태 (2026-10-22 안정화 진행 중)
 

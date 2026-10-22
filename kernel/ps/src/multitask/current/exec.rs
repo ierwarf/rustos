@@ -23,8 +23,6 @@ pub fn exec_current_user_process(
         return None;
     };
     assert!(current, "self exec lost own-CPU current scope");
-    let slot = intent.slot();
-    let task_id = intent.task_id();
     let Some(census) =
         super::super::process_placement::exec_membership::ExecMembership::begin(&intent)
     else {

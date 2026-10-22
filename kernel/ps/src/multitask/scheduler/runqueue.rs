@@ -30,14 +30,16 @@ use super::{frame_publication, MAX_TASK};
 use validation::{bitmap_location, validate_cpu};
 
 mod admission;
-pub(super) use admission::{admit_blocked, admit_initial, admit_running};
+pub(super) use admission::{admit_blocked, admit_initial};
+#[cfg(test)]
+pub(super) use admission::{admit_running};
 pub(super) mod address_space;
 pub(super) mod affinity_payload;
 pub(super) mod claim;
 mod return_publication;
-pub(super) use claim::{
-    claim_dispatch, claim_dispatch_with_owner_generation, claim_validated_dispatch,
-};
+pub(super) use claim::{claim_validated_dispatch};
+#[cfg(test)]
+pub(super) use claim::{claim_dispatch, claim_dispatch_with_owner_generation};
 pub(super) use return_publication::{publish_return, ReturnPublication};
 #[cfg(test)]
 pub(super) use return_publication::{test_blocked_return, test_running_claim};
@@ -53,12 +55,10 @@ pub(super) mod weight;
 
 #[cfg(test)]
 use ipc_handoff::publish_migrating_record;
-pub(super) use ipc_handoff::{
-    claim_blocked_handoff, drain_remote_wakes, materialize_direct_handoff,
-    materialize_direct_handoff_with_generation, publish_direct_handoff, publish_handoff_mailbox,
-    publish_local_wake, publish_remote_wake, rehome_queued, rehome_queued_frame,
-    rehome_queued_owned, rollback_direct_handoff, RemoteWakeOutcome,
-};
+pub(super) use ipc_handoff::{claim_blocked_handoff, drain_remote_wakes, materialize_direct_handoff_with_generation, publish_handoff_mailbox, publish_local_wake, publish_remote_wake, rehome_queued_frame, rehome_queued_owned, RemoteWakeOutcome};
+#[cfg(test)]
+#[cfg(test)]
+pub(super) use ipc_handoff::{materialize_direct_handoff, publish_direct_handoff, rehome_queued, rollback_direct_handoff};
 
 mod lane;
 pub(super) use lane::lane_cas;
@@ -981,6 +981,7 @@ pub(super) fn wait_blocked(owner: RunOwnerSnapshot) -> bool {
             ))
 }
 
+#[cfg(test)]
 pub(super) fn publish_local(slot: usize, cpu: usize, weight: u32) {
     validate_cpu(cpu);
     let owner = owner(slot);
@@ -1007,6 +1008,7 @@ pub(super) fn publish_local(slot: usize, cpu: usize, weight: u32) {
     RUN_QUEUES[cpu].publish_load(&rq);
 }
 
+#[cfg(test)]
 pub(super) fn publish_blocked(slot: usize, cpu: usize, weight: u32) {
     validate_cpu(cpu);
     let owner = owner(slot);

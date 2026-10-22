@@ -83,6 +83,7 @@ impl CurrentWait {
             && !runqueue::wait::blocked(slot)
             && runqueue::wait::reason(slot) == (runqueue::wait::REASON_ENDPOINT_REPLY, reply)
     }
+    #[cfg(test)]
     pub(in crate::multitask) fn arm(&self, reason: BlockReason) -> bool {
         let armed = CurrentSlot { slot: self.slot() }.arm(reason);
         if armed {
@@ -92,6 +93,7 @@ impl CurrentWait {
         }
         armed
     }
+    #[cfg(test)]
     pub(in crate::multitask) fn cancel(&self) -> bool {
         let cancelled = CurrentSlot { slot: self.slot() }.cancel();
         if cancelled {

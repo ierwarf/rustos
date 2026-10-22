@@ -206,6 +206,7 @@ pub(super) fn register_root(handle: ProcessHandle, slot: usize, id: u64, mask: u
         Some(())
     })
 }
+#[cfg(test)]
 pub(super) fn unregister(handle: ProcessHandle, slot: usize, id: u64) {
     let Some(cell) = cell(handle) else {
         return;
@@ -291,6 +292,7 @@ impl Change {
             _process: process,
         })
     }
+    #[cfg(test)]
     pub(super) fn members(&self) -> &[Member] {
         &self.members[..self.len]
     }

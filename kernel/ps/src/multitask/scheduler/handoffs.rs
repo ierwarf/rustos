@@ -10,6 +10,7 @@
 
 /// Absence is unknown, never a catalog grant. Remaining cold catalog users
 /// consume only this observation; FIFO selection has no Scheduler authority.
+#[cfg(test)]
 pub(super) fn published_handoff_lifecycle(
     publication: Option<crate::multitask::current_identity::DispatchPublication>,
 ) -> Option<bool> {

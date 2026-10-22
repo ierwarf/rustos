@@ -25,6 +25,7 @@ impl FrameSnapshot {
         Self { saved, all_zero }
     }
 }
+#[cfg(test)]
 fn same_observation(
     left: frame_publication::StableFrameToken,
     right: frame_publication::StableFrameToken,
@@ -39,6 +40,7 @@ fn same_observation(
 /// Non-executing claim exclusion is acquired with the allocation pin. Executing
 /// Current/Prepared byte stability is IRQ-stabilized here; borrowed alternate
 /// boot backing still relies on its external architecture lifetime owner.
+#[cfg(test)]
 pub(super) unsafe fn observe(
     slot: usize,
     cpu: usize,
@@ -54,6 +56,7 @@ pub(super) unsafe fn observe(
         observe_inner(slot, cpu, saved_rsp, executing)
     }
 }
+#[cfg(test)]
 unsafe fn observe_inner(
     slot: usize,
     cpu: usize,

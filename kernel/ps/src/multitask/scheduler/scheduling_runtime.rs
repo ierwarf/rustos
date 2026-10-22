@@ -27,10 +27,12 @@ use nucleus_core::util::lockdep::{LockClass, MAX_TRACKED_CPUS};
 use crate::multitask::irq_leaf::IrqLeaf;
 
 use super::super::current_identity::PagerChargeStamp;
+#[cfg(test)]
+use super::scheduling_context::BudgetSnapshot;
 use super::MAX_TASK;
 use super::scheduling_context::MAX_SCHEDULING_DOMAINS;
 use super::scheduling_context::{
-    BudgetCounterScope, BudgetSnapshot, BudgetState, ChargeOutcome, SchedulingContextPolicy,
+    BudgetCounterScope, BudgetState, ChargeOutcome, SchedulingContextPolicy,
 };
 
 #[derive(Clone, Copy)]
@@ -127,6 +129,7 @@ pub(super) fn release(slot: usize, identity: ObjectIdentity) {
     }
 }
 
+#[cfg(test)]
 fn budget_for(
     slot: usize,
     identity: ObjectIdentity,
@@ -143,53 +146,10 @@ fn budget_for(
     (runtime.live_identity == Some(identity) && runtime.policy == Some(policy)).then_some(runtime)
 }
 
-pub(super) fn is_eligible(
-    slot: usize,
-    identity: ObjectIdentity,
-    policy: SchedulingContextPolicy,
-    now_ns: u64,
-) -> bool {
-    budget_for(slot, identity, policy)
-        .filter(|runtime| !runtime.closing)
-        .and_then(|runtime| runtime.budget)
-        .is_some_and(|budget| budget.is_eligible(now_ns))
-}
 
-pub(super) fn prepare_dispatch(
-    slot: usize,
-    identity: ObjectIdentity,
-    policy: SchedulingContextPolicy,
-    now_ns: u64,
-) -> bool {
-    let Some(mut runtime) = budget_for(slot, identity, policy) else {
-        return false;
-    };
-    if runtime.closing {
-        return false;
-    }
-    runtime
-        .budget
-        .as_mut()
-        .is_some_and(|budget| budget.replenish(now_ns) && budget.available())
-}
+
 
 #[cfg(test)]
-pub(super) fn record_timeout_fault(
-    slot: usize,
-    identity: ObjectIdentity,
-    policy: SchedulingContextPolicy,
-    reply: u64,
-) -> bool {
-    let Some(mut runtime) = budget_for(slot, identity, policy) else {
-        return false;
-    };
-    let Some(budget) = runtime.budget.as_mut() else {
-        return false;
-    };
-    budget.record_timeout_fault(reply);
-    true
-}
-
 pub(super) fn runtime_snapshot(
     slot: usize,
     identity: ObjectIdentity,
@@ -230,6 +190,7 @@ impl DomainBudgetRuntime {
 
     /// Whole-domain ledger: monotonic counters and credit summed over every
     /// CPU bank, earliest pending refill across banks.
+    #[cfg(test)]
     fn aggregate_snapshot(&self) -> Option<BudgetSnapshot> {
         let mut total = BudgetSnapshot::default();
         for bank in self.banks.as_ref()? {
@@ -421,6 +382,7 @@ pub(super) fn domain_descriptor(
     super::scheduling_context::SchedulingDomainState::admitted(policy, runtime.generation)
 }
 
+#[cfg(test)]
 pub(super) fn domain_matches(
     slot: usize,
     generation: u32,
@@ -449,6 +411,7 @@ fn domain_budget_for(
     (runtime.generation == generation && runtime.policy == Some(policy)).then_some(runtime)
 }
 
+#[cfg(test)]
 pub(super) fn domain_is_eligible(
     slot: usize,
     generation: u32,
@@ -715,6 +678,7 @@ pub(super) fn published_stamp_admission(
 /// Validates a lock-free identity stamp against the exact live context and
 /// domain budget cells. The lock order is Context -> Domain, matching charge
 /// and dispatch preparation; any reused generation or policy fails closed.
+#[cfg(test)]
 pub(super) fn published_stamp_is_eligible(
     stamp: PagerChargeStamp,
     cpu: usize,
@@ -753,6 +717,7 @@ pub(super) fn prepare_published_stamp_dispatch_status(
     .unwrap_or(PublishedDispatchPreparation::Invalid)
 }
 
+#[cfg(test)]
 pub(super) fn prepare_published_stamp_dispatch(
     stamp: PagerChargeStamp,
     cpu: usize,
@@ -762,6 +727,7 @@ pub(super) fn prepare_published_stamp_dispatch(
         == PublishedDispatchPreparation::Ready
 }
 
+#[cfg(test)]
 pub(super) fn charge_domain_runtime(
     slot: usize,
     generation: u32,
@@ -939,6 +905,7 @@ pub(super) fn observe_current_funding(
     })
 }
 
+#[cfg(test)]
 pub(super) fn domain_snapshot(
     slot: usize,
     generation: u32,

@@ -315,6 +315,7 @@ pub(in crate::multitask) struct ExitMembership {
     queued_reason: Option<(u64, Reason)>,
 }
 impl ExitMembership {
+    #[cfg(test)]
     pub(in crate::multitask) fn begin(handle: ProcessHandle, target: Member) -> Option<Self> {
         let process = process_table::pin_owner::pin(handle)?;
         let (nonce, members, len) = cell(handle)?.with(|s| {

@@ -53,6 +53,7 @@ impl Activation {
             cohort,
         })
     }
+    #[cfg(test)]
     pub(super) fn commit_owned(
         self,
         turn: &nucleus_core::util::lockdep::DispatchPreemption,

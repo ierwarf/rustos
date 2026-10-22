@@ -164,6 +164,7 @@ pub(super) fn initialize_reserved_storage(
     })
 }
 
+#[cfg(test)]
 pub(in crate::multitask::scheduler) fn with_unpublished<R>(
     slot: usize,
     f: impl FnOnce(&FrameWriter) -> R,
@@ -175,6 +176,7 @@ pub(in crate::multitask::scheduler) fn with_unpublished<R>(
     })
 }
 
+#[cfg(test)]
 pub(super) fn initialize_storage(slot: usize, f: impl FnOnce(&mut [u8])) {
     irq_excluded(|| {
         let mut writer = FrameWriter::acquire(slot, None, false, None, None)

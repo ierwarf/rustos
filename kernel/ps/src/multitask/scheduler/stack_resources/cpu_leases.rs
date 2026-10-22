@@ -85,6 +85,7 @@ impl CpuLeases {
         self.current.load(Ordering::Acquire) == slot + 1
     }
 
+    #[cfg(test)]
     fn commit(&self) {
         // Called only after assembly installed incoming RSP. StackPin::drop
         // is one lock-free decrement and optional reaper notification.
@@ -169,6 +170,7 @@ pub(in crate::multitask::scheduler) fn pin_initial(slot: usize, task_id: u64) ->
     acquired.then(|| StackPin { slot })
 }
 
+#[cfg(not(test))]
 pub(in crate::multitask) fn initialize(image: &super::super::bootstrap::InitialCpu<'_>) {
     image.assert_publication();
     let cpu = image.cpu();
@@ -270,6 +272,7 @@ pub(in crate::multitask::scheduler) fn simd_reset_custody(slot: usize) -> Option
     None
 }
 
+#[cfg(test)]
 pub(in crate::multitask) fn commit(cpu: usize) {
     CPU_LEASES[cpu].commit();
 }

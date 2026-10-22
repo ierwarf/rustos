@@ -32,7 +32,7 @@ impl PlacementGrant {
         self.task_id.is_none()
             || !current_identity::execution::banks::owns_execution(self.cpu, self.slot)
     }
-    pub(in crate::multitask) fn bind_claimed(&mut self, owner: runqueue::RunOwnerSnapshot) {
+    pub(in crate::multitask::scheduler) fn bind_claimed(&mut self, owner: runqueue::RunOwnerSnapshot) {
         assert!(
             self.owner.is_none()
                 && owner.state == RunOwnerState::Running
@@ -101,6 +101,7 @@ impl PlacementGrant {
     }
 }
 
+#[cfg(test)]
 pub(in crate::multitask) fn capture_architecture(slot: usize, cpu: usize) -> bool {
     if cpu_local::has_placement(cpu, slot) {
         return true;

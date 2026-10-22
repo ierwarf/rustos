@@ -324,6 +324,7 @@ pub(super) struct SyncHandoffState {
     head: usize,
     len: usize,
     handoff_streak: u8,
+    #[cfg(test)]
     last_handoff_tick: u64,
 }
 
@@ -334,10 +335,12 @@ impl SyncHandoffState {
             head: 0,
             len: 0,
             handoff_streak: 0,
+            #[cfg(test)]
             last_handoff_tick: 0,
         }
     }
 
+    #[cfg(test)]
     pub(super) fn enqueue(&mut self, record: SyncHandoffRecord) -> bool {
         self.enqueue_with_direct_owner(record, None)
     }
@@ -385,6 +388,7 @@ impl SyncHandoffState {
         true
     }
 
+    #[cfg(test)]
     pub(super) fn take_next_ready(
         &mut self,
         ready: impl FnMut(SyncHandoffRecord) -> bool,
@@ -392,6 +396,7 @@ impl SyncHandoffState {
         self.take_next_ready_with_competitor(true, ready)
     }
 
+    #[cfg(test)]
     pub(super) fn take_next_ready_with_competitor(
         &mut self,
         fair_competitor_ready: bool,
@@ -440,6 +445,7 @@ impl SyncHandoffState {
         None
     }
 
+    #[cfg(test)]
     pub(super) fn record_dispatch(&mut self, synchronous_handoff: bool, now_ticks: u64) {
         if !synchronous_handoff {
             self.handoff_streak = 0;

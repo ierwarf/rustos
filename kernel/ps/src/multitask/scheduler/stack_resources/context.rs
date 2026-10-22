@@ -218,6 +218,7 @@ pub(in crate::multitask::scheduler) fn test_mismatched_context<R>(
     f()
 }
 
+#[cfg(test)]
 pub(in crate::multitask::scheduler) fn install(slot: usize, context: TaskContext) {
     install_with_reservation(slot, context, None)
 }
@@ -304,11 +305,13 @@ pub(in crate::multitask::scheduler) fn replace_exec_mm(
 /// The CPU turn separately owns IRQ/preemption. This pin linearizes fresh
 /// acquisition against MM close, but does not replace cold exec/quiescence
 /// arbitration for the complete claim/activation/CPU-publication transaction.
+#[cfg(test)]
 pub(in crate::multitask::scheduler) struct ExecutionRootLease {
     root: u64,
     _pin: Option<crate::multitask::process_table::MmExecutionPin>,
     _cpu_affinity: core::marker::PhantomData<*mut ()>,
 }
+#[cfg(test)]
 impl ExecutionRootLease {
     pub(in crate::multitask::scheduler) fn root(&self) -> u64 {
         self.root
@@ -322,6 +325,7 @@ pub(in crate::multitask::scheduler) fn lease_execution_root(
 ) -> Option<ExecutionRootLease> {
     lease_root_inner(slot, root, cpu, false)
 }
+#[cfg(test)]
 pub(in crate::multitask::scheduler) fn lease_for_architecture(
     slot: usize,
     root: u64,
@@ -329,6 +333,7 @@ pub(in crate::multitask::scheduler) fn lease_for_architecture(
 ) -> Option<ExecutionRootLease> {
     lease_root_inner(slot, root, cpu, true)
 }
+#[cfg(test)]
 fn lease_root_inner(
     slot: usize,
     root: u64,

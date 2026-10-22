@@ -1413,7 +1413,7 @@ fn syscall_linux_rustos_ipc_call_with_timeout(
         reply.raw()
     );
     let send_ticks = crate::arch::rtc::ticks();
-    cycle_mark = charge_phase(IpcCallPhase::Enqueue, cycle_mark);
+    let _ = charge_phase(IpcCallPhase::Enqueue, cycle_mark);
     ipc_trace!("ipc call waiting: endpoint={}", endpoint.raw());
     let response =
         match wait_for_service_reply_with_deadline_tick(reply, reply_deadline, timeout_ms) {

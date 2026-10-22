@@ -43,6 +43,7 @@ pub struct ProcessIdentity {
 }
 
 impl ProcessIdentity {
+    #[cfg(test)]
     pub(in crate::multitask) const fn from_parts(
         process_id: u64,
         process_generation: u32,
@@ -303,6 +304,7 @@ impl ProcessRef {
     }
 
     #[track_caller]
+    #[cfg(test)]
     pub fn with_state<R>(&self, f: impl FnOnce(u64, &UserProcessState) -> R) -> R {
         let site = core::panic::Location::caller();
         let state = self
@@ -363,6 +365,7 @@ impl ProcessRef {
         process_state_is_visible(self.handle).then(|| f(self.process_id, &mut state))
     }
 
+    #[cfg(test)]
     pub fn try_with_state_mut<R>(
         &self,
         f: impl FnOnce(u64, &mut UserProcessState) -> R,

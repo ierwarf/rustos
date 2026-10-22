@@ -203,6 +203,7 @@ pub(crate) unsafe fn save_simd_state_lane(slot: usize, task_id: u64) {
 /// # Safety
 /// As [`save_simd_state_lane`].
 #[inline]
+#[cfg(not(test))]
 pub(crate) unsafe fn restore_simd_state_lane(slot: usize, task_id: u64) {
     // SAFETY: caller contract; the bank excludes every other accessor.
     let image = unsafe { &mut *SIMD_STATES[slot].image.get() };

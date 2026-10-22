@@ -26,6 +26,7 @@ pub(in crate::multitask::scheduler) struct Reuse {
     key: Key,
     live: bool,
 }
+#[cfg(test)]
 pub(in crate::multitask::scheduler) fn begin(slot: usize, id: Option<u64>) -> Option<Reuse> {
     begin_qualified(slot, id, false)
 }

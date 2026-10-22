@@ -357,9 +357,8 @@ rg -Fq 'runqueue::weight::replace(pin.slot(), (weight & LOAD_WEIGHT_MASK).min(NI
 }
 scheduler_context=$(sed -n '/^struct TaskContext {/,/^}/p' kernel/ps/src/multitask/scheduler.rs)
 for field in ready_since_ticks blocked blocked_since_ticks; do
-    if ! grep -E -B1 "^[[:space:]]+$field:" <<<"$scheduler_context" \
-        | grep -Fq '#[cfg(test)]'; then
-        echo "scheduler wait payload returned to the global production TaskContext: $field" >&2
+    if grep -Eq "^[[:space:]]+$field:" <<<"$scheduler_context"; then
+        echo "scheduler wait payload returned to the global TaskContext: $field" >&2
         exit 1
     fi
 done

@@ -93,9 +93,11 @@ pub(in crate::multitask) use runtime_profile::{
     SchedulerEntryCause, publish_scheduler_runtime_profile,
 };
 pub(super) use task_weight::{
-    LOAD_WEIGHT_MASK, MIN_LOAD_WEIGHT, NICE_0_LOAD,
+    LOAD_WEIGHT_MASK, NICE_0_LOAD,
     SYSTEM_CLASS_WEIGHT_FLAG,
 };
+#[cfg(test)]
+pub(super) use task_weight::MIN_LOAD_WEIGHT;
 
 pub(in crate::multitask) fn local_dispatch_work_pending(cpu: usize) -> bool {
     // A direct synchronous handoff deliberately has no fair-runqueue entry.
@@ -133,23 +135,20 @@ pub(in crate::multitask) mod irq_entry_tests;
 pub(in crate::multitask) mod thread_creation;
 mod thread_slots;
 
-use alloc::vec::Vec;
 #[cfg(test)]
-use core::sync::atomic::Ordering;
+use alloc::vec::Vec;
 use core::{mem, ptr};
 
 use x86_64::VirtAddr;
 
 use kernel_object::api::identity::ObjectIdentity;
 
-#[cfg(test)]
-use crate::arch::simd::SimdState;
 use crate::io::session::ConsoleSessionHandle;
 use crate::memory::paging::ProcessAddressSpace;
 use crate::user::abi::UserAbi;
 use crate::user::linux::LinuxThreadState;
 use crate::user::process;
-use crate::user::process_state::{UserProcessState, WindowsThreadRuntimeState};
+use crate::user::process_state::UserProcessState;
 
 use super::context::{SAVED_CONTEXT_BYTES, SavedContext};
 use super::current_identity::{self, PagerChargeStamp, TaskIdentity};
@@ -161,8 +160,7 @@ use context_validation::{
 use handoff_queue::SlotHandoffQueue;
 pub(super) use linux_thread_state::CurrentLinuxThreadBinding;
 #[cfg(test)]
-use linux_thread_state::{LinuxThreadStateLock, empty_linux_thread_state_lock};
-use reclaim::{RetiredSlotReclaim, RetirementSideEffect};
+use reclaim::RetirementSideEffect;
 use runtime_profile::SchedulerPhase;
 use sync_handoff::ReplyWakeHandoff;
 
@@ -216,46 +214,7 @@ pub(in crate::multitask) fn cancel_reply_donation_reservation(donor_task_id: u64
     donation_ledger::cancel_reservation(donor_task_id)
 }
 
-/// A host-test set of task slots held in one machine word pair.
-///
-/// Native bitmap algebra witnesses only. Dispatch class publication does not
-/// recurse through donation topology or use this test utility.
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub(super) struct SlotSet(u128);
 
-/// One bit per slot, so the table may not outgrow the word.
-#[cfg(test)]
-const _: () = assert!(MAX_TASK <= u128::BITS as usize);
-
-#[cfg(test)]
-impl SlotSet {
-    pub(super) const EMPTY: Self = Self(0);
-
-    /// Rejects an out-of-range slot rather than wrapping it onto another
-    /// member, which is what the array this replaced did by panicking on the
-    /// index.
-    #[inline]
-    fn bit(slot: usize) -> u128 {
-        assert!(slot < MAX_TASK, "slot set index exceeds capacity");
-        1_u128 << slot
-    }
-
-    #[inline]
-    pub(super) fn contains(&self, slot: usize) -> bool {
-        self.0 & Self::bit(slot) != 0
-    }
-
-    #[inline]
-    pub(super) fn insert(&mut self, slot: usize) {
-        self.0 |= Self::bit(slot);
-    }
-
-    #[inline]
-    pub(super) fn remove(&mut self, slot: usize) {
-        self.0 &= !Self::bit(slot);
-    }
-}
 
 const _: () = assert!(MAX_TASK.is_power_of_two() && MAX_TASK < u8::MAX as usize);
 const _: () = assert!(kernel_ipc_runtime::api::MAX_ENDPOINT_WAKE_TASKS >= MAX_TASK);
@@ -384,15 +343,7 @@ enum SchedClass {
 }
 
 impl SchedClass {
-    const COUNT: usize = 3;
 
-    const fn index(self) -> usize {
-        match self {
-            Self::System => 0,
-            Self::User => 1,
-            Self::Idle => 2,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -432,54 +383,9 @@ struct TaskContext {
     /// Host-test fixture for the production per-slot saved-frame pointer.
     #[cfg(test)]
     saved_rsp: usize,
-    #[cfg(test)]
-    test_ready: bool,
-    /// Host-test mirrors for the production owner-generation-bound wait state.
-    #[cfg(test)]
-    ready_since_ticks: u64,
-    #[cfg(test)]
-    blocked: bool,
-    #[cfg(test)]
-    blocked_since_ticks: u64,
-    /// Host-test fixture for the production per-slot race-free sleep/wake arm.
-    /// Set by `arm_block_current_task`;
-    /// cleared by `wake_task` and `commit_block_current_task`. A wake delivered
-    /// while the task is still running clears the flag, so the subsequent
-    /// `commit_block_current_task` observes that a wake raced and refuses to
-    /// block. Mirrors Linux's `prepare_to_wait` / `set_current_state` pattern.
-    #[cfg(test)]
-    wake_armed: bool,
-    /// Exact condition authorized by the current wait epoch. Endpoint receive
-    /// identity is required before a sender may bypass ordinary wake/runqueue
-    /// publication; every other sleeper remains deliberately generic.
-    #[cfg(test)]
-    block_reason: BlockReason,
-    /// CFS-like load weight. Bigger weight -> larger CPU share. Derived from
-    /// the task's `weight_micros` / pit_divisor at allocation time.
-    #[cfg(test)]
-    weight: u32,
-    /// Virtual runtime in nanoseconds, scaled by NICE_0_LOAD/weight. The task
-    /// with the smallest vruntime among the ready set is picked next.
-    #[cfg(test)]
-    vruntime_ns: u64,
-    /// Test fixture for the per-slot execution baseline. Production storage
-    /// is in `runqueue`, so runtime accounting does not require a task-catalog
-    /// read. Zero means the task is not currently charging an interval.
-    #[cfg(test)]
-    exec_start_ticks: u64,
     /// Host-test fixture for the production per-slot address-space root.
     #[cfg(test)]
     address_space_root: u64,
-    /// Host-test mirrors for production per-slot primary stack geometry.
-    #[cfg(test)]
-    kernel_stack_base: u64,
-    #[cfg(test)]
-    kernel_stack_top: u64,
-    /// Host-test mirror for the production versioned alternate-stack record.
-    #[cfg(test)]
-    alternate_kernel_stack_base: u64,
-    #[cfg(test)]
-    alternate_kernel_stack_top: u64,
     user_mode: bool,
     user_abi: Option<UserAbi>,
     console_session: ConsoleSessionHandle,
@@ -554,14 +460,12 @@ impl SchedulerDispatch {
         self.previous_slot != self.next_slot
     }
 
-    const fn next_slot(self) -> usize {
-        self.next_slot
-    }
 
     /// A task switch only requires a CR3 activation when it also crosses an
     /// address-space boundary. Threads in one process still need their TSS,
     /// syscall-stack, and TLS state restored, but replaying the same CR3 is a
     /// serializing TLB operation on every synchronous IPC handoff.
+    #[cfg(test)]
     const fn requires_address_space_restore(
         self,
         previous_address_space_root: u64,
@@ -633,6 +537,7 @@ fn saved_context_rip(saved_rsp: usize) -> Option<u64> {
     Some(unsafe { (*context).rip })
 }
 
+#[cfg(test)]
 fn should_validate_published_ready_frame(
     slot: usize,
     current_slot: usize,
@@ -644,6 +549,7 @@ fn should_validate_published_ready_frame(
     slot != current_slot && !retired && !start_suspended && ready && !blocked
 }
 
+#[cfg(test)]
 fn published_frame_is_stable(slot: usize, current_slot: usize, running: bool) -> bool {
     slot != current_slot && !running
 }

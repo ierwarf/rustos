@@ -6,11 +6,10 @@
 //! fallback rather than dispatching a catalog-only peer.
 
 use super::LocalFallbackReason;
-#[cfg(not(test))]
-use super::{current_can_keep_running, runqueue};
 
 const MAX_LOCAL_FAIR_OBSERVATIONS: usize = 4;
 
+#[cfg(test)]
 pub(in crate::multitask::scheduler) fn retry_incomplete_fair(
     mut observe: impl FnMut() -> Result<Option<(usize, u64)>, LocalFallbackReason>,
 ) -> Option<(usize, u64)> {
@@ -26,6 +25,7 @@ pub(in crate::multitask::scheduler) fn retry_incomplete_fair(
 
 /// A one-shot Local hint can carry only complete published admission. A
 /// missing generation has no catalog alternative and stays with fair custody.
+#[cfg(test)]
 pub(in crate::multitask::scheduler) fn complete_hint_generation(
     qualification: Result<Option<u64>, LocalFallbackReason>,
 ) -> Option<u64> {
@@ -51,40 +51,7 @@ pub(in crate::multitask::scheduler) fn retry_incomplete_policy<T>(
     Err(LocalFallbackReason::CustodyUnavailable) // unresolved earlier class
 }
 
-/// An unresolved earlier class decision must not fall through to later
-/// hints or ordinary fair selection. Keep a qualified current Local owner,
-/// otherwise the exact published idle owner; absence goes to the guarded
-/// idle fallback, not a catalog-selected peer.
-#[cfg(not(test))]
-pub(in crate::multitask::scheduler) fn incomplete_policy_fallback(
-    current_slot: usize,
-    cpu: usize,
-    idle_slot: usize,
-) -> Option<(usize, u64)> {
-    let now_ns = crate::arch::clock::monotonic_nanos();
-    current_after_incomplete(current_slot, cpu, now_ns).or_else(|| {
-        let generation = super::empty_fair_idle_generation(runqueue::owner(idle_slot), cpu)?;
-        (super::idle_frame_generation(idle_slot, cpu, now_ns) == Ok(Some(generation)))
-            .then_some((idle_slot, generation))
-    })
-}
 
-/// An incomplete peer snapshot cannot displace a live current frame. The
-/// outgoing frame was already validated this turn; retain only its exact
-/// Local generation, never an unbound catalog-selected continuation.
-#[cfg(not(test))]
-pub(in crate::multitask::scheduler) fn current_after_incomplete(
-    slot: usize,
-    cpu: usize,
-    now_ns: u64,
-) -> Option<(usize, u64)> {
-    if !current_can_keep_running(slot, cpu, now_ns) {
-        return None;
-    }
-    let owner = runqueue::owner(slot);
-    (owner.state == runqueue::RunOwnerState::Local && owner.cpu == Some(cpu) && owner.runnable)
-        .then_some((slot, owner.generation))
-}
 
 #[cfg(test)]
 mod tests {

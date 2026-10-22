@@ -275,6 +275,7 @@ pub(super) fn publish_switching(
 
 /// Call trap entry. Binding/funding observations grant no execution: the actual
 /// dispatcher consumes this sole FIFO record and its original claim/interval.
+#[cfg(test)]
 pub(in crate::multitask) fn call(
     scope: &DispatchPreemption<'_>, endpoint: u64, reply: u64, receiver_id: u64,
 ) -> FastIpcCallHandoffOutcome {
@@ -292,6 +293,7 @@ pub(in crate::multitask) fn call_switching(
     call_published(scope, endpoint, reply, receiver_id, || {}, Some(switch))
 }
 
+#[cfg(test)]
 fn call_before_sender_commit(
     scope: &DispatchPreemption<'_>, endpoint: u64, reply: u64, receiver_id: u64,
     before_commit: impl FnOnce(),

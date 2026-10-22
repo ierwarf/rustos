@@ -1288,8 +1288,6 @@ tokens = [
     "latest.eligible_ns = latest.eligible_ns.max(refill.eligible_ns);",
     "let charged_ns = elapsed_ns.min(self.available_ns);",
     "self.available_ns -= charged_ns;",
-    "pub(super) fn prepare_dispatch(self, now_ns: u64)",
-    "super::scheduling_runtime::prepare_dispatch(",
 ]
 
 # Refinement boundary of SchedulerLocalAuthority: budget preparation precedes
@@ -1611,10 +1609,6 @@ tokens = [
     "Ok(choice) => return choice,",
     "Err(LocalFallbackReason::NoLocalCandidate) => return None,",
     "Err(_) => continue,",
-    "pub(in crate::multitask::scheduler) fn current_after_incomplete(",
-    "if !current_can_keep_running(slot, cpu, now_ns) {",
-    "owner.state == runqueue::RunOwnerState::Local",
-    ".then_some((slot, owner.generation))",
 ]
 
 [[required_sequences]]
@@ -2064,9 +2058,6 @@ tokens = ["struct Candidate { slot: usize, id: u64, generation: u64, custody: Fr
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/local_dispatch.rs"
 tokens = [
-    "pub(super) fn idle_frame_generation(",
-    "if !runqueue::is_idle_slot(slot) {",
-    "candidate_is_qualified(slot, cpu, now_ns)",
     "pub(super) fn qualified_catalog_idle_generation(",
     "prior_generation.is_some() || slot == current_slot || target_idle_slot != Some(slot)",
     "qualify().ok().flatten()",
@@ -2176,15 +2167,6 @@ tokens = [
     "OWNER_WORDS[slot].compare_exchange(observed, next)",
     "rq.remove(slot, weight)",
     "frame_publication::bind_local_owner_generation(slot, next.generation)",
-]
-
-[[required_sequences]]
-path = "kernel/ps/src/multitask/scheduler/local_dispatch.rs"
-tokens = [
-    "pub(super) fn qualified_direct_handoff_generation(",
-    "if runqueue::is_idle_slot(slot) && super::smp::idle_slot_for_cpu(cpu) != Some(slot) {",
-    "if !published_candidate_admission(slot, cpu, now_ns)? {",
-    "direct_handoff_frame_generation(slot, cpu).map(Some)",
 ]
 
 [[required_sequences]]
@@ -3408,9 +3390,6 @@ tokens = ["fn preemption(&self)", "self.turn().preemption()"]
 [[required_sequences]]
 path = "kernel/ps/src/multitask/irq.rs"
 tokens = ["fn software_schedule_interrupt_dispatch(", "DispatchEntry::enter()", "entry.save_simd()", "ipc_publication::reply_switching(", "entry.preemption()", "reply,", "caller_task_id,"]
-[[required_sequences]]
-path = "kernel/ps/src/multitask/scheduler/wake_publication.rs"
-tokens = ["fn reply_scoped(", "preemption: &nucleus_core::util::lockdep::DispatchPreemption", "reply_with(", "preemption,", "reply,", "task_id,"]
 [[forbidden_patterns]]
 scope = "kernel/ps/src/multitask/scheduler*.rs"
 regex = 'fn complete_ipc_reply_wake_handoff'

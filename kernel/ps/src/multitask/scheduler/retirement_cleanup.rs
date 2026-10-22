@@ -310,6 +310,7 @@ impl CleanupCell {
             )
     }
 
+    #[cfg(test)]
     fn reset(&self) {
         let mut slot = self.state.lock();
         assert!(
@@ -353,25 +354,12 @@ pub(super) fn publish_terminal(
     mark_reap_pending();
 }
 
-#[cfg(test)]
-pub(super) fn defer(slot: usize, task_id: Option<u64>, reason: TaskRetireReason) {
-    CELLS[slot].defer(task_id, reason);
-    mark_reap_pending();
-}
 
 pub(super) fn deferred(slot: usize) -> Option<TaskRetireReason> {
     CELLS[slot].state.lock().deferred
 }
 
-#[cfg(test)]
-pub(super) fn take_deferred(slot: usize) -> Option<TaskRetireReason> {
-    CELLS[slot].take_deferred()
-}
 
-#[cfg(test)]
-pub(super) fn abort_empty_producer(slot: usize) {
-    CELLS[slot].abort_empty_producer();
-}
 
 pub(super) fn reason(slot: usize) -> Option<TaskRetireReason> {
     CELLS[slot].state.lock().reason
@@ -496,6 +484,7 @@ pub(super) fn test_consumer_publication(slot: usize) -> (bool, bool) {
 }
 
 /// Directory/reaper only, before any runtime, frame or slot identity teardown.
+#[cfg(test)]
 pub(super) fn reset(slot: usize) {
     CELLS[slot].reset();
 }

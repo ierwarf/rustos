@@ -217,6 +217,8 @@ fn spawn_user_process_state_inner(
             return Err(error);
         }
     };
+    #[cfg(not(rustos_lifecycle_trace))]
+    let _ = slot;
     // Repeated fork is a steady-state operation. Formatting/emitting a full
     // debugcon frame here costs more than COW creation under KVM; exact spawn
     // lifecycle evidence belongs to the opt-in diagnostic profile.

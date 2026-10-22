@@ -16,6 +16,7 @@
 //! spends it rather than inferring from the call graph.
 
 
+#[cfg(test)]
 pub(super) const SYSCALL_PHASE_COUNT: usize = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

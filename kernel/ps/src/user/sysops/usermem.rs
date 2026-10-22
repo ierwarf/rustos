@@ -103,7 +103,7 @@ pub fn copy_from_retained_user_and_validate_writes(
             for (write_ptr, write_len) in write_buffers.iter().copied() {
                 if write_len != 0 {
                     let write_start = user_virt_addr(write_ptr, write_len)?;
-                    address_space.validate_user_write_memo(write_start, write_len, &mut memo)?;
+                    let _ = address_space.validate_user_write_memo(write_start, write_len, &mut memo)?;
                 }
             }
             let read_start = user_virt_addr(read_ptr, dest.len())?;

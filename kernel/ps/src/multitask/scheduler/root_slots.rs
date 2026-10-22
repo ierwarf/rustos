@@ -54,6 +54,7 @@ pub(super) struct RootPublication {
     handle: crate::multitask::process_table::ProcessHandle,
 }
 impl RootPublication {
+    #[cfg(test)]
     pub(super) fn begin(
         handle: crate::multitask::process_table::ProcessHandle,
         ticket: Ticket,
@@ -127,6 +128,7 @@ impl RootPublication {
     pub(super) fn publish_start(&self, start: super::TaskStart) {
         self.ticket.publish_start(start);
     }
+    #[cfg(test)]
     pub(super) fn finish(self) {
         let _ = self.finish_inner(None);
     }
@@ -174,6 +176,7 @@ impl RootPublication {
     }
 }
 
+#[cfg(test)]
 pub(super) fn admit_blocked(ticket: Ticket) -> Result<(), Ticket> {
     if !ticket.is_committing() {
         return Err(ticket);

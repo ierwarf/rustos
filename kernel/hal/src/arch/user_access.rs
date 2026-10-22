@@ -143,7 +143,7 @@ static DIRECT_ENABLED: AtomicBool = AtomicBool::new(false);
 pub(crate) fn page_fault_entry_addr(original: u64) -> u64 {
     // ORDERING: Release; the IDT is loaded after this store on every CPU.
     PF_ORIGINAL.store(original, Ordering::Release);
-    rustos_page_fault_entry as usize as u64
+    rustos_page_fault_entry as *const () as usize as u64
 }
 
 /// Enable direct user access on every CPU that has CR0.WP set. The BSP calls

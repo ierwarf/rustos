@@ -1242,6 +1242,7 @@ pub(super) fn syscall_linux_rustos_proc_fork_broker(args_ptr: u64) -> u64 {
     fork::syscall_linux_rustos_proc_fork_broker(args_ptr)
 }
 
+#[cfg(test)]
 fn valid_process_fork_plan_locally(args: &RustosProcForkBrokerArgs) -> bool {
     fork::valid_process_fork_plan_locally(args)
 }

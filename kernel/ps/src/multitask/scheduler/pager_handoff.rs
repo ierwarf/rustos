@@ -20,7 +20,6 @@ pub enum PagerFaultHandoffOutcome {
     ReceiverMismatch,
     EligibilityUnavailable,
     DirectCustodyUnavailable,
-    OrderingUnavailable,
 }
 
 /// One-shot latency accounting, not a funding/class grant. Both ORIGINAL
@@ -63,7 +62,6 @@ fn retry_stranded_worker(
         Outcome::ReceiverMismatch
             | Outcome::EligibilityUnavailable
             | Outcome::DirectCustodyUnavailable
-            | Outcome::OrderingUnavailable
     ) && wake_retry::record_in(scope, worker_id, Some((runqueue::wait::REASON_PAGER_SERVICE, 0)))
 }
 

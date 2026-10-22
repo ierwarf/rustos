@@ -6,7 +6,7 @@
 //! Forbidden: these host witnesses do not prove full guard deletion or external process effects.
 //! Evidence: shared production Grant::capture/detach/finish_with, no catalog reclaim methods.
 use super::super::{
-    BlockReason, TaskStart, execution_image, reclaim::RetirementSideEffect, root_slots,
+    TaskStart, execution_image, reclaim::RetirementSideEffect, root_slots,
     scheduling_context,
 };
 use super::*;
@@ -16,22 +16,7 @@ const ID: u64 = 126011;
 fn context(slot: usize, id: u64) -> TaskContext {
     TaskContext {
         scheduling_context: scheduling_context::SchedulingContext::bind(slot, id),
-        saved_rsp: 0,
-        test_ready: false,
-        ready_since_ticks: 0,
-        blocked: true,
-        blocked_since_ticks: 0,
-        wake_armed: false,
-        block_reason: BlockReason::None,
-        weight: 100,
-        vruntime_ns: 0,
-        exec_start_ticks: 0,
-        address_space_root: 0,
-        kernel_stack_base: 0,
-        kernel_stack_top: 0,
-        alternate_kernel_stack_base: 0,
-        alternate_kernel_stack_top: 0,
-        user_mode: false,
+        saved_rsp: 0,        address_space_root: 0,        user_mode: false,
         user_abi: None,
         console_session: crate::io::session::ConsoleSessionHandle::SYSTEM,
         process_handle: None,

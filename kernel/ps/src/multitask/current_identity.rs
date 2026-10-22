@@ -76,10 +76,12 @@ impl DispatchPublication {
         self.dispatch_flags & DISPATCH_SUSPENDED != 0
     }
 
+    #[cfg(test)]
     pub(super) const fn job_stopped(self) -> bool {
         self.dispatch_flags & DISPATCH_JOB_STOPPED != 0
     }
 
+    #[cfg(test)]
     pub(super) const fn exec_quiesced(self) -> bool {
         self.dispatch_flags & DISPATCH_EXEC_QUIESCED != 0
     }

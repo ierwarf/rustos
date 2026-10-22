@@ -7,7 +7,6 @@ use super::BlockReason;
 #[inline]
 pub(super) fn encoded_reason(reason: BlockReason) -> (u8, u64) {
     match reason {
-        BlockReason::None => (runqueue::wait::REASON_NONE, 0),
         BlockReason::Generic => (runqueue::wait::REASON_GENERIC, 0),
         BlockReason::EndpointReceive(endpoint) => {
             (runqueue::wait::REASON_ENDPOINT_RECEIVE, endpoint)

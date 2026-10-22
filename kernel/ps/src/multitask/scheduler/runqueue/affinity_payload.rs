@@ -109,6 +109,7 @@ pub(crate) fn reset_affinity(slot: usize) {
     LAST_CPU[slot].store(NO_LAST_CPU, Ordering::Release);
 }
 
+#[cfg(test)]
 pub(crate) fn set_affinity(
     slot: usize,
     task_mask: u64,
@@ -120,6 +121,7 @@ pub(crate) fn set_affinity(
         "affinity replacement lacks cold cohort authority"
     );
 }
+#[cfg(test)]
 pub(crate) fn try_set_affinity(
     slot: usize,
     task_mask: u64,
@@ -283,7 +285,9 @@ pub(in crate::multitask::scheduler) fn with_placement_admission<R>(
 }
 
 mod placement;
-pub(in crate::multitask) use placement::{PlacementGrant, capture_architecture, capture_current};
+pub(in crate::multitask) use placement::{PlacementGrant, capture_current};
+#[cfg(test)]
+pub(in crate::multitask) use placement::{capture_architecture};
 
 #[cfg(test)]
 fn with_admission<R>(

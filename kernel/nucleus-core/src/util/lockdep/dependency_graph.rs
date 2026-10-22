@@ -19,7 +19,9 @@
 //!   publication of an edge whose checks have not passed.
 //! - **Evidence:** `scheduler-cpu-ownership` and the lockdep unit witnesses.
 
+#[cfg(rustos_boot_image)]
 use super::{MAX_LOCK_CLASSES, irq_context_depth_on};
+#[cfg(rustos_boot_image)]
 use core::panic::Location;
 use core::sync::atomic::{AtomicU64, Ordering};
 

@@ -339,41 +339,7 @@ fn publish(
         #[cfg(test)]
         saved_rsp: rsp as usize,
         #[cfg(test)]
-        test_ready: false,
-        #[cfg(test)]
-        ready_since_ticks: if suspended {
-            0
-        } else {
-            crate::arch::rtc::ticks()
-        },
-        #[cfg(test)]
-        blocked: true,
-        #[cfg(test)]
-        blocked_since_ticks: if suspended {
-            crate::arch::rtc::ticks()
-        } else {
-            0
-        },
-        #[cfg(test)]
-        wake_armed: false,
-        #[cfg(test)]
-        block_reason: BlockReason::None,
-        #[cfg(test)]
-        weight,
-        #[cfg(test)]
-        vruntime_ns: vruntime,
-        #[cfg(test)]
-        exec_start_ticks: 0,
-        #[cfg(test)]
         address_space_root: phys,
-        #[cfg(test)]
-        kernel_stack_base: kernel_base,
-        #[cfg(test)]
-        kernel_stack_top: kernel_top,
-        #[cfg(test)]
-        alternate_kernel_stack_base: 0,
-        #[cfg(test)]
-        alternate_kernel_stack_top: 0,
         user_mode: true,
         user_abi: Some(bootstrap.abi),
         console_session: bootstrap.console_session,

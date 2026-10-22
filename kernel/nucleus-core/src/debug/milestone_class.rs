@@ -73,3 +73,36 @@ pub(super) fn milestone_loss_snapshot(
         _ => (milestones_dropped, discarded_bytes),
     }
 }
+
+/// Milestones emitted once per process lifecycle step (spawn, exec prepare/map/
+/// commit, activation, termination). A debugcon frame is a synchronous VM exit
+/// (about 3.5 ms for one milestone line), so a fork or exec loop that wrote all
+/// of them would measure the console. They always reach the bounded in-memory
+/// ring; only a sample reaches the wire. Failure evidence is deliberately not in
+/// this family.
+pub(super) fn per_process_lifecycle(name: &str) -> bool {
+    matches!(
+        name,
+        "spawn-user-process"
+            | "spawn-user-process-state"
+            | "linux-process-termination"
+            | "retired-task-ipc-cancelled"
+            | "pager-anon-reservation"
+            | "proc-prepare-published"
+            | "proc-map-file-batch"
+            | "proc-linux-runtime-published"
+            | "proc-commit-address-space-begin"
+            | "proc-commit-address-space-done"
+            | "proc-commit-prepare-done"
+            | "proc-activate-batch-member"
+            | "proc-activate-batch-committed"
+    ) || name.starts_with("lifecycle-")
+}
+
+/// Boot is fully visible; later occurrences are sampled at powers of two so the
+/// stream still shows that the family is alive and how much of it there was.
+pub(super) const LIFECYCLE_EARLY_EMISSIONS: u64 = 256;
+
+pub(super) const fn lifecycle_sample_admits(occurrence: u64) -> bool {
+    occurrence <= LIFECYCLE_EARLY_EMISSIONS || occurrence.is_power_of_two()
+}

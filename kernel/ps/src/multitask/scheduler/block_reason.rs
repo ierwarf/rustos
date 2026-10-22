@@ -1,7 +1,6 @@
 //! Exact scheduler wait identities.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(in crate::multitask) enum BlockReason {
-    None,
     Generic,
     EndpointReceive(u64),
     EndpointReply(u64),

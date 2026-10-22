@@ -57,6 +57,7 @@ impl ExecReservation {
     /// generations remain explicit fields, so none of the three identities is
     /// collapsed into another. Callers must still authorize or consume the
     /// reservation through the process table.
+    #[cfg(test)]
     pub fn object_identity(self) -> Option<ObjectIdentity> {
         ObjectIdentity::new(
             ObjectOwner::Ps,
@@ -66,6 +67,7 @@ impl ExecReservation {
         )
     }
 
+    #[cfg(test)]
     pub const fn transaction_id(self) -> u32 {
         self.transaction_id
     }
@@ -74,10 +76,12 @@ impl ExecReservation {
         self.handle
     }
 
+    #[cfg(test)]
     pub const fn expected_mm_generation(self) -> u32 {
         self.expected_mm_generation
     }
 
+    #[cfg(test)]
     pub const fn next_mm_generation(self) -> u32 {
         self.next_mm_generation
     }
@@ -287,7 +291,9 @@ pub(super) fn with_own_exact_visible_state<R>(
 }
 
 pub(in crate::multitask) mod spawn;
-pub use spawn::{cancel_spawn, publish_spawn, reserve_spawn, SpawnReservation};
+pub use spawn::{cancel_spawn, reserve_spawn, SpawnReservation};
+#[cfg(test)]
+pub use spawn::{publish_spawn};
 
 static PROCESS_TABLE: ProcessTableLock = ProcessTableLock::new(ProcessTable::new());
 
@@ -503,6 +509,7 @@ pub fn with_process_state_mut<R>(
 /// sole recovery owner. `None` means either a stale process generation or
 /// lock contention; both make the user fault fail closed without panicking the
 /// kernel.
+#[cfg(test)]
 pub fn try_with_process_state_mut<R>(
     handle: ProcessHandle,
     f: impl FnOnce(u64, &mut UserProcessState) -> R,

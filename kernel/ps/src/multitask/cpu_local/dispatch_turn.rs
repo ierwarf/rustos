@@ -12,7 +12,9 @@ use super::super::scheduler::PlacementGrant;
 use super::super::scheduler::stack_resources::activation::ActivationCredential;
 use super::super::scheduler::rsp_handoff::RspHandoff;
 use core::cell::UnsafeCell;
-use nucleus_core::util::lockdep::{DispatchPreemption, LockClass};
+use nucleus_core::util::lockdep::DispatchPreemption;
+#[cfg(not(test))]
+use nucleus_core::util::lockdep::LockClass;
 
 struct TurnCell {
     phase: core::sync::atomic::AtomicU8,

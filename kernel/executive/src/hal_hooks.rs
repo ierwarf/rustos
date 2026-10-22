@@ -341,10 +341,23 @@ fn heartbeat_snapshot() -> hal_api::HeartbeatSnapshot {
     }
 }
 
+#[cfg(rustos_lifecycle_trace)]
+fn trace_ticks_per_second() -> u64 {
+    1_000_000_000
+}
+
 pub fn register() {
     nucleus_core::debug::register_runtime_hooks(nucleus_core::debug::DebugRuntimeHooks {
+        #[cfg(not(rustos_lifecycle_trace))]
         ticks: Some(hal_api::arch::rtc::ticks),
+        #[cfg(not(rustos_lifecycle_trace))]
         ticks_per_second: Some(hal_api::arch::rtc::ticks_per_second),
+        // Lifecycle traces resolve sub-tick phases: stamp with the TSC-backed
+        // monotonic clock (nanoseconds) instead of the coarse scheduler tick.
+        #[cfg(rustos_lifecycle_trace)]
+        ticks: Some(hal_api::arch::clock::monotonic_nanos),
+        #[cfg(rustos_lifecycle_trace)]
+        ticks_per_second: Some(trace_ticks_per_second),
         current_user_context: Some(current_debug_user_context),
     });
     hal_api::register_task_hooks(hal_api::TaskHooks {

@@ -30,7 +30,7 @@ use nucleus_core::debug::LogCategory;
 use nucleus_core::debug::phase_profile::{PhaseProfile, phase_now};
 
 #[cfg(any(test, rustos_usermem_phase_profile))]
-pub(crate) const USER_COPY_PHASE_COUNT: usize = 10;
+pub(crate) const USER_COPY_PHASE_COUNT: usize = 9;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum UserCopyPhase {
@@ -55,9 +55,6 @@ pub(crate) enum UserCopyPhase {
     /// per-process state lock and then re-acquires the global process table to
     /// test visibility.
     BindVisible = 8,
-    /// Dropping the retained process, which acquires the global process table
-    /// a third time to decrement the reference count.
-    BindRelease = 9,
 }
 
 #[cfg(rustos_usermem_phase_profile)]
@@ -73,7 +70,6 @@ static PROFILE: PhaseProfile<USER_COPY_PHASE_COUNT> = PhaseProfile::new(
         "usermem-phase-bind-identity",
         "usermem-phase-bind-retain",
         "usermem-phase-bind-visible",
-        "usermem-phase-bind-release",
     ],
     "usermem-phase-discarded",
 );
@@ -151,7 +147,6 @@ mod tests {
             (UserCopyPhase::BindIdentity, 6),
             (UserCopyPhase::BindRetain, 7),
             (UserCopyPhase::BindVisible, 8),
-            (UserCopyPhase::BindRelease, 9),
         ];
         for (phase, index) in phases {
             assert_eq!(phase as usize, index, "phase {phase:?} moved slot");

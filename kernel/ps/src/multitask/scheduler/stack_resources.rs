@@ -284,6 +284,7 @@ pub(in crate::multitask::scheduler) fn simd_resource_state(
 }
 
 /// Allocation is performed by the cold constructor before taking this leaf.
+#[cfg(test)]
 pub(super) fn install_storage(slot: usize, stack: Vec<u8>) {
     install_storage_with_reservation(slot, stack, None)
 }
@@ -315,6 +316,7 @@ fn install_storage_with_reservation(
     });
 }
 
+#[cfg(test)]
 pub(super) fn initialize_storage(slot: usize, f: impl FnOnce(&mut [u8])) {
     frame_access::initialize_storage(slot, f);
 }
@@ -421,6 +423,7 @@ pub(super) fn publish_binding(slot: usize, task_id: u64, view: PublishedFrameVie
 
 /// Irreversible close for this binding. New frame observations cannot revive
 /// it; existing pins retain the allocation until their last release.
+#[cfg(test)]
 pub(super) fn close_for_reclaim(slot: usize) -> bool {
     RESOURCES[slot].with(|resources| {
         if resources.reservation.is_some() || resources.reclaim.is_some()
@@ -478,6 +481,7 @@ pub(in crate::multitask) fn image_writing(slot: usize) -> bool {
 
 /// Metadata detachment only. The caller destroys the returned allocation after
 /// dropping directory/leaf locks, along with process/TLB reclamation work.
+#[cfg(test)]
 pub(super) fn take_storage(slot: usize) -> Option<Vec<u8>> {
     take_storage_with_reservation(slot, None, None)
 }

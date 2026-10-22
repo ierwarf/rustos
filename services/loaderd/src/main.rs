@@ -30,7 +30,7 @@ use alloc::vec::Vec;
 use core::mem::{size_of, MaybeUninit};
 #[cfg(not(test))]
 use core::panic::PanicInfo;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use rustos_image_admission::{
     admit_elf64_image, admit_pe64_image_headers, apply_pe64_base_relocations,
@@ -710,7 +710,9 @@ fn handle_request(
         return spawn_response(response);
     }
     response.pid = pid;
-    debug_line(&format!("loaderd: spawn done exec={exec_path} pid={pid}"));
+    if spawn_done_line_admitted() {
+        debug_line(&format!("loaderd: spawn done exec={exec_path} pid={pid}"));
+    }
     HandledLoaderRequest {
         reply: LoaderReply::Spawn(response),
         cleanup_fds: prepared.cleanup_fds,
@@ -1188,6 +1190,17 @@ fn debug_line(message: &str) {
     line[..len].copy_from_slice(&bytes[..len]);
     line[len] = b'\n';
     rustos_svc_runtime::ipc::debug_bytes(&line[..len + 1]);
+}
+
+/// A debugcon line is a synchronous VM exit, so a spawn/exec loop that logged
+/// every completion would measure the console. Boot spawns are all visible;
+/// later ones are sampled at powers of two.
+fn spawn_done_line_admitted() -> bool {
+    static SEEN: AtomicU64 = AtomicU64::new(0);
+    const EARLY: u64 = 64;
+    // ORDERING: Relaxed; the counter only thins diagnostics.
+    let n = SEEN.fetch_add(1, Ordering::Relaxed) + 1;
+    n <= EARLY || n.is_power_of_two()
 }
 
 #[inline]

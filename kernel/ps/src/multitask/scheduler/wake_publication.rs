@@ -149,19 +149,6 @@ pub(in crate::multitask) fn reply(reply: u64, task_id: u64) -> bool {
     result
 }
 
-/// Borrow an already entered IRQ CPU owner instead of entering another turn.
-pub(in crate::multitask) fn reply_scoped(
-    preemption: &nucleus_core::util::lockdep::DispatchPreemption<'_>,
-    reply: u64,
-    task_id: u64,
-) -> bool {
-    reply_with(
-        preemption,
-        reply,
-        task_id,
-        &runqueue_policy::online_affinity_mask,
-    )
-}
 
 pub(super) fn reply_with(
     preemption: &nucleus_core::util::lockdep::DispatchPreemption<'_>,
@@ -356,6 +343,7 @@ pub(super) fn pager_service_with(
 /// BindingPin/backing retain UID/resources, FrameReader excludes final claims,
 /// and Current/Transition wake arbitration preserves either return CAS order.
 /// A snapshot of preemption counters is not a replacement for caller custody.
+#[cfg(test)]
 pub(super) unsafe fn guarded(slot: usize, id: u64, eligible_cpus: &dyn Fn(usize) -> u64) -> bool {
     let Some(binding) = Binding::capture(slot, id) else {
         return false;

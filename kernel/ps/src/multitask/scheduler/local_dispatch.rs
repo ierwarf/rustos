@@ -13,8 +13,6 @@ mod fair_retry;
 pub(super) mod policy_witnesses;
 mod hint_priority;
 pub(super) use fair_retry::retry_incomplete_policy;
-#[cfg(not(test))]
-pub(super) use fair_retry::{current_after_incomplete, incomplete_policy_fallback};
 pub(super) use hint_priority::{
     refuse_unproven_hint_priority, stable_user_hint_class, user_hint_blocked_by_system,
 };
@@ -277,6 +275,7 @@ fn candidate_is_admitted(
 /// check only with a complete published lifecycle, affinity, budget and frame
 /// observation. Other owner states and incomplete reads retain the catalog
 /// path; an idle owner on a foreign CPU is a stable rejection.
+#[cfg(test)]
 pub(super) fn qualified_local_handoff_generation(
     slot: usize,
     cpu: usize,
@@ -298,26 +297,12 @@ pub(super) fn local_fair_competitor_ready(cpu: usize) -> bool {
         .any(|slot| !runqueue::is_idle_slot(slot) && runqueue::is_local_dispatchable(slot, cpu))
 }
 
-/// An empty fair scan may select an idle owner only if its *same* Local
-/// generation also has a complete published lifecycle, affinity, budget and
-/// saved-frame proof. The currently executing idle frame has no stable token
-/// and stays on the guarded fallback path.
-#[cfg(not(test))]
-pub(super) fn idle_frame_generation(
-    slot: usize,
-    cpu: usize,
-    now_ns: u64,
-) -> Result<Option<u64>, LocalFallbackReason> {
-    if !runqueue::is_idle_slot(slot) {
-        return Err(LocalFallbackReason::CustodyUnavailable);
-    }
-    candidate_is_qualified(slot, cpu, now_ns)
-}
 
 /// A guarded catalog fallback may name the *target CPU's* noncurrent idle
 /// owner. Only a complete published Local qualification can promote that
 /// choice to an exact-generation frame validation and final claim; otherwise
 /// the original guarded validation retains custody.
+#[cfg(test)]
 pub(super) fn qualified_catalog_idle_generation(
     slot: usize,
     current_slot: usize,
@@ -333,6 +318,7 @@ pub(super) fn qualified_catalog_idle_generation(
 
 /// Validates the saved frame behind one exact FIFO handoff. The caller
 /// separately checks record identity and lifecycle/budget/affinity admission.
+#[cfg(test)]
 pub(super) fn direct_handoff_frame_generation(
     slot: usize,
     cpu: usize,
@@ -349,22 +335,6 @@ pub(super) fn direct_handoff_frame_generation(
         .ok_or(LocalFallbackReason::FrameUnavailable)
 }
 
-/// Only a generation-bound Direct FIFO record may use complete published
-/// lifecycle, affinity, exact runtime credit and Direct frame as positive
-/// admission. Incomplete observations retain the guarded catalog fallback.
-pub(super) fn qualified_direct_handoff_generation(
-    slot: usize,
-    cpu: usize,
-    now_ns: u64,
-) -> Result<Option<u64>, LocalFallbackReason> {
-    if runqueue::is_idle_slot(slot) && super::smp::idle_slot_for_cpu(cpu) != Some(slot) {
-        return Ok(None);
-    }
-    if !published_candidate_admission(slot, cpu, now_ns)? {
-        return Ok(None);
-    }
-    direct_handoff_frame_generation(slot, cpu).map(Some)
-}
 
 const fn ordinary_voluntary_pick(voluntary_yield: bool, reservation_applied: bool) -> bool {
     voluntary_yield && !reservation_applied
@@ -421,6 +391,7 @@ fn select_class_candidate(
 /// that is intentionally not in the fair bitmap. Those paths fail closed to
 /// the catalog; normal System/User fair ordering, the user reservation, and
 /// voluntary-yield exclusion are shadowed here.
+#[cfg(test)]
 pub(super) fn choose_local_next(
     cpu: usize, current_slot: usize, voluntary_yield: bool, current_runtime_ns: u64,
     eligibility_now_ns: u64, expected_queue_sequence: u64, expected_class_sequence: u64,
@@ -702,6 +673,7 @@ pub(super) fn choose_overdue_system(
 /// instead of rescanning a catalog that contains no local fair candidate.
 /// Generation zero, remote, nonrunnable, and direct-handoff custody cannot
 /// manufacture an idle claim.
+#[cfg(test)]
 pub(super) fn empty_fair_idle_generation(
     owner: runqueue::RunOwnerSnapshot,
     cpu: usize,

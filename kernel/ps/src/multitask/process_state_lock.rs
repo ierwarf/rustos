@@ -18,6 +18,7 @@ use x86_64::instructions::interrupts;
 use nucleus_core::util::lockdep::{self, LockClass};
 
 /// Guard owner token of a shipping fast-path acquisition (no recorded owner).
+#[cfg(not(test))]
 const FAST_OWNER: usize = 0;
 const UNLOCKED: usize = 0;
 const LOCKED: usize = 1;
@@ -194,6 +195,7 @@ impl<T: ?Sized> ProcessStateLock<T> {
     }
 
     #[track_caller]
+    #[cfg(test)]
     pub(super) fn try_lock(&self) -> Option<ProcessStateGuard<'_, T>> {
         #[cfg(all(rustos_boot_image, not(rustos_lock_phase_profile)))]
         return self

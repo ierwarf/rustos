@@ -8,7 +8,7 @@
 use super::*;
 use crate::multitask::current_identity as identity;
 use crate::multitask::scheduler::{
-    self as scheduler, BlockReason, ConsoleSessionHandle, TaskContext, TaskStart,
+    self as scheduler, ConsoleSessionHandle, TaskContext, TaskStart,
 };
 use std::panic::{AssertUnwindSafe, catch_unwind};
 const SLOT: usize = 104;
@@ -16,22 +16,7 @@ const ID: u64 = 104001;
 fn metadata() -> TaskContext {
     TaskContext {
         scheduling_context: scheduler::scheduling_context::SchedulingContext::bind(SLOT, ID),
-        saved_rsp: 0,
-        test_ready: false,
-        ready_since_ticks: 0,
-        blocked: true,
-        blocked_since_ticks: 0,
-        wake_armed: false,
-        block_reason: BlockReason::None,
-        weight: scheduler::NICE_0_LOAD,
-        vruntime_ns: 0,
-        exec_start_ticks: 0,
-        address_space_root: 0,
-        kernel_stack_base: 0,
-        kernel_stack_top: 0,
-        alternate_kernel_stack_base: 0,
-        alternate_kernel_stack_top: 0,
-        user_mode: false,
+        saved_rsp: 0,        address_space_root: 0,        user_mode: false,
         user_abi: None,
         console_session: ConsoleSessionHandle::SYSTEM,
         process_handle: None,
@@ -91,7 +76,7 @@ fn detach(reuse: &mut Reuse) -> Vec<u8> {
 #[test]
 fn detached_metadata_prefix_keeps_new_creator_closed_until_exact_reuse_ack_and_clears_hidden_binding()
  {
-    let mut fixture = scheduler::tests::boxed_scheduler();
+    let _fixture = scheduler::tests::boxed_scheduler();
     prepare();
     let mut reuse = begin(SLOT, Some(ID)).unwrap();
     assert!(admission::reserve(SLOT, ID + 1).is_none());
@@ -118,7 +103,7 @@ fn detached_metadata_prefix_keeps_new_creator_closed_until_exact_reuse_ack_and_c
 }
 #[test]
 fn foreign_pristine_or_old_uid_cannot_close_live_slot_and_epoch_exhaustion_has_no_partial_gate() {
-    let mut fixture = scheduler::tests::boxed_scheduler();
+    let _fixture = scheduler::tests::boxed_scheduler();
     prepare();
     assert!(begin(SLOT, None).is_none());
     assert!(begin(SLOT, Some(ID + 1)).is_none());
@@ -139,7 +124,7 @@ fn foreign_pristine_or_old_uid_cannot_close_live_slot_and_epoch_exhaustion_has_n
 }
 #[test]
 fn unowned_storage_detach_and_early_ack_cannot_spend_owned_reclaim_or_reopen_constructor() {
-    let mut fixture = scheduler::tests::boxed_scheduler();
+    let _fixture = scheduler::tests::boxed_scheduler();
     prepare();
     let reuse = begin(SLOT, Some(ID)).unwrap();
     assert!(catch_unwind(AssertUnwindSafe(|| take_storage(SLOT))).is_err());
@@ -154,7 +139,7 @@ fn unowned_storage_detach_and_early_ack_cannot_spend_owned_reclaim_or_reopen_con
 #[test]
 fn abandoned_detached_reclaim_quarantines_even_empty_storage_and_next_nonce_cannot_be_spent_by_old_key()
  {
-    let mut fixture = scheduler::tests::boxed_scheduler();
+    let _fixture = scheduler::tests::boxed_scheduler();
     prepare();
     let mut reuse = begin(SLOT, Some(ID)).unwrap();
     let old_key = reuse.key;

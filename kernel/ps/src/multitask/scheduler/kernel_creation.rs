@@ -161,33 +161,7 @@ pub(super) fn commit_image(
         #[cfg(test)]
         saved_rsp: rsp,
         #[cfg(test)]
-        test_ready: false,
-        #[cfg(test)]
-        ready_since_ticks: crate::arch::rtc::ticks(),
-        #[cfg(test)]
-        blocked: false,
-        #[cfg(test)]
-        blocked_since_ticks: 0,
-        #[cfg(test)]
-        wake_armed: false,
-        #[cfg(test)]
-        block_reason: BlockReason::None,
-        #[cfg(test)]
-        weight,
-        #[cfg(test)]
-        vruntime_ns: vruntime,
-        #[cfg(test)]
-        exec_start_ticks: exec_start,
-        #[cfg(test)]
         address_space_root: root,
-        #[cfg(test)]
-        kernel_stack_base: kernel_base,
-        #[cfg(test)]
-        kernel_stack_top: kernel_top,
-        #[cfg(test)]
-        alternate_kernel_stack_base: 0,
-        #[cfg(test)]
-        alternate_kernel_stack_top: 0,
         user_mode: false,
         user_abi: None,
         console_session: ConsoleSessionHandle::SYSTEM,

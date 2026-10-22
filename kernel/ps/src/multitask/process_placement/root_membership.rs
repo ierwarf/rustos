@@ -30,6 +30,7 @@ pub(in crate::multitask) struct RootJoin {
     live: bool,
 }
 impl RootJoin {
+    #[cfg(test)]
     pub(in crate::multitask) fn begin(
         handle: ProcessHandle,
         member: Member,

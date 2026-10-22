@@ -28,9 +28,11 @@ impl Reservation {
     fn ticket(&self) -> &Ticket {
         self.ticket.as_ref().expect("thread producer lost ticket")
     }
+    #[cfg(test)]
     pub(in crate::multitask) fn process_handle(&self) -> ProcessHandle {
         self.handle
     }
+    #[cfg(test)]
     pub(in crate::multitask) fn process_id(&self) -> u64 {
         self.pid
     }
@@ -212,33 +214,7 @@ fn publish(
         #[cfg(test)]
         saved_rsp,
         #[cfg(test)]
-        test_ready: false,
-        #[cfg(test)]
-        ready_since_ticks: 0,
-        #[cfg(test)]
-        blocked: true,
-        #[cfg(test)]
-        blocked_since_ticks: crate::arch::rtc::ticks(),
-        #[cfg(test)]
-        wake_armed: false,
-        #[cfg(test)]
-        block_reason: BlockReason::None,
-        #[cfg(test)]
-        weight: r.weight,
-        #[cfg(test)]
-        vruntime_ns: r.vruntime,
-        #[cfg(test)]
-        exec_start_ticks: 0,
-        #[cfg(test)]
         address_space_root: r.root,
-        #[cfg(test)]
-        kernel_stack_base: kernel_base,
-        #[cfg(test)]
-        kernel_stack_top: kernel_top,
-        #[cfg(test)]
-        alternate_kernel_stack_base: 0,
-        #[cfg(test)]
-        alternate_kernel_stack_top: 0,
         user_mode: true,
         user_abi: Some(bootstrap.abi),
         console_session: bootstrap.console_session,

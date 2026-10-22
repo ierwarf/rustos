@@ -104,6 +104,7 @@ pub(super) fn publish_request(cpu: usize, generation: u64) -> RequestPublication
     }
 }
 
+#[cfg(not(test))]
 pub(super) fn request_sequence_snapshot(cpu: usize) -> u64 {
     request_sequence(observation(cpu).request_word.load(Ordering::Acquire))
 }

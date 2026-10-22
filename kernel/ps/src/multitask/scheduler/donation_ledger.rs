@@ -696,6 +696,7 @@ pub(super) fn publish_base_class(effect: impl FnOnce()) {
 }
 
 #[inline]
+#[cfg(test)]
 pub(super) fn borrowed_context_owner_slot(slot: usize) -> Option<usize> {
     let encoded = BORROWED_CONTEXT_OWNER.get(slot)?.load(Ordering::Acquire);
     (encoded != NO_BORROWED_CONTEXT).then_some(usize::from(encoded))

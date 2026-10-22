@@ -58,6 +58,7 @@ impl Banks {
         }
         drop(Self::put(&self.current, incoming));
     }
+    #[cfg(test)]
     fn commit(&self) {
         drop(Self::take(&self.outgoing));
     }
@@ -83,6 +84,7 @@ pub(in crate::multitask) fn prepare_lane(cpu: usize, pin: ExecutionPermit) {
 pub(in crate::multitask) fn publish(cpu: usize, from: usize, to: usize) {
     BANKS[cpu].publish(from, to);
 }
+#[cfg(test)]
 pub(in crate::multitask) fn commit(cpu: usize) {
     BANKS[cpu].commit();
 }

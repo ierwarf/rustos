@@ -1,26 +1,14 @@
 use super::{
-    BlockReason, ConsoleSessionHandle, FastIpcCallHandoffOutcome, FastIpcReplyHandoffOutcome,
-    MAX_CONSECUTIVE_SYSTEM_DISPATCHES, MAX_TASK, MIN_LOAD_WEIGHT, NICE_0_LOAD,
-    SCHED_CPU_LOCALITY_LAG_NS, SYSTEM_CLASS_WEIGHT_FLAG, SchedClass, SchedulerDispatch,
-    TaskContext, TaskStart, align_kernel_stack_top,
+    ConsoleSessionHandle, MAX_TASK, SchedulerDispatch, TaskContext,
+    align_kernel_stack_top,
 };
 use crate::memory::paging::ProcessAddressSpace;
-use crate::multitask::{UserTaskBootstrap, noop_task_entry, process_table};
+use crate::multitask::{UserTaskBootstrap, process_table};
 use crate::user::abi::UserAbi;
 use crate::user::linux::LinuxThreadState;
 use crate::user::process_state::UserProcessState;
 use kernel_ipc_runtime::api::{EndpointResponseTake, IpcError};
 
-/// Explicit earlier membership input for scalar catalog-policy projections.
-/// The actual iterator always reads its published bitmap, even in native.
-/// This grants no physical frame/MM/UID execution or hardware evidence.
-pub(super) fn model_earlier_queue_membership(slots: &[usize]) {
-    for &slot in slots {
-        super::runqueue::admit_blocked(slot);
-        assert!(matches!(super::runqueue::publish_local_wake(slot, 0, NICE_0_LOAD),
-            super::runqueue::RemoteWakeOutcome::Published { cpu: 0, .. }));
-    }
-}
 
 /// Restores the shared runqueue witness even when one scheduler assertion
 /// fails, so this test's exact custody records cannot leak into another
@@ -119,22 +107,7 @@ pub(super) fn test_user_context(handle: process_table::ProcessHandle) -> TaskCon
     TaskContext {
         scheduling_context:
             crate::multitask::scheduler::scheduling_context::SchedulingContext::bind(0, 1),
-        saved_rsp: 0,
-        test_ready: true,
-        ready_since_ticks: 0,
-        blocked: false,
-        blocked_since_ticks: 0,
-        wake_armed: false,
-        block_reason: BlockReason::None,
-        weight: NICE_0_LOAD,
-        vruntime_ns: 0,
-        exec_start_ticks: 0,
-        address_space_root: 0,
-        kernel_stack_base: 0,
-        kernel_stack_top: 0,
-        alternate_kernel_stack_base: 0,
-        alternate_kernel_stack_top: 0,
-        user_mode: true,
+        saved_rsp: 0,        address_space_root: 0,        user_mode: true,
         user_abi: Some(UserAbi::Linux),
         console_session: ConsoleSessionHandle::SYSTEM,
         process_handle: Some(handle),
