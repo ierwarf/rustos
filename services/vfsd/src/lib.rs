@@ -5,7 +5,7 @@ extern crate alloc;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU32, Ordering};
 use rustos_user_abi::performance::{WAITSET_MAX_EPOLL_OBJECTS, WAITSET_MAX_GLOBAL_INTERESTS};
 use rustos_user_abi::syscall::{
     DvmBlockInfoWire, ServiceCheckpointRecordWire, EARLY_SYSTEM_BROKER_MAX_IO_BYTES,
@@ -103,6 +103,46 @@ impl SnapshotWorkerAdmission {
 }
 
 impl Default for SnapshotWorkerAdmission {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Notification hint for the bounded snapshot pool, not job ownership. Workers
+/// sample before scanning READY slots, then compare-and-park on that sample.
+/// The futex backend must retain a bounded timeout: the epoch may wrap or a
+/// wake may be refused, and neither may strand an already admitted request.
+pub struct SnapshotWorkerSignal(AtomicU32);
+
+impl SnapshotWorkerSignal {
+    pub const fn new() -> Self {
+        Self(AtomicU32::new(0))
+    }
+
+    /// Call only after the job's READY publication, then wake the pool on the
+    /// returned stable word. Release pairs with a worker's Acquire observation.
+    pub fn publish(&self) -> &AtomicU32 {
+        self.0.fetch_add(1, Ordering::Release);
+        &self.0
+    }
+
+    /// The observation precedes the scan. A publication between an empty scan
+    /// and the backend's atomic compare-and-park must therefore refuse sleep.
+    pub fn claim_or_wait<T>(
+        &self,
+        claim: impl FnOnce() -> Option<T>,
+        wait: impl FnOnce(&AtomicU32, u32),
+    ) -> Option<T> {
+        let observed = self.0.load(Ordering::Acquire);
+        let job = claim();
+        if job.is_none() {
+            wait(&self.0, observed);
+        }
+        job
+    }
+}
+
+impl Default for SnapshotWorkerSignal {
     fn default() -> Self {
         Self::new()
     }
@@ -723,6 +763,71 @@ pub fn unlink_policy(path: &str) -> i32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn snapshot_signal_ready_job_never_parks_or_changes_admission_ownership() {
+        let admission = super::SnapshotWorkerAdmission::new();
+        let signal = super::SnapshotWorkerSignal::new();
+        assert!(admission.try_reserve());
+        admission.publish_ready();
+        signal.publish();
+        assert_eq!(
+            signal.claim_or_wait(
+                || admission.try_claim().then_some(7),
+                |_, _| panic!("ready job parked"),
+            ),
+            Some(7),
+        );
+        assert!(!admission.try_reserve());
+        admission.release();
+        assert!(admission.try_reserve());
+    }
+
+    #[test]
+    fn snapshot_signal_publication_after_empty_scan_refuses_stale_wait() {
+        let admission = super::SnapshotWorkerAdmission::new();
+        let signal = super::SnapshotWorkerSignal::new();
+        let job = signal.claim_or_wait(
+            || {
+                assert!(!admission.try_claim());
+                assert!(admission.try_reserve());
+                admission.publish_ready();
+                signal.publish();
+                None::<usize>
+            },
+            |word, expected| {
+                // The kernel FUTEX_WAIT compare rejects this stale sample.
+                assert_ne!(word.load(core::sync::atomic::Ordering::Acquire), expected);
+            },
+        );
+        assert_eq!(job, None);
+        assert_eq!(
+            signal.claim_or_wait(
+                || admission.try_claim().then_some(0),
+                |_, _| panic!("publication lost"),
+            ),
+            Some(0),
+        );
+        admission.release();
+    }
+
+    #[test]
+    fn snapshot_signal_empty_scan_can_park_and_wrapping_notification_changes_sample() {
+        let signal = super::SnapshotWorkerSignal(core::sync::atomic::AtomicU32::new(u32::MAX));
+        assert_eq!(
+            signal.claim_or_wait(
+                || None::<usize>,
+                |word, expected| {
+                    assert_eq!(expected, u32::MAX);
+                    assert_eq!(word.load(core::sync::atomic::Ordering::Acquire), expected);
+                    signal.publish();
+                    assert_eq!(word.load(core::sync::atomic::Ordering::Acquire), 0);
+                    assert_ne!(word.load(core::sync::atomic::Ordering::Acquire), expected);
+                },
+            ),
+            None,
+        );
+    }
+
     use super::*;
     use alloc::vec;
 

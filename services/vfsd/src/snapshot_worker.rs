@@ -5,7 +5,7 @@ use alloc::format;
 use core::arch::asm;
 use core::cell::UnsafeCell;
 use core::mem::{size_of, MaybeUninit};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use rustos_svc_runtime::ipc;
 use rustos_user_abi::linux as linux_abi;
@@ -13,7 +13,7 @@ use rustos_user_abi::syscall::{
     VfsExecutableSnapshotRequest, VfsExecutableSnapshotResponse,
     VFS_EXECUTABLE_SNAPSHOT_ABI_VERSION, VFS_EXECUTABLE_SNAPSHOT_OP_OPEN,
 };
-use vfsd::SnapshotWorkerAdmission;
+use vfsd::{SnapshotWorkerAdmission, SnapshotWorkerSignal};
 
 #[cfg(test)]
 use super::ENOSYS;
@@ -62,6 +62,7 @@ const SNAPSHOT_WORKERS: usize = 2;
 static SNAPSHOT_JOB_ADMISSION: [SnapshotWorkerAdmission; SNAPSHOT_WORKERS] =
     [const { SnapshotWorkerAdmission::new() }; SNAPSHOT_WORKERS];
 static SNAPSHOT_WORKERS_STARTED: AtomicBool = AtomicBool::new(false);
+static SNAPSHOT_WORK_SIGNAL: SnapshotWorkerSignal = SnapshotWorkerSignal::new();
 static SNAPSHOT_JOB: [SnapshotJobSlot; SNAPSHOT_WORKERS] =
     [const { SnapshotJobSlot(UnsafeCell::new(MaybeUninit::uninit())) }; SNAPSHOT_WORKERS];
 #[cfg(not(test))]
@@ -144,7 +145,52 @@ pub(super) fn enqueue_executable_snapshot(
         });
     }
     SNAPSHOT_JOB_ADMISSION[index].publish_ready();
+    wake_snapshot_workers(SNAPSHOT_WORK_SIGNAL.publish());
     0
+}
+
+fn wake_snapshot_workers(word: &AtomicU32) {
+    // SAFETY: the aligned atomic word is static shared process memory. The
+    // wake is only a hint: READY remains the sole admission authority, and a
+    // timed wait preserves progress even when a wake is refused.
+    let _ = unsafe {
+        rustos_svc_runtime::syscall::syscall6(
+            linux_abi::SYS_FUTEX,
+            word.as_ptr() as u64,
+            (linux_abi::FUTEX_WAKE | linux_abi::FUTEX_PRIVATE_FLAG) as u64,
+            SNAPSHOT_WORKERS as u64,
+            0,
+            0,
+            0,
+        )
+    };
+}
+
+#[cfg(not(test))]
+fn wait_snapshot_work(word: &AtomicU32, expected: u32) {
+    let timeout = linux_abi::LinuxTimespec {
+        tv_sec: 0,
+        tv_nsec: 1_000_000,
+    };
+    // SAFETY: the static word and initialized timeout outlive the synchronous
+    // syscall. WAIT compares and registers atomically with respect to WAKE;
+    // publication after an empty scan cannot slip through that boundary.
+    let status = unsafe {
+        rustos_svc_runtime::syscall::syscall6(
+            linux_abi::SYS_FUTEX,
+            word.as_ptr() as u64,
+            (linux_abi::FUTEX_WAIT | linux_abi::FUTEX_PRIVATE_FLAG) as u64,
+            u64::from(expected),
+            (&timeout as *const linux_abi::LinuxTimespec) as u64,
+            0,
+            0,
+        )
+    };
+    // Success, stale comparison, interruption and timeout all re-scan READY.
+    // Unsupported/refused waiter admission must not turn into a busy loop.
+    if !matches!(status, 0 | -11 | -4 | -110) {
+        rustos_svc_runtime::syscall::sleep_millis(1);
+    }
 }
 
 /// Claims any published job, returning the slot the caller now owns.
@@ -232,8 +278,9 @@ fn spawn_snapshot_worker(_index: usize) -> Result<(), i64> {
 #[cfg(not(test))]
 extern "C" fn snapshot_worker_entry() -> ! {
     loop {
-        let Some(index) = claim_any_ready_job() else {
-            rustos_svc_runtime::syscall::sleep_millis(1);
+        let Some(index) = SNAPSHOT_WORK_SIGNAL
+            .claim_or_wait(claim_any_ready_job, wait_snapshot_work)
+        else {
             continue;
         };
         // SAFETY: Acquire of READY observes the complete fixed job, and BUSY

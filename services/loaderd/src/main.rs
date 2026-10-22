@@ -710,7 +710,7 @@ fn handle_request(
         return spawn_response(response);
     }
     response.pid = pid;
-    if spawn_done_line_admitted() {
+    if loaderd::spawn_completion_diagnostic_eligible(request.op) && spawn_done_line_admitted() {
         debug_line(&format!("loaderd: spawn done exec={exec_path} pid={pid}"));
     }
     HandledLoaderRequest {

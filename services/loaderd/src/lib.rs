@@ -46,6 +46,13 @@ pub fn classify_loader_wire_size(received: usize) -> LoaderWireKind {
     }
 }
 
+/// Only a new spawn carries a boot-readiness success diagnostic. An exec
+/// replacement must not synchronously write the console before its first turn
+/// or consume the boot spawn sampler. Refusal diagnostics are independent.
+pub fn spawn_completion_diagnostic_eligible(operation: u16) -> bool {
+    operation == rustos_user_abi::syscall::LOADER_OP_SPAWN_EXEC
+}
+
 /// Fused receive may block only when the completed reply has no immediate
 /// descriptor cleanup or scheduling-class transition behind it.
 pub fn fused_loader_reply_eligible(cleanup_fd_count: usize, demote_after_reply: bool) -> bool {
@@ -87,6 +94,15 @@ pub fn completion_demotion_due(reply: i64, demote_after_reply: bool) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn spawn_completion_diagnostic_rejects_exec_and_unknown_operations() {
+        use rustos_user_abi::syscall::{LOADER_OP_EXEC_TARGET, LOADER_OP_SPAWN_EXEC};
+        assert!(super::spawn_completion_diagnostic_eligible(LOADER_OP_SPAWN_EXEC));
+        for operation in [LOADER_OP_EXEC_TARGET, 0, u16::MAX] {
+            assert!(!super::spawn_completion_diagnostic_eligible(operation));
+        }
+    }
+
     use super::*;
 
     #[test]

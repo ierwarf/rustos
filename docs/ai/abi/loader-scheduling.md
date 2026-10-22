@@ -183,6 +183,13 @@ only the canonical absolute path. The v2 response binds that exact path to the
 handle, byte count, and mount generation returned to loaderd. A relative
 snapshot with no target PID or a directory basis other than `AT_FDCWD` fails
 closed until the ABI carries an authenticated remote directory handle.
+Snapshot job ownership remains the bounded IDLE→WRITING→READY→BUSY admission.
+After READY, the receive owner advances a process-private futex epoch and wakes
+both workers. A worker observes the epoch **before** scanning READY slots and
+compare-and-parks only after an empty scan, closing the scan/sleep wake race.
+The notification grants no slot or reply authority. Timed waits retain the
+previous 1 ms recovery timeout for a refused wake or a wrapped epoch; unsupported
+waiter admission falls back to the bounded sleep, never a busy loop.
 The kernel-stamped `product-executable-snapshot-sealed` milestone is reserved
 for a DVM-volume read. Its checksummed `evidence_v=1` payload contains the
 fixed Vfsd service identity, kernel-observed live Vfsd endpoint generation,

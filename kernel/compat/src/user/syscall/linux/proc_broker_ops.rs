@@ -1105,10 +1105,14 @@ pub(super) fn syscall_linux_rustos_proc_exec_target_broker(args_ptr: u64) -> u64
         argv: argv_refs.as_slice(),
         env: env_refs.as_slice(),
     };
+    #[cfg(rustos_lifecycle_trace)]
+    let exec_started = crate::arch::clock::monotonic_nanos();
     let address_space = match address_space_from_mappings(&state.mappings) {
         Ok(address_space) => address_space,
         Err(errno) => return linux_errno(errno),
     };
+    #[cfg(rustos_lifecycle_trace)]
+    let mapped_at = crate::arch::clock::monotonic_nanos();
     let session = if args.console_session == 0 {
         match multitask::linux_thread_snapshot_by_ids(args.target_pid, args.target_tid) {
             Some(snapshot) => snapshot.console_session,
@@ -1144,6 +1148,8 @@ pub(super) fn syscall_linux_rustos_proc_exec_target_broker(args_ptr: u64) -> u64
         Ok(prepared) => prepared,
         Err(err) => return linux_errno(process_load_error_to_linux_errno(err)),
     };
+    #[cfg(rustos_lifecycle_trace)]
+    let prepared_at = crate::arch::clock::monotonic_nanos();
     let transition = exec_transition_from_prepared(args.target_pid, args.target_tid, &prepared);
     {
         let mut transitions = EXEC_TRANSITIONS.lock();
@@ -1164,6 +1170,20 @@ pub(super) fn syscall_linux_rustos_proc_exec_target_broker(args_ptr: u64) -> u64
         prepared.address_space,
         prepared.bootstrap,
     );
+    #[cfg(rustos_lifecycle_trace)]
+    {
+        // No prepare/transition/process guard spans diagnostic output. Capture
+        // all durations first so console transport is not charged to a phase.
+        let committed_at = crate::arch::clock::monotonic_nanos();
+        nucleus_core::debug::println_serialized(format_args!(
+            "proc-exec-work pid={} map_ns={} prepare_ns={} commit_ns={} ok={}",
+            args.target_pid,
+            mapped_at.saturating_sub(exec_started),
+            prepared_at.saturating_sub(mapped_at),
+            committed_at.saturating_sub(prepared_at),
+            exec_outcome.is_ok(),
+        ));
+    }
     if let Err(refusal) = &exec_outcome {
         // Names the refusing stage; every refusal still surfaces as ESRCH.
         nucleus_core::debug::record_milestone(
