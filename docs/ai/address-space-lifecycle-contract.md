@@ -78,6 +78,21 @@ but not its semantics. §3 and `fork-cow-contract.md` define that distinction.
 
 ## 2. One mutation and one invalidation per operation
 
+Linux `munmap` accepts holes, including repeated removal of an unmapped range
+([munmap(2)](https://man7.org/linux/man-pages/man2/munmap.2.html)). Pager VMA
+removal therefore edits actual intersections only; touching neighbors are not
+coverage. Protect and reservation commit still require complete coverage.
+The broker holds one ProcessState lock across exact process/MM revalidation,
+VMA rewrite, whole-range leaf preflight/removal, and mapping-record release.
+Present ordinary leaves require both an owned tag and exact root/VA/frame
+descriptor. Present external leaves require neither: their intervals come from
+retained authoritative mapping records, whose backing survives the TLB reclaim
+barrier. All geometry, ownership and vector-capacity checks precede the first
+PTE removal. Holes are not ownership errors. External metadata is released only
+after the VMA writer/epoch ends, avoiding lower-ranked backing locks under that
+writer. A failed preflight preserves both leaves and published VMA authority.
+
+
 `map_zeroed_user_pages_at` opens one `AddressSpaceMutationGuard` per operation.
 `clone_user_space_cow` likewise batches every parent write-protection change
 under one guard and drops it once, after the last downgrade. The unpublished

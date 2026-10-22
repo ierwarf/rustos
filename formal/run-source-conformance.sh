@@ -1408,6 +1408,9 @@ process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::p
 process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::process_table::tests::exit_pending_wins_when_exec_is_cancelled
 process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::process_table::tests::exiting_process_rejects_new_thread_attachment
 process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::process_table::tests::parent_wait_is_required_before_child_reap
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::process_table::tests::exited_child_is_consumed_once_even_while_pinned
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::process_table::tests::concurrent_parent_waiters_cannot_replay_a_pinned_exit
+process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-compat|user::syscall::linux::syscalld_ops::tests::settled_child_status_is_delivered_before_eintr
 process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::process_table::tests::process_generations_fail_closed_instead_of_aliasing_stale_handles
 process-lifecycle-transaction/ProcessLifecycleTransaction|kernel-ps|multitask::spawn::tests::process_state_spawn_has_no_unreserved_production_alias
 capability-derivation-lifecycle/CapabilityDerivationLifecycle|kernel-ipc-runtime|ipc::tests::kernel_transfer_ticket_binds_the_nonzero_transfer_object_generation
@@ -1752,6 +1755,7 @@ frame-reader-claim/FrameReaderClaim|kernel-ps|multitask::scheduler::activation::
 atomic-process-activation-batch/AtomicProcessActivationBatch|kernel-ps|multitask::scheduler::activation::publication::tests::actual_activation_exact_capacity_commits_all_first_turn_records_without_overflow_or_replay
 atomic-process-activation-batch/AtomicProcessActivationBatch|kernel-ps|multitask::scheduler::activation::publication::tests::actual_priority_saturation_degrades_to_original_spawn_fifo_not_atomic_count_overflow
 affinity-claim-admission/AffinityClaimAdmission|kernel-ps|multitask::scheduler::activation::publication::tests::actual_remote_activation_publishes_original_mailbox_before_complete_ack_and_bound_frame
+affinity-claim-admission/AffinityClaimAdmission|kernel-ps|multitask::scheduler::activation::publication::tests::remote_activation_notifies_after_all_claim_gates_release_even_with_existing_mailbox_edge
 atomic-process-activation-batch/AtomicProcessActivationBatch|kernel-ps|multitask::scheduler::activation::publication::tests::actual_activation_preserves_strict_class_sleeper_floor_without_priority_donation_shortcut
 frame-reader-claim/FrameReaderClaim|kernel-ps|multitask::scheduler::activation::publication::tests::actual_activation_refuses_copied_current_slot_without_original_physical_cpu_bank_before_callback
 atomic-process-activation-batch/AtomicProcessActivationBatch|kernel-ps|multitask::scheduler::activation::publication::tests::actual_single_activation_recomputes_same_band_floor_after_wake_for_original_spawn_donation
@@ -1943,6 +1947,8 @@ pager-region-agreement/PagerRegionAgreement|rustos-user-abi|pager::region_edit::
 pager-region-agreement/PagerRegionAgreement|rustos-user-abi|pager::region_edit::tests::prot_none_is_a_ring0_vma_and_a_pager_removal
 pager-region-agreement/PagerRegionAgreement|kernel-ps|multitask::pager_vma::tests::ring0_rewrite_matches_the_shared_range_edit_rule
 pager-region-agreement/PagerRegionAgreement|kernel-ps|multitask::pager_vma::tests::a_split_with_no_free_vma_slot_refuses_and_keeps_every_region
+pager-region-agreement/PagerRegionAgreement|kernel-ps|multitask::pager_vma::tests::sparse_unmap_is_idempotent_and_protect_commit_still_require_coverage
+pager-region-agreement/PagerRegionAgreement|kernel-ps|multitask::pager_vma::tests::unmap_partially_initialized_range_and_touching_only_preserve_exact_authority
 pager-region-agreement/PagerRegionAgreement|pagerd|tests::an_interior_release_keeps_both_remainders_and_they_still_fault
 pager-region-agreement/PagerRegionAgreement|pagerd|tests::a_split_that_cannot_fit_refuses_and_keeps_the_region_whole
 pager-region-agreement/PagerRegionAgreement|pagerd|tests::an_interior_protect_narrows_only_the_edited_span
@@ -1968,11 +1974,20 @@ page-table-lifecycle/PageTableLifecycle|kernel-mm|memory::address_space::tests::
 page-table-lifecycle/PageTableLifecycle|kernel-mm|memory::address_space::tests::user_page_flags_enforce_wx_and_reject_huge_pages
 page-table-lifecycle/PageTableLifecycle|kernel-mm|memory::address_space::tests::protection_span_preflight_rejects_a_hole_before_commit
 page-table-lifecycle/PageTableLifecycle|kernel-mm|memory::address_space::tests::unmap_descriptor_plan_is_complete_before_first_pte_remove
+page-table-lifecycle/PageTableLifecycle|kernel-mm|memory::address_space::pager_fault_mapping::tests::user_unmap_preflights_owned_pages_separated_by_holes
+page-table-lifecycle/PageTableLifecycle|kernel-mm|memory::address_space::pager_fault_mapping::tests::user_unmap_preflights_owned_and_borrowed_mix
+page-table-lifecycle/PageTableLifecycle|kernel-mm|memory::address_space::pager_fault_mapping::tests::user_unmap_repeated_no_present_plans_are_empty
+page-table-lifecycle/PageTableLifecycle|kernel-mm|memory::address_space::pager_fault_mapping::tests::user_unmap_ownership_refusals_leave_all_entries_intact
+page-table-lifecycle/PageTableLifecycle|kernel-mm|memory::address_space::pager_fault_mapping::tests::user_unmap_invalid_leaf_refusal_leaves_all_entries_intact
+page-table-lifecycle/PageTableLifecycle|kernel-mm|memory::address_space::pager_fault_mapping::tests::user_unmap_late_invalid_directory_refuses_before_mutation
+page-table-lifecycle/PageTableLifecycle|kernel-mm|memory::address_space::pager_fault_mapping::tests::user_unmap_capacity_refusal_precedes_mutation
+page-table-lifecycle/PageTableLifecycle|kernel-mm|memory::address_space::pager_fault_mapping::tests::user_unmap_external_segments_validate_geometry_and_half_open_membership
 page-table-map-transaction/PageTableMapTransaction|kernel-mm|memory::address_space::rollback::tests::leaf_rollback_runs_in_reverse_publication_order
 page-table-map-transaction/PageTableMapTransaction|kernel-mm|memory::address_space::pager_fault_mapping::tests::a_published_table_entry_must_be_a_present_non_huge_user_table
 page-table-lifecycle/PageTableLifecycle|kernel-mm|memory::kernel_vm::tests::direct_map_update_bounds_are_aligned_nonempty_and_nonwrapping
 page-table-lifecycle/PageTableLifecycle|kernel-mm|memory::kernel_vm::tests::kernel_segment_protection_rejects_writable_executable_authority
 page-table-lifecycle/PageTableLifecycle|syscalld|mmap_policy::tests::invalid_backing_is_rejected_before_a_fixed_replace_plan_exists
+page-table-lifecycle/PageTableLifecycle|syscalld|vma_policy::tests::sparse_munmap_is_one_transaction_and_commits_policy_only_on_success
 physical-frame-lifecycle/PhysicalFrameLifecycle|kernel-mm|memory::phys::tests::usable_region_spans_filter_and_trim_to_direct_map
 physical-frame-lifecycle/PhysicalFrameLifecycle|kernel-mm|memory::phys::tests::bitmap_allocator_reuses_freed_frames
 physical-frame-lifecycle/PhysicalFrameLifecycle|kernel-mm|memory::phys::tests::bounded_allocator_stays_under_limit

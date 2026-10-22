@@ -24,11 +24,11 @@ mod component_contract;
 mod components;
 mod core_contract;
 mod core_paths;
-mod state_probes;
-mod scheduler_probes;
 mod cow_probe;
 mod ipc_probes;
+mod scheduler_probes;
 mod scheduling_context_probe;
+mod state_probes;
 mod tails;
 mod uaccess_selftest;
 use cow_probe::probe_fork_cow_private_write;
@@ -212,8 +212,13 @@ fn linux_output() -> bool {
 fn benchmark_executable() -> CString {
     if linux_output() {
         use std::os::unix::ffi::OsStrExt;
-        CString::new(std::env::current_exe().expect("Linux executable path").as_os_str().as_bytes())
-            .expect("executable path has no NUL")
+        CString::new(
+            std::env::current_exe()
+                .expect("Linux executable path")
+                .as_os_str()
+                .as_bytes(),
+        )
+        .expect("executable path has no NUL")
     } else {
         CString::new("apps/ipcbench/ipcbench.elf").expect("fixed exec path")
     }
@@ -235,13 +240,28 @@ fn emit_line(message: &str) {
     let mut line = Vec::with_capacity(message.len() + 1);
     line.extend_from_slice(message.as_bytes());
     line.push(b'\n');
-    unsafe {
-        syscall2(
-            SYS_RUSTOS_DEBUG_PRINT,
-            line.as_ptr() as u64,
-            line.len() as u64,
-        );
+    let mut written = 0;
+    // Output is outside measured windows. Backpressure must not silently drop
+    // a result or tail witness when another CPU temporarily owns the sink.
+    for _ in 0..1024 {
+        let result = unsafe {
+            syscall2(
+                SYS_RUSTOS_DEBUG_PRINT,
+                line[written..].as_ptr() as u64,
+                (line.len() - written) as u64,
+            )
+        } as i64;
+        if result > 0 && result as usize <= line.len() - written {
+            written += result as usize;
+            if written == line.len() {
+                return;
+            }
+        } else if result != -(libc::EAGAIN as i64) {
+            panic!("benchmark diagnostic transport failed: {result}");
+        }
+        thread::yield_now();
     }
+    panic!("benchmark diagnostic transport did not drain");
 }
 
 // -------------------------------------------------------------------- TSC
@@ -554,8 +574,16 @@ impl Drop for LifecycleStampMapping {
     }
 }
 
-fn valid_lifecycle_window(parent_begin: u64, parent_end: u64, child_begin: u64, child_end: u64) -> bool {
-    parent_begin > 0 && parent_begin <= child_begin && child_begin <= child_end && child_end <= parent_end
+fn valid_lifecycle_window(
+    parent_begin: u64,
+    parent_end: u64,
+    child_begin: u64,
+    child_end: u64,
+) -> bool {
+    parent_begin > 0
+        && parent_begin <= child_begin
+        && child_begin <= child_end
+        && child_end <= parent_end
 }
 
 fn last_errno() -> i32 {
@@ -1091,7 +1119,7 @@ fn run_single_probe(name: &str, tsc_khz: u64) {
         core_contract::STATE => state_probes::run(tsc_khz),
         // uiserver owns the exact GPU receipt samples. Keep only our CPUID
         // anchor and safety preflight; never substitute a syscall for a frame.
-        core_contract::GUI => {},
+        core_contract::GUI => {}
         core_contract::SCHEDULER => scheduler_probes::run(tsc_khz),
         core_contract::LIFECYCLE => state_probes::lifecycle(tsc_khz),
         suite if core_contract::probes(suite).is_some() => core_paths::run(suite, tsc_khz),

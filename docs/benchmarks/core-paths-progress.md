@@ -3,9 +3,40 @@
 목표는 코어 IPC 이외 **전체 경로**의 비용 분해, 불필요한 작업 제거,
 p99/p50 ≤ 1.5, 동일 호스트 Linux 게스트 대비 목표 달성이다. 부분 벤치 추가나
 네이티브 Linux 측정만으로 완료를 주장하지 않는다. ring-3 정책 및 Linux/Windows
-호환 경계를 유지하며, 커밋은 사용자가 수행한다.
+호환 경계를 유지한다. 아래 초기 전체 프로그램의 목표/미착수 표는 역사적
+스냅샷이다. 현재 요청은 기존·부분구현 경로 안정화이며, 새 pipe/eventfd/쓰기
+FS/SEQPACKET/proc/blocking socket 구현은 제외한다. 현재 요청은 검증·문서 정리
+후 에이전트가 커밋하는 것으로 이전의 사용자 커밋 조건을 대체한다.
 
-## 요구사항 / 완료 증거
+## 2026-10-22 안정화 continuation (진행 중)
+
+정적 목록은 [core-paths-gaps](../ai/performance/core-paths-gaps.md)가 소유한다.
+wait4의 소비 후 EINTR 유실, pin이 남은 종료 상태 재소비, WNOHANG/ECHILD 및
+경쟁 waiter 통지를 보완했다. remote activation의 reschedule 요청은 cohort,
+frame readers/pins와 외부 authority 해제 후에만 발행한다. coalesced mailbox도
+다시 통지한다. 진단 출력은 실제 수락 prefix만 반환하고 suffix만 bounded retry한다.
+공유 writer와 직접 service writer도 같은 계약으로 수렴시켰다.
+
+같은 호스트·1 vCPU·CPUID p50=4,480 ticks의 대조:
+
+| 로그 정책 | fork+wait p50 | activation→first turn p50 | exit→reap p50 | archive suffix |
+|---|---:|---:|---:|---|
+| A1 정상 경로도 출력 | 35,020,040 | 19,858,000 | 14,999,480 | 1792653416508135497 |
+| B1 trace opt-in | 2,560,680 | 2,248,920 | 320,680 | 1792654153036620740 |
+| A2 정상 출력 복원 | 35,485,040 | 16,481,960 | 14,593,840 | 1792654454510144372 |
+
+각 archive는 `build/bench-core/core_lifecycle-vcpu-1-<suffix>/`이다.
+B2는 benchmark 전 uiserver 부팅 오류로 거부했으며 개선 반복 증거로 세지 않는다
+(`1792654542580042857`). p99/tail 합격이나 Linux 대비 목표 달성을 주장하지 않는다.
+정상 fork/exit 진단만 opt-in으로 옮겼고 비정상 종료/exec 거부 진단은 유지한다.
+
+후속 sparse/mixed munmap 보완은 반복 hole 제거, 부분 초기화 cleanup, 전체
+range ownership/할당 preflight, backing의 TLB barrier 수명 및 syscalld의 단일
+broker transaction을 포함한다. native MM 80 / PS 977 / compat 184 / ipcbench 20은
+해당 중간 tree에서 통과했다. 최종 now/PR/SMP/KVM 및 state rail은 아직 확인 중이다.
+8CPU state의 과세 판정은 해제하지 않았고 checkpoint 뒤 진단 재측정만 추가했다.
+
+## 초기 요구사항 / 당시 완료 증거 (역사)
 
 | 영역 | 필요한 증거 | 현재 상태 |
 |---|---|---|

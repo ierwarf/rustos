@@ -1142,11 +1142,9 @@ fn boot_line(message: &str) {
     }
     // SAFETY: The diagnostic syscall copies the byte slice synchronously;
     // `line` remains live and immutable for the syscall duration.
-    unsafe {
-        let mut line = message.as_bytes().to_vec();
-        line.push(b'\n');
-        let _ = libc::syscall(0x5255_0001 as libc::c_long, line.as_ptr(), line.len());
-    }
+    let mut line = message.as_bytes().to_vec();
+    line.push(b'\n');
+    observability_client::debug_bytes(&line);
 }
 
 #[cfg(test)]

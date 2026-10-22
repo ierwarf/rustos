@@ -47,10 +47,97 @@ pub fn log_args(service: &str, category: LogCategory, level: LogLevel, args: fmt
         args
     );
     line.push('\n');
-    let emitted =
-        unsafe { libc::syscall(SYS_RUSTOS_DEBUG_PRINT, line.as_ptr() as usize, line.len()) };
-    if emitted < 0 {
-        let _ = std::io::stderr().write_all(line.as_bytes());
+    debug_bytes(line.as_bytes());
+}
+
+/// Emit already-framed diagnostic bytes with bounded suffix-only retries and
+/// stderr fallback for precisely the unaccepted suffix.
+pub fn debug_bytes(bytes: &[u8]) {
+    let written = write_debug_bytes_with(
+        bytes,
+        |remaining| {
+            let result = unsafe {
+                libc::syscall(
+                    SYS_RUSTOS_DEBUG_PRINT,
+                    remaining.as_ptr() as usize,
+                    remaining.len(),
+                )
+            };
+            if result < 0 {
+                -(std::io::Error::last_os_error()
+                    .raw_os_error()
+                    .unwrap_or(libc::EIO) as i64)
+            } else {
+                result as i64
+            }
+        },
+        std::thread::yield_now,
+    );
+    if written < bytes.len() {
+        // A short write already emitted its prefix; never duplicate it in the
+        // fallback, and never mistake a nonnegative prefix for a full line.
+        let _ = std::io::stderr().write_all(&bytes[written..]);
+    }
+}
+
+fn write_debug_bytes_with(
+    bytes: &[u8],
+    mut write: impl FnMut(&[u8]) -> i64,
+    mut yield_now: impl FnMut(),
+) -> usize {
+    let mut written = 0;
+    for _ in 0..64 {
+        if written == bytes.len() {
+            break;
+        }
+        let result = write(&bytes[written..]);
+        if result > 0 && result as usize <= bytes.len() - written {
+            written += result as usize;
+        } else if result != -(libc::EAGAIN as i64) {
+            break;
+        }
+        if written != bytes.len() {
+            yield_now();
+        }
+    }
+    written
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    #[test]
+    fn short_write_then_refusal_never_duplicates_prefix() {
+        let mut responses = [2, -(libc::EAGAIN as i64), 3].into_iter();
+        let mut lengths = Vec::new();
+        assert_eq!(
+            super::write_debug_bytes_with(
+                b"hello",
+                |remaining| {
+                    lengths.push(remaining.len());
+                    responses.next().unwrap()
+                },
+                || {}
+            ),
+            5
+        );
+        assert_eq!(lengths, [5, 3, 3]);
+        let mut calls = 0;
+        assert_eq!(
+            super::write_debug_bytes_with(
+                b"hello",
+                |_| {
+                    calls += 1;
+                    if calls == 1 {
+                        2
+                    } else {
+                        -5
+                    }
+                },
+                || {}
+            ),
+            2
+        );
+        assert_eq!(super::write_debug_bytes_with(b"hello", |_| -11, || {}), 0);
     }
 }
 

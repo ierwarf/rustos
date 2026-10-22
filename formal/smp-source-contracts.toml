@@ -118,6 +118,9 @@ tokens = ["priority_choice: UnsafeCell<Option<", "fn begin_priority_choice(", "s
 path = "kernel/ps/src/multitask/scheduler/activation/publication.rs"
 tokens = ["dispatch_priority::Publication::begin(turn, target)", "dispatch_policy::lock(target)", "enqueue_priority(&mut policy, record)", "publish_atomic_activation_pending(target)"]
 [[required_sequences]]
+path = "kernel/ps/src/multitask/scheduler/activation/publication.rs"
+tokens = ["fn commit_with_notify", "RemoteWakeOutcome::Published { cpu, .. } => Some(cpu)", "notify_cpus |= 1u64 << cpu", "owner.cohort.complete()", "drop(readers)", "drop(pins)", "drop(authority)", "while notify_cpus != 0", "notify(cpu)"]
+[[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/dispatcher/maintenance.rs"
 tokens = ["struct MigrationFrame<'a>", "turn: &'a CpuDispatchTurn", "token: frame_publication::StableFrameToken", "_reader: stack_resources::frame_readers::FrameReader<'a>", "fn transfer(", "frame_publication::pin_for_identity(token, id)", "frame_readers::acquire(&pin, cpu)", "context_validation::validate_published_saved_context", "MigrationFrame { turn, token, id, source, _reader: reader }", "runqueue::rehome_queued_frame(&frame", "drop(frame)", "drop(pin)", "request_target_reschedule(cpu)"]
 [[required_sequences]]
@@ -198,7 +201,7 @@ regex = '(Scheduler::|scheduler_mut|scheduler_ref|SCHEDULER|TrackedSpinLock|find
 reason = "Complete activation uses immutable captured physical members/frame loans and existing per-CPU leaves, not a facade, ID rescan or global serializer."
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/activation/publication.rs"
-tokens = ["fn caller(", "turn.cpu()", "current_cpu_task_slot()", "assert!(stack_resources::cpu_leases::owns_current(", "turn.cpu(),", "original", "fn commit<G>(", "caller(turn, original)", "&owner.members[..owner.len]", "lifecycle.retired || !lifecycle.suspended", "task_slot_is_running(slot)", "context::read(slot)", "scheduling_context.is_bound_to(id)", "observed_frame_token(slot, turn.cpu(), false)", "pin_for_identity(token, id)", "pins[i] = Some(pin)", "let mut readers", "frame_readers::acquire(", "current.frame_epoch != token.frame_epoch", "context_validation::validate_published_saved_context(", "readers[i] = Some(reader)", "commit_authority()", "caller(turn, original)", "identity::lifecycle(slot).suspended", "task_slot_is_running(slot)", "owner.cohort.begin_effects()", "atomic_activation_handoff_remaining == 0", "owner.cohort.unsuspend(slot, id)", "if lifecycle.retired", "kernel_creation::ready_floor(turn.cpu(), Some(system))", "raise_vruntime_floor(", "SLEEPER_LATENCY_BONUS_NS", "set_blocked(slot, false)", "set_armed(slot, false)", "lifecycle.job_stopped || lifecycle.exec_quiesced", "affinity_target_cpu(slot, eligible_cpus(slot))", "publish_local_wake(", "publish_remote_wake(", "identity::lifecycle(slot).retired", "runqueue::owner(slot).runnable", "request_target_reschedule(", "enqueue_priority(&mut policy, record)", "publish_atomic_activation_pending(target)", "spawn_pick_hints", "donate_floor(slot, &current, turn.cpu(), system)", "owner.cohort.complete()", "caller(turn, original)", "drop(readers)", "drop(pins)", "fn donate_floor(", "published_candidate_admission(", "ready_floor(cpu, Some(system))", "caller_floor.min(class_floor.saturating_sub(IPC_DONATION_BONUS_NS))", "lower_vruntime_ceiling("]
+tokens = ["fn caller(", "turn.cpu()", "current_cpu_task_slot()", "assert!(stack_resources::cpu_leases::owns_current(", "turn.cpu(),", "original", "fn commit<G>(", "caller(turn, original)", "&owner.members[..owner.len]", "lifecycle.retired || !lifecycle.suspended", "task_slot_is_running(slot)", "context::read(slot)", "scheduling_context.is_bound_to(id)", "observed_frame_token(slot, turn.cpu(), false)", "pin_for_identity(token, id)", "pins[i] = Some(pin)", "let mut readers", "frame_readers::acquire(", "current.frame_epoch != token.frame_epoch", "context_validation::validate_published_saved_context(", "readers[i] = Some(reader)", "commit_authority()", "caller(turn, original)", "identity::lifecycle(slot).suspended", "task_slot_is_running(slot)", "owner.cohort.begin_effects()", "atomic_activation_handoff_remaining == 0", "owner.cohort.unsuspend(slot, id)", "if lifecycle.retired", "kernel_creation::ready_floor(turn.cpu(), Some(system))", "raise_vruntime_floor(", "SLEEPER_LATENCY_BONUS_NS", "set_blocked(slot, false)", "set_armed(slot, false)", "lifecycle.job_stopped || lifecycle.exec_quiesced", "affinity_target_cpu(slot, eligible_cpus(slot))", "publish_local_wake(", "publish_remote_wake(", "identity::lifecycle(slot).retired", "runqueue::owner(slot).runnable", "enqueue_priority(&mut policy, record)", "publish_atomic_activation_pending(target)", "spawn_pick_hints", "donate_floor(slot, &current, turn.cpu(), system)", "owner.cohort.complete()", "caller(turn, original)", "drop(readers)", "drop(pins)", "drop(authority)", "notify(cpu)", "fn donate_floor(", "published_candidate_admission(", "ready_floor(cpu, Some(system))", "caller_floor.min(class_floor.saturating_sub(IPC_DONATION_BONUS_NS))", "lower_vruntime_ceiling("]
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/kernel_creation.rs"
 tokens = ["fn creation_floor(", "ready_floor(cpu, None).saturating_add(SCHED_NEW_TASK_VRUNTIME_PENALTY_NS)", "fn ready_floor(", "runqueue::local_runnable_slots(cpu)", "SYSTEM_CLASS_WEIGHT_FLAG", "donation_ledger::inherited_system(slot)", "system.is_some_and(|expected| expected != candidate_system)", "published_candidate_admission(", "local_frame_token(", "pin_for_identity(token, id)", "frame_readers::acquire(", "validate_published_saved_context(", "token_is_current(", "floor.unwrap_or(0)"]
@@ -2166,12 +2169,13 @@ tokens = ["fn synchronous(",
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/runqueue/ipc_handoff.rs"
 tokens = [
-    "fn preserve_budget_refused_handoff_generation(",
-    "if observed.generation != generation {",
-    "match observed.state {",
-    "RunOwnerState::DirectHandoff => {",
-    "materialize_direct_handoff_with_generation(slot, cpu, weight, Some(generation))",
-    "RunOwnerState::Local | RunOwnerState::RemoteQueued => true,",
+    "fn materialize_direct_handoff_with_generation(",
+    "expected_generation.is_some_and(|generation| generation != observed.generation)",
+    "observed.state != RunOwnerState::DirectHandoff",
+    "rq.insert(slot, weight)",
+    "OWNER_WORDS[slot].compare_exchange(observed, next)",
+    "rq.remove(slot, weight)",
+    "frame_publication::bind_local_owner_generation(slot, next.generation)",
 ]
 
 [[required_sequences]]
@@ -2399,6 +2403,10 @@ tokens = ["CommitGrant::capture_ticket(", "Cohort::begin(&[r.parent])?", "fn pub
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/process_affinity.rs"
 tokens = ["process_placement::Change::begin", "change.live_members()", "cohort::Cohort::begin", "fn finish_with(", "self.change.begin_effects()", "self.cohort.begin_effects()", "affinity_payload::set_affinity_owned", "rehome(slot, id, self.requested, &self.cohort)", "self.change.publish(self.requested, &mut self.cohort)", "self.cohort.finish_published()", "self.change.finish()"]
+
+[[required_sequences]]
+path = "kernel/ps/src/multitask/pager_vma.rs"
+tokens = ["pub fn unmap_for_process(", "unmap_for_process_inner(", "false,", "pub fn unmap_for_process_with(", "unmap_for_process_inner(process_id, start, end, true, mutate, release)", "fn unmap_for_process_inner(", "published_live_process_identity(retained.handle())", "!= Some(identity)", "rewrite_attenuated_range(", "if mutate_without_publication", "mutate(state)?", "release(state)"]
 
 [[audited_fail_stops]]
 name = "atomic-activation-cohort-publication"

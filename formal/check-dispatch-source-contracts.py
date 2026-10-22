@@ -103,12 +103,16 @@ if 'multitask::arm_block_current_task()' in rpc_wait:
 
 # Deferred registry permission is transferred AFTER physical preflight, never
 # retained as a raw guard across Current/Cohort capture or queue effects.
-activation_commit = body((base / 'activation/publication.rs').read_text(), 'commit')
+activation_source = (base / 'activation/publication.rs').read_text()
+ordered(body(activation_source, 'commit'), ['commit_with_notify(', 'request_target_reschedule(cpu)'],
+    'shipping activation delegates to the checked publication owner')
+activation_commit = body(activation_source, 'commit_with_notify')
 ordered(activation_commit, ['OriginalCurrent::borrow(turn)', 'let members =',
     'frame_readers::acquire(', 'readers[i] = Some(reader)',
     'let Some(authority) = commit_authority() else { return false; };',
     'held_spin_lock_depth()', 'owner.cohort.begin_effects()', 'owner.cohort.unsuspend(slot, id)',
-    'owner.cohort.complete()', 'drop(readers)', 'drop(pins)', 'current.check()', 'drop(authority)'],
+    'owner.cohort.complete()', 'drop(readers)', 'drop(pins)', 'current.check()', 'drop(authority)',
+    'while notify_cpus != 0', 'notify(cpu)'],
     'original activation grant survives final publication without raw registry lock')
 proc_broker = Path('kernel/compat/src/user/syscall/linux/proc_broker_ops.rs').read_text()
 for text, name in [(proc_broker, 'syscall_linux_rustos_proc_activate_broker'),

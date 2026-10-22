@@ -431,6 +431,12 @@ kernel-stamped sender; ring0 owns only the bounded atomic publication:
 - the capability-registry guard is released before milestone or diagnostic
   output, so newly runnable siblings cannot contend on a preempted logging
   owner;
+- remote reschedule requests are published only after cohort admission,
+  frame readers, execution pins and external authority are released. A target
+  can consume a request independently of the producer's deferred IPI flush;
+  deferring the physical IPI alone is not a release barrier. Every accepted
+  remote target is notified once per CPU, including an already-owned/nonempty
+  mailbox whose edge notification was coalesced;
 - successful publication completes every surviving member before loader reply;
   where latency priority is admitted, the bounded exact cohort FIFO gives its
   first-turn prefix before the synchronous loader reply chain;

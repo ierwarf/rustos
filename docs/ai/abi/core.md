@@ -4,6 +4,15 @@
 
 ## Kernel/Userspace ABI Surface
 
+`SYS_DEBUG_PRINT` is a bounded-admission byte stream: success counts only the
+accepted input prefix; zero admission returns `EAGAIN`. A later copy fault
+returns an already accepted prefix rather than inviting duplicate replay.
+Callers retry only the unaccepted suffix, with bounded yielding outside timed
+measurement windows. Benchmark output exhaustion fails collection; runtime
+best-effort diagnostics count abandoned suffix bytes, and observability falls
+back to stderr for the remaining suffix. Retriable refusal is not counted as a
+dropped record until its owner abandons it. Admission is not durable delivery.
+
 - Shared ABI crate: `libs/rustos-user-abi`.
 - Kernel re-export: `kernel/ps/src/user/{abi,handles,sysops}.rs`. `kernel/compat` re-exports through `kernel_ps::api`; no shadow ABI/handle/user-memory sysop files.
 - Device/console/UI `repr(C)` structs and ioctl numbers must live in `rustos-user-abi`. Services (`uiserver`, `runtimed`) consume that crate — never duplicate request structs or ioctl encoding.

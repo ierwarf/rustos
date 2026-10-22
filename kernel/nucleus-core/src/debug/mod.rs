@@ -9,7 +9,7 @@ mod milestone_frame;
 pub mod phase_profile;
 pub mod product_snapshot_evidence;
 #[cfg(rustos_debug_print_enabled)]
-use milestone_class::{MilestoneOutputClass, milestone_loss_snapshot, milestone_output_class};
+use milestone_class::{milestone_loss_snapshot, milestone_output_class, MilestoneOutputClass};
 
 use alloc::string::String;
 use alloc::vec;
@@ -967,24 +967,34 @@ pub fn println_fmt(args: fmt::Arguments<'_>) {
 /// exactly one `print_bytes_unlocked` call.
 #[cfg(rustos_debug_print_enabled)]
 pub fn println_serialized(args: fmt::Arguments<'_>) {
+    if let Err(bytes) = try_println_serialized(args) {
+        DEBUG_BYTES_DISCARDED.fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+}
+
+/// Nonblocking admission: refusal leaves ownership with the caller, which may
+/// retry after leaving the diagnostic/IRQ context. No record is accepted twice.
+#[cfg(rustos_debug_print_enabled)]
+fn try_println_serialized(args: fmt::Arguments<'_>) -> Result<(), usize> {
     let mut line = FixedDebugconLine::<SERIALIZED_DEBUGCON_LINE_CAPACITY>::new();
     if render_serialized_debugcon_line(&mut line, args).is_err() {
         // The whole line is intentionally omitted. Reporting a prefix would
         // turn an unavailable diagnostic into false structured evidence.
-        DEBUG_BYTES_DISCARDED.fetch_add(line.len() as u64, Ordering::Relaxed);
-        return;
+        return Err(line.len());
     }
     for _ in 0..DEBUG_OUTPUT_ACQUIRE_ATTEMPTS {
         if let Some(_guard) = try_debug_output_lock() {
             drain_deferred_records();
             print_bytes_unlocked(line.bytes());
-            return;
+            return Ok(());
         }
         spin_loop();
     }
     // Park for whichever CPU takes the sink next, rather than discarding.
-    if !deferred::park(line.bytes()) {
-        DEBUG_BYTES_DISCARDED.fetch_add(line.len() as u64, Ordering::Relaxed);
+    if deferred::park(line.bytes()) {
+        Ok(())
+    } else {
+        Err(line.len())
     }
 }
 
@@ -1040,21 +1050,34 @@ impl fmt::Display for EscapedUserDebugPayload<'_> {
 /// can confuse with a kernel-stamped evidence frame. Printable diagnostic
 /// substrings remain visible to existing bounded marker searches.
 #[cfg(rustos_debug_print_enabled)]
-pub fn write_user_bytes_serialized(bytes: &[u8]) {
+pub fn write_user_bytes_serialized(bytes: &[u8]) -> usize {
+    write_user_bytes_with(bytes, |payload| {
+        try_println_serialized(format_args!(
+            "user-debug payload={}",
+            EscapedUserDebugPayload(payload)
+        ))
+        .is_ok()
+    })
+}
+
+#[cfg(rustos_debug_print_enabled)]
+fn write_user_bytes_with(bytes: &[u8], mut admit: impl FnMut(&[u8]) -> bool) -> usize {
     let mut written = 0;
     while written < bytes.len() {
         let payload_len = bounded_user_debug_payload_prefix(&bytes[written..]);
         debug_assert!(payload_len != 0);
-        println_serialized(format_args!(
-            "user-debug payload={}",
-            EscapedUserDebugPayload(&bytes[written..written + payload_len])
-        ));
+        if !admit(&bytes[written..written + payload_len]) {
+            break;
+        }
         written += payload_len;
     }
+    written
 }
 
 #[cfg(not(rustos_debug_print_enabled))]
-pub fn write_user_bytes_serialized(_bytes: &[u8]) {}
+pub fn write_user_bytes_serialized(bytes: &[u8]) -> usize {
+    bytes.len()
+}
 
 #[cfg(not(rustos_debug_print_enabled))]
 pub fn println_fmt(_args: fmt::Arguments<'_>) {}

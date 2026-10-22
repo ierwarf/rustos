@@ -19,18 +19,19 @@ mod pager_admission;
 
 use alloc::vec;
 use alloc::vec::Vec;
-use x86_64::VirtAddr;
 use x86_64::structures::paging::PageTableFlags;
+use x86_64::VirtAddr;
 
 use rustos_user_abi::syscall::{
-    IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY, MM_BROKER_ABI_VERSION, MM_BROKER_FD_KIND_DEVICE,
-    MM_BROKER_FD_KIND_DISPLAY_SURFACE, MM_BROKER_FD_KIND_FILE, MM_BROKER_FD_KIND_MEMFD,
-    MM_BROKER_FD_KIND_NONE, MM_BROKER_FD_RIGHT_MAP, MM_BROKER_FD_RIGHT_READ,
-    MM_BROKER_FD_RIGHT_WRITE, MM_BROKER_OP_DESCRIBE_FD, MM_BROKER_OP_MAP_ANON,
-    MM_BROKER_OP_MAP_DEVICE_SHARED, MM_BROKER_OP_MAP_FILE_PRIVATE, MM_BROKER_OP_MAP_MEMFD_SHARED,
-    MM_BROKER_OP_PROTECT, MM_BROKER_OP_QUERY_LAYOUT, MM_BROKER_OP_UNMAP, MM_BROKER_PATH_CAPACITY,
     RustosMmBrokerArgs, RustosMmFdBrokerResult, RustosMmLayoutBrokerResult,
-    RustosMmMapBrokerResult, VFS_DEVICE_ACCESS_DRM_COMPAT, VFS_IPC_PAYLOAD_CAPACITY,
+    RustosMmMapBrokerResult, IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY, MM_BROKER_ABI_VERSION,
+    MM_BROKER_FD_KIND_DEVICE, MM_BROKER_FD_KIND_DISPLAY_SURFACE, MM_BROKER_FD_KIND_FILE,
+    MM_BROKER_FD_KIND_MEMFD, MM_BROKER_FD_KIND_NONE, MM_BROKER_FD_RIGHT_MAP,
+    MM_BROKER_FD_RIGHT_READ, MM_BROKER_FD_RIGHT_WRITE, MM_BROKER_OP_DESCRIBE_FD,
+    MM_BROKER_OP_MAP_ANON, MM_BROKER_OP_MAP_DEVICE_SHARED, MM_BROKER_OP_MAP_FILE_PRIVATE,
+    MM_BROKER_OP_MAP_MEMFD_SHARED, MM_BROKER_OP_PROTECT, MM_BROKER_OP_QUERY_LAYOUT,
+    MM_BROKER_OP_UNMAP, MM_BROKER_PATH_CAPACITY, VFS_DEVICE_ACCESS_DRM_COMPAT,
+    VFS_IPC_PAYLOAD_CAPACITY,
 };
 
 use rustos_user_abi::pager::MM_BROKER_OP_SET_ANON_POLICY;
@@ -594,20 +595,45 @@ fn retry_transient_range_edit<T>(
 fn broker_unmap(args: &RustosMmBrokerArgs) -> Result<(), i64> {
     let len = checked_len(args.len)?;
     let start = checked_page_addr(args.addr)?;
-    let end = start.checked_add(args.len).ok_or(LINUX_EINVAL)?;
-    let pager_end = checked_mapping_end(start, page_count(len)?)?;
-    match retry_transient_range_edit("munmap", || {
-        multitask::unmap_pager_vma_for_process(args.target_pid, start, pager_end)
-    }) {
-        // Ring0 freed its own VMA slot and that is the entire release. There is
-        // no pager region to drop, so `munmap` no longer makes a synchronous
-        // round trip to a single serial pager, and no unconfirmed release can
-        // be left behind to refuse a later mapping of the same range as an
-        // overlap.
-        Ok(Some(_)) => return Ok(()),
-        Ok(None) => {}
-        Err(multitask::PagerVmaError::Pressure) => return Err(LINUX_ENOMEM),
-        Err(multitask::PagerVmaError::Malformed) => return Err(LINUX_EINVAL),
+    let end = checked_mapping_end(start, page_count(len)?)?;
+    let mut mutation_errno = None;
+    let result = retry_transient_range_edit("munmap", || {
+        multitask::unmap_pager_vma_for_process_with(
+            args.target_pid,
+            start,
+            end,
+            |state| {
+                unmap_process_range(state, start, end).map_err(|errno| {
+                    mutation_errno = Some(errno);
+                    if errno == LINUX_ENOMEM {
+                        multitask::PagerVmaError::Pressure
+                    } else {
+                        multitask::PagerVmaError::Stale
+                    }
+                })
+            },
+            |state| {
+                state.release_shared_memfd_mappings_in_range(start, end);
+                state.release_shared_region_mappings_in_range(start, end);
+                state
+                    .handles_mut()
+                    .clear_surface_mappings_in_range(start, end - start);
+            },
+        )
+    });
+    if let Some(errno) = mutation_errno {
+        nucleus_core::debug::record_milestone(
+            nucleus_core::debug::LogCategory::Compat,
+            "mm-unmap-leaf-refused",
+            start,
+            errno as u64,
+        );
+        return Err(errno);
+    }
+    match result {
+        Ok(_) => Ok(()),
+        Err(multitask::PagerVmaError::Pressure) => Err(LINUX_ENOMEM),
+        Err(multitask::PagerVmaError::Malformed) => Err(LINUX_EINVAL),
         Err(refusal) => {
             nucleus_core::debug::record_milestone(
                 nucleus_core::debug::LogCategory::Compat,
@@ -615,88 +641,57 @@ fn broker_unmap(args: &RustosMmBrokerArgs) -> Result<(), i64> {
                 args.target_pid,
                 refusal as u64,
             );
-            return Err(LINUX_EFAULT);
+            Err(LINUX_EFAULT)
         }
     }
-    let Some(result) = multitask::with_process_state_by_pid_mut(args.target_pid, |process_state| {
-        let mut external_segments = Vec::new();
-        external_segments.extend(
-            process_state
-                .shared_memfd_overlap_segments(start, end)
-                .into_iter()
-                .map(|(segment_start, segment_len)| {
-                    (
-                        segment_start,
-                        segment_start.saturating_add(segment_len as u64),
-                    )
-                }),
-        );
-        external_segments.extend(
-            process_state
-                .shared_region_overlap_segments(start, end)
-                .into_iter()
-                .map(|(segment_start, segment_len)| {
-                    (segment_start, segment_start.saturating_add(segment_len))
-                }),
-        );
-        external_segments.extend(
-            process_state
-                .handles()
-                .surface_overlap_segments(start, end)
-                .into_iter()
-                .map(|(segment_start, segment_len)| {
-                    (segment_start, segment_start.saturating_add(segment_len))
-                }),
-        );
-        external_segments.sort_by_key(|(segment_start, _)| *segment_start);
+}
 
-        if external_segments.is_empty() {
-            process_state
-                .address_space_mut()
-                .unmap_user_bytes(VirtAddr::new(start), len)
-                .map_err(address_space_error_to_linux_errno)?;
-        } else {
-            let mut cursor = start;
-            for (segment_start, segment_end) in external_segments {
-                let segment_start = segment_start.max(cursor);
-                let segment_end = segment_end.min(end);
-                if cursor < segment_start {
-                    let owned_len =
-                        usize::try_from(segment_start - cursor).map_err(|_| LINUX_EINVAL)?;
-                    process_state
-                        .address_space_mut()
-                        .unmap_user_bytes(VirtAddr::new(cursor), owned_len)
-                        .map_err(address_space_error_to_linux_errno)?;
-                }
-                if segment_start < segment_end {
-                    let pages = page_count(
-                        usize::try_from(segment_end - segment_start).map_err(|_| LINUX_EINVAL)?,
-                    )?;
-                    process_state
-                        .address_space_mut()
-                        .unmap_user_pages_without_free_at(VirtAddr::new(segment_start), pages)
-                        .map_err(address_space_error_to_linux_errno)?;
-                    cursor = segment_end;
-                }
-            }
-            if cursor < end {
-                let owned_len = usize::try_from(end - cursor).map_err(|_| LINUX_EINVAL)?;
-                process_state
-                    .address_space_mut()
-                    .unmap_user_bytes(VirtAddr::new(cursor), owned_len)
-                    .map_err(address_space_error_to_linux_errno)?;
-            }
-        }
-        process_state.release_shared_memfd_mappings_in_range(start, end);
-        process_state.release_shared_region_mappings_in_range(start, end);
+fn unmap_process_range(
+    process_state: &mut multitask::UserProcessState,
+    start: u64,
+    end: u64,
+) -> Result<(), i64> {
+    let mut external_segments = Vec::new();
+    external_segments.extend(
         process_state
-            .handles_mut()
-            .clear_surface_mappings_in_range(start, args.len);
-        Ok(())
-    }) else {
-        return Err(LINUX_ESRCH);
-    };
-    result
+            .shared_memfd_overlap_segments(start, end)
+            .into_iter()
+            .map(|(segment_start, segment_len)| {
+                (
+                    segment_start,
+                    segment_start.saturating_add(segment_len as u64),
+                )
+            }),
+    );
+    external_segments.extend(
+        process_state
+            .shared_region_overlap_segments(start, end)
+            .into_iter()
+            .map(|(segment_start, segment_len)| {
+                (segment_start, segment_start.saturating_add(segment_len))
+            }),
+    );
+    external_segments.extend(
+        process_state
+            .handles()
+            .surface_overlap_segments(start, end)
+            .into_iter()
+            .map(|(segment_start, segment_len)| {
+                (segment_start, segment_start.saturating_add(segment_len))
+            }),
+    );
+    // One preflight/commit over the ENTIRE range: per-segment mutation
+    // could remove a pager prefix, then fail allocation/ownership checks
+    // on a later borrowed segment and restore misleading VMA authority.
+    process_state
+        .address_space_mut()
+        .unmap_present_user_pages_with_external_at(
+            VirtAddr::new(start),
+            page_count(usize::try_from(end - start).map_err(|_| LINUX_EINVAL)?)?,
+            &external_segments,
+        )
+        .map(|_| ())
+        .map_err(address_space_error_to_linux_errno)
 }
 
 fn file_mapping_source(target_pid: u64, fd: u64) -> Result<FileMappingSource, i64> {

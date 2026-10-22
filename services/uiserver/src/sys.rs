@@ -618,13 +618,7 @@ pub(crate) fn heartbeat_line(message: &str) {
 pub(crate) fn debug_line(message: &str) {
     let mut line = message.as_bytes().to_vec();
     line.push(b'\n');
-    unsafe {
-        let _ = syscall2(
-            syscall_abi::SYS_RUSTOS_DEBUG_PRINT as usize,
-            line.as_ptr() as usize,
-            line.len(),
-        );
-    }
+    rustos_svc_runtime::ipc::debug_bytes(&line);
 }
 
 /// Makes an auxiliary uiserver thread surrender the System-class admission and

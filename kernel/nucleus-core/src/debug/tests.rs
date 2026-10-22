@@ -128,6 +128,30 @@ fn ring3_debug_bytes_are_bounded_and_cannot_open_a_milestone_frame() {
 }
 
 #[test]
+fn user_debug_refusal_reports_only_admitted_prefix_for_retry() {
+    let bytes = [0u8; 256]; // Escaping splits this into 120-byte payloads.
+    let mut accepted = std::vec::Vec::new();
+    let mut calls = 0;
+    let prefix = write_user_bytes_with(&bytes, |payload| {
+        calls += 1;
+        if calls == 2 {
+            return false;
+        }
+        accepted.extend_from_slice(payload);
+        true
+    });
+    assert_eq!(prefix, 120);
+    assert_eq!(accepted.len(), prefix);
+    let suffix = write_user_bytes_with(&bytes[prefix..], |payload| {
+        accepted.extend_from_slice(payload);
+        true
+    });
+    assert_eq!(prefix + suffix, bytes.len());
+    assert_eq!(accepted.as_slice(), bytes.as_slice());
+    assert_eq!(write_user_bytes_with(b"refused", |_| false), 0);
+}
+
+#[test]
 fn milestone_frame_is_complete_self_framed_and_checksum_verified() {
     let record = MilestoneRecord {
         seq: 29,

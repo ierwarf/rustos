@@ -3,6 +3,22 @@ pub trait AddressRange {
     fn end(&self) -> u64;
 }
 
+/// munmap as one transaction: the kernel revocation of the whole interval runs
+/// first, and policy bookkeeping is removed only after it succeeded. A hole in
+/// the policy table is still a valid unmap (legacy leaves may sit there), so
+/// the revocation always runs.
+pub fn unmap_range_with<S, E>(
+    state: &mut S,
+    start: u64,
+    end: u64,
+    revoke: impl FnOnce(u64, u64) -> Result<(), E>,
+    remove_policy: impl FnOnce(&mut S, u64, u64),
+) -> Result<(), E> {
+    revoke(start, end)?;
+    remove_policy(state, start, end);
+    Ok(())
+}
+
 pub fn next_fit_with_wrap<T: AddressRange>(
     ranges: &[T],
     lower_bound: u64,
@@ -55,6 +71,56 @@ fn align_up(value: u64, alignment: u64) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sparse_munmap_is_one_transaction_and_commits_policy_only_on_success() {
+        use super::unmap_range_with;
+        // (start, end) policy intervals; an empty one is (0, 0).
+        let mut policy = [(0x4000_u64, 0x5000_u64), (0x6000, 0x7000)];
+        let remove = |p: &mut [(u64, u64); 2], start: u64, end: u64| {
+            for range in p.iter_mut() {
+                if start < range.1 && range.0 < end {
+                    *range = (0, 0);
+                }
+            }
+        };
+        let mut calls = 0;
+        let refused = unmap_range_with(
+            &mut policy,
+            0x4000,
+            0x7000,
+            |start, end| {
+                calls += 1;
+                assert_eq!((start, end), (0x4000, 0x7000));
+                Err(12)
+            },
+            remove,
+        );
+        assert_eq!(refused, Err(12));
+        assert_eq!(calls, 1, "the whole interval is one revocation");
+        assert_eq!(policy, [(0x4000, 0x5000), (0x6000, 0x7000)], "a refusal keeps policy");
+        assert_eq!(
+            unmap_range_with(&mut policy, 0x4000, 0x7000, |_, _| Ok::<(), i32>(()), remove),
+            Ok(())
+        );
+        assert_eq!(policy, [(0, 0), (0, 0)]);
+        // A repeated unmap of an existing hole still reaches the revocation.
+        let mut reached = false;
+        assert_eq!(
+            unmap_range_with(
+                &mut policy,
+                0x4000,
+                0x7000,
+                |_, _| {
+                    reached = true;
+                    Ok::<(), i32>(())
+                },
+                remove
+            ),
+            Ok(())
+        );
+        assert!(reached);
+    }
+
     use super::*;
 
     #[derive(Clone, Copy)]

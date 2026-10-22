@@ -48,7 +48,7 @@ use rustos_user_abi::syscall::{
     INPUTD_READ_FLAG_NONBLOCK, INPUTD_READ_PAYLOAD_CAPACITY, IPC_MAX_INLINE_BYTES,
     IPC_SERVICE_INPUTD, IPC_SERVICE_NETD, IPC_SERVICE_UISERVER, NETD_DVM_SESSION_GRANT,
     NETD_DVM_SESSION_REVOKE, NETD_IPC_ABI_VERSION, NETD_IPC_OP_DVM_SESSION,
-    NETD_IPC_REQUEST_HEADER_SIZE, SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_INPUT_INGEST_BROKER,
+    NETD_IPC_REQUEST_HEADER_SIZE, SYS_RUSTOS_INPUT_INGEST_BROKER,
     SYS_RUSTOS_INPUT_STATS_BROKER, SYS_RUSTOS_INPUT_WAIT_BROKER, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
 };
 #[cfg(not(test))]
@@ -1799,9 +1799,5 @@ fn debug_line(message: &str) {
     let mut line = [0_u8; 1024];
     line[..len].copy_from_slice(&bytes[..len]);
     line[len] = b'\n';
-    let _ = syscall2(
-        SYS_RUSTOS_DEBUG_PRINT,
-        line.as_ptr() as u64,
-        (len + 1) as u64,
-    );
+    rustos_svc_runtime::ipc::debug_bytes(&line[..len + 1]);
 }

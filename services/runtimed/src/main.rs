@@ -18,7 +18,7 @@ pub(crate) use runtime_control::protocol::{
 use rustos_user_abi::console as console_abi;
 use rustos_user_abi::performance::IPC_CONTROL_DRAIN_BUDGET;
 use rustos_user_abi::syscall::{
-    SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_SCHED_DEMOTE_SELF, TASK_WEIGHT_INTERACTIVE_FLAG,
+    SYS_RUSTOS_SCHED_DEMOTE_SELF, TASK_WEIGHT_INTERACTIVE_FLAG,
 };
 
 mod catalog;
@@ -216,13 +216,7 @@ pub(crate) fn debug_line(message: &str) {
     let mut line = [0_u8; 1024];
     line[..len].copy_from_slice(&bytes[..len]);
     line[len] = b'\n';
-    unsafe {
-        let _ = libc::syscall(
-            SYS_RUSTOS_DEBUG_PRINT as libc::c_long,
-            line.as_ptr(),
-            len + 1,
-        );
-    }
+    rustos_svc_runtime::ipc::debug_bytes(&line[..len + 1]);
 }
 
 fn main() {

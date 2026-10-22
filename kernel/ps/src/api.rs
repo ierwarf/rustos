@@ -15,24 +15,13 @@
 //!   `process-address-space-lifecycle`, `syscall-simd-lifecycle`, and
 //!   `user-memory-access`.
 pub use crate::multitask::{
-    AffinityCommit, AffinityError, CurrentUserSnapshot,
-    DEFAULT_USER_TASK_WEIGHT_MICROS, FastIpcCallHandoffOutcome, MAX_SCHEDULER_TASKS,
-    PagerChargeSnapshot, PagerFaultReservation, PagerFaultSlotError, PagerFaultState,
-    PagerVmaError, PagerVmaSnapshot, ProcessAffinitySnapshot, RetainedCurrentUserAddressSpace,
-    RetainedCurrentUserProcessState, RetiredTaskCleanup, SchedulingContextAdmission,
-    SpawnTaskError, Thread, UserFaultDisposition, UserStackState, UserTaskBootstrap,
-    UserTaskRegisters, WaitChildResult,
-};
-pub use crate::multitask::{ProcessIdentity, SpawnReservation};
-pub use crate::multitask::{
     activate_suspended_user_task, activate_suspended_user_tasks,
     activate_suspended_user_tasks_with_commit, arm_block_current_task,
     arm_block_current_task_on_endpoint, arm_block_current_task_on_pager_fault,
     arm_block_current_task_on_pager_service, arm_block_current_task_on_reply,
-    attach_reserved_ipc_priority, bind_reserved_ipc_priority,
-    cancel_block_current_task, cancel_ipc_priority_reservation, cancel_pager_fault,
-    endpoint_receiver_still_waiting,
-    cancel_process_spawn, claim_pager_fault_reply_from_pager, commit_block_current_task_and_yield,
+    attach_reserved_ipc_priority, bind_reserved_ipc_priority, cancel_block_current_task,
+    cancel_ipc_priority_reservation, cancel_pager_fault, cancel_process_spawn,
+    claim_pager_fault_reply_from_pager, commit_block_current_task_and_yield,
     commit_block_current_task_with_fast_reply_and_yield, commit_fast_ipc_call_handoff_and_yield,
     commit_ipc_call_handoff, commit_pager_fault_block_and_yield,
     complete_fast_ipc_reply_wake_handoff_with_custody, complete_ipc_reply_wake_handoff,
@@ -42,22 +31,21 @@ pub use crate::multitask::{
     current_thread_may_have_pending_signals, current_user_address_space,
     current_user_process_identity, current_user_process_thread_count, current_user_stack_state,
     current_user_thread_id, current_user_wait_binding, demote_current_user_task_to_user_class,
-    drain_scheduler_runtime_profile, exec_current_user_process, exec_user_process_by_pid, exec_user_process_by_pid_checked,
-    ExecRefusal,
-    exit_current_user_process, exit_current_user_task, inherit_ipc_priority,
-    inherit_pager_fault_priority, hardware_rsp_arrivals, is_user_process_exiting, is_user_task_alive, linux_task_affinity,
+    drain_scheduler_runtime_profile, endpoint_receiver_still_waiting, exec_current_user_process,
+    exec_user_process_by_pid, exec_user_process_by_pid_checked, exit_current_user_process,
+    exit_current_user_task, hardware_rsp_arrivals, inherit_ipc_priority,
+    inherit_pager_fault_priority, is_user_process_exiting, is_user_task_alive, linux_task_affinity,
     linux_thread_snapshot_by_ids, live_user_process_identity_by_pid,
     live_user_process_identity_with_exact_exec_path, mark_user_process_exiting,
     mark_user_process_exiting_once, next_retired_task_cleanup, note_process_exit_status,
     pager_fault_snapshot, pager_vma_regions_for_process, protect_pager_vma_for_process,
     publish_current_pager_vma, publish_inherited_pager_vma_for_process,
     publish_pager_vma_for_process, queue_linux_process_sigchld, queue_linux_signal,
-    register_pager_fault_waiter, release_ipc_priority,
-    release_pager_fault_priority, reserve_ipc_call_donation, reserve_ipc_priority,
-    reserve_pager_fault_with_dispatch_grant, reserve_process_spawn, revoke_current_pager_vma,
-    revoke_pager_vma_for_process, set_current_linux_tls_fs_base, set_linux_task_affinity,
-    set_next_latency_pick_hint, set_next_pick_hint, set_next_process_pick_hint,
-    set_next_spawn_pick_hint,
+    register_pager_fault_waiter, release_ipc_priority, release_pager_fault_priority,
+    reserve_ipc_call_donation, reserve_ipc_priority, reserve_pager_fault_with_dispatch_grant,
+    reserve_process_spawn, revoke_current_pager_vma, revoke_pager_vma_for_process,
+    set_current_linux_tls_fs_base, set_linux_task_affinity, set_next_latency_pick_hint,
+    set_next_pick_hint, set_next_process_pick_hint, set_next_spawn_pick_hint,
     set_pager_vma_commit_state_for_process, set_windows_current_thread_affinity,
     set_windows_process_affinity, settle_cancelled_ipc_reply_scheduling_context,
     settle_ipc_reply_scheduling_context,
@@ -67,26 +55,35 @@ pub use crate::multitask::{
     spawn_user_process_without_deferred_reschedule_with_scheduling_context,
     spawn_user_thread_suspended, stop_current_linux_process, take_next_pager_fault_for_rendezvous,
     take_pager_fault_waiter_for, task_has_system_scheduling_class, terminate_user_process,
-    terminate_user_task, unmap_pager_vma_for_process, unregister_pager_fault_waiter,
-    validate_fault_request, wake_pager_service_waiter_for_process, wake_task, wake_user_task,
-    windows_process_affinity, with_current_mm, with_current_process_state,
-    with_current_process_state_mut, with_current_user_linux_state_mut,
+    terminate_user_task, unmap_pager_vma_for_process, unmap_pager_vma_for_process_with,
+    unregister_pager_fault_waiter, validate_fault_request, wake_pager_service_waiter_for_process,
+    wake_task, wake_user_task, windows_process_affinity, with_current_mm,
+    with_current_process_state, with_current_process_state_mut, with_current_user_linux_state_mut,
     with_current_user_process_and_linux_thread_state_mut, with_current_user_process_state,
     with_fork_parent_state, with_process_state_by_pid, with_process_state_by_pid_mut,
-    with_validated_fault_address_space,
+    with_validated_fault_address_space, ExecRefusal,
 };
+pub use crate::multitask::{
+    AffinityCommit, AffinityError, CurrentUserSnapshot, FastIpcCallHandoffOutcome,
+    PagerChargeSnapshot, PagerFaultReservation, PagerFaultSlotError, PagerFaultState,
+    PagerVmaError, PagerVmaSnapshot, ProcessAffinitySnapshot, RetainedCurrentUserAddressSpace,
+    RetainedCurrentUserProcessState, RetiredTaskCleanup, SchedulingContextAdmission,
+    SpawnTaskError, Thread, UserFaultDisposition, UserStackState, UserTaskBootstrap,
+    UserTaskRegisters, WaitChildResult, DEFAULT_USER_TASK_WEIGHT_MICROS, MAX_SCHEDULER_TASKS,
+};
+pub use crate::multitask::{ProcessIdentity, SpawnReservation};
 pub use crate::user::abi::UserAbi;
 pub use crate::user::epoll::{EpollError, EpollHandle, EpollInterestSnapshot};
 pub use crate::user::handles::{
-    ConsoleHandle, ConsoleStreamKind, DisplaySurfaceHandle, FD_CLOEXEC, FIRST_DYNAMIC_FD,
-    FileHandleSeekError, FileHandleSeekWhence, HandleEntry, HandleTable, InetSocketHandle,
-    IpcTransferRegistryError, KernelHandle, MAX_DYNAMIC_FD, RemoteVfsHandle, RemoteVfsHandleKind,
-    TransferredHandleEntry, VfsDirectoryEntry, VfsDirectoryEntryKind, VfsDirectoryHandle,
     bind_ipc_transfer_receiver_by_tickets, bind_ipc_transfer_tickets,
     claim_ipc_transfer_entries_by_tickets, commit_ipc_transfer_enqueue,
     drop_ipc_transfer_descriptors, drop_ipc_transfer_tickets, drop_ipc_transfers_for_service_epoch,
     reclaim_unbound_inet_socket_transfer, register_ipc_transfer_entries,
     register_new_inet_socket_transfer, take_deferred_ipc_transfer_drops, take_ipc_transfer_entries,
+    ConsoleHandle, ConsoleStreamKind, DisplaySurfaceHandle, FileHandleSeekError,
+    FileHandleSeekWhence, HandleEntry, HandleTable, InetSocketHandle, IpcTransferRegistryError,
+    KernelHandle, RemoteVfsHandle, RemoteVfsHandleKind, TransferredHandleEntry, VfsDirectoryEntry,
+    VfsDirectoryEntryKind, VfsDirectoryHandle, FD_CLOEXEC, FIRST_DYNAMIC_FD, MAX_DYNAMIC_FD,
 };
 
 pub fn service_deferred_shared_region_reclaims(max_pages: usize) -> usize {
@@ -119,11 +116,9 @@ pub fn request_deferred_reschedule() {
 }
 
 pub use crate::multitask::{
-    register_child_waiter, unregister_child_waiter, wake_child_waiters,
-};
-pub use crate::multitask::{
     housekeeping_kicked, kick_housekeeping, register_housekeeping_task, take_housekeeping_kick,
 };
+pub use crate::multitask::{register_child_waiter, unregister_child_waiter, wake_child_waiters};
 
 pub fn request_yield_reschedule() {
     crate::multitask::request_yield_reschedule();

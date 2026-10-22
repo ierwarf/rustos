@@ -6,10 +6,95 @@ owners, and fresh validation. Root `AGENTS.md` is the only stable prompt
 prefix. This page does not authorize reusing stale evidence, speculative
 changes, or old uncommitted-work claims.
 
-## Current continuation — 2026-10-22 core-path goal (in progress)
+## Current continuation — lifecycle stabilization (in progress)
 
-- Latest live Goal contract governs the full objective; do not reduce completion
-  to the benchmark slice. No commits allowed. Initial HEAD `f6f618c7`, clean tree.
+Latest checkpoint (supersedes interim counts below): sparse/mixed munmap MM
+worker integrated from `/tmp/rustos-mm-unmap`; independent standalone MM review
+OK, composition review running (`d54aaedb-3999-4d2b-b831-cd3753adcacc`). One
+ProcessState lock covers exact incarnation check, VMA rewrite + whole-range
+preflight/mutation, then external mapping release after VMA writer drop. Old
+three-argument failed-map cleanup API retained as a wrapper. Native current
+MM 80 / PS 977 / compat 184 / ipcbench 20 passed in
+`/tmp/core-mm-integrated-tests2.log`. Runtime sparse-hole + mixed shared-alias
+witness added to state mmap transition. First rerun was invalidated by source
+editing during build, not accepted evidence. bg-21 was intentionally cancelled
+before KVM to fix source-review findings: cleanup now mutates unpublished ranges
+ONLY for explicit unmap, not failed-map cleanup; syscalld accepts holes and
+routes the WHOLE interval through one broker mutation, committing policy only
+after success. Follow-up composition review `/tmp/mm-integration-review.19b58309.md`
+is OK. New syscalld regression covers one transaction/refusal/repeated holes.
+Now lane bg-20 failed because dispatch checker selected wrapper `commit`;
+checker now follows shipping delegation into `commit_with_notify` and passes.
+Latest now lane is bg-24 (`/tmp/core-now4.log`, plan4); registry adds three new
+sparse/MM/policy mutants. A host cargo check of mixed no_std/std service bins
+failed duplicate panic_impl (wrong lane); use selected xtask checks/cargo test.
+All direct service debug writers now use shared bounded byte writer; initd uses
+observability suffix fallback, wayclick has tested suffix retries/fallback.
+Follow-up debug review is `488b8d1b-1ebb-49f4-853c-b9853058c182`. Native partial
+policy/debug tests passed (`/tmp/core-policy-debug-tests.log`) before the final
+service-helper migration; final now/gates/KVM still needed. No commit yet.
+
+- Active user goal resumes from clean HEAD `c64a918f`: stabilize existing/partial
+  paths, exclude untouched syscall/FS/socket subsystems, reconcile Markdown,
+  refresh this handoff and **commit with hooks/signing**. The no-commit rule in
+  the historical continuation below is superseded.
+- Parent is sole writer. Fixed wait4 consumed-status/EINTR loss, repeat exit
+  consumption before physical reclaim, and WNOHANG/ECHILD semantics. Added
+  pinned-child and settled-result regression witnesses.
+- Fixed diagnostic transport falsely acknowledging a refused bounded record:
+  debug syscall now returns admitted bytes/EAGAIN; ipcbench retries outside
+  timing windows. Native compat 183, nucleus-core 66, ps 973 passed before the
+  activation change. First dev-plan now lane passed 282 commands on the earlier
+  two-file wait fix, NOT on the final tree.
+- Removed two uncalled budget-refusal wrappers with their obsolete test/source
+  pin; retained and retargeted the useful stale-generation/budget-recovery
+  witnesses to the live materialization primitive.
+- Independent read-only audit confirmed activation requests can be consumed
+  before Cohort/frame-reader release. Candidate now coalesces remote target
+  hints and publishes after all activation loans/external grant drop, including
+  notify:false mailbox wakes. Production-shared single/batch regression passed;
+  hardware latency attribution and full now/stable validation remain open.
+- Fresh shipping lifecycle 1-vCPU collection passed all seven probes at archive
+  `build/bench-core/core_lifecycle-vcpu-1-1792653416508135497/` (before activation
+  fix): p50 fork/wait 35,020,040; thread join 1,545,120; fork/exec 140,157,800 ticks.
+  No latency improvement established. Final 8-vCPU smoke still required.
+- Fresh state 8-vCPU archive
+  `build/bench-core/core_state-vcpu-8-1792653187024418212/` failed unchanged 1.5x
+  rail: fork 1040, thread 1440 vs pristine 600. Prior control also saw exit/exec
+  rises, not exclusively thread. Candidate adds diagnostic-only null rechecks
+  after IPC; primary rejection threshold is unchanged. Need gather evidence to
+  separate transient teardown/host scaling from persistent state.
+- Current task logs: `/tmp/core-{state-candidate,lifecycle-candidate-1,spawn-trace-1}.log`;
+  raw source/ELF-bound archives remain the actual evidence. Diagnostic
+  `RUSTOS_LIFECYCLE_TRACE=true` isolated spawn run passed; reserve→publish had
+  min/median 3906 µs (coarse timestamps), so child creation itself must be
+  decomposed before attributing all ~5 ms to scheduler waiting. Candidate adds
+  opt-in `proc-fork-work` whole transaction/COW-clone nanosecond attribution,
+  emitted only after releasing parent process/VMA guards. Not yet run.
+- Root cause evidence: `proc-fork-work` diagnostic measured held fork transaction
+  median 410,752 ns, COW clone 399,768 ns (137 samples), far below the old ~5 ms
+  first-turn interval. Unconditional successful fork/exit debugcon frames were
+  dominant. Their formatting/output is now opt-in lifecycle trace; abnormal
+  exit/fault/refusal diagnostics remain shipping. Completed same-session 1-CPU
+  controls/candidates (all CPUID p50 4480): A1 fork/wait 35,020,040 ticks;
+  B1 2,560,680; A2 (restored logging) 35,485,040. B2 is running as `/tmp/core-lifecycle-logB2-1.log`.
+  B1 first-turn 2,248,920 vs A1 19,858,000; exit→wait 320,680 vs 14,999,480.
+  Archives are in each `/tmp/core-lifecycle-{candidate-1,logB1-1,logA2-1}.log`.
+  No tail-target claim (outliers retained).
+- Debug API review found shared writers also needed short-write/EAGAIN handling.
+  `rustos-svc-runtime` now retries the unaccepted suffix at most 64 times and
+  exposes abandoned-byte accounting; observability-client retries, then falls
+  back only the suffix. Native client tests passed (observability 1, runtime 11,
+  runtime doctests 5 with 1 ignored). Other raw debug helpers remain best-effort,
+  never structured acceptance evidence. Final review follow-up still needed.
+- Remaining: diagnose/fix state rail and lifecycle timer-scale delays, run 1/8
+  lifecycle/state plus bounded 8-vCPU smoke, complete independent review and
+  fresh selected now/stable gates; reconcile stale gap/progress/large-file MD,
+  update final handoff, commit. No completion claim yet.
+
+## Historical continuation — 2026-10-22 core-path goal
+
+- Earlier goal prohibited commits. Initial HEAD `f6f618c7`, clean tree.
 - Parent is the sole writer. No product optimization yet; benchmark edits now
   include opt-in UI consumption→validated DVM completion instrumentation.
   Core syscall/MM/lifecycle/data/scheduler/state suites, same-ELF Linux KVM

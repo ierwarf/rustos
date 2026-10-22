@@ -752,13 +752,7 @@ fn debug_line(message: &str) {
     let mut line = [0_u8; 1024];
     line[..len].copy_from_slice(&bytes[..len]);
     line[len] = b'\n';
-    let _ = unsafe {
-        rustos_svc_runtime::syscall::syscall2(
-            linux_abi::SYS_RUSTOS_DEBUG_PRINT,
-            line.as_ptr() as u64,
-            (len + 1) as u64,
-        )
-    };
+    rustos_svc_runtime::ipc::debug_bytes(&line[..len + 1]);
 }
 
 fn checkpoint_revision_key(record: &ServiceCheckpointRecordWire) -> CheckpointRevisionKey {

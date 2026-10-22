@@ -43,10 +43,38 @@ fn profile_enabled() -> bool {
 }
 
 fn raw_stderr_line(message: &str) {
-    if raw_debug_write(message.as_bytes()).is_ok() && raw_debug_write(b"\n").is_ok() {
-        return;
+    use std::io::Write;
+    let line = format!("{message}\n");
+    let written = debug_prefix_with(line.as_bytes(), raw_debug_write);
+    if written < line.len() {
+        let _ = std::io::stderr().write_all(&line.as_bytes()[written..]);
     }
-    eprintln!("{message}");
+}
+
+fn debug_prefix_with(bytes: &[u8], mut write: impl FnMut(&[u8]) -> Result<usize, i32>) -> usize {
+    let mut written = 0;
+    for _ in 0..64 {
+        if written == bytes.len() { break; }
+        match write(&bytes[written..]) {
+            Ok(n) if n > 0 && n <= bytes.len() - written => written += n,
+            Err(libc::EAGAIN) => {},
+            _ => break,
+        }
+        if written < bytes.len() { std::thread::yield_now(); }
+    }
+    written
+}
+
+#[cfg(test)]
+#[test]
+fn diagnostic_short_writes_retry_only_the_remaining_suffix() {
+    let mut replies = [Ok(2), Err(libc::EAGAIN), Ok(4)].into_iter();
+    let mut lengths = Vec::new();
+    assert_eq!(debug_prefix_with(b"hello\n", |bytes| {
+        lengths.push(bytes.len());
+        replies.next().unwrap()
+    }), 6);
+    assert_eq!(lengths, [6, 4, 4]);
 }
 
 fn raw_debug_write(buffer: &[u8]) -> Result<usize, i32> {

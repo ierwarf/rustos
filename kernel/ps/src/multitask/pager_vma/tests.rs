@@ -95,29 +95,60 @@ fn actual_range_rewrite_gap_is_retryable_until_commit_or_original_rollback() {
     let handle = ProcessHandle::new(27, 91);
     let identity = identity(91, 97);
     for refuse_mutation in [false, true] {
-        let region = publish(handle, identity, template(0x30_000), MAX_PAGER_VMAS_PER_PROCESS)
-            .unwrap();
+        let region = publish(
+            handle,
+            identity,
+            template(0x30_000),
+            MAX_PAGER_VMAS_PER_PROCESS,
+        )
+        .unwrap();
         let untouched_page = region.start + PAGER_PAGE_BYTES;
         let mut during = None;
-        let result = rewrite_attenuated_range(handle, identity, region.start, untouched_page,
-            Some(0), || {
+        let result = rewrite_attenuated_range(
+            handle,
+            identity,
+            region.start,
+            untouched_page,
+            Some(0),
+            || {
                 // Execute the production lookup at the real withdrawal/PTE
                 // callback boundary. This page is OUTSIDE the edited range;
                 // its original VMA is temporarily absent, not unmapped.
                 during = Some(lookup(handle, identity, untouched_page, VM_ACCESS_WRITE));
-                if refuse_mutation { Err(PagerVmaError::Pressure) } else { Ok(()) }
-            });
-        assert_eq!(result, if refuse_mutation { Err(PagerVmaError::Pressure) } else { Ok(true) });
+                if refuse_mutation {
+                    Err(PagerVmaError::Pressure)
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        assert_eq!(
+            result,
+            if refuse_mutation {
+                Err(PagerVmaError::Pressure)
+            } else {
+                Ok(true)
+            }
+        );
         let retained = lookup(handle, identity, untouched_page, VM_ACCESS_WRITE).unwrap();
         assert_eq!(retained.vma_generation, region.vma_generation);
-        assert_eq!(lookup(handle, identity, region.start, VM_ACCESS_WRITE).is_ok(), refuse_mutation);
+        assert_eq!(
+            lookup(handle, identity, region.start, VM_ACCESS_WRITE).is_ok(),
+            refuse_mutation
+        );
         for live in snapshot_regions(handle, identity).unwrap() {
             revoke(handle, identity, live.start, live.vma_generation).unwrap();
         }
-        assert_eq!(during, Some(Err(PagerVmaError::Unstable)),
-            "a temporary publication hole must not terminate a valid first touch");
-        assert_eq!(lookup(handle, identity, untouched_page, VM_ACCESS_WRITE),
-            Err(PagerVmaError::Stale), "a committed real unmap must still fail");
+        assert_eq!(
+            during,
+            Some(Err(PagerVmaError::Unstable)),
+            "a temporary publication hole must not terminate a valid first touch"
+        );
+        assert_eq!(
+            lookup(handle, identity, untouched_page, VM_ACCESS_WRITE),
+            Err(PagerVmaError::Stale),
+            "a committed real unmap must still fail"
+        );
     }
 }
 
@@ -126,18 +157,39 @@ fn actual_lookup_rechecks_whole_rewrite_epoch_after_the_scan() {
     let _guard = guard();
     let handle = ProcessHandle::new(27, 93);
     let identity = identity(93, 99);
-    let original = publish(handle, identity, template(0x34_000), MAX_PAGER_VMAS_PER_PROCESS)
-        .unwrap();
-    for old_result in [Ok(original), Err(PagerVmaError::Stale), Err(PagerVmaError::Denied)] {
+    let original = publish(
+        handle,
+        identity,
+        template(0x34_000),
+        MAX_PAGER_VMAS_PER_PROCESS,
+    )
+    .unwrap();
+    for old_result in [
+        Ok(original),
+        Err(PagerVmaError::Stale),
+        Err(PagerVmaError::Denied),
+    ] {
         let observed = read_rewrite_epoch(handle, || {
             // The same production read envelope is used around lookup_slot's
             // entire scan. Complete a real range edit between its two samples.
-            assert_eq!(rewrite_attenuated_range(handle, identity, original.start,
-                original.end, Some(VM_PROT_READ | VM_PROT_WRITE), || Ok(())), Ok(true));
+            assert_eq!(
+                rewrite_attenuated_range(
+                    handle,
+                    identity,
+                    original.start,
+                    original.end,
+                    Some(VM_PROT_READ | VM_PROT_WRITE),
+                    || Ok(())
+                ),
+                Ok(true)
+            );
             old_result
         });
         assert_eq!(observed, Err(PagerVmaError::Unstable));
-        assert_eq!(lookup(handle, identity, original.start, VM_ACCESS_WRITE), Ok(original));
+        assert_eq!(
+            lookup(handle, identity, original.start, VM_ACCESS_WRITE),
+            Ok(original)
+        );
     }
     revoke(handle, identity, original.start, original.vma_generation).unwrap();
 }
@@ -147,18 +199,35 @@ fn actual_exhausted_range_rewrite_epoch_refuses_before_withdrawal_or_pte_mutatio
     let _guard = guard();
     let handle = ProcessHandle::new(27, 95);
     let identity = identity(95, 101);
-    let original = publish(handle, identity, template(0x38_000), MAX_PAGER_VMAS_PER_PROCESS)
-        .unwrap();
+    let original = publish(
+        handle,
+        identity,
+        template(0x38_000),
+        MAX_PAGER_VMAS_PER_PROCESS,
+    )
+    .unwrap();
     // Native exhausted-counter input only, not a production reset/reuse path.
     let sequence = &rewrite_epoch::REWRITE_EPOCHS[handle.index()];
     let before = sequence.swap(u64::MAX - 1, Ordering::AcqRel);
     let mut mutated = false;
-    let result = rewrite_attenuated_range(handle, identity, original.start, original.end,
-        Some(0), || { mutated = true; Ok(()) });
+    let result = rewrite_attenuated_range(
+        handle,
+        identity,
+        original.start,
+        original.end,
+        Some(0),
+        || {
+            mutated = true;
+            Ok(())
+        },
+    );
     sequence.store(before, Ordering::Release);
     assert_eq!(result, Err(PagerVmaError::Pressure));
     assert!(!mutated);
-    assert_eq!(lookup(handle, identity, original.start, VM_ACCESS_WRITE), Ok(original));
+    assert_eq!(
+        lookup(handle, identity, original.start, VM_ACCESS_WRITE),
+        Ok(original)
+    );
     revoke(handle, identity, original.start, original.vma_generation).unwrap();
 }
 
@@ -289,6 +358,117 @@ fn protection_attenuation_and_unmap_rewrite_before_mutation() {
             || Ok(()),
         ),
         Ok(true)
+    );
+}
+
+#[test]
+fn sparse_unmap_is_idempotent_and_protect_commit_still_require_coverage() {
+    let _guard = guard();
+    let handle = ProcessHandle::new(25, 201);
+    let identity = identity(201, 301);
+    let mut region = template(0x40_000);
+    region.end = region.start + 3 * PAGER_PAGE_BYTES;
+    let region = publish(handle, identity, region, MAX_PAGER_VMAS_PER_PROCESS).unwrap();
+    let hole_start = region.start + PAGER_PAGE_BYTES;
+    let hole_end = hole_start + PAGER_PAGE_BYTES;
+    assert_eq!(
+        rewrite_attenuated_range(handle, identity, hole_start, hole_end, None, || Ok(())),
+        Ok(true)
+    );
+    assert_eq!(
+        rewrite_attenuated_range(handle, identity, hole_start, hole_end, None, || panic!(
+            "touching neighbors do not authorize mutation of the hole"
+        )),
+        Ok(false)
+    );
+    assert_eq!(
+        rewrite_attenuated_range(
+            handle,
+            identity,
+            region.start,
+            region.end,
+            Some(VM_PROT_READ),
+            || panic!("protection must reject the gap before mutation")
+        ),
+        Err(PagerVmaError::Stale)
+    );
+    assert_eq!(
+        rewrite_range(
+            handle,
+            identity,
+            region.start,
+            region.end,
+            None,
+            Some(VM_COMMIT_RESERVED),
+            || panic!("commit state still requires complete coverage")
+        ),
+        Err(PagerVmaError::Stale)
+    );
+    for address in [region.start, hole_end] {
+        assert_eq!(
+            lookup(handle, identity, address, VM_ACCESS_WRITE)
+                .unwrap()
+                .prot,
+            VM_PROT_READ | VM_PROT_WRITE
+        );
+    }
+    let mut mutations = 0;
+    assert_eq!(
+        rewrite_attenuated_range(handle, identity, region.start, region.end, None, || {
+            mutations += 1;
+            Ok(())
+        }),
+        Ok(true)
+    );
+    assert_eq!(
+        mutations, 1,
+        "one whole-range preflight/commit, not partial segment mutations"
+    );
+    for address in [region.start, hole_start, hole_end] {
+        assert_eq!(
+            lookup(handle, identity, address, VM_ACCESS_READ),
+            Err(PagerVmaError::Stale)
+        );
+    }
+}
+
+#[test]
+fn unmap_partially_initialized_range_and_touching_only_preserve_exact_authority() {
+    let _guard = guard();
+    let handle = ProcessHandle::new(25, 202);
+    let identity = identity(202, 302);
+    let mut region = template(0x48_000);
+    region.end = region.start + PAGER_PAGE_BYTES;
+    let region = publish(handle, identity, region, MAX_PAGER_VMAS_PER_PROCESS).unwrap();
+    assert_eq!(
+        rewrite_attenuated_range(
+            handle,
+            identity,
+            region.end,
+            region.end + PAGER_PAGE_BYTES,
+            None,
+            || panic!("an adjacent range is not an intersection")
+        ),
+        Ok(false)
+    );
+    assert_eq!(
+        lookup(handle, identity, region.start, VM_ACCESS_WRITE).unwrap(),
+        region
+    );
+    assert_eq!(
+        rewrite_attenuated_range(
+            handle,
+            identity,
+            region.start,
+            region.end + 2 * PAGER_PAGE_BYTES,
+            None,
+            || Ok(())
+        ),
+        Ok(true)
+    );
+    assert_eq!(
+        lookup(handle, identity, region.start, VM_ACCESS_READ),
+        Err(PagerVmaError::Stale)
     );
 }
 
@@ -828,8 +1008,13 @@ fn rewrite_reclaims_previous_exec_incarnation_instead_of_mutating_its_range() {
     let handle = ProcessHandle::new(27, 101);
     let before_exec = identity(101, 103);
     let after_exec = identity(101, 104);
-    let stale = publish(handle, before_exec, template(0x50_000), MAX_PAGER_VMAS_PER_PROCESS)
-        .unwrap();
+    let stale = publish(
+        handle,
+        before_exec,
+        template(0x50_000),
+        MAX_PAGER_VMAS_PER_PROCESS,
+    )
+    .unwrap();
 
     // The new image maps the same addresses again. The old incarnation's region
     // has no authority over them, so unmapping must neither run the PTE
@@ -840,11 +1025,19 @@ fn rewrite_reclaims_previous_exec_incarnation_instead_of_mutating_its_range() {
         Err(PagerVmaError::Stale)
     });
     assert_eq!(result, Ok(false));
-    assert!(!mutated, "a previous incarnation's region must not drive the mutation");
+    assert!(
+        !mutated,
+        "a previous incarnation's region must not drive the mutation"
+    );
 
     // The residue was reclaimed, so the new incarnation can publish the range.
-    let fresh = publish(handle, after_exec, template(0x50_000), MAX_PAGER_VMAS_PER_PROCESS)
-        .unwrap();
+    let fresh = publish(
+        handle,
+        after_exec,
+        template(0x50_000),
+        MAX_PAGER_VMAS_PER_PROCESS,
+    )
+    .unwrap();
     assert_ne!(fresh.mm_generation, stale.mm_generation);
     revoke(handle, after_exec, fresh.start, fresh.vma_generation).unwrap();
 }

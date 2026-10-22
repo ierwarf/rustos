@@ -174,51 +174,6 @@ pub(in crate::multitask::scheduler) fn materialize_direct_handoff_with_generatio
     true
 }
 
-/// A consumed synchronous handoff that loses budget admission must not leave
-/// its sole DirectHandoff owner outside both the FIFO and the fair runqueue.
-/// Ordinary reply-wake records already have Local or RemoteQueued custody.
-pub(in crate::multitask::scheduler) fn preserve_budget_refused_handoff(
-    slot: usize,
-    cpu: usize,
-    weight: u32,
-) -> bool {
-    let observed = owner(slot);
-    if observed.cpu != Some(cpu) || !observed.runnable {
-        return false;
-    }
-    match observed.state {
-        RunOwnerState::DirectHandoff => materialize_direct_handoff(slot, cpu, weight),
-        RunOwnerState::Local | RunOwnerState::RemoteQueued => true,
-        _ => false,
-    }
-}
-
-/// If the FIFO owner changed, its new transaction owns recovery. A budget
-/// refusal may materialize only the consumed DirectHandoff generation; a
-/// Local/RemoteQueued observation requires no second, unbound owner read.
-pub(in crate::multitask::scheduler) fn preserve_budget_refused_handoff_generation(
-    slot: usize,
-    cpu: usize,
-    weight: u32,
-    generation: u64,
-) -> bool {
-    let observed = owner(slot);
-    if observed.generation != generation {
-        return true;
-    }
-    if observed.cpu != Some(cpu) || !observed.runnable {
-        return false;
-    }
-    match observed.state {
-        RunOwnerState::DirectHandoff => {
-            materialize_direct_handoff_with_generation(slot, cpu, weight, Some(generation))
-                || owner(slot).generation != generation
-        }
-        RunOwnerState::Local | RunOwnerState::RemoteQueued => true,
-        _ => false,
-    }
-}
-
 /// Returns a not-yet-dispatched direct receiver to exact blocked custody.
 /// No runqueue or mailbox entry exists while `DirectHandoff` is owned, so one
 /// owner-word CAS restores the pre-reservation representation.

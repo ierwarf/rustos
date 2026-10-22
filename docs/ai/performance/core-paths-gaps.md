@@ -24,9 +24,9 @@
 | B4 | housekeeping 깨우기 | 1 tick `rtc::sleep(1)`에만 의존 | **수정함**: `kick_housekeeping`(원자 플래그+`wake_task`), `rtc::sleep_unless` |
 | B5 | `address_space.rs` `clone_user_space_cow` | fork 반복 시 `InvalidFrameOwnership`(errno 14)이 간헐 발생(exec 수정 전 1회 관찰) | 수정 후 1·8 vCPU 반복 실행 7회에서 재현되지 않음. 원인은 미확정이므로 재발 시 `td-fork-err` 계열 계측부터 |
 | B6 | fork 프로세스 슬롯 | `PROCESS_TABLE` 32개 중 서비스 17개 → fork 15회 후 `reserve_spawn` 실패(EAGAIN). 원인: housekeeping이 fair 대역이고 spawner가 yield만 해서 굶음 | **수정함**: spawner(`reserve_spawn_after_reclaim`)가 housekeeping을 kick하고 1 ms 단위로 sleep(최대 100 ms)해 CPU를 양보. housekeeping을 System 대역으로 올리는 안은 fork는 풀었으나 thread join p50이 1.5M→127M ticks로 악화돼 폐기 |
-| B9 | `syscalld_ops.rs wait4` | 자식이 아직 살아 있으면 `yield_now` busy-poll | **수정함**: 블로킹 대기(`child_wait.rs`, arm→register→recheck→commit). 효과(지연)는 아직 분리 측정 못 함 |
-| B10 | fork+wait p50 | 1 vCPU 12~19 ms, 8 vCPU 18 ms. 최소는 1.2 ms. idle이 30%인데도 대기 → 어딘가 tick 단위 대기가 남음 | 미해결, 원인 미확정 |
-| B7 | `reclaim.rs complete` | task 하나 reap마다 `debug::debug!("reaped exited task ...")` | shipping에서 비활성인지 확인 필요 |
+| B9 | `syscalld_ops.rs wait4` | busy-poll 및 상태 소비/신호 경합 | 블로킹 대기에 더해, 이미 소비한 상태가 EINTR에 버려지던 문제·물리 회수 전 종료 상태 중복 반환·WNOHANG의 잘못된 ECHILD 처리를 수정. 마지막 자식 소비 뒤 다른 부모 waiter도 깨움. pinned-child/경합/신호 우선순위 witness 추가 |
+| B10 | fork+wait p50 | 약 9 ms를 tick 대기로 추정했음 | **원인 분리**: held fork transaction p50 0.411 ms, COW clone 0.400 ms(진단 137회). 반복 fork/정상 exit의 동기 debugcon frame을 opt-in lifecycle trace로 제한하자 1 vCPU fork+wait p50 35.02M→2.56M ticks. 원래 출력을 복원하면 35.49M으로 재상승(CPUID p50 모두 4480). 비정상 종료·exec 거부 계측 유지. 최종 반복/8 vCPU 검증 진행 중 |
+| B7 | `reclaim.rs complete` | task 하나 reap마다 debug log | 기본 `logging.categories.sched="info"`에서 `rustos_log_sched_debug`가 생성되지 않아 formatting/output 자체가 컴파일 제외됨. B10의 무조건 milestone과는 다름 |
 | B8 | 크기 | process table 32개 고정 | 상용 수준에는 부족. 증설 시 reap queue/ledger 크기 동반 검토 |
 
 ## C. SMP 배치
@@ -41,21 +41,44 @@ Linux `select_idle_sibling`/`wake_affine`.
 
 - kernel-ps/compat/executive/hal/mm 컴파일 경고 169건(미사용 함수 91, 메서드 약 30,
   enum 6, const 6, 미사용 import 약 20). 모델 고정용 코드와 실제 죽은 코드를 구분해 삭제.
-- md 불일치: 이 문서와 진행표/세션 핸드오프, `formal/rust-large-files.tsv`의 stale 행.
+- 문서 불일치 정리 중: 진행표/핸드오프의 과거 실패를 현재 결과와 구분한다.
+  `formal/rust-large-files.tsv`의 숫자는 실측 행수가 아니라 허용 부채 상한이다.
+  현재 등록 파일 중 600행 이하가 되어 삭제할 stale 행은 없다. 선행 변경에서
+  상한을 넘은 파일은 경고로 남으며, 검증을 조용하게 하려고 상한을 올리지 않는다.
 
-## E. 이번에 닫지 못한 측정 결과
+## E. 현재 수집 상태 (2026-10-22 안정화 진행 중)
 
-core_lifecycle 1 vCPU: thread join 개선 외에 `fork_exit_wait`는 여전히 15회 뒤 EAGAIN이며
-exec/fork_cow/exit_retire_to_reap은 수집되지 않았다. 따라서 lifecycle 묶음은 미완료다.
+`c64a918f`에서 이미 core_lifecycle 1·8 vCPU 전 프로브 수집에 성공했다.
+15회 뒤 EAGAIN/exec 미수집은 과거 실패이며 현재 상태가 아니다. 이번 후보의
+1 vCPU 수집도 전 프로브 성공했으나, collection COMPLETE는 꼬리 목표 통과가 아니다.
+같은 세션 ABAB 및 최종 8 vCPU 검증은 [진행표](../../benchmarks/core-paths-progress.md)에 기록한다.
 
-## F. 이번 안정화에서 남긴 미해결
+## F. 안정화 검증 경계
 
-- fork+wait / exec의 절대 지연이 크다(1 vCPU p50 fork+wait 10~16 ms, fork+exec 약 46 ms; 8 vCPU 9~12 ms / 약 80 ms).
-  최소값은 0.7~1.2 ms로 tick 단위 대기가 어딘가 남아 있다. 유휴 CPU 선호 배치(wake-idle)는 시험했으나
-  변화가 없어 되돌렸다. 활성화→자식 첫 턴이 5 ms인 원인은 미확정.
-- 8 vCPU 한 번의 실행에서 fork_exit_wait 최대 17 s가 관찰됐다(재현 2회 실패). 호스트 지연인지
-  `wait4` 대기의 깨움 누락인지 미확정이며, 재발 시 우선 의심한다.
-- 죽은 코드: 경고 164건 중 정의 외 참조가 없는 항목은 1건뿐이었고(삭제함) 나머지 112건은
-  테스트·formal 핀·다른 죽은 항목이 참조하는 묶음이다(`sync_handoff`, `locality`, `ipc_handoff` 등 구 IPC 경로).
-  묶음 삭제는 formal 핀/변이 앵커와 함께 해야 하므로 별도 작업으로 둔다.
-- 아직 손대지 않은 미구현(pipe/pipe2, eventfd, 쓰기 가능 FS, SEQPACKET, `/proc`, blocking 소켓 등)은 사용자 지시로 제외.
+- core_state 8 vCPU의 null rail 실패는 thread에만 국한되지 않는다. 이번 control과
+  후보에서 fork/exit/exec 뒤에도 1.5x 초과가 관찰됐다. IPC 뒤 null 재측정은
+  진단용으로만 추가했으며 원래 rail을 완화하거나 실패를 통과로 바꾸지 않는다.
+- activation이 Cohort/frame-reader 해제 전에 원격 reschedule 요청을 공개하여,
+  너무 이른 수신이 실패한 뒤 재시도가 타이머까지 늦어질 수 있음을 독립 검토로 확인했다.
+  현재 후보는 외부 grant까지 해제한 뒤 모든 성공한 원격 wake(`notify:false` 포함)에
+  새 요청을 보낸다. 같은 production engine의 single/batch witness를 추가했다.
+  이 경합이 과거 5 ms 중앙값의 원인이었다고 주장하지 않는다(B10과 구분).
+- 과거 8 vCPU fork_exit_wait 최대 17 s 이상치는 5회 재실행에서 재현되지 않았다.
+  이번 wait4의 확정적 상태 소비 오류를 수정했지만 해당 이상치의 원인으로 확정하지 않는다.
+- 이번 ABAB 마지막 후보 부팅 한 번은 uiserver wayland 초기화 중 pager VMA unmap
+  Stale/EFAULT 뒤 errno5로 종료하여 수집 실패했다. 실패 archive를 보존하고 원인 조사 중이다.
+- 죽은 코드의 경고 수는 삭제 가능 함수 수가 아니다. uncalled budget-refusal wrapper
+  두 개와 전용 obsolete test를 삭제하고, 혼합 witness/소스 핀은 실제 사용하는
+  exact-generation materializer로 옮겼다. 살아 있는 reply-wake/claim 경로의
+  `sync_handoff`/`locality` 의존성을 경고 수만 보고 통째로 지우지 않는다.
+- pipe/pipe2, eventfd, 쓰기 가능 FS, SEQPACKET, `/proc`, blocking 소켓은 사용자 지시로 제외.
+
+## 참고한 외부 계약
+
+- [Linux waitpid](https://man7.org/linux/man-pages/man2/waitpid.2.html): WNOHANG의 0과
+  ECHILD 구분, 상태의 일회성 소비 및 EINTR 경계.
+- [Linux wait queues](https://www.kernel.org/doc/html/latest/driver-api/basics.html):
+  상태 공개 뒤 wake, prepare→조건 재확인→schedule의 lost-wakeup 방지 순서.
+- [Linux printk](https://www.kernel.org/doc/html/latest/core-api/printk-basics.html):
+  반복 콘솔 출력의 stall 위험, 비필수 진단의 제한/지연. RustOS 비용의 증거는 B10의
+  같은 세션 측정이며 Linux 구현 자체를 RustOS 성능 증명으로 쓰지 않는다.

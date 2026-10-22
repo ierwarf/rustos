@@ -22,10 +22,25 @@ fn caller(turn: &DispatchPreemption, original: usize) {
 /// Non-Copy Cohort and physical frame loans survive the callback and every
 /// queue/policy effect. FrameReader holds a count, never a raw Resources leaf.
 pub(super) fn commit<G>(
+    owner: Activation,
+    turn: &DispatchPreemption,
+    eligible_cpus: impl Fn(usize) -> u64,
+    commit_authority: impl FnOnce() -> Option<G>,
+) -> bool {
+    commit_with_notify(owner, turn, eligible_cpus, commit_authority, |cpu| {
+        #[cfg(not(test))]
+        crate::multitask::irq::request_target_reschedule(cpu);
+        #[cfg(test)]
+        let _ = cpu;
+    })
+}
+
+fn commit_with_notify<G>(
     mut owner: Activation,
     turn: &DispatchPreemption,
     eligible_cpus: impl Fn(usize) -> u64,
     commit_authority: impl FnOnce() -> Option<G>,
+    mut notify: impl FnMut(usize),
 ) -> bool {
     let current = super::super::current_terminal::OriginalCurrent::borrow(turn)
         .expect("activation lacks original Current banks/interval");
@@ -123,6 +138,7 @@ pub(super) fn commit<G>(
             members.len() as u64,
         );
     }
+    let mut notify_cpus = 0u64;
     for &(slot, id) in members {
         assert!(
             owner.cohort.unsuspend(slot, id),
@@ -159,9 +175,17 @@ pub(super) fn commit<G>(
                 && runqueue::owner(slot).runnable,
             "scheduler activation invariant: preflighted task {id} could not wake"
         );
-        #[cfg(not(test))]
-        if let runqueue::RemoteWakeOutcome::Published { cpu, notify: true } = wake {
-            crate::multitask::irq::request_target_reschedule(cpu);
+        // A timer or another producer's mailbox edge can reach the receiver
+        // before this activation becomes claimable. Remember every accepted
+        // remote owner, even notify:false, and publish a fresh request only
+        // after the Cohort, readers and external authority have been released.
+        let wake_cpu = match wake {
+            runqueue::RemoteWakeOutcome::Published { cpu, .. } => Some(cpu),
+            runqueue::RemoteWakeOutcome::AlreadyOwned { cpu } => cpu,
+            runqueue::RemoteWakeOutcome::Rejected => None,
+        };
+        if let Some(cpu) = wake_cpu.filter(|&cpu| cpu != turn.cpu()) {
+            notify_cpus |= 1u64 << cpu;
         }
         let record = handoff_queue::FirstTurnHandoff { slot, task_id: id };
         let prioritized = if prioritize {
@@ -198,10 +222,20 @@ pub(super) fn commit<G>(
     // The original non-Copy grant, like Current and Cohort custody, survives
     // every queue/prefix effect. No scalar relookup replaces its lifetime.
     drop(authority);
+    while notify_cpus != 0 {
+        let cpu = notify_cpus.trailing_zeros() as usize;
+        notify_cpus &= notify_cpus - 1;
+        notify(cpu);
+    }
     true
 }
 
-fn donate_floor(slot: usize, current: &super::super::current_terminal::OriginalCurrent<'_, '_>, cpu: usize, system: bool) {
+fn donate_floor(
+    slot: usize,
+    current: &super::super::current_terminal::OriginalCurrent<'_, '_>,
+    cpu: usize,
+    system: bool,
+) {
     let original = current.member().0;
     if slot == original
         || runqueue::is_idle_slot(slot)

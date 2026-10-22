@@ -107,6 +107,11 @@ primitive는 2,000 warmup + 2,000 samples, bulk는 8 + 128, COW 첫 store는
 8 + 128이다. 1-byte latency는 primitive 횟수를 쓴다. yield/CPUID/stamp는 기존
 50,000 samples, IPC checkpoint는 기존 2,000 warmup + 20,000 samples를 유지한다.
 8-worker balance는 8 warmup rounds + 256 measured rounds(2,048 samples)다.
+`core_state`는 각 전체 IPC checkpoint 후 null syscall 분포를 진단용으로
+재수집한다(`state-null-recheck`). 이 출력은 primary persistent-state rail의
+샘플이나 합격 기준을 대체하지 않는다. 출력은 bounded partial-admission을
+처리하며 미수락 suffix만 yield/retry한다. 재시도는 측정 구간 밖이고,
+소진 시 수집 실패이지 합격/샘플 누락 허용이 아니다.
 정확한 lifecycle 횟수는 기존 함수와 공유 host 계약으로 검증한다.
 
 ipcbench의 모든 TSC stamp는 `LFENCE; RDTSC; LFENCE`이며 비용을 빼지 않는다.

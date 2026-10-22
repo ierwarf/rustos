@@ -900,11 +900,6 @@ impl ProcessAddressSpace {
         validate_user_page_range(start, page_count)?;
         let range_end = pager_fault_range_end(start, page_count)?;
         let leaves = self.pager_fault_leaves_in_range(start.as_u64(), range_end, page_count)?;
-        let unmapped_count = leaves.len();
-        let mut frames = Vec::new();
-        frames
-            .try_reserve_exact(leaves.len())
-            .map_err(|_| AddressSpaceError::OutOfFrames)?;
         for leaf in leaves.iter().copied() {
             if !phys::data_leaf_is_owned(
                 self.pml4_frame_phys,
@@ -913,8 +908,62 @@ impl ProcessAddressSpace {
             ) {
                 return Err(AddressSpaceError::InvalidFrameOwnership);
             }
-            frames.push(leaf.physical_address);
         }
+        self.unmap_preflighted_user_leaves(leaves, &[])
+    }
+
+    /// Revokes present 4 KiB user leaves, treating absent pages as holes.
+    ///
+    /// `external_segments` are aligned, nonempty half-open user VA intervals;
+    /// they may overlap, be unordered, or extend beyond the requested range.
+    /// Every present external leaf must be untagged and have no exact owned
+    /// descriptor; every other present leaf needs both witnesses of ownership.
+    /// Geometry, all leaves, and reclaim capacity are checked before mutation.
+    /// Owned descriptors are released only after the normal TLB reclaim barrier;
+    /// external backing is never released here. The caller must serialize VMA/
+    /// PTE writers and retain external backing leases through this call.
+    pub fn unmap_present_user_pages_with_external_at(
+        &mut self,
+        start: VirtAddr,
+        page_count: usize,
+        external_segments: &[(u64, u64)],
+    ) -> Result<usize, AddressSpaceError> {
+        validate_user_page_range(start, page_count)?;
+        let range_end = pager_fault_range_end(start, page_count)?;
+        validate_external_user_segments(external_segments)?;
+        let leaves = scan_present_user_leaves_in_range(
+            self.root_phys(),
+            start.as_u64(),
+            range_end,
+            page_count,
+            read_user_table_entry,
+            read_user_leaf_entry,
+            |leaf, flags| {
+                validate_user_unmap_leaf(
+                    leaf,
+                    flags,
+                    external_segments,
+                    phys::data_leaf_is_owned(
+                        self.pml4_frame_phys,
+                        leaf.virtual_address,
+                        leaf.physical_address,
+                    ),
+                )
+            },
+        )?;
+        self.unmap_preflighted_user_leaves(leaves, external_segments)
+    }
+
+    fn unmap_preflighted_user_leaves(
+        &mut self,
+        leaves: Vec<PagerFaultLeaf>,
+        external_segments: &[(u64, u64)],
+    ) -> Result<usize, AddressSpaceError> {
+        let unmapped_count = leaves.len();
+        let mut frames = Vec::new();
+        frames
+            .try_reserve_exact(leaves.len())
+            .map_err(|_| AddressSpaceError::OutOfFrames)?;
         let mutation = begin_address_space_mutation(self.root_phys());
         for leaf in leaves.iter().copied() {
             let virt = VirtAddr::new(leaf.virtual_address);
@@ -926,8 +975,10 @@ impl ProcessAddressSpace {
             }
         }
         let _flushed_mutation = mutation.flush_for_reclaim();
-        frames.clear();
         for leaf in leaves.iter().copied() {
+            if in_external_user_segment(leaf.virtual_address, external_segments) {
+                continue;
+            }
             match phys::release_data_leaf(
                 self.pml4_frame_phys,
                 leaf.virtual_address,
@@ -954,66 +1005,21 @@ impl ProcessAddressSpace {
         end: u64,
         maximum_count: usize,
     ) -> Result<Vec<PagerFaultLeaf>, AddressSpaceError> {
-        let mut leaves = Vec::new();
-        leaves
-            .try_reserve_exact(maximum_count)
-            .map_err(|_| AddressSpaceError::OutOfFrames)?;
-        let Some(pdpt_phys) = read_user_table_entry(self.root_phys(), USER_PML4_INDEX)? else {
-            return Ok(leaves);
-        };
-        // A large sparse reservation used to perform two complete four-level
-        // translations per absent page. Cache the two directory decisions that
-        // change only at 1-GiB and 2-MiB boundaries, then inspect each leaf PTE
-        // once. The caller serializes VMA/PTE mutation for this root.
-        let mut cached_p3 = usize::MAX;
-        let mut pd_phys = None;
-        let mut cached_p2 = usize::MAX;
-        let mut pt_phys = None;
-        let mut virtual_address = start;
-        while virtual_address < end {
-            let virt = VirtAddr::new(virtual_address);
-            let p3 = p3_index(virt);
-            if p3 != cached_p3 {
-                pd_phys = read_user_table_entry(pdpt_phys, p3)?;
-                cached_p3 = p3;
-                cached_p2 = usize::MAX;
-                pt_phys = None;
-            }
-            let p2 = p2_index(virt);
-            if p2 != cached_p2 {
-                pt_phys = match pd_phys {
-                    Some(pd_phys) => read_user_table_entry(pd_phys, p2)?,
-                    None => None,
-                };
-                cached_p2 = p2;
-            }
-            if let Some(pt_phys) = pt_phys {
-                // SAFETY: `read_user_table_entry` admitted one present,
-                // non-huge user table and the serialized owner keeps it alive.
-                let pt = unsafe { kernel_vm::phys_to_table_ref(pt_phys) };
-                let entry = &pt[p1_index(virt)];
-                if !entry.is_unused() {
-                    let flags = entry.flags();
-                    if !flags.contains(PageTableFlags::PRESENT) {
-                        return Err(AddressSpaceError::InvalidFrameOwnership);
-                    }
-                    if !flags.contains(ROOT_OWNED_USER_LEAF) {
-                        return Err(AddressSpaceError::NotMapped);
-                    }
-                    if leaves.len() == maximum_count {
-                        return Err(AddressSpaceError::InvalidFrameOwnership);
-                    }
-                    leaves.push(PagerFaultLeaf {
-                        virtual_address,
-                        physical_address: entry.addr().as_u64(),
-                    });
+        scan_present_user_leaves_in_range(
+            self.root_phys(),
+            start,
+            end,
+            maximum_count,
+            read_user_table_entry,
+            read_user_leaf_entry,
+            |_, flags| {
+                if flags.contains(ROOT_OWNED_USER_LEAF) {
+                    Ok(())
+                } else {
+                    Err(AddressSpaceError::NotMapped)
                 }
-            }
-            virtual_address = virtual_address
-                .checked_add(PAGE_4KIB_U64)
-                .ok_or(AddressSpaceError::AddressOverflow)?;
-        }
-        Ok(leaves)
+            },
+        )
     }
 
     fn irq_off_pager_fault_leaf_at(&self, virt: VirtAddr) -> Option<PagerFaultLeaf> {
@@ -1083,6 +1089,121 @@ impl ProcessAddressSpace {
         }
         Ok(owned)
     }
+}
+
+fn validate_external_user_segments(segments: &[(u64, u64)]) -> Result<(), AddressSpaceError> {
+    for &(start, end) in segments {
+        if !is_page_aligned(start) || !is_page_aligned(end) {
+            return Err(AddressSpaceError::AddressNotPageAligned);
+        }
+        if start >= end || !is_user_addr(start) || end > USER_SPACE_END_EXCLUSIVE {
+            return Err(AddressSpaceError::AddressOutOfRange);
+        }
+    }
+    Ok(())
+}
+
+fn in_external_user_segment(virtual_address: u64, segments: &[(u64, u64)]) -> bool {
+    segments
+        .iter()
+        .any(|&(start, end)| start <= virtual_address && virtual_address < end)
+}
+
+fn validate_user_unmap_leaf(
+    leaf: PagerFaultLeaf,
+    flags: PageTableFlags,
+    external_segments: &[(u64, u64)],
+    exact_owned: bool,
+) -> Result<(), AddressSpaceError> {
+    if leaf.physical_address == 0
+        || !leaf.physical_address.is_multiple_of(PAGE_4KIB_U64)
+        || !flags.contains(PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE)
+    {
+        return Err(AddressSpaceError::InvalidFrameOwnership);
+    }
+    let tagged = flags.contains(ROOT_OWNED_USER_LEAF);
+    if in_external_user_segment(leaf.virtual_address, external_segments) {
+        if tagged || exact_owned {
+            return Err(AddressSpaceError::InvalidFrameOwnership);
+        }
+    } else if !tagged || !exact_owned {
+        return Err(AddressSpaceError::InvalidFrameOwnership);
+    }
+    Ok(())
+}
+
+fn read_user_leaf_entry(pt_phys: PhysAddr, index: usize) -> PageTableEntry {
+    // SAFETY: the scanner admitted a present non-huge user table, and the
+    // serialized owner keeps it alive throughout preflight.
+    let pt = unsafe { kernel_vm::phys_to_table_ref(pt_phys) };
+    pt[index].clone()
+}
+
+fn scan_present_user_leaves_in_range(
+    root_phys: PhysAddr,
+    start: u64,
+    end: u64,
+    maximum_count: usize,
+    mut read_table: impl FnMut(PhysAddr, usize) -> Result<Option<PhysAddr>, AddressSpaceError>,
+    mut read_leaf: impl FnMut(PhysAddr, usize) -> PageTableEntry,
+    mut validate_leaf: impl FnMut(PagerFaultLeaf, PageTableFlags) -> Result<(), AddressSpaceError>,
+) -> Result<Vec<PagerFaultLeaf>, AddressSpaceError> {
+    let mut leaves = Vec::new();
+    leaves
+        .try_reserve_exact(maximum_count)
+        .map_err(|_| AddressSpaceError::OutOfFrames)?;
+    let Some(pdpt_phys) = read_table(root_phys, USER_PML4_INDEX)? else {
+        return Ok(leaves);
+    };
+    // A large sparse reservation used to perform two complete four-level
+    // translations per absent page. Cache the two directory decisions that
+    // change only at 1-GiB and 2-MiB boundaries, then inspect each leaf PTE
+    // once. The caller serializes VMA/PTE mutation for this root.
+    let mut cached_p3 = usize::MAX;
+    let mut pd_phys = None;
+    let mut cached_p2 = usize::MAX;
+    let mut pt_phys = None;
+    let mut virtual_address = start;
+    while virtual_address < end {
+        let virt = VirtAddr::new(virtual_address);
+        let p3 = p3_index(virt);
+        if p3 != cached_p3 {
+            pd_phys = read_table(pdpt_phys, p3)?;
+            cached_p3 = p3;
+            cached_p2 = usize::MAX;
+            pt_phys = None;
+        }
+        let p2 = p2_index(virt);
+        if p2 != cached_p2 {
+            pt_phys = match pd_phys {
+                Some(pd_phys) => read_table(pd_phys, p2)?,
+                None => None,
+            };
+            cached_p2 = p2;
+        }
+        if let Some(pt_phys) = pt_phys {
+            let entry = read_leaf(pt_phys, p1_index(virt));
+            if !entry.is_unused() {
+                let flags = entry.flags();
+                if !flags.contains(PageTableFlags::PRESENT) {
+                    return Err(AddressSpaceError::InvalidFrameOwnership);
+                }
+                let leaf = PagerFaultLeaf {
+                    virtual_address,
+                    physical_address: entry.addr().as_u64(),
+                };
+                validate_leaf(leaf, flags)?;
+                if leaves.len() == maximum_count {
+                    return Err(AddressSpaceError::InvalidFrameOwnership);
+                }
+                leaves.push(leaf);
+            }
+        }
+        virtual_address = virtual_address
+            .checked_add(PAGE_4KIB_U64)
+            .ok_or(AddressSpaceError::AddressOverflow)?;
+    }
+    Ok(leaves)
 }
 
 fn pager_fault_range_end(start: VirtAddr, page_count: usize) -> Result<u64, AddressSpaceError> {
@@ -1169,6 +1290,279 @@ fn with_prepared_user_leaf_mut<R>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fixture_leaf(frame: u64, owned: bool) -> PageTableEntry {
+        let mut entry = PageTableEntry::new();
+        let flags = PageTableFlags::PRESENT
+            | PageTableFlags::USER_ACCESSIBLE
+            | PageTableFlags::NO_EXECUTE
+            | if owned {
+                ROOT_OWNED_USER_LEAF
+            } else {
+                PageTableFlags::empty()
+            };
+        entry.set_addr(PhysAddr::new(frame), flags);
+        entry
+    }
+
+    // Exercise the production scanner and ownership preflight without using
+    // the kernel direct map, privileged TLB operations, or global descriptors.
+    fn fixture_plan(
+        entries: &[PageTableEntry],
+        descriptor_frames: &[Option<u64>],
+        external_segments: &[(u64, u64)],
+        maximum_count: usize,
+    ) -> Result<Vec<PagerFaultLeaf>, AddressSpaceError> {
+        let start = VirtAddr::new(USER_SPACE_BASE);
+        validate_user_page_range(start, entries.len())?;
+        validate_external_user_segments(external_segments)?;
+        scan_present_user_leaves_in_range(
+            PhysAddr::new(PAGE_4KIB_U64),
+            start.as_u64(),
+            pager_fault_range_end(start, entries.len())?,
+            maximum_count,
+            |parent, _| Ok(Some(PhysAddr::new(parent.as_u64() + PAGE_4KIB_U64))),
+            |_, index| entries[index].clone(),
+            |leaf, flags| {
+                let page = ((leaf.virtual_address - USER_SPACE_BASE) / PAGE_4KIB_U64) as usize;
+                validate_user_unmap_leaf(
+                    leaf,
+                    flags,
+                    external_segments,
+                    descriptor_frames[page] == Some(leaf.physical_address),
+                )
+            },
+        )
+    }
+
+    fn assert_entries_unchanged(entries: &[PageTableEntry], before: &[PageTableEntry]) {
+        for (entry, saved) in entries.iter().zip(before) {
+            assert_eq!(entry.addr(), saved.addr());
+            assert_eq!(entry.flags(), saved.flags());
+            assert_eq!(entry.is_unused(), saved.is_unused());
+        }
+    }
+
+    #[test]
+    fn user_unmap_preflights_owned_pages_separated_by_holes() {
+        let mut first = fixture_leaf(0x10000, true);
+        // Bit 7 in a 4 KiB leaf is PAT, not a huge-page directory flag.
+        first.set_flags(first.flags() | PageTableFlags::HUGE_PAGE);
+        let entries = [first, PageTableEntry::new(), fixture_leaf(0x12000, true)];
+        let leaves = fixture_plan(&entries, &[Some(0x10000), None, Some(0x12000)], &[], 3).unwrap();
+        assert_eq!(leaves.len(), 2);
+        assert_eq!(leaves[0].virtual_address, USER_SPACE_BASE);
+        assert_eq!(
+            leaves[1].virtual_address,
+            USER_SPACE_BASE + 2 * PAGE_4KIB_U64
+        );
+        assert_eq!(leaves[1].physical_address, 0x12000);
+    }
+
+    #[test]
+    fn user_unmap_preflights_owned_and_borrowed_mix() {
+        let entries = [
+            fixture_leaf(0x10000, true),
+            PageTableEntry::new(),
+            fixture_leaf(0x90000, false),
+            fixture_leaf(0x13000, true),
+        ];
+        let segments = [(
+            USER_SPACE_BASE + 2 * PAGE_4KIB_U64,
+            USER_SPACE_BASE + 3 * PAGE_4KIB_U64,
+        )];
+        let leaves = fixture_plan(
+            &entries,
+            &[Some(0x10000), None, None, Some(0x13000)],
+            &segments,
+            4,
+        )
+        .unwrap();
+        assert_eq!(leaves.len(), 3);
+        let reclaimable: Vec<_> = leaves
+            .iter()
+            .filter(|leaf| !in_external_user_segment(leaf.virtual_address, &segments))
+            .map(|leaf| leaf.physical_address)
+            .collect();
+        assert_eq!(reclaimable, [0x10000, 0x13000]);
+    }
+
+    #[test]
+    fn user_unmap_repeated_no_present_plans_are_empty() {
+        let entries = [PageTableEntry::new(), PageTableEntry::new()];
+        for _ in 0..2 {
+            assert!(fixture_plan(&entries, &[None, None], &[], 2)
+                .unwrap()
+                .is_empty());
+        }
+        for missing_level in 0..3 {
+            let mut level = 0;
+            let leaves = scan_present_user_leaves_in_range(
+                PhysAddr::new(PAGE_4KIB_U64),
+                USER_SPACE_BASE,
+                USER_SPACE_BASE + 2 * PAGE_4KIB_U64,
+                2,
+                |parent, _| {
+                    let absent = level == missing_level;
+                    level += 1;
+                    Ok((!absent).then(|| PhysAddr::new(parent.as_u64() + PAGE_4KIB_U64)))
+                },
+                |_, _| panic!("absent directory must not read a leaf"),
+                |_, _| panic!("absent directory must not validate a leaf"),
+            )
+            .unwrap();
+            assert!(leaves.is_empty());
+        }
+    }
+
+    #[test]
+    fn user_unmap_ownership_refusals_leave_all_entries_intact() {
+        let external = [(
+            USER_SPACE_BASE + PAGE_4KIB_U64,
+            USER_SPACE_BASE + 2 * PAGE_4KIB_U64,
+        )];
+        // Missing tag, missing/mismatched descriptor, tagged external, and
+        // untagged external with a descriptor all fail after the first leaf.
+        for (tagged, exact_frame, segments) in [
+            (false, None, &[][..]),
+            (false, Some(0x11000), &[][..]),
+            (true, None, &[][..]),
+            (true, Some(0x99000), &[][..]),
+            (true, None, &external[..]),
+            (true, Some(0x11000), &external[..]),
+            (false, Some(0x11000), &external[..]),
+        ] {
+            let entries = [fixture_leaf(0x10000, true), fixture_leaf(0x11000, tagged)];
+            let before = entries.clone();
+            assert!(matches!(
+                fixture_plan(&entries, &[Some(0x10000), exact_frame], segments, 2),
+                Err(AddressSpaceError::InvalidFrameOwnership)
+            ));
+            assert_entries_unchanged(&entries, &before);
+        }
+    }
+
+    #[test]
+    fn user_unmap_invalid_leaf_refusal_leaves_all_entries_intact() {
+        for (frame, flags) in [
+            (
+                0x11000,
+                PageTableFlags::USER_ACCESSIBLE | ROOT_OWNED_USER_LEAF,
+            ),
+            (0x11000, PageTableFlags::PRESENT | ROOT_OWNED_USER_LEAF),
+            (
+                0,
+                PageTableFlags::PRESENT | PageTableFlags::USER_ACCESSIBLE | ROOT_OWNED_USER_LEAF,
+            ),
+        ] {
+            let mut invalid = PageTableEntry::new();
+            invalid.set_addr(PhysAddr::new(frame), flags);
+            let entries = [fixture_leaf(0x10000, true), invalid];
+            let before = entries.clone();
+            assert!(matches!(
+                fixture_plan(&entries, &[Some(0x10000), Some(frame)], &[], 2),
+                Err(AddressSpaceError::InvalidFrameOwnership)
+            ));
+            assert_entries_unchanged(&entries, &before);
+        }
+    }
+
+    #[test]
+    fn user_unmap_late_invalid_directory_refuses_before_mutation() {
+        let start = USER_SPACE_BASE + (1 << PD_SHIFT) - PAGE_4KIB_U64;
+        for (flags, expected) in [
+            (
+                user_table_flags() | PageTableFlags::HUGE_PAGE,
+                AddressSpaceError::HugePageConflict,
+            ),
+            (
+                user_table_flags().difference(PageTableFlags::PRESENT),
+                AddressSpaceError::ProtectionViolation,
+            ),
+        ] {
+            let entry = fixture_leaf(0x10000, true);
+            let before = entry.clone();
+            let mut validated = 0;
+            let result = scan_present_user_leaves_in_range(
+                PhysAddr::new(0x1000),
+                start,
+                start + 2 * PAGE_4KIB_U64,
+                2,
+                |parent, index| {
+                    let child = parent.as_u64() + PAGE_4KIB_U64;
+                    let flags = if parent.as_u64() == 0x3000 && index == 1 {
+                        flags
+                    } else {
+                        user_table_flags()
+                    };
+                    classify_user_table_entry(child | flags.bits()).map(Some)
+                },
+                |_, _| entry.clone(),
+                |leaf, flags| {
+                    validated += 1;
+                    validate_user_unmap_leaf(leaf, flags, &[], true)
+                },
+            );
+            assert!(matches!(result, Err(error) if error == expected));
+            assert_eq!(validated, 1);
+            assert_entries_unchanged(&[entry], &[before]);
+        }
+    }
+
+    #[test]
+    fn user_unmap_capacity_refusal_precedes_mutation() {
+        let entries = [fixture_leaf(0x10000, true), fixture_leaf(0x11000, true)];
+        let before = entries.clone();
+        assert!(matches!(
+            fixture_plan(&entries, &[Some(0x10000), Some(0x11000)], &[], 1),
+            Err(AddressSpaceError::InvalidFrameOwnership)
+        ));
+        assert_entries_unchanged(&entries, &before);
+        let result = scan_present_user_leaves_in_range(
+            PhysAddr::new(0x1000),
+            USER_SPACE_BASE,
+            USER_SPACE_BASE + PAGE_4KIB_U64,
+            usize::MAX,
+            |_, _| panic!("capacity must be reserved before directory reads"),
+            |_, _| panic!("capacity must be reserved before leaf reads"),
+            |_, _| panic!("capacity must be reserved before validation"),
+        );
+        assert!(matches!(result, Err(AddressSpaceError::OutOfFrames)));
+    }
+
+    #[test]
+    fn user_unmap_external_segments_validate_geometry_and_half_open_membership() {
+        let base = USER_SPACE_BASE;
+        let page = PAGE_4KIB_U64;
+        for segments in [
+            [(base, base)],
+            [(base + page, base)],
+            [(base - page, base)],
+            [(base, USER_SPACE_END_EXCLUSIVE + page)],
+        ] {
+            assert_eq!(
+                validate_external_user_segments(&segments),
+                Err(AddressSpaceError::AddressOutOfRange)
+            );
+        }
+        assert_eq!(
+            validate_external_user_segments(&[(base + 1, base + page)]),
+            Err(AddressSpaceError::AddressNotPageAligned)
+        );
+        assert_eq!(
+            validate_external_user_segments(&[(base, base + page + 1)]),
+            Err(AddressSpaceError::AddressNotPageAligned)
+        );
+        let segments = [(base + 2 * page, base + 4 * page), (base, base + 3 * page)];
+        assert_eq!(validate_external_user_segments(&segments), Ok(()));
+        assert!(in_external_user_segment(base, &segments));
+        assert!(in_external_user_segment(base + 3 * page, &segments));
+        assert!(!in_external_user_segment(base + 4 * page, &segments));
+        assert_eq!(
+            validate_external_user_segments(&[(base, USER_SPACE_END_EXCLUSIVE)]),
+            Ok(())
+        );
+    }
 
     #[test]
     fn cloned_leaf_flags_drop_the_root_owned_user_leaf_tag() {

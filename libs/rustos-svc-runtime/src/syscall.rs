@@ -118,6 +118,7 @@ pub unsafe fn syscall6(number: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64,
 
 // Linux x86_64 syscall numbers used by the runtime itself.
 pub const SYS_MMAP: u64 = 9;
+pub const SYS_SCHED_YIELD: u64 = 24;
 pub const SYS_NANOSLEEP: u64 = 35;
 pub const SYS_EXIT_GROUP: u64 = 231;
 pub const SYS_CLOCK_GETTIME: u64 = 228;

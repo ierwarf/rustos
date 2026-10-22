@@ -3,9 +3,9 @@ use x86_64::instructions::interrupts;
 use kernel_hal::api::cpu;
 
 use super::{
-    MAIN_THREAD_SLICE_MICROS, NEXT_TASK_ID, SchedulingContextAdmission, SpawnReservation,
-    SpawnTaskError, UserTaskBootstrap, allocate_task_id, cancel_process_spawn,
-    checked_thread_pit_divisor, initial_task_rflags, kernel_task_entry_trampoline_addr,
+    allocate_task_id, cancel_process_spawn, checked_thread_pit_divisor, initial_task_rflags,
+    kernel_task_entry_trampoline_addr, SchedulingContextAdmission, SpawnReservation,
+    SpawnTaskError, UserTaskBootstrap, MAIN_THREAD_SLICE_MICROS, NEXT_TASK_ID,
 };
 use crate::memory::paging::ProcessAddressSpace;
 use crate::user::process_state::UserProcessState;
@@ -217,6 +217,10 @@ fn spawn_user_process_state_inner(
             return Err(error);
         }
     };
+    // Repeated fork is a steady-state operation. Formatting/emitting a full
+    // debugcon frame here costs more than COW creation under KVM; exact spawn
+    // lifecycle evidence belongs to the opt-in diagnostic profile.
+    #[cfg(rustos_lifecycle_trace)]
     crate::debug::record_milestone(
         crate::debug::LogCategory::Sched,
         "spawn-user-process-state",

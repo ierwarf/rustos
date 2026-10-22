@@ -19,6 +19,16 @@ fn checkpoint(phase: &str, khz: u64) {
     if !crate::linux_output() {
         ipc_probes::probe_state_checkpoint(&format!("state_{phase}_ipc"), khz);
     }
+    // Diagnostic only: distinguish an immediate post-transition distribution
+    // from a lasting tax after the full IPC checkpoint. The primary rail still
+    // judges the original samples; this cannot turn its failure into a pass.
+    if let Some(mut samples) = core_paths::identity_samples() {
+        let stats = crate::summarize(&mut samples);
+        debug_line(&format!(
+            "ipcbench: state-null-recheck phase={phase} min={} p50={} p99={}",
+            stats.min, stats.p50, stats.p99
+        ));
+    }
 }
 
 fn reap(pid: libc::pid_t) -> bool {
@@ -28,12 +38,17 @@ fn reap(pid: libc::pid_t) -> bool {
     let mut status = 0;
     let waited = unsafe { crate::wait_child(pid, &mut status) };
     let valid = waited.is_ok() && crate::child_exited_successfully(status);
-    if !valid {
+    // Logical consumption is one-shot even if physical reclamation is still
+    // pending. WNOHANG must not turn ECHILD into a zero/pending response.
+    let consumed = valid
+        && unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) } == -1
+        && std::io::Error::last_os_error().raw_os_error() == Some(libc::ECHILD);
+    if !consumed {
         debug_line(&format!(
             "ipcbench: state-child-failure pid={pid} wait={waited:?} status={status}"
         ));
     }
-    valid
+    consumed
 }
 
 fn exec_transition() -> bool {
@@ -86,7 +101,64 @@ fn mapping_transition() -> bool {
         }
         ptr::write_volatile(address.cast::<u8>(), 0x5a);
         let valid = ptr::read_volatile(address.cast::<u8>()) == 0x5a;
-        libc::munmap(address, 4096) == 0 && valid
+        libc::munmap(address, 4096) == 0 && valid && sparse_mapping_transition()
+    }
+}
+
+// Exercise real PTE/TLB removal, holes, and mixed owned/borrowed backing.
+// A second shared alias must survive removing the mixed range.
+unsafe fn sparse_mapping_transition() -> bool {
+    unsafe {
+        let base = libc::mmap(
+            ptr::null_mut(),
+            3 * 4096,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        );
+        if base == libc::MAP_FAILED {
+            return false;
+        }
+        let middle = base.cast::<u8>().add(4096).cast();
+        ptr::write_volatile(base.cast::<u8>(), 1);
+        ptr::write_volatile(base.cast::<u8>().add(8192), 2);
+        let holes = libc::munmap(middle, 4096) == 0 && libc::munmap(middle, 4096) == 0;
+        let fd = libc::memfd_create(c"state-unmap".as_ptr(), libc::MFD_CLOEXEC);
+        if fd < 0 {
+            libc::munmap(base, 3 * 4096);
+            return false;
+        }
+        let sized = libc::ftruncate(fd, 4096) == 0;
+        let alias = if sized {
+            libc::mmap(
+                ptr::null_mut(),
+                4096,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            )
+        } else {
+            libc::MAP_FAILED
+        };
+        let mapped = alias != libc::MAP_FAILED
+            && libc::mmap(
+                middle,
+                4096,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED | libc::MAP_FIXED,
+                fd,
+                0,
+            ) == middle;
+        if mapped {
+            ptr::write_volatile(middle.cast::<u8>(), 0x5a);
+        }
+        let removed = libc::munmap(base, 3 * 4096) == 0;
+        let valid = mapped && removed && ptr::read_volatile(alias.cast::<u8>()) == 0x5a;
+        let alias_removed = alias == libc::MAP_FAILED || libc::munmap(alias, 4096) == 0;
+        libc::close(fd);
+        holes && valid && alias_removed
     }
 }
 

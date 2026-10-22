@@ -265,16 +265,16 @@ mod identity;
 mod mm_execution;
 pub(in crate::multitask) mod pin_owner;
 pub(super) use identity::published_live_process_identity;
-pub use identity::{
-    ProcessHandle, ProcessIdentity, ProcessRef, live_process_identity,
-    live_process_identity_by_pid, retain_process, retain_process_by_pid,
-};
 #[cfg(test)]
 use identity::{clear_publication_for_test, process_state_is_visible};
+pub use identity::{
+    live_process_identity, live_process_identity_by_pid, retain_process, retain_process_by_pid,
+    ProcessHandle, ProcessIdentity, ProcessRef,
+};
 pub(super) use identity::{
     own_process_ref, pin_process_object, publication_divergence_count, with_own_visible_state,
 };
-pub(in crate::multitask) use mm_execution::{MmActivationPin, MmExecutionPin, pin_process_mm};
+pub(in crate::multitask) use mm_execution::{pin_process_mm, MmActivationPin, MmExecutionPin};
 
 /// Keep the exact-state lock bridge as an explicit process-table API instead
 /// of leaking the private identity module through a re-export.
@@ -287,7 +287,7 @@ pub(super) fn with_own_exact_visible_state<R>(
 }
 
 pub(in crate::multitask) mod spawn;
-pub use spawn::{SpawnReservation, cancel_spawn, publish_spawn, reserve_spawn};
+pub use spawn::{cancel_spawn, publish_spawn, reserve_spawn, SpawnReservation};
 
 static PROCESS_TABLE: ProcessTableLock = ProcessTableLock::new(ProcessTable::new());
 
@@ -1036,7 +1036,9 @@ pub fn wait_for_child(
         let Some(object) = slot.object.as_deref_mut() else {
             continue;
         };
-        if object.parent_process_id != Some(parent_process_id) {
+        // Logical wait consumption is final even while references or threads
+        // keep the physical process object alive for teardown.
+        if object.parent_process_id != Some(parent_process_id) || object.waited {
             continue;
         }
         let pid = object.process_id;
@@ -1094,6 +1096,10 @@ pub fn wait_for_child(
     }
 
     if let Some(result) = exited {
+        // Another parent thread may have armed after the exit publication but
+        // before this one consumed the last matching child. It must recheck
+        // eligibility (and return ECHILD), not wait for physical reclamation.
+        super::child_wait::wake_child_waiters(parent_process_id);
         return result;
     }
 
@@ -1224,12 +1230,12 @@ pub(crate) mod tests {
     use core::sync::atomic::AtomicU64;
 
     use super::{
-        ExecReservation, LockClass, ProcessHandle, ProcessObject, ProcessTable, WaitResult,
         attach_task, begin_exec, cancel_exec, clear_publication_for_test, create_process,
         create_process_with_parent, detach_task, is_process_exiting, mark_process_exiting,
-        note_job_control, note_process_exit_status, own_process_ref,
-        process_state_is_visible, reap_exited_processes, retain_process, thread_count_by_pid,
-        try_with_process_state_mut, wait_for_child,
+        note_job_control, note_process_exit_status, own_process_ref, process_state_is_visible,
+        reap_exited_processes, retain_process, thread_count_by_pid, try_with_process_state_mut,
+        wait_for_child, ExecReservation, LockClass, ProcessHandle, ProcessObject, ProcessTable,
+        WaitResult,
     };
     use crate::memory::paging::ProcessAddressSpace;
     use crate::user::process_state::UserProcessState;
@@ -1571,6 +1577,81 @@ pub(crate) mod tests {
         for _ in 0..super::MAX_THREADS_PER_PROCESS {
             detach_task(handle).expect("detach admitted thread");
         }
+        assert_eq!(reap_exited_processes(), 1);
+    }
+
+    #[test]
+    fn exited_child_is_consumed_once_even_while_pinned() {
+        let _guard = lock_process_table_for_tests();
+        let parent = create_process(5_070, new_state()).unwrap();
+        let child = create_process_with_parent(5_071, Some(5_070), new_state()).unwrap();
+        let pin = super::pin_owner::pin(child).unwrap();
+        note_process_exit_status(5_071, 0x2a00).unwrap();
+        detach_task(child).unwrap();
+        assert!(matches!(
+            wait_for_child(5_070, -1, false, false),
+            WaitResult::Exited {
+                pid: 5_071,
+                status: 0x2a00
+            }
+        ));
+        assert_eq!(reap_exited_processes(), 0);
+        for target in [-1, 5_071] {
+            assert!(matches!(
+                wait_for_child(5_070, target, true, true),
+                WaitResult::NoMatchingChild
+            ));
+        }
+        drop(pin);
+        assert_eq!(reap_exited_processes(), 1);
+        detach_task(parent).unwrap();
+        assert_eq!(reap_exited_processes(), 1);
+    }
+
+    #[test]
+    fn concurrent_parent_waiters_cannot_replay_a_pinned_exit() {
+        let _guard = lock_process_table_for_tests();
+        let parent = create_process(5_080, new_state()).unwrap();
+        let child = create_process_with_parent(5_081, Some(5_080), new_state()).unwrap();
+        let pin = super::pin_owner::pin(child).unwrap();
+        note_process_exit_status(5_081, 0x2a00).unwrap();
+        detach_task(child).unwrap();
+        let ready = std::sync::Barrier::new(3);
+        std::thread::scope(|scope| {
+            let a = scope.spawn(|| {
+                ready.wait();
+                wait_for_child(5_080, -1, false, false)
+            });
+            let b = scope.spawn(|| {
+                ready.wait();
+                wait_for_child(5_080, 5_081, false, false)
+            });
+            ready.wait();
+            let results = [a.join().unwrap(), b.join().unwrap()];
+            assert_eq!(
+                results
+                    .iter()
+                    .filter(|r| matches!(
+                        r,
+                        WaitResult::Exited {
+                            pid: 5_081,
+                            status: 0x2a00
+                        }
+                    ))
+                    .count(),
+                1
+            );
+            assert_eq!(
+                results
+                    .iter()
+                    .filter(|r| matches!(r, WaitResult::NoMatchingChild))
+                    .count(),
+                1
+            );
+        });
+        drop(pin);
+        assert_eq!(reap_exited_processes(), 1);
+        detach_task(parent).unwrap();
         assert_eq!(reap_exited_processes(), 1);
     }
 

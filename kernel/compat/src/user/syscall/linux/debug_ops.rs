@@ -1,9 +1,9 @@
 use super::*;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use rustos_user_abi::syscall::{
-    PRODUCT_MILESTONE_BOOTSTRAP_EXECUTABLE_SNAPSHOT_SEALED,
-    ProductExecutableSnapshotEvidence as ProductSnapshotEvidenceWire,
     product_executable_snapshot_evidence_shape_valid,
+    ProductExecutableSnapshotEvidence as ProductSnapshotEvidenceWire,
+    PRODUCT_MILESTONE_BOOTSTRAP_EXECUTABLE_SNAPSHOT_SEALED,
 };
 
 const SECONDARY_LINUX_SYSCALL_DEBUG_LIMIT: usize = 64;
@@ -28,19 +28,54 @@ pub(super) fn syscall_linux_rustos_debug_print(user_ptr: u64, user_len: u64) -> 
         let chunk_len = (len - written).min(chunk.len());
         let ptr = match user_ptr.checked_add(written as u64) {
             Some(ptr) => ptr,
-            None => return linux_errno(LINUX_EINVAL),
+            None => {
+                return if written != 0 {
+                    written as u64
+                } else {
+                    linux_errno(LINUX_EINVAL)
+                }
+            }
         };
         if let Err(err) = usermem::copy_from_current_user_exact(ptr, &mut chunk[..chunk_len]) {
-            return linux_errno(address_space_error_to_linux_errno(err));
+            return if written != 0 {
+                written as u64
+            } else {
+                linux_errno(address_space_error_to_linux_errno(err))
+            };
         }
         // A Ring3 caller must never be able to inject a fresh debugcon line
         // that is indistinguishable from a kernel-stamped milestone frame.
         // Every chunk gets a kernel-owned envelope and every control/quote
         // byte is escaped before the serialized output lock is acquired.
-        debug::write_user_bytes_serialized(&chunk[..chunk_len]);
-        written += chunk_len;
+        let accepted = debug::write_user_bytes_serialized(&chunk[..chunk_len]);
+        written += accepted;
+        if accepted != chunk_len {
+            // Never acknowledge bytes that the bounded diagnostic transport
+            // refused. Userspace can retry the unaccepted suffix after yielding.
+            return if written == 0 {
+                linux_errno(LINUX_EAGAIN)
+            } else {
+                written as u64
+            };
+        }
     }
     written as u64
+}
+
+pub(super) fn record_process_termination_diagnostic(process_id: u64, wait_status: i32) {
+    // Normal exit is a hot lifecycle path, not a fault/refusal diagnostic.
+    if process_termination_diagnostic_required(wait_status, cfg!(rustos_lifecycle_trace)) {
+        debug::record_milestone(
+            debug::LogCategory::Compat,
+            "linux-process-termination",
+            process_id,
+            wait_status as u32 as u64,
+        );
+    }
+}
+
+fn process_termination_diagnostic_required(wait_status: i32, lifecycle_trace: bool) -> bool {
+    wait_status != 0 || lifecycle_trace
 }
 
 fn product_milestone_name(milestone: u64) -> Option<(&'static str, bool)> {
@@ -166,6 +201,18 @@ pub(super) fn linux_errno(errno: i64) -> u64 {
 )]
 #[cfg(test)]
 mod product_milestone_tests {
+    #[test]
+    fn successful_exit_is_quiet_but_anomalies_and_explicit_trace_remain_visible() {
+        assert!(!super::process_termination_diagnostic_required(0, false));
+        for status in [0, 1, 42 << 8, 9] {
+            assert!(super::process_termination_diagnostic_required(status, true));
+            assert_eq!(
+                super::process_termination_diagnostic_required(status, false),
+                status != 0
+            );
+        }
+    }
+
     use super::*;
 
     #[test]

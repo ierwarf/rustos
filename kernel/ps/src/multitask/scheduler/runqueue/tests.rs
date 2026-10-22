@@ -10,7 +10,7 @@ use super::{
     simd_tls::{set_tls_fs_base, tls_fs_base},
     *,
 };
-use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 
 pub(in crate::multitask) fn test_serial_guard() -> std::sync::MutexGuard<'static, ()> {
     TEST_GUARD
@@ -709,12 +709,6 @@ fn consumed_direct_fifo_generation_cannot_claim_or_materialize_a_new_direct_owne
         weight,
         Some(consumed_generation),
     ));
-    assert!(preserve_budget_refused_handoff_generation(
-        slot,
-        cpu,
-        weight,
-        consumed_generation,
-    ));
     assert_eq!(owner(slot), fresh, "old FIFO proof cannot edit a new owner");
     assert_eq!(published_runnable_count(cpu), 0);
     assert!(claim_dispatch_with_owner_generation(
@@ -723,40 +717,6 @@ fn consumed_direct_fifo_generation_cannot_claim_or_materialize_a_new_direct_owne
         weight,
         Some(fresh.generation),
     ));
-}
-
-#[test]
-fn consumed_generic_local_budget_refusal_never_republishes_an_owner() {
-    let _scope = RunQueueTestScope::new();
-    let (slot, cpu, weight) = (26, 2, 144);
-    admit_blocked(slot);
-    publish_local(slot, cpu, weight);
-    let local = owner(slot);
-    assert!(preserve_budget_refused_handoff_generation(
-        slot,
-        cpu,
-        weight,
-        local.generation,
-    ));
-    assert_eq!(owner(slot), local);
-    assert_eq!(published_runnable_count(cpu), 1);
-    publish_blocked(slot, cpu, weight);
-    assert!(matches!(
-        publish_direct_handoff(slot, cpu),
-        RemoteWakeOutcome::Published { .. }
-    ));
-    let fresh = owner(slot);
-    assert!(preserve_budget_refused_handoff_generation(
-        slot,
-        cpu,
-        weight,
-        local.generation,
-    ));
-    assert_eq!(
-        owner(slot),
-        fresh,
-        "an old generic hint cannot materialize a new Direct owner"
-    );
 }
 
 #[test]
@@ -785,14 +745,30 @@ fn budget_refusal_after_consuming_a_direct_handoff_retains_claimable_custody() {
 
     // Model the later budget-commit refusal in dispatch_schedule. No dispatch
     // occurred, so that path must make the consumed direct owner fair-claimable.
-    assert!(preserve_budget_refused_handoff(slot, cpu, weight));
+    let generation = owner(slot).generation;
+    assert!(materialize_direct_handoff_with_generation(
+        slot,
+        cpu,
+        weight,
+        Some(generation)
+    ));
     assert_eq!(owner(slot).state, RunOwnerState::Local);
     assert_eq!(published_runnable_count(cpu), 1);
-    assert!(preserve_budget_refused_handoff(slot, cpu, weight));
+    assert!(!materialize_direct_handoff_with_generation(
+        slot,
+        cpu,
+        weight,
+        Some(generation)
+    ));
     assert_eq!(published_runnable_count(cpu), 1, "no duplicate insertion");
     assert!(claim_dispatch(slot, cpu, weight));
     assert!(!claim_dispatch(slot, cpu, weight));
-    assert!(!preserve_budget_refused_handoff(slot, cpu, weight));
+    assert!(!materialize_direct_handoff_with_generation(
+        slot,
+        cpu,
+        weight,
+        Some(generation)
+    ));
 }
 
 #[test]

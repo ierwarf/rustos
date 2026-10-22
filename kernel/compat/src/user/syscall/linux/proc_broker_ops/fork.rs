@@ -65,6 +65,10 @@ pub(super) fn syscall_linux_rustos_proc_fork_broker(args_ptr: u64) -> u64 {
     // child inherits. The process state lock stabilizes page tables while the
     // VMA writer holds every live publication at an odd sequence; concurrent
     // faults retry, and no mmap/unmap can be linearized inside this snapshot.
+    #[cfg(rustos_lifecycle_trace)]
+    let fork_started = crate::arch::clock::monotonic_nanos();
+    #[cfg(rustos_lifecycle_trace)]
+    let mut clone_ns = 0;
     let forked = multitask::with_fork_parent_state(args.source_pid, |parent, regions| {
         let mut eager_private_ranges = Vec::new();
         if args.clone_flags & linux_abi::CLONE_CHILD_SETTID != 0 {
@@ -114,9 +118,15 @@ pub(super) fn syscall_linux_rustos_proc_fork_broker(args_ptr: u64) -> u64 {
             }
         }
         cow_ranges.sort_unstable_by_key(|region| region.start.as_u64());
+        #[cfg(rustos_lifecycle_trace)]
+        let clone_started = crate::arch::clock::monotonic_nanos();
         let address_space = parent
             .address_space_mut()
             .clone_user_space_cow(&cow_ranges, &eager_private_ranges)?;
+        #[cfg(rustos_lifecycle_trace)]
+        {
+            clone_ns = crate::arch::clock::monotonic_nanos().saturating_sub(clone_started);
+        }
         let mut inherited_regions = Vec::new();
         inherited_regions
             .try_reserve_exact(regions.len())
@@ -138,6 +148,19 @@ pub(super) fn syscall_linux_rustos_proc_fork_broker(args_ptr: u64) -> u64 {
             return linux_errno(LINUX_ENOMEM);
         }
     };
+    #[cfg(rustos_lifecycle_trace)]
+    {
+        // Emit only after the parent process/VMA guards have been released.
+        // Nanoseconds: entire held fork transaction vs just page-table/COW
+        // cloning. Diagnostic profiles are never shipping-latency evidence.
+        let fork_ns = crate::arch::clock::monotonic_nanos().saturating_sub(fork_started);
+        debug::record_milestone(
+            debug::LogCategory::Memory,
+            "proc-fork-work",
+            fork_ns,
+            clone_ns,
+        );
+    }
     let mut child_thread_state = thread_snapshot.thread_state;
     child_thread_state.clear_child_tid = if args.clone_flags & linux_abi::CLONE_CHILD_CLEARTID != 0
     {

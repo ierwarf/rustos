@@ -20,7 +20,7 @@ use rustos_user_abi::syscall::{
     COMMERCIAL_MAX_STORAGED_OP_ROOT_VOLUME_SELECT, COMMERCIAL_MAX_STORAGED_OP_VOLUME_METADATA,
     IPC_SERVICE_STORAGED, IPC_SERVICE_VFSD, PRODUCT_MILESTONE_STORAGE_READY,
     STORAGED_BULK_READ_PAYLOAD_CAPACITY, STORAGE_FLAG_READONLY, STORAGE_TRANSPORT_DVM_BLOCK,
-    SYS_RUSTOS_DEBUG_PRINT, SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_RECV_WITH_SENDER,
+    SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_RECV_WITH_SENDER,
     SYS_RUSTOS_IPC_REPLY,
 };
 
@@ -647,11 +647,7 @@ fn debug_line(message: &str) {
     let mut line = [0_u8; 1024];
     line[..len].copy_from_slice(&bytes[..len]);
     line[len] = b'\n';
-    let _ = syscall2(
-        SYS_RUSTOS_DEBUG_PRINT,
-        line.as_ptr() as u64,
-        (len + 1) as u64,
-    );
+    rustos_svc_runtime::ipc::debug_bytes(&line[..len + 1]);
 }
 
 #[cfg(test)]

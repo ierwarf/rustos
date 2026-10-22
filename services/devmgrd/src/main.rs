@@ -46,7 +46,7 @@ use rustos_user_abi::syscall::{
     DEVMGRD_IPC_OP_IOCTL_ROUTE, DEVMGRD_IPC_OP_LOOKUP, DEVMGRD_IPC_OP_OPEN, DEVMGRD_IPC_OP_READDIR,
     DEVMGRD_MAX_DIR_ENTRIES, DEVMGRD_NAME_CAPACITY, DEVMGRD_NODE_KIND_DEVICE,
     DEVMGRD_NODE_KIND_DIR, IPC_ABI_VERSION, IPC_MAX_INLINE_BYTES, IPC_SERVICE_DEVMGRD,
-    IPC_SERVICE_SESSIOND, IPC_SERVICE_UISERVER, SYS_RUSTOS_DEBUG_PRINT,
+    IPC_SERVICE_SESSIOND, IPC_SERVICE_UISERVER,
     SYS_RUSTOS_DEVICE_IOCTL_BROKER, SYS_RUSTOS_DEVICE_OPEN_BROKER, SYS_RUSTOS_IPC_CALL,
     SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT,
     SYS_RUSTOS_IPC_RECV_WITH_SENDER, SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_IPC_REPLY_WITH_HANDLES,
@@ -1164,11 +1164,7 @@ fn debug_line(message: &str) {
     let mut line = [0_u8; 1024];
     line[..len].copy_from_slice(&bytes[..len]);
     line[len] = b'\n';
-    let _ = syscall2(
-        SYS_RUSTOS_DEBUG_PRINT,
-        line.as_ptr() as u64,
-        (len + 1) as u64,
-    );
+    rustos_svc_runtime::ipc::debug_bytes(&line[..len + 1]);
 }
 
 fn read_unaligned<T: Copy>(bytes: &[u8]) -> T {

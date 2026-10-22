@@ -935,10 +935,17 @@ where
     }
     let overlapping_len = overlapping.len();
     let empty_len = empty_slots.len();
-    if overlapping_len == 0 {
+    // Adjacent regions are merge candidates, not authority for the requested
+    // interval. Repeating an unmap of an existing hole must not withdraw its
+    // neighbors or report a stale process/MM incarnation.
+    if !overlapping
+        .iter()
+        .any(|(_, region)| start < region.end && region.start < end)
+    {
         return Ok(false);
     }
     overlapping.sort_unstable_by_key(|(_, region)| region.start);
+    let removing = replacement_prot.is_none() && replacement_commit_state.is_none();
 
     let process = handle.object_identity().ok_or(PagerVmaError::Stale)?;
     let mut cursor = start;
@@ -964,7 +971,7 @@ where
             rewritten.push(region);
             continue;
         }
-        if region.start > cursor {
+        if !removing && region.start > cursor {
             return Err(PagerVmaError::Stale);
         }
         // The split/trim/remove rule is the shared ABI one. pagerd applies the
@@ -1017,8 +1024,8 @@ where
         rewritten_len <= overlapping_len + maximum_growth,
         "one range edit may add at most one interior split's fragments"
     );
-    if cursor < end || rewritten_len > overlapping_len + empty_len {
-        return Err(if cursor < end {
+    if (!removing && cursor < end) || rewritten_len > overlapping_len + empty_len {
+        return Err(if !removing && cursor < end {
             PagerVmaError::Stale
         } else {
             PagerVmaError::Pressure
@@ -1134,38 +1141,85 @@ pub fn protect_for_process(
     Ok(rewritten.then(|| (process.slot(), process.generation())))
 }
 
-/// Unmaps one exact range and reports the identity whose slot was released.
-///
-/// Returning the stamped `(process_handle, process_generation)` lets the caller
-/// name to the pager exactly what ring0 released, instead of re-deriving an
-/// identity that could disagree with the publication.
+/// Cleans up pager-owned leaves after a failed mapping publication.
 pub fn unmap_for_process(
     process_id: u64,
     start: u64,
     end: u64,
 ) -> Result<Option<(u64, u64)>, PagerVmaError> {
-    let retained =
-        super::process_table::retain_process_by_pid(process_id).ok_or(PagerVmaError::Stale)?;
-    let identity = retained.live_identity().ok_or(PagerVmaError::Stale)?;
-    let page_count = end
+    let pages = end
         .checked_sub(start)
         .and_then(|bytes| usize::try_from(bytes / PAGER_PAGE_BYTES).ok())
         .ok_or(PagerVmaError::Malformed)?;
+    unmap_for_process_inner(
+        process_id,
+        start,
+        end,
+        false,
+        |state| {
+            state
+                .address_space_mut()
+                .unmap_present_prepared_pager_fault_pages_at(x86_64::VirtAddr::new(start), pages)
+                .map(|_| ())
+                .map_err(|_| PagerVmaError::Stale)
+        },
+        |_| {},
+    )
+}
+
+/// Unmaps pager publications and caller-owned PTEs under one process-state
+/// lock. `mutate` must preflight the ENTIRE sparse/mixed range before removing
+/// any leaf, preserve borrowed backing through TLB ACK, and never yield/IPC.
+/// `release` drops mapping records only after the VMA writer/epoch has ended,
+/// still under the same process-state lock (no mmap may fill a hole between).
+/// The returned identity names pager publication work, not whether PTE work ran.
+pub fn unmap_for_process_with(
+    process_id: u64,
+    start: u64,
+    end: u64,
+    mutate: impl FnOnce(&mut super::UserProcessState) -> Result<(), PagerVmaError>,
+    release: impl FnOnce(&mut super::UserProcessState),
+) -> Result<Option<(u64, u64)>, PagerVmaError> {
+    unmap_for_process_inner(process_id, start, end, true, mutate, release)
+}
+
+fn unmap_for_process_inner(
+    process_id: u64,
+    start: u64,
+    end: u64,
+    mutate_without_publication: bool,
+    mutate: impl FnOnce(&mut super::UserProcessState) -> Result<(), PagerVmaError>,
+    release: impl FnOnce(&mut super::UserProcessState),
+) -> Result<Option<(u64, u64)>, PagerVmaError> {
+    let retained =
+        super::process_table::retain_process_by_pid(process_id).ok_or(PagerVmaError::Stale)?;
+    let identity = retained.live_identity().ok_or(PagerVmaError::Stale)?;
     let process = retained
         .handle()
         .object_identity()
         .ok_or(PagerVmaError::Stale)?;
     let unmapped = retained.with_state_mut(|_, state| {
-        rewrite_attenuated_range(retained.handle(), identity, start, end, None, || {
-            state
-                .address_space_mut()
-                .unmap_present_prepared_pager_fault_pages_at(
-                    x86_64::VirtAddr::new(start),
-                    page_count,
-                )
-                .map(|_| ())
-                .map_err(|_| PagerVmaError::Stale)
-        })
+        // The pre-lock identity cannot authorize a new image that exec may
+        // have committed while this caller waited for ProcessState. Never
+        // take the lower-ranked process table from this leaf on a miss.
+        if super::process_table::published_live_process_identity(retained.handle())
+            != Some(identity)
+        {
+            return Err(PagerVmaError::Unstable);
+        }
+        let mut mutate = Some(mutate);
+        let rewritten =
+            rewrite_attenuated_range(retained.handle(), identity, start, end, None, || {
+                mutate.take().expect("unmap mutation consumed once")(state)
+            })?;
+        // No intersecting pager VMA is still a valid sparse/legacy unmap.
+        if mutate_without_publication {
+            if let Some(mutate) = mutate {
+                mutate(state)?;
+            }
+        }
+        release(state);
+        Ok::<_, PagerVmaError>(rewritten)
     })?;
     Ok(unmapped.then(|| (process.slot(), process.generation())))
 }

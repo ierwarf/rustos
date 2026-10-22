@@ -993,13 +993,8 @@ pub(crate) fn handle_munmap(
             return;
         }
     };
-    if !has_overlap(&state, start, end) {
-        response.status = errno::ENOMEM;
-        return;
-    }
-    match unmap_populated_range(request.pid, &state, start, end) {
+    match unmap_populated_range(request.pid, &mut state, start, end) {
         Ok(()) => {
-            remove_vma_range(&mut state, start, end);
             save_mm_state(request.pid, state);
             response.status = 0;
             response.payload_len = 0;
@@ -1119,20 +1114,23 @@ fn broker_map(
     Ok(result.addr)
 }
 
-fn unmap_populated_range(pid: u64, state: &MmPolicyState, start: u64, end: u64) -> Result<(), i32> {
-    for (seg_start, seg_end) in nonreserved_segments(state, start, end) {
-        broker_simple(
-            pid,
-            MM_BROKER_OP_UNMAP,
-            seg_start,
-            seg_end - seg_start,
-            0,
-            0,
-            u64::MAX,
-            0,
-        )?;
-    }
-    Ok(())
+fn unmap_populated_range(pid: u64, state: &mut MmPolicyState, start: u64, end: u64) -> Result<(), i32> {
+    unmap_range_with(state, start, end, |start, end| {
+        // One complete sparse/mixed interval, not one mutation per VMA.
+        // Ring0 preflights every present leaf before removing any prefix.
+        broker_simple(pid, MM_BROKER_OP_UNMAP, start, end - start, 0, 0, u64::MAX, 0)
+    })
+}
+
+fn unmap_range_with(
+    state: &mut MmPolicyState,
+    start: u64,
+    end: u64,
+    revoke: impl FnOnce(u64, u64) -> Result<(), i32>,
+) -> Result<(), i32> {
+    // Even a policy-table hole is valid munmap and may contain legacy leaves.
+    // Commit policy removal only after the whole kernel transaction succeeds.
+    syscalld::vma_policy::unmap_range_with(state, start, end, revoke, remove_vma_range)
 }
 
 fn replace_fixed_range_after_prevalidation(
@@ -1143,7 +1141,6 @@ fn replace_fixed_range_after_prevalidation(
     _validated_plan: MmapPlan,
 ) -> Result<(), i32> {
     unmap_populated_range(pid, state, start, end)?;
-    remove_vma_range(state, start, end);
     Ok(())
 }
 
@@ -1243,13 +1240,6 @@ fn insert_vma(state: &mut MmPolicyState, vma: MmVma) {
     remove_vma_range(state, vma.start, vma.end);
     state.vmas.push(vma);
     state.vmas.sort_by_key(|vma| vma.start);
-}
-
-fn has_overlap(state: &MmPolicyState, start: u64, end: u64) -> bool {
-    state
-        .vmas
-        .iter()
-        .any(|vma| start < vma.end && end > vma.start)
 }
 
 fn range_is_covered(state: &MmPolicyState, start: u64, end: u64) -> bool {

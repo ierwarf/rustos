@@ -15,7 +15,7 @@
 //! - **Forbidden:** Consuming child status here, blocking, allocating, or
 //!   taking a lock: producers run under the process-table leaf's caller context.
 //! - **Evidence:** `core_lifecycle` fork+wait latency; `wait4` blocking witness.
-use core::sync::atomic::{AtomicU64, Ordering, fence};
+use core::sync::atomic::{fence, AtomicU64, Ordering};
 
 const CAPACITY: usize = 64;
 
@@ -80,30 +80,30 @@ pub fn wake_child_waiters(parent_pid: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn register_unregister_round_trip_frees_the_slot() {
+        let _guard = TEST_LOCK.lock().unwrap();
         assert!(register_child_waiter(7, 0xfeed_0001));
-        assert!(
-            WAITERS
-                .iter()
-                .any(|slot| slot.task.load(Ordering::Relaxed) == 0xfeed_0001)
-        );
+        assert!(WAITERS
+            .iter()
+            .any(|slot| slot.task.load(Ordering::Relaxed) == 0xfeed_0001));
         unregister_child_waiter(0xfeed_0001);
-        assert!(
-            WAITERS
-                .iter()
-                .all(|slot| slot.task.load(Ordering::Relaxed) != 0xfeed_0001)
-        );
+        assert!(WAITERS
+            .iter()
+            .all(|slot| slot.task.load(Ordering::Relaxed) != 0xfeed_0001));
     }
 
     #[test]
     fn zero_task_is_never_registered() {
+        let _guard = TEST_LOCK.lock().unwrap();
         assert!(!register_child_waiter(7, 0));
     }
 
     #[test]
     fn table_exhaustion_is_reported_not_overwritten() {
+        let _guard = TEST_LOCK.lock().unwrap();
         let base = 0xfeed_1000;
         let mut taken = 0;
         for i in 0..CAPACITY as u64 {

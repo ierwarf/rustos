@@ -58,17 +58,28 @@ fn actual_fallible_original_grant_refuses_before_effects_and_survives_final_batc
             }
         }
         let dropped = Cell::new(false);
-        assert!(super::commit(capture(roots), turn, |_| 1, || {
-            assert_eq!(nucleus_core::util::lockdep::held_spin_lock_depth(), 0);
-            assert!(super::super::super::current_terminal::OriginalCurrent::borrow(turn).is_none());
-            Some(Grant { members: roots, dropped: &dropped })
-        }));
+        assert!(super::commit(
+            capture(roots),
+            turn,
+            |_| 1,
+            || {
+                assert_eq!(nucleus_core::util::lockdep::held_spin_lock_depth(), 0);
+                assert!(
+                    super::super::super::current_terminal::OriginalCurrent::borrow(turn).is_none()
+                );
+                Some(Grant {
+                    members: roots,
+                    dropped: &dropped,
+                })
+            }
+        ));
         assert!(dropped.get());
     });
 }
 
 #[test]
-pub(in crate::multitask::scheduler) fn actual_activation_holds_original_frame_and_binding_through_callback_before_queue_and_ack() {
+pub(in crate::multitask::scheduler) fn actual_activation_holds_original_frame_and_binding_through_callback_before_queue_and_ack(
+) {
     roots(&[ID, ID + 1], 1, |roots, turn| {
         let owner = capture(roots);
         let consumed = Cell::new(false);
@@ -221,44 +232,63 @@ pub(in crate::multitask::scheduler) fn actual_activation_exact_capacity_commits_
     });
 }
 #[test]
-pub(in crate::multitask::scheduler) fn actual_single_activation_uses_spawn_fifo_and_rejects_foreign_duplicate_or_retired_members() {
+pub(in crate::multitask::scheduler) fn actual_single_activation_uses_spawn_fifo_and_rejects_foreign_duplicate_or_retired_members(
+) {
     roots(&[ID, ID + 1], 1, |roots, turn| {
         let (slot, id, _) = roots[0];
         assert!(Activation::capture(&[(slot, id + 100)]).is_none());
         // Exercise canonical input preflight independently of Cohort's later
         // unique-slot/busy checks, which must not mask its duplicate witness.
         assert!(!super::super::distinct_nonzero_ids([id, id].into_iter()));
-        assert!(super::super::distinct_nonzero_ids([id, roots[1].1].into_iter()));
+        assert!(super::super::distinct_nonzero_ids(
+            [id, roots[1].1].into_iter()
+        ));
         assert!(!super::super::distinct_nonzero_ids([0].into_iter()));
         assert!(Activation::capture(&[(slot, id), (slot, id)]).is_none());
         let owner = Activation::capture(&[(slot, id)]).unwrap();
         assert!(owner.commit_owned(turn, |_| 1, || {}));
-        assert_eq!(dispatch_policy::lock(0).spawn_pick_hints.front(), Some(handoff_queue::FirstTurnHandoff { slot, task_id: id }));
-        assert!(dispatch_policy::lock(0).atomic_activation_pick_hints.is_empty());
+        assert_eq!(
+            dispatch_policy::lock(0).spawn_pick_hints.front(),
+            Some(handoff_queue::FirstTurnHandoff { slot, task_id: id })
+        );
+        assert!(dispatch_policy::lock(0)
+            .atomic_activation_pick_hints
+            .is_empty());
         assert!(Activation::capture(&[(slot, id)]).is_none());
         let (retired, retired_id, _) = roots[1];
-        identity::update_live_lifecycle(retired, retired_id, identity::LifecycleGate::Retired, true);
+        identity::update_live_lifecycle(
+            retired,
+            retired_id,
+            identity::LifecycleGate::Retired,
+            true,
+        );
         assert!(Activation::capture(&[(retired, retired_id)]).is_none());
     });
 }
 #[test]
-pub(in crate::multitask::scheduler) fn actual_over_capacity_activation_refuses_before_callback_with_all_real_members_suspended() {
+pub(in crate::multitask::scheduler) fn actual_over_capacity_activation_refuses_before_callback_with_all_real_members_suspended(
+) {
     let ids: Vec<_> = (0..=CAP).map(|i| ID + i as u64).collect();
     roots(&ids, 1, |roots, _| {
         let members: Vec<_> = roots.iter().map(|&(slot, id, _)| (slot, id)).collect();
         assert!(Activation::capture(&members).is_none());
         let mut callbacks = 0;
-        assert!(!super::super::activate(&ids, || {
-            callbacks += 1;
-            Some(())
-        }), "the production ID-list entry must refuse before indexing its fixed member array");
+        assert!(
+            !super::super::activate(&ids, || {
+                callbacks += 1;
+                Some(())
+            }),
+            "the production ID-list entry must refuse before indexing its fixed member array"
+        );
         assert_eq!(callbacks, 0);
         for &(slot, _, _) in roots {
             assert!(identity::lifecycle(slot).suspended);
             assert_eq!(identity::execution::count(slot), 0);
         }
         assert!(dispatch_policy::lock(0).spawn_pick_hints.is_empty());
-        assert!(dispatch_policy::lock(0).atomic_activation_pick_hints.is_empty());
+        assert!(dispatch_policy::lock(0)
+            .atomic_activation_pick_hints
+            .is_empty());
     });
 }
 #[test]
@@ -312,6 +342,66 @@ fn actual_remote_activation_publishes_original_mailbox_before_complete_ack_and_b
         }
     });
 }
+#[test]
+fn remote_activation_notifies_after_all_claim_gates_release_even_with_existing_mailbox_edge() {
+    roots(&[ID, ID + 1, ID + 2], 3, |roots, turn| {
+        struct Grant<'a>(&'a Cell<bool>);
+        impl Drop for Grant<'_> {
+            fn drop(&mut self) {
+                self.0.set(true);
+            }
+        }
+        // Leave the first remote wake queued. The second activation publishes
+        // into a nonempty mailbox (notify:false), but still needs its own
+        // post-release request if the earlier edge was consumed too soon.
+        for members in [&roots[..1], &roots[1..]] {
+            let dropped = Cell::new(false);
+            let notices = Cell::new(0);
+            assert!(super::commit_with_notify(
+                capture(members),
+                turn,
+                |_| 2,
+                || Some(Grant(&dropped)),
+                |cpu| {
+                    assert_eq!(cpu, 1);
+                    assert!(
+                        dropped.get(),
+                        "external authority must be released before notification"
+                    );
+                    for &(slot, _, _) in members {
+                        assert!(!identity::cohort::busy(slot));
+                        assert_eq!(identity::execution::count(slot), 0);
+                        assert_eq!(stack_resources::frame_readers::test_count(slot), 0);
+                        assert!(!identity::lifecycle(slot).suspended);
+                        assert_eq!(runqueue::owner(slot).cpu, Some(cpu));
+                        assert_eq!(
+                            runqueue::owner(slot).state,
+                            runqueue::RunOwnerState::RemoteQueued
+                        );
+                    }
+                    let policy = dispatch_policy::lock(cpu);
+                    assert_eq!(policy.spawn_pick_hints.len(), 1);
+                    assert_eq!(
+                        policy.atomic_activation_pick_hints.len(),
+                        if members.len() == 1 { 0 } else { 2 }
+                    );
+                    notices.set(notices.get() + 1);
+                },
+            ));
+            assert_eq!(
+                notices.get(),
+                1,
+                "one coalesced post-release request per target"
+            );
+        }
+        runqueue::drain_remote_wakes(1);
+        for &(slot, _, _) in roots {
+            assert_eq!(runqueue::owner(slot).state, runqueue::RunOwnerState::Local);
+            assert!(frame_publication::local_frame_token(slot, 1).is_some());
+        }
+    });
+}
+
 #[test]
 fn actual_activation_preserves_strict_class_sleeper_floor_without_priority_donation_shortcut() {
     roots(&[ID, ID + 1, ID + 2], 1, |roots, turn| {

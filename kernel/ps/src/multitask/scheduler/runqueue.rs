@@ -20,13 +20,13 @@
 //! - **Evidence:** `per-cpu-runqueue-ownership`, `scheduler-dispatch`, and
 //!   `smp-reschedule-ipi-lifecycle`.
 
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering, fence};
+use core::sync::atomic::{fence, AtomicU64, AtomicUsize, Ordering};
 
-use nucleus_core::util::lockdep::{LockClass, MAX_TRACKED_CPUS};
-use nucleus_core::util::cache_padded::CachePadded;
 use crate::multitask::irq_leaf::IrqLeaf;
+use nucleus_core::util::cache_padded::CachePadded;
+use nucleus_core::util::lockdep::{LockClass, MAX_TRACKED_CPUS};
 
-use super::{MAX_TASK, frame_publication};
+use super::{frame_publication, MAX_TASK};
 use validation::{bitmap_location, validate_cpu};
 
 mod admission;
@@ -35,16 +35,16 @@ pub(super) mod address_space;
 pub(super) mod affinity_payload;
 pub(super) mod claim;
 mod return_publication;
-pub(super) use return_publication::{ReturnPublication, publish_return};
+pub(super) use claim::{
+    claim_dispatch, claim_dispatch_with_owner_generation, claim_validated_dispatch,
+};
+pub(super) use return_publication::{publish_return, ReturnPublication};
 #[cfg(test)]
 pub(super) use return_publication::{test_blocked_return, test_running_claim};
-pub(super) use claim::{claim_dispatch, claim_dispatch_with_owner_generation, claim_validated_dispatch};
 mod execution_time;
 pub(super) use execution_time::set as set_exec_start_local_ns;
 mod idle;
-pub(super) use idle::{
-    is_idle as is_idle_slot, set as set_idle_slot,
-};
+pub(super) use idle::{is_idle as is_idle_slot, set as set_idle_slot};
 mod ipc_handoff;
 pub(super) mod simd_tls;
 mod validation;
@@ -54,11 +54,10 @@ pub(super) mod weight;
 #[cfg(test)]
 use ipc_handoff::publish_migrating_record;
 pub(super) use ipc_handoff::{
-    RemoteWakeOutcome, claim_blocked_handoff, publish_handoff_mailbox,
-    drain_remote_wakes, materialize_direct_handoff,
-    materialize_direct_handoff_with_generation, preserve_budget_refused_handoff,
-    preserve_budget_refused_handoff_generation, publish_direct_handoff, publish_local_wake,
-    publish_remote_wake, rehome_queued, rehome_queued_frame, rehome_queued_owned, rollback_direct_handoff,
+    claim_blocked_handoff, drain_remote_wakes, materialize_direct_handoff,
+    materialize_direct_handoff_with_generation, publish_direct_handoff, publish_handoff_mailbox,
+    publish_local_wake, publish_remote_wake, rehome_queued, rehome_queued_frame,
+    rehome_queued_owned, rollback_direct_handoff, RemoteWakeOutcome,
 };
 
 mod lane;
@@ -533,10 +532,8 @@ static OWNER_WORDS: [RunOwnerWord; MAX_TASK] = [const { RunOwnerWord::new() }; M
 
 static RUN_QUEUES: [PerCpuRunQueue; MAX_TRACKED_CPUS] =
     [const { PerCpuRunQueue::new() }; MAX_TRACKED_CPUS];
-static REMOTE_WAKE_MAILBOXES: [IrqLeaf<
-    RemoteWakeMailbox,
-    { LockClass::SchedulerMailbox as u8 },
->; MAX_TRACKED_CPUS] = [const { IrqLeaf::new(RemoteWakeMailbox::new()) }; MAX_TRACKED_CPUS];
+static REMOTE_WAKE_MAILBOXES: [IrqLeaf<RemoteWakeMailbox, { LockClass::SchedulerMailbox as u8 }>;
+    MAX_TRACKED_CPUS] = [const { IrqLeaf::new(RemoteWakeMailbox::new()) }; MAX_TRACKED_CPUS];
 static MAILBOX_PENDING: [CachePadded<AtomicU64>; MAX_TRACKED_CPUS] =
     [const { CachePadded::new(AtomicU64::new(0)) }; MAX_TRACKED_CPUS];
 #[cfg(test)]

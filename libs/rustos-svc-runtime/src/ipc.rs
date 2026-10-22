@@ -17,6 +17,13 @@ use rustos_user_abi::syscall::{
 use crate::syscall::{syscall0, syscall1, syscall2, syscall3, syscall5, syscall6};
 
 const EARLY_REPLY_FAILURE_SAMPLES: u64 = 4;
+static DEBUG_OUTPUT_ABANDONED_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Diagnostic suffixes abandoned after bounded transport retries. This is not
+/// kernel admission loss: rejected bytes remain owned by the userspace writer.
+pub fn debug_output_abandoned_bytes() -> u64 {
+    DEBUG_OUTPUT_ABANDONED_BYTES.load(Ordering::Relaxed)
+}
 
 /// Lifetime-bounded reporting for replies whose caller has already cancelled
 /// or retired its one-shot capability.
@@ -331,13 +338,49 @@ pub fn debug_line_static(message: &'static str) {
 pub fn debug_line(message: &str) {
     let mut line = Vec::from(message.as_bytes());
     line.push(b'\n');
-    unsafe {
-        syscall2(
-            SYS_RUSTOS_DEBUG_PRINT,
-            line.as_ptr() as u64,
-            line.len() as u64,
-        );
+    debug_bytes(&line);
+}
+
+/// Bounded suffix-only diagnostic output; abandoned bytes are counted.
+/// Unlike `debug_line`, preserves caller framing and does not allocate.
+pub fn debug_bytes(bytes: &[u8]) {
+    let _ = write_debug_bytes_with(
+        bytes,
+        |remaining| unsafe {
+            syscall2(
+                SYS_RUSTOS_DEBUG_PRINT,
+                remaining.as_ptr() as u64,
+                remaining.len() as u64,
+            )
+        },
+        || unsafe {
+            syscall0(crate::syscall::SYS_SCHED_YIELD);
+        },
+    );
+}
+
+fn write_debug_bytes_with(
+    bytes: &[u8],
+    mut write: impl FnMut(&[u8]) -> i64,
+    mut yield_now: impl FnMut(),
+) -> usize {
+    let mut written = 0;
+    for _ in 0..64 {
+        if written == bytes.len() {
+            break;
+        }
+        let result = write(&bytes[written..]);
+        if result > 0 && result as usize <= bytes.len() - written {
+            written += result as usize;
+        } else if result != -11 {
+            break;
+        }
+        if written != bytes.len() {
+            yield_now();
+        }
     }
+    DEBUG_OUTPUT_ABANDONED_BYTES.fetch_add((bytes.len() - written) as u64, Ordering::Relaxed);
+    written
 }
 
 /// Emit a fixed-name, kernel-timestamped product acceptance milestone.
@@ -364,6 +407,33 @@ pub fn product_executable_snapshot_evidence(evidence: &ProductExecutableSnapshot
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn debug_output_retries_only_unaccepted_suffix_and_bounds_backpressure() {
+        let mut responses = [2, -11, 3].into_iter();
+        let mut offsets = alloc::vec::Vec::new();
+        let mut yields = 0;
+        let written = super::write_debug_bytes_with(
+            b"hello",
+            |remaining| {
+                offsets.push(remaining.len());
+                responses.next().unwrap()
+            },
+            || yields += 1,
+        );
+        assert_eq!(written, 5);
+        assert_eq!(offsets, [5, 3, 3]);
+        assert_eq!(yields, 2);
+        assert_eq!(super::write_debug_bytes_with(b"x", |_| -11, || {}), 0);
+        assert_eq!(
+            super::write_debug_bytes_with(
+                b"x",
+                |_| 2,
+                || panic!("invalid result is not retryable")
+            ),
+            0
+        );
+    }
+
     use super::{reply_failure_diagnostic_due, reply_recv_committed_errno, reply_recv_result_kind};
     use rustos_user_abi::syscall::IpcReplyRecvResultKind;
 

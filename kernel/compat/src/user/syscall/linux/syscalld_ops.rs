@@ -430,18 +430,19 @@ pub(super) fn syscall_linux_wait4(pid: i64, status_ptr: u64, options: u64, rusag
             }
             multitask::WaitChildResult::Pending if nohang => return 0,
             multitask::WaitChildResult::Pending => {
-                match park_for_child_event(parent_pid, pid, include_stopped, include_continued) {
-                    ChildParking::Resumed => {}
-                    ChildParking::Settled(settled) => carried = Some(settled),
-                    ChildParking::Unavailable => multitask::yield_now(),
+                let parking =
+                    park_for_child_event(parent_pid, pid, include_stopped, include_continued);
+                if matches!(parking, ChildParking::Unavailable) {
+                    multitask::yield_now();
                 }
-                if let Some(state) = multitask::current_linux_thread_state()
-                    && state.pending_signals & !state.signal_mask != 0
-                {
-                    return linux_errno(LINUX_EINTR);
+                match child_wait_after_parking(parking, || {
+                    multitask::current_linux_thread_state()
+                        .is_some_and(|state| state.pending_signals & !state.signal_mask != 0)
+                }) {
+                    Ok(settled) => carried = settled,
+                    Err(errno) => return linux_errno(errno),
                 }
             }
-            multitask::WaitChildResult::NoMatchingChild if nohang => return 0,
             multitask::WaitChildResult::NoMatchingChild => return linux_errno(LINUX_ECHILD),
         }
     }
@@ -456,6 +457,19 @@ enum ChildParking {
     Settled(multitask::WaitChildResult),
     /// No wait slot or block authority; the caller polls with a yield instead.
     Unavailable,
+}
+
+fn child_wait_after_parking(
+    parking: ChildParking,
+    signal_pending: impl FnOnce() -> bool,
+) -> Result<Option<multitask::WaitChildResult>, i64> {
+    match parking {
+        // The recheck already consumed this status. Deliver it before
+        // considering signals, including SIGCHLD; it cannot be put back.
+        ChildParking::Settled(settled) => Ok(Some(settled)),
+        _ if signal_pending() => Err(LINUX_EINTR),
+        _ => Ok(None),
+    }
 }
 
 /// Blocks the calling thread until `ps` reports a child state change for its
@@ -659,6 +673,43 @@ mod tests {
         assert_eq!(request.arg1, 4);
         assert_eq!(request.arg2, CPU_TOPOLOGY_OBSERVATION_ABI_VERSION);
         assert_eq!(request.arg3, 42);
+    }
+
+    #[test]
+    fn settled_child_status_is_delivered_before_eintr() {
+        for result in [
+            multitask::WaitChildResult::Exited {
+                pid: 42,
+                status: 0x2a00,
+            },
+            multitask::WaitChildResult::StateChanged {
+                pid: 42,
+                status: 0x137f,
+            },
+            multitask::WaitChildResult::NoMatchingChild,
+        ] {
+            assert!(matches!(
+                child_wait_after_parking(ChildParking::Settled(result), || panic!(
+                    "status owns completion"
+                )),
+                Ok(Some(_))
+            ));
+        }
+        for parking in [ChildParking::Resumed, ChildParking::Unavailable] {
+            assert!(matches!(
+                child_wait_after_parking(parking, || true),
+                Err(LINUX_EINTR)
+            ));
+        }
+        assert!(matches!(
+            child_wait_after_parking(ChildParking::Resumed, || false),
+            Ok(None)
+        ));
+        let source = include_str!("syscalld_ops.rs")
+            .split_once("#[cfg(test)]")
+            .unwrap()
+            .0;
+        assert!(!source.contains("WaitChildResult::NoMatchingChild if nohang"));
     }
 
     #[test]
