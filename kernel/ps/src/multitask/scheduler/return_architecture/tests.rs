@@ -60,6 +60,11 @@ fn actual_local_peer_plan_uses_original_frame_mm_and_placement_banks() {
         );
         let plan = ReturnArchitecture::capture(turn, result(slot, KERNEL)).unwrap();
         assert!(plan.changed);
+        assert!(plan.incoming.register_ipc); // original Linux context, not a PID hint
+        let mut effects = std::vec::Vec::new();
+        lane_effects(plan.receipt.previous, plan.incoming, slot, |effect| effects.push(effect));
+        assert!(effects.iter().any(|effect| matches!(effect,
+            ArchitectureEffect::SyscallStack(top, true) if *top == plan.incoming.stack_top)));
         // The actual fixture actor is a kernel continuation in the SAME
         // process, not a forged cross-root execution grant.
         assert_eq!(plan.incoming.root, plan.receipt.previous.root);

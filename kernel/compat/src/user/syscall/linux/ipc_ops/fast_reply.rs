@@ -9,7 +9,7 @@ pub(super) struct DeferredFastReply {
 }
 
 impl DeferredFastReply {
-    const fn new(reply: u64, completion: ReplyCompletion) -> Self {
+    pub(super) const fn new(reply: u64, completion: ReplyCompletion) -> Self {
         Self {
             pending: Some((reply, completion)),
         }
@@ -59,16 +59,20 @@ pub(in crate::user::syscall::linux) fn recv_with_sender_blocking_prepared_after_
     reply: u64,
     completion: ReplyCompletion,
 ) -> Result<(usize, bool), (i64, bool)> {
-    super::recv_with_sender_blocking_prepared_inner(
+    super::recv_with_sender_blocking_prepared_inner::<
+        { kernel_ipc_runtime::api::IPC_FAST_INLINE_BYTES },
+    >(
         endpoint,
         task_id,
-        retained_mm,
-        request_ptr,
         request_capacity,
-        reply_cap_ptr,
-        sender_pid_ptr,
-        sender_tid_ptr,
         None,
         Some(DeferredFastReply::new(reply, completion)),
+        super::ReceiveDestination::User {
+            retained_mm,
+            request_ptr,
+            reply_cap_ptr,
+            sender_pid_ptr,
+            sender_tid_ptr,
+        },
     )
 }

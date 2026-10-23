@@ -59,7 +59,7 @@ pub use self::current::{
     current_pager_charge_snapshot, current_pager_fault_install_permit, current_pager_vma_snapshot,
     current_scheduling_context_runtime_snapshot, current_task_id,
     current_thread_may_have_pending_signals, current_user_abi, current_user_address_space,
-    current_user_id, current_user_log_ids, current_user_process_id, current_user_process_identity,
+    current_user_id, current_user_ipc_identity, current_user_log_ids, current_user_process_id, current_user_process_identity,
     current_user_process_thread_count, current_user_snapshot, current_user_stack_state,
     current_user_thread_id, current_user_wait_binding, demote_current_user_task_to_user_class,
     endpoint_receiver_still_waiting, exec_current_user_process, exec_user_process_by_pid,
@@ -109,6 +109,7 @@ pub use self::retirement::UserFaultDisposition;
 pub use self::scheduler::rsp_handoff::hardware_rsp_arrivals;
 pub use self::scheduler::smp::drain_fast_ipc_eligibility_rejections;
 pub use self::scheduler::{
+    begin_ipc_register_simd, IpcRegisterSimdGuard,
     drain_scheduler_runtime_profile, AffinityCommit, AffinityError, FastIpcCallHandoffOutcome,
     ProcessAffinitySnapshot,
 };

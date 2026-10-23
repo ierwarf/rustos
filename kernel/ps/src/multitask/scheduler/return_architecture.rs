@@ -19,6 +19,7 @@ pub(in crate::multitask) struct ArchitectureState {
     pub(super) fs: u64,
     pub(super) gs: u64,
     pub(super) process: bool,
+    pub(super) register_ipc: bool,
 }
 impl ArchitectureState {
     pub(super) fn original(turn: &CpuDispatchTurn<'static>) -> Option<Self> {
@@ -123,7 +124,7 @@ impl<'a> ReturnArchitecture<'a> {
             assert_ne!(next.stack_top, 0, "claimed return has no kernel stack");
             assert_eq!(next.stack_top & 0xf, 0, "claimed return stack is unaligned");
             effect(ArchitectureEffect::PrivilegeStack(next.stack_top));
-            effect(ArchitectureEffect::SyscallStack(next.stack_top));
+            effect(ArchitectureEffect::SyscallStack(next.stack_top, next.register_ipc));
             if fast_ipc && previous.root == next.root && !self.receipt.return_to_user {
                 if previous.fs != next.fs {
                     effect(ArchitectureEffect::FsBase(next.fs));
@@ -159,7 +160,7 @@ pub(in crate::multitask::scheduler) fn lane_effects(
     assert_ne!(next.stack_top, 0, "lane return has no kernel stack");
     assert_eq!(next.stack_top & 0xf, 0, "lane return stack is unaligned");
     effect(ArchitectureEffect::PrivilegeStack(next.stack_top));
-    effect(ArchitectureEffect::SyscallStack(next.stack_top));
+    effect(ArchitectureEffect::SyscallStack(next.stack_top, next.register_ipc));
     if previous.root == next.root {
         if previous.fs != next.fs {
             effect(ArchitectureEffect::FsBase(next.fs));
@@ -205,7 +206,7 @@ std::thread_local! {
 pub(in crate::multitask) enum ArchitectureEffect {
     AddressSpace(u64),
     PrivilegeStack(u64),
-    SyscallStack(u64),
+    SyscallStack(u64, bool),
     FsBase(u64),
     KernelGsBase(u64),
     Segments(ArchitectureState, bool),
@@ -215,7 +216,7 @@ fn hardware_effect(effect: ArchitectureEffect) {
     match effect {
         ArchitectureEffect::AddressSpace(root) => crate::memory::paging::load_address_space_phys(PhysAddr::new(root)),
         ArchitectureEffect::PrivilegeStack(top) => crate::arch::gdt::set_privilege_stack(top),
-        ArchitectureEffect::SyscallStack(top) => crate::user::syscall::set_kernel_stack_top(top),
+        ArchitectureEffect::SyscallStack(top, register_ipc) => crate::user::syscall::set_kernel_stack_top(top, register_ipc),
         ArchitectureEffect::FsBase(base) => FsBase::write(VirtAddr::new(base)),
         ArchitectureEffect::KernelGsBase(base) => KernelGsBase::write(VirtAddr::new(base)),
         ArchitectureEffect::Segments(state, user) => install_segments(state, user),
@@ -260,7 +261,7 @@ impl<'a> InitialArchitecture<'a> {
         crate::memory::paging::load_address_space_phys(PhysAddr::new(self.state.root));
         phase(SchedulerPhase::ArchAddressSpace, &mut marker);
         crate::arch::gdt::set_privilege_stack(self.state.stack_top);
-        crate::user::syscall::set_kernel_stack_top(self.state.stack_top);
+        crate::user::syscall::set_kernel_stack_top(self.state.stack_top, self.state.register_ipc);
         install_segments(self.state, false);
         phase(SchedulerPhase::ArchSegments, &mut marker);
     }
@@ -300,7 +301,7 @@ impl<'a> CurrentArchitecture<'a> {
         crate::memory::paging::load_address_space_phys(PhysAddr::new(self.state.root));
         phase(SchedulerPhase::ArchAddressSpace, &mut marker);
         crate::arch::gdt::set_privilege_stack(self.state.stack_top);
-        crate::user::syscall::set_kernel_stack_top(self.state.stack_top);
+        crate::user::syscall::set_kernel_stack_top(self.state.stack_top, self.state.register_ipc);
         install_segments(self.state, true);
         phase(SchedulerPhase::ArchSegments, &mut marker);
     }

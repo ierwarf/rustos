@@ -53,6 +53,85 @@
 - FD-table transfer goes through `kernel_ps::api::TransferredHandleEntry` + `HandleTable::{duplicate_for_transfer, install_transferred}`. Source class + rights must permit descriptor transfer; directory FDs are file capabilities and transferable for VFS migration.
 - Userspace handle-aware IPC: `SYS_RUSTOS_IPC_{CALL,RECV,REPLY}_WITH_HANDLES` with `Ipc*WithHandlesArgs`. Send handles = Linux fd arrays; received handles install into receiver fd table and return as `i32` fd arrays + `u16` count. `recv_fd_count_ptr` mandatory even when no handles returned. Counts bounded by `IPC_MAX_TRANSFER_HANDLES`.
 
+## Register short-message ABI
+
+Opt-in `SYS_RUSTOS_IPC_REGISTER_{CALL,RECV,REPLY_RECV,REPLY}` (`0x5255_0052..55`)
+passes at most 16 bytes in GPRs without user pointers, argument blocks, or
+handle transfer. The exact input/output register map, shape validator and
+compiler-clobber-aware wrapper live in
+`libs/rustos-user-abi/src/syscall/ipc_registers.rs` (re-exported through `syscall`).
+CALL requests are 1..=16 bytes; replies may be empty. RECV has a fixed 16-byte
+capacity. Oversized/handle-bearing traffic keeps the existing buffer/grant ABI.
+
+This is the same transport, not a new authority or rendezvous cell. Process
+endpoint authorization, exact reply generation/rights, deadlines/cancellation,
+funding custody, fairness and arm/register/recheck/commit remain unchanged.
+A fast reservation decline rolls back before the existing queued fallback;
+remote/unparked peers still work. REPLY_RECV authenticates the next endpoint
+before consuming the old capability, and uses the existing post-commit errno
+tag. Receive metadata is kernel-authenticated; error outputs and unused payload
+bytes are zero. Both buffer/register interoperability directions are supported.
+The buffer ABI retains its fault-recoverable user-access validation unchanged.
+Register handlers obtain `(task, exact live process identity)` from
+`kernel_ps::api::current_user_ipc_identity`: IRQ-stable installed Current binding
+plus the generation-bound live process publication, with the existing lifecycle
+fallback for a missing publication. They acquire no retained MM/process
+allocation loan and do not bind or walk user pages. This snapshot permits IPC
+identity/owner checks only, never user-memory access. Exec/exit/stale-slot
+refusals remain mandatory; diagnostic PID/TID publications are not authority.
+
+The transport still owns its existing fixed frame, but short request/response
+return images are specialized to 16 bytes, rather than copying 256-byte arrays
+through every Rust layer. Exact object-slot transactions, caller/receiver checks,
+receive capacity refusal before consume, terminal response overflow retirement,
+and queued/large-message fallback are shared with the legacy 256-byte API.
+This does not remove the reservation/funding/custody layer (P3), introduce a
+rendezvous cell, or switch directly to a peer user context (P2).
+
+Only these four opt-in syscalls declare all enabled FP/vector **data**
+(x87/MMX/XMM/YMM) caller-clobbered; x87 status/stack state is reset. The entering
+x87 control word and MXCSR remain preserved. Entry retains those controls and
+an immutable mode marker beyond the normalized scheduler frame, omitting the
+ordinary XMM stack image only for these four Linux operations. A GS-private ABI
+selector is installed with the exact retained architecture's kernel stack on
+initial/current/generic/lane returns. Rust checks it against the entering ABI
+and operation before dispatch; the unused legacy GS task pointer is not a
+selector. Other ABIs/operations still save their entering XMM before Rust.
+The exact-task
+SIMD image owns the active marker across blocking/migration; image replacement
+and terminal release clear it. Only admitted IPC lane save/restore may omit the
+full image while that marker is active. The interrupt prefix still preserves
+all kernel-continuation XMM. Ordinary/asynchronous scheduler transitions still
+save/restore full state, including preemption inside a wide-SIMD bracket; no
+wide bracket may span an admitted IPC lane yield.
+
+Both SYSRET and deferred saved-user IRET finalize before exposing a user image:
+mask IRQs, clear enabled vector data and all eight physical x87/MMX registers,
+restore entering controls, retire the exact-task marker. Deferred IRET also
+zeros its explicit XMM image before the generic scheduler capture. FNINIT alone
+does not clear physical data. The linked-image audit permits only these named
+custody instructions, not general x87/FP arithmetic. Ordinary syscall data
+preservation is unchanged. P2 direct user-context switching is not implemented.
+`syscall-simd-lifecycle` distinguishes lane elision, full asynchronous custody,
+marker retirement/rebinding and both finalized return routes.
+
+References: [AMD64 psABI](https://gitlab.com/x86-psABIs/x86-64-ABI/-/blob/master/low-level-sys-info.tex),
+[Rust clobber_abi](https://doc.rust-lang.org/reference/inline-assembly.html#abi-clobbers),
+and [Intel FNINIT semantics](https://www.felixcloutier.com/x86/finit:fninit).
+
+The isolated `ipc_rt_intra_process_register_reply_recv` probe keeps the buffer
+control's 16-byte echo, ordered TSC stamps, 2,000 warmups, all 20,000 samples,
+STOP/join checks and CPUID anchor. Its untimed preflight checks 1..=16-byte
+padding, malformed input, queued fallback, rejected fused endpoint without reply
+consumption, duplicate reply refusal and mixed-ABI peers. Untimed assembly
+witnesses seed x87/vector data, capture immediately after SYSCALL and check
+sanitization plus distinct preserved controls on caller/server, including
+blocking/error paths; an ordinary syscall checks the preservation control.
+It is a same-address-
+space measurement, not evidence of a cross-process/CR3 cost reduction. Existing
+IPC models cover the unchanged transport/custody transitions; this wrapper adds
+no cell/epoch state to refine.
+
 ## IPC Wait Discipline
 
 - A user-created endpoint and every reply capability queued through it are

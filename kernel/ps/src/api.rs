@@ -15,6 +15,7 @@
 //!   `process-address-space-lifecycle`, `syscall-simd-lifecycle`, and
 //!   `user-memory-access`.
 pub use crate::multitask::{
+    begin_ipc_register_simd, IpcRegisterSimdGuard,
     activate_suspended_user_task, activate_suspended_user_tasks,
     activate_suspended_user_tasks_with_commit, arm_block_current_task,
     arm_block_current_task_on_endpoint, arm_block_current_task_on_pager_fault,
@@ -28,7 +29,7 @@ pub use crate::multitask::{
     complete_ipc_reply_wake_handoff_with_custody, complete_pager_fault_wake_handoff,
     complete_retired_task_cleanup, consume_pager_fault_reply, current_linux_thread_state,
     current_pager_charge_snapshot, current_pager_fault_install_permit, current_pager_vma_snapshot,
-    current_thread_may_have_pending_signals, current_user_address_space,
+    current_thread_may_have_pending_signals, current_user_address_space, current_user_ipc_identity,
     current_user_process_identity, current_user_process_thread_count, current_user_stack_state,
     current_user_thread_id, current_user_wait_binding, demote_current_user_task_to_user_class,
     drain_scheduler_runtime_profile, endpoint_receiver_still_waiting, exec_current_user_process,
@@ -298,6 +299,10 @@ pub mod snapshot {
     pub fn current_scheduling_context_runtime_snapshot()
     -> Option<crate::multitask::SchedulingContextRuntimeSnapshot> {
         crate::multitask::current_scheduling_context_runtime_snapshot()
+    }
+
+    pub fn current_user_ipc_identity() -> Option<(u64, crate::multitask::ProcessIdentity)> {
+        crate::multitask::current_user_ipc_identity()
     }
 
     pub fn current_user_log_ids() -> Option<(u64, u64)> {

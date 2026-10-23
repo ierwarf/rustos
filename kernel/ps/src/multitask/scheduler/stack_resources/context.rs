@@ -83,6 +83,7 @@ pub(super) fn architecture_locked(
             fs: super::super::runqueue::simd_tls::tls_fs_base(slot),
             gs: c.windows_thread_state.map(|s| s.teb_address).unwrap_or(0),
             process: c.process_handle.is_some(),
+            register_ipc: c.user_abi == Some(crate::user::abi::UserAbi::Linux),
         })
 }
 

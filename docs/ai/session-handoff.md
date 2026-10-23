@@ -6,7 +6,48 @@ owners, and fresh validation. Root `AGENTS.md` is the only stable prompt
 prefix. This page does not authorize reusing stale evidence, speculative
 changes, or old uncommitted-work claims.
 
-## Current continuation — Ring3 service maturity (in progress)
+## Current continuation — IPC P0/P1 (2026-10-23)
+
+Started clean at `b92fc394`; no commit requested or made. P1 implementation now
+includes all four 16-byte register operations, pointer-free exact live identity,
+compact internal images, omitted register-entry XMM prefix and task-bound lane
+SIMD elision. GS ABI selection is installed with the exact retained kernel stack,
+not the unused GS task pointer. Both SYSRET and published IRET sanitize physical
+FP/vector data and preserve entering controls. IRQ-prefix kernel XMM and generic
+asynchronous full SIMD custody remain. Active service/buffer/fallback paths are
+retained; no cap/revocation/policy, cell/epoch or P2 changes.
+
+**8-vCPU <=8k target not met.** Final post-padding register p50 9,440/9,240 vs
+buffer 9,960/11,400. The complete cohort has 3.26% CPUID drift; adjacent pairs
+1.06%/3.26%, so no aggregate gain claim. Before cleanup: 8-vCPU 9,280/9,640 vs
+11,440/11,160 (also >3% anchor drift); 1-vCPU 7,880/7,920 vs 9,480/9,440
+(2.30% drift, 16.49% repeated-p50 reduction). These are same-address-space,
+single-pair measurements, not cross-process/eight-pair throughput. Raw tails
+remain; no worst-case improvement. A preceding extra control failed boot
+readiness; it is retained as incomplete, not replaced or dropped. Historical
+9.7–10k lacks a matched artifact; initial clean 11.7k/13.68k controls used
+different host anchors, not causal speedup evidence.
+
+Full native PS 977/compat 188/ipcbench 20/xtask 195, selected now 66 commands
+(767 witnesses), and full PR passed with 1503/1503 implementation mutants. SIMD
+TLC passed 4,494,474 distinct states. Three stale old mutation witnesses were
+repaired and killed 3/3. Ring3 asm witnesses check physical data, distinct controls,
+blocked/error/fused paths and ordinary syscall preservation. Prior non-SIMD reviews
+passed; SIMD plan findings were fixed, but provider quota prevented independent
+post-implementation review. Final boundary-padding cleanup passed fresh now,
+native, full PR and four 8-vCPU runtime launches. Final mutation cache reused
+1501 kills and executed 2. Rebuilt `.text` is not byte-identical, so new captures
+have separate provenance; do not relabel the preceding source/ELFs.
+
+Report: `docs/ai/performance/ipc-register-p1.md`; ABI: `docs/ai/abi/ipc.md`.
+Durable raw/provenance: `build/bench-ipc-p01/{final-summary.json,
+final-repeat-summary.json,postpad-summary.json,postpad-text-comparison.json,
+final/,postpad/}` and referenced `build/bench-core/` captures.
+Cache-line isolation removes concrete false sharing but its latency benefit was
+not isolated. Extra readiness failure, cross-process IPC, Windows ring3 and
+exhaustive async SIMD stress remain unverified. Further 8-vCPU tuning is pending.
+
+## Previous continuation — Ring3 service maturity (in progress)
 
 Baseline `d252dc5e`, initially clean. User redirected work away from benchmark
 chasing toward Ring3 correctness and failed-path completion. Critical-path

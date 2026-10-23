@@ -85,6 +85,32 @@ fn reaped_slot_reuse_changes_generation_and_rejects_every_stale_bearer() {
     assert_eq!(reap_exited_processes(), 1);
 }
 
+#[test]
+fn ipc_current_identity_needs_no_mm_loan_and_rejects_exec_exit_and_recycled_slot() {
+    let _isolation = isolate_process_table();
+    let handle = create_process(80_104, new_state()).expect("process");
+    let resolve = |handle| crate::multitask::current::ipc_identity_for_binding(711, handle);
+    let (initial, acquisitions) = process_table_acquisitions_during(|| resolve(handle));
+    let expected = initial.expect("live Current binding");
+    assert_eq!(expected.0, 711);
+    assert_eq!(expected.1.process_id(), 80_104);
+    assert_eq!(expected.1.process_generation(), handle.generation());
+    assert_eq!(acquisitions, 0, "live identity must not take process-table/MM custody");
+    let reservation = begin_exec(handle).expect("exec");
+    assert_eq!(resolve(handle), None);
+    assert!(cancel_exec(reservation));
+    assert_eq!(resolve(handle), Some(expected));
+    assert_eq!(mark_process_exiting(80_104), Some(()));
+    assert_eq!(resolve(handle), None);
+    detach_task(handle).expect("retire Current owner");
+    assert_eq!(reap_exited_processes(), 1, "identity snapshot must retain no allocation loan");
+    let replacement = create_process(80_105, new_state()).expect("replacement");
+    assert_eq!(replacement.index(), handle.index());
+    assert_ne!(replacement.generation(), handle.generation());
+    assert_eq!(resolve(handle), None);
+    assert_eq!(resolve(replacement).unwrap().1.process_id(), 80_105);
+}
+
 /// Exact identity validation is an ordinary user-copy and IPC operation. Once
 /// the running thread has pinned its own process, it must not reacquire the one
 /// global process table merely to prove that the same MM generation is live.

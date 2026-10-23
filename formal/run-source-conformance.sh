@@ -478,19 +478,21 @@ PY
 # read to every synchronous call and can classify a replacement publication
 # rather than the publication that granted authority.
 ipc_authorize_body="$(
-    sed -n '/^fn authorize_current_process_ipc_call(/,/^fn /p' \
+    sed -n '/^fn authorize_ipc_call_for_process(/,/^fn /p' \
         kernel/compat/src/user/syscall/linux/ipc_ops.rs
 )"
 ipc_fast_call_body="$(
-    sed -n '/^fn try_fast_ipc_call_bytes(/,/^fn /p' \
+    sed -n '/^fn try_fast_ipc_call_bytes[<(]/,/^fn /p' \
         kernel/compat/src/user/syscall/linux/ipc_ops.rs
 )"
 ipc_deadline_body="$(
     sed -n '/^fn service_reply_deadline_tick_for_authorized_service(/,/^fn /p' \
         kernel/compat/src/user/syscall/linux/ipc_ops.rs
 )"
-if ! grep -Fq 'Ok((retained_mm, Some(index as u64)))' <<<"$ipc_authorize_body" \
-    || ! grep -Fq '.map(|_| (retained_mm, None))' <<<"$ipc_authorize_body" \
+if ! grep -Fq 'Ok(Some(index as u64))' <<<"$ipc_authorize_body" \
+    || ! grep -Fq '.map(|_| None)' <<<"$ipc_authorize_body" \
+    || ! grep -Fq 'authorize_ipc_call_for_process(endpoint, retained_mm.process_id())?' kernel/compat/src/user/syscall/linux/ipc_ops.rs \
+    || ! grep -Fq 'authorize_ipc_call_for_process(raw, identity.process_id())?' kernel/compat/src/user/syscall/linux/ipc_ops/registers.rs \
     || ! grep -Fq 'service_reply_deadline_tick_for_authorized_service(' <<<"$ipc_fast_call_body" \
     || ! grep -Fq 'authorized_service_id,' <<<"$ipc_fast_call_body" \
     || ! grep -Fq 'service_reply_deadline_tick_for_service(service_id, request, timeout_ms)' <<<"$ipc_deadline_body" \
@@ -525,7 +527,7 @@ fi
 # task-retirement whole-slab scan here is both unnecessary and a tail-latency
 # regression.
 bounded_recv_body="$(
-    sed -n '/^fn recv_with_sender_blocking_prepared_inner(/,/^}/p' \
+    sed -n '/^fn recv_with_sender_blocking_prepared_inner[<(]/,/^}/p' \
         kernel/compat/src/user/syscall/linux/ipc_ops.rs
 )"
 if ! grep -Fq 'arm_sleep_waiter_until_tick' <<<"$bounded_recv_body" \
@@ -1498,6 +1500,10 @@ remote-file-mapping/RemoteFileMapping|rustos-user-abi|syscall::syscall_tests::st
 remote-file-mapping/RemoteFileMapping|vfsd|tests::early_system_reads_chunk_larger_vfs_buffers_to_the_broker_bound
 remote-file-mapping/RemoteFileMapping|kernel-compat|user::syscall::linux::proc_broker_ops::tests::truncated_file_mapping_never_commits_zero_filled_tail
 syscall-simd-lifecycle/SyscallSimdLifecycle|kernel-compat|user::syscall::tests::the_entry_stub_is_the_whole_of_the_syscall_paths_fpu_custody
+syscall-simd-lifecycle/SyscallSimdLifecycle|kernel-compat|user::syscall::tests::register_ipc_entry_elision_requires_exact_linux_operation
+syscall-simd-lifecycle/SyscallSimdLifecycle|kernel-ps|user::syscall::tests::syscall_abi_selector_is_installed_and_reset_with_the_original_stack
+syscall-simd-lifecycle/SyscallSimdLifecycle|kernel-compat|user::syscall::tests::register_ipc_finalizes_before_both_user_return_routes
+syscall-simd-lifecycle/SyscallSimdLifecycle|kernel-ps|multitask::scheduler::runqueue::simd_tls::tests::register_ipc_mode_is_exact_task_paired_and_cleared_on_every_replacement
 syscall-simd-lifecycle/SyscallSimdLifecycle|kernel-hal|arch::simd::tests::a_wide_simd_section_covers_every_register_the_entry_stubs_leave_behind
 syscall-simd-lifecycle/SyscallSimdLifecycle|kernel-ps|multitask::scheduler::tests::scheduler_block_arm_is_exact_race_safe_and_terminally_revoked
 syscall-simd-lifecycle/SyscallSimdLifecycle|kernel-ps|multitask::scheduler::tests::raced_wake_never_validates_a_consumed_current_frame

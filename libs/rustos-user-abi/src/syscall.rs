@@ -1,6 +1,7 @@
 mod activation_batch;
 mod affinity;
 mod ipc_reply_recv;
+mod ipc_registers;
 mod pager_fault;
 mod scheduling_context;
 pub mod smp_qualification;
@@ -8,6 +9,7 @@ mod vfs_executable_snapshot;
 pub use activation_batch::*;
 pub use affinity::*;
 pub use ipc_reply_recv::*;
+pub use ipc_registers::*;
 pub use pager_fault::*;
 pub use scheduling_context::*;
 pub use smp_qualification::*;

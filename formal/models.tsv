@@ -26,7 +26,7 @@ entropy-broker-boundary/EntropyBrokerBoundary	temporal	intentional-terminal	boot
 dvm-volume-io/DvmVolumeIo	temporal	intentional-terminal	DVM request completes or preserves a bounded failure outcome	120	900	exhaustive	no	no	no
 dvm-read-cache/DvmReadCache	temporal	intentional-terminal	cache request serves exact live data, rejects stale generation, or clears on mutation/restart	120	900	exhaustive	no	no	no
 remote-file-mapping/RemoteFileMapping	safety	intentional-terminal	exact file bytes commit or the mapping aborts without fallback or zero fill	120	900	exhaustive	no	no	no
-syscall-simd-lifecycle/SyscallSimdLifecycle	safety	intentional-terminal	syscall return restores the entering task image or remains blocked	120	900	exhaustive	no	no	no
+syscall-simd-lifecycle/SyscallSimdLifecycle	safety	intentional-terminal	ordinary return restores entering data; register return sanitizes data and restores controls on both routes; async custody remains full	120	900	exhaustive	no	no	no
 syscall-scheduler-continuation/SyscallSchedulerContinuation	safety	check	explicit returned or retired terminal stutter preserves deadlock checking	120	900	exhaustive	no	no	no
 pci-bar-discovery/PciBarDiscovery	safety	intentional-terminal	BAR discovery publishes one restored valid resource or rejects it	120	900	exhaustive	no	no	no
 physical-frame-lifecycle/PhysicalFrameLifecycle	safety	check	explicit all-reserved terminal stutter preserves deadlock checking	120	900	exhaustive	no	no	no

@@ -39,7 +39,7 @@ use legacy_test_api::*;
 pub use endpoint_priority::EndpointCallPriority;
 use endpoint_priority::EndpointObject;
 pub use endpoint_receive::{
-    EndpointReceive, published_request_retains_custody, receive_or_wait,
+    EndpointReceive, published_request_retains_custody, receive_or_wait, receive_or_wait_inline,
     received_request_custody_conditions, received_request_retains_custody,
 };
 pub use shared_region_hold::KernelSharedRegionMappingHold;
@@ -872,12 +872,12 @@ struct FastCallFrame {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct FastEndpointReceived {
+pub struct FastEndpointReceived<const N: usize = IPC_FAST_INLINE_BYTES> {
     pub reply: KernelReplyHandle,
     pub caller_process_id: u64,
     pub caller_task_id: u64,
     pub request_len: usize,
-    pub request: [u8; IPC_FAST_INLINE_BYTES],
+    pub request: [u8; N],
 }
 
 /// Exact custody returned when a published fast reservation is rolled back
@@ -897,11 +897,11 @@ pub struct FastReplyCompletion {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum FastEndpointResponseTake {
+pub enum FastEndpointResponseTake<const N: usize = IPC_FAST_INLINE_BYTES> {
     Pending,
     Response {
         response_len: usize,
-        response: [u8; IPC_FAST_INLINE_BYTES],
+        response: [u8; N],
     },
     Error(IpcError),
 }
@@ -1919,13 +1919,23 @@ pub fn take_fast_endpoint_request_within(
     receiver_task_id: u64,
     request_capacity: usize,
 ) -> Result<Option<FastEndpointReceived>, IpcError> {
+    take_fast_endpoint_request_inline::<IPC_FAST_INLINE_BYTES>(endpoint, receiver_task_id, request_capacity)
+}
+
+/// Same atomic receive transaction with a bounded in-kernel return image.
+/// Short register IPC must not copy a full 256-byte frame between Rust layers.
+pub fn take_fast_endpoint_request_inline<const N: usize>(
+    endpoint: KernelEndpointHandle,
+    receiver_task_id: u64,
+    request_capacity: usize,
+) -> Result<Option<FastEndpointReceived<N>>, IpcError> {
     ENDPOINTS
         .with_mut(endpoint.raw(), |endpoint_object| {
-            endpoint_receive::take_fast_request(
+            endpoint_receive::take_fast_request_inline::<N>(
                 endpoint_object,
                 endpoint,
                 receiver_task_id,
-                request_capacity.min(IPC_FAST_INLINE_BYTES),
+                request_capacity.min(IPC_FAST_INLINE_BYTES).min(N),
             )
         })
         .ok_or(IpcError::InvalidHandle)?
@@ -2012,6 +2022,15 @@ pub fn take_fast_endpoint_response(
     reply: KernelReplyHandle,
     caller_task_id: u64,
 ) -> Result<FastEndpointResponseTake, IpcError> {
+    take_fast_endpoint_response_inline::<IPC_FAST_INLINE_BYTES>(reply, caller_task_id)
+}
+
+/// A compact return image; exact caller, one-shot consume, terminal errors and
+/// retirement use the very same reply-slot transaction as buffer IPC.
+pub fn take_fast_endpoint_response_inline<const N: usize>(
+    reply: KernelReplyHandle,
+    caller_task_id: u64,
+) -> Result<FastEndpointResponseTake<N>, IpcError> {
     // One acquisition where `with_mut` then `remove` took this slot's lock
     // twice; `GenerationalSlab::with_mut_take` says why the object comes back.
     let (result, retired) = REPLIES
@@ -2033,10 +2052,15 @@ pub fn take_fast_endpoint_response(
                 break 'take (Ok(FastEndpointResponseTake::Pending), false);
             }
             reply_object.consumed = true;
+            if frame.response_len > N {
+                break 'take (Err(IpcError::BufferTooSmall), true);
+            }
+            let mut response = [0; N];
+            response[..frame.response_len].copy_from_slice(&frame.response[..frame.response_len]);
             (
                 Ok(FastEndpointResponseTake::Response {
                     response_len: frame.response_len,
-                    response: frame.response,
+                    response,
                 }),
                 true,
             )

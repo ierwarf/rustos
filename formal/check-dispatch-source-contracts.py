@@ -436,7 +436,7 @@ ordered(architecture[architecture.index("impl<'a> CurrentArchitecture"):], [
     'pin.slot(), pin.id(), view', 'Some(Self { current, scope, state })',
     'fn install(self)', 'self.current.cpu()', 'self.scope.is_masked()',
     'load_address_space_phys(PhysAddr::new(self.state.root))',
-    'set_privilege_stack(self.state.stack_top)', 'set_kernel_stack_top(self.state.stack_top)',
+    'set_privilege_stack(self.state.stack_top)', 'set_kernel_stack_top(self.state.stack_top, self.state.register_ipc)',
     'install_segments(self.state, true)'], 'retained Current MM/stack through final registers')
 # Native born-resource returns use exactly the production resource qualification
 # and both bank transitions. Only explicitly constructed integer phase models
@@ -455,7 +455,7 @@ for fragment in ['#[cfg(not(test))] if self.from', '#[cfg(not(test))] if let Som
 ordered(body(architecture, 'install_with'), ['self.turn.begin_architecture()',
     'if self.changed', 'effect(ArchitectureEffect::AddressSpace(next.root))',
     'effect(ArchitectureEffect::PrivilegeStack(next.stack_top))',
-    'effect(ArchitectureEffect::SyscallStack(next.stack_top))',
+    'effect(ArchitectureEffect::SyscallStack(next.stack_top, next.register_ipc))',
     'fast_ipc && previous.root == next.root && !self.receipt.return_to_user',
     'effect(ArchitectureEffect::Segments(next, self.receipt.return_to_user))',
     'effect(ArchitectureEffect::Simd(self.receipt.token.slot))',

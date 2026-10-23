@@ -181,7 +181,7 @@ fn actual_irq_fast_producer_claim_and_changed_return_keep_both_born_banks_until_
         let effects = install_model(&mut entry, dispatch, fast);
         assert_eq!(effects.len(), 4);
         assert!(matches!(effects[0], return_architecture::ArchitectureEffect::PrivilegeStack(_)));
-        assert!(matches!(effects[1], return_architecture::ArchitectureEffect::SyscallStack(_)));
+        assert!(matches!(effects[1], return_architecture::ArchitectureEffect::SyscallStack(_, _)));
         assert!(matches!(effects[2], return_architecture::ArchitectureEffect::Segments(_, true)));
         set_scheduler_current_task_scratch_for_cpu(0, 121);
         drop(entry);

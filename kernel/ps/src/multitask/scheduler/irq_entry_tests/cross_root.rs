@@ -15,7 +15,7 @@ fn changed(entry: &mut DispatchEntry, dispatch: SchedulerDispatch, fast: bool, r
     assert_eq!(effects.len(), 5, "cross-MM fast return must not take the same-root TLS shortcut");
     assert_eq!(effects[0], return_architecture::ArchitectureEffect::AddressSpace(root));
     assert!(matches!(effects[1], return_architecture::ArchitectureEffect::PrivilegeStack(_)));
-    assert!(matches!(effects[2], return_architecture::ArchitectureEffect::SyscallStack(_)));
+    assert!(matches!(effects[2], return_architecture::ArchitectureEffect::SyscallStack(_, _)));
     assert!(matches!(effects[3], return_architecture::ArchitectureEffect::Segments(_, _)));
 }
 

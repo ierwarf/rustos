@@ -259,7 +259,12 @@ impl Capture {
             None
         };
         let project = &config.project;
+        let revision = std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"]).current_dir(&config.root_dir).output()?;
+        ensure!(revision.status.success(), "read benchmark source revision");
+        let revision = String::from_utf8(revision.stdout)?;
         let report = serde_json::json!({"v":1, "suite":self.suite, "vcpus":self.vcpus,
+            "source_revision":revision.trim(),
             "source_tree_hash":self.source, "ipcbench_sha256":self.app, "nucleus_sha256":self.kernel,
             "uiserver_sha256":self.ui, "dvm_serial_sha256":dvm_log_hash,
             "launch_ok":launch_ok, "source_and_elf_unchanged":unchanged, "staged_elf_match":staged,

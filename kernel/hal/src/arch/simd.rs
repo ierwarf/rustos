@@ -294,6 +294,57 @@ pub unsafe fn restore_state(area: &SimdState) {
     }
 }
 
+/// Destroy all user-visible FP/vector data at an opt-in register-IPC return.
+/// XCR0 admits only x87/SSE/YMM. FNINIT alone leaves physical x87/MMX data
+/// untouched: overwrite all eight physical registers before emptying the stack.
+///
+/// # Safety
+/// IRQs must be masked. The caller restores the entering MXCSR/control word
+/// afterwards, and must not use any entering FP/vector data across this call.
+#[inline(never)]
+pub unsafe extern "C" fn clear_ipc_registers() {
+    unsafe {
+        core::arch::asm!(
+            "fninit",
+            "fldz",
+            "fldz",
+            "fldz",
+            "fldz",
+            "fldz",
+            "fldz",
+            "fldz",
+            "fldz",
+            "fninit",
+            clobber_abi("C"),
+            options(nostack),
+        );
+        if avx_enabled() {
+            core::arch::asm!("vzeroall", clobber_abi("C"), options(nostack));
+        } else {
+            core::arch::asm!(
+                "pxor xmm0, xmm0",
+                "pxor xmm1, xmm1",
+                "pxor xmm2, xmm2",
+                "pxor xmm3, xmm3",
+                "pxor xmm4, xmm4",
+                "pxor xmm5, xmm5",
+                "pxor xmm6, xmm6",
+                "pxor xmm7, xmm7",
+                "pxor xmm8, xmm8",
+                "pxor xmm9, xmm9",
+                "pxor xmm10, xmm10",
+                "pxor xmm11, xmm11",
+                "pxor xmm12, xmm12",
+                "pxor xmm13, xmm13",
+                "pxor xmm14, xmm14",
+                "pxor xmm15, xmm15",
+                clobber_abi("C"),
+                options(nostack),
+            );
+        }
+    }
+}
+
 /// The sixteen `ymm` upper halves, in register order.
 #[repr(C, align(32))]
 struct YmmUpperHalves([u8; YMM_UPPER_HALF_BYTES]);

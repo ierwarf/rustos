@@ -69,6 +69,20 @@ runs for an optimization claim. Do not subtract isolated component medians to
 claim a measured end-to-end saving. The production-helper native tests and
 registered component mutations cover evidence rejection, not CPU execution.
 
+## Isolated IPC provenance
+
+Ordinary `bench --isolate-probe` runs now reuse the existing private
+`build/bench-core/<probe>-vcpu-<n>-<nonce>/` capture. Metadata binds the Git
+revision **and dirty source fingerprint**, host boot ID, profile flags, archived
+kernel/app/UI ELFs and raw guest log. Collection refuses a changed source/ELF
+or a linked/staged mismatch. A revision alone never identifies a dirty build.
+This does not extend the ordinary IPC timeout or turn diagnostic profiles into
+shipping evidence. Alternate buffer/register probes from the same frozen tree;
+retain all samples and compare CPUID anchors within 3%. No subtraction of stamp
+costs, outliers or anchor normalization is an optimization claim.
+The [P0/P1 register-IPC report](ipc-register-p1.md) retains the measured cohorts,
+failed/incomplete comparisons and their provenance.
+
 ## IPC worst-case evidence
 
 `cargo xtask bench --rustos-vcpus <1|8> --isolate-probe

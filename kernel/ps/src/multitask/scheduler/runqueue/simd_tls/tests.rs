@@ -29,6 +29,32 @@ fn simd_binding_requires_explicit_terminal_release_before_uid_reuse() {
 }
 
 #[test]
+fn register_ipc_mode_is_exact_task_paired_and_cleared_on_every_replacement() {
+    let state = SlotSimdState::new();
+    state.initialize(0);
+    state.with(|image| {
+        set_register_ipc(image, 0, true);
+        assert!(image.register_ipc);
+        assert!(catch_unwind(AssertUnwindSafe(|| set_register_ipc(image, 1, false))).is_err());
+        assert!(catch_unwind(AssertUnwindSafe(|| set_register_ipc(image, 0, true))).is_err());
+        set_register_ipc(image, 0, false);
+        assert!(!image.register_ipc);
+        set_register_ipc(image, 0, true);
+    });
+    state.replace(0, false);
+    state.with(|image| {
+        assert!(!image.register_ipc);
+        set_register_ipc(image, 0, true);
+    });
+    state.replace(0, true);
+    state.initialize(1);
+    state.with(|image| {
+        assert!(!image.register_ipc);
+        assert!(catch_unwind(AssertUnwindSafe(|| set_register_ipc(image, 0, true))).is_err());
+    });
+}
+
+#[test]
 fn exclusive_token_refuses_overlap_before_any_raw_image_is_borrowed() {
     let state = SlotSimdState::new();
     let first = state.claim();

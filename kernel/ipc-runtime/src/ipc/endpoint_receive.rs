@@ -14,8 +14,8 @@ use super::*;
 /// `Waiting` is endpoint publication, not a scheduler block commit. The caller
 /// must still commit its arm; a concurrent wake may already have withdrawn it.
 #[derive(Debug)]
-pub enum EndpointReceive {
-    Fast(FastEndpointReceived),
+pub enum EndpointReceive<const N: usize = IPC_FAST_INLINE_BYTES> {
+    Fast(FastEndpointReceived<N>),
     Queued(EndpointReceivedWithSender),
     Waiting,
     Empty,
@@ -119,10 +119,24 @@ pub fn receive_or_wait(
     handle_capacity: usize,
     may_wait: bool,
 ) -> Result<EndpointReceive, IpcError> {
+    receive_or_wait_inline::<IPC_FAST_INLINE_BYTES>(endpoint, receiver_task_id, request_capacity, handle_capacity, may_wait)
+}
+
+/// Select a small fixed return image without changing transport or custody.
+pub fn receive_or_wait_inline<const N: usize>(
+    endpoint: KernelEndpointHandle,
+    receiver_task_id: u64,
+    request_capacity: usize,
+    handle_capacity: usize,
+    may_wait: bool,
+) -> Result<EndpointReceive<N>, IpcError> {
+    // The legacy 256-byte fast image also receives larger queued byte messages.
+    // Only a smaller compact image narrows the queued admission bound.
+    let request_capacity = if N < IPC_FAST_INLINE_BYTES { request_capacity.min(N) } else { request_capacity };
     ENDPOINTS
         .with_mut(endpoint.raw(), |object| {
             if let Some(received) =
-                take_fast_request(object, endpoint, receiver_task_id, request_capacity)?
+                take_fast_request_inline::<N>(object, endpoint, receiver_task_id, request_capacity)?
             {
                 return Ok(EndpointReceive::Fast(received));
             }
@@ -140,12 +154,12 @@ pub fn receive_or_wait(
         .ok_or(IpcError::InvalidHandle)?
 }
 
-pub(super) fn take_fast_request(
+pub(super) fn take_fast_request_inline<const N: usize>(
     object: &mut EndpointObject,
     endpoint: KernelEndpointHandle,
     receiver_task_id: u64,
     request_capacity: usize,
-) -> Result<Option<FastEndpointReceived>, IpcError> {
+) -> Result<Option<FastEndpointReceived<N>>, IpcError> {
     let Some(reply_id) = object.fast_reply else {
         return Ok(None);
     };
@@ -163,16 +177,18 @@ pub(super) fn take_fast_request(
             {
                 return Err(IpcError::PermissionDenied);
             }
-            if frame.request_len > request_capacity {
+            if frame.request_len > request_capacity.min(N) {
                 return Err(IpcError::BufferTooSmall);
             }
+            let mut request = [0; N];
+            request[..frame.request_len].copy_from_slice(&frame.request[..frame.request_len]);
             frame.state = FastCallState::RequestTaken;
             Ok(FastEndpointReceived {
                 reply: KernelReplyHandle::from_raw(reply_id),
                 caller_process_id: frame.caller_process_id,
                 caller_task_id: frame.caller_task_id,
                 request_len: frame.request_len,
-                request: frame.request,
+                request,
             })
         })
         .ok_or(IpcError::PermissionDenied)??;

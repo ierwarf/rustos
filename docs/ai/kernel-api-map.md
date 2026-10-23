@@ -47,6 +47,21 @@ absent publication nor a scalar slot grants process/MM authority. Native tests
 model the earlier masked IRQ entry and exercise the actual binding/VMA bodies,
 not privileged CLI/STI hardware execution.
 
+Pointer-free short IPC uses `kernel_ps::api::current_user_ipc_identity` to join
+the IRQ-stable installed Current binding with exact live process generation,
+without acquiring an MM allocation loan or inspecting user memory. Its scalar
+snapshot is not a user-copy capability; buffer IPC and all actual user-memory
+access still use the retained/fault-revalidated usermem APIs. Missing or stale
+process lifecycle evidence refuses, never falls back to diagnostic PID authority.
+
+Register IPC's unsafe `begin_ipc_register_simd` guard requires an outer
+control-preserving, data-sanitizing return boundary; only the admitted lane may
+elide hardware SIMD custody. `user::syscall::set_kernel_stack_top(top,
+register_ipc)` installs entry's GS-private ABI selector with that same retained
+architecture's stack under IRQ exclusion. Initial/current/generic/lane installs
+derive the selector from the original context's Linux ABI, never PID telemetry
+or the unused legacy GS current-task pointer. See [IPC ABI](abi/ipc.md).
+
 ## Boot order
 
 From `kernel/src/main.rs`:

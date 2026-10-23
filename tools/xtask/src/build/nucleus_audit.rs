@@ -233,7 +233,7 @@ fn audit_disassembly(listing: &str) -> SimdCustodyReport {
         }
         report.instructions += 1;
 
-        if is_x87(mnemonic) {
+        if is_x87(mnemonic) && !register_ipc_custody(&symbol, mnemonic) {
             report.x87.push(Site::new(&symbol, mnemonic));
         }
         if is_float_arithmetic(mnemonic) {
@@ -273,6 +273,14 @@ fn instruction_mnemonic(line: &str) -> Option<&str> {
         | "fs" | "gs" | "ss" | "notrack" | "bnd" => rest.split_whitespace().nth(1),
         _ => Some(mnemonic),
     }
+}
+
+fn register_ipc_custody(symbol: &str, mnemonic: &str) -> bool {
+    (symbol == "syscall_entry" && matches!(mnemonic, "fnstcw" | "fldcw"))
+        || (symbol.contains("kernel_hal4arch4simd19clear_ipc_registers")
+            && matches!(mnemonic, "fninit" | "fldz"))
+        || (symbol.contains("kernel_compat4user7syscall26finish_register_ipc_return")
+            && mnemonic == "fldcw")
 }
 
 fn is_x87(mnemonic: &str) -> bool {
@@ -464,6 +472,23 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["fldl", "fmul", "fstpl"],
         );
+    }
+
+    #[test]
+    fn register_ipc_custody_exceptions_do_not_permit_x87_elsewhere() {
+        assert!(register_ipc_custody("syscall_entry", "fnstcw"));
+        assert!(!register_ipc_custody("syscall_entry", "fldz"));
+        let sanitizer = "_RNvNtNtCs2_10kernel_hal4arch4simd19clear_ipc_registers";
+        assert!(register_ipc_custody(sanitizer, "fninit"));
+        assert!(register_ipc_custody(sanitizer, "fldz"));
+        assert!(!register_ipc_custody(sanitizer, "fadd"));
+        assert!(!register_ipc_custody("ordinary_kernel_function", "fldz"));
+        let report = audit_disassembly(&listing(
+            "ffffffff80100000 <ordinary_kernel_function>:\n\
+             ffffffff80100000:\tfldz\n\
+             ffffffff80100002:\tfldcw (%rax)\n",
+        ));
+        assert_eq!(report.x87.len(), 2);
     }
 
     #[test]

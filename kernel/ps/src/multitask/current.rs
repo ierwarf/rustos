@@ -139,6 +139,31 @@ pub fn current_user_address_space() -> Option<RetainedCurrentUserAddressSpace> {
     })
 }
 
+/// A pointer-free IPC syscall needs exact live identity, not an address-space
+/// allocation loan. Join the installed Current user binding to the process
+/// generation publication while this CPU cannot switch. No PID-only diagnostic
+/// identity, process-state borrow, MM bind, allocation pin or user page walk.
+/// The returned snapshot authorizes no subsequent user-memory access.
+pub fn current_user_ipc_identity() -> Option<(u64, process_table::ProcessIdentity)> {
+    if nucleus_core::util::lockdep::preemption_disabled() || !current_cpu_task_slot_admitted() {
+        return None;
+    }
+    interrupts::without_interrupts(|| {
+        let (task_id, _, handle, _) = match published_current_identity() {
+            Some(identity) => identity.user_binding(),
+            None => owned_current_user_binding(),
+        }?;
+        ipc_identity_for_binding(task_id, handle)
+    })
+}
+
+pub(super) fn ipc_identity_for_binding(
+    task_id: u64, handle: process_table::ProcessHandle,
+) -> Option<(u64, process_table::ProcessIdentity)> {
+    let identity = process_table::live_process_identity(handle)?;
+    Some((task_id, identity))
+}
+
 /// The current task's published process id, when it names the same process
 /// handle the binding did.
 fn published_current_identity_process_id(handle: process_table::ProcessHandle) -> Option<u64> {

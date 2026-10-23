@@ -21,6 +21,8 @@ use rustos_user_abi::syscall::{
     IpcReplyRecvWithSenderArgs, IPC_ABI_VERSION, SYS_RUSTOS_IPC_CALL,
     SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_RECV_WITH_SENDER, SYS_RUSTOS_IPC_REPLY,
     SYS_RUSTOS_IPC_REPLY_RECV_WITH_SENDER, SYS_RUSTOS_IPC_TRY_RECV,
+    ipc_register_syscall, SYS_RUSTOS_IPC_REGISTER_CALL, SYS_RUSTOS_IPC_REGISTER_RECV,
+    SYS_RUSTOS_IPC_REGISTER_REPLY_RECV, SYS_RUSTOS_IPC_REGISTER_REPLY,
 };
 
 use crate::{
@@ -317,6 +319,7 @@ pub(crate) fn probe_ipc_intra_process(tsc_khz: u64) {
             "ipc_split_reply_to_return",
         ],
         bench_server,
+        false,
     );
 }
 
@@ -332,14 +335,137 @@ pub(crate) fn probe_ipc_intra_process_reply_recv(tsc_khz: u64) {
             "ipc_split_reply_recv_reply_to_return",
         ],
         bench_server_reply_recv,
+        false,
     );
 }
 
 pub(crate) fn probe_state_checkpoint(name: &str, tsc_khz: u64) {
     let legs = [format!("{name}_to_recv"), format!("{name}_body"), format!("{name}_to_return")];
     measure_intra_process_round_trip(
-        tsc_khz, name, [&legs[0], &legs[1], &legs[2]], bench_server_reply_recv,
+        tsc_khz, name, [&legs[0], &legs[1], &legs[2]], bench_server_reply_recv, false,
     );
+}
+
+/// Same payload, stamps, warmups, counts and echo/STOP/join oracle as the
+/// buffer control. This measures two threads in ONE address space, not CR3.
+pub(crate) fn probe_ipc_register_reply_recv(tsc_khz: u64) {
+    if !register_transport_preflight() {
+        skip("ipc_rt_intra_process_register_reply_recv", "register-preflight-failed");
+        return;
+    }
+    measure_intra_process_round_trip(tsc_khz, "ipc_rt_intra_process_register_reply_recv",
+        ["ipc_split_register_call_to_recv", "ipc_split_register_server_body", "ipc_split_register_reply_to_return"],
+        bench_server_register_reply_recv, true);
+}
+
+// Outside all timing windows: length/padding, queued/fast interoperability,
+// rejected fused endpoint before one-shot consume, and duplicate reply refusal.
+fn register_transport_preflight() -> bool {
+    use rustos_user_abi::syscall::{ipc_register_pack, ipc_register_unpack};
+    unsafe fn ipc_register_syscall(operation: u64, endpoint: u64, len: u64,
+        words: [u64; 2], reply: u64) -> rustos_user_abi::syscall::IpcRegisterResult {
+        let (result, valid) = unsafe { crate::ipc_simd::checked_syscall(
+            operation, endpoint, len, words, reply, true) };
+        assert!(valid, "register IPC leaked FP data or changed controls");
+        result
+    }
+    // Ordinary Linux syscalls still preserve data, unlike this opt-in ABI.
+    assert!(unsafe { crate::ipc_simd::checked_syscall(39, 0, 0, [0; 2], 0, false) }.1);
+    for (operation, len) in [(SYS_RUSTOS_IPC_REGISTER_CALL, 17),
+        (SYS_RUSTOS_IPC_REGISTER_CALL, 0), (SYS_RUSTOS_IPC_REGISTER_RECV, 1)] {
+        let result = unsafe { ipc_register_syscall(operation, 0, len, [u64::MAX; 2], 0) };
+        if result.status != -22 || result.words != [0; 2] || result.reply != 0
+            || result.sender_pid != 0 || result.sender_tid != 0 { return false; }
+    }
+    let endpoint = unsafe { syscall0(SYS_RUSTOS_IPC_ENDPOINT_CREATE) };
+    if endpoint < 0 { return false; }
+    let endpoint = endpoint as u64;
+    let server = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(50));
+        let mut received = unsafe { ipc_register_syscall(SYS_RUSTOS_IPC_REGISTER_RECV, endpoint, 0, [0; 2], 0) };
+        for len in 1..=16 {
+            assert_eq!(received.status, len);
+            assert_ne!(received.reply, 0);
+            assert_ne!(received.sender_pid, 0);
+            assert_ne!(received.sender_tid, 0);
+            let data = ipc_register_unpack(received.words);
+            assert!(data[..len as usize].iter().all(|&b| b == len as u8));
+            assert!(data[len as usize..].iter().all(|&b| b == 0));
+            let denied = unsafe { ipc_register_syscall(SYS_RUSTOS_IPC_REGISTER_REPLY_RECV,
+                0, len as u64, received.words, received.reply) };
+            assert!(denied.status < 0 && denied.status > -4096);
+            assert_eq!(denied.words, [0; 2]);
+            if len == 16 {
+                let cap = received.reply;
+                let result = unsafe { ipc_register_syscall(SYS_RUSTOS_IPC_REGISTER_REPLY, cap,
+                    len as u64, received.words, 0) };
+                assert_eq!(result.status, 0);
+                let duplicate = unsafe { ipc_register_syscall(SYS_RUSTOS_IPC_REGISTER_REPLY, cap,
+                    len as u64, received.words, 0) };
+                assert!(duplicate.status < 0);
+            } else {
+                received = unsafe { ipc_register_syscall(SYS_RUSTOS_IPC_REGISTER_REPLY_RECV,
+                    endpoint, len as u64, received.words, received.reply) };
+            }
+        }
+    });
+    // The server delays its first receive so the first call exercises queued
+    // fallback; subsequent fused receives exercise the parked-receiver path.
+    let mut ok = true;
+    for len in 1..=16 {
+        let data = [len as u8; 16];
+        let words = ipc_register_pack(&data[..len]).unwrap();
+        let result = unsafe { ipc_register_syscall(SYS_RUSTOS_IPC_REGISTER_CALL,
+            endpoint, len as u64, words, 0) };
+        ok &= result.status == len as i64 && result.words == words
+            && result.reply == 0 && result.sender_pid == 0 && result.sender_tid == 0;
+        if !ok { break; }
+    }
+    if !server.join().is_ok() || !ok { return false; }
+    // Both cross-ABI directions use the same authenticated endpoint objects.
+    for register_client in [true, false] {
+        let endpoint = unsafe { syscall0(SYS_RUSTOS_IPC_ENDPOINT_CREATE) };
+        if endpoint < 0 { return false; }
+        let endpoint = endpoint as u64;
+        let server = thread::spawn(move || if register_client {
+            bench_server_reply_recv(endpoint)
+        } else { bench_server_register_reply_recv(endpoint) });
+        for op in [BENCH_OP_PING, BENCH_OP_STOP] {
+            let request = BenchMsg { op, seq: 0x1234_5678_90ab_cdef };
+            let mut response = BenchMsg::default();
+            let status = if register_client {
+                let result = unsafe { ipc_register_syscall(SYS_RUSTOS_IPC_REGISTER_CALL,
+                    endpoint, 16, [request.op, request.seq], 0) };
+                response = BenchMsg { op: result.words[0], seq: result.words[1] };
+                result.status
+            } else { unsafe { syscall5(SYS_RUSTOS_IPC_CALL, endpoint,
+                (&request as *const BenchMsg) as u64, 16,
+                (&mut response as *mut BenchMsg) as u64, 16) } };
+            ok &= valid_round_trip_reply(status, &request, &response);
+        }
+        ok &= server.join().is_ok();
+    }
+    ok
+}
+
+fn bench_server_register_reply_recv(endpoint: u64) {
+    let mut received = unsafe { ipc_register_syscall(SYS_RUSTOS_IPC_REGISTER_RECV, endpoint, 0, [0; 2], 0) };
+    loop {
+        if received.status != 16 || received.reply == 0 || received.sender_pid == 0 || received.sender_tid == 0 {
+            return;
+        }
+        RECV_TSC.store(tsc(), Ordering::Relaxed);
+        let stop = received.words[0] == BENCH_OP_STOP;
+        REPLY_TSC.store(tsc(), Ordering::Release);
+        if stop {
+            let result = unsafe { ipc_register_syscall(SYS_RUSTOS_IPC_REGISTER_REPLY,
+                received.reply, 16, received.words, 0) };
+            assert_eq!(result.status, 0, "register STOP reply failed");
+            return;
+        }
+        received = unsafe { ipc_register_syscall(SYS_RUSTOS_IPC_REGISTER_REPLY_RECV,
+            endpoint, 16, received.words, received.reply) };
+    }
 }
 
 fn measure_intra_process_round_trip(
@@ -347,6 +473,7 @@ fn measure_intra_process_round_trip(
     name: &str,
     split_names: [&str; 3],
     server_entry: fn(u64),
+    registers: bool,
 ) {
     let endpoint = unsafe { syscall0(SYS_RUSTOS_IPC_ENDPOINT_CREATE) };
     if endpoint < 0 {
@@ -365,6 +492,12 @@ fn measure_intra_process_round_trip(
     };
     let mut response = BenchMsg::default();
     let mut call = |request: &BenchMsg, response: &mut BenchMsg| -> i64 {
+        if registers {
+            let result = unsafe { ipc_register_syscall(SYS_RUSTOS_IPC_REGISTER_CALL,
+                endpoint, 16, [request.op, request.seq], 0) };
+            *response = BenchMsg { op: result.words[0], seq: result.words[1] };
+            return result.status;
+        }
         unsafe {
             syscall5(
                 SYS_RUSTOS_IPC_CALL,

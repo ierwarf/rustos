@@ -1,4 +1,5 @@
 mod fast_call_tests;
+mod compact_return_tests;
 mod receiver_waiter_tests;
 mod receive_transaction_tests;
 mod reply_publication_tests;

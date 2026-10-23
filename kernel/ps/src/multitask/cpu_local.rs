@@ -21,7 +21,14 @@
 
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use nucleus_core::util::lockdep::MAX_TRACKED_CPUS;
+use nucleus_core::util::{cache_padded::CachePadded, lockdep::MAX_TRACKED_CPUS};
+
+// Every handoff writes these words. Packed arrays make independent CPUs
+// invalidate each other's Current/Transition/ACK publications on every switch.
+type CpuSlot = CachePadded<AtomicUsize>;
+type CpuFlag = CachePadded<AtomicBool>;
+const fn slot_word(value: usize) -> CpuSlot { CachePadded::new(AtomicUsize::new(value)) }
+const fn flag_word(value: bool) -> CpuFlag { CachePadded::new(AtomicBool::new(value)) }
 
 use super::MAX_SCHEDULER_TASKS;
 // ORDERING: This is a one-way scheduler publication. Interrupt leaves need
@@ -29,25 +36,18 @@ use super::MAX_SCHEDULER_TASKS;
 // global lock merely to read its root slot doubled every SMP timer/IPI
 // transaction.
 static SCHEDULER_INITIALIZED: AtomicBool = AtomicBool::new(false);
-static CURRENT_TASK_SLOTS: [AtomicUsize; nucleus_core::util::lockdep::MAX_TRACKED_CPUS] =
-    [const { AtomicUsize::new(0) }; nucleus_core::util::lockdep::MAX_TRACKED_CPUS];
-static CURRENT_TASK_ACTIVE: [AtomicBool; nucleus_core::util::lockdep::MAX_TRACKED_CPUS] =
-    [const { AtomicBool::new(false) }; nucleus_core::util::lockdep::MAX_TRACKED_CPUS];
-static CURRENT_TASK_IDLE: [AtomicBool; nucleus_core::util::lockdep::MAX_TRACKED_CPUS] =
-    [const { AtomicBool::new(false) }; nucleus_core::util::lockdep::MAX_TRACKED_CPUS];
+static CURRENT_TASK_SLOTS: [CpuSlot; MAX_TRACKED_CPUS] = [const { slot_word(0) }; MAX_TRACKED_CPUS];
+static CURRENT_TASK_ACTIVE: [CpuFlag; MAX_TRACKED_CPUS] = [const { flag_word(false) }; MAX_TRACKED_CPUS];
+static CURRENT_TASK_IDLE: [CpuFlag; MAX_TRACKED_CPUS] = [const { flag_word(false) }; MAX_TRACKED_CPUS];
 // This is private working state for one CPU's dispatch turn.  Unlike
 // `CURRENT_TASK_SLOTS`, it is never remote lifetime or execution authority:
 // remote readers use the release-published current/transition pair below.
 // Keeping it out of `Scheduler` removes the last mutable current-task scratch
 // word from the lifecycle catalog without publishing an incoming task before
 // the assembly RSP switch commits.
-static SCHEDULER_CURRENT_TASK_SCRATCH: [AtomicUsize;
-    nucleus_core::util::lockdep::MAX_TRACKED_CPUS] =
-    [const { AtomicUsize::new(0) }; nucleus_core::util::lockdep::MAX_TRACKED_CPUS];
-static TRANSITION_FROM_SLOTS: [AtomicUsize; nucleus_core::util::lockdep::MAX_TRACKED_CPUS] =
-    [const { AtomicUsize::new(0) }; nucleus_core::util::lockdep::MAX_TRACKED_CPUS];
-static TRANSITION_ACTIVE: [AtomicBool; nucleus_core::util::lockdep::MAX_TRACKED_CPUS] =
-    [const { AtomicBool::new(false) }; nucleus_core::util::lockdep::MAX_TRACKED_CPUS];
+static SCHEDULER_CURRENT_TASK_SCRATCH: [CpuSlot; MAX_TRACKED_CPUS] = [const { slot_word(0) }; MAX_TRACKED_CPUS];
+static TRANSITION_FROM_SLOTS: [CpuSlot; MAX_TRACKED_CPUS] = [const { slot_word(0) }; MAX_TRACKED_CPUS];
+static TRANSITION_ACTIVE: [CpuFlag; MAX_TRACKED_CPUS] = [const { flag_word(false) }; MAX_TRACKED_CPUS];
 
 #[cfg(test)]
 mod test_support;
@@ -395,8 +395,8 @@ pub(super) fn published_current_slot(cpu: usize) -> Option<usize> {
 /// free, lock-free, and callable with interrupts disabled.
 /// Slot whose lane switch awaits its RSP ACK on this CPU (`usize::MAX` = none).
 /// Only that CPU's masked trap writes it, and only its commit callback reads it.
-static LANE_ACK_FROM: [AtomicUsize; MAX_TRACKED_CPUS] =
-    [const { AtomicUsize::new(usize::MAX) }; MAX_TRACKED_CPUS];
+static LANE_ACK_FROM: [CpuSlot; MAX_TRACKED_CPUS] =
+    [const { slot_word(usize::MAX) }; MAX_TRACKED_CPUS];
 
 /// No dispatch turn, uncommitted RSP handoff or missing Current on this CPU:
 /// the preconditions for a lane switch, which never opens a `CpuDispatchTurn`.
@@ -515,10 +515,10 @@ fn slot_has_remote_owner(logical_index: usize, slot: usize) -> bool {
 }
 
 fn slot_has_owner_in(
-    slots: &[AtomicUsize],
-    active: &[AtomicBool],
-    transition_slots: &[AtomicUsize],
-    transition_active: &[AtomicBool],
+    slots: &[CpuSlot],
+    active: &[CpuFlag],
+    transition_slots: &[CpuSlot],
+    transition_active: &[CpuFlag],
     excluded_cpu: usize,
     slot: usize,
 ) -> bool {
@@ -545,20 +545,20 @@ fn slot_has_owner_in(
 
 #[cfg(test)]
 fn slot_is_running_in(
-    slots: &[AtomicUsize],
-    active: &[AtomicBool],
-    transition_slots: &[AtomicUsize],
-    transition_active: &[AtomicBool],
+    slots: &[CpuSlot],
+    active: &[CpuFlag],
+    transition_slots: &[CpuSlot],
+    transition_active: &[CpuFlag],
     slot: usize,
 ) -> bool {
     task_execution_owner_in(slots, active, transition_slots, transition_active, slot).is_some()
 }
 
 fn task_execution_owner_in(
-    slots: &[AtomicUsize],
-    active: &[AtomicBool],
-    transition_slots: &[AtomicUsize],
-    transition_active: &[AtomicBool],
+    slots: &[CpuSlot],
+    active: &[CpuFlag],
+    transition_slots: &[CpuSlot],
+    transition_active: &[CpuFlag],
     slot: usize,
 ) -> Option<TaskExecutionOwner> {
     assert_eq!(slots.len(), active.len());
@@ -607,9 +607,11 @@ mod tests {
         install_test_current_owner, install_test_transition_owner_with_admission,
     };
     use super::{
-        AtomicBool, AtomicUsize, CpuSwitchPublication, Ordering, TaskExecutionOwner,
+        CpuSwitchPublication, Ordering, TaskExecutionOwner,
         slot_has_owner_in, slot_is_running_in, task_execution_owner, task_execution_owner_in,
-        test_publication_lock,
+        test_publication_lock, slot_word, flag_word,
+        CURRENT_TASK_SLOTS, CURRENT_TASK_ACTIVE, CURRENT_TASK_IDLE,
+        SCHEDULER_CURRENT_TASK_SCRATCH, TRANSITION_FROM_SLOTS, TRANSITION_ACTIVE, LANE_ACK_FROM,
     };
     use std::panic::{AssertUnwindSafe, catch_unwind};
 
@@ -629,27 +631,31 @@ mod tests {
     }
 
     #[test]
+    fn per_cpu_switch_publications_have_disjoint_cache_lines() {
+        fn check<T>(cells: &[T]) {
+            assert!(core::mem::size_of::<T>() >= 64);
+            for pair in cells.windows(2) {
+                let first = &pair[0] as *const T as usize;
+                let second = &pair[1] as *const T as usize;
+                assert_eq!(first % 64, 0);
+                assert!(second / 64 > first / 64);
+            }
+        }
+        check(&CURRENT_TASK_SLOTS);
+        check(&CURRENT_TASK_ACTIVE);
+        check(&CURRENT_TASK_IDLE);
+        check(&SCHEDULER_CURRENT_TASK_SCRATCH);
+        check(&TRANSITION_FROM_SLOTS);
+        check(&TRANSITION_ACTIVE);
+        check(&LANE_ACK_FROM);
+    }
+
+    #[test]
     fn current_task_ownership_ignores_offline_slots_and_is_cpu_distinct() {
-        let slots = [
-            AtomicUsize::new(0),
-            AtomicUsize::new(17),
-            AtomicUsize::new(29),
-        ];
-        let active = [
-            AtomicBool::new(true),
-            AtomicBool::new(true),
-            AtomicBool::new(false),
-        ];
-        let transition_slots = [
-            AtomicUsize::new(0),
-            AtomicUsize::new(17),
-            AtomicUsize::new(0),
-        ];
-        let transition_active = [
-            AtomicBool::new(false),
-            AtomicBool::new(false),
-            AtomicBool::new(false),
-        ];
+        let slots = [slot_word(0), slot_word(17), slot_word(29)];
+        let active = [flag_word(true), flag_word(true), flag_word(false)];
+        let transition_slots = [slot_word(0), slot_word(17), slot_word(0)];
+        let transition_active = [flag_word(false), flag_word(false), flag_word(false)];
         assert!(slot_is_running_in(
             &slots,
             &active,
@@ -751,10 +757,10 @@ mod tests {
 
     #[test]
     fn duplicate_current_or_transition_owner_panics() {
-        let slots = [AtomicUsize::new(41), AtomicUsize::new(52)];
-        let active = [AtomicBool::new(true), AtomicBool::new(true)];
-        let transition_slots = [AtomicUsize::new(0), AtomicUsize::new(41)];
-        let transition_active = [AtomicBool::new(false), AtomicBool::new(true)];
+        let slots = [slot_word(41), slot_word(52)];
+        let active = [flag_word(true), flag_word(true)];
+        let transition_slots = [slot_word(0), slot_word(41)];
+        let transition_active = [flag_word(false), flag_word(true)];
 
         assert!(
             catch_unwind(AssertUnwindSafe(|| {

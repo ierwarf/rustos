@@ -15,7 +15,7 @@ pub mod endpoint {
         FastEndpointResponseTake, FastEndpointRollback, FastReplyCompletion, IpcError,
         KernelEndpointHandle, KernelReplyHandle, KernelTransferredHandle,
         PreparedReplyHandleBindError, ReplyCompletion, ReplySchedulingContextCustody,
-        ReplySchedulingContextReturn, receive_or_wait,
+        ReplySchedulingContextReturn, receive_or_wait, receive_or_wait_inline,
     };
 
     pub fn create() -> Result<KernelEndpointHandle, IpcError> {
@@ -153,6 +153,12 @@ pub mod endpoint {
         crate::ipc::take_fast_endpoint_request_within(endpoint, receiver_task_id, request_capacity)
     }
 
+    pub fn take_fast_request_inline<const N: usize>(
+        endpoint: KernelEndpointHandle, receiver_task_id: u64, request_capacity: usize,
+    ) -> Result<Option<FastEndpointReceived<N>>, IpcError> {
+        crate::ipc::take_fast_endpoint_request_inline::<N>(endpoint, receiver_task_id, request_capacity)
+    }
+
     pub fn rollback_fast_call(
         endpoint: KernelEndpointHandle,
         reply: KernelReplyHandle,
@@ -187,6 +193,12 @@ pub mod endpoint {
         caller_task_id: u64,
     ) -> Result<FastEndpointResponseTake, IpcError> {
         crate::ipc::take_fast_endpoint_response(reply, caller_task_id)
+    }
+
+    pub fn take_fast_response_inline<const N: usize>(
+        reply: KernelReplyHandle, caller_task_id: u64,
+    ) -> Result<FastEndpointResponseTake<N>, IpcError> {
+        crate::ipc::take_fast_endpoint_response_inline::<N>(reply, caller_task_id)
     }
 
     pub fn reply_custody_returned(reply: KernelReplyHandle, caller_task_id: u64) -> bool {

@@ -226,7 +226,7 @@ fn finish_committed_fast_reply_receive(
     }
 }
 
-fn ipc_reply_recv_committed_error(errno: i64) -> u64 {
+pub(super) fn ipc_reply_recv_committed_error(errno: i64) -> u64 {
     assert!(
         (1..rustos_user_abi::syscall::IPC_REPLY_RECV_COMMITTED_ERROR_BASE).contains(&errno),
         "reply-recv post-commit errno outside native ABI range: {errno}"

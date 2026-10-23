@@ -308,6 +308,15 @@ fn actual_typed_service_requires_original_process_and_wait_kind_and_rejects_fore
         runqueue::wait::set_reason(slot, runqueue::wait::REASON_PAGER_SERVICE, 0);
         let owner = runqueue::owner(slot);
         assert_eq!(pager_service_with(&scope, pid + 1, &|_| 1), None);
+        // A stale diagnostic/advisory PID may pass the cheap pre-filter. It
+        // must never replace the original physical binding's process check.
+        let original = identity::read(slot).unwrap();
+        let advisory = identity::TaskIdentity { process_id: Some(pid + 1), ..original };
+        identity::publish_metadata(slot, Some(advisory));
+        let stale = pager_service_with(&scope, pid + 1, &|_| 1);
+        identity::publish_metadata(slot, Some(original));
+        assert_eq!(stale, None);
+        assert_eq!(runqueue::owner(slot), owner);
         drop(scope);
         let unmasked =
             nucleus_core::util::lockdep::DispatchPreemption::enter_model_with_enabled_irqs(0);

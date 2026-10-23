@@ -13,6 +13,7 @@ static TLS_FS_BASE: [AtomicU64; MAX_TASK] = [const { AtomicU64::new(0) }; MAX_TA
 
 struct SimdImage {
     task_id: Option<u64>,
+    register_ipc: bool,
     state: SimdState,
 }
 struct SlotSimdState {
@@ -34,6 +35,7 @@ impl SlotSimdState {
             busy: AtomicBool::new(false),
             image: UnsafeCell::new(SimdImage {
                 task_id: None,
+                register_ipc: false,
                 state: SimdState::new(),
             }),
         }
@@ -59,6 +61,7 @@ impl SlotSimdState {
                 "live SIMD image rebound without terminal release"
             );
             image.state = SimdState::new();
+            image.register_ipc = false;
             image.task_id = Some(task_id);
         });
     }
@@ -76,6 +79,7 @@ impl SlotSimdState {
                 "foreign SIMD replacement identity"
             );
             image.state = SimdState::new();
+            image.register_ipc = false;
             if terminal {
                 image.task_id = None;
             }
@@ -83,6 +87,57 @@ impl SlotSimdState {
     }
 }
 static SIMD_STATES: [SlotSimdState; MAX_TASK] = [const { SlotSimdState::new() }; MAX_TASK];
+
+/// Exact-task, non-transferable custody of a register-IPC syscall continuation.
+/// This is not a CPU-local flag: migration carries the original slot binding.
+#[must_use]
+pub struct IpcRegisterSimdGuard {
+    slot: usize,
+    task_id: u64,
+    _not_send: core::marker::PhantomData<*mut ()>,
+}
+
+fn set_register_ipc(image: &mut SimdImage, task_id: u64, active: bool) {
+    assert_eq!(
+        image.task_id,
+        Some(task_id),
+        "foreign register IPC SIMD identity"
+    );
+    assert_ne!(
+        image.register_ipc, active,
+        "unpaired register IPC SIMD boundary"
+    );
+    image.register_ipc = active;
+}
+
+impl Drop for IpcRegisterSimdGuard {
+    fn drop(&mut self) {
+        irq_excluded(|| {
+            assert_eq!(live_identity(self.slot, false), self.task_id);
+            SIMD_STATES[self.slot].with(|image| set_register_ipc(image, self.task_id, false));
+        });
+    }
+}
+
+/// # Safety
+/// The outer syscall boundary has saved the entering MXCSR/x87 control word,
+/// declares all FP/vector data caller-clobbered, and sanitizes that data and
+/// restores those controls before *either* user-return route. No wide-SIMD
+/// section may span an admitted IPC lane suspension. Interrupt/ordinary
+/// scheduler transitions must continue to save and restore the full image.
+pub unsafe fn begin_ipc_register_simd() -> IpcRegisterSimdGuard {
+    irq_excluded(|| {
+        let slot = crate::multitask::cpu_local::current_cpu_task_slot()
+            .expect("register IPC SIMD entry lacks current task");
+        let task_id = live_identity(slot, false);
+        SIMD_STATES[slot].with(|image| set_register_ipc(image, task_id, true));
+        IpcRegisterSimdGuard {
+            slot,
+            task_id,
+            _not_send: core::marker::PhantomData,
+        }
+    })
+}
 
 fn irq_excluded<R>(f: impl FnOnce() -> R) -> R {
     #[cfg(not(test))]
@@ -102,6 +157,7 @@ pub(crate) fn reset_before_publication() {
     for state in &SIMD_STATES {
         state.with(|image| {
             image.state = SimdState::new();
+            image.register_ipc = false;
             image.task_id = None;
         });
     }
@@ -195,10 +251,15 @@ pub(crate) fn restore_simd_state(slot: usize) {
 pub(crate) unsafe fn save_simd_state_lane(slot: usize, task_id: u64) {
     // SAFETY: caller contract; the bank excludes every other accessor.
     let image = unsafe { &mut *SIMD_STATES[slot].image.get() };
-    debug_assert!(image.task_id == Some(task_id), "lane SIMD image names another task");
+    debug_assert!(
+        image.task_id == Some(task_id),
+        "lane SIMD image names another task"
+    );
     let _ = task_id;
     // SAFETY: the area is the slot's own image and IRQs are masked.
-    unsafe { save_state(&mut image.state) };
+    if !image.register_ipc {
+        unsafe { save_state(&mut image.state) };
+    }
 }
 /// # Safety
 /// As [`save_simd_state_lane`].
@@ -207,10 +268,15 @@ pub(crate) unsafe fn save_simd_state_lane(slot: usize, task_id: u64) {
 pub(crate) unsafe fn restore_simd_state_lane(slot: usize, task_id: u64) {
     // SAFETY: caller contract; the bank excludes every other accessor.
     let image = unsafe { &mut *SIMD_STATES[slot].image.get() };
-    debug_assert!(image.task_id == Some(task_id), "lane SIMD image names another task");
+    debug_assert!(
+        image.task_id == Some(task_id),
+        "lane SIMD image names another task"
+    );
     let _ = task_id;
     // SAFETY: the area is the slot's own image and IRQs are masked.
-    unsafe { restore_state(&image.state) };
+    if !image.register_ipc {
+        unsafe { restore_state(&image.state) };
+    }
 }
 
 #[cfg(test)]

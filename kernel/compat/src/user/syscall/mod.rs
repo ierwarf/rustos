@@ -129,6 +129,44 @@ const SYSCALL_ENTRY_STACK_BYTES: usize =
     (SYSCALL_SCHEDULE_CONTEXT_OFFSET + kernel_hal::api::SAVED_CONTEXT_BYTES + 15) & !15;
 const _: [(); 432] = [(); SYSCALL_ENTRY_STACK_BYTES];
 
+// Outside the normalized SavedContext suffix: never overwritten by HAL.
+#[repr(C)]
+struct RegisterIpcBoundary {
+    active: u64,
+    mxcsr: u32,
+    control_word: u16,
+    // The trailing two bytes are C-layout padding, not an uninitialized Rust
+    // integer field: the assembly initializes only the three values above.
+}
+const _: [(); 16] = [(); core::mem::size_of::<RegisterIpcBoundary>()];
+const _: [(); 8] = [(); core::mem::offset_of!(RegisterIpcBoundary, mxcsr)];
+const _: [(); 12] = [(); core::mem::offset_of!(RegisterIpcBoundary, control_word)];
+
+unsafe fn register_ipc_boundary(frame: *mut SyscallFrame) -> *mut RegisterIpcBoundary {
+    unsafe { frame.cast::<u8>().add(SYSCALL_ENTRY_STACK_BYTES).cast() }
+}
+
+/// Finalize before the nonreturning saved-user-context route. Its generic
+/// scheduler capture must see this task's controls and no foreign FP data.
+#[inline(never)]
+unsafe fn finish_register_ipc_return(frame: *mut SyscallFrame) {
+    let boundary = unsafe { &mut *register_ipc_boundary(frame) };
+    unsafe {
+        // The IRET leaf restores the explicit XMM image, not just hardware.
+        frame
+            .cast::<u8>()
+            .add(core::mem::size_of::<SyscallFrame>())
+            .write_bytes(0, 256);
+        kernel_hal::api::arch::simd::clear_ipc_registers();
+        core::arch::asm!(
+            "ldmxcsr [{mxcsr}]", "fldcw [{cw}]",
+            mxcsr = in(reg) &boundary.mxcsr, cw = in(reg) &boundary.control_word,
+            options(nostack, readonly),
+        );
+    }
+    boundary.active = 0;
+}
+
 pub use syscall_core::{
     activate_linux_compat_cpu_local, linux_compat_current_task_offset,
     linux_compat_stack_guard_offset, prepare_for_context_return, set_kernel_stack_top,
@@ -147,23 +185,35 @@ global_asm!(
         # or independently initialized CPU-local value cannot turn an ordinary
         # aligned Rust load/store into #GP.
         and rsp, -16
-        # Preserve every architectural XMM register before the first Rust
-        # instruction. This is the whole of the syscall path's FPU custody:
-        # xmm0-xmm15 are the only registers ordinary kernel code can disturb.
+        # Ordinary syscalls preserve every architectural XMM register before
+        # Rust. Only the opt-in Linux register IPC ABI may discard FP data;
+        # its immutable entry marker and controls live beyond SavedContext.
         #
-        # x87 and MXCSR are not saved because nothing writes them -- verified on
-        # the linked image by `tools/xtask/src/build/nucleus_audit.rs`, which
-        # fails the build on any x87 or floating-point arithmetic instruction.
+        # Outside the named register-IPC custody boundary, nothing writes x87
+        # or MXCSR -- verified on the linked image by
+        # `tools/xtask/src/build/nucleus_audit.rs`. General x87/FP arithmetic
+        # remains forbidden; register IPC saves and restores its own controls.
         # The ymm upper halves are not saved because the only kernel code that
         # touches them brackets itself with `kernel_hal::arch::simd`'s
         # `wide_simd_section`, which the same audit enforces.
         #
-        # The complete 432-byte allocation contains either the ordinary
+        # The complete frame plus 16-byte boundary contains either the ordinary
         # SYSRET image or one normalized SavedContext, while preserving
         # call-site alignment so Rust enters with rsp % 16 == 8 as required
         # by the x86_64 SysV ABI.
         sub rsp, {stack_bytes}
-
+        mov qword ptr [rsp + {boundary_offset}], 0
+        cmp qword ptr gs:[{register_abi_offset}], 1
+        jne 2f
+        cmp rax, 0x52550052
+        jb 2f
+        cmp rax, 0x52550055
+        ja 2f
+        mov qword ptr [rsp + {boundary_offset}], 1
+        stmxcsr [rsp + {boundary_offset} + 8]
+        fnstcw [rsp + {boundary_offset} + 12]
+        jmp 3f
+    2:
         # SIMD-ENTRY-SAVE-BEGIN
         movdqu [rsp + {frame_bytes} + 0x00], xmm0
         movdqu [rsp + {frame_bytes} + 0x10], xmm1
@@ -182,7 +232,7 @@ global_asm!(
         movdqu [rsp + {frame_bytes} + 0xE0], xmm14
         movdqu [rsp + {frame_bytes} + 0xF0], xmm15
         # SIMD-ENTRY-SAVE-END
-
+    3:
         mov [rsp + 8], rax
         mov rax, gs:[8]
         mov [rsp + 0], rax
@@ -210,6 +260,13 @@ global_asm!(
         call syscall_dispatch
         cli
 
+        cmp qword ptr [rsp + {boundary_offset}], 0
+        je 4f
+        call {clear_ipc_registers}
+        ldmxcsr [rsp + {boundary_offset} + 8]
+        fldcw [rsp + {boundary_offset} + 12]
+        jmp 5f
+    4:
         # SIMD-ENTRY-RESTORE-BEGIN
         movdqu xmm0, [rsp + {frame_bytes} + 0x00]
         movdqu xmm1, [rsp + {frame_bytes} + 0x10]
@@ -228,7 +285,7 @@ global_asm!(
         movdqu xmm14, [rsp + {frame_bytes} + 0xE0]
         movdqu xmm15, [rsp + {frame_bytes} + 0xF0]
         # SIMD-ENTRY-RESTORE-END
-
+    5:
         mov rdi, [rsp + 48]
         mov rsi, [rsp + 40]
         mov rdx, [rsp + 32]
@@ -250,7 +307,10 @@ global_asm!(
     .size syscall_entry, . - syscall_entry
  "#,
     frame_bytes = const core::mem::size_of::<SyscallFrame>(),
-    stack_bytes = const SYSCALL_ENTRY_STACK_BYTES,
+    stack_bytes = const SYSCALL_ENTRY_STACK_BYTES + core::mem::size_of::<RegisterIpcBoundary>(),
+    boundary_offset = const SYSCALL_ENTRY_STACK_BYTES,
+    register_abi_offset = const syscall_core::register_ipc_abi_offset(),
+    clear_ipc_registers = sym kernel_hal::api::arch::simd::clear_ipc_registers,
 );
 
 pub fn init() {
@@ -283,6 +343,20 @@ extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> u64 {
     let frame = unsafe { &mut *frame };
     let phase = syscall_profile::now();
     let abi = validate_syscall_entry_or_terminate(frame);
+    // The assembly gate, not mutable RAX (signals/results may replace it),
+    // determines custody for the whole continuation, including signal IPC.
+    let register_ipc = unsafe { (*register_ipc_boundary(frame)).active != 0 };
+    assert_eq!(
+        register_ipc,
+        register_ipc_entry_expected(abi, frame.rax),
+        "syscall entry ABI selector is not the installed task's ABI"
+    );
+    let simd_guard = if register_ipc {
+        // SAFETY: entry saved controls; both return routes sanitize below.
+        Some(unsafe { multitask::begin_ipc_register_simd() })
+    } else {
+        None
+    };
     let phase = syscall_profile::charge(syscall_profile::SyscallPhase::Validate, phase);
     trace_syscall_entry(frame, abi);
     let phase = syscall_profile::charge(syscall_profile::SyscallPhase::Trace, phase);
@@ -298,6 +372,13 @@ extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> u64 {
     syscall_profile::charge(syscall_profile::SyscallPhase::Trace, phase);
     frame.rax = result;
     if schedule_user_return {
+        // Nonreturning path: finalize while masked BEFORE the generic save,
+        // and retire the task marker rather than abandoning a live guard.
+        x86_64::instructions::interrupts::disable();
+        if register_ipc {
+            unsafe { finish_register_ipc_return(frame) };
+        }
+        drop(simd_guard);
         // The captured user image stays in this task's kernel stack: the
         // scheduler consumes the existing frame instead of copying SIMD state
         // into a manufactured software-interrupt continuation.
@@ -316,6 +397,21 @@ extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> u64 {
         }
     }
     result
+}
+
+fn register_ipc_entry_expected(abi: UserAbi, operation: u64) -> bool {
+    use rustos_user_abi::syscall::{
+        SYS_RUSTOS_IPC_REGISTER_CALL, SYS_RUSTOS_IPC_REGISTER_RECV, SYS_RUSTOS_IPC_REGISTER_REPLY,
+        SYS_RUSTOS_IPC_REGISTER_REPLY_RECV,
+    };
+    abi == UserAbi::Linux
+        && matches!(
+            operation,
+            SYS_RUSTOS_IPC_REGISTER_CALL
+                | SYS_RUSTOS_IPC_REGISTER_RECV
+                | SYS_RUSTOS_IPC_REGISTER_REPLY_RECV
+                | SYS_RUSTOS_IPC_REGISTER_REPLY
+        )
 }
 
 fn dispatch_syscall(frame: &mut SyscallFrame, abi: UserAbi) -> u64 {
@@ -484,8 +580,8 @@ fn trace_syscall_exit(_frame: &SyscallFrame, _abi: UserAbi, _result: u64) {}
 #[cfg(test)]
 mod tests {
     use super::{
-        SyscallFrame, syscall_return_contract, user_address_is_sysret_safe,
-        user_rflags_are_sysret_safe,
+        SyscallFrame, UserAbi, register_ipc_entry_expected, syscall_return_contract,
+        user_address_is_sysret_safe, user_rflags_are_sysret_safe,
     };
     use crate::memory::paging;
     fn valid_frame() -> SyscallFrame {
@@ -589,6 +685,54 @@ mod tests {
         assert_eq!(restore.matches("movdqu xmm").count(), 16);
         assert!(save_begin < dispatch);
         assert!(dispatch < restore_begin);
+    }
+
+    #[test]
+    fn register_ipc_entry_elision_requires_exact_linux_operation() {
+        for operation in 0x52550052..=0x52550055 {
+            assert!(register_ipc_entry_expected(UserAbi::Linux, operation));
+            assert!(!register_ipc_entry_expected(UserAbi::Windows, operation));
+        }
+        for operation in [0, 39, 0x52550051, 0x52550056, u64::MAX] {
+            assert!(!register_ipc_entry_expected(UserAbi::Linux, operation));
+        }
+    }
+
+    #[test]
+    fn register_ipc_finalizes_before_both_user_return_routes() {
+        let source = include_str!("mod.rs");
+        let stub = source.split("syscall_entry:").nth(1).unwrap();
+        let gate = stub.split("# SIMD-ENTRY-SAVE-BEGIN").next().unwrap();
+        assert!(gate.contains("gs:[{register_abi_offset}]"));
+        assert!(gate.contains("jmp 3f"));
+        assert!(source.contains("register_ipc_entry_expected(abi, frame.rax)"));
+        assert!(gate.contains("cmp rax, 0x52550052"));
+        assert!(gate.contains("cmp rax, 0x52550055"));
+        assert!(gate.contains("stmxcsr"));
+        assert!(gate.contains("fnstcw"));
+        let epilogue = stub.split("call syscall_dispatch").nth(1).unwrap();
+        assert!(
+            epilogue.find("cli").unwrap() < epilogue.find("call {clear_ipc_registers}").unwrap()
+        );
+        assert!(epilogue.contains("ldmxcsr [rsp + {boundary_offset} + 8]"));
+        assert!(epilogue.contains("fldcw [rsp + {boundary_offset} + 12]"));
+        let tail = source.split("if schedule_user_return {").nth(1).unwrap();
+        let finalize = tail.find("finish_register_ipc_return(frame)").unwrap();
+        let publish = tail.find("dispatch_saved_syscall_user_context(").unwrap();
+        assert!(tail.find("interrupts::disable()").unwrap() < finalize);
+        assert!(finalize < tail.find("drop(simd_guard)").unwrap());
+        assert!(tail.find("drop(simd_guard)").unwrap() < publish);
+        let finalize = source
+            .split("unsafe fn finish_register_ipc_return(")
+            .nth(1)
+            .unwrap();
+        assert!(
+            finalize
+                .split("global_asm!")
+                .next()
+                .unwrap()
+                .contains("write_bytes(0, 256)")
+        );
     }
 
     #[test]

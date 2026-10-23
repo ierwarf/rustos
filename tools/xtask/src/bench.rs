@@ -810,7 +810,9 @@ pub(crate) fn bench(
     // end marker is what bounds the run: a guest that never finished must not
     // fall through to parsing a stale log.
     let core_suite = isolate_probe.filter(|name| core_paths::contract::is_suite(name));
-    let core_capture = core_suite.map(|suite| core_paths::Capture::begin(config, suite, rustos_vcpus)).transpose()?;
+    // Bind ordinary isolated IPC A/B runs to the same source/linked/staged ELF
+    // evidence as core suites. Keep the ordinary IPC timeout and acceptance.
+    let core_capture = isolate_probe.map(|probe| core_paths::Capture::begin(config, probe, rustos_vcpus)).transpose()?;
     // Multi-workload collection is diagnostic, not a relaxed product boot gate.
     // Ordinary isolated/IPC acceptance retains its existing readiness budget.
     let timeout_seconds = if core_suite.is_some() { 120 }

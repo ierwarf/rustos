@@ -30,12 +30,17 @@ const CPU_LOCAL_EMPTY: u8 = 0;
 const CPU_LOCAL_BUILDING: u8 = 1;
 const CPU_LOCAL_LIVE: u8 = 2;
 
-#[repr(C, align(16))]
+// Every syscall writes user_rsp and every IPC handoff writes stack_top. Do
+// not let independent CPUs bounce the same cache line through adjacent slots.
+#[repr(C, align(64))]
 struct SyscallCpuLocal {
     kernel_stack_top: u64,
     user_rsp: u64,
     linux_compat_current_task: u64,
     linux_compat_stack_guard: u64,
+    // Installed with the same exact-task kernel stack, not a task pointer or
+    // authority hint. Only the assembly ABI selector consumes this word.
+    register_ipc_abi: u64,
 }
 
 #[repr(align(16))]
@@ -64,6 +69,7 @@ static SYSCALL_CPU_LOCALS: [SyscallCpuLocalMemory; MAX_SUPPORTED_CPUS] = [const 
         user_rsp: 0,
         linux_compat_current_task: 0,
         linux_compat_stack_guard: 0,
+        register_ipc_abi: 0,
     }))
 }; MAX_SUPPORTED_CPUS];
 static SYSCALL_BOOTSTRAP_STACKS: [SyscallBootstrapStackMemory; MAX_SUPPORTED_CPUS] = [const {
@@ -110,6 +116,7 @@ pub fn init_cpu_local() {
             user_rsp: 0,
             linux_compat_current_task: 0,
             linux_compat_stack_guard: 0,
+            register_ipc_abi: 0,
         });
     }
     // ORDERING: all record and stack-address initialization happens-before an
@@ -157,7 +164,11 @@ pub const fn linux_compat_stack_guard_offset() -> usize {
     core::mem::offset_of!(SyscallCpuLocal, linux_compat_stack_guard)
 }
 
-pub fn set_kernel_stack_top(kernel_stack_top: u64) {
+pub const fn register_ipc_abi_offset() -> usize {
+    core::mem::offset_of!(SyscallCpuLocal, register_ipc_abi)
+}
+
+pub fn set_kernel_stack_top(kernel_stack_top: u64, register_ipc: bool) {
     assert_ne!(
         kernel_stack_top, 0,
         "syscall entry kernel stack top must be non-zero"
@@ -169,8 +180,13 @@ pub fn set_kernel_stack_top(kernel_stack_top: u64) {
     );
 
     with_current_cpu_local_mut(|local| {
-        local.kernel_stack_top = kernel_stack_top;
+        install_stack_and_abi(local, kernel_stack_top, register_ipc)
     });
+}
+
+fn install_stack_and_abi(local: &mut SyscallCpuLocal, kernel_stack_top: u64, register_ipc: bool) {
+    local.kernel_stack_top = kernel_stack_top;
+    local.register_ipc_abi = u64::from(register_ipc);
 }
 
 pub fn prepare_for_context_return(returning_to_user: bool, user_gs_base: u64) {
@@ -238,6 +254,28 @@ mod tests {
     };
 
     #[test]
+    fn syscall_abi_selector_is_installed_and_reset_with_the_original_stack() {
+        let mut local = SyscallCpuLocal {
+            kernel_stack_top: 0,
+            user_rsp: 0,
+            linux_compat_current_task: 0,
+            linux_compat_stack_guard: 0,
+            register_ipc_abi: 0,
+        };
+        super::install_stack_and_abi(&mut local, 0x1000, true);
+        assert_eq!(
+            (local.kernel_stack_top, local.register_ipc_abi),
+            (0x1000, 1)
+        );
+        assert_eq!(local.linux_compat_current_task, 0); // not the selector
+        super::install_stack_and_abi(&mut local, 0x2000, false);
+        assert_eq!(
+            (local.kernel_stack_top, local.register_ipc_abi),
+            (0x2000, 0)
+        );
+    }
+
+    #[test]
     fn cpu_local_records_and_bootstrap_stacks_are_aligned_and_disjoint() {
         assert_eq!(core::mem::offset_of!(SyscallCpuLocal, kernel_stack_top), 0);
         assert_eq!(core::mem::offset_of!(SyscallCpuLocal, user_rsp), 8);
@@ -250,12 +288,14 @@ mod tests {
             0x18
         );
 
+        assert_eq!(super::register_ipc_abi_offset(), 0x20);
         let mut locals = [0_usize; MAX_SUPPORTED_CPUS];
         let mut stacks = [0_usize; MAX_SUPPORTED_CPUS];
         for cpu in 0..MAX_SUPPORTED_CPUS {
             locals[cpu] = SYSCALL_CPU_LOCALS[cpu].0.get() as usize;
             stacks[cpu] = SYSCALL_BOOTSTRAP_STACKS[cpu].0.get() as usize;
-            assert_eq!(locals[cpu] & 0xf, 0);
+            assert_eq!(locals[cpu] & 0x3f, 0);
+            assert!(locals[..cpu].iter().all(|&p| p / 64 != locals[cpu] / 64));
             assert_eq!(stacks[cpu] & 0xf, 0);
             assert!(!locals[..cpu].contains(&locals[cpu]));
             assert!(!stacks[..cpu].contains(&stacks[cpu]));
