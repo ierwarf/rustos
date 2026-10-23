@@ -10,6 +10,7 @@ failure output as the primary debugging context.
 | `cargo xtask verify` | **run the whole local pipeline as one command**: layering/manifest check, full build, host tests, formal selftest, then the `pr` seal - in that order, stopping at the first failure. Quiet on success: one line per stage with `elapsed_seconds`. A failing stage prints its stage name, exact rerun command, first relevant diagnostic, at most 120 trailing lines, and the full captured log at `build/verify/<stage>.log` | `target/`, `build/`, `build/formal/`, `build/verify/` on failure | whichever stage failed, named in its own bounded output |
 | `cargo xtask verify --gate [--repeat N] [--rustos-vcpus N] [--min-ui-fps N]` | the same pipeline and then the acceptance boot lane, defaulting to 4 boots at 8 vCPUs with a 60 fps floor. The seal is always the stage immediately before the boots, because a seal binds the source tree and any edit after it invalidates it | as above plus `build/kvm/` | as above, plus the per-run boot failures `kvm-smoke` names |
 | `cargo xtask dev-plan` | classify all tracked and untracked changes into fast `now` checks and one-time `stable-batch` gates | none | non-UTF-8 path or unavailable Git worktree |
+| `cargo xtask formal-contracts test [PATH ...]` | run impacted native witnesses once per exact package/feature selection; each requested pass line and the executed count are mandatory; no paths means current worktree impact | `target/` | missing, ignored, failed or excess witnesses, unmapped high-risk source, or compiler failure |
 | `cargo xtask check` | validate layering/manifests/workspace | `target/` | dependency layer violation, bad manifest, missing target |
 | `cargo xtask check --timings` | run the same check and print deterministic phase timings | `target/` | same as `check`; the slow phase identifies the next optimization target |
 | `cargo xtask build` | full OS build + stage | `target/`, `build/` | compile error, missing firmware/artifact, manifest staging error |
@@ -260,7 +261,15 @@ pass deliberately pruned every firmware file outside the sealed profile.
 edit-loop set. `stable-batch` is ordered and should run once after the related
 source/config set settles. Override TLC parallelism only for diagnosis with
 `TLC_WORKERS=<positive integer>`; `TLC_WORKERS=1` is the serial reproducibility
-fallback.
+fallback. Impacted TLC models may reuse a recent exact closed-input individual
+proof; a miss always falls back to the full model, not a partial result. This
+does not change PR/SMP/nightly model selection or seal requirements. Native
+witnesses are batched only within a package/feature pair, preserving feature
+resolution; `kernel-ps` architecture fixtures remain serialized.
+
+`RUSTOS_KVM_TIMINGS=1 cargo xtask kvm-smoke ...` prints opt-in host preparation,
+probe and evidence timestamps. These include file hashing and must not be
+reported as guest boot latency. Guest milestones remain a separate clock.
 
 ## KVM smoke arguments
 

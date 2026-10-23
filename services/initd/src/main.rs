@@ -121,6 +121,20 @@ struct RetryState {
     failures: u32,
 }
 
+impl RetryState {
+    fn note_spawned(&mut self, now: Instant) {
+        // Creation/endpoint publication is not evidence of sustained health.
+        // Keep the supervisor-lifetime failure budget across replacements.
+        self.next_attempt = now;
+    }
+
+    fn note_failure(&mut self, now: Instant) -> bool {
+        self.failures = self.failures.saturating_add(1);
+        self.next_attempt = now + RETRY_BACKOFF;
+        self.failures >= INITD_LAUNCH_MAX_FAILURES
+    }
+}
+
 fn main() {
     boot_line("initd: main enter");
     if let Err(errno) = publish_init_identity() {
@@ -285,7 +299,9 @@ fn main() {
                         },
                     );
                     spawned_packages.insert(entry.package_id.clone());
-                    retry_state.remove(entry.exec.as_str());
+                    if let Some(retry) = retry_state.get_mut(entry.exec.as_str()) {
+                        retry.note_spawned(Instant::now());
+                    }
                     pending_activations.push(pid);
                     if let Err(err) = report_rootd_service_lease(entry.exec.as_str(), pid) {
                         fail_closed_after_children_cleanup(
@@ -911,14 +927,12 @@ fn record_launch_failure(
             next_attempt: Instant::now(),
             failures: 0,
         });
-    state.failures = state.failures.saturating_add(1);
-    if state.failures >= INITD_LAUNCH_MAX_FAILURES {
+    if state.note_failure(Instant::now()) {
         fail_closed(&format!(
             "initd: fatal launch failure exec={exec_path} reason={reason} status={status} failures={}",
             state.failures
         ));
     }
-    state.next_attempt = Instant::now() + RETRY_BACKOFF;
     observability_client::warn!(
         "initd",
         service,
@@ -1146,6 +1160,9 @@ fn boot_line(message: &str) {
     line.push(b'\n');
     observability_client::debug_bytes(&line);
 }
+
+#[cfg(test)]
+mod retry_tests;
 
 #[cfg(test)]
 mod tests {

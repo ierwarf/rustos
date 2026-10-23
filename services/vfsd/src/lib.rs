@@ -2,6 +2,9 @@
 
 extern crate alloc;
 
+mod snapshot_lease;
+pub use snapshot_lease::ExecutableSnapshotLease;
+
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
 use alloc::vec::Vec;

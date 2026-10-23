@@ -19,6 +19,18 @@ pub fn unmap_range_with<S, E>(
     Ok(())
 }
 
+/// A fixed replacement cannot roll back a completed unmap when the new map
+/// fails. Persist that hole before allowing the mapping continuation to run.
+pub fn persist_fixed_removal_with<S, E>(
+    state: &mut S,
+    unmap: impl FnOnce(&mut S) -> Result<(), E>,
+    save: impl FnOnce(&S),
+) -> Result<(), E> {
+    unmap(state)?;
+    save(state);
+    Ok(())
+}
+
 pub fn next_fit_with_wrap<T: AddressRange>(
     ranges: &[T],
     lower_bound: u64,
@@ -71,6 +83,40 @@ fn align_up(value: u64, alignment: u64) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn fixed_replacement_failure_leaves_the_completed_hole_saved() {
+        let mut live = [(0x4000_u64, 0x5000_u64)];
+        let mut policy = live;
+        let mut saved = live;
+        super::persist_fixed_removal_with(
+            &mut policy,
+            |state| super::unmap_range_with(
+                state, 0x4000, 0x5000,
+                |_, _| { live[0] = (0, 0); Ok::<(), i32>(()) },
+                |state, _, _| state[0] = (0, 0),
+            ),
+            |state| saved = *state,
+        ).unwrap();
+        let replacement: Result<(), i32> = Err(12); // Broker ENOMEM after unmap.
+        assert_eq!(replacement, Err(12));
+        assert_eq!(live, [(0, 0)]);
+        assert_eq!(saved, live, "the next request must reload the hole");
+        assert_eq!(saved[0], (0, 0), "the address is reusable");
+    }
+
+    #[test]
+    fn refused_fixed_removal_never_overwrites_saved_policy() {
+        let mut policy = [(0x4000_u64, 0x5000_u64)];
+        let before = policy;
+        let result = super::persist_fixed_removal_with(
+            &mut policy,
+            |_| Err(16),
+            |_| panic!("refused revocation saved policy"),
+        );
+        assert_eq!(result, Err(16));
+        assert_eq!(policy, before);
+    }
+
     #[test]
     fn sparse_munmap_is_one_transaction_and_commits_policy_only_on_success() {
         use super::unmap_range_with;

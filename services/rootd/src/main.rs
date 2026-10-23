@@ -216,6 +216,7 @@ pub extern "C" fn __rustos_rootd_start() -> ! {
         post_init_lease(POST_INIT_MANIFEST[5]),
     ];
     let mut service_checkpoints = ServiceCheckpointStore::new();
+    let mut next_core_readiness_poll_ns = 0;
 
     // The bootstrap manifest is the rootd-owned policy boundary for direct
     // early spawn, dependency readiness, restart fallback, and advertised
@@ -253,7 +254,7 @@ pub extern "C" fn __rustos_rootd_start() -> ! {
             &mut post_init_leases,
             &mut service_checkpoints,
         );
-        supervise_core_readiness(&mut leases);
+        supervise_core_readiness(&mut leases, &mut next_core_readiness_poll_ns);
         if !service_dependencies_ready(INITD_LEASE_INDEX) && served == 0 {
             wait_for_core_readiness_with(
                 || service_dependencies_ready(INITD_LEASE_INDEX),
@@ -299,6 +300,7 @@ pub extern "C" fn __rustos_rootd_start() -> ! {
             &mut post_init_leases,
             &mut service_checkpoints,
         );
+        supervise_core_readiness(&mut leases, &mut next_core_readiness_poll_ns);
         // The drain above is deliberately nonblocking. Once all ready
         // messages are consumed, this one wait is the idle boundary: a new
         // control message wakes rootd immediately, while the bounded budget
@@ -497,19 +499,44 @@ fn readiness_timeout_due(lease: &mut Lease, ready: bool) -> bool {
     false
 }
 
-fn supervise_core_readiness(leases: &mut [Lease]) {
+fn supervise_core_readiness(leases: &mut [Lease], next_poll_ns: &mut u64) {
+    supervise_core_readiness_with(
+        leases,
+        next_poll_ns,
+        rustos_svc_runtime::syscall::monotonic_nanos(),
+        service_ready,
+        |pid| {
+            terminate_service_process(pid)?;
+            debug_line(b"rootd: core service readiness timed out\n");
+            Ok(())
+        },
+    )
+    .unwrap_or_else(|_| fail_closed(b"rootd: fatal unready core-service cleanup rejected\n"));
+}
+
+fn supervise_core_readiness_with(
+    leases: &mut [Lease],
+    next_poll_ns: &mut u64,
+    now_ns: u64,
+    mut ready: impl FnMut(u64) -> bool,
+    mut terminate: impl FnMut(u64) -> Result<(), i32>,
+) -> Result<(), i32> {
+    if now_ns < *next_poll_ns {
+        return Ok(());
+    }
+    // Control traffic may wake rootd more often than the readiness cadence.
+    // Charge at most once per 250ms, without catching up missed polls against
+    // a newly spawned replacement's fresh budget.
+    *next_poll_ns = now_ns.saturating_add(u64::from(CORE_READINESS_POLL_INTERVAL_MS) * 1_000_000);
     for lease in leases.iter_mut().take(INITD_LEASE_INDEX) {
-        let ready = service_ready(lease.service_id);
-        if !readiness_timeout_due(lease, ready) {
+        if !readiness_timeout_due(lease, ready(lease.service_id)) {
             continue;
         }
-        if terminate_service_process(lease.pid).is_err() {
-            fail_closed(b"rootd: fatal unready core-service cleanup rejected\n");
-        }
+        terminate(lease.pid)?;
         lease.state = ROOTD_LEASE_STATE_EXITED;
         lease.exit_status = -110;
-        debug_line(b"rootd: core service readiness timed out\n");
     }
+    Ok(())
 }
 
 fn service_dependencies_ready(index: usize) -> bool {
@@ -2476,6 +2503,19 @@ mod tests {
     }
 
     #[test]
+    fn post_init_supervisor_keeps_core_readiness_on_the_shared_cadence() {
+        let source = include_str!("main.rs");
+        let steady_state = source
+            .split("debug_line(b\"rootd: initd spawned")
+            .nth(1)
+            .and_then(|rest| rest.split("\nfn lease(").next())
+            .expect("rootd steady-state supervisor loop");
+        assert!(steady_state.contains(
+            "supervise_core_readiness(&mut leases, &mut next_core_readiness_poll_ns);"
+        ));
+    }
+
+    #[test]
     fn loader_worker_result_is_fail_closed_and_preserves_errno() {
         assert_eq!(decode_loader_worker_result(41), Ok(41));
         assert_eq!(decode_loader_worker_result(-11), Err(11));
@@ -2926,6 +2966,170 @@ mod tests {
         });
         assert_eq!(elapsed, CORE_READINESS_POLL_INTERVAL_MS);
         assert_eq!(u64::from(elapsed) * u64::from(CORE_READINESS_POLL_MAX), 5_000);
+    }
+
+    #[test]
+    fn postbootstrap_core_replacement_times_out_on_cadence_and_retires_exact_pid() {
+        let mut leases = BOOTSTRAP_MANIFEST.map(lease);
+        for (index, lease) in leases.iter_mut().enumerate() {
+            lease.pid = 100 + index as u64;
+            lease.state = ROOTD_LEASE_STATE_RUNNING;
+        }
+        // initd is alive: this is replacement supervision, not bootstrap.
+        let replacement = 2;
+        leases[replacement].pid = 777;
+        leases[replacement].restart_budget = 2;
+        let missing_endpoint = leases[replacement].service_id;
+        let start_ns = 10_000_000_000;
+        let mut next_poll_ns = start_ns;
+        let deadline_ms = CORE_READINESS_POLL_INTERVAL_MS * CORE_READINESS_POLL_MAX;
+        assert_eq!(deadline_ms, 5_000);
+
+        // Even a control wake every millisecond must not shorten the budget.
+        for elapsed_ms in 0..deadline_ms {
+            assert_eq!(
+                supervise_core_readiness_with(
+                    &mut leases,
+                    &mut next_poll_ns,
+                    start_ns + u64::from(elapsed_ms) * 1_000_000,
+                    |service_id| service_id != missing_endpoint,
+                    |_| panic!("replacement terminated before its readiness deadline"),
+                ),
+                Ok(())
+            );
+            assert_eq!(leases[replacement].state, ROOTD_LEASE_STATE_RUNNING);
+            assert_eq!(
+                leases[replacement].readiness_polls_remaining,
+                CORE_READINESS_POLL_MAX - (elapsed_ms / CORE_READINESS_POLL_INTERVAL_MS + 1),
+            );
+        }
+        let mut terminated = alloc::vec::Vec::new();
+        assert_eq!(
+            supervise_core_readiness_with(
+                &mut leases,
+                &mut next_poll_ns,
+                start_ns + u64::from(deadline_ms) * 1_000_000,
+                |service_id| service_id != missing_endpoint,
+                |pid| {
+                    terminated.push(pid);
+                    Ok(())
+                },
+            ),
+            Ok(())
+        );
+        assert_eq!(terminated, [777]);
+        let retired = &leases[replacement];
+        assert_eq!(retired.pid, 777);
+        assert_eq!(retired.state, ROOTD_LEASE_STATE_EXITED);
+        assert_eq!(retired.exit_status, -110);
+        // restart_failed_leases admits EXITED leases with remaining budget,
+        // preserving its existing backoff before the next spawn attempt.
+        assert_eq!(retired.restart_budget, 2);
+        assert!(leases.iter().enumerate().all(|(index, lease)| {
+            index == replacement
+                || (lease.pid == 100 + index as u64
+                    && lease.state == ROOTD_LEASE_STATE_RUNNING
+                    && lease.exit_status == 0)
+        }));
+        assert_eq!(
+            supervise_core_readiness_with(
+                &mut leases,
+                &mut next_poll_ns,
+                start_ns + u64::from(deadline_ms + CORE_READINESS_POLL_INTERVAL_MS) * 1_000_000,
+                |service_id| service_id != missing_endpoint,
+                |_| panic!("retired replacement must not be terminated twice"),
+            ),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn postbootstrap_core_readiness_preserves_published_endpoints_at_deadline() {
+        let mut leases = BOOTSTRAP_MANIFEST.map(lease);
+        for (index, lease) in leases.iter_mut().enumerate() {
+            lease.pid = 200 + index as u64;
+            lease.state = ROOTD_LEASE_STATE_RUNNING;
+            lease.readiness_polls_remaining = 0;
+        }
+        let mut next_poll_ns = 0;
+        for poll in 0..=CORE_READINESS_POLL_MAX {
+            assert_eq!(
+                supervise_core_readiness_with(
+                    &mut leases,
+                    &mut next_poll_ns,
+                    u64::from(poll * CORE_READINESS_POLL_INTERVAL_MS) * 1_000_000,
+                    |service_id| {
+                        assert_ne!(service_id, INITD_LEASE_ID);
+                        true
+                    },
+                    |_| panic!("published endpoints must preserve healthy processes"),
+                ),
+                Ok(())
+            );
+        }
+        for (index, lease) in leases.iter().enumerate() {
+            assert_eq!(lease.pid, 200 + index as u64);
+            assert_eq!(lease.state, ROOTD_LEASE_STATE_RUNNING);
+            assert_eq!(lease.exit_status, 0);
+            assert_eq!(lease.restart_budget, 3);
+            assert_eq!(
+                lease.readiness_polls_remaining,
+                if index == INITD_LEASE_INDEX {
+                    0
+                } else {
+                    CORE_READINESS_POLL_MAX
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn core_readiness_does_not_catch_up_missed_polls_against_a_replacement() {
+        let mut replacement = [lease(BOOTSTRAP_MANIFEST[0])];
+        replacement[0].pid = 301;
+        replacement[0].state = ROOTD_LEASE_STATE_RUNNING;
+        let mut next_poll_ns = 250_000_000;
+        for now_ns in [60_000_000_000, 60_000_000_000, 59_000_000_000] {
+            assert_eq!(
+                supervise_core_readiness_with(
+                    &mut replacement,
+                    &mut next_poll_ns,
+                    now_ns,
+                    |_| false,
+                    |_| panic!("a delayed supervisor turn must not spend a fresh budget"),
+                ),
+                Ok(())
+            );
+            assert_eq!(
+                replacement[0].readiness_polls_remaining,
+                CORE_READINESS_POLL_MAX - 1
+            );
+        }
+    }
+
+    #[test]
+    fn core_readiness_cleanup_rejection_does_not_admit_restart() {
+        let mut replacement = [lease(BOOTSTRAP_MANIFEST[0])];
+        replacement[0].pid = 401;
+        replacement[0].state = ROOTD_LEASE_STATE_RUNNING;
+        replacement[0].readiness_polls_remaining = 0;
+        assert_eq!(
+            supervise_core_readiness_with(
+                &mut replacement,
+                &mut 0,
+                0,
+                |_| false,
+                |pid| {
+                    assert_eq!(pid, 401);
+                    Err(5)
+                },
+            ),
+            Err(5)
+        );
+        assert_eq!(replacement[0].pid, 401);
+        assert_eq!(replacement[0].state, ROOTD_LEASE_STATE_RUNNING);
+        assert_eq!(replacement[0].exit_status, 0);
+        assert_eq!(replacement[0].restart_budget, 3);
     }
 
     #[test]

@@ -6,7 +6,32 @@ owners, and fresh validation. Root `AGENTS.md` is the only stable prompt
 prefix. This page does not authorize reusing stale evidence, speculative
 changes, or old uncommitted-work claims.
 
-## Current continuation — lifecycle stabilization (in progress)
+## Current continuation — Ring3 service maturity (in progress)
+
+Baseline `d252dc5e`, initially clean. User redirected work away from benchmark
+chasing toward Ring3 correctness and failed-path completion. Critical-path
+source audits covered all 14 services; scope and unverified boundaries are in
+`docs/ai/ring3-service-maturity.md`. Eight fixes are integrated: per-launch
+runtimed ACK/PID custody, initd failure-budget retention, postbootstrap rootd
+readiness supervision, vfsd snapshot fd leases/generation/size limits, syscalld
+failed fixed-replacement policy persistence, netd empty-request reply custody,
+storaged declared write extent, and ordered inputd session/reset batches.
+No kernel source or wire ABI edits. No new subsystem or performance-gain claim.
+
+The eight changed services' actual native suites passed 254 tests; additional
+loaderd/pagerd/sessiond/uiserver targets bring the total to 368. Devmgrd ran
+zero native tests and procd disables its binary target: neither counts as
+handler coverage. Independent source reviews are OK, including follow-up
+strengthening netd/storaged tests through their real receive/write-admission helpers.
+Integrated now lane passed 456 selected checks. The PR stable gate
+(`verify-all --profile pr`) and bounded 8-vCPU KVM smoke with SMP iteration,
+GUI DVM surfaces and input exercise passed. Logs use `/tmp/ring3-*`, including
+`ring3-now.log`, `ring3-stable-1.log` and `ring3-smoke.log`. No commit. Never infer readiness/saturation/recovery
+coverage from these native tests or treat procd's disabled binary tests as a
+handler suite. Vfsd cache accounting/optional cache refusal still lack direct
+native orchestration witnesses.
+
+## Historical continuation — lifecycle stabilization (in progress)
 
 Latest checkpoint (supersedes interim counts below): sparse/mixed munmap MM
 worker integrated from `/tmp/rustos-mm-unmap`; independent standalone MM review

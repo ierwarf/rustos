@@ -75,6 +75,14 @@ fi
 [[ "$fingerprint" =~ ^([0-9]|[1-9][0-9]|1[0-2][0-9]|130)$ ]] || { echo "TLC_FP must be 0..130" >&2; exit 2; }
 [[ "$seed" =~ ^[0-9]+$ ]] || { echo "TLC_SEED must be a non-negative integer" >&2; exit 2; }
 
+# Capture inputs before the tool reads them, then refuse a result if an edit
+# raced model checking. Individual-proof reuse additionally requires a closed
+# module context, bound by the cache helper on both sides of the invocation.
+spec_sha256_before="$(sha256sum "$spec" | awk '{print $1}')"
+config_sha256_before="$(sha256sum "$config" | awk '{print $1}')"
+individual_before="$(python3 "$formal_dir/tlc_cache.py" --root "$repo_root" \
+    --profile "$profile" --model "$model" --input-fingerprint 2>/dev/null)" || individual_before=""
+
 artifact_dir="${TLA_ARTIFACT_DIR:-$repo_root/build/formal/tlc/$profile/${model//\//__}}"
 mkdir -p "$artifact_dir"
 log="$artifact_dir/tlc.log"
@@ -143,8 +151,18 @@ generated="${generated:-0}"
 distinct="${distinct:-0}"
 depth="${depth:-0}"
 
+spec_sha256_after="$(sha256sum "$spec" | awk '{print $1}')"
+config_sha256_after="$(sha256sum "$config" | awk '{print $1}')"
+individual_after="$(python3 "$formal_dir/tlc_cache.py" --root "$repo_root" \
+    --profile "$profile" --model "$model" --input-fingerprint 2>/dev/null)" || individual_after=""
+
 status=passed
-if [[ "$result" -eq 124 ]]; then
+if [[ "$spec_sha256_before" != "$spec_sha256_after" ||
+      "$config_sha256_before" != "$config_sha256_after" ||
+      ( -n "$individual_before" && "$individual_before" != "$individual_after" ) ]]; then
+    status=input-changed
+    result=1
+elif [[ "$result" -eq 124 ]]; then
     status=timeout
 elif [[ "$result" -ne 0 ]]; then
     status=failed
@@ -160,8 +178,9 @@ jq -n \
     --arg status "$status" \
     --arg tool_version "$version" \
     --arg tool_sha256 "$sha256" \
-    --arg spec_sha256 "$(sha256sum "$spec" | awk '{print $1}')" \
-    --arg config_sha256 "$(sha256sum "$config" | awk '{print $1}')" \
+    --arg spec_sha256 "$spec_sha256_before" \
+    --arg config_sha256 "$config_sha256_before" \
+    --arg individual_input_sha256 "$individual_before" \
     --arg deadlock_policy "$deadlock_policy" \
     --arg workers "$workers" \
     --argjson fingerprint "$fingerprint" \
@@ -171,7 +190,7 @@ jq -n \
     --argjson depth "$depth" \
     --argjson covered_operators "$covered_operators" \
     --argjson exit_code "$result" \
-    '{schema:$schema,model:$model,profile:$profile,status:$status,tool:{name:"TLC",version:$tool_version,sha256:$tool_sha256},inputs:{spec_sha256:$spec_sha256,config_sha256:$config_sha256},policy:{deadlock:$deadlock_policy,workers:$workers,fingerprint:$fingerprint,seed:$seed},metrics:{generated:$generated,distinct:$distinct,depth:$depth,covered_operators:$covered_operators},exit_code:$exit_code}' > "$summary"
+    '{schema:$schema,model:$model,profile:$profile,status:$status,tool:{name:"TLC",version:$tool_version,sha256:$tool_sha256},inputs:{spec_sha256:$spec_sha256,config_sha256:$config_sha256,individual_input_sha256:$individual_input_sha256},policy:{deadlock:$deadlock_policy,workers:$workers,fingerprint:$fingerprint,seed:$seed},metrics:{generated:$generated,distinct:$distinct,depth:$depth,covered_operators:$covered_operators},exit_code:$exit_code}' > "$summary"
 
 if [[ "$result" -ne 0 ]]; then
     echo "TLC $status model=$model; tail follows" >&2

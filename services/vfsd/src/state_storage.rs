@@ -357,11 +357,14 @@ impl VfsStorage {
 
         self.invalidate_caches_if_remounted();
         if let Some(snapshot) = self.executable_snapshot_cache.get(path.as_str()).copied() {
-            return Ok(ExecutableSnapshotAdmission::Cached(ExecutableSnapshotOpen {
-                fd: snapshot.fd,
-                file_bytes: snapshot.file_bytes,
-                close_after_reply: false,
-            }));
+            return ExecutableSnapshotOpen::duplicate_cached(
+                snapshot.fd,
+                snapshot.file_bytes,
+                self.mount_generation,
+                request.max_bytes,
+                duplicate_snapshot_fd,
+                close_fd as fn(i32),
+            ).map(ExecutableSnapshotAdmission::Cached);
         }
 
         let metadata = self.metadata(path.as_str())?;
@@ -437,7 +440,23 @@ impl VfsStorage {
         }
         let path = plan.path.clone();
         let file_len = plan.file_len;
+        // Another worker may have published the same path while this plan
+        // read without storage ownership. Reuse that entry instead of leaking
+        // its descriptor and counting the same image twice.
+        if let Some(snapshot) = self.executable_snapshot_cache.get(path.as_str()).copied() {
+            return ExecutableSnapshotOpen::duplicate_cached(
+                snapshot.fd,
+                snapshot.file_bytes,
+                plan.mount_generation,
+                plan.metadata_len,
+                duplicate_snapshot_fd,
+                close_fd as fn(i32),
+            );
+        }
         let fd = create_terminally_sealed_snapshot(path.as_str(), bytes)?;
+        let snapshot = ExecutableSnapshotOpen::from_owned(
+            fd, plan.metadata_len, plan.mount_generation, close_fd as fn(i32),
+        );
         if plan.verbose {
             ipc::debug_line(
                 executable_snapshot_marker(
@@ -469,7 +488,6 @@ impl VfsStorage {
                         ..ProductExecutableSnapshotEvidence::default()
                     };
                     if ipc::product_executable_snapshot_evidence(&evidence) != 0 {
-                        close_fd(fd);
                         return Err(EIO);
                     }
                 }
@@ -477,12 +495,14 @@ impl VfsStorage {
         }
 
         if file_len > EXECUTABLE_SNAPSHOT_CACHE_BUDGET_BYTES {
-            return Ok(ExecutableSnapshotOpen {
-                fd,
-                file_bytes: plan.metadata_len,
-                close_after_reply: true,
-            });
+            return Ok(snapshot);
         }
+        // Cache admission is optional. The request still owns the original
+        // sealed fd if descriptor pressure refuses the separate cache handle.
+        let cache_fd = match duplicate_snapshot_fd(fd) {
+            Ok(fd) => fd,
+            Err(_) => return Ok(snapshot),
+        };
         if self
             .executable_snapshot_cache_bytes
             .checked_add(file_len)
@@ -497,16 +517,12 @@ impl VfsStorage {
         self.executable_snapshot_cache.insert(
             path,
             ExecutableSnapshot {
-                fd,
+                fd: cache_fd,
                 file_bytes: plan.metadata_len,
             },
         );
         self.executable_snapshot_cache_bytes += file_len;
-        Ok(ExecutableSnapshotOpen {
-            fd,
-            file_bytes: plan.metadata_len,
-            close_after_reply: false,
-        })
+        Ok(snapshot)
     }
 }
 

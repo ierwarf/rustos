@@ -287,104 +287,47 @@ fn serve_request_loop(endpoint: u64) {
                 )
             }
         };
-        if received < 0 {
-            // An expired budget already spent its wait, and the waiter it was
-            // protecting is due now. Backing off again would delay exactly the
-            // reply this budget existed to deliver.
-            if idle_budget_ms.is_some() && received == -(libc::EAGAIN as i64) {
-                continue;
-            }
-            thread::sleep(RECV_BACKOFF);
-            continue;
-        }
-        if received == 0 {
-            thread::sleep(RECV_BACKOFF);
-            continue;
-        }
-
-        if received as usize == size_of::<CommercialMaxProtocolRequest>() {
-            let commercial_request = unsafe {
-                &*((&request as *const NetdIpcRequest).cast::<CommercialMaxProtocolRequest>())
-            };
-            if commercial_request.header.version == COMMERCIAL_MAX_PROTOCOL_ABI_VERSION
-                && commercial_request.header.protocol == COMMERCIAL_MAX_PROTOCOL_NETD
-            {
-                let reply = if commercial_request.header.subject_pid == sender_pid
-                    && commercial_request.header.subject_tid == sender_tid
-                {
-                    reply_commercial_request(reply_cap, commercial_request)
-                } else {
-                    reply_commercial_error(reply_cap, commercial_request, libc::EACCES)
-                };
-                if reply < 0 {
-                    REPLY_FAILURE_DIAGNOSTICS.record("netd", "ipc", -reply);
+        match service_received_request_with(
+            ReceivedNetdRequest {
+                result: received,
+                request: &mut request,
+                reply_cap,
+                sender_pid,
+                sender_tid,
+            },
+            rustos_svc_runtime::syscall::monotonic_nanos,
+            dispatch_admitted_request,
+            reply_netd_response,
+        ) {
+            ReceiveTurn::Retry => {
+                // A bounded idle wait already spent its deadline; service its
+                // deferred waiter now rather than adding another backoff.
+                if idle_budget_ms.is_some() && received == -(libc::EAGAIN as i64) {
+                    continue;
                 }
-                continue;
+                thread::sleep(RECV_BACKOFF);
             }
-        }
-
-        let mut response = NetdIpcResponse {
-            version: NETD_IPC_ABI_VERSION,
-            op: request.op,
-            ..NetdIpcResponse::default()
-        };
-        response.status = match validate_request(received as usize, &request) {
-            Ok(()) if request.pid != sender_pid || request.tid != sender_tid => libc::EACCES,
-            Ok(()) => {
-                // Admission is the one point that derives a service class end
-                // from the caller's immutable wire end. Queued/retried work
-                // only consumes this stamped end; it may never refresh it.
-                if let Err(errno) = clamp_request_deadline_at(
-                    &mut request,
-                    rustos_svc_runtime::syscall::monotonic_nanos(),
-                ) {
-                    errno
-                } else if request.op == NETD_IPC_OP_DVM_SESSION {
-                    let status = handle_dvm_session(&request, sender_pid);
-                    if status != 0 {
-                        let _ = writeln!(
-                            std::io::stderr(),
-                            "netd: DVM session transition rejected status={status} epoch={} action={}",
-                            request.arg0,
-                            request.arg1
-                        );
-                    }
-                    status
-                } else if is_deferred_local_poll_request(&request) {
-                    let status = handle_poll_socket(&request, &mut response);
-                    if status == 0 && response.value == 0 {
-                        match defer_local_poll_request(request, reply_cap) {
-                            Ok(()) => continue,
-                            Err(errno) => errno,
-                        }
-                    } else {
-                        if status == 0 {
-                            response.reserved1 = NETD_IPC_RESPONSE_FLAG_LATENCY_HANDOFF;
-                        }
-                        status
-                    }
-                } else if is_blocking_request(&request) {
-                    match enqueue_blocking_request(request, reply_cap) {
-                        Ok(()) => continue,
-                        Err(errno) => errno,
-                    }
-                } else {
-                    let status = dispatch_request(&request, &mut response, reply_cap);
-                    if local_socket_reply_requests_latency_handoff(&request, &response, status) {
-                        response.reserved1 = NETD_IPC_RESPONSE_FLAG_LATENCY_HANDOFF;
-                    }
-                    status
+            ReceiveTurn::Deferred => continue,
+            ReceiveTurn::Replied { status, poll_after_reply } => {
+                if status < 0 {
+                    REPLY_FAILURE_DIAGNOSTICS.record("netd", "ipc", -status);
+                }
+                if poll_after_reply {
+                    service_local_poll_waiters();
                 }
             }
-            Err(errno) => errno,
-        };
-        let reply = reply_netd_response(reply_cap, &response);
-        if reply < 0 {
-            REPLY_FAILURE_DIAGNOSTICS.record("netd", "ipc", -reply);
         }
-        service_local_poll_waiters();
     }
 }
+
+mod receive_turn;
+use receive_turn::{
+    dispatch_admitted_request, service_received_request_with, ReceiveTurn, ReceivedNetdRequest,
+};
+
+#[cfg(test)]
+#[path = "tests/receive_custody_tests.rs"]
+mod receive_custody_tests;
 
 fn reply_netd_response(reply_cap: u64, response: &NetdIpcResponse) -> i64 {
     let Some(response_len) = NETD_IPC_RESPONSE_HEADER_SIZE

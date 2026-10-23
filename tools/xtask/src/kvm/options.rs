@@ -285,14 +285,24 @@ fn run_one_smoke(
     options: &SmokeOptions,
     runtime_trace_deadlines: Option<bool>,
 ) -> Result<()> {
+    // Host preparation/evidence time is not guest boot latency. Keep this
+    // opt-in attribution outside the readiness clock and acceptance policy.
+    let host_started = Instant::now();
+    let phase = |name| {
+        if std::env::var_os("RUSTOS_KVM_TIMINGS").is_some() {
+            log_kvm_start_phase(name, host_started);
+        }
+    };
     validate_storage_fault_expectation(
         config.project.fault_injection.enabled,
         &config.project.fault_injection.rules,
         &options,
     )?;
     let artifacts = verify_dvm_artifacts(config)?;
+    phase("smoke-dvm-artifacts-verified");
     let qemu = require_qemu(config)?;
     let layout = prepare_layout(config, &options)?;
+    phase("smoke-layout-prepared");
 
     if options.physical_gpu_bdf.is_some() {
         validate_physical_gpu_inputs(&options)?;
@@ -322,6 +332,7 @@ fn run_one_smoke(
     };
     let launch_evidence =
         smp_qualification::capture_kvm_launch_evidence(config, &artifacts, &layout, &options)?;
+    phase("smoke-launch-evidence-captured");
     // The bounded relay owns `options.timeout`; arm it only after potentially
     // expensive prelaunch evidence capture and immediately before guest spawn.
     let control_relay = start_dvm_input_relay(
@@ -350,6 +361,7 @@ fn run_one_smoke(
     // for host-side doorbell setup, render-node admission, or process
     // creation. Start it only after both guest processes exist.
     let boot_started = Instant::now();
+    phase("smoke-guests-spawned");
     let deadline = boot_started + options.timeout;
     let result: Result<ProbeResult> = (|| {
         let probe = wait_for_parallel_boot(
@@ -389,8 +401,10 @@ fn run_one_smoke(
             }
         }
     });
+    phase("smoke-probe-ended");
     stop_guest(&mut rustos);
     stop_guest(&mut dvm);
+    phase("smoke-guests-stopped");
     let probe = result?;
     validate_ui_fps_proof(&layout, &options)?;
     if let (Some(shared_display), Some(shared_pixels)) = (
@@ -432,6 +446,7 @@ fn run_one_smoke(
             &layout.dvm_serial_log,
         )?;
     }
+    phase("smoke-runtime-validated");
     let success_evidence = write_kvm_success_summary(
         config,
         &layout,
@@ -439,6 +454,7 @@ fn run_one_smoke(
         launch_evidence.as_ref(),
         boot_started.elapsed(),
     )?;
+    phase("smoke-success-evidence-published");
     println!(
         "xtask: parallel KVM boot passed (RustOS + Linux DVM); control={} established authenticated L0 input relay (DVM cid={}, inventory={}, virtio-net={}, virtio-gpu={}) without QMP",
         artifacts.control.control_plane(),

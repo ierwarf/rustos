@@ -406,27 +406,47 @@ fn read_ahead_plan(
 pub(super) fn write(
     expected_generation: u64,
     lba: u64,
+    block_count: u64,
     bytes: &[u8],
     fua: bool,
 ) -> Result<(), i32> {
-    clear_read_cache();
-    let info = info()?;
+    write_admitted_with(info()?, expected_generation, lba, block_count, bytes, || {
+        clear_read_cache();
+        let ticket = submit(
+            BLOCK_BROKER_OP_DVM_SUBMIT_WRITE,
+            lba,
+            block_count,
+            if fua { BLOCK_BROKER_FLAG_FUA } else { 0 },
+            bytes.as_ptr(),
+            bytes.len(),
+        )?;
+        wait_and_collect(ticket, None)
+    })
+}
+
+fn write_admitted_with(
+    info: BlockInfo,
+    expected_generation: u64,
+    lba: u64,
+    block_count: u64,
+    bytes: &[u8],
+    write: impl FnOnce() -> Result<(), i32>,
+) -> Result<(), i32> {
     require_generation(info, expected_generation)?;
-    let block_size = info.logical_block_size as usize;
-    if bytes.is_empty() || !bytes.len().is_multiple_of(block_size) {
+    validate_write_extent(info, lba, block_count, bytes.len())?;
+    write()
+}
+
+fn validate_write_extent(
+    info: BlockInfo,
+    lba: u64,
+    block_count: u64,
+    payload_len: usize,
+) -> Result<(), i32> {
+    if checked_byte_len(info, lba, block_count)? != payload_len {
         return Err(libc::EINVAL);
     }
-    let block_count = (bytes.len() / block_size) as u64;
-    checked_byte_len(info, lba, block_count)?;
-    let ticket = submit(
-        BLOCK_BROKER_OP_DVM_SUBMIT_WRITE,
-        lba,
-        block_count,
-        if fua { BLOCK_BROKER_FLAG_FUA } else { 0 },
-        bytes.as_ptr(),
-        bytes.len(),
-    )?;
-    wait_and_collect(ticket, None)
+    Ok(())
 }
 
 fn read_cache_lookup(
@@ -659,6 +679,40 @@ mod tests {
         assert_eq!(checked_byte_len(info(), 4, 2), Ok(8192));
         assert_eq!(checked_byte_len(info(), 1023, 2), Err(libc::EINVAL));
         assert_eq!(checked_byte_len(info(), u64::MAX, 1), Err(libc::EINVAL));
+    }
+
+    #[test]
+    fn write_extent_requires_exact_declared_count_before_submission() {
+        let info = BlockInfo { logical_block_size: 512, ..info() };
+        assert_eq!(validate_write_extent(info, 0, 1, 1024), Err(libc::EINVAL));
+        assert_eq!(validate_write_extent(info, 0, 2, 512), Err(libc::EINVAL));
+        assert_eq!(validate_write_extent(info, 0, u64::MAX, 512), Err(libc::EINVAL));
+        assert_eq!(validate_write_extent(info, 0, 0, 0), Err(libc::EINVAL));
+        assert_eq!(validate_write_extent(info, 8191, 2, 1024), Err(libc::EINVAL));
+        assert_eq!(validate_write_extent(info, 0, 2, 1024), Ok(()));
+    }
+
+    #[test]
+    fn write_extent_refusal_has_no_cache_or_submission_side_effects() {
+        let info = BlockInfo { logical_block_size: 512, ..info() };
+        let bytes = [0_u8; 1024];
+        let mut side_effects = 0;
+        for count in [0, 1, 3, u64::MAX] {
+            assert_eq!(write_admitted_with(info, 7, 0, count, &bytes, || {
+                side_effects += 1;
+                Ok(())
+            }), Err(libc::EINVAL));
+        }
+        assert_eq!(write_admitted_with(info, 6, 0, 2, &bytes, || {
+            side_effects += 1;
+            Ok(())
+        }), Err(libc::ESTALE));
+        assert_eq!(side_effects, 0);
+        assert_eq!(write_admitted_with(info, 7, 0, 2, &bytes, || {
+            side_effects += 1;
+            Err(libc::EIO)
+        }), Err(libc::EIO));
+        assert_eq!(side_effects, 1, "valid requests submit once and preserve failures");
     }
 
     #[test]

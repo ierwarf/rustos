@@ -17,6 +17,9 @@
 
 #![no_std]
 
+mod request_strings;
+pub use request_strings::RequestStrings;
+
 use core::mem::size_of;
 
 use rustos_user_abi::syscall::{

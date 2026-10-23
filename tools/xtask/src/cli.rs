@@ -204,6 +204,12 @@ pub(crate) enum FormalContractsCommand {
     Check,
     /// Regenerate the human-readable contract index from the typed graph.
     Generate,
+    /// Run impacted native witnesses, batched by exact package/features.
+    Test {
+        /// Explicit changed paths; otherwise inspect the current worktree.
+        #[arg(value_name = "PATH")]
+        paths: Vec<PathBuf>,
+    },
     /// Print the formal gates affected by the current worktree or named paths.
     Impact {
         /// Compare committed paths in BASE...HEAD (for CI); otherwise inspect

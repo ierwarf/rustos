@@ -186,11 +186,7 @@ struct ExecutableSnapshot {
     file_bytes: u64,
 }
 
-struct ExecutableSnapshotOpen {
-    fd: i32,
-    file_bytes: u64,
-    close_after_reply: bool,
-}
+type ExecutableSnapshotOpen = vfsd::ExecutableSnapshotLease<fn(i32)>;
 
 fn linux_response_for_op(op: u16) -> LinuxSyscallOffloadResponse {
     let mut response = MaybeUninit::<LinuxSyscallOffloadResponse>::uninit();
@@ -493,12 +489,12 @@ fn reply_executable_snapshot(
             };
         }
     };
-    response.file_bytes = snapshot.file_bytes;
-    response.mount_generation = lock_vfs_storage().mount_generation;
+    response.file_bytes = snapshot.file_bytes();
+    response.mount_generation = snapshot.mount_generation();
     response.resolved_path_len = request.path_len;
     response.resolved_path[..request.path_len as usize]
         .copy_from_slice(&request.path[..request.path_len as usize]);
-    let send_fd = snapshot.fd as u64;
+    let send_fd = snapshot.fd() as u64;
     let args = IpcReplyWithHandlesArgs {
         reply_cap,
         response_ptr: (&response as *const VfsExecutableSnapshotResponse) as u64,
@@ -514,9 +510,7 @@ fn reply_executable_snapshot(
             (&args as *const IpcReplyWithHandlesArgs) as u64,
         )
     };
-    if snapshot.close_after_reply {
-        close_fd(snapshot.fd);
-    }
+    drop(snapshot);
     if ui_bootstrap_snapshot_reply_completed(
         &request.path,
         request.path_len as usize,
@@ -657,6 +651,20 @@ fn create_terminally_sealed_snapshot(_path: &str, bytes: &[u8]) -> Result<i32, i
         return Err(errno);
     }
     Ok(fd)
+}
+
+fn duplicate_snapshot_fd(fd: i32) -> Result<i32, i32> {
+    // The caller holds storage ownership: eviction cannot close/reuse the
+    // cache fd before this request acquires its independent descriptor.
+    let result = unsafe {
+        rustos_svc_runtime::syscall::syscall3(
+            linux_abi::SYS_FCNTL,
+            fd as u64,
+            linux_abi::F_DUPFD_CLOEXEC as u64,
+            0,
+        )
+    };
+    if result < 0 { Err((-result) as i32) } else { Ok(result as i32) }
 }
 
 fn close_fd(fd: i32) {

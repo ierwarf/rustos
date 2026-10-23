@@ -129,7 +129,16 @@ services also complete lease admission before activation and are then confirmed
 through the exact-PID endpoint wait syscall. Activation is single-use, fails
 closed for an unknown, exited, already-running, or non-suspended PID, and
 publishes one spawn-specific scheduler handoff only after this supervisor
-commit point.
+commit point. Each asynchronous runtimed launch has its own record-ACK channel;
+late acknowledgement of a timed-out child cannot authorize the next launch.
+Every terminal result retains the created PID so exact launch bookkeeping can
+be retired without deleting a record owned by another launch.
+
+Rootd supervises replacement core-service endpoint readiness after bootstrap
+as well as during it, at the same 250 ms monotonic cadence. Control traffic
+cannot consume extra readiness polls. Initd retains its 32-failure budget for
+each executable across successful replacements; creation or endpoint publication
+alone does not establish sustained health or reset the supervisor-lifetime budget.
 
 Initd batches only siblings whose declared dependency/barrier state is already
 satisfied. Pending independent children remain suspended while their exact
@@ -180,7 +189,13 @@ memfd and applies
 Relative executable paths are normalized by the vfsd endpoint receive owner
 while it exclusively owns PID cwd state; the bulk snapshot worker receives
 only the canonical absolute path. The v2 response binds that exact path to the
-handle, byte count, and mount generation returned to loaderd. A relative
+handle, byte count, and mount generation returned to loaderd. Every open owns
+an independent descriptor through terminal reply completion, including failed
+replies. A cache hit duplicates under storage ownership and captures that
+entry's mount generation; later eviction, remount, or descriptor-number reuse
+cannot retarget the pending reply. The current request's byte limit also applies
+to hits. Concurrent same-path commits reuse the winning cache entry rather than
+leaking its descriptor or double-counting cache bytes. A relative
 snapshot with no target PID or a directory basis other than `AT_FDCWD` fails
 closed until the ABI carries an authenticated remote directory handle.
 Snapshot job ownership remains the bounded IDLE→WRITING→READY→BUSY admission.

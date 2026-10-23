@@ -115,6 +115,13 @@ split-debuginfo = "unpacked"
 [profile.dev.package."*"]
 debug = false
 
+# Evidence preparation hashes complete signed images repeatedly. In an
+# unoptimized host tool even SHA-NI intrinsics become out-of-line calls, dwarfing
+# guest boot time. Optimize this dependency only; guest/release codegen and all
+# byte-for-byte verification remain unchanged.
+[profile.dev.package.sha2]
+opt-level = 3
+
 # Build scripts and proc macros are run, never stepped through, so their debug
 # info is pure overhead. Optimizing them was measured too and did not pay for
 # itself -- a cold build of the xtask closure went from 10.96s to 13.01s -- so

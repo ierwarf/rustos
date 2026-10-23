@@ -208,8 +208,8 @@ pub(super) fn service_launch_worker(state: &mut BrokerState) -> bool {
         };
         applied = true;
         match progress {
-            crate::launch_worker::LaunchProgress::Spawned { pid } => {
-                record_spawned_launch(state, pid);
+            crate::launch_worker::LaunchProgress::Spawned { pid, record_ack } => {
+                record_spawned_launch(state, pid, record_ack);
             }
             crate::launch_worker::LaunchProgress::Finished { pid, result } => {
                 finish_tracked_launch(state, pid, result);
@@ -218,19 +218,19 @@ pub(super) fn service_launch_worker(state: &mut BrokerState) -> bool {
     }
 }
 
-fn record_spawned_launch(state: &mut BrokerState, pid: i32) {
+fn record_spawned_launch(
+    state: &mut BrokerState,
+    pid: i32,
+    record_ack: std::sync::mpsc::SyncSender<crate::launch_worker::RecordAck>,
+) {
     let Some(in_flight) = state.launch_in_flight.as_ref() else {
         // Nothing is in flight, so this child has no owner here. Refusing it is
         // what makes the worker retire it rather than activate an orphan.
-        if let Some(worker) = state.launch_worker.as_ref() {
-            worker.acknowledge(crate::launch_worker::RecordAck::Duplicate);
-        }
+        let _ = record_ack.try_send(crate::launch_worker::RecordAck::Duplicate);
         return;
     };
     if state.running.contains_key(&pid) {
-        if let Some(worker) = state.launch_worker.as_ref() {
-            worker.acknowledge(crate::launch_worker::RecordAck::Duplicate);
-        }
+        let _ = record_ack.try_send(crate::launch_worker::RecordAck::Duplicate);
         return;
     }
     let record = RunningProcess {
@@ -248,9 +248,7 @@ fn record_spawned_launch(state: &mut BrokerState, pid: i32) {
         in_flight.recorded_pid = Some(pid);
     }
     boot_line(format!("runtimed: spawned pid={pid}").as_str());
-    if let Some(worker) = state.launch_worker.as_ref() {
-        worker.acknowledge(crate::launch_worker::RecordAck::Recorded);
-    }
+    let _ = record_ack.try_send(crate::launch_worker::RecordAck::Recorded);
 }
 
 fn finish_tracked_launch(state: &mut BrokerState, pid: Option<i32>, result: Result<(), i32>) {
@@ -1163,3 +1161,7 @@ fn last_errno() -> i32 {
 #[cfg(test)]
 #[path = "spawn_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "launch_bookkeeping_tests.rs"]
+mod launch_bookkeeping_tests;

@@ -48,15 +48,13 @@ pub(crate) fn print_plan(root: &Path) -> Result<()> {
         plan.scopes.insert("formal-impact");
         plan.push_now("cargo xtask formal-contracts check");
         for model in formal_impact.models {
-            plan.push_now(format!("bash formal/run-tlc.sh {model}"));
+            plan.push_now(focused_tlc_command(&model));
         }
-        for witness in formal_impact.witnesses {
-            let mut command = format!("cargo test -q -p {}", witness.package);
-            if !witness.features.is_empty() {
-                command.push_str(&format!(" --features {}", witness.features));
-            }
-            command.push_str(&format!(" {} -- --exact", witness.test));
-            plan.push_now(command);
+        if !formal_impact.witnesses.is_empty() {
+            // The executor preserves package/feature boundaries and verifies
+            // every exact pass record plus the executed count. Do not re-enter
+            // Cargo once per model-to-test association.
+            plan.push_now("cargo xtask formal-contracts test");
         }
         plan.push_stable("bash formal/verify-all.sh --profile pr");
     }
@@ -212,7 +210,7 @@ fn classify_changes(root: &Path, paths: &[PathBuf]) -> DevPlan {
             plan.push_now("bash formal/selftest.sh");
         }
         for model in formal_models {
-            plan.push_now(format!("bash formal/run-tlc.sh {model}"));
+            plan.push_now(focused_tlc_command(&model));
         }
     }
 
@@ -326,6 +324,13 @@ fn is_documentation(path: &Path) -> bool {
         )
 }
 
+fn focused_tlc_command(model: &str) -> String {
+    let model = shell_quote(model);
+    format!(
+        "python3 formal/tlc_cache.py --root . --profile pr --model {model} --individual || bash formal/run-tlc.sh {model}"
+    )
+}
+
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
@@ -361,9 +366,28 @@ mod tests {
         let plan = classify_changes(root.path(), &[PathBuf::from("formal/example/Example.tla")]);
         assert!(
             plan.now
-                .contains(&"bash formal/run-tlc.sh example/Example".to_owned())
+                .contains(&focused_tlc_command("example/Example"))
         );
         assert!(!plan.now.contains(&"bash formal/run-all-tlc.sh".to_owned()));
+    }
+
+    #[test]
+    fn focused_tlc_cache_miss_propagates_the_fresh_model_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let formal = root.path().join("formal");
+        fs::create_dir_all(&formal).unwrap();
+        fs::write(formal.join("tlc_cache.py"), "raise SystemExit(1)\n").unwrap();
+        fs::write(formal.join("run-tlc.sh"), "exit 7\n").unwrap();
+        let run = || {
+            Command::new("bash")
+                .args(["-c", &focused_tlc_command("sample/Example")])
+                .current_dir(root.path())
+                .status()
+                .unwrap()
+        };
+        assert_eq!(run().code(), Some(7));
+        fs::write(formal.join("tlc_cache.py"), "raise SystemExit(0)\n").unwrap();
+        assert!(run().success());
     }
 
     #[test]

@@ -417,6 +417,7 @@ fn dispatch_commercial(
             block::write(
                 request.arg0,
                 request.arg1,
+                request.arg2,
                 &request.payload[..request.payload_len as usize],
                 fua,
             )?;

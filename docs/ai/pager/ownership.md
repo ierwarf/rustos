@@ -266,6 +266,11 @@ implicit unmap of the target range followed by the new mapping. `ld.so` relies
 on this for every shared library it loads - it reserves the whole library span,
 then maps the zero-fill BSS `MAP_FIXED` *inside* that span.
 
+Syscalld persists the policy hole immediately after a successful fixed-range
+revocation, before requesting the replacement. If allocation or mapping then
+fails, the next request must reload that hole rather than a stale original VMA.
+A refused revocation never removes or saves policy as though it succeeded.
+
 So `PagerVmaError::Overlap` on admission has two meanings, and treating both as
 residue is a defect:
 

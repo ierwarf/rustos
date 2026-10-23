@@ -22,6 +22,7 @@
 
 extern crate alloc;
 
+use alloc::borrow::ToOwned;
 use alloc::ffi::CString;
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -596,7 +597,7 @@ fn handle_request(
         return spawn_response(response);
     }
 
-    let argv = match parse_blob(
+    let argv = match loaderd::RequestStrings::parse(
         &request.argv_bytes,
         request.argv_bytes_len as usize,
         request.argv_count as usize,
@@ -608,7 +609,7 @@ fn handle_request(
             return spawn_response(response);
         }
     };
-    let env = match parse_blob(
+    let env = match loaderd::RequestStrings::parse(
         &request.env_bytes,
         request.env_bytes_len as usize,
         request.env_count as usize,

@@ -42,8 +42,8 @@ fn map_executable_segments(
     exec_path: &str,
     prepare_handle: u64,
     admission: &ExecutableAdmission,
-    argv: &[CString],
-    env: &[CString],
+    argv: &loaderd::RequestStrings<'_>,
+    env: &loaderd::RequestStrings<'_>,
 ) -> Result<PreparedExecutable, i32> {
     match admission {
         ExecutableAdmission::Elf64 {
@@ -76,17 +76,23 @@ fn map_executable_segments(
                 }
             })
         }
-        ExecutableAdmission::Pe64 => map_pe_segments_fd(fd, prepare_handle, exec_path, argv, env)
-            .map(|runtime| PreparedExecutable {
-                windows_runtime: Some(runtime),
-                linux_runtime: None,
-                cleanup_fds: vec![fd],
-            })
-            .inspect_err(|errno| {
-                debug_line(&format!(
-                    "loaderd: map pe segments failed exec={exec_path} errno={errno}",
-                ));
-            }),
+        ExecutableAdmission::Pe64 => {
+            // The PE runtime builder still owns its string representation.
+            // Materialize only on this path, not for every ELF spawn/exec.
+            let argv: Vec<CString> = argv.iter().map(|value| value.to_owned()).collect();
+            let env: Vec<CString> = env.iter().map(|value| value.to_owned()).collect();
+            map_pe_segments_fd(fd, prepare_handle, exec_path, &argv, &env)
+                .map(|runtime| PreparedExecutable {
+                    windows_runtime: Some(runtime),
+                    linux_runtime: None,
+                    cleanup_fds: vec![fd],
+                })
+                .inspect_err(|errno| {
+                    debug_line(&format!(
+                        "loaderd: map pe segments failed exec={exec_path} errno={errno}",
+                    ));
+                })
+        }
     }
 }
 
@@ -262,31 +268,6 @@ fn request_text(bytes: &[u8], len: usize) -> Result<&str, i32> {
         return Err(EINVAL);
     }
     core::str::from_utf8(&bytes[..len]).map_err(|_| EINVAL)
-}
-
-fn parse_blob(bytes: &[u8], len: usize, count: usize) -> Result<Vec<CString>, i32> {
-    if len > bytes.len() {
-        return Err(EINVAL);
-    }
-    if count == 0 {
-        return (len == 0).then(Vec::new).ok_or(EINVAL);
-    }
-    let mut values = Vec::with_capacity(count);
-    let mut start = 0usize;
-    for index in 0..len {
-        if bytes[index] != 0 {
-            continue;
-        }
-        if start == index {
-            return Err(EINVAL);
-        }
-        values.push(CString::new(&bytes[start..index]).map_err(|_| EINVAL)?);
-        start = index + 1;
-    }
-    if start != len || values.len() != count {
-        return Err(EINVAL);
-    }
-    Ok(values)
 }
 
 fn validate_executable_fd(fd: i32) -> Result<ExecutableAdmission, i32> {

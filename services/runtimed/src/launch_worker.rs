@@ -57,7 +57,12 @@ pub(crate) struct LaunchJob {
 pub(crate) enum LaunchProgress {
     /// The child exists and is start-suspended. The worker is now blocked
     /// waiting for the loop to record it; it cannot activate until then.
-    Spawned { pid: i32 },
+    Spawned {
+        pid: i32,
+        /// This reply belongs only to this child. The channel is never
+        /// reused, so a late reply cannot authorize a later launch.
+        record_ack: SyncSender<RecordAck>,
+    },
     /// Terminal. `pid` is present whenever a child was created, so the loop
     /// knows whether it has a record to drop.
     Finished {
@@ -67,6 +72,7 @@ pub(crate) enum LaunchProgress {
 }
 
 /// The loop's answer to `Spawned`.
+#[derive(Debug)]
 pub(crate) enum RecordAck {
     /// Recorded. The worker may activate.
     Recorded,
@@ -88,7 +94,6 @@ pub(crate) struct LaunchCalls {
 pub(crate) struct LaunchWorker {
     jobs: SyncSender<LaunchJob>,
     progress: Receiver<LaunchProgress>,
-    record_acks: SyncSender<RecordAck>,
 }
 
 impl LaunchWorker {
@@ -106,18 +111,6 @@ impl LaunchWorker {
     pub(crate) fn poll(&self) -> Option<LaunchProgress> {
         self.progress.try_recv().ok()
     }
-
-    /// Answer a `Spawned`. The worker is blocked on this.
-    pub(crate) fn acknowledge(&self, ack: RecordAck) {
-        let _ = self.jobs_ack(ack);
-    }
-
-    fn jobs_ack(&self, ack: RecordAck) -> Result<(), i32> {
-        match self.record_acks.try_send(ack) {
-            Ok(()) => Ok(()),
-            Err(_) => Err(libc::EPIPE),
-        }
-    }
 }
 
 /// Start the worker. Returns `None` if the thread cannot be created, which
@@ -128,28 +121,21 @@ pub(crate) fn start(calls: LaunchCalls) -> Option<LaunchWorker> {
     // with.
     let (job_sender, job_receiver) = mpsc::sync_channel::<LaunchJob>(1);
     let (progress_sender, progress_receiver) = mpsc::sync_channel::<LaunchProgress>(2);
-    let (ack_sender, ack_receiver) = mpsc::sync_channel::<RecordAck>(1);
     let spawned = thread::Builder::new()
         .name(String::from("runtimed-launch"))
-        .spawn(move || run(job_receiver, progress_sender, ack_receiver, calls));
+        .spawn(move || run(job_receiver, progress_sender, calls));
     if spawned.is_err() {
         return None;
     }
     Some(LaunchWorker {
         jobs: job_sender,
         progress: progress_receiver,
-        record_acks: ack_sender,
     })
 }
 
-fn run(
-    jobs: Receiver<LaunchJob>,
-    progress: SyncSender<LaunchProgress>,
-    acks: Receiver<RecordAck>,
-    calls: LaunchCalls,
-) {
+fn run(jobs: Receiver<LaunchJob>, progress: SyncSender<LaunchProgress>, calls: LaunchCalls) {
     while let Ok(job) = jobs.recv() {
-        let outcome = execute(&job, &acks, &progress, &calls);
+        let outcome = execute(&job, &progress, &calls);
         let _ = progress.send(outcome);
     }
 }
@@ -162,7 +148,6 @@ fn run(
 /// loop keep answering the console while this runs.
 fn execute(
     job: &LaunchJob,
-    acks: &Receiver<RecordAck>,
     progress: &SyncSender<LaunchProgress>,
     calls: &LaunchCalls,
 ) -> LaunchProgress {
@@ -180,17 +165,22 @@ fn execute(
         if let Err(errno) = (calls.report_lease)(&job.entry, pid) {
             (calls.retire)(pid, "rootd-lease-report");
             return LaunchProgress::Finished {
-                pid: None,
+                pid: Some(pid),
                 result: Err(errno),
             };
         }
     }
 
-    // Nothing below may run until the loop owns this pid.
-    if progress.send(LaunchProgress::Spawned { pid }).is_err() {
+    // Nothing below may run until the loop owns this pid. A fresh channel
+    // confines the acknowledgement to this launch even if the loop is late.
+    let (record_ack, acks) = mpsc::sync_channel(1);
+    if progress
+        .send(LaunchProgress::Spawned { pid, record_ack })
+        .is_err()
+    {
         (calls.retire)(pid, "record-channel");
         return LaunchProgress::Finished {
-            pid: None,
+            pid: Some(pid),
             result: Err(libc::EPIPE),
         };
     }
@@ -199,16 +189,17 @@ fn execute(
         Ok(RecordAck::Duplicate) => {
             (calls.retire)(pid, "duplicate-pid");
             return LaunchProgress::Finished {
-                pid: None,
+                pid: Some(pid),
                 result: Err(libc::EEXIST),
             };
         }
         Err(RecvTimeoutError::Timeout) | Err(RecvTimeoutError::Disconnected) => {
-            // The child is suspended and unowned. Retiring it is the only
-            // outcome that does not leak a task nobody supervises.
+            // The child is still suspended, but the loop may already have
+            // recorded it. Retire it and return its exact pid so the loop can
+            // remove that record even if its acknowledgement arrived late.
             (calls.retire)(pid, "record-ack");
             return LaunchProgress::Finished {
-                pid: None,
+                pid: Some(pid),
                 result: Err(libc::ETIMEDOUT),
             };
         }
@@ -265,10 +256,7 @@ mod tests {
         LaunchCalls {
             spawn: |_, _| Ok(41),
             report_lease: |_, _| Ok(()),
-            bind_and_activate: |_, _| {
-                ACTIVATED_AT.store(ORDER.fetch_add(1, Ordering::SeqCst), Ordering::SeqCst);
-                Ok(())
-            },
+            bind_and_activate: |_, _| Ok(()),
             await_endpoint: |_| Ok(()),
             retire: |_, _| {},
         }
@@ -286,7 +274,12 @@ mod tests {
     fn a_child_is_never_activated_before_the_loop_has_recorded_it() {
         ORDER.store(0, Ordering::SeqCst);
         ACTIVATED_AT.store(-1, Ordering::SeqCst);
-        let worker = super::start(calls()).expect("worker starts");
+        let mut calls = calls();
+        calls.bind_and_activate = |_, _| {
+            ACTIVATED_AT.store(ORDER.fetch_add(1, Ordering::SeqCst), Ordering::SeqCst);
+            Ok(())
+        };
+        let worker = super::start(calls).expect("worker starts");
         worker
             .submit(LaunchJob {
                 entry: entry(),
@@ -297,7 +290,7 @@ mod tests {
             .expect("the first job is accepted");
 
         let spawned = wait_for_progress(&worker);
-        let LaunchProgress::Spawned { pid } = spawned else {
+        let LaunchProgress::Spawned { pid, record_ack } = spawned else {
             panic!("the worker reports the child before activating it");
         };
         assert_eq!(pid, 41);
@@ -309,7 +302,9 @@ mod tests {
         );
 
         let recorded_at = ORDER.fetch_add(1, Ordering::SeqCst);
-        worker.acknowledge(RecordAck::Recorded);
+        record_ack
+            .try_send(RecordAck::Recorded)
+            .expect("record acknowledged");
 
         let finished = wait_for_progress(&worker);
         let LaunchProgress::Finished { pid, result } = finished else {
@@ -343,17 +338,19 @@ mod tests {
             })
             .expect("the first job is accepted");
 
-        assert!(matches!(
-            wait_for_progress(&worker),
-            LaunchProgress::Spawned { .. }
-        ));
-        worker.acknowledge(RecordAck::Duplicate);
+        let LaunchProgress::Spawned { record_ack, .. } = wait_for_progress(&worker) else {
+            panic!("the child was spawned");
+        };
+        record_ack
+            .try_send(RecordAck::Duplicate)
+            .expect("duplicate refused");
         let LaunchProgress::Finished { pid, result } = wait_for_progress(&worker) else {
             panic!("the launch terminates");
         };
         assert_eq!(
-            pid, None,
-            "the loop recorded nothing, so it must be told there is nothing to drop"
+            pid,
+            Some(41),
+            "terminal bookkeeping preserves the child even when the loop refused it"
         );
         assert_eq!(result, Err(libc::EEXIST));
         assert_eq!(RETIRED.load(Ordering::SeqCst), 1);
@@ -372,26 +369,92 @@ mod tests {
         worker.submit(job()).expect("the first job is accepted");
         // The first job occupies the worker until it is acknowledged, so the
         // queue slot is the only place a second could go.
-        assert!(matches!(
-            wait_for_progress(&worker),
-            LaunchProgress::Spawned { .. }
-        ));
+        let LaunchProgress::Spawned { record_ack, .. } = wait_for_progress(&worker) else {
+            panic!("the child was spawned");
+        };
         worker.submit(job()).expect("the queue slot takes one more");
         assert_eq!(
             worker.submit(job()),
             Err(libc::EBUSY),
             "beyond that the loop is told no, rather than blocked"
         );
-        worker.acknowledge(RecordAck::Recorded);
+        record_ack
+            .try_send(RecordAck::Recorded)
+            .expect("record acknowledged");
+    }
+
+    #[test]
+    fn a_late_ack_for_a_timed_out_launch_cannot_authorize_the_next_child() {
+        static ACTIVATED: AtomicI32 = AtomicI32::new(0);
+        static RETIRED: AtomicI32 = AtomicI32::new(0);
+        ACTIVATED.store(0, Ordering::SeqCst);
+        RETIRED.store(0, Ordering::SeqCst);
+        let mut calls = calls();
+        calls.spawn = |_, session| Ok(session as i32);
+        calls.bind_and_activate = |pid, _| {
+            ACTIVATED.store(pid, Ordering::SeqCst);
+            Ok(())
+        };
+        calls.retire = |pid, stage| {
+            assert_eq!(stage, "record-ack");
+            RETIRED.store(pid, Ordering::SeqCst);
+        };
+        let worker = super::start(calls).expect("worker starts");
+        let job = |pid| LaunchJob {
+            entry: entry(),
+            qualification_contract: None,
+            session_handle: Some(pid),
+            is_ui_server: false,
+        };
+        worker.submit(job(41)).expect("A submitted");
+        let LaunchProgress::Spawned {
+            pid: 41,
+            record_ack: ack_a,
+        } = wait_for_progress(&worker)
+        else {
+            panic!("A was spawned");
+        };
+        let LaunchProgress::Finished { pid, result } = wait_for_progress(&worker) else {
+            panic!("A timed out without a record acknowledgement");
+        };
+        assert_eq!(pid, Some(41));
+        assert_eq!(result, Err(libc::ETIMEDOUT));
+        assert_eq!(RETIRED.load(Ordering::SeqCst), 41);
+
+        // A's loop reply arrives after its timeout but before B's bookkeeping.
+        assert!(matches!(
+            ack_a.try_send(RecordAck::Recorded),
+            Err(TrySendError::Disconnected(_))
+        ));
+        worker.submit(job(42)).expect("B submitted");
+        let LaunchProgress::Spawned {
+            pid: 42,
+            record_ack: ack_b,
+        } = wait_for_progress(&worker)
+        else {
+            panic!("B was spawned");
+        };
+        assert_eq!(ACTIVATED.load(Ordering::SeqCst), 0);
+        assert!(
+            matches!(
+                worker.progress.recv_timeout(Duration::from_millis(25)),
+                Err(RecvTimeoutError::Timeout)
+            ),
+            "B cannot finish before its own record acknowledgement"
+        );
+        ack_b.try_send(RecordAck::Recorded).expect("B recorded");
+        let LaunchProgress::Finished { pid, result } = wait_for_progress(&worker) else {
+            panic!("B finishes after its own acknowledgement");
+        };
+        assert_eq!(pid, Some(42));
+        assert_eq!(result, Ok(()));
+        assert_eq!(ACTIVATED.load(Ordering::SeqCst), 42);
     }
 
     fn wait_for_progress(worker: &LaunchWorker) -> LaunchProgress {
-        for _ in 0..2_000 {
-            if let Some(progress) = worker.poll() {
-                return progress;
-            }
-            thread::sleep(Duration::from_millis(1));
-        }
-        panic!("the worker went quiet");
+        worker
+            .progress
+            .recv_timeout(RECORD_ACK_BUDGET + Duration::from_secs(2))
+            .expect("the worker reports progress")
     }
 }

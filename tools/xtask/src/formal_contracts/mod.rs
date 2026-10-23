@@ -2,6 +2,7 @@ mod evidence;
 mod profiles;
 mod registry;
 mod runtime_trace;
+mod witnesses;
 
 use std::path::{Path, PathBuf};
 
@@ -32,6 +33,18 @@ pub(crate) fn run(root: &Path, command: &FormalContractsCommand) -> Result<()> {
                 registry.witnesses.len()
             );
             Ok(())
+        }
+        FormalContractsCommand::Test { paths } => {
+            let paths = if paths.is_empty() {
+                changed_worktree_paths(root)?
+            } else {
+                paths.clone()
+            };
+            let impact = load_impact(root, &paths)?;
+            anyhow::ensure!(impact.unmapped_high_risk.is_empty(),
+                "high-risk changed paths lack a formal contract mapping: {:?}",
+                impact.unmapped_high_risk);
+            witnesses::run(root, &impact.witnesses)
         }
         FormalContractsCommand::Generate => {
             let registry = ContractRegistry::load(root)?;

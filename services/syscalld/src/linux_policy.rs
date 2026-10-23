@@ -1140,8 +1140,11 @@ fn replace_fixed_range_after_prevalidation(
     end: u64,
     _validated_plan: MmapPlan,
 ) -> Result<(), i32> {
-    unmap_populated_range(pid, state, start, end)?;
-    Ok(())
+    syscalld::vma_policy::persist_fixed_removal_with(
+        state,
+        |state| unmap_populated_range(pid, state, start, end),
+        |state| save_mm_state(pid, state.clone()),
+    )
 }
 
 fn mm_broker_call(args: &RustosMmBrokerArgs) -> Result<(), i32> {

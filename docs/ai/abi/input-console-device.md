@@ -192,8 +192,11 @@
   If netd is not yet published or its bounded grant/revoke call fails, inputd
   retains the already-decoded fixed-size batch, decoder epoch, events, and
   exact unacknowledged transition suffix. It retries outside the policy-queue
-  lock for at most five seconds and publishes no event first. A successful ACK
-  clears only that transition; timeout exits fail-closed so endpoint-owner
+  lock for at most five seconds. Events preceding a transition are published
+  before its reset/revoke barrier; events after it wait for that transition's
+  ACK. Same-batch session end must release earlier button/key presses, never
+  reset first and reapply those presses afterward. A successful ACK clears
+  only that transition; timeout exits fail-closed so endpoint-owner
   cleanup withdraws producer admission. Resetting the decoder and draining
   later records after a transient failure is forbidden because the host does
   not repeat the session authority marker.

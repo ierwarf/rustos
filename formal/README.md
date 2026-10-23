@@ -86,8 +86,10 @@ The PR TLC profile is deliberately a 120-second, risk-weighted pre-QEMU set:
 it retains the exact finite configurations of the critical ownership, CPU,
 TLB, wake, ABI, and product-boot models selected by `run-all-tlc.sh` from
 `contracts.toml`, rather than quietly reducing their state depth. The complete
-registered inventory is the nightly qualification lane. Any changed model is still run directly by `dev-plan` before either
-profile; a PR pass is not a claim that unrelated nightly models were explored.
+registered inventory is the nightly qualification lane. `dev-plan` still selects
+every impacted model before either profile: it reuses only a recent exact-input
+individual proof or runs that model to completion. A PR pass is not a claim that
+unrelated nightly models were explored.
 The `tlc_max_wall_seconds` profile budget fails closed rather than accepting a
 partially explored model.
 An exact PR or SMP-iteration pass may be reused for at most 24 hours. These
@@ -98,7 +100,15 @@ unless the TLA module, CFG, pinned TLC version and digest, deadlock policy,
 worker policy, fingerprint, seed, positive exploration metrics, and model name
 still match. A source or policy change therefore reruns only the affected
 model. The SMP iteration profile applies the same rule to its smaller model
-set; nightly qualification never reuses TLC evidence. This is proof-evidence
+set; nightly qualification never reuses TLC evidence. For explicitly selected
+`dev-plan` models outside the curated PR set, `tlc_cache.py --individual` may
+reuse the same PR execution policy, but cannot widen or satisfy a complete
+profile gate. This requires a new before/after input fingerprint from the actual
+TLC runner, including its validator, pinned tool lock, TLA and CFG. Only closed
+standard-module imports qualify; local shadows, unbound imports, mutation and
+execution overrides force a fresh run. Legacy summaries without this binding
+cannot satisfy individual reuse. The runner refuses a passing result if the
+checked TLA/CFG or a bound closed-proof input changes during checking. This is proof-evidence
 reuse, not TLC state recovery, and no artifact is touched to fabricate
 freshness. TLC's `-depth` option controls random simulation rather than the
 depth of exhaustive model checking, so the PR lane does not use it to truncate

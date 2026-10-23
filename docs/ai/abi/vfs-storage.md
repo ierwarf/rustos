@@ -511,6 +511,10 @@
   read-modify-write republishes the updated line, while an error leaves it
   invalid. This cache owns no dirty data and grants no authority beyond the
   mounted block device.
+- A storaged write's declared logical-block count must checked-multiply to
+  exactly the payload length and fit the admitted capacity before submission
+  or read-cache invalidation. Payload length cannot silently redefine the
+  caller's requested write extent.
 - Storaged invokes RustOS-private syscalls only through the raw
   `rustos-svc-runtime` entrypoints. A libc wrapper must not collapse raw
   negative results into `-1` plus TLS `errno`; transient `EAGAIN`, absence,
