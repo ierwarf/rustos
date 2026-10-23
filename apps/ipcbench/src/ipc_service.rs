@@ -6,8 +6,11 @@ use rustos_user_abi::performance::IPC_BOOT_CONTROL_HARD_LIMIT_MS;
 use rustos_user_abi::syscall::*;
 
 fn checked(entry: u64, block: &IpcRegisterBufferArgs) -> IpcRegisterResult {
-    let (result, fp_ok) =
-        unsafe { crate::ipc_simd::checked_buffer_syscall(entry, block as *const _ as u64) };
+    checked_pointer(entry, block as *const _ as u64)
+}
+
+fn checked_pointer(entry: u64, pointer: u64) -> IpcRegisterResult {
+    let (result, fp_ok) = unsafe { crate::ipc_simd::checked_buffer_syscall(entry, pointer) };
     assert!(
         fp_ok,
         "service buffer fastcall changed FP controls or leaked data"
@@ -34,15 +37,29 @@ pub(crate) fn preflight() -> bool {
     if checked(SYS_RUSTOS_IPC_REGISTER_CALL, &forged).status != -22 {
         return false;
     }
-    let (fault, fp_ok) =
-        unsafe { crate::ipc_simd::checked_buffer_syscall(SYS_RUSTOS_IPC_REGISTER_CALL, 0) };
-    if !fp_ok
-        || fault.status != -14
-        || fault.words != [0; 2]
-        || fault.reply != 0
-        || fault.sender_pid != 0
-        || fault.sender_tid != 0
-    {
+    // Null is outside RustOS's user range: the existing user-copy contract
+    // returns EINVAL, not EFAULT. A mapped, unreadable page tests EFAULT.
+    if checked_pointer(SYS_RUSTOS_IPC_REGISTER_CALL, 0).status != -22 {
+        return false;
+    }
+    // SAFETY: Request a private inaccessible page without dereferencing it.
+    let guard = unsafe {
+        libc::mmap(
+            core::ptr::null_mut(),
+            4096,
+            libc::PROT_NONE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if guard == libc::MAP_FAILED {
+        return false;
+    }
+    let fault = checked_pointer(SYS_RUSTOS_IPC_REGISTER_CALL, guard as u64);
+    // SAFETY: Release exactly the successful mapping after the syscall ends.
+    let released = unsafe { libc::munmap(guard, 4096) };
+    if fault.status != -14 || released != 0 {
         return false;
     }
     let endpoint = unsafe { crate::syscall0(SYS_RUSTOS_IPC_ENDPOINT_CREATE) };

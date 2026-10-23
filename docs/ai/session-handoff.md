@@ -19,14 +19,27 @@ initd/runtimed were routed through the common bridge; native-vs-libc errno handl
 was corrected only at those data boundaries. Registration/lookup/broker and Linux
 syscalls retain their old entry. Unsafe typed helpers require live valid buffers.
 
-So far: ABI 60, compat 190, common runtime 14, ipcbench 20 native tests passed;
-service native suites and xtask check passed. Read-only scout inventory and
-independent review found no concrete defects. Added unit/native mutation witnesses
-and untimed ring3 buffer-mode FP/large/fused preflight; full selected now/stable
-and fresh signed KVM runs are still pending. See `docs/ai/abi/ipc.md` for the new
-mode and source owners. Last pre-task 8-vCPU samples: getuid 17,400 vs same-MM
-fastcall 9,400 p50, CPUID drift 1.06%; not an ABI-only cost comparison. Evidence
-`build/bench-ipc-p01/current-getuid-fastcall/summary.json`.
+User committed the common service implementation as `24d01432` during validation.
+ABI 60, compat 190, common runtime 14, ipcbench 20 native tests and service suites
+passed. Selected now checks passed (53 before commit, 2 after the preflight repair);
+full PR verification sealed all 45 artifacts, including implementation mutations,
+Kani, Verus and concurrency triangle. KVM dry-run and both signed 8-vCPU benchmark
+boots passed. Independent read-only inventory/review found no concrete defects.
+
+The initial fastcall run was correctly rejected: its new preflight expected
+EFAULT for null, but the existing out-of-range user-copy contract returns EINVAL.
+Only the preflight was repaired: null now expects EINVAL, a PROT_NONE mapping
+separately proves EFAULT, and buffer/register skip reasons are distinguished.
+These two app-file fixes remain uncommitted; no kernel errno behavior changed.
+The successful fastcall boot passed real buffer-mode FP/control-state, 16/32-byte,
+authenticated-metadata, fused reply/receive and untouched-tail witnesses.
+
+Latest 8-vCPU, 20,000-sample raw results: same-MM fastcall p50 9,360 / p99 23,280;
+cross-process Linux getuid→syscalld p50 18,000 / p99 38,120 invariant-TSC ticks.
+CPUID p50 3,800 / 3,640 (4.40% drift): no matched speedup claim, no ABI-only cost
+comparison, and no <=8k claim. Source/ELF hashes and host boot match across both
+accepted runs. Evidence: `build/bench-ipc-p01/services/summary.json`; prior rejected
+run remains archived. See `docs/ai/abi/ipc.md` for mode/source ownership.
 
 ## Previous continuation — IPC P0/P1 (2026-10-23)
 
