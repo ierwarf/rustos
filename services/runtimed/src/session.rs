@@ -4,37 +4,37 @@ use std::time::{Duration, Instant};
 
 use keyboard_core::KeyCode;
 use runtime_control::{
-    load_runtime_default_env, RuntimeEnvScope, DEFAULT_RUNTIME_ENV_REGISTRY_PATH,
+    DEFAULT_RUNTIME_ENV_REGISTRY_PATH, RuntimeEnvScope, load_runtime_default_env,
 };
 use rustos_user_abi::console::{
     self as console_abi, ConsoleSendInputEventRequest, ConsoleSessionInfo, ConsoleSetFocusRequest,
     ConsoleSnapshotSessionOutputRequest, ConsoleSnapshotSessionsRequest, ConsoleStateInfo,
 };
-use rustos_user_abi::device::{InputEvent, INPUT_ACTION_RELEASED, INPUT_KIND_KEYBOARD};
+use rustos_user_abi::device::{INPUT_ACTION_RELEASED, INPUT_KIND_KEYBOARD, InputEvent};
 use rustos_user_abi::linux::LinuxTermios;
 use rustos_user_abi::syscall::{
-    CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
-    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, IpcRecvWithSenderArgs,
-    WaitSetSignalBrokerArgs, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_SESSIOND,
+    COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_SESSIOND,
     COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_GRAPH_READINESS,
     COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_READ, COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_READINESS,
     COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_WRITE, COMMERCIAL_MAX_SESSIOND_OP_CONSOLE_ROUTE,
     COMMERCIAL_MAX_SESSIOND_OP_FOREGROUND_FOCUS, COMMERCIAL_MAX_SESSIOND_OP_SESSION_GRAPH,
     COMMERCIAL_MAX_SESSIOND_OP_TTY_LINE_DISCIPLINE, COMMERCIAL_MAX_SESSIOND_OP_UI_BOOTSTRAP,
-    IPC_SERVICE_DEVMGRD, IPC_SERVICE_SESSIOND, SESSIOND_CONSOLE_GRAPH_WAIT_MAX_MS,
-    SESSIOND_CONSOLE_READINESS_LIVE, SESSIOND_CONSOLE_READINESS_READY,
-    SESSIOND_CONSOLE_READ_WAIT_MAX_MS, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
+    CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
+    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, IPC_SERVICE_DEVMGRD,
+    IPC_SERVICE_SESSIOND, IpcRecvWithSenderArgs, SESSIOND_CONSOLE_GRAPH_WAIT_MAX_MS,
+    SESSIOND_CONSOLE_READ_WAIT_MAX_MS, SESSIOND_CONSOLE_READINESS_LIVE,
+    SESSIOND_CONSOLE_READINESS_READY, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
     SYS_RUSTOS_IPC_RECV_WITH_SENDER_BOUNDED, SYS_RUSTOS_IPC_REPLY,
     SYS_RUSTOS_IPC_TRY_RECV_WITH_SENDER, SYS_RUSTOS_WAITSET_SIGNAL_BROKER, WAITSET_ABI_VERSION,
-    WAITSET_PROVIDER_SESSIOND,
+    WAITSET_PROVIDER_SESSIOND, WaitSetSignalBrokerArgs,
 };
 
-use super::{
-    boot_line, CONSOLE_SESSION_STATE_RUNNING, LINUX_FIONREAD, LINUX_TCGETS, LINUX_TCSETS,
-    LINUX_TCSETSF, LINUX_TCSETSW, UI_SERVER_BOOTSTRAP_ENV, UI_SERVER_DESKTOP_FILE_ID,
-    UI_SERVER_DISPLAY_NAME, UI_SERVER_EXEC_PATH, UI_SERVER_TASK_WEIGHT_MICROS,
-};
 use super::{BrokerState, LaunchEntry};
+use super::{
+    CONSOLE_SESSION_STATE_RUNNING, LINUX_FIONREAD, LINUX_TCGETS, LINUX_TCSETS, LINUX_TCSETSF,
+    LINUX_TCSETSW, UI_SERVER_BOOTSTRAP_ENV, UI_SERVER_DESKTOP_FILE_ID, UI_SERVER_DISPLAY_NAME,
+    UI_SERVER_EXEC_PATH, UI_SERVER_TASK_WEIGHT_MICROS, boot_line,
+};
 
 const INPUT_BUFFER_CAPACITY: usize = 1024;
 const EDIT_BUFFER_CAPACITY: usize = 256;
@@ -730,8 +730,8 @@ pub(super) fn service_session_endpoint(
     let mut sender_tid = 0_u64;
     let received = match wait {
         None => unsafe {
-            libc::syscall(
-                SYS_RUSTOS_IPC_TRY_RECV_WITH_SENDER as libc::c_long,
+            rustos_svc_runtime::syscall::syscall6(
+                SYS_RUSTOS_IPC_TRY_RECV_WITH_SENDER,
                 endpoint,
                 (&mut request as *mut CommercialMaxProtocolRequest) as u64,
                 size_of::<CommercialMaxProtocolRequest>() as u64,
@@ -754,8 +754,8 @@ pub(super) fn service_session_endpoint(
                 sender_tid_ptr: (&mut sender_tid as *mut u64) as u64,
             };
             unsafe {
-                libc::syscall(
-                    SYS_RUSTOS_IPC_RECV_WITH_SENDER_BOUNDED as libc::c_long,
+                rustos_svc_runtime::syscall::syscall2(
+                    SYS_RUSTOS_IPC_RECV_WITH_SENDER_BOUNDED,
                     (&args as *const IpcRecvWithSenderArgs) as u64,
                     budget_ms,
                 ) as i64
@@ -826,8 +826,8 @@ pub(super) fn service_session_endpoint(
         // could be parked at all.
     }
     let reply = unsafe {
-        libc::syscall(
-            SYS_RUSTOS_IPC_REPLY as libc::c_long,
+        rustos_svc_runtime::syscall::syscall3(
+            SYS_RUSTOS_IPC_REPLY,
             reply_cap,
             (&response as *const CommercialMaxProtocolResponse) as u64,
             size_of::<CommercialMaxProtocolResponse>() as u64,
@@ -977,7 +977,10 @@ fn report_console_graph_wait_release(
         generation,
         waited_us,
         last_advance
-            .map(|at| now.saturating_duration_since(at).as_micros().min(u128::from(u64::MAX)) as u64)
+            .map(|at| now
+                .saturating_duration_since(at)
+                .as_micros()
+                .min(u128::from(u64::MAX)) as u64)
             .unwrap_or(u64::MAX),
         GRAPH_ADVANCES.load(Ordering::Relaxed),
         total,
@@ -1054,12 +1057,12 @@ fn answer_parked_console_graph_wait(waiter: ConsoleGraphWaiter, state: &mut Brok
     response.header.version = COMMERCIAL_MAX_PROTOCOL_ABI_VERSION;
     response.status = handle_session_request(&waiter.request, state, &mut response);
     let reply = unsafe {
-        libc::syscall(
-            SYS_RUSTOS_IPC_REPLY as libc::c_long,
+        rustos_svc_runtime::syscall::syscall3(
+            SYS_RUSTOS_IPC_REPLY,
             waiter.reply_cap,
             (&response as *const CommercialMaxProtocolResponse) as u64,
             size_of::<CommercialMaxProtocolResponse>() as u64,
-        ) as i64
+        )
     };
     if reply < 0 {
         super::spawn::debug_line("runtimed: parked console graph reply failed");
@@ -1109,12 +1112,12 @@ fn answer_parked_console_read(waiter: ConsoleReadWaiter, state: &mut BrokerState
     response.header.version = COMMERCIAL_MAX_PROTOCOL_ABI_VERSION;
     response.status = handle_session_request(&waiter.request, state, &mut response);
     let reply = unsafe {
-        libc::syscall(
-            SYS_RUSTOS_IPC_REPLY as libc::c_long,
+        rustos_svc_runtime::syscall::syscall3(
+            SYS_RUSTOS_IPC_REPLY,
             waiter.reply_cap,
             (&response as *const CommercialMaxProtocolResponse) as u64,
             size_of::<CommercialMaxProtocolResponse>() as u64,
-        ) as i64
+        )
     };
     if reply < 0 {
         super::spawn::debug_line("runtimed: parked console read reply failed");
@@ -1716,22 +1719,22 @@ mod tests {
     use std::mem::size_of;
 
     use super::{
+        ConsoleReadWaiter, MAX_PARKED_CONSOLE_READS, OUTPUT_BUFFER_CAPACITY, SessionRuntime,
         console_read_park_budget, session_ingress_identity_authorized, session_op_accepts_ioctl,
-        ui_bootstrap_may_retry_immediately, ConsoleReadWaiter, SessionRuntime,
-        MAX_PARKED_CONSOLE_READS, OUTPUT_BUFFER_CAPACITY,
+        ui_bootstrap_may_retry_immediately,
     };
     use crate::{BrokerState, RunningProcess};
     use keyboard_core::KeyCode;
     use rustos_user_abi::console::{
         self as console_abi, ConsoleSessionInfo, ConsoleSnapshotSessionsRequest,
     };
-    use rustos_user_abi::device::{InputEvent, INPUT_ACTION_PRESSED, INPUT_KIND_KEYBOARD};
+    use rustos_user_abi::device::{INPUT_ACTION_PRESSED, INPUT_KIND_KEYBOARD, InputEvent};
     use rustos_user_abi::linux::LinuxTermios;
     use rustos_user_abi::syscall::{
-        CommercialMaxProtocolRequest, CommercialMaxProtocolResponse,
         COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_GRAPH_READINESS,
         COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_READ, COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_WRITE,
         COMMERCIAL_MAX_SESSIOND_OP_CONSOLE_ROUTE, COMMERCIAL_MAX_SESSIOND_OP_UI_BOOTSTRAP,
+        CommercialMaxProtocolRequest, CommercialMaxProtocolResponse,
         SESSIOND_CONSOLE_GRAPH_WAIT_MAX_MS, SESSIOND_CONSOLE_READ_WAIT_MAX_MS,
     };
     use std::time::{Duration, Instant};
@@ -1910,25 +1913,33 @@ mod tests {
         runtime.create_session(session);
         let initial = runtime.input_readiness_generation();
 
-        assert!(!runtime
-            .handle_input_event(session, key_event(30, b'x'))
-            .expect("canonical edit is accepted but not readable"));
+        assert!(
+            !runtime
+                .handle_input_event(session, key_event(30, b'x'))
+                .expect("canonical edit is accepted but not readable")
+        );
         assert_eq!(runtime.input_readiness_generation(), initial);
-        assert!(runtime
-            .handle_input_event(session, key_event(KeyCode::Enter as u32, b'\n'))
-            .expect("enter makes the canonical line readable"));
+        assert!(
+            runtime
+                .handle_input_event(session, key_event(KeyCode::Enter as u32, b'\n'))
+                .expect("enter makes the canonical line readable")
+        );
         assert_eq!(runtime.input_readiness_generation(), initial + 1);
 
-        assert!(!runtime
-            .handle_input_event(session, key_event(KeyCode::Enter as u32, b'\n'))
-            .expect("already-ready input does not republish"));
+        assert!(
+            !runtime
+                .handle_input_event(session, key_event(KeyCode::Enter as u32, b'\n'))
+                .expect("already-ready input does not republish")
+        );
         assert_eq!(runtime.input_readiness_generation(), initial + 1);
 
         let mut drained = [0_u8; 8];
         assert_ne!(runtime.read_from_session(session, &mut drained), Some(0));
-        assert!(runtime
-            .handle_input_event(session, key_event(KeyCode::Enter as u32, b'\n'))
-            .expect("a new empty-to-ready transition republishes"));
+        assert!(
+            runtime
+                .handle_input_event(session, key_event(KeyCode::Enter as u32, b'\n'))
+                .expect("a new empty-to-ready transition republishes")
+        );
         assert_eq!(runtime.input_readiness_generation(), initial + 2);
     }
 

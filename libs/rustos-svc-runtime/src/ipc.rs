@@ -1,11 +1,14 @@
-//! Thin convenience wrappers around the RustOS native IPC syscalls. Services
-//! can call these directly without going through libc.
+//! Common service IPC over the opt-in fastcall boundary, without libc.
+//! Exact short shapes use registers; other messages/deadlines/handles retain
+//! the original buffer handlers in the same syscall, never a post-commit retry.
+
+mod fastcall;
 
 use alloc::{format, vec::Vec};
 use core::sync::atomic::{AtomicU64, Ordering};
 use rustos_user_abi::syscall::{
-    IpcReplyRecvResultKind, IpcReplyRecvWithSenderArgs, ProductExecutableSnapshotEvidence,
-    RustosIpcValidateServiceOwnerArgs, IPC_ABI_VERSION, SYS_RUSTOS_DEBUG_PRINT,
+    IPC_ABI_VERSION, IpcReplyRecvResultKind, IpcReplyRecvWithSenderArgs,
+    ProductExecutableSnapshotEvidence, RustosIpcValidateServiceOwnerArgs, SYS_RUSTOS_DEBUG_PRINT,
     SYS_RUSTOS_IPC_CALL, SYS_RUSTOS_IPC_CALL_BOUNDED, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
     SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_RECV_WITH_SENDER,
     SYS_RUSTOS_IPC_REGISTER_LINUX_SYSCALL_ENDPOINT, SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT,
@@ -119,6 +122,9 @@ pub fn validate_service_owner(service_id: u64, sender_pid: u64) -> i64 {
     }
 }
 
+/// # Safety
+/// Input/output ranges must remain valid for the call and obey the endpoint's
+/// one-shot protocol. The reply may alias the request after it has been packed.
 #[inline]
 pub unsafe fn call(
     endpoint: u64,
@@ -127,6 +133,11 @@ pub unsafe fn call(
     reply: *mut u8,
     reply_capacity: usize,
 ) -> i64 {
+    if let Some(result) =
+        unsafe { fastcall::call(endpoint, request, request_len, reply, reply_capacity) }
+    {
+        return result;
+    }
     syscall5(
         SYS_RUSTOS_IPC_CALL,
         endpoint,
@@ -161,6 +172,10 @@ pub unsafe fn call_bounded(
 
 /// Receive one request together with the kernel-stamped sender identity.
 /// Policy services must use this form whenever request fields claim a PID/TID.
+///
+/// # Safety
+/// The receive range and three disjoint output words must remain writable
+/// throughout the call; the sender identity is kernel-authenticated.
 #[inline]
 pub unsafe fn recv_with_sender(
     endpoint: u64,
@@ -170,6 +185,18 @@ pub unsafe fn recv_with_sender(
     sender_pid_out: *mut u64,
     sender_tid_out: *mut u64,
 ) -> i64 {
+    if let Some(result) = unsafe {
+        fastcall::receive(
+            endpoint,
+            request_buf,
+            request_capacity,
+            reply_cap_out,
+            sender_pid_out,
+            sender_tid_out,
+        )
+    } {
+        return result;
+    }
     syscall6(
         SYS_RUSTOS_IPC_RECV_WITH_SENDER,
         endpoint,
@@ -205,8 +232,15 @@ pub unsafe fn try_recv_with_sender(
 }
 
 /// Send a reply to the caller identified by `reply_cap`.
+///
+/// # Safety
+/// `response` is readable for `response_len` bytes (may be null when empty),
+/// and the caller owns the one-shot reply capability.
 #[inline]
 pub unsafe fn reply(reply_cap: u64, response: *const u8, response_len: usize) -> i64 {
+    if let Some(result) = unsafe { fastcall::reply(reply_cap, response, response_len) } {
+        return result;
+    }
     syscall3(
         SYS_RUSTOS_IPC_REPLY,
         reply_cap,
@@ -222,6 +256,10 @@ pub unsafe fn reply(reply_cap: u64, response: *const u8, response_len: usize) ->
 /// errno means the reply was not consumed.  Use
 /// [`reply_recv_committed_errno`] to identify a receive failure after the
 /// reply commit; the old reply capability must never be retried in that case.
+///
+/// # Safety
+/// The response and request ranges remain live and disjoint; the three output
+/// words remain exclusively writable and the caller owns `reply_cap`.
 #[inline]
 pub unsafe fn reply_recv_with_sender(
     endpoint: u64,
@@ -234,6 +272,21 @@ pub unsafe fn reply_recv_with_sender(
     sender_pid_out: *mut u64,
     sender_tid_out: *mut u64,
 ) -> i64 {
+    if let Some(result) = unsafe {
+        fastcall::reply_receive(
+            endpoint,
+            reply_cap,
+            response,
+            response_len,
+            request_buf,
+            request_capacity,
+            next_reply_cap_out,
+            sender_pid_out,
+            sender_tid_out,
+        )
+    } {
+        return result;
+    }
     let args = IpcReplyRecvWithSenderArgs {
         abi_version: IPC_ABI_VERSION,
         endpoint,

@@ -22,15 +22,15 @@ use std::time::Instant;
 
 use rustos_user_abi::performance::IPC_BOOT_CONTROL_HARD_LIMIT_MS;
 use rustos_user_abi::syscall::{
-    LoaderActivateBatchRequest, LoaderActivateBatchResponse, LOADER_ACTIVATE_BATCH_ABI_VERSION,
-    LOADER_ACTIVATE_BATCH_MAX_TARGETS, LOADER_OP_ACTIVATE_BATCH, SYS_RUSTOS_IPC_CALL_BOUNDED,
+    LOADER_ACTIVATE_BATCH_ABI_VERSION, LOADER_ACTIVATE_BATCH_MAX_TARGETS, LOADER_OP_ACTIVATE_BATCH,
+    LoaderActivateBatchRequest, LoaderActivateBatchResponse, SYS_RUSTOS_IPC_CALL_BOUNDED,
 };
 
 use super::bootstrap_barrier::endpoint_admission_may_overlap;
 use super::{
-    admit_running_service_endpoint, boot_line, fail_closed, fail_closed_after_children_cleanup,
-    lookup_loader_endpoint, RunningService, LOADER_ENDPOINT_CACHE, RUNTIMED_EXEC_PATH,
-    SECONDARY_SERVICE_DEFER_AFTER_RUNTIMED,
+    LOADER_ENDPOINT_CACHE, RUNTIMED_EXEC_PATH, RunningService,
+    SECONDARY_SERVICE_DEFER_AFTER_RUNTIMED, admit_running_service_endpoint, boot_line, fail_closed,
+    fail_closed_after_children_cleanup, lookup_loader_endpoint,
 };
 
 fn activate_spawned_services(pids: &[i32]) -> Result<(), i32> {
@@ -40,9 +40,9 @@ fn activate_spawned_services(pids: &[i32]) -> Result<(), i32> {
     // SAFETY: Request and response are initialized, exact-sized ABI records
     // and remain exclusively live for the duration of the bounded call.
     let call = unsafe {
-        libc::syscall(
-            SYS_RUSTOS_IPC_CALL_BOUNDED as libc::c_long,
-            endpoint,
+        rustos_svc_runtime::syscall::syscall6(
+            SYS_RUSTOS_IPC_CALL_BOUNDED,
+            endpoint as u64,
             (&request as *const LoaderActivateBatchRequest) as u64,
             size_of::<LoaderActivateBatchRequest>() as u64,
             (&mut response as *mut LoaderActivateBatchResponse) as u64,
@@ -50,7 +50,6 @@ fn activate_spawned_services(pids: &[i32]) -> Result<(), i32> {
             IPC_BOOT_CONTROL_HARD_LIMIT_MS,
         ) as i64
     };
-    let call = super::libc_syscall_status(call);
     if call < 0 {
         LOADER_ENDPOINT_CACHE.store(0, Ordering::Relaxed);
         return Err((-call) as i32);

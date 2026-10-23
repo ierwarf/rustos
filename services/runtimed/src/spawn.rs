@@ -17,36 +17,34 @@
 use std::ffi::CString;
 use std::mem::size_of;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::sync::atomic::Ordering;
 use std::sync::OnceLock;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use runtime_control::read_bounded_config_snapshot;
 use rustos_user_abi::performance::IPC_BOOT_CONTROL_HARD_LIMIT_MS;
 use rustos_user_abi::syscall::{
-    smp_qualification_bind_shape_valid, CommercialMaxProtocolRequest,
-    CommercialMaxProtocolResponse, LoaderSpawnRequest, LoaderSpawnResponse,
-    RustosIpcWaitServiceEndpointArgs, RustosSchedulingContextAuthority,
-    RustosSmpQualificationBindArgs, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
-    COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR, COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL,
-    COMMERCIAL_MAX_ROOTD_OP_SCHEDULING_CONTEXT_GRANT, IPC_SERVICE_LOADERD, IPC_SERVICE_ROOTD,
-    IPC_SERVICE_UISERVER, IPC_WAIT_SERVICE_ENDPOINT_ABI_VERSION, LOADER_OP_ACTIVATE,
-    LOADER_OP_SPAWN_EXEC, LOADER_REQUEST_ABI_VERSION, LOADER_SPAWN_ARG_BYTES,
+    COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR,
+    COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL, COMMERCIAL_MAX_ROOTD_OP_SCHEDULING_CONTEXT_GRANT,
+    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, IPC_SERVICE_LOADERD,
+    IPC_SERVICE_ROOTD, IPC_SERVICE_UISERVER, IPC_WAIT_SERVICE_ENDPOINT_ABI_VERSION,
+    LOADER_OP_ACTIVATE, LOADER_OP_SPAWN_EXEC, LOADER_REQUEST_ABI_VERSION, LOADER_SPAWN_ARG_BYTES,
     LOADER_SPAWN_ENV_BYTES, LOADER_SPAWN_EXEC_PATH_CAPACITY, LOADER_SPAWN_FLAG_DEFER_START,
+    LoaderSpawnRequest, LoaderSpawnResponse, RustosIpcWaitServiceEndpointArgs,
+    RustosSchedulingContextAuthority, RustosSmpQualificationBindArgs,
     SMP_QUALIFICATION_BIND_ABI_VERSION, SYS_RUSTOS_IPC_CALL_BOUNDED,
     SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_WAIT_SERVICE_ENDPOINT,
-    SYS_RUSTOS_SMP_QUALIFICATION_BIND,
+    SYS_RUSTOS_SMP_QUALIFICATION_BIND, smp_qualification_bind_shape_valid,
 };
 
 use super::kvm_smp_qualification::{
-    qualification_contract_for_launch, KvmSmpQualificationContract,
+    KvmSmpQualificationContract, qualification_contract_for_launch,
 };
 use super::{
-    boot_line, AT_FDCWD, CONSOLE_PATH, CONSOLE_SESSION_STATE_LOADING_IMAGE,
-    CONSOLE_SESSION_STATE_RUNNING, CONSOLE_SESSION_STATE_SPAWNING, DEFAULT_USER_TASK_WEIGHT_MICROS,
-    IDLE_POLL_INTERVAL, LOADER_ENDPOINT_CACHE, MAX_UNTRUSTED_TASK_WEIGHT_MICROS,
-    MIN_EFFECTIVE_TASK_WEIGHT_MICROS, O_RDWR, SYS_OPENAT, UI_SERVER_EXEC_PATH,
-    UI_SERVER_TASK_WEIGHT_MICROS,
+    AT_FDCWD, CONSOLE_PATH, CONSOLE_SESSION_STATE_LOADING_IMAGE, CONSOLE_SESSION_STATE_RUNNING,
+    CONSOLE_SESSION_STATE_SPAWNING, DEFAULT_USER_TASK_WEIGHT_MICROS, IDLE_POLL_INTERVAL,
+    LOADER_ENDPOINT_CACHE, MAX_UNTRUSTED_TASK_WEIGHT_MICROS, MIN_EFFECTIVE_TASK_WEIGHT_MICROS,
+    O_RDWR, SYS_OPENAT, UI_SERVER_EXEC_PATH, UI_SERVER_TASK_WEIGHT_MICROS, boot_line,
 };
 use super::{BrokerState, LaunchEntry, RunningProcess};
 
@@ -759,17 +757,16 @@ pub(super) fn spawn_exec(
     let endpoint = lookup_loader_endpoint()?;
     let mut response = LoaderSpawnResponse::default();
     let call = unsafe {
-        libc::syscall(
-            SYS_RUSTOS_IPC_CALL_BOUNDED as libc::c_long,
-            endpoint,
+        rustos_svc_runtime::syscall::syscall6(
+            SYS_RUSTOS_IPC_CALL_BOUNDED,
+            endpoint as u64,
             (&request as *const LoaderSpawnRequest) as u64,
             size_of::<LoaderSpawnRequest>() as u64,
             (&mut response as *mut LoaderSpawnResponse) as u64,
             size_of::<LoaderSpawnResponse>() as u64,
             IPC_BOOT_CONTROL_HARD_LIMIT_MS,
-        ) as i64
+        )
     };
-    let call = libc_syscall_status(call);
     if call < 0 {
         LOADER_ENDPOINT_CACHE.store(0, Ordering::Relaxed);
         return Err((-call) as i32);
@@ -853,17 +850,16 @@ fn activate_spawned_process(pid: i32) -> Result<(), i32> {
     let endpoint = lookup_loader_endpoint()?;
     let mut response = LoaderSpawnResponse::default();
     let call = unsafe {
-        libc::syscall(
-            SYS_RUSTOS_IPC_CALL_BOUNDED as libc::c_long,
-            endpoint,
+        rustos_svc_runtime::syscall::syscall6(
+            SYS_RUSTOS_IPC_CALL_BOUNDED,
+            endpoint as u64,
             (&request as *const LoaderSpawnRequest) as u64,
             size_of::<LoaderSpawnRequest>() as u64,
             (&mut response as *mut LoaderSpawnResponse) as u64,
             size_of::<LoaderSpawnResponse>() as u64,
             IPC_BOOT_CONTROL_HARD_LIMIT_MS,
-        ) as i64
+        )
     };
-    let call = libc_syscall_status(call);
     if call < 0 {
         LOADER_ENDPOINT_CACHE.store(0, Ordering::Relaxed);
         return Err((-call) as i32);
@@ -1057,7 +1053,7 @@ fn build_exec_argv(exec_path: &str, argv: &[String]) -> Result<Vec<CString>, i32
 
 fn build_exec_env(extra_env: &[String]) -> Result<Vec<CString>, i32> {
     use runtime_control::{
-        load_runtime_default_env, RuntimeEnvScope, DEFAULT_RUNTIME_ENV_REGISTRY_PATH,
+        DEFAULT_RUNTIME_ENV_REGISTRY_PATH, RuntimeEnvScope, load_runtime_default_env,
     };
     let default_env =
         load_runtime_default_env(DEFAULT_RUNTIME_ENV_REGISTRY_PATH, RuntimeEnvScope::Runtime)
@@ -1149,7 +1145,11 @@ pub(super) fn is_permanent_launch_failure(errno: i32) -> bool {
 // Restore the kernel's negative-errno representation immediately after libc,
 // before another syscall or logging can overwrite this thread's errno.
 fn libc_syscall_status(status: i64) -> i64 {
-    if status == -1 { -i64::from(last_errno()) } else { status }
+    if status == -1 {
+        -i64::from(last_errno())
+    } else {
+        status
+    }
 }
 
 fn last_errno() -> i32 {

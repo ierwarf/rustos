@@ -60,7 +60,11 @@ elide hardware SIMD custody. `user::syscall::set_kernel_stack_top(top,
 register_ipc)` installs entry's GS-private ABI selector with that same retained
 architecture's stack under IRQ exclusion. Initial/current/generic/lane installs
 derive the selector from the original context's Linux ABI, never PID telemetry
-or the unused legacy GS current-task pointer. See [IPC ABI](abi/ipc.md).
+or the unused legacy GS current-task pointer. The same guard covers the service
+fastcall buffer slow mode: a fault-revalidated `IpcRegisterBufferArgs` snapshot
+may name only an allowlisted IPC data operation in its matching entry family;
+that original handler runs once, without replaying a committed call. See
+[IPC ABI](abi/ipc.md).
 
 ## Boot order
 

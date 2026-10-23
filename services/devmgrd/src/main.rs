@@ -21,12 +21,6 @@ use std::thread;
 use std::time::Duration;
 
 use rustos_user_abi::syscall::{
-    identity_is_exact_sender, CommercialMaxCapabilityLeaseWire,
-    CommercialMaxProtocolDescriptorWire, CommercialMaxProtocolRequest,
-    CommercialMaxProtocolResponse, DevmgrdDeviceIoctlRequest, DevmgrdDeviceIoctlResponse,
-    DevmgrdDeviceOpenRequest, DevmgrdDeviceOpenResponse, DevmgrdIpcRequest, DevmgrdIpcResponse,
-    DevmgrdNodeEntry, IpcReplyWithHandlesArgs, RustosDeviceIoctlBrokerArgs,
-    RustosDeviceOpenBrokerArgs, RustosIpcValidateServiceOwnerArgs,
     COMMERCIAL_MAX_DEVMGRD_OP_DEVICE_EVENT_SUBSCRIBE, COMMERCIAL_MAX_DEVMGRD_OP_DEVICE_MAP,
     COMMERCIAL_MAX_DEVMGRD_OP_DEVICE_OPEN, COMMERCIAL_MAX_DEVMGRD_OP_DEVICE_REGISTRY,
     COMMERCIAL_MAX_DEVMGRD_OP_IOCTL_AUTHORIZE, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
@@ -35,22 +29,26 @@ use rustos_user_abi::syscall::{
     COMMERCIAL_MAX_SESSIOND_OP_CONSOLE_ROUTE, COMMERCIAL_MAX_SESSIOND_OP_FOREGROUND_FOCUS,
     COMMERCIAL_MAX_SESSIOND_OP_SESSION_GRAPH, COMMERCIAL_MAX_UISERVER_OP_DISPLAY_METADATA,
     COMMERCIAL_MAX_UISERVER_OP_PRESENT_POLICY, COMMERCIAL_MAX_UISERVER_OP_SURFACE_POLICY,
-    DEVMGRD_DEVICE_ACCESS_EVDEV, DEVMGRD_DEVICE_ACCESS_NATIVE, DEVMGRD_DEVICE_ID_CONSOLE,
-    DEVMGRD_DEVICE_ID_DISPLAY, DEVMGRD_DEVICE_ID_INPUT, DEVMGRD_DEVICE_RIGHT_ADMIN,
-    DEVMGRD_DEVICE_RIGHT_IOCTL, DEVMGRD_DEVICE_RIGHT_MAP, DEVMGRD_DEVICE_RIGHT_READ,
-    DEVMGRD_DEVICE_RIGHT_TRANSFER, DEVMGRD_DEVICE_RIGHT_WRITE, DEVMGRD_IOCTL_LINUX_TTY_FIONREAD,
-    DEVMGRD_IOCTL_LINUX_TTY_TCGETS, DEVMGRD_IOCTL_LINUX_TTY_TCSETS,
-    DEVMGRD_IOCTL_LINUX_TTY_TCSETSF, DEVMGRD_IOCTL_LINUX_TTY_TCSETSW, DEVMGRD_IOCTL_ROUTE_DEVMGRD,
-    DEVMGRD_IOCTL_ROUTE_DIRECT, DEVMGRD_IOCTL_ROUTE_SESSIOND_COMMIT,
-    DEVMGRD_IOCTL_ROUTE_SESSIOND_TTY, DEVMGRD_IPC_ABI_VERSION, DEVMGRD_IPC_OP_IOCTL_AUTHORIZE,
-    DEVMGRD_IPC_OP_IOCTL_ROUTE, DEVMGRD_IPC_OP_LOOKUP, DEVMGRD_IPC_OP_OPEN, DEVMGRD_IPC_OP_READDIR,
-    DEVMGRD_MAX_DIR_ENTRIES, DEVMGRD_NAME_CAPACITY, DEVMGRD_NODE_KIND_DEVICE,
-    DEVMGRD_NODE_KIND_DIR, IPC_ABI_VERSION, IPC_MAX_INLINE_BYTES, IPC_SERVICE_DEVMGRD,
-    IPC_SERVICE_SESSIOND, IPC_SERVICE_UISERVER,
+    CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
+    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, DEVMGRD_DEVICE_ACCESS_EVDEV,
+    DEVMGRD_DEVICE_ACCESS_NATIVE, DEVMGRD_DEVICE_ID_CONSOLE, DEVMGRD_DEVICE_ID_DISPLAY,
+    DEVMGRD_DEVICE_ID_INPUT, DEVMGRD_DEVICE_RIGHT_ADMIN, DEVMGRD_DEVICE_RIGHT_IOCTL,
+    DEVMGRD_DEVICE_RIGHT_MAP, DEVMGRD_DEVICE_RIGHT_READ, DEVMGRD_DEVICE_RIGHT_TRANSFER,
+    DEVMGRD_DEVICE_RIGHT_WRITE, DEVMGRD_IOCTL_LINUX_TTY_FIONREAD, DEVMGRD_IOCTL_LINUX_TTY_TCGETS,
+    DEVMGRD_IOCTL_LINUX_TTY_TCSETS, DEVMGRD_IOCTL_LINUX_TTY_TCSETSF,
+    DEVMGRD_IOCTL_LINUX_TTY_TCSETSW, DEVMGRD_IOCTL_ROUTE_DEVMGRD, DEVMGRD_IOCTL_ROUTE_DIRECT,
+    DEVMGRD_IOCTL_ROUTE_SESSIOND_COMMIT, DEVMGRD_IOCTL_ROUTE_SESSIOND_TTY, DEVMGRD_IPC_ABI_VERSION,
+    DEVMGRD_IPC_OP_IOCTL_AUTHORIZE, DEVMGRD_IPC_OP_IOCTL_ROUTE, DEVMGRD_IPC_OP_LOOKUP,
+    DEVMGRD_IPC_OP_OPEN, DEVMGRD_IPC_OP_READDIR, DEVMGRD_MAX_DIR_ENTRIES, DEVMGRD_NAME_CAPACITY,
+    DEVMGRD_NODE_KIND_DEVICE, DEVMGRD_NODE_KIND_DIR, DevmgrdDeviceIoctlRequest,
+    DevmgrdDeviceIoctlResponse, DevmgrdDeviceOpenRequest, DevmgrdDeviceOpenResponse,
+    DevmgrdIpcRequest, DevmgrdIpcResponse, DevmgrdNodeEntry, IPC_ABI_VERSION, IPC_MAX_INLINE_BYTES,
+    IPC_SERVICE_DEVMGRD, IPC_SERVICE_SESSIOND, IPC_SERVICE_UISERVER, IpcReplyWithHandlesArgs,
+    RustosDeviceIoctlBrokerArgs, RustosDeviceOpenBrokerArgs, RustosIpcValidateServiceOwnerArgs,
     SYS_RUSTOS_DEVICE_IOCTL_BROKER, SYS_RUSTOS_DEVICE_OPEN_BROKER, SYS_RUSTOS_IPC_CALL,
     SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT,
     SYS_RUSTOS_IPC_RECV_WITH_SENDER, SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_IPC_REPLY_WITH_HANDLES,
-    SYS_RUSTOS_IPC_VALIDATE_SERVICE_OWNER,
+    SYS_RUSTOS_IPC_VALIDATE_SERVICE_OWNER, identity_is_exact_sender,
 };
 
 const RECV_BACKOFF: Duration = Duration::from_millis(10);
@@ -670,7 +668,7 @@ fn call_sessiond_ioctl(
         size_of::<CommercialMaxProtocolResponse>() as u64,
     );
     if result < 0 {
-        let errno = last_errno();
+        let errno = (-result) as i32;
         if ioctl_request.request == rustos_user_abi::console::CONSOLE_IOCTL_SET_FOCUS {
             debug_line(format!("devmgrd: sessiond call failed errno={errno}").as_str());
         }
@@ -786,7 +784,7 @@ fn authorize_session_ioctl(op: u16, request_number: u64) -> Result<(), i32> {
         size_of::<CommercialMaxProtocolResponse>() as u64,
     );
     if result < 0 {
-        return Err(last_errno());
+        return Err((-result) as i32);
     }
     if result as usize != size_of::<CommercialMaxProtocolResponse>()
         || !response.is_valid_envelope_for(&request)
@@ -827,7 +825,7 @@ fn authorize_uiserver_ioctl(op: u16, request_number: u64) -> Result<(), i32> {
         debug_line("devmgrd: uiserver display policy call returned");
     }
     if result < 0 {
-        return Err(last_errno());
+        return Err((-result) as i32);
     }
     if result as usize != size_of::<CommercialMaxProtocolResponse>()
         || !response.is_valid_envelope_for(&request)
@@ -1117,36 +1115,70 @@ fn encode_node_entry(name: &str, kind: u16) -> Option<DevmgrdNodeEntry> {
 }
 
 fn syscall0(number: u64) -> i64 {
+    // SAFETY: The bridge owns its descriptor; callers retain IPC buffers until return.
+    if let Some(result) = unsafe { rustos_svc_runtime::syscall::try_fast_ipc(number, [0; 6]) } {
+        return result;
+    }
     // SAFETY: This is the centralized zero-argument raw-syscall boundary; each
     // caller supplies a RustOS ABI number whose result is decoded immediately.
     unsafe { libc::syscall(number as libc::c_long) as i64 }
 }
 
 fn syscall1(number: u64, arg0: u64) -> i64 {
+    // SAFETY: The bridge owns its descriptor; callers retain IPC buffers until return.
+    if let Some(result) =
+        unsafe { rustos_svc_runtime::syscall::try_fast_ipc(number, [arg0, 0, 0, 0, 0, 0]) }
+    {
+        return result;
+    }
     // SAFETY: The caller constructs `arg0` according to the selected RustOS
     // syscall ABI and retains any referenced storage through the call.
     unsafe { libc::syscall(number as libc::c_long, arg0) as i64 }
 }
 
 fn syscall2(number: u64, arg0: u64, arg1: u64) -> i64 {
+    // SAFETY: The bridge owns its descriptor; callers retain IPC buffers until return.
+    if let Some(result) =
+        unsafe { rustos_svc_runtime::syscall::try_fast_ipc(number, [arg0, arg1, 0, 0, 0, 0]) }
+    {
+        return result;
+    }
     // SAFETY: Both raw words are admitted by the caller-specific ABI wrapper;
     // referenced buffers, if any, remain live through this synchronous call.
     unsafe { libc::syscall(number as libc::c_long, arg0, arg1) as i64 }
 }
 
 fn syscall3(number: u64, arg0: u64, arg1: u64, arg2: u64) -> i64 {
+    // SAFETY: The bridge owns its descriptor; callers retain IPC buffers until return.
+    if let Some(result) =
+        unsafe { rustos_svc_runtime::syscall::try_fast_ipc(number, [arg0, arg1, arg2, 0, 0, 0]) }
+    {
+        return result;
+    }
     // SAFETY: The caller owns the typed RustOS ABI envelope represented by
     // these three words and retains pointed-to storage until return.
     unsafe { libc::syscall(number as libc::c_long, arg0, arg1, arg2) as i64 }
 }
 
 fn syscall5(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> i64 {
+    // SAFETY: The bridge owns its descriptor; callers retain IPC buffers until return.
+    if let Some(result) = unsafe {
+        rustos_svc_runtime::syscall::try_fast_ipc(number, [arg0, arg1, arg2, arg3, arg4, 0])
+    } {
+        return result;
+    }
     // SAFETY: The caller validates the five-word RustOS syscall contract and
     // keeps every referenced input/output object live for the synchronous call.
     unsafe { libc::syscall(number as libc::c_long, arg0, arg1, arg2, arg3, arg4) as i64 }
 }
 
 fn syscall6(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i64 {
+    // SAFETY: The bridge owns its descriptor; callers retain IPC buffers until return.
+    if let Some(result) = unsafe {
+        rustos_svc_runtime::syscall::try_fast_ipc(number, [arg0, arg1, arg2, arg3, arg4, arg5])
+    } {
+        return result;
+    }
     // SAFETY: The caller validates the six-word RustOS syscall contract and
     // keeps every referenced input/output object live for the synchronous call.
     unsafe { libc::syscall(number as libc::c_long, arg0, arg1, arg2, arg3, arg4, arg5) as i64 }

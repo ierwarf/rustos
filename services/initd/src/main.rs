@@ -26,24 +26,25 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use runtime_control::{
-    load_runtime_default_env, load_startup_entries, RuntimeEnvScope, StartupEntry, StartupMode,
-    DEFAULT_RUNTIME_ENV_REGISTRY_PATH, DEFAULT_STARTUP_REGISTRY_PATH,
+    DEFAULT_RUNTIME_ENV_REGISTRY_PATH, DEFAULT_STARTUP_REGISTRY_PATH, RuntimeEnvScope,
+    StartupEntry, StartupMode, load_runtime_default_env, load_startup_entries,
 };
 use rustos_user_abi::performance::IPC_BOOT_CONTROL_HARD_LIMIT_MS;
 use rustos_user_abi::syscall::{
-    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, LoaderSpawnRequest,
-    LoaderSpawnResponse, RustosIpcWaitServiceEndpointArgs, RustosSchedulingContextAuthority,
     COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR,
     COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_QUERY, COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_RECLAIM,
     COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL, COMMERCIAL_MAX_ROOTD_OP_SCHEDULING_CONTEXT_GRANT,
-    IPC_SERVICE_DEVMGRD, IPC_SERVICE_INITD, IPC_SERVICE_INPUTD, IPC_SERVICE_LINUX_SYSCALLD,
-    IPC_SERVICE_LOADERD, IPC_SERVICE_NETD, IPC_SERVICE_ROOTD, IPC_SERVICE_SESSIOND,
-    IPC_SERVICE_STORAGED, IPC_SERVICE_VFSD, IPC_WAIT_SERVICE_ENDPOINT_ABI_VERSION,
+    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, IPC_SERVICE_DEVMGRD,
+    IPC_SERVICE_INITD, IPC_SERVICE_INPUTD, IPC_SERVICE_LINUX_SYSCALLD, IPC_SERVICE_LOADERD,
+    IPC_SERVICE_NETD, IPC_SERVICE_ROOTD, IPC_SERVICE_SESSIOND, IPC_SERVICE_STORAGED,
+    IPC_SERVICE_VFSD, IPC_WAIT_SERVICE_ENDPOINT_ABI_VERSION,
     IPC_WAIT_SERVICE_ENDPOINT_MAX_TIMEOUT_MS, LOADER_ACTIVATE_BATCH_MAX_TARGETS,
     LOADER_OP_SPAWN_EXEC, LOADER_REQUEST_ABI_VERSION, LOADER_SPAWN_ARG_BYTES,
     LOADER_SPAWN_ENV_BYTES, LOADER_SPAWN_EXEC_PATH_CAPACITY, LOADER_SPAWN_FLAG_DEFER_START,
-    PRODUCT_MILESTONE_INIT_IDENTITY_READY, ROOTD_LEASE_STATE_EMPTY, ROOTD_LEASE_STATE_EXITED,
-    ROOTD_LEASE_STATE_RUNNING, SYS_RUSTOS_IPC_CALL_BOUNDED, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
+    LoaderSpawnRequest, LoaderSpawnResponse, PRODUCT_MILESTONE_INIT_IDENTITY_READY,
+    ROOTD_LEASE_STATE_EMPTY, ROOTD_LEASE_STATE_EXITED, ROOTD_LEASE_STATE_RUNNING,
+    RustosIpcWaitServiceEndpointArgs, RustosSchedulingContextAuthority,
+    SYS_RUSTOS_IPC_CALL_BOUNDED, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
     SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT,
     SYS_RUSTOS_IPC_WAIT_SERVICE_ENDPOINT, SYS_RUSTOS_PRODUCT_MILESTONE,
     TASK_WEIGHT_INTERACTIVE_FLAG,
@@ -60,8 +61,8 @@ mod bootstrap_barrier;
 use activation::activate_pending_services;
 use boot_order::{init_exec_priority, requires_immediate_activation_after_spawn};
 use bootstrap_barrier::{
-    bootstrap_endpoint_admissions_complete, consumer_requires_bootstrap_barrier,
-    endpoint_admission_may_overlap, RUNTIMED_BOOTSTRAP_SERVICES,
+    RUNTIMED_BOOTSTRAP_SERVICES, bootstrap_endpoint_admissions_complete,
+    consumer_requires_bootstrap_barrier, endpoint_admission_may_overlap,
 };
 
 const INITD_EXEC_PATH: &str = "services/initd/initd.elf";
@@ -743,17 +744,16 @@ fn call_rootd_supervisor(
     // SAFETY: Request and response are initialized, exact-sized ABI records
     // and remain exclusively live for the duration of the bounded call.
     let call = unsafe {
-        libc::syscall(
-            SYS_RUSTOS_IPC_CALL_BOUNDED as libc::c_long,
-            endpoint,
+        rustos_svc_runtime::syscall::syscall6(
+            SYS_RUSTOS_IPC_CALL_BOUNDED,
+            endpoint as u64,
             (&request as *const CommercialMaxProtocolRequest) as u64,
             size_of::<CommercialMaxProtocolRequest>() as u64,
             (&mut response as *mut CommercialMaxProtocolResponse) as u64,
             size_of::<CommercialMaxProtocolResponse>() as u64,
             timeout_ms,
-        ) as i64
+        )
     };
-    let call = libc_syscall_status(call);
     if call < 0 {
         return Err((-call) as i32);
     }
@@ -812,17 +812,16 @@ fn report_rootd_service_lease_inner(service_id: u64, exec_path: &str, pid: u64) 
     // SAFETY: Request and response are initialized, exact-sized ABI records
     // and remain exclusively live for the duration of the bounded call.
     let call = unsafe {
-        libc::syscall(
-            SYS_RUSTOS_IPC_CALL_BOUNDED as libc::c_long,
-            endpoint,
+        rustos_svc_runtime::syscall::syscall6(
+            SYS_RUSTOS_IPC_CALL_BOUNDED,
+            endpoint as u64,
             (&request as *const CommercialMaxProtocolRequest) as u64,
             size_of::<CommercialMaxProtocolRequest>() as u64,
             (&mut response as *mut CommercialMaxProtocolResponse) as u64,
             size_of::<CommercialMaxProtocolResponse>() as u64,
             IPC_BOOT_CONTROL_HARD_LIMIT_MS,
-        ) as i64
+        )
     };
-    let call = libc_syscall_status(call);
     if call < 0 {
         return Err((-call) as i32);
     }
@@ -1016,17 +1015,16 @@ fn spawn_exec_via_loaderd(exec_path: &str, env: &[CString]) -> Result<i32, i32> 
     // SAFETY: Request and response are initialized, exact-sized ABI records
     // and remain exclusively live for the duration of the bounded call.
     let call = unsafe {
-        libc::syscall(
-            SYS_RUSTOS_IPC_CALL_BOUNDED as libc::c_long,
-            endpoint,
+        rustos_svc_runtime::syscall::syscall6(
+            SYS_RUSTOS_IPC_CALL_BOUNDED,
+            endpoint as u64,
             (&request as *const LoaderSpawnRequest) as u64,
             size_of::<LoaderSpawnRequest>() as u64,
             (&mut response as *mut LoaderSpawnResponse) as u64,
             size_of::<LoaderSpawnResponse>() as u64,
             IPC_BOOT_CONTROL_HARD_LIMIT_MS,
-        ) as i64
+        )
     };
-    let call = libc_syscall_status(call);
     if call < 0 {
         LOADER_ENDPOINT_CACHE.store(0, Ordering::Relaxed);
         return Err((-call) as i32);
@@ -1139,7 +1137,11 @@ fn exec_weight_micros(exec_path: &str) -> u64 {
 // errno. Internal readiness/envelope consumers use raw negative errno values;
 // restore that representation immediately, before logging or another syscall.
 fn libc_syscall_status(status: i64) -> i64 {
-    if status == -1 { -i64::from(last_errno()) } else { status }
+    if status == -1 {
+        -i64::from(last_errno())
+    } else {
+        status
+    }
 }
 
 fn last_errno() -> i32 {
@@ -1167,8 +1169,9 @@ mod retry_tests;
 #[cfg(test)]
 mod tests {
     use super::{
+        POLL_INTERVAL, RUNTIMED_EXEC_PATH, TASK_WEIGHT_INTERACTIVE_FLAG,
         classify_service_ready_status, cleanup_spawned_service, endpoint_wait_args,
-        exec_weight_micros, POLL_INTERVAL, RUNTIMED_EXEC_PATH, TASK_WEIGHT_INTERACTIVE_FLAG,
+        exec_weight_micros,
     };
 
     #[test]
@@ -1229,12 +1232,14 @@ mod tests {
         assert_eq!(args.timeout_ms, 17);
         assert_eq!(args.service_id, rustos_user_abi::syscall::IPC_SERVICE_NETD);
         assert!(endpoint_wait_args(super::NETD_EXEC_PATH, -1, 17).is_err());
-        assert!(endpoint_wait_args(
-            super::NETD_EXEC_PATH,
-            73,
-            rustos_user_abi::syscall::IPC_WAIT_SERVICE_ENDPOINT_MAX_TIMEOUT_MS + 1,
-        )
-        .is_err());
+        assert!(
+            endpoint_wait_args(
+                super::NETD_EXEC_PATH,
+                73,
+                rustos_user_abi::syscall::IPC_WAIT_SERVICE_ENDPOINT_MAX_TIMEOUT_MS + 1,
+            )
+            .is_err()
+        );
     }
 
     #[test]

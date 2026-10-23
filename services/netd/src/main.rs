@@ -29,23 +29,25 @@ use std::time::{Duration, Instant as StdInstant};
 
 use rustos_user_abi::linux as linux_abi;
 use rustos_user_abi::syscall::{
-    CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
-    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, IpcRecvWithSenderArgs,
-    NetBrokerPrepareSocketPublication, NetdIpcRequest, NetdIpcResponse, RustosNetBrokerArgs,
     COMMERCIAL_MAX_NETD_OP_ADDRESS_BIND, COMMERCIAL_MAX_NETD_OP_FD_TRANSFER,
     COMMERCIAL_MAX_NETD_OP_PACKET_LEASE, COMMERCIAL_MAX_NETD_OP_ROUTE_POLICY,
     COMMERCIAL_MAX_NETD_OP_SOCKET_NAMESPACE, COMMERCIAL_MAX_NETD_OP_SOCKET_OPTIONS,
     COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS,
-    COMMERCIAL_MAX_PROTOCOL_NETD, IPC_SERVICE_INPUTD, IPC_SERVICE_NETD, NETD_DVM_SESSION_GRANT,
-    NETD_DVM_SESSION_REVOKE, NETD_IPC_ABI_VERSION, NETD_IPC_OP_DVM_SESSION, NETD_IPC_OP_REF_ACK,
-    NETD_IPC_REQUEST_HEADER_SIZE, NETD_IPC_RESPONSE_FLAG_LATENCY_HANDOFF,
-    NETD_IPC_RESPONSE_HEADER_SIZE, NETD_POLL_MODE_QUERY, NETD_POLL_MODE_WAIT,
-    NETD_RECVMSG_PAYLOAD_HEADER_SIZE, NETD_SENDMSG_PAYLOAD_HEADER_SIZE,
+    COMMERCIAL_MAX_PROTOCOL_NETD, CommercialMaxCapabilityLeaseWire,
+    CommercialMaxProtocolDescriptorWire, CommercialMaxProtocolRequest,
+    CommercialMaxProtocolResponse, IPC_SERVICE_INPUTD, IPC_SERVICE_NETD, IpcRecvWithSenderArgs,
     NET_BROKER_OP_PACKET_LEASE_GRANT, NET_BROKER_OP_PACKET_LEASE_RESET,
     NET_BROKER_OP_PACKET_LEASE_REVOKE, NET_BROKER_OP_PACKET_RX, NET_BROKER_OP_PACKET_STATUS,
     NET_BROKER_OP_PACKET_TX, NET_BROKER_OP_PREPARE_SOCKET_PUBLICATION, NET_BROKER_PACKET_MTU,
     NET_BROKER_PACKET_STATUS_ACTIVE, NET_BROKER_PACKET_STATUS_AWAITING_AUTHENTICATED_CONTROL,
     NET_BROKER_PACKET_STATUS_UNAVAILABLE, NET_BROKER_SOCKET_PUBLICATION_VERSION,
+    NETD_DVM_SESSION_GRANT, NETD_DVM_SESSION_REVOKE, NETD_IPC_ABI_VERSION, NETD_IPC_OP_DVM_SESSION,
+    NETD_IPC_OP_REF_ACK, NETD_IPC_REQUEST_HEADER_SIZE, NETD_IPC_RESPONSE_FLAG_LATENCY_HANDOFF,
+    NETD_IPC_RESPONSE_HEADER_SIZE, NETD_POLL_MODE_QUERY, NETD_POLL_MODE_WAIT,
+    NETD_RECVMSG_PAYLOAD_HEADER_SIZE, NETD_SENDMSG_PAYLOAD_HEADER_SIZE,
+    NetBrokerPrepareSocketPublication, NetdIpcRequest, NetdIpcResponse, RustosNetBrokerArgs,
+    SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_RECV_WITH_SENDER,
+    SYS_RUSTOS_IPC_RECV_WITH_SENDER_BOUNDED, SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_NET_BROKER,
     SYSCALL_OFFLOAD_OP_LINUX_ACCEPT, SYSCALL_OFFLOAD_OP_LINUX_BIND, SYSCALL_OFFLOAD_OP_LINUX_CLOSE,
     SYSCALL_OFFLOAD_OP_LINUX_CONNECT, SYSCALL_OFFLOAD_OP_LINUX_DUP,
     SYSCALL_OFFLOAD_OP_LINUX_GETPEERNAME, SYSCALL_OFFLOAD_OP_LINUX_GETSOCKNAME,
@@ -54,14 +56,12 @@ use rustos_user_abi::syscall::{
     SYSCALL_OFFLOAD_OP_LINUX_RECVMSG, SYSCALL_OFFLOAD_OP_LINUX_SENDMSG,
     SYSCALL_OFFLOAD_OP_LINUX_SENDTO, SYSCALL_OFFLOAD_OP_LINUX_SETSOCKOPT,
     SYSCALL_OFFLOAD_OP_LINUX_SHUTDOWN, SYSCALL_OFFLOAD_OP_LINUX_SOCKET,
-    SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
-    SYS_RUSTOS_IPC_RECV_WITH_SENDER, SYS_RUSTOS_IPC_RECV_WITH_SENDER_BOUNDED, SYS_RUSTOS_IPC_REPLY,
-    SYS_RUSTOS_NET_BROKER,
+    SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR,
 };
 #[cfg(not(test))]
 use rustos_user_abi::syscall::{
-    WaitSetSignalBrokerArgs, SYS_RUSTOS_ENTROPY_BROKER, SYS_RUSTOS_WAITSET_SIGNAL_BROKER,
-    WAITSET_ABI_VERSION, WAITSET_PROVIDER_NETD,
+    SYS_RUSTOS_ENTROPY_BROKER, SYS_RUSTOS_WAITSET_SIGNAL_BROKER, WAITSET_ABI_VERSION,
+    WAITSET_PROVIDER_NETD, WaitSetSignalBrokerArgs,
 };
 use smoltcp::iface::{
     Config as SmolConfig, Interface, PollIngressSingleResult, PollResult, SocketHandle, SocketSet,
@@ -308,7 +308,10 @@ fn serve_request_loop(endpoint: u64) {
                 thread::sleep(RECV_BACKOFF);
             }
             ReceiveTurn::Deferred => continue,
-            ReceiveTurn::Replied { status, poll_after_reply } => {
+            ReceiveTurn::Replied {
+                status,
+                poll_after_reply,
+            } => {
                 if status < 0 {
                     REPLY_FAILURE_DIAGNOSTICS.record("netd", "ipc", -status);
                 }
@@ -322,7 +325,7 @@ fn serve_request_loop(endpoint: u64) {
 
 mod receive_turn;
 use receive_turn::{
-    dispatch_admitted_request, service_received_request_with, ReceiveTurn, ReceivedNetdRequest,
+    ReceiveTurn, ReceivedNetdRequest, dispatch_admitted_request, service_received_request_with,
 };
 
 #[cfg(test)]
@@ -3429,22 +3432,50 @@ fn clamp_socket_buffer(value: i32) -> i32 {
 }
 
 fn syscall0(number: u64) -> i64 {
+    // SAFETY: The bridge owns its descriptor; callers retain IPC buffers until return.
+    if let Some(result) = unsafe { rustos_svc_runtime::syscall::try_fast_ipc(number, [0; 6]) } {
+        return result;
+    }
     unsafe { libc::syscall(number as libc::c_long) as i64 }
 }
 
 fn syscall1(number: u64, arg0: u64) -> i64 {
+    // SAFETY: The bridge owns its descriptor; callers retain IPC buffers until return.
+    if let Some(result) =
+        unsafe { rustos_svc_runtime::syscall::try_fast_ipc(number, [arg0, 0, 0, 0, 0, 0]) }
+    {
+        return result;
+    }
     unsafe { libc::syscall(number as libc::c_long, arg0) as i64 }
 }
 
 fn syscall2(number: u64, arg0: u64, arg1: u64) -> i64 {
+    // SAFETY: The bridge owns its descriptor; callers retain IPC buffers until return.
+    if let Some(result) =
+        unsafe { rustos_svc_runtime::syscall::try_fast_ipc(number, [arg0, arg1, 0, 0, 0, 0]) }
+    {
+        return result;
+    }
     unsafe { libc::syscall(number as libc::c_long, arg0, arg1) as i64 }
 }
 
 fn syscall3(number: u64, arg0: u64, arg1: u64, arg2: u64) -> i64 {
+    // SAFETY: The bridge owns its descriptor; callers retain IPC buffers until return.
+    if let Some(result) =
+        unsafe { rustos_svc_runtime::syscall::try_fast_ipc(number, [arg0, arg1, arg2, 0, 0, 0]) }
+    {
+        return result;
+    }
     unsafe { libc::syscall(number as libc::c_long, arg0, arg1, arg2) as i64 }
 }
 
 fn syscall6(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i64 {
+    // SAFETY: The bridge owns its descriptor; callers retain IPC buffers until return.
+    if let Some(result) = unsafe {
+        rustos_svc_runtime::syscall::try_fast_ipc(number, [arg0, arg1, arg2, arg3, arg4, arg5])
+    } {
+        return result;
+    }
     unsafe { libc::syscall(number as libc::c_long, arg0, arg1, arg2, arg3, arg4, arg5) as i64 }
 }
 
@@ -3466,8 +3497,8 @@ fn debug_line(message: &str) {
 #[cfg(test)]
 mod idle_cadence_tests {
     use super::{
-        local_poll_budget_ms_for_deadline, INET_IDLE_POLL_INTERVAL, INET_READINESS_POLL_INTERVAL,
-        NETD_MAX_IDLE_WAIT_MS,
+        INET_IDLE_POLL_INTERVAL, INET_READINESS_POLL_INTERVAL, NETD_MAX_IDLE_WAIT_MS,
+        local_poll_budget_ms_for_deadline,
     };
 
     #[test]

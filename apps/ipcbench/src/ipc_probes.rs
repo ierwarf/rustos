@@ -349,7 +349,7 @@ pub(crate) fn probe_state_checkpoint(name: &str, tsc_khz: u64) {
 /// Same payload, stamps, warmups, counts and echo/STOP/join oracle as the
 /// buffer control. This measures two threads in ONE address space, not CR3.
 pub(crate) fn probe_ipc_register_reply_recv(tsc_khz: u64) {
-    if !register_transport_preflight() {
+    if !crate::ipc_service::preflight() || !register_transport_preflight() {
         skip("ipc_rt_intra_process_register_reply_recv", "register-preflight-failed");
         return;
     }

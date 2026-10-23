@@ -27,6 +27,7 @@ mod core_paths;
 mod cow_probe;
 mod ipc_probes;
 mod ipc_simd;
+mod ipc_service;
 mod scheduler_probes;
 mod scheduling_context_probe;
 mod state_probes;

@@ -3,6 +3,8 @@
 //! call uses the same reservation rollback and deadline, and reply consumes
 //! the same generation-bound one-shot capability. Slow/remote paths stay live.
 
+mod buffer;
+
 use super::*;
 use rustos_user_abi::syscall::{
     IPC_REGISTER_BYTES, SYS_RUSTOS_IPC_REGISTER_CALL, SYS_RUSTOS_IPC_REGISTER_RECV,
@@ -121,6 +123,9 @@ pub(super) fn dispatch(frame: &mut SyscallFrame) -> u64 {
     // are never delivered; outputs are padded with zeros, including on failure.
     if !ipc_register_shape_valid(operation, len, word0, word1, reply, reserved) {
         return linux_errno(LINUX_EINVAL);
+    }
+    if reserved == rustos_user_abi::syscall::IPC_REGISTER_BUFFER_MODE {
+        return buffer::dispatch(frame, operation, endpoint);
     }
     let bytes = ipc_register_unpack([word0, word1]);
     let payload = &bytes[..len as usize];

@@ -26,9 +26,9 @@ pub(super) fn request_scheduling_context_authority(
     // complete ranges are writable/readable as required, and ring0 validates
     // endpoint ownership plus every user range before copying.
     let call = unsafe {
-        libc::syscall(
-            SYS_RUSTOS_IPC_CALL_BOUNDED as libc::c_long,
-            endpoint,
+        rustos_svc_runtime::syscall::syscall6(
+            SYS_RUSTOS_IPC_CALL_BOUNDED,
+            endpoint as u64,
             (&request as *const CommercialMaxProtocolRequest) as u64,
             size_of::<CommercialMaxProtocolRequest>() as u64,
             (&mut response as *mut CommercialMaxProtocolResponse) as u64,
@@ -36,7 +36,6 @@ pub(super) fn request_scheduling_context_authority(
             IPC_BOOT_CONTROL_HARD_LIMIT_MS,
         ) as i64
     };
-    let call = libc_syscall_status(call);
     if call < 0 {
         return Err((-call) as i32);
     }

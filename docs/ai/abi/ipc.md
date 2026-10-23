@@ -56,12 +56,48 @@
 ## Register short-message ABI
 
 Opt-in `SYS_RUSTOS_IPC_REGISTER_{CALL,RECV,REPLY_RECV,REPLY}` (`0x5255_0052..55`)
-passes at most 16 bytes in GPRs without user pointers, argument blocks, or
-handle transfer. The exact input/output register map, shape validator and
+in default mode (`R9=0`) passes at most 16 bytes in GPRs without user pointers,
+argument blocks, or handle transfer. The exact input/output register map, shape validator and
 compiler-clobber-aware wrapper live in
 `libs/rustos-user-abi/src/syscall/ipc_registers.rs` (re-exported through `syscall`).
 CALL requests are 1..=16 bytes; replies may be empty. RECV has a fixed 16-byte
-capacity. Oversized/handle-bearing traffic keeps the existing buffer/grant ABI.
+capacity. Oversized/handle-bearing traffic keeps the existing buffer/grant
+semantics through the buffer slow mode below.
+
+### Common service fastcall entry and buffer slow mode
+
+`rustos-svc-runtime::syscall::{syscall0..syscall6}` routes IPC data operations
+through these same four fastcall entries. Services with local syscall wrappers
+use its `try_fast_ipc` bridge; libc-based data calls in initd/runtimed use the
+common native wrappers directly. Ordinary Linux syscalls, endpoint registration,
+lookup/wait and other control/broker operations retain their original entry.
+The bridge returns raw `-errno`, never libc's `-1` plus thread-local errno.
+
+`R9=IPC_REGISTER_BUFFER_MODE` (1) selects the buffer slow mode: RDI points to
+`IpcRegisterBufferArgs` (56 bytes: operation followed by six u64 argument words),
+and RSI/RDX/R10/R8 must be zero. Only CALL, bounded CALL, handle CALL variants,
+RECV/TRY_RECV (including sender/bounded/handle variants), REPLY/handle REPLY and
+fused REPLY_RECV are allowlisted, in their exact matching entry family.
+Linux syscalls, control operations and recursive fastcalls are forbidden.
+`kernel/compat/src/user/syscall/linux/ipc_ops/registers/buffer.rs` fault-revalidates
+and snapshots the block before dispatch, validates the family, then executes the
+original handler **once**. The block and closed allowlist are defined in
+`libs/rustos-user-abi/src/syscall/ipc_fast_buffer.rs`. User-copy validation,
+capability ownership, handle tickets, deadline budgets and pre/post-commit
+error tags remain unchanged. Buffer mode returns only RAX; all register
+payload/metadata outputs are zero on success and failure. It uses the same
+opt-in FP/control-state contract and finalizers as the short mode.
+
+The typed `ipc::{call,recv_with_sender,reply,reply_recv_with_sender}` helpers
+select pure registers when the exact shape fits, through
+`libs/rustos-svc-runtime/src/ipc/fastcall.rs`. Receive capacity must be
+**exactly 16**, not merely at most/at least 16: smaller buffers must not consume
+an oversized request; larger buffers promise to accept traffic beyond the short
+image. Other shapes, finite deadlines and handles select buffer slow mode before
+execution. A syscall error or committed reply is never retried in another mode.
+The unsafe typed helpers require their own input/output ranges to remain valid;
+raw syscall helpers retain kernel fault validation of arbitrary user pointers.
+Large protocols are not silently truncated or migrated to a new wire format.
 
 This is the same transport, not a new authority or rendezvous cell. Process
 endpoint authorization, exact reply generation/rights, deadlines/cancellation,
@@ -72,7 +108,7 @@ before consuming the old capability, and uses the existing post-commit errno
 tag. Receive metadata is kernel-authenticated; error outputs and unused payload
 bytes are zero. Both buffer/register interoperability directions are supported.
 The buffer ABI retains its fault-recoverable user-access validation unchanged.
-Register handlers obtain `(task, exact live process identity)` from
+Pointer-free short handlers obtain `(task, exact live process identity)` from
 `kernel_ps::api::current_user_ipc_identity`: IRQ-stable installed Current binding
 plus the generation-bound live process publication, with the existing lifecycle
 fallback for a missing publication. They acquire no retained MM/process
@@ -127,6 +163,11 @@ consumption, duplicate reply refusal and mixed-ABI peers. Untimed assembly
 witnesses seed x87/vector data, capture immediately after SYSCALL and check
 sanitization plus distinct preserved controls on caller/server, including
 blocking/error paths; an ordinary syscall checks the preservation control.
+`apps/ipcbench/src/ipc_service.rs` also preflights the buffer slow mode: bad
+pointer/non-IPC rejection, 16/32-byte exact echoes with untouched destination
+tails, authenticated PID/TID, finite deadlines, fused receive and large reply,
+and physical FP clearing/control preservation through all four entry families.
+These preflights are untimed, not additional measured probes.
 It is a same-address-
 space measurement, not evidence of a cross-process/CR3 cost reduction. Existing
 IPC models cover the unchanged transport/custody transitions; this wrapper adds

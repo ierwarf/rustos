@@ -14,6 +14,37 @@ pub(crate) unsafe fn checked_syscall(
     reply: u64,
     register: bool,
 ) -> (IpcRegisterResult, bool) {
+    unsafe { checked_syscall_mode(operation, endpoint, len, words, reply, register, 0) }
+}
+
+/// Buffer slow mode must obey the identical physical-data/control contract,
+/// including copy faults and rejected forwarded operations.
+pub(crate) unsafe fn checked_buffer_syscall(
+    operation: u64,
+    args_ptr: u64,
+) -> (IpcRegisterResult, bool) {
+    unsafe {
+        checked_syscall_mode(
+            operation,
+            args_ptr,
+            0,
+            [0; 2],
+            0,
+            true,
+            rustos_user_abi::syscall::IPC_REGISTER_BUFFER_MODE,
+        )
+    }
+}
+
+unsafe fn checked_syscall_mode(
+    operation: u64,
+    endpoint: u64,
+    len: u64,
+    words: [u64; 2],
+    reply: u64,
+    register: bool,
+    mode: u64,
+) -> (IpcRegisterResult, bool) {
     let mut before = Image([0; 576]);
     let mut after = Image([0; 576]);
     let controls = [
@@ -32,7 +63,7 @@ pub(crate) unsafe fn checked_syscall(
     let mut word0 = words[0];
     let mut word1 = words[1];
     let mut cap = reply;
-    let mut sender_pid = 0u64;
+    let mut sender_pid = mode;
     let mut sender_tid = len;
     unsafe {
         core::arch::asm!(

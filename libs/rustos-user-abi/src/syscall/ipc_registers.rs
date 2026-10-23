@@ -1,5 +1,6 @@
-//! Pointer-free, byte-only short IPC. This is opt-in, not a change to Linux
-//! syscall register preservation or the existing buffer/handle IPC ABIs.
+//! Opt-in fastcall IPC, not a change to ordinary Linux syscall preservation.
+//! Default mode is pointer-free short IPC; IPC_REGISTER_BUFFER_MODE reuses an
+//! allowlisted existing buffer/handle operation through IpcRegisterBufferArgs.
 //!
 //! Inputs: RDI endpoint (reply capability for REPLY), RSI byte length,
 //! RDX/R10 little-endian payload words, R8 old reply capability for REPLY_RECV,
@@ -7,7 +8,8 @@
 //! CALL requests must contain 1..=16 bytes; replies may contain 0..=16.
 //! Outputs: RAX length or native errno (tagged post-commit for REPLY_RECV),
 //! RDX/R10 payload, R8 reply capability, R9 authenticated sender PID, RSI TID.
-//! Error outputs are zero. No descriptors, user pointers or public timeouts.
+//! Error outputs are zero. Default mode has no descriptors/pointers/timeouts;
+//! buffer mode retains the existing fault-revalidated pointer/deadline contract.
 //! XMM registers are caller-saved at this boundary; implementations may still
 //! preserve them. All enabled FP/vector data (x87/MMX/XMM/YMM) is caller-clobbered
 //! and sanitized on return; x87 status/stack state is reset. The entering x87
@@ -28,6 +30,19 @@ pub const fn ipc_register_shape_valid(
     reply: u64,
     reserved: u64,
 ) -> bool {
+    if reserved == super::IPC_REGISTER_BUFFER_MODE {
+        return len == 0
+            && word0 == 0
+            && word1 == 0
+            && reply == 0
+            && matches!(
+                operation,
+                SYS_RUSTOS_IPC_REGISTER_CALL
+                    | SYS_RUSTOS_IPC_REGISTER_RECV
+                    | SYS_RUSTOS_IPC_REGISTER_REPLY_RECV
+                    | SYS_RUSTOS_IPC_REGISTER_REPLY
+            );
+    }
     if reserved != 0 || len > IPC_REGISTER_BYTES as u64 {
         return false;
     }

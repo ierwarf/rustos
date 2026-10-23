@@ -8,7 +8,7 @@ use std::fs;
 use std::io::Write;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{mpsc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, mpsc};
 use std::thread;
 
 use keyboard_core::{KeyAction, KeyCode, KeyboardDriver};
@@ -20,17 +20,18 @@ use console_abi::{
 };
 pub(crate) use console_abi::{ConsoleSessionInfo, ConsoleStateInfo};
 pub(crate) use device_abi::{
-    DisplayGpuCompletionQuery, DisplayGpuInfo, DisplayInfo, DisplaySurfaceCreate, InputEvent,
     DISPLAY_GPU_ABI_VERSION, DISPLAY_GPU_INFO_FLAG_DIRECT_DMABUF,
-    DISPLAY_GPU_INFO_FLAG_STAGED_COPY, DISPLAY_GPU_SUBMIT_FLAG_STAGED_COPY, INPUT_ACTION_NONE,
-    INPUT_ACTION_PRESSED, INPUT_ACTION_RELEASED, INPUT_ACTION_REPEATED, INPUT_KIND_KEYBOARD,
-    INPUT_KIND_POINTER_BUTTON, INPUT_KIND_POINTER_MOTION, INPUT_KIND_POINTER_POSITION,
-    INPUT_KIND_POINTER_SCROLL, PIXEL_FORMAT_BGRA8888, POINTER_BUTTON_LEFT, POINTER_BUTTON_MIDDLE,
-    POINTER_BUTTON_RIGHT, POINTER_BUTTON_X1, POINTER_BUTTON_X2,
+    DISPLAY_GPU_INFO_FLAG_STAGED_COPY, DISPLAY_GPU_SUBMIT_FLAG_STAGED_COPY,
+    DisplayGpuCompletionQuery, DisplayGpuInfo, DisplayInfo, DisplaySurfaceCreate,
+    INPUT_ACTION_NONE, INPUT_ACTION_PRESSED, INPUT_ACTION_RELEASED, INPUT_ACTION_REPEATED,
+    INPUT_KIND_KEYBOARD, INPUT_KIND_POINTER_BUTTON, INPUT_KIND_POINTER_MOTION,
+    INPUT_KIND_POINTER_POSITION, INPUT_KIND_POINTER_SCROLL, InputEvent, PIXEL_FORMAT_BGRA8888,
+    POINTER_BUTTON_LEFT, POINTER_BUTTON_MIDDLE, POINTER_BUTTON_RIGHT, POINTER_BUTTON_X1,
+    POINTER_BUTTON_X2,
 };
 use device_abi::{
-    DisplayGpuDamage, DisplayGpuSubmitRequest, DisplayPresentRectRequest, DisplayPresentRequest,
-    DISPLAY_SURFACE_FLAG_GPU_ATLAS,
+    DISPLAY_SURFACE_FLAG_GPU_ATLAS, DisplayGpuDamage, DisplayGpuSubmitRequest,
+    DisplayPresentRectRequest, DisplayPresentRequest,
 };
 
 const SYS_READ: usize = 0;
@@ -1436,6 +1437,14 @@ const fn errno_from_result(result: isize) -> i32 {
 }
 
 unsafe fn syscall2(number: usize, arg0: usize, arg1: usize) -> isize {
+    if let Some(result) = unsafe {
+        rustos_svc_runtime::syscall::try_fast_ipc(
+            number as u64,
+            [arg0 as u64, arg1 as u64, 0, 0, 0, 0],
+        )
+    } {
+        return result as isize;
+    }
     let result: isize;
     unsafe {
         asm!(
@@ -1452,6 +1461,11 @@ unsafe fn syscall2(number: usize, arg0: usize, arg1: usize) -> isize {
 }
 
 unsafe fn syscall0(number: usize) -> isize {
+    if let Some(result) =
+        unsafe { rustos_svc_runtime::syscall::try_fast_ipc(number as u64, [0; 6]) }
+    {
+        return result as isize;
+    }
     let result: isize;
     unsafe {
         asm!(
@@ -1466,6 +1480,11 @@ unsafe fn syscall0(number: usize) -> isize {
 }
 
 unsafe fn syscall1(number: usize, arg0: usize) -> isize {
+    if let Some(result) = unsafe {
+        rustos_svc_runtime::syscall::try_fast_ipc(number as u64, [arg0 as u64, 0, 0, 0, 0, 0])
+    } {
+        return result as isize;
+    }
     let result: isize;
     unsafe {
         asm!(
@@ -1484,9 +1503,9 @@ unsafe fn syscall1(number: usize, arg0: usize) -> isize {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{
-        input_poll_revents, translate_linux_input_event, trusted_ui_status, InputTranslationState,
-        LinuxInputEvent, LinuxInputTimeval, UiThreadRole, EV_KEY, INPUT_ACTION_PRESSED,
-        INPUT_ACTION_RELEASED, INPUT_KIND_KEYBOARD, POLLERR, POLLHUP, POLLIN, POLLNVAL,
+        EV_KEY, INPUT_ACTION_PRESSED, INPUT_ACTION_RELEASED, INPUT_KIND_KEYBOARD,
+        InputTranslationState, LinuxInputEvent, LinuxInputTimeval, POLLERR, POLLHUP, POLLIN,
+        POLLNVAL, UiThreadRole, input_poll_revents, translate_linux_input_event, trusted_ui_status,
     };
     use rustos_user_abi::{device, syscall};
 
@@ -1559,6 +1578,14 @@ mod tests {
 }
 
 unsafe fn syscall3(number: usize, arg0: usize, arg1: usize, arg2: usize) -> isize {
+    if let Some(result) = unsafe {
+        rustos_svc_runtime::syscall::try_fast_ipc(
+            number as u64,
+            [arg0 as u64, arg1 as u64, arg2 as u64, 0, 0, 0],
+        )
+    } {
+        return result as isize;
+    }
     let result: isize;
     unsafe {
         asm!(
@@ -1576,6 +1603,14 @@ unsafe fn syscall3(number: usize, arg0: usize, arg1: usize, arg2: usize) -> isiz
 }
 
 unsafe fn syscall4(number: usize, arg0: usize, arg1: usize, arg2: usize, arg3: usize) -> isize {
+    if let Some(result) = unsafe {
+        rustos_svc_runtime::syscall::try_fast_ipc(
+            number as u64,
+            [arg0 as u64, arg1 as u64, arg2 as u64, arg3 as u64, 0, 0],
+        )
+    } {
+        return result as isize;
+    }
     let result: isize;
     unsafe {
         asm!(
@@ -1602,6 +1637,21 @@ unsafe fn syscall6(
     arg4: usize,
     arg5: usize,
 ) -> isize {
+    if let Some(result) = unsafe {
+        rustos_svc_runtime::syscall::try_fast_ipc(
+            number as u64,
+            [
+                arg0 as u64,
+                arg1 as u64,
+                arg2 as u64,
+                arg3 as u64,
+                arg4 as u64,
+                arg5 as u64,
+            ],
+        )
+    } {
+        return result as isize;
+    }
     let result: isize;
     unsafe {
         asm!(

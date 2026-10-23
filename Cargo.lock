@@ -614,6 +614,7 @@ dependencies = [
  "libc",
  "observability-client",
  "runtime-control",
+ "rustos-svc-runtime",
  "rustos-user-abi",
 ]
 

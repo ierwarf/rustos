@@ -50,12 +50,6 @@ use core::slice;
 use core::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 
 use rustos_user_abi::syscall::{
-    CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
-    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, CoreServiceLeaseWire,
-    IpcRecvWithSenderArgs, LifecycleDrainBrokerArgs, LifecycleEventWire, LoaderSpawnRequest,
-    LoaderSpawnResponse, RustosProcValidateDeferredSpawnBrokerArgs, RustosRootdTerminateBrokerArgs,
-    RustosSchedulingContextAuthority, RustosSchedulingContextGrantBrokerArgs,
-    RustosSchedulingContextPolicy, ServiceCheckpointRecordWire,
     COMMERCIAL_MAX_CAPABILITY_OP_LEASE_GRANT, COMMERCIAL_MAX_CAPABILITY_OP_LEASE_RENEW,
     COMMERCIAL_MAX_CAPABILITY_OP_LEASE_REVOKE, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
     COMMERCIAL_MAX_PROTOCOL_CAPABILITY, COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS,
@@ -67,22 +61,28 @@ use rustos_user_abi::syscall::{
     COMMERCIAL_MAX_ROOTD_OP_SERVICE_CAPABILITY, COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_COMPACT,
     COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_MUTATE,
     COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_SCAN, COMMERCIAL_MAX_ROOTD_OP_SERVICE_LOOKUP,
+    CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
+    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, CoreServiceLeaseWire,
     IPC_SERVICE_DEVMGRD, IPC_SERVICE_INPUTD, IPC_SERVICE_LINUX_SYSCALLD, IPC_SERVICE_LOADERD,
     IPC_SERVICE_NETD, IPC_SERVICE_PAGERD, IPC_SERVICE_PROCD, IPC_SERVICE_ROOTD,
     IPC_SERVICE_SESSIOND, IPC_SERVICE_STORAGED, IPC_SERVICE_UISERVER, IPC_SERVICE_VFSD,
-    LIFECYCLE_DRAIN_BROKER_ABI_VERSION, LIFECYCLE_DRAIN_MAX_EVENTS, LIFECYCLE_EVENT_EXIT,
-    LOADER_OP_ACTIVATE, LOADER_OP_SPAWN_EXEC, LOADER_REQUEST_ABI_VERSION, LOADER_SPAWN_ARG_BYTES,
-    LOADER_SPAWN_ENV_BYTES, LOADER_SPAWN_EXEC_PATH_CAPACITY, LOADER_SPAWN_FLAG_DEFER_START,
-    PRODUCT_MILESTONE_ROOT_CORE_READY, ROOTD_LEASE_STATE_EXITED, ROOTD_LEASE_STATE_FAILED,
-    ROOTD_LEASE_STATE_RESTART_PENDING, ROOTD_LEASE_STATE_RUNNING,
-    ROOTD_TERMINATE_BROKER_ABI_VERSION, SCHEDULING_CONTEXT_POLICY_ABI_UNSET,
-    SYS_RUSTOS_IPC_CALL, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
-    SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_RECV_WITH_SENDER,
-    SYS_RUSTOS_IPC_RECV_WITH_SENDER_BOUNDED, SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT,
-    SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_IPC_TRY_RECV_WITH_SENDER, SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER,
+    IpcRecvWithSenderArgs, LIFECYCLE_DRAIN_BROKER_ABI_VERSION, LIFECYCLE_DRAIN_MAX_EVENTS,
+    LIFECYCLE_EVENT_EXIT, LOADER_OP_ACTIVATE, LOADER_OP_SPAWN_EXEC, LOADER_REQUEST_ABI_VERSION,
+    LOADER_SPAWN_ARG_BYTES, LOADER_SPAWN_ENV_BYTES, LOADER_SPAWN_EXEC_PATH_CAPACITY,
+    LOADER_SPAWN_FLAG_DEFER_START, LifecycleDrainBrokerArgs, LifecycleEventWire,
+    LoaderSpawnRequest, LoaderSpawnResponse, PRODUCT_MILESTONE_ROOT_CORE_READY,
+    ROOTD_LEASE_STATE_EXITED, ROOTD_LEASE_STATE_FAILED, ROOTD_LEASE_STATE_RESTART_PENDING,
+    ROOTD_LEASE_STATE_RUNNING, ROOTD_TERMINATE_BROKER_ABI_VERSION,
+    RustosProcValidateDeferredSpawnBrokerArgs, RustosRootdTerminateBrokerArgs,
+    RustosSchedulingContextAuthority, RustosSchedulingContextGrantBrokerArgs,
+    RustosSchedulingContextPolicy, SCHEDULING_CONTEXT_POLICY_ABI_UNSET, SYS_RUSTOS_IPC_CALL,
+    SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT,
+    SYS_RUSTOS_IPC_RECV_WITH_SENDER, SYS_RUSTOS_IPC_RECV_WITH_SENDER_BOUNDED,
+    SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY,
+    SYS_RUSTOS_IPC_TRY_RECV_WITH_SENDER, SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER,
     SYS_RUSTOS_PROC_VALIDATE_DEFERRED_SPAWN_BROKER, SYS_RUSTOS_PRODUCT_MILESTONE,
     SYS_RUSTOS_ROOTD_TERMINATE_BROKER, SYS_RUSTOS_ROOTD_WAIT_BROKER,
-    SYS_RUSTOS_SCHEDULING_CONTEXT_GRANT_BROKER, SYS_RUSTOS_SPAWN_EXEC,
+    SYS_RUSTOS_SCHEDULING_CONTEXT_GRANT_BROKER, SYS_RUSTOS_SPAWN_EXEC, ServiceCheckpointRecordWire,
 };
 use service_checkpoint::ServiceCheckpointStore;
 
@@ -1918,9 +1918,8 @@ fn cleanup_failed_initial_activation(
 fn wait_for_core_readiness_with(mut ready: impl FnMut() -> bool, mut wait: impl FnMut(u32)) {
     let mut remaining = CORE_READINESS_POLL_INTERVAL_MS;
     while remaining != 0 && !ready() {
-        let slice = remaining.min(
-            rustos_user_abi::performance::ROOTD_SUPERVISOR_IDLE_POLL_MS as u32,
-        );
+        let slice =
+            remaining.min(rustos_user_abi::performance::ROOTD_SUPERVISOR_IDLE_POLL_MS as u32);
         wait(slice);
         remaining -= slice;
     }
@@ -2289,6 +2288,10 @@ fn fail_closed(message: &[u8]) -> ! {
 }
 
 fn syscall0(number: u64) -> i64 {
+    // SAFETY: The bridge owns its descriptor; callers retain IPC buffers until return.
+    if let Some(result) = unsafe { rustos_svc_runtime::syscall::try_fast_ipc(number, [0; 6]) } {
+        return result;
+    }
     let result: i64;
     unsafe {
         asm!(
@@ -2303,6 +2306,12 @@ fn syscall0(number: u64) -> i64 {
 }
 
 fn syscall1(number: u64, arg0: u64) -> i64 {
+    // SAFETY: The bridge owns its descriptor; callers retain IPC buffers until return.
+    if let Some(result) =
+        unsafe { rustos_svc_runtime::syscall::try_fast_ipc(number, [arg0, 0, 0, 0, 0, 0]) }
+    {
+        return result;
+    }
     let result: i64;
     unsafe {
         asm!(
@@ -2318,6 +2327,12 @@ fn syscall1(number: u64, arg0: u64) -> i64 {
 }
 
 fn syscall2(number: u64, arg0: u64, arg1: u64) -> i64 {
+    // SAFETY: The bridge owns its descriptor; callers retain IPC buffers until return.
+    if let Some(result) =
+        unsafe { rustos_svc_runtime::syscall::try_fast_ipc(number, [arg0, arg1, 0, 0, 0, 0]) }
+    {
+        return result;
+    }
     let result: i64;
     unsafe {
         asm!(
@@ -2334,6 +2349,12 @@ fn syscall2(number: u64, arg0: u64, arg1: u64) -> i64 {
 }
 
 fn syscall3(number: u64, arg0: u64, arg1: u64, arg2: u64) -> i64 {
+    // SAFETY: The bridge owns its descriptor; callers retain IPC buffers until return.
+    if let Some(result) =
+        unsafe { rustos_svc_runtime::syscall::try_fast_ipc(number, [arg0, arg1, arg2, 0, 0, 0]) }
+    {
+        return result;
+    }
     let result: i64;
     unsafe {
         asm!(
@@ -2351,6 +2372,12 @@ fn syscall3(number: u64, arg0: u64, arg1: u64, arg2: u64) -> i64 {
 }
 
 fn syscall5(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> i64 {
+    // SAFETY: The bridge owns its descriptor; callers retain IPC buffers until return.
+    if let Some(result) = unsafe {
+        rustos_svc_runtime::syscall::try_fast_ipc(number, [arg0, arg1, arg2, arg3, arg4, 0])
+    } {
+        return result;
+    }
     let result: i64;
     unsafe {
         asm!(
@@ -2370,6 +2397,12 @@ fn syscall5(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) 
 }
 
 fn syscall6(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, arg5: u64) -> i64 {
+    // SAFETY: The bridge owns its descriptor; callers retain IPC buffers until return.
+    if let Some(result) = unsafe {
+        rustos_svc_runtime::syscall::try_fast_ipc(number, [arg0, arg1, arg2, arg3, arg4, arg5])
+    } {
+        return result;
+    }
     let result: i64;
     unsafe {
         asm!(
@@ -2497,9 +2530,11 @@ mod tests {
         assert!(source.lines().any(|line| {
             line.trim() == "Some(rustos_user_abi::performance::ROOTD_SUPERVISOR_IDLE_POLL_MS),"
         }));
-        assert!(!source
-            .lines()
-            .any(|line| line.trim() == "fn supervisor_idle()"));
+        assert!(
+            !source
+                .lines()
+                .any(|line| line.trim() == "fn supervisor_idle()")
+        );
     }
 
     #[test]
@@ -2510,9 +2545,11 @@ mod tests {
             .nth(1)
             .and_then(|rest| rest.split("\nfn lease(").next())
             .expect("rootd steady-state supervisor loop");
-        assert!(steady_state.contains(
-            "supervise_core_readiness(&mut leases, &mut next_core_readiness_poll_ns);"
-        ));
+        assert!(
+            steady_state.contains(
+                "supervise_core_readiness(&mut leases, &mut next_core_readiness_poll_ns);"
+            )
+        );
     }
 
     #[test]
@@ -2894,9 +2931,11 @@ mod tests {
             &[IPC_SERVICE_SESSIOND, IPC_SERVICE_UISERVER]
         );
         assert_eq!(&terminated[..terminated_count], &[73, 74]);
-        assert!(post_init
-            .iter()
-            .all(|lease| lease.state == ROOTD_LEASE_STATE_EXITED));
+        assert!(
+            post_init
+                .iter()
+                .all(|lease| lease.state == ROOTD_LEASE_STATE_EXITED)
+        );
     }
 
     #[test]
@@ -2959,13 +2998,22 @@ mod tests {
     #[test]
     fn core_readiness_wait_preserves_the_unready_supervision_window() {
         let mut elapsed = 0_u32;
-        wait_for_core_readiness_with(|| false, |millis| {
-            assert!(millis > 0);
-            assert!(u64::from(millis) <= rustos_user_abi::performance::IPC_READINESS_QUERY_HARD_LIMIT_MS);
-            elapsed += millis;
-        });
+        wait_for_core_readiness_with(
+            || false,
+            |millis| {
+                assert!(millis > 0);
+                assert!(
+                    u64::from(millis)
+                        <= rustos_user_abi::performance::IPC_READINESS_QUERY_HARD_LIMIT_MS
+                );
+                elapsed += millis;
+            },
+        );
         assert_eq!(elapsed, CORE_READINESS_POLL_INTERVAL_MS);
-        assert_eq!(u64::from(elapsed) * u64::from(CORE_READINESS_POLL_MAX), 5_000);
+        assert_eq!(
+            u64::from(elapsed) * u64::from(CORE_READINESS_POLL_MAX),
+            5_000
+        );
     }
 
     #[test]

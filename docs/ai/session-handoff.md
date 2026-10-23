@@ -6,7 +6,29 @@ owners, and fresh validation. Root `AGENTS.md` is the only stable prompt
 prefix. This page does not authorize reusing stale evidence, speculative
 changes, or old uncommitted-work claims.
 
-## Current continuation — IPC P0/P1 (2026-10-23)
+## Current continuation — common service fastcall (2026-10-23)
+
+User committed P0/P1 as `6e62c19e`; this task started clean. P2+ is explicitly
+out of scope. IPC data calls in the common service syscall0..6 wrappers now use
+the existing four fastcall entries. Exact short typed-helper shapes use registers;
+large/handle/bounded/TRY/fused operations use R9=1 with a fault-revalidated 56-byte
+operation/argument snapshot and a closed family allowlist, then the original
+handler once. No post-commit replay, protocol truncation or Linux ABI change.
+Rootd/uiserver local raw wrappers and libc IPC bypasses in netd/devmgrd/storaged/
+initd/runtimed were routed through the common bridge; native-vs-libc errno handling
+was corrected only at those data boundaries. Registration/lookup/broker and Linux
+syscalls retain their old entry. Unsafe typed helpers require live valid buffers.
+
+So far: ABI 60, compat 190, common runtime 14, ipcbench 20 native tests passed;
+service native suites and xtask check passed. Read-only scout inventory and
+independent review found no concrete defects. Added unit/native mutation witnesses
+and untimed ring3 buffer-mode FP/large/fused preflight; full selected now/stable
+and fresh signed KVM runs are still pending. See `docs/ai/abi/ipc.md` for the new
+mode and source owners. Last pre-task 8-vCPU samples: getuid 17,400 vs same-MM
+fastcall 9,400 p50, CPUID drift 1.06%; not an ABI-only cost comparison. Evidence
+`build/bench-ipc-p01/current-getuid-fastcall/summary.json`.
+
+## Previous continuation — IPC P0/P1 (2026-10-23)
 
 Started clean at `b92fc394`; no commit requested or made. P1 implementation now
 includes all four 16-byte register operations, pointer-free exact live identity,

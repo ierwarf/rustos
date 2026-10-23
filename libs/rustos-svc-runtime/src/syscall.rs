@@ -1,11 +1,22 @@
 //! Raw `syscall` instruction wrappers. Bypass libc entirely so a static-PIE
 //! service can issue RustOS-native syscalls (`SYS_RUSTOS_IPC_*`) without
-//! depending on glibc/musl startup.
+//! depending on glibc/musl startup. IPC data operations share the opt-in fastcall
+//! boundary; large/bounded/handle traffic keeps the original buffer handlers.
+//! Linux syscalls and IPC control operations retain the ordinary entry ABI.
 
 use core::arch::asm;
 
+/// Shared IPC-only bridge for services that retain libc/native wrappers for
+/// their other syscalls. Returns raw `-errno`; never reads/writes libc errno.
+pub use rustos_user_abi::syscall::ipc_register_buffer_syscall as try_fast_ipc;
+
 #[inline]
 pub unsafe fn syscall0(number: u64) -> i64 {
+    if let Some(result) =
+        unsafe { rustos_user_abi::syscall::ipc_register_buffer_syscall(number, [0; 6]) }
+    {
+        return result;
+    }
     let ret: i64;
     asm!(
         "syscall",
@@ -19,6 +30,11 @@ pub unsafe fn syscall0(number: u64) -> i64 {
 
 #[inline]
 pub unsafe fn syscall1(number: u64, a0: u64) -> i64 {
+    if let Some(result) = unsafe {
+        rustos_user_abi::syscall::ipc_register_buffer_syscall(number, [a0, 0, 0, 0, 0, 0])
+    } {
+        return result;
+    }
     let ret: i64;
     asm!(
         "syscall",
@@ -33,6 +49,11 @@ pub unsafe fn syscall1(number: u64, a0: u64) -> i64 {
 
 #[inline]
 pub unsafe fn syscall2(number: u64, a0: u64, a1: u64) -> i64 {
+    if let Some(result) = unsafe {
+        rustos_user_abi::syscall::ipc_register_buffer_syscall(number, [a0, a1, 0, 0, 0, 0])
+    } {
+        return result;
+    }
     let ret: i64;
     asm!(
         "syscall",
@@ -48,6 +69,11 @@ pub unsafe fn syscall2(number: u64, a0: u64, a1: u64) -> i64 {
 
 #[inline]
 pub unsafe fn syscall3(number: u64, a0: u64, a1: u64, a2: u64) -> i64 {
+    if let Some(result) = unsafe {
+        rustos_user_abi::syscall::ipc_register_buffer_syscall(number, [a0, a1, a2, 0, 0, 0])
+    } {
+        return result;
+    }
     let ret: i64;
     asm!(
         "syscall",
@@ -64,6 +90,11 @@ pub unsafe fn syscall3(number: u64, a0: u64, a1: u64, a2: u64) -> i64 {
 
 #[inline]
 pub unsafe fn syscall4(number: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
+    if let Some(result) = unsafe {
+        rustos_user_abi::syscall::ipc_register_buffer_syscall(number, [a0, a1, a2, a3, 0, 0])
+    } {
+        return result;
+    }
     let ret: i64;
     asm!(
         "syscall",
@@ -81,6 +112,11 @@ pub unsafe fn syscall4(number: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
 
 #[inline]
 pub unsafe fn syscall5(number: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> i64 {
+    if let Some(result) = unsafe {
+        rustos_user_abi::syscall::ipc_register_buffer_syscall(number, [a0, a1, a2, a3, a4, 0])
+    } {
+        return result;
+    }
     let ret: i64;
     asm!(
         "syscall",
@@ -99,6 +135,11 @@ pub unsafe fn syscall5(number: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64)
 
 #[inline]
 pub unsafe fn syscall6(number: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> i64 {
+    if let Some(result) = unsafe {
+        rustos_user_abi::syscall::ipc_register_buffer_syscall(number, [a0, a1, a2, a3, a4, a5])
+    } {
+        return result;
+    }
     let ret: i64;
     asm!(
         "syscall",

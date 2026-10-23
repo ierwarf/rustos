@@ -2604,6 +2604,25 @@ tokens = [
     "restore_state(&image.state)",
 ]
 
+# Service buffer slow mode shares that guard but snapshots user arguments and
+# validates a closed entry family before calling the original handler once.
+[[required_sequences]]
+path = "kernel/compat/src/user/syscall/linux/ipc_ops/registers/buffer.rs"
+tokens = [
+    "read_current_user_struct::<IpcRegisterBufferArgs>(args_ptr)",
+    "fn dispatch_snapshot(",
+    "clear_register_result(frame)",
+    "ipc_register_buffer_entry(request.operation) != Some(entry)",
+    "return linux_errno(LINUX_EINVAL)",
+    "frame.rax = request.operation",
+    "] = request.args",
+    "let result = execute(frame)",
+    "frame.rax = entry",
+    "frame.rdi = args_ptr",
+    "clear_register_result(frame)",
+    "result",
+]
+
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/stack_resources/cpu_leases.rs"
 tokens = [

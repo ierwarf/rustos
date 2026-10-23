@@ -1501,6 +1501,12 @@ remote-file-mapping/RemoteFileMapping|vfsd|tests::early_system_reads_chunk_large
 remote-file-mapping/RemoteFileMapping|kernel-compat|user::syscall::linux::proc_broker_ops::tests::truncated_file_mapping_never_commits_zero_filled_tail
 syscall-simd-lifecycle/SyscallSimdLifecycle|kernel-compat|user::syscall::tests::the_entry_stub_is_the_whole_of_the_syscall_paths_fpu_custody
 syscall-simd-lifecycle/SyscallSimdLifecycle|kernel-compat|user::syscall::tests::register_ipc_entry_elision_requires_exact_linux_operation
+syscall-simd-lifecycle/SyscallSimdLifecycle|rustos-user-abi|syscall::ipc_fast_buffer::tests::buffer_mode_is_closed_to_data_plane_and_exact_entry_family
+syscall-simd-lifecycle/SyscallSimdLifecycle|kernel-compat|user::syscall::linux::ipc_ops::registers::buffer::tests::buffer_mode_rejects_foreign_family_recursion_and_non_ipc_before_dispatch
+syscall-simd-lifecycle/SyscallSimdLifecycle|kernel-compat|user::syscall::linux::ipc_ops::registers::buffer::tests::buffer_mode_forwards_all_six_words_once_and_preserves_commit_result
+syscall-simd-lifecycle/SyscallSimdLifecycle|rustos-svc-runtime|ipc::fastcall::tests::short_selection_never_narrows_or_widens_advertised_receive_capacity
+syscall-simd-lifecycle/SyscallSimdLifecycle|rustos-svc-runtime|ipc::fastcall::tests::short_receive_copies_exact_bytes_and_authenticated_metadata
+syscall-simd-lifecycle/SyscallSimdLifecycle|rustos-svc-runtime|ipc::fastcall::tests::short_results_preserve_pre_and_post_commit_errors_without_retry_or_copy
 syscall-simd-lifecycle/SyscallSimdLifecycle|kernel-ps|user::syscall::tests::syscall_abi_selector_is_installed_and_reset_with_the_original_stack
 syscall-simd-lifecycle/SyscallSimdLifecycle|kernel-compat|user::syscall::tests::register_ipc_finalizes_before_both_user_return_routes
 syscall-simd-lifecycle/SyscallSimdLifecycle|kernel-ps|multitask::scheduler::runqueue::simd_tls::tests::register_ipc_mode_is_exact_task_paired_and_cleared_on_every_replacement
