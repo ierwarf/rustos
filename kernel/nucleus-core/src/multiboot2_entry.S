@@ -126,7 +126,7 @@ rustos_ap_protected_mode:
     mov (RUSTOS_AP_MAILBOX_PHYS + RUSTOS_AP_MAILBOX_CR3), %eax
     mov %eax, %cr3
     mov %cr4, %eax
-    or $0x620, %eax
+    or $0x660, %eax
     mov %eax, %cr4
     mov $0xc0000080, %ecx
     rdmsr
@@ -220,8 +220,11 @@ _start:
     mov %cr4, %eax
     # Rust code may use baseline x86_64 SSE instructions before the higher-level
     # SIMD initializer runs. Do not depend on the firmware or hypervisor having
-    # enabled the OS-managed SSE state bits already.
-    or $0x620, %eax
+    # enabled the OS-managed SSE state bits already. CR4.MCE (0x40) is set on
+    # every CPU so a hardware machine check reaches the fatal #MC handler; with
+    # it clear the processor shuts down with no diagnostic. QEMU never injects
+    # one, so only real hardware exercises this.
+    or $0x660, %eax
     mov %eax, %cr4
     mov $0xc0000080, %ecx
     rdmsr

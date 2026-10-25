@@ -53,6 +53,8 @@ const APIC_DELIVERY_MODE_STARTUP: u32 = 0b110 << 8;
 const CPUID_FEATURE_APIC: u32 = 1 << 9;
 const CPUID_FEATURE_X2APIC: u32 = 1 << 21;
 const X2APIC_MSR_ID: u32 = 0x802;
+const X2APIC_MSR_VERSION: u32 = 0x803;
+const X2APIC_MSR_TPR: u32 = 0x808;
 const X2APIC_MSR_EOI: u32 = 0x80b;
 const X2APIC_MSR_SPURIOUS_VECTOR: u32 = 0x80f;
 const X2APIC_MSR_ICR: u32 = 0x830;
@@ -60,6 +62,20 @@ const X2APIC_MSR_LVT_TIMER: u32 = 0x832;
 const LOCAL_APIC_MODE_UNSET: u8 = 0;
 const LOCAL_APIC_MODE_XAPIC: u8 = 1;
 const LOCAL_APIC_MODE_X2APIC: u8 = 2;
+// Local-vector-table entries this kernel never services. Firmware can leave
+// them unmasked and pointed at a vector with no handler, which a real LAPIC
+// then delivers (thermal throttling, performance-counter overflow, corrected
+// machine-check, error). Each entry is (xAPIC MMIO offset, x2APIC MSR, the
+// lowest "maximum LVT entry" value at which the entry exists).
+const LVT_ENTRIES_TO_MASK: [(usize, u32, u32); 4] = [
+    (0x370, 0x837, 3), // error
+    (0x340, 0x834, 4), // performance counter
+    (0x330, 0x833, 5), // thermal sensor
+    (0x2f0, 0x82f, 6), // corrected machine check
+];
+const APIC_VERSION_OFFSET: usize = 0x030;
+const APIC_TPR_OFFSET: usize = 0x080;
+const APIC_LVT_MASKED: u32 = 1 << 16;
 /// Legacy INIT settle wait, required only by pre-P4 era parts.
 const LEGACY_INIT_SETTLE_NS: u64 = 10_000_000;
 const CPUID_VENDOR_INTEL: [u32; 3] = [0x756e_6547, 0x4965_6e69, 0x6c65_746e];
@@ -350,6 +366,7 @@ pub fn init() -> bool {
                 .write_volatile((current & !0xff) | APIC_SPURIOUS_ENABLE | APIC_SPURIOUS_VECTOR);
         }
     }
+    quiesce_local_vectors(use_x2apic);
     if logical_index == 0 {
         crate::debug::record_milestone(
             crate::debug::LogCategory::Boot,
@@ -361,6 +378,47 @@ pub fn init() -> bool {
     // ORDERING: Release publishes completed SVR programming for this CPU.
     LOCAL_APIC_READY[logical_index].store(true, Ordering::Release);
     true
+}
+
+/// Opens the task-priority gate and masks the LVT entries nobody services.
+///
+/// Linux does the same in `setup_local_APIC()`: a TPR left non-zero by firmware
+/// silently blocks every vector below its class, and an unmasked LVT entry
+/// fires into the default fault handler. Virtual machines reset both to the
+/// architectural defaults, so only real hardware can show the difference.
+/// LINT0/LINT1 stay untouched: LINT1 is the platform NMI route.
+fn quiesce_local_vectors(x2apic: bool) {
+    // ORDERING: Acquire observes the admitted xAPIC mapping, as in `init`.
+    let base = LOCAL_APIC_BASE.load(Ordering::Acquire);
+    if !x2apic && base == 0 {
+        return;
+    }
+    // SAFETY: this CPU's local APIC is enabled in the selected mode; the xAPIC
+    // page was admitted uncacheable by kernel-mm, and every register touched
+    // here is architectural for the maximum LVT entry read from the version.
+    unsafe {
+        let version = if x2apic {
+            Msr::new(X2APIC_MSR_VERSION).read() as u32
+        } else {
+            ((base + APIC_VERSION_OFFSET) as *const u32).read_volatile()
+        };
+        let max_lvt = (version >> 16) & 0xff;
+        if x2apic {
+            x2apic_write(X2APIC_MSR_TPR, 0);
+        } else {
+            ((base + APIC_TPR_OFFSET) as *mut u32).write_volatile(0);
+        }
+        for (offset, msr, first_max_lvt) in LVT_ENTRIES_TO_MASK {
+            if max_lvt < first_max_lvt {
+                continue;
+            }
+            if x2apic {
+                x2apic_write(msr, u64::from(APIC_LVT_MASKED));
+            } else {
+                ((base + offset) as *mut u32).write_volatile(APIC_LVT_MASKED);
+            }
+        }
+    }
 }
 
 /// Programs this CPU's LVT timer register. False when the local APIC is not

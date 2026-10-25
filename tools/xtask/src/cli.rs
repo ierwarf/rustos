@@ -71,7 +71,7 @@ enum XtaskCommand {
     KvmRun {
         #[arg(long = "build")]
         build_image: bool,
-        #[arg(long = "rustos-vcpus", default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=8))]
+        #[arg(long = "rustos-vcpus", default_value_t = crate::kvm::DEFAULT_RUSTOS_VCPUS, value_parser = clap::value_parser!(u8).range(1..=16))]
         rustos_vcpus: u8,
         /// Refuse a multicore launch whose formal profile is unsealed instead
         /// of sealing it first.

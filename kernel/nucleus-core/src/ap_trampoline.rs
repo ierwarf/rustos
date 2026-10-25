@@ -87,7 +87,7 @@ impl ApStartupMailbox {
             && self.magic_complement == !MAILBOX_MAGIC
             && self.generation != 0
             && self.logical_index != 0
-            && self.logical_index < 8
+            && self.logical_index < crate::util::lockdep::MAX_TRACKED_CPUS as u64
             && self.stack_top != 0
             && self.stack_top & 0xf == 0
             && self.entry != 0

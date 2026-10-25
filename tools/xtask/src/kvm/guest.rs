@@ -28,8 +28,8 @@ fn parse_rustos_vcpus(value: String) -> Result<u8> {
     let count = value
         .parse::<u8>()
         .with_context(|| format!("invalid --rustos-vcpus value: {value}"))?;
-    if !(1..=8).contains(&count) {
-        bail!("--rustos-vcpus must be in 1..=8, got {count}");
+    if !(1..=16).contains(&count) {
+        bail!("--rustos-vcpus must be in 1..=16, got {count}");
     }
     Ok(count)
 }

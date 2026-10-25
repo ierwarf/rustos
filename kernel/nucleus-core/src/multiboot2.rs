@@ -182,7 +182,7 @@ fn rdseed64() -> Option<u64> {
                 options(nomem, nostack),
             );
         }
-        if success != 0 {
+        if success != 0 && hardware_rng_word_plausible(value) {
             return Some(value);
         }
         core::hint::spin_loop();
@@ -203,12 +203,21 @@ fn rdrand64() -> Option<u64> {
                 options(nomem, nostack),
             );
         }
-        if success != 0 {
+        if success != 0 && hardware_rng_word_plausible(value) {
             return Some(value);
         }
         core::hint::spin_loop();
     }
     None
+}
+
+/// Some AMD firmware revisions leave RDRAND/RDSEED reporting success (CF=1)
+/// while returning a constant all-ones word (the Linux `rdrand` quirk after
+/// suspend, and early Zen AGESA). A genuine 64-bit draw hits 0 or all-ones
+/// with probability 2^-63, so treating them as failure costs nothing and
+/// stops a stuck generator from seeding the boot CSPRNG.
+const fn hardware_rng_word_plausible(value: u64) -> bool {
+    value != 0 && value != u64::MAX
 }
 
 struct Tags {
@@ -555,6 +564,14 @@ fn fatal() -> ! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stuck_hardware_rng_words_are_not_entropy() {
+        assert!(!hardware_rng_word_plausible(0));
+        assert!(!hardware_rng_word_plausible(u64::MAX));
+        assert!(hardware_rng_word_plausible(1));
+        assert!(hardware_rng_word_plausible(u64::MAX - 1));
+    }
 
     #[test]
     fn converts_multiboot_memory_region_to_pages() {

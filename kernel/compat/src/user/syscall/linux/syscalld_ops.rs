@@ -192,6 +192,10 @@ fn affinity_error_to_linux_errno(error: multitask::AffinityError) -> i64 {
     }
 }
 
+// The offload ABI mask width must cover every CPU the kernel can admit.
+const _: () =
+    assert!(CPU_TOPOLOGY_MAX_LOGICAL_CPUS >= kernel_hal::api::cpu::MAX_SUPPORTED_CPUS as u64);
+
 fn stamp_affinity_topology(
     request: &mut LinuxSyscallOffloadRequest,
     online_mask: u64,

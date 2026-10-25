@@ -26,12 +26,14 @@ const MADT_LOCAL_APIC: u8 = 0;
 const MADT_LOCAL_APIC_ADDRESS_OVERRIDE: u8 = 5;
 const MADT_LOCAL_X2APIC: u8 = 9;
 const MADT_PROCESSOR_ENABLED: u32 = 1;
-const MADT_PROCESSOR_ONLINE_CAPABLE: u32 = 2;
 const ACPI_ADDRESS_SPACE_SYSTEM_MEMORY: u8 = 0;
 const ACPI_GAS_ACCESS_QWORD: u8 = 4;
 const MAX_MCFG_REGIONS: usize = 8;
 const MAX_ACPI_SDT_BYTES: usize = 1024 * 1024;
-pub const MAX_SUPPORTED_CPUS: usize = 8;
+pub const MAX_SUPPORTED_CPUS: usize = 16;
+// The topology, per-CPU lock/scheduler tables, and AP mailbox admission must
+// share one capacity; a drift here only surfaces when the extra CPU boots.
+const _: () = assert!(MAX_SUPPORTED_CPUS == nucleus_core::util::lockdep::MAX_TRACKED_CPUS);
 const PCI_ECAM_BUS_BYTES: u64 = 1 << 20;
 const IDENTITY_MAPPED_PHYS_LIMIT: u64 = 512 * 1024 * 1024 * 1024;
 
@@ -130,13 +132,19 @@ impl CpuTopology {
         Some(self)
     }
 
+    /// Admits one enabled CPU. Duplicates reject the table; CPUs beyond
+    /// `MAX_SUPPORTED_CPUS` are left in firmware's reset state rather than
+    /// rejecting the whole topology, so a larger machine boots with the first
+    /// `MAX_SUPPORTED_CPUS` enabled CPUs.
     fn push_cpu(&mut self, firmware_uid: u32, apic_id: u32, uses_x2apic_id: bool) -> bool {
-        if self.cpu_count >= self.cpus.len()
-            || self.cpus[..self.cpu_count]
-                .iter()
-                .any(|cpu| cpu.firmware_uid == firmware_uid || cpu.apic_id == apic_id)
+        if self.cpus[..self.cpu_count]
+            .iter()
+            .any(|cpu| cpu.firmware_uid == firmware_uid || cpu.apic_id == apic_id)
         {
             return false;
+        }
+        if self.cpu_count >= self.cpus.len() {
+            return true;
         }
         let Ok(logical_index) = u8::try_from(self.cpu_count) else {
             return false;
@@ -476,10 +484,7 @@ fn parse_madt_table(table: &[u8]) -> Option<CpuTopology> {
     }
     let mut topology = CpuTopology::empty();
     topology.local_apic_address = u64::from(le_u32(&table[36..40]));
-    if le_u32(&table[40..44]) & !1 != 0 {
-        return None;
-    }
-
+    // Only PCAT_COMPAT (bit 0) is defined; reserved bits are ignored.
     let mut address_overridden = false;
     let mut index = MADT_HEADER_LEN;
     while index < table.len() {
@@ -502,15 +507,11 @@ fn parse_madt_table(table: &[u8]) -> Option<CpuTopology> {
                 if entry_len != 8 {
                     return None;
                 }
+                // Reserved flag bits are ignored. Disabled and hot-add-only
+                // (online-capable, not enabled) entries are skipped: firmware
+                // routinely reserves such slots, and a fixed-CPU topology
+                // simply never starts them.
                 let flags = le_u32(&entry[4..8]);
-                if flags & !(MADT_PROCESSOR_ENABLED | MADT_PROCESSOR_ONLINE_CAPABLE) != 0 {
-                    return None;
-                }
-                if flags & MADT_PROCESSOR_ONLINE_CAPABLE != 0 && flags & MADT_PROCESSOR_ENABLED == 0
-                {
-                    // Fixed-CPU commercial topology does not admit hot-add-only CPUs.
-                    return None;
-                }
                 if flags & MADT_PROCESSOR_ENABLED != 0
                     && !topology.push_cpu(u32::from(entry[2]), u32::from(entry[3]), false)
                 {
@@ -518,17 +519,10 @@ fn parse_madt_table(table: &[u8]) -> Option<CpuTopology> {
                 }
             }
             MADT_LOCAL_X2APIC => {
-                if entry_len != 16 || le_u16(&entry[2..4]) != 0 {
+                if entry_len != 16 {
                     return None;
                 }
                 let flags = le_u32(&entry[8..12]);
-                if flags & !(MADT_PROCESSOR_ENABLED | MADT_PROCESSOR_ONLINE_CAPABLE) != 0 {
-                    return None;
-                }
-                if flags & MADT_PROCESSOR_ONLINE_CAPABLE != 0 && flags & MADT_PROCESSOR_ENABLED == 0
-                {
-                    return None;
-                }
                 if flags & MADT_PROCESSOR_ENABLED != 0
                     && !topology.push_cpu(le_u32(&entry[12..16]), le_u32(&entry[4..8]), true)
                 {
@@ -903,7 +897,31 @@ mod tests {
             let offset = MADT_HEADER_LEN + cpu * 8;
             too_many[offset..offset + 8].copy_from_slice(&[0, 8, cpu as u8, cpu as u8, 1, 0, 0, 0]);
         }
+        let truncated = parse_madt_table(&too_many).expect("over-capacity MADT truncates");
+        assert_eq!(truncated.cpu_count(), MAX_SUPPORTED_CPUS);
+        assert_eq!(
+            truncated.cpus()[MAX_SUPPORTED_CPUS - 1].apic_id,
+            (MAX_SUPPORTED_CPUS - 1) as u32
+        );
+        // An over-capacity entry that collides with an admitted CPU is still a
+        // duplicate and rejects the table.
+        too_many[MADT_HEADER_LEN + MAX_SUPPORTED_CPUS * 8 + 2] = 0;
+        too_many[MADT_HEADER_LEN + MAX_SUPPORTED_CPUS * 8 + 3] = 0;
         assert!(parse_madt_table(&too_many).is_none());
+    }
+
+    #[test]
+    fn madt_skips_hot_add_only_and_ignores_reserved_flags() {
+        let mut table = madt_header(24);
+        table[40..44].copy_from_slice(&0xffff_ffff_u32.to_le_bytes());
+        table[44..52].copy_from_slice(&[0, 8, 0, 0, 1, 0, 0, 0x80]);
+        // Online-capable but not enabled: reserved by firmware, never started.
+        table[52..60].copy_from_slice(&[0, 8, 1, 1, 2, 0, 0, 0]);
+        // Disabled outright.
+        table[60..68].copy_from_slice(&[0, 8, 2, 2, 0, 0, 0, 0]);
+        let topology = parse_madt_table(&table).expect("reserved slots are skipped");
+        assert_eq!(topology.cpu_count(), 1);
+        assert_eq!(topology.cpus()[0].apic_id, 0);
     }
 
     #[test]
@@ -931,14 +949,14 @@ mod tests {
     }
 
     #[test]
-    fn madt_rejects_truncation_hot_add_only_and_bad_apic_override() {
+    fn madt_rejects_truncation_and_bad_apic_override() {
         let mut truncated = madt_header(3);
         truncated[44..47].copy_from_slice(&[0, 8, 0]);
         assert!(parse_madt_table(&truncated).is_none());
 
-        let mut hot_add_only = madt_header(8);
-        hot_add_only[44..52].copy_from_slice(&[0, 8, 0, 0, 2, 0, 0, 0]);
-        assert!(parse_madt_table(&hot_add_only).is_none());
+        let mut no_enabled_cpu = madt_header(8);
+        no_enabled_cpu[44..52].copy_from_slice(&[0, 8, 0, 0, 2, 0, 0, 0]);
+        assert!(parse_madt_table(&no_enabled_cpu).is_none());
 
         let mut bad_override = madt_header(20);
         bad_override[44..52].copy_from_slice(&[0, 8, 0, 0, 1, 0, 0, 0]);

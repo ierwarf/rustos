@@ -13,6 +13,11 @@
 // Failure: an unknown flag, a missing value, or an out-of-range count fails
 // the command; it never silently degrades to a weaker topology.
 
+/// RustOS guest vCPU count when `--rustos-vcpus` is not given. Matches the
+/// kernel's `MAX_SUPPORTED_CPUS`, so the default topology exercises every CPU
+/// the kernel can admit.
+pub(crate) const DEFAULT_RUSTOS_VCPUS: u8 = 16;
+
 #[derive(Debug)]
 struct SmokeOptions {
     dry_run: bool,
@@ -91,7 +96,7 @@ where
         gui_dvm_surfaces: false,
         dvm_network_shmem: false,
         dvm_block_shmem: false,
-        rustos_vcpus: 1,
+        rustos_vcpus: DEFAULT_RUSTOS_VCPUS,
         smp_iteration: false,
         smp_formal_profile_override: None,
         smp_ring3_qualification: false,

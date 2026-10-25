@@ -338,29 +338,69 @@ fn decode_datetime(raw: RawRtcDateTime, reg_b: u8) -> RtcDateTime {
     }
 }
 
-fn read_stable_datetime() -> RtcDateTime {
-    loop {
-        while update_in_progress() {
-            spin_loop();
+/// Upper bound on status polls while waiting for the update-in-progress bit to
+/// clear. A healthy RTC holds it for under 2 ms, and each poll is at least one
+/// port round trip, so this is several times the architectural worst case.
+const RTC_UPDATE_POLL_LIMIT: u32 = 4096;
+/// Re-reads allowed when two consecutive snapshots disagree.
+const RTC_STABLE_READ_ATTEMPTS: u32 = 16;
+/// Register A on a floating bus (no CMOS behind ports 0x70/0x71) reads as all
+/// ones, which would pin the update-in-progress bit forever.
+const RTC_ABSENT_STATUS: u8 = 0xff;
+
+fn wait_for_update_end() -> bool {
+    for _ in 0..RTC_UPDATE_POLL_LIMIT {
+        if !update_in_progress() {
+            return true;
+        }
+        spin_loop();
+    }
+    false
+}
+
+/// Reads one stable calendar snapshot, or `None` when the RTC is absent,
+/// stuck mid-update, or never produces two matching reads. The previous loop
+/// spun forever with interrupts disabled in all three cases, which on a
+/// platform without a working CMOS clock (dead cell, floating bus, hardware
+/// reduced) hung boot instead of leaving the wall clock unreadable.
+fn read_stable_datetime() -> Option<RtcDateTime> {
+    if cmos_read(RTC_REG_A) == RTC_ABSENT_STATUS {
+        return None;
+    }
+    for _ in 0..RTC_STABLE_READ_ATTEMPTS {
+        if !wait_for_update_end() {
+            return None;
         }
         let first = read_raw_datetime();
 
-        while update_in_progress() {
-            spin_loop();
+        if !wait_for_update_end() {
+            return None;
         }
         let second = read_raw_datetime();
 
         if first == second {
             let reg_b = cmos_read(RTC_REG_B);
-            return decode_datetime(second, reg_b);
+            return Some(decode_datetime(second, reg_b));
         }
 
         spin_loop();
     }
+    None
 }
 
+/// The wall-clock calendar, or the all-zero value (month 0, day 0) when the RTC
+/// cannot be read. Callers already reject that as "unreadable calendar" rather
+/// than latching a fabricated epoch.
 pub fn now() -> RtcDateTime {
-    interrupts::without_interrupts(read_stable_datetime)
+    interrupts::without_interrupts(read_stable_datetime).unwrap_or(RtcDateTime {
+        year: 0,
+        month: 0,
+        day: 0,
+        weekday: 0,
+        hour: 0,
+        minute: 0,
+        second: 0,
+    })
 }
 
 /// Elapsed time on the validated clocksource, in nanoseconds.

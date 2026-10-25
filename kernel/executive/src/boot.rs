@@ -28,6 +28,10 @@ use nucleus_core::util::fault_injection;
 
 use crate::{announce_ready, debug, fatal, flow_debug, flow_info, hal_hooks, io_services, tasks};
 
+/// Set once kernel-mm removed the fixed AP startup pages from the allocator,
+/// which is only possible when the firmware map calls them usable RAM.
+static AP_TRAMPOLINE_RANGE_OWNED: AtomicBool = AtomicBool::new(false);
+
 const ROOTD_EXEC_PATH: &str = "services/rootd/rootd.elf";
 const ROOTD_BOOTSTRAP_WEIGHT_MICROS: u64 = 4_000;
 const ROOTD_BOOTSTRAP_DOMAIN: u64 = 10;
@@ -187,7 +191,13 @@ pub unsafe fn initialize_kernel(boot_info_ptr: *const BootInfo) {
         nucleus_core::ap_trampoline::TRAMPOLINE_PHYS,
         nucleus_core::ap_trampoline::RESERVED_BYTES,
     ) {
-        Ok(()) | Err(mm_api::phys::FixedRangeClaimError::OutsideUsableMemory) => {}
+        // ORDERING: Release publishes the completed allocator claim to the
+        // later SMP bring-up on this same BSP; no other CPU reads the flag.
+        Ok(()) => AP_TRAMPOLINE_RANGE_OWNED.store(true, Ordering::Release),
+        // Firmware withheld the range. That is fine for a uniprocessor boot,
+        // but SMP startup must not write a trampoline into memory the
+        // firmware map did not hand us; see `initialize_application_processors`.
+        Err(mm_api::phys::FixedRangeClaimError::OutsideUsableMemory) => {}
         Err(error) => panic!("AP trampoline low-memory range is unavailable: {error:?}"),
     }
     mm_api::frame_capability::preallocate_pager_fault_frames()
@@ -457,6 +467,16 @@ fn initialize_application_processors() {
         return;
     }
 
+    // Real firmware may type the fixed low pages as reserved (SMM, option ROM,
+    // or boot-services scratch). The trampoline would overwrite them, which
+    // corrupts firmware state silently and shows up later as an unrelated
+    // hang. Fail here, with the cause, instead.
+    // ORDERING: Acquire pairs with the Release store made after the claim.
+    assert!(
+        AP_TRAMPOLINE_RANGE_OWNED.load(Ordering::Acquire),
+        "AP startup pages {TRAMPOLINE_PHYS:#x}+{RESERVED_BYTES:#x} are not usable memory in the firmware map; \
+         refusing to write the SMP trampoline over firmware-owned memory"
+    );
     ap_trampoline::install();
     debug::record_milestone(
         debug::LogCategory::Boot,

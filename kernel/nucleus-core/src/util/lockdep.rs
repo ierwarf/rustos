@@ -81,7 +81,7 @@ pub use scheduler_diag::{
 use spin_budget::{RAW_SPIN_CYCLE_LIMIT, raw_spin_wait_exceeded};
 
 pub const MAX_LOCK_CLASSES: usize = 64;
-pub const MAX_TRACKED_CPUS: usize = 8;
+pub const MAX_TRACKED_CPUS: usize = 16;
 #[cfg(rustos_boot_image)]
 const MAX_HELD_LOCK_DEPTH: usize = 16;
 #[cfg(rustos_boot_image)]

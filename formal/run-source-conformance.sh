@@ -1530,7 +1530,7 @@ clocksource-deadline/ClocksourceDeadline|kernel-compat|user::syscall::linux::ser
 clocksource-deadline/ClocksourceDeadline|kernel-compat|user::syscall::linux::service_ops::process_time::tests::a_monotonic_instant_between_two_ticks_keeps_its_own_resolution
 clocksource-deadline/ClocksourceDeadline|kernel-ps|multitask::scheduler::tests::scheduler_block_arm_is_exact_race_safe_and_terminally_revoked
 cpu-topology-admission/CpuTopologyAdmission|kernel-hal|arch::acpi::tests::madt_cpu_topology_is_dense_unique_bounded_and_atomic
-cpu-topology-admission/CpuTopologyAdmission|kernel-hal|arch::acpi::tests::madt_rejects_truncation_hot_add_only_and_bad_apic_override
+cpu-topology-admission/CpuTopologyAdmission|kernel-hal|arch::acpi::tests::madt_rejects_truncation_and_bad_apic_override
 cpu-topology-admission/CpuTopologyAdmission|kernel-hal|arch::acpi::tests::madt_normalizes_the_executing_bsp_to_logical_cpu_zero
 cpu-online-lifecycle/CpuOnlineLifecycle|kernel-hal|arch::smp::tests::cpu_lifecycle_publication_is_dense_generation_bound_and_ordered
 cpu-online-lifecycle/CpuOnlineLifecycle|kernel-hal|arch::smp::tests::cpu_lifecycle_rejects_skipped_state

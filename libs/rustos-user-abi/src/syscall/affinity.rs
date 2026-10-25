@@ -15,7 +15,7 @@
 /// `arg3=target_process_id`. `mask` carries the kernel-resolved effective
 /// task mask; syscalld must not infer target ownership from a thread ID.
 pub const CPU_TOPOLOGY_OBSERVATION_ABI_VERSION: u64 = 2;
-pub const CPU_TOPOLOGY_MAX_LOGICAL_CPUS: u64 = 8;
+pub const CPU_TOPOLOGY_MAX_LOGICAL_CPUS: u64 = 16;
 
 pub const SYSCALL_OFFLOAD_OP_LINUX_SCHED_SETAFFINITY: u16 = 69;
 pub const SYSCALL_OFFLOAD_OP_WIN32_QUERY_SYSTEM_INFORMATION: u16 = 91;

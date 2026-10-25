@@ -155,7 +155,7 @@ round-trips a versioned policy stamp, and commits the effective Online
 intersection. Windows basic topology keeps reserved output zero, while
 Get/SetProcessAffinityMask, SetThreadAffinityMask, and
 GetCurrentProcessorNumber use the same dense single-group scheduler state.
-The KVM launcher accepts explicit `--rustos-vcpus 2..=8` only with a fresh
+The KVM launcher accepts explicit `--rustos-vcpus 2..=16` only with a fresh
 source-bound formal seal and then requires the complete per-CPU runtime event
 matrix. Commercial release remains closed until the affinity ABI differential,
 formal/source gates, and complete 1/2/4/8 runtime/recovery matrix pass.
