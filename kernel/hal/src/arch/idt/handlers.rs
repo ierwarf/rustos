@@ -32,6 +32,7 @@ global_asm!(
     .global rustos_default_handler_alignment_bridge
     .type rustos_default_handler_alignment_bridge, @function
 rustos_default_handler_alignment_bridge:
+    endbr64
     mov r11, rsp
     and rsp, -16
     sub rsp, 16
@@ -96,6 +97,17 @@ fn rustos_default_handler_aligned(
     index: u8,
     error_code: Option<u64>,
 ) {
+    // Supervisor #CP is fatal; user #CP retains exact-task retirement routing.
+    // The general vector-21 wrapper supplies the hardware error-code frame.
+    if index == 21 && !is_user_mode(&stack_frame) {
+        emergency_exception_marker(index);
+        panic!(
+            "control-protection fault (#CP): error={:?}, rip={:#x}, cs={:#x}",
+            error_code,
+            stack_frame.instruction_pointer.as_u64(),
+            stack_frame.code_segment.0,
+        );
+    }
     let cr2 = Cr2::read().map(|addr| addr.as_u64()).unwrap_or(u64::MAX);
     let user_mode = is_user_mode(&stack_frame);
 

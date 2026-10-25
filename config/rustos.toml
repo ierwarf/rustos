@@ -150,20 +150,8 @@ incremental = false
 debuginfo = "1"
 embed_bitcode = true
 panic = "abort"
-# `"none"` means "do not pass the flag", which is not the same as "no
-# relocation". The kernel target is `x86_64-unknown-linux-gnu`, whose default
-# relocation model is PIC, so every kernel library crate reached its own statics
-# through a GOT slot: `mov (GOT),%rax; mov (%rax),%rdst` -- two dependent loads
-# where one direct RIP-relative load would do. The nucleus *binary* crate never
-# paid that, because `nucleus_rustc_args` already passes
-# `-C relocation-model=static`; but `cargo rustc` args stop at the binary crate,
-# and all the hot code lives in the libraries below it.
-#
-# The image is linked `-no-pie -static` at a fixed `KERNEL_LOAD_BASE = 0x200000`
-# and executes at its link address, which is exactly the condition the static
-# model requires -- the binary crate has been relying on it since it was
-# written. Setting it here makes the libraries agree with the binary and with
-# the link, rather than adding a new assumption.
-relocation_model = "static"
+# KASLR requires every kernel crate to use position-independent code.
+# The fixed-physical bootstrap relocates the static PIE before Rust entry.
+relocation_model = "pic"
 strip = "none"
 extra_rustflags = []

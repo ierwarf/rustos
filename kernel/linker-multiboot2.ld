@@ -8,6 +8,7 @@ PHDRS
   rodata PT_LOAD FLAGS(4);
   relro PT_LOAD FLAGS(4);
   data PT_LOAD FLAGS(6);
+  dynamic PT_DYNAMIC FLAGS(6);
 }
 
 SECTIONS
@@ -32,11 +33,24 @@ SECTIONS
     *(.eh_frame)
   } :rodata
 
+  .dynsym : { *(.dynsym) } :rodata
+  .dynstr : { *(.dynstr) } :rodata
+  .gnu.hash : { *(.gnu.hash) } :rodata
+  .hash : { *(.hash) } :rodata
+  .rela.dyn : ALIGN(8)
+  {
+    HIDDEN(rustos_rela_start = .);
+    *(.rela.dyn)
+    HIDDEN(rustos_rela_end = .);
+  } :rodata
+
   . = ALIGN(4096);
   .data.rel.ro : ALIGN(4096)
   {
     *(.data.rel.ro .data.rel.ro.*)
   } :relro
+
+  .dynamic : ALIGN(8) { *(.dynamic) } :relro :dynamic
 
   .got : ALIGN(8)
   {
@@ -59,6 +73,17 @@ SECTIONS
 
   . = ALIGN(4096);
   _end = .;
+
+  /* Only the 32-bit BSP bootstrap uses absolute physical addresses. */
+  HIDDEN(rustos_boot_pml4_phys = ABSOLUTE(rustos_boot_pml4));
+  HIDDEN(rustos_boot_pdpt_phys = ABSOLUTE(rustos_boot_pdpt));
+  HIDDEN(rustos_boot_pd0_phys = ABSOLUTE(rustos_boot_pd0));
+  HIDDEN(rustos_boot_pd1_phys = ABSOLUTE(rustos_boot_pd1));
+  HIDDEN(rustos_boot_pd2_phys = ABSOLUTE(rustos_boot_pd2));
+  HIDDEN(rustos_boot_pd3_phys = ABSOLUTE(rustos_boot_pd3));
+  HIDDEN(rustos_boot_gdt_phys = ABSOLUTE(rustos_boot_gdt));
+  HIDDEN(rustos_boot_gdt_desc_phys = ABSOLUTE(rustos_boot_gdt_desc));
+  HIDDEN(rustos_multiboot_long_mode_phys = ABSOLUTE(rustos_multiboot_long_mode));
 
   ASSERT((rustos_ap_trampoline_end - rustos_ap_trampoline_start) <= 4096,
          "AP trampoline exceeds its executable page")

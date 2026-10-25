@@ -129,7 +129,7 @@ fn broker_query_layout(args: &RustosMmBrokerArgs) -> Result<(), i64> {
             brk_mapped_end: linux.brk_mapped_end,
             mmap_next: linux.mmap_next,
             user_range_start: paging::USER_SPACE_BASE,
-            user_range_end: paging::USER_SPACE_END_EXCLUSIVE,
+            user_range_end: linux.brk_limit(),
         })
     }) else {
         return Err(LINUX_ESRCH);
@@ -281,15 +281,26 @@ fn broker_map_anon(args: &RustosMmBrokerArgs) -> Result<(), i64> {
         pager_admission::AnonymousAdmission::Demand => {
             let Some(result) =
                 multitask::with_process_state_by_pid_mut(args.target_pid, |process_state| {
+                    if !process_state.mapping_below_stack_guard(start, mapping_end) {
+                        return Err(LINUX_ENOMEM);
+                    }
                     process_state.set_mapping_cursor(mapping_end);
-                    RustosMmMapBrokerResult {
+                    Ok::<_, i64>(RustosMmMapBrokerResult {
                         addr: start,
                         len: args.len,
-                    }
+                    })
                 })
             else {
                 let _ = multitask::unmap_pager_vma_for_process(args.target_pid, start, mapping_end);
                 return Err(LINUX_ESRCH);
+            };
+            let result = match result {
+                Ok(result) => result,
+                Err(errno) => {
+                    let _ =
+                        multitask::unmap_pager_vma_for_process(args.target_pid, start, mapping_end);
+                    return Err(errno);
+                }
             };
             return write_out(args, &result);
         }
@@ -298,6 +309,9 @@ fn broker_map_anon(args: &RustosMmBrokerArgs) -> Result<(), i64> {
     }
 
     let Some(result) = multitask::with_process_state_by_pid_mut(args.target_pid, |process_state| {
+        if !process_state.mapping_below_stack_guard(start, mapping_end) {
+            return Err(LINUX_ENOMEM);
+        }
         if args.prot != 0 {
             process_state
                 .address_space_mut()
@@ -332,6 +346,9 @@ fn broker_map_file_private(args: &RustosMmBrokerArgs) -> Result<(), i64> {
 
     let Some(map_result) =
         multitask::with_process_state_by_pid_mut(args.target_pid, |process_state| {
+            if !process_state.mapping_below_stack_guard(start, mapping_end) {
+                return Err(LINUX_ENOMEM);
+            }
             process_state
                 .address_space_mut()
                 .map_zeroed_user_bytes_at(VirtAddr::new(start), len, page_flags)
@@ -370,6 +387,9 @@ fn broker_map_memfd_shared(args: &RustosMmBrokerArgs) -> Result<(), i64> {
     let page_flags = protection_to_page_flags(args.prot)?;
 
     let Some(result) = multitask::with_process_state_by_pid_mut(args.target_pid, |process_state| {
+        if !process_state.mapping_below_stack_guard(start, mapping_end) {
+            return Err(LINUX_ENOMEM);
+        }
         process_state
             .address_space_mut()
             .map_existing_user_pages_at(VirtAddr::new(start), &frames, page_flags)
@@ -391,9 +411,12 @@ fn broker_map_device_shared(args: &RustosMmBrokerArgs) -> Result<(), i64> {
     let start = checked_page_addr(args.addr)?;
     let page_flags = surface_page_flags(args.prot)?;
     let page_count = page_count(len)?;
-    checked_mapping_end(start, page_count)?;
+    let mapping_end = checked_mapping_end(start, page_count)?;
 
     let Some(result) = multitask::with_process_state_by_pid_mut(args.target_pid, |process_state| {
+        if !process_state.mapping_below_stack_guard(start, mapping_end) {
+            return Err(LINUX_ENOMEM);
+        }
         let mut surface_fd = args.fd;
         let entry = process_state
             .handles()

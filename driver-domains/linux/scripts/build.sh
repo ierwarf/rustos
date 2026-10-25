@@ -284,6 +284,10 @@ config_change_preserves_host_toolchain() {
     ' "$ADDITIVE_PACKAGE_CACHE_POLICY" "$previous" "$desired"
 }
 
+kernel_signed_module_packages() {
+    printf '%s\n' rustos-dvm-block rustos-dvm-display rustos-dvm-net rustos-dvm-nvidia-open
+}
+
 selftest_config_cache_policy() {
     local tmp
     local previous
@@ -360,6 +364,15 @@ selftest_config_cache_policy() {
         || die "kernel fragment change did not invalidate the kernel lane"
     test "$structural_before" = "$structural_after" \
         || die "kernel fragment change invalidated the host toolchain lane"
+    local module_makefile
+    local module_package
+    for module_makefile in "$ROOT"/package/*/*.mk; do
+        if grep -Fq '$(eval $(kernel-module))' "$module_makefile"; then
+            module_package="$(basename "$(dirname "$module_makefile")")"
+            kernel_signed_module_packages | grep -Fxq "$module_package" \
+                || die "kernel rebuild omits signed-module package: $module_package"
+        fi
+    done
     rm -rf -- "$tmp"
     printf 'rustos-linux-dvm: config cache policy selftest passed\n'
 }
@@ -722,9 +735,9 @@ prepare_mutable_inputs() {
         || test "$(cat "$kernel_stamp")" != "$kernel_current"; then
         if test -d "$kernel_build" || test -d "$target_modules"; then
             make_buildroot linux-dirclean
-            make_buildroot rustos-dvm-block-dirclean
-            make_buildroot rustos-dvm-display-dirclean
-            make_buildroot rustos-dvm-nvidia-open-dirclean
+            while IFS= read -r service; do
+                make_buildroot "${service}-dirclean"
+            done < <(kernel_signed_module_packages)
             rm -rf -- "$target_modules"
         fi
         invalidate_rootfs_image

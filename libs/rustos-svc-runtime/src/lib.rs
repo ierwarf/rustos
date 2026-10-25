@@ -16,6 +16,78 @@ use rustos_user_abi::syscall::{AT_RUSTOS_BOOTSTRAP_HEAP_BASE, AT_RUSTOS_BOOTSTRA
 // Linux x86_64 auxv terminator code. Defined here to avoid pulling in linux-raw-sys.
 const AT_NULL: u64 = 0;
 
+/// Emit the allocation-free, GOT-free static-PIE relocation leaf. It runs
+/// before any Rust code can dereference a vtable, static slice, or GOT slot.
+/// Service images use a zero link base and only RELA/RELATIVE relocations;
+/// unsupported formats fail closed. Reapplying an already-relocated bootstrap
+/// image is harmless because RELA carries the original addend.
+#[macro_export]
+macro_rules! relocation_trampoline {
+    () => {
+        ::core::arch::global_asm!(
+            ".hidden __rustos_svc_relocate",
+            ".global __rustos_svc_relocate",
+            ".type __rustos_svc_relocate, @function",
+            "__rustos_svc_relocate:",
+            "    endbr64",
+            "    lea rdi, [rip + __ehdr_start]",
+            "    lea r8, [rip + _DYNAMIC]",
+            "    xor r9d, r9d",
+            "    xor r10d, r10d",
+            "    mov r11d, 24",
+            "2:",
+            "    mov rax, [r8]",
+            "    test rax, rax",
+            "    jz 6f",
+            "    cmp rax, 7", // DT_RELA
+            "    jne 3f",
+            "    mov r9, [r8 + 8]",
+            "3:",
+            "    cmp rax, 8", // DT_RELASZ
+            "    jne 4f",
+            "    mov r10, [r8 + 8]",
+            "4:",
+            "    cmp rax, 9", // DT_RELAENT
+            "    jne 5f",
+            "    mov r11, [r8 + 8]",
+            "5:",
+            "    cmp rax, 35", // DT_RELRSZ: packed relocations unsupported
+            "    je 9f",
+            "    add r8, 16",
+            "    jmp 2b",
+            "6:",
+            "    cmp r11, 24",
+            "    jne 9f",
+            "    test r10, r10",
+            "    jz 8f",
+            "    test r9, r9",
+            "    jz 9f",
+            "    add r9, rdi",
+            "7:",
+            "    cmp r10, 24",
+            "    jb 9f",
+            "    cmp qword ptr [r9 + 8], 8", // R_X86_64_RELATIVE, symbol=0
+            "    jne 9f",
+            "    mov rax, [r9]",
+            "    add rax, rdi",
+            "    mov rcx, [r9 + 16]",
+            "    add rcx, rdi",
+            "    mov [rax], rcx",
+            "    add r9, 24",
+            "    sub r10, 24",
+            "    jnz 7b",
+            "8:",
+            "    ret",
+            "9:",
+            "    mov eax, 231", // exit_group(127), no policy/runtime needed
+            "    mov edi, 127",
+            "    syscall",
+            "    ud2",
+            ".size __rustos_svc_relocate, .-__rustos_svc_relocate",
+        );
+    };
+}
+
 /// Declare the entry point of a static-PIE RustOS service.
 ///
 /// Generates `_start` (raw assembly trampoline) plus the
@@ -27,11 +99,14 @@ const AT_NULL: u64 = 0;
 #[macro_export]
 macro_rules! entry {
     ($main:path) => {
+        $crate::relocation_trampoline!();
         ::core::arch::global_asm!(
             ".global _start",
             ".type _start, @function",
             "_start:",
+            "    endbr64",
             "    xor rbp, rbp",
+            "    call __rustos_svc_relocate",
             "    mov rdi, rsp",
             "    and rsp, -16",
             "    call __rustos_svc_rt_start",

@@ -124,6 +124,7 @@ global_asm!(
     .global timer_interrupt_handler
     .type timer_interrupt_handler, @function
     timer_interrupt_handler:
+        endbr64
         test byte ptr [rsp + 8], 0x3
         jnz 1f
         push 0
@@ -175,6 +176,7 @@ global_asm!(
     .global rtc_scheduler_interrupt_handler
     .type rtc_scheduler_interrupt_handler, @function
     rtc_scheduler_interrupt_handler:
+        endbr64
         test byte ptr [rsp + 8], 0x3
         jnz 4f
         push 0
@@ -226,6 +228,7 @@ global_asm!(
     .global software_schedule_interrupt_handler
     .type software_schedule_interrupt_handler, @function
     software_schedule_interrupt_handler:
+        endbr64
         test byte ptr [rsp + 8], 0x3
         jnz 7f
         push 0
@@ -276,6 +279,7 @@ global_asm!(
     .global reschedule_ipi_interrupt_handler
     .type reschedule_ipi_interrupt_handler, @function
     reschedule_ipi_interrupt_handler:
+        endbr64
         test byte ptr [rsp + 8], 0x3
         jnz 10f
         push 0
@@ -326,6 +330,7 @@ global_asm!(
     .global restore_kernel_saved_context
     .type restore_kernel_saved_context, @function
     restore_kernel_saved_context:
+        endbr64
         mov rsp, rdi
         RESTORE_CONTEXT_AND_IRET 0x188
     .size restore_kernel_saved_context, . - restore_kernel_saved_context
@@ -337,6 +342,7 @@ global_asm!(
     .global schedule_saved_user_context
     .type schedule_saved_user_context, @function
     schedule_saved_user_context:
+        endbr64
         cli
         mov rsp, rdi
         mov rdi, rsp
@@ -373,6 +379,7 @@ global_asm!(
     .global software_schedule_trap
     .type software_schedule_trap, @function
     software_schedule_trap:
+        endbr64
         SOFTWARE_TRAP 1f
     1:  ret
     .size software_schedule_trap, . - software_schedule_trap
@@ -380,6 +387,7 @@ global_asm!(
     .global fast_ipc_call_schedule_trap
     .type fast_ipc_call_schedule_trap, @function
     fast_ipc_call_schedule_trap:
+        endbr64
         movabs rax, {fast_ipc_call_schedule_tag}
         SOFTWARE_TRAP 1f
     1:  ret
@@ -388,6 +396,7 @@ global_asm!(
     .global fast_ipc_reply_schedule_trap
     .type fast_ipc_reply_schedule_trap, @function
     fast_ipc_reply_schedule_trap:
+        endbr64
         movabs rax, {fast_ipc_reply_schedule_tag}
         SOFTWARE_TRAP 1f
     1:  ret

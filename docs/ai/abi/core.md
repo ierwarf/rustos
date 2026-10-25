@@ -237,14 +237,14 @@ Service IDs 5 and 13, their former capability bits, and raw syscall numbers
 not extension points and must continue to return `ENOSYS`.
 
 Broker authorization checks the caller's registered service capability — **not** its executable path.
-`SYS_RUSTOS_ENTROPY_BROKER` is limited to the Linux-syscall and network-policy
-capabilities and returns at most one inline-IPC payload of bytes from the
+`SYS_RUSTOS_ENTROPY_BROKER` is limited to the Linux-syscall, network-policy,
+and process-loader capabilities and returns at most one inline-IPC payload of bytes from the
 boot-seeded ChaCha20 substrate. Initialization is one-shot and rejects an
 absent/all-zero seed. A private master stream derives every child seed from
 master output; consumers never clone the master or form related keys by
 combining the boot seed with public PID/TID/counter state. Syscalld still owns
 Linux `getrandom` flag, length, and error policy; netd still owns token
-collision/admission policy. PID/TID/counter-derived pseudo-random output is
+collision/admission policy; loaderd owns image and initial-stack ASLR policy. PID/TID/counter-derived pseudo-random output is
 forbidden for credentials, object capabilities, ASLR material, and Linux
 `getrandom`.
 `pagerd` is a standalone rootd-managed service and is the only process that may

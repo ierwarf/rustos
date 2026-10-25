@@ -776,6 +776,30 @@ pub(super) fn read(slot: usize) -> Option<TaskIdentity> {
     read_state(slot).map(|(identity, _)| identity)
 }
 
+/// `read(slot).map(|i| i.user_binding().map(|b| b.1))` from the one flag word
+/// that decides it. The outer `None` is "never published or mid-update"; the
+/// inner `None` is "published, but not a complete user binding". Syscall entry
+/// and return validation ask only this, and a full `read` loads twelve fields
+/// and rebuilds the whole `TaskIdentity` to answer it.
+pub(super) fn read_user_abi(slot: usize) -> Option<Option<UserAbi>> {
+    let cell = IDENTITIES.get(slot)?;
+    // ORDERING: as in `read_state`; the flag load sits between two version
+    // observations and is discarded unless both name the same stable commit.
+    let before = cell.version.load(Ordering::Acquire);
+    if before & 1 != 0 {
+        return None;
+    }
+    let flags = cell.flags.load(Ordering::Relaxed);
+    fence(Ordering::Acquire);
+    if cell.version.load(Ordering::Relaxed) != before || flags & FLAG_PUBLISHED == 0 {
+        return None;
+    }
+    let complete = flags & FLAG_USER_MODE != 0
+        && flags & FLAG_TASK_ID != 0
+        && flags & FLAG_PROCESS != 0;
+    Some(if complete { decode_abi(flags) } else { None })
+}
+
 /// Reads the immutable identity and lifecycle state from one stable commit.
 fn read_state(slot: usize) -> Option<(TaskIdentity, u32)> {
     let cell = IDENTITIES.get(slot)?;
@@ -1073,6 +1097,49 @@ mod tests {
         );
         cell.version.store(stable_version, Ordering::Relaxed);
         clear(slot);
+    }
+
+    #[test]
+    fn user_abi_fast_read_matches_the_full_identity_read() {
+        let _process = crate::multitask::process_table::tests::isolate_process_table();
+        let _cpu = crate::multitask::cpu_local::test_publication_lock();
+        let _runtime = crate::multitask::scheduler::execution_test_serial_guard();
+        let slot = 5;
+        let complete = TaskIdentity {
+            task_id: Some(61),
+            user_mode: true,
+            abi: Some(UserAbi::Windows),
+            process_handle: Some(ProcessHandle::new(3, 8)),
+            process_id: Some(19),
+            console_session: ConsoleSessionHandle::from_raw(2),
+            pager_charge: None,
+        };
+        for identity in [
+            complete,
+            TaskIdentity { abi: Some(UserAbi::Linux), ..complete },
+            TaskIdentity { abi: None, ..complete },
+            TaskIdentity { user_mode: false, ..complete },
+            TaskIdentity { task_id: None, ..complete },
+            TaskIdentity { process_handle: None, ..complete },
+            TaskIdentity::default(),
+        ] {
+            publish_test_identity(slot, identity);
+            assert_eq!(
+                read_user_abi(slot),
+                read(slot).map(|read| read.user_binding().map(|binding| binding.1)),
+                "{identity:?}"
+            );
+        }
+        // A writer mid-update (odd version) is absent, never a stale answer.
+        let cell = &IDENTITIES[slot];
+        let stable_version = cell.version.load(Ordering::Relaxed);
+        cell.version
+            .store(stable_version.wrapping_add(1), Ordering::Relaxed);
+        assert_eq!(read_user_abi(slot), None);
+        cell.version.store(stable_version, Ordering::Relaxed);
+        clear(slot);
+        assert_eq!(read_user_abi(slot), None);
+        assert_eq!(read_user_abi(MAX_SCHEDULER_TASKS), None);
     }
 
     #[test]

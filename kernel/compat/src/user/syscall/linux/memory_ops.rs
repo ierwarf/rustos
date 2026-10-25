@@ -337,8 +337,8 @@ fn bootstrap_mmap(
             } else {
                 find_bootstrap_mmap_start(address_space, state, requested_addr, len)?
             };
-            let end = start.checked_add(len).ok_or(LINUX_ENOMEM)?;
-            if end > state.brk_limit() || end <= state.brk_mapped_end {
+            let end = checked_bootstrap_mapping_end(state, start, len)?;
+            if end <= state.brk_mapped_end {
                 return Err(LINUX_ENOMEM);
             }
             if fixed {
@@ -433,10 +433,7 @@ fn find_bootstrap_mmap_start(
         checked_align_up(requested_addr, PAGE_SIZE).ok_or(LINUX_ENOMEM)?
     };
     loop {
-        let end = start.checked_add(len).ok_or(LINUX_ENOMEM)?;
-        if end > state.brk_limit() {
-            return Err(LINUX_ENOMEM);
-        }
+        let end = checked_bootstrap_mapping_end(state, start, len)?;
         let page_count = usize::try_from(len / PAGE_SIZE).map_err(|_| LINUX_ENOMEM)?;
         let overlaps_mapped = !address_space
             .user_range_is_unmapped(VirtAddr::new(start), page_count)
@@ -445,6 +442,48 @@ fn find_bootstrap_mmap_start(
             return Ok(start);
         }
         start = checked_align_up(end, PAGE_SIZE).ok_or(LINUX_ENOMEM)?;
+    }
+}
+
+fn checked_bootstrap_mapping_end(
+    state: &linux_abi::LinuxProcessState,
+    start: u64,
+    len: u64,
+) -> Result<u64, i64> {
+    let end = start.checked_add(len).ok_or(LINUX_ENOMEM)?;
+    if end > state.brk_limit() {
+        return Err(LINUX_ENOMEM);
+    }
+    Ok(end)
+}
+
+#[cfg(test)]
+mod aslr_tests {
+    use super::*;
+
+    #[test]
+    fn bootstrap_mmap_refuses_the_randomized_permanent_stack_guard() {
+        let stack_top = paging::USER_SPACE_END_EXCLUSIVE - 128 * 1024 * 1024;
+        let guard = stack_top - rustos_user_abi::syscall::PROC_BROKER_STACK_RESERVE_BYTES;
+        let state = linux_abi::LinuxProcessState {
+            mapping_limit: guard,
+            ..linux_abi::LinuxProcessState::default()
+        };
+        // Both MAP_FIXED and nonfixed hint admission use this before touching
+        // page tables, even though the guard itself has no present PTE.
+        assert_eq!(
+            checked_bootstrap_mapping_end(&state, guard, PAGE_SIZE),
+            Err(LINUX_ENOMEM)
+        );
+        assert_eq!(
+            checked_bootstrap_mapping_end(&state, guard - PAGE_SIZE, PAGE_SIZE),
+            Ok(guard)
+        );
+        assert_eq!(
+            checked_bootstrap_mapping_end(&state, guard - PAGE_SIZE, PAGE_SIZE * 2),
+            Err(LINUX_ENOMEM)
+        );
+        assert!(!state.can_grow_brk_to(guard + PAGE_SIZE));
     }
 }
 

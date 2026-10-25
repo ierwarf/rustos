@@ -719,6 +719,56 @@ fn fork_hold_makes_fault_readers_retry_without_publishing_a_hole() {
 }
 
 #[test]
+fn old_image_mapping_plan_cannot_publish_over_replacement_stack_guard() {
+    use rustos_user_abi::linux::{LinuxMemoryMapState, LinuxProcessState, LinuxRuntimeProfile};
+    let _guard = guard();
+    let _isolation = super::super::process_table::tests::isolate_process_table();
+    let pid = 4_241;
+    let old_guard = rustos_user_abi::syscall::PROC_BROKER_USER_SPACE_END_EXCLUSIVE - (128 << 20);
+    let new_guard = old_guard - (128 << 20);
+    let state = UserProcessState::new(
+        ProcessAddressSpace::empty_for_tests(),
+        Some(LinuxProcessState {
+            mapping_limit: old_guard,
+            ..LinuxProcessState::default()
+        }),
+        None,
+        None,
+        None,
+        false,
+        "/old-image.elf",
+    );
+    let handle = super::super::process_table::create_process(pid, state).unwrap();
+    let retained = super::super::process_table::retain_process(handle).unwrap();
+    let plan = template(new_guard);
+    // Pause a sibling's service-side request after old-image policy admission.
+    assert!(
+        retained.with_state_mut(|_, state| state.mapping_below_stack_guard(plan.start, plan.end))
+    );
+    retained.with_state_mut(|_, state| {
+        let _retired = state.replace_for_exec(
+            ProcessAddressSpace::empty_for_tests(),
+            LinuxProcessState {
+                mapping_limit: new_guard,
+                ..LinuxProcessState::default()
+            },
+            LinuxMemoryMapState::default(),
+            LinuxRuntimeProfile::default(),
+            "/replacement.elf",
+        );
+    });
+    // Resume the old plan against actual VMA admission. It must refuse before
+    // even inspecting the replacement page tables, let alone publishing.
+    assert_eq!(
+        super::super::publish_pager_vma_for_process(pid, plan, MAX_PAGER_VMAS_PER_PROCESS),
+        Err(PagerVmaError::Denied),
+    );
+    assert!(
+        !retained.with_state_mut(|_, state| state.mapping_below_stack_guard(plan.start, plan.end))
+    );
+}
+
+#[test]
 fn target_process_publication_is_generation_bound_and_revocable() {
     let _guard = guard();
     let _isolation = super::super::process_table::tests::isolate_process_table();

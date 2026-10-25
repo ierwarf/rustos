@@ -59,9 +59,9 @@ pub(crate) fn apply_kernel_cargo_env<'a>(
     command: &'a mut Command,
 ) -> &'a mut Command {
     let uses_sccache = rustc_wrapper_is_sccache(config);
+    apply_owned_target_rustflags(command, &kernel_rustflags_env(config));
     command
         .env("CARGO_TARGET_DIR", &config.cargo_target_dir)
-        .env("RUSTFLAGS", kernel_rustflags_env(config))
         .env(
             "RUSTOS_LOCK_TELEMETRY",
             config.project.lock_telemetry.enabled.to_string(),
@@ -112,6 +112,36 @@ pub(crate) fn apply_kernel_cargo_env<'a>(
             .env("CARGO_BUILD_RUSTC_WRAPPER", "");
     }
     command
+}
+
+/// Cargo prioritizes encoded flags over RUSTFLAGS. Owned target hardening must
+/// clear that higher-priority channel, not just append mandatory string flags.
+pub(crate) fn apply_owned_target_rustflags<'a>(
+    command: &'a mut Command,
+    flags: &str,
+) -> &'a mut Command {
+    command
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
+        .env("RUSTFLAGS", flags)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn owned_flags_remove_encoded_override_from_the_child_environment() {
+        let mut command = Command::new("cargo");
+        command.env("CARGO_ENCODED_RUSTFLAGS", "-Z\x1fcf-protection=none");
+        apply_owned_target_rustflags(&mut command, "-Z cf-protection=branch -C jump-tables=n");
+        let environment: Vec<_> = command.get_envs().collect();
+        assert!(environment.contains(&(OsStr::new("CARGO_ENCODED_RUSTFLAGS"), None)));
+        assert!(environment.contains(&(
+            OsStr::new("RUSTFLAGS"),
+            Some(OsStr::new("-Z cf-protection=branch -C jump-tables=n"))
+        )));
+    }
 }
 
 pub(crate) fn kernel_rustflags_env(config: &Config) -> String {

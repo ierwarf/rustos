@@ -122,7 +122,7 @@ impl<T: ?Sized, const CLASS: u8> TrackedSpinLock<T, CLASS> {
         }
     }
 
-    #[cfg(rustos_boot_image)]
+    #[cfg(all(rustos_boot_image, not(rustos_lock_phase_profile)))]
     #[inline]
     fn spin_lean(&self, acquire_site: &'static Location<'static>) -> MutexGuard<'_, T> {
         let mut wait_start_tsc = 0_u64;

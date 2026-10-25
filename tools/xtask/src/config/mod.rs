@@ -96,7 +96,7 @@ impl Config {
             .unwrap_or_else(|| {
                 let linker_script = root_dir.join("kernel/linker-multiboot2.ld");
                 split_whitespace_owned(&format!(
-                    "-C no-redzone -C relocation-model=static -C link-arg=-nostartfiles -C link-arg=-no-pie -C link-arg=-static -C link-arg=-Wl,-T,{} -C link-arg=-Wl,-e,_start",
+                    "-C no-redzone -C relocation-model=pic -C link-arg=-nostartfiles -C link-arg=-static-pie -C link-arg=-Wl,--no-dynamic-linker -C link-arg=-Wl,-Bsymbolic -C link-arg=-Wl,-z,text -C link-arg=-Wl,-T,{} -C link-arg=-Wl,-e,_start",
                     linker_script.display()
                 ))
             });

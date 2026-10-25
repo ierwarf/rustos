@@ -15,8 +15,12 @@
 //! IPC ones included, so it is worth knowing which step of the common path
 //! spends it rather than inferring from the call graph.
 
+#[cfg(rustos_syscall_phase_profile)]
+use nucleus_core::debug::LogCategory;
+#[cfg(rustos_syscall_phase_profile)]
+use nucleus_core::debug::phase_profile::PhaseProfile;
 
-#[cfg(test)]
+#[cfg(any(test, rustos_syscall_phase_profile))]
 pub(super) const SYSCALL_PHASE_COUNT: usize = 4;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

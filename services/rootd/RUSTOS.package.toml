@@ -6,6 +6,7 @@ startup = "none"
 [build]
 builder = "cargo-kernel-binary"
 package = "rootd"
+linkage = "static-pie"
 
 [install]
 path = "services/rootd/rootd.elf"

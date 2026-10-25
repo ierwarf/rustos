@@ -24,7 +24,7 @@ use kernel_compat::api::console_host::{self, ConsoleProgramSpec};
 use kernel_hal::api as hal_api;
 use kernel_mm::api as mm_api;
 use kernel_ps::api as ps_api;
-use nucleus_core::util::{fault_injection, random};
+use nucleus_core::util::fault_injection;
 
 use crate::{announce_ready, debug, fatal, flow_debug, flow_info, hal_hooks, io_services, tasks};
 
@@ -415,10 +415,8 @@ pub unsafe fn initialize_kernel(boot_info_ptr: *const BootInfo) {
     announce_ready("RTC", b"RTC initialized.\r\n");
     mm_api::boot::paging_smoke_test();
 
-    assert!(
-        random::init(boot_info),
-        "refusing to initialize the CSPRNG without boot entropy"
-    );
+    // The BSP entry initialized boot-random before choosing the kernel image
+    // alias; never reseed or reset the master stream here.
     announce_ready("Random", b"Random initialized.\r\n");
 
     compat_api::init_syscalls();
@@ -661,6 +659,8 @@ extern "C" fn rustos_ap_entry(
 
     hal_api::boot::init_gdt_for_cpu(usize::from(logical_index));
     hal_api::init_idt();
+    #[cfg(rustos_boot_image)]
+    hal_api::boot::init_kernel_ibt();
     hal_api::init_simd();
     assert!(
         hal_api::cpu::init_local_apic(),

@@ -1,8 +1,6 @@
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
-use linux_raw_sys::{
-    auxvec as linux_auxvec, general as linux, ioctl as linux_ioctl, net as linux_net,
-};
+use linux_raw_sys::{auxvec as linux_auxvec, general as linux, ioctl as linux_ioctl, net as linux_net};
 
 mod task;
 pub use task::*;
@@ -1063,6 +1061,7 @@ impl LinuxProcessImageInfo {
             brk_current: self.brk_start,
             brk_mapped_end: self.brk_start,
             mmap_next,
+            mapping_limit: crate::syscall::PROC_BROKER_USER_SPACE_END_EXCLUSIVE,
             reserved_mappings: [LinuxReservedMapping::EMPTY; MAX_RESERVED_MAPPINGS],
         }
     }
@@ -1117,6 +1116,9 @@ pub struct LinuxProcessState {
     pub brk_current: u64,
     pub brk_mapped_end: u64,
     pub mmap_next: u64,
+    /// Exclusive mapping ceiling below the process's permanent stack guard.
+    /// This is kernel-owned placement authority, not a releasable mmap reserve.
+    pub mapping_limit: u64,
     pub reserved_mappings: [LinuxReservedMapping; MAX_RESERVED_MAPPINGS],
 }
 
@@ -1127,14 +1129,22 @@ impl Default for LinuxProcessState {
             brk_current: 0,
             brk_mapped_end: 0,
             mmap_next: 0,
+            mapping_limit: crate::syscall::PROC_BROKER_USER_SPACE_END_EXCLUSIVE,
             reserved_mappings: [LinuxReservedMapping::EMPTY; MAX_RESERVED_MAPPINGS],
         }
     }
 }
 
 impl LinuxProcessState {
+    pub fn mapping_below_stack_guard(&self, start: u64, end: u64) -> bool {
+        start < end && end <= self.mapping_limit
+    }
+
     pub fn brk_limit(&self) -> u64 {
-        crate::syscall::PROC_BROKER_USER_SPACE_END_EXCLUSIVE.saturating_sub(MMAP_COLLISION_GUARD)
+        self.mapping_limit.min(
+            crate::syscall::PROC_BROKER_USER_SPACE_END_EXCLUSIVE
+                .saturating_sub(MMAP_COLLISION_GUARD),
+        )
     }
 
     pub fn can_grow_brk_to(&self, requested_end: u64) -> bool {

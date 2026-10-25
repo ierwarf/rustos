@@ -76,8 +76,9 @@ mod commit;
 
 use commit::{commit_prepared_executable, LoaderOperation};
 use loaderd::{
-    classify_loader_wire_size, classify_reply_recv_recovery, completion_demotion_due,
-    fused_loader_reply_eligible, LoaderWireKind, ReplyRecvRecoveryAction,
+    activate_batch_targets_valid, prepare_authority, classify_loader_wire_size,
+    classify_reply_recv_recovery, completion_demotion_due, fused_loader_reply_eligible,
+    LoaderWireKind, ReplyRecvRecoveryAction,
 };
 
 const SYS_EXIT: u64 = 60;
@@ -114,8 +115,8 @@ const ELF_PT_PHDR: u32 = 6;
 const ELF_PF_X: u32 = 1;
 const ELF_PF_W: u32 = 2;
 const ELF_PF_R: u32 = 4;
-const ELF_MAIN_DYN_LOAD_OFFSET: u64 = 0x0040_0000;
-const ELF_INTERP_LOAD_OFFSET: u64 = 0x0200_0000;
+const ELF_MAIN_DYN_LOAD_OFFSET: u64 = loaderd::aslr::MAIN_START;
+const ELF_INTERP_LOAD_OFFSET: u64 = loaderd::aslr::INTERPRETER_START;
 const PE_DOS_HEADER_SIZE: usize = 64;
 const PE_SIGNATURE_SIZE: usize = 4;
 const PE_FILE_HEADER_SIZE: usize = 20;
@@ -129,7 +130,7 @@ const PE_DIRECTORY_BASERELOC: usize = 5;
 const PE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
 const PE_SCN_MEM_READ: u32 = 0x4000_0000;
 const PE_SCN_MEM_WRITE: u32 = 0x8000_0000;
-const PE_LOAD_OFFSET: u64 = 0x0040_0000;
+const PE_LOAD_OFFSET: u64 = loaderd::aslr::MAIN_START;
 const PE_MAX_SECTIONS: u16 = 128;
 const PE_MAX_IMAGE_BYTES: u64 = 128 * 1024 * 1024;
 const PE_MAX_IMPORT_MODULES: usize = 64;
@@ -478,15 +479,6 @@ fn handle_activate_batch_request(
     }
 }
 
-fn activate_batch_targets_valid(target_pids: &[u64]) -> bool {
-    !target_pids.is_empty()
-        && target_pids
-            .iter()
-            .copied()
-            .enumerate()
-            .all(|(index, pid)| pid != 0 && !target_pids[..index].contains(&pid))
-}
-
 fn spawn_response(response: LoaderSpawnResponse) -> HandledLoaderRequest {
     HandledLoaderRequest {
         reply: LoaderReply::Spawn(response),
@@ -626,12 +618,21 @@ fn handle_request(
     let mut envp = env.iter().map(|value| value.as_ptr()).collect::<Vec<_>>();
     envp.push(core::ptr::null());
 
+    let stack_top = match loaderd::aslr::random_stack_top() {
+        Ok(top) => top,
+        Err(errno) => {
+            let _ = syscall1(SYS_CLOSE, fd as u64);
+            response.status = errno;
+            return spawn_response(response);
+        }
+    };
     let (prepare_flags, prepare_ticket) = prepare_authority(operation, request);
     let prepare_args = RustosProcPrepareBrokerArgs {
         abi_version: PROC_BROKER_ABI_VERSION,
         format: executable_format,
         flags: prepare_flags,
         reserved0: prepare_ticket,
+        stack_top,
     };
     trace_line(&format!("loaderd: prepare begin exec={exec_path}"));
     let prepare_handle = syscall1(
@@ -718,17 +719,6 @@ fn handle_request(
         reply: LoaderReply::Spawn(response),
         cleanup_fds: prepared.cleanup_fds,
         demote_after_reply: exec_path == UI_SERVER_EXEC_PATH,
-    }
-}
-
-fn prepare_authority(operation: LoaderOperation, request: &LoaderSpawnRequest) -> (u32, u64) {
-    if operation == LoaderOperation::ExecTarget {
-        (
-            rustos_user_abi::syscall::PROC_BROKER_PREPARE_FLAG_EXEC_TICKET,
-            request.exec_ticket,
-        )
-    } else {
-        (0, 0)
     }
 }
 
@@ -1208,35 +1198,5 @@ fn spawn_done_line_admitted() -> bool {
 fn trace_line(message: &str) {
     if option_env!("RUSTOS_LOGGING_BOOT_TRACE_ENABLED") == Some("true") {
         debug_line(message);
-    }
-}
-
-#[cfg(test)]
-mod activation_batch_tests {
-    use super::{activate_batch_targets_valid, prepare_authority, LoaderOperation};
-    use rustos_user_abi::syscall::{LoaderSpawnRequest, PROC_BROKER_PREPARE_FLAG_EXEC_TICKET};
-
-    #[test]
-    fn activation_batch_targets_are_nonzero_and_unique() {
-        assert!(activate_batch_targets_valid(&[11, 12, 13]));
-        assert!(!activate_batch_targets_valid(&[]));
-        assert!(!activate_batch_targets_valid(&[11, 0]));
-        assert!(!activate_batch_targets_valid(&[11, 12, 11]));
-    }
-
-    #[test]
-    fn exec_prepare_forwards_the_exact_procd_ticket_without_widening_spawn() {
-        let request = LoaderSpawnRequest {
-            exec_ticket: 0x1234_5678,
-            ..LoaderSpawnRequest::default()
-        };
-        assert_eq!(
-            prepare_authority(LoaderOperation::ExecTarget, &request),
-            (PROC_BROKER_PREPARE_FLAG_EXEC_TICKET, request.exec_ticket)
-        );
-        assert_eq!(
-            prepare_authority(LoaderOperation::SpawnExec, &request),
-            (0, 0)
-        );
     }
 }

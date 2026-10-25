@@ -191,6 +191,20 @@ pub(crate) fn record_process_exit(pid: u64, parent_pid: u64, exit_status: i32) {
     }
 }
 
+/// Publish replacement-MM evidence before the blocked exec caller resumes.
+/// Syscalld must discard its old image's VMA/guard cache, but keep credentials.
+pub(crate) fn record_process_exec(pid: u64) {
+    let consumer = LifecycleConsumer::LinuxSyscallPolicy;
+    let event = LifecycleEventWire {
+        event: rustos_user_abi::syscall::LIFECYCLE_EVENT_EXEC,
+        pid,
+        ..LifecycleEventWire::default()
+    };
+    if !consumer.events().lock().push(event) {
+        consumer.overflowed().store(true, Ordering::Release);
+    }
+}
+
 pub(super) fn drain_lifecycle_events(
     args: &LifecycleDrainBrokerArgs,
     consumer: LifecycleConsumer,

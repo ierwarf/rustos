@@ -17,6 +17,7 @@
 
 #![no_std]
 
+pub mod aslr;
 mod request_strings;
 pub use request_strings::RequestStrings;
 
@@ -24,7 +25,49 @@ use core::mem::size_of;
 
 use rustos_user_abi::syscall::{
     CommercialMaxProtocolRequest, LoaderActivateBatchRequest, LoaderSpawnRequest,
+    LOADER_OP_EXEC_TARGET, LOADER_OP_SPAWN_EXEC, PROC_BROKER_FORMAT_ELF64, PROC_BROKER_FORMAT_PE64,
+    PROC_BROKER_PREPARE_FLAG_EXEC_TICKET,
 };
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LoaderOperation {
+    SpawnExec,
+    ExecTarget,
+}
+
+impl LoaderOperation {
+    pub fn from_op(op: u16) -> Result<Self, i32> {
+        match op {
+            LOADER_OP_SPAWN_EXEC => Ok(Self::SpawnExec),
+            LOADER_OP_EXEC_TARGET => Ok(Self::ExecTarget),
+            _ => Err(22), // EINVAL
+        }
+    }
+
+    pub fn allows_format(self, format: u16) -> bool {
+        match self {
+            Self::SpawnExec => matches!(format, PROC_BROKER_FORMAT_ELF64 | PROC_BROKER_FORMAT_PE64),
+            Self::ExecTarget => format == PROC_BROKER_FORMAT_ELF64,
+        }
+    }
+}
+
+pub fn prepare_authority(operation: LoaderOperation, request: &LoaderSpawnRequest) -> (u32, u64) {
+    if operation == LoaderOperation::ExecTarget {
+        (PROC_BROKER_PREPARE_FLAG_EXEC_TICKET, request.exec_ticket)
+    } else {
+        (0, 0)
+    }
+}
+
+pub fn activate_batch_targets_valid(target_pids: &[u64]) -> bool {
+    !target_pids.is_empty()
+        && target_pids
+            .iter()
+            .copied()
+            .enumerate()
+            .all(|(index, pid)| pid != 0 && !target_pids[..index].contains(&pid))
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LoaderWireKind {
@@ -98,9 +141,60 @@ pub fn completion_demotion_due(reply: i64, demote_after_reply: bool) -> bool {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn operation_policy_preserves_native_formats_without_pe_exec_replacement() {
+        use super::*;
+        assert!(LoaderOperation::SpawnExec.allows_format(PROC_BROKER_FORMAT_ELF64));
+        assert!(LoaderOperation::SpawnExec.allows_format(PROC_BROKER_FORMAT_PE64));
+        assert!(LoaderOperation::ExecTarget.allows_format(PROC_BROKER_FORMAT_ELF64));
+        assert!(!LoaderOperation::ExecTarget.allows_format(PROC_BROKER_FORMAT_PE64));
+        for format in [0, u16::MAX] {
+            assert!(!LoaderOperation::SpawnExec.allows_format(format));
+            assert!(!LoaderOperation::ExecTarget.allows_format(format));
+        }
+        assert_eq!(
+            LoaderOperation::from_op(LOADER_OP_SPAWN_EXEC),
+            Ok(LoaderOperation::SpawnExec)
+        );
+        assert_eq!(
+            LoaderOperation::from_op(LOADER_OP_EXEC_TARGET),
+            Ok(LoaderOperation::ExecTarget)
+        );
+        assert_eq!(LoaderOperation::from_op(u16::MAX), Err(22));
+    }
+
+    #[test]
+    fn activation_batch_targets_are_nonzero_and_unique() {
+        use super::activate_batch_targets_valid;
+        assert!(activate_batch_targets_valid(&[11, 12, 13]));
+        assert!(!activate_batch_targets_valid(&[]));
+        assert!(!activate_batch_targets_valid(&[11, 0]));
+        assert!(!activate_batch_targets_valid(&[11, 12, 11]));
+    }
+
+    #[test]
+    fn exec_prepare_forwards_the_exact_procd_ticket_without_widening_spawn() {
+        use super::{prepare_authority, LoaderOperation};
+        use rustos_user_abi::syscall::{LoaderSpawnRequest, PROC_BROKER_PREPARE_FLAG_EXEC_TICKET};
+        let request = LoaderSpawnRequest {
+            exec_ticket: 0x1234_5678,
+            ..LoaderSpawnRequest::default()
+        };
+        assert_eq!(
+            prepare_authority(LoaderOperation::ExecTarget, &request),
+            (PROC_BROKER_PREPARE_FLAG_EXEC_TICKET, request.exec_ticket)
+        );
+        assert_eq!(
+            prepare_authority(LoaderOperation::SpawnExec, &request),
+            (0, 0)
+        );
+    }
+
+    #[test]
     fn spawn_completion_diagnostic_rejects_exec_and_unknown_operations() {
         use rustos_user_abi::syscall::{LOADER_OP_EXEC_TARGET, LOADER_OP_SPAWN_EXEC};
-        assert!(super::spawn_completion_diagnostic_eligible(LOADER_OP_SPAWN_EXEC));
+        assert!(super::spawn_completion_diagnostic_eligible(
+            LOADER_OP_SPAWN_EXEC
+        ));
         for operation in [LOADER_OP_EXEC_TARGET, 0, u16::MAX] {
             assert!(!super::spawn_completion_diagnostic_eligible(operation));
         }

@@ -39,16 +39,22 @@ rustos_multiboot2_header_end:
 
     .section .bss
     .balign 4096
+    .globl rustos_boot_pml4
 rustos_boot_pml4:
     .skip 4096
+    .globl rustos_boot_pdpt
 rustos_boot_pdpt:
     .skip 4096
+    .globl rustos_boot_pd0
 rustos_boot_pd0:
     .skip 4096
+    .globl rustos_boot_pd1
 rustos_boot_pd1:
     .skip 4096
+    .globl rustos_boot_pd2
 rustos_boot_pd2:
     .skip 4096
+    .globl rustos_boot_pd3
 rustos_boot_pd3:
     .skip 4096
     .balign 16
@@ -58,13 +64,15 @@ rustos_multiboot_stack_top:
 
     .section .rodata
     .balign 8
+    .globl rustos_boot_gdt
 rustos_boot_gdt:
     .quad 0
     .quad 0x00af9a000000ffff
     .quad 0x00cf92000000ffff
+    .globl rustos_boot_gdt_desc
 rustos_boot_gdt_desc:
     .short rustos_boot_gdt_desc - rustos_boot_gdt - 1
-    .quad rustos_boot_gdt
+    .quad rustos_boot_gdt_phys
 
     # One-page real-mode AP startup image. The BSP copies this complete section
     # to physical 0x8000 only after kernel-mm atomically claims 0x8000..0xa000.
@@ -176,26 +184,26 @@ _start:
     mov %eax, %esi
     mov %ebx, %edi
 
-    mov $rustos_boot_pml4, %eax
-    mov $rustos_boot_pdpt, %edx
+    mov $rustos_boot_pml4_phys, %eax
+    mov $rustos_boot_pdpt_phys, %edx
     or $0x3, %edx
     mov %edx, (%eax)
 
-    mov $rustos_boot_pdpt, %eax
-    mov $rustos_boot_pd0, %edx
+    mov $rustos_boot_pdpt_phys, %eax
+    mov $rustos_boot_pd0_phys, %edx
     or $0x3, %edx
     mov %edx, 0(%eax)
-    mov $rustos_boot_pd1, %edx
+    mov $rustos_boot_pd1_phys, %edx
     or $0x3, %edx
     mov %edx, 8(%eax)
-    mov $rustos_boot_pd2, %edx
+    mov $rustos_boot_pd2_phys, %edx
     or $0x3, %edx
     mov %edx, 16(%eax)
-    mov $rustos_boot_pd3, %edx
+    mov $rustos_boot_pd3_phys, %edx
     or $0x3, %edx
     mov %edx, 24(%eax)
 
-    mov $rustos_boot_pd0, %edi
+    mov $rustos_boot_pd0_phys, %edi
     xor %eax, %eax
     mov $2048, %ecx
 1:
@@ -207,7 +215,7 @@ _start:
     add $8, %edi
     loop 1b
 
-    mov $rustos_boot_pml4, %eax
+    mov $rustos_boot_pml4_phys, %eax
     mov %eax, %cr3
     mov %cr4, %eax
     # Rust code may use baseline x86_64 SSE instructions before the higher-level
@@ -222,19 +230,40 @@ _start:
     mov %cr0, %eax
     or $0x80000001, %eax
     mov %eax, %cr0
-    lgdt rustos_boot_gdt_desc
-    ljmp $0x08, $rustos_multiboot_long_mode
+    lgdt rustos_boot_gdt_desc_phys
+    ljmp $0x08, $rustos_multiboot_long_mode_phys
 
     .code64
+    .globl rustos_multiboot_long_mode
 rustos_multiboot_long_mode:
     mov $0x10, %ax
     mov %ax, %ds
     mov %ax, %es
     mov %ax, %ss
-    mov $rustos_multiboot_stack_top, %rsp
+    lea rustos_multiboot_stack_top(%rip), %rsp
     and $-16, %rsp
     mov %esi, %edi
     mov %ebx, %esi
+    # The image is a static PIE linked at its fixed physical address. Before
+    # Rust touches GOT/vtables, apply B=0 relative relocations. No entropy or
+    # high alias exists yet, and no other relocation kind is admitted.
+    lea rustos_rela_start(%rip), %rcx
+    lea rustos_rela_end(%rip), %r8
+3:
+    cmp %r8, %rcx
+    jae 5f
+    cmpq $8, 8(%rcx)
+    jne 4f
+    mov 0(%rcx), %rax
+    mov 16(%rcx), %rdx
+    mov %rdx, (%rax)
+    add $24, %rcx
+    jmp 3b
+4:
+    cli
+    hlt
+    jmp 4b
+5:
     call multiboot2_entry64
 2:
     hlt

@@ -400,6 +400,14 @@ impl UserProcessState {
         self.linux_process_state.as_ref()
     }
 
+    /// Immutable stack ownership is checked under the same state lock as a
+    /// mapping/VMA publication, even when a service planned against an old MM.
+    pub fn mapping_below_stack_guard(&self, start: u64, end: u64) -> bool {
+        self.linux_process_state
+            .as_ref()
+            .is_none_or(|state| state.mapping_below_stack_guard(start, end))
+    }
+
     pub fn linux_memory_map(&self) -> Option<&LinuxMemoryMapState> {
         self.linux_memory_map.as_ref()
     }

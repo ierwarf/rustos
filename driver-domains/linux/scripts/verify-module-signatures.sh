@@ -79,6 +79,7 @@ for required in \
     nvidia-drm \
     rustos_dvm_block_uio \
     rustos_dvm_ivshmem_uio \
+    rustos_dvm_net_uio \
     i915 \
     xe \
     amdgpu \

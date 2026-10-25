@@ -1,34 +1,10 @@
 use rustos_svc_runtime::syscall::syscall1;
 use rustos_user_abi::syscall::{
     LoaderSpawnRequest, RustosProcCommitBrokerArgs, RustosProcExecTargetBrokerArgs,
-    LOADER_OP_EXEC_TARGET, LOADER_OP_SPAWN_EXEC, PROC_BROKER_ABI_VERSION, PROC_BROKER_FORMAT_ELF64,
-    PROC_BROKER_FORMAT_PE64, SYS_RUSTOS_PROC_COMMIT_BROKER, SYS_RUSTOS_PROC_EXEC_TARGET_BROKER,
+    PROC_BROKER_ABI_VERSION, SYS_RUSTOS_PROC_COMMIT_BROKER, SYS_RUSTOS_PROC_EXEC_TARGET_BROKER,
 };
 
-use crate::EINVAL;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum LoaderOperation {
-    SpawnExec,
-    ExecTarget,
-}
-
-impl LoaderOperation {
-    pub(crate) fn from_op(op: u16) -> Result<Self, i32> {
-        match op {
-            LOADER_OP_SPAWN_EXEC => Ok(Self::SpawnExec),
-            LOADER_OP_EXEC_TARGET => Ok(Self::ExecTarget),
-            _ => Err(EINVAL),
-        }
-    }
-
-    pub(crate) fn allows_format(self, format: u16) -> bool {
-        match self {
-            Self::SpawnExec => matches!(format, PROC_BROKER_FORMAT_ELF64 | PROC_BROKER_FORMAT_PE64),
-            Self::ExecTarget => format == PROC_BROKER_FORMAT_ELF64,
-        }
-    }
-}
+pub(crate) use loaderd::LoaderOperation;
 
 pub(crate) fn commit_prepared_executable(
     operation: LoaderOperation,

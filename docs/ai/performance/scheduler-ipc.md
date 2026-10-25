@@ -126,14 +126,15 @@ change here; multiple plausible plans have been refuted by its numbers.
    once per *endpoint* call, ~2.4x more often. Mixing them inflates every ratio
    by that factor.
 
-**The kernel libraries must use the static relocation model.** The image links
-`-no-pie -static` at `KERNEL_LOAD_BASE = 0x200000` and executes at its link
-address. Configuring `relocation_model = "none"` meant "pass no rustc flag",
-so the `x86_64-unknown-linux-gnu` default compiled every library as PIC even
-though the nucleus binary already used `-C relocation-model=static`. The GOT
-double-load under 617 statics cost 25-41% across the syscall/IPC probes. The
-default, debug, and release presets all require `"static"`; the hand-relocated
-AP trampoline is assembly and is outside rustc's relocation model.
+**The historical fixed-address baseline used static relocation.** Its
+`-no-pie -static` image executed at its 2 MiB link address. Configuring
+`relocation_model = "none"` left library crates at the GNU target's PIC default,
+while the nucleus binary used `"static"`. GOT double-loads under 617 statics
+cost 25-41% across those probes; that result is not a current build requirement.
+[Kernel KASLR](../kernel-kaslr.md) now requires PIC/PIE libraries and a static-PIE
+image with a randomized virtual alias. The default, debug, and release presets
+use `"pic"`; performance comparisons need a new same-shape baseline. The AP
+trampoline remains hand-relocated assembly outside rustc's relocation model.
 
 **Where the cost is**, per endpoint call, measured:
 

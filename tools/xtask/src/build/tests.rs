@@ -11,18 +11,53 @@ fn c_assembly_sources_are_closed_and_freshness_includes_every_unit() {
     let asm = root.path().join("registers.S");
     let output = root.path().join("probe.elf");
     let manifest = root.path().join("RUSTOS.package.toml");
-    for path in [&c, &asm, &output, &manifest] { fs::write(path, b"input").unwrap(); }
+    let owner = root.path().join("build-owner.rs");
+    for path in [&c, &asm, &output, &manifest, &owner] {
+        fs::write(path, b"input").unwrap();
+    }
     let sources = super::c_demo_sources(c.clone(), root.path(), &["registers.S".into()]).unwrap();
     assert_eq!(sources, vec![c.clone(), asm.clone()]);
     let epoch = std::time::UNIX_EPOCH + std::time::Duration::from_secs(100);
-    for (path, seconds) in [(&c, 0), (&manifest, 0), (&output, 1), (&asm, 2)] {
-        std::fs::File::open(path).unwrap().set_times(std::fs::FileTimes::new()
-            .set_modified(epoch + std::time::Duration::from_secs(seconds))).unwrap();
+    for (path, seconds) in [
+        (&c, 0),
+        (&manifest, 0),
+        (&owner, 0),
+        (&output, 1),
+        (&asm, 2),
+    ] {
+        std::fs::File::open(path)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(epoch + std::time::Duration::from_secs(seconds)),
+            )
+            .unwrap();
     }
     assert!(super::output_is_fresh(&output, &[c]).unwrap());
-    let inputs = super::c_demo_inputs(&sources, &manifest);
-    assert_eq!(inputs, vec![sources[0].clone(), asm, manifest]);
-    assert!(!super::output_is_fresh(&output, &inputs).unwrap(), "assembly change must rebuild ELF");
+    let inputs = super::c_demo_inputs(&sources, &manifest, &owner);
+    assert_eq!(
+        inputs,
+        vec![sources[0].clone(), asm.clone(), manifest, owner.clone()]
+    );
+    assert!(
+        !super::output_is_fresh(&output, &inputs).unwrap(),
+        "assembly change must rebuild ELF"
+    );
+    std::fs::File::open(&asm)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(epoch))
+        .unwrap();
+    assert!(super::output_is_fresh(&output, &inputs).unwrap());
+    std::fs::File::open(&owner)
+        .unwrap()
+        .set_times(
+            std::fs::FileTimes::new().set_modified(epoch + std::time::Duration::from_secs(2)),
+        )
+        .unwrap();
+    assert!(
+        !super::output_is_fresh(&output, &inputs).unwrap(),
+        "compiler flag owner change must rebuild ELF"
+    );
     for alias in ["", "/outside.S", "../outside.S", "./registers.S", "probe.c"] {
         assert!(super::c_demo_sources(sources[0].clone(), root.path(), &[alias.into()]).is_err());
     }
@@ -43,16 +78,33 @@ fn hecs_native_assembly_comparator_detects_gpr_xmm_and_mxcsr_faults() {
     let output = temp.path().join("hecs-native");
     let cc = std::ffi::OsString::from("cc");
     assert_eq!(source.matches("    syscall\n").count(), 1);
-    super::build_c_demo(&cc, &[driver.clone(), probe], &output,
-        &["-O2", "-Wall", "-Wextra", "-Werror"]).unwrap();
-    assert!(std::process::Command::new(&output).output().unwrap().status.success());
+    super::build_c_demo(
+        &cc,
+        &[driver.clone(), probe],
+        &output,
+        &["-O2", "-Wall", "-Wextra", "-Werror"],
+    )
+    .unwrap();
+    assert!(
+        std::process::Command::new(&output)
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
     // This challenges the SAME assembly comparator. It is deliberately not
     // a claim about the RustOS kernel or a privileged machine return.
-    for (fault, code) in [("xorq %r12, %r12", 18), ("pxor %xmm15, %xmm15", 79),
-        ("ldmxcsr 400(%rsp)", 96)] {
+    for (fault, code) in [
+        ("xorq %r12, %r12", 18),
+        ("pxor %xmm15, %xmm15", 79),
+        ("ldmxcsr 400(%rsp)", 96),
+    ] {
         let mutated = temp.path().join("registers-fault.S");
-        fs::write(&mutated, source.replacen("    syscall\n",
-            &format!("    syscall\n    {fault}\n"), 1)).unwrap();
+        fs::write(
+            &mutated,
+            source.replacen("    syscall\n", &format!("    syscall\n    {fault}\n"), 1),
+        )
+        .unwrap();
         super::build_c_demo(&cc, &[driver.clone(), mutated], &output, &["-O2"]).unwrap();
         let failed = std::process::Command::new(&output).output().unwrap();
         assert_eq!(failed.status.code(), Some(1), "fault={fault}");
@@ -137,8 +189,7 @@ The Import Tables (interpreted .idata section contents)
 
 #[test]
 fn parse_def_exports_recognizes_forwarders() {
-    let temp_dir =
-        std::env::temp_dir().join(format!("rustos-xtask-def-{}", std::process::id()));
+    let temp_dir = std::env::temp_dir().join(format!("rustos-xtask-def-{}", std::process::id()));
     let _ = fs::remove_dir_all(&temp_dir);
     fs::create_dir_all(&temp_dir).unwrap();
     let path = temp_dir.join("exports.def");

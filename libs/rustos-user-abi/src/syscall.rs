@@ -904,7 +904,7 @@ pub const fn procd_sigchld_is_suppressed(events: u32, action_flags: u64) -> bool
         && events & PROCD_SIGCHLD_EVENT_EXIT == 0
         && action_flags & PROCD_SIGACTION_SA_NOCLDSTOP != 0
 }
-pub const PROC_BROKER_ABI_VERSION: u16 = 3;
+pub const PROC_BROKER_ABI_VERSION: u16 = 4;
 pub const PROC_BROKER_PREPARE_FLAG_EXEC_TICKET: u32 = 1 << 0;
 /// Lifecycle fan-out is an independent contract. Do not couple its wire
 /// version to process prepare/commit ABI revisions.
@@ -920,6 +920,16 @@ pub const PROC_BROKER_MAP_EXEC: u64 = 1 << 2;
 pub const PROC_BROKER_MAP_PRIVATE: u64 = 1 << 3;
 pub const PROC_BROKER_USER_SPACE_BASE: u64 = 1 << 39;
 pub const PROC_BROKER_USER_SPACE_END_EXCLUSIVE: u64 = 2 << 39;
+/// The loader chooses a page-aligned stack top in the last GiB of the process
+/// window. Ring0 validates and materializes this placement, not its policy.
+pub const PROC_BROKER_STACK_ASLR_BYTES: u64 = 1 << 30;
+pub const PROC_BROKER_STACK_RESERVE_BYTES: u64 = 256 * 4096;
+
+pub const fn proc_broker_stack_top_valid(top: u64) -> bool {
+    top & 4095 == 0
+        && top <= PROC_BROKER_USER_SPACE_END_EXCLUSIVE
+        && top > PROC_BROKER_USER_SPACE_END_EXCLUSIVE - PROC_BROKER_STACK_ASLR_BYTES
+}
 pub const PROC_BROKER_DATA_PAYLOAD_CAPACITY: usize = 4096;
 pub const PROC_BROKER_BATCH_CAPACITY: usize = 8;
 pub const PROC_BROKER_LINUX_INTERP_PATH_CAPACITY: usize = 256;
@@ -2463,6 +2473,8 @@ pub struct RustosProcPrepareBrokerArgs {
     pub format: u16,
     pub flags: u32,
     pub reserved0: u64,
+    /// Immutable loader-selected placement, also used for exec replacement.
+    pub stack_top: u64,
 }
 
 #[repr(C)]

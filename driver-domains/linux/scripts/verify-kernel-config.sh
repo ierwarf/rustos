@@ -37,6 +37,11 @@ require_disabled() {
     }
 }
 
+# A fragment assignment alone is insufficient: compiler/objtool dependencies
+# can resolve IBT away. Pin the resolved built-in kernel contract.
+require_builtin CONFIG_CC_HAS_IBT
+require_builtin CONFIG_X86_CET
+require_builtin CONFIG_X86_KERNEL_IBT
 require_enabled CONFIG_MODULES
 require_enabled CONFIG_MODVERSIONS
 require_enabled CONFIG_MODULE_SIG

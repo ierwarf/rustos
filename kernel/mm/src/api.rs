@@ -115,6 +115,8 @@ pub mod kernel_vm {
 }
 
 pub mod virt {
+    pub use crate::lowlevel::address::kernel_image_addr;
+
     pub fn higher_half_addr(addr: u64) -> u64 {
         crate::lowlevel::address::higher_half_addr(addr)
     }
@@ -128,4 +130,4 @@ pub use address_space::{PageTableFlags, ProcessAddressSpace, debug_direct_map_fl
 pub use alloc::{KernelAllocator, handle_alloc_error, init_heap};
 pub use boot::{init_paging, init_phys, paging_smoke_test};
 pub use phys::{alloc_frame, free_bytes, free_frame, usable_bytes};
-pub use virt::{higher_half_addr, kernel_virt_offset};
+pub use virt::{higher_half_addr, kernel_image_addr, kernel_virt_offset};

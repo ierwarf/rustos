@@ -176,6 +176,53 @@ struct SimdCustodyReport {
 }
 
 /// Fails unless the nucleus artifact is a Multiboot2 image GRUB will load.
+/// GRUB Multiboot2 rejects every SHT_REL[A] section even though RustOS applies
+/// its own relocations. Preserve all loaded bytes and PT_DYNAMIC metadata;
+/// describe the already-linked RELA payload as opaque read-only PROGBITS in
+/// the boot artifact's section table. The original Cargo ELF stays untouched.
+pub(super) fn prepare_self_relocating_multiboot_elf(path: &Path) -> Result<()> {
+    let mut bytes = std::fs::read(path)?;
+    if make_relocations_opaque(&mut bytes)? != 0 {
+        std::fs::write(path, bytes)?;
+    }
+    Ok(())
+}
+
+fn make_relocations_opaque(bytes: &mut [u8]) -> Result<usize> {
+    if bytes.len() < 64 || &bytes[..6] != b"\x7fELF\x02\x01" {
+        bail!("kernel boot artifact must be little-endian ELF64");
+    }
+    let section_offset = usize::try_from(u64::from_le_bytes(bytes[40..48].try_into()?))?;
+    let entry_size = usize::from(u16::from_le_bytes(bytes[58..60].try_into()?));
+    let count = usize::from(u16::from_le_bytes(bytes[60..62].try_into()?));
+    let end = count
+        .checked_mul(entry_size)
+        .and_then(|size| section_offset.checked_add(size));
+    if entry_size != 64 || count == 0 || end.is_none_or(|end| end > bytes.len()) {
+        bail!("invalid or unsupported kernel ELF section table");
+    }
+    let mut changed = 0;
+    for index in 0..count {
+        let start = section_offset + index * entry_size;
+        let section = &mut bytes[start..start + entry_size];
+        let kind = u32::from_le_bytes(section[4..8].try_into()?);
+        if kind == 9 {
+            bail!("kernel REL relocations are unsupported");
+        }
+        if kind != 4 {
+            continue;
+        }
+        let flags = u64::from_le_bytes(section[8..16].try_into()?);
+        let stride = u64::from_le_bytes(section[56..64].try_into()?);
+        if flags & 7 != 2 || stride != 24 {
+            bail!("kernel RELA payload must be allocated, readonly, non-executable ELF64 RELA");
+        }
+        section[4..8].copy_from_slice(&1_u32.to_le_bytes());
+        changed += 1;
+    }
+    Ok(changed)
+}
+
 pub(super) fn check_nucleus_multiboot2(config: &Config) -> Result<()> {
     let artifact = config.artifact_nucleus_elf_path();
     let status = Command::new(&config.grub_file)
@@ -395,6 +442,29 @@ mod tests {
 
     fn listing(body: &str) -> String {
         format!("\nbuild/image/nucleus.elf:     file format elf64-x86-64\n\n{body}")
+    }
+
+    #[test]
+    fn grub_payload_keeps_relocations_but_not_relocation_section_types() {
+        let mut elf = vec![0_u8; 64 + 64 + 24];
+        elf[..6].copy_from_slice(b"\x7fELF\x02\x01");
+        elf[40..48].copy_from_slice(&64_u64.to_le_bytes());
+        elf[58..60].copy_from_slice(&64_u16.to_le_bytes());
+        elf[60..62].copy_from_slice(&1_u16.to_le_bytes());
+        elf[68..72].copy_from_slice(&4_u32.to_le_bytes());
+        elf[72..80].copy_from_slice(&2_u64.to_le_bytes());
+        elf[120..128].copy_from_slice(&24_u64.to_le_bytes());
+        elf[128..].fill(0x5a);
+        let before = elf.clone();
+        assert_eq!(make_relocations_opaque(&mut elf).unwrap(), 1);
+        assert_eq!(&elf[..68], &before[..68]);
+        assert_eq!(&elf[72..], &before[72..]);
+        assert_eq!(&elf[68..72], &1_u32.to_le_bytes());
+        assert_eq!(make_relocations_opaque(&mut elf).unwrap(), 0);
+        let mut writable = before.clone();
+        writable[72..80].copy_from_slice(&3_u64.to_le_bytes());
+        assert!(make_relocations_opaque(&mut writable).is_err());
+        assert!(make_relocations_opaque(&mut before[..100].to_vec()).is_err());
     }
 
     #[test]

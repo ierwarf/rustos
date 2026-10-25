@@ -73,28 +73,35 @@ pub extern "C" fn multiboot2_entry64(magic: u32, mbi_addr: u32) -> ! {
 #[cfg(all(not(test), rustos_boot_image))]
 fn kernel_start_from_boot_info(boot_info_ptr: *const BootInfo) -> ! {
     // Do not inherit interrupt state from firmware/bootloader.
-    // The kernel enables interrupts only after the scheduler and handlers are ready.
     hal_api::disable_interrupts();
 
     debug::boot_trace::init(boot_info_ptr);
     debug::boot_trace::println_fmt(format_args!("kernel: _start"));
-    hal_api::init_gdt();
-    debug::boot_trace::println_fmt(format_args!("kernel: GDT ready"));
-    hal_api::init_idt();
-    debug::boot_trace::println_fmt(format_args!("kernel: IDT ready"));
+    // SAFETY: multiboot2_entry64 published validated BSP-owned BootInfo storage.
+    let boot_info =
+        unsafe { BootInfo::from_ptr(boot_info_ptr) }.expect("valid boot info before KASLR");
+    assert!(
+        nucleus_core::util::random::init(boot_info),
+        "KASLR requires one-time cryptographic boot entropy"
+    );
     mm_api::init_paging(boot_info_ptr);
     debug::boot_trace::println_fmt(format_args!("kernel: paging ready"));
 
     unsafe {
         hal_api::enter_higher_half(
-            mm_api::higher_half_addr(kernel_main_high as *const () as usize as u64),
+            mm_api::kernel_image_addr(kernel_main_high as *const () as usize as u64),
             boot_info_ptr as u64,
         );
     }
 }
-
 #[cfg(all(not(test), rustos_boot_image))]
 extern "C" fn kernel_main_high(boot_info_ptr: *const BootInfo) -> ! {
+    // Construct descriptors only at the final image address: TSS/IST, IDT
+    // handlers and table bases must never retain fixed low code pointers.
+    hal_api::init_gdt();
+    hal_api::init_idt();
+    hal_api::boot::init_kernel_ibt();
+    mm_api::kernel_vm::seal_kernel_image_aliases(boot_info_ptr);
     let bootstrap_stack_top = nucleus_core::bootstrap_stack::top();
     unsafe {
         hal_api::call_with_stack(

@@ -747,10 +747,7 @@ pub(crate) fn handle_mmap(
             }
         }
     };
-    if addr
-        .checked_add(map_len)
-        .is_none_or(|end| end > state.user_range_end)
-    {
+    if !mmap_range_below_ceiling(&state, addr, map_len) {
         response.status = errno::ENOMEM;
         return;
     }
@@ -1017,6 +1014,12 @@ fn mm_state_for(pid: u64) -> Result<MmPolicyState, i32> {
         ..RustosMmBrokerArgs::default()
     };
     mm_broker_call(&args)?;
+    let state = mm_state_from_layout(layout);
+    save_mm_state(pid, state.clone());
+    Ok(state)
+}
+
+fn mm_state_from_layout(layout: RustosMmLayoutBrokerResult) -> MmPolicyState {
     let mut state = MmPolicyState {
         brk_start: layout.brk_start,
         brk_current: layout.brk_current,
@@ -1035,8 +1038,12 @@ fn mm_state_for(pid: u64) -> Result<MmPolicyState, i32> {
         vmas: Vec::new(),
     };
     upsert_heap_vma(&mut state);
-    save_mm_state(pid, state.clone());
-    Ok(state)
+    state
+}
+
+fn mmap_range_below_ceiling(state: &MmPolicyState, addr: u64, len: u64) -> bool {
+    addr.checked_add(len)
+        .is_some_and(|end| end <= state.user_range_end)
 }
 
 fn save_mm_state(pid: u64, state: MmPolicyState) {
@@ -1114,11 +1121,25 @@ fn broker_map(
     Ok(result.addr)
 }
 
-fn unmap_populated_range(pid: u64, state: &mut MmPolicyState, start: u64, end: u64) -> Result<(), i32> {
+fn unmap_populated_range(
+    pid: u64,
+    state: &mut MmPolicyState,
+    start: u64,
+    end: u64,
+) -> Result<(), i32> {
     unmap_range_with(state, start, end, |start, end| {
         // One complete sparse/mixed interval, not one mutation per VMA.
         // Ring0 preflights every present leaf before removing any prefix.
-        broker_simple(pid, MM_BROKER_OP_UNMAP, start, end - start, 0, 0, u64::MAX, 0)
+        broker_simple(
+            pid,
+            MM_BROKER_OP_UNMAP,
+            start,
+            end - start,
+            0,
+            0,
+            u64::MAX,
+            0,
+        )
     })
 }
 
@@ -1154,11 +1175,12 @@ fn mm_broker_call(args: &RustosMmBrokerArgs) -> Result<(), i32> {
             (args as *const RustosMmBrokerArgs) as u64,
         )
     };
-    if ret < 0 {
-        Err((-ret) as i32)
-    } else {
-        Ok(())
-    }
+    if ret < 0 { Err((-ret) as i32) } else { Ok(()) }
+}
+
+pub(crate) fn handle_process_exec_pid(pid: u64) {
+    // Credentials/umask survive exec; image-specific brk/VMA/guard state does not.
+    MM_POLICY.lock().remove(&pid);
 }
 
 pub(crate) fn handle_process_exit_pid(dead_pid: u64) {
@@ -1342,6 +1364,39 @@ mod tests {
 
     use super::*;
     use rustos_user_abi::syscall::LINUX_UTSNAME_SIZE;
+
+    #[test]
+    fn exec_discards_cached_high_guard_before_fixed_and_nonfixed_mmap() {
+        let pid = u64::MAX - 17;
+        let old_guard = LINUX_USER_SPACE_END - 128 * 1024 * 1024;
+        let new_guard = LINUX_USER_SPACE_END - 256 * 1024 * 1024;
+        let layout = |ceiling| RustosMmLayoutBrokerResult {
+            brk_start: LINUX_USER_SPACE_BASE + 4096,
+            brk_current: LINUX_USER_SPACE_BASE + 4096,
+            brk_mapped_end: LINUX_USER_SPACE_BASE + 4096,
+            mmap_next: LINUX_USER_SPACE_BASE + 0x20_0000,
+            user_range_start: LINUX_USER_SPACE_BASE,
+            user_range_end: ceiling,
+        };
+        save_mm_state(pid, mm_state_from_layout(layout(old_guard)));
+        assert!(mmap_range_below_ceiling(
+            &mm_db().lock()[&pid],
+            new_guard,
+            PAGE_SIZE
+        ));
+        handle_process_exec_pid(pid);
+        assert!(!mm_db().lock().contains_key(&pid));
+        // The next request rebuilds from the replacement MM's broker layout.
+        let fresh = mm_state_from_layout(layout(new_guard));
+        assert!(!mmap_range_below_ceiling(&fresh, new_guard, PAGE_SIZE));
+        let selected = find_free_region(&fresh, new_guard, PAGE_SIZE).unwrap();
+        assert!(selected < new_guard);
+        assert!(mmap_range_below_ceiling(&fresh, selected, PAGE_SIZE));
+        let main_source = include_str!("main.rs");
+        assert!(main_source.contains(
+            "LIFECYCLE_EVENT_EXEC {\n            linux_policy::handle_process_exec_pid(event.pid)"
+        ));
+    }
 
     #[test]
     fn uname_payload_fits_inline_response() {

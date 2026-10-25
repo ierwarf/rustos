@@ -31,6 +31,7 @@ core::arch::global_asm!(
     .global rustos_user_copy_from
     .type rustos_user_copy_from, @function
 rustos_user_copy_from:
+    endbr64
     mov rcx, rdx
 1:  rep movsb
     xor eax, eax
@@ -42,6 +43,7 @@ rustos_user_copy_from:
     .global rustos_user_copy_to
     .type rustos_user_copy_to, @function
 rustos_user_copy_to:
+    endbr64
     mov rcx, rdx
 3:  rep movsb
     xor eax, eax
@@ -57,6 +59,7 @@ rustos_user_copy_to:
     .global rustos_user_probe_write
     .type rustos_user_probe_write, @function
 rustos_user_probe_write:
+    endbr64
     xor eax, eax
     xor ecx, ecx
 5:  lock cmpxchg byte ptr [rdi], cl
@@ -83,6 +86,7 @@ RUSTOS_USER_EXTABLE_END:
     .global rustos_page_fault_entry
     .type rustos_page_fault_entry, @function
 rustos_page_fault_entry:
+    endbr64
     test byte ptr [rsp + 16], 3
     jnz 9f
     push rax

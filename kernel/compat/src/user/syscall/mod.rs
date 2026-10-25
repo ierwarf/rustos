@@ -177,6 +177,7 @@ global_asm!(
     .global syscall_entry
     .type syscall_entry, @function
     syscall_entry:
+        endbr64
         swapgs
         mov gs:[8], rsp
         mov rsp, gs:[0]

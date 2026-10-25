@@ -336,6 +336,14 @@ fn validate_elf_fd(
     phdrs: &[u8],
     dyn_load_offset: u64,
 ) -> Result<u64, i32> {
+    // ET_EXEC retains its ABI-required fixed mapping. Only ET_DYN is movable.
+    // Keep the load bias a multiple of every PT_LOAD alignment, including
+    // images whose minimum vaddr is not zero.
+    let dyn_load_offset = if read_u16(header, 16) == 3 {
+        randomized_elf_offset(phdrs, dyn_load_offset)?
+    } else {
+        dyn_load_offset
+    };
     let summary = admit_elf64_image(
         header,
         phdrs,
@@ -354,6 +362,29 @@ fn validate_elf_fd(
         }
     }
     Ok(summary.load_bias)
+}
+
+fn randomized_elf_offset(phdrs: &[u8], window_start: u64) -> Result<u64, i32> {
+    let mut alignment = loaderd::aslr::IMAGE_ALIGNMENT;
+    let mut minimum_page = u64::MAX;
+    for ph in phdrs.chunks_exact(ELF_PROGRAM_HEADER_SIZE) {
+        if read_u32(ph, 0) != ELF_PT_LOAD || read_u64(ph, 40) == 0 {
+            continue;
+        }
+        let segment_alignment = read_u64(ph, 48);
+        if segment_alignment > 1 && !segment_alignment.is_power_of_two() {
+            return Err(ENOEXEC);
+        }
+        alignment = alignment.max(segment_alignment);
+        minimum_page = minimum_page.min(align_down(read_u64(ph, 16), 4096));
+    }
+    if minimum_page == u64::MAX || alignment > (1 << 30) {
+        return Err(ENOEXEC);
+    }
+    let start = align_up(window_start, alignment)?;
+    loaderd::aslr::random_offset(start, loaderd::aslr::IMAGE_WINDOW_BYTES, alignment)?
+        .checked_add(minimum_page & (alignment - 1))
+        .ok_or(EOVERFLOW)
 }
 
 fn map_elf_segments_fd(
@@ -449,12 +480,7 @@ fn map_admitted_elf_segments_fd(
             };
             let end = interp.max_loaded_end.max(max_loaded_end);
             backing_fds.extend(interp.backing_fds);
-            (
-                interp.load_bias,
-                interp.entry,
-                interpreter_path,
-                end,
-            )
+            (interp.load_bias, interp.entry, interpreter_path, end)
         } else {
             (0, entry, None, max_loaded_end)
         };
@@ -574,10 +600,7 @@ fn elf_load_segment_mapping(
     }))
 }
 
-fn publish_elf_mappings(
-    prepare_handle: u64,
-    mappings: &[ElfLoadMapping],
-) -> Result<(), i32> {
+fn publish_elf_mappings(prepare_handle: u64, mappings: &[ElfLoadMapping]) -> Result<(), i32> {
     let mut file_maps = Vec::<RustosProcMapFileBatchEntry>::new();
     for mapping in mappings {
         match mapping {

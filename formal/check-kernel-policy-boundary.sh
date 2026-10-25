@@ -82,6 +82,7 @@ rg -q 'IPC_SERVICE_INPUTD => target == IPC_SERVICE_NETD' services/rootd/src/main
 
 # Preserve native executable compatibility while policy stays in loaderd/procd.
 for source in \
+    services/loaderd/src/lib.rs \
     services/loaderd/src/elf.rs \
     services/loaderd/src/pe_loader.rs \
     services/loaderd/src/pe_runtime.rs \
@@ -89,7 +90,7 @@ for source in \
     services/procd/src/main.rs; do
     test -s "$source" || fail "native ELF/PE policy source missing: $source"
 done
-rg -q 'PROC_BROKER_FORMAT_ELF64.*PROC_BROKER_FORMAT_PE64' services/loaderd/src/commit.rs ||
+rg -q 'PROC_BROKER_FORMAT_ELF64.*PROC_BROKER_FORMAT_PE64' services/loaderd/src/lib.rs ||
     fail "loaderd no longer admits both native ELF64 and PE64"
 
 printf 'kernel policy boundary contracts passed\n'

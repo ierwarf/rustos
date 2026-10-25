@@ -43,15 +43,12 @@ pub mod arch {
     }
 
     pub mod user_access {
-        pub use crate::arch::user_access::{
-            copy_from_user, copy_to_user, enabled, probe_write,
-        };
+        pub use crate::arch::user_access::{copy_from_user, copy_to_user, enabled, probe_write};
         #[cfg(rustos_boot_image)]
         pub use crate::arch::user_access::{
             enable_if_write_protected, ensure_write_protect_on_this_cpu,
         };
     }
-
 
     pub mod tlb {
         pub use crate::arch::tlb_shootdown::{
@@ -69,6 +66,8 @@ pub mod arch {
 
 pub mod boot {
     use super::BootInfo;
+    #[cfg(rustos_boot_image)]
+    pub use crate::arch::ibt::IbtStatus;
 
     pub fn init_gdt() {
         crate::arch::gdt::init();
@@ -76,6 +75,11 @@ pub mod boot {
 
     pub fn init_gdt_for_cpu(logical_index: usize) {
         crate::arch::gdt::init_for_cpu(logical_index);
+    }
+
+    #[cfg(rustos_boot_image)]
+    pub fn init_kernel_ibt() -> IbtStatus {
+        crate::arch::ibt::enable_on_this_cpu()
     }
 
     pub fn init_idt() {
@@ -176,7 +180,6 @@ pub mod cpu {
     pub fn init_simd() {
         crate::arch::simd::init();
     }
-
 
     pub fn simd_mode_name() -> &'static str {
         crate::arch::simd::mode_name()
@@ -300,9 +303,7 @@ pub use crate::hooks::{
     CurrentUserSnapshot, HeartbeatHooks, HeartbeatSnapshot, InputEventQueueDebugSnapshot,
     InterruptHooks, TaskHooks, UserFaultDisposition,
 };
-pub use boot::{
-    call_with_stack, enter_higher_half, init_acpi, init_clocksource, init_gdt, init_idt,
-};
+pub use boot::{call_with_stack, enter_higher_half, init_acpi, init_clocksource, init_gdt, init_idt};
 pub use cpu::{current_rip, init_simd, simd_mode_name};
 pub use interrupts::{
     SAVED_CONTEXT_BYTES, SAVED_CONTEXT_XMM_OFFSET, disable_interrupts,

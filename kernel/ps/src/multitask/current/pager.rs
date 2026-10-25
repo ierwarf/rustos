@@ -141,21 +141,27 @@ pub fn publish_pager_vma_for_process(
         (template.end.saturating_sub(template.start)) / rustos_user_abi::pager::PAGER_PAGE_BYTES,
     )
     .map_err(|_| crate::multitask::pager_vma::PagerVmaError::Pressure)?;
-    let vacant = retained
-        .with_state_mut(|_, state| {
-            state
-                .address_space()
-                .user_range_is_unmapped(VirtAddr::new(template.start), page_count)
-        })
-        .map_err(|_| crate::multitask::pager_vma::PagerVmaError::Pressure)?;
-    if !vacant {
-        return Err(crate::multitask::pager_vma::PagerVmaError::Overlap);
-    }
-    record_reservation(page_count as u64);
-    let identity = retained
-        .live_identity()
-        .ok_or(crate::multitask::pager_vma::PagerVmaError::Stale)?;
-    crate::multitask::pager_vma::publish(retained.handle(), identity, template, ceiling)
+    retained.with_state_mut(|_, state| {
+        // The current MM's immutable guard, vacancy proof and publication must
+        // share state authority: exec can replace the ceiling between locks.
+        if !state.mapping_below_stack_guard(template.start, template.end) {
+            return Err(crate::multitask::pager_vma::PagerVmaError::Denied);
+        }
+        let vacant = state
+            .address_space()
+            .user_range_is_unmapped(VirtAddr::new(template.start), page_count)
+            .map_err(|_| crate::multitask::pager_vma::PagerVmaError::Pressure)?;
+        if !vacant {
+            return Err(crate::multitask::pager_vma::PagerVmaError::Overlap);
+        }
+        let identity = retained
+            .live_identity()
+            .ok_or(crate::multitask::pager_vma::PagerVmaError::Stale)?;
+        let published =
+            crate::multitask::pager_vma::publish(retained.handle(), identity, template, ceiling)?;
+        record_reservation(page_count as u64);
+        Ok(published)
+    })
 }
 
 /// Publishes one inherited VMA over a suspended fork child's cloned leaves.

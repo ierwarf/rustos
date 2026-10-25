@@ -109,7 +109,7 @@ fn serve(endpoint: u64) {
             continue;
         }
 
-        // Apply every queued exit before interpreting the next request. This
+        // Apply every queued exit/exec before interpreting the next request. This
         // local broker drain is bounded and cannot wait on another service,
         // so syscalld recovery never participates in a bootstrap IPC cycle.
         drain_lifecycle_events();
@@ -234,6 +234,8 @@ fn drain_lifecycle_events() {
     for event in &events[..count as usize] {
         if event.event == LIFECYCLE_EVENT_EXIT {
             linux_policy::handle_process_exit_pid(event.pid);
+        } else if event.event == rustos_user_abi::syscall::LIFECYCLE_EVENT_EXEC {
+            linux_policy::handle_process_exec_pid(event.pid);
         }
     }
 }

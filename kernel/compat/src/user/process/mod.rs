@@ -1,6 +1,6 @@
 use alloc::string::String;
-use x86_64::VirtAddr;
 use x86_64::structures::paging::PageTableFlags;
+use x86_64::VirtAddr;
 
 use crate::debug;
 use crate::io::session::ConsoleSessionHandle;
@@ -24,6 +24,12 @@ const USER_STACK_RESERVE_PAGES: usize = 256;
 // exists, map every usable page eagerly and retain one permanent guard page.
 const USER_STACK_INITIAL_COMMIT_PAGES: usize = USER_STACK_RESERVE_PAGES - USER_STACK_GUARD_PAGES;
 const USER_STACK_TOP_EXCLUSIVE: u64 = paging::USER_SPACE_END_EXCLUSIVE;
+
+fn bootstrap_stack_top() -> u64 {
+    let slots = rustos_user_abi::syscall::PROC_BROKER_STACK_ASLR_BYTES / PAGE_SIZE;
+    let slot = nucleus_core::util::random::Random::new().randint(0, slots as i64) as u64;
+    USER_STACK_TOP_EXCLUSIVE - slot * PAGE_SIZE
+}
 
 #[derive(Debug)]
 pub enum ProcessLoadError {
@@ -301,7 +307,7 @@ fn prepare_bootstrap_linux_process_with_launch(
     image: &[u8],
     launch: ProcessLaunchOptions<'_>,
 ) -> Result<PreparedProcessImage, ProcessLoadError> {
-    prepare_loaded_process_with_launch(linux::load_elf(image)?, launch)
+    prepare_loaded_process_with_launch(linux::load_elf(image)?, launch, bootstrap_stack_top())
 }
 // RING3-MIGRATION-REFERENCE END: loaderd/procd-owned bootstrap Linux image loading policy.
 
@@ -309,6 +315,7 @@ pub fn prepare_windows_process_with_address_space(
     metadata: WindowsProcessLoaderRuntime,
     address_space: ProcessAddressSpace,
     launch: ProcessLaunchOptions<'_>,
+    stack_top: u64,
 ) -> Result<PreparedProcessImage, ProcessLoadError> {
     let loaded = LoadedProcessImage {
         abi: UserAbi::Windows,
@@ -318,7 +325,7 @@ pub fn prepare_windows_process_with_address_space(
             runtime: metadata.runtime,
         }),
     };
-    prepare_loaded_process_with_launch(loaded, launch)
+    prepare_loaded_process_with_launch(loaded, launch, stack_top)
 }
 
 pub fn prepare_linux_process_with_metadata(
@@ -326,6 +333,7 @@ pub fn prepare_linux_process_with_metadata(
     actual_entry: u64,
     address_space: ProcessAddressSpace,
     launch: ProcessLaunchOptions<'_>,
+    stack_top: u64,
 ) -> Result<PreparedProcessImage, ProcessLoadError> {
     let loaded = LoadedProcessImage {
         abi: UserAbi::Linux,
@@ -333,7 +341,7 @@ pub fn prepare_linux_process_with_metadata(
         entry: VirtAddr::new(actual_entry),
         runtime: LoadedProcessRuntime::Linux(info),
     };
-    prepare_loaded_process_with_launch(loaded, launch)
+    prepare_loaded_process_with_launch(loaded, launch, stack_top)
 }
 
 fn scheduling_context_admission(
@@ -408,7 +416,7 @@ fn release_user_stack_state(reserve_start: VirtAddr) -> multitask::UserStackStat
             * PAGE_SIZE;
     multitask::UserStackState::new(
         usable_start.as_u64(),
-        USER_STACK_TOP_EXCLUSIVE,
+        reserve_start.as_u64() + USER_STACK_RESERVE_PAGES as u64 * PAGE_SIZE,
         usable_start.as_u64(),
     )
 }
@@ -416,6 +424,7 @@ fn release_user_stack_state(reserve_start: VirtAddr) -> multitask::UserStackStat
 fn prepare_loaded_process_with_launch(
     mut loaded: LoadedProcessImage,
     launch: ProcessLaunchOptions<'_>,
+    stack_top: u64,
 ) -> Result<PreparedProcessImage, ProcessLoadError> {
     const {
         assert!(USER_STACK_RESERVE_PAGES > USER_STACK_GUARD_PAGES);
@@ -424,8 +433,10 @@ fn prepare_loaded_process_with_launch(
         );
     }
 
-    let reserve_start =
-        VirtAddr::new(USER_STACK_TOP_EXCLUSIVE - USER_STACK_RESERVE_PAGES as u64 * PAGE_SIZE);
+    if !rustos_user_abi::syscall::proc_broker_stack_top_valid(stack_top) {
+        return Err(ProcessLoadError::InvalidElf("invalid randomized stack top"));
+    }
+    let reserve_start = VirtAddr::new(stack_top - USER_STACK_RESERVE_PAGES as u64 * PAGE_SIZE);
     ensure_unmapped_user_pages(
         &loaded.address_space,
         reserve_start,
@@ -472,6 +483,11 @@ fn build_process_bootstrap(
     user_stack: Option<multitask::UserStackState>,
     launch: ProcessLaunchOptions<'_>,
 ) -> Result<multitask::UserTaskBootstrap, ProcessLoadError> {
+    #[cfg(rustos_lifecycle_trace)]
+    let image_entry = match &runtime {
+        LoadedProcessRuntime::Linux(image) => image.entry,
+        LoadedProcessRuntime::Windows(_) => entry.as_u64(),
+    };
     let (
         stack_pointer,
         linux_process_state,
@@ -483,6 +499,12 @@ fn build_process_bootstrap(
         (UserAbi::Linux, LoadedProcessRuntime::Linux(image)) => {
             linux::initialize_linux_initial_tls(address_space, &image)?;
             let security = ProcessSecurityContext::new(launch.logical_admin);
+            let mut process_state = image.initial_process_state();
+            if let Some(stack) = user_stack {
+                // A MAP_FIXED request must not erase the permanent guard.
+                // Ordinary reservations are releasable; this ceiling is not.
+                process_state.mapping_limit = stack.reserve_start - PAGE_SIZE;
+            }
             (
                 linux::initialize_linux_user_stack(
                     address_space,
@@ -491,7 +513,7 @@ fn build_process_bootstrap(
                     launch.linux,
                     security,
                 )?,
-                Some(image.initial_process_state()),
+                Some(process_state),
                 Some(linux::build_initial_memory_map(
                     &image,
                     launch.linux.exec_path,
@@ -528,6 +550,14 @@ fn build_process_bootstrap(
     bootstrap.console_session = launch.console_session;
     bootstrap.logical_admin = launch.logical_admin;
     bootstrap.set_exec_path(launch.linux.exec_path);
+    #[cfg(rustos_lifecycle_trace)]
+    nucleus_core::debug::println_serialized(format_args!(
+        "aslr: process path={} entry={:#x} stack={:#x} pc={:#x}",
+        launch.linux.exec_path,
+        image_entry,
+        stack_pointer.as_u64(),
+        entry.as_u64(),
+    ));
     Ok(bootstrap)
 }
 
@@ -608,6 +638,34 @@ mod tests {
         assert_eq!(state.reserve_start, usable_start);
         assert_eq!(state.reserve_start, state.committed_start);
         assert_eq!(state.reserve_end, USER_STACK_TOP_EXCLUSIVE);
+    }
+
+    #[test]
+    fn randomized_stack_preserves_guard_commit_size_and_actual_top() {
+        use rustos_user_abi::syscall::{PROC_BROKER_STACK_ASLR_BYTES, PROC_BROKER_STACK_RESERVE_BYTES};
+        assert_eq!(
+            PROC_BROKER_STACK_RESERVE_BYTES,
+            USER_STACK_RESERVE_PAGES as u64 * PAGE_SIZE
+        );
+        for displacement in [PAGE_SIZE, PROC_BROKER_STACK_ASLR_BYTES - PAGE_SIZE] {
+            let top = USER_STACK_TOP_EXCLUSIVE - displacement;
+            let reserve_start = top - PROC_BROKER_STACK_RESERVE_BYTES;
+            let state = release_user_stack_state(VirtAddr::new(reserve_start));
+            assert_eq!(state.reserve_end, top);
+            assert_eq!(state.reserve_start, reserve_start + PAGE_SIZE);
+            assert_eq!(state.committed_start, state.reserve_start);
+            assert_eq!(
+                state.reserve_end - state.committed_start,
+                USER_STACK_INITIAL_COMMIT_PAGES as u64 * PAGE_SIZE
+            );
+        }
+        let samples = core::array::from_fn::<_, 32, _>(|_| bootstrap_stack_top());
+        assert!(
+            samples
+                .iter()
+                .all(|top| rustos_user_abi::syscall::proc_broker_stack_top_valid(*top))
+        );
+        assert!(samples.iter().any(|top| *top != samples[0]));
     }
 
     #[test]

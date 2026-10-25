@@ -357,10 +357,24 @@ manifest for each supported hardware profile. Schema 9 currently provides the
 locked source/artifact manifest only; it does not claim a CycloneDX SBOM or
 Buildroot `legal-info` bundle.
 
+The resolved kernel configuration must include `CONFIG_X86_KERNEL_IBT=y`;
+Kbuild/objtool instrument and seal the matching kernel and modules. The build
+verifier checks the resolved compiler/CET/IBT dependencies rather than trusting
+the fragment. Runtime enforcement additionally requires guest CPUID IBT support
+and Linux's CET setup/selftest; a configured image on an IBT-less host is not an
+enforcement witness. Upstream Linux supports kernel IBT and userspace shadow
+stack, **not userspace IBT** ([Linux CET documentation](https://docs.kernel.org/arch/x86/shstk.html)).
+Do not add global userspace IBT flags or claim musl/ELF notes provide enforcement.
+Shadow stack requires a separate libc/thread/signal qualification task.
+
 The build wrapper treats cache ownership as part of that profile contract.
 Buildroot/toolchain identity is the only ordinary full-output lane; Linux
-source/config changes rebuild Linux and every kernel-signed module, local relay
-source changes rebuild that package, and overlay/firmware post-build policy
+source/config changes rebuild Linux and every kernel-signed module (block,
+display, network and NVIDIA packages), and artifact verification requires the
+network UIO module as well as the other fixed device modules. The cache
+selftest checks the invalidation registry against every Kbuild-module package;
+clearing the installed module tree must not silently omit an unchanged relay.
+Local relay source changes rebuild that package, and overlay/firmware post-build policy
 regenerates only the rootfs. `build-plan` exposes the decision before mutation,
 and configuration stamps support safe resume after Kconfig reconciliation.
 Kernel/package/rootfs currency stamps are committed only after config,

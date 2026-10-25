@@ -18,8 +18,8 @@
 use super::*;
 
 mod activation_batch;
-mod deferred_activation;
 mod authority;
+mod deferred_activation;
 mod fork;
 mod scheduling_context_grants;
 
@@ -32,28 +32,27 @@ use authority::{current_loader_process_id, prepare_owned_by};
 use core::sync::atomic::{AtomicU64, Ordering};
 use heapless::index_map::FnvIndexMap;
 use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
-use x86_64::VirtAddr;
 use x86_64::structures::paging::PageTableFlags;
+use x86_64::VirtAddr;
 
 use crate::user::handles::KernelHandle;
 use crate::user::memfd::MemfdHandle;
 use rustos_user_abi::syscall::{
-    IPC_SERVICE_CAP_PROCESS_LOADER, IPC_SERVICE_CAP_PROCESS_POLICY,
-    IPC_SERVICE_CAP_ROOT_SUPERVISOR, IPC_SERVICE_INITD, IPC_SERVICE_PROCD, IPC_SERVICE_ROOTD,
-    IPC_SERVICE_SESSIOND, LOADER_SPAWN_ARG_BYTES, LOADER_SPAWN_ENV_BYTES,
-    LOADER_SPAWN_FLAG_DEFER_START, LOADER_SPAWN_FLAG_IMMEDIATE_HANDOFF, LOADER_SPAWN_MAX_ARG_COUNT,
-    LOADER_SPAWN_MAX_ENV_COUNT, PROC_BROKER_ABI_VERSION, PROC_BROKER_BATCH_CAPACITY,
-    PROC_BROKER_FORMAT_ELF64, PROC_BROKER_FORMAT_PE64, PROC_BROKER_LINUX_INTERP_PATH_CAPACITY,
-    PROC_BROKER_MAP_EXEC, PROC_BROKER_MAP_PRIVATE, PROC_BROKER_MAP_READ, PROC_BROKER_MAP_WRITE,
-    PROC_BROKER_PREPARE_FLAG_EXEC_TICKET, PROC_BROKER_USER_SPACE_BASE,
-    PROC_BROKER_USER_SPACE_END_EXCLUSIVE, RustosProcAbortBrokerArgs, RustosProcActivateBrokerArgs,
+    loader_service_role_allows_operation, RustosProcAbortBrokerArgs, RustosProcActivateBrokerArgs,
     RustosProcAuthorizeExecBrokerArgs, RustosProcCancelExecBrokerArgs, RustosProcCommitBrokerArgs,
     RustosProcExecTargetBrokerArgs, RustosProcForkBrokerArgs, RustosProcMapDataBrokerArgs,
     RustosProcMapFileBatchBrokerArgs, RustosProcMapFileBrokerArgs, RustosProcMapZeroedBrokerArgs,
     RustosProcPrepareBrokerArgs, RustosProcSetLinuxRuntimeBrokerArgs,
     RustosProcSetWindowsRuntimeBrokerArgs, RustosProcSignalQueueBrokerArgs,
-    RustosProcValidateDeferredSpawnBrokerArgs, RustosUserRegisters,
-    loader_service_role_allows_operation,
+    RustosProcValidateDeferredSpawnBrokerArgs, RustosUserRegisters, IPC_SERVICE_CAP_PROCESS_LOADER,
+    IPC_SERVICE_CAP_PROCESS_POLICY, IPC_SERVICE_CAP_ROOT_SUPERVISOR, IPC_SERVICE_INITD,
+    IPC_SERVICE_PROCD, IPC_SERVICE_ROOTD, IPC_SERVICE_SESSIOND, LOADER_SPAWN_ARG_BYTES,
+    LOADER_SPAWN_ENV_BYTES, LOADER_SPAWN_FLAG_DEFER_START, LOADER_SPAWN_FLAG_IMMEDIATE_HANDOFF,
+    LOADER_SPAWN_MAX_ARG_COUNT, LOADER_SPAWN_MAX_ENV_COUNT, PROC_BROKER_ABI_VERSION,
+    PROC_BROKER_BATCH_CAPACITY, PROC_BROKER_FORMAT_ELF64, PROC_BROKER_FORMAT_PE64,
+    PROC_BROKER_LINUX_INTERP_PATH_CAPACITY, PROC_BROKER_MAP_EXEC, PROC_BROKER_MAP_PRIVATE,
+    PROC_BROKER_MAP_READ, PROC_BROKER_MAP_WRITE, PROC_BROKER_PREPARE_FLAG_EXEC_TICKET,
+    PROC_BROKER_USER_SPACE_BASE, PROC_BROKER_USER_SPACE_END_EXCLUSIVE,
 };
 const PAGE_SIZE: u64 = 4096;
 const SPAWN_FLAG_LOGICAL_ADMIN: u64 = 1;
@@ -96,6 +95,7 @@ enum MappingEntry {
 struct ProcPrepareState {
     owner_pid: u64,
     format: u16,
+    stack_top: u64,
     exec_ticket: Option<u64>,
     #[allow(
         clippy::vec_box,
@@ -168,6 +168,7 @@ pub(super) fn syscall_linux_rustos_proc_prepare_broker(args_ptr: u64) -> u64 {
     if args.abi_version != PROC_BROKER_ABI_VERSION
         || args.flags & !PROC_BROKER_PREPARE_FLAG_EXEC_TICKET != 0
         || (args.flags == 0) != (args.reserved0 == 0)
+        || !rustos_user_abi::syscall::proc_broker_stack_top_valid(args.stack_top)
     {
         return linux_errno(LINUX_EINVAL);
     }
@@ -198,6 +199,7 @@ pub(super) fn syscall_linux_rustos_proc_prepare_broker(args_ptr: u64) -> u64 {
     let state = ProcPrepareState {
         owner_pid,
         format: args.format,
+        stack_top: args.stack_top,
         exec_ticket,
         mappings: Vec::with_capacity(MAX_MAPPINGS_PER_PREPARE),
         windows_runtime: None,
@@ -741,6 +743,7 @@ pub(super) fn syscall_linux_rustos_proc_commit_broker(args_ptr: u64) -> u64 {
                     linux: linux_launch,
                     ..launch
                 },
+                state.stack_top,
             ) {
                 Ok(prepared) => prepared,
                 Err(err) => return linux_errno(process_load_error_to_linux_errno(err)),
@@ -754,6 +757,7 @@ pub(super) fn syscall_linux_rustos_proc_commit_broker(args_ptr: u64) -> u64 {
                 metadata,
                 address_space,
                 launch,
+                state.stack_top,
             ) {
                 Ok(prepared) => prepared,
                 Err(err) => return linux_errno(process_load_error_to_linux_errno(err)),
@@ -841,14 +845,20 @@ pub(super) fn syscall_linux_rustos_proc_activate_broker(args_ptr: u64) -> u64 {
         Ok(args) => args,
         Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
     };
-    if args.abi_version != PROC_BROKER_ABI_VERSION || args.reserved0 != 0
-        || args.flags != 0 || args.target_pid == 0 || args.requester_pid == 0 {
+    if args.abi_version != PROC_BROKER_ABI_VERSION
+        || args.reserved0 != 0
+        || args.flags != 0
+        || args.target_pid == 0
+        || args.requester_pid == 0
+    {
         return linux_errno(LINUX_EINVAL);
     }
     // Requester policy identity is not loaderd's identity. These observations
     // do not replace the original physical Cohort/readers retained by PS.
     let (owner, target) = match resolve_deferred_activation_identities(
-        args.requester_pid, args.target_pid, multitask::live_user_process_identity_by_pid,
+        args.requester_pid,
+        args.target_pid,
+        multitask::live_user_process_identity_by_pid,
     ) {
         Ok(identities) => identities,
         Err(errno) => return linux_errno(errno),
@@ -857,7 +867,8 @@ pub(super) fn syscall_linux_rustos_proc_activate_broker(args_ptr: u64) -> u64 {
     let mut callback_seen = false;
     let mut failure = LINUX_ESRCH;
     let activated = multitask::activate_suspended_user_tasks_with_commit(
-        core::slice::from_ref(&args.target_pid), || {
+        core::slice::from_ref(&args.target_pid),
+        || {
             // Bounded permission transfer AFTER PS retains the original caller
             // and targets. Cleanup competes at this SAME registry leaf, not in
             // an unprotected gap between copied preflight and consumption.
@@ -868,45 +879,66 @@ pub(super) fn syscall_linux_rustos_proc_activate_broker(args_ptr: u64) -> u64 {
                 return None;
             }
             let required = activations.get(&args.target_pid).unwrap().qualification_required;
-            qualification_armed = match super::smp_qualification_ops::prepare_smp_qualification_activation(
-                owner, target, required,
-            ) {
-                Ok(armed) => armed,
-                Err(errno) => { failure = errno; return None; },
-            };
+            qualification_armed =
+                match super::smp_qualification_ops::prepare_smp_qualification_activation(
+                    owner, target, required,
+                ) {
+                    Ok(armed) => armed,
+                    Err(errno) => {
+                        failure = errno;
+                        return None;
+                    }
+                };
             let grant = deferred_activation::take_exact::<1, _, MAX_DEFERRED_ACTIVATIONS>(
-                &mut activations, core::slice::from_ref(&args.target_pid),
-                |_, authority| deferred_activation_identities_match(
-                    &authority.owner, &authority.target, &owner, &target),
-            ).expect("validated single activation lost its original grant");
+                &mut activations,
+                core::slice::from_ref(&args.target_pid),
+                |_, authority| {
+                    deferred_activation_identities_match(
+                        &authority.owner,
+                        &authority.target,
+                        &owner,
+                        &target,
+                    )
+                },
+            )
+            .expect("validated single activation lost its original grant");
             drop(activations);
             Some(grant)
         },
     );
     if !activated {
         // Registry/qualification refusal did not consume any authority.
-        if callback_seen { return linux_errno(failure); }
+        if callback_seen {
+            return linux_errno(failure);
+        }
         // No runnable effect preceded refusal. Remove only OUR still-pending
         // original record; cleanup or another accepted activation may have won.
         let removed = {
             let mut activations = DEFERRED_ACTIVATIONS.lock();
-            let removed = if deferred_spawn_authority_matches(&activations, args.target_pid, owner, target) {
-                activations.remove(&args.target_pid)
-            } else { None };
+            let removed =
+                if deferred_spawn_authority_matches(&activations, args.target_pid, owner, target) {
+                    activations.remove(&args.target_pid)
+                } else {
+                    None
+                };
             drop(activations);
             removed
         };
         if qualification_armed {
             super::smp_qualification_ops::abort_smp_qualification_activation(target);
         }
-        if removed.is_some() { let _ = multitask::terminate_user_process(args.target_pid); }
+        if removed.is_some() {
+            let _ = multitask::terminate_user_process(args.target_pid);
+        }
         return linux_errno(failure);
     }
     // Permission was moved once, not copied; the SAME grant and original PS
     // Cohort survived all runnable publication. No registry raw lock crossed PS.
     nucleus_core::debug::record_milestone(
         nucleus_core::debug::LogCategory::Compat,
-        "proc-activate-committed", args.target_pid, args.requester_pid,
+        "proc-activate-committed",
+        args.target_pid,
+        args.requester_pid,
     );
     0
 }
@@ -1144,6 +1176,7 @@ pub(super) fn syscall_linux_rustos_proc_exec_target_broker(args_ptr: u64) -> u64
             linux: linux_launch,
             ..launch
         },
+        state.stack_top,
     ) {
         Ok(prepared) => prepared,
         Err(err) => return linux_errno(process_load_error_to_linux_errno(err)),
@@ -1194,6 +1227,7 @@ pub(super) fn syscall_linux_rustos_proc_exec_target_broker(args_ptr: u64) -> u64
         );
     }
     if let Ok(closed_handles) = exec_outcome {
+        offload_ops::record_process_exec(args.target_pid);
         // The process-table commit has already removed CLOEXEC descriptors.
         // Derive cleanup from the exact handles retired by that commit, never
         // from an earlier fd snapshot that a sibling can close/reuse before

@@ -21,9 +21,10 @@ mod nucleus_audit;
 
 pub(crate) use clean::clean;
 
-use cargo::{run_cargo_kernel_check, run_cargo_kernel_rustc};
+use cargo::{apply_owned_target_rustflags, run_cargo_kernel_check, run_cargo_kernel_rustc};
 use nucleus_audit::{
     audit_simd_custody, check_nucleus_multiboot2, check_nucleus_multiboot2_if_present,
+    prepare_self_relocating_multiboot_elf,
 };
 
 const DEFAULT_GRUB_DEV_KEY: &str = "RustOS Dev GRUB <rustos-dev-grub@example.invalid>";
@@ -553,6 +554,7 @@ pub(crate) fn build_nucleus(config: &Config) -> Result<()> {
     if !output_is_fresh(&artifact, std::slice::from_ref(&source))? {
         copy_with_parent(&source, &artifact)?;
     }
+    prepare_self_relocating_multiboot_elf(&artifact)?;
     check_nucleus_multiboot2(config)?;
     audit_simd_custody(config)?;
     refresh_nucleus_signature_after_build(config)
@@ -759,6 +761,7 @@ fn build_windows_system_dlls(config: &Config, manifest: &PackageManifest) -> Res
         let mut inputs = sources.clone();
         inputs.push(exports.clone());
         inputs.push(manifest.manifest_path.clone());
+        inputs.push(config.root_dir.join("tools/xtask/src/build/mod.rs"));
         inputs.extend(winsys_headers(&winsys_dir.join(spec.dir))?);
         inputs.extend(winsys_headers(&winsys_dir.join("common"))?);
         if winsys_dll_needs_ntdll(spec.file_name) {
@@ -778,6 +781,8 @@ fn build_windows_system_dlls(config: &Config, manifest: &PackageManifest) -> Res
             .arg("-shared")
             .arg("-nostdlib")
             .arg("-ffreestanding")
+            .arg("-fcf-protection=branch")
+            .arg("-fno-jump-tables")
             .arg("-fno-builtin")
             .arg("-fno-stack-protector")
             .arg("-I")
@@ -893,12 +898,24 @@ fn build_cargo_kernel_binary_dynamic(config: &Config, manifest: &PackageManifest
     let mut command = Command::new(&config.cargo);
     command
         .arg("build")
+        // Prebuilt std is not CET-instrumented. Rebuild the entire Rust
+        // dependency closure, not just each final userspace crate.
+        .args([
+            "-Z",
+            "build-std=std,panic_abort",
+            "-Z",
+            "build-std-features=compiler-builtins-mem",
+        ])
         .arg("-p")
         .arg(package)
         .arg("--target")
         .arg(&config.kernel_target)
         .arg("--release")
         .env("CARGO_TARGET_DIR", &config.cargo_target_dir);
+    apply_owned_target_rustflags(
+        &mut command,
+        "-Z cf-protection=branch -C jump-tables=n -C panic=abort",
+    );
     run_command(&mut command)?;
 
     let binary = config
@@ -928,6 +945,7 @@ fn build_cargo_kernel_binary_static_pie(config: &Config, manifest: &PackageManif
     // used — we want PIE so the kernel can choose a load bias.
     let rustflags = concat!(
         "-C target-feature=+crt-static ",
+        "-Z cf-protection=branch -C jump-tables=n ",
         "-C panic=abort ",
         "-C relocation-model=pic ",
         "-C link-arg=-nostartfiles ",
@@ -944,8 +962,8 @@ fn build_cargo_kernel_binary_static_pie(config: &Config, manifest: &PackageManif
         .arg("--target")
         .arg(&config.kernel_target)
         .arg("--release")
-        .env("CARGO_TARGET_DIR", &config.cargo_target_dir)
-        .env("RUSTFLAGS", rustflags);
+        .env("CARGO_TARGET_DIR", &config.cargo_target_dir);
+    apply_owned_target_rustflags(&mut command, rustflags);
     run_command(&mut command)?;
 
     let binary = config
@@ -971,7 +989,14 @@ fn build_mingw_c_exe(config: &Config, manifest: &PackageManifest) -> Result<()> 
     })?;
     fs::create_dir_all(parent)?;
 
-    if output_is_fresh(&output, &[source.clone(), manifest.manifest_path.clone()])? {
+    if output_is_fresh(
+        &output,
+        &[
+            source.clone(),
+            manifest.manifest_path.clone(),
+            config.root_dir.join("tools/xtask/src/build/mod.rs"),
+        ],
+    )? {
         return Ok(());
     }
 
@@ -979,6 +1004,8 @@ fn build_mingw_c_exe(config: &Config, manifest: &PackageManifest) -> Result<()> 
 
     run_command(
         Command::new(&config.mingw_cc)
+            .arg("-fcf-protection=branch")
+            .arg("-fno-jump-tables")
             .arg("-Os")
             .arg("-s")
             .arg("-Wl,--image-base,0x400000")
@@ -1006,8 +1033,16 @@ fn build_c_demo_manifest(config: &Config, manifest: &PackageManifest) -> Result<
         .map(String::as_str)
         .collect::<Vec<_>>();
     let output = manifest.artifact_path(config);
-    let sources = c_demo_sources(source, &manifest.package_root, &manifest.build.extra_sources)?;
-    let inputs = c_demo_inputs(&sources, &manifest.manifest_path);
+    let sources = c_demo_sources(
+        source,
+        &manifest.package_root,
+        &manifest.build.extra_sources,
+    )?;
+    let inputs = c_demo_inputs(
+        &sources,
+        &manifest.manifest_path,
+        &config.root_dir.join("tools/xtask/src/build/mod.rs"),
+    );
     if output_is_fresh(&output, &inputs)? {
         return Ok(());
     }
@@ -1017,8 +1052,11 @@ fn build_c_demo_manifest(config: &Config, manifest: &PackageManifest) -> Result<
 fn c_demo_sources(source: PathBuf, package_root: &Path, extra: &[String]) -> Result<Vec<PathBuf>> {
     let mut sources = vec![source];
     for name in extra {
-        if name.is_empty() || !Path::new(name).components().all(|part|
-            matches!(part, std::path::Component::Normal(_))) {
+        if name.is_empty()
+            || !Path::new(name)
+                .components()
+                .all(|part| matches!(part, std::path::Component::Normal(_)))
+        {
             bail!("C package extra source is not a package-relative file: {name}");
         }
         let path = package_root.join(name);
@@ -1030,8 +1068,12 @@ fn c_demo_sources(source: PathBuf, package_root: &Path, extra: &[String]) -> Res
     Ok(sources)
 }
 
-fn c_demo_inputs(sources: &[PathBuf], manifest: &Path) -> Vec<PathBuf> {
-    sources.iter().cloned().chain(core::iter::once(manifest.to_path_buf())).collect()
+fn c_demo_inputs(sources: &[PathBuf], manifest: &Path, build_owner: &Path) -> Vec<PathBuf> {
+    sources
+        .iter()
+        .cloned()
+        .chain([manifest.to_path_buf(), build_owner.to_path_buf()])
+        .collect()
 }
 
 fn build_c_demo(
@@ -1050,7 +1092,10 @@ fn build_c_demo(
     for arg in extra_args {
         command.arg(arg);
     }
-    command.arg("-o").arg(output);
+    command
+        .args(["-fcf-protection=branch", "-fno-jump-tables"])
+        .arg("-o")
+        .arg(output);
     run_command(&mut command)
 }
 

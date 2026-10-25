@@ -2,6 +2,9 @@
 # RustOS Linux DVM baseline: standard PCI assignment plus standard virtio
 # transports. Device-class modules deliberately remain modular so production
 # profiles can pin only the drivers and firmware that they support.
+# Kbuild/objtool own IBT instrumentation and sealing for the kernel and modules.
+# Upstream Linux does not enforce userspace IBT; shadow stack is a separate feature.
+CONFIG_X86_KERNEL_IBT=y
 CONFIG_MODULES=y
 CONFIG_MODULE_UNLOAD=y
 CONFIG_MODVERSIONS=y

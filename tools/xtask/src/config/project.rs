@@ -25,7 +25,7 @@ const DEFAULT_KERNEL_INCREMENTAL: bool = false;
 const DEFAULT_KERNEL_DEBUGINFO: &str = "0";
 const DEFAULT_KERNEL_EMBED_BITCODE: bool = false;
 const DEFAULT_KERNEL_PANIC: &str = "abort";
-const DEFAULT_KERNEL_RELOCATION_MODEL: &str = "none";
+const DEFAULT_KERNEL_RELOCATION_MODEL: &str = "pic";
 const DEFAULT_KERNEL_STRIP: &str = "none";
 
 const PROJECT_CONFIG_ENV: &str = "RUSTOS_CONFIG";
@@ -216,6 +216,13 @@ impl KernelBuildConfig {
             flags.push_str(flag);
             flags.push(' ');
         }
+        // Position-independent code with rustc's default `-Z plt=no` turns every
+        // cross-crate call into `call [rip+GOT]`, and this static-pie link does
+        // not relax them: 12.6k indirect calls and 6.5k GOT loads, which cost the
+        // null syscall 560 cycles (480 -> 1040) and a buffer IPC round trip 2k.
+        // `plt=yes` lets the linker bind local calls directly again, keeping KASLR.
+        // Last wins: inherited/config flags must not weaken supervisor IBT.
+        flags.push_str("-Z plt=yes -Z cf-protection=branch -C jump-tables=n ");
         flags.trim_end().to_owned()
     }
 }
@@ -724,10 +731,10 @@ fn validate_kernel_build(build: &KernelBuildConfig) -> Result<()> {
         }
     }
     match build.relocation_model.as_str() {
-        "none" | "static" | "pic" | "pie" | "dynamic-no-pic" | "ropi" | "rwpi" | "ropi-rwpi" => {}
+        "pic" | "pie" => {}
         other => {
             bail!(
-                "kernel.build.relocation_model must be none, static, pic, pie, dynamic-no-pic, ropi, rwpi, or ropi-rwpi, got {other:?}"
+                "kernel KASLR requires kernel.build.relocation_model = pic or pie, got {other:?}"
             );
         }
     }
@@ -842,7 +849,7 @@ mod tests {
         FaultInjectionConfig, IpcTelemetryConfig, KernelBuildConfig, LifecycleTelemetryConfig,
         LockTelemetryConfig, ProjectConfigFile, SchedulerTelemetryConfig, SyscallTelemetryConfig,
         UsermemTelemetryConfig, apply_fault_rule_overrides, project_from_file,
-        validate_fault_injection,
+        validate_fault_injection, validate_kernel_build,
     };
 
     /// The lock phase profile is eleven counter reads inside every tracked lock
@@ -955,6 +962,27 @@ mod tests {
     }
 
     #[test]
+    fn kernel_kaslr_requires_position_independent_library_code() {
+        let mut build = KernelBuildConfig::default();
+        assert_eq!(build.relocation_model, "pic");
+        for model in ["pic", "pie"] {
+            build.relocation_model = model.to_owned();
+            assert!(validate_kernel_build(&build).is_ok());
+        }
+        for model in [
+            "none",
+            "static",
+            "dynamic-no-pic",
+            "ropi",
+            "rwpi",
+            "ropi-rwpi",
+        ] {
+            build.relocation_model = model.to_owned();
+            assert!(validate_kernel_build(&build).is_err(), "accepted {model}");
+        }
+    }
+
+    #[test]
     fn kernel_rustflags_select_the_boot_image_contract() {
         let flags = KernelBuildConfig::default().rustflags("");
         assert!(
@@ -964,6 +992,24 @@ mod tests {
                 .windows(2)
                 .any(|pair| pair == ["--cfg", "rustos_boot_image"]),
             "kernel RUSTFLAGS must select cfg(rustos_boot_image): {flags}"
+        );
+    }
+
+    #[test]
+    fn kernel_rustflags_enforce_branch_only_ibt_without_notrack_tables() {
+        let mut config = KernelBuildConfig::default();
+        config.extra_rustflags = vec!["-Z cf-protection=none -C jump-tables=y".into()];
+        let flags = config.rustflags("-Z cf-protection=full");
+        assert!(flags.ends_with("-Z cf-protection=branch -C jump-tables=n"));
+    }
+
+    #[test]
+    fn kernel_rustflags_bind_local_calls_directly_under_pic() {
+        let config = KernelBuildConfig::default();
+        let flags = config.rustflags("");
+        assert!(
+            flags.split_whitespace().collect::<Vec<_>>().windows(2).any(|pair| pair == ["-Z", "plt=yes"]),
+            "PIC kernel calls must not go through the GOT: {flags}"
         );
     }
 

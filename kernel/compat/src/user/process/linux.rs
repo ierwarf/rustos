@@ -9,14 +9,14 @@ use core::cmp;
 use core::convert::TryFrom;
 use core::ptr;
 
-use object::LittleEndian;
 use object::elf::{self as objelf, FileHeader64 as RawElfHeader};
 use object::read::FileKind;
-use x86_64::VirtAddr;
+use object::LittleEndian;
 use x86_64::structures::paging::PageTableFlags;
-use xmas_elf::ElfFile;
+use x86_64::VirtAddr;
 use xmas_elf::dynamic::Tag as DynamicTag;
 use xmas_elf::program::{ProgramHeader, SegmentData, Type as ProgramType};
+use xmas_elf::ElfFile;
 
 use crate::memory::paging::{self, ProcessAddressSpace};
 use crate::multitask::UserStackState;
@@ -30,12 +30,12 @@ use crate::user::process_state::ProcessSecurityContext;
 use crate::vfs;
 
 use super::{
-    LoadedProcessImage, LoadedProcessRuntime, MAX_LOAD_SEGMENTS, PAGE_SIZE, ProcessLoadError,
-    align_down, align_up, page_ranges_overlap,
+    align_down, align_up, page_ranges_overlap, LoadedProcessImage, LoadedProcessRuntime,
+    ProcessLoadError, MAX_LOAD_SEGMENTS, PAGE_SIZE,
 };
 
 const ELF_DYN_LOAD_BASE: u64 = paging::USER_SPACE_BASE + 0x0040_0000;
-const ELF_INTERP_LOAD_BASE: u64 = paging::USER_SPACE_BASE + 0x0200_0000;
+const ELF_INTERP_LOAD_BASE: u64 = paging::USER_SPACE_BASE + (1 << 37);
 const ELF_RELOC_X86_64_RELATIVE: u32 = 8;
 const ELF_RELOC_X86_64_IRELATIVE: u32 = 37;
 const LINUX_STACK_RANDOM_BYTES: usize = 16;
@@ -272,11 +272,16 @@ fn choose_elf_load_bias(
         ElfImageType::Executable => Ok(0),
         ElfImageType::StaticPie => {
             let mut min_load_addr = u64::MAX;
+            let mut alignment = 1_u64 << 21;
             for ph in elf.program_iter() {
                 let ph_type = ph.get_type().map_err(ProcessLoadError::InvalidElf)?;
                 if ph_type != ProgramType::Load || ph.mem_size() == 0 {
                     continue;
                 }
+                if ph.align() > 1 && !ph.align().is_power_of_two() {
+                    return Err(ProcessLoadError::InvalidElf("invalid ELF load alignment"));
+                }
+                alignment = alignment.max(ph.align());
                 min_load_addr = min_load_addr.min(align_down(ph.virtual_addr(), PAGE_SIZE));
             }
 
@@ -286,12 +291,25 @@ fn choose_elf_load_bias(
                 ));
             }
 
-            let load_bias =
-                preferred_base
-                    .checked_sub(min_load_addr)
-                    .ok_or(ProcessLoadError::InvalidElf(
-                        "static PIE load bias underflow",
-                    ))?;
+            // This path is limited to pre-loaderd bootstrap images. Normal
+            // image placement remains loaderd policy. Preserve p_align while
+            // choosing one of at least 64 independent cryptographic slots.
+            if alignment > (1 << 30) {
+                return Err(ProcessLoadError::InvalidElf("ELF load alignment too large"));
+            }
+            let slots = (1_u64 << 36) / alignment;
+            let slot = nucleus_core::util::random::Random::new().randint(0, slots as i64) as u64;
+            let base = align_up(preferred_base, alignment)
+                .and_then(|base| base.checked_add(slot * alignment))
+                .and_then(|base| base.checked_add(min_load_addr & (alignment - 1)))
+                .ok_or(ProcessLoadError::InvalidElf(
+                    "static PIE randomized base overflow",
+                ))?;
+            let load_bias = base
+                .checked_sub(min_load_addr)
+                .ok_or(ProcessLoadError::InvalidElf(
+                    "static PIE load bias underflow",
+                ))?;
             Ok(load_bias)
         }
     }
@@ -1559,10 +1577,10 @@ mod tests {
     use alloc::vec::Vec;
 
     use super::{
-        ELF_DYN_LOAD_BASE, ElfTlsTemplateInfo, INITIAL_TLS_TCB_ALIGN, INITIAL_TLS_TCB_SIZE,
-        LINUX_AUX_HWCAP, LINUX_AUX_HWCAP2, build_linux_initial_stack_words, build_runtime_profile,
-        elf_initial_tls_info_from_template, expand_runtime_search_entry,
-        segment_page_file_copy_range,
+        build_linux_initial_stack_words, build_runtime_profile, elf_initial_tls_info_from_template,
+        expand_runtime_search_entry, segment_page_file_copy_range, ElfTlsTemplateInfo,
+        ELF_DYN_LOAD_BASE, INITIAL_TLS_TCB_ALIGN, INITIAL_TLS_TCB_SIZE, LINUX_AUX_HWCAP,
+        LINUX_AUX_HWCAP2,
     };
     use crate::memory::paging::USER_SPACE_BASE;
     use crate::user::linux as linux_abi;

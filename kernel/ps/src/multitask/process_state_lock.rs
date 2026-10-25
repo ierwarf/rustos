@@ -18,7 +18,7 @@ use x86_64::instructions::interrupts;
 use nucleus_core::util::lockdep::{self, LockClass};
 
 /// Guard owner token of a shipping fast-path acquisition (no recorded owner).
-#[cfg(not(test))]
+#[cfg(all(not(test), not(rustos_lock_phase_profile)))]
 const FAST_OWNER: usize = 0;
 const UNLOCKED: usize = 0;
 const LOCKED: usize = 1;

@@ -32,9 +32,7 @@ mod scheduling_policy;
 mod service_checkpoint;
 mod service_manifest;
 
-use loader_wire::{
-    contains_nul, copy_bytes, empty_loader_spawn_request, empty_loader_spawn_response,
-};
+use loader_wire::{contains_nul, copy_bytes, empty_loader_spawn_request, empty_loader_spawn_response};
 use scheduling_policy::{
     issue_scheduling_context_authority, register_scheduling_context_authority,
     scheduling_context_policy_for_exec,
@@ -50,6 +48,12 @@ use core::slice;
 use core::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 
 use rustos_user_abi::syscall::{
+    CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
+    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, CoreServiceLeaseWire,
+    IpcRecvWithSenderArgs, LifecycleDrainBrokerArgs, LifecycleEventWire, LoaderSpawnRequest,
+    LoaderSpawnResponse, RustosProcValidateDeferredSpawnBrokerArgs, RustosRootdTerminateBrokerArgs,
+    RustosSchedulingContextAuthority, RustosSchedulingContextGrantBrokerArgs,
+    RustosSchedulingContextPolicy, ServiceCheckpointRecordWire,
     COMMERCIAL_MAX_CAPABILITY_OP_LEASE_GRANT, COMMERCIAL_MAX_CAPABILITY_OP_LEASE_RENEW,
     COMMERCIAL_MAX_CAPABILITY_OP_LEASE_REVOKE, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
     COMMERCIAL_MAX_PROTOCOL_CAPABILITY, COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS,
@@ -61,28 +65,22 @@ use rustos_user_abi::syscall::{
     COMMERCIAL_MAX_ROOTD_OP_SERVICE_CAPABILITY, COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_COMPACT,
     COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_MUTATE,
     COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_SCAN, COMMERCIAL_MAX_ROOTD_OP_SERVICE_LOOKUP,
-    CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
-    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, CoreServiceLeaseWire,
     IPC_SERVICE_DEVMGRD, IPC_SERVICE_INPUTD, IPC_SERVICE_LINUX_SYSCALLD, IPC_SERVICE_LOADERD,
     IPC_SERVICE_NETD, IPC_SERVICE_PAGERD, IPC_SERVICE_PROCD, IPC_SERVICE_ROOTD,
     IPC_SERVICE_SESSIOND, IPC_SERVICE_STORAGED, IPC_SERVICE_UISERVER, IPC_SERVICE_VFSD,
-    IpcRecvWithSenderArgs, LIFECYCLE_DRAIN_BROKER_ABI_VERSION, LIFECYCLE_DRAIN_MAX_EVENTS,
-    LIFECYCLE_EVENT_EXIT, LOADER_OP_ACTIVATE, LOADER_OP_SPAWN_EXEC, LOADER_REQUEST_ABI_VERSION,
-    LOADER_SPAWN_ARG_BYTES, LOADER_SPAWN_ENV_BYTES, LOADER_SPAWN_EXEC_PATH_CAPACITY,
-    LOADER_SPAWN_FLAG_DEFER_START, LifecycleDrainBrokerArgs, LifecycleEventWire,
-    LoaderSpawnRequest, LoaderSpawnResponse, PRODUCT_MILESTONE_ROOT_CORE_READY,
-    ROOTD_LEASE_STATE_EXITED, ROOTD_LEASE_STATE_FAILED, ROOTD_LEASE_STATE_RESTART_PENDING,
-    ROOTD_LEASE_STATE_RUNNING, ROOTD_TERMINATE_BROKER_ABI_VERSION,
-    RustosProcValidateDeferredSpawnBrokerArgs, RustosRootdTerminateBrokerArgs,
-    RustosSchedulingContextAuthority, RustosSchedulingContextGrantBrokerArgs,
-    RustosSchedulingContextPolicy, SCHEDULING_CONTEXT_POLICY_ABI_UNSET, SYS_RUSTOS_IPC_CALL,
+    LIFECYCLE_DRAIN_BROKER_ABI_VERSION, LIFECYCLE_DRAIN_MAX_EVENTS, LIFECYCLE_EVENT_EXIT,
+    LOADER_OP_ACTIVATE, LOADER_OP_SPAWN_EXEC, LOADER_REQUEST_ABI_VERSION, LOADER_SPAWN_ARG_BYTES,
+    LOADER_SPAWN_ENV_BYTES, LOADER_SPAWN_EXEC_PATH_CAPACITY, LOADER_SPAWN_FLAG_DEFER_START,
+    PRODUCT_MILESTONE_ROOT_CORE_READY, ROOTD_LEASE_STATE_EXITED, ROOTD_LEASE_STATE_FAILED,
+    ROOTD_LEASE_STATE_RESTART_PENDING, ROOTD_LEASE_STATE_RUNNING,
+    ROOTD_TERMINATE_BROKER_ABI_VERSION, SCHEDULING_CONTEXT_POLICY_ABI_UNSET, SYS_RUSTOS_IPC_CALL,
     SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT,
     SYS_RUSTOS_IPC_RECV_WITH_SENDER, SYS_RUSTOS_IPC_RECV_WITH_SENDER_BOUNDED,
     SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY,
     SYS_RUSTOS_IPC_TRY_RECV_WITH_SENDER, SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER,
     SYS_RUSTOS_PROC_VALIDATE_DEFERRED_SPAWN_BROKER, SYS_RUSTOS_PRODUCT_MILESTONE,
     SYS_RUSTOS_ROOTD_TERMINATE_BROKER, SYS_RUSTOS_ROOTD_WAIT_BROKER,
-    SYS_RUSTOS_SCHEDULING_CONTEXT_GRANT_BROKER, SYS_RUSTOS_SPAWN_EXEC, ServiceCheckpointRecordWire,
+    SYS_RUSTOS_SCHEDULING_CONTEXT_GRANT_BROKER, SYS_RUSTOS_SPAWN_EXEC,
 };
 use service_checkpoint::ServiceCheckpointStore;
 
@@ -178,12 +176,17 @@ struct PostInitLease {
 }
 
 #[cfg(not(test))]
+rustos_svc_runtime::relocation_trampoline!();
+
+#[cfg(not(test))]
 core::arch::global_asm!(
     ".global _start",
     ".type _start, @function",
     "_start:",
+    "    endbr64",
     "    xor rbp, rbp",
     "    and rsp, -16",
+    "    call __rustos_svc_relocate",
     "    call __rustos_rootd_start",
     "    ud2",
 );

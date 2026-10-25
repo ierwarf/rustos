@@ -60,7 +60,11 @@ fn pe_step_err(exec_path: &str, step: &str, errno: i32) -> i32 {
 
 fn pe_default_load_base() -> Result<u64, i32> {
     PROC_BROKER_USER_SPACE_BASE
-        .checked_add(PE_LOAD_OFFSET)
+        .checked_add(loaderd::aslr::random_offset(
+            loaderd::aslr::MAIN_START,
+            loaderd::aslr::IMAGE_WINDOW_BYTES,
+            loaderd::aslr::IMAGE_ALIGNMENT,
+        )?)
         .ok_or(EOVERFLOW)
 }
 

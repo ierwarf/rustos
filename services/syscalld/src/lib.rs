@@ -1,5 +1,12 @@
 #![no_std]
 
+#[cfg(test)]
+extern crate alloc;
+#[cfg(test)]
+extern crate self as syscalld;
+#[cfg(test)]
+mod linux_policy;
+
 pub mod affinity_policy;
 pub mod errno;
 pub mod fast_offload;

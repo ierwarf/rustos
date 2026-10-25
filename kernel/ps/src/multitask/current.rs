@@ -429,8 +429,10 @@ pub fn current_user_thread_id() -> Option<u64> {
 /// allocation-bank Current/context/entry custody, not a Scheduler catalog.
 pub fn current_user_abi() -> Option<UserAbi> {
     interrupts::without_interrupts(|| {
-        if let Some(identity) = published_current_identity() {
-            return identity.user_binding().map(|(_, abi, _, _)| abi);
+        if let Some(abi) = cpu_local::current_cpu_task_slot()
+            .and_then(super::current_identity::read_user_abi)
+        {
+            return abi;
         }
         super::scheduler::stack_resources::context::current_user_abi()
     })

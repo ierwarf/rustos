@@ -19,9 +19,7 @@ use core::slice;
 use boot_protocol::BootInfo;
 use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
 use object::LittleEndian;
-use object::elf::{
-    self as objelf, FileHeader64 as RawElfHeader, ProgramHeader64 as RawProgramHeader,
-};
+use object::elf::{self as objelf, FileHeader64 as RawElfHeader, ProgramHeader64 as RawProgramHeader};
 use x86_64::PhysAddr;
 use x86_64::VirtAddr;
 use x86_64::instructions::{interrupts, tlb};
@@ -49,8 +47,11 @@ pub use crate::lowlevel::address::KERNEL_VIRT_OFFSET;
 const MMIO_WINDOW_BASE: u64 = KERNEL_VIRT_OFFSET + (1_u64 << 39);
 const MMIO_UNMAPPED_BLOCK: u64 = u64::MAX;
 const SPLIT_BLOCK_UNMAPPED: u64 = u64::MAX;
-const KERNEL_LOAD_BIAS_MIN: u64 = 0x0020_0000;
+const KERNEL_LOAD_BIAS_MIN: u64 = crate::lowlevel::address::KERNEL_IMAGE_PHYS_BASE;
 const MAX_KERNEL_PHYSICAL_KASLR_SLIDE: u64 = 0x0020_0000;
+const KERNEL_IMAGE_PML4_INDEX: usize = 258;
+const KERNEL_IMAGE_PT_COUNT: usize = 128;
+const MAX_KERNEL_IMAGE_SIZE: u64 = KERNEL_IMAGE_PT_COUNT as u64 * HUGE_2MIB;
 const ELF64_HEADER_SIZE: usize = 64;
 const ELF64_PROGRAM_HEADER_SIZE: usize = 56;
 const ELF64_DYNAMIC_ENTRY_SIZE: usize = 16;
@@ -112,6 +113,9 @@ pub static KERNEL_PML4: TrackedSpinLock<
     pml4: PageTable::new(),
     pdp: PageTable::new(),
     pd: [const { PageTable::new() }; KERNEL_PML4_SIZE_GB],
+    image_pdp: PageTable::new(),
+    image_pd: [const { PageTable::new() }; 2],
+    image_pt: [const { PageTable::new() }; KERNEL_IMAGE_PT_COUNT],
     mmio_pdp: PageTable::new(),
     mmio_pd: PageTable::new(),
     mmio_blocks: [MmioWindowSlot::unmapped(); MMIO_WINDOW_SLOTS],
@@ -126,6 +130,9 @@ pub struct PML4<const SIZE_GB: usize> {
     pub(crate) pml4: PageTable,
     pdp: PageTable,
     pd: [PageTable; SIZE_GB],
+    image_pdp: PageTable,
+    image_pd: [PageTable; 2],
+    image_pt: [PageTable; KERNEL_IMAGE_PT_COUNT],
     mmio_pdp: PageTable,
     mmio_pd: PageTable,
     mmio_blocks: [MmioWindowSlot; MMIO_WINDOW_SLOTS],
@@ -138,6 +145,13 @@ impl<const SIZE_GB: usize> PML4<SIZE_GB> {
         self.pml4 = PageTable::new();
         self.pdp = PageTable::new();
         self.pd = [const { PageTable::new() }; SIZE_GB];
+        self.image_pdp.zero();
+        for table in &mut self.image_pd {
+            table.zero();
+        }
+        for table in &mut self.image_pt {
+            table.zero();
+        }
         self.mmio_pdp = PageTable::new();
         self.mmio_pd = PageTable::new();
         self.mmio_blocks = [MmioWindowSlot::unmapped(); MMIO_WINDOW_SLOTS];
@@ -180,8 +194,96 @@ impl<const SIZE_GB: usize> PML4<SIZE_GB> {
                 self.pd[pdp_index][pd_index].set_addr(phys, huge_flags);
             }
         }
-        self.protect_loaded_kernel_image(boot_info_ptr)
+        self.map_randomized_kernel_image(boot_info_ptr)
+            .expect("randomized kernel image mapping must succeed");
+        self.protect_loaded_kernel_image(boot_info_ptr, false)
             .expect("kernel image executable protections must be derivable");
+    }
+
+    fn map_randomized_kernel_image(
+        &mut self,
+        boot_info_ptr: *const BootInfo,
+    ) -> Result<(), &'static str> {
+        use crate::lowlevel::address::publish_kernel_image_mapping;
+        let (physical_base, header) = find_loaded_kernel_image(boot_info_ptr)?;
+        if physical_base != KERNEL_LOAD_BIAS_MIN || header.e_type.get(ELF_ENDIAN) != objelf::ET_DYN
+        {
+            return Err("KASLR requires the fixed-physical static PIE kernel");
+        }
+        let mut image_end = physical_base;
+        for index in 0..header.e_phnum.get(ELF_ENDIAN) as usize {
+            let ph = read_kernel_program_header(physical_base, &header, index)?;
+            if ph.p_type.get(ELF_ENDIAN) == objelf::PT_LOAD {
+                let start = segment_phys_addr(physical_base, objelf::ET_DYN, &ph)?;
+                if start < physical_base {
+                    return Err("kernel segment precedes image");
+                }
+                image_end = image_end.max(
+                    start
+                        .checked_add(ph.p_memsz.get(ELF_ENDIAN))
+                        .ok_or("kernel image range overflow")?,
+                );
+            }
+        }
+        let image_size =
+            align_up(image_end - physical_base, PAGE_4KIB).ok_or("kernel image size overflow")?;
+        let slots = kernel_image_slot_count(image_size)
+            .ok_or("kernel image exceeds bounded KASLR tables")?;
+        let mut rng = nucleus_core::util::random::Random::new();
+        let slot = rng.randint(0, slots as i64) as u64;
+        let base =
+            kernel_image_base_for_slot(image_size, slot).ok_or("invalid KASLR image slot")?;
+        publish_kernel_image_mapping(base, image_size);
+        let tables = PageTableFlags::PRESENT | PageTableFlags::WRITABLE;
+        self.pml4[KERNEL_IMAGE_PML4_INDEX].set_addr(
+            PhysAddr::new(kernel_virtual_to_physical(addr_of!(self.image_pdp) as u64)),
+            tables,
+        );
+        let first_gib = (base >> 30) & 511;
+        for index in 0..header.e_phnum.get(ELF_ENDIAN) as usize {
+            let ph = read_kernel_program_header(physical_base, &header, index)?;
+            if ph.p_type.get(ELF_ENDIAN) != objelf::PT_LOAD || ph.p_memsz.get(ELF_ENDIAN) == 0 {
+                continue;
+            }
+            let start = segment_phys_addr(physical_base, objelf::ET_DYN, &ph)?;
+            let end = align_up(
+                start
+                    .checked_add(ph.p_memsz.get(ELF_ENDIAN))
+                    .ok_or("kernel segment overflow")?,
+                PAGE_4KIB,
+            )
+            .ok_or("kernel segment alignment overflow")?;
+            let (add, remove) = kernel_segment_flag_delta(ph.p_flags.get(ELF_ENDIAN))?;
+            let flags = (tables | PageTableFlags::NO_EXECUTE | add) & !remove;
+            for physical in (align_down(start, PAGE_4KIB)..end).step_by(PAGE_4KIB as usize) {
+                let virtual_addr = base + physical - physical_base;
+                let pdp_index = ((virtual_addr >> 30) & 511) as usize;
+                let pd_slot = pdp_index - first_gib as usize;
+                let pd_index = ((virtual_addr >> 21) & 511) as usize;
+                let pt_slot = ((physical - physical_base) / HUGE_2MIB) as usize;
+                let pt_index = ((physical >> 12) & 511) as usize;
+                if pd_slot >= self.image_pd.len() || pt_slot >= self.image_pt.len() {
+                    return Err("kernel image table budget exceeded");
+                }
+                self.image_pdp[pdp_index].set_addr(
+                    PhysAddr::new(kernel_virtual_to_physical(
+                        addr_of!(self.image_pd[pd_slot]) as u64
+                    )),
+                    tables,
+                );
+                self.image_pd[pd_slot][pd_index].set_addr(
+                    PhysAddr::new(kernel_virtual_to_physical(
+                        addr_of!(self.image_pt[pt_slot]) as u64
+                    )),
+                    tables,
+                );
+                if !self.image_pt[pt_slot][pt_index].is_unused() {
+                    return Err("kernel PT_LOAD pages overlap");
+                }
+                self.image_pt[pt_slot][pt_index].set_addr(PhysAddr::new(physical), flags);
+            }
+        }
+        Ok(())
     }
 
     fn find_free_mmio_slots(&self, block_count: usize) -> Option<usize> {
@@ -595,6 +697,7 @@ impl<const SIZE_GB: usize> PML4<SIZE_GB> {
     fn protect_loaded_kernel_image(
         &mut self,
         boot_info_ptr: *const BootInfo,
+        seal_aliases: bool,
     ) -> Result<(), &'static str> {
         let (load_bias, header) = find_loaded_kernel_image(boot_info_ptr)?;
         let elf_type = header.e_type.get(ELF_ENDIAN);
@@ -625,19 +728,19 @@ impl<const SIZE_GB: usize> PML4<SIZE_GB> {
             let segment_end = segment_start
                 .checked_add(mem_size)
                 .ok_or("kernel PT_LOAD range overflow")?;
-            let (add_flags, remove_flags) = kernel_segment_flag_delta(ph.p_flags.get(ELF_ENDIAN))?;
+            let program_flags = ph.p_flags.get(ELF_ENDIAN);
+            // Low identity and direct-map aliases share leaves. Before the jump,
+            // relocation-bearing read-only data stays writable; after it, every
+            // fixed image alias is NX with its final data write permission.
+            let alias_flags = kernel_alias_program_flags(program_flags, seal_aliases);
+            let (add_flags, remove_flags) = kernel_segment_flag_delta(alias_flags)?;
             self.update_page_range_flags(
                 segment_start,
                 segment_end - segment_start,
                 add_flags,
                 remove_flags,
             )?;
-            self.audit_kernel_segment_protection(
-                index,
-                segment_start,
-                segment_end,
-                ph.p_flags.get(ELF_ENDIAN),
-            )?;
+            self.audit_kernel_segment_protection(index, segment_start, segment_end, alias_flags)?;
         }
 
         Ok(())
@@ -652,14 +755,12 @@ impl<const SIZE_GB: usize> PML4<SIZE_GB> {
     ) -> Result<(), &'static str> {
         let executable = (program_flags & objelf::PF_X) != 0;
         let writable = (program_flags & objelf::PF_W) != 0;
-        let first_flags = self
-            .direct_map_phys_flags(segment_start)
-            .ok_or("kernel PT_LOAD first page flags missing after protection")?;
-        let last_flags = self
-            .direct_map_phys_flags(segment_end.saturating_sub(1))
-            .ok_or("kernel PT_LOAD last page flags missing after protection")?;
-
-        for flags in [first_flags, last_flags] {
+        for physical in
+            (align_down(segment_start, PAGE_4KIB)..segment_end).step_by(PAGE_4KIB as usize)
+        {
+            let flags = self
+                .direct_map_phys_flags(physical)
+                .ok_or("kernel PT_LOAD page flags missing after protection")?;
             if executable {
                 if flags.contains(PageTableFlags::NO_EXECUTE) {
                     return Err("kernel executable PT_LOAD page remained NX");
@@ -709,12 +810,14 @@ pub fn init(boot_info_ptr: *const BootInfo) {
             crate::debug::boot_trace::println_fmt(format_args!("kernel: paging tables init begin"));
             pml4.init(boot_info_ptr);
             crate::debug::boot_trace::println_fmt(format_args!("kernel: paging tables init done"));
+            // Install both aliases before changing GOT/vtable pointers. The
+            // still-low continuation may call a rebased high function pointer.
+            pml4.load();
             rebase_loaded_kernel_image_to_higher_half(boot_info_ptr)
                 .expect("kernel higher-half rebase must succeed");
             crate::debug::boot_trace::println_fmt(format_args!(
                 "kernel: paging higher-half rebase done"
             ));
-            pml4.load();
             crate::debug::boot_trace::println_fmt(format_args!("kernel: paging root loaded"));
         });
     }
@@ -986,11 +1089,57 @@ pub fn initialize_application_processor_cache_attributes() -> bool {
 }
 
 fn kernel_virtual_to_physical(addr: u64) -> u64 {
-    if addr >= KERNEL_VIRT_OFFSET {
-        addr - KERNEL_VIRT_OFFSET
-    } else {
-        addr
+    crate::lowlevel::address::lower_half_addr(addr)
+}
+
+/// One-way BSP high-entry seal, before interrupts, APs, or user roots exist.
+/// Low identity mappings remain for physical boot metadata and the AP trampoline,
+/// but no fixed-address alias of kernel image text remains executable.
+pub fn seal_kernel_image_aliases(boot_info_ptr: *const BootInfo) {
+    let rip = kernel_hal::api::current_rip();
+    let image = crate::lowlevel::address::kernel_image_addr(KERNEL_LOAD_BIAS_MIN);
+    assert!(
+        rip >= image && rip < image + MAX_KERNEL_IMAGE_SIZE,
+        "kernel aliases may only be sealed from the randomized image"
+    );
+    interrupts::without_interrupts(|| {
+        KERNEL_PML4
+            .lock()
+            .protect_loaded_kernel_image(boot_info_ptr, true)
+            .expect("fixed kernel image aliases must be sealed NX");
+        tlb::flush_all();
+    });
+    #[cfg(rustos_lifecycle_trace)]
+    crate::debug::println_fmt(format_args!("aslr: kernel base={:#x} pc={:#x}", image, rip));
+}
+
+fn kernel_image_slot_count(size: u64) -> Option<u64> {
+    if size == 0 || size > MAX_KERNEL_IMAGE_SIZE {
+        return None;
     }
+    Some((crate::lowlevel::address::KERNEL_IMAGE_WINDOW_SIZE - size) / HUGE_2MIB + 1)
+}
+
+fn kernel_image_base_for_slot(size: u64, slot: u64) -> Option<u64> {
+    if slot >= kernel_image_slot_count(size)? {
+        return None;
+    }
+    Some(crate::lowlevel::address::KERNEL_IMAGE_WINDOW + slot * HUGE_2MIB)
+}
+
+fn read_kernel_program_header(
+    physical_base: u64,
+    header: &RawElfHeader<LittleEndian>,
+    index: usize,
+) -> Result<RawProgramHeader<LittleEndian>, &'static str> {
+    if header.e_phentsize.get(ELF_ENDIAN) as usize != ELF64_PROGRAM_HEADER_SIZE {
+        return Err("kernel ELF phentsize invalid");
+    }
+    let address = physical_base
+        .checked_add(header.e_phoff.get(ELF_ENDIAN))
+        .and_then(|value| value.checked_add((index * ELF64_PROGRAM_HEADER_SIZE) as u64))
+        .ok_or("kernel ELF phdr overflow")?;
+    read_raw_program_header_at(address)
 }
 
 fn align_down(value: u64, align: u64) -> u64 {
@@ -1073,7 +1222,8 @@ fn segment_phys_addr(
 ) -> Result<u64, &'static str> {
     if elf_type == objelf::ET_DYN {
         return load_bias
-            .checked_add(program_header.p_vaddr.get(ELF_ENDIAN))
+            .checked_sub(KERNEL_LOAD_BIAS_MIN)
+            .and_then(|bias| bias.checked_add(program_header.p_vaddr.get(ELF_ENDIAN)))
             .ok_or("kernel PT_LOAD relocated address overflow");
     }
 
@@ -1143,7 +1293,8 @@ fn parse_dynamic_relocation_table(
             DT_RELA => {
                 rela_addr = Some(if elf_type == objelf::ET_DYN {
                     load_bias
-                        .checked_add(value)
+                        .checked_sub(KERNEL_LOAD_BIAS_MIN)
+                        .and_then(|bias| bias.checked_add(value))
                         .ok_or("kernel ELF rela address overflow")?
                 } else {
                     value
@@ -1184,17 +1335,19 @@ fn rebase_loaded_kernel_image_to_higher_half(
 ) -> Result<(), &'static str> {
     let (load_bias, header) = find_loaded_kernel_image(boot_info_ptr)?;
     if header.e_type.get(ELF_ENDIAN) != objelf::ET_DYN {
-        return Ok(());
+        return Err("KASLR kernel must be ET_DYN");
     }
 
     let Some(dynamic) = find_dynamic_segment(load_bias, &header)? else {
         return Err("kernel ELF PT_DYNAMIC segment not found");
     };
     let Some(relocations) = parse_dynamic_relocation_table(&header, load_bias, dynamic)? else {
-        return Ok(());
+        return Err("KASLR kernel requires relative relocations");
     };
 
-    let high_bias = higher_half_addr(load_bias);
+    let high_bias = crate::lowlevel::address::kernel_image_addr(load_bias)
+        .checked_sub(KERNEL_LOAD_BIAS_MIN)
+        .ok_or("kernel image bias overflow")?;
     let rela_count = relocations.size / ELF64_RELA_ENTRY_SIZE;
     let mut applied = 0usize;
     for index in 0..rela_count {
@@ -1206,18 +1359,11 @@ fn rebase_loaded_kernel_image_to_higher_half(
         let info = read_u64_from_memory(entry_addr + 8);
         let addend = read_i64_from_memory(entry_addr + 16);
 
-        if (info as u32) != R_X86_64_RELATIVE {
-            return Err("kernel ELF contains unsupported relocation type");
-        }
-        if (info >> 32) != 0 {
-            return Err("kernel ELF relative relocation references a symbol");
-        }
-
         let target = load_bias
-            .checked_add(offset)
+            .checked_sub(KERNEL_LOAD_BIAS_MIN)
+            .and_then(|bias| bias.checked_add(offset))
             .ok_or("kernel ELF relocation target overflow")?;
-        let rebased = add_signed_u64(high_bias, addend)
-            .ok_or("kernel ELF relocation rebased value overflow")?;
+        let rebased = kernel_relative_relocation_value(info, high_bias, addend)?;
         write_u64_to_memory(target, rebased);
         applied += 1;
     }
@@ -1227,6 +1373,30 @@ fn rebase_loaded_kernel_image_to_higher_half(
         applied
     ));
     Ok(())
+}
+
+fn kernel_relative_relocation_value(
+    info: u64,
+    bias: u64,
+    addend: i64,
+) -> Result<u64, &'static str> {
+    if (info as u32) != R_X86_64_RELATIVE {
+        return Err("kernel ELF contains unsupported relocation type");
+    }
+    if (info >> 32) != 0 {
+        return Err("kernel ELF relative relocation references a symbol");
+    }
+    add_signed_u64(bias, addend).ok_or("kernel ELF relocation rebased value overflow")
+}
+
+fn kernel_alias_program_flags(program_flags: u32, sealed: bool) -> u32 {
+    if sealed {
+        program_flags & !objelf::PF_X
+    } else if program_flags & objelf::PF_X == 0 {
+        program_flags | objelf::PF_W
+    } else {
+        program_flags
+    }
 }
 
 fn kernel_segment_flag_delta(
@@ -1395,6 +1565,96 @@ mod tests {
             direct_map_update_bounds(DIRECT_MAP_PHYS_LIMIT - 1, 1),
             Some((DIRECT_MAP_PHYS_LIMIT - PAGE_4KIB, DIRECT_MAP_PHYS_LIMIT))
         );
+    }
+
+    #[test]
+    fn kernel_image_slots_are_aligned_bounded_and_cover_the_image_window() {
+        use crate::lowlevel::address::{KERNEL_IMAGE_WINDOW, KERNEL_IMAGE_WINDOW_SIZE};
+        for size in [
+            PAGE_4KIB,
+            HUGE_2MIB,
+            37 * HUGE_2MIB + PAGE_4KIB,
+            MAX_KERNEL_IMAGE_SIZE,
+        ] {
+            let count = kernel_image_slot_count(size).expect("admitted image size");
+            assert!(count > (1 << 17));
+            for slot in [0, 1, count / 2, count - 1] {
+                let base = kernel_image_base_for_slot(size, slot).unwrap();
+                assert_eq!(base % HUGE_2MIB, 0);
+                assert_eq!((base >> 39) & 511, KERNEL_IMAGE_PML4_INDEX as u64);
+                assert!(base >= KERNEL_IMAGE_WINDOW);
+                assert!(base + size <= KERNEL_IMAGE_WINDOW + KERNEL_IMAGE_WINDOW_SIZE);
+                assert!(((base + size - 1) >> 30) - (base >> 30) <= 1);
+            }
+            assert_eq!(kernel_image_base_for_slot(size, count), None);
+        }
+        assert_eq!(kernel_image_slot_count(0), None);
+        assert_eq!(kernel_image_slot_count(MAX_KERNEL_IMAGE_SIZE + 1), None);
+        assert_eq!(kernel_image_slot_count(u64::MAX), None);
+    }
+
+    #[test]
+    fn kernel_static_pie_program_headers_use_link_base_not_header_physical_base_as_elf_bias() {
+        // The ELF is linked at 2 MiB, not zero: its actual ELF load bias is
+        // header_physical - 2 MiB. BootInfo still names the physical header.
+        let mut ph: RawProgramHeader<LittleEndian> = unsafe { core::mem::zeroed() };
+        ph.p_vaddr.set(ELF_ENDIAN, KERNEL_LOAD_BIAS_MIN + 0x123000);
+        assert_eq!(
+            segment_phys_addr(KERNEL_LOAD_BIAS_MIN, objelf::ET_DYN, &ph),
+            Ok(0x323000)
+        );
+        assert_eq!(
+            segment_phys_addr(KERNEL_LOAD_BIAS_MIN + HUGE_2MIB, objelf::ET_DYN, &ph),
+            Ok(0x523000)
+        );
+        assert!(segment_phys_addr(KERNEL_LOAD_BIAS_MIN - 1, objelf::ET_DYN, &ph).is_err());
+    }
+
+    #[test]
+    fn kernel_relative_relocations_rebase_code_and_data_and_reject_other_authority() {
+        let base = crate::lowlevel::address::KERNEL_IMAGE_WINDOW + 173 * HUGE_2MIB;
+        let bias = base - KERNEL_LOAD_BIAS_MIN;
+        for addend in [
+            KERNEL_LOAD_BIAS_MIN + 0x1000,
+            KERNEL_LOAD_BIAS_MIN + 0x400000,
+        ] {
+            assert_eq!(
+                kernel_relative_relocation_value(8, bias, addend as i64),
+                Ok(base + addend - KERNEL_LOAD_BIAS_MIN)
+            );
+            assert_eq!(
+                kernel_relative_relocation_value(8, 0, addend as i64),
+                Ok(addend)
+            );
+        }
+        assert!(kernel_relative_relocation_value(1, bias, 0).is_err());
+        assert!(kernel_relative_relocation_value((1 << 32) | 8, bias, 0).is_err());
+        assert!(kernel_relative_relocation_value(8, u64::MAX, 1).is_err());
+        assert!(kernel_relative_relocation_value(8, 0, -1).is_err());
+    }
+
+    #[test]
+    fn kernel_image_fixed_aliases_become_nx_and_keep_final_write_authority() {
+        for flags in [
+            objelf::PF_R | objelf::PF_X,
+            objelf::PF_R,
+            objelf::PF_R | objelf::PF_W,
+        ] {
+            let initial = kernel_alias_program_flags(flags, false);
+            assert_eq!(initial & objelf::PF_X, flags & objelf::PF_X);
+            if flags & objelf::PF_X == 0 {
+                assert_ne!(initial & objelf::PF_W, 0);
+            }
+            let sealed = kernel_alias_program_flags(flags, true);
+            assert_eq!(sealed & objelf::PF_X, 0);
+            assert_eq!(sealed & objelf::PF_W, flags & objelf::PF_W);
+            let (add, remove) = kernel_segment_flag_delta(sealed).unwrap();
+            assert!(add.contains(PageTableFlags::NO_EXECUTE));
+            assert_eq!(
+                remove.contains(PageTableFlags::WRITABLE),
+                flags & objelf::PF_W == 0
+            );
+        }
     }
 
     #[test]
