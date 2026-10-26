@@ -86,11 +86,20 @@ impl BindingPin {
 /// nothing can clear or reuse the slot while this is taken). The admission
 /// gates it checks are the lock-free publications `duplicate_donation` reads.
 pub(in crate::multitask) fn pin_held(slot: usize, id: u64) -> Option<BindingPin> {
-    let published = super::read_dispatch(slot)?;
-    if published.task_id != Some(id) || published.retired() || super::exec_intent::busy(slot) {
+    if !qualified(slot, id) {
         return None;
     }
     acquire(slot).map(|permit| BindingPin { permit, id })
+}
+
+/// The admission half of [`pin_held`] without taking the permit: `slot` still
+/// publishes `id`, is not retired and has no exec intent. For a caller whose own
+/// Current bank already holds the task (nothing can retire or reuse the slot
+/// while it executes on this masked CPU), a second permit buys nothing.
+pub(in crate::multitask) fn qualified(slot: usize, id: u64) -> bool {
+    super::read_task_dispatch(slot)
+        .is_some_and(|published| published.task_id == Some(id) && !published.retired)
+        && !super::exec_intent::busy(slot)
 }
 pub(in crate::multitask) fn pin_creation(
     slot: usize,

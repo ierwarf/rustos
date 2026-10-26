@@ -20,13 +20,20 @@ struct SlotSimdState {
     busy: AtomicBool,
     image: UnsafeCell<SimdImage>,
 }
-// SAFETY: all image access is enclosed by the exclusive atomic guard. Its
-// production callers additionally exclude local IRQs throughout access.
+// SAFETY: all image access is enclosed by the exclusive guard. Its production
+// callers exclude local IRQs throughout access and own the slot's Current or
+// Prepared bank, which is what excludes every other CPU.
 unsafe impl Sync for SlotSimdState {}
 struct SimdAccess<'a>(&'a SlotSimdState);
 impl Drop for SimdAccess<'_> {
     fn drop(&mut self) {
+        #[cfg(test)]
         self.0.busy.store(false, Ordering::Release);
+        #[cfg(not(test))]
+        {
+            core::sync::atomic::compiler_fence(Ordering::SeqCst);
+            self.0.busy.store(false, Ordering::Relaxed);
+        }
     }
 }
 impl SlotSimdState {
@@ -41,12 +48,24 @@ impl SlotSimdState {
         }
     }
     fn claim(&self) -> SimdAccess<'_> {
+        // Native tests run many threads as one modeled CPU, so they keep the
+        // atomic exclusion. A shipping image has IRQs masked here and the bank
+        // that excludes other CPUs, which makes the guard an assertion of that
+        // contract; a lock-prefixed compare-exchange (a store-buffer barrier,
+        // eight times per register-IPC round trip) is not needed to hold it.
+        #[cfg(test)]
         assert!(
             self.busy
                 .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
                 .is_ok(),
             "overlapping live SIMD access"
         );
+        #[cfg(not(test))]
+        {
+            assert!(!self.busy.load(Ordering::Relaxed), "overlapping live SIMD access");
+            self.busy.store(true, Ordering::Relaxed);
+            core::sync::atomic::compiler_fence(Ordering::SeqCst);
+        }
         SimdAccess(self)
     }
     fn with<R>(&self, f: impl FnOnce(&mut SimdImage) -> R) -> R {

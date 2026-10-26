@@ -138,6 +138,17 @@ Policy stays in userspace services.
   7.75k -> direct block 7.65k -> with the resume shortcut 7.24k -> with the lane
   trims (request publication after the lane, masked per-CPU stack/profile writes)
   7.04k (p99 8.3k -> 7.5k).
+  Lane trims after P7 (no ownership or custody change): `admitted` is lifecycle-only
+  (`current_identity::read_task_dispatch`; the placement/affinity proof stays in the
+  claim's `with_placement_admission`), the CALL donor is qualified against its
+  lifecycle (`execution::qualified`) and bound by
+  `donation_publication::bind_lane_current` instead of being pinned (the pinned
+  `bind_original` remains the fallback), and the non-test SIMD marker claim is an
+  assert plus a relaxed store (the CPU's single IPC marker is owned by the one task
+  running there). Together they measure p50 6.76k / p99 7.4k (3 runs, vmexit_cpuid anchor 3.5-3.7k): the remaining round trip is
+  ~40 stages of 80-400 cycles (call-side reserve ~1.2k, each lane switch ~1.7k,
+  server tail ~1.7k, entry ~0.9k), so further gains need the P3 rendezvous cell
+  (epoch-validated receiver, fused reserve/bind/release), not more stage trimming.
 
 Measured (1 vCPU isolated `ipc_rt_intra_process_reply_recv`, p50 ticks):
 session start 41.9k -> DirectSwitch 31.9k -> lane call+reply 19.2k -> funding

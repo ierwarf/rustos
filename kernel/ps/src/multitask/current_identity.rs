@@ -861,6 +861,41 @@ pub(super) fn read_dispatch(slot: usize) -> Option<DispatchPublication> {
     })
 }
 
+/// The part of a dispatch publication the IPC lane decides on.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct TaskDispatch {
+    pub(super) task_id: Option<u64>,
+    pub(super) dispatchable: bool,
+    pub(super) retired: bool,
+}
+
+/// Task id and lifecycle of `slot` from one stable commit, reading only the three
+/// words they come from. `read_dispatch` rebuilds the whole publication (twelve
+/// fields) to answer the same question; the IPC lane asks it six times per round
+/// trip. `None` is exactly `read_dispatch`'s `None`.
+#[inline]
+pub(super) fn read_task_dispatch(slot: usize) -> Option<TaskDispatch> {
+    let cell = IDENTITIES.get(slot)?;
+    // ORDERING: as `read_state`; the loads sit between two version observations
+    // and are discarded unless both name the same stable commit.
+    let before = cell.version.load(Ordering::Acquire);
+    if before & 1 != 0 {
+        return None;
+    }
+    let flags = cell.flags.load(Ordering::Relaxed);
+    let task_id = cell.task_id.load(Ordering::Relaxed);
+    let dispatch_flags = cell.dispatch_flags.load(Ordering::Relaxed);
+    fence(Ordering::Acquire);
+    if cell.version.load(Ordering::Relaxed) != before || flags & FLAG_PUBLISHED == 0 {
+        return None;
+    }
+    Some(TaskDispatch {
+        task_id: (flags & FLAG_TASK_ID != 0).then_some(task_id),
+        dispatchable: dispatch_flags & DISPATCH_INELIGIBLE == 0,
+        retired: dispatch_flags & DISPATCH_RETIRED != 0,
+    })
+}
+
 /// Independent telemetry compares the published scalar descriptor against
 /// its ORIGINAL Identity51 writer in one bounded leaf. No descriptor value
 /// authorizes backing, execution or a new loan; no raw leaf crosses sampling.
@@ -1097,6 +1132,42 @@ mod tests {
         );
         cell.version.store(stable_version, Ordering::Relaxed);
         clear(slot);
+    }
+
+    #[test]
+    fn task_dispatchable_fast_read_matches_the_full_dispatch_read() {
+        let _process = crate::multitask::process_table::tests::isolate_process_table();
+        let _cpu = crate::multitask::cpu_local::test_publication_lock();
+        let _runtime = crate::multitask::scheduler::execution_test_serial_guard();
+        let slot = 6;
+        let identity = TaskIdentity {
+            task_id: Some(77),
+            user_mode: true,
+            abi: Some(UserAbi::Linux),
+            process_handle: Some(ProcessHandle::new(2, 3)),
+            process_id: Some(8),
+            console_session: ConsoleSessionHandle::from_raw(1),
+            pager_charge: None,
+        };
+        for identity in [identity, TaskIdentity { task_id: None, ..identity }] {
+            publish_test_identity(slot, identity);
+            let full = read_dispatch(slot).map(|p| TaskDispatch {
+                task_id: p.task_id,
+                dispatchable: p.lifecycle_dispatchable(),
+                retired: p.retired(),
+            });
+            assert_eq!(read_task_dispatch(slot), full, "{identity:?}");
+        }
+        // A writer mid-update is absent on both reads.
+        publish_state(slot, identity, DispatchLifecycle::default());
+        let cell = &IDENTITIES[slot];
+        let stable = cell.version.load(Ordering::Relaxed);
+        cell.version.store(stable.wrapping_add(1), Ordering::Relaxed);
+        assert_eq!(read_task_dispatch(slot), None);
+        cell.version.store(stable, Ordering::Relaxed);
+        clear(slot);
+        assert_eq!(read_task_dispatch(slot), None);
+        assert_eq!(read_task_dispatch(MAX_SCHEDULER_TASKS), None);
     }
 
     #[test]

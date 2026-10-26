@@ -6,6 +6,15 @@ owners, and fresh validation. Root `AGENTS.md` is the only stable prompt
 prefix. This page does not authorize reusing stale evidence, speculative
 changes, or old uncommitted-work claims.
 
+## IPC P2 closure (2026-10-26)
+
+P2 (IPC-specific entry and direct `sysretq` switch) is complete: P7 direct park/resume
+plus the lane trims in `docs/ai/performance/ipc-lane.md` (register round trip p50
+7.75k -> 6.76k, p99 8.3k -> 7.4k, 1 vCPU isolated probe). Gates: unit tests, profile
+builds, `verify-all --profile pr`, `verify-smp-iteration`, 1 and 8 vCPU KVM smoke.
+Remaining cost is ~40 flat stages; next is P3 (endpoint rendezvous cell with epoch
+validation, fused reserve/bind/release), which changes custody and formal models.
+
 ## Current continuation — common service fastcall (2026-10-23)
 
 User committed P0/P1 as `6e62c19e`; this task started clean. P2+ is explicitly

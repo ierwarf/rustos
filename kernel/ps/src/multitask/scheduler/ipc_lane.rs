@@ -120,7 +120,7 @@ fn settle(cpu: usize, slot: usize, id: u64, clock: &crate::arch::rtc::ClockSampl
 fn funding_label(slot: usize, id: u64) -> Option<(u64, u64)> {
     match donation_ledger::borrowed_context_charge_token(slot) {
         Some((owner_slot, reply)) => {
-            Some((current_identity::read_dispatch(owner_slot)?.task_id?, reply))
+            Some((current_identity::read_task_dispatch(owner_slot)?.task_id?, reply))
         }
         None => Some((id, 0)),
     }
@@ -183,23 +183,29 @@ pub(in crate::multitask) fn call(
         return declined;
     }
     let Some(token) = frame_publication::observed_frame_token(s, cpu, false) else { return declined };
-    if !admitted(cpu, c, c_id) || !admitted(cpu, s, receiver_id) || token.owner_generation != generation {
+    if !admitted(c, c_id) || !admitted(s, receiver_id) || token.owner_generation != generation {
         return declined;
     }
     // Donation bind is the last fallible step that can still decline: the
     // ordinary path would bind the same reservation next.
-    let (Some(donor), Some(receiver)) =
-        (identity_execution::pin_held(c, c_id), identity_execution::pin_held(s, receiver_id))
-    else { return declined };
+    // The donor is this CPU's Current task (its banks own it, checked above):
+    // it needs the same lifecycle qualification a pin applies but no permit.
+    if !identity_execution::qualified(c, c_id) {
+        return declined;
+    }
+    let Some(receiver) = identity_execution::pin_held(s, receiver_id) else { return declined };
     // A donor funded by its own context binds in one ledger acquisition; a
     // borrowed basis takes the full two-step bind with its root loan.
-    let _donation = match donation_publication::bind_lane(scope, reply, &donor, &receiver) {
+    let _donation = match donation_publication::bind_lane_current(scope, reply, (c, c_id), &receiver) {
         Some(true) => None,
         Some(false) => return declined,
-        None => match donation_publication::bind_original(scope, reply, donor, &receiver, false) {
-            Some(loans) => Some(loans),
-            None => return declined,
-        },
+        None => {
+            let Some(donor) = identity_execution::pin_held(c, c_id) else { return declined };
+            match donation_publication::bind_original(scope, reply, donor, &receiver, false) {
+                Some(loans) => Some(loans),
+                None => return declined,
+            }
+        }
     };
 
     // Committed from here: every failure is `Generic`.
@@ -264,7 +270,7 @@ pub(in crate::multitask) fn reply(
         return declined;
     }
     let Some(token) = frame_publication::observed_frame_token(c, cpu, false) else { return declined };
-    if token.owner_generation != generation || !admitted(cpu, s, s_id) || !admitted(cpu, c, caller_id) {
+    if token.owner_generation != generation || !admitted(s, s_id) || !admitted(c, caller_id) {
         return declined;
     }
     // Committed from here: the reply capability's donation is released, as the
@@ -281,16 +287,13 @@ pub(in crate::multitask) fn reply(
     finish(cpu, from, to, rsp, &clock, generic)
 }
 
-/// Whether `slot` may run on `cpu`: published lifecycle dispatchable and the
-/// task and process affinity masks both include the CPU.
-fn admitted(cpu: usize, slot: usize, id: u64) -> bool {
-    current_identity::read_dispatch(slot)
-        .is_some_and(|p| p.task_id == Some(id) && p.lifecycle_dispatchable())
-        && {
-            let (task, process, _) = runqueue::affinity_payload::affinity_snapshot(slot);
-            u32::try_from(cpu).ok().and_then(|cpu| 1_u64.checked_shl(cpu))
-                .is_some_and(|bit| task & process & bit != 0)
-        }
+/// Whether `slot` may run: its published lifecycle is dispatchable for `id`.
+/// Affinity is not checked here: the claim's `with_placement_admission` reads
+/// the same task and process masks under the binding leaf and a refusal there
+/// leaves the receiver awake through the ordinary wake (`Generic`), so a second
+/// early read only repeated the authoritative one.
+fn admitted(slot: usize, id: u64) -> bool {
+    current_identity::read_task_dispatch(slot).is_some_and(|p| p.task_id == Some(id) && p.dispatchable)
 }
 
 struct Party {

@@ -170,6 +170,22 @@ pub(super) fn bind_lane(
     donation_ledger::bind_own_funding(reply, donor.slot(), donor.id(), receiver.slot(), receiver.id())
 }
 
+/// [`bind_lane`] for a donor that is the lane's Current task: its exact slot and
+/// id were qualified against the owner bank by the caller, so no donor permit is
+/// taken. The receiver pin is kept: it is what stops the parked receiver's slot
+/// from being retired and reused between this bind and the claim CAS.
+pub(super) fn bind_lane_current(
+    scope: &DispatchPreemption<'_>,
+    reply: u64,
+    donor: (usize, u64),
+    receiver: &identity::execution::BindingPin,
+) -> Option<bool> {
+    if !scope_valid(scope) || reply == 0 || donor.1 == receiver.id() {
+        return Some(false);
+    }
+    donation_ledger::bind_own_funding(reply, donor.0, donor.1, receiver.slot(), receiver.id())
+}
+
 /// Transfer the original participants to the producer, which retains donor,
 /// root and receiver through queue/FIFO publication and Current wait commit.
 pub(super) fn bind_original(
