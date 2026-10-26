@@ -482,6 +482,62 @@ fn probe_vmexit_cpuid(tsc_khz: u64) {
     }
 }
 
+/// Pure ring-3 compute anchors: no syscall, no VM exit, no RustOS code. A
+/// dependent `imul` chain (3-cycle latency each) follows the core clock alone;
+/// a chain of locked read-modify-writes follows the core/cache atomic path.
+/// Reported in TSC ticks like every row, so a host that boosts higher reads
+/// fewer ticks in both, while `vmexit_cpuid` also carries the host's KVM exit
+/// path. Together they say which resource drifted between two runs.
+const ANCHOR_CHAIN_ITERS: usize = 10_000;
+const ALU_CHAIN_LEN: u64 = 1_200;
+const ATOMIC_CHAIN_LEN: u64 = 480;
+
+fn probe_anchor_chains(tsc_khz: u64) {
+    let alu = measure(ANCHOR_CHAIN_ITERS, WARMUP, || {
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        // SAFETY: register-only dependent multiply loop; touches no memory.
+        unsafe {
+            core::arch::asm!(
+                "2:",
+                "imul {x}, {x}",
+                "dec {n}",
+                "jnz 2b",
+                x = inout(reg) x,
+                n = inout(reg) ALU_CHAIN_LEN => _,
+                options(nomem, nostack),
+            );
+        }
+        core::hint::black_box(x);
+        true
+    });
+    match alu {
+        Some(mut samples) => report("anchor_alu_chain", &summarize(&mut samples), tsc_khz),
+        None => skip("anchor_alu_chain", "measure-failed"),
+    }
+    let mut cell: u64 = 0;
+    let atomic = measure(ANCHOR_CHAIN_ITERS, WARMUP, || {
+        // SAFETY: `cell` is a live stack word owned by this closure's caller.
+        unsafe {
+            core::arch::asm!(
+                "2:",
+                "lock xadd qword ptr [{p}], {v}",
+                "dec {n}",
+                "jnz 2b",
+                p = in(reg) core::ptr::addr_of_mut!(cell),
+                v = inout(reg) 1u64 => _,
+                n = inout(reg) ATOMIC_CHAIN_LEN => _,
+                options(nostack),
+            );
+        }
+        true
+    });
+    core::hint::black_box(cell);
+    match atomic {
+        Some(mut samples) => report("anchor_atomic_chain", &summarize(&mut samples), tsc_khz),
+        None => skip("anchor_atomic_chain", "measure-failed"),
+    }
+}
+
 fn probe_sched_yield(tsc_khz: u64) {
     let result = measure(SYSCALL_ITERS, WARMUP, || unsafe {
         syscall0(SYS_LINUX_SCHED_YIELD) >= 0
@@ -1190,6 +1246,7 @@ fn run_single_probe(name: &str, tsc_khz: u64) {
 fn run_isolated_probe(name: &str, tsc_khz: u64) {
     if name != "vmexit_cpuid" && name != component_contract::FILTER {
         probe_vmexit_cpuid(tsc_khz);
+        probe_anchor_chains(tsc_khz);
     }
     run_single_probe(name, tsc_khz);
 }

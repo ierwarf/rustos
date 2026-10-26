@@ -42,6 +42,7 @@ pass. The ordinary bench now also checks null/IPC cost after lifecycle changes.
 | `ipc_rt_intra_process_reply_recv` | the same client against a server using the fused reply-and-receive call every production service (`syscalld`, `loaderd`, `inputd`) uses — this is the production-shaped probe to quote |
 | `ipc_rt_cross_process_syscalld_getuid` | `getuid`, which `syscalld` answers over IPC |
 | `vmexit_cpuid` | one hypervisor exit, as a scale for every other row and the required anchor for any cross-run comparison |
+| `anchor_alu_chain`, `anchor_atomic_chain` | ring-3 compute with no syscall, no exit and no RustOS code: a dependent `imul` chain (core clock only, ~3k ticks) and a locked-RMW chain (atomic path, ~3.4k ticks). Printed with every isolated probe next to `vmexit_cpuid`, so a drift can be placed: all three move = host clock; only `vmexit_cpuid` = host KVM exit path; only the atomic chain = cache/SMT neighbour. Informational: the required anchor and the comparison gate stay `vmexit_cpuid` |
 | `ipc_split_*` | the round trip cut at the server's own timestamps: `call_to_recv`, `server_body`, `reply_to_return` |
 | `fork_exit_wait`, `fork_exec_exit_wait`, `thread_clone_exit_join`, `exec_replace_single_thread`, `spawn_activation_to_first_turn`, `exit_retire_to_reap` | Phase 6 process-lifecycle probes over the ordinary process ABI |
 
