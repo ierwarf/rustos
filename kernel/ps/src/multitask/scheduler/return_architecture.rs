@@ -175,7 +175,7 @@ pub(in crate::multitask::scheduler) fn lane_effects(
 }
 
 pub(in crate::multitask::scheduler) fn lane_install(
-    previous: ArchitectureState, next: ArchitectureState, to_slot: usize, to_id: u64,
+    cpu: usize, previous: ArchitectureState, next: ArchitectureState, to_slot: usize, to_id: u64,
 ) {
     #[cfg(not(test))]
     lane_effects(previous, next, to_slot, |effect| match effect {
@@ -184,10 +184,19 @@ pub(in crate::multitask::scheduler) fn lane_install(
         ArchitectureEffect::Simd(slot) => unsafe {
             runqueue::simd_tls::restore_simd_state_lane(slot, to_id)
         },
+        // The lane already excludes interrupts and holds this CPU's index: the
+        // two per-CPU stack writes need neither a second mask nor a second
+        // index derivation.
+        ArchitectureEffect::PrivilegeStack(top) => {
+            crate::arch::gdt::set_privilege_stack_masked(cpu, top)
+        }
+        ArchitectureEffect::SyscallStack(top, register_ipc) => {
+            crate::user::syscall::set_kernel_stack_top_masked(cpu, top, register_ipc)
+        }
         other => hardware_effect(other),
     });
     #[cfg(test)]
-    let _ = to_id;
+    let _ = (cpu, to_id);
     // Native tests model the privileged effects, as `install_model` does.
     #[cfg(test)]
     lane_effects(previous, next, to_slot, |effect| LANE_EFFECTS.with(|log| log.borrow_mut().push(effect)));

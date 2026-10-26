@@ -304,6 +304,7 @@ pub use crate::hooks::{
     InterruptHooks, TaskHooks, UserFaultDisposition,
 };
 pub use boot::{call_with_stack, enter_higher_half, init_acpi, init_clocksource, init_gdt, init_idt};
+pub use kernel_lowlevel::interrupts::register_fast_ipc_resume_rip;
 pub use cpu::{current_rip, init_simd, simd_mode_name};
 pub use interrupts::{
     SAVED_CONTEXT_BYTES, SAVED_CONTEXT_XMM_OFFSET, disable_interrupts,

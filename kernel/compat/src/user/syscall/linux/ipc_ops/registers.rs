@@ -151,6 +151,9 @@ fn call(frame: &mut SyscallFrame, raw: u64, request: &[u8]) -> Result<u64, i64> 
         IPC_REGISTER_BYTES,
         SERVICE_IPC_TIMEOUT_MS,
         service,
+        // The call may block through the direct schedule: its continuation is
+        // this syscall frame plus a park record, see `complete_parked_register_ipc`.
+        Some(core::ptr::from_mut::<SyscallFrame>(frame)),
     )? {
         return write_register_result(frame, &response.bytes[..response.len], 0, 0, 0)
             .map(|len| len as u64);
@@ -166,6 +169,76 @@ fn call(frame: &mut SyscallFrame, raw: u64, request: &[u8]) -> Result<u64, i64> 
     let response =
         wait_for_service_reply_with_deadline_tick(reply, deadline, SERVICE_IPC_TIMEOUT_MS)?;
     write_register_result(frame, &response, 0, 0, 0).map(|len| len as u64)
+}
+
+/// Finish a register `CALL` or `REPLY_RECV` that blocked through the direct
+/// schedule. Entered from `fast_ipc_parked_tail` when the scheduler resumes the
+/// task at its syscall frame; every Rust frame the call had is gone, and `record`
+/// is what it left behind. Does what the in-place code would have done after
+/// waking, then the generic syscall epilogue for pending signals.
+pub(in crate::user::syscall) fn complete_parked_register_ipc(
+    frame: &mut SyscallFrame,
+    record: &crate::user::syscall::ParkRecord,
+) -> u64 {
+    use crate::user::syscall::park_kind;
+    let result = match record.kind {
+        park_kind::CALL => complete_parked_call(frame, record),
+        park_kind::RECV => complete_parked_recv(frame, record),
+        other => panic!("parked register IPC resumed with unknown record kind {other}"),
+    };
+    // `dispatch_linux_syscall` runs this after every syscall body.
+    if deliver_pending_signals_if_needed(frame) {
+        return frame.rax;
+    }
+    result
+}
+
+fn complete_parked_call(frame: &mut SyscallFrame, record: &crate::user::syscall::ParkRecord) -> u64 {
+    let task_id = multitask::current_task_id().expect("parked register call lost its task");
+    let reply = KernelReplyHandle::from_raw(record.reply);
+    disarm_reply_deadline_waiter(task_id);
+    note_fast_ipc(IpcFastCounter::HandoffCommitted);
+    fast_call_collect_response::<IPC_REGISTER_BYTES>(
+        reply,
+        task_id,
+        record.deadline_tick,
+        IPC_REGISTER_BYTES,
+        phase_mark(),
+    )
+    .and_then(|response| {
+        let response = response.expect("committed fast call wait produced no response");
+        write_register_result(frame, &response.bytes[..response.len], 0, 0, 0).map(|len| len as u64)
+    })
+    .unwrap_or_else(linux_errno)
+}
+
+fn complete_parked_recv(frame: &mut SyscallFrame, record: &crate::user::syscall::ParkRecord) -> u64 {
+    let task_id = multitask::current_task_id().expect("parked register receive lost its task");
+    let endpoint = KernelEndpointHandle::from_raw(record.endpoint);
+    // Woken by the handoff: the sender's request is already addressed to this
+    // task, so take it directly, as the in-place receive loop does first.
+    if let Ok(Some(received)) = kernel_ipc_runtime::api::endpoint::take_fast_request_inline::<
+        IPC_REGISTER_BYTES,
+    >(endpoint, task_id, IPC_REGISTER_BYTES)
+    {
+        note_fast_ipc(IpcFastCounter::ReceiverTaken);
+        return match (ReceiveDestination::Registers(frame)).write_fast(received) {
+            Ok(len) => len as u64,
+            Err(errno) => ipc_reply_recv::ipc_reply_recv_committed_error(errno),
+        };
+    }
+    // Anything else (a wake that carried no request) takes the full receive.
+    match recv_with_sender_blocking_prepared_inner::<IPC_REGISTER_BYTES>(
+        endpoint,
+        task_id,
+        IPC_REGISTER_BYTES,
+        None,
+        None,
+        ReceiveDestination::Registers(frame),
+    ) {
+        Ok((len, _)) => len as u64,
+        Err((errno, _)) => ipc_reply_recv::ipc_reply_recv_committed_error(errno),
+    }
 }
 
 fn receive(
@@ -292,6 +365,25 @@ fn reply_only(raw: u64, response: &[u8]) -> Result<u64, i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_blocks_describe_themselves_before_they_can_abandon_their_frames() {
+        let source = include_str!("../ipc_ops.rs");
+        let call = source
+            .find("park_register_call(frame, endpoint.raw(), reply.raw(), deadline_tick);")
+            .expect("call park record");
+        let commit = source
+            .find("multitask::commit_fast_ipc_call_handoff_direct(")
+            .expect("direct call commit");
+        assert!(call < commit, "the park record must exist before the call can commit");
+        let recv = source.find("park_register_recv(frame, endpoint.raw());").expect("receive park record");
+        let block = source.find("deferred.commit_block_and_yield_direct(").expect("direct receive commit");
+        assert!(recv < block, "the park record must exist before the receive can commit");
+        // Only register ABI operations may block directly: the buffer wrappers and
+        // the legacy handlers keep their in-place continuation.
+        assert_eq!(source.matches("commit_fast_ipc_call_handoff_direct(").count(), 1);
+        assert_eq!(source.matches("commit_block_and_yield_direct(").count(), 1);
+    }
 
     #[test]
     fn invalid_register_shape_rejects_before_identity_and_clears_outputs() {

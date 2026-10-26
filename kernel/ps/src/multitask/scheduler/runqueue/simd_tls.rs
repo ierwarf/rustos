@@ -139,6 +139,30 @@ pub unsafe fn begin_ipc_register_simd() -> IpcRegisterSimdGuard {
     })
 }
 
+/// Re-form the guard of a register-IPC syscall whose Rust frames were abandoned
+/// at a direct block: the marker `begin_ipc_register_simd` set stays set while
+/// the task is parked, so this only proves it and takes over the drop.
+///
+/// # Safety
+/// The caller is the parked task's own resume entry, on the CPU that task now
+/// runs on, and the syscall that set the marker has not yet returned to user.
+pub unsafe fn adopt_ipc_register_simd() -> IpcRegisterSimdGuard {
+    irq_excluded(|| {
+        let slot = crate::multitask::cpu_local::current_cpu_task_slot()
+            .expect("parked register IPC resume lacks current task");
+        let task_id = live_identity(slot, false);
+        SIMD_STATES[slot].with(|image| {
+            assert_eq!(image.task_id, Some(task_id), "foreign parked register IPC SIMD identity");
+            assert!(image.register_ipc, "parked register IPC lost its SIMD marker");
+        });
+        IpcRegisterSimdGuard {
+            slot,
+            task_id,
+            _not_send: core::marker::PhantomData,
+        }
+    })
+}
+
 fn irq_excluded<R>(f: impl FnOnce() -> R) -> R {
     #[cfg(not(test))]
     {

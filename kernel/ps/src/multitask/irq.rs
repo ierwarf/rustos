@@ -747,15 +747,6 @@ extern "C" fn software_schedule_interrupt_dispatch(
             software_frame.r8,
         ));
     let logical_index = current_cpu_index();
-    // The software interrupt is an explicit local scheduling request. Bind it
-    // to the current CPU lifecycle before opening its independent original turn,
-    // then attest consumption after the selected frame is ready.
-    let _ = super::reschedule_observation::publish_request(
-        logical_index,
-        cpu_lifecycle_generation(logical_index),
-    );
-    let reschedule_goal = super::reschedule_observation::claim_pending(logical_index)
-        .expect("software scheduling request lost before dispatch");
     let current_rsp = context_ptr as usize;
     // A call between two resident tasks on this CPU switches here, without a
     // dispatch turn. Declining changes nothing; `Generic` has already committed
@@ -802,6 +793,18 @@ extern "C" fn software_schedule_interrupt_dispatch(
             super::scheduler::ipc_lane::Outcome::Declined => {}
         }
     }
+    // The software interrupt is an explicit local scheduling request. Bind it
+    // to the current CPU lifecycle before opening its independent original turn,
+    // then attest consumption after the selected frame is ready. A lane switch
+    // returns above without ever opening a turn, so it neither needs nor
+    // consumes a request: publishing one there was two lock-prefixed
+    // operations that nothing observed.
+    let _ = super::reschedule_observation::publish_request(
+        logical_index,
+        cpu_lifecycle_generation(logical_index),
+    );
+    let reschedule_goal = super::reschedule_observation::claim_pending(logical_index)
+        .expect("software scheduling request lost before dispatch");
     let (next_rsp, user_dispatch, runtime_profile, fast_ipc_outcome) = {
         let mut entry = DispatchEntry::enter();
         entry.save_simd();
@@ -1099,6 +1102,66 @@ pub fn commit_block_current_task_with_fast_reply_and_yield(
     })
 }
 
+/// [`commit_block_current_task_with_fast_reply_and_yield`] for a register-IPC
+/// receiver that completes from its syscall frame alone: when the reply trap
+/// switches away this does not return; the task resumes at `resume_rip` with
+/// RSP = `frame` and its Rust frames are abandoned.
+///
+/// # Safety
+///
+/// `frame` is the live syscall frame at the top of the current kernel stack,
+/// `resume_rip` completes the receive from that frame and the park record, and
+/// no caller frame owns anything that must be dropped (the receive loop holds
+/// no guard at this point).
+pub unsafe fn commit_block_current_task_with_fast_reply_direct(
+    reply: u64,
+    completion: kernel_ipc_runtime::api::ReplyCompletion,
+    resume_rip: u64,
+    frame: u64,
+) -> Option<bool> {
+    let custody = completion
+        .scheduling_context
+        .expect("fast reply block transition lost scheduling-context custody");
+    assert_eq!(
+        custody.caller_task_id(),
+        completion.caller_task_id,
+        "fast reply block transition names different caller identities"
+    );
+    if nucleus_core::util::lockdep::preemption_depth() != 0 {
+        let preemption = nucleus_core::util::lockdep::preemption_snapshot();
+        panic!(
+            "task blocked with fast reply while raw spin lock held cpu={} apic={:#x} depth={} held_depth={} pending_depth={} class={:?}",
+            preemption.logical_cpu,
+            preemption.apic_id,
+            preemption.depth,
+            preemption.held_depth,
+            preemption.pending_depth,
+            preemption.top_class,
+        );
+    }
+    interrupts::without_interrupts(|| {
+        // SAFETY: as the trap form; the original masked CPU scope contains the
+        // backing loan, dropped before the direct schedule below.
+        let committed = unsafe { super::scheduler::commit_current_wait() };
+        if committed == Some(true) {
+            let identity = custody.identity();
+            let resume = crate::lowlevel::interrupts::DirectResume { rip: resume_rip, frame };
+            // SAFETY: the caller contract above.
+            unsafe {
+                crate::lowlevel::interrupts::trigger_fast_ipc_reply_schedule_direct(
+                    reply,
+                    completion.caller_task_id,
+                    custody.context_owner_task_id(),
+                    identity.slot(),
+                    identity.generation(),
+                    &resume,
+                );
+            }
+        }
+        committed
+    })
+}
+
 /// Fuse exact Current pager commit, fixed fault publication and worker handoff.
 /// Original masked Current loan survives the worker's LAST effect, but MUST
 /// drop before the trap can reschedule. Resume borrows the then-actual Current
@@ -1175,18 +1238,66 @@ pub fn commit_fast_ipc_call_handoff_and_yield(
             reply,
             receiver_task_id,
         );
-        match code {
-            0 => super::scheduler::FastIpcCallHandoffOutcome::CommittedSameCpu,
-            1 => super::scheduler::FastIpcCallHandoffOutcome::CommittedCrossCpu,
-            2 => super::scheduler::FastIpcCallHandoffOutcome::SenderMismatch,
-            3 => super::scheduler::FastIpcCallHandoffOutcome::ReceiverMismatch,
-            4 => super::scheduler::FastIpcCallHandoffOutcome::DonationUnavailable,
-            5 => super::scheduler::FastIpcCallHandoffOutcome::EligibilityUnavailable,
-            6 => super::scheduler::FastIpcCallHandoffOutcome::DirectCustodyUnavailable,
-            7 => super::scheduler::FastIpcCallHandoffOutcome::OrderingUnavailable,
-            other => panic!("fast IPC software trap returned invalid outcome {other}"),
-        }
+        decode_fast_ipc_call_outcome(code)
     })
+}
+
+/// [`commit_fast_ipc_call_handoff_and_yield`] for a register-IPC caller whose
+/// continuation is its syscall frame: a committed handoff does not return; the
+/// task resumes at `resume_rip` with RSP = `frame`. Every rejected result
+/// returns exactly as the trap form does.
+///
+/// # Safety
+///
+/// `frame` is the live syscall frame at the top of the current kernel stack,
+/// `resume_rip` completes the call from that frame and its park record, and no
+/// caller frame owns anything that must be dropped once the handoff commits.
+pub unsafe fn commit_fast_ipc_call_handoff_direct(
+    endpoint: u64,
+    reply: u64,
+    receiver_task_id: u64,
+    resume_rip: u64,
+    frame: u64,
+) -> super::scheduler::FastIpcCallHandoffOutcome {
+    if nucleus_core::util::lockdep::preemption_depth() != 0 {
+        let preemption = nucleus_core::util::lockdep::preemption_snapshot();
+        panic!(
+            "fast IPC committed while raw spin lock held cpu={} apic={:#x} depth={} held_depth={} pending_depth={} class={:?}",
+            preemption.logical_cpu,
+            preemption.apic_id,
+            preemption.depth,
+            preemption.held_depth,
+            preemption.pending_depth,
+            preemption.top_class,
+        );
+    }
+    interrupts::without_interrupts(|| {
+        let resume = crate::lowlevel::interrupts::DirectResume { rip: resume_rip, frame };
+        // SAFETY: the caller contract above.
+        let code = unsafe {
+            crate::lowlevel::interrupts::trigger_fast_ipc_call_schedule_direct(
+                endpoint,
+                reply,
+                receiver_task_id,
+                &resume,
+            )
+        };
+        decode_fast_ipc_call_outcome(code)
+    })
+}
+
+fn decode_fast_ipc_call_outcome(code: u64) -> super::scheduler::FastIpcCallHandoffOutcome {
+    match code {
+        0 => super::scheduler::FastIpcCallHandoffOutcome::CommittedSameCpu,
+        1 => super::scheduler::FastIpcCallHandoffOutcome::CommittedCrossCpu,
+        2 => super::scheduler::FastIpcCallHandoffOutcome::SenderMismatch,
+        3 => super::scheduler::FastIpcCallHandoffOutcome::ReceiverMismatch,
+        4 => super::scheduler::FastIpcCallHandoffOutcome::DonationUnavailable,
+        5 => super::scheduler::FastIpcCallHandoffOutcome::EligibilityUnavailable,
+        6 => super::scheduler::FastIpcCallHandoffOutcome::DirectCustodyUnavailable,
+        7 => super::scheduler::FastIpcCallHandoffOutcome::OrderingUnavailable,
+        other => panic!("fast IPC software trap returned invalid outcome {other}"),
+    }
 }
 
 #[cfg(test)]

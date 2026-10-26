@@ -401,6 +401,150 @@ global_asm!(
         SOFTWARE_TRAP 1f
     1:  ret
     .size fast_ipc_reply_schedule_trap, . - fast_ipc_reply_schedule_trap
+
+    // Shared tail of the direct fast-IPC schedule: `rax` names the incoming
+    // saved context, IRQs are masked. Same commit/restore sequence as the
+    // software-interrupt handler, minus the interrupt-frame save.
+    .global fast_ipc_dispatch_tail
+    .type fast_ipc_dispatch_tail, @function
+    fast_ipc_dispatch_tail:
+        endbr64
+        mov rsp, rax
+        COMMIT_CONTEXT_SWITCH
+
+        // A context that resumes a direct-blocked register-IPC syscall (its RIP
+        // is the registered entry) holds no register state: skip the GPR/XMM
+        // reload and the `iretq`. The entry runs IRQs masked on the frame, as
+        // the `iretq` would have left it.
+        mov rcx, qword ptr [rip + FAST_IPC_RESUME_RIP]
+        cmp qword ptr [rsp + 0x188], rcx
+        jne 21f
+        mov rsp, [rsp + 0x1a0]
+        jmp rcx
+21:
+        test byte ptr [rsp + 0x190], 0x3
+        jz 22f
+        mov rax, [rsp + 0x178]
+        mov rcx, [rsp + 0x180]
+        mov rdx, [rsp + 0x188]
+        mov rsi, [rsp + 0x190]
+        mov rdi, [rsp + 0x198]
+        mov [rsp + 0x178], rdx
+        mov [rsp + 0x180], rsi
+        mov [rsp + 0x188], rdi
+        mov [rsp + 0x190], rax
+        mov [rsp + 0x198], rcx
+        RESTORE_CONTEXT_AND_IRET 0x178
+22:
+        RESTORE_CONTEXT_AND_IRET 0x188
+    .size fast_ipc_dispatch_tail, . - fast_ipc_dispatch_tail
+
+    // Direct form of `fast_ipc_call_schedule_trap`: the register-IPC syscall
+    // body asks the lane to switch without `int`-style register saving. A
+    // minimal kernel SavedContext is built on the current stack ONLY to give
+    // the unchanged handler its argument words and to be published as this
+    // task's continuation; that continuation resumes at `resume` with
+    // RSP = `frame` (the syscall frame at the top of this kernel stack), so the
+    // Rust frames below it are abandoned by design. If the handler declines
+    // (returns the same context) this returns to the caller with the stamped
+    // outcome, exactly like the trap form.
+    //
+    // rdi = endpoint, rsi = reply, rdx = receiver task id,
+    // rcx = &DirectResume (resume_rip, frame).
+    .global fast_ipc_call_direct_schedule
+    .type fast_ipc_call_direct_schedule, @function
+    fast_ipc_call_direct_schedule:
+        endbr64
+        push rbp
+        mov rbp, rsp
+        push r12
+        push r13
+        mov r10, [rcx]
+        mov r11, [rcx + 8]
+        sub rsp, 0x1b0
+        and rsp, -16
+        mov r12, rsp
+        movabs rax, {fast_ipc_call_schedule_tag}
+        mov [r12 + 0x00], rax
+        mov [r12 + 0x18], rdx
+        mov [r12 + 0x20], rsi
+        mov [r12 + 0x28], rdi
+        mov qword ptr [r12 + 0x178], 1
+        mov qword ptr [r12 + 0x180], 0
+        mov [r12 + 0x188], r10
+        mov rax, cs
+        mov [r12 + 0x190], rax
+        mov qword ptr [r12 + 0x198], 2
+        mov [r12 + 0x1a0], r11
+        mov rax, ss
+        mov [r12 + 0x1a8], rax
+        cli
+        cld
+        mov rdi, r12
+        call software_schedule_interrupt_dispatch
+        cmp rax, r12
+        jne 23f
+        mov rsp, rax
+        COMMIT_CONTEXT_SWITCH
+        mov rax, [rsp + 0x00]
+        lea rsp, [rbp - 16]
+        pop r13
+        pop r12
+        pop rbp
+        ret
+23:
+        jmp fast_ipc_dispatch_tail
+    .size fast_ipc_call_direct_schedule, . - fast_ipc_call_direct_schedule
+
+    // Direct form of `fast_ipc_reply_schedule_trap`; see the call form.
+    // rdi = reply, rsi = caller task id, rdx = context owner task id,
+    // rcx = context slot, r8 = context generation,
+    // r9 = &DirectResume (resume_rip, frame).
+    .global fast_ipc_reply_direct_schedule
+    .type fast_ipc_reply_direct_schedule, @function
+    fast_ipc_reply_direct_schedule:
+        endbr64
+        push rbp
+        mov rbp, rsp
+        push r12
+        push r13
+        mov r10, [r9]
+        mov r11, [r9 + 8]
+        sub rsp, 0x1b0
+        and rsp, -16
+        mov r12, rsp
+        movabs rax, {fast_ipc_reply_schedule_tag}
+        mov [r12 + 0x00], rax
+        mov [r12 + 0x10], rcx
+        mov [r12 + 0x18], rdx
+        mov [r12 + 0x20], rsi
+        mov [r12 + 0x28], rdi
+        mov [r12 + 0x38], r8
+        mov qword ptr [r12 + 0x178], 1
+        mov qword ptr [r12 + 0x180], 0
+        mov [r12 + 0x188], r10
+        mov rax, cs
+        mov [r12 + 0x190], rax
+        mov qword ptr [r12 + 0x198], 2
+        mov [r12 + 0x1a0], r11
+        mov rax, ss
+        mov [r12 + 0x1a8], rax
+        cli
+        cld
+        mov rdi, r12
+        call software_schedule_interrupt_dispatch
+        cmp rax, r12
+        jne 24f
+        mov rsp, rax
+        COMMIT_CONTEXT_SWITCH
+        lea rsp, [rbp - 16]
+        pop r13
+        pop r12
+        pop rbp
+        ret
+24:
+        jmp fast_ipc_dispatch_tail
+    .size fast_ipc_reply_direct_schedule, . - fast_ipc_reply_direct_schedule
 "#,
     fast_ipc_call_schedule_tag = const kernel_lowlevel::interrupts::FAST_IPC_CALL_SCHEDULE_TAG,
     fast_ipc_reply_schedule_tag = const kernel_lowlevel::interrupts::FAST_IPC_REPLY_SCHEDULE_TAG,
@@ -426,9 +570,39 @@ mod tests {
         );
         assert_eq!(
             source.matches("\n        COMMIT_CONTEXT_SWITCH\n").count(),
-            5,
+            8,
             "every scheduling interrupt return must commit the stack transition"
         );
+    }
+
+    #[test]
+    fn direct_fast_ipc_schedule_builds_only_the_words_the_handler_and_the_resume_read() {
+        let source = include_str!("interrupt_stubs.rs");
+        for leaf in ["fast_ipc_call_direct_schedule", "fast_ipc_reply_direct_schedule"] {
+            let body = source
+                .split(alloc::format!("{leaf}:").as_str())
+                .nth(1)
+                .and_then(|rest| rest.split(alloc::format!(".size {leaf}").as_str()).next())
+                .expect("direct schedule leaf");
+            assert!(!body.contains("SAVE_CONTEXT"), "{leaf} must not save a full interrupt image");
+            assert!(body.contains("call software_schedule_interrupt_dispatch"));
+            // Kernel-origin marker words, the resume RIP and the frame as RSP.
+            assert!(body.contains("mov qword ptr [r12 + 0x178], 1"));
+            assert!(body.contains("mov qword ptr [r12 + 0x180], 0"));
+            assert!(body.contains("mov [r12 + 0x188], r10"));
+            assert!(body.contains("mov [r12 + 0x1a0], r11"));
+            // A declined handoff returns to the Rust caller on its own stack.
+            assert!(body.contains("pop rbp\n        ret"));
+            assert!(body.contains("jmp fast_ipc_dispatch_tail"));
+        }
+        let tail = source
+            .split("fast_ipc_dispatch_tail:")
+            .nth(1)
+            .and_then(|rest| rest.split(".size fast_ipc_dispatch_tail").next())
+            .expect("direct schedule tail");
+        let commit = tail.find("COMMIT_CONTEXT_SWITCH").expect("stack commit");
+        let shortcut = tail.find("FAST_IPC_RESUME_RIP").expect("resume shortcut");
+        assert!(commit < shortcut, "the outgoing stack is released before any shortcut");
     }
 
     #[test]

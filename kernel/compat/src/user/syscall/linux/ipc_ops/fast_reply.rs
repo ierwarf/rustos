@@ -40,6 +40,36 @@ impl DeferredFastReply {
     }
 }
 
+impl DeferredFastReply {
+    /// [`Self::commit_block_and_yield`] through the direct schedule: a committed
+    /// block does not return (the task resumes at `resume_rip` on `frame`).
+    ///
+    /// # Safety
+    /// See `multitask::commit_block_current_task_with_fast_reply_direct`.
+    pub(super) unsafe fn commit_block_and_yield_direct(
+        &mut self,
+        resume_rip: u64,
+        frame: u64,
+    ) -> Option<bool> {
+        let (reply, completion) = self
+            .pending
+            .take()
+            .expect("deferred fast reply consumed more than once");
+        // SAFETY: the caller contract above.
+        let committed = unsafe {
+            multitask::commit_block_current_task_with_fast_reply_direct(
+                reply, completion, resume_rip, frame,
+            )
+        };
+        if committed != Some(true)
+            && multitask::complete_fast_ipc_reply_wake_handoff_with_custody(reply, completion)
+        {
+            multitask::request_deferred_reschedule();
+        }
+        committed
+    }
+}
+
 impl Drop for DeferredFastReply {
     fn drop(&mut self) {
         self.settle_without_blocking();

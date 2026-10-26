@@ -191,6 +191,15 @@ impl Drop for Drain {
         DRAINING.store(false, Ordering::Release);
     }
 }
+/// [`local`] for a caller that already excludes interrupts on `cpu` and holds
+/// its index (the IPC lane): no second mask and no index derivation.
+pub(in crate::multitask::scheduler) fn local_masked<R>(
+    cpu: usize,
+    f: impl FnOnce(&mut Counters) -> R,
+) -> R {
+    CELLS[cpu].with(f)
+}
+
 pub(in crate::multitask::scheduler) fn local<R>(f: impl FnOnce(&mut Counters) -> R) -> R {
     #[cfg(not(test))]
     {

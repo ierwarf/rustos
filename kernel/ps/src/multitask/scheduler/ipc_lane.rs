@@ -381,7 +381,7 @@ fn finish(
     }
     assert!(publish_blocked(cpu, from.slot, rsp), "lane outgoing task lost Running custody");
     let next_arch = fresh(to.slot, loans.arch);
-    super::return_architecture::lane_install(from.arch, next_arch, to.slot, to.id);
+    super::return_architecture::lane_install(cpu, from.arch, next_arch, to.slot, to.id);
     note_installed(cpu, to.slot, next_arch);
     cpu_local::lane_publish(cpu, from.slot, to.slot);
     cpu_local::lane_install_placement(cpu, grant);
@@ -395,7 +395,7 @@ fn complete(cpu: usize, from: usize, from_id: u64, to: usize, to_id: u64, next_r
     dispatch_policy::record_completed_choice(
         cpu, !runqueue::is_idle_slot(to) && !local_dispatch::is_user_class(to), false);
     sync_handoff::record_dispatch(cpu, true, ticks);
-    runtime_profile::owner::local(|row| {
+    runtime_profile::owner::local_masked(cpu, |row| {
         row.dispatch(to);
         row.runtime_profile_task_switches = row.runtime_profile_task_switches.saturating_add(1);
         if new_root {
@@ -404,7 +404,7 @@ fn complete(cpu: usize, from: usize, from_id: u64, to: usize, to_id: u64, next_r
         }
     });
     if runtime_profile::owner::migration(to, to_id, cpu as u8) {
-        runtime_profile::owner::local(|row| {
+        runtime_profile::owner::local_masked(cpu, |row| {
             row.runtime_profile_cross_cpu_migrations =
                 row.runtime_profile_cross_cpu_migrations.saturating_add(1);
         });

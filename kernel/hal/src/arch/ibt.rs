@@ -150,6 +150,9 @@ mod tests {
                     "software_schedule_trap",
                     "fast_ipc_call_schedule_trap",
                     "fast_ipc_reply_schedule_trap",
+                    "fast_ipc_dispatch_tail",
+                    "fast_ipc_call_direct_schedule",
+                    "fast_ipc_reply_direct_schedule",
                 ][..],
             ),
             (

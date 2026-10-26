@@ -15,7 +15,7 @@
 //!   `process-address-space-lifecycle`, `syscall-simd-lifecycle`, and
 //!   `user-memory-access`.
 pub use crate::multitask::{
-    begin_ipc_register_simd, IpcRegisterSimdGuard,
+    adopt_ipc_register_simd, begin_ipc_register_simd, IpcRegisterSimdGuard,
     activate_suspended_user_task, activate_suspended_user_tasks,
     activate_suspended_user_tasks_with_commit, arm_block_current_task,
     arm_block_current_task_on_endpoint, arm_block_current_task_on_pager_fault,
@@ -23,8 +23,9 @@ pub use crate::multitask::{
     attach_reserved_ipc_priority, bind_reserved_ipc_priority, cancel_block_current_task,
     cancel_ipc_priority_reservation, cancel_pager_fault, cancel_process_spawn,
     claim_pager_fault_reply_from_pager, commit_block_current_task_and_yield,
-    commit_block_current_task_with_fast_reply_and_yield, commit_fast_ipc_call_handoff_and_yield,
-    commit_ipc_call_handoff, commit_pager_fault_block_and_yield,
+    commit_block_current_task_with_fast_reply_and_yield,
+    commit_block_current_task_with_fast_reply_direct, commit_fast_ipc_call_handoff_and_yield,
+    commit_fast_ipc_call_handoff_direct, commit_ipc_call_handoff, commit_pager_fault_block_and_yield,
     complete_fast_ipc_reply_wake_handoff_with_custody, complete_ipc_reply_wake_handoff,
     complete_ipc_reply_wake_handoff_with_custody, complete_pager_fault_wake_handoff,
     complete_retired_task_cleanup, consume_pager_fault_reply, current_linux_thread_state,

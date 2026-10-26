@@ -114,6 +114,31 @@ Policy stays in userspace services.
     `vfsd`, `procd` and `pagerd` use it - converting them to `reply_recv` is the
     effective fix).
 
+- P7 (2026-10-26) direct block of register IPC. A register `CALL` waiting for its
+  reply and a register `REPLY_RECV` waiting for its next request no longer keep a
+  kernel continuation: before the lane trap they write a **park record** (kind,
+  endpoint, reply, deadline) beside their syscall frame and enter the lane through
+  `fast_ipc_{call,reply}_direct_schedule`, which builds only the words the handler
+  reads in a minimal kernel `SavedContext` whose RIP is `fast_ipc_parked_resume`
+  and whose RSP is the syscall frame. A committed block never returns: the Rust
+  frames below the syscall frame are abandoned (the SIMD marker stays set; the
+  resume entry re-adopts it). When the scheduler (or the lane tail) enters the
+  resume stub, `fast_ipc_parked_tail` completes the operation from the record
+  (`complete_parked_register_ipc`: disarm the deadline waiter, take the response
+  or the addressed request, write the return registers, deliver a pending signal)
+  and leaves through the same `syscall_return` and epilogue as `syscall_dispatch`.
+  A wake that carried no response or request (signal, cancel, deadline) takes the
+  ordinary slow completion from the same record, so no wake path needs to know the
+  task has no continuation. A declined handoff returns to the caller exactly as
+  the trap form does. The lane tail enters a context whose RIP is the registered
+  resume entry directly on its frame (`FAST_IPC_RESUME_RIP`), skipping the 31
+  register reloads and the `iretq`. Plain `RECV`, buffer mode and the legacy
+  handlers keep their in-place continuation.
+  Same-session A/B, 1 vCPU `ipc_rt_intra_process_register_reply_recv` p50: trap form
+  7.75k -> direct block 7.65k -> with the resume shortcut 7.24k -> with the lane
+  trims (request publication after the lane, masked per-CPU stack/profile writes)
+  7.04k (p99 8.3k -> 7.5k).
+
 Measured (1 vCPU isolated `ipc_rt_intra_process_reply_recv`, p50 ticks):
 session start 41.9k -> DirectSwitch 31.9k -> lane call+reply 19.2k -> funding
 shuttle 17.9k -> lock-light CurrentWait pin 16.9k -> interval forwarding 15.1k ->

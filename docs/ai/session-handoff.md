@@ -471,6 +471,15 @@ Open, in priority order:
   `/proc`, blocking sockets. Design for the blocking path:
   `docs/ai/performance/blocking-io-design.md`.
 
+- 2026-10-26 IPC direct block (P7, `docs/ai/performance/ipc-lane.md`): register `CALL` and
+  `REPLY_RECV` block with a park record beside the syscall frame and no kernel Rust
+  continuation; the lane tail enters `fast_ipc_parked_resume` directly. 1 vCPU register
+  round trip p50 7.75k -> 7.04k. Measured breakdown (stamped, p50): lane call+reply 3.1k,
+  client reserve/arm 1.2k, resume tails 1.4k, server ops 0.7k, syscall boundary 1.5k.
+  Reaching ~3k needs the custody model changed (lazy pair custody, merged reservation and
+  funding); invariant-preserving trims top out near 6k. Tracer: temporary per-leg TSC
+  stamps are NOT in the tree; re-create them before profiling (`RTDIAG` markers).
+
 New files need `git add`: `kernel/ps/src/multitask/{child_wait,housekeeping_kick}.rs`,
 `docs/ai/performance/{core-paths-gaps,blocking-io-design}.md` (plus the earlier untracked
 bench files).

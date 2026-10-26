@@ -15,7 +15,7 @@
 //! - **Evidence:** `exception-retirement`, `scheduler-lifecycle`, and
 //!   `syscall-simd-lifecycle`.
 use core::mem;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use x86_64::instructions::interrupts;
 
@@ -121,7 +121,45 @@ unsafe extern "C" {
         context_generation: u64,
     );
     fn schedule_saved_user_context(context: *mut SavedContext) -> !;
+    fn fast_ipc_call_direct_schedule(
+        endpoint: u64,
+        reply: u64,
+        receiver_task_id: u64,
+        resume: *const DirectResume,
+    ) -> u64;
+    fn fast_ipc_reply_direct_schedule(
+        reply: u64,
+        caller_task_id: u64,
+        context_owner_task_id: u64,
+        context_slot: u64,
+        context_generation: u64,
+        resume: *const DirectResume,
+    );
 }
+
+/// Entry that completes a register-IPC syscall that blocked through the direct
+/// schedule (zero until registered). A saved context whose RIP is exactly this
+/// carries no register state worth restoring: `fast_ipc_dispatch_tail` enters it
+/// on the context's frame address without the GPR/XMM reload and `iretq`.
+#[unsafe(no_mangle)]
+pub static FAST_IPC_RESUME_RIP: AtomicU64 = AtomicU64::new(0);
+
+pub fn register_fast_ipc_resume_rip(rip: u64) {
+    // ORDERING: Release publishes the entry before any context naming it can
+    // exist; the tail reads it only to compare against a context's RIP.
+    FAST_IPC_RESUME_RIP.store(rip, Ordering::Release);
+}
+
+/// Where a task that blocks through the direct fast-IPC schedule resumes: the
+/// instruction to enter and the stack position (the syscall frame) to enter it
+/// on. The Rust frames between the frame and the blocking call are abandoned.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DirectResume {
+    pub rip: u64,
+    pub frame: u64,
+}
+const _: [(); 16] = [(); mem::size_of::<DirectResume>()];
 
 pub fn timer_interrupt_handler_addr() -> u64 {
     higher_half_addr(timer_interrupt_handler as *const () as usize as u64)
@@ -195,6 +233,54 @@ pub fn trigger_fast_ipc_call_schedule(endpoint: u64, reply: u64, receiver_task_i
     // discriminator in caller-saved registers before entering the installed
     // software scheduling vector, then returns the handler-stamped result.
     unsafe { fast_ipc_call_schedule_trap(endpoint, reply, receiver_task_id) }
+}
+
+/// [`trigger_fast_ipc_call_schedule`] without the software interrupt. When the
+/// call commits, this does not return: the task resumes at `resume.rip` on
+/// `resume.frame`. It returns only for a declined handoff, with the outcome
+/// word the handler stamped.
+///
+/// # Safety
+///
+/// IRQs are masked, `resume.frame` is the live syscall frame at the top of the
+/// current kernel stack, `resume.rip` is an entry that completes the blocked
+/// operation from that frame alone, and no Rust frame between the frame and
+/// this call owns anything that must be dropped.
+pub unsafe fn trigger_fast_ipc_call_schedule_direct(
+    endpoint: u64,
+    reply: u64,
+    receiver_task_id: u64,
+    resume: &DirectResume,
+) -> u64 {
+    // SAFETY: the caller contract above; the leaf builds the minimal context.
+    unsafe { fast_ipc_call_direct_schedule(endpoint, reply, receiver_task_id, resume) }
+}
+
+/// Direct form of [`trigger_fast_ipc_reply_schedule`]; same contract as
+/// [`trigger_fast_ipc_call_schedule_direct`].
+///
+/// # Safety
+///
+/// See [`trigger_fast_ipc_call_schedule_direct`].
+pub unsafe fn trigger_fast_ipc_reply_schedule_direct(
+    reply: u64,
+    caller_task_id: u64,
+    context_owner_task_id: u64,
+    context_slot: u64,
+    context_generation: u64,
+    resume: &DirectResume,
+) {
+    // SAFETY: the caller contract above.
+    unsafe {
+        fast_ipc_reply_direct_schedule(
+            reply,
+            caller_task_id,
+            context_owner_task_id,
+            context_slot,
+            context_generation,
+            resume,
+        )
+    }
 }
 
 /// Settle one reply's scheduling-context custody at the same software trap

@@ -36,6 +36,7 @@ mod ipc_fast_metrics;
 #[path = "ipc_reply_recv.rs"]
 mod ipc_reply_recv;
 mod registers;
+pub(in crate::user::syscall) use registers::complete_parked_register_ipc;
 use registers::ReceiveDestination;
 mod reply_wait;
 mod service_ownership;
@@ -1511,6 +1512,7 @@ fn try_fast_ipc_call(
             reply_capacity,
             timeout_ms,
             authorized_service_id,
+            None,
         )?
     else {
         return Ok(None);
@@ -1535,6 +1537,7 @@ fn try_fast_ipc_call_bytes<const N: usize>(
     reply_capacity: usize,
     timeout_ms: u64,
     authorized_service_id: Option<u64>,
+    direct_frame: Option<*mut SyscallFrame>,
 ) -> Result<Option<FastCallResponse<N>>, i64> {
     if request.len() > kernel_ipc_runtime::api::IPC_FAST_INLINE_BYTES
         || reply_capacity > N.min(kernel_ipc_runtime::api::IPC_FAST_INLINE_BYTES)
@@ -1600,11 +1603,26 @@ fn try_fast_ipc_call_bytes<const N: usize>(
         false
     } else {
         fast_mark = charge_phase(IpcCallPhase::FastArm, fast_mark);
-        let handoff = multitask::commit_fast_ipc_call_handoff_and_yield(
-            endpoint.raw(),
-            reply.raw(),
-            receiver_task_id,
-        );
+        let handoff = match direct_frame {
+            // SAFETY: `registers::call` owns no guard below its syscall frame at
+            // this point (the SIMD marker is re-adopted by the resume entry); the
+            // record is written first, and a committed handoff does not return.
+            Some(frame) => unsafe {
+                park_register_call(frame, endpoint.raw(), reply.raw(), deadline_tick);
+                multitask::commit_fast_ipc_call_handoff_direct(
+                    endpoint.raw(),
+                    reply.raw(),
+                    receiver_task_id,
+                    crate::user::syscall::fast_ipc_parked_resume_address(),
+                    crate::user::syscall::register_ipc_frame_address(&*frame),
+                )
+            },
+            None => multitask::commit_fast_ipc_call_handoff_and_yield(
+                endpoint.raw(),
+                reply.raw(),
+                receiver_task_id,
+            ),
+        };
         fast_mark = charge_phase(IpcCallPhase::FastHandoff, fast_mark);
         disarm_reply_deadline_waiter(task_id);
         let committed = matches!(
@@ -1632,6 +1650,20 @@ fn try_fast_ipc_call_bytes<const N: usize>(
         note_fast_ipc(IpcFastCounter::HandoffCommitted);
     }
 
+    fast_call_collect_response::<N>(reply, task_id, deadline_tick, reply_capacity, fast_mark)
+}
+
+/// The wait for a committed fast call's response: take it, or re-arm and block
+/// until it (or a terminal error, or the deadline) arrives. Shared by the call
+/// that blocked in place and by the resume entry of one that blocked through the
+/// direct schedule, so both finish through the same deadline and cancel rules.
+fn fast_call_collect_response<const N: usize>(
+    reply: KernelReplyHandle,
+    task_id: u64,
+    deadline_tick: u64,
+    reply_capacity: usize,
+    mut fast_mark: u64,
+) -> Result<Option<FastCallResponse<N>>, i64> {
     loop {
         let response =
             match kernel_ipc_runtime::api::endpoint::take_fast_response_inline::<N>(reply, task_id)
@@ -1718,6 +1750,48 @@ fn try_fast_ipc_call_bytes<const N: usize>(
             cancel_reply_wait(reply, task_id, ReplyCancelReason::InvalidCommit);
             return Err(LINUX_EINVAL);
         }
+    }
+}
+
+/// Describe a register `CALL` that is about to block through the direct schedule.
+///
+/// # Safety
+/// `frame` is the live syscall frame of the calling task's register-IPC syscall.
+unsafe fn park_register_call(
+    frame: *mut SyscallFrame,
+    endpoint: u64,
+    reply: u64,
+    deadline_tick: u64,
+) {
+    // SAFETY: the caller contract above.
+    unsafe {
+        crate::user::syscall::register_ipc_park_record(frame).write(
+            crate::user::syscall::ParkRecord {
+                kind: crate::user::syscall::park_kind::CALL,
+                endpoint,
+                reply,
+                deadline_tick,
+            },
+        );
+    }
+}
+
+/// Describe a register `REPLY_RECV` receive that is about to block through the
+/// direct schedule.
+///
+/// # Safety
+/// `frame` is the live syscall frame of the calling task's register-IPC syscall.
+unsafe fn park_register_recv(frame: *mut SyscallFrame, endpoint: u64) {
+    // SAFETY: the caller contract above.
+    unsafe {
+        crate::user::syscall::register_ipc_park_record(frame).write(
+            crate::user::syscall::ParkRecord {
+                kind: crate::user::syscall::park_kind::RECV,
+                endpoint,
+                reply: 0,
+                deadline_tick: 0,
+            },
+        );
     }
 }
 
@@ -2220,9 +2294,26 @@ fn recv_with_sender_blocking_prepared_inner<const N: usize>(
                         return Err((LINUX_EBUSY, yielded));
                     }
                 }
-                let committed = match deferred_fast_reply.as_mut() {
-                    Some(deferred) => deferred.commit_block_and_yield(),
-                    None => multitask::commit_block_current_task_and_yield(),
+                let committed = match (deferred_fast_reply.as_mut(), &destination) {
+                    // A register-IPC receiver blocks through the direct schedule:
+                    // its continuation is the syscall frame and the park record,
+                    // and the frames from here down are abandoned if it commits.
+                    (Some(deferred), ReceiveDestination::Registers(frame)) => {
+                        let frame = core::ptr::from_ref::<SyscallFrame>(frame).cast_mut();
+                        // SAFETY: `reply_receive` is the only producer of this
+                        // pairing; it holds no guard below the frame (the SIMD
+                        // marker is re-adopted by the resume entry) and the
+                        // deferred reply was taken out of `deferred` just above.
+                        unsafe {
+                            park_register_recv(frame, endpoint.raw());
+                            deferred.commit_block_and_yield_direct(
+                                crate::user::syscall::fast_ipc_parked_resume_address(),
+                                crate::user::syscall::register_ipc_frame_address(&*frame),
+                            )
+                        }
+                    }
+                    (Some(deferred), _) => deferred.commit_block_and_yield(),
+                    (None, _) => multitask::commit_block_current_task_and_yield(),
                 };
                 if deadline_tick.is_some() {
                     crate::arch::rtc::disarm_sleep_waiter(task_id);
@@ -2855,6 +2946,7 @@ pub(super) fn call_linux_syscall_fast_endpoint(
             response_capacity,
             SERVICE_IPC_TIMEOUT_MS,
             Some(linux_abi::IPC_SERVICE_LINUX_SYSCALLD),
+            None,
         )?
     {
         return Ok((response.len, response.bytes));

@@ -89,7 +89,7 @@ pub(in crate::multitask) mod outgoing_image;
 pub(in crate::multitask) mod dispatch_claim;
 mod task_weight;
 pub use runtime_profile::drain_scheduler_runtime_profile;
-pub use runqueue::simd_tls::{begin_ipc_register_simd, IpcRegisterSimdGuard};
+pub use runqueue::simd_tls::{adopt_ipc_register_simd, begin_ipc_register_simd, IpcRegisterSimdGuard};
 pub(in crate::multitask) use runtime_profile::{
     SchedulerEntryCause, publish_scheduler_runtime_profile,
 };

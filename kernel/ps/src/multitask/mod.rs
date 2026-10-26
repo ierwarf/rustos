@@ -109,7 +109,7 @@ pub use self::retirement::UserFaultDisposition;
 pub use self::scheduler::rsp_handoff::hardware_rsp_arrivals;
 pub use self::scheduler::smp::drain_fast_ipc_eligibility_rejections;
 pub use self::scheduler::{
-    begin_ipc_register_simd, IpcRegisterSimdGuard,
+    adopt_ipc_register_simd, begin_ipc_register_simd, IpcRegisterSimdGuard,
     drain_scheduler_runtime_profile, AffinityCommit, AffinityError, FastIpcCallHandoffOutcome,
     ProcessAffinitySnapshot,
 };
@@ -125,7 +125,8 @@ pub(crate) use self::irq::{
 };
 pub use self::irq::{
     commit_block_current_task_and_yield, commit_block_current_task_with_fast_reply_and_yield,
-    commit_fast_ipc_call_handoff_and_yield, commit_pager_fault_block_and_yield,
+    commit_block_current_task_with_fast_reply_direct, commit_fast_ipc_call_handoff_and_yield,
+    commit_fast_ipc_call_handoff_direct, commit_pager_fault_block_and_yield,
     rtc_interrupt_handler_addr, software_schedule_interrupt_handler_addr,
     timer_interrupt_handler_addr, yield_now,
 };

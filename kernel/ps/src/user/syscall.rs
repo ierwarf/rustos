@@ -184,6 +184,26 @@ pub fn set_kernel_stack_top(kernel_stack_top: u64, register_ipc: bool) {
     });
 }
 
+/// [`set_kernel_stack_top`] for a caller that already excludes interrupts on
+/// `logical_index`'s CPU and holds its index (the IPC lane switch).
+pub fn set_kernel_stack_top_masked(logical_index: usize, kernel_stack_top: u64, register_ipc: bool) {
+    debug_assert!(!interrupts::are_enabled());
+    assert_ne!(
+        kernel_stack_top, 0,
+        "syscall entry kernel stack top must be non-zero"
+    );
+    assert_eq!(
+        kernel_stack_top & 0xF,
+        0,
+        "syscall entry kernel stack top must be 16-byte aligned"
+    );
+    assert_cpu_local_live(logical_index);
+    let local_ptr = SYSCALL_CPU_LOCALS[logical_index].0.get();
+    // SAFETY: interrupts are excluded on this CPU and only the executing
+    // logical CPU can select and mutate its permanently assigned slot.
+    install_stack_and_abi(unsafe { &mut *local_ptr }, kernel_stack_top, register_ipc);
+}
+
 fn install_stack_and_abi(local: &mut SyscallCpuLocal, kernel_stack_top: u64, register_ipc: bool) {
     local.kernel_stack_top = kernel_stack_top;
     local.register_ipc_abi = u64::from(register_ipc);

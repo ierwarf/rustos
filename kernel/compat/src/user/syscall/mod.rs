@@ -129,6 +129,28 @@ const SYSCALL_ENTRY_STACK_BYTES: usize =
     (SYSCALL_SCHEDULE_CONTEXT_OFFSET + kernel_hal::api::SAVED_CONTEXT_BYTES + 15) & !15;
 const _: [(); 432] = [(); SYSCALL_ENTRY_STACK_BYTES];
 
+/// What a register-IPC syscall that blocked through the direct schedule needs to
+/// finish from its syscall frame alone. Written by the blocking code just before
+/// the direct commit, read once by [`fast_ipc_parked_tail`]; meaningless while
+/// `kind` is [`ParkKind::None`].
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(super) struct ParkRecord {
+    pub(super) kind: u64,
+    pub(super) endpoint: u64,
+    pub(super) reply: u64,
+    pub(super) deadline_tick: u64,
+}
+
+pub(super) mod park_kind {
+    pub(in crate::user::syscall) const NONE: u64 = 0;
+    /// A `REGISTER_CALL` waiting for its reply (`endpoint`, `reply`, `deadline_tick`).
+    pub(in crate::user::syscall) const CALL: u64 = 1;
+    /// A `REGISTER_REPLY_RECV` whose reply is published and that waits for the
+    /// next request on `endpoint`.
+    pub(in crate::user::syscall) const RECV: u64 = 2;
+}
+
 // Outside the normalized SavedContext suffix: never overwritten by HAL.
 #[repr(C)]
 struct RegisterIpcBoundary {
@@ -137,10 +159,12 @@ struct RegisterIpcBoundary {
     control_word: u16,
     // The trailing two bytes are C-layout padding, not an uninitialized Rust
     // integer field: the assembly initializes only the three values above.
+    park: ParkRecord,
 }
-const _: [(); 16] = [(); core::mem::size_of::<RegisterIpcBoundary>()];
+const _: [(); 48] = [(); core::mem::size_of::<RegisterIpcBoundary>()];
 const _: [(); 8] = [(); core::mem::offset_of!(RegisterIpcBoundary, mxcsr)];
 const _: [(); 12] = [(); core::mem::offset_of!(RegisterIpcBoundary, control_word)];
+const _: [(); 16] = [(); core::mem::offset_of!(RegisterIpcBoundary, park)];
 
 unsafe fn register_ipc_boundary(frame: *mut SyscallFrame) -> *mut RegisterIpcBoundary {
     unsafe { frame.cast::<u8>().add(SYSCALL_ENTRY_STACK_BYTES).cast() }
@@ -261,6 +285,10 @@ global_asm!(
         call syscall_dispatch
         cli
 
+    # A local label, not a symbol: the linked-image audit attributes x87/FP
+    # custody instructions to the symbol that contains them, and these belong to
+    # `syscall_entry`.
+    .Lsyscall_exit_epilogue:
         cmp qword ptr [rsp + {boundary_offset}], 0
         je 4f
         call {clear_ipc_registers}
@@ -306,16 +334,55 @@ global_asm!(
         swapgs
         sysretq
     .size syscall_entry, . - syscall_entry
+
+    # A register-IPC syscall that blocked through the direct fast-IPC schedule
+    # resumes here, entered by the scheduler's IRET with RSP = its syscall frame
+    # (the Rust frames below it were abandoned). Everything the blocked call
+    # still owed is described by the park record beside the frame.
+    .global fast_ipc_parked_resume
+    .type fast_ipc_parked_resume, @function
+    fast_ipc_parked_resume:
+        endbr64
+        cld
+        mov rdi, rsp
+        call {parked_tail}
+        cli
+        jmp .Lsyscall_exit_epilogue
+    .size fast_ipc_parked_resume, . - fast_ipc_parked_resume
  "#,
     frame_bytes = const core::mem::size_of::<SyscallFrame>(),
     stack_bytes = const SYSCALL_ENTRY_STACK_BYTES + core::mem::size_of::<RegisterIpcBoundary>(),
     boundary_offset = const SYSCALL_ENTRY_STACK_BYTES,
     register_abi_offset = const syscall_core::register_ipc_abi_offset(),
     clear_ipc_registers = sym kernel_hal::api::arch::simd::clear_ipc_registers,
+    parked_tail = sym fast_ipc_parked_tail,
 );
+
+unsafe extern "C" {
+    fn fast_ipc_parked_resume();
+}
+
+/// The resume entry for [`ParkRecord`]-described blocks.
+pub(super) fn fast_ipc_parked_resume_address() -> u64 {
+    paging::higher_half_addr(fast_ipc_parked_resume as *const () as usize as u64)
+}
+
+/// The syscall frame this task's current register-IPC syscall runs on.
+pub(super) fn register_ipc_frame_address(frame: &SyscallFrame) -> u64 {
+    core::ptr::from_ref(frame) as usize as u64
+}
+
+/// The park record beside `frame`.
+///
+/// # Safety
+/// `frame` is the live syscall frame of the calling task's register-IPC syscall.
+pub(super) unsafe fn register_ipc_park_record(frame: *mut SyscallFrame) -> *mut ParkRecord {
+    unsafe { core::ptr::addr_of_mut!((*register_ipc_boundary(frame)).park) }
+}
 
 pub fn init() {
     syscall_core::init_cpu_local();
+    kernel_hal::api::register_fast_ipc_resume_rip(fast_ipc_parked_resume_address());
     let entry_addr = paging::higher_half_addr(syscall_entry as *const () as usize as u64);
     let syscall_mask = RFlags::INTERRUPT_FLAG | RFlags::TRAP_FLAG | RFlags::DIRECTION_FLAG;
 
@@ -363,6 +430,23 @@ extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> u64 {
     let phase = syscall_profile::charge(syscall_profile::SyscallPhase::Trace, phase);
     let result = dispatch_syscall(frame, abi);
     let phase = syscall_profile::charge(syscall_profile::SyscallPhase::Dispatch, phase);
+    syscall_return(frame, register_ipc, simd_guard, result, phase)
+}
+
+/// Everything a syscall does after its body: claim a deferred reschedule, prove
+/// the user-return contract again, then either return to the assembly epilogue
+/// (SYSRET) or hand this same frame to the scheduler as a user context.
+///
+/// Shared by [`syscall_dispatch`] and [`fast_ipc_parked_tail`], so a register-IPC
+/// call that resumed from a direct block leaves through the identical sequence.
+#[inline(always)]
+fn syscall_return(
+    frame: &mut SyscallFrame,
+    register_ipc: bool,
+    simd_guard: Option<multitask::IpcRegisterSimdGuard>,
+    result: u64,
+    phase: u64,
+) -> u64 {
     let schedule_user_return = multitask::claim_interruptible_syscall_reschedule();
     let phase = syscall_profile::charge(syscall_profile::SyscallPhase::RescheduleDeferred, phase);
     // Validate after the final syscall mutation and before either SYSRET or
@@ -398,6 +482,27 @@ extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> u64 {
         }
     }
     result
+}
+
+/// Entered by `fast_ipc_parked_resume` when a register-IPC call that blocked
+/// through the direct fast-IPC schedule is scheduled again. Its Rust frames are
+/// gone; the syscall frame and park record are all it has, and the returning
+/// registers are its to fill.
+#[unsafe(no_mangle)]
+extern "C" fn fast_ipc_parked_tail(frame: *mut SyscallFrame) -> u64 {
+    // SAFETY: the resume stub passes the syscall frame it was entered on.
+    let frame = unsafe { &mut *frame };
+    let phase = syscall_profile::now();
+    // SAFETY: the frame is this task's live register-IPC syscall frame.
+    let record = unsafe { register_ipc_park_record(frame).read() };
+    // SAFETY: only the direct block parks here, and it sets the marker first.
+    let boundary_active = unsafe { (*register_ipc_boundary(frame)).active != 0 };
+    assert!(boundary_active, "parked register IPC resumed without its entry marker");
+    unsafe { register_ipc_park_record(frame).write(ParkRecord { kind: park_kind::NONE, ..record }) };
+    // SAFETY: this is the parked task's own resume entry (see the function doc).
+    let simd_guard = Some(unsafe { multitask::adopt_ipc_register_simd() });
+    let result = linux::ipc_ops::complete_parked_register_ipc(frame, &record);
+    syscall_return(frame, true, simd_guard, result, phase)
 }
 
 fn register_ipc_entry_expected(abi: UserAbi, operation: u64) -> bool {
@@ -734,6 +839,52 @@ mod tests {
                 .unwrap()
                 .contains("write_bytes(0, 256)")
         );
+    }
+
+    #[test]
+    fn direct_block_resume_leaves_through_the_one_syscall_epilogue() {
+        let source = include_str!("mod.rs");
+        let stub = source
+            .split("fast_ipc_parked_resume:")
+            .nth(1)
+            .and_then(|rest| rest.split(".size fast_ipc_parked_resume").next())
+            .expect("direct-block resume stub");
+        // Entered by IRET (or the lane tail's jump) on the syscall frame: it may
+        // only run the shared tail and then take the existing epilogue, never a
+        // second copy of the SYSRET sequence.
+        assert!(stub.contains("call {parked_tail}"));
+        assert!(stub.contains("jmp .Lsyscall_exit_epilogue"));
+        assert!(!stub.contains("sysretq") && !stub.contains("swapgs"));
+        let entry = source
+            .split("syscall_entry:")
+            .nth(1)
+            .and_then(|rest| rest.split(".size syscall_entry").next())
+            .expect("syscall entry stub");
+        let label = entry.find(".Lsyscall_exit_epilogue:").expect("epilogue label");
+        let boundary = entry
+            .find("cmp qword ptr [rsp + {boundary_offset}], 0")
+            .expect("register IPC exit gate");
+        assert!(entry.find("call syscall_dispatch").unwrap() < label);
+        assert!(label < boundary, "the label must precede the register-IPC exit gate");
+        // A label, not a symbol: the linked-image FPU audit attributes by symbol.
+        assert!(!entry.contains(".global syscall_exit_epilogue"));
+    }
+
+    #[test]
+    fn parked_tail_shares_the_syscall_return_and_readopts_the_simd_marker() {
+        let source = include_str!("mod.rs");
+        let tail = source
+            .split("extern \"C\" fn fast_ipc_parked_tail(")
+            .nth(1)
+            .and_then(|rest| rest.split("fn register_ipc_entry_expected").next())
+            .expect("parked tail");
+        let adopt = tail.find("adopt_ipc_register_simd()").expect("marker re-adoption");
+        let complete = tail.find("complete_parked_register_ipc(").expect("completion");
+        let leave = tail.find("syscall_return(frame, true, simd_guard").expect("shared return");
+        assert!(adopt < complete && complete < leave);
+        // The same function ends `syscall_dispatch`, so signals, reschedule
+        // claims and the user-return contract cannot diverge between the routes.
+        assert!(source.contains("    syscall_return(frame, register_ipc, simd_guard, result, phase)\n}"));
     }
 
     #[test]

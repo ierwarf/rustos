@@ -229,6 +229,13 @@ pub fn set_privilege_stack(stack_top: u64) {
     });
 }
 
+/// [`set_privilege_stack`] for a caller that already excludes interrupts on
+/// `logical_index`'s CPU and holds its index (the IPC lane switch).
+pub fn set_privilege_stack_masked(logical_index: usize, stack_top: u64) {
+    debug_assert!(!x86_64::instructions::interrupts::are_enabled());
+    set_privilege_stack_for_cpu(logical_index, stack_top);
+}
+
 fn set_privilege_stack_for_cpu(logical_index: usize, stack_top: u64) {
     if stack_top == 0 {
         panic!("GDT invariant: ring0 privilege stack top must be non-zero");
