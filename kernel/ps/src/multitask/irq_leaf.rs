@@ -27,6 +27,10 @@ impl Mask {
 }
 impl Drop for Mask {
     fn drop(&mut self) {
+        // Reading IF is a `pushf` (seventeen ticks in the guest) and every leaf
+        // release paid one: the field order above already guarantees the mask
+        // outlives the raw guard, so shipping images do not re-prove it.
+        #[cfg(any(not(rustos_boot_image), rustos_lock_phase_profile))]
         assert!(!enabled(), "IRQ leaf lost continuous local exclusion");
         if self.restore { enable(); }
     }

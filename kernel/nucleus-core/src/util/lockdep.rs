@@ -281,9 +281,7 @@ pub struct TrackedSpinGuard<'a, T: ?Sized, const CLASS: u8> {
     owner_cpu: usize,
     owner_apic_id: u32,
     #[cfg(rustos_boot_image)]
-    acquire_file: &'static str,
-    #[cfg(rustos_boot_image)]
-    acquire_line: u32,
+    acquire_site: Option<&'static Location<'static>>,
     #[cfg(rustos_boot_image)]
     acquire_preemption_depth: usize,
     /// Acquired through `lock_masked`: IRQs stay masked until release, so the
@@ -750,9 +748,7 @@ impl<T: ?Sized, const CLASS: u8> TrackedSpinLock<T, CLASS> {
             #[cfg(not(rustos_boot_image))]
             owner_apic_id: current_apic_id(),
             #[cfg(rustos_boot_image)]
-            acquire_file: acquire_site.file(),
-            #[cfg(rustos_boot_image)]
-            acquire_line: acquire_site.line(),
+            acquire_site: Some(acquire_site),
             // ORDERING: Acquire observes completed guard/pending transitions
             // before the depth this guard must match on release is recorded.
             #[cfg(rustos_boot_image)]
@@ -784,9 +780,7 @@ impl<T: ?Sized, const CLASS: u8> TrackedSpinLock<T, CLASS> {
                 owner_cpu: tracked_guard_owner_cpu(),
                 owner_apic_id: current_apic_id(),
                 #[cfg(rustos_boot_image)]
-                acquire_file: acquire_site.file(),
-                #[cfg(rustos_boot_image)]
-                acquire_line: acquire_site.line(),
+                acquire_site: Some(acquire_site),
                 #[cfg(rustos_boot_image)]
                 acquire_preemption_depth: preemption_depth(),
                 #[cfg(rustos_boot_image)]
@@ -865,8 +859,7 @@ impl<T: ?Sized, const CLASS: u8> TrackedSpinLock<T, CLASS> {
                         guard: Some(guard),
                         owner_cpu: tracked_guard_owner_cpu(),
                         owner_apic_id: current_apic_id(),
-                        acquire_file: acquire_site.file(),
-                        acquire_line: acquire_site.line(),
+                        acquire_site: Some(acquire_site),
                         acquire_preemption_depth: preemption_depth(),
                         #[cfg(rustos_boot_image)]
                         irqs_masked: false,

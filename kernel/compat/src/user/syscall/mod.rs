@@ -410,10 +410,16 @@ unsafe extern "C" {
 extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> u64 {
     let frame = unsafe { &mut *frame };
     let phase = syscall_profile::now();
-    let abi = validate_syscall_entry_or_terminate(frame);
     // The assembly gate, not mutable RAX (signals/results may replace it),
     // determines custody for the whole continuation, including signal IPC.
     let register_ipc = unsafe { (*register_ipc_boundary(frame)).active != 0 };
+    let abi = if register_ipc {
+        // The gate admits only a Linux task issuing a register IPC operation.
+        ensure_user_return_contract_or_terminate(frame);
+        UserAbi::Linux
+    } else {
+        validate_syscall_entry_or_terminate(frame)
+    };
     assert_eq!(
         register_ipc,
         register_ipc_entry_expected(abi, frame.rax),
@@ -428,7 +434,11 @@ extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> u64 {
     let phase = syscall_profile::charge(syscall_profile::SyscallPhase::Validate, phase);
     trace_syscall_entry(frame, abi);
     let phase = syscall_profile::charge(syscall_profile::SyscallPhase::Trace, phase);
-    let result = dispatch_syscall(frame, abi);
+    let result = if register_ipc {
+        linux::dispatch_register_ipc_syscall(frame)
+    } else {
+        dispatch_syscall(frame, abi)
+    };
     let phase = syscall_profile::charge(syscall_profile::SyscallPhase::Dispatch, phase);
     syscall_return(frame, register_ipc, simd_guard, result, phase)
 }
@@ -451,7 +461,12 @@ fn syscall_return(
     let phase = syscall_profile::charge(syscall_profile::SyscallPhase::RescheduleDeferred, phase);
     // Validate after the final syscall mutation and before either SYSRET or
     // publishing this same image as a scheduler-owned IRET context.
-    let return_abi = validate_syscall_entry_or_terminate(frame);
+    let return_abi = if register_ipc {
+        ensure_user_return_contract_or_terminate(frame);
+        UserAbi::Linux
+    } else {
+        validate_syscall_entry_or_terminate(frame)
+    };
     let phase = syscall_profile::charge(syscall_profile::SyscallPhase::Validate, phase);
     trace_syscall_exit(frame, return_abi, result);
     syscall_profile::charge(syscall_profile::SyscallPhase::Trace, phase);
@@ -538,7 +553,15 @@ pub(super) fn validate_syscall_entry_or_terminate(frame: &SyscallFrame) -> UserA
             frame.user_rip, frame.user_rsp, frame.user_rflags, frame.rax,
         );
     };
+    ensure_user_return_contract_or_terminate(frame);
+    abi
+}
 
+/// The SYSRET-safety half of [`validate_syscall_entry_or_terminate`]. A register
+/// IPC entry (admitted by the entry stub's per-CPU Linux-ABI gate) needs only
+/// this: the ABI lookup it skips is the gate's own answer, and costs a masked
+/// identity read on each of the three validations a syscall makes.
+fn ensure_user_return_contract_or_terminate(frame: &SyscallFrame) {
     if syscall_return_contract(frame).is_none() {
         let (process_id, thread_id) = multitask::current_user_log_ids().unwrap_or_default();
         debug::println!(
@@ -569,8 +592,6 @@ pub(super) fn validate_syscall_entry_or_terminate(frame: &SyscallFrame) -> UserA
         }
         multitask::halt_current_retired_task();
     }
-
-    abi
 }
 
 fn syscall_return_contract(frame: &SyscallFrame) -> Option<SysretReturnContract> {
@@ -755,7 +776,7 @@ mod tests {
             .find("multitask::claim_interruptible_syscall_reschedule();")
             .expect("interruptible scheduler claim");
         let validation = dispatch
-            .find("let return_abi = validate_syscall_entry_or_terminate(frame);")
+            .find("let return_abi =")
             .expect("final user-return validation");
         let publication = dispatch
             .find("kernel_hal::api::dispatch_saved_syscall_user_context(")

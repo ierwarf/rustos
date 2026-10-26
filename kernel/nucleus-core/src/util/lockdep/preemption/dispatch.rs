@@ -107,6 +107,9 @@ impl DispatchPreemption<'_> {
         #[cfg(rustos_boot_image)]
         {
             x86_64::instructions::interrupts::disable();
+            // Shipping images do not re-derive the CPU index: IRQs are masked and
+            // the owner was bound to this CPU by `enter` an instant earlier.
+            #[cfg(rustos_lock_phase_profile)]
             assert_eq!(
                 super::super::current_cpu_index(),
                 self.cpu,
@@ -135,11 +138,17 @@ impl Drop for DispatchPreemption<'_> {
     fn drop(&mut self) {
         #[cfg(rustos_boot_image)]
         {
+            // Both proofs are a `pushf` and a CPU-index derivation on every
+            // release; the continuity they check is structural (the owner is
+            // `!Send`, masks before protected work, and the cell is per CPU), so
+            // shipping images keep them for the phase-profile builds only.
+            #[cfg(rustos_lock_phase_profile)]
             assert!(
                 !self.masked || !x86_64::instructions::interrupts::are_enabled(),
                 "dispatch preemption lost continuous protected IRQ exclusion"
             );
             x86_64::instructions::interrupts::disable();
+            #[cfg(rustos_lock_phase_profile)]
             assert_eq!(
                 super::super::current_cpu_index(),
                 self.cpu,

@@ -128,6 +128,13 @@ pub(in crate::multitask) fn set_armed(slot: usize, armed: bool) {
 pub(in crate::multitask) fn reason(slot: usize) -> (u8, u64) {
     epoch::with(slot, |_| reason_locked(slot))
 }
+/// `reason` without the epoch leaf: a snapshot that may pair a kind with the
+/// previous wait's object while a writer is between its two publications. It is
+/// a pre-filter only (a torn pair compares unequal or is re-proved by the
+/// claim, which re-reads the reason under the epoch leaf before its CAS).
+pub(in crate::multitask) fn reason_snapshot(slot: usize) -> (u8, u64) {
+    reason_locked(slot)
+}
 fn reason_locked(slot: usize) -> (u8, u64) {
     let kind = owner(slot).wait_reason_kind;
     // ORDERING: Acquire, ordered after the packed load, observes the identity

@@ -217,7 +217,16 @@ pub(super) fn reserve_owned(loans: &super::donation_publication::Loans,
     reserve_locked(&mut ledger, basis.donor_id, basis.root_id, basis.root_slot,
         priority, Some(*basis))
 }
-
+/// `reserve_owned` for a donor funded by its own context: the basis is the
+/// unborrowed one by construction, so it is not captured in a separate leaf
+/// acquisition. A charge token published since the caller's lock-free check
+/// refuses here exactly as `current_basis_live` refuses a moved basis.
+pub(super) fn reserve_own(slot: usize, id: u64, priority: bool) -> bool {
+    let mut ledger = DONATION_LEDGER.lock();
+    if borrowed_context_charge_token(slot).is_some() { return false; }
+    let basis = FundingBasis { donor_slot: slot, donor_id: id, root_slot: slot, root_id: id, source: None };
+    reserve_locked(&mut ledger, id, id, slot, priority, Some(basis))
+}
 
 fn reserve_locked(
     ledger: &mut DonationLedger,

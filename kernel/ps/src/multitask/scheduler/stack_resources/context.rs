@@ -24,6 +24,19 @@ pub(in crate::multitask::scheduler) fn retained_scheduling_context(
     })
 }
 
+/// [`retained_scheduling_context`] for the task a masked CPU is executing, whose
+/// own Current bank retains it in place of a binding permit.
+pub(in crate::multitask::scheduler) fn retained_scheduling_context_for(
+    slot: usize, id: u64,
+) -> Option<kernel_object::api::identity::ObjectIdentity> {
+    RESOURCES.get(slot)?.with(|resources| {
+        if resources.start?.id != id { return None; }
+        let context = resources.context?;
+        if !context.scheduling_context.is_bound_to(id) { return None; }
+        Some(context.scheduling_context.identity())
+    })
+}
+
 /// Scalar reply custody ONLY: same actual resource binding/start/context leaf.
 /// No execution, funding, frame or MM loan escapes this comparison. Caller
 /// joins the original Identity51 publication before this Resources53 read.

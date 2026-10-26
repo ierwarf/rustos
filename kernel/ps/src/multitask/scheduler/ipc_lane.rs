@@ -89,7 +89,7 @@ fn settle(cpu: usize, slot: usize, id: u64, clock: &crate::arch::rtc::ClockSampl
         ConsumedInterval::AlreadySettled | ConsumedInterval::Absent => return None,
     };
     let elapsed = interval.elapsed_ns(clock.ticks, clock.local_nanos, ticks_to_ns);
-    runtime_profile::owner::local(|row| row.account(slot, elapsed));
+    runtime_profile::owner::lane_account(cpu, slot, elapsed);
     let mut carried = None;
     if let Some(pin) = interval.take_funding() {
         if elapsed == 0 {
@@ -164,7 +164,7 @@ pub(in crate::multitask) fn call(
         || !c_owner.wait_armed || c_owner.wait_reason_kind != REPLY
         || !stack_resources::cpu_leases::owns_current(cpu, c)
         || !identity_execution::banks::owns_current(cpu, c)
-        || runqueue::wait::reason(c) != (REPLY, reply)
+        || runqueue::wait::reason_snapshot(c) != (REPLY, reply)
     {
         return declined;
     }
@@ -176,7 +176,7 @@ pub(in crate::multitask) fn call(
     let generation = s_owner.generation;
     if s_owner.state != Blocked || s_owner.wait_armed || s_owner.wait_reason_kind != RECEIVE
         || resident::parked_cpu(s, generation) != Some(cpu)
-        || runqueue::wait::reason(s) != (RECEIVE, endpoint)
+        || runqueue::wait::reason_snapshot(s) != (RECEIVE, endpoint)
         || !ipc_publication::direct_switch_admitted(cpu)
         || donation_ledger::class_publication_sequence() & 1 != 0
     {
@@ -261,7 +261,7 @@ pub(in crate::multitask) fn reply(
     let generation = c_owner.generation;
     if c_owner.state != Blocked || c_owner.wait_armed || c_owner.wait_reason_kind != REPLY
         || resident::parked_cpu(c, generation) != Some(cpu)
-        || runqueue::wait::reason(c) != (REPLY, reply)
+        || runqueue::wait::reason_snapshot(c) != (REPLY, reply)
         || !ipc_publication::recent_sleeper(runqueue::wait::blocked_since_ticks(c),
             clock.ticks, crate::arch::rtc::ticks_per_second())
         || !ipc_publication::direct_switch_admitted(cpu)
@@ -373,7 +373,7 @@ fn finish(
     if forward {
         let hop = super::execution_interval::forward(
             cpu, (from.slot, from.id), (to.slot, to.id, running.generation), label.map_or(0, |(_, reply)| reply), clock);
-        runtime_profile::owner::local(|row| row.account(from.slot, hop));
+        runtime_profile::owner::lane_account(cpu, from.slot, hop);
         runqueue::add_vruntime(
             from.slot,
             super::task_weight::weighted_vruntime_delta(
@@ -398,20 +398,10 @@ fn complete(cpu: usize, from: usize, from_id: u64, to: usize, to_id: u64, next_r
     dispatch_policy::record_completed_choice(
         cpu, !runqueue::is_idle_slot(to) && !local_dispatch::is_user_class(to), false);
     sync_handoff::record_dispatch(cpu, true, ticks);
-    runtime_profile::owner::local_masked(cpu, |row| {
-        row.dispatch(to);
-        row.runtime_profile_task_switches = row.runtime_profile_task_switches.saturating_add(1);
-        if new_root {
-            row.runtime_profile_address_space_switches =
-                row.runtime_profile_address_space_switches.saturating_add(1);
-        }
-    });
-    if runtime_profile::owner::migration(to, to_id, cpu as u8) {
-        runtime_profile::owner::local_masked(cpu, |row| {
-            row.runtime_profile_cross_cpu_migrations =
-                row.runtime_profile_cross_cpu_migrations.saturating_add(1);
-        });
-    }
+    // Both ends of a lane switch last ran on this CPU (the receiver parked in
+    // this CPU's resident cell), so no migration can be observed here and the
+    // per-slot history word keeps the value its last generic dispatch wrote.
+    runtime_profile::owner::lane_dispatch(cpu, to, new_root);
     runqueue::affinity_payload::record_last_cpu(to, cpu as u8);
     cpu_local::set_scheduler_current_task_scratch_for_cpu(cpu, to);
     nucleus_core::util::lockdep::record_scheduler_dispatch(

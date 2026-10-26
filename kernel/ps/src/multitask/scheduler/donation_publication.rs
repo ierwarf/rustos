@@ -70,9 +70,12 @@ pub(super) fn participant(id: u64) -> Option<identity::execution::BindingPin> {
         .or_else(|| (0..MAX_TASK).find_map(inspect))
 }
 fn participant_system_class(pin: &identity::execution::BindingPin) -> bool {
-    !runqueue::is_idle_slot(pin.slot())
-        && (runqueue::weight::value(pin.slot()) & SYSTEM_CLASS_WEIGHT_FLAG != 0
-            || donation_ledger::inherited_system(pin.slot()))
+    slot_system_class(pin.slot())
+}
+fn slot_system_class(slot: usize) -> bool {
+    !runqueue::is_idle_slot(slot)
+        && (runqueue::weight::value(slot) & SYSTEM_CLASS_WEIGHT_FLAG != 0
+            || donation_ledger::inherited_system(slot))
 }
 pub(super) struct ReceiveLoans<'a> {
     pub(super) donor: &'a Loans,
@@ -110,7 +113,38 @@ pub(in crate::multitask) fn reserve_call_with(
         scheduling_context_owner_task_id: Some(loans.basis.root().1),
     }
 }
+/// Admission for the task `cpu` is executing when its funding is its own
+/// scheduling context: one ledger acquisition, with no dispatch-preemption unit,
+/// donor permit or separate basis read. The caller has masked local IRQs, and the
+/// Current bank is the proof the permit would only repeat (the slot cannot retire
+/// or be reused while it executes on this masked CPU, the argument
+/// `bind_lane_current` already relies on). `None` hands a borrowed basis or any
+/// other shape to the full capture, which decides exactly as before.
+#[cfg(rustos_boot_image)]
+fn reserve_call_current(cpu: usize, id: u64) -> Option<IpcCallAdmission> {
+    let slot = task_directory::hint(id)?;
+    if !stack_resources::cpu_leases::owns_current(cpu, slot)
+        || !identity::execution::qualified(slot, id)
+        || donation_ledger::borrowed_context_charge_token(slot).is_some()
+    {
+        return None;
+    }
+    let context = stack_resources::context::retained_scheduling_context_for(slot, id)?;
+    let system_class = slot_system_class(slot);
+    Some(IpcCallAdmission {
+        system_class,
+        donation_reserved: donation_ledger::reserve_own(slot, id, system_class),
+        scheduling_context: Some(context),
+        scheduling_context_owner_task_id: Some(id),
+    })
+}
 pub(in crate::multitask) fn reserve_call(id: u64) -> IpcCallAdmission {
+    #[cfg(rustos_boot_image)]
+    if let Some(admission) = x86_64::instructions::interrupts::without_interrupts(|| {
+        reserve_call_current(nucleus_core::util::lockdep::current_cpu_index(), id)
+    }) {
+        return admission;
+    }
     let mut scope = DispatchPreemption::enter();
     scope.mask_irqs();
     reserve_call_with(&scope, id)

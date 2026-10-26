@@ -39,6 +39,10 @@ static SCHEDULER_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static CURRENT_TASK_SLOTS: [CpuSlot; MAX_TRACKED_CPUS] = [const { slot_word(0) }; MAX_TRACKED_CPUS];
 static CURRENT_TASK_ACTIVE: [CpuFlag; MAX_TRACKED_CPUS] = [const { flag_word(false) }; MAX_TRACKED_CPUS];
 static CURRENT_TASK_IDLE: [CpuFlag; MAX_TRACKED_CPUS] = [const { flag_word(false) }; MAX_TRACKED_CPUS];
+/// One past the highest CPU ever admitted as a Current publisher. Execution-owner
+/// scans cover only `0..bound`: a CPU at or above it has never published a task,
+/// so it cannot own one. Raised (Release) before the CPU's first admission store.
+static ADMITTED_CPU_BOUND: AtomicUsize = AtomicUsize::new(0);
 // This is private working state for one CPU's dispatch turn.  Unlike
 // `CURRENT_TASK_SLOTS`, it is never remote lifetime or execution authority:
 // remote readers use the release-published current/transition pair below.
@@ -242,6 +246,8 @@ pub(super) fn publish_cpu_current_task(image: &super::scheduler::bootstrap::Init
     // initial publications are private idle tasks; BSP slot zero is still
     // bootstrap work here and becomes Idle only after `mark_root_idle`.
     CURRENT_TASK_IDLE[logical_index].store(logical_index != 0, Ordering::Release);
+    // ORDERING: Release; the bound precedes the admission it covers.
+    ADMITTED_CPU_BOUND.fetch_max(logical_index + 1, Ordering::Release);
     // ORDERING: Release publishes ownership only after the exact task slot.
     CURRENT_TASK_ACTIVE[logical_index].store(true, Ordering::Release);
 }
@@ -494,11 +500,13 @@ pub(super) enum TaskExecutionOwner {
 }
 
 pub(super) fn task_execution_owner(slot: usize) -> Option<TaskExecutionOwner> {
+    // ORDERING: Acquire pairs with the bound raise that precedes an admission.
+    let bound = ADMITTED_CPU_BOUND.load(Ordering::Acquire).min(MAX_TRACKED_CPUS);
     task_execution_owner_in(
-        &CURRENT_TASK_SLOTS,
-        &CURRENT_TASK_ACTIVE,
-        &TRANSITION_FROM_SLOTS,
-        &TRANSITION_ACTIVE,
+        &CURRENT_TASK_SLOTS[..bound],
+        &CURRENT_TASK_ACTIVE[..bound],
+        &TRANSITION_FROM_SLOTS[..bound],
+        &TRANSITION_ACTIVE[..bound],
         slot,
     )
 }
@@ -648,6 +656,21 @@ mod tests {
         check(&TRANSITION_FROM_SLOTS);
         check(&TRANSITION_ACTIVE);
         check(&LANE_ACK_FROM);
+    }
+
+    #[test]
+    fn execution_owner_scan_is_bounded_by_admission_yet_finds_every_admitted_cpu() {
+        let _lock = test_publication_lock();
+        // Admit a high-numbered CPU first: the scan bound must cover it, and a task it
+        // runs must still be found exactly as a full scan would find it.
+        let high = nucleus_core::util::lockdep::MAX_TRACKED_CPUS - 1;
+        let restore = install_test_current_owner(high, 21);
+        // ORDERING: Acquire pairs with the Release bound raise made by the install.
+        assert!(super::ADMITTED_CPU_BOUND.load(Ordering::Acquire) > high);
+        assert_eq!(task_execution_owner(21), Some(TaskExecutionOwner::Current(high)));
+        assert_eq!(task_execution_owner(22), None);
+        drop(restore);
+        assert_eq!(task_execution_owner(21), None);
     }
 
     #[test]

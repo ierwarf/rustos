@@ -212,6 +212,108 @@ pub(in crate::multitask::scheduler) fn local<R>(f: impl FnOnce(&mut Counters) ->
         CELLS[lockdep::current_cpu_index()].with(f)
     }
 }
+/// Accounting the IPC lane would otherwise push through the CPU's diagnostic
+/// leaf at every switch (a mask plus a tracked lock pair for each of the
+/// dispatch, runtime and switch rows). It collects the same rows in this CPU's
+/// private cell and folds them into the leaf once per [`LANE_FLUSH_EVERY`] lane
+/// switches, so a report lags by at most that many lane switches per CPU and
+/// loses nothing (an entry evicted from the small table is folded at once).
+const LANE_ENTRIES: usize = 4;
+const LANE_FLUSH_EVERY: u32 = 64;
+#[derive(Clone, Copy)]
+struct LaneEntry {
+    slot: usize,
+    dispatches: u64,
+    ns: u64,
+}
+struct LanePending {
+    entries: [LaneEntry; LANE_ENTRIES],
+    used: usize,
+    switches: u64,
+    address_space: u64,
+    since_flush: u32,
+}
+impl LanePending {
+    const fn new() -> Self {
+        Self {
+            entries: [LaneEntry { slot: 0, dispatches: 0, ns: 0 }; LANE_ENTRIES],
+            used: 0,
+            switches: 0,
+            address_space: 0,
+            since_flush: 0,
+        }
+    }
+}
+struct LaneCell(core::cell::UnsafeCell<LanePending>);
+// SAFETY: element `cpu` is accessed only by `cpu` with its IRQs masked (the lane
+// trap and the boot reset before any other CPU publishes).
+unsafe impl Sync for LaneCell {}
+static LANE: [nucleus_core::util::cache_padded::CachePadded<LaneCell>; CPUS] = [const {
+    nucleus_core::util::cache_padded::CachePadded::new(LaneCell(core::cell::UnsafeCell::new(
+        LanePending::new(),
+    )))
+}; CPUS];
+
+fn lane_pending(cpu: usize) -> &'static mut LanePending {
+    // SAFETY: see `LaneCell`; the lane never nests two accesses to one element.
+    unsafe { &mut *LANE[cpu].0.get() }
+}
+fn lane_fold(cpu: usize, pending: &mut LanePending) {
+    let entries = pending.entries;
+    let used = pending.used;
+    let (switches, address_space) = (pending.switches, pending.address_space);
+    *pending = LanePending::new();
+    CELLS[cpu].with(|row| {
+        for entry in &entries[..used] {
+            row.runtime_profile_dispatches[entry.slot] =
+                row.runtime_profile_dispatches[entry.slot].saturating_add(entry.dispatches);
+            row.account(entry.slot, entry.ns);
+        }
+        row.runtime_profile_task_switches =
+            row.runtime_profile_task_switches.saturating_add(switches);
+        row.runtime_profile_address_space_switches =
+            row.runtime_profile_address_space_switches.saturating_add(address_space);
+    });
+}
+fn lane_entry(cpu: usize, slot: usize) -> &'static mut LaneEntry {
+    let pending = lane_pending(cpu);
+    if let Some(index) = pending.entries[..pending.used].iter().position(|e| e.slot == slot) {
+        return &mut pending.entries[index];
+    }
+    if pending.used == LANE_ENTRIES {
+        lane_fold(cpu, pending);
+    }
+    let index = pending.used;
+    pending.used += 1;
+    pending.entries[index] = LaneEntry { slot, dispatches: 0, ns: 0 };
+    &mut pending.entries[index]
+}
+/// Charge `ns` of runtime to `slot` for an IPC lane switch on `cpu` (IRQs masked).
+pub(in crate::multitask::scheduler) fn lane_account(cpu: usize, slot: usize, ns: u64) {
+    let entry = lane_entry(cpu, slot);
+    entry.ns = entry.ns.saturating_add(ns);
+}
+/// Record one IPC lane dispatch of `slot` on `cpu` (IRQs masked).
+pub(in crate::multitask::scheduler) fn lane_dispatch(cpu: usize, slot: usize, new_root: bool) {
+    let entry = lane_entry(cpu, slot);
+    entry.dispatches = entry.dispatches.saturating_add(1);
+    let pending = lane_pending(cpu);
+    pending.switches = pending.switches.saturating_add(1);
+    pending.address_space = pending.address_space.saturating_add(u64::from(new_root));
+    pending.since_flush += 1;
+    if pending.since_flush >= LANE_FLUSH_EVERY {
+        lane_fold(cpu, pending);
+    }
+}
+/// Fold `cpu`'s batched lane rows into its diagnostic leaf now (IRQs masked on
+/// `cpu`, or `cpu` quiescent).
+pub(in crate::multitask::scheduler) fn lane_flush(cpu: usize) {
+    let pending = lane_pending(cpu);
+    if pending.used != 0 || pending.switches != 0 {
+        lane_fold(cpu, pending);
+    }
+}
+
 struct History {
     id: Option<u64>,
     cpu: u8,
@@ -287,6 +389,9 @@ pub(in crate::multitask::scheduler) fn reset_before_boot() {
     STARTED.store(0, Ordering::Release);
     for cell in &CELLS {
         cell.with(|row| *row = Counters::new());
+    }
+    for cpu in 0..CPUS {
+        *lane_pending(cpu) = LanePending::new();
     }
     for slot in 0..MAX_TASK {
         clear_history(slot);

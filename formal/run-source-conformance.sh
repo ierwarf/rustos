@@ -64,7 +64,7 @@ tail_reschedule_line="$(
         <<<"$syscall_dispatch_body" | cut -d: -f1
 )"
 return_validation_line="$(
-    grep -n -m1 'let return_abi = validate_syscall_entry_or_terminate(frame);' \
+    grep -n -m1 'let return_abi = if register_ipc {' \
         <<<"$syscall_dispatch_body" | cut -d: -f1
 )"
 context_publication_line="$(

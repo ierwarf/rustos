@@ -6,6 +6,18 @@ owners, and fresh validation. Root `AGENTS.md` is the only stable prompt
 prefix. This page does not authorize reusing stale evidence, speculative
 changes, or old uncommitted-work claims.
 
+## IPC P3 stage 1 (2026-10-26)
+
+After P2 (`dc1bbcc4`): O(NCPU) owner-scan bound, lane diagnostic batching, shipping-image
+IF re-proof removal in `IrqLeaf`/`DispatchPreemption`, lock-free lane wait-payload
+pre-filters, in-place slab retire, own-context call admission. 1 vCPU register round trip
+p50 7.38k -> ~6.1k (same-session A/B, anchor 3.5-3.7k). Evidence, method (guest `perf
+record`, ablation) and what did not move p50: `docs/ai/performance/ipc-lane.md` ("P3
+stage 1"). Stages 2/3 as planned are worth little on the current object model; the
+rendezvous mechanism and its TLA+ draft (1300 states, 8/8 mutants killed) are in
+`docs/ai/performance/ipc-rendezvous.md`, awaiting the owner's decision (L1 ~5.3k, 3k needs
+the L2 paired-custody model).
+
 ## IPC P2 closure (2026-10-26)
 
 P2 (IPC-specific entry and direct `sysretq` switch) is complete: P7 direct park/resume

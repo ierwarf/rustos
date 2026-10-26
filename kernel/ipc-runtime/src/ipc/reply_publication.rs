@@ -31,6 +31,18 @@ pub(super) fn insert_reply_object(reply_object: ReplyObject) -> Result<u64, Repl
     Ok(reply_id)
 }
 
+/// Publishes a fast-call reply object (message id 0) built inside its slot, so
+/// the ~600-byte frame is written once. `None` means the pool is full.
+pub(super) fn insert_fast_reply_object(
+    caller_task_id: u64, build: impl FnOnce() -> ReplyObject,
+) -> Option<u64> {
+    let reply_id = REPLIES.insert_with_hint_built(caller_task_id, build)?;
+    if let Some(index) = slab::slot_index::<MAX_REPLY_OBJECTS>(reply_id) {
+        REPLY_MESSAGE_IDS[index].store(0, Ordering::Release);
+    }
+    Some(reply_id)
+}
+
 #[inline]
 pub(super) fn published_reply_message_id(reply_id: u64) -> Option<u64> {
     let index = slab::slot_index::<MAX_REPLY_OBJECTS>(reply_id)?;

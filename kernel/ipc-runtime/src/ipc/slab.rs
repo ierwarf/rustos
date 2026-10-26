@@ -124,6 +124,32 @@ impl<T, const N: usize, const CLASS: u8> GenerationalSlab<T, N, CLASS> {
         Err(value.expect("hinted slab insertion lost its unpublished value"))
     }
 
+    /// [`insert_with_hint`](Self::insert_with_hint) that builds the value inside
+    /// the claimed slot, so a large value is written once instead of being moved
+    /// through every caller frame. `build` runs under the slot lock and must be
+    /// bounded; a full pool never calls it.
+    #[track_caller]
+    pub fn insert_with_hint_built(&self, hint: u64, build: impl FnOnce() -> T) -> Option<u64> {
+        assert!(N != 0 && N < INDEX_MASK as usize);
+        let start = (hint % N as u64) as usize;
+        let mut build = Some(build);
+        for offset in 0..N {
+            let index = (start + offset) % N;
+            let inserted = self.with_slot(index, |slot| {
+                if slot.value.is_some() || slot.generation == 0 {
+                    return None;
+                }
+                let handle = slot.handle(index);
+                slot.value = Some((build.take()?)());
+                Some(handle)
+            });
+            if inserted.is_some() {
+                return inserted;
+            }
+        }
+        None
+    }
+
     #[track_caller]
     pub fn with<R>(&self, handle: u64, f: impl FnOnce(&T) -> R) -> Option<R> {
         let (index, generation) = decode_handle::<N>(handle)?;
@@ -158,6 +184,9 @@ impl<T, const N: usize, const CLASS: u8> GenerationalSlab<T, N, CLASS> {
     /// window between the two acquisitions, so a decision and the retirement it
     /// authorizes can no longer be split by another CPU.
     ///
+    /// A value with no destructor has nothing to run after the guard, so it is
+    /// retired in place and `None` comes back instead of a moved-out copy.
+    ///
     /// `f` must not re-enter this slab: it runs while the slot lock is held.
     #[track_caller]
     pub fn with_mut_take<R>(
@@ -175,7 +204,14 @@ impl<T, const N: usize, const CLASS: u8> GenerationalSlab<T, N, CLASS> {
             if !retire {
                 return Some((result, None));
             }
-            let retired = slot.value.take();
+            // A value with no destructor has nothing to run after the guard, so
+            // it is retired in place instead of being moved out to be dropped.
+            let retired = if core::mem::needs_drop::<T>() {
+                slot.value.take()
+            } else {
+                slot.value = None;
+                None
+            };
             slot.retire_generation();
             Some((result, retired))
         })
@@ -321,6 +357,29 @@ mod tests {
         let slab = GenerationalSlab::<u64, 1, TEST_CLASS>::new();
         let _ = slab.insert(1).expect("first insert");
         assert_eq!(slab.insert(2), Err(2));
+    }
+
+    #[test]
+    fn retiring_in_place_returns_a_destructor_bearing_value_but_not_a_plain_one() {
+        let plain = GenerationalSlab::<u64, 2, TEST_CLASS>::new();
+        let handle = plain.insert_with_hint(7, 0).unwrap();
+        let (seen, retired) = plain.with_mut_take(handle, |value| (*value, true)).unwrap();
+        assert_eq!((seen, retired), (7, None));
+        assert_eq!(plain.with(handle, |value| *value), None, "the slot is retired either way");
+
+        let counted = GenerationalSlab::<std::rc::Rc<()>, 2, TEST_CLASS>::new();
+        let marker = std::rc::Rc::new(());
+        let handle = counted.insert_with_hint(std::rc::Rc::clone(&marker), 0).unwrap();
+        let ((), retired) = counted.with_mut_take(handle, |_| ((), true)).unwrap();
+        assert!(retired.is_some(), "a value with a destructor is handed back to run after the guard");
+        assert_eq!(std::rc::Rc::strong_count(&marker), 2);
+        drop(retired);
+        assert_eq!(std::rc::Rc::strong_count(&marker), 1);
+
+        let kept = GenerationalSlab::<u64, 2, TEST_CLASS>::new();
+        let handle = kept.insert_with_hint(9, 0).unwrap();
+        assert_eq!(kept.with_mut_take(handle, |value| (*value, false)).unwrap(), (9, None));
+        assert_eq!(kept.with(handle, |value| *value), Some(9));
     }
 
     #[test]

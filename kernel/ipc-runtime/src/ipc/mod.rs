@@ -57,7 +57,7 @@ use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
 #[cfg(test)]
 use spin::Mutex;
 
-use reply_publication::{insert_reply_object, published_reply_message_id};
+use reply_publication::{insert_fast_reply_object, insert_reply_object, published_reply_message_id};
 use slab::GenerationalSlab;
 
 #[cfg(not(test))]
@@ -1773,35 +1773,37 @@ pub fn reserve_fast_endpoint_call_with_response_capacity(
                 })
                 .ok_or(IpcError::NoMemory)?;
 
-            let mut frame = FastCallFrame {
-                endpoint_id: endpoint.raw(),
-                caller_process_id,
-                caller_task_id,
-                receiver_task_id: receiver_waiter.task_id,
-                receiver_request_capacity: receiver_waiter.request_capacity,
-                caller_response_capacity: response_capacity,
-                request_len: request.len(),
-                response_len: 0,
-                state: FastCallState::RequestReady,
-                terminal_error: None,
-                request: [0; IPC_FAST_INLINE_BYTES],
-                response: [0; IPC_FAST_INLINE_BYTES],
-            };
-            frame.request[..request.len()].copy_from_slice(request);
-
             // LOCK ORDER: IpcEndpoint precedes IpcReply, matching request
             // consumption below. One endpoint transaction binds the exact
             // front waiter to the reply frame; no advisory read/reacquisition
             // can race a receiver cancellation between selection and publish.
-            let reply_id = insert_reply_object(ReplyObject {
-                message_id: 0,
-                receiver_owner: endpoint_object.owner,
-                used: false,
-                consumed: false,
-                scheduling_context,
-                fast_frame: Some(frame),
+            let receiver_owner = endpoint_object.owner;
+            let reply_id = insert_fast_reply_object(caller_task_id, || {
+                let mut frame = FastCallFrame {
+                    endpoint_id: endpoint.raw(),
+                    caller_process_id,
+                    caller_task_id,
+                    receiver_task_id: receiver_waiter.task_id,
+                    receiver_request_capacity: receiver_waiter.request_capacity,
+                    caller_response_capacity: response_capacity,
+                    request_len: request.len(),
+                    response_len: 0,
+                    state: FastCallState::RequestReady,
+                    terminal_error: None,
+                    request: [0; IPC_FAST_INLINE_BYTES],
+                    response: [0; IPC_FAST_INLINE_BYTES],
+                };
+                frame.request[..request.len()].copy_from_slice(request);
+                ReplyObject {
+                    message_id: 0,
+                    receiver_owner,
+                    used: false,
+                    consumed: false,
+                    scheduling_context,
+                    fast_frame: Some(frame),
+                }
             })
-            .map_err(|_| IpcError::NoMemory)?;
+            .ok_or(IpcError::NoMemory)?;
 
             endpoint_object.waiting_receivers.pop_front();
             endpoint_object.fast_reply = Some(reply_id);

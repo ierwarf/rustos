@@ -39,6 +39,12 @@ static RDTSCP_CPU_TOKEN_ADMITTED: AtomicBool = AtomicBool::new(false);
 /// unchanged either way.
 #[cfg(rustos_boot_image)]
 static RDPID_CPU_TOKEN_ADMITTED: AtomicBool = AtomicBool::new(false);
+/// Set once the topology is published AND `RDPID` is admitted: the steady state in
+/// which the token alone names the CPU. One flag replaces four loads and compares
+/// on every derivation; a token that does not name a tracked CPU (an AP that has
+/// not bound its identity yet) still takes the full path below.
+#[cfg(rustos_boot_image)]
+static CPU_TOKEN_FAST: AtomicBool = AtomicBool::new(false);
 
 /// This CPU's dense logical index.
 ///
@@ -62,7 +68,11 @@ pub fn current_cpu_index() -> usize {
     // how five of them accumulated on one lock acquisition.
     #[cfg(rustos_lock_phase_profile)]
     super::work_budget::charge_identity_derivation(index, core::panic::Location::caller());
-    #[cfg(not(rustos_lock_phase_profile))]
+    // Shipping images do not count derivations: the count only feeds the ceiling
+    // assertions, which run in host, test and phase-profile builds, and the
+    // increment is a read-modify-write chain on one line that ~90 derivations per
+    // IPC round trip serialized on.
+    #[cfg(all(not(rustos_lock_phase_profile), not(rustos_boot_image)))]
     super::work_budget::charge_identity_derivation_count(index);
     index
 }
@@ -89,6 +99,20 @@ pub(super) fn current_cpu_index_uncharged() -> usize {
 #[cfg(rustos_boot_image)]
 #[inline]
 fn derive_cpu_index() -> usize {
+    // ORDERING: Acquire pairs with the Release store that follows every admission
+    // and the topology publication it depends on.
+    if CPU_TOKEN_FAST.load(Ordering::Acquire) {
+        let index = (read_tsc_aux_rdpid() as usize).wrapping_sub(1);
+        if index < MAX_TRACKED_CPUS {
+            return index;
+        }
+    }
+    derive_cpu_index_checked()
+}
+
+#[cfg(rustos_boot_image)]
+#[inline]
+fn derive_cpu_index_checked() -> usize {
     // ORDERING: Acquire makes the complete dense APIC-ID map visible after HAL
     // finishes ACPI topology publication. Earlier BSP boot remains index zero.
     if !CPU_IDENTITIES_PUBLISHED.load(Ordering::Acquire) {
@@ -424,6 +448,10 @@ pub fn finalize_cpu_identities(cpu_count: usize) {
             // ORDERING: Release admits the CPU-local token only after the
             // immutable dense topology is visible.
             RDTSCP_CPU_TOKEN_ADMITTED.store(true, Ordering::Release);
+            if rdpid_admitted {
+                // ORDERING: Release after every admission and the published map.
+                CPU_TOKEN_FAST.store(true, Ordering::Release);
+            }
         }
         bind_current_cpu_identity(0, hardware_apic_id());
     }

@@ -123,6 +123,8 @@ pub(super) fn install_test_transition_owner_with_admission(
         "test scheduler transition slot exceeds capacity"
     );
     CURRENT_TASK_SLOTS[logical_index].store(incoming_slot, Ordering::Release);
+    // ORDERING: Release; the bound precedes the admission it covers.
+    ADMITTED_CPU_BOUND.fetch_max(logical_index + 1, Ordering::Release);
     CURRENT_TASK_ACTIVE[logical_index].store(admitted, Ordering::Release);
     CURRENT_TASK_IDLE[logical_index].store(false, Ordering::Release);
     SCHEDULER_CURRENT_TASK_SCRATCH[logical_index].store(incoming_slot, Ordering::Release);
@@ -144,6 +146,8 @@ pub(in super::super) fn install_test_current_owner(
         "test scheduler slot exceeds capacity"
     );
     CURRENT_TASK_SLOTS[logical_index].store(slot, Ordering::Release);
+    // ORDERING: Release; the bound precedes the admission it covers.
+    ADMITTED_CPU_BOUND.fetch_max(logical_index + 1, Ordering::Release);
     CURRENT_TASK_ACTIVE[logical_index].store(true, Ordering::Release);
     CURRENT_TASK_IDLE[logical_index].store(false, Ordering::Release);
     SCHEDULER_CURRENT_TASK_SCRATCH[logical_index].store(slot, Ordering::Relaxed);

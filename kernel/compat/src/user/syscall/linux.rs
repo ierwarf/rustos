@@ -152,6 +152,18 @@ const LINUX_EOVERFLOW: i64 = 75;
 const LINUX_ETIMEDOUT: i64 = 110;
 const MAX_RUSTOS_DEBUG_PRINT_BYTES: usize = 2048;
 
+/// The register IPC entry of [`dispatch_linux_syscall`] for a call the entry stub's
+/// Linux-ABI gate already admitted: the frame contract was validated by the caller,
+/// the operation is one of the four register operations, and secondary tracing is a
+/// diagnostic-kernel feature, so only the pending-signal delivery of every Linux
+/// syscall remains before the operation.
+pub(super) fn dispatch_register_ipc_syscall(frame: &mut SyscallFrame) -> u64 {
+    if deliver_pending_signals_if_needed(frame) {
+        return frame.rax;
+    }
+    ipc_ops::dispatch_register_ipc(frame)
+}
+
 pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
     if let Err(error) = syscall_check(frame) {
         return error;

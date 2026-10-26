@@ -36,6 +36,50 @@ fn cpu_cells_drain_independently_and_merge_saturates_without_spending_next_windo
     assert_eq!(a.with(Counters::take).runtime_profile_ns[7], 0);
 }
 #[test]
+fn lane_rows_batch_per_cpu_and_fold_exactly_once_into_the_diagnostic_leaf() {
+    let _fixture = crate::multitask::scheduler::tests::boxed_scheduler();
+    let cpu = 1;
+    lane_flush(cpu);
+    let _ = CELLS[cpu].with(Counters::take);
+    for _ in 0..3 {
+        lane_account(cpu, 7, 10);
+        lane_dispatch(cpu, 7, false);
+        lane_account(cpu, 9, 5);
+        lane_dispatch(cpu, 9, true);
+    }
+    // Batched rows are not in the leaf yet; one flush folds each exactly once.
+    assert_eq!(CELLS[cpu].with(|row| row.runtime_profile_task_switches), 0);
+    lane_flush(cpu);
+    let window = CELLS[cpu].with(Counters::take);
+    assert_eq!(window.runtime_profile_task_switches, 6);
+    assert_eq!(window.runtime_profile_address_space_switches, 3);
+    assert_eq!((window.runtime_profile_dispatches[7], window.runtime_profile_ns[7]), (3, 30));
+    assert_eq!((window.runtime_profile_dispatches[9], window.runtime_profile_ns[9]), (3, 15));
+    lane_flush(cpu);
+    assert_eq!(CELLS[cpu].with(Counters::take).runtime_profile_task_switches, 0);
+
+    // The table holds a few slots: a fifth distinct slot folds the others at once.
+    for slot in 20..25 {
+        lane_dispatch(cpu, slot, false);
+    }
+    assert_eq!(CELLS[cpu].with(|row| row.runtime_profile_task_switches), LANE_ENTRIES as u64);
+    lane_flush(cpu);
+    let window = CELLS[cpu].with(Counters::take);
+    assert_eq!(window.runtime_profile_task_switches, 5);
+    assert!((20..25).all(|slot| window.runtime_profile_dispatches[slot] == 1));
+
+    // A long run folds on its own, so a report never lags by more than the period.
+    for _ in 0..LANE_FLUSH_EVERY {
+        lane_dispatch(cpu, 7, false);
+    }
+    assert_eq!(
+        CELLS[cpu].with(Counters::take).runtime_profile_task_switches,
+        u64::from(LANE_FLUSH_EVERY)
+    );
+    // Other CPUs' rows are untouched.
+    assert_eq!(CELLS[0].with(|row| row.runtime_profile_dispatches[20]), 0);
+}
+#[test]
 fn remote_window_drain_preserves_open_turn_phase_baseline_and_new_window_segments() {
     let _fixture = crate::multitask::scheduler::tests::boxed_scheduler();
     let cell = Cell::new();

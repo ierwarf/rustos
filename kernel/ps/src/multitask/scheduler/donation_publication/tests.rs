@@ -115,6 +115,31 @@ pub(in crate::multitask::scheduler) fn actual_noncurrent_donor_requires_original
     });
 }
 #[test]
+fn actual_self_funded_current_reservation_stores_the_captured_basis_and_refuses_a_borrowed_one() {
+    born(|slots| {
+        let scope = masked();
+        // The captured reservation is the reference: the fused one must leave the
+        // same ledger entry, so every later bind sees an identical basis.
+        assert!(reserve_call_with(&scope, ID).donation_reserved);
+        let captured = donation_ledger::bind_basis(0, IpcReply, slots[0], ID);
+        assert!(donation_ledger::cancel_reservation(ID));
+        assert!(donation_ledger::reserve_own(slots[0], ID, false));
+        assert!(captured.is_ok_and(|basis| basis.is_some()));
+        assert!(donation_ledger::bind_basis(0, IpcReply, slots[0], ID) == captured);
+        assert!(!donation_ledger::reserve_own(slots[0], ID, false), "one reservation per donor");
+        assert!(bind_with(&scope, 801, ID, ID + 1, false));
+        assert!(donation_ledger::release_reply(801, IpcReply));
+        // A donor now funded by another task's reply is not self-funded: the fused
+        // reservation refuses and leaves the decision to the full capture.
+        assert!(reserve_call_with(&scope, ID).donation_reserved);
+        assert!(bind_with(&scope, 802, ID, ID + 1, false));
+        assert!(donation_ledger::borrowed_context_charge_token(slots[1]).is_some());
+        assert!(!donation_ledger::reserve_own(slots[1], ID + 1, false));
+        assert!(donation_ledger::release_reply(802, IpcReply));
+        assert_eq!(donation_ledger::live_len(), 0);
+    });
+}
+#[test]
 pub(in crate::multitask::scheduler) fn actual_class_admission_uses_trusted_bit_and_preserves_ordinary_custody() {
     born(|slots| {
         let scope = masked();

@@ -272,6 +272,10 @@ pub(super) fn is_linux_rustos_ipc_syscall(syscall_number: u64) -> bool {
     )
 }
 
+pub(super) fn dispatch_register_ipc(frame: &mut SyscallFrame) -> u64 {
+    registers::dispatch(frame)
+}
+
 pub(super) fn dispatch_linux_rustos_ipc_syscall(frame: &mut SyscallFrame) -> u64 {
     match frame.rax {
         rustos_user_abi::syscall::SYS_RUSTOS_IPC_REGISTER_CALL

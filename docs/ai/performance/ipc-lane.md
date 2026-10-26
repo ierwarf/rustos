@@ -150,6 +150,47 @@ Policy stays in userspace services.
   server tail ~1.7k, entry ~0.9k), so further gains need the P3 rendezvous cell
   (epoch-validated receiver, fused reserve/bind/release), not more stage trimming.
 
+- P3 stage 1 (2026-10-26, no custody change): the call-side admission of a task funded by
+  its own context (`donation_publication::reserve_call_current`) takes one masked section
+  and one ledger acquisition (`donation_ledger::reserve_own`, same `FundingBasis` entry,
+  borrowed bases still take the full capture); the fast-call reply object is built inside
+  its slab slot (`GenerationalSlab::insert_with_hint_built`) instead of moving ~600 bytes
+  through three frames; the lane's per-switch diagnostic rows (dispatch, runtime, switch and
+  address-space counts) are batched in a per-CPU cell and folded into the diagnostic leaf
+  every 64 lane switches (`runtime_profile::owner::lane_{account,dispatch,flush}`), and the
+  lane no longer swaps the per-slot migration word (both ends of a lane switch last ran on
+  this CPU). Method note: stamp deltas overstate savings that sit under a later locked
+  instruction and understate stores that precede one; only same-session A/B counts. Removing
+  the four diagnostic leaf round trips per switch pair measured -280 (p50 7.15k -> 6.9k,
+  anchor 3.5-3.7k, 3 alternating runs); the admission/endpoint changes are about -70.
+  The largest single item was found with guest `perf record -e cycles:G` on the vCPU
+  thread (flat profile; the stamp timeline had hidden it): `cpu_local::task_execution_owner`
+  scanned all `MAX_TRACKED_CPUS` (16 since the CPU-cap commit) Current/Transition publications
+  on every frame-token and wake check, ~600 ticks per round trip on a 1-vCPU guest. The scan
+  now covers `0..ADMITTED_CPU_BOUND`, one past the highest CPU ever admitted (raised with
+  Release before that CPU's first admission store), so a never-admitted CPU cannot own a task.
+  With the scan bound and the diagnostic batching: p50 7.27k -> 6.47k (control 7.40/7.20/7.32k vs 6.40/6.40/6.60k). Profiling recipe:
+  `perf record -e cycles:G -c 20000 -t <CPU 0/KVM tid>` while `cargo xtask bench
+  --isolate-probe ...` runs, `perf script -D` for guest IPs (the image is KASLR-slid by a
+  2 MiB multiple; match it against `nm` of the archived `nucleus.elf`). Guest LBR is not
+  virtualized, so callers of `memcpy`/`memset` cannot be recovered that way.
+  Three further trims, each measured on its own (same-session A/B, 3-4 alternating runs):
+  `IrqLeaf` release no longer re-reads IF (`pushf`, 17 ticks) in shipping images, -170;
+  the lane's three `wait::reason` pre-filters read the payload without the epoch leaf
+  (`reason_snapshot`; the claim re-reads it under the leaf before its CAS), -107; and
+  `DispatchPreemption` keeps its release-time IF and CPU-index proofs, and the CPU-index
+  check in `mask_irqs`, for `rustos_lock_phase_profile` builds only, -180. Not measurable
+  (reverted): masked `IrqLeaf`/interval/epoch/ledger/placement lock variants for the lane,
+  a pending-migration pre-check in `PlacementGrant::acknowledge`, and a lock-free identity
+  read in the lane's reply custody filter. Ablations (delete the check, compare p50) bound
+  what stage 2/3 style validation fusion can buy: both `admitted` checks -120, the reply
+  context-custody filter -150, `recent_sleeper` -15, the reply deadline waiter arm+disarm -120.
+  `GenerationalSlab::with_mut_take` retires a value with no destructor in place instead of
+  moving the 600-byte reply object out to be dropped, -150. What stages 2 and 3 as planned
+  (epoch cell, direct delivery) would buy on this object model, the rendezvous mechanism
+  that removes the objects instead, its TLA+ model and the open decision are in
+  [ipc-rendezvous.md](ipc-rendezvous.md).
+
 Measured (1 vCPU isolated `ipc_rt_intra_process_reply_recv`, p50 ticks):
 session start 41.9k -> DirectSwitch 31.9k -> lane call+reply 19.2k -> funding
 shuttle 17.9k -> lock-light CurrentWait pin 16.9k -> interval forwarding 15.1k ->

@@ -7,8 +7,8 @@
 use super::*;
 
 impl<T: ?Sized, const CLASS: u8> Drop for TrackedSpinGuard<'_, T, CLASS> {
+    #[inline(always)]
     fn drop(&mut self) {
-        let profile_entry = lock_profile::now();
         #[cfg(rustos_boot_image)]
         if self.lean {
             let cpu = self.owner_cpu;
@@ -16,26 +16,57 @@ impl<T: ?Sized, const CLASS: u8> Drop for TrackedSpinGuard<'_, T, CLASS> {
             // is still this CPU; the release-on-another-CPU proof lives in the
             // host, test and phase-profile validation builds.
             drop(self.guard.take());
-            // An IF-set acquire pairs with a masked pop; a masked acquire is
-            // already inside its masked scope.
-            let irq_enabled = !self.irqs_masked && x86_64::instructions::interrupts::are_enabled();
-            preemption::masked(irq_enabled, || {
-            with_current_stack_on(cpu, |stack| {
-                assert!(stack.len != 0, "lock-class release without acquisition");
-                let top = stack.classes[stack.len - 1];
+            if self.irqs_masked {
+                // A masked acquire is already inside its masked scope.
+                Self::pop_lean(cpu);
+            } else {
+                // An IF-set acquire pairs with a masked pop.
+                self.pop_lean_masked_by_cli(cpu);
+            }
+            return;
+        }
+        self.drop_full();
+    }
+}
+
+impl<T: ?Sized, const CLASS: u8> TrackedSpinGuard<'_, T, CLASS> {
+    #[cfg(rustos_boot_image)]
+    #[inline(always)]
+    fn pop_lean(cpu: usize) {
+        with_current_stack_on(cpu, |stack| {
+            let len = stack.len;
+            // The class check and the zeroing store are validation for host,
+            // test and hardening builds: shipping images keep the length (it is
+            // enforcement state) and the preemption depth.
+            #[cfg(any(not(rustos_boot_image), rustos_lock_phase_profile))]
+            {
+                assert!(len != 0, "lock-class release without acquisition");
+                let top = stack.classes[len - 1];
                 assert_eq!(
                     top, CLASS,
                     "lock-class release order violation held={} released={}",
                     top, CLASS
                 );
-                stack.len -= 1;
-                stack.classes[stack.len] = 0;
-            });
-            let observed = cpu_counter::dec(&CPU_LOCK_STATE[cpu].preempt_disable_depth);
-            assert!(observed != 0, "raw-spin preemption depth underflow");
-            });
-            return;
-        }
+                stack.classes[len - 1] = 0;
+            }
+            stack.len = len - 1;
+        });
+        let observed = cpu_counter::dec(&CPU_LOCK_STATE[cpu].preempt_disable_depth);
+        #[cfg(any(not(rustos_boot_image), rustos_lock_phase_profile))]
+        assert!(observed != 0, "raw-spin preemption depth underflow");
+        let _ = observed;
+    }
+
+    #[cfg(rustos_boot_image)]
+    #[inline(never)]
+    fn pop_lean_masked_by_cli(&self, cpu: usize) {
+        let irq_enabled = x86_64::instructions::interrupts::are_enabled();
+        preemption::masked(irq_enabled, || Self::pop_lean(cpu));
+    }
+
+    #[inline(never)]
+    fn drop_full(&mut self) {
+        let profile_entry = lock_profile::now();
         #[cfg(rustos_boot_image)]
         {
             // A `lock_masked` guard is released inside the same masked scope.
@@ -79,8 +110,8 @@ impl<T: ?Sized, const CLASS: u8> Drop for TrackedSpinGuard<'_, T, CLASS> {
                     panic!(
                         "raw-spin guard release invariant class={} acquired_at={}:{} owner_cpu={} owner_apic={:#x} release_cpu={} release_apic={:#x} acquire_depth={} release_depth={} held_depth={} top_class={:?}",
                         CLASS,
-                        self.acquire_file,
-                        self.acquire_line,
+                        self.acquire_site.map_or("", |site| site.file()),
+                        self.acquire_site.map_or(0, |site| site.line()),
                         self.owner_cpu,
                         self.owner_apic_id,
                         release_cpu,
