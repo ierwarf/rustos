@@ -409,6 +409,57 @@ pub(in crate::multitask::scheduler) fn actual_cross_cpu_call_keeps_original_fund
 }
 
 #[test]
+fn refused_reply_publication_retries_only_its_original_wait_after_frame_publication() {
+    peers(|_, receiver, scope| {
+        runqueue::wait::set_reason(receiver, runqueue::wait::REASON_ENDPOINT_REPLY, REPLY);
+        let context = stack_resources::context::read(receiver).unwrap().scheduling_context.identity();
+        let owner = runqueue::owner(receiver);
+        assert_eq!(wake_retry::pending_on(scope), 0);
+        // Model the earlier return/ACK generation-publication gap, not wake
+        // authority. The actual typed producer must refuse the unstable frame
+        // and retain an observation of this exact wait for a later IRQ entry.
+        frame_publication::bind_local_owner_generation(receiver, owner.generation + 1);
+        assert_eq!(reply_published(scope, REPLY, RECEIVER, RECEIVER, context, &|_| 1, None),
+            Some(FastIpcReplyHandoffOutcome::Rejected));
+        assert_eq!(runqueue::owner(receiver), owner);
+        assert_eq!(wake_retry::pending_on(scope), 1, "a completed reply must not lose its only wake");
+        assert!(super::super::local_dispatch_work_pending(scope.cpu()),
+            "idle periodic return must see retry-only work");
+        assert_eq!(wake_retry::service_with(scope, &|_| 1), 0);
+        assert!(wake_retry::pending(scope.cpu()), "a repeated refusal must keep dispatch work pending");
+        assert!(super::super::local_dispatch_work_pending(scope.cpu()));
+        frame_publication::bind_local_owner_generation(receiver, owner.generation);
+        assert_eq!(wake_retry::service_with(scope, &|_| 1), 1);
+        assert_eq!(wake_retry::pending_on(scope), 0);
+        assert!(!wake_retry::pending(scope.cpu()));
+        assert_eq!(runqueue::wait::reason(receiver).0, runqueue::wait::REASON_NONE);
+        assert!(runqueue::owner(receiver).runnable);
+    });
+}
+
+#[test]
+fn refused_reply_retry_cannot_wake_a_newer_wait_even_on_the_same_reply() {
+    peers(|_, receiver, scope| {
+        runqueue::wait::set_reason(receiver, runqueue::wait::REASON_ENDPOINT_REPLY, REPLY);
+        let context = stack_resources::context::read(receiver).unwrap().scheduling_context.identity();
+        let owner = runqueue::owner(receiver);
+        frame_publication::bind_local_owner_generation(receiver, owner.generation + 1);
+        assert_eq!(reply_published(scope, REPLY, RECEIVER, RECEIVER, context, &|_| 1, None),
+            Some(FastIpcReplyHandoffOutcome::Rejected));
+        assert_eq!(wake_retry::pending_on(scope), 1);
+        frame_publication::bind_local_owner_generation(receiver, owner.generation);
+        // The payload is identical but the epoch is newer: no retry may clear
+        // it merely because a task/reply ID still matches.
+        runqueue::wait::set_reason(receiver, runqueue::wait::REASON_ENDPOINT_REPLY, REPLY);
+        let newer = runqueue::wait::wait_instance(receiver);
+        assert_eq!(wake_retry::service_with(scope, &|_| 1), 1);
+        assert_eq!(runqueue::wait::wait_instance(receiver), newer);
+        assert_eq!(runqueue::owner(receiver), owner);
+        assert_eq!(wake_retry::pending_on(scope), 0);
+    });
+}
+
+#[test]
 fn actual_reverse_reply_uses_original_typed_wait_fair_owner_and_exact_fifo() {
     peers(|_, receiver, scope| {
         runqueue::wait::set_reason(receiver, runqueue::wait::REASON_ENDPOINT_REPLY, REPLY);

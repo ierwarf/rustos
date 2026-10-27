@@ -177,11 +177,22 @@ pub(super) fn take_fast_request_inline<const N: usize>(
             {
                 return Err(IpcError::PermissionDenied);
             }
-            if frame.request_len > request_capacity.min(N) {
+            let spilled = frame.request_len > IPC_FAST_INLINE_BYTES;
+            // A spilled request needs a receiver whose inline image is the standard
+            // one; the register image (N < 256) can never hold it.
+            if frame.request_len > request_capacity
+                || (spilled && N < IPC_FAST_INLINE_BYTES)
+                || (!spilled && frame.request_len > N)
+            {
                 return Err(IpcError::BufferTooSmall);
             }
             let mut request = [0; N];
-            request[..frame.request_len].copy_from_slice(&frame.request[..frame.request_len]);
+            let spill = if spilled {
+                frame.spill.as_mut().map(|spill| core::mem::take(&mut spill.request))
+            } else {
+                request[..frame.request_len].copy_from_slice(&frame.request[..frame.request_len]);
+                None
+            };
             frame.state = FastCallState::RequestTaken;
             Ok(FastEndpointReceived {
                 reply: KernelReplyHandle::from_raw(reply_id),
@@ -189,6 +200,7 @@ pub(super) fn take_fast_request_inline<const N: usize>(
                 caller_task_id: frame.caller_task_id,
                 request_len: frame.request_len,
                 request,
+                spill,
             })
         })
         .ok_or(IpcError::PermissionDenied)??;

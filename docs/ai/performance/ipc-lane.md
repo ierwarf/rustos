@@ -129,18 +129,55 @@ Artifacts: `build/bench-core/ipc_rt_intra_process_reply_recv-vcpu-1-179308197151
 root. The earlier `1793081320243538315` run overlapped build validation and failed
 source/linked-ELF freshness; it is retained as invalid evidence.
 
-### Measuring the current queued slowpath alone
+### Slow paths folded into the rendezvous (2026-10-27, after the records below)
 
-`cargo xtask bench --rustos-vcpus 1 --isolate-probe ipc_rt_intra_process_queued_reply_recv`
-(and the same command with 8 vCPUs) measures the existing byte-only queued path
-without disabling or editing the kernel. It keeps the 16-byte request/echo,
+Three shapes used to leave the rendezvous and now ride it; same host window,
+1 vCPU p50 in invariant-TSC ticks (the earlier session tables labelled the `min`
+column "p50"; the figures here are real p50):
+
+| Shape | before | after |
+|---|---:|---:|
+| unfused server (`RECV`, `REPLY`, `RECV`) | 40.1k | 8.8k |
+| the same at 8 vCPUs | 65k | 9.5k |
+| reply buffer larger than the 256-byte inline image (272 bytes) | 24.0k | 8.2k |
+
+* **Deferred reply wake was dead code.** `pending_reply::caller_parked_on` tested
+  `owner.cpu`, which is `None` for every Blocked owner word, so no reply was ever
+  stashed and the unfused server was always preempted at the end of its `REPLY`
+  (the caller then called an unparked server: queued request, two generic
+  dispatches). The caller's CPU is the resident cell's (`resident::parked_cpu`),
+  or its last CPU when it parked nothing. Now `REPLY` publishes the response and
+  holds the wake; the same task's next blocking receive carries it
+  (`DeferredFastReply`, one lane reply switch); every other syscall entry
+  (`syscall_dispatch`) and every scheduler entry (`DispatchEntry::from_scope`)
+  settles it first. A server that replies and then computes delays its caller to
+  the next scheduler entry (tick) instead of preempting at once.
+* **Large messages ride the frame.** `FastCallFrame` keeps its 256-byte inline
+  images and owns an optional spill buffer for a request or response above that,
+  up to `IPC_FAST_MAX_BYTES` (one maximum IPC message, 64 KiB). The 16-byte
+  register image can never take a spilled request (`BufferTooSmall`); a response
+  larger than the caller's declared capacity is terminal exactly as for an inline
+  frame. A declared reply capacity above the limit is clamped (no message is
+  larger), so it no longer forces the queued transport. The small-message hot path
+  adds only a null check at retirement.
+* **What still enqueues:** an unparked receiver, handle-bearing calls, reservation
+  `NoMemory`, a deadline-arm failure. `ipc_rt_intra_process_queued_reply_recv` now
+  measures the handle-bearing call form with no descriptors (always the queued
+  objects) at 26.1k; `ipc_rt_intra_process_large_reply_recv` is the 272-byte
+  rendezvous row (8.2k). Fused buffer reply_recv reads 8.1k against 7.9k before
+  this change (about +2%, same CPUID/ALU anchors, not separately attributed).
+
+### Measuring the queued slowpath alone (historical shape)
+
+The records below measured `ipc_rt_intra_process_queued_reply_recv` when that probe
+forced the queue with a 272-byte advertised reply capacity, which the spill above
+now serves on the rendezvous. They remain the pre-change reference for that shape.
+It kept the 16-byte request/echo,
 2,000 warmups, 20,000 timed round trips and fused reply/receive server. Only the
 advertised reply capacity is 272 bytes, backed by a real padded response object;
 that exceeds the 256-byte fast response frame and deterministically rejects
 rendezvous admission before publication on every CALL. An exact echo, STOP,
-join and untouched-tail proof precede the primary result. The native witness
-pins this admission condition and the actual runtime limit. This is the buffer
-queued case, not a register queued call, a large-payload test or cross-process IPC.
+join and untouched-tail proof precede the primary result.
 
 Current-state capture (2026-10-27): the 1-vCPU shipping run completed all 20,000
 samples, exact echo/STOP/join and untouched-tail proofs, authenticated dual-guest

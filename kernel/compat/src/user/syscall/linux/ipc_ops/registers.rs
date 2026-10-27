@@ -45,7 +45,7 @@ impl ReceiveDestination<'_> {
             ),
             Self::Registers(frame) => write_register_result(
                 frame,
-                &received.request[..received.request_len],
+                received.bytes(),
                 received.reply.raw(),
                 received.caller_process_id,
                 received.caller_task_id,
@@ -174,7 +174,7 @@ fn call(
         // this syscall frame plus a park record, see `complete_parked_register_ipc`.
         Some(core::ptr::from_mut::<SyscallFrame>(frame)),
     )? {
-        return write_register_result(frame, &response.bytes[..response.len], 0, 0, 0)
+        return write_register_result(frame, response.data(), 0, 0, 0)
             .map(|len| len as u64);
     }
     // A declined reservation was rolled back by the existing helper. Enqueue
@@ -187,7 +187,7 @@ fn call(
         reply, task_id, deadline, IPC_REGISTER_BYTES, phase_mark(),
         InlineReplyTransport::Queued, Some(core::ptr::from_mut(frame)),
     )?;
-    write_register_result(frame, &response.bytes[..response.len], 0, 0, 0).map(|len| len as u64)
+    write_register_result(frame, response.data(), 0, 0, 0).map(|len| len as u64)
 }
 
 /// Finish a register `CALL` or `REPLY_RECV` that blocked through the direct
@@ -232,7 +232,7 @@ fn complete_parked_call(frame: &mut SyscallFrame, record: &crate::user::syscall:
         Some(core::ptr::from_mut(frame)),
     )
     .and_then(|response| {
-        write_register_result(frame, &response.bytes[..response.len], 0, 0, 0).map(|len| len as u64)
+        write_register_result(frame, response.data(), 0, 0, 0).map(|len| len as u64)
     })
     .unwrap_or_else(linux_errno)
 }

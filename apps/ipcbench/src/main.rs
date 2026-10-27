@@ -1191,6 +1191,7 @@ fn run_single_probe(name: &str, tsc_khz: u64) {
             ipc_probes::probe_ipc_intra_process_reply_recv(tsc_khz)
         }
         "ipc_rt_intra_process_register_reply_recv" => ipc_probes::probe_ipc_register_reply_recv(tsc_khz),
+        "ipc_rt_intra_process_large_reply_recv" => ipc_probes::probe_ipc_large_reply_recv(tsc_khz),
         "ipc_rt_intra_process_queued_reply_recv" => ipc_probes::probe_ipc_queued_reply_recv(tsc_khz),
         "ipc_rt_cross_process_syscalld_getuid" => ipc_probes::probe_syscall_offload(tsc_khz),
         "fork_exit_wait" => probe_fork_exit_wait(tsc_khz),

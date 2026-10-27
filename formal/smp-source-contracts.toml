@@ -3563,6 +3563,18 @@ tokens = [
     "sync_handoff::enqueue(target",
 ]
 
+# Fused completion may sleep its server after publication. A transient caller
+# frame refusal retains only an exact wait-epoch retry observation, never a
+# bare-ID fresh wake or replacement scheduling-context authority.
+[[required_sequences]]
+path = "kernel/ps/src/multitask/scheduler/ipc_publication.rs"
+tokens = [
+    "pub(super) fn reply_published(", "task_directory::reply_context_custody(context_owner, context)",
+    "wake_publication::reply_switching(scope, reply, caller, eligible_cpus, switch)",
+    "wake_retry::record_in(scope, caller,", "runqueue::wait::REASON_ENDPOINT_REPLY, reply",
+    "FastIpcReplyHandoffOutcome::Rejected",
+]
+
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/ipc_publication.rs"
 tokens = [
@@ -3579,6 +3591,32 @@ tokens = [
     "donation_ledger::class_publication_sequence()", "switch.take()", "urgency: Urgency::Sync",
     "claim(outgoing, candidate, class_sequence)", "complete(outgoing, Urgency::Sync)",
 ]
+
+# Refused-wake observations stay dispatchable on an idle CPU and can acquire
+# only their recorded epoch, even if a same-cap rearm races the earlier census.
+[[required_sequences]]
+path = "kernel/ps/src/multitask/scheduler/wake_retry.rs"
+tokens = [
+    "pending: AtomicBool", "fn pending(cpu: usize)", "cell.pending.load(Ordering::Acquire)",
+    "unsafe fn with_cpu_queue", "let result = f(queue)",
+    "cell.pending.store(queue.len != 0, Ordering::Release)",
+    "fn retry_after_observing(", "WaitInstance::Waiting { serial, kind, id }",
+    "before_capture();", "retained_wake_matching_instance(",
+    "binding, (token.serial, token.kind, token.id), eligible_cpus",
+]
+
+[[required_sequences]]
+path = "kernel/ps/src/multitask/scheduler/runqueue/wait/epoch.rs"
+tokens = [
+    "fn capture_at_serial(", "Self::capture_expected(binding, kind, id, Some(serial))",
+    "fn capture_expected(", "with(binding.slot(), |state|",
+    "expected_serial.is_some_and(|serial| serial != state.serial)",
+    "state.pending = Some(state.serial)",
+]
+
+[[required_sequences]]
+path = "kernel/ps/src/multitask/scheduler.rs"
+tokens = ["fn local_dispatch_work_pending(cpu: usize)", "|| wake_retry::pending(cpu)"]
 
 # Same-CPU IPC lane: a trap switches between two resident tasks without a
 # dispatch turn. Every decline precedes the donation bind; the claim CAS of the

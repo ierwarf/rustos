@@ -76,11 +76,23 @@ pub(super) fn syscall_linux_rustos_ipc_reply_recv_with_sender(args_ptr: u64) -> 
         (endpoint, retained_mm.thread_id(), process_id)
     };
     let retained_mm = retained_mm;
-    if inline {
+    // Inline bytes were already snapshotted during preflight; a larger response is
+    // copied once and serves both a fast frame's spill and a queued reply object.
+    let large_response;
+    let response: &[u8] = if inline {
+        &inline_response[..response_len]
+    } else {
+        large_response = match copy_request_from_user(args.response_ptr, args.response_len) {
+            Ok(response) => response,
+            Err(errno) => return linux_errno(errno),
+        };
+        large_response.as_slice()
+    };
+    if response_len <= kernel_ipc_runtime::api::IPC_FAST_MAX_BYTES {
         match kernel_ipc_runtime::api::endpoint::complete_fast_reply_for_task(
             KernelReplyHandle::from_raw(args.reply_cap),
             receiver_task_id,
-            &inline_response[..response_len],
+            response,
         ) {
             Ok(published) => {
                 note_fast_ipc(IpcFastCounter::FusedReplyPublished);
@@ -111,18 +123,6 @@ pub(super) fn syscall_linux_rustos_ipc_reply_recv_with_sender(args_ptr: u64) -> 
     // The fast branch above publishes in-kernel without a user copy and cannot
     // be slow; only this path pays for the slow-call timing reads.
     let start_ticks = crate::arch::rtc::ticks();
-    // Inline bytes were already snapshotted during preflight. A queued reply
-    // does not need another user copy or a temporary Vec for those same bytes.
-    let large_response;
-    let response = if inline {
-        &inline_response[..response_len]
-    } else {
-        large_response = match copy_request_from_user(args.response_ptr, args.response_len) {
-            Ok(response) => response,
-            Err(errno) => return linux_errno(errno),
-        };
-        large_response.as_slice()
-    };
     let copy_ticks = crate::arch::rtc::ticks();
     let completion = match kernel_ipc_runtime::api::complete_endpoint_reply_for_process_with_custody(
         KernelReplyHandle::from_raw(args.reply_cap),

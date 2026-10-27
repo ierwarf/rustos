@@ -103,9 +103,9 @@ pub(super) use task_weight::MIN_LOAD_WEIGHT;
 
 pub(in crate::multitask) fn local_dispatch_work_pending(cpu: usize) -> bool {
     // A direct synchronous handoff deliberately has no fair-runqueue entry.
-    // Its FIFO publication is therefore an independent durable source of
-    // dispatch work and must defeat the periodic continuation fast return.
-    if runqueue::local_dispatch_work_pending(cpu) {
+    // Its FIFO publication and exact refused-wake retries are independent
+    // durable work and must defeat the periodic continuation fast return.
+    if runqueue::local_dispatch_work_pending(cpu) || wake_retry::pending(cpu) {
         return true;
     }
     #[cfg(not(test))]

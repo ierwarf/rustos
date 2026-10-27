@@ -1398,7 +1398,7 @@ fn syscall_linux_rustos_ipc_call_with_timeout(
     // absolute-deadline wait. A shorter budget is not a transport restriction.
     if IPC_FAST_CALL_LIVE
         && let Ok(request_len) = usize::try_from(request_len)
-        && request_len <= kernel_ipc_runtime::api::IPC_FAST_INLINE_BYTES
+        && request_len <= kernel_ipc_runtime::api::IPC_FAST_MAX_BYTES
     {
         note_fast_ipc(IpcFastCounter::AdmissionAttempt);
         match try_fast_ipc_call(
@@ -1503,27 +1503,40 @@ fn try_fast_ipc_call(
     retained_mm: &multitask::RetainedCurrentUserAddressSpace,
     authorized_service_id: Option<u64>,
 ) -> Result<Option<usize>, i64> {
-    if request_len > kernel_ipc_runtime::api::IPC_FAST_INLINE_BYTES {
+    if request_len > kernel_ipc_runtime::api::IPC_FAST_MAX_BYTES {
         note_fast_ipc(IpcFastCounter::FallbackShape);
         return Ok(None);
     }
-    let reply_capacity = usize::try_from(reply_capacity).map_err(|_| LINUX_EINVAL)?;
-    if reply_capacity > kernel_ipc_runtime::api::IPC_FAST_INLINE_BYTES {
-        note_fast_ipc(IpcFastCounter::FallbackShape);
-        return Ok(None);
-    }
-    let mut request = [0_u8; kernel_ipc_runtime::api::IPC_FAST_INLINE_BYTES];
+    // No message exceeds `IPC_FAST_MAX_BYTES`, so a larger declared capacity can
+    // never be filled: the frame needs no more than that, and the caller's range
+    // is still validated at its full declared size below.
+    let declared_capacity = usize::try_from(reply_capacity).map_err(|_| LINUX_EINVAL)?;
+    let reply_capacity = declared_capacity.min(kernel_ipc_runtime::api::IPC_FAST_MAX_BYTES);
+    // Small requests stay on the stack; a larger one is staged in a buffer that
+    // lives only for this call (the frame then copies it into its own spill).
+    let mut inline = [0_u8; kernel_ipc_runtime::api::IPC_FAST_INLINE_BYTES];
+    let mut staged = Vec::new();
+    let request: &mut [u8] = if request_len <= inline.len() {
+        &mut inline[..request_len]
+    } else {
+        if staged.try_reserve_exact(request_len).is_err() {
+            note_fast_ipc(IpcFastCounter::FallbackNoFrame);
+            return Ok(None);
+        }
+        staged.resize(request_len, 0);
+        staged.as_mut_slice()
+    };
     if let Err(error) = usermem::copy_from_retained_user_and_validate_write(
         retained_mm,
         request_ptr,
-        &mut request[..request_len],
+        request,
         reply_ptr,
-        reply_capacity,
+        declared_capacity,
     ) {
         note_fast_ipc(IpcFastCounter::CallerMmRejected);
         return Err(address_space_error_to_linux_errno(error));
     }
-    let request = &request[..request_len];
+    let request: &[u8] = request;
     let Some(response) =
         try_fast_ipc_call_bytes::<{ kernel_ipc_runtime::api::IPC_FAST_INLINE_BYTES }>(
             endpoint,
@@ -1540,7 +1553,7 @@ fn try_fast_ipc_call(
         return Ok(None);
     };
     if response.len != 0 {
-        usermem::write_retained_user_bytes(retained_mm, reply_ptr, &response.bytes[..response.len])
+        usermem::write_retained_user_bytes(retained_mm, reply_ptr, response.data())
             .map_err(address_space_error_to_linux_errno)?;
     }
     Ok(Some(response.len))
@@ -1549,6 +1562,17 @@ fn try_fast_ipc_call(
 struct FastCallResponse<const N: usize> {
     len: usize,
     bytes: [u8; N],
+    /// The whole response when it is larger than the inline image.
+    spill: Option<Vec<u8>>,
+}
+
+impl<const N: usize> FastCallResponse<N> {
+    fn data(&self) -> &[u8] {
+        match &self.spill {
+            Some(spill) => spill,
+            None => &self.bytes[..self.len],
+        }
+    }
 }
 
 fn try_fast_ipc_call_bytes<const N: usize>(
@@ -1560,9 +1584,14 @@ fn try_fast_ipc_call_bytes<const N: usize>(
     deadline_tick: u64,
     direct_frame: Option<*mut SyscallFrame>,
 ) -> Result<Option<FastCallResponse<N>>, i64> {
-    if request.len() > kernel_ipc_runtime::api::IPC_FAST_INLINE_BYTES
-        || reply_capacity > N.min(kernel_ipc_runtime::api::IPC_FAST_INLINE_BYTES)
-    {
+    // Only the standard inline image can receive a spilled response; the register
+    // image (N < 256) keeps its exact inline limit.
+    let capacity_limit = if N >= kernel_ipc_runtime::api::IPC_FAST_INLINE_BYTES {
+        kernel_ipc_runtime::api::IPC_FAST_MAX_BYTES
+    } else {
+        N
+    };
+    if request.len() > kernel_ipc_runtime::api::IPC_FAST_MAX_BYTES || reply_capacity > capacity_limit {
         note_fast_ipc(IpcFastCounter::FallbackShape);
         return Ok(None);
     }
@@ -1701,7 +1730,10 @@ fn take_inline_reply<const N: usize>(
                 }
                 kernel_ipc_runtime::api::FastEndpointResponseTake::Response {
                     response_len, response,
-                } => FastCallResponse { len: response_len, bytes: response },
+                } => FastCallResponse { len: response_len, bytes: response, spill: None },
+                kernel_ipc_runtime::api::FastEndpointResponseTake::Spilled(spill) => {
+                    FastCallResponse { len: spill.len(), bytes: [0; N], spill: Some(spill) }
+                }
             }
         }
         InlineReplyTransport::Queued => {
@@ -1723,7 +1755,7 @@ fn copy_inline_reply<const N: usize>(bytes: &[u8]) -> Result<FastCallResponse<N>
     if bytes.len() > N {
         return Err(LINUX_EOVERFLOW);
     }
-    let mut response = FastCallResponse { len: bytes.len(), bytes: [0; N] };
+    let mut response = FastCallResponse { len: bytes.len(), bytes: [0; N], spill: None };
     response.bytes[..bytes.len()].copy_from_slice(bytes);
     Ok(response)
 }
@@ -2514,7 +2546,7 @@ fn write_fast_endpoint_request(
     request_ptr: u64,
     reply_cap_ptr: u64,
 ) -> Result<usize, i64> {
-    let request = &received.request[..received.request_len];
+    let request = received.bytes();
     let reply = received.reply.raw().to_ne_bytes();
     usermem::write_current_user_bytes_batch(&[(request_ptr, request), (reply_cap_ptr, &reply)])
         .map_err(address_space_error_to_linux_errno)?;
@@ -2530,7 +2562,7 @@ fn write_fast_endpoint_request_with_sender<const N: usize>(
     sender_tid_ptr: u64,
 ) -> Result<usize, i64> {
     let (sender_pid, sender_tid) = (received.caller_process_id, received.caller_task_id);
-    let request = &received.request[..received.request_len];
+    let request = received.bytes();
     let reply = received.reply.raw().to_ne_bytes();
     let pid = sender_pid.to_ne_bytes();
     let tid = sender_tid.to_ne_bytes();
@@ -2625,39 +2657,31 @@ pub(super) fn syscall_linux_rustos_ipc_reply(
     let Some(receiver_task_id) = multitask::current_task_id() else {
         return linux_errno(LINUX_EINVAL);
     };
-    if response_len > kernel_ipc_runtime::api::IPC_FAST_INLINE_BYTES as u64 {
-        match kernel_ipc_runtime::api::endpoint::reject_fast_reply_for_task(
-            KernelReplyHandle::from_raw(reply),
-            receiver_task_id,
-            kernel_ipc_runtime::api::IpcError::BufferTooSmall,
-        ) {
-            Ok(published) => {
-                note_fast_ipc(IpcFastCounter::ReplyPublished);
-                let wake_mark = charge_server_phase(IpcServerPhase::ReplyPublish, publish_mark);
-                if multitask::publish_fast_ipc_reply(reply, published.completion) {
-                    multitask::request_deferred_reschedule();
-                }
-                let _ = charge_server_phase(IpcServerPhase::ReplyWake, wake_mark);
-                return linux_errno(LINUX_EOVERFLOW);
-            }
-            Err(kernel_ipc_runtime::api::IpcError::InvalidHandle) => {}
-            Err(error) => return linux_errno(ipc_error_to_linux_errno(error)),
-        }
-    }
+    // A larger-than-inline response is staged once; a fast frame takes it into its
+    // spill, and a queued reply object below reuses the same bytes.
+    let mut staged: Option<Vec<u8>> = None;
     if let Ok(response_len) = usize::try_from(response_len)
-        && response_len <= kernel_ipc_runtime::api::IPC_FAST_INLINE_BYTES
+        && response_len <= kernel_ipc_runtime::api::IPC_FAST_MAX_BYTES
     {
-        let mut response = [0_u8; kernel_ipc_runtime::api::IPC_FAST_INLINE_BYTES];
-        if response_len != 0
-            && let Err(error) =
-                usermem::copy_from_current_user_exact(response_ptr, &mut response[..response_len])
-        {
-            return linux_errno(address_space_error_to_linux_errno(error));
-        }
+        let mut inline = [0_u8; kernel_ipc_runtime::api::IPC_FAST_INLINE_BYTES];
+        let response: &[u8] = if response_len <= inline.len() {
+            if response_len != 0
+                && let Err(error) =
+                    usermem::copy_from_current_user_exact(response_ptr, &mut inline[..response_len])
+            {
+                return linux_errno(address_space_error_to_linux_errno(error));
+            }
+            &inline[..response_len]
+        } else {
+            match copy_request_from_user(response_ptr, response_len as u64) {
+                Ok(bytes) => staged.insert(bytes).as_slice(),
+                Err(errno) => return linux_errno(errno),
+            }
+        };
         match kernel_ipc_runtime::api::endpoint::complete_fast_reply_for_task(
             KernelReplyHandle::from_raw(reply),
             receiver_task_id,
-            &response[..response_len],
+            response,
         ) {
             Ok(published) => {
                 note_fast_ipc(IpcFastCounter::ReplyPublished);
@@ -2674,9 +2698,12 @@ pub(super) fn syscall_linux_rustos_ipc_reply(
             Err(error) => return linux_errno(ipc_error_to_linux_errno(error)),
         }
     }
-    let response = match copy_request_from_user(response_ptr, response_len) {
-        Ok(response) => response,
-        Err(errno) => return linux_errno(errno),
+    let response = match staged {
+        Some(response) => response,
+        None => match copy_request_from_user(response_ptr, response_len) {
+            Ok(response) => response,
+            Err(errno) => return linux_errno(errno),
+        },
     };
     let copy_ticks = crate::arch::rtc::ticks();
     let Some(receiver_process_id) = multitask::current_user_process_id() else {
@@ -3045,7 +3072,8 @@ pub(super) fn call_linux_syscall_fast_endpoint(
     let (caller_process_id, caller_task_id) =
         multitask::current_user_log_ids().ok_or(LINUX_EINVAL)?;
     note_fast_ipc(IpcFastCounter::AdmissionAttempt);
-    if let Some(response) =
+    if response_capacity <= kernel_ipc_runtime::api::IPC_FAST_INLINE_BYTES
+        && let Some(response) =
         try_fast_ipc_call_bytes::<{ kernel_ipc_runtime::api::IPC_FAST_INLINE_BYTES }>(
             endpoint,
             caller_process_id,

@@ -157,7 +157,9 @@ fn fast_call_rejects_oversize_and_ordinary_queue_without_partial_publication() {
             super::super::reserve_fast_endpoint_call(endpoint, 80, 8, b"four", None),
             Err(super::super::IpcError::NoMemory)
         );
-        let oversized = [0_u8; 257];
+        // Past the fast limit (not merely past the inline image) is the only shape
+        // a rendezvous frame refuses.
+        let oversized = std::vec![0_u8; super::super::IPC_FAST_MAX_BYTES + 1];
         assert_eq!(
             super::super::reserve_fast_endpoint_call(endpoint, 80, 8, &oversized, None),
             Err(super::super::IpcError::InvalidArgument)
@@ -437,3 +439,63 @@ fn queued_request_keeps_custody_from_publication_until_its_reply() {
         assert!(super::super::endpoint_reply_custody_returned(reply, 41));
     });
 }
+
+#[test]
+fn a_message_larger_than_the_inline_image_rides_the_same_frame_in_both_directions() {
+    with_isolated_ipc_test(|| {
+        let endpoint = super::super::create_endpoint().expect("create endpoint");
+        let inline = super::super::IPC_FAST_INLINE_BYTES;
+        for len in [inline + 1, 1000, super::super::IPC_FAST_MAX_BYTES] {
+            super::super::add_endpoint_receiver_waiter_with_capacity(endpoint, 61, len)
+                .expect("add waiter");
+            let request: std::vec::Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            let (reply, receiver) = super::super::reserve_fast_endpoint_call_with_response_capacity(
+                endpoint, 600, 60, &request, len, None,
+            )
+            .expect("a large request still reserves a rendezvous frame");
+            assert_eq!(receiver, 61);
+            let taken = super::super::take_fast_endpoint_request_inline::<256>(endpoint, 61, len)
+                .expect("take")
+                .expect("published");
+            assert_eq!(taken.request_len, len);
+            assert_eq!(taken.bytes(), request.as_slice());
+            let response: std::vec::Vec<u8> = request.iter().map(|b| b ^ 0x5a).collect();
+            let published = super::super::complete_fast_endpoint_reply_for_task(reply, 61, &response)
+                .expect("a large response fits the caller's declared capacity");
+            assert_eq!(published.terminal_error, None);
+            match super::super::take_fast_endpoint_response_inline::<256>(reply, 60) {
+                Ok(super::super::FastEndpointResponseTake::Spilled(bytes)) => assert_eq!(bytes, response),
+                other => panic!("large response did not spill: {other:?}"),
+            }
+        }
+    });
+}
+
+#[test]
+fn a_register_sized_receiver_cannot_take_a_spilled_request_and_a_short_capacity_is_terminal() {
+    with_isolated_ipc_test(|| {
+        let endpoint = super::super::create_endpoint().expect("create endpoint");
+        let len = super::super::IPC_FAST_INLINE_BYTES + 8;
+        super::super::add_endpoint_receiver_waiter_with_capacity(endpoint, 71, len)
+            .expect("add waiter");
+        let request = std::vec![7_u8; len];
+        let (reply, _) = super::super::reserve_fast_endpoint_call_with_response_capacity(
+            endpoint, 700, 70, &request, 300, None,
+        )
+        .expect("reserve");
+        assert_eq!(
+            super::super::take_fast_endpoint_request_inline::<16>(endpoint, 71, len).unwrap_err(),
+            super::super::IpcError::BufferTooSmall
+        );
+        super::super::take_fast_endpoint_request_inline::<256>(endpoint, 71, len)
+            .expect("take")
+            .expect("published");
+        // 301 > the caller's declared 300: terminal, exactly as for an inline frame.
+        let published = super::super::complete_fast_endpoint_reply_for_task(
+            reply, 71, &std::vec![1_u8; 301],
+        )
+        .expect("publish");
+        assert_eq!(published.terminal_error, Some(super::super::IpcError::BufferTooSmall));
+    });
+}
+

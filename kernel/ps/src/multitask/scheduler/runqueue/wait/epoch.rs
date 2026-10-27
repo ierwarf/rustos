@@ -123,11 +123,26 @@ impl<'a> TypedWake<'a> {
         kind: u8,
         id: u64,
     ) -> Option<Self> {
+        Self::capture_expected(binding, kind, id, None)
+    }
+
+    /// A retry must acquire the pending phase at its observed epoch, not a
+    /// newer same-kind/object wait that raced the caller's preliminary check.
+    pub(in crate::multitask::scheduler) fn capture_at_serial(
+        binding: &'a Binding, kind: u8, id: u64, serial: u64,
+    ) -> Option<Self> {
+        Self::capture_expected(binding, kind, id, Some(serial))
+    }
+
+    fn capture_expected(
+        binding: &'a Binding, kind: u8, id: u64, expected_serial: Option<u64>,
+    ) -> Option<Self> {
         if kind == REASON_NONE {
             return None;
         }
         with(binding.slot(), |state| {
             if state.pending.is_some()
+                || expected_serial.is_some_and(|serial| serial != state.serial)
                 || super::reason_locked(binding.slot()) != (kind, id)
                 || owner(binding.slot()).state.is_terminal()
             {

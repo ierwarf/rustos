@@ -74,10 +74,12 @@ impl Counters {
     pub fn account(&mut self, slot: usize, ns: u64) {
         self.runtime_profile_ns[slot] = self.runtime_profile_ns[slot].saturating_add(ns);
     }
+    #[cfg(test)]
     pub fn dispatch(&mut self, slot: usize) {
         self.runtime_profile_dispatches[slot] =
             self.runtime_profile_dispatches[slot].saturating_add(1);
     }
+    #[cfg(test)]
     pub fn entry(&mut self, cause: SchedulerEntryCause) {
         let n = &mut self.runtime_profile_entry_counts[cause as usize];
         *n = n.saturating_add(1);
@@ -191,15 +193,6 @@ impl Drop for Drain {
         DRAINING.store(false, Ordering::Release);
     }
 }
-/// [`local`] for a caller that already excludes interrupts on `cpu` and holds
-/// its index (the IPC lane): no second mask and no index derivation.
-pub(in crate::multitask::scheduler) fn local_masked<R>(
-    cpu: usize,
-    f: impl FnOnce(&mut Counters) -> R,
-) -> R {
-    CELLS[cpu].with(f)
-}
-
 pub(in crate::multitask::scheduler) fn local<R>(f: impl FnOnce(&mut Counters) -> R) -> R {
     #[cfg(not(test))]
     {
@@ -337,6 +330,7 @@ pub(in crate::multitask::scheduler) fn lane_entry_cause(cpu: usize, cause: Sched
 }
 /// Fold `cpu`'s batched lane rows into its diagnostic leaf now (IRQs masked on
 /// `cpu`, or `cpu` quiescent).
+#[cfg(test)]
 pub(in crate::multitask::scheduler) fn lane_flush(cpu: usize) {
     let pending = lane_pending(cpu);
     if pending.used != 0 || pending.switches != 0 {

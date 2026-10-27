@@ -387,7 +387,26 @@ pub(super) unsafe fn retained_wake_matching(
 ) -> Result<Binding, bool> {
     // SAFETY: forward the original caller custody without additional admission.
     unsafe {
-        retained_wake_admitted(binding, expected, eligible_cpus, |_| true, on_wake, false, false)
+        retained_wake_admitted(binding, expected, None, eligible_cpus, |_| true, on_wake, false, false)
+    }
+}
+
+/// Exact-epoch admission for a refused wake's observation token.
+///
+/// # Safety
+/// Same original masked CPU and physical binding as `retained_wake_matching`.
+/// The serial is checked under the epoch leaf that establishes the pending
+/// phase, never used as frame or lifetime authority.
+pub(super) unsafe fn retained_wake_matching_instance(
+    binding: Binding,
+    instance: (u64, u8, u64),
+    eligible_cpus: &dyn Fn(usize) -> u64,
+) -> Result<Binding, bool> {
+    let (serial, kind, id) = instance;
+    // SAFETY: the caller retains original masked CPU custody through all effects.
+    unsafe {
+        retained_wake_admitted(binding, Some((kind, id)), Some(serial), eligible_cpus,
+            |_| true, |_| true, false, false)
     }
 }
 
@@ -406,7 +425,7 @@ pub(super) unsafe fn retained_wake_matching_sync(
 ) -> Result<Binding, bool> {
     // SAFETY: forwarded unchanged from the caller's obligations.
     unsafe {
-        retained_wake_admitted(binding, expected, eligible_cpus, |_| true, on_wake, false, true)
+        retained_wake_admitted(binding, expected, None, eligible_cpus, |_| true, on_wake, false, true)
     }
 }
 
@@ -425,7 +444,7 @@ pub(super) unsafe fn receive_call(
     // SAFETY: forward original masked CPU and physical receiver; caller keeps
     // its sender/funding loans until this same phase and last effect end.
     unsafe { retained_wake_admitted(binding,
-        Some((runqueue::wait::REASON_ENDPOINT_RECEIVE, endpoint)), eligible_cpus,
+        Some((runqueue::wait::REASON_ENDPOINT_RECEIVE, endpoint)), None, eligible_cpus,
         before_wake, on_wake, true, true) }
 }
 
@@ -434,6 +453,7 @@ pub(super) unsafe fn receive_call(
 unsafe fn retained_wake_admitted(
     binding: Binding,
     expected: Option<(u8, u64)>,
+    expected_serial: Option<u64>,
     eligible_cpus: &dyn Fn(usize) -> u64,
     before_wake: impl FnOnce(&Binding) -> bool,
     on_wake: impl FnOnce(&Binding) -> bool,
@@ -441,9 +461,11 @@ unsafe fn retained_wake_admitted(
     sync_wake: bool,
 ) -> Result<Binding, bool> {
     let typed = if let Some((kind, id)) = expected {
-        let Some(loan) = runqueue::wait::TypedWake::capture(&binding, kind, id) else {
-            return Err(false);
+        let loan = match expected_serial {
+            Some(serial) => runqueue::wait::TypedWake::capture_at_serial(&binding, kind, id, serial),
+            None => runqueue::wait::TypedWake::capture(&binding, kind, id),
         };
+        let Some(loan) = loan else { return Err(false) };
         Some(loan)
     } else {
         None

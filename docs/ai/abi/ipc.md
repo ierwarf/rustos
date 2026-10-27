@@ -128,6 +128,11 @@ allocation loan and do not bind or walk user pages. This snapshot permits IPC
 identity/owner checks only, never user-memory access. Exec/exit/stale-slot
 refusals remain mandatory; diagnostic PID/TID publications are not authority.
 
+A rendezvous frame carries up to one maximum IPC message (64 KiB) each way: the
+inline 256-byte images plus an owned spill for the rest. A caller's declared reply
+capacity above that is clamped. An unfused `REPLY` holds its caller's wake until
+the same task's next blocking receive (or its next syscall or scheduler entry).
+
 The transport still owns its existing fixed frame, but short request/response
 return images are specialized to 16 bytes, rather than copying 256-byte arrays
 through every Rust layer. Exact object-slot transactions, caller/receiver checks,

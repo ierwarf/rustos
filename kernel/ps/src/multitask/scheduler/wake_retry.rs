@@ -19,6 +19,7 @@
 //!   milestones.
 
 use core::cell::UnsafeCell;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use nucleus_core::util::lockdep::{DispatchPreemption, MAX_TRACKED_CPUS};
 
@@ -72,14 +73,29 @@ impl Queue {
     }
 }
 
-struct Queues([UnsafeCell<Queue>; MAX_TRACKED_CPUS]);
+struct CpuQueue {
+    queue: UnsafeCell<Queue>,
+    // CPU-private queue contents; the pending observation may be read remotely
+    // to prevent a periodic IRQ from bypassing durable retry work.
+    pending: AtomicBool,
+}
+
+struct Queues([CpuQueue; MAX_TRACKED_CPUS]);
 
 // SAFETY: only the indexed CPU accesses its queue, always with local interrupts
 // masked by an original `DispatchPreemption` scope, and a masked kernel frame
 // never migrates, so no two contexts alias one cell.
 unsafe impl Sync for Queues {}
 
-static QUEUES: Queues = Queues([const { UnsafeCell::new(Queue::new()) }; MAX_TRACKED_CPUS]);
+static QUEUES: Queues = Queues([const {
+    CpuQueue { queue: UnsafeCell::new(Queue::new()), pending: AtomicBool::new(false) }
+}; MAX_TRACKED_CPUS]);
+
+/// Retry observations are local scheduler work even with empty fair/FIFO queues.
+/// A single refused service attempt must not let subsequent idle ticks bypass it.
+pub(in crate::multitask) fn pending(cpu: usize) -> bool {
+    QUEUES.0.get(cpu).is_some_and(|cell| cell.pending.load(Ordering::Acquire))
+}
 
 fn scoped(scope: &DispatchPreemption<'_>) -> bool {
     scope.is_masked()
@@ -95,8 +111,14 @@ fn with_queue<R>(scope: &DispatchPreemption<'_>, f: impl FnOnce(&mut Queue) -> R
 /// # Safety
 /// `cpu` is the current CPU and the caller holds its masked dispatch scope.
 unsafe fn with_cpu_queue<R>(cpu: usize, f: impl FnOnce(&mut Queue) -> R) -> R {
+    let cell = &QUEUES.0[cpu];
     // SAFETY: forwarded from the caller's exclusive masked custody of `cpu`.
-    f(unsafe { &mut *QUEUES.0[cpu].get() })
+    let queue = unsafe { &mut *cell.queue.get() };
+    let result = f(queue);
+    // ORDERING: publish the resulting durable-work observation after queue
+    // mutation. This CPU cannot take a periodic IRQ until the mask is released.
+    cell.pending.store(queue.len != 0, Ordering::Release);
+    result
 }
 
 fn live_slot(task_id: u64) -> Option<usize> {
@@ -197,6 +219,15 @@ fn retry(
     token: Token,
     eligible_cpus: &dyn Fn(usize) -> u64,
 ) -> Retry {
+    retry_after_observing(scope, token, eligible_cpus, || {})
+}
+
+fn retry_after_observing(
+    scope: &DispatchPreemption<'_>,
+    token: Token,
+    eligible_cpus: &dyn Fn(usize) -> u64,
+    before_capture: impl FnOnce(),
+) -> Retry {
     if stack_resources::task_start::read(token.slot).map(|start| start.id) != Some(token.task_id) {
         return Retry::Done;
     }
@@ -209,6 +240,7 @@ fn retry(
             }
         }
     }
+    before_capture();
     let Some(binding) = wake_publication::Binding::capture(token.slot, token.task_id) else {
         return Retry::Keep;
     };
@@ -216,11 +248,8 @@ fn retry(
     // SAFETY: `scoped` proved the original masked CPU custody that the typed
     // wake engine requires; the fresh binding is consumed by this one wake.
     match unsafe {
-        wake_publication::retained_wake_matching(
-            binding,
-            Some((token.kind, token.id)),
-            eligible_cpus,
-            |_| true,
+        wake_publication::retained_wake_matching_instance(
+            binding, (token.serial, token.kind, token.id), eligible_cpus,
         )
     } {
         Ok(_) | Err(true) => Retry::Done,

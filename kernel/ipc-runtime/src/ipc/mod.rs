@@ -847,6 +847,12 @@ struct ReplyObject {
 
 pub const IPC_FAST_INLINE_BYTES: usize = 256;
 
+/// Largest request or response a rendezvous frame carries. Bytes beyond the inline
+/// image ride a spill buffer the frame owns (allocated for that call only), so a
+/// large message takes the same reserve / hand off / reply transaction as a small
+/// one instead of the queued message and reply objects.
+pub const IPC_FAST_MAX_BYTES: usize = rustos_user_abi::syscall::IPC_MAX_INLINE_BYTES;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum FastCallState {
     RequestReady,
@@ -869,6 +875,16 @@ struct FastCallFrame {
     terminal_error: Option<IpcError>,
     request: [u8; IPC_FAST_INLINE_BYTES],
     response: [u8; IPC_FAST_INLINE_BYTES],
+    /// Request and response bytes that do not fit the inline images. Present only
+    /// for a message larger than `IPC_FAST_INLINE_BYTES`; the common frame pays one
+    /// null check at retirement.
+    spill: Option<alloc::boxed::Box<FastSpill>>,
+}
+
+#[derive(Clone, Default)]
+struct FastSpill {
+    request: Vec<u8>,
+    response: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -878,6 +894,19 @@ pub struct FastEndpointReceived<const N: usize = IPC_FAST_INLINE_BYTES> {
     pub caller_task_id: u64,
     pub request_len: usize,
     pub request: [u8; N],
+    /// The whole request when it exceeds `IPC_FAST_INLINE_BYTES`; `request` is then
+    /// unused.
+    pub spill: Option<Vec<u8>>,
+}
+
+impl<const N: usize> FastEndpointReceived<N> {
+    /// The request bytes wherever they live.
+    pub fn bytes(&self) -> &[u8] {
+        match &self.spill {
+            Some(spill) => spill,
+            None => &self.request[..self.request_len],
+        }
+    }
 }
 
 /// Exact custody returned when a published fast reservation is rolled back
@@ -903,6 +932,8 @@ pub enum FastEndpointResponseTake<const N: usize = IPC_FAST_INLINE_BYTES> {
         response_len: usize,
         response: [u8; N],
     },
+    /// A response larger than the inline image.
+    Spilled(Vec<u8>),
     Error(IpcError),
 }
 
@@ -1755,9 +1786,21 @@ pub fn reserve_fast_endpoint_call_with_response_capacity(
     response_capacity: usize,
     scheduling_context: Option<ReplySchedulingContextCustody>,
 ) -> Result<(KernelReplyHandle, u64), IpcError> {
-    if request.is_empty() || request.len() > IPC_FAST_INLINE_BYTES {
+    if request.is_empty() || request.len() > IPC_FAST_MAX_BYTES
+        || response_capacity > IPC_FAST_MAX_BYTES
+    {
         return Err(IpcError::InvalidArgument);
     }
+    // Allocated before any lock: a failure is the ordinary "no frame" fallback.
+    let spill = if request.len() > IPC_FAST_INLINE_BYTES {
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(request.len()).map_err(|_| IpcError::NoMemory)?;
+        bytes.extend_from_slice(request);
+        Some(alloc::boxed::Box::new(FastSpill { request: bytes, response: Vec::new() }))
+    } else {
+        None
+    };
+    let mut spill = spill;
 
     ENDPOINTS
         .with_mut(endpoint.raw(), |endpoint_object| {
@@ -1792,8 +1835,11 @@ pub fn reserve_fast_endpoint_call_with_response_capacity(
                     terminal_error: None,
                     request: [0; IPC_FAST_INLINE_BYTES],
                     response: [0; IPC_FAST_INLINE_BYTES],
+                    spill: spill.take(),
                 };
-                frame.request[..request.len()].copy_from_slice(request);
+                if frame.spill.is_none() {
+                    frame.request[..request.len()].copy_from_slice(request);
+                }
                 ReplyObject {
                     message_id: 0,
                     receiver_owner,
@@ -1937,7 +1983,7 @@ pub fn take_fast_endpoint_request_inline<const N: usize>(
                 endpoint_object,
                 endpoint,
                 receiver_task_id,
-                request_capacity.min(IPC_FAST_INLINE_BYTES).min(N),
+                request_capacity.min(IPC_FAST_MAX_BYTES),
             )
         })
         .ok_or(IpcError::InvalidHandle)?
@@ -1962,15 +2008,26 @@ pub fn complete_fast_endpoint_reply_for_task(
             {
                 return Err(IpcError::PermissionDenied);
             }
-            let terminal_error = (response.len() > IPC_FAST_INLINE_BYTES
+            let mut terminal_error = (response.len() > IPC_FAST_MAX_BYTES
                 || response.len() > frame.caller_response_capacity)
                 .then_some(IpcError::BufferTooSmall);
+            if terminal_error.is_none() && response.len() > IPC_FAST_INLINE_BYTES {
+                let mut bytes = Vec::new();
+                if bytes.try_reserve_exact(response.len()).is_err() {
+                    terminal_error = Some(IpcError::NoMemory);
+                } else {
+                    bytes.extend_from_slice(response);
+                    frame.spill.get_or_insert_with(Default::default).response = bytes;
+                }
+            }
             if let Some(error) = terminal_error {
                 frame.response_len = 0;
                 frame.terminal_error = Some(error);
                 frame.state = FastCallState::ErrorReady;
             } else {
-                frame.response[..response.len()].copy_from_slice(response);
+                if response.len() <= IPC_FAST_INLINE_BYTES {
+                    frame.response[..response.len()].copy_from_slice(response);
+                }
                 frame.response_len = response.len();
                 frame.state = FastCallState::ResponseReady;
             }
@@ -2054,6 +2111,19 @@ pub fn take_fast_endpoint_response_inline<const N: usize>(
                 break 'take (Ok(FastEndpointResponseTake::Pending), false);
             }
             reply_object.consumed = true;
+            if frame.response_len > IPC_FAST_INLINE_BYTES {
+                let spilled = reply_object
+                    .fast_frame
+                    .as_mut()
+                    .and_then(|frame| frame.spill.as_mut())
+                    .map(|spill| core::mem::take(&mut spill.response));
+                break 'take match spilled {
+                    Some(bytes) if N >= IPC_FAST_INLINE_BYTES => {
+                        (Ok(FastEndpointResponseTake::Spilled(bytes)), true)
+                    }
+                    _ => (Err(IpcError::BufferTooSmall), true),
+                };
+            }
             if frame.response_len > N {
                 break 'take (Err(IpcError::BufferTooSmall), true);
             }

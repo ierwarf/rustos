@@ -401,7 +401,15 @@ pub(super) fn reply_published(
     if !exact && live { return None; }
     Some(if wake_publication::reply_switching(scope, reply, caller, eligible_cpus, switch) {
         FastIpcReplyHandoffOutcome::LocalFallback
-    } else { FastIpcReplyHandoffOutcome::Rejected })
+    } else {
+        // The response is already published and the server may now sleep.
+        // A transient frame/Current-return refusal must not discard its only
+        // wake. Retain an observation of the exact reply wait for a later IRQ;
+        // this grants no fresh wake/frame custody and cannot clear a newer epoch.
+        let _ = wake_retry::record_in(scope, caller,
+            Some((runqueue::wait::REASON_ENDPOINT_REPLY, reply)));
+        FastIpcReplyHandoffOutcome::Rejected
+    })
 }
 
 /// Blocked within the last millisecond; `since == 0` means no commit time was

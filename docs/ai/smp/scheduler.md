@@ -353,7 +353,16 @@ by seL4 while preserving RustOS sender identity and deadline semantics:
   release donation, wake the exact caller, and publish its synchronous FIFO
   handoff. Queued and rendezvous byte replies carry the same exact completion
   custody into deferred settlement at the receive block; immediate receive/error
-  settles it without blocking, and a raced block retry cannot consume it twice;
+  settles it without blocking, and a raced block retry cannot consume it twice.
+  If the exact completion wake is transiently refused while the caller's reply
+  wait remains published, the common reply producer records an epoch-bound retry
+  observation before the server sleeps. Retry-pending state defeats periodic
+  continuation retention until the queue resolves or expires, including repeated
+  refusals on an otherwise idle CPU. A later IRQ reacquires actual typed wake
+  custody and compares the observed serial under the same epoch leaf that
+  establishes the pending phase; a changed epoch or recycled task invalidates it.
+  Refusal diagnostics inside a live dispatch scope only log/expedite: they must
+  not acquire a nested dispatch owner to record an already-retained retry;
 - the sender-stamped receive half arms the scheduler first, then under one
   endpoint slot guard consumes the exact fast frame or priority-queue head, or
   publishes a bounded receiver waiter. Every non-waiting result cancels the

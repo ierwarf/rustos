@@ -292,7 +292,9 @@ pub fn complete_fast_ipc_reply_wake_handoff_with_custody(
     // No generic fresh-lookup fallback after ORIGINAL typed-wait refusal.
     let woken = outcome != scheduler::FastIpcReplyHandoffOutcome::Rejected;
     if !woken {
-        record_refused_reply_wake("ipc-fast-reply-wake-refused", reply, completion.caller_task_id, REPLY_WAIT);
+        // The common producer already recorded the retry in this scope.
+        // Diagnostics must not acquire a second dispatch-preemption owner.
+        note_refused_reply_wake("ipc-fast-reply-wake-refused", reply, completion.caller_task_id);
     }
     woken
 }
@@ -380,12 +382,8 @@ pub(in crate::multitask) fn settle_deferred_fast_ipc_reply_in(
     )
     .expect("deferred fast reply returned stale scheduling-context custody");
     if outcome == scheduler::FastIpcReplyHandoffOutcome::Rejected {
-        record_refused_reply_wake(
-            "ipc-fast-reply-wake-refused",
-            reply,
-            completion.caller_task_id,
-            REPLY_WAIT,
-        );
+        // `scope` is the scheduler entry's original owner, still live here.
+        note_refused_reply_wake("ipc-fast-reply-wake-refused", reply, completion.caller_task_id);
     }
 }
 
@@ -399,9 +397,9 @@ pub fn complete_ipc_reply_wake_handoff(reply: u64, task_id: u64) -> bool {
     woken
 }
 
-/// A refused reply wake leaves the caller to its deadline. Recording it ties
-/// a later caller-side timeout or a long-blocked report to the exact reply.
-/// Bounded to the first occurrences and then exponentially spaced counts.
+/// Refused terminal wakes retain a bounded exact-wait retry and diagnostics.
+/// Fast producers record within their original scope; unscoped terminal paths
+/// use the recording wrapper below. Diagnostics are exponentially rate limited.
 const REPLY_WAIT: fn(u64, u64) -> bool = scheduler::wake_retry::record_refused_reply;
 const PAGER_FAULT_WAIT: fn(u64, u64) -> bool = scheduler::wake_retry::record_refused_pager_fault;
 
@@ -411,11 +409,17 @@ fn record_refused_reply_wake(
     task_id: u64,
     retry: fn(u64, u64) -> bool,
 ) {
-    use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
     // Retry this exact reply/fault wait at this CPU's next scheduler entry.
     // A pager-fault wait has no deadline waiter, so without this a refused
     // fault completion parked the faulting task indefinitely.
     let _ = retry(task_id, reply);
+    note_refused_reply_wake(name, reply, task_id);
+}
+
+/// Log/expedite only: the producer may still hold its original dispatch scope.
+/// Retry recording belongs to that producer, never a nested scope here.
+fn note_refused_reply_wake(name: &'static str, reply: u64, task_id: u64) {
+    use core::sync::atomic::{AtomicU64, Ordering::Relaxed};
     // A refused exact wake can leave the caller blocked with its response
     // already queued (the refusal paths give up before clearing the wait when
     // the caller's frame is between publications). Make its armed reply
@@ -492,6 +496,40 @@ mod tests {
                 ReplyCompletion { caller_task_id: id, scheduling_context: Some(custody) })
         });
         assert_eq!(outcome.ok(), Some(false), "a late reply cannot panic or revive its retired caller");
+    }
+
+    #[test]
+    fn refused_fast_reply_uses_original_scope_without_nested_retry_owner() {
+        use crate::multitask::scheduler::{self, root_creation};
+        use crate::user::abi::UserAbi;
+        use kernel_ipc_runtime::api::{ReplyCompletion, ReplySchedulingContextCustody};
+        let id = 132302;
+        root_creation::tests::exec_root(id, true,
+            root_creation::tests::bootstrap(UserAbi::Linux), |_, _| {
+                let mut scope = nucleus_core::util::lockdep::DispatchPreemption::enter_model(0);
+                scope.mask_irqs();
+                let admission = scheduler::donation_publication::reserve_call_with(&scope, id);
+                assert!(admission.donation_reserved);
+                let custody = ReplySchedulingContextCustody::new_with_owner(
+                    admission.scheduling_context.unwrap(), id, id).unwrap();
+                assert!(scheduler::cancel_reply_donation_reservation(id));
+                drop(scope);
+                // The caller is not waiting on this reply. Actual publication
+                // refuses under its own scope; logging must not enter a second
+                // scope merely to record the same refusal again.
+                let outcome = std::panic::catch_unwind(|| {
+                    super::complete_fast_ipc_reply_wake_handoff_with_custody(0x9898,
+                        ReplyCompletion { caller_task_id: id, scheduling_context: Some(custody) })
+                });
+                assert_eq!(outcome.ok(), Some(false));
+            });
+        // The scheduler-entry variant borrows a scope and cannot drop/reopen
+        // it. Pin its logging-only refusal route as well as the real call above.
+        let source = include_str!("ipc.rs").split("#[cfg(test)]").next().unwrap();
+        let deferred = source.split("fn settle_deferred_fast_ipc_reply_in(").nth(1).unwrap()
+            .split("pub fn complete_ipc_reply_wake_handoff(").next().unwrap();
+        assert!(deferred.contains("note_refused_reply_wake("));
+        assert!(!deferred.contains("record_refused_reply_wake("));
     }
 
     #[test]

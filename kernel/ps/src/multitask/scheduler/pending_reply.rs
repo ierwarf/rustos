@@ -16,7 +16,7 @@
 //!   waking from the cell without the reply's scheduling-context custody.
 //! - **Evidence:** `tests` below; the differential against the unfused path is the
 //!   `ipc_rt_intra_process` probe.
-use super::{runqueue, task_directory};
+use super::{resident, runqueue, task_directory};
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, Ordering};
 use kernel_ipc_runtime::api::ReplyCompletion;
@@ -38,8 +38,6 @@ struct Cell {
 // SAFETY: element `cpu` is read and written only by `cpu` with its IRQs masked.
 unsafe impl Sync for Cell {}
 
-static WHY: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0); // GDIAG
-static LASTSTATE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0); // GDIAG
 static CELLS: [CachePadded<Cell>; MAX_TRACKED_CPUS] = [const {
     CachePadded::new(Cell { present: AtomicBool::new(false), value: UnsafeCell::new(None) })
 }; MAX_TRACKED_CPUS];
@@ -70,13 +68,16 @@ pub(in crate::multitask) fn present() -> bool {
 /// back lets the replier's own block carry the switch. Anywhere else an immediate
 /// wake is the faster answer.
 fn caller_parked_on(caller: u64, cpu: usize) -> bool {
-    let Some(slot) = task_directory::hint(caller) else { WHY.fetch_or(1, Ordering::Relaxed); return false }; // GDIAG
+    let Some(slot) = task_directory::hint(caller) else { return false };
     let owner = runqueue::owner(slot);
-    if owner.state != runqueue::RunOwnerState::Blocked { WHY.fetch_or(2, Ordering::Relaxed); } // GDIAG
-    if owner.cpu != Some(cpu) { WHY.fetch_or(4, Ordering::Relaxed); } // GDIAG
-    if owner.runnable { WHY.fetch_or(8, Ordering::Relaxed); } // GDIAG
-    LASTSTATE.store(owner.state as u64, Ordering::Relaxed); // GDIAG
-    owner.state == runqueue::RunOwnerState::Blocked && owner.cpu == Some(cpu) && !owner.wait_armed
+    // A Blocked owner word names no CPU: the resident cell does (an IPC wait
+    // parks its loans where it blocked), and a wait that parked nothing wakes
+    // on the CPU it last ran on.
+    owner.state == runqueue::RunOwnerState::Blocked
+        && !owner.wait_armed
+        && resident::parked_cpu(slot, owner.generation)
+            .unwrap_or_else(|| usize::from(runqueue::affinity_payload::last_cpu(slot)))
+            == cpu
 }
 
 /// Defer the caller wake of a completed fast reply. `false`: nothing was stored and
@@ -91,13 +92,6 @@ pub(in crate::multitask) fn stash(
         let Some(cell) = CELLS.get(cpu) else { return false };
         // SAFETY: see `Cell`.
         let slot = unsafe { &mut *cell.value.get() };
-        static N: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0); // GDIAG
-        static OCC: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0); // GDIAG
-        static PARK: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0); // GDIAG
-        let n = N.fetch_add(1, Ordering::Relaxed); // GDIAG
-        if slot.is_some() { OCC.fetch_add(1, Ordering::Relaxed); } // GDIAG
-        else if !caller_parked_on(completion.caller_task_id, cpu) { PARK.fetch_add(1, Ordering::Relaxed); } // GDIAG
-        if n % 512 == 511 { nucleus_core::debug::record_milestone(nucleus_core::debug::LogCategory::Sched, "prstash", (WHY.load(Ordering::Relaxed) << 56) | (LASTSTATE.load(Ordering::Relaxed) << 48) | (OCC.load(Ordering::Relaxed) << 24) | PARK.load(Ordering::Relaxed), n); } // GDIAG
         if slot.is_some() || !caller_parked_on(completion.caller_task_id, cpu) {
             return false;
         }

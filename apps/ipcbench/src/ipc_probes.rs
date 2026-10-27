@@ -18,7 +18,7 @@ use std::thread;
 use std::time::Duration;
 
 use rustos_user_abi::syscall::{
-    IpcReplyRecvWithSenderArgs, IPC_ABI_VERSION, SYS_RUSTOS_IPC_CALL,
+    IpcReplyRecvWithSenderArgs, IPC_ABI_VERSION, SYS_RUSTOS_IPC_CALL, SYS_RUSTOS_IPC_CALL_WITH_HANDLES,
     SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_RECV_WITH_SENDER, SYS_RUSTOS_IPC_REPLY,
     SYS_RUSTOS_IPC_REPLY_RECV_WITH_SENDER, SYS_RUSTOS_IPC_TRY_RECV,
     ipc_register_syscall, SYS_RUSTOS_IPC_REGISTER_CALL, SYS_RUSTOS_IPC_REGISTER_RECV,
@@ -45,22 +45,30 @@ const _: [(); 16] = [(); size_of::<BenchMsg>()];
 enum CallMode {
     Buffer,
     Registers,
+    /// 16-byte echo into a 272-byte response buffer: past the inline image, inside
+    /// the rendezvous limit, so it rides the frame's spill.
+    Large,
+    /// The handle-bearing call form with no descriptors: the transport is the queued
+    /// message/reply objects even though its server is parked.
     Queued,
 }
 
-// A byte-only CALL with reply capacity > the runtime's 256-byte fixed frame
-// must enqueue even when its server is already parked. Keep the payload at
-// 16 bytes and provide real backing for the entire advertised capacity.
-const FAST_REPLY_LIMIT: usize = 256;
-#[repr(C)]
-struct BenchReply {
-    message: BenchMsg,
-    tail: [u8; FAST_REPLY_LIMIT],
-}
+// The rendezvous frame carries up to one maximum IPC message each way, so a
+// declared reply capacity above it is clamped, not a reason to enqueue.
+const FAST_REPLY_LIMIT: usize = 64 * 1024;
+const LARGE_REPLY_TAIL: usize = 256;
 
 impl CallMode {
+    /// Bytes behind the response message, all of which the bench checks stay untouched.
+    fn tail_bytes(self) -> usize {
+        match self {
+            Self::Large => LARGE_REPLY_TAIL,
+            Self::Buffer | Self::Registers | Self::Queued => 0,
+        }
+    }
+
     fn reply_capacity(self) -> usize {
-        if self == Self::Queued { size_of::<BenchReply>() } else { size_of::<BenchMsg>() }
+        size_of::<BenchMsg>() + self.tail_bytes()
     }
 }
 
@@ -104,8 +112,9 @@ mod tests {
 
     #[test]
     fn queued_probe_exceeds_the_actual_fast_response_capacity_with_real_backing() {
-        assert_eq!(CallMode::Queued.reply_capacity(), 272);
-        assert!(CallMode::Queued.reply_capacity() > FAST_REPLY_LIMIT);
+        assert_eq!(CallMode::Queued.reply_capacity(), 16);
+        assert_eq!(CallMode::Large.reply_capacity(), 272);
+        assert!(CallMode::Large.reply_capacity() <= FAST_REPLY_LIMIT);
         assert_eq!(CallMode::Buffer.reply_capacity(), 16);
         assert_eq!(CallMode::Registers.reply_capacity(), 16);
         // This is an intentional shape rejection, not a statistical assertion
@@ -113,10 +122,14 @@ mod tests {
         // admission condition changes under the benchmark.
         let runtime = include_str!("../../../kernel/ipc-runtime/src/ipc/mod.rs");
         assert!(runtime.contains("pub const IPC_FAST_INLINE_BYTES: usize = 256;"));
+        assert!(runtime.contains(
+            "pub const IPC_FAST_MAX_BYTES: usize = rustos_user_abi::syscall::IPC_MAX_INLINE_BYTES;"
+        ));
+        assert_eq!(rustos_user_abi::syscall::IPC_MAX_INLINE_BYTES, FAST_REPLY_LIMIT);
         let compat = include_str!("../../../kernel/compat/src/user/syscall/linux/ipc_ops.rs");
         let admission = compat.split("fn try_fast_ipc_call(").nth(1).unwrap()
             .split("struct FastCallResponse").next().unwrap();
-        assert!(admission.contains("if reply_capacity > kernel_ipc_runtime::api::IPC_FAST_INLINE_BYTES"));
+        assert!(admission.contains("declared_capacity.min(kernel_ipc_runtime::api::IPC_FAST_MAX_BYTES)"));
         assert!(admission.contains("return Ok(None);"));
     }
 
@@ -380,8 +393,18 @@ pub(crate) fn probe_ipc_intra_process_reply_recv(tsc_khz: u64) {
     );
 }
 
+/// Large-buffer rendezvous: same 16-byte echo and fused server, but the caller
+/// advertises a genuinely backed 272-byte response capacity.
+pub(crate) fn probe_ipc_large_reply_recv(tsc_khz: u64) {
+    measure_intra_process_round_trip(
+        tsc_khz, "ipc_rt_intra_process_large_reply_recv",
+        ["ipc_split_large_call_to_recv", "ipc_split_large_server_body", "ipc_split_large_reply_to_return"],
+        bench_server_reply_recv, CallMode::Large,
+    );
+}
+
 /// Current queued slowpath only: same 16-byte echo and fused server, but the
-/// caller advertises a genuinely backed 272-byte response capacity.
+/// caller uses the handle-bearing form (no descriptors), which always enqueues.
 pub(crate) fn probe_ipc_queued_reply_recv(tsc_khz: u64) {
     measure_intra_process_round_trip(
         tsc_khz, "ipc_rt_intra_process_queued_reply_recv",
@@ -545,8 +568,11 @@ fn measure_intra_process_round_trip(
         op: BENCH_OP_PING,
         seq: 0,
     };
-    let mut response_storage = BenchReply { message: BenchMsg::default(), tail: [0xcc; FAST_REPLY_LIMIT] };
-    let mut response = &mut response_storage.message;
+    // One word-aligned allocation: the response message first, the checked tail behind it.
+    let mut backing = vec![0xcccc_cccc_cccc_cccc_u64; mode.reply_capacity().div_ceil(8)];
+    // SAFETY: the allocation is at least `size_of::<BenchMsg>()` bytes and 8-aligned.
+    let mut response = unsafe { &mut *(backing.as_mut_ptr() as *mut BenchMsg) };
+    *response = BenchMsg::default();
     let reply_capacity = mode.reply_capacity();
     let mut call = |request: &BenchMsg, response: &mut BenchMsg| -> i64 {
         if mode == CallMode::Registers {
@@ -554,6 +580,29 @@ fn measure_intra_process_round_trip(
                 endpoint, 16, [request.op, request.seq], 0) };
             *response = BenchMsg { op: result.words[0], seq: result.words[1] };
             return result.status;
+        }
+        if mode == CallMode::Queued {
+            // The handle form requires a count word even when no descriptor returns.
+            let mut received_fd_count: u16 = 0;
+            let args = rustos_user_abi::syscall::IpcCallWithHandlesArgs {
+                endpoint,
+                request_ptr: (request as *const BenchMsg) as u64,
+                request_len: size_of::<BenchMsg>() as u64,
+                reply_ptr: (response as *mut BenchMsg) as u64,
+                reply_capacity: reply_capacity as u64,
+                send_fds_ptr: 0,
+                send_fd_count: 0,
+                recv_fd_capacity: 0,
+                reserved0: 0,
+                recv_fds_ptr: 0,
+                recv_fd_count_ptr: (&mut received_fd_count as *mut u16) as u64,
+            };
+            return unsafe {
+                syscall1(
+                    SYS_RUSTOS_IPC_CALL_WITH_HANDLES,
+                    (&args as *const rustos_user_abi::syscall::IpcCallWithHandlesArgs) as u64,
+                )
+            };
         }
         unsafe {
             syscall5(
@@ -609,7 +658,15 @@ fn measure_intra_process_round_trip(
     request.seq = request.seq.wrapping_add(1);
     let stopped = valid_round_trip_reply(call(&request, &mut response), &request, &response);
     let joined = server.join().is_ok();
-    let tail_intact = response_storage.tail.iter().all(|byte| *byte == 0xcc);
+    // SAFETY: `backing` outlives this view; `response` is not used past this point.
+    let tail_intact = unsafe {
+        core::slice::from_raw_parts(
+            (backing.as_ptr() as *const u8).add(size_of::<BenchMsg>()),
+            mode.tail_bytes(),
+        )
+    }
+    .iter()
+    .all(|byte| *byte == 0xcc);
     if !tail_intact {
         skip(name, "reply-tail-overwritten");
         return;
@@ -618,9 +675,10 @@ fn measure_intra_process_round_trip(
         skip(name, "ipc-transcript-invalid");
         return;
     }
-    if mode == CallMode::Queued {
+    if matches!(mode, CallMode::Queued | CallMode::Large) {
+        let transport = if mode == CallMode::Queued { "queued" } else { "rendezvous-spill" };
         crate::debug_line(&format!(
-            "ipcbench: proof name={name} transport=queued request_bytes=16 response_bytes=16 reply_capacity={reply_capacity} fast_reply_limit={FAST_REPLY_LIMIT} warmup={WARMUP} samples={IPC_ITERS} tail_intact=1"
+            "ipcbench: proof name={name} transport={transport} request_bytes=16 response_bytes=16 reply_capacity={reply_capacity} fast_reply_limit={FAST_REPLY_LIMIT} warmup={WARMUP} samples={IPC_ITERS} tail_intact=1"
         ));
     }
     report(name, &summarize(&mut total), tsc_khz);

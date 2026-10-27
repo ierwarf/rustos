@@ -2,7 +2,7 @@ pub use crate::ipc::{
     CancelledCall, CancelledCallDisposition, ChannelIdentity, EndpointCallPriority,
     EndpointReceived, EndpointReceivedWithSender, EndpointResponseTake,
     EndpointResponseWithHandles, EndpointWakeSet, FastEndpointReceived, FastEndpointResponseTake,
-    FastEndpointRollback, FastReplyCompletion, IPC_FAST_INLINE_BYTES, IpcError,
+    FastEndpointRollback, FastReplyCompletion, IPC_FAST_INLINE_BYTES, IPC_FAST_MAX_BYTES, IpcError,
     KernelEndpointHandle, KernelReplyHandle, KernelSharedRegionHandle,
     KernelSharedRegionMappingHold, KernelTransferTicket, KernelTransferredHandle,
     MAX_ENDPOINT_WAKE_TASKS, PreparedReplyHandleBindError, ProcessIdentity, ReplyCompletion,
