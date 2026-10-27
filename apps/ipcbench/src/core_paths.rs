@@ -637,11 +637,36 @@ fn transfer(socket: bool, length: usize) -> Option<Vec<u64>> {
     }
 }
 
+// Preload each message before timing so the receiver never relies on an
+// unimplemented blocking read. This measures a buffered read, not transfer or
+// wakeup latency; every returned byte is checked outside the timed interval.
+fn buffered_socket_read_samples(length: usize) -> Option<Vec<u64>> {
+    let (receive, send) = stream_pair()?;
+    let mut input = vec![0u8; length];
+    let mut output = vec![0u8; length];
+    let mut sequence = 0usize;
+    measure_stamped(contract::DATA_ITERS, contract::DATA_WARMUP, || {
+        input.fill((sequence % 255 + 1) as u8);
+        sequence += 1;
+        output.fill(0);
+        write_all(send.as_raw_fd(), &input).ok()?;
+        let start = tsc();
+        let result = read_all(receive.as_raw_fd(), &mut output);
+        let end = tsc();
+        (result.is_ok() && output == input).then_some(end.wrapping_sub(start))
+    })
+}
+
 pub fn run(suite: &str, khz: u64) {
     match suite {
         contract::SYSCALL => syscalls(khz),
         contract::MEMORY => memory(khz),
         contract::DATA => data(khz),
+        contract::SOCKET_BUFFERED => {
+            for (&name, length) in contract::SOCKET_BUFFERED_PROBES.iter().zip([4096, 32768]) {
+                finish(name, buffered_socket_read_samples(length), khz);
+            }
+        }
         _ => unreachable!("closed core suite vocabulary"),
     }
 }
@@ -649,6 +674,16 @@ pub fn run(suite: &str, khz: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn buffered_socket_read_checks_full_payload_at_both_sizes() {
+        for length in [4096, 32768] {
+            assert_eq!(
+                buffered_socket_read_samples(length).unwrap().len(),
+                contract::DATA_ITERS
+            );
+        }
+    }
 
     #[test]
     fn stream_helpers_preserve_errno_but_do_not_assign_stale_errno_to_eof() {

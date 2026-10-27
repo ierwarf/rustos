@@ -134,6 +134,8 @@ pub(super) fn validate(run: &ParsedRun, suite: &str, linux: bool) -> Result<()> 
                     "thread_clone_exit_join" | "fork_cow_private_write" => 64,
                     _ => 128,
                 }
+            } else if suite == contract::SOCKET_BUFFERED {
+                contract::DATA_ITERS as u64
             } else if suite == contract::DATA {
                 if name.ends_with("_1b") {
                     contract::ITERS as u64
@@ -514,6 +516,27 @@ mod tests {
                 )
                 .is_err()
             );
+        }
+    }
+
+    #[test]
+    fn buffered_socket_suite_requires_both_complete_samples() {
+        let mut log = String::from("ipcbench: begin\nipcbench: tsc_khz=4000000\nipcbench: result name=vmexit_cpuid iters=50000 min=40 p50=100 p99=150 max=500 mean=110 min_ns=10 p50_ns=25\n");
+        for name in contract::SOCKET_BUFFERED_PROBES {
+            log.push_str(&format!("ipcbench: result name={name} iters=128 min=40 p50=100 p99=150 max=500 mean=110 min_ns=10 p50_ns=25\n"));
+        }
+        log.push_str("ipcbench: end\n");
+        validate(&super::super::parse_log(&log).unwrap(), contract::SOCKET_BUFFERED, false).unwrap();
+        for broken in [
+            log.replace("iters=128", "iters=127"),
+            log.replace("socket_buffered_read_32k", "wrong_probe"),
+        ] {
+            assert!(validate(
+                &super::super::parse_log(&broken).unwrap(),
+                contract::SOCKET_BUFFERED,
+                false,
+            )
+            .is_err());
         }
     }
 

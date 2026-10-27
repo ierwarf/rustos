@@ -115,5 +115,5 @@ if __name__ == "__main__":
     parser.add_argument("--binary", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--vcpus", type=int, choices=(1, 8), required=True)
-    parser.add_argument("--suite", choices=("core_syscalls", "core_memory", "core_data", "core_state", "core_lifecycle", "core_scheduler"), required=True)
+    parser.add_argument("--suite", choices=("core_syscalls", "core_memory", "core_data", "core_socket_buffered", "core_state", "core_lifecycle", "core_scheduler"), required=True)
     run(parser.parse_args())

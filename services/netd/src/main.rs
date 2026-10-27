@@ -2872,9 +2872,11 @@ fn recv_connected_bytes(
             }
         }
         let count = (dest.len() - read).min(segment.bytes.len());
-        for slot in &mut dest[read..read + count] {
-            *slot = segment.bytes.pop_front().unwrap_or_default();
-        }
+        let (first, second) = segment.bytes.as_slices();
+        let first_len = count.min(first.len());
+        dest[read..read + first_len].copy_from_slice(&first[..first_len]);
+        dest[read + first_len..read + count].copy_from_slice(&second[..count - first_len]);
+        segment.bytes.drain(..count);
         read += count;
         connected.incoming_bytes = connected.incoming_bytes.saturating_sub(count);
         if segment.bytes.is_empty() {

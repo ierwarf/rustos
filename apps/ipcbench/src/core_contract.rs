@@ -3,6 +3,11 @@
 pub const SYSCALL: &str = "core_syscalls";
 pub const MEMORY: &str = "core_memory";
 pub const DATA: &str = "core_data";
+pub const SOCKET_BUFFERED: &str = "core_socket_buffered";
+pub const SOCKET_BUFFERED_PROBES: &[&str] = &[
+    "socket_buffered_read_4k",
+    "socket_buffered_read_32k",
+];
 pub const STATE: &str = "core_state";
 pub const SCHEDULER: &str = "core_scheduler";
 // GUI samples are owned by uiserver, not emulated in ipcbench/Linux stdout.
@@ -65,6 +70,7 @@ pub fn probes(suite: &str) -> Option<&'static [&'static str]> {
         SYSCALL => Some(SYSCALL_PROBES),
         MEMORY => Some(MEMORY_PROBES),
         DATA => Some(DATA_PROBES),
+        SOCKET_BUFFERED => Some(SOCKET_BUFFERED_PROBES),
         LIFECYCLE => Some(LIFECYCLE_PROBES),
         SCHEDULER => Some(SCHEDULER_PROBES),
         _ => None,

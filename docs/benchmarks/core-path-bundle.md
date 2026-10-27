@@ -11,6 +11,7 @@ cargo xtask bench --suite core_syscalls --rustos-vcpus 1
 cargo xtask bench --suite core_memory --rustos-vcpus 1
 cargo xtask bench --suite core_lifecycle --rustos-vcpus 1
 cargo xtask bench --suite core_data --rustos-vcpus 1
+cargo xtask bench --suite core_socket_buffered --rustos-vcpus 1
 cargo xtask bench --suite core_scheduler --rustos-vcpus 8
 cargo xtask bench --suite core_state --rustos-vcpus 8
 cargo xtask bench --suite core_gui --rustos-vcpus 8
@@ -63,6 +64,10 @@ DVM rootfs나 서비스를 수정하지 않으며 새 도구를 설치하지 않
   저장장치 durability나 cold-cache 디스크 처리량은 측정하지 않는다.
   소켓은 AF_UNIX stream이다. 별도 AF_UNIX ACK 채널과 consumer 검증 비용도
   transfer 시간에 포함된다.
+- `core_socket_buffered`: 같은 프로세스의 AF_UNIX stream socketpair에 4 KiB 또는
+  32 KiB를 미리 쓴 후 전체 read만 측정한다. 8회 warmup, 128회 sample이며
+  매번 다른 payload의 모든 바이트를 검증한다. 이미 준비된 데이터의 읽기이며
+  blocking wakeup이나 양방향 transfer 성능을 뜻하지 않는다.
 - `core_scheduler`: sched_yield, 실제 kernel waiter를 깨우는 private futex의
   wake→첫 계측 사용자 turn, 8-worker 동시 깨우기. wake 결과가 정확히 1이
   아니면 전체 프로브를 실패시키며 빠른 early wake를 샘플로 바꾸지 않는다.

@@ -423,6 +423,42 @@ fn install_segmented_test_socket(token: u64, segments: Vec<UnixStreamSegment>) {
 }
 
 #[test]
+fn buffered_read_handles_wrapped_segments_and_partial_consumption() {
+    let token = u64::MAX - 912;
+    let mut bytes = VecDeque::with_capacity(8);
+    bytes.extend(0..8);
+    bytes.drain(..6);
+    bytes.extend(8..14);
+    assert!(!bytes.as_slices().1.is_empty());
+    install_segmented_test_socket(
+        token,
+        vec![UnixStreamSegment {
+            bytes,
+            control: vec![9, 8, 7, 6],
+        }],
+    );
+    let request = NetdIpcRequest {
+        socket_token: token,
+        ..NetdIpcRequest::default()
+    };
+    let mut first = [0; 5];
+    let received = recv_socket_bytes(&request, &mut first, true).unwrap();
+    assert_eq!(first, [6, 7, 8, 9, 10]);
+    assert_eq!(received.control, [9, 8, 7, 6]);
+    let mut rest = [0; 3];
+    let received = recv_socket_bytes(&request, &mut rest, true).unwrap();
+    assert_eq!(rest, [11, 12, 13]);
+    assert!(received.control.is_empty());
+    let socket = net_state().lock().unwrap().sockets.remove(&token).unwrap();
+    let UnixSocketState::Connected(connected) = socket.state else {
+        unreachable!();
+    };
+    assert_eq!(connected.incoming_bytes, 0);
+    assert_eq!(connected.incoming_control_bytes, 0);
+    assert!(connected.incoming.is_empty());
+}
+
+#[test]
 fn recvmsg_ancillary_stays_with_its_stream_segment() {
     let token = u64::MAX - 910;
     install_segmented_test_socket(
