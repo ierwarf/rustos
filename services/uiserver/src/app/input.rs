@@ -3,14 +3,16 @@ use std::time::Instant;
 
 use runtime_control::RuntimeClient;
 
+use super::launch::launch_program_async;
 use super::{AppState, DragTarget, VisualUpdate};
 use crate::canvas;
-use crate::layout::{clamp_wayland_frame, maximized_window_rect};
+use crate::layout::{
+    clamp_wayland_frame, maximized_window_rect, window_chrome_hit, WindowChromeHit,
+};
 use crate::profile;
 use crate::render::{
     clamp_console_window_rect, console_window_dirty_rect, launcher_button_rect, taskbar_slot_rect,
-    wayland_window_dirty_rect, wayland_window_outer_rect, window_close_button_rect,
-    window_maximize_button_rect, window_minimize_button_rect, window_title_bar_rect,
+    wayland_window_dirty_rect, wayland_window_outer_rect,
 };
 use crate::sys::{
     self, ConsoleSessionHandle, InputEvent, INPUT_KIND_KEYBOARD, INPUT_KIND_POINTER_BUTTON,
@@ -22,15 +24,6 @@ use crate::wayland::WaylandCompositor;
 enum TaskbarHit {
     Console(ConsoleSessionHandle),
     Wayland(u32),
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum WindowChromeHit {
-    Client,
-    TitleBar,
-    Minimize,
-    Maximize,
-    Close,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -149,9 +142,13 @@ impl AppState {
         runtime: &RuntimeClient,
         wayland: Option<&mut WaylandCompositor>,
     ) -> Result<VisualUpdate, i32> {
-        if let Some(desktop_file_id) = self.launcher_program_under_cursor() {
-            launch_program_async(desktop_file_id);
-            return Ok(VisualUpdate::default());
+        // Home-screen launchers sit under the windows, so a visible window
+        // over a cell must take the click instead of starting another app.
+        if self.window_under_cursor().is_none() {
+            if let Some(desktop_file_id) = self.launcher_program_under_cursor() {
+                launch_program_async(desktop_file_id);
+                return Ok(VisualUpdate::default());
+            }
         }
 
         if let Some(hit) = self.taskbar_window_under_cursor() {
@@ -185,8 +182,13 @@ impl AppState {
             .iter()
             .enumerate()
             .find(|(index, _)| {
-                launcher_button_rect(self.display.width, *index)
-                    .contains(self.cursor_x, self.cursor_y)
+                launcher_button_rect(
+                    self.display.width,
+                    self.display.height,
+                    self.launcher_programs.len(),
+                    *index,
+                )
+                .contains(self.cursor_x, self.cursor_y)
             })
             .map(|(_, program)| program.desktop_file_id.clone())
     }
@@ -274,19 +276,7 @@ impl AppState {
     }
 
     fn hit_window_chrome(&self, outer: canvas::Rect) -> WindowChromeHit {
-        if window_close_button_rect(outer).contains(self.cursor_x, self.cursor_y) {
-            return WindowChromeHit::Close;
-        }
-        if window_maximize_button_rect(outer).contains(self.cursor_x, self.cursor_y) {
-            return WindowChromeHit::Maximize;
-        }
-        if window_minimize_button_rect(outer).contains(self.cursor_x, self.cursor_y) {
-            return WindowChromeHit::Minimize;
-        }
-        if window_title_bar_rect(outer).contains(self.cursor_x, self.cursor_y) {
-            return WindowChromeHit::TitleBar;
-        }
-        WindowChromeHit::Client
+        window_chrome_hit(outer, self.cursor_x, self.cursor_y)
     }
 
     fn handle_window_hit(
@@ -653,17 +643,4 @@ impl AppState {
             None => VisualUpdate::default(),
         }
     }
-}
-
-fn launch_program_async(desktop_file_id: String) {
-    sys::spawn_ui_thread(
-        sys::UiThreadRole::Background,
-        "uiserver-program-launch",
-        move || {
-            if let Ok(runtime) = RuntimeClient::open_default() {
-                let _ = runtime.request_launch_program_new_session(desktop_file_id.as_str());
-            }
-        },
-    )
-    .unwrap_or_else(|_| std::process::exit(134));
 }

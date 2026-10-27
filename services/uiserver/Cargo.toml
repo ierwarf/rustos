@@ -4,10 +4,8 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
-[build-dependencies]
-fontdue = "0.9.3"
-
 [dependencies]
+fontdue = "0.9.3"
 driver-domain-protocol = { path = "../../libs/driver-domain-protocol" }
 observability-client = { path = "../../libs/observability-client" }
 rustos-svc-runtime = { path = "../../libs/rustos-svc-runtime" }

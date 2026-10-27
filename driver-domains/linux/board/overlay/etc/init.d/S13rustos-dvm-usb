@@ -1,0 +1,26 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+
+# Starts after Buildroot's S11 module-admission turn and before the control
+# agent. A physical USB keyboard or pointer reaches the agent's evdev stream
+# only when its xHCI controller was assigned to this driver domain, so admit
+# exactly the signed xhci_pci driver for assigned xHCI controllers (PCI class
+# 0x0c0330). HID itself is built in. No assigned controller is the normal
+# virtual-device case and must not fail boot.
+start() {
+    for device in /sys/bus/pci/devices/*; do
+        [ -r "$device/class" ] && [ -r "$device/modalias" ] || continue
+        [ "$(cat "$device/class")" = "0x0c0330" ] || continue
+        [ -L "$device/driver" ] && continue
+        modprobe "$(cat "$device/modalias")" || {
+            echo "rustos-dvm-usb: no signed driver for assigned xHCI controller $(basename "$device")" >&2
+            return 1
+        }
+    done
+}
+
+case "$1" in
+    start) start ;;
+    stop|restart|reload) ;;
+    *) echo "usage: $0 {start|stop|restart|reload}" >&2; exit 1 ;;
+esac

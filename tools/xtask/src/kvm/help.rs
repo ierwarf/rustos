@@ -72,6 +72,12 @@ options:
                        from the sealed physical-GPU profile registry through
                        IOMMUFD instead of virtio-GPU; never binds, unbinds, or
                        resets the device
+  --physical-usb <BDF> non-commercial lab mode: attach one already-bound xHCI
+                       controller (sole IOMMU-group member, bound to vfio-pci)
+                       to the DVM through IOMMUFD and omit the virtual DVM
+                       keyboard and pointer, so the DVM agent relays a physical
+                       USB keyboard and pointer. It has no sealed profile and
+                       never binds, unbinds, or resets the controller
   --gpu-firmware <path>
                        profile-specific owner-private firmware table. The
                        currently certified AMD profile requires a relocated

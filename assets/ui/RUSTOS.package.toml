@@ -1,0 +1,11 @@
+id = "ui-assets"
+kind = "data"
+execution_domain = "user"
+
+[build]
+builder = "asset-bundle"
+source = "bundle"
+
+[install]
+path = "assets/ui"
+layout = "directory"

@@ -30,6 +30,7 @@
 | `OVMF_PATH` | `vendor/firmware/ovmf/OVMF.fd` | Firmware image. |
 | `RUSTOS_UI_BOOT_TRACE` | disabled | Enable uiserver local boot trace. |
 | `RUSTOS_UI_PROFILE` | disabled | Enable uiserver profiling lines. |
+| `RUSTOS_UI_CONFIG` | `/assets/ui/ui.conf` | Development override of the uiserver UI config path (font file, size and charset per text role, and the home screen clock UTC offset). runtimed launches uiserver with a fixed environment, so the image relies on the default. |
 | `RUSTOS_WAYCLICK_PROFILE` | disabled | Enable WayClick frame-lifecycle profiling; `xtask kvm-smoke --min-ui-fps` changes only its private KVM disk copy. |
 
 Most build variables are parsed by `tools/xtask/src/config/mod.rs`. KVM
@@ -66,6 +67,7 @@ changes the host hypervisor configuration; dry-run does not admit devices.
 | `OVMF_PATH` | `vendor/firmware/ovmf/OVMF.fd` | firmware image |
 | `RUSTOS_UI_BOOT_TRACE` | disabled | uiserver local boot trace 활성화 |
 | `RUSTOS_UI_PROFILE` | disabled | uiserver profiling line 활성화 |
+| `RUSTOS_UI_CONFIG` | `/assets/ui/ui.conf` | uiserver UI 설정 경로의 개발용 override(text role별 font 파일·크기·charset, home 화면 시계 UTC offset). runtimed가 uiserver를 고정 환경으로 실행하므로 image는 기본값을 사용 |
 | `RUSTOS_WAYCLICK_PROFILE` | disabled | WayClick frame lifecycle profile 활성화. `xtask kvm-smoke --min-ui-fps`는 private KVM disk copy만 변경 |
 
 대부분의 build variable은 `tools/xtask/src/config/mod.rs`에서 읽습니다. KVM

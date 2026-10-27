@@ -77,6 +77,18 @@ enum XtaskCommand {
         /// of sealing it first.
         #[arg(long = "no-auto-verify")]
         no_auto_verify: bool,
+        /// Non-commercial lab mode: attach one xHCI controller that is already
+        /// bound to vfio-pci (sole IOMMU-group member) to the DVM and omit the
+        /// virtual DVM keyboard and pointer, so a physical USB keyboard and
+        /// pointer drive the session. No sealed profile; the controller's
+        /// binding is never changed.
+        #[arg(long = "physical-usb", value_name = "BDF")]
+        physical_usb: Option<String>,
+        /// Show the guest at 1:1 instead of scaling it to fit the QEMU window.
+        /// By default the interactive window scales so the whole desktop fits
+        /// a host screen smaller than the 1600x900 guest.
+        #[arg(long = "actual-size")]
+        actual_size: bool,
     },
     /// Measure ring3 syscall, scheduler, and IPC round-trip cost.
     ///
@@ -281,7 +293,16 @@ pub(crate) fn run() -> Result<()> {
             build_image,
             rustos_vcpus,
             no_auto_verify,
-        }) => kvm::kvm_run_command(&config, build_image, rustos_vcpus, !no_auto_verify),
+            physical_usb,
+            actual_size,
+        }) => kvm::kvm_run_command(
+            &config,
+            build_image,
+            rustos_vcpus,
+            !no_auto_verify,
+            physical_usb,
+            !actual_size,
+        ),
         Some(XtaskCommand::Bench {
             baseline,
             compare,

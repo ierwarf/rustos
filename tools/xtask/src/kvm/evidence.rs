@@ -705,7 +705,7 @@ fn validate_interactive_session(layout: &KvmLayout, pointer_observed: bool) -> R
     }
     if !pointer_observed || !rustos_log.contains(DVM_POINTER_INGRESS_MARKER) {
         bail!(
-            "interactive KVM DVM acceptance did not observe a real absolute-pointer event; move the host pointer over the DVM window before closing it"
+            "interactive KVM DVM acceptance did not observe a real pointer event; move the host pointer over the DVM window, or the physical USB mouse when --physical-usb is used, before closing it"
         );
     }
     println!(

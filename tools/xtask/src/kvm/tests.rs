@@ -17,7 +17,8 @@ mod tests {
         VIRTUAL_GPU_EVIDENCE, WAYCLICK_FIRST_FRAME_MARKER, WayclickProfileObservation,
         acquire_kvm_launch_lock, append_dvm_display_pixels, append_dvm_input_devices,
         append_dvm_network_device, append_dvm_virtual_gpu, append_dvm_virtual_storage,
-        append_physical_gpu, causal_tail, claim_physical_gpu_launch_in,
+        append_physical_gpu, append_physical_usb, causal_tail, claim_physical_gpu_launch_in,
+        dvm_shmem_backing_dir,
         dvm_block_header_matches_ready_generation, dvm_display_failure, dvm_display_provider_ready,
         dvm_display_relay_meets_fps, dvm_display_relay_ready, dvm_gpu_compositor_ready,
         dvm_gpu_device, dvm_machine, dvm_physical_frames_ready, dvm_pointer_device,
@@ -133,6 +134,47 @@ mod tests {
 
         prepare_runtime_log(&log, true).unwrap();
         assert!(fs::read_to_string(&log).unwrap().is_empty());
+    }
+
+    #[test]
+    fn physical_usb_attaches_one_controller_and_is_exclusive_with_virtual_input() {
+        let parse = |extra: &[&str]| {
+            parse_smoke_options(extra.iter().map(|arg| arg.to_string()))
+        };
+        let usb = parse(&["--physical-usb", "0000:65:00.3"]).unwrap();
+        assert_eq!(usb.physical_usb_bdf.as_deref(), Some("0000:65:00.3"));
+        assert!(parse(&["--physical-usb", "0000:65:00.3", "--physical-usb", "0000:65:00.4"]).is_err());
+        assert!(parse(&["--physical-usb", "0000:65:00.3", "--exercise-input"]).is_err());
+        assert!(parse(&["--physical-usb", "0000:65:00.3", "--min-ui-fps", "60"]).is_err());
+        assert!(parse(&["--physical-usb", "0000:65:00.3", "--storage-dvm-only"]).is_err());
+        assert!(parse(&[]).unwrap().physical_usb_bdf.is_none());
+
+        let mut command = std::process::Command::new("qemu");
+        append_physical_usb(&mut command, "0000:65:00.3");
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            args,
+            [
+                "-object",
+                "iommufd,id=iommufd-usb",
+                "-device",
+                "vfio-pci,host=0000:65:00.3,iommufd=iommufd-usb",
+            ]
+        );
+    }
+
+    #[test]
+    fn physical_usb_moves_file_backed_apertures_to_pinnable_tmpfs() {
+        let run = Path::new("/build/kvm");
+        let tmpfs = Path::new("/dev/shm/rustos-kvm-display-x");
+        assert_eq!(dvm_shmem_backing_dir(Some(tmpfs), true, run), tmpfs);
+        // GUI surfaces alone keep the established layout beside the run.
+        assert_eq!(dvm_shmem_backing_dir(Some(tmpfs), false, run), run);
+        assert_eq!(dvm_shmem_backing_dir(None, false, run), run);
+        assert_eq!(dvm_shmem_backing_dir(None, true, run), run);
     }
 
     #[test]
@@ -836,20 +878,27 @@ uiserver: slow loop iter_ms=51 wayland_ms=0 present_ms=51 console_windows=1 wayl
         assert_eq!(
             qemu_display_backend(
                 GuestDisplay::Headless,
-                Some(Path::new("/dev/dri/renderD129"))
+                Some(Path::new("/dev/dri/renderD129")),
+                false,
             )
             .unwrap(),
             "egl-headless,rendernode=/dev/dri/renderD129"
         );
         assert_eq!(
-            qemu_display_backend(GuestDisplay::DvmGtk, None).unwrap(),
+            qemu_display_backend(GuestDisplay::DvmGtk, None, false).unwrap(),
             "gtk,gl=on,show-tabs=off,zoom-to-fit=off,grab-on-hover=on,show-cursor=off"
         );
+        // The interactive session scales the guest to the window and drops
+        // the menu bar so a host screen smaller than 1600x900 shows it all.
         assert_eq!(
-            qemu_display_backend(GuestDisplay::Physical, None).unwrap(),
+            qemu_display_backend(GuestDisplay::DvmGtk, None, true).unwrap(),
+            "gtk,gl=on,show-tabs=off,show-menubar=off,zoom-to-fit=on,grab-on-hover=on,show-cursor=off"
+        );
+        assert_eq!(
+            qemu_display_backend(GuestDisplay::Physical, None, true).unwrap(),
             "none"
         );
-        assert!(qemu_display_backend(GuestDisplay::Headless, None).is_err());
+        assert!(qemu_display_backend(GuestDisplay::Headless, None, true).is_err());
         assert!(
             dvm_gpu_device(GuestDisplay::DvmGtk)
                 .unwrap()

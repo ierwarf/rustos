@@ -2,9 +2,10 @@
 //! re-exports the public surface used by other modules. The actual
 //! drawing primitives live in focused submodules:
 //!
-//! * [`colors`] — the Aurora dark palette.
-//! * [`background`] — sky gradient, aurora glows, starfield.
-//! * [`chrome`] — topbar, dock, window chrome, traffic lights, shadows.
+//! * [`colors`] — the glass palette.
+//! * [`background`] — mesh-gradient wallpaper with soft glows.
+//! * [`glass`] — frosted glass panels: blurred backdrop, tint, edge.
+//! * [`chrome`] — topbar, dock, home grid, window chrome, shadows.
 //! * [`icons`] — app icon themes and shape glyphs.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -20,14 +21,10 @@ use crate::gpu_scene::{
 };
 use crate::layout::{
     clamp_window_rect, default_console_window_rect as layout_default_console_window_rect,
-    launcher_button_rect as layout_launcher_button_rect, taskbar_rail_rect,
-    taskbar_slot_rect as layout_taskbar_slot_rect, topbar_rail_rect,
+    desktop_bounds, home_cell, home_clock, launcher_button_rect as layout_launcher_button_rect,
+    taskbar_rail_rect, taskbar_slot_rect as layout_taskbar_slot_rect,
     wayland_client_rect as layout_wayland_client_rect,
-    wayland_outer_rect as layout_wayland_outer_rect,
-    window_close_button_rect as layout_window_close_button_rect,
-    window_maximize_button_rect as layout_window_maximize_button_rect,
-    window_minimize_button_rect as layout_window_minimize_button_rect,
-    window_title_bar_rect as layout_window_title_bar_rect, WINDOW_SHADOW_STEPS,
+    wayland_outer_rect as layout_wayland_outer_rect, WINDOW_SHADOW_STEPS,
 };
 use crate::sys::{diag_line, ui_profile_enabled, ConsoleSessionHandle};
 use crate::wayland::WaylandWindowSnapshot;
@@ -35,6 +32,7 @@ use crate::wayland::WaylandWindowSnapshot;
 mod background;
 mod chrome;
 mod colors;
+mod glass;
 mod icons;
 
 pub(crate) use background::{start_desktop_background_loader, DesktopBackground};
@@ -53,8 +51,10 @@ static DESKTOP_PENDING_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 // these days; the wrappers here keep the existing call sites intact and
 // can be removed once everything switches over.
 
-pub(crate) fn launcher_dirty_rect(width: u32, _height: u32) -> Rect {
-    shadow_bounds(topbar_rail_rect(width as usize), 3)
+/// Everything a launcher-list change repaints: the home-screen grid, which
+/// fills the desktop.
+pub(crate) fn launcher_dirty_rect(width: u32, height: u32) -> Rect {
+    desktop_bounds(width, height)
 }
 
 pub(crate) fn taskbar_dirty_rect(width: u32, height: u32) -> Rect {
@@ -75,10 +75,6 @@ pub(crate) fn default_console_window_rect(width: u32, height: u32, index: usize)
 
 pub(crate) fn clamp_console_window_rect(width: u32, height: u32, rect: Rect) -> Rect {
     clamp_window_rect(width, height, rect)
-}
-
-pub(crate) fn window_title_bar_rect(rect: Rect) -> Rect {
-    layout_window_title_bar_rect(rect)
 }
 
 /// Chrome outer rect of a Wayland surface.
@@ -112,20 +108,8 @@ pub(crate) fn wayland_window_damage_rect(window: &WaylandWindowSnapshot, damage:
     .intersect(client)
 }
 
-pub(crate) fn window_close_button_rect(outer: Rect) -> Rect {
-    layout_window_close_button_rect(outer)
-}
-
-pub(crate) fn window_minimize_button_rect(outer: Rect) -> Rect {
-    layout_window_minimize_button_rect(outer)
-}
-
-pub(crate) fn window_maximize_button_rect(outer: Rect) -> Rect {
-    layout_window_maximize_button_rect(outer)
-}
-
-pub(crate) fn launcher_button_rect(width: u32, index: usize) -> Rect {
-    layout_launcher_button_rect(width, index)
+pub(crate) fn launcher_button_rect(width: u32, height: u32, count: usize, index: usize) -> Rect {
+    layout_launcher_button_rect(width, height, count, index)
 }
 
 pub(crate) fn taskbar_slot_rect(width: u32, height: u32, index: usize) -> Rect {
@@ -228,6 +212,24 @@ pub(crate) fn build_gpu_atlas_scene(
             width: state.surface.width as usize,
             height: state.surface.height as usize,
         },
+        false,
+    )?;
+
+    // The dock and cursor are essential and small, so they are placed before
+    // any window: windows can be multiplied by clients and by the user, and
+    // must only ever crowd one another out, never the dock or the cursor. The
+    // dock's layers are appended last so the dock still draws on top.
+    let mut dock_layers = Vec::new();
+    push_dock_gpu_layer(&mut packer, &mut dock_layers, atlas, state)?;
+    let mut cursor = vec![0_u32; CURSOR_TEXTURE_SIZE * CURSOR_TEXTURE_SIZE];
+    if !render_cursor_bgra(cursor.as_mut_slice(), state.cursor_motion) {
+        return Err(GpuSceneError::InvalidLayer);
+    }
+    let cursor_source_rect = packer.place_bgra(
+        cursor.as_slice(),
+        CURSOR_TEXTURE_SIZE,
+        CURSOR_TEXTURE_SIZE,
+        CURSOR_TEXTURE_SIZE,
     )?;
 
     let focused_wayland = state.focused_wayland_surface_id;
@@ -254,7 +256,11 @@ pub(crate) fn build_gpu_atlas_scene(
         .iter_mut()
         .filter(|window| !window.minimized && window.session_handle != focused_session)
     {
-        let source_rect = push_console_gpu_layer(&mut packer, &mut layers, atlas, window, false)?;
+        let Some(source_rect) =
+            push_console_gpu_layer(&mut packer, &mut layers, atlas, window, false)?
+        else {
+            continue;
+        };
         console_bindings.push(ConsoleAtlasBinding {
             session_handle: window.session_handle,
             content_version: window.surface_cache.content_version,
@@ -287,28 +293,20 @@ pub(crate) fn build_gpu_atlas_scene(
             .iter_mut()
             .find(|window| !window.minimized && window.session_handle == focused_session)
         {
-            let source_rect =
-                push_console_gpu_layer(&mut packer, &mut layers, atlas, window, true)?;
-            console_bindings.push(ConsoleAtlasBinding {
-                session_handle: window.session_handle,
-                content_version: window.surface_cache.content_version,
-                source_rect,
-                layer_index: layers.len() - 1,
-                focused: true,
-            });
+            if let Some(source_rect) =
+                push_console_gpu_layer(&mut packer, &mut layers, atlas, window, true)?
+            {
+                console_bindings.push(ConsoleAtlasBinding {
+                    session_handle: window.session_handle,
+                    content_version: window.surface_cache.content_version,
+                    source_rect,
+                    layer_index: layers.len() - 1,
+                    focused: true,
+                });
+            }
         }
     }
-    push_dock_gpu_layer(&mut packer, &mut layers, atlas, state)?;
-    let mut cursor = vec![0_u32; CURSOR_TEXTURE_SIZE * CURSOR_TEXTURE_SIZE];
-    if !render_cursor_bgra(cursor.as_mut_slice(), state.cursor_motion) {
-        return Err(GpuSceneError::InvalidLayer);
-    }
-    let cursor_source_rect = packer.place_bgra(
-        cursor.as_slice(),
-        CURSOR_TEXTURE_SIZE,
-        CURSOR_TEXTURE_SIZE,
-        CURSOR_TEXTURE_SIZE,
-    )?;
+    layers.extend(dock_layers);
     Ok(GpuAtlasScene {
         layers,
         cursor_source_rect,
@@ -407,19 +405,20 @@ pub(crate) fn update_gpu_layer_destinations(
         }
     }
 
+    // Console bindings are authoritative for the same reason: a console window
+    // the atlas had no room for has no binding.
     let focused_session = state.focused_session_handle;
-    let mut binding_index = 0;
-    for window in state
-        .console_windows
-        .iter()
-        .filter(|window| !window.minimized && window.session_handle != focused_session)
-    {
-        let Some(binding) = console_bindings.get(binding_index) else {
+    let console_focus_active = focused_wayland.is_none() && focused_session != 0;
+    for binding in console_bindings {
+        let Some(window) = state
+            .console_windows
+            .iter()
+            .find(|window| !window.minimized && window.session_handle == binding.session_handle)
+        else {
             return false;
         };
-        binding_index += 1;
-        if binding.session_handle != window.session_handle
-            || binding.focused
+        let focused = console_focus_active && window.session_handle == focused_session;
+        if binding.focused != focused
             || !update_gpu_texture_layer_destination(
                 layers,
                 binding.layer_index,
@@ -430,30 +429,7 @@ pub(crate) fn update_gpu_layer_destinations(
             return false;
         }
     }
-    if focused_wayland.is_none() && focused_session != 0 {
-        if let Some(window) = state
-            .console_windows
-            .iter()
-            .find(|window| !window.minimized && window.session_handle == focused_session)
-        {
-            let Some(binding) = console_bindings.get(binding_index) else {
-                return false;
-            };
-            binding_index += 1;
-            if binding.session_handle != window.session_handle
-                || !binding.focused
-                || !update_gpu_texture_layer_destination(
-                    layers,
-                    binding.layer_index,
-                    binding.source_rect,
-                    window.frame,
-                )
-            {
-                return false;
-            }
-        }
-    }
-    binding_index == console_bindings.len()
+    true
 }
 
 fn update_gpu_texture_layer_destination(
@@ -548,6 +524,8 @@ pub(crate) fn update_wayland_gpu_textures(
                 pixels.as_slice(),
                 binding.source_rect.width,
             )?;
+            let (atlas_pixels, stride) = packer.pixels_mut();
+            apply_atlas_window_alpha(atlas_pixels, stride, binding.source_rect, binding.focused)?;
             damage.push(padded_atlas_rect(
                 binding.source_rect,
                 atlas_width,
@@ -566,47 +544,31 @@ pub(crate) fn update_console_gpu_textures(
     bindings: &mut [ConsoleAtlasBinding],
 ) -> Result<Option<Vec<Rect>>, GpuSceneError> {
     let focused_session = state.focused_session_handle;
-    let mut binding_index = 0;
+    let console_focus_active = state.focused_wayland_surface_id.is_none() && focused_session != 0;
     let mut damage = Vec::new();
 
-    for window in state
-        .console_windows
-        .iter_mut()
-        .filter(|window| !window.minimized && window.session_handle != focused_session)
-    {
+    // Bindings, not windows, drive the update: a console window the atlas had
+    // no room for has no binding and must not force a rebuild every frame.
+    for binding in bindings.iter_mut() {
+        let Some(window) = state
+            .console_windows
+            .iter_mut()
+            .find(|window| !window.minimized && window.session_handle == binding.session_handle)
+        else {
+            return Ok(None);
+        };
+        let focused = console_focus_active && window.session_handle == focused_session;
         if !update_console_gpu_texture(
             window,
-            false,
+            focused,
             atlas_pixels,
             atlas_stride_pixels,
-            bindings,
-            &mut binding_index,
+            std::slice::from_mut(binding),
+            &mut 0,
             &mut damage,
         )? {
             return Ok(None);
         }
-    }
-    if state.focused_wayland_surface_id.is_none() && focused_session != 0 {
-        if let Some(window) = state
-            .console_windows
-            .iter_mut()
-            .find(|window| !window.minimized && window.session_handle == focused_session)
-        {
-            if !update_console_gpu_texture(
-                window,
-                true,
-                atlas_pixels,
-                atlas_stride_pixels,
-                bindings,
-                &mut binding_index,
-                &mut damage,
-            )? {
-                return Ok(None);
-            }
-        }
-    }
-    if binding_index != bindings.len() {
-        return Ok(None);
     }
     Ok(Some(damage))
 }
@@ -665,6 +627,12 @@ fn update_console_gpu_texture(
                     .ok_or(GpuSceneError::InvalidLayer)?,
             );
     }
+    apply_atlas_window_alpha(
+        atlas_pixels,
+        atlas_stride_pixels,
+        binding.source_rect,
+        focused,
+    )?;
     binding.content_version = window.surface_cache.content_version;
     damage.push(binding.source_rect);
     Ok(true)
@@ -955,6 +923,7 @@ fn push_dock_gpu_layer(
         destination.height,
         destination.width,
         destination,
+        false,
     )
     .map(|_| ())
 }
@@ -969,6 +938,7 @@ fn push_xrgb_gpu_layer(
     height: usize,
     stride_pixels: usize,
     destination: Rect,
+    source_over: bool,
 ) -> Result<Rect, GpuSceneError> {
     if destination.width == 0
         || destination.height == 0
@@ -981,7 +951,7 @@ fn push_xrgb_gpu_layer(
     layers.push(GpuSceneLayer {
         destination,
         opacity: u8::MAX,
-        source_over: false,
+        source_over,
         transform: GpuLayerTransform::flat(),
         kind: GpuLayerKind::Texture {
             region: GpuTextureRegion { atlas, source_rect },
@@ -990,18 +960,48 @@ fn push_xrgb_gpu_layer(
     Ok(source_rect)
 }
 
+/// Make the title band and rounded corners of a window texture region in the
+/// atlas translucent. The region must have just been written in full with
+/// opaque pixels; the pass premultiplies in place, so it never runs twice.
+fn apply_atlas_window_alpha(
+    atlas_pixels: &mut [u32],
+    stride_pixels: usize,
+    region: Rect,
+    focused: bool,
+) -> Result<(), GpuSceneError> {
+    let start = region
+        .y
+        .checked_mul(stride_pixels)
+        .and_then(|offset| offset.checked_add(region.x))
+        .ok_or(GpuSceneError::InvalidLayer)?;
+    let end = region
+        .height
+        .checked_sub(1)
+        .and_then(|rows| rows.checked_mul(stride_pixels))
+        .and_then(|prefix| prefix.checked_add(region.width))
+        .and_then(|length| start.checked_add(length))
+        .ok_or(GpuSceneError::InvalidLayer)?;
+    let pixels = atlas_pixels
+        .get_mut(start..end)
+        .ok_or(GpuSceneError::InvalidLayer)?;
+    chrome::apply_window_texture_alpha(pixels, stride_pixels, region.width, region.height, focused);
+    Ok(())
+}
+
 fn push_console_gpu_layer(
     packer: &mut GpuAtlasPacker<'_>,
     layers: &mut Vec<GpuSceneLayer>,
     atlas: GpuTextureCapability,
     window: &mut ConsoleWindow,
     focused: bool,
-) -> Result<Rect, GpuSceneError> {
+) -> Result<Option<Rect>, GpuSceneError> {
     chrome::rebuild_console_window_surface(window, focused);
+    // A window with no surface (a zero-sized frame on a very small display)
+    // has nothing to draw. That is a missing layer, not a malformed scene.
     if !window.surface_cache.valid {
-        return Err(GpuSceneError::InvalidLayer);
+        return Ok(None);
     }
-    push_xrgb_gpu_layer(
+    match push_xrgb_gpu_layer(
         packer,
         layers,
         atlas,
@@ -1010,7 +1010,19 @@ fn push_console_gpu_layer(
         window.surface_cache.height,
         window.surface_cache.width,
         window.frame,
-    )
+        true,
+    ) {
+        Ok(source_rect) => {
+            let (atlas_pixels, stride) = packer.pixels_mut();
+            apply_atlas_window_alpha(atlas_pixels, stride, source_rect, focused)?;
+            Ok(Some(source_rect))
+        }
+        // As for Wayland windows, a full atlas is a capacity limit: opening
+        // one more shell must cost that shell its texture, not end the
+        // compositor and with it every other window.
+        Err(GpuSceneError::AtlasFull) => Ok(None),
+        Err(err) => Err(err),
+    }
 }
 
 fn push_wayland_gpu_layer(
@@ -1035,10 +1047,14 @@ fn push_wayland_gpu_layer(
             Err(GpuSceneError::AtlasFull) => return Ok(None),
             Err(err) => return Err(err),
         };
+    let (atlas_pixels, stride) = packer.pixels_mut();
+    apply_atlas_window_alpha(atlas_pixels, stride, source_rect, focused)?;
     layers.push(GpuSceneLayer {
         destination: outer,
         opacity: u8::MAX,
-        source_over: false,
+        // The title band is translucent glass, so the window blends over
+        // whatever is beneath it.
+        source_over: true,
         transform: GpuLayerTransform::flat(),
         kind: GpuLayerKind::Texture {
             region: GpuTextureRegion { atlas, source_rect },
@@ -1324,6 +1340,12 @@ fn shadow_bounds(rect: Rect, steps: usize) -> Rect {
     }
 }
 
+/// Make `pixels` an exact copy of the clean wallpaper, resizing it if needed.
+fn reset_desktop_pixels(pixels: &mut Vec<u32>, background: &[u32]) {
+    pixels.clear();
+    pixels.extend_from_slice(background);
+}
+
 /// Lazily rebuilds the cached desktop composite (background + chrome
 /// strips) whenever the launchers or display geometry change. The
 /// expensive aurora background is built once on a background thread and
@@ -1366,38 +1388,16 @@ fn refresh_desktop_surface(state: &mut AppState) {
     }
 
     if !state.desktop_cache.chrome_valid {
-        let total = state.desktop_cache.background_pixels.len();
-        if state.desktop_cache.pixels.len() != total {
-            state.desktop_cache.pixels.resize(total, 0);
-        }
-
-        let screen = Rect {
-            x: 0,
-            y: 0,
-            width,
-            height,
-        };
-        // Restore the chrome strips from clean background pixels so the
-        // new chrome paints over a fresh substrate instead of
-        // accumulating alpha across rebuilds.
-        let topbar = topbar_rail_rect(width);
+        // Start from a full copy of the clean wallpaper so the chrome paints
+        // over a fresh substrate instead of accumulating alpha across
+        // rebuilds. Restoring only the chrome's own strips left every pixel
+        // outside them at its initial zero, which showed up as black bands
+        // between the desktop and the dock.
+        reset_desktop_pixels(
+            &mut state.desktop_cache.pixels,
+            &state.desktop_cache.background_pixels,
+        );
         let taskbar = taskbar_rail_rect(width, height);
-        let chrome_strips: [Rect; 2] = [shadow_bounds(topbar, 3), shadow_bounds(taskbar, 3)];
-        for strip in chrome_strips {
-            let strip = strip.intersect(screen);
-            if strip.is_empty() {
-                continue;
-            }
-            for row in strip.y..strip.y.saturating_add(strip.height) {
-                let row_start = row.saturating_mul(width).saturating_add(strip.x);
-                let row_end = row_start.saturating_add(strip.width);
-                if row_end > total {
-                    continue;
-                }
-                state.desktop_cache.pixels[row_start..row_end]
-                    .copy_from_slice(&state.desktop_cache.background_pixels[row_start..row_end]);
-            }
-        }
 
         let strips_elapsed = refresh_started.elapsed();
         let mut canvas = SurfaceCanvas::new(
@@ -1408,19 +1408,29 @@ fn refresh_desktop_surface(state: &mut AppState) {
         );
 
         let rails_started = Instant::now();
-        chrome::draw_rail_panel(&mut canvas, topbar);
-        chrome::draw_rail_panel(&mut canvas, taskbar);
-        chrome::draw_brand_block(&mut canvas, topbar);
-        chrome::draw_status_block(&mut canvas, topbar, state.launcher_programs.len());
+        let backdrop = glass::Backdrop {
+            pixels: state.desktop_cache.background_pixels.as_slice(),
+            stride: width,
+        };
+        chrome::draw_rail_panel(&mut canvas, backdrop, taskbar);
         let rails_elapsed = rails_started.elapsed();
 
         let launchers_started = Instant::now();
+        let launcher_count = state.launcher_programs.len();
         for (index, program) in state.launcher_programs.iter().enumerate() {
-            chrome::draw_launcher_icon(
-                &mut canvas,
-                launcher_button_rect(width as u32, index),
-                program.title.as_str(),
-            );
+            if let Some(home) = home_cell(width as u32, height as u32, launcher_count, index) {
+                chrome::draw_home_launcher(&mut canvas, home, program.title.as_str());
+            }
+        }
+        // The clock is part of the chrome layer, so a new minute rebuilds it
+        // and records which minute the cache now shows.
+        let reading = crate::clock::ClockReading::now();
+        state.desktop_cache.clock_minute = None;
+        if let (Some(clock), Some(reading)) =
+            (home_clock(width as u32, height as u32), reading.as_ref())
+        {
+            chrome::draw_home_clock(&mut canvas, clock, reading);
+            state.desktop_cache.clock_minute = Some(reading.minute_key);
         }
         chrome_split = Some((
             strips_elapsed,
@@ -1471,8 +1481,8 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        copy_opaque_wayland_damage_to_atlas, push_wayland_gpu_layer,
-        update_gpu_texture_layer_destination, wayland_window_client_rect,
+        copy_opaque_wayland_damage_to_atlas, push_console_gpu_layer, push_wayland_gpu_layer,
+        reset_desktop_pixels, update_gpu_texture_layer_destination, wayland_window_client_rect,
         wayland_window_outer_rect, GpuAtlasPacker, GpuLayerKind, GpuLayerTransform, GpuSceneLayer,
         GpuTextureCapability, GpuTextureRegion, Rect, WaylandWindowSnapshot,
     };
@@ -1701,5 +1711,245 @@ mod tests {
 
         assert!(placed.is_none());
         assert!(layers.is_empty());
+    }
+
+    #[test]
+    fn the_desktop_composite_starts_as_a_full_copy_of_the_wallpaper() {
+        // Pixels outside the chrome's own strips were never written, so the
+        // gaps between the desktop and the dock stayed black.
+        let background: Vec<u32> = (0..64 * 36).map(|index| 0x0010_2030 + index).collect();
+        let mut pixels = vec![0_u32; 64 * 36];
+        reset_desktop_pixels(&mut pixels, &background);
+        assert_eq!(pixels, background);
+        assert!(
+            pixels.iter().all(|pixel| *pixel != 0),
+            "no pixel is left black"
+        );
+
+        // A rebuild discards stale chrome rather than layering on top of it.
+        pixels.iter_mut().for_each(|pixel| *pixel = 0x00ff_ffff);
+        reset_desktop_pixels(&mut pixels, &background);
+        assert_eq!(pixels, background);
+
+        // A size change resizes the composite to match.
+        let smaller = vec![0x0001_0203_u32; 16];
+        reset_desktop_pixels(&mut pixels, &smaller);
+        assert_eq!(pixels, smaller);
+    }
+
+    #[test]
+    fn a_console_window_the_atlas_cannot_fit_is_left_out_rather_than_ending_the_scene() {
+        // Opening one more shell must cost that shell its texture. Returning
+        // the error ended the compositor and froze every other window.
+        use crate::app::ConsoleWindow;
+        let mut pixels = vec![0_u32; 16 * 16];
+        let mut packer = GpuAtlasPacker::new(pixels.as_mut_slice(), 16, 16, 16).expect("packer");
+        let mut layers = Vec::new();
+        let atlas = GpuTextureCapability {
+            token: 1,
+            generation: 1,
+            content_epoch: 1,
+            binding_slot: 0,
+            width: 16,
+            height: 16,
+            stride_bytes: 64,
+        };
+        let frame = Rect {
+            x: 40,
+            y: 60,
+            width: 320,
+            height: 180,
+        };
+        let mut window = ConsoleWindow::new(7, String::from("Shell"), frame, 1);
+
+        let placed = push_console_gpu_layer(&mut packer, &mut layers, atlas, &mut window, false)
+            .expect("a full atlas is a capacity limit, not a malformed scene");
+
+        assert!(placed.is_none());
+        assert!(layers.is_empty());
+    }
+
+    #[test]
+    fn a_console_window_with_no_surface_is_left_out_rather_than_ending_the_scene() {
+        // A zero-sized frame is reachable on a very small display.
+        use crate::app::ConsoleWindow;
+        let mut pixels = vec![0_u32; 512 * 512];
+        let mut packer = GpuAtlasPacker::new(pixels.as_mut_slice(), 512, 512, 512).expect("packer");
+        let mut layers = Vec::new();
+        let atlas = GpuTextureCapability {
+            token: 1,
+            generation: 1,
+            content_epoch: 1,
+            binding_slot: 0,
+            width: 512,
+            height: 512,
+            stride_bytes: 2048,
+        };
+        let mut window = ConsoleWindow::new(7, String::from("Shell"), Rect::empty(), 1);
+
+        let placed = push_console_gpu_layer(&mut packer, &mut layers, atlas, &mut window, false)
+            .expect("an empty window is skipped, not rejected");
+
+        assert!(placed.is_none());
+        assert!(layers.is_empty());
+    }
+
+    fn alpha_at(atlas: &[u32], stride: usize, x: usize, y: usize) -> u32 {
+        atlas[y * stride + x] >> 24
+    }
+
+    #[test]
+    fn a_console_window_has_translucent_title_glass_and_an_opaque_body() {
+        use crate::app::ConsoleWindow;
+        let mut pixels = vec![0_u32; 512 * 512];
+        let mut packer = GpuAtlasPacker::new(pixels.as_mut_slice(), 512, 512, 512).expect("packer");
+        let mut layers = Vec::new();
+        let atlas = GpuTextureCapability {
+            token: 1,
+            generation: 1,
+            content_epoch: 1,
+            binding_slot: 0,
+            width: 512,
+            height: 512,
+            stride_bytes: 2048,
+        };
+        let frame = Rect {
+            x: 40,
+            y: 60,
+            width: 320,
+            height: 180,
+        };
+        let mut window = ConsoleWindow::new(7, String::from("Shell"), frame, 1);
+        let region = push_console_gpu_layer(&mut packer, &mut layers, atlas, &mut window, true)
+            .expect("fits")
+            .expect("placed");
+        assert!(layers[0].source_over, "translucent glass needs blending");
+        drop(packer);
+
+        let at = |x: usize, y: usize| alpha_at(&pixels, 512, region.x + x, region.y + y);
+        let title = at(100, 12);
+        assert!(
+            title > 0 && title < 255,
+            "title glass is translucent: {title}"
+        );
+        assert_eq!(at(100, 120), 255, "the body stays opaque");
+        assert_eq!(at(0, 0), 0, "the rounded outer corner is transparent");
+    }
+
+    #[test]
+    fn a_wayland_window_has_translucent_title_glass_and_an_opaque_client() {
+        let mut pixels = vec![0_u32; 64 * 64];
+        let mut packer = GpuAtlasPacker::new(pixels.as_mut_slice(), 64, 64, 64).expect("packer");
+        let mut layers = Vec::new();
+        let atlas = GpuTextureCapability {
+            token: 1,
+            generation: 1,
+            content_epoch: 1,
+            binding_slot: 0,
+            width: 64,
+            height: 64,
+            stride_bytes: 256,
+        };
+        let window = snapshot(vec![0xff00_0000; 12], Rect::empty());
+        let region = push_wayland_gpu_layer(&mut packer, &mut layers, atlas, &window, true)
+            .expect("fits")
+            .expect("placed");
+        assert!(layers[0].source_over);
+        drop(packer);
+
+        let at = |x: usize, y: usize| alpha_at(&pixels, 64, region.x + x, region.y + y);
+        let title = at(3, 10);
+        assert!(
+            title > 0 && title < 255,
+            "title glass is translucent: {title}"
+        );
+        assert_eq!(at(2, 38), 255, "the client area stays opaque");
+    }
+
+    #[test]
+    fn a_retained_console_update_keeps_the_title_glass_translucent() {
+        use crate::app::ConsoleWindow;
+        let frame = Rect {
+            x: 40,
+            y: 60,
+            width: 320,
+            height: 180,
+        };
+        let mut window = ConsoleWindow::new(7, String::from("Shell"), frame, 1);
+        window.output_cache.extend_from_slice(b"prompt> ");
+        super::chrome::rebuild_console_window_surface(&mut window, true);
+        // The atlas holds the cache as an opaque copy before the update.
+        let mut atlas: Vec<u32> = window
+            .surface_cache
+            .pixels
+            .iter()
+            .map(|pixel| pixel | 0xff00_0000)
+            .collect();
+        let source_rect = Rect {
+            x: 0,
+            y: 0,
+            width: frame.width,
+            height: frame.height,
+        };
+        let mut bindings = [super::ConsoleAtlasBinding {
+            session_handle: 7,
+            content_version: window.surface_cache.content_version,
+            source_rect,
+            layer_index: 0,
+            focused: true,
+        }];
+        window.output_cache.push(b'x');
+        window.terminal_dirty = true;
+        window.invalidate_surface();
+        let mut damage = Vec::new();
+        assert!(super::update_console_gpu_texture(
+            &mut window,
+            true,
+            &mut atlas,
+            frame.width,
+            &mut bindings,
+            &mut 0,
+            &mut damage,
+        )
+        .unwrap());
+
+        let title = alpha_at(&atlas, frame.width, 100, 12);
+        assert!(
+            title > 0 && title < 255,
+            "title glass is translucent: {title}"
+        );
+        assert_eq!(alpha_at(&atlas, frame.width, 100, 120), 255);
+    }
+
+    #[test]
+    fn a_console_window_that_fits_the_atlas_still_gets_its_layer() {
+        use crate::app::ConsoleWindow;
+        let mut pixels = vec![0_u32; 512 * 512];
+        let mut packer = GpuAtlasPacker::new(pixels.as_mut_slice(), 512, 512, 512).expect("packer");
+        let mut layers = Vec::new();
+        let atlas = GpuTextureCapability {
+            token: 1,
+            generation: 1,
+            content_epoch: 1,
+            binding_slot: 0,
+            width: 512,
+            height: 512,
+            stride_bytes: 2048,
+        };
+        let frame = Rect {
+            x: 40,
+            y: 60,
+            width: 320,
+            height: 180,
+        };
+        let mut window = ConsoleWindow::new(7, String::from("Shell"), frame, 1);
+
+        let placed = push_console_gpu_layer(&mut packer, &mut layers, atlas, &mut window, true)
+            .expect("fits")
+            .expect("a window that fits gets a texture region");
+
+        assert_eq!((placed.width, placed.height), (frame.width, frame.height));
+        assert_eq!(layers.len(), 1);
+        assert_eq!(layers[0].destination, frame);
     }
 }

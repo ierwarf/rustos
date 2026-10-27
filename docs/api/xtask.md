@@ -87,6 +87,16 @@ the resetless lane can leave the GPU dirty, it permits one launch per cold host
 boot and is not commercial lifecycle, reset, revoke, recovery, or quantitative
 performance evidence.
 
+`--physical-usb <BDF>` is a non-commercial lab option with no sealed device
+profile. It attaches one xHCI controller (PCI class `0x0c0330`) that is already
+bound to `vfio-pci` and is the sole member of its IOMMU group to the DVM through
+IOMMUFD, and it omits the virtual DVM keyboard and pointer so the DVM agent
+relays a physical USB keyboard and pointer by evdev capability. It cannot be
+combined with `--exercise-input`, `--min-ui-fps`, or `--storage-dvm-only`. The
+runner never changes a driver binding or resets the controller; direct IOMMUFD
+and VFIO device access and a large inherited memlock are required. It is not
+commercial lifecycle, revoke, or recovery evidence.
+
 `--min-ui-fps <fps>` patches only the private KVM disk to enable uiserver and
 WayClick profiles. It requires consecutive render/input windows, balanced
 WayClick commit/frame-callback/buffer-release progress whose exact aggregate
@@ -175,6 +185,15 @@ reset을 변경하지 않습니다. 통과하려면 실제 `uiserver` 장면 제
 가능한 IOMMUFD/VFIO, 상속된 4 GiB 이상의 memlock이 필요합니다. resetless 경로는
 GPU를 dirty 상태로 남길 수 있어 cold host boot마다 한 번만 실행하며, 상용
 수명주기, reset, revoke, 복구 또는 정량 성능 증거가 아닙니다.
+
+`--physical-usb <BDF>`는 sealed device profile이 없는 비상용 lab 옵션입니다.
+이미 `vfio-pci`에 바인딩되어 있고 IOMMU group의 유일한 멤버인 xHCI 컨트롤러(PCI
+class `0x0c0330`) 하나를 IOMMUFD로 DVM에 붙이고, 가상 DVM 키보드와 포인터를 빼서
+DVM agent가 evdev capability로 물리 USB 키보드와 포인터를 relay하게 합니다.
+`--exercise-input`, `--min-ui-fps`, `--storage-dvm-only`와 함께 쓸 수 없습니다.
+실행기는 드라이버 바인딩과 reset을 변경하지 않으며, 직접 읽기/쓰기가 가능한
+IOMMUFD/VFIO 장치 접근과 큰 상속 memlock이 필요합니다. 상용 수명주기, revoke,
+복구 증거가 아닙니다.
 
 `--min-ui-fps <fps>`는 private KVM disk에서만 uiserver와 WayClick profile을
 활성화합니다. 연속 render/input window, 전체 구간의 정확한 commit/callback

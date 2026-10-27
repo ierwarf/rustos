@@ -37,7 +37,7 @@ console_hosted = false
 | Field | Values | Meaning |
 | --- | --- | --- |
 | `id` | string | Stable package id used by runtime deps and registries. |
-| `kind` | `kernel`, `service`, `app`, `compat` | Package taxonomy. |
+| `kind` | `kernel`, `service`, `app`, `compat`, `data` | Package taxonomy. `data` packages ship files only and install under `assets/`. |
 | `execution_domain` | `kernel`, `user` | Required execution domain. |
 | `startup` | `none`, `init`, `session`, `desktop` | Startup policy for generated registries. |
 | `runtime_deps` | package id list | Runtime ordering/exposure dependency metadata. |
@@ -51,6 +51,7 @@ console_hosted = false
 | `mingw-c-exe` | Windows PE executable demo. |
 | `c-demo` | Host C demo/smoke artifact. |
 | `winsys-dll-bundle` | Windows system DLL bundle. |
+| `asset-bundle` | Copies the `build.source` directory verbatim; only for `kind = "data"`, which requires `install.layout = "directory"`. |
 
 For `c-demo`, optional `build.extra_sources = ["registers.S"]` adds explicit
 package-relative translation units alongside `build.source`. Every unit and the
@@ -116,7 +117,7 @@ console_hosted = false
 | Field | Values | Meaning |
 | --- | --- | --- |
 | `id` | string | runtime deps와 registry에서 쓰는 stable package id |
-| `kind` | `kernel`, `service`, `app`, `compat` | package taxonomy |
+| `kind` | `kernel`, `service`, `app`, `compat`, `data` | package taxonomy. `data` package는 파일만 배포하며 `assets/` 아래에 설치 |
 | `execution_domain` | `kernel`, `user` | 필수 execution domain |
 | `startup` | `none`, `init`, `session`, `desktop` | generated registry startup policy |
 | `runtime_deps` | package id list | runtime ordering/exposure dependency metadata |
@@ -130,6 +131,7 @@ console_hosted = false
 | `mingw-c-exe` | Windows PE executable demo |
 | `c-demo` | host C demo/smoke artifact |
 | `winsys-dll-bundle` | Windows system DLL bundle |
+| `asset-bundle` | `build.source` 디렉터리를 그대로 복사. `kind = "data"` 전용이며 `install.layout = "directory"` 필요 |
 
 `c-demo`의 `build.extra_sources = ["registers.S"]`는 package 상대 경로의 추가
 translation unit입니다. 모든 source와 manifest를 freshness 입력으로 검사합니다.

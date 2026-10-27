@@ -1,6 +1,7 @@
 mod acceptance_profile;
 mod app;
 mod canvas;
+mod clock;
 mod cursor_sprites;
 mod diagnostics;
 mod font;
@@ -17,6 +18,8 @@ mod runtime_sync;
 mod simd;
 mod sys;
 mod terminal;
+mod ui_assets;
+mod ui_config;
 mod wayland;
 mod wayland_accept;
 
@@ -475,6 +478,10 @@ fn run() -> Result<(), i32> {
     // normal asynchronous production diagnostic.
     sys::debug_line(GPU_SCENE_READY);
     diag_line(GPU_SCENE_READY);
+    // Fonts and the clock offset come from files on the boot volume, which the
+    // storage stack publishes after this service starts. Load them on a thread
+    // that waits for it; text appears once they are installed.
+    let ui_assets_loaded = ui_assets::start_asset_loader();
     let mut state = AppState::initialize()?;
     // Input ingress is independent of runtime catalog and Wayland startup.
     // Arm it immediately after the display/input handles are validated so a
@@ -633,6 +640,19 @@ fn run() -> Result<(), i32> {
             pending_update.request_full();
         }
 
+        if let Ok(load) = ui_assets_loaded.try_recv() {
+            match load {
+                ui_assets::AssetLoad::Ready(_) => {
+                    // Everything painted so far had no text; repaint it.
+                    state.desktop_cache.invalidate_chrome();
+                    pending_update.request_full();
+                }
+                ui_assets::AssetLoad::Failed(reason) => {
+                    diag_line(format!("uiserver: ui assets {reason}"));
+                }
+            }
+        }
+
         while let Ok(programs) = launcher_programs.try_recv() {
             if state.apply_launcher_programs(programs) {
                 pending_update.absorb(VisualUpdate::partial(render::launcher_dirty_rect(
@@ -640,6 +660,13 @@ fn run() -> Result<(), i32> {
                     state.surface.height,
                 )));
             }
+        }
+
+        if state.refresh_clock(Instant::now(), clock::ClockReading::now) {
+            pending_update.absorb(VisualUpdate::partial(layout::home_clock_dirty_rect(
+                state.surface.width,
+                state.surface.height,
+            )));
         }
 
         let input_started = Instant::now();

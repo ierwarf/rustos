@@ -213,10 +213,14 @@
   topology.
   Both smoke and interactive DVM launches disable QEMU's default VGA so the
   service opens the sole virtio-GPU DRM device rather than a competing VGA DRM
-  node. The interactive GTK frontend uses `zoom-to-fit=off`, and the private
+  node. The smoke and FPS GTK frontend uses `zoom-to-fit=off`, and the private
   DVM virtio-GPU disables resize-aware EDID: otherwise GTK's bootstrap window
   can request 640×480 before Linux DRM starts and force unnecessary scaling.
-  QEMU's explicit 1600×900 mode is therefore authoritative. The 60 FPS proof
+  QEMU's explicit 1600×900 mode is therefore authoritative. The operator-owned
+  `kvm-run` window is the exception: it scales the guest to the window and hides
+  the GTK menu bar (`zoom-to-fit=on,show-menubar=off`) so the whole desktop fits a
+  host screen smaller than 1600×900; `--actual-size` restores the 1:1 window. The
+  guest mode and the pointer mapping are unchanged. The 60 FPS proof
   requires an active GTK consumer and atomic three-buffer page-flip
   completion. The same consecutive uiserver profile windows must satisfy the
   render-rate, input-gap/loss, backlog, and logical/presented-cursor predicates;

@@ -124,6 +124,19 @@ from `runtimed` and a window from `uiserver`. The terminal state lives in
 `uiserver`'s `TerminalState`, parsing input bytes from the console output
 ring. Layout uses the terminal monospace atlas; chrome uses the UI atlas.
 
+### Fonts and UI Config
+
+No font or time zone is compiled into `uiserver`. At startup it reads
+`/assets/ui/ui.conf` (shipped by the `ui-assets` data package from
+`assets/ui/bundle/`; `RUSTOS_UI_CONFIG` overrides the path for development
+because runtimed launches uiserver with a fixed environment), parses each TTF it names with `fontdue`
+and rasterizes one ASCII atlas per text role (`ui_large`, `ui_medium`,
+`clock`, `terminal`). Reads are bounded (64 KiB config, 4 MiB per
+font). `ui.conf` parsing is strict and reports the offending line. If the
+config or a font is missing or invalid, the server logs why and runs without
+text instead of exiting. The home screen clock is UTC plus
+`clock.utc_offset_minutes`; RustOS has no timezone database.
+
 ### Profile Trace
 
 Set `RUSTOS_UI_PROFILE=1` when profiling is needed to enable
@@ -245,6 +258,19 @@ console-hosted program (shell, PE demo)은 `runtimed`에서 console session
 `TerminalState` 안에 있고 console output ring의 input byte를 parsing
 합니다. layout은 terminal monospace atlas를, chrome은 UI atlas를
 사용합니다.
+
+### Font와 UI 설정
+
+`uiserver`에는 font나 time zone이 컴파일되어 들어가지 않습니다. 시작 시
+`/assets/ui/ui.conf`(`ui-assets` data package가 `assets/ui/bundle/`에서 배포.
+runtimed가 uiserver를 고정 환경으로 실행하므로 개발용으로만 `RUSTOS_UI_CONFIG`가
+경로를 override)를 읽고, 거기 적힌 TTF를 `fontdue`로
+parsing해 text role(`ui_large`, `ui_medium`, `clock`, `terminal`)마다
+ASCII atlas를 만듭니다. 읽기는 상한이 있습니다(config 64 KiB, font당 4 MiB).
+`ui.conf` parsing은 엄격하며 잘못된 줄 번호를 보고합니다. config나 font가
+없거나 잘못되면 종료하지 않고 이유를 로그에 남긴 채 text 없이 동작합니다.
+home 화면 시계는 UTC에 `clock.utc_offset_minutes`를 더한 값이며 RustOS에는
+timezone database가 없습니다.
 
 ### Profile Trace
 

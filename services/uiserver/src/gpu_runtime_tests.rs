@@ -323,3 +323,49 @@ fn slot_reconstruction_budget_rejects_atlas_amplification() {
     assert!(!reconstruction_damage_within_budget(180_001, 1600, 900));
     assert!(!reconstruction_damage_within_budget(1600 * 900, 1600, 900));
 }
+
+#[test]
+fn difference_bounds_matches_a_per_pixel_scan() {
+    fn per_pixel(previous: &[u32], next: &[u32], width: usize, height: usize, stride: usize) -> Option<Rect> {
+        let (mut left, mut top, mut right, mut bottom) = (width, height, 0, 0);
+        for y in 0..height {
+            for x in 0..width {
+                let index = y * stride + x;
+                if previous.get(index) != next.get(index) {
+                    left = left.min(x);
+                    top = top.min(y);
+                    right = right.max(x + 1);
+                    bottom = bottom.max(y + 1);
+                }
+            }
+        }
+        (left < right && top < bottom).then(|| Rect {
+            x: left,
+            y: top,
+            width: right - left,
+            height: bottom - top,
+        })
+    }
+    let (width, height, stride) = (37_usize, 23_usize, 41_usize);
+    let base: Vec<u32> = (0..stride * height).map(|i| i as u32 * 7).collect();
+    for (x, y) in [(0, 0), (36, 22), (5, 9), (36, 0), (0, 22)] {
+        let mut next = base.clone();
+        next[y * stride + x] ^= 1;
+        assert_eq!(
+            difference_bounds(&base, &next, width, height, stride),
+            per_pixel(&base, &next, width, height, stride),
+            "pixel ({x}, {y})"
+        );
+    }
+    let mut next = base.clone();
+    next[3 * stride + 30] ^= 1;
+    next[17 * stride + 2] ^= 1;
+    assert_eq!(
+        difference_bounds(&base, &next, width, height, stride),
+        per_pixel(&base, &next, width, height, stride)
+    );
+    // Padding between rows is not part of the image.
+    let mut padded = base.clone();
+    padded[4 * stride + width + 1] ^= 1;
+    assert_eq!(difference_bounds(&base, &padded, width, height, stride), None);
+}

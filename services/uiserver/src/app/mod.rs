@@ -1,5 +1,6 @@
 mod bootstrap;
 mod input;
+mod launch;
 mod runtime;
 
 pub(crate) use bootstrap::start_launcher_program_loader;
@@ -305,6 +306,11 @@ pub(crate) struct DesktopSurfaceCache {
     pub(crate) background_valid: bool,
     pub(crate) chrome_valid: bool,
     pub(crate) content_version: u64,
+    /// The local minute the cached chrome's clock shows, or `None` when it
+    /// shows no clock. A different minute means the chrome is stale.
+    pub(crate) clock_minute: Option<i64>,
+    /// When the system clock was last compared with `clock_minute`.
+    pub(crate) clock_checked: Option<std::time::Instant>,
 }
 
 impl DesktopSurfaceCache {
@@ -320,7 +326,38 @@ impl DesktopSurfaceCache {
     pub(crate) fn fully_valid(&self) -> bool {
         self.background_valid && self.chrome_valid
     }
+
+    /// Invalidate the chrome when the clock it shows is a minute behind.
+    /// Returns whether it did. The system clock is only consulted once per
+    /// [`CLOCK_POLL_INTERVAL`]: reading it every loop pass would cost a
+    /// syscall per frame for a value that changes once a minute.
+    pub(crate) fn refresh_clock(
+        &mut self,
+        now: std::time::Instant,
+        clock_shown: bool,
+        reading: impl FnOnce() -> Option<crate::clock::ClockReading>,
+    ) -> bool {
+        if self
+            .clock_checked
+            .is_some_and(|last| now.saturating_duration_since(last) < CLOCK_POLL_INTERVAL)
+        {
+            return false;
+        }
+        self.clock_checked = Some(now);
+        // A pending rebuild will draw whatever minute it is by then, and a
+        // display too small for a clock has nothing to keep fresh.
+        if !self.chrome_valid || !clock_shown {
+            return false;
+        }
+        if reading().map(|reading| reading.minute_key) == self.clock_minute {
+            return false;
+        }
+        self.invalidate_chrome();
+        true
+    }
 }
+
+pub(crate) const CLOCK_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 pub(crate) struct ConsoleWindow {
     pub(crate) session_handle: ConsoleSessionHandle,
@@ -706,5 +743,79 @@ mod visual_update_tests {
         update.add_partial_rect(Rect::empty());
         assert!(update.is_empty());
         assert!(!update.scene_dirty());
+    }
+}
+
+#[cfg(test)]
+mod clock_refresh_tests {
+    use super::{DesktopSurfaceCache, CLOCK_POLL_INTERVAL};
+    use crate::clock::ClockReading;
+    use std::time::{Duration, Instant};
+
+    fn reading(minute: i64) -> Option<ClockReading> {
+        Some(ClockReading::from_unix(minute * 60, 0))
+    }
+
+    fn shown_at(minute: i64) -> DesktopSurfaceCache {
+        DesktopSurfaceCache {
+            chrome_valid: true,
+            clock_minute: Some(minute),
+            ..DesktopSurfaceCache::default()
+        }
+    }
+
+    #[test]
+    fn a_new_minute_invalidates_the_chrome_once() {
+        let start = Instant::now();
+        let mut cache = shown_at(100);
+        assert!(!cache.refresh_clock(start, true, || reading(100)), "same minute");
+        assert!(cache.chrome_valid);
+
+        let later = start + CLOCK_POLL_INTERVAL;
+        assert!(cache.refresh_clock(later, true, || reading(101)), "next minute");
+        assert!(!cache.chrome_valid);
+
+        // The rebuild has not happened yet, so a second poll must not ask for
+        // another repaint.
+        let again = later + CLOCK_POLL_INTERVAL;
+        assert!(!cache.refresh_clock(again, true, || reading(101)));
+    }
+
+    #[test]
+    fn the_system_clock_is_not_read_more_than_once_per_interval() {
+        let start = Instant::now();
+        let mut cache = shown_at(100);
+        assert!(!cache.refresh_clock(start, true, || reading(100)));
+        let mut reads = 0;
+        let soon = start + CLOCK_POLL_INTERVAL - Duration::from_millis(1);
+        assert!(!cache.refresh_clock(soon, true, || {
+            reads += 1;
+            reading(999)
+        }));
+        assert_eq!(reads, 0);
+        assert!(cache.chrome_valid, "a skipped poll changes nothing");
+    }
+
+    #[test]
+    fn nothing_is_refreshed_without_a_clock_or_while_a_rebuild_is_pending() {
+        let start = Instant::now();
+        let mut hidden = shown_at(100);
+        assert!(!hidden.refresh_clock(start, false, || reading(500)));
+
+        let mut pending = shown_at(100);
+        pending.chrome_valid = false;
+        assert!(!pending.refresh_clock(start, true, || reading(500)));
+    }
+
+    #[test]
+    fn a_clock_that_was_never_drawn_is_drawn_once_time_is_known() {
+        let start = Instant::now();
+        let mut cache = DesktopSurfaceCache {
+            chrome_valid: true,
+            ..DesktopSurfaceCache::default()
+        };
+        assert!(!cache.refresh_clock(start, true, || None), "no time, no clock");
+        let later = start + CLOCK_POLL_INTERVAL;
+        assert!(cache.refresh_clock(later, true, || reading(7)));
     }
 }

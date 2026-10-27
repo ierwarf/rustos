@@ -307,6 +307,9 @@ fn run_one_smoke(
     if options.physical_gpu_bdf.is_some() {
         validate_physical_gpu_inputs(&options)?;
     }
+    if options.physical_usb_bdf.is_some() {
+        validate_physical_usb_inputs(&options)?;
+    }
 
     if options.dry_run {
         println!(
@@ -518,6 +521,8 @@ pub(crate) fn kvm_run_command(
     build_image: bool,
     rustos_vcpus: u8,
     auto_verify: bool,
+    physical_usb_bdf: Option<String>,
+    fit_host_window: bool,
 ) -> Result<()> {
     let _launch_lock = acquire_kvm_launch_lock(&config.build_dir.join("kvm"))?;
     if build_image {
@@ -546,6 +551,8 @@ pub(crate) fn kvm_run_command(
         smp_evidence_cohort: None,
         physical_gpu_bdf: None,
         physical_gpu_firmware: None,
+        physical_usb_bdf,
+        fit_host_window,
         ipcbench_probe: None,
         min_ui_fps: None,
         ui_proof_windows: DEFAULT_UI_FPS_ACTIVE_WINDOWS,
@@ -569,6 +576,9 @@ pub(crate) fn kvm_run_command(
             DVM_BLOCK_READY_MARKER.to_owned(),
         ],
     };
+    if options.physical_usb_bdf.is_some() {
+        validate_physical_usb_inputs(&options)?;
+    }
     // A multicore launch is admitted only by the formal profile that models
     // its topology, and this is the interactive path: an unsealed profile here
     // means someone edited the tree and pressed run, not that they intended to
@@ -698,8 +708,13 @@ pub(crate) fn kvm_run_command(
                 return Err(error).context("record interactive product boot trace");
             }
             readiness_verified = true;
+            let pointer_hint = if options.physical_usb_bdf.is_some() {
+                "move the physical USB mouse"
+            } else {
+                "move the pointer into the Linux DVM window"
+            };
             println!(
-                "xtask: interactive KVM DVM display/storage verified in {} ms; move the pointer into the Linux DVM window to record real-input acceptance evidence, then close it or press Ctrl-C to stop",
+                "xtask: interactive KVM DVM display/storage verified in {} ms; {pointer_hint} to record real-input acceptance evidence, then close the window or press Ctrl-C to stop",
                 started_at.elapsed().as_millis(),
             );
         }
@@ -727,7 +742,11 @@ enum GuestDisplay {
     Physical,
 }
 
-fn qemu_display_backend(display: GuestDisplay, render_node: Option<&Path>) -> Result<String> {
+fn qemu_display_backend(
+    display: GuestDisplay,
+    render_node: Option<&Path>,
+    fit_host_window: bool,
+) -> Result<String> {
     match display {
         // Keep the noninteractive proof on the physical host render node.
         // Allowing QEMU to pick a software EGL device would fabricate GPU
@@ -743,6 +762,18 @@ fn qemu_display_backend(display: GuestDisplay, render_node: Option<&Path>) -> Re
         // result to the frontend default and previously left the host pointer
         // visible over the guest UI on some GTK versions.
         //
+        //
+        // The default presents the guest at exactly 1:1, which is what the
+        // smoke and FPS proofs measure. That makes the window as large as the
+        // 1600x900 guest, which does not fit a host whose logical screen is
+        // smaller (for example a 2880x1800 panel at 200% scale). The
+        // interactive session therefore scales the guest to the window and
+        // hides the menu bar so the whole desktop stays on screen at any
+        // window size. Pointer input is absolute, so scaling stays exact.
+        GuestDisplay::DvmGtk if fit_host_window => Ok(
+            "gtk,gl=on,show-tabs=off,show-menubar=off,zoom-to-fit=on,grab-on-hover=on,show-cursor=off"
+                .to_owned(),
+        ),
         GuestDisplay::DvmGtk => Ok(
             "gtk,gl=on,show-tabs=off,zoom-to-fit=off,grab-on-hover=on,show-cursor=off".to_owned(),
         ),

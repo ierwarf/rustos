@@ -1,3 +1,4 @@
+use std::collections::BTreeSet;
 use std::env;
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
@@ -93,6 +94,48 @@ pub(crate) fn copy_tree_files(src_root: &Path, dst_root: &Path) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// Make `dst_root` hold exactly the files of `src_root`. Only files whose
+/// contents differ are written, so an unchanged tree keeps its modification
+/// times, and files that no longer exist in the source are removed along with
+/// any directory left empty.
+pub(crate) fn sync_directory(src_root: &Path, dst_root: &Path) -> Result<()> {
+    let mut wanted = BTreeSet::new();
+    for entry in WalkDir::new(src_root).sort_by_file_name() {
+        let entry = entry?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let relative = entry.path().strip_prefix(src_root)?.to_owned();
+        let target = dst_root.join(&relative);
+        let source = fs::read(entry.path())?;
+        if fs::read(&target).ok().as_deref() != Some(source.as_slice()) {
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&target, source)?;
+        }
+        wanted.insert(relative);
+    }
+    if !dst_root.is_dir() {
+        return Ok(());
+    }
+    for entry in WalkDir::new(dst_root).contents_first(true) {
+        let entry = entry?;
+        if entry.path() == dst_root {
+            continue;
+        }
+        let relative = entry.path().strip_prefix(dst_root)?;
+        if entry.file_type().is_dir() {
+            if fs::read_dir(entry.path())?.next().is_none() {
+                fs::remove_dir(entry.path())?;
+            }
+        } else if !wanted.contains(relative) {
+            fs::remove_file(entry.path())?;
+        }
+    }
     Ok(())
 }
 
@@ -199,4 +242,49 @@ pub(crate) fn run_command(command: &mut Command) -> Result<()> {
         output.status,
         command
     )
+}
+
+#[cfg(test)]
+mod sync_directory_tests {
+    use super::sync_directory;
+    use std::fs;
+    use std::time::Duration;
+
+    #[test]
+    fn it_mirrors_files_skips_unchanged_ones_and_removes_stale_ones() {
+        let root = tempfile::tempdir().unwrap();
+        let (src, dst) = (root.path().join("src"), root.path().join("dst"));
+        fs::create_dir_all(src.join("fonts")).unwrap();
+        fs::write(src.join("ui.conf"), "a").unwrap();
+        fs::write(src.join("fonts/one.ttf"), "one").unwrap();
+
+        sync_directory(&src, &dst).unwrap();
+        assert_eq!(fs::read_to_string(dst.join("ui.conf")).unwrap(), "a");
+        assert_eq!(fs::read_to_string(dst.join("fonts/one.ttf")).unwrap(), "one");
+
+        // An unchanged file is left alone: its modification time must not move.
+        let before = fs::metadata(dst.join("fonts/one.ttf")).unwrap().modified().unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        sync_directory(&src, &dst).unwrap();
+        let after = fs::metadata(dst.join("fonts/one.ttf")).unwrap().modified().unwrap();
+        assert_eq!(before, after);
+
+        // Changed contents are rewritten; deleted sources disappear with their directory.
+        fs::write(src.join("ui.conf"), "b").unwrap();
+        fs::remove_dir_all(src.join("fonts")).unwrap();
+        sync_directory(&src, &dst).unwrap();
+        assert_eq!(fs::read_to_string(dst.join("ui.conf")).unwrap(), "b");
+        assert!(!dst.join("fonts").exists());
+    }
+
+    #[test]
+    fn an_empty_source_leaves_an_empty_destination() {
+        let root = tempfile::tempdir().unwrap();
+        let (src, dst) = (root.path().join("src"), root.path().join("dst"));
+        fs::create_dir_all(&src).unwrap();
+        fs::create_dir_all(&dst).unwrap();
+        fs::write(dst.join("stale"), "x").unwrap();
+        sync_directory(&src, &dst).unwrap();
+        assert!(fs::read_dir(&dst).unwrap().next().is_none());
+    }
 }

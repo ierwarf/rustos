@@ -81,6 +81,29 @@ require_enabled CONFIG_ZONE_DEVICE
 require_enabled CONFIG_DMA_SHARED_BUFFER
 require_enabled CONFIG_SYNC_FILE
 require_enabled CONFIG_INPUT_UINPUT
+# Assigned physical USB input reaches evdev through the generic HID driver
+# only. Vendor families default on while CONFIG_EXPERT is unset, so pin them off.
+require_builtin CONFIG_HID
+require_builtin CONFIG_HID_GENERIC
+require_builtin CONFIG_USB_HID
+require_module CONFIG_USB_XHCI_HCD
+require_module CONFIG_USB_XHCI_PCI
+for hid_vendor in \
+    CONFIG_HID_A4TECH \
+    CONFIG_HID_APPLE \
+    CONFIG_HID_BELKIN \
+    CONFIG_HID_CHERRY \
+    CONFIG_HID_CHICONY \
+    CONFIG_HID_CYPRESS \
+    CONFIG_HID_EZKEY \
+    CONFIG_HID_ITE \
+    CONFIG_HID_KENSINGTON \
+    CONFIG_HID_LOGITECH \
+    CONFIG_HID_MICROSOFT \
+    CONFIG_HID_MONTEREY \
+    CONFIG_HID_REDRAGON; do
+    require_disabled "$hid_vendor"
+done
 require_enabled CONFIG_DRM
 require_enabled CONFIG_DRM_VIRTIO_GPU
 require_module CONFIG_DRM_I915
@@ -117,8 +140,6 @@ for unused_family in \
     CONFIG_ETHERNET \
     CONFIG_SOUND \
     CONFIG_MEDIA_SUPPORT \
-    CONFIG_HID \
-    CONFIG_USB_HID \
     CONFIG_I2C_HID \
     CONFIG_INPUT_KEYBOARD \
     CONFIG_INPUT_MOUSE \

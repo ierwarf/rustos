@@ -18,6 +18,9 @@ pub(crate) enum PackageKind {
     Service,
     App,
     Compat,
+    /// Static files installed into the image as they are, such as fonts and
+    /// UI configuration. A data package runs no code.
+    Data,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd)]
@@ -71,6 +74,9 @@ pub(crate) enum BuilderKind {
     MingwCExe,
     CDemo,
     WinsysDllBundle,
+    /// Copy `build.source` (a directory in the package) into the image
+    /// unchanged. Used by data packages.
+    AssetBundle,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -310,6 +316,34 @@ fn validate_manifests(manifests: &[PackageManifest]) -> Result<()> {
                     );
                 }
             }
+            BuilderKind::AssetBundle => {
+                if manifest.install.layout != InstallLayout::Directory {
+                    bail!(
+                        "package {} must use install.layout = \"directory\"",
+                        manifest.id
+                    );
+                }
+                if manifest.resolved_source_path().is_none() {
+                    bail!(
+                        "package {} missing build.source in {}",
+                        manifest.id,
+                        manifest.manifest_path.display()
+                    );
+                }
+                if manifest.kind != PackageKind::Data {
+                    bail!(
+                        "package {} uses the asset-bundle builder, which is only for kind = \"data\"",
+                        manifest.id
+                    );
+                }
+            }
+        }
+        if manifest.kind == PackageKind::Data && manifest.build.builder != BuilderKind::AssetBundle
+        {
+            bail!(
+                "data package {} must use builder = \"asset-bundle\"",
+                manifest.id
+            );
         }
 
         match manifest.kind {
@@ -319,7 +353,7 @@ fn validate_manifests(manifests: &[PackageManifest]) -> Result<()> {
                     manifest.id
                 );
             }
-            PackageKind::Service | PackageKind::App | PackageKind::Compat
+            PackageKind::Service | PackageKind::App | PackageKind::Compat | PackageKind::Data
                 if execution_domain != ExecutionDomain::User =>
             {
                 bail!(
@@ -433,6 +467,7 @@ fn validate_manifest_location(manifest: &PackageManifest) -> Result<()> {
         PackageKind::Service => "services/",
         PackageKind::App => "apps/",
         PackageKind::Compat => "compat/",
+        PackageKind::Data => "assets/",
     };
 
     if relative.contains(&format!("/{expected_root}")) || relative.starts_with(expected_root) {
@@ -477,6 +512,15 @@ fn validate_install_taxonomy(manifest: &PackageManifest) -> Result<()> {
             if !path.starts_with("compat/") {
                 bail!(
                     "compat package {} must install under compat/, got {}",
+                    manifest.id,
+                    path
+                );
+            }
+        }
+        PackageKind::Data => {
+            if !path.starts_with("assets/") {
+                bail!(
+                    "data package {} must install under assets/, got {}",
                     manifest.id,
                     path
                 );
@@ -604,5 +648,61 @@ mod tests {
 
         assert_eq!(manifest.startup, StartupMode::Session);
         assert!(manifest.desktop.entries[0].no_display);
+    }
+
+    fn validate_at(text: &str, manifest_path: &str) -> std::result::Result<(), String> {
+        let mut manifest: PackageManifest = toml::from_str(text).map_err(|err| err.to_string())?;
+        manifest.manifest_path = PathBuf::from(manifest_path);
+        manifest.package_root = PathBuf::from(manifest_path)
+            .parent()
+            .expect("manifest has a directory")
+            .to_path_buf();
+        validate_manifests(&[manifest]).map_err(|err| err.to_string())
+    }
+
+    const DATA_MANIFEST: &str = "id = \"ui-assets\"\nkind = \"data\"\nexecution_domain = \"user\"\n[build]\nbuilder = \"asset-bundle\"\nsource = \"bundle\"\n[install]\npath = \"assets/ui\"\nlayout = \"directory\"\n";
+
+    #[test]
+    fn a_data_package_installs_a_directory_of_assets() {
+        validate_at(DATA_MANIFEST, "assets/ui/RUSTOS.package.toml")
+            .expect("a well-formed data package validates");
+    }
+
+    #[test]
+    fn a_data_package_must_use_the_asset_bundle_builder() {
+        let text = DATA_MANIFEST.replace(
+            "builder = \"asset-bundle\"\nsource = \"bundle\"",
+            "builder = \"cargo-kernel-binary\"\npackage = \"x\"",
+        );
+        let err = validate_at(&text, "assets/ui/RUSTOS.package.toml").unwrap_err();
+        assert!(err.contains("must use builder = \"asset-bundle\""), "{err}");
+    }
+
+    #[test]
+    fn the_asset_bundle_builder_is_only_for_data_packages() {
+        let text = DATA_MANIFEST.replace("kind = \"data\"", "kind = \"service\"");
+        let err = validate_at(&text, "services/ui/RUSTOS.package.toml").unwrap_err();
+        assert!(err.contains("only for kind"), "{err}");
+    }
+
+    #[test]
+    fn a_data_package_stays_under_assets() {
+        let moved = DATA_MANIFEST.replace("path = \"assets/ui\"", "path = \"services/ui\"");
+        let err = validate_at(&moved, "assets/ui/RUSTOS.package.toml").unwrap_err();
+        assert!(err.contains("must install under assets/"), "{err}");
+
+        let err = validate_at(DATA_MANIFEST, "services/ui/RUSTOS.package.toml").unwrap_err();
+        assert!(err.contains("outside assets/"), "{err}");
+    }
+
+    #[test]
+    fn a_data_package_needs_a_source_and_a_directory_layout() {
+        let no_source = DATA_MANIFEST.replace("source = \"bundle\"\n", "");
+        let err = validate_at(&no_source, "assets/ui/RUSTOS.package.toml").unwrap_err();
+        assert!(err.contains("missing build.source"), "{err}");
+
+        let file_layout = DATA_MANIFEST.replace("layout = \"directory\"\n", "");
+        let err = validate_at(&file_layout, "assets/ui/RUSTOS.package.toml").unwrap_err();
+        assert!(err.contains("directory"), "{err}");
     }
 }

@@ -1,6 +1,7 @@
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
+use std::time::Instant;
 
 use runtime_control::{load_desktop_program_entries, StartupMode, DEFAULT_APPLICATIONS_DIR};
 
@@ -8,7 +9,9 @@ use super::{
     align_up, start_console_command_dispatcher, AppState, CursorMotion, DesktopSurfaceCache,
     LauncherProgram, MAX_DISPLAY_HEIGHT, MAX_DISPLAY_WIDTH, PAGE_SIZE,
 };
+use crate::clock::ClockReading;
 use crate::gpu_runtime::GpuCompositorRuntime;
+use crate::layout::home_clock;
 use crate::sys::{
     boot_line, debug_line, diag_line, display_create_surface, display_get_info, display_present,
     display_present_rect, map_surface, open_console, open_display, open_input,
@@ -515,6 +518,20 @@ impl AppState {
         // gradient/grid pixels and just repaint the chrome strip on top.
         self.desktop_cache.invalidate_chrome();
         true
+    }
+}
+
+impl AppState {
+    /// Whether the home screen clock shows a stale minute, in which case the
+    /// chrome is invalidated so the next frame repaints it. `reading` supplies
+    /// the current time and is only called when the poll interval has elapsed.
+    pub(crate) fn refresh_clock(
+        &mut self,
+        now: Instant,
+        reading: impl FnOnce() -> Option<ClockReading>,
+    ) -> bool {
+        let clock_shown = home_clock(self.surface.width, self.surface.height).is_some();
+        self.desktop_cache.refresh_clock(now, clock_shown, reading)
     }
 }
 

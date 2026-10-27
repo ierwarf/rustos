@@ -257,7 +257,7 @@ fn spawn_dvm_guest(
     } else {
         "console=ttyS0 preempt=full"
     };
-    let dvm_display = qemu_display_backend(guest_display, host_render_node)?;
+    let dvm_display = qemu_display_backend(guest_display, host_render_node, options.fit_host_window)?;
     if guest_display == GuestDisplay::DvmGtk {
         let render_node =
             host_render_node.context("GTK display lost its validated host render node")?;
@@ -323,7 +323,14 @@ fn spawn_dvm_guest(
         )?;
         append_physical_gpu(&mut dvm_command, profile, bdf, &firmware);
     }
-    append_dvm_input_devices(&mut dvm_command, guest_display);
+    if let Some(bdf) = options.physical_usb_bdf.as_deref() {
+        // The DVM agent relays the first keyboard and pointer by evdev
+        // capability. Omit the virtual pair so only the assigned physical USB
+        // controller can supply them.
+        append_physical_usb(&mut dvm_command, &canonical_pci_bdf(bdf)?);
+    } else {
+        append_dvm_input_devices(&mut dvm_command, guest_display);
+    }
     let stderr = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
@@ -443,6 +450,14 @@ fn append_dvm_display_pixels(command: &mut Command, path: &Path, read_only: bool
 /// VFIO_DEVICE_FEATURE_DMA_BUF API before IOMMUFD maps it. Keep BAR mmap enabled:
 /// `x-no-mmap=on` bypasses that API, falls back to slow MMIO, and recreates the
 /// unsupported PCI-BAR mapping that caused QEMU 10.2.1 to abort before DVM boot.
+fn append_physical_usb(command: &mut Command, bdf: &str) {
+    // A separate IOAS keeps this lab attachment independent of the GPU path.
+    command
+        .args(["-object", "iommufd,id=iommufd-usb"])
+        .arg("-device")
+        .arg(format!("vfio-pci,host={bdf},iommufd=iommufd-usb"));
+}
+
 fn append_physical_gpu(
     command: &mut Command,
     profile: PhysicalGpuProfile,

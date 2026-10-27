@@ -38,6 +38,11 @@ struct SmokeOptions {
     smp_evidence_cohort: Option<String>,
     physical_gpu_bdf: Option<String>,
     physical_gpu_firmware: Option<PathBuf>,
+    physical_usb_bdf: Option<String>,
+    /// Scale the interactive GTK window to fit the host screen instead of
+    /// showing the guest at 1:1. Only the operator-owned `kvm-run` session
+    /// sets it; smoke and the FPS proof keep the exact 1:1 presentation.
+    fit_host_window: bool,
     ipcbench_probe: Option<String>,
     min_ui_fps: Option<u32>,
     ui_proof_windows: usize,
@@ -103,6 +108,8 @@ where
         smp_evidence_cohort: None,
         physical_gpu_bdf: None,
         physical_gpu_firmware: None,
+        physical_usb_bdf: None,
+        fit_host_window: false,
         ipcbench_probe: None,
         min_ui_fps: None,
         ui_proof_windows: DEFAULT_UI_FPS_ACTIVE_WINDOWS,
@@ -166,6 +173,12 @@ where
                     bail!("physical GPU firmware was supplied more than once");
                 }
                 options.physical_gpu_firmware = Some(PathBuf::from(next_value(&mut args, &arg)?));
+            }
+            "--physical-usb" => {
+                if options.physical_usb_bdf.is_some() {
+                    bail!("physical USB controller BDF was supplied more than once");
+                }
+                options.physical_usb_bdf = Some(next_value(&mut args, &arg)?);
             }
             "--ipcbench-probe" => {
                 if options.ipcbench_probe.is_some() {
@@ -387,6 +400,11 @@ where
         (Some(_), Some(_)) => {}
         (None, None) => {}
         _ => bail!("--physical-gpu and --gpu-firmware must be supplied together"),
+    }
+    if options.physical_usb_bdf.is_some() && (options.exercise_input || options.storage_only) {
+        bail!(
+            "--physical-usb replaces the virtual DVM keyboard and pointer, so it cannot be combined with --exercise-input, --min-ui-fps, or --storage-dvm-only"
+        );
     }
     Ok(options)
 }

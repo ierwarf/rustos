@@ -72,12 +72,19 @@ fn prepare_layout(config: &Config, options: &SmokeOptions) -> Result<KvmLayout> 
             options.ipcbench_probe.as_deref(),
         )?;
     }
-    let display_backing_dir = if options.gui_dvm_surfaces {
-        Some(create_dma_pinnable_display_directory()?)
-    } else {
-        None
-    };
-    let gui_dvm_surfaces = if let Some(directory) = display_backing_dir.as_ref() {
+    // Any physical VFIO device makes QEMU map every file-backed guest memory
+    // region into its IOMMUFD IOAS, which write-pins it, so those backings must
+    // be on tmpfs whether the device is a GPU surface or a USB controller.
+    let display_backing_dir =
+        if options.gui_dvm_surfaces || options.physical_usb_bdf.is_some() {
+            Some(create_dma_pinnable_display_directory()?)
+        } else {
+            None
+        };
+    let gui_dvm_surfaces = if let Some(directory) = display_backing_dir
+        .as_ref()
+        .filter(|_| options.gui_dvm_surfaces)
+    {
         // A physical VFIO device causes QEMU to map every guest RAM section
         // into its IOMMUFD IOAS. Keep the writable ivshmem BAR on tmpfs: a
         // regular build-directory file cannot be write-pinned by MAP_FILE.
@@ -87,7 +94,10 @@ fn prepare_layout(config: &Config, options: &SmokeOptions) -> Result<KvmLayout> 
     } else {
         None
     };
-    let gui_dvm_pixels = if let Some(directory) = display_backing_dir.as_ref() {
+    let gui_dvm_pixels = if let Some(directory) = display_backing_dir
+        .as_ref()
+        .filter(|_| options.gui_dvm_surfaces)
+    {
         let path = directory.path().join("dvm-display.pmem");
         create_gui_dvm_surfaces(&path)?;
         Some(path)
@@ -97,8 +107,15 @@ fn prepare_layout(config: &Config, options: &SmokeOptions) -> Result<KvmLayout> 
     let dvm_display_doorbell = gui_dvm_surfaces
         .as_ref()
         .map(|_| run_dir.join("dvm-display-doorbell.sock"));
+    // The network and block apertures stay beside the run unless a physical USB
+    // controller is attached, which requires pinnable tmpfs backings.
+    let shmem_dir = dvm_shmem_backing_dir(
+        display_backing_dir.as_ref().map(TempDir::path),
+        options.physical_usb_bdf.is_some(),
+        &run_dir,
+    );
     let dvm_network_shmem = if options.dvm_network_shmem {
-        let path = run_dir.join("dvm-network.ivshmem");
+        let path = shmem_dir.join("dvm-network.ivshmem");
         create_dvm_network_shmem(&path)?;
         Some(path)
     } else {
@@ -120,7 +137,7 @@ fn prepare_layout(config: &Config, options: &SmokeOptions) -> Result<KvmLayout> 
         })?;
         fs::set_permissions(&disk, std::fs::Permissions::from_mode(0o600))?;
         sync_private_dvm_block_snapshot(&disk, &run_dir)?;
-        let aperture = run_dir.join("dvm-block.ivshmem");
+        let aperture = shmem_dir.join("dvm-block.ivshmem");
         create_dvm_block_aperture(&aperture, &disk, &config.storage_epoch_signing_key)?;
         (
             Some(aperture),
@@ -191,6 +208,15 @@ fn prepare_runtime_log(path: &Path, truncate_existing: bool) -> Result<()> {
         .open(path)
         .with_context(|| format!("prepare KVM runtime log {}", path.display()))?;
     Ok(())
+}
+
+/// File-backed network and block apertures are write-pinned by IOMMUFD once a
+/// physical USB controller is attached, so they move to the tmpfs directory.
+fn dvm_shmem_backing_dir(pinnable: Option<&Path>, physical_usb: bool, run_dir: &Path) -> PathBuf {
+    match pinnable {
+        Some(directory) if physical_usb => directory.to_path_buf(),
+        _ => run_dir.to_path_buf(),
+    }
 }
 
 fn create_dma_pinnable_display_directory() -> Result<TempDir> {
@@ -633,6 +659,48 @@ fn require_qemu(config: &Config) -> Result<PathBuf> {
             Path::new(&config.kvm_qemu_bin).display()
         )
     })
+}
+
+/// Lab-only: one already vfio-bound xHCI controller is assigned to the DVM so a
+/// physical USB keyboard or pointer reaches its evdev stream. It has no sealed
+/// device profile and never binds, unbinds, or resets the controller.
+fn validate_physical_usb_inputs(options: &SmokeOptions) -> Result<()> {
+    let bdf = canonical_pci_bdf(
+        options
+            .physical_usb_bdf
+            .as_deref()
+            .context("physical USB controller BDF is missing")?,
+    )?;
+    let device = Path::new("/sys/bus/pci/devices").join(&bdf);
+    let class = fs::read_to_string(device.join("class"))
+        .with_context(|| format!("cannot read the PCI class of {bdf}"))?;
+    if class.trim() != "0x0c0330" {
+        bail!(
+            "--physical-usb requires an xHCI controller (PCI class 0x0c0330): {bdf} is class {}",
+            class.trim()
+        );
+    }
+    let driver = std::fs::canonicalize(device.join("driver"))
+        .with_context(|| format!("physical USB controller {bdf} must be pre-bound to vfio-pci"))?;
+    if driver.file_name() != Some(OsStr::new("vfio-pci")) {
+        bail!(
+            "physical USB controller {bdf} must be pre-bound to vfio-pci: driver={}",
+            driver.display()
+        );
+    }
+    let group = std::fs::canonicalize(device.join("iommu_group"))?;
+    let mut members = std::fs::read_dir(group.join("devices"))?
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| entry.file_name().into_string().ok())
+        .collect::<Vec<_>>();
+    members.sort();
+    if members != [bdf.clone()] {
+        bail!(
+            "physical USB lab target must be the sole IOMMU-group member: {}",
+            members.join(",")
+        );
+    }
+    Ok(())
 }
 
 fn canonical_pci_bdf(value: &str) -> Result<String> {

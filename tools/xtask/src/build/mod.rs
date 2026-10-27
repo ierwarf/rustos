@@ -12,7 +12,7 @@ use crate::package_manifest::{BuilderKind, PackageManifest, load_manifests, requ
 use crate::stage;
 use crate::util::{
     copy_with_parent, create_temp_dir, output_is_fresh, outputs_are_fresh, remove_dir_if_exists,
-    remove_file_if_exists, run_command,
+    remove_file_if_exists, run_command, sync_directory,
 };
 
 mod cargo;
@@ -737,6 +737,9 @@ fn build_userspace_manifests(config: &Config, manifests: &[PackageManifest]) -> 
         matches!(manifest.build.builder, BuilderKind::WinsysDllBundle)
     })?;
     build_manifests_matching(config, manifests, |manifest| {
+        matches!(manifest.build.builder, BuilderKind::AssetBundle)
+    })?;
+    build_manifests_matching(config, manifests, |manifest| {
         matches!(manifest.build.builder, BuilderKind::CDemo)
     })
 }
@@ -861,7 +864,28 @@ fn build_manifest(config: &Config, manifest: &PackageManifest) -> Result<()> {
         BuilderKind::MingwCExe => build_mingw_c_exe(config, manifest),
         BuilderKind::CDemo => build_c_demo_manifest(config, manifest),
         BuilderKind::WinsysDllBundle => build_windows_system_dlls(config, manifest),
+        BuilderKind::AssetBundle => build_asset_bundle(config, manifest),
     }
+}
+
+/// Mirror a data package's `build.source` directory into its artifact
+/// directory. Only files whose contents changed are written, so an unchanged
+/// bundle does not look newer to later freshness checks, and files removed
+/// from the source are removed from the artifact.
+fn build_asset_bundle(config: &Config, manifest: &PackageManifest) -> Result<()> {
+    let source_root = manifest
+        .resolved_source_path()
+        .with_context(|| format!("data package {} has no build.source", manifest.id))?;
+    if !source_root.is_dir() {
+        bail!(
+            "data package {} source is not a directory: {}",
+            manifest.id,
+            source_root.display()
+        );
+    }
+    let artifact_dir = manifest.artifact_path(config);
+    fs::create_dir_all(&artifact_dir)?;
+    sync_directory(&source_root, &artifact_dir)
 }
 
 fn build_cargo_kernel_binary(config: &Config, manifest: &PackageManifest) -> Result<()> {

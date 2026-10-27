@@ -13,7 +13,11 @@ and the bounded input stream that
 feeds RustOS `inputd`. Display pixels use a separate read-only-DMA triple-slot
 KMS transport; the virtual Ethernet test path uses its own fixed ring and is
 not physical-device authority. The synthetic input smoke is test-only and is
-not physical host-keyboard capture or arbitrary-key forwarding. Physical
+not physical host-keyboard capture or arbitrary-key forwarding. The kernel
+carries the built-in generic USB HID driver, and `S13rustos-dvm-usb` admits only
+the signed `xhci_pci` for an assigned xHCI controller, so a physical USB
+keyboard or pointer can reach the same evdev stream. No host policy assigns a
+USB controller yet, so physical input capture is not validated. Physical
 display release remains blocked until the supervised IOMMUFD/VFIO lifecycle,
 connector, DMA-fault/revoke/reset, and sustained page-flip evidence passes on
 target hardware.
@@ -97,6 +101,10 @@ versioned 물리 display evidence,
 read-only DMA triple-slot KMS transport를 사용하고, 가상 Ethernet 시험 경로는
 독립된 고정 ring을 사용하며 물리 장치 권한을 주지 않습니다. 합성 input smoke는
 시험 전용이고 물리 host keyboard capture나 임의 key forwarding이 아닙니다.
+커널은 built-in generic USB HID driver를 포함하고, `S13rustos-dvm-usb`는 할당된
+xHCI 컨트롤러에 대해 서명된 `xhci_pci`만 허용하므로 물리 USB 키보드/포인터가 같은
+evdev stream에 도달할 수 있습니다. 아직 USB 컨트롤러를 할당하는 host policy가 없어
+물리 입력 capture는 검증되지 않았습니다.
 물리 display release는 target hardware에서 IOMMUFD/VFIO supervisor, connector,
 DMA fault/revoke/reset, 지속 page-flip 증거가 통과할 때까지 차단됩니다.
 활성화된 물리 release policy는 AMDGPU 전용이며 `1002:1900`, direct zero-copy,

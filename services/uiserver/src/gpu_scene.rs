@@ -148,9 +148,10 @@ pub(crate) struct GpuAtlasPacker<'a> {
     width: usize,
     height: usize,
     stride_pixels: usize,
-    next_x: usize,
-    next_y: usize,
-    row_height: usize,
+    /// Disjoint free rectangles, including the padding texel. Each placement
+    /// carves one of them, so room left beside or under a large region (the
+    /// desktop, say) stays usable instead of being stranded by a row cursor.
+    free: Vec<Rect>,
 }
 
 impl<'a> GpuAtlasPacker<'a> {
@@ -178,10 +179,67 @@ impl<'a> GpuAtlasPacker<'a> {
             width,
             height,
             stride_pixels,
-            next_x: 0,
-            next_y: 0,
-            row_height: 0,
+            free: vec![Rect {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            }],
         })
+    }
+
+    /// The atlas pixels and their stride, so a region that was just written can
+    /// be post-processed in place (the window alpha pass).
+    pub(crate) fn pixels_mut(&mut self) -> (&mut [u32], usize) {
+        (&mut *self.pixels, self.stride_pixels)
+    }
+
+    /// The free rectangle that fits `width` x `height` with the least room
+    /// left over on its tighter side. Ties break by position so a scene
+    /// always packs the same way.
+    fn best_free_rect(&self, width: usize, height: usize) -> Option<(usize, Rect)> {
+        self.free
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(_, free)| free.width >= width && free.height >= height)
+            .min_by_key(|(_, free)| {
+                let (spare_w, spare_h) = (free.width - width, free.height - height);
+                (spare_w.min(spare_h), spare_w.max(spare_h), free.y, free.x)
+            })
+    }
+
+    /// Remove the chosen free rectangle and return what is left of it as at
+    /// most two new rectangles, split so the larger remainder stays whole.
+    fn carve_free_rect(&mut self, index: usize, free: Rect, width: usize, height: usize) {
+        self.free.swap_remove(index);
+        let (spare_w, spare_h) = (free.width - width, free.height - height);
+        let beside = |rect_height: usize| Rect {
+            x: free.x + width,
+            y: free.y,
+            width: spare_w,
+            height: rect_height,
+        };
+        let below = |rect_width: usize| Rect {
+            x: free.x,
+            y: free.y + height,
+            width: rect_width,
+            height: spare_h,
+        };
+        let area = |rect: Rect| rect.width * rect.height;
+        let wide_below = (beside(height), below(free.width));
+        let tall_beside = (beside(free.height), below(width));
+        let largest = |(a, b): (Rect, Rect)| area(a).max(area(b));
+        let (right, bottom) = if largest(wide_below) >= largest(tall_beside) {
+            wide_below
+        } else {
+            tall_beside
+        };
+        for rect in [right, bottom] {
+            if !rect.is_empty() {
+                self.free.push(rect);
+            }
+        }
     }
 
     pub(crate) fn place_bgra(
@@ -305,25 +363,10 @@ impl<'a> GpuAtlasPacker<'a> {
             return Err(GpuSceneError::AtlasFull);
         }
 
-        let mut outer_x = self.next_x;
-        let mut outer_y = self.next_y;
-        let mut row_height = self.row_height;
-        if outer_x
-            .checked_add(outer_width)
-            .is_none_or(|end| end > self.width)
-        {
-            outer_x = 0;
-            outer_y = outer_y
-                .checked_add(row_height)
-                .ok_or(GpuSceneError::AtlasFull)?;
-            row_height = 0;
-        }
-        if outer_y
-            .checked_add(outer_height)
-            .is_none_or(|end| end > self.height)
-        {
-            return Err(GpuSceneError::AtlasFull);
-        }
+        let (free_index, free) = self
+            .best_free_rect(outer_width, outer_height)
+            .ok_or(GpuSceneError::AtlasFull)?;
+        let (outer_x, outer_y) = (free.x, free.y);
 
         for row in outer_y..outer_y + outer_height {
             let start = row
@@ -373,9 +416,9 @@ impl<'a> GpuAtlasPacker<'a> {
             }
         }
 
-        self.next_x = outer_x + outer_width;
-        self.next_y = outer_y;
-        self.row_height = row_height.max(outer_height);
+        // Commit only after every copy succeeded, so a failed placement leaves
+        // the free list untouched.
+        self.carve_free_rect(free_index, free, outer_width, outer_height);
         Ok(destination)
     }
 }
@@ -1076,6 +1119,64 @@ mod tests {
         assert_eq!(pixels[13], 5);
         assert_eq!(pixels[0], 0);
         assert_eq!(pixels[4], 0);
+    }
+
+    #[test]
+    fn atlas_packer_reuses_room_beside_a_large_region() {
+        // A row cursor strands the strip beside the first region once a wide
+        // region starts the next row; free rectangles keep it usable.
+        let mut pixels = vec![0_u32; 64 * 44];
+        let wide = vec![1_u32; 50 * 20];
+        let wider = vec![2_u32; 60 * 20];
+        let narrow = vec![3_u32; 8 * 16];
+        let mut packer = GpuAtlasPacker::new(&mut pixels, 64, 44, 64).unwrap();
+        let first = packer.place_bgra(&wide, 50, 20, 50).unwrap();
+        let second = packer.place_bgra(&wider, 60, 20, 60).unwrap();
+        let third = packer.place_bgra(&narrow, 8, 16, 8).unwrap();
+        let rect = |x, y, width, height| Rect {
+            x,
+            y,
+            width,
+            height,
+        };
+        assert_eq!(first, rect(1, 1, 50, 20));
+        assert_eq!(second, rect(1, 23, 60, 20));
+        assert_eq!(third, rect(53, 1, 8, 16));
+    }
+
+    #[test]
+    fn atlas_packer_fits_the_desktop_several_windows_the_dock_and_the_cursor() {
+        // The shipped atlas is 2048x2048. A 1600x900 desktop plus a Wayland
+        // window, three consoles, the dock and the cursor must all fit; a row
+        // cursor ran out of room at the second console window.
+        let (atlas, desktop_w, desktop_h) = (2048_usize, 1600_usize, 900_usize);
+        let mut pixels = vec![0_u32; atlas * atlas];
+        let mut packer = GpuAtlasPacker::new(&mut pixels, atlas, atlas, atlas).unwrap();
+        let mut placed = Vec::new();
+        for (width, height) in [
+            (desktop_w, desktop_h),
+            (1554, 80),
+            (145, 145),
+            (802, 558),
+            (720, 460),
+            (720, 460),
+            (720, 460),
+        ] {
+            let source = vec![0xff00_0000_u32; width * height];
+            let region = packer
+                .place_bgra(&source, width, height, width)
+                .unwrap_or_else(|err| panic!("{width}x{height} did not fit: {err:?}"));
+            placed.push(region);
+        }
+        for (index, region) in placed.iter().enumerate() {
+            assert!(region.x + region.width <= atlas && region.y + region.height <= atlas);
+            for other in placed.iter().skip(index + 1) {
+                assert!(
+                    region.intersect(*other).is_empty(),
+                    "{region:?} overlaps {other:?}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -127,6 +127,44 @@
         assert!(!opted_out.build_image);
     }
 
+    /// The interactive lane must reject an unbound or non-xHCI controller before
+    /// it starts the doorbells or spawns either guest.
+    #[test]
+    fn interactive_run_validates_the_physical_usb_controller_before_spawning() {
+        let source = include_str!("../options.rs");
+        let interactive = &source[source
+            .find("pub(crate) fn kvm_run_command")
+            .expect("interactive KVM command")..];
+        let validate = interactive
+            .find("validate_physical_usb_inputs(&options)?;")
+            .expect("interactive physical USB validation");
+        let doorbell = interactive
+            .find("start_dvm_input_doorbell(&layout)?")
+            .expect("interactive input doorbell");
+        let spawn = interactive
+            .find("let (mut rustos, mut dvm) = spawn_guests(")
+            .expect("interactive guest spawn");
+        assert!(validate < doorbell && doorbell < spawn);
+    }
+
+    /// Only the operator-owned interactive session scales the GTK window to
+    /// the host screen. Smoke and the FPS proof keep the exact 1:1 mode their
+    /// evidence was written against.
+    #[test]
+    fn only_the_interactive_session_fits_the_window_to_the_host() {
+        let smoke = parse_smoke_options(Vec::new().into_iter()).unwrap();
+        assert!(!smoke.fit_host_window);
+        let fps =
+            parse_smoke_options(vec!["--min-ui-fps".into(), "60".into()].into_iter()).unwrap();
+        assert!(!fps.fit_host_window);
+
+        let source = include_str!("../options.rs");
+        let interactive = &source[source
+            .find("pub(crate) fn kvm_run_command")
+            .expect("interactive KVM command")..];
+        assert!(interactive.contains("        fit_host_window,\n"));
+    }
+
     /// A pass rate needs more than one sample, and the loop belongs here.
     ///
     /// Repeating the lane by hand in a shell loses each failing run's debugcon

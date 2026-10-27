@@ -1051,14 +1051,23 @@ fn difference_bounds(
     let mut bottom = 0;
     for y in 0..height {
         let row = y.checked_mul(stride)?;
-        for x in 0..width {
-            let index = row.checked_add(x)?;
-            if previous.get(index) != next.get(index) {
-                left = left.min(x);
-                top = top.min(y);
-                right = right.max(x + 1);
-                bottom = bottom.max(y + 1);
-            }
+        // Pixels past the end of the slices compare equal, as they always did.
+        let end = row.checked_add(width)?.min(previous.len());
+        if row >= end {
+            break;
+        }
+        let (before, after) = (&previous[row..end], &next[row..end]);
+        // Unchanged rows, nearly all of them, are one vectorised comparison.
+        if before == after {
+            continue;
+        }
+        let first = before.iter().zip(after).position(|(a, b)| a != b);
+        let last = before.iter().zip(after).rposition(|(a, b)| a != b);
+        if let (Some(first), Some(last)) = (first, last) {
+            left = left.min(first);
+            top = top.min(y);
+            right = right.max(last + 1);
+            bottom = bottom.max(y + 1);
         }
     }
     if left < right && top < bottom {
@@ -1304,10 +1313,13 @@ fn damage_union(
     })
 }
 
-/// Every scene rejection is a contract violation, so they share one errno.
-/// The errno alone cannot say which contract broke, and the compositor exits
-/// on it, so the caller would be left with a bare `errno=22` and no way back
-/// to the rule that rejected the frame. Name it here, once, at the conversion.
+/// A scene rejection that reaches this point is a contract violation, so they
+/// share one errno. Capacity limits are not rejections: a window the atlas has
+/// no room for, or one with nothing to draw, is left out of the scene before
+/// it gets here. The errno alone cannot say which contract broke, and the
+/// compositor exits on it, so the caller would be left with a bare `errno=22`
+/// and no way back to the rule that rejected the frame. Name it here, once,
+/// at the conversion.
 fn gpu_scene_errno(error: GpuSceneError) -> i32 {
     debug_line(&format!("uiserver: gpu scene rejected reason={error:?}"));
     EINVAL
