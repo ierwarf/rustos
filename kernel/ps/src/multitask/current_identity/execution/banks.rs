@@ -15,11 +15,20 @@ impl Banks {
             outgoing: AtomicUsize::new(0),
         }
     }
+    // Only the IRQ-excluded owning CPU moves a permit between its own cells, so a
+    // move is a load and a store, not a locked exchange; remote readers observe
+    // membership with Acquire loads and the switch publication ends in a fence.
     fn put(cell: &AtomicUsize, pin: ExecutionPermit) -> Option<ExecutionPermit> {
-        ExecutionPermit::take(cell.swap(pin.park(), Ordering::AcqRel))
+        let previous = cell.load(Ordering::Relaxed);
+        cell.store(pin.park(), Ordering::Release);
+        ExecutionPermit::take(previous)
     }
     fn take(cell: &AtomicUsize) -> Option<ExecutionPermit> {
-        ExecutionPermit::take(cell.swap(0, Ordering::AcqRel))
+        let previous = cell.load(Ordering::Relaxed);
+        if previous != 0 {
+            cell.store(0, Ordering::Release);
+        }
+        ExecutionPermit::take(previous)
     }
     fn initialize(&self, pin: ExecutionPermit) {
         assert_eq!(self.current.load(Ordering::Acquire), 0);

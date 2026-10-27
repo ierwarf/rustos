@@ -157,6 +157,41 @@ pub fn current_user_ipc_identity() -> Option<(u64, process_table::ProcessIdentit
     })
 }
 
+/// [`current_user_ipc_identity`] plus whether the running thread may have a
+/// pending Linux signal, from one masked observation of the same slot. Register
+/// IPC asked both on every entry; the hint is [`current_thread_may_have_pending_signals`]'s
+/// answer for the identical slot, so a `false` is as conclusive as there.
+pub fn current_user_ipc_entry() -> Option<(u64, process_table::ProcessIdentity, bool)> {
+    if nucleus_core::util::lockdep::preemption_disabled() || !current_cpu_task_slot_admitted() {
+        return None;
+    }
+    interrupts::without_interrupts(|| {
+        let slot = cpu_local::current_cpu_task_slot()?;
+        let may_have_signal = super::current_identity::signal_pending(slot);
+        let (task_id, _, handle, _) = match super::current_identity::read(slot) {
+            Some(identity) => identity.user_binding(),
+            None => owned_current_user_binding(),
+        }?;
+        ipc_identity_for_binding(task_id, handle).map(|(task, identity)| (task, identity, may_have_signal))
+    })
+}
+
+/// [`current_task_id`] plus the pending-signal hint, as above.
+pub fn current_task_id_with_signal_hint() -> Option<(u64, bool)> {
+    if nucleus_core::util::lockdep::preemption_disabled() || !current_cpu_task_slot_admitted() {
+        return None;
+    }
+    interrupts::without_interrupts(|| {
+        let slot = cpu_local::current_cpu_task_slot()?;
+        let may_have_signal = super::current_identity::signal_pending(slot);
+        let task_id = match super::current_identity::read(slot) {
+            Some(identity) => identity.task_id,
+            None => super::scheduler::stack_resources::context::current_task_start().map(|start| start.id),
+        }?;
+        Some((task_id, may_have_signal))
+    })
+}
+
 pub(super) fn ipc_identity_for_binding(
     task_id: u64, handle: process_table::ProcessHandle,
 ) -> Option<(u64, process_table::ProcessIdentity)> {

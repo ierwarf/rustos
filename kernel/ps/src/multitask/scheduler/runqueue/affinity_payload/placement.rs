@@ -89,6 +89,14 @@ impl PlacementGrant {
     /// migration intent be acknowledged by this older captured version.
     pub(in crate::multitask) fn acknowledge(&self) {
         let affinity = &AFFINITIES[self.slot];
+        // Nothing to acknowledge unless a migration is pending. Every replacement that
+        // sets the flag also advances the version, so a pending flag raised after this
+        // load belongs to a version newer than the one this grant captured and would
+        // be refused below anyway: the common case takes no lock.
+        // ORDERING: Acquire pairs with the Release version store that publishes it.
+        if !affinity.migration_pending.load(Ordering::Acquire) {
+            return;
+        }
         let binding = affinity.binding.lock();
         if *binding != self.task_id || affinity.version.load(Ordering::Relaxed) != self.version {
             return;

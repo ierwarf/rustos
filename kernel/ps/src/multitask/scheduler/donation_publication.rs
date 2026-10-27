@@ -133,7 +133,7 @@ fn reserve_call_current(cpu: usize, id: u64) -> Option<IpcCallAdmission> {
     let system_class = slot_system_class(slot);
     Some(IpcCallAdmission {
         system_class,
-        donation_reserved: donation_ledger::reserve_own(slot, id, system_class),
+        donation_reserved: donation_ledger::reserve_own_lazy(slot, id, system_class),
         scheduling_context: Some(context),
         scheduling_context_owner_task_id: Some(id),
     })
@@ -217,7 +217,10 @@ pub(super) fn bind_lane_current(
     if !scope_valid(scope) || reply == 0 || donor.1 == receiver.id() {
         return Some(false);
     }
-    donation_ledger::bind_own_funding(reply, donor.0, donor.1, receiver.slot(), receiver.id())
+    donation_ledger::bind_own_lazy(donor.0, donor.1, reply, receiver.slot(), receiver.id())
+        .or_else(|| {
+            donation_ledger::bind_own_funding(reply, donor.0, donor.1, receiver.slot(), receiver.id())
+        })
 }
 
 /// Transfer the original participants to the producer, which retains donor,

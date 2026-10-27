@@ -195,9 +195,17 @@ pub fn current_source() -> Option<ClockSourceInfo> {
 /// admitted. This is intentionally not global monotonic authority: callers
 /// may only subtract two readings taken during one non-migratable execution
 /// interval on the same CPU.
-/// Both nanosecond views of one ordered TSC read, or `None` when the invariant
-/// TSC is not the clock source. `(monotonic, scheduler_local)` are exactly what
-/// `monotonic_nanos` and `scheduler_local_nanos` return for that reading.
+/// Both nanosecond views of one TSC read, or `None` when the invariant TSC is
+/// not the clock source. `(monotonic, scheduler_local)` are what `monotonic_nanos`
+/// and `scheduler_local_nanos` return for that reading.
+///
+/// The read is not preceded by `lfence`. The only consumer is the IPC lane's
+/// per-switch sample (execution-interval charging and wait stamps), which
+/// subtracts two readings of one CPU's clock at millisecond-scale slices and
+/// saturates; the fence it used to pay (~140 ticks per round trip, two samples)
+/// bought at most the few nanoseconds by which an unordered read can lead the
+/// instructions before it. Cross-CPU warp admission and the boot calibration
+/// keep `read_tsc_ordered`.
 pub(crate) fn tsc_views() -> Option<(u64, u64)> {
     // ORDERING: Acquire pairs with the clocksource promotion, as `monotonic_nanos`.
     if SOURCE.load(Ordering::Acquire) != SOURCE_INVARIANT_TSC {
@@ -207,7 +215,7 @@ pub(crate) fn tsc_views() -> Option<(u64, u64)> {
     if hz == 0 {
         return None;
     }
-    let tsc = read_tsc_ordered();
+    let tsc = read_tsc_unordered();
     let delta = tsc.saturating_sub(TSC_BASE.load(Ordering::Relaxed));
     Some((nanos_from_tsc_delta(delta, hz), nanos_from_tsc_delta(tsc, hz)))
 }

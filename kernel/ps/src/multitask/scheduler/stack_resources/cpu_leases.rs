@@ -26,12 +26,18 @@ impl CpuLeases {
         // The atomic bank takes precisely this reference. The only decoding
         // paths below move it back into a unique RAII pin or release it once.
         core::mem::forget(pin);
-        let previous = cell.swap(encoded, Ordering::AcqRel);
+        // Only the IRQ-excluded owning CPU mutates its bank: a move is a load and a
+        // store, and the switch publication ends in a fence.
+        let previous = cell.load(Ordering::Relaxed);
+        cell.store(encoded, Ordering::Release);
         (previous != 0).then(|| StackPin { slot: previous - 1 })
     }
 
     fn take(cell: &AtomicUsize) -> Option<StackPin> {
-        let previous = cell.swap(0, Ordering::AcqRel);
+        let previous = cell.load(Ordering::Relaxed);
+        if previous != 0 {
+            cell.store(0, Ordering::Release);
+        }
         (previous != 0).then(|| StackPin { slot: previous - 1 })
     }
 

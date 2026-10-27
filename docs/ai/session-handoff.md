@@ -18,6 +18,22 @@ rendezvous mechanism and its TLA+ draft (1300 states, 8/8 mutants killed) are in
 `docs/ai/performance/ipc-rendezvous.md`, awaiting the owner's decision (L1 ~5.3k, 3k needs
 the L2 paired-custody model).
 
+## IPC P8 (2026-10-27)
+
+Uncommitted on top of `8c1cce76` plus the P3 stage-3 tree. Lazy own-funded donation
+edge, lock-free reply-custody answer, lane token/ACK-ticket trims, single-writer bank
+moves, CPU-private interval cell, acknowledge fast path, XINUSE x87 skip. 1 vCPU register
+p50 5760 -> 4840 ticks same session. Gates passed: kernel-ps 985 / hal 80 tests, `cargo xtask
+check` and the four phase-profile builds, `verify-all --profile pr`, `verify-smp-iteration`,
+1 and 8 vCPU KVM smoke. Pins/mutation rows updated (`locked()`, `release_reply_lane`,
+`commit_outgoing_lane`, park swap, occurrence 2/2 and 1/2). Slow paths, default `cargo xtask bench`
+in a host window ~20% slower than the previous reference (vmexit_cpuid 4440 vs 3680): null syscall 440 (400),
+try_recv_empty 1200 (1120), buffer-mode intra-process 22.9k (31.5k), reply_recv 7.4k (8.6k), cross-process
+syscalld_getuid 13.0k (14.0k), sched_yield 22.3k (23.5k): no regression beyond host drift. Not done: the fused lane switch
+(see ipc-lane.md P8) and a slowpath-only differential beyond the existing lane/legacy
+witnesses. `admission` keeps the locked `retained_scheduling_context_for` (the source
+contract forbids `derived_identity` in donation_publication.rs).
+
 ## IPC P2 closure (2026-10-26)
 
 P2 (IPC-specific entry and direct `sysretq` switch) is complete: P7 direct park/resume

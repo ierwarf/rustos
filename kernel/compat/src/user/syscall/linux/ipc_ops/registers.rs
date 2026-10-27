@@ -115,6 +115,21 @@ fn write_register_result(
 }
 
 pub(super) fn dispatch(frame: &mut SyscallFrame) -> u64 {
+    dispatch_with(frame, None)
+}
+
+/// The identity the entry already observed (together with the pending-signal
+/// hint) for the register operation's own authentication, so it is not read twice.
+pub(super) type EntryIdentity = (u64, multitask::ProcessIdentity);
+
+fn entry_or_current(entry: Option<EntryIdentity>) -> Result<EntryIdentity, i64> {
+    match entry {
+        Some(entry) => Ok(entry),
+        None => multitask::current_user_ipc_identity().ok_or(LINUX_EINVAL),
+    }
+}
+
+pub(super) fn dispatch_with(frame: &mut SyscallFrame, entry: Option<EntryIdentity>) -> u64 {
     let (operation, endpoint, len, word0, word1, reply, reserved) = (
         frame.rax, frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9,
     );
@@ -130,17 +145,19 @@ pub(super) fn dispatch(frame: &mut SyscallFrame) -> u64 {
     let bytes = ipc_register_unpack([word0, word1]);
     let payload = &bytes[..len as usize];
     let result = match operation {
-        SYS_RUSTOS_IPC_REGISTER_CALL => call(frame, endpoint, payload),
-        SYS_RUSTOS_IPC_REGISTER_RECV => receive(frame, endpoint, None),
-        SYS_RUSTOS_IPC_REGISTER_REPLY_RECV => reply_receive(frame, endpoint, reply, payload),
-        SYS_RUSTOS_IPC_REGISTER_REPLY => reply_only(endpoint, payload),
+        SYS_RUSTOS_IPC_REGISTER_CALL => call(frame, endpoint, payload, entry),
+        SYS_RUSTOS_IPC_REGISTER_RECV => receive(frame, endpoint, None, entry),
+        SYS_RUSTOS_IPC_REGISTER_REPLY_RECV => reply_receive(frame, endpoint, reply, payload, entry),
+        SYS_RUSTOS_IPC_REGISTER_REPLY => reply_only(endpoint, payload, entry),
         _ => unreachable!(),
     };
     result.unwrap_or_else(linux_errno)
 }
 
-fn call(frame: &mut SyscallFrame, raw: u64, request: &[u8]) -> Result<u64, i64> {
-    let (task_id, identity) = multitask::current_user_ipc_identity().ok_or(LINUX_EINVAL)?;
+fn call(
+    frame: &mut SyscallFrame, raw: u64, request: &[u8], entry: Option<EntryIdentity>,
+) -> Result<u64, i64> {
+    let (task_id, identity) = entry_or_current(entry)?;
     let service = authorize_ipc_call_for_process(raw, identity.process_id())?;
     let endpoint = KernelEndpointHandle::from_raw(raw);
     if let Some(response) = try_fast_ipc_call_bytes::<IPC_REGISTER_BYTES>(
@@ -245,8 +262,9 @@ fn receive(
     frame: &mut SyscallFrame,
     raw: u64,
     deferred: Option<fast_reply::DeferredFastReply>,
+    entry: Option<EntryIdentity>,
 ) -> Result<u64, i64> {
-    let (task_id, identity) = multitask::current_user_ipc_identity().ok_or(LINUX_EINVAL)?;
+    let (task_id, identity) = entry_or_current(entry)?;
     let endpoint = KernelEndpointHandle::from_raw(raw);
     kernel_ipc_runtime::api::authorize_endpoint_receiver_for_process(
         endpoint,
@@ -270,10 +288,11 @@ fn reply_receive(
     raw: u64,
     reply: u64,
     response: &[u8],
+    entry: Option<EntryIdentity>,
 ) -> Result<u64, i64> {
     // Authenticate the next endpoint BEFORE consuming the old reply. The
     // post-commit tagged error range is identical to the buffer ABI.
-    let (task_id, identity) = multitask::current_user_ipc_identity().ok_or(LINUX_EINVAL)?;
+    let (task_id, identity) = entry_or_current(entry)?;
     let endpoint = KernelEndpointHandle::from_raw(raw);
     kernel_ipc_runtime::api::authorize_endpoint_receiver_for_process(
         endpoint,
@@ -329,8 +348,8 @@ fn reply_receive(
     })
 }
 
-fn reply_only(raw: u64, response: &[u8]) -> Result<u64, i64> {
-    let (task_id, identity) = multitask::current_user_ipc_identity().ok_or(LINUX_EINVAL)?;
+fn reply_only(raw: u64, response: &[u8], entry: Option<EntryIdentity>) -> Result<u64, i64> {
+    let (task_id, identity) = entry_or_current(entry)?;
     let handle = KernelReplyHandle::from_raw(raw);
     match kernel_ipc_runtime::api::endpoint::complete_fast_reply_for_task(handle, task_id, response)
     {

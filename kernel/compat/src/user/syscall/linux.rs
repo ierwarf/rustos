@@ -158,10 +158,20 @@ const MAX_RUSTOS_DEBUG_PRINT_BYTES: usize = 2048;
 /// diagnostic-kernel feature, so only the pending-signal delivery of every Linux
 /// syscall remains before the operation.
 pub(super) fn dispatch_register_ipc_syscall(frame: &mut SyscallFrame) -> u64 {
-    if deliver_pending_signals_if_needed(frame) {
-        return frame.rax;
-    }
-    ipc_ops::dispatch_register_ipc(frame)
+    // The identity and the pending-signal hint come from one masked observation.
+    // A clear hint is conclusive and the operation authenticates with that
+    // identity; a raised hint (or no identity) takes the full delivery check and
+    // the operation reads the identity afresh, after any procd round trip.
+    let entry = match multitask::current_user_ipc_entry() {
+        Some((task_id, identity, false)) => Some((task_id, identity)),
+        _ => {
+            if deliver_pending_signals_if_needed(frame) {
+                return frame.rax;
+            }
+            None
+        }
+    };
+    ipc_ops::dispatch_register_ipc(frame, entry)
 }
 
 pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {

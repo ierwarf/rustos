@@ -219,6 +219,34 @@ layer: args read + retain 0.7k, copy-and-validate 0.55k, output write 0.8k, recv
 arm/commit ~1.4k; 54 tracked lock pairs per round trip at ~45 ticks. A null
 syscall is ~480 ticks, so entry/exit is not the remaining cost.
 
+- P3 stage 3 (2026-10-27, no custody change), 1 vCPU `ipc_rt_intra_process_register_reply_recv`
+  p50 5.28-5.32k -> 5.08-5.12k (same-session alternating, ring-3 anchors alu 3.08k / atomic
+  3.24k / cpuid 3.72k unchanged). Found by microbenchmarking the instructions on the path
+  (TSC ticks per execution, in-kernel loop of 1000): `fninit` 89, `wrmsr` (FS/KernelGS base)
+  79, `rdmsr` 127, `fnclex` 49, `rdtsc` ~27, `swapgs` 28, `cli`+`sti` 13, `pushf`+`pop` 4,
+  `fldz` x8 + `emms` 7, `vzeroall` 7, `xrstor` init 313, `fldenv` 97. The register-IPC return
+  sanitizer ran two `fninit` (170 ticks per call, twice per round trip); the opening one only
+  guaranteed that the eight `fldz` pushes would meet neither a pending exception nor a live
+  stack, so it is now `fnstsw` (+ `fnclex` only when ES is set) and `emms`, and the closing
+  `fninit` still resets control, status, tag and instruction/data pointers: 93 ticks, -200 per
+  round trip. Smaller: the entry reads identity and the pending-signal hint in one masked
+  section (`current_user_ipc_entry`), the lane qualifies and admits each end with one
+  publication read (`qualified_dispatchable`), and a deadline measured from now is not
+  re-checked against the clock it was read from. The lane's two per-switch clock samples no longer start with `lfence`
+  (`clock::tsc_views` reads unordered, like `ticks()`): -140 per round trip; the draining fence
+  was the cost, not the `rdtsc`. Measured and dropped: unrolled 65-256 byte `memcpy`/`memset`
+  (-50, noise), shrinking the fast-call frame arrays (0), the `fence(SeqCst)` in
+  `resident::park` (0), lock-free staging of reply deadlines (the 99 % staged arm/disarm pair
+  saved ~30, so the table lock pair costs ~15 in context and the change was not kept),
+  `WRFSBASE` in place of the FS-base `wrmsr` (-65 for a CR4.FSGSBASE change that also lets
+  ring 3 write the base behind the task record; not kept). Sensitivity check for the
+  reply-object removal (L1): six extra read-only locks of the reply slot add +170, so one
+  uncontended slot lock pair is ~28 ticks and the five reply/endpoint pairs of a round trip
+  are ~140 plus the 584-byte frame copy: about -240 for a change that touches reply
+  cancel, revoke, exit and the donation ledger, which is why it was not built. Cycle-weighted guest profiles over-weight the
+  ~4 % of round trips that take the generic dispatch (+15k each): use ablation or
+  instruction microbenchmarks for p50 decisions.
+
 ## Other paths found after P6 (2026-10-22)
 
 - **Reaped child tax (fixed).** The kernel rejected procd's `SELECT_SIGNAL` reply
@@ -243,3 +271,20 @@ syscall is ~480 ticks, so entry/exit is not the remaining cost.
   the host noise `vmexit_cpuid` shows. Not yet addressed: wake placement is not
   idle-aware (`affinity_target_cpu` keeps a busy last CPU unless the queue is
   deeper by two), and topology (SMT/LLC) is not modelled.
+- P8 (2026-10-27) no new custody model; stages that stopped paying for themselves were
+  removed whole. Own-funded, ordinary-class register-IPC donation edges are reserved,
+  bound and released without the ledger leaf (`donation_ledger/lazy.rs`: a slot word per
+  donor, `settle` under the leaf inserts exactly the eager entries, every locked ledger
+  operation calls `locked()`). Reply custody for a live caller is answered from the
+  published identity and the derived scheduling-context identity before the Identity51 /
+  Resources53 leaves. The lane reads the receiver/caller frame token no more than the
+  resident cell already proves, and the RSP ACK parks from a ticket (saved RSP + Blocked
+  generation) instead of re-reading the owner word and token. Single-writer bank, lease
+  and ACK words move with plain stores and one fence per publish; the execution interval
+  cell is CPU-private; `acknowledge` skips the binding leaf without a pending migration;
+  the x87 clear is skipped when XINUSE reports the init state. Same-session A/B, 1 vCPU
+  register round trip p50: 5760 -> 4840 ticks (alu anchor 3720). Measured and left
+  alone: `xchg` -> store, deadline-waiter removal and the `pushf` bracket moved nothing;
+  host `perf` profiles misattribute those, so decisions use removal experiments.
+  What remains is ~40 protocol steps in the lane switch (owner CAS, frame publication,
+  resident park/take, banks), which only a fused switch can cut.

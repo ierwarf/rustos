@@ -9,7 +9,10 @@
 //! complete joint guard-deletion refinement or hardware/register/RSP acceptance.
 use super::scheduling_runtime::FundingPin;
 use super::{current_identity, donation_ledger, local_dispatch, runqueue, scheduling_runtime};
-use nucleus_core::util::lockdep::{LockClass, MAX_TRACKED_CPUS};
+use nucleus_core::util::lockdep::MAX_TRACKED_CPUS;
+#[cfg(test)]
+use nucleus_core::util::lockdep::LockClass;
+#[cfg(test)]
 use crate::multitask::irq_leaf::IrqLeaf;
 
 pub(super) struct ExecutionInterval {
@@ -95,6 +98,7 @@ pub(super) enum ConsumedInterval {
     Absent,
 }
 
+#[cfg(test)]
 static INTERVALS: [IrqLeaf<IntervalCell, { LockClass::CpuExecutionInterval as u8 }>;
     MAX_TRACKED_CPUS] = [const {
     IrqLeaf::new(IntervalCell {
@@ -104,10 +108,32 @@ static INTERVALS: [IrqLeaf<IntervalCell, { LockClass::CpuExecutionInterval as u8
     })
 }; MAX_TRACKED_CPUS];
 
+/// Each CPU's interval cell is touched only by that CPU, and only inside
+/// `with_interval`, which masks local IRQs for the closure: no other CPU and no
+/// interrupt handler can observe or interleave with it, so the cell needs no lock.
+/// (Native fixtures model CPUs as threads and keep the ranked leaf above.)
+#[cfg(not(test))]
+struct CpuCell(core::cell::UnsafeCell<IntervalCell>);
+// SAFETY: element `cpu` is accessed only by `cpu` with IRQs masked; see `with_interval`.
+#[cfg(not(test))]
+unsafe impl Sync for CpuCell {}
+#[cfg(not(test))]
+static INTERVALS: [CpuCell; MAX_TRACKED_CPUS] = [const {
+    CpuCell(core::cell::UnsafeCell::new(IntervalCell {
+        active: None,
+        settled: None,
+        current_borrowed: false,
+    }))
+}; MAX_TRACKED_CPUS];
+
 fn with_interval<R>(cpu: usize, f: impl FnOnce(&mut IntervalCell) -> R) -> R {
     #[cfg(not(test))]
     {
-        x86_64::instructions::interrupts::without_interrupts(|| f(&mut INTERVALS[cpu].lock()))
+        x86_64::instructions::interrupts::without_interrupts(|| {
+            // SAFETY: see `CpuCell`. The closures passed here never re-enter
+            // `with_interval` (the ranked leaf would have deadlocked on that).
+            f(unsafe { &mut *INTERVALS[cpu].0.get() })
+        })
     }
     #[cfg(test)]
     {

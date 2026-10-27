@@ -49,6 +49,9 @@ static XSTATE_LAYOUT_FINGERPRINT: AtomicU64 = AtomicU64::new(0);
 static AVX_ENABLED: AtomicBool = AtomicBool::new(false);
 static AVX2_ENABLED: AtomicBool = AtomicBool::new(false);
 static XSAVEOPT_ENABLED: AtomicBool = AtomicBool::new(false);
+/// `XGETBV` with `ECX = 1` (the XINUSE init-state bitmap) is usable on every CPU.
+static XGETBV1_ENABLED: AtomicBool = AtomicBool::new(false);
+const CPUID_XGETBV1: u32 = 1 << 2;
 
 #[repr(C, align(64))]
 #[derive(Clone, Copy)]
@@ -129,7 +132,9 @@ pub fn init() {
                 required_bytes, SIMD_STATE_BYTES,
             );
         }
-        let xsaveopt_enabled = (__cpuid_count(0xD, 1).eax & CPUID_XSAVEOPT) != 0;
+        let xsave_leaf1 = __cpuid_count(0xD, 1);
+        let xsaveopt_enabled = (xsave_leaf1.eax & CPUID_XSAVEOPT) != 0;
+        let xgetbv1_enabled = (xsave_leaf1.eax & CPUID_XGETBV1) != 0;
         let layout_fingerprint = xstate_layout_fingerprint(requested_mask);
 
         XSTATE_MASK.store(requested_mask, Ordering::Relaxed);
@@ -138,6 +143,7 @@ pub fn init() {
         AVX_ENABLED.store(avx_enabled, Ordering::Relaxed);
         AVX2_ENABLED.store(avx2_enabled, Ordering::Relaxed);
         XSAVEOPT_ENABLED.store(xsaveopt_enabled, Ordering::Relaxed);
+        XGETBV1_ENABLED.store(xgetbv1_enabled, Ordering::Relaxed);
         SIMD_MODE.store(SIMD_MODE_XSAVE, Ordering::Relaxed);
         // ORDERING: release publishes the complete immutable SIMD migration
         // contract before any AP may enable scheduling.
@@ -153,6 +159,7 @@ unsafe fn publish_fxsave_profile() {
     AVX_ENABLED.store(false, Ordering::Relaxed);
     AVX2_ENABLED.store(false, Ordering::Relaxed);
     XSAVEOPT_ENABLED.store(false, Ordering::Relaxed);
+    XGETBV1_ENABLED.store(false, Ordering::Relaxed);
     SIMD_MODE.store(SIMD_MODE_FXSAVE, Ordering::Relaxed);
     SIMD_PROFILE_STATE.store(SIMD_PROFILE_READY, Ordering::Release);
 }
@@ -207,6 +214,13 @@ unsafe fn configure_published_profile() {
             __cpuid_count(0xD, 1).eax & CPUID_XSAVEOPT,
             0,
             "SIMD invariant: CPU lacks BSP-required XSAVEOPT"
+        );
+    }
+    if XGETBV1_ENABLED.load(Ordering::Acquire) {
+        assert_ne!(
+            __cpuid_count(0xD, 1).eax & CPUID_XGETBV1,
+            0,
+            "SIMD invariant: CPU lacks BSP-required XGETBV1"
         );
     }
 
@@ -304,8 +318,38 @@ pub unsafe fn restore_state(area: &SimdState) {
 #[inline(never)]
 pub unsafe extern "C" fn clear_ipc_registers() {
     unsafe {
+        // The x87/MMX state is almost always in its init configuration: the XINUSE
+        // bitmap (`XGETBV`, ECX = 1) clears bit 0 exactly then, and what `FNINIT`
+        // would write is what is already there. A set bit (or no XGETBV1) takes the
+        // full overwrite below; the bitmap is conservative, never wrongly clear.
+        if XGETBV1_ENABLED.load(Ordering::Relaxed) {
+            let inuse: u32;
+            core::arch::asm!(
+                "xgetbv",
+                in("ecx") 1_u32,
+                out("eax") inuse,
+                out("edx") _,
+                options(nomem, nostack, preserves_flags),
+            );
+            if inuse & 1 == 0 {
+                clear_vector_registers();
+                return;
+            }
+        }
+        // The first FNINIT only guaranteed that the eight pushes below could
+        // neither find a pending exception nor overflow a live stack, and an
+        // FNINIT costs ~90 ticks. A non-waiting FNSTSW reads the error summary
+        // (FNCLEX, also non-waiting, only if it is set), EMMS empties the tag
+        // word, and FLDZ then overwrites all eight physical registers whatever
+        // the entering control word. The closing FNINIT still resets the control,
+        // status, tag and instruction/data pointers.
         core::arch::asm!(
-            "fninit",
+            "fnstsw ax",
+            "test ax, 0x80",
+            "jz 2f",
+            "fnclex",
+            "2:",
+            "emms",
             "fldz",
             "fldz",
             "fldz",
@@ -315,9 +359,18 @@ pub unsafe extern "C" fn clear_ipc_registers() {
             "fldz",
             "fldz",
             "fninit",
+            out("ax") _,
             clobber_abi("C"),
             options(nostack),
         );
+        clear_vector_registers();
+    }
+}
+
+/// Zero every XMM/YMM register.
+#[inline(always)]
+unsafe fn clear_vector_registers() {
+    unsafe {
         if avx_enabled() {
             core::arch::asm!("vzeroall", clobber_abi("C"), options(nostack));
         } else {

@@ -272,8 +272,10 @@ pub(super) fn is_linux_rustos_ipc_syscall(syscall_number: u64) -> bool {
     )
 }
 
-pub(super) fn dispatch_register_ipc(frame: &mut SyscallFrame) -> u64 {
-    registers::dispatch(frame)
+pub(super) fn dispatch_register_ipc(
+    frame: &mut SyscallFrame, entry: Option<registers::EntryIdentity>,
+) -> u64 {
+    registers::dispatch_with(frame, entry)
 }
 
 pub(super) fn dispatch_linux_rustos_ipc_syscall(frame: &mut SyscallFrame) -> u64 {
@@ -1555,7 +1557,10 @@ fn try_fast_ipc_call_bytes<const N: usize>(
         request,
         timeout_ms,
     );
-    if reply_deadline_expired(deadline_tick) {
+    // A deadline measured from now (no authorized service) lies at least one tick
+    // ahead of the clock it was read from, so only a service-supplied absolute
+    // instant can already have passed.
+    if authorized_service_id.is_some() && reply_deadline_expired(deadline_tick) {
         return Err(LINUX_ETIMEDOUT);
     }
     fast_mark = charge_phase(IpcCallPhase::FastDeadline, fast_mark);

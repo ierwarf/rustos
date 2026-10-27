@@ -149,6 +149,37 @@ pub(in crate::multitask) fn reply_context_custody(
     task_id: u64,
     identity: ObjectIdentity,
 ) -> (bool, bool) {
+    if let Some(answer) = reply_context_custody_published(task_id, identity) {
+        return answer;
+    }
+    reply_context_custody_locked(task_id, identity)
+}
+
+/// The common answer without the Identity51 and Resources53 leaves. A live task's
+/// scheduling context is installed once, bound to the task, with an identity that is
+/// a function of its slot and id, so a task published live under its hint slot whose
+/// custody identity equals that function is exactly the `(true, true)` the locked
+/// comparison returns. Every other shape (retired, foreign, unpublished) is
+/// answered by the locked comparison.
+#[inline]
+fn reply_context_custody_published(task_id: u64, identity: ObjectIdentity) -> Option<(bool, bool)> {
+    let slot = hint(task_id)?;
+    let published = current_identity::read_task_dispatch(slot)?;
+    if published.task_id != Some(task_id)
+        || published.retired
+        || super::runqueue::owner(slot).state.is_terminal()
+        || super::scheduling_context::SchedulingContext::derived_identity(slot, task_id)
+            != Some(identity)
+    {
+        return None;
+    }
+    Some((true, true))
+}
+
+fn reply_context_custody_locked(
+    task_id: u64,
+    identity: ObjectIdentity,
+) -> (bool, bool) {
     let inspect = |slot| {
         current_identity::with_reply_custody(slot, task_id, |live| {
             super::stack_resources::context::reply_custody(slot, task_id, identity, live)

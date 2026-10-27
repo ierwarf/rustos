@@ -134,6 +134,10 @@ impl CpuSwitchPublication {
         // Allocation custody crosses this edge before publication can expose
         // the outgoing task's absence. No leaf lock enters assembly.
         super::scheduler::stack_resources::cpu_leases::publish(self.cpu, self.from, self.to);
+        // ORDERING: the bank moves above are plain stores of the owning CPU; one full
+        // fence orders them before the scalar publication remote paths act on, where
+        // each move used to be its own locked exchange.
+        core::sync::atomic::fence(Ordering::SeqCst);
         self.publish_scalars();
     }
 
@@ -403,6 +407,12 @@ pub(super) fn published_current_slot(cpu: usize) -> Option<usize> {
 /// Only that CPU's masked trap writes it, and only its commit callback reads it.
 static LANE_ACK_FROM: [CpuSlot; MAX_TRACKED_CPUS] =
     [const { slot_word(usize::MAX) }; MAX_TRACKED_CPUS];
+/// The parking ticket the lane leaves with its ACK: the saved RSP it published for the
+/// outgoing task and the owner generation of the Blocked word it committed. The ACK
+/// parks from these instead of re-reading the owner word and the frame token the lane
+/// wrote one step earlier; `resident::park` still re-validates the owner after publishing.
+static LANE_ACK_RSP: [CpuSlot; MAX_TRACKED_CPUS] = [const { slot_word(0) }; MAX_TRACKED_CPUS];
+static LANE_ACK_GENERATION: [CpuSlot; MAX_TRACKED_CPUS] = [const { slot_word(0) }; MAX_TRACKED_CPUS];
 
 /// No dispatch turn, uncommitted RSP handoff or missing Current on this CPU:
 /// the preconditions for a lane switch, which never opens a `CpuDispatchTurn`.
@@ -418,9 +428,16 @@ pub(in crate::multitask) fn lane_idle(cpu: usize) -> bool {
 
 /// Publish a lane switch exactly as a dispatch turn does (banks, Transition,
 /// Current) and arm the ACK that releases or parks the outgoing loans.
-pub(in crate::multitask) fn lane_publish(cpu: usize, from: usize, to: usize) {
+pub(in crate::multitask) fn lane_publish(
+    cpu: usize, from: usize, to: usize, saved_rsp: usize, generation: u64,
+) {
     CpuSwitchPublication::new(cpu, from, to, false).publish_before_return();
-    // ORDERING: Relaxed; see `lane_idle`. The Release stores above publish the switch.
+    // ORDERING: Relaxed; see `lane_idle`. The Release stores above publish the switch,
+    // and the ticket words are read only by this CPU's commit callback.
+    LANE_ACK_RSP[cpu].store(saved_rsp, Ordering::Relaxed);
+    // ORDERING: Relaxed; see above.
+    LANE_ACK_GENERATION[cpu].store(generation as usize, Ordering::Relaxed);
+    // ORDERING: Relaxed; see above. Written last: `lane_idle` reads it.
     LANE_ACK_FROM[cpu].store(from, Ordering::Relaxed);
 }
 
@@ -450,13 +467,23 @@ pub(super) extern "C" fn commit_context_switch() {
 
 pub(super) fn commit_context_switch_at_rsp(logical_index: usize, observed_rsp: Option<usize>) {
     // ORDERING: Relaxed; see `lane_idle`.
-    let lane_from = LANE_ACK_FROM[logical_index].swap(usize::MAX, Ordering::Relaxed);
+    // ORDERING: Relaxed; only this CPU's masked trap and this callback touch the word:
+    // a load and a store, not a locked exchange.
+    let lane_from = LANE_ACK_FROM[logical_index].load(Ordering::Relaxed);
     if lane_from != usize::MAX {
+        // ORDERING: Relaxed; see above.
+        LANE_ACK_FROM[logical_index].store(usize::MAX, Ordering::Relaxed);
         // A lane switch has no turn to commit: the RSP is already the incoming
         // task's. Release Transition, then release or park the outgoing loans.
         // ORDERING: Release makes the stack switch precede the transition clear.
         TRANSITION_ACTIVE[logical_index].store(false, Ordering::Release);
-        super::scheduler::resident::commit_outgoing(logical_index, lane_from, true);
+        super::scheduler::resident::commit_outgoing_lane(
+            logical_index,
+            lane_from,
+            // ORDERING: Relaxed; written by this CPU's masked trap before the stub switched.
+            LANE_ACK_RSP[logical_index].load(Ordering::Relaxed),
+            LANE_ACK_GENERATION[logical_index].load(Ordering::Relaxed) as u64,
+        );
         return;
     }
     let Some(commit) = dispatch_turn::begin_commit(logical_index) else {

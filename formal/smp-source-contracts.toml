@@ -1741,9 +1741,9 @@ tokens = [
     "struct CpuLeases",
     "fn park(",
     "core::mem::forget(pin);",
-    "cell.swap(encoded, Ordering::AcqRel)",
+    "cell.store(encoded, Ordering::Release)",
     "fn take(",
-    "cell.swap(0, Ordering::AcqRel)",
+    "cell.store(0, Ordering::Release)",
     "fn publish(",
     "let incoming = Self::take(&self.prepared);",
     "incoming.slot, to",
@@ -3513,13 +3513,13 @@ path = "kernel/ps/src/multitask/scheduler/stack_resources/context.rs"
 tokens = ["fn retained_scheduling_context(", "pin: &crate::multitask::current_identity::execution::BindingPin", "RESOURCES.get(pin.slot())?.with", "resources.start?.id != pin.id()", "resources.context?", "!context.scheduling_context.is_bound_to(pin.id())", "Some(context.scheduling_context.identity())"]
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/donation_ledger.rs"
-tokens = ["struct FundingBasis", "source: Option<FundingSource>", "fn source_live(", "find_reply(source.reply, source.namespace)", "entry.donation.custody_active", "context_owner_task_id == source.root_id", "context_owner_slot == source.root_slot", "receiver_slot == Some(source.receiver_slot)", "BoundWorker(source.receiver_id)", "fn current_basis_live(", "basis_live(ledger, basis)", "basis_locked(ledger, basis.donor_slot, basis.donor_id).as_ref() == Some(basis)", "fn reserve_owned(loans: &super::donation_publication::Loans", "loans.basis()", "DONATION_LEDGER.lock()", "!current_basis_live(&ledger, basis)", "Some(*basis)", "fn bind_owned(loans: &super::donation_publication::ReceiveLoans", "!basis_live(&ledger, basis)", "!= Ok(Some(*basis))", "bind_reserved_locked", "loans.receiver.id()", "loans.receiver.slot()"]
+tokens = ["struct FundingBasis", "source: Option<FundingSource>", "fn source_live(", "find_reply(source.reply, source.namespace)", "entry.donation.custody_active", "context_owner_task_id == source.root_id", "context_owner_slot == source.root_slot", "receiver_slot == Some(source.receiver_slot)", "BoundWorker(source.receiver_id)", "fn current_basis_live(", "basis_live(ledger, basis)", "basis_locked(ledger, basis.donor_slot, basis.donor_id).as_ref() == Some(basis)", "fn reserve_owned(loans: &super::donation_publication::Loans", "loans.basis()", "locked()", "!current_basis_live(&ledger, basis)", "Some(*basis)", "fn bind_owned(loans: &super::donation_publication::ReceiveLoans", "!basis_live(&ledger, basis)", "!= Ok(Some(*basis))", "bind_reserved_locked", "loans.receiver.id()", "loans.receiver.slot()"]
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/donation_publication.rs"
 tokens = ["fn bind_with(", "participant(donor_id)", "participant(receiver_id)", "bind_original(scope, reply, donor, &receiver, inherit)", "fn bind_original(", "receiver: &identity::execution::BindingPin", "!scope_valid(scope)", "bind_basis(reply, IpcReply, donor.slot(), donor.id())", "Ok(Some(basis))", "Ok(None) if inherit", "_ => return None", "let reserved = basis.is_some()", "Loans::from_original(donor, basis)", "ReceiveLoans { donor: &donor, receiver }", "if reserved && inherit", "bind_received_owned(&loans, reply, IpcReply)", "else if reserved", "bind_owned(&loans, reply, IpcReply)", "upsert_owned(&loans, reply, IpcReply)", "bound.then_some(donor)"]
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/donation_ledger.rs"
-tokens = ["fn bind_received_owned(", "loans.donor.basis()", "DONATION_LEDGER.lock()", "!basis_live(&ledger, basis)", "bind_basis_locked(", "!= Ok(Some(*basis))", "previous.donation.custody_active", "loans.receiver.slot()", "loans.receiver.id()", "upsert_locked(", "basis.root_id, basis.root_slot", "previous.donation.priority_donated, Some(*basis)", "bind_reserved_locked("]
+tokens = ["fn bind_received_owned(", "loans.donor.basis()", "locked()", "!basis_live(&ledger, basis)", "bind_basis_locked(", "!= Ok(Some(*basis))", "previous.donation.custody_active", "loans.receiver.slot()", "loans.receiver.id()", "upsert_locked(", "basis.root_id, basis.root_slot", "previous.donation.priority_donated, Some(*basis)", "bind_reserved_locked("]
 [[forbidden_patterns]]
 scope = "kernel/ps/src/multitask/scheduler/donation_publication.rs"
 regex = 'scheduler_(?:mut|ref)|Scheduler::|current_cpu_task_slot|derived_identity|preemption_snapshot'
@@ -3590,7 +3590,7 @@ tokens = [
     "direct_switch_admitted(cpu)", "bind_original(scope, reply, donor, &receiver, false)",
     "runqueue::commit_wait(c)", "finish(cpu, from, to, rsp, &clock, generic)",
     "pub(in crate::multitask) fn reply(", "reply_context_custody(context_owner, context)",
-    "recent_sleeper(", "release_reply(reply", "finish(cpu, from, to, rsp, &clock, generic)",
+    "recent_sleeper(", "release_reply_lane(c, caller_id, reply)", "finish(cpu, from, to, rsp, &clock, generic)",
     "fn finish(", "can_forward(", "settle(cpu, from.slot, from.id, clock)", "prepare_grant(to.slot, cpu)",
     "lane_wake_clear(", "lane_cas(", "resident::take(to.slot, generation)", "banks::prepare_lane(cpu, loans.permit)",
     "execution_interval::forward(", "publish_blocked(cpu, from.slot, rsp)", "lane_install(", "cpu_local::lane_publish(",
@@ -3599,8 +3599,8 @@ tokens = [
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/resident.rs"
 tokens = [
-    "pub(super) fn park(", "cell.pin.store(", "cell.permit.store(", "cell.generation.store(generation, Ordering::Release)",
-    "fence(Ordering::SeqCst)", "runqueue::owner(slot)", "pub(super) fn take(",
+    "pub(super) fn park(", "cell.pin.store(", "cell.permit.store(", "cell.generation.swap(generation, Ordering::SeqCst)",
+    "runqueue::owner(slot)", "pub(super) fn take(",
     "compare_exchange(generation, 0", "pub(super) fn on_owner_transition(",
     "pub(in crate::multitask) fn commit_outgoing(", "cpu_leases::take_outgoing(cpu)", "banks::take_outgoing(cpu)",
     "parkable(from, &pin, &permit)", "kernel_frame_rsp(cpu, from, generation)", "outgoing_arch(cpu, from)",

@@ -648,7 +648,7 @@ ordered(body((base / 'donation_publication.rs').read_text(), 'bind_original'), [
     'else if reserved', 'bind_owned(&loans, reply, IpcReply)'],
     'actual received request and sender wake candidate use distinct original funding effects')
 received_bind = body((base / 'donation_ledger.rs').read_text(), 'bind_received_owned')
-ordered(received_bind, ['loans.donor.basis()', 'DONATION_LEDGER.lock()',
+ordered(received_bind, ['loans.donor.basis()', 'locked()',
     '!basis_live(&ledger, basis)', 'bind_basis_locked(', '!= Ok(Some(*basis))',
     'previous.donation.custody_active', 'loans.receiver.slot()', 'loans.receiver.id()',
     'upsert_locked(', 'basis.root_id, basis.root_slot',
@@ -657,7 +657,7 @@ ordered(received_bind, ['loans.donor.basis()', 'DONATION_LEDGER.lock()',
 if 'funding_basis(' in received_bind or 'upsert_owned(' in received_bind:
     raise SystemExit('actual received request cannot replace its original reserved funding')
 ordered(body((base / 'donation_ledger.rs').read_text(), 'reply_already_dispatched'), [
-    'reply == 0', 'DONATION_LEDGER.lock()', 'find_reply(reply, DonationNamespace::IpcReply)',
+    'reply == 0', 'locked()', 'find_reply(reply, DonationNamespace::IpcReply)',
     'entry.donation.donor_task_id == donor.id()', 'entry.donation.custody_active',
     'entry.receiver_slot.is_some()', 'IpcDonationTarget::BoundWorker(_)',
     'basis.donor_slot == donor.slot()', 'basis.donor_id == donor.id()',
@@ -1355,7 +1355,7 @@ ordered(body(lane, 'call'), ['cpu_local::lane_idle(cpu)', 'resident::parked_cpu(
     'lane call declines before the donation bind and is committed after it')
 ordered(body(lane, 'reply'), ['cpu_local::lane_idle(cpu)', 'reply_context_custody(context_owner, context)',
     'resident::parked_cpu(c, generation)', 'recent_sleeper(', 'direct_switch_admitted(cpu)',
-    'release_reply(reply', 'runqueue::simd_tls::save_simd_state_lane(s, s_id)', 'finish(cpu, from, to, rsp, &clock, generic)'],
+    'release_reply_lane(c, caller_id, reply)', 'runqueue::simd_tls::save_simd_state_lane(s, s_id)', 'finish(cpu, from, to, rsp, &clock, generic)'],
     'lane reply releases the donation only after every decline check')
 ordered(body(lane, 'finish'), ['funding_label(to.slot, to.id)', 'can_forward(', 'settle(cpu, from.slot, from.id, clock)',
     'prepare_grant(to.slot, cpu)', 'with_placement_admission(', 'lane_wake_clear(', 'lane_cas(',
@@ -1365,7 +1365,7 @@ ordered(body(lane, 'finish'), ['funding_label(to.slot, to.id)', 'can_forward(', 
     'lane_install_placement(', 'complete(cpu, from.slot'],
     'lane claim CAS is the point of no return; every move after it is infallible')
 ordered(body(resident_source, 'park'), ['cell.pin.store(', 'cell.permit.store(',
-    'cell.generation.store(generation, Ordering::Release)', 'fence(Ordering::SeqCst)',
+    'cell.generation.swap(generation, Ordering::SeqCst)',
     'runqueue::owner(slot)', 'take(slot, generation)'],
     'a parked cell is published before the owner re-read that revokes it')
 ordered(body(resident_source, 'take'), ['compare_exchange(generation, 0', 'cell.drain()'],
@@ -1374,8 +1374,8 @@ runq = (base / 'runqueue.rs').read_text()
 ordered(body(runq, 'compare_exchange'), ['self.compare_exchange_raw(expected, next)?',
     'expected.generation != next.generation', 'resident::on_owner_transition(self.slot(), expected.generation)'],
     'every owner transition out of a generation revokes its parked cell')
-ordered(body(cpu_source, 'commit_context_switch_at_rsp'), ['LANE_ACK_FROM[logical_index].swap(',
-    'TRANSITION_ACTIVE[logical_index].store(false', 'resident::commit_outgoing(logical_index, lane_from, true)',
+ordered(body(cpu_source, 'commit_context_switch_at_rsp'), ['LANE_ACK_FROM[logical_index].load(',
+    'TRANSITION_ACTIVE[logical_index].store(false', 'resident::commit_outgoing_lane(',
     'return;', 'dispatch_turn::begin_commit('],
     'a lane ACK clears Transition and parks or releases the outgoing loans without a turn')
 print('independent dispatch source contracts passed: whole Scheduler deletion, original dispatch/FIFO, foreign shared-MM census, executor ACK and HECS')

@@ -113,6 +113,47 @@ impl DonationLedger {
 
 static DONATION_LEDGER: IrqLeaf<DonationLedger, { LockClass::SchedulerDonation as u8 }> =
     IrqLeaf::new(DonationLedger::new());
+
+mod lazy;
+
+/// The ledger leaf with every lazily published own-funded edge already inserted,
+/// so a reader never observes less than the eager protocol would have produced.
+fn locked() -> impl core::ops::DerefMut<Target = DonationLedger> + 'static {
+    let mut ledger = DONATION_LEDGER.lock();
+    lazy::settle(&mut ledger);
+    ledger
+}
+
+/// Reserve the donor's edge without taking the ledger leaf when it is an ordinary
+/// class, self-funded edge; otherwise exactly `reserve_own`.
+pub(super) fn reserve_own_lazy(slot: usize, id: u64, priority: bool) -> bool {
+    if !priority && borrowed_context_charge_token(slot).is_none() && lazy::reserve(slot, id) {
+        return true;
+    }
+    reserve_own(slot, id, priority)
+}
+
+/// Lane bind of a lazily reserved self-funded edge; `None` means bind through the ledger.
+pub(super) fn bind_own_lazy(
+    donor_slot: usize, donor_id: u64, reply: u64, receiver_slot: usize, receiver_id: u64,
+) -> Option<bool> {
+    lazy::bind(donor_slot, donor_id, reply, receiver_slot, receiver_id)
+}
+
+#[cfg(test)]
+pub(super) fn lazy_state_for_tests(slot: usize) -> u64 {
+    lazy::state(slot)
+}
+#[cfg(test)]
+pub(super) fn lazy_reserve_for_tests(slot: usize, id: u64, priority: bool) -> bool {
+    !priority && lazy::reserve(slot, id)
+}
+
+/// Lane release of the reply's edge: lock-free when it was published lazily.
+pub(super) fn release_reply_lane(donor_slot: usize, donor_id: u64, reply: u64) -> bool {
+    lazy::release(donor_slot, donor_id, reply)
+        || release_reply(reply, DonationNamespace::IpcReply)
+}
 static INHERITED_SYSTEM: [AtomicU8; MAX_TASK] = [const { AtomicU8::new(0) }; MAX_TASK];
 static CLASS_PUBLICATION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 /// Read side of the class exclusion: claims in progress on each CPU. A count
@@ -153,6 +194,7 @@ fn bind_entry_to_receiver(entry: &mut LedgerEntry, receiver_task_id: u64, receiv
 
 pub(super) fn reset() {
     let mut ledger = DONATION_LEDGER.lock();
+    lazy::reset();
     begin_class_publication();
     *ledger = DonationLedger::new();
     for inherited in &INHERITED_SYSTEM {
@@ -197,7 +239,7 @@ fn basis_locked(ledger: &DonationLedger, slot: usize, id: u64) -> Option<Funding
         donor_id: id, root_slot, root_id: source.root_id, source: Some(source) })
 }
 pub(super) fn funding_basis(slot: usize, id: u64) -> Option<FundingBasis> {
-    basis_locked(&DONATION_LEDGER.lock(), slot, id)
+    basis_locked(&locked(), slot, id)
 }
 fn basis_live(ledger: &DonationLedger, basis: &FundingBasis) -> bool {
     match basis.source {
@@ -212,7 +254,7 @@ fn current_basis_live(ledger: &DonationLedger, basis: &FundingBasis) -> bool {
 pub(super) fn reserve_owned(loans: &super::donation_publication::Loans,
     priority: bool) -> bool {
     let basis = loans.basis();
-    let mut ledger = DONATION_LEDGER.lock();
+    let mut ledger = locked();
     if !current_basis_live(&ledger, basis) { return false; }
     reserve_locked(&mut ledger, basis.donor_id, basis.root_id, basis.root_slot,
         priority, Some(*basis))
@@ -222,7 +264,7 @@ pub(super) fn reserve_owned(loans: &super::donation_publication::Loans,
 /// acquisition. A charge token published since the caller's lock-free check
 /// refuses here exactly as `current_basis_live` refuses a moved basis.
 pub(super) fn reserve_own(slot: usize, id: u64, priority: bool) -> bool {
-    let mut ledger = DONATION_LEDGER.lock();
+    let mut ledger = locked();
     if borrowed_context_charge_token(slot).is_some() { return false; }
     let basis = FundingBasis { donor_slot: slot, donor_id: id, root_slot: slot, root_id: id, source: None };
     reserve_locked(&mut ledger, id, id, slot, priority, Some(basis))
@@ -259,7 +301,7 @@ fn reserve_locked(
 }
 
 pub(super) fn cancel_reservation(donor_task_id: u64) -> bool {
-    let mut ledger = DONATION_LEDGER.lock();
+    let mut ledger = locked();
     let Some(index) = ledger.find_reservation(donor_task_id) else {
         return false;
     };
@@ -278,7 +320,7 @@ pub(super) fn retains_awaiting_reply(
     donor: &super::super::current_identity::execution::BindingPin, reply: u64,
 ) -> bool {
     if reply == 0 { return false; }
-    let ledger = DONATION_LEDGER.lock();
+    let ledger = locked();
     let Some(index) = ledger.find_reply(reply, DonationNamespace::IpcReply) else { return false; };
     let entry = ledger.entries[index].as_ref().unwrap();
     entry.donation.donor_task_id == donor.id()
@@ -296,7 +338,7 @@ pub(super) fn reply_already_dispatched(
     donor: &super::super::current_identity::execution::BindingPin, reply: u64,
 ) -> bool {
     if reply == 0 { return false; }
-    let ledger = DONATION_LEDGER.lock();
+    let ledger = locked();
     let Some(index) = ledger.find_reply(reply, DonationNamespace::IpcReply) else { return false; };
     let entry = ledger.entries[index].as_ref().unwrap();
     entry.donation.donor_task_id == donor.id()
@@ -310,7 +352,7 @@ pub(super) fn attach(reply: u64, namespace: DonationNamespace, donor_task_id: u6
     if reply == 0 {
         return false;
     }
-    let mut ledger = DONATION_LEDGER.lock();
+    let mut ledger = locked();
     if let Some(index) = ledger.find_reply(reply, namespace) {
         // A running receiver may bind the published reply before the sender
         // attaches its reservation. Confirm the exact donor edge instead of
@@ -349,7 +391,7 @@ fn bind_basis_locked(ledger: &DonationLedger, reply: u64, namespace: DonationNam
 }
 pub(super) fn bind_basis(reply: u64, namespace: DonationNamespace,
     slot: usize, id: u64) -> Result<Option<FundingBasis>, ()> {
-    bind_basis_locked(&DONATION_LEDGER.lock(), reply, namespace, slot, id)
+    bind_basis_locked(&locked(), reply, namespace, slot, id)
 }
 /// `bind_basis` + `bind_owned` for a donor whose funding is its own context
 /// (no borrowed source, so no root pin or revalidation beyond the entry itself),
@@ -357,7 +399,7 @@ pub(super) fn bind_basis(reply: u64, namespace: DonationNamespace,
 /// a borrowed basis, a missing reservation or a mismatch.
 pub(super) fn bind_own_funding(reply: u64, donor_slot: usize, donor_id: u64,
     receiver_slot: usize, receiver_id: u64) -> Option<bool> {
-    let mut ledger = DONATION_LEDGER.lock();
+    let mut ledger = locked();
     let basis = match bind_basis_locked(&ledger, reply, DonationNamespace::IpcReply, donor_slot, donor_id) {
         Ok(Some(basis)) => basis,
         _ => return None,
@@ -372,7 +414,7 @@ pub(super) fn bind_own_funding(reply: u64, donor_slot: usize, donor_id: u64,
 pub(super) fn bind_owned(loans: &super::donation_publication::ReceiveLoans,
     reply: u64, namespace: DonationNamespace) -> bool {
     let basis = loans.donor.basis();
-    let mut ledger = DONATION_LEDGER.lock();
+    let mut ledger = locked();
     if !basis_live(&ledger, basis)
         || bind_basis_locked(&ledger, reply, namespace, basis.donor_slot, basis.donor_id)
             != Ok(Some(*basis))
@@ -387,7 +429,7 @@ pub(super) fn bind_owned(loans: &super::donation_publication::ReceiveLoans,
 pub(super) fn bind_received_owned(loans: &super::donation_publication::ReceiveLoans,
     reply: u64, namespace: DonationNamespace) -> bool {
     let basis = loans.donor.basis();
-    let mut ledger = DONATION_LEDGER.lock();
+    let mut ledger = locked();
     if !basis_live(&ledger, basis)
         || bind_basis_locked(&ledger, reply, namespace, basis.donor_slot, basis.donor_id)
             != Ok(Some(*basis))
@@ -410,7 +452,7 @@ pub(super) fn bind_received_owned(loans: &super::donation_publication::ReceiveLo
 pub(super) fn upsert_owned(loans: &super::donation_publication::ReceiveLoans,
     reply: u64, namespace: DonationNamespace) -> bool {
     let basis = loans.donor.basis();
-    let mut ledger = DONATION_LEDGER.lock();
+    let mut ledger = locked();
     if !current_basis_live(&ledger, basis) { return false; }
     // A racing receive/attach owns the original reservation; a fresh upsert
     // must never overwrite that admitted worker or revive cancelled source custody.
@@ -548,7 +590,7 @@ pub(super) fn release_reply(reply: u64, namespace: DonationNamespace) -> bool {
     if reply == 0 {
         return false;
     }
-    let mut ledger = DONATION_LEDGER.lock();
+    let mut ledger = locked();
     let Some(index) = ledger.find_reply(reply, namespace) else {
         return false;
     };
@@ -594,7 +636,7 @@ pub(super) fn release_reply(reply: u64, namespace: DonationNamespace) -> bool {
 }
 
 pub(super) fn release_task(task_id: u64) {
-    let mut ledger = DONATION_LEDGER.lock();
+    let mut ledger = locked();
     let mut index = 0;
     while index < ledger.len {
         let entry = ledger.entries[index]
@@ -722,7 +764,7 @@ pub(super) fn borrowed_context_charge_token(slot: usize) -> Option<(usize, u64)>
 }
 
 pub(super) fn live_len() -> usize {
-    DONATION_LEDGER.lock().len
+    locked().len
 }
 
 fn increment_receiver(slot: usize) {
@@ -882,6 +924,10 @@ mod tests {
             }
         });
         assert!(published.load(SeqCst));
+    }
+    #[test]
+    fn lazy_edge_settles_to_the_eager_entries() {
+        owned::lazy_edges();
     }
     #[test]
     fn a_fault_token_never_aliases_an_equal_reply_handle() {

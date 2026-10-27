@@ -11,7 +11,7 @@
 //! ordering is argued here, not modeled in TLA+.
 use super::{return_architecture::ArchitectureState, runqueue, stack_resources::StackPin};
 use crate::multitask::current_identity::execution::ExecutionPermit;
-use core::{cell::UnsafeCell, sync::atomic::{AtomicU64, AtomicUsize, Ordering, fence}};
+use core::{cell::UnsafeCell, sync::atomic::{AtomicU64, AtomicUsize, Ordering}};
 use nucleus_core::util::cache_padded::CachePadded;
 
 /// Everything a parked task needs to resume without re-admission.
@@ -52,8 +52,10 @@ impl Cell {
     fn drain(&self) -> Loans {
         // ORDERING: the winning Acquire swap of `generation` orders these loads
         // after the parker's Release store of the same word.
-        let pin = self.pin.swap(0, Ordering::Relaxed);
-        let permit = self.permit.swap(0, Ordering::Relaxed);
+        // Winning the generation swap made the payload exclusively ours; `park`
+        // overwrites it before the next publication, so no clearing exchange is needed.
+        let pin = self.pin.load(Ordering::Relaxed);
+        let permit = self.permit.load(Ordering::Relaxed);
         Loans {
             pin: StackPin::from_raw(pin),
             permit: ExecutionPermit::take(permit).expect("resident cell lost its permit"),
@@ -85,11 +87,12 @@ pub(super) fn park(slot: usize, generation: u64, loans: Loans) -> bool {
     // SAFETY: the cell is empty (asserted above), so no taker can observe it
     // before the Release store of `generation` below.
     unsafe { *cell.arch.get() = Some(arch) };
-    // ORDERING: Release publishes the payload; the fence pairs with the
-    // SeqCst owner CAS so either the evictor's hook sees this generation or our
-    // re-read below sees the evictor's new owner word (never both missed).
-    cell.generation.store(generation, Ordering::Release);
-    fence(Ordering::SeqCst);
+    // ORDERING: the SeqCst exchange publishes the payload and, as a full barrier,
+    // pairs with the SeqCst owner CAS so either the evictor's hook sees this
+    // generation or our re-read below sees the evictor's new owner word (never
+    // both missed). One locked exchange where a store and a separate fence were.
+    let previous = cell.generation.swap(generation, Ordering::SeqCst);
+    debug_assert_eq!(previous, 0, "resident cell parked over live loans");
     let owner = runqueue::owner(slot);
     if owner.generation == generation && owner.state == runqueue::RunOwnerState::Blocked {
         return true;
@@ -145,6 +148,22 @@ pub(in crate::multitask) fn commit_outgoing(cpu: usize, from: usize, physical: b
     let (Some(pin), Some(permit)) = (pin, permit) else { return };
     let Some(generation) = parkable(from, &pin, &permit) else { return };
     let Some(saved_rsp) = kernel_frame_rsp(cpu, from, generation) else { return };
+    let Some(arch) = super::ipc_lane::outgoing_arch(cpu, from) else { return };
+    park(from, generation, Loans { pin, permit, saved_rsp, arch, cpu });
+}
+
+/// [`commit_outgoing`] for the lane's own switch, which hands the ACK the saved RSP it
+/// published and the generation of the Blocked word it committed: nothing is re-read
+/// that the lane wrote one step earlier. A wake that moved the owner since is caught
+/// by `park`, which re-reads the owner after publishing the cell.
+pub(in crate::multitask) fn commit_outgoing_lane(cpu: usize, from: usize, saved_rsp: usize, generation: u64) {
+    use crate::multitask::current_identity::execution::banks;
+    let pin = super::stack_resources::cpu_leases::take_outgoing(cpu);
+    let permit = banks::take_outgoing(cpu);
+    let (Some(pin), Some(permit)) = (pin, permit) else { return };
+    if pin.slot() != from || permit.slot() != from || runqueue::is_idle_slot(from) {
+        return;
+    }
     let Some(arch) = super::ipc_lane::outgoing_arch(cpu, from) else { return };
     park(from, generation, Loans { pin, permit, saved_rsp, arch, cpu });
 }

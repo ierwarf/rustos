@@ -509,7 +509,12 @@ fn consume_syscall_tail_reschedule(
     deferred_claimed: bool,
     user_return: &core::sync::atomic::AtomicU64,
 ) -> bool {
-    let user_return = user_return.swap(0, Ordering::AcqRel);
+    // A locked exchange on every syscall tail to clear a flag that is almost never set.
+    let user_return = if user_return.load(Ordering::Relaxed) == 0 {
+        0
+    } else {
+        user_return.swap(0, Ordering::AcqRel)
+    };
     deferred_claimed || user_return != 0
 }
 

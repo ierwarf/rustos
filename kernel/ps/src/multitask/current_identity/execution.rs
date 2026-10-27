@@ -101,6 +101,27 @@ pub(in crate::multitask) fn qualified(slot: usize, id: u64) -> bool {
         .is_some_and(|published| published.task_id == Some(id) && !published.retired)
         && !super::exec_intent::busy(slot)
 }
+/// [`qualified`] plus the lane's dispatchability gate from the same single
+/// publication read: `slot` publishes `id`, is dispatchable, not retired, and has
+/// no exec intent. The IPC lane asked these as two reads of the same words.
+pub(in crate::multitask) fn qualified_dispatchable(slot: usize, id: u64) -> bool {
+    super::read_task_dispatch(slot)
+        .is_some_and(|published| {
+            published.task_id == Some(id) && published.dispatchable && !published.retired
+        })
+        && !super::exec_intent::busy(slot)
+}
+
+/// [`pin_held`] for a caller that has just proved [`qualified_dispatchable`] in
+/// the same masked section: the permit is acquired without a second admission
+/// read. The held parked or banked unit keeps the count above zero exactly as
+/// for `pin_held`; a retirement racing between the proof and this acquire is
+/// refused by the owner-word claim that follows, which fails the lane to the
+/// ordinary wake with the permit dropped.
+pub(in crate::multitask) fn pin_admitted(slot: usize, id: u64) -> Option<BindingPin> {
+    acquire(slot).map(|permit| BindingPin { permit, id })
+}
+
 pub(in crate::multitask) fn pin_creation(
     slot: usize,
     id: u64,

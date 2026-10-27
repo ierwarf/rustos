@@ -182,18 +182,21 @@ pub(in crate::multitask) fn call(
     {
         return declined;
     }
-    let Some(token) = frame_publication::observed_frame_token(s, cpu, false) else { return declined };
-    if !admitted(c, c_id) || !admitted(s, receiver_id) || token.owner_generation != generation {
+    // The resident cell for `generation` was published only after the park validated
+    // the receiver's frame token for that exact generation, and the token changes only
+    // together with an owner transition, which evicts the cell: `parked_cpu` above
+    // already proved what a second token read would.
+    if !identity_execution::qualified_dispatchable(c, c_id)
+        || !identity_execution::qualified_dispatchable(s, receiver_id)
+    {
         return declined;
     }
     // Donation bind is the last fallible step that can still decline: the
     // ordinary path would bind the same reservation next.
-    // The donor is this CPU's Current task (its banks own it, checked above):
-    // it needs the same lifecycle qualification a pin applies but no permit.
-    if !identity_execution::qualified(c, c_id) {
-        return declined;
-    }
-    let Some(receiver) = identity_execution::pin_held(s, receiver_id) else { return declined };
+    // Both ends were qualified by `qualified_dispatchable` above (the donor is
+    // this CPU's Current task, its banks own it): only the receiver's permit
+    // remains to acquire.
+    let Some(receiver) = identity_execution::pin_admitted(s, receiver_id) else { return declined };
     // A donor funded by its own context binds in one ledger acquisition; a
     // borrowed basis takes the full two-step bind with its root loan.
     let _donation = match donation_publication::bind_lane_current(scope, reply, (c, c_id), &receiver) {
@@ -269,13 +272,13 @@ pub(in crate::multitask) fn reply(
     {
         return declined;
     }
-    let Some(token) = frame_publication::observed_frame_token(c, cpu, false) else { return declined };
-    if token.owner_generation != generation || !admitted(s, s_id) || !admitted(c, caller_id) {
+    // As in `call`: the caller's resident cell for `generation` implies its frame token.
+    if !admitted(s, s_id) || !admitted(c, caller_id) {
         return declined;
     }
     // Committed from here: the reply capability's donation is released, as the
     // ordinary reply wake does first, and every failure is `Generic`.
-    let _ = donation_ledger::release_reply(reply, super::ipc_donation::DonationNamespace::IpcReply);
+    let _ = donation_ledger::release_reply_lane(c, caller_id, reply);
     let generic = || {
         let _ = wake_publication::reply_with(scope, reply, caller_id,
             &super::runqueue_policy::online_affinity_mask);
@@ -383,10 +386,12 @@ fn finish(
         super::execution_interval::open_lane(cpu, to.slot, to.id, running.generation, funding, clock);
     }
     assert!(publish_blocked(cpu, from.slot, rsp), "lane outgoing task lost Running custody");
+    // The Blocked word `publish_return` just committed: the generation the ACK parks under.
+    let from_generation = runqueue::owner(from.slot).generation;
     let next_arch = fresh(to.slot, loans.arch);
     super::return_architecture::lane_install(cpu, from.arch, next_arch, to.slot, to.id);
     note_installed(cpu, to.slot, next_arch);
-    cpu_local::lane_publish(cpu, from.slot, to.slot);
+    cpu_local::lane_publish(cpu, from.slot, to.slot, rsp, from_generation);
     cpu_local::lane_install_placement(cpu, grant);
     complete(cpu, from.slot, from.id, to.slot, to.id, loans.saved_rsp, from.arch.root != next_arch.root, clock.ticks);
     Outcome::Switched(loans.saved_rsp)

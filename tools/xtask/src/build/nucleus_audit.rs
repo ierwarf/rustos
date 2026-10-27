@@ -325,7 +325,7 @@ fn instruction_mnemonic(line: &str) -> Option<&str> {
 fn register_ipc_custody(symbol: &str, mnemonic: &str) -> bool {
     (symbol == "syscall_entry" && matches!(mnemonic, "fnstcw" | "fldcw"))
         || (symbol.contains("kernel_hal4arch4simd19clear_ipc_registers")
-            && matches!(mnemonic, "fninit" | "fldz"))
+            && matches!(mnemonic, "fninit" | "fldz" | "fnstsw" | "fnclex"))
         || (symbol.contains("kernel_compat4user7syscall26finish_register_ipc_return")
             && mnemonic == "fldcw")
 }
@@ -551,6 +551,8 @@ mod tests {
         let sanitizer = "_RNvNtNtCs2_10kernel_hal4arch4simd19clear_ipc_registers";
         assert!(register_ipc_custody(sanitizer, "fninit"));
         assert!(register_ipc_custody(sanitizer, "fldz"));
+        assert!(register_ipc_custody(sanitizer, "fnstsw"));
+        assert!(register_ipc_custody(sanitizer, "fnclex"));
         assert!(!register_ipc_custody(sanitizer, "fadd"));
         assert!(!register_ipc_custody("ordinary_kernel_function", "fldz"));
         let report = audit_disassembly(&listing(

@@ -103,3 +103,68 @@ pub(in crate::multitask::scheduler) fn restore_previous() {
         assert!(donation_ledger::test_charge_publication_is_empty(slots[3]));
     });
 }
+
+/// A self-funded ordinary edge published lazily is, to every ledger reader, exactly
+/// the edge the eager protocol inserts; the lock-free release leaves no trace.
+pub(in crate::multitask::scheduler) fn lazy_edges() {
+    use donation_ledger::lazy_state_for_tests as state;
+    born(|slots| {
+        // Reserve + bind + lane release without the ledger leaf.
+        assert!(donation_ledger::reserve_own_lazy(slots[0], ID, false));
+        assert_eq!(state(slots[0]), 1);
+        assert_eq!(donation_ledger::bind_own_lazy(slots[0], ID, 801, slots[1], ID + 1), Some(true));
+        assert_eq!(state(slots[0]), 2);
+        assert_eq!(donation_ledger::borrowed_context_charge_token(slots[1]), Some((slots[0], 801)));
+        assert!(donation_ledger::release_reply_lane(slots[0], ID, 801));
+        assert_eq!(state(slots[0]), 0);
+        assert_eq!(donation_ledger::borrowed_context_charge_token(slots[1]), None);
+        assert_eq!(donation_ledger::live_len(), 0);
+
+        // A ledger reader settles a bound lazy edge into the eager entry.
+        assert!(donation_ledger::reserve_own_lazy(slots[0], ID, false));
+        assert_eq!(donation_ledger::bind_own_lazy(slots[0], ID, 802, slots[1], ID + 1), Some(true));
+        assert_eq!(donation_ledger::live_len(), 1);
+        assert_eq!(state(slots[0]), 0);
+        assert_eq!(donation_ledger::borrowed_context_charge_token(slots[1]), Some((slots[0], 802)));
+        assert!(!donation_ledger::release_reply_lane(slots[0], ID, 801), "other reply");
+        assert!(donation_ledger::release_reply(802, IpcReply));
+        assert_eq!(donation_ledger::borrowed_context_charge_token(slots[1]), None);
+        assert_eq!(donation_ledger::live_len(), 0);
+
+        // A reserved lazy edge is an ordinary reservation to cancel, attach and bind.
+        assert!(donation_ledger::reserve_own_lazy(slots[0], ID, false));
+        assert!(donation_ledger::cancel_reservation(ID));
+        assert!(!donation_ledger::cancel_reservation(ID));
+        assert!(donation_ledger::reserve_own_lazy(slots[0], ID, false));
+        assert!(donation_ledger::attach(803, IpcReply, ID));
+        assert_eq!(state(slots[0]), 0);
+        assert!(donation_ledger::release_reply(803, IpcReply));
+        assert!(donation_ledger::reserve_own_lazy(slots[0], ID, false));
+        assert!(bind_with(&masked(), 804, ID, ID + 1, false));
+        assert!(donation_ledger::release_reply_lane(slots[0], ID, 804), "settled edge releases through the ledger");
+        assert_eq!(donation_ledger::borrowed_context_charge_token(slots[1]), None);
+        assert_eq!(donation_ledger::live_len(), 0);
+
+        // Task retirement settles then withdraws.
+        assert!(donation_ledger::reserve_own_lazy(slots[0], ID, false));
+        assert_eq!(donation_ledger::bind_own_lazy(slots[0], ID, 805, slots[1], ID + 1), Some(true));
+        donation_ledger::release_task(ID + 1);
+        assert_eq!(donation_ledger::live_len(), 0);
+        assert_eq!(donation_ledger::borrowed_context_charge_token(slots[1]), None);
+
+        // Never lazy: a priority edge, a second edge for one donor, a receiver that
+        // already carries a borrowed context.
+        assert!(!donation_ledger::lazy_reserve_for_tests(slots[0], ID, true));
+        assert!(donation_ledger::reserve_own_lazy(slots[0], ID, false));
+        assert!(!donation_ledger::lazy_reserve_for_tests(slots[0], ID, false));
+        assert!(donation_ledger::cancel_reservation(ID));
+        assert!(donation_ledger::reserve_own_lazy(slots[0], ID, false));
+        assert_eq!(donation_ledger::bind_own_lazy(slots[0], ID, 806, slots[1], ID + 1), Some(true));
+        assert!(donation_ledger::reserve_own_lazy(slots[2], ID + 2, false));
+        assert_eq!(donation_ledger::bind_own_lazy(slots[2], ID + 2, 807, slots[1], ID + 1), None,
+            "receiver already serves a borrowed context");
+        assert!(donation_ledger::cancel_reservation(ID + 2));
+        assert!(donation_ledger::release_reply(806, IpcReply));
+        assert_eq!(donation_ledger::live_len(), 0);
+    });
+}
