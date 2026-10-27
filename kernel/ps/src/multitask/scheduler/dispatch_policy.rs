@@ -91,6 +91,9 @@ pub(super) fn discharge_claimed_first_turn(turn: &crate::multitask::cpu_local::d
     let (cpu, _) = turn.original_current().expect("first-turn completion lost CPU owner");
     assert!(turn.owns_priority_choice(), "first-turn completion lacks priority choice");
     let receipt = turn.claimed_return().expect("first-turn completion lacks original claim");
+    // Nothing queued means nothing to discharge: both queues' advertisements
+    // are republished by the leaf release that last changed them.
+    if !spawn_hints_present(cpu) && !atomic_activation_pending(cpu) { return; }
     let record = FirstTurnHandoff { slot: receipt.slot(), task_id: receipt.id };
     let mut policy = lock(cpu);
     policy.spawn_pick_hints.remove_exact(record);
@@ -124,8 +127,72 @@ pub(super) fn store_dispatch_streaks(cpu: usize, system: u8, latency: u8) {
 
 pub(super) type CpuDispatchLock =
     IrqLeaf<CpuDispatchPolicy, { LockClass::SchedulerPolicy as u8 }>;
-pub(super) type CpuDispatchGuard<'a> =
+type RawDispatchGuard<'a> =
     Guard<'a, CpuDispatchPolicy, { LockClass::SchedulerPolicy as u8 }>;
+
+const HINT_NEXT: u8 = 1;
+const HINT_LATENCY: u8 = 2;
+const HINT_SPAWN: u8 = 4;
+
+/// Which per-CPU ordering queues were non-empty when the policy leaf was last
+/// released. Every ordinary dispatch peeked three of them, and cleared a
+/// fourth counter, only to find them empty: five leaf acquisitions to answer
+/// "is there a hint". The bits are recomputed from the queues by the guard's
+/// release, still inside the leaf, so a reader that sees a bit clear linearizes
+/// before the producer's release; the hints convey ordering only, so that
+/// dispatch simply runs without it, exactly as if the producer had published a
+/// moment later. A set bit costs the lock the reader paid before.
+static HINTS_PRESENT: [AtomicU8; MAX_TRACKED_CPUS] =
+    [const { AtomicU8::new(0) }; MAX_TRACKED_CPUS];
+
+fn hint_present(cpu: usize, bit: u8) -> bool {
+    // ORDERING: acquire pairs with the release in `PolicyGuard::drop`, so a set
+    // bit is followed by the queue entry it advertises.
+    HINTS_PRESENT.get(cpu).is_none_or(|bits| bits.load(Ordering::Acquire) & bit != 0)
+}
+
+pub(super) fn next_pick_hint_present(cpu: usize) -> bool { hint_present(cpu, HINT_NEXT) }
+pub(super) fn latency_hints_present(cpu: usize) -> bool { hint_present(cpu, HINT_LATENCY) }
+pub(super) fn spawn_hints_present(cpu: usize) -> bool { hint_present(cpu, HINT_SPAWN) }
+
+/// The CPU's policy leaf. Release republishes the hint summary.
+pub(super) struct PolicyGuard<'a> {
+    inner: RawDispatchGuard<'a>,
+    cpu: usize,
+}
+impl core::ops::Deref for PolicyGuard<'_> {
+    type Target = CpuDispatchPolicy;
+    fn deref(&self) -> &CpuDispatchPolicy { &self.inner }
+}
+impl core::ops::DerefMut for PolicyGuard<'_> {
+    fn deref_mut(&mut self) -> &mut CpuDispatchPolicy { &mut self.inner }
+}
+impl Drop for PolicyGuard<'_> {
+    fn drop(&mut self) {
+        let policy: &CpuDispatchPolicy = &self.inner;
+        let bits = u8::from(policy.next_pick_hint.is_some()) * HINT_NEXT
+            | u8::from(policy.latency_pick_hint_len != 0) * HINT_LATENCY
+            | u8::from(policy.spawn_pick_hints.front().is_some()) * HINT_SPAWN;
+        if let Some(summary) = HINTS_PRESENT.get(self.cpu) {
+            // ORDERING: release publishes the queues' state, written under the
+            // leaf this guard still holds, before the summary advertises it.
+            summary.store(bits, Ordering::Release);
+        }
+    }
+}
+
+/// `ready_validation_turn` is dispatch-owned: only the CPU's own dispatcher
+/// advances it, so it is a plain per-CPU byte, not policy-leaf state.
+static READY_VALIDATION_TURN: [AtomicU8; MAX_TRACKED_CPUS] =
+    [const { AtomicU8::new(0) }; MAX_TRACKED_CPUS];
+
+/// Advance this CPU's ready-validation counter; true when a sweep is due.
+pub(super) fn ready_validation_due(cpu: usize, interval: u8) -> bool {
+    let next = READY_VALIDATION_TURN[cpu].load(Ordering::Relaxed).saturating_add(1);
+    let due = next >= interval;
+    READY_VALIDATION_TURN[cpu].store(if due { 0 } else { next }, Ordering::Relaxed);
+    due
+}
 
 // Production FIFO and admission policy belong to the destination CPU, not
 // to the lifecycle catalog. The host fixture keeps isolated policy arrays in
@@ -133,13 +200,14 @@ pub(super) type CpuDispatchGuard<'a> =
 static CPU_DISPATCH_POLICY: [CpuDispatchLock; MAX_TRACKED_CPUS] =
     [const { CpuDispatchLock::new(CpuDispatchPolicy::new()) }; MAX_TRACKED_CPUS];
 
-pub(super) fn lock(cpu: usize) -> CpuDispatchGuard<'static> {
-    CPU_DISPATCH_POLICY[cpu].lock()
+pub(super) fn lock(cpu: usize) -> PolicyGuard<'static> {
+    PolicyGuard { inner: CPU_DISPATCH_POLICY[cpu].lock(), cpu }
 }
 
 pub(super) fn reset() {
-    for policy in &CPU_DISPATCH_POLICY {
-        *policy.lock() = CpuDispatchPolicy::new();
+    for cpu in 0..MAX_TRACKED_CPUS {
+        *lock(cpu) = CpuDispatchPolicy::new();
+        READY_VALIDATION_TURN[cpu].store(0, Ordering::Relaxed);
     }
 }
 
@@ -201,7 +269,6 @@ pub(super) struct CpuDispatchPolicy {
     pub(super) atomic_activation_pick_hints:
         SlotHandoffQueue<MAX_ATOMIC_ACTIVATION_HANDOFFS, FirstTurnHandoff>,
     pub(super) atomic_activation_handoff_remaining: usize,
-    pub(super) ready_validation_turn: u8,
 }
 
 impl CpuDispatchPolicy {
@@ -214,7 +281,6 @@ impl CpuDispatchPolicy {
             spawn_pick_hints: SlotHandoffQueue::new(),
             atomic_activation_pick_hints: SlotHandoffQueue::new(),
             atomic_activation_handoff_remaining: 0,
-            ready_validation_turn: 0,
         }
     }
 }

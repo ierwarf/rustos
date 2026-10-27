@@ -77,6 +77,7 @@ pub(super) fn initialize_owners(image: &InitialCpu<'_>, pit: u16) {
     super::super::sync_handoff::reset_all_cpus();
     super::super::donation_ledger::reset();
     super::super::runtime_profile::owner::reset_before_boot();
+    super::super::pending_reply::reset();
     super::super::boot_execution::publish_tick(pit);
 }
 

@@ -233,9 +233,9 @@ impl<'a> DispatchFrame<'a> {
 
     pub(super) fn prepare(self) -> Option<FundedFrame<'a>> {
         let _phase = super::runtime_profile::phase_scope(super::SchedulerPhase::ClaimFunding);
-        if !self.is_current() {
-            return None;
-        }
+        // `from_selection` and `capture_selected` proved `is_current` on this
+        // very frame with nothing between them and here; only funding
+        // preparation can interleave, so the check follows it.
         let previous = super::return_architecture::ArchitectureState::original(self.turn)?;
         let funding = scheduling_context::dispatch::prepare_grant(self.token.slot, self.cpu)?;
         if funding.task_id != self.id || !self.is_current() {

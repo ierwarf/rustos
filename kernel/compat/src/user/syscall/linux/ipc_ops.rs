@@ -272,6 +272,18 @@ pub(super) fn is_linux_rustos_ipc_syscall(syscall_number: u64) -> bool {
     )
 }
 
+/// Syscalls whose blocking receive carries a reply an unfused `REPLY` left deferred.
+/// Every other syscall settles it (wakes the caller) before its body runs.
+pub(super) fn consumes_deferred_fast_reply(number: u64) -> bool {
+    matches!(
+        number,
+        rustos_user_abi::syscall::SYS_RUSTOS_IPC_REGISTER_RECV
+            | linux_abi::SYS_RUSTOS_IPC_RECV
+            | linux_abi::SYS_RUSTOS_IPC_RECV_WITH_SENDER
+            | linux_abi::SYS_RUSTOS_IPC_RECV_WITH_SENDER_BOUNDED
+    )
+}
+
 pub(super) fn dispatch_register_ipc(
     frame: &mut SyscallFrame, entry: Option<registers::EntryIdentity>,
 ) -> u64 {
@@ -1381,12 +1393,10 @@ fn syscall_linux_rustos_ipc_call_with_timeout(
         reply_capacity
     );
     let mut cycle_mark = phase_mark();
-    // The first live fast-path tranche covers the ordinary synchronous ABI.
-    // Bounded control calls retain the mature slow-path deadline transaction
-    // until the fixed-frame path carries the same pinned-mm/deadline proof;
-    // silently weakening that contract during boot is not an optimization.
+    let call_deadline = service_ipc_deadline_tick_after(timeout_ms);
+    // Bounded and ordinary calls use the same retained-MM validation and
+    // absolute-deadline wait. A shorter budget is not a transport restriction.
     if IPC_FAST_CALL_LIVE
-        && timeout_ms == SERVICE_IPC_TIMEOUT_MS
         && let Ok(request_len) = usize::try_from(request_len)
         && request_len <= kernel_ipc_runtime::api::IPC_FAST_INLINE_BYTES
     {
@@ -1398,6 +1408,7 @@ fn syscall_linux_rustos_ipc_call_with_timeout(
             reply_ptr,
             reply_capacity,
             timeout_ms,
+            call_deadline,
             &retained_mm,
             authorized_service_id,
         ) {
@@ -1426,7 +1437,10 @@ fn syscall_linux_rustos_ipc_call_with_timeout(
         authorized_service_id,
         request.as_slice(),
         timeout_ms,
-    );
+    ).min(call_deadline);
+    if reply_deadline_expired(reply_deadline) {
+        return linux_errno(LINUX_ETIMEDOUT);
+    }
     cycle_mark = charge_phase(IpcCallPhase::EnqueueDeadline, cycle_mark);
     let reply = match enqueue_call_and_wake(endpoint, request.as_slice()) {
         Ok(reply) => reply,
@@ -1485,6 +1499,7 @@ fn try_fast_ipc_call(
     reply_ptr: u64,
     reply_capacity: u64,
     timeout_ms: u64,
+    call_deadline: u64,
     retained_mm: &multitask::RetainedCurrentUserAddressSpace,
     authorized_service_id: Option<u64>,
 ) -> Result<Option<usize>, i64> {
@@ -1516,8 +1531,9 @@ fn try_fast_ipc_call(
             retained_mm.thread_id(),
             request,
             reply_capacity,
-            timeout_ms,
-            authorized_service_id,
+            service_reply_deadline_tick_for_authorized_service(
+                authorized_service_id, request, timeout_ms,
+            ).min(call_deadline),
             None,
         )?
     else {
@@ -1541,8 +1557,7 @@ fn try_fast_ipc_call_bytes<const N: usize>(
     task_id: u64,
     request: &[u8],
     reply_capacity: usize,
-    timeout_ms: u64,
-    authorized_service_id: Option<u64>,
+    deadline_tick: u64,
     direct_frame: Option<*mut SyscallFrame>,
 ) -> Result<Option<FastCallResponse<N>>, i64> {
     if request.len() > kernel_ipc_runtime::api::IPC_FAST_INLINE_BYTES
@@ -1552,15 +1567,9 @@ fn try_fast_ipc_call_bytes<const N: usize>(
         return Ok(None);
     }
     let mut fast_mark = phase_mark();
-    let deadline_tick = service_reply_deadline_tick_for_authorized_service(
-        authorized_service_id,
-        request,
-        timeout_ms,
-    );
-    // A deadline measured from now (no authorized service) lies at least one tick
-    // ahead of the clock it was read from, so only a service-supplied absolute
-    // instant can already have passed.
-    if authorized_service_id.is_some() && reply_deadline_expired(deadline_tick) {
+    // The deadline is fixed before transport selection, including rollback and
+    // queued fallback. Neither a provider restart nor admission retries renew it.
+    if reply_deadline_expired(deadline_tick) {
         return Err(LINUX_ETIMEDOUT);
     }
     fast_mark = charge_phase(IpcCallPhase::FastDeadline, fast_mark);
@@ -1659,105 +1668,173 @@ fn try_fast_ipc_call_bytes<const N: usize>(
         note_fast_ipc(IpcFastCounter::HandoffCommitted);
     }
 
-    fast_call_collect_response::<N>(reply, task_id, deadline_tick, reply_capacity, fast_mark)
+    collect_inline_reply::<N>(
+        reply, task_id, deadline_tick, reply_capacity, fast_mark,
+        InlineReplyTransport::Rendezvous, direct_frame,
+    ).map(Some)
 }
 
-/// The wait for a committed fast call's response: take it, or re-arm and block
-/// until it (or a terminal error, or the deadline) arrives. Shared by the call
-/// that blocked in place and by the resume entry of one that blocked through the
-/// direct schedule, so both finish through the same deadline and cancel rules.
-fn fast_call_collect_response<const N: usize>(
+#[derive(Clone, Copy)]
+enum InlineReplyTransport {
+    Rendezvous,
+    Queued,
+}
+
+/// Representation-specific take only; both transports share the deadline,
+/// arm/recheck, cancellation and direct-park protocol below. Queued descriptor
+/// rejection and ledger settlement stay with the existing owning transaction.
+fn take_inline_reply<const N: usize>(
+    reply: KernelReplyHandle,
+    task_id: u64,
+    reply_capacity: usize,
+    transport: InlineReplyTransport,
+) -> Result<Option<FastCallResponse<N>>, i64> {
+    let response = match transport {
+        InlineReplyTransport::Rendezvous => {
+            match kernel_ipc_runtime::api::endpoint::take_fast_response_inline::<N>(reply, task_id)
+                .map_err(ipc_error_to_linux_errno)?
+            {
+                kernel_ipc_runtime::api::FastEndpointResponseTake::Pending => return Ok(None),
+                kernel_ipc_runtime::api::FastEndpointResponseTake::Error(error) => {
+                    note_fast_ipc(IpcFastCounter::CallerTerminalError);
+                    return Err(ipc_error_to_linux_errno(error));
+                }
+                kernel_ipc_runtime::api::FastEndpointResponseTake::Response {
+                    response_len, response,
+                } => FastCallResponse { len: response_len, bytes: response },
+            }
+        }
+        InlineReplyTransport::Queued => {
+            let Some((bytes, handles)) = reply_wait::take_endpoint_response_for_wait(reply, 0)? else {
+                return Ok(None);
+            };
+            debug_assert!(handles.is_empty());
+            copy_inline_reply::<N>(&bytes)?
+        }
+    };
+    if response.len > reply_capacity {
+        return Err(LINUX_EOVERFLOW);
+    }
+    note_fast_ipc(IpcFastCounter::CallerResponse);
+    Ok(Some(response))
+}
+
+fn copy_inline_reply<const N: usize>(bytes: &[u8]) -> Result<FastCallResponse<N>, i64> {
+    if bytes.len() > N {
+        return Err(LINUX_EOVERFLOW);
+    }
+    let mut response = FastCallResponse { len: bytes.len(), bytes: [0; N] };
+    response.bytes[..bytes.len()].copy_from_slice(bytes);
+    Ok(response)
+}
+
+/// The same deadline-observation rule for both transports, independently
+/// witnessed with a clock that advances during the take. Never invoke a take
+/// after visible expiry and never publish bytes observed across expiry.
+fn observe_inline_reply<T>(
+    deadline_tick: u64,
+    mut now: impl FnMut() -> u64,
+    take: impl FnOnce() -> Result<Option<T>, i64>,
+) -> Result<Option<T>, i64> {
+    if now() >= deadline_tick {
+        return Err(LINUX_ETIMEDOUT);
+    }
+    let response = take();
+    if matches!(&response, Ok(Some(_))) && now() >= deadline_tick {
+        Err(LINUX_ETIMEDOUT)
+    } else {
+        response
+    }
+}
+
+/// Common inline reply wait, including queued register calls and spurious
+/// resumes. There are at most two takes per turn. Expiry on either side of a
+/// take wins over publication, exactly as in the handle-bearing wait.
+/// `direct_frame` is register-only; no owned resource may cross its block.
+fn collect_inline_reply<const N: usize>(
     reply: KernelReplyHandle,
     task_id: u64,
     deadline_tick: u64,
     reply_capacity: usize,
     mut fast_mark: u64,
-) -> Result<Option<FastCallResponse<N>>, i64> {
+    transport: InlineReplyTransport,
+    direct_frame: Option<*mut SyscallFrame>,
+) -> Result<FastCallResponse<N>, i64> {
+    if let Some(frame) = direct_frame {
+        // SAFETY: register entry/resume owns the live syscall frame. Only this
+        // scalar record survives a direct block, including a spurious resume.
+        unsafe {
+            crate::user::syscall::register_ipc_park_record(frame).write(
+                crate::user::syscall::ParkRecord {
+                    kind: match transport {
+                        InlineReplyTransport::Rendezvous => crate::user::syscall::park_kind::CALL,
+                        InlineReplyTransport::Queued => crate::user::syscall::park_kind::CALL_QUEUED,
+                    },
+                    endpoint: 0,
+                    reply: reply.raw(),
+                    deadline_tick,
+                },
+            );
+        }
+    }
     loop {
-        let response =
-            match kernel_ipc_runtime::api::endpoint::take_fast_response_inline::<N>(reply, task_id)
-            {
-                Ok(response) => response,
-                Err(error) => {
-                    cancel_reply_wait(reply, task_id, ReplyCancelReason::InvalidCommit);
-                    return Err(ipc_error_to_linux_errno(error));
-                }
-            };
-        fast_mark = charge_phase(IpcCallPhase::FastTake, fast_mark);
-        match response {
-            kernel_ipc_runtime::api::FastEndpointResponseTake::Response {
-                response_len,
-                response,
-            } => {
-                note_fast_ipc(IpcFastCounter::CallerResponse);
-                if response_len > reply_capacity {
-                    return Err(LINUX_EOVERFLOW);
-                }
-                return Ok(Some(FastCallResponse {
-                    len: response_len,
-                    bytes: response,
-                }));
-            }
-            kernel_ipc_runtime::api::FastEndpointResponseTake::Error(error) => {
-                note_fast_ipc(IpcFastCounter::CallerTerminalError);
-                return Err(ipc_error_to_linux_errno(error));
-            }
-            kernel_ipc_runtime::api::FastEndpointResponseTake::Pending => {}
-        }
-        if reply_deadline_expired(deadline_tick) {
-            note_fast_ipc(IpcFastCounter::CallerDeadline);
-            cancel_reply_wait(reply, task_id, ReplyCancelReason::DeadlineAfterArm);
-            return Err(LINUX_ETIMEDOUT);
-        }
-        if !multitask::arm_block_current_task_on_reply(reply.raw()) {
-            cancel_reply_wait(reply, task_id, ReplyCancelReason::InvalidArm);
-            return Err(LINUX_EINVAL);
-        }
-        if !arm_reply_deadline_waiter(task_id, deadline_tick) {
-            let _ = multitask::cancel_block_current_task();
-            multitask::yield_now();
-            continue;
-        }
-        let response =
-            match kernel_ipc_runtime::api::endpoint::take_fast_response_inline::<N>(reply, task_id)
-            {
-                Ok(response) => response,
-                Err(error) => {
+        for armed in [false, true] {
+            let take = observe_inline_reply(deadline_tick, crate::arch::rtc::ticks, || {
+                let response = take_inline_reply::<N>(reply, task_id, reply_capacity, transport);
+                fast_mark = charge_phase(IpcCallPhase::FastTake, fast_mark);
+                response
+            });
+            match take {
+                Ok(None) => {}
+                result => {
                     disarm_reply_deadline_waiter(task_id);
+                    if armed {
+                        let _ = multitask::cancel_block_current_task();
+                    }
+                    if let Err(errno) = result {
+                        let reason = if errno == LINUX_ETIMEDOUT {
+                            note_fast_ipc(IpcFastCounter::CallerDeadline);
+                            ReplyCancelReason::DeadlineAfterArm
+                        } else if errno == LINUX_EOVERFLOW {
+                            ReplyCancelReason::TransferCapacity
+                        } else {
+                            ReplyCancelReason::InvalidCommit
+                        };
+                        cancel_reply_wait(reply, task_id, reason);
+                        return Err(errno);
+                    }
+                    return result.map(|response| response.expect("terminal inline take"));
+                }
+            }
+            if !armed {
+                if !multitask::arm_block_current_task_on_reply(reply.raw()) {
+                    cancel_reply_wait(reply, task_id, ReplyCancelReason::InvalidArm);
+                    return Err(LINUX_EINVAL);
+                }
+                if !arm_reply_deadline_waiter(task_id, deadline_tick) {
                     let _ = multitask::cancel_block_current_task();
+                    multitask::yield_now();
+                    break;
+                }
+            } else {
+                let committed = match direct_frame {
+                    // SAFETY: only register entry/resume supplies a frame. Its
+                    // park record already carries reply/transport/deadline;
+                    // all take results and their Vecs were dropped above.
+                    Some(frame) => unsafe {
+                        multitask::commit_block_current_task_direct(
+                            crate::user::syscall::fast_ipc_parked_resume_address(),
+                            crate::user::syscall::register_ipc_frame_address(&*frame),
+                        )
+                    },
+                    None => multitask::commit_block_current_task_and_yield(),
+                };
+                disarm_reply_deadline_waiter(task_id);
+                if committed.is_none() {
                     cancel_reply_wait(reply, task_id, ReplyCancelReason::InvalidCommit);
-                    return Err(ipc_error_to_linux_errno(error));
+                    return Err(LINUX_EINVAL);
                 }
-            };
-        match response {
-            kernel_ipc_runtime::api::FastEndpointResponseTake::Pending => {}
-            kernel_ipc_runtime::api::FastEndpointResponseTake::Response {
-                response_len,
-                response,
-            } => {
-                note_fast_ipc(IpcFastCounter::CallerResponse);
-                disarm_reply_deadline_waiter(task_id);
-                let _ = multitask::cancel_block_current_task();
-                if response_len > reply_capacity {
-                    return Err(LINUX_EOVERFLOW);
-                }
-                return Ok(Some(FastCallResponse {
-                    len: response_len,
-                    bytes: response,
-                }));
             }
-            kernel_ipc_runtime::api::FastEndpointResponseTake::Error(error) => {
-                note_fast_ipc(IpcFastCounter::CallerTerminalError);
-                disarm_reply_deadline_waiter(task_id);
-                let _ = multitask::cancel_block_current_task();
-                return Err(ipc_error_to_linux_errno(error));
-            }
-        }
-        let committed = multitask::commit_block_current_task_and_yield();
-        disarm_reply_deadline_waiter(task_id);
-        if committed.is_none() {
-            cancel_reply_wait(reply, task_id, ReplyCancelReason::InvalidCommit);
-            return Err(LINUX_EINVAL);
         }
     }
 }
@@ -1795,7 +1872,11 @@ unsafe fn park_register_recv(frame: *mut SyscallFrame, endpoint: u64) {
     unsafe {
         crate::user::syscall::register_ipc_park_record(frame).write(
             crate::user::syscall::ParkRecord {
-                kind: crate::user::syscall::park_kind::RECV,
+                kind: if (*frame).rax == rustos_user_abi::syscall::SYS_RUSTOS_IPC_REGISTER_REPLY_RECV {
+                    crate::user::syscall::park_kind::RECV
+                } else {
+                    crate::user::syscall::park_kind::RECV_INITIAL
+                },
                 endpoint,
                 reply: 0,
                 deadline_tick: 0,
@@ -2233,6 +2314,14 @@ fn recv_with_sender_blocking_prepared_inner<const N: usize>(
 ) -> Result<(usize, bool), (i64, bool)> {
     use kernel_ipc_runtime::api::endpoint::EndpointReceive;
 
+    // An unfused `REPLY` left its caller wake for this task's next receive: it rides
+    // this receive's block exactly as a fused `REPLY_RECV`'s reply does.
+    if deferred_fast_reply.is_none()
+        && let Some((reply, completion)) = multitask::take_deferred_fast_ipc_reply()
+    {
+        deferred_fast_reply = Some(fast_reply::DeferredFastReply::new(reply, completion));
+    }
+
     let mut yielded = false;
     let take_mark = server_phase_mark();
     loop {
@@ -2322,8 +2411,24 @@ fn recv_with_sender_blocking_prepared_inner<const N: usize>(
                         }
                     }
                     (Some(deferred), _) => deferred.commit_block_and_yield(),
+                    (None, ReceiveDestination::Registers(frame)) => {
+                        assert!(deadline_tick.is_none(), "register receive park needs an unbounded receive");
+                        let frame = core::ptr::from_ref::<SyscallFrame>(frame).cast_mut();
+                        // SAFETY: register receive owns only scalar state here;
+                        // the same record completes initial and spurious parks.
+                        unsafe {
+                            park_register_recv(frame, endpoint.raw());
+                            multitask::commit_block_current_task_direct(
+                                crate::user::syscall::fast_ipc_parked_resume_address(),
+                                crate::user::syscall::register_ipc_frame_address(&*frame),
+                            )
+                        }
+                    }
                     (None, _) => multitask::commit_block_current_task_and_yield(),
                 };
+                // The commit consumed (or immediately settled) the deferred
+                // reply. A wake-before-commit retry must not consume it twice.
+                deferred_fast_reply = None;
                 if deadline_tick.is_some() {
                     crate::arch::rtc::disarm_sleep_waiter(task_id);
                     // A sender that woke this task already popped it from the
@@ -2529,10 +2634,7 @@ pub(super) fn syscall_linux_rustos_ipc_reply(
             Ok(published) => {
                 note_fast_ipc(IpcFastCounter::ReplyPublished);
                 let wake_mark = charge_server_phase(IpcServerPhase::ReplyPublish, publish_mark);
-                if multitask::complete_fast_ipc_reply_wake_handoff_with_custody(
-                    reply,
-                    published.completion,
-                ) {
+                if multitask::publish_fast_ipc_reply(reply, published.completion) {
                     multitask::request_deferred_reschedule();
                 }
                 let _ = charge_server_phase(IpcServerPhase::ReplyWake, wake_mark);
@@ -2560,10 +2662,7 @@ pub(super) fn syscall_linux_rustos_ipc_reply(
             Ok(published) => {
                 note_fast_ipc(IpcFastCounter::ReplyPublished);
                 let wake_mark = charge_server_phase(IpcServerPhase::ReplyPublish, publish_mark);
-                if multitask::complete_fast_ipc_reply_wake_handoff_with_custody(
-                    reply,
-                    published.completion,
-                ) {
+                if multitask::publish_fast_ipc_reply(reply, published.completion) {
                     multitask::request_deferred_reschedule();
                 }
                 let _ = charge_server_phase(IpcServerPhase::ReplyWake, wake_mark);
@@ -2599,7 +2698,7 @@ pub(super) fn syscall_linux_rustos_ipc_reply(
     // Direct hand-back to the caller: the service is about to wait on its
     // endpoint again, so donate the remaining quantum to the original caller
     // instead of round-robining away from a freshly-completed reply.
-    let handoff = multitask::complete_ipc_reply_wake_handoff_with_custody(reply, completion);
+    let handoff = multitask::publish_ipc_reply(reply, completion);
     if handoff {
         // The common syscall tail consumes this request with IF enabled. The
         // shared synchronous IPC FIFO is burst-bounded, so direct hand-back
@@ -2953,8 +3052,9 @@ pub(super) fn call_linux_syscall_fast_endpoint(
             caller_task_id,
             request,
             response_capacity,
-            SERVICE_IPC_TIMEOUT_MS,
-            Some(linux_abi::IPC_SERVICE_LINUX_SYSCALLD),
+            service_reply_deadline_tick_for_authorized_service(
+                Some(linux_abi::IPC_SERVICE_LINUX_SYSCALLD), request, SERVICE_IPC_TIMEOUT_MS,
+            ),
             None,
         )?
     {
@@ -3200,7 +3300,6 @@ fn enqueue_call_and_wake_with_handles_for_task(
     let admission = ipc_call_admission::reserve(task_id)?;
     let priority = admission.priority;
     let scheduling_context = admission.scheduling_context;
-    let donation_required = admission.donation_required;
     let enqueue_mark = phase_mark();
     let (reply, receiver_to_wake) =
         match kernel_ipc_runtime::api::enqueue_endpoint_call_with_handles_priority_and_custody(
@@ -3213,9 +3312,7 @@ fn enqueue_call_and_wake_with_handles_for_task(
         ) {
             Ok(enqueued) => enqueued,
             Err(error) => {
-                if donation_required {
-                    let _ = multitask::cancel_ipc_priority_reservation(task_id);
-                }
+                let _ = multitask::cancel_ipc_priority_reservation(task_id);
                 return Err(ipc_error_to_linux_errno(error));
             }
         };
@@ -3230,9 +3327,8 @@ fn enqueue_call_and_wake_with_handles_for_task(
     // soon as publication returns. A process worker can dequeue on another
     // CPU before this sender reaches its wake transaction; reply ownership
     // makes that race idempotent and gives cancellation an exact edge.
-    let mut donation_admitted =
-        !donation_required || multitask::attach_reserved_ipc_priority(reply.raw(), task_id);
-    if receiver_to_wake.is_none() && donation_required {
+    let mut donation_admitted = multitask::attach_reserved_ipc_priority(reply.raw(), task_id);
+    if receiver_to_wake.is_none() {
         // No receiver is parked, so no concrete worker owns this request yet.
         // Keep custody AwaitingReceiver on the reply; selecting an arbitrary
         // runnable process worker here could bind caller budget to a worker

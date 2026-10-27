@@ -1,8 +1,10 @@
 # IPC lane: resident same-CPU synchronous call/reply switch
 
 [Contract index](../performance-hardening.md). Owner: `kernel/ps` scheduler
-(`scheduler/ipc_lane*`, `scheduler/resident.rs`). Status: design of record;
-phases below land one at a time and each leaves the tree shippable.
+(`scheduler/ipc_lane*`, `scheduler/resident.rs`). Status: implemented mechanism
+with dated phase history. The current queued-only result and unresolved SMP
+measurement failures are recorded below; historical targets are not achieved
+performance guarantees.
 
 ## Why a lane
 
@@ -25,32 +27,32 @@ queueing: the TCB, not the run queue, is the truth). The lane adopts exactly
 that shape on RustOS custody rules. Target: Fiasco.OC class (<= ~3-4k) as the
 end state; each phase is measured and reported, none is promised.
 
-## Architecture (final form)
+## Implemented mechanism
 
 1. **Resident blocked IPC tasks.** A task that blocks in an endpoint receive
    or reply wait on a CPU keeps its CPU-bank loans (allocation pin and
-   execution permit, later placement grant) parked in `RESIDENT[slot]` instead
+   execution permit and placement grant) parked in its resident cell instead
    of releasing them at the RSP ACK. Residency is one bit in the owner word
    (`resident`, valid only for `Blocked`/`DirectHandoff`). Every owner CAS that
    clears the bit evicts (drops) the cell inside `RunOwnerWord::compare_exchange`,
    so wake, terminal, migration and every legacy claim stay correct without
    edits; only the lane's `compare_exchange_taking` takes the loans. Flows that
    need quiescence (pins == 0) call `resident::evict(slot)` first.
-2. **Lane trap.** A dedicated software-interrupt vector and stub run
-   `ipc_lane_dispatch` with IRQs masked and no `CpuDispatchTurn`. It either
-   switches C -> S (returns S's saved RSP) or declines (returns C's own frame
-   with an outcome code in RAX, exactly like `stamp_fast_ipc_call_outcome`) so
-   the unchanged syscall slowpath continues. All fallible checks precede the
-   single point of no return (the CAS of S to Running); after it only
-   infallible moves remain.
-3. **Preconditions (all cheap, lock-free).** Same CPU; S resident on this CPU
+2. **Shared schedule boundary.** With IRQs masked,
+   `software_schedule_interrupt_dispatch` attempts `ipc_lane::{call,reply}`
+   before opening a `CpuDispatchTurn`. `Switched` returns the peer's saved RSP;
+   `Declined` leaves the handoff to the ordinary producer. Once donation/wait
+   publication commits, a later refusal is `Generic`: ordinary dispatch finishes
+   that same transaction, never a rollback-and-replay of the request. Direct
+   register stubs use this same handler and the common parked-resume tail.
+3. **Preconditions.** Same CPU; S resident on this CPU
    and waiting on exactly this endpoint/reply; no older sync FIFO work, no
    activation prefix, chain not owed to a fair competitor (the DirectSwitch
    admission already shipped); both published lifecycles dispatchable; affinity
    admits the CPU with no migration pending; class publication sequence even;
    inline message; S's effective funding stamp equals C's; budget available
    after charging C's elapsed time.
-4. **Effects at the point of no return.** C: Running -> Blocked(resident)
+4. **Committed lane switch.** C: Running -> Blocked(resident)
    (frame published, wait committed). S: Blocked(resident) -> Running via the
    taking CAS; banks move cell -> Current, Current -> cell; interval: the one
    FundingPin shuttles (charge in place, relabel the reply token, no
@@ -63,11 +65,114 @@ end state; each phase is measured and reported, none is promised.
    snapshot (owner words, banks, interval, Current/Transition, installed
    placement, frame publication, ledger).
 
-## Non-goals
+## Original lane scope (historical)
 
-No change to capabilities, the ring-3 service model, endpoint semantics, the
-slow/cross-CPU/handle-bearing/oversized paths, or the 8-turn fairness bound.
-Policy stays in userspace services.
+The original lane left slow/cross-CPU/handle-bearing/oversized transport
+unchanged. The convergence work below subsequently shares byte-only continuation
+and reply settlement. Capabilities, endpoint semantics, the 8-turn fairness
+bound and policy ownership in ring3 services remain unchanged.
+
+## Queued/rendezvous convergence (2026-10-27)
+
+The original scope above is not a claim that today's slowpath is untouched. The current byte-only
+call/receive implementation additionally shares:
+
+- Bounded buffer CALL admission with ordinary inline calls; one absolute budget
+  is capped across the attempted rendezvous and queued fallback. Both sides of
+  response observation enforce expiry, including the fixed-frame transport.
+- `collect_inline_reply` for register CALLs, regardless of transport. Only take
+  and queued ledger/descriptor cleanup remain representation-specific. Queued
+  message storage still owns a Vec; this does not claim allocation-free queuing.
+- `ipc_wait_direct_schedule` / the existing direct-resume tail for queued CALL,
+  initial RECV and spurious re-parks. It uses a neutral scheduler discriminator,
+  never a fabricated peer or bypassed owner claim. Initial RECV error partition
+  is recorded separately from reply-committed RECV.
+- Deferred completion fused into receive for queued and rendezvous byte-only
+  REPLY_RECV (buffer and register). The separate eager-wake receive helper is
+  removed. Inline queued buffer replies reuse their admitted snapshot, avoiding
+  a second copy and temporary Vec. Wake-before-commit consumes the deferred
+  completion once even when the receive retries.
+
+The constant-true `CallSchedulingAdmission::donation_required` and its dead
+non-donating branches are removed. Donation remains mandatory. Own-funded call
+admission already uses lazy reservation; asynchronous queue attachment still
+materializes it under the existing lifetime contract. Queue/message/reply
+objects and remote wake/IPI paths remain live and must not be deleted.
+
+External source comparison: seL4 [`fastpath.c`](https://github.com/seL4/seL4/blob/master/src/fastpath/fastpath.c)
+checks affinity and fallible conditions before its point of no return;
+[`possibleSwitchTo`](https://github.com/seL4/seL4/blob/master/src/kernel/thread.c)
+defers queueing on the local direct candidate but enqueues other-affinity or
+competing candidates. This supports common continuation/custody, not unsafe
+cross-CPU direct execution or eliminating the genuine queued case.
+
+Validation: compat 198, HAL 81, PS 986 and IPC runtime 81 native tests; all 60
+selected now commands; 1349 source witnesses; 4/4 focused implementation mutants;
+full PR (45 artifacts) and SMP iteration (26 artifacts), sealed successfully.
+Signed dual-guest benchmark boots with authenticated DVM input relay passed at
+1 and 8 RustOS vCPUs; register preflight exercises a deliberately queued first
+call, mixed buffer/register peers and the physical FP/data contract.
+
+| Probe | vCPU | samples | p50 ticks | p99 ticks | CPUID p50 |
+|---|---:|---:|---:|---:|---:|
+| buffer control before | 1 | 20,000 | 7760 | 16160 | 4480 |
+| buffer after | 1 | 20,000 | 7840 | 8440 | 4480 |
+| register after | 1 | 20,000 | 5160 | 5720 | 4480 |
+| register after | 8 | 20,000 | 6000 | 9560 | 4480 |
+
+Buffer p50 is +1.03%, not a speedup; tails are retained, not normalized away.
+There is no matched queued-only before/after cohort or register-before cohort here, so
+neither a queued 40k-to-fast improvement nor a register speedup is claimed.
+Artifacts: `build/bench-core/ipc_rt_intra_process_reply_recv-vcpu-1-1793081971517604780`,
+`ipc_rt_intra_process_register_reply_recv-vcpu-1-1793081986558796363` and
+`ipc_rt_intra_process_register_reply_recv-vcpu-8-1793082001400114565` under the same
+root. The earlier `1793081320243538315` run overlapped build validation and failed
+source/linked-ELF freshness; it is retained as invalid evidence.
+
+### Measuring the current queued slowpath alone
+
+`cargo xtask bench --rustos-vcpus 1 --isolate-probe ipc_rt_intra_process_queued_reply_recv`
+(and the same command with 8 vCPUs) measures the existing byte-only queued path
+without disabling or editing the kernel. It keeps the 16-byte request/echo,
+2,000 warmups, 20,000 timed round trips and fused reply/receive server. Only the
+advertised reply capacity is 272 bytes, backed by a real padded response object;
+that exceeds the 256-byte fast response frame and deterministically rejects
+rendezvous admission before publication on every CALL. An exact echo, STOP,
+join and untouched-tail proof precede the primary result. The native witness
+pins this admission condition and the actual runtime limit. This is the buffer
+queued case, not a register queued call, a large-payload test or cross-process IPC.
+
+Current-state capture (2026-10-27): the 1-vCPU shipping run completed all 20,000
+samples, exact echo/STOP/join and untouched-tail proofs, authenticated dual-guest
+readiness and `ipcbench: end`. Every diagnostic profile is off in its metadata;
+source/linked/staged ELF freshness passed. This is not a before/after cohort.
+
+| Metric | invariant-TSC ticks | time |
+|---|---:|---:|
+| p50 | 24,080 | 6.033 us |
+| p90 | 26,520 | 6.645 us |
+| p99 | 36,280 | 9.090 us |
+| observed max | 52,866,240 | 13.246 ms |
+
+The paired request-to-receive leg p50 is 18,760 ticks; reply-to-return is 5,160.
+These are separate distributions, not additive percentiles. CPUID p50 is 4,480
+and calibrated TSC is 3,991,109 kHz. No outliers were removed. The diagnostic
+run is evidence for routing only: admission-attempt, admission-fallback and
+fallback-shape are each 22,001 (2,000 warmups + 20,000 samples + STOP), with no
+reservation-published row. Do not use its instrumented latency as shipping cost.
+
+Artifacts under `build/bench-core/`:
+- shipping: `ipc_rt_intra_process_queued_reply_recv-vcpu-1-1793082845527969983`
+- diagnostic: `ipc_rt_intra_process_queued_reply_recv-vcpu-1-1793082804515142933`
+- failed 8-vCPU attempts: suffixes `1793082860418958897` and
+  `1793083036418419128`; both lacked `ipcbench: end` within 30 seconds, so neither
+  supplies a latency result. The repeat also lacked the wayclick first-frame
+  marker. Both reached the probe's anchors but emitted no queued primary result;
+  the cause remains unresolved. No 8-vCPU number or SMP success is inferred.
+
+Probe validation: ipcbench native 21 tests, all 60 now checks and full PR formal
+(45 sealed artifacts) passed. Kernel product code was unchanged for this
+measurement; only the app probe/isolated selector and this owner record changed.
 
 ## Phases and status (2026-10-21)
 
@@ -132,8 +237,10 @@ Policy stays in userspace services.
   task has no continuation. A declined handoff returns to the caller exactly as
   the trap form does. The lane tail enters a context whose RIP is the registered
   resume entry directly on its frame (`FAST_IPC_RESUME_RIP`), skipping the 31
-  register reloads and the `iretq`. Plain `RECV`, buffer mode and the legacy
-  handlers keep their in-place continuation.
+  register reloads and the `iretq`. At this phase plain `RECV` still kept its
+  in-place continuation; the queued/rendezvous convergence above later extended
+  direct parking to plain register RECV. Buffer and legacy handlers retain
+  their in-place continuation.
   Same-session A/B, 1 vCPU `ipc_rt_intra_process_register_reply_recv` p50: trap form
   7.75k -> direct block 7.65k -> with the resume shortcut 7.24k -> with the lane
   trims (request publication after the lane, masked per-CPU stack/profile writes)
@@ -288,3 +395,50 @@ syscall is ~480 ticks, so entry/exit is not the remaining cost.
   host `perf` profiles misattribute those, so decisions use removal experiments.
   What remains is ~40 protocol steps in the lane switch (owner CAS, frame publication,
   resident park/take, banks), which only a fused switch can cut.
+  Removal experiment (unsafe, reverted): `publish_return`'s run-queue leaf plus its load
+  publication was worth ~120 ticks per round trip. At that intermediate stage,
+  load publication (two locked sequence bumps) was skipped for blocked/refused
+  returns, but the leaf stayed to order frame-generation rebind against a remote
+  wake. Skipping `publish_blocked` altogether did not boot.
+  The subsequent blocked-return change removed that leaf: it binds the frame generation
+  BEFORE its owner CAS (a Running slot's token has no other writer, and after the CAS
+  the return writes nothing), so the ordering the leaf gave against a remote wake's
+  rebind comes from the order of the two writes. 1 vCPU register p50, same session:
+  4880 -> 4800.
+
+## Generic dispatch (`sched_yield`) after P8 (2026-10-27)
+
+The ordinary dispatcher (`saved_user_context_dispatch` -> `dispatcher::dispatch`) was
+profiled with `rdtsc` stage stamps over two same-process threads that only call
+`sched_yield` (temporary probe, not registered). One switch is ~9k stamped ticks (~8.3k
+real, 2 switches + 2 syscalls = 20.4k): `enter`/`save_simd` 0.7k, account 1.4k (interval
+consume 0.5k, budget charge + funding-pin drop 0.8k), frame publish 0.55k, arm checks 0.4k,
+fair scan 0.8k + frame capture 0.45k, claim chain + complete 3.4k, architecture install 1.3k.
+It took 33.7 tracked locks per dispatch (14 of them the Context/Domain budget pair, 8.3
+`TaskStackResources`, 5.1 `SchedulerPolicy`, 3 `SchedulerDiagnostics`). An uncontended tracked
+pair is ~55 ticks here, so locks are ~25% of the switch, not the 134 measured in the
+earlier `f9b497cb` window.
+
+Removed (same-session p50, `sched_yield_pair`): 20360 -> 18480 (-9%), locks 33.7 -> 24.4.
+- The fair-scan winner was admitted twice; `fair` now builds its frame loan with
+  `admitted_local_candidate` (admission stays in `local_candidate` for the other arms).
+- `DispatchFrame::prepare` no longer repeats `is_current` right after `from_selection`; the
+  check after funding preparation and the one inside the claim leaf remain.
+- Account, dispatch and entry-cause rows use the CPU-private batch the lane already had
+  (`lane_account` / `lane_dispatch` / `lane_same_task` / `lane_entry_cause`), folded every 64
+  dispatches instead of one `SchedulerDiagnostics` leaf each.
+- `dispatch_policy::lock` returns a `PolicyGuard` whose release republishes per-CPU
+  next/latency/spawn hint bits; `first_turn`, `latency`, `hint` and
+  `discharge_claimed_first_turn` read them first (a clear bit linearizes before the producer's
+  release; hints are ordering only). The ready-validation counter is a CPU-owned byte.
+- `complete()` reads the published root for its statistic; `ReturnArchitecture::capture`
+  already proves the retained image and the claimed MM activation before any effect (the
+  source-contract pin moved there).
+- A voluntary yield qualifies the yielding task (its budget pair) only when no other
+  candidate exists (`choose_local_next_with`, memoized `current_is_live!`).
+
+Left alone, all 100-400 ticks each and spread across ~20 places: budget pair per admission
+(still 6 pairs: scan, prepare, pin, claim, charge, drop), claim leaf nest, `XRSTOR`, three
+`wrmsr`s (unconditional by design, see `prepare_for_context_return`), frame reader acquire.
+Cutting a further ~40% needs a yield-specific lane (skip the scan and claim chain), a
+separate custody/formal change.

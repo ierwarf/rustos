@@ -160,7 +160,7 @@ impl<'a> CurrentReturn<'a> {
                 ticks_to_ns(start, now_ticks)
             }
         };
-        runtime_profile::owner::local(|row| row.account(self.slot, elapsed));
+        runtime_profile::owner::lane_account(self.cpu, self.slot, elapsed);
         #[cfg(rustos_scheduler_phase_profile)]
         let budget_start = crate::arch::clock::monotonic_nanos();
         if let Some((id, outcome)) = interval.and_then(|interval| {

@@ -88,18 +88,30 @@ error tags remain unchanged. Buffer mode returns only RAX; all register
 payload/metadata outputs are zero on success and failure. It uses the same
 opt-in FP/control-state contract and finalizers as the short mode.
 
+Buffer-mode selection does not imply queued transport: bounded byte-only CALLs
+may attempt the same inline rendezvous as ordinary CALLs. The absolute deadline
+is fixed before transport selection and capped across rollback/fallback; expiry
+before or during response observation wins over returning a response. Register
+CALLs share one inline reply-wait protocol for queued and rendezvous replies,
+including direct syscall-frame parking on initial and spurious waits. Plain
+register RECV also parks directly; its errors remain ordinary errno, while
+REPLY_RECV retains the reply-committed tag. Both queued and rendezvous byte-only
+REPLY_RECV completions carry exact reply/context custody into the same deferred
+settlement-and-receive path. Handle-bearing operations retain their owning
+transfer cleanup; remote peers retain remote wake/IPI scheduling.
+
 The typed `ipc::{call,recv_with_sender,reply,reply_recv_with_sender}` helpers
 select pure registers when the exact shape fits, through
 `libs/rustos-svc-runtime/src/ipc/fastcall.rs`. Receive capacity must be
 **exactly 16**, not merely at most/at least 16: smaller buffers must not consume
 an oversized request; larger buffers promise to accept traffic beyond the short
-image. Other shapes, finite deadlines and handles select buffer slow mode before
-execution. A syscall error or committed reply is never retried in another mode.
+image. Other shapes, finite deadlines and handles select the buffer ABI mode
+before execution; an eligible byte-only call may still use kernel rendezvous. A syscall error or committed reply is never retried in another mode.
 The unsafe typed helpers require their own input/output ranges to remain valid;
 raw syscall helpers retain kernel fault validation of arbitrary user pointers.
 Large protocols are not silently truncated or migrated to a new wire format.
 
-This is the same transport, not a new authority or rendezvous cell. Process
+The register ABI adds no new authority or objectless rendezvous cell. Process
 endpoint authorization, exact reply generation/rights, deadlines/cancellation,
 funding custody, fairness and arm/register/recheck/commit remain unchanged.
 A fast reservation decline rolls back before the existing queued fallback;
@@ -121,8 +133,11 @@ return images are specialized to 16 bytes, rather than copying 256-byte arrays
 through every Rust layer. Exact object-slot transactions, caller/receiver checks,
 receive capacity refusal before consume, terminal response overflow retirement,
 and queued/large-message fallback are shared with the legacy 256-byte API.
-This does not remove the reservation/funding/custody layer (P3), introduce a
-rendezvous cell, or switch directly to a peer user context (P2).
+The scheduler's resident lane and direct syscall-frame resume now switch eligible
+peers without the generic dispatch turn; see [IPC lane](../performance/ipc-lane.md).
+The register image specialization does not itself remove reply objects or the
+reservation/funding/custody layer. Objectless virtual rendezvous and paired-custody
+switching remain [unimplemented design](../performance/ipc-rendezvous.md).
 
 Only these four opt-in syscalls declare all enabled FP/vector **data**
 (x87/MMX/XMM/YMM) caller-clobbered; x87 status/stack state is reset. The entering
@@ -147,7 +162,9 @@ restore entering controls, retire the exact-task marker. Deferred IRET also
 zeros its explicit XMM image before the generic scheduler capture. FNINIT alone
 does not clear physical data. The linked-image audit permits only these named
 custody instructions, not general x87/FP arithmetic. Ordinary syscall data
-preservation is unchanged. P2 direct user-context switching is not implemented.
+preservation is unchanged. Resident lane switches and direct parked-register
+resumes leave through the same finalized syscall return boundary; generic
+saved-user IRET remains available where direct return is not admitted.
 `syscall-simd-lifecycle` distinguishes lane elision, full asynchronous custody,
 marker retirement/rebinding and both finalized return routes.
 

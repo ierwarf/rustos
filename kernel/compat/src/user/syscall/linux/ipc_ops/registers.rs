@@ -160,14 +160,16 @@ fn call(
     let (task_id, identity) = entry_or_current(entry)?;
     let service = authorize_ipc_call_for_process(raw, identity.process_id())?;
     let endpoint = KernelEndpointHandle::from_raw(raw);
+    let deadline = service_reply_deadline_tick_for_authorized_service(
+        service, request, SERVICE_IPC_TIMEOUT_MS,
+    );
     if let Some(response) = try_fast_ipc_call_bytes::<IPC_REGISTER_BYTES>(
         endpoint,
         identity.process_id(),
         task_id,
         request,
         IPC_REGISTER_BYTES,
-        SERVICE_IPC_TIMEOUT_MS,
-        service,
+        deadline,
         // The call may block through the direct schedule: its continuation is
         // this syscall frame plus a park record, see `complete_parked_register_ipc`.
         Some(core::ptr::from_mut::<SyscallFrame>(frame)),
@@ -177,15 +179,15 @@ fn call(
     }
     // A declined reservation was rolled back by the existing helper. Enqueue
     // exactly once; lack of a parked receiver is not an ABI-level failure.
-    let deadline = service_reply_deadline_tick_for_authorized_service(
-        service,
-        request,
-        SERVICE_IPC_TIMEOUT_MS,
-    );
+    if reply_deadline_expired(deadline) {
+        return Err(LINUX_ETIMEDOUT);
+    }
     let reply = enqueue_call_and_wake(endpoint, request)?;
-    let response =
-        wait_for_service_reply_with_deadline_tick(reply, deadline, SERVICE_IPC_TIMEOUT_MS)?;
-    write_register_result(frame, &response, 0, 0, 0).map(|len| len as u64)
+    let response = collect_inline_reply::<IPC_REGISTER_BYTES>(
+        reply, task_id, deadline, IPC_REGISTER_BYTES, phase_mark(),
+        InlineReplyTransport::Queued, Some(core::ptr::from_mut(frame)),
+    )?;
+    write_register_result(frame, &response.bytes[..response.len], 0, 0, 0).map(|len| len as u64)
 }
 
 /// Finish a register `CALL` or `REPLY_RECV` that blocked through the direct
@@ -199,8 +201,8 @@ pub(in crate::user::syscall) fn complete_parked_register_ipc(
 ) -> u64 {
     use crate::user::syscall::park_kind;
     let result = match record.kind {
-        park_kind::CALL => complete_parked_call(frame, record),
-        park_kind::RECV => complete_parked_recv(frame, record),
+        park_kind::CALL | park_kind::CALL_QUEUED => complete_parked_call(frame, record),
+        park_kind::RECV | park_kind::RECV_INITIAL => complete_parked_recv(frame, record),
         other => panic!("parked register IPC resumed with unknown record kind {other}"),
     };
     // `dispatch_linux_syscall` runs this after every syscall body.
@@ -214,16 +216,22 @@ fn complete_parked_call(frame: &mut SyscallFrame, record: &crate::user::syscall:
     let task_id = multitask::current_task_id().expect("parked register call lost its task");
     let reply = KernelReplyHandle::from_raw(record.reply);
     disarm_reply_deadline_waiter(task_id);
-    note_fast_ipc(IpcFastCounter::HandoffCommitted);
-    fast_call_collect_response::<IPC_REGISTER_BYTES>(
+    let transport = if record.kind == crate::user::syscall::park_kind::CALL_QUEUED {
+        InlineReplyTransport::Queued
+    } else {
+        note_fast_ipc(IpcFastCounter::HandoffCommitted);
+        InlineReplyTransport::Rendezvous
+    };
+    collect_inline_reply::<IPC_REGISTER_BYTES>(
         reply,
         task_id,
         record.deadline_tick,
         IPC_REGISTER_BYTES,
         phase_mark(),
+        transport,
+        Some(core::ptr::from_mut(frame)),
     )
     .and_then(|response| {
-        let response = response.expect("committed fast call wait produced no response");
         write_register_result(frame, &response.bytes[..response.len], 0, 0, 0).map(|len| len as u64)
     })
     .unwrap_or_else(linux_errno)
@@ -232,6 +240,13 @@ fn complete_parked_call(frame: &mut SyscallFrame, record: &crate::user::syscall:
 fn complete_parked_recv(frame: &mut SyscallFrame, record: &crate::user::syscall::ParkRecord) -> u64 {
     let task_id = multitask::current_task_id().expect("parked register receive lost its task");
     let endpoint = KernelEndpointHandle::from_raw(record.endpoint);
+    let error = |errno| {
+        if record.kind == crate::user::syscall::park_kind::RECV {
+            ipc_reply_recv::ipc_reply_recv_committed_error(errno)
+        } else {
+            linux_errno(errno)
+        }
+    };
     // Woken by the handoff: the sender's request is already addressed to this
     // task, so take it directly, as the in-place receive loop does first.
     if let Ok(Some(received)) = kernel_ipc_runtime::api::endpoint::take_fast_request_inline::<
@@ -241,7 +256,7 @@ fn complete_parked_recv(frame: &mut SyscallFrame, record: &crate::user::syscall:
         note_fast_ipc(IpcFastCounter::ReceiverTaken);
         return match (ReceiveDestination::Registers(frame)).write_fast(received) {
             Ok(len) => len as u64,
-            Err(errno) => ipc_reply_recv::ipc_reply_recv_committed_error(errno),
+            Err(errno) => error(errno),
         };
     }
     // Anything else (a wake that carried no request) takes the full receive.
@@ -254,7 +269,7 @@ fn complete_parked_recv(frame: &mut SyscallFrame, record: &crate::user::syscall:
         ReceiveDestination::Registers(frame),
     ) {
         Ok((len, _)) => len as u64,
-        Err((errno, _)) => ipc_reply_recv::ipc_reply_recv_committed_error(errno),
+        Err((errno, _)) => error(errno),
     }
 }
 
@@ -300,7 +315,7 @@ fn reply_receive(
     )
     .map_err(ipc_error_to_linux_errno)?;
     let handle = KernelReplyHandle::from_raw(reply);
-    let (deferred, handoff) = match kernel_ipc_runtime::api::endpoint::complete_fast_reply_for_task(
+    let deferred = match kernel_ipc_runtime::api::endpoint::complete_fast_reply_for_task(
         handle, task_id, response,
     ) {
         Ok(published) => {
@@ -311,7 +326,7 @@ fn reply_receive(
                     ipc_error_to_linux_errno(error),
                 ));
             }
-            (Some(deferred), false)
+            deferred
         }
         Err(kernel_ipc_runtime::api::IpcError::InvalidHandle) => {
             let completion =
@@ -321,10 +336,9 @@ fn reply_receive(
                     response,
                 )
                 .map_err(ipc_error_to_linux_errno)?;
-            (
-                None,
-                multitask::complete_ipc_reply_wake_handoff_with_custody(reply, completion),
-            )
+            // Queued calls carry the same exact caller/context custody. Fuse
+            // settlement with receive's park just as for a rendezvous reply.
+            fast_reply::DeferredFastReply::new(reply, completion)
         }
         Err(error) => return Err(ipc_error_to_linux_errno(error)),
     };
@@ -333,15 +347,9 @@ fn reply_receive(
         task_id,
         IPC_REGISTER_BYTES,
         None,
-        deferred,
+        Some(deferred),
         ReceiveDestination::Registers(frame),
     );
-    let yielded = match &result {
-        Ok((_, yielded)) | Err((_, yielded)) => *yielded,
-    };
-    if handoff && !yielded {
-        multitask::request_deferred_reschedule();
-    }
     Ok(match result {
         Ok((len, _)) => len as u64,
         Err((errno, _)) => ipc_reply_recv::ipc_reply_recv_committed_error(errno),
@@ -354,10 +362,7 @@ fn reply_only(raw: u64, response: &[u8], entry: Option<EntryIdentity>) -> Result
     match kernel_ipc_runtime::api::endpoint::complete_fast_reply_for_task(handle, task_id, response)
     {
         Ok(published) => {
-            if multitask::complete_fast_ipc_reply_wake_handoff_with_custody(
-                raw,
-                published.completion,
-            ) {
+            if multitask::publish_fast_ipc_reply(raw, published.completion) {
                 multitask::request_deferred_reschedule();
             }
             published
@@ -372,7 +377,7 @@ fn reply_only(raw: u64, response: &[u8], entry: Option<EntryIdentity>) -> Result
                     response,
                 )
                 .map_err(ipc_error_to_linux_errno)?;
-            if multitask::complete_ipc_reply_wake_handoff_with_custody(raw, completion) {
+            if multitask::publish_ipc_reply(raw, completion) {
                 multitask::request_deferred_reschedule();
             }
             Ok(0)

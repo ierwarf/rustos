@@ -297,6 +297,98 @@ pub fn complete_fast_ipc_reply_wake_handoff_with_custody(
     woken
 }
 
+/// Publish a completed fast reply. The caller's wake is held back to the replier's
+/// next boundary when the caller is parked on this CPU: the replier's own receive
+/// then carries the switch (`take_deferred_fast_ipc_reply`), exactly as the fused
+/// `REPLY_RECV` does inside one syscall. Anywhere else, or when a boundary already
+/// holds one, the caller is woken now and the return value says to reschedule.
+pub fn publish_fast_ipc_reply(
+    reply: u64,
+    completion: kernel_ipc_runtime::api::ReplyCompletion,
+) -> bool {
+    if let Some(replier) = super::current_task_id()
+        && scheduler::pending_reply::stash(replier, reply, completion)
+    {
+        return false;
+    }
+    complete_fast_ipc_reply_wake_handoff_with_custody(reply, completion)
+}
+
+/// [`publish_fast_ipc_reply`] for a reply object that was queued rather than
+/// fast-delivered. Its scheduling-context custody is settled now, in the order the
+/// immediate wake settles it; only the wake itself is deferred.
+pub fn publish_ipc_reply(
+    reply: u64,
+    completion: kernel_ipc_runtime::api::ReplyCompletion,
+) -> bool {
+    let custody = completion
+        .scheduling_context
+        .expect("synchronous IPC reply completed without scheduling-context custody");
+    assert_eq!(
+        custody.caller_task_id(),
+        completion.caller_task_id,
+        "reply returned scheduling-context custody to a different caller"
+    );
+    assert!(
+        settle_terminal_ipc_reply_scheduling_context(reply, custody),
+        "reply returned stale scheduling-context custody"
+    );
+    if let Some(replier) = super::current_task_id()
+        && scheduler::pending_reply::stash(replier, reply, completion)
+    {
+        return false;
+    }
+    complete_ipc_reply_wake_handoff(reply, completion.caller_task_id)
+}
+
+/// The reply this task deferred, for its blocking receive to carry.
+pub fn take_deferred_fast_ipc_reply() -> Option<(u64, kernel_ipc_runtime::api::ReplyCompletion)> {
+    if !scheduler::pending_reply::present() {
+        return None;
+    }
+    scheduler::pending_reply::take_for(super::current_task_id()?)
+}
+
+/// Whether this CPU holds a deferred reply (lock-free; the syscall entry's gate).
+pub fn fast_ipc_reply_deferred() -> bool {
+    scheduler::pending_reply::present()
+}
+
+/// Wake the deferred caller now, as the reply syscall would have, and request the
+/// hand-back reschedule. Idempotent.
+pub fn settle_deferred_fast_ipc_reply() {
+    if let Some((reply, completion)) = scheduler::pending_reply::take_any()
+        && complete_fast_ipc_reply_wake_handoff_with_custody(reply, completion)
+    {
+        crate::multitask::request_deferred_reschedule();
+    }
+}
+
+/// [`settle_deferred_fast_ipc_reply`] at a scheduler entry: the entry's own masked
+/// scope publishes the wake and its dispatcher picks the caller next.
+pub(in crate::multitask) fn settle_deferred_fast_ipc_reply_in(
+    scope: &nucleus_core::util::lockdep::DispatchPreemption<'_>,
+) {
+    let Some((reply, completion)) = scheduler::pending_reply::take_any() else { return };
+    let Some(custody) = completion.scheduling_context else { return };
+    let outcome = scheduler::ipc_publication::reply(
+        scope,
+        reply,
+        completion.caller_task_id,
+        custody.context_owner_task_id(),
+        custody.identity(),
+    )
+    .expect("deferred fast reply returned stale scheduling-context custody");
+    if outcome == scheduler::FastIpcReplyHandoffOutcome::Rejected {
+        record_refused_reply_wake(
+            "ipc-fast-reply-wake-refused",
+            reply,
+            completion.caller_task_id,
+            REPLY_WAIT,
+        );
+    }
+}
+
 /// Withdraws exact reply donation and retains the original wake lifetime loan
 /// through exact per-CPU FIFO publication. No legacy guard or lookup after wake.
 pub fn complete_ipc_reply_wake_handoff(reply: u64, task_id: u64) -> bool {

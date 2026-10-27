@@ -152,6 +152,10 @@ const LINUX_EOVERFLOW: i64 = 75;
 const LINUX_ETIMEDOUT: i64 = 110;
 const MAX_RUSTOS_DEBUG_PRINT_BYTES: usize = 2048;
 
+pub(super) fn consumes_deferred_fast_reply(number: u64) -> bool {
+    ipc_ops::consumes_deferred_fast_reply(number)
+}
+
 /// The register IPC entry of [`dispatch_linux_syscall`] for a call the entry stub's
 /// Linux-ABI gate already admitted: the frame contract was validated by the caller,
 /// the operation is one of the four register operations, and secondary tracing is a

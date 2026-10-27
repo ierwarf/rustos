@@ -1,5 +1,7 @@
 use super::*;
 
+mod inline_reply;
+
 #[test]
 fn public_ipc_calls_share_the_finite_service_deadline() {
     const {

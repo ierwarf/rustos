@@ -113,8 +113,8 @@ the exact current continuation when it is either the sole User task or the
 CPU's published Idle task and there is no local queue/mailbox work, foreign
 runnable load, deferred reschedule, or user-return request. Each checked source
 is independently release/acquire published; a concurrent enqueue still owns a
-directed IPI. This keeps quiescent CPUs off the lifecycle-global catalog lock
-without polling away a real wake or idle-steal opportunity.
+directed IPI. This keeps quiescent CPUs on their local continuation path without
+opening a dispatch turn or polling away a real wake or idle-steal opportunity.
 
 ### 7.1 Dispatch, raw-guard, and CPU-affinity linearization
 
@@ -351,7 +351,9 @@ by seL4 while preserving RustOS sender identity and deadline semantics:
   reply capability remains live;
 - reply completion is the commit point: only a successful one-shot consume may
   release donation, wake the exact caller, and publish its synchronous FIFO
-  handoff;
+  handoff. Queued and rendezvous byte replies carry the same exact completion
+  custody into deferred settlement at the receive block; immediate receive/error
+  settles it without blocking, and a raced block retry cannot consume it twice;
 - the sender-stamped receive half arms the scheduler first, then under one
   endpoint slot guard consumes the exact fast frame or priority-queue head, or
   publishes a bounded receiver waiter. Every non-waiting result cancels the

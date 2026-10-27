@@ -33,11 +33,42 @@ fn publish_return_inner(
     mut before_cas: impl FnMut(usize),
 ) -> ReturnPublication {
     validate_cpu(cpu);
-    let mut rq = RUN_QUEUES[cpu].inner.lock();
+    // A blocked (or refused) return changes no queue membership, so it needs no queue
+    // leaf. The leaf used to order this return's frame-generation rebind against a
+    // remote wake's rebind; binding the generation BEFORE the owner CAS orders them
+    // instead: while the slot is still Running no wake writes its frame token (a wake
+    // of a Running slot only raises its run intent in the owner word), and once the CAS
+    // makes Blocked visible this return writes nothing more. A CAS lost to a raced wake
+    // leaves a token naming a generation no owner word carries, which no reader accepts
+    // and the next bind overwrites.
     loop {
         let observed = owner(slot);
         if observed.state.is_terminal() {
-            RUN_QUEUES[cpu].publish_load(&rq);
+            return ReturnPublication::Terminal;
+        }
+        assert!(
+            observed.state == RunOwnerState::Running && observed.cpu == Some(cpu),
+            "CPU return lacks original Running custody slot={slot} owner={observed:?} cpu={cpu}"
+        );
+        if observed.runnable && allow_local {
+            break;
+        }
+        let next = observed.next_preserving_wait(RunOwnerState::Blocked, None);
+        frame_publication::bind_local_owner_generation(slot, next.generation);
+        before_cas(slot);
+        if OWNER_WORDS[slot].compare_exchange(observed, next).is_ok() {
+            return ReturnPublication::Blocked {
+                was_runnable: observed.runnable,
+            };
+        }
+    }
+    let mut rq = RUN_QUEUES[cpu].inner.lock();
+    loop {
+        let observed = owner(slot);
+        // The published bitmap and load describe queue membership. Only a local
+        // insert (or its rollback) changes it, so the refusal and blocked returns
+        // below leave the publication, and its two locked sequence bumps, alone.
+        if observed.state.is_terminal() {
             return ReturnPublication::Terminal;
         }
         assert!(
@@ -58,7 +89,9 @@ fn publish_return_inner(
             // afterwards a typed wake must observe THIS committed generation.
             // The queue leaf excludes a concurrent wake's later rebind here.
             frame_publication::bind_local_owner_generation(slot, next.generation);
-            RUN_QUEUES[cpu].publish_load(&rq);
+            if local {
+                RUN_QUEUES[cpu].publish_load(&rq);
+            }
             return if local {
                 ReturnPublication::Local
             } else {
@@ -72,8 +105,8 @@ fn publish_return_inner(
         // wins. No provisional queue entry survives a failed owner CAS.
         if local {
             rq.remove(slot, weight);
+            RUN_QUEUES[cpu].publish_load(&rq);
         }
-        RUN_QUEUES[cpu].publish_load(&rq);
     }
 }
 

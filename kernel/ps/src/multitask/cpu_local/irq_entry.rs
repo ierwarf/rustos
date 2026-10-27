@@ -30,6 +30,11 @@ impl DispatchEntry {
         let turn = dispatch_turn::begin(scope, from);
         assert!(turn.original_current().is_some(), "IRQ entry lacks physical Current bank");
         let entry = Self { turn: Some(turn), selected: None, simd_saved: core::cell::Cell::new(false) };
+        // A reply deferred past its replier's syscall is woken at the replier's next
+        // scheduler entry, so this entry's dispatch sees the caller in the FIFO.
+        if scheduler::pending_reply::present() {
+            super::super::current::settle_deferred_fast_ipc_reply_in(entry.preemption());
+        }
         // Exact deferred identities own no backing. Each independent wake
         // captures its own original binding, outside every raw leaf.
         #[cfg(rustos_scheduler_phase_profile)]

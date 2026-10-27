@@ -1,5 +1,9 @@
 # IPC P0/P1 implementation and measurements — 2026-10-23
 
+**Historical P0/P1 snapshot, not current performance or implementation status.**
+Later direct parking, lane changes and current queued-only results are in
+[IPC lane](ipc-lane.md); retain the measurements below as their original cohort.
+
 ## Result and scope
 
 P1's opt-in 16-byte register transport and SIMD elision are implemented.
@@ -43,7 +47,9 @@ change to product edits.
 The buffer ABI is still used by real services and compatibility/fallback paths;
 removing it without migrating callers would regress them. No second authority
 policy was added. Cap generation/rights/revocation, fault-revalidated buffer
-access, queued/remote fallback and fairness are retained. P2/P3 were not done.
+access, queued/remote fallback and fairness were retained. P2/P3 were outside
+this historical P0/P1 snapshot; later implementation status belongs to the lane
+record linked above.
 See [IPC ABI](../abi/ipc.md) for the register/control-state contract and external
 psABI, Rust-asm and Intel references.
 

@@ -5,6 +5,10 @@
 Status: **design draft, not implemented.** Written 2026-10-26 after the stage 1 package
 of `ipc-lane.md` ("P3 stage 1"); it records what was measured, what the proposed
 mechanism would buy, and the formal model that bounds its correctness argument.
+The existing resident scheduler lane, direct parking and queued/rendezvous reply
+convergence are implemented separately in [IPC lane](ipc-lane.md). This draft's
+**objectless virtual reply and paired-custody mechanisms remain unimplemented**;
+its cost estimates are historical projections, not current measured latency.
 
 ## What the measurements say
 

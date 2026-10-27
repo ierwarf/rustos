@@ -18,10 +18,12 @@ use super::{
     boot_execution, context_validation_reason_code, current_identity, current_return::CurrentReturn,
     dispatch_claim::{self, DispatchFrame, FrameCapture, FrameCustody, FrameSelection, FrameSelectionError}, dispatch_policy,
     donation_ledger, frame_publication, handoff_queue::FirstTurnHandoff, local_dispatch,
-    runqueue, runqueue_policy, runtime_profile, smp, stack_resources, sync_handoff, terminal_quarantine,
+    runqueue, runqueue_policy, runtime_profile, smp, sync_handoff, terminal_quarantine,
     SchedulerDispatch, TaskRetireReason, ROOT_TASK_SLOT, MAX_TASK, MAX_LATENCY_HANDOFF_HINTS,
     MAX_CONSECUTIVE_LATENCY_HANDOFFS,
 };
+#[cfg(test)]
+use super::stack_resources;
 use core::sync::atomic::{AtomicU64, Ordering};
 use nucleus_core::util::{cache_padded::CachePadded, lockdep::MAX_TRACKED_CPUS};
 
@@ -59,18 +61,29 @@ fn selected_candidate(slot: usize, cpu: usize, id: u64, generation: u64, custody
 fn local_candidate(slot: usize, cpu: usize, urgency: Urgency) -> Decision {
     if runqueue::is_idle_slot(slot) && smp::idle_slot_for_cpu(cpu) != Some(slot) { return Decision::Empty; }
     match local_dispatch::published_candidate_admission(slot, cpu, selection_now(cpu)) {
-        Ok(true) => match current_identity::read_dispatch(slot).and_then(|p| p.task_id) {
-            Some(id) => selected_candidate(slot, cpu, id, runqueue::owner(slot).generation, FrameCustody::Local, urgency),
-            None => Decision::Incomplete,
-        },
+        Ok(true) => admitted_local_candidate(slot, cpu, urgency),
         Ok(false) => Decision::Empty,
         Err(_) => Decision::Incomplete,
+    }
+}
+
+/// Frame loan for a Local slot whose published admission the caller has
+/// already proven in this masked turn at the same `selection_now`. The fair
+/// scan admits every candidate it orders (`candidate_is_admitted`), so
+/// re-running lifecycle/affinity/budget admission for its winner only
+/// repeated the answer; the frame token and the final claim still re-prove
+/// ownership and generation.
+fn admitted_local_candidate(slot: usize, cpu: usize, urgency: Urgency) -> Decision {
+    match current_identity::read_dispatch(slot).and_then(|p| p.task_id) {
+        Some(id) => selected_candidate(slot, cpu, id, runqueue::owner(slot).generation, FrameCustody::Local, urgency),
+        None => Decision::Incomplete,
     }
 }
 
 /// Peek outside Policy; consume only a complete exact front observation. A
 /// partially completed Cohort retains its original FIFO place and pending bit.
 fn first_turn(turn: &crate::multitask::cpu_local::dispatch_turn::CpuDispatchTurn<'static>, cpu: usize, atomic: bool, class_sequence: u64) -> Decision {
+    if !atomic && !dispatch_policy::spawn_hints_present(cpu) { return Decision::Empty; }
     for _ in 0..MAX_TASK {
         let front = {
             let policy = dispatch_policy::lock(cpu);
@@ -172,7 +185,8 @@ fn synchronous(cpu: usize) -> Decision {
 }
 
 fn latency(cpu: usize) -> Decision {
-    if dispatch_policy::latency_handoff_streak(cpu) >= MAX_CONSECUTIVE_LATENCY_HANDOFFS { return Decision::Empty; }
+    if dispatch_policy::latency_handoff_streak(cpu) >= MAX_CONSECUTIVE_LATENCY_HANDOFFS
+        || !dispatch_policy::latency_hints_present(cpu) { return Decision::Empty; }
     for _ in 0..MAX_LATENCY_HANDOFF_HINTS {
         let hint = {
             let mut policy = dispatch_policy::lock(cpu);
@@ -209,6 +223,7 @@ pub(super) fn test_hint_refuses_selection(cpu: usize, current: usize) -> bool {
     !matches!(hint(cpu, current), Decision::Selected(_) | Decision::Claimed(_))
 }
 fn hint(cpu: usize, current: usize) -> Decision {
+    if !dispatch_policy::next_pick_hint_present(cpu) { return Decision::Empty; }
     let Some(hint) = dispatch_policy::lock(cpu).next_pick_hint.take() else { return Decision::Empty; };
     if !current_identity::read_dispatch(hint.slot).is_some_and(|p| p.task_id == Some(hint.task_id)) {
         return Decision::Empty;
@@ -223,7 +238,7 @@ fn fair(cpu: usize, current: usize, voluntary: bool, runtime: u64) -> Result<Opt
     let result = local_dispatch::choose_local_next_with(cpu, current, voluntary, runtime,
         selection_now(cpu), runqueue::local_runnable_sequence(cpu),
         donation_ledger::class_publication_sequence(), false, false, |slot, cpu, _now| {
-            match local_candidate(slot, cpu, Urgency::Fair) {
+            match admitted_local_candidate(slot, cpu, Urgency::Fair) {
                 Decision::Selected(candidate) => {
                     let generation = candidate.generation;
                     selected = Some(candidate);
@@ -421,22 +436,12 @@ fn complete(outgoing: &CurrentReturn<'_>, urgency: Urgency) -> SchedulerDispatch
         matches!(urgency, Urgency::Latency));
     sync_handoff::record_dispatch(cpu, matches!(urgency, Urgency::Sync), crate::arch::rtc::ticks());
     // The SAME successful claim retains Prepared physical/UID/placement banks.
-    // Process execution additionally owns an activation pin; a pure kernel
-    // executor has no process MM to activate and retains its exact kernel image.
-    let incoming = stack_resources::context::retained_architecture(cpu, next, receipt.id, receipt.token.view)
-        .expect("dispatch lost original claimed physical image");
-    let root = if incoming.process {
-        turn.claimed_mm_root(next, receipt.id).expect("dispatch lost original claimed MM")
-    } else { incoming.root };
-    assert_eq!(root, incoming.root, "claimed process activation differs from retained image");
-    runtime_profile::owner::local(|row| {
-        row.dispatch(next);
-        if previous == next { row.runtime_profile_same_task_dispatches = row.runtime_profile_same_task_dispatches.saturating_add(1); }
-        else {
-            row.runtime_profile_task_switches = row.runtime_profile_task_switches.saturating_add(1);
-            if receipt.previous.root != root { row.runtime_profile_address_space_switches = row.runtime_profile_address_space_switches.saturating_add(1); }
-        }
-    });
+    // `ReturnArchitecture::capture` proves the retained image and the claimed
+    // MM activation against this receipt before any effect, so completion only
+    // reads the published root for its address-space statistic.
+    let root = runqueue::address_space::root(next);
+    if previous == next { runtime_profile::owner::lane_same_task(cpu, next); }
+    else { runtime_profile::owner::lane_dispatch(cpu, next, receipt.previous.root != root); }
     if runtime_profile::owner::migration(next, receipt.id, cpu as u8) {
         runtime_profile::owner::local(|row| row.runtime_profile_cross_cpu_migrations = row.runtime_profile_cross_cpu_migrations.saturating_add(1));
     }

@@ -91,7 +91,7 @@ pub(super) fn syscall_linux_rustos_ipc_reply_recv_with_sender(args_ptr: u64) -> 
                     );
                     return ipc_reply_recv_committed_error(ipc_error_to_linux_errno(error));
                 }
-                return finish_committed_fast_reply_receive(
+                return finish_committed_reply_receive(
                     endpoint,
                     receiver_task_id,
                     &retained_mm,
@@ -111,15 +111,23 @@ pub(super) fn syscall_linux_rustos_ipc_reply_recv_with_sender(args_ptr: u64) -> 
     // The fast branch above publishes in-kernel without a user copy and cannot
     // be slow; only this path pays for the slow-call timing reads.
     let start_ticks = crate::arch::rtc::ticks();
-    let response = match copy_request_from_user(args.response_ptr, args.response_len) {
-        Ok(response) => response,
-        Err(errno) => return linux_errno(errno),
+    // Inline bytes were already snapshotted during preflight. A queued reply
+    // does not need another user copy or a temporary Vec for those same bytes.
+    let large_response;
+    let response = if inline {
+        &inline_response[..response_len]
+    } else {
+        large_response = match copy_request_from_user(args.response_ptr, args.response_len) {
+            Ok(response) => response,
+            Err(errno) => return linux_errno(errno),
+        };
+        large_response.as_slice()
     };
     let copy_ticks = crate::arch::rtc::ticks();
     let completion = match kernel_ipc_runtime::api::complete_endpoint_reply_for_process_with_custody(
         KernelReplyHandle::from_raw(args.reply_cap),
         receiver_process_id,
-        response.as_slice(),
+        response,
     ) {
         Ok(completion) => completion,
         Err(err) => {
@@ -128,8 +136,6 @@ pub(super) fn syscall_linux_rustos_ipc_reply_recv_with_sender(args_ptr: u64) -> 
         }
     };
     let reply_ticks = crate::arch::rtc::ticks();
-    let handoff_queued =
-        multitask::complete_ipc_reply_wake_handoff_with_custody(args.reply_cap, completion);
     log_slow_ipc_reply(
         "reply-recv",
         args.reply_cap,
@@ -139,10 +145,9 @@ pub(super) fn syscall_linux_rustos_ipc_reply_recv_with_sender(args_ptr: u64) -> 
         response.len(),
     );
 
-    // The endpoint receive keeps the existing check-arm-recheck protocol. If
-    // it blocks, that software-schedule transition consumes the exact caller
-    // hint. If a request was already queued, request one syscall-tail handoff
-    // so the completed caller still receives its bounded direct turn.
+    // Both representations carry the same reply/context custody into receive.
+    // Its block settles and hands back in one boundary; an immediate receive
+    // or error drops the deferred reply and wakes the caller exactly once.
     finish_committed_reply_receive(
         endpoint,
         receiver_task_id,
@@ -152,52 +157,13 @@ pub(super) fn syscall_linux_rustos_ipc_reply_recv_with_sender(args_ptr: u64) -> 
         args.next_reply_cap_ptr,
         args.sender_pid_ptr,
         args.sender_tid_ptr,
-        handoff_queued,
+        args.reply_cap,
+        completion,
     )
 }
 
 #[allow(clippy::too_many_arguments)]
 fn finish_committed_reply_receive(
-    endpoint: KernelEndpointHandle,
-    receiver_task_id: u64,
-    retained_mm: &multitask::RetainedCurrentUserAddressSpace,
-    request_ptr: u64,
-    request_capacity: usize,
-    next_reply_cap_ptr: u64,
-    sender_pid_ptr: u64,
-    sender_tid_ptr: u64,
-    handoff_queued: bool,
-) -> u64 {
-    match recv_with_sender_blocking_prepared(
-        endpoint,
-        receiver_task_id,
-        retained_mm,
-        request_ptr,
-        request_capacity,
-        next_reply_cap_ptr,
-        sender_pid_ptr,
-        sender_tid_ptr,
-        // Reply-and-receive belongs to a single-endpoint server, which has
-        // nothing else to service and so has no reason to wake early.
-        None,
-    ) {
-        Ok((received, yielded)) => {
-            if handoff_queued && !yielded {
-                multitask::request_deferred_reschedule();
-            }
-            received as u64
-        }
-        Err((errno, yielded)) => {
-            if handoff_queued && !yielded {
-                multitask::request_deferred_reschedule();
-            }
-            ipc_reply_recv_committed_error(errno)
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn finish_committed_fast_reply_receive(
     endpoint: KernelEndpointHandle,
     receiver_task_id: u64,
     retained_mm: &multitask::RetainedCurrentUserAddressSpace,

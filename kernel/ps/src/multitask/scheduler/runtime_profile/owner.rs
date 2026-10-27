@@ -212,12 +212,13 @@ pub(in crate::multitask::scheduler) fn local<R>(f: impl FnOnce(&mut Counters) ->
         CELLS[lockdep::current_cpu_index()].with(f)
     }
 }
-/// Accounting the IPC lane would otherwise push through the CPU's diagnostic
-/// leaf at every switch (a mask plus a tracked lock pair for each of the
-/// dispatch, runtime and switch rows). It collects the same rows in this CPU's
-/// private cell and folds them into the leaf once per [`LANE_FLUSH_EVERY`] lane
-/// switches, so a report lags by at most that many lane switches per CPU and
-/// loses nothing (an entry evicted from the small table is folded at once).
+/// Accounting the IPC lane and the ordinary dispatcher would otherwise push
+/// through the CPU's diagnostic leaf at every switch (a mask plus a tracked
+/// lock pair for each of the dispatch, runtime, switch and entry rows). It
+/// collects the same rows in this CPU's private cell and folds them into the
+/// leaf once per [`LANE_FLUSH_EVERY`] switches, so a report lags by at most
+/// that many switches per CPU and loses nothing (an entry evicted from the
+/// small table is folded at once).
 const LANE_ENTRIES: usize = 4;
 const LANE_FLUSH_EVERY: u32 = 64;
 #[derive(Clone, Copy)]
@@ -230,7 +231,9 @@ struct LanePending {
     entries: [LaneEntry; LANE_ENTRIES],
     used: usize,
     switches: u64,
+    same_task: u64,
     address_space: u64,
+    entry_counts: [u64; SCHEDULER_ENTRY_CAUSE_COUNT],
     since_flush: u32,
 }
 impl LanePending {
@@ -239,7 +242,9 @@ impl LanePending {
             entries: [LaneEntry { slot: 0, dispatches: 0, ns: 0 }; LANE_ENTRIES],
             used: 0,
             switches: 0,
+            same_task: 0,
             address_space: 0,
+            entry_counts: [0; SCHEDULER_ENTRY_CAUSE_COUNT],
             since_flush: 0,
         }
     }
@@ -261,7 +266,9 @@ fn lane_pending(cpu: usize) -> &'static mut LanePending {
 fn lane_fold(cpu: usize, pending: &mut LanePending) {
     let entries = pending.entries;
     let used = pending.used;
-    let (switches, address_space) = (pending.switches, pending.address_space);
+    let (switches, same_task, address_space) =
+        (pending.switches, pending.same_task, pending.address_space);
+    let entry_counts = pending.entry_counts;
     *pending = LanePending::new();
     CELLS[cpu].with(|row| {
         for entry in &entries[..used] {
@@ -271,8 +278,13 @@ fn lane_fold(cpu: usize, pending: &mut LanePending) {
         }
         row.runtime_profile_task_switches =
             row.runtime_profile_task_switches.saturating_add(switches);
+        row.runtime_profile_same_task_dispatches =
+            row.runtime_profile_same_task_dispatches.saturating_add(same_task);
         row.runtime_profile_address_space_switches =
             row.runtime_profile_address_space_switches.saturating_add(address_space);
+        for (n, v) in row.runtime_profile_entry_counts.iter_mut().zip(entry_counts) {
+            *n = n.saturating_add(v);
+        }
     });
 }
 fn lane_entry(cpu: usize, slot: usize) -> &'static mut LaneEntry {
@@ -304,6 +316,24 @@ pub(in crate::multitask::scheduler) fn lane_dispatch(cpu: usize, slot: usize, ne
     if pending.since_flush >= LANE_FLUSH_EVERY {
         lane_fold(cpu, pending);
     }
+}
+/// Record one ordinary dispatch of `slot` that kept the same task on `cpu`
+/// (IRQs masked).
+pub(in crate::multitask::scheduler) fn lane_same_task(cpu: usize, slot: usize) {
+    let entry = lane_entry(cpu, slot);
+    entry.dispatches = entry.dispatches.saturating_add(1);
+    let pending = lane_pending(cpu);
+    pending.same_task = pending.same_task.saturating_add(1);
+    pending.since_flush += 1;
+    if pending.since_flush >= LANE_FLUSH_EVERY {
+        lane_fold(cpu, pending);
+    }
+}
+/// Count one scheduler entry of `cause` on `cpu` (IRQs masked); folded with the
+/// next dispatch batch.
+pub(in crate::multitask::scheduler) fn lane_entry_cause(cpu: usize, cause: SchedulerEntryCause) {
+    let n = &mut lane_pending(cpu).entry_counts[cause as usize];
+    *n = n.saturating_add(1);
 }
 /// Fold `cpu`'s batched lane rows into its diagnostic leaf now (IRQs masked on
 /// `cpu`, or `cpu` quiescent).

@@ -1551,7 +1551,7 @@ tokens = [
     "context_validation::validate_published_saved_context(slot, rsp, view)", "fn capture_selected(", "turn.original_current()",
     "FrameCustody::Current) && slot != original", "fn from_selection(",
     "cpu != selection.cpu", "Self::token_current(selection.token, cpu, selection.custody)",
-    "fn prepare(self)", "self.is_current()", "scheduling_context::dispatch::prepare_grant",
+    "fn prepare(self)", "scheduling_context::dispatch::prepare_grant",
     "funding.task_id != self.id || !self.is_current()",
 ]
 
@@ -2129,9 +2129,11 @@ tokens = [
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/dispatcher.rs"
 tokens = ["fn local_candidate(", "local_dispatch::published_candidate_admission(",
-    "Ok(true)", "current_identity::read_dispatch(slot).and_then(|p| p.task_id)",
+    "Ok(true) => admitted_local_candidate(slot, cpu, urgency)",
+    "Ok(false) => Decision::Empty", "Err(_) => Decision::Incomplete",
+    "fn admitted_local_candidate(", "current_identity::read_dispatch(slot).and_then(|p| p.task_id)",
     "selected_candidate(slot, cpu, id, runqueue::owner(slot).generation, FrameCustody::Local",
-    "None => Decision::Incomplete", "Ok(false) => Decision::Empty", "Err(_) => Decision::Incomplete"]
+    "None => Decision::Incomplete"]
 
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/sync_handoff.rs"
@@ -2192,7 +2194,7 @@ tokens = [
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/local_dispatch.rs"
 tokens = [
-    "let generation = if slot == current_slot && current_is_live {",
+    "let generation = if slot == current_slot && current_is_live!() {",
     "qualify(slot, cpu, eligibility_now_ns)",
     "Ok((slot, generation))",
 ]

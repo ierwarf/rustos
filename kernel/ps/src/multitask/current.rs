@@ -31,6 +31,8 @@ pub use ipc::{
     arm_block_current_task_on_reply, attach_reserved_ipc_priority,
     bind_reserved_ipc_priority, cancel_block_current_task,
     cancel_ipc_priority_reservation, complete_fast_ipc_reply_wake_handoff_with_custody,
+    fast_ipc_reply_deferred, publish_fast_ipc_reply, publish_ipc_reply, settle_deferred_fast_ipc_reply,
+    take_deferred_fast_ipc_reply,
     endpoint_receiver_still_waiting,
     complete_ipc_reply_wake_handoff, complete_ipc_reply_wake_handoff_with_custody,
     complete_pager_fault_wake_handoff, demote_current_user_task_to_user_class,
@@ -40,6 +42,7 @@ pub use ipc::{
     settle_ipc_reply_scheduling_context, task_has_system_scheduling_class,
     wake_pager_service_waiter_for_process, wake_task,
 };
+pub(in crate::multitask) use ipc::settle_deferred_fast_ipc_reply_in;
 pub use pager::{
     PagerChargeSnapshot, current_pager_charge_snapshot, current_pager_fault_install_permit,
     current_pager_vma_snapshot, pager_vma_regions_for_process, publish_current_pager_vma,

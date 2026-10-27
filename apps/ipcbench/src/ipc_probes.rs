@@ -41,6 +41,29 @@ pub(crate) const BENCH_OP_PING: u64 = 0;
 pub(crate) const BENCH_OP_STOP: u64 = 1;
 const _: [(); 16] = [(); size_of::<BenchMsg>()];
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CallMode {
+    Buffer,
+    Registers,
+    Queued,
+}
+
+// A byte-only CALL with reply capacity > the runtime's 256-byte fixed frame
+// must enqueue even when its server is already parked. Keep the payload at
+// 16 bytes and provide real backing for the entire advertised capacity.
+const FAST_REPLY_LIMIT: usize = 256;
+#[repr(C)]
+struct BenchReply {
+    message: BenchMsg,
+    tail: [u8; FAST_REPLY_LIMIT],
+}
+
+impl CallMode {
+    fn reply_capacity(self) -> usize {
+        if self == Self::Queued { size_of::<BenchReply>() } else { size_of::<BenchMsg>() }
+    }
+}
+
 fn valid_round_trip_reply(status: i64, request: &BenchMsg, response: &BenchMsg) -> bool {
     status == size_of::<BenchMsg>() as i64
         && response.op == request.op
@@ -78,6 +101,24 @@ fn empty_receive_status_valid(status: i64, reply_cap: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queued_probe_exceeds_the_actual_fast_response_capacity_with_real_backing() {
+        assert_eq!(CallMode::Queued.reply_capacity(), 272);
+        assert!(CallMode::Queued.reply_capacity() > FAST_REPLY_LIMIT);
+        assert_eq!(CallMode::Buffer.reply_capacity(), 16);
+        assert_eq!(CallMode::Registers.reply_capacity(), 16);
+        // This is an intentional shape rejection, not a statistical assertion
+        // that a server happened to be unparked. Fail if the kernel limit or
+        // admission condition changes under the benchmark.
+        let runtime = include_str!("../../../kernel/ipc-runtime/src/ipc/mod.rs");
+        assert!(runtime.contains("pub const IPC_FAST_INLINE_BYTES: usize = 256;"));
+        let compat = include_str!("../../../kernel/compat/src/user/syscall/linux/ipc_ops.rs");
+        let admission = compat.split("fn try_fast_ipc_call(").nth(1).unwrap()
+            .split("struct FastCallResponse").next().unwrap();
+        assert!(admission.contains("if reply_capacity > kernel_ipc_runtime::api::IPC_FAST_INLINE_BYTES"));
+        assert!(admission.contains("return Ok(None);"));
+    }
 
     #[test]
     fn empty_receive_requires_exact_would_block_and_no_reply_capability() {
@@ -319,7 +360,7 @@ pub(crate) fn probe_ipc_intra_process(tsc_khz: u64) {
             "ipc_split_reply_to_return",
         ],
         bench_server,
-        false,
+        CallMode::Buffer,
     );
 }
 
@@ -335,14 +376,24 @@ pub(crate) fn probe_ipc_intra_process_reply_recv(tsc_khz: u64) {
             "ipc_split_reply_recv_reply_to_return",
         ],
         bench_server_reply_recv,
-        false,
+        CallMode::Buffer,
+    );
+}
+
+/// Current queued slowpath only: same 16-byte echo and fused server, but the
+/// caller advertises a genuinely backed 272-byte response capacity.
+pub(crate) fn probe_ipc_queued_reply_recv(tsc_khz: u64) {
+    measure_intra_process_round_trip(
+        tsc_khz, "ipc_rt_intra_process_queued_reply_recv",
+        ["ipc_split_queued_call_to_recv", "ipc_split_queued_server_body", "ipc_split_queued_reply_to_return"],
+        bench_server_reply_recv, CallMode::Queued,
     );
 }
 
 pub(crate) fn probe_state_checkpoint(name: &str, tsc_khz: u64) {
     let legs = [format!("{name}_to_recv"), format!("{name}_body"), format!("{name}_to_return")];
     measure_intra_process_round_trip(
-        tsc_khz, name, [&legs[0], &legs[1], &legs[2]], bench_server_reply_recv, false,
+        tsc_khz, name, [&legs[0], &legs[1], &legs[2]], bench_server_reply_recv, CallMode::Buffer,
     );
 }
 
@@ -359,7 +410,7 @@ pub(crate) fn probe_ipc_register_reply_recv(tsc_khz: u64) {
     }
     measure_intra_process_round_trip(tsc_khz, "ipc_rt_intra_process_register_reply_recv",
         ["ipc_split_register_call_to_recv", "ipc_split_register_server_body", "ipc_split_register_reply_to_return"],
-        bench_server_register_reply_recv, true);
+        bench_server_register_reply_recv, CallMode::Registers);
 }
 
 // Outside all timing windows: length/padding, queued/fast interoperability,
@@ -477,7 +528,7 @@ fn measure_intra_process_round_trip(
     name: &str,
     split_names: [&str; 3],
     server_entry: fn(u64),
-    registers: bool,
+    mode: CallMode,
 ) {
     let endpoint = unsafe { syscall0(SYS_RUSTOS_IPC_ENDPOINT_CREATE) };
     if endpoint < 0 {
@@ -494,9 +545,11 @@ fn measure_intra_process_round_trip(
         op: BENCH_OP_PING,
         seq: 0,
     };
-    let mut response = BenchMsg::default();
+    let mut response_storage = BenchReply { message: BenchMsg::default(), tail: [0xcc; FAST_REPLY_LIMIT] };
+    let mut response = &mut response_storage.message;
+    let reply_capacity = mode.reply_capacity();
     let mut call = |request: &BenchMsg, response: &mut BenchMsg| -> i64 {
-        if registers {
+        if mode == CallMode::Registers {
             let result = unsafe { ipc_register_syscall(SYS_RUSTOS_IPC_REGISTER_CALL,
                 endpoint, 16, [request.op, request.seq], 0) };
             *response = BenchMsg { op: result.words[0], seq: result.words[1] };
@@ -509,7 +562,7 @@ fn measure_intra_process_round_trip(
                 (request as *const BenchMsg) as u64,
                 size_of::<BenchMsg>() as u64,
                 (response as *mut BenchMsg) as u64,
-                size_of::<BenchMsg>() as u64,
+                reply_capacity as u64,
             )
         }
     };
@@ -556,9 +609,19 @@ fn measure_intra_process_round_trip(
     request.seq = request.seq.wrapping_add(1);
     let stopped = valid_round_trip_reply(call(&request, &mut response), &request, &response);
     let joined = server.join().is_ok();
+    let tail_intact = response_storage.tail.iter().all(|byte| *byte == 0xcc);
+    if !tail_intact {
+        skip(name, "reply-tail-overwritten");
+        return;
+    }
     if !round_trip_transcript_complete(ok, stopped, joined, total.len()) {
         skip(name, "ipc-transcript-invalid");
         return;
+    }
+    if mode == CallMode::Queued {
+        crate::debug_line(&format!(
+            "ipcbench: proof name={name} transport=queued request_bytes=16 response_bytes=16 reply_capacity={reply_capacity} fast_reply_limit={FAST_REPLY_LIMIT} warmup={WARMUP} samples={IPC_ITERS} tail_intact=1"
+        ));
     }
     report(name, &summarize(&mut total), tsc_khz);
     worst.defer(name);

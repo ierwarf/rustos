@@ -54,6 +54,8 @@ pub use self::current::{
     attach_reserved_ipc_priority, bind_reserved_ipc_priority, cancel_block_current_task,
     cancel_ipc_priority_reservation, commit_ipc_call_handoff,
     complete_fast_ipc_reply_wake_handoff_with_custody, complete_ipc_reply_wake_handoff,
+    fast_ipc_reply_deferred, publish_fast_ipc_reply, publish_ipc_reply, settle_deferred_fast_ipc_reply,
+    take_deferred_fast_ipc_reply,
     complete_ipc_reply_wake_handoff_with_custody, complete_pager_fault_wake_handoff,
     complete_retired_task_cleanup, current_console_session, current_linux_thread_state,
     current_pager_charge_snapshot, current_pager_fault_install_permit, current_pager_vma_snapshot,
@@ -124,7 +126,8 @@ pub(crate) use self::irq::{
     request_user_return_reschedule, request_yield_reschedule, reschedule_if_requested,
 };
 pub use self::irq::{
-    commit_block_current_task_and_yield, commit_block_current_task_with_fast_reply_and_yield,
+    commit_block_current_task_and_yield, commit_block_current_task_direct,
+    commit_block_current_task_with_fast_reply_and_yield,
     commit_block_current_task_with_fast_reply_direct, commit_fast_ipc_call_handoff_and_yield,
     commit_fast_ipc_call_handoff_direct, commit_pager_fault_block_and_yield,
     rtc_interrupt_handler_addr, software_schedule_interrupt_handler_addr,

@@ -278,8 +278,11 @@ because the task slot stayed equal: ring0 compiler code executes after the
 save boundary and may use vector registers.
 When software scheduler entries dominate timer, RTC, and reschedule-IPI
 entries, inspect synchronous service loops before changing timer or IPI policy.
-A separate byte-only `reply` followed by `recv_with_sender` costs an avoidable
-ring3 boundary and scheduler transition per request. The admitted fused
+A separate byte-only `reply` followed by `recv_with_sender` adds a ring3
+boundary. When the exact caller is parked on the same CPU, the kernel may defer
+its wake into the replier's next receive; another syscall or scheduler boundary
+settles it instead. Thus split reply/receive no longer necessarily incurs an
+extra scheduler transition, but it still has two entries. The admitted fused
 `reply_recv_with_sender` path preflights both phases before commit, preserves
 the exact caller handoff, and then blocks or dequeues under the existing
 endpoint check-arm-recheck protocol. Measure its effect first on one service;

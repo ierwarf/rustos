@@ -430,7 +430,19 @@ pub(super) fn choose_local_next_with(
     // Snapshot its publication once so candidate admission and the later
     // min-granularity decision cannot disagree because they sampled different
     // points of an otherwise valid current-frame transition.
-    let current_is_live = current_can_keep_running(current_slot, cpu, eligibility_now_ns);
+    //
+    // The snapshot is memoized and taken at first use: a voluntary yield that
+    // finds another candidate never needs it, and that evaluation is the
+    // scan's Context+Domain budget pair for the outgoing task.
+    let mut current_live: Option<bool> = None;
+    macro_rules! current_is_live {
+        () => {
+            *current_live.get_or_insert_with(|| {
+                current_can_keep_running(current_slot, cpu, eligibility_now_ns)
+            })
+        };
+    }
+    let mut yielded_current_deferred = false;
     let mut best_system = None;
     let mut best_user = None;
     let mut local_system = None;
@@ -456,7 +468,14 @@ pub(super) fn choose_local_next_with(
         // and lifecycle publication are the coherent evidence for retaining
         // it; every replacement candidate requires the generation-bound frame
         // token below.
-        let qualification = if slot == current_slot && current_is_live {
+        // A yielding current is only the fallback when nothing else is
+        // eligible, so it is qualified after the scan, and only then. A due
+        // User reservation can pick it outright and keeps the eager order.
+        if voluntary_yield && slot == current_slot && !reserve_user {
+            yielded_current_deferred = true;
+            continue;
+        }
+        let qualification = if slot == current_slot && current_is_live!() {
             Ok(Some(runqueue::owner(slot).generation))
         } else {
             candidate_is_admitted(slot, cpu, eligibility_now_ns)
@@ -532,6 +551,25 @@ pub(super) fn choose_local_next_with(
         }
     }
 
+    if yielded_current_deferred && best_system.is_none() && best_user.is_none() {
+        let slot = current_slot;
+        let qualification = if current_is_live!() {
+            Ok(Some(runqueue::owner(slot).generation))
+        } else {
+            candidate_is_admitted(slot, cpu, eligibility_now_ns)
+        };
+        match qualification {
+            Ok(Some(_)) => {
+                observed_class(slot)?;
+                current_candidate = Some((slot, runqueue::vruntime(slot).saturating_add(1), 0));
+            }
+            Ok(None) => {}
+            Err(reason) => {
+                first_revalidation_failure.get_or_insert(reason);
+            }
+        }
+    }
+
     // A partial candidate set is not authoritative: the unavailable slot may
     // be the class or vruntime winner. Fall back even when another qualified
     // candidate exists rather than silently selecting around missing state.
@@ -566,7 +604,7 @@ pub(super) fn choose_local_next_with(
         if !voluntary_yield
             && !reservation_applied
             && slot != current_slot
-            && current_is_live
+            && current_is_live!()
             // Legacy fairness preempts across a higher-priority class, but
             // applies min-granularity to same/lower-priority peers. The current
             // frame is actively executing, so retaining it needs no stable
@@ -585,7 +623,7 @@ pub(super) fn choose_local_next_with(
         // The chosen slot must still name an eligible frame and its exact
         // generation after ordering and min-granularity. The earlier scan's
         // token cannot authorize a later, possibly reused Local owner.
-        let generation = if slot == current_slot && current_is_live {
+        let generation = if slot == current_slot && current_is_live!() {
             if !current_can_keep_running(slot, cpu, eligibility_now_ns) {
                 return fallback(LocalFallbackReason::LifecycleIneligible);
             }

@@ -8,7 +8,6 @@ use super::*;
 pub(super) struct CallSchedulingAdmission {
     pub(super) priority: EndpointCallPriority,
     pub(super) scheduling_context: kernel_ipc_runtime::api::ReplySchedulingContextCustody,
-    pub(super) donation_required: bool,
 }
 
 /// Read-only transport race discriminator after the original scheduler wake
@@ -87,11 +86,9 @@ pub(super) fn reserve(task_id: u64) -> Result<CallSchedulingAdmission, i64> {
     } else {
         EndpointCallPriority::Ordinary
     };
-    let donation_required = true;
     Ok(CallSchedulingAdmission {
         priority,
         scheduling_context,
-        donation_required,
     })
 }
 

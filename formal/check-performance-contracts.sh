@@ -669,7 +669,7 @@ rg -Fq 'static SYNC_HANDOFFS: [SyncHandoffLock; MAX_TRACKED_CPUS]' \
 # priority/fair/Direct path, including incomplete-prefix refusal and generation
 # retention; a stale source string in Scheduler is no longer evidence.
 python3 formal/check-dispatch-source-contracts.py
-if [ "$(rg -c 'complete_ipc_reply_wake_handoff_with_custody\(' \
+if [ "$(rg -c '(complete_ipc_reply_wake_handoff_with_custody|publish_ipc_reply|recv_with_sender_blocking_prepared_after_fast_reply)\(' \
     kernel/compat/src/user/syscall/linux/{ipc_ops.rs,ipc_reply_recv.rs} | \
     awk -F: '{ total += $2 } END { print total + 0 }')" -ne 3 ]; then
     echo "one terminal IPC reply ABI bypasses the combined scheduling-context return/donation/wake handoff" >&2
@@ -761,7 +761,7 @@ for witness in \
     'authorize_endpoint_receiver_for_process(' \
     'with_retained_user_access(' \
     'complete_endpoint_reply_for_process_with_custody(' \
-    'recv_with_sender_blocking_prepared(' \
+    'recv_with_sender_blocking_prepared_after_fast_reply(' \
     'IPC_REPLY_RECV_COMMITTED_ERROR_BASE + errno'; do
     rg -Fq "$witness" "$reply_recv_kernel" || {
         echo "fused reply-receive lost phase or custody witness: $witness" >&2
@@ -770,7 +770,7 @@ for witness in \
 done
 rg -Uq 'authorize_endpoint_receiver_for_process\([\s\S]{0,3600}copy_request_from_user\([\s\S]{0,1800}complete_endpoint_reply_for_process_with_custody\([\s\S]{0,2600}finish_committed_reply_receive\(' \
     "$reply_recv_kernel" \
-    && rg -Uq 'fn finish_committed_reply_receive\([\s\S]{0,1200}recv_with_sender_blocking_prepared\(' \
+    && rg -Uq 'fn finish_committed_reply_receive\([\s\S]{0,1200}recv_with_sender_blocking_prepared_after_fast_reply\(' \
     "$reply_recv_kernel" || {
     echo "fused reply-receive no longer preflights before reply commit and receive" >&2
     exit 1

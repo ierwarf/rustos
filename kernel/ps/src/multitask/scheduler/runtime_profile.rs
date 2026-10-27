@@ -996,6 +996,11 @@ pub(super) fn observe_original_current(
 }
 
 pub(in crate::multitask) fn record_entry(cause: SchedulerEntryCause) {
+    #[cfg(not(test))]
+    x86_64::instructions::interrupts::without_interrupts(|| {
+        owner::lane_entry_cause(nucleus_core::util::lockdep::current_cpu_index(), cause)
+    });
+    #[cfg(test)]
     owner::local(|window| window.entry(cause));
 }
 

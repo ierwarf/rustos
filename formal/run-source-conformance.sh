@@ -482,7 +482,7 @@ ipc_authorize_body="$(
         kernel/compat/src/user/syscall/linux/ipc_ops.rs
 )"
 ipc_fast_call_body="$(
-    sed -n '/^fn try_fast_ipc_call_bytes[<(]/,/^fn /p' \
+    sed -n '/^fn try_fast_ipc_call(/,/^fn /p' \
         kernel/compat/src/user/syscall/linux/ipc_ops.rs
 )"
 ipc_deadline_body="$(
@@ -1213,9 +1213,11 @@ if ! grep -Fq 'scheduler::wake_publication::reply(reply, task_id)' <<<"$reply_cu
     || ! grep -Fq 'record.bind_selected_local_owner(runqueue::owner(record.slot()), cpu)' <<<"$reply_selection_body" \
     || ! grep -Fq 'settle_terminal_ipc_reply_scheduling_context(reply, custody)' <<<"$reply_custody_body" \
     || ! grep -Fq 'complete_ipc_reply_wake_handoff(reply, completion.caller_task_id)' <<<"$reply_custody_body" \
-    || ! grep -Fq 'multitask::complete_ipc_reply_wake_handoff_with_custody(reply, completion)' <<<"$plain_reply_body" \
+    || ! grep -Fq 'multitask::publish_ipc_reply(reply, completion)' <<<"$plain_reply_body" \
     || ! grep -Fq 'multitask::complete_ipc_reply_wake_handoff_with_custody(args.reply_cap, completion)' <<<"$handle_reply_body" \
-    || ! grep -Fq 'multitask::complete_ipc_reply_wake_handoff_with_custody(args.reply_cap, completion)' <<<"$reply_recv_body" \
+    || ! grep -Fq 'recv_with_sender_blocking_prepared_after_fast_reply(' <<<"$reply_recv_body" \
+    || ! grep -Fq 'args.reply_cap,' <<<"$reply_recv_body" \
+    || ! grep -Fq 'completion,' <<<"$reply_recv_body" \
     || grep -Eq 'release_ipc_priority|wake_task|set_next_synchronous_pick_hint' <<<"$plain_reply_body" \
     || grep -Eq 'release_ipc_priority|wake_task|set_next_synchronous_pick_hint' <<<"$handle_reply_body" \
     || grep -Eq 'release_ipc_priority|wake_task|set_next_synchronous_pick_hint' <<<"$reply_recv_body"; then

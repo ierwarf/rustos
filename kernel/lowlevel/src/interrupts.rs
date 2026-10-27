@@ -112,6 +112,7 @@ unsafe extern "C" {
     fn software_schedule_interrupt_handler();
     fn reschedule_ipi_interrupt_handler();
     fn software_schedule_trap();
+    fn ipc_wait_direct_schedule(resume: *const DirectResume) -> !;
     fn fast_ipc_call_schedule_trap(endpoint: u64, reply: u64, receiver_task_id: u64) -> u64;
     fn fast_ipc_reply_schedule_trap(
         reply: u64,
@@ -211,6 +212,17 @@ pub fn trigger_software_schedule() {
     interrupts::without_interrupts(|| unsafe {
         software_schedule_trap();
     });
+}
+
+/// Schedule an already committed IPC wait from its scalar park record.
+///
+/// # Safety
+/// Same frame/lifetime contract as [`trigger_fast_ipc_call_schedule_direct`].
+/// IRQs are masked and the current wait has already committed. No handoff
+/// discriminator or peer identity is fabricated for this generic block.
+pub unsafe fn trigger_software_schedule_direct(resume: &DirectResume) -> ! {
+    // SAFETY: the caller contract above.
+    unsafe { ipc_wait_direct_schedule(resume) }
 }
 
 /// Enter the software scheduler while preserving an IF-enabled kernel

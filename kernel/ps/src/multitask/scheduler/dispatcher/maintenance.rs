@@ -112,13 +112,7 @@ pub(super) fn service(turn: &CpuDispatchTurn<'static>, cpu: usize, current: usiz
         }
     }
     if let Some(((_, _, slot, target), source)) = selected { transfer(turn, slot, source, target); }
-    let due = {
-        let mut policy = dispatch_policy::lock(cpu);
-        let next = policy.ready_validation_turn.saturating_add(1);
-        let due = next >= READY_VALIDATION_INTERVAL_TURNS;
-        policy.ready_validation_turn = if due { 0 } else { next };
-        due
-    };
+    let due = dispatch_policy::ready_validation_due(cpu, READY_VALIDATION_INTERVAL_TURNS);
     if due {
         for slot in runqueue::local_runnable_slots(cpu) {
             if slot == current || slot == ROOT_TASK_SLOT || crate::multitask::task_slot_is_running(slot) { continue; }

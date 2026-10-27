@@ -46,6 +46,7 @@ mod donation_ledger;
 pub(super) mod donation_publication;
 pub(in crate::multitask) mod ipc_publication;
 pub(in crate::multitask) mod ipc_lane;
+pub(in crate::multitask) mod pending_reply;
 mod frame_observation;
 mod frame_publication;
 pub(in crate::multitask) mod rsp_handoff;

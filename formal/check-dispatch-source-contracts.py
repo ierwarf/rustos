@@ -1133,9 +1133,11 @@ ordered(returned, ['OWNER_WORDS[slot].compare_exchange(observed, next).is_ok()',
     'successful outgoing CAS binds Blocked and Local frame generation')
 if 'if local { frame_publication::bind_local_owner_generation' in ' '.join(returned.split()):
     raise SystemExit('Blocked return lost exact frame generation binding')
-ordered(body(dispatch, 'complete'), ['stack_resources::context::retained_architecture(',
-    'if incoming.process', 'turn.claimed_mm_root(next, receipt.id)',
-    '} else { incoming.root }', 'assert_eq!(root, incoming.root'],
+# Completion reads only the published root for its statistic; the retained image
+# and the claimed activation are proven once, against the receipt, before any effect.
+ordered(architecture, ['stack_resources::context::retained_architecture(',
+    'if incoming.process', 'turn.claimed_mm_root(token.slot, receipt.id)',
+    '!= incoming.root'],
     'original process activation versus exact pure-kernel image')
 bitmap = body((base / 'runqueue.rs').read_text(), 'local_runnable_snapshot')
 if 'cfg(' in bitmap or '[u64::MAX;' in bitmap:

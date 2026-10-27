@@ -178,7 +178,7 @@ pub(super) fn wait_for_reply_with_deadline(
 
 type EndpointWaitResponse = (Vec<u8>, Vec<KernelTransferredHandle>);
 
-fn take_endpoint_response_for_wait(
+pub(super) fn take_endpoint_response_for_wait(
     reply: KernelReplyHandle,
     handle_capacity: usize,
 ) -> Result<Option<EndpointWaitResponse>, i64> {

@@ -1059,6 +1059,32 @@ pub fn commit_block_current_task_and_yield() -> Option<bool> {
     })
 }
 
+/// Commit an armed register-IPC wait and resume from its syscall frame alone.
+/// Unlike the rendezvous handoff, this also covers a queued call with no parked
+/// peer and an initial receive with no completed reply. Wake-before-commit is
+/// arbitrated by the same CurrentWait transaction as the in-place path.
+///
+/// # Safety
+/// `frame` is the live syscall frame, `resume_rip` completes the wait from its
+/// park record, and no abandoned Rust frame owns a drop-required resource.
+/// IRQs remain excluded from wait commit through the stack switch.
+pub unsafe fn commit_block_current_task_direct(resume_rip: u64, frame: u64) -> Option<bool> {
+    assert_eq!(
+        nucleus_core::util::lockdep::preemption_depth(), 0,
+        "direct IPC block while raw spin lock held",
+    );
+    interrupts::without_interrupts(|| {
+        // SAFETY: the original masked CPU owns Current through commit.
+        let committed = unsafe { super::scheduler::commit_current_wait() };
+        if committed == Some(true) {
+            let resume = crate::lowlevel::interrupts::DirectResume { rip: resume_rip, frame };
+            // SAFETY: the caller contract above; no loan crosses the schedule.
+            unsafe { crate::lowlevel::interrupts::trigger_software_schedule_direct(&resume) };
+        }
+        committed
+    })
+}
+
 /// Commit the server's endpoint receive block, then settle the completed reply
 /// and dispatch its exact caller in the same scheduler acquisition.
 ///

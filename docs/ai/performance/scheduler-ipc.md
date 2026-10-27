@@ -260,31 +260,36 @@ explains the Release/Acquire distinction retained by reader release and
 zero-reader claim admission. Neither reference proves RustOS's protocol; the
 owner contract, original-resource race tests and mutation witnesses do.
 
-The later Phase-3 ownership cut is not another fusion. Wait reason kind, arm,
-block intent, and runnable intent now share `RunOwnerWord`; the ordinary commit
-is a single CAS and a wake either clears the arm first (commit refuses sleep)
-or restores runnable intent after the commit. The catalog remains only as the
-invalid-owner fallback. A one-vCPU instrumented census measured catalog
-acquisitions per scheduler entry at **1.99**, down from 2.59 before this cut.
-The remaining normal-path entries are dispatch, reply-wake handoff, pick hints,
-and retirement cleanup, so the Phase-3 zero-acquisition gate remains open.
+**Historical Phase-3 ownership cut, before catalog deletion:** wait reason,
+arm, block intent and runnable intent moved into `RunOwnerWord`; the ordinary
+commit became one CAS, with wake either withdrawing the arm or restoring runnable
+intent after commit. At that stage the catalog still supplied the invalid-owner
+fallback. A one-vCPU instrumented census measured **1.99** catalog acquisitions
+per scheduler entry, down from 2.59; dispatch, reply wake, pick hints and cleanup
+still entered it. Those were intermediate measurements, not today's catalog
+ownership: the current independent path described above deletes that catalog.
 
-**Five telemetry profiles are build switches, all off by default**:
-`[lock_telemetry]`, `[scheduler_telemetry]`, `[syscall_telemetry]`, and
-`[ipc_telemetry]`, plus `[usermem_telemetry]`
-`phase_profile` in `config/rustos.toml`. Each cost more than the work it
-measured. Turn one on for a diagnosis run and read the result as the cost of an
-*instrumented* operation.
+**Six telemetry profiles are build switches, all off by default**:
+`[lock_telemetry]`, `[scheduler_telemetry]`, `[syscall_telemetry]`,
+`[ipc_telemetry]`, `[usermem_telemetry]` and `[lifecycle_telemetry]`, via
+`phase_profile` in `config/rustos.toml`. They add measurement overhead. Turn one
+on for diagnosis and read its timings as the cost of an *instrumented*
+operation, not the shipping path.
 
-**FPU custody is an invariant, not a save.** Both kernel entry paths preserve
-`xmm0`-`xmm15` and nothing else. x87, MXCSR, and the `ymm` upper halves are held
-by `tools/xtask/src/build/nucleus_audit.rs`, which audits the linked image on
-every build and fails it on any x87 instruction, any floating-point arithmetic,
-or wide SIMD outside `kernel_hal::arch::simd::wide_simd_section`. The one
-exception is the 32-bit `_start` transition stub: it runs before any user
-register set exists, and x86-64 `objdump` misdecodes its far jump as x87 bytes.
-Adding floating-point work after `rustos_multiboot_long_mode` is therefore a
-build error, by design.
+**FPU custody is an invariant, not a blanket prefix save.** Ordinary kernel
+entries preserve their XMM prefix. The four opt-in register-IPC operations omit
+the user-XMM prefix and declare FP/vector data caller-clobbered, but preserve
+entering x87 controls/MXCSR and sanitize data on every finalized return; see
+[the register IPC ABI](../abi/ipc.md#register-short-message-abi). Full asynchronous
+scheduler custody remains mandatory outside admitted lane elision.
+`tools/xtask/src/build/nucleus_audit.rs` audits the linked image on every build:
+floating-point arithmetic and unapproved x87 instructions are rejected, and wide
+SIMD stays inside `kernel_hal::arch::simd::wide_simd_section`. Named register-IPC
+control-preservation/sanitization instructions are explicit custody exceptions,
+not permission for FP arithmetic. The 32-bit `_start` transition stub is also
+excluded because it predates user state and x86-64 `objdump` misdecodes its far
+jump. General floating-point work after `rustos_multiboot_long_mode` remains a
+build error.
 
 ## Executable Snapshot Path
 

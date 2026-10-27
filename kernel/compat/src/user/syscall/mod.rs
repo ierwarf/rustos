@@ -146,9 +146,13 @@ pub(super) mod park_kind {
     pub(in crate::user::syscall) const NONE: u64 = 0;
     /// A `REGISTER_CALL` waiting for its reply (`endpoint`, `reply`, `deadline_tick`).
     pub(in crate::user::syscall) const CALL: u64 = 1;
+    /// The same register reply wait, backed by a queued message/reply object.
+    pub(in crate::user::syscall) const CALL_QUEUED: u64 = 3;
     /// A `REGISTER_REPLY_RECV` whose reply is published and that waits for the
     /// next request on `endpoint`.
     pub(in crate::user::syscall) const RECV: u64 = 2;
+    /// A plain `REGISTER_RECV`: errors are not tagged as reply-committed.
+    pub(in crate::user::syscall) const RECV_INITIAL: u64 = 4;
 }
 
 // Outside the normalized SavedContext suffix: never overwritten by HAL.
@@ -434,11 +438,24 @@ extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> u64 {
     let phase = syscall_profile::charge(syscall_profile::SyscallPhase::Validate, phase);
     trace_syscall_entry(frame, abi);
     let phase = syscall_profile::charge(syscall_profile::SyscallPhase::Trace, phase);
+    // A reply an unfused `REPLY` deferred belongs to this task's next blocking
+    // receive; any other syscall wakes its caller first.
+    let carries_deferred_reply = multitask::fast_ipc_reply_deferred()
+        && if linux::consumes_deferred_fast_reply(frame.rax) {
+            true
+        } else {
+            multitask::settle_deferred_fast_ipc_reply();
+            false
+        };
     let result = if register_ipc {
         linux::dispatch_register_ipc_syscall(frame)
     } else {
         dispatch_syscall(frame, abi)
     };
+    // A receive that refused before it could carry the reply leaves it behind.
+    if carries_deferred_reply && multitask::fast_ipc_reply_deferred() {
+        multitask::settle_deferred_fast_ipc_reply();
+    }
     let phase = syscall_profile::charge(syscall_profile::SyscallPhase::Dispatch, phase);
     syscall_return(frame, register_ipc, simd_guard, result, phase)
 }

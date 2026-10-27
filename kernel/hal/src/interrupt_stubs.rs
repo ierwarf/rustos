@@ -496,6 +496,43 @@ global_asm!(
         jmp fast_ipc_dispatch_tail
     .size fast_ipc_call_direct_schedule, . - fast_ipc_call_direct_schedule
 
+    // A queued register call or an initial/spurious receive has no peer
+    // handoff. Enter the SAME dispatcher and direct-resume tail with a neutral
+    // discriminator; the Current wait was already committed with IRQs masked.
+    // There is no Rust return even when dispatch selects this task again.
+    .global ipc_wait_direct_schedule
+    .type ipc_wait_direct_schedule, @function
+    ipc_wait_direct_schedule:
+        endbr64
+        mov r10, [rdi]
+        mov r11, [rdi + 8]
+        sub rsp, 0x1b0
+        and rsp, -16
+        mov r12, rsp
+        // The generic dispatcher may read GPR arguments even with a neutral
+        // tag (Rust then_some evaluates eagerly). Initialize the entire image,
+        // including the unused SIMD prefix, without saving physical registers.
+        cld
+        xor eax, eax
+        mov ecx, 0x36
+        mov rdi, r12
+        rep stosq
+        mov qword ptr [r12 + 0x178], 1
+        mov qword ptr [r12 + 0x180], 0
+        mov [r12 + 0x188], r10
+        mov rax, cs
+        mov [r12 + 0x190], rax
+        mov qword ptr [r12 + 0x198], 2
+        mov [r12 + 0x1a0], r11
+        mov rax, ss
+        mov [r12 + 0x1a8], rax
+        cli
+        cld
+        mov rdi, r12
+        call software_schedule_interrupt_dispatch
+        jmp fast_ipc_dispatch_tail
+    .size ipc_wait_direct_schedule, . - ipc_wait_direct_schedule
+
     // Direct form of `fast_ipc_reply_schedule_trap`; see the call form.
     // rdi = reply, rsi = caller task id, rdx = context owner task id,
     // rcx = context slot, r8 = context generation,
@@ -603,6 +640,23 @@ mod tests {
         let commit = tail.find("COMMIT_CONTEXT_SWITCH").expect("stack commit");
         let shortcut = tail.find("FAST_IPC_RESUME_RIP").expect("resume shortcut");
         assert!(commit < shortcut, "the outgoing stack is released before any shortcut");
+    }
+
+    #[test]
+    fn queued_ipc_wait_uses_neutral_dispatch_and_never_returns_to_abandoned_frames() {
+        let source = include_str!("interrupt_stubs.rs");
+        let body = source.split("ipc_wait_direct_schedule:").nth(1).unwrap()
+            .split(".size ipc_wait_direct_schedule").next().unwrap();
+        let zero = body.find("rep stosq").expect("initialize every SavedContext word");
+        assert!(body.contains("xor eax, eax"));
+        assert!(body.contains("mov ecx, 0x36"));
+        assert!(zero < body.find("call software_schedule_interrupt_dispatch").unwrap());
+        assert!(body.contains("mov [r12 + 0x188], r10"));
+        assert!(body.contains("mov [r12 + 0x1a0], r11"));
+        assert!(body.contains("call software_schedule_interrupt_dispatch"));
+        assert!(body.contains("jmp fast_ipc_dispatch_tail"));
+        assert!(!body.contains("SAVE_CONTEXT"));
+        assert!(!body.contains("ret\n"));
     }
 
     #[test]
