@@ -671,6 +671,16 @@ pub fn record_anonymous_fault_census() {
         mm_api::phys::free_bytes() / rustos_user_abi::pager::PAGER_PAGE_BYTES,
         mm_api::frame_capability::pager_fault_reserve_depth().unwrap_or(usize::MAX) as u64,
     );
+    // The watermark beside the supply it gates: free pages above this reserve
+    // are all user-class allocation may take, and the denial count is how many
+    // times it was refused or cut short. Free pages at or below the reserve
+    // with a rising count is memory pressure, not a fault-path defect.
+    nucleus_core::debug::record_milestone(
+        nucleus_core::debug::LogCategory::Compat,
+        "pager-anon-census-watermark",
+        mm_api::phys::min_free_bytes() / rustos_user_abi::pager::PAGER_PAGE_BYTES,
+        mm_api::phys::user_watermark_denials(),
+    );
     nucleus_core::debug::record_milestone(
         nucleus_core::debug::LogCategory::Compat,
         "pager-anon-census-access",

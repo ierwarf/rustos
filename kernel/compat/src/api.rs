@@ -71,6 +71,23 @@ pub mod syscall {
 
 pub use syscall::init as init_syscalls;
 
+/// Ring0 fallback for the root supervisor's memory-pressure policy. See
+/// `crate::oom_watchdog`.
+pub mod oom {
+    pub use crate::oom_watchdog::OomWatchdog;
+
+    /// Called from the IRQ-off fault gate when a frame is refused. Two relaxed
+    /// stores; no lock, allocation, or process lookup.
+    pub fn note_refused_fault(process_id: u64, now_ms: u64) {
+        crate::oom_watchdog::note_refused_fault(process_id, now_ms);
+    }
+
+    /// One pass from the normal-context fault-frame producer task.
+    pub fn service(watchdog: &mut OomWatchdog) -> usize {
+        crate::oom_watchdog::service(watchdog)
+    }
+}
+
 pub mod pager {
     /// Runs a fixed amount of normal-time pager work from nucleus housekeeping.
     ///

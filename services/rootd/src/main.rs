@@ -28,6 +28,7 @@ extern crate alloc;
 
 mod control_drain;
 mod loader_wire;
+mod memory_governor;
 mod scheduling_policy;
 mod service_checkpoint;
 mod service_manifest;
@@ -73,13 +74,15 @@ use rustos_user_abi::syscall::{
     LOADER_SPAWN_ENV_BYTES, LOADER_SPAWN_EXEC_PATH_CAPACITY, LOADER_SPAWN_FLAG_DEFER_START,
     PRODUCT_MILESTONE_ROOT_CORE_READY, ROOTD_LEASE_STATE_EXITED, ROOTD_LEASE_STATE_FAILED,
     ROOTD_LEASE_STATE_RESTART_PENDING, ROOTD_LEASE_STATE_RUNNING,
-    ROOTD_TERMINATE_BROKER_ABI_VERSION, SCHEDULING_CONTEXT_POLICY_ABI_UNSET, SYS_RUSTOS_IPC_CALL,
+    ROOTD_MEMORY_BROKER_ABI_VERSION, ROOTD_TERMINATE_BROKER_ABI_VERSION,
+    RustosRootdMemoryBrokerArgs, SCHEDULING_CONTEXT_POLICY_ABI_UNSET, SYS_RUSTOS_IPC_CALL,
     SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT,
     SYS_RUSTOS_IPC_RECV_WITH_SENDER, SYS_RUSTOS_IPC_RECV_WITH_SENDER_BOUNDED,
     SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY,
     SYS_RUSTOS_IPC_TRY_RECV_WITH_SENDER, SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER,
     SYS_RUSTOS_PROC_VALIDATE_DEFERRED_SPAWN_BROKER, SYS_RUSTOS_PRODUCT_MILESTONE,
-    SYS_RUSTOS_ROOTD_TERMINATE_BROKER, SYS_RUSTOS_ROOTD_WAIT_BROKER,
+    SYS_RUSTOS_ROOTD_MEMORY_BROKER, SYS_RUSTOS_ROOTD_TERMINATE_BROKER,
+    SYS_RUSTOS_ROOTD_WAIT_BROKER,
     SYS_RUSTOS_SCHEDULING_CONTEXT_GRANT_BROKER, SYS_RUSTOS_SPAWN_EXEC,
 };
 use service_checkpoint::ServiceCheckpointStore;
@@ -284,6 +287,7 @@ pub extern "C" fn __rustos_rootd_start() -> ! {
 
     debug_line(b"rootd: initd spawned\n");
     yield_now();
+    let mut memory_governor = memory_governor::MemoryGovernor::new();
     loop {
         drain_lifecycle_events(&mut leases, &mut post_init_leases);
         // Keep post-init control draining bounded by `control_drain` too.
@@ -304,6 +308,7 @@ pub extern "C" fn __rustos_rootd_start() -> ! {
             &mut service_checkpoints,
         );
         supervise_core_readiness(&mut leases, &mut next_core_readiness_poll_ns);
+        supervise_memory_pressure(&mut memory_governor, &leases, &post_init_leases);
         // The drain above is deliberately nonblocking. Once all ready
         // messages are consumed, this one wait is the idle boundary: a new
         // control message wakes rootd immediately, while the bounded budget
@@ -1523,6 +1528,87 @@ fn reclaim_post_init_lease(
         }
     }
     Ok(())
+}
+
+/// Asks ring0 for the memory census and, when the governor finds pressure,
+/// terminates its chosen victim. Allocates nothing: the census lives on this
+/// stack, because this runs when the user-class allocator is refusing.
+fn supervise_memory_pressure(
+    governor: &mut memory_governor::MemoryGovernor,
+    leases: &[Lease],
+    post_init_leases: &[PostInitLease],
+) {
+    let mut census = RustosRootdMemoryBrokerArgs {
+        abi_version: ROOTD_MEMORY_BROKER_ABI_VERSION,
+        ..RustosRootdMemoryBrokerArgs::default()
+    };
+    let status = syscall1(
+        SYS_RUSTOS_ROOTD_MEMORY_BROKER,
+        (&mut census as *mut RustosRootdMemoryBrokerArgs) as u64,
+    );
+    let mut line = [0_u8; 96];
+    if status < 0 {
+        if governor.first_report() {
+            let len = memory_governor::format_line(
+                &mut line,
+                b"rootd: memory census rejected errno:",
+                &[(-status) as u64],
+            );
+            debug_line(&line[..len]);
+        }
+        return;
+    }
+    if governor.first_report() {
+        let len = memory_governor::format_line(
+            &mut line,
+            b"rootd: memory governor usable/free/min pages:",
+            &[census.usable_pages, census.free_pages, census.min_free_pages],
+        );
+        debug_line(&line[..len]);
+    }
+    let now_ms = rustos_svc_runtime::syscall::monotonic_nanos() / 1_000_000;
+    let rootd_pid = syscall0(SYS_GETPID) as u64;
+    let verdict = governor.assess(now_ms, &census, rootd_pid, |pid| {
+        leases.iter().any(|lease| lease.pid == pid)
+            || post_init_leases
+                .iter()
+                .any(|lease| lease.pid == pid || lease.reporter_pid == pid)
+    });
+    match verdict {
+        memory_governor::Verdict::Idle | memory_governor::Verdict::Cooldown => {}
+        memory_governor::Verdict::Recovered { free_pages } => {
+            let len = memory_governor::format_line(
+                &mut line,
+                b"rootd: oom recovered free/min:",
+                &[free_pages, census.min_free_pages],
+            );
+            debug_line(&line[..len]);
+        }
+        memory_governor::Verdict::NoVictim => {
+            let len = memory_governor::format_line(
+                &mut line,
+                b"rootd: oom no eligible victim free/min/denials:",
+                &[census.free_pages, census.min_free_pages, census.watermark_denials],
+            );
+            debug_line(&line[..len]);
+        }
+        memory_governor::Verdict::Kill {
+            process_id,
+            resident_pages,
+        } => {
+            let result = terminate_service_process(process_id);
+            let len = memory_governor::format_line(
+                &mut line,
+                if result.is_ok() {
+                    b"rootd: oom killed pid/pages/free:"
+                } else {
+                    b"rootd: oom kill rejected pid/pages/free:"
+                },
+                &[process_id, resident_pages, census.free_pages],
+            );
+            debug_line(&line[..len]);
+        }
+    }
 }
 
 fn terminate_service_process(pid: u64) -> Result<(), i32> {

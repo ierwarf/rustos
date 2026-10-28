@@ -50,19 +50,31 @@ pub(super) fn request(slot: usize, id: u64, reason: TaskRetireReason) {
 }
 
 pub(super) fn publish(mut owner: Producer) {
-    withdraw(&mut owner);
+    if !withdraw(&mut owner) {
+        owner.park_unwithdrawn();
+        return;
+    }
     owner.defer();
 }
 
 /// Stop every fresh identity/execution/Cohort admission BEFORE borrower drain.
 /// Retain the same non-Copy original producer across election without an
 /// unlocked defer/reclaim gap; no other claimant can spend this stop.
-pub(super) fn retain_for_finalization(mut owner: Producer) -> Producer {
-    withdraw(&mut owner);
-    owner.retain_stopped()
+///
+/// `Err` returns the untouched producer: another CPU's dispatch claim of this
+/// task is in flight and withdrawing now would retire the owner word under it.
+pub(super) fn retain_for_finalization(mut owner: Producer) -> Result<Producer, Producer> {
+    if !withdraw(&mut owner) {
+        return Err(owner);
+    }
+    Ok(owner.retain_stopped())
 }
 
-fn withdraw(owner: &mut Producer) {
+/// Returns false, having changed nothing, while a remote dispatch claim of the
+/// task is in flight. The run-owner retirement is first and is itself the check
+/// (see `runqueue::retire_unless_claim_in_flight`), because a check made before
+/// it could be overtaken by the claim.
+fn withdraw(owner: &mut Producer) -> bool {
     let slot = owner.slot();
     assert_ne!(
         slot,
@@ -83,8 +95,12 @@ fn withdraw(owner: &mut Producer) {
     );
     let context =
         stack_resources::context::read(slot).expect("terminal quarantine lost retained context");
+    if runqueue::retire_unless_claim_in_flight(slot, runqueue::weight::value(slot))
+        == runqueue::RetireOutcome::ClaimInFlight
+    {
+        return false;
+    }
     owner.begin_effects();
-    runqueue::retire(slot, runqueue::weight::value(slot));
     assert!(
         identity::update_live_lifecycle(slot, id, identity::LifecycleGate::Retired, true),
         "terminal quarantine lost exact lifecycle authority"
@@ -101,6 +117,7 @@ fn withdraw(owner: &mut Producer) {
         Some(context.process_handle),
         "terminal stop detached process before publication"
     );
+    true
 }
 
 #[cfg(test)]

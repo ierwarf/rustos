@@ -47,6 +47,7 @@ use crate::user::process_state::{
 };
 
 pub use self::current::{
+    MemoryCensusEntry, memory_census,
     activate_suspended_user_task, activate_suspended_user_tasks,
     activate_suspended_user_tasks_with_commit, arm_block_current_task,
     arm_block_current_task_on_endpoint, arm_block_current_task_on_pager_fault,
@@ -81,6 +82,7 @@ pub use self::current::{
     set_windows_current_thread_affinity, set_windows_process_affinity,
     settle_cancelled_ipc_reply_scheduling_context, settle_ipc_reply_scheduling_context,
     stop_current_linux_process, task_has_system_scheduling_class, terminate_user_process,
+    terminate_user_process_once, TerminateOutcome,
     terminate_user_task, user_log_ids_for_task, wait_for_child,
     wake_pager_service_waiter_for_process, wake_task, wake_user_task, windows_process_affinity,
     with_current_mm, with_current_process_credentials, with_current_process_state,

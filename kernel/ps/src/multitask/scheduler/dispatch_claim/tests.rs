@@ -14,7 +14,18 @@ use crate::user::abi::UserAbi;
 const ID: u64 = 82800;
 const KERNEL: usize = 121;
 pub(in crate::multitask::scheduler) fn fixture(current: bool, f: impl FnOnce(usize, &CpuDispatchTurn<'static>)) {
-    root_creation::tests::exec_root(
+    fixture_with_release(current, f, root_creation::tests::release);
+}
+
+/// `fixture` for a test that stops the task itself: the test then supplies the
+/// consumer ACK and reclaim, because the default teardown would try to begin a
+/// second terminal producer for a slot that is already stopped.
+pub(in crate::multitask::scheduler) fn fixture_with_release(
+    current: bool,
+    f: impl FnOnce(usize, &CpuDispatchTurn<'static>),
+    release: impl FnOnce(usize, u64, crate::multitask::process_table::ProcessHandle),
+) {
+    root_creation::tests::exec_root_with_release(
         ID,
         current,
         root_creation::tests::bootstrap(UserAbi::Linux),
@@ -49,6 +60,7 @@ pub(in crate::multitask::scheduler) fn fixture(current: bool, f: impl FnOnce(usi
                 f(slot, turn);
             });
         },
+        release,
     );
 }
 pub(in crate::multitask::scheduler) fn capture<'a>(

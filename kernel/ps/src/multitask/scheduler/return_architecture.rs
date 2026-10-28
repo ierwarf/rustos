@@ -57,40 +57,71 @@ impl<'a> ReturnArchitecture<'a> {
         turn: &'a CpuDispatchTurn<'static>,
         dispatch: SchedulerDispatch,
     ) -> Option<Self> {
-        let (cpu, original) = turn.original_current()?;
-        let receipt = turn.claimed_return()?;
-        if !turn.architecture_pending()
-            || !super::execution_interval::original_claim_is_active(turn)
-        {
-            return None;
+        Self::capture_checked(turn, dispatch).ok()
+    }
+
+    /// `capture` with the first refused check named.
+    ///
+    /// The numbering is a diagnostic contract, not an ABI: it exists so a fatal
+    /// refusal in the IRQ path can say *which* of the claim, placement, owner,
+    /// execution-bank, or MM-root checks failed instead of collapsing them all
+    /// into one `None`. Tests keep using `capture`, so the success and refusal
+    /// conditions are the same expressions as before.
+    pub(in crate::multitask) fn capture_checked(
+        turn: &'a CpuDispatchTurn<'static>,
+        dispatch: SchedulerDispatch,
+    ) -> Result<Self, u8> {
+        let (cpu, original) = turn.original_current().ok_or(1_u8)?;
+        let receipt = turn.claimed_return().ok_or(2_u8)?;
+        if !turn.architecture_pending() {
+            return Err(3);
+        }
+        if !super::execution_interval::original_claim_is_active(turn) {
+            return Err(4);
         }
         let token = receipt.token;
-        if dispatch.previous_slot != original
-            || dispatch.next_slot != token.slot
-            || dispatch.next_rsp != token.saved_rsp
-            || !frame_publication::claimed_frame_is_current(token)
-        {
-            return None;
+        if dispatch.previous_slot != original {
+            return Err(5);
+        }
+        if dispatch.next_slot != token.slot {
+            return Err(6);
+        }
+        if dispatch.next_rsp != token.saved_rsp {
+            return Err(7);
+        }
+        if !frame_publication::claimed_frame_is_current(token) {
+            return Err(8);
         }
         let owner = runqueue::owner(token.slot);
-        if owner.state != runqueue::RunOwnerState::Running
-            || owner.cpu != Some(cpu)
-            || owner.generation != receipt.running_generation
-            || !stack_resources::cpu_leases::owns_prepared(cpu, token.slot)
-            || !crate::multitask::current_identity::execution::banks::owns_execution(
-                cpu, token.slot,
-            )
-            || !turn.has_claimed_placement(token.slot)
-        {
-            return None;
+        if owner.state != runqueue::RunOwnerState::Running {
+            return Err(9);
+        }
+        if owner.cpu != Some(cpu) {
+            return Err(10);
+        }
+        if owner.generation != receipt.running_generation {
+            return Err(11);
+        }
+        if !stack_resources::cpu_leases::owns_prepared(cpu, token.slot) {
+            return Err(12);
+        }
+        if !crate::multitask::current_identity::execution::banks::owns_execution(cpu, token.slot) {
+            return Err(13);
+        }
+        if !turn.has_claimed_placement(token.slot) {
+            return Err(14);
         }
         let incoming = stack_resources::context::retained_architecture(
             cpu, token.slot, receipt.id, token.view,
-        )?;
-        if incoming.process && turn.claimed_mm_root(token.slot, receipt.id)? != incoming.root {
-            return None;
+        )
+        .ok_or(15_u8)?;
+        if incoming.process {
+            let root = turn.claimed_mm_root(token.slot, receipt.id).ok_or(16_u8)?;
+            if root != incoming.root {
+                return Err(17);
+            }
         }
-        Some(Self {
+        Ok(Self {
             turn,
             receipt,
             incoming,

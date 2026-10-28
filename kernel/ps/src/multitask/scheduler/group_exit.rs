@@ -98,7 +98,15 @@ pub(in crate::multitask) fn service(scope: &DispatchPreemption<'_>) -> bool {
             // SAFETY: borrowed ORIGINAL masked same-CPU scope remains live;
             // original producer, not a raw directory, owns source lifetime.
             unsafe { terminal_publication::guarded(producer, &runqueue_policy::online_affinity_mask); }
-            assert!(done(&census, member), "group stop lost original desired withdrawal");
+            if !done(&census, member) {
+                // Only one outcome leaves a member neither stopped nor withdrawn:
+                // its stop parked untouched behind another CPU's dispatch claim
+                // that is still in flight. That producer is the member's retained
+                // deferred stop, so resume this census once the claim has
+                // published instead of treating the member as lost.
+                census.suspend();
+                return false;
+            }
         }
     }
     census.finish();

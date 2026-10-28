@@ -63,6 +63,7 @@ the image can be staged.
 | `ipc.endpoint.enqueue` | Endpoint call admission fails before allocating or queueing message/reply state. |
 | `ipc.endpoint.reply` | Endpoint reply admission fails before consuming the one-shot reply or publishing response data. |
 | `process.spawn` | User process spawn fails as if no task slot was available. |
+| `rootd.memory.census` | The root supervisor's memory census fails with `EIO`, leaving its OOM policy blind so the ring0 watchdog must act. |
 | `waitset.register` | Wait-set registration fails before replacing the caller's existing provider observations. |
 
 ### Examples
@@ -187,6 +188,7 @@ fault.point=action
 | `ipc.endpoint.enqueue` | endpoint call admission이 message/reply 할당 또는 queue 전에 실패 |
 | `ipc.endpoint.reply` | endpoint reply admission이 one-shot reply 소비 또는 response publish 전에 실패 |
 | `process.spawn` | task slot 부족처럼 user process spawn 실패 |
+| `rootd.memory.census` | root supervisor의 memory census가 `EIO`로 실패해 OOM 정책이 눈먼 상태가 되므로 ring0 watchdog이 동작해야 함 |
 | `waitset.register` | wait-set 등록이 기존 provider observation 교체 전에 실패 |
 
 ### 예시

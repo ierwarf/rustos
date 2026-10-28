@@ -30,8 +30,16 @@ pub fn cancel_lazy_table_record(root_phys: u64, table_phys: u64) {
     FRAME_DESCRIPTORS.cancel_table(root_phys, table_phys);
 }
 
-pub fn drain_lazy_table_records(root_phys: u64) -> alloc::vec::Vec<u64> {
-    FRAME_DESCRIPTORS.drain_tables(root_phys)
+pub fn lazy_table_record_count(root_phys: u64) -> usize {
+    FRAME_DESCRIPTORS.table_count(root_phys)
+}
+
+pub fn lazy_table_record_is_owned(root_phys: u64, table_phys: u64) -> bool {
+    FRAME_DESCRIPTORS.table_is_owned(root_phys, table_phys)
+}
+
+pub fn pop_lazy_table_record(root_phys: u64) -> Option<u64> {
+    FRAME_DESCRIPTORS.pop_table(root_phys)
 }
 
 pub fn claim_data_leaf(root_phys: u64, virtual_address: u64, frame_phys: u64) -> bool {

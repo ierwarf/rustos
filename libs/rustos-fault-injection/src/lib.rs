@@ -24,6 +24,7 @@ pub const REGISTERED_FAULT_POINTS: &[&str] = &[
     "ipc.endpoint.enqueue",
     "ipc.endpoint.reply",
     "process.spawn",
+    "rootd.memory.census",
     "waitset.register",
 ];
 

@@ -181,6 +181,25 @@ where
     kvm_smoke_command_with_runtime_trace(config, args, None, Some("smp-iteration"))
 }
 
+/// The watchdog proof is only meaningful if `rootd` really cannot see memory
+/// pressure; otherwise `rootd` kills the hog first and the proof would pass for
+/// the wrong reason.
+fn require_rootd_blinding_fault(config: &Config) -> Result<()> {
+    let blind = config.project.fault_injection.enabled
+        && config
+            .project
+            .fault_injection
+            .rules
+            .iter()
+            .any(|rule| rule.as_str() == "rootd.memory.census=fail");
+    if !blind {
+        bail!(
+            "--oom-hog-watchdog needs rootd blinded: run it as RUSTOS_FAULTS='rootd.memory.census=fail' cargo xtask kvm-smoke --oom-hog-watchdog"
+        );
+    }
+    Ok(())
+}
+
 fn kvm_smoke_command_with_runtime_trace<I>(
     config: &Config,
     args: I,
@@ -200,6 +219,9 @@ where
     }
     let mut options = parse_smoke_options(args.into_iter())?;
     options.smp_formal_profile_override = smp_formal_profile_override;
+    if options.oom_hog_watchdog {
+        require_rootd_blinding_fault(config)?;
+    }
     let _launch_lock = acquire_kvm_launch_lock(&config.build_dir.join("kvm"))?;
     // A stale boot image is the most expensive mistake available here: the run
     // boots the previous build, and every conclusion drawn from it describes
@@ -449,6 +471,26 @@ fn run_one_smoke(
             &layout.dvm_serial_log,
         )?;
     }
+    if options.oom_hog {
+        let rustos_log = fs::read_to_string(&layout.debugcon_log)
+            .with_context(|| format!("read {}", layout.debugcon_log.display()))?;
+        if options.oom_hog_watchdog {
+            let evidence = validate_oom_hog_watchdog_log(&rustos_log)?;
+            println!(
+                "xtask: OOM watchdog proof: with rootd blinded, the ring0 watchdog terminated the hog (pid {}) at {} free pages, free memory recovered to {} pages, and rootd killed nothing",
+                evidence.pid, evidence.free_pages, evidence.recovered_free_pages
+            );
+        } else {
+            let evidence = validate_oom_hog_log(&rustos_log)?;
+            println!(
+                "xtask: OOM proof: rootd terminated the hog (pid {}, {} resident pages) at {} free pages, free memory recovered to {} pages, and no panic, stall, or relay failure was observed",
+                evidence.pid,
+                evidence.resident_pages,
+                evidence.free_pages,
+                evidence.recovered_free_pages
+            );
+        }
+    }
     phase("smoke-runtime-validated");
     let success_evidence = write_kvm_success_summary(
         config,
@@ -554,6 +596,9 @@ pub(crate) fn kvm_run_command(
         physical_usb_bdf,
         fit_host_window,
         ipcbench_probe: None,
+        oom_hog: false,
+        oom_hog_watchdog: false,
+        proc_stress: false,
         min_ui_fps: None,
         ui_proof_windows: DEFAULT_UI_FPS_ACTIVE_WINDOWS,
         recovery_probe: RecoveryProbe::None,

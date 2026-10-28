@@ -278,6 +278,37 @@ impl Producer {
         self
     }
 
+    /// Park an untouched producer whose target cannot be withdrawn yet because
+    /// another CPU's dispatch claim of it is in flight.
+    ///
+    /// Nothing has been withdrawn, so the stop request is the whole state: it is
+    /// recorded as deferred and the next claimant restarts the withdrawal from
+    /// the top, by which time the claiming CPU has published the task as its
+    /// Current and the ordinary remote stop applies. The request is not lost.
+    pub(in crate::multitask::scheduler) fn park_unwithdrawn(mut self) {
+        let parked = Some(self.reason);
+        {
+            let mut cell = CELLS[self.slot].state.lock();
+            assert!(
+                self.exact(&cell)
+                    && !self.effects
+                    && cell.producing
+                    && cell
+                        .producer
+                        .is_some_and(|r| matches!(r.phase, Phase::Reserved | Phase::Claimed)),
+                "terminal park lacks an untouched original producer"
+            );
+            if let Some(record) = cell.producer.as_mut() {
+                record.phase = Phase::Deferred;
+            }
+            cell.reason = parked;
+            cell.deferred = parked;
+            cell.producing = false;
+        }
+        self.live = false;
+        mark_reap_pending();
+    }
+
     pub(in crate::multitask::scheduler) fn defer(mut self) {
         {
             let mut row = CELLS[self.slot].state.lock();

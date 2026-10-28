@@ -40,6 +40,7 @@ required_models = [
     "mm-activation-close/MmActivationClose",
     "msi-vector-lifecycle/MsiVectorLifecycle",
     "netd-deferred-reply/NetdDeferredReply",
+    "oom-termination-owner/OomTerminationOwner",
     "page-cache-lifecycle/PageCacheLifecycle",
     "page-table-map-transaction/PageTableMapTransaction",
     "pager-fault-slot-lifecycle/PagerFaultSlotLifecycle",
@@ -54,6 +55,7 @@ required_models = [
     "scheduler-cpu-distribution/SchedulerCpuDistribution",
     "scheduler-cpu-ownership/SchedulerCpuOwnership",
     "scheduler-local-authority/SchedulerLocalAuthority",
+    "scheduler-terminal-claim/SchedulerTerminalClaim",
     "scheduler-thread-demotion/SchedulerThreadDemotion",
     "scheduler-wakeup/SchedulerWakeup",
     "sigchld-notification/SigchldNotification",
@@ -168,6 +170,7 @@ replace = '''Reset == /\ leaf = "Writer" /\ phase = "Retired"'''
 occurrence = 1
 invariant = "ResetWaitsExecution"
 min_counterexample_states = 4
+
 [[mutation]]
 id = "affinity-claim-task-mask-bypass"
 kind = "transition-effect"
@@ -257,6 +260,7 @@ replace = '''Reset == /\ TRUE /\ ~oldGrant /\ uid = 1'''
 occurrence = 1
 invariant = "NoResetWithOwner"
 min_counterexample_states = 3
+
 [[mutation]]
 id = "cold-exec-intent-stale-cancel-bypass"
 kind = "transition-effect"
@@ -391,6 +395,7 @@ replace = '''/\ phase = "AwaitingRsp" /\ phase' = "Committing" /\ incomingRsp' =
 occurrence = 1
 invariant = "NoReleaseBeforeIncomingRsp"
 min_counterexample_states = 8
+
 [[mutation]]
 id = "cpu-dispatch-preemption-completion-before-unlock"
 kind = "transition-guard-removal"
@@ -1016,6 +1021,7 @@ replace = '''    /\ owner = expectedOwner /\ TRUE'''
 occurrence = 1
 invariant = "ExactClaimHasExclusiveBytes"
 min_counterexample_states = 6
+
 [[mutation]]
 id = "frame-reader-claim-reader-bypass"
 kind = "transition-guard-removal"
@@ -1578,6 +1584,7 @@ replace = '''/\ phase' = "AwaitingRsp" /\ current' = FALSE /\ outgoing' = FALSE'
 occurrence = 1
 invariant = "BankConservation"
 min_counterexample_states = 6
+
 [[mutation]]
 id = "lifecycle-execution-reset-before-drain"
 kind = "transition-effect"
@@ -1742,6 +1749,18 @@ invariant = "NmiTakesNoTrackedLock"
 min_counterexample_states = 2
 
 [[mutation]]
+id = "oom-termination-owner-request-always-publishes"
+kind = "transition-effect"
+severity = "critical"
+model = "oom-termination-owner/OomTerminationOwner"
+flow = "process-lifecycle-transaction"
+find = "    /\\ IF ~queued\n"
+replace = "    /\\ IF TRUE\n"
+occurrence = 1
+invariant = "AtMostOneFinalization"
+min_counterexample_states = 5
+
+[[mutation]]
 id = "ordering-consume-stale-hint-uid"
 severity = "critical"
 kind = "transition-guard-removal"
@@ -1765,7 +1784,6 @@ occurrence = 1
 invariant = "HintPublishRequiresOriginal"
 min_counterexample_states = 2
 
-
 [[mutation]]
 id = "ordering-target-reuse-before-original-drop"
 severity = "critical"
@@ -1777,7 +1795,6 @@ replace = '''/\ TRUE /\ targetUid = 1'''
 occurrence = 1
 invariant = "OriginalOrderingTarget"
 min_counterexample_states = 2
-
 
 [[mutation]]
 id = "page-cache-cow-dirties-shared-source"
@@ -2744,6 +2761,7 @@ min_counterexample_states = 2
 # CPUID triple exit per IPI. All three were correct and none tripped an
 # assertion. A cost invariant that no mutation kills is decoration, so each of
 # the three has one here.
+
 [[mutation]]
 id = "return-foreign-reuse-before-old-mm-retired"
 kind = "transition-effect"
@@ -3355,6 +3373,37 @@ replace = '''    /\ LET valid == RetainedCurrentPublishedAdmission /\ owner = "l
 occurrence = 1
 invariant = "RetainedCurrentCommitHasExactFrameAndAdmission"
 min_counterexample_states = 5
+
+[[mutation]]
+id = "scheduler-terminal-claim-cas-resurrects-retired-owner"
+kind = "transition-effect"
+severity = "critical"
+model = "scheduler-terminal-claim/SchedulerTerminalClaim"
+flow = "scheduler-lifecycle"
+find = "    /\\ owner = OwnerLocal\n    /\\ owner' = OwnerRunning"
+replace = "    /\\ owner \\in {OwnerLocal, OwnerRetired}\n    /\\ owner' = OwnerRunning"
+occurrence = 1
+invariant = "WithdrawnMeansRetired"
+min_counterexample_states = 4
+
+[[mutation]]
+id = "scheduler-terminal-claim-withdraw-ignores-in-flight"
+kind = "transition-effect"
+severity = "critical"
+model = "scheduler-terminal-claim/SchedulerTerminalClaim"
+flow = "scheduler-lifecycle"
+find = '''    /\ IF InFlight
+          THEN /\ stop' = StopParked
+               /\ owner' = owner
+          ELSE /\ stop' = StopWithdrawn
+               /\ owner' = OwnerRetired
+'''
+replace = '''    /\ stop' = StopWithdrawn
+    /\ owner' = OwnerRetired
+'''
+occurrence = 1
+invariant = "NoRetireUnderClaim"
+min_counterexample_states = 4
 
 [[mutation]]
 id = "scheduler-transition-legacy-ready-before-custody"

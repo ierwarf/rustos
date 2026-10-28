@@ -1277,6 +1277,8 @@ mod tests {
     include!("fifo_identity_tests.rs");
     include!("fair_retry_tests.rs");
     include!("activation_claim_tests.rs");
+    include!("terminal_claim_tests.rs");
+    include!("termination_owner_tests.rs");
     include!("budget_dispatch_tests.rs");
     include!("smp_qualification_tests.rs");
     include!("pager_fault_tests.rs");

@@ -31,9 +31,15 @@ pub(super) fn nucleus_housekeeping_task(_id: u64) {
 pub(super) fn nucleus_pager_fault_refill_task(_id: u64) {
     flow_debug(61, "pager fault refill task entered");
     let mut passes = 0_u64;
+    let mut oom_watchdog = kernel_compat::api::oom::OomWatchdog::new();
     loop {
         x86_64::instructions::interrupts::enable();
-        let work = kernel_mm::api::frame_capability::service_pager_fault_frame_refill();
+        let mut work = kernel_mm::api::frame_capability::service_pager_fault_frame_refill();
+        // The ring0 fallback for rootd's memory-pressure policy. It runs here
+        // because this is the one normal-context task that already wakes when
+        // faults are refused frames; it rate-limits itself to one look per
+        // 100 ms and does nothing unless the refusals persist.
+        work += kernel_compat::api::oom::service(&mut oom_watchdog);
         // One periodic census from the one task that already wakes on fault
         // pressure. The individual fault counters each report on their own
         // first occurrence and then at a stride, which cannot distinguish "the

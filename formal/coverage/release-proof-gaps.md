@@ -512,3 +512,39 @@ recorded. The separate RustOS
 native boot-device DMA backend remains identity-only. Therefore the DMA
 hardware gate stays explicitly failed even though both finite abstractions pass
 TLC.
+
+## Static scheduler review disposition (2026-10-28)
+
+Result of a read-only review of the scheduler's terminal path, taken after an
+intermittent `irq_entry.rs` "IRQ architecture lacks the original successful
+claim" panic that execution could not reproduce on demand.
+
+Closed, with a witness in each tool that the property fits:
+
+- **Remote terminal withdraw versus an in-flight dispatch claim**
+  (`scheduler-terminal-claim`): `runqueue::retire` could retire the owner word
+  of a task another CPU had claimed but not yet published as Current. Fixed by
+  `retire_unless_claim_in_flight` plus a parked, unwithdrawn producer. TLA+
+  model, Loom and Shuttle row `scheduler-terminal-claim-window`, Kani harness
+  `terminal_withdraw_never_retires_an_in_flight_claim...`, unit regressions,
+  and implementation mutants.
+- **Two terminators of one process** (`oom-termination-owner`): the root
+  supervisor and the memory-pressure watchdog could both run the
+  once-per-process follow-up. `request_marked` now reports freshness and
+  `terminate_user_process_once` returns `Started`, `AlreadyQueued` or `Absent`.
+  TLA+, Loom, Shuttle, unit test, and mutant
+  `termination-joined-request-claims-ownership`.
+
+Not closed (boundary stated, not claimed away):
+
+- The observed IRQ-entry panic is **not confirmed** to be the withdraw race.
+  `capture_checked` now records which of its 17 checks refused
+  (`irq-architecture-capture-refused`, `arg0` = check number) before stopping.
+- The two observed `tlb_shootdown.rs` panics (2 s no-ack, then a nested
+  protocol-lock timeout) have no code defect found. `tlb-ack-liveness-timeout`
+  records the target CPU and APIC id before the panic. The redesign is a plan,
+  [TLB Shootdown Design](../../docs/architecture/tlb-shootdown-design.md); no
+  phase beyond the diagnostic is implemented.
+- Scheduler modules that received **no new** model, Loom, Shuttle or Kani
+  witness in this pass and rely on their existing unit tests: group-exit
+  service, exit membership, execution interval, process placement.

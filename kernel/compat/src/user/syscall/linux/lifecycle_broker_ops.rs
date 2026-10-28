@@ -6,7 +6,9 @@ use super::*;
 use rustos_user_abi::syscall::{
     IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY, IPC_SERVICE_CAP_PROCESS_POLICY,
     IPC_SERVICE_CAP_ROOT_SUPERVISOR, LIFECYCLE_DRAIN_BROKER_ABI_VERSION, LifecycleDrainBrokerArgs,
-    ROOTD_TERMINATE_BROKER_ABI_VERSION, RustosRootdTerminateBrokerArgs,
+    ROOTD_MEMORY_BROKER_ABI_VERSION, ROOTD_MEMORY_CENSUS_MAX_ENTRIES,
+    ROOTD_TERMINATE_BROKER_ABI_VERSION, RootdMemoryCensusEntry, RustosRootdMemoryBrokerArgs,
+    RustosRootdTerminateBrokerArgs,
 };
 
 /// A supervisor may defer a restart but must not turn the timer substrate into
@@ -183,36 +185,157 @@ pub(super) fn syscall_linux_rustos_rootd_terminate_broker(args_ptr: u64) -> u64 
     let parent_pid = multitask::parent_process_id_of(args.target_pid).unwrap_or(0);
     // The scheduler marks the process exiting before retiring any sibling, so
     // no new thread or process-scoped authority can enter during teardown.
-    if !multitask::terminate_user_process(args.target_pid) {
-        return linux_errno(LINUX_ESRCH);
+    match multitask::terminate_user_process_once(args.target_pid) {
+        multitask::TerminateOutcome::Absent => return linux_errno(LINUX_ESRCH),
+        // Another terminator (the memory-pressure watchdog) published this
+        // termination first and owns its once-per-process follow-up. Running it
+        // again would record a second exit and signal the parent twice.
+        multitask::TerminateOutcome::AlreadyQueued => {
+            crate::oom_watchdog::note_rootd_termination();
+            return 0;
+        }
+        multitask::TerminateOutcome::Started => {}
     }
-    release_all_service_handle_refs(args.target_pid);
-    ipc_ops::cleanup_service_endpoints_for_process(args.target_pid);
-    let _ = super::super::cleanup_proc_broker_state_for_process(args.target_pid);
+    crate::oom_watchdog::note_rootd_termination();
+    finalize_terminated_process(args.target_pid, parent_pid);
+    0
+}
+
+/// Everything that follows `terminate_user_process` succeeding: the revocation
+/// and the terminal status that waiters and lifecycle consumers observe. Shared
+/// by the root supervisor's terminate call and the ring0 memory-pressure
+/// watchdog so both end a process identically.
+fn finalize_terminated_process(process_id: u64, parent_pid: u64) {
+    release_all_service_handle_refs(process_id);
+    ipc_ops::cleanup_service_endpoints_for_process(process_id);
+    let _ = super::super::cleanup_proc_broker_state_for_process(process_id);
     // A fixed SIGKILL status prevents rootd policy from forging application
     // exit codes while still giving waiters and lifecycle consumers a terminal
     // result they can reason about.
     let exit_status = linux_abi::SIGKILL as i32;
-    let _ = multitask::note_process_exit_status(args.target_pid, exit_status);
-    offload_ops::record_process_exit(args.target_pid, parent_pid, exit_status);
+    let _ = multitask::note_process_exit_status(process_id, exit_status);
+    offload_ops::record_process_exit(process_id, parent_pid, exit_status);
     if parent_pid != 0 {
         multitask::queue_linux_process_sigchld(
             parent_pid,
             rustos_user_abi::syscall::PROCD_SIGCHLD_EVENT_EXIT,
         );
     }
-    0
+}
+
+/// Ends `process_id` on behalf of the memory-pressure watchdog. Normal task
+/// context only. False means the process was already gone.
+pub(crate) fn terminate_process_for_memory_pressure(process_id: u64) -> bool {
+    let parent_pid = multitask::parent_process_id_of(process_id).unwrap_or(0);
+    // Only the terminator that published the termination finalizes it, so a
+    // root supervisor kill racing this one cannot record the exit twice.
+    if multitask::terminate_user_process_once(process_id) != multitask::TerminateOutcome::Started {
+        return false;
+    }
+    finalize_terminated_process(process_id, parent_pid);
+    true
+}
+
+fn rootd_memory_args_are_valid(args: &RustosRootdMemoryBrokerArgs) -> bool {
+    args.abi_version == ROOTD_MEMORY_BROKER_ABI_VERSION
+        && args.reserved0 == 0
+        && args.flags == 0
+        && args.reserved1 == 0
+        && args.entry_count == 0
+}
+
+/// The injected-failure boundary of the census call: when active, `rootd`
+/// receives `EIO` and is blind to memory pressure exactly as a wedged
+/// supervisor would be, which is how the ring0 watchdog is exercised.
+fn memory_census_fault_gate(injected_failure: bool) -> Result<(), i64> {
+    if injected_failure {
+        Err(LINUX_EIO)
+    } else {
+        Ok(())
+    }
+}
+
+/// Page counts of the physical allocator, in 4 KiB pages.
+struct MemoryPressureStats {
+    usable_pages: u64,
+    free_pages: u64,
+    min_free_pages: u64,
+    watermark_denials: u64,
+}
+
+fn build_memory_reply(
+    stats: &MemoryPressureStats,
+    census: &[multitask::MemoryCensusEntry],
+) -> RustosRootdMemoryBrokerArgs {
+    let mut reply = RustosRootdMemoryBrokerArgs {
+        abi_version: ROOTD_MEMORY_BROKER_ABI_VERSION,
+        usable_pages: stats.usable_pages,
+        free_pages: stats.free_pages,
+        min_free_pages: stats.min_free_pages,
+        watermark_denials: stats.watermark_denials,
+        ..RustosRootdMemoryBrokerArgs::default()
+    };
+    let count = census.len().min(ROOTD_MEMORY_CENSUS_MAX_ENTRIES);
+    for (slot, entry) in reply.entries.iter_mut().zip(&census[..count]) {
+        *slot = RootdMemoryCensusEntry {
+            process_id: entry.process_id,
+            parent_process_id: entry.parent_process_id,
+            resident_pages: entry.resident_pages,
+        };
+    }
+    reply.entry_count = count as u32;
+    reply
+}
+
+/// Report memory pressure and the largest live processes to the root
+/// supervisor. Ring0 only measures: which process, if any, to terminate is
+/// rootd policy, enacted through `SYS_RUSTOS_ROOTD_TERMINATE_BROKER`.
+pub(super) fn syscall_linux_rustos_rootd_memory_broker(args_ptr: u64) -> u64 {
+    if !ipc_ops::current_process_has_service_capability(IPC_SERVICE_CAP_ROOT_SUPERVISOR) {
+        return linux_errno(LINUX_EPERM);
+    }
+    if let Err(errno) = memory_census_fault_gate(
+        nucleus_core::util::fault_injection::should_fail("rootd.memory.census"),
+    ) {
+        return linux_errno(errno);
+    }
+    let args = match usermem::read_current_user_struct::<RustosRootdMemoryBrokerArgs>(args_ptr) {
+        Ok(args) => args,
+        Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
+    };
+    if !rootd_memory_args_are_valid(&args) {
+        return linux_errno(LINUX_EINVAL);
+    }
+    let page_bytes = rustos_user_abi::pager::PAGER_PAGE_BYTES;
+    let stats = MemoryPressureStats {
+        usable_pages: crate::memory::phys::usable_bytes() / page_bytes,
+        free_pages: crate::memory::phys::free_bytes() / page_bytes,
+        min_free_pages: crate::memory::phys::min_free_bytes() / page_bytes,
+        watermark_denials: crate::memory::phys::user_watermark_denials(),
+    };
+    let mut census = [multitask::MemoryCensusEntry::default(); ROOTD_MEMORY_CENSUS_MAX_ENTRIES];
+    let count = multitask::memory_census(&mut census);
+    let reply = build_memory_reply(&stats, &census[..count]);
+    match usermem::write_current_user_struct(args_ptr, &reply) {
+        Ok(()) => 0,
+        Err(err) => linux_errno(address_space_error_to_linux_errno(err)),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        lifecycle_drain_args_are_valid, retired_process_fault_vector,
-        rootd_terminate_args_are_valid, rootd_wait_delay_is_valid,
+        MemoryPressureStats, build_memory_reply, lifecycle_drain_args_are_valid,
+        memory_census_fault_gate,
+        retired_process_fault_vector, rootd_memory_args_are_valid, rootd_terminate_args_are_valid,
+        rootd_wait_delay_is_valid,
     };
+    use crate::multitask;
     use rustos_user_abi::syscall::{
         LIFECYCLE_DRAIN_BROKER_ABI_VERSION, LifecycleDrainBrokerArgs,
-        ROOTD_TERMINATE_BROKER_ABI_VERSION, RustosRootdTerminateBrokerArgs,
+        ROOTD_MEMORY_BROKER_ABI_VERSION, ROOTD_MEMORY_CENSUS_MAX_ENTRIES,
+        ROOTD_TERMINATE_BROKER_ABI_VERSION, RustosRootdMemoryBrokerArgs,
+        RustosRootdTerminateBrokerArgs,
     };
 
     #[test]
@@ -239,6 +362,77 @@ mod tests {
             reserved2: 1,
             ..valid
         }));
+    }
+
+    #[test]
+    fn rootd_memory_census_fault_blinds_the_supervisor_without_touching_state() {
+        assert_eq!(memory_census_fault_gate(false), Ok(()));
+        assert_eq!(memory_census_fault_gate(true), Err(super::LINUX_EIO));
+    }
+
+    #[test]
+    fn memory_census_request_is_exact_version_with_empty_reply_fields() {
+        let valid = RustosRootdMemoryBrokerArgs {
+            abi_version: ROOTD_MEMORY_BROKER_ABI_VERSION,
+            ..RustosRootdMemoryBrokerArgs::default()
+        };
+        assert!(rootd_memory_args_are_valid(&valid));
+        for bad in [
+            RustosRootdMemoryBrokerArgs {
+                abi_version: 0,
+                ..valid
+            },
+            RustosRootdMemoryBrokerArgs { flags: 1, ..valid },
+            RustosRootdMemoryBrokerArgs {
+                reserved0: 1,
+                ..valid
+            },
+            RustosRootdMemoryBrokerArgs {
+                reserved1: 1,
+                ..valid
+            },
+            RustosRootdMemoryBrokerArgs {
+                entry_count: 1,
+                ..valid
+            },
+        ] {
+            assert!(!rootd_memory_args_are_valid(&bad));
+        }
+    }
+
+    #[test]
+    fn memory_reply_carries_stats_and_clamps_the_census() {
+        let stats = MemoryPressureStats {
+            usable_pages: 1000,
+            free_pages: 40,
+            min_free_pages: 64,
+            watermark_denials: 7,
+        };
+        let sample_count = ROOTD_MEMORY_CENSUS_MAX_ENTRIES + 5;
+        let census: alloc::vec::Vec<multitask::MemoryCensusEntry> = (0..sample_count)
+            .map(|index| multitask::MemoryCensusEntry {
+                process_id: index as u64 + 1,
+                parent_process_id: 1,
+                resident_pages: 100 - index as u64,
+            })
+            .collect();
+        let reply = build_memory_reply(&stats, &census);
+        assert_eq!(reply.abi_version, ROOTD_MEMORY_BROKER_ABI_VERSION);
+        assert_eq!(
+            (
+                reply.usable_pages,
+                reply.free_pages,
+                reply.min_free_pages,
+                reply.watermark_denials
+            ),
+            (1000, 40, 64, 7)
+        );
+        assert_eq!(reply.entry_count as usize, ROOTD_MEMORY_CENSUS_MAX_ENTRIES);
+        assert_eq!(reply.entries[0].process_id, 1);
+        assert_eq!(reply.entries[0].resident_pages, 100);
+        let short = build_memory_reply(&stats, &census[..2]);
+        assert_eq!(short.entry_count, 2);
+        assert_eq!(short.entries[2].process_id, 0);
     }
 
     #[test]

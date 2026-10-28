@@ -352,7 +352,7 @@ fn ensure_len_locked(state: &mut MemfdState, len: usize) -> Result<(), MemfdErro
     let required_pages = len.div_ceil(PAGE_SIZE);
     let original_len = state.frames.len();
     while state.frames.len() < required_pages {
-        let Some(frame_phys) = phys::alloc_frame() else {
+        let Some(frame_phys) = phys::alloc_frame_user() else {
             for frame_phys in state.frames.drain(original_len..) {
                 phys::free_frame(PhysAddr::new(frame_phys));
             }

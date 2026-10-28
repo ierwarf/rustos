@@ -55,6 +55,24 @@ pub(super) fn withdraw_pager_policy_owner(process_id: u64) {
         PAGER_POLICY_OWNER.compare_exchange(process_id, 0, Ordering::Release, Ordering::Relaxed);
 }
 
+/// Whether `process_id` owns any live service endpoint.
+///
+/// The registry is the kernel's own record of which processes are named
+/// services, so protecting them needs no list of names in ring0. Normal context
+/// only: it takes the registry mutation lock.
+pub(crate) fn process_owns_service_endpoint(process_id: u64) -> bool {
+    if process_id == 0 {
+        return false;
+    }
+    let _registry = SERVICE_ENDPOINT_REGISTRY_MUTATION.lock();
+    SERVICE_ENDPOINTS
+        .iter()
+        .zip(SERVICE_ENDPOINT_OWNERS.iter())
+        .any(|(endpoint, owner)| {
+            endpoint.load(Ordering::Acquire) != 0 && owner.load(Ordering::Acquire) == process_id
+        })
+}
+
 pub(super) fn current_process_has_service_capability_locked(
     capability: u64,
     process_id: u64,

@@ -163,6 +163,7 @@ fn try_handle_current_user_page_fault(
                 hal_api::UserFaultDisposition::Resumed
             }
             compat_api::pager::AnonymousFaultOutcome::Refused => {
+                note_refused_frame();
                 hal_api::UserFaultDisposition::Unhandled
             }
         };
@@ -189,6 +190,7 @@ fn try_handle_current_user_page_fault(
                 hal_api::UserFaultDisposition::Resumed
             }
             compat_api::pager::AnonymousFaultOutcome::Refused => {
+                note_refused_frame();
                 nucleus_core::debug::record_milestone(
                     nucleus_core::debug::LogCategory::Compat,
                     "pager-user-anon-fault-refused",
@@ -269,6 +271,16 @@ fn try_handle_current_user_page_fault(
     }
     cancel_reserved_fault(reservation, binding);
     hal_api::UserFaultDisposition::Unhandled
+}
+
+/// Tells the memory-pressure watchdog which process was refused a frame. Runs
+/// at exception entry with IF clear, so it is two relaxed stores and a lock-free
+/// read of the scheduler-stamped current process.
+fn note_refused_frame() {
+    if let Some(process_id) = ps_api::current_user_process_id() {
+        let now_ms = hal_api::arch::clock::monotonic_nanos() / 1_000_000;
+        compat_api::oom::note_refused_fault(process_id, now_ms);
+    }
 }
 
 fn retire_current_user_task_due_to_fault(

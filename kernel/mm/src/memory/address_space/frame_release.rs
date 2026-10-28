@@ -39,30 +39,59 @@ fn settle_frame_chunks(frames: &[u64], mut free_batch: impl FnMut(&[PhysAddr]) -
     }
 }
 
-/// Frees retired frames in bounded chunks and reports allocator rejections
-/// only after the allocator lock and IRQ-off region have ended.
-pub(super) fn free_retired_frames_logged(pml4_frame_phys: u64, frames: impl Iterator<Item = u64>) {
-    let mut batch = [PhysAddr::new(0); FRAME_BATCH_CHUNK];
-    let mut failures = [(PhysAddr::new(0), phys::FreeFrameError::AlreadyFree); FRAME_BATCH_CHUNK];
-    let mut batch_len = 0;
-    for frame_phys in frames {
+/// Accumulates retired frames on the stack and hands them to the allocator one
+/// bounded batch at a time.
+///
+/// Retirement pushes frames as it discovers them, so no collection that grows
+/// with the address space is ever allocated on a path that runs under memory
+/// pressure.
+pub(super) struct RetiredFrameBatcher {
+    pml4_frame_phys: u64,
+    batch: [PhysAddr; FRAME_BATCH_CHUNK],
+    failures: [(PhysAddr, phys::FreeFrameError); FRAME_BATCH_CHUNK],
+    batch_len: usize,
+}
+
+impl RetiredFrameBatcher {
+    pub(super) fn new(pml4_frame_phys: u64) -> Self {
+        Self {
+            pml4_frame_phys,
+            batch: [PhysAddr::new(0); FRAME_BATCH_CHUNK],
+            failures: [(PhysAddr::new(0), phys::FreeFrameError::AlreadyFree); FRAME_BATCH_CHUNK],
+            batch_len: 0,
+        }
+    }
+
+    pub(super) fn push(&mut self, frame_phys: u64) {
         if frame_phys == 0 || frame_phys % PAGE_4KIB_U64 != 0 {
             crate::debug::println!(
                 "process address space: skipping invalid retired frame root={:#x} frame={:#x}",
-                pml4_frame_phys,
+                self.pml4_frame_phys,
                 frame_phys,
             );
-            continue;
+            return;
         }
-        batch[batch_len] = PhysAddr::new(frame_phys);
-        batch_len += 1;
-        if batch_len == FRAME_BATCH_CHUNK {
-            report_free_failures(pml4_frame_phys, &batch, batch_len, &mut failures);
-            batch_len = 0;
+        self.batch[self.batch_len] = PhysAddr::new(frame_phys);
+        self.batch_len += 1;
+        if self.batch_len == FRAME_BATCH_CHUNK {
+            self.flush();
         }
     }
-    if batch_len != 0 {
-        report_free_failures(pml4_frame_phys, &batch, batch_len, &mut failures);
+
+    fn flush(&mut self) {
+        if self.batch_len != 0 {
+            report_free_failures(
+                self.pml4_frame_phys,
+                &self.batch,
+                self.batch_len,
+                &mut self.failures,
+            );
+            self.batch_len = 0;
+        }
+    }
+
+    pub(super) fn finish(mut self) {
+        self.flush();
     }
 }
 

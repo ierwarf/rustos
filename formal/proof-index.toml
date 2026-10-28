@@ -207,6 +207,17 @@ harnesses = ["running_frame_geometry_never_inherits_a_distant_generation_or_fore
 depends_on = ["scheduler-frame-custody"]
 
 [[proof]]
+id = "scheduler-terminal-withdraw-claim"
+kind = "kani"
+package = "rustos-scheduler-frame-gate"
+source = "libs/rustos-scheduler-frame-gate/src/lib.rs"
+symbol = "terminal_withdraw_must_wait"
+formal_model = "scheduler-terminal-claim/SchedulerTerminalClaim"
+scope = "bounded two-flag decision: a Running owner without a published execution role must wait, and a published or non-Running owner never waits; excludes the owner-word CAS, the role's memory ordering and the cleanup cell"
+harnesses = ["terminal_withdraw_never_retires_an_in_flight_claim_and_never_blocks_a_published_stop"]
+depends_on = ["scheduler-frame-custody"]
+
+[[proof]]
 id = "smp-qualification-bind-wire"
 kind = "kani"
 package = "rustos-user-abi"

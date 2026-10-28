@@ -79,6 +79,9 @@ pub const SYS_RUSTOS_ROOTD_WAIT_BROKER: u64 = 0x5255_003b;
 /// Rootd-only final process teardown.  Admission and target selection remain
 /// rootd lease policy; ring0 atomically performs the process-resource cleanup.
 pub const SYS_RUSTOS_ROOTD_TERMINATE_BROKER: u64 = 0x5255_003c;
+/// Root-supervisor memory-pressure census. Appended after the IPC register
+/// calls; 0x5255_0056 was the first unused number when it was added.
+pub const SYS_RUSTOS_ROOTD_MEMORY_BROKER: u64 = 0x5255_0056;
 /// Capability-gated, event-driven wait for the DVM input transport. Only
 /// inputd may use this to wait for an MSI-X-published ingress batch; input
 /// policy and translation remain in the service.
@@ -912,6 +915,10 @@ pub const LIFECYCLE_DRAIN_BROKER_ABI_VERSION: u16 = 1;
 /// Root-supervisor termination is versioned independently from every other
 /// process broker operation.
 pub const ROOTD_TERMINATE_BROKER_ABI_VERSION: u16 = 1;
+/// Root-supervisor memory census, versioned independently of termination.
+pub const ROOTD_MEMORY_BROKER_ABI_VERSION: u16 = 1;
+/// Fixed size of the census: the live processes with the largest resident sets.
+pub const ROOTD_MEMORY_CENSUS_MAX_ENTRIES: usize = 32;
 pub const PROC_BROKER_FORMAT_ELF64: u16 = 1;
 pub const PROC_BROKER_FORMAT_PE64: u16 = 2;
 pub const PROC_BROKER_MAP_READ: u64 = 1 << 0;
@@ -2818,6 +2825,38 @@ pub struct RustosRootdTerminateBrokerArgs {
     pub reserved0: u16,
     pub flags: u32,
     pub target_pid: u64,
+}
+
+/// One process in the memory census. `resident_pages` is the count of mapped
+/// 4 KiB data leaves in its address space, shared copy-on-write aliases
+/// included; page-table frames are not counted.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RootdMemoryCensusEntry {
+    pub process_id: u64,
+    pub parent_process_id: u64,
+    pub resident_pages: u64,
+}
+
+/// Request and reply of `SYS_RUSTOS_ROOTD_MEMORY_BROKER`. The caller sets
+/// `abi_version` and zeroes everything else; ring0 fills the rest in place.
+/// `entries[..entry_count]` are ordered by `resident_pages`, largest first.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RustosRootdMemoryBrokerArgs {
+    pub abi_version: u16,
+    pub reserved0: u16,
+    pub flags: u32,
+    pub usable_pages: u64,
+    pub free_pages: u64,
+    /// Pages only kernel-class allocation may use; user-class allocation is
+    /// refused at or below this.
+    pub min_free_pages: u64,
+    /// Monotonic count of user-class allocations refused or cut short.
+    pub watermark_denials: u64,
+    pub entry_count: u32,
+    pub reserved1: u32,
+    pub entries: [RootdMemoryCensusEntry; ROOTD_MEMORY_CENSUS_MAX_ENTRIES],
 }
 
 #[repr(C)]

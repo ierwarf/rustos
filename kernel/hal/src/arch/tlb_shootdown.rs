@@ -512,6 +512,15 @@ fn finish_shootdown(scope: MutationScope) {
             }
             let elapsed = deadline.elapsed_nanos();
             if elapsed >= ACK_LIVENESS_TIMEOUT_NS {
+                // The panic text below is lost when another CPU, blocked behind
+                // the protocol lock this CPU still holds, panics concurrently
+                // and prints a nested panic. A milestone survives that.
+                crate::debug::record_milestone(
+                    crate::debug::LogCategory::Sched,
+                    "tlb-ack-liveness-timeout",
+                    (u64::from(descriptor.logical_index) << 32) | u64::from(descriptor.apic_id),
+                    generation,
+                );
                 panic!(
                     "TLB liveness watchdog: generation {generation} retained reclaim quarantine while logical CPU {} APIC {} failed to acknowledge after {}ns",
                     descriptor.logical_index,

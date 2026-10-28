@@ -335,27 +335,65 @@ impl FrameDescriptorLedger {
         );
     }
 
-    fn drain_tables(&self, root_phys: u64) -> alloc::vec::Vec<u64> {
+    /// Counts the published lazy tables of a retiring root without allocating.
+    fn table_count(&self, root_phys: u64) -> usize {
         let root = self
             .verify_root(root_phys)
             .expect("retired root is outside frame descriptors");
-        let mut current = root.owner_or_table_head.swap(0, DESCRIPTOR_ACQ_REL);
         let maximum = self.frame_count.load(DESCRIPTOR_ACQUIRE);
-        let mut tables = alloc::vec::Vec::new();
+        let mut current = root.owner_or_table_head.load(DESCRIPTOR_ACQUIRE);
+        let mut count = 0;
         while current != 0 {
-            assert!(tables.len() < maximum, "frame-descriptor table cycle");
+            assert!(count < maximum, "frame-descriptor table cycle");
             let table = self
                 .record(current)
                 .expect("table descriptor points outside metadata");
-            assert_eq!(table.role.load(DESCRIPTOR_ACQUIRE), ROLE_LAZY_TABLE);
-            assert_eq!(table.owner_or_table_head.load(Ordering::Relaxed), root_phys);
-            let next = table.next_or_virtual_address.swap(0, DESCRIPTOR_ACQ_REL);
-            table.owner_or_table_head.store(0, Ordering::Relaxed);
-            table.role.store(ROLE_FREE, DESCRIPTOR_RELEASE);
-            tables.push(current);
-            current = next;
+            current = table.next_or_virtual_address.load(Ordering::Relaxed);
+            count += 1;
         }
-        tables
+        count
+    }
+
+    /// Whether `table_phys` is a published lazy table owned by `root_phys`.
+    fn table_is_owned(&self, root_phys: u64, table_phys: u64) -> bool {
+        self.record(table_phys).is_some_and(|table| {
+            table.role.load(DESCRIPTOR_ACQUIRE) == ROLE_LAZY_TABLE
+                && table.owner_or_table_head.load(Ordering::Relaxed) == root_phys
+        })
+    }
+
+    /// Detaches the newest published lazy table of a retiring root.
+    ///
+    /// Retirement holds the only reference to the root, so no publisher races
+    /// the head. Popping one record at a time lets the caller settle each table
+    /// frame in a bounded batch instead of materializing the whole set.
+    fn pop_table(&self, root_phys: u64) -> Option<u64> {
+        let root = self
+            .verify_root(root_phys)
+            .expect("retired root is outside frame descriptors");
+        let current = root.owner_or_table_head.load(DESCRIPTOR_ACQUIRE);
+        if current == 0 {
+            return None;
+        }
+        let table = self
+            .record(current)
+            .expect("table descriptor points outside metadata");
+        assert_eq!(table.role.load(DESCRIPTOR_ACQUIRE), ROLE_LAZY_TABLE);
+        assert_eq!(table.owner_or_table_head.load(Ordering::Relaxed), root_phys);
+        let next = table.next_or_virtual_address.swap(0, DESCRIPTOR_ACQ_REL);
+        assert_eq!(
+            root.owner_or_table_head.compare_exchange(
+                current,
+                next,
+                DESCRIPTOR_ACQ_REL,
+                DESCRIPTOR_ACQUIRE
+            ),
+            Ok(current),
+            "retiring root published a table during retirement"
+        );
+        table.owner_or_table_head.store(0, Ordering::Relaxed);
+        table.role.store(ROLE_FREE, DESCRIPTOR_RELEASE);
+        Some(current)
     }
 
     fn claim_exclusive_data(&self, root_phys: u64, va: u64, frame_phys: u64) -> bool {

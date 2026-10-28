@@ -38,7 +38,16 @@ fn one_catalog_tracks_tables_and_exact_data_leaves() {
         ledger.release_data(root, va, frame),
         Some(DataLeafRelease::FrameReusable)
     );
-    assert_eq!(ledger.drain_tables(root), alloc::vec![table]);
+    assert!(ledger.table_is_owned(root, table));
+    assert!(
+        !ledger.data_is_owned(root, va, table),
+        "a table frame is never also a data leaf"
+    );
+    assert_eq!(ledger.table_count(root), 1);
+    assert_eq!(ledger.pop_table(root), Some(table));
+    assert_eq!(ledger.pop_table(root), None);
+    assert_eq!(ledger.table_count(root), 0);
+    assert!(!ledger.table_is_owned(root, table));
     ledger.unregister_root(root);
 }
 

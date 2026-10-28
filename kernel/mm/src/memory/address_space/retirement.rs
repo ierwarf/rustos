@@ -25,43 +25,31 @@ impl Drop for ProcessAddressSpace {
     }
 }
 
-fn assert_tagged_ownership(root_phys: u64, tagged: &PagerFaultOwnership) {
-    for leaf in &tagged.leaves {
-        let frame = leaf.physical_address;
-        assert!(
-            tagged.tables.binary_search(&frame).is_err(),
-            "process address space: frame claimed as both leaf and table root={root_phys:#x} frame={frame:#x}"
-        );
-        assert!(
-            phys::data_leaf_is_owned(root_phys, leaf.virtual_address, leaf.physical_address,),
-            "process address space: leaf tag disagrees with data descriptor root={root_phys:#x} va={:#x} frame={frame:#x}",
-            leaf.virtual_address,
-        );
-    }
+/// Stops retirement when a PTE ownership tag has no matching descriptor.
+///
+/// A frame has exactly one descriptor role, so a frame tagged as both a leaf and
+/// a table fails one of the two lookups that feed this check.
+fn assert_tagged_frame_owned(root_phys: u64, frame: u64, kind: &str, owned: bool) {
+    assert!(
+        owned,
+        "process address space: {kind} tag disagrees with its descriptor root={root_phys:#x} frame={frame:#x}"
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn tagged(tables: &[u64], leaves: &[(u64, u64)]) -> PagerFaultOwnership {
-        PagerFaultOwnership {
-            tables: tables.to_vec(),
-            leaves: leaves
-                .iter()
-                .map(|&(virtual_address, physical_address)| PagerFaultLeaf {
-                    virtual_address,
-                    physical_address,
-                })
-                .collect(),
-        }
+    #[test]
+    fn a_tagged_frame_with_a_descriptor_passes() {
+        assert_tagged_frame_owned(0x1000, 0x4000, "leaf", true);
     }
 
     #[test]
-    #[should_panic(expected = "frame claimed as both leaf and table")]
+    #[should_panic(expected = "tag disagrees with its descriptor")]
     fn one_frame_cannot_be_owned_as_both_a_leaf_and_a_table() {
-        let ownership = tagged(&[0x4000], &[(0x1_0000_0000, 0x4000)]);
-        assert_tagged_ownership(0x1000, &ownership);
+        // The table lookup reports a frame the ledger holds only as data.
+        assert_tagged_frame_owned(0x1000, 0x4000, "table", false);
     }
 }
 
@@ -84,56 +72,71 @@ pub(super) fn reclaim_root(root: u64) {
         panic!("cannot drop the active process address space");
     }
 
-    let mut tagged = match address_space.pager_fault_ownership() {
-        Ok(tagged) => tagged,
-        Err(error) => panic!(
-            "process address space: page-table ownership walk found corruption root={:#x} error={:?}",
-            address_space.pml4_frame_phys, error
-        ),
-    };
-    let mut explicit_tables =
-        crate::memory::phys::drain_lazy_table_records(address_space.pml4_frame_phys);
-    explicit_tables.sort_unstable();
-    tagged.tables.sort_unstable();
+    let root_phys = address_space.pml4_frame_phys;
+
+    // Pass 1 validates the whole topology against the descriptor ledger before
+    // any frame is released, and allocates nothing: the walk is streamed and
+    // every comparison is a count or a per-frame descriptor lookup. A table or
+    // data frame has exactly one descriptor role, so a frame claimed as both a
+    // leaf and a table fails one of the two ownership checks below.
+    let mut tagged_tables = 0_usize;
+    let mut tagged_leaves = 0_u64;
+    if let Err(error) = address_space.walk_pager_fault_ownership(
+        |table| {
+            assert_tagged_frame_owned(
+                root_phys,
+                table,
+                "table",
+                phys::lazy_table_record_is_owned(root_phys, table),
+            );
+            tagged_tables += 1;
+        },
+        |leaf| {
+            assert_tagged_frame_owned(
+                root_phys,
+                leaf.physical_address,
+                "leaf",
+                phys::data_leaf_is_owned(root_phys, leaf.virtual_address, leaf.physical_address),
+            );
+            tagged_leaves += 1;
+        },
+    ) {
+        panic!(
+            "process address space: page-table ownership walk found corruption root={root_phys:#x} error={error:?}"
+        );
+    }
     assert_eq!(
-        explicit_tables, tagged.tables,
-        "process address space: explicit lazy-table ledger disagrees with PTE tags root={:#x}",
-        address_space.pml4_frame_phys,
+        phys::lazy_table_record_count(root_phys),
+        tagged_tables,
+        "process address space: explicit lazy-table ledger disagrees with PTE tags root={root_phys:#x}",
+    );
+    let descriptor_count =
+        phys::data_leaf_count(root_phys).expect("retired root lost its data-leaf descriptor");
+    assert_eq!(
+        descriptor_count, tagged_leaves,
+        "process address space: data-leaf descriptor count disagrees with PTE tags root={root_phys:#x}",
     );
 
-    let descriptor_count = phys::data_leaf_count(address_space.pml4_frame_phys)
-        .expect("retired root lost its data-leaf descriptor");
-    assert_eq!(
-        descriptor_count as usize,
-        tagged.leaves.len(),
-        "process address space: data-leaf descriptor count disagrees with PTE tags root={:#x}",
-        address_space.pml4_frame_phys,
-    );
-    assert_tagged_ownership(address_space.pml4_frame_phys, &tagged);
-
-    let mut reusable_leaves = Vec::new();
-    reusable_leaves
-        .try_reserve_exact(tagged.leaves.len())
-        .expect("retirement could not reserve reusable-leaf batch");
-    for leaf in tagged.leaves.iter().copied() {
-        match phys::release_data_leaf(
-            address_space.pml4_frame_phys,
-            leaf.virtual_address,
-            leaf.physical_address,
-        ) {
-            Some(phys::DataLeafRelease::FrameReusable) => {
-                reusable_leaves.push(leaf.physical_address);
-            }
+    // Pass 2 settles each frame as it is found. Leaves go first, then tables,
+    // then the root, in bounded allocator batches held on the stack.
+    let mut frames = RetiredFrameBatcher::new(root_phys);
+    if let Err(error) = address_space.walk_pager_fault_ownership(
+        |_table| {},
+        |leaf| match phys::release_data_leaf(root_phys, leaf.virtual_address, leaf.physical_address)
+        {
+            Some(phys::DataLeafRelease::FrameReusable) => frames.push(leaf.physical_address),
             Some(phys::DataLeafRelease::FrameRetained) => {}
             None => panic!("retired PTE tag disagrees with its data-frame descriptor"),
-        }
+        },
+    ) {
+        panic!(
+            "process address space: page-table ownership changed during retirement root={root_phys:#x} error={error:?}"
+        );
     }
-    phys::unregister_data_leaf_root(address_space.pml4_frame_phys);
-
-    free_retired_frames_logged(address_space.pml4_frame_phys, reusable_leaves.into_iter());
-    free_retired_frames_logged(address_space.pml4_frame_phys, explicit_tables.into_iter());
-    free_retired_frames_logged(
-        address_space.pml4_frame_phys,
-        core::iter::once(address_space.pml4_frame_phys),
-    );
+    while let Some(table) = phys::pop_lazy_table_record(root_phys) {
+        frames.push(table);
+    }
+    phys::unregister_data_leaf_root(root_phys);
+    frames.push(root_phys);
+    frames.finish();
 }

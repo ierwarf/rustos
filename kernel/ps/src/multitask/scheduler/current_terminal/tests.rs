@@ -205,7 +205,16 @@ pub(in crate::multitask::scheduler) fn group_witness() {
     family(true, |slot, _| {
         let sibling = sibling(slot);
         let scope = DispatchPreemption::enter_model(0);
-        let receipt = crate::multitask::current::group_exit::request(&scope, ID, Some(7)).unwrap();
+        let (receipt, fresh) =
+            crate::multitask::current::group_exit::request_marked(&scope, ID, Some(7)).unwrap();
+        assert!(fresh, "the first terminator publishes the termination");
+        // A second terminator (for example the memory-pressure watchdog racing
+        // the root supervisor) joins the queued request and must not own its
+        // once-per-process follow-up.
+        let (joined, second_fresh) =
+            crate::multitask::current::group_exit::request_marked(&scope, ID, Some(8)).unwrap();
+        assert!(!second_fresh, "a queued termination is not published twice");
+        assert!(!joined.complete());
         // Original obligation: process exit admission MUST precede every worker
         // retirement; the old catalog regression now observes actual owners.
         assert_eq!(process_table::is_process_exiting(ID), Some(true));
@@ -214,6 +223,7 @@ pub(in crate::multitask::scheduler) fn group_witness() {
         assert!(!receipt.complete());
         assert!(super::super::group_exit::service(&scope));
         assert!(receipt.complete());
+        assert!(joined.complete(), "both terminators observe the one exit");
         assert!(identity::lifecycle(slot).retired);
         assert!(identity::lifecycle(sibling).retired);
         Some(sibling)

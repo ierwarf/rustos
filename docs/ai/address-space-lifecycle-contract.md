@@ -169,17 +169,17 @@ the internal error is forbidden; doing so previously made stale-slot residue
 and a `PROT_NONE` canonicality mismatch indistinguishable from allocator
 pressure.
 
-## 4. Memory pressure has no endgame
+## 4. Memory pressure: watermark and OOM policy
 
 No code in `kernel/mm` or `kernel/hal` reads the `ACCESSED` or `DIRTY` page
-table flags.  There is no aging, no reclaim, no swap, and no OOM policy.
-Exhaustion surfaces as `OutOfFrames` → `ENOMEM` or a retired thread.
+table flags.  There is no aging, no reclaim, and no swap.  Exhaustion
+surfaces as `OutOfFrames` → `ENOMEM` or a retired thread; below, the watermark
+and `rootd`'s OOM policy decide who is killed before that happens.
 
 The general-purpose answer here is **not** an LRU.  Without swap, anonymous
 pages are not reclaimable at all, and RustOS has no live page cache either
 (`page_cache.rs` is not on any path), so there is currently nothing an LRU
-could evict.  What a general-purpose kernel always has, and RustOS does not,
-is:
+could evict.  What a general-purpose kernel always has is:
 
 1. **watermarks** — a min-free reserve below which user allocation fails while
    the kernel keeps enough frames to make progress and report; and
@@ -187,35 +187,156 @@ is:
    resolves into one attributable death instead of an arbitrary thread dying
    wherever the shortage happened to land.
 
-The accessed bit becomes useful only once a reclaimable class exists.  Order:
-watermark and OOM kill first; aging and reclaim when `page_cache.rs` goes live
-or swap exists.
+**Watermark: implemented.**  `phys` keeps `min_free_frames`, set at boot by
+`min_free_for` (one 128th of free memory, clamped to 1-64 MiB, and never more
+than an eighth of a very small machine).  Allocation has two classes:
+
+- **user class** - `alloc_frame_user` / `alloc_frames_batch_user` - may take
+  only `free_frames - min_free_frames`.  Anonymous first touch and its
+  fault-frame reserve producer, copy-on-write, user page-table growth, process
+  creation and fork cloning, `memfd` pages, and frame grants are user class.
+  A short fill is the pressure signal.
+- **kernel class** - `alloc_frame`, `alloc_frames_batch`, `alloc_contiguous` -
+  may use the reserve.  Heap growth, IPC buffers, boot-time reserve wiring, and
+  everything that must run to resolve the pressure stay here.
+
+The check is one comparison on counters already inside the allocator lock, so
+it is safe on the IRQ-off fault path.  `pager-anon-census-watermark` reports
+the reserve and the denial count beside `pager-anon-census-supply`.
+
+**OOM policy: implemented in `rootd`; ring0 supplies mechanism only.**
+
+*Charge.*  No new counter exists.  The frame-descriptor ledger already keeps a
+per-root count of mapped data leaves (`data_leaf_count`), incremented on every
+exclusive or shared-alias publication and decremented on release, so it is the
+process's resident set.  It excludes page-table frames, which are well under
+1% of the leaves and are not safely countable from another CPU while the root
+is being retired.  Ring0 reads the count through the process's
+`ExecutionPin::root_phys`, lock-free, under the process-table lock.
+
+*Signal and census.*  `SYS_RUSTOS_ROOTD_MEMORY_BROKER` (root-supervisor
+capability only, ABI v1) returns in one copy-out: usable, free and min-free
+pages, the watermark denial count, and the up-to-32 live, non-exiting
+processes with the largest resident sets.  The bound makes the output fixed
+size; it is a top-N selection, not a victim choice.  Ring0 never decides who
+dies and keeps no pressure state.
+
+*Policy.*  `rootd` already supervises every core and post-init lease, wakes
+every 10 ms, and owns `SYS_RUSTOS_ROOTD_TERMINATE_BROKER`, which performs a
+complete teardown in one non-yielding syscall turn.  Each supervisor pass asks
+for the census.  A pass is *pressure* when free pages are at or below the
+reserve **and** the denial count has risen since the last pass: a quiet
+machine resting at the watermark is not an event.  The governor then:
+
+1. skips when a previous victim is still inside its cooldown (200 ms), so a
+   victim whose frames are not yet back does not cascade into a second kill;
+2. picks, among entries that are not `rootd`, not any core or post-init lease
+   pid, not any lease's reporter pid, and not below 16 resident pages, the
+   largest resident set (ties go to the larger pid, the younger process);
+3. terminates it through the existing broker and records the pid, charge and
+   free/reserve pages in a milestone;
+4. records `no victim` once per pressure episode when nothing qualifies.
+
+Leased services are never victims in v1.  A leaking service therefore degrades
+into refused faults instead of a kill; a restart-aware second tier belongs with
+`initd`, which owns post-init restarts.
+
+*End-to-end witness.*  `cargo xtask kvm-smoke --oom-hog` writes the private
+contract `/system/registry/system/oomhog-v1.env`.  `apps/oomhog` is a
+session-startup program, and runtimed launches every session program once the
+UI is ready, so it exits silently without that file.  With it, the hog waits
+3 s, then four threads touch anonymous memory until the watermark refuses them.
+A refused first touch retires only the faulting thread, so the main thread
+keeps the process alive holding about 1.4 GiB, which is the case the governor
+exists for.  The run passes only if `rootd` logs exactly one kill whose pid is
+the hog's, `rootd: oom recovered` shows at least half of the victim's pages
+back, `oomhog: survived` never appears, and the smoke's own crash/stall/relay
+checks stay clean (`validate_oom_hog_log`, `tools/xtask/src/kvm/oom_hog.rs`).
+
+*Why `rootd` can run under pressure.*  It does not allocate while governing:
+the census buffer and governor state live on its stack, which release builds
+map eagerly, and kernel-class allocation (heap, teardown) is exactly what the
+reserve exists for.  The victim's frames return when its address space retires,
+which §5 made allocation-free.
+
+*Ring0 fallback: a normal-context watchdog.*  If `rootd` is wedged, a refused
+fault still retires only the faulting thread, and the process holding the
+memory lives on.  Killing a process from the IRQ-off exception path is unsafe,
+so that path only records.  The fault-frame producer task, which already wakes
+on fault pressure, runs the watchdog once per 100 ms:
+
+1. **Record (exception path, lock-free).**  A refused anonymous or COW fault
+   stores the faulting process id in one atomic (`note_refused_fault`).
+2. **Episode.**  Pressure is free memory at or below the reserve **and** new
+   watermark denials since the previous look.  Each such look adds one tick to
+   the episode; free memory above the reserve ends it.  A look that is below
+   the reserve with no new denials leaves the count alone, because a stalled
+   hog stops asking before anyone kills it.
+3. **Defer to rootd.**  `rootd`'s terminate broker bumps a counter.  If it moved
+   at any time during the episode, rootd is alive and acting and the episode
+   restarts; the watchdog never races the policy owner.
+4. **Act.**  After 30 ticks (3 s, 300 times rootd's 10 ms pass) of episode with
+   no rootd termination, the watchdog terminates the recorded process, with the
+   same `terminate_user_process` rootd uses, unless that process owns a live
+   service endpoint.  A process that owns a service endpoint is a named
+   service by the kernel's own registry; ring0 does not know which service,
+   and the refusal is logged as `oom-watchdog-protected`.  A kill starts a
+   5 s cooldown.
+
+This is deliberately not a victim policy.  It does not search for the largest
+process; it ends the one that kept asking for memory that did not exist, and
+only after the policy owner has had three seconds.  Its state machine is the
+pure `OomWatchdog` in `kernel/compat/src/oom_watchdog.rs`.
+
+*Witness.*  The new fault point `rootd.memory.census` makes the census syscall
+fail, which blinds the governor exactly as a wedged `rootd` would.  With
+`RUSTOS_FAULTS='rootd.memory.census=fail' cargo xtask kvm-smoke --oom-hog`
+the expected kill is the watchdog's (`oom-watchdog-kill`), rootd logs no kill,
+and the same hog-death and recovery checks apply.
+
+The accessed bit becomes useful only once a reclaimable class exists: aging
+and reclaim when `page_cache.rs` goes live or swap exists.
 
 Until then, fault-around's amplification is unbounded in the same way: the run
 is 16 pages, nothing reclaims the 15 that a sparse workload never touches, and
-that combination has never been measured.
+that combination has never been measured.  It is still not gated on the
+watermark.
 
 ## 5. Retirement must not allocate
 
-`Drop for ProcessAddressSpace` calls `pager_fault_ownership`, which walks the
-user subtree and pushes every leaf and table into unbounded `Vec`s, and
-`drain_lazy_table_records`, which builds another. The two results are now
-checked against one frame descriptor catalog rather than `owned_frames` plus a
-separate table ledger, but a heap shortage during exit is still a panic — and
-exit is exactly when the system is likely to be short.
+**Implemented.**  `reclaim_root` allocates nothing.  It used to walk the user
+subtree into unbounded `Vec`s (`pager_fault_ownership`), drain a third
+(`drain_lazy_table_records`) and build a fourth for reusable leaves, so a heap
+shortage during exit was a panic - and exit is exactly when the system is
+likely to be short.
 
-`Drop` itself is not the problem, and this is worth stating because it is the
-tempting conclusion.  Linux's teardown is also refcount-triggered and
+`Drop` itself was never the problem, and this is worth stating because it is
+the tempting conclusion.  Linux's teardown is also refcount-triggered and
 synchronous: `mmput` reaching zero calls `exit_mmap` inline, and `mmput_async`
 was removed once the OOM reaper could run concurrently instead.  What Linux
 does not do is allocate.  `exit_mmap` frees as it walks, through a fixed-size
 `mmu_gather` batch with a single-page fallback that always makes progress.
 
-Required: stream the retirement walk through the existing `FRAME_BATCH_CHUNK`
-batch and free as it walks, so teardown allocates nothing.  The cross-ledger
-reconciliation currently needs all three complete sets in memory at once; it
-must become an incremental or bounded comparison, or move to a debug build,
-rather than being the reason exit allocates.
+RustOS now does the same in two passes over a root that is already inactive:
+
+1. **Validate, free nothing.**  `walk_pager_fault_ownership` streams every
+   tagged table and leaf.  Each table must be a published lazy-table
+   descriptor of this root and each leaf an exact data descriptor
+   (`lazy_table_record_is_owned`, `data_leaf_is_owned`); the tagged table count
+   must equal `lazy_table_record_count` and the tagged leaf count must equal
+   `data_leaf_count`.  A frame has one descriptor role, so a frame claimed as
+   both leaf and table fails one of the two lookups.  No frame is released on a
+   topology that failed to validate.
+2. **Settle as found.**  The same walk releases each leaf descriptor and pushes
+   reusable frames into `RetiredFrameBatcher` (`FRAME_BATCH_CHUNK` frames on the
+   stack, one bounded allocator critical section per batch).  The root's table
+   list is then popped one record at a time (`pop_lazy_table_record`), the root
+   descriptor is unregistered, and the root frame is last.
+
+`formal/run-source-conformance.sh` rejects any `Vec`, `try_reserve`, `collect`
+or `Box` token inside `reclaim_root`.  Other allocation on the exit path
+(task and process-state teardown outside `kernel/mm`) is not covered by this
+witness.
 
 ## 6. Withdrawn: live table reclamation needs no bespoke hazard protocol
 

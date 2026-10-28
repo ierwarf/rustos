@@ -87,3 +87,19 @@ not measured here. Prior lifecycle/state-rail and physical-GPU questions are
 separate scope: consult [core-path gaps](performance/core-paths-gaps.md),
 [benchmark progress](../benchmarks/core-paths-progress.md) and
 [physical GPU status](physical-gpu-status.md), then obtain fresh evidence.
+
+## Termination, OOM and hardening pass (2026-10-28)
+
+Uncommitted working tree. Added: memory-pressure governor in rootd plus ring0
+`OomWatchdog` (defers to rootd, spares service-endpoint owners), single-finalizer
+termination (`terminate_user_process_once`), the terminal-withdraw versus
+dispatch-claim fix, and new models `scheduler-terminal-claim` and
+`oom-termination-owner` with Loom, Shuttle, Kani and mutation witnesses. Disposition and
+remaining gaps: `formal/coverage/release-proof-gaps.md`. TLB redesign is a design only:
+`docs/architecture/tlb-shootdown-design.md`.
+
+KVM baseline: roughly 4% of 16-vCPU `--expect "ipcbench: end"` boots fail on unmodified
+HEAD (UI-class); the OOM work did not change it (48/50 on all three arms). Two scheduler
+or TLB panics in about 200 candidate boots remain unattributed; read the new milestones
+`irq-architecture-capture-refused` and `tlb-ack-liveness-timeout` first if one recurs.
+No performance optimization was made in this pass; none was measured.

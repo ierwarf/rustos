@@ -1200,10 +1200,37 @@ pub(super) fn is_handoff_dispatchable(slot: usize) -> bool {
 }
 
 pub(super) fn retire(slot: usize, weight: u32) {
+    // Unconditional: every caller reaches here with the slot already
+    // quiescent or being retired by its own CPU, so no claim can be in flight.
+    let _ = retire_slot(slot, weight, false);
+}
+
+/// Result of a withdrawal that may have to wait for a dispatch claim.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum RetireOutcome {
+    /// The owner word is `Retired` (it already was, or this call retired it).
+    Retired,
+    /// Another CPU has claimed the slot (`Running`) but has not yet published
+    /// it as Current. That CPU will install the claim and still expects the
+    /// owner word to be `Running`, so nothing was changed.
+    ClaimInFlight,
+}
+
+/// `retire` for a remote terminal withdrawal.
+///
+/// The decision and the owner CAS are one step: each iteration re-reads the
+/// owner word and the CAS is against that exact value, so a claim that wins the
+/// race changes the word, fails this CAS, and is seen as in flight on the next
+/// iteration. A check made before calling could not give that guarantee.
+pub(super) fn retire_unless_claim_in_flight(slot: usize, weight: u32) -> RetireOutcome {
+    retire_slot(slot, weight, true)
+}
+
+fn retire_slot(slot: usize, weight: u32, wait_for_claim: bool) -> RetireOutcome {
     loop {
         let owner = owner(slot);
         if owner.state == RunOwnerState::Retired {
-            return;
+            return RetireOutcome::Retired;
         }
         if owner.state == RunOwnerState::Local {
             let cpu = owner.cpu.expect("local scheduler owner omitted CPU");
@@ -1221,7 +1248,15 @@ pub(super) fn retire(slot: usize, weight: u32) {
                     panic!("scheduler retire completion raced observed={observed:?}")
                 });
             RUN_QUEUES[cpu].publish_load(&rq);
-            return;
+            return RetireOutcome::Retired;
+        }
+        if wait_for_claim
+            && rustos_scheduler_frame_gate::terminal_withdraw_must_wait(
+                owner.state == RunOwnerState::Running,
+                crate::multitask::cpu_local::task_execution_owner(slot).is_some(),
+            )
+        {
+            return RetireOutcome::ClaimInFlight;
         }
         let retiring = owner.next(RunOwnerState::Retiring, owner.cpu);
         if OWNER_WORDS[slot].compare_exchange(owner, retiring).is_err() {
@@ -1232,7 +1267,7 @@ pub(super) fn retire(slot: usize, weight: u32) {
             .unwrap_or_else(|observed| {
                 panic!("scheduler retire completion raced observed={observed:?}")
             });
-        return;
+        return RetireOutcome::Retired;
     }
 }
 

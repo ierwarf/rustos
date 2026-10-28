@@ -24,6 +24,16 @@ options:
                        named probe, so the in-kernel `ipc-call-phase-*` and
                        `usermem-phase-*` counters it charges belong to that
                        probe alone for the whole boot
+  --oom-hog            arm the `oomhog` session program, which touches memory until
+                       the allocator refuses it, and require the root supervisor
+                       to terminate it (`rootd: oom killed`) while the desktop,
+                       driver-domain relay, and every service keep running
+  --proc-stress        arm the `procstress` session program (fork, copy-on-write,
+                       mmap/mprotect/munmap churn from many threads) and wait for
+                       it to finish; used to reproduce scheduler and TLB panics
+  --oom-hog-watchdog   like --oom-hog, but require the ring0 watchdog to end the
+                       hog while rootd is blinded; run as
+                       RUSTOS_FAULTS='rootd.memory.census=fail'
   --min-ui-fps <fps>   enable the private KVM-only UI profiler and bounded DVM
                        uinput/evdev load, then require three high-volume input
                        windows, WayClick commit/frame-callback windows, and three

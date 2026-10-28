@@ -15,25 +15,43 @@ pub(in crate::multitask) fn request(
     pid: u64,
     requested_by_pid: Option<u64>,
 ) -> Option<Receipt> {
+    request_marked(scope, pid, requested_by_pid).map(|(receipt, _fresh)| receipt)
+}
+
+/// `request`, also saying whether this call published the termination.
+///
+/// A request that finds one already queued returns that request's receipt, so
+/// two terminators both wait for the same exit. Only the one that published it
+/// may then run the once-per-process revocation and exit record; the other must
+/// not repeat them.
+pub(in crate::multitask) fn request_marked(
+    scope: &nucleus_core::util::lockdep::DispatchPreemption<'_>,
+    pid: u64,
+    requested_by_pid: Option<u64>,
+) -> Option<(Receipt, bool)> {
     if scope.cpu() != nucleus_core::util::lockdep::current_cpu_index()
         || nucleus_core::util::lockdep::held_spin_lock_depth() != 0 { return None; }
     let (handle, member) = exit_membership::target_by_pid(pid)?;
-    if let Some(receipt) = exit_membership::queued_for(handle) { return Some(receipt); }
+    if let Some(receipt) = exit_membership::queued_for(handle) { return Some((receipt, false)); }
     let pending = PendingExit::begin(handle, member)?;
     // Non-sleeping exact-handle command; no census leaf spans it. Do not mask
     // caller-enabled IPIs during the process table leaf acquisition.
     super::super::process_table::mark_process_exiting_for_handle(handle, pid)?;
-    Some(pending.publish(pid, Reason::Terminated { requested_by_pid }))
+    Some((pending.publish(pid, Reason::Terminated { requested_by_pid }), true))
 }
 
 pub(super) fn terminate(pid: u64) -> bool {
-    let receipt = {
+    terminate_marked(pid).is_some()
+}
+
+/// Terminates `pid` and reports whether this call was the one that started it.
+pub(super) fn terminate_marked(pid: u64) -> Option<bool> {
+    let (receipt, fresh) = {
         let preemption = nucleus_core::util::lockdep::DispatchPreemption::enter();
-        let Some(receipt) = request(&preemption, pid, super::current_user_id()) else { return false; };
-        receipt
+        request_marked(&preemption, pid, super::current_user_id())?
     };
     wait(receipt);
-    true
+    Some(fresh)
 }
 
 pub(super) fn exit_current() -> ! {

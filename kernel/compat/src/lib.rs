@@ -107,6 +107,8 @@ pub(crate) mod vfs_core {
 
 pub mod user;
 
+pub(crate) mod oom_watchdog;
+
 /// Normal-time pager dispatch and reply adoption.
 ///
 /// This lives beside the syscall ABI rather than in `kernel-executive` because

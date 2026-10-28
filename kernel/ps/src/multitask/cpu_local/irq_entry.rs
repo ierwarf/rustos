@@ -113,8 +113,23 @@ impl DispatchEntry {
     }
     pub(in crate::multitask) fn install(&mut self, dispatch: SchedulerDispatch, fast: bool) -> bool {
         let turn = self.turn();
-        scheduler::return_architecture::ReturnArchitecture::capture(turn, dispatch)
-            .expect("IRQ architecture lacks the original successful claim").install(fast);
+        match scheduler::return_architecture::ReturnArchitecture::capture_checked(turn, dispatch) {
+            Ok(architecture) => architecture.install(fast),
+            Err(refused_check) => {
+                // Record which check refused before stopping: a single `expect`
+                // used to collapse seventeen different invariants into one
+                // message, which made an intermittent panic undiagnosable.
+                crate::debug::record_milestone(
+                    crate::debug::LogCategory::Process,
+                    "irq-architecture-capture-refused",
+                    u64::from(refused_check),
+                    0,
+                );
+                panic!(
+                    "IRQ architecture lacks the original successful claim: check {refused_check} refused"
+                );
+            }
+        }
         self.accept_installed_return()
     }
     pub(in crate::multitask) fn accept_installed_return(&mut self) -> bool {

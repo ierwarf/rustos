@@ -72,6 +72,25 @@ shuttle_test = "ipc_reply_timeout_and_revoke_have_one_terminal_owner"
 herd_not_applicable = "the property is a lock-protected terminal-state race; a register-level litmus would omit call identity and cancellation ownership"
 
 [[scenario]]
+id = "oom-termination-single-finalizer"
+severity = "critical"
+flow = "process-lifecycle-transaction"
+model = "oom-termination-owner/OomTerminationOwner"
+source = "kernel/ps/src/multitask/current/group_exit.rs"
+source_symbol = "request_marked"
+source_anchors = [
+  "exit_membership::queued_for(handle)",
+  "return Some((receipt, false));",
+  "PendingExit::begin(handle, member)?",
+  "mark_process_exiting_for_handle(handle, pid)?",
+  "pending.publish(pid, Reason::Terminated { requested_by_pid }), true)",
+]
+invariant = "a termination request that finds one queued joins it, so concurrent terminators of one process run its once-per-process follow-up exactly once"
+loom_test = "concurrent_terminators_finalize_a_process_exactly_once"
+shuttle_test = "concurrent_terminators_finalize_a_process_exactly_once_pct"
+herd_not_applicable = "the decision is one publish-or-join step serialized by the pending-exit seal, not a lock-free multi-location publication whose order an ISA litmus could constrain"
+
+[[scenario]]
 id = "pager-fault-frame-reserve"
 severity = "high"
 flow = "pager-frame-grant-lifecycle"
@@ -343,6 +362,26 @@ invariant = "ordinary spawn uses the same original frame/funding and exact first
 loom_test = "activation_claim_rejects_republish_and_slot_reuse"
 shuttle_test = "activation_claim_rejects_republish_and_slot_reuse_pct"
 herd_not_applicable = "the shared first-turn FIFO, published identity, original frame/funding and owner-word CAS form a multi-object protocol; one ISA publication litmus cannot express their custody"
+
+[[scenario]]
+id = "scheduler-terminal-claim-window"
+severity = "critical"
+flow = "scheduler-lifecycle"
+model = "scheduler-terminal-claim/SchedulerTerminalClaim"
+source = "kernel/ps/src/multitask/scheduler/runqueue.rs"
+source_symbol = "retire_slot"
+source_anchors = [
+  "wait_for_claim",
+  "rustos_scheduler_frame_gate::terminal_withdraw_must_wait(",
+  "owner.state == RunOwnerState::Running",
+  "crate::multitask::cpu_local::task_execution_owner(slot).is_some()",
+  "return RetireOutcome::ClaimInFlight;",
+  "OWNER_WORDS[slot].compare_exchange(owner, retiring)",
+]
+invariant = "a remote stop retires the owner word in one CAS loop with its in-flight check, so the CPU that claimed a task never installs it under a retired owner, and a stop parked behind the claim retires once the task is published"
+loom_test = "terminal_withdraw_never_retires_an_in_flight_claim"
+shuttle_test = "terminal_withdraw_never_retires_an_in_flight_claim_pct"
+herd_not_applicable = "the decision is one compare-exchange on a single owner word plus a role read whose only unsafe outcome would be a role observed before it is written; a stale unpublished read merely parks the stop, so there is no multi-location publication order for an ISA litmus to constrain"
 
 [[scenario]]
 id = "scheduler-transition-publication"

@@ -1,0 +1,19 @@
+id = "oomhog"
+kind = "app"
+execution_domain = "user"
+startup = "session"
+
+[build]
+builder = "c-demo"
+source = "oomhog.c"
+extra_args = ["-pthread"]
+
+[install]
+path = "apps/oomhog/oomhog.elf"
+
+[[desktop.entries]]
+display_name = "OOM hog"
+weight_micros = 100
+logical_admin = false
+console_hosted = false
+no_display = true

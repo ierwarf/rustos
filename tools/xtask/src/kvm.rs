@@ -166,6 +166,13 @@ const PRIVATE_SMP_QUALIFICATION_CONTRACT_PATH: &str =
 // way `uiserver` reads the acceptance contract above, so no service mediates
 // it.
 const PRIVATE_IPCBENCH_PROBE_CONTRACT_PATH: &str = "system/registry/system/ipcbench-probe-v1.env";
+// Arms `apps/oomhog`, a session-startup program that exits at once without this
+// file. It is written only for `kvm-smoke --oom-hog`.
+const PRIVATE_OOM_HOG_CONTRACT_PATH: &str = "system/registry/system/oomhog-v1.env";
+// Arms `apps/procstress`, which exits at once without this file. Written only
+// for `kvm-smoke --proc-stress`.
+const PRIVATE_PROC_STRESS_CONTRACT_PATH: &str = "system/registry/system/procstress-v1.env";
+const PROC_STRESS_DONE_MARKER: &str = "procstress: done maps forks fork_failures";
 const SMP_QUALIFICATION_WORK_UNITS: u64 = 1_000_000;
 const SMP_QUALIFICATION_DEADLINE_MS: u64 = 5_000;
 const SMP_QUALIFICATION_DEADLINE_US: u64 = SMP_QUALIFICATION_DEADLINE_MS * 1_000;
@@ -735,4 +742,5 @@ include!("kvm/layout.rs");
 include!("kvm/guest.rs");
 include!("kvm/evidence.rs");
 include!("kvm/user_debug_records.rs");
+include!("kvm/oom_hog.rs");
 include!("kvm/tests.rs");

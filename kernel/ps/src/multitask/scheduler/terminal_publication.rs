@@ -76,7 +76,15 @@ pub(super) unsafe fn guarded(mut owner: Producer, eligible_cpus: &dyn Fn(usize) 
     // Close ALL fresh identity/CPU/Cohort admission before checking the old
     // borrower count. A Terminal50 seal alone only excludes terminal/reset,
     // kernel Executor and wake captures, not every independent constructor.
-    owner = terminal_quarantine::retain_for_finalization(owner);
+    owner = match terminal_quarantine::retain_for_finalization(owner) {
+        Ok(owner) => owner,
+        Err(owner) => {
+            // Another CPU's dispatch claim of this task is in flight. Park the
+            // untouched stop; it restarts once that CPU has published the task.
+            owner.park_unwithdrawn();
+            return;
+        }
+    };
     if !quiescent(slot) {
         defer(owner);
         return;

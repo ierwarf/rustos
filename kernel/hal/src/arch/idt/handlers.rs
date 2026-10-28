@@ -58,6 +58,10 @@ unsafe extern "Rust" {
 // error-code wrapper's misaligned stack.
 #[inline(always)]
 pub fn default_handler(stack_frame: InterruptStackFrame, index: u8, error_code: Option<u64>) {
+    // SAFETY: the bridge is the assembly defined at the top of this file. It
+    // receives the frame and error code exactly as this wrapper did, realigns
+    // the stack to 16 bytes around its single call into the aligned Rust
+    // handler, and restores the original stack pointer before returning here.
     unsafe {
         rustos_default_handler_alignment_bridge(stack_frame, index, error_code);
     }
@@ -80,6 +84,9 @@ fn emergency_exception_marker(index: u8) {
         HEX[usize::from(index & 0x0f)],
         b'\n',
     ] {
+        // SAFETY: a single `out` to the 0xe9 debug console. It touches no
+        // memory and no stack, preserves flags, and is ignored by a machine
+        // that has no debug console on that port.
         unsafe {
             core::arch::asm!(
                 "out dx, al",

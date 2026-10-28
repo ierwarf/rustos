@@ -61,6 +61,7 @@ pub use crate::multitask::{
     spawn_user_process_without_deferred_reschedule_with_scheduling_context,
     spawn_user_thread_suspended, stop_current_linux_process, take_next_pager_fault_for_rendezvous,
     take_pager_fault_waiter_for, task_has_system_scheduling_class, terminate_user_process,
+    terminate_user_process_once, TerminateOutcome,
     terminate_user_task, unmap_pager_vma_for_process, unmap_pager_vma_for_process_with,
     unregister_pager_fault_waiter, validate_fault_request, wake_pager_service_waiter_for_process,
     wake_task, wake_user_task, windows_process_affinity, with_current_mm,
@@ -125,6 +126,7 @@ pub use crate::multitask::{
     housekeeping_kicked, kick_housekeeping, register_housekeeping_task, take_housekeeping_kick,
 };
 pub use crate::multitask::{register_child_waiter, unregister_child_waiter, wake_child_waiters};
+pub use crate::multitask::{MemoryCensusEntry, memory_census};
 
 pub fn request_yield_reschedule() {
     crate::multitask::request_yield_reschedule();

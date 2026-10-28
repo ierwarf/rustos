@@ -88,7 +88,8 @@ fn actual_stop_foreign_uid_refuses_before_lifecycle_queue_or_terminal_reservatio
 fn actual_stop_retained_owner_closes_all_fresh_binding_and_cohort_admission_without_claim_gap() {
     root(|slot| {
         let original = begin(slot, Some(ID), TaskRetireReason::Exited, true).unwrap();
-        let retained = retain_for_finalization(original);
+        let retained = retain_for_finalization(original)
+            .unwrap_or_else(|_| panic!("a quiescent root slot has no claim in flight"));
         assert!(identity::lifecycle(slot).retired);
         assert_eq!(runqueue::owner(slot).state, runqueue::RunOwnerState::Retired);
         assert!(identity::cohort::Cohort::begin(&[(slot, ID)]).is_none());

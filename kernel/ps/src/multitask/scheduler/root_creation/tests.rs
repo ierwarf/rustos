@@ -388,7 +388,7 @@ pub(in crate::multitask::scheduler) fn exec_root_with_backing(
         release(slot, id, handle);
     });
 }
-fn release(slot: usize, id: u64, handle: process_table::ProcessHandle) {
+pub(in crate::multitask::scheduler) fn release(slot: usize, id: u64, handle: process_table::ProcessHandle) {
     // Explicit native external ACK injection only; real seals/bank/context/MM
     // and process detachment still execute and refuse outstanding loans.
     super::super::thread_creation::tests::release_born(slot, id, handle);

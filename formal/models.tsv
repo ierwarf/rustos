@@ -144,3 +144,5 @@ mm-activation-close/MmActivationClose	safety	check	All finite phases explicitly 
 lifecycle-execution-claim/LifecycleExecutionClaim	safety	check	Finite lifecycle and CPU bank phases explicitly stutter; no hardware or full cold arbitration refinement	30	120	exhaustive	no	no	no
 cold-exec-intent/ColdExecIntent	safety	check	Finite cold ownership phases explicitly stutter; no weak-memory or hardware refinement	30	120	exhaustive	no	no	no
 affinity-claim-admission/AffinityClaimAdmission	safety	check	Finite masks and slot identities explicitly stutter; no hardware/return refinement	30	120	exhaustive	no	no	no
+scheduler-terminal-claim/SchedulerTerminalClaim	safety	check	a completed stop stutters; every other state has an enabled claim, publish, or withdraw step	30	120	exhaustive	no	no	no
+oom-termination-owner/OomTerminationOwner	safety	check	a finished race stutters; every other state has an enabled request, finalize, or join step	30	120	exhaustive	no	no	no

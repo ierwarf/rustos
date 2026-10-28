@@ -198,7 +198,7 @@ fi
 # Exception-side table installation has no allocator lock or heap admission.
 # Its explicit descriptor must therefore be claimed before the directory-entry
 # CAS, linked only by the winner, and cleared before a losing supplied frame
-# returns to `phys`.  Retirement drains that root ledger only after the
+# returns to `phys`.  Retirement pops that root ledger only after the
 # cross-CPU barrier and before reusing the table frames.
 fault_table_body="$(sed -n '/^pub fn ensure_current_fault_tables_at(/,$p' \
     kernel/mm/src/memory/address_space/pager_fault_mapping.rs)"
@@ -210,13 +210,19 @@ fault_error_body="$(sed -n '/Err(error) => {/,/^                    }/p' <<<"$fa
 retirement_body="$(sed -n '/^pub(super) fn reclaim_root(/,/^}/p' \
     kernel/mm/src/memory/address_space/retirement.rs)"
 retire_barrier_line="$(grep -n -m1 'begin_address_space_retirement' <<<"$retirement_body" | cut -d: -f1)"
-retire_drain_line="$(grep -n -m1 'drain_lazy_table_records' <<<"$retirement_body" | cut -d: -f1)"
-retire_free_line="$(grep -n -m1 'explicit_tables.into_iter' <<<"$retirement_body" | cut -d: -f1)"
+retire_drain_line="$(grep -n -m1 'pop_lazy_table_record' <<<"$retirement_body" | cut -d: -f1)"
+retire_free_line="$(grep -n -m1 'frames.push(table)' <<<"$retirement_body" | cut -d: -f1)"
 if [[ -z "$fault_claim_line" || -z "$fault_entry_line" || -z "$fault_publish_line" \
     || "$fault_claim_line" -ge "$fault_entry_line" || "$fault_entry_line" -ge "$fault_publish_line" \
     || -z "$retire_barrier_line" || -z "$retire_drain_line" || -z "$retire_free_line" \
     || "$retire_barrier_line" -ge "$retire_drain_line" || "$retire_drain_line" -ge "$retire_free_line" ]]; then
     echo 'lazy-table ledger must claim before CAS, resolve each loser, and drain after retirement' >&2
+    exit 1
+fi
+# Retirement runs when memory is scarce, so it must not allocate: no collection
+# that grows with the address space may appear in the finalizer.
+if grep -Eq 'Vec|try_reserve|to_vec|collect|Box|String' <<<"$retirement_body"; then
+    echo 'address-space retirement must stream frames through the stack batch and not allocate' >&2
     exit 1
 fi
 if ! grep -Fq 'cancel_lazy_table_record' <<<"$fault_loser_body" \
@@ -1331,6 +1337,8 @@ done <<'EOF'
 pager-fault-slot-lifecycle/PagerFaultSlotLifecycle|kernel-ps|multitask::scheduler::pager_handoff::tests::actual_pager_full_fifo_preserves_original_worker_wait_and_faulting_current
 pager-fault-slot-lifecycle/PagerFaultSlotLifecycle|kernel-ps|multitask::scheduler::pager_handoff::tests::actual_pager_does_not_clear_an_unrelated_rearmed_worker_wait
 frame-reader-claim/FrameReaderClaim|kernel-ps|multitask::scheduler::pager_handoff::tests::actual_pager_last_floor_effect_keeps_original_reader_binding_and_typed_phase
+oom-termination-owner/OomTerminationOwner|kernel-ps|multitask::scheduler::current_terminal::tests::actual_group_request_marks_exit_before_original_census_worker_effects
+scheduler-terminal-claim/SchedulerTerminalClaim|kernel-ps|multitask::scheduler::return_architecture::tests::actual_remote_terminal_cannot_retire_a_slot_whose_dispatch_claim_is_in_flight
 scheduler-wakeup/SchedulerWakeup|kernel-ps|multitask::scheduler::pager_handoff::tests::actual_pager_precommit_current_worker_wake_never_reads_consumed_frame_or_reblocks
 mm-activation-close/MmActivationClose|kernel-ps|multitask::scheduler::pager_handoff::tests::actual_pager_resume_borrows_original_current_mm_without_claim_or_frame_read
 synchronous-ipc-handoff/SynchronousIpcHandoff|kernel-ps|multitask::scheduler::pager_handoff::tests::actual_pager_remote_worker_publication_binds_exact_fifo_and_mailbox_generation

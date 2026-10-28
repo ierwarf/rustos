@@ -91,12 +91,12 @@ kernel/nucleus-core/src/ap_trampoline.rs	0	0
 kernel/nucleus-core/src/util/lockdep.rs	0	0
 kernel/nucleus-core/src/util/lockdep/cpu_identity.rs	0	0
 kernel/nucleus-core/src/bootstrap_stack.rs	0	0
-kernel/hal/src/arch/idt/handlers.rs	4	0
+kernel/hal/src/arch/idt/handlers.rs	0	0
 kernel/hal/src/arch/acpi.rs	2	0
 kernel/hal/src/arch/smp.rs	0	0
 kernel/hal/src/arch/tlb_shootdown.rs	0	0
 kernel/hal/src/arch/timer.rs	0	0
-kernel/hal/src/arch/clock.rs	5	7
+kernel/hal/src/arch/clock.rs	5	0
 kernel/hal/src/arch/rtc.rs	3	18
 kernel/compat/src/pager.rs	0	0
 kernel/compat/src/user/syscall/linux/proc_broker_ops/fork.rs	0	0
@@ -124,7 +124,7 @@ kernel/mm/src/memory/phys/frame_descriptor_ledger/encoding.rs	0	0
 kernel/mm/src/memory/frame_capability.rs	0	0
 kernel/mm/src/memory/kernel_vm.rs	16	0
 kernel/mm/src/memory/cache_attributes.rs	0	0
-kernel/mm/src/memory/phys.rs	5	0
+kernel/mm/src/memory/phys.rs	0	0
 kernel/mm/src/memory/heap.rs	9	0
 kernel/mm/src/api.rs	0	0
 libs/rustos-svc-runtime/src/allocator.rs	9	5

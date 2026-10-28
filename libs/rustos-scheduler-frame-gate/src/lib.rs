@@ -168,6 +168,26 @@ pub const fn budget_admission_after_token_check(
     if token_unchanged { admission } else { None }
 }
 
+/// Whether a terminal withdrawal must wait instead of retiring the run-owner
+/// word of a slot.
+///
+/// A dispatch claim is the owner CAS to `Running(cpu)`. The claiming CPU then
+/// installs the claimed task's architecture and publishes it as that CPU's
+/// Current; both steps check that the owner word is still `Running`. Until the
+/// publication a slot is `Running` with **no** execution role, and a remote
+/// withdrawal that retires it in that window makes the installing CPU's capture
+/// refuse a claim it already owns. Once the slot is published Current the same
+/// withdrawal is the normal remote-stop mechanism: the running CPU sees the
+/// terminal owner at its next dispatch. So the rule is exactly: wait for a
+/// claim that is in flight, and only that.
+#[inline]
+pub const fn terminal_withdraw_must_wait(
+    owner_is_running: bool,
+    execution_role_published: bool,
+) -> bool {
+    owner_is_running && !execution_role_published
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -275,6 +295,17 @@ mod tests {
             9, 9, false, true, true, false
         ));
         assert!(!direct_handoff_frame_custody(9, 9, true, true, true, true));
+    }
+
+    #[test]
+    fn terminal_withdraw_waits_only_for_a_claim_that_is_in_flight() {
+        // Claimed, not yet published as Current: must wait.
+        assert!(terminal_withdraw_must_wait(true, false));
+        // Published Current: the normal remote stop proceeds.
+        assert!(!terminal_withdraw_must_wait(true, true));
+        // Not Running at all (Local, Blocked, ...): nothing is in flight.
+        assert!(!terminal_withdraw_must_wait(false, false));
+        assert!(!terminal_withdraw_must_wait(false, true));
     }
 }
 
@@ -540,6 +571,24 @@ mod verification {
         if accepted {
             assert_eq!(published_generation, owner_generation);
             assert!(is_direct_handoff && cpu_matches && runnable && !executing);
+        }
+    }
+
+    #[kani::proof]
+    fn terminal_withdraw_never_retires_an_in_flight_claim_and_never_blocks_a_published_stop() {
+        let owner_is_running: bool = kani::any();
+        let role_published: bool = kani::any();
+        let must_wait = terminal_withdraw_must_wait(owner_is_running, role_published);
+        kani::cover!(must_wait);
+        kani::cover!(!must_wait && owner_is_running);
+        // A claimed-but-unpublished slot is never retired under its claimer.
+        if owner_is_running && !role_published {
+            assert!(must_wait);
+        }
+        // Waiting is never required once the slot is published or not Running,
+        // so a remote stop of an executing or queued task is not starved.
+        if !owner_is_running || role_published {
+            assert!(!must_wait);
         }
     }
 }

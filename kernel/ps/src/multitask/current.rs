@@ -573,6 +573,29 @@ pub fn terminate_user_process(process_id: u64) -> bool {
     terminated
 }
 
+/// What a terminator learns about the process it asked to end.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TerminateOutcome {
+    /// This call published the termination and now owns its follow-up.
+    Started,
+    /// Another terminator had already published it; this call only waited.
+    AlreadyQueued,
+    /// There is no such live process.
+    Absent,
+}
+
+/// `terminate_user_process` for a caller that performs once-per-process effects
+/// afterwards (revoking endpoints, recording the exit, notifying the parent).
+/// Two concurrent terminators of one process, such as the root supervisor and
+/// the memory-pressure watchdog, must not both perform them.
+pub fn terminate_user_process_once(process_id: u64) -> TerminateOutcome {
+    let Some(fresh) = group_exit::terminate_marked(process_id) else {
+        return TerminateOutcome::Absent;
+    };
+    complete_retirement_side_effects();
+    if fresh { TerminateOutcome::Started } else { TerminateOutcome::AlreadyQueued }
+}
+
 pub fn wake_user_task(task_id: u64) -> bool {
     if nucleus_core::util::lockdep::preemption_disabled() {
         return super::deferred_wake::defer_current_cpu(task_id);
@@ -739,6 +762,13 @@ pub fn is_user_process_exiting(process_id: u64) -> bool {
 
 pub fn parent_process_id_of(process_id: u64) -> Option<u64> {
     process_table::parent_process_id_of(process_id)
+}
+
+pub use process_table::MemoryCensusEntry;
+
+/// See [`process_table::memory_census`].
+pub fn memory_census(out: &mut [MemoryCensusEntry]) -> usize {
+    process_table::memory_census(out)
 }
 
 pub fn wait_for_child(

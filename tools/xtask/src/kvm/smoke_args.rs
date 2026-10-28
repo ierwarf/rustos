@@ -44,6 +44,15 @@ struct SmokeOptions {
     /// sets it; smoke and the FPS proof keep the exact 1:1 presentation.
     fit_host_window: bool,
     ipcbench_probe: Option<String>,
+    /// Arm `apps/oomhog` and require the root supervisor to kill it under
+    /// memory pressure while the rest of the system stays up.
+    oom_hog: bool,
+    /// With `oom_hog`: expect the ring0 watchdog, not `rootd`, to end the hog.
+    /// Requires `RUSTOS_FAULTS=rootd.memory.census=fail`, which blinds `rootd`.
+    oom_hog_watchdog: bool,
+    /// Arm `apps/procstress` (fork, COW, mmap/mprotect/munmap churn) and wait
+    /// for its completion marker; panics are caught by the ordinary checks.
+    proc_stress: bool,
     min_ui_fps: Option<u32>,
     ui_proof_windows: usize,
     recovery_probe: RecoveryProbe,
@@ -111,6 +120,9 @@ where
         physical_usb_bdf: None,
         fit_host_window: false,
         ipcbench_probe: None,
+        oom_hog: false,
+        oom_hog_watchdog: false,
+        proc_stress: false,
         min_ui_fps: None,
         ui_proof_windows: DEFAULT_UI_FPS_ACTIVE_WINDOWS,
         recovery_probe: RecoveryProbe::None,
@@ -179,6 +191,12 @@ where
                     bail!("physical USB controller BDF was supplied more than once");
                 }
                 options.physical_usb_bdf = Some(next_value(&mut args, &arg)?);
+            }
+            "--oom-hog" => options.oom_hog = true,
+            "--proc-stress" => options.proc_stress = true,
+            "--oom-hog-watchdog" => {
+                options.oom_hog = true;
+                options.oom_hog_watchdog = true;
             }
             "--ipcbench-probe" => {
                 if options.ipcbench_probe.is_some() {
@@ -259,6 +277,29 @@ where
         }
     }
 
+    if options.oom_hog {
+        // The proof is about the product topology staying up through pressure,
+        // so it needs the graphical session whose launch starts the hog. The
+        // storage provider that session requires is added just below.
+        options.gui_dvm_surfaces = true;
+        options
+            .expected_markers
+            .push(OOM_HOG_STARTED_MARKER.to_owned());
+        let (killed, recovered) = if options.oom_hog_watchdog {
+            (OOM_HOG_WATCHDOG_KILLED_MARKER, OOM_HOG_WATCHDOG_RECOVERED_MARKER)
+        } else {
+            (OOM_HOG_KILLED_MARKER, OOM_HOG_RECOVERED_MARKER)
+        };
+        options.expected_markers.push(killed.to_owned());
+        options.expected_markers.push(recovered.to_owned());
+    }
+    if options.proc_stress {
+        // Session programs start only once the graphical session is up.
+        options.gui_dvm_surfaces = true;
+        options
+            .expected_markers
+            .push(PROC_STRESS_DONE_MARKER.to_owned());
+    }
     // The graphical product topology launches its shell and WayClick from the
     // production DVM volume. Attaching the display transport without its
     // storage provider produces a compositor-only boot that can never satisfy

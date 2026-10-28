@@ -1,0 +1,19 @@
+id = "procstress"
+kind = "app"
+execution_domain = "user"
+startup = "session"
+
+[build]
+builder = "c-demo"
+source = "procstress.c"
+extra_args = ["-pthread"]
+
+[install]
+path = "apps/procstress/procstress.elf"
+
+[[desktop.entries]]
+display_name = "Process stress"
+weight_micros = 100
+logical_admin = false
+console_hosted = false
+no_display = true

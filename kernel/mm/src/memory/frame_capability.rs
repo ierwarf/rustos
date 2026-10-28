@@ -598,7 +598,7 @@ pub fn replenish_pager_fault_frames(budget: usize) -> usize {
         {
             break;
         }
-        let Some(frame) = phys::alloc_frame() else {
+        let Some(frame) = phys::alloc_frame_user() else {
             break;
         };
         // SAFETY: this normal-time owner holds the fresh physical frame until
@@ -702,7 +702,7 @@ pub fn return_pager_fault_frame(frame: PhysAddr) -> bool {
 /// spending it on best-effort surplus pages would trade a guarantee for a
 /// throughput gain. Returning `None` here simply means fewer surplus pages.
 pub fn allocate_zeroed_frame() -> Option<PhysAddr> {
-    let frame = phys::alloc_frame()?;
+    let frame = phys::alloc_frame_user()?;
     // SAFETY: `alloc_frame` returns one live page below the direct-map ceiling
     // and this caller owns it exclusively until it is mapped or freed.
     unsafe {
@@ -719,7 +719,7 @@ pub fn allocate_zeroed_frame_grant(
     binding: FrameGrantBinding,
     rights: u64,
 ) -> Result<u64, FrameGrantError> {
-    let frame = phys::alloc_frame().ok_or(FrameGrantError::OutOfFrames)?;
+    let frame = phys::alloc_frame_user().ok_or(FrameGrantError::OutOfFrames)?;
     // SAFETY: `alloc_frame` returns one live page below the direct-map ceiling;
     // no handle is published until this exact page has been fully initialized.
     unsafe {

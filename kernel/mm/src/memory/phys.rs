@@ -14,6 +14,7 @@
 //! - **Evidence:** `physical-frame-lifecycle`.
 use boot_protocol::{BootInfo, BootMemoryKind, BootMemoryRegion};
 use core::ptr;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
 use x86_64::PhysAddr;
@@ -26,6 +27,38 @@ const PAGE_SIZE: u64 = 4096;
 const BITS_PER_WORD: usize = 64;
 const MAX_USABLE_RANGES: usize = 128;
 const PHYS_ALLOC_SCAN_MILESTONE_FRAMES: usize = 64 * 1024;
+/// Floor and ceiling of the kernel-only reserve: 1 MiB to 64 MiB.
+const MIN_FREE_FLOOR_FRAMES: usize = 256;
+const MIN_FREE_CEILING_FRAMES: usize = 16 * 1024;
+/// The reserve is one 128th of free memory at boot (about 0.8%).
+const MIN_FREE_DIVISOR: usize = 128;
+
+/// Times a user-class allocation was refused, or cut short, by the watermark.
+static USER_WATERMARK_DENIALS: AtomicU64 = AtomicU64::new(0);
+
+/// Size of the kernel-only reserve for a machine with `free_frames` free at
+/// boot.
+///
+/// This is the `min_free_kbytes` role: below it, user allocation fails while
+/// the kernel keeps enough frames to run an OOM policy, tear a victim down, and
+/// report. On a machine too small for the floor the reserve is an eighth of
+/// memory so user allocation is never refused outright.
+pub(crate) const fn min_free_for(free_frames: usize) -> usize {
+    let scaled = free_frames / MIN_FREE_DIVISOR;
+    let clamped = if scaled < MIN_FREE_FLOOR_FRAMES {
+        MIN_FREE_FLOOR_FRAMES
+    } else if scaled > MIN_FREE_CEILING_FRAMES {
+        MIN_FREE_CEILING_FRAMES
+    } else {
+        scaled
+    };
+    let small_machine_cap = free_frames / 8;
+    if clamped > small_machine_cap {
+        small_machine_cap
+    } else {
+        clamped
+    }
+}
 
 static PHYS_ALLOCATOR: TrackedSpinLock<PhysAllocatorState, { LockClass::PhysicalAllocator as u8 }> =
     TrackedSpinLock::new(PhysAllocatorState::new());
@@ -35,11 +68,12 @@ pub use frame_descriptor_ledger::{
     CowFrameKind, CowMappingClaim, DataLeafRelease, SharedAliasTicket, cancel_cow_mapping,
     cancel_data_leaf, cancel_lazy_table_record, cancel_private_file_data_leaf, cancel_shared_alias,
     claim_data_leaf, claim_lazy_table_record, claim_private_file_data_leaf, commit_cow_mapping,
-    data_leaf_count, data_leaf_cow_identity, data_leaf_is_owned, drain_lazy_table_records,
-    prepare_shared_alias, promote_cow_mapping_in_place, publish_data_leaf,
-    publish_lazy_table_record, publish_private_file_data_leaf, publish_shared_alias,
-    register_data_leaf_root, register_lazy_table_root, release_data_leaf, rollback_shared_alias,
-    try_claim_cow_mapping, unregister_data_leaf_root,
+    data_leaf_count, data_leaf_cow_identity, data_leaf_is_owned, lazy_table_record_count,
+    lazy_table_record_is_owned, pop_lazy_table_record, prepare_shared_alias,
+    promote_cow_mapping_in_place, publish_data_leaf, publish_lazy_table_record,
+    publish_private_file_data_leaf, publish_shared_alias, register_data_leaf_root,
+    register_lazy_table_root, release_data_leaf, rollback_shared_alias, try_claim_cow_mapping,
+    unregister_data_leaf_root,
 };
 use frame_descriptor_ledger::{CowMappingRecord, FRAME_DESCRIPTORS, FrameDescriptorRecord};
 
@@ -85,6 +119,8 @@ struct PhysAllocatorState {
     frame_count: usize,
     usable_frames: usize,
     free_frames: usize,
+    /// Frames only kernel-class allocation may consume. See [`min_free_for`].
+    min_free_frames: usize,
     next_hint: usize,
     usable_ranges: [UsableFrameRange; MAX_USABLE_RANGES],
     usable_range_count: usize,
@@ -123,6 +159,7 @@ impl PhysAllocatorState {
             frame_count: 0,
             usable_frames: 0,
             free_frames: 0,
+            min_free_frames: 0,
             next_hint: 0,
             usable_ranges: [UsableFrameRange::EMPTY; MAX_USABLE_RANGES],
             usable_range_count: 0,
@@ -135,6 +172,9 @@ impl PhysAllocatorState {
         if self.bitmap_words == 0 || self.bitmap_ptr.is_null() {
             &[]
         } else {
+            // SAFETY: non-null (checked above) and spans `bitmap_words` u64
+            // words reserved and direct-mapped by `init`, never freed; `&self`
+            // is reachable only under the allocator lock, so no writer aliases.
             unsafe { core::slice::from_raw_parts(self.bitmap_ptr.cast_const(), self.bitmap_words) }
         }
     }
@@ -143,6 +183,9 @@ impl PhysAllocatorState {
         if self.bitmap_words == 0 || self.bitmap_ptr.is_null() {
             &mut []
         } else {
+            // SAFETY: as for `bitmap`; `&mut self` is only reachable through
+            // the allocator lock's exclusive guard, so this is the only live
+            // reference to the bitmap words.
             unsafe { core::slice::from_raw_parts_mut(self.bitmap_ptr, self.bitmap_words) }
         }
     }
@@ -267,6 +310,24 @@ impl PhysAllocatorState {
         self.alloc_frames_locked_with_fault_gate(out, || {
             nucleus_core::util::fault_injection::should_fail("alloc.frame")
         })
+    }
+
+    /// Like [`Self::alloc_frames_locked`], but never dips into the kernel
+    /// reserve: it fills at most `free_frames - min_free_frames` slots.
+    ///
+    /// A short fill is the user-visible memory-pressure signal. The reserve
+    /// stays available to the callers that must make progress while the system
+    /// is short - heap growth, address-space retirement, IPC, the fault-frame
+    /// reserve's own producer excepted - so a refusal here can still be
+    /// reported and resolved instead of wedging the kernel.
+    fn alloc_user_frames_locked(&mut self, out: &mut [PhysAddr]) -> usize {
+        let admissible = self.free_frames.saturating_sub(self.min_free_frames);
+        let want = out.len().min(admissible);
+        let filled = self.alloc_frames_locked(&mut out[..want]);
+        if filled < out.len() && admissible < out.len() {
+            USER_WATERMARK_DENIALS.fetch_add(1, Ordering::Relaxed);
+        }
+        filled
     }
 
     fn alloc_frames_locked_with_fault_gate(
@@ -555,6 +616,10 @@ pub fn init(boot_info_ptr: *const BootInfo) {
         };
 
         let bitmap_ptr = higher_half_addr(bitmap_phys) as *mut u64;
+        // SAFETY: `bitmap_phys` was just reserved from usable memory outside
+        // the kernel image, early-system image, and AP trampoline, spans
+        // `bitmap_bytes`, and is reached through the direct map. `init` runs
+        // once before any allocation, so nothing else references the region.
         unsafe {
             ptr::write_bytes(bitmap_ptr.cast::<u8>(), 0xff, bitmap_bytes);
         }
@@ -619,6 +684,7 @@ pub fn init(boot_info_ptr: *const BootInfo) {
             frame_count,
             usable_frames: 0,
             free_frames: 0,
+            min_free_frames: 0,
             next_hint: 0,
             usable_ranges: [UsableFrameRange::EMPTY; MAX_USABLE_RANGES],
             usable_range_count: 0,
@@ -660,10 +726,22 @@ pub fn init(boot_info_ptr: *const BootInfo) {
             frame_descriptor_pages as u64 * PAGE_SIZE,
         );
         new_state.reserve_phys_range(cow_mapping_phys, cow_mapping_pages as u64 * PAGE_SIZE);
+        new_state.min_free_frames = min_free_for(new_state.free_frames);
         new_state.initialized = true;
 
         *state = new_state;
     });
+}
+
+/// Allocates one frame for a user-driven mapping, refusing to dip into the
+/// kernel reserve.
+///
+/// Anonymous first touch, copy-on-write, page-table growth for a user range,
+/// and process creation are user-class. Kernel structures that must make
+/// progress under pressure keep using [`alloc_frame`].
+pub fn alloc_frame_user() -> Option<PhysAddr> {
+    let mut out = [PhysAddr::new(0)];
+    (alloc_frames_batch_user(&mut out) == 1).then_some(out[0])
 }
 
 pub fn alloc_frame() -> Option<PhysAddr> {
@@ -764,6 +842,32 @@ pub fn alloc_frames_batch(out: &mut [PhysAddr]) -> usize {
     filled
 }
 
+/// User-class [`alloc_frames_batch`]: fills no more than the frames above the
+/// kernel reserve. A short fill means pressure, not only exhaustion.
+pub fn alloc_frames_batch_user(out: &mut [PhysAddr]) -> usize {
+    let filled = irq_safe(|| PHYS_ALLOCATOR.lock().alloc_user_frames_locked(out));
+    frame_batch_profile::record_allocation(out.len(), filled);
+    filled
+}
+
+/// Frames the kernel withholds from user-class allocation.
+pub fn min_free_bytes() -> u64 {
+    irq_safe(|| PHYS_ALLOCATOR.lock().min_free_frames as u64 * PAGE_SIZE)
+}
+
+/// Whether free memory is at or below the user-class watermark.
+pub fn below_user_watermark() -> bool {
+    irq_safe(|| {
+        let state = PHYS_ALLOCATOR.lock();
+        state.free_frames <= state.min_free_frames
+    })
+}
+
+/// Count of user-class allocations refused or truncated by the watermark.
+pub fn user_watermark_denials() -> u64 {
+    USER_WATERMARK_DENIALS.load(Ordering::Relaxed)
+}
+
 /// Frees every frame in `frames` under one lock acquisition. Failures are
 /// written into `failures` (per-slot, extras beyond its length are counted
 /// but not recorded) so the caller can log them *after* the lock and any
@@ -840,6 +944,10 @@ pub fn free_bytes() -> u64 {
 }
 
 fn boot_info_from_ptr(boot_info_ptr: *const BootInfo) -> &'static BootInfo {
+    // SAFETY: the pointer is the one the boot handoff gave the kernel entry.
+    // `from_ptr` rejects a null, misaligned, or invalidly encoded block; that
+    // the block is mapped and not concurrently written is the handoff's
+    // contract, stated in `BootInfo::from_ptr`'s safety section.
     match unsafe { BootInfo::from_ptr(boot_info_ptr) } {
         Ok(boot_info) => boot_info,
         Err(error) => panic!("{}", error.as_str()),
@@ -847,6 +955,10 @@ fn boot_info_from_ptr(boot_info_ptr: *const BootInfo) -> &'static BootInfo {
 }
 
 fn boot_memory_map(boot_info: &BootInfo) -> &'static [BootMemoryRegion] {
+    // SAFETY: `boot_info` passed `BootInfo::validate`, which requires a
+    // non-null, aligned `entries_ptr` and a non-zero `entry_count`, and the
+    // handoff keeps the memory-map array resident and unmodified for the life
+    // of the kernel.
     unsafe {
         core::slice::from_raw_parts(
             boot_info.memory_map.entries_ptr as *const BootMemoryRegion,
@@ -955,6 +1067,7 @@ mod tests {
             frame_count: page_count,
             usable_frames: page_count,
             free_frames: page_count,
+            min_free_frames: 0,
             next_hint,
             usable_ranges: [UsableFrameRange::EMPTY; MAX_USABLE_RANGES],
             usable_range_count: 1,
@@ -1103,6 +1216,54 @@ mod tests {
         seen.dedup();
         assert_eq!(seen.len(), 5, "batch must not repeat a frame");
         assert_eq!(state.free_frames, 3);
+    }
+
+    #[test]
+    fn reserve_scales_with_memory_and_is_clamped() {
+        // 8 GiB of frames: one 128th exceeds 64 MiB, so the ceiling holds.
+        assert_eq!(min_free_for(2 * 1024 * 1024), MIN_FREE_CEILING_FRAMES);
+        // 256 MiB: one 128th is 2 MiB, between the floor and the ceiling.
+        assert_eq!(min_free_for(64 * 1024), 512);
+        // 16 MiB: one 128th is below the floor, and an eighth is above it.
+        assert_eq!(min_free_for(4096), MIN_FREE_FLOOR_FRAMES);
+        // A tiny machine reserves an eighth, never the whole floor.
+        assert_eq!(min_free_for(512), 64);
+        assert_eq!(min_free_for(0), 0);
+    }
+
+    #[test]
+    fn user_allocation_stops_at_the_reserve_and_kernel_allocation_does_not() {
+        let mut bitmap = [0_u64; 1];
+        let mut state = test_state(&mut bitmap, 16, 0);
+        state.min_free_frames = 4;
+        let denials = USER_WATERMARK_DENIALS.load(Ordering::Relaxed);
+
+        let mut out = [PhysAddr::new(0); 16];
+        // Twelve frames sit above the reserve; the request is cut short there.
+        assert_eq!(state.alloc_user_frames_locked(&mut out), 12);
+        assert_eq!(state.free_frames, 4);
+        assert!(USER_WATERMARK_DENIALS.load(Ordering::Relaxed) > denials);
+
+        // At the watermark user allocation yields nothing...
+        assert_eq!(state.alloc_user_frames_locked(&mut out[..1]), 0);
+        assert_eq!(state.free_frames, 4);
+        // ...while the kernel class still reaches the reserve.
+        assert_eq!(state.alloc_frames_locked(&mut out[..4]), 4);
+        assert_eq!(state.free_frames, 0);
+    }
+
+    #[test]
+    fn user_allocation_below_the_reserve_recovers_after_frames_are_freed() {
+        let mut bitmap = [0_u64; 1];
+        let mut state = test_state(&mut bitmap, 8, 0);
+        state.min_free_frames = 2;
+        let mut out = [PhysAddr::new(0); 8];
+        assert_eq!(state.alloc_user_frames_locked(&mut out), 6);
+        assert_eq!(state.alloc_user_frames_locked(&mut out[..1]), 0);
+        state.free_frame_locked(out[0]).unwrap();
+        state.free_frame_locked(out[1]).unwrap();
+        assert_eq!(state.alloc_user_frames_locked(&mut out[..2]), 2);
+        assert_eq!(state.free_frames, 2);
     }
 
     #[test]

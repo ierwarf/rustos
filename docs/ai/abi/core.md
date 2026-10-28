@@ -186,6 +186,12 @@ threads, marks the process exiting, revokes its endpoints, clears loader
 broker state, records one fixed SIGKILL lifecycle exit, and signals its parent.
 It is teardown substrate, not a generic kill syscall or a kernel restart
 policy table.
+`SYS_RUSTOS_ROOTD_MEMORY_BROKER` (ABI v1, also root-supervisor-only) is its
+read-only counterpart for memory pressure: one in-place struct returns usable,
+free and kernel-reserve pages, the monotonic watermark-denial count, and up to
+32 live processes ordered by resident data-leaf count. Ring0 neither retains
+pressure state nor chooses a victim; rootd's `memory_governor` does, then
+terminates through the call above.
 Rootd receives supervisor requests through endpoint-owner-only sender-stamped
 receive syscalls; both pre-init and post-init supervisor turns must drain
 lifecycle/restart state before using `SYS_RUSTOS_IPC_TRY_RECV_WITH_SENDER`, so

@@ -121,6 +121,8 @@ pub fn tsc_admission_facts() -> TscAdmissionFacts {
 /// calibrated against HPET is preferred; a validated 64-bit HPET counter is the
 /// bounded fallback.
 pub fn init() -> Option<ClockSourceInfo> {
+    // ORDERING: Acquire pairs with the Release publication of SOURCE below, so
+    // a repeated `init` that sees a source also sees its Relaxed payload.
     if SOURCE.load(Ordering::Acquire) != SOURCE_UNINITIALIZED {
         return current_source();
     }
@@ -151,6 +153,8 @@ pub fn init() -> Option<ClockSourceInfo> {
         // completed the bounded zero-warp rendezvous.
         if tsc_clocksource_admitted(super::smp::cpu_count()) {
             TSC_BASE.store(read_tsc_ordered(), Ordering::Relaxed);
+            // ORDERING: Release publishes TSC_HZ, TSC_NANOS_MULT and TSC_BASE
+            // (all stored Relaxed above) to every reader that Acquires SOURCE.
             SOURCE.store(SOURCE_INVARIANT_TSC, Ordering::Release);
             return Some(ClockSourceInfo {
                 name: "invariant-tsc",
@@ -164,6 +168,8 @@ pub fn init() -> Option<ClockSourceInfo> {
         HPET_PERIOD_FS.store(period_fs, Ordering::Relaxed);
         HPET_NANOS_MULT.store(nanos_mult_from_period_fs(period_fs), Ordering::Relaxed);
         HPET_BASE_COUNTER.store(counter, Ordering::Relaxed);
+        // ORDERING: Release publishes the HPET base, period, multiplier and
+        // base counter (all stored Relaxed above) to Acquire readers of SOURCE.
         SOURCE.store(SOURCE_HPET, Ordering::Release);
         return Some(ClockSourceInfo {
             name: "hpet",
@@ -175,12 +181,17 @@ pub fn init() -> Option<ClockSourceInfo> {
 }
 
 pub fn current_source() -> Option<ClockSourceInfo> {
+    // ORDERING: Acquire pairs with the Release publication of SOURCE, which
+    // makes the payload loaded below visible.
     match SOURCE.load(Ordering::Acquire) {
         SOURCE_INVARIANT_TSC => Some(ClockSourceInfo {
             name: "invariant-tsc",
+            // ORDERING: ordered after the SOURCE Acquire above; stronger than
+            // needed and kept so the read cannot be hoisted above it.
             frequency_hz: TSC_HZ.load(Ordering::Acquire),
         }),
         SOURCE_HPET => {
+            // ORDERING: as for TSC_HZ above.
             let period_fs = HPET_PERIOD_FS.load(Ordering::Acquire);
             Some(ClockSourceInfo {
                 name: "hpet",
@@ -460,6 +471,8 @@ pub fn monotonic_nanos_coarse() -> u64 {
 }
 
 pub fn monotonic_nanos() -> u64 {
+    // ORDERING: Acquire pairs with the Release publication of SOURCE; the
+    // payload loads below are Relaxed because they are ordered after it.
     match SOURCE.load(Ordering::Acquire) {
         SOURCE_INVARIANT_TSC => {
             let hz = TSC_HZ.load(Ordering::Relaxed);

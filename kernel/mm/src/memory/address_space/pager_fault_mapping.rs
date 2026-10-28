@@ -141,7 +141,7 @@ pub(crate) fn publish_user_table_entry(
 /// child frame when the entry says the fault path published it.
 fn tagged_child_of(
     entry: &PageTableEntry,
-    tables: &mut Vec<u64>,
+    on_table: &mut impl FnMut(u64),
 ) -> Result<Option<PhysAddr>, AddressSpaceError> {
     if entry.is_unused() {
         return Ok(None);
@@ -157,7 +157,7 @@ fn tagged_child_of(
         return Err(AddressSpaceError::InvalidFrameOwnership);
     }
     if flags.contains(ROOT_OWNED_USER_TABLE) {
-        tables.push(entry.addr().as_u64());
+        on_table(entry.addr().as_u64());
     }
     Ok(Some(entry.addr()))
 }
@@ -477,7 +477,7 @@ impl ProcessAddressSpace {
         kind: phys::CowFrameKind,
     ) -> Result<(), AddressSpaceError> {
         validate_user_page_range(start, 1)?;
-        let frame = phys::alloc_frame().ok_or(AddressSpaceError::OutOfFrames)?;
+        let frame = phys::alloc_frame_user().ok_or(AddressSpaceError::OutOfFrames)?;
         let mut deadline = kernel_hal::api::arch::clock::SpinDeadline::start();
         loop {
             let mutation = kernel_hal::api::arch::tlb::begin_address_space_mutation(PhysAddr::new(
@@ -1045,25 +1045,41 @@ impl ProcessAddressSpace {
     /// than guessing what the topology meant.
     pub(crate) fn pager_fault_ownership(&self) -> Result<PagerFaultOwnership, AddressSpaceError> {
         let mut owned = PagerFaultOwnership::empty();
+        let PagerFaultOwnership { leaves, tables } = &mut owned;
+        self.walk_pager_fault_ownership(|table| tables.push(table), |leaf| leaves.push(leaf))?;
+        Ok(owned)
+    }
+
+    /// Visits the same tagged tables and leaves as [`Self::pager_fault_ownership`]
+    /// without collecting them, so a caller can settle each one as it is found.
+    ///
+    /// Retirement uses this to avoid a heap allocation proportional to the
+    /// address space at the moment the system is most likely to be short of
+    /// memory. A table is reported before the entries beneath it.
+    pub(crate) fn walk_pager_fault_ownership(
+        &self,
+        mut on_table: impl FnMut(u64),
+        mut on_leaf: impl FnMut(PagerFaultLeaf),
+    ) -> Result<(), AddressSpaceError> {
         if self.pml4_frame_phys == 0 {
-            return Ok(owned);
+            return Ok(());
         }
         let root = self.root_table_ref();
-        let Some(pdpt_phys) = tagged_child_of(&root[USER_PML4_INDEX], &mut owned.tables)? else {
-            return Ok(owned);
+        let Some(pdpt_phys) = tagged_child_of(&root[USER_PML4_INDEX], &mut on_table)? else {
+            return Ok(());
         };
         // SAFETY: this normal-context owner walks its own page-table hierarchy
         // while the address space is provably inactive on every CPU.  VMA
         // writers serialize destructive changes externally.
         let pdpt = unsafe { kernel_vm::phys_to_table_ref(pdpt_phys) };
         for p3 in 0..ENTRIES_PER_TABLE {
-            let Some(pd_phys) = tagged_child_of(&pdpt[p3], &mut owned.tables)? else {
+            let Some(pd_phys) = tagged_child_of(&pdpt[p3], &mut on_table)? else {
                 continue;
             };
             // SAFETY: as above for the next present non-huge owned table.
             let pd = unsafe { kernel_vm::phys_to_table_ref(pd_phys) };
             for p2 in 0..ENTRIES_PER_TABLE {
-                let Some(pt_phys) = tagged_child_of(&pd[p2], &mut owned.tables)? else {
+                let Some(pt_phys) = tagged_child_of(&pd[p2], &mut on_table)? else {
                     continue;
                 };
                 // SAFETY: as above for the leaf-bearing table.
@@ -1080,14 +1096,14 @@ impl ProcessAddressSpace {
                         | ((p3 as u64) << 30)
                         | ((p2 as u64) << 21)
                         | ((p1 as u64) << 12);
-                    owned.leaves.push(PagerFaultLeaf {
+                    on_leaf(PagerFaultLeaf {
                         virtual_address,
                         physical_address: entry.addr().as_u64(),
                     });
                 }
             }
         }
-        Ok(owned)
+        Ok(())
     }
 }
 
@@ -1391,9 +1407,11 @@ mod tests {
     fn user_unmap_repeated_no_present_plans_are_empty() {
         let entries = [PageTableEntry::new(), PageTableEntry::new()];
         for _ in 0..2 {
-            assert!(fixture_plan(&entries, &[None, None], &[], 2)
-                .unwrap()
-                .is_empty());
+            assert!(
+                fixture_plan(&entries, &[None, None], &[], 2)
+                    .unwrap()
+                    .is_empty()
+            );
         }
         for missing_level in 0..3 {
             let mut level = 0;

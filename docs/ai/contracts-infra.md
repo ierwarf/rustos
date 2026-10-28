@@ -337,7 +337,7 @@ The closed registry is `formal/fault-scenarios.tsv` and currently contains
 `alloc.frame`, `block.read`, `block.write`, `block.flush`,
 `display.present`, `display.provider.register`, `handle.commit`,
 `handle.reserve`, `ipc.endpoint.enqueue`, `ipc.endpoint.reply`,
-`process.spawn`, and `waitset.register`.
+`process.spawn`, `rootd.memory.census`, and `waitset.register`.
 Configuration and guest admission reject unknown, retired, and duplicate
 points. Production `source` and executable `witness_source` are separate,
 mandatory registry fields and are both validated. Normal product configuration

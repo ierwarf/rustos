@@ -884,7 +884,9 @@ ordered(body(interval, 'consume'), ['assert!(!cell.current_borrowed', 'cell.acti
 ordered(body(interval, 'install'), ['assert!(!cell.current_borrowed', 'cell.active',
     'cell.active = incoming.take()'], 'no replacement during original Current effects')
 group_api = (base.parent / 'current/group_exit.rs').read_text()
-ordered(body(group_api, 'request'), ['held_spin_lock_depth()', 'target_by_pid(pid)',
+ordered(body(group_api, 'request'), ['request_marked(scope, pid, requested_by_pid)'],
+    'group admission request delegates to the single marked admission')
+ordered(body(group_api, 'request_marked'), ['held_spin_lock_depth()', 'target_by_pid(pid)',
     'queued_for(handle)', 'PendingExit::begin(handle, member)',
     'mark_process_exiting_for_handle(handle, pid)?', 'pending.publish(pid, Reason::Terminated'],
     'group admission marks exact original process before durable worker publication')

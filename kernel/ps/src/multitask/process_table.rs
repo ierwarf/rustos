@@ -478,6 +478,71 @@ pub fn parent_process_id_of(process_id: u64) -> Option<u64> {
     None
 }
 
+/// One live process in a memory census.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MemoryCensusEntry {
+    pub process_id: u64,
+    pub parent_process_id: u64,
+    /// Mapped data leaves in the address space, shared aliases included.
+    pub resident_pages: u64,
+}
+
+/// Inserts `entry` into `out[..len]`, kept ordered by `resident_pages`
+/// (largest first, then larger `process_id`), dropping the smallest when full.
+/// Returns the new length.
+fn insert_largest(out: &mut [MemoryCensusEntry], len: usize, entry: MemoryCensusEntry) -> usize {
+    let outranks = |a: &MemoryCensusEntry, b: &MemoryCensusEntry| {
+        (a.resident_pages, a.process_id) > (b.resident_pages, b.process_id)
+    };
+    let mut at = len;
+    while at > 0 && outranks(&entry, &out[at - 1]) {
+        at -= 1;
+    }
+    if at == out.len() {
+        return len;
+    }
+    let new_len = (len + 1).min(out.len());
+    let mut index = new_len - 1;
+    while index > at {
+        out[index] = out[index - 1];
+        index -= 1;
+    }
+    out[at] = entry;
+    new_len
+}
+
+/// Fills `out` with the live, non-exiting processes that map the most memory,
+/// largest first, and returns how many entries were written.
+///
+/// This allocates nothing and reads each resident count from the frame
+/// descriptor ledger without taking any process-state lock, so it may run
+/// while a process is faulting, exiting, or being retired. A root that has
+/// already been unregistered counts as zero pages.
+pub fn memory_census(out: &mut [MemoryCensusEntry]) -> usize {
+    let table = PROCESS_TABLE.lock();
+    let mut len = 0;
+    for slot in table.slots.iter() {
+        let Some(object) = slot.object.as_deref() else {
+            continue;
+        };
+        if object.exiting || object.exit_pending {
+            continue;
+        }
+        let resident_pages =
+            kernel_mm::api::phys::data_leaf_count(object.mm_execution.root_phys()).unwrap_or(0);
+        len = insert_largest(
+            out,
+            len,
+            MemoryCensusEntry {
+                process_id: object.process_id,
+                parent_process_id: object.parent_process_id.unwrap_or(0),
+                resident_pages,
+            },
+        );
+    }
+    len
+}
+
 pub enum WaitResult {
     Exited { pid: u64, status: i32 },
     StateChanged { pid: u64, status: i32 },
@@ -1248,6 +1313,66 @@ pub(crate) mod tests {
     use crate::user::process_state::UserProcessState;
 
     mod identity_tests;
+
+    mod census_tests {
+        use super::super::{MemoryCensusEntry, insert_largest};
+
+        fn entry(process_id: u64, resident_pages: u64) -> MemoryCensusEntry {
+            MemoryCensusEntry {
+                process_id,
+                parent_process_id: 1,
+                resident_pages,
+            }
+        }
+
+        #[test]
+        fn census_keeps_the_largest_first_and_breaks_ties_toward_the_younger_pid() {
+            let mut out = [MemoryCensusEntry::default(); 3];
+            let mut len = 0;
+            for (pid, pages) in [(10, 5), (11, 50), (12, 5), (13, 20)] {
+                len = insert_largest(&mut out, len, entry(pid, pages));
+            }
+            assert_eq!(len, 3);
+            assert_eq!(
+                [out[0].process_id, out[1].process_id, out[2].process_id],
+                [11, 13, 12]
+            );
+        }
+
+        #[test]
+        fn the_live_census_lists_a_process_until_it_is_marked_exiting() {
+            use super::super::{
+                create_process_with_parent, mark_process_exiting, memory_census,
+            };
+            use super::{isolate_process_table, new_state};
+            let _isolation = isolate_process_table();
+            create_process_with_parent(8_101, Some(1), new_state()).expect("process 8101");
+            create_process_with_parent(8_102, Some(8_101), new_state()).expect("process 8102");
+            let mut out = [MemoryCensusEntry::default(); 4];
+            let count = memory_census(&mut out);
+            let mut live: std::vec::Vec<(u64, u64)> = out[..count]
+                .iter()
+                .map(|entry| (entry.process_id, entry.parent_process_id))
+                .collect();
+            live.sort_unstable();
+            assert_eq!(live, [(8_101, 1), (8_102, 8_101)]);
+
+            mark_process_exiting(8_101).expect("mark exiting");
+            let count = memory_census(&mut out);
+            assert_eq!(count, 1);
+            assert_eq!(out[0].process_id, 8_102);
+        }
+
+        #[test]
+        fn a_full_census_drops_an_entry_smaller_than_all_it_holds() {
+            let mut out = [MemoryCensusEntry::default(); 2];
+            let mut len = insert_largest(&mut out, 0, entry(1, 10));
+            len = insert_largest(&mut out, len, entry(2, 20));
+            len = insert_largest(&mut out, len, entry(3, 5));
+            assert_eq!(len, 2);
+            assert_eq!([out[0].process_id, out[1].process_id], [2, 1]);
+        }
+    }
 
     // These tests exercise the one global process table and call the global
     // reaper. Running them concurrently lets one test reap another test's

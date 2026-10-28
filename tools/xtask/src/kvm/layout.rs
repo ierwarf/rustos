@@ -48,7 +48,9 @@ fn prepare_layout(config: &Config, options: &SmokeOptions) -> Result<KvmLayout> 
     let needs_private_contracts = options.min_ui_fps.is_some()
         || options.exercise_network
         || options.smp_ring3_qualification
-        || options.ipcbench_probe.is_some();
+        || options.ipcbench_probe.is_some()
+        || options.oom_hog
+        || options.proc_stress;
     let runtime_disk = if needs_private_contracts {
         let runtime_disk = run_dir.join("rustos-kvm.img");
         fs::copy(&config.boot_disk_image, &runtime_disk).with_context(|| {
@@ -70,6 +72,8 @@ fn prepare_layout(config: &Config, options: &SmokeOptions) -> Result<KvmLayout> 
                 .smp_ring3_qualification
                 .then_some(options.rustos_vcpus),
             options.ipcbench_probe.as_deref(),
+            options.oom_hog,
+            options.proc_stress,
         )?;
     }
     // Any physical VFIO device makes QEMU map every file-backed guest memory
@@ -566,6 +570,10 @@ fn render_smp_ring3_qualification_contract(workers: u8) -> String {
     )
 }
 
+fn render_oom_hog_contract() -> String {
+    String::from("contract=rustos-oomhog-v1\n")
+}
+
 fn render_ipcbench_probe_contract(probe: &str) -> String {
     format!("contract=rustos-ipcbench-probe-v1\nprobe={probe}\n")
 }
@@ -577,6 +585,8 @@ fn write_private_kvm_contracts(
     acceptance: Option<(bool, bool)>,
     smp_ring3_workers: Option<u8>,
     ipcbench_probe: Option<&str>,
+    oom_hog: bool,
+    proc_stress: bool,
 ) -> Result<()> {
     let disk = std::fs::OpenOptions::new()
         .read(true)
@@ -617,6 +627,22 @@ fn write_private_kvm_contracts(
             contract.truncate()?;
             let contents = render_ipcbench_probe_contract(probe);
             FatWrite::write_all(&mut contract, contents.as_bytes())?;
+            FatWrite::flush(&mut contract)?;
+        }
+        if proc_stress {
+            let mut contract = root
+                .create_file(PRIVATE_PROC_STRESS_CONTRACT_PATH)
+                .context("create private KVM process-stress contract file")?;
+            contract.truncate()?;
+            FatWrite::write_all(&mut contract, b"contract=rustos-procstress-v1\n")?;
+            FatWrite::flush(&mut contract)?;
+        }
+        if oom_hog {
+            let mut contract = root
+                .create_file(PRIVATE_OOM_HOG_CONTRACT_PATH)
+                .context("create private KVM OOM hog contract file")?;
+            contract.truncate()?;
+            FatWrite::write_all(&mut contract, render_oom_hog_contract().as_bytes())?;
             FatWrite::flush(&mut contract)?;
         }
     }

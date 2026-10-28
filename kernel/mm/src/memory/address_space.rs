@@ -36,8 +36,8 @@ pub use execution_lifetime::{
 mod rollback;
 mod user_copy;
 use frame_release::{
-    FRAME_BATCH_CHUNK, free_frame_buffer_tail, free_removed_frames_exact,
-    free_retired_frames_logged, free_rollback_frames_exact,
+    FRAME_BATCH_CHUNK, RetiredFrameBatcher, free_frame_buffer_tail, free_removed_frames_exact,
+    free_rollback_frames_exact,
 };
 use pager_fault_mapping::{
     COW_USER_LEAF, ROOT_OWNED_USER_LEAF, ROOT_OWNED_USER_TABLE, publish_user_table_entry,
@@ -132,7 +132,7 @@ pub struct ProcessAddressSpace {
 impl ProcessAddressSpace {
     #[inline(never)]
     pub fn new() -> Result<Self, AddressSpaceError> {
-        let pml4_phys = phys::alloc_frame().ok_or(AddressSpaceError::OutOfFrames)?;
+        let pml4_phys = phys::alloc_frame_user().ok_or(AddressSpaceError::OutOfFrames)?;
         phys::register_lazy_table_root(pml4_phys.as_u64());
         phys::register_data_leaf_root(pml4_phys.as_u64());
         let root = unsafe { kernel_vm::phys_to_table_mut(pml4_phys) };
@@ -308,7 +308,7 @@ impl ProcessAddressSpace {
                 continue;
             }
 
-            let Some(dst_phys) = phys::alloc_frame() else {
+            let Some(dst_phys) = phys::alloc_frame_user() else {
                 rollback_cloned_leaves(&mut cloned, &cloned_leaves);
                 drop(mutation);
                 return Err(AddressSpaceError::OutOfFrames);
@@ -458,7 +458,7 @@ impl ProcessAddressSpace {
 
             if frame_buffer_pos == frame_buffer_len {
                 let want = (page_count - page_index).min(FRAME_BATCH_CHUNK);
-                frame_buffer_len = phys::alloc_frames_batch(&mut frame_buffer[..want]);
+                frame_buffer_len = phys::alloc_frames_batch_user(&mut frame_buffer[..want]);
                 frame_buffer_pos = 0;
                 if frame_buffer_len == 0 {
                     rollback_user_pages(self, &mapped_pages, mutation);
@@ -980,7 +980,7 @@ fn ensure_next_table(
         return Ok(child);
     }
 
-    let Some(table_phys) = phys::alloc_frame() else {
+    let Some(table_phys) = phys::alloc_frame_user() else {
         return Err(AddressSpaceError::OutOfFrames);
     };
     unsafe {
