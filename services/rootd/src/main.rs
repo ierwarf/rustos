@@ -27,6 +27,7 @@
 extern crate alloc;
 
 mod control_drain;
+mod jobs;
 mod loader_wire;
 mod memory_governor;
 mod scheduling_policy;
@@ -271,6 +272,11 @@ pub extern "C" fn __rustos_rootd_start() -> ! {
         }
     }
 
+    // The job tree is additive in this phase: report its health, never gate on it.
+    match jobs::selfcheck(syscall0(SYS_GETPID) as u64) {
+        0 => debug_line(b"rootd: job tree ok\n"),
+        _ => debug_line(b"rootd: job tree self-check failed\n"),
+    }
     debug_line(b"rootd: core services ready, spawning initd via loaderd\n");
     let _ = syscall3(
         SYS_RUSTOS_PRODUCT_MILESTONE,

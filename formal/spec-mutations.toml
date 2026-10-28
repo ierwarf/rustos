@@ -36,6 +36,7 @@ required_models = [
     "ipc-reply-deadline/IpcReplyDeadline",
     "ipc-reply-recv-transaction/IpcReplyRecvTransaction",
     "ipc-transfer-authority/IpcTransferAuthority",
+    "job-lifecycle/JobLifecycle",
     "lifecycle-execution-claim/LifecycleExecutionClaim",
     "mm-activation-close/MmActivationClose",
     "msi-vector-lifecycle/MsiVectorLifecycle",
@@ -1499,6 +1500,30 @@ find = """    /\\ jobUpdated' = jobUpdated \\cup {m}"""
 replace = """    /\\ jobUpdated' = JobMembers"""
 occurrence = 1
 invariant = "AllJobGatesBeforeRelease"
+min_counterexample_states = 5
+
+[[mutation]]
+id = "job-lifecycle-publish-into-killing-job"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "job-lifecycle/JobLifecycle"
+flow = "process-lifecycle-transaction"
+find = "    /\\ ~jkilling[j] \\* publish guard\n"
+replace = "    /\\ TRUE \\* publish guard\n"
+occurrence = 1
+invariant = "NoMemberJoinsKillingJob"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "job-lifecycle-recycle-with-live-member"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "job-lifecycle/JobLifecycle"
+flow = "process-lifecycle-transaction"
+find = "    /\\ \\A p \\in Procs: ~(pstate[p] # \"absent\" /\\ pjob[p] = j) \\* no member object\n"
+replace = "    /\\ TRUE \\* no member object\n"
+occurrence = 1
+invariant = "MemberJobIsLive"
 min_counterexample_states = 5
 
 [[mutation]]

@@ -10,7 +10,7 @@ Concrete owners:
   * kernel/ps/src/multitask/current.rs             (terminate_user_process_once)
   * kernel/compat/src/user/syscall/linux/lifecycle_broker_ops.rs
         (syscall_linux_rustos_rootd_terminate_broker,
-         terminate_process_for_memory_pressure, finalize_terminated_process)
+         terminate_process_once_and_finalize, finalize_terminated_process)
 
 A termination request that finds one already queued joins it and waits for the
 same exit. Only the terminator that published the request may run the

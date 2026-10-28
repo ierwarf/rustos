@@ -6,8 +6,9 @@
 
 ## English
 
-**Status: design. Nothing in this document is implemented.** The one thing that
-exists today is its per-process ancestor: the memory census, the watermark, and
+**Status: phase 1 is implemented (see [Phase 1 as built](#phase-1-as-built));
+everything after it is design.** Before phase 1 the only precursor was the
+per-process ancestor: the memory census, the watermark, and
 the `rootd` / ring0-watchdog OOM policy described in
 [the address-space contract](../ai/address-space-lifecycle-contract.md#4-memory-pressure-watermark-and-oom-policy).
 The parent decision record is [Ring3 Process Model](ring3-process-model.md).
@@ -302,6 +303,55 @@ charge for kernel allocations *(recalled)*. This is why invariant 1 is "one job
 per process" and not "one job per allocation": the owner stays simple and the
 exception is an explicit, scoped charge target.
 
+### Phase 1 as built
+
+Implemented in `kernel/ps/src/multitask/process_table/jobs.rs`, the syscall edge
+`kernel/compat/src/user/syscall/linux/job_ops.rs`
+(`SYS_RUSTOS_JOB`, `0x5255_0057`, ABI v1), and the `rootd` client
+`services/rootd/src/jobs.rs`. Model: `job-lifecycle`.
+
+What exists: a root job at boot; `CREATE_CHILD`, `GET_INFO`, `KILL` and
+`PROCESS_JOB`; a `JobId` of `(slot, generation)` that a recycled slot cannot
+alias; every process created into its parent's job or, through the kernel entry
+`reserve_process_spawn_in`, an explicit live job; a `Killing` job refusing new
+members and children across its whole subtree; the memory census carrying each
+process's job; and a kill that ends members with the same single-finalizer
+termination the watchdog uses, at most 128 per call, reporting `remaining`.
+
+Decisions and departures from the sections above, stated so they are not read as
+the final form:
+
+- **Authority is the root-supervisor capability, not a job handle.** The
+  `HandleRights::Job` rights of section 4 are not built, so only `rootd` can
+  operate on jobs. Handle rights land with phase 3, when policy needs them.
+- **Membership is derived, not counted.** Live-process counts are computed by
+  scanning the 32 process slots under the process-table lock, so no counter can
+  disagree with the processes. This is a phase-1 convenience; the directory in
+  phase 2a replaces the scan with an indexed structure.
+- **The job slab holds 64 jobs and depth 8.** These are internal bounds, not ABI
+  values. They become `jobs.max` and a depth limit of the root job's policy in
+  phase 2a.
+- **A job slot is recycled only when no process object, exiting or not, names
+  it.** An exiting process that has not been reaped still carries its job index,
+  so releasing earlier would let a new job inherit its members. A killed job with
+  no member and no child is released inside the kill call; otherwise on the next
+  job operation after the last member is reaped.
+- **A caller inside the target subtree is refused (`EPERM`).** A supervisor
+  cannot kill itself, and the root job cannot be killed at all.
+- **No spawn ABI places a process in a job yet.** The kernel entry exists; the
+  process broker's prepare step does not take a job. Until it does, every
+  process lives in the root job and `rootd` only exercises the tree through a
+  boot self-check (`rootd: job tree ok`).
+- **`rootd`'s memory governor still chooses a process, not a job.** The census
+  now reports the job, which is what the job-level governor will group by.
+
+Verification: the `job-lifecycle` TLA+ model (two spec mutants killed), seven
+kernel-ps unit tests, four compat tests, three implementation mutants killed,
+and a 1-vCPU KVM boot that reached the self-check milestone. The process-table
+Loom and Shuttle witnesses were **not** extended for the job slab: it shares the
+process-table lock, so there is no new lock-free path, but that is an argument,
+not a concurrency witness.
+
 ### 13. Alternatives considered
 
 - **Per-process limits only (rlimits).** Does not aggregate a multi-process
@@ -339,9 +389,14 @@ exception is an explicit, scoped charge target.
 
 ## 한국어 요약
 
-**상태: 설계 문서이며 구현된 것은 없습니다.** 이번 세션에서 만든 OOM 작업
-(프로세스별 census, 워터마크, `rootd` 거버너, ring0 watchdog)이 이 설계의
-프로세스 단위 선행 형태입니다.
+**상태: 1단계는 구현되었고 그 이후는 설계입니다.** 구현된 것: 루트 job,
+`CREATE_CHILD`/`GET_INFO`/`KILL`/`PROCESS_JOB`(`SYS_RUSTOS_JOB`), 세대 번호가 붙은
+`JobId`, 부모 job 상속, `Killing` job의 신규 멤버·자식 거부, census의 job 필드,
+`rootd`의 부팅 시 자체 점검. 이번 세션에서 만든 OOM 작업(프로세스별 census,
+워터마크, `rootd` 거버너, ring0 watchdog)이 이 설계의 프로세스 단위 선행 형태입니다.
+1단계의 권한 확인은 job 핸들이 아니라 root-supervisor capability이고, 어떤 spawn
+ABI도 아직 프로세스를 특정 job에 넣지 못하며, 거버너는 여전히 프로세스를 고릅니다.
+프로세스 테이블의 Loom/Shuttle witness는 확장하지 않았습니다.
 
 - **문제**: 프로세스 32개, 스레드 32개, 서비스 endpoint 16개, 서비스 ID 정수,
   서비스당 권한 비트 하나(최대 64)가 컴파일 타임 상수이며, 프로세스 상한 하나가

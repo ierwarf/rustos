@@ -82,6 +82,9 @@ pub const SYS_RUSTOS_ROOTD_TERMINATE_BROKER: u64 = 0x5255_003c;
 /// Root-supervisor memory-pressure census. Appended after the IPC register
 /// calls; 0x5255_0056 was the first unused number when it was added.
 pub const SYS_RUSTOS_ROOTD_MEMORY_BROKER: u64 = 0x5255_0056;
+/// Job tree: create, inspect and kill groups of processes. Appended after the
+/// memory broker; 0x5255_0057 was the next unused number.
+pub const SYS_RUSTOS_JOB: u64 = 0x5255_0057;
 /// Capability-gated, event-driven wait for the DVM input transport. Only
 /// inputd may use this to wait for an MSI-X-published ingress batch; input
 /// policy and translation remain in the service.
@@ -919,6 +922,17 @@ pub const ROOTD_TERMINATE_BROKER_ABI_VERSION: u16 = 1;
 pub const ROOTD_MEMORY_BROKER_ABI_VERSION: u16 = 1;
 /// Fixed size of the census: the live processes with the largest resident sets.
 pub const ROOTD_MEMORY_CENSUS_MAX_ENTRIES: usize = 32;
+/// Job broker wire version, independent of every other broker.
+pub const JOB_ABI_VERSION: u16 = 1;
+pub const JOB_OP_GET_INFO: u16 = 1;
+pub const JOB_OP_CREATE_CHILD: u16 = 2;
+pub const JOB_OP_KILL: u16 = 3;
+pub const JOB_OP_PROCESS_JOB: u16 = 4;
+/// The root job's id. A job id is `(slot << 32) | generation`; only the root
+/// has a fixed value, and every other id comes from `JOB_OP_CREATE_CHILD`.
+pub const JOB_ID_ROOT: u64 = 1;
+pub const JOB_STATE_LIVE: u32 = 0;
+pub const JOB_STATE_KILLING: u32 = 1;
 pub const PROC_BROKER_FORMAT_ELF64: u16 = 1;
 pub const PROC_BROKER_FORMAT_PE64: u16 = 2;
 pub const PROC_BROKER_MAP_READ: u64 = 1 << 0;
@@ -2836,6 +2850,35 @@ pub struct RootdMemoryCensusEntry {
     pub process_id: u64,
     pub parent_process_id: u64,
     pub resident_pages: u64,
+    /// The job this process belongs to (`JOB_ID_ROOT` unless placed elsewhere).
+    pub job: u64,
+}
+
+/// Request and reply of `SYS_RUSTOS_JOB`. `op` selects the use of the fields;
+/// unused inputs must be zero and unused outputs are written as zero.
+///
+/// - `GET_INFO`: in `job`; out `result_job` (the parent, 0 for the root),
+///   `state`, `depth`, `processes`, `subtree_processes`, `children`, `kills`.
+/// - `CREATE_CHILD`: in `job` (the parent); out `result_job` (the new job).
+/// - `KILL`: in `job`; out `remaining`, the members still alive when the
+///   bounded kill step ended. Repeat the call until it reports zero.
+/// - `PROCESS_JOB`: in `pid`; out `result_job`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RustosJobArgs {
+    pub abi_version: u16,
+    pub op: u16,
+    pub flags: u32,
+    pub job: u64,
+    pub pid: u64,
+    pub result_job: u64,
+    pub state: u32,
+    pub depth: u32,
+    pub processes: u64,
+    pub subtree_processes: u64,
+    pub children: u64,
+    pub kills: u64,
+    pub remaining: u64,
 }
 
 /// Request and reply of `SYS_RUSTOS_ROOTD_MEMORY_BROKER`. The caller sets

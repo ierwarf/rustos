@@ -20,6 +20,8 @@ use super::*;
 pub struct SpawnReservation {
     pub(super) handle: ProcessHandle,
     pub(super) transaction_id: u32,
+    /// Job requested at reservation; `None` joins the parent's job.
+    pub(super) job: Option<jobs::JobId>,
 }
 
 impl SpawnReservation {
@@ -46,6 +48,18 @@ impl SpawnReservation {
 /// invisible to all live-process lookup paths until `publish_spawn` installs
 /// a complete process object.
 pub fn reserve_spawn() -> Option<SpawnReservation> {
+    reserve_spawn_in(None)
+}
+
+/// `reserve_spawn` that places the new process in `job`. A job that is stale or
+/// being killed refuses here, before any address-space work, and is checked
+/// again at publication because a kill may start in between.
+pub fn reserve_spawn_in(job: Option<jobs::JobId>) -> Option<SpawnReservation> {
+    if let Some(job) = job {
+        if jobs::job_info(job).ok()?.state != jobs::JobState::Live {
+            return None;
+        }
+    }
     let transaction_id = allocate_lifecycle_transaction_id()?;
     let mut table = PROCESS_TABLE.lock();
     let (index, slot) = table.slots.iter_mut().enumerate().find(|(_, slot)| {
@@ -61,6 +75,7 @@ pub fn reserve_spawn() -> Option<SpawnReservation> {
     Some(SpawnReservation {
         handle,
         transaction_id,
+        job,
     })
 }
 
@@ -180,13 +195,22 @@ fn publish_inner(
 ) -> Option<(ProcessHandle, Option<pin_owner::ProcessObjectPin>)> {
     // Heap construction and failed-state destruction stay outside the table
     // leaf. The table guard drops before this earlier-declared object on refusal.
-    let object = Box::new(ProcessObject::new(
+    // The job is only known under the lock, so the object is built with the
+    // root job and re-pointed before it becomes visible.
+    let mut object = Box::new(ProcessObject::new(
         process_id,
         parent_process_id,
         state,
         reservation.transaction_id,
+        jobs::ROOT_JOB,
     ));
     let mut table = PROCESS_TABLE.lock();
+    // A process joins its parent's job, or the explicit job; a job being killed
+    // refuses, and a refused birth leaves the reservation for the caller to
+    // cancel exactly as for any other publication refusal.
+    object.job = table
+        .resolve_new_member_job(reservation.job, parent_process_id)
+        .ok()?;
     let slot = table.lookup_slot_mut(reservation.handle)?;
     if slot.object.is_some()
         || slot.spawn_transaction_id != Some(reservation.transaction_id)

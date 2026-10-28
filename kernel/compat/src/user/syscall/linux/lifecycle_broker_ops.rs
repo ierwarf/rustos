@@ -225,7 +225,7 @@ fn finalize_terminated_process(process_id: u64, parent_pid: u64) {
 
 /// Ends `process_id` on behalf of the memory-pressure watchdog. Normal task
 /// context only. False means the process was already gone.
-pub(crate) fn terminate_process_for_memory_pressure(process_id: u64) -> bool {
+pub(crate) fn terminate_process_once_and_finalize(process_id: u64) -> bool {
     let parent_pid = multitask::parent_process_id_of(process_id).unwrap_or(0);
     // Only the terminator that published the termination finalizes it, so a
     // root supervisor kill racing this one cannot record the exit twice.
@@ -281,6 +281,7 @@ fn build_memory_reply(
             process_id: entry.process_id,
             parent_process_id: entry.parent_process_id,
             resident_pages: entry.resident_pages,
+            job: entry.job,
         };
     }
     reply.entry_count = count as u32;
@@ -414,6 +415,7 @@ mod tests {
                 process_id: index as u64 + 1,
                 parent_process_id: 1,
                 resident_pages: 100 - index as u64,
+                job: 1,
             })
             .collect();
         let reply = build_memory_reply(&stats, &census);

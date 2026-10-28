@@ -6,7 +6,9 @@
 
 ## English
 
-**Status: decision record and roadmap. Nothing here is implemented.** It states
+**Status: decision record and roadmap. Step 1 (job object, root job, kill by
+job) is implemented as described in [Job Model](job-model.md#phase-1-as-built);
+steps 2 to 8 are not.** It states
 what in the current ring3 structure must be replaced, the target shape, and the
 invariants that keep later work from being redone. The first and largest
 component, jobs and quotas, is specified in [Job Model](job-model.md).
@@ -159,7 +161,8 @@ job.
 
 ## 한국어 요약
 
-**상태: 결정 기록과 로드맵이며 구현된 것은 없습니다.**
+**상태: 결정 기록과 로드맵입니다. 1단계(job 객체, 루트 job, job 단위 kill)만
+구현되었고 2~8단계는 아직입니다.**
 
 - **판정**: 정책을 이름 있는 서비스로 나눈 구조는 유지합니다. 그 아래 프로세스·서비스
   모델이 서비스 약 15개짜리 고정 시스템에 맞춰져 있어, 서드파티 서비스나 다수

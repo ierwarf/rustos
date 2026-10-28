@@ -11,6 +11,8 @@ mod early_system_broker_ops;
 mod entropy_broker_ops;
 #[path = "input_broker_ops.rs"]
 mod input_broker_ops;
+#[path = "job_ops.rs"]
+mod job_ops;
 #[path = "lifecycle_broker_ops.rs"]
 mod lifecycle_broker_ops;
 #[path = "net_broker_ops.rs"]
@@ -22,6 +24,7 @@ use device_broker_ops::*;
 use early_system_broker_ops::*;
 use entropy_broker_ops::*;
 use input_broker_ops::*;
+use job_ops::*;
 use lifecycle_broker_ops::*;
 use net_broker_ops::*;
 use waitset_broker_ops::*;
@@ -29,7 +32,7 @@ use waitset_broker_ops::*;
 pub(super) use device_broker_ops::device_sysop_error_to_linux_errno;
 pub(crate) use lifecycle_broker_ops::{
     RETIRED_TASK_CLEANUP_BUDGET, service_retired_task_runtime_cleanup,
-    terminate_process_for_memory_pressure,
+    terminate_process_once_and_finalize,
 };
 
 pub(super) fn is_linux_rustos_broker_syscall(syscall_number: u64) -> bool {
@@ -45,6 +48,7 @@ pub(super) fn is_linux_rustos_broker_syscall(syscall_number: u64) -> bool {
             | linux_abi::SYS_RUSTOS_ROOTD_WAIT_BROKER
             | linux_abi::SYS_RUSTOS_ROOTD_TERMINATE_BROKER
             | linux_abi::SYS_RUSTOS_ROOTD_MEMORY_BROKER
+            | linux_abi::SYS_RUSTOS_JOB
             | linux_abi::SYS_RUSTOS_SCHEDULING_CONTEXT_GRANT_BROKER
             | linux_abi::SYS_RUSTOS_WAITSET_SIGNAL_BROKER
             | linux_abi::SYS_RUSTOS_ENTROPY_BROKER
@@ -80,6 +84,7 @@ pub(super) fn dispatch_linux_rustos_broker_syscall(frame: &SyscallFrame) -> u64 
         linux_abi::SYS_RUSTOS_ROOTD_MEMORY_BROKER => {
             syscall_linux_rustos_rootd_memory_broker(frame.rdi)
         }
+        linux_abi::SYS_RUSTOS_JOB => syscall_linux_rustos_job(frame.rdi),
         linux_abi::SYS_RUSTOS_SCHEDULING_CONTEXT_GRANT_BROKER => {
             syscall_linux_rustos_scheduling_context_grant_broker(frame.rdi)
         }

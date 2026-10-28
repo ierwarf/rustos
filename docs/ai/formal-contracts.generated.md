@@ -2,18 +2,18 @@
 # Formal Contract Registry
 
 - Schema: `3`
-- Registry SHA-256: `b757e3db1704db0ab31f146b58b6eef21c385a9036eddd98cd4b1e5a4dc84529`
-- Models: `147`
+- Registry SHA-256: `eb591469b053f610a2e2a03f0e924402a9db51f6048cad11e1b37ed58dca85cb`
+- Models: `148`
 - Whole flows: `75`
-- Transitions: `882`
+- Transitions: `883`
 - Product runtime scenarios: `3`
-- Exact source witnesses: `1351`
+- Exact source witnesses: `1352`
 - Apalache pilots: `3`
 - TLAPS theorem models: `2`
 - Runtime-traced models: `7`
 - Intentional-terminal exceptions: `92` (ceiling `92`)
 - Cyclic strongly connected components: `49`
-- Supporting model bindings: `119`
+- Supporting model bindings: `120`
 - Explicit critical/high risk surfaces: `234`
 - Additional source mappings: `360`
 
@@ -69,7 +69,7 @@
 | `post-init-bootstrap-barrier` | `critical` | initd | post-init-bootstrap-barrier/PostInitBootstrapBarrier | 5 | 5 | barrier-failed, consumer-started |
 | `post-init-service-authority` | `critical` | kernel-compat, loaderd, rootd | post-init-leases/PostInitLeases | 6 | 6 | denied, revoked |
 | `process-address-space-lifecycle` | `critical` | kernel-ps | exec-address-space-transaction/ExecAddressSpaceTransaction, process-address-space-lifetime/ProcessAddressSpaceLifetime | 15 | 15 | live, reclaimed, rejected |
-| `process-lifecycle-transaction` | `critical` | kernel-mm, kernel-ps | oom-termination-owner/OomTerminationOwner, process-lifecycle-transaction/ProcessLifecycleTransaction | 16 | 16 | dead, rejected, rolled-back |
+| `process-lifecycle-transaction` | `critical` | kernel-mm, kernel-ps | job-lifecycle/JobLifecycle, oom-termination-owner/OomTerminationOwner, process-lifecycle-transaction/ProcessLifecycleTransaction | 17 | 17 | dead, rejected, rolled-back |
 | `process-signal-lifecycle` | `critical` | kernel-compat, kernel-executive, kernel-ps, procd | process-signal-delivery/ProcessSignalDelivery, sigchld-notification/SigchldNotification | 15 | 15 | delivered, frame-installed, lifecycle-committed, process-terminated, rejected, reported, runtime-preserved |
 | `remote-file-map` | `critical` | kernel-compat, vfsd | remote-file-mapping/RemoteFileMapping | 9 | 9 | aborted, mapped |
 | `root-authority` | `critical` | kernel-compat, kernel-ipc-runtime, rootd | root-authority-publication/RootAuthorityPublication | 6 | 6 | denied, service-published |

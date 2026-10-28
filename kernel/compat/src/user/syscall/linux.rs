@@ -17,7 +17,7 @@ mod smp_qualification_ops;
 mod support;
 mod syscalld_ops;
 
-pub(crate) use broker_ops::{service_retired_task_runtime_cleanup, terminate_process_for_memory_pressure, RETIRED_TASK_CLEANUP_BUDGET};
+pub(crate) use broker_ops::{service_retired_task_runtime_cleanup, terminate_process_once_and_finalize, RETIRED_TASK_CLEANUP_BUDGET};
 pub(crate) use runtime_maintenance::{drain_ipc_call_profile, service_deferred_transfer_releases};
 
 use alloc::string::String;

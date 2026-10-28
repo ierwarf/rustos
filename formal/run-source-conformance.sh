@@ -1338,6 +1338,7 @@ pager-fault-slot-lifecycle/PagerFaultSlotLifecycle|kernel-ps|multitask::schedule
 pager-fault-slot-lifecycle/PagerFaultSlotLifecycle|kernel-ps|multitask::scheduler::pager_handoff::tests::actual_pager_does_not_clear_an_unrelated_rearmed_worker_wait
 frame-reader-claim/FrameReaderClaim|kernel-ps|multitask::scheduler::pager_handoff::tests::actual_pager_last_floor_effect_keeps_original_reader_binding_and_typed_phase
 oom-termination-owner/OomTerminationOwner|kernel-ps|multitask::scheduler::current_terminal::tests::actual_group_request_marks_exit_before_original_census_worker_effects
+job-lifecycle/JobLifecycle|kernel-ps|multitask::process_table::jobs::tests::killing_a_job_refuses_new_members_and_children_in_its_whole_subtree
 scheduler-terminal-claim/SchedulerTerminalClaim|kernel-ps|multitask::scheduler::return_architecture::tests::actual_remote_terminal_cannot_retire_a_slot_whose_dispatch_claim_is_in_flight
 scheduler-wakeup/SchedulerWakeup|kernel-ps|multitask::scheduler::pager_handoff::tests::actual_pager_precommit_current_worker_wake_never_reads_consumed_frame_or_reblocks
 mm-activation-close/MmActivationClose|kernel-ps|multitask::scheduler::pager_handoff::tests::actual_pager_resume_borrows_original_current_mm_without_claim_or_frame_read

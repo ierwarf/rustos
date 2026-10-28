@@ -165,6 +165,8 @@ struct ProcessObject {
     exit_status: Option<i32>,
     child_state_change: Option<ChildStateChange>,
     waited: bool,
+    /// The job this process was created into. Fixed for the process's life.
+    job: jobs::JobId,
     state: ProcessStateLock<UserProcessState>,
 }
 
@@ -174,6 +176,7 @@ impl ProcessObject {
         parent_process_id: Option<u64>,
         state: UserProcessState,
         lifecycle_transaction_id: u32,
+        job: jobs::JobId,
     ) -> Self {
         Self {
             process_id,
@@ -196,6 +199,7 @@ impl ProcessObject {
             exit_status: None,
             child_state_change: None,
             waited: parent_process_id.is_none(),
+            job,
             state: ProcessStateLock::new(state),
         }
     }
@@ -225,6 +229,7 @@ impl ProcessSlot {
 
 struct ProcessTable {
     slots: [ProcessSlot; MAX_PROCESS_OBJECTS],
+    jobs: [jobs::JobSlot; jobs::JOB_SLOTS],
     reap_queue: [Option<ProcessHandle>; MAX_PROCESS_OBJECTS],
     reap_len: usize,
     reap_scan_pending: bool,
@@ -234,6 +239,11 @@ impl ProcessTable {
     const fn new() -> Self {
         Self {
             slots: [const { ProcessSlot::empty() }; MAX_PROCESS_OBJECTS],
+            jobs: {
+                let mut jobs = [const { jobs::JobSlot::empty() }; jobs::JOB_SLOTS];
+                jobs[0] = jobs::JobSlot::root();
+                jobs
+            },
             reap_queue: [None; MAX_PROCESS_OBJECTS],
             reap_len: 0,
             reap_scan_pending: false,
@@ -266,6 +276,7 @@ impl ProcessTable {
 }
 
 mod identity;
+pub mod jobs;
 mod mm_execution;
 pub(in crate::multitask) mod pin_owner;
 pub(super) use identity::published_live_process_identity;
@@ -291,7 +302,7 @@ pub(super) fn with_own_exact_visible_state<R>(
 }
 
 pub(in crate::multitask) mod spawn;
-pub use spawn::{cancel_spawn, reserve_spawn, SpawnReservation};
+pub use spawn::{cancel_spawn, reserve_spawn, reserve_spawn_in, SpawnReservation};
 #[cfg(test)]
 pub use spawn::{publish_spawn};
 
@@ -485,6 +496,8 @@ pub struct MemoryCensusEntry {
     pub parent_process_id: u64,
     /// Mapped data leaves in the address space, shared aliases included.
     pub resident_pages: u64,
+    /// Raw `JobId` of the process's job.
+    pub job: u64,
 }
 
 /// Inserts `entry` into `out[..len]`, kept ordered by `resident_pages`
@@ -537,6 +550,7 @@ pub fn memory_census(out: &mut [MemoryCensusEntry]) -> usize {
                 process_id: object.process_id,
                 parent_process_id: object.parent_process_id.unwrap_or(0),
                 resident_pages,
+                job: object.job.to_raw(),
             },
         );
     }
@@ -1322,6 +1336,7 @@ pub(crate) mod tests {
                 process_id,
                 parent_process_id: 1,
                 resident_pages,
+                job: 1,
             }
         }
 
@@ -1602,7 +1617,7 @@ pub(crate) mod tests {
 
     #[test]
     fn process_address_space_and_exec_exit_are_serialized() {
-        let mut object = ProcessObject::new(7, None, new_state(), 41);
+        let mut object = ProcessObject::new(7, None, new_state(), 41, super::jobs::ROOT_JOB);
         let held = object.state.lock();
         assert!(object.state.try_lock().is_none());
         drop(held);

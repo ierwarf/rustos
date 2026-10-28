@@ -127,6 +127,10 @@ pub use crate::multitask::{
 };
 pub use crate::multitask::{register_child_waiter, unregister_child_waiter, wake_child_waiters};
 pub use crate::multitask::{MemoryCensusEntry, memory_census};
+pub use crate::multitask::{
+    job_collect_members, job_create_child, job_info, job_kill_begin, job_subtree_contains_process,
+    process_job, JobError, JobId, JobInfo, JobState, ROOT_JOB,
+};
 
 pub fn request_yield_reschedule() {
     crate::multitask::request_yield_reschedule();

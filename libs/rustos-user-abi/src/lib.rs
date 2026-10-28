@@ -152,8 +152,10 @@ mod tests {
         assert_eq!(syscall::SYS_RUSTOS_ROOTD_WAIT_BROKER, 0x5255_003b);
         assert_eq!(syscall::SYS_RUSTOS_ROOTD_TERMINATE_BROKER, 0x5255_003c);
         assert_eq!(syscall::SYS_RUSTOS_ROOTD_MEMORY_BROKER, 0x5255_0056);
-        assert_eq!(size_of::<syscall::RootdMemoryCensusEntry>(), 24);
-        assert_eq!(size_of::<syscall::RustosRootdMemoryBrokerArgs>(), 48 + 32 * 24);
+        assert_eq!(syscall::SYS_RUSTOS_JOB, 0x5255_0057);
+        assert_eq!(size_of::<syscall::RustosJobArgs>(), 80);
+        assert_eq!(size_of::<syscall::RootdMemoryCensusEntry>(), 32);
+        assert_eq!(size_of::<syscall::RustosRootdMemoryBrokerArgs>(), 48 + 32 * 32);
         assert_eq!(
             syscall::SYS_RUSTOS_SCHEDULING_CONTEXT_GRANT_BROKER,
             0x5255_004d

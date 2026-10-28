@@ -106,8 +106,12 @@ pub use self::pager_vma::{
     with_validated_fault_address_space, PagerFaultInstallPermit, PagerVmaError, PagerVmaSnapshot,
 };
 pub use self::process_table::{
-    cancel_spawn as cancel_process_spawn, reserve_spawn as reserve_process_spawn, ProcessIdentity,
-    SpawnReservation,
+    cancel_spawn as cancel_process_spawn, reserve_spawn as reserve_process_spawn,
+    reserve_spawn_in as reserve_process_spawn_in, ProcessIdentity, SpawnReservation,
+};
+pub use self::process_table::jobs::{
+    job_collect_members, job_create_child, job_info, job_kill_begin, job_subtree_contains_process,
+    process_job, JobError, JobId, JobInfo, JobState, JOB_MAX_DEPTH, ROOT_JOB,
 };
 pub use self::retirement::UserFaultDisposition;
 pub use self::scheduler::rsp_handoff::hardware_rsp_arrivals;

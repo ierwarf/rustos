@@ -191,7 +191,16 @@ read-only counterpart for memory pressure: one in-place struct returns usable,
 free and kernel-reserve pages, the monotonic watermark-denial count, and up to
 32 live processes ordered by resident data-leaf count. Ring0 neither retains
 pressure state nor chooses a victim; rootd's `memory_governor` does, then
-terminates through the call above.
+terminates through the call above. Each census entry also carries the process's
+`job`.
+`SYS_RUSTOS_JOB` (`0x5255_0057`, ABI v1, root-supervisor-only in this phase)
+operates the kernel job tree through one in-place `RustosJobArgs`: `GET_INFO`,
+`CREATE_CHILD`, `KILL` (bounded: at most 128 members ended per call, the rest
+reported in `remaining`) and `PROCESS_JOB`. Input fields only on entry; every
+output field must arrive zero. A job id is `(slot << 32) | generation` and the
+root job is `JOB_ID_ROOT` (1). A caller inside the target subtree and the root
+job are refused with `EPERM`. Design and limits:
+[Job Model](../../architecture/job-model.md#phase-1-as-built).
 Rootd receives supervisor requests through endpoint-owner-only sender-stamped
 receive syscalls; both pre-init and post-init supervisor turns must drain
 lifecycle/restart state before using `SYS_RUSTOS_IPC_TRY_RECV_WITH_SENDER`, so

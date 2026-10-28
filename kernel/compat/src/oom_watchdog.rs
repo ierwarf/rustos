@@ -237,7 +237,7 @@ pub(crate) fn service(watchdog: &mut OomWatchdog) -> usize {
         }
         Verdict::Kill { process_id } => {
             let ended =
-                crate::user::syscall::linux::terminate_process_for_memory_pressure(process_id);
+                crate::user::syscall::linux::terminate_process_once_and_finalize(process_id);
             crate::debug::record_milestone(
                 crate::debug::LogCategory::Compat,
                 if ended {

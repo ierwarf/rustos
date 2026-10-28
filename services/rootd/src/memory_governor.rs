@@ -210,6 +210,7 @@ mod tests {
                 process_id,
                 parent_process_id: 1,
                 resident_pages,
+                job: 1,
             };
         }
         reply

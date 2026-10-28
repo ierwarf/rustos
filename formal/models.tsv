@@ -146,3 +146,4 @@ cold-exec-intent/ColdExecIntent	safety	check	Finite cold ownership phases explic
 affinity-claim-admission/AffinityClaimAdmission	safety	check	Finite masks and slot identities explicitly stutter; no hardware/return refinement	30	120	exhaustive	no	no	no
 scheduler-terminal-claim/SchedulerTerminalClaim	safety	check	a completed stop stutters; every other state has an enabled claim, publish, or withdraw step	30	120	exhaustive	no	no	no
 oom-termination-owner/OomTerminationOwner	safety	check	a finished race stutters; every other state has an enabled request, finalize, or join step	30	120	exhaustive	no	no	no
+job-lifecycle/JobLifecycle	safety	check	an explicit stutter step is always enabled once the bounded generation space is exhausted	30	120	exhaustive	no	no	no
