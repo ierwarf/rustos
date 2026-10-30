@@ -11,7 +11,7 @@ still do not identify the owner.
 ## Focused AI docs
 
 - `docs/ai/token-policy.md` — detailed context/tool/output budgets.
-- `docs/ai/session-handoff.md` — volatile checkout state for continuation only.
+- `docs/ai/session-handoff.md` — dated repository snapshot; verify live checkout state before resuming.
 - `docs/ai/repo-map.md` — deeper source ownership and entrypoints.
 - `docs/ai/commands.md` — quiet build/check/debug commands.
 - `docs/ai/contracts-infra.md` — manifests, stage/build/log/fault contracts.

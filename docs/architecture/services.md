@@ -18,7 +18,8 @@ surfaces or sockets they expose.
 | `initd` | Linux-style init. Starts `runtimed`, sets per-session env, and reaps strays. | `/proc/1`. |
 | `runtimed` | Service manager + launch broker. Bootstraps `uiserver` (synchronously with manifest env), then dispatches autostart and on-demand launches. | `/run/runtimed.sock` (`RuntimeClient`). |
 | `sessiond` | Session policy: focus, console session lifecycle, per-user resources. | Pairs with `runtimed`. |
-| `syscalld` | Linux MM/clock/signal policy. Calls into the gated `SYS_RUSTOS_MM_BROKER`. | `IPC_SERVICE_SYSCALLD`. |
+| `syscalld` | Linux MM/credential and selected signal policy via gated brokers; routine clocks use the local compat timer path. | `IPC_SERVICE_SYSCALLD`. |
+| `pagerd` | Backing-object and fault-policy service; anonymous faults are served in ring0, and file-backed fault dispatch is not yet live. | `IPC_SERVICE_PAGERD`. |
 | `vfsd` | Linux VFS policy (mount table, openat resolution, FAT boot volume). | `IPC_SERVICE_VFSD`. |
 | `loaderd` | Process spawn: ELF dynamic main+interpreter, PE32+ main + System32 imports, Windows runtime broker registration. | `IPC_SERVICE_LOADERD`. |
 | Linux DVM | Linux driver lifecycle, DRM/KMS, evdev, and virtio-net. | Fixed RDI3/ivshmem transports. |
@@ -68,7 +69,8 @@ ELF, 그리고 staged registry에 한 줄을 함께 가집니다. 아래 표는 
 | `initd` | Linux 스타일 init. `runtimed`를 띄우고 session 환경을 set, 좀비 회수. | `/proc/1`. |
 | `runtimed` | service manager + launch broker. manifest env를 적용한 채 `uiserver`를 동기 부트스트랩한 뒤, autostart와 on-demand launch를 dispatch. | `/run/runtimed.sock` (`RuntimeClient`). |
 | `sessiond` | session policy: focus, console session lifecycle, per-user resource. | `runtimed`와 쌍. |
-| `syscalld` | Linux MM/clock/signal policy. `SYS_RUSTOS_MM_BROKER` 호출. | `IPC_SERVICE_SYSCALLD`. |
+| `syscalld` | Linux MM/credential 및 일부 signal 정책. 일반 clock 호출은 compat 내부 timer 경로. | `IPC_SERVICE_SYSCALLD`. |
+| `pagerd` | backing-object 및 fault 정책. anonymous fault는 ring0가 처리하며 file-backed dispatch는 아직 실사용 경로에 연결되지 않음. | `IPC_SERVICE_PAGERD`. |
 | `vfsd` | Linux VFS policy (mount table, openat resolution, FAT boot volume). | `IPC_SERVICE_VFSD`. |
 | `loaderd` | process spawn: ELF dynamic main+interpreter, PE32+ main + System32 import, Windows runtime broker 등록. | `IPC_SERVICE_LOADERD`. |
 | Linux DVM | Linux driver lifecycle, DRM/KMS, evdev, virtio-net. | 고정 RDI3/ivshmem transport. |

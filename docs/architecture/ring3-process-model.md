@@ -6,71 +6,59 @@
 
 ## English
 
-**Status: decision record and roadmap. Step 1 (job object, root job, kill by
-job) and the storage half of step 2 (the chunked process-table directory) are
-implemented as described in [Job Model](job-model.md#phase-1-as-built) and
-[Phase 2a as built](job-model.md#phase-2a-as-built); counted process and thread
-limits are implemented ([Phase 2b](job-model.md#phase-2b-counted-limits-as-built)),
-as is resident-page memory charging
-([2b-ii](job-model.md#phase-2b-ii-memory-limit-as-built)); kernel-memory
-accounting, `memory.high/min` and steps 3 to 8 are not.** It states
-what in the current ring3 structure must be replaced, the target shape, and the
-invariants that keep later work from being redone. The first and largest
-component, jobs and quotas, is specified in [Job Model](job-model.md).
+**Status (2026-10-31 source snapshot):** This is a target architecture and
+migration plan, not an all-unimplemented feature list. Job lifecycle (step 1),
+the chunked process directory (2a), counted process/thread limits, resident
+user-page accounting (2b) and application Job placement have landed. JobPolicy
+v1's 256-bit ceiling is implemented as a **partial step 3a**; the complete
+legacy-capability cutover has not. Kernel-memory accounting,
+`memory.high/min`, unified service/runtime/IDL, component supervision,
+client-funded sessions, personality servers and operability work remain open.
+See [Job Model as-built sections](job-model.md#phase-1-as-built) for exact status.
+Dated tests there are not automatically current release evidence.
 
-Tags: **(verified)** read from this tree, **(proposed)** a design decision,
-**(recalled)** background knowledge not re-read for this document.
+Tags: **(verified)** refers to the snapshot identified above,
+**(proposed)** to a target and **(historical)** to the pre-migration audit.
 
 ### 1. Verdict
 
-The split of policy into named services (`rootd`, `vfsd`, `netd`, ...) is
-sound and stays. What does not scale is the layer beneath it: the process and
-service model has hard-wired numbers and enumerations. It fits a fixed system of
-about fifteen services; third-party services, many applications, per-user
-isolation, or any resource accounting would rewrite it. So the work is three
-full redesigns and five partial ones.
+The division into named userspace policy services remains sound. The redesign
+targets the **identity, resource and supervision model beneath those services**,
+not the scheduler, IPC fast paths or basic memory manager. Process-table
+scalability and initial job quotas are already implemented; fixed service
+identity/authority and fragmented lifecycle supervision are not yet retired.
 
-### 2. Evidence
+### 2. Current source evidence
 
-All **(verified)** against the tree.
-
-| Fact | Where |
-| --- | --- |
-| 32 processes system-wide, 32 threads per process | `MAX_PROCESS_OBJECTS`, `MAX_THREADS_PER_PROCESS`, [process_table.rs:27](../../kernel/ps/src/multitask/process_table.rs) |
-| 16 registered service endpoints | [ipc_ops.rs:80](../../kernel/compat/src/user/syscall/linux/ipc_ops.rs) |
-| Service identity is an integer 1..15 | `IPC_SERVICE_*`, [syscall.rs:332](../../libs/rustos-user-abi/src/syscall.rs) |
-| Service authority is one bit per service, 64 at most | `IPC_SERVICE_CAP_*`, same file |
-| Bootstrap manifest is a compile-time array with a `u16` dependency mask and a hard-coded index | [service_manifest.rs](../../services/rootd/src/service_manifest.rs) |
-| Restart policy is a fixed budget of 3 with a 250 ms backoff | [rootd main.rs](../../services/rootd/src/main.rs) |
-| No per-service memory, handle, endpoint or process quota; CPU has a domain-admission quota | grep of `kernel/ps`, `kernel/compat`, `services` |
-| Security context is uid/gid plus a `logical_admin` flag | `ProcessSecurityContext`, [process_state.rs:85](../../kernel/ps/src/user/process_state.rs) |
-| 42 `RING3-MIGRATION-REFERENCE` exception blocks in 39 kernel files (Linux and Windows compatibility, tty, console host, VFS metadata, DVM transports) | `kernel/compat`, `kernel/io-manager` |
-| Seven services are `std`, six are `no_std`; raw `syscall0/1/2` wrappers are re-implemented per service (`rootd` 6, `devmgrd` 6, `netd` 5, ...) | `services/*/src` |
-| IPC wire formats are hand-written `#[repr(C)]` structs, about 10 000 lines, versioned per struct | `libs/rustos-user-abi` |
-| Lifecycle is split across `rootd` (core and post-init leases), `initd`, `runtimed`, and `sessiond`, which reconcile leases among themselves | [ring3-service-maturity.md](../ai/ring3-service-maturity.md), `services/*` |
-
-Not examined: the internals of `uiserver` (about 23 000 lines) and `runtimed`
-(about 7 000), and any cost estimate.
-
-### 3. Redesigns
-
-**Full**
-
-| ID | Area | Why it cannot be patched | Target |
-| --- | --- | --- | --- |
-| A | Process and service identity, namespace | The numbers are in the ABI and in static lock-free arrays | Job tree, generational identity, capability routing instead of integer service IDs |
-| B | Lifecycle and supervision | Four supervisors share leases; the manifest is static and positional | One declarative component manifest, one component tree, one supervision tree with restart intensity and escalation |
-| C | Resource accounting and quotas | Nothing aggregates across processes | Hierarchical budgets in the job tree; session quotas funded by clients |
-
-**Partial**
-
-| ID | Area | Direction |
+| Area | Snapshot observation | Owner |
 | --- | --- | --- |
-| D | Policy still in ring0 | Finish the migration. The kernel keeps syscall entry and mechanism; Linux and Windows semantics move to personality servers |
-| E | Service runtime | One `svc-runtime`: server loop, typed dispatch, deadlines, per-session heaps; one syscall layer; retire the `std`/`no_std` split for services |
-| F | IPC wire format | An IDL with generated bindings and written compatibility rules, replacing hand-written structs |
-| G | Security model | A sandbox derived from the manifest and enforced by job policy, replacing uid/gid plus `logical_admin` |
-| H | Operability | Structured logs, crash dumps, health and watchdog, A/B update with rollback. These are commercial requirements, and none was found in this survey |
+| Process directory | Default admission 32, non-moving chunked slots up to internal ceiling 4,096; no longer a 32-slot static array | [process table](../../kernel/ps/src/multitask/process_table.rs), [slot directory](../../kernel/ps/src/multitask/slot_dir.rs) |
+| Thread limits | Job-level counted quota; per-process structural maximum 32 | [process table](../../kernel/ps/src/multitask/process_table.rs) |
+| Job and resident memory | Generation-bound Job tree, hierarchical counted limits and resident-page charge implemented; kernel-memory and high/min policies open | [Job model](job-model.md#phase-2b-ii-memory-limit-as-built) |
+| Application isolation | Loader application-job placement implemented; opt-in limit evidence is not general stability acceptance | [Job model](job-model.md#application-placement-step-0a-as-built-limit-proof-still-open) |
+| JobPolicy | 256-bit v1 ceiling and GET/SET operations exist, but service-capability cutover is incomplete | [job policy ABI](../../libs/rustos-user-abi/src/syscall/job_policy.rs) |
+| Service discovery | Fixed numeric IDs, legacy capability bits, fixed registration/manifest contracts | [service ABI](../../libs/rustos-user-abi/src/syscall.rs), [rootd manifest](../../services/rootd/src/service_manifest.rs) |
+| Supervision | `rootd`, `initd`, `runtimed` and `sessiond` retain distinct lifecycle responsibilities | [Services](services.md) |
+| IPC wire/runtime | Hand-authored, versioned wire structures and heterogeneous service runtimes; unified IDL and component manager are proposals | [ABI contract](../ai/contracts-abi.md) |
+
+The **historical** audit found 32 static process slots and no per-job quotas.
+Do not repeat those findings as current implementation facts. The original
+`uiserver`/`runtimed` estimate was not an exhaustive source audit.
+
+### 3. Remaining redesign work
+
+| Area | Implemented foundation | Remaining target |
+| --- | --- | --- |
+| A. Process/service identity | Chunked process slots; generational process and Job identities | Routed named capabilities instead of numeric service identities |
+| B. Lifecycle/supervision | Individual service restart and lease contracts | Declarative component tree and one coherent supervision owner |
+| C. Resource accounting | Counted process/thread and resident user-page limits | Kernel-memory, high/min, client-funded session budgets |
+| D. Personality policy | Existing user-service brokers | Remove remaining ring0 personality exceptions without weakening mechanisms |
+| E–F. Runtime/IDL | Existing `rustos-svc-runtime` and versioned `repr(C)` ABI | Shared service runtime, generated bindings and compatibility rules |
+| G. Security model | Typed Job handles and JobPolicy v1 ceiling | Full manifest-derived sandbox and legacy-capability cutover |
+| H. Operability | Existing logging, probes and fault models | Crash/health, update/rollback and sustained recovery evidence |
+
+These are **targets**, not claims that each row is absent or that
+historical audit counts still match the tree.
 
 ### 4. Target shape
 
@@ -101,7 +89,7 @@ topology, so a component cannot reach what no ancestor passed down)**.
 
 ### 5. Invariants
 
-Fixed now, so that no phase has to be reopened.
+**Proposed end-state invariants** (not a list of already-shipped properties):
 
 1. **Identity** is `(job, generation, moniker)`. The kernel stores the first two;
    `rootd` stores the moniker.
@@ -117,31 +105,29 @@ Fixed now, so that no phase has to be reopened.
    run time. seL4 Microkit does the same: its monitor only iterates a system
    description compiled in advance **(verified from the Microkit material)**.
 
-### 6. Order
+### 6. Migration order and snapshot status
 
-Ordered so that each step's output is the final form of what it touches. Phase
-numbers match [Job Model §12](job-model.md#12-migration).
-
-| Step | Work | Area |
+| Step | Target | 2026-10-31 status |
 | --- | --- | --- |
-| 1 | Job object and root job, process↔job binding, kill by job | A, C |
-| 2 | Process-table directory; charging; `memory.max`, `processes.max`, `threads.max` | A, C |
-| 3 | Job policy replaces the `IPC_SERVICE_CAP_*` bits | A, G |
-| 4 | IDL and the unified `svc-runtime`, service by service | E, F |
-| 5 | Component manager: manifests, realms, capability routing, supervision trees | B |
-| 6 | Session jobs funded by clients | C |
-| 7 | Personality servers; shrink the 42 kernel exception blocks | D |
-| 8 | Operability: logs, dumps, health, update | H |
+| 1 | Root Job, membership and group kill | Implemented |
+| 2 | Chunked process directory; job process/thread and resident memory quotas | Partly implemented: 2a/2b landed; `kmem.max_bytes`, `memory.high/min` open |
+| 3 | Replace legacy service authority with Job policy | JobPolicy 3a exists; cutover unproven |
+| 4 | Generated IDL and unified service runtime | Planned |
+| 5 | Declarative components, realms, capability routing and one supervisor | Planned |
+| 6 | Client-funded session quotas | Planned |
+| 7 | Linux/Windows personality servers and ring0 policy reduction | Planned |
+| 8 | Operational logs, crash reporting, health and rollback | Planned |
 
-Steps 4 and 5 can run in parallel with 2 and 3 once step 1 has fixed the job
-interface; nothing before step 1 should start, because every other step names a
-job.
+Steps 4 and 5 can be planned independently after the Job foundation, but each
+authority/lifecycle transition still needs source and KVM evidence before old
+routes are deleted. See the separate [TLB design](tlb-shootdown-design.md):
+its redesign is outside this service-model roadmap.
 
 ### 7. What the OOM work already built is reused
 
 | Existing | Becomes |
 | --- | --- |
-| Per-process resident count from the frame-descriptor ledger | Per-job hierarchical usage |
+| Per-process resident count from the frame-descriptor ledger | Per-job hierarchical resident usage (implemented for user data pages) |
 | `rootd` memory governor | The root job's memory governor, selecting jobs |
 | Ring0 watchdog | Kills the job of the refused process unless critical or covered by `memory.min` |
 | `SYS_RUSTOS_ROOTD_MEMORY_BROKER` census | Job census in the job ABI |
@@ -166,27 +152,18 @@ job.
 
 ## 한국어 요약
 
-**상태: 결정 기록과 로드맵입니다. 1단계(job 객체, 루트 job, job 단위 kill)만
-구현되었고 2~8단계는 아직입니다.**
+**상태(2026-10-31 소스 기준):** Job 생성·수명주기(1단계), 프로세스
+디렉터리 청크화(2a), 프로세스·스레드 한도 및 상주 사용자 페이지 과금(2b),
+애플리케이션 Job 배치가 구현되었습니다. JobPolicy v1의 256비트
+한도도 구현되었지만 기존 서비스 권한 비트 대체는 끝나지 않았습니다.
 
-- **판정**: 정책을 이름 있는 서비스로 나눈 구조는 유지합니다. 그 아래 프로세스·서비스
-  모델이 서비스 약 15개짜리 고정 시스템에 맞춰져 있어, 서드파티 서비스나 다수
-  앱, 사용자별 격리, 자원 회계가 들어오면 다시 써야 합니다.
-- **전면 재설계 3건**: (A) 프로세스·서비스 신원과 이름공간 → Job 트리와 capability
-  라우팅, (B) 수명주기·감독 → 선언형 컴포넌트 매니페스트와 단일 감독 트리,
-  (C) 자원 회계 → job 트리의 계층형 예산과 클라이언트가 내는 세션 쿼터.
-- **부분 재설계 5건**: (D) ring0에 남은 정책 42블록, (E) 서비스 런타임 통일,
-  (F) IPC wire 형식의 IDL화, (G) 매니페스트 기반 보안 모델, (H) 운영성(로그, 덤프,
-  헬스, 롤백 가능한 업데이트).
-- **구조**: 커널은 job 트리(자원·권한·그룹 수명)만 알고, `rootd`가 컴포넌트
-  트리(이름·라우팅·감독)를 갖는 컴포넌트 매니저가 됩니다. realm은 job에
-  대응하지만 커널은 컴포넌트를 모릅니다.
-- **불변식**: 신원은 `(job, generation, moniker)`, ABI에 보이는 `const` 개수 없음,
-  서비스 이름은 라우팅된 capability, wire 형식은 IDL 생성, 감독자는 하나, core는
-  빌드 시 서명·앱은 런타임.
-- **순서**: Job 객체 → 테이블 디렉터리·충전·한도 → 정책이 권한 비트 대체 → IDL과
-  `svc-runtime` → 컴포넌트 매니저 → 세션 쿼터 → personality 서버 → 운영성.
-  1단계(Job 객체)가 인터페이스를 확정하기 전에는 다른 작업을 시작하지 않습니다.
-- **재사용**: 이번에 만든 OOM 작업(census, 거버너, watchdog)은 버려지지 않고 job
-  단위로 확장됩니다.
-- **미검증**: `uiserver`/`runtimed` 내부와 공수 추정은 평가하지 않았습니다.
+다음 구조적 작업은 `kmem.max_bytes`, `memory.high/min`, 서비스
+capability 라우팅, 단일 컴포넌트 감독, 공통 런타임/IDL,
+클라이언트 부담 세션 쿼터, personality 서버와 운영성 확장입니다.
+과거 감사의 '프로세스 32개 고정 배열·Job 과금 없음'은 현재 사실이
+아닙니다. 기본 한도 32개와 내부 청크 디렉터리 상한 4,096개를
+구분해야 합니다.
+
+위 8단계 표는 **목표 아키텍처와 현재 상태를 분리**합니다.
+구체적 구현·검증은 [Job Model](job-model.md)의 as-built 섹션과
+실제 소스를 기준으로 판단하세요.

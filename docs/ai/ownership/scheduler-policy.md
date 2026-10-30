@@ -1,5 +1,13 @@
 # Scheduler policy, measurements and ordering
 
+> **Historical optimization and cutover record.** Sections 2.1–2.7 describe
+> successive implementations and their *then-current* measurements, including
+> a global `Scheduler` catalog that has since been deleted. Do not infer
+> present lock ownership, bottlenecks or remaining work from those paragraphs.
+> Current production authority is in [SMP scheduler](../smp/scheduler.md)
+> and [execution ownership](execution.md); closure/evidence boundaries are
+> in [structural ownership](../structural-ownership-design.md).
+
 [Contract index](../structural-ownership-design.md).
 
 ## 2. Per-CPU scheduler (`V5-SCHED-GLOBAL-001`, `V5-FORMAL-SCHED-019`)

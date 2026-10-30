@@ -19,7 +19,7 @@ Do not start at line 1 merely because the route names the file.
 
 | User task | Read first | Then only if unresolved |
 | --- | --- | --- |
-| Resume prior work / prepare session handoff | `session-handoff.md` dated snapshot | live goal + `git status --short`, then one owner contract |
+| Resume prior work / prepare session handoff | `session-handoff.md` repository snapshot, never local authority | live goal + `git status --short` + `git log -1`, then one owner contract |
 | Build/check issue | `.agents/skills/rustos-build/SKILL.md` or the failing diagnostic | search `commands.md` only if exact invocation remains unclear |
 | Development-speed/tooling change | relevant `token-policy.md` section + exact active hook/config | search `commands.md` only if a build invocation is part of the issue |
 | Run/KVM/debug issue | `.agents/skills/rustos-kvm/SKILL.md` | exact KVM owner; bounded `build/kvm/` evidence after symptom is known |

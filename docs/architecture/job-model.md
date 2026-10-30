@@ -6,53 +6,43 @@
 
 ## English
 
-**Status: phase 1 is implemented (see [Phase 1 as built](#phase-1-as-built));
-everything after it is design.** Before phase 1 the only precursor was the
-per-process ancestor: the memory census, the watermark, and
-the `rootd` / ring0-watchdog OOM policy described in
-[the address-space contract](../ai/address-space-lifecycle-contract.md#4-memory-pressure-watermark-and-oom-policy).
+**Status (2026-10-31 source snapshot):** Phase 1 jobs, phase 2a's chunked
+process directory, and phase 2b's process/thread limits and resident user-page
+charging are implemented. Application-job placement and a JobPolicy v1/256-bit
+ceiling implementation also exist; their opt-in runtime evidence does **not**
+complete policy migration or commercial stability acceptance. Kernel-memory
+charging (`kmem.max_bytes`), `memory.high/min`, client-funded sessions, and the
+later component/personality redesign remain open. Read the **as-built** sections
+below for implementation details; dated tests are not current acceptance.
+The original watermark/OOM baseline is in the
+[address-space contract](../ai/address-space-lifecycle-contract.md#4-memory-pressure-watermark-and-oom-policy).
 The parent decision record is [Ring3 Process Model](ring3-process-model.md).
 
 Every claim below is tagged **(verified)** when it was read from this tree,
 **(proposed)** when it is a design decision, or **(recalled)** when it comes from
 background knowledge of another system that was not re-read for this document.
 
-### 1. Why jobs
+### 1. Why jobs — current baseline
 
-The kernel's process and service limits are compile-time constants, baked into
-lock-free static arrays **(verified)**:
+The original fixed-process-table audit predates phases 2a/2b. Current limits
+and owners must not be confused with that historical design input:
 
-| Limit | Value | Where |
+| Resource | Current shape | Source |
 | --- | --- | --- |
-| processes, system-wide | 32 | `MAX_PROCESS_OBJECTS`, [process_table.rs:27](../../kernel/ps/src/multitask/process_table.rs) |
-| threads per process | 32 | `MAX_THREADS_PER_PROCESS`, same file, line 28 |
-| endpoints per process / per task | 32 / 8 | [ipc/mod.rs:89](../../kernel/ipc-runtime/src/ipc/mod.rs) |
-| registered service endpoints | 16 | `MAX_SERVICE_ENDPOINTS`, [ipc_ops.rs:80](../../kernel/compat/src/user/syscall/linux/ipc_ops.rs) |
-| descriptors per process | 65 535 | `MAX_DYNAMIC_FD`, [handles.rs:41](../../kernel/ps/src/user/handles.rs) |
-| scheduling domains | `MAX_SCHEDULING_DOMAINS` | [scheduling_runtime.rs:227](../../kernel/ps/src/multitask/scheduler/scheduling_runtime.rs) |
-| service identities | 1..15, integers | `IPC_SERVICE_*`, [syscall.rs:332](../../libs/rustos-user-abi/src/syscall.rs) |
-| service authority | one bit per service, 64 max | `IPC_SERVICE_CAP_*`, same file, line 351 |
+| Process slots | Default admission 32; chunked storage up to 4,096 slots (internal ceiling), with a runtime/root-job policy limit | [process_table.rs](../../kernel/ps/src/multitask/process_table.rs), [slot_dir.rs](../../kernel/ps/src/multitask/slot_dir.rs) |
+| Threads | Job-level counted limit; per-process structural ceiling still 32 | [process_table.rs](../../kernel/ps/src/multitask/process_table.rs) |
+| Jobs | Generation-bound tree, 64 internal slots | [jobs.rs](../../kernel/ps/src/multitask/process_table/jobs.rs) |
+| Resident user memory | Per-job hierarchical page charging and admission | [Phase 2b-ii](#phase-2b-ii-memory-limit-as-built) |
+| Service identity | Static numeric IDs and legacy capability bits remain | [Ring3 process model](ring3-process-model.md) |
 
-`MAX_PROCESS_OBJECTS` alone sizes at least eight static arrays: `PROCESS_IDENTITY`,
-`PROCESS_ID`, `PROCESS_STATE_PTR` ([identity.rs:131](../../kernel/ps/src/multitask/process_table/identity.rs)),
-`PINS` ([pin_owner.rs:105](../../kernel/ps/src/multitask/process_table/pin_owner.rs)),
-`CELLS` ([process_placement.rs:176](../../kernel/ps/src/multitask/process_placement.rs)),
-`REWRITE_EPOCHS` ([rewrite_epoch.rs:10](../../kernel/ps/src/multitask/pager_vma/rewrite_epoch.rs)),
-`PAGER_VMA_WRITERS`, and `PAGER_VMAS` (`MAX_PROCESS_OBJECTS * MAX_PAGER_VMAS_PER_PROCESS`,
-[pager_vma.rs:450](../../kernel/ps/src/multitask/pager_vma.rs)).
+Job lifetime and accounting protect privileged service resources from
+application workloads. The remaining work is kernel-memory charging,
+`memory.high/min`, capability cutover, and client-funded service usage.
+Proposed sections below are target designs, not implementation claims.
 
-Nothing aggregates resources across processes: there is no per-service memory,
-handle, endpoint or process quota, and the security context is a Unix
-uid/gid plus a `logical_admin` flag **(verified)**. A service that leaks, or a
-client that floods a shared server, is bounded only by the machine.
+### 2. Target invariants
 
-A **job** is the single object that carries these limits, the authority that
-goes with them, and the group lifetime. It replaces the constants above with
-policy values, and it is what the OOM policy should select and kill.
-
-### 2. Invariants
-
-These are fixed up front so later phases build on the final shape.
+These constraints guide the remaining migration; they are not all shipped yet.
 
 1. **One job per process, for life.** A process is created into a job and never
    moves. Exec and fork keep it. This makes every charge attributable to exactly
@@ -239,28 +229,16 @@ that reads kernel pressure signals because the older vmpressure signal produced
 false wakeups **(verified from the lmkd documentation)**, which is the same split
 as `rootd` policy over ring0 measurement here.
 
-### 10. Prerequisite: the process table must scale
+### 10. Process-table scalability — phase 2a implemented
 
-Lifting `MAX_PROCESS_OBJECTS` is the largest piece of work and is not specific
-to jobs. The arrays in section 1 are static because the fault path reads them
-lock-free with interrupts off.
+The former `MAX_PROCESS_OBJECTS`-sized arrays are now chunked, non-moving
+directories; see [Phase 2a as built](#phase-2a-as-built). The admitted limit
+defaults to 32, but the storage ceiling is 4,096. Per-process VMA capacity
+remains bounded, with its tables and writer locks in chunked directories.
 
-Design **(proposed)**:
-
-- Replace each fixed array with a **two-level directory**: a fixed array of
-  `AtomicPtr<Chunk>`, each chunk a block of cells, published with a release CAS
-  and never freed while any generation in it is live. Lookup stays two dependent
-  loads with no lock; chunk allocation happens in normal context at process
-  creation, charged to the creating job's `kmem`.
-- `PAGER_VMAS` stops being `MAX_PROCESS_OBJECTS × MAX_PAGER_VMAS_PER_PROCESS`
-  statically. Each process owns a heap table published through its cell with the
-  process generation, charged to its job.
-- The directory's size is set by the root job's `processes.max`, read at boot.
-
-Cost, stated plainly: these structures are covered by existing formal models and
-concurrency witnesses (for example `process-address-space-lifetime`), so each
-change needs the model and the Loom/Shuttle witnesses extended in the same
-change. That verification is most of the effort.
+Do not treat the earlier two-level directory proposal as unimplemented.
+Remaining work concerns accounting, capacity qualification and resource policy,
+not another process-table rewrite.
 
 ### 11. ABI
 
@@ -289,8 +267,8 @@ Each phase ends in the final shape of what it touches.
 | --- | --- | --- |
 | 1 | `Job`, the root job, process↔job binding, `GET_INFO`, `KILL`. No limits. All existing processes live in the root job. | census and kill work by job; existing KVM gates unchanged |
 | 2a | Process-table directory (section 10) | 32 is a root-job policy value; the pager VMA and identity models re-verified |
-| 2b | Charging, `memory.max`, `processes.max`, `threads.max`, `kmem.max_bytes` | a job over its limit refuses, others unaffected, on the existing `oomhog` proof |
-| 3 | Policy replaces `IPC_SERVICE_CAP_*` | both checks agree for one release, then the bits are deleted |
+| 2b | Counted `processes.max`/`threads.max` and resident `memory.pages` implemented; `kmem.max_bytes` and `memory.high/min` open | verify native and opt-in runtime refusal, not only the ABI |
+| 3 | JobPolicy v1 ceiling exists (3a); legacy `IPC_SERVICE_CAP_*` authorization remains | prove exact revoke/fork/cutover behavior before deleting bits |
 | 4 | `rootd` becomes the component manager: manifests, realm ↔ job, capability routing, supervision trees | `service_manifest.rs`'s static arrays are gone |
 | 5 | Session jobs funded by clients (see below) | a flooding client exhausts only its own quota on `vfsd`/`netd` |
 
@@ -302,6 +280,12 @@ session job that lives under the client's subtree. Linux has a comparable remote
 charge for kernel allocations *(recalled)*. This is why invariant 1 is "one job
 per process" and not "one job per allocation": the owner stays simple and the
 exception is an explicit, scoped charge target.
+
+> **Chronological evidence below:** Each "as built" section describes a
+> particular implementation slice, including then-current ABI versions,
+> acceptance gaps and logs. Later sections supersede earlier limits and wire
+> versions; read the source and newest evidence before calling a historical
+> phase description the current implementation.
 
 ### Phase 1 as built
 
@@ -894,7 +878,8 @@ exact live endpoint-owner, fork noninheritance and revocation authority.
 - Whether the Linux personality must present a cgroup-like filesystem; Linux
   applications and container tools expect one.
 - How page cache and swap are charged once `page_cache.rs` is live.
-- The exact policy bitmap width and which operations get their own bit.
+- JobPolicy has a 256-bit bitmap; assignment of operation authority and the
+  legacy service-capability cutover remain open.
 - Zircon's concrete policy kinds and inheritance rules were **not** read for
   this document (the fetched page described only the job syscalls); read them
   before fixing the policy model.
@@ -911,53 +896,18 @@ exact live endpoint-owner, fork noninheritance and revocation authority.
 
 ## 한국어 요약
 
-**상태: 1단계는 구현되었고 그 이후는 설계입니다.** 구현된 것: 루트 job,
-`CREATE_CHILD`/`GET_INFO`/`KILL`/`PROCESS_JOB`(`SYS_RUSTOS_JOB`), 세대 번호가 붙은
-`JobId`, 부모 job 상속, `Killing` job의 신규 멤버·자식 거부, census의 job 필드,
-`rootd`의 부팅 시 자체 점검. 이번 세션에서 만든 OOM 작업(프로세스별 census,
-워터마크, `rootd` 거버너, ring0 watchdog)이 이 설계의 프로세스 단위 선행 형태입니다.
-후속 변경에서 ABI v2의 typed Job 핸들 권한 검사·축소 복제·범위 내 PID 검사와,
-명시적인 커널 부팅 경로를 통한 rootd fd 3 전달을 구현했습니다. 1-vCPU 부팅에서
-자체 점검과 `ipcbench: end`는 확인했지만 UI watchdog/첫 프레임 누락으로 전체
-smoke는 실패했습니다. 이후 수정한 겹치는 fd 예약 결함은 native red/green 검증을
-통과했고, 수정 후보에서도 Job 자체 점검은 통과했지만 전체 20초 UI readiness는
-확인하지 못했습니다. 이후 전체 PR 봉인과 단일 16-vCPU smoke는 통과했습니다.
-이는 기능 검증이며, UP 실패 원인이나 실패율 비교 결과는 아닙니다.
-예약/kill/publication 및 reap/슬롯 재사용의 제한된
-Loom/Shuttle 프로토콜 witness도 추가했습니다(실제 teardown 실행 증명은 아님).
-spawn ABI의 job 배치는 이후 완료되었고, `rootd` 거버너는 이제 보호 대상 pid가 하위
-트리에 하나도 없는 가장 큰 job을 통째로 종료합니다(`JOB_OP_OPEN_SUBTREE` +
-`PROCESS_JOB`으로 커널이 판정, 없으면 기존처럼 가장 큰 단일 프로세스). ring0
-watchdog은 아직 단일 프로세스 단위이고, 응용 job이 아직 없어 job 경로는 실제 OOM
-상황에서 실행되지 않았습니다(단위 테스트·소스 가드·mutant로만 검증).
+**상태(2026-10-31 소스 기준):** Job 생성·수명주기(1단계), 청크형 프로세스
+디렉터리(2a), 계층형 프로세스·스레드 한도 및 상주 사용자 페이지 과금(2b)이
+구현되었습니다. 기본 프로세스 한도 32개는 고정 테이블 크기가 아니며,
+디렉터리 내부 상한은 4,096개입니다. 프로세스당 스레드 상한 32개와
+Job 슬롯 64개는 별도의 내부 제한입니다.
 
-**2a 구현됨(2026-10-29)**: 프로세스 테이블과 그 크기에 묶인 락 없는 배열 6종이
-32칸 청크 디렉터리가 되었고(청크는 해제·이동하지 않음), `grow_slots`는 보조 배열을
-먼저 게시한 뒤 테이블 청크를 설치합니다. reaper는 32개씩 배치로 처리하고, 콘솔
-open-description 레지스트리(256칸 고정, 가득 차면 panic)도 같은 방식으로 늘어납니다.
-한도(`process_limit`, 기본 32)는 아직 root job 정책이 아니라 런타임 변수이며 2b의
-`SET_LIMITS`가 연결합니다. 스레드 상한 32, job slab 64 등 다른 상수는 그대로입니다.
-32개를 넘는 프로세스로 부팅한 적은 없습니다.
+애플리케이션을 별도 Job에 배치하는 경로와 256비트 JobPolicy v1도
+존재하지만, opt-in 검증을 전체 안정성이나 레거시 서비스 권한 비트의
+대체 완료로 간주하지 않습니다. `kmem.max_bytes`, `memory.high/min`,
+클라이언트 부담 세션 쿼터, 컴포넌트 매니저 통합은 후속 작업입니다.
 
-- **문제**: 프로세스 32개, 스레드 32개, 서비스 endpoint 16개, 서비스 ID 정수,
-  서비스당 권한 비트 하나(최대 64)가 컴파일 타임 상수이며, 프로세스 상한 하나가
-  정적 lock-free 배열 8개의 크기를 정합니다. 서비스·클라이언트 단위 메모리/핸들
-  쿼터는 없습니다.
-- **해법**: Job 트리. 프로세스는 평생 정확히 하나의 job에 속하고, 한도(메모리,
-  프로세스, 스레드, 핸들, 커널 메모리)와 정책(허용 연산 비트맵)은 위에서 아래로
-  좁아지기만 하며, 권한은 `HandleRights::Job` 핸들로 하위 트리에만 전달됩니다.
-- **핵심 불변식**: 한 프로세스 = 한 job, 한도는 상수가 아니라 정책, 커널은 job만
-  알고 컴포넌트는 모름, fault 경로에서는 lock-free 충전, 그룹 kill은 재개 가능한
-  단계.
-- **충전 방식**: CPU별 stock(배치 64페이지)으로 캐시 라인 경합을 피하고, 한도
-  근처에서는 정밀 모드로 전환합니다. 한도는 멀리 있을 때 최대 `배치 × CPU 수`만큼
-  흐릿합니다.
-- **OOM**: 거버너는 프로세스 대신 job을 고르고, `KILL`은 하위 트리를 함께
-  종료하며, watchdog의 서비스 endpoint 휴리스틱은 `critical`/`memory.min`으로
-  대체됩니다.
-- **선행 과제**: 프로세스 테이블을 2단계 디렉터리로 바꾸는 일이 가장 크고,
-  관련 formal 모델과 Loom/Shuttle witness를 같은 변경에서 확장해야 합니다.
-- **이행**: 1단계 Job 객체(한도 없음) → 2a 테이블 디렉터리 → 2b 충전과 한도 →
-  3 정책이 `IPC_SERVICE_CAP_*` 대체 → 4 컴포넌트 매니저 → 5 세션 쿼터.
-- **미확인**: Zircon 정책 종류와 상속 규칙 원문은 읽지 못했고, Linux 메모리
-  컨트롤러의 배치 충전과 원격 충전은 기억에 근거합니다.
+상세한 소스 연결과 날짜별 검증 증거는 위 **Phase 1 / 2a / 2b /
+Application placement / Job qualitative ceilings as built** 항목을
+참고하세요. 과거 설계 제안과 실패 기록은 현재 구현을 설명하는
+근거로 재사용하지 마세요.

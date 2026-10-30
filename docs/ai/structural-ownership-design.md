@@ -1,11 +1,10 @@
 # RustOS Structural Ownership Design
 
 **Status:** normative design for the audit items that remain structurally open
-after `RustOS_Ring0_Ring3_Structural_Audit_v5.md`. It fixes the target
-structure, the linearization point of every ownership transfer, the memory
-ordering that publishes it, and the mutant each formal model must kill. It is
-not evidence that any of it is implemented; per-item status lives in section 1
-and is re-derived from source, never inherited.
+after `RustOS_Ring0_Ring3_Structural_Audit_v5.md`. It records target ownership, publication order and the relevant mutation
+witnesses. Parts of this record predate the deleted global scheduler catalog:
+**design text and old measurements are not a current open-work inventory**.
+The current source, its owning contract and runtime acceptance decide closure.
 
 Detailed wire rules stay in `contracts-abi.md`, proof infrastructure in
 `contracts-infra.md`, and the SMP envelope in `smp-contract.md`. This document
@@ -19,9 +18,9 @@ to be misclassified from name-based searching, and a third — `V5-VFSD-HOL-007`
 recorded as closed — is contradicted by runtime: the executable snapshot times
 out at 2005 ms under 8 vCPU and fails `storaged` spawn repeatedly.
 
-So section 1 re-derives status from source, and section 1 itself then had to be
-corrected once for the same name-based error. Everything after it is design for
-what that check found still open.
+Section 1 corrected the earlier name-based audit. Later sections deliberately
+retain measurements, proposals and implemented cutovers together as engineering
+history; they are not all missing from today's tree.
 
 A claim of closure here requires the construct to exist in source **and** a
 mutant that fails without it. Source inspection alone is what produced the
@@ -29,7 +28,8 @@ matrix this document had to correct twice.
 
 ## 1. Verified status, re-derived from source
 
-Checked against the working tree, not against the audit's matrix.
+Historical source recheck associated with the original audit; confirm each
+item against the current tree before treating it as an open release gate.
 
 ### Closed, with the source construct that closes it
 

@@ -17,8 +17,8 @@ everything else into userspace services. A built-in Wayland compositor in
 This book is split by audience:
 
 - **Start:** build, run, debug, and follow the OS execution flow.
-- **Architecture:** how the microkernel and services fit together, the
-  Wayland UI server, the compat path, and repo structure/logging rules.
+- **Architecture:** current service boundaries plus separately labeled
+  implementation snapshots and *proposed* Ring3/Job/TLB redesigns.
 - **OS Developer APIs:** kernel crate APIs, `cargo xtask`, the
   `RUSTOS.package.toml` manifest, and runtime control.
 - **Guides:** end-to-end recipes for adding services, apps, and drivers.
@@ -40,6 +40,7 @@ Recommended reading order:
 10. [Package Manifest API](api/package-manifest.md)
 11. [Logging Guide](logging.md)
 12. [Fault Injection](fault-injection.md)
+13. [Ring3/Job migration status](architecture/ring3-process-model.md)
 
 <a id="korean"></a>
 
@@ -55,8 +56,8 @@ IRQ/MMIO/DMA bridge, 그리고 소수의 gated broker — 만 남기고 나머�
 이 문서는 대상별로 나뉩니다.
 
 - **Start:** build, run, debug, 그리고 OS 실행 흐름.
-- **Architecture:** microkernel과 service들이 어떻게 맞물리는지, Wayland
-  UI server, 호환 경로, repo 구조와 logging 규칙.
+- **Architecture:** 현재 서비스 경계와 Ring3/Job/TLB의 구현 현황·미구현
+  설계를 구분한 자료.
 - **OS Developer APIs:** kernel crate API, `cargo xtask`,
   `RUSTOS.package.toml` manifest, runtime control.
 - **Guides:** service / app / driver를 추가하는 끝-끝 절차.
@@ -78,3 +79,4 @@ IRQ/MMIO/DMA bridge, 그리고 소수의 gated broker — 만 남기고 나머�
 10. [Package Manifest API](api/package-manifest.md)
 11. [로깅 가이드](logging.md)
 12. [Fault Injection](fault-injection.md)
+13. [Ring3/Job 이행 현황](architecture/ring3-process-model.md)
