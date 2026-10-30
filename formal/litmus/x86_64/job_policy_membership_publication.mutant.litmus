@@ -1,0 +1,11 @@
+X86_64 JobPolicyMembershipPublicationMutant
+"replacing the job before revoking its process generation permits an alias"
+{
+uint64_t incarnation=1; uint64_t job=11;
+uint64_t 1:rax; uint64_t 1:rbx; uint64_t 1:rcx;
+}
+P0                         | P1                         ;
+movq $22,(job)            | movq (incarnation),%rax    ;
+movq $0,(incarnation)      | movq (job),%rbx            ;
+movq $2,(incarnation)      | movq (incarnation),%rcx    ;
+exists (1:rax=1 /\ 1:rbx=22 /\ 1:rcx=1)

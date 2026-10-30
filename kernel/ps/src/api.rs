@@ -34,7 +34,7 @@ pub use crate::multitask::{
     complete_retired_task_cleanup, consume_pager_fault_reply, current_linux_thread_state,
     current_pager_charge_snapshot, current_pager_fault_install_permit, current_pager_vma_snapshot,
     current_task_id_with_signal_hint, current_thread_may_have_pending_signals, current_user_address_space,
-    current_user_ipc_entry, current_user_ipc_identity,
+    current_user_ipc_entry, current_user_ipc_identity, current_user_job_policy_allows,
     current_user_process_identity, current_user_process_thread_count, current_user_stack_state,
     current_user_thread_id, current_user_wait_binding, demote_current_user_task_to_user_class,
     drain_scheduler_runtime_profile, endpoint_receiver_still_waiting, exec_current_user_process,
@@ -49,7 +49,7 @@ pub use crate::multitask::{
     publish_pager_vma_for_process, queue_linux_process_sigchld, queue_linux_signal,
     register_pager_fault_waiter, release_ipc_priority, release_pager_fault_priority,
     reserve_ipc_call_donation, reserve_ipc_priority, reserve_pager_fault_with_dispatch_grant,
-    reserve_process_spawn, revoke_current_pager_vma, revoke_pager_vma_for_process,
+    reserve_process_spawn, reserve_process_spawn_in, revoke_current_pager_vma, revoke_pager_vma_for_process,
     set_current_linux_tls_fs_base, set_linux_task_affinity, set_next_latency_pick_hint,
     set_next_pick_hint, set_next_process_pick_hint, set_next_spawn_pick_hint,
     set_pager_vma_commit_state_for_process, set_windows_current_thread_affinity,
@@ -128,7 +128,10 @@ pub use crate::multitask::{
 pub use crate::multitask::{register_child_waiter, unregister_child_waiter, wake_child_waiters};
 pub use crate::multitask::{MemoryCensusEntry, memory_census};
 pub use crate::multitask::{
-    job_collect_members, job_create_child, job_info, job_kill_begin, job_subtree_contains_process,
+    job_admits_process, job_collect_members, job_create_child, job_info, job_is_within,
+    job_kill_begin, job_set_limits, JobLimits, LimitMask, LIMIT_UNSET,
+    job_policy_allows, job_policy_info, job_set_policy, JobPolicy, JobPolicyInfo,
+    job_subtree_contains_process,
     process_job, JobError, JobId, JobInfo, JobState, ROOT_JOB,
 };
 

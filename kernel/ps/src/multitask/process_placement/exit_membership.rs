@@ -104,7 +104,7 @@ pub(in crate::multitask) fn queued_for(handle: ProcessHandle) -> Option<Receipt>
 }
 
 pub(in crate::multitask) fn target_by_pid(pid: u64) -> Option<(ProcessHandle, Member)> {
-    for cell in &CELLS {
+    for cell in CELLS.iter() {
         if let Some(target) = cell.with(|s| {
             let h = s.handle?;
             let (&m, _) = s
@@ -121,7 +121,7 @@ pub(in crate::multitask) fn target_by_pid(pid: u64) -> Option<(ProcessHandle, Me
 }
 
 pub(in crate::multitask) fn claim_next() -> Option<(ExitMembership, Reason)> {
-    for cell in &CELLS {
+    for cell in CELLS.iter() {
         let candidate = cell.with(|s| {
             let r = s.exit?;
             if !r.claim_ready(s) {

@@ -62,6 +62,25 @@ fn netd_invalid_cleanup_cannot_be_hidden_by_an_operation_error() {
 }
 
 #[test]
+fn direct_bootstrap_requires_typed_job_authority_before_loading_and_keeps_the_generation() {
+    // Source wiring witness, not production user-copy or boot fault injection.
+    let source = include_str!("bootstrap_spawn.rs");
+    let shape = source.find("bootstrap_spawn_shape_valid(&args)").unwrap();
+    let authority = source.find("resolve_spawn_job_descriptor(requester_pid, args.job_handle)").unwrap();
+    let scheduling = source.find("consume_direct_bootstrap_scheduling_context(").unwrap();
+    let spawn = source.find("match spawn_bootstrap_exec_direct(").unwrap();
+    assert!(shape < authority && authority < scheduling && scheduling < spawn);
+    assert!(source.contains(".with_job(job)"));
+    let console = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/user/console_host.rs"));
+    let call = console.split_once("let spawned = process::spawn_bootstrap_linux_process_with_launch_and_scheduling_context(").unwrap().1;
+    assert!(call.split_once(");").unwrap().0.contains("program.job"));
+    let process = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/user/process/mod.rs"));
+    let construct = process.split_once("pub fn spawn_bootstrap_linux_process_with_launch_and_scheduling_context(").unwrap().1;
+    assert!(construct.find("reserve_process_spawn_transaction_in(job)?").unwrap()
+        < construct.find("prepare_bootstrap_linux_process_with_launch(image, launch)?").unwrap());
+}
+
+#[test]
 fn direct_bootstrap_consumes_exact_rootd_scheduling_authority_before_spawn() {
     let source = include_str!("bootstrap_spawn.rs");
     let direct = source

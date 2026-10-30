@@ -743,4 +743,6 @@ include!("kvm/guest.rs");
 include!("kvm/evidence.rs");
 include!("kvm/user_debug_records.rs");
 include!("kvm/oom_hog.rs");
+include!("kvm/application_limit.rs");
+include!("kvm/job_policy.rs");
 include!("kvm/tests.rs");

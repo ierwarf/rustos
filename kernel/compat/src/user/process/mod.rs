@@ -180,8 +180,13 @@ pub struct PreparedSpawnImage {
     transaction: ProcessSpawnTransaction,
 }
 
-pub fn reserve_process_spawn_transaction() -> Result<ProcessSpawnTransaction, ProcessLoadError> {
-    let reservation = multitask::reserve_process_spawn().ok_or(ProcessLoadError::Spawn(
+/// Hold exact spawn rollback custody in the chosen generational job. Admission
+/// and publication both reject a killed or recycled job; no membership migration
+/// is possible after birth.
+pub fn reserve_process_spawn_transaction_in(
+    job: Option<multitask::JobId>,
+) -> Result<ProcessSpawnTransaction, ProcessLoadError> {
+    let reservation = multitask::reserve_process_spawn_in(job).ok_or(ProcessLoadError::Spawn(
         multitask::SpawnTaskError::NoFreeTaskSlot,
     ))?;
     Ok(ProcessSpawnTransaction {
@@ -283,6 +288,7 @@ pub struct ProcessLaunchOptions<'a> {
     pub linux: LinuxProcessLaunch<'a>,
     pub(crate) console_session: ConsoleSessionHandle,
     pub logical_admin: bool,
+    pub(crate) root_job_authority: bool,
 }
 
 // RING3-MIGRATION-REFERENCE START: loaderd/procd should own bootstrap Linux
@@ -293,8 +299,9 @@ pub fn spawn_bootstrap_linux_process_with_launch_and_scheduling_context(
     weight_micros: u64,
     launch: ProcessLaunchOptions<'_>,
     policy: rustos_user_abi::syscall::RustosSchedulingContextPolicy,
+    job: Option<multitask::JobId>,
 ) -> Result<SpawnedProcess, ProcessLoadError> {
-    let transaction = reserve_process_spawn_transaction()?;
+    let transaction = reserve_process_spawn_transaction_in(job)?;
     let prepared = prepare_bootstrap_linux_process_with_launch(image, launch)?;
     spawn_prepared_process_with_scheduling_context(
         bind_prepared_spawn(prepared, transaction),
@@ -549,6 +556,7 @@ fn build_process_bootstrap(
     }
     bootstrap.console_session = launch.console_session;
     bootstrap.logical_admin = launch.logical_admin;
+    bootstrap.root_job_authority = launch.root_job_authority;
     bootstrap.set_exec_path(launch.linux.exec_path);
     #[cfg(rustos_lifecycle_trace)]
     nucleus_core::debug::println_serialized(format_args!(
@@ -623,6 +631,21 @@ fn align_up(value: u64, align: u64) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn root_job_authority_has_one_explicit_kernel_boot_route() {
+        // Source witness: native hosts cannot construct the real initial image.
+        let process = include_str!("mod.rs").split("#[cfg(test)]").next().unwrap();
+        assert!(process.contains("bootstrap.root_job_authority = launch.root_job_authority;"));
+        let host = include_str!("../console_host.rs");
+        assert!(host.contains("root_job_authority: false,"));
+        assert!(host.contains("root_job_authority: program.root_job_authority,"));
+        let brokers = include_str!("../syscall/linux/proc_broker_ops.rs");
+        assert_eq!(brokers.matches("root_job_authority: false,").count(), 2);
+        let executive = include_str!("../../../../executive/src/boot.rs");
+        let executive = executive.split("#[cfg(test)]").next().unwrap();
+        assert_eq!(executive.matches(".with_root_job_authority()").count(), 1);
+    }
 
     #[test]
     fn release_stack_maps_every_usable_page_above_one_guard() {

@@ -1,6 +1,10 @@
 mod activation_batch;
 mod affinity;
+mod bootstrap_spawn;
+mod loader_job_realm;
+mod job_policy;
 mod ipc_reply_recv;
+mod ipc_handle_receive;
 mod ipc_registers;
 mod ipc_fast_buffer;
 mod pager_fault;
@@ -9,7 +13,11 @@ pub mod smp_qualification;
 mod vfs_executable_snapshot;
 pub use activation_batch::*;
 pub use affinity::*;
+pub use bootstrap_spawn::*;
+pub use loader_job_realm::*;
+pub use job_policy::*;
 pub use ipc_reply_recv::*;
+pub use ipc_handle_receive::*;
 pub use ipc_registers::*;
 pub use ipc_fast_buffer::*;
 pub use pager_fault::*;
@@ -17,6 +25,7 @@ pub use scheduling_context::*;
 pub use smp_qualification::*;
 pub use vfs_executable_snapshot::*;
 pub const SYS_RUSTOS_DEBUG_PRINT: u64 = 0x5255_0001;
+/// Rootd-only pre-loader launch using `RustosBootstrapSpawnArgs` ABI v1.
 pub const SYS_RUSTOS_SPAWN_EXEC: u64 = 0x5255_0002;
 pub const SYS_RUSTOS_IPC_ENDPOINT_CREATE: u64 = 0x5255_0003;
 pub const SYS_RUSTOS_IPC_CALL: u64 = 0x5255_0004;
@@ -85,6 +94,8 @@ pub const SYS_RUSTOS_ROOTD_MEMORY_BROKER: u64 = 0x5255_0056;
 /// Job tree: create, inspect and kill groups of processes. Appended after the
 /// memory broker; 0x5255_0057 was the next unused number.
 pub const SYS_RUSTOS_JOB: u64 = 0x5255_0057;
+/// Versioned qualitative job ceilings; does not change the Job v4 limit wire.
+pub const SYS_RUSTOS_JOB_POLICY: u64 = 0x5255_005a;
 /// Capability-gated, event-driven wait for the DVM input transport. Only
 /// inputd may use this to wait for an MSI-X-published ingress batch; input
 /// policy and translation remain in the service.
@@ -866,6 +877,7 @@ pub const fn loader_service_role_allows_operation(op: u16, service_id: u64) -> b
             IPC_SERVICE_ROOTD | IPC_SERVICE_INITD | IPC_SERVICE_SESSIOND
         ),
         LOADER_OP_EXEC_TARGET => service_id == IPC_SERVICE_PROCD,
+        LOADER_OP_CONFIGURE_JOB_REALM => service_id == IPC_SERVICE_ROOTD,
         _ => false,
     }
 }
@@ -910,8 +922,11 @@ pub const fn procd_sigchld_is_suppressed(events: u32, action_flags: u64) -> bool
         && events & PROCD_SIGCHLD_EVENT_EXIT == 0
         && action_flags & PROCD_SIGACTION_SA_NOCLDSTOP != 0
 }
-pub const PROC_BROKER_ABI_VERSION: u16 = 4;
+pub const PROC_BROKER_ABI_VERSION: u16 = 5;
 pub const PROC_BROKER_PREPARE_FLAG_EXEC_TICKET: u32 = 1 << 0;
+/// `job_handle` is a loader-local Job descriptor with CREATE_PROCESS authority.
+/// Mutually exclusive with EXEC_TICKET: exec never changes process membership.
+pub const PROC_BROKER_PREPARE_FLAG_JOB_HANDLE: u32 = 1 << 1;
 /// Lifecycle fan-out is an independent contract. Do not couple its wire
 /// version to process prepare/commit ABI revisions.
 pub const LIFECYCLE_DRAIN_BROKER_ABI_VERSION: u16 = 1;
@@ -923,14 +938,41 @@ pub const ROOTD_MEMORY_BROKER_ABI_VERSION: u16 = 1;
 /// Fixed size of the census: the live processes with the largest resident sets.
 pub const ROOTD_MEMORY_CENSUS_MAX_ENTRIES: usize = 32;
 /// Job broker wire version, independent of every other broker.
-pub const JOB_ABI_VERSION: u16 = 1;
+pub const JOB_ABI_VERSION: u16 = 4;
 pub const JOB_OP_GET_INFO: u16 = 1;
 pub const JOB_OP_CREATE_CHILD: u16 = 2;
 pub const JOB_OP_KILL: u16 = 3;
 pub const JOB_OP_PROCESS_JOB: u16 = 4;
+pub const JOB_OP_DUPLICATE_HANDLE: u16 = 5;
+/// Mints a rights-attenuated handle to a job named by id, only if that job lies
+/// within the subtree of the authorizing handle. Input `job` is the target id;
+/// authority still flows only downward from a handle the caller already holds.
+pub const JOB_OP_OPEN_SUBTREE: u16 = 6;
+/// Sets counted limits (processes, threads) on the handle's job. Input
+/// `limit_mask` selects the dimensions; `JOB_LIMIT_UNSET` means inherit.
+pub const JOB_OP_SET_LIMITS: u16 = 7;
+pub const JOB_LIMIT_PROCESSES: u32 = 1 << 0;
+pub const JOB_LIMIT_THREADS: u32 = 1 << 1;
+/// Resident user data pages (4 KiB) of the job and its descendants.
+pub const JOB_LIMIT_MEMORY_PAGES: u32 = 1 << 2;
+/// No limit on a dimension: the job inherits its parent's.
+pub const JOB_LIMIT_UNSET: u64 = u64::MAX;
+pub const JOB_RIGHT_INSPECT: u32 = 1 << 0;
+pub const JOB_RIGHT_WAIT: u32 = 1 << 1;
+pub const JOB_RIGHT_CREATE_JOB: u32 = 1 << 2;
+pub const JOB_RIGHT_CREATE_PROCESS: u32 = 1 << 3;
+pub const JOB_RIGHT_SET_LIMITS: u32 = 1 << 4;
+pub const JOB_RIGHT_SET_POLICY: u32 = 1 << 5;
+pub const JOB_RIGHT_KILL: u32 = 1 << 6;
+pub const JOB_RIGHT_SET_CRITICAL: u32 = 1 << 7;
+pub const JOB_RIGHT_DUPLICATE: u32 = 1 << 8;
+pub const JOB_RIGHT_TRANSFER: u32 = 1 << 9;
 /// The root job's id. A job id is `(slot << 32) | generation`; only the root
-/// has a fixed value, and every other id comes from `JOB_OP_CREATE_CHILD`.
+/// has a fixed value; other ids are inspection/census output, not authority.
 pub const JOB_ID_ROOT: u64 = 1;
+/// Initial root authority in rootd only; not inherited by ordinary new images.
+/// This is a bootstrap descriptor convention, not a process/job capacity.
+pub const JOB_BOOTSTRAP_ROOT_FD: u64 = 3;
 pub const JOB_STATE_LIVE: u32 = 0;
 pub const JOB_STATE_KILLING: u32 = 1;
 pub const PROC_BROKER_FORMAT_ELF64: u16 = 1;
@@ -2496,6 +2538,9 @@ pub struct RustosProcPrepareBrokerArgs {
     pub reserved0: u64,
     /// Immutable loader-selected placement, also used for exec replacement.
     pub stack_top: u64,
+    /// Valid only with PREPARE_FLAG_JOB_HANDLE (fd zero is valid). Without it,
+    /// spawn inherits the authenticated requester's job, not the loader's job.
+    pub job_handle: u64,
 }
 
 #[repr(C)]
@@ -2857,21 +2902,27 @@ pub struct RootdMemoryCensusEntry {
 /// Request and reply of `SYS_RUSTOS_JOB`. `op` selects the use of the fields;
 /// unused inputs must be zero and unused outputs are written as zero.
 ///
-/// - `GET_INFO`: in `job`; out `result_job` (the parent, 0 for the root),
-///   `state`, `depth`, `processes`, `subtree_processes`, `children`, `kills`.
-/// - `CREATE_CHILD`: in `job` (the parent); out `result_job` (the new job).
-/// - `KILL`: in `job`; out `remaining`, the members still alive when the
-///   bounded kill step ended. Repeat the call until it reports zero.
-/// - `PROCESS_JOB`: in `pid`; out `result_job`.
+/// `job_handle` is always a local Job descriptor; raw JobIds grant no authority.
+/// - `GET_INFO`: requires INSPECT; out `job`, `parent_job` (0 for root),
+///   `state`, `depth`, `processes`, `subtree_processes`, `children`, `kills`, `rights`.
+/// - `CREATE_CHILD`: requires CREATE_JOB on the parent; out `result_handle`,
+///   `job`, `parent_job`, `rights`. The child inherits the handle's rights.
+/// - `DUPLICATE_HANDLE`: requires DUPLICATE; in `rights` (a subset mask), out
+///   `result_handle`, `job`. Unknown or widening bits are refused.
+/// - `KILL`: requires KILL; out `remaining`. Repeat bounded steps until zero.
+/// - `PROCESS_JOB`: requires INSPECT on a subtree containing `pid`; out `job`
+///   (identity only, never a new handle). Unused inputs/outputs are zero.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RustosJobArgs {
     pub abi_version: u16,
     pub op: u16,
     pub flags: u32,
-    pub job: u64,
+    pub job_handle: u64,
     pub pid: u64,
-    pub result_job: u64,
+    pub result_handle: u64,
+    pub job: u64,
+    pub parent_job: u64,
     pub state: u32,
     pub depth: u32,
     pub processes: u64,
@@ -2879,6 +2930,26 @@ pub struct RustosJobArgs {
     pub children: u64,
     pub kills: u64,
     pub remaining: u64,
+    pub rights: u32,
+    pub reserved0: u32,
+    /// `SET_LIMITS` input: dimensions to change (`JOB_LIMIT_*`).
+    pub limit_mask: u32,
+    pub reserved1: u32,
+    /// `SET_LIMITS` input; `GET_INFO` output: this job's own limits.
+    pub limit_processes: u64,
+    pub limit_threads: u64,
+    /// `GET_INFO` output: the tightest limit on the chain to the root.
+    pub effective_processes: u64,
+    pub effective_threads: u64,
+    /// `GET_INFO` output: unreaped process objects and threads in the subtree.
+    pub usage_processes: u64,
+    pub usage_threads: u64,
+    /// `SET_LIMITS` input; `GET_INFO` output: this job's own memory limit.
+    pub limit_memory_pages: u64,
+    /// `GET_INFO` output: the tightest memory limit on the chain to the root.
+    pub effective_memory_pages: u64,
+    /// `GET_INFO` output: pages currently charged to the subtree.
+    pub usage_memory_pages: u64,
 }
 
 /// Request and reply of `SYS_RUSTOS_ROOTD_MEMORY_BROKER`. The caller sets

@@ -122,6 +122,11 @@ fn user_identity_requires_each_abi_handle_and_pid_qualifier_before_claim() {
     complete.abi = Some(UserAbi::Linux);
     complete.process_handle = Some(crate::multitask::process_table::ProcessHandle::new(1, 2));
     complete.process_id = Some(ID);
+    // Missing placement storage is deliberately fail-closed in production.
+    // Allocate the fake process's side cell without depending on test order.
+    assert!(crate::multitask::process_placement::ensure_slot_storage(
+        complete.process_handle.unwrap().index(),
+    ));
     for missing in 0..3 {
         let mut partial = complete;
         match missing {

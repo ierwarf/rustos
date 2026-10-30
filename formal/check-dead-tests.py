@@ -42,7 +42,9 @@ def main() -> int:
     seen: set[str] = set()
 
     for manifest in sorted(ROOT.glob("**/Cargo.toml")):
-        if SKIP_DIR_NAMES & set(manifest.parts):
+        # Only cache directories inside this checkout are excluded. A valid
+        # worktree may itself live below an ancestor named build or target.
+        if SKIP_DIR_NAMES & set(manifest.relative_to(ROOT).parts):
             continue
         data = tomllib.loads(manifest.read_text())
         for bin_entry in data.get("bin", []):

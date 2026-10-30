@@ -46,7 +46,7 @@ while IFS=$'\t' read -r boundary owner source identity delegation object respons
         exit 1
     fi
     [[ -f "$source" ]] || { echo "missing ingress source: $source" >&2; exit 1; }
-    rg -q 'recv_with_sender|RECV_WITH_SENDER' "$source" || {
+    rg -q 'recv_with_(handles_and_)?sender|RECV_WITH_(HANDLES_AND_)?SENDER' "$source" || {
         echo "service ingress omits kernel-stamped sender: $boundary ($source)" >&2
         exit 1
     }
@@ -83,7 +83,7 @@ while IFS=$'\t' read -r boundary owner source service authority lifecycle extra;
         echo "identity publication omits no-call authority marker: $boundary" >&2
         exit 1
     }
-    if rg -q 'recv_with_sender|RECV_WITH_SENDER|\bSYS_RUSTOS_IPC_(TRY_)?RECV\b' "$source"; then
+    if rg -q 'recv_with_(handles_and_)?sender|RECV_WITH_(HANDLES_AND_)?SENDER|\bSYS_RUSTOS_IPC_(TRY_)?RECV\b' "$source"; then
         echo "identity-only endpoint unexpectedly has a receive surface: $boundary" >&2
         exit 1
     fi

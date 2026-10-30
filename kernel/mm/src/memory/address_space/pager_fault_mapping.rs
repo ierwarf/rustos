@@ -189,6 +189,12 @@ pub fn map_current_prepared_pager_fault_frame_at(
     let page_flags = normalize_user_page_flags(flags)? | ROOT_OWNED_USER_LEAF;
     let root_phys = kernel_vm::current_root_phys().as_u64();
     let virtual_address = start.as_u64();
+    // A job's memory limit refuses here like a watermark denial: the caller
+    // returns its unpublished frame and reports no frame. Fault-around stops at
+    // the same place, so a run cannot overshoot the limit.
+    if !phys::root_admits(root_phys, 1) {
+        return Err(AddressSpaceError::OutOfFrames);
+    }
     if !phys::claim_data_leaf(root_phys, virtual_address, frame_phys) {
         return Err(AddressSpaceError::InvalidFrameOwnership);
     }
@@ -555,6 +561,9 @@ impl ProcessAddressSpace {
         let root = self.root_phys();
         let root_phys = root.as_u64();
         let virtual_address = start.as_u64();
+        if !phys::root_admits(root_phys, 1) {
+            return Err(AddressSpaceError::OutOfFrames);
+        }
         if !phys::claim_private_file_data_leaf(
             root_phys,
             virtual_address,
@@ -738,6 +747,9 @@ impl ProcessAddressSpace {
         let root = self.root_phys();
         let root_phys = root.as_u64();
         let virtual_address = start.as_u64();
+        if !phys::root_admits(root_phys, 1) {
+            return Err(AddressSpaceError::OutOfFrames);
+        }
         if !phys::claim_data_leaf(root_phys, virtual_address, frame_phys) {
             return Err(AddressSpaceError::InvalidFrameOwnership);
         }

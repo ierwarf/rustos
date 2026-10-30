@@ -1,3 +1,4 @@
+pub(crate) mod slot_dir;
 mod child_wait;
 mod context;
 pub use self::child_wait::{register_child_waiter, unregister_child_waiter, wake_child_waiters};
@@ -62,7 +63,7 @@ pub use self::current::{
     current_pager_charge_snapshot, current_pager_fault_install_permit, current_pager_vma_snapshot,
     current_scheduling_context_runtime_snapshot, current_task_id, current_task_id_with_signal_hint,
     current_thread_may_have_pending_signals, current_user_abi, current_user_address_space,
-    current_user_id, current_user_ipc_entry, current_user_ipc_identity, current_user_log_ids, current_user_process_id, current_user_process_identity,
+    current_user_id, current_user_ipc_entry, current_user_ipc_identity, current_user_job_policy_allows, current_user_log_ids, current_user_process_id, current_user_process_identity,
     current_user_process_thread_count, current_user_snapshot, current_user_stack_state,
     current_user_thread_id, current_user_wait_binding, demote_current_user_task_to_user_class,
     endpoint_receiver_still_waiting, exec_current_user_process, exec_user_process_by_pid,
@@ -110,7 +111,10 @@ pub use self::process_table::{
     reserve_spawn_in as reserve_process_spawn_in, ProcessIdentity, SpawnReservation,
 };
 pub use self::process_table::jobs::{
-    job_collect_members, job_create_child, job_info, job_kill_begin, job_subtree_contains_process,
+    job_admits_process, job_collect_members, job_create_child, job_info, job_is_within,
+    job_kill_begin, job_set_limits, JobLimits, LimitMask, LIMIT_UNSET,
+    job_policy_allows, job_policy_info, job_set_policy, JobPolicy, JobPolicyInfo,
+    job_subtree_contains_process,
     process_job, JobError, JobId, JobInfo, JobState, JOB_MAX_DEPTH, ROOT_JOB,
 };
 pub use self::retirement::UserFaultDisposition;
@@ -340,6 +344,8 @@ pub struct UserTaskBootstrap {
     pub windows_thread_state: Option<WindowsThreadRuntimeState>,
     pub console_session: ConsoleSessionHandle,
     pub logical_admin: bool,
+    /// Kernel bootstrap grant, never derived from a user path or admin flag.
+    pub root_job_authority: bool,
     exec_path: [u8; USER_TASK_EXEC_PATH_CAPACITY],
     exec_path_len: usize,
 }
@@ -360,6 +366,7 @@ impl UserTaskBootstrap {
             windows_thread_state: None,
             console_session: ConsoleSessionHandle::SYSTEM,
             logical_admin: false,
+            root_job_authority: false,
             exec_path: [0; USER_TASK_EXEC_PATH_CAPACITY],
             exec_path_len: 0,
         }

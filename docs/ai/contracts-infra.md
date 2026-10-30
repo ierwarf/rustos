@@ -149,6 +149,17 @@ or launch policy.
   TLC's `-deadlock` option disables deadlock checking; never describe it as
   enabling the check. TLC 1.7.4 action coverage is `distinct-successors:evaluations`, so
   `0:N` is exercised convergence and only an evaluation count of zero fails.
+- `tools/xtask/src/formal_contracts/runtime_trace.rs` selects the first complete,
+  identity-verified occurrence at or after every registered predecessor in
+  `formal/product-scenarios.tsv`. Earlier repeated markers do not terminate the
+  search, but their framing/evidence must still validate; missing predecessors,
+  malformed matching frames encountered before selection and traces with only
+  premature matches fail closed.
+  The scenario DAG and deadlines are not relaxed by candidate selection.
+  `formal/runtime-trace-causal-selection/RuntimeTraceCausalSelection.tla` and
+  native witnesses cover this bounded, serial immutable-log algorithm, not live
+  concurrent logging, clock correctness or cross-step executable identity.
+  No new concurrency-triangle claim is made for this single-threaded parser.
 - Stable summaries, SARIF, normalized counterexamples, runtime traces, and
   solver output belong under `build/formal/`. Solver caches and `_apalache-out`
   directories are ignored and must not be committed.

@@ -13,6 +13,32 @@ shuttle_max_seconds = 30
 herd_max_seconds = 10
 
 [[scenario]]
+id = "application-job-retirement"
+severity = "critical"
+flow = "application-job-custody"
+model = "application-job-custody/ApplicationJobCustody"
+source = "services/loaderd/src/application_jobs.rs"
+source_symbol = "collect"
+source_anchors = ["pub fn collect", "Ok(info) if info.remaining == 0", "Err(3) => { jobs.close(handle); false }"]
+invariant = "bounded child retirement and ancestor kill retain descriptor custody until empty and close once; protocol projection only"
+loom_test = "application_job_partial_retirement_and_ancestor_kill_keep_one_closer"
+shuttle_test = "application_job_partial_retirement_and_ancestor_kill_keep_one_closer_pct"
+herd_not_applicable = "the service loop is serial and the external race linearizes through existing kernel job operations; no new lock-free publication edge exists"
+
+[[scenario]]
+id = "application-limit-retirement"
+severity = "critical"
+flow = "application-limit-refusal"
+model = "application-limit-refusal/ApplicationLimitRefusal"
+source = "services/rootd/src/application_limit_probe.rs"
+source_symbol = "poll_with"
+source_anchors = ["fn poll_with", "info.live_processes == 0", "info.process_objects == 0", "info.pages == 0", "State::Draining(target)"]
+invariant = "live membership is already zero while object reap and page retirement finish independently; both precede one drain report; bounded protocol projection only"
+loom_test = "application_limit_drain_waits_for_process_and_page_retirement"
+shuttle_test = "application_limit_drain_waits_for_process_and_page_retirement_pct"
+herd_not_applicable = "rootd owns one serial probe state machine and adds no atomic publication; existing MM atomics and ledger teardown are outside this mutex projection"
+
+[[scenario]]
 id = "endpoint-publication"
 severity = "critical"
 flow = "endpoint-lifecycle"
@@ -70,6 +96,81 @@ invariant = "reply, timeout, and revoke leave at most one terminal owner for eac
 loom_test = "ipc_retirement_accepts_exact_global_capacity"
 shuttle_test = "ipc_reply_timeout_and_revoke_have_one_terminal_owner"
 herd_not_applicable = "the property is a lock-protected terminal-state race; a register-level litmus would omit call identity and cancellation ownership"
+
+[[scenario]]
+id = "job-member-reap-before-reuse"
+severity = "critical"
+flow = "process-lifecycle-transaction"
+model = "job-lifecycle/JobLifecycle"
+source = "kernel/ps/src/multitask/process_table/jobs.rs"
+source_symbol = "release_dead_jobs"
+source_anchors = [
+  "&& !self.has_any_member_object(index as u32)",
+  "slot.generation = slot.generation.checked_add(1).unwrap_or(0);",
+]
+invariant = "an exiting member still pins the job generation until object reap; only a later release pass permits reuse"
+loom_test = "job_reuse_waits_for_last_member_object_reap"
+shuttle_test = "job_reuse_waits_for_last_member_object_reap_pct"
+herd_not_applicable = "the decisive transitions are membership removal and generation reuse under the one process-table lock; an ISA litmus would omit the object ownership protocol"
+
+[[scenario]]
+id = "job-policy-membership-publication"
+severity = "critical"
+flow = "job-policy-control"
+model = "job-policy-publication/JobPolicyPublication"
+source = "kernel/ps/src/multitask/process_table/identity.rs"
+source_symbol = "published_process_job"
+source_anchors = ["PROCESS_JOB[index].store(job, Ordering::Release);", "let job = PROCESS_JOB.get(handle.index())?.load(Ordering::Acquire);", "(before == after && job != 0)"]
+invariant = "a replacement membership cannot be resolved under the preceding process generation; bounded atomic protocol projection, not Current/MM/object retirement proof"
+loom_test = "job_policy_membership_generation_and_payload_have_one_publication"
+shuttle_test = "job_policy_membership_generation_and_payload_have_one_publication_pct"
+herd_test = "formal/litmus/x86_64/job_policy_membership_publication.litmus"
+herd_mutant = "formal/litmus/x86_64/job_policy_membership_publication.mutant.litmus"
+herd_cat = "x86tso-mixed.cat"
+
+[[scenario]]
+id = "job-policy-tightening-completion"
+severity = "critical"
+flow = "job-policy-control"
+model = "job-policy-lifecycle/JobPolicyLifecycle"
+source = "kernel/ps/src/multitask/process_table/jobs/policy.rs"
+source_symbol = "job_set_policy"
+source_anchors = ["table.jobs[job.index as usize].policy = own;", "table.job_contains(job.index, index as u32)", "publish_job(&table, table.job_id_of(index as u32));"]
+invariant = "a check ordered after observed SET completion sees the affected descendant update; racing checks can see old/new per word, with no atomic whole-mask/subtree or wall-clock-only guarantee"
+loom_test = "job_policy_tightening_is_visible_after_acknowledged_completion"
+shuttle_test = "job_policy_tightening_is_visible_after_acknowledged_completion_pct"
+herd_not_applicable = "the claim spans an owner-serialized tree traversal and external caller completion acknowledgment; a single ISA litmus would invent that acknowledgment rather than model it, while concrete incarnation/payload edges have separate litmus witnesses"
+
+[[scenario]]
+id = "job-policy-word-publication"
+severity = "critical"
+flow = "job-policy-control"
+model = "job-policy-publication/JobPolicyPublication"
+source = "kernel/ps/src/multitask/process_table/jobs/policy.rs"
+source_symbol = "allows_with_hook"
+source_anchors = ["word.store(value, Ordering::Release);", "let word = self.words[operation / 64].load(Ordering::Acquire);", "before == after && word &"]
+invariant = "an old job incarnation cannot accept a replacement tenant's operation word; bounded atomic protocol projection with explicit weak-edge sensitivity, not a production spinlock/teardown proof"
+loom_test = "job_policy_word_generation_and_payload_have_one_publication"
+shuttle_test = "job_policy_word_generation_and_payload_have_one_publication_pct"
+herd_test = "formal/litmus/x86_64/job_policy_incarnation_publication.litmus"
+herd_mutant = "formal/litmus/x86_64/job_policy_incarnation_publication.mutant.litmus"
+herd_cat = "x86tso-mixed.cat"
+
+[[scenario]]
+id = "job-spawn-reservation-revalidation"
+severity = "critical"
+flow = "process-lifecycle-transaction"
+model = "job-lifecycle/JobLifecycle"
+source = "kernel/ps/src/multitask/process_table/jobs.rs"
+source_symbol = "resolve_new_member_job"
+source_anchors = [
+  "(slot.in_use && slot.generation == id.generation).then_some(slot)",
+  "Some(slot) if slot.state == JobState::Killing => Err(JobError::Killing)",
+]
+invariant = "a pre-kill reservation cannot publish into a killing job or its recycled replacement; refusal preserves exact cancellation custody"
+loom_test = "job_spawn_reservation_cannot_publish_into_killed_or_reused_job"
+shuttle_test = "job_spawn_reservation_cannot_publish_into_killed_or_reused_job_pct"
+herd_not_applicable = "the decisive job-generation validation and member publication share the process-table lock; an ISA litmus would omit the reservation and membership transaction"
 
 [[scenario]]
 id = "oom-termination-single-finalizer"
@@ -421,6 +522,38 @@ shuttle_test = "scheduler_transition_wake_has_one_mailbox_owner_until_commit"
 herd_not_applicable = "the decisive property composes assembly transition state, an owner-word CAS, and a lock-protected mailbox drain; the atomic transition publication already has a separate x86_64 litmus, while an ISA-only wake litmus would omit queue identity and one-shot dispatch"
 
 [[scenario]]
+id = "slot-chunk-publication-race"
+severity = "critical"
+flow = "process-lifecycle-transaction"
+model = "slot-directory-growth/SlotDirectoryGrowth"
+source = "kernel/ps/src/multitask/slot_dir.rs"
+source_symbol = "ensure"
+source_anchors = [
+  "match cell.compare_exchange(ptr::null_mut(), base, Ordering::AcqRel, Ordering::Acquire) {",
+  "drop(unsafe { Box::from_raw(ptr::slice_from_raw_parts_mut(base, SLOT_CHUNK)) });",
+]
+invariant = "a directory chunk is published once by a release CAS after its body is initialized; a losing grower frees only its own unpublished chunk and a lock-free reader sees either no chunk or a fully initialized one"
+loom_test = "slot_chunk_publication_race_publishes_once_and_readers_see_initialized_chunks"
+shuttle_test = "slot_chunk_publication_race_publishes_once_and_readers_see_initialized_chunks_pct"
+herd_not_applicable = "the decisive step is a single release-CAS publication of an initialized heap chunk; the allocator and chunk contents are outside an ISA litmus, and Loom checks the release/acquire pairing directly"
+
+[[scenario]]
+id = "slot-storage-before-slot"
+severity = "critical"
+flow = "process-lifecycle-transaction"
+model = "slot-directory-growth/SlotDirectoryGrowth"
+source = "kernel/ps/src/multitask/process_table.rs"
+source_symbol = "grow_slots"
+source_anchors = [
+  "&& super::pager_vma::ensure_slot_storage(expected_len))",
+  "table.slots.push_chunk(chunk)",
+]
+invariant = "every per-slot side array publishes the chunk covering an index before the table chunk that makes that slot allocatable, so a reserved slot always finds its storage"
+loom_test = "a_slot_is_allocatable_only_after_its_side_chunks_are_published"
+shuttle_test = "a_slot_is_allocatable_only_after_its_side_chunks_are_published_pct"
+herd_not_applicable = "ordering between a published side chunk and the table length is a program-level publication protocol across several arrays; Loom exercises the release/acquire edge and the sibling ISA litmus would omit the table lock"
+
+[[scenario]]
 id = "smp-qualification-deferred-bind"
 severity = "critical"
 flow = "deferred-process-activation"
@@ -508,6 +641,19 @@ shuttle_test = "tlb_mailbox_flush_ack_and_reclaim_preserve_generation_order"
 herd_test = "formal/litmus/x86_64/tlb_mailbox_request_publication.litmus"
 herd_mutant = "formal/litmus/x86_64/tlb_mailbox_request_publication.mutant.litmus"
 herd_cat = "x86tso-mixed.cat"
+
+[[scenario]]
+id = "user-exception-marker-serialization"
+severity = "critical"
+flow = "exception-retirement"
+model = "exception-diagnostic-custody/ExceptionDiagnosticCustody"
+source = "kernel/hal/src/arch/idt/handlers.rs"
+source_symbol = "exception_marker_with"
+source_anchors = ["fn exception_marker_with", "if user_mode { serialized(index); } else { emergency(index); }", "println_serialized"]
+invariant = "ordinary user markers share complete normal-sink ownership while fatal emergency output remains independent; protocol projection only"
+loom_test = "user_exception_marker_cannot_split_a_structured_frame"
+shuttle_test = "user_exception_marker_cannot_split_a_structured_frame_pct"
+herd_not_applicable = "no new atomic publication is introduced; callback classification reuses the existing bounded debug sink and this projection excludes port I/O and panic output"
 
 [[scenario]]
 id = "waitset-arm"

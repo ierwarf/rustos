@@ -2,8 +2,9 @@
 EXTENDS Integers
 
 (*******************************************************************************
-Models the byte-only RustOS reply-receive syscall as one phase-explicit
-transaction.  User-controlled shape, output ranges, endpoint ownership, and
+Models byte reply plus byte/handle RustOS receive as one phase-explicit
+transaction. The explicit handle variant admits fd outputs before consume.
+User-controlled shape, output ranges, endpoint ownership, and
 response bytes are preflighted while the old reply capability is still live.
 Only then may the kernel consume that one-shot reply, wake the exact caller,
 and enter the existing endpoint check-arm-recheck receive protocol.
@@ -33,10 +34,10 @@ PreError == "pre-error"
 TaggedPostError == "tagged-post-error"
 
 VARIABLES phase, replyLive, callerRunnable, waiterArmed, serverBlocked,
-          requestPending, nextReplyOwned, resultKind
+          requestPending, nextReplyOwned, resultKind, handleReceive, handleOutputsValid
 
 vars == <<phase, replyLive, callerRunnable, waiterArmed, serverBlocked,
-          requestPending, nextReplyOwned, resultKind>>
+          requestPending, nextReplyOwned, resultKind, handleReceive, handleOutputsValid>>
 
 Init ==
     /\ phase = Preflight
@@ -47,21 +48,24 @@ Init ==
     /\ requestPending \in BOOLEAN
     /\ nextReplyOwned = FALSE
     /\ resultKind = NoResult
+    /\ handleReceive \in BOOLEAN
+    /\ handleOutputsValid \in BOOLEAN
 
 PreflightReject ==
     /\ phase = Preflight
     /\ phase' = PreFailed
     /\ resultKind' = PreError
     /\ UNCHANGED <<replyLive, callerRunnable, waiterArmed, serverBlocked,
-                    requestPending, nextReplyOwned>>
+                    requestPending, nextReplyOwned, handleReceive, handleOutputsValid>>
 
 CommitReply ==
     /\ phase = Preflight
+    /\ (~handleReceive \/ handleOutputsValid) \* handle output admission
     /\ phase' = ReplyCommitted
     /\ replyLive' = FALSE
     /\ callerRunnable' = TRUE
     /\ UNCHANGED <<waiterArmed, serverBlocked, requestPending,
-                    nextReplyOwned, resultKind>>
+                    nextReplyOwned, resultKind, handleReceive, handleOutputsValid>>
 
 ReceiveQueued ==
     /\ phase = ReplyCommitted
@@ -70,7 +74,7 @@ ReceiveQueued ==
     /\ requestPending' = FALSE
     /\ nextReplyOwned' = TRUE
     /\ resultKind' = Success
-    /\ UNCHANGED <<replyLive, callerRunnable, waiterArmed, serverBlocked>>
+    /\ UNCHANGED <<replyLive, callerRunnable, waiterArmed, serverBlocked, handleReceive, handleOutputsValid>>
 
 ArmReceive ==
     /\ phase = ReplyCommitted
@@ -78,7 +82,7 @@ ArmReceive ==
     /\ phase' = ReceiveArmed
     /\ waiterArmed' = TRUE
     /\ UNCHANGED <<replyLive, callerRunnable, serverBlocked, requestPending,
-                    nextReplyOwned, resultKind>>
+                    nextReplyOwned, resultKind, handleReceive, handleOutputsValid>>
 
 PublishDuringRecheck ==
     /\ phase = ReceiveArmed
@@ -87,7 +91,7 @@ PublishDuringRecheck ==
     /\ waiterArmed' = FALSE
     /\ nextReplyOwned' = TRUE
     /\ resultKind' = Success
-    /\ UNCHANGED <<replyLive, callerRunnable, serverBlocked, requestPending>>
+    /\ UNCHANGED <<replyLive, callerRunnable, serverBlocked, requestPending, handleReceive, handleOutputsValid>>
 
 CommitBlock ==
     /\ phase = ReceiveArmed
@@ -95,7 +99,7 @@ CommitBlock ==
     /\ phase' = Blocked
     /\ serverBlocked' = TRUE
     /\ UNCHANGED <<replyLive, callerRunnable, waiterArmed, requestPending,
-                    nextReplyOwned, resultKind>>
+                    nextReplyOwned, resultKind, handleReceive, handleOutputsValid>>
 
 PublishAndWake ==
     /\ phase = Blocked
@@ -105,7 +109,7 @@ PublishAndWake ==
     /\ serverBlocked' = FALSE
     /\ nextReplyOwned' = TRUE
     /\ resultKind' = Success
-    /\ UNCHANGED <<replyLive, callerRunnable, requestPending>>
+    /\ UNCHANGED <<replyLive, callerRunnable, requestPending, handleReceive, handleOutputsValid>>
 
 PostCommitFail ==
     /\ phase \in {ReplyCommitted, ReceiveArmed}
@@ -113,7 +117,7 @@ PostCommitFail ==
     /\ waiterArmed' = FALSE
     /\ serverBlocked' = FALSE
     /\ resultKind' = TaggedPostError
-    /\ UNCHANGED <<replyLive, callerRunnable, requestPending, nextReplyOwned>>
+    /\ UNCHANGED <<replyLive, callerRunnable, requestPending, nextReplyOwned, handleReceive, handleOutputsValid>>
 
 TerminalStutter ==
     /\ phase \in {Delivered, PreFailed, PostFailed}
@@ -142,6 +146,10 @@ TypeOK ==
     /\ requestPending \in BOOLEAN
     /\ nextReplyOwned \in BOOLEAN
     /\ resultKind \in {NoResult, Success, PreError, TaggedPostError}
+    /\ handleReceive \in BOOLEAN /\ handleOutputsValid \in BOOLEAN
+
+HandleOutputsAdmittedBeforeConsume ==
+    (handleReceive /\ ~handleOutputsValid) => replyLive
 
 PreCommitFailurePreservesReply ==
     phase = PreFailed =>

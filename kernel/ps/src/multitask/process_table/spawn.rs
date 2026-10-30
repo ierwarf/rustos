@@ -56,21 +56,40 @@ pub fn reserve_spawn() -> Option<SpawnReservation> {
 /// again at publication because a kill may start in between.
 pub fn reserve_spawn_in(job: Option<jobs::JobId>) -> Option<SpawnReservation> {
     if let Some(job) = job {
-        if jobs::job_info(job).ok()?.state != jobs::JobState::Live {
+        if jobs::job_info(job).ok()?.state != jobs::JobState::Live
+            || !jobs::job_admits_process(job)
+        {
             return None;
         }
     }
     let transaction_id = allocate_lifecycle_transaction_id()?;
-    let mut table = PROCESS_TABLE.lock();
-    let (index, slot) = table.slots.iter_mut().enumerate().find(|(_, slot)| {
-        slot.object.is_none()
-            && slot.spawn_transaction_id.is_none()
-            && slot.root_spawn.is_none()
-            && slot.generation != 0
-    })?;
-    let handle = ProcessHandle::new(index, slot.generation);
-    slot.spawn_transaction_id = Some(transaction_id);
-    drop(table);
+    let limit = process_limit();
+    let handle = loop {
+        let mut table = PROCESS_TABLE.lock();
+        let free = table
+            .slots
+            .iter_mut()
+            .enumerate()
+            .take(limit)
+            .find(|(_, slot)| {
+                slot.object.is_none()
+                    && slot.spawn_transaction_id.is_none()
+                    && slot.root_spawn.is_none()
+                    && slot.generation != 0
+            });
+        if let Some((index, slot)) = free {
+            let handle = ProcessHandle::new(index, slot.generation);
+            slot.spawn_transaction_id = Some(transaction_id);
+            break handle;
+        }
+        // No free slot below the limit: grow by one chunk if the limit admits
+        // more slots than exist, otherwise the table is genuinely full.
+        let existing = table.slots.len();
+        drop(table);
+        if existing >= limit || !grow_slots(existing) {
+            return None;
+        }
+    };
     record_lifecycle_marker("lifecycle-spawn-reserve", handle, 1, transaction_id);
     Some(SpawnReservation {
         handle,
@@ -211,6 +230,11 @@ fn publish_inner(
     object.job = table
         .resolve_new_member_job(reservation.job, parent_process_id)
         .ok()?;
+    // The authoritative admission check: reservation could not know the job a
+    // fork inherits, and counts may have moved since an explicit job was checked.
+    if !table.admits_process(object.job) {
+        return None;
+    }
     let slot = table.lookup_slot_mut(reservation.handle)?;
     if slot.object.is_some()
         || slot.spawn_transaction_id != Some(reservation.transaction_id)
@@ -218,7 +242,12 @@ fn publish_inner(
     {
         return None;
     }
+    // The root is quiescent until the process is visible, so binding it now
+    // charges the image pages already mapped to the job exactly once.
+    let root_phys = object.mm_execution.root_phys();
+    let job_index = object.job.index() as usize;
     slot.object = Some(object);
+    let _ = kernel_mm::api::phys::bind_root_charge(root_phys, job_index);
     slot.spawn_transaction_id = None;
     // Acquire actual backing BEFORE the release that admits live PID lookup;
     // no capture-after-publication gap and no Class55 leaf spans this Class54.

@@ -44,6 +44,8 @@ pub struct ConsoleProgramSpec<'a> {
     pub logical_admin: bool,
     pub argv: &'a [&'a str],
     pub env: &'a [&'a str],
+    root_job_authority: bool,
+    job: Option<crate::multitask::JobId>,
     scheduling_context: Option<rustos_user_abi::syscall::RustosSchedulingContextPolicy>,
 }
 
@@ -56,6 +58,8 @@ impl<'a> ConsoleProgramSpec<'a> {
             logical_admin: false,
             argv: &[],
             env: &[],
+            root_job_authority: false,
+            job: None,
             scheduling_context: None,
         }
     }
@@ -68,6 +72,20 @@ impl<'a> ConsoleProgramSpec<'a> {
 
     pub const fn with_logical_admin(mut self, logical_admin: bool) -> Self {
         self.logical_admin = logical_admin;
+        self
+    }
+
+    /// Kernel-only placement; user bootstrap requests first resolve a typed
+    /// CREATE_PROCESS descriptor. This never grants the root job descriptor.
+    pub const fn with_job(mut self, job: crate::multitask::JobId) -> Self {
+        self.job = Some(job);
+        self
+    }
+
+    /// Only the executive's initial user-process constructor requests this.
+    /// No user syscall maps a flag, executable path or admin bit to this grant.
+    pub const fn with_root_job_authority(mut self) -> Self {
+        self.root_job_authority = true;
         self
     }
 
@@ -187,6 +205,7 @@ pub fn spawn_program_in_session(
         },
         console_session: session,
         logical_admin: program.logical_admin,
+        root_job_authority: program.root_job_authority,
     };
 
     let policy = program.scheduling_context.ok_or(ConsoleHostError::Spawn {
@@ -197,6 +216,7 @@ pub fn spawn_program_in_session(
         program.weight_micros,
         launch,
         policy,
+        program.job,
     );
     spawned
         .inspect(|spawned| {
@@ -218,6 +238,22 @@ pub fn spawn_program_in_session(
             let _ = session;
             ConsoleHostError::Spawn { error }
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_bootstrap_job_is_retained_without_minting_root_authority() {
+        let job = crate::multitask::JobId::from_raw((1_u64 << 32) | 7);
+        let ordinary = ConsoleProgramSpec::new(&[], "/service", 1000);
+        assert_eq!(ordinary.job, None);
+        assert!(!ordinary.root_job_authority);
+        let placed = ordinary.with_job(job);
+        assert_eq!(placed.job, Some(job));
+        assert!(!placed.root_job_authority);
+    }
 }
 
 pub fn load_executable_image_by_path(

@@ -14,6 +14,7 @@ not be preloaded for unrelated work.
 | `token-policy.md` | On-demand context/tool/output budgets and stop limits. |
 | `task-router.md` | On-demand task → smallest context route when ownership or validation is unclear. |
 | `session-handoff.md` | Volatile checkout state and safe new-session resume sequence. |
+| `session-handoff-log.md` | Chronology and evidence behind the handoff; append here, not to the handoff head. |
 | `repo-map.md` | Source ownership and canonical entrypoints. Deeper than `docs/ai-map.md`. |
 | `commands.md` | Quiet build/check/debug commands and their failure meanings. Search before opening. |
 | `contracts.md` | Index into `contracts-infra.md`/`contracts-abi.md`; edit the section owner, not this file. |

@@ -1,4 +1,13 @@
 # path	undocumented_unsafe_limit	undocumented_ordering_limit
+kernel/nucleus-core/src/debug/milestone_class.rs	0	0
+kernel/compat/src/user/syscall/linux/job_policy_ops.rs	0	0
+kernel/ps/src/multitask/current/job_policy.rs	0	0
+kernel/ps/src/multitask/process_table/identity.rs	0	0
+kernel/ps/src/multitask/process_table/jobs/policy.rs	0	0
+libs/rustos-user-abi/src/syscall/job_policy.rs	0	0
+services/rootd/src/job_policy.rs	0	0
+services/rootd/src/job_policy_probe.rs	0	0
+tools/xtask/src/kvm/job_policy.rs	0	0
 kernel/ps/src/multitask/scheduler/ordering_publication.rs	0	0
 kernel/ps/src/multitask/scheduler/ordering_publication/tests.rs	0	0
 kernel/ps/src/multitask/scheduler/current_observation.rs	0	0

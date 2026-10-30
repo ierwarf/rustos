@@ -33,6 +33,7 @@ use core::ptr;
 use core::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 
 use super::PAGE_SIZE;
+use crate::memory::charge;
 
 mod api;
 mod encoding;
@@ -258,6 +259,9 @@ impl FrameDescriptorLedger {
             "retired root still owns data leaves"
         );
         assert_eq!(root.shared_backing_identity.load(Ordering::Relaxed), 0);
+        // The binding word is free for roots; the count is zero here, so
+        // nothing is left charged to the group being released.
+        root.next_or_virtual_address.store(0, Ordering::Relaxed);
         assert_eq!(
             root.role.compare_exchange(
                 ROLE_ROOT,
@@ -431,6 +435,7 @@ impl FrameDescriptorLedger {
         assert_eq!(frame.next_or_virtual_address.load(Ordering::Relaxed), va);
         root.data_leaf_count_or_map_head
             .fetch_add(1, DESCRIPTOR_ACQ_REL);
+        self.charge_root(root, 1);
         assert_eq!(
             frame.role.compare_exchange(
                 ROLE_EXCLUSIVE_DATA_CLAIMED,
@@ -583,6 +588,7 @@ impl FrameDescriptorLedger {
         );
         root.data_leaf_count_or_map_head
             .fetch_add(1, DESCRIPTOR_ACQ_REL);
+        self.charge_root(root, 1);
         assert_eq!(
             frame
                 .role
@@ -742,6 +748,7 @@ impl FrameDescriptorLedger {
         assert_ne!(frame.shared_backing_identity.load(Ordering::Relaxed), 0);
         root.data_leaf_count_or_map_head
             .fetch_add(1, DESCRIPTOR_ACQ_REL);
+        self.charge_root(root, 1);
         assert_eq!(
             frame
                 .role
@@ -1262,6 +1269,57 @@ impl FrameDescriptorLedger {
         }
     }
 
+    /// The charge group a root is bound to. A root's `next_or_virtual_address`
+    /// is otherwise unused (leaves use it for their virtual address), so it holds
+    /// `group + 1`; zero means unbound.
+    fn root_group(root: &FrameDescriptorRecord) -> Option<usize> {
+        let word = root.next_or_virtual_address.load(Ordering::Relaxed);
+        word.checked_sub(1).map(|group| group as usize)
+    }
+
+    fn charge_root(&self, root: &FrameDescriptorRecord, pages: u64) {
+        if let Some(group) = Self::root_group(root) {
+            charge::charge(group, pages);
+        }
+    }
+
+    fn uncharge_root(&self, root: &FrameDescriptorRecord, pages: u64) {
+        if let Some(group) = Self::root_group(root) {
+            charge::uncharge(group, pages);
+        }
+    }
+
+    /// Binds a quiescent root to a charge group and charges the data leaves it
+    /// already holds. The caller guarantees nothing claims, publishes or
+    /// releases on this root concurrently (a new root, before its process is
+    /// published or its exec committed). Refused if the root is unknown or
+    /// already bound.
+    fn bind_charge(&self, root_phys: u64, group: usize) -> bool {
+        let Some(root) = self.verify_root(root_phys) else {
+            return false;
+        };
+        if root
+            .next_or_virtual_address
+            .compare_exchange(0, group as u64 + 1, DESCRIPTOR_ACQ_REL, DESCRIPTOR_ACQUIRE)
+            .is_err()
+        {
+            return false;
+        }
+        let held = root.data_leaf_count_or_map_head.load(DESCRIPTOR_ACQUIRE);
+        if held != 0 {
+            charge::charge(group, held);
+        }
+        true
+    }
+
+    /// Whether `pages` more data leaves fit under every limit of the root's
+    /// group. An unknown or unbound root is always admitted.
+    fn root_admits(&self, root_phys: u64, pages: u64) -> bool {
+        self.verify_root(root_phys)
+            .and_then(Self::root_group)
+            .is_none_or(|group| charge::would_admit(group, pages))
+    }
+
     fn decrement_root_data_count(&self, root_phys: u64) {
         let root = self
             .verify_root(root_phys)
@@ -1274,6 +1332,7 @@ impl FrameDescriptorLedger {
             .data_leaf_count_or_map_head
             .fetch_sub(1, DESCRIPTOR_ACQ_REL);
         assert!(previous != 0, "data-leaf root count underflow");
+        self.uncharge_root(root, 1);
     }
 }
 

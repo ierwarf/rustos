@@ -98,6 +98,18 @@ fn emergency_exception_marker(index: u8) {
     }
 }
 
+/// Ordinary user retirement must not splice raw bytes into another CPU's
+/// structured evidence. Fatal supervisor/NMI paths retain emergency output.
+#[inline(always)]
+fn exception_marker_with(
+    user_mode: bool,
+    index: u8,
+    serialized: impl FnOnce(u8),
+    emergency: impl FnOnce(u8),
+) {
+    if user_mode { serialized(index); } else { emergency(index); }
+}
+
 #[unsafe(no_mangle)]
 fn rustos_default_handler_aligned(
     stack_frame: InterruptStackFrame,
@@ -137,7 +149,12 @@ fn rustos_default_handler_aligned(
         }
     }
 
-    emergency_exception_marker(index);
+    exception_marker_with(
+        user_mode,
+        index,
+        |vector| crate::debug::println_serialized(format_args!("!EX:{vector:02x}")),
+        emergency_exception_marker,
+    );
     crate::debug::dump_recent_trace_locations("exception");
     if index == 14 {
         log_page_fault_details(
@@ -168,6 +185,9 @@ fn rustos_default_handler_aligned(
             crate::hooks::UserFaultDisposition::Unhandled => {}
         }
 
+        // Retirement refusal is a broken-kernel emergency, not an ordinary
+        // user fault. Preserve the lock-free last-ditch breadcrumb here.
+        emergency_exception_marker(index);
         panic!(
             "user-mode exception was raised without an active user task: vector={}, rip={:#x}, cs={:#x}",
             index,
@@ -326,6 +346,30 @@ pub extern "x86-interrupt" fn tlb_shootdown_interrupt_handler(_stack_frame: Inte
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn user_exception_markers_use_serialized_output_but_kernel_faults_stay_emergency() {
+        for (user, vector) in [(true, 14), (true, 6), (true, 21), (false, 14), (false, 21)] {
+            let serialized = core::cell::Cell::new(None);
+            let emergency = core::cell::Cell::new(None);
+            super::exception_marker_with(user, vector,
+                |value| serialized.set(Some(value)), |value| emergency.set(Some(value)));
+            assert_eq!(serialized.get(), user.then_some(vector));
+            assert_eq!(emergency.get(), (!user).then_some(vector));
+        }
+    }
+
+    #[test]
+    fn exception_marker_wiring_keeps_nonblocking_user_output_and_raw_fatal_fallbacks() {
+        let source = include_str!("handlers.rs").split("#[cfg(test)]").next().unwrap();
+        let aligned = source.split_once("fn rustos_default_handler_aligned(").unwrap().1;
+        assert!(aligned.contains("|vector| crate::debug::println_serialized(format_args!(\"!EX:{vector:02x}\"))"));
+        let unhandled = aligned.split_once("Retirement refusal is a broken-kernel emergency").unwrap().1;
+        assert!(unhandled.find("emergency_exception_marker(index)").unwrap()
+            < unhandled.find("user-mode exception was raised without an active user task").unwrap());
+        assert!(source.contains("emergency_exception_marker(2);"));
+        assert!(source.contains("emergency_exception_marker(8);"));
+    }
+
     #[test]
     fn general_exception_bridge_aligns_every_rust_call_boundary() {
         for raw_rsp in [0x1000_u64, 0x1008, 0x100f, 0x1010, u64::MAX - 0x1f] {

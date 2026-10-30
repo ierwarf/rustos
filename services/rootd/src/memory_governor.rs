@@ -17,7 +17,7 @@
 //! - **Evidence:** `memory_governor` unit tests; contract
 //!   `address-space-lifecycle-contract.md` §4.
 
-use rustos_user_abi::syscall::RustosRootdMemoryBrokerArgs;
+use rustos_user_abi::syscall::{ROOTD_MEMORY_CENSUS_MAX_ENTRIES, RustosRootdMemoryBrokerArgs};
 
 /// A kill is followed by this long during which no further kill is issued.
 pub(super) const KILL_COOLDOWN_MS: u64 = 200;
@@ -41,8 +41,15 @@ pub(super) enum Verdict {
     /// An earlier victim's frames are back: free memory is well above the
     /// reserve again. Reported once per kill.
     Recovered { free_pages: u64 },
-    /// Terminate this process.
+    /// Terminate this process alone.
     Kill {
+        process_id: u64,
+        resident_pages: u64,
+    },
+    /// Kill this whole job: `resident_pages` is the census sum of its eligible
+    /// members and `process_id` its largest one, for the log line only.
+    KillJob {
+        job: u64,
         process_id: u64,
         resident_pages: u64,
     },
@@ -80,12 +87,29 @@ impl MemoryGovernor {
     /// Pressure is free memory at or below the kernel reserve **and** new
     /// refusals since the previous pass: a quiet machine resting at the
     /// watermark has nobody to protect and nobody to blame.
+    #[cfg(test)]
     pub(super) fn assess(
         &mut self,
         now_ms: u64,
         census: &RustosRootdMemoryBrokerArgs,
         rootd_pid: u64,
+        is_protected: impl FnMut(u64) -> bool,
+    ) -> Verdict {
+        self.assess_with_jobs(now_ms, census, rootd_pid, is_protected, |_| false)
+    }
+
+    /// `assess` that prefers ending a whole job. `job_killable(job)` must be
+    /// true only when killing `job` and everything below it cannot end a
+    /// protected process; it may be expensive and is called only after the
+    /// pressure and cooldown checks, largest job first, until one answers yes.
+    /// With no killable job the verdict is the single largest eligible process.
+    pub(super) fn assess_with_jobs(
+        &mut self,
+        now_ms: u64,
+        census: &RustosRootdMemoryBrokerArgs,
+        rootd_pid: u64,
         mut is_protected: impl FnMut(u64) -> bool,
+        mut job_killable: impl FnMut(u64) -> bool,
     ) -> Verdict {
         let denied_since_last = census.watermark_denials > self.last_denials;
         self.last_denials = census.watermark_denials;
@@ -114,6 +138,9 @@ impl MemoryGovernor {
         }
         let count = (census.entry_count as usize).min(census.entries.len());
         let mut best: Option<(u64, u64)> = None;
+        // (job, eligible resident pages, largest eligible pid) per distinct job.
+        let mut jobs = [(0_u64, 0_u64, 0_u64); ROOTD_MEMORY_CENSUS_MAX_ENTRIES];
+        let mut job_count = 0;
         for entry in &census.entries[..count] {
             let pid = entry.process_id;
             if pid == 0
@@ -123,11 +150,47 @@ impl MemoryGovernor {
             {
                 continue;
             }
+            if entry.job != 0 {
+                match jobs[..job_count].iter_mut().find(|slot| slot.0 == entry.job) {
+                    Some(slot) => {
+                        slot.1 = slot.1.saturating_add(entry.resident_pages);
+                        slot.2 = slot.2.max(pid);
+                    }
+                    None => {
+                        jobs[job_count] = (entry.job, entry.resident_pages, pid);
+                        job_count += 1;
+                    }
+                }
+            }
             // The census is largest-first, but the policy does not depend on
             // the kernel's ordering: compare explicitly, ties to the younger.
             if best.is_none_or(|(pages, best_pid)| (entry.resident_pages, pid) > (pages, best_pid))
             {
                 best = Some((entry.resident_pages, pid));
+            }
+        }
+        // Largest job first. The census is partial (largest processes only), so
+        // a job's sum is a lower bound and never overstates what it frees.
+        let mut probed = [false; ROOTD_MEMORY_CENSUS_MAX_ENTRIES];
+        while best.is_some() {
+            let Some(next) = (0..job_count)
+                .filter(|&i| !probed[i])
+                .max_by_key(|&i| (jobs[i].1, jobs[i].2))
+            else {
+                break;
+            };
+            probed[next] = true;
+            let (job, resident_pages, process_id) = jobs[next];
+            if job_killable(job) {
+                self.cooldown_until_ms = now_ms.saturating_add(KILL_COOLDOWN_MS);
+                self.reported_no_victim = false;
+                self.recovery_floor_pages =
+                    census.free_pages.saturating_add(resident_pages / 2).max(1);
+                return Verdict::KillJob {
+                    job,
+                    process_id,
+                    resident_pages,
+                };
             }
         }
         match best {
@@ -425,5 +488,122 @@ mod tests {
         let len = format_line(&mut small, b"oom:", &[12345]);
         assert_eq!(len, 6);
         assert_eq!(&small[..len], b"oom: 1");
+    }
+
+    fn census_in_jobs(entries: &[(u64, u64, u64)]) -> RustosRootdMemoryBrokerArgs {
+        let mut reply = census(10, 64, 5, &[]);
+        reply.entry_count = entries.len() as u32;
+        for (slot, &(process_id, resident_pages, job)) in reply.entries.iter_mut().zip(entries) {
+            *slot = RootdMemoryCensusEntry { process_id, parent_process_id: 1, resident_pages, job };
+        }
+        reply
+    }
+
+    #[test]
+    fn the_largest_killable_job_dies_as_a_whole() {
+        let mut governor = MemoryGovernor::new();
+        let census = census_in_jobs(&[(10, 50, 7), (11, 40, 7), (12, 70, 8)]);
+        let verdict = governor.assess_with_jobs(1_000, &census, ROOTD, |_| false, |job| job == 7);
+        assert_eq!(
+            verdict,
+            Verdict::KillJob { job: 7, process_id: 11, resident_pages: 90 },
+            "job 7 holds 90 pages across two processes, more than job 8's single 70"
+        );
+    }
+
+    #[test]
+    fn jobs_are_probed_largest_first_and_probing_stops_at_the_first_yes() {
+        let mut governor = MemoryGovernor::new();
+        let census = census_in_jobs(&[(10, 30, 5), (11, 80, 6), (12, 50, 7)]);
+        let mut probed = std::vec::Vec::new();
+        let verdict = governor.assess_with_jobs(1_000, &census, ROOTD, |_| false, |job| {
+            probed.push(job);
+            job == 7
+        });
+        assert_eq!(probed, [6, 7], "job 5 is never asked after job 7 answers yes");
+        assert_eq!(verdict, Verdict::KillJob { job: 7, process_id: 12, resident_pages: 50 });
+    }
+
+    #[test]
+    fn with_no_killable_job_the_single_largest_process_is_the_victim() {
+        let mut governor = MemoryGovernor::new();
+        let census = census_in_jobs(&[(10, 50, 7), (11, 40, 7), (12, 70, 8)]);
+        let verdict = governor.assess_with_jobs(1_000, &census, ROOTD, |_| false, |_| false);
+        assert_eq!(verdict, Verdict::Kill { process_id: 12, resident_pages: 70 });
+    }
+
+    #[test]
+    fn a_protected_member_never_counts_toward_its_jobs_sum() {
+        let mut governor = MemoryGovernor::new();
+        let census = census_in_jobs(&[(10, 50, 7), (11, 40, 7), (12, 70, 8)]);
+        let verdict = governor.assess_with_jobs(1_000, &census, ROOTD, |pid| pid == 10, |job| job == 7);
+        assert_eq!(verdict, Verdict::KillJob { job: 7, process_id: 11, resident_pages: 40 });
+    }
+
+    #[test]
+    fn jobs_are_not_probed_without_pressure_or_during_a_cooldown() {
+        let mut governor = MemoryGovernor::new();
+        let mut quiet = census_in_jobs(&[(10, 50, 7)]);
+        quiet.free_pages = quiet.min_free_pages + 1;
+        let mut asked = false;
+        let verdict = governor.assess_with_jobs(1_000, &quiet, ROOTD, |_| false, |_| { asked = true; true });
+        assert_eq!((verdict, asked), (Verdict::Idle, false));
+
+        // New refusals since the quiet pass above, otherwise pressure is "resting".
+        let mut pressured = census_in_jobs(&[(10, 50, 7)]);
+        pressured.watermark_denials = 6;
+        assert!(matches!(
+            governor.assess_with_jobs(1_000, &pressured, ROOTD, |_| false, |_| true),
+            Verdict::KillJob { .. }
+        ));
+        let mut again = census_in_jobs(&[(10, 50, 7)]);
+        again.watermark_denials = 7;
+        asked = false;
+        let verdict = governor.assess_with_jobs(1_001, &again, ROOTD, |_| false, |_| { asked = true; true });
+        assert_eq!((verdict, asked), (Verdict::Cooldown, false));
+    }
+
+    #[test]
+    fn a_process_with_no_known_job_is_only_ever_a_single_process_victim() {
+        let mut governor = MemoryGovernor::new();
+        let census = census_in_jobs(&[(10, 50, 0)]);
+        let verdict = governor.assess_with_jobs(1_000, &census, ROOTD, |_| false, |_| true);
+        assert_eq!(verdict, Verdict::Kill { process_id: 10, resident_pages: 50 });
+    }
+
+    #[test]
+    fn a_whole_job_kill_is_authorized_only_after_every_protected_pid_is_proven_outside_it() {
+        // Source witness for the syscall-backed edge, which has no host fake.
+        let main = include_str!("main.rs");
+        let safe = main.split_once("fn job_kill_is_safe(").unwrap().1
+            .split_once("fn kill_job_by_id(").unwrap().0;
+        assert!(safe.contains("if job == rustos_user_abi::syscall::JOB_ID_ROOT"));
+        assert!(safe.contains(".all(|&pid| jobs::process_job_in(handle, pid) == Err(ESRCH))"));
+        // Inspection only: a probe handle must not carry kill authority.
+        assert!(safe.contains("rustos_user_abi::syscall::JOB_RIGHT_INSPECT,\n    ) else"));
+        assert!(!safe.contains("JOB_RIGHT_KILL"));
+        let kill = main.split_once("fn kill_job_by_id(").unwrap().1
+            .split_once("fn terminate_service_process(").unwrap().0;
+        assert!(kill.contains("JOB_RIGHT_INSPECT | rustos_user_abi::syscall::JOB_RIGHT_KILL"));
+        let supervise = main.split_once("fn supervise_memory_pressure(").unwrap().1
+            .split_once("fn job_kill_is_safe(").unwrap().0;
+        assert!(supervise.contains("|job| !protected_overflow && job_kill_is_safe(job, protected)"));
+    }
+
+    #[test]
+    fn a_job_kill_arms_recovery_reporting_like_a_process_kill() {
+        let mut governor = MemoryGovernor::new();
+        let census = census_in_jobs(&[(10, 50, 7), (11, 40, 7)]);
+        assert!(matches!(
+            governor.assess_with_jobs(1_000, &census, ROOTD, |_| false, |_| true),
+            Verdict::KillJob { .. }
+        ));
+        let mut after = census_in_jobs(&[]);
+        after.free_pages = 300;
+        after.watermark_denials = census.watermark_denials;
+        assert_eq!(
+            governor.assess_with_jobs(2_000, &after, ROOTD, |_| false, |_| true),
+            Verdict::Recovered { free_pages: 300 }
+        );
     }
 }

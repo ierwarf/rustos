@@ -7,10 +7,126 @@ use super::{
 use crate::memory::paging::UserRegion;
 use crate::user::linux as linux_abi;
 use kernel_object::api::{
-    handle::{FileHandleRights, HandleOwner, HandleRights},
+    handle::{FileHandleRights, HandleOwner, HandleRights, JobHandleRights},
     identity::{ObjectKind, ObjectOwner},
 };
 use x86_64::VirtAddr;
+
+#[test]
+fn job_rights_wire_bits_match_the_typed_kernel_rights() {
+    use rustos_user_abi::syscall::*;
+    for (wire, typed) in [
+        (JOB_RIGHT_INSPECT, JobHandleRights::INSPECT), (JOB_RIGHT_WAIT, JobHandleRights::WAIT),
+        (JOB_RIGHT_CREATE_JOB, JobHandleRights::CREATE_JOB), (JOB_RIGHT_CREATE_PROCESS, JobHandleRights::CREATE_PROCESS),
+        (JOB_RIGHT_SET_LIMITS, JobHandleRights::SET_LIMITS), (JOB_RIGHT_SET_POLICY, JobHandleRights::SET_POLICY),
+        (JOB_RIGHT_KILL, JobHandleRights::KILL), (JOB_RIGHT_SET_CRITICAL, JobHandleRights::SET_CRITICAL),
+        (JOB_RIGHT_DUPLICATE, JobHandleRights::DUPLICATE), (JOB_RIGHT_TRANSFER, JobHandleRights::TRANSFER),
+    ] { assert_eq!(wire, typed.bits()); }
+}
+
+#[test]
+fn a_raw_job_identity_never_recreates_descriptor_authority() {
+    let mut table = HandleTable::new();
+    let fd = table.install(KernelHandle::Job(crate::multitask::ROOT_JOB)).unwrap();
+    let entry = table.get_entry(fd).unwrap();
+    assert_eq!(entry.rights(), HandleRights::Job(JobHandleRights::empty()));
+    assert_eq!(entry.token().owner(), HandleOwner::Job);
+    assert_eq!(entry.token().identity().unwrap().kind(), ObjectKind::Job);
+    assert!(table.duplicate_for_transfer(fd).is_none());
+    assert_eq!(table.duplicate_min(fd, 0, false), None);
+}
+
+#[test]
+fn two_live_job_publications_keep_independent_reservations() {
+    // Publication windows overlap, but each table mutation is serialized by
+    // the process-state lock. Model both reverse commit and cancellation.
+    for cancel_first in [false, true] {
+        let mut table = HandleTable::new();
+        let (first, a) = table.reserve_slots(1).unwrap();
+        let (second, b) = table.reserve_slots(1).unwrap();
+        assert_ne!(a[0], b[0]);
+        assert_eq!(table.reserved.get(&a[0]), Some(&first), "a later reserve must not steal an invisible slot");
+        assert_eq!(table.reserved.get(&b[0]), Some(&second));
+        let job = crate::multitask::ROOT_JOB;
+        assert!(table.commit_reserved_job(second, b[0], job, JobHandleRights::INSPECT));
+        if cancel_first {
+            table.cancel_reservations(first, &a);
+            assert!(table.get_entry(a[0]).is_none());
+        } else {
+            assert!(table.commit_reserved_job(first, a[0], job, JobHandleRights::CREATE_PROCESS));
+            assert_eq!(table.get_entry(a[0]).unwrap().rights(), HandleRights::Job(JobHandleRights::CREATE_PROCESS));
+        }
+        assert_eq!(table.get_entry(b[0]).unwrap().rights(), HandleRights::Job(JobHandleRights::INSPECT));
+        assert!(table.reserved.is_empty(), "no unreachable reservation may remain");
+    }
+}
+
+#[test]
+fn a_job_descriptor_publishes_only_through_its_exact_live_reservation() {
+    let mut table = HandleTable::new();
+    let job = crate::multitask::ROOT_JOB;
+    let (old, slots) = table.reserve_slots(1).unwrap();
+    let fd = slots[0];
+    assert!(table.get_entry(fd).is_none());
+    table.cancel_reservations(old, &slots);
+    let (current, reused) = table.reserve_slots(1).unwrap();
+    assert_eq!(reused, slots);
+    assert_ne!(current, old);
+    table.cancel_reservations(old, &slots);
+    assert!(!table.commit_reserved_job(old, fd, job, JobHandleRights::ALL));
+    assert!(!table.commit_reserved_job(current, fd, crate::multitask::JobId::from_raw(0), JobHandleRights::ALL));
+    assert!(table.get_entry(fd).is_none());
+    assert!(table.commit_reserved_job(current, fd, job, JobHandleRights::INSPECT));
+    assert!(!table.commit_reserved_job(current, fd, job, JobHandleRights::ALL));
+    assert_eq!(table.get_entry(fd).unwrap().rights(), HandleRights::Job(JobHandleRights::INSPECT));
+}
+
+#[test]
+fn explicit_job_duplicates_require_duplicate_and_preserve_attenuation() {
+    let mut table = HandleTable::new();
+    let handle = KernelHandle::Job(crate::multitask::ROOT_JOB);
+    let inspect = HandleRights::Job(JobHandleRights::INSPECT);
+    let fd = table.install_with_open_flags_and_rights(handle.clone(), 0, inspect).unwrap();
+    let target = table.install(handle.clone()).unwrap();
+    assert_eq!(table.duplicate_min(fd, 0, false), None);
+    assert!(table.duplicate_exact_with_replaced(fd, target, false).is_none());
+    assert_eq!(table.get_entry(target).unwrap().rights(), HandleRights::Job(JobHandleRights::empty()));
+    // A no-op dup2 does not create another capability.
+    assert_eq!(table.duplicate_exact(fd, fd, false), Some(fd));
+    let rights = HandleRights::Job(JobHandleRights::INSPECT.union(JobHandleRights::DUPLICATE));
+    let source = table.install_with_open_flags_and_rights(handle, 0, rights).unwrap();
+    let copy = table.duplicate_min(source, 0, true).unwrap();
+    assert_eq!(table.get_entry(copy).unwrap().rights(), rights);
+    assert_eq!(table.get_entry(copy).unwrap().fd_flags(), FD_CLOEXEC);
+    assert_eq!(table.duplicate_exact(source, target, false), Some(target));
+    assert_eq!(table.get_entry(target).unwrap().rights(), rights);
+    assert!(table.duplicate_for_transfer(source).is_none());
+}
+
+#[test]
+fn job_transfer_and_fork_preserve_exact_rights_and_generation() {
+    let mut source = HandleTable::new();
+    let rights = HandleRights::Job(JobHandleRights::CREATE_PROCESS.union(JobHandleRights::TRANSFER));
+    let job = crate::multitask::JobId::from_raw((7_u64 << 32) | 9);
+    let fd = source.install_with_open_flags_and_rights(KernelHandle::Job(job), 0, rights).unwrap();
+    let token = source.get_entry(fd).unwrap().token();
+    assert_eq!(token.object_id(), job.to_raw());
+    let identity = token.identity().unwrap();
+    assert_eq!((identity.slot(), identity.generation()), (8, 9));
+    let transferred = source.duplicate_for_transfer(fd).unwrap();
+    let mut destination = HandleTable::new();
+    let received = destination.install_transferred(transferred).unwrap();
+    assert_eq!(destination.get_entry(received).unwrap().rights(), rights);
+    assert_eq!(destination.get_entry(received).unwrap().token(), token);
+    assert!(matches!(destination.get(received), Some(KernelHandle::Job(id)) if *id == job));
+    // Fork inherits the existing table, not an explicit DUPLICATE request.
+    let inherited = source.clone();
+    assert_eq!(inherited.get_entry(fd).unwrap().rights(), rights);
+    assert_eq!(inherited.get_entry(fd).unwrap().token(), token);
+    let raw = destination.close(received).unwrap();
+    let rewrapped = destination.install(raw).unwrap();
+    assert_eq!(destination.get_entry(rewrapped).unwrap().rights(), HandleRights::Job(JobHandleRights::empty()));
+}
 
 #[test]
 fn install_entry_min_keeps_existing_dynamic_fds() {

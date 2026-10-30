@@ -11,9 +11,13 @@ use std::sync::Mutex;
 static TEST_GUARD: Mutex<()> = Mutex::new(());
 
 fn guard() -> std::sync::MutexGuard<'static, ()> {
-    TEST_GUARD
+    let guard = TEST_GUARD
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Fake handles in this suite name the first process chunk. Standalone
+    // witnesses must not depend on another test having grown its side tables.
+    assert!(ensure_slot_storage(crate::multitask::slot_dir::SLOT_CHUNK - 1));
+    guard
 }
 
 fn identity(generation: u32, mm_generation: u32) -> ProcessIdentity {

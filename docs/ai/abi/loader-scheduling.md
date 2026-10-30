@@ -4,6 +4,59 @@
 
 ## Process Loader Surface (`loaderd` + `procd`)
 
+Application placement uses the separate 16-byte `LoaderJobRealmRequest` v1
+(`LOADER_OP_CONFIGURE_JOB_REALM`, 5), defined in
+`libs/rustos-user-abi/src/syscall/loader_job_realm.rs`. It requires an exact
+kernel-stamped sender, the live rootd owner and exactly one transferred typed
+Job descriptor. Rootd retains the realm outside all service subtrees and lends
+only inspect/create-child/create-process/set-limits/kill/duplicate/transfer.
+Loaderd retains an exact-right duplicate; retries of the same realm are
+idempotent and a different live realm is refused. Existing spawn v3 and process
+prepare v5 wire layouts are unchanged; an older loader refuses the new envelope
+rather than silently inheriting a service job.
+
+`services/rootd/src/loader_realm.rs` records realm custody before transfer,
+keeps an independent descriptor before lending lease storage to its worker,
+and runs configuration under the same cooperative supervisor as loader spawns.
+This keeps rootd available for an earlier queued spawn's VFSD authorization.
+After the worker joins, configuration rechecks the loader incarnation and lease.
+`services/rootd/src/job_lease.rs` drains the application realm before retiring
+the loader's service job. Partial/denied retirement retains custody.
+
+Every spawn from the live SESSIOND owner (`runtimed`) receives a new child in
+that realm, with limits of 8 processes, 64 threads and 524288 resident data
+pages (2 GiB), before prepare. A runtime-supplied placement descriptor is
+refused. An unconfigured replacement returns `EAGAIN`, not a permanent launch
+denial. `services/loaderd/src/application_jobs.rs` retains child authority
+before fallible limit-setting, verifies the committed PID's exact JobId, and
+retires failed prepares/commits/replies as a whole job. Application replies do
+not enter fused receive until terminal-reply cleanup is settled. Collection
+is demand-driven at the next loader request; it retains partial/denied kills,
+retires descendants after the leader is reaped, and closes exactly once when
+empty/stale. Rootd's ancestor authority covers loader failure. The requester
+PID and record-before-activation barrier remain runtimed-owned; no job authority
+is passed to the application. `RUSTOS_LOADERD_LIMIT_PROBE=1` selects a 32768-page
+(128 MiB) test ceiling only for `/apps/oomhog/oomhog.elf`, without lowering
+UI/service budgets or adding a default boot validation thread/probe.
+A sealed live job-governor OOM proof and individual smoke passed; the 40-boot
+cohort was 38/40 (exit 1, no matched control/rate claim). Strict app-limit refusal/drain now passed in a sealed SMP boot; the opt-in
+cohort was 59/60 (exit 1: ipcbench end omitted once), without matched controls.
+
+The opt-in application-limit proof additionally enables
+`RUSTOS_ROOTD_APP_LIMIT_PROBE=1`. It reuses the existing rootd census and job
+ABI v4 thread/page fields; it adds no syscall or default validation thread.
+`services/rootd/src/application_limit_probe.rs` requires exact quota/accounting,
+only the main thread left and physical headroom, rechecks service protection,
+then retains custody until objects/pages drain. The host
+`--oom-hog-job-limit` mode in `tools/xtask/src/kvm/application_limit.rs` requires
+four distinct complete checksum-framed vector-14 worker faults and exact
+placement/accounting/drain, and rejects physical OOM substitution. SIGSEGV is
+the worker fault class, not the final process status after rootd cleanup.
+The sealed strict SMP proof and 59/60 opt-in cohort observed this behavior;
+the failed attempt remains a failure, not a discarded sample. Bounded
+protocol/native witnesses do not prove complete C/MM/x86 execution or
+production relaxed-atomic ordering. Normal-image restoration/smoke is pending.
+
 - Runtime launches route through `loaderd` (`IPC_SERVICE_LOADERD`), not direct `SYS_RUSTOS_SPAWN_EXEC`.
 - `SYS_RUSTOS_PROC_*_BROKER` calls fail with `EACCES` unless caller owns `PROCESS_LOADER`.
 - `SYS_RUSTOS_PROC_PREPARE_BROKER` consumes loaderd's exact
@@ -40,7 +93,7 @@
   corruption; desired terminal stop is not corruption. Concurrent task-affinity
   replacement shares the Identity51 cohort leaf and refuses before masks/epoch,
   returning the existing MissingTask error; there is no new wire/errno enum.
-- `SYS_RUSTOS_SPAWN_EXEC` restricted to `rootd` spawning the fixed bootstrap allowlist (`syscalld`, `vfsd`, `loaderd`, `procd`, `initd`). Fails closed for `initd`, generic apps, broad service restarts. rootd may use direct spawn only during fixed bootstrap + `loaderd` recovery; post-bootstrap restarts of other leases must call loaderd.
+- `SYS_RUSTOS_SPAWN_EXEC` is restricted to `rootd` spawning the fixed bootstrap allowlist (`syscalld`, `pagerd`, `vfsd`, `loaderd`, `procd`). It takes one pointer to the 40-byte `RustosBootstrapSpawnArgs` ABI v1 (exact version, zero reserved, only LOGICAL_ADMIN flag): path, console session, weight and a required caller-local Job descriptor with CREATE_PROCESS. Fd zero is valid; there is no missing-job/root fallback. The old ignored-argv/env six-register form is retired. The exact JobId/generation is reserved before image construction and revalidated at publication; only the executive can grant root Job authority. Rootd retains the supervisor descriptor and verifies returned membership before `rootd: direct job placement ok`. Fails closed for `initd`, generic apps, broad service restarts. rootd may use direct spawn only during fixed bootstrap + `loaderd` recovery; post-bootstrap restarts of other leases must call loaderd.
 - Linux `execve` → `procd` (target auth) → `loaderd` (image materialization)
   → `vfsd` (namespace resolution and immutable executable snapshot). Kernel
   process state carries no cwd copy. Procd forwards the raw path plus
@@ -64,7 +117,7 @@
 
 ### Process Broker Session
 
-Start: `SYS_RUSTOS_PROC_PREPARE_BROKER` with `PROC_BROKER_ABI_VERSION` (v4), explicit format (`PROC_BROKER_FORMAT_ELF64` or `PROC_BROKER_FORMAT_PE64`), and a loader-selected `stack_top`. The top must be page-aligned and lie in the final GiB of the process window; the 1-MiB reservation retains its unmapped bottom guard page. Placement is immutable for that prepare handle, including exec replacement. Linux allocation authority ends below the actual guard (`LinuxProcessState::mapping_limit`); bootstrap fixed/nonfixed mmap and brk cannot populate it. MM broker `QUERY_LAYOUT.user_range_end` advertises this guarded allocation ceiling to syscalld, not the raw process-window end. Fork inherits the ceiling; exec replaces it. Successful exec publishes `LIFECYCLE_EVENT_EXEC` to syscalld before the blocked exec caller resumes. Syscalld drains it before the next request and drops only MM policy state, retaining credentials/umask, so a PID cache cannot reuse the old image's guard or brk layout. Lifecycle queue overflow discards the uncertain policy baseline as before. Ring0 validates placement and mapping collisions; loaderd owns normal-launch randomization policy. Only pre-loaderd bootstrap images draw their placements directly from boot-random. Returned `prepare_handle` is owned by the loader process; supply to `SYS_RUSTOS_PROC_COMMIT_BROKER` or `_ABORT_BROKER`.
+Start: `SYS_RUSTOS_PROC_PREPARE_BROKER` with `PROC_BROKER_ABI_VERSION` (v5), explicit format (`PROC_BROKER_FORMAT_ELF64` or `PROC_BROKER_FORMAT_PE64`), and a loader-selected `stack_top`. The top must be page-aligned and lie in the final GiB of the process window; the 1-MiB reservation retains its unmapped bottom guard page. Placement is immutable for that prepare handle, including exec replacement. Linux allocation authority ends below the actual guard (`LinuxProcessState::mapping_limit`); bootstrap fixed/nonfixed mmap and brk cannot populate it. MM broker `QUERY_LAYOUT.user_range_end` advertises this guarded allocation ceiling to syscalld, not the raw process-window end. Fork inherits the ceiling; exec replaces it. Successful exec publishes `LIFECYCLE_EVENT_EXEC` to syscalld before the blocked exec caller resumes. Syscalld drains it before the next request and drops only MM policy state, retaining credentials/umask, so a PID cache cannot reuse the old image's guard or brk layout. Lifecycle queue overflow discards the uncertain policy baseline as before. Ring0 validates placement and mapping collisions; loaderd owns normal-launch randomization policy. Only pre-loaderd bootstrap images draw their placements directly from boot-random. For job placement, `PROC_BROKER_PREPARE_FLAG_JOB_HANDLE` makes the new `job_handle` field a loader-local typed Job descriptor requiring `CREATE_PROCESS` (fd zero is valid). Loaderd receives it alongside kernel-stamped sender PID/TID, never as a guessed fd in request bytes. The kernel captures its full generation, rejecting a stale or killing job. Without this flag `job_handle` must be zero, and commit inherits the authenticated requester's job rather than loaderd's. `EXEC_TICKET` and job placement are mutually exclusive: exec and fork retain process membership. A received descriptor is closed after handling; process reservation/publication independently revalidate the captured job. Rootd's loader-backed lease retains the supervisor descriptor, transfers only an attenuated CREATE_PROCESS|TRANSFER duplicate, and verifies returned process membership before emitting `rootd: loader job placement ok`. Failed/lost attempts and exiting leases use bounded job retirement; supervisor authority is closed only once the attempt is empty. Boot-direct services use the separate versioned bootstrap block above; both paths share typed CREATE_PROCESS admission and the same generation-preserving reservation. Returned `prepare_handle` is owned by the loader process; supply to `SYS_RUSTOS_PROC_COMMIT_BROKER` or `_ABORT_BROKER`.
 
 Prepare state is owner-bound and bounded. `COMMIT_BROKER` consumes the prepare
 handle before its later launch validation, so both successful and rejected

@@ -15,16 +15,41 @@
 //!   `kernel-resource-lifecycle`.
 use alloc::boxed::Box;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use kernel_object::api::identity::{ObjectIdentity, ObjectKind, ObjectOwner};
 use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
 
 use super::process_state_lock::ProcessStateLock;
+use super::slot_dir::{ChunkTable, SLOT_CEILING};
 use crate::memory::paging::ProcessAddressSpace;
 use crate::user::process_state::UserProcessState;
 
-pub(super) const MAX_PROCESS_OBJECTS: usize = 32;
+/// Process slots the system admits until policy says otherwise. This is the
+/// boot default of the root job's `processes.max`, not a structural limit: the
+/// slot storage is chunked and grows on demand up to `slot_dir::SLOT_CEILING`.
+pub const DEFAULT_PROCESS_LIMIT: usize = 32;
+static PROCESS_LIMIT: AtomicUsize = AtomicUsize::new(DEFAULT_PROCESS_LIMIT);
+/// Deferred reap handles held before the reaper falls back to a full scan.
+const REAP_QUEUE_CAPACITY: usize = 64;
+/// Processes reclaimed per table-lock hold by the reaper.
+const REAP_BATCH: usize = 32;
+/// Slots examined per table-lock hold during a full reap scan.
+const REAP_SCAN_STRIDE: usize = 256;
+
+/// The admitted number of process slots (the root job's `processes.max`).
+pub fn process_limit() -> usize {
+    PROCESS_LIMIT.load(Ordering::Relaxed)
+}
+
+/// Sets the admitted number of process slots, clamped to what the slot storage
+/// can hold. Lowering it never evicts a live process: it only stops new slots
+/// beyond the limit from being handed out. Returns the value now in force.
+pub fn set_process_limit(limit: usize) -> usize {
+    let limit = limit.clamp(1, SLOT_CEILING);
+    PROCESS_LIMIT.store(limit, Ordering::Relaxed);
+    limit
+}
 pub const MAX_THREADS_PER_PROCESS: usize = 32;
 type ProcessTableLock = TrackedSpinLock<ProcessTable, { LockClass::ProcessTable as u8 }>;
 
@@ -228,9 +253,9 @@ impl ProcessSlot {
 }
 
 struct ProcessTable {
-    slots: [ProcessSlot; MAX_PROCESS_OBJECTS],
+    slots: ChunkTable<ProcessSlot>,
     jobs: [jobs::JobSlot; jobs::JOB_SLOTS],
-    reap_queue: [Option<ProcessHandle>; MAX_PROCESS_OBJECTS],
+    reap_queue: [Option<ProcessHandle>; REAP_QUEUE_CAPACITY],
     reap_len: usize,
     reap_scan_pending: bool,
 }
@@ -238,13 +263,13 @@ struct ProcessTable {
 impl ProcessTable {
     const fn new() -> Self {
         Self {
-            slots: [const { ProcessSlot::empty() }; MAX_PROCESS_OBJECTS],
+            slots: ChunkTable::new(),
             jobs: {
                 let mut jobs = [const { jobs::JobSlot::empty() }; jobs::JOB_SLOTS];
                 jobs[0] = jobs::JobSlot::root();
                 jobs
             },
-            reap_queue: [None; MAX_PROCESS_OBJECTS],
+            reap_queue: [None; REAP_QUEUE_CAPACITY],
             reap_len: 0,
             reap_scan_pending: false,
         }
@@ -279,7 +304,7 @@ mod identity;
 pub mod jobs;
 mod mm_execution;
 pub(in crate::multitask) mod pin_owner;
-pub(super) use identity::published_live_process_identity;
+pub(super) use identity::{published_live_process_identity, published_process_job};
 #[cfg(test)]
 use identity::{clear_publication_for_test, process_state_is_visible};
 pub use identity::{
@@ -364,6 +389,7 @@ fn publish_slot_visibility(index: usize, slot: &ProcessSlot) {
         .as_deref()
         .map(|object| identity::SlotPublication {
             process_id: object.process_id,
+            job: object.job,
             mm_generation: object.mm_generation,
             live: !object.exiting && !object.exec_in_progress && !object.exec_state_staged,
             state: object.state_ptr().as_ptr(),
@@ -419,13 +445,22 @@ pub fn attach_task(handle: ProcessHandle) -> Option<()> {
     if !pin_owner::is_open(handle) {
         return None;
     }
+    let job_index = {
+        let object = table.lookup_object_mut(handle)?;
+        if object.exiting || object.exec_in_progress {
+            return None;
+        }
+        if object.thread_count >= MAX_THREADS_PER_PROCESS {
+            return None;
+        }
+        object.job.index()
+    };
+    // The per-process ceiling above is structural; this is the job's threads
+    // limit, checked against every ancestor under the same lock as the count.
+    if !table.admits_thread(job_index) {
+        return None;
+    }
     let object = table.lookup_object_mut(handle)?;
-    if object.exiting || object.exec_in_progress {
-        return None;
-    }
-    if object.thread_count >= MAX_THREADS_PER_PROCESS {
-        return None;
-    }
     let ref_count = object.ref_count.checked_add(1)?;
     let thread_count = object.thread_count.checked_add(1)?;
     object.ref_count = ref_count;
@@ -697,6 +732,9 @@ pub fn stage_exec_state_checked(
             );
             object.mm_execution = new_mm.pin_for_publication();
             object.mm_generation = reservation.next_mm_generation;
+            // The new image's root is quiescent until the exec is installed, so
+            // it can be bound and its already-mapped pages charged to the job.
+            let _ = kernel_mm::api::phys::bind_root_charge(new_root, object.job.index() as usize);
             object.exec_state_staged = true;
             let index = reservation.handle.index();
             let slot = &table.slots[index];
@@ -1200,46 +1238,36 @@ pub fn reap_exited_processes() -> usize {
     // this scan or the next one, never gets erased after the scan.
     let pin_reap_pending = pin_owner::take_reap_notification();
     let mut reaped = 0usize;
-    let mut reclaimed: [Option<Box<ProcessObject>>; MAX_PROCESS_OBJECTS] =
-        [const { None }; MAX_PROCESS_OBJECTS];
-    let mut reclaimed_len = 0usize;
-    let mut markers: [Option<(ProcessHandle, u32, u32)>; MAX_PROCESS_OBJECTS] =
-        [const { None }; MAX_PROCESS_OBJECTS];
-
-    {
+    let (queue, queue_len, scan_all) = {
         let mut table = PROCESS_TABLE.lock();
-        let queue = core::mem::replace(&mut table.reap_queue, [None; MAX_PROCESS_OBJECTS]);
+        let queue = core::mem::replace(&mut table.reap_queue, [None; REAP_QUEUE_CAPACITY]);
         let queue_len = core::mem::replace(&mut table.reap_len, 0);
         let scan_all = core::mem::replace(&mut table.reap_scan_pending, false) || pin_reap_pending;
-        for handle in queue.into_iter().take(queue_len).flatten() {
-            let index = handle.index();
-            let Some(slot) = table.lookup_slot_mut(handle) else {
-                continue;
-            };
-            let identity = slot.object.as_deref().map(|object| {
-                (
-                    handle,
-                    object.mm_generation,
-                    object.lifecycle_transaction_id,
-                )
-            });
-            let Some(object) = reclaim_slot(index, slot) else {
-                continue;
-            };
-            markers[reclaimed_len] = identity;
-            reclaimed[reclaimed_len] = Some(object);
-            reclaimed_len += 1;
-            reaped += 1;
-        }
-        if scan_all {
-            for (index, slot) in table.slots.iter_mut().enumerate() {
-                let handle = ProcessHandle::new(index, slot.generation);
+        (queue, queue_len, scan_all)
+    };
+    let mut queue_next = 0usize;
+    let mut scan_next = 0usize;
+    loop {
+        // Each pass reclaims a bounded batch, so the table lock is never held
+        // across an unbounded number of slots and the stack never scales with
+        // the number of process slots.
+        let mut reclaimed: [Option<Box<ProcessObject>>; REAP_BATCH] =
+            [const { None }; REAP_BATCH];
+        let mut markers: [Option<(ProcessHandle, u32, u32)>; REAP_BATCH] =
+            [const { None }; REAP_BATCH];
+        let mut reclaimed_len = 0usize;
+        let finished = {
+            let mut table = PROCESS_TABLE.lock();
+            while queue_next < queue_len && reclaimed_len < REAP_BATCH {
+                let handle = queue[queue_next];
+                queue_next += 1;
+                let Some(handle) = handle else { continue };
+                let index = handle.index();
+                let Some(slot) = table.lookup_slot_mut(handle) else {
+                    continue;
+                };
                 let identity = slot.object.as_deref().map(|object| {
-                    (
-                        handle,
-                        object.mm_generation,
-                        object.lifecycle_transaction_id,
-                    )
+                    (handle, object.mm_generation, object.lifecycle_transaction_id)
                 });
                 let Some(object) = reclaim_slot(index, slot) else {
                     continue;
@@ -1247,22 +1275,79 @@ pub fn reap_exited_processes() -> usize {
                 markers[reclaimed_len] = identity;
                 reclaimed[reclaimed_len] = Some(object);
                 reclaimed_len += 1;
-                reaped += 1;
             }
+            let mut scanned = 0usize;
+            while scan_all
+                && queue_next >= queue_len
+                && scan_next < table.slots.len()
+                && reclaimed_len < REAP_BATCH
+                && scanned < REAP_SCAN_STRIDE
+            {
+                let index = scan_next;
+                scan_next += 1;
+                scanned += 1;
+                let slot = &mut table.slots[index];
+                let handle = ProcessHandle::new(index, slot.generation);
+                let identity = slot.object.as_deref().map(|object| {
+                    (handle, object.mm_generation, object.lifecycle_transaction_id)
+                });
+                let Some(object) = reclaim_slot(index, slot) else {
+                    continue;
+                };
+                markers[reclaimed_len] = identity;
+                reclaimed[reclaimed_len] = Some(object);
+                reclaimed_len += 1;
+            }
+            queue_next >= queue_len && (!scan_all || scan_next >= table.slots.len())
+        };
+        reaped += reclaimed_len;
+        for (handle, mm_generation, transaction_id) in
+            markers.into_iter().take(reclaimed_len).flatten()
+        {
+            record_lifecycle_marker(
+                "lifecycle-reap-complete",
+                handle,
+                mm_generation,
+                transaction_id,
+            );
+        }
+        // Objects are destroyed after the table lock is released.
+        drop(reclaimed);
+        if finished {
+            break;
         }
     }
-    for (handle, mm_generation, transaction_id) in markers.into_iter().take(reclaimed_len).flatten()
-    {
-        record_lifecycle_marker(
-            "lifecycle-reap-complete",
-            handle,
-            mm_generation,
-            transaction_id,
-        );
-    }
-    drop(reclaimed);
     kernel_mm::api::address_space::drain_retired_address_spaces(16);
     reaped
+}
+
+/// Adds one chunk of process slots starting at slot index `expected_len`.
+///
+/// Runs in normal context with no lock held: every per-slot side array gets its
+/// chunk published first, then the table chunk is built outside the lock and
+/// installed under it without allocating. A slot therefore never becomes
+/// allocatable before the storage that its index addresses exists. Two racing
+/// growers both succeed; the loser's table chunk is dropped unused.
+fn grow_slots(expected_len: usize) -> bool {
+    if expected_len >= SLOT_CEILING {
+        return false;
+    }
+    if !(identity::ensure_slot_storage(expected_len)
+        && pin_owner::ensure_slot_storage(expected_len)
+        && super::process_placement::ensure_slot_storage(expected_len)
+        && super::pager_vma::ensure_slot_storage(expected_len))
+    {
+        return false;
+    }
+    let Some(chunk) = ChunkTable::<ProcessSlot>::build(ProcessSlot::empty) else {
+        return false;
+    };
+    let mut table = PROCESS_TABLE.lock();
+    if table.slots.len() != expected_len {
+        // Someone else grew the table past `expected_len` meanwhile.
+        return true;
+    }
+    table.slots.push_chunk(chunk)
 }
 
 #[cfg(test)]
@@ -1272,10 +1357,14 @@ fn reset_for_tests() {
         let mut table = PROCESS_TABLE.lock();
         pin_owner::reset_for_tests();
         let retired = core::mem::replace(&mut *table, ProcessTable::new());
+        jobs::reset_policy_for_tests();
         // The unlocked visibility words mirror the table, so a reset that left
         // them behind would let one test read another's slot as live.
-        for (index, slot) in table.slots.iter().enumerate() {
-            publish_slot_visibility(index, slot);
+        // The side arrays outlive the table, so republish every slot the old
+        // table had grown as empty; the new table starts with none.
+        let empty = ProcessSlot::empty();
+        for index in 0..retired.slots.len() {
+            publish_slot_visibility(index, &empty);
         }
         retired
     };
@@ -1321,8 +1410,10 @@ pub(crate) mod tests {
         note_job_control, note_process_exit_status, own_process_ref, process_state_is_visible,
         reap_exited_processes, retain_process, thread_count_by_pid, try_with_process_state_mut,
         wait_for_child, ExecReservation, LockClass, ProcessHandle, ProcessObject, ProcessTable,
-        WaitResult,
+        WaitResult, live_process_identity, pin_owner, process_limit, set_process_limit,
+        DEFAULT_PROCESS_LIMIT,
     };
+    use crate::multitask::slot_dir::{SLOT_CEILING, SLOT_CHUNK};
     use crate::memory::paging::ProcessAddressSpace;
     use crate::user::process_state::UserProcessState;
 
@@ -1588,6 +1679,122 @@ pub(crate) mod tests {
         assert_eq!(reap_exited_processes(), 0);
         drop(retained);
         assert_eq!(reap_exited_processes(), 1);
+    }
+
+    /// Restores the boot default so a growth test cannot leak its limit.
+    struct ProcessLimitGuard;
+    impl ProcessLimitGuard {
+        fn raise(limit: usize) -> Self {
+            assert_eq!(set_process_limit(limit), limit);
+            Self
+        }
+    }
+    impl Drop for ProcessLimitGuard {
+        fn drop(&mut self) {
+            set_process_limit(DEFAULT_PROCESS_LIMIT);
+        }
+    }
+
+    #[test]
+    fn the_default_limit_still_admits_exactly_the_boot_default_of_processes() {
+        let _isolation = isolate_process_table();
+        for pid in 0..DEFAULT_PROCESS_LIMIT as u64 {
+            create_process(10_000 + pid, new_state()).expect("a slot below the limit");
+        }
+        assert!(
+            create_process(99_999, new_state()).is_none(),
+            "the 33rd process is refused at the default limit"
+        );
+    }
+
+    #[test]
+    fn a_raised_limit_grows_the_slot_table_and_every_side_array_follows() {
+        let _isolation = isolate_process_table();
+        let _limit = ProcessLimitGuard::raise(100);
+        let mut handles = std::vec::Vec::new();
+        for pid in 0..100_u64 {
+            let handle = create_process(20_000 + pid, new_state())
+                .unwrap_or_else(|| panic!("process {pid} below the raised limit"));
+            handles.push(handle);
+        }
+        assert!(create_process(29_999, new_state()).is_none(), "the limit is exact, not chunk-rounded");
+        let highest = handles.iter().map(|handle| handle.index()).max().unwrap();
+        assert!(highest >= 2 * SLOT_CHUNK, "slots past the second chunk are in use");
+        for (offset, &handle) in handles.iter().enumerate() {
+            // Identity publication, pins, placement and the VMA tables all
+            // address the same slot index, so each must exist for every slot.
+            let identity = live_process_identity(handle).expect("published identity");
+            assert_eq!(identity.process_id(), 20_000 + offset as u64);
+            assert!(pin_owner::pin(handle).is_some(), "pin cell for slot {}", handle.index());
+            assert!(
+                crate::multitask::process_placement::cell_exists_for_tests(handle),
+                "placement cell for slot {}",
+                handle.index()
+            );
+            assert!(
+                crate::multitask::pager_vma::slot_storage_exists_for_tests(handle),
+                "pager VMA storage for slot {}",
+                handle.index()
+            );
+        }
+    }
+
+    #[test]
+    fn lowering_the_limit_never_evicts_a_live_process_and_admission_resumes_only_below_it() {
+        let _isolation = isolate_process_table();
+        let _limit = ProcessLimitGuard::raise(70);
+        let handles: std::vec::Vec<_> = (0..70_u64)
+            .map(|pid| create_process(30_000 + pid, new_state()).expect("below 70"))
+            .collect();
+        set_process_limit(40);
+        for &handle in &handles {
+            assert!(live_process_identity(handle).is_some(), "lowering must not evict");
+        }
+        assert!(
+            create_process(39_999, new_state()).is_none(),
+            "70 live processes exceed the lowered limit of 40, so nothing is admitted"
+        );
+        // The limit counts processes: admission resumes only once usage drops
+        // below it, not merely when some low-numbered slot frees up.
+        let mut reaped = 0;
+        for &handle in handles.iter().take(30) {
+            detach_task(handle).expect("detach");
+            reaped += reap_exited_processes();
+        }
+        assert_eq!(reaped, 30);
+        assert!(create_process(39_998, new_state()).is_none(), "40 live processes still fill a limit of 40");
+        let next = handles[30];
+        detach_task(next).expect("detach");
+        assert_eq!(reap_exited_processes(), 1);
+        assert!(create_process(39_997, new_state()).is_some(), "39 live processes leave room for one");
+    }
+
+    #[test]
+    fn the_limit_is_clamped_to_the_storage_ceiling_and_never_zero() {
+        let _isolation = isolate_process_table();
+        let _limit = ProcessLimitGuard::raise(DEFAULT_PROCESS_LIMIT);
+        assert_eq!(set_process_limit(usize::MAX), SLOT_CEILING);
+        assert_eq!(set_process_limit(0), 1);
+        assert_eq!(process_limit(), 1);
+    }
+
+    #[test]
+    fn one_reap_pass_reclaims_more_processes_than_a_batch_and_than_the_queue_holds() {
+        let _isolation = isolate_process_table();
+        let _limit = ProcessLimitGuard::raise(150);
+        let handles: std::vec::Vec<_> = (0..150_u64)
+            .map(|pid| create_process(40_000 + pid, new_state()).expect("below 150"))
+            .collect();
+        for &handle in &handles {
+            detach_task(handle).expect("detach");
+        }
+        // 150 exceeds both REAP_BATCH and REAP_QUEUE_CAPACITY, so this pass
+        // must fall back to the scan and still finish in one call.
+        assert_eq!(reap_exited_processes(), 150);
+        for &handle in &handles {
+            assert!(live_process_identity(handle).is_none());
+        }
+        assert_eq!(reap_exited_processes(), 0);
     }
 
     #[test]

@@ -7,8 +7,13 @@
 ## English
 
 **Status: decision record and roadmap. Step 1 (job object, root job, kill by
-job) is implemented as described in [Job Model](job-model.md#phase-1-as-built);
-steps 2 to 8 are not.** It states
+job) and the storage half of step 2 (the chunked process-table directory) are
+implemented as described in [Job Model](job-model.md#phase-1-as-built) and
+[Phase 2a as built](job-model.md#phase-2a-as-built); counted process and thread
+limits are implemented ([Phase 2b](job-model.md#phase-2b-counted-limits-as-built)),
+as is resident-page memory charging
+([2b-ii](job-model.md#phase-2b-ii-memory-limit-as-built)); kernel-memory
+accounting, `memory.high/min` and steps 3 to 8 are not.** It states
 what in the current ring3 structure must be replaced, the target shape, and the
 invariants that keep later work from being redone. The first and largest
 component, jobs and quotas, is specified in [Job Model](job-model.md).

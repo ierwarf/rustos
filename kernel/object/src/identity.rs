@@ -16,6 +16,7 @@ pub enum ObjectOwner {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ObjectKind {
+    Job,
     Process,
     Task,
     OpenDescription,

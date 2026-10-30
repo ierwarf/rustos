@@ -19,6 +19,7 @@
 # cites it as phase-closure evidence, which makes it part of the provenance
 # story even though no checker parses it.
 docs/ai/session-handoff.md
+docs/ai/session-handoff-log.md
 docs/ai/performance-hardening.md
 docs/ai/structural-ownership-design.md
 docs/ai/task-router.md

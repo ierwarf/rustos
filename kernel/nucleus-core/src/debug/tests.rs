@@ -98,6 +98,16 @@ fn acceptance_milestones_retry_the_contended_debug_sink() {
 }
 
 #[test]
+fn policy_acceptance_milestone_retains_required_sink_custody() {
+    let class = milestone_output_class("job-policy-current-cache-checked");
+    assert_eq!(class, MilestoneOutputClass::Required);
+    assert!(class.must_reach_sink(), "host acceptance requires this evidence");
+    assert!(class.output_attempts() > 1);
+    assert_eq!(milestone_output_class("job-policy-current-cache-checked-extra"),
+               MilestoneOutputClass::BestEffort, "do not widen the diagnostic class");
+}
+
+#[test]
 fn serialized_line_renderer_keeps_one_complete_logical_line() {
     let mut line = FixedDebugconLine::<64>::new();
     render_serialized_debugcon_line(

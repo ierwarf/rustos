@@ -52,6 +52,7 @@
 - Supervisor services draining independent brokers must use `SYS_RUSTOS_IPC_TRY_RECV`, not blocking `SYS_RUSTOS_IPC_RECV`. Their *idle* wait is `SYS_RUSTOS_IPC_RECV_WITH_SENDER_BOUNDED`, not a timer; see the IPC Wait Discipline section.
 - FD-table transfer goes through `kernel_ps::api::TransferredHandleEntry` + `HandleTable::{duplicate_for_transfer, install_transferred}`. Source class + rights must permit descriptor transfer; directory FDs are file capabilities and transferable for VFS migration.
 - Userspace handle-aware IPC: `SYS_RUSTOS_IPC_{CALL,RECV,REPLY}_WITH_HANDLES` with `Ipc*WithHandlesArgs`. Send handles = Linux fd arrays; received handles install into receiver fd table and return as `i32` fd arrays + `u16` count. `recv_fd_count_ptr` mandatory even when no handles returned. Counts bounded by `IPC_MAX_TRANSFER_HANDLES`.
+- Explicit authenticated descriptor receive uses `SYS_RUSTOS_IPC_RECV_WITH_HANDLES_AND_SENDER` (`0x5255_0058`, 80-byte versioned args) or `SYS_RUSTOS_IPC_REPLY_RECV_WITH_HANDLES_AND_SENDER` (`0x5255_0059`, 112-byte args with the legacy fused envelope as its prefix). Both return kernel-stamped sender PID/TID alongside descriptors. The 56-byte legacy handle-only and 88-byte legacy fused layouts are unchanged. All request/reply/sender/fd outputs copy out under one retained MM before exact descriptor publication; byte-only messages write a zero fd count without reserving slots.
 
 ## Register short-message ABI
 
@@ -375,8 +376,11 @@ no cell/epoch state to refine.
   reports the next request length. The receive half reuses the endpoint
   check-arm-recheck waiter protocol and retains the exact awakened caller's
   bounded synchronous scheduler custody. Handle-bearing reply/receive remains
-  on the explicit separate syscalls; the fused byte path may not drop, infer,
-  or partially install handles. The executable transaction is
+  on explicit syscalls; the byte-only fused path may not drop, infer,
+  or partially install handles. The explicit handle+sender fused extension
+  validates fd-array/count outputs before reply consumption and carries the
+  same exact deferred reply custody into the shared receive state machine.
+  It never falls back to a handle-unaware register receive. The executable transaction is
   `formal/ipc-reply-recv-transaction/IpcReplyRecvTransaction.tla`.
 - root-supervisor services that authorize subjects may use
   `SYS_RUSTOS_IPC_{TRY_RECV,RECV}_WITH_SENDER` to receive the caller PID/TID

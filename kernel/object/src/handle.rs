@@ -2,6 +2,8 @@ use crate::identity::{ObjectIdentity, ObjectKind, ObjectOwner};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HandleOwner {
+    /// Generational job tokens have a separate namespace from PS console ids.
+    Job,
     Io,
     Compat,
     Ps,
@@ -50,6 +52,7 @@ impl HandleToken {
             HandleOwner::Io => ObjectOwner::Io,
             HandleOwner::Compat => ObjectOwner::ServiceProxy,
             HandleOwner::Ps => ObjectOwner::Ps,
+            HandleOwner::Job => return None,
         };
         let Some(identity) =
             ObjectIdentity::new(object_owner, ObjectKind::OpenDescription, object_id, 1)
@@ -59,6 +62,24 @@ impl HandleToken {
         Some(Self {
             owner,
             object_id,
+            identity: Some(identity),
+        })
+    }
+
+    /// Encodes a complete job identity, including root slot zero. The identity
+    /// vocabulary reserves slot zero, so its slot is the job index plus one.
+    pub const fn from_job(index: u32, generation: u32) -> Option<Self> {
+        let Some(identity) = ObjectIdentity::new(
+            ObjectOwner::Ps,
+            ObjectKind::Job,
+            index as u64 + 1,
+            generation as u64,
+        ) else {
+            return None;
+        };
+        Some(Self {
+            owner: HandleOwner::Job,
+            object_id: ((index as u64) << 32) | generation as u64,
             identity: Some(identity),
         })
     }
@@ -185,6 +206,49 @@ impl SocketHandleRights {
     }
 }
 
+/// Authority over one job's subtree. Explicit duplication may only attenuate
+/// these bits; possession never grants authority over an ancestor or sibling.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct JobHandleRights(u32);
+
+impl JobHandleRights {
+    pub const INSPECT: Self = Self(1 << 0);
+    pub const WAIT: Self = Self(1 << 1);
+    pub const CREATE_JOB: Self = Self(1 << 2);
+    pub const CREATE_PROCESS: Self = Self(1 << 3);
+    pub const SET_LIMITS: Self = Self(1 << 4);
+    pub const SET_POLICY: Self = Self(1 << 5);
+    pub const KILL: Self = Self(1 << 6);
+    pub const SET_CRITICAL: Self = Self(1 << 7);
+    pub const DUPLICATE: Self = Self(1 << 8);
+    pub const TRANSFER: Self = Self(1 << 9);
+    pub const ALL: Self = Self((1 << 10) - 1);
+
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+
+    pub const fn from_bits(bits: u32) -> Option<Self> {
+        if bits & !Self::ALL.0 == 0 { Some(Self(bits)) } else { None }
+    }
+
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    pub const fn contains(self, right: Self) -> bool {
+        self.0 & right.0 == right.0
+    }
+
+    pub const fn is_subset_of(self, parent: Self) -> bool {
+        self.0 & !parent.0 == 0
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HandleRights {
     Console,
@@ -194,6 +258,7 @@ pub enum HandleRights {
     Epoll,
     Memfd(FileHandleRights),
     DisplaySurface(SharedRegionRights),
+    Job(JobHandleRights),
 }
 
 impl HandleRights {
@@ -207,6 +272,7 @@ impl HandleRights {
             }
             (Self::Device(parent), Self::Device(child)) => child.is_subset_of(parent),
             (Self::Socket(parent), Self::Socket(child)) => child.is_subset_of(parent),
+            (Self::Job(parent), Self::Job(child)) => child.is_subset_of(parent),
             (Self::DisplaySurface(parent), Self::DisplaySurface(child)) => {
                 child.is_subset_of(parent)
             }
@@ -221,6 +287,7 @@ impl HandleRights {
             Self::Socket(rights) => rights.contains(SocketHandleRights::TRANSFER),
             Self::Device(rights) => rights.contains(DeviceHandleRights::TRANSFER),
             Self::DisplaySurface(rights) => rights.contains(SharedRegionRights::TRANSFER),
+            Self::Job(rights) => rights.contains(JobHandleRights::TRANSFER),
             Self::Console | Self::Epoll => false,
         }
     }
@@ -268,7 +335,7 @@ impl HandleRights {
 
 #[cfg(test)]
 mod tests {
-    use super::{DeviceHandleRights, FileHandleRights, HandleOwner, HandleRights, HandleToken};
+    use super::{DeviceHandleRights, FileHandleRights, HandleOwner, HandleRights, HandleToken, JobHandleRights};
     use crate::identity::{ObjectKind, ObjectOwner};
 
     #[test]
@@ -283,6 +350,39 @@ mod tests {
         assert_eq!(token, HandleToken::new(HandleOwner::Ps, 17));
         assert!(HandleToken::new(HandleOwner::Ps, 17).identity().is_none());
         assert!(HandleToken::from_nonreusable_open_description(HandleOwner::Ps, 0).is_none());
+    }
+
+    #[test]
+    fn job_tokens_preserve_generation_and_cannot_alias_console_tokens() {
+        let root = HandleToken::from_job(0, 1).unwrap();
+        let identity = root.identity().unwrap();
+        assert_eq!(identity.kind(), ObjectKind::Job);
+        assert_eq!((identity.slot(), identity.generation()), (1, 1));
+        assert_eq!(root.owner(), HandleOwner::Job);
+        assert_ne!(root, HandleToken::new(HandleOwner::Ps, root.object_id()));
+        let recycled = HandleToken::from_job(0, 2).unwrap();
+        assert_ne!(root, recycled);
+        assert_eq!(recycled.identity().unwrap().generation(), 2);
+        assert_eq!(HandleToken::from_job(u32::MAX, u32::MAX).unwrap().object_id(), u64::MAX);
+        assert!(HandleToken::from_job(0, 0).is_none());
+        assert!(HandleToken::from_nonreusable_open_description(HandleOwner::Job, 1).is_none());
+    }
+
+    #[test]
+    fn job_rights_only_attenuate_and_transfer_requires_its_own_bit() {
+        let rights = JobHandleRights::INSPECT.union(JobHandleRights::DUPLICATE);
+        let parent = HandleRights::Job(rights);
+        assert!(parent.can_attenuate_to(HandleRights::Job(JobHandleRights::INSPECT)));
+        assert!(!parent.can_attenuate_to(HandleRights::Job(rights.union(JobHandleRights::KILL))));
+        assert!(!parent.can_attenuate_to(HandleRights::File(FileHandleRights::READ)));
+        assert!(!HandleRights::File(FileHandleRights::READ).can_attenuate_to(parent));
+        assert!(!parent.allows_transfer());
+        assert!(HandleRights::Job(rights.union(JobHandleRights::TRANSFER)).allows_transfer());
+        assert_eq!(JobHandleRights::from_bits(rights.bits()), Some(rights));
+        assert_eq!(JobHandleRights::from_bits(1 << 10), None);
+        assert_eq!(JobHandleRights::from_bits(u32::MAX), None);
+        assert_eq!(JobHandleRights::from_bits(0), Some(JobHandleRights::empty()));
+        assert!(JobHandleRights::ALL.contains(JobHandleRights::CREATE_PROCESS));
     }
 
     #[test]

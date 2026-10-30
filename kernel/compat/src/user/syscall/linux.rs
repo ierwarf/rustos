@@ -208,9 +208,7 @@ pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
         linux_abi::SYS_RUSTOS_SMP_QUALIFICATION_BIND => {
             syscall_linux_rustos_smp_qualification_bind(frame.rdi)
         }
-        linux_abi::SYS_RUSTOS_SPAWN_EXEC => syscall_linux_loader_spawn_exec(
-            frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8, frame.r9,
-        ),
+        linux_abi::SYS_RUSTOS_SPAWN_EXEC => syscall_linux_loader_spawn_exec(frame.rdi),
         SYS_RUSTOS_SCHED_DEMOTE_SELF => syscall_linux_rustos_sched_demote_self(),
         linux_abi::SYS_RUSTOS_PROC_PREPARE_BROKER => {
             syscall_linux_rustos_proc_prepare_broker(frame.rdi)

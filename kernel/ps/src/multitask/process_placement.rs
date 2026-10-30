@@ -4,6 +4,7 @@ use super::{current_identity, process_table};
 use crate::user::abi::UserAbi;
 use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
 use process_table::ProcessHandle;
+use crate::multitask::slot_dir::AtomicDir;
 const MAX: usize = process_table::MAX_THREADS_PER_PROCESS;
 type Member = (usize, u64);
 struct State {
@@ -173,8 +174,16 @@ impl Cell {
         }
     }
 }
-static CELLS: [Cell; process_table::MAX_PROCESS_OBJECTS] =
-    [const { Cell::new() }; process_table::MAX_PROCESS_OBJECTS];
+static CELLS: AtomicDir<Cell> = AtomicDir::new();
+
+/// Publishes the placement cells covering `index` before that slot can exist.
+pub(super) fn ensure_slot_storage(index: usize) -> bool {
+    CELLS.ensure(index, Cell::new)
+}
+#[cfg(test)]
+pub(super) fn cell_exists_for_tests(handle: ProcessHandle) -> bool {
+    cell(handle).is_some()
+}
 fn cell(handle: ProcessHandle) -> Option<&'static Cell> {
     CELLS.get(handle.index())
 }
@@ -434,7 +443,7 @@ impl Drop for Join {
 }
 #[cfg(test)]
 pub(super) fn reset_for_tests() {
-    for cell in &CELLS {
+    for cell in CELLS.iter() {
         cell.with(|state| {
             assert_eq!(state.phase, 0);
             assert_eq!(state.joins, 0);

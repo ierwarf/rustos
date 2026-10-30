@@ -21,6 +21,7 @@ mod activation_batch;
 mod authority;
 mod deferred_activation;
 mod fork;
+mod job_placement;
 mod scheduling_context_grants;
 
 pub(super) use activation_batch::syscall_linux_rustos_proc_activate_batch_broker;
@@ -97,6 +98,8 @@ struct ProcPrepareState {
     format: u16,
     stack_top: u64,
     exec_ticket: Option<u64>,
+    /// Exact identity resolved from CREATE_PROCESS authority at prepare time.
+    job: Option<multitask::JobId>,
     #[allow(
         clippy::vec_box,
         reason = "mapping entries may carry a page payload; stable indirection avoids copying page-sized records when the bounded vector grows"
@@ -157,6 +160,12 @@ pub(super) fn consume_direct_bootstrap_scheduling_context(
     scheduling_context_grants::consume_direct_bootstrap(requester_pid, exec_path)
 }
 
+/// Shared typed descriptor admission for rootd's pre-loader bootstrap and the
+/// ordinary loader prepare transaction. Neither path can mint job authority.
+pub(super) fn resolve_spawn_job_descriptor(owner: u64, descriptor: u64) -> Result<multitask::JobId, i64> {
+    job_placement::resolve_descriptor(owner, descriptor)
+}
+
 pub(super) fn syscall_linux_rustos_proc_prepare_broker(args_ptr: u64) -> u64 {
     let Some(loader_pid) = current_loader_process_id() else {
         return linux_errno(LINUX_EPERM);
@@ -165,13 +174,13 @@ pub(super) fn syscall_linux_rustos_proc_prepare_broker(args_ptr: u64) -> u64 {
         Ok(args) => args,
         Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
     };
-    if args.abi_version != PROC_BROKER_ABI_VERSION
-        || args.flags & !PROC_BROKER_PREPARE_FLAG_EXEC_TICKET != 0
-        || (args.flags == 0) != (args.reserved0 == 0)
-        || !rustos_user_abi::syscall::proc_broker_stack_top_valid(args.stack_top)
-    {
+    if !job_placement::prepare_shape_valid(&args) {
         return linux_errno(LINUX_EINVAL);
     }
+    let job = match job_placement::resolve_prepare_job(loader_pid, &args) {
+        Ok(job) => job,
+        Err(errno) => return linux_errno(errno),
+    };
     let exec_ticket =
         (args.flags & PROC_BROKER_PREPARE_FLAG_EXEC_TICKET != 0).then_some(args.reserved0);
     if let Some(ticket) = exec_ticket
@@ -201,6 +210,7 @@ pub(super) fn syscall_linux_rustos_proc_prepare_broker(args_ptr: u64) -> u64 {
         format: args.format,
         stack_top: args.stack_top,
         exec_ticket,
+        job,
         mappings: Vec::with_capacity(MAX_MAPPINGS_PER_PREPARE),
         windows_runtime: None,
         linux_runtime: None,
@@ -692,7 +702,11 @@ pub(super) fn syscall_linux_rustos_proc_commit_broker(args_ptr: u64) -> u64 {
         argv: argv_refs.as_slice(),
         env: env_refs.as_slice(),
     };
-    let spawn_transaction = match crate::user::process::reserve_process_spawn_transaction() {
+    let job = match job_placement::spawn_job(state.job, args.requester_pid) {
+        Ok(job) => job,
+        Err(errno) => return linux_errno(errno),
+    };
+    let spawn_transaction = match crate::user::process::reserve_process_spawn_transaction_in(Some(job)) {
         Ok(transaction) => transaction,
         Err(err) => return linux_errno(process_load_error_to_linux_errno(err)),
     };
@@ -726,6 +740,7 @@ pub(super) fn syscall_linux_rustos_proc_commit_broker(args_ptr: u64) -> u64 {
         linux: linux_launch,
         console_session: session,
         logical_admin,
+        root_job_authority: false,
     };
     let prepared = match state.format {
         PROC_BROKER_FORMAT_ELF64 => {
@@ -1162,6 +1177,7 @@ pub(super) fn syscall_linux_rustos_proc_exec_target_broker(args_ptr: u64) -> u64
         linux: linux_launch,
         console_session: session,
         logical_admin,
+        root_job_authority: false,
     };
     // Same loaderd contract as prepare: linux_runtime must be populated; the
     // bytes-image fallback into ring0 ELF parsing was retired.

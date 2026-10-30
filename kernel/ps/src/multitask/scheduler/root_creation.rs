@@ -152,7 +152,7 @@ impl Input {
         id: u64,
     ) -> Option<UserProcessState> {
         match self {
-            Self::State(state) => Some(state),
+            Self::State(state) => (!bootstrap.root_job_authority).then_some(state),
             Self::AddressSpace(space) => {
                 let mut state = UserProcessState::new(
                     space,
@@ -163,6 +163,18 @@ impl Input {
                     bootstrap.logical_admin,
                     bootstrap.exec_path(),
                 );
+                if core::mem::take(&mut bootstrap.root_job_authority) {
+                    use crate::user::handles::KernelHandle;
+                    use kernel_object::api::handle::{HandleRights, JobHandleRights};
+                    let fd = state.handles_mut().install_with_open_flags_and_rights(
+                        KernelHandle::Job(crate::multitask::ROOT_JOB),
+                        0,
+                        HandleRights::Job(JobHandleRights::ALL),
+                    )?;
+                    if fd != rustos_user_abi::syscall::JOB_BOOTSTRAP_ROOT_FD {
+                        return None;
+                    }
+                }
                 if let Some(thread) = bootstrap.windows_thread_state
                     && process::initialize_windows_thread_identifiers(
                         state.address_space_mut(),

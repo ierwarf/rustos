@@ -50,6 +50,10 @@ struct SmokeOptions {
     /// With `oom_hog`: expect the ring0 watchdog, not `rootd`, to end the hog.
     /// Requires `RUSTOS_FAULTS=rootd.memory.census=fail`, which blinds `rootd`.
     oom_hog_watchdog: bool,
+    /// Require the opt-in 128 MiB application job refusal and drained-job proof.
+    oom_hog_job_limit: bool,
+    /// Require the opt-in JobPolicy ABI and actual Current-cache boot proof.
+    job_policy_probe: bool,
     /// Arm `apps/procstress` (fork, COW, mmap/mprotect/munmap churn) and wait
     /// for its completion marker; panics are caught by the ordinary checks.
     proc_stress: bool,
@@ -122,6 +126,8 @@ where
         ipcbench_probe: None,
         oom_hog: false,
         oom_hog_watchdog: false,
+        oom_hog_job_limit: false,
+        job_policy_probe: false,
         proc_stress: false,
         min_ui_fps: None,
         ui_proof_windows: DEFAULT_UI_FPS_ACTIVE_WINDOWS,
@@ -192,7 +198,12 @@ where
                 }
                 options.physical_usb_bdf = Some(next_value(&mut args, &arg)?);
             }
+            "--job-policy-probe" => options.job_policy_probe = true,
             "--oom-hog" => options.oom_hog = true,
+            "--oom-hog-job-limit" => {
+                options.oom_hog = true;
+                options.oom_hog_job_limit = true;
+            }
             "--proc-stress" => options.proc_stress = true,
             "--oom-hog-watchdog" => {
                 options.oom_hog = true;
@@ -277,6 +288,15 @@ where
         }
     }
 
+    if options.job_policy_probe {
+        if options.oom_hog || options.proc_stress {
+            bail!("--job-policy-probe cannot combine with memory or process stress proofs");
+        }
+        options.expected_markers.push(JOB_POLICY_OK.to_owned());
+    }
+    if options.oom_hog_watchdog && options.oom_hog_job_limit {
+        bail!("--oom-hog-job-limit and --oom-hog-watchdog prove different refusal owners");
+    }
     if options.oom_hog {
         // The proof is about the product topology staying up through pressure,
         // so it needs the graphical session whose launch starts the hog. The
@@ -285,10 +305,12 @@ where
         options
             .expected_markers
             .push(OOM_HOG_STARTED_MARKER.to_owned());
-        let (killed, recovered) = if options.oom_hog_watchdog {
+        let (killed, recovered) = if options.oom_hog_job_limit {
+            (APP_LIMIT_OBSERVED, APP_LIMIT_DRAINED)
+        } else if options.oom_hog_watchdog {
             (OOM_HOG_WATCHDOG_KILLED_MARKER, OOM_HOG_WATCHDOG_RECOVERED_MARKER)
         } else {
-            (OOM_HOG_KILLED_MARKER, OOM_HOG_RECOVERED_MARKER)
+            ("rootd: oom killed ", OOM_HOG_RECOVERED_MARKER)
         };
         options.expected_markers.push(killed.to_owned());
         options.expected_markers.push(recovered.to_owned());

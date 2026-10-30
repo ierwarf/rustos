@@ -471,10 +471,25 @@ fn run_one_smoke(
             &layout.dvm_serial_log,
         )?;
     }
+    if options.job_policy_probe {
+        let rustos_log = fs::read_to_string(&layout.debugcon_log)
+            .with_context(|| format!("read {}", layout.debugcon_log.display()))?;
+        let proof = validate_job_policy_log(&rustos_log)?;
+        println!(
+            "xtask: job policy proof: rootd pid {} observed {} denied and {} restored checksum-framed Current-cache checks; hierarchical ABI, attenuation and retirement controller completed",
+            proof.rootd_pid, proof.denied, proof.allowed,
+        );
+    }
     if options.oom_hog {
         let rustos_log = fs::read_to_string(&layout.debugcon_log)
             .with_context(|| format!("read {}", layout.debugcon_log.display()))?;
-        if options.oom_hog_watchdog {
+        if options.oom_hog_job_limit {
+            let evidence = validate_application_limit_log(&rustos_log)?;
+            println!(
+                "xtask: application quota proof: hog pid {} job {} charged {} pages with {} free pages; {} checksum-framed worker page faults (SIGSEGV class), exact quota and zero-charge job retirement observed",
+                evidence.pid, evidence.job, evidence.pages, evidence.free_pages, evidence.faulted_workers,
+            );
+        } else if options.oom_hog_watchdog {
             let evidence = validate_oom_hog_watchdog_log(&rustos_log)?;
             println!(
                 "xtask: OOM watchdog proof: with rootd blinded, the ring0 watchdog terminated the hog (pid {}) at {} free pages, free memory recovered to {} pages, and rootd killed nothing",
@@ -483,8 +498,9 @@ fn run_one_smoke(
         } else {
             let evidence = validate_oom_hog_log(&rustos_log)?;
             println!(
-                "xtask: OOM proof: rootd terminated the hog (pid {}, {} resident pages) at {} free pages, free memory recovered to {} pages, and no panic, stall, or relay failure was observed",
+                "xtask: OOM proof: rootd terminated the hog (pid {}, job {:?}, {} resident pages) at {} free pages, free memory recovered to {} pages, and no panic, stall, or relay failure was observed",
                 evidence.pid,
+                evidence.job,
                 evidence.resident_pages,
                 evidence.free_pages,
                 evidence.recovered_free_pages
@@ -598,6 +614,8 @@ pub(crate) fn kvm_run_command(
         ipcbench_probe: None,
         oom_hog: false,
         oom_hog_watchdog: false,
+        oom_hog_job_limit: false,
+        job_policy_probe: false,
         proc_stress: false,
         min_ui_fps: None,
         ui_proof_windows: DEFAULT_UI_FPS_ACTIVE_WINDOWS,

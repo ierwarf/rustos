@@ -14,9 +14,10 @@ use kernel_ipc_runtime::api::{
 };
 use kernel_object::api::handle::{
     DeviceHandleRights, FileHandleRights, HandleOwner, HandleRights, HandleToken,
-    SharedRegionRights, SocketHandleRights,
+    JobHandleRights, SharedRegionRights, SocketHandleRights,
 };
 use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
+use crate::multitask::slot_dir::ChunkTable;
 
 #[path = "handles/display_surface.rs"]
 mod display_surface;
@@ -65,12 +66,15 @@ pub struct ConsoleHandle {
 }
 
 static NEXT_CONSOLE_OPEN_DESCRIPTION_TOKEN: AtomicU64 = AtomicU64::new(1);
-const CONSOLE_OPEN_DESCRIPTION_CAPACITY: usize = 256;
+/// Registry entries added per growth step. The registry grows on demand, so
+/// the number of live console open descriptions is bounded by memory and by
+/// `SLOT_DIR * CONSOLE_REGISTRY_CHUNK`, not by the number of process slots.
+const CONSOLE_REGISTRY_CHUNK: usize = 128;
 
 static CONSOLE_OPEN_DESCRIPTIONS: TrackedSpinLock<
-    [Option<ConsoleDescriptionRegistryEntry>; CONSOLE_OPEN_DESCRIPTION_CAPACITY],
+    ChunkTable<Option<ConsoleDescriptionRegistryEntry>, CONSOLE_REGISTRY_CHUNK>,
     { LockClass::ConsoleRegistry as u8 },
-> = TrackedSpinLock::new([const { None }; CONSOLE_OPEN_DESCRIPTION_CAPACITY]);
+> = TrackedSpinLock::new(ChunkTable::new());
 
 struct ConsoleDescriptionRegistryEntry {
     token: u64,
@@ -87,26 +91,36 @@ impl ConsoleHandle {
             })
             .expect("console open-description token exhausted");
         let description = Arc::new(ConsoleOpenDescription { token, stream });
-        let mut descriptions = CONSOLE_OPEN_DESCRIPTIONS.lock();
-        for slot in descriptions.iter_mut() {
-            if slot.as_ref().is_some_and(|entry| {
-                entry.descriptor_refs == 0 || entry.description.strong_count() == 0
-            }) {
-                *slot = None;
+        loop {
+            let mut descriptions = CONSOLE_OPEN_DESCRIPTIONS.lock();
+            for slot in descriptions.iter_mut() {
+                if slot.as_ref().is_some_and(|entry| {
+                    entry.descriptor_refs == 0 || entry.description.strong_count() == 0
+                }) {
+                    *slot = None;
+                }
             }
+            if let Some(slot) = descriptions.iter_mut().find(|slot| slot.is_none()) {
+                *slot = Some(ConsoleDescriptionRegistryEntry {
+                    token,
+                    description: Arc::downgrade(&description),
+                    stream,
+                    descriptor_refs: 1,
+                });
+                return Self { description };
+            }
+            drop(descriptions);
+            // Full after reclaiming dead entries: build the next chunk with no
+            // lock held, then install it without allocating. A racing creator
+            // may install first; the loop then simply finds its free entry.
+            let chunk = ChunkTable::<_, CONSOLE_REGISTRY_CHUNK>::build(|| None)
+                .expect("console open-description registry could not grow");
+            let mut descriptions = CONSOLE_OPEN_DESCRIPTIONS.lock();
+            assert!(
+                descriptions.push_chunk(chunk),
+                "console open-description registry exhausted its ceiling"
+            );
         }
-        let slot = descriptions
-            .iter_mut()
-            .find(|slot| slot.is_none())
-            .expect("console open-description registry exhausted");
-        *slot = Some(ConsoleDescriptionRegistryEntry {
-            token,
-            description: Arc::downgrade(&description),
-            stream,
-            descriptor_refs: 1,
-        });
-        drop(descriptions);
-        Self { description }
     }
 
     pub fn token_id(&self) -> u64 {
@@ -212,6 +226,8 @@ fn allocate_nonwrapping_identity(counter: &AtomicU64) -> Option<u64> {
 
 #[derive(Debug, Clone)]
 pub enum KernelHandle {
+    /// An identity, not ambient authority: install with explicit Job rights.
+    Job(crate::multitask::JobId),
     Console(ConsoleHandle),
     Device(DeviceHandle),
     Epoll(EpollHandle),
@@ -336,6 +352,8 @@ impl InetSocketHandle {
 impl KernelHandle {
     pub(crate) fn token(&self) -> HandleToken {
         match self {
+            Self::Job(job) => job.handle_token()
+                .expect("job descriptor requires a nonzero generation"),
             Self::Console(console) => {
                 HandleToken::from_nonreusable_open_description(HandleOwner::Ps, console.token_id())
                     .expect("console open-description token is nonzero and nonreusable")
@@ -364,6 +382,7 @@ impl KernelHandle {
 
     pub const fn kind_name(&self) -> &'static str {
         match self {
+            Self::Job(_) => "job",
             Self::Console(_) => "console",
             Self::Device(_) => "device",
             Self::Epoll(_) => "epoll",
@@ -399,6 +418,8 @@ impl KernelHandle {
 
     pub fn default_rights(&self, status_flags: u64) -> HandleRights {
         match self {
+            // Rewrapping a raw object must not recreate attenuated authority.
+            Self::Job(_) => HandleRights::Job(JobHandleRights::empty()),
             Self::Console(_) => HandleRights::Console,
             Self::Device(device) => {
                 let mut rights = DeviceHandleRights::READ
@@ -455,7 +476,8 @@ impl KernelHandle {
     pub fn supports_descriptor_transfer(&self, rights: HandleRights) -> bool {
         matches!(
             self,
-            Self::Socket(_)
+            Self::Job(_)
+                | Self::Socket(_)
                 | Self::Memfd(_)
                 | Self::VfsDirectory(_)
                 | Self::Device(_)
@@ -472,6 +494,7 @@ impl KernelHandle {
 
     pub fn procfs_link_target(&self, token: HandleToken) -> alloc::string::String {
         match self {
+            Self::Job(job) => alloc::format!("anon_inode:[rustos-job:{}]", job.to_raw()),
             Self::Console(_) => alloc::string::String::from("/dev/tty"),
             Self::Device(device) => alloc::string::String::from(device.device_id().path()),
             Self::Epoll(epoll) => alloc::string::String::from(epoll.path()),

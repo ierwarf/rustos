@@ -393,7 +393,8 @@ impl HandleTable {
                 break;
             }
             let occupied = self.get_entry(fd).is_some();
-            if !occupied && self.reserved.insert(fd, reservation_id).is_none() {
+            if !occupied && !self.reserved.contains_key(&fd) {
+                self.reserved.insert(fd, reservation_id);
                 slots.push(fd);
             }
         }
@@ -423,6 +424,38 @@ impl HandleTable {
                 self.reserved.remove(&fd);
             }
         }
+    }
+
+    /// Publishes one newly minted Job descriptor after its result copyout.
+    /// The exact reservation, not an fd guess, owns the invisible slot. No
+    /// provider reference is acquired: a Job token does not pin a live job.
+    pub fn commit_reserved_job(
+        &mut self,
+        reservation_id: u64,
+        fd: u64,
+        job: crate::multitask::JobId,
+        rights: JobHandleRights,
+    ) -> bool {
+        if self.reserved.get(&fd) != Some(&reservation_id)
+            || self.get_entry(fd).is_some()
+            || job.handle_token().is_none()
+        {
+            return false;
+        }
+        if let Some(index) = dynamic_index(fd)
+            && self.ensure_entry_capacity(index).is_none()
+        {
+            return false;
+        }
+        let entry = HandleEntry::new_with_rights(KernelHandle::Job(job), HandleRights::Job(rights), 0, 0);
+        self.reserved.remove(&fd);
+        if let Some(index) = standard_index(fd) {
+            self.standard[index] = Some(entry);
+        } else {
+            let index = dynamic_index(fd).expect("validated job descriptor reservation");
+            self.entries[index] = Some(entry);
+        }
+        true
     }
 
     /// Atomically publishes every prepared transfer entry. On failure the
@@ -599,6 +632,9 @@ impl HandleTable {
             return None;
         }
         let mut entry = self.get_entry(fd)?.clone();
+        if matches!(entry.rights(), HandleRights::Job(rights) if !rights.contains(JobHandleRights::DUPLICATE)) {
+            return None;
+        }
         entry.set_fd_flags(if close_on_exec { FD_CLOEXEC } else { 0 });
         if !acquire_entry_descriptor_reference(&entry) {
             return None;
@@ -634,6 +670,9 @@ impl HandleTable {
             return None;
         }
         let mut entry = self.get_entry(fd)?.clone();
+        if matches!(entry.rights(), HandleRights::Job(rights) if !rights.contains(JobHandleRights::DUPLICATE)) {
+            return None;
+        }
         entry.set_fd_flags(if close_on_exec { FD_CLOEXEC } else { 0 });
         if !acquire_entry_descriptor_reference(&entry) {
             return None;

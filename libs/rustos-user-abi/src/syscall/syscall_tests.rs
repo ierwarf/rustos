@@ -33,6 +33,19 @@ use super::{
 };
 
 #[test]
+fn process_prepare_job_authority_layout_is_explicit() {
+    use super::{RustosProcPrepareBrokerArgs, PROC_BROKER_ABI_VERSION,
+        PROC_BROKER_PREPARE_FLAG_EXEC_TICKET, PROC_BROKER_PREPARE_FLAG_JOB_HANDLE};
+    assert_eq!(PROC_BROKER_ABI_VERSION, 5);
+    assert_eq!(size_of::<RustosProcPrepareBrokerArgs>(), 32);
+    assert_eq!(core::mem::offset_of!(RustosProcPrepareBrokerArgs, reserved0), 8);
+    assert_eq!(core::mem::offset_of!(RustosProcPrepareBrokerArgs, stack_top), 16);
+    assert_eq!(core::mem::offset_of!(RustosProcPrepareBrokerArgs, job_handle), 24);
+    assert_ne!(PROC_BROKER_PREPARE_FLAG_JOB_HANDLE, 0);
+    assert_eq!(PROC_BROKER_PREPARE_FLAG_JOB_HANDLE & PROC_BROKER_PREPARE_FLAG_EXEC_TICKET, 0);
+}
+
+#[test]
 fn pager_fault_wire_is_distinct_fixed_and_append_only() {
     assert_ne!(SYS_RUSTOS_PAGER_FAULT_WAIT, SYS_RUSTOS_PAGER_FAULT_REPLY);
     assert_eq!(size_of::<RustosPagerFaultWaitArgs>(), 16);

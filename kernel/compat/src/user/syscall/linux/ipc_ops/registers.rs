@@ -21,14 +21,37 @@ pub(super) enum ReceiveDestination<'a> {
         sender_tid_ptr: u64,
     },
     Registers(&'a mut SyscallFrame),
+    UserWithHandles(super::handle_receive::ReceiveOutputs<'a>),
 }
 
 impl ReceiveDestination<'_> {
+    pub(super) fn handle_capacity(&self) -> usize {
+        match self {
+            Self::UserWithHandles(outputs) => outputs.handles.capacity,
+            _ => 0,
+        }
+    }
+
+    pub(super) fn write_queued_handles(
+        &mut self,
+        reply: KernelReplyHandle,
+        request: &[u8],
+        handles: &[KernelTransferredHandle],
+        caller: u64,
+    ) -> Result<usize, i64> {
+        match self {
+            Self::UserWithHandles(outputs) => outputs.write_queued(reply, request, handles, caller),
+            _ if handles.is_empty() => self.write_queued(reply, request, caller),
+            _ => Err(LINUX_EINVAL),
+        }
+    }
+
     pub(super) fn write_fast<const N: usize>(
         &mut self,
         received: kernel_ipc_runtime::api::FastEndpointReceived<N>,
     ) -> Result<usize, i64> {
         match self {
+            Self::UserWithHandles(outputs) => outputs.write_fast(received),
             Self::User {
                 retained_mm,
                 request_ptr,
@@ -61,6 +84,7 @@ impl ReceiveDestination<'_> {
     ) -> Result<usize, i64> {
         let (pid, tid) = multitask::user_log_ids_for_task(caller).unwrap_or((0, 0));
         match self {
+            Self::UserWithHandles(outputs) => outputs.write_queued(reply, request, &[], caller),
             Self::Registers(frame) => write_register_result(frame, request, reply.raw(), pid, tid),
             Self::User {
                 retained_mm,

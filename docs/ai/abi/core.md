@@ -193,14 +193,49 @@ free and kernel-reserve pages, the monotonic watermark-denial count, and up to
 pressure state nor chooses a victim; rootd's `memory_governor` does, then
 terminates through the call above. Each census entry also carries the process's
 `job`.
-`SYS_RUSTOS_JOB` (`0x5255_0057`, ABI v1, root-supervisor-only in this phase)
-operates the kernel job tree through one in-place `RustosJobArgs`: `GET_INFO`,
+`SYS_RUSTOS_JOB` (`0x5255_0057`, ABI v4) operates the kernel job tree
+through one in-place `RustosJobArgs` and an exact typed Job descriptor with
+operation-specific rights: `GET_INFO`,
 `CREATE_CHILD`, `KILL` (bounded: at most 128 members ended per call, the rest
 reported in `remaining`) and `PROCESS_JOB`. Input fields only on entry; every
 output field must arrive zero. A job id is `(slot << 32) | generation` and the
 root job is `JOB_ID_ROOT` (1). A caller inside the target subtree and the root
-job are refused with `EPERM`. Design and limits:
+job are refused with `EPERM`. `OPEN_SUBTREE` (op 6) takes the target id in
+`job` and a rights mask, and returns a handle attenuated to that mask only when
+the target lies within the authorizing handle's subtree; anything else is
+`ESRCH`. It needs the `DUPLICATE` right and is how `rootd` reaches a job named
+by a census entry. ABI v3 adds `SET_LIMITS` (op 7, `SET_LIMITS` right): input
+`limit_mask` (`JOB_LIMIT_PROCESSES | JOB_LIMIT_THREADS`) with
+`limit_processes` / `limit_threads` (`JOB_LIMIT_UNSET` inherits); the reply
+carries the limits now in force. `GET_INFO` additionally returns own and
+effective limits and subtree usage. Unknown mask bits are `EINVAL`; the
+limit fields must be zero for every other op. ABI v4 adds
+`JOB_LIMIT_MEMORY_PAGES` (`limit_memory_pages`, `effective_memory_pages`,
+`usage_memory_pages`): a limit on resident user data pages of the job and its
+descendants, enforced by refusing the page claim (`OutOfFrames`); it does not
+count page tables or kernel objects. Design and limits:
 [Job Model](../../architecture/job-model.md#phase-1-as-built).
+
+`SYS_RUSTOS_JOB_POLICY` (`0x5255_005a`) has an independent 96-byte v1
+`RustosJobPolicyArgs` wire in `libs/rustos-user-abi/src/syscall/job_policy.rs`.
+GET requires `INSPECT`, SET requires `SET_POLICY` (not `SET_LIMITS`) on the typed
+Job descriptor. Flags, reserved, output job identity and effective mask must be
+zero on entry; GET also requires an empty own mask. Own/effective masks each
+have four 64-bit words; effective is the intersection of every live ancestor.
+New jobs default to ALL, so existing behavior is unchanged. A ceiling never
+grants a broker role; existing `IPC_SERVICE_CAP_*` authorization remains intact.
+SET refreshes every descendant before returning, but racing single-operation
+readers may see the old or new word, not an atomic whole-subtree snapshot.
+A late user-copy failure does not roll back the completed scalar mutation.
+The handler in `kernel/compat/src/user/syscall/linux/job_policy_ops.rs` resolves
+generations again under the lifecycle lock. `kernel/ps/src/multitask/current/job_policy.rs`
+uses exact published membership, generation-bound cached ceilings and final
+membership revalidation without a PID scan, state borrow or table lock.
+Missing publication fails closed. The opt-in `RUSTOS_ROOTD_POLICY_PROBE=1` build
+exercises denial/restoration and typed hierarchy through
+`services/rootd/src/job_policy_probe.rs`; it is not a default boot check or a
+completed broker-policy migration.
+
 Rootd receives supervisor requests through endpoint-owner-only sender-stamped
 receive syscalls; both pre-init and post-init supervisor turns must drain
 lifecycle/restart state before using `SYS_RUSTOS_IPC_TRY_RECV_WITH_SENDER`, so

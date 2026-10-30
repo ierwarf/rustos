@@ -28,6 +28,13 @@ options:
                        the allocator refuses it, and require the root supervisor
                        to terminate it (`rootd: oom killed`) while the desktop,
                        driver-domain relay, and every service keep running
+  --oom-hog-job-limit  require four framed hog page faults at the 128 MiB job
+                       quota, physical headroom, and a zero-charge retired job;
+                       build first with RUSTOS_LOADERD_LIMIT_PROBE=1 and
+                       RUSTOS_ROOTD_APP_LIMIT_PROBE=1 (both off by default)
+  --job-policy-probe  require hierarchical JobPolicy ABI and framed Current-cache
+                       deny/restore proof; build with RUSTOS_ROOTD_POLICY_PROBE=1
+                       (off by default), separate from memory/process stress
   --proc-stress        arm the `procstress` session program (fork, copy-on-write,
                        mmap/mprotect/munmap churn from many threads) and wait for
                        it to finish; used to reproduce scheduler and TLB panics

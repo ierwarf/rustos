@@ -97,3 +97,31 @@ recipes below use that plan for check/build selection, not ad hoc substitutes.
 2. Prefer one subsystem at a time.
 3. Close questions by pointing at source path + line/symbol — do not paste
    long code.
+
+## Verify fast, and work in parallel without breaking each other
+
+Shorten the loop before the sealed run, not instead of it.
+
+1. `tools/agent/formal-preflight.sh` runs every static registry and source-contract
+   check in parallel (about 10 seconds): sorted ids, unique REQ/HAZ numbers, matching
+   flows, full documented paths, mutation anchors, the AI-context contract. Run it
+   after any formal, registry or documentation edit and before `formal/verify-all.sh`.
+2. A new TLA+ model touches nine files. `tools/agent/formal-register-model.py` writes
+   all of its registry rows from one command line and regenerates the contract
+   document; the model's invariants, at least one spec mutant and its implementation
+   mutants remain the author's work.
+3. `cargo host-test` runs the `rootd` and `loaderd` unit tests. They are freestanding
+   binaries and crash with SIGSEGV without `--features host-test`.
+4. Compare a change against a control with `tools/agent/kvm-ab.py`: it builds the
+   control ref in its own worktree and alternates one boot of each arm, so host drift
+   hits both and the working tree stays usable. It reports a Fisher exact p-value;
+   with a baseline failure rate near 4% a few dozen pairs only separate large effects.
+5. Concurrent agents work in separate worktrees (`tools/agent/agent-worktree.sh new
+   NAME`). Seals and builds are per worktree, so one agent's edit cannot invalidate
+   another's sealed boot. Merge at a slice boundary, after preflight and a sealed run
+   pass in that worktree; the script never merges for you.
+6. `docs/ai/session-handoff.md` is the short resume head; evidence and chronology go
+   to `docs/ai/session-handoff-log.md`. Both are exempt from the verification seal
+   (`formal/binding-exempt-paths.txt`) because no lane reads them as input.
+   Other documents are not exempt: `check-rust-source-contracts.py` reads every
+   Markdown file for documented source paths, so editing one invalidates the seal.

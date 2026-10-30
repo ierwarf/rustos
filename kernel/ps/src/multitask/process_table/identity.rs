@@ -7,6 +7,8 @@
 //! - **Publication:** writers revoke the committed word, update pointer/PID
 //!   payloads, then release-store one generation word. Readers validate that
 //!   word before and after reading the payload.
+//! - **Concurrency:** release/acquire payload bridges join replacement to prior
+//!   revocation; IRQ masking alone does not exclude remote lifecycle writers.
 //! - **Lifetime:** counted references or exact atomic allocation pins retain
 //!   the state-lock box independently of directory guards/task membership.
 //!   MM generation and visibility still gate every retained mapping access.
@@ -22,7 +24,9 @@ use core::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 
 use kernel_object::api::identity::{ObjectIdentity, ObjectKind, ObjectOwner};
 
-use super::{MAX_PROCESS_OBJECTS, PROCESS_TABLE};
+use super::PROCESS_TABLE;
+use super::jobs::JobId;
+use crate::multitask::slot_dir::AtomicDir;
 use crate::multitask::process_state_lock::ProcessStateLock;
 use crate::user::process_state::UserProcessState;
 
@@ -122,20 +126,29 @@ enum ProcessRefPin {
 /// Payload published with one process-table slot.
 pub(super) struct SlotPublication {
     pub(super) process_id: u64,
+    pub(super) job: JobId,
     pub(super) mm_generation: u32,
     pub(super) live: bool,
     pub(super) state: *mut ProcessStateLock<UserProcessState>,
 }
 
 /// The committed generation pair. Zero means no live identity is published.
-static PROCESS_IDENTITY: [AtomicU64; MAX_PROCESS_OBJECTS] =
-    [const { AtomicU64::new(0) }; MAX_PROCESS_OBJECTS];
+static PROCESS_IDENTITY: AtomicDir<AtomicU64> = AtomicDir::new();
 /// Payload committed by the release store to PROCESS_IDENTITY.
-static PROCESS_ID: [AtomicU64; MAX_PROCESS_OBJECTS] =
-    [const { AtomicU64::new(0) }; MAX_PROCESS_OBJECTS];
+static PROCESS_ID: AtomicDir<AtomicU64> = AtomicDir::new();
+/// Immutable membership payload, committed with the exact process generation.
+static PROCESS_JOB: AtomicDir<AtomicU64> = AtomicDir::new();
 /// State pointer committed by the release store to PROCESS_IDENTITY.
-static PROCESS_STATE_PTR: [AtomicPtr<ProcessStateLock<UserProcessState>>; MAX_PROCESS_OBJECTS] =
-    [const { AtomicPtr::new(core::ptr::null_mut()) }; MAX_PROCESS_OBJECTS];
+static PROCESS_STATE_PTR: AtomicDir<AtomicPtr<ProcessStateLock<UserProcessState>>> =
+    AtomicDir::new();
+
+/// Publishes the identity chunks covering `index` before that slot can exist.
+pub(super) fn ensure_slot_storage(index: usize) -> bool {
+    PROCESS_IDENTITY.ensure(index, || AtomicU64::new(0))
+        && PROCESS_ID.ensure(index, || AtomicU64::new(0))
+        && PROCESS_JOB.ensure(index, || AtomicU64::new(0))
+        && PROCESS_STATE_PTR.ensure(index, || AtomicPtr::new(core::ptr::null_mut()))
+}
 
 #[inline]
 const fn encode_identity(process_generation: u32, mm_generation: u32) -> u64 {
@@ -163,24 +176,50 @@ pub(super) fn publish_slot_visibility(
     if publication.is_some() {
         super::pin_owner::bind(index, generation);
     }
+    // ORDERING: Release revokes the old generation before membership payload
+    // replacement. A reader acquiring a replacement job observes this revoke.
     PROCESS_IDENTITY[index].store(0, Ordering::Release);
-    let (process_id, state, committed) =
-        publication.map_or((0, core::ptr::null_mut(), 0), |publication| {
+    let (process_id, job, state, committed) =
+        publication.map_or((0, 0, core::ptr::null_mut(), 0), |publication| {
             let committed = publication
                 .live
                 .then_some(encode_identity(generation, publication.mm_generation))
                 .unwrap_or(0);
-            (publication.process_id, publication.state, committed)
+            (publication.process_id, publication.job.to_raw(), publication.state, committed)
         });
+    // ORDERING: Release binds a changed membership payload to the preceding
+    // process-generation revocation, even before the final commit is visible.
+    PROCESS_JOB[index].store(job, Ordering::Release);
     PROCESS_STATE_PTR[index].store(state, Ordering::Relaxed);
     PROCESS_ID[index].store(process_id, Ordering::Relaxed);
+    // ORDERING: Release commits all identity payloads for this generation.
     PROCESS_IDENTITY[index].store(committed, Ordering::Release);
+}
+
+/// Reads immutable membership through exact published process/MM generation.
+/// Missing or transitioning publication refuses; this is not a membership
+/// census and deliberately has no locked fallback during exec or retirement.
+pub(in crate::multitask) fn published_process_job(handle: ProcessHandle) -> Option<JobId> {
+    let identity = PROCESS_IDENTITY.get(handle.index())?;
+    // ORDERING: Acquire observes payloads committed for this exact process.
+    let before = identity.load(Ordering::Acquire);
+    if before == 0 || before >> 32 != u64::from(handle.generation()) {
+        return None;
+    }
+    // ORDERING: Acquire joins any replacement membership to its preceding
+    // revocation; the final read cannot authorize a new tenant as the old one.
+    let job = PROCESS_JOB.get(handle.index())?.load(Ordering::Acquire);
+    // ORDERING: Acquire revalidates both slot and MM generation after payload.
+    let after = identity.load(Ordering::Acquire);
+    (before == after && job != 0).then(|| JobId::from_raw(job))
 }
 
 /// Reads a committed exact identity without consulting the table.
 pub(in crate::multitask) fn published_live_process_identity(
     handle: ProcessHandle,
 ) -> Option<ProcessIdentity> {
+    // ORDERING: Acquire observes the committed process/MM incarnation before
+    // reading its PID label; a second identity read rejects replacement.
     let before = PROCESS_IDENTITY
         .get(handle.index())?
         .load(Ordering::Acquire);
@@ -188,6 +227,7 @@ pub(in crate::multitask) fn published_live_process_identity(
         return None;
     }
     let process_id = PROCESS_ID[handle.index()].load(Ordering::Relaxed);
+    // ORDERING: Acquire revalidates the exact identity after the PID read.
     let after = PROCESS_IDENTITY[handle.index()].load(Ordering::Acquire);
     (before == after).then(|| decode_identity(before, process_id))
 }
@@ -205,11 +245,12 @@ pub(super) fn published_process_is_live_by_pid(process_id: u64) -> bool {
     if process_id == 0 {
         return false;
     }
-    (0..MAX_PROCESS_OBJECTS).any(|index| {
+    (0..PROCESS_IDENTITY.capacity()).any(|index| {
         // ORDERING: Acquire observes the committing release store before the
         // PID payload it commits; the re-read rejects a publication that was
         // revoked or replaced between the two payload reads.
         let before = PROCESS_IDENTITY[index].load(Ordering::Acquire);
+        // ORDERING: Acquire revalidates the committed word around the PID read.
         before != 0
             && PROCESS_ID[index].load(Ordering::Relaxed) == process_id
             && PROCESS_IDENTITY[index].load(Ordering::Acquire) == before
@@ -259,6 +300,8 @@ pub(super) fn process_state_is_visible(handle: ProcessHandle) -> bool {
     PROCESS_IDENTITY
         .get(handle.index())
         .is_some_and(|identity| {
+            // ORDERING: Acquire observes live publication for this incarnation;
+            // a lifetime pin, not visibility alone, retains any state pointer.
             let word = identity.load(Ordering::Acquire);
             word != 0 && word >> 32 == u64::from(handle.generation())
         })
@@ -268,6 +311,8 @@ pub(super) fn process_state_is_visible(handle: ProcessHandle) -> bool {
 fn published_process_state(
     handle: ProcessHandle,
 ) -> Option<NonNull<ProcessStateLock<UserProcessState>>> {
+    // ORDERING: Acquire observes the state payload's committed incarnation;
+    // callers separately retain an allocation pin before dereferencing it.
     let before = PROCESS_IDENTITY
         .get(handle.index())?
         .load(Ordering::Acquire);
@@ -275,6 +320,7 @@ fn published_process_state(
         return None;
     }
     let state = PROCESS_STATE_PTR[handle.index()].load(Ordering::Relaxed);
+    // ORDERING: Acquire rejects a pointer read spanning identity replacement.
     let after = PROCESS_IDENTITY[handle.index()].load(Ordering::Acquire);
     (before == after).then(|| NonNull::new(state)).flatten()
 }
@@ -310,6 +356,8 @@ impl ProcessRef {
         let state = self
             .state()
             .expect("process reference lost its state object");
+        // SAFETY: this ProcessRef retains the state-lock allocation through its
+        // counted reference or exact object pin; the lock guards the payload.
         let state = unsafe { state.as_ref() }.lock_at(site);
         f(self.process_id, &state)
     }
@@ -320,12 +368,16 @@ impl ProcessRef {
         let state = self
             .state()
             .expect("process reference lost its state object");
+        // SAFETY: this ProcessRef retains the state-lock allocation through its
+        // counted reference or exact object pin; the lock guards mutable access.
         let mut state = unsafe { state.as_ref() }.lock_at(site);
         f(self.process_id, &mut state)
     }
 
     #[track_caller]
     pub fn with_visible_state<R>(&self, f: impl FnOnce(u64, &UserProcessState) -> R) -> Option<R> {
+        // SAFETY: the reference's retained pin keeps the state-lock box alive;
+        // the lock guards access, and visibility is checked before the callback.
         let state = unsafe { self.state()?.as_ref() }.lock_at(core::panic::Location::caller());
         process_state_is_visible(self.handle).then(|| f(self.process_id, &state))
     }
@@ -338,6 +390,8 @@ impl ProcessRef {
         expected: ProcessIdentity,
         f: impl FnOnce(u64, &UserProcessState) -> R,
     ) -> Option<R> {
+        // SAFETY: the retained reference pins the state-lock allocation; the
+        // locked exact-identity check gates the callback's MM generation.
         let state = unsafe { self.state()?.as_ref() }.lock_at(core::panic::Location::caller());
         (live_process_identity(self.handle) == Some(expected)).then(|| f(self.process_id, &state))
     }
@@ -351,6 +405,8 @@ impl ProcessRef {
         expected: ProcessIdentity,
         f: impl FnOnce(u64, &mut UserProcessState) -> R,
     ) -> Option<R> {
+        // SAFETY: the retained reference pins the allocation; the lock excludes
+        // concurrent state mutation and exact identity gates the callback.
         let mut state = unsafe { self.state()?.as_ref() }.lock_at(core::panic::Location::caller());
         (live_process_identity(self.handle) == Some(expected))
             .then(|| f(self.process_id, &mut state))
@@ -361,6 +417,8 @@ impl ProcessRef {
         &self,
         f: impl FnOnce(u64, &mut UserProcessState) -> R,
     ) -> Option<R> {
+        // SAFETY: the retained reference pins the allocation; the lock guards
+        // mutable state and publication visibility gates the callback.
         let mut state = unsafe { self.state()?.as_ref() }.lock_at(core::panic::Location::caller());
         process_state_is_visible(self.handle).then(|| f(self.process_id, &mut state))
     }
@@ -370,6 +428,8 @@ impl ProcessRef {
         &self,
         f: impl FnOnce(u64, &mut UserProcessState) -> R,
     ) -> Option<R> {
+        // SAFETY: the retained reference keeps the state-lock allocation alive;
+        // successful try_lock supplies the exclusive guard before the callback.
         let mut state = unsafe { self.state()?.as_ref() }.try_lock()?;
         process_state_is_visible(self.handle).then(|| f(self.process_id, &mut state))
     }
@@ -404,6 +464,8 @@ pub(in crate::multitask) fn pin_process_object(
     process_id: u64,
 ) -> Option<super::pin_owner::ProcessObjectPin> {
     let allocation = super::pin_owner::pin(handle)?;
+    // ORDERING: Acquire validates the published PID after taking exact object
+    // custody; the pin prevents generation and PID reuse until dropped.
     (PROCESS_ID.get(handle.index())?.load(Ordering::Acquire) == process_id).then_some(allocation)
 }
 
@@ -475,6 +537,8 @@ pub(in crate::multitask) fn with_own_visible_state<R>(
 ) -> Option<R> {
     let _allocation = super::pin_owner::pin(handle)?;
     let state = published_process_state(handle)?;
+    // SAFETY: _allocation pins the exact state-lock box until after the guard
+    // and callback are dropped; the lock protects the state payload.
     let state = unsafe { state.as_ref() }.lock();
     process_state_is_visible(handle).then(|| f(&state))
 }
@@ -489,6 +553,8 @@ pub(in crate::multitask) fn with_own_exact_visible_state<R>(
 ) -> Option<R> {
     let _allocation = super::pin_owner::pin(handle)?;
     let state = published_process_state(handle)?;
+    // SAFETY: _allocation retains the state-lock box; the lock guards access
+    // and exact publication revalidation gates this callback's MM generation.
     let state = unsafe { state.as_ref() }.lock();
     (published_live_process_identity(handle) == Some(expected)).then(|| f(&state))
 }
@@ -518,5 +584,6 @@ pub(in crate::multitask) fn publication_divergence_count() -> u64 {
 
 #[cfg(test)]
 pub(super) fn clear_publication_for_test(index: usize) {
+    // ORDERING: Release models lifecycle revocation for subsequent readers.
     PROCESS_IDENTITY[index].store(0, Ordering::Release);
 }

@@ -156,3 +156,15 @@ pub fn data_leaf_count(root_phys: u64) -> Option<u64> {
 pub fn unregister_data_leaf_root(root_phys: u64) {
     FRAME_DESCRIPTORS.unregister_root(root_phys);
 }
+
+/// Binds a quiescent address-space root to a charge group and charges the data
+/// leaves it already holds. See `charge` for the model.
+pub fn bind_root_charge(root_phys: u64, group: usize) -> bool {
+    FRAME_DESCRIPTORS.bind_charge(root_phys, group)
+}
+
+/// Whether `pages` more data leaves fit under every limit of the root's charge
+/// group. Advisory; an unbound root always fits.
+pub fn root_admits(root_phys: u64, pages: u64) -> bool {
+    FRAME_DESCRIPTORS.root_admits(root_phys, pages)
+}

@@ -4,7 +4,8 @@
 //! This protects the state-lock allocation, not an old exec MM generation.
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use super::{MAX_PROCESS_OBJECTS, ProcessHandle};
+use super::ProcessHandle;
+use crate::multitask::slot_dir::AtomicDir;
 
 const CLOSED: u64 = 1 << 31;
 const COUNT: u64 = CLOSED - 1;
@@ -102,7 +103,13 @@ impl PinCell {
     }
 }
 
-static PINS: [PinCell; MAX_PROCESS_OBJECTS] = [const { PinCell::new() }; MAX_PROCESS_OBJECTS];
+static PINS: AtomicDir<PinCell> = AtomicDir::new();
+
+/// Publishes the pin cells covering `index` before that slot can exist. A new
+/// cell starts closed at generation zero, like every never-bound slot.
+pub(super) fn ensure_slot_storage(index: usize) -> bool {
+    PINS.ensure(index, PinCell::new)
+}
 static REAP_PENDING: AtomicBool = AtomicBool::new(false);
 
 /// Consume-once allocation lifetime, with no lock carried into a caller.
@@ -149,7 +156,7 @@ pub(in crate::multitask) fn pin(handle: ProcessHandle) -> Option<ProcessObjectPi
 
 #[cfg(test)]
 pub(super) fn reset_for_tests() {
-    for cell in &PINS {
+    for cell in PINS.iter() {
         let state = cell.0.load(Ordering::Acquire);
         assert_eq!(
             state & COUNT,

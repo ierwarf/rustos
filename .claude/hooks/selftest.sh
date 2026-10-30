@@ -36,6 +36,21 @@ pass "AI context efficiency contract passes"
 
 expect_deny "destructive shell command is denied" .claude/hooks/pre_bash_destructive.sh \
   "$(jq -n --arg cmd 'git reset --hard' '{tool_input:{cmd:$cmd}}')"
+# Bypass flags are denied when a git command carries them, but not when they only
+# appear as text in a file body, a heredoc, or an unrelated command.
+expect_deny "git commit --no-verify is denied" .claude/hooks/pre_bash_destructive.sh \
+  "$(jq -n --arg cmd 'git commit --no-verify -m x' '{tool_input:{cmd:$cmd}}')"
+expect_deny "git commit without gpg signing is denied" .claude/hooks/pre_bash_destructive.sh \
+  "$(jq -n --arg cmd 'git -C . commit --no-gpg-sign -m x' '{tool_input:{cmd:$cmd}}')"
+expect_deny "git push with a hook bypass in a chain is denied" .claude/hooks/pre_bash_destructive.sh \
+  "$(jq -n --arg cmd 'cargo xtask check && git push --no-verify' '{tool_input:{cmd:$cmd}}')"
+expect_quiet_allow "bypass flag text in a heredoc body is allowed" .claude/hooks/pre_bash_destructive.sh \
+  "$(jq -n --arg cmd $'cat > /tmp/note.txt <<\'EOF\'\nNever pass --no-verify to git commit.\nEOF' '{tool_input:{cmd:$cmd}}')"
+# Writes into generated paths are denied per command, not per whole command line.
+expect_deny "cp into build is denied" .claude/hooks/pre_bash_destructive.sh \
+  "$(jq -n --arg cmd 'cp a.img build/a.img' '{tool_input:{cmd:$cmd}}')"
+expect_deny "tee into logs after a pipe is denied" .claude/hooks/pre_bash_destructive.sh \
+  "$(jq -n --arg cmd 'cargo test | tee logs/test.log' '{tool_input:{cmd:$cmd}}')"
 expect_quiet_allow "read-only search is allowed" .claude/hooks/pre_bash_destructive.sh \
   "$(jq -n --arg cmd 'rg -n "rm -rf" .claude/hooks' '{tool_input:{cmd:$cmd}}')"
 expect_quiet_allow "large AI document cat is allowed" .claude/hooks/pre_bash_destructive.sh \

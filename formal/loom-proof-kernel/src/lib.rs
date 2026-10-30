@@ -1279,6 +1279,12 @@ mod tests {
     include!("activation_claim_tests.rs");
     include!("terminal_claim_tests.rs");
     include!("termination_owner_tests.rs");
+    include!("application_job_tests.rs");
+    include!("application_limit_tests.rs");
+    include!("exception_diagnostic_tests.rs");
+    include!("job_lifecycle_tests.rs");
+    include!("job_policy_tests.rs");
+    include!("slot_directory_tests.rs");
     include!("budget_dispatch_tests.rs");
     include!("smp_qualification_tests.rs");
     include!("pager_fault_tests.rs");

@@ -4,6 +4,17 @@
 //! their absence as a failure, while the per-dispatch measurements are
 //! deliberately one-shot. Keeping that policy in one place is what lets the
 //! emission path stay a single flow with one decision in it.
+//!
+//! - Owner: the debug sink owns bounded output attempts and deferred custody.
+//! - Boundary: only exact acceptance names/families require sink delivery;
+//!   classification grants no process or broker authority.
+//! - Lifecycle: required records retain custody when immediate output contends.
+//! - Concurrency: the serialized sink/deferred owner allocates output sequence;
+//!   this pure selector neither waits nor acquires a lock.
+//! - Failure: bounded queue exhaustion remains explicit loss, not proof success.
+//! - Forbidden: no broad policy-marker prefix or one-shot scheduler promotion.
+//! - Evidence: native exact-class tests and strict JobPolicy host acceptance;
+//!   models do not prove physical output, queue capacity or arbitrary progress.
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum MilestoneOutputClass {
@@ -49,6 +60,7 @@ pub(super) fn milestone_output_class(name: &str) -> MilestoneOutputClass {
             || name == "pager-user-fault-vma-rejected"
             || name == "pager-user-anon-fault-refused"
             || name == "linux-thread-clone-rejected"
+            || name == "job-policy-current-cache-checked"
             || name.starts_with("ipc-donation-")
             || name.starts_with("dvm-input-") =>
         {

@@ -8,6 +8,87 @@ witnesses = "formal/run-source-conformance.sh"
 generated_doc = "docs/ai/formal-contracts.generated.md"
 
 [[risk_surfaces]]
+path = "kernel/nucleus-core/src/debug/milestone_class.rs"
+severity = "high"
+flows = ["job-policy-control"]
+reason = "The exact test-build JobPolicy acceptance event requires existing bounded retry/deferred sink custody, not best-effort loss. Native selector/near-name tests and strict host rejection witness this classification; the policy publication model does not prove queue capacity, physical output or arbitrary progress. Existing required families and qualification counters are unchanged."
+[[source_mappings]]
+path = "kernel/nucleus-core/src/debug/milestone_class.rs"
+models = ["job-policy-publication/JobPolicyPublication"]
+
+[[risk_surfaces]]
+path = "services/rootd/src/job_policy.rs"
+severity = "high"
+flows = ["job-policy-control"]
+reason = "JobPolicy v1 clients preserve full own/effective masks, reject malformed echo/envelope/status and refuse effective widening. Rootd chooses ceilings, not ring0; a successful ceiling query grants no broker authority."
+[[source_mappings]]
+path = "services/rootd/src/job_policy.rs"
+models = ["job-policy-lifecycle/JobPolicyLifecycle"]
+
+[[risk_surfaces]]
+path = "services/rootd/src/job_policy_probe.rs"
+severity = "high"
+flows = ["job-policy-control"]
+reason = "Explicit build-only quiescent probe verifies root deny/restore, child intersection, attenuated refusal and generational retirement. Default-off guard is native-tested; cleanup retains authority on failure and a root restore guard survives early errors. Real installed Current evidence requires signed opt-in boots, not this bounded model alone."
+[[source_mappings]]
+path = "services/rootd/src/job_policy_probe.rs"
+models = ["job-policy-lifecycle/JobPolicyLifecycle", "job-policy-publication/JobPolicyPublication"]
+
+[[risk_surfaces]]
+path = "tools/xtask/src/kvm/job_policy.rs"
+severity = "high"
+flows = ["job-policy-control"]
+reason = "Host acceptance joins one rootd controller report to exact bootstrap PID and complete kernel deny/restore frames, refuses foreign/malformed/replayed evidence or retained cleanup. FNV is transport integrity, not authentication; sealed producers and bootstrap authority remain assumptions."
+[[source_mappings]]
+path = "tools/xtask/src/kvm/job_policy.rs"
+models = ["job-policy-lifecycle/JobPolicyLifecycle", "job-policy-publication/JobPolicyPublication"]
+
+[[risk_surfaces]]
+path = "libs/rustos-user-abi/src/syscall/job_policy.rs"
+severity = "high"
+flows = ["job-policy-control"]
+reason = "Fixed96-byte ceiling ABI remains separate from Job v4; all256 filter positions intersect monotonically and never constitute a positive broker grant. Exact wire layout and range/header admission are native witnesses, not a byte-level TLA proof."
+[[source_mappings]]
+path = "libs/rustos-user-abi/src/syscall/job_policy.rs"
+models = ["job-policy-lifecycle/JobPolicyLifecycle"]
+
+[[risk_surfaces]]
+path = "kernel/compat/src/user/syscall/linux/job_policy_ops.rs"
+severity = "critical"
+flows = ["job-policy-control"]
+reason = "Typed generation-bearing Job descriptors require INSPECT or dedicated SET_POLICY, never SET_LIMITS; closed version/reserved fields precede mutation. Scalar copyout failure does not mint a descriptor or undo completed policy. No component decision or positive subject grant moves into ring0."
+[[source_mappings]]
+path = "kernel/compat/src/user/syscall/linux/job_policy_ops.rs"
+models = ["job-policy-lifecycle/JobPolicyLifecycle", "job-policy-publication/JobPolicyPublication"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/process_table/jobs/policy.rs"
+severity = "critical"
+flows = ["job-policy-control"]
+reason = "Serialized ancestor ceilings publish every existing descendant before return; one-word generation-bound reads tolerate racing old/new policy, never a replacement tenant. Completed kill and exhausted/recycled generations invalidate caches. No whole256-bit/subtree atomicity or member/page teardown proof is claimed."
+[[source_mappings]]
+path = "kernel/ps/src/multitask/process_table/jobs/policy.rs"
+models = ["job-policy-lifecycle/JobPolicyLifecycle", "job-policy-publication/JobPolicyPublication"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/process_table/identity.rs"
+severity = "critical"
+flows = ["job-policy-control"]
+reason = "Birth-published immutable membership uses exact process/MM generation and a replacement-payload release/acquire bridge. Stable chunk storage is not incarnation authority; stale, hidden and retiring publication refuses. Existing process/Current ownership contracts remain prerequisites."
+[[source_mappings]]
+path = "kernel/ps/src/multitask/process_table/identity.rs"
+models = ["job-policy-publication/JobPolicyPublication"]
+
+[[risk_surfaces]]
+path = "kernel/ps/src/multitask/current/job_policy.rs"
+severity = "critical"
+flows = ["job-policy-control"]
+reason = "Installed Current binding uses a bounded pointer-free ceiling primitive with final process-incarnation validation, no PID scan/table recovery or allocation. Native held-table tests execute the binding primitive, not physical Current/IRQ construction; no broker positive grant or hardware claim is implied."
+[[source_mappings]]
+path = "kernel/ps/src/multitask/current/job_policy.rs"
+models = ["job-policy-publication/JobPolicyPublication"]
+
+[[risk_surfaces]]
 path = "kernel/ps/src/multitask/scheduler/current_observation.rs"
 severity = "critical"
 flows = ["scheduler-dispatch"]

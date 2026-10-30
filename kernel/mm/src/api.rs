@@ -88,6 +88,11 @@ pub mod frame_capability {
     };
 }
 
+/// Hierarchical resident-page charge groups (see `memory::charge`).
+pub mod charge {
+    pub use crate::memory::charge::*;
+}
+
 pub mod phys {
     pub use crate::memory::phys::*;
 

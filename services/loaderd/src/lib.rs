@@ -17,7 +17,9 @@
 
 #![no_std]
 
+pub mod application_jobs;
 pub mod aslr;
+pub mod placement;
 mod request_strings;
 pub use request_strings::RequestStrings;
 

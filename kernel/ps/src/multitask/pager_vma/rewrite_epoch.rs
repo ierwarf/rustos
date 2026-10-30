@@ -1,14 +1,19 @@
 //! Bounded consistency interval for one complete VMA range rewrite.
 //! The process writer already owns serialization; fault readers never spin.
 
-use super::{MAX_PROCESS_OBJECTS, MAX_PUBLICATION_SEQUENCE, PagerVmaError, ProcessHandle};
+use super::{MAX_PUBLICATION_SEQUENCE, PagerVmaError, ProcessHandle};
+use crate::multitask::slot_dir::AtomicDir;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 // Per-slot sequences protect payloads, not a range rewrite's temporary empty
 // publications or movement between slots. Never reset this counter on reuse:
 // exact process/MM identity is still checked separately and no scan may ABA.
-pub(super) static REWRITE_EPOCHS: [AtomicU64; MAX_PROCESS_OBJECTS] =
-    [const { AtomicU64::new(0) }; MAX_PROCESS_OBJECTS];
+pub(super) static REWRITE_EPOCHS: AtomicDir<AtomicU64> = AtomicDir::new();
+
+/// Publishes the epoch cells covering `index` before that slot can exist.
+pub(in crate::multitask) fn ensure_slot_storage(index: usize) -> bool {
+    REWRITE_EPOCHS.ensure(index, || AtomicU64::new(0))
+}
 
 /// Only a consistency interval, never VMA, process or frame authority. The
 /// caller already owns this process's writer lock; fault readers never take it.

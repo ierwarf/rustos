@@ -307,7 +307,7 @@ exception is an explicit, scoped charge target.
 
 Implemented in `kernel/ps/src/multitask/process_table/jobs.rs`, the syscall edge
 `kernel/compat/src/user/syscall/linux/job_ops.rs`
-(`SYS_RUSTOS_JOB`, `0x5255_0057`, ABI v1), and the `rootd` client
+(`SYS_RUSTOS_JOB`, `0x5255_0057`, ABI v2), and the `rootd` client
 `services/rootd/src/jobs.rs`. Model: `job-lifecycle`.
 
 What exists: a root job at boot; `CREATE_CHILD`, `GET_INFO`, `KILL` and
@@ -321,9 +321,30 @@ termination the watchdog uses, at most 128 per call, reporting `remaining`.
 Decisions and departures from the sections above, stated so they are not read as
 the final form:
 
-- **Authority is the root-supervisor capability, not a job handle.** The
-  `HandleRights::Job` rights of section 4 are not built, so only `rootd` can
-  operate on jobs. Handle rights land with phase 3, when policy needs them.
+- **Authority is now a typed Job descriptor, not root-supervisor capability.**
+  The executive explicitly grants rootd fd 3 (`JOB_BOOTSTRAP_ROOT_FD`) before
+  its first publication; ordinary/admin/path-matching images get no grant.
+  Every job syscall resolves `job_handle`, its Job type, operation-specific
+  rights and live generation. `PROCESS_JOB` returns identity only within the
+  inspected subtree (out-of-scope/absent PIDs both give `ESRCH`). ABI v2 returns
+  separate `job`/`parent_job` identities and `result_handle` authority. Duplication
+  requires `DUPLICATE` and subset rights; a raw Job object defaults to empty
+  rights, and transfer/fork preserve exact identity and rights. Fork inherits
+  a table rather than making an explicit duplicate request. New descriptors
+  remain reserved until copyout succeeds; failure cancels the exact reservation
+  and kills an unpublished empty child. Source/native tests and the bounded
+  `job-handle-publication` model witness this mechanism. One 1-vCPU KVM attempt
+  reached `rootd: job tree ok` and `ipcbench: end`, but ordinary smoke acceptance
+  failed on a uiserver idle watchdog / missing wayclick frame. Neither diagnostic
+  TLB/IRQ milestone appeared; this is not a matched-cohort regression claim.
+  A subsequently fixed overlapping-fd-reservation defect has native red/green
+  coverage and passed independent review. Two post-fix 1-vCPU attempts also
+  passed the Job self-check but missed full 20s UI readiness (one also missed
+  ipcbench end); no TLB/IRQ diagnostic milestone appeared. A later quiet
+  1-vCPU attempt again missed wayclick readiness. The same authority/fix
+  snapshot subsequently passed full PR (45 artifacts) and one sealed 16-vCPU
+  smoke including the Job self-check and ipcbench end. This is functional SMP
+  evidence, not a failure-rate comparison or an explanation of the UP failures.
 - **Membership is derived, not counted.** Live-process counts are computed by
   scanning the 32 process slots under the process-table lock, so no counter can
   disagree with the processes. This is a phase-1 convenience; the directory in
@@ -338,19 +359,520 @@ the final form:
   job operation after the last member is reaped.
 - **A caller inside the target subtree is refused (`EPERM`).** A supervisor
   cannot kill itself, and the root job cannot be killed at all.
-- **No spawn ABI places a process in a job yet.** The kernel entry exists; the
-  process broker's prepare step does not take a job. Until it does, every
-  process lives in the root job and `rootd` only exercises the tree through a
-  boot self-check (`rootd: job tree ok`).
-- **`rootd`'s memory governor still chooses a process, not a job.** The census
-  now reports the job, which is what the job-level governor will group by.
+- **Broker placement is being connected; rootd placement remains open.** The
+  process broker's ABI v5 prepare now accepts an explicitly flagged, loader-local
+  Job descriptor with `CREATE_PROCESS`. Loaderd's ordinary and fused receives
+  retain kernel-stamped sender identity alongside descriptor transfer, and close
+  received authority after prepare has captured its generation. Commit reserves
+  in that job, or the authenticated requester's job when absent (not loaderd's).
+  Exec rejects placement. The broker/loader seam passed native checks, ten
+  implementation mutants, five spec mutants, its 97-state bounded model, the
+  full now lane and signed build. Rootd now retains child-job authority for
+  loader-launched leases (initial initd and loader-backed restarts), lends only
+  `CREATE_PROCESS|TRANSFER`, verifies the returned process's job, and retains
+  supervisor custody until a failed/lost attempt or exiting lease is empty.
+  The newer rootd slice passed 49 host tests, eight implementation mutants,
+  signed build and the expanded 277-state model with seven spec mutants. Its
+  witness-routing host-test omission was fixed; refreshed now checks are pending.
+  One unsealed 1-vCPU smoke reached `rootd: loader job placement ok`, but failed
+  full 20s ipcbench/compositor/wayclick readiness without either TLB/IRQ diagnostic
+  milestone. This is limited placement evidence, not full smoke acceptance or a
+  matched-cohort regression claim. Boot-direct service placement and job-level
+  OOM policy remain open; the earlier `rootd: job tree ok` alone is not evidence
+  of service placement. The subsequent boot-direct source slice now uses a
+  versioned 40-byte `RustosBootstrapSpawnArgs` at `SYS_RUSTOS_SPAWN_EXEC`, with a
+  required typed CREATE_PROCESS Job descriptor, forwarded through ConsoleProgramSpec
+  to reservation. Rootd allocates, retains and verifies a child job for these
+  services too. Native compat 226, feature-unified ABI 69 and rootd host-test 51
+  passed. Its full now lane (768 selected native tests), signed build, ten
+  implementation mutants and additional rights spec mutant also passed. A new
+  unsealed 1-vCPU smoke reached five direct-placement markers and the loader
+  placement marker, but missed full 20s ipcbench/wayclick readiness without either
+  TLB/IRQ diagnostic milestone. These limited functional markers do not establish
+  full smoke acceptance or a regression rate. Work stopped at the operator's
+  commit checkpoint.
+- **`rootd`'s memory governor now prefers a whole job (2026-10-29).** It groups
+  the census by job, sums the eligible members' resident pages, and probes jobs
+  largest first. A job is killable only if no protected pid (rootd, every core
+  and post-init lease, every reporter) lies anywhere in its subtree. The kernel
+  answers that per pid through `JOB_OP_OPEN_SUBTREE` (a rights-attenuated handle
+  to a job named by id, granted only inside the authorizing handle's subtree)
+  followed by `PROCESS_JOB`, which is `ESRCH` for a pid outside the subtree. So
+  ancestors, descendants and siblings need no tree walk in `rootd`, and any
+  other answer, including an error, refuses. With no killable job the verdict
+  is the single largest eligible process, exactly as before. A job kill also
+  counts as a rootd termination for the ring0 watchdog, which therefore defers.
+  Limits: the census lists the 32 largest processes, so a job's sum is a lower
+  bound; the ring0 watchdog still ends a single process, not a job, because the
+  lease set that protects services lives in `rootd`; and no unprotected
+  application job exists at boot yet (applications inherit `initd`'s protected
+  job), so the job path is covered by unit tests, source guards and mutants but
+  has not run in a live OOM episode.
 
-Verification: the `job-lifecycle` TLA+ model (two spec mutants killed), seven
-kernel-ps unit tests, four compat tests, three implementation mutants killed,
-and a 1-vCPU KVM boot that reached the self-check milestone. The process-table
-Loom and Shuttle witnesses were **not** extended for the job slab: it shares the
-process-table lock, so there is no new lock-free path, but that is an argument,
-not a concurrency witness.
+Initial verification: the `job-lifecycle` TLA+ model (two spec mutants killed),
+seven kernel-ps unit tests, four compat tests, three implementation mutants
+killed, and a 1-vCPU KVM boot that reached the self-check milestone.
+
+Follow-up verification: the model now separates explicit-job reservation from
+publication and checks the original generation again after a possible kill and
+slot reuse (5,994 distinct states). Nine native job tests include publication
+refusal after reservation and kill/reuse, exact cancellation after refusal, and
+actual last-thread detach/reap followed by job-slot reuse. Two new implementation
+mutants and the new stale-reservation spec mutant were killed; both original
+spec mutants were re-killed. Two registered Loom and two Shuttle witnesses cover
+reservation versus kill/publication and exiting-object reap versus reuse. They
+are bounded projections using one model mutex, not executions of the production
+spinlock, teardown, or the whole job slab. The whole Loom and Shuttle lanes
+passed. The reservation/concurrency slice alone changed no job authority or spawn ABI.
+The subsequent typed-handle/ABI-v2 slice described above is still being validated;
+none of this claims that service placement, job-level OOM policy or all remaining
+phase-1 departures are closed.
+
+### Phase 2a as built
+
+Implemented in `kernel/ps/src/multitask/slot_dir.rs`, `process_table.rs`,
+`process_table/spawn.rs` and `kernel/ps/src/user/handles.rs`. Model:
+`slot-directory-growth`.
+
+What changed: the 32-slot process table and the six lock-free arrays sized by
+it (identity x3, pin cells, rewrite epochs, placement cells, VMA tables and
+writer locks) are chunked directories. A chunk is 32 slots, is allocated in
+normal context, published once, and **never freed or moved**, so a reader with
+interrupts off still dereferences stable storage. `grow_slots` publishes every
+side array's chunk first and installs the table chunk last, without allocating
+under the table lock; `reserve_spawn_in` grows on demand while a free slot
+below the limit is missing. The reaper now works in batches of 32 under one lock
+hold instead of keeping two process-count-sized arrays on the stack. The console
+open-description registry, a second hidden cap of 256 entries that panicked when
+full, grows the same way (128-entry chunks).
+
+Decisions and limits, so they are not read as the final form:
+
+- **The limit is a runtime variable, not yet job policy.** `process_limit()`
+  defaults to 32 (`DEFAULT_PROCESS_LIMIT`), `set_process_limit` clamps to the
+  directory ceiling of 4096 slots, and lowering it never evicts a live process.
+  Nothing sets it yet: wiring it to the root job's `processes.max` needs
+  `SET_LIMITS`, which is phase 2b. Boot behaviour is therefore unchanged.
+- **Other constants remain.** Threads per process (32, which also sizes each
+  placement cell), the job slab (64 jobs, depth 8), service endpoints (16), and
+  the other fixed tables listed in section 1 are untouched.
+- **Chunks are leaked on purpose.** A process slot index is stable for the life
+  of the system; memory is only ever added.
+- **The ceiling is an implementation bound**, 128 chunks of 32 slots, kept so
+  the directory itself is a fixed array that needs no allocation to read.
+
+Verification: 1022 kernel-ps unit tests (new: four directory tests, five growth,
+limit and batched-reap tests), `slot-directory-growth` TLA+ with two spec
+mutants killed, four implementation mutants killed, and a Loom and Shuttle
+witness for chunk publication and for side-storage-before-slot (the Loom
+ordering witness was shown to fail when its release/acquire pairing is
+removed). Those witnesses are protocol projections; they do not execute the
+production allocator or table lock. A boot with more than 32 processes has not
+been run; chunk 0 is grown at first process creation in every boot, chunks past
+it only in unit tests.
+
+Live evidence on the sealed tree (16 vCPU, `--expect "ipcbench: end"`,
+`--timeout 20`, no matched control arm): the OOM hog e2e passed, and 47 of 52
+boots passed (5 failures: two missing the gpu-scene compiler, one compositor and
+wayclick, two `ipcbench: end` not reached in 20 s; no panic and neither
+diagnostic milestone). The earlier unmatched baseline was 48/50; 5/52 against
+2/50 failures is not distinguishable at these sample sizes (Fisher p ~0.4), so
+this is neither a regression finding nor a clean bill. `--proc-stress` did not
+print any `procstress:` line in two attempts (16 vCPU and 1 vCPU); whether that
+mode ever worked end to end was not established, so it gives no evidence either
+way.
+
+### Phase 2b (counted limits) as built
+
+Implemented in `process_table/jobs.rs`, `process_table/spawn.rs`,
+`process_table.rs` (`attach_task`), `kernel/compat/src/user/syscall/linux/job_ops.rs` and
+`services/rootd/src/jobs.rs`; ABI `SYS_RUSTOS_JOB` v3, op `SET_LIMITS` (7).
+Model: `job-limits`.
+
+What exists: a job carries an own `processes` and `threads` limit (unset =
+inherit); the effective limit is the tightest on the chain to the root.
+Admission of a process (at reservation for an explicit job, authoritatively at
+publication) and of a thread (`attach_task`) asks every job on the chain whether
+its subtree count plus one fits that job. Counts are the unreaped process
+objects and their threads, derived from the objects under the process-table
+lock, so no counter can drift. A larger child limit is accepted and clamped in
+the effective value; lowering a limit evicts nobody and only stops admission.
+`GET_INFO` reports own limits, effective limits and usage, and `SET_LIMITS`
+returns the limits now in force. The root job's process limit **is**
+`process_limit()`, so the 2a runtime variable is now the root job's policy
+value, reachable through a handle that holds `SET_LIMITS`.
+
+**Not done, and deliberately not faked:**
+
+- **`memory.max`, `memory.high`, `memory.min` and `kmem.max_bytes`.** Charging
+  memory exactly needs a hook at each site in the frame-descriptor ledger that
+  changes a root's data-leaf count (exclusive publish, shared alias, release,
+  copy-on-write break, root unregister), carrying a charge group from the root
+  record to the job. That is a change inside a critical, formally modelled path
+  of `kernel/mm`, so it is its own slice. `SET_LIMITS` rejects the memory mask
+  bit instead of storing a limit nothing enforces.
+- **Per-CPU stock charging.** Counts here are exact and derived under the
+  table lock, which is right for process and thread admission (rare events). The
+  stock-and-batch design of section 6 is for the page-fault path and arrives
+  with memory.
+- **Policy.** `rootd` sets no limit at boot; the defaults (root processes 32,
+  everything else unset) keep boot behaviour unchanged. The boot self-check
+  exercises set, read-back, clamp reporting and the missing-right refusal.
+- **`handles.max`, `endpoints.max`, `ipc_objects.max`** and the 32-threads-per-
+  process structural cap are untouched.
+- A scan of the process slots per admission is O(slots x depth); fine at tens
+  of processes, to be indexed when the table is large.
+
+Verification: 1031 kernel-ps tests (eight new job-limit tests plus a fork
+inheritance test), compat job_ops 12, rootd 59; TLA+ `job-limits` (4096 states)
+with two spec mutants killed; five implementation mutants killed (one first
+survived because an explicit-job pre-check hid the publication check; the fork
+inheritance test now kills it). The 2a "reserve ignores the limit" mutant was
+removed: once admission counts processes it is equivalent. No concurrency
+witness was added because every check runs under the existing table lock.
+
+### Phase 2b-ii (memory limit) as built
+
+Implemented in `kernel/mm/src/memory/charge.rs`, the frame-descriptor ledger
+(`phys/frame_descriptor_ledger.rs`), the admission calls in
+`address_space/pager_fault_mapping.rs` and `address_space.rs`, the binding in
+`kernel/ps` (`process_table/spawn.rs` at publication, `process_table.rs` at exec
+commit), job ABI v4 (`JOB_LIMIT_MEMORY_PAGES`) and `rootd`. Model:
+`memory-charge-conservation`.
+
+How it works: each job owns a **charge group** of the same index (64, asserted
+equal to the job slab). A process's address-space root is bound to its job's
+group once, in the root's otherwise unused `next_or_virtual_address` word. The
+ledger charges the group exactly where it raises the root's data-leaf count (the
+exclusive, shared-alias and private-file publish sites) and uncharges where it
+lowers it (`decrement_root_data_count_with`), and the charge propagates to every
+ancestor, so a group's usage equals the pages held at or below it by
+construction. Binding a root that already holds pages (a new image, a forked
+child, an exec's new image) charges what it holds, forcibly. `memory_pages` is the
+group's own limit; the effective limit is the tightest on the chain.
+
+**Enforcement.** Before a root claims a page the caller asks `root_admits`, and a
+refusal is `AddressSpaceError::OutOfFrames`, the same error a watermark denial
+returns: the first-touch gate returns its unpublished frame and reports a
+refused fault, and fault-around stops at the limit. The faulting thread then
+takes an unhandled page fault; there is no policy kill from the limit.
+Admission is advisory (checked before the claim, charged at publication), so a
+limit can be exceeded by pages in flight on other CPUs and by the forced charge
+at binding; usage never drifts from the ledger counts. The model carries that
+as an explicit slack that grows only by concurrent admissions and binding.
+
+**Not done:**
+
+- **Page-table frames and kernel objects are not charged**, so `memory.max`
+  bounds resident user data pages only. `kmem.max_bytes` is not implemented.
+- **`memory.high` and `memory.min`**, and the job-level OOM policy that would use
+  `memory.min` as protection, are not implemented.
+- **Application jobs do not exist yet**, so no application has run into a job
+  memory limit. The live evidence instead comes from `rootd` boot self-checks.
+  `rootd: job memory charge ok` runs on every boot (touching 32 fresh pages
+  raised the root job's usage by at least half and unmapping returned it).
+  `rootd: job memory limit ok peak/limit:` is a **test mode**, built with
+  `RUSTOS_ROOTD_LIMIT_PROBE=1 cargo xtask build`, not a default: run at every
+  boot it perturbed SMP start-up (a CPU's first-reschedule marker went missing
+  in 4 of 60 boots, against none in about 130 boots without it). When enabled,
+  `rootd` starts an unprivileged copy
+  of its own image into a fresh job limited to 12 288 pages (48 MiB), the copy
+  maps 128 MiB and touches pages until it is refused, and the parent checks
+  that the copy died, that the job's peak charge stayed within 256 pages above
+  and 512 below the limit, and that the job drained to zero and its slot was
+  released). The kernel admits a copy of `services/rootd/rootd.elf` for direct
+  spawn only without logical admin. A first attempt with a 2 048-page limit
+  failed the probe with peak 6 436 because the child image itself is charged at
+  publication and is not refused (its 8 MiB static heap alone is 2 048 pages);
+  that is the documented forced binding charge, and the limit was raised above
+  it.
+- Shared copy-on-write pages are charged to every mapping root (per mapping, not
+  per frame), as the model states.
+- A job slot is not reused while pages are still charged to it (a retiring
+  address space can outlive its process object), so a dead job can linger until
+  its last page is freed.
+
+Verification: kernel-mm 103 tests (six charge, seven ledger), kernel-ps job
+tests including limit hierarchy, recycled groups and the release gate; the TLA+
+`memory-charge-conservation` model (85 231 states) with two spec mutants killed;
+ten implementation mutants killed.
+
+### Application placement (step 0a as built; limit proof still open)
+
+`services/rootd/src/loader_realm.rs` retains a separate root-child application
+realm for each loader incarnation. Provisioning is a new exact 16-byte v1
+request in `libs/rustos-user-abi/src/syscall/loader_job_realm.rs`, accompanied by
+one typed, attenuated descriptor. It uses cooperative rootd supervision so a
+queued spawn's first VFSD lookup can complete. An independently duplicated
+descriptor precedes worker startup; incarnation/lease revalidation follows its
+join. `services/rootd/src/job_lease.rs` drains this realm before retiring the
+loader's service job, including incomplete bounded retirement.
+
+`services/loaderd/src/application_launch.rs` places every live runtimed/SESSIOND
+spawn in a child of that realm, not in initd's protected service job. The
+loader retains supervisor custody in
+`services/loaderd/src/application_jobs.rs`, sets all three limits before
+prepare (8 processes, 64 threads, 524288 resident user-data pages), verifies
+membership before a successful reply, and retires the whole job on an error
+or failed terminal reply. Runtime-supplied placement handles are refused.
+Normal collection happens on the next loader request, not a new periodic boot
+probe; a reaped leader retires its remaining descendants. Rootd retains the
+ancestor if the loader dies. Runtimed remains the process requester and still
+records a suspended child before activation. Runtime-launched services receive
+the same isolation; rootd's existing lease protection excludes them from OOM
+victims. No Job descriptor is given to an app.
+
+The 2 GiB default ceiling is finite but allows physical pressure in the current
+2 GiB KVM guest. The opt-in `RUSTOS_LOADERD_LIMIT_PROBE=1` build selects 128 MiB
+only for `/apps/oomhog/oomhog.elf` for the separate limit-refusal proof; it does
+not lower UI/service quotas. Neither setting claims a strict bound
+against forced image-binding charges or concurrent admissions. The model
+`application-job-custody` projects provisioning, all-limits-before-publication,
+exact placement, retained retirement and ancestor recovery; Loom/Shuttle are
+bounded protocol projections. Native tests and focused mutants accompany it.
+Verification of step 0a: native kernel-ps 1035, kernel-compat 233, kernel-mm
+103, kernel-object 7, rustos-user-abi 70, rootd host-test 63, loaderd 25, and OOM
+validator 14 passed. The now lane passed 895 native selections / 932 witness
+associations. Nineteen focused implementation mutants (two are re-anchored
+existing rootd mutants) and five spec mutants were killed. The bounded model
+checked 1780 states; full PR sealed 45 artifacts. A sealed 16-vCPU ordinary
+smoke passed. A separate real hog boot passed exact job-level OOM acceptance:
+pid 75, job 42949672961, resident 372335 pages, free pages 3947 → 208939, with
+actual DVM input relay and no reported panic/stall/relay failure. This proves
+at least half-page recovery, not an observed full drain.
+
+The requested sealed 16-vCPU 40-boot cohort was 38/40 (command exit 1): run 2
+missed the wayclick first-frame marker, run 6 missed `ipcbench: end`. There was
+no matched same-session control, so no regression-rate claim or clean bill is
+made. The runner did not archive both failed debug logs; the retained run-6
+failure summary has no TLB/IRQ diagnostic milestone in its causal tail, which
+is not evidence about the unavailable run-2 full log. Convenience evidence:
+`/tmp/ring3-app-kvm-oom-debugcon.log`, `/tmp/ring3-app-kvm-40.log`,
+`/tmp/ring3-app-kvm-40-failure.json`; the exact seal was copied to
+`/tmp/ring3-app-0a-pr-seal.json` (tree
+`4ad95cd5189ba9e9ee369e51b9d4a6eca20f46fcf90ddbc8771d36c112c34179`).
+Live limited-hog refusal remains open; this is not phase-0 closure. Older
+as-built statements that application jobs do not exist describe earlier
+snapshots. Subsequent edits invalidate that exact-tree seal.
+
+### Application limit proof (step 0b functional evidence; stability follow-up)
+
+The opt-in `RUSTOS_ROOTD_APP_LIMIT_PROBE=1` rootd build adds a state machine in
+`services/rootd/src/application_limit_probe.rs` to the existing census loop,
+not a new thread/timer or default boot check. Combined with
+`RUSTOS_LOADERD_LIMIT_PROBE=1`, only the hog receives the shared 32768-page
+quota defined in `libs/rustos-user-abi/src/syscall/loader_job_realm.rs`.
+The existing job ABI v4 already reports thread and unreaped-process-object
+usage separately from live membership; `services/rootd/src/jobs.rs` preserves
+all three in its client snapshot.
+
+The observer requires an exact quota and JobId, one live process and one
+process object/no children, only one remaining thread, resident charge from 512 pages below to 256 above the
+limit (advisory-admission/binding slack), and free pages above twice the kernel
+reserve. It holds inspect/kill authority, rechecks protected-subtree exclusion
+before each cleanup step, retains custody on partial/denied cleanup, and
+reports drain only after live membership, unreaped objects, threads and page
+charges are zero. The zero-live count alone is insufficient: the real wire →
+client → probe regression failed with premature close/drain before preserving
+`usage_processes`, and passed with the separate object counter. The model and
+Loom/Shuttle projections now retain the post-kill zero-live/nonzero-object
+interval. A stale generational job also means drained under the kernel's
+release gate.
+
+`tools/xtask/src/kvm/application_limit.rs` independently requires the hog's
+exact loader placement and accounting/drain identities plus four distinct
+complete checksum-framed vector-14 worker events. The existing native x86
+wait-status test in
+`kernel/compat/src/user/syscall/linux/process_termination_tests.rs` maps that
+class to SIGSEGV. Physical OOM kills, worker-creation/mmap failures, malformed
+frames, repeats, wrong identity/limit and incomplete drain refuse acceptance.
+The host mode is `--oom-hog-job-limit`, mutually exclusive with watchdog proof.
+
+These are distinct claims: the boot observes worker fault class, near-limit
+accounting, last-thread state, physical headroom and drain; attribution to
+quota refusal also uses the signed hog source's valid anonymous first touches
+in `apps/oomhog/oomhog.c` and the existing native/MM admission witnesses. There
+is no new per-fault kernel cause counter, no whole-C/MM/x86 correctness proof,
+and no claim that the final process wait status is SIGSEGV: rootd deliberately
+cleans up the surviving main thread. The model `application-limit-refusal`
+uses two workers/three pages, with bounded Loom/Shuttle retirement projections,
+not executions of production atomics or teardown. Following the P1 fix, the
+model checked 431 states; all 70 rootd host-tests and 17 implementation/seven
+spec mutants passed, with the full required native batch and focused
+Loom/Shuttle witnesses. The initial refreshed now lane passed 916 selected
+native tests / 958 associations. Full PR then exposed 23 existing test-order-
+dependent mutation baselines, fixed by explicit test-only side-storage growth
+in `kernel/ps/src/multitask/pager_vma/tests.rs`,
+`kernel/ps/src/multitask/process_placement/tests.rs`, and
+`kernel/ps/src/multitask/current_identity/execution/tests.rs`. Their standalone
+red cases now pass green, and all 23 mutants were killed without weakening
+production or runner guards. Post-fixture now passed 951 selected tests / 993
+associations; required native, opt-in signed build, check and contracts passed.
+Live opt-in 60-boot evidence and PR resealing remain pending.
+
+The first sealed opt-in 16-vCPU attempt was rejected by the strict host parser:
+rootd observed job 42949672961 / pid 75 at 32769 charged pages against 32768,
+one thread, free/reserve 342128/3947, and reported drain, but raw `!EX:0e`
+breadcrumbs spliced structured fault-frame prefixes. This is not a passed quota
+proof. The parser is not relaxed. `kernel/hal/src/arch/idt/handlers.rs` now
+routes ordinary user breadcrumbs through the existing bounded, allocation-free
+serialized sink in `kernel/nucleus-core/src/debug/mod.rs`. Supervisor, NMI,
+double-fault and refused-retirement emergency paths stay lock-free/raw. The
+`exception-diagnostic-custody` model and native sink-selection/boundary witnesses
+cover this seam; their concurrency projection is not port-I/O or panic proof.
+The exact pre-fix logs are `/tmp/ring3-quota-kvm-first.log` and
+`/tmp/ring3-quota-kvm-first-debugcon.log`; its full-tree supplemental seal was
+`08c41c639319c8df72339c8893a88bbc9b8de004c35375bb43ad600ab401406b`.
+The correction passed full PR (45 artifacts) and a zero-exclusion supplemental
+seal over 1772 source files, hash
+`61940ff3ed7e1f09f642db8c1659733c9863254e1251a0f4b333a53bfb346b21`.
+The strict single 16-vCPU proof then passed: pid 73, job 42949672961, charged
+32768 pages, free 342110 pages, four checksum-verified vector-14 workers,
+exact object/page drain and real DVM input relay.
+
+The subsequent opt-in cohort was 59/60 (aggregate exit 1). Every attempt and
+pre/post full-tree check was preserved under `/tmp/ring3-quota-60-framing`.
+Run 1 missed `ipcbench: end` within 30 seconds; its accounting/drain markers
+were present but the overall attempt is not counted as a pass. Its full log
+contains no TLB/IRQ diagnostic or panic marker. Accepted charge snapshots
+ranged 32768–32770 pages. All 60 raw logs contain first-reschedule-IPI markers
+for CPU indexes 0–15; this presence check is distinct from complete-frame
+validation and is not a matched-control regression claim. No same-session
+control cohort or performance measurement was run. The test modes remain
+off by default; restore a normal signed image, reseal and execute the required
+40-boot default smoke before advancing.
+
+Fresh resume evidence (2026-10-30): the previous temporary logs were unavailable,
+so the current source was verified again rather than treating this chronology
+as proof. The now lane passed 955 native tests / 998 associations; the required
+native batch passed (kernel-ps 1035, kernel-compat 233, kernel-mm 103,
+kernel-object 7, rustos-user-abi 70), as did rootd 70 / loaderd 25 host tests,
+normal signed build, check, contract generation/check and exact-tree PR seal
+reuse (45 artifacts). An additional zero-exclusion seal covers all 1772 files,
+tree `55ee10fed64c080a622dc75d748904e59b44eedce06d2a887a747300462b7b7c`.
+
+The exact requested default 16-vCPU / 20-second / 40-boot command yielded 38/40
+(exit 1). Runs 1 and 12 missed ipcbench/compositor/wayclick readiness; run 1
+also logged the uiserver main-present watchdog. Both full failed logs are
+retained; neither contains either TLB/IRQ diagnostic milestone or a kernel
+panic marker. All 40 logs contain first-reschedule markers for CPU0–15, and
+none contains an enabled limit-probe result. This is not a matched-control
+regression finding or a claim that all boots passed.
+
+The source-unchanged opt-in signed image then passed one strict quota proof
+and a fresh 60-boot cohort yielded 57/60 (exit 1). Runs 9 and 28 lacked quota
+observation/drain; run 59 had those markers but missed DVM GPU readiness.
+These are failed attempts, not accepted quota proofs. All 60 raw logs contain
+CPU0–15 first-reschedule markers; no failed log contains a TLB/IRQ diagnostic
+milestone or kernel panic marker. There were 58 accounting observations in the
+range 32768–32770 pages. The strict host acceptance passed in each of the 57
+successful attempts. Source/PR supplemental checks ran before and after every
+attempt. These marker checks do not prove arbitrary scheduling progress or a
+matched-control failure rate.
+
+All three probe build options were then unset again. Normal signed build,
+check and contract check passed, followed by a successful live job-level OOM
+proof with real input relay: pid 73, job 42949672961, resident 372271 pages,
+free pages 3947 → 374914. This observes substantial recovery, not a full job
+charge-drain assertion. Current evidence, command lines and raw per-attempt
+logs are retained under `build/ring3-evidence/resume-20261030`; the original
+supplemental seal is retained there too. The user requested execution stability
+before further implementation, so HEAD control preparation and a same-session
+interleaved comparison are next. Step 3 has not been implemented; no dedicated
+benchmark or commit has run. These documentation edits invalidate the earlier
+supplemental source seal and require resealing before another SMP boot.
+
+The subsequent same-session interleaved comparison completed 40 pairs:
+current tree 38/40, clean HEAD 37/40, two-sided Fisher p=1.0. Source supplements
+were checked before/after every attempt and raw logs are retained under
+`build/ring3-evidence/resume-20261030/ab40`. This does not establish equivalence
+or complete stability. Neither arm logged TLB/IRQ diagnostics or a kernel panic;
+all 80 logs contain CPU0–15 first-reschedule markers. Both arms exhibited a
+host runtime-trace rejection when the first snapshot marker preceded storage
+but a later verified snapshot could satisfy the dependency. The serial host
+selector correction in `tools/xtask/src/formal_contracts/runtime_trace.rs`
+leaves all scenario prerequisites and strict frame/identity checks intact.
+Its six focused native tests, 21204-state model, five spec/five source mutant
+kills, independent review, now959/1002, required stable batch and full PR passed.
+A fresh sealed default16-vCPU/20-second/40-boot cohort then passed40/40, exit0,
+with complete-tree checks before the cohort and after each completed attempt
+(1775 files, tree
+`8490b7f51593680b80118444cd1cab6507026720403fe45b7521f96d8714f2f5`).
+All40 raw logs have CPU0–15 first-reschedule markers and no TLB/IRQ diagnostic,
+kernel panic, uiserver watchdog or enabled limit-probe result. Evidence is under
+`build/ring3-evidence/resume-20261030/causal40`. This closes that execution-tooling
+slice, not arbitrary boot liveness or a measured performance/failure-rate
+improvement. Storage-before-input with no later storage marker and ipcbench
+timeouts remain failed-attempt categories, not outcomes this correction repairs.
+Step3 is next and remains unimplemented. Result-document edits invalidate this
+exact-tree seal; final resealing precedes further work.
+
+### Job qualitative ceilings (step 3a; validation in progress)
+
+`libs/rustos-user-abi/src/syscall/job_policy.rs` defines the separate 96-byte
+JobPolicy v1 ABI at `SYS_RUSTOS_JOB_POLICY` (`0x5255_005a`), leaving Job ABI v4
+unchanged. `kernel/compat/src/user/syscall/linux/job_policy_ops.rs` requires
+an exact typed INSPECT descriptor for GET and SET_POLICY for SET; SET_LIMITS
+cannot authorize a qualitative change. Closed wire fields are checked before
+mutation. A later copyout fault reports an error without undoing scalar SET.
+
+`kernel/ps/src/multitask/process_table/jobs/policy.rs` owns four-word ceilings
+under PROCESS_TABLE. ALL is the default own mask; every live ancestor clamps
+the effective mask. A completed SET refreshes all existing descendants; racing
+single-bit checks see old or new data, not an atomic subtree/256-bit snapshot.
+Kill invalidates the cache; reuse cannot alias its generation. The cache's
+release/acquire replacement-payload bridge prevents an old incarnation from
+borrowing a new tenant's operation word. Immutable process membership is
+published in `kernel/ps/src/multitask/process_table/identity.rs` and revalidated
+around the bounded Current adapter in `kernel/ps/src/multitask/current/job_policy.rs`.
+Missing/hidden publication refuses; no table lock, state borrow or PID lookup
+is introduced in this read path.
+
+`services/rootd/src/job_policy.rs` validates typed ABI replies. Its opt-in
+controller in `services/rootd/src/job_policy_probe.rs` requires the exact
+`RUSTOS_ROOTD_POLICY_PROBE=1` build setting, restores the root mask, checks
+all words/hierarchy, attenuated rights, stale generations and child retirement.
+Failures retain cleanup authority. The test-build-only handler witnesses the
+actual installed Current cache on root GET; default builds do not run it.
+`tools/xtask/src/kvm/job_policy.rs` independently requires complete verified
+kernel frames from the exact rootd/bootstrap subject, distinct denial and a
+later allowed observation (initial allowance is not restoration), and a
+successful controller with no cleanup/restore failure. `--job-policy-probe`
+selects host acceptance and cannot combine with memory/process stress proofs.
+
+Models `job-policy-lifecycle` and `job-policy-publication`, native tests,
+implementation/specification mutants and source-anchored Loom/Shuttle/herd
+witnesses cover these bounded mechanisms. They are not executions/proofs of
+production spinlocks, Current ownership, all MM teardown, arbitrary scheduling
+progress or atomic whole-mask updates. Live boot validation and exact-tree
+sealing for this slice are not yet complete.
+
+The first opt-in attempt missed the controller because a subsequent KVM dry-run
+used its default build option and restaged a normal image. That is failed test
+configuration, not a quota/policy proof. Rebuilding opt-in and checking the signed
+rootd artifact restored the controller. The second attempt passed the controller
+but strict host acceptance refused absent Current-cache frames. The debug sink
+classified the new exact event as best-effort; the log's dropped counter rose
+during the probe. A native regression reproduces BestEffort instead of Required.
+`kernel/nucleus-core/src/debug/milestone_class.rs` now puts only the exact event
+in existing bounded retry/deferred custody; near-prefix events stay best-effort.
+Native selector tests and targeted mutants accompany this correction. This does
+not prove queue capacity or arbitrary output progress, and no parser acceptance
+condition is relaxed. Subsequent source changes invalidate both earlier seals;
+new closure gates and sealing precede any further SMP boot. Future dry-runs use
+`--no-build --no-auto-verify` so they cannot replace the selected test image.
+The correction's regression passed green and both exact-class/near-prefix
+implementation mutants were killed fresh. Refreshed now1024 tests/1071
+associations, required native/services, nucleus-core69, xtask237, preflight20/20,
+check, contracts generation/check, non-mutating dry-run and opt-in signed build
+passed. New full PR/whole-source sealing and live rerun remain pending.
+
+**Not step 3 completion:** no production broker consumes this ceiling yet,
+no independently authorized positive subject grant replaces legacy roles,
+and no overlap release has occurred. `IPC_SERVICE_CAP_*` stays intact until
+independent old/new decisions agree through the required release interval;
+local tests cannot establish that release history. A bitmap alone cannot encode
+exact live endpoint-owner, fork noninheritance and revocation authority.
 
 ### 13. Alternatives considered
 
@@ -394,9 +916,28 @@ not a concurrency witness.
 `JobId`, 부모 job 상속, `Killing` job의 신규 멤버·자식 거부, census의 job 필드,
 `rootd`의 부팅 시 자체 점검. 이번 세션에서 만든 OOM 작업(프로세스별 census,
 워터마크, `rootd` 거버너, ring0 watchdog)이 이 설계의 프로세스 단위 선행 형태입니다.
-1단계의 권한 확인은 job 핸들이 아니라 root-supervisor capability이고, 어떤 spawn
-ABI도 아직 프로세스를 특정 job에 넣지 못하며, 거버너는 여전히 프로세스를 고릅니다.
-프로세스 테이블의 Loom/Shuttle witness는 확장하지 않았습니다.
+후속 변경에서 ABI v2의 typed Job 핸들 권한 검사·축소 복제·범위 내 PID 검사와,
+명시적인 커널 부팅 경로를 통한 rootd fd 3 전달을 구현했습니다. 1-vCPU 부팅에서
+자체 점검과 `ipcbench: end`는 확인했지만 UI watchdog/첫 프레임 누락으로 전체
+smoke는 실패했습니다. 이후 수정한 겹치는 fd 예약 결함은 native red/green 검증을
+통과했고, 수정 후보에서도 Job 자체 점검은 통과했지만 전체 20초 UI readiness는
+확인하지 못했습니다. 이후 전체 PR 봉인과 단일 16-vCPU smoke는 통과했습니다.
+이는 기능 검증이며, UP 실패 원인이나 실패율 비교 결과는 아닙니다.
+예약/kill/publication 및 reap/슬롯 재사용의 제한된
+Loom/Shuttle 프로토콜 witness도 추가했습니다(실제 teardown 실행 증명은 아님).
+spawn ABI의 job 배치는 이후 완료되었고, `rootd` 거버너는 이제 보호 대상 pid가 하위
+트리에 하나도 없는 가장 큰 job을 통째로 종료합니다(`JOB_OP_OPEN_SUBTREE` +
+`PROCESS_JOB`으로 커널이 판정, 없으면 기존처럼 가장 큰 단일 프로세스). ring0
+watchdog은 아직 단일 프로세스 단위이고, 응용 job이 아직 없어 job 경로는 실제 OOM
+상황에서 실행되지 않았습니다(단위 테스트·소스 가드·mutant로만 검증).
+
+**2a 구현됨(2026-10-29)**: 프로세스 테이블과 그 크기에 묶인 락 없는 배열 6종이
+32칸 청크 디렉터리가 되었고(청크는 해제·이동하지 않음), `grow_slots`는 보조 배열을
+먼저 게시한 뒤 테이블 청크를 설치합니다. reaper는 32개씩 배치로 처리하고, 콘솔
+open-description 레지스트리(256칸 고정, 가득 차면 panic)도 같은 방식으로 늘어납니다.
+한도(`process_limit`, 기본 32)는 아직 root job 정책이 아니라 런타임 변수이며 2b의
+`SET_LIMITS`가 연결합니다. 스레드 상한 32, job slab 64 등 다른 상수는 그대로입니다.
+32개를 넘는 프로세스로 부팅한 적은 없습니다.
 
 - **문제**: 프로세스 32개, 스레드 32개, 서비스 endpoint 16개, 서비스 ID 정수,
   서비스당 권한 비트 하나(최대 64)가 컴파일 타임 상수이며, 프로세스 상한 하나가

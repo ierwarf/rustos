@@ -73,6 +73,7 @@ use rustos_user_abi::syscall::{
 };
 
 mod commit;
+mod application_launch;
 
 use commit::{commit_prepared_executable, LoaderOperation};
 use loaderd::{
@@ -203,12 +204,15 @@ fn serve(endpoint: u64) {
     let mut reply_cap = 0_u64;
     let mut sender_pid = 0_u64;
     let mut sender_tid = 0_u64;
+    let mut handles = loaderd::placement::ReceivedHandles::default();
+    let mut applications = loaderd::application_jobs::ApplicationJobs::default();
     let mut received = recv_loader_request(
         endpoint,
         &mut request,
         &mut reply_cap,
         &mut sender_pid,
         &mut sender_tid,
+        &mut handles,
     );
     loop {
         if received < 0 {
@@ -222,6 +226,7 @@ fn serve(endpoint: u64) {
                 &mut reply_cap,
                 &mut sender_pid,
                 &mut sender_tid,
+                &mut handles,
             );
             continue;
         }
@@ -231,8 +236,14 @@ fn serve(endpoint: u64) {
         let request_bytes = unsafe {
             core::slice::from_raw_parts(request.as_ptr() as *const u8, received as usize)
         };
-        let handled = handle_wire_request(received as usize, request_bytes, sender_pid, sender_tid);
-        if fused_loader_reply_eligible(handled.cleanup_fds.len(), handled.demote_after_reply) {
+        applications.collect(&mut loaderd::application_jobs::NativeJobs);
+        let handled = handle_wire_request(received as usize, request_bytes, sender_pid, sender_tid, handles.as_slice(), &mut applications);
+        // Prepare retained a generational JobId, never this descriptor. Rejected
+        // requests also release their authority before the next receive.
+        close_fds(handles.as_slice());
+        handles.clear();
+        if handled.application_job.is_none()
+            && fused_loader_reply_eligible(handled.cleanup_fds.len(), handled.demote_after_reply) {
             // CONTRACT: this path owns no post-reply cleanup or class
             // transition. The response and receive buffer are disjoint and
             // remain live for the complete fused transaction.
@@ -245,6 +256,7 @@ fn serve(endpoint: u64) {
                 &mut reply_cap,
                 &mut sender_pid,
                 &mut sender_tid,
+                &mut handles,
             );
             continue;
         }
@@ -257,6 +269,9 @@ fn serve(endpoint: u64) {
             rustos_svc_runtime::ipc::reply(reply_cap, handled.reply.as_ptr(), handled.reply.len())
         };
         if reply < 0 {
+            if let Some(handle) = handled.application_job {
+                applications.abort(handle, &mut loaderd::application_jobs::NativeJobs);
+            }
             rustos_svc_runtime::ipc::debug_line("loaderd: reply failed");
         } else if completion_demotion_due(reply, handled.demote_after_reply) {
             // CONTRACT: The terminal spawn reply transfers the prepared UI
@@ -272,6 +287,7 @@ fn serve(endpoint: u64) {
             &mut reply_cap,
             &mut sender_pid,
             &mut sender_tid,
+            &mut handles,
         );
     }
 }
@@ -282,19 +298,28 @@ fn recv_loader_request(
     reply_cap: &mut u64,
     sender_pid: &mut u64,
     sender_tid: &mut u64,
+    handles: &mut loaderd::placement::ReceivedHandles,
 ) -> i64 {
     // SAFETY: every output points into the single-threaded service loop's live
     // stack frame and remains exclusively borrowed for the blocking call.
-    unsafe {
-        rustos_svc_runtime::ipc::recv_with_sender(
-            endpoint,
-            request.as_mut_ptr().cast::<u8>(),
-            LOADERD_RECV_BYTES,
-            reply_cap,
-            sender_pid,
-            sender_tid,
-        )
-    }
+    handles.clear();
+    let args = rustos_user_abi::syscall::IpcRecvWithHandlesAndSenderArgs {
+        abi_version: rustos_user_abi::syscall::IPC_ABI_VERSION,
+        endpoint,
+        request_ptr: request.as_mut_ptr() as u64,
+        request_capacity: LOADERD_RECV_BYTES as u64,
+        reply_cap_ptr: reply_cap as *mut u64 as u64,
+        sender_pid_ptr: sender_pid as *mut u64 as u64,
+        sender_tid_ptr: sender_tid as *mut u64 as u64,
+        recv_fds_ptr: handles.fds.as_mut_ptr() as u64,
+        recv_fd_capacity: 1,
+        recv_fd_count_ptr: &mut handles.count as *mut u16 as u64,
+        ..rustos_user_abi::syscall::IpcRecvWithHandlesAndSenderArgs::default()
+    };
+    // SAFETY: the live disjoint request, metadata and descriptor buffers above
+    // stay exclusively borrowed until this blocking receive returns.
+    let result = unsafe { rustos_svc_runtime::ipc::recv_with_handles_and_sender(&args) };
+    handles.finish(result)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -307,22 +332,33 @@ fn reply_recv_loader_request(
     next_reply_cap: &mut u64,
     sender_pid: &mut u64,
     sender_tid: &mut u64,
+    handles: &mut loaderd::placement::ReceivedHandles,
 ) -> i64 {
     // SAFETY: response storage and the disjoint receive buffer remain live and
     // immovable until the fused syscall returns; every output is exclusive.
-    let result = unsafe {
-        rustos_svc_runtime::ipc::reply_recv_with_sender(
-            endpoint,
-            reply_cap,
-            response,
-            response_len,
-            request.as_mut_ptr().cast::<u8>(),
-            LOADERD_RECV_BYTES,
-            next_reply_cap,
-            sender_pid,
-            sender_tid,
-        )
+    handles.clear();
+    let args = rustos_user_abi::syscall::IpcReplyRecvWithHandlesAndSenderArgs {
+        reply_recv: rustos_user_abi::syscall::IpcReplyRecvWithSenderArgs {
+            abi_version: rustos_user_abi::syscall::IPC_ABI_VERSION,
+            endpoint, reply_cap,
+            response_ptr: response as u64,
+            response_len: response_len as u64,
+            request_ptr: request.as_mut_ptr() as u64,
+            request_capacity: LOADERD_RECV_BYTES as u64,
+            next_reply_cap_ptr: next_reply_cap as *mut u64 as u64,
+            sender_pid_ptr: sender_pid as *mut u64 as u64,
+            sender_tid_ptr: sender_tid as *mut u64 as u64,
+            ..rustos_user_abi::syscall::IpcReplyRecvWithSenderArgs::default()
+        },
+        recv_fds_ptr: handles.fds.as_mut_ptr() as u64,
+        recv_fd_capacity: 1,
+        recv_fd_count_ptr: &mut handles.count as *mut u16 as u64,
+        ..rustos_user_abi::syscall::IpcReplyRecvWithHandlesAndSenderArgs::default()
     };
+    // SAFETY: response, request, metadata, fd array and count remain live and
+    // disjoint across the full fused transaction, including a blocking receive.
+    let result = unsafe { rustos_svc_runtime::ipc::reply_recv_with_handles_and_sender(&args) };
+    let result = handles.finish(result);
     match classify_reply_recv_recovery(result) {
         ReplyRecvRecoveryAction::None => {}
         ReplyRecvRecoveryAction::PostCommit(_) => {
@@ -358,6 +394,7 @@ struct HandledLoaderRequest {
     reply: LoaderReply,
     cleanup_fds: Vec<i32>,
     demote_after_reply: bool,
+    application_job: Option<u64>,
 }
 
 const LOADERD_RECV_BYTES: usize =
@@ -400,7 +437,15 @@ fn handle_wire_request(
     bytes: &[u8],
     sender_pid: u64,
     sender_tid: u64,
+    descriptors: &[i32],
+    applications: &mut loaderd::application_jobs::ApplicationJobs,
 ) -> HandledLoaderRequest {
+    if received == size_of::<rustos_user_abi::syscall::LoaderJobRealmRequest>() {
+        return application_launch::configure(bytes, sender_pid, descriptors, applications);
+    }
+    if !descriptors.is_empty() && classify_loader_wire_size(received) != LoaderWireKind::Spawn {
+        return spawn_response(LoaderSpawnResponse { status: EINVAL, ..LoaderSpawnResponse::default() });
+    }
     match classify_loader_wire_size(received) {
         LoaderWireKind::Commercial => {
             let request = unsafe { &*bytes.as_ptr().cast::<CommercialMaxProtocolRequest>() };
@@ -410,6 +455,7 @@ fn handle_wire_request(
                 )),
                 cleanup_fds: Vec::new(),
                 demote_after_reply: false,
+                application_job: None,
             }
         }
         LoaderWireKind::ActivateBatch => {
@@ -418,7 +464,7 @@ fn handle_wire_request(
         }
         LoaderWireKind::Spawn => {
             let request = unsafe { &*bytes.as_ptr().cast::<LoaderSpawnRequest>() };
-            handle_request(received, request, sender_pid)
+            handle_request(received, request, sender_pid, descriptors, applications)
         }
         LoaderWireKind::Malformed => spawn_response(LoaderSpawnResponse {
             status: EINVAL,
@@ -476,6 +522,7 @@ fn handle_activate_batch_request(
         reply: LoaderReply::ActivateBatch(response),
         cleanup_fds: Vec::new(),
         demote_after_reply: false,
+        application_job: None,
     }
 }
 
@@ -484,6 +531,7 @@ fn spawn_response(response: LoaderSpawnResponse) -> HandledLoaderRequest {
         reply: LoaderReply::Spawn(response),
         cleanup_fds: Vec::new(),
         demote_after_reply: false,
+        application_job: None,
     }
 }
 
@@ -491,6 +539,8 @@ fn handle_request(
     received: usize,
     request: &LoaderSpawnRequest,
     sender_pid: u64,
+    descriptors: &[i32],
+    applications: &mut loaderd::application_jobs::ApplicationJobs,
 ) -> HandledLoaderRequest {
     let mut response = LoaderSpawnResponse {
         version: LOADER_REQUEST_ABI_VERSION,
@@ -511,6 +561,20 @@ fn handle_request(
         response.status = errno;
         return spawn_response(response);
     }
+    let job_handle = match loaderd::placement::job_handle(request.op, descriptors) {
+        Ok(job) => job,
+        Err(errno) => {
+            response.status = errno;
+            return spawn_response(response);
+        }
+    };
+    application_launch::spawn(request, sender_pid, job_handle, applications)
+}
+
+fn handle_placed_request(request: &LoaderSpawnRequest, job_handle: Option<u64>) -> HandledLoaderRequest {
+    let mut response = LoaderSpawnResponse {
+        version: LOADER_REQUEST_ABI_VERSION, op: request.op, status: 0, pid: -1, reserved0: 0,
+    };
     if request.op == LOADER_OP_ACTIVATE {
         let args = RustosProcActivateBrokerArgs {
             abi_version: PROC_BROKER_ABI_VERSION,
@@ -630,8 +694,9 @@ fn handle_request(
     let prepare_args = RustosProcPrepareBrokerArgs {
         abi_version: PROC_BROKER_ABI_VERSION,
         format: executable_format,
-        flags: prepare_flags,
+        flags: prepare_flags | if job_handle.is_some() { rustos_user_abi::syscall::PROC_BROKER_PREPARE_FLAG_JOB_HANDLE } else { 0 },
         reserved0: prepare_ticket,
+        job_handle: job_handle.unwrap_or(0),
         stack_top,
     };
     trace_line(&format!("loaderd: prepare begin exec={exec_path}"));
@@ -719,6 +784,7 @@ fn handle_request(
         reply: LoaderReply::Spawn(response),
         cleanup_fds: prepared.cleanup_fds,
         demote_after_reply: exec_path == UI_SERVER_EXEC_PATH,
+        application_job: None,
     }
 }
 

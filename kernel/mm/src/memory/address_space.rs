@@ -458,6 +458,12 @@ impl ProcessAddressSpace {
 
             if frame_buffer_pos == frame_buffer_len {
                 let want = (page_count - page_index).min(FRAME_BATCH_CHUNK);
+                // Admit the whole batch before drawing frames: a refusal then
+                // costs no allocation and unwinds like any out-of-frames case.
+                if !phys::root_admits(self.pml4_frame_phys, want as u64) {
+                    rollback_user_pages(self, &mapped_pages, mutation);
+                    return Err(AddressSpaceError::OutOfFrames);
+                }
                 frame_buffer_len = phys::alloc_frames_batch_user(&mut frame_buffer[..want]);
                 frame_buffer_pos = 0;
                 if frame_buffer_len == 0 {

@@ -24,9 +24,11 @@ Root == 0
 None == 99
 MaxGen == 2
 
-VARIABLES jinuse, jkilling, jparent, jgen, pstate, pjob, pjgen, joinedKilling
+VARIABLES jinuse, jkilling, jparent, jgen, pstate, pjob, pjgen, joinedKilling,
+          reserved, rjob, rgen
 
-vars == <<jinuse, jkilling, jparent, jgen, pstate, pjob, pjgen, joinedKilling>>
+vars == <<jinuse, jkilling, jparent, jgen, pstate, pjob, pjgen, joinedKilling,
+          reserved, rjob, rgen>>
 
 TypeOK ==
     /\ jinuse \in [Jobs -> BOOLEAN]
@@ -37,6 +39,9 @@ TypeOK ==
     /\ pjob \in [Procs -> Jobs \cup {None}]
     /\ pjgen \in [Procs -> 0..MaxGen]
     /\ joinedKilling \in [Procs -> BOOLEAN]
+    /\ reserved \in [Procs -> BOOLEAN]
+    /\ rjob \in [Procs -> Jobs \cup {None}]
+    /\ rgen \in [Procs -> 0..MaxGen]
 
 Init ==
     /\ jinuse = [j \in Jobs |-> j = Root]
@@ -47,6 +52,9 @@ Init ==
     /\ pjob = [p \in Procs |-> None]
     /\ pjgen = [p \in Procs |-> 0]
     /\ joinedKilling = [p \in Procs |-> FALSE]
+    /\ reserved = [p \in Procs |-> FALSE]
+    /\ rjob = [p \in Procs |-> None]
+    /\ rgen = [p \in Procs |-> 0]
 
 \* k is j or lies below it (the model's depth is at most two).
 InSubtree(j, k) ==
@@ -61,28 +69,49 @@ CreateChild(parent, j) ==
     /\ jinuse' = [jinuse EXCEPT ![j] = TRUE]
     /\ jparent' = [jparent EXCEPT ![j] = parent]
     /\ jkilling' = [jkilling EXCEPT ![j] = FALSE]
-    /\ UNCHANGED <<jgen, pstate, pjob, pjgen, joinedKilling>>
+    /\ UNCHANGED <<jgen, pstate, pjob, pjgen, joinedKilling, reserved, rjob, rgen>>
+
+\* Explicit job admission is checked before image construction. A reservation
+\* does not pin a job: kill may release and recreate it before publication.
+Reserve(p, j) ==
+    /\ pstate[p] = "absent" /\ ~reserved[p]
+    /\ jinuse[j] /\ ~jkilling[j]
+    /\ reserved' = [reserved EXCEPT ![p] = TRUE]
+    /\ rjob' = [rjob EXCEPT ![p] = j]
+    /\ rgen' = [rgen EXCEPT ![p] = jgen[j]]
+    /\ UNCHANGED <<jinuse, jkilling, jparent, jgen, pstate, pjob, pjgen, joinedKilling>>
+
+Cancel(p) ==
+    /\ reserved[p]
+    /\ reserved' = [reserved EXCEPT ![p] = FALSE]
+    /\ rjob' = [rjob EXCEPT ![p] = None]
+    /\ rgen' = [rgen EXCEPT ![p] = 0]
+    /\ UNCHANGED <<jinuse, jkilling, jparent, jgen, pstate, pjob, pjgen, joinedKilling>>
 
 Publish(p, j) ==
-    /\ pstate[p] = "absent"
+    /\ pstate[p] = "absent" /\ reserved[p] /\ rjob[p] = j
     /\ jinuse[j]
+    /\ rgen[p] = jgen[j] \* reservation generation guard
     /\ ~jkilling[j] \* publish guard
     /\ pstate' = [pstate EXCEPT ![p] = "live"]
     /\ pjob' = [pjob EXCEPT ![p] = j]
-    /\ pjgen' = [pjgen EXCEPT ![p] = jgen[j]]
+    /\ pjgen' = [pjgen EXCEPT ![p] = rgen[p]]
     /\ joinedKilling' = [joinedKilling EXCEPT ![p] = jkilling[j]]
+    /\ reserved' = [reserved EXCEPT ![p] = FALSE]
+    /\ rjob' = [rjob EXCEPT ![p] = None]
+    /\ rgen' = [rgen EXCEPT ![p] = 0]
     /\ UNCHANGED <<jinuse, jkilling, jparent, jgen>>
 
 Kill(j) ==
     /\ j # Root
     /\ jinuse[j]
     /\ jkilling' = [k \in Jobs |-> IF jinuse[k] /\ InSubtree(j, k) THEN TRUE ELSE jkilling[k]]
-    /\ UNCHANGED <<jinuse, jparent, jgen, pstate, pjob, pjgen, joinedKilling>>
+    /\ UNCHANGED <<jinuse, jparent, jgen, pstate, pjob, pjgen, joinedKilling, reserved, rjob, rgen>>
 
 Exit(p) ==
     /\ pstate[p] = "live"
     /\ pstate' = [pstate EXCEPT ![p] = "exiting"]
-    /\ UNCHANGED <<jinuse, jkilling, jparent, jgen, pjob, pjgen, joinedKilling>>
+    /\ UNCHANGED <<jinuse, jkilling, jparent, jgen, pjob, pjgen, joinedKilling, reserved, rjob, rgen>>
 
 Reap(p) ==
     /\ pstate[p] = "exiting"
@@ -90,7 +119,7 @@ Reap(p) ==
     /\ pjob' = [pjob EXCEPT ![p] = None]
     /\ pjgen' = [pjgen EXCEPT ![p] = 0]
     /\ joinedKilling' = [joinedKilling EXCEPT ![p] = FALSE]
-    /\ UNCHANGED <<jinuse, jkilling, jparent, jgen>>
+    /\ UNCHANGED <<jinuse, jkilling, jparent, jgen, reserved, rjob, rgen>>
 
 Release(j) ==
     /\ j # Root
@@ -103,11 +132,12 @@ Release(j) ==
     /\ jparent' = [jparent EXCEPT ![j] = None]
     /\ jkilling' = [jkilling EXCEPT ![j] = FALSE]
     /\ jgen' = [jgen EXCEPT ![j] = jgen[j] + 1]
-    /\ UNCHANGED <<pstate, pjob, pjgen, joinedKilling>>
+    /\ UNCHANGED <<pstate, pjob, pjgen, joinedKilling, reserved, rjob, rgen>>
 
 Next ==
     \/ \E parent \in Jobs, j \in Jobs: CreateChild(parent, j)
-    \/ \E p \in Procs, j \in Jobs: Publish(p, j)
+    \/ \E p \in Procs, j \in Jobs: Reserve(p, j) \/ Publish(p, j)
+    \/ \E p \in Procs: Cancel(p)
     \/ \E j \in Jobs: Kill(j) \/ Release(j)
     \/ \E p \in Procs: Exit(p) \/ Reap(p)
     \/ UNCHANGED vars \* the bounded generation space is exhausted

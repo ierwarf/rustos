@@ -9,6 +9,8 @@
 
 const OOM_HOG_STARTED_MARKER: &str = "oomhog: start pid";
 const OOM_HOG_KILLED_MARKER: &str = "rootd: oom killed pid/pages/free:";
+const OOM_HOG_JOB_KILLED_MARKER: &str = "rootd: oom killed job/pid/pages/free:";
+const OOM_HOG_JOB_PLACED_MARKER: &str = "loaderd: application job placed job/pid/limit:";
 const OOM_HOG_RECOVERED_MARKER: &str = "rootd: oom recovered free/min:";
 /// Milestone names as the debug channel renders them (`name=...`).
 const OOM_HOG_WATCHDOG_KILLED_MARKER: &str = "name=oom-watchdog-kill ";
@@ -22,6 +24,7 @@ const OOM_HOG_MIN_KILLED_PAGES: u64 = 65_536;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct OomHogEvidence {
     pid: u64,
+    job: Option<u64>,
     resident_pages: u64,
     /// Free pages when the kill was issued, at the kernel reserve.
     free_pages: u64,
@@ -44,7 +47,7 @@ fn validate_oom_hog_log(log: &str) -> Result<OomHogEvidence> {
     if log.contains(OOM_HOG_SURVIVED_MARKER) {
         bail!("oomhog survived its deadline: the memory governor did not terminate it");
     }
-    if log.contains(OOM_HOG_REJECTED_MARKER) {
+    if log.contains(OOM_HOG_REJECTED_MARKER) || log.contains("rootd: oom job kill rejected") {
         bail!("rootd selected a victim but the kernel rejected the termination");
     }
     if log.contains(OOM_HOG_NO_VICTIM_MARKER) {
@@ -61,11 +64,30 @@ fn validate_oom_hog_log(log: &str) -> Result<OomHogEvidence> {
             started.len()
         );
     };
-    let kills: Vec<Vec<u64>> = log
-        .lines()
-        .filter_map(|line| numbers_after(line, OOM_HOG_KILLED_MARKER))
-        .collect();
-    let [kill] = kills.as_slice() else {
+    let mut kills = Vec::new();
+    for line in log.lines() {
+        if let Some(fields) = numbers_after(line, OOM_HOG_JOB_KILLED_MARKER) {
+            let [job, pid, pages, free] = fields.as_slice() else {
+                bail!("malformed rootd job oom kill record: {fields:?}");
+            };
+            if *job == 0 || *job == rustos_user_abi::syscall::JOB_ID_ROOT {
+                bail!("rootd job oom kill did not name an application child job");
+            }
+            let matching_placement = log.lines().any(|line| {
+                numbers_after(line, OOM_HOG_JOB_PLACED_MARKER).is_some_and(|placement| {
+                    matches!(placement.as_slice(), [placed_job, placed_pid, limit]
+                        if placed_job == job && placed_pid == pid && *limit > 0 && *limit != u64::MAX)
+                })
+            });
+            if !matching_placement {
+                bail!("rootd job oom kill has no matching limited application placement");
+            }
+            kills.push((Some(*job), vec![*pid, *pages, *free]));
+        } else if let Some(fields) = numbers_after(line, OOM_HOG_KILLED_MARKER) {
+            kills.push((None, fields));
+        }
+    }
+    let [(job, kill)] = kills.as_slice() else {
         bail!(
             "expected rootd to kill exactly one process under pressure, found {}",
             kills.len()
@@ -105,6 +127,7 @@ fn validate_oom_hog_log(log: &str) -> Result<OomHogEvidence> {
     }
     Ok(OomHogEvidence {
         pid: *killed_pid,
+        job: *job,
         resident_pages: *resident_pages,
         free_pages: *free_pages,
         recovered_free_pages: *recovered_free_pages,
@@ -130,7 +153,7 @@ fn validate_oom_hog_watchdog_log(log: &str) -> Result<OomHogEvidence> {
     if log.contains(OOM_HOG_SURVIVED_MARKER) {
         bail!("oomhog survived its deadline: the watchdog did not terminate it");
     }
-    if log.contains(OOM_HOG_KILLED_MARKER) {
+    if log.contains(OOM_HOG_KILLED_MARKER) || log.contains(OOM_HOG_JOB_KILLED_MARKER) {
         bail!("rootd killed a process although its census was supposed to be blind");
     }
     if log.contains("name=oom-watchdog-protected ") {
@@ -175,6 +198,7 @@ fn validate_oom_hog_watchdog_log(log: &str) -> Result<OomHogEvidence> {
     }
     Ok(OomHogEvidence {
         pid: *killed_pid,
+        job: None,
         resident_pages: 0,
         free_pages: *free_pages,
         recovered_free_pages: *recovered_free_pages,
@@ -201,11 +225,42 @@ mod oom_hog_tests {
             evidence,
             OomHogEvidence {
                 pid: 41,
+                job: None,
                 resident_pages: 380_000,
                 free_pages: 3_900,
                 recovered_free_pages: 380_000
             }
         );
+    }
+
+    #[test]
+    fn oom_readiness_accepts_process_or_job_termination_before_exact_validation() {
+        let options = parse_smoke_options(vec!["--oom-hog".to_owned()].into_iter()).unwrap();
+        assert!(options.expected_markers.iter().any(|marker| marker == "rootd: oom killed "));
+        assert!(!options.expected_markers.iter().any(|marker| marker == OOM_HOG_KILLED_MARKER));
+        for marker in [OOM_HOG_KILLED_MARKER, OOM_HOG_JOB_KILLED_MARKER] {
+            assert!(marker.contains("rootd: oom killed "));
+        }
+    }
+
+    #[test]
+    fn a_job_kill_requires_the_exact_limited_application_placement_and_no_collateral() {
+        let placed = "loaderd: application job placed job/pid/limit: 80 41 524288";
+        let killed = "rootd: oom killed job/pid/pages/free: 80 41 380000 3900";
+        let valid = log(&[START, placed, killed, RECOVERED]);
+        assert_eq!(validate_oom_hog_log(&valid).unwrap().job, Some(80));
+        for bad in [
+            valid.replace(placed, ""),
+            valid.replace("80 41 524288", "81 41 524288"),
+            valid.replace("80 41 524288", "80 42 524288"),
+            valid.replace("80 41 524288", "80 41 0"),
+            valid.replace("80 41 524288", "80 41 18446744073709551615"),
+            valid.replace("80 41 380000 3900", "0 41 380000 3900"),
+            valid.replace("80 41 380000 3900", "80 41 380000"),
+            format!("{valid}\n{KILL}"),
+            format!("{valid}\nrootd: oom job kill rejected job/pid/pages/free: 80 41 1 1"),
+        ] { assert!(validate_oom_hog_log(&bad).is_err(), "accepted: {bad}"); }
+        assert!(validate_oom_hog_watchdog_log(&log(&[START, W_KILL, W_BACK, killed])).is_err());
     }
 
     #[test]

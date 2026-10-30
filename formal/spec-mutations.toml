@@ -12,6 +12,8 @@ schema = "rustos-tla-mutation-corpus-v1"
 required_models = [
     "acceptance-profile-publication/AcceptanceProfilePublication",
     "affinity-claim-admission/AffinityClaimAdmission",
+    "application-job-custody/ApplicationJobCustody",
+    "application-limit-refusal/ApplicationLimitRefusal",
     "atomic-process-activation-batch/AtomicProcessActivationBatch",
     "bootstrap-activation-handoff/BootstrapActivationHandoff",
     "capability-derivation-lifecycle/CapabilityDerivationLifecycle",
@@ -25,6 +27,7 @@ required_models = [
     "dvm-input-ring/DvmInputRing",
     "dvm-network-ring/DvmNetworkRing",
     "dvm-transport-lifecycle/DvmTransportLifecycle",
+    "exception-diagnostic-custody/ExceptionDiagnosticCustody",
     "exception-retirement-lifecycle/ExceptionRetirementLifecycle",
     "exec-address-space-transaction/ExecAddressSpaceTransaction",
     "frame-reader-claim/FrameReaderClaim",
@@ -36,8 +39,14 @@ required_models = [
     "ipc-reply-deadline/IpcReplyDeadline",
     "ipc-reply-recv-transaction/IpcReplyRecvTransaction",
     "ipc-transfer-authority/IpcTransferAuthority",
+    "job-handle-publication/JobHandlePublication",
     "job-lifecycle/JobLifecycle",
+    "job-limits/JobLimits",
+    "job-policy-lifecycle/JobPolicyLifecycle",
+    "job-policy-publication/JobPolicyPublication",
+    "job-spawn-placement/JobSpawnPlacement",
     "lifecycle-execution-claim/LifecycleExecutionClaim",
+    "memory-charge-conservation/MemoryChargeConservation",
     "mm-activation-close/MmActivationClose",
     "msi-vector-lifecycle/MsiVectorLifecycle",
     "netd-deferred-reply/NetdDeferredReply",
@@ -52,6 +61,7 @@ required_models = [
     "process-lifecycle-transaction/ProcessLifecycleTransaction",
     "product-boot/ProductBoot",
     "robust-futex-owner-death/RobustFutexOwnerDeath",
+    "runtime-trace-causal-selection/RuntimeTraceCausalSelection",
     "scheduler-active-balance/SchedulerActiveBalance",
     "scheduler-cpu-distribution/SchedulerCpuDistribution",
     "scheduler-cpu-ownership/SchedulerCpuOwnership",
@@ -60,6 +70,7 @@ required_models = [
     "scheduler-thread-demotion/SchedulerThreadDemotion",
     "scheduler-wakeup/SchedulerWakeup",
     "sigchld-notification/SigchldNotification",
+    "slot-directory-growth/SlotDirectoryGrowth",
     "smp-reschedule-ipi/SmpRescheduleIpi",
     "smp-ring3-qualification/SmpRing3Qualification",
     "synchronous-ipc-handoff-concurrency/SynchronousIpcHandoffConcurrency",
@@ -183,6 +194,164 @@ replace = '''Eligible == TRUE /\ processAllows /\ binding = uid'''
 occurrence = 1
 invariant = "ClaimHasCurrentAffinity"
 min_counterexample_states = 4
+
+[[mutation]]
+id = "application-job-ack-foreign-placement"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "application-job-custody/ApplicationJobCustody"
+flow = "application-job-custody"
+find = '''    /\ exact[c] \* PROCESS_JOB must match before exposing success'''
+replace = '''    /\ TRUE \* PROCESS_JOB must match before exposing success'''
+occurrence = 1
+invariant = "AcknowledgedExactPlacement"
+min_counterexample_states = 5
+
+[[mutation]]
+id = "application-job-close-before-empty"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "application-job-custody/ApplicationJobCustody"
+flow = "application-job-custody"
+find = '''    /\ remaining[c] = 0 \* partial or denied kill cannot release custody'''
+replace = '''    /\ TRUE \* partial or denied kill cannot release custody'''
+occurrence = 1
+invariant = "ClosedOnlyWhenEmpty"
+min_counterexample_states = 6
+
+[[mutation]]
+id = "application-job-provision-without-authority"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "application-job-custody/ApplicationJobCustody"
+flow = "application-job-custody"
+find = '''    /\ authorized \* exact sender, live rootd owner and exact typed rights'''
+replace = '''    /\ TRUE \* exact sender, live rootd owner and exact typed rights'''
+occurrence = 1
+invariant = "ProvisionedOnlyByAuthority"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "application-job-publish-before-limits"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "application-job-custody/ApplicationJobCustody"
+flow = "application-job-custody"
+find = '''    /\ loaderAlive /\ ~revoked /\ phase[c] = "limited"
+    /\ limited[c] /\ own[c]'''
+replace = '''    /\ loaderAlive /\ ~revoked /\ phase[c] \in {"created", "limited"}
+    /\ own[c]'''
+occurrence = 1
+invariant = "LimitedBeforePublication"
+min_counterexample_states = 4
+
+[[mutation]]
+id = "application-job-release-realm-before-drain"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "application-job-custody/ApplicationJobCustody"
+flow = "application-job-custody"
+find = '''    /\ \A c \in Children: remaining[c] = 0 \* realm must drain before authority closes'''
+replace = '''    /\ TRUE \* realm must drain before authority closes'''
+occurrence = 1
+invariant = "NoAbandonedMembers"
+min_counterexample_states = 6
+
+[[mutation]]
+id = "application-limit-accept-without-framed-faults"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "application-limit-refusal/ApplicationLimitRefusal"
+flow = "application-limit-refusal"
+find = '''    /\ faults = Workers \* four independently verified native worker records'''
+replace = '''    /\ TRUE \* four independently verified native worker records'''
+occurrence = 1
+invariant = "AcceptedRequiresAllFaults"
+min_counterexample_states = 4
+
+[[mutation]]
+id = "application-limit-cleanup-without-scope-recheck"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "application-limit-refusal/ApplicationLimitRefusal"
+flow = "application-limit-refusal"
+find = '''    /\ ~protected \* recheck immediately before cleanup'''
+replace = '''    /\ TRUE \* recheck immediately before cleanup'''
+occurrence = 1
+invariant = "CleanupHasSafeScope"
+min_counterexample_states = 4
+
+[[mutation]]
+id = "application-limit-drain-uses-live-count"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "application-limit-refusal/ApplicationLimitRefusal"
+flow = "application-limit-refusal"
+find = '''    /\ objects = 0 \* live zero is not object zero'''
+replace = '''    /\ live = 0 \* live zero is not object zero'''
+occurrence = 1
+invariant = "DrainedMeansNoObjectsOrPages"
+min_counterexample_states = 4
+
+[[mutation]]
+id = "application-limit-drain-with-pages"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "application-limit-refusal/ApplicationLimitRefusal"
+flow = "application-limit-refusal"
+find = '''    /\ pages = 0 \* a dead process is not yet zero-charge evidence'''
+replace = '''    /\ TRUE \* a dead process is not yet zero-charge evidence'''
+occurrence = 1
+invariant = "DrainedMeansNoObjectsOrPages"
+min_counterexample_states = 4
+
+[[mutation]]
+id = "application-limit-observation-ignores-extra-object"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "application-limit-refusal/ApplicationLimitRefusal"
+flow = "application-limit-refusal"
+find = '''    /\ live = 1 /\ objects = 1 \* one live member is not one process object'''
+replace = '''    /\ live = 1 \* one live member is not one process object'''
+occurrence = 1
+invariant = "ObservedHasExactQuota"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "application-limit-observe-without-profile"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "application-limit-refusal/ApplicationLimitRefusal"
+flow = "application-limit-refusal"
+find = '''    /\ enabled /\ limitMatch /\ headroom \* explicit test mode and exact quota'''
+replace = '''    /\ TRUE \* explicit test mode and exact quota'''
+occurrence = 1
+invariant = "ObservedHasExactQuota"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "application-limit-rejection-closes-custody"
+kind = "transition-effect"
+severity = "critical"
+model = "application-limit-refusal/ApplicationLimitRefusal"
+flow = "application-limit-refusal"
+find = '''    /\ phase' = "rejected" /\ own' = own \* denied cleanup retains custody'''
+replace = '''    /\ phase' = "rejected" /\ own' = FALSE \* denied cleanup retains custody'''
+occurrence = 1
+invariant = "RetirementRetainsCustody"
+min_counterexample_states = 4
+
+[[mutation]]
+id = "capability-derivation-kind-substitution"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "capability-derivation-lifecycle/CapabilityDerivationLifecycle"
+flow = "capability-derivation-lifecycle"
+find = "    /\\ kind = parentKind \\* same object kind\n"
+replace = "    /\\ TRUE \\* same object kind\n"
+occurrence = 1
+invariant = "LiveChildIsAttenuatedAndExact"
+min_counterexample_states = 2
 
 [[mutation]]
 id = "capability-derivation-lease-drift"
@@ -892,6 +1061,42 @@ invariant = "ResetOnlyAfterQuiescence"
 min_counterexample_states = 4
 
 [[mutation]]
+id = "exception-diagnostic-fatal-buffered"
+kind = "transition-effect"
+severity = "critical"
+model = "exception-diagnostic-custody/ExceptionDiagnosticCustody"
+flow = "exception-retirement"
+find = '''    /\ route' = IF user THEN "serialized" ELSE "raw" \* ordinary user is not emergency'''
+replace = '''    /\ route' = "serialized" \* ordinary user is not emergency'''
+occurrence = 1
+invariant = "FatalChoosesEmergency"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "exception-diagnostic-splices-held-frame"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "exception-diagnostic-custody/ExceptionDiagnosticCustody"
+flow = "exception-retirement"
+find = '''    /\ frame # 1 \* normal output cannot splice a held structured frame'''
+replace = '''    /\ TRUE \* normal output cannot splice a held structured frame'''
+occurrence = 1
+invariant = "UserCannotCorruptStructuredFrame"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "exception-diagnostic-user-raw"
+kind = "transition-effect"
+severity = "critical"
+model = "exception-diagnostic-custody/ExceptionDiagnosticCustody"
+flow = "exception-retirement"
+find = '''    /\ route' = IF user THEN "serialized" ELSE "raw" \* ordinary user is not emergency'''
+replace = '''    /\ route' = "raw" \* ordinary user is not emergency'''
+occurrence = 1
+invariant = "UserChoosesSerialized"
+min_counterexample_states = 2
+
+[[mutation]]
 id = "exception-user-diagnostic-memory-probe-restored"
 kind = "transition-effect"
 severity = "critical"
@@ -1354,7 +1559,7 @@ find = '''ReceiveQueued ==
     /\ requestPending' = FALSE
     /\ nextReplyOwned' = TRUE
     /\ resultKind' = Success
-    /\ UNCHANGED <<replyLive, callerRunnable, waiterArmed, serverBlocked>>
+    /\ UNCHANGED <<replyLive, callerRunnable, waiterArmed, serverBlocked, handleReceive, handleOutputsValid>>
 '''
 replace = '''ReceiveQueued ==
     /\ phase = ReplyCommitted
@@ -1364,11 +1569,23 @@ replace = '''ReceiveQueued ==
     /\ nextReplyOwned' = TRUE
     /\ resultKind' = Success
     /\ replyLive' = TRUE
-    /\ UNCHANGED <<callerRunnable, waiterArmed, serverBlocked>>
+    /\ UNCHANGED <<callerRunnable, waiterArmed, serverBlocked, handleReceive, handleOutputsValid>>
 '''
 occurrence = 1
 invariant = "ReplyCommitPrecedesReceive"
 min_counterexample_states = 3
+
+[[mutation]]
+id = "ipc-reply-recv-handle-output-preflight-skipped"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "ipc-reply-recv-transaction/IpcReplyRecvTransaction"
+flow = "scheduler-dispatch"
+find = "    /\\ (~handleReceive \\/ handleOutputsValid) \\* handle output admission\n"
+replace = "    /\\ TRUE \\* handle output admission\n"
+occurrence = 1
+invariant = "HandleOutputsAdmittedBeforeConsume"
+min_counterexample_states = 2
 
 [[mutation]]
 id = "ipc-reply-recv-postcommit-error-untagged"
@@ -1503,6 +1720,66 @@ invariant = "AllJobGatesBeforeRelease"
 min_counterexample_states = 5
 
 [[mutation]]
+id = "job-handle-publication-before-copyout"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "job-handle-publication/JobHandlePublication"
+flow = "capability-derivation-lifecycle"
+find = "    /\\ copyOK \\* copyout guard\n"
+replace = "    /\\ TRUE \\* copyout guard\n"
+occurrence = 1
+invariant = "NoUncopiedOrStalePublication"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "job-handle-publication-cancels-foreign-slot"
+kind = "transition-effect"
+severity = "critical"
+model = "job-handle-publication/JobHandlePublication"
+flow = "capability-derivation-lifecycle"
+find = "    /\\ reserved' = IF ticket = epoch THEN FALSE ELSE reserved\n"
+replace = "    /\\ reserved' = FALSE\n"
+occurrence = 1
+invariant = "NoForeignReservationCancellation"
+min_counterexample_states = 5
+
+[[mutation]]
+id = "job-handle-publication-forgets-child-rollback"
+kind = "transition-effect"
+severity = "critical"
+model = "job-handle-publication/JobHandlePublication"
+flow = "capability-derivation-lifecycle"
+find = "    /\\ childOwed' = FALSE \\* rollback child\n"
+replace = "    /\\ UNCHANGED childOwed \\* rollback child\n"
+occurrence = 1
+invariant = "NoAbandonedChild"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "job-handle-publication-overwrites-live-reservation"
+kind = "transition-effect"
+severity = "critical"
+model = "job-handle-publication/JobHandlePublication"
+flow = "capability-derivation-lifecycle"
+find = "    /\\ epoch' = epoch \\* preserve occupied reservation\n"
+replace = "    /\\ epoch' = 2 \\* preserve occupied reservation\n"
+occurrence = 1
+invariant = "LiveReservationIsNotStolen"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "job-handle-publication-stale-reservation"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "job-handle-publication/JobHandlePublication"
+flow = "capability-derivation-lifecycle"
+find = "    /\\ ticket = epoch \\* exact reservation guard\n"
+replace = "    /\\ TRUE \\* exact reservation guard\n"
+occurrence = 1
+invariant = "NoUncopiedOrStalePublication"
+min_counterexample_states = 5
+
+[[mutation]]
 id = "job-lifecycle-publish-into-killing-job"
 kind = "transition-guard-removal"
 severity = "critical"
@@ -1515,6 +1792,18 @@ invariant = "NoMemberJoinsKillingJob"
 min_counterexample_states = 3
 
 [[mutation]]
+id = "job-lifecycle-publish-stale-reservation"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "job-lifecycle/JobLifecycle"
+flow = "process-lifecycle-transaction"
+find = "    /\\ rgen[p] = jgen[j] \\* reservation generation guard\n"
+replace = "    /\\ TRUE \\* reservation generation guard\n"
+occurrence = 1
+invariant = "MemberJobIsLive"
+min_counterexample_states = 6
+
+[[mutation]]
 id = "job-lifecycle-recycle-with-live-member"
 kind = "transition-guard-removal"
 severity = "critical"
@@ -1525,6 +1814,237 @@ replace = "    /\\ TRUE \\* no member object\n"
 occurrence = 1
 invariant = "MemberJobIsLive"
 min_counterexample_states = 5
+
+[[mutation]]
+id = "job-limits-admission-skips-the-ancestors"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "job-limits/JobLimits"
+flow = "process-lifecycle-transaction"
+find = "    /\\ ~Violates(j) \\* admission guard\n"
+replace = "    /\\ TRUE \\* admission guard\n"
+occurrence = 1
+invariant = "NoOverAdmission"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "job-limits-effective-takes-the-loosest"
+kind = "transition-effect"
+severity = "critical"
+model = "job-limits/JobLimits"
+flow = "process-lifecycle-transaction"
+find = "       ELSE CHOOSE m \\in bounded: \\A v \\in bounded: m <= v\n"
+replace = "       ELSE CHOOSE m \\in bounded: \\A v \\in bounded: m >= v\n"
+occurrence = 1
+invariant = "EffectiveWithinParent"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "job-policy-ancestor-root-omitted"
+kind = "transition-effect"
+severity = "critical"
+model = "job-policy-lifecycle/JobPolicyLifecycle"
+flow = "job-policy-control"
+find = '''                   [] j = 2 -> {0, 1, 2} [] OTHER -> {0, 3}'''
+replace = '''                   [] j = 2 -> {1, 2} [] OTHER -> {0, 3}'''
+occurrence = 1
+invariant = "CompletedCacheIsExact"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "job-policy-descendant-refresh-omitted"
+kind = "transition-effect"
+severity = "critical"
+model = "job-policy-lifecycle/JobPolicyLifecycle"
+flow = "job-policy-control"
+find = '''         /\ pending' = {k \in Descendants(j) : state[k] # "Dead"}'''
+replace = '''         /\ pending' = {j}'''
+occurrence = 1
+invariant = "CompletedCacheIsExact"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "job-policy-kill-leaves-visible-authority"
+kind = "transition-revocation"
+severity = "critical"
+model = "job-policy-lifecycle/JobPolicyLifecycle"
+flow = "job-policy-control"
+find = '''         /\ cached' = [cached EXCEPT ![j] = Computed(own, state, j)]
+         /\ publishedGeneration' = [publishedGeneration EXCEPT
+                 ![j] = IF state[j] = "Live" THEN generation[j] ELSE 0]'''
+replace = '''         /\ cached' = IF writer = "Kill" THEN cached ELSE [cached EXCEPT ![j] = Computed(own, state, j)]
+         /\ publishedGeneration' = IF writer = "Kill" THEN publishedGeneration ELSE [publishedGeneration EXCEPT ![j] = generation[j]]'''
+occurrence = 1
+invariant = "CompletedCacheIsExact"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "job-policy-limits-right-authorizes-set"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "job-policy-lifecycle/JobPolicyLifecycle"
+flow = "job-policy-control"
+find = '''    /\ setRight \* SET_LIMITS cannot authorize a qualitative policy write'''
+replace = '''    /\ (setRight \/ limitsRight) \* SET_LIMITS cannot authorize a qualitative policy write'''
+occurrence = 1
+invariant = "SetRequiresItsOwnRight"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "job-policy-publication-capture-generation-ignored"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "job-policy-publication/JobPolicyPublication"
+flow = "job-policy-control"
+find = '''    /\ reader' = IF commit = expected /\ commit # 0 THEN "Payload" ELSE "Done"'''
+replace = '''    /\ reader' = IF commit # 0 THEN "Payload" ELSE "Done"'''
+occurrence = 1
+invariant = "AcceptedExactInvocation"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "job-policy-publication-final-generation-ignored"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "job-policy-publication/JobPolicyPublication"
+flow = "job-policy-control"
+find = '''    /\ accepted' = (commit = first)'''
+replace = '''    /\ accepted' = TRUE'''
+occurrence = 1
+invariant = "AcceptedStableCommit"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "job-policy-publication-payload-before-revoke"
+kind = "transition-revocation"
+severity = "critical"
+model = "job-policy-publication/JobPolicyPublication"
+flow = "job-policy-control"
+find = '''    /\ commit' = 0'''
+replace = '''    /\ commit' = commit'''
+occurrence = 1
+invariant = "AcceptedExactPayload"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "job-policy-read-generation-check-omitted"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "job-policy-lifecycle/JobPolicyLifecycle"
+flow = "job-policy-control"
+find = '''         /\ readAllowed' = (requested # 0 /\ requested = publishedGeneration[j] /\ bit \in cached[j])'''
+replace = '''         /\ readAllowed' = (requested # 0 /\ publishedGeneration[j] # 0 /\ bit \in cached[j])'''
+occurrence = 1
+invariant = "ReadDoesNotAliasGeneration"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "job-policy-reuse-retains-own-ceiling"
+kind = "transition-effect"
+severity = "critical"
+model = "job-policy-lifecycle/JobPolicyLifecycle"
+flow = "job-policy-control"
+find = '''         /\ own' = [own EXCEPT ![j] = Bits]'''
+replace = '''         /\ own' = own'''
+occurrence = 1
+invariant = "BirthResetsOwnCeiling"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "job-spawn-placement-closes-before-empty"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "job-spawn-placement/JobSpawnPlacement"
+flow = "process-lifecycle-transaction"
+find = '''    /\ remaining = 0 \* close only when empty'''
+replace = '''    /\ TRUE \* close only when empty'''
+occurrence = 1
+invariant = "NoAbandonedMembers"
+min_counterexample_states = 4
+
+[[mutation]]
+id = "job-spawn-placement-defaults-to-loader"
+kind = "transition-effect"
+severity = "critical"
+model = "job-spawn-placement/JobSpawnPlacement"
+flow = "loader-request-authority"
+find = '''    /\ selected' = IF explicit THEN LoaderJob ELSE RequesterJob'''
+replace = '''    /\ selected' = LoaderJob'''
+occurrence = 1
+invariant = "DefaultInheritsRequester"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "job-spawn-placement-exec-retargets"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "job-spawn-placement/JobSpawnPlacement"
+flow = "loader-request-authority"
+find = '''    /\ ~(exec /\ explicit) \* exec cannot retarget'''
+replace = '''    /\ TRUE \* exec cannot retarget'''
+occurrence = 1
+invariant = "ExecKeepsMembership"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "job-spawn-placement-forgets-pending-supervisor"
+kind = "transition-effect"
+severity = "critical"
+model = "job-spawn-placement/JobSpawnPlacement"
+flow = "process-lifecycle-transaction"
+find = '''    /\ supervisor' = supervisor \* pending kill retains custody'''
+replace = '''    /\ supervisor' = FALSE \* pending kill retains custody'''
+occurrence = 1
+invariant = "NoAbandonedMembers"
+min_counterexample_states = 4
+
+[[mutation]]
+id = "job-spawn-placement-ignores-target"
+kind = "transition-effect"
+severity = "critical"
+model = "job-spawn-placement/JobSpawnPlacement"
+flow = "loader-request-authority"
+find = '''    /\ selected' = IF explicit THEN LoaderJob ELSE RequesterJob'''
+replace = '''    /\ selected' = RequesterJob'''
+occurrence = 1
+invariant = "ExplicitUsesAuthorizedJob"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "job-spawn-placement-stale-birth"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "job-spawn-placement/JobSpawnPlacement"
+flow = "loader-request-authority"
+find = '''    /\ live /\ captured = generation \* birth revalidation'''
+replace = '''    /\ TRUE \* birth revalidation'''
+occurrence = 1
+invariant = "BirthHasExactLiveJob"
+min_counterexample_states = 5
+
+[[mutation]]
+id = "job-spawn-placement-untyped-authority"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "job-spawn-placement/JobSpawnPlacement"
+flow = "loader-request-authority"
+find = '''    /\ (~explicit \/ (typed /\ create)) \* typed CREATE_PROCESS admission'''
+replace = '''    /\ TRUE \* typed CREATE_PROCESS admission'''
+occurrence = 1
+invariant = "PreparedIsAuthorized"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "job-spawn-placement-without-create-right"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "job-spawn-placement/JobSpawnPlacement"
+flow = "loader-request-authority"
+find = '''    /\ (~explicit \/ (typed /\ create)) \* typed CREATE_PROCESS admission'''
+replace = '''    /\ (~explicit \/ typed) \* typed CREATE_PROCESS admission'''
+occurrence = 1
+invariant = "PreparedIsAuthorized"
+min_counterexample_states = 2
 
 [[mutation]]
 id = "joint-claim-class-publication-unlocked"
@@ -1620,6 +2140,30 @@ find = '''Reset == /\ ~writer /\ Refs = 0'''
 replace = '''Reset == /\ ~writer'''
 occurrence = 1
 invariant = "IdentityResetDrained"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "memory-charge-bind-forgets-held-pages"
+kind = "transition-effect"
+severity = "critical"
+model = "memory-charge-conservation/MemoryChargeConservation"
+flow = "process-lifecycle-transaction"
+find = "IF h \\in Chain(g) THEN usage[h] + count[r] ELSE usage[h]] \\* catch-up charge\n"
+replace = "IF h \\in Chain(g) THEN usage[h] ELSE usage[h]] \\* catch-up charge\n"
+occurrence = 1
+invariant = "ChargeConservation"
+min_counterexample_states = 4
+
+[[mutation]]
+id = "memory-charge-release-forgets-to-uncharge"
+kind = "transition-effect"
+severity = "critical"
+model = "memory-charge-conservation/MemoryChargeConservation"
+flow = "process-lifecycle-transaction"
+find = "                ELSE [h \\in Groups |-> IF h \\in Chain(bound[r]) THEN usage[h] - 1 ELSE usage[h]] \\* release uncharge\n"
+replace = "                ELSE usage \\* release uncharge\n"
+occurrence = 1
+invariant = "ChargeConservation"
 min_counterexample_states = 3
 
 [[mutation]]
@@ -2885,6 +3429,66 @@ invariant = "JointSealedReuse"
 min_counterexample_states = 15
 
 [[mutation]]
+id = "runtime-trace-accept-before-dependency"
+kind = "transition-guard-removal"
+severity = "high"
+model = "runtime-trace-causal-selection/RuntimeTraceCausalSelection"
+flow = "commercial-product-boot"
+find = '''          ELSE IF events[cursor].time >= Bound'''
+replace = '''          ELSE IF TRUE'''
+occurrence = 1
+invariant = "AcceptedAuthority"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "runtime-trace-first-parent-only"
+kind = "transition-guard-removal"
+severity = "high"
+model = "runtime-trace-causal-selection/RuntimeTraceCausalSelection"
+flow = "commercial-product-boot"
+find = '''Bound == IF firstParent >= secondParent THEN firstParent ELSE secondParent'''
+replace = '''Bound == firstParent'''
+occurrence = 1
+invariant = "AcceptedAuthority"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "runtime-trace-ignore-frame"
+kind = "transition-guard-removal"
+severity = "high"
+model = "runtime-trace-causal-selection/RuntimeTraceCausalSelection"
+flow = "commercial-product-boot"
+find = '''Verified(i) == events[i].framed /\ events[i].identity'''
+replace = '''Verified(i) == events[i].identity'''
+occurrence = 1
+invariant = "AcceptedAuthority"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "runtime-trace-ignore-identity"
+kind = "transition-guard-removal"
+severity = "high"
+model = "runtime-trace-causal-selection/RuntimeTraceCausalSelection"
+flow = "commercial-product-boot"
+find = '''Verified(i) == events[i].framed /\ events[i].identity'''
+replace = '''Verified(i) == events[i].framed'''
+occurrence = 1
+invariant = "AcceptedAuthority"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "runtime-trace-reject-premature-repeat"
+kind = "transition-guard-removal"
+severity = "high"
+model = "runtime-trace-causal-selection/RuntimeTraceCausalSelection"
+flow = "commercial-product-boot"
+find = '''               ELSE /\ status' = IF cursor = Len(events) THEN "Rejected" ELSE "Scanning"'''
+replace = '''               ELSE /\ status' = "Rejected"'''
+occurrence = 1
+invariant = "TerminalDecision"
+min_counterexample_states = 2
+
+[[mutation]]
 id = "scheduler-activation-final-claim-ignores-generation"
 kind = "transition-guard-removal"
 severity = "critical"
@@ -3497,6 +4101,30 @@ replace = '''WakeTask(task) ==
 occurrence = 1
 invariant = "TransitionWakeSurvives"
 min_counterexample_states = 4
+
+[[mutation]]
+id = "slot-directory-growth-reserve-past-table"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "slot-directory-growth/SlotDirectoryGrowth"
+flow = "process-lifecycle-transaction"
+find = "    /\\ s < tableChunks * ChunkSize\n"
+replace = "    /\\ s < (tableChunks + 1) * ChunkSize\n"
+occurrence = 1
+invariant = "ReservedSlotHasStorage"
+min_counterexample_states = 2
+
+[[mutation]]
+id = "slot-directory-growth-table-ahead-of-side"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "slot-directory-growth/SlotDirectoryGrowth"
+flow = "process-lifecycle-transaction"
+find = "    /\\ tableChunks < sideChunks \\* side storage first\n"
+replace = "    /\\ TRUE \\* side storage first\n"
+occurrence = 1
+invariant = "TableNeverAheadOfSide"
+min_counterexample_states = 2
 
 [[mutation]]
 id = "smp-ipi-claim-drops-request-generation"

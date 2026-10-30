@@ -8,6 +8,8 @@ use alloc::{format, vec::Vec};
 use core::sync::atomic::{AtomicU64, Ordering};
 use rustos_user_abi::syscall::{
     IPC_ABI_VERSION, IpcReplyRecvResultKind, IpcReplyRecvWithSenderArgs,
+    IpcRecvWithHandlesAndSenderArgs, IpcReplyRecvWithHandlesAndSenderArgs,
+    SYS_RUSTOS_IPC_RECV_WITH_HANDLES_AND_SENDER, SYS_RUSTOS_IPC_REPLY_RECV_WITH_HANDLES_AND_SENDER,
     ProductExecutableSnapshotEvidence, RustosIpcValidateServiceOwnerArgs, SYS_RUSTOS_DEBUG_PRINT,
     SYS_RUSTOS_IPC_CALL, SYS_RUSTOS_IPC_CALL_BOUNDED, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
     SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_RECV_WITH_SENDER,
@@ -206,6 +208,32 @@ pub unsafe fn recv_with_sender(
         sender_pid_out as u64,
         sender_tid_out as u64,
     )
+}
+
+/// Receive descriptors and the kernel-authenticated sender in one transaction.
+/// This explicit form never falls back to a handle-unaware register receive.
+///
+/// # Safety
+/// All outputs named by `args` must remain writable for the blocking call and
+/// disjoint from the live argument block. The fd array holds i32 values and its
+/// returned count is a u16. On error no descriptor is published.
+#[inline]
+// SAFETY: callers own the live output buffers described by this raw ABI block.
+pub unsafe fn recv_with_handles_and_sender(args: &IpcRecvWithHandlesAndSenderArgs) -> i64 {
+    syscall1(SYS_RUSTOS_IPC_RECV_WITH_HANDLES_AND_SENDER, args as *const _ as u64)
+}
+
+/// Commit a byte reply, then receive bytes, descriptors and stamped sender.
+/// The result uses the same explicit precommit/postcommit error partition as
+/// `reply_recv_with_sender`; a postcommit failure never permits reply retry.
+///
+/// # Safety
+/// Response bytes stay readable, receive outputs stay writable and disjoint,
+/// and the ABI argument block stays live for the entire blocking call.
+#[inline]
+// SAFETY: callers retain the response and every receive output for the call.
+pub unsafe fn reply_recv_with_handles_and_sender(args: &IpcReplyRecvWithHandlesAndSenderArgs) -> i64 {
+    syscall1(SYS_RUSTOS_IPC_REPLY_RECV_WITH_HANDLES_AND_SENDER, args as *const _ as u64)
 }
 
 /// Receive immediately if a request is queued, otherwise return `-EAGAIN`.
@@ -500,6 +528,16 @@ mod tests {
         assert!(!reply_failure_diagnostic_due(9));
         assert!(reply_failure_diagnostic_due(1_u64 << 63));
         assert!(!reply_failure_diagnostic_due(u64::MAX));
+    }
+
+    #[test]
+    fn authenticated_handle_wrappers_do_not_use_handle_unaware_fallbacks() {
+        let source = include_str!("ipc.rs").split("#[cfg(test)]").next().unwrap();
+        let wrappers = source.split_once("pub unsafe fn recv_with_handles_and_sender(").unwrap().1
+            .split_once("pub unsafe fn try_recv_with_sender(").unwrap().0;
+        assert!(wrappers.contains("syscall1(SYS_RUSTOS_IPC_RECV_WITH_HANDLES_AND_SENDER"));
+        assert!(wrappers.contains("syscall1(SYS_RUSTOS_IPC_REPLY_RECV_WITH_HANDLES_AND_SENDER"));
+        assert!(!wrappers.contains("fastcall::"), "a handle-unaware fallback would lose attached authority");
     }
 
     #[test]

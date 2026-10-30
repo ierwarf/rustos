@@ -28,7 +28,7 @@ use rustos_user_abi::pager::{
     apply_region_edit,
 };
 
-use super::process_table::MAX_PROCESS_OBJECTS;
+use super::slot_dir::AtomicDir;
 use super::process_table::{ProcessHandle, ProcessIdentity};
 
 mod fork_hold;
@@ -447,8 +447,14 @@ impl Drop for PagerFaultInstallPermit {
 )]
 const EMPTY_PAGER_VMA: PublishedPagerVma = PublishedPagerVma::empty();
 
-static PAGER_VMAS: [PublishedPagerVma; MAX_PROCESS_OBJECTS * MAX_PAGER_VMAS_PER_PROCESS] =
-    [EMPTY_PAGER_VMA; MAX_PROCESS_OBJECTS * MAX_PAGER_VMAS_PER_PROCESS];
+/// One process's publication slots. Boxed per chunk of processes, never freed.
+struct ProcessVmaTable([PublishedPagerVma; MAX_PAGER_VMAS_PER_PROCESS]);
+impl ProcessVmaTable {
+    fn empty() -> Self {
+        Self([EMPTY_PAGER_VMA; MAX_PAGER_VMAS_PER_PROCESS])
+    }
+}
+static PAGER_VMAS: AtomicDir<ProcessVmaTable> = AtomicDir::new();
 type PagerVmaWriterLock = TrackedSpinLock<(), { LockClass::PagerVmaPublication as u8 }>;
 /// One publication writer lock **per process**, not one for the system.
 ///
@@ -467,8 +473,21 @@ type PagerVmaWriterLock = TrackedSpinLock<(), { LockClass::PagerVmaPublication a
     reason = "array initializer for the fixed per-process writer lock table"
 )]
 const EMPTY_PAGER_VMA_WRITER: PagerVmaWriterLock = TrackedSpinLock::new(());
-static PAGER_VMA_WRITERS: [PagerVmaWriterLock; MAX_PROCESS_OBJECTS] =
-    [EMPTY_PAGER_VMA_WRITER; MAX_PROCESS_OBJECTS];
+static PAGER_VMA_WRITERS: AtomicDir<PagerVmaWriterLock> = AtomicDir::new();
+
+/// Publishes the VMA tables and writer locks covering `index` before that
+/// process slot can exist.
+pub(super) fn ensure_slot_storage(index: usize) -> bool {
+    PAGER_VMAS.ensure(index, ProcessVmaTable::empty)
+        && PAGER_VMA_WRITERS.ensure(index, || EMPTY_PAGER_VMA_WRITER)
+        && rewrite_epoch::ensure_slot_storage(index)
+}
+
+#[cfg(test)]
+pub(super) fn slot_storage_exists_for_tests(handle: ProcessHandle) -> bool {
+    process_slots(handle).is_some() && writer_lock(handle).is_some()
+        && rewrite_epoch::REWRITE_EPOCHS.get(handle.index()).is_some()
+}
 
 /// The writer lock guarding one process's publication slots.
 fn writer_lock(handle: ProcessHandle) -> Option<&'static PagerVmaWriterLock> {
@@ -476,8 +495,7 @@ fn writer_lock(handle: ProcessHandle) -> Option<&'static PagerVmaWriterLock> {
 }
 
 fn process_slots(handle: ProcessHandle) -> Option<&'static [PublishedPagerVma]> {
-    let start = handle.index().checked_mul(MAX_PAGER_VMAS_PER_PROCESS)?;
-    PAGER_VMAS.get(start..start.checked_add(MAX_PAGER_VMAS_PER_PROCESS)?)
+    PAGER_VMAS.get(handle.index()).map(|table| table.0.as_slice())
 }
 
 fn template_is_canonical(region: PagerVmRegionWire) -> bool {

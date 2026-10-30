@@ -16,11 +16,16 @@
 //!   publishing a process into a `Killing` job.
 //! - **Evidence:** `job-lifecycle`.
 use super::*;
+mod policy;
+pub use rustos_user_abi::syscall::RustosJobPolicy as JobPolicy;
+pub use policy::{JobPolicyInfo, job_policy_allows, job_policy_info, job_set_policy};
 
 /// Slab capacity of the job table. An internal bound of this implementation, not
 /// an ABI value: it moves into the root job's `jobs.max` policy when the process
 /// table gets its directory (see `docs/architecture/job-model.md`, phase 2a).
 pub(super) const JOB_SLOTS: usize = 64;
+// One charge group per job slot, indexed the same way.
+const _: () = assert!(JOB_SLOTS == kernel_mm::api::charge::CHARGE_GROUPS);
 /// Deepest nesting below the root job.
 pub const JOB_MAX_DEPTH: u8 = 8;
 
@@ -39,6 +44,10 @@ pub const ROOT_JOB: JobId = JobId {
 };
 
 impl JobId {
+    pub(super) const fn index(self) -> u32 {
+        self.index
+    }
+
     pub const fn from_raw(raw: u64) -> Self {
         Self {
             index: (raw >> 32) as u32,
@@ -48,6 +57,11 @@ impl JobId {
 
     pub const fn to_raw(self) -> u64 {
         ((self.index as u64) << 32) | self.generation as u64
+    }
+
+    /// Descriptor identity adapter only; the job table still resolves liveness.
+    pub(crate) const fn handle_token(self) -> Option<kernel_object::api::handle::HandleToken> {
+        kernel_object::api::handle::HandleToken::from_job(self.index, self.generation)
     }
 }
 
@@ -69,6 +83,51 @@ pub enum JobError {
     Root,
 }
 
+/// A dimension no limit applies to; the job inherits its parent's.
+pub const LIMIT_UNSET: u64 = u64::MAX;
+
+/// Counted limits of one job, `LIMIT_UNSET` meaning inherit. Memory is absent on
+/// purpose: charging it needs a hook in the frame-descriptor ledger, and a limit
+/// that is stored but not enforced would be worse than none.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct JobLimits {
+    /// Process objects not yet reaped, in this job and every descendant.
+    pub processes: u64,
+    /// Threads of those processes.
+    pub threads: u64,
+    /// Resident user data pages (4 KiB) mapped by the job's processes and its
+    /// descendants, charged where the frame-descriptor ledger counts them.
+    /// Page-table frames and kernel objects are not charged.
+    pub memory_pages: u64,
+}
+
+impl JobLimits {
+    pub const UNSET: Self =
+        Self { processes: LIMIT_UNSET, threads: LIMIT_UNSET, memory_pages: LIMIT_UNSET };
+}
+
+/// Which dimensions a `job_set_limits` call changes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LimitMask(u32);
+
+impl LimitMask {
+    pub const PROCESSES: Self = Self(1 << 0);
+    pub const THREADS: Self = Self(1 << 1);
+    pub const MEMORY: Self = Self(1 << 2);
+
+    pub const fn from_bits(bits: u32) -> Option<Self> {
+        if bits == 0 || bits & !(Self::PROCESSES.0 | Self::THREADS.0 | Self::MEMORY.0) != 0 {
+            None
+        } else {
+            Some(Self(bits))
+        }
+    }
+
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct JobInfo {
     pub id: JobId,
@@ -82,6 +141,15 @@ pub struct JobInfo {
     /// Live jobs directly below this one.
     pub children: u64,
     pub kills: u64,
+    /// As configured on this job.
+    pub limits: JobLimits,
+    /// `min` of this job's and every ancestor's own limit.
+    pub effective: JobLimits,
+    /// Unreaped process objects and their threads in the subtree.
+    pub usage_processes: u64,
+    pub usage_threads: u64,
+    /// Pages currently charged to the subtree.
+    pub usage_memory_pages: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -92,6 +160,8 @@ pub(super) struct JobSlot {
     depth: u8,
     state: JobState,
     kills: u64,
+    limits: JobLimits,
+    policy: JobPolicy,
 }
 
 impl JobSlot {
@@ -103,6 +173,8 @@ impl JobSlot {
             depth: 0,
             state: JobState::Live,
             kills: 0,
+            limits: JobLimits::UNSET,
+            policy: JobPolicy::ALL,
         }
     }
 
@@ -171,6 +243,90 @@ impl ProcessTable {
             .any(|object| object.job.index == job)
     }
 
+    /// This job's own limit in a dimension. The root's process limit is the
+    /// system-wide admitted slot count, so there is one source of truth for it.
+    fn own_limit(&self, index: u32, threads: bool) -> u64 {
+        let slot = &self.jobs[index as usize];
+        match (index, threads) {
+            (0, false) => super::process_limit() as u64,
+            (_, false) => slot.limits.processes,
+            (_, true) => slot.limits.threads,
+        }
+    }
+
+    /// The tightest limit on the chain from `index` to the root.
+    fn effective_limit(&self, index: u32, threads: bool) -> u64 {
+        let mut cursor = index;
+        let mut effective = LIMIT_UNSET;
+        for _ in 0..=usize::from(JOB_MAX_DEPTH) {
+            effective = effective.min(self.own_limit(cursor, threads));
+            let parent = self.jobs[cursor as usize].parent;
+            if parent == NO_PARENT {
+                break;
+            }
+            cursor = parent;
+        }
+        effective
+    }
+
+    /// Unreaped process objects in `job`'s subtree, exiting ones included: they
+    /// still hold a slot, an address space and their threads until reaped.
+    fn subtree_objects(&self, job: u32) -> u64 {
+        self.slots
+            .iter()
+            .filter_map(|slot| slot.object.as_deref())
+            .filter(|object| self.job_contains(job, object.job.index))
+            .count() as u64
+    }
+
+    fn subtree_threads(&self, job: u32) -> u64 {
+        self.slots
+            .iter()
+            .filter_map(|slot| slot.object.as_deref())
+            .filter(|object| self.job_contains(job, object.job.index))
+            .map(|object| object.thread_count as u64)
+            .sum()
+    }
+
+    /// Whether one more process, or `extra_threads` more threads, fits under
+    /// every limit on the chain. Counts include existing objects only, so the
+    /// caller asks before adding.
+    fn admits(&self, index: u32, new_processes: u64, new_threads: u64) -> bool {
+        let mut cursor = index;
+        for _ in 0..=usize::from(JOB_MAX_DEPTH) {
+            let processes = self.own_limit(cursor, false);
+            if new_processes != 0
+                && processes != LIMIT_UNSET
+                && self.subtree_objects(cursor).saturating_add(new_processes) > processes
+            {
+                return false;
+            }
+            let threads = self.own_limit(cursor, true);
+            if new_threads != 0
+                && threads != LIMIT_UNSET
+                && self.subtree_threads(cursor).saturating_add(new_threads) > threads
+            {
+                return false;
+            }
+            let parent = self.jobs[cursor as usize].parent;
+            if parent == NO_PARENT {
+                break;
+            }
+            cursor = parent;
+        }
+        true
+    }
+
+    /// A new process (with its first thread) fits in `job`.
+    pub(super) fn admits_process(&self, job: JobId) -> bool {
+        self.job_slot(job).is_some() && self.admits(job.index, 1, 1)
+    }
+
+    /// One more thread fits in the job `index`.
+    pub(super) fn admits_thread(&self, index: u32) -> bool {
+        self.admits(index, 0, 1)
+    }
+
     fn child_count(&self, job: u32) -> u64 {
         self.jobs
             .iter()
@@ -216,12 +372,20 @@ impl ProcessTable {
                     && slot.state == JobState::Killing
                     && self.child_count(index as u32) == 0
                     && !self.has_any_member_object(index as u32)
+                    // Pages of an already reaped process may still be draining
+                    // out of a retiring address space; the slot is not reusable
+                    // while any are charged to it.
+                    && kernel_mm::api::charge::usage(index) == 0
             });
             let Some(index) = dead else { return };
+            policy::invalidate_job(index);
             let slot = &mut self.jobs[index];
             slot.in_use = false;
             slot.parent = NO_PARENT;
             slot.state = JobState::Live;
+            // A recycled slot must not inherit its previous tenant's limits.
+            slot.limits = JobLimits::UNSET;
+            slot.policy = JobPolicy::ALL;
             // Generation exhaustion retires the slot permanently, exactly like
             // a process slot: reusing generation one would alias a stale id.
             slot.generation = slot.generation.checked_add(1).unwrap_or(0);
@@ -250,7 +414,12 @@ pub fn job_create_child(parent: JobId) -> Result<JobId, JobError> {
     slot.depth = parent_slot.depth + 1;
     slot.state = JobState::Live;
     slot.kills = 0;
-    Ok(table.job_id_of(index as u32))
+    slot.limits = JobLimits::UNSET;
+    slot.policy = JobPolicy::ALL;
+    kernel_mm::api::charge::init_group(index, Some(parent.index as usize));
+    let job = table.job_id_of(index as u32);
+    policy::publish_job(&table, job);
+    Ok(job)
 }
 
 pub fn job_info(id: JobId) -> Result<JobInfo, JobError> {
@@ -265,7 +434,54 @@ pub fn job_info(id: JobId) -> Result<JobInfo, JobError> {
         subtree_processes: table.live_member_count(id.index, true),
         children: table.child_count(id.index),
         kills: slot.kills,
+        limits: JobLimits {
+            processes: table.own_limit(id.index, false),
+            threads: table.own_limit(id.index, true),
+            memory_pages: kernel_mm::api::charge::limit(id.index as usize),
+        },
+        effective: JobLimits {
+            processes: table.effective_limit(id.index, false),
+            threads: table.effective_limit(id.index, true),
+            memory_pages: kernel_mm::api::charge::effective_limit(id.index as usize),
+        },
+        usage_processes: table.subtree_objects(id.index),
+        usage_threads: table.subtree_threads(id.index),
+        usage_memory_pages: kernel_mm::api::charge::usage(id.index as usize),
     })
+}
+
+/// Whether one more process would fit under every limit on `job`'s chain.
+pub fn job_admits_process(job: JobId) -> bool {
+    PROCESS_TABLE.lock().admits_process(job)
+}
+
+/// Sets the dimensions in `mask` on `id`. A value above what an ancestor
+/// allows is accepted and clamped in the effective limit, because refusing it
+/// would make the order of operations matter when a parent is later tightened.
+/// Lowering a limit below current usage evicts nobody; it only stops admission.
+/// The root's process limit is the system-wide slot count, clamped to the slot
+/// storage ceiling.
+pub fn job_set_limits(id: JobId, mask: LimitMask, limits: JobLimits) -> Result<(), JobError> {
+    let mut table = PROCESS_TABLE.lock();
+    let slot = table.job_slot(id).ok_or(JobError::Stale)?;
+    if slot.state == JobState::Killing {
+        return Err(JobError::Killing);
+    }
+    if mask.contains(LimitMask::PROCESSES) {
+        if id.index == 0 {
+            super::set_process_limit(limits.processes as usize);
+        } else {
+            table.jobs[id.index as usize].limits.processes = limits.processes;
+        }
+    }
+    if mask.contains(LimitMask::THREADS) {
+        table.jobs[id.index as usize].limits.threads = limits.threads;
+    }
+    if mask.contains(LimitMask::MEMORY) {
+        // The charge group owns the limit so the fault path reads it lock-free.
+        kernel_mm::api::charge::set_limit(id.index as usize, limits.memory_pages);
+    }
+    Ok(())
 }
 
 /// Marks `id` and every descendant `Killing`. Idempotent. After it returns no
@@ -279,6 +495,7 @@ pub fn job_kill_begin(id: JobId) -> Result<(), JobError> {
     table.job_slot(id).ok_or(JobError::Stale)?;
     for index in 0..JOB_SLOTS {
         if table.jobs[index].in_use && table.job_contains(id.index, index as u32) {
+            policy::invalidate_job(index);
             let slot = &mut table.jobs[index];
             if slot.state != JobState::Killing {
                 slot.state = JobState::Killing;
@@ -333,6 +550,19 @@ pub fn job_subtree_contains_process(id: JobId, process_id: u64) -> bool {
             .find(|object| object.process_id == process_id)
             .is_some_and(|object| table.job_contains(id.index, object.job.index))
 }
+
+/// True when `descendant` is `ancestor` or lies below it, and both are live
+/// jobs of the generation named. A stale id on either side is false, so this
+/// never distinguishes "recycled" from "not below".
+pub fn job_is_within(ancestor: JobId, descendant: JobId) -> bool {
+    let table = PROCESS_TABLE.lock();
+    table.job_slot(ancestor).is_some()
+        && table.job_slot(descendant).is_some()
+        && table.job_contains(ancestor.index, descendant.index)
+}
+
+#[cfg(test)]
+pub(super) fn reset_policy_for_tests() { policy::reset_for_tests(); }
 
 #[cfg(test)]
 mod tests;

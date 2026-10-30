@@ -39,6 +39,7 @@ mod registers;
 pub(in crate::user::syscall) use registers::complete_parked_register_ipc;
 use registers::ReceiveDestination;
 mod reply_wait;
+mod handle_receive;
 mod service_ownership;
 mod subject;
 
@@ -259,6 +260,8 @@ pub(super) fn is_linux_rustos_ipc_syscall(syscall_number: u64) -> bool {
             | linux_abi::SYS_RUSTOS_IPC_RECV_WITH_SENDER
             | linux_abi::SYS_RUSTOS_IPC_RECV_WITH_SENDER_BOUNDED
             | linux_abi::SYS_RUSTOS_IPC_REPLY_RECV_WITH_SENDER
+            | linux_abi::SYS_RUSTOS_IPC_RECV_WITH_HANDLES_AND_SENDER
+            | linux_abi::SYS_RUSTOS_IPC_REPLY_RECV_WITH_HANDLES_AND_SENDER
             | linux_abi::SYS_RUSTOS_IPC_REPLY
             | linux_abi::SYS_RUSTOS_IPC_CALL_WITH_HANDLES
             | linux_abi::SYS_RUSTOS_IPC_CALL_WITH_HANDLES_BOUNDED
@@ -281,6 +284,7 @@ pub(super) fn consumes_deferred_fast_reply(number: u64) -> bool {
             | linux_abi::SYS_RUSTOS_IPC_RECV
             | linux_abi::SYS_RUSTOS_IPC_RECV_WITH_SENDER
             | linux_abi::SYS_RUSTOS_IPC_RECV_WITH_SENDER_BOUNDED
+            | linux_abi::SYS_RUSTOS_IPC_RECV_WITH_HANDLES_AND_SENDER
     )
 }
 
@@ -330,6 +334,12 @@ pub(super) fn dispatch_linux_rustos_ipc_syscall(frame: &mut SyscallFrame) -> u64
         }
         linux_abi::SYS_RUSTOS_IPC_REPLY_RECV_WITH_SENDER => {
             ipc_reply_recv::syscall_linux_rustos_ipc_reply_recv_with_sender(frame.rdi)
+        }
+        linux_abi::SYS_RUSTOS_IPC_RECV_WITH_HANDLES_AND_SENDER => {
+            handle_receive::syscall_linux_rustos_ipc_recv_with_handles_and_sender(frame.rdi)
+        }
+        linux_abi::SYS_RUSTOS_IPC_REPLY_RECV_WITH_HANDLES_AND_SENDER => {
+            ipc_reply_recv::syscall_linux_rustos_ipc_reply_recv_with_handles_and_sender(frame.rdi)
         }
         linux_abi::SYS_RUSTOS_IPC_VALIDATE_SERVICE_OWNER => {
             syscall_linux_rustos_ipc_validate_service_owner(frame.rdi)
@@ -2384,7 +2394,7 @@ fn recv_with_sender_blocking_prepared_inner<const N: usize>(
             endpoint,
             task_id,
             request_capacity,
-            0,
+            destination.handle_capacity(),
             may_wait,
         );
         if !matches!(&received, Ok(EndpointReceive::Waiting)) {
@@ -2400,11 +2410,12 @@ fn recv_with_sender_blocking_prepared_inner<const N: usize>(
                 let _ = charge_server_phase(IpcServerPhase::RecvWrite, write_mark);
                 return result.map(|received| (received, yielded));
             }
-            Ok(EndpointReceive::Queued((reply, request, _handles, caller_task_id))) => {
+            Ok(EndpointReceive::Queued((reply, request, handles, caller_task_id))) => {
                 let write_mark = charge_server_phase(IpcServerPhase::RecvTake, take_mark);
-                destination
-                    .write_queued(reply, &request, caller_task_id)
-                    .map_err(|errno| (errno, yielded))?;
+                if let Err(errno) = destination.write_queued_handles(reply, &request, &handles, caller_task_id) {
+                    drop_transfer_descriptors(handles.as_slice());
+                    return Err((errno, yielded));
+                }
                 let _ = charge_server_phase(IpcServerPhase::RecvWrite, write_mark);
                 let _ = multitask::inherit_ipc_priority(reply.raw(), caller_task_id, task_id);
                 return Ok((request.len(), yielded));
@@ -3813,6 +3824,29 @@ fn install_received_handles(
     fd_count_ptr: u64,
 ) -> Result<(), i64> {
     validate_received_handle_outputs(fds_ptr, fd_count_ptr, descriptors.len())?;
+    install_received_handles_with_copyout(descriptors, |fds, count| {
+        if !fds.is_empty() {
+            usermem::write_current_user_bytes(fds_ptr, received_fd_bytes(fds))
+                .map_err(address_space_error_to_linux_errno)?;
+        }
+        usermem::write_current_user_bytes(fd_count_ptr, &count.to_ne_bytes())
+            .map_err(address_space_error_to_linux_errno)
+    })
+}
+
+fn received_fd_bytes(fds: &[i32]) -> &[u8] {
+    // SAFETY: i32 has no padding; this shared byte view stays within the live
+    // slice's allocation and cannot outlive the immutable descriptor slice.
+    unsafe { core::slice::from_raw_parts(fds.as_ptr().cast::<u8>(), core::mem::size_of_val(fds)) }
+}
+
+/// The callback copies every receiver-visible output before any descriptor is
+/// published. Both legacy fd-only and sender-authenticated receives share the
+/// same one-shot transfer claim, exact reservation and rollback mechanism.
+fn install_received_handles_with_copyout(
+    descriptors: &[KernelTransferredHandle],
+    copyout: impl FnOnce(&[i32], u16) -> Result<(), i64>,
+) -> Result<(), i64> {
     let entries = take_transfer_entries(descriptors)?;
     let service_refs = service_transfer_refs(&entries);
     let Some(slots) = multitask::with_current_user_process_state_mut(|_, _, process_state| {
@@ -3839,16 +3873,6 @@ fn install_received_handles(
         }
     };
 
-    if !fds.is_empty() {
-        let bytes = unsafe {
-            core::slice::from_raw_parts(fds.as_ptr().cast::<u8>(), fds.len() * size_of::<i32>())
-        };
-        if let Err(err) = usermem::write_current_user_bytes(fds_ptr, bytes) {
-            cancel_received_handle_reservations(reservation_id, &slots);
-            super::service_ops::release_service_handle_refs_bounded(&service_refs);
-            return Err(address_space_error_to_linux_errno(err));
-        }
-    }
     let count = match u16::try_from(fds.len()) {
         Ok(count) => count,
         Err(_) => {
@@ -3857,10 +3881,10 @@ fn install_received_handles(
             return Err(LINUX_EOVERFLOW);
         }
     };
-    if let Err(err) = usermem::write_current_user_bytes(fd_count_ptr, &count.to_ne_bytes()) {
+    if let Err(errno) = copyout(&fds, count) {
         cancel_received_handle_reservations(reservation_id, &slots);
         super::service_ops::release_service_handle_refs_bounded(&service_refs);
-        return Err(address_space_error_to_linux_errno(err));
+        return Err(errno);
     }
     let committed = multitask::with_current_user_process_state_mut(|_, _, process_state| {
         process_state

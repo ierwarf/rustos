@@ -89,7 +89,10 @@ if [[ "$cmd" =~ git[[:space:]]+(checkout|restore)[[:space:]].*(AGENTS\.md|docs/a
   block_destructive "discarding agent policy/hook files"
 fi
 
-if [[ "$cmd" =~ --no-verify ]] || [[ "$cmd" =~ --no-gpg-sign ]]; then
+# The flags are denied when a git command carries them; the same text inside a
+# file body, a heredoc, or an unrelated command is not a bypass.
+git_hook_bypass_re='git[[:space:]]+[^|;&]*(--no-verify|--no-gpg-sign)'
+if [[ "$cmd" =~ $git_hook_bypass_re ]]; then
   block_destructive "skipping hooks or signing"
 fi
 if [[ "$cmd" =~ --dangerously-bypass-hook-trust ]] || [[ "$cmd" =~ --dangerously-bypass-approvals-and-sandbox ]]; then

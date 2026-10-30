@@ -824,6 +824,7 @@ pub fn bootstrap_init_process() {
         ROOTD_BOOTSTRAP_WEIGHT_MICROS,
     )
     .with_logical_admin(true)
+    .with_root_job_authority()
     .with_bootstrap_scheduling_context(
         ROOTD_BOOTSTRAP_DOMAIN,
         ROOTD_BOOTSTRAP_BUDGET_NS,
@@ -978,6 +979,9 @@ mod tests {
             .split_once("let program = ConsoleProgramSpec::new(")
             .expect("rootd bootstrap program")
             .1;
+        let root_job = spawn.find(".with_root_job_authority()")
+            .expect("initial rootd must receive explicit root job authority");
+        assert_eq!(source.matches(".with_root_job_authority()").count(), 1);
         let admission = spawn
             .find(".with_bootstrap_scheduling_context(")
             .expect("rootd bootstrap scheduling context");
@@ -985,6 +989,7 @@ mod tests {
             .find("console_host::spawn_program_in_session")
             .expect("rootd bootstrap publication");
         assert!(admission < publication);
+        assert!(root_job < publication);
         assert!(source.contains("const ROOTD_BOOTSTRAP_BUDGET_NS: u64 = 4_000_000"));
         assert!(source.contains("const ROOTD_BOOTSTRAP_PERIOD_NS: u64 = 10_000_000"));
     }

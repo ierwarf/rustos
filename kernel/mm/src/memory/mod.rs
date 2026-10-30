@@ -1,3 +1,4 @@
+pub mod charge;
 pub mod address_space;
 mod cache_attributes;
 pub mod frame_capability;

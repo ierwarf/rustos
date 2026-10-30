@@ -234,7 +234,12 @@ machine resting at the watermark is not an event.  The governor then:
    pid, not any lease's reporter pid, and not below 16 resident pages, the
    largest resident set (ties go to the larger pid, the younger process);
 3. terminates it through the existing broker and records the pid, charge and
-   free/reserve pages in a milestone;
+   free/reserve pages in a milestone. When a job holds the largest eligible
+   total and no protected pid lies anywhere in its subtree, the whole job is
+   killed instead (`rootd: oom killed job/pid/pages/free:`); the kernel proves
+   the subtree free of protected pids per pid (`JOB_OP_OPEN_SUBTREE` then
+   `PROCESS_JOB`), and a refused or failed proof falls back to the single
+   process above;
 4. records `no victim` once per pressure episode when nothing qualifies.
 
 Leased services are never victims in v1.  A leaking service therefore degrades

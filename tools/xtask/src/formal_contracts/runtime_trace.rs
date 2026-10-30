@@ -123,9 +123,10 @@ pub(crate) fn record_kvm_runtime_trace(
     });
     let mut output = Vec::new();
     for step in steps {
+        let not_before_us = required_timestamp_us(step, &observed_guest_ts_us)?;
         let (line_number, guest_ts_us) = match step.log.as_str() {
-            "rustos" => find_structured_step(&rustos_lines, step)?,
-            "dvm" => find_structured_step(&dvm_lines, step)?,
+            "rustos" => find_structured_step(&rustos_lines, step, not_before_us)?,
+            "dvm" => find_structured_step(&dvm_lines, step, not_before_us)?,
             other => bail!(
                 "runtime trace step {} uses unsupported log {other}",
                 step.step
@@ -215,7 +216,27 @@ pub(crate) fn record_kvm_runtime_trace(
     Ok(())
 }
 
-fn find_structured_step(lines: &[&str], step: &ProductScenarioStep) -> Result<(usize, u64)> {
+fn required_timestamp_us(
+    step: &ProductScenarioStep,
+    observed: &std::collections::BTreeMap<&str, u64>,
+) -> Result<u64> {
+    let mut not_before_us = 0;
+    for required in step.requires.iter().filter(|required| *required != "START") {
+        let timestamp_us = observed.get(required.as_str()).with_context(|| {
+            format!(
+                "runtime trace step {} requires unobserved predecessor {required}",
+                step.step
+            )
+        })?;
+        not_before_us = not_before_us.max(*timestamp_us);
+    }
+    Ok(not_before_us)
+}
+
+fn find_structured_step(
+    lines: &[&str], step: &ProductScenarioStep, not_before_us: u64,
+) -> Result<(usize, u64)> {
+    let mut premature_us = None;
     for (offset, line) in lines.iter().enumerate() {
         if !line.contains(step.marker.as_str()) {
             continue;
@@ -234,7 +255,21 @@ fn find_structured_step(lines: &[&str], step: &ProductScenarioStep) -> Result<(u
                 step.evidence
             );
         }
+        // Repeated markers can precede the scenario's prerequisite (for
+        // example, a different image was sealed before the storage barrier).
+        // Validate framing and evidence even for those earlier occurrences;
+        // accept only a witness after every selected prerequisite.
+        if milestone.timestamp_us < not_before_us {
+            premature_us.get_or_insert(milestone.timestamp_us);
+            continue;
+        }
         return Ok((offset + 1, milestone.timestamp_us));
+    }
+    if let Some(timestamp_us) = premature_us {
+        bail!(
+            "runtime trace dependency moved backwards at {}: no eligible repeat after {not_before_us} us (earlier marker {timestamp_us} us)",
+            step.step
+        );
     }
     bail!(
         "runtime trace is missing scenario marker {} for step {}",
@@ -328,7 +363,8 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        FNV1A64_OFFSET_BASIS, FNV1A64_PRIME, milestone_evidence_matches, verified_milestone,
+        FNV1A64_OFFSET_BASIS, FNV1A64_PRIME, ProductScenarioStep, find_structured_step,
+        milestone_evidence_matches, required_timestamp_us, verified_milestone,
     };
 
     fn framed(semantic: &str) -> String {
@@ -339,6 +375,63 @@ mod tests {
                 (value ^ u64::from(*byte)).wrapping_mul(FNV1A64_PRIME)
             });
         format!("seq=7 msg=\"{semantic} checksum={checksum:016x} milestone-end\"")
+    }
+
+    fn step() -> ProductScenarioStep {
+        ProductScenarioStep {
+            scenario: "interactive-boot".into(), topology: "qemu-commercial".into(),
+            sequence: 4, step: "executable-snapshot".into(),
+            flow: "commercial-product-boot".into(), transition: "executable-snapshot".into(),
+            model: "product-boot/ProductBoot".into(), log: "rustos".into(),
+            marker: "name=product-executable-snapshot-sealed".into(),
+            evidence: "executable-snapshot-v1".into(),
+            requires: vec!["storage-data-plane".into()], deadline_ms: 4500,
+        }
+    }
+
+    fn snapshot(timestamp: u64) -> String {
+        framed(&format!("milestone-begin v=1 output_seq=7 seq=3 ts_us={timestamp} tick=9 cat=compat name=product-executable-snapshot-sealed arg0=0x1 arg1=0x2 pid=71 tid=72 dropped=0 discarded_bytes=0 evidence_v=1 backing=dvm-volume provider_service=2 provider_generation=7 storage_epoch=8 mount_generation=9 request_id=10 sha256=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"))
+    }
+
+    #[test]
+    fn causal_selection_requires_every_predecessor_and_uses_the_latest_bound() {
+        let mut step = step();
+        step.requires = vec!["START".into(), "first".into(), "second".into()];
+        let observed = std::collections::BTreeMap::from([("first", 9), ("second", 100)]);
+        assert_eq!(required_timestamp_us(&step, &observed).unwrap(), 100);
+        assert!(required_timestamp_us(&step, &std::collections::BTreeMap::from([("first", 9)])).is_err());
+        step.requires = vec!["START".into()];
+        assert_eq!(required_timestamp_us(&step, &std::collections::BTreeMap::new()).unwrap(), 0);
+    }
+
+    #[test]
+    fn causal_selection_uses_the_first_verified_repeat_after_every_predecessor() {
+        let early = snapshot(99);
+        let eligible = snapshot(100);
+        let later = snapshot(101);
+        assert_eq!(find_structured_step(&[&early, &eligible, &later], &step(), 100).unwrap(), (2, 100));
+        assert_eq!(find_structured_step(&[&early], &step(), 99).unwrap(), (1, 99));
+    }
+
+    #[test]
+    fn causal_selection_refuses_a_trace_with_only_premature_or_missing_markers() {
+        let early = snapshot(99);
+        assert!(find_structured_step(&[&early], &step(), 100).is_err());
+        assert!(find_structured_step(&[], &step(), 100).is_err());
+    }
+
+    #[test]
+    fn causal_selection_does_not_hide_malformed_or_wrong_identity_evidence() {
+        let early = snapshot(99);
+        let eligible = snapshot(100);
+        let corrupt = early.replace("arg1=0x2", "arg1=0x3");
+        assert!(find_structured_step(&[&corrupt, &eligible], &step(), 100).is_err());
+        let incomplete = framed("milestone-begin v=1 output_seq=7 seq=3 ts_us=99 tick=9 cat=compat name=product-executable-snapshot-sealed arg0=0x1 arg1=0x2 pid=71 tid=72 dropped=0 discarded_bytes=0");
+        assert!(find_structured_step(&[&incomplete, &eligible], &step(), 100).is_err());
+        let wrong_identity = framed(&verified_milestone(&early).unwrap().semantic
+            .replace("provider_service=2", "provider_service=3"));
+        assert!(verified_milestone(&wrong_identity).is_some());
+        assert!(find_structured_step(&[&wrong_identity, &eligible], &step(), 100).is_err());
     }
 
     #[test]

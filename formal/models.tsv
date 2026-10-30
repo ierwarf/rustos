@@ -1,7 +1,9 @@
 # model	class	deadlock_policy	deadlock_reason	pr_timeout_s	nightly_timeout_s	nightly_mode	apalache	tlaps	trace
+application-limit-refusal/ApplicationLimitRefusal	safety	check	explicit stutter covers incomplete evidence denied cleanup and object and page retirement after zero live members	30	120	exhaustive	no	no	no
+application-job-custody/ApplicationJobCustody	safety	check	explicit stutter covers refused provisioning partial retirement and loader death while rootd retains ancestor custody	30	120	exhaustive	no	no	no
 task-retirement-cleanup-owner/TaskRetirementCleanupOwner	safety	check	vacant and complete cells stutter while exact claim ACK and two-task reset remain explicit	30	120	exhaustive	no	no	no
 authority-identity-lifecycle/AuthorityIdentityLifecycle	safety	intentional-terminal	bounded identity namespace may exhaust	30	120	exhaustive	no	no	no
-capability-derivation-lifecycle/CapabilityDerivationLifecycle	safety	check	explicit rejection and terminal revoke states stutter while typed rights attenuation and independent epochs remain explicit	30	120	exhaustive	no	no	no
+capability-derivation-lifecycle/CapabilityDerivationLifecycle	safety	check	explicit rejection and terminal revoke states stutter while same-kind rights attenuation and independent epochs remain explicit	30	120	exhaustive	no	no	no
 atomic-process-activation-batch/AtomicProcessActivationBatch	safety	check	committed rejected and requester-exit terminals stutter while full target identities and all-or-nothing activation remain explicit	30	120	exhaustive	no	no	no
 cpu-affinity-observation/CpuAffinityObservation	safety	check	reply and rejection terminals stutter while exact online-mask publication remains explicit	30	120	exhaustive	no	no	no
 task-affinity-lifecycle/TaskAffinityLifecycle	safety	check	rejected affinity requests stutter while successful changes retain explicit migration fork and exec progress	30	120	exhaustive	no	no	no
@@ -80,7 +82,7 @@ ipc-endpoint-ownership/IpcEndpointOwnership	safety	intentional-terminal	message 
 ipc-handle-transfer/IpcHandleTransfer	safety	intentional-terminal	transfer outcome is terminal	120	900	exhaustive+simulate	yes	no	no
 ipc-priority-inheritance/IpcPriorityInheritance	safety	intentional-terminal	IPC call may resolve or cancel	120	900	exhaustive	no	no	no
 ipc-priority-queue/IpcPriorityQueue	safety	check	all-delivered terminal state stutters while priority selection remains explicit	30	120	exhaustive	no	no	no
-ipc-reply-recv-transaction/IpcReplyRecvTransaction	safety	check	explicit success and phase-aware error terminals stutter while reply consumption and receive wake custody remain explicit	30	120	exhaustive	no	no	no
+ipc-reply-recv-transaction/IpcReplyRecvTransaction	safety	check	explicit success and phase-aware error terminals stutter while byte/handle output admission and reply/receive custody remain explicit	30	120	exhaustive	no	no	no
 ipc-reply-deadline/IpcReplyDeadline	temporal	intentional-terminal	IPC wait outcome is terminal	120	900	exhaustive	no	no	no
 ipc-transfer-authority/IpcTransferAuthority	temporal	check	installed and released terminals stutter while exact ownership remains checked	120	900	exhaustive	no	no	no
 ivshmem-pairing/IvshmemPairing	temporal	intentional-terminal	peer pairing may disconnect	120	900	exhaustive	no	no	no
@@ -146,4 +148,13 @@ cold-exec-intent/ColdExecIntent	safety	check	Finite cold ownership phases explic
 affinity-claim-admission/AffinityClaimAdmission	safety	check	Finite masks and slot identities explicitly stutter; no hardware/return refinement	30	120	exhaustive	no	no	no
 scheduler-terminal-claim/SchedulerTerminalClaim	safety	check	a completed stop stutters; every other state has an enabled claim, publish, or withdraw step	30	120	exhaustive	no	no	no
 oom-termination-owner/OomTerminationOwner	safety	check	a finished race stutters; every other state has an enabled request, finalize, or join step	30	120	exhaustive	no	no	no
+job-handle-publication/JobHandlePublication	safety	check	explicit stutter covers terminal publication and cancellation with one replacement reservation	30	120	exhaustive	no	no	no
+job-spawn-placement/JobSpawnPlacement	safety	check	explicit stutter covers refused preparation and closed retirement while descriptor admission kill/recycle and bounded supervisor custody remain explicit	30	120	exhaustive	no	no	no
 job-lifecycle/JobLifecycle	safety	check	an explicit stutter step is always enabled once the bounded generation space is exhausted	30	120	exhaustive	no	no	no
+slot-directory-growth/SlotDirectoryGrowth	safety	check	an explicit stutter step is always enabled once the bounded storage is fully grown	30	120	exhaustive	no	no	no
+job-limits/JobLimits	safety	check	admission and reaping stay enabled until every job holds the maximum count	30	120	exhaustive	no	no	no
+memory-charge-conservation/MemoryChargeConservation	safety	check	an explicit stutter step is always enabled once every bounded counter is exhausted	60	240	exhaustive	no	no	no
+exception-diagnostic-custody/ExceptionDiagnosticCustody	safety	check	an explicit stutter step is always enabled	30	120	exhaustive	no	no	no
+runtime-trace-causal-selection/RuntimeTraceCausalSelection	safety	check	accepted and rejected states stutter after a bounded immutable-log scan	30	120	exhaustive	no	no	no
+job-policy-lifecycle/JobPolicyLifecycle	safety	check	every state retains a bounded policy observation action	30	120	exhaustive	no	no	no
+job-policy-publication/JobPolicyPublication	safety	check	terminal writer and reader explicitly stutter	30	120	exhaustive	no	no	no

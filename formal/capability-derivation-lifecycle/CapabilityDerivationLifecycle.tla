@@ -11,6 +11,7 @@ transfer ticket's ObjectIdentity adapter.
 *******************************************************************************)
 
 Rights == {"read", "write", "transfer"}
+Kinds == {"file", "job"}
 Epochs == 1..2
 
 Live == "live"
@@ -18,10 +19,12 @@ Absent == "absent"
 Revoked == "revoked"
 
 VARIABLES parentState, childState, parentRights, childRights,
-          parentLease, childLease, parentRevoke, childRevoke, outcome
+          parentLease, childLease, parentRevoke, childRevoke, outcome,
+          parentKind, childKind
 
 vars == <<parentState, childState, parentRights, childRights,
-          parentLease, childLease, parentRevoke, childRevoke, outcome>>
+          parentLease, childLease, parentRevoke, childRevoke, outcome,
+          parentKind, childKind>>
 
 Init ==
     /\ parentState = Live
@@ -33,11 +36,14 @@ Init ==
     /\ parentRevoke = 1
     /\ childRevoke = 0
     /\ outcome = "idle"
+    /\ parentKind \in Kinds
+    /\ childKind = "none"
 
-Derive(rights, lease, revoke) ==
+Derive(kind, rights, lease, revoke) ==
     /\ parentState = Live
     /\ childState = Absent
     /\ rights \subseteq parentRights
+    /\ kind = parentKind \* same object kind
     /\ lease = parentLease
     /\ revoke = parentRevoke
     /\ childState' = Live
@@ -45,30 +51,31 @@ Derive(rights, lease, revoke) ==
     /\ childLease' = lease
     /\ childRevoke' = revoke
     /\ outcome' = "derived"
-    /\ UNCHANGED <<parentState, parentRights, parentLease, parentRevoke>>
+    /\ childKind' = kind
+    /\ UNCHANGED <<parentState, parentRights, parentLease, parentRevoke, parentKind>>
 
 DeriveAny ==
-    \E rights \in SUBSET Rights, lease \in Epochs, revoke \in Epochs:
-        Derive(rights, lease, revoke)
+    \E kind \in Kinds, rights \in SUBSET Rights, lease \in Epochs, revoke \in Epochs:
+        Derive(kind, rights, lease, revoke)
 
-RejectBroadenOrEpochDrift(rights, lease, revoke) ==
+RejectBroadenOrEpochDrift(kind, rights, lease, revoke) ==
     /\ parentState = Live
     /\ childState = Absent
-    /\ ~(rights \subseteq parentRights) \/ lease # parentLease \/ revoke # parentRevoke
+    /\ ~(rights \subseteq parentRights) \/ kind # parentKind \/ lease # parentLease \/ revoke # parentRevoke
     /\ outcome' = "rejected"
     /\ UNCHANGED <<parentState, childState, parentRights, childRights,
-                    parentLease, childLease, parentRevoke, childRevoke>>
+                    parentLease, childLease, parentRevoke, childRevoke, parentKind, childKind>>
 
 RejectAny ==
-    \E rights \in SUBSET Rights, lease \in Epochs, revoke \in Epochs:
-        RejectBroadenOrEpochDrift(rights, lease, revoke)
+    \E kind \in Kinds, rights \in SUBSET Rights, lease \in Epochs, revoke \in Epochs:
+        RejectBroadenOrEpochDrift(kind, rights, lease, revoke)
 
 RevokeChild ==
     /\ childState = Live
     /\ childState' = Revoked
     /\ outcome' = "child-revoked"
     /\ UNCHANGED <<parentState, parentRights, childRights, parentLease,
-                    childLease, parentRevoke, childRevoke>>
+                    childLease, parentRevoke, childRevoke, parentKind, childKind>>
 
 RevokeParent ==
     /\ parentState = Live
@@ -76,7 +83,7 @@ RevokeParent ==
     /\ childState' = IF childState = Live THEN Revoked ELSE childState
     /\ outcome' = "parent-revoked"
     /\ UNCHANGED <<parentRights, childRights, parentLease, childLease,
-                    parentRevoke, childRevoke>>
+                    parentRevoke, childRevoke, parentKind, childKind>>
 
 RotateProviderLease ==
     /\ parentState = Live
@@ -85,23 +92,24 @@ RotateProviderLease ==
     /\ childState' = IF childState = Live THEN Revoked ELSE childState
     /\ outcome' = "lease-rotated"
     /\ UNCHANGED <<parentState, parentRights, childRights, childLease,
-                    parentRevoke, childRevoke>>
+                    parentRevoke, childRevoke, parentKind, childKind>>
 
 UseChild ==
     /\ childState = Live
     /\ parentState = Live
     /\ childRights \subseteq parentRights
+    /\ childKind = parentKind
     /\ childLease = parentLease
     /\ childRevoke = parentRevoke
     /\ outcome' = "used"
     /\ UNCHANGED <<parentState, childState, parentRights, childRights,
-                    parentLease, childLease, parentRevoke, childRevoke>>
+                    parentLease, childLease, parentRevoke, childRevoke, parentKind, childKind>>
 
 RejectStale ==
     /\ childState = Revoked \/ parentState = Revoked
     /\ outcome' = "stale-rejected"
     /\ UNCHANGED <<parentState, childState, parentRights, childRights,
-                    parentLease, childLease, parentRevoke, childRevoke>>
+                    parentLease, childLease, parentRevoke, childRevoke, parentKind, childKind>>
 
 Stutter ==
     /\ UNCHANGED vars
@@ -121,6 +129,8 @@ TypeOK ==
     /\ childState \in {Absent, Live, Revoked}
     /\ parentRights \subseteq Rights
     /\ childRights \subseteq Rights
+    /\ parentKind \in Kinds
+    /\ childKind \in Kinds \cup {"none"}
     /\ parentLease \in Epochs
     /\ childLease \in Epochs \cup {0}
     /\ parentRevoke \in Epochs
@@ -132,6 +142,7 @@ LiveChildIsAttenuatedAndExact ==
     childState = Live =>
         /\ parentState = Live
         /\ childRights \subseteq parentRights
+        /\ childKind = parentKind
         /\ childLease = parentLease
         /\ childRevoke = parentRevoke
 

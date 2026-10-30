@@ -28,6 +28,12 @@ extern crate alloc;
 
 mod control_drain;
 mod jobs;
+mod job_policy;
+mod job_policy_probe;
+mod job_lease;
+mod loader_realm;
+mod loader_transaction;
+mod application_limit_probe;
 mod loader_wire;
 mod memory_governor;
 mod scheduling_policy;
@@ -161,6 +167,9 @@ struct Lease {
     service_id: u64,
     exec_path: &'static [u8],
     pid: u64,
+    job_handle: Option<u64>,
+    application_realm: Option<u64>,
+    application_realm_configured: bool,
     restart_budget: u32,
     backoff_ms: u32,
     state: u16,
@@ -203,6 +212,11 @@ pub extern "C" fn __rustos_rootd_start() -> ! {
             base: core::ptr::addr_of_mut!(ROOTD_HEAP.0).cast::<u8>() as usize,
             len: ROOTD_HEAP_BYTES,
         });
+    }
+    // A second copy of this binary is started into a limited job at boot to
+    // prove the limit refuses pages; it must do that and nothing else.
+    if jobs::is_limit_probe_child() {
+        jobs::limit_probe_child();
     }
     debug_line(b"rootd: bootstrap enter\n");
     let endpoint = create_rootd_endpoint();
@@ -277,6 +291,45 @@ pub extern "C" fn __rustos_rootd_start() -> ! {
         0 => debug_line(b"rootd: job tree ok\n"),
         _ => debug_line(b"rootd: job tree self-check failed\n"),
     }
+    match jobs::charge_probe() {
+        Ok(()) => debug_line(b"rootd: job memory charge ok\n"),
+        Err((before, during, after)) => {
+            let mut line = [0_u8; 96];
+            let len = memory_governor::format_line(
+                &mut line,
+                b"rootd: job memory charge probe before/during/after:",
+                &[before, during, after],
+            );
+            debug_line(&line[..len]);
+        }
+    }
+    // The limited-job probe starts a second copy of this binary and faults 48 MiB
+    // into it at every boot it runs, which perturbed SMP start-up in measurement
+    // (CPU first-reschedule markers went missing in 4 of 60 boots against none in
+    // about 130 without it). It is a test mode: build with
+    // `RUSTOS_ROOTD_LIMIT_PROBE=1 cargo xtask build` to run it.
+    if option_env!("RUSTOS_ROOTD_LIMIT_PROBE").is_some() {
+        match jobs::limit_probe() {
+            Ok((peak, limit)) => {
+                let mut line = [0_u8; 96];
+                let len = memory_governor::format_line(
+                    &mut line,
+                    b"rootd: job memory limit ok peak/limit:",
+                    &[peak, limit],
+                );
+                debug_line(&line[..len]);
+            }
+            Err((code, peak, last)) => {
+                let mut line = [0_u8; 96];
+                let len = memory_governor::format_line(
+                    &mut line,
+                    b"rootd: job memory limit probe failed code/peak/last:",
+                    &[u64::from(code), peak, last],
+                );
+                debug_line(&line[..len]);
+            }
+        }
+    }
     debug_line(b"rootd: core services ready, spawning initd via loaderd\n");
     let _ = syscall3(
         SYS_RUSTOS_PRODUCT_MILESTONE,
@@ -284,6 +337,7 @@ pub extern "C" fn __rustos_rootd_start() -> ! {
         0,
         0,
     );
+    job_policy_probe::boot();
     spawn_initd_via_loaderd(
         endpoint,
         &mut leases,
@@ -294,6 +348,7 @@ pub extern "C" fn __rustos_rootd_start() -> ! {
     debug_line(b"rootd: initd spawned\n");
     yield_now();
     let mut memory_governor = memory_governor::MemoryGovernor::new();
+    let mut application_limit_probe = application_limit_probe::Probe::default();
     loop {
         drain_lifecycle_events(&mut leases, &mut post_init_leases);
         // Keep post-init control draining bounded by `control_drain` too.
@@ -314,7 +369,10 @@ pub extern "C" fn __rustos_rootd_start() -> ! {
             &mut service_checkpoints,
         );
         supervise_core_readiness(&mut leases, &mut next_core_readiness_poll_ns);
-        supervise_memory_pressure(&mut memory_governor, &leases, &post_init_leases);
+        let _ = loader_realm::configure_ready(
+            endpoint, &mut leases, &mut post_init_leases, &mut service_checkpoints,
+        );
+        supervise_memory_pressure(&mut memory_governor, &mut application_limit_probe, &leases, &post_init_leases);
         // The drain above is deliberately nonblocking. Once all ready
         // messages are consumed, this one wait is the idle boundary: a new
         // control message wakes rootd immediately, while the bounded budget
@@ -341,6 +399,9 @@ fn lease(spec: BootstrapServiceSpec) -> Lease {
         exit_status: 0,
         weight_micros: spec.weight_micros,
         readiness_polls_remaining: CORE_READINESS_POLL_MAX,
+        job_handle: None,
+        application_realm: None,
+        application_realm_configured: false,
     }
 }
 
@@ -386,7 +447,8 @@ fn spawn_tracked_with_attempts(lease: &mut Lease, max_attempts: u32) -> Result<(
     let mut last_errno = 11;
     let mut attempt = 0;
     while attempt < max_attempts {
-        match spawn_exec(lease.exec_path, lease.weight_micros) {
+        let job_handle = job_lease::ensure(lease)?;
+        match spawn_exec(lease.exec_path, lease.weight_micros, job_handle) {
             Ok(pid) => {
                 lease.pid = pid;
                 lease.state = ROOTD_LEASE_STATE_RUNNING;
@@ -396,6 +458,10 @@ fn spawn_tracked_with_attempts(lease: &mut Lease, max_attempts: u32) -> Result<(
             }
             Err(errno) => {
                 last_errno = errno;
+                match job_lease::retire(lease) {
+                    Ok(()) | Err(11) => {}
+                    Err(errno) => return Err(errno),
+                }
                 yield_now();
             }
         }
@@ -404,7 +470,8 @@ fn spawn_tracked_with_attempts(lease: &mut Lease, max_attempts: u32) -> Result<(
     Err(last_errno)
 }
 
-fn spawn_exec(path: &'static [u8], weight_micros: u64) -> Result<u64, i64> {
+fn spawn_exec(path: &'static [u8], weight_micros: u64, job_handle: u64) -> Result<u64, i64> {
+    let expected_job = jobs::info(job_handle)?.id;
     let requester_pid = syscall0(SYS_GETPID);
     if requester_pid <= 0 {
         return Err(5);
@@ -415,21 +482,17 @@ fn spawn_exec(path: &'static [u8], weight_micros: u64) -> Result<u64, i64> {
         scheduling_context_policy_for_exec(path),
     )
     .map_err(i64::from)?;
-    let argv = [path.as_ptr(), core::ptr::null()];
-    let result = syscall6(
-        SYS_RUSTOS_SPAWN_EXEC,
-        path.as_ptr() as u64,
-        argv.as_ptr() as u64,
-        0,
-        SPAWN_FLAG_LOGICAL_ADMIN,
-        0,
-        weight_micros,
-    );
+    let args = jobs::bootstrap_args(path, weight_micros, job_handle);
+    let result = syscall1(SYS_RUSTOS_SPAWN_EXEC, &args as *const _ as u64);
     if result < 0 {
-        Err(-result)
-    } else {
-        Ok(result as u64)
+        return Err(-result);
     }
+    if jobs::process_job(result as u64) != Ok(expected_job) {
+        let _ = jobs::kill(job_handle);
+        return Err(5);
+    }
+    debug_line(b"rootd: direct job placement ok\n");
+    Ok(result as u64)
 }
 
 fn spawn_initd_via_loaderd(
@@ -440,17 +503,23 @@ fn spawn_initd_via_loaderd(
 ) {
     let mut attempts = 0_u64;
     while attempts < INITD_SPAWN_MAX_ATTEMPTS as u64 {
+        let realm_ready = loader_realm::configure_ready(
+            endpoint, leases, post_init_leases, service_checkpoints,
+        );
         debug_line(b"rootd: initd spawn request to loaderd\n");
+        let job_handle = job_lease::ensure(&mut leases[INITD_LEASE_INDEX])
+            .unwrap_or_else(|_| fail_closed(b"rootd: fatal initd job creation failed\n"));
         let initd_path = leases[INITD_LEASE_INDEX].exec_path;
         let initd_weight = leases[INITD_LEASE_INDEX].weight_micros;
-        match spawn_exec_via_loaderd_cooperative(
+        match realm_ready.and_then(|_| spawn_exec_via_loaderd_cooperative(
             endpoint,
             leases,
             post_init_leases,
             service_checkpoints,
             initd_path,
             initd_weight,
-        ) {
+            job_handle,
+        )) {
             Ok(pid) => {
                 debug_line(b"rootd: initd loader spawn complete\n");
                 leases[INITD_LEASE_INDEX].pid = pid;
@@ -467,9 +536,16 @@ fn spawn_initd_via_loaderd(
                 .unwrap_or_else(|_| {
                     fail_closed(b"rootd: fatal initial-activation child cleanup rejected\n")
                 });
+                let _ = job_lease::retire(&mut leases[INITD_LEASE_INDEX]);
                 fail_closed(b"rootd: fatal initd activation failed\n");
             }
             Err(_) => {
+                // A lost reply may hide a published child. Kill the complete
+                // attempt before lending fresh placement authority on retry.
+                match job_lease::retire(&mut leases[INITD_LEASE_INDEX]) {
+                    Ok(()) | Err(11) => {}
+                    Err(_) => fail_closed(b"rootd: fatal failed initd job retirement\n"),
+                }
                 attempts = attempts.saturating_add(1);
                 if attempts <= 8 || attempts.is_power_of_two() {
                     debug_line(b"rootd: initd loader spawn retry\n");
@@ -589,6 +665,10 @@ fn drain_lifecycle_events(leases: &mut [Lease], post_init_leases: &mut [PostInit
             if lease.pid == event.pid {
                 lease.state = ROOTD_LEASE_STATE_EXITED;
                 lease.exit_status = event.exit_status;
+                match job_lease::retire(lease) {
+                    Ok(()) | Err(11) => {}
+                    Err(_) => fail_closed(b"rootd: fatal exited service job retirement failed\n"),
+                }
                 break;
             }
         }
@@ -1541,6 +1621,7 @@ fn reclaim_post_init_lease(
 /// stack, because this runs when the user-class allocator is refusing.
 fn supervise_memory_pressure(
     governor: &mut memory_governor::MemoryGovernor,
+    application_limit_probe: &mut application_limit_probe::Probe,
     leases: &[Lease],
     post_init_leases: &[PostInitLease],
 ) {
@@ -1574,12 +1655,42 @@ fn supervise_memory_pressure(
     }
     let now_ms = rustos_svc_runtime::syscall::monotonic_nanos() / 1_000_000;
     let rootd_pid = syscall0(SYS_GETPID) as u64;
-    let verdict = governor.assess(now_ms, &census, rootd_pid, |pid| {
-        leases.iter().any(|lease| lease.pid == pid)
-            || post_init_leases
-                .iter()
-                .any(|lease| lease.pid == pid || lease.reporter_pid == pid)
-    });
+    // Every process a whole-job kill must not reach. A fixed array: this runs
+    // while the user-class allocator is refusing. An overflow disables job
+    // kills (single-process victims remain) instead of risking a miss.
+    let mut protected = [0_u64; PROTECTED_PIDS_MAX];
+    let mut protected_len = 0;
+    let mut protected_overflow = false;
+    let mut note = |pid: u64| {
+        if pid == 0 {
+            return;
+        }
+        if protected_len < protected.len() {
+            protected[protected_len] = pid;
+            protected_len += 1;
+        } else {
+            protected_overflow = true;
+        }
+    };
+    note(rootd_pid);
+    for lease in leases {
+        note(lease.pid);
+    }
+    for lease in post_init_leases {
+        note(lease.pid);
+        note(lease.reporter_pid);
+    }
+    let protected = &protected[..protected_len];
+    if option_env!("RUSTOS_ROOTD_APP_LIMIT_PROBE") == Some("1") {
+        application_limit_probe.poll(&census, protected, protected_overflow);
+    }
+    let verdict = governor.assess_with_jobs(
+        now_ms,
+        &census,
+        rootd_pid,
+        |pid| protected.contains(&pid),
+        |job| !protected_overflow && job_kill_is_safe(job, protected),
+    );
     match verdict {
         memory_governor::Verdict::Idle | memory_governor::Verdict::Cooldown => {}
         memory_governor::Verdict::Recovered { free_pages } => {
@@ -1595,6 +1706,23 @@ fn supervise_memory_pressure(
                 &mut line,
                 b"rootd: oom no eligible victim free/min/denials:",
                 &[census.free_pages, census.min_free_pages, census.watermark_denials],
+            );
+            debug_line(&line[..len]);
+        }
+        memory_governor::Verdict::KillJob {
+            job,
+            process_id,
+            resident_pages,
+        } => {
+            let result = kill_job_by_id(job);
+            let len = memory_governor::format_line(
+                &mut line,
+                if result.is_ok() {
+                    b"rootd: oom killed job/pid/pages/free:"
+                } else {
+                    b"rootd: oom job kill rejected job/pid/pages/free:"
+                },
+                &[job, process_id, resident_pages, census.free_pages],
             );
             debug_line(&line[..len]);
         }
@@ -1615,6 +1743,61 @@ fn supervise_memory_pressure(
             debug_line(&line[..len]);
         }
     }
+}
+
+/// Upper bound on distinct supervised pids a whole-job kill must avoid.
+const PROTECTED_PIDS_MAX: usize = 64;
+
+/// True only when `job` and everything below it contains none of `protected`.
+/// The kernel answers per pid whether it lies within the opened subtree, so
+/// descendants and ancestors are covered without rootd walking the tree. Any
+/// answer other than "not in this subtree" refuses, including errors.
+fn job_kill_is_safe(job: u64, protected: &[u64]) -> bool {
+    const ESRCH: i64 = 3;
+    if job == rustos_user_abi::syscall::JOB_ID_ROOT {
+        return false;
+    }
+    let Ok(handle) = jobs::open_subtree(
+        rustos_user_abi::syscall::JOB_BOOTSTRAP_ROOT_FD,
+        job,
+        rustos_user_abi::syscall::JOB_RIGHT_INSPECT,
+    ) else {
+        return false;
+    };
+    let safe = protected
+        .iter()
+        .all(|&pid| jobs::process_job_in(handle, pid) == Err(ESRCH));
+    jobs::close(handle);
+    safe
+}
+
+/// Ends every process of `job`'s subtree. The kernel kills a bounded batch per
+/// call and reports what remains, so repeat a few times; a job that still has
+/// members afterwards is reported as busy and the next pass continues.
+fn kill_job_by_id(job: u64) -> Result<(), i64> {
+    const BUSY: i64 = 11;
+    const ESRCH: i64 = 3;
+    let handle = jobs::open_subtree(
+        rustos_user_abi::syscall::JOB_BOOTSTRAP_ROOT_FD,
+        job,
+        rustos_user_abi::syscall::JOB_RIGHT_INSPECT | rustos_user_abi::syscall::JOB_RIGHT_KILL,
+    )?;
+    let mut result = Err(BUSY);
+    for _ in 0..8 {
+        match jobs::kill(handle) {
+            Ok(0) | Err(ESRCH) => {
+                result = Ok(());
+                break;
+            }
+            Ok(_) => {}
+            Err(errno) => {
+                result = Err(errno);
+                break;
+            }
+        }
+    }
+    jobs::close(handle);
+    result
 }
 
 fn terminate_service_process(pid: u64) -> Result<(), i32> {
@@ -2036,13 +2219,16 @@ fn restart_lease(
     post_init_leases: &mut [PostInitLease],
     service_checkpoints: &mut ServiceCheckpointStore,
 ) -> Result<(u64, bool), i64> {
+    job_lease::retire(&mut leases[index])?;
     let lease = leases[index];
     if BOOTSTRAP_MANIFEST[index].restart_direct {
-        return spawn_exec(lease.exec_path, lease.weight_micros).map(|pid| (pid, false));
+        let job_handle = job_lease::ensure(&mut leases[index])?;
+        return spawn_exec(lease.exec_path, lease.weight_micros, job_handle).map(|pid| (pid, false));
     }
     if !service_dependencies_ready(index) || !service_ready(IPC_SERVICE_LOADERD) {
         return Err(11);
     }
+    let job_handle = job_lease::ensure(&mut leases[index])?;
     spawn_exec_via_loaderd_cooperative(
         endpoint,
         leases,
@@ -2050,6 +2236,7 @@ fn restart_lease(
         service_checkpoints,
         lease.exec_path,
         lease.weight_micros,
+        job_handle,
     )
     .map(|pid| (pid, true))
 }
@@ -2061,10 +2248,28 @@ fn spawn_exec_via_loaderd_cooperative(
     service_checkpoints: &mut ServiceCheckpointStore,
     path: &'static [u8],
     weight_micros: u64,
+    job_handle: u64,
 ) -> Result<u64, i64> {
-    start_loader_supervisor_worker(endpoint, leases, post_init_leases, service_checkpoints)?;
-    debug_line(b"rootd: loader supervisor worker started\n");
-    let result = spawn_exec_via_loaderd_blocking(path, weight_micros);
+    with_loader_supervision(endpoint, leases, post_init_leases, service_checkpoints, || {
+        spawn_exec_via_loaderd_blocking(path, weight_micros, job_handle)
+    })
+}
+
+fn with_loader_supervision(
+    endpoint: u64,
+    leases: &mut [Lease],
+    post_init_leases: &mut [PostInitLease],
+    service_checkpoints: &mut ServiceCheckpointStore,
+    operation: impl FnOnce() -> Result<u64, i64>,
+) -> Result<u64, i64> {
+    loader_transaction::run(
+        || start_loader_supervisor_worker(endpoint, leases, post_init_leases, service_checkpoints),
+        operation,
+        complete_loader_supervision,
+    )
+}
+
+fn complete_loader_supervision(result: Result<u64, i64>) -> Result<u64, i64> {
     let encoded = match result {
         Ok(pid) => i64::try_from(pid).unwrap_or(-75),
         Err(errno) => errno.checked_neg().unwrap_or(-75),
@@ -2248,7 +2453,8 @@ fn decode_loader_worker_result(encoded: i64) -> Result<u64, i64> {
     }
 }
 
-fn spawn_exec_via_loaderd_blocking(path: &'static [u8], weight_micros: u64) -> Result<u64, i64> {
+fn spawn_exec_via_loaderd_blocking(path: &'static [u8], weight_micros: u64, job_handle: u64) -> Result<u64, i64> {
+    let expected_job = jobs::info(job_handle)?.id;
     let endpoint = syscall1(SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT, IPC_SERVICE_LOADERD);
     if endpoint <= 0 {
         return Err(if endpoint < 0 { -endpoint } else { 11 });
@@ -2299,18 +2505,8 @@ fn spawn_exec_via_loaderd_blocking(path: &'static [u8], weight_micros: u64) -> R
 
     let response = unsafe { &mut *INITD_LOADER_RESPONSE.0.get() };
     *response = empty_loader_spawn_response();
-    let result = syscall5(
-        SYS_RUSTOS_IPC_CALL,
-        endpoint as u64,
-        (request as *const LoaderSpawnRequest) as u64,
-        size_of::<LoaderSpawnRequest>() as u64,
-        (response as *mut LoaderSpawnResponse) as u64,
-        size_of::<LoaderSpawnResponse>() as u64,
-    );
-    if result < 0 {
-        return Err(-result);
-    }
-    if result as usize != size_of::<LoaderSpawnResponse>()
+    let result = jobs::call_loader(endpoint as u64, job_handle, request, response)?;
+    if result != size_of::<LoaderSpawnResponse>()
         || response.version != LOADER_REQUEST_ABI_VERSION
         || response.op != LOADER_OP_SPAWN_EXEC
     {
@@ -2322,6 +2518,11 @@ fn spawn_exec_via_loaderd_blocking(path: &'static [u8], weight_micros: u64) -> R
     if response.pid <= 0 {
         return Err(22);
     }
+    if jobs::process_job(response.pid as u64) != Ok(expected_job) {
+        let _ = jobs::kill(job_handle);
+        return Err(5);
+    }
+    debug_line(b"rootd: loader job placement ok\n");
     Ok(response.pid as u64)
 }
 

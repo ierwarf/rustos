@@ -601,6 +601,7 @@ fn kernel_handle_kind_code(handle: &multitask::KernelHandle) -> u64 {
         multitask::KernelHandle::Socket(_) => 7,
         multitask::KernelHandle::VfsDirectory(_) => 8,
         multitask::KernelHandle::DisplaySurface(_) => 9,
+        multitask::KernelHandle::Job(_) => 10,
     }
 }
 

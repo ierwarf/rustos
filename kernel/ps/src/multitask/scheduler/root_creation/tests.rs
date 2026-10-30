@@ -35,6 +35,30 @@ pub(in crate::multitask::scheduler) fn donation_roots(
     });
 }
 
+#[test]
+fn root_job_authority_is_an_explicit_consumed_bootstrap_grant() {
+    let _fixture = super::super::tests::boxed_scheduler();
+    use crate::user::handles::KernelHandle;
+    use kernel_object::api::handle::{HandleRights, JobHandleRights};
+    let fd = rustos_user_abi::syscall::JOB_BOOTSTRAP_ROOT_FD;
+    let mut b = bootstrap(UserAbi::Linux);
+    b.logical_admin = true;
+    b.set_exec_path("services/rootd/rootd.elf");
+    let normal = Input::AddressSpace(ProcessAddressSpace::modeled_root_for_host(0x4000))
+        .materialize(&mut b, ID).unwrap();
+    assert!(normal.handles().get_entry(fd).is_none(), "path and admin do not grant root authority");
+    let mut b = bootstrap(UserAbi::Linux);
+    b.root_job_authority = true;
+    let granted = Input::AddressSpace(ProcessAddressSpace::modeled_root_for_host(0x5000))
+        .materialize(&mut b, ID).unwrap();
+    assert!(!b.root_job_authority, "materialization consumes the bootstrap grant");
+    let entry = granted.handles().get_entry(fd).unwrap();
+    assert_eq!(entry.rights(), HandleRights::Job(JobHandleRights::ALL));
+    assert!(matches!(entry.handle(), KernelHandle::Job(id) if *id == crate::multitask::ROOT_JOB));
+    b.root_job_authority = true;
+    assert!(Input::State(state()).materialize(&mut b, ID).is_none(), "a fork-state input cannot mint root authority");
+}
+
 pub(in crate::multitask::scheduler) fn policy() -> super::super::super::SchedulingContextAdmission {
     super::super::super::SchedulingContextAdmission {
         budget_ns: 4000,

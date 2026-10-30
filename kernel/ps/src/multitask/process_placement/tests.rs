@@ -9,6 +9,8 @@ fn fixture(f: impl FnOnce(ProcessHandle)) {
     identity::clear(SLOT);
     identity::clear(CHILD);
     let h = ProcessHandle::new(31, 42);
+    // This catalog projection has no production spawn to grow the side cell.
+    assert!(ensure_slot_storage(h.index()));
     identity::publish_metadata(
         SLOT,
         Some(TaskIdentity {

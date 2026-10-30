@@ -1,0 +1,11 @@
+X86_64 JobPolicyIncarnationPublicationMutant
+"publishing replacement data before revocation permits a mixed incarnation"
+{
+uint64_t incarnation=1; uint64_t payload=0;
+uint64_t 1:rax; uint64_t 1:rbx; uint64_t 1:rcx;
+}
+P0                         | P1                         ;
+movq $1,(payload)          | movq (incarnation),%rax    ;
+movq $0,(incarnation)      | movq (payload),%rbx        ;
+movq $2,(incarnation)      | movq (incarnation),%rcx    ;
+exists (1:rax=1 /\ 1:rbx=1 /\ 1:rcx=1)
