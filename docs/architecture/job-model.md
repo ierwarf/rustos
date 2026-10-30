@@ -40,9 +40,9 @@ application workloads. The remaining work is kernel-memory charging,
 `memory.high/min`, capability cutover, and client-funded service usage.
 Proposed sections below are target designs, not implementation claims.
 
-### 2. Invariants
+### 2. Target invariants
 
-These are fixed up front so later phases build on the final shape.
+These constraints guide the remaining migration; they are not all shipped yet.
 
 1. **One job per process, for life.** A process is created into a job and never
    moves. Exec and fork keep it. This makes every charge attributable to exactly
@@ -280,6 +280,12 @@ session job that lives under the client's subtree. Linux has a comparable remote
 charge for kernel allocations *(recalled)*. This is why invariant 1 is "one job
 per process" and not "one job per allocation": the owner stays simple and the
 exception is an explicit, scoped charge target.
+
+> **Chronological evidence below:** Each "as built" section describes a
+> particular implementation slice, including then-current ABI versions,
+> acceptance gaps and logs. Later sections supersede earlier limits and wire
+> versions; read the source and newest evidence before calling a historical
+> phase description the current implementation.
 
 ### Phase 1 as built
 
