@@ -26,7 +26,8 @@ runtimed (or initd autostart)
        commit and return pid
   -> kernel scheduler picks up the new task
   -> Linux libc syscalls trap into kernel
-       syscalld owns MM/clock/signal policy via SYS_RUSTOS_MM_BROKER
+       syscalld owns MM/credential and selected signal policy via gated brokers
+       clock_gettime/nanosleep use the local compat timer substrate
        vfsd owns VFS policy
 ```
 
@@ -48,7 +49,7 @@ runtimed
   -> loaderd
        open executable, validate DOS+PE+OPTIONAL_HEADER
        read the bounded section table in one pread64 and enforce the same image gate
-       load PE main image at default base
+       map PE main image at an admitted randomized base
        load_system_dll_registry (system/registry/compat/windows-system-dlls.txt)
        preload system DLLs (ntdll, kernel32, kernelbase, msvcrt, ucrtbase, ...)
        resolve_import_closure (imports + forwarders)
@@ -123,7 +124,8 @@ runtimed (또는 initd autostart)
        commit, pid 반환
   -> kernel scheduler가 새 task를 pickup
   -> Linux libc syscall이 kernel로 trap
-       syscalld가 SYS_RUSTOS_MM_BROKER로 MM/clock/signal 정책 소유
+       syscalld가 gated broker를 통해 MM/credential 및 일부 signal 정책 소유
+       clock_gettime/nanosleep은 compat 내부 timer 경로 사용
        vfsd가 VFS 정책 소유
 ```
 
@@ -146,7 +148,7 @@ runtimed
   -> loaderd
        executable open, DOS+PE+OPTIONAL_HEADER 검증
        bounded section table을 pread64 한 번으로 읽고 동일 image gate 적용
-       PE main image를 default base에 load
+       PE main image를 검증된 randomized base에 load
        load_system_dll_registry (system/registry/compat/windows-system-dlls.txt)
        system DLL preload (ntdll, kernel32, kernelbase, msvcrt, ucrtbase, ...)
        resolve_import_closure (import + forwarder)

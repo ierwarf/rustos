@@ -1,9 +1,11 @@
 # 코어 외 경로: 정적 검토로 확정한 미구현·부실 목록
 
 측정 인터페이스는 [벤치 묶음](../../benchmarks/core-path-bundle.md), 수치는
-[진행표](../../benchmarks/core-paths-progress.md). 이 문서는 **소스만 읽고 확정한**
-사실이며, 각 항목은 수정 후 해당 벤치/회귀 witness로 닫는다. 측정 없이 추정한
-원인은 "가설"로 표시한다.
+[진행표](../../benchmarks/core-paths-progress.md). 이 문서는 **2026-10-22 당시의 소스 정적 감사 기록**입니다.
+아래 '미구현'·'부실' 판정은 최신 master의 보증된 현황표가 아닙니다.
+현재 소스와 [Ring3 현황](../../architecture/ring3-process-model.md)을
+먼저 비교하세요. 각 항목은 수정 후 벤치/회귀 witness로 닫고,
+측정 없이 추정한 원인은 "가설"로 표시합니다.
 
 ## A. 미구현 (구조 설계 후 구현, 임시 우회 금지)
 
@@ -27,7 +29,7 @@
 | B9 | `syscalld_ops.rs wait4` | busy-poll 및 상태 소비/신호 경합 | 블로킹 대기에 더해, 이미 소비한 상태가 EINTR에 버려지던 문제·물리 회수 전 종료 상태 중복 반환·WNOHANG의 잘못된 ECHILD 처리를 수정. 마지막 자식 소비 뒤 다른 부모 waiter도 깨움. pinned-child/경합/신호 우선순위 witness 추가 |
 | B10 | fork+wait p50 | 약 9 ms를 tick 대기로 추정했음 | **원인 분리**: held fork transaction p50 0.411 ms, COW clone 0.400 ms(진단 137회). 반복 fork/정상 exit의 동기 debugcon frame을 opt-in lifecycle trace로 제한하자 1 vCPU fork+wait p50 35.02M→2.56M ticks. 원래 출력을 복원하면 35.49M으로 재상승(CPUID p50 모두 4480). 비정상 종료·exec 거부 계측 유지. 최종 반복/8 vCPU 검증 진행 중 |
 | B7 | `reclaim.rs complete` | task 하나 reap마다 debug log | 기본 `logging.categories.sched="info"`에서 `rustos_log_sched_debug`가 생성되지 않아 formatting/output 자체가 컴파일 제외됨. B10의 무조건 milestone과는 다름 |
-| B8 | 크기 | process table 32개 고정 | 상용 수준에는 부족. 증설 시 reap queue/ledger 크기 동반 검토 |
+| B8 | 크기(과거 상태) | 당시 process table 32개 고정 | **2a에서 청크 디렉터리로 교체.** 현재 기본 한도 32와 내부 슬롯 상한 4096은 별도이며, 확장 부하 검증은 별도 과제 |
 
 ## C. SMP 배치
 

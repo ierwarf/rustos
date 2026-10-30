@@ -328,8 +328,12 @@ edit (one `mprotect` inside one region) reserves one entry instead of the whole
 table and the stack no longer scales with it at all. Measured after: zero
 capacity refusals and zero `cannot map zero-fill pages` across a boot.
 
-The static publication table is `MAX_PROCESS_OBJECTS * PAGER_MAX_VMAS_PER_PROCESS`
-— 1.3 MiB at 32×256. That is the real ceiling on raising it again.
+The 256-entry **per-process** VMA table remains bounded, but the earlier
+`MAX_PROCESS_OBJECTS * PAGER_MAX_VMAS_PER_PROCESS` boot-wide static array
+was removed in process-directory phase 2a. `PAGER_VMAS` and
+`PAGER_VMA_WRITERS` now use chunked `AtomicDir` storage, published before
+the associated process slot. Growing the process limit does not preallocate
+one monolithic VMA table for the entire slot ceiling.
 
 ### Fork publication and reusable process slots
 
@@ -339,7 +343,7 @@ copied reservation over a suspended child's already-cloned resident leaves.
 They therefore use separate typed entrypoints; weakening the ordinary
 empty-range proof or routing fork through it is forbidden.
 
-The fixed per-process VMA array outlives a process-table slot. Before counting
+The published per-process VMA chunk outlives a recycled process-table slot. Before counting
 overlap or capacity for a new publication, the writer compares every occupied
 entry's process object generation and MM generation with the live identity,
 drains its installers, and clears mismatches. A process index match alone is
