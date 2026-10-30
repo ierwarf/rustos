@@ -79,3 +79,4 @@ IRQ/MMIO/DMA bridge, 그리고 소수의 gated broker — 만 남기고 나머�
 10. [Package Manifest API](api/package-manifest.md)
 11. [로깅 가이드](logging.md)
 12. [Fault Injection](fault-injection.md)
+13. [Ring3/Job 이행 현황](architecture/ring3-process-model.md)
