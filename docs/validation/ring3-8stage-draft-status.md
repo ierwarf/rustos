@@ -176,3 +176,24 @@ authenticate the exact witness PID and lease generation, implement durable
 journal/fsync and image custody before claiming power-loss recovery,
 add negative/replay tests, and remove legacy paths only after exact
 ownership cutover. No build, compilation, test, boot, or CI was executed.
+
+## 2026-11-01 large-batch continuation — single staged source commit
+
+The detailed source map and Codex handoff is now documented at
+[ring3-mass-draft-codex.md](ring3-mass-draft-codex.md).
+
+This batch adds allocation-class policy accounting, kernel-descriptor
+escrow bookkeeping, strict canonical TLV/replay staging, parent-ordered
+component activation, generic netd/vfsd-ready client session state,
+namespace-personality policy, disk journal codec/sequence logic, image
+custody, pressure response, rollout/reconciliation and a storage trait.
+This is substantial Ring3 scaffolding with failure paths and focused
+tests authored, **not** a claim that production services now consume it.
+
+Production-wired changes are limited to rootd's bootstrap positive-grant
+cross-check and repair of the already referenced InvalidManifest variant.
+ProviderBilling is imported but not dispatched. No kernel fast mechanism
+was moved, no TLB change was made, no compile/build/boot tests were run.
+Codex owns wiring to netd/vfsd, actual kernel job charging, generated IDL,
+image verification, storaged stable sync, cleanup of superseded legacy paths
+and negative-right/copyout/lifecycle acceptance tests.

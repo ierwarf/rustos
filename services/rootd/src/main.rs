@@ -28,6 +28,8 @@ extern crate alloc;
 
 mod control_drain;
 mod component_policy;
+mod control_preflight;
+mod provider_billing;
 mod jobs;
 mod job_policy;
 mod job_policy_probe;
@@ -240,6 +242,7 @@ pub extern "C" fn __rustos_rootd_start() -> ! {
     }
     if component_policy::preflight().is_err()
         || service_grants::preflight().is_err()
+        || control_preflight::preflight().is_err()
     {
         fail_closed(b"rootd: fatal component manifest preflight failed\n");
     }

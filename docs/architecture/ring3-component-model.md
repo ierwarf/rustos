@@ -215,3 +215,20 @@ initd rollback-required launch blocking and remaining completion work is at
 This is uncompiled source, not an acceptance claim. Full object-byte charging,
 disk durability, signed-image rollback and final unified descriptor transfer
 remain unfinished.
+
+### 2026-11-01 bulk Ring3 source drafting (unverified)
+
+The component model now contains bounded, fail-closed planning and
+reconciliation state machines for hierarchical allocation classes,
+descriptor transfer custody, canonical provider-session wires, generic
+provider billing, per-personality namespace configuration, image custody,
+durable journal records, service rollout and supervisor reconciliation.
+These are exported from the library but are not automatically adopted by
+production clients. Rootd now runs an additional immutable grant/catalog
+cross-check before endpoint publication; its generic provider ledger has
+not been wired to public IPC. See [Codex mass draft ledger](../validation/ring3-mass-draft-codex.md).
+
+Do not confuse any staging journal trait with actual power-loss durability,
+any descriptor escrow record with a ring0 capability, or policy accounting
+with an exact kernel charge. The kernel/user mechanism boundary above
+remains unchanged. None of the new code was compiled or booted here.

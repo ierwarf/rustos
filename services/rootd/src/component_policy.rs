@@ -38,6 +38,7 @@ pub(super) enum ManifestError {
     InvalidScheduling,
     InvalidRoute,
     InvalidRole,
+    InvalidManifest,
 }
 
 const ALL_DEPS: u16 = DEP_SYSCALLD | DEP_VFSD | DEP_LOADERD | DEP_PROCD | DEP_PAGERD;
