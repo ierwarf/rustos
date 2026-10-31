@@ -845,6 +845,14 @@ pub fn job_release_client_session_token(
     // If a caller claims a Job for an unknown token, do not accidentally
     // refund it; the cancellation receipt is jobless by construction.
     if expected_job.is_some() {
+        // The previous release may have committed and lost copyout. Only
+        // a token at or below this exact provider's watermark can be
+        // acknowledged idempotently without uncharging any other Job.
+        if table.session_owners[owner_index].pid == owner_pid
+            && token <= table.session_owners[owner_index].high_watermark
+        {
+            return Ok(None);
+        }
         return Err(JobError::Stale);
     }
     table.session_owners[owner_index] = SessionOwner {
@@ -862,11 +870,29 @@ pub fn job_release_client_session_token(
 pub fn job_drain_client_session_tokens(owner_pid: Option<u64>) -> Result<u64, JobError> {
     let mut table = PROCESS_TABLE.lock();
     let mut drained = 0_u64;
-    // Every entry is a previously committed charge. Preflight all before
-    // mutating any to avoid a partial multi-Job settlement on corruption.
+    // Every entry is a previously committed charge. Preflight aggregated
+    // ancestry requirements before touching *any* Job counter. Checking
+    // each token individually is insufficient if several share one Job.
+    for index in 0..JOB_SLOTS {
+        let job = &table.jobs[index];
+        if !job.in_use {
+            continue;
+        }
+        let required = table.session_tokens.iter().filter(|entry| {
+            entry.owner_pid != 0
+                && owner_pid.is_none_or(|pid| pid == entry.owner_pid)
+                && table.job_slot(entry.job).is_some()
+                && table.job_contains(index as u32, entry.job.index)
+        }).count() as u64;
+        if job.subtree_sessions < required {
+            return Err(JobError::Stale);
+        }
+    }
     for entry in &table.session_tokens {
-        if entry.owner_pid != 0 && owner_pid.is_none_or(|pid| pid == entry.owner_pid) {
-            session_refund_preflight(&table, entry.job)?;
+        if entry.owner_pid != 0 && owner_pid.is_none_or(|pid| pid == entry.owner_pid)
+            && table.job_slot(entry.job).is_none()
+        {
+            return Err(JobError::Stale);
         }
     }
     for index in 0..table.session_tokens.len() {

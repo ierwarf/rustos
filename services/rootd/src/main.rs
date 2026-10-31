@@ -706,6 +706,12 @@ fn drain_lifecycle_events(
                     ).unwrap_or_else(|_| {
                         fail_closed(b"rootd: fatal sessiond charge settlement failed\n")
                     });
+                    // All per-provider token tombstones may now be retired:
+                    // this exact service PID has exited and cannot submit
+                    // any delayed new control IPC under its old identity.
+                    jobs::drain_client_sessions(event.pid).unwrap_or_else(|_| {
+                        fail_closed(b"rootd: fatal exited-provider kernel ledger drain\n")
+                    });
                 }
                 break;
             }
