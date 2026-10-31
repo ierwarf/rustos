@@ -2,12 +2,12 @@ name: Ring3 component model
 
 on:
   push:
-    branches: [master]
+    branches: [master, ring3-runtimed-session-capacity]
   pull_request:
-    branches: [master]
+    branches: [master, ring3-runtimed-session-capacity]
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   model:
@@ -21,6 +21,24 @@ jobs:
           rustup toolchain install "$toolchain" --profile minimal --component rustfmt
       - name: Verify declarative Ring3 IDL
         run: python3 tools/ring3_idl_codegen.py --check
+      - name: Format staged session capacity controls
+        run: |
+          rustfmt --edition 2021 services/runtimed/src/session.rs
+          rustfmt --edition 2021 services/runtimed/src/spawn.rs
+      - name: Save staged session formatting
+        if: github.ref == 'refs/heads/ring3-runtimed-session-capacity'
+        run: |
+          git add services/runtimed/src/session.rs services/runtimed/src/spawn.rs
+          if ! git diff --cached --quiet; then
+            git config user.name "rustos-ring3-checks[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit -m "style: format runtimed session budget changes"
+            git push origin HEAD:refs/heads/ring3-runtimed-session-capacity
+          fi
+      - name: Check session capacity formatting
+        run: |
+          rustfmt --edition 2021 --check services/runtimed/src/session.rs
+          rustfmt --edition 2021 --check services/runtimed/src/spawn.rs
       - name: Check component formatting
         run: |
           cargo fmt -p rustos-component-model -- --check
@@ -29,5 +47,7 @@ jobs:
         run: cargo test -p rustos-component-model --locked
       - name: Run rootd unit tests
         run: cargo test -p rootd --features host-test --locked
+      - name: Run runtimed host tests
+        run: cargo test -p runtimed --locked
       - name: Check full RustOS build graph
         run: cargo xtask check

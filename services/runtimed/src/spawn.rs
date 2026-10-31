@@ -149,8 +149,7 @@ pub(super) fn begin_tracked_launch(state: &mut BrokerState, entry: LaunchEntry) 
     );
     let session_handle = if entry.console_hosted {
         let _ = ensure_console_fd(state)?;
-        let session = allocate_console_session(state);
-        state.session_runtime.create_session(session);
+        let session = allocate_console_session(state)?;
         Some(session)
     } else {
         None
@@ -332,8 +331,7 @@ pub(super) fn spawn_tracked_process(
     );
     let session_handle = if entry.console_hosted {
         let _ = ensure_console_fd(state)?;
-        let session = allocate_console_session(state);
-        state.session_runtime.create_session(session);
+        let session = allocate_console_session(state)?;
         let _ = CONSOLE_SESSION_STATE_LOADING_IMAGE;
         Some(session)
     } else {
@@ -985,10 +983,42 @@ pub(super) fn terminate_pid(pid: i32) -> Result<(), i32> {
 
 // --- console lifecycle (owned by runtimed's session policy endpoint) ---
 
-fn allocate_console_session(state: &mut BrokerState) -> u64 {
+fn allocate_console_session(state: &mut BrokerState) -> Result<u64, i32> {
+    // Never wrap an externally visible session handle. A live or stale
+    // capability must never alias the next launch through u64 wraparound.
     let session = state.next_session_handle.max(1);
-    state.next_session_handle = session.wrapping_add(1).max(1);
-    session
+    let next = session.checked_add(1).ok_or(libc::EOVERFLOW)?;
+    // Atomicity at the loop-owned boundary: on denial, both the next handle
+    // and session graph are unchanged. We do not spawn a child without a
+    // matching owned console session.
+    state.session_runtime.create_session(session)?;
+    state.next_session_handle = next;
+    Ok(session)
+}
+
+#[cfg(test)]
+mod session_budget_tests {
+    use super::*;
+
+    #[test]
+    fn exhausted_handle_space_refuses_without_reusing_an_old_session() {
+        let mut state = BrokerState::default();
+        state.next_session_handle = u64::MAX;
+        assert_eq!(allocate_console_session(&mut state), Err(libc::EOVERFLOW));
+        assert_eq!(state.next_session_handle, u64::MAX);
+        assert!(state.session_runtime.sessions_is_empty_for_test());
+    }
+
+    #[test]
+    fn session_allocation_is_monotonic_and_is_only_committed_on_success() {
+        let mut state = BrokerState::default();
+        let first = allocate_console_session(&mut state).unwrap();
+        assert_ne!(first, 0);
+        assert_eq!(state.next_session_handle, first + 1);
+        state.session_runtime.remove_session(first);
+        let next = allocate_console_session(&mut state).unwrap();
+        assert_eq!(next, first + 1);
+    }
 }
 
 pub(super) fn close_console_session(_console_fd: RawFd, session_handle: u64) -> Result<bool, i32> {
