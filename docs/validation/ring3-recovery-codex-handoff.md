@@ -148,3 +148,11 @@ Full positive role-capability cutover is still incomplete.
 
 The preceding items must remain labelled **incomplete** until implemented and
 measured by an independent validation runner.
+
+## Production IDL: post-init lease snapshot validation
+
+The initd/rootd post-init query now uses generated schema opcode 517 inside
+supervisor operation 15; old scalar operation 8 is removed. Test strict TLV
+field ordering, malformed length, replayed challenge, wrong service identity,
+unknown state values, exited service PIDs and recovery across rootd restart.
+This is one live service operation cutover, not an entire ABI rewrite.

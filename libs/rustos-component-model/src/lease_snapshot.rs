@@ -4,9 +4,9 @@
 //! The message cannot authorize a lease: rootd separately authenticates the
 //! kernel-stamped sender and exact live initd principal before replying.
 //! The request-id and challenge match to reject a mismatched/stale reply.
-use alloc::vec::Vec;
 use crate::generated_idl::POST_INIT_LEASE_SNAPSHOT;
 use crate::idl::{Builder, IdlError, Message};
+use alloc::vec::Vec;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Query {
@@ -14,9 +14,7 @@ pub struct Query {
     pub challenge: u64,
 }
 
-fn encode_fields(service: u64, pid: u64, challenge: u64, state: u16)
-    -> Result<Vec<u8>, IdlError>
-{
+fn encode_fields(service: u64, pid: u64, challenge: u64, state: u16) -> Result<Vec<u8>, IdlError> {
     if service == 0 || challenge == 0 {
         return Err(IdlError::Malformed);
     }
@@ -52,9 +50,7 @@ pub fn decode_query(frame: &[u8]) -> Result<Query, IdlError> {
     Ok(Query { service, challenge })
 }
 
-pub fn encode_reply(query: Query, pid: u64, state: u16)
-    -> Result<Vec<u8>, IdlError>
-{
+pub fn encode_reply(query: Query, pid: u64, state: u16) -> Result<Vec<u8>, IdlError> {
     encode_fields(query.service, pid, query.challenge, state)
 }
 
@@ -78,7 +74,13 @@ mod tests {
     fn generated_lease_snapshot_roundtrips_exact_query_and_reply() {
         let request = encode_query(11, 27).unwrap();
         let query = decode_query(&request).unwrap();
-        assert_eq!(query, Query { service: 11, challenge: 27 });
+        assert_eq!(
+            query,
+            Query {
+                service: 11,
+                challenge: 27
+            }
+        );
         let reply = encode_reply(query, 901, 1).unwrap();
         assert_eq!(decode_reply(&reply, 11, 27), Ok((901, 1)));
         assert_eq!(decode_reply(&reply, 11, 28), Err(IdlError::Malformed));
@@ -93,13 +95,29 @@ mod tests {
         let mut query = encode_query(10, 1).unwrap();
         query.push(0);
         assert!(decode_query(&query).is_err());
-        let reply = encode_reply(Query { service: 10, challenge: 1 }, 0, 0).unwrap();
+        let reply = encode_reply(
+            Query {
+                service: 10,
+                challenge: 1,
+            },
+            0,
+            0,
+        )
+        .unwrap();
         assert_eq!(decode_reply(&reply, 10, 1), Ok((0, 0)));
     }
 
     #[test]
     fn noncanonical_query_cannot_claim_an_incarnation_or_state() {
-        let reply = encode_reply(Query { service: 10, challenge: 1 }, 50, 1).unwrap();
+        let reply = encode_reply(
+            Query {
+                service: 10,
+                challenge: 1,
+            },
+            50,
+            1,
+        )
+        .unwrap();
         assert!(decode_query(&reply).is_err());
         let mut query = encode_query(10, 1).unwrap();
         let request_id_offset = 16;

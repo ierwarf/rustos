@@ -612,6 +612,7 @@ name = "initd"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "rustos-component-model",
  "observability-client",
  "runtime-control",
  "rustos-svc-runtime",

@@ -106,7 +106,7 @@ library as replacing the existing rootd/Job/IPC authorities.
 | 1. Job lifecycle | Existing ring0 generational Job tree and typed descriptors (unchanged) | Hardware qualification, not reimplementation |
 | 2. Accounting | Existing counted process/thread/user-page limits; new userspace `pressure` model | Authoritative kernel-byte charge, memory.high/min admission/pressure wiring and acceptance |
 | 3. JobPolicy | Existing 256-bit kernel policy ceilings; production negative gating of checkpoint/reclaim controls by effective JobPolicy; live 13-role rootd authority manifest | Assign positive subject grants and dual-run cutover of legacy service-capability checks |
-| 4. IDL/runtime | Canonical `idl` codec, schema validator/code generator and five generated staging interfaces | Generated production bindings, ABI versioned adapters and live service migrations |
+| 4. IDL/runtime | Canonical no_std codec and generator; **production initd/rootd post-init lease snapshot uses generated-IDL op 517** with challenge-bound replies and retires scalar query op 8 | Other production services and request classes still require migration; outer supervisor IPC remains repr(C) |
 | 5. Components | New generation-bound Graph; live rootd manifest and 15-offer route validation, declarative ordered supervisor parent edges, exact live service PID collision/reporter-chain denial | Declarative activation, named kernel capability transfer and consolidated production supervisor ownership |
 | 6. Session budgets | New client-funded session policy with exact-generation tickets, overflow retirement, offer-issuance epochs, mandatory one-unit session charging and revoked-route scavenging | Binding client-funded service allocation to kernel Job budget and provider-failure accounting; live runtimed has an independent 256-console-session bound |
 | 7. Personality split | Existing syscalld/procd/loaderd/vfsd policy split preserved | Audit remaining **slow** ring0 ABI policies and cut over with measured cost; no hotpath moves |
@@ -151,3 +151,13 @@ performance relative to the prior release.
 Related contracts: [Ring3 roadmap](ring3-process-model.md),
 [Job model](job-model.md),
 [commercial gates](../ai/commercial-quality-gates.md).
+
+### Production lease-snapshot IDL cutover (2026-10-31)
+
+The initd/rootd post-init lease query is now an actual generated-IDL operation,
+using schema opcode 517 inside rootd supervisor operation 15. Initd validates
+an exact service identifier and unreused challenge in the canonical reply.
+Rootd authenticates the current initd lease and rejects malformed or padded
+requests. Scalar query operation 8 is retired without fallback. Other service
+request types and the outer `CommercialMaxProtocol` transport are not yet
+migrated, and no hotpath IPC was added.
