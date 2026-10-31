@@ -379,6 +379,95 @@ fn restart_budget_exhaustion_escalates_critical_service() {
 }
 
 #[test]
+fn nested_manifest_activates_parents_before_children_and_preserves_routes() {
+    let exported = [ExportSpec {
+        name: "endpoint",
+        rights: 0b11,
+    }];
+    let specs = [
+        ComponentSpec {
+            parent_index: 0,
+            name: "root",
+            kernel_job_id: 1,
+            ceiling: JobCeiling::ALL,
+            quota: Quota::UNLIMITED,
+            restart: RestartPolicy::NEVER,
+            critical: true,
+            exports: &[],
+        },
+        ComponentSpec {
+            parent_index: 0,
+            name: "realm",
+            kernel_job_id: 2,
+            ceiling: JobCeiling::ALL,
+            quota: Quota::UNLIMITED,
+            restart: RestartPolicy::NEVER,
+            critical: true,
+            exports: &[],
+        },
+        ComponentSpec {
+            parent_index: 1,
+            name: "service",
+            kernel_job_id: 3,
+            ceiling: JobCeiling::ALL,
+            quota: Quota::UNLIMITED,
+            restart: RestartPolicy::NEVER,
+            critical: false,
+            exports: &exported,
+        },
+        ComponentSpec {
+            parent_index: 0,
+            name: "client",
+            kernel_job_id: 4,
+            ceiling: JobCeiling::ALL,
+            quota: Quota::UNLIMITED,
+            restart: RestartPolicy::NEVER,
+            critical: false,
+            exports: &[],
+        },
+    ];
+    let offers = [OfferSpec {
+        provider_index: 2,
+        consumer_index: 3,
+        name: "endpoint",
+        rights: 0b01,
+    }];
+    let mut graph = Graph::from_manifest("root", 1, &specs, &offers).unwrap();
+    let realm = ComponentId::new(1, 1).unwrap();
+    let service = ComponentId::new(2, 1).unwrap();
+    let client = ComponentId::new(3, 1).unwrap();
+    assert_eq!(graph.live_count(), 4);
+    assert_eq!(
+        graph.inspect(service).unwrap().state,
+        ComponentState::Running
+    );
+    assert!(graph.is_within(service, realm));
+    assert_eq!(
+        graph
+            .resolve(client, service, n("endpoint"))
+            .unwrap()
+            .rights,
+        0b01
+    );
+
+    // Even a valid-looking manifest cannot reference a parent defined later.
+    let mut invalid = specs;
+    invalid[2].parent_index = 3;
+    assert!(matches!(
+        Graph::from_manifest("root", 1, &invalid, &offers),
+        Err(crate::manifest::ManifestError::InvalidDependency)
+    ));
+
+    // Closing an ancestor stops all descendants' *effective* authority.
+    graph.begin_stop(realm).unwrap();
+    assert_eq!(
+        graph.inspect(service).unwrap().state,
+        ComponentState::Stopping
+    );
+    assert!(graph.resolve(client, service, n("endpoint")).is_err());
+}
+
+#[test]
 fn invalid_manifest_fails_closed_before_publishing_routes() {
     let root_export = ExportSpec {
         name: "control",

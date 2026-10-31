@@ -4,37 +4,37 @@ use std::time::{Duration, Instant};
 
 use keyboard_core::KeyCode;
 use runtime_control::{
-    DEFAULT_RUNTIME_ENV_REGISTRY_PATH, RuntimeEnvScope, load_runtime_default_env,
+    load_runtime_default_env, RuntimeEnvScope, DEFAULT_RUNTIME_ENV_REGISTRY_PATH,
 };
 use rustos_user_abi::console::{
     self as console_abi, ConsoleSendInputEventRequest, ConsoleSessionInfo, ConsoleSetFocusRequest,
     ConsoleSnapshotSessionOutputRequest, ConsoleSnapshotSessionsRequest, ConsoleStateInfo,
 };
-use rustos_user_abi::device::{INPUT_ACTION_RELEASED, INPUT_KIND_KEYBOARD, InputEvent};
+use rustos_user_abi::device::{InputEvent, INPUT_ACTION_RELEASED, INPUT_KIND_KEYBOARD};
 use rustos_user_abi::linux::LinuxTermios;
 use rustos_user_abi::syscall::{
-    COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_SESSIOND,
+    CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
+    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, IpcRecvWithSenderArgs,
+    WaitSetSignalBrokerArgs, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_SESSIOND,
     COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_GRAPH_READINESS,
     COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_READ, COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_READINESS,
     COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_WRITE, COMMERCIAL_MAX_SESSIOND_OP_CONSOLE_ROUTE,
     COMMERCIAL_MAX_SESSIOND_OP_FOREGROUND_FOCUS, COMMERCIAL_MAX_SESSIOND_OP_SESSION_GRAPH,
     COMMERCIAL_MAX_SESSIOND_OP_TTY_LINE_DISCIPLINE, COMMERCIAL_MAX_SESSIOND_OP_UI_BOOTSTRAP,
-    CommercialMaxCapabilityLeaseWire, CommercialMaxProtocolDescriptorWire,
-    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, IPC_SERVICE_DEVMGRD,
-    IPC_SERVICE_SESSIOND, IpcRecvWithSenderArgs, SESSIOND_CONSOLE_GRAPH_WAIT_MAX_MS,
-    SESSIOND_CONSOLE_READ_WAIT_MAX_MS, SESSIOND_CONSOLE_READINESS_LIVE,
-    SESSIOND_CONSOLE_READINESS_READY, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
+    IPC_SERVICE_DEVMGRD, IPC_SERVICE_SESSIOND, SESSIOND_CONSOLE_GRAPH_WAIT_MAX_MS,
+    SESSIOND_CONSOLE_READINESS_LIVE, SESSIOND_CONSOLE_READINESS_READY,
+    SESSIOND_CONSOLE_READ_WAIT_MAX_MS, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
     SYS_RUSTOS_IPC_RECV_WITH_SENDER_BOUNDED, SYS_RUSTOS_IPC_REPLY,
     SYS_RUSTOS_IPC_TRY_RECV_WITH_SENDER, SYS_RUSTOS_WAITSET_SIGNAL_BROKER, WAITSET_ABI_VERSION,
-    WAITSET_PROVIDER_SESSIOND, WaitSetSignalBrokerArgs,
+    WAITSET_PROVIDER_SESSIOND,
 };
 
-use super::{BrokerState, LaunchEntry};
 use super::{
-    CONSOLE_SESSION_STATE_RUNNING, LINUX_FIONREAD, LINUX_TCGETS, LINUX_TCSETS, LINUX_TCSETSF,
-    LINUX_TCSETSW, UI_SERVER_BOOTSTRAP_ENV, UI_SERVER_DESKTOP_FILE_ID, UI_SERVER_DISPLAY_NAME,
-    UI_SERVER_EXEC_PATH, UI_SERVER_TASK_WEIGHT_MICROS, boot_line,
+    boot_line, CONSOLE_SESSION_STATE_RUNNING, LINUX_FIONREAD, LINUX_TCGETS, LINUX_TCSETS,
+    LINUX_TCSETSF, LINUX_TCSETSW, UI_SERVER_BOOTSTRAP_ENV, UI_SERVER_DESKTOP_FILE_ID,
+    UI_SERVER_DISPLAY_NAME, UI_SERVER_EXEC_PATH, UI_SERVER_TASK_WEIGHT_MICROS,
 };
+use super::{BrokerState, LaunchEntry};
 
 const INPUT_BUFFER_CAPACITY: usize = 1024;
 const EDIT_BUFFER_CAPACITY: usize = 256;
@@ -50,6 +50,12 @@ const OUTPUT_BUFFER_CAPACITY: usize = 4096;
 /// per foreground TTY session, so eight is generous. Overflow is not an error:
 /// a ninth reader is answered immediately with the historical empty snapshot
 /// and simply polls the way every reader did before.
+/// Each live console session owns at least one input, edit and output
+/// buffer. A caller must not grow this user-space service's heap without a
+/// finite budget. Kernel Job resource admission remains separately
+/// authoritative; this is a Ring3 defence-in-depth ceiling.
+pub(crate) const MAX_LIVE_CONSOLE_SESSIONS: usize = 256;
+
 const MAX_PARKED_CONSOLE_READS: usize = 8;
 
 /// How many console-graph waits may sit parked at once. Its observers are
@@ -137,14 +143,26 @@ impl Default for SessionRuntime {
 }
 
 impl SessionRuntime {
-    pub(crate) fn create_session(&mut self, session: u64) {
-        // Recreating a live session must keep its buffers, so the vacancy is
-        // tested rather than overwritten; only a genuinely new session is a
-        // change the compositor has to redraw for.
-        if let std::collections::btree_map::Entry::Vacant(entry) = self.sessions.entry(session) {
-            entry.insert(TtySessionState::default());
-            self.advance_graph_generation();
+    pub(crate) fn create_session(&mut self, session: u64) -> Result<(), i32> {
+        // Recreating a live session keeps its existing buffers, without
+        // charging a second slot or publishing a duplicate graph event.
+        if session == 0 {
+            return Err(libc::EINVAL);
         }
+        if self.sessions.contains_key(&session) {
+            return Ok(());
+        }
+        if self.sessions.len() >= MAX_LIVE_CONSOLE_SESSIONS {
+            return Err(libc::ENOSPC);
+        }
+        self.sessions.insert(session, TtySessionState::default());
+        self.advance_graph_generation();
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sessions_is_empty_for_test(&self) -> bool {
+        self.sessions.is_empty()
     }
 
     pub(crate) fn remove_session(&mut self, session: u64) {
@@ -1719,22 +1737,22 @@ mod tests {
     use std::mem::size_of;
 
     use super::{
-        ConsoleReadWaiter, MAX_PARKED_CONSOLE_READS, OUTPUT_BUFFER_CAPACITY, SessionRuntime,
         console_read_park_budget, session_ingress_identity_authorized, session_op_accepts_ioctl,
-        ui_bootstrap_may_retry_immediately,
+        ui_bootstrap_may_retry_immediately, ConsoleReadWaiter, SessionRuntime,
+        MAX_PARKED_CONSOLE_READS, OUTPUT_BUFFER_CAPACITY,
     };
     use crate::{BrokerState, RunningProcess};
     use keyboard_core::KeyCode;
     use rustos_user_abi::console::{
         self as console_abi, ConsoleSessionInfo, ConsoleSnapshotSessionsRequest,
     };
-    use rustos_user_abi::device::{INPUT_ACTION_PRESSED, INPUT_KIND_KEYBOARD, InputEvent};
+    use rustos_user_abi::device::{InputEvent, INPUT_ACTION_PRESSED, INPUT_KIND_KEYBOARD};
     use rustos_user_abi::linux::LinuxTermios;
     use rustos_user_abi::syscall::{
+        CommercialMaxProtocolRequest, CommercialMaxProtocolResponse,
         COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_GRAPH_READINESS,
         COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_READ, COMMERCIAL_MAX_SESSIOND_CONSOLE_ROUTE_WRITE,
         COMMERCIAL_MAX_SESSIOND_OP_CONSOLE_ROUTE, COMMERCIAL_MAX_SESSIOND_OP_UI_BOOTSTRAP,
-        CommercialMaxProtocolRequest, CommercialMaxProtocolResponse,
         SESSIOND_CONSOLE_GRAPH_WAIT_MAX_MS, SESSIOND_CONSOLE_READ_WAIT_MAX_MS,
     };
     use std::time::{Duration, Instant};
@@ -1818,7 +1836,7 @@ mod tests {
     fn an_echo_into_a_saturated_output_ring_still_advances_the_graph() {
         let mut runtime = SessionRuntime::default();
         let session = 1;
-        runtime.create_session(session);
+        runtime.create_session(session).unwrap();
 
         // Run the session past the ring's capacity, the way ordinary shell
         // output does within the first few screens.
@@ -1881,7 +1899,7 @@ mod tests {
     fn canonical_console_input_commits_text_on_enter() {
         let mut runtime = SessionRuntime::default();
         let session = 7;
-        runtime.create_session(session);
+        runtime.create_session(session).unwrap();
 
         for byte in b"pwd" {
             runtime
@@ -1910,36 +1928,28 @@ mod tests {
     fn console_readiness_generation_advances_only_when_input_becomes_ready() {
         let mut runtime = SessionRuntime::default();
         let session = 9;
-        runtime.create_session(session);
+        runtime.create_session(session).unwrap();
         let initial = runtime.input_readiness_generation();
 
-        assert!(
-            !runtime
-                .handle_input_event(session, key_event(30, b'x'))
-                .expect("canonical edit is accepted but not readable")
-        );
+        assert!(!runtime
+            .handle_input_event(session, key_event(30, b'x'))
+            .expect("canonical edit is accepted but not readable"));
         assert_eq!(runtime.input_readiness_generation(), initial);
-        assert!(
-            runtime
-                .handle_input_event(session, key_event(KeyCode::Enter as u32, b'\n'))
-                .expect("enter makes the canonical line readable")
-        );
+        assert!(runtime
+            .handle_input_event(session, key_event(KeyCode::Enter as u32, b'\n'))
+            .expect("enter makes the canonical line readable"));
         assert_eq!(runtime.input_readiness_generation(), initial + 1);
 
-        assert!(
-            !runtime
-                .handle_input_event(session, key_event(KeyCode::Enter as u32, b'\n'))
-                .expect("already-ready input does not republish")
-        );
+        assert!(!runtime
+            .handle_input_event(session, key_event(KeyCode::Enter as u32, b'\n'))
+            .expect("already-ready input does not republish"));
         assert_eq!(runtime.input_readiness_generation(), initial + 1);
 
         let mut drained = [0_u8; 8];
         assert_ne!(runtime.read_from_session(session, &mut drained), Some(0));
-        assert!(
-            runtime
-                .handle_input_event(session, key_event(KeyCode::Enter as u32, b'\n'))
-                .expect("a new empty-to-ready transition republishes")
-        );
+        assert!(runtime
+            .handle_input_event(session, key_event(KeyCode::Enter as u32, b'\n'))
+            .expect("a new empty-to-ready transition republishes"));
         assert_eq!(runtime.input_readiness_generation(), initial + 2);
     }
 
@@ -1947,7 +1957,7 @@ mod tests {
     fn console_close_revokes_readiness_without_resurrecting_the_session() {
         let mut runtime = SessionRuntime::default();
         let session = 10;
-        runtime.create_session(session);
+        runtime.create_session(session).unwrap();
         let generation = runtime.input_readiness_generation();
         assert_eq!(
             runtime.input_readiness_snapshot(session),
@@ -1985,11 +1995,11 @@ mod tests {
         let mut runtime = SessionRuntime::default();
         let idle = runtime.graph_generation();
 
-        runtime.create_session(3);
+        runtime.create_session(3).unwrap();
         let after_create = runtime.graph_generation();
         assert_ne!(after_create, idle, "a new session is a new window");
 
-        runtime.create_session(3);
+        runtime.create_session(3).unwrap();
         assert_eq!(
             runtime.graph_generation(),
             after_create,
@@ -2083,6 +2093,31 @@ mod tests {
     /// render loop each time, and never reached its idle wait - a spin whose
     /// traffic lands on the same endpoint that carries shell keystrokes.
     #[test]
+    fn session_budget_is_bounded_idempotent_and_refunded_on_remove() {
+        let mut state = SessionRuntime::default();
+        assert_eq!(state.create_session(0), Err(libc::EINVAL));
+        for session in 1..=super::MAX_LIVE_CONSOLE_SESSIONS as u64 {
+            assert_eq!(state.create_session(session), Ok(()));
+        }
+        assert_eq!(state.sessions.len(), super::MAX_LIVE_CONSOLE_SESSIONS);
+        let observed_generation = state.graph_generation();
+        assert_eq!(state.create_session(1), Ok(()));
+        assert_eq!(state.graph_generation(), observed_generation);
+        assert_eq!(
+            state.create_session(super::MAX_LIVE_CONSOLE_SESSIONS as u64 + 1),
+            Err(libc::ENOSPC)
+        );
+        assert_eq!(state.graph_generation(), observed_generation);
+        state.remove_session(2);
+        assert_eq!(state.sessions.len(), super::MAX_LIVE_CONSOLE_SESSIONS - 1);
+        assert_eq!(
+            state.create_session(super::MAX_LIVE_CONSOLE_SESSIONS as u64 + 1),
+            Ok(())
+        );
+        assert_eq!(state.sessions.len(), super::MAX_LIVE_CONSOLE_SESSIONS);
+    }
+
+    #[test]
     fn snapshotting_the_console_never_advances_the_generation_it_reports() {
         let mut state = BrokerState::default();
         state.running.insert(
@@ -2098,7 +2133,7 @@ mod tests {
                 logical_admin: false,
             },
         );
-        state.session_runtime.create_session(7);
+        state.session_runtime.create_session(7).unwrap();
 
         let idle = snapshot_generation(&mut state);
         assert_eq!(

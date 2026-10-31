@@ -172,3 +172,143 @@ pub(super) const POST_INIT_MANIFEST: [PostInitServiceSpec; 6] = [
         scheduling: scheduling_policy(IPC_SERVICE_UISERVER, 6_000_000, 2),
     },
 ];
+
+/// Directed service-lookup capabilities beyond bootstrap dependency offers.
+/// This is an immutable rootd control-plane policy, **not** a kernel handle.
+/// A caller must still satisfy exact live lease / sender-identity checks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ServiceRouteSpec {
+    pub(super) subject: u64,
+    pub(super) target: u64,
+}
+
+/// One source of truth for named post-init and cross-service lookup routes.
+/// These offers are checked during bootstrap and evaluated without allocation
+/// at lookup time. Bootstrap dependency offers remain in dependency_mask.
+pub(super) const SERVICE_ROUTING_MANIFEST: [ServiceRouteSpec; 15] = [
+    ServiceRouteSpec {
+        subject: INITD_LEASE_ID,
+        target: IPC_SERVICE_NETD,
+    },
+    ServiceRouteSpec {
+        subject: INITD_LEASE_ID,
+        target: IPC_SERVICE_DEVMGRD,
+    },
+    ServiceRouteSpec {
+        subject: INITD_LEASE_ID,
+        target: IPC_SERVICE_INPUTD,
+    },
+    ServiceRouteSpec {
+        subject: INITD_LEASE_ID,
+        target: IPC_SERVICE_STORAGED,
+    },
+    ServiceRouteSpec {
+        subject: INITD_LEASE_ID,
+        target: IPC_SERVICE_SESSIOND,
+    },
+    ServiceRouteSpec {
+        subject: IPC_SERVICE_VFSD,
+        target: IPC_SERVICE_DEVMGRD,
+    },
+    ServiceRouteSpec {
+        subject: IPC_SERVICE_VFSD,
+        target: IPC_SERVICE_STORAGED,
+    },
+    ServiceRouteSpec {
+        subject: IPC_SERVICE_PROCD,
+        target: IPC_SERVICE_LOADERD,
+    },
+    ServiceRouteSpec {
+        subject: IPC_SERVICE_INPUTD,
+        target: IPC_SERVICE_NETD,
+    },
+    ServiceRouteSpec {
+        subject: IPC_SERVICE_SESSIOND,
+        target: IPC_SERVICE_LOADERD,
+    },
+    ServiceRouteSpec {
+        subject: IPC_SERVICE_SESSIOND,
+        target: IPC_SERVICE_DEVMGRD,
+    },
+    ServiceRouteSpec {
+        subject: IPC_SERVICE_SESSIOND,
+        target: IPC_SERVICE_UISERVER,
+    },
+    ServiceRouteSpec {
+        subject: IPC_SERVICE_UISERVER,
+        target: IPC_SERVICE_INPUTD,
+    },
+    ServiceRouteSpec {
+        subject: IPC_SERVICE_DEVMGRD,
+        target: IPC_SERVICE_SESSIOND,
+    },
+    ServiceRouteSpec {
+        subject: IPC_SERVICE_DEVMGRD,
+        target: IPC_SERVICE_UISERVER,
+    },
+];
+
+/// Immutable positive service-role registry. A role bit is an *upper bound*
+/// on the service's fixed policy role; kernel-stamped sender identity and the
+/// currently sealed lease are still required to exercise the capability.
+/// This registry is never writable by service requests or application input.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ServiceRoleSpec {
+    pub(super) service_id: u64,
+    pub(super) capability: u64,
+}
+
+pub(super) const SERVICE_ROLE_MANIFEST: [ServiceRoleSpec; 13] = [
+    ServiceRoleSpec {
+        service_id: rustos_user_abi::syscall::IPC_SERVICE_LINUX_SYSCALLD,
+        capability: rustos_user_abi::syscall::IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY,
+    },
+    ServiceRoleSpec {
+        service_id: rustos_user_abi::syscall::IPC_SERVICE_VFSD,
+        capability: rustos_user_abi::syscall::IPC_SERVICE_CAP_VFS_POLICY,
+    },
+    ServiceRoleSpec {
+        service_id: rustos_user_abi::syscall::IPC_SERVICE_NETD,
+        capability: rustos_user_abi::syscall::IPC_SERVICE_CAP_NET_POLICY,
+    },
+    ServiceRoleSpec {
+        service_id: rustos_user_abi::syscall::IPC_SERVICE_DEVMGRD,
+        capability: rustos_user_abi::syscall::IPC_SERVICE_CAP_DEVICE_POLICY,
+    },
+    ServiceRoleSpec {
+        service_id: rustos_user_abi::syscall::IPC_SERVICE_LOADERD,
+        capability: rustos_user_abi::syscall::IPC_SERVICE_CAP_PROCESS_LOADER,
+    },
+    ServiceRoleSpec {
+        service_id: rustos_user_abi::syscall::IPC_SERVICE_STORAGED,
+        capability: rustos_user_abi::syscall::IPC_SERVICE_CAP_STORAGE_POLICY,
+    },
+    ServiceRoleSpec {
+        service_id: rustos_user_abi::syscall::IPC_SERVICE_INPUTD,
+        capability: rustos_user_abi::syscall::IPC_SERVICE_CAP_INPUT_POLICY,
+    },
+    ServiceRoleSpec {
+        service_id: rustos_user_abi::syscall::IPC_SERVICE_PROCD,
+        capability: rustos_user_abi::syscall::IPC_SERVICE_CAP_PROCESS_POLICY,
+    },
+    ServiceRoleSpec {
+        service_id: rustos_user_abi::syscall::IPC_SERVICE_ROOTD,
+        capability: rustos_user_abi::syscall::IPC_SERVICE_CAP_ROOT_SUPERVISOR,
+    },
+    ServiceRoleSpec {
+        service_id: rustos_user_abi::syscall::IPC_SERVICE_SESSIOND,
+        capability: rustos_user_abi::syscall::IPC_SERVICE_CAP_SESSION_POLICY,
+    },
+    ServiceRoleSpec {
+        service_id: rustos_user_abi::syscall::IPC_SERVICE_PAGERD,
+        capability: rustos_user_abi::syscall::IPC_SERVICE_CAP_PAGER_POLICY,
+    },
+    ServiceRoleSpec {
+        service_id: rustos_user_abi::syscall::IPC_SERVICE_UISERVER,
+        capability: rustos_user_abi::syscall::IPC_SERVICE_CAP_UI_POLICY,
+    },
+    ServiceRoleSpec {
+        service_id: rustos_user_abi::syscall::IPC_SERVICE_INITD,
+        capability: rustos_user_abi::syscall::IPC_SERVICE_CAP_INIT_POLICY,
+    },
+];
