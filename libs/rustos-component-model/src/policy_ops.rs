@@ -48,19 +48,38 @@ pub enum SlowBrokerOperation {
 
 impl SlowBrokerOperation {
     pub const ALL: [Self; 32] = [
-        Self::SpawnProcess, Self::CreateJob, Self::SetJobLimits,
-        Self::SetJobPolicy, Self::TerminateProcess, Self::ChangeCredentials,
-        Self::ChangeNamespace, Self::MountFilesystem, Self::OpenDevice,
-        Self::ControlDevice, Self::AttachDriverDomain, Self::CreateNetworkSocket,
-        Self::BindNetworkSocket, Self::ConnectNetworkSocket, Self::ConfigureNetwork,
-        Self::CreateSession, Self::RouteSession, Self::CreateCapabilityRoute,
-        Self::RevokeCapabilityRoute, Self::UpgradeComponent,
-        Self::RollbackComponent, Self::ReadCrashRecords,
-        Self::ConfigureSupervisor, Self::ConfigureMemoryLimits,
-        Self::ConfigureCpuPolicy, Self::SignalForeignProcess,
-        Self::IntrospectForeignJob, Self::PublishServiceEndpoint,
-        Self::TransferJobDescriptor, Self::CreateSharedMemory,
-        Self::ModifyFilesystemPolicy, Self::InstallIdentityPolicy,
+        Self::SpawnProcess,
+        Self::CreateJob,
+        Self::SetJobLimits,
+        Self::SetJobPolicy,
+        Self::TerminateProcess,
+        Self::ChangeCredentials,
+        Self::ChangeNamespace,
+        Self::MountFilesystem,
+        Self::OpenDevice,
+        Self::ControlDevice,
+        Self::AttachDriverDomain,
+        Self::CreateNetworkSocket,
+        Self::BindNetworkSocket,
+        Self::ConnectNetworkSocket,
+        Self::ConfigureNetwork,
+        Self::CreateSession,
+        Self::RouteSession,
+        Self::CreateCapabilityRoute,
+        Self::RevokeCapabilityRoute,
+        Self::UpgradeComponent,
+        Self::RollbackComponent,
+        Self::ReadCrashRecords,
+        Self::ConfigureSupervisor,
+        Self::ConfigureMemoryLimits,
+        Self::ConfigureCpuPolicy,
+        Self::SignalForeignProcess,
+        Self::IntrospectForeignJob,
+        Self::PublishServiceEndpoint,
+        Self::TransferJobDescriptor,
+        Self::CreateSharedMemory,
+        Self::ModifyFilesystemPolicy,
+        Self::InstallIdentityPolicy,
     ];
 
     pub const fn operation(self) -> Operation {
@@ -76,10 +95,7 @@ pub enum BrokerDecision {
 
 /// Does **not** grant an action. Successful policy checks must still pass
 /// the kernel's existing positive capability/role authority check.
-pub fn inspect_ceiling(
-    effective: JobCeiling,
-    operation: SlowBrokerOperation,
-) -> BrokerDecision {
+pub fn inspect_ceiling(effective: JobCeiling, operation: SlowBrokerOperation) -> BrokerDecision {
     if effective.permits(operation.operation()) {
         BrokerDecision::SubjectGrantStillRequired
     } else {
@@ -98,10 +114,14 @@ mod tests {
             let id = op.operation().0 as usize;
             assert!(!seen[id]);
             seen[id] = true;
-            assert_eq!(inspect_ceiling(JobCeiling::ALL, op),
-                BrokerDecision::SubjectGrantStillRequired);
-            assert_eq!(inspect_ceiling(JobCeiling::NONE, op),
-                BrokerDecision::DeniedByCeiling);
+            assert_eq!(
+                inspect_ceiling(JobCeiling::ALL, op),
+                BrokerDecision::SubjectGrantStillRequired
+            );
+            assert_eq!(
+                inspect_ceiling(JobCeiling::NONE, op),
+                BrokerDecision::DeniedByCeiling
+            );
         }
     }
 }

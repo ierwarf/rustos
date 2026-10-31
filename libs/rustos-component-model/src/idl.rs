@@ -5,8 +5,8 @@
 //! excessive body sizes and missing required fields all fail closed. Nothing
 //! here replaces production `repr(C)` RustOS ABIs until migration gates pass.
 
-use alloc::vec::Vec;
 use crate::wire::{Header, WireError, CURRENT_VERSION, MAX_BODY_BYTES};
+use alloc::vec::Vec;
 
 pub const FIELD_HEADER_LEN: usize = 4;
 pub const MAX_FIELDS: usize = 64;
@@ -57,7 +57,9 @@ pub enum IdlError {
 }
 
 impl From<WireError> for IdlError {
-    fn from(e: WireError) -> Self { Self::Wire(e) }
+    fn from(e: WireError) -> Self {
+        Self::Wire(e)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -75,22 +77,30 @@ pub struct Field<'a> {
 
 impl<'a> Field<'a> {
     pub fn as_u64(self) -> Result<u64, IdlError> {
-        if self.kind != FieldKind::U64 { return Err(IdlError::WrongType); }
+        if self.kind != FieldKind::U64 {
+            return Err(IdlError::WrongType);
+        }
         let arr: [u8; 8] = self.bytes.try_into().map_err(|_| IdlError::Malformed)?;
         Ok(u64::from_le_bytes(arr))
     }
     pub fn as_u32(self) -> Result<u32, IdlError> {
-        if self.kind != FieldKind::U32 { return Err(IdlError::WrongType); }
+        if self.kind != FieldKind::U32 {
+            return Err(IdlError::WrongType);
+        }
         let arr: [u8; 4] = self.bytes.try_into().map_err(|_| IdlError::Malformed)?;
         Ok(u32::from_le_bytes(arr))
     }
     pub fn as_u16(self) -> Result<u16, IdlError> {
-        if self.kind != FieldKind::U16 { return Err(IdlError::WrongType); }
+        if self.kind != FieldKind::U16 {
+            return Err(IdlError::WrongType);
+        }
         let arr: [u8; 2] = self.bytes.try_into().map_err(|_| IdlError::Malformed)?;
         Ok(u16::from_le_bytes(arr))
     }
     pub fn as_bool(self) -> Result<bool, IdlError> {
-        if self.kind != FieldKind::Bool { return Err(IdlError::WrongType); }
+        if self.kind != FieldKind::Bool {
+            return Err(IdlError::WrongType);
+        }
         match self.bytes {
             [0] => Ok(false),
             [1] => Ok(true),
@@ -98,22 +108,30 @@ impl<'a> Field<'a> {
         }
     }
     pub fn as_str(self) -> Result<&'a str, IdlError> {
-        if self.kind != FieldKind::Utf8 { return Err(IdlError::WrongType); }
+        if self.kind != FieldKind::Utf8 {
+            return Err(IdlError::WrongType);
+        }
         core::str::from_utf8(self.bytes).map_err(|_| IdlError::Malformed)
     }
 }
 
 impl<'a> Schema<'a> {
     pub fn validate(self) -> Result<Self, IdlError> {
-        if self.fields.len() > MAX_FIELDS { return Err(IdlError::Schema); }
+        if self.fields.len() > MAX_FIELDS {
+            return Err(IdlError::Schema);
+        }
         let mut previous = 0;
         for (index, field) in self.fields.iter().enumerate() {
-            if field.tag == 0 || (index != 0 && field.tag <= previous)
-                || field.max_len > MAX_BODY_BYTES {
+            if field.tag == 0
+                || (index != 0 && field.tag <= previous)
+                || field.max_len > MAX_BODY_BYTES
+            {
                 return Err(IdlError::Schema);
             }
             if let Some(len) = field.kind.fixed_len() {
-                if field.max_len != len { return Err(IdlError::Schema); }
+                if field.max_len != len {
+                    return Err(IdlError::Schema);
+                }
             }
             previous = field.tag;
         }
@@ -121,21 +139,33 @@ impl<'a> Schema<'a> {
     }
 
     fn specification(self, tag: u16) -> Option<(usize, FieldSpec)> {
-        self.fields.iter().copied().enumerate().find(|(_, f)| f.tag == tag)
+        self.fields
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, f)| f.tag == tag)
     }
 }
 
 fn validate_field(spec: FieldSpec, value: &[u8]) -> Result<(), IdlError> {
-    if value.len() > spec.max_len { return Err(IdlError::TooLong); }
+    if value.len() > spec.max_len {
+        return Err(IdlError::TooLong);
+    }
     if let Some(expected) = spec.kind.fixed_len() {
-        if value.len() != expected { return Err(IdlError::WrongType); }
+        if value.len() != expected {
+            return Err(IdlError::WrongType);
+        }
     }
     match spec.kind {
         FieldKind::Bool if value != [0] && value != [1] => Err(IdlError::Malformed),
         FieldKind::Utf8 => {
-            if value.is_empty() { return Err(IdlError::EmptyText); }
+            if value.is_empty() {
+                return Err(IdlError::EmptyText);
+            }
             let text = core::str::from_utf8(value).map_err(|_| IdlError::Malformed)?;
-            if text.as_bytes().contains(&0) { return Err(IdlError::Malformed); }
+            if text.as_bytes().contains(&0) {
+                return Err(IdlError::Malformed);
+            }
             Ok(())
         }
         _ => Ok(()),
@@ -161,16 +191,26 @@ impl<'a> Message<'a> {
         let mut previous = 0u16;
         let mut found = 0u64;
         while cursor < body.len() {
-            if body.len() - cursor < FIELD_HEADER_LEN { return Err(IdlError::Malformed); }
+            if body.len() - cursor < FIELD_HEADER_LEN {
+                return Err(IdlError::Malformed);
+            }
             let tag = u16::from_le_bytes([body[cursor], body[cursor + 1]]);
             let len = u16::from_le_bytes([body[cursor + 2], body[cursor + 3]]) as usize;
-            if tag == 0 { return Err(IdlError::UnknownField); }
+            if tag == 0 {
+                return Err(IdlError::UnknownField);
+            }
             if tag <= previous {
-                return Err(if tag == previous { IdlError::Duplicate } else { IdlError::Order });
+                return Err(if tag == previous {
+                    IdlError::Duplicate
+                } else {
+                    IdlError::Order
+                });
             }
             cursor += FIELD_HEADER_LEN;
             let end = cursor.checked_add(len).ok_or(IdlError::TooLong)?;
-            if end > body.len() { return Err(IdlError::Malformed); }
+            if end > body.len() {
+                return Err(IdlError::Malformed);
+            }
             let (index, spec) = schema.specification(tag).ok_or(IdlError::UnknownField)?;
             validate_field(spec, &body[cursor..end])?;
             found |= 1u64 << index;
@@ -182,10 +222,16 @@ impl<'a> Message<'a> {
                 return Err(IdlError::Missing);
             }
         }
-        Ok(Self { header, schema, body })
+        Ok(Self {
+            header,
+            schema,
+            body,
+        })
     }
 
-    pub fn header(&self) -> Header { self.header }
+    pub fn header(&self) -> Header {
+        self.header
+    }
 
     pub fn field(&self, tag: u16) -> Option<Field<'a>> {
         let (_, spec) = self.schema.specification(tag)?;
@@ -195,9 +241,15 @@ impl<'a> Message<'a> {
             let len = u16::from_le_bytes([self.body[cursor + 2], self.body[cursor + 3]]) as usize;
             cursor += FIELD_HEADER_LEN;
             if current == tag {
-                return Some(Field { tag, kind: spec.kind, bytes: &self.body[cursor..cursor + len] });
+                return Some(Field {
+                    tag,
+                    kind: spec.kind,
+                    bytes: &self.body[cursor..cursor + len],
+                });
             }
-            if current > tag { return None; }
+            if current > tag {
+                return None;
+            }
             cursor += len;
         }
         None
@@ -213,20 +265,42 @@ pub struct Builder<'a> {
 
 impl<'a> Builder<'a> {
     pub fn new(schema: Schema<'a>) -> Result<Self, IdlError> {
-        Ok(Self { schema: schema.validate()?, body: Vec::new(), last_tag: 0, present: 0 })
+        Ok(Self {
+            schema: schema.validate()?,
+            body: Vec::new(),
+            last_tag: 0,
+            present: 0,
+        })
     }
 
     pub fn field(&mut self, tag: u16, value: &[u8]) -> Result<(), IdlError> {
-        let (index, spec) = self.schema.specification(tag).ok_or(IdlError::UnknownField)?;
+        let (index, spec) = self
+            .schema
+            .specification(tag)
+            .ok_or(IdlError::UnknownField)?;
         if tag <= self.last_tag {
-            return Err(if tag == self.last_tag { IdlError::Duplicate } else { IdlError::Order });
+            return Err(if tag == self.last_tag {
+                IdlError::Duplicate
+            } else {
+                IdlError::Order
+            });
         }
         validate_field(spec, value)?;
         let len = u16::try_from(value.len()).map_err(|_| IdlError::TooLong)?;
-        let added = FIELD_HEADER_LEN.checked_add(value.len()).ok_or(IdlError::TooLong)?;
-        let total = self.body.len().checked_add(added).ok_or(IdlError::TooLong)?;
-        if total > MAX_BODY_BYTES { return Err(IdlError::TooLong); }
-        self.body.try_reserve(added).map_err(|_| IdlError::OutOfMemory)?;
+        let added = FIELD_HEADER_LEN
+            .checked_add(value.len())
+            .ok_or(IdlError::TooLong)?;
+        let total = self
+            .body
+            .len()
+            .checked_add(added)
+            .ok_or(IdlError::TooLong)?;
+        if total > MAX_BODY_BYTES {
+            return Err(IdlError::TooLong);
+        }
+        self.body
+            .try_reserve(added)
+            .map_err(|_| IdlError::OutOfMemory)?;
         self.body.extend_from_slice(&tag.to_le_bytes());
         self.body.extend_from_slice(&len.to_le_bytes());
         self.body.extend_from_slice(value);
@@ -242,8 +316,10 @@ impl<'a> Builder<'a> {
             }
         }
         let header = Header {
-            version: CURRENT_VERSION, opcode: self.schema.opcode,
-            body_len: self.body.len() as u32, request_id,
+            version: CURRENT_VERSION,
+            opcode: self.schema.opcode,
+            body_len: self.body.len() as u32,
+            request_id,
         };
         header.encode(&self.body).map_err(IdlError::Wire)
     }
@@ -254,11 +330,29 @@ mod tests {
     use super::*;
 
     const FIELDS: [FieldSpec; 3] = [
-        FieldSpec { tag: 1, kind: FieldKind::U64, required: true, max_len: 8 },
-        FieldSpec { tag: 2, kind: FieldKind::Utf8, required: true, max_len: 32 },
-        FieldSpec { tag: 3, kind: FieldKind::Bool, required: false, max_len: 1 },
+        FieldSpec {
+            tag: 1,
+            kind: FieldKind::U64,
+            required: true,
+            max_len: 8,
+        },
+        FieldSpec {
+            tag: 2,
+            kind: FieldKind::Utf8,
+            required: true,
+            max_len: 32,
+        },
+        FieldSpec {
+            tag: 3,
+            kind: FieldKind::Bool,
+            required: false,
+            max_len: 1,
+        },
     ];
-    const S: Schema<'static> = Schema { opcode: 7, fields: &FIELDS };
+    const S: Schema<'static> = Schema {
+        opcode: 7,
+        fields: &FIELDS,
+    };
 
     #[test]
     fn canonical_encoding_roundtrip_is_strict() {
@@ -274,7 +368,10 @@ mod tests {
         assert_eq!(msg.field(3).unwrap().as_bool(), Ok(true));
         let mut invalid = bytes;
         invalid[crate::wire::HEADER_SIZE] = 0;
-        assert_eq!(Message::decode(S, &invalid).err(), Some(IdlError::UnknownField));
+        assert_eq!(
+            Message::decode(S, &invalid).err(),
+            Some(IdlError::UnknownField)
+        );
     }
 
     #[test]
@@ -292,13 +389,34 @@ mod tests {
     #[test]
     fn schemas_must_be_sorted_and_fixed_widths_exact() {
         const BAD: [FieldSpec; 2] = [
-            FieldSpec { tag: 2, kind: FieldKind::U32, required: true, max_len: 4 },
-            FieldSpec { tag: 1, kind: FieldKind::U64, required: true, max_len: 8 },
+            FieldSpec {
+                tag: 2,
+                kind: FieldKind::U32,
+                required: true,
+                max_len: 4,
+            },
+            FieldSpec {
+                tag: 1,
+                kind: FieldKind::U64,
+                required: true,
+                max_len: 8,
+            },
         ];
-        assert!(Builder::new(Schema { opcode: 1, fields: &BAD }).is_err());
-        const BAD_WIDTH: [FieldSpec; 1] = [
-            FieldSpec { tag: 1, kind: FieldKind::U32, required: false, max_len: 8 },
-        ];
-        assert!(Builder::new(Schema { opcode: 1, fields: &BAD_WIDTH }).is_err());
+        assert!(Builder::new(Schema {
+            opcode: 1,
+            fields: &BAD
+        })
+        .is_err());
+        const BAD_WIDTH: [FieldSpec; 1] = [FieldSpec {
+            tag: 1,
+            kind: FieldKind::U32,
+            required: false,
+            max_len: 8,
+        }];
+        assert!(Builder::new(Schema {
+            opcode: 1,
+            fields: &BAD_WIDTH
+        })
+        .is_err());
     }
 }
