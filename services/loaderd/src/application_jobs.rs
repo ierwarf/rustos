@@ -93,6 +93,42 @@ impl Jobs for NativeJobs {
                 return Err((-qos_status) as i32);
             }
         }
+        if args.op == JOB_OP_SET_LIMITS && args.limit_processes != JOB_LIMIT_UNSET {
+            // Exact ProcessObject Box quota follows the same Job handle and
+            // fails launch on refusal. INSPECT obtains the actual target
+            // kernel's object size: no guessed host-compiler struct layout.
+            let mut kmem = RustosJobKmemArgs {
+                abi_version: JOB_KMEM_ABI_VERSION,
+                op: JOB_KMEM_OP_INSPECT,
+                job_handle: args.job_handle,
+                ..RustosJobKmemArgs::default()
+            };
+            let status = unsafe {
+                rustos_svc_runtime::syscall::syscall1(
+                    SYS_RUSTOS_JOB_KMEM, &mut kmem as *mut _ as u64,
+                )
+            };
+            if status < 0 {
+                return Err((-status) as i32);
+            }
+            if kmem.object_size_bytes == 0 || kmem.job == 0 {
+                return Err(71);
+            }
+            kmem.op = JOB_KMEM_OP_SET_LIMIT;
+            kmem.process_object_max_bytes =
+                args.limit_processes.saturating_mul(kmem.object_size_bytes);
+            kmem.usage_process_object_bytes = 0;
+            kmem.object_size_bytes = 0;
+            kmem.job = 0;
+            let status = unsafe {
+                rustos_svc_runtime::syscall::syscall1(
+                    SYS_RUSTOS_JOB_KMEM, &mut kmem as *mut _ as u64,
+                )
+            };
+            if status < 0 {
+                return Err((-status) as i32);
+            }
+        }
         Ok(args)
     }
     fn close(&mut self, handle: u64) {
