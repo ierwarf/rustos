@@ -11,6 +11,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{OpenOptionsExt, MetadataExt};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
+use rustos_component_model::durable_recovery::{self,Cursor,Record};
 
 const RECORD_BYTES:usize=96;
 const MAX_RECORDS:u64=1_048_576;
@@ -62,6 +63,22 @@ fn header(id:JournalIdentity)->[u8;HEADER_BYTES]{
 fn exact_header(value:&[u8;HEADER_BYTES],id:JournalIdentity)->bool{
     value==&header(id)
 }
+/// Reboot-time file reopening is not the same as trustworthy replay.
+/// Verify the entire append-only prefix without loading it into RAM; a torn,
+/// re-ordered, skipped or malformed transaction prevents journal activation.
+/// This is a pure local media check, not authentication of the storage device.
+fn scan_canonical_records(file:&mut File,records:u64)->Result<Cursor,i32>{
+    file.seek(SeekFrom::Start(HEADER_BYTES as u64)).map_err(status)?;
+    let mut cursor=Cursor::new();
+    for index in 0..records {
+        let mut bytes=[0u8;RECORD_BYTES];
+        file.read_exact(&mut bytes).map_err(status)?;
+        let record=durable_recovery::decode(&bytes).map_err(|_|ERROR_EPROTO)?;
+        if record.sequence!=index+1{return Err(ERROR_EPROTO)}
+        cursor=cursor.admit(record).map_err(|_|ERROR_EPROTO)?;
+    }
+    Ok(cursor)
+}
 /// The backing location is opened through an already established trusted
 /// mount. Never accept an arbitrary client-controlled path as authority.
 pub(super) struct ReleaseJournalFile{
@@ -70,6 +87,9 @@ pub(super) struct ReleaseJournalFile{
     id:JournalIdentity,
     records:u64,
     fail_closed:bool,
+    /// Replayed transaction position. No media ACK is trusted without the
+    /// corresponding canonical sequence transition.
+    cursor:Cursor,
 }
 impl ReleaseJournalFile{
     pub(super) fn open_existing(
@@ -92,7 +112,9 @@ impl ReleaseJournalFile{
         if !exact_header(&raw,id){return Err(ERROR_EPERM)}
         let count=(meta.len()-HEADER_BYTES as u64)/RECORD_BYTES as u64;
         if count>MAX_RECORDS{return Err(ERROR_ENOSPC)}
-        Ok(Self{file,path:path.to_owned(),id,records:count,fail_closed:false})
+        let cursor=scan_canonical_records(&mut file,count)?;
+        Ok(Self{file,path:path.to_owned(),id,records:count,
+            fail_closed:false,cursor})
     }
     /// Creating a new file is an explicit privileged provisioning action,
     /// NOT an implicit recovery fallback. If open_existing fails on boot,
@@ -113,10 +135,12 @@ impl ReleaseJournalFile{
         // supporting filesystems. It is not a substitute for media honesty.
         let parent=path.parent().ok_or(ERROR_EINVAL)?;
         File::open(parent).map_err(status)?.sync_all().map_err(status)?;
-        Ok(Self{file,path:path.to_owned(),id,records:0,fail_closed:false})
+        Ok(Self{file,path:path.to_owned(),id,records:0,
+            fail_closed:false,cursor:Cursor::new()})
     }
     pub(super) fn id(&self)->JournalIdentity{self.id}
     pub(super) fn records(&self)->u64{self.records}
+    pub(super) fn recovered_cursor(&self)->Cursor{self.cursor}
     pub(super) fn failed(&self)->bool{self.fail_closed}
     fn check_file_shape(&mut self)->Result<(),i32>{
         if self.fail_closed{return Err(ERROR_EIO)}
@@ -147,6 +171,12 @@ impl ReleaseJournalFile{
         if let Err(error)=self.file.read_exact(&mut result){
             self.fail_closed=true;return Err(status(error))
         }
+        let admitted=durable_recovery::decode(&result).map_err(|_|{
+            self.fail_closed=true;ERROR_EPROTO
+        })?;
+        if admitted.sequence!=index.checked_add(1).ok_or(ERROR_ENOSPC)?{
+            self.fail_closed=true;return Err(ERROR_EPROTO)
+        }
         Ok(Some(result))
     }
     pub(super) fn append_and_verify(
@@ -158,6 +188,11 @@ impl ReleaseJournalFile{
         }
         if index!=self.records||index>=MAX_RECORDS{return Err(ERROR_ENOSPC)}
         self.check_file_shape()?;
+        let next_record=durable_recovery::decode(&record)
+            .map_err(|_|ERROR_EPROTO)?;
+        let next_cursor=self.cursor.admit(next_record)
+            .map_err(|_|ERROR_EPROTO)?;
+        if next_record.sequence!=index+1{return Err(ERROR_EPROTO)}
         let offset=(HEADER_BYTES as u64)
             .checked_add(index.checked_mul(RECORD_BYTES as u64)
                 .ok_or(ERROR_ENOSPC)?).ok_or(ERROR_ENOSPC)?;
@@ -181,6 +216,7 @@ impl ReleaseJournalFile{
             self.fail_closed=true;return Err(ERROR_EPROTO)
         }
         self.records+=1;
+        self.cursor=next_cursor;
         self.check_file_shape()?;
         Ok(())
     }
