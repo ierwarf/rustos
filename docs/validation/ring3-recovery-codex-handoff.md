@@ -111,6 +111,21 @@ Check the above pure tests separately from 1/2/4/8-vCPU KVM experiments.
 The prior KVM boot smoke missed its 25-second readiness markers, so do not
 treat a model/host pass as release acceptance.
 
+## Declarative post-init supervisor parent cutover
+
+The exact reporter parent for each post-init service is now specified in
+`POST_INIT_MANIFEST`. Validation enforces a previously defined parent and
+rejects cyclic or unknown dependencies. Rootd's live parent admission and
+transitive reporter-chain checks use this manifest, instead of selecting
+an arbitrary live service with a matching PID. Verify the negative cases
+where a real netd principal attempts to report a uiserver child, when
+sessiond's own parent is stale, and when duplicate live service PIDs exist.
+
+`initd` remains authorized to query and reclaim **only** services it
+actually supervises. Do not delete the legacy fixed numeric service-ID ABI
+until independent named capability handles are provisioned through kernel
+and userspace. The authorization predicate itself is no longer duplicated.
+
 ## Known remaining integration gates
 
 - Kernel-authoritative per-Job kernel-byte and service-session charges.

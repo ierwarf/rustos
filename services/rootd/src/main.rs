@@ -1905,14 +1905,7 @@ fn authorize_current_initd(leases: &[Lease], sender: IpcSenderIdentity) -> Resul
 }
 
 fn initd_manages_post_init_service(service_id: u64) -> bool {
-    matches!(
-        service_id,
-        IPC_SERVICE_NETD
-            | IPC_SERVICE_DEVMGRD
-            | IPC_SERVICE_INPUTD
-            | IPC_SERVICE_STORAGED
-            | IPC_SERVICE_SESSIOND
-    )
+    component_policy::reporter_service_id(service_id) == Some(INITD_LEASE_ID)
 }
 
 fn authorize_post_init_lease_reporter(
@@ -1921,23 +1914,10 @@ fn authorize_post_init_lease_reporter(
     service_id: u64,
     sender: IpcSenderIdentity,
 ) -> Result<(), i32> {
-    if service_id == IPC_SERVICE_UISERVER {
-        let Some(sessiond) = post_init_leases
-            .iter()
-            .find(|lease| lease.service_id == IPC_SERVICE_SESSIOND)
-        else {
-            return Err(13);
-        };
-        if sessiond.pid == sender.pid
-            && sessiond.state == ROOTD_LEASE_STATE_RUNNING
-            && post_init_lease_reporter_is_live(leases, post_init_leases, sessiond.reporter_pid)
-        {
-            return Ok(());
-        }
-        return Err(13);
-    }
-    authorize_current_initd(leases, sender)?;
-    if initd_manages_post_init_service(service_id) {
+    let expected = component_policy::reporter_service_id(service_id).ok_or(13)?;
+    // Retain the exact live authority chain, not just a matching PID. This
+    // also rejects duplicate live PIDs in both the core and post-init sets.
+    if current_service_id_for_sender(leases, post_init_leases, sender)? == expected {
         Ok(())
     } else {
         Err(13)
@@ -2002,6 +1982,27 @@ fn post_init_lease_reporter_is_live(
             return false;
         };
         if children.next().is_some() {
+            return false;
+        }
+        let Some(expected_parent) =
+            component_policy::reporter_service_id(reporter_lease.service_id)
+        else {
+            return false;
+        };
+        let actual_parent = if leases.iter().any(|lease| {
+            lease.service_id == expected_parent
+                && lease.pid == reporter_lease.reporter_pid
+                && lease.state == ROOTD_LEASE_STATE_RUNNING
+        }) {
+            true
+        } else {
+            post_init_leases.iter().any(|lease| {
+                lease.service_id == expected_parent
+                    && lease.pid == reporter_lease.reporter_pid
+                    && lease.state == ROOTD_LEASE_STATE_RUNNING
+            })
+        };
+        if !actual_parent {
             return false;
         }
         current = reporter_lease.reporter_pid;
@@ -3216,6 +3217,55 @@ mod tests {
         post2[1].reporter_pid = 41;
         post2[1].state = ROOTD_LEASE_STATE_RUNNING;
         assert!(!post_init_lease_reporter_is_live(&core, &post2, 73));
+    }
+
+    #[test]
+    fn manifest_parent_edge_denies_forged_live_reporter_and_ancestry() {
+        let core = leases_with_live_initd(41);
+        let mut post = [
+            post_init_lease(POST_INIT_MANIFEST[0]), // netd
+            post_init_lease(POST_INIT_MANIFEST[4]), // sessiond
+            post_init_lease(POST_INIT_MANIFEST[5]), // uiserver
+        ];
+        post[0].pid = 70;
+        post[0].reporter_pid = 41;
+        post[0].state = ROOTD_LEASE_STATE_RUNNING;
+        post[1].pid = 71;
+        post[1].reporter_pid = 41;
+        post[1].state = ROOTD_LEASE_STATE_RUNNING;
+        post[2].pid = 72;
+        post[2].reporter_pid = 70; // live netd, not the declared sessiond
+        post[2].state = ROOTD_LEASE_STATE_RUNNING;
+
+        assert!(!post_init_lease_reporter_is_live(&core, &post, 72));
+        assert_eq!(
+            post_init_reported_service_capability(&core, &post, IPC_SERVICE_UISERVER, 72),
+            None
+        );
+        assert_eq!(
+            authorize_post_init_lease_reporter(
+                &core,
+                &post,
+                IPC_SERVICE_UISERVER,
+                IpcSenderIdentity { pid: 70, tid: 1 },
+            ),
+            Err(13)
+        );
+        assert_eq!(
+            authorize_post_init_lease_reporter(
+                &core,
+                &post,
+                IPC_SERVICE_UISERVER,
+                IpcSenderIdentity { pid: 71, tid: 1 },
+            ),
+            Ok(())
+        );
+        post[2].reporter_pid = 71;
+        assert!(post_init_lease_reporter_is_live(&core, &post, 72));
+        assert_eq!(
+            post_init_reported_service_capability(&core, &post, IPC_SERVICE_UISERVER, 72),
+            Some(rustos_user_abi::syscall::IPC_SERVICE_CAP_UI_POLICY)
+        );
     }
 
     #[test]

@@ -68,6 +68,12 @@ library as replacing the existing rootd/Job/IPC authorities.
   before creating a child, and only advance the handle after success. This
   is a Ring3 *local quota*; it does not replace kernel Job charging or make
   the in-memory policy session ticket kernel-authoritative.
+- Post-init reporter ownership is now a **declarative parent edge** in
+  `POST_INIT_MANIFEST`. Bootstrap rejects missing, forward and cyclic parents;
+  live registration and transitive ancestry must resolve to the exact declared
+  parent rather than a matching PID in any live service. The old per-service
+  reporter switch was removed. This is a production authorization change,
+  not merely a component-model simulation.
 - On reporter exit **and** explicit initd lease reclamation, rootd prepares a
   bounded transitive post-init dependency closure before any kernel operation.
   Reclamation also traverses exited intermediate records. Every live descendant
@@ -90,7 +96,7 @@ library as replacing the existing rootd/Job/IPC authorities.
 | 2. Accounting | Existing counted process/thread/user-page limits; new userspace `pressure` model | Authoritative kernel-byte charge, memory.high/min admission/pressure wiring and acceptance |
 | 3. JobPolicy | Existing 256-bit kernel policy ceilings; typed slow-operation registry and live 13-role rootd authority manifest | Assign positive subject grants and dual-run cutover of legacy service-capability checks |
 | 4. IDL/runtime | Canonical `idl` codec, schema validator/code generator and five generated staging interfaces | Generated production bindings, ABI versioned adapters and live service migrations |
-| 5. Components | New generation-bound Graph; live rootd manifest and 15-offer route validation, full legacy-route equivalence witness, and exact live service PID collision/reporter-chain denial | Declarative activation, named kernel capability transfer and consolidated production supervisor ownership |
+| 5. Components | New generation-bound Graph; live rootd manifest and 15-offer route validation, declarative ordered supervisor parent edges, exact live service PID collision/reporter-chain denial | Declarative activation, named kernel capability transfer and consolidated production supervisor ownership |
 | 6. Session budgets | New client-funded session policy with exact-generation tickets, overflow retirement, offer-issuance epochs, mandatory one-unit session charging and revoked-route scavenging | Binding client-funded service allocation to kernel Job budget and provider-failure accounting; live runtimed has an independent 256-console-session bound |
 | 7. Personality split | Existing syscalld/procd/loaderd/vfsd policy split preserved | Audit remaining **slow** ring0 ABI policies and cut over with measured cost; no hotpath moves |
 | 8. Operability | New health probe, restart, event and update/rollback policy models; live bounded nested checkpoint tree, transitive exit/reclaim revocation and exact compaction | Actual persistent crash store, authenticated health reporter, image admission, restart transaction and KVM rollback |

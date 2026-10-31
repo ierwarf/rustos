@@ -13,7 +13,9 @@ user-page accounting (2b) and application Job placement have landed. JobPolicy
 v1's 256-bit ceiling is implemented as a **partial step 3a**; the complete
 legacy-capability cutover has not. Kernel-memory accounting,
 `memory.high/min`, unified service/runtime/IDL, component supervision,
-client-funded sessions, personality servers and operability work remain open.\nA no_std component-policy model, generated staging IDL, validated rootd role and\nroute manifests, bounded rootd checkpoints and runtimed console sessions\nare implemented, but **do not yet constitute a completed production cutover**.
+client-funded sessions, personality servers and operability work remain open.\nA no_std component-policy model, generated staging IDL, validated rootd role,
+route and supervisor-parent manifests, bounded rootd checkpoints and runtimed
+console sessions are implemented, but **do not yet constitute a completed production cutover**.
 See [Job Model as-built sections](job-model.md#phase-1-as-built) for exact status.
 Dated tests there are not automatically current release evidence.
 
@@ -26,7 +28,8 @@ The division into named userspace policy services remains sound. The redesign
 targets the **identity, resource and supervision model beneath those services**,
 not the scheduler, IPC fast paths or basic memory manager. Process-table
 scalability and initial job quotas are already implemented; fixed service
-identity/authority and fragmented lifecycle supervision are not yet retired.
+identity/authority and fragmented lifecycle supervision are not yet retired; production post-init
+reporter admission now uses a manifest-declared exact parent edge.
 
 ### 2. Current source evidence
 

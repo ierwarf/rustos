@@ -137,6 +137,9 @@ pub(super) const BOOTSTRAP_MANIFEST: [BootstrapServiceSpec; 6] = [
 pub(super) struct PostInitServiceSpec {
     pub(super) service_id: u64,
     pub(super) exec_path: &'static [u8],
+    /// Exact service principal allowed to report and supervise this child.
+    /// The ancestor must itself have a live, authenticated reporter chain.
+    pub(super) reporter_service_id: u64,
     pub(super) scheduling: RustosSchedulingContextPolicy,
 }
 
@@ -144,31 +147,37 @@ pub(super) const POST_INIT_MANIFEST: [PostInitServiceSpec; 6] = [
     PostInitServiceSpec {
         service_id: IPC_SERVICE_NETD,
         exec_path: NETD_EXEC,
+        reporter_service_id: INITD_LEASE_ID,
         scheduling: scheduling_policy(IPC_SERVICE_NETD, 4_000_000, 1),
     },
     PostInitServiceSpec {
         service_id: IPC_SERVICE_DEVMGRD,
         exec_path: DEVMGRD_EXEC,
+        reporter_service_id: INITD_LEASE_ID,
         scheduling: scheduling_policy(IPC_SERVICE_DEVMGRD, 4_000_000, 1),
     },
     PostInitServiceSpec {
         service_id: IPC_SERVICE_INPUTD,
         exec_path: INPUTD_EXEC,
+        reporter_service_id: INITD_LEASE_ID,
         scheduling: scheduling_policy(IPC_SERVICE_INPUTD, 4_000_000, 1),
     },
     PostInitServiceSpec {
         service_id: IPC_SERVICE_STORAGED,
         exec_path: STORAGED_EXEC,
+        reporter_service_id: INITD_LEASE_ID,
         scheduling: scheduling_policy(IPC_SERVICE_STORAGED, 4_000_000, 1),
     },
     PostInitServiceSpec {
         service_id: IPC_SERVICE_SESSIOND,
         exec_path: RUNTIMED_EXEC,
+        reporter_service_id: INITD_LEASE_ID,
         scheduling: scheduling_policy(IPC_SERVICE_SESSIOND, 4_000_000, 1),
     },
     PostInitServiceSpec {
         service_id: IPC_SERVICE_UISERVER,
         exec_path: UISERVER_EXEC,
+        reporter_service_id: IPC_SERVICE_SESSIOND,
         scheduling: scheduling_policy(IPC_SERVICE_UISERVER, 6_000_000, 2),
     },
 ];

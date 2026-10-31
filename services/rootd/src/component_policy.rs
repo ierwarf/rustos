@@ -32,6 +32,7 @@ pub(super) enum ManifestError {
     InvalidName,
     DuplicateServiceId,
     DuplicateExecutable,
+    InvalidReporter,
     UnknownDependency,
     DependencyCycle,
     InvalidScheduling,
@@ -140,6 +141,15 @@ fn validate(
                 return Err(ManifestError::DuplicateExecutable);
             }
         }
+        // A declared parent must exist before its child, so a malformed
+        // manifest cannot install a cyclic or detached live supervisor.
+        if !boot.iter().any(|parent| parent.service_id == spec.reporter_service_id)
+            && !post[..index]
+                .iter()
+                .any(|parent| parent.service_id == spec.reporter_service_id)
+        {
+            return Err(ManifestError::InvalidReporter);
+        }
     }
     Ok(())
 }
@@ -241,6 +251,15 @@ pub(super) fn service_policy_capability(id: u64) -> u64 {
         .map_or(0, |role| role.capability)
 }
 
+/// The authoritative, immutable parent edge for a post-init service. A
+/// service never becomes a reporter merely by possessing a matching PID.
+pub(super) fn reporter_service_id(id: u64) -> Option<u64> {
+    POST_INIT_MANIFEST
+        .iter()
+        .find(|service| service.service_id == id)
+        .map(|service| service.reporter_service_id)
+}
+
 pub(super) fn preflight() -> Result<(), ManifestError> {
     validate(&BOOTSTRAP_MANIFEST, &POST_INIT_MANIFEST)?;
     validate_routes(
@@ -309,6 +328,33 @@ pub(super) fn admit_unique_live_service_pid(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reporter_manifest_is_acyclic_and_rejects_unauthorized_parents() {
+        assert_eq!(validate(&BOOTSTRAP_MANIFEST, &POST_INIT_MANIFEST), Ok(()));
+        assert_eq!(reporter_service_id(IPC_SERVICE_NETD), Some(INITD_LEASE_ID));
+        assert_eq!(reporter_service_id(IPC_SERVICE_SESSIOND), Some(INITD_LEASE_ID));
+        assert_eq!(reporter_service_id(IPC_SERVICE_UISERVER), Some(IPC_SERVICE_SESSIOND));
+        assert_eq!(reporter_service_id(u64::MAX), None);
+        let mut invalid = POST_INIT_MANIFEST;
+        invalid[0].reporter_service_id = invalid[0].service_id;
+        assert_eq!(
+            validate(&BOOTSTRAP_MANIFEST, &invalid),
+            Err(ManifestError::InvalidReporter)
+        );
+        invalid = POST_INIT_MANIFEST;
+        invalid[4].reporter_service_id = IPC_SERVICE_UISERVER;
+        assert_eq!(
+            validate(&BOOTSTRAP_MANIFEST, &invalid),
+            Err(ManifestError::InvalidReporter)
+        );
+        invalid = POST_INIT_MANIFEST;
+        invalid[5].reporter_service_id = 0xdead;
+        assert_eq!(
+            validate(&BOOTSTRAP_MANIFEST, &invalid),
+            Err(ManifestError::InvalidReporter)
+        );
+    }
 
     #[test]
     fn immutable_routing_table_matches_legacy_service_capability_matrix() {
