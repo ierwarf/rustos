@@ -1399,24 +1399,7 @@ fn rootd_capability_mask(op: u16) -> u64 {
 }
 
 fn service_policy_capability(service_id: u64) -> u64 {
-    match service_id {
-        IPC_SERVICE_LINUX_SYSCALLD => {
-            rustos_user_abi::syscall::IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY
-        }
-        IPC_SERVICE_VFSD => rustos_user_abi::syscall::IPC_SERVICE_CAP_VFS_POLICY,
-        IPC_SERVICE_NETD => rustos_user_abi::syscall::IPC_SERVICE_CAP_NET_POLICY,
-        IPC_SERVICE_DEVMGRD => rustos_user_abi::syscall::IPC_SERVICE_CAP_DEVICE_POLICY,
-        IPC_SERVICE_LOADERD => rustos_user_abi::syscall::IPC_SERVICE_CAP_PROCESS_LOADER,
-        IPC_SERVICE_STORAGED => rustos_user_abi::syscall::IPC_SERVICE_CAP_STORAGE_POLICY,
-        IPC_SERVICE_INPUTD => rustos_user_abi::syscall::IPC_SERVICE_CAP_INPUT_POLICY,
-        IPC_SERVICE_PROCD => rustos_user_abi::syscall::IPC_SERVICE_CAP_PROCESS_POLICY,
-        IPC_SERVICE_ROOTD => rustos_user_abi::syscall::IPC_SERVICE_CAP_ROOT_SUPERVISOR,
-        IPC_SERVICE_SESSIOND => rustos_user_abi::syscall::IPC_SERVICE_CAP_SESSION_POLICY,
-        IPC_SERVICE_PAGERD => rustos_user_abi::syscall::IPC_SERVICE_CAP_PAGER_POLICY,
-        IPC_SERVICE_UISERVER => rustos_user_abi::syscall::IPC_SERVICE_CAP_UI_POLICY,
-        INITD_LEASE_ID => rustos_user_abi::syscall::IPC_SERVICE_CAP_INIT_POLICY,
-        _ => 0,
-    }
+    component_policy::service_policy_capability(service_id)
 }
 
 fn service_capability_for_subject(
@@ -1434,16 +1417,33 @@ fn service_capability_for_subject(
     {
         return Err(22);
     }
+    // A service role must bind to a *unique* live principal. This check
+    // covers core/core and core/post-init overlaps as well as dangling
+    // reporter chains; request.arg0 and lease-table order grant nothing.
+    let authenticated_service = current_service_id_for_sender(
+        leases,
+        post_init_leases,
+        IpcSenderIdentity {
+            pid: request.header.subject_pid,
+            tid: request.header.subject_tid,
+        },
+    )?;
     if let Some(capability) = post_init_reported_service_capability(
         leases,
         post_init_leases,
         request.arg0,
         request.header.subject_pid,
     ) {
+        if authenticated_service != request.arg0 {
+            return Err(13);
+        }
         return Ok(capability);
     }
     let lease = lease_by_service_or_index(leases, request.arg0, request.arg1 as usize)?;
-    if lease.pid != request.header.subject_pid || lease.state != ROOTD_LEASE_STATE_RUNNING {
+    if lease.pid != request.header.subject_pid
+        || lease.state != ROOTD_LEASE_STATE_RUNNING
+        || lease.service_id != authenticated_service
+    {
         return Err(13);
     }
     let capability = service_policy_capability(lease.service_id);
@@ -1885,6 +1885,16 @@ fn post_init_reported_service_capability(
     service_id: u64,
     subject_pid: u64,
 ) -> Option<u64> {
+    // The PID must resolve to exactly one live service, including all
+    // transitively live reporter leases. A forged overlapping PID must never
+    // select a privileged role just because it appeared first in the table.
+    if current_service_id_for_sender(
+        leases,
+        post_init_leases,
+        IpcSenderIdentity { pid: subject_pid, tid: 1 },
+    ).ok()? != service_id {
+        return None;
+    }
     post_init_leases
         .iter()
         .find(|lease| {
@@ -1907,18 +1917,28 @@ fn post_init_lease_reporter_is_live(
         if current == 0 {
             return false;
         }
-        if leases
-            .iter()
-            .any(|lease| lease.pid == current && lease.state == ROOTD_LEASE_STATE_RUNNING)
-        {
-            return true;
+        // A reporter ancestry chain may terminate only at the one
+        // authenticated initd service. Duplicate live service principals,
+        // even in an ancestor, fail closed instead of taking the first hit.
+        let mut core = leases.iter().filter(|lease| {
+            lease.pid == current && lease.state == ROOTD_LEASE_STATE_RUNNING
+        });
+        if let Some(owner) = core.next() {
+            return owner.service_id == INITD_LEASE_ID
+                && core.next().is_none()
+                && !post_init_leases.iter().any(|lease| {
+                    lease.pid == current && lease.state == ROOTD_LEASE_STATE_RUNNING
+                });
         }
-        let Some(reporter_lease) = post_init_leases
-            .iter()
-            .find(|lease| lease.pid == current && lease.state == ROOTD_LEASE_STATE_RUNNING)
-        else {
+        let mut children = post_init_leases.iter().filter(|lease| {
+            lease.pid == current && lease.state == ROOTD_LEASE_STATE_RUNNING
+        });
+        let Some(reporter_lease) = children.next() else {
             return false;
         };
+        if children.next().is_some() {
+            return false;
+        }
         current = reporter_lease.reporter_pid;
     }
     // A cycle or chain longer than the fixed lease set has no trusted root.
@@ -3067,6 +3087,90 @@ mod tests {
             Err(13)
         );
         assert_eq!(post_init[0].reporter_pid, initd_pid);
+    }
+
+    #[test]
+    fn core_capability_denied_on_ambiguous_active_identity() {
+        let mut core = leases_with_live_initd(41);
+        core[0].pid = 61;
+        core[0].state = ROOTD_LEASE_STATE_RUNNING;
+        let mut request = CommercialMaxProtocolRequest::default();
+        request.arg0 = core[0].service_id;
+        request.header.subject_pid = 61;
+        request.header.subject_tid = 1;
+        assert_eq!(
+            service_capability_for_subject(&core, &mut [], &request),
+            Ok(rustos_user_abi::syscall::IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY),
+        );
+        core[1].pid = 61;
+        core[1].state = ROOTD_LEASE_STATE_RUNNING;
+        assert_eq!(
+            service_capability_for_subject(&core, &mut [], &request),
+            Err(13),
+        );
+
+        core[1].pid = 0;
+        core[1].state = ROOTD_LEASE_STATE_EXITED;
+        let mut post = [post_init_lease(POST_INIT_MANIFEST[0])];
+        post[0].pid = 61;
+        post[0].reporter_pid = 41;
+        post[0].state = ROOTD_LEASE_STATE_RUNNING;
+        assert_eq!(
+            service_capability_for_subject(&core, &mut post, &request),
+            Err(13),
+        );
+        post[0].state = ROOTD_LEASE_STATE_EXITED;
+        assert_eq!(
+            service_capability_for_subject(&core, &mut post, &request),
+            Ok(rustos_user_abi::syscall::IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY),
+        );
+    }
+
+    #[test]
+    fn nested_reporter_chain_requires_a_unique_live_initd_ancestor() {
+        let mut core = leases_with_live_initd(41);
+        let mut post = [post_init_lease(POST_INIT_MANIFEST[4])];
+        post[0].pid = 73;
+        post[0].reporter_pid = 41;
+        post[0].state = ROOTD_LEASE_STATE_RUNNING;
+        assert!(post_init_lease_reporter_is_live(&core, &post, 73));
+        core[0].pid = 41;
+        core[0].state = ROOTD_LEASE_STATE_RUNNING;
+        assert!(!post_init_lease_reporter_is_live(&core, &post, 73));
+        core[0].state = ROOTD_LEASE_STATE_EXITED;
+        assert!(post_init_lease_reporter_is_live(&core, &post, 73));
+        core[INITD_LEASE_INDEX].state = ROOTD_LEASE_STATE_EXITED;
+        core[0].state = ROOTD_LEASE_STATE_RUNNING;
+        assert!(!post_init_lease_reporter_is_live(&core, &post, 73));
+
+        core[0].state = ROOTD_LEASE_STATE_EXITED;
+        core[INITD_LEASE_INDEX].state = ROOTD_LEASE_STATE_RUNNING;
+        let other = post_init_lease(POST_INIT_MANIFEST[0]);
+        let mut post2 = [post[0], other];
+        post2[1].pid = 73;
+        post2[1].reporter_pid = 41;
+        post2[1].state = ROOTD_LEASE_STATE_RUNNING;
+        assert!(!post_init_lease_reporter_is_live(&core, &post2, 73));
+    }
+
+    #[test]
+    fn post_init_capability_never_resolves_a_duplicated_live_pid() {
+        let core = leases_with_live_initd(41);
+        let mut post = [post_init_lease(POST_INIT_MANIFEST[0]),
+            post_init_lease(POST_INIT_MANIFEST[1])];
+        post[0].pid = 77;
+        post[0].reporter_pid = 41;
+        post[0].state = ROOTD_LEASE_STATE_RUNNING;
+        assert_eq!(post_init_reported_service_capability(
+            &core, &post, IPC_SERVICE_NETD, 77),
+            Some(rustos_user_abi::syscall::IPC_SERVICE_CAP_NET_POLICY));
+        post[1].pid = 77;
+        post[1].reporter_pid = 41;
+        post[1].state = ROOTD_LEASE_STATE_RUNNING;
+        assert_eq!(post_init_reported_service_capability(
+            &core, &post, IPC_SERVICE_NETD, 77), None);
+        assert_eq!(post_init_reported_service_capability(
+            &core, &post, IPC_SERVICE_DEVMGRD, 77), None);
     }
 
     #[test]

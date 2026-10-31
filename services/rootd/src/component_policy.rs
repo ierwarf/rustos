@@ -10,8 +10,9 @@
 
 use super::service_manifest::INITD_LEASE_ID;
 use super::service_manifest::{
-    BootstrapServiceSpec, PostInitServiceSpec, ServiceRouteSpec, BOOTSTRAP_MANIFEST, DEP_LOADERD,
-    DEP_PAGERD, DEP_PROCD, DEP_SYSCALLD, DEP_VFSD, POST_INIT_MANIFEST, SERVICE_ROUTING_MANIFEST,
+    BootstrapServiceSpec, PostInitServiceSpec, ServiceRoleSpec, ServiceRouteSpec,
+    BOOTSTRAP_MANIFEST, DEP_LOADERD, DEP_PAGERD, DEP_PROCD, DEP_SYSCALLD, DEP_VFSD,
+    POST_INIT_MANIFEST, SERVICE_ROLE_MANIFEST, SERVICE_ROUTING_MANIFEST,
 };
 use rustos_component_model::Moniker;
 use rustos_user_abi::syscall::{
@@ -35,6 +36,7 @@ pub(super) enum ManifestError {
     DependencyCycle,
     InvalidScheduling,
     InvalidRoute,
+    InvalidRole,
 }
 
 const ALL_DEPS: u16 = DEP_SYSCALLD | DEP_VFSD | DEP_LOADERD | DEP_PROCD | DEP_PAGERD;
@@ -188,12 +190,68 @@ fn dependency_target_for(service: u64) -> u16 {
     }
 }
 
+/// The exact service-role table is complete, unique and one-to-one. Unknown
+/// or overlapping positive capabilities could bypass other services' policy
+/// domains if the role is ever reused during an unrelated lookup.
+fn validate_roles(
+    boot: &[BootstrapServiceSpec],
+    post: &[PostInitServiceSpec],
+    roles: &[ServiceRoleSpec],
+) -> Result<(), ManifestError> {
+    if roles.len() != boot.len() + post.len() + 1 {
+        return Err(ManifestError::InvalidRole);
+    }
+    let known = |id| {
+        id == rustos_user_abi::syscall::IPC_SERVICE_ROOTD
+            || boot.iter().any(|x| x.service_id == id)
+            || post.iter().any(|x| x.service_id == id)
+    };
+    for (index, item) in roles.iter().enumerate() {
+        if item.capability == 0
+            || item.capability.count_ones() != 1
+            || !known(item.service_id)
+            || roles[..index].iter().any(|prev| {
+                prev.service_id == item.service_id || prev.capability == item.capability
+            })
+        {
+            return Err(ManifestError::InvalidRole);
+        }
+    }
+    if boot
+        .iter()
+        .any(|x| !roles.iter().any(|r| r.service_id == x.service_id))
+        || post
+            .iter()
+            .any(|x| !roles.iter().any(|r| r.service_id == x.service_id))
+        || !roles
+            .iter()
+            .any(|r| r.service_id == rustos_user_abi::syscall::IPC_SERVICE_ROOTD)
+    {
+        return Err(ManifestError::InvalidRole);
+    }
+    Ok(())
+}
+
+/// Pure lookup; a nonzero result is not permission. The authenticated exact
+/// sender and live service Job/lease are checked by rootd before use.
+pub(super) fn service_policy_capability(id: u64) -> u64 {
+    SERVICE_ROLE_MANIFEST
+        .iter()
+        .find(|role| role.service_id == id)
+        .map_or(0, |role| role.capability)
+}
+
 pub(super) fn preflight() -> Result<(), ManifestError> {
     validate(&BOOTSTRAP_MANIFEST, &POST_INIT_MANIFEST)?;
     validate_routes(
         &BOOTSTRAP_MANIFEST,
         &POST_INIT_MANIFEST,
         &SERVICE_ROUTING_MANIFEST,
+    )?;
+    validate_roles(
+        &BOOTSTRAP_MANIFEST,
+        &POST_INIT_MANIFEST,
+        &SERVICE_ROLE_MANIFEST,
     )
 }
 
@@ -331,6 +389,79 @@ mod tests {
         assert_eq!(
             validate_routes(&BOOTSTRAP_MANIFEST, &POST_INIT_MANIFEST, &invalid),
             Err(ManifestError::InvalidRoute)
+        );
+    }
+
+    #[test]
+    fn fixed_service_roles_match_the_previous_live_policy_exactly() {
+        use rustos_user_abi::syscall as abi;
+        let expected = [
+            (
+                abi::IPC_SERVICE_LINUX_SYSCALLD,
+                abi::IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY,
+            ),
+            (abi::IPC_SERVICE_VFSD, abi::IPC_SERVICE_CAP_VFS_POLICY),
+            (abi::IPC_SERVICE_NETD, abi::IPC_SERVICE_CAP_NET_POLICY),
+            (abi::IPC_SERVICE_DEVMGRD, abi::IPC_SERVICE_CAP_DEVICE_POLICY),
+            (
+                abi::IPC_SERVICE_LOADERD,
+                abi::IPC_SERVICE_CAP_PROCESS_LOADER,
+            ),
+            (
+                abi::IPC_SERVICE_STORAGED,
+                abi::IPC_SERVICE_CAP_STORAGE_POLICY,
+            ),
+            (abi::IPC_SERVICE_INPUTD, abi::IPC_SERVICE_CAP_INPUT_POLICY),
+            (abi::IPC_SERVICE_PROCD, abi::IPC_SERVICE_CAP_PROCESS_POLICY),
+            (abi::IPC_SERVICE_ROOTD, abi::IPC_SERVICE_CAP_ROOT_SUPERVISOR),
+            (
+                abi::IPC_SERVICE_SESSIOND,
+                abi::IPC_SERVICE_CAP_SESSION_POLICY,
+            ),
+            (abi::IPC_SERVICE_PAGERD, abi::IPC_SERVICE_CAP_PAGER_POLICY),
+            (abi::IPC_SERVICE_UISERVER, abi::IPC_SERVICE_CAP_UI_POLICY),
+            (abi::IPC_SERVICE_INITD, abi::IPC_SERVICE_CAP_INIT_POLICY),
+        ];
+        for (id, cap) in expected {
+            assert_eq!(service_policy_capability(id), cap);
+        }
+        assert_eq!(service_policy_capability(0), 0);
+        assert_eq!(service_policy_capability(u64::MAX), 0);
+    }
+
+    #[test]
+    fn service_roles_must_be_complete_and_injective() {
+        assert_eq!(
+            validate_roles(
+                &BOOTSTRAP_MANIFEST,
+                &POST_INIT_MANIFEST,
+                &SERVICE_ROLE_MANIFEST
+            ),
+            Ok(())
+        );
+        let mut invalid = SERVICE_ROLE_MANIFEST;
+        invalid[0].capability = invalid[1].capability;
+        assert_eq!(
+            validate_roles(&BOOTSTRAP_MANIFEST, &POST_INIT_MANIFEST, &invalid),
+            Err(ManifestError::InvalidRole)
+        );
+        invalid = SERVICE_ROLE_MANIFEST;
+        invalid[0].service_id = invalid[1].service_id;
+        assert_eq!(
+            validate_roles(&BOOTSTRAP_MANIFEST, &POST_INIT_MANIFEST, &invalid),
+            Err(ManifestError::InvalidRole)
+        );
+        invalid = SERVICE_ROLE_MANIFEST;
+        invalid[0].capability = 0;
+        assert_eq!(
+            validate_roles(&BOOTSTRAP_MANIFEST, &POST_INIT_MANIFEST, &invalid),
+            Err(ManifestError::InvalidRole)
+        );
+        invalid = SERVICE_ROLE_MANIFEST;
+        invalid[0].service_id = u64::MAX;
+        assert_eq!(
+            validate_roles(&BOOTSTRAP_MANIFEST, &POST_INIT_MANIFEST, &invalid),
+            Err(ManifestError::InvalidRole)
         );
     }
 
