@@ -216,6 +216,7 @@ fn stopped_ancestor_immediately_revokes_descendant_policy_and_routes() {
 
     g.on_exit(parent, 1, ExitReason::Crash, 10).unwrap();
     assert!(!g.permits(provider, Operation(1)));
+    assert_eq!(g.effective_ceiling(provider), Err(GraphError::InvalidState));
     assert_eq!(
         g.resolve(consumer, provider, endpoint),
         Err(CapabilityError::OwnerNotRunning)

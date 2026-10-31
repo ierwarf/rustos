@@ -389,6 +389,9 @@ impl Graph {
                 return Ok(result);
             };
             let c = self.component(node)?;
+            if c.state != ComponentState::Running {
+                return Err(GraphError::InvalidState);
+            }
             result = result.intersect(c.ceiling);
             current = c.parent;
         }
@@ -400,9 +403,6 @@ impl Graph {
     }
 
     pub fn permits(&self, id: ComponentId, op: Operation) -> bool {
-        if self.require_running_chain(id).is_err() {
-            return false;
-        }
         self.effective_ceiling(id)
             .map_or(false, |mask| mask.permits(op))
     }
