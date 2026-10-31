@@ -42,7 +42,7 @@ reporter admission now uses a manifest-declared exact parent edge.
 | JobPolicy | 256-bit v1 ceiling and GET/SET operations exist, but service-capability cutover is incomplete | [job policy ABI](../../libs/rustos-user-abi/src/syscall/job_policy.rs) |
 | Service discovery | Immutable rootd service-role and routing manifests now validate legacy-equivalent positive policy; live registration still uses fixed numeric IDs | [service ABI](../../libs/rustos-user-abi/src/syscall.rs), [rootd manifest](../../services/rootd/src/service_manifest.rs) |
 | Supervision | `rootd`, `initd`, `runtimed` and `sessiond` retain distinct lifecycle responsibilities | [Services](services.md) |
-| IPC wire/runtime | Existing production wire structs and heterogeneous runtimes; generated IDL is staging-only and does not authorize live IPC | [ABI contract](../ai/contracts-abi.md) |
+| IPC wire/runtime | Existing production wire structs and heterogeneous runtimes; generated IDL now serves live initd/rootd lease query/reclaim, while other schemas remain staging-only. The IDL does not grant authority. | [ABI contract](../ai/contracts-abi.md) |
 
 The **historical** audit found 32 static process slots and no per-job quotas.
 Do not repeat those findings as current implementation facts. The original
@@ -115,7 +115,7 @@ topology, so a component cannot reach what no ancestor passed down)**.
 | 1 | Root Job, membership and group kill | Implemented |
 | 2 | Chunked process directory; job process/thread and resident memory quotas | Partly implemented: 2a/2b landed; `kmem.max_bytes`, `memory.high/min` open |
 | 3 | Replace legacy service authority with Job policy | JobPolicy 3a exists; cutover unproven |
-| 4 | Generated IDL and unified service runtime | Generated staging control schemas and canonical codec implemented; production binding and runtime migration open |
+| 4 | Generated IDL and unified service runtime | Production post-init lease query/reclaim migrated to generated IDL (opcodes 517/518), scalar operations 8/9 retired; other services and shared runtime migration remain open |
 | 5 | Declarative components, realms, capability routing and one supervisor | Component graph and immutable rootd route/role manifests implemented; unified live supervisor and kernel capability transfer open |
 | 6 | Client-funded session quotas | Bounded session policy model and runtimed local 256-console-session ceiling implemented; kernel-backed client billing open |
 | 7 | Linux/Windows personality servers and ring0 policy reduction | Existing service brokers preserved; remaining slowpath-only migration unproven; ring0 hot paths deliberately untouched |

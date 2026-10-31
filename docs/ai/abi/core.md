@@ -175,10 +175,15 @@ and runtimed-as-sessiond, while running sessiond/runtimed reports uiserver.
 Reports for an already-running lease are idempotent only for the same PID and
 must reject attempts to overwrite the lease with a different PID. rootd also
 records the kernel-stamped reporter PID. A newly restarted `initd` reconciles
-its five service leases through `COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_QUERY`:
-it adopts only an exact-PID endpoint, keeps an endpoint-pending admitted lease in a
-bounded 30-second recovery window, then requests
-`COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_RECLAIM` for the exact stale PID.
+its five service leases through the generated-IDL
+`COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_SNAPSHOT_IDL` (supervisor op 15,
+schema 517): it adopts only an exact-PID endpoint, keeps an
+endpoint-pending admitted lease in a bounded 30-second recovery window,
+then requests `COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_RECLAIM_IDL`
+(supervisor op 16, schema 518) for the exact stale PID. The former scalar
+query/reclaim operations 8 and 9 are retired with no fallback. Both replies
+bind the service and request challenge; destructive reclaim also binds the
+exact PID and prepares its IDL acknowledgement before endpoint revocation.
 Only the current initd may query/reclaim its own service classes; sessiond's
 uiserver child is reclaimed first with its parent. Reclaim uses the
 root-supervisor-only `SYS_RUSTOS_ROOTD_TERMINATE_BROKER`, which retires all
