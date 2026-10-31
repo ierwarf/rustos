@@ -225,22 +225,11 @@ pub extern "C" fn __rustos_rootd_start() -> ! {
         fail_closed(b"rootd: fatal component manifest preflight failed\n");
     }
     let endpoint = create_rootd_endpoint();
-    let mut leases = [
-        lease(BOOTSTRAP_MANIFEST[0]),
-        lease(BOOTSTRAP_MANIFEST[1]),
-        lease(BOOTSTRAP_MANIFEST[2]),
-        lease(BOOTSTRAP_MANIFEST[3]),
-        lease(BOOTSTRAP_MANIFEST[4]),
-        lease(BOOTSTRAP_MANIFEST[5]),
-    ];
-    let mut post_init_leases = [
-        post_init_lease(POST_INIT_MANIFEST[0]),
-        post_init_lease(POST_INIT_MANIFEST[1]),
-        post_init_lease(POST_INIT_MANIFEST[2]),
-        post_init_lease(POST_INIT_MANIFEST[3]),
-        post_init_lease(POST_INIT_MANIFEST[4]),
-        post_init_lease(POST_INIT_MANIFEST[5]),
-    ];
+    // Both live lease inventories come from the validated, immutable service
+    // manifest. Adding a declared service no longer requires another hand-
+    // maintained bootstrap array or matching list of initial zero states.
+    let mut leases = BOOTSTRAP_MANIFEST.map(lease);
+    let mut post_init_leases = POST_INIT_MANIFEST.map(post_init_lease);
     let mut service_checkpoints = ServiceCheckpointStore::new();
     let mut next_core_readiness_poll_ns = 0;
 
