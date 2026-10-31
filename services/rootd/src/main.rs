@@ -3316,6 +3316,62 @@ mod tests {
     }
 
     #[test]
+    fn production_lease_snapshot_idl_verifies_initd_and_exact_reply() {
+        let leases = leases_with_live_initd(41);
+        let mut post_init = [post_init_lease(POST_INIT_MANIFEST[0])];
+        post_init[0].pid = 72;
+        post_init[0].state = ROOTD_LEASE_STATE_RUNNING;
+        post_init[0].reporter_pid = 41;
+        let frame = rustos_component_model::lease_snapshot::encode_query(
+            IPC_SERVICE_NETD, 33,
+        ).unwrap();
+        let mut request = CommercialMaxProtocolRequest::default();
+        request.header.protocol = COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR;
+        request.header.op = COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_SNAPSHOT_IDL;
+        request.header.subject_pid = 41;
+        request.header.subject_tid = 1;
+        request.payload[..frame.len()].copy_from_slice(&frame);
+        request.payload_len = frame.len() as u32;
+        let sender = IpcSenderIdentity { pid: 41, tid: 1 };
+        let mut response = CommercialMaxProtocolResponse::default();
+        let mut checkpoints = ServiceCheckpointStore::new();
+        assert_eq!(
+            fill_commercial_max_response(
+                &request, &leases, &mut post_init, &mut checkpoints,
+                &mut response, sender,
+            ),
+            Ok(())
+        );
+        assert_eq!((response.value0, response.value1), (0, 0));
+        assert_eq!(
+            rustos_component_model::lease_snapshot::decode_reply(
+                &response.payload[..response.payload_len as usize],
+                IPC_SERVICE_NETD, 33,
+            ),
+            Ok((72, ROOTD_LEASE_STATE_RUNNING))
+        );
+        assert!(rustos_component_model::lease_snapshot::decode_reply(
+            &response.payload[..response.payload_len as usize],
+            IPC_SERVICE_NETD, 34,
+        ).is_err());
+        assert_eq!(
+            fill_commercial_max_response(
+                &request, &leases, &mut post_init, &mut checkpoints,
+                &mut response, IpcSenderIdentity { pid: 99, tid: 1 },
+            ),
+            Err(13)
+        );
+        request.arg0 = IPC_SERVICE_NETD;
+        assert_eq!(
+            fill_commercial_max_response(
+                &request, &leases, &mut post_init, &mut checkpoints,
+                &mut response, sender,
+            ),
+            Err(22)
+        );
+    }
+
+    #[test]
     fn post_init_capability_never_resolves_a_duplicated_live_pid() {
         let core = leases_with_live_initd(41);
         let mut post = [post_init_lease(POST_INIT_MANIFEST[0]),

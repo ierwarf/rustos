@@ -34,6 +34,8 @@ jobs:
         env:
           RUST_BACKTRACE: "1"
         run: cargo test -p rootd --features host-test --locked -- --test-threads=1 --nocapture
+      - name: Run initd host tests
+        run: cargo test -p initd --locked
       - name: Run runtimed host tests
         run: cargo test -p runtimed --locked
       - name: Check full RustOS build graph
