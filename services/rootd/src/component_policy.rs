@@ -211,9 +211,10 @@ pub(super) fn admit_unique_live_service_pid(
     if candidate_pid == 0 || candidate_pid == reporter_pid {
         return false;
     }
-    if core.iter().any(|lease| {
-        lease.pid == candidate_pid && lease.state == super::ROOTD_LEASE_STATE_RUNNING
-    }) {
+    if core
+        .iter()
+        .any(|lease| lease.pid == candidate_pid && lease.state == super::ROOTD_LEASE_STATE_RUNNING)
+    {
         return false;
     }
     !post_init.iter().any(|lease| {
