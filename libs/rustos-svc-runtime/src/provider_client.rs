@@ -16,6 +16,8 @@ use rustos_user_abi::syscall::{
     COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR,
     COMMERCIAL_MAX_ROOTD_OP_PROVIDER_SESSION_CHARGE,
     COMMERCIAL_MAX_ROOTD_OP_PROVIDER_SESSION_RELEASE,
+    COMMERCIAL_MAX_ROOTD_OP_PROVIDER_SESSION_CANCEL,
+    COMMERCIAL_MAX_ROOTD_OP_PROVIDER_RECEIPT_ACK,
     IPC_SERVICE_ROOTD,SYS_RUSTOS_IPC_CALL_BOUNDED,
 };
 use crate::{ipc,syscall};
@@ -24,7 +26,7 @@ const ENOSPC:i32=28;const EOVERFLOW:i32=75;const ESTALE:i32=116;
 pub const MAX_LOCAL_SESSIONS:usize=4096;
 #[derive(Clone,Copy,Debug,Eq,PartialEq)]
 pub enum State{ChargePrepared,ChargeInFlight,Funded,
-    ReleasePrepared,ReleaseInFlight}
+    ReleasePrepared,ReleaseInFlight,CancelPrepared,CancelInFlight}
 #[derive(Clone,Copy,Debug,Eq,PartialEq)]
 pub struct Receipt{
     pub client_pid:u64,pub client_job:u64,
@@ -101,6 +103,45 @@ impl ProviderClient {
         e.state=State::Funded;
         Ok(receipt)
     }
+    /// Convert a failed or ambiguous CHARGE into a jobless CANCEL. The
+    /// provider token and original session identity stay unchanged, so rootd
+    /// can fence a late charge even if the original reply never arrived.
+    pub fn begin_cancel(&mut self,session:u64)->Result<Frame,Error>{
+        let next=self.next_request_id.checked_add(1).ok_or(Error::Overflow)?;
+        let entry=self.sessions.get_mut(&session).ok_or(Error::Missing)?;
+        if matches!(entry.state,State::CancelPrepared|State::CancelInFlight){
+            return Ok(entry.frame)
+        }
+        if !matches!(entry.state,State::ChargePrepared|State::ChargeInFlight|
+            State::Funded){return Err(Error::Phase)}
+        entry.frame.operation=Operation::Cancel;
+        entry.frame.phase=Phase::Request;
+        entry.frame.request_id=next;
+        entry.frame.client_job=0;
+        entry.frame.client_job_generation=0;
+        entry.frame.kernel_receipt=0;
+        entry.frame.status=0;
+        entry.state=State::CancelPrepared;
+        self.next_request_id=next;
+        Ok(entry.frame)
+    }
+    pub fn dispatch_cancel(&mut self,session:u64)->Result<Frame,Error>{
+        let entry=self.sessions.get_mut(&session).ok_or(Error::Missing)?;
+        if !matches!(entry.state,State::CancelPrepared|State::CancelInFlight){
+            return Err(Error::Phase)
+        }
+        entry.state=State::CancelInFlight;
+        Ok(entry.frame)
+    }
+    pub fn cancelled(&mut self,session:u64,ack:Frame)->Result<(),Error>{
+        let entry=self.sessions.get(&session).ok_or(Error::Missing)?;
+        if entry.state!=State::CancelInFlight{return Err(Error::Phase)}
+        ack.validate_ack(entry.frame).map_err(|_|Error::WrongAck)?;
+        if ack.phase!=Phase::Committed||ack.status!=0
+            ||ack.kernel_receipt!=0{return Err(Error::WrongAck)}
+        self.sessions.remove(&session);
+        Ok(())
+    }
     pub fn receipt(&self,session:u64)->Result<Receipt,Error>{
         let e=self.sessions.get(&session).ok_or(Error::Missing)?;
         if !matches!(e.state,State::Funded|State::ReleasePrepared|
@@ -165,7 +206,8 @@ impl ProviderClient {
     pub fn pending_count(&self)->usize {
         self.sessions.values().filter(|e|matches!(e.state,
             State::ChargeInFlight|State::ReleaseInFlight|
-            State::ReleasePrepared)).count()
+            State::ReleasePrepared|State::CancelPrepared|
+            State::CancelInFlight)).count()
     }
     pub fn unresolved(&self,mut f:impl FnMut(u64,State,Frame)){
         for (id,e) in &self.sessions {
@@ -188,10 +230,16 @@ pub fn acknowledge_receipt(mut committed:Frame)->Result<(),i32>{
     Ok(())
 }
 pub fn call_rootd(frame:Frame)->Result<Frame,i32>{
-    if !frame.valid()||frame.phase!=Phase::Request{return Err(EINVAL)}
-    let op=match frame.operation {
-        Operation::Charge=>COMMERCIAL_MAX_ROOTD_OP_PROVIDER_SESSION_CHARGE,
-        Operation::Release=>COMMERCIAL_MAX_ROOTD_OP_PROVIDER_SESSION_RELEASE,
+    if !frame.valid(){return Err(EINVAL)}
+    let op=match (frame.phase,frame.operation){
+        (Phase::Request,Operation::Charge)=>
+            COMMERCIAL_MAX_ROOTD_OP_PROVIDER_SESSION_CHARGE,
+        (Phase::Request,Operation::Release)=>
+            COMMERCIAL_MAX_ROOTD_OP_PROVIDER_SESSION_RELEASE,
+        (Phase::Request,Operation::Cancel)=>
+            COMMERCIAL_MAX_ROOTD_OP_PROVIDER_SESSION_CANCEL,
+        (Phase::Accepted,Operation::Release|Operation::Cancel)=>
+            COMMERCIAL_MAX_ROOTD_OP_PROVIDER_RECEIPT_ACK,
         _=>return Err(EINVAL),
     };
     let endpoint=ipc::lookup_service_endpoint(IPC_SERVICE_ROOTD);
