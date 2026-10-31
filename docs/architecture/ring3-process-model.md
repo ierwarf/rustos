@@ -113,7 +113,7 @@ topology, so a component cannot reach what no ancestor passed down)**.
 | Step | Target | 2026-10-31 status |
 | --- | --- | --- |
 | 1 | Root Job, membership and group kill | Implemented |
-| 2 | Chunked process directory; job process/thread and resident memory quotas | Partly implemented: 2a/2b landed; `kmem.max_bytes`, `memory.high/min` open |
+| 2 | Chunked process directory; Job process/thread/page quotas | Additional unvalidated memory.high event counter and memory.min rootd OOM protection draft; kmem bytes and acceptance remain missing |
 | 3 | Replace legacy service authority with Job policy | JobPolicy 3a exists; cutover unproven |
 | 4 | Generated IDL and unified service runtime | Production post-init lease query/reclaim migrated to generated IDL (opcodes 517/518), scalar operations 8/9 retired; other services and shared runtime migration remain open |
 | 5 | Declarative components, realms, capability routing and one supervisor | Component graph and immutable rootd route/role manifests implemented; unified live supervisor and kernel capability transfer open |
@@ -174,3 +174,11 @@ Ring3 컴포넌트 정책 모델, 스테이징 IDL 생성, rootd의 역할/라�
 위 8단계 표는 **목표 아키텍처와 현재 상태를 분리**합니다.
 구체적 구현·검증은 [Job Model](job-model.md)의 as-built 섹션과
 실제 소스를 기준으로 판단하세요.
+
+### Unvalidated 2026-10-31 draft
+
+Kernel session counters, rootd client-Job token settlement, loaderd Job session
+limits and runtime pre-activation billing are now present in source. The
+memory.high/min slow Job QoS syscall and OOM-exclusion policy are also present.
+The remaining 3/4/5/7/8 migrations are not complete, and kernel-byte
+accounting remains missing. No tests were run for this draft.

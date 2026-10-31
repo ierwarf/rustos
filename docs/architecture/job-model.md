@@ -11,8 +11,8 @@ process directory, and phase 2b's process/thread limits and resident user-page
 charging are implemented. Application-job placement and a JobPolicy v1/256-bit
 ceiling implementation also exist; their opt-in runtime evidence does **not**
 complete policy migration or commercial stability acceptance. Kernel-memory
-charging (`kmem.max_bytes`) and `memory.high/min` remain open. Production
-client-funded console sessions now cross a rootd-owned exact-token ledger
+charging (`kmem.max_bytes`) remains open. The unvalidated memory.high/min
+policy and client-funded console session integration now cross a rootd-owned ledger
 and a kernel-enforced hierarchical Job count, while other provider session
 classes and the later component/personality redesign remain open. Read the **as-built** sections
 below for implementation details; dated tests are not current acceptance.
@@ -935,3 +935,16 @@ to restart at one. The new Job accounting fast-path impact is **zero**: only
 slow session creation/teardown issues these syscalls. This does *not* yet
 implement arbitrary cross-service client sessions or kernel-memory byte
 accounting. Rootd's in-memory ledger is not a durable transactional journal.
+
+### Memory.high/min and client-billed console integration (unvalidated draft)
+
+The Job memory QoS slow syscall has per-Job high and min page controls.
+Kernel-mm records a threshold-crossing event without interfering with the
+resident-data-leaf fault path. Rootd conservatively excludes protected
+non-root Job minima from OOM victims. Loaderd configures memory.high to 80%
+of each application Job hard page limit and uses no implicit app minimum.
+A separate Job session syscall enforces hierarchical client-funded counts.
+Rootd owns replay and timeout cancellation; runtimed charges suspended
+clients before activation, and provider exit reclaims the corresponding
+kernel bill. Missing: kernel-object bytes, durable rootd crash recovery,
+other provider session types, and pressure-policy acceptance.
