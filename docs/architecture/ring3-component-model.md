@@ -32,6 +32,11 @@ library as replacing the existing rootd/Job/IPC authorities.
   reserving all 32,768 slots during bootstrap; failed checkpoint or scan
   allocations return ENOMEM instead of panicking. This is still an
   **in-memory** restart checkpoint, not durable crash storage.
+- Ring3 IDL schemas are authored in `schemas/ring3/control.json` and
+  converted deterministically to no_std Rust field definitions by
+  `tools/ring3_idl_codegen.py`. CI rejects stale generated files.
+  The five declarative control-plane schemas are staging contracts only:
+  production IPC and syscall structs have **not** been switched over.
 - `rootd` and the component model have focused host tests; this work
   leaves the live fixed service registry and exact kernel lease owner intact.
 
@@ -42,7 +47,7 @@ library as replacing the existing rootd/Job/IPC authorities.
 | 1. Job lifecycle | Existing ring0 generational Job tree and typed descriptors (unchanged) | Hardware qualification, not reimplementation |
 | 2. Accounting | Existing counted process/thread/user-page limits; new userspace `pressure` model | Authoritative kernel-byte charge, memory.high/min admission/pressure wiring and acceptance |
 | 3. JobPolicy | Existing 256-bit kernel policy ceilings; new typed slow-operation registry | Assign positive subject grants and dual-run cutover of legacy service-capability checks |
-| 4. IDL/runtime | New `idl` canonical field/schema codec, existing service runtime | Source generator, full ABI versioned bindings, existing service migrations |
+| 4. IDL/runtime | Canonical `idl` codec, schema validator/code generator and five generated staging interfaces | Generated production bindings, ABI versioned adapters and live service migrations |
 | 5. Components | New generation-bound Graph; live rootd manifest preflight, lookup predicate migration and exact live service PID collision/reporter-chain denial | Declarative activation, named kernel capability transfer and one owning service supervisor |
 | 6. Session budgets | New client-funded session policy with exact-generation tickets, offer-issuance epochs, mandatory one-unit session charging and revoked-route scavenging | Binding service allocation to kernel Job budget and accounting on provider failure |
 | 7. Personality split | Existing syscalld/procd/loaderd/vfsd policy split preserved | Audit remaining **slow** ring0 ABI policies and cut over with measured cost; no hotpath moves |
@@ -71,6 +76,7 @@ trip to any of those paths, even if a component router becomes available.
 Focused CI executes:
 
 ```sh
+python3 tools/ring3_idl_codegen.py --check
 cargo fmt -p rustos-component-model -- --check
 rustfmt --edition 2021 --check services/rootd/src/component_policy.rs
 cargo test -p rustos-component-model --locked

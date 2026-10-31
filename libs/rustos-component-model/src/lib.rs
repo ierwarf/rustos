@@ -16,6 +16,7 @@
 
 extern crate alloc;
 
+pub mod generated_idl;
 pub mod health;
 pub mod identity;
 pub mod idl;

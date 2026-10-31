@@ -19,6 +19,8 @@ jobs:
         run: |
           toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
           rustup toolchain install "$toolchain" --profile minimal --component rustfmt
+      - name: Verify declarative Ring3 IDL
+        run: python3 tools/ring3_idl_codegen.py --check
       - name: Check component formatting
         run: |
           cargo fmt -p rustos-component-model -- --check
