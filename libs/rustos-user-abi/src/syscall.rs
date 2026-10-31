@@ -1091,6 +1091,8 @@ pub const COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_RECLAIM_IDL: u16 = 16;
 pub const COMMERCIAL_MAX_ROOTD_OP_SESSION_ACCOUNT_CHARGE: u16 = 17;
 /// Idempotence and exact JobId refunds are owned by rootd's token book.
 pub const COMMERCIAL_MAX_ROOTD_OP_SESSION_ACCOUNT_RELEASE: u16 = 18;
+/// Authenticated exact-incarnation heartbeat, sequenced and fail-closed.
+pub const COMMERCIAL_MAX_ROOTD_OP_SERVICE_HEARTBEAT: u16 = 19;
 /// Store one versioned, service-owned checkpoint record.  Rootd authenticates
 /// the current service lease and retains the opaque record across a supervised
 /// service restart; it never interprets the service-private value bytes.
