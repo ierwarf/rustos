@@ -52,6 +52,7 @@ use rustos_user_abi::syscall::{
 
 mod activation;
 mod lease_reconciliation;
+mod update_supervisor;
 mod scheduling_context;
 
 use scheduling_context::request_scheduling_context_authority;
@@ -176,12 +177,14 @@ fn main() {
     let mut launched_once_packages = BTreeSet::new();
     let mut retry_state = BTreeMap::<String, RetryState>::new();
     let mut rootd_lease_recovery = lease_reconciliation::RootdLeaseReconciler::default();
+    let mut update_recovery = update_supervisor::UpdateReconciler::default();
     let mut defer_secondary_services_until = None::<Instant>;
     let mut next_rootd_lease_reconciliation = Instant::now();
     let mut initial_lease_reconciliation = true;
 
     loop {
         reap_children(&mut running, &mut retry_state);
+        update_recovery.poll(Instant::now());
 
         let now = Instant::now();
         if now >= next_rootd_lease_reconciliation {
@@ -258,6 +261,15 @@ fn main() {
                 .get(entry.exec.as_str())
                 .is_some_and(|state| now < state.next_attempt)
             {
+                continue;
+            }
+
+            if rootd_service_id_for_exec(entry.exec.as_str())
+                .is_some_and(|service_id| update_recovery.blocks_auto_launch(service_id))
+            {
+                // A candidate failed its supervised trial, but no trusted
+                // restored previous image was admitted. Never restart an
+                // arbitrary current path and mislabel it as a rollback.
                 continue;
             }
 
