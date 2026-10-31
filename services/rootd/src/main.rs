@@ -1418,14 +1418,17 @@ fn fill_commercial_max_response(
                         .cast::<ServiceCheckpointRecordWire>(),
                 )
             };
-            let duplicate = service_checkpoints.mutate(request.arg0, record)?;
-            // A duplicate caller retry must reach this same idempotent
-            // append. Do not ACK an in-memory-only mutation.
+            // The supervisor validates the entire DAG mutation first.
+            // Kernel-resident journal publication is the durable-within-boot
+            // commit point; no in-memory state changes before that.
+            service_checkpoints.preflight_mutate(request.arg0, record)?;
             checkpoint_journal::append(
                 request.arg0,
                 rustos_user_abi::syscall::CHECKPOINT_JOURNAL_RECORD_MUTATE,
                 record,
             )?;
+            let duplicate = service_checkpoints.mutate(request.arg0, record)
+                .unwrap_or_else(|_| fail_closed(b"rootd: fatal journaled checkpoint apply failed\n"));
             response.value0 = record.revision;
             response.value1 = u64::from(duplicate);
             Ok(())
@@ -1451,12 +1454,14 @@ fn fill_commercial_max_response(
                         .cast::<ServiceCheckpointRecordWire>(),
                 )
             };
-            let already_compacted = service_checkpoints.compact(request.arg0, proof)?;
+            service_checkpoints.preflight_compact(request.arg0, proof)?;
             checkpoint_journal::append(
                 request.arg0,
                 rustos_user_abi::syscall::CHECKPOINT_JOURNAL_RECORD_COMPACT,
                 proof,
             )?;
+            let already_compacted = service_checkpoints.compact(request.arg0, proof)
+                .unwrap_or_else(|_| fail_closed(b"rootd: fatal journaled checkpoint compact failed\n"));
             response.value0 = proof.revision;
             response.value1 = u64::from(already_compacted);
             Ok(())

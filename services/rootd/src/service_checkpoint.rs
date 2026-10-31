@@ -48,6 +48,33 @@ impl ServiceCheckpointStore {
         }
     }
 
+    /// Evaluate one complex checkpoint mutation without publishing it.
+    /// Kernel journal append follows only a successful dry-run, so ENOSPC
+    /// cannot mutate the rootd DAG without a corresponding log entry.
+    fn snapshot_for_preflight(&self) -> Result<Self, i32> {
+        let mut scratch = Self::new();
+        scratch.records.try_reserve_exact(self.records.len())
+            .map_err(|_| ENOMEM)?;
+        scratch.records.extend_from_slice(&self.records);
+        Ok(scratch)
+    }
+
+    pub(crate) fn preflight_mutate(
+        &self,
+        service_id: u64,
+        record: ServiceCheckpointRecordWire,
+    ) -> Result<(), i32> {
+        self.snapshot_for_preflight()?.mutate(service_id, record).map(|_| ())
+    }
+
+    pub(crate) fn preflight_compact(
+        &self,
+        service_id: u64,
+        proof: ServiceCheckpointRecordWire,
+    ) -> Result<(), i32> {
+        self.snapshot_for_preflight()?.compact(service_id, proof).map(|_| ())
+    }
+
     pub(crate) fn mutate(
         &mut self,
         service_id: u64,
