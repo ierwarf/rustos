@@ -1870,7 +1870,7 @@ fn supervise_memory_pressure(
         now_ms,
         &census,
         rootd_pid,
-        |pid| protected.contains(&pid),
+        |pid| protected.contains(&pid) || process_inside_memory_min(pid),
         |job| !protected_overflow && job_kill_is_safe(job, protected),
     );
     match verdict {
@@ -1934,6 +1934,32 @@ const PROTECTED_PIDS_MAX: usize = 64;
 /// The kernel answers per pid whether it lies within the opened subtree, so
 /// descendants and ancestors are covered without rootd walking the tree. Any
 /// answer other than "not in this subtree" refuses, including errors.
+/// Never pick a process below its own or an ancestor's declared memory.min
+/// reserve. This is slow OOM-policy IPC issued only by rootd during a pressure
+/// episode, not a syscall, fault, TLB, scheduling or IPC fast path.
+fn process_inside_memory_min(pid: u64) -> bool {
+    let Ok(mut id) = jobs::process_job(pid) else { return false };
+    for _ in 0..=8 {
+        let Ok(handle) = jobs::open_subtree(
+            rustos_user_abi::syscall::JOB_BOOTSTRAP_ROOT_FD,
+            id,
+            rustos_user_abi::syscall::JOB_RIGHT_INSPECT,
+        ) else { return true };
+        let qos = jobs::memory_qos_info(handle);
+        let info = jobs::info(handle);
+        jobs::close(handle);
+        let (Ok(qos), Ok(info)) = (qos, info) else { return true };
+        if qos.min_pages != 0 && info.usage_memory_pages <= qos.min_pages {
+            return true;
+        }
+        if info.parent == 0 {
+            break;
+        }
+        id = info.parent;
+    }
+    false
+}
+
 fn job_kill_is_safe(job: u64, protected: &[u64]) -> bool {
     const ESRCH: i64 = 3;
     if job == rustos_user_abi::syscall::JOB_ID_ROOT {
@@ -1946,9 +1972,15 @@ fn job_kill_is_safe(job: u64, protected: &[u64]) -> bool {
     ) else {
         return false;
     };
+    let memory = jobs::memory_qos_info(handle);
+    let usage = jobs::info(handle).map(|info| info.usage_memory_pages);
     let safe = protected
         .iter()
-        .all(|&pid| jobs::process_job_in(handle, pid) == Err(ESRCH));
+        .all(|&pid| jobs::process_job_in(handle, pid) == Err(ESRCH))
+        && memory.as_ref().is_ok_and(|qos| {
+            qos.min_pages == 0
+                || usage.as_ref().is_ok_and(|pages| *pages > qos.min_pages)
+        });
     jobs::close(handle);
     safe
 }

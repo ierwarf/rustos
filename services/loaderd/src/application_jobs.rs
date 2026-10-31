@@ -71,6 +71,28 @@ impl Jobs for NativeJobs {
                 return Err((-admission) as i32);
             }
         }
+        // The application Job's resident limit is already enforced by the
+        // kernel frame ledger. Its high watermark adds nonblocking pressure
+        // telemetry at 80% and no implicit memory.min protection for apps.
+        if args.op == JOB_OP_SET_LIMITS && args.limit_memory_pages != JOB_LIMIT_UNSET {
+            let mut memory = RustosJobMemoryQosArgs {
+                abi_version: JOB_MEMORY_QOS_ABI_VERSION,
+                op: JOB_MEMORY_QOS_OP_SET,
+                job_handle: args.job_handle,
+                high_pages: args.limit_memory_pages.saturating_mul(4) / 5,
+                min_pages: 0,
+                ..RustosJobMemoryQosArgs::default()
+            };
+            let qos_status = unsafe {
+                rustos_svc_runtime::syscall::syscall1(
+                    SYS_RUSTOS_JOB_MEMORY_QOS,
+                    &mut memory as *mut _ as u64,
+                )
+            };
+            if qos_status < 0 {
+                return Err((-qos_status) as i32);
+            }
+        }
         Ok(args)
     }
     fn close(&mut self, handle: u64) {

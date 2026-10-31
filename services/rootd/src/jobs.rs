@@ -207,6 +207,22 @@ pub(super) fn release_client_session(job_id: u64) -> Result<u64, i64> {
     if status < 0 { Err(-status) } else { Ok(args.usage) }
 }
 
+/// Inspect the live kernel memory pressure and OOM protection state using an
+/// attenuated Job inspect handle. Does not confer permission to modify it.
+pub(super) fn memory_qos_info(handle: u64)
+    -> Result<rustos_user_abi::syscall::RustosJobMemoryQosArgs, i64>
+{
+    use rustos_user_abi::syscall::*;
+    let mut args = RustosJobMemoryQosArgs {
+        abi_version: JOB_MEMORY_QOS_ABI_VERSION,
+        op: JOB_MEMORY_QOS_OP_INSPECT,
+        job_handle: handle,
+        ..RustosJobMemoryQosArgs::default()
+    };
+    let status = syscall1(SYS_RUSTOS_JOB_MEMORY_QOS, &mut args as *mut _ as u64);
+    if status < 0 { Err(-status) } else { Ok(args) }
+}
+
 /// Live evidence that page charging follows the fault and unmap paths: touching
 /// fresh pages raises the root job's charged pages and unmapping returns them.
 /// Other processes run concurrently, so the check is deliberately loose (half
