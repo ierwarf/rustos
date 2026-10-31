@@ -23,6 +23,11 @@ pub(super) struct PositiveGrant {
 }
 
 const fn op_mask(op: Op) -> u64 { 1u64 << (op as u16) }
+const fn service_reads() -> u64 {
+    op_mask(Op::ResolveServiceRoute) | op_mask(Op::ReadServicePrincipal)
+        | op_mask(Op::ReportComponentHealth)
+}
+
 const fn checkpoint() -> u64 {
     op_mask(Op::WriteRecoveryCheckpoint)
         | op_mask(Op::CompactRecoveryCheckpoint)
@@ -30,7 +35,7 @@ const fn checkpoint() -> u64 {
 }
 
 const fn grant(service: u64, operations: u64) -> PositiveGrant {
-    PositiveGrant { service, operations }
+    PositiveGrant { service, operations: operations | service_reads() }
 }
 
 pub(super) const GRANTS: [PositiveGrant; 13] = [
@@ -47,7 +52,8 @@ pub(super) const GRANTS: [PositiveGrant; 13] = [
     grant(IPC_SERVICE_DEVMGRD, checkpoint() | op_mask(Op::ControlDevice)),
     grant(IPC_SERVICE_INPUTD, checkpoint()),
     grant(IPC_SERVICE_STORAGED, checkpoint()),
-    grant(IPC_SERVICE_SESSIOND, checkpoint() | op_mask(Op::CreateSession) | op_mask(Op::RouteSession)),
+    grant(IPC_SERVICE_SESSIOND, checkpoint() | op_mask(Op::CreateSession)
+        | op_mask(Op::RouteSession) | op_mask(Op::ChargeClientSession)),
     grant(IPC_SERVICE_UISERVER, checkpoint()),
     grant(IPC_SERVICE_ROOTD, u64::MAX),
 ];
@@ -89,5 +95,8 @@ mod tests {
         assert!(permits(IPC_SERVICE_SESSIOND, Op::CreateSession));
         assert!(!permits(IPC_SERVICE_VFSD, Op::CreateSession));
         assert!(!permits(0, Op::WriteRecoveryCheckpoint));
+        assert!(permits(IPC_SERVICE_NETD, Op::ResolveServiceRoute));
+        assert!(permits(IPC_SERVICE_SESSIOND, Op::ChargeClientSession));
+        assert!(!permits(IPC_SERVICE_VFSD, Op::ChargeClientSession));
     }
 }
