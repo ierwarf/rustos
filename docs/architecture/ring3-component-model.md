@@ -41,6 +41,11 @@ library as replacing the existing rootd/Job/IPC authorities.
   `tools/ring3_idl_codegen.py`. CI rejects stale generated files.
   The five declarative control-plane schemas are staging contracts only:
   production IPC and syscall structs have **not** been switched over.
+- `Graph::from_manifest` admits topologically sorted nested components
+  one parent at a time before admitting each child. Its output is private
+  until all exports and offers validate; malformed dependency indices
+  fail closed. A dedicated nested-realm regression test covers activation,
+  capability routing and descendant revocation.
 - `rootd` and the component model have focused host tests; this work
   leaves the live fixed service registry and exact kernel lease owner intact.
 
