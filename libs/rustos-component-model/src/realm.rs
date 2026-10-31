@@ -123,7 +123,7 @@ pub struct Graph {
     pub(crate) exports: Vec<crate::routing::Capability>,
     outstanding: Vec<OutstandingCharge>,
     next_ticket: u64,
-    next_route_epoch: u64,
+    pub(crate) next_route_epoch: u64,
     capacity: usize,
     pub(crate) max_routes: usize,
 }
