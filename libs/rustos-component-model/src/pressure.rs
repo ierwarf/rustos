@@ -5,9 +5,9 @@
 //! permit reclaim/kill without the independently authenticated Job handle.
 //! In particular memory.min is protection preference, not an extra allocation.
 
-use alloc::vec::Vec;
 use crate::identity::ComponentId;
 use crate::realm::{ComponentState, Graph, GraphError};
+use alloc::vec::Vec;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PressureError {
@@ -88,7 +88,10 @@ impl PressureIndex {
         if capacity == 0 || capacity > crate::realm::MAX_COMPONENTS {
             return Err(PressureError::InvalidLimit);
         }
-        Ok(Self { entries: Vec::new(), capacity })
+        Ok(Self {
+            entries: Vec::new(),
+            capacity,
+        })
     }
 
     pub fn install(
@@ -98,16 +101,28 @@ impl PressureIndex {
         limits: MemoryBoundary,
     ) -> Result<(), PressureError> {
         limits.validate()?;
-        let view = graph.inspect(component).map_err(|_| PressureError::UnknownComponent)?;
-        if view.state == ComponentState::Dead { return Err(PressureError::UnknownComponent); }
+        let view = graph
+            .inspect(component)
+            .map_err(|_| PressureError::UnknownComponent)?;
+        if view.state == ComponentState::Dead {
+            return Err(PressureError::UnknownComponent);
+        }
         if limits.max_pages > view.quota.maximum.user_pages {
             return Err(PressureError::InvalidLimit);
         }
-        if self.entries.iter().any(|entry| entry.component == component) {
+        if self
+            .entries
+            .iter()
+            .any(|entry| entry.component == component)
+        {
             return Err(PressureError::Duplicate);
         }
-        if self.entries.len() >= self.capacity { return Err(PressureError::Full); }
-        self.entries.try_reserve(1).map_err(|_| PressureError::OutOfMemory)?;
+        if self.entries.len() >= self.capacity {
+            return Err(PressureError::Full);
+        }
+        self.entries
+            .try_reserve(1)
+            .map_err(|_| PressureError::OutOfMemory)?;
         self.entries.push(Entry {
             component,
             limits,
@@ -124,14 +139,19 @@ impl PressureIndex {
         limits: MemoryBoundary,
     ) -> Result<(), PressureError> {
         limits.validate()?;
-        let view = graph.inspect(component).map_err(|_| PressureError::UnknownComponent)?;
+        let view = graph
+            .inspect(component)
+            .map_err(|_| PressureError::UnknownComponent)?;
         if limits.max_pages > view.quota.maximum.user_pages {
             return Err(PressureError::InvalidLimit);
         }
         if view.used.user_pages > limits.max_pages {
             return Err(PressureError::LiveUsageExceedsMax);
         }
-        let entry = self.entries.iter_mut().find(|e| e.component == component)
+        let entry = self
+            .entries
+            .iter_mut()
+            .find(|e| e.component == component)
             .ok_or(PressureError::UnknownComponent)?;
         if !limits.tightened_from(entry.limits) {
             return Err(PressureError::InvalidLimit);
@@ -148,14 +168,22 @@ impl PressureIndex {
         now: u64,
         global_pressure: bool,
     ) -> Result<PressureAction, PressureError> {
-        let usage = graph.inspect(component)
-            .map_err(|_| PressureError::UnknownComponent)?.used.user_pages;
-        let entry = self.entries.iter_mut().find(|e| e.component == component)
+        let usage = graph
+            .inspect(component)
+            .map_err(|_| PressureError::UnknownComponent)?
+            .used
+            .user_pages;
+        let entry = self
+            .entries
+            .iter_mut()
+            .find(|e| e.component == component)
             .ok_or(PressureError::UnknownComponent)?;
         let bounds = entry.limits;
         // Hard limit is checked even when there is no global pressure.
         let action = if usage > bounds.max_pages {
-            PressureAction::HardRefuse { excess_pages: usage - bounds.max_pages }
+            PressureAction::HardRefuse {
+                excess_pages: usage - bounds.max_pages,
+            }
         } else if !global_pressure {
             PressureAction::Normal
         } else if usage <= bounds.minimum_pages {
@@ -163,7 +191,9 @@ impl PressureIndex {
         } else if usage <= bounds.low_pages {
             PressureAction::ProtectedLow
         } else if usage > bounds.high_pages {
-            PressureAction::SoftThrottle { excess_pages: usage - bounds.high_pages }
+            PressureAction::SoftThrottle {
+                excess_pages: usage - bounds.high_pages,
+            }
         } else {
             PressureAction::Normal
         };
@@ -192,7 +222,9 @@ impl PressureIndex {
     }
 
     pub fn snapshot(&self, component: ComponentId) -> Option<(MemoryBoundary, PressureEvents)> {
-        self.entries.iter().find(|e| e.component == component)
+        self.entries
+            .iter()
+            .find(|e| e.component == component)
             .map(|e| (e.limits, e.events))
     }
 
@@ -209,33 +241,117 @@ impl PressureIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Graph, Moniker, JobCeiling, Quota, RestartPolicy, Charge};
+    use crate::{Charge, Graph, JobCeiling, Moniker, Quota, RestartPolicy};
 
     #[test]
     fn boundary_is_ordered_and_cannot_overrun_job_quota() {
         let mut g = Graph::new(Moniker::new("root").unwrap(), 1, 4).unwrap();
-        let q = Quota { maximum: Charge { user_pages: 8, ..Quota::UNLIMITED.maximum } };
-        let c = g.create(g.root(), Moniker::new("app").unwrap(), 2,
-            JobCeiling::ALL, q, RestartPolicy::NEVER, false).unwrap();
+        let q = Quota {
+            maximum: Charge {
+                user_pages: 8,
+                ..Quota::UNLIMITED.maximum
+            },
+        };
+        let c = g
+            .create(
+                g.root(),
+                Moniker::new("app").unwrap(),
+                2,
+                JobCeiling::ALL,
+                q,
+                RestartPolicy::NEVER,
+                false,
+            )
+            .unwrap();
         g.activate(c).unwrap();
         let mut i = PressureIndex::new(2).unwrap();
-        assert_eq!(i.install(&g, c, MemoryBoundary { minimum_pages: 4, low_pages: 2, high_pages: 6, max_pages: 8 }), Err(PressureError::InvalidLimit));
-        assert_eq!(i.install(&g, c, MemoryBoundary { minimum_pages: 0, low_pages: 0, high_pages: 6, max_pages: 10 }), Err(PressureError::InvalidLimit));
-        i.install(&g, c, MemoryBoundary { minimum_pages: 0, low_pages: 0, high_pages: 6, max_pages: 8 }).unwrap();
-        assert_eq!(i.observe(&g, c, 2, true), Ok(PressureAction::ProtectedMinimum));
+        assert_eq!(
+            i.install(
+                &g,
+                c,
+                MemoryBoundary {
+                    minimum_pages: 4,
+                    low_pages: 2,
+                    high_pages: 6,
+                    max_pages: 8
+                }
+            ),
+            Err(PressureError::InvalidLimit)
+        );
+        assert_eq!(
+            i.install(
+                &g,
+                c,
+                MemoryBoundary {
+                    minimum_pages: 0,
+                    low_pages: 0,
+                    high_pages: 6,
+                    max_pages: 10
+                }
+            ),
+            Err(PressureError::InvalidLimit)
+        );
+        i.install(
+            &g,
+            c,
+            MemoryBoundary {
+                minimum_pages: 0,
+                low_pages: 0,
+                high_pages: 6,
+                max_pages: 8,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            i.observe(&g, c, 2, true),
+            Ok(PressureAction::ProtectedMinimum)
+        );
     }
 
     #[test]
     fn crossing_high_counts_only_edges_not_every_poll() {
         let mut g = Graph::new(Moniker::new("root").unwrap(), 1, 4).unwrap();
-        let c = g.create(g.root(), Moniker::new("app").unwrap(), 2,
-            JobCeiling::ALL, Quota::UNLIMITED, RestartPolicy::NEVER, false).unwrap();
+        let c = g
+            .create(
+                g.root(),
+                Moniker::new("app").unwrap(),
+                2,
+                JobCeiling::ALL,
+                Quota::UNLIMITED,
+                RestartPolicy::NEVER,
+                false,
+            )
+            .unwrap();
         g.activate(c).unwrap();
         let mut i = PressureIndex::new(2).unwrap();
-        i.install(&g, c, MemoryBoundary { minimum_pages: 0, low_pages: 1, high_pages: 2, max_pages: 10 }).unwrap();
-        let t = g.charge(c, Charge { user_pages: 4, ..Charge::ZERO }).unwrap();
-        assert_eq!(i.observe(&g, c, 3, true), Ok(PressureAction::SoftThrottle { excess_pages: 2 }));
-        assert_eq!(i.observe(&g, c, 4, true), Ok(PressureAction::SoftThrottle { excess_pages: 2 }));
+        i.install(
+            &g,
+            c,
+            MemoryBoundary {
+                minimum_pages: 0,
+                low_pages: 1,
+                high_pages: 2,
+                max_pages: 10,
+            },
+        )
+        .unwrap();
+        let t = g
+            .charge(
+                c,
+                Charge {
+                    user_pages: 4,
+                    ..Charge::ZERO
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            i.observe(&g, c, 3, true),
+            Ok(PressureAction::SoftThrottle { excess_pages: 2 })
+        );
+        assert_eq!(
+            i.observe(&g, c, 4, true),
+            Ok(PressureAction::SoftThrottle { excess_pages: 2 })
+        );
         assert_eq!(i.snapshot(c).unwrap().1.high_crossings, 1);
         g.release(t).unwrap();
         assert_eq!(i.observe(&g, c, 5, false), Ok(PressureAction::Normal));

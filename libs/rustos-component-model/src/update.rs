@@ -58,12 +58,22 @@ impl Update {
         if installed.epoch == 0 || installed.digest == [0; 32] {
             return Err(UpdateError::Invalid);
         }
-        Ok(Self { component, current: installed, state: UpdateState::Idle,
-            transaction: 0, pending: None, trial_incarnation: 0 })
+        Ok(Self {
+            component,
+            current: installed,
+            state: UpdateState::Idle,
+            transaction: 0,
+            pending: None,
+            trial_incarnation: 0,
+        })
     }
 
-    pub fn installed(&self) -> ReleaseId { self.current }
-    pub fn state(&self) -> UpdateState { self.state }
+    pub fn installed(&self) -> ReleaseId {
+        self.current
+    }
+    pub fn state(&self) -> UpdateState {
+        self.state
+    }
 
     pub fn stage(
         &mut self,
@@ -73,18 +83,27 @@ impl Update {
         trial_deadline: u64,
     ) -> Result<UpdateReceipt, UpdateError> {
         if !matches!(self.state, UpdateState::Idle | UpdateState::Committed)
-            || expected_incarnation == 0 || activate_before >= trial_deadline
-            || candidate.digest == [0; 32] {
+            || expected_incarnation == 0
+            || activate_before >= trial_deadline
+            || candidate.digest == [0; 32]
+        {
             return Err(UpdateError::Invalid);
         }
         if candidate.epoch <= self.current.epoch {
             return Err(UpdateError::Downgrade);
         }
-        let transaction = self.transaction.checked_add(1).ok_or(UpdateError::Overflow)?;
+        let transaction = self
+            .transaction
+            .checked_add(1)
+            .ok_or(UpdateError::Overflow)?;
         let receipt = UpdateReceipt {
-            component: self.component, transaction,
-            previous: self.current, candidate, expected_incarnation,
-            activate_before, trial_deadline,
+            component: self.component,
+            transaction,
+            previous: self.current,
+            candidate,
+            expected_incarnation,
+            activate_before,
+            trial_deadline,
         };
         self.transaction = transaction;
         self.pending = Some(receipt);
@@ -93,13 +112,17 @@ impl Update {
         Ok(receipt)
     }
 
-    pub fn begin_activation(&mut self, receipt: UpdateReceipt, now: u64)
-        -> Result<(), UpdateError>
-    {
+    pub fn begin_activation(
+        &mut self,
+        receipt: UpdateReceipt,
+        now: u64,
+    ) -> Result<(), UpdateError> {
         if self.pending != Some(receipt) || self.state != UpdateState::Staged {
             return Err(UpdateError::Stale);
         }
-        if now > receipt.activate_before { return Err(UpdateError::NotReady); }
+        if now > receipt.activate_before {
+            return Err(UpdateError::NotReady);
+        }
         self.state = UpdateState::Activating;
         Ok(())
     }
@@ -115,10 +138,13 @@ impl Update {
             return Err(UpdateError::Stale);
         }
         if previous_incarnation != receipt.expected_incarnation
-            || new_incarnation <= previous_incarnation {
+            || new_incarnation <= previous_incarnation
+        {
             return Err(UpdateError::WrongIncarnation);
         }
-        if now >= receipt.trial_deadline { return Err(UpdateError::NotReady); }
+        if now >= receipt.trial_deadline {
+            return Err(UpdateError::NotReady);
+        }
         self.trial_incarnation = new_incarnation;
         self.state = UpdateState::Trial;
         Ok(())
@@ -137,8 +163,12 @@ impl Update {
         if self.pending != Some(receipt) || self.state != UpdateState::Trial {
             return Err(UpdateError::Stale);
         }
-        if incarnation != self.trial_incarnation { return Err(UpdateError::WrongIncarnation); }
-        if now >= receipt.trial_deadline || !healthy { return Err(UpdateError::NotReady); }
+        if incarnation != self.trial_incarnation {
+            return Err(UpdateError::WrongIncarnation);
+        }
+        if now >= receipt.trial_deadline || !healthy {
+            return Err(UpdateError::NotReady);
+        }
         self.current = receipt.candidate;
         self.pending = None;
         self.state = UpdateState::Committed;
@@ -147,7 +177,11 @@ impl Update {
 
     pub fn request_rollback(&mut self, receipt: UpdateReceipt) -> Result<ReleaseId, UpdateError> {
         if self.pending != Some(receipt)
-            || !matches!(self.state, UpdateState::Staged | UpdateState::Activating | UpdateState::Trial) {
+            || !matches!(
+                self.state,
+                UpdateState::Staged | UpdateState::Activating | UpdateState::Trial
+            )
+        {
             return Err(UpdateError::Stale);
         }
         self.state = UpdateState::RollingBack;
@@ -160,8 +194,10 @@ impl Update {
         receipt: UpdateReceipt,
         restored: ReleaseId,
     ) -> Result<(), UpdateError> {
-        if self.pending != Some(receipt) || self.state != UpdateState::RollingBack
-            || restored != receipt.previous {
+        if self.pending != Some(receipt)
+            || self.state != UpdateState::RollingBack
+            || restored != receipt.previous
+        {
             return Err(UpdateError::Stale);
         }
         self.current = restored;
@@ -179,16 +215,31 @@ mod tests {
     #[test]
     fn staged_update_requires_exact_trial_incarnation() {
         let id = ComponentId::new(1, 1).unwrap();
-        let base = ReleaseId { epoch: 1, digest: [1; 32] };
-        let next = ReleaseId { epoch: 2, digest: [2; 32] };
+        let base = ReleaseId {
+            epoch: 1,
+            digest: [1; 32],
+        };
+        let next = ReleaseId {
+            epoch: 2,
+            digest: [2; 32],
+        };
         let mut u = Update::new(id, base).unwrap();
         assert_eq!(u.stage(base, 1, 10, 100), Err(UpdateError::Downgrade));
         let receipt = u.stage(next, 1, 10, 100).unwrap();
         u.begin_activation(receipt, 3).unwrap();
-        assert_eq!(u.report_activated(receipt, 1, 1, 5), Err(UpdateError::WrongIncarnation));
+        assert_eq!(
+            u.report_activated(receipt, 1, 1, 5),
+            Err(UpdateError::WrongIncarnation)
+        );
         u.report_activated(receipt, 1, 2, 5).unwrap();
-        assert_eq!(u.finish_trial(receipt, 1, 20, true), Err(UpdateError::WrongIncarnation));
-        assert_eq!(u.finish_trial(receipt, 2, 100, true), Err(UpdateError::NotReady));
+        assert_eq!(
+            u.finish_trial(receipt, 1, 20, true),
+            Err(UpdateError::WrongIncarnation)
+        );
+        assert_eq!(
+            u.finish_trial(receipt, 2, 100, true),
+            Err(UpdateError::NotReady)
+        );
         u.finish_trial(receipt, 2, 30, true).unwrap();
         assert_eq!(u.installed(), next);
     }
@@ -196,12 +247,21 @@ mod tests {
     #[test]
     fn rollback_retains_exact_old_release() {
         let id = ComponentId::new(1, 1).unwrap();
-        let old = ReleaseId { epoch: 3, digest: [3; 32] };
-        let proposed = ReleaseId { epoch: 4, digest: [4; 32] };
+        let old = ReleaseId {
+            epoch: 3,
+            digest: [3; 32],
+        };
+        let proposed = ReleaseId {
+            epoch: 4,
+            digest: [4; 32],
+        };
         let mut u = Update::new(id, old).unwrap();
         let receipt = u.stage(proposed, 10, 20, 100).unwrap();
         assert_eq!(u.request_rollback(receipt), Ok(old));
-        assert_eq!(u.rollback_complete(receipt, proposed), Err(UpdateError::Stale));
+        assert_eq!(
+            u.rollback_complete(receipt, proposed),
+            Err(UpdateError::Stale)
+        );
         u.rollback_complete(receipt, old).unwrap();
         assert_eq!(u.installed(), old);
         assert_eq!(u.state(), UpdateState::Idle);

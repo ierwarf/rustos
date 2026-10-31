@@ -5,11 +5,11 @@
 //! resource mechanism remains authoritative, and a caller must authenticate
 //! the IPC sender before invoking this policy layer.
 
-use alloc::vec::Vec;
 use crate::identity::{ComponentId, Moniker};
 use crate::quota::Charge;
 use crate::realm::{ChargeTicket, Graph, GraphError};
 use crate::routing::CapabilityError;
+use alloc::vec::Vec;
 
 pub const MAX_SESSIONS: usize = 4_096;
 
@@ -27,7 +27,9 @@ pub enum SessionError {
 }
 
 impl From<GraphError> for SessionError {
-    fn from(err: GraphError) -> Self { Self::Charge(err) }
+    fn from(err: GraphError) -> Self {
+        Self::Charge(err)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -69,7 +71,10 @@ impl Sessions {
         if capacity == 0 || capacity > MAX_SESSIONS {
             return Err(SessionError::Invalid);
         }
-        Ok(Self { slots: Vec::new(), capacity })
+        Ok(Self {
+            slots: Vec::new(),
+            capacity,
+        })
     }
 
     pub fn open(
@@ -85,11 +90,15 @@ impl Sessions {
         if client == provider || expires_at <= now {
             return Err(SessionError::Invalid);
         }
-        let route = graph.resolve(client, provider, capability).map_err(|e| match e {
-            CapabilityError::Missing => SessionError::Missing,
-            _ => SessionError::Denied,
-        })?;
-        if route.rights == 0 { return Err(SessionError::Denied); }
+        let route = graph
+            .resolve(client, provider, capability)
+            .map_err(|e| match e {
+                CapabilityError::Missing => SessionError::Missing,
+                _ => SessionError::Denied,
+            })?;
+        if route.rights == 0 {
+            return Err(SessionError::Denied);
+        }
         let client_incarnation = graph.inspect(client)?.incarnation;
         let provider_incarnation = graph.inspect(provider)?.incarnation;
         let vacant = self.slots.iter().position(|s| s.item.is_none());
@@ -97,44 +106,79 @@ impl Sessions {
             return Err(SessionError::Full);
         }
         if vacant.is_none() {
-            self.slots.try_reserve(1).map_err(|_| SessionError::Allocation)?;
+            self.slots
+                .try_reserve(1)
+                .map_err(|_| SessionError::Allocation)?;
         }
         let slot_index = vacant.unwrap_or(self.slots.len());
         let generation = if let Some(index) = vacant {
             let generation = self.slots[index].generation;
-            if generation == u32::MAX { return Err(SessionError::Overflow); }
+            if generation == u32::MAX {
+                return Err(SessionError::Overflow);
+            }
             generation
-        } else { 1 };
+        } else {
+            1
+        };
         let ticket = graph.charge(client, cost)?;
-        let id = SessionId { slot: slot_index as u32, generation };
-        let item = Session { charge: ticket, view: SessionView {
-            id, client, provider, capability, opened_at: now, expires_at,
-            client_incarnation, provider_incarnation,
-        }};
+        let id = SessionId {
+            slot: slot_index as u32,
+            generation,
+        };
+        let item = Session {
+            charge: ticket,
+            view: SessionView {
+                id,
+                client,
+                provider,
+                capability,
+                opened_at: now,
+                expires_at,
+                client_incarnation,
+                provider_incarnation,
+            },
+        };
         if vacant.is_some() {
             self.slots[slot_index].item = Some(item);
         } else {
-            self.slots.push(Slot { generation, item: Some(item) });
+            self.slots.push(Slot {
+                generation,
+                item: Some(item),
+            });
         }
         Ok(id)
     }
 
     fn session(&self, id: SessionId) -> Result<&Session, SessionError> {
-        let s = self.slots.get(id.slot as usize).ok_or(SessionError::Missing)?;
-        if s.generation != id.generation { return Err(SessionError::Stale); }
+        let s = self
+            .slots
+            .get(id.slot as usize)
+            .ok_or(SessionError::Missing)?;
+        if s.generation != id.generation {
+            return Err(SessionError::Stale);
+        }
         s.item.as_ref().ok_or(SessionError::Missing)
     }
 
-    pub fn inspect(&self, graph: &Graph, id: SessionId, now: u64) -> Result<SessionView, SessionError> {
+    pub fn inspect(
+        &self,
+        graph: &Graph,
+        id: SessionId,
+        now: u64,
+    ) -> Result<SessionView, SessionError> {
         let view = self.session(id)?.view;
-        if now >= view.expires_at { return Err(SessionError::Stale); }
+        if now >= view.expires_at {
+            return Err(SessionError::Stale);
+        }
         let client = graph.inspect(view.client)?;
         let provider = graph.inspect(view.provider)?;
         if client.incarnation != view.client_incarnation
-            || provider.incarnation != view.provider_incarnation {
+            || provider.incarnation != view.provider_incarnation
+        {
             return Err(SessionError::Stale);
         }
-        graph.resolve(view.client, view.provider, view.capability)
+        graph
+            .resolve(view.client, view.provider, view.capability)
             .map_err(|_| SessionError::Denied)?;
         Ok(view)
     }
@@ -143,7 +187,9 @@ impl Sessions {
     pub fn close(&mut self, graph: &mut Graph, id: SessionId) -> Result<(), SessionError> {
         let ticket = self.session(id)?.charge;
         let index = id.slot as usize;
-        let next_generation = self.slots[index].generation.checked_add(1)
+        let next_generation = self.slots[index]
+            .generation
+            .checked_add(1)
             .ok_or(SessionError::Overflow)?;
         graph.release(ticket)?;
         self.slots[index].item = None;
@@ -152,17 +198,31 @@ impl Sessions {
     }
 
     /// Expire in a bounded batch; one failed release leaves its slot intact.
-    pub fn expire(&mut self, graph: &mut Graph, now: u64, budget: usize) -> Result<usize, SessionError> {
+    pub fn expire(
+        &mut self,
+        graph: &mut Graph,
+        now: u64,
+        budget: usize,
+    ) -> Result<usize, SessionError> {
         let mut closed = 0;
         for index in 0..self.slots.len() {
-            if closed >= budget { break; }
-            let Some(session) = self.slots[index].item else { continue };
+            if closed >= budget {
+                break;
+            }
+            let Some(session) = self.slots[index].item else {
+                continue;
+            };
             let view = session.view;
             let client = graph.inspect(view.client).ok();
             let provider = graph.inspect(view.provider).ok();
-            if now >= view.expires_at ||
-                client.as_ref().map_or(true, |c| c.incarnation != view.client_incarnation) ||
-                provider.as_ref().map_or(true, |c| c.incarnation != view.provider_incarnation) {
+            if now >= view.expires_at
+                || client
+                    .as_ref()
+                    .map_or(true, |c| c.incarnation != view.client_incarnation)
+                || provider
+                    .as_ref()
+                    .map_or(true, |c| c.incarnation != view.provider_incarnation)
+            {
                 self.close(graph, view.id)?;
                 closed += 1;
             }
@@ -170,11 +230,20 @@ impl Sessions {
         Ok(closed)
     }
 
-    pub fn revoke_component(&mut self, graph: &mut Graph, id: ComponentId, budget: usize) -> Result<usize, SessionError> {
+    pub fn revoke_component(
+        &mut self,
+        graph: &mut Graph,
+        id: ComponentId,
+        budget: usize,
+    ) -> Result<usize, SessionError> {
         let mut closed = 0;
         for index in 0..self.slots.len() {
-            if closed >= budget { break; }
-            let Some(session) = self.slots[index].item else { continue };
+            if closed >= budget {
+                break;
+            }
+            let Some(session) = self.slots[index].item else {
+                continue;
+            };
             if session.view.client == id || session.view.provider == id {
                 self.close(graph, session.view.id)?;
                 closed += 1;
@@ -197,8 +266,17 @@ mod tests {
     fn sessions_charge_client_not_server_and_single_close() {
         let mut g = Graph::new(Moniker::new("root").unwrap(), 1, 6).unwrap();
         let mut add = |name: &str, job| {
-            let id = g.create(g.root(), Moniker::new(name).unwrap(), job, JobCeiling::ALL,
-                Quota::UNLIMITED, RestartPolicy::NEVER, false).unwrap();
+            let id = g
+                .create(
+                    g.root(),
+                    Moniker::new(name).unwrap(),
+                    job,
+                    JobCeiling::ALL,
+                    Quota::UNLIMITED,
+                    RestartPolicy::NEVER,
+                    false,
+                )
+                .unwrap();
             g.activate(id).unwrap();
             id
         };
@@ -208,8 +286,21 @@ mod tests {
         g.publish(p, name, 1).unwrap();
         g.offer(p, c, name, 1).unwrap();
         let mut s = Sessions::new(2).unwrap();
-        let id = s.open(&mut g, c, p, name, Charge { sessions: 1, kernel_bytes: 42, ..Charge::ZERO },
-            100, 200).unwrap();
+        let id = s
+            .open(
+                &mut g,
+                c,
+                p,
+                name,
+                Charge {
+                    sessions: 1,
+                    kernel_bytes: 42,
+                    ..Charge::ZERO
+                },
+                100,
+                200,
+            )
+            .unwrap();
         assert_eq!(g.inspect(c).unwrap().used.kernel_bytes, 42);
         assert_eq!(g.inspect(p).unwrap().used.kernel_bytes, 0);
         assert!(s.inspect(&g, id, 100).is_ok());
@@ -222,10 +313,28 @@ mod tests {
     #[test]
     fn expiration_is_bounded_and_cannot_double_refund() {
         let mut g = Graph::new(Moniker::new("root").unwrap(), 1, 4).unwrap();
-        let client = g.create(g.root(), Moniker::new("a").unwrap(), 2, JobCeiling::ALL,
-            Quota::UNLIMITED, RestartPolicy::NEVER, false).unwrap();
-        let provider = g.create(g.root(), Moniker::new("b").unwrap(), 3, JobCeiling::ALL,
-            Quota::UNLIMITED, RestartPolicy::NEVER, false).unwrap();
+        let client = g
+            .create(
+                g.root(),
+                Moniker::new("a").unwrap(),
+                2,
+                JobCeiling::ALL,
+                Quota::UNLIMITED,
+                RestartPolicy::NEVER,
+                false,
+            )
+            .unwrap();
+        let provider = g
+            .create(
+                g.root(),
+                Moniker::new("b").unwrap(),
+                3,
+                JobCeiling::ALL,
+                Quota::UNLIMITED,
+                RestartPolicy::NEVER,
+                false,
+            )
+            .unwrap();
         g.activate(client).unwrap();
         g.activate(provider).unwrap();
         let cap = Moniker::new("fs").unwrap();
@@ -233,8 +342,20 @@ mod tests {
         g.offer(provider, client, cap, 1).unwrap();
         let mut sessions = Sessions::new(3).unwrap();
         for expiry in [10, 11] {
-            sessions.open(&mut g, client, provider, cap,
-                Charge { sessions: 1, ..Charge::ZERO }, 1, expiry).unwrap();
+            sessions
+                .open(
+                    &mut g,
+                    client,
+                    provider,
+                    cap,
+                    Charge {
+                        sessions: 1,
+                        ..Charge::ZERO
+                    },
+                    1,
+                    expiry,
+                )
+                .unwrap();
         }
         assert_eq!(sessions.expire(&mut g, 20, 1), Ok(1));
         assert_eq!(g.inspect(client).unwrap().used.sessions, 1);

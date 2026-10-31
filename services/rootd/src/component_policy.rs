@@ -8,14 +8,14 @@
 //! lease/Job owner until a dual-run cutover is proven. A path or a moniker
 //! never grants authority.
 
+use super::service_manifest::{
+    BootstrapServiceSpec, PostInitServiceSpec, BOOTSTRAP_MANIFEST, DEP_LOADERD, DEP_PAGERD,
+    DEP_PROCD, DEP_SYSCALLD, DEP_VFSD, POST_INIT_MANIFEST,
+};
 use rustos_component_model::Moniker;
 use rustos_user_abi::syscall::{
-    IPC_SERVICE_LINUX_SYSCALLD, IPC_SERVICE_VFSD, IPC_SERVICE_LOADERD,
-    IPC_SERVICE_PROCD, IPC_SERVICE_PAGERD,
-};
-use super::service_manifest::{
-    BootstrapServiceSpec, PostInitServiceSpec, BOOTSTRAP_MANIFEST, POST_INIT_MANIFEST,
-    DEP_SYSCALLD, DEP_VFSD, DEP_LOADERD, DEP_PROCD, DEP_PAGERD,
+    IPC_SERVICE_LINUX_SYSCALLD, IPC_SERVICE_LOADERD, IPC_SERVICE_PAGERD, IPC_SERVICE_PROCD,
+    IPC_SERVICE_VFSD,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -38,15 +38,22 @@ fn checked_exec(path: &[u8]) -> Result<Moniker, ManifestError> {
         return Err(ManifestError::MissingTerminator);
     }
     let body = &path[..path.len() - 1];
-    if body.is_empty() { return Err(ManifestError::EmptyPath); }
+    if body.is_empty() {
+        return Err(ManifestError::EmptyPath);
+    }
     let text = core::str::from_utf8(body).map_err(|_| ManifestError::InvalidPath)?;
-    if !text.starts_with("services/") || text.contains("..")
-        || text.contains("//") || text.as_bytes().contains(&0)
-        || !text.ends_with(".elf") {
+    if !text.starts_with("services/")
+        || text.contains("..")
+        || text.contains("//")
+        || text.as_bytes().contains(&0)
+        || !text.ends_with(".elf")
+    {
         return Err(ManifestError::InvalidPath);
     }
     let mut parts = text.split('/');
-    if parts.next() != Some("services") { return Err(ManifestError::InvalidPath); }
+    if parts.next() != Some("services") {
+        return Err(ManifestError::InvalidPath);
+    }
     let service = parts.next().ok_or(ManifestError::InvalidPath)?;
     let filename = parts.next().ok_or(ManifestError::InvalidPath)?;
     if parts.next().is_some() || filename.strip_suffix(".elf") != Some(service) {
@@ -66,13 +73,19 @@ fn dependency_target(bit: u16) -> Option<u64> {
     }
 }
 
-fn validate(boot: &[BootstrapServiceSpec], post: &[PostInitServiceSpec])
-    -> Result<(), ManifestError>
-{
-    if boot.is_empty() { return Err(ManifestError::EmptyPath); }
+fn validate(
+    boot: &[BootstrapServiceSpec],
+    post: &[PostInitServiceSpec],
+) -> Result<(), ManifestError> {
+    if boot.is_empty() {
+        return Err(ManifestError::EmptyPath);
+    }
     for (index, spec) in boot.iter().enumerate() {
-        if boot[..index].iter().any(|s| s.service_id == spec.service_id)
-            || post.iter().any(|s| s.service_id == spec.service_id) {
+        if boot[..index]
+            .iter()
+            .any(|s| s.service_id == spec.service_id)
+            || post.iter().any(|s| s.service_id == spec.service_id)
+        {
             return Err(ManifestError::DuplicateServiceId);
         }
         let name = checked_exec(spec.exec_path)?;
@@ -88,7 +101,9 @@ fn validate(boot: &[BootstrapServiceSpec], post: &[PostInitServiceSpec])
             return Err(ManifestError::UnknownDependency);
         }
         for bit in [DEP_SYSCALLD, DEP_VFSD, DEP_LOADERD, DEP_PROCD, DEP_PAGERD] {
-            if spec.dependency_mask & bit == 0 { continue; }
+            if spec.dependency_mask & bit == 0 {
+                continue;
+            }
             let target = dependency_target(bit).ok_or(ManifestError::UnknownDependency)?;
             if !boot[..index].iter().any(|s| s.service_id == target) {
                 return Err(ManifestError::DependencyCycle);
@@ -97,7 +112,10 @@ fn validate(boot: &[BootstrapServiceSpec], post: &[PostInitServiceSpec])
     }
     for (index, spec) in post.iter().enumerate() {
         if boot.iter().any(|s| s.service_id == spec.service_id)
-            || post[..index].iter().any(|s| s.service_id == spec.service_id) {
+            || post[..index]
+                .iter()
+                .any(|s| s.service_id == spec.service_id)
+        {
             return Err(ManifestError::DuplicateServiceId);
         }
         let name = checked_exec(spec.exec_path)?;
@@ -135,10 +153,16 @@ mod tests {
     fn duplicate_service_and_dependency_cycles_fail_closed() {
         let mut repeated = BOOTSTRAP_MANIFEST;
         repeated[1].service_id = repeated[0].service_id;
-        assert_eq!(validate(&repeated, &POST_INIT_MANIFEST), Err(ManifestError::DuplicateServiceId));
+        assert_eq!(
+            validate(&repeated, &POST_INIT_MANIFEST),
+            Err(ManifestError::DuplicateServiceId)
+        );
         let mut cyclic = BOOTSTRAP_MANIFEST;
         cyclic[0].dependency_mask = DEP_VFSD;
-        assert_eq!(validate(&cyclic, &POST_INIT_MANIFEST), Err(ManifestError::DependencyCycle));
+        assert_eq!(
+            validate(&cyclic, &POST_INIT_MANIFEST),
+            Err(ManifestError::DependencyCycle)
+        );
     }
 
     #[test]

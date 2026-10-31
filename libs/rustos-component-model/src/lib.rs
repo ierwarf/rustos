@@ -16,6 +16,7 @@
 
 extern crate alloc;
 
+pub mod health;
 pub mod identity;
 pub mod manifest;
 pub mod policy;
@@ -26,7 +27,6 @@ pub mod routing;
 pub mod session;
 pub mod supervision;
 pub mod telemetry;
-pub mod health;
 pub mod update;
 pub mod wire;
 
