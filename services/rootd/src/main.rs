@@ -1145,40 +1145,28 @@ fn fill_commercial_max_response(
             response.value1 = 0;
             Ok(())
         }
-        COMMERCIAL_MAX_ROOTD_OP_SESSION_ACCOUNT_CHARGE => {
-            if request.arg0 == 0
-                || request.arg1 == 0
-                || request.arg2 != 0
-                || request.arg3 != 0
-                || request.path_len != 0
-                || request.payload_len != 0
-            {
-                return Err(22);
-            }
-            authorize_current_service_namespace(
-                leases, post_init_leases, IPC_SERVICE_SESSIOND, sender,
-            )?;
-            service_checkpoints.sessions.bind_owner(
-                sender.pid,
-                |job| jobs::release_client_session(job).map(|_| ()).map_err(|e| e as i32),
-            )?;
-            let job_id = service_checkpoints.sessions.charge(
-                request.arg0,
-                request.arg1,
-                |pid| jobs::process_job(pid).map_err(|e| e as i32),
-                |pid, job| jobs::charge_client_session(pid, job).map(|_| ()).map_err(|e| e as i32),
-            )?;
-            response.value0 = job_id;
-            response.value1 = service_checkpoints.sessions.live_count() as u64;
-            Ok(())
-        }
-        COMMERCIAL_MAX_ROOTD_OP_SESSION_ACCOUNT_RELEASE => {
-            if request.arg0 == 0
+        COMMERCIAL_MAX_ROOTD_OP_SESSION_ACCOUNT_CHARGE
+        | COMMERCIAL_MAX_ROOTD_OP_SESSION_ACCOUNT_RELEASE => {
+            use rustos_component_model::client_session_wire::{
+                self, CHARGE, RELEASE,
+            };
+            // There is no scalar fallback; old callers sending arg0/arg1
+            // instead of a generated-IDL canonical frame are rejected.
+            if request.arg0 != 0
                 || request.arg1 != 0
                 || request.arg2 != 0
                 || request.arg3 != 0
                 || request.path_len != 0
-                || request.payload_len != 0
+            {
+                return Err(22);
+            }
+            let control = client_session_wire::decode_request(
+                &request.payload[..request.payload_len as usize],
+            ).map_err(|_| 22)?;
+            if (request.header.op == COMMERCIAL_MAX_ROOTD_OP_SESSION_ACCOUNT_CHARGE
+                    && control.operation != CHARGE)
+                || (request.header.op == COMMERCIAL_MAX_ROOTD_OP_SESSION_ACCOUNT_RELEASE
+                    && control.operation != RELEASE)
             {
                 return Err(22);
             }
@@ -1187,14 +1175,36 @@ fn fill_commercial_max_response(
             )?;
             service_checkpoints.sessions.bind_owner(
                 sender.pid,
-                |job| jobs::release_client_session(job).map(|_| ()).map_err(|e| e as i32),
+                |job| jobs::release_client_session(job)
+                    .map(|_| ())
+                    .map_err(|err| err as i32),
             )?;
-            let job_id = service_checkpoints.sessions.release_trusted(
-                request.arg0,
-                |job| jobs::release_client_session(job).map(|_| ()).map_err(|e| e as i32),
-            )?;
-            response.value0 = job_id;
-            response.value1 = service_checkpoints.sessions.live_count() as u64;
+            let job_id = if control.operation == CHARGE {
+                service_checkpoints.sessions.charge(
+                    control.token,
+                    control.client_pid,
+                    |pid| jobs::process_job(pid).map_err(|err| err as i32),
+                    |pid, job| jobs::charge_client_session(pid, job)
+                        .map(|_| ())
+                        .map_err(|err| err as i32),
+                )?
+            } else {
+                service_checkpoints.sessions.release_trusted(
+                    control.token,
+                    |job| jobs::release_client_session(job)
+                        .map(|_| ())
+                        .map_err(|err| err as i32),
+                )?
+            };
+            let canonical = client_session_wire::encode_ack(control, job_id)
+                .map_err(|_| 12)?;
+            if canonical.len() > response.payload.len() {
+                return Err(75);
+            }
+            response.payload[..canonical.len()].copy_from_slice(&canonical);
+            response.payload_len = canonical.len() as u32;
+            response.value0 = 0;
+            response.value1 = 0;
             Ok(())
         }
         COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_MUTATE => {
