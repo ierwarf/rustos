@@ -8,5 +8,6 @@ publish = false
 observability-client = { path = "../../libs/observability-client" }
 libc = "0.2"
 runtime-control = { path = "../../libs/runtime-control" }
+rustos-component-model = { path = "../../libs/rustos-component-model" }
 rustos-svc-runtime = { path = "../../libs/rustos-svc-runtime" }
 rustos-user-abi = { path = "../../libs/rustos-user-abi" }
