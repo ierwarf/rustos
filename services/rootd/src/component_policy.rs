@@ -192,6 +192,38 @@ pub(super) fn bootstrap_route_allowed(subject: u64, target: u64) -> bool {
             .is_some_and(|spec| spec.dependency_mask & bit != 0)
 }
 
+/// A live service principal is exactly one PID, and a post-init service
+/// cannot use its reporter's PID as its own. This predicate is evaluated only
+/// on the authenticated deferred-spawn registration path; it does not insert
+/// any IPC into service calls or syscall hot paths.
+///
+/// An exited lease is not live authority: a recycled PID can be admitted
+/// after that process's old identity has been retired by rootd. A request for
+/// the *same* service and live PID is handled separately as an idempotent
+/// replay by the rootd lease owner, without changing the reporter.
+pub(super) fn admit_unique_live_service_pid(
+    core: &[super::Lease],
+    post_init: &[super::PostInitLease],
+    service_id: u64,
+    candidate_pid: u64,
+    reporter_pid: u64,
+) -> bool {
+    if candidate_pid == 0 || candidate_pid == reporter_pid {
+        return false;
+    }
+    if core
+        .iter()
+        .any(|lease| lease.pid == candidate_pid && lease.state == super::ROOTD_LEASE_STATE_RUNNING)
+    {
+        return false;
+    }
+    !post_init.iter().any(|lease| {
+        lease.service_id != service_id
+            && lease.pid == candidate_pid
+            && lease.state == super::ROOTD_LEASE_STATE_RUNNING
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
