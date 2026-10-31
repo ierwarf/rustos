@@ -99,23 +99,23 @@ impl ServiceCheckpointStore {
             }
         }
 
-        if incoming.flags & SERVICE_CHECKPOINT_FLAG_TOMBSTONE != 0 {
-            // Preflight the complete descendant closure before publishing the
-            // parent tombstone. Every revision must be incrementable; no
-            // partial subtree revocation can escape after an overflow.
-            let root_key = (incoming.key_hi, incoming.key_lo);
-            for index in 0..self.records.len() {
-                if self.is_descendant(service_id, index, root_key)?
+        // A single fallible, parent-before-child pass computes a bounded
+        // descendant bitmap. Reuse that exact snapshot both for the revision
+        // preflight and for the final commit, never re-traverse the changed
+        // tree after publishing the parent tombstone.
+        let descendants = if incoming.flags & SERVICE_CHECKPOINT_FLAG_TOMBSTONE != 0 {
+            let mask = self.descendant_mask(service_id, (incoming.key_hi, incoming.key_lo))?;
+            for (index, &selected) in mask.iter().enumerate() {
+                if selected
                     && self.records[index].wire.flags & SERVICE_CHECKPOINT_FLAG_TOMBSTONE == 0
                 {
-                    self.records[index]
-                        .wire
-                        .revision
-                        .checked_add(1)
-                        .ok_or(ESTALE)?;
+                    self.records[index].wire.revision.checked_add(1).ok_or(ESTALE)?;
                 }
             }
-        }
+            Some(mask)
+        } else {
+            None
+        };
 
         match existing_index {
             Some(index) => self.records[index].wire = incoming,
@@ -130,15 +130,9 @@ impl ServiceCheckpointStore {
             }
         }
 
-        if incoming.flags & SERVICE_CHECKPOINT_FLAG_TOMBSTONE != 0 {
-            let root_key = (incoming.key_hi, incoming.key_lo);
-            for index in 0..self.records.len() {
-                // All parent links were proven acyclic by key-uniqueness and
-                // parent-before-child admission. The first pass above
-                // checked every revision and ancestral reference.
-                if self.is_descendant(service_id, index, root_key)?
-                    && self.records[index].wire.flags & SERVICE_CHECKPOINT_FLAG_TOMBSTONE == 0
-                {
+        if let Some(descendants) = descendants {
+            for (index, selected) in descendants.into_iter().enumerate() {
+                if selected && self.records[index].wire.flags & SERVICE_CHECKPOINT_FLAG_TOMBSTONE == 0 {
                     let child = &mut self.records[index].wire;
                     child.flags = SERVICE_CHECKPOINT_FLAG_TOMBSTONE;
                     child.value_len = 0;
@@ -200,17 +194,12 @@ impl ServiceCheckpointStore {
         // Collect the exact subtree as a stable per-record bitmap *before*
         // mutating the ledger. The allocation can fail without consuming the
         // proof or removing any other service's records.
-        let mut remove = Vec::new();
-        remove
-            .try_reserve_exact(self.records.len())
-            .map_err(|_| ENOMEM)?;
-        let root_key = (proof.key_hi, proof.key_lo);
-        for i in 0..self.records.len() {
-            let selected = i == index || self.is_descendant(service_id, i, root_key)?;
-            if selected && self.records[i].wire.flags & SERVICE_CHECKPOINT_FLAG_TOMBSTONE == 0 {
+        let mut remove = self.descendant_mask(service_id, (proof.key_hi, proof.key_lo))?;
+        for (i, selected) in remove.iter_mut().enumerate() {
+            *selected |= i == index;
+            if *selected && self.records[i].wire.flags & SERVICE_CHECKPOINT_FLAG_TOMBSTONE == 0 {
                 return Err(ESTALE);
             }
-            remove.push(selected);
         }
         let mut cursor = 0;
         self.records.retain(|_| {
@@ -234,33 +223,38 @@ impl ServiceCheckpointStore {
     /// A bounded ancestry walk, without recursion, heap allocation or a
     /// kernel call. The caller uses it only for slow checkpoint mutation and
     /// compaction, never for IPC transport or scheduler hot paths.
-    fn is_descendant(
+    /// Parent-before-child insertion is the index invariant. This one-pass
+    /// closure is bounded by service checkpoint count; unlike repeated
+    /// ancestry searches it cannot explode with pathological tree depth.
+    /// The bitmap is allocated before any state mutation and recycled by
+    /// the caller for either revocation or compaction.
+    fn descendant_mask(
         &self,
         service_id: u64,
-        index: usize,
         ancestor_key: (u64, u64),
-    ) -> Result<bool, i32> {
-        let record = self.records.get(index).ok_or(ESTALE)?;
-        if record.service_id != service_id {
-            return Ok(false);
-        }
-        let mut parent = (record.wire.parent_hi, record.wire.parent_lo);
-        for _ in 0..self.records.len() {
-            if parent == (0, 0) {
-                return Ok(false);
+    ) -> Result<Vec<bool>, i32> {
+        let mut descendants = Vec::new();
+        descendants.try_reserve_exact(self.records.len()).map_err(|_| ENOMEM)?;
+        for (index, record) in self.records.iter().enumerate() {
+            if record.service_id != service_id {
+                descendants.push(false);
+                continue;
             }
-            if parent == ancestor_key {
-                return Ok(true);
-            }
-            let id = self
-                .find_key(service_id, parent.0, parent.1)
-                .ok_or(ESTALE)?;
-            parent = (
-                self.records[id].wire.parent_hi,
-                self.records[id].wire.parent_lo,
-            );
+            let parent = (record.wire.parent_hi, record.wire.parent_lo);
+            let selected = if parent == (0, 0) {
+                false
+            } else if parent == ancestor_key {
+                true
+            } else {
+                let parent_index = self.find_key(service_id, parent.0, parent.1).ok_or(ESTALE)?;
+                if parent_index >= index {
+                    return Err(EPROTO);
+                }
+                descendants[parent_index]
+            };
+            descendants.push(selected);
         }
-        Err(EPROTO)
+        Ok(descendants)
     }
 
     fn find(
@@ -435,6 +429,29 @@ mod tests {
         assert_eq!(store.scan(7, 0, 20).unwrap().0, vec![sibling]);
         assert_eq!(store.scan(8, 0, 20).unwrap().0, vec![foreign]);
         assert_eq!(store.compact(7, tombstone), Ok(true));
+    }
+
+    #[test]
+    fn deep_tree_compaction_is_bounded_and_preserves_foreign_service() {
+        let mut store = ServiceCheckpointStore::new();
+        let root = record((5, 1), (0, 0), 1, 10);
+        store.mutate(1, root).unwrap();
+        for n in 2..=128 {
+            store.mutate(1, record((5, n), (5, n - 1), 1, 10 + n)).unwrap();
+        }
+        let other = record((8, 8), (0, 0), 1, 8);
+        store.mutate(2, other).unwrap();
+        let mut tombstone = root;
+        tombstone.revision = 2;
+        tombstone.operation_lo = 999;
+        tombstone.flags = SERVICE_CHECKPOINT_FLAG_TOMBSTONE;
+        tombstone.value_len = 0;
+        tombstone.value.fill(0);
+        store.mutate(1, tombstone).unwrap();
+        assert_eq!(store.scan(1, 0, 300).unwrap().0.len(), 128);
+        assert_eq!(store.compact(1, tombstone), Ok(false));
+        assert_eq!(store.scan(1, 0, 300).unwrap().0.len(), 0);
+        assert_eq!(store.scan(2, 0, 300).unwrap().0, vec![other]);
     }
 
     #[test]
