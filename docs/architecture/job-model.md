@@ -948,3 +948,16 @@ Rootd owns replay and timeout cancellation; runtimed charges suspended
 clients before activation, and provider exit reclaims the corresponding
 kernel bill. Missing: kernel-object bytes, durable rootd crash recovery,
 other provider session types, and pressure-policy acceptance.
+
+
+### Actual ProcessObject kernel-byte quota (unvalidated source)
+
+The kernel now counts live and unreaped boxed ProcessObject allocations
+using the target kernel's exact size_of ProcessObject. Each ancestor Job's
+process-object kmem budget is checked under the publication lock, and loaderd
+sets a finite application limit through SYS_RUSTOS_JOB_KMEM after querying the
+object size. This only covers the ProcessObject Box; other kernel objects,
+page tables, handles and IPC allocations are still uncharged. Full
+kmem.max_bytes is therefore **not** finished. The signed service upgrade
+and recovery state are likewise only partially wired. See
+[8-stage source ledger](../validation/ring3-8stage-draft-status.md).

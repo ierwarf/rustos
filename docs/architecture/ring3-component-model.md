@@ -202,3 +202,16 @@ IDL binds token, exact client PID, operation, request phase and job ACK.
 The release ACK may carry a zero JobId when a previously unseen token is
 canceled; the charge ACK must return a real JobId. No production validation
 was run on this change.
+
+
+## 2026-10-31 integrated 8-stage draft ledger
+
+The current interconnected source-draft status, including new rights-scoped
+kmem Object Box accounting, generated supervisor health/update controls,
+rootd checkpoint process-crash replay, kernel-owned client-session tokens,
+initd rollback-required launch blocking and remaining completion work is at
+[Ring3 eight-stage Codex draft status](../validation/ring3-8stage-draft-status.md).
+
+This is uncompiled source, not an acceptance claim. Full object-byte charging,
+disk durability, signed-image rollback and final unified descriptor transfer
+remain unfinished.

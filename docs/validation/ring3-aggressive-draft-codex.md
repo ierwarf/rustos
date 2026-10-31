@@ -116,3 +116,17 @@ Codex must check generated descriptor drift, request/ack phase separation,
 zero-JobId cancellation ACKs, wrong operation, mutated token, swapped sender
 PID, truncation, oversized frames, unknown tags and replay across sessiond
 incarnations. Charge/release must still be exactly-once across copyout fault.
+
+
+## Latest continued draft — important additional gates
+
+The [full eight-stage ledger](ring3-8stage-draft-status.md) supersedes stale
+statements above implying every kernel-object byte is unimplemented. A real
+narrow ProcessObject Box kmem dimension now has Job admission enforcement and
+a rights-scoped slow syscall; other allocation classes are still missing.
+Rootd has a kernel-memory checkpoint journal that survives rootd process death,
+but **not power loss**. Rootd and runtimed exchange generated-IDL health; initd
+has sticky rollback-required launch suppression, but **does not restore an
+old image**. Kernel-owned provider/token session accounting survives rootd
+process restarts, but requires fault-injection proof across PID reuse and
+teardown. The full implementation is uncompiled and unbooted.

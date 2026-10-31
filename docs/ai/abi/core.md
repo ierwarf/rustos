@@ -335,3 +335,22 @@ wire schema 519 carries token, exact client PID, operation, Job output and
 request/ack phase. The historical scalar arg0/arg1 request form for these
 operations is retired. Outer supervisor operations 17/18 remain as selectors
 rather than untyped payload formats. All of this is a nonvalidated draft.
+
+
+### Additional draft Job and supervisor management ABIs
+
+- SYS_RUSTOS_JOB_KMEM (0x5255_005e): versioned INSPECT and SET_LIMIT for the
+  exact boxed ProcessObject allocation byte dimension. This is **not** a
+  general kmem allocator ledger yet. Loaderd obtains actual kernel-reported
+  object size before setting application Job limits.
+- SYS_RUSTOS_JOB_SESSION (0x5255_005b), version 2: provider-PID and exact token
+  support; kernel retains token/release watermark and rootd process-crash drain.
+- SYS_RUSTOS_JOB_MEMORY_QOS (0x5255_005c): nonblocking memory.high threshold
+  event and conservative memory.min policy controls.
+- SYS_RUSTOS_CHECKPOINT_JOURNAL (0x5255_005d): rootd-only memory-resident
+  service checkpoint operation journal, survives process death but not reboot.
+- Generated IDL schemas 514/515/519: authenticated heartbeat, update approval
+  and client-billed session control; rootd still has legacy C-shaped envelopes.
+
+Full status and Codex fault-injection handoff:
+[Ring3 eight-stage draft](../../validation/ring3-8stage-draft-status.md).

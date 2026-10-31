@@ -182,3 +182,24 @@ limits and runtime pre-activation billing are now present in source. The
 memory.high/min slow Job QoS syscall and OOM-exclusion policy are also present.
 The remaining 3/4/5/7/8 migrations are not complete, and kernel-byte
 accounting remains missing. No tests were run for this draft.
+
+
+## 2026-10-31 integrated 8-stage draft ledger
+
+The current interconnected source-draft status, including new rights-scoped
+kmem Object Box accounting, generated supervisor health/update controls,
+rootd checkpoint process-crash replay, kernel-owned client-session tokens,
+initd rollback-required launch blocking and remaining completion work is at
+[Ring3 eight-stage Codex draft status](../validation/ring3-8stage-draft-status.md).
+
+This is uncompiled source, not an acceptance claim. Full object-byte charging,
+disk durability, signed-image rollback and final unified descriptor transfer
+remain unfinished.
+
+
+한국어 최신 상태: 2단계에서 실제 ProcessObject Box 메모리 크기에 대한
+Job별 한도 검사가 추가됐지만 전체 커널 객체의 kmem 과금은 아직 미완성입니다.
+3단계의 서비스별 양성 허용 정책, 4단계의 건강 신호·청구 IDL, 5단계의
+공유 매니페스트, 6단계의 커널 소유 과금 토큰, 8단계의 프로세스 재시작
+체크포인트 재생 및 업데이트 상태 관리가 연결됐습니다. 컴파일과 부팅은
+검증하지 않았으며, 저장장치 영속 롤백은 미구현입니다.
