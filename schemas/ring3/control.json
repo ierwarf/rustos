@@ -165,6 +165,36 @@
           "max_len": 64
         }
       ]
+    },
+    {
+      "name": "post_init_lease_snapshot",
+      "opcode": 517,
+      "fields": [
+        {
+          "name": "service",
+          "tag": 1,
+          "type": "u64",
+          "required": true
+        },
+        {
+          "name": "pid",
+          "tag": 2,
+          "type": "u64",
+          "required": true
+        },
+        {
+          "name": "challenge",
+          "tag": 3,
+          "type": "u64",
+          "required": true
+        },
+        {
+          "name": "state",
+          "tag": 4,
+          "type": "u16",
+          "required": true
+        }
+      ]
     }
   ]
 }
