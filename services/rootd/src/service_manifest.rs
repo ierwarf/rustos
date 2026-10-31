@@ -259,17 +259,56 @@ pub(super) struct ServiceRoleSpec {
 }
 
 pub(super) const SERVICE_ROLE_MANIFEST: [ServiceRoleSpec; 13] = [
-    ServiceRoleSpec { service_id: rustos_user_abi::syscall::IPC_SERVICE_LINUX_SYSCALLD, capability: rustos_user_abi::syscall::IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY },
-    ServiceRoleSpec { service_id: rustos_user_abi::syscall::IPC_SERVICE_VFSD, capability: rustos_user_abi::syscall::IPC_SERVICE_CAP_VFS_POLICY },
-    ServiceRoleSpec { service_id: rustos_user_abi::syscall::IPC_SERVICE_NETD, capability: rustos_user_abi::syscall::IPC_SERVICE_CAP_NET_POLICY },
-    ServiceRoleSpec { service_id: rustos_user_abi::syscall::IPC_SERVICE_DEVMGRD, capability: rustos_user_abi::syscall::IPC_SERVICE_CAP_DEVICE_POLICY },
-    ServiceRoleSpec { service_id: rustos_user_abi::syscall::IPC_SERVICE_LOADERD, capability: rustos_user_abi::syscall::IPC_SERVICE_CAP_PROCESS_LOADER },
-    ServiceRoleSpec { service_id: rustos_user_abi::syscall::IPC_SERVICE_STORAGED, capability: rustos_user_abi::syscall::IPC_SERVICE_CAP_STORAGE_POLICY },
-    ServiceRoleSpec { service_id: rustos_user_abi::syscall::IPC_SERVICE_INPUTD, capability: rustos_user_abi::syscall::IPC_SERVICE_CAP_INPUT_POLICY },
-    ServiceRoleSpec { service_id: rustos_user_abi::syscall::IPC_SERVICE_PROCD, capability: rustos_user_abi::syscall::IPC_SERVICE_CAP_PROCESS_POLICY },
-    ServiceRoleSpec { service_id: rustos_user_abi::syscall::IPC_SERVICE_ROOTD, capability: rustos_user_abi::syscall::IPC_SERVICE_CAP_ROOT_SUPERVISOR },
-    ServiceRoleSpec { service_id: rustos_user_abi::syscall::IPC_SERVICE_SESSIOND, capability: rustos_user_abi::syscall::IPC_SERVICE_CAP_SESSION_POLICY },
-    ServiceRoleSpec { service_id: rustos_user_abi::syscall::IPC_SERVICE_PAGERD, capability: rustos_user_abi::syscall::IPC_SERVICE_CAP_PAGER_POLICY },
-    ServiceRoleSpec { service_id: rustos_user_abi::syscall::IPC_SERVICE_UISERVER, capability: rustos_user_abi::syscall::IPC_SERVICE_CAP_UI_POLICY },
-    ServiceRoleSpec { service_id: rustos_user_abi::syscall::IPC_SERVICE_INITD, capability: rustos_user_abi::syscall::IPC_SERVICE_CAP_INIT_POLICY },
+    ServiceRoleSpec {
+        service_id: rustos_user_abi::syscall::IPC_SERVICE_LINUX_SYSCALLD,
+        capability: rustos_user_abi::syscall::IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY,
+    },
+    ServiceRoleSpec {
+        service_id: rustos_user_abi::syscall::IPC_SERVICE_VFSD,
+        capability: rustos_user_abi::syscall::IPC_SERVICE_CAP_VFS_POLICY,
+    },
+    ServiceRoleSpec {
+        service_id: rustos_user_abi::syscall::IPC_SERVICE_NETD,
+        capability: rustos_user_abi::syscall::IPC_SERVICE_CAP_NET_POLICY,
+    },
+    ServiceRoleSpec {
+        service_id: rustos_user_abi::syscall::IPC_SERVICE_DEVMGRD,
+        capability: rustos_user_abi::syscall::IPC_SERVICE_CAP_DEVICE_POLICY,
+    },
+    ServiceRoleSpec {
+        service_id: rustos_user_abi::syscall::IPC_SERVICE_LOADERD,
+        capability: rustos_user_abi::syscall::IPC_SERVICE_CAP_PROCESS_LOADER,
+    },
+    ServiceRoleSpec {
+        service_id: rustos_user_abi::syscall::IPC_SERVICE_STORAGED,
+        capability: rustos_user_abi::syscall::IPC_SERVICE_CAP_STORAGE_POLICY,
+    },
+    ServiceRoleSpec {
+        service_id: rustos_user_abi::syscall::IPC_SERVICE_INPUTD,
+        capability: rustos_user_abi::syscall::IPC_SERVICE_CAP_INPUT_POLICY,
+    },
+    ServiceRoleSpec {
+        service_id: rustos_user_abi::syscall::IPC_SERVICE_PROCD,
+        capability: rustos_user_abi::syscall::IPC_SERVICE_CAP_PROCESS_POLICY,
+    },
+    ServiceRoleSpec {
+        service_id: rustos_user_abi::syscall::IPC_SERVICE_ROOTD,
+        capability: rustos_user_abi::syscall::IPC_SERVICE_CAP_ROOT_SUPERVISOR,
+    },
+    ServiceRoleSpec {
+        service_id: rustos_user_abi::syscall::IPC_SERVICE_SESSIOND,
+        capability: rustos_user_abi::syscall::IPC_SERVICE_CAP_SESSION_POLICY,
+    },
+    ServiceRoleSpec {
+        service_id: rustos_user_abi::syscall::IPC_SERVICE_PAGERD,
+        capability: rustos_user_abi::syscall::IPC_SERVICE_CAP_PAGER_POLICY,
+    },
+    ServiceRoleSpec {
+        service_id: rustos_user_abi::syscall::IPC_SERVICE_UISERVER,
+        capability: rustos_user_abi::syscall::IPC_SERVICE_CAP_UI_POLICY,
+    },
+    ServiceRoleSpec {
+        service_id: rustos_user_abi::syscall::IPC_SERVICE_INITD,
+        capability: rustos_user_abi::syscall::IPC_SERVICE_CAP_INIT_POLICY,
+    },
 ];
