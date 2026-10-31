@@ -231,6 +231,43 @@ pub const POST_INIT_LEASE_RECLAIM: Schema<'static> = Schema {
     fields: &POST_INIT_LEASE_RECLAIM_FIELDS,
 };
 
+pub const CLIENT_JOB_SESSION_ACCOUNTING_FIELDS: [FieldSpec; 5] = [
+    FieldSpec {
+        tag: 1,
+        kind: FieldKind::U64,
+        required: true,
+        max_len: 8,
+    },
+    FieldSpec {
+        tag: 2,
+        kind: FieldKind::U64,
+        required: true,
+        max_len: 8,
+    },
+    FieldSpec {
+        tag: 3,
+        kind: FieldKind::U16,
+        required: true,
+        max_len: 2,
+    },
+    FieldSpec {
+        tag: 4,
+        kind: FieldKind::U64,
+        required: true,
+        max_len: 8,
+    },
+    FieldSpec {
+        tag: 5,
+        kind: FieldKind::U16,
+        required: true,
+        max_len: 2,
+    },
+];
+pub const CLIENT_JOB_SESSION_ACCOUNTING: Schema<'static> = Schema {
+    opcode: 519,
+    fields: &CLIENT_JOB_SESSION_ACCOUNTING_FIELDS,
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -245,6 +282,7 @@ mod tests {
             CHECKPOINT_STATE,
             POST_INIT_LEASE_SNAPSHOT,
             POST_INIT_LEASE_RECLAIM,
+            CLIENT_JOB_SESSION_ACCOUNTING,
         ] {
             assert!(schema.validate().is_ok());
         }

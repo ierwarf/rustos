@@ -225,6 +225,42 @@
           "required": true
         }
       ]
+    },
+    {
+      "name": "client_job_session_accounting",
+      "opcode": 519,
+      "fields": [
+        {
+          "name": "token",
+          "tag": 1,
+          "type": "u64",
+          "required": true
+        },
+        {
+          "name": "client_pid",
+          "tag": 2,
+          "type": "u64",
+          "required": true
+        },
+        {
+          "name": "operation",
+          "tag": 3,
+          "type": "u16",
+          "required": true
+        },
+        {
+          "name": "job",
+          "tag": 4,
+          "type": "u64",
+          "required": true
+        },
+        {
+          "name": "phase",
+          "tag": 5,
+          "type": "u16",
+          "required": true
+        }
+      ]
     }
   ]
 }
