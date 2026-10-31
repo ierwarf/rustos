@@ -7,7 +7,7 @@
 
 use crate::identity::{ComponentId, Moniker};
 use crate::quota::Charge;
-use crate::realm::{ChargeTicket, Graph};
+use crate::realm::{ChargeTicket, Graph, GraphError};
 use crate::routing::CapabilityError;
 use alloc::vec::Vec;
 

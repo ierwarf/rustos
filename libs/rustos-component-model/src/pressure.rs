@@ -6,7 +6,7 @@
 //! In particular memory.min is protection preference, not an extra allocation.
 
 use crate::identity::ComponentId;
-use crate::realm::{ComponentState, Graph, GraphError};
+use crate::realm::{ComponentState, Graph};
 use alloc::vec::Vec;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
