@@ -41,3 +41,5 @@ jobs:
         run: cargo test -p rustos-component-model --locked
       - name: Run rootd unit tests
         run: cargo test -p rootd --features host-test --locked
+      - name: Check full RustOS build graph
+        run: cargo xtask check
