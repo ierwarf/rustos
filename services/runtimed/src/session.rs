@@ -129,6 +129,13 @@ pub(crate) struct SessionRuntime {
     last_advance: Option<Instant>,
 }
 
+/// The graph token is never permitted to wrap and collide with a waiter
+/// holding an older observation. The policy calculation is separately
+/// testable without invoking a production fail-closed panic.
+fn checked_next_graph_generation(current: u64) -> Option<u64> {
+    current.checked_add(1)
+}
+
 impl Default for SessionRuntime {
     fn default() -> Self {
         Self {
@@ -195,9 +202,7 @@ impl SessionRuntime {
     fn advance_graph_generation(&mut self) {
         // Reusing an observable graph token could make old compositor waiters
         // appear current after wraparound. Exhaustion must fail closed.
-        self.output_generation = self
-            .output_generation
-            .checked_add(1)
+        self.output_generation = checked_next_graph_generation(self.output_generation)
             .expect("sessiond console graph generation exhausted");
         self.last_advance = Some(Instant::now());
         GRAPH_ADVANCES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -2098,11 +2103,16 @@ mod tests {
     /// render loop each time, and never reached its idle wait - a spin whose
     /// traffic lands on the same endpoint that carries shell keystrokes.
     #[test]
-    #[should_panic(expected = "sessiond console graph generation exhausted")]
     fn graph_generation_exhaustion_refuses_reused_compositor_token() {
         let mut state = SessionRuntime::default();
-        state.output_generation = u64::MAX;
+        state.output_generation = u64::MAX - 1;
+        assert_eq!(
+            checked_next_graph_generation(state.output_generation),
+            Some(u64::MAX)
+        );
         state.advance_graph_generation();
+        assert_eq!(state.graph_generation(), u64::MAX);
+        assert_eq!(checked_next_graph_generation(state.graph_generation()), None);
     }
 
     #[test]
