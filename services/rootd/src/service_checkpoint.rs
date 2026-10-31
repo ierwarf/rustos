@@ -109,7 +109,11 @@ impl ServiceCheckpointStore {
                 if selected
                     && self.records[index].wire.flags & SERVICE_CHECKPOINT_FLAG_TOMBSTONE == 0
                 {
-                    self.records[index].wire.revision.checked_add(1).ok_or(ESTALE)?;
+                    self.records[index]
+                        .wire
+                        .revision
+                        .checked_add(1)
+                        .ok_or(ESTALE)?;
                 }
             }
             Some(mask)
@@ -132,7 +136,9 @@ impl ServiceCheckpointStore {
 
         if let Some(descendants) = descendants {
             for (index, selected) in descendants.into_iter().enumerate() {
-                if selected && self.records[index].wire.flags & SERVICE_CHECKPOINT_FLAG_TOMBSTONE == 0 {
+                if selected
+                    && self.records[index].wire.flags & SERVICE_CHECKPOINT_FLAG_TOMBSTONE == 0
+                {
                     let child = &mut self.records[index].wire;
                     child.flags = SERVICE_CHECKPOINT_FLAG_TOMBSTONE;
                     child.value_len = 0;
@@ -228,13 +234,11 @@ impl ServiceCheckpointStore {
     /// ancestry searches it cannot explode with pathological tree depth.
     /// The bitmap is allocated before any state mutation and recycled by
     /// the caller for either revocation or compaction.
-    fn descendant_mask(
-        &self,
-        service_id: u64,
-        ancestor_key: (u64, u64),
-    ) -> Result<Vec<bool>, i32> {
+    fn descendant_mask(&self, service_id: u64, ancestor_key: (u64, u64)) -> Result<Vec<bool>, i32> {
         let mut descendants = Vec::new();
-        descendants.try_reserve_exact(self.records.len()).map_err(|_| ENOMEM)?;
+        descendants
+            .try_reserve_exact(self.records.len())
+            .map_err(|_| ENOMEM)?;
         for (index, record) in self.records.iter().enumerate() {
             if record.service_id != service_id {
                 descendants.push(false);
@@ -246,7 +250,9 @@ impl ServiceCheckpointStore {
             } else if parent == ancestor_key {
                 true
             } else {
-                let parent_index = self.find_key(service_id, parent.0, parent.1).ok_or(ESTALE)?;
+                let parent_index = self
+                    .find_key(service_id, parent.0, parent.1)
+                    .ok_or(ESTALE)?;
                 if parent_index >= index {
                     return Err(EPROTO);
                 }
@@ -437,7 +443,9 @@ mod tests {
         let root = record((5, 1), (0, 0), 1, 10);
         store.mutate(1, root).unwrap();
         for n in 2..=128 {
-            store.mutate(1, record((5, n), (5, n - 1), 1, 10 + n)).unwrap();
+            store
+                .mutate(1, record((5, n), (5, n - 1), 1, 10 + n))
+                .unwrap();
         }
         let other = record((8, 8), (0, 0), 1, 8);
         store.mutate(2, other).unwrap();
