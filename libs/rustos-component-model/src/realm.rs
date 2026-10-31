@@ -222,7 +222,11 @@ impl Graph {
             }
             current = component.parent;
         }
-        if current.is_none() { Ok(()) } else { Err(GraphError::InvalidParent) }
+        if current.is_none() {
+            Ok(())
+        } else {
+            Err(GraphError::InvalidParent)
+        }
     }
 
     pub fn is_within(&self, id: ComponentId, ancestor: ComponentId) -> bool {
@@ -396,7 +400,9 @@ impl Graph {
     }
 
     pub fn permits(&self, id: ComponentId, op: Operation) -> bool {
-        if self.require_running_chain(id).is_err() { return false; }
+        if self.require_running_chain(id).is_err() {
+            return false;
+        }
         self.effective_ceiling(id)
             .map_or(false, |mask| mask.permits(op))
     }
