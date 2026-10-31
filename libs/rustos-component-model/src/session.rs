@@ -106,7 +106,10 @@ impl Sessions {
         let client_incarnation = graph.inspect(client)?.incarnation;
         let provider_incarnation = graph.inspect(provider)?.incarnation;
         // Exhausted generations are retired, not candidates for reuse.
-        let vacant = self.slots.iter().position(|s| s.item.is_none() && s.generation != u32::MAX);
+        let vacant = self
+            .slots
+            .iter()
+            .position(|s| s.item.is_none() && s.generation != u32::MAX);
         if vacant.is_none() && self.slots.len() >= self.capacity {
             return Err(SessionError::Full);
         }
@@ -433,32 +436,56 @@ mod tests {
     #[test]
     fn exhausted_generation_refunds_and_retires_slot_without_aba() {
         let mut g = Graph::new(Moniker::new("root").unwrap(), 1, 4).unwrap();
-        let client = g.create(
-            g.root(), Moniker::new("client").unwrap(), 2,
-            JobCeiling::ALL, Quota::UNLIMITED, RestartPolicy::NEVER, false,
-        ).unwrap();
-        let provider = g.create(
-            g.root(), Moniker::new("provider").unwrap(), 3,
-            JobCeiling::ALL, Quota::UNLIMITED, RestartPolicy::NEVER, false,
-        ).unwrap();
+        let client = g
+            .create(
+                g.root(),
+                Moniker::new("client").unwrap(),
+                2,
+                JobCeiling::ALL,
+                Quota::UNLIMITED,
+                RestartPolicy::NEVER,
+                false,
+            )
+            .unwrap();
+        let provider = g
+            .create(
+                g.root(),
+                Moniker::new("provider").unwrap(),
+                3,
+                JobCeiling::ALL,
+                Quota::UNLIMITED,
+                RestartPolicy::NEVER,
+                false,
+            )
+            .unwrap();
         g.activate(client).unwrap();
         g.activate(provider).unwrap();
         let cap = Moniker::new("fs").unwrap();
         g.publish(provider, cap, 1).unwrap();
         g.offer(provider, client, cap, 1).unwrap();
-        let cost = Charge { sessions: 1, ..Charge::ZERO };
+        let cost = Charge {
+            sessions: 1,
+            ..Charge::ZERO
+        };
         let mut sessions = Sessions::new(2).unwrap();
-        let id = sessions.open(&mut g, client, provider, cap, cost, 1, 100).unwrap();
+        let id = sessions
+            .open(&mut g, client, provider, cap, cost, 1, 100)
+            .unwrap();
         // Simulate the last allowed incarnation without billions of opens.
         sessions.slots[0].generation = u32::MAX;
         sessions.slots[0].item.as_mut().unwrap().view.id.generation = u32::MAX;
-        let last_id = SessionId { slot: 0, generation: u32::MAX };
+        let last_id = SessionId {
+            slot: 0,
+            generation: u32::MAX,
+        };
         assert!(sessions.inspect(&g, last_id, 2).is_ok());
         sessions.close(&mut g, last_id).unwrap();
         assert_eq!(g.inspect(client).unwrap().used.sessions, 0);
         assert_eq!(sessions.live_count(), 0);
         assert_eq!(sessions.close(&mut g, last_id), Err(SessionError::Missing));
-        let next = sessions.open(&mut g, client, provider, cap, cost, 3, 100).unwrap();
+        let next = sessions
+            .open(&mut g, client, provider, cap, cost, 3, 100)
+            .unwrap();
         assert_eq!(next.slot, 1);
         assert_ne!(next, id);
         assert_eq!(sessions.slots[0].generation, u32::MAX);
