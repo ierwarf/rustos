@@ -23,10 +23,12 @@ jobs:
         run: python3 tools/ring3_idl_codegen.py --check
       - name: Format recovery checkpoint source
         run: rustfmt --edition 2021 services/rootd/src/service_checkpoint.rs
+          rustfmt --edition 2021 services/rootd/src/service_manifest.rs
+          rustfmt --edition 2021 services/rootd/src/component_policy.rs
       - name: Publish isolated recovery formatting
         if: github.ref == 'refs/heads/ring3-recovery-graph-hardening'
         run: |
-          git add services/rootd/src/service_checkpoint.rs
+          git add services/rootd/src/service_checkpoint.rs services/rootd/src/service_manifest.rs services/rootd/src/component_policy.rs
           if ! git diff --cached --quiet; then
             git config user.name "rustos-ring3-checks[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
@@ -35,6 +37,8 @@ jobs:
           fi
       - name: Verify checkpoint formatting
         run: rustfmt --edition 2021 --check services/rootd/src/service_checkpoint.rs
+          rustfmt --edition 2021 --check services/rootd/src/service_manifest.rs
+          rustfmt --edition 2021 --check services/rootd/src/component_policy.rs
       - name: Check component formatting
         run: |
           cargo fmt -p rustos-component-model -- --check
