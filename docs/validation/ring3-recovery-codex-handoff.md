@@ -180,3 +180,11 @@ Test: PID recycling between lookup/admission, rootd restart, sessiond crash,
 refund IPC timeout, wrong reporter, duplicate token, multiple descendant Jobs,
 limit tightening, session flood, KVM 1/8 vCPU and launch-worker ACK timeout.
 The generic netd/vfsd session path and durable restart journal remain TODO.
+
+## Lifecycle settlement and worker fallback retirement
+
+Check exact sessiond PID match during rootd lifecycle drain; refund all outstanding
+client sessions on exit, check that a second exit is idempotent, and that a new
+instance may restart its token namespace at one. Loaderd sets per-application
+session ceilings on the same child handle as its other Job limits. The old
+runtimed launch-worker-absent inline fallback is intentionally retired.

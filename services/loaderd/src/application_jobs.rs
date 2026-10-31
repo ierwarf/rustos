@@ -46,7 +46,32 @@ impl Jobs for NativeJobs {
         let status = unsafe {
             rustos_svc_runtime::syscall::syscall1(SYS_RUSTOS_JOB, &mut args as *mut _ as u64)
         };
-        if status < 0 { Err((-status) as i32) } else { Ok(args) }
+        if status < 0 {
+            return Err((-status) as i32);
+        }
+        if args.op == JOB_OP_SET_LIMITS {
+            // Runtime application Jobs receive a finite client-funded session
+            // ceiling at the same preparation boundary as process and page
+            // limits. This is the live enforcement path, not only a model.
+            let budget = args.limit_processes.saturating_mul(4).clamp(1, 64);
+            let mut sessions = RustosJobSessionArgs {
+                abi_version: JOB_SESSION_ABI_VERSION,
+                op: JOB_SESSION_OP_SET_LIMIT,
+                job_handle: args.job_handle,
+                limit: budget,
+                ..RustosJobSessionArgs::default()
+            };
+            let admission = unsafe {
+                rustos_svc_runtime::syscall::syscall1(
+                    SYS_RUSTOS_JOB_SESSION,
+                    &mut sessions as *mut _ as u64,
+                )
+            };
+            if admission < 0 {
+                return Err((-admission) as i32);
+            }
+        }
+        Ok(args)
     }
     fn close(&mut self, handle: u64) {
         // SAFETY: close has no user pointers and consumes this owned descriptor.

@@ -254,7 +254,7 @@ pub extern "C" fn __rustos_rootd_start() -> ! {
 
     debug_line(b"rootd: core services spawned, waiting for readiness\n");
     while !service_dependencies_ready(INITD_LEASE_INDEX) {
-        drain_lifecycle_events(&mut leases, &mut post_init_leases);
+        drain_lifecycle_events(&mut leases, &mut post_init_leases, &mut service_checkpoints);
         let served = control_drain::drain_rootd_control_requests(|| {
             serve_rootd_once(
                 endpoint,
@@ -346,7 +346,7 @@ pub extern "C" fn __rustos_rootd_start() -> ! {
     let mut memory_governor = memory_governor::MemoryGovernor::new();
     let mut application_limit_probe = application_limit_probe::Probe::default();
     loop {
-        drain_lifecycle_events(&mut leases, &mut post_init_leases);
+        drain_lifecycle_events(&mut leases, &mut post_init_leases, &mut service_checkpoints);
         // Keep post-init control draining bounded by `control_drain` too.
         let _ = control_drain::drain_rootd_control_requests(|| {
             serve_rootd_once(
@@ -546,7 +546,7 @@ fn spawn_initd_via_loaderd(
                 if attempts <= 8 || attempts.is_power_of_two() {
                     debug_line(b"rootd: initd loader spawn retry\n");
                 }
-                drain_lifecycle_events(leases, post_init_leases);
+                drain_lifecycle_events(leases, post_init_leases, service_checkpoints);
                 serve_rootd_once(
                     endpoint,
                     leases,
@@ -634,7 +634,11 @@ fn service_dependencies_ready(index: usize) -> bool {
         && (mask & DEP_PAGERD == 0 || service_ready(IPC_SERVICE_PAGERD))
 }
 
-fn drain_lifecycle_events(leases: &mut [Lease], post_init_leases: &mut [PostInitLease]) {
+fn drain_lifecycle_events(
+    leases: &mut [Lease],
+    post_init_leases: &mut [PostInitLease],
+    service_checkpoints: &mut ServiceCheckpointStore,
+) {
     let mut events = [LifecycleEventWire::default(); LIFECYCLE_DRAIN_MAX_EVENTS];
     let mut count = 0_u32;
     let args = LifecycleDrainBrokerArgs {
@@ -672,6 +676,19 @@ fn drain_lifecycle_events(leases: &mut [Lease], post_init_leases: &mut [PostInit
             if lease.pid == event.pid {
                 lease.state = ROOTD_LEASE_STATE_EXITED;
                 lease.exit_status = event.exit_status;
+                if lease.service_id == IPC_SERVICE_SESSIOND {
+                    // Sessiond's authority has ended. All outstanding
+                    // client-Job charges are retired immediately, including
+                    // clients whose process-exit notification arrived earlier.
+                    service_checkpoints.sessions.owner_exited(
+                        event.pid,
+                        |job| jobs::release_client_session(job)
+                            .map(|_| ())
+                            .map_err(|err| err as i32),
+                    ).unwrap_or_else(|_| {
+                        fail_closed(b"rootd: fatal sessiond charge settlement failed\n")
+                    });
+                }
                 break;
             }
         }
@@ -2567,7 +2584,7 @@ extern "C" fn loader_supervisor_worker_entry() -> ! {
         let post_init_leases = unsafe { slice::from_raw_parts_mut(post_init_ptr, post_init_len) };
         let service_checkpoints = unsafe { &mut *checkpoints_ptr };
         while LOADER_WORKER_STATE.load(Ordering::Acquire) != LOADER_WORKER_COMPLETE {
-            drain_lifecycle_events(leases, post_init_leases);
+            drain_lifecycle_events(leases, post_init_leases, service_checkpoints);
             serve_rootd_once(
                 endpoint,
                 leases,

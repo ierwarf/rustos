@@ -55,6 +55,23 @@ impl SessionLedger {
         Ok(())
     }
 
+    /// Flush an exited owner on lifecycle evidence, not only on the next
+    /// incoming sessiond instance's first charge. This prevents a crashed
+    /// provider from pinning arbitrary client Jobs until it is restarted.
+    pub(crate) fn owner_exited(
+        &mut self,
+        pid: u64,
+        kernel_release: impl FnMut(u64) -> Result<(), i32>,
+    ) -> Result<(), i32> {
+        if pid == 0 || self.owner_pid != pid {
+            return Ok(());
+        }
+        self.release_all(kernel_release)?;
+        self.owner_pid = 0;
+        self.last_token = 0;
+        Ok(())
+    }
+
     /// No kernel mutation occurs before the inventory is validated and can
     /// hold the new token. Duplicate live requests never double-charge.
     pub(crate) fn charge(
@@ -197,6 +214,22 @@ mod tests {
             Ok(())
         }), Ok(1));
         assert_eq!(book.live_count(), 0);
+    }
+
+    #[test]
+    fn exited_provider_refunds_every_client_token() {
+        let mut book = SessionLedger::new();
+        book.bind_owner(901, |_| Ok(())).unwrap();
+        book.charge(1, 20, |_| Ok(2), |_, _| Ok(())).unwrap();
+        book.charge(2, 21, |_| Ok(3), |_, _| Ok(())).unwrap();
+        let mut retired = alloc::vec::Vec::new();
+        book.owner_exited(777, |_| panic!("foreign exit")).unwrap();
+        assert_eq!(book.live_count(), 2);
+        book.owner_exited(901, |job| { retired.push(job); Ok(()) }).unwrap();
+        assert_eq!(retired, alloc::vec![3, 2]);
+        assert_eq!(book.live_count(), 0);
+        book.bind_owner(902, |_| panic!("already clean")).unwrap();
+        assert_eq!(book.charge(1, 22, |_| Ok(4), |_, _| Ok(())), Ok(4));
     }
 
     #[test]

@@ -172,3 +172,13 @@ transitive descendant revocation and termination as before. The resulting ACK
 must echo the exact service, PID and request challenge; no legacy fallback
 is available. This does **not** implement durable recovery or global session
 billing.
+
+### Client-Job accounting rollout and legacy removal
+
+Loaderd now installs a kernel Job session ceiling alongside every application
+Job's existing process, thread and resident memory limits. Rootd settles every
+client Job charge when a sessiond lifecycle exit is authenticated, not only
+when a replacement sessiond later contacts it. Runtimed's old worker-missing
+inline fallback was removed, so a failed worker does not synchronously block
+the compositor's supervisor control loop. UI bootstrap still owns a separate
+synchronous service-start contract and is not part of this cutover.

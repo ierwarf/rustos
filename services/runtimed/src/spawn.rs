@@ -138,11 +138,11 @@ pub(super) fn begin_tracked_launch(state: &mut BrokerState, entry: LaunchEntry) 
     // depends on it.
     let qualification_contract =
         qualification_contract_for_launch(&entry).map_err(|()| libc::EINVAL)?;
+    // The old inline fallback could block the compositor/control loop behind
+    // loader, VFS or rootd IPC for an entire bootstrap timeout. A missing
+    // worker now fails the launch explicitly; recovery policy owns retry.
     if state.launch_worker.is_none() {
-        // No worker: run the transaction inline rather than not at all. This is
-        // the old behaviour, head-of-line blocking included, and it is reserved
-        // for a broker that could not create a thread.
-        return spawn_tracked_process(state, entry);
+        return Err(libc::EAGAIN);
     }
     boot_line(
         format!(
