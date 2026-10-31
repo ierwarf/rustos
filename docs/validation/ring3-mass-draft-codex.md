@@ -234,3 +234,26 @@ prove that initial registration before exact post-init lease publication
 fails closed but later rebinds, that replay cannot fake three healthy
 trial pulses, and that the 30-second timeout only fires for live leases
 whose first pulse really established an exact incarnation.
+
+## Practical review of the latest source continuation
+
+Authoritative pushed commits after d6507cf: provider Cancel/ACK state machine,
+stable file writer exclusion and replay scanning, std-service heartbeat
+deployment. Intentionally unpushed proposals: generated-IDL 520 live provider
+RPC cutover and process-owned endpoint reserved-queue byte Job quota.
+
+Static and dynamic repair checklist for Codex: build no_std ProviderClient
+and its Charge/Cancel/Release/ACK callsites; verify rootd unknown charge
+copyout retry and exact kernel-token watermark; add an ACK outbox before
+bounded rootd tombstones exhaust; validate release file scan/append cursor
+with intentionally corrupt and out-of-order records; prove advisory locks
+cannot substitute for signed mount/media identity; inspect service worker
+thread budgets before enabling watchdog timeouts; finish generated-IDL
+producer/consumer cutover and reject fixed-frame fallback only when both
+sides are updated atomically. Service health must not run from scheduler,
+IPC, fault, or TLB mechanisms.
+
+Actual signed release swap and reboot resurrection still need boot-trusted
+release signing keys, image byte custody, stable volume selection, verified
+previous-image restoration and rootd/storaged orchestration. A working
+pure codec does not meet any of these obligations.

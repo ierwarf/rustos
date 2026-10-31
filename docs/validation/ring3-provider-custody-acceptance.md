@@ -138,3 +138,13 @@ client/session/Job while ACK-compacting, forged ACK from unrelated
 PID, rootd crash between kernel refund and receipt ACK, PID reuse,
 global kernel provider watermark and 4096-ticket bounds. The new
 unit tests are source only, not executed.
+
+## Current source and remaining billing ownership
+
+ProviderClient now has matching CANCEL state transitions for netd/vfsd, so
+the prior local method references have concrete source implementations.
+However, terminal rootd receipt ACKs are best-effort and dropped after an
+unreliable RPC result. A provider-local replayable ACK outbox is still
+unimplemented. Test long-running close/reopen cycles above 4096 sessions
+and deliberately drop only the terminal receipt ACK (not the kernel refund).
+The generated schema 520 live control RPC replacement remains unmerged.

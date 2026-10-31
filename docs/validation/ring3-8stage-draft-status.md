@@ -345,3 +345,32 @@ sessiond/runtimed health reporting remains in place.
 
 No compilation, boot, tests, benchmark, CI or formal review was run.
 This is source-only functionality and is not an accepted live watchdog.
+
+## 2026-11-01 further source continuation: live outcome
+
+- ProviderClient now authors BEGIN/DISPATCH/SETTLE state transitions for
+  ambiguous provider CANCEL and sends rootd operations 27/28 on the fixed
+  provider wire. These runtime methods are now present rather than unresolved.
+- Storaged release journal now opens under an exclusive advisory writer lock,
+  rejects external truncation/extension and scans the complete replay prefix
+  with canonical checksum, sequence and transaction-order checks. Every
+  appended record is independently decoded and admitted before media write.
+  This is source-level verification, **not** physically attested durable media.
+- Supervisor health workers were added to initd, inputd, devmgrd and uiserver
+  after exact endpoint/identity registration, independently of their request
+  locks. Together with existing netd/storaged/runtimed sources, the std
+  service coverage has grown; freestanding services still need independent
+  workers. No worker behavior was boot-tested.
+- A proposed live IDL-520 conversion did not pass the connected repository
+  commit safety gate and was NOT pushed. The production provider RPC still
+  uses the 112-byte fixed frame; the generated IDL 520 schema remains staged.
+- No ACK-outbox is committed. A lost terminal receipt acknowledgment can
+  still retain rootd's bounded settled ticket indefinitely. Long-running
+  session traffic can exhaust this table; Codex must implement bounded,
+  replayable terminal ACK custody before production acceptance.
+- Ring0 IPC endpoint reserved-queue byte Job charging remains unimplemented.
+  Kernel-per-owner endpoint count quotas already exist, but should not be
+  advertised as hierarchical full-object kmem accounting.
+
+These changes do NOT complete stages 2/3/4/7/8. No build, syntax check,
+boot, fuzz, stress, unit tests, formal proof or audit script was run.
