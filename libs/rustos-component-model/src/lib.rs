@@ -28,6 +28,8 @@ pub mod manifest;
 pub mod service_catalog;
 pub mod policy;
 pub mod policy_ops;
+pub mod personality;
+pub mod restart_transaction;
 pub mod pressure;
 pub mod quota;
 pub mod realm;
