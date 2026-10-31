@@ -71,6 +71,20 @@ regressions in the files above.
 - Validate persistent recovery separately: this checkpoint ledger is
   intentionally *not* durable across rootd process death or power loss.
 
+## Live runtimed console-session admission
+
+Production runtimed now caps the number of live consoles at 256 and refuses
+session-handle wraparound. The handle is reserved only after its session
+buffer has been admitted; a failed attempt leaves both generation and graph
+unchanged, and ordinary child activation is not reached.
+
+Codex should stress 256 live sessions with concurrent close/reopen, asynchronous
+spawn cancellation, deferred-start failure, foreground-focus transitions,
+graph-generation waits and app exit/reaping. Verify neither a leaked console
+session nor a recycled u64 handle can grant stale authority. Confirm
+non-console-hosted launch behavior remains unchanged. This quota is **not**
+client-funded kernel Job memory accounting.
+
 ## Known remaining integration gates
 
 - Kernel-authoritative per-Job kernel-byte and service-session charges.
