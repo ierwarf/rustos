@@ -53,6 +53,9 @@ impl Graph {
         if c.state != ComponentState::Running {
             return Err(CapabilityError::OwnerNotRunning);
         }
+        if self.require_running_chain(owner).is_err() {
+            return Err(CapabilityError::OwnerNotRunning);
+        }
         if rights == 0 {
             return Err(CapabilityError::Denied);
         }
@@ -93,6 +96,11 @@ impl Graph {
             .component(consumer)
             .map_err(|_| CapabilityError::Missing)?;
         if from.state != ComponentState::Running || to.state != ComponentState::Running {
+            return Err(CapabilityError::OwnerNotRunning);
+        }
+        if self.require_running_chain(provider).is_err()
+            || self.require_running_chain(consumer).is_err()
+        {
             return Err(CapabilityError::OwnerNotRunning);
         }
         let from_incarnation = from.incarnation;
@@ -149,6 +157,11 @@ impl Graph {
             .component(consumer)
             .map_err(|_| CapabilityError::Missing)?;
         if from.state != ComponentState::Running || to.state != ComponentState::Running {
+            return Err(CapabilityError::OwnerNotRunning);
+        }
+        if self.require_running_chain(provider).is_err()
+            || self.require_running_chain(consumer).is_err()
+        {
             return Err(CapabilityError::OwnerNotRunning);
         }
         let route = self
