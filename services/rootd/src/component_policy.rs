@@ -10,8 +10,8 @@
 
 use super::service_manifest::INITD_LEASE_ID;
 use super::service_manifest::{
-    BootstrapServiceSpec, PostInitServiceSpec, BOOTSTRAP_MANIFEST, DEP_LOADERD, DEP_PAGERD,
-    DEP_PROCD, DEP_SYSCALLD, DEP_VFSD, POST_INIT_MANIFEST,
+    BootstrapServiceSpec, PostInitServiceSpec, ServiceRouteSpec, BOOTSTRAP_MANIFEST, DEP_LOADERD,
+    DEP_PAGERD, DEP_PROCD, DEP_SYSCALLD, DEP_VFSD, POST_INIT_MANIFEST, SERVICE_ROUTING_MANIFEST,
 };
 use rustos_component_model::Moniker;
 use rustos_user_abi::syscall::{
@@ -34,6 +34,7 @@ pub(super) enum ManifestError {
     UnknownDependency,
     DependencyCycle,
     InvalidScheduling,
+    InvalidRoute,
 }
 
 const ALL_DEPS: u16 = DEP_SYSCALLD | DEP_VFSD | DEP_LOADERD | DEP_PROCD | DEP_PAGERD;
@@ -141,50 +142,73 @@ fn validate(
     Ok(())
 }
 
-pub(super) fn preflight() -> Result<(), ManifestError> {
-    validate(&BOOTSTRAP_MANIFEST, &POST_INIT_MANIFEST)
-}
-
-/// Existing service lookup policy, now colocated with manifest validation.
-/// This remains a pure, allocation-free predicate; rootd's authenticated
-/// sender/lease checks still execute before reaching it.
-pub(super) fn route_allowed(subject: u64, target: u64) -> bool {
-    if bootstrap_route_allowed(subject, target) {
-        return true;
-    }
-    match subject {
-        INITD_LEASE_ID => matches!(
-            target,
-            IPC_SERVICE_NETD
-                | IPC_SERVICE_DEVMGRD
-                | IPC_SERVICE_INPUTD
-                | IPC_SERVICE_STORAGED
-                | IPC_SERVICE_SESSIOND
-        ),
-        IPC_SERVICE_VFSD => matches!(target, IPC_SERVICE_DEVMGRD | IPC_SERVICE_STORAGED),
-        IPC_SERVICE_PROCD => target == IPC_SERVICE_LOADERD,
-        IPC_SERVICE_INPUTD => target == IPC_SERVICE_NETD,
-        IPC_SERVICE_SESSIOND => matches!(
-            target,
-            IPC_SERVICE_LOADERD | IPC_SERVICE_DEVMGRD | IPC_SERVICE_UISERVER
-        ),
-        IPC_SERVICE_UISERVER => target == IPC_SERVICE_INPUTD,
-        IPC_SERVICE_DEVMGRD => {
-            matches!(target, IPC_SERVICE_SESSIOND | IPC_SERVICE_UISERVER)
+/// Validate the complete directed service-capability manifest at boot. The
+/// IDs must be listed in the same authenticated service manifest, routes must
+/// not impersonate self, and a duplicate cannot cause order-dependent grants.
+/// This does *not* issue a kernel capability or replace lease validation.
+fn validate_routes(
+    boot: &[BootstrapServiceSpec],
+    post: &[PostInitServiceSpec],
+    routes: &[ServiceRouteSpec],
+) -> Result<(), ManifestError> {
+    let known = |id: u64| {
+        boot.iter().any(|spec| spec.service_id == id)
+            || post.iter().any(|spec| spec.service_id == id)
+    };
+    for (index, route) in routes.iter().enumerate() {
+        if route.subject == route.target
+            || !known(route.subject)
+            || !known(route.target)
+            || routes[..index].iter().any(|old| old == route)
+        {
+            return Err(ManifestError::InvalidRoute);
         }
-        _ => false,
+        // Duplicate bootstrap grants are not a privilege escalation but may
+        // hide a manifest error; deny a redundant post-init offer as well.
+        let bootstrap_bit = dependency_target_for(route.target);
+        if bootstrap_bit != 0
+            && boot.iter().any(|spec| {
+                spec.service_id == route.subject && spec.dependency_mask & bootstrap_bit != 0
+            })
+        {
+            return Err(ManifestError::InvalidRoute);
+        }
     }
+    Ok(())
 }
 
-pub(super) fn bootstrap_route_allowed(subject: u64, target: u64) -> bool {
-    let bit = match target {
+fn dependency_target_for(service: u64) -> u16 {
+    match service {
         IPC_SERVICE_LINUX_SYSCALLD => DEP_SYSCALLD,
         IPC_SERVICE_VFSD => DEP_VFSD,
         IPC_SERVICE_LOADERD => DEP_LOADERD,
         IPC_SERVICE_PROCD => DEP_PROCD,
         IPC_SERVICE_PAGERD => DEP_PAGERD,
         _ => 0,
-    };
+    }
+}
+
+pub(super) fn preflight() -> Result<(), ManifestError> {
+    validate(&BOOTSTRAP_MANIFEST, &POST_INIT_MANIFEST)?;
+    validate_routes(
+        &BOOTSTRAP_MANIFEST,
+        &POST_INIT_MANIFEST,
+        &SERVICE_ROUTING_MANIFEST,
+    )
+}
+
+/// Existing service lookup policy, now colocated with manifest validation.
+/// This remains a pure, allocation-free predicate; rootd's authenticated
+/// sender/lease checks still execute before reaching it.
+pub(super) fn route_allowed(subject: u64, target: u64) -> bool {
+    bootstrap_route_allowed(subject, target)
+        || SERVICE_ROUTING_MANIFEST
+            .iter()
+            .any(|route| route.subject == subject && route.target == target)
+}
+
+pub(super) fn bootstrap_route_allowed(subject: u64, target: u64) -> bool {
+    let bit = dependency_target_for(target);
     bit != 0
         && BOOTSTRAP_MANIFEST
             .iter()
@@ -227,6 +251,88 @@ pub(super) fn admit_unique_live_service_pid(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn immutable_routing_table_matches_legacy_service_capability_matrix() {
+        // Independent witness for the previous runtime match arms. Ensure
+        // that replacing them with a declarative table changes no authority.
+        fn previous_allowed(subject: u64, target: u64) -> bool {
+            if bootstrap_route_allowed(subject, target) {
+                return true;
+            }
+            match subject {
+                INITD_LEASE_ID => matches!(
+                    target,
+                    IPC_SERVICE_NETD
+                        | IPC_SERVICE_DEVMGRD
+                        | IPC_SERVICE_INPUTD
+                        | IPC_SERVICE_STORAGED
+                        | IPC_SERVICE_SESSIOND
+                ),
+                IPC_SERVICE_VFSD => matches!(target, IPC_SERVICE_DEVMGRD | IPC_SERVICE_STORAGED),
+                IPC_SERVICE_PROCD => target == IPC_SERVICE_LOADERD,
+                IPC_SERVICE_INPUTD => target == IPC_SERVICE_NETD,
+                IPC_SERVICE_SESSIOND => matches!(
+                    target,
+                    IPC_SERVICE_LOADERD | IPC_SERVICE_DEVMGRD | IPC_SERVICE_UISERVER
+                ),
+                IPC_SERVICE_UISERVER => target == IPC_SERVICE_INPUTD,
+                IPC_SERVICE_DEVMGRD => {
+                    matches!(target, IPC_SERVICE_SESSIOND | IPC_SERVICE_UISERVER)
+                }
+                _ => false,
+            }
+        }
+        let known = BOOTSTRAP_MANIFEST
+            .iter()
+            .map(|spec| spec.service_id)
+            .chain(POST_INIT_MANIFEST.iter().map(|spec| spec.service_id));
+        for subject in known.clone().chain([0, u64::MAX]) {
+            for target in known.clone().chain([0, u64::MAX]) {
+                assert_eq!(
+                    route_allowed(subject, target),
+                    previous_allowed(subject, target),
+                    "routing mismatch: subject={subject} target={target}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn route_preflight_rejects_unknown_duplicated_or_self_issued_offers() {
+        assert_eq!(
+            validate_routes(
+                &BOOTSTRAP_MANIFEST,
+                &POST_INIT_MANIFEST,
+                &SERVICE_ROUTING_MANIFEST
+            ),
+            Ok(())
+        );
+        let mut invalid = SERVICE_ROUTING_MANIFEST;
+        invalid[0].target = invalid[0].subject;
+        assert_eq!(
+            validate_routes(&BOOTSTRAP_MANIFEST, &POST_INIT_MANIFEST, &invalid),
+            Err(ManifestError::InvalidRoute)
+        );
+        invalid = SERVICE_ROUTING_MANIFEST;
+        invalid[1] = invalid[0];
+        assert_eq!(
+            validate_routes(&BOOTSTRAP_MANIFEST, &POST_INIT_MANIFEST, &invalid),
+            Err(ManifestError::InvalidRoute)
+        );
+        invalid = SERVICE_ROUTING_MANIFEST;
+        invalid[0].subject = u64::MAX;
+        assert_eq!(
+            validate_routes(&BOOTSTRAP_MANIFEST, &POST_INIT_MANIFEST, &invalid),
+            Err(ManifestError::InvalidRoute)
+        );
+        invalid = SERVICE_ROUTING_MANIFEST;
+        invalid[0].target = u64::MAX;
+        assert_eq!(
+            validate_routes(&BOOTSTRAP_MANIFEST, &POST_INIT_MANIFEST, &invalid),
+            Err(ManifestError::InvalidRoute)
+        );
+    }
 
     #[test]
     fn current_manifest_is_acyclic_and_bounded() {
