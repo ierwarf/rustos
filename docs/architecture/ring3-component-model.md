@@ -46,6 +46,28 @@ library as replacing the existing rootd/Job/IPC authorities.
   until all exports and offers validate; malformed dependency indices
   fail closed. A dedicated nested-realm regression test covers activation,
   capability routing and descendant revocation.
+- `rootd` service-role capabilities are now defined in one
+  `SERVICE_ROLE_MANIFEST` with exactly 13 roles. Bootstrap rejects unknown,
+  duplicate or overlapping service role definitions. Positive capability
+  checks also bind the caller to an unambiguous live lease. Post-init reporter
+  chains must end at the one live `initd` identity and reject duplicated
+  ancestors. Rootd remains the authority: no kernel role or JobPolicy ABI
+  was changed.
+- `ServiceCheckpointStore` now supports nested parent-before-child
+  checkpoint trees. Exact per-service keys cannot be silently reparented,
+  ancestor tombstones mark their **entire descendant closure** atomically,
+  and compaction removes only an exact, already-tombstoned subtree.
+  Per-service storage has a 4096-record cap below the unchanged global
+  32768-record ABI limit. A fallible, bounded bitmap keeps descendant
+  selection independent of nesting depth; the control plane is still
+  in-memory and is not persistent crash storage.
+- The production `runtimed` console-session owner now limits live
+  console sessions to 256, returns ENOSPC on resource saturation, refuses
+  zero handles, and never wraps the externally visible u64 session identity.
+  Both cooperative-worker and inline launch paths admit the console session
+  before creating a child, and only advance the handle after success. This
+  is a Ring3 *local quota*; it does not replace kernel Job charging or make
+  the in-memory policy session ticket kernel-authoritative.
 - `rootd` and the component model have focused host tests; this work
   leaves the live fixed service registry and exact kernel lease owner intact.
 
@@ -55,12 +77,12 @@ library as replacing the existing rootd/Job/IPC authorities.
 | --- | --- | --- |
 | 1. Job lifecycle | Existing ring0 generational Job tree and typed descriptors (unchanged) | Hardware qualification, not reimplementation |
 | 2. Accounting | Existing counted process/thread/user-page limits; new userspace `pressure` model | Authoritative kernel-byte charge, memory.high/min admission/pressure wiring and acceptance |
-| 3. JobPolicy | Existing 256-bit kernel policy ceilings; new typed slow-operation registry | Assign positive subject grants and dual-run cutover of legacy service-capability checks |
+| 3. JobPolicy | Existing 256-bit kernel policy ceilings; typed slow-operation registry and live 13-role rootd authority manifest | Assign positive subject grants and dual-run cutover of legacy service-capability checks |
 | 4. IDL/runtime | Canonical `idl` codec, schema validator/code generator and five generated staging interfaces | Generated production bindings, ABI versioned adapters and live service migrations |
-| 5. Components | New generation-bound Graph; live rootd manifest and 15-offer route validation, full legacy-route equivalence witness, and exact live service PID collision/reporter-chain denial | Declarative activation, named kernel capability transfer and one owning service supervisor |
-| 6. Session budgets | New client-funded session policy with exact-generation tickets, offer-issuance epochs, mandatory one-unit session charging and revoked-route scavenging | Binding service allocation to kernel Job budget and accounting on provider failure |
+| 5. Components | New generation-bound Graph; live rootd manifest and 15-offer route validation, full legacy-route equivalence witness, and exact live service PID collision/reporter-chain denial | Declarative activation, named kernel capability transfer and consolidated production supervisor ownership |
+| 6. Session budgets | New client-funded session policy with exact-generation tickets, offer-issuance epochs, mandatory one-unit session charging and revoked-route scavenging | Binding client-funded service allocation to kernel Job budget and provider-failure accounting; live runtimed has an independent 256-console-session bound |
 | 7. Personality split | Existing syscalld/procd/loaderd/vfsd policy split preserved | Audit remaining **slow** ring0 ABI policies and cut over with measured cost; no hotpath moves |
-| 8. Operability | New health probe, restart, event and update/rollback policy models; fallible lazy rootd checkpoint storage | Actual persistent crash store, authenticated health reporter, image admission, restart transaction and KVM rollback |
+| 8. Operability | New health probe, restart, event and update/rollback policy models; live bounded nested checkpoint tree with atomic transitive revocation and exact compaction | Actual persistent crash store, authenticated health reporter, image admission, restart transaction and KVM rollback |
  
 The model must never be mistaken for a security boundary. A policy decision
 does **not** mint a capability or authorize a syscall. Rootd and ring0 must
