@@ -85,6 +85,32 @@ session nor a recycled u64 handle can grant stale authority. Confirm
 non-console-hosted launch behavior remains unchanged. This quota is **not**
 client-funded kernel Job memory accounting.
 
+## Transitive post-init reclaim and client-session generation hardening
+
+This follow-up changes production service behavior, not only the policy model:
+
+- Explicit initd lease reclaim now discovers the full post-init descendant
+  closure before changing any state. It must traverse an already-exited
+  intermediate reporter, refuse PID cycles and reject a stale exact PID.
+- Revoke *all* selected live service endpoints before terminating *any* of
+  their processes, then reset only the selected lease records after success.
+  A kernel revoke/terminate error in production must fail-closed; do not
+  return a successful or partially committed reclaim receipt.
+- Both exit-driven revocation and explicit reclaim share the fixed-size,
+  bounded ancestry selection logic.
+- Client-funded model sessions refund exact charges when generation reaches
+  `u32::MAX`; the exhausted slot is permanently retired, never wrapped.
+- Live runtimed's console graph generation now rejects `u64` rollover rather
+  than reusing a compositor change token. Host tests exercise the guard.
+
+Codex should add adversarial runtime tests that race initd reclaim, a
+sessiond crash, uiserver exit, late PID reports, and independent netd/inputd
+leases. Verify the absence of active descendant endpoints after reclaim,
+and bound the number of termination syscalls to the selected subtree.
+Check the above pure tests separately from 1/2/4/8-vCPU KVM experiments.
+The prior KVM boot smoke missed its 25-second readiness markers, so do not
+treat a model/host pass as release acceptance.
+
 ## Known remaining integration gates
 
 - Kernel-authoritative per-Job kernel-byte and service-session charges.

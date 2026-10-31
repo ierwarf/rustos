@@ -2098,6 +2098,14 @@ mod tests {
     /// render loop each time, and never reached its idle wait - a spin whose
     /// traffic lands on the same endpoint that carries shell keystrokes.
     #[test]
+    #[should_panic(expected = "sessiond console graph generation exhausted")]
+    fn graph_generation_exhaustion_refuses_reused_compositor_token() {
+        let mut state = SessionRuntime::default();
+        state.output_generation = u64::MAX;
+        state.advance_graph_generation();
+    }
+
+    #[test]
     fn session_budget_is_bounded_idempotent_and_refunded_on_remove() {
         let mut state = SessionRuntime::default();
         assert_eq!(state.create_session(0), Err(libc::EINVAL));
