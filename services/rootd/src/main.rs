@@ -1917,18 +1917,28 @@ fn post_init_lease_reporter_is_live(
         if current == 0 {
             return false;
         }
-        if leases
-            .iter()
-            .any(|lease| lease.pid == current && lease.state == ROOTD_LEASE_STATE_RUNNING)
-        {
-            return true;
+        // A reporter ancestry chain may terminate only at the one
+        // authenticated initd service. Duplicate live service principals,
+        // even in an ancestor, fail closed instead of taking the first hit.
+        let mut core = leases.iter().filter(|lease| {
+            lease.pid == current && lease.state == ROOTD_LEASE_STATE_RUNNING
+        });
+        if let Some(owner) = core.next() {
+            return owner.service_id == INITD_LEASE_ID
+                && core.next().is_none()
+                && !post_init_leases.iter().any(|lease| {
+                    lease.pid == current && lease.state == ROOTD_LEASE_STATE_RUNNING
+                });
         }
-        let Some(reporter_lease) = post_init_leases
-            .iter()
-            .find(|lease| lease.pid == current && lease.state == ROOTD_LEASE_STATE_RUNNING)
-        else {
+        let mut children = post_init_leases.iter().filter(|lease| {
+            lease.pid == current && lease.state == ROOTD_LEASE_STATE_RUNNING
+        });
+        let Some(reporter_lease) = children.next() else {
             return false;
         };
+        if children.next().is_some() {
+            return false;
+        }
         current = reporter_lease.reporter_pid;
     }
     // A cycle or chain longer than the fixed lease set has no trusted root.
@@ -3114,6 +3124,33 @@ mod tests {
             service_capability_for_subject(&core, &mut post, &request),
             Ok(rustos_user_abi::syscall::IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY),
         );
+    }
+
+    #[test]
+    fn nested_reporter_chain_requires_a_unique_live_initd_ancestor() {
+        let mut core = leases_with_live_initd(41);
+        let mut post = [post_init_lease(POST_INIT_MANIFEST[4])];
+        post[0].pid = 73;
+        post[0].reporter_pid = 41;
+        post[0].state = ROOTD_LEASE_STATE_RUNNING;
+        assert!(post_init_lease_reporter_is_live(&core, &post, 73));
+        core[0].pid = 41;
+        core[0].state = ROOTD_LEASE_STATE_RUNNING;
+        assert!(!post_init_lease_reporter_is_live(&core, &post, 73));
+        core[0].state = ROOTD_LEASE_STATE_EXITED;
+        assert!(post_init_lease_reporter_is_live(&core, &post, 73));
+        core[INITD_LEASE_INDEX].state = ROOTD_LEASE_STATE_EXITED;
+        core[0].state = ROOTD_LEASE_STATE_RUNNING;
+        assert!(!post_init_lease_reporter_is_live(&core, &post, 73));
+
+        core[0].state = ROOTD_LEASE_STATE_EXITED;
+        core[INITD_LEASE_INDEX].state = ROOTD_LEASE_STATE_RUNNING;
+        let other = post_init_lease(POST_INIT_MANIFEST[0]);
+        let mut post2 = [post[0], other];
+        post2[1].pid = 73;
+        post2[1].reporter_pid = 41;
+        post2[1].state = ROOTD_LEASE_STATE_RUNNING;
+        assert!(!post_init_lease_reporter_is_live(&core, &post2, 73));
     }
 
     #[test]
