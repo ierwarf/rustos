@@ -122,19 +122,47 @@ impl UpdateBook {
         }
     }
 
+    /// Pure transaction admission preflight, called BEFORE rootd publishes a
+    /// replacement service lease. Once the lease has been authenticated and
+    /// inserted, this exact check cannot reject the same candidate.
+    pub(crate) fn may_publish(
+        &self, service: u64, pid: u64, now_ns: u64,
+    ) -> Result<(), i32> {
+        let slot = &self.entries[Self::position(service)?];
+        if slot.state == Phase::Empty {
+            return Ok(());
+        }
+        if slot.state != Phase::Armed || pid == 0 || pid == slot.previous_pid
+            || now_ns >= slot.deadline_ns
+        {
+            return Err(ESTALE);
+        }
+        Ok(())
+    }
+
+    /// Pure health preflight before mutating the independent health witness.
+    /// The same monotonic timestamp is used in both transitions.
+    pub(crate) fn may_accept_health(
+        &self, service: u64, pid: u64, now_ns: u64,
+    ) -> Result<(), i32> {
+        let slot = &self.entries[Self::position(service)?];
+        if slot.state == Phase::Trial
+            && (slot.candidate_pid != pid || now_ns >= slot.deadline_ns)
+        {
+            return Err(ESTALE);
+        }
+        Ok(())
+    }
+
     /// Exact live post-init lease publication, not the requester's PID, sets
     /// the candidate incarnation. This cannot invent a process.
     pub(crate) fn published(
         &mut self, service: u64, new_pid: u64, now_ns: u64,
     ) -> Result<Phase, i32> {
+        self.may_publish(service, new_pid, now_ns)?;
         let slot = &mut self.entries[Self::position(service)?];
         if slot.state == Phase::Empty {
             return Ok(Phase::Empty);
-        }
-        if slot.state != Phase::Armed || new_pid == 0
-            || new_pid == slot.previous_pid || now_ns >= slot.deadline_ns
-        {
-            return Err(ESTALE);
         }
         slot.candidate_pid = new_pid;
         slot.state = Phase::Trial;
@@ -147,12 +175,10 @@ impl UpdateBook {
     pub(crate) fn healthy(
         &mut self, service: u64, pid: u64, now_ns: u64,
     ) -> Result<Phase, i32> {
+        self.may_accept_health(service, pid, now_ns)?;
         let slot = &mut self.entries[Self::position(service)?];
         if slot.state != Phase::Trial {
             return Ok(slot.state);
-        }
-        if slot.candidate_pid != pid || now_ns >= slot.deadline_ns {
-            return Err(ESTALE);
         }
         slot.health_pulses = slot.health_pulses.saturating_add(1);
         if slot.health_pulses >= 3 {
@@ -243,6 +269,21 @@ mod tests {
         assert_eq!(ledger.seal(approval(1)), Ok(Phase::Committed));
         assert_eq!(ledger.stage(approval(1), 12, 30), Err(ESTALE));
     }
+    #[test]
+    fn side_effecting_lease_and_health_transitions_have_pure_admission() {
+        let mut ledger = UpdateBook::new();
+        ledger.stage(approval(7), 101, 1).unwrap();
+        assert_eq!(ledger.may_publish(IPC_SERVICE_SESSIOND, 102, 2), Err(ESTALE));
+        ledger.arm(approval(7), 3).unwrap();
+        assert_eq!(ledger.may_publish(IPC_SERVICE_SESSIOND, 101, 4), Err(ESTALE));
+        assert_eq!(ledger.inspect(IPC_SERVICE_SESSIOND).unwrap().0, Phase::Armed);
+        assert_eq!(ledger.may_publish(IPC_SERVICE_SESSIOND, 102, 5), Ok(()));
+        ledger.published(IPC_SERVICE_SESSIOND, 102, 5).unwrap();
+        assert_eq!(ledger.may_accept_health(IPC_SERVICE_SESSIOND, 101, 6), Err(ESTALE));
+        assert_eq!(ledger.may_accept_health(IPC_SERVICE_SESSIOND, 102, 6), Ok(()));
+        assert_eq!(ledger.inspect(IPC_SERVICE_SESSIOND).unwrap().0, Phase::Trial);
+    }
+
     #[test]
     fn failed_trial_is_rollback_required_not_success() {
         let mut ledger = UpdateBook::new();

@@ -1162,10 +1162,16 @@ fn fill_commercial_max_response(
             Ok(())
         }
         COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL => {
+            // Pure update-state preflight MUST precede lease publication.
+            // A declined update must not leave an accepted child with an
+            // error reply and an ambiguous parent-ownership transaction.
+            let now_ns = rustos_svc_runtime::syscall::monotonic_nanos();
+            service_checkpoints.updates.may_publish(
+                request.arg0, request.arg1, now_ns,
+            )?;
             register_post_init_service_lease(leases, post_init_leases, request, sender)?;
             service_checkpoints.updates.published(
-                request.arg0, request.arg1,
-                rustos_svc_runtime::syscall::monotonic_nanos(),
+                request.arg0, request.arg1, now_ns,
             )?;
             response.value0 = request.arg0;
             response.value1 = request.arg1;
@@ -1324,6 +1330,11 @@ fn fill_commercial_max_response(
                 return Err(75);
             }
             let now_ns = rustos_svc_runtime::syscall::monotonic_nanos();
+            // Avoid accepting fresh health while rejecting the same pulse's
+            // update trial transition; no half-observed healthy candidate.
+            service_checkpoints.updates.may_accept_health(
+                pulse.service, sender.pid, now_ns,
+            )?;
             let deadline = service_checkpoints.health.report(
                 pulse.service, sender.pid, pulse.sequence, now_ns,
             )?;
