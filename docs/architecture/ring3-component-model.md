@@ -191,3 +191,14 @@ NO compile, boot or CI validation. Memory.high counts threshold crossings
 without throttling. Memory.min is an OOM-victim exclusion heuristic, not a
 physical page guarantee. The worker-missing synchronous launch fallback was
 removed. See docs/validation/ring3-aggressive-draft-codex.md.
+
+### Production client-Job session control IDL cutover (draft)
+
+Runtimed and rootd now use generated schema `CLIENT_JOB_SESSION_ACCOUNTING`
+(opcode 519) for the session charge and refund control path. The versioned
+supervisor envelope keeps op 17/18 as operation selectors, but all former
+scalar `arg0/arg1` payloads must be zero and are rejected. The canonical
+IDL binds token, exact client PID, operation, request phase and job ACK.
+The release ACK may carry a zero JobId when a previously unseen token is
+canceled; the charge ACK must return a real JobId. No production validation
+was run on this change.

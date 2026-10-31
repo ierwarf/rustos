@@ -105,3 +105,14 @@ changes, and do not call this a complete eight-stage migration.
   performance baseline, with negative-right tests and fault injection.
 
 **The draft author intentionally executed none of those checks.**
+
+## Additional generated-IDL migration (schema 519)
+
+The newly drafted client-Job session calls were also converted from scalar
+arg0/arg1 encoding to the generated canonical CLIENT_JOB_SESSION_ACCOUNTING
+schema (opcode 519). Both rootd and runtimed reject the old scalar request
+shape; outer supervisor operation numbers 17/18 only select charge/release.
+Codex must check generated descriptor drift, request/ack phase separation,
+zero-JobId cancellation ACKs, wrong operation, mutated token, swapped sender
+PID, truncation, oversized frames, unknown tags and replay across sessiond
+incarnations. Charge/release must still be exactly-once across copyout fault.

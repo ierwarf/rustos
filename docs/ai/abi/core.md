@@ -326,3 +326,12 @@ reauthorization, and TLB-acknowledged reclaim exist with model and mutation
 evidence; vfsd/storaged I/O, kernel fault dispatch, runtime pressure/restart,
 and Linux/Windows differential cutover are still required before Phase 8 is
 complete.
+
+### Client-Job accounting schema 519
+
+Production sessiond/rootd control of client session accounting uses a
+canonical generated-IDL frame in the existing supervisor IPC envelope:
+wire schema 519 carries token, exact client PID, operation, Job output and
+request/ack phase. The historical scalar arg0/arg1 request form for these
+operations is retired. Outer supervisor operations 17/18 remain as selectors
+rather than untyped payload formats. All of this is a nonvalidated draft.
