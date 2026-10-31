@@ -31,7 +31,9 @@ jobs:
       - name: Run component-model tests
         run: cargo test -p rustos-component-model --locked
       - name: Run rootd unit tests
-        run: cargo test -p rootd --features host-test --locked
+        env:
+          RUST_BACKTRACE: "1"
+        run: cargo test -p rootd --features host-test --locked -- --test-threads=1 --nocapture
       - name: Run runtimed host tests
         run: cargo test -p runtimed --locked
       - name: Check full RustOS build graph

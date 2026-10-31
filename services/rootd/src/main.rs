@@ -1105,10 +1105,6 @@ fn fill_commercial_max_response(
             Ok(())
         }
         COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_RECLAIM => {
-            policy_cutover::authorize_job_slow_op(
-                sender.pid,
-                rustos_component_model::policy_ops::SlowBrokerOperation::ReclaimServiceLease,
-            )?;
             reclaim_post_init_lease(leases, post_init_leases, request, sender)?;
             response.value0 = request.arg0;
             response.value1 = 0;
@@ -1632,6 +1628,10 @@ fn reclaim_post_init_lease(
     if !initd_manages_post_init_service(request.arg0) {
         return Err(13);
     }
+    policy_cutover::authorize_job_slow_op(
+        sender.pid,
+        rustos_component_model::policy_ops::SlowBrokerOperation::ReclaimServiceLease,
+    )?;
     // Validation above performs no kernel operations. For the actual
     // revocation phase, a partial syscall failure must stop the supervisor:
     // returning a normal error could leave an endpoint revoked while its
