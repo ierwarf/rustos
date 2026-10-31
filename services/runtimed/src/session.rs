@@ -2107,12 +2107,12 @@ mod tests {
         let mut state = SessionRuntime::default();
         state.output_generation = u64::MAX - 1;
         assert_eq!(
-            checked_next_graph_generation(state.output_generation),
+            super::checked_next_graph_generation(state.output_generation),
             Some(u64::MAX)
         );
         state.advance_graph_generation();
         assert_eq!(state.graph_generation(), u64::MAX);
-        assert_eq!(checked_next_graph_generation(state.graph_generation()), None);
+        assert_eq!(super::checked_next_graph_generation(state.graph_generation()), None);
     }
 
     #[test]
