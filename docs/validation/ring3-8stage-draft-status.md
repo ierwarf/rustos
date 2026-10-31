@@ -151,3 +151,28 @@ required state is NOT a completed rollback.
 The writing assistant performed no compiler, boot, formal, dynamic test,
 or performance verification for this source batch. This is an intentionally
 aggressive Codex repair draft, not a product release.
+
+## 2026-11-01 continuation — Stage 7/8 policy models (UNVERIFIED)
+
+Added `rustos-component-model::personality`: immutable bounded slow-control
+policy snapshots, exact PID/Job/lease-generation subject binding, strictly
+monotonic revisions, fail-closed duplicate-key detection, ABI major/minor
+profile negotiation, and an explicit set of mechanisms that MUST remain
+Ring0. Integration into live syscalld/loaderd/brokers is **not done**.
+No capability can be created by these decisions. This does not migrate the
+legacy Windows/Linux broker policy on its own.
+
+Added `rustos-component-model::restart_transaction`: staged image identity
+and transaction admission, journal durability gate, quiesce/activate/health
+witness/commit flow, rollback-required and verified restoration as distinct
+states. The required durability, signature verification, old-image custody,
+health witness authentication and actual image swap are **external**
+obligations; the booleans passed to the policy model are NOT proof.
+Integration into production rootd/initd/storage update flow remains open.
+
+Important Codex repairs: wire the above models to authenticated Ring3
+controllers without inventing privileges; source-gate kernel handles,
+authenticate the exact witness PID and lease generation, implement durable
+journal/fsync and image custody before claiming power-loss recovery,
+add negative/replay tests, and remove legacy paths only after exact
+ownership cutover. No build, compilation, test, boot, or CI was executed.
