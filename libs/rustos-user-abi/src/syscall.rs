@@ -96,6 +96,8 @@ pub const SYS_RUSTOS_ROOTD_MEMORY_BROKER: u64 = 0x5255_0056;
 pub const SYS_RUSTOS_JOB: u64 = 0x5255_0057;
 /// Versioned qualitative job ceilings; does not change the Job v4 limit wire.
 pub const SYS_RUSTOS_JOB_POLICY: u64 = 0x5255_005a;
+/// Slow kernel accounting of client-funded service sessions.
+pub const SYS_RUSTOS_JOB_SESSION: u64 = 0x5255_005b;
 /// Capability-gated, event-driven wait for the DVM input transport. Only
 /// inputd may use this to wait for an MSI-X-published ingress batch; input
 /// policy and translation remain in the service.
@@ -967,6 +969,8 @@ pub const JOB_RIGHT_KILL: u32 = 1 << 6;
 pub const JOB_RIGHT_SET_CRITICAL: u32 = 1 << 7;
 pub const JOB_RIGHT_DUPLICATE: u32 = 1 << 8;
 pub const JOB_RIGHT_TRANSFER: u32 = 1 << 9;
+/// Dedicated Job session accounting authority.
+pub const JOB_RIGHT_ACCOUNT_SESSIONS: u32 = 1 << 10;
 /// The root job's id. A job id is `(slot << 32) | generation`; only the root
 /// has a fixed value; other ids are inspection/census output, not authority.
 pub const JOB_ID_ROOT: u64 = 1;
@@ -975,6 +979,28 @@ pub const JOB_ID_ROOT: u64 = 1;
 pub const JOB_BOOTSTRAP_ROOT_FD: u64 = 3;
 pub const JOB_STATE_LIVE: u32 = 0;
 pub const JOB_STATE_KILLING: u32 = 1;
+/// Dedicated slow-path Job session accounting ABI. The existing Job broker
+/// structure and fast scheduling ABI remain unchanged.
+pub const JOB_SESSION_ABI_VERSION: u16 = 1;
+pub const JOB_SESSION_OP_INSPECT: u16 = 1;
+pub const JOB_SESSION_OP_SET_LIMIT: u16 = 2;
+pub const JOB_SESSION_OP_CHARGE: u16 = 3;
+pub const JOB_SESSION_OP_RELEASE: u16 = 4;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RustosJobSessionArgs {
+    pub abi_version: u16,
+    pub op: u16,
+    pub flags: u32,
+    pub job_handle: u64,
+    pub client_pid: u64,
+    pub job_id: u64,
+    pub limit: u64,
+    pub effective: u64,
+    pub usage: u64,
+    pub reserved: u64,
+}
 pub const PROC_BROKER_FORMAT_ELF64: u16 = 1;
 pub const PROC_BROKER_FORMAT_PE64: u16 = 2;
 pub const PROC_BROKER_MAP_READ: u64 = 1 << 0;

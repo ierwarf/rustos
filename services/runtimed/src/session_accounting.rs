@@ -100,8 +100,7 @@ mod tests {
         assert!(build_request(COMMERCIAL_MAX_ROOTD_OP_SESSION_ACCOUNT_CHARGE, 1, 0, 41, 4).is_err());
         let req = build_request(COMMERCIAL_MAX_ROOTD_OP_SESSION_ACCOUNT_CHARGE, 88, 900, 41, 4).unwrap();
         assert_eq!((req.arg0, req.arg1), (88, 900));
-        assert!(req.subject_is_exact_sender(41, 4));
-        assert!(!req.subject_is_exact_sender(42, 4));
+        assert_eq!((req.header.subject_pid, req.header.subject_tid), (41, 4));
         assert_eq!(req.payload_len, 0);
         assert_eq!(req.path_len, 0);
         assert!(build_request(COMMERCIAL_MAX_ROOTD_OP_SESSION_ACCOUNT_RELEASE, 88, 900, 41, 4).is_err());
