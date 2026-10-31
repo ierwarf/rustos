@@ -19,7 +19,7 @@ const MAX_JOURNAL_ENTRIES: usize = 8_192;
 const ENOSPC: i64 = 28;
 const EPROTO: i64 = 71;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct JournalEntry {
     service: u64,
     kind: u16,
@@ -46,6 +46,8 @@ impl Journal {
             .filter_map(|(position, value)| value.as_ref().map(|entry| (position, entry)))
             .find(|(_, entry)| entry.service == service
                 && entry.kind == kind
+                && entry.record.key_hi == record.key_hi
+                && entry.record.key_lo == record.key_lo
                 && entry.record.operation_hi == record.operation_hi
                 && entry.record.operation_lo == record.operation_lo)
         {
