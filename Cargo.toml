@@ -12,6 +12,7 @@ members = [
     "libs/runtime-control",
     "libs/rustos-user-abi",
     "libs/rustos-svc-runtime",
+    "libs/rustos-component-model",
     "libs/rustos-fault-injection",
     "libs/rustos-observability",
     "libs/storage-core",

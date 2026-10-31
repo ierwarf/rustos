@@ -1,0 +1,31 @@
+name: Ring3 component model
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  model:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Install repository Rust toolchain
+        run: |
+          toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$toolchain" --profile minimal --component rustfmt
+      - name: Check component formatting
+        run: |
+          cargo fmt -p rustos-component-model -- --check
+          rustfmt --edition 2021 --check services/rootd/src/component_policy.rs
+      - name: Run component-model tests
+        run: cargo test -p rustos-component-model --locked
+      - name: Run rootd unit tests
+        run: cargo test -p rootd --features host-test --locked
+      - name: Check full RustOS build graph
+        run: cargo xtask check
