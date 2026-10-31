@@ -514,14 +514,24 @@ mod tests {
         let mut g = Graph::new(Moniker::new("root").unwrap(), 1, 4).unwrap();
         let client = g
             .create(
-                g.root(), Moniker::new("client").unwrap(), 2,
-                JobCeiling::ALL, Quota::UNLIMITED, RestartPolicy::NEVER, false,
+                g.root(),
+                Moniker::new("client").unwrap(),
+                2,
+                JobCeiling::ALL,
+                Quota::UNLIMITED,
+                RestartPolicy::NEVER,
+                false,
             )
             .unwrap();
         let provider = g
             .create(
-                g.root(), Moniker::new("provider").unwrap(), 3,
-                JobCeiling::ALL, Quota::UNLIMITED, RestartPolicy::NEVER, false,
+                g.root(),
+                Moniker::new("provider").unwrap(),
+                3,
+                JobCeiling::ALL,
+                Quota::UNLIMITED,
+                RestartPolicy::NEVER,
+                false,
             )
             .unwrap();
         g.activate(client).unwrap();
@@ -537,12 +547,16 @@ mod tests {
         let mut ids = Vec::new();
         for _ in 0..4 {
             ids.push(
-                sessions.open(&mut g, client, provider, cap, charge, 1, 10).unwrap()
+                sessions
+                    .open(&mut g, client, provider, cap, charge, 1, 10)
+                    .unwrap(),
             );
         }
         assert_eq!(sessions.expire(&mut g, 20, 1), Ok(1));
         assert_eq!(sessions.cleanup_cursor, 1);
-        let fresh = sessions.open(&mut g, client, provider, cap, charge, 21, 100).unwrap();
+        let fresh = sessions
+            .open(&mut g, client, provider, cap, charge, 21, 100)
+            .unwrap();
         assert_eq!(fresh.slot, 0);
         assert_eq!(sessions.expire(&mut g, 22, 1), Ok(1));
         assert_eq!(sessions.cleanup_cursor, 2);

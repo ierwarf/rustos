@@ -88,6 +88,10 @@ library as replacing the existing rootd/Job/IPC authorities.
   production revoke/terminate request fail-closes rather than returning a
   partially successful lease cleanup. Regression tests cover nested trees,
   stale PIDs, cycles, unrelated leases, and revoked-before-terminate order.
+- The no_std client-funded session policy now rotates its bounded expiry
+  and component-revoke scans, so a one-session cleanup budget cannot
+  perpetually favor low slot indices under churn. This is a policy-model
+  change, not production kernel Job charging.
 - The no_std client-funded session policy now retires exhausted generation
   slots while refunding their exact charge. A formerly occupied slot can never
   wrap its generation and revive an old SessionId. The live runtimed console
