@@ -268,6 +268,97 @@ pub const CLIENT_JOB_SESSION_ACCOUNTING: Schema<'static> = Schema {
     fields: &CLIENT_JOB_SESSION_ACCOUNTING_FIELDS,
 };
 
+pub const PROVIDER_SESSION_ACCOUNTING_FIELDS: [FieldSpec; 14] = [
+    FieldSpec {
+        tag: 1,
+        kind: FieldKind::U64,
+        required: true,
+        max_len: 8,
+    },
+    FieldSpec {
+        tag: 2,
+        kind: FieldKind::U64,
+        required: true,
+        max_len: 8,
+    },
+    FieldSpec {
+        tag: 3,
+        kind: FieldKind::U64,
+        required: true,
+        max_len: 8,
+    },
+    FieldSpec {
+        tag: 4,
+        kind: FieldKind::U64,
+        required: true,
+        max_len: 8,
+    },
+    FieldSpec {
+        tag: 5,
+        kind: FieldKind::U64,
+        required: true,
+        max_len: 8,
+    },
+    FieldSpec {
+        tag: 6,
+        kind: FieldKind::U64,
+        required: true,
+        max_len: 8,
+    },
+    FieldSpec {
+        tag: 7,
+        kind: FieldKind::U32,
+        required: true,
+        max_len: 4,
+    },
+    FieldSpec {
+        tag: 8,
+        kind: FieldKind::U64,
+        required: true,
+        max_len: 8,
+    },
+    FieldSpec {
+        tag: 9,
+        kind: FieldKind::U64,
+        required: true,
+        max_len: 8,
+    },
+    FieldSpec {
+        tag: 10,
+        kind: FieldKind::U64,
+        required: true,
+        max_len: 8,
+    },
+    FieldSpec {
+        tag: 11,
+        kind: FieldKind::U64,
+        required: true,
+        max_len: 8,
+    },
+    FieldSpec {
+        tag: 12,
+        kind: FieldKind::U16,
+        required: true,
+        max_len: 2,
+    },
+    FieldSpec {
+        tag: 13,
+        kind: FieldKind::U16,
+        required: true,
+        max_len: 2,
+    },
+    FieldSpec {
+        tag: 14,
+        kind: FieldKind::U32,
+        required: true,
+        max_len: 4,
+    },
+];
+pub const PROVIDER_SESSION_ACCOUNTING: Schema<'static> = Schema {
+    opcode: 520,
+    fields: &PROVIDER_SESSION_ACCOUNTING_FIELDS,
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,6 +374,7 @@ mod tests {
             POST_INIT_LEASE_SNAPSHOT,
             POST_INIT_LEASE_RECLAIM,
             CLIENT_JOB_SESSION_ACCOUNTING,
+            PROVIDER_SESSION_ACCOUNTING,
         ] {
             assert!(schema.validate().is_ok());
         }

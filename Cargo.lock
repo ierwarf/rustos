@@ -885,6 +885,7 @@ checksum = "c3c8dda44ff03a2f238717214da50f65d5a53b45cd213a7370424ffdb6fae815"
 name = "netd"
 version = "0.1.0"
 dependencies = [
+ "rustos-component-model",
  "libc",
  "rustos-svc-runtime",
  "rustos-user-abi",
@@ -1229,6 +1230,7 @@ version = "0.1.0"
 name = "rustos-svc-runtime"
 version = "0.1.0"
 dependencies = [
+ "rustos-component-model",
  "rustos-user-abi",
 ]
 
@@ -1627,6 +1629,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 name = "vfsd"
 version = "0.1.0"
 dependencies = [
+ "rustos-component-model",
  "fatfs",
  "rustos-svc-runtime",
  "rustos-user-abi",

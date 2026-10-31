@@ -197,3 +197,34 @@ was moved, no TLB change was made, no compile/build/boot tests were run.
 Codex owns wiring to netd/vfsd, actual kernel job charging, generated IDL,
 image verification, storaged stable sync, cleanup of superseded legacy paths
 and negative-right/copyout/lifecycle acceptance tests.
+
+## 2026-11-01 provider RPC continuation (draft; no validation)
+
+Supervisor 25/26 now accepts a canonical 112-byte provider session frame.
+Rootd validates kernel-stamped provider identity, live service grant and
+effective JobPolicy; the client Job ID and generation are discovered from
+the kernel process directory, not trusted from a provider claim. Rootd
+uses a separate provider ledger for netd/vfsd and retains the older
+sessiond 17/18 ABI unchanged. A charge command stores its exact kernel
+token BEFORE issuing a possibly ambiguous kernel charge; a lost copyout
+ACK retries that same token. Refund requires the stored client Job and
+session identity, and a confirmed kernel EXIT for netd/vfsd drains the
+provider's outstanding kernel tokens before discarding user-space
+receipts. Rootd process restart still drains the kernel token ledger
+globally before accepting new providers.
+
+The shared no_std service runtime now provides ProviderClient and the
+exact-bound provider RPC. netd has a lock-dropping socket accounting
+adapter; vfsd has an open-description accounting adapter. Both are
+imported but deliberately NOT inserted into socket/open/close publication
+paths until all final-reference and ambiguous-failure cases are wired.
+Therefore do NOT claim all netd/vfsd sessions are funded yet.
+
+Production acceptance blockers: kernel-owned provider incarnation
+generation beyond PID, durable acknowledgment/receipt evidence after
+rootd power loss, bounded fallible allocation in provider local storage,
+all final close/dup/fork/socketpair/accept/replay paths, deferred reply
+cancellation, netd and vfsd release rollback, and typed schema-generator
+adoption for the new provider RPC. The provider wire's lease epoch is a
+client incarnation nonce; it MUST NOT be treated as independent kernel
+identity proof. No compiler/build/boot/tests were executed here.

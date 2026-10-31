@@ -1,7 +1,7 @@
 //! Draft generic rootd broker for client-funded provider sessions.
 //!
-//! NOT WIRED TO THE PUBLIC SUPERVISOR RPC YET. This exists to allow the
-//! netd/vfsd conversion to be made atomically in a later Codex cutover.
+//! Generic provider RPC is dispatched by rootd; netd/vfsd final-ref
+//! call-site custody remains staged until actual per-object cutover.
 //! Its inputs MUST come from kernel-stamped sender identity, not from a
 //! provider-supplied PID. The kernel Job token ledger remains authoritative.
 use alloc::vec::Vec;
@@ -27,6 +27,9 @@ pub(super) struct ProviderBilling {
 impl ProviderBilling {
     pub(super) const fn new()->Self {
         Self{funded:Vec::new(),next_kernel_token:0}
+    }
+    pub(super) fn unknown(&self,owner:Owner,token:Token)->bool {
+        self.find(owner,token).is_some_and(|i|self.funded[i].state==State::ChargeUnknown)
     }
     fn find(&self,owner:Owner,token:Token)->Option<usize> {
         self.funded.iter().position(|x|x.provider==owner&&x.token==token)
@@ -75,15 +78,40 @@ impl ProviderBilling {
             Err(err) => Err(err),
         }
     }
+    /// A lost ACK after charge must be retried with this SAME kernel token.
+    /// The callback must obtain an authoritative kernel result. No other
+    /// provider token is spent while its predecessor is unresolved.
+    pub(super) fn reconcile_charge(
+        &mut self, owner:Owner, token:Token, client:Client,
+        session:u64, kind:ProviderKind, sender_pid:u64,
+        mut retry:impl FnMut(Client,u64,u64)->Result<u64,i32>,
+    )->Result<u64,i32>{
+        if sender_pid!=owner.pid {return Err(EACCES)}
+        let idx=self.find(owner,token).ok_or(ESTALE)?;
+        let e=self.funded[idx];
+        if e.client!=client || e.session!=session || e.kind!=kind {
+            return Err(EACCES)
+        }
+        if e.state==State::Charged {return Ok(e.charge_id)}
+        if e.state!=State::ChargeUnknown {return Err(EBUSY)}
+        let receipt=retry(e.client,owner.pid,e.kernel_token)?;
+        if receipt==0 {return Err(ESTALE)}
+        self.funded[idx].charge_id=receipt;
+        self.funded[idx].state=State::Charged;
+        Ok(receipt)
+    }
     /// Record release only after a kernel-confirmed terminal refund. A
     /// timeout must leave the entry alive for exact-token reconciliation.
     pub(super) fn release(
         &mut self,owner:Owner,token:Token,kernel_sender_pid:u64,
+        expected_client:Client,expected_session:u64,expected_kind:ProviderKind,
         mut refund:impl FnMut(u64,u64,u64)->Result<(),i32>,
     )->Result<(),i32> {
         if kernel_sender_pid!=owner.pid{return Err(EACCES)}
         let idx=self.find(owner,token).ok_or(ESTALE)?;
         let entry=self.funded[idx];
+        if entry.client!=expected_client || entry.session!=expected_session
+            || entry.kind!=expected_kind {return Err(EACCES)}
         if !matches!(entry.state,State::Charged|State::ReleaseUnknown){
             return Err(EBUSY)
         }
@@ -104,6 +132,28 @@ impl ProviderBilling {
         let before=self.funded.len();
         self.funded.retain(|e|e.provider!=owner);
         Ok(before-self.funded.len())
+    }
+    /// The rootd supervisor passes only a kernel-stamped lifecycle EXIT
+    /// for a confirmed netd/vfsd lease. The kernel is authoritative for
+    /// cleanup even when the provider's last IPC reply was lost.
+    pub(super) fn owner_exit_pid(
+        &mut self,pid:u64,
+        mut kernel_drain:impl FnMut(u64)->Result<(),i32>,
+    )->Result<usize,i32> {
+        if pid==0{return Err(EINVAL)}
+        let has_provider=self.funded.iter().any(|e|e.provider.pid==pid);
+        if !has_provider{return Ok(0)}
+        kernel_drain(pid)?;
+        let before=self.funded.len();
+        self.funded.retain(|e|e.provider.pid!=pid);
+        Ok(before-self.funded.len())
+    }
+    /// Rootd must not acknowledge a provider release merely because its
+    /// local book no longer has an entry. An absent entry is ambiguous until
+    /// the kernel's own token ledger confirms terminal nonexistence.
+    pub(super) fn unknown_tokens_for_pid(&self,pid:u64)->usize {
+        self.funded.iter().filter(|e|e.provider.pid==pid
+            &&matches!(e.state,State::ChargeUnknown|State::ReleaseUnknown)).count()
     }
     pub(super) fn unresolved(&self,mut f:impl FnMut(Owner,Client,u64)) {
         for x in &self.funded {f(x.provider,x.client,x.kernel_token)}
@@ -127,9 +177,25 @@ mod tests{
         }).unwrap();
         book.charge(ticket,8,true,|_,_,_|panic!("must never double charge")).unwrap();
         assert_eq!(calls,1);
-        book.release(owner,ticket.token,8,|job,p,t|{
+        book.release(owner,ticket.token,8,client,1,ProviderKind::Socket,|job,p,t|{
             assert_eq!((job,p,t),(22,8,1));Ok(())
         }).unwrap();
+        assert_eq!(book.count(),0);
+    }
+
+    #[test]
+    fn a_provider_exit_drains_before_forgetting_receipts(){
+        let owner=Owner{service:3,pid:19,lease:1};
+        let client=Client{pid:44,job:0x100000001,job_generation:1};
+        let ticket=Ticket{provider:owner,client,kind:ProviderKind::Socket,
+            session:2,token:Token{epoch:1,nonce:2}};
+        let mut book=ProviderBilling::new();
+        book.charge(ticket,19,true,|_,_,t|Ok(t)).unwrap();
+        let mut drains=0;
+        assert_eq!(book.owner_exit_pid(19,|pid|{
+            assert_eq!(pid,19);drains+=1;Ok(())
+        }),Ok(1));
+        assert_eq!(drains,1);
         assert_eq!(book.count(),0);
     }
 }

@@ -1126,6 +1126,9 @@ pub const COMMERCIAL_MAX_ROOTD_OP_UPDATE_ARM: u16 = 21;
 pub const COMMERCIAL_MAX_ROOTD_OP_UPDATE_ROLLBACK: u16 = 22;
 pub const COMMERCIAL_MAX_ROOTD_OP_UPDATE_SEAL: u16 = 23;
 pub const COMMERCIAL_MAX_ROOTD_OP_UPDATE_INSPECT: u16 = 24;
+/// Multi-provider, exact-token client Job funding. Canonical provider frame only.
+pub const COMMERCIAL_MAX_ROOTD_OP_PROVIDER_SESSION_CHARGE: u16 = 25;
+pub const COMMERCIAL_MAX_ROOTD_OP_PROVIDER_SESSION_RELEASE: u16 = 26;
 /// Store one versioned, service-owned checkpoint record.  Rootd authenticates
 /// the current service lease and retains the opaque record across a supervised
 /// service restart; it never interprets the service-private value bytes.

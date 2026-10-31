@@ -10,3 +10,4 @@ global-allocator = []
 
 [dependencies]
 rustos-user-abi = { path = "../rustos-user-abi" }
+rustos-component-model = { path = "../rustos-component-model" }

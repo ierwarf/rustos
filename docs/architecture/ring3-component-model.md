@@ -232,3 +232,15 @@ Do not confuse any staging journal trait with actual power-loss durability,
 any descriptor escrow record with a ring0 capability, or policy accounting
 with an exact kernel charge. The kernel/user mechanism boundary above
 remains unchanged. None of the new code was compiled or booted here.
+
+### 2026-11-01 generic provider-billing RPC draft (unverified)
+
+The supervisor now has explicitly reserved operations 25/26 for netd/vfsd
+generic client-funded sessions, with a canonical fixed-length 112-byte
+staging frame, exact live service grants and a rootd-owned token ledger.
+The kernel retains actual Job charges, PID membership and generations.
+The provider service adapters intentionally remain inactive until full
+socket/open-description final-close integration. IDL schema 520 is added
+for future canonical protocol cutover, but live ops still use fixed wire.
+See the validation ledger for pending unknown-ACK/reboot/killed-provider
+and cycle-free bootstrap acceptance tests.

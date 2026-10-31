@@ -30,6 +30,7 @@ mod control_drain;
 mod component_policy;
 mod control_preflight;
 mod provider_billing;
+mod provider_control;
 mod jobs;
 mod job_policy;
 mod job_policy_probe;
@@ -83,6 +84,7 @@ use rustos_user_abi::syscall::{
     COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_MUTATE,
     COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_SCAN, COMMERCIAL_MAX_ROOTD_OP_SERVICE_LOOKUP,
     COMMERCIAL_MAX_ROOTD_OP_SESSION_ACCOUNT_CHARGE, COMMERCIAL_MAX_ROOTD_OP_SESSION_ACCOUNT_RELEASE,
+    COMMERCIAL_MAX_ROOTD_OP_PROVIDER_SESSION_CHARGE, COMMERCIAL_MAX_ROOTD_OP_PROVIDER_SESSION_RELEASE,
     COMMERCIAL_MAX_ROOTD_OP_SERVICE_HEARTBEAT,
     COMMERCIAL_MAX_ROOTD_OP_UPDATE_STAGE, COMMERCIAL_MAX_ROOTD_OP_UPDATE_ARM,
     COMMERCIAL_MAX_ROOTD_OP_UPDATE_ROLLBACK, COMMERCIAL_MAX_ROOTD_OP_UPDATE_SEAL,
@@ -729,6 +731,28 @@ fn drain_lifecycle_events(
                 break;
             }
         }
+        // Only an authenticated kernel EXIT for the exact active provider
+        // incarnation can retire its client Job charges. Do not drain on a
+        // timeout or on an untrusted broker's request to close a PID.
+        let funded_provider_exited =
+            leases.iter().any(|lease| {
+                lease.service_id == IPC_SERVICE_VFSD
+                    && lease.pid == event.pid
+                    && lease.state == ROOTD_LEASE_STATE_EXITED
+            }) || post_init_leases.iter().any(|lease| {
+                lease.service_id == IPC_SERVICE_NETD
+                    && lease.pid == event.pid
+                    && lease.state == ROOTD_LEASE_STATE_EXITED
+            });
+        if funded_provider_exited {
+            service_checkpoints.providers.owner_exit_pid(
+                event.pid,
+                |provider| jobs::drain_client_sessions(provider)
+                    .map(|_|()).map_err(|err|err as i32),
+            ).unwrap_or_else(|_| {
+                fail_closed(b"rootd: fatal provider session retirement failed\\n")
+            });
+        }
         service_checkpoints.health.forget_pid(event.pid);
         service_checkpoints.updates.on_exit(event.pid);
         revoke_post_init_dependents(post_init_leases, event.pid);
@@ -1049,6 +1073,8 @@ fn validate_commercial_max_request(
             | COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_SCAN
             | COMMERCIAL_MAX_ROOTD_OP_SESSION_ACCOUNT_CHARGE
             | COMMERCIAL_MAX_ROOTD_OP_SESSION_ACCOUNT_RELEASE
+            | COMMERCIAL_MAX_ROOTD_OP_PROVIDER_SESSION_CHARGE
+            | COMMERCIAL_MAX_ROOTD_OP_PROVIDER_SESSION_RELEASE
             | COMMERCIAL_MAX_ROOTD_OP_SERVICE_HEARTBEAT
             | COMMERCIAL_MAX_ROOTD_OP_UPDATE_STAGE
             | COMMERCIAL_MAX_ROOTD_OP_UPDATE_ARM
@@ -1305,6 +1331,19 @@ fn fill_commercial_max_response(
             }
             response.payload[..canonical.len()].copy_from_slice(&canonical);
             response.payload_len = canonical.len() as u32;
+            response.value0 = 0;
+            response.value1 = 0;
+            Ok(())
+        }
+        COMMERCIAL_MAX_ROOTD_OP_PROVIDER_SESSION_CHARGE
+        | COMMERCIAL_MAX_ROOTD_OP_PROVIDER_SESSION_RELEASE => {
+            let encoded = provider_control::execute(
+                request, sender, leases, post_init_leases,
+                &mut service_checkpoints.providers,
+            )?;
+            if encoded.len() > response.payload.len() { return Err(75); }
+            response.payload[..encoded.len()].copy_from_slice(&encoded);
+            response.payload_len = encoded.len() as u32;
             response.value0 = 0;
             response.value1 = 0;
             Ok(())
@@ -1766,6 +1805,8 @@ fn rootd_capability_mask(op: u16) -> u64 {
         COMMERCIAL_MAX_ROOTD_OP_UPDATE_ROLLBACK => 1 << 18,
         COMMERCIAL_MAX_ROOTD_OP_UPDATE_SEAL => 1 << 19,
         COMMERCIAL_MAX_ROOTD_OP_UPDATE_INSPECT => 1 << 20,
+        COMMERCIAL_MAX_ROOTD_OP_PROVIDER_SESSION_CHARGE => 1 << 21,
+        COMMERCIAL_MAX_ROOTD_OP_PROVIDER_SESSION_RELEASE => 1 << 22,
         COMMERCIAL_MAX_ROOTD_OP_SCHEDULING_CONTEXT_GRANT => 1 << 12,
         _ => 0,
     }

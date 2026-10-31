@@ -24,7 +24,7 @@ pub(super) fn preflight()->Result<(),()> {
     }
     // Explicitly restrict high-risk operations to their natural holders.
     let exclusive:&[(Op,&[u64])]=&[
-        (Op::ChargeClientSession,&[11]),
+        (Op::ChargeClientSession,&[2,3,11]),
         (Op::ReclaimServiceLease,&[15]),
         (Op::ConfigureNetwork,&[3]),
         (Op::ModifyFilesystemPolicy,&[2]),
@@ -56,7 +56,7 @@ mod tests {
     fn bootstrap_roster_has_no_implicit_charging_authority() {
         assert_eq!(preflight(),Ok(()));
         assert!(service_grants::permits(11,Op::ChargeClientSession));
-        assert!(!service_grants::permits(3,Op::ChargeClientSession));
-        assert!(!service_grants::permits(2,Op::ChargeClientSession));
+        assert!(service_grants::permits(3,Op::ChargeClientSession));
+        assert!(service_grants::permits(2,Op::ChargeClientSession));
     }
 }

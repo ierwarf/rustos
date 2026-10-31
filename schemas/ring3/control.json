@@ -261,6 +261,96 @@
           "required": true
         }
       ]
+    },
+    {
+      "name": "provider_session_accounting",
+      "opcode": 520,
+      "fields": [
+        {
+          "name": "request_id",
+          "tag": 1,
+          "type": "u64",
+          "required": true
+        },
+        {
+          "name": "provider_service",
+          "tag": 2,
+          "type": "u64",
+          "required": true
+        },
+        {
+          "name": "provider_pid",
+          "tag": 3,
+          "type": "u64",
+          "required": true
+        },
+        {
+          "name": "provider_lease",
+          "tag": 4,
+          "type": "u64",
+          "required": true
+        },
+        {
+          "name": "client_pid",
+          "tag": 5,
+          "type": "u64",
+          "required": true
+        },
+        {
+          "name": "client_job",
+          "tag": 6,
+          "type": "u64",
+          "required": true
+        },
+        {
+          "name": "client_job_generation",
+          "tag": 7,
+          "type": "u32",
+          "required": true
+        },
+        {
+          "name": "session",
+          "tag": 8,
+          "type": "u64",
+          "required": true
+        },
+        {
+          "name": "token_epoch",
+          "tag": 9,
+          "type": "u64",
+          "required": true
+        },
+        {
+          "name": "token_nonce",
+          "tag": 10,
+          "type": "u64",
+          "required": true
+        },
+        {
+          "name": "kernel_receipt",
+          "tag": 11,
+          "type": "u64",
+          "required": true
+        },
+        {
+          "name": "operation",
+          "tag": 12,
+          "type": "u16",
+          "required": true
+        },
+        {
+          "name": "phase",
+          "tag": 13,
+          "type": "u16",
+          "required": true
+        },
+        {
+          "name": "status",
+          "tag": 14,
+          "type": "u32",
+          "required": true
+        }
+      ]
     }
   ]
 }

@@ -152,3 +152,30 @@ rustfmt check, IDL generation/check, QEMU, KVM, CI, formal verification,
 sanitizer, runtime stress or performance measurement. The content is meant
 for Codex to repair, not an accepted release. All unresolved production
 interfaces above remain unresolved.
+
+## Second batch: production generic provider slow control RPC
+
+- Rootd ops 25/26 now decode fixed, strictly shaped provider-session
+  frames and refuse mismatched operation/phase/scalar fallback.
+- Rootd authenticates netd/vfsd against exact live lease, positive service
+  grant and effective kernel JobPolicy before looking up the client's
+  generational Job ID.
+- Kernel Job charge is keyed to the exact provider PID and a retained rootd
+  kernel token. Ambiguous charge and release replies keep their token alive.
+- Kernel lifecycle EXIT for netd/vfsd triggers token drain before the
+  user-space provider receipt table is discarded.
+- Shared `rustos-svc-runtime::provider_client` can prepare, dispatch and
+  settle a provider charge/release with identical retries, without holding a
+  local service lock during RPC.
+- New netd/vfsd service adapters are imported. Socket and open-description
+  publication/closure call sites are NOT yet wired, pending final-ref and
+  startup deadlock analysis.
+- Descriptor schema opcode 520 is staged in declarative generated-IDL inputs.
+  The fixed provider wire remains the LIVE draft, so this is NOT yet a
+  generated-IDL transport cutover.
+
+**Codex first:** fix remaining inferred no_std/feature/codegen drift,
+run exact negative-right tests, and migrate every socket and VFS open/dup/
+close/accept/retirement path with a single client-funded bill. Do not
+allow bootstrapping vfsd to wait on rootd while rootd waits on vfsd.
+No build, compilation or boot validation has been performed.

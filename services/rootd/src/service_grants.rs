@@ -40,7 +40,7 @@ const fn grant(service: u64, operations: u64) -> PositiveGrant {
 
 pub(super) const GRANTS: [PositiveGrant; 13] = [
     grant(IPC_SERVICE_LINUX_SYSCALLD, checkpoint()),
-    grant(IPC_SERVICE_VFSD, checkpoint() | op_mask(Op::MountFilesystem) | op_mask(Op::ModifyFilesystemPolicy)),
+    grant(IPC_SERVICE_VFSD, checkpoint() | op_mask(Op::MountFilesystem) | op_mask(Op::ModifyFilesystemPolicy) | op_mask(Op::ChargeClientSession)),
     grant(IPC_SERVICE_LOADERD, checkpoint() | op_mask(Op::SpawnProcess)
         | op_mask(Op::TransferJobDescriptor) | op_mask(Op::UpgradeComponent)),
     grant(IPC_SERVICE_PROCD, checkpoint() | op_mask(Op::SignalForeignProcess)),
@@ -48,7 +48,7 @@ pub(super) const GRANTS: [PositiveGrant; 13] = [
     grant(IPC_SERVICE_INITD, checkpoint() | op_mask(Op::ReclaimServiceLease)
         | op_mask(Op::ConfigureSupervisor) | op_mask(Op::UpgradeComponent)
         | op_mask(Op::RollbackComponent)),
-    grant(IPC_SERVICE_NETD, checkpoint() | op_mask(Op::ConfigureNetwork)),
+    grant(IPC_SERVICE_NETD, checkpoint() | op_mask(Op::ConfigureNetwork) | op_mask(Op::ChargeClientSession)),
     grant(IPC_SERVICE_DEVMGRD, checkpoint() | op_mask(Op::ControlDevice)),
     grant(IPC_SERVICE_INPUTD, checkpoint()),
     grant(IPC_SERVICE_STORAGED, checkpoint()),
@@ -97,6 +97,6 @@ mod tests {
         assert!(!permits(0, Op::WriteRecoveryCheckpoint));
         assert!(permits(IPC_SERVICE_NETD, Op::ResolveServiceRoute));
         assert!(permits(IPC_SERVICE_SESSIOND, Op::ChargeClientSession));
-        assert!(!permits(IPC_SERVICE_VFSD, Op::ChargeClientSession));
+        assert!(permits(IPC_SERVICE_VFSD, Op::ChargeClientSession));
     }
 }

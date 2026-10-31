@@ -1,4 +1,5 @@
 use super::session_accounting::SessionLedger;
+use super::provider_billing::ProviderBilling;
 use super::service_health::HealthBook;
 use super::service_updates::UpdateBook;
 use alloc::vec::Vec;
@@ -31,6 +32,8 @@ pub(crate) struct ServiceCheckpointStore {
     /// Supervisor control state: session accounts are independent of the
     /// checkpoint records but share rootd's one serialized service loop.
     pub(crate) sessions: SessionLedger,
+    /// Generic provider-session state is independent of the console ledger.
+    pub(crate) providers: ProviderBilling,
     pub(crate) health: HealthBook,
     pub(crate) updates: UpdateBook,
 }
@@ -43,6 +46,7 @@ impl ServiceCheckpointStore {
         Self {
             records: Vec::new(),
             sessions: SessionLedger::new(),
+            providers: ProviderBilling::new(),
             health: HealthBook::new(),
             updates: UpdateBook::new(),
         }

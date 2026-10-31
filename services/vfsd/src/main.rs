@@ -587,6 +587,7 @@ use storage_owner::{
     ExecutableSnapshotAdmission, ExecutableSnapshotPlan, VfsStorage,
 };
 
+mod provider_accounting;
 include!("state_checkpoint.rs");
 include!("state_requests.rs");
 include!("state_files.rs");

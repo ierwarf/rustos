@@ -39,9 +39,11 @@ pub enum Error{
 impl Frame{
     pub fn valid(self)->bool {
         self.request_id!=0&&self.provider_service!=0&&self.provider_pid!=0
-          &&self.provider_lease!=0&&self.client_pid!=0&&
-          self.client_job!=0&&self.client_job_generation!=0
+          &&self.provider_lease!=0&&self.client_pid!=0
           &&self.session!=0&&self.token_epoch!=0&&self.token_nonce!=0
+          && ((self.operation==Operation::Charge && self.phase==Phase::Request
+                && self.client_job==0 && self.client_job_generation==0)
+              || (self.client_job!=0 && self.client_job_generation!=0))
     }
     /// Only a server that already authenticated exact caller PID and live
     /// lease may use this validation. The wire is not self-authenticating.
@@ -63,11 +65,16 @@ impl Frame{
           ||self.provider_pid!=request.provider_pid
           ||self.provider_lease!=request.provider_lease
           ||self.client_pid!=request.client_pid
-          ||self.client_job!=request.client_job
-          ||self.client_job_generation!=request.client_job_generation
+          ||(request.operation!=Operation::Charge
+             && (self.client_job!=request.client_job
+                 ||self.client_job_generation!=request.client_job_generation))
           ||self.session!=request.session
           ||self.token_epoch!=request.token_epoch
           ||self.token_nonce!=request.token_nonce{return Err(Error::WrongRequest)}
+        if request.operation==Operation::Charge
+           && (self.client_job==0 || self.client_job_generation==0){
+            return Err(Error::Invalid)
+        }
         if !matches!(self.phase,Phase::Accepted|Phase::Committed|Phase::NotFound){
             return Err(Error::Phase)
         }
@@ -136,13 +143,14 @@ mod tests{
     fn no_scalar_fallback_and_exact_reply() {
         let r=Frame{operation:Operation::Charge,phase:Phase::Request,
             request_id:7,provider_service:3,provider_pid:10,provider_lease:4,
-            client_pid:20,client_job:5,client_job_generation:9,
+            client_pid:20,client_job:0,client_job_generation:0,
             session:1,token_epoch:3,token_nonce:10,kernel_receipt:0,status:0};
         let bytes=encode(r).unwrap();
         assert_eq!(decode(&bytes),Ok(r));
         let mut bad=bytes;bad[105]=1;
         assert_eq!(decode(&bad),Err(Error::Reserved));
         let mut ack=r;ack.phase=Phase::Committed;ack.kernel_receipt=99;
+        ack.client_job=5;ack.client_job_generation=9;
         assert_eq!(ack.validate_ack(r),Ok(()));
         ack.client_pid=21;
         assert_eq!(ack.validate_ack(r),Err(Error::WrongRequest));

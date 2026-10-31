@@ -72,6 +72,7 @@ use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
 
 mod commercial_protocol;
+mod provider_accounting;
 use commercial_protocol::{dispatch_commercial_request, validate_commercial_request};
 
 const RECV_BACKOFF: Duration = Duration::from_millis(1);
