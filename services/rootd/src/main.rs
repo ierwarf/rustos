@@ -43,6 +43,7 @@ mod loader_wire;
 mod memory_governor;
 mod scheduling_policy;
 mod service_checkpoint;
+mod checkpoint_journal;
 mod service_manifest;
 mod session_accounting;
 
@@ -249,6 +250,15 @@ pub extern "C" fn __rustos_rootd_start() -> ! {
     let mut leases = BOOTSTRAP_MANIFEST.map(lease);
     let mut post_init_leases = POST_INIT_MANIFEST.map(post_init_lease);
     let mut service_checkpoints = ServiceCheckpointStore::new();
+    // Replay every acknowledged checkpoint operation from kernel-resident
+    // custody before any restarted provider can scan or mutate its state.
+    // Fail closed on partial/corrupt history; this is rootd-process recovery,
+    // not a claim of persistence across machine power loss.
+    match checkpoint_journal::replay(&mut service_checkpoints) {
+        Ok(0) => debug_line(b"rootd: checkpoint journal fresh\n"),
+        Ok(_) => debug_line(b"rootd: checkpoint journal replayed\n"),
+        Err(_) => fail_closed(b"rootd: checkpoint journal replay refused\n"),
+    }
     let mut next_core_readiness_poll_ns = 0;
 
     // The bootstrap manifest is the rootd-owned policy boundary for direct
@@ -1409,6 +1419,13 @@ fn fill_commercial_max_response(
                 )
             };
             let duplicate = service_checkpoints.mutate(request.arg0, record)?;
+            // A duplicate caller retry must reach this same idempotent
+            // append. Do not ACK an in-memory-only mutation.
+            checkpoint_journal::append(
+                request.arg0,
+                rustos_user_abi::syscall::CHECKPOINT_JOURNAL_RECORD_MUTATE,
+                record,
+            )?;
             response.value0 = record.revision;
             response.value1 = u64::from(duplicate);
             Ok(())
@@ -1435,6 +1452,11 @@ fn fill_commercial_max_response(
                 )
             };
             let already_compacted = service_checkpoints.compact(request.arg0, proof)?;
+            checkpoint_journal::append(
+                request.arg0,
+                rustos_user_abi::syscall::CHECKPOINT_JOURNAL_RECORD_COMPACT,
+                proof,
+            )?;
             response.value0 = proof.revision;
             response.value1 = u64::from(already_compacted);
             Ok(())
