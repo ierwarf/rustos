@@ -2096,25 +2096,25 @@ mod tests {
     fn session_budget_is_bounded_idempotent_and_refunded_on_remove() {
         let mut state = SessionRuntime::default();
         assert_eq!(state.create_session(0), Err(libc::EINVAL));
-        for session in 1..=MAX_LIVE_CONSOLE_SESSIONS as u64 {
+        for session in 1..=super::MAX_LIVE_CONSOLE_SESSIONS as u64 {
             assert_eq!(state.create_session(session), Ok(()));
         }
-        assert_eq!(state.sessions.len(), MAX_LIVE_CONSOLE_SESSIONS);
+        assert_eq!(state.sessions.len(), super::MAX_LIVE_CONSOLE_SESSIONS);
         let observed_generation = state.graph_generation();
         assert_eq!(state.create_session(1), Ok(()));
         assert_eq!(state.graph_generation(), observed_generation);
         assert_eq!(
-            state.create_session(MAX_LIVE_CONSOLE_SESSIONS as u64 + 1),
+            state.create_session(super::MAX_LIVE_CONSOLE_SESSIONS as u64 + 1),
             Err(libc::ENOSPC)
         );
         assert_eq!(state.graph_generation(), observed_generation);
         state.remove_session(2);
-        assert_eq!(state.sessions.len(), MAX_LIVE_CONSOLE_SESSIONS - 1);
+        assert_eq!(state.sessions.len(), super::MAX_LIVE_CONSOLE_SESSIONS - 1);
         assert_eq!(
-            state.create_session(MAX_LIVE_CONSOLE_SESSIONS as u64 + 1),
+            state.create_session(super::MAX_LIVE_CONSOLE_SESSIONS as u64 + 1),
             Ok(())
         );
-        assert_eq!(state.sessions.len(), MAX_LIVE_CONSOLE_SESSIONS);
+        assert_eq!(state.sessions.len(), super::MAX_LIVE_CONSOLE_SESSIONS);
     }
 
     #[test]
