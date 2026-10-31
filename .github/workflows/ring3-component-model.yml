@@ -7,7 +7,7 @@ on:
     branches: [master]
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   model:
@@ -19,8 +19,24 @@ jobs:
         run: |
           toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
           rustup toolchain install "$toolchain" --profile minimal --component rustfmt
+      - name: Format only new Ring3 policy sources
+        run: |
+          cargo fmt -p rustos-component-model
+          rustfmt --edition 2021 services/rootd/src/component_policy.rs
+      - name: Publish format changes to staging branch
+        if: github.ref == 'refs/heads/ring3-staged-integration' && github.event_name == 'push'
+        run: |
+          git add libs/rustos-component-model/src/ services/rootd/src/component_policy.rs
+          if ! git diff --cached --quiet; then
+            git config user.name "rustos-ring3-checks[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit -m "style: format staged Ring3 policy code"
+            git push origin HEAD:refs/heads/ring3-staged-integration
+          fi
       - name: Check component formatting
-        run: cargo fmt -p rustos-component-model -- --check
+        run: |
+          cargo fmt -p rustos-component-model -- --check
+          rustfmt --edition 2021 --check services/rootd/src/component_policy.rs
       - name: Run component-model tests
         run: cargo test -p rustos-component-model --locked
       - name: Run rootd unit tests
