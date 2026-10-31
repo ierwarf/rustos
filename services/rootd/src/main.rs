@@ -32,6 +32,7 @@ mod jobs;
 mod job_policy;
 mod job_policy_probe;
 mod job_lease;
+mod policy_cutover;
 mod loader_realm;
 mod loader_transaction;
 mod application_limit_probe;
@@ -1104,6 +1105,10 @@ fn fill_commercial_max_response(
             Ok(())
         }
         COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_RECLAIM => {
+            policy_cutover::authorize_job_slow_op(
+                sender.pid,
+                rustos_component_model::policy_ops::SlowBrokerOperation::ReclaimServiceLease,
+            )?;
             reclaim_post_init_lease(leases, post_init_leases, request, sender)?;
             response.value0 = request.arg0;
             response.value1 = 0;
@@ -1111,6 +1116,10 @@ fn fill_commercial_max_response(
         }
         COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_MUTATE => {
             authorize_current_service_namespace(leases, post_init_leases, request.arg0, sender)?;
+            policy_cutover::authorize_job_slow_op(
+                sender.pid,
+                rustos_component_model::policy_ops::SlowBrokerOperation::WriteRecoveryCheckpoint,
+            )?;
             if request.path_len != 0
                 || request.payload_len as usize != size_of::<ServiceCheckpointRecordWire>()
                 || request.arg1 != 0
@@ -1134,6 +1143,10 @@ fn fill_commercial_max_response(
         }
         COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_COMPACT => {
             authorize_current_service_namespace(leases, post_init_leases, request.arg0, sender)?;
+            policy_cutover::authorize_job_slow_op(
+                sender.pid,
+                rustos_component_model::policy_ops::SlowBrokerOperation::CompactRecoveryCheckpoint,
+            )?;
             if request.path_len != 0
                 || request.payload_len as usize != size_of::<ServiceCheckpointRecordWire>()
                 || request.arg1 != 0
@@ -1157,6 +1170,10 @@ fn fill_commercial_max_response(
         }
         COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_SCAN => {
             authorize_current_service_namespace(leases, post_init_leases, request.arg0, sender)?;
+            policy_cutover::authorize_job_slow_op(
+                sender.pid,
+                rustos_component_model::policy_ops::SlowBrokerOperation::ReadRecoveryCheckpoint,
+            )?;
             if request.path_len != 0
                 || request.payload_len != 0
                 || request.arg2 != 0

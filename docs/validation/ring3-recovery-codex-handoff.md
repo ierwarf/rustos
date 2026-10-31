@@ -126,6 +126,17 @@ actually supervises. Do not delete the legacy fixed numeric service-ID ABI
 until independent named capability handles are provisioned through kernel
 and userspace. The authorization predicate itself is no longer duplicated.
 
+## Live slow-control JobPolicy gate
+
+Rootd now obtains a fresh kernel Job identity and inspect-only typed handle
+for the authenticated service caller of checkpoint read/write/compact and
+lease reclaim. It checks effective JobPolicy before modifying control-plane
+state. The IDL and positive role ACL remain separate. Run tests with a
+reduced effective ceiling, stale caller PID, recycled JobId and revoked parent
+policy; fail closed on inspection errors. This intentionally adds slow
+syscalls only to service-control operations, not the syscall/IPC hot path.
+Full positive role-capability cutover is still incomplete.
+
 ## Known remaining integration gates
 
 - Kernel-authoritative per-Job kernel-byte and service-session charges.

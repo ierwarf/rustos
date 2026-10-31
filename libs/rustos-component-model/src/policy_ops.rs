@@ -44,10 +44,14 @@ pub enum SlowBrokerOperation {
     CreateSharedMemory = 29,
     ModifyFilesystemPolicy = 30,
     InstallIdentityPolicy = 31,
+    WriteRecoveryCheckpoint = 32,
+    CompactRecoveryCheckpoint = 33,
+    ReadRecoveryCheckpoint = 34,
+    ReclaimServiceLease = 35,
 }
 
 impl SlowBrokerOperation {
-    pub const ALL: [Self; 32] = [
+    pub const ALL: [Self; 36] = [
         Self::SpawnProcess,
         Self::CreateJob,
         Self::SetJobLimits,
@@ -80,6 +84,10 @@ impl SlowBrokerOperation {
         Self::CreateSharedMemory,
         Self::ModifyFilesystemPolicy,
         Self::InstallIdentityPolicy,
+        Self::WriteRecoveryCheckpoint,
+        Self::CompactRecoveryCheckpoint,
+        Self::ReadRecoveryCheckpoint,
+        Self::ReclaimServiceLease,
     ];
 
     pub const fn operation(self) -> Operation {

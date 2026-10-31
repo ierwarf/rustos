@@ -143,7 +143,9 @@ fn validate(
         }
         // A declared parent must exist before its child, so a malformed
         // manifest cannot install a cyclic or detached live supervisor.
-        if !boot.iter().any(|parent| parent.service_id == spec.reporter_service_id)
+        if !boot
+            .iter()
+            .any(|parent| parent.service_id == spec.reporter_service_id)
             && !post[..index]
                 .iter()
                 .any(|parent| parent.service_id == spec.reporter_service_id)
@@ -333,8 +335,14 @@ mod tests {
     fn reporter_manifest_is_acyclic_and_rejects_unauthorized_parents() {
         assert_eq!(validate(&BOOTSTRAP_MANIFEST, &POST_INIT_MANIFEST), Ok(()));
         assert_eq!(reporter_service_id(IPC_SERVICE_NETD), Some(INITD_LEASE_ID));
-        assert_eq!(reporter_service_id(IPC_SERVICE_SESSIOND), Some(INITD_LEASE_ID));
-        assert_eq!(reporter_service_id(IPC_SERVICE_UISERVER), Some(IPC_SERVICE_SESSIOND));
+        assert_eq!(
+            reporter_service_id(IPC_SERVICE_SESSIOND),
+            Some(INITD_LEASE_ID)
+        );
+        assert_eq!(
+            reporter_service_id(IPC_SERVICE_UISERVER),
+            Some(IPC_SERVICE_SESSIOND)
+        );
         assert_eq!(reporter_service_id(u64::MAX), None);
         let mut invalid = POST_INIT_MANIFEST;
         invalid[0].reporter_service_id = invalid[0].service_id;

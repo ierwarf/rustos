@@ -68,6 +68,13 @@ library as replacing the existing rootd/Job/IPC authorities.
   before creating a child, and only advance the handle after success. This
   is a Ring3 *local quota*; it does not replace kernel Job charging or make
   the in-memory policy session ticket kernel-authoritative.
+- A production **negative JobPolicy gate** now consults the live, exact
+  kernel Job and effective ancestor ceiling before admitting checkpoint
+  read/write/compaction and initd post-init reclaim operations. The gate
+  denies stale descriptors, denied bits and failed kernel inspection without
+  falling back to the legacy grant. It runs only on rootd slow control IPC;
+  ordinary service lookup, syscall, scheduling, paging and TLB fast paths are
+  untouched. Existing positive service-role and lease checks remain required.
 - Post-init reporter ownership is now a **declarative parent edge** in
   `POST_INIT_MANIFEST`. Bootstrap rejects missing, forward and cyclic parents;
   live registration and transitive ancestry must resolve to the exact declared
@@ -94,7 +101,7 @@ library as replacing the existing rootd/Job/IPC authorities.
 | --- | --- | --- |
 | 1. Job lifecycle | Existing ring0 generational Job tree and typed descriptors (unchanged) | Hardware qualification, not reimplementation |
 | 2. Accounting | Existing counted process/thread/user-page limits; new userspace `pressure` model | Authoritative kernel-byte charge, memory.high/min admission/pressure wiring and acceptance |
-| 3. JobPolicy | Existing 256-bit kernel policy ceilings; typed slow-operation registry and live 13-role rootd authority manifest | Assign positive subject grants and dual-run cutover of legacy service-capability checks |
+| 3. JobPolicy | Existing 256-bit kernel policy ceilings; production negative gating of checkpoint/reclaim controls by effective JobPolicy; live 13-role rootd authority manifest | Assign positive subject grants and dual-run cutover of legacy service-capability checks |
 | 4. IDL/runtime | Canonical `idl` codec, schema validator/code generator and five generated staging interfaces | Generated production bindings, ABI versioned adapters and live service migrations |
 | 5. Components | New generation-bound Graph; live rootd manifest and 15-offer route validation, declarative ordered supervisor parent edges, exact live service PID collision/reporter-chain denial | Declarative activation, named kernel capability transfer and consolidated production supervisor ownership |
 | 6. Session budgets | New client-funded session policy with exact-generation tickets, overflow retirement, offer-issuance epochs, mandatory one-unit session charging and revoked-route scavenging | Binding client-funded service allocation to kernel Job budget and provider-failure accounting; live runtimed has an independent 256-console-session bound |
