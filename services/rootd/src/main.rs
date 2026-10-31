@@ -33,6 +33,7 @@ mod job_policy;
 mod job_policy_probe;
 mod job_lease;
 mod policy_cutover;
+mod service_grants;
 mod loader_realm;
 mod loader_transaction;
 mod application_limit_probe;
@@ -1208,9 +1209,8 @@ fn fill_commercial_max_response(
             Ok(())
         }
         COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_MUTATE => {
-            authorize_current_service_namespace(leases, post_init_leases, request.arg0, sender)?;
-            policy_cutover::authorize_job_slow_op(
-                sender.pid,
+            authorize_service_slow_grant(
+                leases, post_init_leases, request.arg0, sender,
                 rustos_component_model::policy_ops::SlowBrokerOperation::WriteRecoveryCheckpoint,
             )?;
             if request.path_len != 0
@@ -1235,9 +1235,8 @@ fn fill_commercial_max_response(
             Ok(())
         }
         COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_COMPACT => {
-            authorize_current_service_namespace(leases, post_init_leases, request.arg0, sender)?;
-            policy_cutover::authorize_job_slow_op(
-                sender.pid,
+            authorize_service_slow_grant(
+                leases, post_init_leases, request.arg0, sender,
                 rustos_component_model::policy_ops::SlowBrokerOperation::CompactRecoveryCheckpoint,
             )?;
             if request.path_len != 0
@@ -1262,9 +1261,8 @@ fn fill_commercial_max_response(
             Ok(())
         }
         COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_SCAN => {
-            authorize_current_service_namespace(leases, post_init_leases, request.arg0, sender)?;
-            policy_cutover::authorize_job_slow_op(
-                sender.pid,
+            authorize_service_slow_grant(
+                leases, post_init_leases, request.arg0, sender,
                 rustos_component_model::policy_ops::SlowBrokerOperation::ReadRecoveryCheckpoint,
             )?;
             if request.path_len != 0
@@ -1723,8 +1721,8 @@ fn reclaim_post_init_lease(
     if !initd_manages_post_init_service(exact.service) {
         return Err(13);
     }
-    policy_cutover::authorize_job_slow_op(
-        sender.pid,
+    authorize_service_slow_grant(
+        leases, post_init_leases, IPC_SERVICE_INITD, sender,
         rustos_component_model::policy_ops::SlowBrokerOperation::ReclaimServiceLease,
     )?;
 
@@ -2223,6 +2221,23 @@ fn authorize_service_lookup_for_subject(
     } else {
         Err(13)
     }
+}
+
+/// An explicit service grant is required in addition to the exact live
+/// caller and current kernel-enforced JobPolicy. The legacy role bit returned
+/// in capability descriptors is never sufficient for an operation.
+fn authorize_service_slow_grant(
+    leases: &[Lease],
+    post_init_leases: &[PostInitLease],
+    service: u64,
+    sender: IpcSenderIdentity,
+    operation: rustos_component_model::policy_ops::SlowBrokerOperation,
+) -> Result<(), i32> {
+    authorize_current_service_namespace(leases, post_init_leases, service, sender)?;
+    if !service_grants::permits(service, operation) {
+        return Err(13);
+    }
+    policy_cutover::authorize_job_slow_op(sender.pid, operation)
 }
 
 fn authorize_current_service_namespace(
