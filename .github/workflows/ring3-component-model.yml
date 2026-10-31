@@ -2,12 +2,12 @@ name: Ring3 component model
 
 on:
   push:
-    branches: [master]
+    branches: [master, ring3-recovery-graph-hardening]
   pull_request:
-    branches: [master]
+    branches: [master, ring3-recovery-graph-hardening]
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   model:
@@ -21,6 +21,20 @@ jobs:
           rustup toolchain install "$toolchain" --profile minimal --component rustfmt
       - name: Verify declarative Ring3 IDL
         run: python3 tools/ring3_idl_codegen.py --check
+      - name: Format recovery checkpoint source
+        run: rustfmt --edition 2021 services/rootd/src/service_checkpoint.rs
+      - name: Publish isolated recovery formatting
+        if: github.ref == 'refs/heads/ring3-recovery-graph-hardening'
+        run: |
+          git add services/rootd/src/service_checkpoint.rs
+          if ! git diff --cached --quiet; then
+            git config user.name "rustos-ring3-checks[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit -m "style: format Ring3 recovery checkpoint tests"
+            git push origin HEAD:refs/heads/ring3-recovery-graph-hardening
+          fi
+      - name: Verify checkpoint formatting
+        run: rustfmt --edition 2021 --check services/rootd/src/service_checkpoint.rs
       - name: Check component formatting
         run: |
           cargo fmt -p rustos-component-model -- --check
