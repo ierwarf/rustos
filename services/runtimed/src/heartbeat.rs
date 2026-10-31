@@ -5,6 +5,7 @@
 //! Kernel-stamped sender identity and rootd's exact lease graph are the
 //! authority; our sequence rejects delayed replies and repeated evidence.
 use std::mem::size_of;
+use rustos_component_model::health_wire::{self, Pulse};
 use std::time::{Duration, Instant};
 use rustos_user_abi::syscall::{
     CommercialMaxProtocolRequest, CommercialMaxProtocolResponse,
@@ -61,9 +62,18 @@ impl Heartbeat {
         request.header.op = COMMERCIAL_MAX_ROOTD_OP_SERVICE_HEARTBEAT;
         request.header.subject_pid = pid as u64;
         request.header.subject_tid = tid as u64;
-        request.arg0 = IPC_SERVICE_SESSIOND;
-        request.arg1 = sequence;
-        request.arg2 = pid as u64;
+        let pulse = Pulse {
+            service: IPC_SERVICE_SESSIOND,
+            incarnation_pid: pid as u64,
+            sequence,
+        };
+        let wire = health_wire::encode_pulse(pulse)
+            .map_err(|_| libc::EINVAL)?;
+        if wire.len() > request.payload.len() {
+            return Err(libc::E2BIG);
+        }
+        request.payload[..wire.len()].copy_from_slice(&wire);
+        request.payload_len = wire.len() as u32;
         let mut reply = CommercialMaxProtocolResponse::default();
         let bytes = unsafe {
             rustos_svc_runtime::syscall::syscall6(
@@ -81,13 +91,14 @@ impl Heartbeat {
         }
         if bytes as usize != size_of::<CommercialMaxProtocolResponse>()
             || !reply.is_valid_envelope_for(&request)
-            || reply.status != 0 || reply.value0 != sequence
-            || reply.value1 == 0 || reply.payload_len != 0
-            || reply.descriptor_count != 0
+            || reply.status != 0 || reply.value0 != 0
+            || reply.value1 == 0 || reply.descriptor_count != 0
         {
             return Err(libc::EPROTO);
         }
-        Ok(())
+        health_wire::decode_accept(
+            &reply.payload[..reply.payload_len as usize], pulse,
+        ).map_err(|_| libc::EPROTO)
     }
 }
 

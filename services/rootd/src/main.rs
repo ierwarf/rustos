@@ -1243,25 +1243,36 @@ fn fill_commercial_max_response(
             Ok(())
         }
         COMMERCIAL_MAX_ROOTD_OP_SERVICE_HEARTBEAT => {
-            if request.arg0 == 0
-                || request.arg1 == 0
-                || request.arg2 != sender.pid
-                || request.arg3 != 0
-                || request.path_len != 0
-                || request.payload_len != 0
+            use rustos_component_model::health_wire;
+            if request.arg0 != 0 || request.arg1 != 0
+                || request.arg2 != 0 || request.arg3 != 0 || request.path_len != 0
             {
                 return Err(22);
             }
+            let pulse = health_wire::decode_pulse(
+                &request.payload[..request.payload_len as usize],
+            ).map_err(|_| 22)?;
+            if pulse.incarnation_pid != sender.pid {
+                return Err(13);
+            }
             authorize_current_service_namespace(
-                leases, post_init_leases, request.arg0, sender,
+                leases, post_init_leases, pulse.service, sender,
             )?;
+            // Prepare the reply first. Even if encoding/heap admission fails,
+            // no health counter or expiry deadline has yet been modified.
+            let ack = health_wire::encode_accept(pulse).map_err(|_| 12)?;
+            if ack.len() > response.payload.len() {
+                return Err(75);
+            }
             let deadline = service_checkpoints.health.report(
-                request.arg0,
+                pulse.service,
                 sender.pid,
-                request.arg1,
+                pulse.sequence,
                 rustos_svc_runtime::syscall::monotonic_nanos(),
             )?;
-            response.value0 = request.arg1;
+            response.payload[..ack.len()].copy_from_slice(&ack);
+            response.payload_len = ack.len() as u32;
+            response.value0 = 0;
             response.value1 = deadline;
             Ok(())
         }
