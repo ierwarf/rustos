@@ -166,6 +166,9 @@ pub(super) struct JobSlot {
     /// The Ring3 supervisor retains exact session tokens and owns refunds.
     subtree_sessions: u64,
     session_limit: u64,
+    /// Exact boxed ProcessObject allocation budget (bytes). Other kernel
+    /// allocations are not yet included in this dimension.
+    kmem_process_limit_bytes: u64,
 }
 
 impl JobSlot {
@@ -181,6 +184,7 @@ impl JobSlot {
             policy: JobPolicy::ALL,
             subtree_sessions: 0,
             session_limit: LIMIT_UNSET,
+            kmem_process_limit_bytes: LIMIT_UNSET,
         }
     }
 
@@ -307,6 +311,22 @@ impl ProcessTable {
             {
                 return false;
             }
+            if new_processes != 0 {
+                let limit_bytes = self.jobs[cursor as usize].kmem_process_limit_bytes;
+                if limit_bytes != LIMIT_UNSET {
+                    // The process object has an exact-sized Box allocation.
+                    // The publication gate rechecks under the Job table lock
+                    // after reservations; no second concurrent publication can
+                    // exceed this admitted object-budget dimension.
+                    let object_bytes = core::mem::size_of::<ProcessObject>() as u64;
+                    let needed = self.subtree_objects(cursor)
+                        .saturating_add(new_processes)
+                        .saturating_mul(object_bytes);
+                    if needed > limit_bytes {
+                        return false;
+                    }
+                }
+            }
             let threads = self.own_limit(cursor, true);
             if new_threads != 0
                 && threads != LIMIT_UNSET
@@ -394,6 +414,7 @@ impl ProcessTable {
             slot.limits = JobLimits::UNSET;
             slot.policy = JobPolicy::ALL;
             slot.session_limit = LIMIT_UNSET;
+            slot.kmem_process_limit_bytes = LIMIT_UNSET;
             slot.subtree_sessions = 0;
             // Generation exhaustion retires the slot permanently, exactly like
             // a process slot: reusing generation one would alias a stale id.
@@ -427,6 +448,7 @@ pub fn job_create_child(parent: JobId) -> Result<JobId, JobError> {
     slot.policy = JobPolicy::ALL;
     slot.subtree_sessions = 0;
     slot.session_limit = LIMIT_UNSET;
+    slot.kmem_process_limit_bytes = LIMIT_UNSET;
     kernel_mm::api::charge::init_group(index, Some(parent.index as usize));
     let job = table.job_id_of(index as u32);
     policy::publish_job(&table, job);
@@ -578,6 +600,51 @@ pub fn job_is_within(ancestor: JobId, descendant: JobId) -> bool {
 }
 
 
+
+
+/// The first exact-sized kmem dimension is the boxed ProcessObject allocation.
+/// Unreaped objects remain charged while their Box is still live; this is
+/// independent from user data pages. Further kernel allocations (handle
+/// tables, IPC endpoints, page tables, VMA nodes) need their own real
+/// allocation/free custody before a *total* kmem.max_bytes claim is valid.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct JobKmemInfo {
+    pub job: JobId,
+    pub process_object_limit_bytes: u64,
+    pub usage_process_object_bytes: u64,
+    pub process_object_size: u64,
+}
+
+pub fn job_kmem_info(id: JobId) -> Result<JobKmemInfo, JobError> {
+    let table = PROCESS_TABLE.lock();
+    let slot = table.job_slot(id).ok_or(JobError::Stale)?;
+    let bytes = core::mem::size_of::<ProcessObject>() as u64;
+    Ok(JobKmemInfo {
+        job: id,
+        process_object_limit_bytes: slot.kmem_process_limit_bytes,
+        usage_process_object_bytes: table.subtree_objects(id.index).saturating_mul(bytes),
+        process_object_size: bytes,
+    })
+}
+
+pub fn job_set_kmem_process_limit(id: JobId, bytes: u64) -> Result<JobKmemInfo, JobError> {
+    let mut table = PROCESS_TABLE.lock();
+    let slot = table.job_slot(id).ok_or(JobError::Stale)?;
+    if slot.state == JobState::Killing {
+        return Err(JobError::Killing);
+    }
+    // Matching memory.max behavior: shrinking below current usage does not
+    // retroactively free an object. It only forbids the next publication.
+    let object_size = core::mem::size_of::<ProcessObject>() as u64;
+    let usage = table.subtree_objects(id.index).saturating_mul(object_size);
+    table.jobs[id.index as usize].kmem_process_limit_bytes = bytes;
+    Ok(JobKmemInfo {
+        job: id,
+        process_object_limit_bytes: bytes,
+        usage_process_object_bytes: usage,
+        process_object_size: object_size,
+    })
+}
 
 /// Kernel-owned memory pressure policy. Memory.max keeps its existing
 /// fault-path admission. Soft high emits a bounded counter and protected min
