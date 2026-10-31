@@ -7,6 +7,7 @@ members = [
     "libs/driver-domain-protocol",
     "libs/driver-domain-host",
     "libs/rustos-image-admission",
+    "libs/rustos-release-verifier",
     "libs/rustos-scheduler-frame-gate",
     "libs/observability-client",
     "libs/runtime-control",

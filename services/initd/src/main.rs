@@ -1,3 +1,4 @@
+mod update_control;
 //! Post-root bootstrap, service dependency, and exact child-lease supervisor.
 //!
 //! - **Owner:** `initd` owns the signed startup graph and post-init children;

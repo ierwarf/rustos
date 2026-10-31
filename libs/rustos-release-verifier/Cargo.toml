@@ -1,0 +1,9 @@
+[package]
+name = "rustos-release-verifier"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Canonical Ed25519 release manifest and immutable byte hash verifier"
+[dependencies]
+ed25519-dalek = { version = "2.2", default-features = false }
+sha2 = { version = "0.10", default-features = false }

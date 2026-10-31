@@ -22,6 +22,8 @@
 
 extern crate alloc;
 
+mod release_attestation;
+
 use alloc::borrow::ToOwned;
 use alloc::ffi::CString;
 use alloc::format;

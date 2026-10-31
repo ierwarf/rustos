@@ -175,6 +175,18 @@ impl ProviderClient {
 }
 /// Stateless transport; must be invoked AFTER releasing all local state
 /// locks. Exact service identity and the client Job are checked by rootd.
+/// Explicit custody ACK. The kernel provider-token watermark remains
+/// after rootd compacts the terminal receipt. Failure to acknowledge merely
+/// retains the bounded rootd tombstone; it does not resurrect a debit.
+pub fn acknowledge_receipt(mut committed:Frame)->Result<(),i32>{
+    if !matches!(committed.operation,Operation::Cancel|Operation::Release)
+        || committed.phase!=Phase::Committed || committed.status!=0
+        || committed.kernel_receipt!=0 {return Err(EINVAL)}
+    committed.phase=Phase::Accepted;
+    let ack=call_rootd(committed)?;
+    if ack.phase!=Phase::Committed || ack.status!=0 {return Err(EPROTO)}
+    Ok(())
+}
 pub fn call_rootd(frame:Frame)->Result<Frame,i32>{
     if !frame.valid()||frame.phase!=Phase::Request{return Err(EINVAL)}
     let op=match frame.operation {
@@ -249,4 +261,36 @@ mod tests {
         assert_eq!(b.charged(1,bad),Err(Error::WrongAck));
         assert_eq!(b.rotate_epoch(6),Err(Error::Uncertain));
     }
+    #[test]
+    fn ambiguous_charge_cancel_preserves_original_provider_nonce(){
+        let mut b=ProviderClient::new(3,81,7).unwrap();
+        let charge=b.begin_charge(999,70).unwrap();
+        b.dispatch_charge(999).unwrap();
+        let cancel=b.begin_cancel(999).unwrap();
+        assert_eq!(cancel.token_nonce,charge.token_nonce);
+        assert_eq!(cancel.operation,Operation::Cancel);
+        assert_eq!(cancel.client_job,0);
+        assert_eq!(b.dispatch_cancel(999),Ok(cancel));
+        assert_eq!(b.dispatch_cancel(999),Ok(cancel));
+        let settled=Frame{phase:Phase::Committed,..cancel};
+        b.cancelled(999,settled).unwrap();
+        assert_eq!(b.live_count(),0);
+    }
+    #[test]
+    fn refund_does_not_confuse_a_new_request_with_a_prior_ack(){
+        let mut b=ProviderClient::new(2,88,15).unwrap();
+        let charge=b.begin_charge(11,98).unwrap();
+        b.dispatch_charge(11).unwrap();
+        b.charged(11,Frame{phase:Phase::Committed,
+            client_job:0x200000007,client_job_generation:7,
+            kernel_receipt:3,..charge}).unwrap();
+        let release=b.begin_release(11).unwrap();
+        b.dispatch_release(11).unwrap();
+        let mut wrong=Frame{phase:Phase::Committed,..release};
+        wrong.token_nonce+=1;
+        assert_eq!(b.released(11,wrong),Err(Error::WrongAck));
+        b.released(11,Frame{phase:Phase::Committed,..release}).unwrap();
+        assert_eq!(b.live_count(),0);
+    }
+
 }

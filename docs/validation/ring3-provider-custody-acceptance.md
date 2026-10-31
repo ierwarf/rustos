@@ -117,3 +117,24 @@ compaction contract before claiming long-running production stability.
 6. Kernel accounting counter deltas including exact negative-right tests.
 7. Failure after kernel charge before user copyout and before IPC reply.
 8. Control-plane deadlock and IPC p50/p99 latency regression review.
+
+## 2026-11-01 CANCEL / receipt-ACK extension
+
+Rootd operations 27 and 28 are added to the provider control ABI.
+CANCEL is a jobless kernel-token release, not a second CHARGE, and
+the provider uses the same exact token/lease even when the original
+charge IPC never reached rootd. The kernel's root Job session ledger
+records the terminal refund watermark for known tokens. Rootd's
+per-owner nonce high watermark fences a late charge where no rootd
+entry was created at all. A released or canceled receipt remains until
+the provider confirms the terminal ACK using operation 28. Successful
+receipt compaction must never reset the nonce high watermark. On
+provider process exit, kernel drain runs before receipt/owner custody
+is discarded.
+
+P0 negative cases to run: CANCEL-before-CHARGE ordering, concurrent
+late CHARGE after CANCEL, two providers with equal nonce, wrong
+client/session/Job while ACK-compacting, forged ACK from unrelated
+PID, rootd crash between kernel refund and receipt ACK, PID reuse,
+global kernel provider watermark and 4096-ticket bounds. The new
+unit tests are source only, not executed.

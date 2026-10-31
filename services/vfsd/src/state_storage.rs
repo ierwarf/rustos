@@ -192,7 +192,7 @@ impl VfsState {
             // A checkpoint partial write can be replayed, but its unexposed
             // session charge must not leak when an OPEN did not complete.
             // The exact ticket survives if the refund ACK is ambiguous.
-            let refund=self.refund_open_description(id);
+            let refund=self.cancel_unpublished_open_description(id);
             if refund.is_err() {
                 return Err(EBUSY);
             }

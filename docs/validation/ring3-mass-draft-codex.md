@@ -198,3 +198,28 @@ IPC to rootd. An ambiguous refund cannot be interpreted as a successful
 close, and a refunded socket must never regain a public reference. Run the
 existing UNIX socket lifecycle unit matrix and bounded scheduler/IPC
 regressions in Codex, not in this drafting session.
+
+## Release trust / stable-media gap-fill (2026-11-01)
+
+- `libs/rustos-release-verifier`: domain-bound canonical Ed25519 release
+  manifest with exact no_std SHA-256 checks against candidate **and** old
+  byte streams; trusted keys are external sealed boot configuration, not
+  a caller-supplied signer name. Generation floor and revocation checked.
+- `services/loaderd/src/release_attestation.rs`: typed canonical update
+  stage RPC emitted only after real verifier returns. This module has no
+  live request dispatcher: production signed update initiation must still
+  be added.
+- `services/initd/src/update_control.rs`: ARM, ROLLBACK, SEAL, INSPECT
+  typed rootd RPC clients. A successful call DOES NOT by itself prove the
+  old image is retained or a new executable was signed.
+- `services/storaged/src/release_journal.rs`: exclusive provision vs
+  open-existing, O_NOFOLLOW, header identity, append, sync_all, exact
+  readback, and JournalDevice adapter. Must be provided an independently
+  authenticated *persistent* mount. It does not pick its own filename or
+  pretend a tmpfs/diskless path is physically durable.
+- `rootd`: existing release transaction remains memory-backed. It has
+  not been connected to storaged JournalDevice, old-image pin custody,
+  independent boot trust, or recovery reactivation.
+
+This is not eight-stage completion; Codex must separate compile fixes
+from genuinely unimplemented production integration. No validation run.

@@ -64,6 +64,22 @@ impl OpenDescriptionBilling {
         let ack=control_retry(request)?;
         self.ledger.charged(remote_id,ack).map_err(errno)
     }
+    fn ensure_cancel(&mut self,remote_id:u64)->Result<(),i32>{
+        let phase=match self.ledger.pending(remote_id){
+            Ok((phase,_))=>phase,
+            Err(Error::Missing)=>return Ok(()),
+            Err(err)=>return Err(errno(err)),
+        };
+        if matches!(phase,State::ReleasePrepared|State::ReleaseInFlight){
+            return self.ensure_release(remote_id)
+        }
+        let request=self.ledger.begin_cancel(remote_id).map_err(errno)?;
+        let request=self.ledger.dispatch_cancel(remote_id).map_err(errno)?;
+        let ack=control_retry(request)?;
+        self.ledger.cancelled(remote_id,ack).map_err(errno)?;
+        let _=rustos_svc_runtime::provider_client::acknowledge_receipt(ack);
+        Ok(())
+    }
     fn ensure_release(&mut self,remote_id:u64)->Result<(),i32>{
         let state=match self.ledger.pending(remote_id) {
             Ok((state,_))=>state,
@@ -71,19 +87,18 @@ impl OpenDescriptionBilling {
             Err(Error::Missing)=>return Ok(()),
             Err(err)=>return Err(errno(err)),
         };
-        if matches!(state,State::ChargePrepared|State::ChargeInFlight){
-            // A charge may have happened despite a lost ACK. Reconcile with
-            // its original token before attempting the final refund.
-            let charge=self.ledger.dispatch_charge(remote_id).map_err(errno)?;
-            let ack=control_retry(charge)?;
-            self.ledger.charged(remote_id,ack).map_err(errno)?;
+        if matches!(state,State::ChargePrepared|State::ChargeInFlight|
+            State::CancelPrepared|State::CancelInFlight){
+            return self.ensure_cancel(remote_id)
         }
         if self.ledger.pending(remote_id).map_err(errno)?.0==State::Funded {
             self.ledger.begin_release(remote_id).map_err(errno)?;
         }
         let request=self.ledger.dispatch_release(remote_id).map_err(errno)?;
         let ack=control_retry(request)?;
-        self.ledger.released(remote_id,ack).map_err(errno)
+        self.ledger.released(remote_id,ack).map_err(errno)?;
+        let _=rustos_svc_runtime::provider_client::acknowledge_receipt(ack);
+        Ok(())
     }
     fn owns_funded(&self,remote_id:u64,client_pid:u64)->bool{
         self.ledger.pending(remote_id).ok().is_some_and(|(state,frame)|{
@@ -111,6 +126,13 @@ impl VfsState {
     pub(super) fn bill_open_description(
         &mut self,remote_id:u64,client_pid:u64)->Result<(),i32>{
         self.billing_mut()?.ensure_open(remote_id,client_pid).map(|_|())
+    }
+    pub(super) fn cancel_unpublished_open_description(
+        &mut self,remote_id:u64)->Result<(),i32>{
+        match self.billing.as_mut(){
+            Some(billing)=>billing.ensure_cancel(remote_id),
+            None=>Ok(()),
+        }
     }
     pub(super) fn refund_open_description(
         &mut self,remote_id:u64)->Result<(),i32>{

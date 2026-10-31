@@ -83,9 +83,11 @@ JobSession ABI v2 stores provider PID + token, atomic Job counts, high-water
 cancellation markers and replay-safe refund. Records survive rootd PROCESS
 restart; rootd startup and provider exit drain kernel-resident charges.
 Runtimed charges suspended children before activation; loaderd sets app
-session ceilings; rootd retains bounded receipts. Missing: netd/vfsd and
-other provider session billing, exact SMP cancellation and PID-reuse proof,
-and provider-lifecycle race acceptance.
+session ceilings. Source now wires netd and vfsd open/close callsites through
+a rootd provider ledger, including explicit cancel, release ACK compaction
+and nonce watermark that survives a compacted tombstone. NOT VERIFIED:
+service bootstrap deadlock, PID reuse, active/in-flight accept races,
+lossy IPC or rootd crash, other provider sessions and multi-core concurrency.
 
 ## 7. Ring3 policy and personalities
 
@@ -108,11 +110,18 @@ candidate PID, deadline and exact health. A candidate cannot satisfy trial
 through claimed service name alone. Initd sees rollback-required and refuses
 automatic launch of a potentially changed image until independent restoration.
 
-NOT IMPLEMENTED: authoritative signed previous-image custody, real byte-
-signature verification of new release in the update transaction, durable
-filesystem journal and fsync, transactional old-image restoration, replay
-after power loss, and end-to-end verified release acceptance. A rollback-
-required state is NOT a completed rollback.
+New release verifier source performs strict Ed25519 verification of a
+canonical, domain-separated release manifest and SHA-256 checks for both
+candidate and previous image bytes against independently supplied trusted
+signers and rollback floor. Loaderd and initd now have typed control IPC
+clients for signed-stage and subsequent transitions, and storaged has an
+append/sync/readback file journal backend implementing JournalDevice. THESE
+ARE NOT AN END-TO-END RELEASE PATH. They lack a boot-trusted signer keyring,
+authoritative immutable old-image pin, physically authenticated persistent
+mount, an actual update dispatcher, a fully integrated commit/restore
+transaction and reboot-time orchestration. Rootd's old memory-only checkpoint
+journal is not equivalent to this new disk backend. A rollback-required
+state is NOT a completed rollback.
 
 ## Codex P0 repair and acceptance gates
 
@@ -143,7 +152,7 @@ required state is NOT a completed rollback.
 - Full generated-IDL migration of remaining operational service protocols.
 - Unified atomic component activation, consistent parent ownership and
   service crash rollback.
-- Bill netd/vfsd clients, not service providers.
+- Harden and verify netd/vfsd client-billing cutover; expand to other providers.
 - Complete Ring3 slow personality/policy migration without hotpath changes.
 - Persistent power-loss-safe storage, signed upgrades, exact old image
   rollback and accepted health recovery.
@@ -271,3 +280,53 @@ capacity/worker termination, vfsd bootstrap control dependency cycles,
 provider PID reuse, actual kernel token and source-fd binding, reconnect
 semantics, and missing end-to-end generated-IDL 520 adoption. No compiler,
 boot, unit tests, stress, CI, or audit script was executed.
+
+## 2026-11-01 final draft gap-fill: actual source status
+
+**Stage 1:** User-space Job lifecycle is already wired, with exact
+generational identities in Ring0. Remaining rejection/counterexamples are
+Codex proof work. Do not move kernel Job object ownership to Ring3.
+
+**Stage 2:** ProcessObject kmem dimension and slow memory QoS exist. FULL
+kernel resource charging at every page-table, IPC endpoint, scheduling,
+handle-table and VMA allocation/free is **still implementation work**,
+not merely Codex validation. Future changes must touch exact real Ring0
+allocation owners; a userspace ledger may never stand in for kernel quota.
+
+**Stage 3:** Service positive grants and sender/Job ceilings are live.
+Actual type-safe kernel capability handle transfer and elimination of all
+numeric legacy privileged role branches are **still implementation work**.
+
+**Stage 4:** Canonical generated control protocols are partial. Schema 520
+is staged but fixed provider wire remains active. Full producer/consumer
+migration of legacy repr(C) control APIs and removal of old code is still
+implementation work; no generic mechanical conversion is safe without
+transaction and copyout semantics review.
+
+**Stage 5:** Parent/service catalog, rootd preflight, health and initd
+supervision are live. Atomic activation ownership/recovery graph and all
+service heartbeat senders are still partial, not just acceptance tests.
+
+**Stage 6:** Live service callsites for netd/vfsd added. This pass adds
+provider CANCEL for failed/ambiguous CHARGE with same token, an explicit
+provider receipt ACK for safe tombstone compaction, rootd monotonic per-owner
+nonce watermarks, and exact-tombstone replay after lost release ACK. Live
+path concurrency, PID reuse, kernel watermark exhaustion and failure
+injection must be validated and potentially reworked by Codex.
+
+**Stage 7:** Slow Ring3 personality/namespace policy models are present.
+A full Linux/Windows compatibility broker authorization cutover remains
+unimplemented. Kernel IPC, scheduler, futex, getpid/gettid, clock, page
+fault, mapping/TLB and trusted handle enforcement remain Ring0 by design.
+
+**Stage 8:** Signed release verifier (Ed25519 + byte hash) and storaged
+sync/readback JournalDevice implementation now have real source;
+loaderd/initd update RPC client modules have been drafted. But no
+boot-authenticated keyring provisioning, image swap sender flow, physically
+persistent configured journal mount, restore process or power-loss replay
+integration has been connected. UpdateBook's health-committed state is NOT
+independent evidence of a signed durable release. No acceptance claim.
+
+No compiler, build, QEMU, sanitizer, unit test, audit script, formal run,
+or performance run was executed. New code is an intentionally unverified
+source draft for Codex to repair/complete.

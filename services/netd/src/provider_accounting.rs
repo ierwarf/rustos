@@ -47,8 +47,7 @@ fn refund_worker() {
             Some(token)=>{
                 // A lost CHARGE ACK must be reconciled before releasing
                 // the same kernel token. Never use a second charge ID.
-                let success=recheck_ambiguous(token)
-                    .and_then(|()|release_if_funded(token)).is_ok();
+                let success=release_if_funded(token).is_ok();
                 if !success {
                     // Retry the exact token. Do not invent an errno-success
                     // state merely because the socket itself is already gone.
@@ -119,7 +118,10 @@ pub(super) fn charge_before_publish(token:u64,client_pid:u64)
         let mut book=lock()?;
         match book.begin_charge(token,client_pid){
             Ok(_)=>{}
-            Err(Error::Existing)=>{}
+            Err(Error::Existing)=>{
+                let (_,prior)=book.pending(token).map_err(errno)?;
+                if prior.client_pid!=client_pid{return Err(libc::EACCES)}
+            }
             Err(err)=>return Err(errno(err)),
         }
         book.dispatch_charge(token).map_err(errno)?
@@ -129,20 +131,38 @@ pub(super) fn charge_before_publish(token:u64,client_pid:u64)
     book.charged(token,ack).map_err(errno)
 }
 pub(super) fn release_if_funded(token:u64)->Result<(),i32>{
-    let present={
+    let phase={
         let book=lock()?;
         match book.pending(token) {
-            Ok((State::Funded,_))|
-            Ok((State::ReleasePrepared,_))|
-            Ok((State::ReleaseInFlight,_))=>true,
-            Ok((State::ChargeInFlight,_))|
-            Ok((State::ChargePrepared,_))=>return Err(libc::EAGAIN),
-            Err(Error::Missing)=>false,
+            Ok((state,_))=>state,
+            Err(Error::Missing)=>return Ok(()),
             Err(err)=>return Err(errno(err)),
         }
     };
-    if !present{return Ok(())}
-    release_after_final_close(token)
+    match phase {
+        State::Funded|State::ReleasePrepared|State::ReleaseInFlight=>
+            release_after_final_close(token),
+        State::ChargePrepared|State::ChargeInFlight|
+        State::CancelPrepared|State::CancelInFlight=>
+            cancel_unpublished(token),
+    }
+}
+/// An unpublished object cannot go back through CHARGE reconciliation:
+/// CANCEL is valid with no client Job receipt and fences a charge that
+/// arrived before an ACK was lost.
+fn cancel_unpublished(token:u64)->Result<(),i32>{
+    let req={
+        let mut book=lock()?;
+        book.begin_cancel(token).map_err(errno)?;
+        book.dispatch_cancel(token).map_err(errno)?
+    };
+    let ack=rpc_retry(req)?;
+    {
+        let mut book=lock()?;
+        book.cancelled(token,ack).map_err(errno)?;
+    }
+    let _=provider_client::acknowledge_receipt(ack);
+    Ok(())
 }
 pub(super) fn release_after_final_close(token:u64)->Result<(),i32>{
     let req={
@@ -159,22 +179,23 @@ pub(super) fn release_after_final_close(token:u64)->Result<(),i32>{
         book.dispatch_release(token).map_err(errno)?
     };
     let ack=rpc_retry(req)?;
-    let mut book=lock()?;
-    book.released(token,ack).map_err(errno)
+    {
+        let mut book=lock()?;
+        book.released(token,ack).map_err(errno)?;
+    }
+    // On ACK loss the rootd tombstone stays, but the kernel refund is final.
+    // Tombstone cleanup is best effort, never another socket close.
+    let _=provider_client::acknowledge_receipt(ack);
+    Ok(())
 }
 pub(super) fn recheck_ambiguous(token:u64)->Result<(),i32>{
     let (state,_)={lock()?.pending(token).map_err(errno)?};
     match state {
-        State::ChargeInFlight=>{
-            let req={lock()?.dispatch_charge(token).map_err(errno)?};
-            let ack=rpc_retry(req)?;
-            lock()?.charged(token,ack).map_err(errno)?;
-            Ok(())
-        }
+        State::ChargeInFlight|State::ChargePrepared|
+        State::CancelInFlight|State::CancelPrepared=>cancel_unpublished(token),
         State::ReleaseInFlight|State::ReleasePrepared=>
             release_after_final_close(token),
-        State::Funded=>Ok(()),
-        State::ChargePrepared=>Err(libc::EAGAIN),
+        State::Funded=>release_after_final_close(token),
     }
 }
 pub(super) fn unsettled(mut each:impl FnMut(u64,State,Frame))->Result<(),i32>{

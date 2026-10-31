@@ -1129,6 +1129,11 @@ pub const COMMERCIAL_MAX_ROOTD_OP_UPDATE_INSPECT: u16 = 24;
 /// Multi-provider, exact-token client Job funding. Canonical provider frame only.
 pub const COMMERCIAL_MAX_ROOTD_OP_PROVIDER_SESSION_CHARGE: u16 = 25;
 pub const COMMERCIAL_MAX_ROOTD_OP_PROVIDER_SESSION_RELEASE: u16 = 26;
+/// Jobless cancel of an ambiguous provider charge, using the SAME kernel token.
+pub const COMMERCIAL_MAX_ROOTD_OP_PROVIDER_SESSION_CANCEL: u16 = 27;
+/// Provider ACK of a committed release/cancel. Rootd may compact a settled
+/// receipt only after this signal and the kernel's high-water mark remain.
+pub const COMMERCIAL_MAX_ROOTD_OP_PROVIDER_RECEIPT_ACK: u16 = 28;
 /// Store one versioned, service-owned checkpoint record.  Rootd authenticates
 /// the current service lease and retains the opaque record across a supervised
 /// service restart; it never interprets the service-private value bytes.

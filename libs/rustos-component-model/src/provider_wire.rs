@@ -41,8 +41,8 @@ impl Frame{
         self.request_id!=0&&self.provider_service!=0&&self.provider_pid!=0
           &&self.provider_lease!=0&&self.client_pid!=0
           &&self.session!=0&&self.token_epoch!=0&&self.token_nonce!=0
-          && ((self.operation==Operation::Charge && self.phase==Phase::Request
-                && self.client_job==0 && self.client_job_generation==0)
+          && (((matches!(self.operation,Operation::Charge|Operation::Cancel)
+                && self.client_job==0 && self.client_job_generation==0))
               || (self.client_job!=0 && self.client_job_generation!=0))
     }
     /// Only a server that already authenticated exact caller PID and live
@@ -55,7 +55,7 @@ impl Frame{
         if self.phase!=Phase::Request||self.kernel_receipt!=0||self.status!=0 {
             return Err(Error::Phase)
         }
-        if self.operation==Operation::Charge
+        if matches!(self.operation,Operation::Charge|Operation::Cancel)
             && (self.client_job!=0||self.client_job_generation!=0){
             return Err(Error::Invalid)
         }

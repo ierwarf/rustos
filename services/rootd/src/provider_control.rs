@@ -28,6 +28,15 @@ fn exact_accounting_fields(request:&CommercialMaxProtocolRequest)
     let intended=match request.header.op {
         COMMERCIAL_MAX_ROOTD_OP_PROVIDER_SESSION_CHARGE=>Operation::Charge,
         COMMERCIAL_MAX_ROOTD_OP_PROVIDER_SESSION_RELEASE=>Operation::Release,
+        COMMERCIAL_MAX_ROOTD_OP_PROVIDER_SESSION_CANCEL=>Operation::Cancel,
+        COMMERCIAL_MAX_ROOTD_OP_PROVIDER_RECEIPT_ACK=>{
+            if !matches!(control.operation,Operation::Release|Operation::Cancel)
+                ||control.phase!=Phase::Accepted
+                ||control.kernel_receipt!=0||control.status!=0 {
+                return Err(22)
+            }
+            return Ok(control)
+        }
         _=>return Err(22),
     };
     if control.operation!=intended||control.phase!=Phase::Request
@@ -51,20 +60,37 @@ pub(super) fn execute(
     }
     // The asserted provider lease/epoch is not independently a kernel
     // generation: the exact live service owner must already be checked above.
-    req.validate_request(sender.pid,req.provider_lease).map_err(|_|13)?;
+    if request.header.op!=COMMERCIAL_MAX_ROOTD_OP_PROVIDER_RECEIPT_ACK {
+        req.validate_request(sender.pid,req.provider_lease).map_err(|_|13)?;
+    }
     let owner=Owner{service,pid:sender.pid,lease:req.provider_lease};
     let token=Token{epoch:req.token_epoch,nonce:req.token_nonce};
     let receipt;
     let (job,gen);
-    if req.operation==Operation::Charge {
-        let actual=jobs::process_job(req.client_pid).map_err(|_|13i32)?;
-        if actual==0{return Err(13)}
-        // Kernel Job ID packs slot (upper 32) + immutable slot generation
-        // (lower 32). Never accept a caller-supplied guessed Job identity.
-        job=actual;
-        gen=actual as u32;
-        if gen==0{return Err(116)}
-        let client=Client{pid:req.client_pid,job,job_generation:gen};
+    if request.header.op==COMMERCIAL_MAX_ROOTD_OP_PROVIDER_RECEIPT_ACK {
+        book.acknowledge(owner,token,sender.pid,req.client_pid,
+            req.session,kind,req.client_job,req.client_job_generation)?;
+        job=req.client_job;
+        gen=req.client_job_generation;
+        receipt=0;
+    } else if req.operation==Operation::Charge {
+        // An in-flight kernel charge may already have succeeded when the
+        // client process exits. A retry MUST reuse the originally verified
+        // JobId rather than querying the now-stale client PID and treating
+        // the lost ACK as permission to invent a new token.
+        let client=if let Some((prior,session,prior_kind,_,_))=
+            book.find_ticket(owner,token) {
+            if prior.pid!=req.client_pid || session!=req.session
+                || prior_kind!=kind {return Err(13)}
+            prior
+        } else {
+            let actual=jobs::process_job(req.client_pid).map_err(|_|13i32)?;
+            if actual==0 || actual as u32==0{return Err(116)}
+            Client{pid:req.client_pid,job:actual,
+                job_generation:actual as u32}
+        };
+        job=client.job;
+        gen=client.job_generation;
         let ticket=Ticket{token,provider:owner,client,kind,session:req.session};
         let kernel_charge=|c:Client,pid:u64,t:u64|{
             jobs::charge_client_session(c.pid,c.job,pid,t)
@@ -76,6 +102,15 @@ pub(super) fn execute(
         } else {
             book.charge(ticket,sender.pid,true,kernel_charge)?
         };
+    } else if req.operation==Operation::Cancel {
+        // A failed or ambiguous CHARGE is canceled with expected_job=0;
+        // the kernel's per-provider token watermark fences delayed retries.
+        book.cancel(owner,token,sender.pid,req.client_pid,req.session,kind,
+            |pid,kernel_token|jobs::release_client_session(0,pid,kernel_token)
+                .map(|_|()).map_err(|e|e as i32))?;
+        job=0;
+        gen=0;
+        receipt=0;
     } else {
         job=req.client_job;
         gen=req.client_job_generation;

@@ -6,6 +6,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 mod block;
+mod release_journal;
 
 use rustos_user_abi::performance::DVM_STORAGE_BOOT_READY_HARD_LIMIT_MS;
 use rustos_user_abi::syscall::{

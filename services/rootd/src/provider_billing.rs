@@ -14,6 +14,7 @@ const ENOSPC:i32=28;
 const ESTALE:i32=116;
 const EBUSY:i32=16;
 const MAX_PROVIDER_TICKETS:usize=4096;
+const MAX_PROVIDER_OWNERS:usize=128;
 #[derive(Clone,Copy,Debug,Eq,PartialEq)]
 struct Funded {
     provider:Owner,client:Client,kind:ProviderKind,
@@ -23,13 +24,39 @@ struct Funded {
 pub(super) struct ProviderBilling {
     funded:Vec<Funded>,
     next_kernel_token:u64,
+    // An ACKed terminal receipt can be discarded, but the provider-local
+    // token watermark must survive until this exact PID exits. Otherwise a
+    // reissued nonce could receive a FRESH kernel token and double-charge.
+    owner_watermarks:Vec<(Owner,u64)>,
 }
 impl ProviderBilling {
     pub(super) const fn new()->Self {
-        Self{funded:Vec::new(),next_kernel_token:0}
+        Self{funded:Vec::new(),next_kernel_token:0,
+            owner_watermarks:Vec::new()}
     }
     pub(super) fn unknown(&self,owner:Owner,token:Token)->bool {
         self.find(owner,token).is_some_and(|i|self.funded[i].state==State::ChargeUnknown)
+    }
+    pub(super) fn find_ticket(&self,owner:Owner,token:Token)
+        ->Option<(Client,u64,ProviderKind,State,u64)> {
+        let i=self.find(owner,token)?;
+        let e=self.funded[i];
+        Some((e.client,e.session,e.kind,e.state,e.charge_id))
+    }
+    fn watermark(&self,owner:Owner)->Option<u64>{
+        self.owner_watermarks.iter().find(|(o,_)|*o==owner).map(|(_,high)|*high)
+    }
+    fn admit_owner_nonce(&mut self,owner:Owner,nonce:u64)->Result<(),i32>{
+        if let Some((_,high))=self.owner_watermarks.iter_mut()
+            .find(|(o,_)|*o==owner){
+            if nonce<=*high{return Err(ESTALE)}
+            *high=nonce;
+            return Ok(())
+        }
+        if self.owner_watermarks.len()>=MAX_PROVIDER_OWNERS{return Err(ENOSPC)}
+        self.owner_watermarks.try_reserve(1).map_err(|_|12)?;
+        self.owner_watermarks.push((owner,nonce));
+        Ok(())
     }
     fn find(&self,owner:Owner,token:Token)->Option<usize> {
         self.funded.iter().position(|x|x.provider==owner&&x.token==token)
@@ -66,8 +93,11 @@ impl ProviderBilling {
                 && x.token.nonce>=ticket.token.nonce
         }) {return Err(ESTALE)}
         if self.funded.len()>=MAX_PROVIDER_TICKETS{return Err(ENOSPC)}
+        // All fallible memory and token-overflow checks precede the kernel
+        // charge; watermark advancement is conservatively irreversible.
         self.funded.try_reserve(1).map_err(|_|12)?;
         let kernel_token=self.next_kernel_token.checked_add(1).ok_or(75)?;
+        self.admit_owner_nonce(ticket.provider,ticket.token.nonce)?;
         // A kernel charge may commit even if the copyout fails. The callback
         // MUST reconcile by this token; it may not retry with a fresh token.
         // The token and ambiguous intent MUST be stored before an RPC can
@@ -137,6 +167,66 @@ impl ProviderBilling {
         self.funded[idx].state=State::Settled;
         Ok(())
     }
+    /// Cancellation of an uncertain CHARGE is NOT another CHARGE. Kernel
+    /// RELEASE with no expected JobId fences the original rootd-owned token
+    /// even if the original charge request never reached the kernel. It also
+    /// refunds an already committed charge without needing an ACKed JobId.
+    pub(super) fn cancel(
+        &mut self,owner:Owner,token:Token,sender_pid:u64,
+        client_pid:u64,session:u64,kind:ProviderKind,
+        mut release_any:impl FnMut(u64,u64)->Result<(),i32>,
+    )->Result<(),i32>{
+        if sender_pid!=owner.pid{return Err(EACCES)}
+        let Some(i)=self.find(owner,token) else {
+            // No original charge was dispatched through rootd (or an old
+            // cancellation was ACK-compacted). Reserve this nonce in the
+            // provider watermark, so an in-flight late CHARGE may not create
+            // a new kernel token after cancellation was accepted.
+            if self.watermark(owner).is_some_and(|high|token.nonce<=high){
+                return Ok(())
+            }
+            self.admit_owner_nonce(owner,token.nonce)?;
+            return Ok(())
+        };
+        let e=self.funded[i];
+        if e.client.pid!=client_pid||e.session!=session||e.kind!=kind{
+            return Err(EACCES)
+        }
+        if e.state==State::Settled{return Ok(())}
+        if !matches!(e.state,State::ChargeUnknown|State::Charged|
+            State::ReleaseUnknown){return Err(EBUSY)}
+        self.funded[i].state=State::ReleaseUnknown;
+        release_any(owner.pid,e.kernel_token)?;
+        self.funded[i].state=State::Settled;
+        Ok(())
+    }
+
+    /// An exact provider ACK is the only point at which rootd may compact a
+    /// settled receipt. The owner watermark survives compaction.
+    pub(super) fn acknowledge(
+        &mut self,owner:Owner,token:Token,sender_pid:u64,
+        client_pid:u64,session:u64,kind:ProviderKind,
+        job:u64,generation:u32,
+    )->Result<(),i32>{
+        if sender_pid!=owner.pid{return Err(EACCES)}
+        let Some(i)=self.find(owner,token) else {
+            // Only the same owner can acknowledge its already-compacted
+            // receipt. The sender authentication has already completed.
+            return if self.watermark(owner).is_some_and(|high|
+                token.nonce<=high){Ok(())} else {Err(ESTALE)}
+        };
+        let e=self.funded[i];
+        if e.client.pid!=client_pid||e.session!=session||e.kind!=kind{
+            return Err(EACCES)
+        }
+        if job!=0 && (job!=e.client.job || generation!=e.client.job_generation){
+            return Err(EACCES)
+        }
+        if e.state!=State::Settled{return Err(EBUSY)}
+        self.funded.swap_remove(i);
+        Ok(())
+    }
+
     /// On provider exit, do NOT trust stale provider IPC to trigger refund.
     /// Rootd requires kernel-authenticated lifecycle evidence, then drains
     /// kernel-owned outstanding tokens before any PID reuse.
@@ -148,6 +238,7 @@ impl ProviderBilling {
         drain(owner.pid)?;
         let before=self.funded.len();
         self.funded.retain(|e|e.provider!=owner);
+        self.owner_watermarks.retain(|(o,_)|*o!=owner);
         Ok(before-self.funded.len())
     }
     /// The rootd supervisor passes only a kernel-stamped lifecycle EXIT
@@ -159,10 +250,14 @@ impl ProviderBilling {
     )->Result<usize,i32> {
         if pid==0{return Err(EINVAL)}
         let has_provider=self.funded.iter().any(|e|e.provider.pid==pid);
-        if !has_provider{return Ok(0)}
+        if !has_provider{
+            self.owner_watermarks.retain(|(o,_)|o.pid!=pid);
+            return Ok(0)
+        }
         kernel_drain(pid)?;
         let before=self.funded.len();
         self.funded.retain(|e|e.provider.pid!=pid);
+        self.owner_watermarks.retain(|(o,_)|o.pid!=pid);
         Ok(before-self.funded.len())
     }
     /// Rootd must not acknowledge a provider release merely because its
@@ -295,6 +390,40 @@ mod tests{
         assert_eq!(book.count(),1);
         assert_eq!(book.owner_exit_pid(300,|_|Ok(())),Ok(1));
         assert_eq!(book.count(),0);
+    }
+
+    #[test]
+    fn cancel_undelivered_charge_fences_late_same_nonce(){
+        let owner=Owner{service:3,pid:42,lease:1};
+        let client=Client{pid:10,job:0x100000001,job_generation:1};
+        let token=Token{epoch:1,nonce:5};
+        let ticket=Ticket{provider:owner,client,kind:ProviderKind::Socket,
+            session:8,token};
+        let mut book=ProviderBilling::new();
+        book.cancel(owner,token,42,10,8,ProviderKind::Socket,
+            |_,_|panic!("absent charge must not require refund")).unwrap();
+        assert_eq!(book.charge(ticket,42,true,|_,_,_|panic!("late charge")),
+            Err(ESTALE));
+        book.acknowledge(owner,token,42,10,8,ProviderKind::Socket,0,0).unwrap();
+    }
+
+    #[test]
+    fn ack_compaction_preserves_the_spent_nonce_fence(){
+        let owner=Owner{service:2,pid:62,lease:6};
+        let client=Client{pid:7,job:0x200000001,job_generation:1};
+        let token=Token{epoch:6,nonce:13};
+        let ticket=Ticket{provider:owner,client,kind:ProviderKind::OpenDescription,
+            session:22,token};
+        let mut b=ProviderBilling::new();
+        b.charge(ticket,62,true,|_,_,t|Ok(t)).unwrap();
+        b.release(owner,token,62,client,22,ProviderKind::OpenDescription,
+            |_,_,_|Ok(())).unwrap();
+        b.acknowledge(owner,token,62,7,22,ProviderKind::OpenDescription,
+            client.job,client.job_generation).unwrap();
+        assert_eq!(b.count(),0);
+        assert_eq!(b.charge(ticket,62,true,|_,_,_|panic!("double charge")),
+            Err(ESTALE));
+        assert_eq!(b.owner_exit_pid(62,|_|Ok(())),Ok(0));
     }
 
 }

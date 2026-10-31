@@ -14,3 +14,6 @@ test = false
 rustos-svc-runtime = { path = "../../libs/rustos-svc-runtime" }
 rustos-user-abi = { path = "../../libs/rustos-user-abi" }
 rustos-image-admission = { path = "../../libs/rustos-image-admission" }
+
+rustos-release-verifier = { path = "../../libs/rustos-release-verifier" }
+rustos-component-model = { path = "../../libs/rustos-component-model" }
