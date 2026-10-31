@@ -2,9 +2,9 @@ name: Ring3 component model
 
 on:
   push:
-    branches: [master, ring3-runtimed-session-capacity]
+    branches: [master, ring3-recovery-graph-hardening]
   pull_request:
-    branches: [master, ring3-runtimed-session-capacity]
+    branches: [master, ring3-recovery-graph-hardening]
 
 permissions:
   contents: write
@@ -21,24 +21,26 @@ jobs:
           rustup toolchain install "$toolchain" --profile minimal --component rustfmt
       - name: Verify declarative Ring3 IDL
         run: python3 tools/ring3_idl_codegen.py --check
-      - name: Format staged session capacity controls
+      - name: Format recovery checkpoint source
         run: |
-          rustfmt --edition 2021 services/runtimed/src/session.rs
-          rustfmt --edition 2021 services/runtimed/src/spawn.rs
-      - name: Save staged session formatting
-        if: github.ref == 'refs/heads/ring3-runtimed-session-capacity'
+          rustfmt --edition 2021 services/rootd/src/service_checkpoint.rs
+          rustfmt --edition 2021 services/rootd/src/service_manifest.rs
+          rustfmt --edition 2021 services/rootd/src/component_policy.rs
+      - name: Publish isolated recovery formatting
+        if: github.ref == 'refs/heads/ring3-recovery-graph-hardening'
         run: |
-          git add services/runtimed/src/session.rs services/runtimed/src/spawn.rs
+          git add services/rootd/src/service_checkpoint.rs services/rootd/src/service_manifest.rs services/rootd/src/component_policy.rs
           if ! git diff --cached --quiet; then
             git config user.name "rustos-ring3-checks[bot]"
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git commit -m "style: format runtimed session budget changes"
-            git push origin HEAD:refs/heads/ring3-runtimed-session-capacity
+            git commit -m "style: format Ring3 recovery checkpoint tests"
+            git push origin HEAD:refs/heads/ring3-recovery-graph-hardening
           fi
-      - name: Check session capacity formatting
+      - name: Verify checkpoint formatting
         run: |
-          rustfmt --edition 2021 --check services/runtimed/src/session.rs
-          rustfmt --edition 2021 --check services/runtimed/src/spawn.rs
+          rustfmt --edition 2021 --check services/rootd/src/service_checkpoint.rs
+          rustfmt --edition 2021 --check services/rootd/src/service_manifest.rs
+          rustfmt --edition 2021 --check services/rootd/src/component_policy.rs
       - name: Check component formatting
         run: |
           cargo fmt -p rustos-component-model -- --check
