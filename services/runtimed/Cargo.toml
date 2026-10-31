@@ -5,6 +5,7 @@ edition = "2021"
 publish = false
 
 [dependencies]
+rustos-component-model = { path = "../../libs/rustos-component-model" }
 observability-client = { path = "../../libs/observability-client" }
 libc = "0.2"
 keyboard-core = { path = "../../drivers/libs/keyboard-core" }

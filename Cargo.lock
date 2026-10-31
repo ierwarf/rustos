@@ -1147,6 +1147,7 @@ dependencies = [
 name = "runtimed"
 version = "0.1.0"
 dependencies = [
+ "rustos-component-model",
  "keyboard-core",
  "libc",
  "observability-client",
