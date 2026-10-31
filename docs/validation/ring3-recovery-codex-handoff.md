@@ -188,3 +188,17 @@ client sessions on exit, check that a second exit is idempotent, and that a new
 instance may restart its token namespace at one. Loaderd sets per-application
 session ceilings on the same child handle as its other Job limits. The old
 runtimed launch-worker-absent inline fallback is intentionally retired.
+
+## Session ACK-loss and cancellation semantics
+
+Rootd maintains a bounded recent release receipt ledger (up to 256 tokens)
+for each authenticated sessiond incarnation. Repeated releases of a
+successfully refunded token return the exact original JobId without another
+kernel uncharge. Releasing an unknown token stamps a cancellation tombstone,
+advancing the token watermark; a delayed old charge cannot reappear after a
+successful cancel ACK. Runtimed retries transient charge/release errors with
+the same token. If charge ACK is ambiguous, it issues a cancellation before
+activating the suspended child and panics rather than allowing an unaccounted
+or double-accounted child if settlement itself is ambiguous. Codex must assess
+lost responses, duplicate reordered messages, interrupted or partial user
+copyout, rootd crash after kernel mutation and receipt eviction under churn.

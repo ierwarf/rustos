@@ -73,21 +73,48 @@ fn call(op: u16, token: u64, client_pid: u64) -> Result<(), i32> {
     if response.status != 0 {
         return Err(response.status);
     }
-    if response.value0 == 0 {
+    if op == COMMERCIAL_MAX_ROOTD_OP_SESSION_ACCOUNT_CHARGE && response.value0 == 0 {
         return Err(libc::EPROTO);
     }
     Ok(())
+}
+
+fn bounded_retry(op: u16, token: u64, pid: u64) -> Result<(), i32> {
+    let mut last = libc::ETIMEDOUT;
+    for _ in 0..3 {
+        match call(op, token, pid) {
+            Ok(()) => return Ok(()),
+            Err(e) if e == libc::ETIMEDOUT || e == libc::EINTR || e == libc::EAGAIN => {
+                last = e;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last)
 }
 
 pub(super) fn charge(token: u64, pid: i32) -> Result<(), i32> {
     if pid <= 0 {
         return Err(libc::EINVAL);
     }
-    call(COMMERCIAL_MAX_ROOTD_OP_SESSION_ACCOUNT_CHARGE, token, pid as u64)
+    match bounded_retry(COMMERCIAL_MAX_ROOTD_OP_SESSION_ACCOUNT_CHARGE, token, pid as u64) {
+        Ok(()) => Ok(()),
+        Err(e) if e == libc::ETIMEDOUT || e == libc::EINTR || e == libc::EAGAIN => {
+            // The original charge might have succeeded and lost its ACK.
+            // Release is an idempotent tombstone, even if no charge reached
+            // rootd yet. Do not activate a suspended child before settlement.
+            bounded_retry(COMMERCIAL_MAX_ROOTD_OP_SESSION_ACCOUNT_RELEASE, token, 0)
+                .unwrap_or_else(|refund_error| {
+                    panic!("runtimed: fatal ambiguous Job session charge token={token} refund={refund_error}")
+                });
+            Err(e)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 pub(super) fn release(token: u64) -> Result<(), i32> {
-    call(COMMERCIAL_MAX_ROOTD_OP_SESSION_ACCOUNT_RELEASE, token, 0)
+    bounded_retry(COMMERCIAL_MAX_ROOTD_OP_SESSION_ACCOUNT_RELEASE, token, 0)
 }
 
 #[cfg(test)]

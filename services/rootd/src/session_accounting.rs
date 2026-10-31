@@ -23,8 +23,18 @@ struct Accounted {
     client_job: u64,
 }
 
+/// Bounded recent receipts make a retried release idempotent even after its
+/// first kernel refund succeeded but the supervisor response was lost.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Retired {
+    token: u64,
+    client_pid: u64,
+    client_job: u64,
+}
+
 pub(crate) struct SessionLedger {
     entries: Vec<Accounted>,
+    retired: Vec<Retired>,
     last_token: u64,
     /// Live authenticated sessiond generation, named by exact reporter PID.
     owner_pid: u64,
@@ -32,7 +42,12 @@ pub(crate) struct SessionLedger {
 
 impl SessionLedger {
     pub(crate) fn new() -> Self {
-        Self { entries: Vec::new(), last_token: 0, owner_pid: 0 }
+        Self {
+            entries: Vec::new(),
+            retired: Vec::new(),
+            last_token: 0,
+            owner_pid: 0,
+        }
     }
 
     /// A restarted sessiond may start its local handle counter at one.
@@ -51,6 +66,7 @@ impl SessionLedger {
             self.release_all(kernel_release)?;
             self.owner_pid = pid;
             self.last_token = 0;
+            self.retired.clear();
         }
         Ok(())
     }
@@ -69,6 +85,7 @@ impl SessionLedger {
         self.release_all(kernel_release)?;
         self.owner_pid = 0;
         self.last_token = 0;
+        self.retired.clear();
         Ok(())
     }
 
@@ -107,6 +124,17 @@ impl SessionLedger {
         Ok(job)
     }
 
+    /// Bound the reply-dedup history; never allocate after a kernel refund
+    /// has already committed.
+    fn reserve_receipt(&mut self) -> Result<(), i32> {
+        if self.retired.len() == MAX_SESSIONS {
+            self.retired.remove(0);
+        } else {
+            self.retired.try_reserve(1).map_err(|_| ENOMEM)?;
+        }
+        Ok(())
+    }
+
     /// The JobId was captured at admission. Never rediscover the Job by a PID
     /// that may have exited or been recycled before this refund.
     pub(crate) fn release(
@@ -119,14 +147,25 @@ impl SessionLedger {
             return Err(EINVAL);
         }
         let Some(index) = self.entries.iter().position(|e| e.token == token) else {
-            return Err(ESTALE);
+            return match self.retired.iter().find(|e| e.token == token) {
+                Some(receipt) if receipt.client_pid == client_pid =>
+                    Ok(receipt.client_job),
+                Some(_) => Err(EACCES),
+                None => Err(ESTALE),
+            };
         };
         let entry = self.entries[index];
         if entry.client_pid != client_pid {
             return Err(EACCES);
         }
+        self.reserve_receipt()?;
         kernel_release(entry.client_job)?;
         self.entries.swap_remove(index);
+        self.retired.push(Retired {
+            token,
+            client_pid,
+            client_job: entry.client_job,
+        });
         Ok(entry.client_job)
     }
 
@@ -138,11 +177,26 @@ impl SessionLedger {
         token: u64,
         kernel_release: impl FnMut(u64) -> Result<(), i32>,
     ) -> Result<u64, i32> {
-        let pid = self.entries.iter()
-            .find(|entry| entry.token == token)
-            .map(|entry| entry.client_pid)
-            .ok_or(ESTALE)?;
-        self.release(token, pid, kernel_release)
+        if token == 0 {
+            return Err(EINVAL);
+        }
+        if let Some(entry) = self.entries.iter().find(|entry| entry.token == token) {
+            return self.release(token, entry.client_pid, kernel_release);
+        }
+        if let Some(receipt) = self.retired.iter().find(|entry| entry.token == token) {
+            return Ok(receipt.client_job);
+        }
+        // Lost/late charge acknowledgement: release unknown is a cancellation.
+        // Advance the watermark so the corresponding old charge can NEVER
+        // arrive later and create a new bill after we acknowledged release.
+        self.reserve_receipt()?;
+        self.last_token = self.last_token.max(token);
+        self.retired.push(Retired {
+            token,
+            client_pid: 0,
+            client_job: 0,
+        });
+        Ok(0)
     }
 
     /// Reclaim every outstanding session after sessiond's authenticated
@@ -158,6 +212,7 @@ impl SessionLedger {
             self.entries.pop();
             released += 1;
         }
+        self.retired.clear();
         Ok(released)
     }
 
@@ -195,7 +250,7 @@ mod tests {
             releases.set(releases.get() + 1);
             Ok(())
         }), Ok(77));
-        assert_eq!(book.release(8, 200, |_| panic!("double refund")), Err(ESTALE));
+        assert_eq!(book.release(8, 200, |_| panic!("double refund")), Ok(77));
         assert_eq!(book.charge(8, 200, |_| Ok(77), |_, _| Ok(())), Err(ESTALE));
         assert_eq!(releases.get(), 1);
         assert_eq!(book.live_count(), 0);
@@ -246,6 +301,18 @@ mod tests {
         assert_eq!(book.last_token, 1);
         book.bind_owner(11, |_| panic!("same owner no rollback")).unwrap();
         assert_eq!(book.live_count(), 1);
+    }
+
+    #[test]
+    fn late_charge_is_invalidated_by_exact_token_cancellation() {
+        let mut book = SessionLedger::new();
+        book.bind_owner(10, |_| Ok(())).unwrap();
+        assert_eq!(book.release_trusted(23, |_| panic!("nothing to bill")), Ok(0));
+        assert_eq!(book.charge(23, 200, |_| Ok(7), |_, _| panic!("late charge")), Err(ESTALE));
+        assert_eq!(book.release_trusted(23, |_| panic!("already canceled")), Ok(0));
+        assert_eq!(book.charge(24, 201, |_| Ok(8), |_, _| Ok(())), Ok(8));
+        assert_eq!(book.release_trusted(24, |_| Ok(())), Ok(8));
+        assert_eq!(book.release_trusted(24, |_| panic!("double refund")), Ok(8));
     }
 
     #[test]
