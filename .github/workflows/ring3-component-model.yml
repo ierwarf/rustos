@@ -2,9 +2,9 @@ name: Ring3 component model
 
 on:
   push:
-    branches: [master]
+    branches: [master, ring3-lease-admission-hardening]
   pull_request:
-    branches: [master]
+    branches: [master, ring3-lease-admission-hardening]
 
 permissions:
   contents: read
