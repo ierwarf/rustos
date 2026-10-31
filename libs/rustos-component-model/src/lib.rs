@@ -35,6 +35,7 @@ pub mod session;
 pub mod supervision;
 pub mod telemetry;
 pub mod update;
+pub mod update_wire;
 pub mod wire;
 
 pub use identity::{ComponentId, Moniker, MonikerError};
