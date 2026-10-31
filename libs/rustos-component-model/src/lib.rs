@@ -18,6 +18,7 @@ extern crate alloc;
 
 pub mod generated_idl;
 pub mod health;
+pub mod health_wire;
 pub mod identity;
 pub mod idl;
 pub mod lease_reclaim;
