@@ -180,7 +180,9 @@ pub(super) fn process_job(pid: u64) -> Result<u64, i64> {
 /// Admission/refund is deliberately outside the IPC fast path. Only rootd's
 /// boot descriptor retains ACCOUNT_SESSIONS; the loader receives attenuated
 /// process creation rights and cannot underbill another Job.
-pub(super) fn charge_client_session(pid: u64, job_id: u64) -> Result<u64, i64> {
+pub(super) fn charge_client_session(
+    pid: u64, job_id: u64, provider_pid: u64, token: u64,
+) -> Result<u64, i64> {
     use rustos_user_abi::syscall::*;
     let mut args = RustosJobSessionArgs {
         abi_version: JOB_SESSION_ABI_VERSION,
@@ -188,22 +190,43 @@ pub(super) fn charge_client_session(pid: u64, job_id: u64) -> Result<u64, i64> {
         job_handle: JOB_BOOTSTRAP_ROOT_FD,
         client_pid: pid,
         job_id,
+        provider_pid,
+        token,
         ..RustosJobSessionArgs::default()
     };
     let status = syscall1(SYS_RUSTOS_JOB_SESSION, (&mut args as *mut RustosJobSessionArgs) as u64);
     if status < 0 { Err(-status) } else { Ok(args.usage) }
 }
 
-pub(super) fn release_client_session(job_id: u64) -> Result<u64, i64> {
+pub(super) fn release_client_session(
+    job_id: u64, provider_pid: u64, token: u64,
+) -> Result<u64, i64> {
     use rustos_user_abi::syscall::*;
     let mut args = RustosJobSessionArgs {
         abi_version: JOB_SESSION_ABI_VERSION,
         op: JOB_SESSION_OP_RELEASE,
         job_handle: JOB_BOOTSTRAP_ROOT_FD,
         job_id,
+        provider_pid,
+        token,
         ..RustosJobSessionArgs::default()
     };
     let status = syscall1(SYS_RUSTOS_JOB_SESSION, (&mut args as *mut RustosJobSessionArgs) as u64);
+    if status < 0 { Err(-status) } else { Ok(args.usage) }
+}
+
+/// Rootd startup or an authenticated provider exit can reconcile any kernel
+/// token left alive after losing the previous rootd process's user ledger.
+pub(super) fn drain_client_sessions(provider_pid: u64) -> Result<u64, i64> {
+    use rustos_user_abi::syscall::*;
+    let mut args = RustosJobSessionArgs {
+        abi_version: JOB_SESSION_ABI_VERSION,
+        op: JOB_SESSION_OP_DRAIN,
+        job_handle: JOB_BOOTSTRAP_ROOT_FD,
+        provider_pid,
+        ..RustosJobSessionArgs::default()
+    };
+    let status = syscall1(SYS_RUSTOS_JOB_SESSION, &mut args as *mut _ as u64);
     if status < 0 { Err(-status) } else { Ok(args.usage) }
 }
 

@@ -57,7 +57,7 @@ impl SessionLedger {
     pub(crate) fn bind_owner(
         &mut self,
         pid: u64,
-        kernel_release: impl FnMut(u64) -> Result<(), i32>,
+        kernel_release: impl FnMut(u64, u64, u64) -> Result<(), i32>,
     ) -> Result<(), i32> {
         if pid == 0 {
             return Err(EINVAL);
@@ -77,7 +77,7 @@ impl SessionLedger {
     pub(crate) fn owner_exited(
         &mut self,
         pid: u64,
-        kernel_release: impl FnMut(u64) -> Result<(), i32>,
+        kernel_release: impl FnMut(u64, u64, u64) -> Result<(), i32>,
     ) -> Result<(), i32> {
         if pid == 0 || self.owner_pid != pid {
             return Ok(());
@@ -141,7 +141,7 @@ impl SessionLedger {
         &mut self,
         token: u64,
         client_pid: u64,
-        mut kernel_release: impl FnMut(u64) -> Result<(), i32>,
+        mut kernel_release: impl FnMut(u64, u64, u64) -> Result<(), i32>,
     ) -> Result<u64, i32> {
         if token == 0 || client_pid == 0 {
             return Err(EINVAL);
@@ -159,7 +159,7 @@ impl SessionLedger {
             return Err(EACCES);
         }
         self.reserve_receipt()?;
-        kernel_release(entry.client_job)?;
+        kernel_release(entry.client_job, self.owner_pid, entry.token)?;
         self.entries.swap_remove(index);
         self.retired.push(Retired {
             token,
@@ -175,7 +175,7 @@ impl SessionLedger {
     pub(crate) fn release_trusted(
         &mut self,
         token: u64,
-        kernel_release: impl FnMut(u64) -> Result<(), i32>,
+        kernel_release: impl FnMut(u64, u64, u64) -> Result<(), i32>,
     ) -> Result<u64, i32> {
         if token == 0 {
             return Err(EINVAL);
@@ -190,6 +190,9 @@ impl SessionLedger {
         // Advance the watermark so the corresponding old charge can NEVER
         // arrive later and create a new bill after we acknowledged release.
         self.reserve_receipt()?;
+        // Kernel owns a second nonreusable token watermark: a rootd crash
+        // after this point cannot permit a delayed CHARGE to revive the bill.
+        kernel_release(0, self.owner_pid, token)?;
         self.last_token = self.last_token.max(token);
         self.retired.push(Retired {
             token,
@@ -204,11 +207,11 @@ impl SessionLedger {
     /// to keep another client's accounting pinned indefinitely.
     pub(crate) fn release_all(
         &mut self,
-        mut kernel_release: impl FnMut(u64) -> Result<(), i32>,
+        mut kernel_release: impl FnMut(u64, u64, u64) -> Result<(), i32>,
     ) -> Result<usize, i32> {
         let mut released = 0;
         while let Some(entry) = self.entries.last().copied() {
-            kernel_release(entry.client_job)?;
+            kernel_release(entry.client_job, self.owner_pid, entry.token)?;
             self.entries.pop();
             released += 1;
         }
@@ -245,12 +248,12 @@ mod tests {
         assert_eq!(book.charge(8, 201, |_| Ok(99), |_, _| Ok(())), Err(EACCES));
         assert_eq!(charges.get(), 1);
         assert_eq!(book.live_count(), 1);
-        assert_eq!(book.release(8, 200, |job| {
+        assert_eq!(book.release(8, 200, |job, _, _| {
             assert_eq!(job, 77);
             releases.set(releases.get() + 1);
             Ok(())
         }), Ok(77));
-        assert_eq!(book.release(8, 200, |_| panic!("double refund")), Ok(77));
+        assert_eq!(book.release(8, 200, |_, _, _| panic!("double refund")), Ok(77));
         assert_eq!(book.charge(8, 200, |_| Ok(77), |_, _| Ok(())), Err(ESTALE));
         assert_eq!(releases.get(), 1);
         assert_eq!(book.live_count(), 0);
@@ -261,10 +264,10 @@ mod tests {
         let mut book = SessionLedger::new();
         assert_eq!(book.charge(10, 22, |_| Ok(9), |_, _| Err(ENOSPC)), Err(ENOSPC));
         assert_eq!(book.charge(10, 22, |_| Ok(9), |_, _| Ok(())), Ok(9));
-        assert_eq!(book.release(10, 21, |_| panic!("wrong PID")), Err(EACCES));
-        assert_eq!(book.release(10, 22, |_| Err(16)), Err(16));
+        assert_eq!(book.release(10, 21, |_, _, _| panic!("wrong PID")), Err(EACCES));
+        assert_eq!(book.release(10, 22, |_, _, _| Err(16)), Err(16));
         assert_eq!(book.live_count(), 1);
-        assert_eq!(book.release_all(|job| {
+        assert_eq!(book.release_all(|job, _, _| {
             assert_eq!(job, 9);
             Ok(())
         }), Ok(1));
@@ -274,45 +277,45 @@ mod tests {
     #[test]
     fn exited_provider_refunds_every_client_token() {
         let mut book = SessionLedger::new();
-        book.bind_owner(901, |_| Ok(())).unwrap();
+        book.bind_owner(901, |_, _, _| Ok(())).unwrap();
         book.charge(1, 20, |_| Ok(2), |_, _| Ok(())).unwrap();
         book.charge(2, 21, |_| Ok(3), |_, _| Ok(())).unwrap();
         let mut retired = alloc::vec::Vec::new();
-        book.owner_exited(777, |_| panic!("foreign exit")).unwrap();
+        book.owner_exited(777, |_, _, _| panic!("foreign exit")).unwrap();
         assert_eq!(book.live_count(), 2);
-        book.owner_exited(901, |job| { retired.push(job); Ok(()) }).unwrap();
+        book.owner_exited(901, |job, _, _| { retired.push(job); Ok(()) }).unwrap();
         assert_eq!(retired, alloc::vec![3, 2]);
         assert_eq!(book.live_count(), 0);
-        book.bind_owner(902, |_| panic!("already clean")).unwrap();
+        book.bind_owner(902, |_, _, _| panic!("already clean")).unwrap();
         assert_eq!(book.charge(1, 22, |_| Ok(4), |_, _| Ok(())), Ok(4));
     }
 
     #[test]
     fn supervisor_restart_refunds_previous_epoch_and_allows_fresh_tokens() {
         let mut book = SessionLedger::new();
-        book.bind_owner(10, |_| panic!("nothing to refund")).unwrap();
+        book.bind_owner(10, |_, _, _| panic!("nothing to refund")).unwrap();
         book.charge(1, 100, |_| Ok(7), |_, _| Ok(())).unwrap();
         book.charge(2, 101, |_| Ok(8), |_, _| Ok(())).unwrap();
         let mut refunded = alloc::vec::Vec::new();
-        book.bind_owner(11, |job| { refunded.push(job); Ok(()) }).unwrap();
+        book.bind_owner(11, |job, _, _| { refunded.push(job); Ok(()) }).unwrap();
         assert_eq!(refunded, alloc::vec![8, 7]);
         assert_eq!(book.live_count(), 0);
         assert_eq!(book.charge(1, 102, |_| Ok(9), |_, _| Ok(())), Ok(9));
         assert_eq!(book.last_token, 1);
-        book.bind_owner(11, |_| panic!("same owner no rollback")).unwrap();
+        book.bind_owner(11, |_, _, _| panic!("same owner no rollback")).unwrap();
         assert_eq!(book.live_count(), 1);
     }
 
     #[test]
     fn late_charge_is_invalidated_by_exact_token_cancellation() {
         let mut book = SessionLedger::new();
-        book.bind_owner(10, |_| Ok(())).unwrap();
-        assert_eq!(book.release_trusted(23, |_| panic!("nothing to bill")), Ok(0));
+        book.bind_owner(10, |_, _, _| Ok(())).unwrap();
+        assert_eq!(book.release_trusted(23, |_, _, _| panic!("nothing to bill")), Ok(0));
         assert_eq!(book.charge(23, 200, |_| Ok(7), |_, _| panic!("late charge")), Err(ESTALE));
-        assert_eq!(book.release_trusted(23, |_| panic!("already canceled")), Ok(0));
+        assert_eq!(book.release_trusted(23, |_, _, _| panic!("already canceled")), Ok(0));
         assert_eq!(book.charge(24, 201, |_| Ok(8), |_, _| Ok(())), Ok(8));
-        assert_eq!(book.release_trusted(24, |_| Ok(())), Ok(8));
-        assert_eq!(book.release_trusted(24, |_| panic!("double refund")), Ok(8));
+        assert_eq!(book.release_trusted(24, |_, _, _| Ok(())), Ok(8));
+        assert_eq!(book.release_trusted(24, |_, _, _| panic!("double refund")), Ok(8));
     }
 
     #[test]
@@ -327,6 +330,6 @@ mod tests {
             }),
             Err(ENOSPC)
         );
-        assert_eq!(book.release_all(|_| Ok(())), Ok(MAX_SESSIONS));
+        assert_eq!(book.release_all(|_, _, _| Ok(())), Ok(MAX_SESSIONS));
     }
 }

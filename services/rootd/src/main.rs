@@ -230,6 +230,13 @@ pub extern "C" fn __rustos_rootd_start() -> ! {
         jobs::limit_probe_child();
     }
     debug_line(b"rootd: bootstrap enter\n");
+    // Rootd owns the root descriptor; reconcile any kernel-resident session
+    // tokens left after a previous rootd incarnation crashed before starting
+    // a new service graph. No provider becomes live until the old job bills
+    // have been atomically refunded.
+    if jobs::drain_client_sessions(0).is_err() {
+        fail_closed(b"rootd: crash token ledger recovery denied\n");
+    }
     if component_policy::preflight().is_err()
         || service_grants::preflight().is_err()
     {
@@ -693,7 +700,7 @@ fn drain_lifecycle_events(
                     // clients whose process-exit notification arrived earlier.
                     service_checkpoints.sessions.owner_exited(
                         event.pid,
-                        |job| jobs::release_client_session(job)
+                        |job, provider, token| jobs::release_client_session(job, provider, token)
                             .map(|_| ())
                             .map_err(|err| err as i32),
                     ).unwrap_or_else(|_| {
@@ -741,8 +748,8 @@ fn supervise_service_health(
         terminate_service_process(pid)
             .unwrap_or_else(|_| fail_closed(b"rootd: health termination rejected\n"));
         if service == IPC_SERVICE_SESSIOND {
-            store.sessions.owner_exited(pid, |job| {
-                jobs::release_client_session(job).map(|_| ()).map_err(|err| err as i32)
+            store.sessions.owner_exited(pid, |job, provider, token| {
+                jobs::release_client_session(job, provider, token).map(|_| ()).map_err(|err| err as i32)
             }).unwrap_or_else(|_| {
                 fail_closed(b"rootd: health session settlement failed\n")
             });
@@ -1236,7 +1243,7 @@ fn fill_commercial_max_response(
             )?;
             service_checkpoints.sessions.bind_owner(
                 sender.pid,
-                |job| jobs::release_client_session(job)
+                |job, provider, token| jobs::release_client_session(job, provider, token)
                     .map(|_| ())
                     .map_err(|err| err as i32),
             )?;
@@ -1245,14 +1252,14 @@ fn fill_commercial_max_response(
                     control.token,
                     control.client_pid,
                     |pid| jobs::process_job(pid).map_err(|err| err as i32),
-                    |pid, job| jobs::charge_client_session(pid, job)
+                    |pid, job| jobs::charge_client_session(pid, job, sender.pid, control.token)
                         .map(|_| ())
                         .map_err(|err| err as i32),
                 )?
             } else {
                 service_checkpoints.sessions.release_trusted(
                     control.token,
-                    |job| jobs::release_client_session(job)
+                    |job, provider, token| jobs::release_client_session(job, provider, token)
                         .map(|_| ())
                         .map_err(|err| err as i32),
                 )?
