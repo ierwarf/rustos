@@ -1991,50 +1991,11 @@ fn current_service_id_for_sender(
 }
 
 fn service_dependency_allowed(subject: u64, target: u64) -> bool {
-    if bootstrap_dependency_allowed(subject, target) {
-        return true;
-    }
-    match subject {
-        INITD_LEASE_ID => matches!(
-            target,
-            IPC_SERVICE_NETD
-                | IPC_SERVICE_DEVMGRD
-                | IPC_SERVICE_INPUTD
-                | IPC_SERVICE_STORAGED
-                | IPC_SERVICE_SESSIOND
-        ),
-        IPC_SERVICE_VFSD => matches!(target, IPC_SERVICE_DEVMGRD | IPC_SERVICE_STORAGED),
-        IPC_SERVICE_PROCD => target == IPC_SERVICE_LOADERD,
-        // Inputd alone validates the authenticated RDI session lifecycle.
-        // Its only outbound policy edge is the bounded grant/revoke handoff
-        // to netd; it cannot discover arbitrary service endpoints.
-        IPC_SERVICE_INPUTD => target == IPC_SERVICE_NETD,
-        IPC_SERVICE_SESSIOND => matches!(
-            target,
-            IPC_SERVICE_LOADERD | IPC_SERVICE_DEVMGRD | IPC_SERVICE_UISERVER
-        ),
-        IPC_SERVICE_UISERVER => target == IPC_SERVICE_INPUTD,
-        IPC_SERVICE_DEVMGRD => {
-            matches!(target, IPC_SERVICE_SESSIOND | IPC_SERVICE_UISERVER)
-        }
-        _ => false,
-    }
+    component_policy::route_allowed(subject, target)
 }
 
 fn bootstrap_dependency_allowed(subject: u64, target: u64) -> bool {
-    let dependency_bit = match target {
-        IPC_SERVICE_LINUX_SYSCALLD => DEP_SYSCALLD,
-        IPC_SERVICE_VFSD => DEP_VFSD,
-        IPC_SERVICE_LOADERD => DEP_LOADERD,
-        IPC_SERVICE_PROCD => DEP_PROCD,
-        IPC_SERVICE_PAGERD => DEP_PAGERD,
-        _ => 0,
-    };
-    dependency_bit != 0
-        && BOOTSTRAP_MANIFEST
-            .iter()
-            .find(|service| service.service_id == subject)
-            .is_some_and(|service| service.dependency_mask & dependency_bit != 0)
+    component_policy::bootstrap_route_allowed(subject, target)
 }
 
 fn service_name(path: &'static [u8]) -> &'static [u8] {

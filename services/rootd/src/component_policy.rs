@@ -140,6 +140,53 @@ pub(super) fn preflight() -> Result<(), ManifestError> {
     validate(&BOOTSTRAP_MANIFEST, &POST_INIT_MANIFEST)
 }
 
+/// Existing service lookup policy, now colocated with manifest validation.
+/// This remains a pure, allocation-free predicate; rootd's authenticated
+/// sender/lease checks still execute before reaching it.
+pub(super) fn route_allowed(subject: u64, target: u64) -> bool {
+    if bootstrap_route_allowed(subject, target) {
+        return true;
+    }
+    match subject {
+        INITD_LEASE_ID => matches!(
+            target,
+            IPC_SERVICE_NETD
+                | IPC_SERVICE_DEVMGRD
+                | IPC_SERVICE_INPUTD
+                | IPC_SERVICE_STORAGED
+                | IPC_SERVICE_SESSIOND
+        ),
+        IPC_SERVICE_VFSD => matches!(target, IPC_SERVICE_DEVMGRD | IPC_SERVICE_STORAGED),
+        IPC_SERVICE_PROCD => target == IPC_SERVICE_LOADERD,
+        IPC_SERVICE_INPUTD => target == IPC_SERVICE_NETD,
+        IPC_SERVICE_SESSIOND => matches!(
+            target,
+            IPC_SERVICE_LOADERD | IPC_SERVICE_DEVMGRD | IPC_SERVICE_UISERVER
+        ),
+        IPC_SERVICE_UISERVER => target == IPC_SERVICE_INPUTD,
+        IPC_SERVICE_DEVMGRD => {
+            matches!(target, IPC_SERVICE_SESSIOND | IPC_SERVICE_UISERVER)
+        }
+        _ => false,
+    }
+}
+
+pub(super) fn bootstrap_route_allowed(subject: u64, target: u64) -> bool {
+    let bit = match target {
+        IPC_SERVICE_LINUX_SYSCALLD => DEP_SYSCALLD,
+        IPC_SERVICE_VFSD => DEP_VFSD,
+        IPC_SERVICE_LOADERD => DEP_LOADERD,
+        IPC_SERVICE_PROCD => DEP_PROCD,
+        IPC_SERVICE_PAGERD => DEP_PAGERD,
+        _ => 0,
+    };
+    bit != 0
+        && BOOTSTRAP_MANIFEST
+            .iter()
+            .find(|spec| spec.service_id == subject)
+            .is_some_and(|spec| spec.dependency_mask & bit != 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
