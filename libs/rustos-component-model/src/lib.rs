@@ -18,8 +18,10 @@ extern crate alloc;
 
 pub mod health;
 pub mod identity;
+pub mod idl;
 pub mod manifest;
 pub mod policy;
+pub mod policy_ops;
 pub mod pressure;
 pub mod quota;
 pub mod realm;
