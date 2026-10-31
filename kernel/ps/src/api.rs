@@ -133,6 +133,7 @@ pub use crate::multitask::{
     job_session_info, job_set_session_limit, job_charge_client_session,
     job_release_client_session, JobSessionInfo,
     job_memory_qos, job_set_memory_qos, JobMemoryQos,
+    job_kmem_info, job_set_kmem_process_limit, JobKmemInfo,
     job_charge_client_session_token, job_release_client_session_token,
     job_drain_client_session_tokens,
     job_policy_allows, job_policy_info, job_set_policy, JobPolicy, JobPolicyInfo,

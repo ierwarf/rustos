@@ -453,6 +453,66 @@ pub(super) fn syscall_linux_rustos_job_session(args_ptr: u64) -> u64 {
 }
 
 
+
+/// Rights-scoped boxed ProcessObject kmem budget. This is real accounting of
+/// exactly one kernel allocation class; it must not be mistaken for a total
+/// kernel-memory quota until other allocation/free owners are integrated.
+/// The publication gate is within ProcessTable's Job lock, never IPC/TLB.
+pub(super) fn syscall_linux_rustos_job_kmem(ptr: u64) -> u64 {
+    use rustos_user_abi::syscall::*;
+    let mut args = match usermem::read_current_user_struct::<RustosJobKmemArgs>(ptr) {
+        Ok(args) => args,
+        Err(error) => return linux_errno(address_space_error_to_linux_errno(error)),
+    };
+    if args.abi_version != JOB_KMEM_ABI_VERSION
+        || args.job_handle == 0 || args.flags != 0 || args.reserved != 0
+        || args.usage_process_object_bytes != 0 || args.object_size_bytes != 0
+        || args.job != 0 || !matches!(args.op, JOB_KMEM_OP_INSPECT | JOB_KMEM_OP_SET_LIMIT)
+        || (args.op == JOB_KMEM_OP_INSPECT && args.process_object_max_bytes != 0)
+    {
+        return linux_errno(LINUX_EINVAL);
+    }
+    if let Err(error) =
+        usermem::validate_current_user_write_buffer(ptr, size_of::<RustosJobKmemArgs>())
+    {
+        return linux_errno(address_space_error_to_linux_errno(error));
+    }
+    let Some(caller) = multitask::current_user_process_id() else {
+        return linux_errno(LINUX_ESRCH);
+    };
+    let right = if args.op == JOB_KMEM_OP_INSPECT {
+        JobHandleRights::INSPECT
+    } else {
+        JobHandleRights::SET_LIMITS
+    };
+    let handle = multitask::with_process_state_by_pid(caller, |state| {
+        state.handles().get_entry(args.job_handle).ok_or(LINUX_EBADF)
+            .and_then(|entry| job_authority_with_right(entry, right))
+    });
+    let (job, _) = match handle {
+        Some(Ok(value)) => value,
+        Some(Err(error)) => return linux_errno(error),
+        None => return linux_errno(LINUX_ESRCH),
+    };
+    let result = if args.op == JOB_KMEM_OP_INSPECT {
+        multitask::job_kmem_info(job)
+    } else {
+        multitask::job_set_kmem_process_limit(job, args.process_object_max_bytes)
+    };
+    let info = match result {
+        Ok(info) => info,
+        Err(error) => return linux_errno(job_error_errno(error)),
+    };
+    args.job = info.job.to_raw();
+    args.process_object_max_bytes = info.process_object_limit_bytes;
+    args.usage_process_object_bytes = info.usage_process_object_bytes;
+    args.object_size_bytes = info.process_object_size;
+    match usermem::write_current_user_struct(ptr, &args) {
+        Ok(()) => 0,
+        Err(error) => linux_errno(address_space_error_to_linux_errno(error)),
+    }
+}
+
 /// Memory pressure policy is configured in the Job control path. Hard page
 /// admission stays lock-free in kernel-mm; no kernel call to Ring3 happens
 /// inside page fault, pager, futex, TLB or scheduler execution paths.

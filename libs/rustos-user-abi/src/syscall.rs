@@ -100,6 +100,8 @@ pub const SYS_RUSTOS_JOB_POLICY: u64 = 0x5255_005a;
 pub const SYS_RUSTOS_JOB_SESSION: u64 = 0x5255_005b;
 /// Memory QoS is a Job slow control syscall, not a fault-path policy lookup.
 pub const SYS_RUSTOS_JOB_MEMORY_QOS: u64 = 0x5255_005c;
+/// Job-local exact ProcessObject Box allocation budget (slow control only).
+pub const SYS_RUSTOS_JOB_KMEM: u64 = 0x5255_005e;
 /// Rootd-only slow kernel-resident checkpoint write-ahead journal.
 pub const SYS_RUSTOS_CHECKPOINT_JOURNAL: u64 = 0x5255_005d;
 /// Capability-gated, event-driven wait for the DVM input transport. Only
@@ -996,6 +998,25 @@ pub const JOB_SESSION_OP_DRAIN: u16 = 5;
 pub const JOB_MEMORY_QOS_ABI_VERSION: u16 = 1;
 pub const JOB_MEMORY_QOS_OP_INSPECT: u16 = 1;
 pub const JOB_MEMORY_QOS_OP_SET: u16 = 2;
+pub const JOB_KMEM_ABI_VERSION: u16 = 1;
+pub const JOB_KMEM_OP_INSPECT: u16 = 1;
+pub const JOB_KMEM_OP_SET_LIMIT: u16 = 2;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RustosJobKmemArgs {
+    pub abi_version: u16,
+    pub op: u16,
+    pub flags: u32,
+    pub job_handle: u64,
+    /// Exact boxed process-object budget; u64::MAX removes this one limit.
+    pub process_object_max_bytes: u64,
+    pub usage_process_object_bytes: u64,
+    pub object_size_bytes: u64,
+    pub job: u64,
+    pub reserved: u64,
+}
+
 
 /// Memory.high is an event threshold. Memory.min is an explicit
 /// hierarchical OOM victim protection reserve, not allocated memory.
