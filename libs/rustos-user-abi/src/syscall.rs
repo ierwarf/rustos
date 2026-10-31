@@ -100,6 +100,8 @@ pub const SYS_RUSTOS_JOB_POLICY: u64 = 0x5255_005a;
 pub const SYS_RUSTOS_JOB_SESSION: u64 = 0x5255_005b;
 /// Memory QoS is a Job slow control syscall, not a fault-path policy lookup.
 pub const SYS_RUSTOS_JOB_MEMORY_QOS: u64 = 0x5255_005c;
+/// Rootd-only slow kernel-resident checkpoint write-ahead journal.
+pub const SYS_RUSTOS_CHECKPOINT_JOURNAL: u64 = 0x5255_005d;
 /// Capability-gated, event-driven wait for the DVM input transport. Only
 /// inputd may use this to wait for an MSI-X-published ingress batch; input
 /// policy and translation remain in the service.
@@ -1397,6 +1399,29 @@ impl Default for ServiceCheckpointRecordWire {
             value: [0; SERVICE_CHECKPOINT_VALUE_CAPACITY],
         }
     }
+}
+
+pub const CHECKPOINT_JOURNAL_ABI_VERSION: u16 = 1;
+pub const CHECKPOINT_JOURNAL_OP_APPEND: u16 = 1;
+pub const CHECKPOINT_JOURNAL_OP_READ: u16 = 2;
+pub const CHECKPOINT_JOURNAL_RECORD_MUTATE: u16 = 1;
+pub const CHECKPOINT_JOURNAL_RECORD_COMPACT: u16 = 2;
+
+/// The journal stays in kernel memory across rootd process restarts. It is
+/// not block-device durability and does not survive a machine power cycle.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
+pub struct RustosCheckpointJournalArgs {
+    pub abi_version: u16,
+    pub op: u16,
+    pub flags: u32,
+    pub cursor: u64,
+    pub next_cursor: u64,
+    pub service_id: u64,
+    pub record_kind: u16,
+    pub done: u16,
+    pub reserved: u32,
+    pub record: ServiceCheckpointRecordWire,
 }
 
 #[repr(C)]
