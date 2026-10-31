@@ -105,7 +105,8 @@ impl Sessions {
         }
         let client_incarnation = graph.inspect(client)?.incarnation;
         let provider_incarnation = graph.inspect(provider)?.incarnation;
-        let vacant = self.slots.iter().position(|s| s.item.is_none());
+        // Exhausted generations are retired, not candidates for reuse.
+        let vacant = self.slots.iter().position(|s| s.item.is_none() && s.generation != u32::MAX);
         if vacant.is_none() && self.slots.len() >= self.capacity {
             return Err(SessionError::Full);
         }
@@ -115,15 +116,7 @@ impl Sessions {
                 .map_err(|_| SessionError::Allocation)?;
         }
         let slot_index = vacant.unwrap_or(self.slots.len());
-        let generation = if let Some(index) = vacant {
-            let generation = self.slots[index].generation;
-            if generation == u32::MAX {
-                return Err(SessionError::Overflow);
-            }
-            generation
-        } else {
-            1
-        };
+        let generation = vacant.map_or(1, |index| self.slots[index].generation);
         let ticket = graph.charge(client, cost)?;
         let id = SessionId {
             slot: slot_index as u32,
@@ -195,13 +188,12 @@ impl Sessions {
     pub fn close(&mut self, graph: &mut Graph, id: SessionId) -> Result<(), SessionError> {
         let ticket = self.session(id)?.charge;
         let index = id.slot as usize;
-        let next_generation = self.slots[index]
-            .generation
-            .checked_add(1)
-            .ok_or(SessionError::Overflow)?;
+        // Refund exactly once even when the external generation has reached
+        // its final value. That slot stays permanently retired; wrapping it
+        // would revalidate an ancient SessionId (ABA).
         graph.release(ticket)?;
         self.slots[index].item = None;
-        self.slots[index].generation = next_generation;
+        self.slots[index].generation = self.slots[index].generation.saturating_add(1);
         Ok(())
     }
 
@@ -435,6 +427,42 @@ mod tests {
             Err(SessionError::Invalid)
         );
         assert_eq!(sessions.live_count(), 0);
+        assert_eq!(g.inspect(client).unwrap().used.sessions, 0);
+    }
+
+    #[test]
+    fn exhausted_generation_refunds_and_retires_slot_without_aba() {
+        let mut g = Graph::new(Moniker::new("root").unwrap(), 1, 4).unwrap();
+        let client = g.create(
+            g.root(), Moniker::new("client").unwrap(), 2,
+            JobCeiling::ALL, Quota::UNLIMITED, RestartPolicy::NEVER, false,
+        ).unwrap();
+        let provider = g.create(
+            g.root(), Moniker::new("provider").unwrap(), 3,
+            JobCeiling::ALL, Quota::UNLIMITED, RestartPolicy::NEVER, false,
+        ).unwrap();
+        g.activate(client).unwrap();
+        g.activate(provider).unwrap();
+        let cap = Moniker::new("fs").unwrap();
+        g.publish(provider, cap, 1).unwrap();
+        g.offer(provider, client, cap, 1).unwrap();
+        let cost = Charge { sessions: 1, ..Charge::ZERO };
+        let mut sessions = Sessions::new(2).unwrap();
+        let id = sessions.open(&mut g, client, provider, cap, cost, 1, 100).unwrap();
+        // Simulate the last allowed incarnation without billions of opens.
+        sessions.slots[0].generation = u32::MAX;
+        sessions.slots[0].item.as_mut().unwrap().view.id.generation = u32::MAX;
+        let last_id = SessionId { slot: 0, generation: u32::MAX };
+        assert!(sessions.inspect(&g, last_id, 2).is_ok());
+        sessions.close(&mut g, last_id).unwrap();
+        assert_eq!(g.inspect(client).unwrap().used.sessions, 0);
+        assert_eq!(sessions.live_count(), 0);
+        assert_eq!(sessions.close(&mut g, last_id), Err(SessionError::Missing));
+        let next = sessions.open(&mut g, client, provider, cap, cost, 3, 100).unwrap();
+        assert_eq!(next.slot, 1);
+        assert_ne!(next, id);
+        assert_eq!(sessions.slots[0].generation, u32::MAX);
+        sessions.close(&mut g, next).unwrap();
         assert_eq!(g.inspect(client).unwrap().used.sessions, 0);
     }
 

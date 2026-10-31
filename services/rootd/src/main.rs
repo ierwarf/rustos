@@ -705,47 +705,60 @@ fn revoke_post_init_dependents(post_init_leases: &mut [PostInitLease], reporter_
     });
 }
 
+/// The rootd-owned reporter graph is small and fixed. Prepare a complete
+/// transitive closure before issuing *any* fallible kernel operation; neither
+/// an old exited intermediate lease nor a malformed cycle may silently leave
+/// a live grandchild with inherited authority.
+fn collect_post_init_descendants(
+    leases: &[PostInitLease],
+    root_pid: u64,
+    include_exited: bool,
+) -> Result<[bool; POST_INIT_MANIFEST.len()], i32> {
+    if root_pid == 0 || leases.len() > POST_INIT_MANIFEST.len() {
+        return Err(22);
+    }
+    let mut selected = [false; POST_INIT_MANIFEST.len()];
+    let mut reporters = [0_u64; POST_INIT_MANIFEST.len() + 1];
+    reporters[0] = root_pid;
+    let mut count = 1_usize;
+    let mut cursor = 0_usize;
+    while cursor < count {
+        let reporter = reporters[cursor];
+        cursor += 1;
+        for (index, lease) in leases.iter().enumerate() {
+            let eligible = lease.state == ROOTD_LEASE_STATE_RUNNING
+                || (include_exited
+                    && lease.state != rustos_user_abi::syscall::ROOTD_LEASE_STATE_EMPTY);
+            if selected[index] || !eligible || lease.reporter_pid != reporter {
+                continue;
+            }
+            // In a valid graph there is only one live lease per PID. Refuse
+            // ambiguous ancestry, cycles and a broken nonempty lease rather
+            // than allowing table order to decide who to terminate.
+            if lease.pid == 0
+                || reporters[..count].contains(&lease.pid)
+                || count == reporters.len()
+            {
+                return Err(71);
+            }
+            selected[index] = true;
+            reporters[count] = lease.pid;
+            count += 1;
+        }
+    }
+    Ok(selected)
+}
+
 fn revoke_post_init_dependents_with(
     post_init_leases: &mut [PostInitLease],
     reporter_pid: u64,
     mut revoke_endpoint: impl FnMut(u64) -> Result<(), i32>,
     mut terminate: impl FnMut(u64) -> Result<(), i32>,
 ) -> Result<(), i32> {
-    // A fixed-size first pass computes the entire descendant closure without
-    // changing leases or invoking fallible kernel operations. A malformed
-    // reporter graph must fail before any partial revocation is attempted.
-    if post_init_leases.len() > POST_INIT_MANIFEST.len() {
-        return Err(75);
-    }
-    let mut selected = [false; POST_INIT_MANIFEST.len()];
-    let mut reporters = [0_u64; POST_INIT_MANIFEST.len() + 1];
-    reporters[0] = reporter_pid;
-    let mut reporter_count = 1_usize;
-    let mut cursor = 0_usize;
-    while cursor < reporter_count {
-        let current_reporter = reporters[cursor];
-        cursor += 1;
-        for (index, lease) in post_init_leases.iter().enumerate() {
-            if selected[index]
-                || lease.reporter_pid != current_reporter
-                || lease.state != ROOTD_LEASE_STATE_RUNNING
-            {
-                continue;
-            }
-            if lease.pid == 0 || reporter_count == reporters.len() {
-                return Err(75);
-            }
-            selected[index] = true;
-            reporters[reporter_count] = lease.pid;
-            reporter_count += 1;
-        }
-    }
+    let selected = collect_post_init_descendants(post_init_leases, reporter_pid, false)?;
 
-    // Revoke every selected endpoint before initiating *any* process
-    // termination. Kernel termination can be asynchronous; a descendant
-    // must not retain an endpoint while its parent's cleanup is pending.
-    // A syscall failure is fatal to the production supervisor, so no
-    // partially revoked graph is ever reported as a successful recovery.
+    // First revoke the *entire* closure; only then begin asynchronous process
+    // termination. The production caller fail-closes on any callback failure.
     for (index, lease) in post_init_leases.iter().enumerate() {
         if selected[index] {
             revoke_endpoint(lease.service_id)?;
@@ -1602,34 +1615,71 @@ fn reclaim_post_init_lease(
     if !initd_manages_post_init_service(request.arg0) {
         return Err(13);
     }
+    // Validation above performs no kernel operations. For the actual
+    // revocation phase, a partial syscall failure must stop the supervisor:
+    // returning a normal error could leave an endpoint revoked while its
+    // original lease is still advertised as live.
+    reclaim_post_init_lease_with(
+        post_init_leases,
+        request.arg0,
+        request.arg1,
+        |service_id| {
+            revoke_service_endpoint(service_id)
+                .unwrap_or_else(|_| fail_closed(b"rootd: fatal reclaim endpoint revoke failed\n"));
+            Ok(())
+        },
+        |pid| {
+            terminate_service_process(pid)
+                .unwrap_or_else(|_| fail_closed(b"rootd: fatal reclaim process termination failed\n"));
+            Ok(())
+        },
+    )
+}
+
+/// Retire one exact post-init lease and its entire dependent closure.
+/// As with exit-driven cascading, all endpoints are revoked before the first
+/// termination, and no state is cleared until every required kernel action
+/// succeeds. Exited intermediates are traversed too: a child must not survive
+/// solely because rootd already received its ancestor's exit event.
+fn reclaim_post_init_lease_with(
+    post_init_leases: &mut [PostInitLease],
+    service_id: u64,
+    exact_pid: u64,
+    mut revoke_endpoint: impl FnMut(u64) -> Result<(), i32>,
+    mut terminate: impl FnMut(u64) -> Result<(), i32>,
+) -> Result<(), i32> {
     let Some(index) = post_init_leases
         .iter()
-        .position(|lease| lease.service_id == request.arg0)
+        .position(|lease| lease.service_id == service_id)
     else {
         return Err(22);
     };
     let target = post_init_leases[index];
-    if target.pid != request.arg1
+    if exact_pid == 0
+        || target.pid != exact_pid
         || target.state == rustos_user_abi::syscall::ROOTD_LEASE_STATE_EMPTY
     {
         return Err(16);
     }
+    let selected = collect_post_init_descendants(post_init_leases, exact_pid, true)?;
 
-    // A session policy service may have admitted a UI child.  Reclaim the
-    // dependent child first, so a dead session supervisor cannot leave a live
-    // cross-domain UI endpoint behind when initd replaces the session lease.
-    for lease in post_init_leases.iter() {
-        if lease.reporter_pid == target.pid && lease.state == ROOTD_LEASE_STATE_RUNNING {
-            revoke_service_endpoint(lease.service_id)?;
-            terminate_service_process(lease.pid)?;
+    for (child_index, lease) in post_init_leases.iter().enumerate() {
+        if (child_index == index || selected[child_index])
+            && lease.state == ROOTD_LEASE_STATE_RUNNING
+        {
+            revoke_endpoint(lease.service_id)?;
         }
     }
-    if target.state == ROOTD_LEASE_STATE_RUNNING {
-        revoke_service_endpoint(target.service_id)?;
-        terminate_service_process(target.pid)?;
+    for (child_index, lease) in post_init_leases.iter().enumerate() {
+        if (child_index == index || selected[child_index])
+            && lease.state == ROOTD_LEASE_STATE_RUNNING
+        {
+            terminate(lease.pid)?;
+        }
     }
-    for lease in post_init_leases.iter_mut() {
-        if lease.pid == target.pid || lease.reporter_pid == target.pid {
+
+    for (child_index, lease) in post_init_leases.iter_mut().enumerate() {
+        if child_index == index || selected[child_index] {
             lease.pid = 0;
             lease.reporter_pid = 0;
             lease.state = rustos_user_abi::syscall::ROOTD_LEASE_STATE_EMPTY;
@@ -1637,6 +1687,7 @@ fn reclaim_post_init_lease(
         }
     }
     Ok(())
+
 }
 
 /// Asks ring0 for the memory census and, when the governor finds pressure,
@@ -3472,6 +3523,138 @@ mod tests {
                 .iter()
                 .all(|lease| lease.state == ROOTD_LEASE_STATE_EXITED)
         );
+    }
+
+    #[test]
+    fn reclaim_revokes_entire_nested_subtree_before_termination() {
+        let mut post_init = [
+            post_init_lease(POST_INIT_MANIFEST[0]),
+            post_init_lease(POST_INIT_MANIFEST[4]),
+            post_init_lease(POST_INIT_MANIFEST[5]),
+            post_init_lease(POST_INIT_MANIFEST[2]),
+        ];
+        post_init[0].pid = 71;
+        post_init[0].reporter_pid = 41;
+        post_init[0].state = ROOTD_LEASE_STATE_RUNNING;
+        post_init[1].pid = 72;
+        post_init[1].reporter_pid = 71;
+        post_init[1].state = ROOTD_LEASE_STATE_RUNNING;
+        post_init[2].pid = 73;
+        post_init[2].reporter_pid = 72;
+        post_init[2].state = ROOTD_LEASE_STATE_RUNNING;
+        post_init[3].pid = 88;
+        post_init[3].reporter_pid = 41;
+        post_init[3].state = ROOTD_LEASE_STATE_RUNNING;
+
+        let events = core::cell::RefCell::new(alloc::vec::Vec::<(bool, u64)>::new());
+        assert_eq!(
+            reclaim_post_init_lease_with(
+                &mut post_init,
+                IPC_SERVICE_NETD,
+                71,
+                |service_id| {
+                    events.borrow_mut().push((false, service_id));
+                    Ok(())
+                },
+                |pid| {
+                    events.borrow_mut().push((true, pid));
+                    Ok(())
+                },
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            *events.borrow(),
+            alloc::vec![
+                (false, IPC_SERVICE_NETD),
+                (false, IPC_SERVICE_SESSIOND),
+                (false, IPC_SERVICE_UISERVER),
+                (true, 71),
+                (true, 72),
+                (true, 73),
+            ]
+        );
+        assert!(post_init[..3].iter().all(|lease|
+            lease.pid == 0
+                && lease.reporter_pid == 0
+                && lease.state == rustos_user_abi::syscall::ROOTD_LEASE_STATE_EMPTY
+        ));
+        assert_eq!(post_init[3].pid, 88);
+        assert_eq!(post_init[3].state, ROOTD_LEASE_STATE_RUNNING);
+    }
+
+    #[test]
+    fn reclaim_fails_before_mutation_on_stale_pid_or_cycle() {
+        let mut post_init = [
+            post_init_lease(POST_INIT_MANIFEST[4]),
+            post_init_lease(POST_INIT_MANIFEST[5]),
+        ];
+        post_init[0].pid = 72;
+        post_init[0].reporter_pid = 73;
+        post_init[0].state = ROOTD_LEASE_STATE_RUNNING;
+        post_init[1].pid = 73;
+        post_init[1].reporter_pid = 72;
+        post_init[1].state = ROOTD_LEASE_STATE_RUNNING;
+        assert_eq!(
+            reclaim_post_init_lease_with(
+                &mut post_init, IPC_SERVICE_SESSIOND, 99,
+                |_| panic!("stale PID must not touch endpoints"),
+                |_| panic!("stale PID must not terminate"),
+            ),
+            Err(16)
+        );
+        assert_eq!(
+            reclaim_post_init_lease_with(
+                &mut post_init, IPC_SERVICE_SESSIOND, 72,
+                |_| panic!("cycle must fail preflight"),
+                |_| panic!("cycle must fail preflight"),
+            ),
+            Err(71)
+        );
+        assert_eq!(post_init[0].pid, 72);
+        assert_eq!(post_init[1].pid, 73);
+    }
+
+    #[test]
+    fn reclaim_traverses_exited_intermediates_and_rejects_partial_success() {
+        let mut post_init = [
+            post_init_lease(POST_INIT_MANIFEST[0]),
+            post_init_lease(POST_INIT_MANIFEST[4]),
+            post_init_lease(POST_INIT_MANIFEST[5]),
+        ];
+        post_init[0].pid = 71;
+        post_init[0].state = ROOTD_LEASE_STATE_EXITED;
+        post_init[1].pid = 72;
+        post_init[1].reporter_pid = 71;
+        post_init[1].state = ROOTD_LEASE_STATE_EXITED;
+        post_init[2].pid = 73;
+        post_init[2].reporter_pid = 72;
+        post_init[2].state = ROOTD_LEASE_STATE_RUNNING;
+        assert_eq!(
+            reclaim_post_init_lease_with(
+                &mut post_init, IPC_SERVICE_NETD, 71,
+                |_| Err(5),
+                |_| panic!("failure must prevent process termination"),
+            ),
+            Err(5)
+        );
+        assert_eq!(post_init[0].pid, 71);
+        assert_eq!(post_init[2].state, ROOTD_LEASE_STATE_RUNNING);
+        let revoked = core::cell::Cell::new(0_u64);
+        let terminated = core::cell::Cell::new(0_u64);
+        assert_eq!(
+            reclaim_post_init_lease_with(
+                &mut post_init, IPC_SERVICE_NETD, 71,
+                |id| { revoked.set(id); Ok(()) },
+                |pid| { terminated.set(pid); Ok(()) },
+            ),
+            Ok(())
+        );
+        assert_eq!(revoked.get(), IPC_SERVICE_UISERVER);
+        assert_eq!(terminated.get(), 73);
+        assert!(post_init.iter().all(|l|
+            l.state == rustos_user_abi::syscall::ROOTD_LEASE_STATE_EMPTY
+        ));
     }
 
     #[test]

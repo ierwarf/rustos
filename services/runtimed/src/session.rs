@@ -193,7 +193,12 @@ impl SessionRuntime {
     /// here: a missed publication is silent, and it strands a waiter that has
     /// deliberately stopped polling.
     fn advance_graph_generation(&mut self) {
-        self.output_generation = self.output_generation.wrapping_add(1).max(1);
+        // Reusing an observable graph token could make old compositor waiters
+        // appear current after wraparound. Exhaustion must fail closed.
+        self.output_generation = self
+            .output_generation
+            .checked_add(1)
+            .expect("sessiond console graph generation exhausted");
         self.last_advance = Some(Instant::now());
         GRAPH_ADVANCES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         #[cfg(not(test))]
