@@ -1399,24 +1399,7 @@ fn rootd_capability_mask(op: u16) -> u64 {
 }
 
 fn service_policy_capability(service_id: u64) -> u64 {
-    match service_id {
-        IPC_SERVICE_LINUX_SYSCALLD => {
-            rustos_user_abi::syscall::IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY
-        }
-        IPC_SERVICE_VFSD => rustos_user_abi::syscall::IPC_SERVICE_CAP_VFS_POLICY,
-        IPC_SERVICE_NETD => rustos_user_abi::syscall::IPC_SERVICE_CAP_NET_POLICY,
-        IPC_SERVICE_DEVMGRD => rustos_user_abi::syscall::IPC_SERVICE_CAP_DEVICE_POLICY,
-        IPC_SERVICE_LOADERD => rustos_user_abi::syscall::IPC_SERVICE_CAP_PROCESS_LOADER,
-        IPC_SERVICE_STORAGED => rustos_user_abi::syscall::IPC_SERVICE_CAP_STORAGE_POLICY,
-        IPC_SERVICE_INPUTD => rustos_user_abi::syscall::IPC_SERVICE_CAP_INPUT_POLICY,
-        IPC_SERVICE_PROCD => rustos_user_abi::syscall::IPC_SERVICE_CAP_PROCESS_POLICY,
-        IPC_SERVICE_ROOTD => rustos_user_abi::syscall::IPC_SERVICE_CAP_ROOT_SUPERVISOR,
-        IPC_SERVICE_SESSIOND => rustos_user_abi::syscall::IPC_SERVICE_CAP_SESSION_POLICY,
-        IPC_SERVICE_PAGERD => rustos_user_abi::syscall::IPC_SERVICE_CAP_PAGER_POLICY,
-        IPC_SERVICE_UISERVER => rustos_user_abi::syscall::IPC_SERVICE_CAP_UI_POLICY,
-        INITD_LEASE_ID => rustos_user_abi::syscall::IPC_SERVICE_CAP_INIT_POLICY,
-        _ => 0,
-    }
+    component_policy::service_policy_capability(service_id)
 }
 
 fn service_capability_for_subject(
@@ -1885,6 +1868,16 @@ fn post_init_reported_service_capability(
     service_id: u64,
     subject_pid: u64,
 ) -> Option<u64> {
+    // The PID must resolve to exactly one live service, including all
+    // transitively live reporter leases. A forged overlapping PID must never
+    // select a privileged role just because it appeared first in the table.
+    if current_service_id_for_sender(
+        leases,
+        post_init_leases,
+        IpcSenderIdentity { pid: subject_pid, tid: 1 },
+    ).ok()? != service_id {
+        return None;
+    }
     post_init_leases
         .iter()
         .find(|lease| {
@@ -3067,6 +3060,26 @@ mod tests {
             Err(13)
         );
         assert_eq!(post_init[0].reporter_pid, initd_pid);
+    }
+
+    #[test]
+    fn post_init_capability_never_resolves_a_duplicated_live_pid() {
+        let core = leases_with_live_initd(41);
+        let mut post = [post_init_lease(POST_INIT_MANIFEST[0]),
+            post_init_lease(POST_INIT_MANIFEST[1])];
+        post[0].pid = 77;
+        post[0].reporter_pid = 41;
+        post[0].state = ROOTD_LEASE_STATE_RUNNING;
+        assert_eq!(post_init_reported_service_capability(
+            &core, &post, IPC_SERVICE_NETD, 77),
+            Some(rustos_user_abi::syscall::IPC_SERVICE_CAP_NET_POLICY));
+        post[1].pid = 77;
+        post[1].reporter_pid = 41;
+        post[1].state = ROOTD_LEASE_STATE_RUNNING;
+        assert_eq!(post_init_reported_service_capability(
+            &core, &post, IPC_SERVICE_NETD, 77), None);
+        assert_eq!(post_init_reported_service_capability(
+            &core, &post, IPC_SERVICE_DEVMGRD, 77), None);
     }
 
     #[test]
