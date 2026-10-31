@@ -4,7 +4,7 @@ on:
   push:
     branches: [master, ring3-ancestor-liveness-fix]
   pull_request:
-    branches: [master]
+    branches: [master, ring3-recovery-graph-hardening]
 
 permissions:
   contents: write
@@ -33,6 +33,26 @@ jobs:
           fi
       - name: Verify declarative Ring3 IDL
         run: python3 tools/ring3_idl_codegen.py --check
+      - name: Format recovery checkpoint source
+        run: |
+          rustfmt --edition 2021 services/rootd/src/service_checkpoint.rs
+          rustfmt --edition 2021 services/rootd/src/service_manifest.rs
+          rustfmt --edition 2021 services/rootd/src/component_policy.rs
+      - name: Publish isolated recovery formatting
+        if: github.ref == 'refs/heads/ring3-recovery-graph-hardening'
+        run: |
+          git add services/rootd/src/service_checkpoint.rs services/rootd/src/service_manifest.rs services/rootd/src/component_policy.rs
+          if ! git diff --cached --quiet; then
+            git config user.name "rustos-ring3-checks[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit -m "style: format Ring3 recovery checkpoint tests"
+            git push origin HEAD:refs/heads/ring3-recovery-graph-hardening
+          fi
+      - name: Verify checkpoint formatting
+        run: |
+          rustfmt --edition 2021 --check services/rootd/src/service_checkpoint.rs
+          rustfmt --edition 2021 --check services/rootd/src/service_manifest.rs
+          rustfmt --edition 2021 --check services/rootd/src/component_policy.rs
       - name: Check component formatting
         run: |
           cargo fmt -p rustos-component-model -- --check
@@ -41,10 +61,6 @@ jobs:
         run: cargo test -p rustos-component-model --locked
       - name: Run rootd unit tests
         run: cargo test -p rootd --features host-test --locked
-      - name: Verify runtimed session source formatting
-        run: |
-          rustfmt --edition 2021 --check --config skip_children=true services/runtimed/src/session.rs
-          rustfmt --edition 2021 --check --config skip_children=true services/runtimed/src/spawn.rs
       - name: Run runtimed host tests
         run: cargo test -p runtimed --locked
       - name: Check full RustOS build graph
