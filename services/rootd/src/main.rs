@@ -1172,11 +1172,19 @@ fn fill_commercial_max_response(
             Ok(())
         }
         COMMERCIAL_MAX_ROOTD_OP_SERVICE_CAPABILITY => {
+            authorize_sender_slow_grant(
+                leases, post_init_leases, sender,
+                rustos_component_model::policy_ops::SlowBrokerOperation::ReadServicePrincipal,
+            )?;
             let capability = service_capability_for_subject(leases, post_init_leases, request)?;
             response.value0 = capability;
             Ok(())
         }
         COMMERCIAL_MAX_ROOTD_OP_SERVICE_LOOKUP => {
+            authorize_sender_slow_grant(
+                leases, post_init_leases, sender,
+                rustos_component_model::policy_ops::SlowBrokerOperation::ResolveServiceRoute,
+            )?;
             authorize_service_lookup_for_subject(leases, post_init_leases, request)?;
             response.value0 = request.arg0;
             Ok(())
@@ -1254,8 +1262,9 @@ fn fill_commercial_max_response(
             {
                 return Err(22);
             }
-            authorize_current_service_namespace(
+            authorize_service_slow_grant(
                 leases, post_init_leases, IPC_SERVICE_SESSIOND, sender,
+                rustos_component_model::policy_ops::SlowBrokerOperation::ChargeClientSession,
             )?;
             service_checkpoints.sessions.bind_owner(
                 sender.pid,
@@ -1304,8 +1313,9 @@ fn fill_commercial_max_response(
             if pulse.incarnation_pid != sender.pid {
                 return Err(13);
             }
-            authorize_current_service_namespace(
+            authorize_service_slow_grant(
                 leases, post_init_leases, pulse.service, sender,
+                rustos_component_model::policy_ops::SlowBrokerOperation::ReportComponentHealth,
             )?;
             // Prepare the reply first. Even if encoding/heap admission fails,
             // no health counter or expiry deadline has yet been modified.
@@ -2435,6 +2445,22 @@ fn authorize_service_lookup_for_subject(
     }
 }
 
+/// Authenticate the exact live principal first, then intersect its
+/// immutable positive operation grant and current negative JobPolicy.
+fn authorize_sender_slow_grant(
+    leases: &[Lease],
+    post_init: &[PostInitLease],
+    sender: IpcSenderIdentity,
+    operation: rustos_component_model::policy_ops::SlowBrokerOperation,
+) -> Result<u64, i32> {
+    let service = current_service_id_for_sender(leases, post_init, sender)?;
+    if !service_grants::permits(service, operation) {
+        return Err(13);
+    }
+    policy_cutover::authorize_job_slow_op(sender.pid, operation)?;
+    Ok(service)
+}
+
 /// An explicit service grant is required in addition to the exact live
 /// caller and current kernel-enforced JobPolicy. The legacy role bit returned
 /// in capability descriptors is never sufficient for an operation.
@@ -2445,11 +2471,10 @@ fn authorize_service_slow_grant(
     sender: IpcSenderIdentity,
     operation: rustos_component_model::policy_ops::SlowBrokerOperation,
 ) -> Result<(), i32> {
-    authorize_current_service_namespace(leases, post_init_leases, service, sender)?;
-    if !service_grants::permits(service, operation) {
+    if authorize_sender_slow_grant(leases, post_init_leases, sender, operation)? != service {
         return Err(13);
     }
-    policy_cutover::authorize_job_slow_op(sender.pid, operation)
+    Ok(())
 }
 
 fn authorize_current_service_namespace(
