@@ -1,49 +1,76 @@
-# Ring3 component model integration boundary
+# Ring3 component model — implementation and cutover ledger
 
-**Status: policy-engine foundation, not an 8-stage implementation.**
+**Status (2026-10-31): partial integration. The eight-stage migration is NOT
+complete.** This document distinguishes shipped source changes, pure policy
+models, and missing kernel/service enforcement. Do not advertise the new
+library as replacing the existing rootd/Job/IPC authorities.
 
-The `rustos-component-model` library is a new, userspace-only, allocation-
-bounded state machine with host-testable invariants for:
+## Applied integration
 
-- generational component names and exact incarnation identity;
-- hierarchical qualitative policy ceilings (never positive kernel authority);
-- fail-closed component manifest preparation;
-- explicit, scoped capability routes and restart revocation;
-- checked hierarchical resource budgets and single-use charge tickets;
-- restart windows, exponential backoff and terminal failure decisions;
-- bounded in-memory health and crash events;
-- strict length/version-checked IDL envelope staging.
+- `rustos-component-model` is a no_std, no-unsafe, userspace-only library.
+  It has generation-bound `ComponentId`, bounded `Graph`, hierarchical
+  `JobCeiling`, single-use charge tickets, scoped capability offers,
+  canonical-encoding IDL/field checks, restart policy, memory-pressure and
+  client-funded session *policy*, health probes and update/rollback models.
+- `rootd::component_policy::preflight` runs **once before rootd endpoint
+  publication**, checks the immutable bootstrap/post-init manifests, rejects
+  duplicate service identities, invalid paths, malformed scheduling contexts
+  and non-forward bootstrap dependency edges. It performs no kernel syscall.
+- `rootd::component_policy::route_allowed` is now the pure lookup-policy
+  owner called by the existing rootd service dependency path. The kernel
+  still binds identity, endpoint epochs, and per-service grants. No
+  additional service IPC is inserted in the existing lookup call.
+- `rootd` and the component model have focused host tests; this work
+  leaves the live fixed service registry and exact kernel lease owner intact.
 
-It deliberately performs no syscall, touches no kernel/compat code and does
-not change rootd's existing bootstrap/service graph. The current kernel Job
-tree remains the authoritative resource ledger, and only kernel-validated
-Job descriptors can create actual process/resource authority.
+## Eight-stage status
 
-## Integration work required
+| Stage | Implemented source/evidence | Remaining work |
+| --- | --- | --- |
+| 1. Job lifecycle | Existing ring0 generational Job tree and typed descriptors (unchanged) | Hardware qualification, not reimplementation |
+| 2. Accounting | Existing counted process/thread/user-page limits; new userspace `pressure` model | Authoritative kernel-byte charge, memory.high/min admission/pressure wiring and acceptance |
+| 3. JobPolicy | Existing 256-bit kernel policy ceilings; new typed slow-operation registry | Assign positive subject grants and dual-run cutover of legacy service-capability checks |
+| 4. IDL/runtime | New `idl` canonical field/schema codec, existing service runtime | Source generator, full ABI versioned bindings, existing service migrations |
+| 5. Components | New generation-bound Graph; live rootd manifest preflight and lookup predicate migration | Declarative activation, named kernel capability transfer and one owning service supervisor |
+| 6. Session budgets | New client-funded session policy with exact-generation tickets and bounded expiration | Binding service allocation to kernel Job budget and accounting on provider failure |
+| 7. Personality split | Existing syscalld/procd/loaderd/vfsd policy split preserved | Audit remaining **slow** ring0 ABI policies and cut over with measured cost; no hotpath moves |
+| 8. Operability | New health probe, restart, event and update/rollback policy models | Actual persistent crash store, authenticated health reporter, image admission, restart transaction and KVM rollback |
+ 
+The model must never be mistaken for a security boundary. A policy decision
+does **not** mint a capability or authorize a syscall. Rootd and ring0 must
+still check the exact live principal, typed descriptor, version and endpoint
+generation. A session's user-space ticket is not kernel memory charging.
 
-1. Bind manifests to **signed** rootd image/registry state; reject untrusted
-   manifest-supplied Job IDs. The policy graph is not signature verification.
-2. Replace the historical fixed-ID discovery routing only after dual-running
-   source/ABI witnesses and proving no unauthorized endpoint transfer.
-3. Translate component lifecycle decisions to existing exact-generation
-   rootd service leases, handle revocation and loader transactions.
-4. Connect session charge tickets to real kernel-backed Job accounting,
-   including kernel-byte budget and memory high/min behavior.
-5. Generate the transport bindings from IDL; the current `wire` module is
-   envelope validation only and must not replace production ABI structs yet.
-6. Add persistent crash storage/health escalation and tested update rollback.
-7. Preserve ring0 hot paths: futex wait/wake, scheduler and thread substrate,
-   clock_gettime/sleep, getpid/gettid, usercopy, fault and page-table commit.
-   Never add a policy IPC round trip to these paths as a migration shortcut.
+## Explicit ring0 / TLB exclusions
 
-**Unimplemented stages are not marked complete.** See
-[Ring3 roadmap](ring3-process-model.md) and
-[Job model](job-model.md) for the existing work and remaining stages.
-Neither TLB shootdown nor ring0 compatibility code is modified here.
+No TLB code is changed. **Do not migrate** these fast or atomic mechanisms
+out of ring0: futex wait/wake/requeue and robust-list cleanup, local
+clock_gettime/timer wait paths, getpid/gettid, scheduler yield/block and
+thread substrate, syscall entry, usercopy, page faults, page-table commit,
+TLB invalidation and exact-ACK reclaim. Preserve the existing bootstrap-local
+ELF, initial address-space and emergency console exceptions. For mmap/brk
+keep the existing syscalld-policy versus kernel-mm commit boundary.
 
-## Verification
+Changes in the service control plane must not add a synchronous IPC round
+trip to any of those paths, even if a component router becomes available.
 
-`cargo test -p rustos-component-model --locked` exercises the model
-separately from live rootd. This does not prove reboot, SMP or ABI correctness.
-The existing `cargo xtask check`, formal requirements and KVM smoke remain
-mandatory once production wiring changes.
+## Verification and acceptance boundary
+
+Focused CI executes:
+
+```sh
+cargo fmt -p rustos-component-model -- --check
+rustfmt --edition 2021 --check services/rootd/src/component_policy.rs
+cargo test -p rustos-component-model --locked
+cargo test -p rootd --features host-test --locked
+```
+
+These are compile and state-machine witnesses, not KVM boot, SMP scheduling,
+formal-model or hardware stability evidence. Before a production cutover,
+validate `cargo xtask check`, the applicable formal profiles, 1/2/4/8-vCPU
+KVM smoke, service termination/restart storms, Job/frame leakage, and IPC
+performance relative to the prior release.
+
+Related contracts: [Ring3 roadmap](ring3-process-model.md),
+[Job model](job-model.md),
+[commercial gates](../ai/commercial-quality-gates.md).
