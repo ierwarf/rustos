@@ -1963,10 +1963,36 @@ fn post_init_reported_service_capability(
             lease.service_id == service_id
                 && lease.pid == subject_pid
                 && lease.state == ROOTD_LEASE_STATE_RUNNING
-                && post_init_lease_reporter_is_live(leases, post_init_leases, lease.reporter_pid)
+                && declared_reporter_is_live(
+                    leases, post_init_leases, lease.service_id, lease.reporter_pid
+                )
         })
         .map(|lease| service_policy_capability(lease.service_id))
         .filter(|capability| *capability != 0)
+}
+
+/// Exact parent is part of the service identity. Checking only the
+/// transitive PID chain would allow any live post-init service to impersonate
+/// the parent of a different component (notably netd -> uiserver).
+fn declared_reporter_is_live(
+    leases: &[Lease],
+    post_init_leases: &[PostInitLease],
+    child_service_id: u64,
+    reporter_pid: u64,
+) -> bool {
+    let Some(expected_parent) = component_policy::reporter_service_id(child_service_id) else {
+        return false;
+    };
+    let owner_matches = leases.iter().any(|lease| {
+        lease.service_id == expected_parent
+            && lease.pid == reporter_pid
+            && lease.state == ROOTD_LEASE_STATE_RUNNING
+    }) || post_init_leases.iter().any(|lease| {
+        lease.service_id == expected_parent
+            && lease.pid == reporter_pid
+            && lease.state == ROOTD_LEASE_STATE_RUNNING
+    });
+    owner_matches && post_init_lease_reporter_is_live(leases, post_init_leases, reporter_pid)
 }
 
 fn post_init_lease_reporter_is_live(
@@ -2098,8 +2124,8 @@ fn current_service_id_for_sender(
     for lease in post_init_leases.iter().filter(|lease| {
         lease.pid == sender.pid && lease.state == ROOTD_LEASE_STATE_RUNNING
     }) {
-        if owner.is_some() || !post_init_lease_reporter_is_live(
-            leases, post_init_leases, lease.reporter_pid
+        if owner.is_some() || !declared_reporter_is_live(
+            leases, post_init_leases, lease.service_id, lease.reporter_pid
         ) {
             return Err(13);
         }
