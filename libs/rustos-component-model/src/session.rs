@@ -66,6 +66,9 @@ struct Slot {
 pub struct Sessions {
     slots: Vec<Slot>,
     capacity: usize,
+    // Rotating bounded cleanup cursor: repeatedly expiring one early slot
+    // cannot starve an older session at the end of the table.
+    cleanup_cursor: usize,
 }
 
 impl Sessions {
@@ -76,6 +79,7 @@ impl Sessions {
         Ok(Self {
             slots: Vec::new(),
             capacity,
+            cleanup_cursor: 0,
         })
     }
 
@@ -200,40 +204,47 @@ impl Sessions {
         Ok(())
     }
 
-    /// Expire in a bounded batch; one failed release leaves its slot intact.
+    /// Expire a bounded number of sessions while rotating the scan start.
+    /// Each call walks at most the populated slot directory once; a finite
+    /// budget cannot repeatedly favor low indexes and starve later entries.
     pub fn expire(
         &mut self,
         graph: &mut Graph,
         now: u64,
         budget: usize,
     ) -> Result<usize, SessionError> {
-        let mut closed = 0;
-        for index in 0..self.slots.len() {
-            if closed >= budget {
-                break;
-            }
-            let Some(session) = self.slots[index].item else {
-                continue;
-            };
-            let view = session.view;
-            let client = graph.inspect(view.client).ok();
-            let provider = graph.inspect(view.provider).ok();
-            let route_invalid = graph
-                .resolve(view.client, view.provider, view.capability)
-                .map_or(true, |route| route.epoch != session.route_epoch);
-            if now >= view.expires_at
-                || route_invalid
-                || client
-                    .as_ref()
-                    .map_or(true, |c| c.incarnation != view.client_incarnation)
-                || provider
-                    .as_ref()
-                    .map_or(true, |c| c.incarnation != view.provider_incarnation)
-            {
-                self.close(graph, view.id)?;
-                closed += 1;
-            }
+        if budget == 0 || self.slots.is_empty() {
+            return Ok(0);
         }
+        let len = self.slots.len();
+        let mut index = self.cleanup_cursor % len;
+        let mut scanned = 0;
+        let mut closed = 0;
+        while scanned < len && closed < budget {
+            if let Some(session) = self.slots[index].item {
+                let view = session.view;
+                let client = graph.inspect(view.client).ok();
+                let provider = graph.inspect(view.provider).ok();
+                let route_invalid = graph
+                    .resolve(view.client, view.provider, view.capability)
+                    .map_or(true, |route| route.epoch != session.route_epoch);
+                if now >= view.expires_at
+                    || route_invalid
+                    || client
+                        .as_ref()
+                        .map_or(true, |c| c.incarnation != view.client_incarnation)
+                    || provider
+                        .as_ref()
+                        .map_or(true, |c| c.incarnation != view.provider_incarnation)
+                {
+                    self.close(graph, view.id)?;
+                    closed += 1;
+                }
+            }
+            index = if index + 1 == len { 0 } else { index + 1 };
+            scanned += 1;
+        }
+        self.cleanup_cursor = index;
         Ok(closed)
     }
 
@@ -243,19 +254,24 @@ impl Sessions {
         id: ComponentId,
         budget: usize,
     ) -> Result<usize, SessionError> {
-        let mut closed = 0;
-        for index in 0..self.slots.len() {
-            if closed >= budget {
-                break;
-            }
-            let Some(session) = self.slots[index].item else {
-                continue;
-            };
-            if session.view.client == id || session.view.provider == id {
-                self.close(graph, session.view.id)?;
-                closed += 1;
-            }
+        if budget == 0 || self.slots.is_empty() {
+            return Ok(0);
         }
+        let len = self.slots.len();
+        let mut index = self.cleanup_cursor % len;
+        let mut scanned = 0;
+        let mut closed = 0;
+        while scanned < len && closed < budget {
+            if let Some(session) = self.slots[index].item {
+                if session.view.client == id || session.view.provider == id {
+                    self.close(graph, session.view.id)?;
+                    closed += 1;
+                }
+            }
+            index = if index + 1 == len { 0 } else { index + 1 };
+            scanned += 1;
+        }
+        self.cleanup_cursor = index;
         Ok(closed)
     }
 
@@ -490,6 +506,58 @@ mod tests {
         assert_ne!(next, id);
         assert_eq!(sessions.slots[0].generation, u32::MAX);
         sessions.close(&mut g, next).unwrap();
+        assert_eq!(g.inspect(client).unwrap().used.sessions, 0);
+    }
+
+    #[test]
+    fn rotating_cleanup_cursor_reaches_late_slots_under_single_step_budget() {
+        let mut g = Graph::new(Moniker::new("root").unwrap(), 1, 4).unwrap();
+        let client = g
+            .create(
+                g.root(), Moniker::new("client").unwrap(), 2,
+                JobCeiling::ALL, Quota::UNLIMITED, RestartPolicy::NEVER, false,
+            )
+            .unwrap();
+        let provider = g
+            .create(
+                g.root(), Moniker::new("provider").unwrap(), 3,
+                JobCeiling::ALL, Quota::UNLIMITED, RestartPolicy::NEVER, false,
+            )
+            .unwrap();
+        g.activate(client).unwrap();
+        g.activate(provider).unwrap();
+        let cap = Moniker::new("fs").unwrap();
+        g.publish(provider, cap, 1).unwrap();
+        g.offer(provider, client, cap, 1).unwrap();
+        let charge = Charge {
+            sessions: 1,
+            ..Charge::ZERO
+        };
+        let mut sessions = Sessions::new(4).unwrap();
+        let mut ids = Vec::new();
+        for _ in 0..4 {
+            ids.push(
+                sessions.open(&mut g, client, provider, cap, charge, 1, 10).unwrap()
+            );
+        }
+        assert_eq!(sessions.expire(&mut g, 20, 1), Ok(1));
+        assert_eq!(sessions.cleanup_cursor, 1);
+        let fresh = sessions.open(&mut g, client, provider, cap, charge, 21, 100).unwrap();
+        assert_eq!(fresh.slot, 0);
+        assert_eq!(sessions.expire(&mut g, 22, 1), Ok(1));
+        assert_eq!(sessions.cleanup_cursor, 2);
+        assert_eq!(sessions.expire(&mut g, 22, 1), Ok(1));
+        assert_eq!(sessions.cleanup_cursor, 3);
+        assert_eq!(sessions.expire(&mut g, 22, 1), Ok(1));
+        assert_eq!(sessions.live_count(), 1);
+        assert_eq!(g.inspect(client).unwrap().used.sessions, 1);
+        assert!(sessions.inspect(&g, fresh, 22).is_ok());
+        for stale in &ids {
+            assert!(sessions.inspect(&g, *stale, 22).is_err());
+        }
+        assert_eq!(sessions.expire(&mut g, 22, 1), Ok(0));
+        assert_eq!(sessions.revoke_component(&mut g, provider, 1), Ok(1));
+        assert_eq!(sessions.live_count(), 0);
         assert_eq!(g.inspect(client).unwrap().used.sessions, 0);
     }
 
