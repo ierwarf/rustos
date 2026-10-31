@@ -28,7 +28,9 @@ impl ServiceCheckpointStore {
         // The ABI bound is a *limit*, not a request to reserve tens of
         // thousands of wire records from rootd's finite bootstrap heap.
         // Allocate incrementally on successful admission instead.
-        Self { records: Vec::new() }
+        Self {
+            records: Vec::new(),
+        }
     }
 
     pub(crate) fn mutate(
@@ -268,7 +270,10 @@ mod tests {
         store.mutate(5, b).unwrap();
         assert_eq!(store.scan(5, 0, 1), Ok((vec![a], 1)));
         assert_eq!(store.scan(5, 1, usize::MAX), Ok((vec![b], 2)));
-        assert_eq!(store.scan(5, usize::MAX, usize::MAX), Ok((vec![], usize::MAX)));
+        assert_eq!(
+            store.scan(5, usize::MAX, usize::MAX),
+            Ok((vec![], usize::MAX))
+        );
         assert_eq!(store.scan(5, 0, 0), Err(EINVAL));
         assert_eq!(store.scan(6, 0, usize::MAX), Ok((vec![foreign], 1)));
     }
