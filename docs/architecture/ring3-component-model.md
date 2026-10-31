@@ -20,6 +20,14 @@ library as replacing the existing rootd/Job/IPC authorities.
   owner called by the existing rootd service dependency path. The kernel
   still binds identity, endpoint epochs, and per-service grants. No
   additional service IPC is inserted in the existing lookup call.
+- `rootd` requires each running service to have one unambiguous PID
+  and checks post-init reporter ancestry before admitting UI service identity.
+  A conflicting live lease is denied, including when an old exit report is
+  delayed. Existing kernel-stamped sender identity is still authoritative.
+- `rootd::ServiceCheckpointStore` grows records on demand rather than
+  reserving all 32,768 slots during bootstrap; failed checkpoint or scan
+  allocations return ENOMEM instead of panicking. This is still an
+  **in-memory** restart checkpoint, not durable crash storage.
 - `rootd` and the component model have focused host tests; this work
   leaves the live fixed service registry and exact kernel lease owner intact.
 
@@ -31,10 +39,10 @@ library as replacing the existing rootd/Job/IPC authorities.
 | 2. Accounting | Existing counted process/thread/user-page limits; new userspace `pressure` model | Authoritative kernel-byte charge, memory.high/min admission/pressure wiring and acceptance |
 | 3. JobPolicy | Existing 256-bit kernel policy ceilings; new typed slow-operation registry | Assign positive subject grants and dual-run cutover of legacy service-capability checks |
 | 4. IDL/runtime | New `idl` canonical field/schema codec, existing service runtime | Source generator, full ABI versioned bindings, existing service migrations |
-| 5. Components | New generation-bound Graph; live rootd manifest preflight and lookup predicate migration | Declarative activation, named kernel capability transfer and one owning service supervisor |
+| 5. Components | New generation-bound Graph; live rootd manifest preflight, lookup predicate migration and exact live service PID collision/reporter-chain denial | Declarative activation, named kernel capability transfer and one owning service supervisor |
 | 6. Session budgets | New client-funded session policy with exact-generation tickets and bounded expiration | Binding service allocation to kernel Job budget and accounting on provider failure |
 | 7. Personality split | Existing syscalld/procd/loaderd/vfsd policy split preserved | Audit remaining **slow** ring0 ABI policies and cut over with measured cost; no hotpath moves |
-| 8. Operability | New health probe, restart, event and update/rollback policy models | Actual persistent crash store, authenticated health reporter, image admission, restart transaction and KVM rollback |
+| 8. Operability | New health probe, restart, event and update/rollback policy models; fallible lazy rootd checkpoint storage | Actual persistent crash store, authenticated health reporter, image admission, restart transaction and KVM rollback |
  
 The model must never be mistaken for a security boundary. A policy decision
 does **not** mint a capability or authorize a syscall. Rootd and ring0 must
