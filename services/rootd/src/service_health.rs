@@ -144,6 +144,21 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_sequence_is_acknowledged_without_renewing_deadline(){
+        let mut book=HealthBook::new();
+        let original=book.report(IPC_SERVICE_SESSIOND,71,5,1_000).unwrap();
+        assert_eq!(original,1_000+DEFAULT_TIMEOUT_NS);
+        assert!(book.is_duplicate(IPC_SERVICE_SESSIOND,71,5));
+        assert_eq!(book.report(IPC_SERVICE_SESSIOND,71,5,
+            1_000+DEFAULT_TIMEOUT_NS-1),Ok(original));
+        assert_eq!(book.report(IPC_SERVICE_SESSIOND,71,4,10_000),Err(ESTALE));
+        assert!(!book.is_duplicate(IPC_SERVICE_SESSIOND,71,6));
+        let expiry=book.expire(original+1,|_,pid|pid==71);
+        assert_eq!(expiry[0],Some((IPC_SERVICE_SESSIOND,71)));
+        assert_eq!(book.report(IPC_SERVICE_SESSIOND,71,5,original+2),Err(ESTALE));
+    }
+
+    #[test]
     fn expiry_is_a_single_fail_closed_witness_and_requires_live_pid() {
         let mut h = HealthBook::new();
         h.report(IPC_SERVICE_SESSIOND, 7, 1, 1).unwrap();

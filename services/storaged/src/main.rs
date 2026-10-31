@@ -69,6 +69,10 @@ fn main() {
         return;
     }
     debug_line("storaged: storage policy endpoint registered");
+    if let Err(error)=start_service_health_worker() {
+        debug_line(format!("storaged: heartbeat worker failed error={error}").as_str());
+        return;
+    }
     if let Err(error) = thread::Builder::new()
         .name("storaged-dvm-ready".to_string())
         .spawn(supervise_dvm_block_readiness)
@@ -80,6 +84,22 @@ fn main() {
         return;
     }
     serve(endpoint as u64);
+}
+
+/// Run independent exact-incarnation health evidence while the DVM storage
+/// readiness worker owns a potentially long media barrier. An unready block
+/// device does NOT suspend the supervisor's service heartbeat.
+fn start_service_health_worker()->Result<(),std::io::Error>{
+    thread::Builder::new()
+        .name("storaged-health".into())
+        .spawn(||{
+            let mut health=rustos_svc_runtime::heartbeat::Heartbeat::new(IPC_SERVICE_STORAGED);
+            loop {
+                let now=rustos_svc_runtime::syscall::monotonic_nanos();
+                let _=health.poll(now);
+                thread::sleep(Duration::from_millis(250));
+            }
+        }).map(|_|())
 }
 
 /// Own the only bounded DVM-ready wait outside the receive loop. Event wakes

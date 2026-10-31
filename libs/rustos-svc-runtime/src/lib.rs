@@ -7,6 +7,7 @@ pub mod allocator;
 pub mod ipc;
 pub mod pager;
 pub mod provider_client;
+pub mod heartbeat;
 pub mod syscall;
 
 use core::ptr;

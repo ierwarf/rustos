@@ -223,3 +223,14 @@ regressions in Codex, not in this drafting session.
 
 This is not eight-stage completion; Codex must separate compile fixes
 from genuinely unimplemented production integration. No validation run.
+
+## Lost-health-ACK semantics (2026-11-01)
+
+Rootd accepts one same-PID same-sequence replay without deadline extension.
+Do not count duplicate heartbeat ACKs as fresh UpdateBook healthy pulses.
+The new netd/storaged workers must be lifecycle-cancelled on process exit;
+no socket/storage locks are allowed across heartbeat IPC. Codex should
+prove that initial registration before exact post-init lease publication
+fails closed but later rebinds, that replay cannot fake three healthy
+trial pulses, and that the 30-second timeout only fires for live leases
+whose first pulse really established an exact incarnation.

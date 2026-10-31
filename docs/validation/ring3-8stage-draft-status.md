@@ -330,3 +330,18 @@ independent evidence of a signed durable release. No acceptance claim.
 No compiler, build, QEMU, sanitizer, unit test, audit script, formal run,
 or performance run was executed. New code is an intentionally unverified
 source draft for Codex to repair/complete.
+
+## 2026-11-01 stage-5 live health continuation
+
+Rootd HealthBook now explicitly recognizes exact duplicate health evidence
+after an IPC reply was lost; a replay receives the original deadline,
+does NOT extend that deadline and does NOT increment UpdateBook's
+three-distinct-pulse trial acceptance counter. New independent slow-control
+heartbeat workers now run in netd and storaged, reporting exact PID/TID
+and canonical health IDL through the shared no_std service-runtime
+heartbeat client. Other service senders, notably freestanding vfsd,
+still need a suitable independent/bounded scheduling source. Existing
+sessiond/runtimed health reporting remains in place.
+
+No compilation, boot, tests, benchmark, CI or formal review was run.
+This is source-only functionality and is not an accepted live watchdog.

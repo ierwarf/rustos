@@ -184,9 +184,27 @@ fn main() {
     }
 
     debug_line("netd: network policy endpoint registered");
+    if let Err(error)=start_service_health_worker() {
+        debug_line(&format!("netd: heartbeat worker creation failed error={error}"));
+        return;
+    }
     serve(endpoint as u64);
 }
 
+/// Own health proof independently of socket traffic. Slow rootd control IPC
+/// cannot be allowed to wait for a NetState, poll-waiter or deferred-reply lock.
+fn start_service_health_worker()->Result<(),std::io::Error>{
+    thread::Builder::new()
+        .name("netd-health".into())
+        .spawn(||{
+            let mut health=rustos_svc_runtime::heartbeat::Heartbeat::new(IPC_SERVICE_NETD);
+            loop {
+                let now=rustos_svc_runtime::syscall::monotonic_nanos();
+                let _=health.poll(now);
+                thread::sleep(Duration::from_millis(250));
+            }
+        }).map(|_|())
+}
 fn serve(endpoint: u64) {
     start_blocking_workers();
     start_inet_readiness_worker();

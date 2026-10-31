@@ -1382,12 +1382,20 @@ fn fill_commercial_max_response(
             service_checkpoints.updates.may_accept_health(
                 pulse.service, sender.pid, now_ns,
             )?;
+            let duplicate=service_checkpoints.health.is_duplicate(
+                pulse.service,sender.pid,pulse.sequence,
+            );
             let deadline = service_checkpoints.health.report(
                 pulse.service, sender.pid, pulse.sequence, now_ns,
             )?;
-            service_checkpoints.updates.healthy(
-                pulse.service, sender.pid, now_ns,
-            )?;
+            if !duplicate {
+                // A copyout-lost ACK may repeat an already accepted pulse.
+                // Such a replay must never counterfeit 3 health witnesses
+                // and seal a candidate update without new progress.
+                service_checkpoints.updates.healthy(
+                    pulse.service, sender.pid, now_ns,
+                )?;
+            }
             response.payload[..ack.len()].copy_from_slice(&ack);
             response.payload_len = ack.len() as u32;
             response.value0 = 0;
