@@ -35,12 +35,18 @@ fn decode(frame: &[u8], phase: u16) -> Result<Reclaim, IdlError> {
     let challenge = msg.field(3).ok_or(IdlError::Missing)?.as_u64()?;
     let found_phase = msg.field(4).ok_or(IdlError::Missing)?.as_u16()?;
     if found_phase != phase
-        || service == 0 || pid == 0 || challenge == 0
+        || service == 0
+        || pid == 0
+        || challenge == 0
         || msg.header().request_id != challenge
     {
         return Err(IdlError::Malformed);
     }
-    Ok(Reclaim { service, pid, challenge })
+    Ok(Reclaim {
+        service,
+        pid,
+        challenge,
+    })
 }
 
 pub fn encode_request(value: Reclaim) -> Result<Vec<u8>, IdlError> {
@@ -68,24 +74,68 @@ mod tests {
 
     #[test]
     fn strict_reclaim_idl_binds_service_pid_and_nonce() {
-        let ticket = Reclaim { service: 11, pid: 77, challenge: 19 };
+        let ticket = Reclaim {
+            service: 11,
+            pid: 77,
+            challenge: 19,
+        };
         let wire = encode_request(ticket).unwrap();
         assert_eq!(decode_request(&wire), Ok(ticket));
         assert!(decode_ack(&wire, ticket).is_err());
         let reply = encode_ack(ticket).unwrap();
         assert_eq!(decode_ack(&reply, ticket), Ok(()));
-        assert_eq!(decode_ack(&reply, Reclaim { pid: 78, ..ticket }), Err(IdlError::Malformed));
-        assert_eq!(decode_ack(&reply, Reclaim { challenge: 20, ..ticket }), Err(IdlError::Malformed));
-        assert_eq!(decode_ack(&reply, Reclaim { service: 12, ..ticket }), Err(IdlError::Malformed));
+        assert_eq!(
+            decode_ack(&reply, Reclaim { pid: 78, ..ticket }),
+            Err(IdlError::Malformed)
+        );
+        assert_eq!(
+            decode_ack(
+                &reply,
+                Reclaim {
+                    challenge: 20,
+                    ..ticket
+                }
+            ),
+            Err(IdlError::Malformed)
+        );
+        assert_eq!(
+            decode_ack(
+                &reply,
+                Reclaim {
+                    service: 12,
+                    ..ticket
+                }
+            ),
+            Err(IdlError::Malformed)
+        );
         assert!(decode_request(&reply).is_err());
     }
 
     #[test]
     fn malformed_reclaim_writes_nothing() {
-        assert!(encode_request(Reclaim { service: 0, pid: 1, challenge: 1 }).is_err());
-        assert!(encode_request(Reclaim { service: 1, pid: 0, challenge: 1 }).is_err());
-        assert!(encode_request(Reclaim { service: 1, pid: 1, challenge: 0 }).is_err());
-        let ticket = Reclaim { service: 11, pid: 77, challenge: 19 };
+        assert!(encode_request(Reclaim {
+            service: 0,
+            pid: 1,
+            challenge: 1
+        })
+        .is_err());
+        assert!(encode_request(Reclaim {
+            service: 1,
+            pid: 0,
+            challenge: 1
+        })
+        .is_err());
+        assert!(encode_request(Reclaim {
+            service: 1,
+            pid: 1,
+            challenge: 0
+        })
+        .is_err());
+        let ticket = Reclaim {
+            service: 11,
+            pid: 77,
+            challenge: 19,
+        };
         let mut wire = encode_request(ticket).unwrap();
         wire.push(0);
         assert!(decode_request(&wire).is_err());

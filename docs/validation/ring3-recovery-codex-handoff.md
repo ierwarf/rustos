@@ -156,3 +156,12 @@ supervisor operation 15; old scalar operation 8 is removed. Test strict TLV
 field ordering, malformed length, replayed challenge, wrong service identity,
 unknown state values, exited service PIDs and recovery across rootd restart.
 This is one live service operation cutover, not an entire ABI rewrite.
+
+## Production generated-IDL reclaim transaction
+
+Scalar lease-reclaim op 9 is retired. Initd uses generated schema 518 and
+supervisor op 16; the exact service/PID/nonce and ACK phase must match.
+Rootd preallocates the ACK before irrevocable kernel actions and retains
+its fail-closed endpoint/terminate contract. Fault-inject OOM before mutation,
+verify stale PID and ancestor cycles refuse, and stress lost ACK responses
+without ever adopting a recycled PID. Full durable rollback is not claimed.

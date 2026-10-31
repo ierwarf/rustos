@@ -106,7 +106,7 @@ library as replacing the existing rootd/Job/IPC authorities.
 | 1. Job lifecycle | Existing ring0 generational Job tree and typed descriptors (unchanged) | Hardware qualification, not reimplementation |
 | 2. Accounting | Existing counted process/thread/user-page limits; new userspace `pressure` model | Authoritative kernel-byte charge, memory.high/min admission/pressure wiring and acceptance |
 | 3. JobPolicy | Existing 256-bit kernel policy ceilings; production negative gating of checkpoint/reclaim controls by effective JobPolicy; live 13-role rootd authority manifest | Assign positive subject grants and dual-run cutover of legacy service-capability checks |
-| 4. IDL/runtime | Canonical no_std codec and generator; **production initd/rootd post-init lease snapshot uses generated-IDL op 517** with challenge-bound replies and retires scalar query op 8 | Other production services and request classes still require migration; outer supervisor IPC remains repr(C) |
+| 4. IDL/runtime | Generated-IDL production `initd`/`rootd` lease snapshot **and destructive reclaim** operations, exact PID/challenge-bound replies, retired scalar ops 8/9, five other staged schemas | Remaining production service protocols and outer commercial IPC envelope still require IDL/runtime cutover |
 | 5. Components | New generation-bound Graph; live rootd manifest and 15-offer route validation, declarative ordered supervisor parent edges, exact live service PID collision/reporter-chain denial | Declarative activation, named kernel capability transfer and consolidated production supervisor ownership |
 | 6. Session budgets | New client-funded session policy with exact-generation tickets, overflow retirement, offer-issuance epochs, mandatory one-unit session charging and revoked-route scavenging | Binding client-funded service allocation to kernel Job budget and provider-failure accounting; live runtimed has an independent 256-console-session bound |
 | 7. Personality split | Existing syscalld/procd/loaderd/vfsd policy split preserved | Audit remaining **slow** ring0 ABI policies and cut over with measured cost; no hotpath moves |
@@ -161,3 +161,14 @@ Rootd authenticates the current initd lease and rejects malformed or padded
 requests. Scalar query operation 8 is retired without fallback. Other service
 request types and the outer `CommercialMaxProtocol` transport are not yet
 migrated, and no hotpath IPC was added.
+
+### Exact post-init reclaim production IDL
+
+The destructive initd-to-rootd reclaim RPC is now also generated-IDL: schema
+opcode 518 inside rootd supervisor operation 16, replacing scalar operation 9.
+Rootd authenticates the current initd lease and exact target PID, allocates
+the IDL ACK before revoking any endpoint, then performs the same bounded
+transitive descendant revocation and termination as before. The resulting ACK
+must echo the exact service, PID and request challenge; no legacy fallback
+is available. This does **not** implement durable recovery or global session
+billing.
