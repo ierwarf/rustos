@@ -5,6 +5,7 @@ use rustos_user_abi::syscall::{
 };
 
 const EINVAL: i32 = 22;
+const ENOMEM: i32 = 12;
 const ENOSPC: i32 = 28;
 const EPROTO: i32 = 71;
 const ESTALE: i32 = 116;
@@ -24,9 +25,10 @@ pub(crate) struct ServiceCheckpointStore {
 
 impl ServiceCheckpointStore {
     pub(crate) fn new() -> Self {
-        Self {
-            records: Vec::with_capacity(SERVICE_CHECKPOINT_MAX_RECORDS),
-        }
+        // The ABI bound is a *limit*, not a request to reserve tens of
+        // thousands of wire records from rootd's finite bootstrap heap.
+        // Allocate incrementally on successful admission instead.
+        Self { records: Vec::new() }
     }
 
     pub(crate) fn mutate(
@@ -88,10 +90,15 @@ impl ServiceCheckpointStore {
 
         match existing_index {
             Some(index) => self.records[index].wire = incoming,
-            None => self.records.push(StoredRecord {
-                service_id,
-                wire: incoming,
-            }),
+            None => {
+                // Reserve before changing any state (including dependent
+                // tombstones); OOM must not partially publish a checkpoint.
+                self.records.try_reserve(1).map_err(|_| ENOMEM)?;
+                self.records.push(StoredRecord {
+                    service_id,
+                    wire: incoming,
+                });
+            }
         }
 
         if incoming.flags & SERVICE_CHECKPOINT_FLAG_TOMBSTONE != 0 {
@@ -121,14 +128,20 @@ impl ServiceCheckpointStore {
         if max == 0 {
             return Err(EINVAL);
         }
-        let records = self
-            .records
-            .iter()
-            .filter(|record| record.service_id == service_id)
-            .skip(cursor)
-            .take(max)
-            .map(|record| record.wire)
-            .collect::<Vec<_>>();
+        // Two bounded passes avoid infallible `collect` in the supervisor.
+        // Reserve only the actual result count, never the untrusted `max`.
+        let matching = || {
+            self.records
+                .iter()
+                .filter(|record| record.service_id == service_id)
+                .skip(cursor)
+                .take(max)
+                .map(|record| record.wire)
+        };
+        let count = matching().count();
+        let mut records = Vec::new();
+        records.try_reserve_exact(count).map_err(|_| ENOMEM)?;
+        records.extend(matching());
         let next = cursor.saturating_add(records.len());
         Ok((records, next))
     }
@@ -233,6 +246,31 @@ mod tests {
         };
         record.value[0] = revision as u8;
         record
+    }
+
+    #[test]
+    fn startup_does_not_reserve_full_checkpoint_limit() {
+        let mut store = ServiceCheckpointStore::new();
+        assert_eq!(store.records.len(), 0);
+        assert_eq!(store.records.capacity(), 0);
+        assert_eq!(store.mutate(3, record((1, 1), (0, 0), 1, 2)), Ok(false));
+        assert!(store.records.capacity() < SERVICE_CHECKPOINT_MAX_RECORDS);
+    }
+
+    #[test]
+    fn paginated_scan_is_exact_and_does_not_reserve_untrusted_max() {
+        let mut store = ServiceCheckpointStore::new();
+        let a = record((1, 1), (0, 0), 1, 10);
+        let b = record((2, 2), (0, 0), 1, 11);
+        let foreign = record((3, 3), (0, 0), 1, 12);
+        store.mutate(5, a).unwrap();
+        store.mutate(6, foreign).unwrap();
+        store.mutate(5, b).unwrap();
+        assert_eq!(store.scan(5, 0, 1), Ok((vec![a], 1)));
+        assert_eq!(store.scan(5, 1, usize::MAX), Ok((vec![b], 2)));
+        assert_eq!(store.scan(5, usize::MAX, usize::MAX), Ok((vec![], usize::MAX)));
+        assert_eq!(store.scan(5, 0, 0), Err(EINVAL));
+        assert_eq!(store.scan(6, 0, usize::MAX), Ok((vec![foreign], 1)));
     }
 
     #[test]
