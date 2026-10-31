@@ -156,7 +156,7 @@ fn parent_stop_refuses_new_children_and_cascades_to_descendants() {
             RestartPolicy::NEVER,
             false
         ),
-        Err(GraphError::InvalidParent)
+        Err(GraphError::InvalidState)
     );
     g.finish_stop(a).unwrap();
     assert_eq!(g.reap(a), Err(GraphError::Busy));
