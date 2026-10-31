@@ -31,6 +31,9 @@ const MAX_DEPTH: usize = 9;
 struct Group {
     usage: AtomicU64,
     limit: AtomicU64,
+    high: AtomicU64,
+    min: AtomicU64,
+    high_events: AtomicU64,
     parent: AtomicU32,
 }
 
@@ -39,6 +42,9 @@ impl Group {
         Self {
             usage: AtomicU64::new(0),
             limit: AtomicU64::new(UNLIMITED),
+            high: AtomicU64::new(UNLIMITED),
+            min: AtomicU64::new(0),
+            high_events: AtomicU64::new(0),
             parent: AtomicU32::new(NO_PARENT),
         }
     }
@@ -74,6 +80,9 @@ fn walk(index: usize, mut visit: impl FnMut(&'static Group) -> bool) -> bool {
 pub fn init_group(index: usize, parent: Option<usize>) {
     let Some(cell) = group(index) else { return };
     cell.limit.store(UNLIMITED, Ordering::Relaxed);
+    cell.high.store(UNLIMITED, Ordering::Relaxed);
+    cell.min.store(0, Ordering::Relaxed);
+    cell.high_events.store(0, Ordering::Relaxed);
     cell.parent
         .store(parent.map_or(NO_PARENT, |p| p as u32), Ordering::Relaxed);
 }
@@ -100,6 +109,36 @@ pub fn effective_limit(index: usize) -> u64 {
     effective
 }
 
+/// Slow-path job memory QoS policy. A high crossing emits an event without
+/// refusing page faults or scheduling a worker in ring0.
+pub fn set_qos(index: usize, high: u64, min: u64) {
+    if let Some(cell) = group(index) {
+        cell.high.store(high, Ordering::Relaxed);
+        cell.min.store(min, Ordering::Relaxed);
+    }
+}
+
+pub fn high(index: usize) -> u64 {
+    group(index).map_or(UNLIMITED, |cell| cell.high.load(Ordering::Relaxed))
+}
+
+pub fn minimum(index: usize) -> u64 {
+    group(index).map_or(0, |cell| cell.min.load(Ordering::Relaxed))
+}
+
+pub fn effective_high(index: usize) -> u64 {
+    let mut effective = UNLIMITED;
+    walk(index, |cell| {
+        effective = effective.min(cell.high.load(Ordering::Relaxed));
+        true
+    });
+    effective
+}
+
+pub fn high_events(index: usize) -> u64 {
+    group(index).map_or(0, |cell| cell.high_events.load(Ordering::Relaxed))
+}
+
 /// Pages charged to this group and every descendant.
 pub fn usage(index: usize) -> u64 {
     group(index).map_or(0, |cell| cell.usage.load(Ordering::Relaxed))
@@ -117,7 +156,11 @@ pub fn would_admit(index: usize, pages: u64) -> bool {
 /// Charges `pages` to the group and every ancestor.
 pub fn charge(index: usize, pages: u64) {
     walk(index, |cell| {
-        cell.usage.fetch_add(pages, Ordering::Relaxed);
+        let old = cell.usage.fetch_add(pages, Ordering::Relaxed);
+        let high = cell.high.load(Ordering::Relaxed);
+        if high != UNLIMITED && old <= high && old.saturating_add(pages) > high {
+            cell.high_events.fetch_add(1, Ordering::Relaxed);
+        }
         true
     });
 }

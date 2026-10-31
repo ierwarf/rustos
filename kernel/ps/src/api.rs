@@ -132,6 +132,7 @@ pub use crate::multitask::{
     job_kill_begin, job_set_limits, JobLimits, LimitMask, LIMIT_UNSET,
     job_session_info, job_set_session_limit, job_charge_client_session,
     job_release_client_session, JobSessionInfo,
+    job_memory_qos, job_set_memory_qos, JobMemoryQos,
     job_policy_allows, job_policy_info, job_set_policy, JobPolicy, JobPolicyInfo,
     job_subtree_contains_process,
     process_job, JobError, JobId, JobInfo, JobState, ROOT_JOB,

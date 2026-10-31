@@ -573,6 +573,77 @@ pub fn job_is_within(ancestor: JobId, descendant: JobId) -> bool {
 }
 
 
+
+/// Kernel-owned memory pressure policy. Memory.max keeps its existing
+/// fault-path admission. Soft high emits a bounded counter and protected min
+/// only affects the root supervisor's slow OOM victim policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct JobMemoryQos {
+    pub high: u64,
+    pub min: u64,
+    pub effective_high: u64,
+    pub high_events: u64,
+    pub usage: u64,
+}
+
+pub fn job_memory_qos(id: JobId) -> Result<JobMemoryQos, JobError> {
+    let table = PROCESS_TABLE.lock();
+    table.job_slot(id).ok_or(JobError::Stale)?;
+    Ok(JobMemoryQos {
+        high: kernel_mm::api::charge::high(id.index as usize),
+        min: kernel_mm::api::charge::minimum(id.index as usize),
+        effective_high: kernel_mm::api::charge::effective_high(id.index as usize),
+        high_events: kernel_mm::api::charge::high_events(id.index as usize),
+        usage: kernel_mm::api::charge::usage(id.index as usize),
+    })
+}
+
+/// Publish high/min atomically with respect to the Job tree. No memory
+/// reclaim is performed while holding the table lock. Child minima are
+/// admitted only into an explicit parent reserve, preventing double grants.
+pub fn job_set_memory_qos(id: JobId, high: u64, min: u64) -> Result<JobMemoryQos, JobError> {
+    let table = PROCESS_TABLE.lock();
+    let slot = table.job_slot(id).ok_or(JobError::Stale)?;
+    if slot.state == JobState::Killing {
+        return Err(JobError::Killing);
+    }
+    if high != LIMIT_UNSET && min > high {
+        return Err(JobError::Full);
+    }
+    let hard = kernel_mm::api::charge::limit(id.index as usize);
+    if hard != LIMIT_UNSET && min > hard {
+        return Err(JobError::Full);
+    }
+    if slot.parent != NO_PARENT && min != 0 {
+        let parent_min = kernel_mm::api::charge::minimum(slot.parent as usize);
+        let mut sibling_min = 0_u64;
+        for (index, child) in table.jobs.iter().enumerate() {
+            if child.in_use && child.parent == slot.parent && index != id.index as usize {
+                sibling_min = sibling_min.saturating_add(kernel_mm::api::charge::minimum(index));
+            }
+        }
+        if sibling_min.saturating_add(min) > parent_min {
+            return Err(JobError::Full);
+        }
+    }
+    let child_total = table.jobs.iter().enumerate()
+        .filter(|(_, child)| child.in_use && child.parent == id.index)
+        .fold(0u64, |sum, (index, _)| {
+            sum.saturating_add(kernel_mm::api::charge::minimum(index))
+        });
+    if min < child_total {
+        return Err(JobError::Full);
+    }
+    kernel_mm::api::charge::set_qos(id.index as usize, high, min);
+    Ok(JobMemoryQos {
+        high,
+        min,
+        effective_high: kernel_mm::api::charge::effective_high(id.index as usize),
+        high_events: kernel_mm::api::charge::high_events(id.index as usize),
+        usage: kernel_mm::api::charge::usage(id.index as usize),
+    })
+}
+
 /// Bounded, generation-aware job session-accounting snapshot. The page count
 /// ledger is separate: a session token must never manufacture a mapped page.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
