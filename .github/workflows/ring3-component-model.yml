@@ -22,7 +22,8 @@ jobs:
       - name: Verify declarative Ring3 IDL
         run: python3 tools/ring3_idl_codegen.py --check
       - name: Format recovery checkpoint source
-        run: rustfmt --edition 2021 services/rootd/src/service_checkpoint.rs
+        run: |
+          rustfmt --edition 2021 services/rootd/src/service_checkpoint.rs
           rustfmt --edition 2021 services/rootd/src/service_manifest.rs
           rustfmt --edition 2021 services/rootd/src/component_policy.rs
       - name: Publish isolated recovery formatting
@@ -36,7 +37,8 @@ jobs:
             git push origin HEAD:refs/heads/ring3-recovery-graph-hardening
           fi
       - name: Verify checkpoint formatting
-        run: rustfmt --edition 2021 --check services/rootd/src/service_checkpoint.rs
+        run: |
+          rustfmt --edition 2021 --check services/rootd/src/service_checkpoint.rs
           rustfmt --edition 2021 --check services/rootd/src/service_manifest.rs
           rustfmt --edition 2021 --check services/rootd/src/component_policy.rs
       - name: Check component formatting
