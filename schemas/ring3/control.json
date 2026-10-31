@@ -195,6 +195,36 @@
           "required": true
         }
       ]
+    },
+    {
+      "name": "post_init_lease_reclaim",
+      "opcode": 518,
+      "fields": [
+        {
+          "name": "service",
+          "tag": 1,
+          "type": "u64",
+          "required": true
+        },
+        {
+          "name": "pid",
+          "tag": 2,
+          "type": "u64",
+          "required": true
+        },
+        {
+          "name": "challenge",
+          "tag": 3,
+          "type": "u64",
+          "required": true
+        },
+        {
+          "name": "phase",
+          "tag": 4,
+          "type": "u16",
+          "required": true
+        }
+      ]
     }
   ]
 }

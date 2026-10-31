@@ -200,6 +200,37 @@ pub const POST_INIT_LEASE_SNAPSHOT: Schema<'static> = Schema {
     fields: &POST_INIT_LEASE_SNAPSHOT_FIELDS,
 };
 
+pub const POST_INIT_LEASE_RECLAIM_FIELDS: [FieldSpec; 4] = [
+    FieldSpec {
+        tag: 1,
+        kind: FieldKind::U64,
+        required: true,
+        max_len: 8,
+    },
+    FieldSpec {
+        tag: 2,
+        kind: FieldKind::U64,
+        required: true,
+        max_len: 8,
+    },
+    FieldSpec {
+        tag: 3,
+        kind: FieldKind::U64,
+        required: true,
+        max_len: 8,
+    },
+    FieldSpec {
+        tag: 4,
+        kind: FieldKind::U16,
+        required: true,
+        max_len: 2,
+    },
+];
+pub const POST_INIT_LEASE_RECLAIM: Schema<'static> = Schema {
+    opcode: 518,
+    fields: &POST_INIT_LEASE_RECLAIM_FIELDS,
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,6 +244,7 @@ mod tests {
             UPDATE_APPROVAL,
             CHECKPOINT_STATE,
             POST_INIT_LEASE_SNAPSHOT,
+            POST_INIT_LEASE_RECLAIM,
         ] {
             assert!(schema.validate().is_ok());
         }
