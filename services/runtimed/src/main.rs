@@ -24,6 +24,7 @@ use rustos_user_abi::syscall::{
 mod catalog;
 mod kvm_smp_qualification;
 mod launch_worker;
+mod heartbeat;
 mod offload;
 mod session;
 mod socket;
@@ -253,8 +254,10 @@ fn main() {
     let mut runtime_connections = socket::RuntimeConnections::default();
     let _ = ensure_ui_bootstrap(&mut state);
     let mut pass = LoopPassTiming::default();
+    let mut service_health = heartbeat::Heartbeat::new();
     loop {
         pass.begin();
+        service_health.poll();
         let mut did_work = false;
         did_work |= drain_session_request_burst(session_endpoint, &mut state) != 0;
         pass.mark(LoopPhase::Drain);

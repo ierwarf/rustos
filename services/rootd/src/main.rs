@@ -226,7 +226,9 @@ pub extern "C" fn __rustos_rootd_start() -> ! {
         jobs::limit_probe_child();
     }
     debug_line(b"rootd: bootstrap enter\n");
-    if component_policy::preflight().is_err() {
+    if component_policy::preflight().is_err()
+        || service_grants::preflight().is_err()
+    {
         fail_closed(b"rootd: fatal component manifest preflight failed\n");
     }
     let endpoint = create_rootd_endpoint();
