@@ -341,10 +341,16 @@ fn job_session_args_valid(args: &rustos_user_abi::syscall::RustosJobSessionArgs)
         return false;
     }
     match args.op {
-        JOB_SESSION_OP_INSPECT => args.client_pid == 0 && args.job_id == 0 && args.limit == 0,
-        JOB_SESSION_OP_SET_LIMIT => args.client_pid == 0 && args.job_id == 0,
-        JOB_SESSION_OP_CHARGE => args.client_pid != 0 && args.job_id != 0 && args.limit == 0,
-        JOB_SESSION_OP_RELEASE => args.client_pid == 0 && args.job_id != 0 && args.limit == 0,
+        JOB_SESSION_OP_INSPECT => args.client_pid == 0 && args.job_id == 0
+            && args.limit == 0 && args.provider_pid == 0 && args.token == 0,
+        JOB_SESSION_OP_SET_LIMIT => args.client_pid == 0 && args.job_id == 0
+            && args.provider_pid == 0 && args.token == 0,
+        JOB_SESSION_OP_CHARGE => args.client_pid != 0 && args.job_id != 0
+            && args.limit == 0 && args.provider_pid != 0 && args.token != 0,
+        JOB_SESSION_OP_RELEASE => args.client_pid == 0 && args.limit == 0
+            && args.provider_pid != 0 && args.token != 0,
+        JOB_SESSION_OP_DRAIN => args.client_pid == 0 && args.job_id == 0
+            && args.limit == 0 && args.token == 0,
         _ => false,
     }
 }
@@ -357,34 +363,65 @@ fn execute_job_session(
     let required = match args.op {
         JOB_SESSION_OP_INSPECT => JobHandleRights::INSPECT,
         JOB_SESSION_OP_SET_LIMIT => JobHandleRights::SET_LIMITS,
-        JOB_SESSION_OP_CHARGE | JOB_SESSION_OP_RELEASE => JobHandleRights::ACCOUNT_SESSIONS,
+        JOB_SESSION_OP_CHARGE | JOB_SESSION_OP_RELEASE | JOB_SESSION_OP_DRAIN =>
+            JobHandleRights::ACCOUNT_SESSIONS,
         _ => return Err(LINUX_EINVAL),
     };
     let (authority, _) = multitask::with_process_state_by_pid(caller, |state| {
-        state.handles().get_entry(args.job_handle).ok_or(LINUX_EBADF)
+        state.handles().get_entry(args.job_handle)
+            .ok_or(LINUX_EBADF)
             .and_then(|entry| job_authority_with_right(entry, required))
     }).ok_or(LINUX_ESRCH)??;
-    // Only the boot root authority can mutate the accounting of a client
-    // whose JobId was discovered through an authenticated ring3 supervisor.
-    if matches!(args.op, JOB_SESSION_OP_CHARGE | JOB_SESSION_OP_RELEASE)
-        && (authority != multitask::ROOT_JOB
-            || args.job_handle != JOB_BOOTSTRAP_ROOT_FD)
-    {
+    if matches!(args.op,
+        JOB_SESSION_OP_CHARGE | JOB_SESSION_OP_RELEASE | JOB_SESSION_OP_DRAIN
+    ) && (authority != multitask::ROOT_JOB || args.job_handle != JOB_BOOTSTRAP_ROOT_FD) {
         return Err(LINUX_EPERM);
     }
-    let info = match args.op {
-        JOB_SESSION_OP_INSPECT => multitask::job_session_info(authority),
-        JOB_SESSION_OP_SET_LIMIT => multitask::job_set_session_limit(authority, args.limit),
-        JOB_SESSION_OP_CHARGE => multitask::job_charge_client_session(
-            args.client_pid, multitask::JobId::from_raw(args.job_id)),
-        JOB_SESSION_OP_RELEASE => multitask::job_release_client_session(
-            multitask::JobId::from_raw(args.job_id)),
+    match args.op {
+        JOB_SESSION_OP_INSPECT | JOB_SESSION_OP_SET_LIMIT => {
+            let info = match args.op {
+                JOB_SESSION_OP_INSPECT => multitask::job_session_info(authority),
+                _ => multitask::job_set_session_limit(authority, args.limit),
+            }.map_err(job_error_errno)?;
+            args.job_id = info.job.to_raw();
+            args.limit = info.limit;
+            args.effective = info.effective_limit;
+            args.usage = info.usage;
+        }
+        JOB_SESSION_OP_CHARGE => {
+            let info = multitask::job_charge_client_session_token(
+                args.provider_pid, args.token, args.client_pid,
+                multitask::JobId::from_raw(args.job_id),
+            ).map_err(job_error_errno)?;
+            args.job_id = info.job.to_raw();
+            args.limit = info.limit;
+            args.effective = info.effective_limit;
+            args.usage = info.usage;
+        }
+        JOB_SESSION_OP_RELEASE => {
+            let expected = (args.job_id != 0).then(|| multitask::JobId::from_raw(args.job_id));
+            let info = multitask::job_release_client_session_token(
+                args.provider_pid, args.token, expected,
+            ).map_err(job_error_errno)?;
+            if let Some(info) = info {
+                args.job_id = info.job.to_raw();
+                args.limit = info.limit;
+                args.effective = info.effective_limit;
+                args.usage = info.usage;
+            } else {
+                args.job_id = 0;
+                args.limit = 0;
+                args.effective = 0;
+                args.usage = 0;
+            }
+        }
+        JOB_SESSION_OP_DRAIN => {
+            args.usage = multitask::job_drain_client_session_tokens(
+                (args.provider_pid != 0).then_some(args.provider_pid),
+            ).map_err(job_error_errno)?;
+        }
         _ => return Err(LINUX_EINVAL),
-    }.map_err(job_error_errno)?;
-    args.job_id = info.job.to_raw();
-    args.limit = info.limit;
-    args.effective = info.effective_limit;
-    args.usage = info.usage;
+    }
     args.client_pid = 0;
     Ok(())
 }
@@ -408,13 +445,8 @@ pub(super) fn syscall_linux_rustos_job_session(args_ptr: u64) -> u64 {
         return linux_errno(err);
     }
     if let Err(err) = usermem::write_current_user_struct(args_ptr, &args) {
-        // A charge whose output cannot be copied back is observable by
-        // rootd only as an error; compensate before returning, so retries
-        // cannot double-charge. Release operations require a valid, writable
-        // buffer preflight before the irreversible decrement.
-        if args.op == rustos_user_abi::syscall::JOB_SESSION_OP_CHARGE {
-            let _ = multitask::job_release_client_session(multitask::JobId::from_raw(args.job_id));
-        }
+        // The kernel owns tokens and watermarks: repeating the same request
+        // after ambiguous user copyout never doubles the charge or refund.
         return linux_errno(address_space_error_to_linux_errno(err));
     }
     0

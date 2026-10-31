@@ -983,11 +983,13 @@ pub const JOB_STATE_LIVE: u32 = 0;
 pub const JOB_STATE_KILLING: u32 = 1;
 /// Dedicated slow-path Job session accounting ABI. The existing Job broker
 /// structure and fast scheduling ABI remain unchanged.
-pub const JOB_SESSION_ABI_VERSION: u16 = 1;
+pub const JOB_SESSION_ABI_VERSION: u16 = 2;
 pub const JOB_SESSION_OP_INSPECT: u16 = 1;
 pub const JOB_SESSION_OP_SET_LIMIT: u16 = 2;
 pub const JOB_SESSION_OP_CHARGE: u16 = 3;
 pub const JOB_SESSION_OP_RELEASE: u16 = 4;
+/// Rootd crash-recovery reconciliation by provider PID, or all providers.
+pub const JOB_SESSION_OP_DRAIN: u16 = 5;
 
 pub const JOB_MEMORY_QOS_ABI_VERSION: u16 = 1;
 pub const JOB_MEMORY_QOS_OP_INSPECT: u16 = 1;
@@ -1024,6 +1026,8 @@ pub struct RustosJobSessionArgs {
     pub effective: u64,
     pub usage: u64,
     pub reserved: u64,
+    pub provider_pid: u64,
+    pub token: u64,
 }
 pub const PROC_BROKER_FORMAT_ELF64: u16 = 1;
 pub const PROC_BROKER_FORMAT_PE64: u16 = 2;

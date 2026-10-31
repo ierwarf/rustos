@@ -117,6 +117,8 @@ pub use self::process_table::jobs::{
     job_subtree_contains_process, job_session_info, job_set_session_limit,
     job_charge_client_session, job_release_client_session, JobSessionInfo,
     job_memory_qos, job_set_memory_qos, JobMemoryQos,
+    job_charge_client_session_token, job_release_client_session_token,
+    job_drain_client_session_tokens,
     process_job, JobError, JobId, JobInfo, JobState, JOB_MAX_DEPTH, ROOT_JOB,
 };
 pub use self::retirement::UserFaultDisposition;
