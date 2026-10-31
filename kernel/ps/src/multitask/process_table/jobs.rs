@@ -489,7 +489,12 @@ pub fn job_set_limits(id: JobId, mask: LimitMask, limits: JobLimits) -> Result<(
         table.jobs[id.index as usize].limits.threads = limits.threads;
     }
     if mask.contains(LimitMask::MEMORY) {
-        // The charge group owns the limit so the fault path reads it lock-free.
+        // Never shrink hard memory below a previously admitted minimum.
+        // The charge group owns the limit; the fault path reads it lock-free.
+        let minimum = kernel_mm::api::charge::minimum(id.index as usize);
+        if limits.memory_pages != LIMIT_UNSET && limits.memory_pages < minimum {
+            return Err(JobError::Full);
+        }
         kernel_mm::api::charge::set_limit(id.index as usize, limits.memory_pages);
     }
     Ok(())

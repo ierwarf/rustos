@@ -1949,7 +1949,11 @@ fn process_inside_memory_min(pid: u64) -> bool {
         let info = jobs::info(handle);
         jobs::close(handle);
         let (Ok(qos), Ok(info)) = (qos, info) else { return true };
-        if qos.min_pages != 0 && info.usage_memory_pages <= qos.min_pages {
+        if qos.min_pages != 0 && id != rustos_user_abi::syscall::JOB_ID_ROOT {
+            // A whole-process kill is not guaranteed to leave its Job above
+            // the reserve; reject that candidate conservatively. The root
+            // reservation covers the whole machine, not every individual
+            // application in isolation.
             return true;
         }
         if info.parent == 0 {
@@ -1979,7 +1983,7 @@ fn job_kill_is_safe(job: u64, protected: &[u64]) -> bool {
         .all(|&pid| jobs::process_job_in(handle, pid) == Err(ESRCH))
         && memory.as_ref().is_ok_and(|qos| {
             qos.min_pages == 0
-                || usage.as_ref().is_ok_and(|pages| *pages > qos.min_pages)
+                && usage.is_ok()
         });
     jobs::close(handle);
     safe
