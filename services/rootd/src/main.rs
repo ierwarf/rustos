@@ -1981,21 +1981,28 @@ fn current_service_id_for_sender(
     if sender.pid == 0 || sender.tid == 0 {
         return Err(22);
     }
-    if let Some(lease) = leases
-        .iter()
-        .find(|lease| lease.pid == sender.pid && lease.state == ROOTD_LEASE_STATE_RUNNING)
-    {
-        return Ok(lease.service_id);
+    // A service identity is *unique*, not first-match. Inconsistencies may
+    // arise after delayed exit notification or PID reuse; never let table
+    // order decide which service's capability the caller receives.
+    let mut owner = None;
+    for lease in leases.iter().filter(|lease| {
+        lease.pid == sender.pid && lease.state == ROOTD_LEASE_STATE_RUNNING
+    }) {
+        if owner.replace(lease.service_id).is_some() {
+            return Err(13);
+        }
     }
-    post_init_leases
-        .iter()
-        .find(|lease| {
-            lease.pid == sender.pid
-                && lease.state == ROOTD_LEASE_STATE_RUNNING
-                && post_init_lease_reporter_is_live(leases, post_init_leases, lease.reporter_pid)
-        })
-        .map(|lease| lease.service_id)
-        .ok_or(13)
+    for lease in post_init_leases.iter().filter(|lease| {
+        lease.pid == sender.pid && lease.state == ROOTD_LEASE_STATE_RUNNING
+    }) {
+        if owner.is_some() || !post_init_lease_reporter_is_live(
+            leases, post_init_leases, lease.reporter_pid
+        ) {
+            return Err(13);
+        }
+        owner = Some(lease.service_id);
+    }
+    owner.ok_or(13)
 }
 
 fn service_dependency_allowed(subject: u64, target: u64) -> bool {
@@ -3060,6 +3067,48 @@ mod tests {
             Err(13)
         );
         assert_eq!(post_init[0].reporter_pid, initd_pid);
+    }
+
+    #[test]
+    fn service_namespace_lookup_refuses_ambiguous_active_pid() {
+        let mut core = leases_with_live_initd(41);
+        let mut post = [
+            post_init_lease(POST_INIT_MANIFEST[0]),
+            post_init_lease(POST_INIT_MANIFEST[2]),
+        ];
+        post[0].pid = 73;
+        post[0].reporter_pid = 41;
+        post[0].state = ROOTD_LEASE_STATE_RUNNING;
+        let sender = IpcSenderIdentity { pid: 73, tid: 2 };
+        assert_eq!(
+            current_service_id_for_sender(&core, &post, sender),
+            Ok(IPC_SERVICE_NETD)
+        );
+
+        // Two post-init services claiming one live PID must not inherit
+        // whichever capability happens to appear first in the fixed array.
+        post[1].pid = 73;
+        post[1].reporter_pid = 41;
+        post[1].state = ROOTD_LEASE_STATE_RUNNING;
+        assert_eq!(current_service_id_for_sender(&core, &post, sender), Err(13));
+
+        // The same protection covers an accidental core/post-init overlap.
+        post[1].pid = 41;
+        assert_eq!(
+            current_service_id_for_sender(
+                &core, &post, IpcSenderIdentity { pid: 41, tid: 2 }
+            ), Err(13)
+        );
+
+        // A core-core collision is also fail-closed.
+        post[1].state = ROOTD_LEASE_STATE_EXITED;
+        core[0].pid = 41;
+        core[0].state = ROOTD_LEASE_STATE_RUNNING;
+        assert_eq!(
+            current_service_id_for_sender(
+                &core, &post, IpcSenderIdentity { pid: 41, tid: 2 }
+            ), Err(13)
+        );
     }
 
     #[test]
