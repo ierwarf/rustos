@@ -156,7 +156,7 @@ fn parent_stop_refuses_new_children_and_cascades_to_descendants() {
             RestartPolicy::NEVER,
             false
         ),
-        Err(GraphError::InvalidParent)
+        Err(GraphError::InvalidState)
     );
     g.finish_stop(a).unwrap();
     assert_eq!(g.reap(a), Err(GraphError::Busy));
@@ -189,6 +189,77 @@ fn once_denied_at_parent_the_child_cannot_restore_operation() {
         g.narrow_ceiling(a, JobCeiling::ALL),
         Err(GraphError::PermissionDenied)
     );
+}
+
+#[test]
+fn stopped_ancestor_immediately_revokes_descendant_policy_and_routes() {
+    let mut g = graph();
+    let parent = child(&mut g, "realm", 2);
+    let provider = g
+        .create(
+            parent,
+            n("provider"),
+            3,
+            JobCeiling::ALL,
+            Quota::UNLIMITED,
+            RestartPolicy::NEVER,
+            false,
+        )
+        .unwrap();
+    g.activate(provider).unwrap();
+    let consumer = child(&mut g, "consumer", 4);
+    let endpoint = n("endpoint");
+    g.publish(provider, endpoint, 1).unwrap();
+    g.offer(provider, consumer, endpoint, 1).unwrap();
+    assert!(g.permits(provider, Operation(1)));
+    assert!(g.resolve(consumer, provider, endpoint).is_ok());
+
+    g.on_exit(parent, 1, ExitReason::Crash, 10).unwrap();
+    assert!(!g.permits(provider, Operation(1)));
+    assert_eq!(g.effective_ceiling(provider), Err(GraphError::InvalidState));
+    assert_eq!(
+        g.resolve(consumer, provider, endpoint),
+        Err(CapabilityError::OwnerNotRunning)
+    );
+    assert_eq!(
+        g.publish(provider, n("another"), 1),
+        Err(CapabilityError::OwnerNotRunning)
+    );
+    assert_eq!(
+        g.create(
+            provider,
+            n("late"),
+            5,
+            JobCeiling::ALL,
+            Quota::UNLIMITED,
+            RestartPolicy::NEVER,
+            false
+        ),
+        Err(GraphError::InvalidState)
+    );
+}
+
+#[test]
+fn descendant_restart_requires_live_parent_realm() {
+    let mut g = graph();
+    let parent = child(&mut g, "parent", 2);
+    let policy = RestartPolicy::new(1, 1000, 1, 10, false).unwrap();
+    let nested = g
+        .create(
+            parent,
+            n("nested"),
+            3,
+            JobCeiling::ALL,
+            Quota::UNLIMITED,
+            policy,
+            false,
+        )
+        .unwrap();
+    g.activate(nested).unwrap();
+    let action = g.on_exit(nested, 1, ExitReason::Crash, 10).unwrap();
+    assert_eq!(action.action, ExitAction::RestartAt(11));
+    g.on_exit(parent, 1, ExitReason::Crash, 12).unwrap();
+    assert_eq!(g.restart(nested, 5, 13), Err(GraphError::InvalidState));
 }
 
 #[test]

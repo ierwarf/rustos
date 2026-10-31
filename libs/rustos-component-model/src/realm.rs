@@ -209,6 +209,26 @@ impl Graph {
         })
     }
 
+    /// Every ancestor must remain Running before a policy, launch or route
+    /// decision can be considered. A stopped realm immediately denies its
+    /// descendants, even before asynchronous child retirement completes.
+    pub(crate) fn require_running_chain(&self, id: ComponentId) -> Result<(), GraphError> {
+        let mut current = Some(id);
+        for _ in 0..self.slots.len() {
+            let Some(node) = current else { return Ok(()) };
+            let component = self.component(node)?;
+            if component.state != ComponentState::Running {
+                return Err(GraphError::InvalidState);
+            }
+            current = component.parent;
+        }
+        if current.is_none() {
+            Ok(())
+        } else {
+            Err(GraphError::InvalidParent)
+        }
+    }
+
     pub fn is_within(&self, id: ComponentId, ancestor: ComponentId) -> bool {
         let mut current = Some(id);
         for _ in 0..self.slots.len() {
@@ -239,6 +259,7 @@ impl Graph {
         if kernel_job_id == 0 {
             return Err(GraphError::InvalidJob);
         }
+        self.require_running_chain(parent)?;
         let parent_ref = self.component(parent)?;
         if parent_ref.state != ComponentState::Running {
             return Err(GraphError::InvalidParent);
@@ -306,6 +327,9 @@ impl Graph {
     /// Two-phase activation: the kernel Job/endpoint admission must finish
     /// before rootd marks the user-policy component Running.
     pub fn activate(&mut self, id: ComponentId) -> Result<(), GraphError> {
+        if let Some(parent) = self.component(id)?.parent {
+            self.require_running_chain(parent)?;
+        }
         let c = self.component_mut(id)?;
         if c.state != ComponentState::Prepared {
             return Err(GraphError::InvalidState);
@@ -325,6 +349,9 @@ impl Graph {
     ) -> Result<(), GraphError> {
         if new_kernel_job_id == 0 {
             return Err(GraphError::InvalidJob);
+        }
+        if let Some(parent) = self.component(id)?.parent {
+            self.require_running_chain(parent)?;
         }
         if self.slots.iter().any(|slot| {
             slot.value
@@ -362,6 +389,9 @@ impl Graph {
                 return Ok(result);
             };
             let c = self.component(node)?;
+            if c.state != ComponentState::Running {
+                return Err(GraphError::InvalidState);
+            }
             result = result.intersect(c.ceiling);
             current = c.parent;
         }
