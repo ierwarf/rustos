@@ -1,4 +1,3 @@
-mod update_control;
 //! Post-root bootstrap, service dependency, and exact child-lease supervisor.
 //!
 //! - **Owner:** `initd` owns the signed startup graph and post-init children;
@@ -17,6 +16,8 @@ mod update_control;
 //! - **Evidence:** `service-bootstrap-lifecycle`,
 //!   `post-init-bootstrap-barrier`, `atomic-process-activation-batch`, and
 //!   `post-init-supervisor-recovery`.
+
+mod update_control;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CString;
@@ -139,6 +140,22 @@ impl RetryState {
     }
 }
 
+fn start_supervisor_heartbeat()->Result<(),std::io::Error>{
+    // Exact-incarnation slow control. This independent worker does not own
+    // service request locks, fd handles or a fast syscall path.
+    thread::Builder::new().name("initd-health".into())
+        .spawn(||{
+            let mut heartbeat=rustos_svc_runtime::heartbeat::Heartbeat::new(
+                rustos_user_abi::syscall::IPC_SERVICE_INITD,
+            );
+            loop {
+                let now=rustos_svc_runtime::syscall::monotonic_nanos();
+                let _=heartbeat.poll(now);
+                thread::sleep(Duration::from_millis(250));
+            }
+        }).map(|_|())
+}
+
 fn main() {
     boot_line("initd: main enter");
     if let Err(errno) = publish_init_identity() {
@@ -146,6 +163,10 @@ fn main() {
         std::process::exit(1);
     }
     boot_line("initd: identity endpoint registered");
+    if let Err(error)=start_supervisor_heartbeat() {
+        boot_line(format!("initd: heartbeat worker failed error={error}").as_str());
+        std::process::exit(1);
+    }
     // Debugcon bytes from multiple CPUs may interleave. The kernel-stamped
     // milestone is the durable acceptance witness for this authority boundary.
     // SAFETY: the milestone ABI accepts only three scalar values and returns

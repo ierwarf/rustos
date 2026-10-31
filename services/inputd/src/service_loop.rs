@@ -39,6 +39,10 @@ pub(super) fn run() {
         return;
     }
     debug_line("inputd: input policy endpoint registered");
+    if let Err(error)=start_supervisor_heartbeat() {
+        debug_line(&format!("inputd: heartbeat worker failed {error}"));
+        return;
+    }
     serve(endpoint as u64);
 }
 

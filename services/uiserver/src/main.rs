@@ -1128,6 +1128,22 @@ mod main_loop_tests {
     }
 }
 
+fn start_supervisor_heartbeat()->Result<(),std::io::Error>{
+    // Exact-incarnation slow control. This independent worker does not own
+    // service request locks, fd handles or a fast syscall path.
+    thread::Builder::new().name("uiserver-health".into())
+        .spawn(||{
+            let mut heartbeat=rustos_svc_runtime::heartbeat::Heartbeat::new(
+                rustos_user_abi::syscall::IPC_SERVICE_UISERVER,
+            );
+            loop {
+                let now=rustos_svc_runtime::syscall::monotonic_nanos();
+                let _=heartbeat.poll(now);
+                thread::sleep(Duration::from_millis(250));
+            }
+        }).map(|_|())
+}
+
 fn main() {
     boot_line("uiserver: main enter");
     install_panic_hook();
@@ -1142,6 +1158,10 @@ fn main() {
             "uiserver: display policy endpoint failed errno={err}"
         ));
         std::process::exit(err);
+    }
+    if let Err(error)=start_supervisor_heartbeat() {
+        sys::debug_line(&format!("uiserver: heartbeat worker failed {error}"));
+        std::process::exit(libc::EIO);
     }
     let exit_code = match run() {
         Ok(()) => 0,

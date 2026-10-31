@@ -1005,6 +1005,22 @@ mod tests {
     }
 }
 
+fn start_supervisor_heartbeat()->Result<(),std::io::Error>{
+    // Exact-incarnation slow control. This independent worker does not own
+    // service request locks, fd handles or a fast syscall path.
+    thread::Builder::new().name("inputd-health".into())
+        .spawn(||{
+            let mut heartbeat=rustos_svc_runtime::heartbeat::Heartbeat::new(
+                rustos_user_abi::syscall::IPC_SERVICE_INPUTD,
+            );
+            loop {
+                let now=rustos_svc_runtime::syscall::monotonic_nanos();
+                let _=heartbeat.poll(now);
+                thread::sleep(Duration::from_millis(250));
+            }
+        }).map(|_|())
+}
+
 fn main() {
     observability_client::info!("inputd", service, "service started");
     service_loop::run();
