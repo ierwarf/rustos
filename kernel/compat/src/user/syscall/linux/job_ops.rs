@@ -328,6 +328,98 @@ pub(super) fn syscall_linux_rustos_job(args_ptr: u64) -> u64 {
     0
 }
 
+
+/// Session charging is a separate slow syscall. The kernel stores no
+/// component names, performs no policy IPC, and retains no user session IDs:
+/// the authenticated rootd supervisor keeps the exact-token ledger.
+fn job_session_args_valid(args: &rustos_user_abi::syscall::RustosJobSessionArgs) -> bool {
+    use rustos_user_abi::syscall::*;
+    if args.abi_version != JOB_SESSION_ABI_VERSION
+        || args.flags != 0 || args.reserved != 0
+        || args.job_handle == 0 || args.effective != 0 || args.usage != 0
+    {
+        return false;
+    }
+    match args.op {
+        JOB_SESSION_OP_INSPECT => args.client_pid == 0 && args.job_id == 0 && args.limit == 0,
+        JOB_SESSION_OP_SET_LIMIT => args.client_pid == 0 && args.job_id == 0,
+        JOB_SESSION_OP_CHARGE => args.client_pid != 0 && args.job_id != 0 && args.limit == 0,
+        JOB_SESSION_OP_RELEASE => args.client_pid == 0 && args.job_id != 0 && args.limit == 0,
+        _ => false,
+    }
+}
+
+fn execute_job_session(
+    args: &mut rustos_user_abi::syscall::RustosJobSessionArgs,
+    caller: u64,
+) -> Result<(), i64> {
+    use rustos_user_abi::syscall::*;
+    let required = match args.op {
+        JOB_SESSION_OP_INSPECT => JobHandleRights::INSPECT,
+        JOB_SESSION_OP_SET_LIMIT => JobHandleRights::SET_LIMITS,
+        JOB_SESSION_OP_CHARGE | JOB_SESSION_OP_RELEASE => JobHandleRights::ACCOUNT_SESSIONS,
+        _ => return Err(LINUX_EINVAL),
+    };
+    let (authority, _) = multitask::with_process_state_by_pid(caller, |state| {
+        state.handles().get_entry(args.job_handle).ok_or(LINUX_EBADF)
+            .and_then(|entry| job_authority_with_right(entry, required))
+    }).ok_or(LINUX_ESRCH)??;
+    // Only the boot root authority can mutate the accounting of a client
+    // whose JobId was discovered through an authenticated ring3 supervisor.
+    if matches!(args.op, JOB_SESSION_OP_CHARGE | JOB_SESSION_OP_RELEASE)
+        && (authority != multitask::ROOT_JOB
+            || args.job_handle != JOB_BOOTSTRAP_ROOT_FD)
+    {
+        return Err(LINUX_EPERM);
+    }
+    let info = match args.op {
+        JOB_SESSION_OP_INSPECT => multitask::job_session_info(authority),
+        JOB_SESSION_OP_SET_LIMIT => multitask::job_set_session_limit(authority, args.limit),
+        JOB_SESSION_OP_CHARGE => multitask::job_charge_client_session(
+            args.client_pid, multitask::JobId::from_raw(args.job_id)),
+        JOB_SESSION_OP_RELEASE => multitask::job_release_client_session(
+            multitask::JobId::from_raw(args.job_id)),
+        _ => return Err(LINUX_EINVAL),
+    }.map_err(job_error_errno)?;
+    args.job_id = info.job.to_raw();
+    args.limit = info.limit;
+    args.effective = info.effective_limit;
+    args.usage = info.usage;
+    args.client_pid = 0;
+    Ok(())
+}
+
+pub(super) fn syscall_linux_rustos_job_session(args_ptr: u64) -> u64 {
+    use rustos_user_abi::syscall::RustosJobSessionArgs;
+    let mut args = match usermem::read_current_user_struct::<RustosJobSessionArgs>(args_ptr) {
+        Ok(value) => value,
+        Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
+    };
+    if !job_session_args_valid(&args) {
+        return linux_errno(LINUX_EINVAL);
+    }
+    let Some(caller) = multitask::current_user_process_id() else {
+        return linux_errno(LINUX_ESRCH);
+    };
+    if let Err(err) = usermem::validate_current_user_write_buffer(args_ptr, size_of::<RustosJobSessionArgs>()) {
+        return linux_errno(address_space_error_to_linux_errno(err));
+    }
+    if let Err(err) = execute_job_session(&mut args, caller) {
+        return linux_errno(err);
+    }
+    if let Err(err) = usermem::write_current_user_struct(args_ptr, &args) {
+        // A charge whose output cannot be copied back is observable by
+        // rootd only as an error; compensate before returning, so retries
+        // cannot double-charge. Release operations require a valid, writable
+        // buffer preflight before the irreversible decrement.
+        if args.op == rustos_user_abi::syscall::JOB_SESSION_OP_CHARGE {
+            let _ = multitask::job_release_client_session(multitask::JobId::from_raw(args.job_id));
+        }
+        return linux_errno(address_space_error_to_linux_errno(err));
+    }
+    0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

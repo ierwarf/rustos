@@ -133,6 +133,9 @@ pub(crate) struct BrokerState {
     pub(crate) focused_session_handle: u64,
     pub(crate) session_runtime: session::SessionRuntime,
     pub(crate) running: BTreeMap<i32, RunningProcess>,
+    /// Tokens already charged to actual client Jobs through rootd.
+    /// Distinct from the local console slot capacity.
+    pub(crate) charged_sessions: BTreeSet<u64>,
     pub(crate) launched_once: BTreeSet<String>,
     pub(crate) retry_after: BTreeMap<String, Instant>,
     pub(crate) launch_failure_counts: BTreeMap<String, u32>,
@@ -174,6 +177,7 @@ impl Default for BrokerState {
             focused_session_handle: 0,
             session_runtime: session::SessionRuntime::default(),
             running: BTreeMap::new(),
+            charged_sessions: BTreeSet::new(),
             launched_once: BTreeSet::new(),
             retry_after: BTreeMap::new(),
             launch_failure_counts: BTreeMap::new(),

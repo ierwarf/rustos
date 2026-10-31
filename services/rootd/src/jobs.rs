@@ -176,6 +176,37 @@ pub(super) fn process_job(pid: u64) -> Result<u64, i64> {
     Ok(call(request(JOB_OP_PROCESS_JOB, JOB_BOOTSTRAP_ROOT_FD, pid))?.job)
 }
 
+
+/// Admission/refund is deliberately outside the IPC fast path. Only rootd's
+/// boot descriptor retains ACCOUNT_SESSIONS; the loader receives attenuated
+/// process creation rights and cannot underbill another Job.
+pub(super) fn charge_client_session(pid: u64, job_id: u64) -> Result<u64, i64> {
+    use rustos_user_abi::syscall::*;
+    let mut args = RustosJobSessionArgs {
+        abi_version: JOB_SESSION_ABI_VERSION,
+        op: JOB_SESSION_OP_CHARGE,
+        job_handle: JOB_BOOTSTRAP_ROOT_FD,
+        client_pid: pid,
+        job_id,
+        ..RustosJobSessionArgs::default()
+    };
+    let status = syscall1(SYS_RUSTOS_JOB_SESSION, (&mut args as *mut RustosJobSessionArgs) as u64);
+    if status < 0 { Err(-status) } else { Ok(args.usage) }
+}
+
+pub(super) fn release_client_session(job_id: u64) -> Result<u64, i64> {
+    use rustos_user_abi::syscall::*;
+    let mut args = RustosJobSessionArgs {
+        abi_version: JOB_SESSION_ABI_VERSION,
+        op: JOB_SESSION_OP_RELEASE,
+        job_handle: JOB_BOOTSTRAP_ROOT_FD,
+        job_id,
+        ..RustosJobSessionArgs::default()
+    };
+    let status = syscall1(SYS_RUSTOS_JOB_SESSION, (&mut args as *mut RustosJobSessionArgs) as u64);
+    if status < 0 { Err(-status) } else { Ok(args.usage) }
+}
+
 /// Live evidence that page charging follows the fault and unmap paths: touching
 /// fresh pages raises the root job's charged pages and unmapping returns them.
 /// Other processes run concurrently, so the check is deliberately loose (half

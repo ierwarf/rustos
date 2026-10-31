@@ -1,4 +1,5 @@
 use alloc::vec::Vec;
+use super::session_accounting::SessionLedger;
 use rustos_user_abi::syscall::{
     ServiceCheckpointRecordWire, SERVICE_CHECKPOINT_ABI_VERSION, SERVICE_CHECKPOINT_FLAG_TOMBSTONE,
     SERVICE_CHECKPOINT_MAX_RECORDS,
@@ -25,6 +26,9 @@ struct StoredRecord {
 /// crash-consistency rules; record contents remain owned by the service.
 pub(crate) struct ServiceCheckpointStore {
     records: Vec<StoredRecord>,
+    /// Supervisor control state: session accounts are independent of the
+    /// checkpoint records but share rootd's one serialized service loop.
+    pub(crate) sessions: SessionLedger,
 }
 
 impl ServiceCheckpointStore {
@@ -34,6 +38,7 @@ impl ServiceCheckpointStore {
         // Allocate incrementally on successful admission instead.
         Self {
             records: Vec::new(),
+            sessions: SessionLedger::new(),
         }
     }
 

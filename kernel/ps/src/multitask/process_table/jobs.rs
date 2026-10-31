@@ -162,6 +162,10 @@ pub(super) struct JobSlot {
     kills: u64,
     limits: JobLimits,
     policy: JobPolicy,
+    /// Direct + descendants; changed only under the process-table lock.
+    /// The Ring3 supervisor retains exact session tokens and owns refunds.
+    subtree_sessions: u64,
+    session_limit: u64,
 }
 
 impl JobSlot {
@@ -175,6 +179,8 @@ impl JobSlot {
             kills: 0,
             limits: JobLimits::UNSET,
             policy: JobPolicy::ALL,
+            subtree_sessions: 0,
+            session_limit: LIMIT_UNSET,
         }
     }
 
@@ -376,6 +382,7 @@ impl ProcessTable {
                     // out of a retiring address space; the slot is not reusable
                     // while any are charged to it.
                     && kernel_mm::api::charge::usage(index) == 0
+                    && slot.subtree_sessions == 0
             });
             let Some(index) = dead else { return };
             policy::invalidate_job(index);
@@ -386,6 +393,8 @@ impl ProcessTable {
             // A recycled slot must not inherit its previous tenant's limits.
             slot.limits = JobLimits::UNSET;
             slot.policy = JobPolicy::ALL;
+            slot.session_limit = LIMIT_UNSET;
+            slot.subtree_sessions = 0;
             // Generation exhaustion retires the slot permanently, exactly like
             // a process slot: reusing generation one would alias a stale id.
             slot.generation = slot.generation.checked_add(1).unwrap_or(0);
@@ -416,6 +425,8 @@ pub fn job_create_child(parent: JobId) -> Result<JobId, JobError> {
     slot.kills = 0;
     slot.limits = JobLimits::UNSET;
     slot.policy = JobPolicy::ALL;
+    slot.subtree_sessions = 0;
+    slot.session_limit = LIMIT_UNSET;
     kernel_mm::api::charge::init_group(index, Some(parent.index as usize));
     let job = table.job_id_of(index as u32);
     policy::publish_job(&table, job);
@@ -559,6 +570,141 @@ pub fn job_is_within(ancestor: JobId, descendant: JobId) -> bool {
     table.job_slot(ancestor).is_some()
         && table.job_slot(descendant).is_some()
         && table.job_contains(ancestor.index, descendant.index)
+}
+
+
+/// Bounded, generation-aware job session-accounting snapshot. The page count
+/// ledger is separate: a session token must never manufacture a mapped page.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct JobSessionInfo {
+    pub job: JobId,
+    pub limit: u64,
+    pub effective_limit: u64,
+    pub usage: u64,
+}
+
+fn session_info_locked(table: &ProcessTable, id: JobId) -> Result<JobSessionInfo, JobError> {
+    let slot = table.job_slot(id).ok_or(JobError::Stale)?;
+    let mut effective = LIMIT_UNSET;
+    let mut cursor = id.index;
+    for _ in 0..=usize::from(JOB_MAX_DEPTH) {
+        let ancestor = &table.jobs[cursor as usize];
+        effective = effective.min(ancestor.session_limit);
+        if ancestor.parent == NO_PARENT {
+            break;
+        }
+        cursor = ancestor.parent;
+    }
+    Ok(JobSessionInfo {
+        job: id,
+        limit: slot.session_limit,
+        effective_limit: effective,
+        usage: slot.subtree_sessions,
+    })
+}
+
+/// Inspect a live job's session capacity, accounting and inherited ceiling.
+pub fn job_session_info(id: JobId) -> Result<JobSessionInfo, JobError> {
+    session_info_locked(&PROCESS_TABLE.lock(), id)
+}
+
+/// Update the soft-independent hard session ceiling for one job. Lowering it
+/// refuses future sessions but does not destroy already admitted sessions.
+pub fn job_set_session_limit(id: JobId, limit: u64) -> Result<JobSessionInfo, JobError> {
+    let mut table = PROCESS_TABLE.lock();
+    let slot = table.job_slot(id).ok_or(JobError::Stale)?;
+    if slot.state == JobState::Killing {
+        return Err(JobError::Killing);
+    }
+    table.jobs[id.index as usize].session_limit = limit;
+    session_info_locked(&table, id)
+}
+
+/// Charge one new session to the *actual* client's Job, not to sessiond.
+/// Both process membership and admission are checked under the table lock,
+/// closing a concurrent exit/reparent/recycled JobId race.
+pub fn job_charge_client_session(
+    client_pid: u64,
+    expected_job: JobId,
+) -> Result<JobSessionInfo, JobError> {
+    let mut table = PROCESS_TABLE.lock();
+    let member = table.slots.iter()
+        .filter_map(|slot| slot.object.as_deref())
+        .find(|object| object.process_id == client_pid && !object.exiting)
+        .map(|object| object.job)
+        .ok_or(JobError::Stale)?;
+    if member != expected_job {
+        return Err(JobError::Stale);
+    }
+    let job = table.job_slot(expected_job).ok_or(JobError::Stale)?;
+    if job.state != JobState::Live {
+        return Err(JobError::Killing);
+    }
+    let mut cursor = expected_job.index;
+    // Preflight whole chain before incrementing any counter.
+    for _ in 0..=usize::from(JOB_MAX_DEPTH) {
+        let slot = &table.jobs[cursor as usize];
+        if slot.state != JobState::Live {
+            return Err(JobError::Killing);
+        }
+        if slot.subtree_sessions == u64::MAX
+            || (slot.session_limit != LIMIT_UNSET
+                && slot.subtree_sessions >= slot.session_limit)
+        {
+            return Err(JobError::Full);
+        }
+        if slot.parent == NO_PARENT {
+            break;
+        }
+        cursor = slot.parent;
+    }
+    let mut cursor = expected_job.index;
+    for _ in 0..=usize::from(JOB_MAX_DEPTH) {
+        let slot = &mut table.jobs[cursor as usize];
+        slot.subtree_sessions += 1;
+        if slot.parent == NO_PARENT {
+            break;
+        }
+        cursor = slot.parent;
+    }
+    session_info_locked(&table, expected_job)
+}
+
+/// Exactly one supervisor-owned session token has been retired. Callers must
+/// retain the original JobId generation until release; the Job slot cannot be
+/// recycled while its session counter is nonzero.
+pub fn job_release_client_session(job: JobId) -> Result<JobSessionInfo, JobError> {
+    let mut table = PROCESS_TABLE.lock();
+    let slot = table.job_slot(job).ok_or(JobError::Stale)?;
+    if slot.subtree_sessions == 0 {
+        return Err(JobError::Stale);
+    }
+    // Never permit partial subtraction if an ancestor ledger is corrupt.
+    let mut cursor = job.index;
+    for _ in 0..=usize::from(JOB_MAX_DEPTH) {
+        let slot = &table.jobs[cursor as usize];
+        if slot.subtree_sessions == 0 {
+            return Err(JobError::Stale);
+        }
+        if slot.parent == NO_PARENT {
+            break;
+        }
+        cursor = slot.parent;
+    }
+    let mut cursor = job.index;
+    for _ in 0..=usize::from(JOB_MAX_DEPTH) {
+        let slot = &mut table.jobs[cursor as usize];
+        slot.subtree_sessions -= 1;
+        if slot.parent == NO_PARENT {
+            break;
+        }
+        cursor = slot.parent;
+    }
+    // A killing job is eligible for recycling once the last exact charge
+    // and all its members/pages have drained.
+    let info = session_info_locked(&table, job)?;
+    table.release_dead_jobs();
+    Ok(info)
 }
 
 #[cfg(test)]

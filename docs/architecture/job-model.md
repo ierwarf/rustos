@@ -11,8 +11,10 @@ process directory, and phase 2b's process/thread limits and resident user-page
 charging are implemented. Application-job placement and a JobPolicy v1/256-bit
 ceiling implementation also exist; their opt-in runtime evidence does **not**
 complete policy migration or commercial stability acceptance. Kernel-memory
-charging (`kmem.max_bytes`), `memory.high/min`, client-funded sessions, and the
-later component/personality redesign remain open. Read the **as-built** sections
+charging (`kmem.max_bytes`) and `memory.high/min` remain open. Production
+client-funded console sessions now cross a rootd-owned exact-token ledger
+and a kernel-enforced hierarchical Job count, while other provider session
+classes and the later component/personality redesign remain open. Read the **as-built** sections
 below for implementation details; dated tests are not current acceptance.
 The original watermark/OOM baseline is in the
 [address-space contract](../ai/address-space-lifecycle-contract.md#4-memory-pressure-watermark-and-oom-policy).
@@ -911,3 +913,25 @@ Job 슬롯 64개는 별도의 내부 제한입니다.
 Application placement / Job qualitative ceilings as built** 항목을
 참고하세요. 과거 설계 제안과 실패 기록은 현재 구현을 설명하는
 근거로 재사용하지 마세요.
+
+### Phase 2c/6a — live client-funded console session accounting
+
+Rootd owns one bounded (256-token) supervisor ledger per live sessiond
+reporter generation. A suspended/live client PID is resolved to its exact
+kernel `JobId` when runtimed records a new console session, *before* that
+child is activated. A new `SYS_RUSTOS_JOB_SESSION` slow Job syscall requires
+rootd's boot-root `ACCOUNT_SESSIONS` descriptor right for admission and
+refund. The process-table lock verifies PID/Job membership, checks every
+ancestor's session ceiling, then atomically increments the subtree counters.
+A stale expected JobId, a Killing Job or a full ancestor refuses admission.
+
+Runtimed maintains a charged-token set; reap/failed-launch paths issue an
+exact refund to rootd. Rootd refunds the originally captured JobId even if
+the client has since exited, and rejects duplicate or stale tokens without
+double charging. The kernel prevents recycling a Job slot while its session
+charges are outstanding. When a newly authenticated sessiond PID replaces
+its predecessor, rootd drains the old epoch before allowing handle counters
+to restart at one. The new Job accounting fast-path impact is **zero**: only
+slow session creation/teardown issues these syscalls. This does *not* yet
+implement arbitrary cross-service client sessions or kernel-memory byte
+accounting. Rootd's in-memory ledger is not a durable transactional journal.

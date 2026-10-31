@@ -165,3 +165,18 @@ Rootd preallocates the ACK before irrevocable kernel actions and retains
 its fail-closed endpoint/terminate contract. Fault-inject OOM before mutation,
 verify stale PID and ancestor cycles refuse, and stress lost ACK responses
 without ever adopting a recycled PID. Full durable rollback is not claimed.
+
+## Production client-Job console session charging (kernel/rootd/runtimed)
+
+Rootd has a serialized 256-token accounting book. A live sessiond owner
+requests charge for an exact suspended client PID; rootd resolves JobId,
+then calls rights-scoped `SYS_RUSTOS_JOB_SESSION`. The kernel rechecks PID
+membership while holding the job lock, checks hierarchical quotas and retains
+that Job's subtree usage until the exact refund. Runtimed requests refunds
+on failed activation or process reaping and never in the console I/O path.
+Rootd's token book prevents duplicate charge and replay; a new live sessiond
+PID causes the predecessor's charges to drain and resets its token namespace.
+Test: PID recycling between lookup/admission, rootd restart, sessiond crash,
+refund IPC timeout, wrong reporter, duplicate token, multiple descendant Jobs,
+limit tightening, session flood, KVM 1/8 vCPU and launch-worker ACK timeout.
+The generic netd/vfsd session path and durable restart journal remain TODO.

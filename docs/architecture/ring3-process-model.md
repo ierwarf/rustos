@@ -117,7 +117,7 @@ topology, so a component cannot reach what no ancestor passed down)**.
 | 3 | Replace legacy service authority with Job policy | JobPolicy 3a exists; cutover unproven |
 | 4 | Generated IDL and unified service runtime | Production post-init lease query/reclaim migrated to generated IDL (opcodes 517/518), scalar operations 8/9 retired; other services and shared runtime migration remain open |
 | 5 | Declarative components, realms, capability routing and one supervisor | Component graph and immutable rootd route/role manifests implemented; unified live supervisor and kernel capability transfer open |
-| 6 | Client-funded session quotas | Bounded session policy model and runtimed local 256-console-session ceiling implemented; kernel-backed client billing open |
+| 6 | Client-funded session quotas | Real kernel-backed client Job billing now wired for runtimed console creation and teardown, including hierarchical session ceilings and generation-bound Job refunds; generic provider sessions and durable crash recovery remain open |
 | 7 | Linux/Windows personality servers and ring0 policy reduction | Existing service brokers preserved; remaining slowpath-only migration unproven; ring0 hot paths deliberately untouched |
 | 8 | Operational logs, crash reporting, health and rollback | Health/update policy models, rootd checkpoint and transitive service revocation implemented; durable recovery and verified rollback open |
 

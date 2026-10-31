@@ -1,0 +1,232 @@
+//! Rootd-only exact-token client session accounting.
+//!
+//! The kernel owns hierarchical job counters; only the authenticated live
+//! sessiond process can request rootd to mint/retire one session token.
+//! Rootd never charges sessiond's own Job for a client allocation.
+//!
+//! This bounded book is the authority for idempotent operations and exact
+//! refunds. It lives as part of rootd's single-threaded supervisor control
+//! state, and all mutations pass through the same message receiver.
+use alloc::vec::Vec;
+
+const MAX_SESSIONS: usize = 256;
+const EINVAL: i32 = 22;
+const EACCES: i32 = 13;
+const ENOMEM: i32 = 12;
+const ENOSPC: i32 = 28;
+const ESTALE: i32 = 116;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Accounted {
+    token: u64,
+    client_pid: u64,
+    client_job: u64,
+}
+
+pub(crate) struct SessionLedger {
+    entries: Vec<Accounted>,
+    last_token: u64,
+    /// Live authenticated sessiond generation, named by exact reporter PID.
+    owner_pid: u64,
+}
+
+impl SessionLedger {
+    pub(crate) fn new() -> Self {
+        Self { entries: Vec::new(), last_token: 0, owner_pid: 0 }
+    }
+
+    /// A restarted sessiond may start its local handle counter at one.
+    /// Before admitting its first charge, refund the *whole* previous live
+    /// generation and retire its token namespace. This is a slow supervisor
+    /// transition; it cannot happen on a console read/write hot path.
+    pub(crate) fn bind_owner(
+        &mut self,
+        pid: u64,
+        kernel_release: impl FnMut(u64) -> Result<(), i32>,
+    ) -> Result<(), i32> {
+        if pid == 0 {
+            return Err(EINVAL);
+        }
+        if self.owner_pid != pid {
+            self.release_all(kernel_release)?;
+            self.owner_pid = pid;
+            self.last_token = 0;
+        }
+        Ok(())
+    }
+
+    /// No kernel mutation occurs before the inventory is validated and can
+    /// hold the new token. Duplicate live requests never double-charge.
+    pub(crate) fn charge(
+        &mut self,
+        token: u64,
+        client_pid: u64,
+        mut lookup_job: impl FnMut(u64) -> Result<u64, i32>,
+        mut kernel_charge: impl FnMut(u64, u64) -> Result<(), i32>,
+    ) -> Result<u64, i32> {
+        if token == 0 || client_pid == 0 {
+            return Err(EINVAL);
+        }
+        if let Some(entry) = self.entries.iter().find(|e| e.token == token) {
+            if entry.client_pid == client_pid {
+                return Ok(entry.client_job);
+            }
+            return Err(EACCES);
+        }
+        if token <= self.last_token {
+            return Err(ESTALE);
+        }
+        if self.entries.len() >= MAX_SESSIONS {
+            return Err(ENOSPC);
+        }
+        self.entries.try_reserve(1).map_err(|_| ENOMEM)?;
+        let job = lookup_job(client_pid)?;
+        if job == 0 {
+            return Err(EACCES);
+        }
+        kernel_charge(client_pid, job)?;
+        self.entries.push(Accounted { token, client_pid, client_job: job });
+        self.last_token = token;
+        Ok(job)
+    }
+
+    /// The JobId was captured at admission. Never rediscover the Job by a PID
+    /// that may have exited or been recycled before this refund.
+    pub(crate) fn release(
+        &mut self,
+        token: u64,
+        client_pid: u64,
+        mut kernel_release: impl FnMut(u64) -> Result<(), i32>,
+    ) -> Result<u64, i32> {
+        if token == 0 || client_pid == 0 {
+            return Err(EINVAL);
+        }
+        let Some(index) = self.entries.iter().position(|e| e.token == token) else {
+            return Err(ESTALE);
+        };
+        let entry = self.entries[index];
+        if entry.client_pid != client_pid {
+            return Err(EACCES);
+        }
+        kernel_release(entry.client_job)?;
+        self.entries.swap_remove(index);
+        Ok(entry.client_job)
+    }
+
+    /// Only a currently authenticated SESSIOND principal may request
+    /// a token-only retirement. The client PID comes from the original
+    /// account, not a caller-supplied mutable input.
+    pub(crate) fn release_trusted(
+        &mut self,
+        token: u64,
+        kernel_release: impl FnMut(u64) -> Result<(), i32>,
+    ) -> Result<u64, i32> {
+        let pid = self.entries.iter()
+            .find(|entry| entry.token == token)
+            .map(|entry| entry.client_pid)
+            .ok_or(ESTALE)?;
+        self.release(token, pid, kernel_release)
+    }
+
+    /// Reclaim every outstanding session after sessiond's authenticated
+    /// service lease is retired. No process may borrow sessiond authority
+    /// to keep another client's accounting pinned indefinitely.
+    pub(crate) fn release_all(
+        &mut self,
+        mut kernel_release: impl FnMut(u64) -> Result<(), i32>,
+    ) -> Result<usize, i32> {
+        let mut released = 0;
+        while let Some(entry) = self.entries.last().copied() {
+            kernel_release(entry.client_job)?;
+            self.entries.pop();
+            released += 1;
+        }
+        Ok(released)
+    }
+
+    pub(crate) fn live_count(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::cell::Cell;
+
+    #[test]
+    fn session_charge_is_client_funded_and_exactly_once() {
+        let mut book = SessionLedger::new();
+        let charges = Cell::new(0u64);
+        let releases = Cell::new(0u64);
+        assert_eq!(
+            book.charge(8, 200, |_| Ok(77), |pid, job| {
+                assert_eq!((pid, job), (200, 77));
+                charges.set(charges.get() + 1);
+                Ok(())
+            }),
+            Ok(77)
+        );
+        assert_eq!(book.charge(8, 200, |_| panic!("duplicate lookup"), |_, _| {
+            panic!("duplicate bill")
+        }), Ok(77));
+        assert_eq!(book.charge(8, 201, |_| Ok(99), |_, _| Ok(())), Err(EACCES));
+        assert_eq!(charges.get(), 1);
+        assert_eq!(book.live_count(), 1);
+        assert_eq!(book.release(8, 200, |job| {
+            assert_eq!(job, 77);
+            releases.set(releases.get() + 1);
+            Ok(())
+        }), Ok(77));
+        assert_eq!(book.release(8, 200, |_| panic!("double refund")), Err(ESTALE));
+        assert_eq!(book.charge(8, 200, |_| Ok(77), |_, _| Ok(())), Err(ESTALE));
+        assert_eq!(releases.get(), 1);
+        assert_eq!(book.live_count(), 0);
+    }
+
+    #[test]
+    fn denied_admission_does_not_advance_last_token() {
+        let mut book = SessionLedger::new();
+        assert_eq!(book.charge(10, 22, |_| Ok(9), |_, _| Err(ENOSPC)), Err(ENOSPC));
+        assert_eq!(book.charge(10, 22, |_| Ok(9), |_, _| Ok(())), Ok(9));
+        assert_eq!(book.release(10, 21, |_| panic!("wrong PID")), Err(EACCES));
+        assert_eq!(book.release(10, 22, |_| Err(16)), Err(16));
+        assert_eq!(book.live_count(), 1);
+        assert_eq!(book.release_all(|job| {
+            assert_eq!(job, 9);
+            Ok(())
+        }), Ok(1));
+        assert_eq!(book.live_count(), 0);
+    }
+
+    #[test]
+    fn supervisor_restart_refunds_previous_epoch_and_allows_fresh_tokens() {
+        let mut book = SessionLedger::new();
+        book.bind_owner(10, |_| panic!("nothing to refund")).unwrap();
+        book.charge(1, 100, |_| Ok(7), |_, _| Ok(())).unwrap();
+        book.charge(2, 101, |_| Ok(8), |_, _| Ok(())).unwrap();
+        let mut refunded = alloc::vec::Vec::new();
+        book.bind_owner(11, |job| { refunded.push(job); Ok(()) }).unwrap();
+        assert_eq!(refunded, alloc::vec![8, 7]);
+        assert_eq!(book.live_count(), 0);
+        assert_eq!(book.charge(1, 102, |_| Ok(9), |_, _| Ok(())), Ok(9));
+        assert_eq!(book.last_token, 1);
+        book.bind_owner(11, |_| panic!("same owner no rollback")).unwrap();
+        assert_eq!(book.live_count(), 1);
+    }
+
+    #[test]
+    fn registry_ceiling_preflights_before_kernel_mutation() {
+        let mut book = SessionLedger::new();
+        for token in 1..=MAX_SESSIONS as u64 {
+            book.charge(token, token, |pid| Ok(pid), |_, _| Ok(())).unwrap();
+        }
+        assert_eq!(
+            book.charge(MAX_SESSIONS as u64 + 1, 99, |_| panic!("full lookup"), |_, _| {
+                panic!("full kernel charge")
+            }),
+            Err(ENOSPC)
+        );
+        assert_eq!(book.release_all(|_| Ok(())), Ok(MAX_SESSIONS));
+    }
+}

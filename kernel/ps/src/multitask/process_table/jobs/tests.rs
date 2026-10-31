@@ -360,6 +360,50 @@ fn a_dead_job_slot_is_not_reused_while_pages_are_still_charged_to_it() {
     assert_eq!(job_info(job), Err(JobError::Stale), "released once the pages drained");
 }
 
+
+#[test]
+fn sessions_are_client_funded_hierarchical_and_refunded_exactly_once() {
+    let _isolation = isolate_process_table();
+    let parent = job_create_child(ROOT_JOB).unwrap();
+    let client = job_create_child(parent).unwrap();
+    let unrelated = job_create_child(ROOT_JOB).unwrap();
+    assert!(spawn_in(18891, None, Some(client)).is_some());
+    assert!(spawn_in(18892, None, Some(unrelated)).is_some());
+    job_set_session_limit(parent, 2).unwrap();
+    job_set_session_limit(client, 99).unwrap();
+    assert_eq!(job_session_info(client).unwrap().effective_limit, 2);
+    assert_eq!(job_charge_client_session(18891, client).unwrap().usage, 1);
+    assert_eq!(job_charge_client_session(18891, client).unwrap().usage, 2);
+    assert_eq!(job_charge_client_session(18891, client), Err(JobError::Full));
+    assert_eq!(job_session_info(parent).unwrap().usage, 2);
+    assert_eq!(job_session_info(ROOT_JOB).unwrap().usage, 2);
+    assert_eq!(job_charge_client_session(18891, unrelated), Err(JobError::Stale));
+    assert_eq!(job_charge_client_session(18892, unrelated).unwrap().usage, 1);
+    assert_eq!(job_session_info(parent).unwrap().usage, 2);
+    assert_eq!(job_release_client_session(client).unwrap().usage, 1);
+    assert_eq!(job_release_client_session(client).unwrap().usage, 0);
+    assert_eq!(job_release_client_session(client), Err(JobError::Stale));
+    assert_eq!(job_session_info(ROOT_JOB).unwrap().usage, 1);
+    assert_eq!(job_release_client_session(unrelated).unwrap().usage, 0);
+}
+
+#[test]
+fn killing_job_cannot_recycle_until_session_refunded() {
+    let _isolation = isolate_process_table();
+    let client = job_create_child(ROOT_JOB).unwrap();
+    spawn_in(18893, None, Some(client)).unwrap();
+    job_charge_client_session(18893, client).unwrap();
+    job_kill_begin(client).unwrap();
+    assert!(job_session_info(client).is_ok());
+    assert_eq!(job_charge_client_session(18893, client), Err(JobError::Killing));
+    let mut pids = [0_u64; 4];
+    job_collect_members(client, &mut pids);
+    assert!(job_session_info(client).is_ok());
+    job_release_client_session(client).unwrap();
+    // The process object may still hold the Job after its session is gone.
+    assert_eq!(job_session_info(client).unwrap().usage, 0);
+}
+
 #[test]
 fn roots_are_bound_to_their_job_at_publication_and_at_exec_commit() {
     // The host ledger is not installed, so the binding itself is a source

@@ -52,6 +52,8 @@ use super::{BrokerState, LaunchEntry, RunningProcess};
 
 #[path = "scheduling_context.rs"]
 mod scheduling_context;
+#[path = "session_accounting.rs"]
+mod session_accounting;
 
 use scheduling_context::{report_rootd_service_lease, request_scheduling_context_authority};
 
@@ -232,6 +234,19 @@ fn record_spawned_launch(
         let _ = record_ack.try_send(crate::launch_worker::RecordAck::Duplicate);
         return;
     }
+    if let Some(token) = in_flight.session_handle {
+        if let Err(errno) = session_accounting::charge(token, pid) {
+            boot_line(format!(
+                "runtimed: client Job session admission refused token={token} pid={pid} errno={errno}"
+            ).as_str());
+            // The worker has not activated this child yet. Refuse the
+            // acknowledgement so it retires the still-suspended process.
+            let _ = record_ack.try_send(crate::launch_worker::RecordAck::Duplicate);
+            return;
+        }
+        state.charged_sessions.insert(token);
+    }
+    let pending_session = in_flight.session_handle;
     let record = RunningProcess {
         pid,
         package_id: in_flight.package_id.clone(),
@@ -247,7 +262,16 @@ fn record_spawned_launch(
         in_flight.recorded_pid = Some(pid);
     }
     boot_line(format!("runtimed: spawned pid={pid}").as_str());
-    let _ = record_ack.try_send(crate::launch_worker::RecordAck::Recorded);
+    if record_ack
+        .try_send(crate::launch_worker::RecordAck::Recorded)
+        .is_err()
+    {
+        // The worker timed out before observing our admission result and
+        // will retire the child. Revoke the new charge immediately rather
+        // than retaining an owner entry for an orphan.
+        state.running.remove(&pid);
+        release_failed_session(state, pending_session);
+    }
 }
 
 fn finish_tracked_launch(state: &mut BrokerState, pid: Option<i32>, result: Result<(), i32>) {
@@ -402,6 +426,14 @@ pub(super) fn spawn_tracked_process(
         retire_failed_spawn_or_abort(pid, "duplicate-pid");
         release_failed_session(state, session_handle);
         return Err(libc::EEXIST);
+    }
+    if let Some(token) = session_handle {
+        if let Err(errno) = session_accounting::charge(token, pid) {
+            retire_failed_spawn_or_abort(pid, "job-session-charge");
+            release_failed_session(state, session_handle);
+            return Err(errno);
+        }
+        state.charged_sessions.insert(token);
     }
     state.running.insert(
         pid,
@@ -616,6 +648,11 @@ fn release_failed_session(state: &mut BrokerState, session_handle: Option<u64>) 
     let Some(session) = session_handle else {
         return;
     };
+    if state.charged_sessions.remove(&session) {
+        session_accounting::release(session).unwrap_or_else(|errno| {
+            panic!("runtimed: fatal exact client-session refund failed token={session} errno={errno}")
+        });
+    }
     state.session_runtime.remove_session(session);
     super::session::clear_focused_session_if(state, session);
     if let Ok(console_fd) = ensure_console_fd(state) {
@@ -669,11 +706,7 @@ pub(super) fn reap_children(state: &mut BrokerState) -> bool {
             reaped_any = true;
             if let Some(process) = state.running.remove(&pid) {
                 if process.session_handle != 0 {
-                    state.session_runtime.remove_session(process.session_handle);
-                    super::session::clear_focused_session_if(state, process.session_handle);
-                    if let Ok(console_fd) = ensure_console_fd(state) {
-                        let _ = close_console_session(console_fd, process.session_handle);
-                    }
+                    release_failed_session(state, Some(process.session_handle));
                 }
                 if process.restart {
                     super::socket::schedule_launch_retry(

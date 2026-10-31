@@ -1036,6 +1036,11 @@ pub const COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_SNAPSHOT_IDL: u16 = 15;
 // Supervisor operation 9 (scalar reclaim) is retired. Reclamation is now
 // an exact PID, request-id/challenge-bound generated-IDL control operation.
 pub const COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_RECLAIM_IDL: u16 = 16;
+/// Authenticated sessiond asks rootd to charge a token to an exact client
+/// process Job. This is slow control IPC, never called on an IPC hot path.
+pub const COMMERCIAL_MAX_ROOTD_OP_SESSION_ACCOUNT_CHARGE: u16 = 17;
+/// Idempotence and exact JobId refunds are owned by rootd's token book.
+pub const COMMERCIAL_MAX_ROOTD_OP_SESSION_ACCOUNT_RELEASE: u16 = 18;
 /// Store one versioned, service-owned checkpoint record.  Rootd authenticates
 /// the current service lease and retains the opaque record across a supervised
 /// service restart; it never interprets the service-private value bytes.

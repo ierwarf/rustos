@@ -222,7 +222,9 @@ impl JobHandleRights {
     pub const SET_CRITICAL: Self = Self(1 << 7);
     pub const DUPLICATE: Self = Self(1 << 8);
     pub const TRANSFER: Self = Self(1 << 9);
-    pub const ALL: Self = Self((1 << 10) - 1);
+    /// Rootd-only admission/refund authority; never lent to loaderd.
+    pub const ACCOUNT_SESSIONS: Self = Self(1 << 10);
+    pub const ALL: Self = Self((1 << 11) - 1);
 
     pub const fn empty() -> Self {
         Self(0)

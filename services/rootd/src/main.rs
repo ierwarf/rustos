@@ -41,6 +41,7 @@ mod memory_governor;
 mod scheduling_policy;
 mod service_checkpoint;
 mod service_manifest;
+mod session_accounting;
 
 use loader_wire::{contains_nul, copy_bytes, empty_loader_spawn_request, empty_loader_spawn_response};
 use scheduling_policy::{
@@ -75,6 +76,7 @@ use rustos_user_abi::syscall::{
     COMMERCIAL_MAX_ROOTD_OP_SERVICE_CAPABILITY, COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_COMPACT,
     COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_MUTATE,
     COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_SCAN, COMMERCIAL_MAX_ROOTD_OP_SERVICE_LOOKUP,
+    COMMERCIAL_MAX_ROOTD_OP_SESSION_ACCOUNT_CHARGE, COMMERCIAL_MAX_ROOTD_OP_SESSION_ACCOUNT_RELEASE,
     IPC_SERVICE_DEVMGRD, IPC_SERVICE_INPUTD, IPC_SERVICE_LINUX_SYSCALLD, IPC_SERVICE_LOADERD,
     IPC_SERVICE_NETD, IPC_SERVICE_PAGERD, IPC_SERVICE_PROCD, IPC_SERVICE_ROOTD,
     IPC_SERVICE_SESSIOND, IPC_SERVICE_STORAGED, IPC_SERVICE_UISERVER, IPC_SERVICE_VFSD,
@@ -951,6 +953,8 @@ fn validate_commercial_max_request(
             | COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_MUTATE
             | COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_COMPACT
             | COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_SCAN
+            | COMMERCIAL_MAX_ROOTD_OP_SESSION_ACCOUNT_CHARGE
+            | COMMERCIAL_MAX_ROOTD_OP_SESSION_ACCOUNT_RELEASE
             | COMMERCIAL_MAX_ROOTD_OP_LOADER_WORKER_COMPLETE => Ok(()),
             COMMERCIAL_MAX_ROOTD_OP_SCHEDULING_CONTEXT_GRANT => {
                 if request.path_len == 0
@@ -1122,6 +1126,58 @@ fn fill_commercial_max_response(
             response.payload_len = ack.len() as u32;
             response.value0 = 0;
             response.value1 = 0;
+            Ok(())
+        }
+        COMMERCIAL_MAX_ROOTD_OP_SESSION_ACCOUNT_CHARGE => {
+            if request.arg0 == 0
+                || request.arg1 == 0
+                || request.arg2 != 0
+                || request.arg3 != 0
+                || request.path_len != 0
+                || request.payload_len != 0
+            {
+                return Err(22);
+            }
+            authorize_current_service_namespace(
+                leases, post_init_leases, IPC_SERVICE_SESSIOND, sender,
+            )?;
+            service_checkpoints.sessions.bind_owner(
+                sender.pid,
+                |job| jobs::release_client_session(job).map(|_| ()).map_err(|e| e as i32),
+            )?;
+            let job_id = service_checkpoints.sessions.charge(
+                request.arg0,
+                request.arg1,
+                |pid| jobs::process_job(pid).map_err(|e| e as i32),
+                |pid, job| jobs::charge_client_session(pid, job).map(|_| ()).map_err(|e| e as i32),
+            )?;
+            response.value0 = job_id;
+            response.value1 = service_checkpoints.sessions.live_count() as u64;
+            Ok(())
+        }
+        COMMERCIAL_MAX_ROOTD_OP_SESSION_ACCOUNT_RELEASE => {
+            if request.arg0 == 0
+                || request.arg1 != 0
+                || request.arg2 != 0
+                || request.arg3 != 0
+                || request.path_len != 0
+                || request.payload_len != 0
+            {
+                return Err(22);
+            }
+            authorize_current_service_namespace(
+                leases, post_init_leases, IPC_SERVICE_SESSIOND, sender,
+            )?;
+            service_checkpoints.sessions.bind_owner(
+                sender.pid,
+                |job| jobs::release_client_session(job).map(|_| ()).map_err(|e| e as i32),
+            )?;
+            let job_id = service_checkpoints.sessions.release_trusted(
+                request.arg0,
+                |job| jobs::release_client_session(job).map(|_| ()).map_err(|e| e as i32),
+            )?;
+            response.value0 = job_id;
+            response.value1 = service_checkpoints.sessions.live_count() as u64;
             Ok(())
         }
         COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_MUTATE => {
@@ -1447,6 +1503,8 @@ fn rootd_capability_mask(op: u16) -> u64 {
         COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_MUTATE => 1 << 9,
         COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_SCAN => 1 << 10,
         COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_COMPACT => 1 << 11,
+        COMMERCIAL_MAX_ROOTD_OP_SESSION_ACCOUNT_CHARGE => 1 << 13,
+        COMMERCIAL_MAX_ROOTD_OP_SESSION_ACCOUNT_RELEASE => 1 << 14,
         COMMERCIAL_MAX_ROOTD_OP_SCHEDULING_CONTEXT_GRANT => 1 << 12,
         _ => 0,
     }
