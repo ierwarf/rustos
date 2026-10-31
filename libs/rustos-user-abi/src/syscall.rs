@@ -1031,8 +1031,8 @@ pub const COMMERCIAL_MAX_ROOTD_OP_RESTART_POLICY: u16 = 4;
 pub const COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL: u16 = 5;
 pub const COMMERCIAL_MAX_ROOTD_OP_SERVICE_CAPABILITY: u16 = 6;
 pub const COMMERCIAL_MAX_ROOTD_OP_SERVICE_LOOKUP: u16 = 7;
-/// Return the current post-init service lease for the authenticated initd.
-pub const COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_QUERY: u16 = 8;
+// Supervisor operation 8 (scalar lease query) is retired.
+pub const COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_SNAPSHOT_IDL: u16 = 15;
 /// Revoke and, when still live, terminate an unrecoverable post-init lease.
 /// Only the current initd may reclaim its own service classes.
 pub const COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_RECLAIM: u16 = 9;

@@ -69,7 +69,7 @@ use rustos_user_abi::syscall::{
     COMMERCIAL_MAX_PROTOCOL_CAPABILITY, COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS,
     COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR, COMMERCIAL_MAX_ROOTD_OP_BOOTSTRAP_MANIFEST,
     COMMERCIAL_MAX_ROOTD_OP_CORE_SERVICE_LEASE, COMMERCIAL_MAX_ROOTD_OP_DEPENDENCY_GRAPH,
-    COMMERCIAL_MAX_ROOTD_OP_LOADER_WORKER_COMPLETE, COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_QUERY,
+    COMMERCIAL_MAX_ROOTD_OP_LOADER_WORKER_COMPLETE, COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_SNAPSHOT_IDL,
     COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_RECLAIM, COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL,
     COMMERCIAL_MAX_ROOTD_OP_RESTART_POLICY, COMMERCIAL_MAX_ROOTD_OP_SCHEDULING_CONTEXT_GRANT,
     COMMERCIAL_MAX_ROOTD_OP_SERVICE_CAPABILITY, COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_COMPACT,
@@ -946,7 +946,7 @@ fn validate_commercial_max_request(
             COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL
             | COMMERCIAL_MAX_ROOTD_OP_SERVICE_CAPABILITY
             | COMMERCIAL_MAX_ROOTD_OP_SERVICE_LOOKUP
-            | COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_QUERY
+            | COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_SNAPSHOT_IDL
             | COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_RECLAIM
             | COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_MUTATE
             | COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_COMPACT
@@ -1087,10 +1087,31 @@ fn fill_commercial_max_response(
             response.value0 = authority.token;
             Ok(())
         }
-        COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_QUERY => {
-            let lease = query_post_init_lease(leases, post_init_leases, request, sender)?;
-            response.value0 = lease.pid;
-            response.value1 = u64::from(lease.state);
+        COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_SNAPSHOT_IDL => {
+            if request.path_len != 0
+                || request.arg0 != 0
+                || request.arg1 != 0
+                || request.arg2 != 0
+                || request.arg3 != 0
+            {
+                return Err(22);
+            }
+            let query = rustos_component_model::lease_snapshot::decode_query(
+                &request.payload[..request.payload_len as usize],
+            ).map_err(|_| 22)?;
+            let lease = query_post_init_lease(
+                leases, post_init_leases, query.service, sender,
+            )?;
+            let wire = rustos_component_model::lease_snapshot::encode_reply(
+                query, lease.pid, lease.state,
+            ).map_err(|_| 12)?;
+            if wire.len() > response.payload.len() {
+                return Err(75);
+            }
+            response.payload[..wire.len()].copy_from_slice(&wire);
+            response.payload_len = wire.len() as u32;
+            response.value0 = 0;
+            response.value1 = 0;
             Ok(())
         }
         COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_RECLAIM => {
@@ -1417,7 +1438,7 @@ fn rootd_capability_mask(op: u16) -> u64 {
         COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL => 1 << 4,
         COMMERCIAL_MAX_ROOTD_OP_SERVICE_CAPABILITY => 1 << 5,
         COMMERCIAL_MAX_ROOTD_OP_SERVICE_LOOKUP => 1 << 6,
-        COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_QUERY => 1 << 7,
+        COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_SNAPSHOT_IDL => 1 << 7,
         COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_RECLAIM => 1 << 8,
         COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_MUTATE => 1 << 9,
         COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_SCAN => 1 << 10,
@@ -1576,25 +1597,19 @@ fn register_post_init_service_lease_with_provenance(
 fn query_post_init_lease<'a>(
     leases: &[Lease],
     post_init_leases: &'a [PostInitLease],
-    request: &CommercialMaxProtocolRequest,
+    service_id: u64,
     sender: IpcSenderIdentity,
 ) -> Result<&'a PostInitLease, i32> {
-    if request.arg0 == 0
-        || request.arg1 != 0
-        || request.arg2 != 0
-        || request.arg3 != 0
-        || request.path_len != 0
-        || request.payload_len != 0
-    {
+    if service_id == 0 {
         return Err(22);
     }
     authorize_current_initd(leases, sender)?;
-    if !initd_manages_post_init_service(request.arg0) {
+    if !initd_manages_post_init_service(service_id) {
         return Err(13);
     }
     post_init_leases
         .iter()
-        .find(|lease| lease.service_id == request.arg0)
+        .find(|lease| lease.service_id == service_id)
         .ok_or(22)
 }
 
