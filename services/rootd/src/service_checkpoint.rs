@@ -1,5 +1,5 @@
-use alloc::vec::Vec;
 use super::session_accounting::SessionLedger;
+use alloc::vec::Vec;
 use rustos_user_abi::syscall::{
     ServiceCheckpointRecordWire, SERVICE_CHECKPOINT_ABI_VERSION, SERVICE_CHECKPOINT_FLAG_TOMBSTONE,
     SERVICE_CHECKPOINT_MAX_RECORDS,

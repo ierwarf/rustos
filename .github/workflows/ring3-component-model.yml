@@ -21,6 +21,8 @@ jobs:
           rustup toolchain install "$toolchain" --profile minimal --component rustfmt
       - name: Verify declarative Ring3 IDL
         run: python3 tools/ring3_idl_codegen.py --check
+      - name: Check full RustOS build graph
+        run: cargo xtask check
       - name: Verify checkpoint and role formatting
         run: |
           rustfmt --edition 2021 --check services/rootd/src/service_checkpoint.rs
@@ -38,6 +40,4 @@ jobs:
         run: cargo test -p initd --locked
       - name: Run runtimed host tests
         run: cargo test -p runtimed --locked
-      - name: Check full RustOS build graph
-        run: cargo xtask check
 
