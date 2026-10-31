@@ -255,6 +255,10 @@ impl ProcessSlot {
 struct ProcessTable {
     slots: ChunkTable<ProcessSlot>,
     jobs: [jobs::JobSlot; jobs::JOB_SLOTS],
+    /// Kernel-owned exact-token resource custody. This survives a rootd
+    /// process crash and cannot be forged by a guessed PID/JobId.
+    session_tokens: [jobs::SessionToken; jobs::SESSION_TOKEN_SLOTS],
+    session_owners: [jobs::SessionOwner; jobs::SESSION_OWNER_SLOTS],
     reap_queue: [Option<ProcessHandle>; REAP_QUEUE_CAPACITY],
     reap_len: usize,
     reap_scan_pending: bool,
@@ -269,6 +273,8 @@ impl ProcessTable {
                 jobs[0] = jobs::JobSlot::root();
                 jobs
             },
+            session_tokens: [jobs::SessionToken::EMPTY; jobs::SESSION_TOKEN_SLOTS],
+            session_owners: [jobs::SessionOwner::EMPTY; jobs::SESSION_OWNER_SLOTS],
             reap_queue: [None; REAP_QUEUE_CAPACITY],
             reap_len: 0,
             reap_scan_pending: false,
