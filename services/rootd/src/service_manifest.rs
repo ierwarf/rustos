@@ -186,19 +186,64 @@ pub(super) struct ServiceRouteSpec {
 /// These offers are checked during bootstrap and evaluated without allocation
 /// at lookup time. Bootstrap dependency offers remain in dependency_mask.
 pub(super) const SERVICE_ROUTING_MANIFEST: [ServiceRouteSpec; 15] = [
-    ServiceRouteSpec { subject: INITD_LEASE_ID, target: IPC_SERVICE_NETD },
-    ServiceRouteSpec { subject: INITD_LEASE_ID, target: IPC_SERVICE_DEVMGRD },
-    ServiceRouteSpec { subject: INITD_LEASE_ID, target: IPC_SERVICE_INPUTD },
-    ServiceRouteSpec { subject: INITD_LEASE_ID, target: IPC_SERVICE_STORAGED },
-    ServiceRouteSpec { subject: INITD_LEASE_ID, target: IPC_SERVICE_SESSIOND },
-    ServiceRouteSpec { subject: IPC_SERVICE_VFSD, target: IPC_SERVICE_DEVMGRD },
-    ServiceRouteSpec { subject: IPC_SERVICE_VFSD, target: IPC_SERVICE_STORAGED },
-    ServiceRouteSpec { subject: IPC_SERVICE_PROCD, target: IPC_SERVICE_LOADERD },
-    ServiceRouteSpec { subject: IPC_SERVICE_INPUTD, target: IPC_SERVICE_NETD },
-    ServiceRouteSpec { subject: IPC_SERVICE_SESSIOND, target: IPC_SERVICE_LOADERD },
-    ServiceRouteSpec { subject: IPC_SERVICE_SESSIOND, target: IPC_SERVICE_DEVMGRD },
-    ServiceRouteSpec { subject: IPC_SERVICE_SESSIOND, target: IPC_SERVICE_UISERVER },
-    ServiceRouteSpec { subject: IPC_SERVICE_UISERVER, target: IPC_SERVICE_INPUTD },
-    ServiceRouteSpec { subject: IPC_SERVICE_DEVMGRD, target: IPC_SERVICE_SESSIOND },
-    ServiceRouteSpec { subject: IPC_SERVICE_DEVMGRD, target: IPC_SERVICE_UISERVER },
+    ServiceRouteSpec {
+        subject: INITD_LEASE_ID,
+        target: IPC_SERVICE_NETD,
+    },
+    ServiceRouteSpec {
+        subject: INITD_LEASE_ID,
+        target: IPC_SERVICE_DEVMGRD,
+    },
+    ServiceRouteSpec {
+        subject: INITD_LEASE_ID,
+        target: IPC_SERVICE_INPUTD,
+    },
+    ServiceRouteSpec {
+        subject: INITD_LEASE_ID,
+        target: IPC_SERVICE_STORAGED,
+    },
+    ServiceRouteSpec {
+        subject: INITD_LEASE_ID,
+        target: IPC_SERVICE_SESSIOND,
+    },
+    ServiceRouteSpec {
+        subject: IPC_SERVICE_VFSD,
+        target: IPC_SERVICE_DEVMGRD,
+    },
+    ServiceRouteSpec {
+        subject: IPC_SERVICE_VFSD,
+        target: IPC_SERVICE_STORAGED,
+    },
+    ServiceRouteSpec {
+        subject: IPC_SERVICE_PROCD,
+        target: IPC_SERVICE_LOADERD,
+    },
+    ServiceRouteSpec {
+        subject: IPC_SERVICE_INPUTD,
+        target: IPC_SERVICE_NETD,
+    },
+    ServiceRouteSpec {
+        subject: IPC_SERVICE_SESSIOND,
+        target: IPC_SERVICE_LOADERD,
+    },
+    ServiceRouteSpec {
+        subject: IPC_SERVICE_SESSIOND,
+        target: IPC_SERVICE_DEVMGRD,
+    },
+    ServiceRouteSpec {
+        subject: IPC_SERVICE_SESSIOND,
+        target: IPC_SERVICE_UISERVER,
+    },
+    ServiceRouteSpec {
+        subject: IPC_SERVICE_UISERVER,
+        target: IPC_SERVICE_INPUTD,
+    },
+    ServiceRouteSpec {
+        subject: IPC_SERVICE_DEVMGRD,
+        target: IPC_SERVICE_SESSIOND,
+    },
+    ServiceRouteSpec {
+        subject: IPC_SERVICE_DEVMGRD,
+        target: IPC_SERVICE_UISERVER,
+    },
 ];

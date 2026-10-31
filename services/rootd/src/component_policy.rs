@@ -11,8 +11,7 @@
 use super::service_manifest::INITD_LEASE_ID;
 use super::service_manifest::{
     BootstrapServiceSpec, PostInitServiceSpec, ServiceRouteSpec, BOOTSTRAP_MANIFEST, DEP_LOADERD,
-    DEP_PAGERD, DEP_PROCD, DEP_SYSCALLD, DEP_VFSD, POST_INIT_MANIFEST,
-    SERVICE_ROUTING_MANIFEST,
+    DEP_PAGERD, DEP_PROCD, DEP_SYSCALLD, DEP_VFSD, POST_INIT_MANIFEST, SERVICE_ROUTING_MANIFEST,
 };
 use rustos_component_model::Moniker;
 use rustos_user_abi::syscall::{
@@ -169,8 +168,7 @@ fn validate_routes(
         let bootstrap_bit = dependency_target_for(route.target);
         if bootstrap_bit != 0
             && boot.iter().any(|spec| {
-                spec.service_id == route.subject
-                    && spec.dependency_mask & bootstrap_bit != 0
+                spec.service_id == route.subject && spec.dependency_mask & bootstrap_bit != 0
             })
         {
             return Err(ManifestError::InvalidRoute);
