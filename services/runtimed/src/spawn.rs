@@ -17,34 +17,36 @@
 use std::ffi::CString;
 use std::mem::size_of;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
-use std::sync::OnceLock;
 use std::sync::atomic::Ordering;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use runtime_control::read_bounded_config_snapshot;
 use rustos_user_abi::performance::IPC_BOOT_CONTROL_HARD_LIMIT_MS;
 use rustos_user_abi::syscall::{
-    COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR,
-    COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL, COMMERCIAL_MAX_ROOTD_OP_SCHEDULING_CONTEXT_GRANT,
-    CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, IPC_SERVICE_LOADERD,
-    IPC_SERVICE_ROOTD, IPC_SERVICE_UISERVER, IPC_WAIT_SERVICE_ENDPOINT_ABI_VERSION,
-    LOADER_OP_ACTIVATE, LOADER_OP_SPAWN_EXEC, LOADER_REQUEST_ABI_VERSION, LOADER_SPAWN_ARG_BYTES,
+    smp_qualification_bind_shape_valid, CommercialMaxProtocolRequest,
+    CommercialMaxProtocolResponse, LoaderSpawnRequest, LoaderSpawnResponse,
+    RustosIpcWaitServiceEndpointArgs, RustosSchedulingContextAuthority,
+    RustosSmpQualificationBindArgs, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
+    COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR, COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL,
+    COMMERCIAL_MAX_ROOTD_OP_SCHEDULING_CONTEXT_GRANT, IPC_SERVICE_LOADERD, IPC_SERVICE_ROOTD,
+    IPC_SERVICE_UISERVER, IPC_WAIT_SERVICE_ENDPOINT_ABI_VERSION, LOADER_OP_ACTIVATE,
+    LOADER_OP_SPAWN_EXEC, LOADER_REQUEST_ABI_VERSION, LOADER_SPAWN_ARG_BYTES,
     LOADER_SPAWN_ENV_BYTES, LOADER_SPAWN_EXEC_PATH_CAPACITY, LOADER_SPAWN_FLAG_DEFER_START,
-    LoaderSpawnRequest, LoaderSpawnResponse, RustosIpcWaitServiceEndpointArgs,
-    RustosSchedulingContextAuthority, RustosSmpQualificationBindArgs,
     SMP_QUALIFICATION_BIND_ABI_VERSION, SYS_RUSTOS_IPC_CALL_BOUNDED,
     SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_WAIT_SERVICE_ENDPOINT,
-    SYS_RUSTOS_SMP_QUALIFICATION_BIND, smp_qualification_bind_shape_valid,
+    SYS_RUSTOS_SMP_QUALIFICATION_BIND,
 };
 
 use super::kvm_smp_qualification::{
-    KvmSmpQualificationContract, qualification_contract_for_launch,
+    qualification_contract_for_launch, KvmSmpQualificationContract,
 };
 use super::{
-    AT_FDCWD, CONSOLE_PATH, CONSOLE_SESSION_STATE_LOADING_IMAGE, CONSOLE_SESSION_STATE_RUNNING,
-    CONSOLE_SESSION_STATE_SPAWNING, DEFAULT_USER_TASK_WEIGHT_MICROS, IDLE_POLL_INTERVAL,
-    LOADER_ENDPOINT_CACHE, MAX_UNTRUSTED_TASK_WEIGHT_MICROS, MIN_EFFECTIVE_TASK_WEIGHT_MICROS,
-    O_RDWR, SYS_OPENAT, UI_SERVER_EXEC_PATH, UI_SERVER_TASK_WEIGHT_MICROS, boot_line,
+    boot_line, AT_FDCWD, CONSOLE_PATH, CONSOLE_SESSION_STATE_LOADING_IMAGE,
+    CONSOLE_SESSION_STATE_RUNNING, CONSOLE_SESSION_STATE_SPAWNING, DEFAULT_USER_TASK_WEIGHT_MICROS,
+    IDLE_POLL_INTERVAL, LOADER_ENDPOINT_CACHE, MAX_UNTRUSTED_TASK_WEIGHT_MICROS,
+    MIN_EFFECTIVE_TASK_WEIGHT_MICROS, O_RDWR, SYS_OPENAT, UI_SERVER_EXEC_PATH,
+    UI_SERVER_TASK_WEIGHT_MICROS,
 };
 use super::{BrokerState, LaunchEntry, RunningProcess};
 
@@ -1083,7 +1085,7 @@ fn build_exec_argv(exec_path: &str, argv: &[String]) -> Result<Vec<CString>, i32
 
 fn build_exec_env(extra_env: &[String]) -> Result<Vec<CString>, i32> {
     use runtime_control::{
-        DEFAULT_RUNTIME_ENV_REGISTRY_PATH, RuntimeEnvScope, load_runtime_default_env,
+        load_runtime_default_env, RuntimeEnvScope, DEFAULT_RUNTIME_ENV_REGISTRY_PATH,
     };
     let default_env =
         load_runtime_default_env(DEFAULT_RUNTIME_ENV_REGISTRY_PATH, RuntimeEnvScope::Runtime)
