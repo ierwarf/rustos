@@ -81,6 +81,9 @@ use rustos_user_abi::syscall::{
     COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_SCAN, COMMERCIAL_MAX_ROOTD_OP_SERVICE_LOOKUP,
     COMMERCIAL_MAX_ROOTD_OP_SESSION_ACCOUNT_CHARGE, COMMERCIAL_MAX_ROOTD_OP_SESSION_ACCOUNT_RELEASE,
     COMMERCIAL_MAX_ROOTD_OP_SERVICE_HEARTBEAT,
+    COMMERCIAL_MAX_ROOTD_OP_UPDATE_STAGE, COMMERCIAL_MAX_ROOTD_OP_UPDATE_ARM,
+    COMMERCIAL_MAX_ROOTD_OP_UPDATE_ROLLBACK, COMMERCIAL_MAX_ROOTD_OP_UPDATE_SEAL,
+    COMMERCIAL_MAX_ROOTD_OP_UPDATE_INSPECT,
     IPC_SERVICE_DEVMGRD, IPC_SERVICE_INPUTD, IPC_SERVICE_LINUX_SYSCALLD, IPC_SERVICE_LOADERD,
     IPC_SERVICE_NETD, IPC_SERVICE_PAGERD, IPC_SERVICE_PROCD, IPC_SERVICE_ROOTD,
     IPC_SERVICE_SESSIOND, IPC_SERVICE_STORAGED, IPC_SERVICE_UISERVER, IPC_SERVICE_VFSD,
@@ -372,6 +375,7 @@ pub extern "C" fn __rustos_rootd_start() -> ! {
         );
         supervise_core_readiness(&mut leases, &mut next_core_readiness_poll_ns);
         supervise_service_health(&leases, &post_init_leases, &mut service_checkpoints);
+        supervise_update_deadlines(&mut service_checkpoints);
         let _ = loader_realm::configure_ready(
             endpoint, &mut leases, &mut post_init_leases, &mut service_checkpoints,
         );
@@ -700,6 +704,7 @@ fn drain_lifecycle_events(
             }
         }
         service_checkpoints.health.forget_pid(event.pid);
+        service_checkpoints.updates.on_exit(event.pid);
         revoke_post_init_dependents(post_init_leases, event.pid);
     }
 }
@@ -709,6 +714,17 @@ fn drain_lifecycle_events(
 /// authority after the session service that reported it has exited.
 /// The manifest lease supervisor uses *authenticated* exact incarnation
 /// health evidence, never a service-name-based watchdog permission.
+/// Staged candidate deadline expiry is a rollback-required transition;
+/// without verified old-image custody it must never pretend that rollback
+/// finished. The initd supervisor can inspect and coordinate a restore.
+fn supervise_update_deadlines(store: &mut ServiceCheckpointStore) {
+    let now_ns = rustos_svc_runtime::syscall::monotonic_nanos();
+    for service in store.updates.expired(now_ns).into_iter().flatten() {
+        let _ = service;
+        debug_line(b"rootd: image trial deadline expired; rollback required\n");
+    }
+}
+
 fn supervise_service_health(
     leases: &[Lease],
     post_init: &[PostInitLease],
@@ -1008,6 +1024,11 @@ fn validate_commercial_max_request(
             | COMMERCIAL_MAX_ROOTD_OP_SESSION_ACCOUNT_CHARGE
             | COMMERCIAL_MAX_ROOTD_OP_SESSION_ACCOUNT_RELEASE
             | COMMERCIAL_MAX_ROOTD_OP_SERVICE_HEARTBEAT
+            | COMMERCIAL_MAX_ROOTD_OP_UPDATE_STAGE
+            | COMMERCIAL_MAX_ROOTD_OP_UPDATE_ARM
+            | COMMERCIAL_MAX_ROOTD_OP_UPDATE_ROLLBACK
+            | COMMERCIAL_MAX_ROOTD_OP_UPDATE_SEAL
+            | COMMERCIAL_MAX_ROOTD_OP_UPDATE_INSPECT
             | COMMERCIAL_MAX_ROOTD_OP_LOADER_WORKER_COMPLETE => Ok(()),
             COMMERCIAL_MAX_ROOTD_OP_SCHEDULING_CONTEXT_GRANT => {
                 if request.path_len == 0
@@ -1119,6 +1140,10 @@ fn fill_commercial_max_response(
         }
         COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL => {
             register_post_init_service_lease(leases, post_init_leases, request, sender)?;
+            service_checkpoints.updates.published(
+                request.arg0, request.arg1,
+                rustos_svc_runtime::syscall::monotonic_nanos(),
+            )?;
             response.value0 = request.arg0;
             response.value1 = request.arg1;
             Ok(())
@@ -1265,16 +1290,88 @@ fn fill_commercial_max_response(
             if ack.len() > response.payload.len() {
                 return Err(75);
             }
+            let now_ns = rustos_svc_runtime::syscall::monotonic_nanos();
             let deadline = service_checkpoints.health.report(
-                pulse.service,
-                sender.pid,
-                pulse.sequence,
-                rustos_svc_runtime::syscall::monotonic_nanos(),
+                pulse.service, sender.pid, pulse.sequence, now_ns,
+            )?;
+            service_checkpoints.updates.healthy(
+                pulse.service, sender.pid, now_ns,
             )?;
             response.payload[..ack.len()].copy_from_slice(&ack);
             response.payload_len = ack.len() as u32;
             response.value0 = 0;
             response.value1 = deadline;
+            Ok(())
+        }
+        COMMERCIAL_MAX_ROOTD_OP_UPDATE_STAGE
+        | COMMERCIAL_MAX_ROOTD_OP_UPDATE_ARM
+        | COMMERCIAL_MAX_ROOTD_OP_UPDATE_ROLLBACK
+        | COMMERCIAL_MAX_ROOTD_OP_UPDATE_SEAL => {
+            use rustos_component_model::update_wire;
+            use rustos_component_model::policy_ops::SlowBrokerOperation as Op;
+            if request.arg0 != 0 || request.arg1 != 0
+                || request.arg2 != 0 || request.arg3 != 0
+                || request.path_len != 0
+            {
+                return Err(22);
+            }
+            let approval = update_wire::decode(
+                &request.payload[..request.payload_len as usize],
+            ).map_err(|_| 22)?;
+            // STAGE is a trusted loaderd attestation of the previously
+            // validated signed image; all other mutations are initd's
+            // exact principal. This digest alone is never execution proof.
+            let (owner, operation) = if request.header.op == COMMERCIAL_MAX_ROOTD_OP_UPDATE_STAGE {
+                (IPC_SERVICE_LOADERD, Op::UpgradeComponent)
+            } else if request.header.op == COMMERCIAL_MAX_ROOTD_OP_UPDATE_ROLLBACK {
+                (service_manifest::INITD_LEASE_ID, Op::RollbackComponent)
+            } else {
+                (service_manifest::INITD_LEASE_ID, Op::UpgradeComponent)
+            };
+            authorize_service_slow_grant(
+                leases, post_init_leases, owner, sender, operation,
+            )?;
+            let phase = match request.header.op {
+                COMMERCIAL_MAX_ROOTD_OP_UPDATE_STAGE => {
+                    let current = post_init_leases.iter().find(|lease| {
+                        lease.service_id == approval.service
+                            && lease.state == ROOTD_LEASE_STATE_RUNNING
+                            && lease.pid != 0
+                    }).ok_or(116)?;
+                    service_checkpoints.updates.stage(
+                        approval, current.pid,
+                        rustos_svc_runtime::syscall::monotonic_nanos(),
+                    )?
+                }
+                COMMERCIAL_MAX_ROOTD_OP_UPDATE_ARM => service_checkpoints.updates.arm(
+                    approval, rustos_svc_runtime::syscall::monotonic_nanos(),
+                )?,
+                COMMERCIAL_MAX_ROOTD_OP_UPDATE_ROLLBACK =>
+                    service_checkpoints.updates.rollback(approval)?,
+                COMMERCIAL_MAX_ROOTD_OP_UPDATE_SEAL =>
+                    service_checkpoints.updates.seal(approval)?,
+                _ => return Err(22),
+            };
+            response.value0 = approval.epoch;
+            response.value1 = phase as u64;
+            Ok(())
+        }
+        COMMERCIAL_MAX_ROOTD_OP_UPDATE_INSPECT => {
+            if request.arg0 == 0
+                || request.arg1 != 0 || request.arg2 != 0
+                || request.arg3 != 0 || request.path_len != 0
+                || request.payload_len != 0
+            {
+                return Err(22);
+            }
+            authorize_current_initd(leases, sender)?;
+            let (phase, epoch, previous_pid, candidate_pid) =
+                service_checkpoints.updates.inspect(request.arg0)?;
+            response.value0 = epoch;
+            response.value1 = phase as u64;
+            response.payload_len = 16;
+            response.payload[..8].copy_from_slice(&previous_pid.to_le_bytes());
+            response.payload[8..16].copy_from_slice(&candidate_pid.to_le_bytes());
             Ok(())
         }
         COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_MUTATE => {
@@ -1600,6 +1697,11 @@ fn rootd_capability_mask(op: u16) -> u64 {
         COMMERCIAL_MAX_ROOTD_OP_SESSION_ACCOUNT_CHARGE => 1 << 13,
         COMMERCIAL_MAX_ROOTD_OP_SESSION_ACCOUNT_RELEASE => 1 << 14,
         COMMERCIAL_MAX_ROOTD_OP_SERVICE_HEARTBEAT => 1 << 15,
+        COMMERCIAL_MAX_ROOTD_OP_UPDATE_STAGE => 1 << 16,
+        COMMERCIAL_MAX_ROOTD_OP_UPDATE_ARM => 1 << 17,
+        COMMERCIAL_MAX_ROOTD_OP_UPDATE_ROLLBACK => 1 << 18,
+        COMMERCIAL_MAX_ROOTD_OP_UPDATE_SEAL => 1 << 19,
+        COMMERCIAL_MAX_ROOTD_OP_UPDATE_INSPECT => 1 << 20,
         COMMERCIAL_MAX_ROOTD_OP_SCHEDULING_CONTEXT_GRANT => 1 << 12,
         _ => 0,
     }
