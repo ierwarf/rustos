@@ -9,6 +9,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{OpenOptionsExt, MetadataExt};
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 
 const RECORD_BYTES:usize=96;
@@ -22,6 +23,16 @@ const ERROR_EPERM:i32=1;
 const ERROR_ENOSPC:i32=28;
 const ERROR_EPROTO:i32=71;
 
+/// Rootd owns one release transaction; storaged must reject a second
+/// filesystem writer before examining any record. Advisory locks are not
+/// a security boundary against a compromised privileged writer: the mount
+/// itself and file ACL remain external trust anchors.
+fn lock_exclusive(file:&File)->Result<(),i32>{
+    let result=unsafe{libc::flock(file.as_raw_fd(),libc::LOCK_EX|libc::LOCK_NB)};
+    if result!=0{return Err(std::io::Error::last_os_error()
+        .raw_os_error().unwrap_or(ERROR_EIO))}
+    Ok(())
+}
 fn status(error:std::io::Error)->i32{
     error.raw_os_error().unwrap_or(ERROR_EIO)
 }
@@ -70,6 +81,7 @@ impl ReleaseJournalFile{
             libc::O_CLOEXEC|libc::O_NOFOLLOW,
         );
         let mut file=opts.open(path).map_err(status)?;
+        lock_exclusive(&file)?;
         let meta=file.metadata().map_err(status)?;
         if !meta.is_file()||meta.len()<HEADER_BYTES as u64
             ||(meta.len()-HEADER_BYTES as u64)%RECORD_BYTES as u64!=0 {
@@ -93,6 +105,7 @@ impl ReleaseJournalFile{
         opts.read(true).write(true).create_new(true).mode(0o600)
             .custom_flags(libc::O_CLOEXEC|libc::O_NOFOLLOW);
         let mut file=opts.open(path).map_err(status)?;
+        lock_exclusive(&file)?;
         let header=header(id);
         file.write_all(&header).map_err(status)?;
         file.sync_all().map_err(status)?;
@@ -105,9 +118,24 @@ impl ReleaseJournalFile{
     pub(super) fn id(&self)->JournalIdentity{self.id}
     pub(super) fn records(&self)->u64{self.records}
     pub(super) fn failed(&self)->bool{self.fail_closed}
+    fn check_file_shape(&mut self)->Result<(),i32>{
+        if self.fail_closed{return Err(ERROR_EIO)}
+        let meta=match self.file.metadata(){
+            Ok(meta)=>meta,
+            Err(error)=>{self.fail_closed=true;return Err(status(error))}
+        };
+        let expected=(HEADER_BYTES as u64)
+            .checked_add(self.records.checked_mul(RECORD_BYTES as u64)
+                .ok_or(ERROR_ENOSPC)?).ok_or(ERROR_ENOSPC)?;
+        if !meta.is_file()||meta.len()!=expected {
+            self.fail_closed=true;
+            return Err(ERROR_EPROTO)
+        }
+        Ok(())
+    }
     pub(super) fn read_record(&mut self,index:u64)
         ->Result<Option<[u8;RECORD_BYTES]>,i32>{
-        if self.fail_closed{return Err(ERROR_EIO)}
+        self.check_file_shape()?;
         if index>=self.records{return Ok(None)}
         let offset=(HEADER_BYTES as u64)
             .checked_add(index.checked_mul(RECORD_BYTES as u64)
@@ -129,6 +157,7 @@ impl ReleaseJournalFile{
             return Err(ERROR_EPERM)
         }
         if index!=self.records||index>=MAX_RECORDS{return Err(ERROR_ENOSPC)}
+        self.check_file_shape()?;
         let offset=(HEADER_BYTES as u64)
             .checked_add(index.checked_mul(RECORD_BYTES as u64)
                 .ok_or(ERROR_ENOSPC)?).ok_or(ERROR_ENOSPC)?;
@@ -152,6 +181,7 @@ impl ReleaseJournalFile{
             self.fail_closed=true;return Err(ERROR_EPROTO)
         }
         self.records+=1;
+        self.check_file_shape()?;
         Ok(())
     }
     /// Never truncate a replayed torn tail without independent transaction
