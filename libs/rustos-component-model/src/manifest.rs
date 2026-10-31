@@ -119,10 +119,12 @@ impl Graph {
                     spec.critical,
                 )
                 .map_err(map_graph_error)?;
-            ids.push(id);
-        }
-        for id in ids.iter().copied().skip(1) {
+            // A nested component's parent must already be active. Since the
+            // manifest is in parent-before-child order, publish each local
+            // policy state before admitting the next child, while keeping
+            // the entire Graph private until every export/offer is valid.
             graph.activate(id).map_err(map_graph_error)?;
+            ids.push(id);
         }
 
         for (index, spec) in specs.iter().enumerate() {

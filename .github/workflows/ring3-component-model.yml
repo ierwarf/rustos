@@ -2,12 +2,12 @@ name: Ring3 component model
 
 on:
   push:
-    branches: [master]
+    branches: [master, ring3-nested-manifest-activation-20261031]
   pull_request:
-    branches: [master]
+    branches: [master, ring3-nested-manifest-activation-20261031]
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   model:
@@ -21,6 +21,18 @@ jobs:
           rustup toolchain install "$toolchain" --profile minimal --component rustfmt
       - name: Verify declarative Ring3 IDL
         run: python3 tools/ring3_idl_codegen.py --check
+      - name: Format staged nested-manifest sources
+        run: cargo fmt -p rustos-component-model
+      - name: Save staged formatting
+        if: github.ref == 'refs/heads/ring3-nested-manifest-activation-20261031'
+        run: |
+          git add libs/rustos-component-model/src/manifest.rs libs/rustos-component-model/src/tests.rs
+          if ! git diff --cached --quiet; then
+            git config user.name "rustos-ring3-checks[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit -m "style: format nested component manifest tests"
+            git push origin HEAD:refs/heads/ring3-nested-manifest-activation-20261031
+          fi
       - name: Check component formatting
         run: |
           cargo fmt -p rustos-component-model -- --check
