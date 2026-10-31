@@ -1093,6 +1093,12 @@ pub const COMMERCIAL_MAX_ROOTD_OP_SESSION_ACCOUNT_CHARGE: u16 = 17;
 pub const COMMERCIAL_MAX_ROOTD_OP_SESSION_ACCOUNT_RELEASE: u16 = 18;
 /// Authenticated exact-incarnation heartbeat, sequenced and fail-closed.
 pub const COMMERCIAL_MAX_ROOTD_OP_SERVICE_HEARTBEAT: u16 = 19;
+/// Update candidate approval is a control-plane transaction, not image trust.
+pub const COMMERCIAL_MAX_ROOTD_OP_UPDATE_STAGE: u16 = 20;
+pub const COMMERCIAL_MAX_ROOTD_OP_UPDATE_ARM: u16 = 21;
+pub const COMMERCIAL_MAX_ROOTD_OP_UPDATE_ROLLBACK: u16 = 22;
+pub const COMMERCIAL_MAX_ROOTD_OP_UPDATE_SEAL: u16 = 23;
+pub const COMMERCIAL_MAX_ROOTD_OP_UPDATE_INSPECT: u16 = 24;
 /// Store one versioned, service-owned checkpoint record.  Rootd authenticates
 /// the current service lease and retains the opaque record across a supervised
 /// service restart; it never interprets the service-private value bytes.

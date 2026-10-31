@@ -1,5 +1,6 @@
 use super::session_accounting::SessionLedger;
 use super::service_health::HealthBook;
+use super::service_updates::UpdateBook;
 use alloc::vec::Vec;
 use rustos_user_abi::syscall::{
     ServiceCheckpointRecordWire, SERVICE_CHECKPOINT_ABI_VERSION, SERVICE_CHECKPOINT_FLAG_TOMBSTONE,
@@ -31,6 +32,7 @@ pub(crate) struct ServiceCheckpointStore {
     /// checkpoint records but share rootd's one serialized service loop.
     pub(crate) sessions: SessionLedger,
     pub(crate) health: HealthBook,
+    pub(crate) updates: UpdateBook,
 }
 
 impl ServiceCheckpointStore {
@@ -42,6 +44,7 @@ impl ServiceCheckpointStore {
             records: Vec::new(),
             sessions: SessionLedger::new(),
             health: HealthBook::new(),
+            updates: UpdateBook::new(),
         }
     }
 

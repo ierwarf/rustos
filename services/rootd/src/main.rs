@@ -35,6 +35,7 @@ mod job_lease;
 mod policy_cutover;
 mod service_grants;
 mod service_health;
+mod service_updates;
 mod loader_realm;
 mod loader_transaction;
 mod application_limit_probe;
