@@ -32,7 +32,7 @@ use runtime_control::{
 use rustos_user_abi::performance::IPC_BOOT_CONTROL_HARD_LIMIT_MS;
 use rustos_user_abi::syscall::{
     COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR,
-    COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_SNAPSHOT_IDL, COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_RECLAIM,
+    COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_SNAPSHOT_IDL, COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_RECLAIM_IDL,
     COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL, COMMERCIAL_MAX_ROOTD_OP_SCHEDULING_CONTEXT_GRANT,
     CommercialMaxProtocolRequest, CommercialMaxProtocolResponse, IPC_SERVICE_DEVMGRD,
     IPC_SERVICE_INITD, IPC_SERVICE_INPUTD, IPC_SERVICE_LINUX_SYSCALLD, IPC_SERVICE_LOADERD,
@@ -720,29 +720,33 @@ fn rootd_post_init_lease_query(service_id: u64, timeout_ms: u64) -> Result<(u64,
 }
 
 fn reclaim_rootd_post_init_lease(service_id: u64, pid: u64) -> Result<(), i32> {
-    if pid == 0 {
+    if service_id == 0 || pid == 0 {
         return Err(libc::EINVAL);
     }
-    let _ = call_rootd_supervisor(
-        COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_RECLAIM,
-        service_id,
+    let challenge = LEASE_SNAPSHOT_REQUEST_ID
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .map_err(|_| libc::EOVERFLOW)?;
+    let ticket = rustos_component_model::lease_reclaim::Reclaim {
+        service: service_id,
         pid,
+        challenge,
+    };
+    let frame = rustos_component_model::lease_reclaim::encode_request(ticket)
+        .map_err(|_| libc::EINVAL)?;
+    let response = call_rootd_supervisor_with_payload(
+        COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_RECLAIM_IDL,
+        0,
+        0,
         IPC_BOOT_CONTROL_HARD_LIMIT_MS,
+        &frame,
     )?;
-    Ok(())
-}
-
-fn call_rootd_supervisor(
-    op: u16,
-    arg0: u64,
-    arg1: u64,
-    timeout_ms: u64,
-) -> Result<CommercialMaxProtocolResponse, i32> {
-    let response = call_rootd_supervisor_with_payload(op, arg0, arg1, timeout_ms, &[])?;
-    if response.payload_len != 0 {
+    if response.value0 != 0 || response.value1 != 0 {
         return Err(libc::EINVAL);
     }
-    Ok(response)
+    rustos_component_model::lease_reclaim::decode_ack(
+        &response.payload[..response.payload_len as usize],
+        ticket,
+    ).map_err(|_| libc::EINVAL)
 }
 
 fn call_rootd_supervisor_with_payload(
