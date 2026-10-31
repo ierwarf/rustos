@@ -79,6 +79,7 @@ use rustos_user_abi::syscall::{
     COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_MUTATE,
     COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_SCAN, COMMERCIAL_MAX_ROOTD_OP_SERVICE_LOOKUP,
     COMMERCIAL_MAX_ROOTD_OP_SESSION_ACCOUNT_CHARGE, COMMERCIAL_MAX_ROOTD_OP_SESSION_ACCOUNT_RELEASE,
+    COMMERCIAL_MAX_ROOTD_OP_SERVICE_HEARTBEAT,
     IPC_SERVICE_DEVMGRD, IPC_SERVICE_INPUTD, IPC_SERVICE_LINUX_SYSCALLD, IPC_SERVICE_LOADERD,
     IPC_SERVICE_NETD, IPC_SERVICE_PAGERD, IPC_SERVICE_PROCD, IPC_SERVICE_ROOTD,
     IPC_SERVICE_SESSIOND, IPC_SERVICE_STORAGED, IPC_SERVICE_UISERVER, IPC_SERVICE_VFSD,
@@ -367,6 +368,7 @@ pub extern "C" fn __rustos_rootd_start() -> ! {
             &mut service_checkpoints,
         );
         supervise_core_readiness(&mut leases, &mut next_core_readiness_poll_ns);
+        supervise_service_health(&leases, &post_init_leases, &mut service_checkpoints);
         let _ = loader_realm::configure_ready(
             endpoint, &mut leases, &mut post_init_leases, &mut service_checkpoints,
         );
@@ -694,6 +696,7 @@ fn drain_lifecycle_events(
                 break;
             }
         }
+        service_checkpoints.health.forget_pid(event.pid);
         revoke_post_init_dependents(post_init_leases, event.pid);
     }
 }
@@ -701,6 +704,33 @@ fn drain_lifecycle_events(
 /// A running child inherits supervisor admission only while that supervisor is
 /// alive.  In particular, uiserver must not keep SESSION_POLICY-derived
 /// authority after the session service that reported it has exited.
+/// The manifest lease supervisor uses *authenticated* exact incarnation
+/// health evidence, never a service-name-based watchdog permission.
+fn supervise_service_health(
+    leases: &[Lease],
+    post_init: &[PostInitLease],
+    store: &mut ServiceCheckpointStore,
+) {
+    let now_ns = rustos_svc_runtime::syscall::monotonic_nanos();
+    let expired = store.health.expire(now_ns, |service, pid| {
+        current_service_id_for_sender(
+            leases, post_init, IpcSenderIdentity { pid, tid: 1 },
+        ).is_ok_and(|found| found == service)
+    });
+    for (service, pid) in expired.into_iter().flatten() {
+        debug_line(b"rootd: authenticated service health timeout\n");
+        terminate_service_process(pid)
+            .unwrap_or_else(|_| fail_closed(b"rootd: health termination rejected\n"));
+        if service == IPC_SERVICE_SESSIOND {
+            store.sessions.owner_exited(pid, |job| {
+                jobs::release_client_session(job).map(|_| ()).map_err(|err| err as i32)
+            }).unwrap_or_else(|_| {
+                fail_closed(b"rootd: health session settlement failed\n")
+            });
+        }
+    }
+}
+
 fn revoke_post_init_dependents(post_init_leases: &mut [PostInitLease], reporter_pid: u64) {
     if reporter_pid == 0 {
         return;
@@ -974,6 +1004,7 @@ fn validate_commercial_max_request(
             | COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_SCAN
             | COMMERCIAL_MAX_ROOTD_OP_SESSION_ACCOUNT_CHARGE
             | COMMERCIAL_MAX_ROOTD_OP_SESSION_ACCOUNT_RELEASE
+            | COMMERCIAL_MAX_ROOTD_OP_SERVICE_HEARTBEAT
             | COMMERCIAL_MAX_ROOTD_OP_LOADER_WORKER_COMPLETE => Ok(()),
             COMMERCIAL_MAX_ROOTD_OP_SCHEDULING_CONTEXT_GRANT => {
                 if request.path_len == 0
@@ -1207,6 +1238,29 @@ fn fill_commercial_max_response(
             response.payload_len = canonical.len() as u32;
             response.value0 = 0;
             response.value1 = 0;
+            Ok(())
+        }
+        COMMERCIAL_MAX_ROOTD_OP_SERVICE_HEARTBEAT => {
+            if request.arg0 == 0
+                || request.arg1 == 0
+                || request.arg2 != sender.pid
+                || request.arg3 != 0
+                || request.path_len != 0
+                || request.payload_len != 0
+            {
+                return Err(22);
+            }
+            authorize_current_service_namespace(
+                leases, post_init_leases, request.arg0, sender,
+            )?;
+            let deadline = service_checkpoints.health.report(
+                request.arg0,
+                sender.pid,
+                request.arg1,
+                rustos_svc_runtime::syscall::monotonic_nanos(),
+            )?;
+            response.value0 = request.arg1;
+            response.value1 = deadline;
             Ok(())
         }
         COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_MUTATE => {
@@ -1531,6 +1585,7 @@ fn rootd_capability_mask(op: u16) -> u64 {
         COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_COMPACT => 1 << 11,
         COMMERCIAL_MAX_ROOTD_OP_SESSION_ACCOUNT_CHARGE => 1 << 13,
         COMMERCIAL_MAX_ROOTD_OP_SESSION_ACCOUNT_RELEASE => 1 << 14,
+        COMMERCIAL_MAX_ROOTD_OP_SERVICE_HEARTBEAT => 1 << 15,
         COMMERCIAL_MAX_ROOTD_OP_SCHEDULING_CONTEXT_GRANT => 1 << 12,
         _ => 0,
     }

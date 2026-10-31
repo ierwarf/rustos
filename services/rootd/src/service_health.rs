@@ -65,10 +65,11 @@ impl HealthBook {
         {
             return Err(ESTALE);
         }
-        let slot = self.entries.iter_mut()
-            .find(|entry| entry.service == service)
-            .or_else(|| self.entries.iter_mut().find(|entry| entry.service == 0))
+        let slot_index = self.entries.iter()
+            .position(|entry| entry.service == service)
+            .or_else(|| self.entries.iter().position(|entry| entry.service == 0))
             .ok_or(ENOSPC)?;
+        let slot = &mut self.entries[slot_index];
         if slot.service == service && slot.pid == pid {
             if sequence <= slot.sequence || slot.timed_out {
                 return Err(ESTALE);
