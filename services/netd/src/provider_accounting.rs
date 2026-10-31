@@ -64,6 +64,22 @@ pub(super) fn charge_before_publish(token:u64,client_pid:u64)
     let mut book=lock()?;
     book.charged(token,ack).map_err(errno)
 }
+pub(super) fn release_if_funded(token:u64)->Result<(),i32>{
+    let present={
+        let book=lock()?;
+        match book.pending(token) {
+            Ok((State::Funded,_))|
+            Ok((State::ReleasePrepared,_))|
+            Ok((State::ReleaseInFlight,_))=>true,
+            Ok((State::ChargeInFlight,_))|
+            Ok((State::ChargePrepared,_))=>return Err(libc::EAGAIN),
+            Err(Error::Missing)=>false,
+            Err(err)=>return Err(errno(err)),
+        }
+    };
+    if !present{return Ok(())}
+    release_after_final_close(token)
+}
 pub(super) fn release_after_final_close(token:u64)->Result<(),i32>{
     let req={
         let mut book=lock()?;

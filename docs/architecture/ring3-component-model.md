@@ -244,3 +244,11 @@ socket/open-description final-close integration. IDL schema 520 is added
 for future canonical protocol cutover, but live ops still use fixed wire.
 See the validation ledger for pending unknown-ACK/reboot/killed-provider
 and cycle-free bootstrap acceptance tests.
+
+### netd active source call-site draft
+
+The netd socket and accept code paths now invoke the shared
+client-funded slow RPC in the source draft. This is not accepted until the
+exact last-reference paths and all failure/retry outcomes have been
+verified. Vfsd's bootstrap-critical path deliberately remains unmodified
+until its rootd dependency cycle and checkpoint replay can be proven safe.

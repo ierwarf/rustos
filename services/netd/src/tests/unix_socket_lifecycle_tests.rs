@@ -252,7 +252,7 @@ fn listener_close_repeatedly_retires_pending_bytes_and_authority_once() {
                 Ok(6)
             );
         }
-        let (retired, peers) = retire_unix_socket(&mut state, 1);
+        let (retired, peers, _funded) = retire_unix_socket(&mut state, 1);
         let mut response = NetdIpcResponse::default();
         encode_retired_socket_release(retired, &mut response);
         let mut released = release_controls(&response);
@@ -283,7 +283,7 @@ fn listener_close_repeatedly_retires_pending_bytes_and_authority_once() {
                 0
             );
         }
-        let (retired, peers) = retire_unix_socket(&mut state, 1);
+        let (retired, peers, _funded) = retire_unix_socket(&mut state, 1);
         assert!(retired.is_empty() && peers.is_empty());
         encode_retired_socket_release(retired, &mut response);
         assert_eq!(response.reserved0, 0);
@@ -322,7 +322,7 @@ fn pending_budget_admission_is_aligned_atomic_and_shared_across_accept_pop() {
     );
     assert_eq!(connected(&state, 2).incoming_bytes, before);
     assert_eq!(connected(&state, 2).incoming_control_bytes, before_control);
-    let (retired, peers) = settle_unix_accept(&mut state, 1, accepted, false);
+    let (retired, peers, _funded) = settle_unix_accept(&mut state, 1, accepted, false);
     assert!(retired.is_empty() && peers.is_empty());
     assert_eq!(connected(&state, 2).pending_listener, Some(1));
     assert_eq!(pop_accept(&mut state), 2);
@@ -334,7 +334,7 @@ fn pending_budget_admission_is_aligned_atomic_and_shared_across_accept_pop() {
         send_socket_message_in_state(&mut state, &request(5), b"x", &control),
         Ok(1)
     );
-    let (retired, _) = retire_unix_socket(&mut state, 1);
+    let (retired, _, _funded) = retire_unix_socket(&mut state, 1);
     let mut response = NetdIpcResponse::default();
     encode_retired_socket_release(retired, &mut response);
     assert!(state.sockets.contains_key(&2));
@@ -352,12 +352,12 @@ fn failed_inflight_accept_after_listener_close_carries_only_error_release_traile
         );
     }
     assert_eq!(pop_accept(&mut state), 2);
-    let (retired, _) = retire_unix_socket(&mut state, 1);
+    let (retired, _, _funded) = retire_unix_socket(&mut state, 1);
     let mut close_response = NetdIpcResponse::default();
     encode_retired_socket_release(retired, &mut close_response);
     assert_eq!(release_controls(&close_response), vec![rights(3)]);
     assert_eq!(connected(&state, 2).pending_listener, Some(1));
-    let (retired, peers) = settle_unix_accept(&mut state, 1, 2, false);
+    let (retired, peers, _funded) = settle_unix_accept(&mut state, 1, 2, false);
     let mut error = NetdIpcResponse {
         status: libc::EIO,
         op: SYSCALL_OFFLOAD_OP_LINUX_ACCEPT,
@@ -378,7 +378,7 @@ fn successful_inflight_accept_after_listener_close_keeps_published_socket() {
     let mut state = listener_state();
     assert_eq!(pop_accept(&mut state), 2);
     let _ = retire_unix_socket(&mut state, 1);
-    let (retired, peers) = settle_unix_accept(&mut state, 1, 2, true);
+    let (retired, peers, _funded) = settle_unix_accept(&mut state, 1, 2, true);
     assert!(retired.is_empty() && peers.is_empty());
     assert_eq!(connected(&state, 2).pending_listener, None);
     assert!(!connected(&state, 4).peer_closed);
@@ -413,7 +413,7 @@ fn listener_close_at_exact_aligned_custody_cap_emits_every_control() {
         send_socket_message_in_state(&mut state, &request(4), b"rejected", &rights(9)),
         Err(libc::EAGAIN)
     );
-    let (retired, _) = retire_unix_socket(&mut state, 1);
+    let (retired, _, _funded) = retire_unix_socket(&mut state, 1);
     let mut response = NetdIpcResponse::default();
     encode_retired_socket_release(retired, &mut response);
     let mut released = release_controls(&response);

@@ -228,3 +228,22 @@ cancellation, netd and vfsd release rollback, and typed schema-generator
 adoption for the new provider RPC. The provider wire's lease epoch is a
 client incarnation nonce; it MUST NOT be treated as independent kernel
 identity proof. No compiler/build/boot/tests were executed here.
+
+## 2026-11-01 netd socket-path first source cutover — UNVERIFIED
+
+Following the RPC/client scaffold above, netd now calls the shared
+provider client for AF_INET and AF_UNIX socket publication and both
+socketpair endpoints, funds queued internal accept sockets only as they
+become public, and releases charges after final closes and indirect
+UNIX listener-child retirement. No NetState mutex is intentionally
+held while rootd IPC is executed. Reference duplication is not charged
+again. The provider client retains ambiguous charge/release attempts by
+exact token and does not equate network broker failure with a refund.
+
+**High-priority unresolved correctness:** open/close failure interleavings,
+pending accept requeue, connection-ref transitions, kernel broker copyout
+ambiguity, service restarts, rootd restart, rootd/vfsd startup cycles and
+partial socketpair refund failure. Failures after object removal can leave
+an uncertain accounting receipt. No KVM, compile, cargo tests, dynamic
+sanitizers, fault injection, or perf measurements were run. Vfsd still
+uses a staged but inactive open-description adapter.

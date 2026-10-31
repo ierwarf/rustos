@@ -179,3 +179,22 @@ run exact negative-right tests, and migrate every socket and VFS open/dup/
 close/accept/retirement path with a single client-funded bill. Do not
 allow bootstrapping vfsd to wait on rootd while rootd waits on vfsd.
 No build, compilation or boot validation has been performed.
+
+## Socket creation/final close trial cutover (second source commit)
+
+netd now attempts a client Job session charge before publishing AF_INET and
+AF_UNIX stream sockets and both AF_UNIX socketpair ends. Duplicate fd
+references do not create a second charge. Final close and indirect UNIX
+listener/accept retirement trigger the corresponding kernel-rootd refund
+through the same exact provider token. Accept now funds its queued internal
+socket only immediately before broker publication; on failed publication
+and requeue the charge is retired or kept in an explicit uncertain state.
+
+The netd socket-path integration is draft only. In particular, review every
+implicit kernel broker discard, accepted socket after listener close, foreign
+pid reuse, peer teardown, deferred reply abandonment, and retry after a rootd
+process restart. The local provider accounting mutex MUST be dropped before
+IPC to rootd. An ambiguous refund cannot be interpreted as a successful
+close, and a refunded socket must never regain a public reference. Run the
+existing UNIX socket lifecycle unit matrix and bounded scheduler/IPC
+regressions in Codex, not in this drafting session.

@@ -1612,6 +1612,11 @@ fn handle_socket(request: &NetdIpcRequest, response: &mut NetdIpcResponse, reply
             Ok(token) => token,
             Err(errno) => return errno,
         };
+        // Charge the *calling process Job* before publishing a socket
+        // identity. No NetState lock is held over the rootd IPC.
+        if let Err(errno)=provider_accounting::charge_before_publish(token,request.pid){
+            return errno;
+        }
         let mut state = net_state().lock().unwrap();
         let token_available = state.token_available(token);
         let tcp = match start_inet_socket_provider_at(
@@ -1621,7 +1626,11 @@ fn handle_socket(request: &NetdIpcRequest, response: &mut NetdIpcResponse, reply
             || state.inet_stack().map(|stack| stack.add_tcp_socket()),
         ) {
             Ok(tcp) => tcp,
-            Err(errno) => return errno,
+            Err(errno) => {
+                drop(state);
+                let _=provider_accounting::release_after_final_close(token);
+                return errno;
+            }
         };
         state.inet_sockets.insert(
             token,
@@ -1642,8 +1651,13 @@ fn handle_socket(request: &NetdIpcRequest, response: &mut NetdIpcResponse, reply
         Ok(token) => token,
         Err(errno) => return errno,
     };
+    if let Err(errno)=provider_accounting::charge_before_publish(token,request.pid){
+        return errno;
+    }
     let mut state = net_state().lock().unwrap();
     if !state.token_available(token) {
+        drop(state);
+        let _=provider_accounting::release_after_final_close(token);
         return libc::EAGAIN;
     }
     state.sockets.insert(
@@ -1677,8 +1691,20 @@ fn handle_socketpair(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -
         Ok(token) => token,
         Err(errno) => return errno,
     };
+    // Socketpair owns two independently closeable descriptions. Fund each
+    // once and unwind the first if the second is denied before publication.
+    if let Err(errno)=provider_accounting::charge_before_publish(left,request.pid){
+        return errno;
+    }
+    if let Err(errno)=provider_accounting::charge_before_publish(right,request.pid){
+        let _=provider_accounting::release_after_final_close(left);
+        return errno;
+    }
     let mut state = net_state().lock().unwrap();
     if left == right || !state.token_available(left) || !state.token_available(right) {
+        drop(state);
+        let _=provider_accounting::release_after_final_close(left);
+        let _=provider_accounting::release_after_final_close(right);
         return libc::EAGAIN;
     }
     state.sockets.insert(
@@ -1765,7 +1791,9 @@ fn handle_close(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32
             stack.remove(socket.tcp);
             stack.poll_budget(8);
         }
-        return 0;
+        drop(state);
+        // No local socket lock crosses the rootd billing control IPC.
+        return provider_accounting::release_if_funded(request.socket_token);
     }
     let Some(socket) = state.sockets.get_mut(&request.socket_token) else {
         return libc::EBADF;
@@ -1775,20 +1803,30 @@ fn handle_close(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32
         response.value = socket.refs as u64;
         return 0;
     }
-    let (retired, peers) = retire_unix_socket(&mut state, request.socket_token);
+    let (retired, peers, retired_tokens) =
+        retire_unix_socket(&mut state, request.socket_token);
     drop(state);
     encode_retired_socket_release(retired, response);
+    let mut refund_error=0;
+    for token in retired_tokens {
+        if let Err(errno)=provider_accounting::release_if_funded(token) {
+            // A missing ACK must leave the exact token in the client book.
+            if refund_error==0{refund_error=errno}
+        }
+    }
     // Pending clients are not in the dispatcher's pre-close target snapshot.
     advance_readiness_generation(&peers);
-    0
+    refund_error
 }
 
 /// Withdraw identities and notify peers atomically; backing and authority are
 /// carried out of the state lock for destruction and the kernel release trailer.
-fn retire_unix_socket(state: &mut NetState, token: u64) -> (Vec<UnixSocket>, Vec<u64>) {
+fn retire_unix_socket(state: &mut NetState, token: u64)
+    -> (Vec<UnixSocket>, Vec<u64>, Vec<u64>) {
     let mut tokens = vec![token];
     let mut retired = Vec::new();
     let mut peers = Vec::new();
+    let mut retired_tokens = Vec::new();
     while let Some(token) = tokens.pop() {
         let Some(mut socket) = state.sockets.remove(&token) else {
             continue;
@@ -1815,8 +1853,9 @@ fn retire_unix_socket(state: &mut NetState, token: u64) -> (Vec<UnixSocket>, Vec
             UnixSocketState::Idle => {}
         }
         retired.push(socket);
+        retired_tokens.push(token);
     }
-    (retired, peers)
+    (retired, peers, retired_tokens)
 }
 
 fn encode_retired_socket_release(retired: Vec<UnixSocket>, response: &mut NetdIpcResponse) {
@@ -2168,9 +2207,14 @@ fn handle_accept(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i3
                 }
             }
         }
+        // An accepted endpoint is not funded merely because it is queued.
+        // Charge the client only at the public accept handoff boundary.
+        if let Err(errno)=provider_accounting::charge_before_publish(accepted,request.pid){
+            return errno;
+        }
         call_net_broker(request, response, 0, accepted, channel_id, false)
     })();
-    let (retired, peers) = {
+    let (retired, peers, tokens) = {
         let mut state = net_state().lock().unwrap();
         settle_unix_accept(&mut state, request.socket_token, accepted, result == 0)
     };
@@ -2179,6 +2223,16 @@ fn handle_accept(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i3
         // reference. Error replies carry its release trailer too; the compat
         // consumer must retire that authority before returning the errno.
         encode_retired_socket_release(retired, response);
+    }
+    // Internal not-yet-public accepted sockets may be unfunded; the refund
+    // predicate treats those as no-op rather than charging a ghost session.
+    for token in tokens {
+        let _=provider_accounting::release_if_funded(token);
+    }
+    if result!=0 {
+        // A failed broker publication may requeue the accepted endpoint.
+        // Its charge is not permitted to survive the failed public handoff.
+        let _=provider_accounting::release_if_funded(accepted);
     }
     advance_readiness_generation(&peers);
     result
@@ -2189,24 +2243,24 @@ fn settle_unix_accept(
     listener_token: u64,
     accepted: u64,
     published: bool,
-) -> (Vec<UnixSocket>, Vec<u64>) {
+) -> (Vec<UnixSocket>, Vec<u64>, Vec<u64>) {
     if published {
         if let Some(socket) = state.sockets.get_mut(&accepted) {
             if let UnixSocketState::Connected(connected) = &mut socket.state {
                 connected.pending_listener = None;
             }
         }
-        return (Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), Vec::new());
     }
     if !state.sockets.contains_key(&accepted) {
-        return (Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), Vec::new());
     }
     if let Some(listener) = state.sockets.get_mut(&listener_token) {
         if let UnixSocketState::Listening { pending, .. } = &mut listener.state {
             if !pending.contains(&accepted) {
                 pending.push_front(accepted);
             }
-            return (Vec::new(), Vec::new());
+            return (Vec::new(), Vec::new(), Vec::new());
         }
     }
     retire_unix_socket(state, accepted)
