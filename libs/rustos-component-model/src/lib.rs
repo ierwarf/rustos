@@ -19,6 +19,7 @@ extern crate alloc;
 pub mod health;
 pub mod identity;
 pub mod idl;
+pub mod generated_idl;
 pub mod manifest;
 pub mod policy;
 pub mod policy_ops;

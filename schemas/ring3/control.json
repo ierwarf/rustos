@@ -1,0 +1,170 @@
+{
+  "version": 1,
+  "interfaces": [
+    {
+      "name": "component_command",
+      "opcode": 512,
+      "fields": [
+        {
+          "name": "component",
+          "tag": 1,
+          "type": "u64",
+          "required": true
+        },
+        {
+          "name": "operation",
+          "tag": 2,
+          "type": "u16",
+          "required": true
+        },
+        {
+          "name": "issuer_epoch",
+          "tag": 3,
+          "type": "u64",
+          "required": true
+        },
+        {
+          "name": "payload",
+          "tag": 4,
+          "type": "bytes",
+          "required": false,
+          "max_len": 1024
+        }
+      ]
+    },
+    {
+      "name": "session_admission",
+      "opcode": 513,
+      "fields": [
+        {
+          "name": "client_component",
+          "tag": 1,
+          "type": "u64",
+          "required": true
+        },
+        {
+          "name": "provider_component",
+          "tag": 2,
+          "type": "u64",
+          "required": true
+        },
+        {
+          "name": "route_epoch",
+          "tag": 3,
+          "type": "u64",
+          "required": true
+        },
+        {
+          "name": "expires_at_tick",
+          "tag": 4,
+          "type": "u64",
+          "required": true
+        },
+        {
+          "name": "resource_pages",
+          "tag": 5,
+          "type": "u64",
+          "required": false
+        }
+      ]
+    },
+    {
+      "name": "supervisor_health",
+      "opcode": 514,
+      "fields": [
+        {
+          "name": "component",
+          "tag": 1,
+          "type": "u64",
+          "required": true
+        },
+        {
+          "name": "incarnation",
+          "tag": 2,
+          "type": "u64",
+          "required": true
+        },
+        {
+          "name": "challenge",
+          "tag": 3,
+          "type": "u64",
+          "required": true
+        },
+        {
+          "name": "status",
+          "tag": 4,
+          "type": "u16",
+          "required": true
+        }
+      ]
+    },
+    {
+      "name": "update_approval",
+      "opcode": 515,
+      "fields": [
+        {
+          "name": "component",
+          "tag": 1,
+          "type": "u64",
+          "required": true
+        },
+        {
+          "name": "candidate_epoch",
+          "tag": 2,
+          "type": "u64",
+          "required": true
+        },
+        {
+          "name": "candidate_digest",
+          "tag": 3,
+          "type": "bytes",
+          "required": true,
+          "max_len": 32
+        },
+        {
+          "name": "trial_deadline",
+          "tag": 4,
+          "type": "u64",
+          "required": true
+        }
+      ]
+    },
+    {
+      "name": "checkpoint_state",
+      "opcode": 516,
+      "fields": [
+        {
+          "name": "service",
+          "tag": 1,
+          "type": "u64",
+          "required": true
+        },
+        {
+          "name": "record_key_hi",
+          "tag": 2,
+          "type": "u64",
+          "required": true
+        },
+        {
+          "name": "record_key_lo",
+          "tag": 3,
+          "type": "u64",
+          "required": true
+        },
+        {
+          "name": "revision",
+          "tag": 4,
+          "type": "u64",
+          "required": true
+        },
+        {
+          "name": "value",
+          "tag": 5,
+          "type": "bytes",
+          "required": false,
+          "max_len": 64
+        }
+      ]
+    }
+  ]
+}

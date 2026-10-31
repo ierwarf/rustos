@@ -2,12 +2,12 @@ name: Ring3 component model
 
 on:
   push:
-    branches: [master]
+    branches: [master, ring3-declarative-idl]
   pull_request:
-    branches: [master]
+    branches: [master, ring3-declarative-idl]
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   model:
@@ -19,6 +19,22 @@ jobs:
         run: |
           toolchain="$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)"
           rustup toolchain install "$toolchain" --profile minimal --component rustfmt
+      - name: Generate declarative Ring3 IDL
+        run: |
+          python3 tools/ring3_idl_codegen.py --write
+          cargo fmt -p rustos-component-model
+      - name: Save generated IDL in staging only
+        if: github.ref == 'refs/heads/ring3-declarative-idl'
+        run: |
+          git add libs/rustos-component-model/src/lib.rs libs/rustos-component-model/src/generated_idl.rs
+          if ! git diff --cached --quiet; then
+            git config user.name "rustos-ring3-checks[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit -m "build: synchronize generated control-plane IDL"
+            git push origin HEAD:refs/heads/ring3-declarative-idl
+          fi
+      - name: Verify generated IDL is deterministic
+        run: python3 tools/ring3_idl_codegen.py --check
       - name: Check component formatting
         run: |
           cargo fmt -p rustos-component-model -- --check
