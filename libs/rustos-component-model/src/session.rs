@@ -325,10 +325,28 @@ mod tests {
     #[test]
     fn revoked_offer_never_revalidates_old_client_session_after_reissue() {
         let mut g = Graph::new(Moniker::new("root").unwrap(), 1, 4).unwrap();
-        let client = g.create(g.root(), Moniker::new("client").unwrap(), 2, JobCeiling::ALL,
-            Quota::UNLIMITED, RestartPolicy::NEVER, false).unwrap();
-        let provider = g.create(g.root(), Moniker::new("server").unwrap(), 3, JobCeiling::ALL,
-            Quota::UNLIMITED, RestartPolicy::NEVER, false).unwrap();
+        let client = g
+            .create(
+                g.root(),
+                Moniker::new("client").unwrap(),
+                2,
+                JobCeiling::ALL,
+                Quota::UNLIMITED,
+                RestartPolicy::NEVER,
+                false,
+            )
+            .unwrap();
+        let provider = g
+            .create(
+                g.root(),
+                Moniker::new("server").unwrap(),
+                3,
+                JobCeiling::ALL,
+                Quota::UNLIMITED,
+                RestartPolicy::NEVER,
+                false,
+            )
+            .unwrap();
         g.activate(client).unwrap();
         g.activate(provider).unwrap();
         let cap = Moniker::new("storage").unwrap();
@@ -336,14 +354,22 @@ mod tests {
         g.offer(provider, client, cap, 0b01).unwrap();
         let original_epoch = g.resolve(client, provider, cap).unwrap().epoch;
         let mut sessions = Sessions::new(4).unwrap();
-        let charge = Charge { sessions: 1, ..Charge::ZERO };
-        let first = sessions.open(&mut g, client, provider, cap, charge, 10, 200).unwrap();
+        let charge = Charge {
+            sessions: 1,
+            ..Charge::ZERO
+        };
+        let first = sessions
+            .open(&mut g, client, provider, cap, charge, 10, 200)
+            .unwrap();
         assert!(sessions.inspect(&g, first, 11).is_ok());
 
         assert!(g.withdraw_offer(provider, client, cap));
         assert_eq!(sessions.inspect(&g, first, 12), Err(SessionError::Denied));
         g.offer(provider, client, cap, 0b01).unwrap();
-        assert_ne!(original_epoch, g.resolve(client, provider, cap).unwrap().epoch);
+        assert_ne!(
+            original_epoch,
+            g.resolve(client, provider, cap).unwrap().epoch
+        );
         assert_eq!(sessions.inspect(&g, first, 13), Err(SessionError::Stale));
 
         // Expiry scavenging also revokes the old charge without waiting for
@@ -351,7 +377,9 @@ mod tests {
         assert_eq!(sessions.expire(&mut g, 14, 1), Ok(1));
         assert_eq!(g.inspect(client).unwrap().used.sessions, 0);
         assert_eq!(sessions.close(&mut g, first), Err(SessionError::Stale));
-        let second = sessions.open(&mut g, client, provider, cap, charge, 15, 200).unwrap();
+        let second = sessions
+            .open(&mut g, client, provider, cap, charge, 15, 200)
+            .unwrap();
         assert_ne!(first.generation, second.generation);
         assert!(sessions.inspect(&g, second, 15).is_ok());
     }
@@ -359,19 +387,53 @@ mod tests {
     #[test]
     fn session_admission_requires_one_client_session_unit() {
         let mut g = Graph::new(Moniker::new("root").unwrap(), 1, 4).unwrap();
-        let client = g.create(g.root(), Moniker::new("client").unwrap(), 2, JobCeiling::ALL,
-            Quota::UNLIMITED, RestartPolicy::NEVER, false).unwrap();
-        let provider = g.create(g.root(), Moniker::new("server").unwrap(), 3, JobCeiling::ALL,
-            Quota::UNLIMITED, RestartPolicy::NEVER, false).unwrap();
+        let client = g
+            .create(
+                g.root(),
+                Moniker::new("client").unwrap(),
+                2,
+                JobCeiling::ALL,
+                Quota::UNLIMITED,
+                RestartPolicy::NEVER,
+                false,
+            )
+            .unwrap();
+        let provider = g
+            .create(
+                g.root(),
+                Moniker::new("server").unwrap(),
+                3,
+                JobCeiling::ALL,
+                Quota::UNLIMITED,
+                RestartPolicy::NEVER,
+                false,
+            )
+            .unwrap();
         g.activate(client).unwrap();
         g.activate(provider).unwrap();
         let name = Moniker::new("cap").unwrap();
         g.publish(provider, name, 1).unwrap();
         g.offer(provider, client, name, 1).unwrap();
         let mut sessions = Sessions::new(4).unwrap();
-        assert_eq!(sessions.open(&mut g, client, provider, name, Charge::ZERO, 1, 30), Err(SessionError::Invalid));
-        assert_eq!(sessions.open(&mut g, client, provider, name,
-            Charge { sessions: 2, ..Charge::ZERO }, 1, 30), Err(SessionError::Invalid));
+        assert_eq!(
+            sessions.open(&mut g, client, provider, name, Charge::ZERO, 1, 30),
+            Err(SessionError::Invalid)
+        );
+        assert_eq!(
+            sessions.open(
+                &mut g,
+                client,
+                provider,
+                name,
+                Charge {
+                    sessions: 2,
+                    ..Charge::ZERO
+                },
+                1,
+                30
+            ),
+            Err(SessionError::Invalid)
+        );
         assert_eq!(sessions.live_count(), 0);
         assert_eq!(g.inspect(client).unwrap().used.sessions, 0);
     }
