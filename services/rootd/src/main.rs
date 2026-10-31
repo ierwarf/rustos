@@ -711,10 +711,13 @@ fn revoke_post_init_dependents_with(
     mut revoke_endpoint: impl FnMut(u64) -> Result<(), i32>,
     mut terminate: impl FnMut(u64) -> Result<(), i32>,
 ) -> Result<(), i32> {
-    // The graph is fixed and acyclic by admission policy: initd reports the
-    // post-init services, and sessiond alone may report uiserver. Revoke the
-    // complete descendant closure in this rootd turn so a child cannot retain
-    // capability authority until its parent's later lifecycle notification.
+    // A fixed-size first pass computes the entire descendant closure without
+    // changing leases or invoking fallible kernel operations. A malformed
+    // reporter graph must fail before any partial revocation is attempted.
+    if post_init_leases.len() > POST_INIT_MANIFEST.len() {
+        return Err(75);
+    }
+    let mut selected = [false; POST_INIT_MANIFEST.len()];
     let mut reporters = [0_u64; POST_INIT_MANIFEST.len() + 1];
     reporters[0] = reporter_pid;
     let mut reporter_count = 1_usize;
@@ -722,26 +725,37 @@ fn revoke_post_init_dependents_with(
     while cursor < reporter_count {
         let current_reporter = reporters[cursor];
         cursor += 1;
-        for lease in post_init_leases.iter_mut() {
-            if lease.reporter_pid != current_reporter || lease.state != ROOTD_LEASE_STATE_RUNNING {
+        for (index, lease) in post_init_leases.iter().enumerate() {
+            if selected[index]
+                || lease.reporter_pid != current_reporter
+                || lease.state != ROOTD_LEASE_STATE_RUNNING
+            {
                 continue;
             }
-            let child_pid = lease.pid;
-            // Endpoint revocation is the authority linearization point. A
-            // terminate request may return before the scheduler completes
-            // process teardown, so waiting for exit cleanup would leave a
-            // stale cached capability window.
+            if lease.pid == 0 || reporter_count == reporters.len() {
+                return Err(75);
+            }
+            selected[index] = true;
+            reporters[reporter_count] = lease.pid;
+            reporter_count += 1;
+        }
+    }
+
+    // Revoke every selected endpoint before initiating *any* process
+    // termination. Kernel termination can be asynchronous; a descendant
+    // must not retain an endpoint while its parent's cleanup is pending.
+    // A syscall failure is fatal to the production supervisor, so no
+    // partially revoked graph is ever reported as a successful recovery.
+    for (index, lease) in post_init_leases.iter().enumerate() {
+        if selected[index] {
             revoke_endpoint(lease.service_id)?;
-            terminate(child_pid)?;
+        }
+    }
+    for (index, lease) in post_init_leases.iter_mut().enumerate() {
+        if selected[index] {
+            terminate(lease.pid)?;
             lease.state = ROOTD_LEASE_STATE_EXITED;
             lease.exit_status = 9;
-            if child_pid != 0 && !reporters[..reporter_count].contains(&child_pid) {
-                if reporter_count == reporters.len() {
-                    return Err(75);
-                }
-                reporters[reporter_count] = child_pid;
-                reporter_count += 1;
-            }
         }
     }
     Ok(())
@@ -3416,6 +3430,8 @@ mod tests {
         let mut terminated_count = 0_usize;
         let mut revoked = [0_u64; 2];
         let mut revoked_count = 0_usize;
+        let event_order = core::cell::RefCell::new([(false, 0_u64); 4]);
+        let events = core::cell::Cell::new(0_usize);
         assert_eq!(
             revoke_post_init_dependents_with(
                 &mut post_init,
@@ -3423,11 +3439,15 @@ mod tests {
                 |service_id| {
                     revoked[revoked_count] = service_id;
                     revoked_count += 1;
+                    event_order.borrow_mut()[events.get()] = (false, service_id);
+                    events.set(events.get() + 1);
                     Ok(())
                 },
                 |pid| {
                     terminated[terminated_count] = pid;
                     terminated_count += 1;
+                    event_order.borrow_mut()[events.get()] = (true, pid);
+                    events.set(events.get() + 1);
                     Ok(())
                 },
             ),
@@ -3438,6 +3458,15 @@ mod tests {
             &[IPC_SERVICE_SESSIOND, IPC_SERVICE_UISERVER]
         );
         assert_eq!(&terminated[..terminated_count], &[73, 74]);
+        assert_eq!(
+            *event_order.borrow(),
+            [
+                (false, IPC_SERVICE_SESSIOND),
+                (false, IPC_SERVICE_UISERVER),
+                (true, 73),
+                (true, 74),
+            ]
+        );
         assert!(
             post_init
                 .iter()

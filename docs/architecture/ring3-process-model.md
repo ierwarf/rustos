@@ -13,7 +13,7 @@ user-page accounting (2b) and application Job placement have landed. JobPolicy
 v1's 256-bit ceiling is implemented as a **partial step 3a**; the complete
 legacy-capability cutover has not. Kernel-memory accounting,
 `memory.high/min`, unified service/runtime/IDL, component supervision,
-client-funded sessions, personality servers and operability work remain open.
+client-funded sessions, personality servers and operability work remain open.\nA no_std component-policy model, generated staging IDL, validated rootd role and\nroute manifests, bounded rootd checkpoints and runtimed console sessions\nare implemented, but **do not yet constitute a completed production cutover**.
 See [Job Model as-built sections](job-model.md#phase-1-as-built) for exact status.
 Dated tests there are not automatically current release evidence.
 
@@ -37,9 +37,9 @@ identity/authority and fragmented lifecycle supervision are not yet retired.
 | Job and resident memory | Generation-bound Job tree, hierarchical counted limits and resident-page charge implemented; kernel-memory and high/min policies open | [Job model](job-model.md#phase-2b-ii-memory-limit-as-built) |
 | Application isolation | Loader application-job placement implemented; opt-in limit evidence is not general stability acceptance | [Job model](job-model.md#application-placement-step-0a-as-built-limit-proof-still-open) |
 | JobPolicy | 256-bit v1 ceiling and GET/SET operations exist, but service-capability cutover is incomplete | [job policy ABI](../../libs/rustos-user-abi/src/syscall/job_policy.rs) |
-| Service discovery | Fixed numeric IDs, legacy capability bits, fixed registration/manifest contracts | [service ABI](../../libs/rustos-user-abi/src/syscall.rs), [rootd manifest](../../services/rootd/src/service_manifest.rs) |
+| Service discovery | Immutable rootd service-role and routing manifests now validate legacy-equivalent positive policy; live registration still uses fixed numeric IDs | [service ABI](../../libs/rustos-user-abi/src/syscall.rs), [rootd manifest](../../services/rootd/src/service_manifest.rs) |
 | Supervision | `rootd`, `initd`, `runtimed` and `sessiond` retain distinct lifecycle responsibilities | [Services](services.md) |
-| IPC wire/runtime | Hand-authored, versioned wire structures and heterogeneous service runtimes; unified IDL and component manager are proposals | [ABI contract](../ai/contracts-abi.md) |
+| IPC wire/runtime | Existing production wire structs and heterogeneous runtimes; generated IDL is staging-only and does not authorize live IPC | [ABI contract](../ai/contracts-abi.md) |
 
 The **historical** audit found 32 static process slots and no per-job quotas.
 Do not repeat those findings as current implementation facts. The original
@@ -112,15 +112,16 @@ topology, so a component cannot reach what no ancestor passed down)**.
 | 1 | Root Job, membership and group kill | Implemented |
 | 2 | Chunked process directory; job process/thread and resident memory quotas | Partly implemented: 2a/2b landed; `kmem.max_bytes`, `memory.high/min` open |
 | 3 | Replace legacy service authority with Job policy | JobPolicy 3a exists; cutover unproven |
-| 4 | Generated IDL and unified service runtime | Planned |
-| 5 | Declarative components, realms, capability routing and one supervisor | Planned |
-| 6 | Client-funded session quotas | Planned |
-| 7 | Linux/Windows personality servers and ring0 policy reduction | Planned |
-| 8 | Operational logs, crash reporting, health and rollback | Planned |
+| 4 | Generated IDL and unified service runtime | Generated staging control schemas and canonical codec implemented; production binding and runtime migration open |
+| 5 | Declarative components, realms, capability routing and one supervisor | Component graph and immutable rootd route/role manifests implemented; unified live supervisor and kernel capability transfer open |
+| 6 | Client-funded session quotas | Bounded session policy model and runtimed local 256-console-session ceiling implemented; kernel-backed client billing open |
+| 7 | Linux/Windows personality servers and ring0 policy reduction | Existing service brokers preserved; remaining slowpath-only migration unproven; ring0 hot paths deliberately untouched |
+| 8 | Operational logs, crash reporting, health and rollback | Health/update policy models, rootd checkpoint and transitive service revocation implemented; durable recovery and verified rollback open |
 
-Steps 4 and 5 can be planned independently after the Job foundation, but each
+The staging work for steps 4–8 exists in source, but each production
 authority/lifecycle transition still needs source and KVM evidence before old
-routes are deleted. See the separate [TLB design](tlb-shootdown-design.md):
+routes are deleted. See [the Ring3 cutover ledger](ring3-component-model.md)
+for implemented-vs-model-only boundaries. See the separate [TLB design](tlb-shootdown-design.md):
 its redesign is outside this service-model roadmap.
 
 ### 7. What the OOM work already built is reused
@@ -156,9 +157,12 @@ its redesign is outside this service-model roadmap.
 디렉터리 청크화(2a), 프로세스·스레드 한도 및 상주 사용자 페이지 과금(2b),
 애플리케이션 Job 배치가 구현되었습니다. JobPolicy v1의 256비트
 한도도 구현되었지만 기존 서비스 권한 비트 대체는 끝나지 않았습니다.
+Ring3 컴포넌트 정책 모델, 스테이징 IDL 생성, rootd의 역할/라우팅
+매니페스트, 체크포인트와 runtimed 콘솔 세션 상한은 구현되었습니다.
+다만 실제 서비스·커널 권한의 전체 전환을 완료했다는 뜻은 아닙니다.
 
 다음 구조적 작업은 `kmem.max_bytes`, `memory.high/min`, 서비스
-capability 라우팅, 단일 컴포넌트 감독, 공통 런타임/IDL,
+커널에서 강제되는 capability 라우팅, 단일 컴포넌트 감독, 운영 ABI/IDL 전환,
 클라이언트 부담 세션 쿼터, personality 서버와 운영성 확장입니다.
 과거 감사의 '프로세스 32개 고정 배열·Job 과금 없음'은 현재 사실이
 아닙니다. 기본 한도 32개와 내부 청크 디렉터리 상한 4,096개를

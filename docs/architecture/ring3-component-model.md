@@ -68,6 +68,10 @@ library as replacing the existing rootd/Job/IPC authorities.
   before creating a child, and only advance the handle after success. This
   is a Ring3 *local quota*; it does not replace kernel Job charging or make
   the in-memory policy session ticket kernel-authoritative.
+- On reporter exit, rootd now computes the bounded post-init dependent closure
+  before changing any lease; it revokes all selected service endpoints before
+  initiating any descendant process termination. This prevents a child from
+  retaining its route while the parent awaits asynchronous termination.
 - `rootd` and the component model have focused host tests; this work
   leaves the live fixed service registry and exact kernel lease owner intact.
 
