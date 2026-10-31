@@ -27,6 +27,7 @@
 extern crate alloc;
 
 mod control_drain;
+mod component_policy;
 mod jobs;
 mod job_policy;
 mod job_policy_probe;
@@ -219,6 +220,9 @@ pub extern "C" fn __rustos_rootd_start() -> ! {
         jobs::limit_probe_child();
     }
     debug_line(b"rootd: bootstrap enter\n");
+    if component_policy::preflight().is_err() {
+        fail_closed(b"rootd: fatal component manifest preflight failed\n");
+    }
     let endpoint = create_rootd_endpoint();
     let mut leases = [
         lease(BOOTSTRAP_MANIFEST[0]),

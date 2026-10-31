@@ -2,7 +2,7 @@ name: Ring3 component model
 
 on:
   push:
-    branches: [master]
+    branches: [master, ring3-staged-integration]
   pull_request:
     branches: [master]
 
@@ -23,3 +23,5 @@ jobs:
         run: cargo fmt -p rustos-component-model -- --check
       - name: Run component-model tests
         run: cargo test -p rustos-component-model --locked
+      - name: Run rootd unit tests
+        run: cargo test -p rootd --features host-test --locked

@@ -19,11 +19,15 @@ extern crate alloc;
 pub mod identity;
 pub mod manifest;
 pub mod policy;
+pub mod pressure;
 pub mod quota;
 pub mod realm;
 pub mod routing;
+pub mod session;
 pub mod supervision;
 pub mod telemetry;
+pub mod health;
+pub mod update;
 pub mod wire;
 
 pub use identity::{ComponentId, Moniker, MonikerError};
