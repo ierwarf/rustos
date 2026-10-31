@@ -247,3 +247,27 @@ partial socketpair refund failure. Failures after object removal can leave
 an uncertain accounting receipt. No KVM, compile, cargo tests, dynamic
 sanitizers, fault injection, or perf measurements were run. Vfsd still
 uses a staged but inactive open-description adapter.
+
+## 2026-11-01 provider final-reference/restart continuation (UNVERIFIED)
+
+An additional batch replaces the inactive vfsd provider adapter with a
+no_std receive-owner billing manager and hooks actual VFS OPENAT, checkpoint
+replay, final-close/tombstone and rollback on failed OPEN checkpoint.
+After vfsd restart, a replayed unbilled open description cannot perform
+read/fcntl/cursor operations until it is rebound through the exact OPENAT
+admission and funded against the current client Job.
+
+netd now retains ambiguous socket final-close refunds in a bounded
+deduplicated queue and retries original tokens in a dedicated slow-control
+worker, rather than reflecting an uncertain Job refund as a repeatable
+close of a socket that already disappeared. Rootd now keeps settled receipt
+tombstones for duplicate release ACKs, rejects recharging spent tokens, and
+includes additional static unit tests around lost ACKs, wrong owners and
+process exit drain failures.
+
+Crucial defects and acceptance holes remain: no sustained operation after
+rootd's bounded settled-tombstone capacity is exhausted, netd refund queue
+capacity/worker termination, vfsd bootstrap control dependency cycles,
+provider PID reuse, actual kernel token and source-fd binding, reconnect
+semantics, and missing end-to-end generated-IDL 520 adoption. No compiler,
+boot, unit tests, stress, CI, or audit script was executed.

@@ -545,6 +545,9 @@ fn demote_after_ui_bootstrap_snapshot_reply() {
 }
 
 struct VfsState {
+    /// Per-provider client-funded open-description tickets. This is NOT
+    /// transferred into a kernel allocation or used in a syscall hotpath.
+    billing: Option<provider_accounting::OpenDescriptionBilling>,
     cwd: BTreeMap<u64, String>,
     handles: BTreeMap<u64, RemoteHandle>,
     epolls: WaitSetRegistry,

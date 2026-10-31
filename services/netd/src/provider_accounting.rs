@@ -1,15 +1,78 @@
 //! netd slow-path per-socket client Job accounting adapter.
 //!
-//! This adapter is staged and imported, but the actual socket open/final
-//! close dispatch is not yet cut over: socketpair, accept, listen retirement,
-//! DVM publication and borrowed refs all need one coordinated call-site
-//! migration. It must not take NetState while performing rootd IPC.
+//! Socket publication/last-close are now wired. An independent pending
+//! refund worker resolves ambiguous ACKs without extending kernel socket
+//! lifetime. More fault injection is required at broker publication and
+//! queued accept/cancellation boundaries. No NetState lock crosses rootd IPC.
 use std::sync::{Mutex,OnceLock};
+use std::collections::VecDeque;
+use std::thread;
+use std::time::Duration;
 use rustos_svc_runtime::provider_client::{self,ProviderClient,Receipt,State,Error};
 use rustos_component_model::provider_wire::Frame;
 use rustos_user_abi::syscall::IPC_SERVICE_NETD;
 const RETRIES:usize=3;
 static CLIENT:OnceLock<Result<Mutex<ProviderClient>,i32>>=OnceLock::new();
+// A close is logically final once the provider has withdrawn the object.
+// Ambiguous kernel accounting is retained as an exact token and refunded by
+// the control worker, not reported as a retryable socket close that could
+// decrement a newly reused file descriptor.
+const MAX_PENDING_REFUNDS:usize=4096;
+static PENDING_REFUNDS:OnceLock<Mutex<VecDeque<u64>>>=OnceLock::new();
+static REFUND_WORKER:OnceLock<()>=OnceLock::new();
+fn pending_refunds()->&'static Mutex<VecDeque<u64>> {
+    PENDING_REFUNDS.get_or_init(||Mutex::new(VecDeque::new()))
+}
+fn start_refund_worker() {
+    REFUND_WORKER.get_or_init(||{
+        thread::Builder::new()
+            .name("netd-session-refund".into())
+            .spawn(refund_worker)
+            .expect("netd: refund worker required for exact session custody");
+    });
+}
+fn enqueue_refund(token:u64)->Result<(),i32>{
+    if token==0 {return Err(libc::EINVAL)}
+    let mut q=pending_refunds().lock().map_err(|_|libc::EIO)?;
+    if q.contains(&token){return Ok(())}
+    if q.len()>=MAX_PENDING_REFUNDS{return Err(libc::ENOSPC)}
+    q.push_back(token);
+    Ok(())
+}
+fn refund_worker() {
+    loop {
+        let token=pending_refunds().lock().ok()
+            .and_then(|mut q|q.pop_front());
+        match token {
+            Some(token)=>{
+                // A lost CHARGE ACK must be reconciled before releasing
+                // the same kernel token. Never use a second charge ID.
+                let success=recheck_ambiguous(token)
+                    .and_then(|()|release_if_funded(token)).is_ok();
+                if !success {
+                    // Retry the exact token. Do not invent an errno-success
+                    // state merely because the socket itself is already gone.
+                    let _=enqueue_refund(token);
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+            None=>thread::sleep(Duration::from_millis(20)),
+        }
+    }
+}
+/// Retire an already withdrawn socket identity. When rootd's control IPC
+/// returns an ambiguous result, retain the exact provider token while the
+/// local socket close continues to report its independently settled result.
+pub(super) fn retire_final(token:u64)->Result<(),i32>{
+    match release_if_funded(token){
+        Ok(())=>Ok(()),
+        Err(_err)=>{
+            start_refund_worker();
+            enqueue_refund(token)
+        }
+    }
+}
+
 fn ledger()->Result<&'static Mutex<ProviderClient>,i32>{
     match CLIENT.get_or_init(||{
         let pid=unsafe{libc::syscall(libc::SYS_getpid)} as i64;
@@ -49,6 +112,7 @@ fn rpc_retry(request:Frame)->Result<Frame,i32>{
 }
 pub(super) fn charge_before_publish(token:u64,client_pid:u64)
     ->Result<Receipt,i32>{
+    start_refund_worker();
     // Prepare the request before any rootd IPC. The same token must survive
     // an ambiguous ACK. This function is never called under NetState lock.
     let req={

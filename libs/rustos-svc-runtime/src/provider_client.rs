@@ -6,7 +6,10 @@
 use alloc::collections::BTreeMap;
 use core::mem::size_of;
 use rustos_component_model::provider_wire::{self, Frame, Operation, Phase};
-use rustos_user_abi::linux;
+// Native x86_64 Linux ABI syscall numbers, also valid without optional
+// rustos-user-abi linux-compat-state feature (svc-runtime is no_std).
+const SYS_GETPID: u64 = 39;
+const SYS_GETTID: u64 = 186;
 use rustos_user_abi::performance::IPC_BOOT_CONTROL_HARD_LIMIT_MS;
 use rustos_user_abi::syscall::{
     CommercialMaxProtocolRequest,CommercialMaxProtocolResponse,
@@ -107,6 +110,8 @@ impl ProviderClient {
             job_generation:e.frame.client_job_generation,
             kernel_receipt:0})
     }
+    /// After any uncertain refund, no subsequent charge can reuse this
+    /// service-local session ID until terminal kernel custody is proven.
     pub fn begin_release(&mut self,session:u64)->Result<Frame,Error>{
         let next_id=self.next_request_id.checked_add(1).ok_or(Error::Overflow)?;
         let e=self.sessions.get_mut(&session).ok_or(Error::Missing)?;
@@ -157,6 +162,11 @@ impl ProviderClient {
         self.epoch=new_epoch;self.next_nonce=0;
         self.next_request_id=0;Ok(())
     }
+    pub fn pending_count(&self)->usize {
+        self.sessions.values().filter(|e|matches!(e.state,
+            State::ChargeInFlight|State::ReleaseInFlight|
+            State::ReleasePrepared)).count()
+    }
     pub fn unresolved(&self,mut f:impl FnMut(u64,State,Frame)){
         for (id,e) in &self.sessions {
             if e.state!=State::Funded {f(*id,e.state,e.frame)}
@@ -174,8 +184,8 @@ pub fn call_rootd(frame:Frame)->Result<Frame,i32>{
     };
     let endpoint=ipc::lookup_service_endpoint(IPC_SERVICE_ROOTD);
     if endpoint<=0{return Err(if endpoint==0{EPROTO}else{(-endpoint) as i32})}
-    let pid=unsafe{syscall::syscall0(linux::SYS_GETPID)};
-    let tid=unsafe{syscall::syscall0(linux::SYS_GETTID)};
+    let pid=unsafe{syscall::syscall0(SYS_GETPID)};
+    let tid=unsafe{syscall::syscall0(SYS_GETTID)};
     if pid<=0||tid<=0||frame.provider_pid!=pid as u64{return Err(EINVAL)}
     let bytes=provider_wire::encode(frame).map_err(|_|EINVAL)?;
     let mut req=CommercialMaxProtocolRequest::default();

@@ -151,6 +151,9 @@ impl VfsState {
             expected.operation_hi = operation_hi;
             expected.operation_lo = operation_lo;
             return if current == expected && handle.path == path {
+                // An idempotent open replay may arrive after a lost receipt
+                // or a restarted vfsd. Fund only once per exact description.
+                self.bill_open_description(id, request.pid)?;
                 Ok((id, handle))
             } else {
                 Err(EINVAL)
@@ -181,12 +184,22 @@ impl VfsState {
             last_start: flags,
             last_result: 0,
         };
-        self.checkpoint_open_description(request, id, &handle)
-            .inspect_err(|&errno| {
-                debug_line(&format!(
-                    "vfsd: open failed stage=checkpoint errno={errno} path={path}"
-                ));
-            })?;
+        // Never publish a new open description without charging its exact
+        // client Job. The storage metadata lock has been dropped above and
+        // the rootd control IPC runs in the service receiver, not ring0.
+        self.bill_open_description(id, request.pid)?;
+        if let Err(errno)=self.checkpoint_open_description(request, id, &handle) {
+            // A checkpoint partial write can be replayed, but its unexposed
+            // session charge must not leak when an OPEN did not complete.
+            // The exact ticket survives if the refund ACK is ambiguous.
+            let refund=self.refund_open_description(id);
+            if refund.is_err() {
+                return Err(EBUSY);
+            }
+            return Err(errno);
+        }
+        // This source point remains before the live handle table insert.
+        // No later fallible transition may forget this exact client ticket.
         if self.handles.insert(id, handle.clone()).is_some() {
             debug_line(&format!(
                 "vfsd: open failed stage=install errno={EIO} path={path}"

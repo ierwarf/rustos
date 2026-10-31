@@ -1615,6 +1615,7 @@ fn handle_socket(request: &NetdIpcRequest, response: &mut NetdIpcResponse, reply
         // Charge the *calling process Job* before publishing a socket
         // identity. No NetState lock is held over the rootd IPC.
         if let Err(errno)=provider_accounting::charge_before_publish(token,request.pid){
+            let _=provider_accounting::retire_final(token);
             return errno;
         }
         let mut state = net_state().lock().unwrap();
@@ -1628,7 +1629,7 @@ fn handle_socket(request: &NetdIpcRequest, response: &mut NetdIpcResponse, reply
             Ok(tcp) => tcp,
             Err(errno) => {
                 drop(state);
-                let _=provider_accounting::release_after_final_close(token);
+                let _=provider_accounting::retire_final(token);
                 return errno;
             }
         };
@@ -1652,12 +1653,13 @@ fn handle_socket(request: &NetdIpcRequest, response: &mut NetdIpcResponse, reply
         Err(errno) => return errno,
     };
     if let Err(errno)=provider_accounting::charge_before_publish(token,request.pid){
+        let _=provider_accounting::retire_final(token);
         return errno;
     }
     let mut state = net_state().lock().unwrap();
     if !state.token_available(token) {
         drop(state);
-        let _=provider_accounting::release_after_final_close(token);
+        let _=provider_accounting::retire_final(token);
         return libc::EAGAIN;
     }
     state.sockets.insert(
@@ -1694,17 +1696,19 @@ fn handle_socketpair(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -
     // Socketpair owns two independently closeable descriptions. Fund each
     // once and unwind the first if the second is denied before publication.
     if let Err(errno)=provider_accounting::charge_before_publish(left,request.pid){
+        let _=provider_accounting::retire_final(left);
         return errno;
     }
     if let Err(errno)=provider_accounting::charge_before_publish(right,request.pid){
-        let _=provider_accounting::release_after_final_close(left);
+        let _=provider_accounting::retire_final(right);
+        let _=provider_accounting::retire_final(left);
         return errno;
     }
     let mut state = net_state().lock().unwrap();
     if left == right || !state.token_available(left) || !state.token_available(right) {
         drop(state);
-        let _=provider_accounting::release_after_final_close(left);
-        let _=provider_accounting::release_after_final_close(right);
+        let _=provider_accounting::retire_final(left);
+        let _=provider_accounting::retire_final(right);
         return libc::EAGAIN;
     }
     state.sockets.insert(
@@ -1793,7 +1797,7 @@ fn handle_close(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32
         }
         drop(state);
         // No local socket lock crosses the rootd billing control IPC.
-        return provider_accounting::release_if_funded(request.socket_token);
+        return provider_accounting::retire_final(request.socket_token).err().unwrap_or(0);
     }
     let Some(socket) = state.sockets.get_mut(&request.socket_token) else {
         return libc::EBADF;
@@ -1809,7 +1813,7 @@ fn handle_close(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32
     encode_retired_socket_release(retired, response);
     let mut refund_error=0;
     for token in retired_tokens {
-        if let Err(errno)=provider_accounting::release_if_funded(token) {
+        if let Err(errno)=provider_accounting::retire_final(token) {
             // A missing ACK must leave the exact token in the client book.
             if refund_error==0{refund_error=errno}
         }
@@ -2227,12 +2231,12 @@ fn handle_accept(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i3
     // Internal not-yet-public accepted sockets may be unfunded; the refund
     // predicate treats those as no-op rather than charging a ghost session.
     for token in tokens {
-        let _=provider_accounting::release_if_funded(token);
+        let _=provider_accounting::retire_final(token);
     }
     if result!=0 {
         // A failed broker publication may requeue the accepted endpoint.
         // Its charge is not permitted to survive the failed public handoff.
-        let _=provider_accounting::release_if_funded(accepted);
+        let _=provider_accounting::retire_final(accepted);
     }
     advance_readiness_generation(&peers);
     result

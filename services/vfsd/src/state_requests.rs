@@ -127,6 +127,22 @@ impl VfsState {
             response.status = errno;
             return;
         }
+        // Restored checkpoint handles are structural descriptions, not a
+        // live kernel-funded client session. After a vfsd restart the old
+        // provider PID's charges have been drained by rootd. Reuse of the
+        // remote ID must first perform exact OPENAT replay/admission so a
+        // new provider incarnation can bind it to the current client Job.
+        // Fail closed rather than silently allowing unbilled reads/ioctls.
+        if self.handles.contains_key(&request.remote_id)
+            && matches!(request.op,
+                VFS_IPC_OP_READ | VFS_IPC_OP_PREAD64 | VFS_IPC_OP_WRITE |
+                VFS_IPC_OP_LSEEK | VFS_IPC_OP_FSTAT | VFS_IPC_OP_GETDENTS64 |
+                VFS_IPC_OP_FCNTL | VFS_IPC_OP_CURSOR_SETTLE | VFS_IPC_OP_FTRUNCATE)
+            && !self.has_funded_open_description(request.remote_id,request.pid)
+        {
+            response.status=116; // ESTALE, forces reopen against new provider
+            return;
+        }
         match request.op {
             VFS_IPC_OP_OPENAT => self.vfs_openat(request, response),
             VFS_IPC_OP_CLOSE => self.vfs_close(request, response),

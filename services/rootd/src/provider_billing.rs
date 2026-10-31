@@ -51,9 +51,20 @@ impl ProviderBilling {
             let prior=self.funded[idx];
             if prior.client!=ticket.client || prior.session!=ticket.session
                 || prior.kind!=ticket.kind{return Err(EACCES)}
-            if prior.state!=State::Charged{return Err(EBUSY)}
-            return Ok(prior.charge_id)
+            return match prior.state {
+                State::Charged=>Ok(prior.charge_id),
+                State::Settled=>Err(ESTALE),
+                _=>Err(EBUSY),
+            }
         }
+        // Never reuse an already-seen token even if its receipt has been
+        // retained only as a settled tombstone. Clients must monotonically
+        // advance the provider epoch/nonce pair.
+        if self.funded.iter().any(|x|{
+            x.provider==ticket.provider
+                && x.token.epoch==ticket.token.epoch
+                && x.token.nonce>=ticket.token.nonce
+        }) {return Err(ESTALE)}
         if self.funded.len()>=MAX_PROVIDER_TICKETS{return Err(ENOSPC)}
         self.funded.try_reserve(1).map_err(|_|12)?;
         let kernel_token=self.next_kernel_token.checked_add(1).ok_or(75)?;
@@ -93,6 +104,7 @@ impl ProviderBilling {
             return Err(EACCES)
         }
         if e.state==State::Charged {return Ok(e.charge_id)}
+        if e.state==State::Settled {return Err(ESTALE)}
         if e.state!=State::ChargeUnknown {return Err(EBUSY)}
         let receipt=retry(e.client,owner.pid,e.kernel_token)?;
         if receipt==0 {return Err(ESTALE)}
@@ -112,12 +124,17 @@ impl ProviderBilling {
         let entry=self.funded[idx];
         if entry.client!=expected_client || entry.session!=expected_session
             || entry.kind!=expected_kind {return Err(EACCES)}
-        if !matches!(entry.state,State::Charged|State::ReleaseUnknown){
-            return Err(EBUSY)
+        match entry.state {
+            State::Settled => return Ok(()),
+            State::Charged|State::ReleaseUnknown=>{},
+            _=>return Err(EBUSY),
         }
         self.funded[idx].state=State::ReleaseUnknown;
         refund(entry.client.job,owner.pid,entry.kernel_token)?;
-        self.funded.swap_remove(idx);
+        // A successful refund is not the same as a delivered rootd reply.
+        // Keep the tombstone until provider exit, so retried releases receive
+        // the same success and the old token cannot be re-charged.
+        self.funded[idx].state=State::Settled;
         Ok(())
     }
     /// On provider exit, do NOT trust stale provider IPC to trigger refund.
@@ -159,6 +176,9 @@ impl ProviderBilling {
         for x in &self.funded {f(x.provider,x.client,x.kernel_token)}
     }
     pub(super) fn count(&self)->usize{self.funded.len()}
+    pub(super) fn unsettled_count(&self)->usize{
+        self.funded.iter().filter(|x|x.state!=State::Settled).count()
+    }
 }
 #[cfg(test)]
 mod tests{
@@ -180,7 +200,13 @@ mod tests{
         book.release(owner,ticket.token,8,client,1,ProviderKind::Socket,|job,p,t|{
             assert_eq!((job,p,t),(22,8,1));Ok(())
         }).unwrap();
-        assert_eq!(book.count(),0);
+        assert_eq!(book.count(),1);
+        assert_eq!(book.unsettled_count(),0);
+        // Exact retry is acknowledged without running the refund a second time.
+        book.release(owner,ticket.token,8,client,1,ProviderKind::Socket,
+            |_,_,_|panic!("cannot refund twice")).unwrap();
+        assert_eq!(book.charge(ticket,8,true,|_,_,_|panic!("cannot revive token")),
+            Err(ESTALE));
     }
 
     #[test]
@@ -198,4 +224,77 @@ mod tests{
         assert_eq!(drains,1);
         assert_eq!(book.count(),0);
     }
+    #[test]
+    fn uncertain_charge_reuses_same_kernel_token() {
+        let owner=Owner{service:3,pid:51,lease:9};
+        let client=Client{pid:71,job:0x100000003,job_generation:3};
+        let token=Token{epoch:9,nonce:11};
+        let ticket=Ticket{provider:owner,client,kind:ProviderKind::Socket,
+            session:81,token};
+        let mut book=ProviderBilling::new();
+        let mut issued=0;
+        assert_eq!(book.charge(ticket,51,true,|_,_,kernel_token|{
+            issued=kernel_token;Err(110)
+        }),Err(110));
+        assert_eq!(book.unknown_tokens_for_pid(51),1);
+        assert_eq!(book.reconcile_charge(owner,token,client,81,
+            ProviderKind::Socket,51,|_,pid,kernel_token|{
+            assert_eq!(pid,51);
+            assert_eq!(kernel_token,issued);
+            Ok(kernel_token)
+        }),Ok(issued));
+        assert_eq!(book.unknown_tokens_for_pid(51),0);
+    }
+
+    #[test]
+    fn uncertain_refund_never_recharges_a_settled_ticket() {
+        let owner=Owner{service:2,pid:62,lease:3};
+        let client=Client{pid:80,job:0x200000004,job_generation:4};
+        let token=Token{epoch:3,nonce:1};
+        let ticket=Ticket{provider:owner,client,kind:ProviderKind::OpenDescription,
+            session:47,token};
+        let mut book=ProviderBilling::new();
+        book.charge(ticket,62,true,|_,_,k|Ok(k)).unwrap();
+        assert_eq!(book.release(owner,token,62,client,47,
+            ProviderKind::OpenDescription,|_,_,_|Err(110)),Err(110));
+        assert_eq!(book.unknown_tokens_for_pid(62),1);
+        assert_eq!(book.release(owner,token,62,client,47,
+            ProviderKind::OpenDescription,|_,_,_|Ok(())),Ok(()));
+        assert_eq!(book.release(owner,token,62,client,47,
+            ProviderKind::OpenDescription,|_,_,_|Err(5)),Ok(()));
+        assert_eq!(book.unsettled_count(),0);
+    }
+
+    #[test]
+    fn wrong_client_job_or_session_cannot_claim_refund() {
+        let owner=Owner{service:3,pid:13,lease:10};
+        let client=Client{pid:9,job:0x300000001,job_generation:1};
+        let token=Token{epoch:10,nonce:4};
+        let ticket=Ticket{provider:owner,client,kind:ProviderKind::Socket,
+            session:71,token};
+        let mut book=ProviderBilling::new();
+        book.charge(ticket,13,true,|_,_,k|Ok(k)).unwrap();
+        assert_eq!(book.release(owner,token,13,
+            Client{pid:12,..client},71,ProviderKind::Socket,
+            |_,_,_|panic!("foreign refund")),Err(EACCES));
+        assert_eq!(book.release(owner,token,13,client,72,
+            ProviderKind::Socket,|_,_,_|panic!("wrong session")),Err(EACCES));
+        assert_eq!(book.unsettled_count(),1);
+    }
+
+    #[test]
+    fn failed_kernel_drain_keeps_provider_receipts() {
+        let owner=Owner{service:3,pid:300,lease:40};
+        let client=Client{pid:4,job:0x100000001,job_generation:1};
+        let token=Token{epoch:40,nonce:1};
+        let ticket=Ticket{provider:owner,client,kind:ProviderKind::Socket,
+            session:2,token};
+        let mut book=ProviderBilling::new();
+        book.charge(ticket,300,true,|_,_,k|Ok(k)).unwrap();
+        assert_eq!(book.owner_exit_pid(300,|_|Err(5)),Err(5));
+        assert_eq!(book.count(),1);
+        assert_eq!(book.owner_exit_pid(300,|_|Ok(())),Ok(1));
+        assert_eq!(book.count(),0);
+    }
+
 }

@@ -3,6 +3,7 @@
 impl VfsState {
     fn new() -> Self {
         Self {
+            billing: None,
             cwd: BTreeMap::new(),
             handles: BTreeMap::new(),
             epolls: WaitSetRegistry::default(),

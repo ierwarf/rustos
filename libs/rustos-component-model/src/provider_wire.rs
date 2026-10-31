@@ -55,6 +55,10 @@ impl Frame{
         if self.phase!=Phase::Request||self.kernel_receipt!=0||self.status!=0 {
             return Err(Error::Phase)
         }
+        if self.operation==Operation::Charge
+            && (self.client_job!=0||self.client_job_generation!=0){
+            return Err(Error::Invalid)
+        }
         Ok(())
     }
     pub fn validate_ack(self,request:Frame)->Result<(),Error>{
@@ -150,7 +154,7 @@ mod tests{
         let mut bad=bytes;bad[105]=1;
         assert_eq!(decode(&bad),Err(Error::Reserved));
         let mut ack=r;ack.phase=Phase::Committed;ack.kernel_receipt=99;
-        ack.client_job=5;ack.client_job_generation=9;
+        ack.client_job=0x100000009;ack.client_job_generation=9;
         assert_eq!(ack.validate_ack(r),Ok(()));
         ack.client_pid=21;
         assert_eq!(ack.validate_ack(r),Err(Error::WrongRequest));

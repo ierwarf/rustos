@@ -43,11 +43,19 @@ impl VfsState {
                     != (request.operation_hi, request.operation_lo)
                 {
                     response.status = EBADF;
+                } else if let Err(errno)=self.refund_open_description(request.remote_id) {
+                    // The close is already persistent, but a lost refund ACK
+                    // may still be pending in the provider's local token book.
+                    // A retry with the same close operation is allowed to
+                    // settle precisely that receipt, never a second charge.
+                    response.status = errno;
                 }
                 return;
             }
             if let Err(errno) = self.checkpoint_close_description(request, request.remote_id) {
                 response.status = errno;
+            } else if let Err(errno)=self.refund_open_description(request.remote_id) {
+                response.status=errno;
             }
             return;
         };
@@ -58,6 +66,11 @@ impl VfsState {
         match self.checkpoint_close_description(request, request.remote_id) {
             Ok(_) => {
                 self.handles.remove(&request.remote_id);
+                // A committed tombstone is a final reference, not just a
+                // request to close. The rootd receipt remains replayable.
+                if let Err(errno)=self.refund_open_description(request.remote_id){
+                    response.status=errno;
+                }
             }
             Err(errno) => response.status = errno,
         }
