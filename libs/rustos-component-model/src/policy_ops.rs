@@ -48,10 +48,14 @@ pub enum SlowBrokerOperation {
     CompactRecoveryCheckpoint = 33,
     ReadRecoveryCheckpoint = 34,
     ReclaimServiceLease = 35,
+    ResolveServiceRoute = 36,
+    ReadServicePrincipal = 37,
+    ChargeClientSession = 38,
+    ReportComponentHealth = 39,
 }
 
 impl SlowBrokerOperation {
-    pub const ALL: [Self; 36] = [
+    pub const ALL: [Self; 40] = [
         Self::SpawnProcess,
         Self::CreateJob,
         Self::SetJobLimits,
@@ -88,6 +92,10 @@ impl SlowBrokerOperation {
         Self::CompactRecoveryCheckpoint,
         Self::ReadRecoveryCheckpoint,
         Self::ReclaimServiceLease,
+        Self::ResolveServiceRoute,
+        Self::ReadServicePrincipal,
+        Self::ChargeClientSession,
+        Self::ReportComponentHealth,
     ];
 
     pub const fn operation(self) -> Operation {
