@@ -71,11 +71,18 @@ impl ServiceCheckpointStore {
             // A checkpoint key is unique across every parent within one
             // service. Without this, the same key could be reparented and
             // become ambiguous to a descendant or a compaction receipt.
-            if self.find_key(service_id, incoming.key_hi, incoming.key_lo).is_some() {
+            if self
+                .find_key(service_id, incoming.key_hi, incoming.key_lo)
+                .is_some()
+            {
                 return Err(ESTALE);
             }
             if self.records.len() >= SERVICE_CHECKPOINT_MAX_RECORDS
-                || self.records.iter().filter(|record| record.service_id == service_id).count()
+                || self
+                    .records
+                    .iter()
+                    .filter(|record| record.service_id == service_id)
+                    .count()
                     >= MAX_RECORDS_PER_SERVICE
             {
                 return Err(ENOSPC);
@@ -101,7 +108,11 @@ impl ServiceCheckpointStore {
                 if self.is_descendant(service_id, index, root_key)?
                     && self.records[index].wire.flags & SERVICE_CHECKPOINT_FLAG_TOMBSTONE == 0
                 {
-                    self.records[index].wire.revision.checked_add(1).ok_or(ESTALE)?;
+                    self.records[index]
+                        .wire
+                        .revision
+                        .checked_add(1)
+                        .ok_or(ESTALE)?;
                 }
             }
         }
@@ -190,7 +201,9 @@ impl ServiceCheckpointStore {
         // mutating the ledger. The allocation can fail without consuming the
         // proof or removing any other service's records.
         let mut remove = Vec::new();
-        remove.try_reserve_exact(self.records.len()).map_err(|_| ENOMEM)?;
+        remove
+            .try_reserve_exact(self.records.len())
+            .map_err(|_| ENOMEM)?;
         let root_key = (proof.key_hi, proof.key_lo);
         for i in 0..self.records.len() {
             let selected = i == index || self.is_descendant(service_id, i, root_key)?;
@@ -239,8 +252,13 @@ impl ServiceCheckpointStore {
             if parent == ancestor_key {
                 return Ok(true);
             }
-            let id = self.find_key(service_id, parent.0, parent.1).ok_or(ESTALE)?;
-            parent = (self.records[id].wire.parent_hi, self.records[id].wire.parent_lo);
+            let id = self
+                .find_key(service_id, parent.0, parent.1)
+                .ok_or(ESTALE)?;
+            parent = (
+                self.records[id].wire.parent_hi,
+                self.records[id].wire.parent_lo,
+            );
         }
         Err(EPROTO)
     }
@@ -428,14 +446,8 @@ mod tests {
         store.mutate(7, root_b).unwrap();
         let descendant = record((4, 4), (1, 1), 1, 3);
         store.mutate(7, descendant).unwrap();
-        assert_eq!(
-            store.mutate(7, record((4, 4), (1, 2), 1, 4)),
-            Err(ESTALE)
-        );
-        assert_eq!(
-            store.mutate(8, record((4, 4), (0, 0), 1, 4)),
-            Ok(false)
-        );
+        assert_eq!(store.mutate(7, record((4, 4), (1, 2), 1, 4)), Err(ESTALE));
+        assert_eq!(store.mutate(8, record((4, 4), (0, 0), 1, 4)), Ok(false));
     }
 
     #[test]
