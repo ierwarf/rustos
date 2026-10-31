@@ -54,6 +54,8 @@ pub struct SessionView {
 struct Session {
     view: SessionView,
     charge: ChargeTicket,
+    /// The route must still be the *same issuance*, not merely the same name.
+    route_epoch: u64,
 }
 
 struct Slot {
@@ -87,7 +89,9 @@ impl Sessions {
         now: u64,
         expires_at: u64,
     ) -> Result<SessionId, SessionError> {
-        if client == provider || expires_at <= now {
+        // Every admitted session consumes exactly one of the client's
+        // session slots; a zero-cost or double-counted session is invalid.
+        if client == provider || expires_at <= now || cost.sessions != 1 {
             return Err(SessionError::Invalid);
         }
         let route = graph
@@ -127,6 +131,7 @@ impl Sessions {
         };
         let item = Session {
             charge: ticket,
+            route_epoch: route.epoch,
             view: SessionView {
                 id,
                 client,
@@ -177,9 +182,12 @@ impl Sessions {
         {
             return Err(SessionError::Stale);
         }
-        graph
+        let route = graph
             .resolve(view.client, view.provider, view.capability)
             .map_err(|_| SessionError::Denied)?;
+        if route.epoch != self.session(id)?.route_epoch {
+            return Err(SessionError::Stale);
+        }
         Ok(view)
     }
 
@@ -215,7 +223,11 @@ impl Sessions {
             let view = session.view;
             let client = graph.inspect(view.client).ok();
             let provider = graph.inspect(view.provider).ok();
+            let route_invalid = graph
+                .resolve(view.client, view.provider, view.capability)
+                .map_or(true, |route| route.epoch != session.route_epoch);
             if now >= view.expires_at
+                || route_invalid
                 || client
                     .as_ref()
                     .map_or(true, |c| c.incarnation != view.client_incarnation)
@@ -308,6 +320,60 @@ mod tests {
         s.close(&mut g, id).unwrap();
         assert_eq!(g.inspect(c).unwrap().used.kernel_bytes, 0);
         assert_eq!(s.close(&mut g, id), Err(SessionError::Stale));
+    }
+
+    #[test]
+    fn revoked_offer_never_revalidates_old_client_session_after_reissue() {
+        let mut g = Graph::new(Moniker::new("root").unwrap(), 1, 4).unwrap();
+        let client = g.create(g.root(), Moniker::new("client").unwrap(), 2, JobCeiling::ALL,
+            Quota::UNLIMITED, RestartPolicy::NEVER, false).unwrap();
+        let provider = g.create(g.root(), Moniker::new("server").unwrap(), 3, JobCeiling::ALL,
+            Quota::UNLIMITED, RestartPolicy::NEVER, false).unwrap();
+        g.activate(client).unwrap();
+        g.activate(provider).unwrap();
+        let cap = Moniker::new("storage").unwrap();
+        g.publish(provider, cap, 0b11).unwrap();
+        g.offer(provider, client, cap, 0b01).unwrap();
+        let original_epoch = g.resolve(client, provider, cap).unwrap().epoch;
+        let mut sessions = Sessions::new(4).unwrap();
+        let charge = Charge { sessions: 1, ..Charge::ZERO };
+        let first = sessions.open(&mut g, client, provider, cap, charge, 10, 200).unwrap();
+        assert!(sessions.inspect(&g, first, 11).is_ok());
+
+        assert!(g.withdraw_offer(provider, client, cap));
+        assert_eq!(sessions.inspect(&g, first, 12), Err(SessionError::Denied));
+        g.offer(provider, client, cap, 0b01).unwrap();
+        assert_ne!(original_epoch, g.resolve(client, provider, cap).unwrap().epoch);
+        assert_eq!(sessions.inspect(&g, first, 13), Err(SessionError::Stale));
+
+        // Expiry scavenging also revokes the old charge without waiting for
+        // its TTL, but preserves the newly issued provider offer.
+        assert_eq!(sessions.expire(&mut g, 14, 1), Ok(1));
+        assert_eq!(g.inspect(client).unwrap().used.sessions, 0);
+        assert_eq!(sessions.close(&mut g, first), Err(SessionError::Stale));
+        let second = sessions.open(&mut g, client, provider, cap, charge, 15, 200).unwrap();
+        assert_ne!(first.generation, second.generation);
+        assert!(sessions.inspect(&g, second, 15).is_ok());
+    }
+
+    #[test]
+    fn session_admission_requires_one_client_session_unit() {
+        let mut g = Graph::new(Moniker::new("root").unwrap(), 1, 4).unwrap();
+        let client = g.create(g.root(), Moniker::new("client").unwrap(), 2, JobCeiling::ALL,
+            Quota::UNLIMITED, RestartPolicy::NEVER, false).unwrap();
+        let provider = g.create(g.root(), Moniker::new("server").unwrap(), 3, JobCeiling::ALL,
+            Quota::UNLIMITED, RestartPolicy::NEVER, false).unwrap();
+        g.activate(client).unwrap();
+        g.activate(provider).unwrap();
+        let name = Moniker::new("cap").unwrap();
+        g.publish(provider, name, 1).unwrap();
+        g.offer(provider, client, name, 1).unwrap();
+        let mut sessions = Sessions::new(4).unwrap();
+        assert_eq!(sessions.open(&mut g, client, provider, name, Charge::ZERO, 1, 30), Err(SessionError::Invalid));
+        assert_eq!(sessions.open(&mut g, client, provider, name,
+            Charge { sessions: 2, ..Charge::ZERO }, 1, 30), Err(SessionError::Invalid));
+        assert_eq!(sessions.live_count(), 0);
+        assert_eq!(g.inspect(client).unwrap().used.sessions, 0);
     }
 
     #[test]

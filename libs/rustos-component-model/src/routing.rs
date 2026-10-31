@@ -34,6 +34,8 @@ pub struct CapabilityRoute {
     pub consumer: ComponentId,
     pub name: Moniker,
     pub rights: u32,
+    /// Exact offer incarnation, never reused after withdraw/re-offer.
+    pub epoch: u64,
     pub provider_incarnation: u64,
     pub consumer_incarnation: u64,
 }
@@ -125,17 +127,20 @@ impl Graph {
         {
             return Err(CapabilityError::Duplicated);
         }
-        if self.routes.len() >= self.max_routes {
+        if self.routes.len() >= self.max_routes || self.next_route_epoch == u64::MAX {
             return Err(CapabilityError::Full);
         }
         self.routes
             .try_reserve(1)
             .map_err(|_| CapabilityError::OutOfMemory)?;
+        let epoch = self.next_route_epoch;
+        self.next_route_epoch += 1;
         self.routes.push(CapabilityRoute {
             provider,
             consumer,
             name,
             rights,
+            epoch,
             provider_incarnation: from_incarnation,
             consumer_incarnation: to_incarnation,
         });
