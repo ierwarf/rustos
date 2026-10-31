@@ -42,6 +42,10 @@ pub(super) enum ManifestError {
 
 const ALL_DEPS: u16 = DEP_SYSCALLD | DEP_VFSD | DEP_LOADERD | DEP_PROCD | DEP_PAGERD;
 
+fn trim_exec(bytes: &[u8]) -> &str {
+    core::str::from_utf8(bytes.strip_suffix(&[0]).unwrap_or(bytes)).unwrap_or("")
+}
+
 fn checked_exec(path: &[u8]) -> Result<Moniker, ManifestError> {
     if path.last().copied() != Some(0) {
         return Err(ManifestError::MissingTerminator);
@@ -263,7 +267,31 @@ pub(super) fn reporter_service_id(id: u64) -> Option<u64> {
 }
 
 pub(super) fn preflight() -> Result<(), ManifestError> {
+    rustos_component_model::service_catalog::validate()
+        .map_err(|_| ManifestError::InvalidManifest)?;
     validate(&BOOTSTRAP_MANIFEST, &POST_INIT_MANIFEST)?;
+    // Both supervisors must agree on the immutable child PID/lease parent
+    // edges and executable names. Refuse mixed manifest epochs before any
+    // IPC endpoint or Job authority is published.
+    for service in BOOTSTRAP_MANIFEST {
+        let declared = rustos_component_model::service_catalog::by_id(service.service_id)
+            .ok_or(ManifestError::InvalidManifest)?;
+        if !declared.bootstrap
+            || trim_exec(service.exec_path) != declared.exec
+        {
+            return Err(ManifestError::InvalidManifest);
+        }
+    }
+    for service in POST_INIT_MANIFEST {
+        let declared = rustos_component_model::service_catalog::by_id(service.service_id)
+            .ok_or(ManifestError::InvalidManifest)?;
+        if declared.bootstrap
+            || declared.parent_id != service.reporter_service_id
+            || trim_exec(service.exec_path) != declared.exec
+        {
+            return Err(ManifestError::InvalidManifest);
+        }
+    }
     validate_routes(
         &BOOTSTRAP_MANIFEST,
         &POST_INIT_MANIFEST,

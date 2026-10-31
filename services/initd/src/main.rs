@@ -799,26 +799,14 @@ fn call_rootd_supervisor_with_payload(
     Ok(response)
 }
 
+/// Map only the declarative children supervised by this initd. A hardcoded
+/// pathname switch was the last duplicate of rootd's post-init roster.
 fn rootd_service_id_for_exec(exec_path: &str) -> Option<u64> {
-    match exec_path {
-        NETD_EXEC_PATH => Some(IPC_SERVICE_NETD),
-        DEVMGRD_EXEC_PATH => Some(IPC_SERVICE_DEVMGRD),
-        INPUTD_EXEC_PATH => Some(IPC_SERVICE_INPUTD),
-        STORAGED_EXEC_PATH => Some(IPC_SERVICE_STORAGED),
-        RUNTIMED_EXEC_PATH => Some(IPC_SERVICE_SESSIOND),
-        _ => None,
-    }
+    rustos_component_model::service_catalog::initd_owned_id_for_exec(exec_path)
 }
 
 fn rootd_exec_for_service_id(service_id: u64) -> Option<&'static str> {
-    match service_id {
-        IPC_SERVICE_NETD => Some(NETD_EXEC_PATH),
-        IPC_SERVICE_DEVMGRD => Some(DEVMGRD_EXEC_PATH),
-        IPC_SERVICE_INPUTD => Some(INPUTD_EXEC_PATH),
-        IPC_SERVICE_STORAGED => Some(STORAGED_EXEC_PATH),
-        IPC_SERVICE_SESSIOND => Some(RUNTIMED_EXEC_PATH),
-        _ => None,
-    }
+    rustos_component_model::service_catalog::initd_owned_exec_for_id(service_id)
 }
 
 fn report_rootd_service_lease_inner(service_id: u64, exec_path: &str, pid: u64) -> Result<(), i32> {

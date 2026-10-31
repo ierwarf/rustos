@@ -25,6 +25,7 @@ pub mod lease_reclaim;
 pub mod lease_snapshot;
 pub mod client_session_wire;
 pub mod manifest;
+pub mod service_catalog;
 pub mod policy;
 pub mod policy_ops;
 pub mod pressure;
