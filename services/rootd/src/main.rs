@@ -70,7 +70,7 @@ use rustos_user_abi::syscall::{
     COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR, COMMERCIAL_MAX_ROOTD_OP_BOOTSTRAP_MANIFEST,
     COMMERCIAL_MAX_ROOTD_OP_CORE_SERVICE_LEASE, COMMERCIAL_MAX_ROOTD_OP_DEPENDENCY_GRAPH,
     COMMERCIAL_MAX_ROOTD_OP_LOADER_WORKER_COMPLETE, COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_SNAPSHOT_IDL,
-    COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_RECLAIM, COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL,
+    COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_RECLAIM_IDL, COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL,
     COMMERCIAL_MAX_ROOTD_OP_RESTART_POLICY, COMMERCIAL_MAX_ROOTD_OP_SCHEDULING_CONTEXT_GRANT,
     COMMERCIAL_MAX_ROOTD_OP_SERVICE_CAPABILITY, COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_COMPACT,
     COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_MUTATE,
@@ -947,7 +947,7 @@ fn validate_commercial_max_request(
             | COMMERCIAL_MAX_ROOTD_OP_SERVICE_CAPABILITY
             | COMMERCIAL_MAX_ROOTD_OP_SERVICE_LOOKUP
             | COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_SNAPSHOT_IDL
-            | COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_RECLAIM
+            | COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_RECLAIM_IDL
             | COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_MUTATE
             | COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_COMPACT
             | COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_SCAN
@@ -1114,9 +1114,13 @@ fn fill_commercial_max_response(
             response.value1 = 0;
             Ok(())
         }
-        COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_RECLAIM => {
-            reclaim_post_init_lease(leases, post_init_leases, request, sender)?;
-            response.value0 = request.arg0;
+        COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_RECLAIM_IDL => {
+            let ack = reclaim_post_init_lease(leases, post_init_leases, request, sender)?;
+            // The canonical IDL ack is prepared and bounded before the
+            // destructive revocation. No allocation happens after it commits.
+            response.payload[..ack.len()].copy_from_slice(&ack);
+            response.payload_len = ack.len() as u32;
+            response.value0 = 0;
             response.value1 = 0;
             Ok(())
         }
@@ -1439,7 +1443,7 @@ fn rootd_capability_mask(op: u16) -> u64 {
         COMMERCIAL_MAX_ROOTD_OP_SERVICE_CAPABILITY => 1 << 5,
         COMMERCIAL_MAX_ROOTD_OP_SERVICE_LOOKUP => 1 << 6,
         COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_SNAPSHOT_IDL => 1 << 7,
-        COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_RECLAIM => 1 << 8,
+        COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_RECLAIM_IDL => 1 << 8,
         COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_MUTATE => 1 << 9,
         COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_SCAN => 1 << 10,
         COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_COMPACT => 1 << 11,
@@ -1618,32 +1622,39 @@ fn reclaim_post_init_lease(
     post_init_leases: &mut [PostInitLease],
     request: &CommercialMaxProtocolRequest,
     sender: IpcSenderIdentity,
-) -> Result<(), i32> {
-    if request.arg0 == 0
-        || request.arg1 == 0
+) -> Result<alloc::vec::Vec<u8>, i32> {
+    if request.arg0 != 0
+        || request.arg1 != 0
         || request.arg2 != 0
         || request.arg3 != 0
         || request.path_len != 0
-        || request.payload_len != 0
     {
         return Err(22);
     }
+    let exact = rustos_component_model::lease_reclaim::decode_request(
+        &request.payload[..request.payload_len as usize],
+    ).map_err(|_| 22)?;
     authorize_current_initd(leases, sender)?;
-    if !initd_manages_post_init_service(request.arg0) {
+    if !initd_manages_post_init_service(exact.service) {
         return Err(13);
     }
     policy_cutover::authorize_job_slow_op(
         sender.pid,
         rustos_component_model::policy_ops::SlowBrokerOperation::ReclaimServiceLease,
     )?;
-    // Validation above performs no kernel operations. For the actual
-    // revocation phase, a partial syscall failure must stop the supervisor:
-    // returning a normal error could leave an endpoint revoked while its
-    // original lease is still advertised as live.
+
+    // Pre-allocate the canonical ack before any endpoint is revoked, so a
+    // reclaim cannot succeed in the kernel and then fail reply allocation.
+    let ack = rustos_component_model::lease_reclaim::encode_ack(exact)
+        .map_err(|_| 12)?;
+    if ack.len() > rustos_user_abi::syscall::COMMERCIAL_MAX_PROTOCOL_PAYLOAD_CAPACITY {
+        return Err(75);
+    }
+    // This is fail-closed in production after the first kernel mutation.
     reclaim_post_init_lease_with(
         post_init_leases,
-        request.arg0,
-        request.arg1,
+        exact.service,
+        exact.pid,
         |service_id| {
             revoke_service_endpoint(service_id)
                 .unwrap_or_else(|_| fail_closed(b"rootd: fatal reclaim endpoint revoke failed\n"));
@@ -1654,7 +1665,8 @@ fn reclaim_post_init_lease(
                 .unwrap_or_else(|_| fail_closed(b"rootd: fatal reclaim process termination failed\n"));
             Ok(())
         },
-    )
+    )?;
+    Ok(ack)
 }
 
 /// Retire one exact post-init lease and its entire dependent closure.

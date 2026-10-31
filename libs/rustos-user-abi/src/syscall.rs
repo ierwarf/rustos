@@ -1033,9 +1033,9 @@ pub const COMMERCIAL_MAX_ROOTD_OP_SERVICE_CAPABILITY: u16 = 6;
 pub const COMMERCIAL_MAX_ROOTD_OP_SERVICE_LOOKUP: u16 = 7;
 // Supervisor operation 8 (scalar lease query) is retired.
 pub const COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_SNAPSHOT_IDL: u16 = 15;
-/// Revoke and, when still live, terminate an unrecoverable post-init lease.
-/// Only the current initd may reclaim its own service classes.
-pub const COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_RECLAIM: u16 = 9;
+// Supervisor operation 9 (scalar reclaim) is retired. Reclamation is now
+// an exact PID, request-id/challenge-bound generated-IDL control operation.
+pub const COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_RECLAIM_IDL: u16 = 16;
 /// Store one versioned, service-owned checkpoint record.  Rootd authenticates
 /// the current service lease and retains the opaque record across a supervised
 /// service restart; it never interprets the service-private value bytes.
