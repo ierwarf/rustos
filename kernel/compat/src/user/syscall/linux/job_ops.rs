@@ -420,6 +420,81 @@ pub(super) fn syscall_linux_rustos_job_session(args_ptr: u64) -> u64 {
     0
 }
 
+
+/// Memory pressure policy is configured in the Job control path. Hard page
+/// admission stays lock-free in kernel-mm; no kernel call to Ring3 happens
+/// inside page fault, pager, futex, TLB or scheduler execution paths.
+fn job_memory_qos_args_valid(args: &rustos_user_abi::syscall::RustosJobMemoryQosArgs) -> bool {
+    use rustos_user_abi::syscall::*;
+    if args.abi_version != JOB_MEMORY_QOS_ABI_VERSION
+        || args.job_handle == 0
+        || args.flags != 0
+        || args.reserved != 0
+        || args.effective_high_pages != 0
+        || args.usage_pages != 0
+        || args.high_crossings != 0
+    {
+        return false;
+    }
+    match args.op {
+        JOB_MEMORY_QOS_OP_INSPECT => args.high_pages == 0 && args.min_pages == 0,
+        JOB_MEMORY_QOS_OP_SET => true,
+        _ => false,
+    }
+}
+
+pub(super) fn syscall_linux_rustos_job_memory_qos(ptr: u64) -> u64 {
+    use rustos_user_abi::syscall::*;
+    let mut args = match usermem::read_current_user_struct::<RustosJobMemoryQosArgs>(ptr) {
+        Ok(value) => value,
+        Err(error) => return linux_errno(address_space_error_to_linux_errno(error)),
+    };
+    if !job_memory_qos_args_valid(&args) {
+        return linux_errno(LINUX_EINVAL);
+    }
+    let Some(caller) = multitask::current_user_process_id() else {
+        return linux_errno(LINUX_ESRCH);
+    };
+    if let Err(error) =
+        usermem::validate_current_user_write_buffer(ptr, size_of::<RustosJobMemoryQosArgs>())
+    {
+        return linux_errno(address_space_error_to_linux_errno(error));
+    }
+    let right = if args.op == JOB_MEMORY_QOS_OP_INSPECT {
+        JobHandleRights::INSPECT
+    } else {
+        JobHandleRights::SET_LIMITS
+    };
+    let authority = multitask::with_process_state_by_pid(caller, |state| {
+        state.handles().get_entry(args.job_handle)
+            .ok_or(LINUX_EBADF)
+            .and_then(|entry| job_authority_with_right(entry, right))
+    });
+    let (job, _) = match authority {
+        Some(Ok(value)) => value,
+        Some(Err(errno)) => return linux_errno(errno),
+        None => return linux_errno(LINUX_ESRCH),
+    };
+    let reply = if args.op == JOB_MEMORY_QOS_OP_INSPECT {
+        multitask::job_memory_qos(job)
+    } else {
+        multitask::job_set_memory_qos(job, args.high_pages, args.min_pages)
+    };
+    let info = match reply {
+        Ok(info) => info,
+        Err(error) => return linux_errno(job_error_errno(error)),
+    };
+    args.high_pages = info.high;
+    args.min_pages = info.min;
+    args.effective_high_pages = info.effective_high;
+    args.usage_pages = info.usage;
+    args.high_crossings = info.high_events;
+    match usermem::write_current_user_struct(ptr, &args) {
+        Ok(()) => 0,
+        Err(error) => linux_errno(address_space_error_to_linux_errno(error)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

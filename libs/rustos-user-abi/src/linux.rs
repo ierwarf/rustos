@@ -1496,6 +1496,7 @@ pub const SYS_RUSTOS_ROOTD_WAIT_BROKER: u64 = crate::syscall::SYS_RUSTOS_ROOTD_W
 pub use crate::syscall::SYS_RUSTOS_JOB;
 pub use crate::syscall::SYS_RUSTOS_JOB_POLICY;
 pub use crate::syscall::SYS_RUSTOS_JOB_SESSION;
+pub use crate::syscall::SYS_RUSTOS_JOB_MEMORY_QOS;
 pub use crate::syscall::SYS_RUSTOS_ROOTD_MEMORY_BROKER;
 pub use crate::syscall::SYS_RUSTOS_ROOTD_TERMINATE_BROKER;
 pub use crate::syscall::SYS_RUSTOS_SCHEDULING_CONTEXT_GRANT_BROKER;

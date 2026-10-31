@@ -98,6 +98,8 @@ pub const SYS_RUSTOS_JOB: u64 = 0x5255_0057;
 pub const SYS_RUSTOS_JOB_POLICY: u64 = 0x5255_005a;
 /// Slow kernel accounting of client-funded service sessions.
 pub const SYS_RUSTOS_JOB_SESSION: u64 = 0x5255_005b;
+/// Memory QoS is a Job slow control syscall, not a fault-path policy lookup.
+pub const SYS_RUSTOS_JOB_MEMORY_QOS: u64 = 0x5255_005c;
 /// Capability-gated, event-driven wait for the DVM input transport. Only
 /// inputd may use this to wait for an MSI-X-published ingress batch; input
 /// policy and translation remain in the service.
@@ -986,6 +988,28 @@ pub const JOB_SESSION_OP_INSPECT: u16 = 1;
 pub const JOB_SESSION_OP_SET_LIMIT: u16 = 2;
 pub const JOB_SESSION_OP_CHARGE: u16 = 3;
 pub const JOB_SESSION_OP_RELEASE: u16 = 4;
+
+pub const JOB_MEMORY_QOS_ABI_VERSION: u16 = 1;
+pub const JOB_MEMORY_QOS_OP_INSPECT: u16 = 1;
+pub const JOB_MEMORY_QOS_OP_SET: u16 = 2;
+
+/// Memory.high is an event threshold. Memory.min is an explicit
+/// hierarchical OOM victim protection reserve, not allocated memory.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RustosJobMemoryQosArgs {
+    pub abi_version: u16,
+    pub op: u16,
+    pub flags: u32,
+    pub job_handle: u64,
+    pub high_pages: u64,
+    pub min_pages: u64,
+    pub effective_high_pages: u64,
+    pub usage_pages: u64,
+    pub high_crossings: u64,
+    pub reserved: u64,
+}
+
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
