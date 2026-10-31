@@ -649,6 +649,243 @@ pub fn job_set_memory_qos(id: JobId, high: u64, min: u64) -> Result<JobMemoryQos
     })
 }
 
+
+/// Kernel-retained rootd-crash recovery ledger. These records live inside the
+/// exact same process-table lock as Job slots and process membership. Rootd
+/// retains policy/rights while the kernel makes charge/refund idempotent.
+pub(super) const SESSION_TOKEN_SLOTS: usize = 512;
+pub(super) const SESSION_OWNER_SLOTS: usize = 64;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SessionToken {
+    owner_pid: u64,
+    token: u64,
+    client_pid: u64,
+    job: JobId,
+}
+impl SessionToken {
+    pub(super) const EMPTY: Self = Self {
+        owner_pid: 0,
+        token: 0,
+        client_pid: 0,
+        job: ROOT_JOB,
+    };
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct SessionOwner {
+    pid: u64,
+    high_watermark: u64,
+}
+impl SessionOwner {
+    pub(super) const EMPTY: Self = Self { pid: 0, high_watermark: 0 };
+}
+
+fn client_job_live_locked(table: &ProcessTable, pid: u64, job: JobId) -> bool {
+    table.slots.iter()
+        .filter_map(|slot| slot.object.as_deref())
+        .any(|object| object.process_id == pid && !object.exiting && object.job == job)
+}
+
+fn session_charge_preflight(table: &ProcessTable, job: JobId) -> Result<(), JobError> {
+    if table.job_slot(job).is_none() {
+        return Err(JobError::Stale);
+    }
+    let mut cursor = job.index;
+    for _ in 0..=usize::from(JOB_MAX_DEPTH) {
+        let slot = &table.jobs[cursor as usize];
+        if slot.state != JobState::Live {
+            return Err(JobError::Killing);
+        }
+        if slot.subtree_sessions == u64::MAX
+            || (slot.session_limit != LIMIT_UNSET
+                && slot.subtree_sessions >= slot.session_limit)
+        {
+            return Err(JobError::Full);
+        }
+        if slot.parent == NO_PARENT {
+            return Ok(());
+        }
+        cursor = slot.parent;
+    }
+    Err(JobError::TooDeep)
+}
+
+fn session_refund_preflight(table: &ProcessTable, job: JobId) -> Result<(), JobError> {
+    if table.job_slot(job).is_none() {
+        return Err(JobError::Stale);
+    }
+    let mut cursor = job.index;
+    for _ in 0..=usize::from(JOB_MAX_DEPTH) {
+        let slot = &table.jobs[cursor as usize];
+        if slot.subtree_sessions == 0 {
+            return Err(JobError::Stale);
+        }
+        if slot.parent == NO_PARENT {
+            return Ok(());
+        }
+        cursor = slot.parent;
+    }
+    Err(JobError::TooDeep)
+}
+
+fn adjust_session_chain(table: &mut ProcessTable, job: JobId, charge: bool) {
+    let mut cursor = job.index;
+    for _ in 0..=usize::from(JOB_MAX_DEPTH) {
+        let slot = &mut table.jobs[cursor as usize];
+        if charge {
+            slot.subtree_sessions += 1;
+        } else {
+            slot.subtree_sessions -= 1;
+        }
+        if slot.parent == NO_PARENT {
+            break;
+        }
+        cursor = slot.parent;
+    }
+}
+
+/// Exactly-one charge for (authenticated provider PID, provider-local
+/// nonrepeating token). The kernel verifies the client PID/Job membership,
+/// all ancestors and the provider's live process under one lock before
+/// publishing any usage. Retries return the original charge without a second
+/// increment even if rootd restarted and lost its user-space receipts.
+pub fn job_charge_client_session_token(
+    owner_pid: u64,
+    token: u64,
+    client_pid: u64,
+    expected_job: JobId,
+) -> Result<JobSessionInfo, JobError> {
+    if owner_pid == 0 || token == 0 || client_pid == 0 {
+        return Err(JobError::Stale);
+    }
+    let mut table = PROCESS_TABLE.lock();
+    if !table.slots.iter().filter_map(|slot| slot.object.as_deref())
+        .any(|object| object.process_id == owner_pid && !object.exiting)
+    {
+        return Err(JobError::Stale);
+    }
+    if let Some(existing) = table.session_tokens.iter()
+        .find(|entry| entry.owner_pid == owner_pid && entry.token == token)
+    {
+        if existing.client_pid != client_pid || existing.job != expected_job {
+            return Err(JobError::Stale);
+        }
+        return session_info_locked(&table, expected_job);
+    }
+    let owner_index = match table.session_owners.iter()
+        .position(|entry| entry.pid == owner_pid)
+    {
+        Some(index) => index,
+        None => table.session_owners.iter()
+            .position(|entry| entry.pid == 0)
+            .ok_or(JobError::Full)?,
+    };
+    let owner = table.session_owners[owner_index];
+    if owner.pid == owner_pid && token <= owner.high_watermark {
+        // Old refunded or canceled token, never reissued in this lifetime.
+        return Err(JobError::Stale);
+    }
+    let slot_index = table.session_tokens.iter()
+        .position(|entry| entry.owner_pid == 0)
+        .ok_or(JobError::Full)?;
+    if !client_job_live_locked(&table, client_pid, expected_job) {
+        return Err(JobError::Stale);
+    }
+    session_charge_preflight(&table, expected_job)?;
+    adjust_session_chain(&mut table, expected_job, true);
+    table.session_tokens[slot_index] = SessionToken {
+        owner_pid, token, client_pid, job: expected_job,
+    };
+    table.session_owners[owner_index] = SessionOwner {
+        pid: owner_pid, high_watermark: token,
+    };
+    session_info_locked(&table, expected_job)
+}
+
+/// Exactly-once refund or cancellation. An unknown token is a tombstone: it
+/// advances the original provider's watermark so a delayed old charge cannot
+/// publish after a successful cancel ACK. A repeated release has no side
+/// effects, even after the original Job was recycled.
+pub fn job_release_client_session_token(
+    owner_pid: u64,
+    token: u64,
+    expected_job: Option<JobId>,
+) -> Result<Option<JobSessionInfo>, JobError> {
+    if owner_pid == 0 || token == 0 {
+        return Err(JobError::Stale);
+    }
+    let mut table = PROCESS_TABLE.lock();
+    let owner_index = match table.session_owners.iter()
+        .position(|entry| entry.pid == owner_pid)
+    {
+        Some(index) => index,
+        None => table.session_owners.iter()
+            .position(|entry| entry.pid == 0)
+            .ok_or(JobError::Full)?,
+    };
+    if let Some(index) = table.session_tokens.iter()
+        .position(|entry| entry.owner_pid == owner_pid && entry.token == token)
+    {
+        let existing = table.session_tokens[index];
+        if expected_job.is_some_and(|job| job != existing.job) {
+            return Err(JobError::Stale);
+        }
+        session_refund_preflight(&table, existing.job)?;
+        adjust_session_chain(&mut table, existing.job, false);
+        table.session_tokens[index] = SessionToken::EMPTY;
+        let info = session_info_locked(&table, existing.job)?;
+        table.release_dead_jobs();
+        table.session_owners[owner_index] = SessionOwner {
+            pid: owner_pid,
+            high_watermark: table.session_owners[owner_index].high_watermark.max(token),
+        };
+        return Ok(Some(info));
+    }
+    // If a caller claims a Job for an unknown token, do not accidentally
+    // refund it; the cancellation receipt is jobless by construction.
+    if expected_job.is_some() {
+        return Err(JobError::Stale);
+    }
+    table.session_owners[owner_index] = SessionOwner {
+        pid: owner_pid,
+        high_watermark: table.session_owners[owner_index].high_watermark.max(token),
+    };
+    Ok(None)
+}
+
+/// Reclaim one exited provider or every provider after rootd's own crash.
+/// This is slow recovery invoked only with the boot-root descriptor; it
+/// atomically returns all surviving Job charges and resets old token epochs.
+/// A new rootd must terminate/adopt the corresponding providers before
+/// admitting fresh control IPC; draining is not permission to reuse old PIDs.
+pub fn job_drain_client_session_tokens(owner_pid: Option<u64>) -> Result<u64, JobError> {
+    let mut table = PROCESS_TABLE.lock();
+    let mut drained = 0_u64;
+    // Every entry is a previously committed charge. Preflight all before
+    // mutating any to avoid a partial multi-Job settlement on corruption.
+    for entry in &table.session_tokens {
+        if entry.owner_pid != 0 && owner_pid.is_none_or(|pid| pid == entry.owner_pid) {
+            session_refund_preflight(&table, entry.job)?;
+        }
+    }
+    for index in 0..table.session_tokens.len() {
+        let entry = table.session_tokens[index];
+        if entry.owner_pid != 0 && owner_pid.is_none_or(|pid| pid == entry.owner_pid) {
+            adjust_session_chain(&mut table, entry.job, false);
+            table.session_tokens[index] = SessionToken::EMPTY;
+            drained += 1;
+        }
+    }
+    for owner in &mut table.session_owners {
+        if owner.pid != 0 && owner_pid.is_none_or(|pid| pid == owner.pid) {
+            *owner = SessionOwner::EMPTY;
+        }
+    }
+    table.release_dead_jobs();
+    Ok(drained)
+}
+
 /// Bounded, generation-aware job session-accounting snapshot. The page count
 /// ledger is separate: a session token must never manufacture a mapped page.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
