@@ -1295,6 +1295,10 @@ pub const COMMERCIAL_MAX_ROOTD_OP_LOADER_WORKER_COMPLETE: u16 = 13;
 /// Issue one rootd-authored, kernel-sealed scheduling-context authority for
 /// the authenticated caller and exact executable path in this request.
 pub const COMMERCIAL_MAX_ROOTD_OP_SCHEDULING_CONTEXT_GRANT: u16 = 14;
+/// Canonical IDL 523: may the calling service act for a personality and
+/// namespace on a class of slow request? Decided by rootd's exact-incarnation
+/// personality policy; the caller must hold the SpawnProcess slow grant.
+pub const COMMERCIAL_MAX_ROOTD_OP_SLOW_REQUEST_AUTHORIZE: u16 = 29;
 pub const SERVICE_CHECKPOINT_ABI_VERSION: u16 = 1;
 pub const SERVICE_CHECKPOINT_FLAG_TOMBSTONE: u16 = 1 << 0;
 pub const SERVICE_CHECKPOINT_VALUE_CAPACITY: usize = 64;

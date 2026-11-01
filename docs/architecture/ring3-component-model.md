@@ -206,14 +206,17 @@ Live generated schemas: 514 heartbeat, 515 update approval, 517/518 post-init
 lease snapshot/reclaim, 519 client-Job session accounting, 520 provider
 session accounting, 521 service-checkpoint records (rootd ops MUTATE,
 COMPACT and SCAN; SCAN replies are length-prefixed IDL frames), 522 post-init
-service lease report (the scalar form is refused). Their former scalar payloads are rejected. All other
+service lease report (the scalar form is refused), 523 slow-request
+authorization (rootd op 29: may the calling service act for a personality and
+namespace; decided by rootd's exact-incarnation `PersonalityPolicy`, consulted
+by loaderd before every spawn, fail-closed). Their former scalar payloads are rejected. All other
 service protocols are still `repr(C)` and migrate per producer/consumer pair.
 
 ### Library models with no production caller
 
 `resource_ledger`, `quota`, `pressure*`, `capability_escrow`,
 `supervision`, `rollout_plan`, `reconcile`, `routing`,
-`realm`, `telemetry`, `personality`, `namespace_policy`, `image_custody` and
+`realm`, `telemetry`, `namespace_policy`, `image_custody` and
 `restart_transaction` compile and are
 unit tested but are not imported by any service. A model record is not a Ring0
 capability, a journal trait is not power-loss durability, and policy accounting

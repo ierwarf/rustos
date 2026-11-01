@@ -443,6 +443,30 @@
           "max_len": 256
         }
       ]
+    },
+    {
+      "name": "slow_request_authorization",
+      "opcode": 523,
+      "fields": [
+        {
+          "name": "personality",
+          "tag": 1,
+          "type": "u16",
+          "required": true
+        },
+        {
+          "name": "request",
+          "tag": 2,
+          "type": "u16",
+          "required": true
+        },
+        {
+          "name": "namespace",
+          "tag": 3,
+          "type": "u64",
+          "required": true
+        }
+      ]
     }
   ]
 }

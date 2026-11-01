@@ -116,6 +116,30 @@ impl ActivationOwner {
         Ok(())
     }
 
+    /// Publish a bootstrap service rootd itself spawned. Its parent (rootd or
+    /// initd) is authenticated by the lease rootd created at spawn, so the
+    /// book only records the one live incarnation. An earlier incarnation of
+    /// the same service that rootd has not yet seen exit is retired first: the
+    /// lease now names a different PID, which is the authoritative evidence.
+    /// Idempotent for an incarnation that is already published.
+    pub(crate) fn adopt_bootstrap(&mut self, service: u64, pid: u64, job_generation: u32) -> Result<(), i32> {
+        if pid == 0 || self.is_active(service, pid) {
+            return Ok(());
+        }
+        let mut stale = None;
+        self.book.active(|component, state, evidence| {
+            if component.id == service && state != State::Revoked {
+                stale = Some((component.generation, evidence.is_some_and(|e| e.pid == pid)));
+            }
+        });
+        match stale {
+            Some((_, true)) => return Ok(()),
+            Some((transaction, false)) => self.revoke_tx(service, transaction),
+            None => {}
+        }
+        self.activate(service, pid, job_generation)
+    }
+
     /// An authenticated EXIT of `pid`: drain, revoke and retire its slot.
     pub(crate) fn deactivate_pid(&mut self, pid: u64) {
         let mut target = None;
@@ -205,6 +229,22 @@ mod tests {
         // A second live incarnation of the same service is refused.
         assert_eq!(owner.check(3), Err(EBUSY));
         assert_eq!(owner.activate(3, 51, 2), Err(EBUSY));
+    }
+
+    #[test]
+    fn a_bootstrap_service_is_published_once_and_a_replacement_retires_its_predecessor() {
+        let mut owner = ActivationOwner::new();
+        owner.adopt_bootstrap(1, 10, 1).unwrap();
+        owner.adopt_bootstrap(1, 10, 1).unwrap();
+        assert_eq!(owner.live_count(), 1, "re-adopting the same incarnation is a no-op");
+        assert!(owner.is_active(1, 10));
+        owner.adopt_bootstrap(1, 11, 1).unwrap();
+        assert!(!owner.is_active(1, 10) && owner.is_active(1, 11));
+        assert_eq!(owner.live_count(), 1, "the predecessor's slot was retired, not leaked");
+        owner.deactivate_pid(11);
+        assert_eq!(owner.live_count(), 0);
+        assert!(owner.adopt_bootstrap(1, 0, 1).is_ok(), "a lease without a PID is not adopted");
+        assert_eq!(owner.live_count(), 0);
     }
 
     #[test]

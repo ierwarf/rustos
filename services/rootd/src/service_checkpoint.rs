@@ -37,6 +37,7 @@ pub(crate) struct ServiceCheckpointStore {
     pub(crate) health: HealthBook,
     pub(crate) updates: UpdateBook,
     pub(crate) activation: super::activation_owner::ActivationOwner,
+    pub(crate) personality: super::personality_policy::PersonalityPolicy,
 }
 
 impl ServiceCheckpointStore {
@@ -51,6 +52,7 @@ impl ServiceCheckpointStore {
             health: HealthBook::new(),
             updates: UpdateBook::new(),
             activation: super::activation_owner::ActivationOwner::new(),
+            personality: super::personality_policy::PersonalityPolicy::new(),
         }
     }
 

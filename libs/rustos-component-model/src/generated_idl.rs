@@ -451,6 +451,31 @@ pub const SERVICE_LEASE_REPORT: Schema<'static> = Schema {
     fields: &SERVICE_LEASE_REPORT_FIELDS,
 };
 
+pub const SLOW_REQUEST_AUTHORIZATION_FIELDS: [FieldSpec; 3] = [
+    FieldSpec {
+        tag: 1,
+        kind: FieldKind::U16,
+        required: true,
+        max_len: 2,
+    },
+    FieldSpec {
+        tag: 2,
+        kind: FieldKind::U16,
+        required: true,
+        max_len: 2,
+    },
+    FieldSpec {
+        tag: 3,
+        kind: FieldKind::U64,
+        required: true,
+        max_len: 8,
+    },
+];
+pub const SLOW_REQUEST_AUTHORIZATION: Schema<'static> = Schema {
+    opcode: 523,
+    fields: &SLOW_REQUEST_AUTHORIZATION_FIELDS,
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -469,6 +494,7 @@ mod tests {
             PROVIDER_SESSION_ACCOUNTING,
             SERVICE_CHECKPOINT_RECORD,
             SERVICE_LEASE_REPORT,
+            SLOW_REQUEST_AUTHORIZATION,
         ] {
             assert!(schema.validate().is_ok());
         }

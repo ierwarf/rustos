@@ -22,6 +22,7 @@
 
 extern crate alloc;
 
+mod personality_gate;
 mod release_attestation;
 mod trust_anchor;
 
@@ -657,6 +658,15 @@ fn handle_placed_request(request: &LoaderSpawnRequest, job_handle: Option<u64>) 
     if !operation.allows_format(executable_format) {
         let _ = syscall1(SYS_CLOSE, fd as u64);
         response.status = ENOEXEC;
+        return spawn_response(response);
+    }
+    // Rootd's personality policy must grant this loader the right to launch
+    // this image's personality; a refusal or an unreachable rootd fails the
+    // spawn before any process state is prepared.
+    if let Err(errno) = personality_gate::authorize_launch(executable_format) {
+        debug_line("loaderd: personality policy refused the launch");
+        let _ = syscall1(SYS_CLOSE, fd as u64);
+        response.status = errno;
         return spawn_response(response);
     }
 

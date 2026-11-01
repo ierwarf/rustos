@@ -51,6 +51,7 @@ mod service_checkpoint;
 mod checkpoint_journal;
 mod service_manifest;
 mod kernel_policy;
+mod personality_policy;
 mod session_accounting;
 
 use loader_wire::{contains_nul, copy_bytes, empty_loader_spawn_request, empty_loader_spawn_response};
@@ -81,6 +82,7 @@ use rustos_user_abi::syscall::{
     COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR, COMMERCIAL_MAX_ROOTD_OP_BOOTSTRAP_MANIFEST,
     COMMERCIAL_MAX_ROOTD_OP_CORE_SERVICE_LEASE, COMMERCIAL_MAX_ROOTD_OP_DEPENDENCY_GRAPH,
     COMMERCIAL_MAX_ROOTD_OP_LOADER_WORKER_COMPLETE, COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_SNAPSHOT_IDL,
+    COMMERCIAL_MAX_ROOTD_OP_SLOW_REQUEST_AUTHORIZE,
     COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_RECLAIM_IDL, COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL,
     COMMERCIAL_MAX_ROOTD_OP_RESTART_POLICY, COMMERCIAL_MAX_ROOTD_OP_SCHEDULING_CONTEXT_GRANT,
     COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_COMPACT,
@@ -776,6 +778,25 @@ fn drain_lifecycle_events(
         service_checkpoints.activation.deactivate_pid(event.pid);
         revoke_post_init_dependents(post_init_leases, event.pid);
     }
+    adopt_running_bootstrap_services(leases, service_checkpoints);
+}
+
+/// Every running bootstrap lease is one published incarnation in the single
+/// activation owner, exactly like a post-init lease, so "one live incarnation
+/// per service" and restart ordering are enforced in one place. Leases are
+/// rootd's own record of what it spawned; the book adds no authority.
+fn adopt_running_bootstrap_services(leases: &[Lease], store: &mut ServiceCheckpointStore) {
+    for lease in leases.iter().filter(|lease| {
+        lease.pid != 0 && lease.state == ROOTD_LEASE_STATE_RUNNING && lease.service_id != 0
+    }) {
+        if store.activation.is_active(lease.service_id, lease.pid) {
+            continue;
+        }
+        let job_generation = jobs::process_job(lease.pid).map(|job| job as u32).unwrap_or(1);
+        if store.activation.adopt_bootstrap(lease.service_id, lease.pid, job_generation).is_err() {
+            fail_closed(b"rootd: activation owner rejected a bootstrap lease\n");
+        }
+    }
 }
 
 /// A running child inherits supervisor admission only while that supervisor is
@@ -1085,6 +1106,7 @@ fn validate_commercial_max_request(
             | COMMERCIAL_MAX_ROOTD_OP_UPDATE_ROLLBACK
             | COMMERCIAL_MAX_ROOTD_OP_UPDATE_SEAL
             | COMMERCIAL_MAX_ROOTD_OP_UPDATE_INSPECT
+            | COMMERCIAL_MAX_ROOTD_OP_SLOW_REQUEST_AUTHORIZE
             | COMMERCIAL_MAX_ROOTD_OP_LOADER_WORKER_COMPLETE => Ok(()),
             COMMERCIAL_MAX_ROOTD_OP_SCHEDULING_CONTEXT_GRANT => {
                 if request.path_len == 0
@@ -1247,6 +1269,44 @@ fn fill_commercial_max_response(
             )?;
             response.value0 = request.arg0;
             response.value1 = request.arg1;
+            Ok(())
+        }
+        COMMERCIAL_MAX_ROOTD_OP_SLOW_REQUEST_AUTHORIZE => {
+            // Canonical IDL 523. The subject is the kernel-stamped sender,
+            // never a field of the request; the decision is the exact-
+            // incarnation personality policy, not a role or a name.
+            if request.arg0 != 0 || request.arg1 != 0 || request.arg2 != 0
+                || request.arg3 != 0 || request.path_len != 0 || request.payload_len == 0
+            {
+                return Err(22);
+            }
+            let query = rustos_component_model::slow_authorization::decode(
+                &request.payload[..request.payload_len as usize],
+            ).map_err(|_| 22)?;
+            let service = authorize_sender_slow_grant(
+                leases, post_init_leases, sender,
+                rustos_component_model::policy_ops::SlowBrokerOperation::SpawnProcess,
+            )?;
+            let subject = personality_principal(sender.pid)?;
+            let mut principals = alloc::vec::Vec::new();
+            for lease in leases.iter().filter(|lease| {
+                lease.pid != 0 && lease.state == ROOTD_LEASE_STATE_RUNNING
+                    && personality_policy::GRANTS.iter().any(|g| g.service == lease.service_id)
+            }) {
+                principals.try_reserve(1).map_err(|_| 12)?;
+                principals.push((lease.service_id, personality_principal(lease.pid)?));
+            }
+            service_checkpoints.personality.refresh(&principals)?;
+            let revision = service_checkpoints.personality.authorize(
+                rustos_component_model::personality::PolicyKey {
+                    personality: query.personality,
+                    operation: query.request,
+                    namespace: query.namespace,
+                },
+                subject,
+            )?;
+            response.value0 = revision;
+            response.value1 = service;
             Ok(())
         }
         COMMERCIAL_MAX_ROOTD_OP_LOADER_WORKER_COMPLETE => {
@@ -2406,6 +2466,20 @@ fn post_init_lease_reporter_is_live(
     }
     // A cycle or chain longer than the fixed lease set has no trusted root.
     false
+}
+
+/// The exact incarnation a personality rule is owned by: the live process, the
+/// kernel Job it runs in (slot and generation), and its lease. PIDs are
+/// monotonic and never reused, so the PID doubles as the lease generation.
+fn personality_principal(pid: u64) -> Result<rustos_component_model::personality::Principal, i32> {
+    let job = jobs::process_job(pid).map_err(|_| 3)?;
+    let principal = rustos_component_model::personality::Principal {
+        pid,
+        job_slot: (job >> 32) as u32,
+        job_generation: job as u32,
+        lease_generation: pid,
+    };
+    if principal.valid() { Ok(principal) } else { Err(3) }
 }
 
 /// Authenticate the exact live principal first, then intersect its
