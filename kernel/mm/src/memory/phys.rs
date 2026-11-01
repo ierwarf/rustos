@@ -68,7 +68,7 @@ pub use frame_descriptor_ledger::{
     CowFrameKind, CowMappingClaim, DataLeafRelease, SharedAliasTicket, bind_root_charge,
     root_admits, cancel_cow_mapping,
     cancel_data_leaf, cancel_lazy_table_record, cancel_private_file_data_leaf, cancel_shared_alias,
-    claim_data_leaf, claim_lazy_table_record, claim_private_file_data_leaf, commit_cow_mapping,
+    TableClaim, claim_data_leaf, claim_lazy_table_record, claim_private_file_data_leaf, commit_cow_mapping,
     data_leaf_count, data_leaf_cow_identity, data_leaf_is_owned, lazy_table_record_count,
     lazy_table_record_is_owned, pop_lazy_table_record, prepare_shared_alias,
     promote_cow_mapping_in_place, publish_data_leaf, publish_lazy_table_record,

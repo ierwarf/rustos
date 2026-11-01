@@ -63,7 +63,7 @@ pub use self::current::{
     current_pager_charge_snapshot, current_pager_fault_install_permit, current_pager_vma_snapshot,
     current_scheduling_context_runtime_snapshot, current_task_id, current_task_id_with_signal_hint,
     current_thread_may_have_pending_signals, current_user_abi, current_user_address_space,
-    current_user_id, current_user_ipc_entry, current_user_ipc_identity, current_user_job_policy_allows, current_user_log_ids, current_user_process_id, current_user_process_identity,
+    current_user_id, current_user_ipc_entry, current_user_ipc_identity, current_user_job_charge_group, current_user_job_policy_allows, current_user_log_ids, current_user_process_id, current_user_process_identity,
     current_user_process_thread_count, current_user_snapshot, current_user_stack_state,
     current_user_thread_id, current_user_wait_binding, demote_current_user_task_to_user_class,
     endpoint_receiver_still_waiting, exec_current_user_process, exec_user_process_by_pid,

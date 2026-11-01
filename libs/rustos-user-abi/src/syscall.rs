@@ -1085,6 +1085,14 @@ pub const JOB_KMEM_OP_SET_CLASS_LIMIT: u16 = 4;
 pub const JOB_KMEM_CLASS_HANDLE_TABLE: u32 = 1;
 /// Reserved queue storage of process-owned IPC endpoints.
 pub const JOB_KMEM_CLASS_IPC_ENDPOINT: u32 = 2;
+/// Page-table frames of the Job's address spaces.
+pub const JOB_KMEM_CLASS_PAGE_TABLE: u32 = 3;
+/// Kernel stacks of the Job's user threads.
+pub const JOB_KMEM_CLASS_THREAD: u32 = 4;
+/// Shared-mapping bookkeeping records.
+pub const JOB_KMEM_CLASS_VMA: u32 = 5;
+/// Queued synchronous-call messages, billed to the sending Job.
+pub const JOB_KMEM_CLASS_IPC_MESSAGE: u32 = 6;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

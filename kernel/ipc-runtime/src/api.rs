@@ -96,6 +96,26 @@ pub mod endpoint {
         )
     }
 
+    pub fn enqueue_call_with_handles_priority_custody_in_group(
+        endpoint: KernelEndpointHandle,
+        caller_task_id: u64,
+        request: &[u8],
+        attached_handles: &[KernelTransferredHandle],
+        priority: EndpointCallPriority,
+        scheduling_context: ReplySchedulingContextCustody,
+        kmem_group: Option<usize>,
+    ) -> Result<(KernelReplyHandle, Option<u64>), IpcError> {
+        crate::ipc::enqueue_endpoint_call_with_handles_priority_custody_in_group(
+            endpoint,
+            caller_task_id,
+            request,
+            attached_handles,
+            priority,
+            scheduling_context,
+            kmem_group,
+        )
+    }
+
     pub fn receiver_process_for_reply(reply: KernelReplyHandle) -> Option<u64> {
         crate::ipc::endpoint_receiver_process_for_reply(reply)
     }
@@ -501,6 +521,7 @@ pub use endpoint::{
     enqueue_call_with_handles as enqueue_endpoint_call_with_handles,
     enqueue_call_with_handles_and_priority as enqueue_endpoint_call_with_handles_and_priority,
     enqueue_call_with_handles_priority_and_custody as enqueue_endpoint_call_with_handles_priority_and_custody,
+    enqueue_call_with_handles_priority_custody_in_group as enqueue_endpoint_call_with_handles_priority_custody_in_group,
     fail_owned_by_process as fail_endpoints_owned_by_process,
     fail_owned_by_task as fail_endpoints_owned_by_task, recv as recv_endpoint,
     recv_with_limit as recv_endpoint_with_limit,

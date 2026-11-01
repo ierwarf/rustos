@@ -246,6 +246,15 @@ fn publish_inner(
     {
         return None;
     }
+    // The shared-mapping bookkeeping (fork-cloned records included) is billed
+    // the same way, so a Job's Vma budget refuses the publication.
+    if !object
+        .state
+        .get_mut()
+        .bind_mapping_kmem(object.job.index() as usize)
+    {
+        return None;
+    }
     let slot = table.lookup_slot_mut(reservation.handle)?;
     if slot.object.is_some()
         || slot.spawn_transaction_id != Some(reservation.transaction_id)
@@ -253,6 +262,16 @@ fn publish_inner(
     {
         return None;
     }
+    // The first thread's stack is billed with the process; nothing after this
+    // point can refuse the publication, so a charge never needs unwinding.
+    if !kernel_mm::api::kmem_charge::try_charge(
+        kernel_mm::api::kmem_charge::Class::Thread,
+        object.job.index() as usize,
+        super::THREAD_KMEM_BYTES,
+    ) {
+        return None;
+    }
+    object.thread_kmem = super::THREAD_KMEM_BYTES;
     // The root is quiescent until the process is visible, so binding it now
     // charges the image pages already mapped to the job exactly once.
     let root_phys = object.mm_execution.root_phys();

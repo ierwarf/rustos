@@ -390,6 +390,10 @@ fn broker_map_memfd_shared(args: &RustosMmBrokerArgs) -> Result<(), i64> {
         if !process_state.mapping_below_stack_guard(start, mapping_end) {
             return Err(LINUX_ENOMEM);
         }
+        // The Job's mapping-record budget refuses before any page is mapped.
+        if !process_state.admit_mapping_records(1) {
+            return Err(LINUX_ENOMEM);
+        }
         process_state
             .address_space_mut()
             .map_existing_user_pages_at(VirtAddr::new(start), &frames, page_flags)
@@ -487,6 +491,9 @@ fn broker_map_device_shared(args: &RustosMmBrokerArgs) -> Result<(), i64> {
         };
         if frames.len() != page_count {
             return Err(LINUX_EINVAL);
+        }
+        if !process_state.admit_mapping_records(1) {
+            return Err(LINUX_ENOMEM);
         }
         let region = if external_mapping.is_some() {
             process_state

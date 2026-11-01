@@ -958,10 +958,26 @@ The kernel now counts live and unreaped boxed ProcessObject allocations
 using the target kernel's exact size_of ProcessObject. Each ancestor Job's
 process-object kmem budget is checked under the publication lock, and loaderd
 sets a finite application limit through SYS_RUSTOS_JOB_KMEM after querying the
-object size. This covers the ProcessObject Box and, as a second class, descriptor-table
-slots (lock-free `kmem_charge` groups bound at process publication, refunded in
-`HandleTable::drop`; ops 3/4 of `SYS_RUSTOS_JOB_KMEM`). Page tables, VMA nodes
-and IPC allocations are still uncharged. Full
-kmem.max_bytes is therefore **not** finished. The signed service upgrade
+object size. This covers the ProcessObject Box and six lock-free `kmem_charge`
+classes (`SYS_RUSTOS_JOB_KMEM` ops 3/4 name them; loaderd sets an application
+budget for each):
+
+| Class | Billed object | Charged | Refunded |
+| --- | --- | --- | --- |
+| `HandleTable` | descriptor-table slots | process publication, table growth | `HandleTable::drop` |
+| `IpcEndpoint` | reserved endpoint queues | endpoint creation | endpoint teardown |
+| `PageTable` | root and every lazily published table frame (4 KiB) | `claim_table` (refused as `OutOfFrames`), root bind catch-up (forced) | `cancel_table`, `pop_table`, `unregister_root` |
+| `Thread` | the 2 MiB kernel stack of each user thread | process publication (first), `attach_task` | `detach_task`, `ProcessObject::drop` |
+| `Vma` | shared memfd / shared-region mapping records | before the mapping is installed (`admit_mapping_records`); list sync after | `Meter` drop, list shrink |
+| `IpcMessage` | a queued synchronous call (object, request copy, handle vector) | sender's group, before any allocation | `EndpointMessageObject::drop` |
+
+The allocation-free fast-call rendezvous allocates nothing and is not billed.
+Known limits: a thread's stack is allocated before `attach_task` bills it
+(overshoot bounded by one stack per CPU); splitting a shared mapping by unmap
+is charged without a limit check because unmap must not fail; pager VMA slots
+are a preallocated fixed table and are not a per-Job allocation. A boot-time
+smoke (`kmem page-table limit smoke passed`) drives the real allocator into the
+page-table limit on every boot. Full cgroup-style `kmem.max_bytes` aggregation
+across classes is still per-class, not one shared total. The signed service upgrade
 and recovery state are likewise only partially wired. See
 [8-stage source ledger](../validation/ring3-8stage-status.md).

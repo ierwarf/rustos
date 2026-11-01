@@ -765,6 +765,10 @@ pub(super) const SESSION_OWNER_SLOTS: usize = 64;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct SessionToken {
     owner_pid: u64,
+    /// Kernel process-slot generation of the incarnation that charged this
+    /// token. A reused PID is a different incarnation and cannot replay,
+    /// adopt or collide with it.
+    owner_generation: u32,
     token: u64,
     client_pid: u64,
     job: JobId,
@@ -772,6 +776,7 @@ pub(super) struct SessionToken {
 impl SessionToken {
     pub(super) const EMPTY: Self = Self {
         owner_pid: 0,
+        owner_generation: 0,
         token: 0,
         client_pid: 0,
         job: ROOT_JOB,
@@ -781,10 +786,13 @@ impl SessionToken {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct SessionOwner {
     pid: u64,
+    /// Incarnation (process-slot generation) the watermark belongs to; zero
+    /// only for a tombstone written by a release that never saw a charge.
+    generation: u32,
     high_watermark: u64,
 }
 impl SessionOwner {
-    pub(super) const EMPTY: Self = Self { pid: 0, high_watermark: 0 };
+    pub(super) const EMPTY: Self = Self { pid: 0, generation: 0, high_watermark: 0 };
 }
 
 fn client_job_live_locked(table: &ProcessTable, pid: u64, job: JobId) -> bool {
@@ -866,15 +874,22 @@ pub fn job_charge_client_session_token(
         return Err(JobError::Stale);
     }
     let mut table = PROCESS_TABLE.lock();
-    if !table.slots.iter().filter_map(|slot| slot.object.as_deref())
-        .any(|object| object.process_id == owner_pid && !object.exiting)
-    {
-        return Err(JobError::Stale);
-    }
+    // The provider's kernel incarnation: its process-slot generation, which
+    // advances every time the slot is reused, so a recycled PID is distinct.
+    let owner_generation = table.slots.iter()
+        .find_map(|slot| {
+            slot.object.as_deref()
+                .filter(|object| object.process_id == owner_pid && !object.exiting)
+                .map(|_| slot.generation)
+        })
+        .ok_or(JobError::Stale)?;
     if let Some(existing) = table.session_tokens.iter()
         .find(|entry| entry.owner_pid == owner_pid && entry.token == token)
     {
-        if existing.client_pid != client_pid || existing.job != expected_job {
+        if existing.owner_generation != owner_generation
+            || existing.client_pid != client_pid
+            || existing.job != expected_job
+        {
             return Err(JobError::Stale);
         }
         return session_info_locked(&table, expected_job);
@@ -888,6 +903,12 @@ pub fn job_charge_client_session_token(
             .ok_or(JobError::Full)?,
     };
     let owner = table.session_owners[owner_index];
+    // One ledger per PID: a new incarnation of a reused PID is refused until
+    // the supervisor has drained the previous incarnation's tokens and
+    // watermark (provider-exit reconciliation), so the two can never mix.
+    if owner.pid == owner_pid && owner.generation != 0 && owner.generation != owner_generation {
+        return Err(JobError::Stale);
+    }
     if owner.pid == owner_pid && token <= owner.high_watermark {
         // Old refunded or canceled token, never reissued in this lifetime.
         return Err(JobError::Stale);
@@ -901,10 +922,10 @@ pub fn job_charge_client_session_token(
     session_charge_preflight(&table, expected_job)?;
     adjust_session_chain(&mut table, expected_job, true);
     table.session_tokens[slot_index] = SessionToken {
-        owner_pid, token, client_pid, job: expected_job,
+        owner_pid, owner_generation, token, client_pid, job: expected_job,
     };
     table.session_owners[owner_index] = SessionOwner {
-        pid: owner_pid, high_watermark: token,
+        pid: owner_pid, generation: owner_generation, high_watermark: token,
     };
     session_info_locked(&table, expected_job)
 }
@@ -944,6 +965,7 @@ pub fn job_release_client_session_token(
         table.release_dead_jobs();
         table.session_owners[owner_index] = SessionOwner {
             pid: owner_pid,
+            generation: existing.owner_generation,
             high_watermark: table.session_owners[owner_index].high_watermark.max(token),
         };
         return Ok(Some(info));
@@ -963,6 +985,7 @@ pub fn job_release_client_session_token(
     }
     table.session_owners[owner_index] = SessionOwner {
         pid: owner_pid,
+        generation: table.session_owners[owner_index].generation,
         high_watermark: table.session_owners[owner_index].high_watermark.max(token),
     };
     Ok(None)

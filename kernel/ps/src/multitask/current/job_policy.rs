@@ -32,6 +32,25 @@ pub fn current_user_job_policy_allows(operation: u16) -> bool {
     })
 }
 
+/// The current user process's Job charge group, by the same lock-free
+/// published-identity path as the policy check. `None` for kernel tasks,
+/// unpublished processes and preemption-disabled callers: the caller then
+/// bills nothing rather than guessing a group.
+pub fn current_user_job_charge_group() -> Option<usize> {
+    if nucleus_core::util::lockdep::preemption_disabled() || !current_cpu_task_slot_admitted() {
+        return None;
+    }
+    interrupts::without_interrupts(|| {
+        let binding = match published_current_identity() {
+            Some(identity) => identity.user_binding(),
+            None => owned_current_user_binding(),
+        };
+        let (_, _, handle, _) = binding?;
+        let job = process_table::published_process_job(handle)?;
+        (process_table::published_process_job(handle) == Some(job)).then(|| job.charge_group())
+    })
+}
+
 pub(in crate::multitask) fn policy_for_binding(
     handle: process_table::ProcessHandle, operation: u16,
 ) -> bool {

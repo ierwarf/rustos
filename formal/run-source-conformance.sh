@@ -1240,7 +1240,7 @@ if ! rg -Uq 'struct ReplyObject \{[^}]*scheduling_context: Option<ReplySchedulin
     || [ "$(rg -c 'reply_object\.scheduling_context\.take\(\)|reply\.scheduling_context\.take\(\)' "$ipc_runtime_source")" -ne 7 ] \
     || ! rg -Fq 'pub scheduling_context: Option<ReplySchedulingContextCustody>' "$ipc_runtime_source" \
     || ! rg -Fq 'ensure_reply_has_no_scheduling_context(reply)?;' "$ipc_runtime_source" \
-    || ! rg -Fq 'enqueue_endpoint_call_with_handles_priority_and_custody(' kernel/compat/src/user/syscall/linux/ipc_ops.rs \
+    || ! rg -Fq 'enqueue_endpoint_call_with_handles_priority_custody_in_group(' kernel/compat/src/user/syscall/linux/ipc_ops.rs \
     || ! rg -Fq 'settle_endpoint_scheduling_contexts(&wake_set);' kernel/ps/src/multitask/scheduler/reclaim.rs; then
     echo 'reply-owned scheduling-context custody no longer covers reply, cancel, owner failure, and retirement exactly once' >&2
     exit 1

@@ -996,9 +996,17 @@ fn ensure_next_table(
     // mapper or an IRQ-off fault won the directory CAS, has one root-owned
     // descriptor. The claim precedes publication so a reachable table never
     // exists outside that ledger.
-    if !phys::claim_lazy_table_record(root_phys, table_phys.as_u64()) {
-        let _ = phys::try_free_frame(table_phys);
-        return Err(AddressSpaceError::InvalidFrameOwnership);
+    match phys::claim_lazy_table_record(root_phys, table_phys.as_u64()) {
+        phys::TableClaim::Claimed => {}
+        // The Job's page-table budget refuses like a frame-allocation failure.
+        phys::TableClaim::Quota => {
+            let _ = phys::try_free_frame(table_phys);
+            return Err(AddressSpaceError::OutOfFrames);
+        }
+        phys::TableClaim::Invalid => {
+            let _ = phys::try_free_frame(table_phys);
+            return Err(AddressSpaceError::InvalidFrameOwnership);
+        }
     }
 
     // The mutation guard excludes every other normal-time writer, but not the
@@ -1253,6 +1261,44 @@ fn higher_half_ptr(phys: PhysAddr) -> *mut u8 {
     kernel_vm::higher_half_addr(phys.as_u64()) as *mut u8
 }
 
+/// Boot-time proof that a Job's page-table budget actually binds in the real
+/// allocator: the root and one directory fit, the next table is refused with
+/// `OutOfFrames`, and lifting the limit lets the same mapping succeed. Uses the
+/// last charge group, which no Job can hold this early; its retirement drains
+/// the charge later and the job layer waits for that before reusing the slot.
+fn kmem_limit_smoke() {
+    use crate::memory::{charge, kmem_charge};
+
+    const GROUP: usize = charge::CHARGE_GROUPS - 1;
+    const TABLE_BYTES: u64 = 4096;
+    kmem_charge::init_group(GROUP, None);
+    let mut space =
+        ProcessAddressSpace::new().expect("kmem smoke address space allocation must succeed");
+    assert!(phys::bind_root_charge(space.root_phys().as_u64(), GROUP));
+    assert_eq!(kmem_charge::usage(kmem_charge::Class::PageTable, GROUP), TABLE_BYTES);
+    kmem_charge::set_limit(kmem_charge::Class::PageTable, GROUP, 2 * TABLE_BYTES);
+    let flags = PageTableFlags::WRITABLE | PageTableFlags::NO_EXECUTE;
+    let refused = space.alloc_user_bytes(4096, flags);
+    let held = kmem_charge::usage(kmem_charge::Class::PageTable, GROUP);
+    assert!(
+        matches!(refused, Err(AddressSpaceError::OutOfFrames)),
+        "page-table budget did not refuse the third frame: {refused:?}"
+    );
+    assert!(held <= 2 * TABLE_BYTES, "page-table usage {held} exceeds its limit");
+    kmem_charge::set_limit(kmem_charge::Class::PageTable, GROUP, charge::UNLIMITED);
+    space
+        .alloc_user_bytes(4096, flags)
+        .expect("mapping succeeds once the page-table budget is lifted");
+    // `println!` is compiled out of release images, so the proof is a milestone
+    // (refused at `held` bytes, then mapped within the lifted budget).
+    nucleus_core::debug::record_milestone(
+        nucleus_core::debug::LogCategory::Memory,
+        "kmem-page-table-limit-smoke",
+        held,
+        kmem_charge::usage(kmem_charge::Class::PageTable, GROUP),
+    );
+}
+
 pub fn smoke_test() {
     use crate::debug;
 
@@ -1287,6 +1333,7 @@ pub fn smoke_test() {
         region.start.as_u64(),
         phys.as_u64()
     );
+    kmem_limit_smoke();
 }
 
 #[cfg(test)]

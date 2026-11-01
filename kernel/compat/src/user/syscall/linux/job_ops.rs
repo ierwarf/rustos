@@ -454,6 +454,20 @@ pub(super) fn syscall_linux_rustos_job_session(args_ptr: u64) -> u64 {
 
 
 
+fn kmem_class_from_abi(id: u32) -> Option<kernel_mm::api::kmem_charge::Class> {
+    use kernel_mm::api::kmem_charge::Class;
+    use rustos_user_abi::syscall::*;
+    Some(match id {
+        JOB_KMEM_CLASS_HANDLE_TABLE => Class::HandleTable,
+        JOB_KMEM_CLASS_IPC_ENDPOINT => Class::IpcEndpoint,
+        JOB_KMEM_CLASS_PAGE_TABLE => Class::PageTable,
+        JOB_KMEM_CLASS_THREAD => Class::Thread,
+        JOB_KMEM_CLASS_VMA => Class::Vma,
+        JOB_KMEM_CLASS_IPC_MESSAGE => Class::IpcMessage,
+        _ => return None,
+    })
+}
+
 /// Rights-scoped boxed ProcessObject kmem budget. This is real accounting of
 /// exactly one kernel allocation class; it must not be mistaken for a total
 /// kernel-memory quota until other allocation/free owners are integrated.
@@ -466,7 +480,7 @@ pub(super) fn syscall_linux_rustos_job_kmem(ptr: u64) -> u64 {
     };
     let class_op = matches!(args.op, JOB_KMEM_OP_INSPECT_CLASS | JOB_KMEM_OP_SET_CLASS_LIMIT);
     let flags_ok = if class_op {
-        matches!(args.flags, JOB_KMEM_CLASS_HANDLE_TABLE | JOB_KMEM_CLASS_IPC_ENDPOINT)
+        kmem_class_from_abi(args.flags).is_some()
     } else {
         args.flags == 0
     };
@@ -508,10 +522,8 @@ pub(super) fn syscall_linux_rustos_job_kmem(ptr: u64) -> u64 {
     };
     if class_op {
         // `flags` was validated against the known class ids above.
-        let class = if args.flags == JOB_KMEM_CLASS_IPC_ENDPOINT {
-            kernel_mm::api::kmem_charge::Class::IpcEndpoint
-        } else {
-            kernel_mm::api::kmem_charge::Class::HandleTable
+        let Some(class) = kmem_class_from_abi(args.flags) else {
+            return linux_errno(LINUX_EINVAL);
         };
         let result = if args.op == JOB_KMEM_OP_INSPECT_CLASS {
             multitask::job_kmem_class_info(job, class)

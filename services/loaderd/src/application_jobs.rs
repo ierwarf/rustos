@@ -133,6 +133,10 @@ impl Jobs for NativeJobs {
             for (class_id, budget) in [
                 (JOB_KMEM_CLASS_HANDLE_TABLE, APPLICATION_HANDLE_TABLE_BUDGET_BYTES),
                 (JOB_KMEM_CLASS_IPC_ENDPOINT, APPLICATION_IPC_ENDPOINT_BUDGET_BYTES),
+                (JOB_KMEM_CLASS_PAGE_TABLE, APPLICATION_PAGE_TABLE_BUDGET_BYTES),
+                (JOB_KMEM_CLASS_THREAD, APPLICATION_THREAD_BUDGET_BYTES),
+                (JOB_KMEM_CLASS_VMA, APPLICATION_VMA_BUDGET_BYTES),
+                (JOB_KMEM_CLASS_IPC_MESSAGE, APPLICATION_IPC_MESSAGE_BUDGET_BYTES),
             ] {
                 let mut class = RustosJobKmemArgs {
                     abi_version: JOB_KMEM_ABI_VERSION,
@@ -164,6 +168,17 @@ impl Jobs for NativeJobs {
 const APPLICATION_HANDLE_TABLE_BUDGET_BYTES: u64 = 8 * 1024 * 1024;
 /// Per-application-Job ceiling for reserved IPC endpoint queue storage.
 const APPLICATION_IPC_ENDPOINT_BUDGET_BYTES: u64 = 4 * 1024 * 1024;
+/// Page-table frames: 64 MiB maps well over the 2 GiB resident ceiling even
+/// when sparse (one table covers 2 MiB).
+const APPLICATION_PAGE_TABLE_BUDGET_BYTES: u64 = 64 * 1024 * 1024;
+/// Kernel stacks: the Job's 64-thread limit times the 2 MiB stack, so the
+/// thread count stays the binding limit for well-behaved applications and
+/// this class only stops a Job from pinning stacks beyond it.
+const APPLICATION_THREAD_BUDGET_BYTES: u64 = 64 * 2 * 1024 * 1024;
+/// Shared-mapping bookkeeping records.
+const APPLICATION_VMA_BUDGET_BYTES: u64 = 4 * 1024 * 1024;
+/// Queued synchronous-call messages sent by the application.
+const APPLICATION_IPC_MESSAGE_BUDGET_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Clone, Copy)]
 struct Authority {

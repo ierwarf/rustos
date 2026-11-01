@@ -581,12 +581,15 @@ fn apply_kvm_acceptance_contract(entry: &mut LaunchEntry) {
     // the 55 FPS gate can be measured at all. The uiserver branch demonstrably
     // fires; this records the identity actually seen here so a mismatch names
     // itself instead of being inferred from an absent profile line.
-    boot_line(
-        format!(
-            "runtimed: acceptance contract applied desktop_id={} ui_profile={} network_exercise={}",
-            entry.desktop_file_id, contract.ui_profile, contract.network_exercise
-        )
-        .as_str(),
+    // `boot_line` never reaches the debugcon log in the KVM image, so the
+    // identity actually seen is reported through the observability channel.
+    observability_client::info!(
+        "runtimed",
+        service,
+        "acceptance contract applied desktop_id={} ui_profile={} network_exercise={}",
+        entry.desktop_file_id,
+        contract.ui_profile,
+        contract.network_exercise
     );
     if contract.network_exercise && entry.desktop_file_id == "netprobe.desktop" {
         upsert_env(&mut entry.env, "RUSTOS_NETPROBE_QEMU=1");
@@ -599,6 +602,10 @@ fn load_kvm_acceptance_contract() -> Option<KvmAcceptanceContract> {
     // unrelated checkpoint burst; positioned bounded I/O is the same path
     // used by the admitted runtime registries.
     static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    // The first launches precede the admitted volume, so a failure is normal
+    // there. Later failures are reported too (bounded), because a contract that
+    // stays unreadable silently disables the network exercise.
+    static FAILURES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let contents = match read_bounded_config_snapshot(
         KVM_ACCEPTANCE_CONTRACT_PATH,
         KVM_ACCEPTANCE_CONTRACT_MAX_BYTES,
@@ -607,11 +614,13 @@ fn load_kvm_acceptance_contract() -> Option<KvmAcceptanceContract> {
         Err(error) => {
             // Absence is the normal product case; any other failure would
             // silently disable a KVM acceptance contract, so say so once.
-            if !REPORTED.swap(true, Ordering::Relaxed) {
+            let failures = FAILURES.fetch_add(1, Ordering::Relaxed);
+            if !REPORTED.swap(true, Ordering::Relaxed) || (1..16).contains(&failures) {
                 observability_client::warn!(
                     "runtimed",
                     service,
-                    "kvm acceptance contract unreadable: {error:?}"
+                    "kvm acceptance contract unreadable (attempt {}): {error:?}",
+                    failures + 1
                 );
             }
             return None;

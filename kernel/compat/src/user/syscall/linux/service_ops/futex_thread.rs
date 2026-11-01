@@ -61,6 +61,9 @@ static FUTEX_WAITERS: TrackedSpinLock<
 // Keep it local and allocation-free: putting a synchronous policy-service
 // call before waiter/deadline registration can stall every userspace mutex and
 // lets an unpark race ahead of the target's waiter installation.
+/// Bounded retries of a futex whose word was transiently copy-on-write.
+const FUTEX_COW_RETRIES: u32 = 16;
+
 pub fn futex_impl(uaddr: u64, op: u64, val: u64, timeout_ptr: u64, uaddr2: u64, val3: u64) -> u64 {
     if (uaddr & 0x3) != 0 {
         return linux_errno(LINUX_EINVAL);
@@ -69,7 +72,7 @@ pub fn futex_impl(uaddr: u64, op: u64, val: u64, timeout_ptr: u64, uaddr2: u64, 
         return linux_errno(errno);
     }
     let cmd = op & linux_abi::FUTEX_CMD_MASK;
-    let result = match cmd {
+    let dispatch = || match cmd {
         c if c == linux_abi::FUTEX_WAIT => futex_wait(
             uaddr,
             val as u32,
@@ -94,6 +97,30 @@ pub fn futex_impl(uaddr: u64, op: u64, val: u64, timeout_ptr: u64, uaddr2: u64, 
         }
         _ => Err(LINUX_ENOSYS),
     };
+    let mut result = dispatch();
+    // The kernel reads and writes futex words as atomics on the physical page,
+    // which needs a present, writable mapping. A concurrent fork() in this
+    // multi-threaded process downgrades the whole parent to copy-on-write, so
+    // a perfectly valid word can be read-only for an instant; glibc treats the
+    // EFAULT that follows as fatal ("unexpected error code"). Break the
+    // sharing through the owner-resolving user-copy path and retry. EFAULT is
+    // raised before any waiter is registered or any queue is mutated, so the
+    // retry is exact. A genuinely bad address still fails resolution once.
+    let mut attempts = 0;
+    while result == Err(LINUX_EFAULT) && attempts < FUTEX_COW_RETRIES {
+        attempts += 1;
+        let word = size_of::<u32>();
+        let second_word = matches!(
+            cmd,
+            c if c == linux_abi::FUTEX_REQUEUE || c == linux_abi::FUTEX_CMP_REQUEUE
+        );
+        if usermem::validate_current_user_write_buffer(uaddr, word).is_err()
+            || (second_word && usermem::validate_current_user_write_buffer(uaddr2, word).is_err())
+        {
+            break;
+        }
+        result = dispatch();
+    }
     // A successful pthread join resumes through FUTEX_WAIT after the exiting
     // child cleared its TID. Advance the same bounded retirement owner used by
     // wait4 before returning to the joining thread, otherwise a tight
@@ -142,6 +169,24 @@ fn current_process_is_procd_policy_owner() -> bool {
 // RING3-MIGRATION-REFERENCE START: scheduler-thread substrate exception: procd
 // owns Linux clone/thread admission policy. Ring0 keeps final
 // same-address-space thread spawn and register substrate.
+/// Names the step of a thread clone that failed. The bare errno of
+/// `linux-thread-clone-rejected` cannot tell a procd plan refusal from a user
+/// pointer that was not writable, which is the question that matters under
+/// concurrent address-space churn. Bounded so a failure storm stays cheap.
+fn clone_stage_failed(stage: u64, errno: i64, address: u64) -> u64 {
+    static RECORDED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    // ORDERING: Relaxed; a counter bounding telemetry volume.
+    if stage != 1 && RECORDED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 32 {
+        nucleus_core::debug::record_milestone(
+            nucleus_core::debug::LogCategory::Compat,
+            "linux-thread-clone-stage",
+            (stage << 32) | (errno.unsigned_abs() & 0xffff_ffff),
+            address,
+        );
+    }
+    linux_errno(errno)
+}
+
 pub fn clone_linux_thread(
     frame: &SyscallFrame,
     flags: u64,
@@ -178,10 +223,28 @@ pub fn clone_linux_thread(
         request.arg4 = tls;
         match call_procd(&request).and_then(|response| ensure_empty_procd_response(&response)) {
             Ok(()) => {}
-            Err(errno) => return linux_errno(errno),
+            Err(errno) => return clone_stage_failed(1, errno, 0),
         }
     }
 
+    // The tid words live in the new thread's stack block, which a concurrent
+    // fork in this multi-threaded process may have just made copy-on-write.
+    // Only the owner-resolving user-copy path breaks that sharing; the raw
+    // address-space writer reports EFAULT for a perfectly valid address.
+    if flags & linux_abi::CLONE_PARENT_SETTID != 0 {
+        if let Err(error) =
+            usermem::validate_current_user_write_buffer(parent_tid_ptr, size_of::<u32>())
+        {
+            return clone_stage_failed(2, address_space_error_to_linux_errno(error), parent_tid_ptr);
+        }
+    }
+    if flags & linux_abi::CLONE_CHILD_SETTID != 0 {
+        if let Err(error) =
+            usermem::validate_current_user_write_buffer(child_tid_ptr, size_of::<u32>())
+        {
+            return clone_stage_failed(3, address_space_error_to_linux_errno(error), child_tid_ptr);
+        }
+    }
     let Some(console_session) = multitask::current_console_session() else {
         return linux_errno(LINUX_EINVAL);
     };
@@ -193,17 +256,6 @@ pub fn clone_linux_thread(
             let Some(parent_thread_state) = linux_thread_state.as_ref() else {
                 return Err(LINUX_ENOSYS);
             };
-            if flags & linux_abi::CLONE_PARENT_SETTID != 0 {
-                address_space
-                    .validate_user_write_buffer(VirtAddr::new(parent_tid_ptr), size_of::<u32>())
-                    .map_err(address_space_error_to_linux_errno)?;
-            }
-            if flags & linux_abi::CLONE_CHILD_SETTID != 0 {
-                address_space
-                    .validate_user_write_buffer(VirtAddr::new(child_tid_ptr), size_of::<u32>())
-                    .map_err(address_space_error_to_linux_errno)?;
-            }
-
             let mut child_thread_state = *parent_thread_state;
             if flags & linux_abi::CLONE_SETTLS != 0 {
                 child_thread_state.fs_base = tls;
@@ -268,33 +320,16 @@ pub fn clone_linux_thread(
     };
     let child_tid_bytes = (child_tid as u32).to_le_bytes();
     if flags & (linux_abi::CLONE_PARENT_SETTID | linux_abi::CLONE_CHILD_SETTID) != 0 {
-        let result = multitask::with_current_user_process_state_mut(|_, abi, process_state| {
-            if abi != crate::user::abi::UserAbi::Linux {
-                return Err(LINUX_ENOSYS);
-            }
-            let address_space = process_state.address_space();
-            if flags & linux_abi::CLONE_PARENT_SETTID != 0 {
-                address_space
-                    .copy_into_user(VirtAddr::new(parent_tid_ptr), &child_tid_bytes)
-                    .map_err(address_space_error_to_linux_errno)?;
-            }
-            if flags & linux_abi::CLONE_CHILD_SETTID != 0 {
-                address_space
-                    .copy_into_user(VirtAddr::new(child_tid_ptr), &child_tid_bytes)
-                    .map_err(address_space_error_to_linux_errno)?;
-            }
-            Ok(())
-        });
-        match result {
-            Some(Ok(())) => {}
-            Some(Err(errno)) => {
-                let _ = multitask::terminate_user_task(child_tid);
-                return linux_errno(errno);
-            }
-            None => {
-                let _ = multitask::terminate_user_task(child_tid);
-                return linux_errno(LINUX_ENOSYS);
-            }
+        let mut result = Ok(());
+        if flags & linux_abi::CLONE_PARENT_SETTID != 0 {
+            result = usermem::write_current_user_bytes(parent_tid_ptr, &child_tid_bytes);
+        }
+        if result.is_ok() && flags & linux_abi::CLONE_CHILD_SETTID != 0 {
+            result = usermem::write_current_user_bytes(child_tid_ptr, &child_tid_bytes);
+        }
+        if let Err(error) = result {
+            let _ = multitask::terminate_user_task(child_tid);
+            return clone_stage_failed(4, address_space_error_to_linux_errno(error), parent_tid_ptr);
         }
     }
     if !multitask::activate_suspended_user_task(child_tid) {
@@ -1031,6 +1066,14 @@ pub fn cleanup_linux_thread_exit() {
     .flatten();
     if let Some((process_id, task_id, clear_child_tid, robust_list_head, robust_list_len)) = cleanup
     {
+        // The tid word is stored as an atomic on the physical page under the
+        // process-state lock, which cannot break copy-on-write. If a sibling's
+        // fork() just shared the page, the store would silently fail and the
+        // joiner would sleep forever, so resolve the sharing first. Best
+        // effort: a fork landing between this and the store can still win.
+        if clear_child_tid != 0 {
+            let _ = usermem::validate_current_user_write_buffer(clear_child_tid, size_of::<u32>());
+        }
         let _ = cleanup_retired_linux_thread_state(
             task_id,
             process_id,

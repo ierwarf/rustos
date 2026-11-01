@@ -29,7 +29,7 @@ fn one_catalog_tracks_tables_and_exact_data_leaves() {
     let frame = PAGE_SIZE * 3;
     let va = 0x8000_4000;
     ledger.register_root(root);
-    assert!(ledger.claim_table(root, table));
+    assert_eq!(ledger.claim_table(root, table), TableClaim::Claimed);
     ledger.publish_table(root, table);
     assert!(ledger.claim_exclusive_data(root, va, frame));
     ledger.publish_exclusive_data(root, va, frame);
@@ -317,4 +317,60 @@ fn a_claim_that_is_cancelled_never_reaches_the_group() {
     ledger.cancel_exclusive_data(root, 0x8000_4000, frame);
     assert_eq!(crate::memory::charge::usage(18), 0, "charging happens at publication");
     ledger.unregister_root(root);
+}
+
+#[test]
+fn page_table_frames_are_billed_at_claim_and_refunded_exactly_once() {
+    use crate::memory::kmem_charge::{self, Class};
+    let (ledger, _records, _mappings) = ledger();
+    let root = PAGE_SIZE;
+    let (t1, t2, t3) = (PAGE_SIZE * 2, PAGE_SIZE * 3, PAGE_SIZE * 4);
+    kmem_charge::init_group(20, None);
+    ledger.register_root(root);
+    assert_eq!(ledger.claim_table(root, t1), TableClaim::Claimed);
+    ledger.publish_table(root, t1);
+    assert_eq!(kmem_charge::usage(Class::PageTable, 20), 0, "unbound roots charge nothing");
+    assert!(ledger.bind_charge(root, 20));
+    assert_eq!(
+        kmem_charge::usage(Class::PageTable, 20),
+        2 * PAGE_SIZE,
+        "binding catches up the root frame and the published table"
+    );
+    kmem_charge::set_limit(Class::PageTable, 20, 3 * PAGE_SIZE);
+    assert_eq!(ledger.claim_table(root, t2), TableClaim::Claimed);
+    assert_eq!(
+        ledger.claim_table(root, t3),
+        TableClaim::Quota,
+        "the Job's page-table budget refuses the fourth frame"
+    );
+    assert_eq!(kmem_charge::usage(Class::PageTable, 20), 3 * PAGE_SIZE);
+    ledger.cancel_table(root, t2);
+    assert_eq!(kmem_charge::usage(Class::PageTable, 20), 2 * PAGE_SIZE, "cancel refunds");
+    assert_eq!(ledger.claim_table(root, t3), TableClaim::Claimed);
+    ledger.publish_table(root, t3);
+    while ledger.pop_table(root).is_some() {}
+    assert_eq!(kmem_charge::usage(Class::PageTable, 20), PAGE_SIZE, "only the root remains");
+    ledger.unregister_root(root);
+    assert_eq!(kmem_charge::usage(Class::PageTable, 20), 0);
+}
+
+#[test]
+fn a_failed_table_claim_does_not_leak_its_charge() {
+    use crate::memory::kmem_charge::{self, Class};
+    let (ledger, _records, _mappings) = ledger();
+    let root = PAGE_SIZE;
+    let table = PAGE_SIZE * 2;
+    kmem_charge::init_group(21, None);
+    ledger.register_root(root);
+    assert!(ledger.bind_charge(root, 21));
+    assert_eq!(ledger.claim_table(root, table), TableClaim::Claimed);
+    assert_eq!(
+        ledger.claim_table(root, table),
+        TableClaim::Invalid,
+        "a frame already claimed is not claimable twice"
+    );
+    assert_eq!(kmem_charge::usage(Class::PageTable, 21), 2 * PAGE_SIZE);
+    ledger.cancel_table(root, table);
+    ledger.unregister_root(root);
+    assert_eq!(kmem_charge::usage(Class::PageTable, 21), 0);
 }

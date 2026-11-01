@@ -229,7 +229,7 @@ const NO_IDLE_CPU: u8 = u8::MAX;
 // Kernel-side Rust paths during syscall, process load, and service orchestration are deep in
 // no-opt/debug builds. Keep a generous per-task kernel stack so corrupted return frames do not
 // silently spill into adjacent scheduler storage.
-const TASK_STACK_SIZE: usize = 2 * 1024 * 1024;
+pub(super) const TASK_STACK_SIZE: usize = 2 * 1024 * 1024;
 const TASK_STACK_GUARD_BYTES: usize = 256;
 const STACK_CANARY_WORD: u64 = 0x5343_4844_554c_4552;
 const TASK_ENTRY_STACK_RESERVE_QWORDS: usize = 3;

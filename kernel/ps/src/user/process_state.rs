@@ -189,6 +189,9 @@ pub struct UserProcessState {
     mapping_cursor: u64,
     shared_memfd_mappings: Vec<SharedMemfdMapping>,
     shared_region_mappings: Vec<SharedRegionMapping>,
+    /// Bytes of the two mapping lists above, billed to the Job as
+    /// `Class::Vma` once the process is published.
+    mapping_kmem: kernel_mm::api::kmem_charge::Meter,
     exec_path: [u8; PROCESS_EXEC_PATH_CAPACITY],
     exec_path_len: usize,
 }
@@ -371,6 +374,9 @@ impl UserProcessState {
             mapping_cursor: default_cursor,
             shared_memfd_mappings: Vec::new(),
             shared_region_mappings: Vec::new(),
+            mapping_kmem: kernel_mm::api::kmem_charge::Meter::new(
+                kernel_mm::api::kmem_charge::Class::Vma,
+            ),
             exec_path: [0; PROCESS_EXEC_PATH_CAPACITY],
             exec_path_len: 0,
         };
@@ -447,6 +453,7 @@ impl UserProcessState {
             backing_offset,
             hold,
         });
+        self.sync_mapping_kmem();
     }
 
     pub fn shared_memfd_overlap_segments(&self, start: u64, end: u64) -> Vec<(u64, usize)> {
@@ -492,6 +499,7 @@ impl UserProcessState {
             }
         }
         self.shared_memfd_mappings = updated;
+        self.sync_mapping_kmem();
     }
 
     pub fn record_shared_region_mapping(
@@ -506,6 +514,7 @@ impl UserProcessState {
             backing_offset: 0,
             hold,
         });
+        self.sync_mapping_kmem();
     }
 
     pub fn shared_region_overlap_segments(&self, start: u64, end: u64) -> Vec<(u64, u64)> {
@@ -545,6 +554,44 @@ impl UserProcessState {
             }
         }
         self.shared_region_mappings = updated;
+        self.sync_mapping_kmem();
+    }
+
+    fn mapping_kmem_total(&self) -> u64 {
+        (self.shared_memfd_mappings.len() * core::mem::size_of::<SharedMemfdMapping>()
+            + self.shared_region_mappings.len() * core::mem::size_of::<SharedRegionMapping>())
+            as u64
+    }
+
+    /// Re-aims the Job charge at the lists' exact byte total. Callers run it
+    /// after the list changed, so it cannot refuse: the new record already
+    /// exists (admission was `admit_mapping_records`) and a split by unmap
+    /// must not fail. A shrink refunds.
+    fn sync_mapping_kmem(&mut self) {
+        let total = self.mapping_kmem_total();
+        self.mapping_kmem.set_total_forced(total);
+    }
+
+    /// Bills the mapping lists to `group` (the Job's charge group); refused,
+    /// charging nothing, when the budget cannot hold the records already
+    /// present. A state binds once.
+    pub fn bind_mapping_kmem(&mut self, group: usize) -> bool {
+        let total = self.mapping_kmem_total();
+        self.mapping_kmem.bind(group, total)
+    }
+
+    /// Whether `extra` more shared-mapping records fit the Job's `Vma`
+    /// budget. Called before the mapping is installed so a refusal leaves
+    /// nothing to unwind.
+    pub fn admit_mapping_records(&self, extra: usize) -> bool {
+        let per_record = core::mem::size_of::<SharedMemfdMapping>()
+            .max(core::mem::size_of::<SharedRegionMapping>());
+        self.mapping_kmem
+            .would_admit(self.mapping_kmem_total() + (extra * per_record) as u64)
+    }
+
+    pub fn mapping_kmem_charged(&self) -> u64 {
+        self.mapping_kmem.charged()
     }
 
     /// Resolve a process-shared futex through retained VMA backing metadata.
@@ -656,6 +703,8 @@ impl UserProcessState {
             mapping_cursor: self.mapping_cursor,
             shared_memfd_mappings: self.shared_memfd_mappings.clone(),
             shared_region_mappings: self.shared_region_mappings.clone(),
+            // A fork child is billed when it is published, not when cloned.
+            mapping_kmem: self.mapping_kmem.clone(),
             exec_path: [0; PROCESS_EXEC_PATH_CAPACITY],
             exec_path_len: 0,
         };
@@ -669,6 +718,7 @@ impl UserProcessState {
         self.security = parent.security;
         self.mapping_cursor = parent.mapping_cursor;
         self.shared_memfd_mappings = parent.shared_memfd_mappings.clone();
+        self.sync_mapping_kmem();
         self.set_exec_path(parent.exec_path());
     }
 
@@ -693,6 +743,7 @@ impl UserProcessState {
             mapping_cursor,
             shared_memfd_mappings,
             shared_region_mappings,
+            mapping_kmem,
             exec_path,
             exec_path_len,
         } = self;
@@ -708,6 +759,7 @@ impl UserProcessState {
             mapping_cursor,
             shared_memfd_mappings,
             shared_region_mappings,
+            mapping_kmem,
             exec_path,
             exec_path_len,
         ));
@@ -744,6 +796,10 @@ impl UserProcessState {
             exec_path,
         );
         fresh.handles = handles;
+        // The Job binding survives exec; exec leaves no shared mappings, so
+        // the new lists are empty and the old bytes are refunded now.
+        fresh.mapping_kmem.adopt(&mut self.mapping_kmem);
+        fresh.sync_mapping_kmem();
         fresh.security = security;
         for (signal, ignored) in preserved_ignored
             .iter()

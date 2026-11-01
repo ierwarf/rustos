@@ -498,6 +498,7 @@ fn endpoint_fault_boundaries_fail_before_queue_or_reply_mutation() {
                 &[],
                 super::EndpointCallPriority::Ordinary,
                 None,
+                None,
                 true,
             ),
             Err(IpcError::NoMemory)
@@ -516,6 +517,65 @@ fn endpoint_fault_boundaries_fail_before_queue_or_reply_mutation() {
         );
         assert_eq!(super::take_endpoint_response(reply), Ok(None));
         assert_eq!(super::complete_endpoint_reply(reply, b"response"), Ok(41));
+    });
+}
+
+#[test]
+fn queued_calls_are_billed_to_the_sender_group_and_refunded_on_every_removal() {
+    use kernel_mm::api::kmem_charge::{self, Class};
+    with_isolated_ipc_test(|| {
+        kmem_charge::init_group(46, None);
+        let endpoint = super::create_endpoint().expect("create endpoint");
+        let one = super::message_kmem_bytes(b"request".len());
+        kmem_charge::set_limit(Class::IpcMessage, 46, one);
+        let (reply, _) = super::enqueue_endpoint_call_with_handles_faultable(
+            endpoint,
+            41,
+            b"request",
+            &[],
+            super::EndpointCallPriority::Ordinary,
+            None,
+            Some(46),
+            false,
+        )
+        .expect("the first call fits the budget");
+        assert_eq!(kmem_charge::usage(Class::IpcMessage, 46), one);
+        assert_eq!(
+            super::enqueue_endpoint_call_with_handles_faultable(
+                endpoint,
+                41,
+                b"request",
+                &[],
+                super::EndpointCallPriority::Ordinary,
+                None,
+                Some(46),
+                false,
+            ),
+            Err(IpcError::NoMemory),
+            "the sender's Job budget refuses before any message is allocated"
+        );
+        assert_eq!(kmem_charge::usage(Class::IpcMessage, 46), one, "a refusal charges nothing");
+        super::cancel_endpoint_call_with_transfers(reply, 41).expect("cancel");
+        assert_eq!(kmem_charge::usage(Class::IpcMessage, 46), 0, "cancellation refunds");
+        // A publication refusal after the charge (injected) also leaves nothing.
+        kmem_charge::set_limit(Class::IpcMessage, 46, kernel_mm::api::charge::UNLIMITED);
+        assert_eq!(
+            super::enqueue_endpoint_call_with_handles_faultable(
+                endpoint,
+                41,
+                b"request",
+                &[],
+                super::EndpointCallPriority::Ordinary,
+                None,
+                Some(46),
+                true,
+            ),
+            Err(IpcError::NoMemory)
+        );
+        assert_eq!(kmem_charge::usage(Class::IpcMessage, 46), 0);
+        let (reply, _) = super::enqueue_endpoint_call(endpoint, 41, b"unbilled").expect("unbilled");
+        assert_eq!(kmem_charge::usage(Class::IpcMessage, 46), 0, "no group, no charge");
+        super::cancel_endpoint_call_with_transfers(reply, 41).expect("cancel");
     });
 }
 

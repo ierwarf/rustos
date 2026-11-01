@@ -679,7 +679,7 @@ ordered(body(wake, 'retained_wake_admitted'), ['TypedWake::capture(&binding, kin
 enqueue = body(Path('kernel/compat/src/user/syscall/linux/ipc_ops.rs').read_text(),
     'enqueue_call_and_wake_with_handles_for_task')
 ordered(enqueue, ['preemption_disabled()', 'held_spin_lock_depth()',
-    'ipc_call_admission::reserve(task_id)?', 'enqueue_endpoint_call_with_handles_priority_and_custody(',
+    'ipc_call_admission::reserve(task_id)?', 'enqueue_endpoint_call_with_handles_priority_custody_in_group(',
     'multitask::commit_ipc_call_handoff(', 'endpoint.raw(), reply.raw(), task_id, receiver_task_id',
     'ipc_call_admission::refused_wake_can_keep_delivered_reply(', 'reply, task_id, donation_admitted',
     'cancel_reply_wait(reply, task_id, ReplyCancelReason::SchedulingCustody)'],

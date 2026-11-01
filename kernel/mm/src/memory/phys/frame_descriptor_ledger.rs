@@ -33,7 +33,7 @@ use core::ptr;
 use core::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 
 use super::PAGE_SIZE;
-use crate::memory::charge;
+use crate::memory::{charge, kmem_charge};
 
 mod api;
 mod encoding;
@@ -260,7 +260,11 @@ impl FrameDescriptorLedger {
         );
         assert_eq!(root.shared_backing_identity.load(Ordering::Relaxed), 0);
         // The binding word is free for roots; the count is zero here, so
-        // nothing is left charged to the group being released.
+        // nothing is left charged to the group being released. The root frame
+        // itself is the last page-table byte this root still owns.
+        if let Some(group) = Self::root_group(root) {
+            kmem_charge::uncharge(kmem_charge::Class::PageTable, group, PAGE_SIZE);
+        }
         root.next_or_virtual_address.store(0, Ordering::Relaxed);
         assert_eq!(
             root.role.compare_exchange(
@@ -273,13 +277,24 @@ impl FrameDescriptorLedger {
         );
     }
 
-    fn claim_table(&self, root_phys: u64, table_phys: u64) -> bool {
-        if root_phys == 0 || root_phys == table_phys || self.verify_root(root_phys).is_none() {
-            return false;
+    fn claim_table(&self, root_phys: u64, table_phys: u64) -> TableClaim {
+        if root_phys == 0 || root_phys == table_phys {
+            return TableClaim::Invalid;
         }
-        let Some(table) = self.record(table_phys) else {
-            return false;
+        let Some(root) = self.verify_root(root_phys) else {
+            return TableClaim::Invalid;
         };
+        let Some(table) = self.record(table_phys) else {
+            return TableClaim::Invalid;
+        };
+        // Bill the table frame before taking it, so a refused charge leaves
+        // the descriptor untouched. An unbound root charges nothing.
+        let group = Self::root_group(root);
+        if let Some(group) = group
+            && !kmem_charge::try_charge(kmem_charge::Class::PageTable, group, PAGE_SIZE)
+        {
+            return TableClaim::Quota;
+        }
         if table
             .role
             .compare_exchange(
@@ -290,12 +305,15 @@ impl FrameDescriptorLedger {
             )
             .is_err()
         {
-            return false;
+            if let Some(group) = group {
+                kmem_charge::uncharge(kmem_charge::Class::PageTable, group, PAGE_SIZE);
+            }
+            return TableClaim::Invalid;
         }
         table
             .owner_or_table_head
             .store(root_phys, Ordering::Relaxed);
-        true
+        TableClaim::Claimed
     }
 
     fn publish_table(&self, root_phys: u64, table_phys: u64) {
@@ -337,6 +355,14 @@ impl FrameDescriptorLedger {
             Ok(ROLE_LAZY_TABLE),
             "only an unpublished table claim may be cancelled"
         );
+        self.refund_tables(root_phys, 1);
+    }
+
+    /// Returns `tables` page-table frames of `root_phys` to its kmem group.
+    fn refund_tables(&self, root_phys: u64, tables: u64) {
+        if let Some(group) = self.verify_root(root_phys).and_then(Self::root_group) {
+            kmem_charge::uncharge(kmem_charge::Class::PageTable, group, tables * PAGE_SIZE);
+        }
     }
 
     /// Counts the published lazy tables of a retiring root without allocating.
@@ -397,6 +423,7 @@ impl FrameDescriptorLedger {
         );
         table.owner_or_table_head.store(0, Ordering::Relaxed);
         table.role.store(ROLE_FREE, DESCRIPTOR_RELEASE);
+        self.refund_tables(root_phys, 1);
         Some(current)
     }
 
@@ -1309,6 +1336,10 @@ impl FrameDescriptorLedger {
         if held != 0 {
             charge::charge(group, held);
         }
+        // The root frame and every table already published are existing state:
+        // catch the group up without a limit check, as for data leaves.
+        let tables = 1 + self.table_count(root_phys) as u64;
+        kmem_charge::charge_forced(kmem_charge::Class::PageTable, group, tables * PAGE_SIZE);
         true
     }
 
@@ -1334,6 +1365,16 @@ impl FrameDescriptorLedger {
         assert!(previous != 0, "data-leaf root count underflow");
         self.uncharge_root(root, 1);
     }
+}
+
+/// Outcome of claiming a frame as a lazily published page table.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TableClaim {
+    Claimed,
+    /// The root or frame is not claimable (unknown root, frame not free).
+    Invalid,
+    /// The root's Job refused the page-table frame under its kmem limit.
+    Quota,
 }
 
 pub static FRAME_DESCRIPTORS: FrameDescriptorLedger = FrameDescriptorLedger::empty();

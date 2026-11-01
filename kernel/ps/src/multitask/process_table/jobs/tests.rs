@@ -419,3 +419,327 @@ fn roots_are_bound_to_their_job_at_publication_and_at_exec_commit() {
     let exec = table.split_once("object.mm_execution = new_mm.pin_for_publication();").unwrap().1;
     assert!(exec[..600].contains("bind_root_charge(new_root, object.job.index() as usize)"));
 }
+
+/// Exhaustive kill/reap interleavings.
+///
+/// One job `J` (child of the root) with one live-session slot is driven through
+/// every sequence of up to `DEPTH` operations drawn from the alphabet below,
+/// on a freshly reset table each time. After every operation the table is
+/// compared with a straight-line model, so the property is not "these cases
+/// pass" but "no ordering of spawn / kill / exit / detach / reap / session
+/// charge / release / child creation breaks these invariants":
+///
+/// - a Killing job admits no member, child job or session;
+/// - the job slot is recycled (its id goes Stale) only once every process
+///   object in it is reaped, no child remains and no session is outstanding;
+/// - until then `usage_processes` equals the model's unreaped object count and
+///   `JobInfo::processes` counts only live members;
+/// - a recycled slot never aliases the old id: every later operation on the old
+///   id is Stale and a fresh child of the root carries a new generation.
+mod kill_reap_interleavings {
+    use super::*;
+    use alloc::vec::Vec;
+
+    const DEPTH: usize = 5;
+    const OPS: u8 = 9;
+
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum Proc {
+        Live,
+        /// Marked exiting but still holding its thread.
+        Exiting,
+        /// Last thread detached: reapable.
+        Detached,
+    }
+
+    struct Model {
+        job: JobId,
+        killing: bool,
+        stale: bool,
+        procs: Vec<(u64, ProcHandleBox, Proc)>,
+        sessions: u64,
+        children: u64,
+        next_pid: u64,
+    }
+
+    struct ProcHandleBox(ProcessHandle);
+
+    impl Model {
+        fn unreaped(&self) -> u64 {
+            self.procs.len() as u64
+        }
+        fn live(&self) -> u64 {
+            self.procs.iter().filter(|(_, _, state)| *state == Proc::Live).count() as u64
+        }
+        /// The slot's death condition: killing, empty, childless, no sessions.
+        fn must_be_recycled(&self) -> bool {
+            self.killing && self.procs.is_empty() && self.children == 0 && self.sessions == 0
+        }
+    }
+
+    fn apply(model: &mut Model, op: u8) {
+        let job = model.job;
+        match op {
+            // Spawn a member.
+            0 => {
+                let spawned = spawn_in(model.next_pid, None, Some(job));
+                match spawned {
+                    Some(handle) => {
+                        assert!(!model.killing && !model.stale, "a dying job admitted a member");
+                        model.procs.push((model.next_pid, ProcHandleBox(handle), Proc::Live));
+                        model.next_pid += 1;
+                    }
+                    None => assert!(
+                        model.killing || model.stale,
+                        "a live job refused a member under no limit"
+                    ),
+                }
+            }
+            1 => {
+                let result = job_kill_begin(job);
+                if model.stale {
+                    assert_eq!(result, Err(JobError::Stale));
+                } else {
+                    assert!(result.is_ok() || model.killing);
+                    model.killing = true;
+                    // Kill covers the subtree; the model's child jobs never
+                    // hold members, so they die and are reclaimed at once.
+                    model.children = 0;
+                }
+            }
+            // Mark the oldest live member exiting.
+            2 => {
+                if let Some((pid, _, state)) =
+                    model.procs.iter_mut().find(|(_, _, state)| *state == Proc::Live)
+                {
+                    assert!(mark_process_exiting(*pid).is_some());
+                    *state = Proc::Exiting;
+                }
+            }
+            // Detach the last thread of the oldest not-yet-detached member.
+            3 => {
+                if let Some((_, handle, state)) =
+                    model.procs.iter_mut().find(|(_, _, state)| *state != Proc::Detached)
+                {
+                    detach_task(handle.0).expect("detach the only thread");
+                    *state = Proc::Detached;
+                }
+            }
+            4 => {
+                let reaped = reap_exited_processes() as usize;
+                let before = model.procs.len();
+                model.procs.retain(|(_, _, state)| *state != Proc::Detached);
+                assert_eq!(reaped, before - model.procs.len(), "reap count disagrees with model");
+            }
+            5 => {
+                let child = job_create_child(job);
+                match child {
+                    Ok(_) => {
+                        assert!(!model.killing && !model.stale, "a dying job admitted a child");
+                        model.children += 1;
+                    }
+                    Err(JobError::Killing) => assert!(model.killing),
+                    Err(JobError::Stale) => assert!(model.stale),
+                    Err(other) => panic!("unexpected child creation error {other:?}"),
+                }
+            }
+            // Charge a session for the oldest live member.
+            6 => {
+                let Some((pid, _, _)) = model.procs.iter().find(|(_, _, s)| *s == Proc::Live)
+                else {
+                    return;
+                };
+                match job_charge_client_session(*pid, job) {
+                    Ok(_) => {
+                        assert!(!model.killing && !model.stale, "a dying job admitted a session");
+                        model.sessions += 1;
+                    }
+                    Err(JobError::Killing) => assert!(model.killing),
+                    Err(JobError::Stale) => assert!(model.stale),
+                    Err(other) => panic!("unexpected session error {other:?}"),
+                }
+            }
+            7 => {
+                let released = job_release_client_session(job);
+                match released {
+                    Ok(_) => {
+                        assert!(model.sessions > 0);
+                        model.sessions -= 1;
+                    }
+                    Err(JobError::Stale) => assert!(model.sessions == 0 || model.stale),
+                    Err(other) => panic!("unexpected release error {other:?}"),
+                }
+            }
+            // Slow recovery path: collect (and thereby release dead) jobs.
+            8 => {
+                let mut pids = [0_u64; 8];
+                let collected = job_collect_members(job, &mut pids) as u64;
+                if !model.stale {
+                    assert!(collected <= model.live() + model.procs.len() as u64);
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// The model cannot see when recycling happens (it is driven by reap and
+    /// collect), so both outcomes are legal until the death condition holds;
+    /// once it does, the very next table-visiting call must have recycled it.
+    fn check(model: &mut Model, trace: &[u8]) {
+        let info = job_info(model.job);
+        if info.is_err() {
+            assert_eq!(info, Err(JobError::Stale));
+            assert!(
+                model.stale || model.must_be_recycled(),
+                "job recycled while it still had members/children/sessions: {trace:?} {:?}",
+                (model.killing, model.procs.len(), model.children, model.sessions)
+            );
+            model.stale = true;
+        } else {
+            let info = info.unwrap();
+            assert!(!model.stale, "a recycled id came back to life: {trace:?}");
+            assert_eq!(info.usage_processes, model.unreaped(), "usage drifted: {trace:?}");
+            assert!(info.processes <= model.unreaped());
+            let sessions = job_session_info(model.job).expect("live job has session info").usage;
+            assert_eq!(sessions, model.sessions, "session count drifted: {trace:?}");
+            assert_eq!(info.state == JobState::Killing, model.killing, "kill state: {trace:?}");
+        }
+    }
+
+    fn run(trace: &[u8]) {
+        let _isolation = isolate_process_table();
+        let job = job_create_child(ROOT_JOB).unwrap();
+        let mut model = Model {
+            job,
+            killing: false,
+            stale: false,
+            procs: Vec::new(),
+            sessions: 0,
+            children: 0,
+            next_pid: 40_000,
+        };
+        for (step, &op) in trace.iter().enumerate() {
+            apply(&mut model, op);
+            check(&mut model, &trace[..=step]);
+        }
+        // Liveness: a dead job must be reclaimed by one visit of the slow
+        // recovery path, never left pinned by an interleaving.
+        apply(&mut model, 8);
+        check(&mut model, trace);
+        if model.must_be_recycled() {
+            assert!(model.stale, "a dead job was not reclaimed: {trace:?}");
+        }
+        if model.stale {
+            // The old id must stay dead and the slot must come back with a new
+            // generation rather than alias it.
+            assert_eq!(job_kill_begin(job), Err(JobError::Stale));
+            assert_eq!(spawn_in(99_999, None, Some(job)), None);
+            let fresh = job_create_child(ROOT_JOB).unwrap();
+            if fresh.index == job.index {
+                assert_ne!(fresh.generation, job.generation);
+            }
+        }
+    }
+
+    fn enumerate(prefix: &mut Vec<u8>, count: &mut u64) {
+        if !prefix.is_empty() {
+            run(prefix);
+            *count += 1;
+        }
+        if prefix.len() == DEPTH {
+            return;
+        }
+        for op in 0..OPS {
+            prefix.push(op);
+            enumerate(prefix, count);
+            prefix.pop();
+        }
+    }
+
+    #[test]
+    fn no_ordering_of_kill_exit_detach_reap_and_session_ops_breaks_job_lifetime() {
+        let mut count = 0;
+        enumerate(&mut Vec::new(), &mut count);
+        assert_eq!(count, (1..=DEPTH as u32).map(|n| u64::from(OPS).pow(n)).sum::<u64>());
+    }
+}
+
+mod provider_incarnation {
+    use super::*;
+
+    /// Provider `pid` exits and is reaped; a new process then reuses the PID.
+    fn replace_provider(pid: u64, handle: ProcessHandle) -> ProcessHandle {
+        mark_process_exiting(pid).expect("provider exits");
+        detach_task(handle).expect("detach provider thread");
+        assert_eq!(reap_exited_processes(), 1);
+        spawn_in(pid, None, None).expect("a new process reuses the PID")
+    }
+
+    #[test]
+    fn tokens_are_idempotent_for_their_own_incarnation_and_fenced_by_the_watermark() {
+        let _isolation = isolate_process_table();
+        let client_job = job_create_child(ROOT_JOB).unwrap();
+        spawn_in(7101, None, Some(client_job)).unwrap();
+        spawn_in(7100, None, None).unwrap();
+        let first = job_charge_client_session_token(7100, 1, 7101, client_job).unwrap();
+        assert_eq!(first.usage, 1);
+        // A retried CHARGE of the same token returns the same charge.
+        assert_eq!(job_charge_client_session_token(7100, 1, 7101, client_job).unwrap().usage, 1);
+        // Another client or Job under the same token is a conflict.
+        assert_eq!(
+            job_charge_client_session_token(7100, 1, 7102, client_job),
+            Err(JobError::Stale)
+        );
+        assert_eq!(job_release_client_session_token(7100, 1, Some(client_job)).unwrap().unwrap().usage, 0);
+        // The released nonce is below the watermark and can never bill again.
+        assert_eq!(
+            job_charge_client_session_token(7100, 1, 7101, client_job),
+            Err(JobError::Stale)
+        );
+        assert_eq!(job_charge_client_session_token(7100, 2, 7101, client_job).unwrap().usage, 1);
+    }
+
+    #[test]
+    fn a_reused_provider_pid_cannot_replay_or_collide_with_the_previous_incarnations_tokens() {
+        let _isolation = isolate_process_table();
+        let client_job = job_create_child(ROOT_JOB).unwrap();
+        spawn_in(7201, None, Some(client_job)).unwrap();
+        let old = spawn_in(7200, None, None).unwrap();
+        job_charge_client_session_token(7200, 1, 7201, client_job).unwrap();
+        // The provider dies before rootd drains its ledger; its PID is reused.
+        let _new = replace_provider(7200, old);
+        // The token is not the new incarnation's: neither an idempotent retry
+        // nor a fresh nonce above the old watermark may touch the old ledger.
+        assert_eq!(
+            job_charge_client_session_token(7200, 1, 7201, client_job),
+            Err(JobError::Stale),
+            "an old token must not be adopted by the new incarnation"
+        );
+        assert_eq!(
+            job_charge_client_session_token(7200, 9, 7201, client_job),
+            Err(JobError::Stale),
+            "a new incarnation waits for the old ledger to drain"
+        );
+        assert_eq!(job_session_info(client_job).unwrap().usage, 1, "the old charge still stands");
+        // Provider-exit reconciliation drains the old incarnation exactly once.
+        assert_eq!(job_drain_client_session_tokens(Some(7200)), Ok(1));
+        assert_eq!(job_session_info(client_job).unwrap().usage, 0);
+        // The new incarnation now starts a clean ledger, including nonce 1.
+        assert_eq!(job_charge_client_session_token(7200, 1, 7201, client_job).unwrap().usage, 1);
+    }
+
+    #[test]
+    fn a_tombstone_before_any_charge_does_not_block_the_live_incarnation() {
+        let _isolation = isolate_process_table();
+        let client_job = job_create_child(ROOT_JOB).unwrap();
+        spawn_in(7301, None, Some(client_job)).unwrap();
+        spawn_in(7300, None, None).unwrap();
+        // A cancel of a never-charged token fences nonce 3 for this provider.
+        assert_eq!(job_release_client_session_token(7300, 3, None), Ok(None));
+        assert_eq!(
+            job_charge_client_session_token(7300, 3, 7301, client_job),
+            Err(JobError::Stale)
+        );
+        assert_eq!(job_charge_client_session_token(7300, 4, 7301, client_job).unwrap().usage, 1);
+    }
+}

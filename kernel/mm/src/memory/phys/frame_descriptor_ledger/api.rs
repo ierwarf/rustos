@@ -18,7 +18,7 @@ pub fn register_data_leaf_root(root_phys: u64) {
     assert!(FRAME_DESCRIPTORS.verify_root(root_phys).is_some());
 }
 
-pub fn claim_lazy_table_record(root_phys: u64, table_phys: u64) -> bool {
+pub fn claim_lazy_table_record(root_phys: u64, table_phys: u64) -> TableClaim {
     FRAME_DESCRIPTORS.claim_table(root_phys, table_phys)
 }
 

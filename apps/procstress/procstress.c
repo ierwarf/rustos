@@ -40,6 +40,7 @@ static volatile int stop;
 static uint64_t maps_done;
 static uint64_t forks_done;
 static uint64_t fork_failures;
+static volatile int last_fork_errno;
 static char *shared;
 
 static void debug_line(const char *message) {
@@ -97,6 +98,7 @@ static void *forker(void *unused) {
             _exit(7);
         }
         if (child < 0) {
+            last_fork_errno = errno;
             __atomic_fetch_add(&fork_failures, 1, __ATOMIC_RELAXED);
             struct timespec pause = {.tv_sec = 0, .tv_nsec = 1000000};
             nanosleep(&pause, NULL);
@@ -158,5 +160,6 @@ int main(void) {
                    __atomic_load_n(&maps_done, __ATOMIC_RELAXED),
                    __atomic_load_n(&forks_done, __ATOMIC_RELAXED),
                    __atomic_load_n(&fork_failures, __ATOMIC_RELAXED));
+    debug_counters("procstress: last fork errno", (uint64_t)last_fork_errno, 0, 0);
     return 0;
 }

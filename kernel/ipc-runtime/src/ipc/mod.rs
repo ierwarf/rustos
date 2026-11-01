@@ -827,6 +827,46 @@ struct EndpointMessageObject {
     // here until the normal reply transition moves it into response handles.
     prepared_reply_handles: Option<Vec<KernelTransferredHandle>>,
     response: Option<EndpointResponse>,
+    /// Sender Job group and bytes billed as `Class::IpcMessage` while this
+    /// message object exists; refunded by `Drop`, which covers every removal
+    /// path (completion, cancellation, endpoint failure, publication refusal).
+    kmem: Option<(usize, u64)>,
+}
+
+impl Drop for EndpointMessageObject {
+    fn drop(&mut self) {
+        if let Some((group, bytes)) = self.kmem.take() {
+            kernel_mm::api::kmem_charge::uncharge(
+                kernel_mm::api::kmem_charge::Class::IpcMessage,
+                group,
+                bytes,
+            );
+        }
+    }
+}
+
+/// Refunds a not-yet-moved message charge on an early return.
+struct MessageKmemGuard(Option<(usize, u64)>);
+
+impl Drop for MessageKmemGuard {
+    fn drop(&mut self) {
+        if let Some((group, bytes)) = self.0.take() {
+            kernel_mm::api::kmem_charge::uncharge(
+                kernel_mm::api::kmem_charge::Class::IpcMessage,
+                group,
+                bytes,
+            );
+        }
+    }
+}
+
+/// Bytes one queued call pins: the object, its request copy and the handle
+/// vector reserved for the request and its response transfers.
+fn message_kmem_bytes(request_len: usize) -> u64 {
+    (core::mem::size_of::<EndpointMessageObject>()
+        + request_len
+        + MAX_ENDPOINT_TRANSFER_HANDLES.saturating_mul(2)
+            * core::mem::size_of::<KernelTransferredHandle>()) as u64
 }
 
 #[cfg(test)]
@@ -1645,6 +1685,7 @@ pub fn enqueue_endpoint_call_with_handles_and_priority(
         attached_handles,
         priority,
         None,
+        None,
     )
 }
 
@@ -1656,6 +1697,30 @@ pub fn enqueue_endpoint_call_with_handles_priority_and_custody(
     priority: EndpointCallPriority,
     scheduling_context: ReplySchedulingContextCustody,
 ) -> Result<(KernelReplyHandle, Option<u64>), IpcError> {
+    enqueue_endpoint_call_with_handles_priority_custody_in_group(
+        endpoint,
+        caller_task_id,
+        request,
+        attached_handles,
+        priority,
+        scheduling_context,
+        None,
+    )
+}
+
+/// As the unbilled call, additionally billing the queued message to the
+/// sender's Job charge group (`Class::IpcMessage`). A refused charge fails the
+/// call with `NoMemory` before any message storage is allocated. The caller
+/// resolves the group in its own context, as for endpoint creation.
+pub fn enqueue_endpoint_call_with_handles_priority_custody_in_group(
+    endpoint: KernelEndpointHandle,
+    caller_task_id: u64,
+    request: &[u8],
+    attached_handles: &[KernelTransferredHandle],
+    priority: EndpointCallPriority,
+    scheduling_context: ReplySchedulingContextCustody,
+    kmem_group: Option<usize>,
+) -> Result<(KernelReplyHandle, Option<u64>), IpcError> {
     if scheduling_context.donor_task_id() != caller_task_id {
         return Err(IpcError::InvalidArgument);
     }
@@ -1666,6 +1731,7 @@ pub fn enqueue_endpoint_call_with_handles_priority_and_custody(
         attached_handles,
         priority,
         Some(scheduling_context),
+        kmem_group,
     )
 }
 
@@ -1676,6 +1742,7 @@ fn enqueue_endpoint_call_with_handles_priority_and_optional_custody(
     attached_handles: &[KernelTransferredHandle],
     priority: EndpointCallPriority,
     scheduling_context: Option<ReplySchedulingContextCustody>,
+    kmem_group: Option<usize>,
 ) -> Result<(KernelReplyHandle, Option<u64>), IpcError> {
     enqueue_endpoint_call_with_handles_faultable(
         endpoint,
@@ -1684,6 +1751,7 @@ fn enqueue_endpoint_call_with_handles_priority_and_optional_custody(
         attached_handles,
         priority,
         scheduling_context,
+        kmem_group,
         rustos_fault_injection::should_fail("ipc.endpoint.enqueue"),
     )
 }
@@ -1695,6 +1763,7 @@ fn enqueue_endpoint_call_with_handles_faultable(
     attached_handles: &[KernelTransferredHandle],
     priority: EndpointCallPriority,
     scheduling_context: Option<ReplySchedulingContextCustody>,
+    kmem_group: Option<usize>,
     injected_failure: bool,
 ) -> Result<(KernelReplyHandle, Option<u64>), IpcError> {
     if request.is_empty() || request.len() > MAX_ENDPOINT_INLINE_MESSAGE_BYTES {
@@ -1704,6 +1773,24 @@ fn enqueue_endpoint_call_with_handles_faultable(
     if injected_failure {
         return Err(IpcError::NoMemory);
     }
+    // Bill the sender's Job before any message storage is allocated. The
+    // charge moves into the message object, whose Drop refunds it on every
+    // removal path; until then `charge` refunds it on an early return.
+    let message_kmem = match kmem_group {
+        Some(group) => {
+            let bytes = message_kmem_bytes(request.len());
+            if !kernel_mm::api::kmem_charge::try_charge(
+                kernel_mm::api::kmem_charge::Class::IpcMessage,
+                group,
+                bytes,
+            ) {
+                return Err(IpcError::NoMemory);
+            }
+            Some((group, bytes))
+        }
+        None => None,
+    };
+    let mut kmem_guard = MessageKmemGuard(message_kmem);
 
     let receiver_owner = ENDPOINTS
         .with(endpoint.raw(), |endpoint| endpoint.owner)
@@ -1725,6 +1812,7 @@ fn enqueue_endpoint_call_with_handles_faultable(
             attached_handles: request_handles,
             prepared_reply_handles: None,
             response: None,
+            kmem: kmem_guard.0.take(),
         })
         .map_err(|_| IpcError::NoMemory)?;
     let reply_id = match insert_reply_object(ReplyObject {

@@ -60,6 +60,9 @@ pub(super) fn milestone_output_class(name: &str) -> MilestoneOutputClass {
             || name == "pager-user-fault-vma-rejected"
             || name == "pager-user-anon-fault-refused"
             || name == "linux-thread-clone-rejected"
+            || name == "linux-thread-clone-stage"
+            || name == "linux-fork-stage"
+            || name == "kmem-page-table-limit-smoke"
             || name == "job-policy-current-cache-checked"
             || name.starts_with("ipc-donation-")
             || name.starts_with("dvm-input-") =>

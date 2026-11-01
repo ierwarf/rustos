@@ -26,8 +26,18 @@ pub enum Class {
     HandleTable = 0,
     /// Reserved queue storage of a process-owned IPC endpoint.
     IpcEndpoint = 1,
+    /// Page-table frames (the root and every lazily published table) of a
+    /// bound address space.
+    PageTable = 2,
+    /// Kernel stack and scheduler record of a user thread.
+    Thread = 3,
+    /// Per-mapping bookkeeping nodes (shared memfd and shared-region mappings).
+    Vma = 4,
+    /// A queued synchronous-call message and its request/handle storage,
+    /// billed to the sending process's Job.
+    IpcMessage = 5,
 }
-pub const CLASSES: usize = 2;
+pub const CLASSES: usize = 6;
 const NO_PARENT: u32 = u32::MAX;
 const MAX_DEPTH: usize = 9;
 
@@ -120,6 +130,146 @@ pub fn try_charge(class: Class, index: usize, bytes: u64) -> bool {
     ok
 }
 
+/// Whether `bytes` more would fit under every limit on the path to the root,
+/// charging nothing. Advisory, like `charge::would_admit`.
+pub fn would_admit(class: Class, index: usize, bytes: u64) -> bool {
+    let mut cursor = index;
+    for _ in 0..MAX_DEPTH {
+        let Some(cell) = group(class, cursor) else { return true };
+        let limit = cell.limit.load(Ordering::Relaxed);
+        if limit != UNLIMITED && cell.usage.load(Ordering::Relaxed).saturating_add(bytes) > limit {
+            return false;
+        }
+        let parent = cell.parent.load(Ordering::Relaxed);
+        if parent == NO_PARENT {
+            return true;
+        }
+        cursor = parent as usize;
+    }
+    true
+}
+
+/// A kernel object owner's running charge in one class: the pattern every
+/// owner of variable-size kernel state follows. The meter is bound to a Job
+/// group once; `set_total`/`set_total_forced` keep the group's usage equal to
+/// the owner's current byte total, and dropping the meter refunds whatever it
+/// still holds. A clone starts unbound and holds nothing, so duplicating the
+/// owner never double-refunds.
+#[derive(Debug)]
+pub struct Meter {
+    class: Class,
+    group: Option<u32>,
+    charged: u64,
+}
+
+impl Meter {
+    pub const fn new(class: Class) -> Self {
+        Self { class, group: None, charged: 0 }
+    }
+
+    pub fn is_bound(&self) -> bool {
+        self.group.is_some()
+    }
+
+    pub fn charged(&self) -> u64 {
+        self.charged
+    }
+
+    /// Binds once to `group` and charges `total` bytes against its limits;
+    /// refused (nothing charged, still unbound) if they do not fit.
+    pub fn bind(&mut self, group: usize, total: u64) -> bool {
+        if self.group.is_some() || !try_charge(self.class, group, total) {
+            return false;
+        }
+        self.group = Some(group as u32);
+        self.charged = total;
+        true
+    }
+
+    /// Whether a total of `total` bytes would be admitted. Unbound meters
+    /// admit everything.
+    pub fn would_admit(&self, total: u64) -> bool {
+        match self.group {
+            Some(group) if total > self.charged => {
+                would_admit(self.class, group as usize, total - self.charged)
+            }
+            _ => true,
+        }
+    }
+
+    /// Moves the charge to `total` bytes. Growth is checked against limits and
+    /// refused without change; shrinking cannot fail.
+    pub fn set_total(&mut self, total: u64) -> bool {
+        let Some(group) = self.group else { return true };
+        if total > self.charged {
+            if !try_charge(self.class, group as usize, total - self.charged) {
+                return false;
+            }
+        } else {
+            uncharge(self.class, group as usize, self.charged - total);
+        }
+        self.charged = total;
+        true
+    }
+
+    /// As `set_total`, but growth ignores limits (state that already exists).
+    pub fn set_total_forced(&mut self, total: u64) {
+        let Some(group) = self.group else { return };
+        if total > self.charged {
+            charge_forced(self.class, group as usize, total - self.charged);
+        } else {
+            uncharge(self.class, group as usize, self.charged - total);
+        }
+        self.charged = total;
+    }
+
+    /// Takes over the binding and charge of `other`, leaving it unbound.
+    pub fn adopt(&mut self, other: &mut Meter) {
+        self.release();
+        self.group = other.group.take();
+        self.charged = core::mem::take(&mut other.charged);
+    }
+
+    fn release(&mut self) {
+        if let Some(group) = self.group.take() {
+            uncharge(self.class, group as usize, self.charged);
+        }
+        self.charged = 0;
+    }
+}
+
+impl Clone for Meter {
+    fn clone(&self) -> Self {
+        Self::new(self.class)
+    }
+}
+
+impl Drop for Meter {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+/// Charges `bytes` without consulting any limit, like `page_counter_charge`.
+/// Only for state that already exists and cannot be refused (catching a
+/// bound group up to objects built before it was bound, or a split that an
+/// unmap must not fail); the matching refund is the ordinary `uncharge`.
+pub fn charge_forced(class: Class, index: usize, bytes: u64) {
+    if bytes == 0 {
+        return;
+    }
+    let mut cursor = index;
+    for _ in 0..MAX_DEPTH {
+        let Some(cell) = group(class, cursor) else { return };
+        cell.usage.fetch_add(bytes, Ordering::Relaxed);
+        let parent = cell.parent.load(Ordering::Relaxed);
+        if parent == NO_PARENT {
+            return;
+        }
+        cursor = parent as usize;
+    }
+}
+
 /// Returns `bytes` to the group and every ancestor.
 pub fn uncharge(class: Class, index: usize, bytes: u64) {
     if bytes == 0 {
@@ -177,6 +327,53 @@ mod tests {
         assert!(!try_charge(C, 56, 11));
         assert_eq!((usage(C, 56), usage(C, 55)), (0, 0));
         assert_eq!(limit(C, 56), 10);
+    }
+
+    #[test]
+    fn forced_charge_ignores_limits_and_every_class_is_summed() {
+        init_group(62, None);
+        init_group(63, Some(62));
+        set_limit(Class::PageTable, 62, 4096);
+        charge_forced(Class::PageTable, 63, 3 * 4096);
+        assert_eq!((usage(Class::PageTable, 63), usage(Class::PageTable, 62)), (3 * 4096, 3 * 4096));
+        assert!(!try_charge(Class::PageTable, 63, 1), "usage above the limit refuses");
+        assert!(try_charge(Class::Vma, 63, 7), "classes are independent");
+        assert_eq!(total_usage(62), 3 * 4096 + 7);
+        uncharge(Class::PageTable, 63, 3 * 4096);
+        uncharge(Class::Vma, 63, 7);
+        assert_eq!(total_usage(62), 0);
+    }
+
+    #[test]
+    fn a_meter_tracks_its_owner_total_and_refunds_on_drop() {
+        init_group(48, None);
+        set_limit(Class::Vma, 48, 100);
+        let mut meter = Meter::new(Class::Vma);
+        assert!(meter.set_total(500), "an unbound meter charges nothing");
+        assert_eq!(usage(Class::Vma, 48), 0);
+        assert!(!meter.bind(48, 101), "binding is limit checked");
+        assert!(!meter.is_bound());
+        assert!(meter.bind(48, 60));
+        assert!(!meter.bind(48, 1), "binds once");
+        assert!(meter.would_admit(100));
+        assert!(!meter.would_admit(101));
+        assert!(!meter.set_total(101), "growth is refused unchanged");
+        assert_eq!((meter.charged(), usage(Class::Vma, 48)), (60, 60));
+        assert!(meter.set_total(100));
+        meter.set_total_forced(130);
+        assert_eq!(usage(Class::Vma, 48), 130);
+        assert!(meter.set_total(10), "shrinking never fails");
+        let clone = meter.clone();
+        assert_eq!((clone.is_bound(), clone.charged()), (false, 0));
+        drop(clone);
+        assert_eq!(usage(Class::Vma, 48), 10, "a clone refunds nothing");
+        let mut heir = Meter::new(Class::Vma);
+        heir.adopt(&mut meter);
+        assert_eq!((meter.charged(), heir.charged()), (0, 10));
+        drop(meter);
+        assert_eq!(usage(Class::Vma, 48), 10);
+        drop(heir);
+        assert_eq!(usage(Class::Vma, 48), 0);
     }
 
     #[test]

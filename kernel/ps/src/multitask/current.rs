@@ -18,7 +18,7 @@ use x86_64::instructions::interrupts;
 
 pub(super) mod group_exit;
 mod job_policy;
-pub use job_policy::current_user_job_policy_allows;
+pub use job_policy::{current_user_job_charge_group, current_user_job_policy_allows};
 #[cfg(test)]
 pub(super) use job_policy::policy_for_binding;
 mod owner_bindings;

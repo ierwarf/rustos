@@ -181,6 +181,23 @@ mod tests {
     }
 
     #[test]
+    fn a_restarted_rootd_readopts_runtimed_before_uiserver_in_any_arrival_order() {
+        // A fresh owner models the new rootd incarnation: nothing is published.
+        // initd re-reports its surviving leases; whichever order the reports
+        // arrive in, uiserver is refused fail-closed (ESTALE, retryable) until
+        // runtimed is published, then accepted without touching the book.
+        let mut owner = ActivationOwner::new();
+        assert_eq!(owner.activate(14, 101, 1), Err(ESTALE));
+        assert_eq!(owner.live_count(), 0, "a refused child leaves no half-published slot");
+        owner.activate(11, 100, 1).unwrap();
+        owner.activate(14, 101, 1).unwrap();
+        assert!(owner.is_active(11, 100) && owner.is_active(14, 101));
+        // Re-reporting an already adopted incarnation is a conflict, not a twin.
+        assert_eq!(owner.activate(14, 101, 1), Err(EBUSY));
+        assert_eq!(owner.live_count(), 2);
+    }
+
+    #[test]
     fn initd_children_have_no_in_book_parent_requirement() {
         let mut owner = ActivationOwner::new();
         assert_eq!(owner.check(3), Ok(()));

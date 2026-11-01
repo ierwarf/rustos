@@ -952,7 +952,7 @@ tokens = [
 # What this sequence pins is unchanged: admission is sampled before the IPC slot
 # lock is taken. The admission helper returns before this file enters IPC.
     "ipc_call_admission::reserve(task_id)?",
-    "enqueue_endpoint_call_with_handles_priority_and_custody(",
+    "enqueue_endpoint_call_with_handles_priority_custody_in_group(",
 # The cold producer now retains original Current/funding/receiver and a single
 # exact endpoint pending phase through billing-before-wake and optional FIFO.
 # It never arms the sender; raw callers refuse before IPC publication and a

@@ -192,7 +192,27 @@ struct ProcessObject {
     waited: bool,
     /// The job this process was created into. Fixed for the process's life.
     job: jobs::JobId,
+    /// Kernel stack bytes billed to `job` for this process's live threads
+    /// (`Class::Thread`); refunded one thread at a time and on drop.
+    thread_kmem: u64,
     state: ProcessStateLock<UserProcessState>,
+}
+
+/// Kernel bytes one user thread pins: its heap-backed kernel stack. The
+/// scheduler record is a fixed slot in a preallocated array, not an
+/// allocation, so the stack is the only per-thread kernel allocation.
+const THREAD_KMEM_BYTES: u64 = super::scheduler::TASK_STACK_SIZE as u64;
+
+impl Drop for ProcessObject {
+    fn drop(&mut self) {
+        if self.thread_kmem != 0 {
+            kernel_mm::api::kmem_charge::uncharge(
+                kernel_mm::api::kmem_charge::Class::Thread,
+                self.job.index() as usize,
+                self.thread_kmem,
+            );
+        }
+    }
 }
 
 impl ProcessObject {
@@ -225,6 +245,7 @@ impl ProcessObject {
             child_state_change: None,
             waited: parent_process_id.is_none(),
             job,
+            thread_kmem: 0,
             state: ProcessStateLock::new(state),
         }
     }
@@ -469,6 +490,16 @@ pub fn attach_task(handle: ProcessHandle) -> Option<()> {
     let object = table.lookup_object_mut(handle)?;
     let ref_count = object.ref_count.checked_add(1)?;
     let thread_count = object.thread_count.checked_add(1)?;
+    // Bill the stack to the process's Job; a Job at its thread-memory budget
+    // refuses the thread exactly like the threads limit above. Lock-free.
+    if !kernel_mm::api::kmem_charge::try_charge(
+        kernel_mm::api::kmem_charge::Class::Thread,
+        object.job.index() as usize,
+        THREAD_KMEM_BYTES,
+    ) {
+        return None;
+    }
+    object.thread_kmem += THREAD_KMEM_BYTES;
     object.ref_count = ref_count;
     object.thread_count = thread_count;
     Some(())
@@ -487,6 +518,14 @@ pub fn detach_task(handle: ProcessHandle) -> Option<()> {
         }
         object.thread_count -= 1;
         object.ref_count -= 1;
+        if object.thread_kmem >= THREAD_KMEM_BYTES {
+            object.thread_kmem -= THREAD_KMEM_BYTES;
+            kernel_mm::api::kmem_charge::uncharge(
+                kernel_mm::api::kmem_charge::Class::Thread,
+                object.job.index() as usize,
+                THREAD_KMEM_BYTES,
+            );
+        }
         if object.thread_count == 0 {
             object.exiting = true;
         }
@@ -1889,6 +1928,50 @@ pub(crate) mod tests {
         detach_task(handle).expect("detach sibling");
         detach_task(handle).expect("detach leader");
         assert_eq!(reap_exited_processes(), 1);
+    }
+
+    #[test]
+    fn thread_stacks_are_billed_per_thread_and_a_job_budget_refuses_the_next() {
+        use kernel_mm::api::kmem_charge::{self, Class};
+        let _guard = lock_process_table_for_tests();
+        let group = super::jobs::ROOT_JOB.charge_group();
+        use super::THREAD_KMEM_BYTES;
+        let baseline = kmem_charge::usage(Class::Thread, group);
+        let handle = create_process(4901, new_state()).expect("process handle");
+        assert_eq!(
+            kmem_charge::usage(Class::Thread, group),
+            baseline + THREAD_KMEM_BYTES,
+            "the first thread is billed with the process"
+        );
+        kmem_charge::set_limit(Class::Thread, group, baseline + 2 * THREAD_KMEM_BYTES);
+        attach_task(handle).expect("second thread fits the budget");
+        assert_eq!(attach_task(handle), None, "a third stack exceeds the Job's thread memory");
+        assert_eq!(kmem_charge::usage(Class::Thread, group), baseline + 2 * THREAD_KMEM_BYTES);
+        detach_task(handle).expect("detach");
+        assert_eq!(kmem_charge::usage(Class::Thread, group), baseline + THREAD_KMEM_BYTES);
+        attach_task(handle).expect("a refunded stack can be billed again");
+        detach_task(handle).expect("detach");
+        detach_task(handle).expect("detach last");
+        assert_eq!(reap_exited_processes(), 1);
+        assert_eq!(kmem_charge::usage(Class::Thread, group), baseline, "every stack is refunded");
+        kmem_charge::set_limit(Class::Thread, group, kernel_mm::api::charge::UNLIMITED);
+    }
+
+    #[test]
+    fn mapping_records_bind_once_and_a_zero_vma_budget_refuses_admission() {
+        use kernel_mm::api::kmem_charge::{self, Class};
+        kmem_charge::init_group(44, None);
+        let mut state = new_state();
+        assert!(state.admit_mapping_records(1), "an unbound state admits everything");
+        kmem_charge::set_limit(Class::Vma, 44, 0);
+        assert!(state.bind_mapping_kmem(44), "an empty state binds under any budget");
+        assert!(!state.bind_mapping_kmem(44), "a state binds once");
+        assert!(!state.admit_mapping_records(1));
+        kmem_charge::set_limit(Class::Vma, 44, kernel_mm::api::charge::UNLIMITED);
+        assert!(state.admit_mapping_records(1));
+        assert_eq!(state.mapping_kmem_charged(), 0);
+        drop(state);
+        assert_eq!(kmem_charge::usage(Class::Vma, 44), 0);
     }
 
     #[test]

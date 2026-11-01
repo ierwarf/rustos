@@ -141,11 +141,11 @@ pub(super) fn syscall_linux_rustos_proc_fork_broker(args_ptr: u64) -> u64 {
         Ok(Ok(result)) => result,
         Ok(Err(err)) => {
             let _ = multitask::cancel_process_spawn(spawn_reservation);
-            return linux_errno(address_space_error_to_linux_errno(err));
+            return fork_stage_failed(1, address_space_error_to_linux_errno(err), err as u64);
         }
-        Err(_) => {
+        Err(error) => {
             let _ = multitask::cancel_process_spawn(spawn_reservation);
-            return linux_errno(LINUX_ENOMEM);
+            return fork_stage_failed(5 + error as i64 as u64, LINUX_ENOMEM, 0);
         }
     };
     #[cfg(rustos_lifecycle_trace)]
@@ -229,7 +229,7 @@ pub(super) fn syscall_linux_rustos_proc_fork_broker(args_ptr: u64) -> u64 {
         &inherited_regions,
     ) {
         let _ = multitask::terminate_user_task(child_pid);
-        return linux_errno(errno);
+        return fork_stage_failed(2, errno, 0);
     }
     if args.clone_flags & linux_abi::CLONE_CHILD_SETTID != 0 {
         let child_tid = (child_pid as u32).to_le_bytes();
@@ -242,7 +242,7 @@ pub(super) fn syscall_linux_rustos_proc_fork_broker(args_ptr: u64) -> u64 {
             Some(Ok(())) => {}
             Some(Err(err)) => {
                 let _ = multitask::terminate_user_task(child_pid);
-                return linux_errno(address_space_error_to_linux_errno(err));
+                return fork_stage_failed(3, address_space_error_to_linux_errno(err), err as u64);
             }
             None => {
                 let _ = multitask::terminate_user_task(child_pid);
@@ -270,23 +270,27 @@ fn writable_committed_regions_cover(
     let Some(end) = start.checked_add(byte_len as u64) else {
         return false;
     };
+    // `regions` arrive in publication-slot order, which has nothing to do with
+    // address order, so each step finds the region that contains the cursor
+    // instead of assuming a sorted walk (a sorted walk rejected a perfectly
+    // covered range whenever a higher region sat in an earlier slot, which
+    // failed most multi-threaded forks with EFAULT).
     let mut cursor = start;
-    for region in regions {
-        if region.end <= cursor {
-            continue;
-        }
-        if region.start > cursor
-            || region.commit_state != rustos_user_abi::pager::VM_COMMIT_COMMITTED
+    while cursor < end {
+        let Some(region) = regions
+            .iter()
+            .find(|region| region.start <= cursor && cursor < region.end)
+        else {
+            return false;
+        };
+        if region.commit_state != rustos_user_abi::pager::VM_COMMIT_COMMITTED
             || region.prot & rustos_user_abi::pager::VM_PROT_WRITE == 0
         {
             return false;
         }
         cursor = core::cmp::min(end, region.end);
-        if cursor == end {
-            return true;
-        }
     }
-    false
+    true
 }
 
 pub(super) fn valid_process_fork_plan_locally(args: &RustosProcForkBrokerArgs) -> bool {
@@ -342,6 +346,21 @@ mod tests {
     }
 
     #[test]
+    fn child_tid_coverage_does_not_depend_on_publication_slot_order() {
+        // Slot order is arbitrary: a higher region published first must not
+        // hide the lower region that actually holds the word.
+        let regions = [
+            region(0x9000, 0xa000, VM_PROT_WRITE, VM_COMMIT_COMMITTED),
+            region(0x2000, 0x3000, VM_PROT_WRITE, VM_COMMIT_COMMITTED),
+            region(0x1000, 0x2000, VM_PROT_WRITE, VM_COMMIT_COMMITTED),
+        ];
+        assert!(!writable_committed_regions_cover(&regions, 0x2ffe, 4));
+        assert!(writable_committed_regions_cover(&regions, 0x1ffe, 4));
+        assert!(writable_committed_regions_cover(&regions, 0x2ffc, 4));
+        assert!(!writable_committed_regions_cover(&regions, 0x3000, 4));
+    }
+
+    #[test]
     fn child_tid_span_rejects_reserved_or_read_only_vmas() {
         assert!(!writable_committed_regions_cover(
             &[region(0x1000, 0x2000, VM_PROT_WRITE, VM_COMMIT_RESERVED)],
@@ -354,4 +373,21 @@ mod tests {
             4,
         ));
     }
+}
+
+/// Names the step of a fork that failed (1 COW clone, 2 pager VMA inheritance,
+/// 3 child-tid store, 5+ the parent VMA hold with its `PagerVmaError`), so a
+/// bare errno under concurrent address-space churn is attributable. Bounded.
+fn fork_stage_failed(stage: u64, errno: i64, detail: u64) -> u64 {
+    static RECORDED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    // ORDERING: Relaxed; a counter bounding telemetry volume.
+    if RECORDED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 32 {
+        debug::record_milestone(
+            debug::LogCategory::Compat,
+            "linux-fork-stage",
+            (stage << 32) | (errno.unsigned_abs() & 0xffff_ffff),
+            detail,
+        );
+    }
+    linux_errno(errno)
 }

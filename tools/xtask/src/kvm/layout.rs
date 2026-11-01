@@ -66,8 +66,13 @@ fn prepare_layout(config: &Config, options: &SmokeOptions) -> Result<KvmLayout> 
     if needs_private_contracts {
         write_private_kvm_contracts(
             &runtime_disk,
-            private_ui_profile_requested(options)
-                .then_some((true, options.exercise_network)),
+            // `--exercise-network` alone must still publish the contract:
+            // runtimed arms netprobe's QEMU-gateway mode only from it, and
+            // without the file netprobe silently probes a public address.
+            (private_ui_profile_requested(options) || options.exercise_network).then_some((
+                private_ui_profile_requested(options),
+                options.exercise_network,
+            )),
             options
                 .smp_ring3_qualification
                 .then_some(options.rustos_vcpus),

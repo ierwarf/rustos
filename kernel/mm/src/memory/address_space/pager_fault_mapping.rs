@@ -444,9 +444,16 @@ pub fn ensure_current_fault_tables_at(
                     release(frame);
                     return Err(AddressSpaceError::InvalidFrameOwnership);
                 }
-                if !crate::memory::phys::claim_lazy_table_record(root_phys, frame) {
-                    release(frame);
-                    return Err(AddressSpaceError::InvalidFrameOwnership);
+                match crate::memory::phys::claim_lazy_table_record(root_phys, frame) {
+                    crate::memory::phys::TableClaim::Claimed => {}
+                    crate::memory::phys::TableClaim::Quota => {
+                        release(frame);
+                        return Err(AddressSpaceError::OutOfFrames);
+                    }
+                    crate::memory::phys::TableClaim::Invalid => {
+                        release(frame);
+                        return Err(AddressSpaceError::InvalidFrameOwnership);
+                    }
                 }
                 match publish_user_table_entry(parent, index, PhysAddr::new(frame), table_flags) {
                     Ok((child, true)) => {

@@ -3354,13 +3354,15 @@ fn enqueue_call_and_wake_with_handles_for_task(
     let scheduling_context = admission.scheduling_context;
     let enqueue_mark = phase_mark();
     let (reply, receiver_to_wake) =
-        match kernel_ipc_runtime::api::enqueue_endpoint_call_with_handles_priority_and_custody(
+        match kernel_ipc_runtime::api::enqueue_endpoint_call_with_handles_priority_custody_in_group(
             endpoint,
             task_id,
             request,
             attached_handles,
             priority,
             scheduling_context,
+            // The message is billed to the sender's Job (`Class::IpcMessage`).
+            multitask::current_user_job_charge_group(),
         ) {
             Ok(enqueued) => enqueued,
             Err(error) => {
