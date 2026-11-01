@@ -56,6 +56,33 @@ fn verification_command(profile_name: &str) -> Result<Vec<&'static str>> {
     }
 }
 
+/// Launch policy for ordinary boots: report an unsealed profile, never block.
+///
+/// A boot is a test run, not an acceptance claim. Refusing to start (or
+/// spending minutes re-running the whole formal gate) before every QEMU
+/// launch made the inner loop as slow as the push gate, so an unsealed or
+/// stale profile now only prints a warning and the boot proceeds. Anything
+/// that *claims* a result from the boot (`--smp-iteration`,
+/// `--smp-ring3-qualification` evidence) still validates the seal strictly in
+/// its own evidence step and is launched through `ensure_smp_launch_evidence`.
+pub(crate) fn warn_if_smp_launch_unsealed(root: &Path, profile_name: &str) {
+    if let Err(stale) = validate_smp_launch_evidence(root, profile_name) {
+        eprintln!(
+            "xtask: WARNING: formal profile {profile_name} is not sealed for this tree ({stale:#}); \
+             launching anyway. This boot is NOT verified against the formal models; \
+             run `bash formal/verify-all.sh --profile {profile_name}` before relying on it."
+        );
+    }
+}
+
+impl ValidatedSmpLaunchEvidence {
+    /// A launch token for a boot that proceeds without a valid seal. Only the
+    /// warn-only launch path may construct it; it claims nothing.
+    pub(crate) fn unsealed_launch() -> Self {
+        Self { _private: () }
+    }
+}
+
 /// Seal the profile for this tree before refusing to launch.
 ///
 /// The gate exists so a multicore boot cannot run ahead of the models that

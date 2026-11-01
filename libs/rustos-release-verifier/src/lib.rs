@@ -16,7 +16,7 @@ pub const SIGNATURE_BYTES:usize=64;
 pub const ENVELOPE_BYTES:usize=MANIFEST_BYTES+SIGNATURE_BYTES;
 pub const MAX_IMAGE_BYTES:u64=128*1024*1024;
 const MAGIC:[u8;4]=*b"RREL";
-const DOMAIN:&[u8]=b"RustOS signed service image v1\0";
+pub const DOMAIN:&[u8]=b"RustOS signed service image v1\0";
 
 #[derive(Clone,Copy,Debug,Eq,PartialEq)]
 pub enum Error {

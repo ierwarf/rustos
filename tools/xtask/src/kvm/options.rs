@@ -217,6 +217,10 @@ where
         print_kvm_smoke_help();
         return Ok(());
     }
+    if args.iter().any(|arg| arg == "--print-release-probe-key") {
+        println!("{}", release_probe_public_key_hex());
+        return Ok(());
+    }
     let mut options = parse_smoke_options(args.into_iter())?;
     options.smp_formal_profile_override = smp_formal_profile_override;
     if options.oom_hog_watchdog {
@@ -230,6 +234,18 @@ where
     // about two seconds next to a thirty-second boot, so pay it every time
     // unless the caller explicitly wants the artifact already on disk.
     if options.build_image {
+        // A boot image built with probe-only variables (RUSTOS_*_PROBE,
+        // RUSTOS_LOADERD_TEST_RELEASE_KEY, ...) is replaced by this rebuild,
+        // which does not see them; say so instead of letting the probe silently
+        // vanish from the booted image.
+        if std::env::vars_os().all(|(name, _)| {
+            let name = name.to_string_lossy();
+            !(name.starts_with("RUSTOS_") && (name.contains("PROBE") || name.contains("TEST")))
+        }) {
+            println!(
+                "xtask: rebuilding the image before boot; pass --no-build to boot an image you built with custom RUSTOS_* probe variables"
+            );
+        }
         crate::build::build(config, false)?;
     }
     // Seal once, here, before any boot and before the repeat loop.
@@ -241,10 +257,19 @@ where
     // caller to run a command this process can run itself. `--repeat` made it
     // worse: it burned every run in the batch on the same stale seal.
     if options.rustos_vcpus > 1 && options.auto_verify {
-        crate::formal_contracts::ensure_smp_launch_evidence(
-            &config.root_dir,
-            smp_formal_profile(&options),
-        )?;
+        if options.smp_iteration || options.smp_ring3_qualification {
+            // These modes publish acceptance evidence, so they keep the strict
+            // seal (and the auto-seal repair) before they claim host resources.
+            crate::formal_contracts::ensure_smp_launch_evidence(
+                &config.root_dir,
+                smp_formal_profile(&options),
+            )?;
+        } else {
+            crate::formal_contracts::warn_if_smp_launch_unsealed(
+                &config.root_dir,
+                smp_formal_profile(&options),
+            );
+        }
     }
     if options.repeat == 1 {
         return run_one_smoke(config, &options, runtime_trace_deadlines);
@@ -302,7 +327,26 @@ fn repeat_smoke(
     }
 }
 
+/// One smoke boot, with its console log kept in the bounded per-run history.
+///
+/// The canonical `rustos-debugcon.log` is truncated by the next boot, and only
+/// the bench paths used to copy it aside, so the log of a plain `kvm-smoke`
+/// (passing or failing) was gone as soon as the next run started. The copy is
+/// best effort: losing it must never change the verdict of the run itself.
 fn run_one_smoke(
+    config: &Config,
+    options: &SmokeOptions,
+    runtime_trace_deadlines: Option<bool>,
+) -> Result<()> {
+    let result = run_one_smoke_unarchived(config, options, runtime_trace_deadlines);
+    let log = config.build_dir.join("kvm/rustos-debugcon.log");
+    if let Err(error) = archive_run_log(&log) {
+        eprintln!("xtask: could not archive {}: {error:#}", log.display());
+    }
+    result
+}
+
+fn run_one_smoke_unarchived(
     config: &Config,
     options: &SmokeOptions,
     runtime_trace_deadlines: Option<bool>,
@@ -617,6 +661,7 @@ pub(crate) fn kvm_run_command(
         oom_hog_job_limit: false,
         job_policy_probe: false,
         proc_stress: false,
+        release_stage_probe: false,
         min_ui_fps: None,
         ui_proof_windows: DEFAULT_UI_FPS_ACTIVE_WINDOWS,
         recovery_probe: RecoveryProbe::None,
@@ -656,8 +701,10 @@ pub(crate) fn kvm_run_command(
             "pr"
         };
         if auto_verify {
-            crate::formal_contracts::ensure_smp_launch_evidence(&config.root_dir, profile)?;
-            log_kvm_start_phase("sealed-formal-evidence", started_at);
+            // Interactive runs claim nothing: warn about an unsealed profile
+            // and boot, instead of re-running the formal gate first.
+            crate::formal_contracts::warn_if_smp_launch_unsealed(&config.root_dir, profile);
+            log_kvm_start_phase("checked-formal-evidence", started_at);
         }
     }
     let layout = prepare_layout(config, &options)?;

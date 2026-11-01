@@ -57,6 +57,9 @@ struct SmokeOptions {
     /// Arm `apps/procstress` (fork, COW, mmap/mprotect/munmap churn) and wait
     /// for its completion marker; panics are caught by the ordinary checks.
     proc_stress: bool,
+    /// Drop a signed release bundle on the volume and require loaderd to
+    /// verify it with the test key and rootd to stage it.
+    release_stage_probe: bool,
     min_ui_fps: Option<u32>,
     ui_proof_windows: usize,
     recovery_probe: RecoveryProbe,
@@ -129,6 +132,7 @@ where
         oom_hog_job_limit: false,
         job_policy_probe: false,
         proc_stress: false,
+        release_stage_probe: false,
         min_ui_fps: None,
         ui_proof_windows: DEFAULT_UI_FPS_ACTIVE_WINDOWS,
         recovery_probe: RecoveryProbe::None,
@@ -205,6 +209,7 @@ where
                 options.oom_hog_job_limit = true;
             }
             "--proc-stress" => options.proc_stress = true,
+            "--release-stage-probe" => options.release_stage_probe = true,
             "--oom-hog-watchdog" => {
                 options.oom_hog = true;
                 options.oom_hog_watchdog = true;
@@ -314,6 +319,14 @@ where
         };
         options.expected_markers.push(killed.to_owned());
         options.expected_markers.push(recovered.to_owned());
+    }
+    if options.release_stage_probe {
+        // The bundle lives on the DVM-backed volume; without its storage
+        // provider vfsd answers ENODEV forever.
+        options.gui_dvm_surfaces = true;
+        options
+            .expected_markers
+            .push(RELEASE_PROBE_STAGED_MARKER.to_owned());
     }
     if options.proc_stress {
         // Session programs start only once the graphical session is up.

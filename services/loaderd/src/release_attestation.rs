@@ -83,10 +83,30 @@ fn call_rootd_stage(approval:Approval)->Result<(),AdmissionError>{
     if reply.value1!=1{return Err(AdmissionError::WrongReply)}
     Ok(())
 }
+fn bundle_error(error:loaderd::release_bundle::BundleError)->AdmissionError{
+    match error{
+        loaderd::release_bundle::BundleError::Invalid=>AdmissionError::Invalid,
+        loaderd::release_bundle::BundleError::Image(error)=>AdmissionError::Image(error),
+    }
+}
+/// Verify a bundle against the sealed keyring and stage its digest with rootd.
+/// This is the request path behind `COMMERCIAL_MAX_LOADERD_OP_STAGE_RELEASE`;
+/// the caller must already have read the bytes from a sealed read-only file.
+pub(super) fn stage_release_bundle(
+    bytes:&[u8],service:u64,durable_floor:u64,release_epoch:u64,
+    trial_deadline_ns:u64,
+)->Result<Verified,AdmissionError>{
+    let keys=super::trust_anchor::sealed_keys().map_err(AdmissionError::Image)?;
+    let ring=KeyRing::new(&keys).map_err(AdmissionError::Image)?;
+    let verified=loaderd::release_bundle::admit_bundle(&ring,bytes,service,durable_floor)
+        .map_err(bundle_error)?;
+    let approval=stage_approval(verified,release_epoch,trial_deadline_ns)?;
+    call_rootd_stage(approval)?;
+    Ok(verified)
+}
 /// Cryptographically check both images and stage only the verified digest.
 /// The caller MUST hold an independently authenticated, fsync-and-readback
 /// old-image pin before invoking this; this API does not create that pin.
-/// No normal loaderd request dispatch currently calls this entrypoint.
 pub(super) fn verify_and_stage(
     ring:&KeyRing<'_>,signed:&[u8],
     candidate:&[u8],previous:&[u8],

@@ -173,6 +173,12 @@ const PRIVATE_OOM_HOG_CONTRACT_PATH: &str = "system/registry/system/oomhog-v1.en
 // for `kvm-smoke --proc-stress`.
 const PRIVATE_PROC_STRESS_CONTRACT_PATH: &str = "system/registry/system/procstress-v1.env";
 const PROC_STRESS_DONE_MARKER: &str = "procstress: done maps forks fork_failures";
+// A signed release bundle for `kvm-smoke --release-stage-probe`; initd asks
+// loaderd to verify and stage it. Only loaderd images built with
+// `RUSTOS_LOADERD_TEST_RELEASE_KEY` (see `RELEASE_PROBE_PUBLIC_KEY_HEX`) trust
+// its signer; every other image refuses it with EACCES.
+const PRIVATE_RELEASE_PROBE_BUNDLE_PATH: &str = "system/registry/system/release-probe-v1.rel";
+const RELEASE_PROBE_STAGED_MARKER: &str = "release stage probe ok service=3 epoch=2 generation=2";
 const SMP_QUALIFICATION_WORK_UNITS: u64 = 1_000_000;
 const SMP_QUALIFICATION_DEADLINE_MS: u64 = 5_000;
 const SMP_QUALIFICATION_DEADLINE_US: u64 = SMP_QUALIFICATION_DEADLINE_MS * 1_000;

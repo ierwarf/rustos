@@ -50,7 +50,8 @@ fn prepare_layout(config: &Config, options: &SmokeOptions) -> Result<KvmLayout> 
         || options.smp_ring3_qualification
         || options.ipcbench_probe.is_some()
         || options.oom_hog
-        || options.proc_stress;
+        || options.proc_stress
+        || options.release_stage_probe;
     let runtime_disk = if needs_private_contracts {
         let runtime_disk = run_dir.join("rustos-kvm.img");
         fs::copy(&config.boot_disk_image, &runtime_disk).with_context(|| {
@@ -79,6 +80,7 @@ fn prepare_layout(config: &Config, options: &SmokeOptions) -> Result<KvmLayout> 
             options.ipcbench_probe.as_deref(),
             options.oom_hog,
             options.proc_stress,
+            options.release_stage_probe,
         )?;
     }
     // Any physical VFIO device makes QEMU map every file-backed guest memory
@@ -592,6 +594,7 @@ fn write_private_kvm_contracts(
     ipcbench_probe: Option<&str>,
     oom_hog: bool,
     proc_stress: bool,
+    release_stage_probe: bool,
 ) -> Result<()> {
     let disk = std::fs::OpenOptions::new()
         .read(true)
@@ -641,6 +644,14 @@ fn write_private_kvm_contracts(
             contract.truncate()?;
             FatWrite::write_all(&mut contract, b"contract=rustos-procstress-v1\n")?;
             FatWrite::flush(&mut contract)?;
+        }
+        if release_stage_probe {
+            let mut bundle = root
+                .create_file(PRIVATE_RELEASE_PROBE_BUNDLE_PATH)
+                .context("create private KVM release probe bundle")?;
+            bundle.truncate()?;
+            FatWrite::write_all(&mut bundle, &render_release_probe_bundle())?;
+            FatWrite::flush(&mut bundle)?;
         }
         if oom_hog {
             let mut contract = root
@@ -1389,4 +1400,94 @@ pub(crate) fn archive_run_log(log_path: &Path) -> Result<()> {
         let _ = fs::remove_file(stale);
     }
     Ok(())
+}
+
+/// Public seed of the release-probe signing key. It exists only so the KVM
+/// harness and a test-key loaderd agree; it protects nothing.
+const RELEASE_PROBE_SEED: [u8; 32] = [0x52; 32];
+const RELEASE_PROBE_SIGNER_ID: [u8; 16] = [0x7e; 16];
+const RELEASE_PROBE_SERVICE: u64 = 3;
+const RELEASE_PROBE_GENERATION: u64 = 2;
+const RELEASE_PROBE_CANDIDATE: &[u8] = b"rustos release stage probe: candidate image bytes";
+const RELEASE_PROBE_PREVIOUS: &[u8] = b"rustos release stage probe: previous image bytes";
+
+fn release_probe_public_key_hex() -> String {
+    let signing = ed25519_dalek::SigningKey::from_bytes(&RELEASE_PROBE_SEED);
+    signing
+        .verifying_key()
+        .to_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// The signed bundle loaderd's `bundle_length`/`admit_bundle` parse:
+/// `RSRELv1\0 | candidate_len | previous_len | manifest | signature |
+/// candidate | previous`, signed under the verifier's domain separator.
+fn render_release_probe_bundle() -> Vec<u8> {
+    use ed25519_dalek::Signer;
+    use rustos_release_verifier::{encode, Manifest, DOMAIN};
+    use sha2::{Digest, Sha256};
+    let digest = |bytes: &[u8]| -> [u8; 32] { Sha256::digest(bytes).into() };
+    let manifest = encode(Manifest {
+        service: RELEASE_PROBE_SERVICE,
+        generation: RELEASE_PROBE_GENERATION,
+        minimum_floor: RELEASE_PROBE_GENERATION - 1,
+        image_len: RELEASE_PROBE_CANDIDATE.len() as u64,
+        image_sha256: digest(RELEASE_PROBE_CANDIDATE),
+        signer_id: RELEASE_PROBE_SIGNER_ID,
+        previous_sha256: digest(RELEASE_PROBE_PREVIOUS),
+    })
+    .expect("the release probe manifest is canonical");
+    let mut message = DOMAIN.to_vec();
+    message.extend_from_slice(&manifest);
+    let signature = ed25519_dalek::SigningKey::from_bytes(&RELEASE_PROBE_SEED)
+        .sign(&message)
+        .to_bytes();
+    let mut bundle = Vec::new();
+    bundle.extend_from_slice(b"RSRELv1\0");
+    bundle.extend_from_slice(&(RELEASE_PROBE_CANDIDATE.len() as u32).to_le_bytes());
+    bundle.extend_from_slice(&(RELEASE_PROBE_PREVIOUS.len() as u32).to_le_bytes());
+    bundle.extend_from_slice(&manifest);
+    bundle.extend_from_slice(&signature);
+    bundle.extend_from_slice(RELEASE_PROBE_CANDIDATE);
+    bundle.extend_from_slice(RELEASE_PROBE_PREVIOUS);
+    bundle
+}
+
+#[cfg(test)]
+mod release_probe_tests {
+    use super::*;
+
+    #[test]
+    fn the_probe_bundle_verifies_against_the_documented_test_key() {
+        use rustos_release_verifier::{verify_release, KeyRing, TrustedKey};
+        let bundle = render_release_probe_bundle();
+        let verifying_key = ed25519_dalek::SigningKey::from_bytes(&RELEASE_PROBE_SEED)
+            .verifying_key()
+            .to_bytes();
+        let keys = [TrustedKey {
+            signer_id: RELEASE_PROBE_SIGNER_ID,
+            service: RELEASE_PROBE_SERVICE,
+            verifying_key,
+            minimum_generation: 1,
+            revoked: false,
+        }];
+        let ring = KeyRing::new(&keys).unwrap();
+        let envelope_end = 16 + 192;
+        let candidate_end = envelope_end + RELEASE_PROBE_CANDIDATE.len();
+        let verified = verify_release(
+            &ring,
+            &bundle[16..envelope_end],
+            &bundle[envelope_end..candidate_end],
+            &bundle[candidate_end..],
+            RELEASE_PROBE_SERVICE,
+            1,
+        )
+        .expect("the harness bundle verifies under the test key");
+        assert_eq!(verified.manifest().generation, RELEASE_PROBE_GENERATION);
+        assert_eq!(release_probe_public_key_hex().len(), 64);
+        assert_eq!(bundle.len(), candidate_end + RELEASE_PROBE_PREVIOUS.len());
+        assert_eq!(RELEASE_PROBE_SIGNER_ID, [0x7e; 16], "loaderd's TEST_SIGNER_ID");
+    }
 }

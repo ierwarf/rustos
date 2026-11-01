@@ -44,7 +44,7 @@ pub(super) fn smoke_readiness_budget_starts_only_after_both_guests_spawn() {
     assert!(boot_started < deadline);
 }
 
-/// The interactive path seals its formal profile, and seals it early.
+/// The interactive path checks its formal profile early and only warns.
 ///
 /// A missing seal on this path means an edited tree, not an intent to launch
 /// unverified, so `kvm_run_command` runs the profile's own verification rather
@@ -58,8 +58,8 @@ pub(super) fn interactive_multicore_run_seals_formal_evidence_before_claiming_re
         .expect("interactive KVM command");
     let interactive = &source[interactive_start..];
     let seal = interactive
-        .find("crate::formal_contracts::ensure_smp_launch_evidence(")
-        .expect("interactive formal seal");
+        .find("crate::formal_contracts::warn_if_smp_launch_unsealed(")
+        .expect("interactive formal seal check");
     let layout = interactive
         .find("let layout = prepare_layout(config, &options)?;")
         .expect("interactive layout");
@@ -73,7 +73,7 @@ pub(super) fn interactive_multicore_run_seals_formal_evidence_before_claiming_re
     assert!(layout < doorbell);
     assert!(doorbell < spawn);
     // The seal is a repair, never a bypass: the single-CPU launch has no
-    // profile to seal, and `--no-auto-verify` restores the refusal.
+    // profile to check, and `--no-auto-verify` skips even the warning.
     assert!(interactive[..seal].contains("options.smp_iteration || options.rustos_vcpus > 1"));
     assert!(interactive[..seal].contains("if auto_verify {"));
 }
@@ -202,7 +202,11 @@ pub(super) fn rustos_smp_topology_is_machine_gated_on_complete_prerequisites() {
         rustos_vcpus: 2,
         ..RUSTOS_SMP_READINESS
     };
+    // Without a launch token a multi-vCPU readiness check still fails; the
+    // warn-only launch path supplies an explicit unsealed token instead.
     assert!(incomplete_multi.validate(None).is_err());
+    let unsealed = crate::formal_contracts::ValidatedSmpLaunchEvidence::unsealed_launch();
+    assert!(incomplete_multi.validate(Some(&unsealed)).is_ok());
 
     let evidence = crate::formal_contracts::validated_smp_launch_evidence_for_tests();
     assert!(incomplete_multi.validate(Some(&evidence)).is_ok());

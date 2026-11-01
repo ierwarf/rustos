@@ -84,6 +84,15 @@ fn a_dead_job_is_recycled_only_after_its_last_process_object_is_gone() {
     assert_eq!(job_collect_members(job, &mut pids), 0);
     assert!(job_info(job).is_ok());
     detach_task(handle).expect("detach the last thread");
+    // Detaching refunds the thread's kernel stack, so no byte is charged to
+    // the job any more; only the unreaped process object still names the slot.
+    // This is the state that isolates the member-object check: the kmem usage
+    // condition cannot be what keeps the slot alive here.
+    assert_eq!(job_collect_members(job, &mut pids), 0);
+    assert!(
+        job_info(job).is_ok(),
+        "an unreaped process object must pin the slot even with every charge refunded"
+    );
     assert_eq!(reap_exited_processes(), 1);
     assert!(job_info(job).is_ok(), "reaping does not itself release job slots");
     assert_eq!(job_collect_members(job, &mut pids), 0);

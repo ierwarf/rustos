@@ -592,7 +592,65 @@ def kill_semantics_digest() -> str:
     return digest.hexdigest()
 
 
-def mutation_cache_key(root: Path, mutation: dict[str, str | int]) -> str:
+@functools.lru_cache(maxsize=None)
+def _locked_packages(lock_text: str) -> tuple[dict[str, list[dict]], dict[tuple[str, str], dict]]:
+    """Index Cargo.lock once: by name, and by (name, version)."""
+    by_name: dict[str, list[dict]] = {}
+    by_exact: dict[tuple[str, str], dict] = {}
+    for entry in tomllib.loads(lock_text).get("package", []):
+        by_name.setdefault(entry["name"], []).append(entry)
+        by_exact[(entry["name"], entry["version"])] = entry
+    return by_name, by_exact
+
+
+@functools.lru_cache(maxsize=None)
+def lock_closure_digest(root_raw: str, package: str) -> str:
+    """Digest of exactly the locked packages `package` can link against.
+
+    Hashing the whole lockfile makes every mutation's key depend on every
+    crate in the workspace, so adding one dev-dependency to one crate
+    re-executed all ~1700 mutants. A Rust package compiles against its own
+    transitive dependency closure and nothing else, which is also how cargo
+    fingerprints a unit (per-dependency, not per-workspace). Walking the
+    closure from the package keeps that scope: a lock edit that does not touch
+    the package's closure no longer discards its evidence, while any change to
+    a reachable crate's version, source, checksum or dependency list still does.
+    Falls back to the whole file whenever the package cannot be resolved.
+    """
+    lock = Path(root_raw) / "Cargo.lock"
+    if not lock.is_file():
+        return "no-lock"
+    text = lock.read_text(encoding="utf-8")
+    by_name, by_exact = _locked_packages(text)
+    starts = by_name.get(package)
+    if not starts:
+        return "whole:" + hashlib.sha256(text.encode()).hexdigest()
+    seen: dict[tuple[str, str], dict] = {}
+    stack = list(starts)
+    while stack:
+        entry = stack.pop()
+        key = (entry["name"], entry["version"])
+        if key in seen:
+            continue
+        seen[key] = entry
+        for dependency in entry.get("dependencies", []):
+            parts = dependency.split(" ")
+            name = parts[0]
+            if len(parts) > 1 and (name, parts[1]) in by_exact:
+                stack.append(by_exact[(name, parts[1])])
+            else:
+                stack.extend(by_name.get(name, []))
+    digest = hashlib.sha256()
+    for key in sorted(seen):
+        entry = seen[key]
+        digest.update(json.dumps(entry, sort_keys=True, default=str).encode())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def mutation_cache_key(
+    root: Path, mutation: dict[str, str | int], *, whole_lock: bool = False
+) -> str:
     """Seal one anchor, its witness and literal includes, and build policy inputs.
 
     Mutation evidence is deliberately cached at the decision witness rather
@@ -609,7 +667,13 @@ def mutation_cache_key(root: Path, mutation: dict[str, str | int]) -> str:
     if package_root == root:
         raise ValueError(f"no package root for {mutation['source']}")
     digest = hashlib.sha256()
-    digest.update(b"rustos-implementation-mutation-cache-v4\0")
+    # `whole_lock` reproduces the v4 key so evidence written before the
+    # dependency-closure scoping can be migrated once instead of re-executed.
+    digest.update(
+        b"rustos-implementation-mutation-cache-v4\0"
+        if whole_lock
+        else b"rustos-implementation-mutation-cache-v5\0"
+    )
     semantic_fields = (
         "id", "source", "find", "replace", "anchor_spec", "package",
         "features", "target", "test", "max_ms",
@@ -650,10 +714,17 @@ def mutation_cache_key(root: Path, mutation: dict[str, str | int]) -> str:
                 raise ValueError(f"witness include escapes repository: {included}")
             inputs.append(included)
 
-    for name in ("Cargo.toml", "Cargo.lock", ".cargo/config.toml", "rust-toolchain.toml"):
+    for name in ("Cargo.toml", ".cargo/config.toml", "rust-toolchain.toml"):
         path = root / name
         if path.is_file():
             inputs.append(path)
+    if whole_lock:
+        if (root / "Cargo.lock").is_file():
+            inputs.append(root / "Cargo.lock")
+    else:
+        digest.update(b"lock-closure\0")
+        digest.update(lock_closure_digest(str(root), str(mutation["package"])).encode())
+        digest.update(b"\0")
     digest.update(kill_semantics_digest().encode())
     digest.update(b"\0")
     for path in sorted(set(inputs)):
@@ -698,6 +769,13 @@ def reusable_mutation_outcomes(
         cache_key = mutation_cache_key(root, mutation)
         old = previous.get(str(mutation["id"]))
         exact = old is not None and old.get("cache_key") == cache_key
+        if old is not None and not exact and old.get("cache_key"):
+            # One-time migration from the whole-lockfile key: the evidence is
+            # valid iff it matches the v4 key of the CURRENT tree, which is
+            # exactly the condition under which v4 would have reused it.
+            exact = old.get("cache_key") == mutation_cache_key(
+                root, mutation, whole_lock=True
+            )
         # Migration path for evidence written before witness-scoped cache keys
         # existed. Exact registry, source, anchor, and witness semantics must
         # still match. A present but mismatched key must NEVER use this fallback.
@@ -991,6 +1069,27 @@ SHARD_DISK_BUDGET_BYTES = 3 * 1024 * 1024 * 1024
 SHARD_MEMORY_BUDGET_BYTES = 3 * 1024 * 1024 * 1024
 
 
+def available_memory_bytes() -> int:
+    """Memory a new shard can actually use, page cache included.
+
+    `SC_AVPHYS_PAGES` counts only never-used pages, so on a workstation whose
+    RAM is mostly reclaimable file cache it reported ~3 GiB free of ~22 GiB
+    available and pinned the lane to a single shard. `MemAvailable` is the
+    kernel's own estimate of what can be allocated without swapping.
+    """
+    try:
+        with open("/proc/meminfo", encoding="ascii") as meminfo:
+            for line in meminfo:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        return os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    except (ValueError, OSError):
+        return 4 * SHARD_MEMORY_BUDGET_BYTES
+
+
 def shard_count(mutation_count: int, artifact_dir: Path) -> int:
     """How many checkouts to run concurrently.
 
@@ -1010,12 +1109,8 @@ def shard_count(mutation_count: int, artifact_dir: Path) -> int:
         return 1
     affordable = 1 + int(free // SHARD_DISK_BUDGET_BYTES)
     # One kernel-crate rustc/link per shard; keep that resident set in RAM.
-    try:
-        available = os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
-        memory = max(1, int(available // SHARD_MEMORY_BUDGET_BYTES))
-    except (ValueError, OSError):
-        memory = 4
-    return max(1, min(6, (os.cpu_count() or 1) // 3, mutation_count, affordable, memory))
+    memory = max(1, int(available_memory_bytes() // SHARD_MEMORY_BUDGET_BYTES))
+    return max(1, min(8, (os.cpu_count() or 1) // 2, mutation_count, affordable, memory))
 
 
 def run_bucket_mutations(
@@ -1063,8 +1158,16 @@ def run_shards(
     by_source: dict[str, list[dict[str, str | int]]] = {}
     for mutation in ordered:
         by_source.setdefault(str(mutation["source"]), []).append(mutation)
-    for index, group in enumerate(by_source.values()):
-        buckets[index % shards].extend(group)
+    # Longest-processing-time-first onto the least loaded shard. Round-robin by
+    # file left the busiest shard with most of kernel-ps (over half of all
+    # mutants) while the others idled at a load average near 3, so the lane's
+    # wall time was one shard's. Whole files still stay together, which is what
+    # keeps cargo's incremental rebuild inside one crate per shard.
+    loads = [0] * shards
+    for group in sorted(by_source.values(), key=len, reverse=True):
+        lightest = min(range(shards), key=lambda i: (loads[i], i))
+        buckets[lightest].extend(group)
+        loads[lightest] += len(group)
 
     def run_bucket(index: int) -> list[dict[str, str | int]]:
         bucket = buckets[index]
@@ -1200,7 +1303,7 @@ def main() -> int:
         "cache": {
             "reused": len(reused),
             "executed": len(pending),
-            "approximation": "anchor-and-exact-witness-body-literal-includes-kill-semantics-v4",
+            "approximation": "anchor-and-exact-witness-body-literal-includes-dependency-closure-kill-semantics-v5",
         },
     }
     summary_path.write_text(

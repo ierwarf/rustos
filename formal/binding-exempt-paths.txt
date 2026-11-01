@@ -23,3 +23,6 @@ docs/ai/session-handoff-log.md
 docs/ai/performance-hardening.md
 docs/ai/structural-ownership-design.md
 docs/ai/task-router.md
+docs/validation/ring3-8stage-status.md
+docs/validation/ring3-provider-custody-acceptance.md
+docs/architecture/job-model.md

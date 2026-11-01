@@ -21,6 +21,7 @@ pub mod application_jobs;
 pub mod aslr;
 pub mod placement;
 mod request_strings;
+pub mod release_bundle;
 pub use request_strings::RequestStrings;
 
 use core::mem::size_of;

@@ -55,7 +55,7 @@ use rustos_user_abi::syscall::{
     COMMERCIAL_MAX_LOADERD_OP_AUXV_PLAN, COMMERCIAL_MAX_LOADERD_OP_ELF_RUNTIME_PLAN,
     COMMERCIAL_MAX_LOADERD_OP_IMAGE_PROBE, COMMERCIAL_MAX_LOADERD_OP_IMPORT_POLICY,
     COMMERCIAL_MAX_LOADERD_OP_INTERPRETER_PLAN, COMMERCIAL_MAX_LOADERD_OP_MAP_PLAN,
-    COMMERCIAL_MAX_LOADERD_OP_PE_RUNTIME_PLAN, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
+    COMMERCIAL_MAX_LOADERD_OP_PE_RUNTIME_PLAN, COMMERCIAL_MAX_LOADERD_OP_STAGE_RELEASE, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
     COMMERCIAL_MAX_PROTOCOL_LOADERD, IPC_SERVICE_INITD, IPC_SERVICE_LOADERD, IPC_SERVICE_PROCD,
     IPC_SERVICE_ROOTD, IPC_SERVICE_SESSIOND, IPC_SERVICE_VFSD, LOADER_ACTIVATE_BATCH_ABI_VERSION,
     LOADER_ACTIVATE_BATCH_MAX_TARGETS, LOADER_OP_ACTIVATE, LOADER_OP_ACTIVATE_BATCH,
@@ -857,6 +857,14 @@ fn handle_commercial_request(
         response.status = EACCES;
         return response;
     }
+    // Release staging is the update supervisor's request, not a loader
+    // client's: only the live initd principal may name a bundle to stage.
+    if request.header.op == COMMERCIAL_MAX_LOADERD_OP_STAGE_RELEASE
+        && rustos_svc_runtime::ipc::validate_service_owner(IPC_SERVICE_INITD, sender_pid) < 0
+    {
+        response.status = EACCES;
+        return response;
+    }
     match request.header.op {
         COMMERCIAL_MAX_LOADERD_OP_IMAGE_PROBE => {
             let path = match commercial_request_path(request) {
@@ -873,6 +881,28 @@ fn handle_commercial_request(
                     response.descriptors[0] =
                         loader_descriptor("image-probe", request.header.op, format as u64);
                     response.capability = loader_capability("image-probe", request.header.op);
+                }
+                Err(errno) => response.status = errno,
+            }
+        }
+        COMMERCIAL_MAX_LOADERD_OP_STAGE_RELEASE => {
+            let path = match commercial_request_path(request) {
+                Ok(path) => path,
+                Err(errno) => {
+                    response.status = errno;
+                    return response;
+                }
+            };
+            match stage_release_file(
+                path,
+                request.arg0,
+                request.arg3,
+                request.arg1,
+                request.arg2,
+            ) {
+                Ok(generation) => {
+                    response.value0 = request.arg1;
+                    response.value1 = generation;
                 }
                 Err(errno) => response.status = errno,
             }
@@ -929,6 +959,65 @@ fn handle_commercial_request(
         _ => response.status = EINVAL,
     }
     response
+}
+
+/// Reads a release bundle from a sealed read-only snapshot, verifies it
+/// against the keyring sealed into this image and stages its digest with
+/// rootd. Returns the verified release generation. Nothing is written and no
+/// service is restarted: staging only records the candidate digest.
+fn stage_release_file(
+    path: &str,
+    service: u64,
+    durable_floor: u64,
+    release_epoch: u64,
+    trial_deadline_ns: u64,
+) -> Result<u64, i32> {
+    use loaderd::release_bundle::{bundle_length, BUNDLE_HEADER_BYTES};
+    let fd = open_immutable_file_snapshot(path, 0, 0)?.fd;
+    let read = (|| -> Result<Vec<u8>, i32> {
+        let mut header = [0_u8; BUNDLE_HEADER_BYTES];
+        read_exact_at(fd, 0, &mut header)?;
+        let total = bundle_length(&header).map_err(|_| EINVAL)?;
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(total).map_err(|_| 12)?;
+        bytes.resize(total, 0);
+        let mut done = 0_usize;
+        while done < total {
+            let chunk = (total - done).min(1 << 20);
+            read_exact_at(fd, done as u64, &mut bytes[done..done + chunk])?;
+            done += chunk;
+        }
+        Ok(bytes)
+    })();
+    let _ = syscall1(SYS_CLOSE, fd as u64);
+    let bytes = read?;
+    match release_attestation::stage_release_bundle(
+        &bytes,
+        service,
+        durable_floor,
+        release_epoch,
+        trial_deadline_ns,
+    ) {
+        Ok(verified) => {
+            debug_line(&format!(
+                "loaderd: release staged service={service} epoch={release_epoch} generation={}",
+                verified.manifest().generation
+            ));
+            Ok(verified.manifest().generation)
+        }
+        Err(error) => {
+            debug_line(&format!(
+                "loaderd: release stage refused service={service} epoch={release_epoch} reason={error:?}"
+            ));
+            Err(match error {
+                release_attestation::AdmissionError::Invalid => EINVAL,
+                release_attestation::AdmissionError::Image(_) => EACCES,
+                release_attestation::AdmissionError::Policy(errno)
+                | release_attestation::AdmissionError::Transport(errno) => errno,
+                release_attestation::AdmissionError::WrongReply => 71,
+            })
+        }
+    }
 }
 
 fn probe_image(path: &str) -> Result<u16, i32> {

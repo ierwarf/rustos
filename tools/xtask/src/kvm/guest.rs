@@ -114,14 +114,14 @@ fn spawn_rustos_guest(
         rustos_vcpus,
         ..RUSTOS_SMP_READINESS
     };
-    let smp_evidence = (rustos_vcpus > 1)
-        .then(|| {
-            crate::formal_contracts::validate_smp_launch_evidence(
-                &config.root_dir,
-                evidence_profile,
-            )
-        })
-        .transpose()?;
+    // An unsealed profile is reported by the launch entry as a warning; it
+    // does not stop the guest (see `warn_if_smp_launch_unsealed`).
+    let smp_evidence = (rustos_vcpus > 1).then(|| {
+        crate::formal_contracts::validate_smp_launch_evidence(&config.root_dir, evidence_profile)
+            .unwrap_or_else(|_| {
+                crate::formal_contracts::ValidatedSmpLaunchEvidence::unsealed_launch()
+            })
+    });
     readiness.validate(smp_evidence.as_ref())?;
     if layout.rustos_monitor.exists() {
         fs::remove_file(&layout.rustos_monitor).with_context(|| {

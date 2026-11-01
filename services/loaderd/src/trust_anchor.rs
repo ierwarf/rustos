@@ -44,9 +44,34 @@ pub(super) fn parse(bytes: &[u8]) -> Result<Vec<TrustedKey>, Error> {
     Ok(keys)
 }
 
+/// Signer id and service of the opt-in test key (see `test_key`).
+pub(super) const TEST_SIGNER_ID: [u8; 16] = [0x7e; 16];
+pub(super) const TEST_SERVICE: u64 = 3;
+
+/// A key compiled in only when the image is built with
+/// `RUSTOS_LOADERD_TEST_RELEASE_KEY=<64 hex digits>`. It trusts exactly one
+/// signer for one service, from generation 1. The matching private seed is
+/// public test material in the xtask, so an image built with this variable
+/// must never ship: the default build leaves the ring empty and every release
+/// is refused with `UntrustedKey`.
+fn test_key() -> Option<TrustedKey> {
+    let verifying_key = loaderd::release_bundle::parse_hex_key(option_env!("RUSTOS_LOADERD_TEST_RELEASE_KEY")?)?;
+    Some(TrustedKey {
+        signer_id: TEST_SIGNER_ID,
+        service: TEST_SERVICE,
+        verifying_key,
+        minimum_generation: 1,
+        revoked: false,
+    })
+}
+
 /// The keys sealed into this loaderd image.
 pub(super) fn sealed_keys() -> Result<Vec<TrustedKey>, Error> {
-    parse(SEALED)
+    let mut keys = parse(SEALED)?;
+    if let Some(key) = test_key() {
+        keys.push(key);
+    }
+    Ok(keys)
 }
 
 #[cfg(test)]
@@ -69,6 +94,11 @@ mod tests {
         let keys = sealed_keys().unwrap();
         assert!(keys.is_empty());
         assert!(KeyRing::new(&keys).is_ok());
+    }
+
+    #[test]
+    fn the_test_key_is_absent_from_a_default_build() {
+        assert!(test_key().is_none(), "the shipped build trusts no test signer");
     }
 
     #[test]

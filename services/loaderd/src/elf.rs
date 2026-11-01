@@ -172,6 +172,19 @@ fn validate_commercial_request(request: &CommercialMaxProtocolRequest) -> Result
                 Ok(())
             }
         }
+        COMMERCIAL_MAX_LOADERD_OP_STAGE_RELEASE => {
+            // arg0 service, arg1 epoch, arg2 absolute deadline, arg3 floor.
+            if request.path_len == 0
+                || request.payload_len != 0
+                || request.arg0 == 0
+                || request.arg1 == 0
+                || request.arg2 == 0
+            {
+                Err(EINVAL)
+            } else {
+                Ok(())
+            }
+        }
         COMMERCIAL_MAX_LOADERD_OP_ELF_RUNTIME_PLAN
         | COMMERCIAL_MAX_LOADERD_OP_PE_RUNTIME_PLAN
         | COMMERCIAL_MAX_LOADERD_OP_INTERPRETER_PLAN
@@ -252,6 +265,7 @@ fn loader_capability_mask(op: u16) -> u64 {
         COMMERCIAL_MAX_LOADERD_OP_IMPORT_POLICY => 1 << 4,
         COMMERCIAL_MAX_LOADERD_OP_MAP_PLAN => 1 << 5,
         COMMERCIAL_MAX_LOADERD_OP_AUXV_PLAN => 1 << 6,
+        COMMERCIAL_MAX_LOADERD_OP_STAGE_RELEASE => 1 << 7,
         _ => 0,
     }
 }

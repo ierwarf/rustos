@@ -38,6 +38,13 @@ options:
   --proc-stress        arm the `procstress` session program (fork, copy-on-write,
                        mmap/mprotect/munmap churn from many threads) and wait for
                        it to finish; used to reproduce scheduler and TLB panics
+  --release-stage-probe
+                       put a signed release bundle on the volume and require
+                       initd -> loaderd -> rootd to verify and stage it; build
+                       first with RUSTOS_INITD_RELEASE_PROBE=1 and
+                       RUSTOS_LOADERD_TEST_RELEASE_KEY set to the
+                       public test key printed by `cargo xtask kvm-smoke
+                       --print-release-probe-key` (never ship such an image)
   --oom-hog-watchdog   like --oom-hog, but require the ring0 watchdog to end the
                        hog while rootd is blinded; run as
                        RUSTOS_FAULTS='rootd.memory.census=fail'

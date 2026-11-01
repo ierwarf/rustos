@@ -15,6 +15,8 @@ use rustos_user_abi::syscall::{
     COMMERCIAL_MAX_ROOTD_OP_UPDATE_SEAL,
     COMMERCIAL_MAX_ROOTD_OP_UPDATE_INSPECT,
     IPC_SERVICE_ROOTD,SYS_RUSTOS_IPC_CALL_BOUNDED,
+    COMMERCIAL_MAX_LOADERD_OP_STAGE_RELEASE,COMMERCIAL_MAX_PROTOCOL_LOADERD,
+    IPC_SERVICE_LOADERD,
 };
 const EINVAL:i32=22;const EPROTO:i32=71;
 #[derive(Clone,Copy,Debug,Eq,PartialEq)]
@@ -133,3 +135,50 @@ mod tests {
         assert_eq!(Phase::parse(u64::MAX),Err(EPROTO));
     }
 }
+
+/// Typed initd -> loaderd request: verify the signed release bundle at `path`
+/// (a sealed read-only file) and stage its digest with rootd. Returns the
+/// verified release generation. Loaderd, not initd, holds the keyring and
+/// decides; initd only names the bundle, service, epoch and deadline.
+pub(super) fn stage_release_via_loaderd(
+    path:&str,service:u64,epoch:u64,trial_deadline_ns:u64,durable_floor:u64,
+)->Result<u64,i32>{
+    let mut request=CommercialMaxProtocolRequest::default();
+    if path.is_empty()||path.len()>request.path.len()||path.as_bytes().contains(&0){
+        return Err(EINVAL)
+    }
+    let endpoint=super::lookup_service_endpoint(IPC_SERVICE_LOADERD)?;
+    request.header.version=COMMERCIAL_MAX_PROTOCOL_ABI_VERSION;
+    request.header.protocol=COMMERCIAL_MAX_PROTOCOL_LOADERD;
+    request.header.op=COMMERCIAL_MAX_LOADERD_OP_STAGE_RELEASE;
+    request.header.subject_pid=u64::from(std::process::id());
+    request.header.subject_tid=super::current_tid();
+    request.arg0=service;request.arg1=epoch;
+    request.arg2=trial_deadline_ns;request.arg3=durable_floor;
+    request.path_len=path.len() as u32;
+    request.path[..path.len()].copy_from_slice(path.as_bytes());
+    let mut response=CommercialMaxProtocolResponse::default();
+    // SAFETY: both records are initialized, exact-sized ABI structs that stay
+    // exclusively live for the whole bounded synchronous call.
+    let got=unsafe{rustos_svc_runtime::syscall::syscall6(
+        SYS_RUSTOS_IPC_CALL_BOUNDED,
+        endpoint,
+        (&request as *const CommercialMaxProtocolRequest) as u64,
+        size_of::<CommercialMaxProtocolRequest>() as u64,
+        (&mut response as *mut CommercialMaxProtocolResponse) as u64,
+        size_of::<CommercialMaxProtocolResponse>() as u64,
+        STAGE_RELEASE_CALL_TIMEOUT_MS,
+    )};
+    if got<0{return Err((-got) as i32)}
+    if got as usize!=size_of::<CommercialMaxProtocolResponse>()
+        ||!response.is_valid_envelope_for(&request)
+        ||response.descriptor_count!=0
+    {
+        return Err(EPROTO)
+    }
+    if response.status!=0{return Err(response.status)}
+    if response.value0!=epoch||response.value1==0{return Err(EPROTO)}
+    Ok(response.value1)
+}
+/// Reading and hashing two images is bulk work, not a heartbeat.
+const STAGE_RELEASE_CALL_TIMEOUT_MS:u64=15_000;

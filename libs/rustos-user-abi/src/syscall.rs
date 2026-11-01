@@ -1261,6 +1261,12 @@ pub const COMMERCIAL_MAX_LOADERD_OP_INTERPRETER_PLAN: u16 = 4;
 pub const COMMERCIAL_MAX_LOADERD_OP_IMPORT_POLICY: u16 = 5;
 pub const COMMERCIAL_MAX_LOADERD_OP_MAP_PLAN: u16 = 6;
 pub const COMMERCIAL_MAX_LOADERD_OP_AUXV_PLAN: u16 = 7;
+/// Verify a signed release bundle read from a sealed read-only volume file and
+/// stage its digest with rootd. `path` is the bundle, `arg0` the service id,
+/// `arg1` the release epoch, `arg2` the absolute trial deadline in rootd's
+/// monotonic nanoseconds and `arg3` the durable anti-rollback floor. Only the
+/// live initd principal may issue it; the keyring is sealed into loaderd.
+pub const COMMERCIAL_MAX_LOADERD_OP_STAGE_RELEASE: u16 = 8;
 pub const COMMERCIAL_MAX_SYSCALLD_OP_LINUX_POLICY: u16 = 1;
 pub const COMMERCIAL_MAX_SYSCALLD_OP_WIN32_POLICY: u16 = 2;
 pub const COMMERCIAL_MAX_SYSCALLD_OP_MM_POLICY: u16 = 3;
