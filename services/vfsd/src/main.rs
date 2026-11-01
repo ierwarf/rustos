@@ -1067,7 +1067,6 @@ fn vfs_descriptor(
         op,
         flags: 0,
         service_id: IPC_SERVICE_VFSD,
-        capability_mask: vfs_capability_mask(op),
         value0,
         value1,
         ..CommercialMaxProtocolDescriptorWire::default()
@@ -1080,24 +1079,10 @@ fn vfs_capability(label: &str, op: u16) -> CommercialMaxCapabilityLeaseWire {
     let mut capability = CommercialMaxCapabilityLeaseWire {
         lease_id: ((COMMERCIAL_MAX_PROTOCOL_VFSD as u64) << 32) | u64::from(op),
         service_id: IPC_SERVICE_VFSD,
-        capability_mask: vfs_capability_mask(op),
-        rights_mask: vfs_capability_mask(op),
         ..CommercialMaxCapabilityLeaseWire::default()
     };
     copy_label(label, &mut capability.label, &mut capability.label_len);
     capability
-}
-
-fn vfs_capability_mask(op: u16) -> u64 {
-    match op {
-        COMMERCIAL_MAX_VFSD_OP_MOUNT_GRAPH => 1 << 0,
-        COMMERCIAL_MAX_VFSD_OP_PATH_RESOLVE => 1 << 1,
-        COMMERCIAL_MAX_VFSD_OP_FD_TABLE_PLAN => 1 << 2,
-        COMMERCIAL_MAX_VFSD_OP_DIRECTORY_CURSOR => 1 << 3,
-        COMMERCIAL_MAX_VFSD_OP_FILE_CURSOR => 1 << 4,
-        COMMERCIAL_MAX_VFSD_OP_METADATA_POLICY => 1 << 5,
-        _ => 0,
-    }
 }
 
 fn copy_label(label: &str, target: &mut [u8], len: &mut u16) {

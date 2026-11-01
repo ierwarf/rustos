@@ -389,7 +389,6 @@ fn procd_descriptor(label: &str, op: u16, value0: u64) -> CommercialMaxProtocolD
         op,
         flags: 0,
         service_id: IPC_SERVICE_PROCD,
-        capability_mask: procd_capability_mask(op),
         value0,
         value1: 0,
         ..CommercialMaxProtocolDescriptorWire::default()
@@ -402,24 +401,10 @@ fn procd_capability(label: &str, op: u16) -> CommercialMaxCapabilityLeaseWire {
     let mut capability = CommercialMaxCapabilityLeaseWire {
         lease_id: ((COMMERCIAL_MAX_PROTOCOL_PROCD as u64) << 32) | u64::from(op),
         service_id: IPC_SERVICE_PROCD,
-        capability_mask: procd_capability_mask(op),
-        rights_mask: procd_capability_mask(op),
         ..CommercialMaxCapabilityLeaseWire::default()
     };
     copy_label(label, &mut capability.label, &mut capability.label_len);
     capability
-}
-
-fn procd_capability_mask(op: u16) -> u64 {
-    match op {
-        COMMERCIAL_MAX_PROCD_OP_EXEC_TICKET => 1 << 1,
-        COMMERCIAL_MAX_PROCD_OP_FORK_PLAN => 1 << 2,
-        COMMERCIAL_MAX_PROCD_OP_THREAD_PLAN => 1 << 3,
-        COMMERCIAL_MAX_PROCD_OP_SIGNAL_POLICY => 1 << 4,
-        COMMERCIAL_MAX_PROCD_OP_WAIT_NAMESPACE => 1 << 5,
-        COMMERCIAL_MAX_PROCD_OP_SESSION_MEMBERSHIP => 1 << 6,
-        _ => 0,
-    }
 }
 
 fn copy_label(label: &str, target: &mut [u8], len: &mut u16) {

@@ -102,6 +102,7 @@ pub(super) fn bootstrap_args(
     path: &'static [u8],
     weight_micros: u64,
     job: u64,
+    principal_service: u64,
 ) -> rustos_user_abi::syscall::RustosBootstrapSpawnArgs {
     use rustos_user_abi::syscall::{BOOTSTRAP_SPAWN_ABI_VERSION, BOOTSTRAP_SPAWN_FLAG_LOGICAL_ADMIN, RustosBootstrapSpawnArgs};
     RustosBootstrapSpawnArgs {
@@ -110,6 +111,7 @@ pub(super) fn bootstrap_args(
         path_ptr: path.as_ptr() as u64,
         weight_micros,
         job_handle: job,
+        principal_service,
         ..RustosBootstrapSpawnArgs::default()
     }
 }
@@ -324,7 +326,7 @@ fn spawn_unprivileged_probe(job: u64) -> Result<u64, i64> {
         super::scheduling_context_policy_for_exec(path),
     )
     .map_err(i64::from)?;
-    let mut args = bootstrap_args(path, 100, job);
+    let mut args = bootstrap_args(path, 100, job, 0);
     args.flags = 0;
     let pid = syscall1(rustos_user_abi::syscall::SYS_RUSTOS_SPAWN_EXEC, (&args as *const _) as u64);
     if pid < 0 {
@@ -468,7 +470,7 @@ mod tests {
     #[test]
     fn bootstrap_placement_names_the_caller_local_job_in_a_versioned_block() {
         static PATH: &[u8] = b"/services/loaderd/loaderd.elf\0";
-        let args = bootstrap_args(PATH, 1000, 9);
+        let args = bootstrap_args(PATH, 1000, 9, 0);
         assert!(rustos_user_abi::syscall::bootstrap_spawn_shape_valid(&args));
         assert_eq!((args.job_handle, args.weight_micros, args.console_session), (9, 1000, 0));
         assert_eq!(args.path_ptr, PATH.as_ptr() as u64);

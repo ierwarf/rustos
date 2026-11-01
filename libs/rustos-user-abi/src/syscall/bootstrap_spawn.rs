@@ -2,7 +2,7 @@
 //! versioned argument block, not Linux exec argv/env registers. Every child is
 //! born into a Job descriptor with CREATE_PROCESS authority; fd zero is valid.
 
-pub const BOOTSTRAP_SPAWN_ABI_VERSION: u16 = 1;
+pub const BOOTSTRAP_SPAWN_ABI_VERSION: u16 = 2;
 pub const BOOTSTRAP_SPAWN_FLAG_LOGICAL_ADMIN: u32 = 1;
 
 #[repr(C)]
@@ -17,6 +17,10 @@ pub struct RustosBootstrapSpawnArgs {
     pub weight_micros: u64,
     /// Caller-local typed Job descriptor; never a raw JobId.
     pub job_handle: u64,
+    /// Service identity rootd binds to the child before its first instruction
+    /// (zero binds none). The child is created suspended, bound, then started,
+    /// so it can never act ahead of the service policy.
+    pub principal_service: u64,
 }
 
 pub const fn bootstrap_spawn_shape_valid(args: &RustosBootstrapSpawnArgs) -> bool {
@@ -31,11 +35,12 @@ mod tests {
 
     #[test]
     fn bootstrap_spawn_wire_has_explicit_version_and_job_descriptor() {
-        assert_eq!(core::mem::size_of::<RustosBootstrapSpawnArgs>(), 40);
+        assert_eq!(core::mem::size_of::<RustosBootstrapSpawnArgs>(), 48);
         assert_eq!(core::mem::offset_of!(RustosBootstrapSpawnArgs, path_ptr), 8);
         assert_eq!(core::mem::offset_of!(RustosBootstrapSpawnArgs, console_session), 16);
         assert_eq!(core::mem::offset_of!(RustosBootstrapSpawnArgs, weight_micros), 24);
         assert_eq!(core::mem::offset_of!(RustosBootstrapSpawnArgs, job_handle), 32);
+        assert_eq!(core::mem::offset_of!(RustosBootstrapSpawnArgs, principal_service), 40);
         let args = RustosBootstrapSpawnArgs { abi_version: BOOTSTRAP_SPAWN_ABI_VERSION, ..RustosBootstrapSpawnArgs::default() };
         assert!(bootstrap_spawn_shape_valid(&args), "fd zero is not a missing-job sentinel");
         assert!(bootstrap_spawn_shape_valid(&RustosBootstrapSpawnArgs { flags: BOOTSTRAP_SPAWN_FLAG_LOGICAL_ADMIN, job_handle: 9, ..args }));

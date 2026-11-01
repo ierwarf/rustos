@@ -405,7 +405,6 @@ fn display_policy_descriptor(
         protocol: syscall_abi::COMMERCIAL_MAX_PROTOCOL_UISERVER,
         op,
         service_id: syscall_abi::IPC_SERVICE_UISERVER,
-        capability_mask: display_policy_capability_mask(op),
         value0: (u64::from(DISPLAY_POLICY_WIDTH.load(Ordering::Acquire)) << 32)
             | u64::from(DISPLAY_POLICY_HEIGHT.load(Ordering::Acquire)),
         value1: DISPLAY_POLICY_GENERATION.load(Ordering::Acquire),
@@ -422,24 +421,10 @@ fn display_policy_capability(
     let mut capability = syscall_abi::CommercialMaxCapabilityLeaseWire {
         lease_id: ((syscall_abi::COMMERCIAL_MAX_PROTOCOL_UISERVER as u64) << 32) | u64::from(op),
         service_id: syscall_abi::IPC_SERVICE_UISERVER,
-        capability_mask: display_policy_capability_mask(op),
-        rights_mask: display_policy_capability_mask(op),
         ..syscall_abi::CommercialMaxCapabilityLeaseWire::default()
     };
     copy_policy_label(label, &mut capability.label, &mut capability.label_len);
     capability
-}
-
-fn display_policy_capability_mask(op: u16) -> u64 {
-    match op {
-        syscall_abi::COMMERCIAL_MAX_UISERVER_OP_DISPLAY_READINESS => 1 << 0,
-        syscall_abi::COMMERCIAL_MAX_UISERVER_OP_DISPLAY_METADATA => 1 << 1,
-        syscall_abi::COMMERCIAL_MAX_UISERVER_OP_SURFACE_POLICY => 1 << 2,
-        syscall_abi::COMMERCIAL_MAX_UISERVER_OP_PRESENT_POLICY => 1 << 3,
-        syscall_abi::COMMERCIAL_MAX_UISERVER_OP_TERMINAL_PRESENT_POLICY => 1 << 4,
-        syscall_abi::COMMERCIAL_MAX_UISERVER_OP_TRUSTED_UI_STATUS => 1 << 5,
-        _ => 0,
-    }
 }
 
 /// Current RustOS DVM transports deliberately provide no attested physical

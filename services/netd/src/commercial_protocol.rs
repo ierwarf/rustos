@@ -112,7 +112,6 @@ fn net_descriptor(name: &str, offload_op: u16) -> CommercialMaxProtocolDescripto
         op: offload_op,
         flags: 0,
         service_id: IPC_SERVICE_NETD,
-        capability_mask: net_capability_mask(offload_op),
         value0: offload_op as u64,
         value1: 0,
         ..CommercialMaxProtocolDescriptorWire::default()
@@ -125,37 +124,10 @@ fn net_capability(label: &str, op: u16) -> CommercialMaxCapabilityLeaseWire {
     let mut capability = CommercialMaxCapabilityLeaseWire {
         lease_id: ((COMMERCIAL_MAX_PROTOCOL_NETD as u64) << 32) | u64::from(op),
         service_id: IPC_SERVICE_NETD,
-        capability_mask: net_capability_mask(op),
-        rights_mask: net_capability_mask(op),
         ..CommercialMaxCapabilityLeaseWire::default()
     };
     copy_label(label, &mut capability.label, &mut capability.label_len);
     capability
-}
-
-fn net_capability_mask(op: u16) -> u64 {
-    match op {
-        COMMERCIAL_MAX_NETD_OP_SOCKET_NAMESPACE
-        | SYSCALL_OFFLOAD_OP_LINUX_SOCKET
-        | SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR
-        | SYSCALL_OFFLOAD_OP_LINUX_DUP
-        | SYSCALL_OFFLOAD_OP_LINUX_CLOSE
-        | SYSCALL_OFFLOAD_OP_LINUX_SHUTDOWN => 1 << 0,
-        COMMERCIAL_MAX_NETD_OP_SOCKET_OPTIONS
-        | SYSCALL_OFFLOAD_OP_LINUX_SETSOCKOPT
-        | SYSCALL_OFFLOAD_OP_LINUX_GETSOCKOPT => 1 << 1,
-        COMMERCIAL_MAX_NETD_OP_ADDRESS_BIND
-        | SYSCALL_OFFLOAD_OP_LINUX_BIND
-        | SYSCALL_OFFLOAD_OP_LINUX_LISTEN => 1 << 2,
-        COMMERCIAL_MAX_NETD_OP_ROUTE_POLICY | SYSCALL_OFFLOAD_OP_LINUX_CONNECT => 1 << 3,
-        COMMERCIAL_MAX_NETD_OP_PACKET_LEASE
-        | SYSCALL_OFFLOAD_OP_LINUX_SENDTO
-        | SYSCALL_OFFLOAD_OP_LINUX_SENDMSG
-        | SYSCALL_OFFLOAD_OP_LINUX_RECVFROM
-        | SYSCALL_OFFLOAD_OP_LINUX_RECVMSG => 1 << 4,
-        COMMERCIAL_MAX_NETD_OP_FD_TRANSFER | SYSCALL_OFFLOAD_OP_LINUX_ACCEPT => 1 << 5,
-        _ => 0,
-    }
 }
 
 fn copy_label(label: &str, target: &mut [u8], len: &mut u16) {
@@ -226,14 +198,11 @@ mod tests {
             assert_eq!(descriptor.protocol, COMMERCIAL_MAX_PROTOCOL_NETD);
             assert_eq!(descriptor.service_id, IPC_SERVICE_NETD);
             assert_eq!(descriptor.op, expected_op);
-            assert_eq!(descriptor.capability_mask, 1 << 0);
         }
 
         let packet = request(COMMERCIAL_MAX_NETD_OP_PACKET_LEASE);
         let mut response = CommercialMaxProtocolResponse::default();
         assert_eq!(dispatch_commercial_request(&packet, &mut response), 0);
-        assert_eq!(response.capability.capability_mask, 1 << 4);
-        assert_eq!(response.capability.rights_mask, 1 << 4);
         assert_eq!(response.capability.service_id, IPC_SERVICE_NETD);
 
         let transfer = request(COMMERCIAL_MAX_NETD_OP_FD_TRANSFER);
@@ -241,7 +210,5 @@ mod tests {
         assert_eq!(dispatch_commercial_request(&transfer, &mut response), 0);
         assert_eq!(response.descriptor_count, 1);
         assert_eq!(response.descriptors[0].op, SYSCALL_OFFLOAD_OP_LINUX_ACCEPT);
-        assert_eq!(response.capability.capability_mask, 1 << 5);
-        assert_eq!(response.capability.rights_mask, 1 << 5);
     }
 }

@@ -96,6 +96,7 @@ const SERVICE_IPC_TIMEOUT_MS: u64 = rustos_user_abi::performance::IPC_BULK_DATA_
 const IPC_FAST_CALL_LIVE: bool = true;
 use rustos_user_abi::performance::IPC_RECEIVE_REPORT_MAX_ADDRESS_SPACE_BINDS as MAX_RECEIVE_BINDS;
 use rustos_user_abi::syscall::{ServiceCapability, ServiceCapabilitySet};
+use super::broker_ops::service_policy_ops;
 // RING3-MIGRATION-REFERENCE START: rootd should own service namespace endpoint
 // ownership and capability leases. Ring0 keeps the temporary service registry
 // table until rootd can mint narrow broker capabilities.
@@ -1081,30 +1082,19 @@ fn service_capability(service_id: u64) -> Result<ServiceCapabilityAuthorization,
         });
     }
     let rootd_epoch = service_endpoint_epoch(linux_abi::IPC_SERVICE_ROOTD).ok_or(LINUX_ENOENT)?;
-    // Endpoint registration is a rare authority transition, but it is on the
-    // boot-critical path. Keep the two kernel-stamped ends of the rootd
-    // round-trip visible so a delayed registrar is not misattributed to the
-    // local endpoint table or an unrelated storage request.
-    record_service_endpoint_milestone(
-        "ipc-service-capability-request",
-        service_id,
-        multitask::current_user_process_id().unwrap_or_default(),
-        rootd_epoch,
-    );
-    // Rootd's mask is untrusted input to the kernel: a bit that names no
-    // assigned capability refuses the registration instead of being stored.
-    let capability = ServiceCapabilitySet::from_wire(service_capability_via_rootd(service_id)?)
-        .ok_or(LINUX_EINVAL)?;
-    record_service_endpoint_milestone(
-        "ipc-service-capability-reply",
-        service_id,
-        multitask::current_user_process_id().unwrap_or_default(),
-        capability.to_wire(),
-    );
-    Ok(ServiceCapabilityAuthorization {
-        capability,
-        rootd_epoch: Some(rootd_epoch),
-    })
+    // Registration is decided from the typed policy rootd installed, for the
+    // service identity rootd bound to this process. The kernel never calls
+    // rootd for it.
+    let registrant = multitask::current_user_process_id().unwrap_or_default();
+    if let Some(decision) = service_policy_ops::registration_decision(registrant, service_id) {
+        return decision.map(|capability| ServiceCapabilityAuthorization {
+            capability,
+            rootd_epoch: Some(rootd_epoch),
+        });
+    }
+    // No binding means rootd never authenticated this process as a service.
+    // There is no one to ask: the kernel does not call rootd, so it refuses.
+    Err(LINUX_EACCES)
 }
 
 pub(super) fn validate_commercial_response_envelope(
@@ -1115,39 +1105,6 @@ pub(super) fn validate_commercial_response_envelope(
         return Err(LINUX_EINVAL);
     }
     Ok(())
-}
-
-fn service_capability_via_rootd(service_id: u64) -> Result<u64, i64> {
-    let mut request = CommercialMaxProtocolRequest::default();
-    request.header.version = rustos_user_abi::syscall::COMMERCIAL_MAX_PROTOCOL_ABI_VERSION;
-    request.header.protocol = rustos_user_abi::syscall::COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR;
-    request.header.op = rustos_user_abi::syscall::COMMERCIAL_MAX_ROOTD_OP_SERVICE_CAPABILITY;
-    let Some(snapshot) = multitask::current_user_snapshot() else {
-        return Err(LINUX_EINVAL);
-    };
-    request.header.subject_pid = snapshot.process_id();
-    request.header.subject_tid = snapshot.thread_id();
-    request.arg0 = service_id;
-    let response = call_service_endpoint_with_class(
-        linux_abi::IPC_SERVICE_ROOTD,
-        as_bytes(&request),
-        ServiceIpcClass::BootControl,
-    )?;
-    if response.len() != size_of::<CommercialMaxProtocolResponse>() {
-        return Err(LINUX_EINVAL);
-    }
-    let response = read_unaligned::<CommercialMaxProtocolResponse>(response.as_slice());
-    validate_commercial_response_envelope(&request, &response)?;
-    if response.descriptor_count != 0 || response.payload_len != 0 || response.value1 != 0 {
-        return Err(LINUX_EINVAL);
-    }
-    if response.status != 0 {
-        return Err(response.status.unsigned_abs() as i64);
-    }
-    if response.value0 == 0 {
-        return Err(LINUX_EINVAL);
-    }
-    Ok(response.value0)
 }
 
 pub(super) fn syscall_linux_rustos_ipc_lookup_service_endpoint(service_id: u64) -> u64 {
@@ -1163,7 +1120,7 @@ pub(super) fn syscall_linux_rustos_ipc_lookup_service_endpoint(service_id: u64) 
     }
     if service_id != linux_abi::IPC_SERVICE_ROOTD
         && !current_process_can_lookup_service_endpoint()
-        && let Err(errno) = authorize_service_lookup_via_rootd(service_id)
+        && let Err(errno) = authorize_service_lookup(service_id)
     {
         return linux_errno(errno);
     }
@@ -1191,7 +1148,7 @@ pub(super) fn syscall_linux_rustos_ipc_wait_service_endpoint(args_ptr: u64) -> u
     }
     if args.service_id != linux_abi::IPC_SERVICE_ROOTD
         && !current_process_can_lookup_service_endpoint()
-        && let Err(errno) = authorize_service_lookup_via_rootd(args.service_id)
+        && let Err(errno) = authorize_service_lookup(args.service_id)
     {
         return linux_errno(errno);
     }
@@ -1310,46 +1267,22 @@ fn service_endpoint_for_expected_process(
     Ok(Some(endpoint))
 }
 
-fn authorize_service_lookup_via_rootd(service_id: u64) -> Result<(), i64> {
-    let mut request = CommercialMaxProtocolRequest::default();
-    request.header.version = rustos_user_abi::syscall::COMMERCIAL_MAX_PROTOCOL_ABI_VERSION;
-    request.header.protocol = rustos_user_abi::syscall::COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR;
-    request.header.op = rustos_user_abi::syscall::COMMERCIAL_MAX_ROOTD_OP_SERVICE_LOOKUP;
-    let Some(snapshot) = multitask::current_user_snapshot() else {
-        return Err(LINUX_EINVAL);
-    };
-    request.header.subject_pid = snapshot.process_id();
-    request.header.subject_tid = snapshot.thread_id();
-    request.arg0 = service_id;
-    let response = call_service_endpoint_with_class(
-        linux_abi::IPC_SERVICE_ROOTD,
-        as_bytes(&request),
-        ServiceIpcClass::BootControl,
-    )?;
-    if response.len() != size_of::<CommercialMaxProtocolResponse>() {
-        return Err(LINUX_EINVAL);
-    }
-    let response = read_unaligned::<CommercialMaxProtocolResponse>(response.as_slice());
-    validate_commercial_response_envelope(&request, &response)?;
-    if response.status != 0 {
-        if response.descriptor_count != 0
-            || response.payload_len != 0
-            || response.value0 != 0
-            || response.value1 != 0
-        {
-            return Err(LINUX_EINVAL);
+/// Decides a service lookup from the policy rootd installed in the kernel.
+///
+/// A caller rootd bound to a service identity is allowed or denied right here;
+/// there is no round trip to rootd. A caller with no binding (rootd has not
+/// authenticated it as a service, or no policy is installed) is refused: with
+/// no one to ask, the kernel fails closed.
+fn authorize_service_lookup(service_id: u64) -> Result<(), i64> {
+    let process_id = multitask::current_user_process_id().ok_or(LINUX_EINVAL)?;
+    match service_policy_ops::lookup_decision(process_id, service_id) {
+        service_policy_ops::Decision::Allowed => Ok(()),
+        service_policy_ops::Decision::Denied | service_policy_ops::Decision::Unbound => {
+            Err(LINUX_EACCES)
         }
-        return Err(response.status.unsigned_abs() as i64);
     }
-    if response.descriptor_count != 0
-        || response.payload_len != 0
-        || response.value0 != service_id
-        || response.value1 != 0
-    {
-        return Err(LINUX_EINVAL);
-    }
-    Ok(())
 }
+
 // RING3-MIGRATION-REFERENCE END: rootd-owned service registration and capability policy.
 
 pub(super) fn syscall_linux_rustos_ipc_call(

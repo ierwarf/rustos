@@ -114,7 +114,7 @@ endpoint lifecycle transitions: `ipc-service-register`,
 service admission and capability policy owner. Endpoint revoke is owner-only
 unless the caller holds `ROOT_SUPERVISOR`.
 `SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT` is service/supervisor discovery: root-supervisor callers may use the kernel table directly; other callers are admitted through rootd `COMMERCIAL_MAX_ROOTD_OP_SERVICE_LOOKUP`. Core services and post-init services are admitted only by matching a running rootd lease. Generic apps use Linux/Win32 ABI routes and kernel compat helpers, not raw policy-service endpoint lookup.
-Service capability assignment is rootd policy: after rootd self-registration, kernel compat asks `COMMERCIAL_MAX_ROOTD_OP_SERVICE_CAPABILITY` with the registering subject PID/TID and records the returned `IPC_SERVICE_CAP_*` mask only if rootd confirms the PID matches the running lease. This includes endpoint registration through the Linux syscall ABI. Do not reintroduce a full `service_id -> capability` table in ring0.
+Service capability assignment is rootd policy, delegated to the kernel ahead of time: after self-registration rootd installs the typed routing policy with `SYS_RUSTOS_SERVICE_POLICY` (`INSTALL`: directed lookup routes plus each service's `ServiceCapability` list as discriminants; no mask) and binds each live process to its authenticated service identity (`BIND_PRINCIPAL`) when its lease becomes live, before the child is activated. The kernel then decides every service lookup and every endpoint registration from that table with no rootd round trip; a caller with no binding is refused. `COMMERCIAL_MAX_ROOTD_OP_SERVICE_CAPABILITY` / `_SERVICE_LOOKUP` (6, 7) are retired and never reused. Do not reintroduce a full `service_id -> capability` table in ring0 policy: the table is installed data, authored by rootd.
 Rootd self-registration is a boot-only trust transition, not a permanent
 fallback. The first successful rootd publication seals its non-reusable process
 identity for the boot; revoke or exit never allows a foreign process to claim
@@ -156,7 +156,7 @@ are defense in depth and never replace this per-request authorization.
 Post-init lease reporting is ring3-owned: `initd` reports successfully spawned
 policy services to rootd with `COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL`
 (`arg0=IPC_SERVICE_*`, `arg1=pid`, `path=exec`). rootd uses that lease registry
-when answering kernel compat `SERVICE_CAPABILITY` / `SERVICE_LOOKUP` requests.
+when installing the kernel service policy.
 Services launched by another supervisor must be reported by that supervisor
 before the child depends on service endpoint registration; `runtimed` reports
 the `uiserver` lease. There is no post-init capability or lookup allowlist
@@ -228,7 +228,7 @@ Job descriptor. Flags, reserved, output job identity and effective mask must be
 zero on entry; GET also requires an empty own mask. Own/effective masks each
 have four 64-bit words; effective is the intersection of every live ancestor.
 New jobs default to ALL, so existing behavior is unchanged. A ceiling never
-grants a broker role; existing `IPC_SERVICE_CAP_*` authorization remains intact.
+grants a broker role; broker roles are the typed `ServiceCapability` values the kernel holds (see `SYS_RUSTOS_SERVICE_POLICY`).
 SET refreshes every descendant before returning, but racing single-operation
 readers may see the old or new word, not an atomic whole-subtree snapshot.
 A late user-copy failure does not roll back the completed scalar mutation.
@@ -244,8 +244,7 @@ completed broker-policy migration.
 Rootd receives supervisor requests through endpoint-owner-only sender-stamped
 receive syscalls; both pre-init and post-init supervisor turns must drain
 lifecycle/restart state before using `SYS_RUSTOS_IPC_TRY_RECV_WITH_SENDER`, so
-a failed child cannot hide behind an indefinite rootd IPC wait. `SERVICE_CAPABILITY`,
-`SERVICE_LOOKUP`, and `READINESS_SIGNAL` must reject payload `subject_pid/tid`
+a failed child cannot hide behind an indefinite rootd IPC wait. `READINESS_SIGNAL` must reject payload `subject_pid/tid`
 values that do not match the kernel-stamped sender PID/TID. The sender-stamped
 receive path first re-authorizes the exact endpoint owner and is not a generic
 app IPC ABI; kernel-stamped sender identity does not grant policy capability.
@@ -274,7 +273,7 @@ worker publishes `EXITED`. The worker receives no new capability and concurrent
 jobs fail closed; direct spawn and deferred checkpointing are not permitted
 substitutes.
 
-| ID | Service | Capability (`IPC_SERVICE_CAP_*`) | Owns |
+| ID | Service | Capability (`ServiceCapability`) | Owns |
 |----|---------|----------------------------------|------|
 | 1 | `syscalld` | `LINUX_SYSCALL_POLICY` | Linux cold validation, credentials, rlimits, clock/random/MM policy, Win32 syscalls |
 | 2 | `vfsd` | `VFS_POLICY` | File namespace, cwd, dir/file cursors, mount/umount, metadata |
@@ -355,3 +354,4 @@ rather than untyped payload formats.
 
 Full status and Codex fault-injection handoff:
 [Ring3 eight-stage status](../../validation/ring3-8stage-status.md).
+- SYS_RUSTOS_SERVICE_POLICY (0x5255_005f): rootd-only (`RootSupervisor`) `INSTALL` of the typed routing policy (generation must increase; validated whole before it replaces the old table) and `BIND_PRINCIPAL` of a live pid to a service identity under the installed generation. Typed wire only (`ServiceRouteWire`, `ServiceCapabilityListWire`).

@@ -224,9 +224,9 @@ fn validate_roles(
             || post.iter().any(|x| x.service_id == id)
     };
     for (index, item) in roles.iter().enumerate() {
-        if item.capability == 0
-            || item.capability.count_ones() != 1
-            || !known(item.service_id)
+        // A role is exactly one typed capability, so "unassigned bit" and
+        // "more than one bit" cannot be expressed; only injectivity remains.
+        if !known(item.service_id)
             || roles[..index].iter().any(|prev| {
                 prev.service_id == item.service_id || prev.capability == item.capability
             })
@@ -249,13 +249,15 @@ fn validate_roles(
     Ok(())
 }
 
-/// Pure lookup; a nonzero result is not permission. The authenticated exact
-/// sender and live service Job/lease are checked by rootd before use.
-pub(super) fn service_policy_capability(id: u64) -> u64 {
+/// Pure lookup; a result is not permission. The authenticated exact sender and
+/// live service Job/lease are checked by rootd before use.
+pub(super) fn service_policy_capability(
+    id: u64,
+) -> Option<rustos_user_abi::syscall::ServiceCapability> {
     SERVICE_ROLE_MANIFEST
         .iter()
         .find(|role| role.service_id == id)
-        .map_or(0, |role| role.capability)
+        .map(|role| role.capability)
 }
 
 /// The authoritative, immutable parent edge for a post-init service. A
@@ -481,35 +483,35 @@ mod tests {
         let expected = [
             (
                 abi::IPC_SERVICE_LINUX_SYSCALLD,
-                abi::IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY,
+                abi::ServiceCapability::LinuxSyscallPolicy,
             ),
-            (abi::IPC_SERVICE_VFSD, abi::IPC_SERVICE_CAP_VFS_POLICY),
-            (abi::IPC_SERVICE_NETD, abi::IPC_SERVICE_CAP_NET_POLICY),
-            (abi::IPC_SERVICE_DEVMGRD, abi::IPC_SERVICE_CAP_DEVICE_POLICY),
+            (abi::IPC_SERVICE_VFSD, abi::ServiceCapability::VfsPolicy),
+            (abi::IPC_SERVICE_NETD, abi::ServiceCapability::NetPolicy),
+            (abi::IPC_SERVICE_DEVMGRD, abi::ServiceCapability::DevicePolicy),
             (
                 abi::IPC_SERVICE_LOADERD,
-                abi::IPC_SERVICE_CAP_PROCESS_LOADER,
+                abi::ServiceCapability::ProcessLoader,
             ),
             (
                 abi::IPC_SERVICE_STORAGED,
-                abi::IPC_SERVICE_CAP_STORAGE_POLICY,
+                abi::ServiceCapability::StoragePolicy,
             ),
-            (abi::IPC_SERVICE_INPUTD, abi::IPC_SERVICE_CAP_INPUT_POLICY),
-            (abi::IPC_SERVICE_PROCD, abi::IPC_SERVICE_CAP_PROCESS_POLICY),
-            (abi::IPC_SERVICE_ROOTD, abi::IPC_SERVICE_CAP_ROOT_SUPERVISOR),
+            (abi::IPC_SERVICE_INPUTD, abi::ServiceCapability::InputPolicy),
+            (abi::IPC_SERVICE_PROCD, abi::ServiceCapability::ProcessPolicy),
+            (abi::IPC_SERVICE_ROOTD, abi::ServiceCapability::RootSupervisor),
             (
                 abi::IPC_SERVICE_SESSIOND,
-                abi::IPC_SERVICE_CAP_SESSION_POLICY,
+                abi::ServiceCapability::SessionPolicy,
             ),
-            (abi::IPC_SERVICE_PAGERD, abi::IPC_SERVICE_CAP_PAGER_POLICY),
-            (abi::IPC_SERVICE_UISERVER, abi::IPC_SERVICE_CAP_UI_POLICY),
-            (abi::IPC_SERVICE_INITD, abi::IPC_SERVICE_CAP_INIT_POLICY),
+            (abi::IPC_SERVICE_PAGERD, abi::ServiceCapability::PagerPolicy),
+            (abi::IPC_SERVICE_UISERVER, abi::ServiceCapability::UiPolicy),
+            (abi::IPC_SERVICE_INITD, abi::ServiceCapability::InitPolicy),
         ];
         for (id, cap) in expected {
-            assert_eq!(service_policy_capability(id), cap);
+            assert_eq!(service_policy_capability(id), Some(cap));
         }
-        assert_eq!(service_policy_capability(0), 0);
-        assert_eq!(service_policy_capability(u64::MAX), 0);
+        assert_eq!(service_policy_capability(0), None);
+        assert_eq!(service_policy_capability(u64::MAX), None);
     }
 
     #[test]
@@ -530,12 +532,6 @@ mod tests {
         );
         invalid = SERVICE_ROLE_MANIFEST;
         invalid[0].service_id = invalid[1].service_id;
-        assert_eq!(
-            validate_roles(&BOOTSTRAP_MANIFEST, &POST_INIT_MANIFEST, &invalid),
-            Err(ManifestError::InvalidRole)
-        );
-        invalid = SERVICE_ROLE_MANIFEST;
-        invalid[0].capability = 0;
         assert_eq!(
             validate_roles(&BOOTSTRAP_MANIFEST, &POST_INIT_MANIFEST, &invalid),
             Err(ManifestError::InvalidRole)

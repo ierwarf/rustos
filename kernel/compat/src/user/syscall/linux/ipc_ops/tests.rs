@@ -230,7 +230,7 @@ fn service_call_grants_are_exact_epoch_bounded_and_revocable() {
 fn matching_commercial_response() -> (CommercialMaxProtocolRequest, CommercialMaxProtocolResponse) {
     let mut request = CommercialMaxProtocolRequest::default();
     request.header.protocol = rustos_user_abi::syscall::COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR;
-    request.header.op = rustos_user_abi::syscall::COMMERCIAL_MAX_ROOTD_OP_SERVICE_LOOKUP;
+    request.header.op = rustos_user_abi::syscall::COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL;
     request.header.service_id = linux_abi::IPC_SERVICE_ROOTD;
     request.header.subject_pid = 41;
     request.header.subject_tid = 43;

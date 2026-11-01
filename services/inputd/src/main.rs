@@ -1732,7 +1732,6 @@ fn input_descriptor(label: &str, op: u16) -> CommercialMaxProtocolDescriptorWire
         protocol: COMMERCIAL_MAX_PROTOCOL_INPUTD,
         op,
         service_id: IPC_SERVICE_INPUTD,
-        capability_mask: input_capability_mask(op),
         value0: INPUTD_QUEUE_MAX_EVENTS as u64,
         ..CommercialMaxProtocolDescriptorWire::default()
     };
@@ -1748,8 +1747,6 @@ fn input_capability(label: &str, op: u16) -> CommercialMaxCapabilityLeaseWire {
     let mut capability = CommercialMaxCapabilityLeaseWire {
         lease_id: op as u64,
         service_id: IPC_SERVICE_INPUTD,
-        capability_mask: input_capability_mask(op),
-        rights_mask: input_capability_mask(op),
         generation: INPUTD_QUEUE_MAX_EVENTS as u64,
         ..CommercialMaxCapabilityLeaseWire::default()
     };
@@ -1759,18 +1756,6 @@ fn input_capability(label: &str, op: u16) -> CommercialMaxCapabilityLeaseWire {
         &mut capability.label_len,
     );
     capability
-}
-
-fn input_capability_mask(op: u16) -> u64 {
-    match op {
-        COMMERCIAL_MAX_INPUTD_OP_INPUT_READER => 1 << 1,
-        COMMERCIAL_MAX_INPUTD_OP_EVDEV_TRANSLATE => 1 << 2,
-        COMMERCIAL_MAX_INPUTD_OP_LAYOUT_POLICY => 1 << 3,
-        COMMERCIAL_MAX_INPUTD_OP_DROP_POLICY => 1 << 4,
-        COMMERCIAL_MAX_INPUTD_OP_INPUT_STATS => 1 << 5,
-        COMMERCIAL_MAX_INPUTD_OP_POINTER_SURFACE_POLICY => 1 << 10,
-        _ => 0,
-    }
 }
 
 fn copy_label(src: &[u8], dest: &mut [u8], len: &mut u16) {

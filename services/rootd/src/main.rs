@@ -50,6 +50,7 @@ mod scheduling_policy;
 mod service_checkpoint;
 mod checkpoint_journal;
 mod service_manifest;
+mod kernel_policy;
 mod session_accounting;
 
 use loader_wire::{contains_nul, copy_bytes, empty_loader_spawn_request, empty_loader_spawn_response};
@@ -82,9 +83,9 @@ use rustos_user_abi::syscall::{
     COMMERCIAL_MAX_ROOTD_OP_LOADER_WORKER_COMPLETE, COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_SNAPSHOT_IDL,
     COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_RECLAIM_IDL, COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL,
     COMMERCIAL_MAX_ROOTD_OP_RESTART_POLICY, COMMERCIAL_MAX_ROOTD_OP_SCHEDULING_CONTEXT_GRANT,
-    COMMERCIAL_MAX_ROOTD_OP_SERVICE_CAPABILITY, COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_COMPACT,
+    COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_COMPACT,
     COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_MUTATE,
-    COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_SCAN, COMMERCIAL_MAX_ROOTD_OP_SERVICE_LOOKUP,
+    COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_SCAN,
     COMMERCIAL_MAX_ROOTD_OP_SESSION_ACCOUNT_CHARGE, COMMERCIAL_MAX_ROOTD_OP_SESSION_ACCOUNT_RELEASE,
     COMMERCIAL_MAX_ROOTD_OP_PROVIDER_SESSION_CHARGE, COMMERCIAL_MAX_ROOTD_OP_PROVIDER_SESSION_RELEASE,
     COMMERCIAL_MAX_ROOTD_OP_PROVIDER_SESSION_CANCEL, COMMERCIAL_MAX_ROOTD_OP_PROVIDER_RECEIPT_ACK,
@@ -252,6 +253,9 @@ pub extern "C" fn __rustos_rootd_start() -> ! {
         fail_closed(b"rootd: fatal component manifest preflight failed\n");
     }
     let endpoint = create_rootd_endpoint();
+    // Delegate service routing authority to the kernel before any service
+    // exists to ask for it.
+    kernel_policy::install();
     // Both live lease inventories come from the validated, immutable service
     // manifest. Adding a declared service no longer requires another hand-
     // maintained bootstrap array or matching list of initial zero states.
@@ -490,7 +494,7 @@ fn spawn_tracked_with_attempts(lease: &mut Lease, max_attempts: u32) -> Result<(
     let mut attempt = 0;
     while attempt < max_attempts {
         let job_handle = job_lease::ensure(lease)?;
-        match spawn_exec(lease.exec_path, lease.weight_micros, job_handle) {
+        match spawn_exec(lease.exec_path, lease.weight_micros, job_handle, lease.service_id) {
             Ok(pid) => {
                 lease.pid = pid;
                 lease.state = ROOTD_LEASE_STATE_RUNNING;
@@ -512,7 +516,7 @@ fn spawn_tracked_with_attempts(lease: &mut Lease, max_attempts: u32) -> Result<(
     Err(last_errno)
 }
 
-fn spawn_exec(path: &'static [u8], weight_micros: u64, job_handle: u64) -> Result<u64, i64> {
+fn spawn_exec(path: &'static [u8], weight_micros: u64, job_handle: u64, service: u64) -> Result<u64, i64> {
     let expected_job = jobs::info(job_handle)?.id;
     let requester_pid = syscall0(SYS_GETPID);
     if requester_pid <= 0 {
@@ -524,7 +528,7 @@ fn spawn_exec(path: &'static [u8], weight_micros: u64, job_handle: u64) -> Resul
         scheduling_context_policy_for_exec(path),
     )
     .map_err(i64::from)?;
-    let args = jobs::bootstrap_args(path, weight_micros, job_handle);
+    let args = jobs::bootstrap_args(path, weight_micros, job_handle, service);
     let result = syscall1(SYS_RUSTOS_SPAWN_EXEC, &args as *const _ as u64);
     if result < 0 {
         return Err(-result);
@@ -565,6 +569,7 @@ fn spawn_initd_via_loaderd(
             Ok(pid) => {
                 debug_line(b"rootd: initd loader spawn complete\n");
                 leases[INITD_LEASE_INDEX].pid = pid;
+                kernel_policy::bind(pid, leases[INITD_LEASE_INDEX].service_id);
                 leases[INITD_LEASE_INDEX].state = ROOTD_LEASE_STATE_RUNNING;
                 leases[INITD_LEASE_INDEX].exit_status = 0;
                 if activate_exec_via_loaderd(pid).is_ok() {
@@ -1010,9 +1015,6 @@ fn reply_commercial_max_request(
     if request.header.op == COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL {
         debug_line(b"rootd: readiness request received\n");
     }
-    if request.header.op == COMMERCIAL_MAX_ROOTD_OP_SERVICE_CAPABILITY {
-        debug_line(b"rootd: service capability request received\n");
-    }
     response.header.version = COMMERCIAL_MAX_PROTOCOL_ABI_VERSION;
     response.status = match validate_commercial_max_request(request, sender) {
         Ok(()) => match fill_commercial_max_response(
@@ -1028,9 +1030,6 @@ fn reply_commercial_max_request(
         },
         Err(errno) => errno,
     };
-    if request.header.op == COMMERCIAL_MAX_ROOTD_OP_SERVICE_CAPABILITY && response.status != 0 {
-        debug_line(b"rootd: service capability denied\n");
-    }
     if request.header.op == COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL && response.status != 0 {
         debug_line(b"rootd: readiness denied\n");
     }
@@ -1048,15 +1047,6 @@ fn reply_commercial_max_request(
         && replied >= 0
     {
         debug_line(b"rootd: readiness replied ok\n");
-    }
-    if request.header.op == COMMERCIAL_MAX_ROOTD_OP_SERVICE_CAPABILITY && replied < 0 {
-        debug_line(b"rootd: service capability reply failed\n");
-    }
-    if request.header.op == COMMERCIAL_MAX_ROOTD_OP_SERVICE_CAPABILITY
-        && response.status == 0
-        && replied >= 0
-    {
-        debug_line(b"rootd: service capability replied ok\n");
     }
 }
 
@@ -1078,8 +1068,6 @@ fn validate_commercial_max_request(
                 validate_empty_request_body(request, true)
             }
             COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL
-            | COMMERCIAL_MAX_ROOTD_OP_SERVICE_CAPABILITY
-            | COMMERCIAL_MAX_ROOTD_OP_SERVICE_LOOKUP
             | COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_SNAPSHOT_IDL
             | COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_RECLAIM_IDL
             | COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_MUTATE
@@ -1259,24 +1247,6 @@ fn fill_commercial_max_response(
             )?;
             response.value0 = request.arg0;
             response.value1 = request.arg1;
-            Ok(())
-        }
-        COMMERCIAL_MAX_ROOTD_OP_SERVICE_CAPABILITY => {
-            authorize_sender_slow_grant(
-                leases, post_init_leases, sender,
-                rustos_component_model::policy_ops::SlowBrokerOperation::ReadServicePrincipal,
-            )?;
-            let capability = service_capability_for_subject(leases, post_init_leases, request)?;
-            response.value0 = capability;
-            Ok(())
-        }
-        COMMERCIAL_MAX_ROOTD_OP_SERVICE_LOOKUP => {
-            authorize_sender_slow_grant(
-                leases, post_init_leases, sender,
-                rustos_component_model::policy_ops::SlowBrokerOperation::ResolveServiceRoute,
-            )?;
-            authorize_service_lookup_for_subject(leases, post_init_leases, request)?;
-            response.value0 = request.arg0;
             Ok(())
         }
         COMMERCIAL_MAX_ROOTD_OP_LOADER_WORKER_COMPLETE => {
@@ -1694,7 +1664,7 @@ fn fill_capability_response(
             response.descriptor_count = 1;
             response.descriptors[0] = capability_descriptor(lease, request.header.op, 0);
             response.capability = service_capability_lease(lease);
-            response.value0 = service_policy_capability(lease.service_id);
+            response.value0 = service_policy_capability(lease.service_id).map_or(0, |capability| capability as u64);
             response.value1 = lease.pid;
             Ok(())
         }
@@ -1711,7 +1681,7 @@ fn fill_capability_response(
             response.descriptor_count = 1;
             response.descriptors[0] = capability_descriptor(lease, request.header.op, 0);
             response.capability = service_capability_lease(lease);
-            response.value0 = service_policy_capability(lease.service_id);
+            response.value0 = service_policy_capability(lease.service_id).map_or(0, |capability| capability as u64);
             response.value1 = u64::from(lease.state == ROOTD_LEASE_STATE_RUNNING);
             Ok(())
         }
@@ -1811,7 +1781,6 @@ fn lease_descriptor(lease: &Lease, op: u16, index: u64) -> CommercialMaxProtocol
         protocol: COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR,
         op,
         service_id: lease.service_id,
-        capability_mask: rootd_capability_mask(op),
         value0: index,
         value1: lease.pid,
         ..CommercialMaxProtocolDescriptorWire::default()
@@ -1826,8 +1795,6 @@ fn lease_capability(lease: &Lease, op: u16) -> CommercialMaxCapabilityLeaseWire 
         lease_id: lease.pid,
         service_id: lease.service_id,
         subject_pid: lease.pid,
-        capability_mask: rootd_capability_mask(op),
-        rights_mask: rootd_capability_mask(op),
         generation: lease.pid,
         ..CommercialMaxCapabilityLeaseWire::default()
     };
@@ -1845,7 +1812,6 @@ fn capability_descriptor(
         protocol: COMMERCIAL_MAX_PROTOCOL_CAPABILITY,
         op,
         service_id: lease.service_id,
-        capability_mask: service_policy_capability(lease.service_id),
         value0: index,
         value1: lease.pid,
         ..CommercialMaxProtocolDescriptorWire::default()
@@ -1860,8 +1826,6 @@ fn service_capability_lease(lease: &Lease) -> CommercialMaxCapabilityLeaseWire {
         lease_id: ((COMMERCIAL_MAX_PROTOCOL_CAPABILITY as u64) << 32) | lease.service_id,
         service_id: lease.service_id,
         subject_pid: lease.pid,
-        capability_mask: service_policy_capability(lease.service_id),
-        rights_mask: service_policy_capability(lease.service_id),
         generation: lease.pid,
         ..CommercialMaxCapabilityLeaseWire::default()
     };
@@ -1870,90 +1834,8 @@ fn service_capability_lease(lease: &Lease) -> CommercialMaxCapabilityLeaseWire {
     capability
 }
 
-fn rootd_capability_mask(op: u16) -> u64 {
-    match op {
-        COMMERCIAL_MAX_ROOTD_OP_BOOTSTRAP_MANIFEST => 1 << 0,
-        COMMERCIAL_MAX_ROOTD_OP_CORE_SERVICE_LEASE => 1 << 1,
-        COMMERCIAL_MAX_ROOTD_OP_DEPENDENCY_GRAPH => 1 << 2,
-        COMMERCIAL_MAX_ROOTD_OP_RESTART_POLICY => 1 << 3,
-        COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL => 1 << 4,
-        COMMERCIAL_MAX_ROOTD_OP_SERVICE_CAPABILITY => 1 << 5,
-        COMMERCIAL_MAX_ROOTD_OP_SERVICE_LOOKUP => 1 << 6,
-        COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_SNAPSHOT_IDL => 1 << 7,
-        COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_RECLAIM_IDL => 1 << 8,
-        COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_MUTATE => 1 << 9,
-        COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_SCAN => 1 << 10,
-        COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_COMPACT => 1 << 11,
-        COMMERCIAL_MAX_ROOTD_OP_SESSION_ACCOUNT_CHARGE => 1 << 13,
-        COMMERCIAL_MAX_ROOTD_OP_SESSION_ACCOUNT_RELEASE => 1 << 14,
-        COMMERCIAL_MAX_ROOTD_OP_SERVICE_HEARTBEAT => 1 << 15,
-        COMMERCIAL_MAX_ROOTD_OP_UPDATE_STAGE => 1 << 16,
-        COMMERCIAL_MAX_ROOTD_OP_UPDATE_ARM => 1 << 17,
-        COMMERCIAL_MAX_ROOTD_OP_UPDATE_ROLLBACK => 1 << 18,
-        COMMERCIAL_MAX_ROOTD_OP_UPDATE_SEAL => 1 << 19,
-        COMMERCIAL_MAX_ROOTD_OP_UPDATE_INSPECT => 1 << 20,
-        COMMERCIAL_MAX_ROOTD_OP_PROVIDER_SESSION_CHARGE => 1 << 21,
-        COMMERCIAL_MAX_ROOTD_OP_PROVIDER_SESSION_RELEASE => 1 << 22,
-        COMMERCIAL_MAX_ROOTD_OP_PROVIDER_SESSION_CANCEL => 1 << 23,
-        COMMERCIAL_MAX_ROOTD_OP_PROVIDER_RECEIPT_ACK => 1 << 24,
-        COMMERCIAL_MAX_ROOTD_OP_SCHEDULING_CONTEXT_GRANT => 1 << 12,
-        _ => 0,
-    }
-}
-
-fn service_policy_capability(service_id: u64) -> u64 {
+fn service_policy_capability(service_id: u64) -> Option<rustos_user_abi::syscall::ServiceCapability> {
     component_policy::service_policy_capability(service_id)
-}
-
-fn service_capability_for_subject(
-    leases: &[Lease],
-    post_init_leases: &mut [PostInitLease],
-    request: &CommercialMaxProtocolRequest,
-) -> Result<u64, i32> {
-    if request.arg0 == 0
-        || request.arg2 != 0
-        || request.arg3 != 0
-        || request.path_len != 0
-        || request.payload_len != 0
-        || request.header.subject_pid == 0
-        || request.header.subject_tid == 0
-    {
-        return Err(22);
-    }
-    // A service role must bind to a *unique* live principal. This check
-    // covers core/core and core/post-init overlaps as well as dangling
-    // reporter chains; request.arg0 and lease-table order grant nothing.
-    let authenticated_service = current_service_id_for_sender(
-        leases,
-        post_init_leases,
-        IpcSenderIdentity {
-            pid: request.header.subject_pid,
-            tid: request.header.subject_tid,
-        },
-    )?;
-    if let Some(capability) = post_init_reported_service_capability(
-        leases,
-        post_init_leases,
-        request.arg0,
-        request.header.subject_pid,
-    ) {
-        if authenticated_service != request.arg0 {
-            return Err(13);
-        }
-        return Ok(capability);
-    }
-    let lease = lease_by_service_or_index(leases, request.arg0, request.arg1 as usize)?;
-    if lease.pid != request.header.subject_pid
-        || lease.state != ROOTD_LEASE_STATE_RUNNING
-        || lease.service_id != authenticated_service
-    {
-        return Err(13);
-    }
-    let capability = service_policy_capability(lease.service_id);
-    if capability == 0 {
-        return Err(22);
-    }
-    Ok(capability)
 }
 
 fn register_post_init_service_lease(
@@ -2041,6 +1923,7 @@ fn register_post_init_service_lease_with_provenance(
         return Err(16);
     }
     lease.pid = request.arg1;
+    kernel_policy::bind(request.arg1, lease.service_id);
     lease.reporter_pid = sender.pid;
     lease.state = ROOTD_LEASE_STATE_RUNNING;
     lease.exit_status = 0;
@@ -2442,36 +2325,6 @@ fn authorize_post_init_lease_reporter(
     }
 }
 
-fn post_init_reported_service_capability(
-    leases: &[Lease],
-    post_init_leases: &[PostInitLease],
-    service_id: u64,
-    subject_pid: u64,
-) -> Option<u64> {
-    // The PID must resolve to exactly one live service, including all
-    // transitively live reporter leases. A forged overlapping PID must never
-    // select a privileged role just because it appeared first in the table.
-    if current_service_id_for_sender(
-        leases,
-        post_init_leases,
-        IpcSenderIdentity { pid: subject_pid, tid: 1 },
-    ).ok()? != service_id {
-        return None;
-    }
-    post_init_leases
-        .iter()
-        .find(|lease| {
-            lease.service_id == service_id
-                && lease.pid == subject_pid
-                && lease.state == ROOTD_LEASE_STATE_RUNNING
-                && declared_reporter_is_live(
-                    leases, post_init_leases, lease.service_id, lease.reporter_pid
-                )
-        })
-        .map(|lease| service_policy_capability(lease.service_id))
-        .filter(|capability| *capability != 0)
-}
-
 /// Exact parent is part of the service identity. Checking only the
 /// transitive PID chain would allow any live post-init service to impersonate
 /// the parent of a different component (notably netd -> uiserver).
@@ -2553,40 +2406,6 @@ fn post_init_lease_reporter_is_live(
     }
     // A cycle or chain longer than the fixed lease set has no trusted root.
     false
-}
-
-fn authorize_service_lookup_for_subject(
-    leases: &[Lease],
-    post_init_leases: &[PostInitLease],
-    request: &CommercialMaxProtocolRequest,
-) -> Result<(), i32> {
-    if request.arg0 == 0
-        || request.arg1 != 0
-        || request.arg2 != 0
-        || request.arg3 != 0
-        || request.path_len != 0
-        || request.payload_len != 0
-        || request.header.subject_pid == 0
-        || request.header.subject_tid == 0
-    {
-        return Err(22);
-    }
-    if service_policy_capability(request.arg0) == 0 {
-        return Err(22);
-    }
-    let subject_service = current_service_id_for_sender(
-        leases,
-        post_init_leases,
-        IpcSenderIdentity {
-            pid: request.header.subject_pid,
-            tid: request.header.subject_tid,
-        },
-    )?;
-    if service_dependency_allowed(subject_service, request.arg0) {
-        Ok(())
-    } else {
-        Err(13)
-    }
 }
 
 /// Authenticate the exact live principal first, then intersect its
@@ -2770,6 +2589,7 @@ fn restart_failed_leases(
         match result {
             Ok((pid, deferred_start)) => {
                 lease.pid = pid;
+                kernel_policy::bind(pid, lease.service_id);
                 lease.restart_budget -= 1;
                 lease.state = ROOTD_LEASE_STATE_RUNNING;
                 lease.exit_status = 0;
@@ -2865,7 +2685,7 @@ fn restart_lease(
     let lease = leases[index];
     if BOOTSTRAP_MANIFEST[index].restart_direct {
         let job_handle = job_lease::ensure(&mut leases[index])?;
-        return spawn_exec(lease.exec_path, lease.weight_micros, job_handle).map(|pid| (pid, false));
+        return spawn_exec(lease.exec_path, lease.weight_micros, job_handle, lease.service_id).map(|pid| (pid, false));
     }
     if !service_dependencies_ready(index) || !service_ready(IPC_SERVICE_LOADERD) {
         return Err(11);
@@ -3392,6 +3212,65 @@ pub unsafe extern "C" fn bcmp(lhs: *const u8, rhs: *const u8, len: usize) -> i32
 mod tests {
     use super::*;
 
+    // The kernel now decides lookups and registrations from the policy rootd
+    // installs (`kernel_policy`) and the pid -> service bindings rootd makes
+    // from this identity authentication. These oracles state, from rootd's own
+    // lease tables, the answers that policy is built to reproduce, so the
+    // identity edge cases (ambiguous or forged pids, dead reporter chains)
+    // stay pinned where the identity is established.
+    fn authorize_service_lookup_for_subject(
+        leases: &[Lease],
+        post_init_leases: &[PostInitLease],
+        request: &CommercialMaxProtocolRequest,
+    ) -> Result<(), i32> {
+        let subject = current_service_id_for_sender(
+            leases,
+            post_init_leases,
+            IpcSenderIdentity {
+                pid: request.header.subject_pid,
+                tid: request.header.subject_tid,
+            },
+        )?;
+        if service_policy_capability(request.arg0).is_some()
+            && service_dependency_allowed(subject, request.arg0)
+        {
+            Ok(())
+        } else {
+            Err(13)
+        }
+    }
+
+    fn post_init_reported_service_capability(
+        leases: &[Lease],
+        post_init_leases: &[PostInitLease],
+        service_id: u64,
+        subject_pid: u64,
+    ) -> Option<rustos_user_abi::syscall::ServiceCapability> {
+        let authenticated = current_service_id_for_sender(
+            leases,
+            post_init_leases,
+            IpcSenderIdentity { pid: subject_pid, tid: 1 },
+        )
+        .ok()?;
+        (authenticated == service_id)
+            .then(|| service_policy_capability(service_id))
+            .flatten()
+    }
+
+    fn service_capability_for_subject(
+        leases: &[Lease],
+        post_init_leases: &mut [PostInitLease],
+        request: &CommercialMaxProtocolRequest,
+    ) -> Result<rustos_user_abi::syscall::ServiceCapability, i32> {
+        post_init_reported_service_capability(
+            leases,
+            post_init_leases,
+            request.arg0,
+            request.header.subject_pid,
+        )
+        .ok_or(13)
+    }
+
     #[test]
     fn raw_entry_aligns_stack_before_calling_rust() {
         let source = include_str!("main.rs");
@@ -3742,7 +3621,7 @@ mod tests {
         request.header.subject_tid = 1;
         assert_eq!(
             service_capability_for_subject(&core, &mut [], &request),
-            Ok(rustos_user_abi::syscall::IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY),
+            Ok(rustos_user_abi::syscall::ServiceCapability::LinuxSyscallPolicy),
         );
         core[1].pid = 61;
         core[1].state = ROOTD_LEASE_STATE_RUNNING;
@@ -3764,7 +3643,7 @@ mod tests {
         post[0].state = ROOTD_LEASE_STATE_EXITED;
         assert_eq!(
             service_capability_for_subject(&core, &mut post, &request),
-            Ok(rustos_user_abi::syscall::IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY),
+            Ok(rustos_user_abi::syscall::ServiceCapability::LinuxSyscallPolicy),
         );
     }
 
@@ -3840,7 +3719,7 @@ mod tests {
         assert!(post_init_lease_reporter_is_live(&core, &post, 72));
         assert_eq!(
             post_init_reported_service_capability(&core, &post, IPC_SERVICE_UISERVER, 72),
-            Some(rustos_user_abi::syscall::IPC_SERVICE_CAP_UI_POLICY)
+            Some(rustos_user_abi::syscall::ServiceCapability::UiPolicy)
         );
     }
 
@@ -3910,7 +3789,7 @@ mod tests {
         post[0].state = ROOTD_LEASE_STATE_RUNNING;
         assert_eq!(post_init_reported_service_capability(
             &core, &post, IPC_SERVICE_NETD, 77),
-            Some(rustos_user_abi::syscall::IPC_SERVICE_CAP_NET_POLICY));
+            Some(rustos_user_abi::syscall::ServiceCapability::NetPolicy));
         post[1].pid = 77;
         post[1].reporter_pid = 41;
         post[1].state = ROOTD_LEASE_STATE_RUNNING;
@@ -4151,7 +4030,7 @@ mod tests {
 
         assert_eq!(
             post_init_reported_service_capability(&leases, &post_init, IPC_SERVICE_UISERVER, 74,),
-            Some(rustos_user_abi::syscall::IPC_SERVICE_CAP_UI_POLICY)
+            Some(rustos_user_abi::syscall::ServiceCapability::UiPolicy)
         );
         leases[INITD_LEASE_INDEX].state = ROOTD_LEASE_STATE_EXITED;
         assert_eq!(

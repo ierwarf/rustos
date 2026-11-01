@@ -42,6 +42,7 @@ pub fn syscall_linux_loader_spawn_exec(args_ptr: u64) -> u64 {
         args.weight_micros,
         scheduling_policy,
         job,
+        args.principal_service,
     ) {
         Ok(pid) => pid,
         Err(errno) => linux_errno(errno),
@@ -113,6 +114,7 @@ fn spawn_bootstrap_exec_direct(
     weight_micros: u64,
     scheduling_policy: rustos_user_abi::syscall::RustosSchedulingContextPolicy,
     job: multitask::JobId,
+    principal_service: u64,
 ) -> Result<u64, i64> {
     let loaded = crate::user::console_host::load_executable_image_by_path(exec_path)
         .map_err(console_host_error_to_linux_errno)?;
@@ -132,9 +134,26 @@ fn spawn_bootstrap_exec_direct(
     .with_logical_admin(logical_admin)
     .with_job(job)
     .with_scheduling_context(scheduling_policy);
-    crate::user::console_host::spawn_program_in_session(session, program)
+    if principal_service == 0 {
+        return crate::user::console_host::spawn_program_in_session(session, program)
+            .map(|spawned| spawned.pid)
+            .map_err(console_host_error_to_linux_errno);
+    }
+    // The service identity must exist before the child's first instruction,
+    // or its first lookup or registration would find no principal. Create it
+    // suspended, bind it in the kernel's policy, then start it.
+    let pid = crate::user::console_host::spawn_program_in_session(session, program.start_suspended())
         .map(|spawned| spawned.pid)
-        .map_err(console_host_error_to_linux_errno)
+        .map_err(console_host_error_to_linux_errno)?;
+    if let Err(errno) = crate::user::syscall::linux::broker_ops::service_policy_ops::bind_spawned(pid, principal_service) {
+        let _ = multitask::terminate_user_process(pid);
+        return Err(errno);
+    }
+    if !multitask::activate_suspended_user_tasks_with_commit(core::slice::from_ref(&pid), || Some(())) {
+        let _ = multitask::terminate_user_process(pid);
+        return Err(LINUX_ESRCH);
+    }
+    Ok(pid)
 }
 
 fn console_host_error_to_linux_errno(error: crate::user::console_host::ConsoleHostError) -> i64 {

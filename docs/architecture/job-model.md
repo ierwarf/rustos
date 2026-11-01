@@ -183,7 +183,7 @@ v1), not one bit per service.
   a policy takes effect on the next check.
 - A check is one load of the process's cached job pointer and a bit test, so the
   syscall path pays no lookup.
-- `IPC_SERVICE_CAP_*` bits become *roles* in this bitmap. The check
+- Service roles are typed `ServiceCapability` values (the numeric `IPC_SERVICE_CAP_*` masks no longer exist), held by the kernel in the policy rootd installs. The check
   `current_process_has_service_capability(CAP)` becomes
   `job.effective_policy.allows(Broker::X)`. The service registry keeps mapping
   names to endpoints and stops being an authority source.
@@ -270,7 +270,7 @@ Each phase ends in the final shape of what it touches.
 | 1 | `Job`, the root job, process↔job binding, `GET_INFO`, `KILL`. No limits. All existing processes live in the root job. | census and kill work by job; existing KVM gates unchanged |
 | 2a | Process-table directory (section 10) | 32 is a root-job policy value; the pager VMA and identity models re-verified |
 | 2b | Counted `processes.max`/`threads.max` and resident `memory.pages` implemented; `kmem.max_bytes` and `memory.high/min` open | verify native and opt-in runtime refusal, not only the ABI |
-| 3 | JobPolicy v1 ceiling exists (3a); legacy `IPC_SERVICE_CAP_*` authorization remains | prove exact revoke/fork/cutover behavior before deleting bits |
+| 3 | JobPolicy v1 ceiling exists (3a); service authorization is the kernel-held typed policy (no numeric masks); the JobPolicy bitmap is not yet the authority | prove exact revoke/fork/cutover behavior before deleting bits |
 | 4 | `rootd` becomes the component manager: manifests, realm ↔ job, capability routing, supervision trees | `service_manifest.rs`'s static arrays are gone |
 | 5 | Session jobs funded by clients (see below) | a flooding client exhausts only its own quota on `vfsd`/`netd` |
 
@@ -855,7 +855,7 @@ passed. New full PR/whole-source sealing and live rerun remain pending.
 
 **Not step 3 completion:** no production broker consumes this ceiling yet,
 no independently authorized positive subject grant replaces legacy roles,
-and no overlap release has occurred. `IPC_SERVICE_CAP_*` stays intact until
+and no overlap release has occurred. The typed service policy stays authoritative until
 independent old/new decisions agree through the required release interval;
 local tests cannot establish that release history. A bitmap alone cannot encode
 exact live endpoint-owner, fork noninheritance and revocation authority.

@@ -1674,7 +1674,6 @@ fn session_descriptor(
         op,
         flags: 0,
         service_id: IPC_SERVICE_SESSIOND,
-        capability_mask: session_capability_mask(op),
         value0,
         value1,
         ..CommercialMaxProtocolDescriptorWire::default()
@@ -1687,23 +1686,10 @@ fn session_capability(label: &str, op: u16) -> CommercialMaxCapabilityLeaseWire 
     let mut capability = CommercialMaxCapabilityLeaseWire {
         lease_id: ((COMMERCIAL_MAX_PROTOCOL_SESSIOND as u64) << 32) | u64::from(op),
         service_id: IPC_SERVICE_SESSIOND,
-        capability_mask: session_capability_mask(op),
-        rights_mask: session_capability_mask(op),
         ..CommercialMaxCapabilityLeaseWire::default()
     };
     super::util::copy_label(label, &mut capability.label, &mut capability.label_len);
     capability
-}
-
-fn session_capability_mask(op: u16) -> u64 {
-    match op {
-        COMMERCIAL_MAX_SESSIOND_OP_SESSION_GRAPH => 1 << 0,
-        COMMERCIAL_MAX_SESSIOND_OP_TTY_LINE_DISCIPLINE => 1 << 1,
-        COMMERCIAL_MAX_SESSIOND_OP_CONSOLE_ROUTE => 1 << 2,
-        COMMERCIAL_MAX_SESSIOND_OP_FOREGROUND_FOCUS => 1 << 3,
-        COMMERCIAL_MAX_SESSIOND_OP_UI_BOOTSTRAP => 1 << 4,
-        _ => 0,
-    }
 }
 
 fn ui_server_bootstrap_args_env() -> Result<(Vec<String>, Vec<String>), i32> {

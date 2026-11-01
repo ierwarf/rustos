@@ -912,7 +912,6 @@ fn dispatch_commercial_request(
                     protocol: COMMERCIAL_MAX_PROTOCOL_SESSIOND,
                     op,
                     service_id: IPC_SERVICE_SESSIOND,
-                    capability_mask: 1,
                     value0: request.arg0,
                     ..CommercialMaxProtocolDescriptorWire::default()
                 };
@@ -926,7 +925,6 @@ fn dispatch_commercial_request(
                     protocol: COMMERCIAL_MAX_PROTOCOL_UISERVER,
                     op,
                     service_id: IPC_SERVICE_UISERVER,
-                    capability_mask: 1,
                     value0: request.arg0,
                     ..CommercialMaxProtocolDescriptorWire::default()
                 };
@@ -1047,7 +1045,6 @@ fn device_descriptor(path: &str, policy: DeviceOpenPolicy) -> CommercialMaxProto
         protocol: COMMERCIAL_MAX_PROTOCOL_DEVMGRD,
         op: COMMERCIAL_MAX_DEVMGRD_OP_DEVICE_OPEN,
         service_id: policy.device_id as u64,
-        capability_mask: policy.rights,
         value0: policy.access as u64,
         value1: policy.rights,
         ..CommercialMaxProtocolDescriptorWire::default()
@@ -1064,8 +1061,6 @@ fn device_capability(path: &str, policy: DeviceOpenPolicy) -> CommercialMaxCapab
     let mut capability = CommercialMaxCapabilityLeaseWire {
         lease_id: policy.device_id as u64,
         service_id: IPC_SERVICE_DEVMGRD,
-        capability_mask: policy.rights,
-        rights_mask: policy.rights,
         generation: policy.access as u64,
         ..CommercialMaxCapabilityLeaseWire::default()
     };

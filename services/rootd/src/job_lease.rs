@@ -54,10 +54,10 @@ mod tests {
         let main = include_str!("main.rs");
         let tracked = main.split_once("fn spawn_tracked_with_attempts(").unwrap().1;
         assert!(tracked.find("job_lease::ensure(lease)?").unwrap()
-            < tracked.find("spawn_exec(lease.exec_path, lease.weight_micros, job_handle)").unwrap());
+            < tracked.find("spawn_exec(lease.exec_path, lease.weight_micros, job_handle, lease.service_id)").unwrap());
         let direct = main.split_once("fn spawn_exec(").unwrap().1;
         let expected = direct.find("jobs::info(job_handle)?.id").unwrap();
-        let args = direct.find("jobs::bootstrap_args(path, weight_micros, job_handle)").unwrap();
+        let args = direct.find("jobs::bootstrap_args(path, weight_micros, job_handle, service)").unwrap();
         let syscall = direct.find("syscall1(SYS_RUSTOS_SPAWN_EXEC, &args").unwrap();
         let check = direct.find("jobs::process_job(result as u64) != Ok(expected_job)").unwrap();
         let milestone = direct.find("rootd: direct job placement ok").unwrap();

@@ -104,6 +104,11 @@ pub const SYS_RUSTOS_JOB_MEMORY_QOS: u64 = 0x5255_005c;
 pub const SYS_RUSTOS_JOB_KMEM: u64 = 0x5255_005e;
 /// Rootd-only slow kernel-resident checkpoint write-ahead journal.
 pub const SYS_RUSTOS_CHECKPOINT_JOURNAL: u64 = 0x5255_005d;
+/// Rootd-only installation of the typed service-routing policy and of the
+/// pid -> service principal bindings the kernel enforces on its own. The
+/// kernel never asks rootd about a lookup or a registration; rootd decides
+/// once, ahead of time, and the kernel only consults the installed table.
+pub const SYS_RUSTOS_SERVICE_POLICY: u64 = 0x5255_005f;
 /// Capability-gated, event-driven wait for the DVM input transport. Only
 /// inputd may use this to wait for an MSI-X-published ingress batch; input
 /// policy and translation remain in the service.
@@ -393,6 +398,12 @@ pub enum ServiceCapability {
 }
 
 impl ServiceCapability {
+    /// The capability named by a wire discriminant, or `None` for a value that
+    /// names no assigned capability (bits 4 and 12 are permanently unassigned).
+    pub fn from_id(id: u8) -> Option<Self> {
+        Self::ALL.iter().copied().find(|capability| *capability as u8 == id)
+    }
+
     pub const ALL: [ServiceCapability; 13] = [
         Self::LinuxSyscallPolicy,
         Self::VfsPolicy,
@@ -447,24 +458,65 @@ impl ServiceCapabilitySet {
     }
 }
 
-pub const IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY: u64 = ServiceCapability::LinuxSyscallPolicy.bit();
-pub const IPC_SERVICE_CAP_VFS_POLICY: u64 = ServiceCapability::VfsPolicy.bit();
-pub const IPC_SERVICE_CAP_NET_POLICY: u64 = ServiceCapability::NetPolicy.bit();
-pub const IPC_SERVICE_CAP_DEVICE_POLICY: u64 = ServiceCapability::DevicePolicy.bit();
-pub const IPC_SERVICE_CAP_PROCESS_LOADER: u64 = ServiceCapability::ProcessLoader.bit();
-pub const IPC_SERVICE_CAP_STORAGE_POLICY: u64 = ServiceCapability::StoragePolicy.bit();
-pub const IPC_SERVICE_CAP_INPUT_POLICY: u64 = ServiceCapability::InputPolicy.bit();
-pub const IPC_SERVICE_CAP_PROCESS_POLICY: u64 = ServiceCapability::ProcessPolicy.bit();
-pub const IPC_SERVICE_CAP_ROOT_SUPERVISOR: u64 = ServiceCapability::RootSupervisor.bit();
-pub const IPC_SERVICE_CAP_SESSION_POLICY: u64 = ServiceCapability::SessionPolicy.bit();
-pub const IPC_SERVICE_CAP_PAGER_POLICY: u64 = ServiceCapability::PagerPolicy.bit();
-pub const IPC_SERVICE_CAP_UI_POLICY: u64 = ServiceCapability::UiPolicy.bit();
-pub const IPC_SERVICE_CAP_INIT_POLICY: u64 = ServiceCapability::InitPolicy.bit();
-pub const IPC_SERVICE_CAP_BOOTSTRAP_POLICY: u64 = IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY
-    | IPC_SERVICE_CAP_VFS_POLICY
-    | IPC_SERVICE_CAP_NET_POLICY
-    | IPC_SERVICE_CAP_DEVICE_POLICY
-    | IPC_SERVICE_CAP_PROCESS_LOADER;
+pub const SERVICE_POLICY_ABI_VERSION: u16 = 1;
+/// Replace the whole routing + capability policy (generation must increase).
+pub const SERVICE_POLICY_OP_INSTALL: u16 = 1;
+/// Bind one live process to the service identity rootd authenticated for it.
+pub const SERVICE_POLICY_OP_BIND_PRINCIPAL: u16 = 2;
+pub const SERVICE_POLICY_MAX_ROUTES: usize = 64;
+pub const SERVICE_POLICY_MAX_SERVICES: usize = 16;
+pub const SERVICE_POLICY_MAX_CAPABILITIES: usize = 14;
+
+/// One directed lookup offer: `subject` may obtain `target`'s endpoint.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ServiceRouteWire {
+    pub subject: u8,
+    pub target: u8,
+}
+
+/// The typed capabilities one service may hold, as discriminants. There is no
+/// mask on this wire: each entry is a `ServiceCapability::from_id` value.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ServiceCapabilityListWire {
+    pub service: u8,
+    pub count: u8,
+    pub capabilities: [u8; SERVICE_POLICY_MAX_CAPABILITIES],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RustosServicePolicyArgs {
+    pub abi_version: u16,
+    pub op: u16,
+    pub route_count: u16,
+    pub capability_count: u16,
+    /// INSTALL: the new policy generation. BIND_PRINCIPAL: the generation the
+    /// binding was authenticated under (must equal the installed one).
+    pub generation: u64,
+    pub principal_pid: u64,
+    pub principal_service: u64,
+    pub routes: [ServiceRouteWire; SERVICE_POLICY_MAX_ROUTES],
+    pub capabilities: [ServiceCapabilityListWire; SERVICE_POLICY_MAX_SERVICES],
+}
+
+impl Default for RustosServicePolicyArgs {
+    fn default() -> Self {
+        Self {
+            abi_version: SERVICE_POLICY_ABI_VERSION,
+            op: 0,
+            route_count: 0,
+            capability_count: 0,
+            generation: 0,
+            principal_pid: 0,
+            principal_service: 0,
+            routes: [ServiceRouteWire::default(); SERVICE_POLICY_MAX_ROUTES],
+            capabilities: [ServiceCapabilityListWire::default(); SERVICE_POLICY_MAX_SERVICES],
+        }
+    }
+}
+
 pub const SYSCALL_OFFLOAD_ABI_VERSION: u16 = 1;
 pub const SYSCALL_OFFLOAD_OP_LINUX_STATX: u16 = 1;
 pub const SYSCALL_OFFLOAD_OP_LINUX_NEWFSTATAT: u16 = 2;
@@ -1198,8 +1250,9 @@ pub const COMMERCIAL_MAX_ROOTD_OP_CORE_SERVICE_LEASE: u16 = 2;
 pub const COMMERCIAL_MAX_ROOTD_OP_DEPENDENCY_GRAPH: u16 = 3;
 pub const COMMERCIAL_MAX_ROOTD_OP_RESTART_POLICY: u16 = 4;
 pub const COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL: u16 = 5;
-pub const COMMERCIAL_MAX_ROOTD_OP_SERVICE_CAPABILITY: u16 = 6;
-pub const COMMERCIAL_MAX_ROOTD_OP_SERVICE_LOOKUP: u16 = 7;
+// Rootd operations 6 and 7 (service capability / service lookup) are retired:
+// the kernel decides both from the policy rootd installs through
+// `SYS_RUSTOS_SERVICE_POLICY`. The numbers are never reused.
 // Supervisor operation 8 (scalar lease query) is retired.
 pub const COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_SNAPSHOT_IDL: u16 = 15;
 // Supervisor operation 9 (scalar reclaim) is retired. Reclamation is now
@@ -1444,7 +1497,6 @@ pub struct CommercialMaxProtocolDescriptorWire {
     pub op: u16,
     pub flags: u32,
     pub service_id: u64,
-    pub capability_mask: u64,
     pub value0: u64,
     pub value1: u64,
     pub name_len: u16,
@@ -1460,8 +1512,6 @@ pub struct CommercialMaxCapabilityLeaseWire {
     pub service_id: u64,
     pub subject_pid: u64,
     pub subject_tid: u64,
-    pub capability_mask: u64,
-    pub rights_mask: u64,
     pub expires_at_mono_ns: u64,
     pub generation: u64,
     pub label_len: u16,
@@ -1477,8 +1527,6 @@ impl Default for CommercialMaxCapabilityLeaseWire {
             service_id: 0,
             subject_pid: 0,
             subject_tid: 0,
-            capability_mask: 0,
-            rights_mask: 0,
             expires_at_mono_ns: 0,
             generation: 0,
             label_len: 0,

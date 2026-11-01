@@ -300,14 +300,16 @@ pub fn spawn_bootstrap_linux_process_with_launch_and_scheduling_context(
     launch: ProcessLaunchOptions<'_>,
     policy: rustos_user_abi::syscall::RustosSchedulingContextPolicy,
     job: Option<multitask::JobId>,
+    start_suspended: bool,
 ) -> Result<SpawnedProcess, ProcessLoadError> {
     let transaction = reserve_process_spawn_transaction_in(job)?;
     let prepared = prepare_bootstrap_linux_process_with_launch(image, launch)?;
-    spawn_prepared_process_with_scheduling_context(
-        bind_prepared_spawn(prepared, transaction),
-        weight_micros,
-        policy,
-    )
+    let spawn = bind_prepared_spawn(prepared, transaction);
+    if start_suspended {
+        spawn_prepared_process_suspended_with_scheduling_context(spawn, weight_micros, policy)
+    } else {
+        spawn_prepared_process_with_scheduling_context(spawn, weight_micros, policy)
+    }
 }
 
 fn prepare_bootstrap_linux_process_with_launch(

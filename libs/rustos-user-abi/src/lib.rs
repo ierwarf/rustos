@@ -266,8 +266,6 @@ mod tests {
         assert_eq!(syscall::COMMERCIAL_MAX_PROTOCOL_CAPABILITY, 14);
         assert_eq!(syscall::COMMERCIAL_MAX_PROTOCOL_UISERVER, 15);
         assert_eq!(syscall::COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL, 5);
-        assert_eq!(syscall::COMMERCIAL_MAX_ROOTD_OP_SERVICE_CAPABILITY, 6);
-        assert_eq!(syscall::COMMERCIAL_MAX_ROOTD_OP_SERVICE_LOOKUP, 7);
         assert_eq!(syscall::COMMERCIAL_MAX_PROCD_OP_SESSION_MEMBERSHIP, 7);
         assert_eq!(syscall::COMMERCIAL_MAX_LOADERD_OP_AUXV_PLAN, 7);
         assert_eq!(syscall::COMMERCIAL_MAX_SYSCALLD_OP_COLD_SYSCALL_OFFLOAD, 7);

@@ -73,8 +73,17 @@ rg -q 'VFS_DEVICE_ACCESS_DRM_COMPAT' services/vfsd/src/main.rs ||
 
 # Service capability selection is a rootd policy decision. Compat may ask for
 # the current lease but must not regain a parallel hard-coded role table.
-rg -q 'service_capability_via_rootd' kernel/compat/src/user/syscall/linux/ipc_ops.rs ||
-    fail "compat no longer resolves service authority through rootd"
+# The authority is delegated, not queried: rootd installs the typed policy and
+# the principal bindings, and the kernel decides from that table alone.
+rg -q 'service_policy_ops::registration_decision' kernel/compat/src/user/syscall/linux/ipc_ops.rs ||
+    fail "compat no longer registers services from the installed rootd policy"
+rg -q 'service_policy_ops::lookup_decision' kernel/compat/src/user/syscall/linux/ipc_ops.rs ||
+    fail "compat no longer decides lookups from the installed rootd policy"
+if rg -q 'via_rootd' kernel/compat/src/user/syscall/linux/ipc_ops.rs; then
+    fail "compat calls rootd from inside a service lookup or registration again"
+fi
+rg -q 'kernel_policy::install\(\)' services/rootd/src/main.rs ||
+    fail "rootd does not install the service policy into the kernel"
 rg -q 'fn service_policy_capability' services/rootd/src/main.rs ||
     fail "rootd service capability policy source is missing"
 rg -qU 'subject: IPC_SERVICE_INPUTD,\s*target: IPC_SERVICE_NETD,' services/rootd/src/service_manifest.rs ||

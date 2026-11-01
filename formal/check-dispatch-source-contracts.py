@@ -1307,7 +1307,7 @@ ordered(body(hecs_archive, 'write_kvm_success_summary'), ['hecs::evidence(&rusto
 failure_snapshot = Path('tools/xtask/src/kvm/failure_snapshot.rs').read_text()
 ordered(body(failure_snapshot, 'after_failed_probe'), ['if result.is_err()', 'diagnostic();'],
     'only a latched failure may invoke CPU snapshot diagnostics')
-smoke = body(Path('tools/xtask/src/kvm/options.rs').read_text(), 'run_one_smoke')
+smoke = body(Path('tools/xtask/src/kvm/options.rs').read_text(), 'run_one_smoke_unarchived')
 ordered(smoke, ['let result: Result<ProbeResult>', 'wait_for_parallel_boot(',
     'failure_snapshot::after_failed_probe(result, ||', 'options.physical_gpu_bdf.is_none()',
     'failure_snapshot::capture(config, &layout, options.rustos_vcpus)',

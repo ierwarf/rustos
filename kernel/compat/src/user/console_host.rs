@@ -46,6 +46,7 @@ pub struct ConsoleProgramSpec<'a> {
     pub env: &'a [&'a str],
     root_job_authority: bool,
     job: Option<crate::multitask::JobId>,
+    start_suspended: bool,
     scheduling_context: Option<rustos_user_abi::syscall::RustosSchedulingContextPolicy>,
 }
 
@@ -60,6 +61,7 @@ impl<'a> ConsoleProgramSpec<'a> {
             env: &[],
             root_job_authority: false,
             job: None,
+            start_suspended: false,
             scheduling_context: None,
         }
     }
@@ -79,6 +81,13 @@ impl<'a> ConsoleProgramSpec<'a> {
     /// CREATE_PROCESS descriptor. This never grants the root job descriptor.
     pub const fn with_job(mut self, job: crate::multitask::JobId) -> Self {
         self.job = Some(job);
+        self
+    }
+
+    /// The child is created but not started; the caller starts it after binding
+    /// whatever must exist before its first instruction.
+    pub const fn start_suspended(mut self) -> Self {
+        self.start_suspended = true;
         self
     }
 
@@ -217,6 +226,7 @@ pub fn spawn_program_in_session(
         launch,
         policy,
         program.job,
+        program.start_suspended,
     );
     spawned
         .inspect(|spawned| {

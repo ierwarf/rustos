@@ -1498,6 +1498,7 @@ pub use crate::syscall::SYS_RUSTOS_JOB_POLICY;
 pub use crate::syscall::SYS_RUSTOS_JOB_SESSION;
 pub use crate::syscall::SYS_RUSTOS_JOB_MEMORY_QOS;
 pub use crate::syscall::SYS_RUSTOS_JOB_KMEM;
+pub use crate::syscall::SYS_RUSTOS_SERVICE_POLICY;
 pub use crate::syscall::SYS_RUSTOS_CHECKPOINT_JOURNAL;
 pub use crate::syscall::SYS_RUSTOS_ROOTD_MEMORY_BROKER;
 pub use crate::syscall::SYS_RUSTOS_ROOTD_TERMINATE_BROKER;

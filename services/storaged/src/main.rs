@@ -592,7 +592,6 @@ fn storage_descriptor(
         op,
         flags: descriptor.flags,
         service_id: descriptor.id as u64,
-        capability_mask: storaged_capability_mask(op),
         value0: descriptor.block_count,
         value1: descriptor.start_block,
         ..CommercialMaxProtocolDescriptorWire::default()
@@ -612,8 +611,6 @@ fn storage_capability(
     let mut wire = CommercialMaxCapabilityLeaseWire {
         lease_id: descriptor.id as u64,
         service_id: IPC_SERVICE_STORAGED,
-        capability_mask: storaged_capability_mask(op),
-        rights_mask: storaged_capability_mask(op),
         generation: descriptor.id as u64,
         ..CommercialMaxCapabilityLeaseWire::default()
     };
@@ -623,21 +620,6 @@ fn storage_capability(
     wire.label_len = label_len as u16;
     wire.label[..label_len].copy_from_slice(&descriptor.path[..label_len]);
     wire
-}
-
-fn storaged_capability_mask(op: u16) -> u64 {
-    match op {
-        COMMERCIAL_MAX_STORAGED_OP_BLOCK_INVENTORY => 1 << 0,
-        COMMERCIAL_MAX_STORAGED_OP_PARTITION_SCAN => 1 << 1,
-        COMMERCIAL_MAX_STORAGED_OP_ROOT_VOLUME_SELECT => 1 << 2,
-        COMMERCIAL_MAX_STORAGED_OP_VOLUME_METADATA => 1 << 4,
-        COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_INFO => 1 << 7,
-        COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_READ
-        | COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_READ_BULK => 1 << 8,
-        COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_WRITE => 1 << 9,
-        COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_FLUSH => 1 << 10,
-        _ => 0,
-    }
 }
 
 fn write_payload_struct<T>(value: &T, dest: &mut [u8]) -> u32 {
@@ -706,10 +688,24 @@ mod tests {
 
     #[test]
     fn bulk_read_reuses_read_authority_instead_of_minting_a_new_right() {
-        assert_eq!(
-            storaged_capability_mask(COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_READ_BULK),
-            storaged_capability_mask(COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_READ)
-        );
+        // Authority is the service's single typed capability; an op carries no
+        // right of its own. The bulk variant is therefore the same request
+        // class as a plain read: identical admission and refusal.
+        for (arg0, arg2, arg3, payload_len) in [(7, 15, 0, 0), (0, 15, 0, 0), (7, 0, 0, 0), (7, 15, 1, 0), (7, 15, 0, 1)] {
+            let shape = |op| {
+                let mut r = request(op);
+                r.arg0 = arg0;
+                r.arg1 = 11;
+                r.arg2 = arg2;
+                r.arg3 = arg3;
+                r.payload_len = payload_len;
+                validate_commercial_request(&r)
+            };
+            assert_eq!(
+                shape(COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_READ_BULK),
+                shape(COMMERCIAL_MAX_STORAGED_OP_DVM_BLOCK_READ)
+            );
+        }
     }
 
     #[test]

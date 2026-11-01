@@ -621,7 +621,6 @@ fn syscalld_descriptor(name: &str, op: u16, value0: u64) -> CommercialMaxProtoco
         op,
         flags: 0,
         service_id: IPC_SERVICE_LINUX_SYSCALLD,
-        capability_mask: syscalld_capability_mask(op),
         value0,
         value1: 0,
         ..CommercialMaxProtocolDescriptorWire::default()
@@ -634,33 +633,10 @@ fn syscalld_capability(label: &str, op: u16) -> CommercialMaxCapabilityLeaseWire
     let mut capability = CommercialMaxCapabilityLeaseWire {
         lease_id: ((COMMERCIAL_MAX_PROTOCOL_SYSCALLD as u64) << 32) | u64::from(op),
         service_id: IPC_SERVICE_LINUX_SYSCALLD,
-        capability_mask: syscalld_capability_mask(op),
-        rights_mask: syscalld_capability_mask(op),
         ..CommercialMaxCapabilityLeaseWire::default()
     };
     copy_label(label, &mut capability.label, &mut capability.label_len);
     capability
-}
-
-fn syscalld_capability_mask(op: u16) -> u64 {
-    match op {
-        COMMERCIAL_MAX_SYSCALLD_OP_LINUX_POLICY | SYSCALL_OFFLOAD_OP_LINUX_UNAME => 1 << 0,
-        COMMERCIAL_MAX_SYSCALLD_OP_WIN32_POLICY | SYSCALL_OFFLOAD_OP_WIN32_WRITE_FILE => 1 << 1,
-        COMMERCIAL_MAX_SYSCALLD_OP_MM_POLICY
-        | SYSCALL_OFFLOAD_OP_LINUX_BRK
-        | SYSCALL_OFFLOAD_OP_LINUX_MMAP
-        | SYSCALL_OFFLOAD_OP_LINUX_MPROTECT
-        | SYSCALL_OFFLOAD_OP_LINUX_MUNMAP => 1 << 2,
-        COMMERCIAL_MAX_SYSCALLD_OP_CREDS_LIMITS
-        | SYSCALL_OFFLOAD_OP_LINUX_GETUID
-        | SYSCALL_OFFLOAD_OP_LINUX_SETUID => 1 << 3,
-        COMMERCIAL_MAX_SYSCALLD_OP_CLOCK_POLICY
-        | SYSCALL_OFFLOAD_OP_LINUX_ARCH_PRCTL_POLICY
-        | SYSCALL_OFFLOAD_OP_WIN32_DELAY_EXECUTION => 1 << 4,
-        COMMERCIAL_MAX_SYSCALLD_OP_RANDOM_POLICY | SYSCALL_OFFLOAD_OP_LINUX_GETRANDOM => 1 << 5,
-        COMMERCIAL_MAX_SYSCALLD_OP_COLD_SYSCALL_OFFLOAD => 1 << 6,
-        _ => 0,
-    }
 }
 
 fn copy_label(label: &str, target: &mut [u8], len: &mut u16) {
