@@ -2795,6 +2795,7 @@ EOF
 # verification below still walks `group_order` in registry order, so a failure
 # names the same group, witness, and count it always did.
 run_dir="$(mktemp -d)"
+declare -A group_keys=()
 trap 'rm -f "$records" "$seen"; rm -rf "$run_dir"' EXIT
 group_index=0
 for group in "${group_order[@]}"; do
@@ -2814,6 +2815,17 @@ for group in "${group_order[@]}"; do
     # that group's own threads at one rather than letting one witness reset
     # another's synthetic scheduler while it is allocating a slot. Running it
     # beside *other* packages is unaffected: the fixtures are process-local.
+    # A group that passed on an identical dependency closure and witness set
+    # is not run again; its recorded output feeds the same verification below.
+    # `RUSTOS_WITNESS_CACHE=off` (nightly) turns this into a full re-audit.
+    group_key="$(python3 formal/witness-cache.py key --package "$package" \
+        --salt "source-conformance|$package|$features|${group_tests[$group]}")"
+    if python3 formal/witness-cache.py hit "$group_key" "$run_dir/$group_index.out"; then
+        printf '0' > "$run_dir/$group_index.rc"
+        group_index=$((group_index + 1))
+        continue
+    fi
+    group_keys[$group_index]="$group_key"
     (
         # `set -e` is inherited here, so a failing cargo would abort this
         # subshell before it could record the exit code, and verification below
@@ -2839,12 +2851,14 @@ for group in "${group_order[@]}"; do
     mapfile -t names < <(printf '%s' "${group_tests[$group]}" | sed '/^$/d')
     output="$(cat "$run_dir/$group_index.out")"
     group_rc="$(cat "$run_dir/$group_index.rc")"
+    this_group_index="$group_index"
     group_index=$((group_index + 1))
     if [[ "$group_rc" != "0" ]]; then
         printf '%s\n' "$output" >&2
         echo "source conformance witnesses failed for $package${features:+ [$features]}" >&2
         exit 1
     fi
+
     for name in "${names[@]}"; do
         # libtest decorates a `#[should_panic]` witness, and a registered test
         # name is compared whole so one witness cannot be satisfied by another
@@ -2866,6 +2880,11 @@ for group in "${group_order[@]}"; do
         printf '%s\n' "$output" >&2
         echo "source conformance executed $executed witnesses for $package, expected ${#names[@]}" >&2
         exit 1
+    fi
+    # Record the pass only after every check above held for this group.
+    if [[ -n "${group_keys[$this_group_index]:-}" ]]; then
+        python3 formal/witness-cache.py store "${group_keys[$this_group_index]}" \
+            "$run_dir/$this_group_index.out"
     fi
     while IFS='|' read -r model row_package row_test row_features; do
         [[ -n "$model" ]] || continue

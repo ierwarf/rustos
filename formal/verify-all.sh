@@ -126,6 +126,9 @@ run_parallel_lane fault-scenarios bash formal/run-fault-scenarios.sh
 run_parallel_lane abi-differential bash formal/run-abi-differential.sh
 run_parallel_lane recovery-scenarios bash formal/run-recovery-scenarios.sh
 if [[ "$profile" == nightly ]]; then
+    # Nightly re-audits everything: both the mutation cache and the witness
+    # pass cache are off, which bounds what their closure keys approximate.
+    export RUSTOS_WITNESS_CACHE=off
     run_parallel_lane implementation-mutations env \
         RUSTOS_IMPLEMENTATION_MUTATION_CACHE=off \
         bash formal/run-implementation-mutations.sh

@@ -60,9 +60,11 @@ ring0 as a shortcut.
   1-vCPU `kvm-smoke` (needs no formal seal); (2) push gate -
   `formal/verify-all.sh --profile pr`, whose mutation lane reuses kills cached
   per witness and per package dependency closure (a `Cargo.lock` edit only
-  re-runs mutants whose package depends on the changed crate), and which a
+  re-runs mutants whose package depends on the changed crate; source-conformance
+  and fault-scenario witness groups are cached the same way, by package
+  dependency closure), and which a
   multi-vCPU `kvm-smoke` seals automatically; (3) nightly -
-  `--profile nightly` turns the mutation cache off and re-audits everything,
+  `--profile nightly` turns the mutation and witness caches off and re-audits everything,
   which is what bounds the cache's documented approximation.
 - If the user asks for unverified drafting, skip compilation, builds, tests and
   formal runs.

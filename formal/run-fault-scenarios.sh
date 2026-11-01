@@ -21,6 +21,11 @@ for witness in "${!witnesses[@]}"; do
     artifact_name="${package}-${test_name}"
     list_log="$artifact_dir/${artifact_name}.list.log"
     test_log="$artifact_dir/${artifact_name}.test.log"
+    witness_key="$(python3 "$repo_root/formal/witness-cache.py" key --package "$package" \
+        --salt "fault-scenarios|$witness")"
+    if python3 "$repo_root/formal/witness-cache.py" hit "$witness_key"; then
+        continue
+    fi
     cargo test -q -p "$package" "$test_name" -- --list >"$list_log" 2>&1
     listed="$(grep -Ec "(^|::)${test_name}: test$" "$list_log" || true)"
     if [[ "$listed" != 1 ]]; then
@@ -32,6 +37,7 @@ for witness in "${!witnesses[@]}"; do
         tail -n 80 "$test_log" >&2
         exit 1
     fi
+    python3 "$repo_root/formal/witness-cache.py" store "$witness_key"
 done
 
 printf 'fault source witnesses passed count=%s\n' "${#witnesses[@]}"
