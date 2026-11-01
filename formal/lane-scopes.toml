@@ -1,0 +1,24 @@
+# Declared inputs of formal lanes whose result is a pure function of them.
+#
+# A lane listed here is skipped when its scope is byte-identical to the last
+# run that passed (see lane-cache.py). The declaration is not trusted: on every
+# real run the lane executes in a bubblewrap sandbox where only these paths of
+# the checkout exist, so a lane that reads anything undeclared fails instead of
+# being cached on an incomplete key. `paths` are git-tracked prefixes; every
+# `manifest` contributes the local dependency closure of its package.
+# `artifacts` are the lane's outputs, recorded by digest and re-verified on a hit.
+
+[lane.concurrency-triangle]
+paths = ["formal", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo"]
+# Registries whose path-like tokens name more inputs (production sources the
+# lane anchors on); tokens that are not tracked files are ignored.
+path_refs = ["formal/concurrency-triangle.toml", "formal/concurrency-witnesses.tsv"]
+manifests = ["formal/loom-proof-kernel/Cargo.toml"]
+# Ignored build directories the lane writes into (bound read-write).
+writable = ["formal/loom-proof-kernel/target"]
+artifacts = [
+  "build/formal/concurrency-triangle",
+  "build/formal/loom",
+  "build/formal/shuttle",
+  "build/formal/herd",
+]

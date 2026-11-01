@@ -42,11 +42,12 @@ def _git_files(root: Path, directories: set[Path]) -> set[Path]:
 
 
 class Workspace:
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, manifest_path: Path | None = None) -> None:
         self.root = root.resolve()
+        extra = ["--manifest-path", str(manifest_path)] if manifest_path else []
         metadata = json.loads(
             subprocess.run(
-                ["cargo", "metadata", "--format-version", "1", "--locked"],
+                ["cargo", "metadata", "--format-version", "1", "--locked", *extra],
                 cwd=self.root,
                 check=True,
                 capture_output=True,
@@ -62,6 +63,23 @@ class Workspace:
         self.checksums = {
             (p["name"], p["version"]): p.get("checksum", "") for p in lock.get("package", [])
         }
+
+    def package_for_manifest(self, manifest: Path) -> str:
+        for pid, package in self.packages.items():
+            if Path(package["manifest_path"]).resolve() == manifest.resolve():
+                return pid
+        raise ValueError(f"no package for {manifest}")
+
+    def closure_ids(self, package_id: str) -> set[str]:
+        seen: set[str] = set()
+        pending = [package_id]
+        while pending:
+            current = pending.pop()
+            if current in seen:
+                continue
+            seen.add(current)
+            pending.extend(d["pkg"] for d in self.nodes[current]["deps"])
+        return seen
 
     def closure(self, name: str) -> set[str]:
         if name not in self.by_name:
