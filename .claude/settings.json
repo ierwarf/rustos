@@ -46,19 +46,6 @@
         ]
       }
     ],
-    "PostToolUse": [
-      {
-        "matcher": "Edit|Write|mcp__serena__(create_text_file|insert_after_symbol|insert_before_symbol|rename_symbol|replace_content|replace_in_files|replace_symbol_body|safe_delete_symbol)",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "\"$(git rev-parse --show-toplevel)/.agents/hooks/post_edit_rust.sh\"",
-            "timeout": 12,
-            "statusMessage": "Checking Rust edit"
-          }
-        ]
-      }
-    ],
     "UserPromptSubmit": [
       {
         "hooks": [

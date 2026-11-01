@@ -22,9 +22,9 @@ use alloc::vec::Vec;
 use x86_64::structures::paging::PageTableFlags;
 use x86_64::VirtAddr;
 
-use rustos_user_abi::syscall::{
+use rustos_user_abi::syscall::{ServiceCapability,
     RustosMmBrokerArgs, RustosMmFdBrokerResult, RustosMmLayoutBrokerResult,
-    RustosMmMapBrokerResult, IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY, MM_BROKER_ABI_VERSION,
+    RustosMmMapBrokerResult, MM_BROKER_ABI_VERSION,
     MM_BROKER_FD_KIND_DEVICE, MM_BROKER_FD_KIND_DISPLAY_SURFACE, MM_BROKER_FD_KIND_FILE,
     MM_BROKER_FD_KIND_MEMFD, MM_BROKER_FD_KIND_NONE, MM_BROKER_FD_RIGHT_MAP,
     MM_BROKER_FD_RIGHT_READ, MM_BROKER_FD_RIGHT_WRITE, MM_BROKER_OP_DESCRIBE_FD,
@@ -56,7 +56,7 @@ pub(super) fn syscall_linux_rustos_mm_broker(args_ptr: u64) -> u64 {
     // and the pager may not map through this broker. A caller holding neither
     // is rejected before its arguments are read, exactly as before.
     let has_mapping_policy =
-        ipc_ops::current_process_has_service_capability(IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY);
+        ipc_ops::current_process_has_service_capability(ServiceCapability::LinuxSyscallPolicy);
     let owns_pager_endpoint = current_process_owns_pager_endpoint();
     if !has_mapping_policy && !owns_pager_endpoint {
         return linux_errno(LINUX_EPERM);

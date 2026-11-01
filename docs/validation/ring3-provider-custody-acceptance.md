@@ -1,8 +1,9 @@
 # Ring3 provider custody: Codex acceptance matrix
 
-**Status:** 2026-11-01 draft. Nothing on this page proves the implementation
-works. The author intentionally did not run compiler, tests, static audit,
-QEMU/KVM, stress, sanitizer or formal proofs.
+**Status (2026-11-01):** an acceptance *matrix*. The cases below are the
+contract; the witness table at the end says which ones currently have an
+executed unit test and which still need KVM fault injection. A case without a
+named witness is not verified.
 
 ## Minimum production authority invariant
 
@@ -95,56 +96,57 @@ QEMU/KVM, stress, sanitizer or formal proofs.
 
 ## Failure and performance boundaries
 
-The source draft currently leaves unresolved whether vfsd may safely make a
-second rootd IPC from the exact bootstrap service callback. Require a
-call-graph/deadlock audit before acceptance. Under the intended Ring3 model,
-all accounting IPC is at socket/open creation or final destruction, not
-send/recv/read/write, futex, scheduler, pager fault or TLB paths.
+All accounting IPC happens at socket/open creation or final destruction, never
+in send/recv/read/write, futex, scheduler, pager-fault or TLB paths. Nobody may
+report success when a kernel debit or refund ACK is ambiguous: the exact token
+is retained, an ambiguous CHARGE is fenced by CANCEL, and an ambiguous RELEASE
+is retried with the same token. Restored vfsd checkpoint data is never fresh
+billing authority; a restored description refuses data operations until it is
+rebound through OPENAT admission.
 
-No one may report success when the kernel debit/refund ACK is ambiguous.
-A provider restart may not automatically treat restored checkpoint data as
-fresh billing authority. Bounded tombstone history can exhaust after many
-completed sessions; Codex must add an authenticated completion-ACK/watermark
-compaction contract before claiming long-running production stability.
+Bootstrap: vfsd builds its provider ledger lazily after checkpoint replay, so
+no rootd call is made while the endpoint is being registered. A 1-vCPU KVM smoke
+boot reached init handoff and launched UI/app processes with the vfsd and netd
+billing paths compiled in; the billing RPC volume was not instrumented.
 
-### Required Codex runs (not executed in this draft session)
+## Receipt ACK and tombstone lifecycle
 
-1. Rust formatting, Cargo.lock, targeted no_std crate compile and unit tests.
-2. Generated-IDL check and schema 520 compatibility tests.
-3. `python3 tools/ring3_provider_source_audit.py` followed by real code review.
-4. KVM 1/8 vCPU open/close and socketpair/accept/final-ref stress.
-5. Process-exit and rootd/netd/vfsd restart fault injection with PID reuse.
-6. Kernel accounting counter deltas including exact negative-right tests.
-7. Failure after kernel charge before user copyout and before IPC reply.
-8. Control-plane deadlock and IPC p50/p99 latency regression review.
+CANCEL and RELEASE leave a Settled tombstone in rootd. The provider confirms it
+with op 28 from its bounded `ProviderClient` outbox (retried by netd's refund
+worker and at every vfsd billing operation). Rootd removes the tombstone only on
+an exact ACK. Under table pressure (4096 tickets) it reclaims the oldest Settled
+tombstone; unsettled tickets are never reclaimed and a full table of them
+refuses with ENOSPC. The per-owner nonce watermark is never reset by either
+path, so a reclaimed token cannot be charged again, and a repeated RELEASE,
+CANCEL or ACK of an absent token succeeds idempotently. A restarted rootd has an
+empty book and a drained kernel ledger, so the same idempotence lets providers
+finish closing without wedging.
 
-## 2026-11-01 CANCEL / receipt-ACK extension
+## Witness status
 
-Rootd operations 27 and 28 are added to the provider control ABI.
-CANCEL is a jobless kernel-token release, not a second CHARGE, and
-the provider uses the same exact token/lease even when the original
-charge IPC never reached rootd. The kernel's root Job session ledger
-records the terminal refund watermark for known tokens. Rootd's
-per-owner nonce high watermark fences a late charge where no rootd
-entry was created at all. A released or canceled receipt remains until
-the provider confirms the terminal ACK using operation 28. Successful
-receipt compaction must never reset the nonce high watermark. On
-provider process exit, kernel drain runs before receipt/owner custody
-is discarded.
+| Case | Witness |
+| --- | --- |
+| Exact shape, scalar args, wrong op denied | `provider_control::tests::exact_shape_denies_scalar_and_wrong_operation` |
+| Canonical IDL 520 round trip, trailing/corrupt/legacy frames | `provider_wire::tests` (3) |
+| Duplicate charge never double-charges; settled token cannot recharge | `provider_billing::tests::billing_records_exact_client_not_provider` |
+| Lost CHARGE ACK reuses the same kernel token | `uncertain_charge_reuses_same_kernel_token` |
+| Lost RELEASE ACK, uncertain refund | `uncertain_refund_never_recharges_a_settled_ticket` |
+| Wrong client/session/kind cannot refund | `wrong_client_job_or_session_cannot_claim_refund` |
+| Provider exit drains before forgetting; failed drain keeps receipts | `a_provider_exit_drains_before_forgetting_receipts`, `failed_kernel_drain_keeps_provider_receipts` |
+| CANCEL before CHARGE fences a late nonce | `cancel_undelivered_charge_fences_late_same_nonce` |
+| ACK compaction keeps the spent-nonce fence | `ack_compaction_preserves_the_spent_nonce_fence` |
+| Lost ACKs do not exhaust the table; unsettled exhaustion still refuses | `settled_tombstones_are_reclaimed_under_pressure_without_unspending_tokens`, `unsettled_table_exhaustion_still_refuses` |
+| Rootd restart does not wedge RELEASE/ACK | `rootd_restart_does_not_wedge_provider_release_or_receipt_ack` |
+| Provider-side ACK outbox retry, wrong-nonce reply, overflow eviction | `provider_client::tests::lost_receipt_ack_is_retained_and_retried_until_exact_commit`, `cancel_receipts_queue_acks_and_overflow_evicts_oldest` |
+| Client and provider ledgers: replay, cancel, nonce mismatch | `provider_client::tests` (remaining) |
+| netd UNIX lifecycle matrix (dup, close, accept requeue) | `netd` `unix_socket_lifecycle_tests` |
+| Source ordering of charge/checkpoint/refund call sites | `tools/ring3_provider_source_audit.py` (string-order aid only) |
+| Kernel charge commits then copyout faults | kernel `job_ops` source witnesses; no native copyout fault test |
 
-P0 negative cases to run: CANCEL-before-CHARGE ordering, concurrent
-late CHARGE after CANCEL, two providers with equal nonce, wrong
-client/session/Job while ACK-compacting, forged ACK from unrelated
-PID, rootd crash between kernel refund and receipt ACK, PID reuse,
-global kernel provider watermark and 4096-ticket bounds. The new
-unit tests are source only, not executed.
+### Not yet executed (needs KVM fault injection)
 
-## Current source and remaining billing ownership
-
-ProviderClient now has matching CANCEL state transitions for netd/vfsd, so
-the prior local method references have concrete source implementations.
-However, terminal rootd receipt ACKs are best-effort and dropped after an
-unreliable RPC result. A provider-local replayable ACK outbox is still
-unimplemented. Test long-running close/reopen cycles above 4096 sessions
-and deliberately drop only the terminal receipt ACK (not the kernel refund).
-The generated schema 520 live control RPC replacement remains unmerged.
+Rootd killed between kernel refund and ACK; provider PID reuse; concurrent late
+CHARGE after CANCEL across two providers; deliberately dropped terminal ACKs
+over more than 4096 close/reopen cycles; socketpair partial funding under
+kernel capacity exhaustion; vfsd restart with live descriptions; IPC p50/p99
+regression against the pre-change baseline.

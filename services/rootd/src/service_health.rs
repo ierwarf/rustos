@@ -43,6 +43,15 @@ impl HealthBook {
         Self { entries: [Witness::EMPTY; CAPACITY] }
     }
 
+    /// True when `(service, pid, sequence)` exactly repeats the last accepted,
+    /// not yet timed-out pulse (a pulse whose IPC reply was lost).
+    pub(crate) fn is_duplicate(&self, service: u64, pid: u64, sequence: u64) -> bool {
+        service != 0 && pid != 0 && sequence != 0
+            && self.entries.iter().any(|entry| entry.service == service
+                && entry.pid == pid && entry.sequence == sequence
+                && !entry.timed_out)
+    }
+
     pub(crate) fn report(
         &mut self,
         service: u64,
@@ -71,6 +80,10 @@ impl HealthBook {
             .ok_or(ENOSPC)?;
         let slot = &mut self.entries[slot_index];
         if slot.service == service && slot.pid == pid {
+            if sequence == slot.sequence && !slot.timed_out {
+                // Exact replay after a lost ACK: original deadline, no renewal.
+                return Ok(slot.deadline_ns);
+            }
             if sequence <= slot.sequence || slot.timed_out {
                 return Err(ESTALE);
             }
@@ -137,7 +150,10 @@ mod tests {
         let mut h = HealthBook::new();
         assert_eq!(h.report(0, 7, 1, 123), Err(EINVAL));
         assert_eq!(h.report(IPC_SERVICE_SESSIOND, 7, 1, 1), Ok(1 + DEFAULT_TIMEOUT_NS));
-        assert_eq!(h.report(IPC_SERVICE_SESSIOND, 7, 1, 2), Err(ESTALE));
+        // Exact replay keeps the original deadline; an older sequence is stale.
+        assert_eq!(h.report(IPC_SERVICE_SESSIOND, 7, 1, 2), Ok(1 + DEFAULT_TIMEOUT_NS));
+        assert_eq!(h.report(IPC_SERVICE_SESSIOND, 7, 3, 3), Ok(3 + DEFAULT_TIMEOUT_NS));
+        assert_eq!(h.report(IPC_SERVICE_SESSIOND, 7, 2, 4), Err(ESTALE));
         assert_eq!(h.report(IPC_SERVICE_SESSIOND, 8, 2, 3), Err(ESTALE));
         h.forget_pid(7);
         assert_eq!(h.report(IPC_SERVICE_SESSIOND, 8, 1, 4), Ok(4 + DEFAULT_TIMEOUT_NS));

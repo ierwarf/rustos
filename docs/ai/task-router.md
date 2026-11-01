@@ -7,13 +7,13 @@ the AI map, or all AI docs.
 ## Source-work routing
 
 Use `rg` for exact text and Serena for symbol/reference-aware navigation and
-editing. Serena is preferred when it helps, but is not a mandatory gate. For
-structural or critical work, widen Serena/reference/compiler/test evidence only
-as far as needed to establish correctness; do not preflight extra source MCPs.
+editing. Serena is preferred when it helps, but is not a mandatory gate. The
+scope of a task is set by the requested goal and its real dependencies: read
+and change every producer, consumer and call site that the goal touches, across
+as many subsystems as that takes.
 
-Any route that points into a document above the 32 KiB whole-read ceiling means:
-search the owning heading/key first, then open only the needed <=120-line range.
-Do not start at line 1 merely because the route names the file.
+A route into a very large document means: search the owning heading first and
+read the sections you need, rather than paging from line 1 by habit.
 
 ## Task routes
 
@@ -40,14 +40,12 @@ Do not start at line 1 merely because the route names the file.
 | Docs update | target doc | `docs/SUMMARY.md` only when navigation changes |
 | Agent/token policy | `token-policy.md` | exact active skill/hook/config only |
 
-## Stop rules
+## Working rules
 
-- If one focused contract and one source range answer the question, stop.
-- If search gives an exact symbol, open only that body/range.
-- Before a fourth source file or second large range, name the exact missing fact.
-- For clear ownership, patch the smallest viable slice.
+- Explore until the owner, the contract and every dependent call site are
+  known; there is no file-count or range limit.
 - Do not patch runtime failures without evidence.
 - `session-handoff.md` is a dated snapshot; verify its claims against the live
   goal, checkout, and `git status --short` before resuming.
-- Search large contracts by owning heading; never read them from the top merely
-  because the subsystem appears somewhere in the task.
+- Search large contracts by owning heading instead of reading them from the top
+  merely because the subsystem appears somewhere in the task.

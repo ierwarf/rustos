@@ -24,7 +24,7 @@ use super::*;
 /// critical sections; scheduler observation is intentionally unavailable
 /// while preemption is disabled.
 pub(super) fn current_loader_process_id() -> Option<u64> {
-    ipc_ops::current_process_with_service_capability(IPC_SERVICE_CAP_PROCESS_LOADER)
+    ipc_ops::current_process_with_service_capability(ServiceCapability::ProcessLoader)
 }
 
 pub(super) fn prepare_owned_by(state: &ProcPrepareState, loader_pid: u64) -> bool {

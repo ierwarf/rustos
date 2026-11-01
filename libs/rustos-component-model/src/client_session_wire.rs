@@ -32,7 +32,10 @@ impl SessionControl {
 
 fn encode(value: SessionControl, job: u64, phase: u16) -> Result<Vec<u8>, IdlError> {
     SessionControl::new(value.token, value.client_pid, value.operation)?;
-    if phase != REQUEST && phase != ACK || (phase == REQUEST && job != 0) {
+    if phase != REQUEST && phase != ACK
+        || (phase == REQUEST && job != 0)
+        || (phase == ACK && value.operation == CHARGE && job == 0)
+    {
         return Err(IdlError::Malformed);
     }
     let mut builder = Builder::new(CLIENT_JOB_SESSION_ACCOUNTING)?;

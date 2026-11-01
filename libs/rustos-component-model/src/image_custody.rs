@@ -100,13 +100,14 @@ impl<const N:usize> Custody<N>{
                            release_epoch:u64,verifier_authenticated:bool)
        ->Result<(),Error>{
         let i=self.position(service)?;
+        let floor=self.floor(service);
         let s=self.slots[i].as_mut().ok_or(Error::Unknown)?;
         if !verifier_authenticated||!evidence.valid(){return Err(Error::WrongEvidence)}
         if s.release_epoch!=release_epoch ||
             evidence.image.service!=service{return Err(Error::WrongImage)}
         if s.phase!=Phase::PreviousPinned{return Err(Error::WrongPhase)}
         if evidence.image.generation<=s.previous.generation ||
-            evidence.image.generation<self.floor(service){return Err(Error::AntiRollback)}
+            evidence.image.generation<floor{return Err(Error::AntiRollback)}
         if evidence.image==s.previous{return Err(Error::WrongImage)}
         s.candidate=Some(evidence.image);
         s.phase=Phase::CandidateAdmitted;Ok(())

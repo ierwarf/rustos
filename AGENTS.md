@@ -1,89 +1,84 @@
 # RustOS Agent Instructions
 
 Keep model context small. This `AGENTS.md` is the only stable repository prompt
-prefix. If already supplied, do not reread it unless it changed. Everything else
-is on demand. AI-infrastructure edits must keep
-`tools/agent/check-ai-context-contract.sh` passing.
+prefix; everything else is read on demand.
 
-## Core workflow
+## Project
 
-1. Search first and open the smallest focused contract/source range. Read
-   `docs/ai/task-router.md` only when ownership or validation routing is unclear.
-2. Use local `rg` for exact text. Prefer Serena when symbol/reference context or
-   semantic editing helps.
-3. Serena is a preference, not a mandatory gate. Once it is useful for a
-   symbol-aware task, prefer continuing with focused Serena bodies, references,
-   and edits instead of drifting back to broad raw reads or whole-file manual
-   editing from habit. Use `rg`, shell reads, or `apply_patch` when they are
-   smaller/clearer or Serena is unavailable or ill-suited.
-4. After product-source edits run `cargo xtask dev-plan`, execute its `now` lane
-   while iterating, then relevant `stable-batch` checks once when stable.
-   Agent/docs-only edits use focused selftests.
-5. Never bypass hooks/signing with `--no-verify`, `--no-gpg-sign`, or equivalent
-   flags. Do not use `clean`/`distclean` as routine build recovery.
-6. Keep policy in named userspace services (`rootd`, `syscalld`, `vfsd`,
-   `loaderd`, `netd`, `inputd`, etc.); do not move policy back into ring0 as a
-   compatibility or performance shortcut.
+RustOS is a microkernel operating system that runs Linux ELF and Windows PE
+applications, with Linux drivers isolated in a driver domain. Keep privileged
+mechanisms in Ring0 and policy in Ring3 named services (`rootd`, `syscalld`,
+`vfsd`, `loaderd`, `netd`, `inputd`, ...). Preserve the existing architecture
+unless the user asks for an architectural change; do not move policy back into
+ring0 as a shortcut.
 
-## Source work
+## Execution
 
-For local edits, search the exact symbol/range and change the smallest owner.
-For structural or critical work (scheduler, MM, IPC, security/capability, ABI,
-SMP/TLB, privilege, lifetime/concurrency, ring boundaries, hardware), widen
-Serena/reference/compiler/test evidence only as far as correctness requires.
-There is no multi-MCP preflight gate.
+- Implement the requested goal, not merely a small patch. Scope follows the
+  goal and its real dependencies.
+- No arbitrary limits on changed files, lines, modules, subsystems or size.
+  Cross-subsystem changes and large refactors are normal.
+- Read and modify all relevant code when necessary. Update producers,
+  consumers, interfaces, call sites, manifests and related implementations
+  together.
+- Prefer complete integration over isolated scaffolding, and remove superseded
+  code once its replacement is complete.
+- Do not stop at an arbitrary small milestone while the goal can be advanced.
+- Make routine implementation decisions autonomously; ask only when a decision
+  genuinely needs the user.
+- Preserve unrelated user changes.
 
-For non-local changes check the applicable subset of lock order,
-IRQ/preemption, blocking/allocation, user copy/faults, publication/teardown,
-capability generation/rights, ABI/wire format, cancellation/timeouts, and
-partial initialization/hot-unplug.
+## Tools and context
 
-## Context and output discipline
+- Use `rg`, Serena, shell commands and `apply_patch` as the task suggests.
+  Serena is a preference, not a mandatory gate.
+- Batch independent searches, reads and edits. Do not repeat exploration or
+  reread unchanged files.
+- Keep generated output and large logs (`logs/`, `target/`, `build/`,
+  `vendor/`, `perf.data`, `Cargo.lock`) out of model context; capture them to a
+  file and read a bounded part.
+- Read focused reference docs on demand, not up front:
+  resume `docs/ai/session-handoff.md` then `git status --short`; routing
+  `docs/ai/task-router.md`; kernel APIs `docs/ai/kernel-api-map.md`;
+  ABI/services `docs/ai/contracts-abi.md`; SMP `docs/ai/smp-contract.md`;
+  build/KVM/performance skills under `.agents/skills/`;
+  physical GPU `docs/ai/physical-gpu-status.md`.
+- Use parallel agents or worktrees for genuinely independent work with
+  explicit, disjoint write ownership.
+- For long tasks keep a short progress note in `docs/ai/session-handoff.md`
+  (what is done, what is disconnected, what is unverified) and resume from
+  `git status --short` plus the changed files.
 
-Use `docs/ai/token-policy.md` only when detailed limits matter. Keep reads
-focused, batch independent probes, keep successful command output quiet, and
-return only the first useful failure diagnostic plus a tiny tail. Avoid raw
-`logs/`, `target/`, `build/`, `vendor/`, `perf.data`, and `Cargo.lock` unless a
-routed task requires a bounded read there.
+## Validation
 
-Never dump `ALL_TOOLS` or bulk tool descriptions. Do not gather evidence that
-cannot change the next decision. At meaningful milestones refresh the short
-handoff and let Claude Code use model-specific default compaction rather than a
-repo-pinned early threshold.
+- Validation timing belongs to the task. Batch related changes, then validate
+  once per coherent batch instead of after every edit.
+- `cargo xtask dev-plan` lists suggested checks for the changed files; it is
+  routing, not evidence.
+- If the user asks for unverified drafting, skip compilation, builds, tests and
+  formal runs.
+- Report failures and unverified assumptions accurately; never claim
+  validation that was not performed.
 
-## Contracts and validation
+## Engineering
 
-Fix the violated invariant and add an appropriate regression witness. Update an
-owner/flow Markdown contract only when behavior, public interface, invariant,
-ownership/lifecycle, registry, validation, or routing actually changes.
-Mechanical/internal edits do not require documentation churn.
+- Respect privilege, capability, lifetime, concurrency, IPC and memory-safety
+  invariants (lock order, IRQ/preemption, user copy, publication/teardown,
+  capability generation, ABI/wire format).
+- No fake success paths, silent security fallbacks, or placeholder-only
+  implementations.
+- Prefer clean ownership and typed interfaces, and delete obsolete code instead
+  of accumulating compatibility layers.
+- Update an owner contract in Markdown when behavior, interface, invariant,
+  ownership or validation actually changes.
+- External research is warranted for a new subsystem architecture or an
+  unfamiliar external ABI/specification; otherwise prefer local evidence.
 
-Before Linux DVM integration run `make -C driver-domains/linux build-plan`; use
-cached `dev-*` lanes while iterating and one matching `rebuild-*` when stable.
-Resume interrupted targets instead of cleaning them.
+## Git and completion
 
-## Sub-agents
-
-Use sub-agents only when independent parallel exploration or a disjoint slice
-reduces main-context churn. Give them only the task, relevant paths, stop
-condition, and required evidence. They are read-only unless a disjoint write
-scope is explicit. Prefer a fresh minimal task packet; do not fork or inherit
-the full conversation unless it is necessary. Do not pin a repository model or
-reasoning effort; the main agent owns integration and validation.
-
-## Routing pointers
-
-- Resume: `docs/ai/session-handoff.md`, then live `git status --short`.
-- Physical GPU/VFIO: `docs/ai/physical-gpu-status.md` before hardware tests.
-- Source ownership: `docs/ai-map.md` only if the router does not name the owner.
-- Build/check/KVM: use the matching small skill first; search
-  `docs/ai/commands.md` only for unresolved invocation detail.
-- Kernel APIs: `docs/ai/kernel-api-map.md`.
-- ABI/service routing: `docs/ai/contracts-abi.md`.
-- SMP: `docs/ai/smp-contract.md`.
-- Performance: `.agents/skills/rustos-performance-optimization/SKILL.md` and the
-  measured benchmark owner.
-
-External research is mandatory for a new subsystem architecture or unfamiliar
-external ABI/specification. Otherwise prefer local evidence. At completion,
-briefly state what changed, validation actually run, and any unverified boundary.
+- Prefer coherent large commits over micro-commits; commit and push when the
+  user authorizes it.
+- Never bypass hooks or signing (`--no-verify`, `--no-gpg-sign`), discard
+  unrelated work, or force-push without explicit authorization.
+- At the end state what was implemented, what remains disconnected, and what
+  was not verified.

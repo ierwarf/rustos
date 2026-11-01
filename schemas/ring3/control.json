@@ -351,6 +351,98 @@
           "required": true
         }
       ]
+    },
+    {
+      "name": "service_checkpoint_record",
+      "opcode": 521,
+      "fields": [
+        {
+          "name": "version",
+          "tag": 1,
+          "type": "u16",
+          "required": true
+        },
+        {
+          "name": "flags",
+          "tag": 2,
+          "type": "u16",
+          "required": true
+        },
+        {
+          "name": "key_hi",
+          "tag": 3,
+          "type": "u64",
+          "required": true
+        },
+        {
+          "name": "key_lo",
+          "tag": 4,
+          "type": "u64",
+          "required": true
+        },
+        {
+          "name": "parent_hi",
+          "tag": 5,
+          "type": "u64",
+          "required": true
+        },
+        {
+          "name": "parent_lo",
+          "tag": 6,
+          "type": "u64",
+          "required": true
+        },
+        {
+          "name": "operation_hi",
+          "tag": 7,
+          "type": "u64",
+          "required": true
+        },
+        {
+          "name": "operation_lo",
+          "tag": 8,
+          "type": "u64",
+          "required": true
+        },
+        {
+          "name": "revision",
+          "tag": 9,
+          "type": "u64",
+          "required": true
+        },
+        {
+          "name": "value",
+          "tag": 10,
+          "type": "bytes",
+          "required": false,
+          "max_len": 64
+        }
+      ]
+    },
+    {
+      "name": "service_lease_report",
+      "opcode": 522,
+      "fields": [
+        {
+          "name": "service",
+          "tag": 1,
+          "type": "u64",
+          "required": true
+        },
+        {
+          "name": "pid",
+          "tag": 2,
+          "type": "u64",
+          "required": true
+        },
+        {
+          "name": "exec_path",
+          "tag": 3,
+          "type": "utf8",
+          "required": true,
+          "max_len": 256
+        }
+      ]
     }
   ]
 }

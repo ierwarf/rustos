@@ -20,18 +20,17 @@ use core::mem::size_of;
 use crate::user::sysops::device::{self, DeviceSysopError};
 use kernel_object::api::device::{DeviceAccessKind, DeviceId};
 use kernel_object::api::handle::{DeviceHandleRights, HandleRights};
-use rustos_user_abi::syscall::{
+use rustos_user_abi::syscall::{ServiceCapability,
     DEVMGRD_DEVICE_ACCESS_EVDEV, DEVMGRD_DEVICE_ACCESS_NATIVE, DEVMGRD_DEVICE_ID_CONSOLE,
     DEVMGRD_DEVICE_ID_DISPLAY, DEVMGRD_DEVICE_ID_INPUT, DEVMGRD_DEVICE_RIGHT_ADMIN,
     DEVMGRD_DEVICE_RIGHT_IOCTL, DEVMGRD_DEVICE_RIGHT_MAP, DEVMGRD_DEVICE_RIGHT_READ,
     DEVMGRD_DEVICE_RIGHT_TRANSFER, DEVMGRD_DEVICE_RIGHT_WRITE, DEVMGRD_IOCTL_ROUTE_SESSIOND_COMMIT,
     DEVMGRD_IPC_ABI_VERSION, DEVMGRD_IPC_OP_IOCTL_ROUTE, DevmgrdDeviceIoctlRequest,
-    DevmgrdDeviceIoctlResponse, IPC_SERVICE_CAP_DEVICE_POLICY, IPC_SERVICE_CAP_SESSION_POLICY,
-    IPC_SERVICE_DEVMGRD, RustosDeviceIoctlBrokerArgs, RustosDeviceOpenBrokerArgs,
+    DevmgrdDeviceIoctlResponse, IPC_SERVICE_DEVMGRD, RustosDeviceIoctlBrokerArgs, RustosDeviceOpenBrokerArgs,
 };
 
 pub(super) fn syscall_linux_rustos_device_open_broker(args_ptr: u64) -> u64 {
-    if !ipc_ops::current_process_has_service_capability(IPC_SERVICE_CAP_DEVICE_POLICY) {
+    if !ipc_ops::current_process_has_service_capability(ServiceCapability::DevicePolicy) {
         return linux_errno(LINUX_EPERM);
     }
 
@@ -102,9 +101,9 @@ pub(super) fn syscall_linux_rustos_device_open_broker(args_ptr: u64) -> u64 {
 
 pub(super) fn syscall_linux_rustos_device_ioctl_broker(args_ptr: u64) -> u64 {
     let has_device_policy =
-        ipc_ops::current_process_has_service_capability(IPC_SERVICE_CAP_DEVICE_POLICY);
+        ipc_ops::current_process_has_service_capability(ServiceCapability::DevicePolicy);
     let has_session_policy =
-        ipc_ops::current_process_has_service_capability(IPC_SERVICE_CAP_SESSION_POLICY);
+        ipc_ops::current_process_has_service_capability(ServiceCapability::SessionPolicy);
     if !has_device_policy && !has_session_policy {
         return linux_errno(LINUX_EPERM);
     }

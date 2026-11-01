@@ -851,14 +851,15 @@ fn report_rootd_service_lease_inner(service_id: u64, exec_path: &str, pid: u64) 
     request.header.op = COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL;
     request.header.subject_pid = u64::from(std::process::id());
     request.header.subject_tid = current_tid();
-    request.arg0 = service_id;
-    request.arg1 = pid;
-    let path = exec_path.as_bytes();
-    if path.len() > request.path.len() || path.contains(&0) {
+    // Canonical generated IDL (schema 522); the scalar arg/path form is
+    // refused by rootd.
+    let report = rustos_component_model::lease_report::encode(service_id, pid, exec_path)
+        .map_err(|_| libc::EINVAL)?;
+    if report.len() > request.payload.len() {
         return Err(libc::EINVAL);
     }
-    request.path_len = path.len() as u32;
-    request.path[..path.len()].copy_from_slice(path);
+    request.payload_len = report.len() as u32;
+    request.payload[..report.len()].copy_from_slice(&report);
     let mut response = CommercialMaxProtocolResponse::default();
     // SAFETY: Request and response are initialized, exact-sized ABI records
     // and remain exclusively live for the duration of the bounded call.

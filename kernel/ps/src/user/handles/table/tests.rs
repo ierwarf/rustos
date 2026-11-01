@@ -691,3 +691,81 @@ fn dynamic_install_never_exceeds_descriptor_ceiling() {
     assert_eq!(rejected, None);
     assert_eq!(table.entries.len(), max_dynamic_entries());
 }
+
+mod kmem_billing {
+    use super::*;
+    use kernel_mm::api::kmem_charge::{self, Class};
+    use super::super::SLOT_BYTES;
+
+    // The charge groups are process-wide statics: every test owns its indices.
+    fn install_n(table: &mut HandleTable, n: usize) -> usize {
+        (0..n)
+            .take_while(|_| table.install(KernelHandle::Job(crate::multitask::ROOT_JOB)).is_some())
+            .count()
+    }
+
+    #[test]
+    fn a_bound_table_bills_growth_and_refunds_exactly_on_drop() {
+        kmem_charge::init_group(58, None);
+        let mut table = HandleTable::new();
+        assert!(table.bind_kmem_group(58));
+        assert_eq!(kmem_charge::usage(Class::HandleTable, 58), 0);
+        assert_eq!(install_n(&mut table, 5), 5);
+        let billed = table.kmem_charged_bytes();
+        assert!(billed >= 2 * SLOT_BYTES && billed % SLOT_BYTES == 0);
+        assert_eq!(kmem_charge::usage(Class::HandleTable, 58), billed);
+        drop(table);
+        assert_eq!(kmem_charge::usage(Class::HandleTable, 58), 0);
+    }
+
+    #[test]
+    fn a_refused_charge_fails_the_install_and_leaves_the_table_unchanged() {
+        kmem_charge::init_group(59, None);
+        kmem_charge::set_limit(Class::HandleTable, 59, 2 * SLOT_BYTES);
+        let mut table = HandleTable::new();
+        assert!(table.bind_kmem_group(59));
+        let installed = install_n(&mut table, 10);
+        assert!(installed < 10, "the budget must stop descriptor growth");
+        assert_eq!(table.kmem_charged_bytes(), kmem_charge::usage(Class::HandleTable, 59));
+        assert!(table.kmem_charged_bytes() <= 2 * SLOT_BYTES);
+        // Closing a descriptor frees a slot for reuse without new billing.
+        let before = table.kmem_charged_bytes();
+        let fd = crate::user::handles::FIRST_DYNAMIC_FD as u64;
+        assert!(table.close(fd).is_some());
+        assert!(table.install(KernelHandle::Job(crate::multitask::ROOT_JOB)).is_some());
+        assert_eq!(table.kmem_charged_bytes(), before);
+        drop(table);
+        assert_eq!(kmem_charge::usage(Class::HandleTable, 59), 0);
+    }
+
+    #[test]
+    fn binding_charges_existing_slots_atomically_or_not_at_all() {
+        kmem_charge::init_group(60, None);
+        let mut table = HandleTable::new();
+        assert_eq!(install_n(&mut table, 6), 6);
+        kmem_charge::set_limit(Class::HandleTable, 60, SLOT_BYTES);
+        assert!(!table.bind_kmem_group(60), "existing slots exceed the budget");
+        assert_eq!(kmem_charge::usage(Class::HandleTable, 60), 0);
+        assert_eq!(table.kmem_charged_bytes(), 0);
+        kmem_charge::set_limit(Class::HandleTable, 60, kernel_mm::api::charge::UNLIMITED);
+        assert!(table.bind_kmem_group(60));
+        assert!(!table.bind_kmem_group(60), "a table binds once");
+        drop(table);
+        assert_eq!(kmem_charge::usage(Class::HandleTable, 60), 0);
+    }
+
+    #[test]
+    fn a_fork_clone_is_unbound_until_its_own_publication() {
+        kmem_charge::init_group(61, None);
+        let mut parent = HandleTable::new();
+        assert!(parent.bind_kmem_group(61));
+        assert_eq!(install_n(&mut parent, 3), 3);
+        let billed = parent.kmem_charged_bytes();
+        let child = parent.clone();
+        assert_eq!(child.kmem_charged_bytes(), 0);
+        drop(child);
+        assert_eq!(kmem_charge::usage(Class::HandleTable, 61), billed, "a clone's drop refunds nothing");
+        drop(parent);
+        assert_eq!(kmem_charge::usage(Class::HandleTable, 61), 0);
+    }
+}

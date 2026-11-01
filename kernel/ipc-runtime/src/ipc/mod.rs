@@ -1499,13 +1499,13 @@ pub fn service_deferred_shared_region_reclaims(max_pages: usize) -> usize {
 }
 
 pub fn create_endpoint() -> Result<KernelEndpointHandle, IpcError> {
-    create_endpoint_with_owner(None)
+    create_endpoint_with_owner(None, None)
 }
 
 pub fn create_endpoint_for_task(
     owner_task_id: Option<u64>,
 ) -> Result<KernelEndpointHandle, IpcError> {
-    create_endpoint_with_owner(owner_task_id.map(EndpointOwner::Task))
+    create_endpoint_with_owner(owner_task_id.map(EndpointOwner::Task), None)
 }
 
 /// User-visible endpoints are process-owned: a service may safely receive and
@@ -1514,11 +1514,23 @@ pub fn create_endpoint_for_task(
 pub fn create_endpoint_for_process(
     owner_process_id: u64,
 ) -> Result<KernelEndpointHandle, IpcError> {
-    create_endpoint_with_owner(Some(EndpointOwner::Process(owner_process_id)))
+    create_endpoint_with_owner(Some(EndpointOwner::Process(owner_process_id)), None)
+}
+
+/// As `create_endpoint_for_process`, additionally billing the endpoint's
+/// reserved queue storage to the owner's Job charge group (lock-free; refunded
+/// when the owner's endpoints are failed at exit). The caller resolves the
+/// group in its own context so this crate takes no process-table lock.
+pub fn create_endpoint_for_process_in_group(
+    owner_process_id: u64,
+    kmem_group: usize,
+) -> Result<KernelEndpointHandle, IpcError> {
+    create_endpoint_with_owner(Some(EndpointOwner::Process(owner_process_id)), Some(kmem_group))
 }
 
 fn create_endpoint_with_owner(
     owner: Option<EndpointOwner>,
+    kmem_group: Option<usize>,
 ) -> Result<KernelEndpointHandle, IpcError> {
     if let Some(owner) = owner {
         ENDPOINT_QUOTAS.lock().reserve(owner)?;
@@ -1546,7 +1558,7 @@ fn create_endpoint_with_owner(
             waiting_receivers,
         ))
     })();
-    let endpoint = match endpoint {
+    let mut endpoint = match endpoint {
         Ok(endpoint) => endpoint,
         Err(error) => {
             if let Some(owner) = owner {
@@ -1555,12 +1567,27 @@ fn create_endpoint_with_owner(
             return Err(error);
         }
     };
+    if let Some(group) = kmem_group {
+        let bytes = endpoint.reserved_queue_bytes();
+        if !kernel_mm::api::kmem_charge::try_charge(
+            kernel_mm::api::kmem_charge::Class::IpcEndpoint,
+            group,
+            bytes,
+        ) {
+            if let Some(owner) = owner {
+                ENDPOINT_QUOTAS.lock().release(owner);
+            }
+            return Err(IpcError::NoMemory);
+        }
+        endpoint.kmem = Some((group, bytes));
+    }
     match ENDPOINTS.insert(endpoint) {
         Ok(handle) => Ok(KernelEndpointHandle::from_raw(handle)),
         Err(endpoint) => {
             if let Some(owner) = endpoint.owner {
                 ENDPOINT_QUOTAS.lock().release(owner);
             }
+            endpoint.refund_kmem();
             Err(IpcError::NoMemory)
         }
     }
@@ -3121,6 +3148,7 @@ fn fail_endpoints_owned_by(owner: EndpointOwner, err: IpcError) -> EndpointWakeS
         ENDPOINTS.take_first_matching(|endpoint| endpoint.owner == Some(owner))
     {
         ENDPOINT_QUOTAS.lock().release(owner);
+        endpoint.refund_kmem();
         for receiver in endpoint.waiting_receivers {
             wake_set.push_receiver(receiver.task_id);
         }

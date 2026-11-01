@@ -1,8 +1,8 @@
 use super::*;
 
 use core::sync::atomic::{AtomicU64, Ordering};
-use rustos_user_abi::syscall::{
-    IPC_SERVICE_CAP_NET_POLICY, NET_BROKER_OP_PACKET_LEASE_GRANT, NET_BROKER_OP_PACKET_LEASE_RESET,
+use rustos_user_abi::syscall::{ServiceCapability,
+    NET_BROKER_OP_PACKET_LEASE_GRANT, NET_BROKER_OP_PACKET_LEASE_RESET,
     NET_BROKER_OP_PACKET_LEASE_REVOKE, NET_BROKER_OP_PACKET_RX, NET_BROKER_OP_PACKET_STATUS,
     NET_BROKER_OP_PACKET_TX, NET_BROKER_OP_PREPARE_SOCKET_PUBLICATION,
     NET_BROKER_OP_UNIX_CONNECT_BIND, NetBrokerPrepareSocketPublication, RustosNetBrokerArgs,
@@ -11,7 +11,7 @@ use rustos_user_abi::syscall::{
 use x86_64::VirtAddr;
 
 pub(super) fn syscall_linux_rustos_net_broker(args_ptr: u64) -> u64 {
-    if !ipc_ops::current_process_has_service_capability(IPC_SERVICE_CAP_NET_POLICY) {
+    if !ipc_ops::current_process_has_service_capability(ServiceCapability::NetPolicy) {
         return linux_errno(LINUX_EPERM);
     }
 

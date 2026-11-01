@@ -359,6 +359,98 @@ pub const PROVIDER_SESSION_ACCOUNTING: Schema<'static> = Schema {
     fields: &PROVIDER_SESSION_ACCOUNTING_FIELDS,
 };
 
+pub const SERVICE_CHECKPOINT_RECORD_FIELDS: [FieldSpec; 10] = [
+    FieldSpec {
+        tag: 1,
+        kind: FieldKind::U16,
+        required: true,
+        max_len: 2,
+    },
+    FieldSpec {
+        tag: 2,
+        kind: FieldKind::U16,
+        required: true,
+        max_len: 2,
+    },
+    FieldSpec {
+        tag: 3,
+        kind: FieldKind::U64,
+        required: true,
+        max_len: 8,
+    },
+    FieldSpec {
+        tag: 4,
+        kind: FieldKind::U64,
+        required: true,
+        max_len: 8,
+    },
+    FieldSpec {
+        tag: 5,
+        kind: FieldKind::U64,
+        required: true,
+        max_len: 8,
+    },
+    FieldSpec {
+        tag: 6,
+        kind: FieldKind::U64,
+        required: true,
+        max_len: 8,
+    },
+    FieldSpec {
+        tag: 7,
+        kind: FieldKind::U64,
+        required: true,
+        max_len: 8,
+    },
+    FieldSpec {
+        tag: 8,
+        kind: FieldKind::U64,
+        required: true,
+        max_len: 8,
+    },
+    FieldSpec {
+        tag: 9,
+        kind: FieldKind::U64,
+        required: true,
+        max_len: 8,
+    },
+    FieldSpec {
+        tag: 10,
+        kind: FieldKind::Bytes,
+        required: false,
+        max_len: 64,
+    },
+];
+pub const SERVICE_CHECKPOINT_RECORD: Schema<'static> = Schema {
+    opcode: 521,
+    fields: &SERVICE_CHECKPOINT_RECORD_FIELDS,
+};
+
+pub const SERVICE_LEASE_REPORT_FIELDS: [FieldSpec; 3] = [
+    FieldSpec {
+        tag: 1,
+        kind: FieldKind::U64,
+        required: true,
+        max_len: 8,
+    },
+    FieldSpec {
+        tag: 2,
+        kind: FieldKind::U64,
+        required: true,
+        max_len: 8,
+    },
+    FieldSpec {
+        tag: 3,
+        kind: FieldKind::Utf8,
+        required: true,
+        max_len: 256,
+    },
+];
+pub const SERVICE_LEASE_REPORT: Schema<'static> = Schema {
+    opcode: 522,
+    fields: &SERVICE_LEASE_REPORT_FIELDS,
+};
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -375,6 +467,8 @@ mod tests {
             POST_INIT_LEASE_RECLAIM,
             CLIENT_JOB_SESSION_ACCOUNTING,
             PROVIDER_SESSION_ACCOUNTING,
+            SERVICE_CHECKPOINT_RECORD,
+            SERVICE_LEASE_REPORT,
         ] {
             assert!(schema.validate().is_ok());
         }

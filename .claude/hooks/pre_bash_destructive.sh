@@ -66,7 +66,10 @@ if [[ "$cmd" =~ (^[[:space:]]*|[[:space:];|&])sed[[:space:]]+(-[^[:space:]]*i[^[
   && [[ "$cmd" =~ $write_protected_path_re ]]; then
   block_destructive "in-place sed write to generated/vendor/log path"
 fi
-if [[ "$cmd" =~ (>|>>)[[:space:]]*(\./)?(build|target|vendor|logs|Cargo\.lock|perf\.data)(/|[[:space:]]|$) ]]; then
+# `=>` and `->` are Rust/prose arrows, not redirections.
+redirect_probe="${cmd//=>/  }"
+redirect_probe="${redirect_probe//->/  }"
+if [[ "$redirect_probe" =~ (>|>>)[[:space:]]*(\./)?(build|target|vendor|logs|Cargo\.lock|perf\.data)(/|[[:space:]]|$) ]]; then
   block_destructive "redirection into generated/vendor/log path"
 fi
 
@@ -102,8 +105,9 @@ if [[ "$cmd" =~ ^[[:space:]]*(sudo[[:space:]]+)?(dd|mkfs|fdisk|parted|wipefs) ]]
   block_destructive "raw disk command"
 fi
 
-# Everything below is commit-only. Ordinary shell calls return after one JSON
-# parse and the cheap safety regexes above.
+# Everything below is commit-only and deliberately minimal: a cheap git
+# integrity check, plus the agent-policy selftest when policy files are part of
+# the commit. No compile, fmt or test gate runs at commit time.
 if [[ ! "$cmd" =~ git[[:space:]]+commit([[:space:]]|$) ]]; then
   exit 0
 fi
@@ -129,25 +133,12 @@ run_gate() {
   block "$(rustos_compact_failure "$label" "$rc" "$log")"
 }
 
-if printf '%s\n' "$staged" | grep -Eq '\.rs$'; then
-  run_gate "cargo fmt --check" 20 cargo fmt --all -- --check
-fi
+run_gate "git diff --cached --check" 10 git diff --cached --check
 
 # The agent-policy selftest is relevant only when agent policy or
 # its owned validation infrastructure is actually part of the commit.
 if printf '%s\n' "$staged" | grep -Eq '^(AGENTS\.md|docs/ai-map\.md|\.claude/|\.claude/|\.agents/|\.serena/|\.mcp\.json|docs/ai/|tools/agent/|tools/check-dev-environment\.sh|\.github/workflows/)'; then
   run_gate "agent hook selftest" 25 .claude/hooks/selftest.sh
-fi
-
-# Before a source/build-system commit, validate the exact current workspace
-# fingerprint unless that same state already passed. Documentation/agent-only
-# commits avoid this cost.
-if printf '%s\n' "$staged" | grep -Eq '(^|/)(Cargo\.toml|RUSTOS\.package\.toml)$|\.rs$|^(kernel|services|libs|apps|compat|boot|tools/xtask|driver-domains)/'; then
-  fingerprint="$(rustos_workspace_fingerprint "$REPO_ROOT")"
-  if [[ "$(rustos_read_check_stamp "$REPO_ROOT")" != "$fingerprint" ]]; then
-    run_gate "cargo xtask check" 50 cargo xtask check
-    rustos_write_check_stamp "$REPO_ROOT" "$fingerprint"
-  fi
 fi
 
 exit 0

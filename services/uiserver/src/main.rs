@@ -1131,8 +1131,7 @@ mod main_loop_tests {
 fn start_supervisor_heartbeat()->Result<(),std::io::Error>{
     // Exact-incarnation slow control. This independent worker does not own
     // service request locks, fd handles or a fast syscall path.
-    thread::Builder::new().name("uiserver-health".into())
-        .spawn(||{
+    sys::spawn_ui_thread(sys::UiThreadRole::Background, "uiserver-health", ||{
             let mut heartbeat=rustos_svc_runtime::heartbeat::Heartbeat::new(
                 rustos_user_abi::syscall::IPC_SERVICE_UISERVER,
             );

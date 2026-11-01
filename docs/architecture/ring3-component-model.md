@@ -183,72 +183,44 @@ inline fallback was removed, so a failed worker does not synchronously block
 the compositor's supervisor control loop. UI bootstrap still owns a separate
 synchronous service-start contract and is not part of this cutover.
 
-### Aggressive integration draft — 2026-10-31
+### Client-funded provider sessions (netd, vfsd)
 
-Kernel Job session charging and memory.high/min soft policy now have source
-implementations and user service paths, but this draft deliberately received
-NO compile, boot or CI validation. Memory.high counts threshold crossings
-without throttling. Memory.min is an OOM-victim exclusion heuristic, not a
-physical page guarantee. The worker-missing synchronous launch fallback was
-removed. See docs/validation/ring3-aggressive-draft-codex.md.
+Rootd ops 25-28 carry provider CHARGE / RELEASE / CANCEL / receipt-ACK as
+canonical generated IDL schema 520 (`provider_session_accounting`, exact
+172-byte frame; the earlier fixed 112-byte frame is rejected). The kernel
+stamps the sender; rootd checks the live lease, the positive service grant and
+the effective JobPolicy, then discovers the client Job by PID. netd charges
+before publishing an AF_INET/AF_UNIX socket or socketpair end and funds queued
+accepts only when they become public; vfsd charges each new open description
+before its OPEN checkpoint and refunds at the final close tombstone. Duplicated
+fds share one charge. A lost reply keeps the exact token; an ambiguous CHARGE
+is fenced with CANCEL; terminal RELEASE/CANCEL receipts stay in a bounded
+`ProviderClient` ACK outbox until rootd confirms, and rootd reclaims settled
+tombstones under pressure while a per-owner nonce watermark keeps every spent
+token unspendable. A restarted rootd drains the kernel token ledger at startup,
+so surviving sessions are unbilled until they close (see the status ledger).
 
-### Production client-Job session control IDL cutover (draft)
+### Generated-IDL control protocols
 
-Runtimed and rootd now use generated schema `CLIENT_JOB_SESSION_ACCOUNTING`
-(opcode 519) for the session charge and refund control path. The versioned
-supervisor envelope keeps op 17/18 as operation selectors, but all former
-scalar `arg0/arg1` payloads must be zero and are rejected. The canonical
-IDL binds token, exact client PID, operation, request phase and job ACK.
-The release ACK may carry a zero JobId when a previously unseen token is
-canceled; the charge ACK must return a real JobId. No production validation
-was run on this change.
+Live generated schemas: 514 heartbeat, 515 update approval, 517/518 post-init
+lease snapshot/reclaim, 519 client-Job session accounting, 520 provider
+session accounting, 521 service-checkpoint records (rootd ops MUTATE,
+COMPACT and SCAN; SCAN replies are length-prefixed IDL frames), 522 post-init
+service lease report (the scalar form is refused). Their former scalar payloads are rejected. All other
+service protocols are still `repr(C)` and migrate per producer/consumer pair.
 
+### Library models with no production caller
 
-## 2026-10-31 integrated 8-stage draft ledger
+`resource_ledger`, `quota`, `pressure*`, `capability_escrow`,
+`supervision`, `rollout_plan`, `reconcile`, `routing`,
+`realm`, `telemetry`, `personality`, `namespace_policy`, `image_custody` and
+`restart_transaction` compile and are
+unit tested but are not imported by any service. A model record is not a Ring0
+capability, a journal trait is not power-loss durability, and policy accounting
+is not a kernel charge.
 
-The current interconnected source-draft status, including new rights-scoped
-kmem Object Box accounting, generated supervisor health/update controls,
-rootd checkpoint process-crash replay, kernel-owned client-session tokens,
-initd rollback-required launch blocking and remaining completion work is at
-[Ring3 eight-stage Codex draft status](../validation/ring3-8stage-draft-status.md).
+## Verified status
 
-This is uncompiled source, not an acceptance claim. Full object-byte charging,
-disk durability, signed-image rollback and final unified descriptor transfer
-remain unfinished.
-
-### 2026-11-01 bulk Ring3 source drafting (unverified)
-
-The component model now contains bounded, fail-closed planning and
-reconciliation state machines for hierarchical allocation classes,
-descriptor transfer custody, canonical provider-session wires, generic
-provider billing, per-personality namespace configuration, image custody,
-durable journal records, service rollout and supervisor reconciliation.
-These are exported from the library but are not automatically adopted by
-production clients. Rootd now runs an additional immutable grant/catalog
-cross-check before endpoint publication; its generic provider ledger has
-not been wired to public IPC. See [Codex mass draft ledger](../validation/ring3-mass-draft-codex.md).
-
-Do not confuse any staging journal trait with actual power-loss durability,
-any descriptor escrow record with a ring0 capability, or policy accounting
-with an exact kernel charge. The kernel/user mechanism boundary above
-remains unchanged. None of the new code was compiled or booted here.
-
-### 2026-11-01 generic provider-billing RPC draft (unverified)
-
-The supervisor now has explicitly reserved operations 25/26 for netd/vfsd
-generic client-funded sessions, with a canonical fixed-length 112-byte
-staging frame, exact live service grants and a rootd-owned token ledger.
-The kernel retains actual Job charges, PID membership and generations.
-The provider service adapters intentionally remain inactive until full
-socket/open-description final-close integration. IDL schema 520 is added
-for future canonical protocol cutover, but live ops still use fixed wire.
-See the validation ledger for pending unknown-ACK/reboot/killed-provider
-and cycle-free bootstrap acceptance tests.
-
-### netd active source call-site draft
-
-The netd socket and accept code paths now invoke the shared
-client-funded slow RPC in the source draft. This is not accepted until the
-exact last-reference paths and all failure/retry outcomes have been
-verified. Vfsd's bootstrap-critical path deliberately remains unmodified
-until its rootd dependency cycle and checkpoint replay can be proven safe.
+The per-stage wired / model-only / not-implemented table, the defects fixed
+and the open risks are in
+[Ring3 eight-stage status](../validation/ring3-8stage-status.md).

@@ -38,15 +38,14 @@ use x86_64::VirtAddr;
 
 use crate::user::handles::KernelHandle;
 use crate::user::memfd::MemfdHandle;
-use rustos_user_abi::syscall::{
+use rustos_user_abi::syscall::{ServiceCapability,
     loader_service_role_allows_operation, RustosProcAbortBrokerArgs, RustosProcActivateBrokerArgs,
     RustosProcAuthorizeExecBrokerArgs, RustosProcCancelExecBrokerArgs, RustosProcCommitBrokerArgs,
     RustosProcExecTargetBrokerArgs, RustosProcForkBrokerArgs, RustosProcMapDataBrokerArgs,
     RustosProcMapFileBatchBrokerArgs, RustosProcMapFileBrokerArgs, RustosProcMapZeroedBrokerArgs,
     RustosProcPrepareBrokerArgs, RustosProcSetLinuxRuntimeBrokerArgs,
     RustosProcSetWindowsRuntimeBrokerArgs, RustosProcSignalQueueBrokerArgs,
-    RustosProcValidateDeferredSpawnBrokerArgs, RustosUserRegisters, IPC_SERVICE_CAP_PROCESS_LOADER,
-    IPC_SERVICE_CAP_PROCESS_POLICY, IPC_SERVICE_CAP_ROOT_SUPERVISOR, IPC_SERVICE_INITD,
+    RustosProcValidateDeferredSpawnBrokerArgs, RustosUserRegisters, IPC_SERVICE_INITD,
     IPC_SERVICE_PROCD, IPC_SERVICE_ROOTD, IPC_SERVICE_SESSIOND, LOADER_SPAWN_ARG_BYTES,
     LOADER_SPAWN_ENV_BYTES, LOADER_SPAWN_FLAG_DEFER_START, LOADER_SPAWN_FLAG_IMMEDIATE_HANDOFF,
     LOADER_SPAWN_MAX_ARG_COUNT, LOADER_SPAWN_MAX_ENV_COUNT, PROC_BROKER_ABI_VERSION,
@@ -959,7 +958,7 @@ pub(super) fn syscall_linux_rustos_proc_activate_broker(args_ptr: u64) -> u64 {
 }
 
 pub(super) fn syscall_linux_rustos_proc_validate_deferred_spawn_broker(args_ptr: u64) -> u64 {
-    if !ipc_ops::current_process_has_service_capability(IPC_SERVICE_CAP_ROOT_SUPERVISOR) {
+    if !ipc_ops::current_process_has_service_capability(ServiceCapability::RootSupervisor) {
         return linux_errno(LINUX_EPERM);
     }
     let args = match usermem::read_current_user_struct::<RustosProcValidateDeferredSpawnBrokerArgs>(
@@ -1463,7 +1462,7 @@ fn cleanup_proc_broker_exec_state_for_siblings(process_id: u64, surviving_thread
 }
 
 fn current_process_can_load() -> bool {
-    ipc_ops::current_process_has_service_capability(IPC_SERVICE_CAP_PROCESS_LOADER)
+    ipc_ops::current_process_has_service_capability(ServiceCapability::ProcessLoader)
 }
 
 /// Revalidate the original loader client at the terminal ring0 commit. This
@@ -1481,7 +1480,7 @@ fn requester_owns_live_spawn_role(requester_pid: u64) -> bool {
 }
 
 fn current_process_can_policy() -> bool {
-    ipc_ops::current_process_has_service_capability(IPC_SERVICE_CAP_PROCESS_POLICY)
+    ipc_ops::current_process_has_service_capability(ServiceCapability::ProcessPolicy)
 }
 
 fn user_registers_to_task_registers(

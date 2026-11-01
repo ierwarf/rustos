@@ -235,6 +235,17 @@ fn publish_inner(
     if !table.admits_process(object.job) {
         return None;
     }
+    // Bill the new process's descriptor slots to its job. The object is still
+    // private, so no state lock is taken, and the charge is lock-free: a
+    // refusal here is a plain publication refusal and charges nothing.
+    if !object
+        .state
+        .get_mut()
+        .handles_mut()
+        .bind_kmem_group(object.job.index() as usize)
+    {
+        return None;
+    }
     let slot = table.lookup_slot_mut(reservation.handle)?;
     if slot.object.is_some()
         || slot.spawn_transaction_id != Some(reservation.transaction_id)

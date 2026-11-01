@@ -85,6 +85,9 @@ fn service_main() {
         return;
     }
     ipc::debug_line("procd: process policy endpoint registered");
+    if let Err(errno) = rustos_svc_runtime::heartbeat::spawn_thread(rustos_user_abi::syscall::IPC_SERVICE_PROCD) {
+        ipc::debug_line(&alloc::format!("procd: heartbeat thread unavailable errno={errno}"));
+    }
     // Rebase this generation's private fan-out queue before serving policy.
     // A replacement procd must not wait for sixteen new requests before it
     // acknowledges evidence accumulated while its predecessor was absent.

@@ -41,7 +41,7 @@ use support::*;
 pub(crate) use syscalld_ops::call_syscalld_raw;
 use syscalld_ops::*;
 
-use rustos_user_abi::syscall::{
+use rustos_user_abi::syscall::{ServiceCapability,
     waitset_interest_shape_valid, CommercialMaxProtocolRequest, CommercialMaxProtocolResponse,
     DevmgrdDeviceIoctlRequest, DevmgrdDeviceIoctlResponse, DevmgrdDeviceOpenRequest,
     DevmgrdDeviceOpenResponse, InputdIpcRequest, InputdIpcResponse, InputdReadResponse,
@@ -56,7 +56,7 @@ use rustos_user_abi::syscall::{
     INPUTD_IPC_ABI_VERSION, INPUTD_IPC_OP_AUTHORIZE_READ, INPUTD_IPC_OP_READ, INPUTD_IPC_OP_STATS,
     INPUTD_READ_FLAG_NONBLOCK, INPUTD_READ_PAYLOAD_CAPACITY, INPUT_STATS_FLAG_PENDING_COALESCED,
     INPUT_STATS_FLAG_PENDING_POINTER_POSITION, IPC_ABI_VERSION,
-    IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY, IPC_SERVICE_DEVMGRD, IPC_SERVICE_INPUTD,
+    IPC_SERVICE_DEVMGRD, IPC_SERVICE_INPUTD,
     IPC_SERVICE_NETD, IPC_SERVICE_PROCD, IPC_SERVICE_SESSIOND, IPC_SERVICE_VFSD,
     IPC_WAIT_SERVICE_ENDPOINT_ABI_VERSION, IPC_WAIT_SERVICE_ENDPOINT_MAX_TIMEOUT_MS,
     LINUX_CPUSET_BYTES, LINUX_RLIMIT_SIZE, LINUX_SIGACTION_SIZE, LINUX_STATX_SIZE, LINUX_STAT_SIZE,

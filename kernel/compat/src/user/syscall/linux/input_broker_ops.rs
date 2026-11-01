@@ -18,9 +18,8 @@
 // current-process user-copy substrate.
 use super::*;
 
-use rustos_user_abi::syscall::{
-    INPUTD_INGEST_MAX_EVENTS, INPUTD_IPC_ABI_VERSION, IPC_SERVICE_CAP_INPUT_POLICY,
-    InputDvmRecordWire, InputIngestBrokerArgs, InputStatsBrokerArgs, InputStatsWire,
+use rustos_user_abi::syscall::{ServiceCapability,
+    INPUTD_INGEST_MAX_EVENTS, INPUTD_IPC_ABI_VERSION, InputDvmRecordWire, InputIngestBrokerArgs, InputStatsBrokerArgs, InputStatsWire,
 };
 
 /// Interrupt delivery is the primary wake path. This bounded watchdog is a
@@ -38,7 +37,7 @@ fn input_broker_abi_is_current(abi_version: u16) -> bool {
 }
 
 pub(super) fn syscall_linux_rustos_input_stats_broker(args_ptr: u64) -> u64 {
-    if !ipc_ops::current_process_has_service_capability(IPC_SERVICE_CAP_INPUT_POLICY) {
+    if !ipc_ops::current_process_has_service_capability(ServiceCapability::InputPolicy) {
         return linux_errno(LINUX_EPERM);
     }
 
@@ -77,7 +76,7 @@ pub(super) fn syscall_linux_rustos_input_stats_broker(args_ptr: u64) -> u64 {
 // RING3-MIGRATION-REFERENCE END: inputd-owned input broker policy.
 
 pub(super) fn syscall_linux_rustos_input_ingest_broker(args_ptr: u64) -> u64 {
-    if !ipc_ops::current_process_has_service_capability(IPC_SERVICE_CAP_INPUT_POLICY) {
+    if !ipc_ops::current_process_has_service_capability(ServiceCapability::InputPolicy) {
         return linux_errno(LINUX_EPERM);
     }
 
@@ -128,7 +127,7 @@ pub(super) fn syscall_linux_rustos_input_ingest_broker(args_ptr: u64) -> u64 {
 /// waiter; this capability-gated task-context turn remains the sole consumer
 /// and therefore cannot move input policy back into ring0.
 pub(super) fn syscall_linux_rustos_input_wait_broker() -> u64 {
-    if !ipc_ops::current_process_has_service_capability(IPC_SERVICE_CAP_INPUT_POLICY) {
+    if !ipc_ops::current_process_has_service_capability(ServiceCapability::InputPolicy) {
         return linux_errno(LINUX_EPERM);
     }
 

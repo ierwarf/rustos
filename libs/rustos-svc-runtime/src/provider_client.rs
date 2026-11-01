@@ -21,9 +21,13 @@ use rustos_user_abi::syscall::{
     IPC_SERVICE_ROOTD,SYS_RUSTOS_IPC_CALL_BOUNDED,
 };
 use crate::{ipc,syscall};
-const EINVAL:i32=22;const EPROTO:i32=71;const EBUSY:i32=16;
-const ENOSPC:i32=28;const EOVERFLOW:i32=75;const ESTALE:i32=116;
+const EINVAL:i32=22;const EPROTO:i32=71;
+
 pub const MAX_LOCAL_SESSIONS:usize=4096;
+/// Terminal receipts awaiting rootd compaction. Losing the oldest one only
+/// leaves a rootd tombstone (reclaimed under pressure); it never un-spends a
+/// token, so overflow evicts instead of blocking a provider.
+pub const MAX_ACK_OUTBOX:usize=MAX_LOCAL_SESSIONS;
 #[derive(Clone,Copy,Debug,Eq,PartialEq)]
 pub enum State{ChargePrepared,ChargeInFlight,Funded,
     ReleasePrepared,ReleaseInFlight,CancelPrepared,CancelInFlight}
@@ -45,12 +49,15 @@ pub struct ProviderClient {
     service:u64, epoch:u64,pid:u64,
     next_request_id:u64,next_nonce:u64,
     sessions:BTreeMap<u64,Session>,
+    // Committed Release/Cancel frames (Phase::Accepted) keyed by token nonce.
+    ack_outbox:BTreeMap<u64,Frame>,
 }
 impl ProviderClient {
     pub fn new(service:u64,pid:u64,epoch:u64)->Result<Self,Error>{
         if service==0||pid==0||epoch==0{return Err(Error::Invalid)}
         Ok(Self{service,epoch,pid,next_request_id:0,
-            next_nonce:0,sessions:BTreeMap::new()})
+            next_nonce:0,sessions:BTreeMap::new(),
+            ack_outbox:BTreeMap::new()})
     }
     pub fn live_count(&self)->usize{self.sessions.len()}
     pub fn epoch(&self)->u64{self.epoch}
@@ -140,6 +147,7 @@ impl ProviderClient {
         if ack.phase!=Phase::Committed||ack.status!=0
             ||ack.kernel_receipt!=0{return Err(Error::WrongAck)}
         self.sessions.remove(&session);
+        self.queue_ack(ack);
         Ok(())
     }
     pub fn receipt(&self,session:u64)->Result<Receipt,Error>{
@@ -180,7 +188,48 @@ impl ProviderClient {
         if ack.phase!=Phase::Committed||ack.status!=0
             ||ack.kernel_receipt!=0{return Err(Error::WrongAck)}
         self.sessions.remove(&session);
+        self.queue_ack(ack);
         Ok(())
+    }
+    fn queue_ack(&mut self,committed:Frame){
+        if self.ack_outbox.len()>=MAX_ACK_OUTBOX{
+            if let Some(oldest)=self.ack_outbox.keys().next().copied(){
+                self.ack_outbox.remove(&oldest);
+            }
+        }
+        let mut frame=committed;
+        frame.phase=Phase::Accepted;
+        self.ack_outbox.insert(frame.token_nonce,frame);
+    }
+    /// Oldest terminal receipt not yet acknowledged to rootd. Retried until
+    /// `ack_done`; a transport error leaves it queued (idempotent at rootd).
+    pub fn next_ack(&self)->Option<Frame>{
+        self.ack_outbox.values().next().copied()
+    }
+    pub fn ack_pending(&self)->usize{self.ack_outbox.len()}
+    /// Retire an outbox entry only for rootd's exact Committed reply.
+    pub fn ack_done(&mut self,sent:Frame,reply:Frame)->Result<(),Error>{
+        let queued=self.ack_outbox.get(&sent.token_nonce).copied()
+            .ok_or(Error::Missing)?;
+        if queued!=sent{return Err(Error::WrongAck)}
+        reply.validate_ack(queued).map_err(|_|Error::WrongAck)?;
+        if reply.phase!=Phase::Committed||reply.status!=0
+            ||reply.kernel_receipt!=0{return Err(Error::WrongAck)}
+        self.ack_outbox.remove(&sent.token_nonce);
+        Ok(())
+    }
+    /// Bounded drain for owners that hold the client by `&mut` (no shared
+    /// lock): at most `limit` attempts, stops at the first transport failure.
+    pub fn flush_acks(&mut self,limit:usize,
+        mut send:impl FnMut(Frame)->Result<Frame,i32>)->usize{
+        let mut done=0;
+        while done<limit{
+            let Some(frame)=self.next_ack() else {break};
+            let Ok(reply)=send(frame) else {break};
+            if self.ack_done(frame,reply).is_err(){break}
+            done+=1;
+        }
+        done
     }
     /// A failed or timed-out RPC never deletes a local token. The caller
     /// can retry exactly the same prepared frame, or fail-stop on shutdown.
@@ -215,20 +264,19 @@ impl ProviderClient {
         }
     }
 }
+/// Send one receipt-ACK outbox frame (Phase::Accepted) and return rootd's
+/// reply. Failure merely leaves the frame queued: the rootd tombstone is
+/// compaction state only and the nonce watermark already fences re-charging.
+pub fn acknowledge_frame(accepted:Frame)->Result<Frame,i32>{
+    if !matches!(accepted.operation,Operation::Cancel|Operation::Release)
+        || accepted.phase!=Phase::Accepted || accepted.status!=0
+        || accepted.kernel_receipt!=0 {return Err(EINVAL)}
+    let ack=call_rootd(accepted)?;
+    if ack.phase!=Phase::Committed || ack.status!=0 {return Err(EPROTO)}
+    Ok(ack)
+}
 /// Stateless transport; must be invoked AFTER releasing all local state
 /// locks. Exact service identity and the client Job are checked by rootd.
-/// Explicit custody ACK. The kernel provider-token watermark remains
-/// after rootd compacts the terminal receipt. Failure to acknowledge merely
-/// retains the bounded rootd tombstone; it does not resurrect a debit.
-pub fn acknowledge_receipt(mut committed:Frame)->Result<(),i32>{
-    if !matches!(committed.operation,Operation::Cancel|Operation::Release)
-        || committed.phase!=Phase::Committed || committed.status!=0
-        || committed.kernel_receipt!=0 {return Err(EINVAL)}
-    committed.phase=Phase::Accepted;
-    let ack=call_rootd(committed)?;
-    if ack.phase!=Phase::Committed || ack.status!=0 {return Err(EPROTO)}
-    Ok(())
-}
 pub fn call_rootd(frame:Frame)->Result<Frame,i32>{
     if !frame.valid(){return Err(EINVAL)}
     let op=match (frame.phase,frame.operation){
@@ -298,6 +346,45 @@ mod tests {
         let released=Frame{phase:Phase::Committed,..release};
         b.released(88,released).unwrap();
         assert_eq!(b.live_count(),0);
+    }
+    #[test]
+    fn lost_receipt_ack_is_retained_and_retried_until_exact_commit(){
+        let mut b=ProviderClient::new(2,88,15).unwrap();
+        let charge=b.begin_charge(11,98).unwrap();
+        b.dispatch_charge(11).unwrap();
+        b.charged(11,Frame{phase:Phase::Committed,client_job:0x200000007,
+            client_job_generation:7,kernel_receipt:3,..charge}).unwrap();
+        let release=b.begin_release(11).unwrap();
+        b.dispatch_release(11).unwrap();
+        b.released(11,Frame{phase:Phase::Committed,..release}).unwrap();
+        assert_eq!(b.live_count(),0);
+        assert_eq!(b.ack_pending(),1);
+        let queued=b.next_ack().unwrap();
+        assert_eq!(queued.phase,Phase::Accepted);
+        // Lost reply: transport error keeps the receipt queued.
+        assert_eq!(b.flush_acks(4,|_|Err(110)),0);
+        assert_eq!(b.ack_pending(),1);
+        // A reply for a different nonce never retires it.
+        let mut wrong=Frame{phase:Phase::Committed,..queued};
+        wrong.token_nonce+=1;
+        assert_eq!(b.flush_acks(4,|_|Ok(wrong)),0);
+        assert_eq!(b.ack_pending(),1);
+        assert_eq!(b.flush_acks(4,|f|Ok(Frame{phase:Phase::Committed,..f})),1);
+        assert_eq!(b.ack_pending(),0);
+    }
+    #[test]
+    fn cancel_receipts_queue_acks_and_overflow_evicts_oldest(){
+        let mut b=ProviderClient::new(3,81,7).unwrap();
+        for i in 0..(MAX_ACK_OUTBOX as u64+3){
+            let s=i+1;
+            b.begin_charge(s,70).unwrap();
+            b.dispatch_charge(s).unwrap();
+            let c=b.begin_cancel(s).unwrap();
+            b.dispatch_cancel(s).unwrap();
+            b.cancelled(s,Frame{phase:Phase::Committed,..c}).unwrap();
+        }
+        assert_eq!(b.ack_pending(),MAX_ACK_OUTBOX);
+        assert_eq!(b.next_ack().unwrap().token_nonce,4);
     }
     #[test]
     fn wrong_job_and_nonce_never_settle(){

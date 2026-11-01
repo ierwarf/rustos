@@ -381,7 +381,7 @@ mod tests {
         assert!(!parent.allows_transfer());
         assert!(HandleRights::Job(rights.union(JobHandleRights::TRANSFER)).allows_transfer());
         assert_eq!(JobHandleRights::from_bits(rights.bits()), Some(rights));
-        assert_eq!(JobHandleRights::from_bits(1 << 10), None);
+        assert_eq!(JobHandleRights::from_bits(1 << 11), None);
         assert_eq!(JobHandleRights::from_bits(u32::MAX), None);
         assert_eq!(JobHandleRights::from_bits(0), Some(JobHandleRights::empty()));
         assert!(JobHandleRights::ALL.contains(JobHandleRights::CREATE_PROCESS));

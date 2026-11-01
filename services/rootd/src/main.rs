@@ -38,7 +38,9 @@ mod job_lease;
 mod policy_cutover;
 mod service_grants;
 mod service_health;
+mod activation_owner;
 mod service_updates;
+mod update_journal;
 mod loader_realm;
 mod loader_transaction;
 mod application_limit_probe;
@@ -90,7 +92,7 @@ use rustos_user_abi::syscall::{
     COMMERCIAL_MAX_ROOTD_OP_UPDATE_STAGE, COMMERCIAL_MAX_ROOTD_OP_UPDATE_ARM,
     COMMERCIAL_MAX_ROOTD_OP_UPDATE_ROLLBACK, COMMERCIAL_MAX_ROOTD_OP_UPDATE_SEAL,
     COMMERCIAL_MAX_ROOTD_OP_UPDATE_INSPECT,
-    IPC_SERVICE_DEVMGRD, IPC_SERVICE_INPUTD, IPC_SERVICE_LINUX_SYSCALLD, IPC_SERVICE_LOADERD,
+    IPC_SERVICE_DEVMGRD, IPC_SERVICE_INITD, IPC_SERVICE_INPUTD, IPC_SERVICE_LINUX_SYSCALLD, IPC_SERVICE_LOADERD,
     IPC_SERVICE_NETD, IPC_SERVICE_PAGERD, IPC_SERVICE_PROCD, IPC_SERVICE_ROOTD,
     IPC_SERVICE_SESSIOND, IPC_SERVICE_STORAGED, IPC_SERVICE_UISERVER, IPC_SERVICE_VFSD,
     LIFECYCLE_DRAIN_BROKER_ABI_VERSION, LIFECYCLE_DRAIN_MAX_EVENTS, LIFECYCLE_EVENT_EXIT,
@@ -256,6 +258,16 @@ pub extern "C" fn __rustos_rootd_start() -> ! {
     let mut leases = BOOTSTRAP_MANIFEST.map(lease);
     let mut post_init_leases = POST_INIT_MANIFEST.map(post_init_lease);
     let mut service_checkpoints = ServiceCheckpointStore::new();
+    // Every release transition is validated and recorded by the update
+    // journal (RAM-backed until a persistent volume exists).
+    match update_journal::UpdateJournal::new(
+        syscall0(SYS_GETPID).max(0) as u64,
+        1,
+        rustos_svc_runtime::syscall::monotonic_nanos(),
+    ) {
+        Some(journal) => service_checkpoints.updates.attach_journal(journal),
+        None => debug_line(b"rootd: update journal unavailable; releases are unjournaled\n"),
+    }
     // Replay every acknowledged checkpoint operation from kernel-resident
     // custody before any restarted provider can scan or mutate its state.
     // Fail closed on partial/corrupt history; this is rootd-process recovery,
@@ -751,11 +763,12 @@ fn drain_lifecycle_events(
                 |provider| jobs::drain_client_sessions(provider)
                     .map(|_|()).map_err(|err|err as i32),
             ).unwrap_or_else(|_| {
-                fail_closed(b"rootd: fatal provider session retirement failed\\n")
+                fail_closed(b"rootd: fatal provider session retirement failed\n")
             });
         }
         service_checkpoints.health.forget_pid(event.pid);
         service_checkpoints.updates.on_exit(event.pid);
+        service_checkpoints.activation.deactivate_pid(event.pid);
         revoke_post_init_dependents(post_init_leases, event.pid);
     }
 }
@@ -1194,6 +1207,24 @@ fn fill_commercial_max_response(
             Ok(())
         }
         COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL => {
+            // The report is canonical IDL 522; the old scalar arg/path form is
+            // a hard error. Decoding yields the one internal request the
+            // lease and update paths already authenticate.
+            if request.arg0 != 0 || request.arg1 != 0 || request.arg2 != 0
+                || request.arg3 != 0 || request.path_len != 0 || request.payload_len == 0
+            {
+                return Err(22);
+            }
+            let report = rustos_component_model::lease_report::decode(
+                &request.payload[..request.payload_len as usize],
+            ).map_err(|_| 22)?;
+            let mut canonical = *request;
+            canonical.payload_len = 0;
+            canonical.arg0 = report.service;
+            canonical.arg1 = report.pid;
+            canonical.path_len = report.exec_path.len() as u32;
+            canonical.path[..report.exec_path.len()].copy_from_slice(report.exec_path.as_bytes());
+            let request = &canonical;
             // Pure update-state preflight MUST precede lease publication.
             // A declined update must not leave an accepted child with an
             // error reply and an ambiguous parent-ownership transaction.
@@ -1201,7 +1232,28 @@ fn fill_commercial_max_response(
             service_checkpoints.updates.may_publish(
                 request.arg0, request.arg1, now_ns,
             )?;
+            // An idempotent replay of the already-published incarnation passes
+            // through; a fresh publication must be admitted by the single
+            // activation owner (parent published, no live twin) BEFORE any
+            // lease state changes.
+            let replay = service_checkpoints.activation.is_active(request.arg0, request.arg1);
+            if !replay {
+                service_checkpoints.activation.check(request.arg0)?;
+            }
             register_post_init_service_lease(leases, post_init_leases, request, sender)?;
+            if !replay {
+                // Job generation is the low half of the kernel JobId; it is
+                // only recorded as witness metadata, never as authority.
+                let job_generation = jobs::process_job(request.arg1)
+                    .map(|job| job as u32)
+                    .unwrap_or(1);
+                service_checkpoints
+                    .activation
+                    .activate(request.arg0, request.arg1, job_generation)
+                    .unwrap_or_else(|_| {
+                        fail_closed(b"rootd: activation owner rejected a checked lease\n")
+                    });
+            }
             service_checkpoints.updates.published(
                 request.arg0, request.arg1, now_ns,
             )?;
@@ -1369,7 +1421,20 @@ fn fill_commercial_max_response(
             authorize_service_slow_grant(
                 leases, post_init_leases, pulse.service, sender,
                 rustos_component_model::policy_ops::SlowBrokerOperation::ReportComponentHealth,
-            )?;
+            ).map_err(|errno| {
+                if pulse.sequence == 1 {
+                    // A service whose heartbeat is never accepted is otherwise
+                    // invisible; name the first refusal once per attempt.
+                    debug_line(
+                        alloc::format!(
+                            "rootd: health pulse refused service={} pid={} errno={}\n",
+                            pulse.service, sender.pid, errno
+                        )
+                        .as_bytes(),
+                    );
+                }
+                errno
+            })?;
             // Prepare the reply first. Even if encoding/heap admission fails,
             // no health counter or expiry deadline has yet been modified.
             let ack = health_wire::encode_accept(pulse).map_err(|_| 12)?;
@@ -1388,6 +1453,17 @@ fn fill_commercial_max_response(
             let deadline = service_checkpoints.health.report(
                 pulse.service, sender.pid, pulse.sequence, now_ns,
             )?;
+            if !duplicate && pulse.sequence == 1 {
+                // One line per service incarnation proves its heartbeat
+                // source really runs; later pulses are deliberately silent.
+                debug_line(
+                    alloc::format!(
+                        "rootd: health first pulse service={} pid={}\n",
+                        pulse.service, sender.pid
+                    )
+                    .as_bytes(),
+                );
+            }
             if !duplicate {
                 // A copyout-lost ACK may repeat an already accepted pulse.
                 // Such a replay must never counterfeit 3 health witnesses
@@ -1464,13 +1540,16 @@ fn fill_commercial_max_response(
                 return Err(22);
             }
             authorize_current_initd(leases, sender)?;
-            let (phase, epoch, previous_pid, candidate_pid) =
-                service_checkpoints.updates.inspect(request.arg0)?;
-            response.value0 = epoch;
-            response.value1 = phase as u64;
-            response.payload_len = 16;
-            response.payload[..8].copy_from_slice(&previous_pid.to_le_bytes());
-            response.payload[8..16].copy_from_slice(&candidate_pid.to_le_bytes());
+            let snapshot = service_checkpoints.updates.inspect(request.arg0)?;
+            response.value0 = snapshot.epoch;
+            response.value1 = snapshot.phase as u64;
+            // previous pid, candidate pid, candidate digest, trial deadline:
+            // exactly what initd needs to name this transaction to SEAL.
+            response.payload_len = 56;
+            response.payload[..8].copy_from_slice(&snapshot.previous_pid.to_le_bytes());
+            response.payload[8..16].copy_from_slice(&snapshot.candidate_pid.to_le_bytes());
+            response.payload[16..48].copy_from_slice(&snapshot.digest);
+            response.payload[48..56].copy_from_slice(&snapshot.deadline_ns.to_le_bytes());
             Ok(())
         }
         COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_MUTATE => {
@@ -1479,21 +1558,18 @@ fn fill_commercial_max_response(
                 rustos_component_model::policy_ops::SlowBrokerOperation::WriteRecoveryCheckpoint,
             )?;
             if request.path_len != 0
-                || request.payload_len as usize != size_of::<ServiceCheckpointRecordWire>()
+                || request.payload_len == 0
+                || request.payload_len as usize > request.payload.len()
                 || request.arg1 != 0
                 || request.arg2 != 0
                 || request.arg3 != 0
             {
                 return Err(22);
             }
-            let record = unsafe {
-                core::ptr::read_unaligned(
-                    request
-                        .payload
-                        .as_ptr()
-                        .cast::<ServiceCheckpointRecordWire>(),
-                )
-            };
+            let record = rustos_svc_runtime::checkpoint_idl::decode(
+                &request.payload[..request.payload_len as usize],
+            )
+            .map_err(|_| 22)?;
             // The supervisor validates the entire DAG mutation first.
             // Kernel-resident journal publication is the durable-within-boot
             // commit point; no in-memory state changes before that.
@@ -1515,21 +1591,18 @@ fn fill_commercial_max_response(
                 rustos_component_model::policy_ops::SlowBrokerOperation::CompactRecoveryCheckpoint,
             )?;
             if request.path_len != 0
-                || request.payload_len as usize != size_of::<ServiceCheckpointRecordWire>()
+                || request.payload_len == 0
+                || request.payload_len as usize > request.payload.len()
                 || request.arg1 != 0
                 || request.arg2 != 0
                 || request.arg3 != 0
             {
                 return Err(22);
             }
-            let proof = unsafe {
-                core::ptr::read_unaligned(
-                    request
-                        .payload
-                        .as_ptr()
-                        .cast::<ServiceCheckpointRecordWire>(),
-                )
-            };
+            let proof = rustos_svc_runtime::checkpoint_idl::decode(
+                &request.payload[..request.payload_len as usize],
+            )
+            .map_err(|_| 22)?;
             service_checkpoints.preflight_compact(request.arg0, proof)?;
             checkpoint_journal::append(
                 request.arg0,
@@ -1554,23 +1627,24 @@ fn fill_commercial_max_response(
             {
                 return Err(22);
             }
-            let wire_size = size_of::<ServiceCheckpointRecordWire>();
-            let max = response.payload.len() / wire_size;
+            // A canonical record is at most ~190 bytes; 16 per page leaves
+            // headroom inside the 4 KiB reply payload.
+            const SCAN_PAGE_RECORDS: usize = 16;
             let cursor = usize::try_from(request.arg1).map_err(|_| 22)?;
-            let (records, next) = service_checkpoints.scan(request.arg0, cursor, max)?;
-            for (index, record) in records.iter().enumerate() {
-                let bytes = unsafe {
-                    core::slice::from_raw_parts(
-                        (record as *const ServiceCheckpointRecordWire).cast::<u8>(),
-                        wire_size,
-                    )
-                };
-                let offset = index * wire_size;
-                response.payload[offset..offset + wire_size].copy_from_slice(bytes);
+            let (records, next) =
+                service_checkpoints.scan(request.arg0, cursor, SCAN_PAGE_RECORDS)?;
+            let mut framed = alloc::vec::Vec::new();
+            for record in records.iter() {
+                rustos_svc_runtime::checkpoint_idl::append_framed(&mut framed, record)
+                    .map_err(|_| 12)?;
             }
+            if framed.len() > response.payload.len() {
+                return Err(75);
+            }
+            response.payload[..framed.len()].copy_from_slice(&framed);
             response.value0 = next as u64;
             response.value1 = records.len() as u64;
-            response.payload_len = (records.len() * wire_size) as u32;
+            response.payload_len = framed.len() as u32;
             Ok(())
         }
         _ => Err(22),

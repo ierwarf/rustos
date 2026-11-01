@@ -48,6 +48,11 @@ impl JobId {
         self.index
     }
 
+    /// The Job's kernel-object charge group (the same index as its page group).
+    pub const fn charge_group(self) -> usize {
+        self.index as usize
+    }
+
     pub const fn from_raw(raw: u64) -> Self {
         Self {
             index: (raw >> 32) as u32,
@@ -402,6 +407,8 @@ impl ProcessTable {
                     // out of a retiring address space; the slot is not reusable
                     // while any are charged to it.
                     && kernel_mm::api::charge::usage(index) == 0
+                    // A reaped process's descriptor table may still be dropping.
+                    && kernel_mm::api::kmem_charge::total_usage(index) == 0
                     && slot.subtree_sessions == 0
             });
             let Some(index) = dead else { return };
@@ -450,6 +457,7 @@ pub fn job_create_child(parent: JobId) -> Result<JobId, JobError> {
     slot.session_limit = LIMIT_UNSET;
     slot.kmem_process_limit_bytes = LIMIT_UNSET;
     kernel_mm::api::charge::init_group(index, Some(parent.index as usize));
+    kernel_mm::api::kmem_charge::init_group(index, Some(parent.index as usize));
     let job = table.job_id_of(index as u32);
     policy::publish_job(&table, job);
     Ok(job)
@@ -625,6 +633,37 @@ pub fn job_kmem_info(id: JobId) -> Result<JobKmemInfo, JobError> {
         usage_process_object_bytes: table.subtree_objects(id.index).saturating_mul(bytes),
         process_object_size: bytes,
     })
+}
+
+/// Limit and usage, in bytes, of one hierarchical kernel-object class. The
+/// counters are lock-free atomics owned by kernel-mm; the job table lock is
+/// held only to prove the JobId is live.
+pub fn job_kmem_class_info(id: JobId, class: kernel_mm::api::kmem_charge::Class)
+    -> Result<(u64, u64), JobError>
+{
+    let table = PROCESS_TABLE.lock();
+    table.job_slot(id).ok_or(JobError::Stale)?;
+    let index = id.index as usize;
+    Ok((
+        kernel_mm::api::kmem_charge::limit(class, index),
+        kernel_mm::api::kmem_charge::usage(class, index),
+    ))
+}
+
+pub fn job_set_kmem_class_limit(
+    id: JobId,
+    class: kernel_mm::api::kmem_charge::Class,
+    bytes: u64,
+) -> Result<(u64, u64), JobError> {
+    let table = PROCESS_TABLE.lock();
+    let slot = table.job_slot(id).ok_or(JobError::Stale)?;
+    if slot.state == JobState::Killing {
+        return Err(JobError::Killing);
+    }
+    // Like memory.max, shrinking below usage only forbids the next charge.
+    let index = id.index as usize;
+    kernel_mm::api::kmem_charge::set_limit(class, index, bytes);
+    Ok((bytes, kernel_mm::api::kmem_charge::usage(class, index)))
 }
 
 pub fn job_set_kmem_process_limit(id: JobId, bytes: u64) -> Result<JobKmemInfo, JobError> {

@@ -98,9 +98,28 @@ pub(super) fn verify_and_stage(
     call_rootd_stage(approval)?;
     Ok(verified)
 }
+/// Verify against the keyring sealed into this loaderd image and stage.
+/// With the shipped empty ring this always fails with `UntrustedKey`.
+pub(super) fn verify_and_stage_sealed(
+    signed:&[u8],candidate:&[u8],previous:&[u8],
+    service:u64,durable_floor:u64,release_epoch:u64,trial_deadline_ns:u64,
+)->Result<Verified,AdmissionError>{
+    let keys=super::trust_anchor::sealed_keys().map_err(AdmissionError::Image)?;
+    let ring=KeyRing::new(&keys).map_err(AdmissionError::Image)?;
+    verify_and_stage(&ring,signed,candidate,previous,service,durable_floor,
+        release_epoch,trial_deadline_ns)
+}
 #[cfg(test)]
 mod tests{
     use super::*;
+    #[test]
+    fn the_sealed_empty_ring_refuses_every_release_before_any_rootd_call(){
+        let envelope=[0u8;rustos_release_verifier::ENVELOPE_BYTES];
+        assert!(matches!(
+            verify_and_stage_sealed(&envelope,&[1],&[1],3,0,1,1),
+            Err(AdmissionError::Image(_))
+        ));
+    }
     #[test]
     fn zero_deadline_and_forged_digest_never_stage(){
         let ring=KeyRing::new(&[]).unwrap();

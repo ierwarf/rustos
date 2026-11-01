@@ -78,6 +78,10 @@ fn service_main() {
         return;
     }
     ipc::debug_line("syscalld: linux syscall endpoint registered");
+    // Independent thread: the receive loop (the IPC fast path) is untouched.
+    if let Err(errno) = rustos_svc_runtime::heartbeat::spawn_thread(rustos_user_abi::syscall::IPC_SERVICE_LINUX_SYSCALLD) {
+        ipc::debug_line(&alloc::format!("syscalld: heartbeat thread unavailable errno={errno}"));
+    }
     drain_lifecycle_events();
     ipc::debug_line("syscalld: lifecycle drain ready");
     serve(endpoint as u64);
@@ -96,6 +100,7 @@ fn serve(endpoint: u64) {
         &mut sender_tid,
     );
     loop {
+        rustos_svc_runtime::heartbeat::ensure_thread(rustos_user_abi::syscall::IPC_SERVICE_LINUX_SYSCALLD);
         if received < 0 {
             // Brief back-off before a fresh receive after an endpoint error.
             errno::sleep_millis(1);

@@ -10,8 +10,8 @@ use super::*;
 
 use crate::multitask as ps_api;
 use rustos_user_abi::pager::{PagerEndpointCapabilityWire, VM_PROT_READ};
-use rustos_user_abi::syscall::{
-    IPC_SERVICE_CAP_PAGER_POLICY, IPC_SERVICE_PAGERD, PAGER_FAULT_RENDEZVOUS_ABI_VERSION,
+use rustos_user_abi::syscall::{ServiceCapability,
+    IPC_SERVICE_PAGERD, PAGER_FAULT_RENDEZVOUS_ABI_VERSION,
     RustosPagerFaultReplyArgs, RustosPagerFaultWaitArgs, SYS_RUSTOS_PAGER_FAULT_REPLY,
     SYS_RUSTOS_PAGER_FAULT_WAIT,
 };
@@ -141,7 +141,7 @@ fn wait_for_dispatch(
 /// a bounded atomic table only after its scheduler wait is armed; exception
 /// ingress can therefore wake or hand off to it without generic IPC state.
 pub(super) fn syscall_linux_rustos_pager_fault_wait(args_ptr: u64) -> u64 {
-    if !ipc_ops::current_process_has_service_capability(IPC_SERVICE_CAP_PAGER_POLICY) {
+    if !ipc_ops::current_process_has_service_capability(ServiceCapability::PagerPolicy) {
         return linux_errno(LINUX_EPERM);
     }
     let args = match usermem::read_current_user_struct::<RustosPagerFaultWaitArgs>(args_ptr) {
@@ -168,7 +168,7 @@ pub(super) fn syscall_linux_rustos_pager_fault_wait(args_ptr: u64) -> u64 {
 /// kernel's opaque-frame primitive, while VMA and access policy have already
 /// been decided by pagerd when it formed this reply.
 pub(super) fn syscall_linux_rustos_pager_fault_reply(args_ptr: u64) -> u64 {
-    if !ipc_ops::current_process_has_service_capability(IPC_SERVICE_CAP_PAGER_POLICY) {
+    if !ipc_ops::current_process_has_service_capability(ServiceCapability::PagerPolicy) {
         return linux_errno(LINUX_EPERM);
     }
     let args = match usermem::read_current_user_struct::<RustosPagerFaultReplyArgs>(args_ptr) {

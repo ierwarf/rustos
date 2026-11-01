@@ -23,6 +23,7 @@
 extern crate alloc;
 
 mod release_attestation;
+mod trust_anchor;
 
 use alloc::borrow::ToOwned;
 use alloc::ffi::CString;
@@ -197,6 +198,9 @@ fn service_main() {
     }
 
     debug_line("loaderd: loader policy endpoint registered");
+    if let Err(errno) = rustos_svc_runtime::heartbeat::spawn_thread(rustos_user_abi::syscall::IPC_SERVICE_LOADERD) {
+        debug_line(&alloc::format!("loaderd: heartbeat thread unavailable errno={errno}"));
+    }
     serve(endpoint as u64);
 }
 
@@ -217,6 +221,7 @@ fn serve(endpoint: u64) {
         &mut handles,
     );
     loop {
+        rustos_svc_runtime::heartbeat::ensure_thread(rustos_user_abi::syscall::IPC_SERVICE_LOADERD);
         if received < 0 {
             if !recv_error_reported {
                 debug_line("loaderd: recv failed");

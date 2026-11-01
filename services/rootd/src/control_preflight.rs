@@ -22,6 +22,15 @@ pub(super) fn preflight()->Result<(),()> {
             return Err(())
         }
     }
+    // Every role mask must name only assigned capabilities and hold exactly
+    // one: the kernel refuses a lease whose mask has an unassigned bit, so a
+    // malformed table must stop rootd here and not at first registration.
+    for role in super::service_manifest::SERVICE_ROLE_MANIFEST {
+        match rustos_user_abi::syscall::ServiceCapabilitySet::from_wire(role.capability) {
+            Some(set) if role.capability.count_ones() == 1 && !set.is_empty() => {}
+            _ => return Err(()),
+        }
+    }
     // Explicitly restrict high-risk operations to their natural holders.
     let exclusive:&[(Op,&[u64])]=&[
         (Op::ChargeClientSession,&[2,3,11]),

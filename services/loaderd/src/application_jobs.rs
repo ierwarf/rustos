@@ -128,6 +128,29 @@ impl Jobs for NativeJobs {
             if status < 0 {
                 return Err((-status) as i32);
             }
+            // Descriptor-table slots and endpoint queues are their own
+            // hierarchical byte classes; each is refunded as its owner dies.
+            for (class_id, budget) in [
+                (JOB_KMEM_CLASS_HANDLE_TABLE, APPLICATION_HANDLE_TABLE_BUDGET_BYTES),
+                (JOB_KMEM_CLASS_IPC_ENDPOINT, APPLICATION_IPC_ENDPOINT_BUDGET_BYTES),
+            ] {
+                let mut class = RustosJobKmemArgs {
+                    abi_version: JOB_KMEM_ABI_VERSION,
+                    op: JOB_KMEM_OP_SET_CLASS_LIMIT,
+                    flags: class_id,
+                    job_handle: args.job_handle,
+                    process_object_max_bytes: budget,
+                    ..RustosJobKmemArgs::default()
+                };
+                let status = unsafe {
+                    rustos_svc_runtime::syscall::syscall1(
+                        SYS_RUSTOS_JOB_KMEM, &mut class as *mut _ as u64,
+                    )
+                };
+                if status < 0 {
+                    return Err((-status) as i32);
+                }
+            }
         }
         Ok(args)
     }
@@ -136,6 +159,11 @@ impl Jobs for NativeJobs {
         let _ = unsafe { rustos_svc_runtime::syscall::syscall1(3, handle) };
     }
 }
+
+/// Per-application-Job ceiling for descriptor-table slots.
+const APPLICATION_HANDLE_TABLE_BUDGET_BYTES: u64 = 8 * 1024 * 1024;
+/// Per-application-Job ceiling for reserved IPC endpoint queue storage.
+const APPLICATION_IPC_ENDPOINT_BUDGET_BYTES: u64 = 4 * 1024 * 1024;
 
 #[derive(Clone, Copy)]
 struct Authority {

@@ -3,9 +3,8 @@
 // per-consumer exit-event fan-out and collection substrate.
 use super::*;
 
-use rustos_user_abi::syscall::{
-    IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY, IPC_SERVICE_CAP_PROCESS_POLICY,
-    IPC_SERVICE_CAP_ROOT_SUPERVISOR, LIFECYCLE_DRAIN_BROKER_ABI_VERSION, LifecycleDrainBrokerArgs,
+use rustos_user_abi::syscall::{ServiceCapability,
+    LIFECYCLE_DRAIN_BROKER_ABI_VERSION, LifecycleDrainBrokerArgs,
     ROOTD_MEMORY_BROKER_ABI_VERSION, ROOTD_MEMORY_CENSUS_MAX_ENTRIES,
     ROOTD_TERMINATE_BROKER_ABI_VERSION, RootdMemoryCensusEntry, RustosRootdMemoryBrokerArgs,
     RustosRootdTerminateBrokerArgs,
@@ -122,11 +121,11 @@ fn lifecycle_drain_args_are_valid(args: &LifecycleDrainBrokerArgs) -> bool {
 
 pub(super) fn syscall_linux_rustos_lifecycle_drain_broker(args_ptr: u64) -> u64 {
     let is_process_policy =
-        ipc_ops::current_process_has_service_capability(IPC_SERVICE_CAP_PROCESS_POLICY);
+        ipc_ops::current_process_has_service_capability(ServiceCapability::ProcessPolicy);
     let is_root_supervisor =
-        ipc_ops::current_process_has_service_capability(IPC_SERVICE_CAP_ROOT_SUPERVISOR);
+        ipc_ops::current_process_has_service_capability(ServiceCapability::RootSupervisor);
     let is_linux_syscall_policy =
-        ipc_ops::current_process_has_service_capability(IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY);
+        ipc_ops::current_process_has_service_capability(ServiceCapability::LinuxSyscallPolicy);
     if !is_process_policy && !is_root_supervisor && !is_linux_syscall_policy {
         return linux_errno(LINUX_EPERM);
     }
@@ -155,7 +154,7 @@ pub(super) fn syscall_linux_rustos_lifecycle_drain_broker(args_ptr: u64) -> u64 
 /// process: those remain rootd policy. Keeping this timer primitive here
 /// avoids depending on syscalld while syscalld itself is being recovered.
 pub(super) fn syscall_linux_rustos_rootd_wait_broker(millis: u64) -> u64 {
-    if !ipc_ops::current_process_has_service_capability(IPC_SERVICE_CAP_ROOT_SUPERVISOR) {
+    if !ipc_ops::current_process_has_service_capability(ServiceCapability::RootSupervisor) {
         return linux_errno(LINUX_EPERM);
     }
     if !rootd_wait_delay_is_valid(millis) {
@@ -169,7 +168,7 @@ pub(super) fn syscall_linux_rustos_rootd_wait_broker(millis: u64) -> u64 {
 /// lease is stale; this substrate only verifies root-supervisor authority and
 /// performs the complete process teardown in one non-yielding syscall turn.
 pub(super) fn syscall_linux_rustos_rootd_terminate_broker(args_ptr: u64) -> u64 {
-    if !ipc_ops::current_process_has_service_capability(IPC_SERVICE_CAP_ROOT_SUPERVISOR) {
+    if !ipc_ops::current_process_has_service_capability(ServiceCapability::RootSupervisor) {
         return linux_errno(LINUX_EPERM);
     }
     let args = match usermem::read_current_user_struct::<RustosRootdTerminateBrokerArgs>(args_ptr) {
@@ -292,7 +291,7 @@ fn build_memory_reply(
 /// supervisor. Ring0 only measures: which process, if any, to terminate is
 /// rootd policy, enacted through `SYS_RUSTOS_ROOTD_TERMINATE_BROKER`.
 pub(super) fn syscall_linux_rustos_rootd_memory_broker(args_ptr: u64) -> u64 {
-    if !ipc_ops::current_process_has_service_capability(IPC_SERVICE_CAP_ROOT_SUPERVISOR) {
+    if !ipc_ops::current_process_has_service_capability(ServiceCapability::RootSupervisor) {
         return linux_errno(LINUX_EPERM);
     }
     if let Err(errno) = memory_census_fault_gate(

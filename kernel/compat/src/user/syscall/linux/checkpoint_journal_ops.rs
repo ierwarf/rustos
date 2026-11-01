@@ -7,13 +7,12 @@
 use super::*;
 use core::mem::size_of;
 use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
-use rustos_user_abi::syscall::{
+use rustos_user_abi::syscall::{ServiceCapability,
     RustosCheckpointJournalArgs, ServiceCheckpointRecordWire,
     CHECKPOINT_JOURNAL_ABI_VERSION, CHECKPOINT_JOURNAL_OP_APPEND,
     CHECKPOINT_JOURNAL_OP_READ, CHECKPOINT_JOURNAL_RECORD_COMPACT,
     CHECKPOINT_JOURNAL_RECORD_MUTATE, SERVICE_CHECKPOINT_ABI_VERSION,
-    IPC_SERVICE_CAP_ROOT_SUPERVISOR,
-};
+    };
 
 const MAX_JOURNAL_ENTRIES: usize = 8_192;
 const ENOSPC: i64 = 28;
@@ -109,7 +108,7 @@ fn valid_request(args: &RustosCheckpointJournalArgs) -> bool {
 }
 
 pub(super) fn syscall_linux_rustos_checkpoint_journal(ptr: u64) -> u64 {
-    if !ipc_ops::current_process_has_service_capability(IPC_SERVICE_CAP_ROOT_SUPERVISOR) {
+    if !ipc_ops::current_process_has_service_capability(ServiceCapability::RootSupervisor) {
         return linux_errno(LINUX_EPERM);
     }
     let mut args = match usermem::read_current_user_struct::<RustosCheckpointJournalArgs>(ptr) {
@@ -169,9 +168,21 @@ pub(super) fn syscall_linux_rustos_checkpoint_journal(ptr: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    extern crate std;
 
     #[test]
     fn journal_append_replay_and_conflicting_duplicate() {
+        // The production journal is a static; by value it is several MiB, far
+        // above a default test thread's stack, so build and use it on a big one.
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(journal_append_replay_and_conflicting_duplicate_body)
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    fn journal_append_replay_and_conflicting_duplicate_body() {
         let mut log = Journal::new();
         let mut record = ServiceCheckpointRecordWire::default();
         record.key_hi = 1;

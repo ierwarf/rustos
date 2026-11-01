@@ -11,7 +11,7 @@ a selected opt-in image; check these before executing or editing.
 1. Read `git status --short`, `git log -1`, the active goal and selected
    image/config. Preserve uncommitted work. Never infer a clean tree from
    this committed snapshot.
-2. Find the smallest source/owner contract via [task router](task-router.md).
+2. Find the owner contracts and dependent code via [task router](task-router.md).
    `AGENTS.md` is the stable instruction prefix, not this file.
 3. Re-run focused native/model/contract checks for the exact modified
    slice. An old signed-image seal or benchmark cannot validate changed bytes.
@@ -19,20 +19,24 @@ a selected opt-in image; check these before executing or editing.
    profile before bounded KVM evidence. Do not report a source/model pass
    as live crash, hardware or performance verification.
 
-## Implementation snapshot, not acceptance
+## Implementation snapshot
 
-- [Job model](../architecture/job-model.md): phase 1, 2a, counted
-  process/thread and resident user-page limits (2b), application Job
-  placement and JobPolicy v1 ceilings are in source. Kernel-memory
-  charging, `memory.high/min` and full legacy authority migration remain open.
-- [Ring3 roadmap](../architecture/ring3-process-model.md): IDL/runtime,
-  component supervision, client-funded sessions, personality servers and
-  operability are later stages. Partial 3a policy support is not a completed
-  capability cutover.
+- Ring3 eight-stage migration: the per-stage wired / model-only / missing table,
+  fixed defects and open risks are in
+  [Ring3 eight-stage status](../validation/ring3-8stage-status.md); the provider
+  billing acceptance matrix and witness map are in
+  [provider custody acceptance](../validation/ring3-provider-custody-acceptance.md).
+- [Job model](../architecture/job-model.md): process/thread/page limits, one
+  kmem class (ProcessObject bytes), client-funded sessions (runtimed, netd,
+  vfsd) and JobPolicy ceilings are in source. Total kmem charging and full
+  legacy authority migration remain open.
 - [TLB redesign](../architecture/tlb-shootdown-design.md) is separate.
   Existing exact-ACK/reclaim safety must be preserved.
 - [Commercial gates](commercial-quality-gates.md) and
   `formal/COVERAGE.md` determine what runtime/hardware evidence is missing.
+- A formal seal covers the whole tree (including docs): any edit unseals it, and
+  multi-vCPU `kvm-smoke` re-runs `verify-all.sh --profile pr` first. A 1-vCPU
+  smoke (`--rustos-vcpus 1`) does not need the seal.
 
 ## Preserved dated evidence
 
@@ -41,6 +45,3 @@ experiments, successful and failed boots, WIP policy3a checks and evidence
 paths. They describe their original source/image trees, **not** a future
 checkout or this docs-only change. Historical 40/40 boots and opt-in quota
 attempts are not new results or a blanket stability claim.
-
-No compilation, KVM execution, benchmark or formal re-verification is
-claimed by this Markdown-only update.

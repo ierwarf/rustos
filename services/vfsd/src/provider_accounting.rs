@@ -14,6 +14,7 @@ const EPROTO:i32=71;
 const EBUSY:i32=16;
 const EAGAIN:i32=11;
 const MAX_RETRIES:usize=3;
+const ACK_BATCH:usize=4;
 
 fn errno(error:Error)->i32{
     match error {
@@ -46,6 +47,7 @@ impl OpenDescriptionBilling {
     fn ensure_open(&mut self,remote_id:u64,client_pid:u64)
         ->Result<Receipt,i32>{
         if remote_id==0 || client_pid==0 {return Err(22)}
+        self.flush_acks();
         match self.ledger.begin_charge(remote_id,client_pid) {
             Ok(_) => {},
             Err(Error::Existing)=>{
@@ -64,6 +66,12 @@ impl OpenDescriptionBilling {
         let ack=control_retry(request)?;
         self.ledger.charged(remote_id,ack).map_err(errno)
     }
+    /// Bounded, single-attempt drain of terminal receipt ACKs; there is no
+    /// background worker in this freestanding service, so every billing
+    /// operation retries what an earlier lost reply left queued.
+    fn flush_acks(&mut self){
+        self.ledger.flush_acks(ACK_BATCH,rustos_svc_runtime::provider_client::acknowledge_frame);
+    }
     fn ensure_cancel(&mut self,remote_id:u64)->Result<(),i32>{
         let phase=match self.ledger.pending(remote_id){
             Ok((phase,_))=>phase,
@@ -77,7 +85,7 @@ impl OpenDescriptionBilling {
         let request=self.ledger.dispatch_cancel(remote_id).map_err(errno)?;
         let ack=control_retry(request)?;
         self.ledger.cancelled(remote_id,ack).map_err(errno)?;
-        let _=rustos_svc_runtime::provider_client::acknowledge_receipt(ack);
+        self.flush_acks();
         Ok(())
     }
     fn ensure_release(&mut self,remote_id:u64)->Result<(),i32>{
@@ -97,7 +105,7 @@ impl OpenDescriptionBilling {
         let request=self.ledger.dispatch_release(remote_id).map_err(errno)?;
         let ack=control_retry(request)?;
         self.ledger.released(remote_id,ack).map_err(errno)?;
-        let _=rustos_svc_runtime::provider_client::acknowledge_receipt(ack);
+        self.flush_acks();
         Ok(())
     }
     fn owns_funded(&self,remote_id:u64,client_pid:u64)->bool{

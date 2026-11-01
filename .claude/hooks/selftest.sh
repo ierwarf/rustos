@@ -51,6 +51,12 @@ expect_deny "cp into build is denied" .claude/hooks/pre_bash_destructive.sh \
   "$(jq -n --arg cmd 'cp a.img build/a.img' '{tool_input:{cmd:$cmd}}')"
 expect_deny "tee into logs after a pipe is denied" .claude/hooks/pre_bash_destructive.sh \
   "$(jq -n --arg cmd 'cargo test | tee logs/test.log' '{tool_input:{cmd:$cmd}}')"
+expect_deny "redirection into build is still denied" .claude/hooks/pre_bash_destructive.sh \
+  "$(jq -n --arg cmd 'echo x > build/a.log' '{tool_input:{cmd:$cmd}}')"
+expect_quiet_allow "a Rust match arrow before a protected word is not a redirection" .claude/hooks/pre_bash_destructive.sh \
+  "$(jq -n --arg cmd 'echo "IPC_SERVICE_INPUTD => target == NETD"' '{tool_input:{cmd:$cmd}}')"
+expect_deny "git push --force is still denied" .claude/hooks/pre_bash_destructive.sh \
+  "$(jq -n --arg cmd 'git push --force origin master' '{tool_input:{cmd:$cmd}}')"
 expect_quiet_allow "read-only search is allowed" .claude/hooks/pre_bash_destructive.sh \
   "$(jq -n --arg cmd 'rg -n "rm -rf" .claude/hooks' '{tool_input:{cmd:$cmd}}')"
 expect_quiet_allow "large AI document cat is allowed" .claude/hooks/pre_bash_destructive.sh \

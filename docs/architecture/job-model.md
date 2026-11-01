@@ -936,7 +936,7 @@ slow session creation/teardown issues these syscalls. This does *not* yet
 implement arbitrary cross-service client sessions or kernel-memory byte
 accounting. Rootd's in-memory ledger is not a durable transactional journal.
 
-### Memory.high/min and client-billed console integration (unvalidated draft)
+### Memory.high/min and client-billed sessions
 
 The Job memory QoS slow syscall has per-Job high and min page controls.
 Kernel-mm records a threshold-crossing event without interfering with the
@@ -945,19 +945,23 @@ non-root Job minima from OOM victims. Loaderd configures memory.high to 80%
 of each application Job hard page limit and uses no implicit app minimum.
 A separate Job session syscall enforces hierarchical client-funded counts.
 Rootd owns replay and timeout cancellation; runtimed charges suspended
-clients before activation, and provider exit reclaims the corresponding
-kernel bill. Missing: kernel-object bytes, durable rootd crash recovery,
-other provider session types, and pressure-policy acceptance.
+clients before activation, netd charges sockets and vfsd open descriptions,
+and provider exit reclaims the corresponding kernel bill. Missing: kernel-object
+bytes, durable rootd crash recovery (a restarted rootd drains the kernel token
+ledger, so surviving sessions go unbilled until closed), and pressure-policy
+acceptance.
 
 
-### Actual ProcessObject kernel-byte quota (unvalidated source)
+### Actual ProcessObject kernel-byte quota
 
 The kernel now counts live and unreaped boxed ProcessObject allocations
 using the target kernel's exact size_of ProcessObject. Each ancestor Job's
 process-object kmem budget is checked under the publication lock, and loaderd
 sets a finite application limit through SYS_RUSTOS_JOB_KMEM after querying the
-object size. This only covers the ProcessObject Box; other kernel objects,
-page tables, handles and IPC allocations are still uncharged. Full
+object size. This covers the ProcessObject Box and, as a second class, descriptor-table
+slots (lock-free `kmem_charge` groups bound at process publication, refunded in
+`HandleTable::drop`; ops 3/4 of `SYS_RUSTOS_JOB_KMEM`). Page tables, VMA nodes
+and IPC allocations are still uncharged. Full
 kmem.max_bytes is therefore **not** finished. The signed service upgrade
 and recovery state are likewise only partially wired. See
-[8-stage source ledger](../validation/ring3-8stage-draft-status.md).
+[8-stage source ledger](../validation/ring3-8stage-status.md).

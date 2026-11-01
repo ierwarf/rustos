@@ -18,14 +18,17 @@ pub(super) fn report_rootd_service_lease(
     request.header.op = COMMERCIAL_MAX_ROOTD_OP_READINESS_SIGNAL;
     request.header.subject_pid = u64::from(std::process::id());
     request.header.subject_tid = current_tid();
-    request.arg0 = service_id;
-    request.arg1 = u64::try_from(pid).map_err(|_| libc::EINVAL)?;
-    let path = exec_path.as_bytes();
-    if path.is_empty() || path.len() > request.path.len() || path.contains(&0) {
+    let report = rustos_component_model::lease_report::encode(
+        service_id,
+        u64::try_from(pid).map_err(|_| libc::EINVAL)?,
+        exec_path,
+    )
+    .map_err(|_| libc::EINVAL)?;
+    if report.len() > request.payload.len() {
         return Err(libc::EINVAL);
     }
-    request.path_len = path.len() as u32;
-    request.path[..path.len()].copy_from_slice(path);
+    request.payload_len = report.len() as u32;
+    request.payload[..report.len()].copy_from_slice(&report);
 
     let mut response = CommercialMaxProtocolResponse::default();
     // SAFETY: Both records are fixed-size, live, and correctly mutable for the

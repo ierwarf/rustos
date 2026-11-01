@@ -464,11 +464,23 @@ pub(super) fn syscall_linux_rustos_job_kmem(ptr: u64) -> u64 {
         Ok(args) => args,
         Err(error) => return linux_errno(address_space_error_to_linux_errno(error)),
     };
+    let class_op = matches!(args.op, JOB_KMEM_OP_INSPECT_CLASS | JOB_KMEM_OP_SET_CLASS_LIMIT);
+    let flags_ok = if class_op {
+        matches!(args.flags, JOB_KMEM_CLASS_HANDLE_TABLE | JOB_KMEM_CLASS_IPC_ENDPOINT)
+    } else {
+        args.flags == 0
+    };
     if args.abi_version != JOB_KMEM_ABI_VERSION
-        || args.job_handle == 0 || args.flags != 0 || args.reserved != 0
+        || args.job_handle == 0 || !flags_ok || args.reserved != 0
         || args.usage_process_object_bytes != 0 || args.object_size_bytes != 0
-        || args.job != 0 || !matches!(args.op, JOB_KMEM_OP_INSPECT | JOB_KMEM_OP_SET_LIMIT)
-        || (args.op == JOB_KMEM_OP_INSPECT && args.process_object_max_bytes != 0)
+        || args.job != 0
+        || !matches!(
+            args.op,
+            JOB_KMEM_OP_INSPECT | JOB_KMEM_OP_SET_LIMIT
+                | JOB_KMEM_OP_INSPECT_CLASS | JOB_KMEM_OP_SET_CLASS_LIMIT
+        )
+        || (matches!(args.op, JOB_KMEM_OP_INSPECT | JOB_KMEM_OP_INSPECT_CLASS)
+            && args.process_object_max_bytes != 0)
     {
         return linux_errno(LINUX_EINVAL);
     }
@@ -480,7 +492,7 @@ pub(super) fn syscall_linux_rustos_job_kmem(ptr: u64) -> u64 {
     let Some(caller) = multitask::current_user_process_id() else {
         return linux_errno(LINUX_ESRCH);
     };
-    let right = if args.op == JOB_KMEM_OP_INSPECT {
+    let right = if matches!(args.op, JOB_KMEM_OP_INSPECT | JOB_KMEM_OP_INSPECT_CLASS) {
         JobHandleRights::INSPECT
     } else {
         JobHandleRights::SET_LIMITS
@@ -494,6 +506,30 @@ pub(super) fn syscall_linux_rustos_job_kmem(ptr: u64) -> u64 {
         Some(Err(error)) => return linux_errno(error),
         None => return linux_errno(LINUX_ESRCH),
     };
+    if class_op {
+        // `flags` was validated against the known class ids above.
+        let class = if args.flags == JOB_KMEM_CLASS_IPC_ENDPOINT {
+            kernel_mm::api::kmem_charge::Class::IpcEndpoint
+        } else {
+            kernel_mm::api::kmem_charge::Class::HandleTable
+        };
+        let result = if args.op == JOB_KMEM_OP_INSPECT_CLASS {
+            multitask::job_kmem_class_info(job, class)
+        } else {
+            multitask::job_set_kmem_class_limit(job, class, args.process_object_max_bytes)
+        };
+        let (limit, usage) = match result {
+            Ok(value) => value,
+            Err(error) => return linux_errno(job_error_errno(error)),
+        };
+        args.job = job.to_raw();
+        args.process_object_max_bytes = limit;
+        args.usage_process_object_bytes = usage;
+        return match usermem::write_current_user_struct(ptr, &args) {
+            Ok(()) => 0,
+            Err(error) => linux_errno(address_space_error_to_linux_errno(error)),
+        };
+    }
     let result = if args.op == JOB_KMEM_OP_INSPECT {
         multitask::job_kmem_info(job)
     } else {
@@ -731,7 +767,7 @@ mod tests {
         let rights = JobHandleRights::INSPECT.union(JobHandleRights::DUPLICATE);
         assert_eq!(attenuated_job_rights(rights, JobHandleRights::INSPECT.bits()), Ok(JobHandleRights::INSPECT));
         assert_eq!(attenuated_job_rights(rights, JobHandleRights::KILL.bits()), Err(LINUX_EPERM));
-        assert_eq!(attenuated_job_rights(rights, 1 << 10), Err(LINUX_EINVAL));
+        assert_eq!(attenuated_job_rights(rights, 1 << 11), Err(LINUX_EINVAL));
     }
 
     #[test]

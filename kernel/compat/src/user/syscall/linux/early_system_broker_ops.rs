@@ -5,13 +5,12 @@ use super::*;
 
 use alloc::vec::Vec;
 use kernel_io_manager::api::block as block_api;
-use rustos_user_abi::syscall::{
+use rustos_user_abi::syscall::{ServiceCapability,
     EARLY_SYSTEM_BROKER_ABI_VERSION, EARLY_SYSTEM_BROKER_MAX_IO_BYTES, EARLY_SYSTEM_BROKER_OP_INFO,
-    EARLY_SYSTEM_BROKER_OP_READ, EarlySystemBrokerArgs, IPC_SERVICE_CAP_VFS_POLICY,
-};
+    EARLY_SYSTEM_BROKER_OP_READ, EarlySystemBrokerArgs, };
 
 pub(super) fn syscall_linux_rustos_early_system_broker(args_ptr: u64) -> u64 {
-    if !ipc_ops::current_process_has_service_capability(IPC_SERVICE_CAP_VFS_POLICY) {
+    if !ipc_ops::current_process_has_service_capability(ServiceCapability::VfsPolicy) {
         return linux_errno(LINUX_EPERM);
     }
     let args = match usermem::read_current_user_struct::<EarlySystemBrokerArgs>(args_ptr) {

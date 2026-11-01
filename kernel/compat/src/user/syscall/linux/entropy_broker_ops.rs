@@ -3,10 +3,8 @@
 // boot-seeded CSPRNG and bounded user-copy substrate.
 use super::*;
 
-use rustos_user_abi::syscall::{
-    IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY, IPC_SERVICE_CAP_NET_POLICY,
-    IPC_SERVICE_CAP_PROCESS_LOADER,
-};
+use rustos_user_abi::syscall::{ServiceCapability,
+    };
 
 const ENTROPY_BROKER_MAX_BYTES: usize = SYSCALL_OFFLOAD_PAYLOAD_CAPACITY;
 
@@ -23,9 +21,9 @@ fn validate_entropy_request(out_ptr: u64, len: u64) -> Result<usize, i64> {
 
 pub(super) fn syscall_linux_rustos_entropy_broker(out_ptr: u64, len: u64) -> u64 {
     let authorized =
-        ipc_ops::current_process_has_service_capability(IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY)
-            || ipc_ops::current_process_has_service_capability(IPC_SERVICE_CAP_NET_POLICY)
-            || ipc_ops::current_process_has_service_capability(IPC_SERVICE_CAP_PROCESS_LOADER);
+        ipc_ops::current_process_has_service_capability(ServiceCapability::LinuxSyscallPolicy)
+            || ipc_ops::current_process_has_service_capability(ServiceCapability::NetPolicy)
+            || ipc_ops::current_process_has_service_capability(ServiceCapability::ProcessLoader);
     if !authorized {
         return linux_errno(LINUX_EPERM);
     }

@@ -158,11 +158,24 @@ impl Drop for TransferredHandleEntry {
     }
 }
 
+/// Bytes charged to the owning Job for one dynamic descriptor slot.
+const SLOT_BYTES: u64 = core::mem::size_of::<Option<HandleEntry>>() as u64;
+
+/// The Job charge group a table's dynamic slots are billed to, and the bytes
+/// billed so far. A table is bound once, when its process is published into a
+/// job, and refunds exactly `charged` when it is dropped.
+#[derive(Clone, Copy)]
+struct KmemBinding {
+    group: usize,
+    charged: u64,
+}
+
 pub struct HandleTable {
     standard: [Option<HandleEntry>; FIRST_DYNAMIC_FD as usize],
     entries: Vec<Option<HandleEntry>>,
     reserved: BTreeMap<u64, u64>,
     next_reservation_id: u64,
+    kmem: Option<KmemBinding>,
 }
 
 impl Clone for HandleTable {
@@ -174,6 +187,8 @@ impl Clone for HandleTable {
             // process only. Forked children must not inherit invisible slots.
             reserved: BTreeMap::new(),
             next_reservation_id: self.next_reservation_id,
+            // A fork child is billed by its own publication into a job.
+            kmem: None,
         };
         for entry in cloned
             .standard
@@ -213,7 +228,53 @@ impl HandleTable {
             entries: Vec::new(),
             reserved: BTreeMap::new(),
             next_reservation_id: 1,
+            kmem: None,
         }
+    }
+
+    /// Bills this table's dynamic slots, now and as it grows, to `group`
+    /// (the Job's charge group). Refuses, charging nothing, when the Job's
+    /// hierarchical handle-table limit cannot hold the slots already present.
+    pub fn bind_kmem_group(&mut self, group: usize) -> bool {
+        if self.kmem.is_some() {
+            return false;
+        }
+        let bytes = (self.entries.len() as u64).saturating_mul(SLOT_BYTES);
+        if !kernel_mm::api::kmem_charge::try_charge(
+            kernel_mm::api::kmem_charge::Class::HandleTable,
+            group,
+            bytes,
+        ) {
+            return false;
+        }
+        self.kmem = Some(KmemBinding { group, charged: bytes });
+        true
+    }
+
+    /// Bytes currently billed for dynamic slots (zero when unbound).
+    pub fn kmem_charged_bytes(&self) -> u64 {
+        self.kmem.map_or(0, |binding| binding.charged)
+    }
+
+    /// Grows the dynamic slot vector to `new_len`, billing the new slots first
+    /// so a refused charge leaves the table untouched.
+    fn grow_entries(&mut self, new_len: usize) -> Option<()> {
+        if new_len <= self.entries.len() {
+            return Some(());
+        }
+        if let Some(binding) = self.kmem.as_mut() {
+            let delta = ((new_len - self.entries.len()) as u64).saturating_mul(SLOT_BYTES);
+            if !kernel_mm::api::kmem_charge::try_charge(
+                kernel_mm::api::kmem_charge::Class::HandleTable,
+                binding.group,
+                delta,
+            ) {
+                return None;
+            }
+            binding.charged += delta;
+        }
+        self.entries.resize_with(new_len, || None);
+        Some(())
     }
 
     pub fn install(&mut self, handle: KernelHandle) -> Option<u64> {
@@ -294,9 +355,7 @@ impl HandleTable {
         while index < max_dynamic_entries() {
             let fd = FIRST_DYNAMIC_FD as u64 + index as u64;
             if !self.reserved.contains_key(&fd) {
-                if self.entries.len() <= index {
-                    self.entries.resize_with(index + 1, || None);
-                }
+                self.grow_entries(index + 1)?;
                 self.entries[index] = Some(entry);
                 return Some(fd);
             }
@@ -536,10 +595,7 @@ impl HandleTable {
         if required > max_dynamic_entries() {
             return None;
         }
-        if self.entries.len() < required {
-            self.entries.resize_with(required, || None);
-        }
-        Some(())
+        self.grow_entries(required)
     }
 
     pub fn replace_entry(&mut self, fd: u64, entry: Option<HandleEntry>) -> Option<()> {
@@ -746,6 +802,13 @@ impl HandleTable {
 
 impl Drop for HandleTable {
     fn drop(&mut self) {
+        if let Some(binding) = self.kmem.take() {
+            kernel_mm::api::kmem_charge::uncharge(
+                kernel_mm::api::kmem_charge::Class::HandleTable,
+                binding.group,
+                binding.charged,
+            );
+        }
         for entry in self.standard.iter().chain(self.entries.iter()).flatten() {
             release_entry_descriptor_reference(Some(entry));
         }

@@ -98,10 +98,10 @@ forbid_regex .claude/settings.json '"timeout":[[:space:]]*75' \
 
 require_literal .agents/hooks/lib.sh 'tail -n 8' "failure tail remains <= 8 lines"
 require_literal .agents/hooks/lib.sh 'head -c 2048' "failure payload remains <= 2048 bytes"
-forbid_regex .agents/hooks/post_edit_rust.sh 'cargo[[:space:]]+xtask[[:space:]]+check' \
-  "PostToolUse does not run the full workspace check"
-require_literal .agents/hooks/post_edit_rust.sh 'formal/check-rust-source-contracts.py' \
-  "PostToolUse keeps the cheap source-contract lint"
+forbid_regex .claude/settings.json 'PostToolUse' \
+  "no per-edit hook runs after a file edit"
+forbid_regex .claude/hooks/pre_bash_destructive.sh 'cargo[[:space:]]+(xtask|fmt)' \
+  "commit gate runs no compile or format check"
 forbid_regex .github/workflows/agent-tools-bootstrap.yml '\.claude/hooks/\*\*|\.agents/hooks/\*\*|tools/check-dev-environment\.sh' \
   "Serena bootstrap is not retriggered by unrelated hook/environment checks"
 

@@ -22,6 +22,7 @@ pub mod health_wire;
 pub mod identity;
 pub mod idl;
 pub mod lease_reclaim;
+pub mod lease_report;
 pub mod lease_snapshot;
 pub mod client_session_wire;
 pub mod manifest;

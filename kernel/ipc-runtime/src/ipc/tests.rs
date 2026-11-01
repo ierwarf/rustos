@@ -1306,3 +1306,31 @@ fn endpoint_remove_waiters_for_task_prunes_stale_waiters() {
         assert_eq!(receiver_to_wake, None);
     });
 }
+
+#[test]
+fn endpoint_queue_bytes_are_billed_to_the_job_group_and_refunded_on_owner_exit() {
+    use kernel_mm::api::kmem_charge::{self, Class};
+    with_isolated_ipc_test(|| {
+        const GROUP: usize = 62;
+        kmem_charge::init_group(GROUP, None);
+        let first = super::create_endpoint_for_process_in_group(70, GROUP).expect("billed endpoint");
+        let billed = kmem_charge::usage(Class::IpcEndpoint, GROUP);
+        assert!(billed > 0, "the reserved queues must be charged");
+        // A budget of exactly one endpoint refuses the second and charges nothing more.
+        kmem_charge::set_limit(Class::IpcEndpoint, GROUP, billed);
+        assert_eq!(
+            super::create_endpoint_for_process_in_group(70, GROUP),
+            Err(IpcError::NoMemory)
+        );
+        assert_eq!(kmem_charge::usage(Class::IpcEndpoint, GROUP), billed);
+        // The refused creation must not have consumed the per-process quota.
+        assert!(super::create_endpoint_for_process(70).is_ok());
+        // Unbilled and task-owned creation never touch the group.
+        assert!(super::create_endpoint().is_ok());
+        assert!(super::create_endpoint_for_task(Some(71)).is_ok());
+        assert_eq!(kmem_charge::usage(Class::IpcEndpoint, GROUP), billed);
+        let _ = first;
+        super::fail_endpoints_owned_by_process(70, IpcError::PeerClosed);
+        assert_eq!(kmem_charge::usage(Class::IpcEndpoint, GROUP), 0);
+    });
+}

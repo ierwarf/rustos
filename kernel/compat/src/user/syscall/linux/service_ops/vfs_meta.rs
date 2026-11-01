@@ -521,7 +521,7 @@ pub fn syscall_linux_ioctl(fd: u64, request_number: u64, arg: u64) -> u64 {
     let route = if ioctl_is_direct_display_present(request_number)
         || ioctl_is_display_policy_request(request_number)
             && ipc_ops::current_process_has_service_capability(
-                rustos_user_abi::syscall::IPC_SERVICE_CAP_UI_POLICY,
+                ServiceCapability::UiPolicy,
             ) {
         rustos_user_abi::syscall::DEVMGRD_IOCTL_ROUTE_DIRECT
     } else {
@@ -633,7 +633,7 @@ fn console_graph_wait_authority(fd: u64) -> Result<(), i64> {
     // subject and no single session's. A shell holds a console handle for its
     // own session and is served by the per-session readiness subject instead.
     if !ipc_ops::current_process_has_service_capability(
-        rustos_user_abi::syscall::IPC_SERVICE_CAP_UI_POLICY,
+        ServiceCapability::UiPolicy,
     ) {
         report_console_graph_wait_refusal(CONSOLE_GRAPH_REFUSAL_NO_CAPABILITY, 0);
         return Err(LINUX_EPERM);

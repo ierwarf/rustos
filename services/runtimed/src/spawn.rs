@@ -246,7 +246,6 @@ fn record_spawned_launch(
         }
         state.charged_sessions.insert(token);
     }
-    let pending_session = in_flight.session_handle;
     let record = RunningProcess {
         pid,
         package_id: in_flight.package_id.clone(),
@@ -262,16 +261,10 @@ fn record_spawned_launch(
         in_flight.recorded_pid = Some(pid);
     }
     boot_line(format!("runtimed: spawned pid={pid}").as_str());
-    if record_ack
-        .try_send(crate::launch_worker::RecordAck::Recorded)
-        .is_err()
-    {
-        // The worker timed out before observing our admission result and
-        // will retire the child. Revoke the new charge immediately rather
-        // than retaining an owner entry for an orphan.
-        state.running.remove(&pid);
-        release_failed_session(state, pending_session);
-    }
+    // A failed send means the worker already timed out and will retire the
+    // child; the queued Finished(Err) then removes this exact record and
+    // refunds the session charge (finish_tracked_launch), in FIFO order.
+    let _ = record_ack.try_send(crate::launch_worker::RecordAck::Recorded);
 }
 
 fn finish_tracked_launch(state: &mut BrokerState, pid: Option<i32>, result: Result<(), i32>) {
@@ -605,12 +598,30 @@ fn load_kvm_acceptance_contract() -> Option<KvmAcceptanceContract> {
     // VFS cursor checkpoint and can lose the small KVM contract behind an
     // unrelated checkpoint burst; positioned bounded I/O is the same path
     // used by the admitted runtime registries.
-    let contents = read_bounded_config_snapshot(
+    static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let contents = match read_bounded_config_snapshot(
         KVM_ACCEPTANCE_CONTRACT_PATH,
         KVM_ACCEPTANCE_CONTRACT_MAX_BYTES,
-    )
-    .ok()?;
-    parse_kvm_acceptance_contract(contents.as_str())
+    ) {
+        Ok(contents) => contents,
+        Err(error) => {
+            // Absence is the normal product case; any other failure would
+            // silently disable a KVM acceptance contract, so say so once.
+            if !REPORTED.swap(true, Ordering::Relaxed) {
+                observability_client::warn!(
+                    "runtimed",
+                    service,
+                    "kvm acceptance contract unreadable: {error:?}"
+                );
+            }
+            return None;
+        }
+    };
+    let parsed = parse_kvm_acceptance_contract(contents.as_str());
+    if parsed.is_none() && !REPORTED.swap(true, Ordering::Relaxed) {
+        observability_client::warn!("runtimed", service, "kvm acceptance contract malformed");
+    }
+    parsed
 }
 
 fn parse_kvm_acceptance_contract(contents: &str) -> Option<KvmAcceptanceContract> {

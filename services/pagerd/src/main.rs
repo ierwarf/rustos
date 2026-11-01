@@ -66,6 +66,11 @@ fn service_main() {
         return;
     }
     ipc::debug_line("pagerd: pager policy endpoint registered");
+    // Independent thread: the receive loop (the IPC fast path) is untouched.
+    if let Err(errno) = rustos_svc_runtime::heartbeat::spawn_thread(rustos_user_abi::syscall::IPC_SERVICE_PAGERD) {
+        let _ = errno;
+        ipc::debug_line("pagerd: heartbeat thread unavailable");
+    }
     publish_anonymous_policy();
     let mut pager = PagerState::new(1);
     serve(endpoint as u64, &mut pager);
@@ -133,6 +138,9 @@ fn serve(endpoint: u64, pager: &mut PagerState) {
     let mut bytes = [0_u8; IPC_MAX_INLINE_BYTES];
     let mut dispatch = PagerFaultDispatchWire::default();
     loop {
+        // Retries until the kernel admits the heartbeat thread (procd may not
+        // be up when pagerd starts); a single relaxed load once it is running.
+        rustos_svc_runtime::heartbeat::ensure_thread(rustos_user_abi::syscall::IPC_SERVICE_PAGERD);
         let mut reply_cap = 0;
         let mut sender_pid = 0;
         let mut sender_tid = 0;

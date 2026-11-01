@@ -101,8 +101,104 @@ impl Heartbeat {
         Ok(response.value1)
     }
 }
+/// Stack for the dedicated heartbeat thread of a single-receive-loop service.
+#[repr(align(16))]
+pub struct ThreadStack(pub [u8; THREAD_STACK_BYTES]);
+pub const THREAD_STACK_BYTES: usize = 16 * 1024;
+impl ThreadStack {
+    pub const fn new() -> Self { Self([0; THREAD_STACK_BYTES]) }
+}
+static THREAD_SERVICE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static THREAD_STARTED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Start the independent heartbeat thread of a freestanding service whose
+/// receive loop blocks without a deadline (so an idle but healthy service
+/// would otherwise never pulse). The thread shares the address space, owns
+/// no service lock and only issues the bounded supervisor RPC; it ends with
+/// the process. One thread per process.
+#[cfg(all(target_arch = "x86_64", not(test)))]
+pub fn spawn_thread(service: u64) -> Result<(), i64> {
+    static mut STACK: ThreadStack = ThreadStack::new();
+    use core::arch::asm;
+    use core::sync::atomic::Ordering;
+    const SYS_CLONE: u64 = 56;
+    const CLONE_VM: u64 = 0x0000_0100;
+    const CLONE_FS: u64 = 0x0000_0200;
+    const CLONE_FILES: u64 = 0x0000_0400;
+    const CLONE_SIGHAND: u64 = 0x0000_0800;
+    const CLONE_THREAD: u64 = 0x0001_0000;
+    if service == 0 { return Err(22); }
+    if THREAD_SERVICE.compare_exchange(0, service, Ordering::AcqRel, Ordering::Acquire).is_err() {
+        return Err(16);
+    }
+    let stack_top = unsafe {
+        (core::ptr::addr_of_mut!(STACK) as *mut u8).add(THREAD_STACK_BYTES)
+    } as u64;
+    let flags = CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD;
+    let result: i64;
+    unsafe {
+        asm!(
+            "syscall",
+            "test rax, rax",
+            "jnz 2f",
+            "call {entry}",
+            "ud2",
+            "2:",
+            entry = sym heartbeat_thread_entry,
+            inlateout("rax") SYS_CLONE as i64 => result,
+            in("rdi") flags,
+            in("rsi") stack_top,
+            in("rdx") 0_u64,
+            in("r10") 0_u64,
+            in("r8") 0_u64,
+            lateout("rcx") _,
+            lateout("r11") _,
+        );
+    }
+    if result <= 0 {
+        THREAD_SERVICE.store(0, Ordering::Release);
+        Err(if result < 0 { -result } else { 11 })
+    } else {
+        THREAD_STARTED.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+}
+
+/// Start the heartbeat thread as soon as the kernel permits one. A bootstrap
+/// service can be running before procd (which plans thread creation) is up, in
+/// which case `clone` answers ENOSYS; this retries from the service's own
+/// receive loop, cheaply (one relaxed load once started, one clone attempt
+/// per 32 calls until then), and never blocks or allocates.
+#[cfg(all(target_arch = "x86_64", not(test)))]
+pub fn ensure_thread(service: u64) {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    static ATTEMPTS: AtomicU32 = AtomicU32::new(0);
+    if THREAD_STARTED.load(Ordering::Relaxed) {
+        return;
+    }
+    if ATTEMPTS.fetch_add(1, Ordering::Relaxed) % 32 != 0 {
+        return;
+    }
+    let _ = spawn_thread(service);
+}
+
+#[cfg(all(target_arch = "x86_64", not(test)))]
+extern "C" fn heartbeat_thread_entry() -> ! {
+    let service = THREAD_SERVICE.load(core::sync::atomic::Ordering::Acquire);
+    let mut beat = Heartbeat::new(service);
+    loop {
+        let _ = beat.poll(crate::syscall::monotonic_nanos());
+        crate::syscall::sleep_millis(250);
+    }
+}
+
 #[cfg(test)]
 mod tests{
+    #[test]
+    fn thread_stack_is_sixteen_byte_aligned(){
+        assert_eq!(core::mem::align_of::<ThreadStack>(),16);
+        assert_eq!(THREAD_STACK_BYTES%16,0);
+    }
     use super::*;
     #[test]
     fn default_interval_is_slow_and_timeout_below_interval(){

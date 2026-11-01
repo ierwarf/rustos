@@ -19,13 +19,14 @@ use rustos_user_abi::syscall::{
 const EINVAL:i32=22;const EPROTO:i32=71;
 #[derive(Clone,Copy,Debug,Eq,PartialEq)]
 pub(super) enum Phase{
-    Empty,Staged,Armed,Trial,Committed,RollbackRequired,
+    Empty,Staged,Armed,Trial,Committed,RollbackRequired,RolledBack,
 }
 impl Phase{
     fn parse(value:u64)->Result<Self,i32>{
         Ok(match value{
             0=>Self::Empty,1=>Self::Staged,2=>Self::Armed,
             3=>Self::Trial,4=>Self::Committed,5=>Self::RollbackRequired,
+            6=>Self::RolledBack,
             _=>return Err(EPROTO)
         })
     }
@@ -36,6 +37,8 @@ pub(super) struct Trial{
     pub epoch:u64,
     pub previous_pid:u64,
     pub candidate_pid:u64,
+    pub digest:[u8;32],
+    pub deadline_ns:u64,
 }
 fn exact_subject()->Result<(u64,u64),i32>{
     let pid=unsafe{libc::syscall(libc::SYS_getpid) as i64};
@@ -98,17 +101,26 @@ pub(super) fn seal(approval:Approval)->Result<(),i32>{
     apply(COMMERCIAL_MAX_ROOTD_OP_UPDATE_SEAL,approval,
         Phase::Committed).map(|_|())
 }
+/// Retire a transaction whose restored incarnation passed rootd's health
+/// quorum. The approval is rebuilt from rootd's own INSPECT snapshot.
+pub(super) fn seal_rolled_back(approval:Approval)->Result<(),i32>{
+    apply(COMMERCIAL_MAX_ROOTD_OP_UPDATE_SEAL,approval,
+        Phase::RolledBack).map(|_|())
+}
 pub(super) fn inspect(service:u64)->Result<Trial,i32>{
     if service==0{return Err(EINVAL)}
     let mut request=CommercialMaxProtocolRequest::default();
     request.header.op=COMMERCIAL_MAX_ROOTD_OP_UPDATE_INSPECT;
     request.arg0=service;
     let response=transact(request)?;
-    if response.payload_len!=16{return Err(EPROTO)}
+    if response.payload_len!=56{return Err(EPROTO)}
     let prev=u64::from_le_bytes(response.payload[..8].try_into().map_err(|_|EPROTO)?);
     let candidate=u64::from_le_bytes(response.payload[8..16].try_into().map_err(|_|EPROTO)?);
+    let digest:[u8;32]=response.payload[16..48].try_into().map_err(|_|EPROTO)?;
+    let deadline=u64::from_le_bytes(response.payload[48..56].try_into().map_err(|_|EPROTO)?);
     Ok(Trial{phase:Phase::parse(response.value1)?,
-        epoch:response.value0,previous_pid:prev,candidate_pid:candidate})
+        epoch:response.value0,previous_pid:prev,candidate_pid:candidate,
+        digest,deadline_ns:deadline})
 }
 #[cfg(test)]
 mod tests {
@@ -116,7 +128,8 @@ mod tests {
     #[test]
     fn update_phase_decoding_fails_closed(){
         assert_eq!(Phase::parse(5),Ok(Phase::RollbackRequired));
-        assert_eq!(Phase::parse(6),Err(EPROTO));
+        assert_eq!(Phase::parse(6),Ok(Phase::RolledBack));
+        assert_eq!(Phase::parse(7),Err(EPROTO));
         assert_eq!(Phase::parse(u64::MAX),Err(EPROTO));
     }
 }

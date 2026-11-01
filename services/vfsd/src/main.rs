@@ -264,6 +264,9 @@ fn service_main() {
         return;
     }
     ipc::debug_line("vfsd: vfs policy endpoint registered");
+    if let Err(errno) = rustos_svc_runtime::heartbeat::spawn_thread(rustos_user_abi::syscall::IPC_SERVICE_VFSD) {
+        ipc::debug_line(&alloc::format!("vfsd: heartbeat thread unavailable errno={errno}"));
+    }
     if ensure_snapshot_worker().is_err() {
         // procd is an independently starting core service. Keep the endpoint
         // receive owner live and retry the exact worker admission when the
@@ -319,6 +322,7 @@ fn serve(endpoint: u64, mut state: VfsState) {
     let mut received =
         receive_request(endpoint, &mut request, &mut reply_cap, &mut sender_pid, &mut sender_tid);
     loop {
+        rustos_svc_runtime::heartbeat::ensure_thread(rustos_user_abi::syscall::IPC_SERVICE_VFSD);
         if received < 0 {
             rustos_svc_runtime::syscall::sleep_millis(1);
             received = receive_request(
@@ -714,14 +718,12 @@ fn call_rootd_checkpoint(
     request.arg0 = IPC_SERVICE_VFSD;
     request.arg1 = cursor;
     if let Some(record) = record {
-        let bytes = unsafe {
-            core::slice::from_raw_parts(
-                (record as *const ServiceCheckpointRecordWire).cast::<u8>(),
-                size_of::<ServiceCheckpointRecordWire>(),
-            )
-        };
+        let bytes = rustos_svc_runtime::checkpoint_idl::encode(record).map_err(|_| EIO)?;
+        if bytes.len() > request.payload.len() {
+            return Err(EIO);
+        }
         request.payload_len = bytes.len() as u32;
-        request.payload[..bytes.len()].copy_from_slice(bytes);
+        request.payload[..bytes.len()].copy_from_slice(&bytes);
     }
     let mut response = CommercialMaxProtocolResponse::default();
     let received = unsafe {

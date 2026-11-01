@@ -7,6 +7,8 @@
 //! No service can commit merely by claiming that a PID is healthy.
 use rustos_component_model::update_wire::Approval;
 use super::service_manifest::POST_INIT_MANIFEST;
+use super::update_journal::UpdateJournal;
+use rustos_component_model::durable_recovery::Kind as JournalKind;
 
 const EINVAL: i32 = 22;
 const EACCES: i32 = 13;
@@ -22,6 +24,9 @@ pub(crate) enum Phase {
     Trial,
     Committed,
     RollbackRequired,
+    /// The previous image's replacement incarnation passed three health
+    /// pulses after a rollback; `seal` retires the transaction.
+    RolledBack,
 }
 
 #[derive(Clone, Copy)]
@@ -34,6 +39,9 @@ struct Upgrade {
     deadline_ns: u64,
     state: Phase,
     health_pulses: u8,
+    /// Incarnation published after RollbackRequired (the restored image).
+    restore_pid: u64,
+    restore_pulses: u8,
 }
 impl Upgrade {
     const EMPTY: Self = Self {
@@ -45,6 +53,8 @@ impl Upgrade {
         deadline_ns: 0,
         state: Phase::Empty,
         health_pulses: 0,
+        restore_pid: 0,
+        restore_pulses: 0,
     };
     fn matches(&self, approval: Approval) -> bool {
         self.service == approval.service
@@ -54,9 +64,24 @@ impl Upgrade {
     }
 }
 
+/// The supervisor-visible snapshot of one service's release transaction.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Inspected {
+    pub phase: Phase,
+    pub epoch: u64,
+    pub previous_pid: u64,
+    pub candidate_pid: u64,
+    pub digest: [u8; 32],
+    pub deadline_ns: u64,
+}
+
 pub(crate) struct UpdateBook {
     entries: [Upgrade; MAX_UPGRADES],
     committed_epochs: [u64; MAX_UPGRADES],
+    /// Present once rootd has attached its release journal; every transition
+    /// is then recorded (and validated by the journal's state machine) BEFORE
+    /// the book changes, so an illegal order or journal failure refuses it.
+    journal: Option<UpdateJournal>,
 }
 
 impl UpdateBook {
@@ -64,6 +89,19 @@ impl UpdateBook {
         Self {
             entries: [Upgrade::EMPTY; MAX_UPGRADES],
             committed_epochs: [0; MAX_UPGRADES],
+            journal: None,
+        }
+    }
+
+    pub(crate) fn attach_journal(&mut self, journal: UpdateJournal) {
+        self.journal = Some(journal);
+    }
+
+    /// Record one transition; `Ok` when no journal is attached.
+    fn journaled(&mut self, upgrade: &Upgrade, kind: JournalKind) -> Result<(), i32> {
+        match self.journal.as_mut() {
+            Some(journal) => journal.record(upgrade.service, upgrade.epoch, kind, upgrade.candidate_digest),
+            None => Ok(()),
         }
     }
 
@@ -92,7 +130,7 @@ impl UpdateBook {
             }
             return Err(EBUSY);
         }
-        *slot = Upgrade {
+        let staged = Upgrade {
             service: approval.service,
             epoch: approval.epoch,
             candidate_digest: approval.digest,
@@ -101,21 +139,33 @@ impl UpdateBook {
             deadline_ns: approval.trial_deadline_ns,
             state: Phase::Staged,
             health_pulses: 0,
+            restore_pid: 0,
+            restore_pulses: 0,
         };
-        Ok(slot.state)
+        if let Some(journal) = self.journal.as_mut() {
+            // A staged release is a verified candidate with the previous
+            // incarnation recorded; open the transaction and say so in order.
+            journal.begin(staged.service, staged.epoch, staged.candidate_digest)?;
+            journal.record(staged.service, staged.epoch, JournalKind::OldImagePinned, staged.candidate_digest)?;
+            journal.record(staged.service, staged.epoch, JournalKind::CandidateVerified, staged.candidate_digest)?;
+        }
+        self.entries[index] = staged;
+        Ok(Phase::Staged)
     }
 
     /// Only initd can request the cutover; rootd still requires the actual
     /// loader transition and an exact new service lease before starting trial.
     pub(crate) fn arm(&mut self, approval: Approval, now_ns: u64) -> Result<Phase, i32> {
-        let slot = &mut self.entries[Self::position(approval.service)?];
+        let index = Self::position(approval.service)?;
+        let slot = self.entries[index];
         if !slot.matches(approval) || now_ns >= slot.deadline_ns {
             return Err(ESTALE);
         }
         match slot.state {
             Phase::Staged => {
-                slot.state = Phase::Armed;
-                Ok(slot.state)
+                self.journaled(&slot, JournalKind::Quiesced)?;
+                self.entries[index].state = Phase::Armed;
+                Ok(Phase::Armed)
             }
             Phase::Armed => Ok(slot.state),
             _ => Err(EBUSY),
@@ -125,19 +175,26 @@ impl UpdateBook {
     /// Pure transaction admission preflight, called BEFORE rootd publishes a
     /// replacement service lease. Once the lease has been authenticated and
     /// inserted, this exact check cannot reject the same candidate.
+    ///
+    /// After RollbackRequired the only admissible new incarnation is the
+    /// restored previous image: a fresh PID that is neither the failed
+    /// candidate nor the incarnation the update started from.
     pub(crate) fn may_publish(
         &self, service: u64, pid: u64, now_ns: u64,
     ) -> Result<(), i32> {
         let slot = &self.entries[Self::position(service)?];
-        if slot.state == Phase::Empty {
-            return Ok(());
+        match slot.state {
+            Phase::Empty => Ok(()),
+            Phase::RollbackRequired => {
+                if pid == 0 || pid == slot.candidate_pid || pid == slot.previous_pid {
+                    Err(ESTALE)
+                } else {
+                    Ok(())
+                }
+            }
+            Phase::Armed if pid != 0 && pid != slot.previous_pid && now_ns < slot.deadline_ns => Ok(()),
+            _ => Err(ESTALE),
         }
-        if slot.state != Phase::Armed || pid == 0 || pid == slot.previous_pid
-            || now_ns >= slot.deadline_ns
-        {
-            return Err(ESTALE);
-        }
-        Ok(())
     }
 
     /// Pure health preflight before mutating the independent health witness.
@@ -145,7 +202,13 @@ impl UpdateBook {
     pub(crate) fn may_accept_health(
         &self, service: u64, pid: u64, now_ns: u64,
     ) -> Result<(), i32> {
-        let slot = &self.entries[Self::position(service)?];
+        // Only post-init services can be under a release transaction; the
+        // bootstrap services' health is still authenticated and recorded by
+        // the health book, and simply has no update trial to gate.
+        let Ok(index) = Self::position(service) else {
+            return Ok(());
+        };
+        let slot = &self.entries[index];
         if slot.state == Phase::Trial
             && (slot.candidate_pid != pid || now_ns >= slot.deadline_ns)
         {
@@ -155,60 +218,109 @@ impl UpdateBook {
     }
 
     /// Exact live post-init lease publication, not the requester's PID, sets
-    /// the candidate incarnation. This cannot invent a process.
+    /// the candidate (or, after RollbackRequired, the restored) incarnation.
     pub(crate) fn published(
         &mut self, service: u64, new_pid: u64, now_ns: u64,
     ) -> Result<Phase, i32> {
         self.may_publish(service, new_pid, now_ns)?;
-        let slot = &mut self.entries[Self::position(service)?];
-        if slot.state == Phase::Empty {
-            return Ok(Phase::Empty);
+        let index = Self::position(service)?;
+        let slot = self.entries[index];
+        match slot.state {
+            Phase::Empty => Ok(Phase::Empty),
+            Phase::RollbackRequired => {
+                // A different restored incarnation replaces an earlier failed
+                // restore attempt; the journal opens RestoreBegin only once.
+                if slot.restore_pid == 0 {
+                    self.journaled(&slot, JournalKind::RestoreBegin)?;
+                }
+                let entry = &mut self.entries[index];
+                entry.restore_pid = new_pid;
+                entry.restore_pulses = 0;
+                Ok(Phase::RollbackRequired)
+            }
+            _ => {
+                self.journaled(&slot, JournalKind::Activated)?;
+                let entry = &mut self.entries[index];
+                entry.candidate_pid = new_pid;
+                entry.state = Phase::Trial;
+                entry.health_pulses = 0;
+                Ok(Phase::Trial)
+            }
         }
-        slot.candidate_pid = new_pid;
-        slot.state = Phase::Trial;
-        slot.health_pulses = 0;
-        Ok(slot.state)
     }
 
-    /// The only automatic success path is repeated authenticated health
-    /// from the **new** incarnation after it was published.
+    /// Success is repeated authenticated health from the **new** incarnation
+    /// after it was published: the candidate during a trial, or the restored
+    /// image after a rollback. Three distinct pulses either way.
     pub(crate) fn healthy(
         &mut self, service: u64, pid: u64, now_ns: u64,
     ) -> Result<Phase, i32> {
         self.may_accept_health(service, pid, now_ns)?;
-        let slot = &mut self.entries[Self::position(service)?];
-        if slot.state != Phase::Trial {
-            return Ok(slot.state);
+        let Ok(index) = Self::position(service) else {
+            return Ok(Phase::Empty);
+        };
+        let slot = self.entries[index];
+        match slot.state {
+            Phase::Trial => {
+                if slot.health_pulses.saturating_add(1) >= 3 {
+                    self.journaled(&slot, JournalKind::HealthAccepted)?;
+                    self.entries[index].state = Phase::Committed;
+                }
+                let entry = &mut self.entries[index];
+                entry.health_pulses = entry.health_pulses.saturating_add(1);
+                Ok(entry.state)
+            }
+            Phase::RollbackRequired if slot.restore_pid != 0 && slot.restore_pid == pid => {
+                if slot.restore_pulses.saturating_add(1) >= 3 {
+                    self.journaled(&slot, JournalKind::RestoreComplete)?;
+                    self.entries[index].state = Phase::RolledBack;
+                }
+                let entry = &mut self.entries[index];
+                entry.restore_pulses = entry.restore_pulses.saturating_add(1);
+                Ok(entry.state)
+            }
+            _ => Ok(slot.state),
         }
-        slot.health_pulses = slot.health_pulses.saturating_add(1);
-        if slot.health_pulses >= 3 {
-            slot.state = Phase::Committed;
-        }
-        Ok(slot.state)
     }
 
     /// A rollback request seals the transaction against later commit. It
-    /// does NOT imply the old executable image was actually restored.
+    /// does NOT imply the old executable image was actually restored; that
+    /// is `RolledBack`, reached only through a restored incarnation's health.
     pub(crate) fn rollback(
         &mut self, approval: Approval,
     ) -> Result<Phase, i32> {
-        let slot = &mut self.entries[Self::position(approval.service)?];
+        let index = Self::position(approval.service)?;
+        let slot = self.entries[index];
         if !slot.matches(approval) {
             return Err(ESTALE);
         }
         match slot.state {
-            Phase::Armed | Phase::Staged | Phase::Trial | Phase::RollbackRequired => {
-                slot.state = Phase::RollbackRequired;
-                Ok(slot.state)
+            Phase::Armed | Phase::Staged | Phase::Trial => {
+                self.journaled(&slot, JournalKind::RollbackRequired)?;
+                self.entries[index].state = Phase::RollbackRequired;
+                Ok(Phase::RollbackRequired)
             }
+            Phase::RollbackRequired => Ok(Phase::RollbackRequired),
             _ => Err(EBUSY),
         }
     }
 
     pub(crate) fn on_exit(&mut self, pid: u64) {
-        for slot in &mut self.entries {
-            if pid != 0 && pid == slot.candidate_pid && slot.state == Phase::Trial {
-                slot.state = Phase::RollbackRequired;
+        for index in 0..self.entries.len() {
+            let slot = self.entries[index];
+            if pid == 0 {
+                continue;
+            }
+            if pid == slot.candidate_pid && slot.state == Phase::Trial {
+                // Refusing to record must never block the safe direction.
+                let _ = self.journaled(&slot, JournalKind::RollbackRequired);
+                self.entries[index].state = Phase::RollbackRequired;
+            } else if pid == slot.restore_pid && slot.state == Phase::RollbackRequired {
+                // The restored incarnation died before three pulses: it must
+                // be relaunched and start counting again.
+                let entry = &mut self.entries[index];
+                entry.restore_pid = 0;
+                entry.restore_pulses = 0;
             }
         }
     }
@@ -217,33 +329,55 @@ impl UpdateBook {
     /// upgraded. A stopped candidate must never be considered committed.
     pub(crate) fn expired(&mut self, now_ns: u64) -> [Option<u64>; MAX_UPGRADES] {
         let mut result = [None; MAX_UPGRADES];
-        for (i, slot) in self.entries.iter_mut().enumerate() {
+        for index in 0..self.entries.len() {
+            let slot = self.entries[index];
             if matches!(slot.state, Phase::Staged | Phase::Armed | Phase::Trial)
                 && now_ns >= slot.deadline_ns
             {
-                slot.state = Phase::RollbackRequired;
-                result[i] = Some(slot.service);
+                let _ = self.journaled(&slot, JournalKind::RollbackRequired);
+                self.entries[index].state = Phase::RollbackRequired;
+                result[index] = Some(slot.service);
             }
         }
         result
     }
 
-    /// Commit marks the epoch immutable only after exact trial health.
-    /// Storage-safe irreversible commit awaits durable image custody.
+    /// Commit marks the epoch immutable only after exact trial health; a
+    /// finished rollback retires the transaction and burns its epoch so the
+    /// failed candidate can never be staged again.
     pub(crate) fn seal(&mut self, approval: Approval) -> Result<Phase, i32> {
-        let i = Self::position(approval.service)?;
-        let slot = &mut self.entries[i];
-        if !slot.matches(approval) || slot.state != Phase::Committed {
+        let index = Self::position(approval.service)?;
+        let slot = self.entries[index];
+        if !slot.matches(approval) {
             return Err(ESTALE);
         }
-        self.committed_epochs[i] = slot.epoch;
-        *slot = Upgrade::EMPTY;
-        Ok(Phase::Committed)
+        match slot.state {
+            Phase::Committed => {
+                self.journaled(&slot, JournalKind::Commit)?;
+                self.committed_epochs[index] = slot.epoch;
+                self.entries[index] = Upgrade::EMPTY;
+                Ok(Phase::Committed)
+            }
+            Phase::RolledBack => {
+                // RestoreComplete was journaled when the state was entered.
+                self.committed_epochs[index] = slot.epoch;
+                self.entries[index] = Upgrade::EMPTY;
+                Ok(Phase::RolledBack)
+            }
+            _ => Err(ESTALE),
+        }
     }
 
-    pub(crate) fn inspect(&self, service: u64) -> Result<(Phase, u64, u64, u64), i32> {
+    pub(crate) fn inspect(&self, service: u64) -> Result<Inspected, i32> {
         let slot = &self.entries[Self::position(service)?];
-        Ok((slot.state, slot.epoch, slot.previous_pid, slot.candidate_pid))
+        Ok(Inspected {
+            phase: slot.state,
+            epoch: slot.epoch,
+            previous_pid: slot.previous_pid,
+            candidate_pid: slot.candidate_pid,
+            digest: slot.candidate_digest,
+            deadline_ns: slot.deadline_ns,
+        })
     }
 }
 
@@ -276,12 +410,12 @@ mod tests {
         assert_eq!(ledger.may_publish(IPC_SERVICE_SESSIOND, 102, 2), Err(ESTALE));
         ledger.arm(approval(7), 3).unwrap();
         assert_eq!(ledger.may_publish(IPC_SERVICE_SESSIOND, 101, 4), Err(ESTALE));
-        assert_eq!(ledger.inspect(IPC_SERVICE_SESSIOND).unwrap().0, Phase::Armed);
+        assert_eq!(ledger.inspect(IPC_SERVICE_SESSIOND).unwrap().phase, Phase::Armed);
         assert_eq!(ledger.may_publish(IPC_SERVICE_SESSIOND, 102, 5), Ok(()));
         ledger.published(IPC_SERVICE_SESSIOND, 102, 5).unwrap();
         assert_eq!(ledger.may_accept_health(IPC_SERVICE_SESSIOND, 101, 6), Err(ESTALE));
         assert_eq!(ledger.may_accept_health(IPC_SERVICE_SESSIOND, 102, 6), Ok(()));
-        assert_eq!(ledger.inspect(IPC_SERVICE_SESSIOND).unwrap().0, Phase::Trial);
+        assert_eq!(ledger.inspect(IPC_SERVICE_SESSIOND).unwrap().phase, Phase::Trial);
     }
 
     #[test]
@@ -291,7 +425,97 @@ mod tests {
         ledger.arm(approval(2), 2).unwrap();
         ledger.published(IPC_SERVICE_SESSIOND, 11, 3).unwrap();
         ledger.on_exit(11);
-        assert_eq!(ledger.inspect(IPC_SERVICE_SESSIOND).unwrap().0, Phase::RollbackRequired);
+        assert_eq!(ledger.inspect(IPC_SERVICE_SESSIOND).unwrap().phase, Phase::RollbackRequired);
         assert_eq!(ledger.seal(approval(2)), Err(ESTALE));
+    }
+
+    #[test]
+    fn rollback_completes_only_through_three_pulses_of_a_restored_incarnation() {
+        let mut ledger = UpdateBook::new();
+        ledger.stage(approval(3), 10, 1).unwrap();
+        ledger.arm(approval(3), 2).unwrap();
+        ledger.published(IPC_SERVICE_SESSIOND, 11, 3).unwrap();
+        ledger.on_exit(11);
+        assert_eq!(ledger.inspect(IPC_SERVICE_SESSIOND).unwrap().phase, Phase::RollbackRequired);
+        // Neither the failed candidate nor the starting incarnation restores.
+        assert_eq!(ledger.may_publish(IPC_SERVICE_SESSIOND, 11, 4), Err(ESTALE));
+        assert_eq!(ledger.may_publish(IPC_SERVICE_SESSIOND, 10, 4), Err(ESTALE));
+        assert_eq!(ledger.published(IPC_SERVICE_SESSIOND, 12, 4), Ok(Phase::RollbackRequired));
+        // A different pid's pulses do not count; the restored one needs three.
+        assert_eq!(ledger.healthy(IPC_SERVICE_SESSIOND, 11, 5), Ok(Phase::RollbackRequired));
+        assert_eq!(ledger.healthy(IPC_SERVICE_SESSIOND, 12, 6), Ok(Phase::RollbackRequired));
+        assert_eq!(ledger.healthy(IPC_SERVICE_SESSIOND, 12, 7), Ok(Phase::RollbackRequired));
+        assert_eq!(ledger.healthy(IPC_SERVICE_SESSIOND, 12, 8), Ok(Phase::RolledBack));
+        assert_eq!(ledger.seal(approval(3)), Ok(Phase::RolledBack));
+        // The failed epoch is burned; a later epoch can stage again.
+        assert_eq!(ledger.stage(approval(3), 12, 9), Err(ESTALE));
+        assert_eq!(ledger.stage(approval(4), 12, 9), Ok(Phase::Staged));
+    }
+
+    #[test]
+    fn a_restored_incarnation_that_dies_must_restart_its_count() {
+        let mut ledger = UpdateBook::new();
+        ledger.stage(approval(5), 10, 1).unwrap();
+        ledger.rollback(approval(5)).unwrap();
+        ledger.published(IPC_SERVICE_SESSIOND, 12, 2).unwrap();
+        ledger.healthy(IPC_SERVICE_SESSIOND, 12, 3).unwrap();
+        ledger.healthy(IPC_SERVICE_SESSIOND, 12, 4).unwrap();
+        ledger.on_exit(12);
+        assert_eq!(ledger.published(IPC_SERVICE_SESSIOND, 13, 5), Ok(Phase::RollbackRequired));
+        assert_eq!(ledger.healthy(IPC_SERVICE_SESSIOND, 13, 6), Ok(Phase::RollbackRequired));
+        assert_eq!(ledger.healthy(IPC_SERVICE_SESSIOND, 13, 7), Ok(Phase::RollbackRequired));
+        assert_eq!(ledger.healthy(IPC_SERVICE_SESSIOND, 13, 8), Ok(Phase::RolledBack));
+    }
+
+    #[test]
+    fn journaled_book_records_every_transition_and_refuses_a_concurrent_release() {
+        let mut ledger = UpdateBook::new();
+        ledger.attach_journal(UpdateJournal::new(1, 2, 3).unwrap());
+        ledger.stage(approval(1), 11, 1).unwrap();
+        // Begin, OldImagePinned, CandidateVerified.
+        assert_eq!(ledger.journal.as_ref().unwrap().records(), 3);
+        ledger.arm(approval(1), 2).unwrap();
+        ledger.published(IPC_SERVICE_SESSIOND, 12, 3).unwrap();
+        for tick in 4..7 {
+            ledger.healthy(IPC_SERVICE_SESSIOND, 12, tick).unwrap();
+        }
+        ledger.seal(approval(1)).unwrap();
+        // Quiesced, Activated, HealthAccepted, Commit.
+        assert_eq!(ledger.journal.as_ref().unwrap().records(), 7);
+        assert!(!ledger.journal.as_ref().unwrap().failed());
+    }
+
+    #[test]
+    fn journaled_rollback_and_restore_are_recorded_and_frees_the_slot() {
+        let mut ledger = UpdateBook::new();
+        ledger.attach_journal(UpdateJournal::new(1, 2, 3).unwrap());
+        ledger.stage(approval(2), 10, 1).unwrap();
+        ledger.arm(approval(2), 2).unwrap();
+        ledger.published(IPC_SERVICE_SESSIOND, 11, 3).unwrap();
+        ledger.on_exit(11);
+        ledger.published(IPC_SERVICE_SESSIOND, 12, 4).unwrap();
+        for tick in 5..8 {
+            ledger.healthy(IPC_SERVICE_SESSIOND, 12, tick).unwrap();
+        }
+        ledger.seal(approval(2)).unwrap();
+        // 3 staging + Quiesced + Activated + RollbackRequired + RestoreBegin + RestoreComplete.
+        assert_eq!(ledger.journal.as_ref().unwrap().records(), 8);
+        // The transaction is closed, so the next epoch can begin.
+        assert_eq!(ledger.stage(approval(3), 12, 9), Ok(Phase::Staged));
+    }
+
+    #[test]
+    fn bootstrap_service_health_is_not_an_update_error() {
+        use rustos_user_abi::syscall::{IPC_SERVICE_INITD, IPC_SERVICE_VFSD};
+        let mut ledger = UpdateBook::new();
+        for service in [IPC_SERVICE_VFSD, IPC_SERVICE_INITD] {
+            assert_eq!(ledger.may_accept_health(service, 9, 1), Ok(()));
+            assert_eq!(ledger.healthy(service, 9, 1), Ok(Phase::Empty));
+        }
+        // A post-init service is still gated by its trial.
+        ledger.stage(approval(1), 11, 1).unwrap();
+        ledger.arm(approval(1), 2).unwrap();
+        ledger.published(IPC_SERVICE_SESSIOND, 12, 3).unwrap();
+        assert_eq!(ledger.may_accept_health(IPC_SERVICE_SESSIOND, 99, 4), Err(ESTALE));
     }
 }

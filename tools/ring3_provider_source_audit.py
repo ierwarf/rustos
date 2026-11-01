@@ -78,7 +78,7 @@ def review_rootd(findings: list[Finding]) -> None:
           path, "charge-order", "exact grant/Job checks must precede charge", findings)
     check("book.release(owner,token" in body, path, "refund-owner",
           "refund must use exact owner/token entry", findings)
-    check("provider_wire::encode_vec(ack)" in body, path, "canonical-reply",
+    check("provider_wire::encode(ack)" in body, path, "canonical-reply",
           "ACK must match provider wire codec", findings)
     path = "services/rootd/src/provider_billing.rs"
     text = source(path)
@@ -112,7 +112,8 @@ def review_service(path: str, findings: list[Finding]) -> None:
             ("inet-charge", sock, ("provider_accounting::charge_before_publish(", "state.inet_sockets.insert(")),
             ("unix-charge", sock, ("provider_accounting::charge_before_publish(", "state.sockets.insert(")),
             ("socketpair-charge", pair, ("provider_accounting::charge_before_publish(left", "provider_accounting::charge_before_publish(right", "state.sockets.insert(")),
-            ("close-refund", close, ("retire_unix_socket(", "provider_accounting::retire_final(")),
+            ("close-refund", close[close.find("retire_unix_socket("):], ("retire_unix_socket(", "provider_accounting::retire_final(")),
+            ("inet-close-refund", close, ("state.inet_sockets.remove(", "drop(state)", "provider_accounting::retire_final(")),
             ("accept-charge", accept, ("provider_accounting::charge_before_publish(accepted", "call_net_broker(")),
         ]:
             check(ordered(body, *markers), path, label,
@@ -124,7 +125,7 @@ def review_service(path: str, findings: list[Finding]) -> None:
         body = lexical_block(text, "fn open_remote_checkpointed(")
         check(ordered(body, "self.bill_open_description(", "self.checkpoint_open_description("),
               path, "vfs-charge", "charge before successful OPEN checkpoint", findings)
-        check("self.refund_open_description(id)" in body,
+        check("self.cancel_unpublished_open_description(id)" in body,
               path, "failed-open-refund", "failed checkpoint cannot leak unexposed debit", findings)
     elif path.endswith("/vfsd/src/state_files.rs"):
         body = lexical_block(text, "fn vfs_close(")
@@ -147,7 +148,7 @@ def review_runtime(findings: list[Finding]) -> None:
           "svc-runtime cannot assume optional linux-compat-state feature", findings)
     path = "libs/rustos-component-model/src/provider_wire.rs"
     text = source(path)
-    check("if self.operation==Operation::Charge" in text and "self.client_job!=0" in text,
+    check("Operation::Charge|Operation::Cancel)\n            && (self.client_job!=0||self.client_job_generation!=0)" in text,
           path, "untrusted-job", "charge request cannot select JobId", findings)
 
 

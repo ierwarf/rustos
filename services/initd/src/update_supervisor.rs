@@ -5,6 +5,14 @@
 //! to launch/restart a declared child. After an unverified rollback-required
 //! outcome, halt automatic relaunch rather than booting a potentially changed
 //! image and claiming the old image was restored.
+//!
+//! Restore: while the service image volume is immutable (read-only) the
+//! declared catalog executable IS the previous image, so initd may relaunch
+//! it. Rootd then requires a fresh PID (neither the failed candidate nor the
+//! starting incarnation) and three authenticated health pulses before it
+//! reports `RolledBack`, which initd retires with SEAL and only then clears
+//! the block. A writable image store must replace the constant below with a
+//! verified previous-image digest pin before this relaunch is acceptable.
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 use rustos_component_model::service_catalog;
@@ -16,6 +24,8 @@ use super::{call_rootd_supervisor_with_payload, boot_line};
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 const UPDATE_CALL_TIMEOUT_MS: u64 = 150;
 const EPROTO: i32 = libc::EPROTO;
+/// True while no component can change an executable on the image volume.
+const IMAGE_VOLUME_IS_IMMUTABLE: bool = true;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum UpdatePhase {
@@ -25,6 +35,7 @@ pub(super) enum UpdatePhase {
     Trial,
     Committed,
     RollbackRequired,
+    RolledBack,
 }
 
 impl UpdatePhase {
@@ -36,6 +47,7 @@ impl UpdatePhase {
             3 => Ok(Self::Trial),
             4 => Ok(Self::Committed),
             5 => Ok(Self::RollbackRequired),
+            6 => Ok(Self::RolledBack),
             _ => Err(EPROTO),
         }
     }
@@ -47,6 +59,8 @@ pub(super) struct UpdateSnapshot {
     pub epoch: u64,
     pub previous_pid: u64,
     pub candidate_pid: u64,
+    pub digest: [u8; 32],
+    pub deadline_ns: u64,
 }
 
 impl UpdateSnapshot {
@@ -57,18 +71,20 @@ impl UpdateSnapshot {
         payload: &[u8],
     ) -> Result<Self, i32> {
         let phase = UpdatePhase::from_raw(status)?;
-        if requested_service == 0 || payload.len() != 16 {
+        if requested_service == 0 || payload.len() != 56 {
             return Err(EPROTO);
         }
         let previous_pid = u64::from_le_bytes(payload[..8].try_into().map_err(|_| EPROTO)?);
-        let candidate_pid = u64::from_le_bytes(payload[8..].try_into().map_err(|_| EPROTO)?);
+        let candidate_pid = u64::from_le_bytes(payload[8..16].try_into().map_err(|_| EPROTO)?);
+        let digest: [u8; 32] = payload[16..48].try_into().map_err(|_| EPROTO)?;
+        let deadline_ns = u64::from_le_bytes(payload[48..56].try_into().map_err(|_| EPROTO)?);
         if (phase == UpdatePhase::Empty && (epoch != 0 || previous_pid != 0 || candidate_pid != 0))
             || (phase != UpdatePhase::Empty && (epoch == 0 || previous_pid == 0))
             || (phase == UpdatePhase::Trial && candidate_pid == 0)
         {
             return Err(EPROTO);
         }
-        Ok(Self { phase, epoch, previous_pid, candidate_pid })
+        Ok(Self { phase, epoch, previous_pid, candidate_pid, digest, deadline_ns })
     }
 }
 
@@ -84,7 +100,15 @@ pub(super) struct UpdateReconciler {
 }
 
 impl UpdateReconciler {
+    /// Whether automatic (re)launch of `service` is withheld. With an
+    /// immutable image volume the restore relaunch is the point of the
+    /// rollback, so the block only applies when the image could have changed.
     pub(super) fn blocks_auto_launch(&self, service: u64) -> bool {
+        !IMAGE_VOLUME_IS_IMMUTABLE && self.blocked.contains_key(&service)
+    }
+
+    /// Rollback demanded and not yet retired by SEAL.
+    pub(super) fn restore_pending(&self, service: u64) -> bool {
         self.blocked.contains_key(&service)
     }
 
@@ -109,6 +133,24 @@ impl UpdateReconciler {
                         boot_line(&format!(
                             "initd: update rollback REQUIRED service={} epoch={} candidate_pid={} (safe old image not restored)",
                             service, snapshot.epoch, snapshot.candidate_pid,
+                        ));
+                    }
+                }
+                if snapshot.phase == UpdatePhase::RolledBack {
+                    // Rootd saw three pulses from a fresh restored incarnation.
+                    // Retire the transaction by naming it exactly; only a
+                    // successful SEAL clears the block.
+                    let approval = rustos_component_model::update_wire::Approval {
+                        service,
+                        epoch: snapshot.epoch,
+                        digest: snapshot.digest,
+                        trial_deadline_ns: snapshot.deadline_ns,
+                    };
+                    if super::update_control::seal_rolled_back(approval).is_ok() {
+                        self.blocked.remove(&service);
+                        boot_line(&format!(
+                            "initd: update rollback COMPLETE service={} epoch={} (restored incarnation healthy)",
+                            service, snapshot.epoch,
                         ));
                     }
                 }
@@ -153,18 +195,23 @@ mod tests {
     #[test]
     fn rollback_is_never_inferred_from_an_empty_snapshot() {
         assert_eq!(
-            UpdateSnapshot::decode(11, 0, 0, &[0; 16]),
+            UpdateSnapshot::decode(11, 0, 0, &[0; 56]),
             Ok(UpdateSnapshot {
                 phase: UpdatePhase::Empty,
                 epoch: 0,
                 previous_pid: 0,
                 candidate_pid: 0,
+                digest: [0; 32],
+                deadline_ns: 0,
             })
         );
-        assert!(UpdateSnapshot::decode(11, 3, 1, &[0; 16]).is_err());
+        assert!(UpdateSnapshot::decode(11, 3, 1, &[0; 56]).is_err());
+        assert!(UpdateSnapshot::decode(11, 0, 0, &[0; 16]).is_err());
         let mut r = UpdateReconciler::default();
         r.blocked.insert(11, 1);
-        assert!(r.blocks_auto_launch(11));
-        assert!(!r.blocks_auto_launch(3));
+        assert!(r.restore_pending(11));
+        assert!(!r.restore_pending(3));
+        // With an immutable volume the catalog image may be relaunched.
+        assert_eq!(r.blocks_auto_launch(11), !IMAGE_VOLUME_IS_IMMUTABLE);
     }
 }

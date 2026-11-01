@@ -1,9 +1,11 @@
-//! Draft generic rootd broker for client-funded provider sessions.
+//! rootd's generic ledger for client-funded provider sessions (netd, vfsd).
 //!
-//! Generic provider RPC is dispatched by rootd; netd/vfsd final-ref
-//! call-site custody remains staged until actual per-object cutover.
-//! Its inputs MUST come from kernel-stamped sender identity, not from a
-//! provider-supplied PID. The kernel Job token ledger remains authoritative.
+//! Dispatched by `provider_control` for ops 25-28 (canonical IDL 520). Its
+//! inputs MUST come from the kernel-stamped sender identity, never from a
+//! provider-supplied PID. The kernel Job token ledger is authoritative; this
+//! book stores charge intent before every possibly ambiguous kernel call so a
+//! lost reply is reconciled by the same token, and keeps per-owner nonce
+//! watermarks so a spent token can never be charged again.
 use alloc::vec::Vec;
 use rustos_component_model::provider_sessions::{
     Client, Owner, ProviderKind, State, Ticket, Token,
@@ -92,7 +94,15 @@ impl ProviderBilling {
                 && x.token.epoch==ticket.token.epoch
                 && x.token.nonce>=ticket.token.nonce
         }) {return Err(ESTALE)}
-        if self.funded.len()>=MAX_PROVIDER_TICKETS{return Err(ENOSPC)}
+        if self.funded.len()>=MAX_PROVIDER_TICKETS{
+            // Receipt ACKs are best-effort compaction, so a provider that
+            // lost them must not wedge. Only a Settled tombstone is
+            // reclaimable: the owner watermark keeps its nonce spent, and
+            // a replayed release/cancel/ack for it stays idempotent.
+            let Some(settled)=self.funded.iter()
+                .position(|x|x.state==State::Settled) else {return Err(ENOSPC)};
+            self.funded.swap_remove(settled);
+        }
         // All fallible memory and token-overflow checks precede the kernel
         // charge; watermark advancement is conservatively irreversible.
         self.funded.try_reserve(1).map_err(|_|12)?;
@@ -150,7 +160,19 @@ impl ProviderBilling {
         mut refund:impl FnMut(u64,u64,u64)->Result<(),i32>,
     )->Result<(),i32> {
         if kernel_sender_pid!=owner.pid{return Err(EACCES)}
-        let idx=self.find(owner,token).ok_or(ESTALE)?;
+        let Some(idx)=self.find(owner,token) else {
+            // Absent means no unsettled kernel charge exists for this token:
+            // entries leave the book only after Settled (provider ACK or
+            // pressure reclaim, both behind the owner watermark) or provider
+            // exit (kernel drain), and a restarted rootd drains the whole
+            // kernel token ledger before serving. Reporting ESTALE here made
+            // every post-restart close fail forever. Fence the nonce so a
+            // delayed CHARGE of this token can never create a new bill.
+            return match self.admit_owner_nonce(owner,token.nonce){
+                Ok(())|Err(ESTALE)=>Ok(()),
+                Err(error)=>Err(error),
+            }
+        };
         let entry=self.funded[idx];
         if entry.client!=expected_client || entry.session!=expected_session
             || entry.kind!=expected_kind {return Err(EACCES)}
@@ -210,10 +232,10 @@ impl ProviderBilling {
     )->Result<(),i32>{
         if sender_pid!=owner.pid{return Err(EACCES)}
         let Some(i)=self.find(owner,token) else {
-            // Only the same owner can acknowledge its already-compacted
-            // receipt. The sender authentication has already completed.
-            return if self.watermark(owner).is_some_and(|high|
-                token.nonce<=high){Ok(())} else {Err(ESTALE)}
+            // Nothing is left to compact: a compacted receipt, a reclaimed
+            // tombstone or a ledger rebuilt by a restarted rootd. The sender
+            // is already authenticated and an ACK never changes accounting.
+            return Ok(())
         };
         let e=self.funded[i];
         if e.client.pid!=client_pid||e.session!=session||e.kind!=kind{
@@ -407,6 +429,75 @@ mod tests{
         book.acknowledge(owner,token,42,10,8,ProviderKind::Socket,0,0).unwrap();
     }
 
+    #[test]
+    fn settled_tombstones_are_reclaimed_under_pressure_without_unspending_tokens(){
+        let owner=Owner{service:3,pid:90,lease:4};
+        let client=Client{pid:5,job:0x100000001,job_generation:1};
+        let mut b=ProviderBilling::new();
+        let mk=|n:u64|Ticket{provider:owner,client,kind:ProviderKind::Socket,
+            session:n,token:Token{epoch:4,nonce:n}};
+        for n in 1..=MAX_PROVIDER_TICKETS as u64{
+            b.charge(mk(n),90,true,|_,_,k|Ok(k)).unwrap();
+            b.release(owner,mk(n).token,90,client,n,ProviderKind::Socket,
+                |_,_,_|Ok(())).unwrap();
+        }
+        assert_eq!(b.count(),MAX_PROVIDER_TICKETS);
+        // Every ACK was lost; the next charge still succeeds.
+        let next=MAX_PROVIDER_TICKETS as u64+1;
+        b.charge(mk(next),90,true,|_,_,k|Ok(k)).unwrap();
+        assert_eq!(b.count(),MAX_PROVIDER_TICKETS);
+        // Retried release / cancel / ack of a reclaimed token stays final.
+        let evicted=(1..=MAX_PROVIDER_TICKETS as u64)
+            .find(|n|b.find_ticket(owner,mk(*n).token).is_none()).unwrap();
+        b.release(owner,mk(evicted).token,90,client,evicted,ProviderKind::Socket,
+            |_,_,_|panic!("no second refund")).unwrap();
+        b.cancel(owner,mk(evicted).token,90,5,evicted,ProviderKind::Socket,
+            |_,_|panic!("no second release")).unwrap();
+        b.acknowledge(owner,mk(evicted).token,90,5,evicted,ProviderKind::Socket,
+            0,0).unwrap();
+        assert_eq!(b.charge(mk(evicted),90,true,|_,_,_|panic!("respend")),
+            Err(ESTALE));
+    }
+    #[test]
+    fn rootd_restart_does_not_wedge_provider_release_or_receipt_ack(){
+        let owner=Owner{service:2,pid:70,lease:5};
+        let client=Client{pid:8,job:0x100000002,job_generation:2};
+        let token=Token{epoch:5,nonce:9};
+        let ticket=Ticket{provider:owner,client,kind:ProviderKind::OpenDescription,
+            session:33,token};
+        // A fresh book models a restarted rootd: the kernel ledger was
+        // drained at startup, the provider still holds a Funded token.
+        let mut restarted=ProviderBilling::new();
+        restarted.release(owner,token,70,client,33,ProviderKind::OpenDescription,
+            |_,_,_|panic!("nothing is charged after the startup drain")).unwrap();
+        restarted.release(owner,token,70,client,33,ProviderKind::OpenDescription,
+            |_,_,_|panic!("idempotent")).unwrap();
+        restarted.acknowledge(owner,token,70,8,33,ProviderKind::OpenDescription,
+            client.job,client.job_generation).unwrap();
+        // A delayed CHARGE carrying the released nonce can never bill.
+        assert_eq!(restarted.charge(ticket,70,true,|_,_,_|panic!("revived")),
+            Err(ESTALE));
+        // Fresh nonces keep working and a foreign sender is still refused.
+        let mut next=ticket;next.token.nonce=10;next.session=34;
+        restarted.charge(next,70,true,|_,_,k|Ok(k)).unwrap();
+        assert_eq!(restarted.release(owner,next.token,71,client,34,
+            ProviderKind::OpenDescription,|_,_,_|Ok(())),Err(EACCES));
+    }
+    #[test]
+    fn unsettled_table_exhaustion_still_refuses(){
+        let owner=Owner{service:2,pid:91,lease:1};
+        let client=Client{pid:6,job:0x100000001,job_generation:1};
+        let mut b=ProviderBilling::new();
+        for n in 1..=MAX_PROVIDER_TICKETS as u64{
+            b.charge(Ticket{provider:owner,client,kind:ProviderKind::OpenDescription,
+                session:n,token:Token{epoch:1,nonce:n}},91,true,|_,_,k|Ok(k)).unwrap();
+        }
+        let extra=MAX_PROVIDER_TICKETS as u64+1;
+        assert_eq!(b.charge(Ticket{provider:owner,client,
+            kind:ProviderKind::OpenDescription,session:extra,
+            token:Token{epoch:1,nonce:extra}},91,true,|_,_,_|panic!("full")),
+            Err(ENOSPC));
+    }
     #[test]
     fn ack_compaction_preserves_the_spent_nonce_fence(){
         let owner=Owner{service:2,pid:62,lease:6};

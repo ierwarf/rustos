@@ -334,10 +334,10 @@ canonical generated-IDL frame in the existing supervisor IPC envelope:
 wire schema 519 carries token, exact client PID, operation, Job output and
 request/ack phase. The historical scalar arg0/arg1 request form for these
 operations is retired. Outer supervisor operations 17/18 remain as selectors
-rather than untyped payload formats. All of this is a nonvalidated draft.
+rather than untyped payload formats.
 
 
-### Additional draft Job and supervisor management ABIs
+### Job and supervisor management ABIs
 
 - SYS_RUSTOS_JOB_KMEM (0x5255_005e): versioned INSPECT and SET_LIMIT for the
   exact boxed ProcessObject allocation byte dimension. This is **not** a
@@ -349,8 +349,9 @@ rather than untyped payload formats. All of this is a nonvalidated draft.
   event and conservative memory.min policy controls.
 - SYS_RUSTOS_CHECKPOINT_JOURNAL (0x5255_005d): rootd-only memory-resident
   service checkpoint operation journal, survives process death but not reboot.
-- Generated IDL schemas 514/515/519: authenticated heartbeat, update approval
-  and client-billed session control; rootd still has legacy C-shaped envelopes.
+- Generated IDL schemas 514/515/517/518/519/520: authenticated heartbeat, update
+  approval, post-init lease snapshot/reclaim, client-billed session control and
+  the provider session RPC (ops 25-28); other rootd envelopes are still C-shaped.
 
 Full status and Codex fault-injection handoff:
-[Ring3 eight-stage draft](../../validation/ring3-8stage-draft-status.md).
+[Ring3 eight-stage status](../../validation/ring3-8stage-status.md).

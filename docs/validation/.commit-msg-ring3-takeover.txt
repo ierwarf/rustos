@@ -1,0 +1,25 @@
+feat(ring3): repair, verify and extend the eight-stage draft
+
+Compile/test repairs: image_custody borrow, rootd imports and
+HealthBook::is_duplicate, session ledger closure, client_session_wire ack,
+runtimed late-Spawned contract, job-rights bit 10 tests, kernel-compat journal
+test stack overflow.
+
+Stage 6: provider receipt-ACK outbox with bounded tombstone reclaim,
+rootd-restart-safe RELEASE/ACK, provider wire on generated IDL 520.
+Stage 4: service checkpoint protocol (rootd <-> vfsd) on generated IDL 521.
+Stage 5: clone-based heartbeat thread for freestanding vfsd/procd/loaderd.
+Stage 2: lock-free hierarchical kmem_charge groups; descriptor-table slots are
+a second per-Job kmem class (SYS_RUSTOS_JOB_KMEM ops 3/4, loaderd budget).
+Stage 8: storaged ReleaseJournalFile torn-tail recovery.
+
+Gates: formal policy anchor, mutation registry anchors and a stronger
+compaction witness (1698/1698 killed), uiserver role-typed health thread.
+Docs: one verified status ledger replaces the unverified draft ledgers.
+
+Validated: cargo xtask check/build, host tests, formal pr (sealed), source
+conformance, 16-vCPU kvm-smoke, oom-hog, 8/8 repeat boots. Not validated:
+--proc-stress (pre-existing failure), --exercise-network (netprobe contract),
+handle-table limit under KVM, any power-loss or signed-update path.
+
+Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>

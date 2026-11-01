@@ -370,21 +370,96 @@ pub const IPC_SERVICE_UISERVER: u64 = 14;
 /// restart-sensitive, kernel-verified owner identity for privileged launch
 /// authorization.
 pub const IPC_SERVICE_INITD: u64 = 15;
-pub const IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY: u64 = 1 << 0;
-pub const IPC_SERVICE_CAP_VFS_POLICY: u64 = 1 << 1;
-pub const IPC_SERVICE_CAP_NET_POLICY: u64 = 1 << 2;
-pub const IPC_SERVICE_CAP_DEVICE_POLICY: u64 = 1 << 3;
-// Capability bit 4 is permanently unassigned.
-pub const IPC_SERVICE_CAP_PROCESS_LOADER: u64 = 1 << 5;
-pub const IPC_SERVICE_CAP_STORAGE_POLICY: u64 = 1 << 6;
-pub const IPC_SERVICE_CAP_INPUT_POLICY: u64 = 1 << 7;
-pub const IPC_SERVICE_CAP_PROCESS_POLICY: u64 = 1 << 8;
-pub const IPC_SERVICE_CAP_ROOT_SUPERVISOR: u64 = 1 << 9;
-pub const IPC_SERVICE_CAP_SESSION_POLICY: u64 = 1 << 10;
-pub const IPC_SERVICE_CAP_PAGER_POLICY: u64 = 1 << 11;
-// Capability bit 12 is permanently unassigned.
-pub const IPC_SERVICE_CAP_UI_POLICY: u64 = 1 << 13;
-pub const IPC_SERVICE_CAP_INIT_POLICY: u64 = 1 << 14;
+/// A privilege a supervised service endpoint may hold. Each variant owns one
+/// fixed wire bit; bits 4 and 12 are permanently unassigned. Kernel code
+/// authorizes with this type (never a raw mask), and any mask received from
+/// rootd is validated by `ServiceCapabilitySet::from_wire`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum ServiceCapability {
+    LinuxSyscallPolicy = 0,
+    VfsPolicy = 1,
+    NetPolicy = 2,
+    DevicePolicy = 3,
+    ProcessLoader = 5,
+    StoragePolicy = 6,
+    InputPolicy = 7,
+    ProcessPolicy = 8,
+    RootSupervisor = 9,
+    SessionPolicy = 10,
+    PagerPolicy = 11,
+    UiPolicy = 13,
+    InitPolicy = 14,
+}
+
+impl ServiceCapability {
+    pub const ALL: [ServiceCapability; 13] = [
+        Self::LinuxSyscallPolicy,
+        Self::VfsPolicy,
+        Self::NetPolicy,
+        Self::DevicePolicy,
+        Self::ProcessLoader,
+        Self::StoragePolicy,
+        Self::InputPolicy,
+        Self::ProcessPolicy,
+        Self::RootSupervisor,
+        Self::SessionPolicy,
+        Self::PagerPolicy,
+        Self::UiPolicy,
+        Self::InitPolicy,
+    ];
+    /// The fixed wire bit of this capability.
+    pub const fn bit(self) -> u64 {
+        1 << (self as u8)
+    }
+}
+
+/// A set of `ServiceCapability` values; the wire form is a `u64` mask.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ServiceCapabilitySet(u64);
+
+impl ServiceCapabilitySet {
+    pub const EMPTY: Self = Self(0);
+    const KNOWN: u64 = {
+        let mut mask = 0;
+        let mut index = 0;
+        while index < ServiceCapability::ALL.len() {
+            mask |= ServiceCapability::ALL[index].bit();
+            index += 1;
+        }
+        mask
+    };
+    /// Accepts a wire mask only if it names no unassigned capability bit.
+    pub const fn from_wire(mask: u64) -> Option<Self> {
+        if mask & !Self::KNOWN != 0 { None } else { Some(Self(mask)) }
+    }
+    pub const fn to_wire(self) -> u64 {
+        self.0
+    }
+    pub const fn with(self, capability: ServiceCapability) -> Self {
+        Self(self.0 | capability.bit())
+    }
+    pub const fn contains(self, capability: ServiceCapability) -> bool {
+        self.0 & capability.bit() != 0
+    }
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+}
+
+pub const IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY: u64 = ServiceCapability::LinuxSyscallPolicy.bit();
+pub const IPC_SERVICE_CAP_VFS_POLICY: u64 = ServiceCapability::VfsPolicy.bit();
+pub const IPC_SERVICE_CAP_NET_POLICY: u64 = ServiceCapability::NetPolicy.bit();
+pub const IPC_SERVICE_CAP_DEVICE_POLICY: u64 = ServiceCapability::DevicePolicy.bit();
+pub const IPC_SERVICE_CAP_PROCESS_LOADER: u64 = ServiceCapability::ProcessLoader.bit();
+pub const IPC_SERVICE_CAP_STORAGE_POLICY: u64 = ServiceCapability::StoragePolicy.bit();
+pub const IPC_SERVICE_CAP_INPUT_POLICY: u64 = ServiceCapability::InputPolicy.bit();
+pub const IPC_SERVICE_CAP_PROCESS_POLICY: u64 = ServiceCapability::ProcessPolicy.bit();
+pub const IPC_SERVICE_CAP_ROOT_SUPERVISOR: u64 = ServiceCapability::RootSupervisor.bit();
+pub const IPC_SERVICE_CAP_SESSION_POLICY: u64 = ServiceCapability::SessionPolicy.bit();
+pub const IPC_SERVICE_CAP_PAGER_POLICY: u64 = ServiceCapability::PagerPolicy.bit();
+pub const IPC_SERVICE_CAP_UI_POLICY: u64 = ServiceCapability::UiPolicy.bit();
+pub const IPC_SERVICE_CAP_INIT_POLICY: u64 = ServiceCapability::InitPolicy.bit();
 pub const IPC_SERVICE_CAP_BOOTSTRAP_POLICY: u64 = IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY
     | IPC_SERVICE_CAP_VFS_POLICY
     | IPC_SERVICE_CAP_NET_POLICY
@@ -1001,6 +1076,15 @@ pub const JOB_MEMORY_QOS_OP_SET: u16 = 2;
 pub const JOB_KMEM_ABI_VERSION: u16 = 1;
 pub const JOB_KMEM_OP_INSPECT: u16 = 1;
 pub const JOB_KMEM_OP_SET_LIMIT: u16 = 2;
+/// Per-class kernel-object byte budgets. `flags` names the class and
+/// `process_object_max_bytes` / `usage_process_object_bytes` carry that
+/// class's limit and usage (INSPECT_CLASS requires the limit to be zero).
+pub const JOB_KMEM_OP_INSPECT_CLASS: u16 = 3;
+pub const JOB_KMEM_OP_SET_CLASS_LIMIT: u16 = 4;
+/// Slots of a process's dynamic descriptor (handle) table.
+pub const JOB_KMEM_CLASS_HANDLE_TABLE: u32 = 1;
+/// Reserved queue storage of process-owned IPC endpoints.
+pub const JOB_KMEM_CLASS_IPC_ENDPOINT: u32 = 2;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

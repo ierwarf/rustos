@@ -95,6 +95,7 @@ const EARLY_IPC_SAMPLE_COUNT: usize = 6;
 const SERVICE_IPC_TIMEOUT_MS: u64 = rustos_user_abi::performance::IPC_BULK_DATA_HARD_LIMIT_MS;
 const IPC_FAST_CALL_LIVE: bool = true;
 use rustos_user_abi::performance::IPC_RECEIVE_REPORT_MAX_ADDRESS_SPACE_BINDS as MAX_RECEIVE_BINDS;
+use rustos_user_abi::syscall::{ServiceCapability, ServiceCapabilitySet};
 // RING3-MIGRATION-REFERENCE START: rootd should own service namespace endpoint
 // ownership and capability leases. Ring0 keeps the temporary service registry
 // table until rootd can mint narrow broker capabilities.
@@ -228,7 +229,7 @@ impl ServiceCallGrant {
 
 #[derive(Clone, Copy)]
 struct ServiceCapabilityAuthorization {
-    capability: u64,
+    capability: ServiceCapabilitySet,
     rootd_epoch: Option<u64>,
 }
 
@@ -844,7 +845,16 @@ pub(super) fn syscall_linux_rustos_ipc_endpoint_create() -> u64 {
         return linux_errno(LINUX_EINVAL);
     };
     ipc_trace!("ipc endpoint create: process={}", process_id);
-    match kernel_ipc_runtime::api::create_endpoint_for_process(process_id) {
+    // Bill the endpoint's reserved queues to the caller's Job; a process with
+    // no resolvable job (exiting) falls back to the unbilled owner path.
+    let created = match multitask::process_job(process_id) {
+        Some(job) => kernel_ipc_runtime::api::create_endpoint_for_process_in_group(
+            process_id,
+            job.charge_group(),
+        ),
+        None => kernel_ipc_runtime::api::create_endpoint_for_process(process_id),
+    };
+    match created {
         Ok(endpoint) => {
             ipc_trace!(
                 "ipc endpoint created: process={} endpoint={}",
@@ -903,7 +913,7 @@ pub(super) fn syscall_linux_rustos_ipc_register_linux_syscall_endpoint(endpoint:
         return linux_errno(LINUX_EAGAIN);
     }
     SERVICE_ENDPOINT_CAPS[linux_abi::IPC_SERVICE_LINUX_SYSCALLD as usize]
-        .store(authorization.capability, Ordering::Release);
+        .store(authorization.capability.to_wire(), Ordering::Release);
     SERVICE_ENDPOINT_OWNERS[linux_abi::IPC_SERVICE_LINUX_SYSCALLD as usize]
         .store(process_id, Ordering::Release);
     if let Err(errno) =
@@ -925,7 +935,7 @@ pub(super) fn syscall_linux_rustos_ipc_register_linux_syscall_endpoint(endpoint:
         linux_abi::IPC_SERVICE_LINUX_SYSCALLD,
         endpoint,
         process_id,
-        authorization.capability
+        authorization.capability.to_wire()
     );
     record_service_endpoint_milestone(
         "ipc-service-register",
@@ -962,7 +972,7 @@ pub(super) fn syscall_linux_rustos_ipc_register_service_endpoint(
         }
         if owner != process_id
             && !current_process_has_service_capability_locked(
-                rustos_user_abi::syscall::IPC_SERVICE_CAP_ROOT_SUPERVISOR,
+                ServiceCapability::RootSupervisor,
                 process_id,
             )
         {
@@ -1039,9 +1049,9 @@ pub(super) fn syscall_linux_rustos_ipc_register_service_endpoint(
     if service_id == linux_abi::IPC_SERVICE_ROOTD && sealed_rootd_owner == 0 {
         ROOTD_BOOTSTRAP_OWNER.store(process_id, Ordering::Release);
     }
-    SERVICE_ENDPOINT_CAPS[index].store(authorization.capability, Ordering::Release);
+    SERVICE_ENDPOINT_CAPS[index].store(authorization.capability.to_wire(), Ordering::Release);
     SERVICE_ENDPOINT_OWNERS[index].store(process_id, Ordering::Release);
-    if authorization.capability & rustos_user_abi::syscall::IPC_SERVICE_CAP_PAGER_POLICY != 0 {
+    if authorization.capability.contains(ServiceCapability::PagerPolicy) {
         // ORDERING: Release publishes the pager owner before its endpoint
         // becomes visible, so a mapping that can reach the pager transport
         // already observes which process must be excluded from it.
@@ -1056,7 +1066,7 @@ pub(super) fn syscall_linux_rustos_ipc_register_service_endpoint(
         service_id,
         endpoint,
         process_id,
-        authorization.capability
+        authorization.capability.to_wire()
     );
     record_service_endpoint_milestone("ipc-service-register", service_id, process_id, endpoint);
     wake_registered_service_endpoint_waiters(service_id, process_id);
@@ -1066,7 +1076,7 @@ pub(super) fn syscall_linux_rustos_ipc_register_service_endpoint(
 fn service_capability(service_id: u64) -> Result<ServiceCapabilityAuthorization, i64> {
     if service_id == linux_abi::IPC_SERVICE_ROOTD {
         return Ok(ServiceCapabilityAuthorization {
-            capability: rustos_user_abi::syscall::IPC_SERVICE_CAP_ROOT_SUPERVISOR,
+            capability: ServiceCapabilitySet::EMPTY.with(ServiceCapability::RootSupervisor),
             rootd_epoch: None,
         });
     }
@@ -1081,12 +1091,15 @@ fn service_capability(service_id: u64) -> Result<ServiceCapabilityAuthorization,
         multitask::current_user_process_id().unwrap_or_default(),
         rootd_epoch,
     );
-    let capability = service_capability_via_rootd(service_id)?;
+    // Rootd's mask is untrusted input to the kernel: a bit that names no
+    // assigned capability refuses the registration instead of being stored.
+    let capability = ServiceCapabilitySet::from_wire(service_capability_via_rootd(service_id)?)
+        .ok_or(LINUX_EINVAL)?;
     record_service_endpoint_milestone(
         "ipc-service-capability-reply",
         service_id,
         multitask::current_user_process_id().unwrap_or_default(),
-        capability,
+        capability.to_wire(),
     );
     Ok(ServiceCapabilityAuthorization {
         capability,

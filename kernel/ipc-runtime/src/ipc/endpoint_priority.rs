@@ -57,6 +57,8 @@ pub(super) struct EndpointObject {
     /// One queue-bypassing byte-only synchronous rendezvous. Its reply object
     /// owns the fixed frame; this field is only endpoint publication custody.
     pub(super) fast_reply: Option<u64>,
+    /// Job charge group and bytes billed for the reserved queues, if any.
+    pub(super) kmem: Option<(usize, u64)>,
 }
 
 impl EndpointObject {
@@ -73,6 +75,25 @@ impl EndpointObject {
             consecutive_system_deliveries: 0,
             waiting_receivers,
             fast_reply: None,
+            kmem: None,
+        }
+    }
+
+    /// Bytes of queue storage reserved up front (capacity, not length).
+    pub(super) fn reserved_queue_bytes(&self) -> u64 {
+        let messages = self.pending_messages.capacity() + self.pending_system_messages.capacity();
+        (messages * core::mem::size_of::<u64>()
+            + self.waiting_receivers.capacity() * core::mem::size_of::<EndpointReceiverWaiter>())
+            as u64
+    }
+
+    pub(super) fn refund_kmem(&self) {
+        if let Some((group, bytes)) = self.kmem {
+            kernel_mm::api::kmem_charge::uncharge(
+                kernel_mm::api::kmem_charge::Class::IpcEndpoint,
+                group,
+                bytes,
+            );
         }
     }
 

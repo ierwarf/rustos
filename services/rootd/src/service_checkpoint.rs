@@ -36,6 +36,7 @@ pub(crate) struct ServiceCheckpointStore {
     pub(crate) providers: ProviderBilling,
     pub(crate) health: HealthBook,
     pub(crate) updates: UpdateBook,
+    pub(crate) activation: super::activation_owner::ActivationOwner,
 }
 
 impl ServiceCheckpointStore {
@@ -49,6 +50,7 @@ impl ServiceCheckpointStore {
             providers: ProviderBilling::new(),
             health: HealthBook::new(),
             updates: UpdateBook::new(),
+            activation: super::activation_owner::ActivationOwner::new(),
         }
     }
 
@@ -580,5 +582,20 @@ mod tests {
         store.mutate(3, replacement).unwrap();
         assert_eq!(store.compact(3, tombstone), Err(ESTALE));
         assert_eq!(store.scan(3, 0, 8).unwrap().0, vec![replacement]);
+
+        // The reused key later becomes a tombstone of its own. The old proof
+        // is a tombstone too, so only the exact-record comparison (not the
+        // tombstone-flag check) can refuse it.
+        let mut second = replacement;
+        second.flags = SERVICE_CHECKPOINT_FLAG_TOMBSTONE;
+        second.value_len = 0;
+        second.value.fill(0);
+        second.operation_lo = 43;
+        second.revision = replacement.revision + 1;
+        store.mutate(3, second).unwrap();
+        assert_eq!(store.compact(3, tombstone), Err(ESTALE));
+        assert_eq!(store.scan(3, 0, 8).unwrap().0, vec![second]);
+        assert_eq!(store.compact(3, second), Ok(false));
+        assert!(store.scan(3, 0, 8).unwrap().0.is_empty());
     }
 }

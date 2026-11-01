@@ -175,7 +175,7 @@ impl SessionLedger {
     pub(crate) fn release_trusted(
         &mut self,
         token: u64,
-        kernel_release: impl FnMut(u64, u64, u64) -> Result<(), i32>,
+        mut kernel_release: impl FnMut(u64, u64, u64) -> Result<(), i32>,
     ) -> Result<u64, i32> {
         if token == 0 {
             return Err(EINVAL);
@@ -310,7 +310,15 @@ mod tests {
     fn late_charge_is_invalidated_by_exact_token_cancellation() {
         let mut book = SessionLedger::new();
         book.bind_owner(10, |_, _, _| Ok(())).unwrap();
-        assert_eq!(book.release_trusted(23, |_, _, _| panic!("nothing to bill")), Ok(0));
+        // Cancelling an unseen token still fences it in the kernel ledger
+        // (job 0 = no expected Job), exactly once.
+        let mut fenced = 0;
+        assert_eq!(book.release_trusted(23, |job, owner, token| {
+            assert_eq!((job, owner, token), (0, 10, 23));
+            fenced += 1;
+            Ok(())
+        }), Ok(0));
+        assert_eq!(fenced, 1);
         assert_eq!(book.charge(23, 200, |_| Ok(7), |_, _| panic!("late charge")), Err(ESTALE));
         assert_eq!(book.release_trusted(23, |_, _, _| panic!("already canceled")), Ok(0));
         assert_eq!(book.charge(24, 201, |_| Ok(8), |_, _| Ok(())), Ok(8));

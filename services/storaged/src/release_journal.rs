@@ -116,6 +116,60 @@ impl ReleaseJournalFile{
         Ok(Self{file,path:path.to_owned(),id,records:count,
             fail_closed:false,cursor})
     }
+    /// Crash-recovery open. An append is acknowledged only after write, sync
+    /// and readback, and the exclusive writer lock allows at most one append
+    /// in flight, so an acknowledged record is never part of the damaged
+    /// tail. A tail of at most one record after the longest canonical prefix
+    /// (a partial record, or one complete record that fails decode/sequence/
+    /// order) is therefore an unacknowledged torn append: it is truncated and
+    /// synced. Anything larger, or damage that is not confined to the tail,
+    /// stays fail-closed. The caller receives the discarded byte count and
+    /// must treat a nonzero count as possible loss of an acknowledged record
+    /// (media rot is indistinguishable from a torn tail) and so as
+    /// rollback-required evidence, never as success.
+    pub(super) fn open_recovering(
+        path:&Path,id:JournalIdentity,authenticated_mount:bool,
+    )->Result<(Self,u64),i32>{
+        if !id.valid()||!authenticated_mount{return Err(ERROR_EPERM)}
+        let mut opts=OpenOptions::new();
+        opts.read(true).write(true).custom_flags(
+            libc::O_CLOEXEC|libc::O_NOFOLLOW,
+        );
+        let mut file=opts.open(path).map_err(status)?;
+        lock_exclusive(&file)?;
+        let meta=file.metadata().map_err(status)?;
+        if !meta.is_file()||meta.len()<HEADER_BYTES as u64{
+            return Err(ERROR_EPROTO)
+        }
+        let mut raw=[0u8;HEADER_BYTES];
+        file.read_exact(&mut raw).map_err(status)?;
+        if !exact_header(&raw,id){return Err(ERROR_EPERM)}
+        let body=meta.len()-HEADER_BYTES as u64;
+        let complete=body/RECORD_BYTES as u64;
+        if complete>MAX_RECORDS+1{return Err(ERROR_ENOSPC)}
+        let mut cursor=Cursor::new();
+        let mut valid=0u64;
+        while valid<complete {
+            let mut bytes=[0u8;RECORD_BYTES];
+            file.read_exact(&mut bytes).map_err(status)?;
+            let next=durable_recovery::decode(&bytes).ok()
+                .filter(|record|record.sequence==valid+1)
+                .and_then(|record|cursor.admit(record).ok());
+            let Some(next)=next else {break};
+            cursor=next;
+            valid+=1;
+        }
+        if valid>MAX_RECORDS{return Err(ERROR_ENOSPC)}
+        let keep=HEADER_BYTES as u64+valid*RECORD_BYTES as u64;
+        let discarded=meta.len()-keep;
+        if discarded>RECORD_BYTES as u64{return Err(ERROR_EPROTO)}
+        if discarded!=0 {
+            file.set_len(keep).map_err(status)?;
+            file.sync_all().map_err(status)?;
+        }
+        Ok((Self{file,path:path.to_owned(),id,records:valid,
+            fail_closed:false,cursor},discarded))
+    }
     /// Creating a new file is an explicit privileged provisioning action,
     /// NOT an implicit recovery fallback. If open_existing fails on boot,
     /// never silently call this function to discard prior acknowledgments.
@@ -270,5 +324,113 @@ mod tests{
         let mut bad=h;
         bad[11]=1;
         assert!(!exact_header(&bad,id));
+    }
+
+    fn temp_journal(tag:&str)->PathBuf{
+        let dir=std::env::temp_dir().join(format!(
+            "rstr-jnl-{}-{}-{}",std::process::id(),tag,
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                .unwrap().as_nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("release.journal")
+    }
+    fn id()->JournalIdentity{
+        JournalIdentity{device_id:2,namespace_generation:3,
+            volume_generation:4,rootd_owner:5}
+    }
+    fn rec(sequence:u64,kind:durable_recovery::Kind)->[u8;RECORD_BYTES]{
+        durable_recovery::encode(Record{sequence,transaction:9,service:7,
+            kind,generation:1,payload_hash:[sequence as u8;32]}).unwrap()
+    }
+    fn two_record_journal(tag:&str)->PathBuf{
+        use durable_recovery::Kind;
+        let path=temp_journal(tag);
+        let mut j=ReleaseJournalFile::provision_new(&path,id(),true).unwrap();
+        j.append_and_verify(0,rec(1,Kind::Begin),id()).unwrap();
+        j.append_and_verify(1,rec(2,Kind::OldImagePinned),id()).unwrap();
+        path
+    }
+    #[test]
+    fn strict_open_replays_and_second_writer_is_refused(){
+        let path=two_record_journal("strict");
+        let j=ReleaseJournalFile::open_existing(&path,id(),true).unwrap();
+        assert_eq!(j.records(),2);
+        assert_eq!(j.recovered_cursor().last_sequence,2);
+        assert_eq!(ReleaseJournalFile::open_existing(&path,id(),true).err(),
+            Some(libc::EWOULDBLOCK));
+        assert_eq!(ReleaseJournalFile::open_existing(
+            &path,JournalIdentity{rootd_owner:6,..id()},true).err().is_some(),true);
+    }
+    #[test]
+    fn partial_tail_blocks_strict_open_but_recovers_without_losing_acked_records(){
+        use durable_recovery::Kind;
+        let path=two_record_journal("partial");
+        {
+            let mut f=OpenOptions::new().append(true).open(&path).unwrap();
+            f.write_all(&rec(3,Kind::CandidateVerified)[..40]).unwrap();
+        }
+        assert_eq!(ReleaseJournalFile::open_existing(&path,id(),true).err(),
+            Some(ERROR_EPROTO));
+        let (mut j,discarded)=ReleaseJournalFile::open_recovering(
+            &path,id(),true).unwrap();
+        assert_eq!(discarded,40);
+        assert_eq!(j.records(),2);
+        // The next append continues the exact sequence.
+        j.append_and_verify(2,rec(3,Kind::CandidateVerified),id()).unwrap();
+        drop(j);
+        let j=ReleaseJournalFile::open_existing(&path,id(),true).unwrap();
+        assert_eq!(j.recovered_cursor().last_kind,Some(Kind::CandidateVerified));
+    }
+    #[test]
+    fn one_corrupt_complete_tail_record_is_discarded_but_midfile_damage_is_not(){
+        use durable_recovery::Kind;
+        // A full-length record whose bytes are garbage at the very tail.
+        let path=two_record_journal("torn");
+        {
+            let mut f=OpenOptions::new().append(true).open(&path).unwrap();
+            let mut bad=rec(3,Kind::CandidateVerified);
+            bad[20]^=0xff;
+            f.write_all(&bad).unwrap();
+        }
+        let (j,discarded)=ReleaseJournalFile::open_recovering(
+            &path,id(),true).unwrap();
+        assert_eq!(discarded,RECORD_BYTES as u64);
+        assert_eq!(j.records(),2);
+        drop(j);
+        // Damage to a record that is followed by more data is not a tail.
+        let path=two_record_journal("mid");
+        {
+            let mut j=ReleaseJournalFile::open_existing(&path,id(),true).unwrap();
+            j.append_and_verify(2,rec(3,Kind::CandidateVerified),id()).unwrap();
+            j.append_and_verify(3,rec(4,Kind::Quiesced),id()).unwrap();
+        }
+        {
+            let mut f=OpenOptions::new().read(true).write(true).open(&path).unwrap();
+            f.seek(SeekFrom::Start((HEADER_BYTES+RECORD_BYTES+20) as u64)).unwrap();
+            f.write_all(&[0xaa]).unwrap();
+        }
+        assert_eq!(ReleaseJournalFile::open_recovering(&path,id(),true).err(),
+            Some(ERROR_EPROTO));
+        // An unauthenticated mount or wrong identity never recovers.
+        assert_eq!(ReleaseJournalFile::open_recovering(&path,id(),false).err(),
+            Some(ERROR_EPERM));
+    }
+    #[test]
+    fn append_rejects_gaps_reorders_and_stale_indices(){
+        use durable_recovery::Kind;
+        let path=temp_journal("order");
+        let mut j=ReleaseJournalFile::provision_new(&path,id(),true).unwrap();
+        j.append_and_verify(0,rec(1,Kind::Begin),id()).unwrap();
+        // Skipped state, repeated index, wrong sequence and foreign owner.
+        assert_eq!(j.append_and_verify(1,rec(2,Kind::Quiesced),id()),
+            Err(ERROR_EPROTO));
+        assert_eq!(j.append_and_verify(0,rec(1,Kind::Begin),id()),
+            Err(ERROR_ENOSPC));
+        assert_eq!(j.append_and_verify(1,rec(3,Kind::OldImagePinned),id()),
+            Err(ERROR_EPROTO));
+        assert_eq!(j.append_and_verify(1,rec(2,Kind::OldImagePinned),
+            JournalIdentity{rootd_owner:99,..id()}),Err(ERROR_EPERM));
+        j.append_and_verify(1,rec(2,Kind::OldImagePinned),id()).unwrap();
+        assert_eq!(j.records(),2);
     }
 }

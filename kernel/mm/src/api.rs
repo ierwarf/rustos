@@ -93,6 +93,11 @@ pub mod charge {
     pub use crate::memory::charge::*;
 }
 
+/// Hierarchical kernel-object byte charge groups (see `memory::kmem_charge`).
+pub mod kmem_charge {
+    pub use crate::memory::kmem_charge::*;
+}
+
 pub mod phys {
     pub use crate::memory::phys::*;
 

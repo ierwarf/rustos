@@ -126,7 +126,7 @@ pub(super) fn execute(
         client_job:job,client_job_generation:gen,kernel_receipt:receipt,
         ..req
     };
-    provider_wire::encode_vec(ack).map_err(|_|12)
+    provider_wire::encode(ack).map_err(|_|12)
 }
 #[cfg(test)]
 mod tests {

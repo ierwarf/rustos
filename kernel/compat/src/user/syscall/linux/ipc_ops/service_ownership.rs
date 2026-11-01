@@ -74,10 +74,10 @@ pub(crate) fn process_owns_service_endpoint(process_id: u64) -> bool {
 }
 
 pub(super) fn current_process_has_service_capability_locked(
-    capability: u64,
+    capability: ServiceCapability,
     process_id: u64,
 ) -> bool {
-    if capability == 0 || multitask::is_user_process_exiting(process_id) {
+    if multitask::is_user_process_exiting(process_id) {
         return false;
     }
     SERVICE_ENDPOINTS
@@ -89,13 +89,14 @@ pub(super) fn current_process_has_service_capability_locked(
             // tuple cannot combine generations during revoke/republication.
             endpoint.load(Ordering::Acquire) != 0
                 && owner.load(Ordering::Acquire) == process_id
-                && caps.load(Ordering::Acquire) & capability == capability
+                && ServiceCapabilitySet::from_wire(caps.load(Ordering::Acquire))
+                    .is_some_and(|held| held.contains(capability))
         })
 }
 
 pub(super) fn current_process_can_lookup_service_endpoint() -> bool {
     current_process_has_service_capability(
-        rustos_user_abi::syscall::IPC_SERVICE_CAP_ROOT_SUPERVISOR,
+        ServiceCapability::RootSupervisor,
     )
 }
 

@@ -14,18 +14,15 @@ decision. Human docs are not bootstrap context.
 
 Search before opening large files. Only binary artifacts and whole-file reads
 of log/build/vendor output or text above 1 MiB are blocked; symbol navigation
-and ranged reads are never limited. Default source read is a focused range;
-expand when a search identifies the missing context. Start ordinary searches at
-6–12 results and avoid reopening unchanged ranges.
+and ranged reads are never limited. Read as much source as the task needs,
+including whole files and several subsystems at once; the aim is to keep logs
+and generated output out of context, not to limit what may be explored. Avoid
+reopening unchanged ranges.
 
-Batch 3–10 known independent probes when that removes model/tool round trips.
-Keep an ordinary combined model-visible batch <=8 KiB; a justified critical
-batch may reach 12 KiB. Narrow a query before splitting a large batch into many
-model turns.
+Batch known independent probes when that removes model/tool round trips.
 
 Use `rg` for exact text. Serena is the preferred semantic navigator/editor when
-symbols or references matter. Default Serena answer budgets are 3,000–4,000
-characters and must not exceed 8,000. Once Serena is useful, prefer continuing
+symbols or references matter. Serena answer sizes are not capped by policy. Once Serena is useful, prefer continuing
 with focused Serena reads/references/edits instead of reverting to broad raw
 reads by habit. This is a preference, not a hard requirement.
 
@@ -50,15 +47,17 @@ Never patch generated/vendor output as a shortcut.
 
 ## Validation and long sessions
 
-Post-edit hooks run only the cheap source-contract lint; they do not run a full
-workspace check. After product-source edits run `cargo xtask dev-plan`; execute
-`now` lanes while iterating and relevant `stable-batch` lanes once after the
-change settles. The pre-commit gate enforces `cargo xtask check` for an
-unvalidated final source fingerprint. Agent/docs-only changes use focused
-selftests.
+No hook runs a check after an edit or at commit time except the agent-policy
+selftest when agent policy files are committed. Validation is chosen by the task
+and run after a coherent batch of changes: `cargo xtask dev-plan` suggests the
+checks for the changed files, `cargo xtask check` is the quick compile gate, and
+formal/KVM runs happen when the user asks for them or a task needs them. The
+hooks that remain only stop irreversible mistakes: destructive shell commands,
+force-push, hook bypass, secrets in prompts, and reading binaries or log
+dumps.
 
-Hooks are silent on success and should emit one primary failure diagnostic plus
-a tiny tail. Do not increase output limits/timeouts as routine recovery.
+Hooks are silent on success and emit one primary failure diagnostic plus a tiny
+tail.
 
 Project Claude Code config intentionally does not override the model context window or
 auto-compaction threshold. Follow the selected model/runtime defaults so this

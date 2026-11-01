@@ -29,24 +29,19 @@ impl VfsState {
                 cursor,
                 None,
             )?;
-            let wire_size = size_of::<ServiceCheckpointRecordWire>();
-            let record_count = response.payload_len as usize / wire_size;
-            if !(response.payload_len as usize).is_multiple_of(wire_size)
-                || response.value1 as usize != record_count
+            let page = rustos_svc_runtime::checkpoint_idl::decode_framed(
+                &response.payload[..response.payload_len as usize],
+            )
+            .map_err(|_| EIO)?;
+            let record_count = page.len();
+            if response.value1 as usize != record_count
                 || cursor
                     .checked_add(record_count as u64)
                     .is_none_or(|next| response.value0 != next)
             {
                 return Err(EIO);
             }
-            for offset in (0..response.payload_len as usize).step_by(wire_size) {
-                let record = unsafe {
-                    core::ptr::read_unaligned(
-                        response.payload[offset..]
-                            .as_ptr()
-                            .cast::<ServiceCheckpointRecordWire>(),
-                    )
-                };
+            for record in page {
                 let key = checkpoint_revision_key(&record);
                 if !valid_checkpoint_record(&record)
                     || candidate

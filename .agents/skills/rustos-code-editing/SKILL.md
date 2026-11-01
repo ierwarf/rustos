@@ -18,21 +18,21 @@ Use the cheapest evidence that establishes correctness.
   `sed`/whole-file reads or manual editing by habit.
 - Use `apply_patch` or narrow shell/text operations when they are smaller,
   clearer, or Serena is unavailable/ill-suited.
-- Read only the exact symbol/range needed; after edits prefer the changed symbol
-  or `git diff -U3` over rereading a large unchanged region.
+- Read what the goal requires, including whole files and every dependent call
+  site; after edits prefer `git diff` over rereading unchanged regions.
 
 ## Correctness
 
 For structural/critical work, identify execution context and trust boundary and
-check only the applicable subset: lock order, IRQ/preemption,
+check the applicable subset: lock order, IRQ/preemption,
 blocking/allocation, user copy/faults, publication/teardown, capability rights
 and generation, ABI/wire format, cancellation/timeouts, and partial
 initialization/hot-unplug. Keep policy in the owning user service.
 
 ## Validation
 
-After product-source edits run `cargo xtask dev-plan`; execute selected `now`
-checks during iteration and relevant `stable-batch` checks once when stable. For
+Edit a coherent batch first, then run `cargo xtask dev-plan` and the selected
+checks once; do not validate after every file. For
 DVM work run `make -C driver-domains/linux build-plan` before integration.
 Never bypass hooks/signing or use clean builds as routine recovery.
 

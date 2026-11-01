@@ -16,8 +16,8 @@
 //! - **Evidence:** `futex-wait-lifecycle`.
 use super::*;
 use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
-use rustos_user_abi::syscall::{
-    IPC_SERVICE_CAP_PROCESS_POLICY, PROCD_OP_THREAD_PLAN,
+use rustos_user_abi::syscall::{ServiceCapability,
+    PROCD_OP_THREAD_PLAN,
     SYSCALL_OFFLOAD_OP_LINUX_ARCH_PRCTL_POLICY,
 };
 use x86_64::VirtAddr;
@@ -132,11 +132,11 @@ fn validate_futex_policy_locally(op: u64, val3: u64) -> Result<(), i64> {
 }
 
 fn current_process_is_syscalld_policy_owner() -> bool {
-    ipc_ops::current_process_has_service_capability(IPC_SERVICE_CAP_LINUX_SYSCALL_POLICY)
+    ipc_ops::current_process_has_service_capability(ServiceCapability::LinuxSyscallPolicy)
 }
 
 fn current_process_is_procd_policy_owner() -> bool {
-    ipc_ops::current_process_has_service_capability(IPC_SERVICE_CAP_PROCESS_POLICY)
+    ipc_ops::current_process_has_service_capability(ServiceCapability::ProcessPolicy)
 }
 
 // RING3-MIGRATION-REFERENCE START: scheduler-thread substrate exception: procd

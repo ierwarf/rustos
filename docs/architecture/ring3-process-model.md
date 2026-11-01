@@ -113,11 +113,11 @@ topology, so a component cannot reach what no ancestor passed down)**.
 | Step | Target | 2026-10-31 status |
 | --- | --- | --- |
 | 1 | Root Job, membership and group kill | Implemented |
-| 2 | Chunked process directory; Job process/thread/page quotas | Additional unvalidated memory.high event counter and memory.min rootd OOM protection draft; kmem bytes and acceptance remain missing |
+| 2 | Chunked process directory; Job process/thread/page quotas | memory.high event counter and memory.min rootd OOM exclusion exist; only ProcessObject bytes are charged as kmem |
 | 3 | Replace legacy service authority with Job policy | JobPolicy 3a exists; cutover unproven |
 | 4 | Generated IDL and unified service runtime | Production post-init lease query/reclaim migrated to generated IDL (opcodes 517/518), scalar operations 8/9 retired; other services and shared runtime migration remain open |
 | 5 | Declarative components, realms, capability routing and one supervisor | Component graph and immutable rootd route/role manifests implemented; unified live supervisor and kernel capability transfer open |
-| 6 | Client-funded session quotas | Real kernel-backed client Job billing now wired for runtimed console creation and teardown, including hierarchical session ceilings and generation-bound Job refunds; generic provider sessions and durable crash recovery remain open |
+| 6 | Client-funded session quotas | Kernel-backed client Job billing wired for runtimed console sessions, netd sockets and vfsd open descriptions (canonical IDL 520, ACK outbox); durable rootd crash recovery and kernel-generation provider identity remain open |
 | 7 | Linux/Windows personality servers and ring0 policy reduction | Existing service brokers preserved; remaining slowpath-only migration unproven; ring0 hot paths deliberately untouched |
 | 8 | Operational logs, crash reporting, health and rollback | Health/update policy models, rootd checkpoint and transitive service revocation implemented; durable recovery and verified rollback open |
 
@@ -175,27 +175,13 @@ Ring3 컴포넌트 정책 모델, 스테이징 IDL 생성, rootd의 역할/라�
 구체적 구현·검증은 [Job Model](job-model.md)의 as-built 섹션과
 실제 소스를 기준으로 판단하세요.
 
-### Unvalidated 2026-10-31 draft
+### Current status
 
 Kernel session counters, rootd client-Job token settlement, loaderd Job session
-limits and runtime pre-activation billing are now present in source. The
-memory.high/min slow Job QoS syscall and OOM-exclusion policy are also present.
-The remaining 3/4/5/7/8 migrations are not complete, and kernel-byte
-accounting remains missing. No tests were run for this draft.
-
-
-## 2026-10-31 integrated 8-stage draft ledger
-
-The current interconnected source-draft status, including new rights-scoped
-kmem Object Box accounting, generated supervisor health/update controls,
-rootd checkpoint process-crash replay, kernel-owned client-session tokens,
-initd rollback-required launch blocking and remaining completion work is at
-[Ring3 eight-stage Codex draft status](../validation/ring3-8stage-draft-status.md).
-
-This is uncompiled source, not an acceptance claim. Full object-byte charging,
-disk durability, signed-image rollback and final unified descriptor transfer
-remain unfinished.
-
+limits, runtime pre-activation billing and netd/vfsd provider billing are wired.
+The memory.high/min slow Job QoS syscall and OOM-exclusion policy are present.
+Stages 3/4/5/7/8 remain partial; the exact wired / model-only / missing split is
+in [Ring3 eight-stage status](../validation/ring3-8stage-status.md).
 
 한국어 최신 상태: 2단계에서 실제 ProcessObject Box 메모리 크기에 대한
 Job별 한도 검사가 추가됐지만 전체 커널 객체의 kmem 과금은 아직 미완성입니다.

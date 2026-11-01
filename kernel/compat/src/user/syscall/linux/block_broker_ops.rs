@@ -20,13 +20,13 @@ use super::*;
 
 use alloc::vec::Vec;
 use kernel_io_manager::api::{DvmBlockError, DvmBlockPoll, DvmBlockTicket, block as block_api};
-use rustos_user_abi::syscall::{
+use rustos_user_abi::syscall::{ServiceCapability,
     BLOCK_BROKER_ABI_VERSION, BLOCK_BROKER_FLAG_FUA, BLOCK_BROKER_INFO_FLAG_READ_ONLY,
     BLOCK_BROKER_KNOWN_FLAGS, BLOCK_BROKER_MAX_IO_BYTES, BLOCK_BROKER_OP_DVM_CANCEL,
     BLOCK_BROKER_OP_DVM_COLLECT, BLOCK_BROKER_OP_DVM_INFO, BLOCK_BROKER_OP_DVM_SUBMIT_FLUSH,
     BLOCK_BROKER_OP_DVM_SUBMIT_READ, BLOCK_BROKER_OP_DVM_SUBMIT_WRITE, BLOCK_BROKER_OP_DVM_WAIT,
     BLOCK_BROKER_WAIT_MAX_TIMEOUT_MS, DvmBlockInfoWire, DvmBlockTicketWire,
-    IPC_SERVICE_CAP_STORAGE_POLICY, RustosBlockBrokerArgs,
+    RustosBlockBrokerArgs,
 };
 
 static BLOCK_BROKER_REJECTION_COUNT: core::sync::atomic::AtomicU64 =
@@ -90,7 +90,7 @@ pub(super) fn syscall_linux_rustos_block_broker(args_ptr: u64) -> u64 {
         | BLOCK_BROKER_OP_DVM_COLLECT
         | BLOCK_BROKER_OP_DVM_CANCEL
         | BLOCK_BROKER_OP_DVM_WAIT => {
-            if !ipc_ops::current_process_has_service_capability(IPC_SERVICE_CAP_STORAGE_POLICY) {
+            if !ipc_ops::current_process_has_service_capability(ServiceCapability::StoragePolicy) {
                 if let Some((process_id, capabilities)) =
                     ipc_ops::current_process_service_capability_snapshot()
                 {
@@ -99,7 +99,7 @@ pub(super) fn syscall_linux_rustos_block_broker(args_ptr: u64) -> u64 {
                             "dvm-block: broker denied pid={} capabilities={:#x} required={:#x}",
                             process_id,
                             capabilities,
-                            IPC_SERVICE_CAP_STORAGE_POLICY,
+                            ServiceCapability::StoragePolicy.bit(),
                         )
                         .as_bytes(),
                     );

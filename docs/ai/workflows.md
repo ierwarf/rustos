@@ -94,7 +94,8 @@ recipes below use that plan for check/build selection, not ad hoc substitutes.
 ## Reduce context mid-task
 
 1. Summarize findings into the current response before opening more files.
-2. Prefer one subsystem at a time.
+2. Work across as many subsystems as the goal needs; keep a short list of
+   what is done and what is still disconnected.
 3. Close questions by pointing at source path + line/symbol — do not paste
    long code.
 

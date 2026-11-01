@@ -16,15 +16,14 @@
 
 use super::*;
 
-pub(crate) fn current_process_has_service_capability(capability: u64) -> bool {
+pub(crate) fn current_process_has_service_capability(capability: ServiceCapability) -> bool {
     current_process_with_service_capability(capability).is_some()
 }
 
 /// Return the exact syscall subject whose live endpoint owns `capability`.
-pub(crate) fn current_process_with_service_capability(capability: u64) -> Option<u64> {
-    if capability == 0 {
-        return None;
-    }
+pub(crate) fn current_process_with_service_capability(
+    capability: ServiceCapability,
+) -> Option<u64> {
     let process_id = multitask::current_user_process_id()?;
     let _registry = SERVICE_ENDPOINT_REGISTRY_MUTATION.lock();
     current_process_has_service_capability_locked(capability, process_id).then_some(process_id)

@@ -77,8 +77,10 @@ rg -q 'service_capability_via_rootd' kernel/compat/src/user/syscall/linux/ipc_op
     fail "compat no longer resolves service authority through rootd"
 rg -q 'fn service_policy_capability' services/rootd/src/main.rs ||
     fail "rootd service capability policy source is missing"
-rg -q 'IPC_SERVICE_INPUTD => target == IPC_SERVICE_NETD' services/rootd/src/main.rs ||
+rg -qU 'subject: IPC_SERVICE_INPUTD,\s*target: IPC_SERVICE_NETD,' services/rootd/src/service_manifest.rs ||
     fail "inputd to netd lifecycle dependency is not explicitly least-authority"
+rg -q 'component_policy::route_allowed\(subject, target\)' services/rootd/src/main.rs ||
+    fail "rootd lifecycle dependency checks no longer use the routing manifest"
 
 # Preserve native executable compatibility while policy stays in loaderd/procd.
 for source in \

@@ -22,6 +22,13 @@ pub mod endpoint {
         crate::ipc::create_endpoint()
     }
 
+    pub fn create_for_process_in_group(
+        owner_process_id: u64,
+        kmem_group: usize,
+    ) -> Result<KernelEndpointHandle, IpcError> {
+        crate::ipc::create_endpoint_for_process_in_group(owner_process_id, kmem_group)
+    }
+
     pub fn create_for_task(owner_task_id: u64) -> Result<KernelEndpointHandle, IpcError> {
         crate::ipc::create_endpoint_for_task(Some(owner_task_id))
     }
@@ -488,7 +495,8 @@ pub use endpoint::{
     cancel_call as cancel_endpoint_call,
     cancel_call_with_transfers as cancel_endpoint_call_with_transfers,
     cancel_calls_for_task as cancel_endpoint_calls_for_task, create as create_endpoint,
-    create_for_process as create_endpoint_for_process, create_for_task as create_endpoint_for_task,
+    create_for_process as create_endpoint_for_process,
+    create_for_process_in_group as create_endpoint_for_process_in_group, create_for_task as create_endpoint_for_task,
     enqueue_call as enqueue_endpoint_call,
     enqueue_call_with_handles as enqueue_endpoint_call_with_handles,
     enqueue_call_with_handles_and_priority as enqueue_endpoint_call_with_handles_and_priority,

@@ -12,6 +12,7 @@ use rustos_svc_runtime::provider_client::{self,ProviderClient,Receipt,State,Erro
 use rustos_component_model::provider_wire::Frame;
 use rustos_user_abi::syscall::IPC_SERVICE_NETD;
 const RETRIES:usize=3;
+const ACK_BATCH:usize=8;
 static CLIENT:OnceLock<Result<Mutex<ProviderClient>,i32>>=OnceLock::new();
 // A close is logically final once the provider has withdrawn the object.
 // Ambiguous kernel accounting is retained as an exact token and refunded by
@@ -55,7 +56,9 @@ fn refund_worker() {
                     thread::sleep(Duration::from_millis(10));
                 }
             }
-            None=>thread::sleep(Duration::from_millis(20)),
+            None=>{
+                if flush_acks()==0 {thread::sleep(Duration::from_millis(20))}
+            }
         }
     }
 }
@@ -161,7 +164,7 @@ fn cancel_unpublished(token:u64)->Result<(),i32>{
         let mut book=lock()?;
         book.cancelled(token,ack).map_err(errno)?;
     }
-    let _=provider_client::acknowledge_receipt(ack);
+    flush_acks();
     Ok(())
 }
 pub(super) fn release_after_final_close(token:u64)->Result<(),i32>{
@@ -184,9 +187,26 @@ pub(super) fn release_after_final_close(token:u64)->Result<(),i32>{
         book.released(token,ack).map_err(errno)?;
     }
     // On ACK loss the rootd tombstone stays, but the kernel refund is final.
-    // Tombstone cleanup is best effort, never another socket close.
-    let _=provider_client::acknowledge_receipt(ack);
+    // The receipt ACK stays in the client's bounded outbox and is retried by
+    // the control worker; it is never another socket close.
+    flush_acks();
     Ok(())
+}
+/// Drain the receipt-ACK outbox without holding the ledger lock across IPC.
+/// Bounded per call; a transport failure leaves the receipt queued.
+pub(super) fn flush_acks()->usize{
+    let mut done=0;
+    while done<ACK_BATCH {
+        let frame={
+            match lock(){Ok(book)=>book.next_ack(),Err(_)=>return done}
+        };
+        let Some(frame)=frame else {break};
+        let Ok(reply)=provider_client::acknowledge_frame(frame) else {break};
+        let Ok(mut book)=lock() else {break};
+        if book.ack_done(frame,reply).is_err(){break}
+        done+=1;
+    }
+    done
 }
 pub(super) fn recheck_ambiguous(token:u64)->Result<(),i32>{
     let (state,_)={lock()?.pending(token).map_err(errno)?};
