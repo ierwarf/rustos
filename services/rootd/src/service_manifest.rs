@@ -1,7 +1,9 @@
 //! Immutable root-owned bootstrap and post-init scheduling manifest.
 
+use rustos_component_model::personality::{Personality, SlowRequest};
+use rustos_component_model::policy_ops::SlowBrokerOperation as Op;
 use rustos_user_abi::syscall::{
-    RustosSchedulingContextPolicy, IPC_SERVICE_DEVMGRD, IPC_SERVICE_INITD, IPC_SERVICE_INPUTD,
+    RustosSchedulingContextPolicy, ServiceCapability, IPC_SERVICE_ROOTD, IPC_SERVICE_DEVMGRD, IPC_SERVICE_INITD, IPC_SERVICE_INPUTD,
     IPC_SERVICE_LINUX_SYSCALLD, IPC_SERVICE_LOADERD, IPC_SERVICE_NETD, IPC_SERVICE_PAGERD,
     IPC_SERVICE_PROCD, IPC_SERVICE_SESSIOND, IPC_SERVICE_STORAGED, IPC_SERVICE_UISERVER,
     IPC_SERVICE_VFSD, TASK_WEIGHT_INTERACTIVE_FLAG,
@@ -257,67 +259,98 @@ pub(super) const SERVICE_ROUTING_MANIFEST: [ServiceRouteSpec; 15] = [
     },
 ];
 
-/// Immutable positive service-role registry. A role bit is an *upper bound*
-/// on the service's fixed policy role; kernel-stamped sender identity and the
-/// currently sealed lease are still required to exercise the capability.
-/// This registry is never writable by service requests or application input.
+/// What a service may do for a personality: act on one class of slow request
+/// inside one namespace (see `personality_policy`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) struct ServiceRoleSpec {
-    pub(super) service_id: u64,
-    pub(super) capability: rustos_user_abi::syscall::ServiceCapability,
+pub(super) struct PersonalityGrant {
+    pub(super) personality: Personality,
+    pub(super) request: SlowRequest,
+    pub(super) namespace: u64,
 }
 
-pub(super) const SERVICE_ROLE_MANIFEST: [ServiceRoleSpec; 13] = [
-    ServiceRoleSpec {
-        service_id: rustos_user_abi::syscall::IPC_SERVICE_LINUX_SYSCALLD,
-        capability: rustos_user_abi::syscall::ServiceCapability::LinuxSyscallPolicy,
+/// The one immutable policy record of a service. Every authority rootd hands
+/// out for a service is derived from this single row: the typed kernel role
+/// installed with `SYS_RUSTOS_SERVICE_POLICY` (the route table comes from the
+/// dependency and routing manifests above), the positive slow-operation grants
+/// (`service_grants`) and the personality grants (`personality_policy`).
+/// Keeping them in one row is what lets `service_policy_preflight` check them
+/// against each other, which three separate tables could not. A row is an
+/// upper bound only: the kernel-stamped sender and the live lease are still
+/// required to exercise it. It is never writable by requests or applications.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ServicePolicy {
+    pub(super) service_id: u64,
+    pub(super) capability: rustos_user_abi::syscall::ServiceCapability,
+    /// Slow operations beyond the ones every service holds
+    /// (`service_grants::BASE_OPERATIONS`, plus recovery checkpoints when
+    /// `checkpoints` is set).
+    pub(super) slow_ops: &'static [Op],
+    pub(super) checkpoints: bool,
+    pub(super) personalities: &'static [PersonalityGrant],
+}
+
+pub(super) const DEFAULT_NAMESPACE: u64 = 1;
+const EXECUTABLE_IMAGES: &[PersonalityGrant] = &[
+    PersonalityGrant {
+        personality: Personality::Linux,
+        request: SlowRequest::ExecutableImage,
+        namespace: DEFAULT_NAMESPACE,
     },
-    ServiceRoleSpec {
-        service_id: rustos_user_abi::syscall::IPC_SERVICE_VFSD,
-        capability: rustos_user_abi::syscall::ServiceCapability::VfsPolicy,
+    PersonalityGrant {
+        personality: Personality::Windows,
+        request: SlowRequest::ExecutableImage,
+        namespace: DEFAULT_NAMESPACE,
     },
-    ServiceRoleSpec {
-        service_id: rustos_user_abi::syscall::IPC_SERVICE_NETD,
-        capability: rustos_user_abi::syscall::ServiceCapability::NetPolicy,
+];
+
+const fn policy(
+    service_id: u64,
+    capability: rustos_user_abi::syscall::ServiceCapability,
+    slow_ops: &'static [Op],
+) -> ServicePolicy {
+    ServicePolicy { service_id, capability, slow_ops, checkpoints: true, personalities: &[] }
+}
+
+pub(super) const SERVICE_POLICY_MANIFEST: [ServicePolicy; 13] = [
+    policy(IPC_SERVICE_LINUX_SYSCALLD, ServiceCapability::LinuxSyscallPolicy, &[]),
+    policy(
+        IPC_SERVICE_VFSD,
+        ServiceCapability::VfsPolicy,
+        &[Op::MountFilesystem, Op::ModifyFilesystemPolicy, Op::ChargeClientSession],
+    ),
+    policy(
+        IPC_SERVICE_NETD,
+        ServiceCapability::NetPolicy,
+        &[Op::ConfigureNetwork, Op::ChargeClientSession],
+    ),
+    policy(IPC_SERVICE_DEVMGRD, ServiceCapability::DevicePolicy, &[Op::ControlDevice]),
+    ServicePolicy {
+        personalities: EXECUTABLE_IMAGES,
+        ..policy(
+            IPC_SERVICE_LOADERD,
+            ServiceCapability::ProcessLoader,
+            &[Op::SpawnProcess, Op::TransferJobDescriptor, Op::UpgradeComponent],
+        )
     },
-    ServiceRoleSpec {
-        service_id: rustos_user_abi::syscall::IPC_SERVICE_DEVMGRD,
-        capability: rustos_user_abi::syscall::ServiceCapability::DevicePolicy,
-    },
-    ServiceRoleSpec {
-        service_id: rustos_user_abi::syscall::IPC_SERVICE_LOADERD,
-        capability: rustos_user_abi::syscall::ServiceCapability::ProcessLoader,
-    },
-    ServiceRoleSpec {
-        service_id: rustos_user_abi::syscall::IPC_SERVICE_STORAGED,
-        capability: rustos_user_abi::syscall::ServiceCapability::StoragePolicy,
-    },
-    ServiceRoleSpec {
-        service_id: rustos_user_abi::syscall::IPC_SERVICE_INPUTD,
-        capability: rustos_user_abi::syscall::ServiceCapability::InputPolicy,
-    },
-    ServiceRoleSpec {
-        service_id: rustos_user_abi::syscall::IPC_SERVICE_PROCD,
-        capability: rustos_user_abi::syscall::ServiceCapability::ProcessPolicy,
-    },
-    ServiceRoleSpec {
-        service_id: rustos_user_abi::syscall::IPC_SERVICE_ROOTD,
-        capability: rustos_user_abi::syscall::ServiceCapability::RootSupervisor,
-    },
-    ServiceRoleSpec {
-        service_id: rustos_user_abi::syscall::IPC_SERVICE_SESSIOND,
-        capability: rustos_user_abi::syscall::ServiceCapability::SessionPolicy,
-    },
-    ServiceRoleSpec {
-        service_id: rustos_user_abi::syscall::IPC_SERVICE_PAGERD,
-        capability: rustos_user_abi::syscall::ServiceCapability::PagerPolicy,
-    },
-    ServiceRoleSpec {
-        service_id: rustos_user_abi::syscall::IPC_SERVICE_UISERVER,
-        capability: rustos_user_abi::syscall::ServiceCapability::UiPolicy,
-    },
-    ServiceRoleSpec {
-        service_id: rustos_user_abi::syscall::IPC_SERVICE_INITD,
-        capability: rustos_user_abi::syscall::ServiceCapability::InitPolicy,
-    },
+    policy(IPC_SERVICE_STORAGED, ServiceCapability::StoragePolicy, &[]),
+    policy(IPC_SERVICE_INPUTD, ServiceCapability::InputPolicy, &[]),
+    policy(IPC_SERVICE_PROCD, ServiceCapability::ProcessPolicy, &[Op::SignalForeignProcess]),
+    policy(IPC_SERVICE_ROOTD, ServiceCapability::RootSupervisor, &Op::ALL),
+    policy(
+        IPC_SERVICE_SESSIOND,
+        ServiceCapability::SessionPolicy,
+        &[Op::CreateSession, Op::RouteSession, Op::ChargeClientSession],
+    ),
+    policy(IPC_SERVICE_PAGERD, ServiceCapability::PagerPolicy, &[]),
+    policy(IPC_SERVICE_UISERVER, ServiceCapability::UiPolicy, &[]),
+    policy(
+        IPC_SERVICE_INITD,
+        ServiceCapability::InitPolicy,
+        &[
+            Op::ReclaimServiceLease,
+            Op::ConfigureSupervisor,
+            Op::UpgradeComponent,
+            Op::RollbackComponent,
+        ],
+    ),
 ];

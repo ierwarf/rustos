@@ -270,17 +270,17 @@ fn single_activation_resolves_claimed_requester_identity_not_loaderd_context() {
         .find("resolve_deferred_activation_identities(")
         .expect("claimed requester identity resolution");
     let authority_match = activation
-        .find("deferred_spawn_authority_matches(&activations, args.target_pid, owner, target)")
+        .find("deferred_spawn_authority_matches(&activations, target_pid, owner, target)")
         .expect("exact owner and target authority match");
     assert!(service_gate < requester_identity);
     assert!(requester_identity < authority_match);
     assert!(!activation.contains("current_user_process_identity"));
     let resolver_args = &activation[requester_identity..authority_match];
     let requester_arg = resolver_args
-        .find("args.requester_pid")
+        .find("requester_pid")
         .expect("requester PID passed to resolver");
     let target_arg = resolver_args
-        .find("args.target_pid")
+        .find("target_pid")
         .expect("target PID passed to resolver");
     assert!(requester_arg < target_arg);
 

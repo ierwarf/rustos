@@ -141,17 +141,24 @@ fn spawn_bootstrap_exec_direct(
     }
     // The service identity must exist before the child's first instruction,
     // or its first lookup or registration would find no principal. Create it
-    // suspended, bind it in the kernel's policy, then start it.
+    // suspended and register rootd as its only activator, exactly as the
+    // loader path does; bind it in the kernel's policy; then start it through
+    // the same `activate_deferred` the loader path uses.
     let pid = crate::user::console_host::spawn_program_in_session(session, program.start_suspended())
         .map(|spawned| spawned.pid)
         .map_err(console_host_error_to_linux_errno)?;
+    let Some(requester_pid) = multitask::current_user_process_id() else {
+        let _ = multitask::terminate_user_process(pid);
+        return Err(LINUX_ESRCH);
+    };
+    proc_broker_ops::register_deferred_activation(requester_pid, pid, false)?;
     if let Err(errno) = crate::user::syscall::linux::broker_ops::service_policy_ops::bind_spawned(pid, principal_service) {
         let _ = multitask::terminate_user_process(pid);
         return Err(errno);
     }
-    if !multitask::activate_suspended_user_tasks_with_commit(core::slice::from_ref(&pid), || Some(())) {
+    if let Err(errno) = proc_broker_ops::activate_deferred(requester_pid, pid) {
         let _ = multitask::terminate_user_process(pid);
-        return Err(LINUX_ESRCH);
+        return Err(errno);
     }
     Ok(pid)
 }

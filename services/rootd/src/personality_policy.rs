@@ -4,7 +4,8 @@
 //! its production owner. Rules are exact-incarnation: a rule is owned by one
 //! live `Principal` (pid, Job slot and generation, lease generation), so the
 //! restart of a service silently revokes everything its predecessor held. The
-//! manifest below says which service may act for which personality; the
+//! manifest row (`service_manifest::ServicePolicy::personalities`) says which
+//! service may act for which personality; the
 //! snapshot is rebuilt from it for the live principals and republished whole
 //! (new revision, all-or-nothing) whenever that set changes. This is never
 //! consulted from syscall entry, IPC, scheduling or fault paths.
@@ -14,37 +15,14 @@ use rustos_component_model::personality::{
 };
 use rustos_user_abi::syscall::IPC_SERVICE_LOADERD;
 
+use super::service_policy::policy_of;
+
 /// The one default namespace every personality starts with.
-pub(super) const DEFAULT_NAMESPACE: u64 = 1;
+pub(super) use super::service_manifest::DEFAULT_NAMESPACE;
 const MAX_RULES: usize = 32;
 const EACCES: i32 = 13;
 const EINVAL: i32 = 22;
 const ESTALE: i32 = 116;
-
-#[derive(Clone, Copy)]
-pub(super) struct Grant {
-    pub service: u64,
-    pub personality: Personality,
-    pub request: SlowRequest,
-    pub namespace: u64,
-}
-
-/// loaderd admits and launches both executable formats; nothing else here
-/// creates processes from foreign images, so nothing else is granted.
-pub(super) const GRANTS: [Grant; 2] = [
-    Grant {
-        service: IPC_SERVICE_LOADERD,
-        personality: Personality::Linux,
-        request: SlowRequest::ExecutableImage,
-        namespace: DEFAULT_NAMESPACE,
-    },
-    Grant {
-        service: IPC_SERVICE_LOADERD,
-        personality: Personality::Windows,
-        request: SlowRequest::ExecutableImage,
-        namespace: DEFAULT_NAMESPACE,
-    },
-];
 
 pub(super) struct PersonalityPolicy {
     snapshot: PolicySnapshot<MAX_RULES>,
@@ -61,21 +39,20 @@ impl PersonalityPolicy {
     pub(super) fn refresh(&mut self, principals: &[(u64, Principal)]) -> Result<(), i32> {
         let revision = self.snapshot.revision().saturating_add(1);
         let mut wanted = Vec::new();
-        for grant in GRANTS {
-            for (service, owner) in principals {
-                if *service == grant.service && owner.valid() {
-                    wanted.try_reserve(1).map_err(|_| 12)?;
-                    wanted.push(Rule {
-                        key: PolicyKey {
-                            personality: grant.personality,
-                            operation: grant.request,
-                            namespace: grant.namespace,
-                        },
-                        owner: *owner,
-                        allow: true,
-                        revision,
-                    });
-                }
+        for (service, owner) in principals {
+            let Some(row) = policy_of(*service) else { continue };
+            for grant in row.personalities.iter().filter(|_| owner.valid()) {
+                wanted.try_reserve(1).map_err(|_| 12)?;
+                wanted.push(Rule {
+                    key: PolicyKey {
+                        personality: grant.personality,
+                        operation: grant.request,
+                        namespace: grant.namespace,
+                    },
+                    owner: *owner,
+                    allow: true,
+                    revision,
+                });
             }
         }
         let unchanged = wanted.len() == self.published.len()

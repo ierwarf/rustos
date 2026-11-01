@@ -1068,7 +1068,7 @@ if [[ -z "$join_line" || -z "$complete_line" || "$complete_line" -le "$join_line
     || ! grep -Fq 'let now_tick = crate::arch::rtc::ticks();' <<<"$smp_phase_body" \
     || ! grep -Fq 'binding.admit_phase(' <<<"$smp_phase_body" \
     || ! grep -Fq 'terminalize_binding_after_endpoint_revalidation(binding_id, target);' <<<"$smp_phase_body" \
-    || ! grep -Fq 'activations.get(&args.target_pid).unwrap().qualification_required' <<<"$proc_activate_body" \
+    || ! grep -Fq 'activations.get(&target_pid).unwrap().qualification_required' <<<"$proc_activate_body" \
     || ! grep -Fq 'activate_suspended_user_tasks_with_commit(' <<<"$proc_activate_body" \
     || ! rg -Fq 'const fn deferred_authority_is_batch_eligible(qualification_required: bool) -> bool' kernel/compat/src/user/syscall/linux/proc_broker_ops/activation_batch.rs \
     || ! rg -Fq '&& deferred_authority_is_batch_eligible(qualification_required)' kernel/compat/src/user/syscall/linux/proc_broker_ops/activation_batch.rs \

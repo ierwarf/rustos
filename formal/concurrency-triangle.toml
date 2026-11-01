@@ -559,7 +559,7 @@ severity = "critical"
 flow = "deferred-process-activation"
 model = "deferred-process-activation/DeferredProcessActivation"
 source = "kernel/compat/src/user/syscall/linux/proc_broker_ops.rs"
-source_symbol = "syscall_linux_rustos_proc_activate_broker"
+source_symbol = "activate_deferred"
 source_anchors = [
   "let activations = DEFERRED_ACTIVATIONS.lock();",
   "prepare_smp_qualification_activation(",

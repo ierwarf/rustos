@@ -10,9 +10,9 @@
 
 use super::service_manifest::INITD_LEASE_ID;
 use super::service_manifest::{
-    BootstrapServiceSpec, PostInitServiceSpec, ServiceRoleSpec, ServiceRouteSpec,
+    BootstrapServiceSpec, PostInitServiceSpec, ServicePolicy, ServiceRouteSpec,
     BOOTSTRAP_MANIFEST, DEP_LOADERD, DEP_PAGERD, DEP_PROCD, DEP_SYSCALLD, DEP_VFSD,
-    POST_INIT_MANIFEST, SERVICE_ROLE_MANIFEST, SERVICE_ROUTING_MANIFEST,
+    POST_INIT_MANIFEST, SERVICE_POLICY_MANIFEST, SERVICE_ROUTING_MANIFEST,
 };
 use rustos_component_model::Moniker;
 use rustos_user_abi::syscall::{
@@ -213,7 +213,7 @@ fn dependency_target_for(service: u64) -> u16 {
 fn validate_roles(
     boot: &[BootstrapServiceSpec],
     post: &[PostInitServiceSpec],
-    roles: &[ServiceRoleSpec],
+    roles: &[ServicePolicy],
 ) -> Result<(), ManifestError> {
     if roles.len() != boot.len() + post.len() + 1 {
         return Err(ManifestError::InvalidRole);
@@ -254,7 +254,7 @@ fn validate_roles(
 pub(super) fn service_policy_capability(
     id: u64,
 ) -> Option<rustos_user_abi::syscall::ServiceCapability> {
-    SERVICE_ROLE_MANIFEST
+    SERVICE_POLICY_MANIFEST
         .iter()
         .find(|role| role.service_id == id)
         .map(|role| role.capability)
@@ -303,7 +303,7 @@ pub(super) fn preflight() -> Result<(), ManifestError> {
     validate_roles(
         &BOOTSTRAP_MANIFEST,
         &POST_INIT_MANIFEST,
-        &SERVICE_ROLE_MANIFEST,
+        &SERVICE_POLICY_MANIFEST,
     )
 }
 
@@ -520,23 +520,23 @@ mod tests {
             validate_roles(
                 &BOOTSTRAP_MANIFEST,
                 &POST_INIT_MANIFEST,
-                &SERVICE_ROLE_MANIFEST
+                &SERVICE_POLICY_MANIFEST
             ),
             Ok(())
         );
-        let mut invalid = SERVICE_ROLE_MANIFEST;
+        let mut invalid = SERVICE_POLICY_MANIFEST;
         invalid[0].capability = invalid[1].capability;
         assert_eq!(
             validate_roles(&BOOTSTRAP_MANIFEST, &POST_INIT_MANIFEST, &invalid),
             Err(ManifestError::InvalidRole)
         );
-        invalid = SERVICE_ROLE_MANIFEST;
+        invalid = SERVICE_POLICY_MANIFEST;
         invalid[0].service_id = invalid[1].service_id;
         assert_eq!(
             validate_roles(&BOOTSTRAP_MANIFEST, &POST_INIT_MANIFEST, &invalid),
             Err(ManifestError::InvalidRole)
         );
-        invalid = SERVICE_ROLE_MANIFEST;
+        invalid = SERVICE_POLICY_MANIFEST;
         invalid[0].service_id = u64::MAX;
         assert_eq!(
             validate_roles(&BOOTSTRAP_MANIFEST, &POST_INIT_MANIFEST, &invalid),

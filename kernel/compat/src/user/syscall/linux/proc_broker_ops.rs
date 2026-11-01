@@ -808,47 +808,64 @@ pub(super) fn syscall_linux_rustos_proc_commit_broker(args_ptr: u64) -> u64 {
     match spawned {
         Ok(spawned) => {
             if args.flags & LOADER_SPAWN_FLAG_DEFER_START as u64 != 0 {
-                let Some(owner) = multitask::live_user_process_identity_by_pid(args.requester_pid)
-                else {
-                    let _ = multitask::terminate_user_process(spawned.pid);
-                    return linux_errno(LINUX_ESRCH);
-                };
-                let Some(target) = multitask::live_user_process_identity_by_pid(spawned.pid) else {
-                    let _ = multitask::terminate_user_process(spawned.pid);
-                    return linux_errno(LINUX_ESRCH);
-                };
-                let authority = DeferredActivationAuthority {
-                    owner,
-                    target,
+                if let Err(errno) = register_deferred_activation(
+                    args.requester_pid,
+                    spawned.pid,
                     qualification_required,
-                };
-                let mut activations = DEFERRED_ACTIVATIONS.lock();
-                if activations.len() >= MAX_DEFERRED_ACTIVATIONS
-                    || activations.contains_key(&spawned.pid)
-                {
-                    drop(activations);
-                    let _ = multitask::terminate_user_process(spawned.pid);
-                    return linux_errno(LINUX_EAGAIN);
-                }
-                if activations.insert(spawned.pid, authority).is_err() {
-                    drop(activations);
-                    let _ = multitask::terminate_user_process(spawned.pid);
-                    return linux_errno(LINUX_EAGAIN);
-                }
-                drop(activations);
-                // Close the requester-exit race on both sides of publication:
-                // cleanup either observes the new entry, or this recheck
-                // consumes it and retires the still-suspended target.
-                if multitask::live_user_process_identity_by_pid(args.requester_pid) != Some(owner) {
-                    DEFERRED_ACTIVATIONS.lock().remove(&spawned.pid);
-                    let _ = multitask::terminate_user_process(spawned.pid);
-                    return linux_errno(LINUX_ESRCH);
+                ) {
+                    return linux_errno(errno);
                 }
             }
             spawned.pid
         }
         Err(err) => linux_errno(process_load_error_to_linux_errno(err)),
     }
+}
+
+/// Records the one authority that may later start a process created suspended:
+/// its creator (`requester_pid`) and the exact target incarnation. Both the
+/// loader path and the rootd bootstrap spawn register here, and both start the
+/// process through `activate_deferred`, so there is one place that checks
+/// "only the creator, only this incarnation, only once". On any failure the
+/// still-suspended target is terminated, never left parked.
+pub(in crate::user::syscall::linux) fn register_deferred_activation(
+    requester_pid: u64,
+    target_pid: u64,
+    qualification_required: bool,
+) -> Result<(), i64> {
+    let terminate = || {
+        let _ = multitask::terminate_user_process(target_pid);
+    };
+    let Some(owner) = multitask::live_user_process_identity_by_pid(requester_pid) else {
+        terminate();
+        return Err(LINUX_ESRCH);
+    };
+    let Some(target) = multitask::live_user_process_identity_by_pid(target_pid) else {
+        terminate();
+        return Err(LINUX_ESRCH);
+    };
+    let authority = DeferredActivationAuthority { owner, target, qualification_required };
+    let mut activations = DEFERRED_ACTIVATIONS.lock();
+    if activations.len() >= MAX_DEFERRED_ACTIVATIONS || activations.contains_key(&target_pid) {
+        drop(activations);
+        terminate();
+        return Err(LINUX_EAGAIN);
+    }
+    if activations.insert(target_pid, authority).is_err() {
+        drop(activations);
+        terminate();
+        return Err(LINUX_EAGAIN);
+    }
+    drop(activations);
+    // Close the requester-exit race on both sides of publication: cleanup
+    // either observes the new entry, or this recheck consumes it and retires
+    // the still-suspended target.
+    if multitask::live_user_process_identity_by_pid(requester_pid) != Some(owner) {
+        DEFERRED_ACTIVATIONS.lock().remove(&target_pid);
+        terminate();
+        return Err(LINUX_ESRCH);
+    }
+    Ok(())
 }
 
 pub(super) fn syscall_linux_rustos_proc_activate_broker(args_ptr: u64) -> u64 {
@@ -867,32 +884,47 @@ pub(super) fn syscall_linux_rustos_proc_activate_broker(args_ptr: u64) -> u64 {
     {
         return linux_errno(LINUX_EINVAL);
     }
+    match activate_deferred(args.requester_pid, args.target_pid) {
+        Ok(()) => 0,
+        Err(errno) => linux_errno(errno),
+    }
+}
+
+
+/// Starts a process that was created suspended and registered with
+/// `register_deferred_activation`. `requester_pid` must be the creator and
+/// `target_pid` the exact registered incarnation; the authority is consumed
+/// once, atomically with the runnable publication.
+pub(in crate::user::syscall::linux) fn activate_deferred(
+    requester_pid: u64,
+    target_pid: u64,
+) -> Result<(), i64> {
     // Requester policy identity is not loaderd's identity. These observations
     // do not replace the original physical Cohort/readers retained by PS.
     let (owner, target) = match resolve_deferred_activation_identities(
-        args.requester_pid,
-        args.target_pid,
+        requester_pid,
+        target_pid,
         multitask::live_user_process_identity_by_pid,
     ) {
         Ok(identities) => identities,
-        Err(errno) => return linux_errno(errno),
+        Err(errno) => return Err(errno),
     };
     let mut qualification_armed = false;
     let mut callback_seen = false;
     let mut failure = LINUX_ESRCH;
     let activated = multitask::activate_suspended_user_tasks_with_commit(
-        core::slice::from_ref(&args.target_pid),
+        core::slice::from_ref(&target_pid),
         || {
             // Bounded permission transfer AFTER PS retains the original caller
             // and targets. Cleanup competes at this SAME registry leaf, not in
             // an unprotected gap between copied preflight and consumption.
             callback_seen = true;
             let mut activations = DEFERRED_ACTIVATIONS.lock();
-            if !deferred_spawn_authority_matches(&activations, args.target_pid, owner, target) {
+            if !deferred_spawn_authority_matches(&activations, target_pid, owner, target) {
                 failure = LINUX_EPERM;
                 return None;
             }
-            let required = activations.get(&args.target_pid).unwrap().qualification_required;
+            let required = activations.get(&target_pid).unwrap().qualification_required;
             qualification_armed =
                 match super::smp_qualification_ops::prepare_smp_qualification_activation(
                     owner, target, required,
@@ -905,7 +937,7 @@ pub(super) fn syscall_linux_rustos_proc_activate_broker(args_ptr: u64) -> u64 {
                 };
             let grant = deferred_activation::take_exact::<1, _, MAX_DEFERRED_ACTIVATIONS>(
                 &mut activations,
-                core::slice::from_ref(&args.target_pid),
+                core::slice::from_ref(&target_pid),
                 |_, authority| {
                     deferred_activation_identities_match(
                         &authority.owner,
@@ -923,15 +955,15 @@ pub(super) fn syscall_linux_rustos_proc_activate_broker(args_ptr: u64) -> u64 {
     if !activated {
         // Registry/qualification refusal did not consume any authority.
         if callback_seen {
-            return linux_errno(failure);
+            return Err(failure);
         }
         // No runnable effect preceded refusal. Remove only OUR still-pending
         // original record; cleanup or another accepted activation may have won.
         let removed = {
             let mut activations = DEFERRED_ACTIVATIONS.lock();
             let removed =
-                if deferred_spawn_authority_matches(&activations, args.target_pid, owner, target) {
-                    activations.remove(&args.target_pid)
+                if deferred_spawn_authority_matches(&activations, target_pid, owner, target) {
+                    activations.remove(&target_pid)
                 } else {
                     None
                 };
@@ -942,19 +974,19 @@ pub(super) fn syscall_linux_rustos_proc_activate_broker(args_ptr: u64) -> u64 {
             super::smp_qualification_ops::abort_smp_qualification_activation(target);
         }
         if removed.is_some() {
-            let _ = multitask::terminate_user_process(args.target_pid);
+            let _ = multitask::terminate_user_process(target_pid);
         }
-        return linux_errno(failure);
+        return Err(failure);
     }
     // Permission was moved once, not copied; the SAME grant and original PS
     // Cohort survived all runnable publication. No registry raw lock crossed PS.
     nucleus_core::debug::record_milestone(
         nucleus_core::debug::LogCategory::Compat,
         "proc-activate-committed",
-        args.target_pid,
-        args.requester_pid,
+        target_pid,
+        requester_pid,
     );
-    0
+    Ok(())
 }
 
 pub(super) fn syscall_linux_rustos_proc_validate_deferred_spawn_broker(args_ptr: u64) -> u64 {

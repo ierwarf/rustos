@@ -115,7 +115,7 @@ ordered(activation_commit, ['OriginalCurrent::borrow(turn)', 'let members =',
     'while notify_cpus != 0', 'notify(cpu)'],
     'original activation grant survives final publication without raw registry lock')
 proc_broker = Path('kernel/compat/src/user/syscall/linux/proc_broker_ops.rs').read_text()
-for text, name in [(proc_broker, 'syscall_linux_rustos_proc_activate_broker'),
+for text, name in [(proc_broker, 'activate_deferred'),
         (Path('kernel/compat/src/user/syscall/linux/proc_broker_ops/activation_batch.rs').read_text(),
          'syscall_linux_rustos_proc_activate_batch_broker')]:
     ordered(body(text, name), ['activate_suspended_user_tasks_with_commit(',

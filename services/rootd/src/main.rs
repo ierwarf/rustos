@@ -28,7 +28,6 @@ extern crate alloc;
 
 mod control_drain;
 mod component_policy;
-mod control_preflight;
 mod provider_billing;
 mod provider_control;
 mod jobs;
@@ -36,7 +35,7 @@ mod job_policy;
 mod job_policy_probe;
 mod job_lease;
 mod policy_cutover;
-mod service_grants;
+mod service_policy;
 mod service_health;
 mod activation_owner;
 mod service_updates;
@@ -249,8 +248,7 @@ pub extern "C" fn __rustos_rootd_start() -> ! {
         fail_closed(b"rootd: crash token ledger recovery denied\n");
     }
     if component_policy::preflight().is_err()
-        || service_grants::preflight().is_err()
-        || control_preflight::preflight().is_err()
+        || service_policy::preflight().is_err()
     {
         fail_closed(b"rootd: fatal component manifest preflight failed\n");
     }
@@ -1291,7 +1289,8 @@ fn fill_commercial_max_response(
             let mut principals = alloc::vec::Vec::new();
             for lease in leases.iter().filter(|lease| {
                 lease.pid != 0 && lease.state == ROOTD_LEASE_STATE_RUNNING
-                    && personality_policy::GRANTS.iter().any(|g| g.service == lease.service_id)
+                    && service_policy::policy_of(lease.service_id)
+                        .is_some_and(|row| !row.personalities.is_empty())
             }) {
                 principals.try_reserve(1).map_err(|_| 12)?;
                 principals.push((lease.service_id, personality_principal(lease.pid)?));
@@ -2491,7 +2490,7 @@ fn authorize_sender_slow_grant(
     operation: rustos_component_model::policy_ops::SlowBrokerOperation,
 ) -> Result<u64, i32> {
     let service = current_service_id_for_sender(leases, post_init, sender)?;
-    if !service_grants::permits(service, operation) {
+    if !service_policy::permits(service, operation) {
         return Err(13);
     }
     policy_cutover::authorize_job_slow_op(sender.pid, operation)?;
