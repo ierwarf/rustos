@@ -68,6 +68,19 @@ runs 16 hardware threads for an 18-vCPU pair of guests. This is why section 3
 exists and why phase 4 exists. It is **not** claimed that phase 4 fixes those
 panics.
 
+A related scheduler panic was analysed statically on 2026-11-02: `irq_entry.rs`
+"IRQ architecture lacks the original successful claim: check 9". A dispatch that
+re-selects the task its CPU was running re-claims it (owner back to `Running`)
+while it is still the CPU's published Current, and a remote terminal withdrawal
+(`retire_unless_claim_in_flight`) treats a published Current as an ordinary stop,
+so it can retire the owner under the installing CPU. The obvious guard (also wait
+while the Current's CPU has an open dispatch turn) was implemented and measured:
+`--proc-stress --repeat 8` at 16 vCPU failed 5 of 7 boots, four of them with
+`tlb-ack-liveness-timeout`, against 1 of 8 with the guard off in the same
+session, so it was reverted. Whatever fixes the claim window must not make a
+terminating CPU wait on a dispatching one while the TLB protocol can be waiting
+on the terminating CPU's acknowledgement.
+
 ### 3. Diagnostics (implemented)
 
 `tlb-ack-liveness-timeout` is recorded just before the watchdog panics, with
