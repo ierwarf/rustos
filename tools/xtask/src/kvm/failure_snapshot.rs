@@ -14,6 +14,9 @@ use sha2::{Digest, Sha256};
 use super::{Config, KvmLayout, Result};
 
 const READ_BUDGET: Duration = Duration::from_secs(4);
+/// Added per guest CPU: each costs two monitor round trips, so a fixed budget
+/// would run out on a large guest before the tables behind the registers.
+const READ_BUDGET_PER_CPU: Duration = Duration::from_millis(250);
 const MAX_TRANSCRIPT_BYTES: usize = 512 * 1024;
 const MAX_SYMBOL_BYTES: u64 = 16 * 1024;
 // Diagnostic adapters for the current 64-bit, cache-aligned IPC slabs. Exact
@@ -65,11 +68,15 @@ struct Monitor {
 }
 
 impl Monitor {
-    fn connect(path: &Path) -> Result<Self> {
+    fn connect(path: &Path, vcpus: u8) -> Result<Self> {
         let stream = UnixStream::connect(path).context("connect failed guest monitor")?;
+        Self::over(stream, vcpus)
+    }
+
+    fn over(stream: UnixStream, vcpus: u8) -> Result<Self> {
         let mut monitor = Self {
             stream,
-            deadline: Instant::now() + READ_BUDGET,
+            deadline: Instant::now() + READ_BUDGET + READ_BUDGET_PER_CPU * u32::from(vcpus),
             transcript: Vec::new(),
         };
         monitor.prompt()?;
@@ -113,10 +120,9 @@ impl Monitor {
     }
 
     fn registers(&mut self, vcpus: u8) -> Result<()> {
-        ensure!(
-            [1, 2, 4, 8].contains(&vcpus),
-            "unsupported snapshot CPU count"
-        );
+        // Any guest size: the monitor refuses a CPU the guest does not have,
+        // and a hard-coded list silently emptied every 16-vCPU snapshot.
+        ensure!(vcpus >= 1, "snapshot needs at least one CPU");
         self.command("stop")?;
         for cpu in 0..vcpus {
             self.command(&format!("cpu {cpu}"))?;
@@ -149,8 +155,24 @@ impl Monitor {
         Ok(words)
     }
 
+    /// The 128 owner words. Each lives alone on a cache line (`RunOwnerWord` is
+    /// 64-byte aligned), so the symbol dump holds eight words per slot with the
+    /// owner first; a dump of exactly 128 words is already dense.
+    fn owner_words(&self) -> Result<Vec<u64>> {
+        const SLOTS: usize = 128;
+        const WORDS_PER_LINE: usize = 8;
+        let words = self.words("kernel_ps::multitask::scheduler::runqueue::OWNER_WORDS")?;
+        match words.len() {
+            SLOTS => Ok(words),
+            len if len == SLOTS * WORDS_PER_LINE => {
+                Ok(words.into_iter().step_by(WORDS_PER_LINE).collect())
+            }
+            _ => Ok(words),
+        }
+    }
+
     fn published_stacks(&mut self) -> Result<()> {
-        let owners = self.words("kernel_ps::multitask::scheduler::runqueue::OWNER_WORDS")?;
+        let owners = self.owner_words()?;
         let rsps = self.words("kernel_ps::multitask::scheduler::frame_publication::SAVED_RSP")?;
         let bases = self.words("kernel_ps::multitask::scheduler::runqueue::KERNEL_STACK_BASE")?;
         let tops = self.words("kernel_ps::multitask::scheduler::runqueue::KERNEL_STACK_TOP")?;
@@ -208,8 +230,12 @@ impl Monitor {
             "IPC diagnostic row budget exceeded"
         );
         let &(base, size) = tables.get(name).context("linked IPC slab is absent")?;
+        // Slots come first; what follows is the cache-padded per-CPU insertion
+        // hints (one 64-byte line per tracked CPU), so the tail grows with the
+        // CPU capacity and only its shape is checked, not a fixed size.
+        let tail = size.saturating_sub(capacity * stride);
         ensure!(
-            size == capacity * stride + 64,
+            size >= capacity * stride + 64 && tail % 64 == 0 && tail <= 64 * 64,
             "linked IPC slab layout changed: {name}"
         );
         let address = base
@@ -223,7 +249,7 @@ impl Monitor {
     }
 
     fn ipc_waits(&mut self, tables: &BTreeMap<String, (u64, u64)>) -> Result<()> {
-        let owners = self.words("kernel_ps::multitask::scheduler::runqueue::OWNER_WORDS")?;
+        let owners = self.owner_words()?;
         let reasons = self.words("kernel_ps::multitask::scheduler::runqueue::wait::REASON_ID")?;
         ensure!(
             owners.len() == 128 && reasons.len() == owners.len(),
@@ -299,7 +325,7 @@ pub(super) fn capture(
         "diagnostic_only=true\nprobe_result=failed\nkernel_sha256={kernel_sha}\nvcpus={vcpus}\n"
     );
     let collection = (|| -> Result<()> {
-        let mut monitor = Monitor::connect(&layout.rustos_monitor)?;
+        let mut monitor = Monitor::connect(&layout.rustos_monitor, vcpus)?;
         let result = (|| -> Result<()> {
             monitor.registers(vcpus)?;
             // This optional diagnostic dependency is itself time-bounded. A
@@ -433,7 +459,7 @@ mod tests {
             }
             commands
         });
-        let mut monitor = Monitor::connect(&path).unwrap();
+        let mut monitor = Monitor::connect(&path, 1).unwrap();
         let base = DIRECT_MAP_BASE + 0x4000;
         let mut owners = [0_u64; 128];
         owners[127] = 1; // Local: a published continuation, not a live CPU RSP.
@@ -543,7 +569,7 @@ mod tests {
                 "refused symbol emitted monitor IO: {extra}"
             );
         });
-        let mut monitor = Monitor::connect(&path).unwrap();
+        let mut monitor = Monitor::connect(&path, 1).unwrap();
         monitor.registers(1).unwrap();
         monitor.symbol("original-owner", 0x1000, 16).unwrap();
         assert_eq!(monitor.words("original-owner").unwrap(), [0x4005, 0x10002]);
@@ -560,5 +586,90 @@ mod tests {
         assert!(monitor.symbol("overflowing-pointer", u64::MAX, 8).is_err());
         drop(monitor);
         server.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod wide_guest_tests {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+
+    use super::Monitor;
+
+    /// A monitor that answers every command with a register block and a prompt.
+    fn fake_monitor(mut server: UnixStream) -> std::thread::JoinHandle<Vec<String>> {
+        std::thread::spawn(move || {
+            let mut commands = Vec::new();
+            server.write_all(b"QEMU monitor\n(qemu) ").unwrap();
+            let mut pending = String::new();
+            let mut bytes = [0; 256];
+            loop {
+                let count = server.read(&mut bytes).unwrap_or(0);
+                if count == 0 {
+                    return commands;
+                }
+                pending.push_str(&String::from_utf8_lossy(&bytes[..count]));
+                while let Some((line, rest)) = pending.split_once('\n') {
+                    commands.push(line.to_owned());
+                    let reply = format!("{line}\nRAX=0\n(qemu) ");
+                    server.write_all(reply.as_bytes()).unwrap();
+                    pending = rest.to_owned();
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn registers_are_collected_for_every_cpu_of_a_sixteen_vcpu_guest() {
+        let (client, server) = UnixStream::pair().unwrap();
+        let guest = fake_monitor(server);
+        let mut monitor = Monitor::over(client, 16).unwrap();
+        monitor.registers(16).unwrap();
+        drop(monitor);
+        let commands = guest.join().unwrap();
+        assert_eq!(commands.first().map(String::as_str), Some("stop"));
+        for cpu in 0..16 {
+            assert!(commands.contains(&format!("cpu {cpu}")), "cpu {cpu}");
+        }
+        assert_eq!(
+            commands.iter().filter(|c| *c == "info registers").count(),
+            16
+        );
+    }
+
+    #[test]
+    fn a_guest_without_cpus_is_rejected_rather_than_snapshotted_empty() {
+        let (client, server) = UnixStream::pair().unwrap();
+        let guest = fake_monitor(server);
+        let mut monitor = Monitor::over(client, 1).unwrap();
+        assert!(monitor.registers(0).is_err());
+        drop(monitor);
+        guest.join().unwrap();
+    }
+
+    #[test]
+    fn owner_words_dumped_one_per_cache_line_are_reduced_to_one_word_per_slot() {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        server.write_all(b"(qemu) ").unwrap();
+        let mut monitor = Monitor::over(client, 1).unwrap();
+        let mut dump =
+            String::from("\nSYMBOL kernel_ps::multitask::scheduler::runqueue::OWNER_WORDS\n");
+        for line in 0..128 {
+            // The owner leads each 64-byte line; the other seven words are padding.
+            dump.push_str(&format!("{:016x}: 0x{:016x}", line * 64, line + 1));
+            for _ in 0..7 {
+                dump.push_str(" 0x0000000000000000");
+            }
+            dump.push('\n');
+        }
+        monitor.transcript.extend_from_slice(dump.as_bytes());
+        let owners = monitor.owner_words().unwrap();
+        assert_eq!(owners.len(), 128);
+        assert!(
+            owners
+                .iter()
+                .enumerate()
+                .all(|(slot, owner)| *owner == slot as u64 + 1)
+        );
     }
 }
