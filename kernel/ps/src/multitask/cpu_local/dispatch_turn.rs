@@ -18,6 +18,10 @@ use nucleus_core::util::lockdep::LockClass;
 
 struct TurnCell {
     phase: core::sync::atomic::AtomicU8,
+    /// The slot this CPU's dispatch is claiming or has claimed and not yet
+    /// installed, plus one; zero when none. Readable from any CPU. See
+    /// `claim_announced`.
+    claiming: core::sync::atomic::AtomicUsize,
     parked: UnsafeCell<Option<DispatchPreemption<'static>>>,
     activation: UnsafeCell<Option<ActivationCredential>>,
     placement: UnsafeCell<Option<PlacementGrant>>,
@@ -38,6 +42,7 @@ impl TurnCell {
     const fn new() -> Self {
         Self {
             phase: core::sync::atomic::AtomicU8::new(VACANT),
+            claiming: core::sync::atomic::AtomicUsize::new(0),
             parked: UnsafeCell::new(None),
             activation: UnsafeCell::new(None),
             placement: UnsafeCell::new(None),
@@ -265,6 +270,20 @@ impl<'a> CpuDispatchTurn<'a> {
         // borrowing self prevents consuming/publishing this turn concurrently.
         unsafe { &*self.claimed_return.get() }.as_ref()
     }
+    /// Announce, BEFORE the owner CAS that claims `slot`, that this CPU's
+    /// dispatch is about to own it. A remote terminal withdrawal that finds the
+    /// slot `Running` then sees the announcement (the CAS is a full barrier, so
+    /// whoever observes `Running` from this claim also observes this store) and
+    /// reports a claim in flight instead of retiring the owner word under the
+    /// installing CPU. Cleared by `retract_claim` when the claim fails, and by
+    /// the end of the turn when it succeeds.
+    pub(in crate::multitask) fn announce_claim(&self, slot: usize) {
+        // ORDERING: Release; precedes the claiming owner CAS in program order.
+        self.cell.claiming.store(slot + 1, Ordering::Release);
+    }
+    pub(in crate::multitask) fn retract_claim(&self) {
+        self.cell.claiming.store(0, Ordering::Release);
+    }
     pub(in crate::multitask) fn has_claimed_placement(&self, slot: usize) -> bool {
         self.original_current().is_some() && has_placement(self.cpu, slot)
     }
@@ -344,6 +363,9 @@ impl<'a> CpuDispatchTurn<'a> {
                 assert!(parked.is_none(), "CPU overwrote parked preemption custody");
                 *parked = self.preemption.take();
             }
+            // ORDERING: Release; the claim is installed, so a remote stop may
+            // treat the claimed task as an ordinary executing one again.
+            self.cell.claiming.store(0, Ordering::Release);
             self.cell.phase.store(AWAITING_RSP, Ordering::Release);
         } else {
             // SAFETY: the unique Publishing producer owns activation storage.
@@ -354,6 +376,7 @@ impl<'a> CpuDispatchTurn<'a> {
             if let Some(grant) = placement {
                 self.cell.complete_placement(grant);
             }
+            self.cell.claiming.store(0, Ordering::Release);
             self.cell.phase.store(VACANT, Ordering::Release);
             // Make destruction inert before restoration can admit an IRQ turn.
             self.live = false;
@@ -468,10 +491,31 @@ impl Drop for CpuDispatchTurn<'_> {
             }
             // An abandoned/partially published architecture transaction is not
             // rollback-safe. Never reopen the CPU after a producer panic.
+            self.cell.claiming.store(0, Ordering::Release);
             self.cell.phase.store(POISONED, Ordering::Release);
             // Keep any successful claim/architecture MM grant quarantined.
             // No proven RSP completion exists; poison cannot authorize close.
         }
+    }
+}
+
+/// Whether some CPU's dispatch has announced a claim of `slot` that has not
+/// yet been installed. This is precise: it is true only between the start of
+/// that claim and the end of its turn, unlike "the CPU is dispatching", which is
+/// true on every timer tick for whatever task the CPU was running.
+pub(in crate::multitask) fn claim_announced(slot: usize) -> bool {
+    TURNS
+        .iter()
+        // ORDERING: Acquire pairs with the announcing store; the caller read the
+        // owner word (Acquire) first, which orders this load after the claim.
+        .any(|cell| cell.claiming.load(Ordering::Acquire) == slot + 1)
+}
+
+impl TurnCell {
+    /// This one cell's view of `claim_announced`, for tests of a private cell.
+    #[cfg(test)]
+    fn claiming_slot(&self, slot: usize) -> bool {
+        self.claiming.load(Ordering::Acquire) == slot + 1
     }
 }
 

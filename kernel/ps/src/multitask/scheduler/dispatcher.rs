@@ -114,8 +114,9 @@ fn first_turn(turn: &crate::multitask::cpu_local::dispatch_turn::CpuDispatchTurn
             let rsp = candidate.frame.saved_rsp();
             decision = match DispatchFrame::from_selection(turn, candidate.frame, class_sequence) {
                 FrameCapture::Ready(frame) => {
+                    turn.announce_claim(slot);
                     if frame.prepare().is_some_and(|funded| funded.claim()) { Decision::Claimed(candidate.urgency) }
-                    else { Decision::Incomplete }
+                    else { turn.retract_claim(); Decision::Incomplete }
                 },
                 FrameCapture::Stale => Decision::Incomplete,
                 FrameCapture::Invalid(reason) => { quarantine(slot, task_id, rsp, reason); Decision::Empty },
@@ -412,8 +413,17 @@ fn prologue(outgoing: &mut CurrentReturn<'_>, rsp: usize, voluntary: bool) -> u6
 fn claim(outgoing: &CurrentReturn<'_>, candidate: Candidate, class_sequence: u64) -> bool {
     let cpu = outgoing.original_turn().original_current().expect("claim lost original Current").0;
     let rsp = candidate.frame.saved_rsp();
-    let success = match DispatchFrame::from_selection(outgoing.original_turn(), candidate.frame, class_sequence) {
-        FrameCapture::Ready(frame) => frame.prepare().is_some_and(|funded| funded.claim()),
+    let turn = outgoing.original_turn();
+    let success = match DispatchFrame::from_selection(turn, candidate.frame, class_sequence) {
+        FrameCapture::Ready(frame) => {
+            // Announced before the claiming CAS: a re-selected Current stays a
+            // published Current throughout, so a remote stop cannot otherwise
+            // tell this claim from an ordinary executing task.
+            turn.announce_claim(candidate.slot);
+            let claimed = frame.prepare().is_some_and(|funded| funded.claim());
+            if !claimed { turn.retract_claim(); }
+            claimed
+        }
         FrameCapture::Invalid(reason) => { quarantine(candidate.slot, candidate.id, rsp, reason); false },
         FrameCapture::Stale => false,
     };

@@ -1250,6 +1250,17 @@ fn retire_slot(slot: usize, weight: u32, wait_for_claim: bool) -> RetireOutcome 
             RUN_QUEUES[cpu].publish_load(&rq);
             return RetireOutcome::Retired;
         }
+        // A dispatch that re-selects the task its CPU was running claims it again
+        // while it is still that CPU's published Current, so the execution role
+        // below cannot tell that claim from an ordinary executing task. The
+        // claiming CPU announces the claim before its owner CAS; seeing `Running`
+        // from that CAS implies seeing the announcement.
+        if wait_for_claim
+            && owner.state == RunOwnerState::Running
+            && crate::multitask::cpu_local::dispatch_turn::claim_announced(slot)
+        {
+            return RetireOutcome::ClaimInFlight;
+        }
         if wait_for_claim
             && rustos_scheduler_frame_gate::terminal_withdraw_must_wait(
                 owner.state == RunOwnerState::Running,

@@ -17,6 +17,30 @@ fn unique_turn_refuses_overlap_and_commit_cannot_release_a_live_producer() {
 }
 
 #[test]
+fn a_claim_is_announced_until_the_turn_ends_and_only_for_that_slot() {
+    // The table is shared; 91 is a slot number no other test announces.
+    let cell = TurnCell::new();
+    let turn = cell.begin_phase_model(0, 1).unwrap();
+    assert!(!cell.claiming_slot(91), "nothing is announced before the claim");
+    turn.announce_claim(91);
+    assert!(cell.claiming_slot(91));
+    assert!(!cell.claiming_slot(90) && !cell.claiming_slot(92), "slot-exact, not CPU-wide");
+    turn.retract_claim();
+    assert!(!cell.claiming_slot(91), "a failed claim leaves nothing behind");
+    turn.announce_claim(91);
+    turn.seal();
+    assert!(cell.claiming_slot(91), "still announced while the architecture installs");
+    turn.finish(false);
+    assert!(!cell.claiming_slot(91), "an unchanged return ends the announcement");
+
+    let turn = cell.begin_phase_model(0, 1).unwrap();
+    turn.announce_claim(92);
+    turn.seal();
+    turn.finish(true);
+    assert!(!cell.claiming_slot(92), "a switch ends the announcement at the RSP handoff");
+}
+
+#[test]
 fn rsp_consumer_is_admitted_before_bank_ack_and_stays_closed_until_final_release() {
     let cell = TurnCell::new();
     let turn = cell.begin_phase_model(0, 1).unwrap();

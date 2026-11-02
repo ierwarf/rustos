@@ -68,18 +68,33 @@ runs 16 hardware threads for an 18-vCPU pair of guests. This is why section 3
 exists and why phase 4 exists. It is **not** claimed that phase 4 fixes those
 panics.
 
-A related scheduler panic was analysed statically on 2026-11-02: `irq_entry.rs`
-"IRQ architecture lacks the original successful claim: check 9". A dispatch that
-re-selects the task its CPU was running re-claims it (owner back to `Running`)
-while it is still the CPU's published Current, and a remote terminal withdrawal
-(`retire_unless_claim_in_flight`) treats a published Current as an ordinary stop,
-so it can retire the owner under the installing CPU. The obvious guard (also wait
-while the Current's CPU has an open dispatch turn) was implemented and measured:
-`--proc-stress --repeat 8` at 16 vCPU failed 5 of 7 boots, four of them with
-`tlb-ack-liveness-timeout`, against 1 of 8 with the guard off in the same
-session, so it was reverted. Whatever fixes the claim window must not make a
-terminating CPU wait on a dispatching one while the TLB protocol can be waiting
-on the terminating CPU's acknowledgement.
+A related scheduler panic, `irq_entry.rs` "IRQ architecture lacks the original
+successful claim: check 9", is a different bug on the same exit path, analysed
+statically on 2026-11-02 and addressed separately from the TLB protocol:
+a dispatch that re-selects the task its CPU was running re-claims it (owner back
+to `Running`) while it is still the CPU's published Current, and a remote terminal
+withdrawal (`retire_unless_claim_in_flight`) treated a published Current as an
+ordinary stop, so it could retire the owner word under the installing CPU. The
+fix announces the claim: the dispatching CPU stores the claimed slot in its turn
+cell before the owner CAS and clears it when the turn ends
+(`dispatch_turn::announce_claim` / `claim_announced`), and the withdrawal reports
+`ClaimInFlight` for a `Running` slot whose claim is announced. The announcement is
+slot-exact and lives only for the claim, so a stop is deferred for microseconds,
+not for every timer tick. A coarser guard (defer whenever the Current's CPU has an
+open dispatch turn) was tried first and reverted: `--proc-stress --repeat 8` at 16
+vCPU failed 5 of 7 boots (four with `tlb-ack-liveness-timeout`) against 1 of 8
+with the guard off, because it parked a stop on most timer ticks. The TLB protocol
+still must not make a terminating CPU wait on a dispatching one while it can be
+waiting on the terminating CPU's acknowledgement.
+
+The same owner-executes principle is the usual answer elsewhere: a remote CPU
+flags a running task and the owning CPU acts at a safe point, as in
+[Fuchsia's thread signaling](https://fuchsia.dev/fuchsia-src/concepts/kernel/kernel_thread_signaling)
+(an IPI makes the target's CPU check for the signal) and in Linux's
+`sched_setaffinity` (a stopper runs `migration_cpu_stop()` on the source CPU, see
+[this walkthrough](https://www.systutorials.com/sched_setaffinity-works-inside-of-linux-kernel/));
+Zephyr's SMP halt flags the target, sends it an IPI and waits for it to halt
+itself ([zephyr#123476](https://github.com/zephyrproject-rtos/zephyr/pull/123476)).
 
 ### 3. Diagnostics (implemented)
 

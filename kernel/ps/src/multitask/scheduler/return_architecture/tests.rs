@@ -370,6 +370,38 @@ fn actual_published_current_is_still_stopped_remotely_without_waiting() {
     });
 }
 
+#[test]
+fn a_reclaimed_published_current_is_not_stopped_while_its_claim_is_announced() {
+    // A dispatch that re-selects the task its CPU was running claims it again
+    // (owner back to `Running`) while the slot is still that CPU's published
+    // Current. Without the announcement the stop below would retire the owner
+    // word under the installing CPU, whose capture then refuses its own claim
+    // (check 9). With it the stop reports the claim in flight and changes nothing.
+    fixture(true, |slot, turn| {
+        turn.announce_claim(slot);
+        assert!(
+            capture(slot, turn, FrameCustody::Current)
+                .prepare()
+                .unwrap()
+                .claim()
+        );
+        let before = runqueue::owner(slot);
+        assert_eq!(
+            runqueue::retire_unless_claim_in_flight(slot, runqueue::weight::value(slot)),
+            runqueue::RetireOutcome::ClaimInFlight,
+            "an announced re-claim of a published Current is a claim in flight"
+        );
+        assert_eq!(runqueue::owner(slot), before, "a deferred stop changes nothing");
+        // Once the turn ends the claim is installed and the ordinary remote stop applies.
+        turn.retract_claim();
+        assert_eq!(
+            runqueue::retire_unless_claim_in_flight(slot, runqueue::weight::value(slot)),
+            runqueue::RetireOutcome::Retired
+        );
+        finish_modeled_preparation(slot, slot);
+    });
+}
+
 /// Teardown for a task whose stop was withdrawn and deferred by the test: it
 /// completes the same cleanup as the default release but finishes the retained
 /// producer instead of beginning a new one.
