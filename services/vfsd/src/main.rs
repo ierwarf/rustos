@@ -264,8 +264,12 @@ fn service_main() {
         return;
     }
     ipc::debug_line("vfsd: vfs policy endpoint registered");
-    if let Err(errno) = rustos_svc_runtime::heartbeat::spawn_thread(rustos_user_abi::syscall::IPC_SERVICE_VFSD) {
-        ipc::debug_line(&alloc::format!("vfsd: heartbeat thread unavailable errno={errno}"));
+    if let Err(errno) =
+        rustos_svc_runtime::heartbeat::spawn_thread(rustos_user_abi::syscall::IPC_SERVICE_VFSD)
+    {
+        ipc::debug_line(&alloc::format!(
+            "vfsd: heartbeat thread unavailable errno={errno}"
+        ));
     }
     if ensure_snapshot_worker().is_err() {
         // procd is an independently starting core service. Keep the endpoint
@@ -319,14 +323,24 @@ fn serve(endpoint: u64, mut state: VfsState) {
     // can send them after the request buffer is reused for the next message.
     let mut commercial_response = CommercialMaxProtocolResponse::default();
     let mut linux_response = LinuxSyscallOffloadResponse::default();
-    let mut received =
-        receive_request(endpoint, &mut request, &mut reply_cap, &mut sender_pid, &mut sender_tid);
+    let mut received = receive_request(
+        endpoint,
+        &mut request,
+        &mut reply_cap,
+        &mut sender_pid,
+        &mut sender_tid,
+    );
     loop {
         rustos_svc_runtime::heartbeat::ensure_thread(rustos_user_abi::syscall::IPC_SERVICE_VFSD);
         if received < 0 {
             rustos_svc_runtime::syscall::sleep_millis(1);
             received = receive_request(
-                endpoint, &mut request, &mut reply_cap, &mut sender_pid, &mut sender_tid);
+                endpoint,
+                &mut request,
+                &mut reply_cap,
+                &mut sender_pid,
+                &mut sender_tid,
+            );
             continue;
         }
 
@@ -349,9 +363,9 @@ fn serve(endpoint: u64, mut state: VfsState) {
                         reply_snapshot_status(reply_cap, EACCES)
                     } else {
                         match state.resolve_executable_snapshot_request(*request) {
-                            Ok(resolved) => {
-                                enqueue_executable_snapshot(reply_cap, sender_pid, sender_tid, resolved)
-                            }
+                            Ok(resolved) => enqueue_executable_snapshot(
+                                reply_cap, sender_pid, sender_tid, resolved,
+                            ),
                             Err(errno) => reply_snapshot_status(reply_cap, errno),
                         }
                     },
@@ -420,7 +434,12 @@ fn serve(endpoint: u64, mut state: VfsState) {
                     }
                 }
                 receive_request(
-                    endpoint, &mut request, &mut reply_cap, &mut sender_pid, &mut sender_tid)
+                    endpoint,
+                    &mut request,
+                    &mut reply_cap,
+                    &mut sender_pid,
+                    &mut sender_tid,
+                )
             }
             Served::Reply(response, response_len) => {
                 // SAFETY: the response lives in a static slot or a local that
@@ -442,7 +461,12 @@ fn serve(endpoint: u64, mut state: VfsState) {
                 };
                 if next < 0 {
                     receive_request(
-                        endpoint, &mut request, &mut reply_cap, &mut sender_pid, &mut sender_tid)
+                        endpoint,
+                        &mut request,
+                        &mut reply_cap,
+                        &mut sender_pid,
+                        &mut sender_tid,
+                    )
                 } else {
                     next
                 }
@@ -672,7 +696,11 @@ fn duplicate_snapshot_fd(fd: i32) -> Result<i32, i32> {
             0,
         )
     };
-    if result < 0 { Err((-result) as i32) } else { Ok(result as i32) }
+    if result < 0 {
+        Err((-result) as i32)
+    } else {
+        Ok(result as i32)
+    }
 }
 
 fn close_fd(fd: i32) {

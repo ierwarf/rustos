@@ -278,8 +278,8 @@ fn spawn_snapshot_worker(_index: usize) -> Result<(), i64> {
 #[cfg(not(test))]
 extern "C" fn snapshot_worker_entry() -> ! {
     loop {
-        let Some(index) = SNAPSHOT_WORK_SIGNAL
-            .claim_or_wait(claim_any_ready_job, wait_snapshot_work)
+        let Some(index) =
+            SNAPSHOT_WORK_SIGNAL.claim_or_wait(claim_any_ready_job, wait_snapshot_work)
         else {
             continue;
         };

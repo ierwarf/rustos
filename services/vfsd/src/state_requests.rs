@@ -272,7 +272,9 @@ impl VfsState {
     fn vfs_poll_once(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
         const POLLFD_SIZE: usize = size_of::<linux_abi::LinuxPollFd>();
         let len = request.payload_len as usize;
-        if !len.is_multiple_of(POLLFD_SIZE) || len > response.payload.len() {
+        if !len.is_multiple_of(POLLFD_SIZE)
+            || len > response.payload.len().min(request.payload.len())
+        {
             response.status = EINVAL;
             return;
         }

@@ -8,7 +8,7 @@ pub use snapshot_lease::ExecutableSnapshotLease;
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU8, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
 use rustos_user_abi::performance::{WAITSET_MAX_EPOLL_OBJECTS, WAITSET_MAX_GLOBAL_INTERESTS};
 use rustos_user_abi::syscall::{
     DvmBlockInfoWire, ServiceCheckpointRecordWire, EARLY_SYSTEM_BROKER_MAX_IO_BYTES,
