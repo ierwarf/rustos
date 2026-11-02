@@ -22,7 +22,9 @@ The target is the normal general-OS shape:
    frame descriptor catalog;
 3. remove an empty subtree only after withdrawing the parent entry;
 4. defer physical reuse until exact CPU TLB acknowledgement, which also
-   excludes IRQ-off walkers under the active-root/PCID-disabled contract; and
+   excludes IRQ-off walkers (an address-space mutation always waits for the
+   acknowledgement of a CPU running the space; only global and retirement
+   mutations may leave a preempted vCPU to its host); and
 5. account table pages against a bounded root and system budget.
 
 Linux has the same broad split: it dynamically allocates missing levels,

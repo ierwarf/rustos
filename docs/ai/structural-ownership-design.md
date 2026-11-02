@@ -85,7 +85,7 @@ by writing the mapping down rather than by renaming either side.
 | `V5-VFSD-HOL-007` | **structure landed, runtime evidence owed.** The receive owner never blocks, the plan carries its mount generation and the commit refuses a stale one, and custody is a bounded two-worker pool. What is still owed is the measured control-lane residence bound in section 3, and the 2005 ms snapshot itself is still unattributed. Section 3 |
 | `V5-WAYLAND-HOL-013`, `V5-GPU-UI-OWNER-014` | no `WaylandProtocolOwner`, `SceneOwner`, `GpuSubmissionOwner`, or `FramePlan`. Section 4 |
 | `V5-UI-PIPELINE-011` | `frame_seq` exists only inside `uiserver/main.rs` and `loop_timing.rs`; it never reaches the scheduler, IPC, or DVM relay. Section 5 |
-| `V5-TLB-SCALE-009` | **structure closed, runtime evidence owed.** `active_root_targeting_is_sound` asserts CR4.PCIDE is clear per admitted CPU, and the unacknowledged-target policy is documented as system fail-stop with the reclaim alternative rejected in writing. What is owed is the measured ACK latency distribution under a delayed vCPU. Section 8 |
+| `V5-TLB-SCALE-009` | **structure closed, runtime evidence owed.** PCID is enabled per admitted CPU with generation-checked activation (`tlb_shootdown.rs`), and the unacknowledged-target policy is documented as system fail-stop with the reclaim alternative rejected in writing. What is owed is the measured ACK latency distribution under a delayed vCPU. Section 8 |
 
 `V5-VFSD-HOL-007` being recorded closed while it times out is the reason section
 1 exists. The correction above is the reason it re-derives from source instead
@@ -494,21 +494,18 @@ optimization: "if it can be proven that a user address space has never executed
 on a cpu (see `mm_cpumask()`), one need not perform a flush for this address
 space on that cpu", with flushes ordered after page-table changes.
 
-RustOS reaches the same conclusion by a different route, and that route is a
-coupling rather than a coincidence: the tree enables **neither PCID nor
-INVPCID**, so a CR3 write flushes non-global entries and a CPU that switched
-away from a root provably retains none of its translations. With PCID enabled,
-translations survive the switch under their ASID; a CPU that merely *ran* the
-address space still holds them; and targeting by *currently active* root would
-skip exactly those CPUs and authorize reclaim of frames they can still
-translate. That is memory corruption, not a latency regression.
-
-`active_root_targeting_is_sound` now asserts CR4.PCIDE is clear, checked per
-admitted CPU rather than once because PCIDE is a per-CPU control register and a
-BSP-only check would not cover an AP that came up differently. A mutant that
-weakens the predicate fails. Enabling PCID must therefore come with an ASID
-allocation, reuse, and wrap proof and a different target set, per Intel SDM
-Vol. 3 — <https://www.intel.com/content/www/us/en/developer/articles/technical/intel-sdm.html>.
+RustOS now tags address spaces with PCID (see
+[tlb-shootdown-design.md](../architecture/tlb-shootdown-design.md) section 7),
+so a CPU that merely *ran* a space can still hold its translations. Targeting by
+the currently active root stays sound because those translations are tagged and
+cannot be used until the space is activated again, and every activation compares
+the CPU's binding with the space's `tlb_gen` and flushes a binding that is
+behind. The ordering that makes this hold against a mutation concurrent with the
+switch is the `tlb-activation-generation` scenario; the failure it excludes is a
+mutation that misses the activating CPU in its root sample *and* an activation
+that reads the old generation. A global or retirement mutation does not rely on
+this: it targets every eligible CPU and invalidates every PCID. Enabling PCID is
+per CPU, requires INVPCID, and falls back to the untagged protocol otherwise.
 
 The unacknowledged-target policy was already settled in source and did not need
 choosing: the module documents **system fail-stop**, not CPU quarantine, and

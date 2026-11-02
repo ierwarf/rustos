@@ -611,10 +611,10 @@ severity = "critical"
 flow = "tlb-shootdown-lifecycle"
 model = "tlb-shootdown-lifecycle/TlbShootdownLifecycle"
 source = "kernel/hal/src/arch/tlb_shootdown.rs"
-source_symbol = "on_interrupt"
+source_symbol = "service_requests"
 source_anchors = [
-  "ACK_GENERATION[logical_index].store(generation, Ordering::Release)",
-  "ACK_GENERATION[target].load(Ordering::Acquire) == generation",
+  "ACK_GENERATION[sender][logical_index].store(generation, Ordering::Release)",
+  "ACK_GENERATION[current][target].load(Ordering::Acquire) == generation",
 ]
 invariant = "an exact acknowledgement publishes a completed flush before reclaim"
 loom_test = "tlb_mailbox_and_ack_publish_the_exact_generation"
@@ -624,6 +624,40 @@ herd_mutant = "formal/litmus/x86_64/tlb_ack_reclaim_publication.mutant.litmus"
 herd_cat = "x86tso-mixed.cat"
 
 [[scenario]]
+id = "tlb-activation-generation"
+severity = "critical"
+flow = "tlb-shootdown-lifecycle"
+model = "tlb-shootdown-lifecycle/TlbShootdownLifecycle"
+source = "kernel/hal/src/arch/tlb_shootdown.rs"
+source_symbol = "activate_tagged"
+source_anchors = [
+  "ACTIVE_ROOT[logical_index].store(root_raw, Ordering::SeqCst)",
+  "let generation = SPACE_GEN[stripe(root_raw)].load(Ordering::SeqCst)",
+  "SPACE_GEN[stripe(root)].fetch_add(1, Ordering::SeqCst) + 1",
+]
+invariant = "a mutation either sees the activating CPU as running the space or the activation reads the mutation's generation and flushes its tagged translations"
+loom_test = "tlb_activation_and_generation_bump_cannot_both_miss"
+shuttle_test = "tlb_activation_and_generation_bump_cannot_both_miss_pct"
+herd_not_applicable = "the decisive edge is a sequentially consistent store-buffering pair (publish then fence then read on both sides), which the pinned x86tso-mixed cat model forbids only through the fence this scenario asserts"
+
+[[scenario]]
+id = "tlb-gate-exclusion"
+severity = "critical"
+flow = "tlb-shootdown-lifecycle"
+model = "tlb-shootdown-lifecycle/TlbShootdownLifecycle"
+source = "kernel/hal/src/arch/tlb_shootdown.rs"
+source_symbol = "acquire_global"
+source_anchors = [
+  "GATE.fetch_or(GATE_EXCLUSIVE, Ordering::AcqRel)",
+  "if GATE.load(Ordering::Acquire) == GATE_EXCLUSIVE",
+  "GATE.compare_exchange(gate, next, Ordering::AcqRel, Ordering::Acquire)",
+]
+invariant = "a global or retirement mutation holds the gate exclusively: no per-space mutation is in flight or admitted while it runs"
+loom_test = "tlb_gate_excludes_global_from_shared_mutations"
+shuttle_test = "tlb_gate_excludes_global_from_shared_mutations_pct"
+herd_not_applicable = "both transitions are read-modify-writes of a single word, whose total modification order is architectural rather than an ordering edge between distinct locations"
+
+[[scenario]]
 id = "tlb-mailbox-request"
 severity = "critical"
 flow = "tlb-shootdown-lifecycle"
@@ -631,9 +665,9 @@ model = "tlb-shootdown-lifecycle/TlbShootdownLifecycle"
 source = "kernel/hal/src/arch/tlb_shootdown.rs"
 source_symbol = "finish_shootdown"
 source_anchors = [
-  "REQUEST_ROOT[target].store(mutation_root, Ordering::Relaxed)",
-  "REQUEST_GENERATION[target].store(generation, Ordering::Release)",
-  "let generation = REQUEST_GENERATION[logical_index].load(Ordering::Acquire)",
+  "REQUEST_ROOT[current][target].store(mutation_root, Ordering::Relaxed)",
+  "REQUEST_GENERATION[current][target].store(generation, Ordering::Release)",
+  "let generation = REQUEST_GENERATION[sender][logical_index].load(Ordering::Acquire)",
 ]
 invariant = "a request generation publishes its complete target mailbox before handler validation"
 loom_test = "tlb_mailbox_and_ack_publish_the_exact_generation"
@@ -641,6 +675,22 @@ shuttle_test = "tlb_mailbox_flush_ack_and_reclaim_preserve_generation_order"
 herd_test = "formal/litmus/x86_64/tlb_mailbox_request_publication.litmus"
 herd_mutant = "formal/litmus/x86_64/tlb_mailbox_request_publication.mutant.litmus"
 herd_cat = "x86tso-mixed.cat"
+
+[[scenario]]
+id = "tlb-sender-slots"
+severity = "critical"
+flow = "tlb-shootdown-lifecycle"
+model = "tlb-shootdown-lifecycle/TlbShootdownLifecycle"
+source = "kernel/hal/src/arch/tlb_shootdown.rs"
+source_symbol = "service_requests"
+source_anchors = [
+  "PENDING[target].fetch_or(1 << current, Ordering::Release)",
+  "PENDING[logical_index].swap(0, Ordering::Acquire)",
+]
+invariant = "concurrent senders own distinct sender-by-target slots, so a target acknowledges each with exactly the generation that sender published"
+loom_test = "tlb_sender_slots_never_alias"
+shuttle_test = "tlb_sender_slots_never_alias_pct"
+herd_not_applicable = "the pending bit publishes a slot written by the same sender with release ordering, the same edge the tlb-mailbox-request litmus already covers for the slot payload"
 
 [[scenario]]
 id = "user-exception-marker-serialization"

@@ -55,7 +55,7 @@ pub mod arch {
             AddressSpaceMutationGuard, FlushedAddressSpaceMutationGuard, activate_address_space,
             admit_current_cpu_online, assert_address_space_inactive, begin_address_space_mutation,
             begin_address_space_retirement, begin_global_mapping_mutation,
-            try_begin_address_space_mutation_from_exception,
+            enable_paravirtual_flush, try_begin_address_space_mutation_from_exception,
         };
     }
 
@@ -303,14 +303,16 @@ pub use crate::hooks::{
     CurrentUserSnapshot, HeartbeatHooks, HeartbeatSnapshot, InputEventQueueDebugSnapshot,
     InterruptHooks, TaskHooks, UserFaultDisposition,
 };
-pub use boot::{call_with_stack, enter_higher_half, init_acpi, init_clocksource, init_gdt, init_idt};
-pub use kernel_lowlevel::interrupts::register_fast_ipc_resume_rip;
+pub use boot::{
+    call_with_stack, enter_higher_half, init_acpi, init_clocksource, init_gdt, init_idt,
+};
 pub use cpu::{current_rip, init_simd, simd_mode_name};
 pub use interrupts::{
     SAVED_CONTEXT_BYTES, SAVED_CONTEXT_XMM_OFFSET, disable_interrupts,
     dispatch_saved_syscall_user_context, init_pic, register_heartbeat_hooks,
     register_interrupt_hooks, register_task_hooks, restore_kernel_saved_context,
 };
+pub use kernel_lowlevel::interrupts::register_fast_ipc_resume_rip;
 pub use time::init_rtc;
 
 extern "C" fn timer_interrupt_default_dispatch(

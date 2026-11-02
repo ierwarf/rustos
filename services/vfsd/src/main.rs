@@ -363,9 +363,7 @@ fn serve(endpoint: u64, mut state: VfsState) {
                         reply_snapshot_status(reply_cap, EACCES)
                     } else {
                         match state.resolve_executable_snapshot_request(*request) {
-                            Ok(resolved) => enqueue_executable_snapshot(
-                                reply_cap, sender_pid, sender_tid, resolved,
-                            ),
+                            Ok(resolved) => enqueue_executable_snapshot(reply_cap, sender_pid, sender_tid, resolved),
                             Err(errno) => reply_snapshot_status(reply_cap, errno),
                         }
                     },

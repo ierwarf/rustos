@@ -37,11 +37,13 @@ RetireMutation == "retire-mutation"
 
 VARIABLES activeRoot, eligible, rootState, references, phase, mutationKind,
           mutationRoot, generation, targets, requestGeneration, ackGeneration,
-          lastActivationSameRoot, lastActivationReloaded, targetSnapshotRoot
+          lastActivationSameRoot, lastActivationReloaded, targetSnapshotRoot,
+          staleAt
 
 vars == <<activeRoot, eligible, rootState, references, phase, mutationKind,
           mutationRoot, generation, targets, requestGeneration, ackGeneration,
-          lastActivationSameRoot, lastActivationReloaded, targetSnapshotRoot>>
+          lastActivationSameRoot, lastActivationReloaded, targetSnapshotRoot,
+          staleAt>>
 
 Init ==
     /\ activeRoot = [cpu \in Cpus |-> NoneRoot]
@@ -58,6 +60,7 @@ Init ==
     /\ lastActivationSameRoot = FALSE
     /\ lastActivationReloaded = FALSE
     /\ targetSnapshotRoot = [cpu \in Cpus |-> NoneRoot]
+    /\ staleAt = [cpu \in Cpus |-> {}]
 
 EligibleTargets == {cpu \in Cpus: eligible[cpu]}
 AddressSpaceTargets(root) ==
@@ -70,7 +73,7 @@ AcquireReference(root) ==
     /\ UNCHANGED <<activeRoot, eligible, rootState, phase, mutationKind,
                    mutationRoot, generation, targets, requestGeneration,
                    ackGeneration, lastActivationSameRoot,
-                   lastActivationReloaded, targetSnapshotRoot>>
+                   lastActivationReloaded, targetSnapshotRoot, staleAt>>
 
 ReleaseReference(root) ==
     /\ references[root] > 0
@@ -79,7 +82,7 @@ ReleaseReference(root) ==
     /\ UNCHANGED <<activeRoot, eligible, rootState, phase, mutationKind,
                    mutationRoot, generation, targets, requestGeneration,
                    ackGeneration, lastActivationSameRoot,
-                   lastActivationReloaded, targetSnapshotRoot>>
+                   lastActivationReloaded, targetSnapshotRoot, staleAt>>
 
 Activate(cpu, root) ==
     /\ rootState[root] = RootLive
@@ -87,6 +90,10 @@ Activate(cpu, root) ==
     /\ lastActivationSameRoot' = (activeRoot[cpu] = root)
     /\ lastActivationReloaded' = (activeRoot[cpu] # root)
     /\ activeRoot' = [activeRoot EXCEPT ![cpu] = root]
+    \* A tagged activation compares its binding with the space's tlb_gen: a
+    \* binding that is behind (the space was mutated while this CPU was not
+    \* running it) flushes before the first user instruction.
+    /\ staleAt' = [staleAt EXCEPT ![cpu] = @ \ {root}]
     /\ UNCHANGED <<eligible, rootState, references, phase, mutationKind,
                    mutationRoot, generation, targets, requestGeneration,
                    ackGeneration, targetSnapshotRoot>>
@@ -98,7 +105,7 @@ Deactivate(cpu) ==
     /\ lastActivationReloaded' = FALSE
     /\ UNCHANGED <<eligible, rootState, references, phase, mutationKind,
                    mutationRoot, generation, targets, requestGeneration,
-                   ackGeneration, targetSnapshotRoot>>
+                   ackGeneration, targetSnapshotRoot, staleAt>>
 
 Admit(cpu) ==
     /\ phase = Idle
@@ -108,7 +115,7 @@ Admit(cpu) ==
     /\ UNCHANGED <<activeRoot, rootState, references, phase, mutationKind,
                    mutationRoot, generation, targets, requestGeneration,
                    ackGeneration, lastActivationSameRoot,
-                   lastActivationReloaded, targetSnapshotRoot>>
+                   lastActivationReloaded, targetSnapshotRoot, staleAt>>
 
 BeginMutation(root) ==
     /\ phase = Idle
@@ -122,7 +129,7 @@ BeginMutation(root) ==
     /\ targets' = {}
     /\ UNCHANGED <<activeRoot, eligible, rootState, references, generation,
                    requestGeneration, ackGeneration, lastActivationSameRoot,
-                   lastActivationReloaded, targetSnapshotRoot>>
+                   lastActivationReloaded, targetSnapshotRoot, staleAt>>
 
 BeginGlobalMutation ==
     /\ phase = Idle
@@ -132,7 +139,7 @@ BeginGlobalMutation ==
     /\ targets' = {}
     /\ UNCHANGED <<activeRoot, eligible, rootState, references, generation,
                    requestGeneration, ackGeneration, lastActivationSameRoot,
-                   lastActivationReloaded, targetSnapshotRoot>>
+                   lastActivationReloaded, targetSnapshotRoot, staleAt>>
 
 BeginRetirement(root) ==
     /\ phase = Idle
@@ -146,7 +153,7 @@ BeginRetirement(root) ==
     /\ targets' = {}
     /\ UNCHANGED <<activeRoot, eligible, references, generation,
                    requestGeneration, ackGeneration, lastActivationSameRoot,
-                   lastActivationReloaded, targetSnapshotRoot>>
+                   lastActivationReloaded, targetSnapshotRoot, staleAt>>
 
 Publish ==
     /\ phase = Editing
@@ -163,6 +170,17 @@ Publish ==
               [cpu \in Cpus |->
                   IF cpu \in publishTargets THEN 0 ELSE ackGeneration[cpu]]
           /\ targetSnapshotRoot' = activeRoot
+          \* Every CPU may now cache a translation older than this edit; a
+          \* target clears it on acknowledgement, any other CPU at activation.
+          \* An admitted CPU discarded everything cached while parked, so
+          \* only an eligible CPU can hold an older translation.
+          /\ staleAt' =
+              [cpu \in Cpus |->
+                  IF eligible[cpu]
+                  THEN staleAt[cpu] \cup
+                      (IF mutationKind = EditMutation
+                       THEN {mutationRoot} ELSE Roots)
+                  ELSE staleAt[cpu]]
     /\ generation' = generation + 1
     /\ phase' = Published
     /\ UNCHANGED <<activeRoot, eligible, rootState, references, mutationKind,
@@ -174,6 +192,9 @@ Acknowledge(cpu) ==
     /\ cpu \in targets
     /\ requestGeneration[cpu] = generation
     /\ ackGeneration' = [ackGeneration EXCEPT ![cpu] = generation]
+    /\ staleAt' =
+        [staleAt EXCEPT ![cpu] =
+            @ \ (IF mutationKind = EditMutation THEN {mutationRoot} ELSE Roots)]
     /\ UNCHANGED <<activeRoot, eligible, rootState, references, phase,
                    mutationKind, mutationRoot, generation, targets,
                    requestGeneration, lastActivationSameRoot,
@@ -190,7 +211,7 @@ Finish ==
     /\ UNCHANGED <<activeRoot, eligible, references, mutationKind,
                    mutationRoot, generation, targets, requestGeneration,
                    ackGeneration, lastActivationSameRoot,
-                   lastActivationReloaded, targetSnapshotRoot>>
+                   lastActivationReloaded, targetSnapshotRoot, staleAt>>
 
 Terminal ==
     /\ phase = Complete
@@ -228,6 +249,7 @@ TypeOK ==
     /\ lastActivationSameRoot \in BOOLEAN
     /\ lastActivationReloaded \in BOOLEAN
     /\ targetSnapshotRoot \in [Cpus -> Roots \cup {NoneRoot}]
+    /\ staleAt \in [Cpus -> SUBSET Roots]
 
 SameRootActivationDoesNotReload ==
     lastActivationSameRoot => ~lastActivationReloaded
@@ -246,6 +268,15 @@ PublishedTargetsOwnExactGeneration ==
 FinishRequiresEveryAcknowledgement ==
     phase = Complete =>
         \A cpu \in targets: ackGeneration[cpu] = generation
+
+\* After reclaim is admitted no CPU that is running a space holds a translation
+\* older than the edit: targets acknowledged, and a CPU that was not a target
+\* either is not running the space or flushed when it activated it.
+CompletedMutationLeavesNoStaleTranslationOnARunningCpu ==
+    phase = Complete =>
+        \A cpu \in Cpus:
+            activeRoot[cpu] # NoneRoot =>
+                activeRoot[cpu] \notin staleAt[cpu]
 
 RetiredRootsOwnNoReference ==
     \A root \in Roots:

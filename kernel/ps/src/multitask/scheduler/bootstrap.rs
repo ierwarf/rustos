@@ -517,6 +517,7 @@ impl Bootstrap {
                 generation,
             );
         }
+        crate::arch::tlb::enable_paravirtual_flush(crate::memory::paging::kernel_virtual_to_physical_addr);
         crate::arch::tlb::admit_current_cpu_online();
         cpu::transition_lifecycle(
             0,
@@ -553,7 +554,8 @@ pub(in crate::multitask) fn enter_secondary() {
         nucleus_core::util::lockdep::set_current_task_owner(
             id.checked_add(1).expect("AP lock owner token exhausted"));
     });
-    crate::arch::tlb::admit_current_cpu_online();
+    crate::arch::tlb::enable_paravirtual_flush(crate::memory::paging::kernel_virtual_to_physical_addr);
+        crate::arch::tlb::admit_current_cpu_online();
     assert!(
         crate::arch::timer::init_current_cpu(),
         "AP clockevent unavailable"

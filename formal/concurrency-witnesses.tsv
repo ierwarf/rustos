@@ -27,6 +27,9 @@ sleepable_lock_class_cannot_nest_with_raw_spin	kernel/nucleus-core/src/util/lock
 scheduler_callback_runs_after_hook_registry_read_guard_is_released	kernel/hal/src/hooks.rs	commit_block_current_task_and_yield	hook-registry-snapshot-is-released-before-the-atomic-block-reschedule-callback
 reschedule_request_is_never_lost_across_concurrent_consume	kernel/ps/src/multitask/reschedule_observation.rs	publish_request	packed-pending-sequence-cas-leaves-each-publication-pending-or-exactly-claimed
 tlb_mailbox_and_ack_publish_the_exact_generation	kernel/hal/src/arch/tlb_shootdown.rs	finish_shootdown	release-request-publishes-mailbox-and-release-ack-publishes-flush-before-reclaim
+tlb_activation_and_generation_bump_cannot_both_miss	kernel/hal/src/arch/tlb_shootdown.rs	activate_tagged	mutation-reaches-an-activating-cpu-by-request-or-generation-never-neither
+tlb_gate_excludes_global_from_shared_mutations	kernel/hal/src/arch/tlb_shootdown.rs	acquire_global	exclusive-gate-and-shared-mutation-slots-never-overlap
+tlb_sender_slots_never_alias	kernel/hal/src/arch/tlb_shootdown.rs	service_requests	sender-by-target-slots-acknowledge-each-sender-with-its-own-generation
 recoverable_stack_growth_never_nests_scheduler_and_process_locks	kernel/ps/src/multitask/current.rs	retire_current_user_task_due_to_fault	plan-apply-commit-separates-raw-scheduler-and-process-state-lock-domains
 exec_installed_root_retains_generation_bound_owner	kernel/ps/src/multitask/process_table.rs	finalize_exec_state	authorized-reservation-survives-late-exit-through-mandatory-owner-transfer
 exec_cancel_promotes_pending_exit_transaction_once	kernel/ps/src/multitask/process_table.rs	cancel_exec	separate-nonreusable-exit-token-becomes-active-and-seals-attach-when-exec-cancels

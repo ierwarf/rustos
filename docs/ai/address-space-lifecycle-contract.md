@@ -373,9 +373,10 @@ already has or needs for other reasons:
    guard typestate already enforces.
 
 Drop the hazard references and mutation pins from the design.  The one thing
-that would reinstate them is PCID, which independently invalidates active-root
-targeting; `tlb_shootdown.rs` already states that coupling and asserts against
-it.
+that would reinstate them is a way to skip the acknowledgement; the paravirtual
+flush hint is therefore restricted to global and retirement mutations
+(`tlb-shootdown-design.md` section 7), because only an acknowledgement excludes an
+IRQ-off software walk.
 
 ## 7. Where an MM decision lives
 

@@ -5273,6 +5273,32 @@ invariant = "NoReuseBeforeExactAck"
 min_counterexample_states = 3
 
 [[mutation]]
+id = "tlb-acknowledgement-keeps-stale-translation"
+kind = "transition-effect"
+severity = "critical"
+model = "tlb-shootdown-lifecycle/TlbShootdownLifecycle"
+flow = "tlb-shootdown-lifecycle"
+find = """    /\\ staleAt' =
+        [staleAt EXCEPT ![cpu] =
+            @ \\ (IF mutationKind = EditMutation THEN {mutationRoot} ELSE Roots)]"""
+replace = "    /\\ staleAt' = staleAt"
+occurrence = 1
+invariant = "CompletedMutationLeavesNoStaleTranslationOnARunningCpu"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "tlb-activation-skips-generation-flush"
+kind = "transition-effect"
+severity = "critical"
+model = "tlb-shootdown-lifecycle/TlbShootdownLifecycle"
+flow = "tlb-shootdown-lifecycle"
+find = "    /\\ staleAt' = [staleAt EXCEPT ![cpu] = @ \\ {root}]"
+replace = "    /\\ staleAt' = staleAt"
+occurrence = 1
+invariant = "CompletedMutationLeavesNoStaleTranslationOnARunningCpu"
+min_counterexample_states = 3
+
+[[mutation]]
 id = "tlb-active-root-target-filter-removed"
 kind = "transition-effect"
 severity = "critical"

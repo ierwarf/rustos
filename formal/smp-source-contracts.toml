@@ -1190,9 +1190,14 @@ path = "kernel/hal/src/arch/tlb_shootdown.rs"
 names = [
     "ACTIVE_ROOT",
     "SHOOTDOWN_ELIGIBLE",
-    "REQUEST_ROOT",
-    "REQUEST_GENERATION",
-    "ACK_GENERATION",
+    "SENDER_GEN",
+    "PENDING",
+    "CPU_PCID",
+    "ASID_ROOT",
+    "ASID_APPLIED",
+    "ASID_NEXT_VICTIM",
+    "STEAL_TIME",
+    "PV_FLUSH",
 ]
 capacity = "MAX_SUPPORTED_CPUS"
 

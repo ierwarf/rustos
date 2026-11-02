@@ -6,10 +6,11 @@
 
 ## English
 
-**Status: design. Only the diagnostics in section 3 are implemented.** The
-current protocol is correct and fail-stop, and it is kept as the correctness
-baseline of every phase below. This document fixes the shape it grows into so
-that later work extends it instead of replacing it.
+**Status: phases 1 to 6 are implemented; phase 7 is deliberately not.** The
+protocol described in section 1 is the one that shipped before this change and
+is kept as the history it grew from; section 7 describes what runs now. The
+fail-stop rule and "no timeout authorizes reuse" are unchanged and remain the
+correctness baseline.
 
 Tags: **(verified)** read from this tree, **(proposed)** a design decision,
 **(recalled)** background knowledge not re-read for this document, **(source)**
@@ -181,6 +182,40 @@ Phases 1 to 3 change structure and are independent of the hypervisor; phase 4
 is the one aimed at the virtualized-vCPU stall; phases 5 to 7 are
 optimizations that the contract in invariant 2 already admits.
 
+### 7. Implementation (current)
+
+Owner: [tlb_shootdown.rs](../../kernel/hal/src/arch/tlb_shootdown.rs).
+
+| Phase | What runs | Where |
+| --- | --- | --- |
+| 1 | `SPACE_GEN[stripe(root)]` is a per-address-space `tlb_gen`; each CPU records, per bound PCID, how far it has applied it (`ASID_APPLIED`). Spaces hash onto 64 stripes: a collision costs a serialization or one extra flush, never a skipped one. | `finish_shootdown`, `activate_tagged` |
+| 2 | A per-space mutation takes a shared slot of `GATE` and its stripe lock; a global, retirement or admission mutation takes `GATE` exclusively, behind `GLOBAL_LOCK`. Requests live in a sender-by-target mailbox with a `PENDING` bit per sender, so concurrent senders never share a slot. | `try_space`, `acquire_global`, `service_requests` |
+| 3 | Every wait a sender performs (gate, stripe, drain, acknowledgement) also services the requests addressed to its own CPU, and opens an interrupt window when the caller had interrupts enabled. Two senders waiting on each other therefore cannot deadlock, with or without interrupts. The exception path keeps its single try. | `acquire_space`, `finish_shootdown` |
+| 4 | On a KVM guest that offers steal time and PV TLB flush, a target whose `preempted` byte is set is marked `KVM_VCPU_FLUSH_TLB` by compare-and-exchange and left out of the wait; the host flushes it before it runs again. Anything else gets the IPI. **Only global and retirement mutations use it**: an address-space mutation frees frames that an IRQ-off software walk on the target may be about to read, and only the target's acknowledgement excludes that walk (`page-table-reclamation-contract.md` §3), so such a mutation always waits. Retirement is the one that benefits, since it targets every eligible CPU. | `enable_paravirtual_flush`, `paravirtual_flush_claimed` |
+| 5 | A CPU that is not running the space is never a target and owes its flush at its next activation (the binding is behind `tlb_gen`). Kernel-only and idle tasks run on the kernel root, so they are in this set already; no separate lazy mode exists. | `activate_tagged` |
+| 6 | With PCID and INVPCID, six dynamic PCIDs per CPU are bound to roots round-robin; `CR3` keeps translations only for a current binding. Hardware without both keeps the untagged path, per CPU. | `admit_current_cpu_online`, `activate_address_space` |
+| 7 | **Not implemented.** | see below |
+
+The ordering that makes phase 5 sound: an activation publishes its root with
+`SeqCst`, fences, and only then reads `tlb_gen`; a sender bumps `tlb_gen`
+with `SeqCst`, fences, and only then samples roots. In the total order one of
+the two comes first, so a mutation concurrent with a switch either reaches the
+CPU as a request or is read by the activation, which flushes. The untagged path
+keeps its original order (CR3 write, then publish) because there a CR3 write
+discards everything. This is the `tlb-activation-generation` scenario.
+
+Why phase 7 is absent: `INVLPGB` needs AMD hardware, which the build host does
+not have, so nothing in it could be run here; and erratum #1718 can leave an
+entry valid on older microcode, with the fixed revision list and the kernel
+workaround not available to this change *(source: [Phoronix](https://phoronix.com/news/Linux-WA-TLBI-Erratum-1718))*.
+Shipping a broadcast invalidate that can silently leave a stale translation,
+with no way to exercise it, is not a net gain; the IPI and PV paths already
+satisfy the same delivery contract.
+
+Not verified by a run: the PV path (it needs a host that offers the feature;
+the claim logic is unit-tested), and any gain in throughput from phases 2 and 6,
+which want the repository's same-session control method.
+
 ### 6. Non-goals and open questions
 
 - Replacing fail-stop with quarantining a silent CPU: rejected for the same
@@ -197,7 +232,7 @@ optimizations that the contract in invariant 2 already admits.
 
 ## 한국어 요약
 
-**상태: 설계 문서. 구현된 것은 진단 milestone 하나뿐입니다.** 현재 프로토콜은
+**상태: 1~6단계 구현, 7단계(INVLPGB)는 의도적으로 미구현입니다. 아래 `현재`는 개편 전 프로토콜 설명이며 현재 구현은 영어 7절을 보세요.** 현재 프로토콜은
 올바르고 fail-stop이며, 아래 모든 단계에서 정확성의 기준선으로 유지됩니다.
 
 - **현재**: 전역 `PROTOCOL_LOCK` 하나가 모든 주소공간의 변경을 직렬화하고,
