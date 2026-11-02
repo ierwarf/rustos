@@ -56,8 +56,8 @@ const DVM_GUEST_MEMORY: &str = "2048M";
 const DVM_REQUIRED_MEMLOCK_BYTES: libc::rlim_t = 4 * 1024 * 1024 * 1024;
 // Must match RUSTOS_GUI_PIXEL_REGION_BYTES in the signed DVM exporter and the
 // V3 three-slot atlas ABI. The former 32 MiB supervisor value could not hold
-// the admitted 128 MiB source pool.
-const DVM_PIXEL_BYTES: u64 = 128 * 1024 * 1024;
+// the admitted 512 MiB source pool.
+const DVM_PIXEL_BYTES: u64 = 512 * 1024 * 1024;
 const DVM_PIXEL_PHYS: u64 = 0x1_0000_0000;
 const GUEST_SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 const TERMINATE_GRACE: Duration = Duration::from_secs(5);
@@ -2784,7 +2784,7 @@ mod tests {
 
     #[test]
     fn physical_pixel_backing_contract_is_exact_and_dma_pinnable() {
-        assert_eq!(DVM_PIXEL_BYTES, 128 * 1024 * 1024);
+        assert_eq!(DVM_PIXEL_BYTES, 512 * 1024 * 1024);
         assert!(dma_pinnable_filesystem_type(0x0102_1994));
         assert!(dma_pinnable_filesystem_type(0x9584_58f6));
         assert!(!dma_pinnable_filesystem_type(0xef53));

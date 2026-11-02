@@ -968,7 +968,7 @@ uiserver: slow loop iter_ms=51 wayland_ms=0 present_ms=51 console_windows=1 wayl
 
     #[test]
     fn physical_pixel_backing_is_preallocated_and_dvm_read_only() {
-        assert_eq!(DVM_DISPLAY_REGION_BYTES, 128 * 1024 * 1024);
+        assert_eq!(DVM_DISPLAY_REGION_BYTES, 512 * 1024 * 1024);
         let path = std::path::Path::new("/dev/shm/rustos-kvm-test-pixels");
 
         let mut producer = Command::new("qemu-system-x86_64");
@@ -979,7 +979,7 @@ uiserver: slow loop iter_ms=51 wayland_ms=0 present_ms=51 console_windows=1 wayl
             .collect::<Vec<_>>();
         assert!(producer_args.iter().any(|arg| {
             arg.contains("memory-backend-file,id=dvm-display-pixels")
-                && arg.contains("size=134217728")
+                && arg.contains("size=536870912")
                 && arg.contains("share=on")
                 && arg.contains("prealloc=on")
                 && !arg.contains("readonly=on")
@@ -993,9 +993,33 @@ uiserver: slow loop iter_ms=51 wayland_ms=0 present_ms=51 console_windows=1 wayl
             .collect::<Vec<_>>();
         assert!(consumer_args.iter().any(|arg| {
             arg.contains("memory-backend-file,id=dvm-display-pixels")
+                && arg.contains("size=536870912")
                 && arg.contains("readonly=on,rom=on")
                 && !arg.contains("prealloc=on")
         }));
+    }
+
+    #[test]
+    fn kvm_gpu_atlas_layout_fits_pixel_backing() {
+        let pool = super::DvmGuiSurfacePoolHeader::new(
+            DVM_DISPLAY_REGION_BYTES,
+            super::DVM_DISPLAY_WIDTH,
+            super::DVM_DISPLAY_HEIGHT,
+        );
+        assert!(pool.is_valid());
+        let atlas = super::DvmGpuAtlasPoolHeader::new(
+            DVM_DISPLAY_REGION_BYTES,
+            pool,
+            super::DVM_GPU_ATLAS_WIDTH,
+            super::DVM_GPU_ATLAS_HEIGHT,
+        )
+        .expect("GPU atlas layout must fit the KVM pixel backing");
+        let last_slot = driver_domain_protocol::DVM_GPU_RENDER_MAX_IN_FLIGHT - 1;
+        let atlas_end = atlas
+            .atlas_slot_offset(last_slot)
+            .and_then(|offset| offset.checked_add(atlas.atlas_slot_bytes))
+            .expect("last GPU atlas slot must have a bounded end");
+        assert!(atlas_end <= DVM_DISPLAY_REGION_BYTES);
     }
 
     #[test]
