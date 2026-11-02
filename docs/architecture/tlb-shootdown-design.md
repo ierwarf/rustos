@@ -102,6 +102,16 @@ itself ([zephyr#123476](https://github.com/zephyrproject-rtos/zephyr/pull/123476
 `arg0 = logical_cpu << 32 | apic_id` and `arg1 = generation`, because a second
 CPU timing out on the protocol lock prints a nested panic that hides the first.
 
+Also implemented: the sender's own `flush_all` now runs after the IPIs are
+sent, so it overlaps the targets' flushes instead of preceding them (reclaim
+still waits for every acknowledgement). `tlb-wait-under-lock` records, once per
+lock class, that an acknowledgement wait began while the sender held another raw
+lock; such a lock is the one way an interrupt-off target can make the wait
+unwinnable. Two 16-vCPU `--proc-stress` boots recorded none, which rules that
+path out for the exercised workload only. Phases 1 to 7 remain unimplemented;
+none is justified by a reproduced failure yet, and phase 4 is the one aimed at
+host preemption.
+
 ### 4. References
 
 - **Linux** keeps a per-address-space generation (`tlb_gen`) and a per-CPU copy

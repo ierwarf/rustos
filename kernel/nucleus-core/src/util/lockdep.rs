@@ -934,6 +934,26 @@ fn tracked_guard_owner_cpu() -> usize {
     }
 }
 
+/// The outermost tracked raw-spin class this CPU holds that is not `except`.
+///
+/// A CPU that waits on a remote CPU's acknowledgement must hold no raw lock
+/// the remote CPU can be spinning on with interrupts masked, or neither side
+/// can progress; this names the first such lock for the waiter's diagnostics.
+#[inline]
+pub fn first_held_spin_class_except(except: u8) -> Option<u8> {
+    #[cfg(rustos_boot_image)]
+    {
+        with_current_stack(|stack| {
+            stack.classes[..stack.len].iter().copied().find(|class| *class != except)
+        })
+    }
+    #[cfg(not(rustos_boot_image))]
+    {
+        let _ = except;
+        None
+    }
+}
+
 #[inline]
 pub fn current_lock_class() -> Option<u8> {
     #[cfg(rustos_boot_image)]

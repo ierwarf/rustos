@@ -478,9 +478,14 @@ fn finish_shootdown(scope: MutationScope) {
         targets[target] = true;
     }
 
-    // The sender flushes unconditionally because it owns the page-table edit
-    // even when its current root changed during the mutation transaction.
-    tlb::flush_all();
+    // The acknowledgement wait runs with interrupts masked, so a target that
+    // spins on any raw lock this sender holds can never acknowledge. Name the
+    // first such lock once per class instead of waiting 2 s to find out.
+    if let Some(class) = nucleus_core::util::lockdep::first_held_spin_class_except(
+        LockClass::TlbShootdown as u8,
+    ) {
+        note_wait_under_lock(class);
+    }
 
     for descriptor in topology.cpus() {
         let target = usize::from(descriptor.logical_index);
@@ -493,6 +498,13 @@ fn finish_shootdown(scope: MutationScope) {
             });
         }
     }
+
+    // The sender flushes unconditionally because it owns the page-table edit
+    // even when its current root changed during the mutation transaction. It
+    // does so after the IPIs are out, so its own flush overlaps the targets'
+    // (Amit et al., concurrent local and remote flush); reclaim still waits for
+    // every acknowledgement below, so no ordering the protocol relies on moves.
+    tlb::flush_all();
 
     // One batched deadline spans the complete acknowledgement quorum, so the
     // liveness horizon still covers the whole shootdown rather than resetting
@@ -547,6 +559,23 @@ fn finish_shootdown(scope: MutationScope) {
         acknowledgements_complete(&targets, &ACK_GENERATION, generation),
         "TLB invariant: reclaim reached without every exact acknowledgement"
     );
+}
+
+/// Records, once per lock class, that a shootdown acknowledgement wait started
+/// while the sender held another raw lock. Bounded, so it costs one bit test.
+#[cfg(rustos_boot_image)]
+fn note_wait_under_lock(class: u8) {
+    static SEEN: AtomicU64 = AtomicU64::new(0);
+    let bit = 1u64 << (class & 63);
+    // ORDERING: Relaxed; a once-per-class telemetry latch.
+    if SEEN.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+        crate::debug::record_milestone(
+            crate::debug::LogCategory::Sched,
+            "tlb-wait-under-lock",
+            u64::from(class),
+            0,
+        );
+    }
 }
 
 pub(super) fn on_interrupt() {
