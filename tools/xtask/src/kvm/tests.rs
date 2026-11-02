@@ -226,37 +226,37 @@ mod tests {
                 .contains(&DVM_BOOTSTRAP_FRAME_MARKER.to_owned())
         );
         assert!(dvm_display_provider_ready(
-            "[INFO ] service=uiserver uiserver: display_get_info attempt=1 width=1600 height=900 stride=7168 bpp=4 fmt=1 flags=0x6 gen=1\n\
+            "[INFO ] service=uiserver uiserver: display_get_info attempt=1 width=2560 height=1440 stride=10240 bpp=4 fmt=1 flags=0x6 gen=1\n\
              seq=9 msg=\"milestone name=product-display-ready arg0=0x1 arg1=0x1\""
         ));
         assert!(!dvm_display_provider_ready(
-            "[INFO ] service=uiserver uiserver: display_get_info attempt=1 width=1600 height=900 stride=7168 bpp=4 fmt=1 flags=0x6 gen=1"
+            "[INFO ] service=uiserver uiserver: display_get_info attempt=1 width=2560 height=1440 stride=10240 bpp=4 fmt=1 flags=0x6 gen=1"
         ));
         assert!(!dvm_display_provider_ready(
-            "[INFO ] service=uiserver uiserver: display_get_info attempt=1 width=1600 height=900 stride=7168 bpp=4 fmt=1 flags=0x4 gen=1\n\
+            "[INFO ] service=uiserver uiserver: display_get_info attempt=1 width=2560 height=1440 stride=10240 bpp=4 fmt=1 flags=0x4 gen=1\n\
              seq=9 msg=\"milestone name=product-display-ready arg0=0x1 arg1=0x1\""
         ));
         assert!(dvm_display_relay_ready(
             "rustos-dvm-display: peer readiness sent event=ivshmem-msix-uio\n\
              rustos-dvm-display: host confirmed peer readiness event=ivshmem-msix-uio\n\
              rustos-dvm-display: scheduler admitted policy=rr priority=9 rttime_soft_us=50000 rttime_hard_us=100000 rttime_hard_action=terminate\n\
-             rustos-dvm-display: active width=1600 height=900 stride=7168 format=BGRA8888 event=ivshmem-msix-uio irq_count=1 source-path=staged-copy zero-copy=0 gpu-composition=1 explicit-fence=1 scanout_buffers=3 cpu-final-compose=0 staged-damage-copy=1",
+             rustos-dvm-display: active width=2560 height=1440 stride=10240 format=BGRA8888 event=ivshmem-msix-uio irq_count=1 source-path=staged-copy zero-copy=0 gpu-composition=1 explicit-fence=1 scanout_buffers=3 cpu-final-compose=0 staged-damage-copy=1",
             false,
         ));
         assert!(!dvm_display_relay_ready(
-            "rustos-dvm-display: active width=1600 height=900 stride=7168 format=BGRA8888 dmabuf-direct-scanout",
+            "rustos-dvm-display: active width=2560 height=1440 stride=10240 format=BGRA8888 dmabuf-direct-scanout",
             false,
         ));
         assert!(!dvm_display_relay_ready(
             "rustos-dvm-display: peer readiness sent event=ivshmem-msix-uio\n\
              rustos-dvm-display: host confirmed peer readiness event=ivshmem-msix-uio\n\
-             rustos-dvm-display: active width=1600 height=900 stride=7168 format=BGRA8888 event=ivshmem-msix-uio irq_count=0 source-path=staged-copy zero-copy=0 gpu-composition=1 explicit-fence=1 scanout_buffers=3 cpu-final-compose=0 staged-damage-copy=1",
+             rustos-dvm-display: active width=2560 height=1440 stride=10240 format=BGRA8888 event=ivshmem-msix-uio irq_count=0 source-path=staged-copy zero-copy=0 gpu-composition=1 explicit-fence=1 scanout_buffers=3 cpu-final-compose=0 staged-damage-copy=1",
             false,
         ));
         assert!(dvm_display_relay_ready(
             "rustos-dvm-display: host confirmed peer readiness event=ivshmem-msix-uio\n\
              rustos-dvm-display: scheduler admitted policy=rr priority=9 rttime_soft_us=50000 rttime_hard_us=100000 rttime_hard_action=terminate\n\
-             rustos-dvm-display: active width=1600 height=900 stride=7168 format=BGRA8888 event=ivshmem-msix-uio irq_count=1 source-path=dmabuf zero-copy=1 gpu-composition=1 explicit-fence=1 scanout_buffers=3 cpu-final-compose=0 staged-damage-copy=0",
+             rustos-dvm-display: active width=2560 height=1440 stride=10240 format=BGRA8888 event=ivshmem-msix-uio irq_count=1 source-path=dmabuf zero-copy=1 gpu-composition=1 explicit-fence=1 scanout_buffers=3 cpu-final-compose=0 staged-damage-copy=0",
             true,
         ));
         assert_eq!(
@@ -889,7 +889,7 @@ uiserver: slow loop iter_ms=51 wayland_ms=0 present_ms=51 console_windows=1 wayl
             "gtk,gl=on,show-tabs=off,zoom-to-fit=off,grab-on-hover=on,show-cursor=off"
         );
         // The interactive session scales the guest to the window and drops
-        // the menu bar so a host screen smaller than 1600x900 shows it all.
+        // the menu bar so a host screen smaller than 2560x1440 shows it all.
         assert_eq!(
             qemu_display_backend(GuestDisplay::DvmGtk, None, true).unwrap(),
             "gtk,gl=on,show-tabs=off,show-menubar=off,zoom-to-fit=on,grab-on-hover=on,show-cursor=off"

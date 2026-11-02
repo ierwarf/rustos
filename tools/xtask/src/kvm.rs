@@ -109,10 +109,10 @@ const MIN_UI_CURSOR_SPAN: u64 = 96;
 // inside a 16.67 ms 60 Hz frame.  The relay never copies pixel payloads.
 const MAX_DVM_DISPLAY_RELAY_US: u64 = 12_000;
 const MAX_DVM_GPU_RENDER_US: u64 = 16_667;
-const DVM_DISPLAY_WIDTH: u32 = 1600;
-const DVM_DISPLAY_HEIGHT: u32 = 900;
+const DVM_DISPLAY_WIDTH: u32 = 2560;
+const DVM_DISPLAY_HEIGHT: u32 = 1440;
 const DVM_DISPLAY_REGION_BYTES: u64 = 128 * 1024 * 1024;
-const DVM_GPU_ATLAS_WIDTH: u32 = 2048;
+const DVM_GPU_ATLAS_WIDTH: u32 = 4096;
 const DVM_GPU_ATLAS_HEIGHT: u32 = 2048;
 // Keep the KVM proof topology identical to the supervised physical-display
 // DVM. Mesa virgl plus the AMD radeonsi/LLVM runtime, firmware, the compressed

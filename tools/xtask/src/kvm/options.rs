@@ -875,7 +875,7 @@ fn qemu_display_backend(
         //
         // The default presents the guest at exactly 1:1, which is what the
         // smoke and FPS proofs measure. That makes the window as large as the
-        // 1600x900 guest, which does not fit a host whose logical screen is
+        // 2560x1440 guest, which does not fit a host whose logical screen is
         // smaller (for example a 2880x1800 panel at 200% scale). The
         // interactive session therefore scales the guest to the window and
         // hides the menu bar so the whole desktop stays on screen at any
@@ -922,7 +922,7 @@ fn dvm_keyboard_device(display: GuestDisplay) -> &'static str {
 fn dvm_pointer_device(display: GuestDisplay) -> &'static str {
     // An absolute tablet keeps host pointer motion available while the GTK
     // window is merely hovered. The DVM agent normalizes the tablet range to
-    // the fixed 1600x900 scanout before it emits the authenticated RDI3 frame.
+    // the fixed 2560x1440 scanout before it emits the authenticated RDI3 frame.
     if display == GuestDisplay::Physical {
         "virtio-tablet-pci,id=dvm-pointer"
     } else {

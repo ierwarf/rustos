@@ -86,7 +86,7 @@ enum XtaskCommand {
         physical_usb: Option<String>,
         /// Show the guest at 1:1 instead of scaling it to fit the QEMU window.
         /// By default the interactive window scales so the whole desktop fits
-        /// a host screen smaller than the 1600x900 guest.
+        /// a host screen smaller than the 2560x1440 guest.
         #[arg(long = "actual-size")]
         actual_size: bool,
     },
