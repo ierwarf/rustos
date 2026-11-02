@@ -541,7 +541,13 @@ fn drm_ioctl_create_dumb(
         crate::ipc::release_shared_region_descriptor(region);
         return Err(DeviceSysopError::TryAgain);
     };
-    create.handle = u32::try_from(handle).map_err(|_| DeviceSysopError::InvalidArgument)?;
+    let Ok(handle32) = u32::try_from(handle) else {
+        // Do not leak the installed handle (and its shared region) when the
+        // descriptor number cannot be reported through the u32 ABI field.
+        let _ = process_state.handles_mut().close(handle);
+        return Err(DeviceSysopError::InvalidArgument);
+    };
+    create.handle = handle32;
     create.pitch = surface.stride_bytes();
     create.size = surface.mapping_len();
     if let Err(error) = write_process_struct(process_state, arg, &create) {
@@ -569,6 +575,9 @@ fn drm_ioctl_destroy_dumb(
     arg: u64,
 ) -> Result<u64, DeviceSysopError> {
     let destroy = read_process_struct::<DrmModeDestroyDumb>(process_state, arg)?;
+    // Only dumb-buffer (display surface) handles may be destroyed here; an
+    // arbitrary descriptor number must not be closed through this ioctl.
+    process_surface(process_state, destroy.handle)?;
     let _ = process_state.handles_mut().close(u64::from(destroy.handle));
     Ok(0)
 }

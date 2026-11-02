@@ -96,8 +96,10 @@ pub(super) fn try_install_serialized() -> bool {
     }
     PUBLISHED_GENERATION.store(0, Ordering::Release);
     DROPPED_FRAMES.store(0, Ordering::Release);
-    GUI_DVM_CONTROL_IRQ_PENDING.store(false, Ordering::Release);
-    GUI_DVM_OFFLINE_IRQ_PENDING.store(false, Ordering::Release);
+    // The MSI-X vectors are already unmasked (arm_gui_dvm_interrupts runs
+    // first), so the IRQ-pending flags are deliberately NOT cleared here: an
+    // edge delivered since arming is a real peer event and clearing it would
+    // lose a DVM offline/control notification. Spurious drains are harmless.
     GUI_DVM_PEER_READY.store(false, Ordering::Release);
     GUI_DVM_EXPECTED_INVITATION.store(0, Ordering::Release);
     GUI_DVM_ACKED_CONTROL_SEQUENCE.store(0, Ordering::Release);

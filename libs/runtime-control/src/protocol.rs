@@ -76,6 +76,9 @@ pub struct RuntimeRequest {
     /// asking for longer is bounded, not rejected.
     pub wait_ms: u16,
     pub text_len: u32,
+    /// Explicit pad: `target_value` is 8-aligned, so without this field four
+    /// uninitialised padding bytes would cross the socket. Always zero.
+    pub reserved: u32,
     pub target_value: u64,
     pub text: [u8; MAX_REQUEST_PATH_BYTES],
 }
@@ -88,6 +91,7 @@ impl Default for RuntimeRequest {
             target_kind: 0,
             wait_ms: 0,
             text_len: 0,
+            reserved: 0,
             target_value: 0,
             text: [0; MAX_REQUEST_PATH_BYTES],
         }

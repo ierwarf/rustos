@@ -65,6 +65,8 @@ static FUTEX_WAITERS: TrackedSpinLock<
 const FUTEX_COW_RETRIES: u32 = 16;
 
 pub fn futex_impl(uaddr: u64, op: u64, val: u64, timeout_ptr: u64, uaddr2: u64, val3: u64) -> u64 {
+    // `op` is a C `int`; the register's upper half is not ABI.
+    let op = op as u32 as u64;
     if (uaddr & 0x3) != 0 {
         return linux_errno(LINUX_EINVAL);
     }
@@ -152,7 +154,7 @@ fn validate_futex_policy_locally(op: u64, val3: u64) -> Result<(), i64> {
             Ok(())
         }
         c if c == linux_abi::FUTEX_WAIT_BITSET || c == linux_abi::FUTEX_WAKE_BITSET => {
-            if val3 == 0 { Err(LINUX_EINVAL) } else { Ok(()) }
+            if val3 as u32 == 0 { Err(LINUX_EINVAL) } else { Ok(()) }
         }
         _ => Err(LINUX_ENOSYS),
     }
@@ -546,12 +548,21 @@ fn timespec_delta_ticks(
 }
 
 fn futex_wake(uaddr: u64, max_wake: u64, bitset: u32, op: u64) -> Result<u64, i64> {
-    let max_wake = usize::try_from(max_wake).map_err(|_| LINUX_EINVAL)?;
-    if max_wake == 0 {
-        return Ok(0);
-    }
+    // `val` is a C `int`. Linux's wake loop stops after `++woken >= nr_wake`,
+    // so a negative count wakes at most one waiter rather than failing.
+    let max_wake = match max_wake as u32 as i32 {
+        0 => return Ok(0),
+        n if n < 0 => 1,
+        n => n as usize,
+    };
     let (_, key) = current_futex_waiter_context(uaddr, op)?;
     Ok(wake_futex_waiters(key, max_wake, bitset) as u64)
+}
+
+/// Requeue counts are C `int`s; Linux rejects negative values with EINVAL.
+fn futex_int_count(raw: u64) -> Result<usize, i64> {
+    let value = raw as u32 as i32;
+    usize::try_from(value).map_err(|_| LINUX_EINVAL)
 }
 
 fn futex_requeue(
@@ -575,8 +586,8 @@ fn futex_cmp_requeue(
     if (uaddr2 & 0x3) != 0 {
         return Err(LINUX_EINVAL);
     }
-    let max_wake = usize::try_from(max_wake).map_err(|_| LINUX_EINVAL)?;
-    let max_requeue = usize::try_from(max_requeue).map_err(|_| LINUX_EINVAL)?;
+    let max_wake = futex_int_count(max_wake)?;
+    let max_requeue = futex_int_count(max_requeue)?;
     let (_, address_space_root, retained) = current_futex_binding()?;
     let mut task_ids = [0_u64; FUTEX_WAITERS_CAPACITY];
 
@@ -593,7 +604,9 @@ fn futex_cmp_requeue(
             .address_space()
             .atomic_load_user_u32(uaddr)
             .map_err(address_space_error_to_linux_errno)?;
-        if actual as u64 != expected {
+        // Linux compares the 32-bit futex word with `(u32)val3`; the upper
+        // register half of an `int` argument is not part of the ABI.
+        if actual != expected as u32 {
             return Err(LINUX_EAGAIN);
         }
         Ok::<(usize, usize), i64>(select_requeue_futex_waiters(
@@ -620,8 +633,8 @@ fn futex_requeue_inner(
     if (uaddr2 & 0x3) != 0 {
         return Err(LINUX_EINVAL);
     }
-    let max_wake = usize::try_from(max_wake).map_err(|_| LINUX_EINVAL)?;
-    let max_requeue = usize::try_from(max_requeue).map_err(|_| LINUX_EINVAL)?;
+    let max_wake = futex_int_count(max_wake)?;
+    let max_requeue = futex_int_count(max_requeue)?;
     let (_, address_space_root, retained) = current_futex_binding()?;
     let mut task_ids = [0_u64; FUTEX_WAITERS_CAPACITY];
     let (wake_count, requeued) = retained.with_process_state(|process_state| {

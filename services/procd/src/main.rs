@@ -102,12 +102,17 @@ fn serve(endpoint: u64) {
     let mut sender_pid = 0_u64;
     let mut sender_tid = 0_u64;
     let mut received = receive_request(endpoint, &mut request, &mut reply_cap, &mut sender_pid, &mut sender_tid);
+    let mut failed_receives = 0_u32;
     loop {
         if received < 0 {
-            rustos_svc_runtime::syscall::sleep_millis(1);
+            // A persistently failing receive must not become a 1 kHz spin;
+            // widen the pause to 16 ms, restarting at 1 ms after any success.
+            rustos_svc_runtime::syscall::sleep_millis(1 << failed_receives.min(4));
+            failed_receives = failed_receives.saturating_add(1);
             received = receive_request(endpoint, &mut request, &mut reply_cap, &mut sender_pid, &mut sender_tid);
             continue;
         }
+        failed_receives = 0;
 
         // Apply queued exit evidence before any PID-keyed policy lookup. The
         // drain is a bounded local broker call and never discovers syscalld or

@@ -346,10 +346,14 @@ fn bootstrap_mmap(
                 // below would either fail as an overlap or replace a leaf whose
                 // frame nothing released. Discarding the result turned that
                 // into a silent leak.
-                match address_space.unmap_user_bytes(VirtAddr::new(start), len as usize) {
-                    Ok(_) | Err(paging::AddressSpaceError::NotMapped) => {}
-                    Err(err) => return Err(address_space_error_to_linux_errno(err)),
-                }
+                // The all-or-nothing `unmap_user_bytes` answers `NotMapped` for
+                // any hole in the range, and accepting that as success unmapped
+                // nothing, so the mapping below then failed as an overlap. The
+                // present-leaf form tolerates holes and still preflights
+                // ownership before mutating.
+                address_space
+                    .unmap_present_user_pages_at(VirtAddr::new(start), (len / PAGE_SIZE) as usize)
+                    .map_err(address_space_error_to_linux_errno)?;
                 let _ = state.release_reserved_range(start, end);
             } else if state.has_reserved_overlap(start, end)
                 || !address_space
@@ -407,13 +411,14 @@ fn bootstrap_munmap(start: u64, user_len: u64) -> Result<(), i64> {
         if abi != crate::user::abi::UserAbi::Linux {
             return Err(LINUX_ENOSYS);
         }
-        match process_state
+        // munmap of a range with holes is legal and unmaps the present pages;
+        // the all-or-nothing `unmap_user_bytes` reported `NotMapped` for any
+        // hole, which was then treated as success with nothing unmapped.
+        process_state
             .address_space_mut()
-            .unmap_user_bytes(VirtAddr::new(start), len as usize)
-        {
-            Ok(_) | Err(paging::AddressSpaceError::NotMapped) => Ok(()),
-            Err(err) => Err(address_space_error_to_linux_errno(err)),
-        }
+            .unmap_present_user_pages_at(VirtAddr::new(start), (len / PAGE_SIZE) as usize)
+            .map(|_| ())
+            .map_err(address_space_error_to_linux_errno)
     }) else {
         return Err(LINUX_ENOSYS);
     };

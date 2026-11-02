@@ -249,11 +249,9 @@ pub(crate) fn transmit(frame: &[u8]) -> Result<usize, PacketError> {
     }
     let slot = tx_slot(state, state.tx_producer).ok_or(PacketError::Invalid)?;
     write_u32(slot, 0, frame.len() as u32);
-    unsafe {
-        for (index, byte) in frame.iter().enumerate() {
-            slot.add(SLOT_LEN_BYTES + index).write_volatile(*byte);
-        }
-    }
+    // SAFETY: `slot` spans DVM_NET_SLOT_BYTES inside the admitted aperture and
+    // `frame.len() <= mtu` was checked above.
+    unsafe { copy_to_shared(slot.add(SLOT_LEN_BYTES), frame) };
     fence(Ordering::Release);
     state.tx_producer = state.tx_producer.wrapping_add(1);
     write_u32(state.base, TX_PRODUCER_OFFSET, state.tx_producer);
@@ -282,17 +280,57 @@ pub(crate) fn receive(out: &mut [u8]) -> Result<usize, PacketError> {
         advance_rx_consumer(state);
         return Err(PacketError::Invalid);
     }
-    unsafe {
-        for (index, byte) in out.iter_mut().enumerate().take(len) {
-            *byte = slot.add(SLOT_LEN_BYTES + index).read_volatile();
-        }
-    }
+    // SAFETY: `len <= mtu` and `len <= out.len()` were checked above; the slot
+    // spans DVM_NET_SLOT_BYTES inside the admitted aperture.
+    unsafe { copy_from_shared(slot.add(SLOT_LEN_BYTES), &mut out[..len]) };
     if validate_dvm_ethernet_frame(&out[..len]).is_err() {
         advance_rx_consumer(state);
         return Err(PacketError::Invalid);
     }
     advance_rx_consumer(state);
     Ok(len)
+}
+
+/// Volatile copy into the shared aperture in 4-byte words (slots are 4-byte
+/// aligned: the length word at offset 0 is already accessed as `AtomicU32`)
+/// with a byte tail. Volatile keeps a hostile peer's concurrent writes from
+/// being assumed stable by the compiler; word width cuts the access count 4x.
+///
+/// # Safety
+/// `dst` must be valid for `src.len()` bytes and 4-byte aligned.
+unsafe fn copy_to_shared(dst: *mut u8, src: &[u8]) {
+    let words = src.len() / 4;
+    for word in 0..words {
+        let value = u32::from_ne_bytes([
+            src[word * 4],
+            src[word * 4 + 1],
+            src[word * 4 + 2],
+            src[word * 4 + 3],
+        ]);
+        // SAFETY: word < len / 4, so the 4 bytes lie inside `dst`'s validated span.
+        unsafe { dst.add(word * 4).cast::<u32>().write_volatile(value) };
+    }
+    for index in words * 4..src.len() {
+        // SAFETY: index < src.len(), inside `dst`'s validated span.
+        unsafe { dst.add(index).write_volatile(src[index]) };
+    }
+}
+
+/// Counterpart of [`copy_to_shared`].
+///
+/// # Safety
+/// `src` must be valid for `dst.len()` bytes and 4-byte aligned.
+unsafe fn copy_from_shared(src: *const u8, dst: &mut [u8]) {
+    let words = dst.len() / 4;
+    for word in 0..words {
+        // SAFETY: word < len / 4, so the 4 bytes lie inside `src`'s validated span.
+        let value = unsafe { src.add(word * 4).cast::<u32>().read_volatile() };
+        dst[word * 4..word * 4 + 4].copy_from_slice(&value.to_ne_bytes());
+    }
+    for index in words * 4..dst.len() {
+        // SAFETY: index < dst.len(), inside `src`'s validated span.
+        dst[index] = unsafe { src.add(index).read_volatile() };
+    }
 }
 
 fn advance_rx_consumer(state: &mut DvmNetworkState) {

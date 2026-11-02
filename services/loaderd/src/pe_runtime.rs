@@ -595,6 +595,11 @@ fn load_system_dll_registry() -> Result<Vec<SystemDllEntry>, i32> {
     Ok(entries)
 }
 
+/// Hard bound on a registry-style text file; the only caller reads the system
+/// DLL list, so anything larger is corrupt or hostile rather than useful.
+const EFBIG_ERRNO: i32 = 27;
+const READ_FILE_TO_VEC_MAX_BYTES: usize = 1 << 20;
+
 fn read_file_to_vec(path: &str) -> Result<Vec<u8>, i32> {
     let fd = open_readonly(path)?;
     let mut out: Vec<u8> = Vec::with_capacity(ELF_READ_CHUNK_BYTES);
@@ -604,9 +609,12 @@ fn read_file_to_vec(path: &str) -> Result<Vec<u8>, i32> {
         let want = ELF_READ_CHUNK_BYTES;
         out.reserve(want);
         let cur_len = out.len();
-        unsafe {
-            out.set_len(cur_len + want);
+        if cur_len >= READ_FILE_TO_VEC_MAX_BYTES {
+            error = Some(EFBIG_ERRNO);
+            break;
         }
+        // Zero-fill so the kernel only ever writes into initialized memory.
+        out.resize(cur_len + want, 0);
         let read = syscall4(
             SYS_PREAD64,
             fd as u64,
@@ -615,16 +623,12 @@ fn read_file_to_vec(path: &str) -> Result<Vec<u8>, i32> {
             offset,
         );
         if read < 0 {
-            unsafe {
-                out.set_len(cur_len);
-            }
+            out.truncate(cur_len);
             error = Some((-read) as i32);
             break;
         }
         let read = read as usize;
-        unsafe {
-            out.set_len(cur_len + read);
-        }
+        out.truncate(cur_len + read);
         if read == 0 {
             break;
         }

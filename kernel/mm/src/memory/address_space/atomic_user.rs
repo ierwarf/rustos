@@ -2,8 +2,9 @@
 //!
 //! - **Owner:** `kernel-mm` owns atomic translation and access; kernel-compat
 //!   owns Linux futex cleanup policy.
-//! - **Boundary:** Only an aligned, complete, present, user-accessible,
-//!   writable `u32` in the retained process mapping is admitted.
+//! - **Boundary:** Only an aligned, complete, present, user-accessible `u32`
+//!   in the retained process mapping is admitted; stores and compare-exchange
+//!   also require it to be writable (never a COW-shared frame), loads do not.
 //! - **Lifecycle:** Retain the mapping generation, resolve once, perform one
 //!   atomic operation, then release the process-state guard.
 //! - **Concurrency:** Callers retain the exact process state lock, preventing
@@ -44,7 +45,10 @@ impl ProcessAddressSpace {
     }
 
     pub fn atomic_load_user_u32(&self, address: u64) -> Result<u32, AddressSpaceError> {
-        let word = self.atomic_user_u32(address)?;
+        // A load only needs a readable word: FUTEX_WAIT on a read-only mapping
+        // or on a not-yet-split COW page (every writable page after fork) is
+        // legal and must not fail as if the caller intended to store.
+        let word = self.atomic_user_u32(address, UserBufferAccess::Read)?;
         // ORDERING: Acquire observes release publication by another CPU before
         // the kernel decides whether this thread still owns the futex.
         Ok(word.load(Ordering::Acquire))
@@ -56,7 +60,7 @@ impl ProcessAddressSpace {
         current: u32,
         new: u32,
     ) -> Result<Result<u32, u32>, AddressSpaceError> {
-        let word = self.atomic_user_u32(address)?;
+        let word = self.atomic_user_u32(address, UserBufferAccess::Write)?;
         // ORDERING: AcqRel publishes OWNER_DIED before a waiter is woken and
         // Acquire returns the exact competing user value on CAS failure.
         Ok(word.compare_exchange(current, new, Ordering::AcqRel, Ordering::Acquire))
@@ -67,19 +71,23 @@ impl ProcessAddressSpace {
         address: u64,
         value: u32,
     ) -> Result<(), AddressSpaceError> {
-        let word = self.atomic_user_u32(address)?;
+        let word = self.atomic_user_u32(address, UserBufferAccess::Write)?;
         // ORDERING: Release makes clear_child_tid visible before futex wake.
         word.store(value, Ordering::Release);
         Ok(())
     }
 
-    fn atomic_user_u32(&self, address: u64) -> Result<&AtomicU32, AddressSpaceError> {
+    fn atomic_user_u32(
+        &self,
+        address: u64,
+        access: UserBufferAccess,
+    ) -> Result<&AtomicU32, AddressSpaceError> {
         validate_atomic_u32_address(address)?;
         let virt = VirtAddr::new(address);
         let (phys, flags) = self
             .translate_user_with_flags(virt)
             .ok_or(AddressSpaceError::NotMapped)?;
-        validate_user_page_access(flags, UserBufferAccess::Write)?;
+        validate_user_page_access(flags, access)?;
         assert!(
             phys.as_u64()
                 .is_multiple_of(core::mem::align_of::<AtomicU32>() as u64),

@@ -17,6 +17,12 @@ use storage_fat::FatError;
 use vfsd::storage_io_error_to_linux_errno;
 
 pub(super) fn normalize_absolute_path(base_path: &str, path: &str) -> Result<String, i32> {
+    // `\` is a separator inside the FAT layer (`normalize_fat_path`) but not
+    // here, so `a\..\b` would escape this normalizer's `..` handling. FAT
+    // names cannot contain it, so refusing it loses no valid path.
+    if path.as_bytes().iter().any(|&b| b == 0 || b == b'\\') {
+        return Err(EINVAL);
+    }
     let capacity = base_path
         .len()
         .saturating_add(path.len())

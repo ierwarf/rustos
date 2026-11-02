@@ -7,7 +7,8 @@
 //! - **Lifecycle:** Allocate backing, publish one tracked live span, validate
 //!   exact layout on free, quarantine its address, then return it to the buddy.
 //! - **Concurrency:** Allocation runs with interrupts disabled under one fixed
-//!   tracker-to-buddy lock order; the normal path performs no quarantine scan.
+//!   non-nested tracker and buddy critical sections; the normal path performs no
+//!   quarantine scan.
 //! - **Failure:** Exhaustion, tracker saturation, invalid free, double free, and
 //!   layout mismatch fail without freeing an unowned span.
 //! - **Forbidden:** No unbounded scan on successful allocation, allocator
@@ -302,11 +303,16 @@ pub struct KernelAllocator;
 unsafe impl GlobalAlloc for KernelAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         interrupts::without_interrupts(|| {
-            let mut tracker = ALLOCATION_TRACKER.lock();
+            // The buddy and the tracker are never held together: a block is
+            // unreachable by any other CPU until this call returns it, so it
+            // can be recorded after the buddy lock is gone. Holding the
+            // tracker across the buddy search serialized both critical
+            // sections behind one another on every allocation.
             let ptr = unsafe { HEAP.alloc(layout) };
             if ptr.is_null() {
                 return ptr;
             }
+            let mut tracker = ALLOCATION_TRACKER.lock();
             if tracker.record_alloc(ptr as usize, layout) {
                 return ptr;
             }

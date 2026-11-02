@@ -340,6 +340,11 @@ pub fn cacheable_metadata_errno(errno: i32) -> bool {
 /// miss must remain a bounded range read through the current storage epoch.
 pub const FILE_BYTES_CACHE_MAX_ENTRY_BYTES: usize = 16 * 1024 * 1024;
 pub const FILE_BYTES_CACHE_BUDGET_BYTES: usize = 32 * 1024 * 1024;
+/// Entry bounds for the path-keyed metadata caches. Keys are client-chosen, so
+/// an unbounded map is a heap-exhaustion lever; a full cache is dropped whole
+/// (answers are re-derived from the volume).
+pub const METADATA_CACHE_MAX_ENTRIES: usize = 4096;
+pub const DIR_ENTRIES_CACHE_MAX_ENTRIES: usize = 256;
 
 /// Returns the exact file size only when the current request demonstrates a
 /// complete-file reuse pattern. Header probes, partial sequential reads, and

@@ -168,8 +168,13 @@ pub fn charge(index: usize, pages: u64) {
 /// Returns `pages` to the group and every ancestor.
 pub fn uncharge(index: usize, pages: u64) {
     walk(index, |cell| {
-        let previous = cell.usage.fetch_sub(pages, Ordering::Relaxed);
-        assert!(previous >= pages, "charge group usage underflow");
+        // Checked update: an over-return leaves the counter untouched rather
+        // than wrapped, so a caller that survives the panic (host tests, a
+        // contained fault) never sees a huge usage that blocks admission.
+        let updated = cell.usage.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |usage| {
+            usage.checked_sub(pages)
+        });
+        assert!(updated.is_ok(), "charge group usage underflow");
         true
     });
 }

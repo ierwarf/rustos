@@ -127,12 +127,22 @@ impl SessionLedger {
     /// Bound the reply-dedup history; never allocate after a kernel refund
     /// has already committed.
     fn reserve_receipt(&mut self) -> Result<(), i32> {
-        if self.retired.len() == MAX_SESSIONS {
-            self.retired.remove(0);
-        } else {
+        // Eviction is deferred to `push_receipt`: dropping the oldest receipt
+        // before the kernel refund would lose dedup history on a refused
+        // refund that leaves the entry live.
+        if self.retired.len() < MAX_SESSIONS {
             self.retired.try_reserve(1).map_err(|_| ENOMEM)?;
         }
         Ok(())
+    }
+
+    /// Infallible after `reserve_receipt`: evicts the oldest receipt only once
+    /// the refund has committed.
+    fn push_receipt(&mut self, receipt: Retired) {
+        if self.retired.len() >= MAX_SESSIONS {
+            self.retired.remove(0);
+        }
+        self.retired.push(receipt);
     }
 
     /// The JobId was captured at admission. Never rediscover the Job by a PID
@@ -161,7 +171,7 @@ impl SessionLedger {
         self.reserve_receipt()?;
         kernel_release(entry.client_job, self.owner_pid, entry.token)?;
         self.entries.swap_remove(index);
-        self.retired.push(Retired {
+        self.push_receipt(Retired {
             token,
             client_pid,
             client_job: entry.client_job,
@@ -194,7 +204,7 @@ impl SessionLedger {
         // after this point cannot permit a delayed CHARGE to revive the bill.
         kernel_release(0, self.owner_pid, token)?;
         self.last_token = self.last_token.max(token);
-        self.retired.push(Retired {
+        self.push_receipt(Retired {
             token,
             client_pid: 0,
             client_job: 0,

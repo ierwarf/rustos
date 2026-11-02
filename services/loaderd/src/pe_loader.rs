@@ -606,6 +606,17 @@ fn build_export_cache(
         return Err(ENOEXEC);
     }
     let _ = read_c_string_at_rva(image, name_rva)?;
+    // The counts are attacker-controlled u32s: prove the tables fit in the
+    // image before sizing any allocation from them.
+    let functions_end = (address_of_functions as u64) + u64::from(function_count) * 4;
+    let names_end = (address_of_names as u64) + u64::from(name_count) * 4;
+    let ordinals_end = (address_of_name_ordinals as u64) + u64::from(name_count) * 2;
+    let image_len = image.len() as u64;
+    if functions_end > image_len
+        || (name_count != 0 && (names_end > image_len || ordinals_end > image_len))
+    {
+        return Err(ENOEXEC);
+    }
     let mut functions = Vec::with_capacity(function_count as usize);
     for index in 0..function_count {
         let table = (address_of_functions as usize)

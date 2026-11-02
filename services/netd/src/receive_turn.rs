@@ -5,6 +5,13 @@
 
 use super::*;
 
+// The commercial frame is reinterpreted in place inside the NetdIpcRequest
+// receive buffer; the receive capacity must be able to hold (and align) it.
+const _: () = assert!(
+    size_of::<CommercialMaxProtocolRequest>() <= size_of::<NetdIpcRequest>()
+        && align_of::<CommercialMaxProtocolRequest>() <= align_of::<NetdIpcRequest>()
+);
+
 pub(super) struct ReceivedNetdRequest<'a> {
     pub result: i64,
     pub request: &'a mut NetdIpcRequest,

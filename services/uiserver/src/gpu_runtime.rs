@@ -62,7 +62,14 @@ const GPU_INITIALIZATION_RETAINS_BOOT_CLASS: bool = true;
 // wake-only DVM offline IRQ. Probe the descriptor at a bounded low rate so
 // process replacement is detected without adding one syscall to every frame.
 const GPU_PROVIDER_HEALTH_INTERVAL: Duration = Duration::from_millis(100);
-const GPU_COMPLETION_TIMEOUT: Duration = Duration::from_millis(50);
+// Bound on the time the DVM may go without completing ANY frame while one is
+// outstanding. The DVM serialises frames, each waiting for a page flip (up to
+// 100 ms in its own fence deadline), and up to `slot_count` frames queue
+// behind that. Measuring from each frame's submit time made a healthy,
+// vblank-paced pipeline (66.7 Hz submit vs. ~60 Hz flip) saturate its queue
+// and trip a 50 ms limit a few seconds after activation. A dead DVM is
+// reported by the kernel as ENODEV; this only catches a silent stall.
+const GPU_COMPLETION_TIMEOUT: Duration = Duration::from_millis(500);
 const GPU_COMPLETION_POLL: Duration = Duration::from_micros(100);
 const GPU_SLOW_SUBMIT_THRESHOLD: Duration = Duration::from_millis(8);
 const MAX_GPU_SLOW_SUBMIT_LOGS: usize = 24;
@@ -125,6 +132,12 @@ struct PendingGpuFrame {
     input_completion: Option<crate::input_completion::Ticket>,
 }
 
+/// The instant from which the head frame's completion deadline runs: a frame
+/// queued behind others cannot start before its predecessor completes.
+fn completion_wait_origin(submitted_at: Instant, last_completion_at: Instant) -> Instant {
+    submitted_at.max(last_completion_at)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct AtlasDamageEpoch {
     epoch: u64,
@@ -155,6 +168,8 @@ pub(crate) struct GpuCompositor {
     active: bool,
     activation_deadline: Instant,
     next_health_probe: Instant,
+    last_completion_at: Instant,
+    completion_stall_logged: bool,
     next_submission_at: Instant,
     scene_wait_logged: bool,
 }
@@ -537,6 +552,8 @@ impl GpuCompositor {
                 active: false,
                 activation_deadline: Instant::now() + GPU_FIRST_FRAME_TIMEOUT,
                 next_health_probe: Instant::now() + GPU_PROVIDER_HEALTH_INTERVAL,
+                last_completion_at: Instant::now(),
+                completion_stall_logged: false,
                 next_submission_at: Instant::now(),
                 scene_wait_logged: false,
             },
@@ -953,7 +970,7 @@ impl GpuCompositor {
         loop {
             let now = Instant::now();
             let timed_out = gpu_completion_timed_out(
-                frame.submitted_at,
+                completion_wait_origin(frame.submitted_at, self.last_completion_at),
                 self.activation_deadline,
                 self.active,
                 now,
@@ -969,6 +986,8 @@ impl GpuCompositor {
                         .present(completion.present)
                         .map_err(gpu_scene_errno)?;
                     self.pending.remove(0);
+                    self.last_completion_at = Instant::now();
+                    self.completion_stall_logged = false;
                     // Both exact render and present receipts validated above.
                     crate::input_completion::completed(frame.input_completion);
                     return Ok(true);
@@ -978,6 +997,22 @@ impl GpuCompositor {
                 }
                 Err(EAGAIN) if !timed_out => {
                     thread::sleep(GPU_COMPLETION_POLL);
+                }
+                // After activation a silent stall must NOT re-initialise: the
+                // DVM keeps `expected_submit`, the content epoch and the
+                // sequence, while GPU_GET_INFO re-primes a compiler at submit 1
+                // / content epoch 1 (and the kernel keeps the stale SUBMITTED
+                // slots), so every later batch would fail with EPROTO. Only a
+                // DVM restart (kernel epoch reset, reported as ENODEV) makes a
+                // fresh context valid. Keep the frame pending, stay alive and
+                // keep serving input/Wayland; the queue backpressures with
+                // EAGAIN meanwhile.
+                Err(EAGAIN) if self.active => {
+                    if !self.completion_stall_logged {
+                        self.completion_stall_logged = true;
+                        diag_line("uiserver: DVM GPU completion stalled; waiting for completion or provider loss");
+                    }
+                    return Ok(false);
                 }
                 Err(EAGAIN) => return Err(ETIMEDOUT),
                 Err(err) => return Err(err),

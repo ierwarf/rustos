@@ -36,13 +36,47 @@ pub struct FatMetadata {
     pub len: u64,
 }
 
+/// Bytes fetched per read-ahead window. This matches the largest inline
+/// storaged bulk reply (60 KiB), so a sequential refill is one provider call.
+const READ_WINDOW_BYTES: usize = 60 * 1024;
+
+/// One contiguous run of device blocks held after a read.
+///
+/// fatfs reads a file one cluster at a time and consults the FAT between
+/// clusters, so a single-block cache made every cluster cost two device
+/// round trips (data, then a re-read of the FAT sector). Two windows keep the
+/// FAT region and the data region resident at once, and a window that follows
+/// directly on a previous one grows to the full read-ahead size.
+struct ReadWindow {
+    start_lba: u64,
+    blocks: usize,
+    stamp: u64,
+    data: Vec<u8>,
+}
+
+impl ReadWindow {
+    fn empty() -> Self {
+        Self {
+            start_lba: 0,
+            blocks: 0,
+            stamp: 0,
+            data: Vec::new(),
+        }
+    }
+
+    fn contains(&self, lba: u64) -> bool {
+        self.blocks != 0 && lba >= self.start_lba && lba - self.start_lba < self.blocks as u64
+    }
+}
+
 pub struct FatDisk<D: BlockDevice> {
     dev: D,
     pos: u64,
     block_size: usize,
     bytes_len: u64,
     scratch: Vec<u8>,
-    scratch_lba: Option<u64>,
+    windows: [ReadWindow; 2],
+    tick: u64,
 }
 
 impl<D: BlockDevice> FatDisk<D> {
@@ -62,28 +96,70 @@ impl<D: BlockDevice> FatDisk<D> {
             block_size,
             bytes_len,
             scratch,
-            scratch_lba: None,
+            windows: [ReadWindow::empty(), ReadWindow::empty()],
+            tick: 0,
         })
     }
 
-    fn load_scratch(&mut self, lba: u64) -> IoResult<()> {
-        if self.scratch_lba != Some(lba) {
-            self.dev.read_blocks(lba, &mut self.scratch)?;
-            self.scratch_lba = Some(lba);
+    fn window_index(&self, lba: u64) -> Option<usize> {
+        self.windows.iter().position(|window| window.contains(lba))
+    }
+
+    /// Loads a window starting at `lba`, replacing the least recently used one.
+    fn fill_window(&mut self, lba: u64, need_blocks: usize) -> IoResult<()> {
+        let window_blocks = (READ_WINDOW_BYTES / self.block_size).max(1);
+        let total_blocks = self.bytes_len / self.block_size as u64;
+        let sequential = self
+            .windows
+            .iter()
+            .any(|window| window.blocks != 0 && window.start_lba + window.blocks as u64 == lba);
+        let span = if sequential {
+            window_blocks
+        } else {
+            need_blocks.min(window_blocks)
+        };
+        let span = (span.max(1) as u64).min(total_blocks.saturating_sub(lba)) as usize;
+        if span == 0 {
+            return Err(StorageError::InvalidInput);
         }
+        let victim = if self.windows[0].stamp <= self.windows[1].stamp {
+            0
+        } else {
+            1
+        };
+        let block_size = self.block_size;
+        let window = &mut self.windows[victim];
+        window.blocks = 0;
+        window.data.resize(span * block_size, 0);
+        self.dev.read_blocks(lba, &mut window.data)?;
+        self.tick += 1;
+        window.start_lba = lba;
+        window.blocks = span;
+        window.stamp = self.tick;
         Ok(())
     }
 
-    fn invalidate_scratch_range(&mut self, start_lba: u64, block_count: u64) {
-        let Some(cached_lba) = self.scratch_lba else {
-            return;
-        };
-        let Some(end_lba) = start_lba.checked_add(block_count) else {
-            self.scratch_lba = None;
-            return;
-        };
-        if cached_lba >= start_lba && cached_lba < end_lba {
-            self.scratch_lba = None;
+    /// Write-through: keeps every cached window byte-identical to the device.
+    fn update_windows(&mut self, byte_pos: u64, bytes: &[u8]) {
+        let block_size = self.block_size as u64;
+        for window in &mut self.windows {
+            if window.blocks == 0 {
+                continue;
+            }
+            let win_start = window.start_lba * block_size;
+            let win_end = win_start + window.data.len() as u64;
+            let start = byte_pos.max(win_start);
+            let end = (byte_pos + bytes.len() as u64).min(win_end);
+            if start < end {
+                window.data[(start - win_start) as usize..(end - win_start) as usize]
+                    .copy_from_slice(&bytes[(start - byte_pos) as usize..(end - byte_pos) as usize]);
+            }
+        }
+    }
+
+    fn drop_windows(&mut self) {
+        for window in &mut self.windows {
+            window.blocks = 0;
         }
     }
 
@@ -122,11 +198,24 @@ impl<D: BlockDevice> Read for FatDisk<D> {
         let max_read = min(buf.len() as u64, disk_len - self.pos) as usize;
         let mut done = 0usize;
         while done < max_read {
-            let lba = self.pos / self.block_size as u64;
-            let off = (self.pos as usize) % self.block_size;
+            let block_size = self.block_size;
+            let lba = self.pos / block_size as u64;
+            let off = (self.pos as usize) % block_size;
+            if let Some(index) = self.window_index(lba) {
+                self.tick += 1;
+                let window = &mut self.windows[index];
+                window.stamp = self.tick;
+                let start = (lba - window.start_lba) as usize * block_size + off;
+                let n = min(window.data.len() - start, max_read - done);
+                buf[done..done + n].copy_from_slice(&window.data[start..start + n]);
+                self.pos += n as u64;
+                done += n;
+                continue;
+            }
+            let remaining = max_read - done;
             if off == 0 {
-                let direct_len = ((max_read - done) / self.block_size) * self.block_size;
-                if direct_len != 0 {
+                let direct_len = (remaining / block_size) * block_size;
+                if direct_len >= READ_WINDOW_BYTES {
                     self.dev
                         .read_blocks(lba, &mut buf[done..done + direct_len])?;
                     self.pos += direct_len as u64;
@@ -134,11 +223,7 @@ impl<D: BlockDevice> Read for FatDisk<D> {
                     continue;
                 }
             }
-            self.load_scratch(lba)?;
-            let n = min(self.block_size - off, max_read - done);
-            buf[done..done + n].copy_from_slice(&self.scratch[off..off + n]);
-            self.pos += n as u64;
-            done += n;
+            self.fill_window(lba, (off + remaining).div_ceil(block_size))?;
         }
 
         Ok(done)
@@ -159,29 +244,25 @@ impl<D: BlockDevice> Write for FatDisk<D> {
         let max_write = min(buf.len() as u64, disk_len - self.pos) as usize;
         let mut done = 0usize;
         while done < max_write {
-            let lba = self.pos / self.block_size as u64;
-            let off = (self.pos as usize) % self.block_size;
-            if off == 0 {
-                let direct_len = ((max_write - done) / self.block_size) * self.block_size;
-                if direct_len != 0 {
-                    self.invalidate_scratch_range(lba, (direct_len / self.block_size) as u64);
-                    self.dev.write_blocks(lba, &buf[done..done + direct_len])?;
-                    self.pos += direct_len as u64;
-                    done += direct_len;
-                    continue;
-                }
-            }
-            let n = min(self.block_size - off, max_write - done);
-            if off == 0 && n == self.block_size {
-                self.invalidate_scratch_range(lba, 1);
-                self.dev.write_blocks(lba, &buf[done..done + n])?;
+            let block_size = self.block_size;
+            let lba = self.pos / block_size as u64;
+            let off = (self.pos as usize) % block_size;
+            let n = if off == 0 && max_write - done >= block_size {
+                ((max_write - done) / block_size) * block_size
             } else {
-                self.load_scratch(lba)?;
-                self.scratch[off..off + n].copy_from_slice(&buf[done..done + n]);
-                self.scratch_lba = None;
-                self.dev.write_blocks(lba, &self.scratch)?;
-                self.scratch_lba = Some(lba);
+                min(block_size - off, max_write - done)
+            };
+            let result = if off == 0 && n % block_size == 0 {
+                self.dev.write_blocks(lba, &buf[done..done + n])
+            } else {
+                self.write_partial_block(lba, off, &buf[done..done + n])
+            };
+            if let Err(error) = result {
+                // The device state of this range is now unknown.
+                self.drop_windows();
+                return Err(error);
             }
+            self.update_windows(self.pos, &buf[done..done + n]);
             self.pos += n as u64;
             done += n;
         }
@@ -190,6 +271,24 @@ impl<D: BlockDevice> Write for FatDisk<D> {
 
     fn flush(&mut self) -> IoResult<()> {
         self.dev.flush()
+    }
+}
+
+impl<D: BlockDevice> FatDisk<D> {
+    /// Read-modify-write of one block, sourcing the old bytes from a cached
+    /// window when one holds the block.
+    fn write_partial_block(&mut self, lba: u64, off: usize, bytes: &[u8]) -> IoResult<()> {
+        let block_size = self.block_size;
+        if let Some(index) = self.window_index(lba) {
+            let window = &self.windows[index];
+            let start = (lba - window.start_lba) as usize * block_size;
+            self.scratch
+                .copy_from_slice(&window.data[start..start + block_size]);
+        } else {
+            self.dev.read_blocks(lba, &mut self.scratch)?;
+        }
+        self.scratch[off..off + bytes.len()].copy_from_slice(bytes);
+        self.dev.write_blocks(lba, &self.scratch)
     }
 }
 
@@ -224,6 +323,8 @@ type InnerDir<'a, D> =
 
 pub struct FatVolume<D: BlockDevice> {
     fs: FatFs<D>,
+    /// Size of the underlying device in bytes; no valid file can be larger.
+    device_bytes: u64,
 }
 
 pub struct FatFile<'a, D: BlockDevice>(InnerFile<'a, D>);
@@ -235,8 +336,9 @@ impl<D: BlockDevice> FatVolume<D> {
     }
 
     pub fn from_disk(disk: FatDisk<D>) -> Result<Self, FatError> {
+        let device_bytes = disk.bytes_len();
         let fs = fatfs::FileSystem::new(disk, fatfs::FsOptions::new())?;
-        Ok(Self { fs })
+        Ok(Self { fs, device_bytes })
     }
 
     pub fn from_partition(
@@ -309,7 +411,9 @@ impl<D: BlockDevice> FatVolume<D> {
         let dir = self.open_dir_by_path(parent)?;
         for entry_result in dir.iter() {
             let entry = entry_result?;
-            if entry.file_name() != child {
+            // Lookup is case-insensitive everywhere else (open/create), so
+            // stat must agree or a file could open but not stat.
+            if !entry.file_name().eq_ignore_ascii_case(child) {
                 continue;
             }
             return Ok(FatMetadata {
@@ -386,6 +490,11 @@ impl<D: BlockDevice> FatVolume<D> {
 
     pub fn read_file_to_vec(&self, path: &str) -> Result<Vec<u8>, FatError> {
         let (mut file, len) = self.open_file_with_len(path)?;
+        // The directory-entry size is untrusted (up to 4 GiB); a file cannot
+        // exceed the device, so refuse before allocating.
+        if len > self.device_bytes {
+            return Err(fatfs::Error::InvalidInput);
+        }
         let expected_len = usize::try_from(len).map_err(|_| fatfs::Error::InvalidInput)?;
         let mut bytes = vec![0_u8; expected_len];
         let mut done = 0usize;
@@ -643,7 +752,32 @@ mod tests {
         let mut replacement = [0_u8; 4];
         disk.read(&mut replacement).expect("read replacement");
         assert_eq!(replacement, [0xa5; 4]);
-        assert_eq!(disk.dev.reads, 2);
+        // Writes go through the cached window, so no device re-read is needed.
+        assert_eq!(disk.dev.reads, 1);
+    }
+
+    #[test]
+    fn sequential_small_reads_and_interleaved_fat_reads_batch_into_windows() {
+        let mut inner = MemBlockDevice::new_zeroed(512, 2048);
+        let pattern = (0..512 * 2048).map(|i| (i % 253) as u8).collect::<Vec<_>>();
+        inner.write_blocks(0, &pattern).expect("seed");
+        let mut disk =
+            FatDisk::new(CountingBlockDevice { inner, reads: 0 }).expect("valid counting disk");
+        let mut chunk = [0_u8; 4096];
+        // Data stream at 64 KiB.., with a "FAT" probe at sector 1 between each
+        // cluster-sized read, as fatfs does.
+        for index in 0..32u64 {
+            let at = 65536 + index * 4096;
+            disk.seek(SeekFrom::Start(at)).expect("seek data");
+            disk.read(&mut chunk).expect("read data");
+            assert_eq!(&chunk[..], &pattern[at as usize..at as usize + 4096]);
+            let mut fat = [0_u8; 4];
+            disk.seek(SeekFrom::Start(512 + 4 * index)).expect("seek fat");
+            disk.read(&mut fat).expect("read fat");
+            assert_eq!(&fat[..], &pattern[(512 + 4 * index) as usize..][..4]);
+        }
+        // 128 KiB of data plus the FAT probes: a handful of window fills.
+        assert!(disk.dev.reads <= 6, "reads = {}", disk.dev.reads);
     }
 
     #[test]

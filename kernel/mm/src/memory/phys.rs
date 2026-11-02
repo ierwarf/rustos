@@ -209,16 +209,37 @@ impl PhysAllocatorState {
         (self.bitmap()[word_index] & (1_u64 << bit_index)) != 0
     }
 
-    fn mark_range_used(&mut self, frame_start: usize, page_count: usize) {
-        for frame_index in frame_start..frame_start.saturating_add(page_count) {
-            self.set_used(frame_index);
+    /// Applies `set` to every bit of `[frame_start, frame_start + page_count)`
+    /// one word at a time; a multi-megabyte run is a handful of word writes
+    /// under the allocator lock instead of one read-modify-write per frame.
+    fn update_range_words(&mut self, frame_start: usize, page_count: usize, set: bool) {
+        let end = frame_start.saturating_add(page_count);
+        let bitmap = self.bitmap_mut();
+        let mut frame = frame_start;
+        while frame < end {
+            let word_index = frame / BITS_PER_WORD;
+            let bit_index = frame % BITS_PER_WORD;
+            let bits = (BITS_PER_WORD - bit_index).min(end - frame);
+            let mask = if bits == BITS_PER_WORD {
+                u64::MAX
+            } else {
+                ((1_u64 << bits) - 1) << bit_index
+            };
+            if set {
+                bitmap[word_index] |= mask;
+            } else {
+                bitmap[word_index] &= !mask;
+            }
+            frame += bits;
         }
     }
 
+    fn mark_range_used(&mut self, frame_start: usize, page_count: usize) {
+        self.update_range_words(frame_start, page_count, true);
+    }
+
     fn mark_range_free(&mut self, frame_start: usize, page_count: usize) {
-        for frame_index in frame_start..frame_start.saturating_add(page_count) {
-            self.set_free(frame_index);
-        }
+        self.update_range_words(frame_start, page_count, false);
     }
 
     fn reserve_phys_range(&mut self, phys_start: u64, byte_len: u64) -> usize {
@@ -1081,6 +1102,21 @@ mod tests {
         };
         state.mark_range_free(0, page_count);
         state
+    }
+
+    #[test]
+    fn word_granular_range_marking_matches_per_bit_marking() {
+        let mut words = [0_u64; 4];
+        let mut state = test_state(&mut words, 256, 0);
+        for (start, count) in [(0, 1), (3, 61), (60, 8), (64, 64), (100, 100), (255, 1), (10, 0)] {
+            state.mark_range_free(0, 256);
+            state.mark_range_used(start, count);
+            for frame in 0..256 {
+                assert_eq!(state.is_used(frame), (start..start + count).contains(&frame));
+            }
+            state.mark_range_free(start, count);
+            assert!((0..256).all(|frame| !state.is_used(frame)));
+        }
     }
 
     #[test]

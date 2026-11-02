@@ -194,6 +194,24 @@ impl MemfdHandle {
             for frame_phys in released {
                 phys::free_frame(PhysAddr::new(frame_phys));
             }
+            // The last kept page still holds the old bytes past the new end.
+            // A later grow (or a write after a seek beyond EOF) must observe
+            // zeros there, as ftruncate(2) specifies, not the stale contents.
+            let tail = len % PAGE_SIZE;
+            if tail != 0
+                && let Some(&last_frame) = state.frames.last()
+            {
+                // SAFETY: the frame is owned by this object and retained under
+                // the object-state lock; the direct map covers the whole page
+                // and `tail..PAGE_SIZE` stays inside it.
+                unsafe {
+                    ptr::write_bytes(
+                        (kernel_vm::higher_half_addr(last_frame) as *mut u8).add(tail),
+                        0,
+                        PAGE_SIZE - tail,
+                    );
+                }
+            }
             state.len = len;
             return Ok(());
         }
@@ -344,8 +362,10 @@ fn next_mapping_counts(
 }
 
 fn ensure_len_locked(state: &mut MemfdState, len: usize) -> Result<(), MemfdError> {
+    // Only grows. A write that ends inside the file must not shorten it:
+    // shrinking is `truncate`'s job, which also releases frames and zeroes the
+    // retained tail.
     if len <= state.len {
-        state.len = len;
         return Ok(());
     }
 

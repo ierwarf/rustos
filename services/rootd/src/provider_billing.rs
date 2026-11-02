@@ -94,14 +94,16 @@ impl ProviderBilling {
                 && x.token.epoch==ticket.token.epoch
                 && x.token.nonce>=ticket.token.nonce
         }) {return Err(ESTALE)}
+        let mut evict=None;
         if self.funded.len()>=MAX_PROVIDER_TICKETS{
             // Receipt ACKs are best-effort compaction, so a provider that
             // lost them must not wedge. Only a Settled tombstone is
             // reclaimable: the owner watermark keeps its nonce spent, and
             // a replayed release/cancel/ack for it stays idempotent.
-            let Some(settled)=self.funded.iter()
-                .position(|x|x.state==State::Settled) else {return Err(ENOSPC)};
-            self.funded.swap_remove(settled);
+            // The tombstone is dropped only after every fallible check below
+            // has passed, so a refused charge never loses a receipt.
+            evict=Some(self.funded.iter()
+                .position(|x|x.state==State::Settled).ok_or(ENOSPC)?);
         }
         // All fallible memory and token-overflow checks precede the kernel
         // charge; watermark advancement is conservatively irreversible.
@@ -113,6 +115,7 @@ impl ProviderBilling {
         // The token and ambiguous intent MUST be stored before an RPC can
         // commit the kernel charge. Error leaves ChargeUnknown in custody.
         self.next_kernel_token=kernel_token;
+        if let Some(settled)=evict{self.funded.swap_remove(settled);}
         self.funded.push(Funded{
             provider:ticket.provider,client:ticket.client,
             kind:ticket.kind,session:ticket.session,token:ticket.token,

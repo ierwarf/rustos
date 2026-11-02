@@ -292,18 +292,18 @@ pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
         ),
         linux_abi::SYS_FTRUNCATE => syscall_linux_vfs_ftruncate(frame.rdi, frame.rsi),
         linux_abi::SYS_FSTAT => syscall_linux_vfs_fstat(frame.rdi, frame.rsi),
-        linux_abi::SYS_POLL => syscall_linux_poll(frame.rdi, frame.rsi, frame.rdx as i64),
+        linux_abi::SYS_POLL => syscall_linux_poll(frame.rdi, frame.rsi, frame.rdx as i32 as i64),
         linux_abi::SYS_PPOLL => {
             syscall_linux_ppoll(frame.rdi, frame.rsi, frame.rdx, frame.r10, frame.r8)
         }
         linux_abi::SYS_EPOLL_WAIT => {
-            syscall_linux_epoll_wait(frame.rdi, frame.rsi, frame.rdx, frame.r10 as i64)
+            syscall_linux_epoll_wait(frame.rdi, frame.rsi, frame.rdx, frame.r10 as i32 as i64)
         }
         linux_abi::SYS_EPOLL_PWAIT => syscall_linux_epoll_pwait(
             frame.rdi,
             frame.rsi,
             frame.rdx,
-            frame.r10 as i64,
+            frame.r10 as i32 as i64,
             frame.r8,
             frame.r9,
         ),

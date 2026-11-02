@@ -122,6 +122,10 @@ const SOCKET_CONTROL_BUFFER_CAPACITY: usize = 16 * 1024;
 const INET_TCP_BUFFER_CAPACITY: usize = 16 * 1024;
 const INET_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const INET_IO_POLL_BUDGET: usize = 256;
+/// Bound on how long a closed-by-owner connection may linger to finish its FIN
+/// exchange, and on how many may do so at once (each pins 32 KiB of buffers).
+const INET_CLOSE_LINGER: Duration = Duration::from_secs(5);
+const INET_CLOSING_CAPACITY: usize = 64;
 const BLOCKING_RETRY_BACKOFF: Duration = Duration::from_millis(1);
 // A mapped aperture can appear before the L0-authenticated control relay has
 // delivered SESSION_START. Delay only that explicitly transitional state so a
@@ -237,7 +241,7 @@ fn start_inet_readiness_worker() {
 fn inet_readiness_worker_loop() {
     loop {
         let changed_tokens = {
-            let mut state = net_state().lock().unwrap();
+            let mut state = lock_net_state();
             let before = state.inet_readiness_snapshot();
             let readiness_changed = state
                 .inet
@@ -260,7 +264,7 @@ fn inet_readiness_worker_loop() {
             }
         };
         advance_readiness_generation(&changed_tokens);
-        let has_sockets = !net_state().lock().unwrap().inet_sockets.is_empty();
+        let has_sockets = !lock_net_state().inet_sockets.is_empty();
         thread::sleep(if has_sockets {
             INET_READINESS_POLL_INTERVAL
         } else {
@@ -484,7 +488,7 @@ fn local_socket_reply_requests_latency_handoff(
 }
 
 fn consume_local_recv_drain_handoff(socket_token: u64) -> bool {
-    let mut state = net_state().lock().unwrap();
+    let mut state = lock_net_state();
     let Some(socket) = state.sockets.get_mut(&socket_token) else {
         return false;
     };
@@ -1153,7 +1157,7 @@ fn request_mutates_readiness(op: u16) -> bool {
 }
 
 fn readiness_targets_for_request(request: &NetdIpcRequest) -> Vec<u64> {
-    let state = net_state().lock().unwrap();
+    let state = lock_net_state();
     readiness_targets_in_state(request, &state)
 }
 
@@ -1341,6 +1345,10 @@ struct InetSocket {
     refs: usize,
     options: SocketOptions,
     tcp: SocketHandle,
+    /// Armed while an active open is in flight. smoltcp reports both an RST
+    /// and its own connect timeout as a closed socket; the deadline tells
+    /// them apart (`ETIMEDOUT` vs `ECONNREFUSED`) and `SO_ERROR` consumes it.
+    connect_deadline: Option<StdInstant>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1453,6 +1461,20 @@ fn mint_socket_token() -> Result<u64, i32> {
     Err(libc::EAGAIN)
 }
 
+/// Locks the global network state. The release profile aborts on panic, so a
+/// poisoned lock can only be observed after unwinding (tests); a half-updated
+/// socket table must not be served, so fail the process (the supervisor
+/// restarts it) instead of letting every later handler unwrap-panic.
+fn lock_net_state() -> MutexGuard<'static, NetState> {
+    match net_state().lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            eprintln!("netd: state lock poisoned; exiting");
+            std::process::exit(101)
+        }
+    }
+}
+
 fn net_state() -> &'static Mutex<NetState> {
     static STATE: OnceLock<Mutex<NetState>> = OnceLock::new();
     STATE.get_or_init(|| Mutex::new(NetState::new()))
@@ -1463,6 +1485,10 @@ struct InetStack {
     sockets: SocketSet<'static>,
     device: BrokerDevice,
     next_port: u16,
+    /// Sockets whose owner closed them while the connection was still live.
+    /// They stay in the set until the FIN handshake finishes (or the deadline
+    /// passes) so the peer observes an orderly close instead of silence.
+    closing: Vec<(SocketHandle, StdInstant)>,
 }
 
 impl InetStack {
@@ -1470,7 +1496,9 @@ impl InetStack {
         if packet_provider_state()? != PacketProviderState::Active {
             return Err(libc::ENODEV);
         }
-        let mut device = BrokerDevice;
+        let mut device = BrokerDevice {
+            rx: [0; NET_BROKER_PACKET_MTU],
+        };
         let mut config = SmolConfig::new(HardwareAddress::Ethernet(QEMU_USERNET_MAC));
         config.random_seed = 0x5255_0001;
         let mut iface = Interface::new(config, &mut device, smol_now());
@@ -1486,6 +1514,7 @@ impl InetStack {
             sockets: SocketSet::new(Vec::new()),
             device,
             next_port: 49152,
+            closing: Vec::new(),
         })
     }
 
@@ -1496,7 +1525,34 @@ impl InetStack {
     }
 
     fn remove(&mut self, handle: SocketHandle) {
-        self.sockets.remove(handle);
+        let socket = self.sockets.get_mut::<tcp::Socket>(handle);
+        // `close` queues a FIN for a synchronized connection and drops a
+        // half-open or listening one straight to Closed.
+        socket.close();
+        if socket.is_open() && self.closing.len() < INET_CLOSING_CAPACITY {
+            self.closing
+                .push((handle, StdInstant::now() + INET_CLOSE_LINGER));
+        } else {
+            socket.abort();
+            self.sockets.remove(handle);
+        }
+    }
+
+    fn reap_closing(&mut self) {
+        if self.closing.is_empty() {
+            return;
+        }
+        let now = StdInstant::now();
+        let sockets = &mut self.sockets;
+        self.closing.retain(|(handle, deadline)| {
+            let socket = sockets.get_mut::<tcp::Socket>(*handle);
+            if socket.is_open() && now < *deadline {
+                return true;
+            }
+            socket.abort();
+            sockets.remove(*handle);
+            false
+        });
     }
 
     fn poll_one(&mut self) -> (bool, bool) {
@@ -1523,17 +1579,27 @@ impl InetStack {
                 break;
             }
         }
+        self.reap_closing();
         readiness_changed
     }
 
     fn next_ephemeral_port(&mut self) -> u16 {
-        let port = self.next_port;
-        self.next_port = if self.next_port == 65535 {
-            49152
-        } else {
-            self.next_port + 1
-        };
-        port
+        // Skip ports still held by a live socket (including lingering closes):
+        // smoltcp does not reject two sockets with the same local endpoint.
+        let mut candidate = self.next_port;
+        for _ in 0..=(65535 - 49152) {
+            candidate = self.next_port;
+            self.next_port = if candidate == 65535 { 49152 } else { candidate + 1 };
+            let in_use = self.sockets.iter().any(|(_, socket)| {
+                matches!(socket, smoltcp::socket::Socket::Tcp(tcp)
+                    if tcp.is_open()
+                        && tcp.local_endpoint().is_some_and(|ep| ep.port == candidate))
+            });
+            if !in_use {
+                break;
+            }
+        }
+        candidate
     }
 }
 
@@ -1542,31 +1608,33 @@ fn poll_turn_changes_readiness(ingress: PollIngressSingleResult, egress: PollRes
         || matches!(egress, PollResult::SocketStateChanged)
 }
 
-struct BrokerDevice;
+/// Owns one receive scratch frame so an empty poll costs no allocation.
+struct BrokerDevice {
+    rx: [u8; NET_BROKER_PACKET_MTU],
+}
 
-struct BrokerRxToken {
-    frame: Vec<u8>,
+struct BrokerRxToken<'a> {
+    frame: &'a [u8],
 }
 
 struct BrokerTxToken;
 
 impl Device for BrokerDevice {
-    type RxToken<'a> = BrokerRxToken;
+    type RxToken<'a> = BrokerRxToken<'a>;
     type TxToken<'a> = BrokerTxToken;
 
     fn receive(
         &mut self,
         _timestamp: SmolInstant,
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        let mut frame = vec![0_u8; NET_BROKER_PACKET_MTU];
-        match packet_rx(frame.as_mut_slice()) {
-            Ok(0) => None,
-            Ok(len) => {
-                frame.truncate(len);
-                Some((BrokerRxToken { frame }, BrokerTxToken))
-            }
-            Err(errno) if errno == libc::EAGAIN => None,
-            Err(_) => None,
+        match packet_rx(self.rx.as_mut_slice()) {
+            Ok(len) if len > 0 && len <= self.rx.len() => Some((
+                BrokerRxToken {
+                    frame: &self.rx[..len],
+                },
+                BrokerTxToken,
+            )),
+            _ => None,
         }
     }
 
@@ -1582,12 +1650,12 @@ impl Device for BrokerDevice {
     }
 }
 
-impl RxToken for BrokerRxToken {
+impl RxToken for BrokerRxToken<'_> {
     fn consume<R, F>(self, f: F) -> R
     where
         F: FnOnce(&[u8]) -> R,
     {
-        f(self.frame.as_slice())
+        f(self.frame)
     }
 }
 
@@ -1596,9 +1664,10 @@ impl TxToken for BrokerTxToken {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        let mut frame = vec![0_u8; len.min(NET_BROKER_PACKET_MTU)];
-        let result = f(frame.as_mut_slice());
-        let _ = packet_tx(frame.as_slice());
+        let mut frame = [0_u8; NET_BROKER_PACKET_MTU];
+        let len = len.min(NET_BROKER_PACKET_MTU);
+        let result = f(&mut frame[..len]);
+        let _ = packet_tx(&frame[..len]);
         result
     }
 }
@@ -1636,7 +1705,7 @@ fn handle_socket(request: &NetdIpcRequest, response: &mut NetdIpcResponse, reply
             let _=provider_accounting::retire_final(token);
             return errno;
         }
-        let mut state = net_state().lock().unwrap();
+        let mut state = lock_net_state();
         let token_available = state.token_available(token);
         let tcp = match start_inet_socket_provider_at(
             request,
@@ -1657,6 +1726,7 @@ fn handle_socket(request: &NetdIpcRequest, response: &mut NetdIpcResponse, reply
                 refs: 1,
                 options: SocketOptions::default(),
                 tcp,
+                connect_deadline: None,
             },
         );
         drop(state);
@@ -1674,7 +1744,7 @@ fn handle_socket(request: &NetdIpcRequest, response: &mut NetdIpcResponse, reply
         let _=provider_accounting::retire_final(token);
         return errno;
     }
-    let mut state = net_state().lock().unwrap();
+    let mut state = lock_net_state();
     if !state.token_available(token) {
         drop(state);
         let _=provider_accounting::retire_final(token);
@@ -1722,7 +1792,7 @@ fn handle_socketpair(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -
         let _=provider_accounting::retire_final(left);
         return errno;
     }
-    let mut state = net_state().lock().unwrap();
+    let mut state = lock_net_state();
     if left == right || !state.token_available(left) || !state.token_available(right) {
         drop(state);
         let _=provider_accounting::retire_final(left);
@@ -1786,7 +1856,7 @@ fn handle_socketpair(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -
 }
 
 fn handle_dup(request: &NetdIpcRequest) -> i32 {
-    let mut state = net_state().lock().unwrap();
+    let mut state = lock_net_state();
     if let Some(socket) = state.inet_sockets.get_mut(&request.socket_token) {
         socket.refs = socket.refs.saturating_add(1).max(1);
         return 0;
@@ -1799,7 +1869,7 @@ fn handle_dup(request: &NetdIpcRequest) -> i32 {
 }
 
 fn handle_close(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {
-    let mut state = net_state().lock().unwrap();
+    let mut state = lock_net_state();
     if let Some(socket) = state.inet_sockets.get_mut(&request.socket_token) {
         if socket.refs > 1 {
             socket.refs -= 1;
@@ -1925,7 +1995,7 @@ fn handle_bind(request: &NetdIpcRequest) -> i32 {
     if is_wayland_path(path.as_str()) {
         debug_line("netd: wayland bind");
     }
-    let mut state = net_state().lock().unwrap();
+    let mut state = lock_net_state();
     if state.bindings.contains_key(&path) {
         return libc::EADDRINUSE;
     }
@@ -1942,7 +2012,7 @@ fn handle_bind(request: &NetdIpcRequest) -> i32 {
 }
 
 fn handle_listen(request: &NetdIpcRequest) -> i32 {
-    let mut state = net_state().lock().unwrap();
+    let mut state = lock_net_state();
     let Some(socket) = state.sockets.get_mut(&request.socket_token) else {
         return libc::EBADF;
     };
@@ -1976,7 +2046,7 @@ fn handle_connect(request: &NetdIpcRequest) -> i32 {
         Ok(token) => token,
         Err(errno) => return errno,
     };
-    let mut state = net_state().lock().unwrap();
+    let mut state = lock_net_state();
     let Some(listener_token) = state.bindings.get(&path).copied() else {
         return libc::ENOENT;
     };
@@ -2113,7 +2183,7 @@ fn begin_inet_connect(request: &NetdIpcRequest) -> i32 {
         Ok(endpoint) => endpoint,
         Err(errno) => return errno,
     };
-    let mut state = net_state().lock().unwrap();
+    let mut state = lock_net_state();
     let Some(inet) = state.inet_sockets.get(&request.socket_token) else {
         return libc::EBADF;
     };
@@ -2122,7 +2192,6 @@ fn begin_inet_connect(request: &NetdIpcRequest) -> i32 {
         Ok(stack) => stack,
         Err(errno) => return errno,
     };
-    let local_port = stack.next_ephemeral_port();
     {
         let socket = stack.sockets.get_mut::<tcp::Socket>(tcp_handle);
         if socket.may_send() {
@@ -2131,6 +2200,10 @@ fn begin_inet_connect(request: &NetdIpcRequest) -> i32 {
         if socket.is_open() {
             return libc::EINPROGRESS;
         }
+    }
+    let local_port = stack.next_ephemeral_port();
+    {
+        let socket = stack.sockets.get_mut::<tcp::Socket>(tcp_handle);
         socket.set_timeout(Some(smoltcp::time::Duration::from_millis(
             connect_timeout_ms.min(u128::from(u64::MAX)) as u64,
         )));
@@ -2146,47 +2219,69 @@ fn begin_inet_connect(request: &NetdIpcRequest) -> i32 {
         }
     }
     stack.poll_budget(8);
-    let socket = stack.sockets.get_mut::<tcp::Socket>(tcp_handle);
-    if socket.may_send() {
+    if let Some(inet) = state.inet_sockets.get_mut(&request.socket_token) {
+        inet.connect_deadline = Some(StdInstant::now() + connect_timeout);
+    }
+    inet_connect_status(&mut state, request.socket_token)
+}
+
+/// Evaluates an in-flight active open. A terminal outcome disarms the
+/// deadline so it is reported exactly once (to `connect` or to `SO_ERROR`).
+fn inet_connect_status(state: &mut NetState, token: u64) -> i32 {
+    // smoltcp stamps its own timeout later than our deadline; allow slack so
+    // its closure is not misread as a refusal.
+    const TIMEOUT_SLACK: Duration = Duration::from_millis(100);
+    let Some(inet) = state.inet_sockets.get(&token) else {
+        return libc::EBADF;
+    };
+    let (tcp_handle, deadline) = (inet.tcp, inet.connect_deadline);
+    let stack = match state.inet_stack() {
+        Ok(stack) => stack,
+        Err(errno) => return errno,
+    };
+    let socket = stack.sockets.get::<tcp::Socket>(tcp_handle);
+    let status = if socket.may_send() {
         debug_line("netd: inet connect ok");
         0
     } else if !socket.is_open() {
-        libc::ECONNREFUSED
+        if deadline.is_some_and(|d| StdInstant::now() + TIMEOUT_SLACK >= d) {
+            libc::ETIMEDOUT
+        } else {
+            libc::ECONNREFUSED
+        }
     } else {
         libc::EINPROGRESS
+    };
+    if status != libc::EINPROGRESS {
+        if let Some(inet) = state.inet_sockets.get_mut(&token) {
+            inet.connect_deadline = None;
+        }
     }
+    status
 }
 
 fn poll_inet_connect(request: &NetdIpcRequest) -> i32 {
     if let Err(errno) = request_deadline_remaining_ns(request) {
         return errno;
     }
-    let mut state = net_state().lock().unwrap();
-    let Some(inet) = state.inet_sockets.get(&request.socket_token) else {
+    let mut state = lock_net_state();
+    if !state.inet_sockets.contains_key(&request.socket_token) {
         return libc::EBADF;
-    };
-    let tcp_handle = inet.tcp;
-    let stack = match state.inet_stack() {
-        Ok(stack) => stack,
-        Err(errno) => return errno,
-    };
-    stack.poll_budget(8);
-    let socket = stack.sockets.get_mut::<tcp::Socket>(tcp_handle);
-    if socket.may_send() {
-        debug_line("netd: inet connect ok");
-        0
-    } else if !socket.is_open() {
-        libc::ECONNREFUSED
-    } else {
-        libc::EINPROGRESS
     }
+    match state.inet_stack() {
+        Ok(stack) => {
+            stack.poll_budget(8);
+        }
+        Err(errno) => return errno,
+    }
+    inet_connect_status(&mut state, request.socket_token)
 }
 
 fn handle_accept(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {
     let nonblocking = request.status_flags & linux_abi::O_NONBLOCK != 0
         || request.arg3 & linux_abi::SOCK_NONBLOCK != 0;
     let accepted = {
-        let mut state = net_state().lock().unwrap();
+        let mut state = lock_net_state();
         let Some(listener) = state.sockets.get_mut(&request.socket_token) else {
             return libc::EBADF;
         };
@@ -2207,7 +2302,7 @@ fn handle_accept(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i3
     };
     let result = (|| {
         let channel_id = {
-            let state = net_state().lock().unwrap();
+            let state = lock_net_state();
             let Some(socket) = state.sockets.get(&accepted) else {
                 return libc::ECONNABORTED;
             };
@@ -2220,7 +2315,7 @@ fn handle_accept(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i3
             return libc::EPROTO;
         }
         if request.arg1 != 0 && request.arg2 != 0 {
-            let state = net_state().lock().unwrap();
+            let state = lock_net_state();
             if let Some(socket) = state.sockets.get(&accepted) {
                 if let Err(errno) =
                     sockaddr_payload(socket.peer_path.as_deref().unwrap_or(""), response)
@@ -2237,7 +2332,7 @@ fn handle_accept(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i3
         call_net_broker(request, response, 0, accepted, channel_id, false)
     })();
     let (retired, peers, tokens) = {
-        let mut state = net_state().lock().unwrap();
+        let mut state = lock_net_state();
         settle_unix_accept(&mut state, request.socket_token, accepted, result == 0)
     };
     if !retired.is_empty() {
@@ -2294,7 +2389,21 @@ fn is_wayland_path(path: &str) -> bool {
 
 fn handle_send(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {
     if inet_socket_exists(request.socket_token) {
-        return handle_inet_send(request, response);
+        if request.op == SYSCALL_OFFLOAD_OP_LINUX_SENDMSG {
+            // The sendmsg envelope is a 16-byte header plus data and control
+            // sections; only the data section is TCP stream payload. TCP has
+            // no ancillary data, so a control section is refused.
+            let (data, control) = match split_sendmsg_payload(request) {
+                Ok(sections) => sections,
+                Err(errno) => return errno,
+            };
+            if !control.is_empty() {
+                return libc::EOPNOTSUPP;
+            }
+            return handle_inet_send(request, &request.payload[data], response);
+        }
+        let len = request.payload_len as usize;
+        return handle_inet_send(request, &request.payload[..len], response);
     }
     if request.op == SYSCALL_OFFLOAD_OP_LINUX_SENDMSG {
         return handle_sendmsg(request, response);
@@ -2310,34 +2419,36 @@ fn handle_send(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 
     }
 }
 
-fn handle_sendmsg(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {
+/// Split a SENDMSG envelope into its data and control byte ranges inside
+/// `request.payload`, rejecting any section that leaves the received payload.
+fn split_sendmsg_payload(
+    request: &NetdIpcRequest,
+) -> Result<(std::ops::Range<usize>, std::ops::Range<usize>), i32> {
     let payload_len = request.payload_len as usize;
-    if payload_len < NETD_SENDMSG_PAYLOAD_HEADER_SIZE {
-        return libc::EINVAL;
+    if payload_len < NETD_SENDMSG_PAYLOAD_HEADER_SIZE || payload_len > request.payload.len() {
+        return Err(libc::EINVAL);
     }
     let data_len = u32::from_ne_bytes(request.payload[0..4].try_into().unwrap_or([0; 4])) as usize;
     let control_len =
         u32::from_ne_bytes(request.payload[4..8].try_into().unwrap_or([0; 4])) as usize;
     let data_start = NETD_SENDMSG_PAYLOAD_HEADER_SIZE;
-    let control_start = match data_start.checked_add(data_len) {
-        Some(value) => value,
-        None => return libc::EINVAL,
-    };
-    let end = match control_start.checked_add(control_len) {
-        Some(value) => value,
-        None => return libc::EINVAL,
-    };
+    let control_start = data_start.checked_add(data_len).ok_or(libc::EINVAL)?;
+    let end = control_start.checked_add(control_len).ok_or(libc::EINVAL)?;
     if end > payload_len {
-        return libc::EINVAL;
+        return Err(libc::EINVAL);
     }
-    if let Err(errno) = validate_sendmsg_control(&request.payload[control_start..end]) {
+    Ok((data_start..control_start, control_start..end))
+}
+
+fn handle_sendmsg(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {
+    let (data, control) = match split_sendmsg_payload(request) {
+        Ok(sections) => sections,
+        Err(errno) => return errno,
+    };
+    if let Err(errno) = validate_sendmsg_control(&request.payload[control.clone()]) {
         return errno;
     }
-    match send_socket_message(
-        request,
-        &request.payload[data_start..control_start],
-        &request.payload[control_start..end],
-    ) {
+    match send_socket_message(request, &request.payload[data], &request.payload[control]) {
         Ok(sent) => {
             response.value = sent as u64;
             0
@@ -2375,7 +2486,7 @@ fn handle_recv(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 
 }
 
 fn handle_recvmsg(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {
-    let mut state = net_state().lock().unwrap();
+    let mut state = lock_net_state();
     recvmsg_in_state(&mut state, request, response)
 }
 
@@ -2426,13 +2537,16 @@ fn recvmsg_in_state(
     }
 }
 
-fn handle_inet_send(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {
-    let bytes = &request.payload[..request.payload_len as usize];
+fn handle_inet_send(
+    request: &NetdIpcRequest,
+    bytes: &[u8],
+    response: &mut NetdIpcResponse,
+) -> i32 {
     if bytes.is_empty() {
         response.value = 0;
         return 0;
     }
-    let mut state = net_state().lock().unwrap();
+    let mut state = lock_net_state();
     let Some(inet) = state.inet_sockets.get(&request.socket_token) else {
         return libc::EBADF;
     };
@@ -2461,14 +2575,22 @@ fn handle_inet_send(request: &NetdIpcRequest, response: &mut NetdIpcResponse) ->
 }
 
 fn handle_inet_recv(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {
-    let requested = usize::try_from(request.arg2).unwrap_or(usize::MAX);
-    let limit = requested.min(response.payload.len());
+    // RECVMSG carries its length in `payload_len` (arg2 holds the msg flags)
+    // and expects the reply to start with the recvmsg envelope header.
+    let recvmsg = request.op == SYSCALL_OFFLOAD_OP_LINUX_RECVMSG;
+    let (requested, data_start) = if recvmsg {
+        (request.payload_len as usize, NETD_RECVMSG_PAYLOAD_HEADER_SIZE)
+    } else {
+        (usize::try_from(request.arg2).unwrap_or(usize::MAX), 0)
+    };
+    let limit = requested.min(response.payload.len() - data_start);
     if limit == 0 {
         response.value = 0;
-        response.payload_len = 0;
+        response.payload_len = data_start as u32;
+        response.payload[..data_start].fill(0);
         return 0;
     }
-    let mut state = net_state().lock().unwrap();
+    let mut state = lock_net_state();
     let Some(inet) = state.inet_sockets.get(&request.socket_token) else {
         return libc::EBADF;
     };
@@ -2480,10 +2602,14 @@ fn handle_inet_recv(request: &NetdIpcRequest, response: &mut NetdIpcResponse) ->
     stack.poll_budget(8);
     let socket = stack.sockets.get_mut::<tcp::Socket>(tcp_handle);
     if socket.can_recv() {
-        match socket.recv_slice(&mut response.payload[..limit]) {
+        match socket.recv_slice(&mut response.payload[data_start..data_start + limit]) {
             Ok(read) => {
                 response.value = read as u64;
-                response.payload_len = read as u32;
+                response.payload_len = (data_start + read) as u32;
+                response.payload[..data_start].fill(0);
+                if recvmsg {
+                    response.payload[0..4].copy_from_slice(&(read as u32).to_ne_bytes());
+                }
                 stack.poll_budget(8);
                 return 0;
             }
@@ -2492,7 +2618,8 @@ fn handle_inet_recv(request: &NetdIpcRequest, response: &mut NetdIpcResponse) ->
     }
     if !socket.may_recv() {
         response.value = 0;
-        response.payload_len = 0;
+        response.payload_len = data_start as u32;
+        response.payload[..data_start].fill(0);
         0
     } else {
         libc::EAGAIN
@@ -2501,7 +2628,7 @@ fn handle_inet_recv(request: &NetdIpcRequest, response: &mut NetdIpcResponse) ->
 
 fn handle_inet_poll(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {
     let requested = request.arg1 as u32;
-    let mut state = net_state().lock().unwrap();
+    let mut state = lock_net_state();
     let Some(inet) = state.inet_sockets.get(&request.socket_token) else {
         return libc::EBADF;
     };
@@ -2530,7 +2657,7 @@ fn handle_poll_socket(request: &NetdIpcRequest, response: &mut NetdIpcResponse) 
     let status = if inet_socket_exists(request.socket_token) {
         handle_inet_poll(request, response)
     } else {
-        let state = net_state().lock().unwrap();
+        let state = lock_net_state();
         match unix_socket_revents(&state, request.socket_token, request.arg1 as u32) {
             Ok(revents) => {
                 response.value = revents as u64;
@@ -2622,7 +2749,7 @@ fn wait_for_socket_readiness(request: &NetdIpcRequest, response: &mut NetdIpcRes
 }
 
 fn handle_getsockname(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {
-    let state = net_state().lock().unwrap();
+    let state = lock_net_state();
     let Some(socket) = state.sockets.get(&request.socket_token) else {
         return libc::EBADF;
     };
@@ -2631,7 +2758,7 @@ fn handle_getsockname(request: &NetdIpcRequest, response: &mut NetdIpcResponse) 
 }
 
 fn handle_getpeername(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {
-    let state = net_state().lock().unwrap();
+    let state = lock_net_state();
     let Some(socket) = state.sockets.get(&request.socket_token) else {
         return libc::EBADF;
     };
@@ -2645,10 +2772,24 @@ fn handle_getsockopt(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -
     if request.arg1 != linux_abi::SOL_SOCKET {
         return libc::EOPNOTSUPP;
     }
-    let state = net_state().lock().unwrap();
-    if let Some(socket) = state.inet_sockets.get(&request.socket_token) {
+    let mut state = lock_net_state();
+    if state.inet_sockets.contains_key(&request.socket_token) {
+        let pending = if request.arg2 == linux_abi::SO_ERROR
+            && state.inet_sockets[&request.socket_token]
+                .connect_deadline
+                .is_some()
+        {
+            // Nonblocking connect outcome; reading SO_ERROR consumes it.
+            match inet_connect_status(&mut state, request.socket_token) {
+                libc::EINPROGRESS => 0,
+                errno => errno,
+            }
+        } else {
+            0
+        };
+        let socket = &state.inet_sockets[&request.socket_token];
         let value = match request.arg2 {
-            linux_abi::SO_ERROR => 0_i32,
+            linux_abi::SO_ERROR => pending,
             linux_abi::SO_TYPE => linux_abi::SOCK_STREAM as i32,
             linux_abi::SO_DOMAIN => linux_abi::AF_INET as i32,
             linux_abi::SO_PROTOCOL => 0_i32,
@@ -2699,7 +2840,7 @@ fn handle_setsockopt(request: &NetdIpcRequest) -> i32 {
     let Some(value) = request_i32_payload(request) else {
         return libc::EINVAL;
     };
-    let mut state = net_state().lock().unwrap();
+    let mut state = lock_net_state();
     if let Some(socket) = state.inet_sockets.get_mut(&request.socket_token) {
         match request.arg2 {
             linux_abi::SO_KEEPALIVE => socket.options.keepalive = value != 0,
@@ -2726,16 +2867,23 @@ fn handle_setsockopt(request: &NetdIpcRequest) -> i32 {
 }
 
 fn handle_shutdown(request: &NetdIpcRequest) -> i32 {
-    let mut state = net_state().lock().unwrap();
+    let mut state = lock_net_state();
     if let Some(inet) = state.inet_sockets.get(&request.socket_token) {
         let tcp_handle = inet.tcp;
+        let how = request.arg1;
+        if !matches!(how, linux_abi::SHUT_RD | linux_abi::SHUT_WR | linux_abi::SHUT_RDWR) {
+            return libc::EINVAL;
+        }
         let stack = match state.inet_stack() {
             Ok(stack) => stack,
             Err(errno) => return errno,
         };
-        let socket = stack.sockets.get_mut::<tcp::Socket>(tcp_handle);
-        socket.close();
-        stack.poll_budget(8);
+        // smoltcp has no receive half-close; only the write side (FIN) maps.
+        // SHUT_RD alone must not send a FIN.
+        if how != linux_abi::SHUT_RD {
+            stack.sockets.get_mut::<tcp::Socket>(tcp_handle).close();
+            stack.poll_budget(8);
+        }
         return 0;
     }
     let peer = {
@@ -2785,7 +2933,7 @@ fn send_socket_message(
     if bytes.is_empty() {
         return Ok(0);
     }
-    let mut state = net_state().lock().unwrap();
+    let mut state = lock_net_state();
     send_socket_message_in_state(&mut state, request, bytes, control)
 }
 
@@ -2867,10 +3015,16 @@ fn send_socket_message_in_state(
             .incoming_control_bytes
             .saturating_add(control_charge);
     }
-    peer_connected.incoming.push_back(UnixStreamSegment {
-        bytes: bytes[..write_len].iter().copied().collect(),
-        control: control.to_vec(),
-    });
+    // A plain send carries no message boundary a reader could observe, so it
+    // extends the tail segment. Without this, one-byte sends would cost a
+    // heap segment each (up to SOCKET_BUFFER_CAPACITY of them per socket).
+    match peer_connected.incoming.back_mut() {
+        Some(tail) if control.is_empty() => tail.bytes.extend(&bytes[..write_len]),
+        _ => peer_connected.incoming.push_back(UnixStreamSegment {
+            bytes: bytes[..write_len].iter().copied().collect(),
+            control: control.to_vec(),
+        }),
+    }
     Ok(write_len)
 }
 
@@ -2892,7 +3046,7 @@ fn recv_socket_bytes(
             discarded: Vec::new(),
         });
     }
-    let mut state = net_state().lock().unwrap();
+    let mut state = lock_net_state();
     let socket = state
         .sockets
         .get_mut(&request.socket_token)
@@ -3239,9 +3393,7 @@ fn request_credentials(request: &NetdIpcRequest) -> Credentials {
 }
 
 fn inet_socket_exists(token: u64) -> bool {
-    net_state()
-        .lock()
-        .unwrap()
+    lock_net_state()
         .inet_sockets
         .contains_key(&token)
 }
@@ -3608,5 +3760,21 @@ mod idle_cadence_tests {
                 .any(|line| line.trim()
                     == "Some(local_poll_budget_ms_for_deadline(earliest, now_ns))")
         );
+    }
+
+    #[test]
+    fn sendmsg_sections_are_bounded_by_the_received_payload() {
+        use crate::{NETD_SENDMSG_PAYLOAD_HEADER_SIZE, NetdIpcRequest, split_sendmsg_payload};
+        let mut request = NetdIpcRequest::default();
+        request.payload[0..4].copy_from_slice(&3_u32.to_ne_bytes());
+        request.payload[4..8].copy_from_slice(&2_u32.to_ne_bytes());
+        request.payload_len = (NETD_SENDMSG_PAYLOAD_HEADER_SIZE + 5) as u32;
+        let (data, control) = split_sendmsg_payload(&request).unwrap();
+        assert_eq!(data, NETD_SENDMSG_PAYLOAD_HEADER_SIZE..NETD_SENDMSG_PAYLOAD_HEADER_SIZE + 3);
+        assert_eq!(control.len(), 2);
+        request.payload_len -= 1;
+        assert_eq!(split_sendmsg_payload(&request), Err(libc::EINVAL));
+        request.payload[0..4].copy_from_slice(&u32::MAX.to_ne_bytes());
+        assert_eq!(split_sendmsg_payload(&request), Err(libc::EINVAL));
     }
 }

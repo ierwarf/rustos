@@ -636,24 +636,61 @@ pub(crate) fn arm_consumer_wake() -> bool {
     };
     let mapped = mapping.mapped();
     let generation = mapping.generation();
-    let current = CONSUMER_WAKE_GENERATION.load(Ordering::Acquire);
-    let Some(next) = current.checked_add(1) else {
-        revoke("consumer-wake-generation-wrapped");
-        return false;
-    };
     if !mapping.validate_current() || mapping.epoch() != generation {
         return false;
     }
+    // Claim a unique, strictly increasing generation with a CAS so concurrent
+    // armers can never hand out the same value or publish out of order.
+    // ORDERING: AcqRel on the claim orders it against every other armer's claim.
+    let mut current = CONSUMER_WAKE_GENERATION.load(Ordering::Acquire);
+    let next = loop {
+        let Some(next) = current.checked_add(1) else {
+            revoke("consumer-wake-generation-wrapped");
+            return false;
+        };
+        match CONSUMER_WAKE_GENERATION.compare_exchange_weak(
+            current,
+            next,
+            // ORDERING: AcqRel claims against every other armer; a failed
+            // attempt only needs Acquire to see the winner's value.
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => break next,
+            Err(observed) => current = observed,
+        }
+    };
     // ORDERING: Release publishes the registered waiter before L0's Acquire
-    // wake-generation read decides whether to send its MSI-X edge.
-    store_shared_u64(
+    // wake-generation read decides whether to send its MSI-X edge. The shared
+    // word is only ever raised (max), so a slower armer holding a smaller
+    // claimed value cannot move L0's view of the generation backwards.
+    raise_shared_u64(
         mapped,
         DVM_INPUT_RING_CONSUMER_WAKE_GENERATION_OFFSET,
         next,
-        shared_control_publish_order(),
+        shared_control_update_order(),
     );
-    CONSUMER_WAKE_GENERATION.store(next, Ordering::Release);
     true
+}
+
+/// Monotonic raise of a shared little-endian control word (CAS max).
+fn raise_shared_u64(base: *mut u8, offset: usize, value: u64, ordering: Ordering) {
+    debug_assert!(shared_control_words_are_aligned(base));
+    // SAFETY: same mapping and alignment contract as `store_shared_u64`.
+    let word = unsafe { AtomicU64::from_ptr(base.add(offset).cast::<u64>()) };
+    // ORDERING: Acquire pairs with the publishing CAS below and with L0's stores.
+    let mut observed = word.load(Ordering::Acquire);
+    while u64::from_le(observed) < value {
+        match word.compare_exchange_weak(
+            observed,
+            value.to_le(),
+            ordering,
+            shared_control_update_failure_order(),
+        ) {
+            Ok(_) => return,
+            Err(actual) => observed = actual,
+        }
+    }
 }
 
 /// Read-only poll recheck for the arm/recheck/commit protocol. An MSI-X edge

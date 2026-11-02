@@ -342,8 +342,18 @@ pub(crate) fn start_input_reader(input_fds: Vec<OwnedFd>) -> Result<InputReader,
             let read_count = match result {
                 Ok(count) => count,
                 Err(errno) => {
-                    reader_stats.errors.fetch_add(1, Ordering::Relaxed);
-                    diag_line(format!("uiserver: input reader failed errno={errno}"));
+                    let failures = reader_stats
+                        .errors
+                        .fetch_add(1, Ordering::Relaxed)
+                        .saturating_add(1);
+                    // Readiness is level-triggered: a persistent read error
+                    // would otherwise spin this thread and flood the log.
+                    if failures <= MAX_INITIAL_INPUT_DROP_LOGS || failures.is_power_of_two() {
+                        diag_line(format!(
+                            "uiserver: input reader failed errno={errno} failures={failures}"
+                        ));
+                    }
+                    thread::sleep(Duration::from_millis(2));
                     continue;
                 }
             };

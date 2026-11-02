@@ -2897,6 +2897,13 @@ impl InputRingSink {
         // RustOS acquires this producer cursor and reads the fixed slot.
         store_shared_u64(self.mapped, DVM_INPUT_RING_PRODUCER_OFFSET, next);
         self.producer_cursor = next;
+        // The cursor store above and the wake-generation load below form the
+        // producer half of a store-buffering (Dekker) handshake with inputd's
+        // arm-store / cursor-reload. Release/Acquire do not forbid the
+        // store->load reorder on x86, so without a full fence both sides can
+        // miss each other and strand a nonempty ring with no doorbell.
+        // ORDERING: SeqCst fence between the cursor store and generation load.
+        std::sync::atomic::fence(Ordering::SeqCst);
         // Sample the consumer-owned generation only after the release-ordered
         // producer cursor is visible. If inputd armed before this commit, L0
         // observes the new generation and rings. If it armed after an earlier
@@ -3351,44 +3358,69 @@ impl HostControlListener {
     }
 
     fn accept_authenticated(&self, timeout: Option<Duration>) -> Result<std::fs::File> {
-        let timeout_ms = timeout
-            .map(|duration| duration.as_millis().min(i32::MAX as u128) as libc::c_int)
-            .unwrap_or(-1);
-        let mut pollfd = libc::pollfd {
-            fd: self.fd.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
+        let deadline = timeout.map(|duration| std::time::Instant::now() + duration);
+        let mut connection = loop {
+            let remaining = deadline.map(|deadline| {
+                deadline.saturating_duration_since(std::time::Instant::now())
+            });
+            let timeout_ms = remaining
+                .map(|duration| {
+                    // Round up so a sub-millisecond remainder still waits.
+                    duration.as_micros().div_ceil(1000).min(i32::MAX as u128) as libc::c_int
+                })
+                .unwrap_or(-1);
+            let mut pollfd = libc::pollfd {
+                fd: self.fd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let ready = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
+            if ready == 0 {
+                bail!("timed out waiting for Linux DVM vsock control connection");
+            }
+            if ready < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error).context("poll host AF_VSOCK listener");
+            }
+            let mut peer = SockaddrVm::new(0, 0);
+            let mut peer_len = size_of::<SockaddrVm>() as libc::socklen_t;
+            let accepted = unsafe {
+                libc::accept4(
+                    self.fd.as_raw_fd(),
+                    (&raw mut peer).cast::<libc::sockaddr>(),
+                    &raw mut peer_len,
+                    libc::SOCK_CLOEXEC,
+                )
+            };
+            if accepted < 0 {
+                let error = std::io::Error::last_os_error();
+                match error.kind() {
+                    // A peer that reset before accept, or a signal, must not
+                    // abort the wait for the expected DVM.
+                    std::io::ErrorKind::Interrupted
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::WouldBlock => continue,
+                    _ => return Err(error).context("accept Linux DVM vsock connection"),
+                }
+            }
+            let connection = unsafe { std::fs::File::from_raw_fd(accepted) };
+            if peer.family != AF_VSOCK as libc::sa_family_t || peer.cid != self.expected_dvm_cid {
+                // Any local guest can connect to the listening port; a wrong
+                // peer is dropped without ending the wait for the real DVM.
+                eprintln!(
+                    "rejected DVM vsock peer cid={} expected={}",
+                    peer.cid, self.expected_dvm_cid
+                );
+                drop(connection);
+                continue;
+            }
+            break connection;
         };
-        let ready = unsafe { libc::poll(&mut pollfd, 1, timeout_ms) };
-        if ready == 0 {
-            bail!("timed out waiting for Linux DVM vsock control connection");
-        }
-        if ready < 0 {
-            return Err(std::io::Error::last_os_error()).context("poll host AF_VSOCK listener");
-        }
-        let mut peer = SockaddrVm::new(0, 0);
-        let mut peer_len = size_of::<SockaddrVm>() as libc::socklen_t;
-        let connection = unsafe {
-            libc::accept4(
-                self.fd.as_raw_fd(),
-                (&raw mut peer).cast::<libc::sockaddr>(),
-                &raw mut peer_len,
-                libc::SOCK_CLOEXEC,
-            )
-        };
-        if connection < 0 {
-            return Err(std::io::Error::last_os_error())
-                .context("accept Linux DVM vsock connection");
-        }
-        let mut connection = unsafe { std::fs::File::from_raw_fd(connection) };
         configure_socket_timeout(&connection, timeout)?;
-        if peer.family != AF_VSOCK as libc::sa_family_t || peer.cid != self.expected_dvm_cid {
-            bail!(
-                "rejected DVM vsock peer cid={} expected={}",
-                peer.cid,
-                self.expected_dvm_cid
-            );
-        }
         let hello = read_message(&mut connection)?;
         validate_hello(&hello, &self.contract)?;
         authenticate_control_peer(&mut connection, &hello, &self.control_secret)?;

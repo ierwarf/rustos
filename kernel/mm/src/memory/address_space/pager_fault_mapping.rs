@@ -931,6 +931,16 @@ impl ProcessAddressSpace {
         self.unmap_preflighted_user_leaves(leaves, &[])
     }
 
+    /// Unmap every present leaf in the range with no external segments;
+    /// holes are tolerated. See [`Self::unmap_present_user_pages_with_external_at`].
+    pub fn unmap_present_user_pages_at(
+        &mut self,
+        start: VirtAddr,
+        page_count: usize,
+    ) -> Result<usize, AddressSpaceError> {
+        self.unmap_present_user_pages_with_external_at(start, page_count, &[])
+    }
+
     /// Revokes present 4 KiB user leaves, treating absent pages as holes.
     ///
     /// `external_segments` are aligned, nonempty half-open user VA intervals;
@@ -984,17 +994,30 @@ impl ProcessAddressSpace {
             .try_reserve_exact(leaves.len())
             .map_err(|_| AddressSpaceError::OutOfFrames)?;
         let mutation = begin_address_space_mutation(self.root_phys());
+        // Leaves are removed in order and a failure stops the loop, so the
+        // removed leaves are always a prefix. Whatever was removed is rolled
+        // forward through the reclaim barrier and descriptor release below
+        // before the error is returned; no removed PTE keeps its descriptor.
+        let mut removed = 0usize;
+        let mut failure = None;
         for leaf in leaves.iter().copied() {
             let virt = VirtAddr::new(leaf.virtual_address);
-            let unmapped = self
-                .unmap_user_page(virt)
-                .ok_or(AddressSpaceError::NotMapped)?;
-            if unmapped.as_u64() != leaf.physical_address {
-                return Err(AddressSpaceError::InvalidFrameOwnership);
+            match self.unmap_user_page(virt) {
+                None => {
+                    failure = Some(AddressSpaceError::NotMapped);
+                    break;
+                }
+                Some(unmapped) => {
+                    removed += 1;
+                    if unmapped.as_u64() != leaf.physical_address {
+                        failure = Some(AddressSpaceError::InvalidFrameOwnership);
+                        break;
+                    }
+                }
             }
         }
         let _flushed_mutation = mutation.flush_for_reclaim();
-        for leaf in leaves.iter().copied() {
+        for leaf in leaves[..removed].iter().copied() {
             if in_external_user_segment(leaf.virtual_address, external_segments) {
                 continue;
             }
@@ -1011,7 +1034,10 @@ impl ProcessAddressSpace {
             }
         }
         free_removed_frames_exact(&frames);
-        Ok(unmapped_count)
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(unmapped_count),
+        }
     }
 
     fn pager_fault_leaf_at(&self, virtual_address: u64) -> Option<PagerFaultLeaf> {

@@ -1184,11 +1184,17 @@ fn ingest_batch_needs_immediate_retry(drained: usize) -> bool {
 }
 
 fn wait_for_dvm_ingress() -> Result<(), i32> {
-    let result = syscall0(SYS_RUSTOS_INPUT_WAIT_BROKER);
-    if result < 0 {
-        Err(last_errno())
-    } else {
-        Ok(())
+    loop {
+        let result = syscall0(SYS_RUSTOS_INPUT_WAIT_BROKER);
+        if result >= 0 {
+            return Ok(());
+        }
+        // A signal-style interruption is not loss of the ingress authority;
+        // exiting here would drop the keyboard for the whole system.
+        match last_errno() {
+            libc::EINTR => continue,
+            errno => return Err(errno),
+        }
     }
 }
 

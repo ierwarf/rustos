@@ -6,19 +6,17 @@ impl VfsState {
             response.status = EINVAL;
             return;
         };
-        let resolved_path;
-        let path = if path.starts_with('/') {
-            path
-        } else {
-            resolved_path = match self.resolve_path(request, request.pid, request.dirfd, path) {
-                Ok(path) => path,
-                Err(errno) => {
-                    response.status = errno;
-                    return;
-                }
-            };
-            resolved_path.as_str()
+        // Absolute paths are canonicalized too: the open-description path is
+        // the key for device routing, caches and checkpoint replay, so a raw
+        // `/dev/../x` or `//x` must never become a handle path.
+        let resolved_path = match self.resolve_path(request, request.pid, request.dirfd, path) {
+            Ok(path) => path,
+            Err(errno) => {
+                response.status = errno;
+                return;
+            }
         };
+        let path = resolved_path.as_str();
         match self.open_remote_checkpointed(request, path, request.arg0) {
             Ok((id, handle)) => {
                 response.remote_id = id;

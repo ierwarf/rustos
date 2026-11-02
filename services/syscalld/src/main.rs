@@ -58,7 +58,9 @@ rustos_svc_runtime::entry!(service_main);
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(_info: &PanicInfo<'_>) -> ! {
-    loop {}
+    // Exit instead of spinning: the heartbeat thread would keep a wedged
+    // service looking healthy and the supervisor could never restart it.
+    rustos_svc_runtime::syscall::exit_group(101)
 }
 
 #[no_mangle]
@@ -237,7 +239,8 @@ fn drain_lifecycle_events() {
         ipc::debug_line("syscalld: lifecycle evidence reset after drain failure");
         return;
     }
-    for event in &events[..count as usize] {
+    // The count is kernel-written; never let it index past the local buffer.
+    for event in &events[..(count as usize).min(LIFECYCLE_DRAIN_MAX_EVENTS)] {
         if event.event == LIFECYCLE_EVENT_EXIT {
             linux_policy::handle_process_exit_pid(event.pid);
         } else if event.event == rustos_user_abi::syscall::LIFECYCLE_EVENT_EXEC {

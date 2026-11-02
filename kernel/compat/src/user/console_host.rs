@@ -308,6 +308,20 @@ fn reserve_console_host_trace() -> bool {
     debug::enabled!(console, debug)
 }
 
+/// Returns a `'static` copy of an executable path, leaking each distinct path
+/// at most once. Spawns of the same service (restarts, repeated bootstrap
+/// requests) and repeated load failures must not grow the kernel heap.
+fn intern_executable_path(path: &str) -> &'static str {
+    static INTERNED: spin::Mutex<Vec<&'static str>> = spin::Mutex::new(Vec::new());
+    let mut interned = INTERNED.lock();
+    if let Some(existing) = interned.iter().copied().find(|known| *known == path) {
+        return existing;
+    }
+    let leaked: &'static str = Box::leak(path.to_string().into_boxed_str());
+    interned.push(leaked);
+    leaked
+}
+
 fn load_executable_image_path_uncached(
     primary_path: &str,
 ) -> Result<LoadedExecutableImage, ConsoleHostError> {
@@ -322,7 +336,7 @@ fn load_executable_image_path_uncached(
                 0,
             );
             Ok(LoadedExecutableImage {
-                path: Box::leak(primary_path.to_string().into_boxed_str()),
+                path: intern_executable_path(primary_path),
                 bytes,
             })
         }
@@ -335,7 +349,7 @@ fn load_executable_image_path_uncached(
                 primary_error,
             );
             Err(ConsoleHostError::Load {
-                path: Box::leak(primary_path.to_string().into_boxed_str()),
+                path: intern_executable_path(primary_path),
                 error: primary_error,
             })
         }

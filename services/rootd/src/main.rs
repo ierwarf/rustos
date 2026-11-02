@@ -135,6 +135,7 @@ const BOOTSTRAP_SPAWN_MAX_ATTEMPTS: u32 = 64;
 const INITD_SPAWN_MAX_ATTEMPTS: u32 = 64;
 const CORE_READINESS_POLL_INTERVAL_MS: u32 = 250;
 const CORE_READINESS_POLL_MAX: u32 = 20;
+const MEMORY_CENSUS_INTERVAL_NS: u64 = 20_000_000;
 struct RootdIpcCell<T>(UnsafeCell<T>);
 
 unsafe impl<T> Sync for RootdIpcCell<T> {}
@@ -193,6 +194,10 @@ struct Lease {
     application_realm_configured: bool,
     restart_budget: u32,
     backoff_ms: u32,
+    /// Monotonic deadline before which a `RESTART_PENDING` lease must not be
+    /// respawned. Deadline-driven so one crashing service never parks the
+    /// whole supervisor (and its IPC service) for its backoff.
+    restart_not_before_ns: u64,
     state: u16,
     exit_status: i32,
     weight_micros: u64,
@@ -393,6 +398,7 @@ pub extern "C" fn __rustos_rootd_start() -> ! {
     yield_now();
     let mut memory_governor = memory_governor::MemoryGovernor::new();
     let mut application_limit_probe = application_limit_probe::Probe::default();
+    let mut next_memory_census_ns = 0_u64;
     loop {
         drain_lifecycle_events(&mut leases, &mut post_init_leases, &mut service_checkpoints);
         // Keep post-init control draining bounded by `control_drain` too.
@@ -418,7 +424,19 @@ pub extern "C" fn __rustos_rootd_start() -> ! {
         let _ = loader_realm::configure_ready(
             endpoint, &mut leases, &mut post_init_leases, &mut service_checkpoints,
         );
-        supervise_memory_pressure(&mut memory_governor, &mut application_limit_probe, &leases, &post_init_leases);
+        // The census is a kernel walk of every process; a busy control queue
+        // would otherwise pay it once per request. Pressure verdicts are
+        // cooldown-gated in milliseconds, so a 20 ms cadence loses nothing.
+        let census_now_ns = rustos_svc_runtime::syscall::monotonic_nanos();
+        if census_now_ns >= next_memory_census_ns {
+            next_memory_census_ns = census_now_ns.saturating_add(MEMORY_CENSUS_INTERVAL_NS);
+            supervise_memory_pressure(
+                &mut memory_governor,
+                &mut application_limit_probe,
+                &leases,
+                &post_init_leases,
+            );
+        }
         // The drain above is deliberately nonblocking. Once all ready
         // messages are consumed, this one wait is the idle boundary: a new
         // control message wakes rootd immediately, while the bounded budget
@@ -441,6 +459,7 @@ fn lease(spec: BootstrapServiceSpec) -> Lease {
         pid: 0,
         restart_budget: 3,
         backoff_ms: 250,
+        restart_not_before_ns: 0,
         state: rustos_user_abi::syscall::ROOTD_LEASE_STATE_EMPTY,
         exit_status: 0,
         weight_micros: spec.weight_micros,
@@ -2607,7 +2626,10 @@ fn restart_failed_leases(
     post_init_leases: &mut [PostInitLease],
     service_checkpoints: &mut ServiceCheckpointStore,
 ) {
-    let mut restart_backoff_ms = 0_u32;
+    // Backoff is a per-lease deadline, never a blocking wait: the caller's
+    // idle receive (ROOTD_SUPERVISOR_IDLE_POLL_MS) is the only sleep, so rootd
+    // keeps serving IPC while a crash-looping service waits out its delay.
+    let mut now_ns = None;
     for index in 0..leases.len() {
         let lease = &mut leases[index];
         if !matches!(
@@ -2626,9 +2648,16 @@ fn restart_failed_leases(
         // despite the lease advertising a real backoff policy.
         if lease.state == ROOTD_LEASE_STATE_EXITED {
             lease.state = ROOTD_LEASE_STATE_RESTART_PENDING;
-            restart_backoff_ms = restart_backoff_ms.max(lease.backoff_ms);
+            lease.restart_not_before_ns = restart_deadline_ns(&mut now_ns, lease.backoff_ms);
             continue;
         }
+        if lease.restart_not_before_ns != 0
+            && *now_ns.get_or_insert_with(rustos_svc_runtime::syscall::monotonic_nanos)
+                < lease.restart_not_before_ns
+        {
+            continue;
+        }
+        lease.restart_not_before_ns = 0;
         let result = restart_lease(
             index,
             endpoint,
@@ -2636,6 +2665,8 @@ fn restart_failed_leases(
             post_init_leases,
             service_checkpoints,
         );
+        // The spawn may have taken a while; later deadlines start from now.
+        now_ns = None;
         let lease = &mut leases[index];
         match result {
             Ok((pid, deferred_start)) => {
@@ -2650,7 +2681,8 @@ fn restart_failed_leases(
                         .unwrap_or_else(|_| {
                             fail_closed(b"rootd: fatal failed-activation child cleanup rejected\n")
                         });
-                    restart_backoff_ms = restart_backoff_ms.max(lease.backoff_ms);
+                    lease.restart_not_before_ns =
+                        restart_deadline_ns(&mut now_ns, lease.backoff_ms);
                 }
             }
             Err(_) => {
@@ -2661,14 +2693,17 @@ fn restart_failed_leases(
                     debug_line(b"rootd: restart budget exhausted\n");
                 } else {
                     lease.state = ROOTD_LEASE_STATE_RESTART_PENDING;
-                    restart_backoff_ms = restart_backoff_ms.max(lease.backoff_ms);
+                    lease.restart_not_before_ns =
+                        restart_deadline_ns(&mut now_ns, lease.backoff_ms);
                 }
             }
         }
     }
-    if restart_backoff_ms != 0 {
-        wait_for_restart_backoff(restart_backoff_ms);
-    }
+}
+
+fn restart_deadline_ns(now_ns: &mut Option<u64>, backoff_ms: u32) -> u64 {
+    let now = *now_ns.get_or_insert_with(rustos_svc_runtime::syscall::monotonic_nanos);
+    now.saturating_add(u64::from(backoff_ms) * 1_000_000).max(1)
 }
 
 fn cleanup_failed_restart_activation(
@@ -2704,8 +2739,7 @@ fn cleanup_failed_initial_activation(
 }
 
 /// Observe endpoint publication inside one existing readiness-budget window.
-/// Only bootstrap readiness may end this wait early; restart backoff remains
-/// indivisible. The outer supervisor still charges at most one poll per window.
+/// Only bootstrap readiness may end this wait early. The outer supervisor still charges at most one poll per window.
 fn wait_for_core_readiness_with(mut ready: impl FnMut() -> bool, mut wait: impl FnMut(u32)) {
     let mut remaining = CORE_READINESS_POLL_INTERVAL_MS;
     while remaining != 0 && !ready() {

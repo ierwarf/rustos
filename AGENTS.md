@@ -28,6 +28,36 @@ ring0 as a shortcut.
   genuinely needs the user.
 - Preserve unrelated user changes.
 
+## Autonomy and trust
+
+The user does not review implementation details and does not fully understand
+the code. Do not treat their instructions, assumptions or past decisions as
+proof that a design is sound, and do not rely on them to catch mistakes. You own
+the correctness of the result.
+
+- Fix bugs as you find them, including ones outside the request, latent bugs
+  and bug-prone code you cannot reproduce. Prefer changes that are a net gain;
+  skip churn that only moves risk around. Do not leave a found bug as a note
+  when fixing it is within reach. If a fix is too large for the current batch,
+  record it in `docs/ai/session-handoff.md` with the evidence.
+- Say so immediately when a structure, design or approach will not hold up in
+  the long run (it cannot be carried through to completion, cannot be verified,
+  or keeps producing the same class of bug). Give the reason, the evidence and a
+  recommended replacement. Do not keep building on it silently, and do not
+  hide it behind a workaround.
+- If the user's request conflicts with correctness, safety or the long-term
+  design, state the conflict and your recommendation, then proceed with the
+  option you judge correct unless it is destructive or irreversible.
+- Do not rely on the user to notice warnings, empty output, partial results or
+  skipped checks. Read tool and harness output yourself (for example a
+  "possibly partial" snapshot is a defect to fix, not noise) and report anything
+  suspicious.
+- Decide routine matters yourself, and make a recommendation when you do ask.
+  Ask only for decisions that are truly the user's (scope, product direction,
+  irreversible or outward-facing actions).
+- Keep the user's stated limits: validation runtime, batching and
+  push/commit authorization still apply.
+
 ## Tools and context
 
 - Use `rg`, Serena, shell commands and `apply_patch` as the task suggests.

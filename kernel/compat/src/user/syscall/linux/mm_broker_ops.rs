@@ -508,6 +508,12 @@ fn broker_map_device_shared(args: &RustosMmBrokerArgs) -> Result<(), i64> {
         if let Some(hold) = shared_region_hold {
             process_state.record_shared_region_mapping(region.start.as_u64(), args.len, hold);
         }
+        if external_mapping.is_some() {
+            // The surface handle's own record dies with the fd (close, dup2,
+            // exec-cloexec) while the PTEs stay; this per-process record keeps
+            // them recognizable as external backing so munmap can retire them.
+            process_state.record_external_physical_mapping(region.start.as_u64(), args.len);
+        }
         surface.set_mapped_region(region);
         let slot = process_state
             .handles_mut()
@@ -645,9 +651,25 @@ fn broker_unmap(args: &RustosMmBrokerArgs) -> Result<(), i64> {
             |state| {
                 state.release_shared_memfd_mappings_in_range(start, end);
                 state.release_shared_region_mappings_in_range(start, end);
-                state
-                    .handles_mut()
-                    .clear_surface_mappings_in_range(start, end - start);
+                state.release_external_physical_mappings_in_range(start, end);
+                // Drop a surface's mapping record only when this munmap
+                // covers its whole region. A partial unmap leaves PTEs of the
+                // rest present; dropping the record then would hide them from
+                // `unmap_process_range`'s external-segment list, and every later
+                // munmap of the remainder is refused as a foreign leaf.
+                let covered: Vec<(u64, u64)> = state
+                    .handles()
+                    .surface_overlap_segments(0, u64::MAX)
+                    .into_iter()
+                    .filter(|&(seg_start, seg_len)| {
+                        seg_start >= start && seg_start.saturating_add(seg_len) <= end
+                    })
+                    .collect();
+                for (seg_start, seg_len) in covered {
+                    state
+                        .handles_mut()
+                        .clear_surface_mappings_in_range(seg_start, seg_len);
+                }
             },
         )
     });
@@ -701,6 +723,7 @@ fn unmap_process_range(
                 (segment_start, segment_start.saturating_add(segment_len))
             }),
     );
+    external_segments.extend(process_state.external_physical_overlap_segments(start, end));
     external_segments.extend(
         process_state
             .handles()

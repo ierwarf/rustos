@@ -215,9 +215,14 @@ fn collect_poll_readiness(
         if revents != 0 {
             state.ready += 1;
         }
-        entry[6..8].copy_from_slice(&(revents as i16).to_le_bytes());
-        usermem::write_current_user_bytes(entry_ptr, &entry)
-            .map_err(address_space_error_to_linux_errno)?;
+        // Linux stores only `revents`; rewriting fd/events would clobber a
+        // concurrent edit of those fields, and an unchanged value needs no
+        // store (the page may not even be writable then).
+        let revents_bytes = (revents as i16).to_le_bytes();
+        if entry[6..8] != revents_bytes {
+            usermem::write_current_user_bytes(entry_ptr + 6, &revents_bytes)
+                .map_err(address_space_error_to_linux_errno)?;
+        }
     }
     if state.observations.len()
         > super::super::broker_ops::waitset_broker_ops::WAITSET_MAX_OBSERVATIONS
@@ -471,15 +476,16 @@ fn merge_provider_observation(
     observations: &mut Vec<super::super::broker_ops::waitset_broker_ops::ProviderObservation>,
     observation: super::super::broker_ops::waitset_broker_ops::ProviderObservation,
 ) {
-    if let Some(previous) = observations.iter_mut().find(|previous| {
-        previous.provider == observation.provider && previous.object_id == observation.object_id
-    }) {
-        if observation.generation > previous.generation {
-            *previous = observation;
+    // The vector is kept sorted by (provider, object); a binary search keeps a
+    // scan of n descriptors O(n log n) instead of re-sorting on every insert.
+    let key = (observation.provider, observation.object_id);
+    match observations.binary_search_by_key(&key, |entry| (entry.provider, entry.object_id)) {
+        Ok(index) => {
+            if observation.generation > observations[index].generation {
+                observations[index] = observation;
+            }
         }
-    } else {
-        observations.push(observation);
-        observations.sort_by_key(|entry| (entry.provider, entry.object_id));
+        Err(index) => observations.insert(index, observation),
     }
 }
 
@@ -782,7 +788,8 @@ pub fn syscall_linux_epoll_wait(
     maxevents: u64,
     timeout_ms: i64,
 ) -> u64 {
-    let Ok(maxevents) = usize::try_from(maxevents) else {
+    // `maxevents` is a C `int`; the register's upper half is not ABI.
+    let Ok(maxevents) = usize::try_from(maxevents as u32 as i32) else {
         return linux_errno(LINUX_EINVAL);
     };
     if maxevents == 0 || maxevents > MAX_POLL_FDS {

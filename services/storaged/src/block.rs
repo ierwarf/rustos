@@ -420,7 +420,12 @@ pub(super) fn write(
             bytes.as_ptr(),
             bytes.len(),
         )?;
-        wait_and_collect(ticket, None)
+        // A write that times out or fails may still land later, and a read
+        // between the pre-write clear and that landing would repopulate the
+        // cache with old bytes. Drop the cache again once the write settles.
+        let result = wait_and_collect(ticket, None);
+        clear_read_cache();
+        result
     })
 }
 

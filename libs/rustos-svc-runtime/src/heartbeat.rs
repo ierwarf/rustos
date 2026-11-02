@@ -201,6 +201,11 @@ mod tests{
     }
     use super::*;
     #[test]
+    fn heartbeat_frames_leave_stack_headroom(){
+        let frames=size_of::<CommercialMaxProtocolRequest>()+size_of::<CommercialMaxProtocolResponse>();
+        assert!(frames+4096<=THREAD_STACK_BYTES,"heartbeat thread stack too small: {frames} bytes of frames");
+    }
+    #[test]
     fn default_interval_is_slow_and_timeout_below_interval(){
         let h=Heartbeat::new(3);
         assert_eq!(h.sequence,0);

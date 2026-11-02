@@ -17,6 +17,7 @@
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <signal.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/file.h>
@@ -127,10 +128,19 @@ struct rustos_dvm_acquire_request {
 static void relay_log(const char *format, ...) __attribute__((format(printf, 1, 2)));
 static int write_complete(int fd, const void *buffer, size_t length);
 
+/* Diagnostics go to the guest serial console. A console whose host reader
+ * stalls blocks write(2) once the tty buffer fills, and the relay (and the
+ * GPU health probe sharing that console) would silently stop making progress
+ * inside a log call. Log through a private non-blocking open of stderr and
+ * drop (and count) lines the console cannot take instead of stalling. */
+static int relay_log_fd = -2;
+static uint64_t relay_log_dropped;
+
 static void relay_log(const char *format, ...) {
     char line[1024];
     va_list arguments;
     int length;
+    ssize_t written;
 
     va_start(arguments, format);
     length = vsnprintf(line, sizeof(line), format, arguments);
@@ -141,7 +151,25 @@ static void relay_log(const char *format, ...) {
     if ((size_t)length >= sizeof(line)) {
         length = (int)sizeof(line) - 1;
     }
-    (void)write(STDERR_FILENO, line, (size_t)length);
+    if (relay_log_fd == -2) {
+        int saved_errno = errno;
+        relay_log_fd = open("/proc/self/fd/2",
+                            O_WRONLY | O_NONBLOCK | O_NOCTTY | O_CLOEXEC);
+        errno = saved_errno;
+    }
+    if (relay_log_fd < 0) {
+        (void)write(STDERR_FILENO, line, (size_t)length);
+        return;
+    }
+    {
+        int saved_errno = errno;
+        do {
+            written = write(relay_log_fd, line, (size_t)length);
+        } while (written < 0 && errno == EINTR);
+        if (written < 0 && relay_log_dropped != UINT64_MAX)
+            relay_log_dropped++;
+        errno = saved_errno;
+    }
 }
 #define DISPLAY_BYTES_PER_PIXEL 4U
 #define GUI_POOL_MAX_REGION_BYTES (128U * 1024U * 1024U)
@@ -253,6 +281,13 @@ static int display_scheduler_enter(struct display_scheduler_guard *guard) {
     return 0;
 }
 #define DISPLAY_PAGEFLIP_TIMEOUT_MS 100
+/* A doorbell is an edge with no retained state. While serving, also rescan the
+ * invitation words on a bounded timer so a lost or coalesced edge delays a
+ * frame by at most this long instead of wedging the relay until the next
+ * unrelated interrupt. */
+#define DISPLAY_UIO_RESCAN_MS 20
+#define DISPLAY_SLOW_FRAME_NS (40ULL * 1000ULL * 1000ULL)
+#define DISPLAY_DIAG_INTERVAL_NS (2ULL * 1000ULL * 1000ULL * 1000ULL)
 #define DISPLAY_RETRY_SECONDS 1U
 #define UIO_BIND_RETRIES 50U
 #define UIO_BIND_RETRY_NS (20ULL * 1000ULL * 1000ULL)
@@ -346,6 +381,13 @@ static uint32_t read_le32(const volatile uint8_t *bytes) {
 static uint64_t read_le64(const volatile uint8_t *bytes) {
     uint64_t value = 0;
     unsigned int index;
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+    /* The host rewrites sequence words with one 64-bit store; assembling
+     * them from eight byte loads can tear across a carry (0x00ff -> 0x0100
+     * read as 0x01ff) and fabricate a sequence that fails the record check. */
+    if (((uintptr_t)bytes & 7U) == 0U)
+        return __atomic_load_n((const volatile uint64_t *)bytes, __ATOMIC_ACQUIRE);
+#endif
     for (index = 0; index < 8U; index++) {
         value |= (uint64_t)bytes[index] << (index * 8U);
     }
@@ -1943,6 +1985,9 @@ static int select_gpu_submission(const struct shared_display *shared,
     }
     if (selected_slot == UINT32_MAX)
         return 0;
+    /* The invitation word publishes the command record and pixels written
+     * before it; keep every record load after the invitation load. */
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
     command_offset = shared->atlas.command_offset +
                      (uint64_t)selected_slot * GPU_ATLAS_COMMAND_SLOT_BYTES;
     record = gpu_pixel_pointer(shared, command_offset, GPU_ATLAS_SUBMIT_BYTES);
@@ -2028,6 +2073,32 @@ static int select_gpu_submission(const struct shared_display *shared,
         return -1;
     }
     return 1;
+}
+
+static uint32_t count_pending_gpu_submissions(const struct shared_display *shared) {
+    uint32_t pending = 0U;
+    uint32_t slot;
+    for (slot = 0U; slot < GPU_ATLAS_SLOT_COUNT; slot++) {
+        uint64_t invitation = read_le64(shared->base + GPU_ATLAS_INVITATION_OFFSET +
+                                        slot * sizeof(uint64_t));
+        uint64_t acknowledged = read_le64(shared->base + GPU_ATLAS_COMPLETION_ACK_OFFSET +
+                                          slot * sizeof(uint64_t));
+        uint64_t completed = read_le64(shared->base + GPU_ATLAS_COMPLETION_SEQUENCE_OFFSET +
+                                       slot * sizeof(uint64_t));
+        if (invitation != 0U && invitation != acknowledged && invitation != completed)
+            pending++;
+    }
+    return pending;
+}
+
+static void rttime_soft_limit_exceeded(int signal_number) {
+    static const char message[] =
+        "rustos-dvm-display: SIGXCPU RLIMIT_RTTIME soft limit exceeded; hard limit kills the relay\n";
+    int saved_errno = errno;
+    (void)signal_number;
+    if (relay_log_fd >= 0)
+        (void)write(relay_log_fd, message, sizeof(message) - 1U);
+    errno = saved_errno;
 }
 
 static int publish_gpu_completion(const struct shared_display *shared,
@@ -2171,6 +2242,12 @@ static int serve_gpu_display(struct shared_display *shared) {
     int peer_ready_confirmed = 0;
     int active_logged = 0;
     int ready_lock = -1;
+    uint32_t event_count = 0U;
+    uint64_t diag_wakes = 0U;
+    uint64_t diag_rescan_hits = 0U;
+    uint64_t diag_max_frame_ns = 0U;
+    uint64_t diag_last_ns = 0U;
+    uint64_t diag_last_slow_ns = 0U;
     if (open_gpu_kms_display(shared, &display, &runtime, &prime_duration_ns,
                              &prime_present_fence) != 0) {
         relay_log("rustos-dvm-display: GPU KMS setup unavailable stage=%s errno=%d\n",
@@ -2193,10 +2270,13 @@ static int serve_gpu_display(struct shared_display *shared) {
               prime_present_fence ? "out-fence" : "blocking-atomic");
     if (monotonic_time_ns(&last_reported_ns) != 0)
         goto fail;
+    (void)signal(SIGXCPU, rttime_soft_limit_exceeded);
     for (;;) {
-        uint32_t event_count;
         ssize_t read_bytes;
         int invitation_pending = 0;
+        int timed_out = 0;
+        int event_pass = 0;
+        uint64_t frames_before = presented_frames;
         if (!peer_ready_sent) {
             if (host_invitation_pending(shared, &invitation_pending) != 0)
                 break;
@@ -2207,11 +2287,29 @@ static int serve_gpu_display(struct shared_display *shared) {
                 peer_ready_sent = 1;
             }
         }
-        do {
-            read_bytes = read(shared->uio_fd, &event_count, sizeof(event_count));
-        } while (read_bytes < 0 && errno == EINTR);
-        if (read_bytes != (ssize_t)sizeof(event_count) || event_count == 0U)
-            break;
+        {
+            struct pollfd uio_poll = {.fd = shared->uio_fd, .events = POLLIN, .revents = 0};
+            int poll_result;
+            do {
+                poll_result = poll(&uio_poll, 1U, peer_ready_confirmed ? DISPLAY_UIO_RESCAN_MS : -1);
+            } while (poll_result < 0 && errno == EINTR);
+            if (poll_result < 0)
+                break;
+            if (poll_result == 0) {
+                timed_out = 1;
+            } else {
+                uint32_t observed_events = 0U;
+                do {
+                    read_bytes = read(shared->uio_fd, &observed_events,
+                                      sizeof(observed_events));
+                } while (read_bytes < 0 && errno == EINTR);
+                if (read_bytes != (ssize_t)sizeof(observed_events) || observed_events == 0U)
+                    break;
+                event_count = observed_events;
+                diag_wakes++;
+                event_pass = 1;
+            }
+        }
         if (!peer_ready_sent) {
             if (acknowledge_gpu_host_invitation(shared, prime_duration_ns,
                                                 dmabuf_sources) != 0)
@@ -2239,11 +2337,25 @@ static int serve_gpu_display(struct shared_display *shared) {
             uint64_t presented_ns;
             uint64_t render_time_ns;
             int acquire_fence_fd = -1;
+            uint64_t frame_started_ns = 0U;
+            uint64_t frame_finished_ns = 0U;
             int selected = select_gpu_submission(shared, &submission, dmabuf_sources);
             if (selected < 0)
                 goto fail;
             if (selected == 0)
                 break;
+            if (timed_out) {
+                /* Work was pending without a doorbell: evidence of a lost or
+                 * coalesced edge on the host-to-DVM direction. */
+                timed_out = 0;
+                diag_rescan_hits++;
+                relay_log("rustos-dvm-display: rescan found pending submission without doorbell "
+                          "slot=%u sequence=%llu hits=%llu\n", submission.slot,
+                          (unsigned long long)submission.sequence,
+                          (unsigned long long)diag_rescan_hits);
+            }
+            if (monotonic_time_ns(&frame_started_ns) != 0)
+                frame_started_ns = 0U;
             if (dmabuf_sources) {
                 display.setup_stage = "gpu-dmabuf-acquire";
                 acquire_fence_fd = acquire_gpu_source_fence(&display, &submission);
@@ -2263,6 +2375,22 @@ static int serve_gpu_display(struct shared_display *shared) {
                 goto fail;
             front_submit_value = frame.submit_value;
             presented_frames++;
+            if (frame_started_ns != 0U && monotonic_time_ns(&frame_finished_ns) == 0 &&
+                frame_finished_ns > frame_started_ns) {
+                uint64_t frame_ns = frame_finished_ns - frame_started_ns;
+                if (frame_ns > diag_max_frame_ns)
+                    diag_max_frame_ns = frame_ns;
+                if (frame_ns > DISPLAY_SLOW_FRAME_NS &&
+                    frame_finished_ns - diag_last_slow_ns > 1000ULL * 1000ULL * 1000ULL) {
+                    diag_last_slow_ns = frame_finished_ns;
+                    relay_log("rustos-dvm-display: slow-frame total_us=%llu render_us=%llu "
+                              "sequence=%llu pending=%u\n",
+                              (unsigned long long)(frame_ns / 1000ULL),
+                              (unsigned long long)(render_time_ns / 1000ULL),
+                              (unsigned long long)frame.sequence,
+                              count_pending_gpu_submissions(shared));
+                }
+            }
             if (gpu_metrics.render_time_ns > UINT64_MAX - render_time_ns ||
                 gpu_metrics.render_measurements == UINT64_MAX) {
                 errno = EOVERFLOW;
@@ -2307,14 +2435,30 @@ static int serve_gpu_display(struct shared_display *shared) {
                                    &gpu_metrics) != 0)
                 goto fail;
         }
-        if (report_relay_stats(&display, dmabuf_sources, presented_frames,
-                               atomic_commit_time_ns,
-                               atomic_commit_measurements, &last_reported_ns,
-                               &last_pageflip_completions, &last_atomic_commit_time_ns,
-                               &last_atomic_commit_measurements,
-                               &last_pageflip_latency_time_ns, &sample_sequence,
-                               &gpu_metrics) != 0)
-            goto fail;
+        if (presented_frames != frames_before || event_pass) {
+            uint64_t diag_now_ns;
+            if (report_relay_stats(&display, dmabuf_sources, presented_frames,
+                                   atomic_commit_time_ns,
+                                   atomic_commit_measurements, &last_reported_ns,
+                                   &last_pageflip_completions, &last_atomic_commit_time_ns,
+                                   &last_atomic_commit_measurements,
+                                   &last_pageflip_latency_time_ns, &sample_sequence,
+                                   &gpu_metrics) != 0)
+                goto fail;
+            if (monotonic_time_ns(&diag_now_ns) == 0 &&
+                diag_now_ns - diag_last_ns >= DISPLAY_DIAG_INTERVAL_NS) {
+                diag_last_ns = diag_now_ns;
+                relay_log("rustos-dvm-display: relay-diag frames=%llu pending=%u wakes=%llu "
+                          "rescan_hits=%llu max_frame_us=%llu log_drops=%llu\n",
+                          (unsigned long long)presented_frames,
+                          count_pending_gpu_submissions(shared),
+                          (unsigned long long)diag_wakes,
+                          (unsigned long long)diag_rescan_hits,
+                          (unsigned long long)(diag_max_frame_ns / 1000ULL),
+                          (unsigned long long)relay_log_dropped);
+                diag_max_frame_ns = 0U;
+            }
+        }
     }
 fail:
     if (ready_lock >= 0) {

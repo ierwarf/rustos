@@ -60,8 +60,17 @@ impl VfsState {
             }
             COMMERCIAL_MAX_VFSD_OP_PATH_RESOLVE => {
                 let path = commercial_request_path(request);
+                // Canonicalize before routing, as the VFS IPC path does.
+                let path = path.map(|raw| normalize_absolute_path("/", raw));
                 if let Some(path) = path {
-                    match lock_vfs_storage().metadata(path) {
+                    let path = match path {
+                        Ok(path) => path,
+                        Err(errno) => {
+                            response.status = errno;
+                            return response;
+                        }
+                    };
+                    match lock_vfs_storage().metadata(path.as_str()) {
                         Ok(metadata) => {
                             response.value0 = metadata.inode;
                             response.value1 = metadata.len;
@@ -400,6 +409,22 @@ impl VfsState {
         }
     }
 
+    /// The retired offload envelope carries raw client paths. Canonicalize
+    /// them against the caller's cwd exactly like the versioned VFS IPC does,
+    /// so `..`, `//` and relative forms cannot dodge the exact-path routing
+    /// (`/dev`, `/proc`, `/run`) in `VfsStorage::metadata`.
+    fn linux_resolved_path(
+        &self,
+        request: &LinuxSyscallOffloadRequest,
+        path: &str,
+    ) -> Result<String, i32> {
+        if path.is_empty() {
+            return Err(ENOENT);
+        }
+        let cwd = self.cwd.get(&request.pid).map(String::as_str).unwrap_or("/");
+        normalize_absolute_path(cwd, path)
+    }
+
     fn linux_statx(
         &mut self,
         request: &LinuxSyscallOffloadRequest,
@@ -409,7 +434,14 @@ impl VfsState {
             response.status = EINVAL;
             return;
         };
-        match lock_vfs_storage().metadata(path) {
+        let path = match self.linux_resolved_path(request, path) {
+            Ok(path) => path,
+            Err(errno) => {
+                response.status = errno;
+                return;
+            }
+        };
+        match lock_vfs_storage().metadata(path.as_str()) {
             Ok(metadata) => {
                 let statx = build_linux_statx(metadata);
                 response.payload_len = LINUX_STATX_SIZE as u32;
@@ -428,7 +460,14 @@ impl VfsState {
             response.status = EINVAL;
             return;
         };
-        match lock_vfs_storage().metadata(path) {
+        let path = match self.linux_resolved_path(request, path) {
+            Ok(path) => path,
+            Err(errno) => {
+                response.status = errno;
+                return;
+            }
+        };
+        match lock_vfs_storage().metadata(path.as_str()) {
             Ok(metadata) => {
                 let stat = build_linux_stat(metadata);
                 response.payload_len = LINUX_STAT_SIZE as u32;
@@ -451,7 +490,14 @@ impl VfsState {
             response.status = EINVAL;
             return;
         };
-        response.status = match lock_vfs_storage().metadata(path) {
+        let path = match self.linux_resolved_path(request, path) {
+            Ok(path) => path,
+            Err(errno) => {
+                response.status = errno;
+                return;
+            }
+        };
+        response.status = match lock_vfs_storage().metadata(path.as_str()) {
             Ok(_) => 0,
             Err(errno) => errno,
         };
@@ -475,7 +521,12 @@ impl VfsState {
             response.status = EINVAL;
             return;
         };
-        response.status = self.chdir(request.pid, path);
+        // Store the canonical absolute path: a raw `a/../b` or relative cwd
+        // would later be re-joined as if it were rooted.
+        response.status = match self.linux_resolved_path(request, path) {
+            Ok(path) => self.chdir(request.pid, path.as_str()),
+            Err(errno) => errno,
+        };
     }
 
     fn linux_mkdir(

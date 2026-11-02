@@ -29,6 +29,11 @@ pub(crate) fn write_from_current_process(
         if let Err(err) = read_result {
             crate::debug::trace_loc!();
             log_console_user_buffer_failure("copy", user_ptr, len, chunk_ptr, chunk_len, err);
+            // write(2) reports a short count once any byte has been delivered;
+            // only a failure before the first byte is an error.
+            if total_written != 0 {
+                return Ok(total_written);
+            }
             return Err(err);
         }
         total_written += tty::write_to_session(session, &chunk[..chunk_len]);

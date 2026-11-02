@@ -400,6 +400,7 @@ fn write_all_retry_until(
             Err(err) if err.kind() == ErrorKind::WouldBlock => {
                 wait_for_socket_ready(stream, deadline, libc::POLLOUT)?;
             }
+            Err(err) if err.kind() == ErrorKind::Interrupted => {}
             Err(err) => return Err(io_errno(err)),
         }
     }
@@ -426,6 +427,7 @@ fn read_exact_retry_until(
             Err(err) if err.kind() == ErrorKind::WouldBlock => {
                 wait_for_socket_ready(stream, deadline, libc::POLLIN)?;
             }
+            Err(err) if err.kind() == ErrorKind::Interrupted => {}
             Err(err) => return Err(io_errno(err)),
         }
     }

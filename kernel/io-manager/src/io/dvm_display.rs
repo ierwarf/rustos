@@ -128,21 +128,26 @@ static GPU_SUBMIT_LOCK: AtomicBool = AtomicBool::new(false);
 static GPU_LIFECYCLE: crate::transport_lifecycle::TransportLifecycle =
     crate::transport_lifecycle::TransportLifecycle::detached();
 static GPU_EPOCH_RESET_PENDING: AtomicBool = AtomicBool::new(false);
-static GPU_SLOT_STATE: [AtomicU8; DVM_GPU_RENDER_MAX_IN_FLIGHT as usize] = [
-    AtomicU8::new(GPU_SLOT_FREE),
-    AtomicU8::new(GPU_SLOT_FREE),
-    AtomicU8::new(GPU_SLOT_FREE),
-];
+static GPU_SLOT_STATE: [AtomicU8; DVM_GPU_RENDER_MAX_IN_FLIGHT as usize] =
+    [const { AtomicU8::new(GPU_SLOT_FREE) }; DVM_GPU_RENDER_MAX_IN_FLIGHT as usize];
 static GPU_SLOT_GENERATION: [AtomicU64; DVM_GPU_RENDER_MAX_IN_FLIGHT as usize] =
-    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+    [const { AtomicU64::new(0) }; DVM_GPU_RENDER_MAX_IN_FLIGHT as usize];
 static GPU_SLOT_SEQUENCE: [AtomicU64; DVM_GPU_RENDER_MAX_IN_FLIGHT as usize] =
-    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+    [const { AtomicU64::new(0) }; DVM_GPU_RENDER_MAX_IN_FLIGHT as usize];
 static GPU_SLOT_CONTEXT_ID: [AtomicU32; DVM_GPU_RENDER_MAX_IN_FLIGHT as usize] =
-    [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)];
+    [const { AtomicU32::new(0) }; DVM_GPU_RENDER_MAX_IN_FLIGHT as usize];
 static GPU_SLOT_CONTEXT_EPOCH: [AtomicU32; DVM_GPU_RENDER_MAX_IN_FLIGHT as usize] =
-    [AtomicU32::new(0), AtomicU32::new(0), AtomicU32::new(0)];
+    [const { AtomicU32::new(0) }; DVM_GPU_RENDER_MAX_IN_FLIGHT as usize];
 static GPU_SLOT_SUBMIT_VALUE: [AtomicU64; DVM_GPU_RENDER_MAX_IN_FLIGHT as usize] =
-    [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+    [const { AtomicU64::new(0) }; DVM_GPU_RENDER_MAX_IN_FLIGHT as usize];
+/// Completion polls that found the slot still pending since its submission.
+/// The doorbell is the only DVM wakeup for a submitted slot and an
+/// ivshmem interrupt that is coalesced or lands before the DVM handler is
+/// armed is never repeated, so a pending poll periodically re-rings it. The
+/// DVM consumes invitations idempotently by sequence.
+static GPU_SLOT_PENDING_POLLS: [AtomicU32; DVM_GPU_RENDER_MAX_IN_FLIGHT as usize] =
+    [const { AtomicU32::new(0) }; DVM_GPU_RENDER_MAX_IN_FLIGHT as usize];
+const GPU_PENDING_REDOORBELL_POLLS: u32 = 64;
 static PUBLISHED_GENERATION: AtomicU64 = AtomicU64::new(0);
 static SLOT_STATE: [AtomicU8; GUI_SLOT_COUNT] = [
     AtomicU8::new(GUI_SLOT_FREE),
@@ -496,6 +501,7 @@ pub(crate) fn try_submit_gpu_atlas(
         return DvmGpuSubmitOutcome::Invalid;
     };
     write_u64(invitation_offset, sequence);
+    GPU_SLOT_PENDING_POLLS[slot].store(0, Ordering::Relaxed);
     GPU_SESSION_SUBMISSIONS.store(next_session_submissions, Ordering::Release);
     fence(Ordering::SeqCst);
     signal_gpu_dvm();
@@ -524,8 +530,17 @@ pub(crate) fn query_gpu_atlas_completion(
     if slot >= GPU_SLOT_STATE.len() {
         return DvmGpuCompletionOutcome::Invalid;
     }
-    if GPU_SLOT_STATE[slot].load(Ordering::Acquire) != GPU_SLOT_SUBMITTED {
-        return DvmGpuCompletionOutcome::Pending;
+    match GPU_SLOT_STATE[slot].load(Ordering::Acquire) {
+        GPU_SLOT_SUBMITTED => {}
+        // FREE here means the caller still holds a ticket for a submission
+        // that no longer exists: a DVM offline epoch reset (`reset_gpu_slots`)
+        // wiped it while the transport stayed installed and re-activated.
+        // Reporting Pending would make the caller wait forever for a
+        // completion that can never arrive (uiserver then times out with
+        // errno 110 / stalls). Unavailable (ENODEV) tells it the provider was
+        // lost so it re-primes a fresh context.
+        GPU_SLOT_FREE => return DvmGpuCompletionOutcome::Unavailable,
+        _ => return DvmGpuCompletionOutcome::Pending,
     }
     let expected_sequence = GPU_SLOT_SEQUENCE[slot].load(Ordering::Acquire);
     let Some(sequence_offset) = dvm_gpu_atlas_completion_sequence_offset(binding_slot) else {
@@ -533,6 +548,10 @@ pub(crate) fn query_gpu_atlas_completion(
     };
     let observed_sequence = read_u64(sequence_offset);
     if observed_sequence == 0 || observed_sequence < expected_sequence {
+        let polls = GPU_SLOT_PENDING_POLLS[slot].fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        if polls % GPU_PENDING_REDOORBELL_POLLS == 0 {
+            signal_gpu_dvm();
+        }
         return DvmGpuCompletionOutcome::Pending;
     }
     if observed_sequence > expected_sequence {
@@ -549,6 +568,7 @@ pub(crate) fn query_gpu_atlas_completion(
     }
     fence(Ordering::Acquire);
     let Some(completion) = DvmGpuAtlasCompletion::decode(&bytes) else {
+        log_malformed_gpu_completion(binding_slot, expected_sequence, &bytes);
         let control_sequence = GUI_DVM_ACKED_CONTROL_SEQUENCE.load(Ordering::Acquire);
         revoke_transport("gpu-completion-malformed", control_sequence);
         return DvmGpuCompletionOutcome::Unavailable;
@@ -584,6 +604,47 @@ pub(crate) fn query_gpu_atlas_completion(
     GPU_SLOT_STATE[slot].store(GPU_SLOT_FREE, Ordering::Release);
     *result = bytes;
     DvmGpuCompletionOutcome::Completed
+}
+
+/// Names the raw fields of a completion that failed `decode` before the
+/// transport is revoked, so a real render failure (non-Completed status) is
+/// distinguishable from wire corruption. Offsets follow
+/// `DvmGpuAtlasCompletion::encode`: render completion at 64, status at +24.
+fn log_malformed_gpu_completion(
+    slot: u32,
+    expected_sequence: u64,
+    bytes: &[u8; driver_domain_protocol::DVM_GPU_ATLAS_COMPLETION_SLOT_BYTES],
+) {
+    let u32_at = |offset: usize| {
+        u32::from_le_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ])
+    };
+    let u64_at = |offset: usize| {
+        let mut raw = [0_u8; 8];
+        raw.copy_from_slice(&bytes[offset..offset + 8]);
+        u64::from_le_bytes(raw)
+    };
+    crate::debug::warn!(
+        display,
+        "gui-dvm: malformed gpu completion slot={} expected_seq={} magic_ok={} seq={} gen={} flags={:#x} render_status={} ctx={}/{} submit={} completion={} release={} present_value={}",
+        slot,
+        expected_sequence,
+        bytes[0..8] == driver_domain_protocol::DVM_GPU_ATLAS_COMPLETION_MAGIC,
+        u64_at(32),
+        u64_at(24),
+        u32_at(20),
+        u32_at(64 + 24),
+        u32_at(64 + 16),
+        u32_at(64 + 20),
+        u64_at(64 + 32),
+        u64_at(64 + 40),
+        u64_at(64 + 56),
+        u64_at(128 + 40),
+    );
 }
 
 fn parse_gpu_batch(

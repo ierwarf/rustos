@@ -189,6 +189,11 @@ pub struct UserProcessState {
     mapping_cursor: u64,
     shared_memfd_mappings: Vec<SharedMemfdMapping>,
     shared_region_mappings: Vec<SharedRegionMapping>,
+    /// Fixed physical windows (scanout/GPU surfaces) mapped into this process.
+    /// They have no shared region to hold, and the surface handle's own record
+    /// dies with the fd, so this list is the only thing that keeps the PTEs
+    /// visible to `unmap` as external backing after the fd is closed.
+    external_physical_mappings: Vec<(u64, u64)>,
     /// Bytes of the two mapping lists above, billed to the Job as
     /// `Class::Vma` once the process is published.
     mapping_kmem: kernel_mm::api::kmem_charge::Meter,
@@ -374,6 +379,7 @@ impl UserProcessState {
             mapping_cursor: default_cursor,
             shared_memfd_mappings: Vec::new(),
             shared_region_mappings: Vec::new(),
+            external_physical_mappings: Vec::new(),
             mapping_kmem: kernel_mm::api::kmem_charge::Meter::new(
                 kernel_mm::api::kmem_charge::Class::Vma,
             ),
@@ -470,6 +476,15 @@ impl UserProcessState {
     }
 
     pub fn release_shared_memfd_mappings_in_range(&mut self, start: u64, end: u64) {
+        // Every munmap/mprotect-style release lands here; most ranges touch no
+        // shared mapping, so do not rebuild (and reallocate) the list for them.
+        if !self
+            .shared_memfd_mappings
+            .iter()
+            .any(|mapping| end > mapping.start && start < mapping.end())
+        {
+            return;
+        }
         let mut updated = Vec::with_capacity(self.shared_memfd_mappings.len() + 1);
         for mapping in self.shared_memfd_mappings.drain(..) {
             let mapping_end = mapping.end();
@@ -517,6 +532,46 @@ impl UserProcessState {
         self.sync_mapping_kmem();
     }
 
+    pub fn record_external_physical_mapping(&mut self, start: u64, len: u64) {
+        self.external_physical_mappings.push((start, len));
+        self.sync_mapping_kmem();
+    }
+
+    pub fn external_physical_overlap_segments(&self, start: u64, end: u64) -> Vec<(u64, u64)> {
+        self.external_physical_mappings
+            .iter()
+            .filter_map(|&(map_start, map_len)| {
+                overlap_segment(map_start, map_start.saturating_add(map_len), start, end)
+            })
+            .collect()
+    }
+
+    pub fn release_external_physical_mappings_in_range(&mut self, start: u64, end: u64) {
+        if !self
+            .external_physical_mappings
+            .iter()
+            .any(|&(map_start, map_len)| end > map_start && start < map_start.saturating_add(map_len))
+        {
+            return;
+        }
+        let mut updated = Vec::with_capacity(self.external_physical_mappings.len() + 1);
+        for (map_start, map_len) in self.external_physical_mappings.drain(..) {
+            let map_end = map_start.saturating_add(map_len);
+            if end <= map_start || start >= map_end {
+                updated.push((map_start, map_len));
+                continue;
+            }
+            if start > map_start {
+                updated.push((map_start, start - map_start));
+            }
+            if end < map_end {
+                updated.push((end, map_end - end));
+            }
+        }
+        self.external_physical_mappings = updated;
+        self.sync_mapping_kmem();
+    }
+
     pub fn shared_region_overlap_segments(&self, start: u64, end: u64) -> Vec<(u64, u64)> {
         self.shared_region_mappings
             .iter()
@@ -525,6 +580,15 @@ impl UserProcessState {
     }
 
     pub fn release_shared_region_mappings_in_range(&mut self, start: u64, end: u64) {
+        // Every munmap/mprotect-style release lands here; most ranges touch no
+        // shared mapping, so do not rebuild (and reallocate) the list for them.
+        if !self
+            .shared_region_mappings
+            .iter()
+            .any(|mapping| end > mapping.start && start < mapping.end())
+        {
+            return;
+        }
         let mut updated = Vec::with_capacity(self.shared_region_mappings.len() + 1);
         for mapping in self.shared_region_mappings.drain(..) {
             let mapping_end = mapping.end();
@@ -559,7 +623,8 @@ impl UserProcessState {
 
     fn mapping_kmem_total(&self) -> u64 {
         (self.shared_memfd_mappings.len() * core::mem::size_of::<SharedMemfdMapping>()
-            + self.shared_region_mappings.len() * core::mem::size_of::<SharedRegionMapping>())
+            + self.shared_region_mappings.len() * core::mem::size_of::<SharedRegionMapping>()
+            + self.external_physical_mappings.len() * core::mem::size_of::<(u64, u64)>())
             as u64
     }
 
@@ -703,6 +768,7 @@ impl UserProcessState {
             mapping_cursor: self.mapping_cursor,
             shared_memfd_mappings: self.shared_memfd_mappings.clone(),
             shared_region_mappings: self.shared_region_mappings.clone(),
+            external_physical_mappings: self.external_physical_mappings.clone(),
             // A fork child is billed when it is published, not when cloned.
             mapping_kmem: self.mapping_kmem.clone(),
             exec_path: [0; PROCESS_EXEC_PATH_CAPACITY],
@@ -743,6 +809,7 @@ impl UserProcessState {
             mapping_cursor,
             shared_memfd_mappings,
             shared_region_mappings,
+            external_physical_mappings,
             mapping_kmem,
             exec_path,
             exec_path_len,
@@ -759,6 +826,7 @@ impl UserProcessState {
             mapping_cursor,
             shared_memfd_mappings,
             shared_region_mappings,
+            external_physical_mappings,
             mapping_kmem,
             exec_path,
             exec_path_len,

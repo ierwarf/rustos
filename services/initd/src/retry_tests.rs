@@ -6,6 +6,7 @@ fn successful_replacements_do_not_erase_the_crash_loop_budget() {
     let mut retry = RetryState {
         next_attempt: now,
         failures: 0,
+        spawned_at: None,
     };
     for failure in 1..=INITD_LAUNCH_MAX_FAILURES {
         retry.note_spawned(now);
@@ -18,6 +19,30 @@ fn successful_replacements_do_not_erase_the_crash_loop_budget() {
     }
     retry.note_spawned(now);
     assert!(retry.note_failure(now), "exhaustion remains fail-closed");
+}
+
+#[test]
+fn sustained_health_starts_a_fresh_failure_budget() {
+    let start = Instant::now();
+    let mut retry = RetryState {
+        next_attempt: start,
+        failures: INITD_LAUNCH_MAX_FAILURES - 1,
+        spawned_at: None,
+    };
+    retry.note_spawned(start);
+    let died = start + INITD_LAUNCH_HEALTHY_RESET;
+    assert!(!retry.note_failure(died), "a long-lived incarnation is forgiven");
+    assert_eq!(retry.failures, 1);
+
+    // Uptime is consumed by the failure it ended: a launch error that never
+    // ran must not inherit it.
+    retry.failures = INITD_LAUNCH_MAX_FAILURES - 1;
+    assert!(retry.note_failure(died + INITD_LAUNCH_HEALTHY_RESET));
+
+    // A short-lived incarnation keeps consuming the budget.
+    retry.failures = INITD_LAUNCH_MAX_FAILURES - 1;
+    retry.note_spawned(start);
+    assert!(retry.note_failure(start + INITD_LAUNCH_HEALTHY_RESET / 2));
 }
 
 #[test]

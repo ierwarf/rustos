@@ -191,7 +191,10 @@ Rootd supervises replacement core-service endpoint readiness after bootstrap
 as well as during it, at the same 250 ms monotonic cadence. Control traffic
 cannot consume extra readiness polls. Initd retains its 32-failure budget for
 each executable across successful replacements; creation or endpoint publication
-alone does not establish sustained health or reset the supervisor-lifetime budget.
+alone does not establish sustained health or reset the budget. Only a replacement
+that then stays up for 60 s (`INITD_LAUNCH_HEALTHY_RESET`) starts a fresh budget
+when it exits, so exhaustion means consecutive short-lived incarnations rather
+than 32 exits over initd's whole uptime.
 
 Initd batches only siblings whose declared dependency/barrier state is already
 satisfied. Pending independent children remain suspended while their exact

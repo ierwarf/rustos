@@ -190,31 +190,27 @@ impl AllocatorState {
         (*block).size = size;
         (*block).next = ptr::null_mut();
 
+        let mut previous: *mut FreeBlock = ptr::null_mut();
         let mut link: *mut *mut FreeBlock = &mut self.free_head;
         while !(*link).is_null() && (*link as usize) < start {
+            previous = *link;
             link = &mut (**link).next;
         }
         (*block).next = *link;
         *link = block;
-        self.coalesce();
-    }
 
-    unsafe fn coalesce(&mut self) {
-        let mut current = self.free_head;
-        while !current.is_null() {
-            let next = (*current).next;
-            if next.is_null() {
-                break;
-            }
-            let Some(current_end) = (current as usize).checked_add((*current).size) else {
-                break;
-            };
-            if current_end == next as usize {
-                (*current).size += (*next).size;
-                (*current).next = (*next).next;
-            } else {
-                current = next;
-            }
+        // Only the new span's neighbours can have become adjacent, so merge
+        // locally instead of rescanning the whole free list on every free.
+        let next = (*block).next;
+        if !next.is_null() && start.checked_add((*block).size) == Some(next as usize) {
+            (*block).size += (*next).size;
+            (*block).next = (*next).next;
+        }
+        if !previous.is_null()
+            && (previous as usize).checked_add((*previous).size) == Some(start)
+        {
+            (*previous).size += (*block).size;
+            (*previous).next = (*block).next;
         }
     }
 }

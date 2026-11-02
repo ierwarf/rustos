@@ -80,6 +80,10 @@ enum PhysicalMappingCacheMode {
 #[derive(Clone, Copy)]
 struct MmioWindowSlot {
     phys_block: u64,
+    /// First block of the mapping that owns this slot. An unmap must start at a
+    /// head and end where the next slot is free or another head, so a caller's
+    /// range can never release part of, or more than, one mapping.
+    head: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -98,6 +102,7 @@ impl MmioWindowSlot {
     const fn unmapped() -> Self {
         Self {
             phys_block: MMIO_UNMAPPED_BLOCK,
+            head: false,
         }
     }
 
@@ -328,7 +333,10 @@ impl<const SIZE_GB: usize> PML4<SIZE_GB> {
         for block_offset in 0..block_count {
             let slot = slot_start + block_offset;
             let phys_block = phys_block_start + block_offset as u64;
-            self.mmio_blocks[slot] = MmioWindowSlot { phys_block };
+            self.mmio_blocks[slot] = MmioWindowSlot {
+                phys_block,
+                head: block_offset == 0,
+            };
             self.mmio_pd[slot].set_addr(PhysAddr::new(phys_block * HUGE_2MIB), huge_flags);
             tlb::flush(VirtAddr::new(mmio_slot_base(slot)));
         }
@@ -374,8 +382,21 @@ impl<const SIZE_GB: usize> PML4<SIZE_GB> {
             return false;
         }
 
-        for slot in slot_start..slot_start + block_count {
-            if self.mmio_blocks[slot].is_unmapped() {
+        let slot_end = slot_start + block_count;
+        if !self.mmio_blocks[slot_start].head
+            || (slot_start + 1..slot_end).any(|slot| self.mmio_blocks[slot].head)
+            || (slot_end < MMIO_WINDOW_SLOTS
+                && !self.mmio_blocks[slot_end].is_unmapped()
+                && !self.mmio_blocks[slot_end].head)
+        {
+            return false;
+        }
+        for slot in slot_start..slot_end {
+            let mapping = self.mmio_blocks[slot];
+            if mapping.is_unmapped()
+                || (slot > slot_start
+                    && mapping.phys_block != self.mmio_blocks[slot - 1].phys_block + 1)
+            {
                 return false;
             }
         }

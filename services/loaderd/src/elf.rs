@@ -433,6 +433,7 @@ fn map_admitted_elf_segments_fd(
     let phdr_addr = program_header_table_addr_from_phdrs(header, phdrs, load_bias)?;
 
     let mut max_loaded_end: u64 = load_bias;
+    let mut min_loaded_start: u64 = u64::MAX;
     let mut interpreter_path = None::<String>;
     let mut mappings = Vec::<ElfLoadMapping>::new();
 
@@ -450,6 +451,8 @@ fn map_admitted_elf_segments_fd(
                     .and_then(|e| e.checked_add(load_bias))
                     .ok_or(EOVERFLOW)?;
                 max_loaded_end = max_loaded_end.max(end);
+                min_loaded_start =
+                    min_loaded_start.min(vaddr.checked_add(load_bias).ok_or(EOVERFLOW)?);
             }
             ELF_PT_INTERP if map_interpreter => {
                 interpreter_path = Some(read_elf_interp_path(fd, &ph)?);
@@ -475,6 +478,13 @@ fn map_admitted_elf_segments_fd(
                     return Err(errno);
                 }
             };
+            // A fixed-address (ET_EXEC) image can be linked anywhere; the
+            // interpreter lives at a fixed window, so refuse any overlap
+            // here instead of relying on the commit-time mapping failure.
+            if min_loaded_start < interp.max_loaded_end && interp.load_bias < max_loaded_end {
+                close_fds(&interp.backing_fds);
+                return Err(ENOEXEC);
+            }
             let end = interp.max_loaded_end.max(max_loaded_end);
             backing_fds.extend(interp.backing_fds);
             (interp.load_bias, interp.entry, interpreter_path, end)

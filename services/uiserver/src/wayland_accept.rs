@@ -23,6 +23,30 @@ use crate::sys::{diag_line, spawn_ui_thread, UiThreadRole};
 
 const WAYLAND_ACCEPT_QUEUE_CAPACITY: usize = 16;
 const WAYLAND_ACCEPT_WAIT_TIMEOUT_MS: i32 = -1;
+const WAYLAND_ACCEPT_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Error/flood-only pause. The acceptor stays readiness-driven while idle (it
+/// blocks in `epoll_wait` with no timeout); this runs only after a queue-full
+/// rejection or a transient accept error, where the level-triggered listener
+/// would otherwise report readiness again immediately and spin the worker.
+fn shed_load_pause() {
+    std::thread::sleep(WAYLAND_ACCEPT_BACKOFF);
+}
+
+fn transient_accept_error(err: &std::io::Error) -> bool {
+    matches!(
+        err.raw_os_error(),
+        Some(
+            libc::ECONNABORTED
+                | libc::EMFILE
+                | libc::ENFILE
+                | libc::ENOBUFS
+                | libc::ENOMEM
+                | libc::EPROTO
+                | libc::EPERM
+        )
+    )
+}
 
 pub(crate) struct WaylandAcceptor {
     receiver: Receiver<UnixStream>,
@@ -174,6 +198,9 @@ pub(crate) fn start_wayland_acceptor(
                                 // unpublished stream's Release token.
                                 worker_pending.fetch_sub(1, Ordering::AcqRel);
                                 diag_line("uiserver: Wayland accept queue full; client rejected");
+                                // The listener is level-triggered: without a
+                                // pause a connection flood spins this worker.
+                                shed_load_pause();
                                 break;
                             }
                             Err(TrySendError::Disconnected(_)) => {
@@ -186,6 +213,16 @@ pub(crate) fn start_wayland_acceptor(
                     }
                     Err(err) if err.kind() == ErrorKind::WouldBlock => break,
                     Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+                    Err(err) if transient_accept_error(&err) => {
+                        // A peer that connects and resets, or a client flood
+                        // that exhausts descriptors, is not a reason to take
+                        // the whole display server down. Shed load and retry.
+                        diag_line(format!(
+                            "uiserver: Wayland accept deferred: {err}"
+                        ));
+                        shed_load_pause();
+                        break;
+                    }
                     Err(err) => {
                         diag_line(format!("uiserver: Wayland accept failed: {err}"));
                         std::process::exit(134);

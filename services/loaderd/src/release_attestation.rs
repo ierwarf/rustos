@@ -95,18 +95,26 @@ pub(super) fn stage_release_bundle(
 #[cfg(test)]
 mod tests{
     use super::*;
+    use loaderd::release_bundle::{BUNDLE_HEADER_BYTES,BUNDLE_MAGIC};
+    fn zero_bundle()->Vec<u8>{
+        let mut bytes=vec![0u8;BUNDLE_HEADER_BYTES+rustos_release_verifier::ENVELOPE_BYTES+2];
+        bytes[..8].copy_from_slice(&BUNDLE_MAGIC);
+        bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
+        bytes[12..16].copy_from_slice(&1u32.to_le_bytes());
+        bytes
+    }
     #[test]
-    fn the_sealed_empty_ring_refuses_every_release_before_any_rootd_call(){
-        let envelope=[0u8;rustos_release_verifier::ENVELOPE_BYTES];
+    fn a_non_bundle_is_refused_before_any_rootd_call(){
         assert!(matches!(
-            verify_and_stage_sealed(&envelope,&[1],&[1],3,0,1,1),
-            Err(AdmissionError::Image(_))
+            stage_release_bundle(&[],3,0,1,1),
+            Err(AdmissionError::Image(_))|Err(AdmissionError::Invalid)
         ));
     }
     #[test]
-    fn zero_deadline_and_forged_digest_never_stage(){
-        let ring=KeyRing::new(&[]).unwrap();
-        assert_eq!(admit(&ring,&[],&[],&[],3,0),
-            Err(AdmissionError::Image(rustos_release_verifier::Error::Length)));
+    fn an_unsigned_well_formed_bundle_never_stages(){
+        assert!(matches!(
+            stage_release_bundle(&zero_bundle(),3,0,1,1),
+            Err(AdmissionError::Image(_))
+        ));
     }
 }

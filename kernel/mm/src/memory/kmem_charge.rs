@@ -278,8 +278,11 @@ pub fn uncharge(class: Class, index: usize, bytes: u64) {
     let mut cursor = index;
     for _ in 0..MAX_DEPTH {
         let Some(cell) = group(class, cursor) else { return };
-        let previous = cell.usage.fetch_sub(bytes, Ordering::Relaxed);
-        assert!(previous >= bytes, "kmem charge group usage underflow");
+        // Checked update: an over-refund leaves the counter intact, never wrapped.
+        let updated = cell.usage.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |usage| {
+            usage.checked_sub(bytes)
+        });
+        assert!(updated.is_ok(), "kmem charge group usage underflow");
         let parent = cell.parent.load(Ordering::Relaxed);
         if parent == NO_PARENT {
             return;

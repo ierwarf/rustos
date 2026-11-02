@@ -66,6 +66,9 @@ const MAX_WAYLAND_BUFFER_PIXELS: usize = MAX_WAYLAND_SHM_POOL_BYTES / 4;
 const MAX_WAYLAND_CLIENT_ACCEPTS_PER_TICK: usize = 8;
 const MAX_WAYLAND_CLIENT_DISPATCHES_PER_TICK: usize = 1;
 const MAX_WAYLAND_SURFACES: usize = 64;
+const MAX_WAYLAND_CLIENTS: usize = 64;
+const MAX_WAYLAND_OUTSTANDING_CONFIGURES: usize = 16;
+const MAX_WAYLAND_TITLE_BYTES: usize = 256;
 const MAX_WAYLAND_OUTPUT_RESOURCES: usize = 64;
 const MAX_WAYLAND_POINTER_RESOURCES: usize = 64;
 const MAX_WAYLAND_KEYBOARD_RESOURCES: usize = 64;
@@ -319,6 +322,13 @@ impl WaylandCompositor {
             match self.acceptor.try_recv() {
                 Ok(stream) => {
                     accepted = accepted.saturating_add(1);
+                    if self.clients.len() >= MAX_WAYLAND_CLIENTS {
+                        // Each client pins a descriptor and protocol state;
+                        // shed the newcomer instead of exhausting the table
+                        // that input, GPU and service IPC also draw from.
+                        diag_line("uiserver: wayland client limit reached; connection closed");
+                        continue;
+                    }
                     match self
                         .display
                         .handle()
@@ -1326,6 +1336,10 @@ impl WaylandState {
         if let Ok(mut state) = surface.lock() {
             state.configured_serial = serial;
             state.acknowledged_serial = 0;
+            if state.outstanding_configures.len() >= MAX_WAYLAND_OUTSTANDING_CONFIGURES {
+                state.outstanding_configures.remove(0);
+            }
+            state.outstanding_configures.push(serial);
             state.needs_initial_configure = false;
         }
     }
@@ -1940,6 +1954,11 @@ struct WaylandSurfaceState {
     needs_initial_configure: bool,
     configured_serial: u32,
     acknowledged_serial: u32,
+    /// Recently sent, not yet superseded configure serials. A client may
+    /// legitimately acknowledge any of them (it can ack an earlier configure
+    /// after a later one is already on the wire); only unknown serials are a
+    /// protocol error.
+    outstanding_configures: Vec<u32>,
     on_output: bool,
     alive: bool,
 }
@@ -1972,6 +1991,9 @@ struct ShmPoolData {
 struct WaylandShmPoolState {
     mapping: SharedFdMapping,
     len: usize,
+    /// Retained so `wl_shm_pool.resize` can grow the mapping; the protocol
+    /// lets a client enlarge a pool and clients (GTK, Chromium, Firefox) do.
+    fd: OwnedFd,
 }
 
 #[derive(Default)]
@@ -2465,7 +2487,7 @@ impl Dispatch<wl_shm::WlShm, ()> for WaylandState {
             data_init.init(
                 id,
                 ShmPoolData {
-                    shared: Arc::new(Mutex::new(WaylandShmPoolState { mapping, len: size })),
+                    shared: Arc::new(Mutex::new(WaylandShmPoolState { mapping, len: size, fd })),
                 },
             );
         }
@@ -2604,12 +2626,25 @@ impl Dispatch<wl_shm_pool::WlShmPool, ShmPoolData> for WaylandState {
                 }
                 let resize_result = {
                     if let Ok(mut pool) = data.shared.lock() {
-                        if size > MAX_WAYLAND_SHM_POOL_BYTES || size > pool.mapping.len_bytes() {
+                        if size > MAX_WAYLAND_SHM_POOL_BYTES {
                             Err(format!(
-                                "wl_shm_pool.resize: size {} exceeds mapped safety limit {}",
-                                size,
-                                pool.mapping.len_bytes().min(MAX_WAYLAND_SHM_POOL_BYTES)
+                                "wl_shm_pool.resize: size {} exceeds safety limit {}",
+                                size, MAX_WAYLAND_SHM_POOL_BYTES
                             ))
+                        } else if size > pool.mapping.len_bytes() {
+                            // Growth: map the larger extent before dropping
+                            // the old one; buffers observe the swap only
+                            // under this lock.
+                            match map_shared_fd_readable(pool.fd.as_raw_fd(), size) {
+                                Ok(mapping) => {
+                                    pool.mapping = mapping;
+                                    pool.len = size;
+                                    Ok(())
+                                }
+                                Err(_) => Err(format!(
+                                    "wl_shm_pool.resize: failed to map fd for size={size}"
+                                )),
+                            }
                         } else {
                             pool.len = size;
                             Ok(())
@@ -2764,9 +2799,7 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for WaylandState {
                             Ok(surface)
                                 if surface.toplevel.is_some()
                                     && surface.current_buffer.is_none()
-                                    && (surface.configured_serial == 0
-                                        || surface.acknowledged_serial
-                                            != surface.configured_serial) =>
+                                    && surface.acknowledged_serial == 0 =>
                             {
                                 Err(
                                     "wl_surface.commit: xdg surface buffer committed before configure ack"
@@ -3108,11 +3141,19 @@ impl Dispatch<xdg_surface::XdgSurface, SurfaceData> for WaylandState {
             xdg_surface::Request::AckConfigure { serial } => {
                 let ack_result = {
                     if let Ok(mut surface) = data.shared.lock() {
-                        if surface.configured_serial == 0 || serial != surface.configured_serial {
-                            Err("xdg_surface.ack_configure: unknown configure serial".into())
-                        } else {
-                            surface.acknowledged_serial = serial;
-                            Ok(())
+                        match surface
+                            .outstanding_configures
+                            .iter()
+                            .position(|sent| *sent == serial)
+                        {
+                            Some(index) if serial != 0 => {
+                                surface.acknowledged_serial = serial;
+                                // Older configures are superseded by this ack.
+                                surface.outstanding_configures.drain(..=index);
+                                Ok(())
+                            }
+                            _ if serial != 0 && serial == surface.acknowledged_serial => Ok(()),
+                            _ => Err("xdg_surface.ack_configure: unknown configure serial".into()),
                         }
                     } else {
                         Err("xdg_surface.ack_configure: surface unavailable".into())
@@ -3148,6 +3189,14 @@ impl Dispatch<xdg_toplevel::XdgToplevel, SurfaceData> for WaylandState {
     ) {
         match request {
             xdg_toplevel::Request::SetTitle { title } => {
+                let mut title = title;
+                if title.len() > MAX_WAYLAND_TITLE_BYTES {
+                    let mut end = MAX_WAYLAND_TITLE_BYTES;
+                    while !title.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    title.truncate(end);
+                }
                 if let Ok(mut surface) = data.shared.lock() {
                     surface.title = title;
                 }

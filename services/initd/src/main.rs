@@ -86,6 +86,9 @@ const ROOTD_LEASE_RECONCILIATION_INTERVAL: Duration = Duration::from_millis(100)
 const ROOTD_LEASE_RECOVERY_TIMEOUT: Duration =
     Duration::from_millis(IPC_WAIT_SERVICE_ENDPOINT_MAX_TIMEOUT_MS);
 const INITD_LAUNCH_MAX_FAILURES: u32 = 32;
+/// Uptime after which a replacement counts as sustained health and the next
+/// exit starts a fresh failure budget.
+const INITD_LAUNCH_HEALTHY_RESET: Duration = Duration::from_secs(60);
 const ROOTD_LEASE_REPORT_MAX_ATTEMPTS: u32 = 16;
 const DEFAULT_INIT_TASK_WEIGHT_MICROS: u64 = 1_000;
 const EARLY_POLICY_TASK_WEIGHT_MICROS: u64 = 4_000;
@@ -124,16 +127,30 @@ struct RunningService {
 struct RetryState {
     next_attempt: Instant,
     failures: u32,
+    /// Start of the replacement currently being supervised; consumed by the
+    /// next failure so a launch error that never ran cannot claim its uptime.
+    spawned_at: Option<Instant>,
 }
 
 impl RetryState {
     fn note_spawned(&mut self, now: Instant) {
         // Creation/endpoint publication is not evidence of sustained health.
-        // Keep the supervisor-lifetime failure budget across replacements.
+        // The failure budget survives replacements and is only forgiven by a
+        // replacement that then stays up for `INITD_LAUNCH_HEALTHY_RESET`.
         self.next_attempt = now;
+        self.spawned_at = Some(now);
     }
 
     fn note_failure(&mut self, now: Instant) -> bool {
+        if let Some(spawned_at) = self.spawned_at.take() {
+            // Crash-loop exhaustion must mean consecutive short-lived
+            // incarnations. A service that ran healthily for this long and
+            // then died starts a new budget instead of consuming one that
+            // accumulated over the whole uptime of initd.
+            if now.saturating_duration_since(spawned_at) >= INITD_LAUNCH_HEALTHY_RESET {
+                self.failures = 0;
+            }
+        }
         self.failures = self.failures.saturating_add(1);
         self.next_attempt = now + RETRY_BACKOFF;
         self.failures >= INITD_LAUNCH_MAX_FAILURES
@@ -977,6 +994,7 @@ fn record_launch_failure(
         .or_insert_with(|| RetryState {
             next_attempt: Instant::now(),
             failures: 0,
+            spawned_at: None,
         });
     if state.note_failure(Instant::now()) {
         fail_closed(&format!(
@@ -1091,6 +1109,10 @@ fn spawn_exec_via_loaderd(exec_path: &str, env: &[CString]) -> Result<i32, i32> 
         return Err(response.status);
     }
     let pid = i32::try_from(response.pid).map_err(|_| libc::EOVERFLOW)?;
+    if pid <= 0 {
+        // A zero pid would become a supervisor key and a tgkill(0, 0) target.
+        return Err(libc::EPROTO);
+    }
     boot_line(&format!(
         "initd: loader spawn returned exec={exec_path} pid={pid}"
     ));
@@ -1170,9 +1192,10 @@ fn lookup_loader_endpoint() -> Result<u64, i32> {
         return Err((-endpoint) as i32);
     }
     let endpoint = endpoint as u64;
-    if endpoint != 0 {
-        LOADER_ENDPOINT_CACHE.store(endpoint, Ordering::Relaxed);
+    if endpoint == 0 {
+        return Err(libc::ENOENT);
     }
+    LOADER_ENDPOINT_CACHE.store(endpoint, Ordering::Relaxed);
     Ok(endpoint)
 }
 

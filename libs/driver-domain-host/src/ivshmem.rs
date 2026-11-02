@@ -219,74 +219,15 @@ fn accept_ready_peers(
                     drop(stream);
                     continue;
                 };
-                if !peer_is_launch_owner(&stream)? {
-                    drop(stream);
-                    continue;
-                }
-                stream
-                    .set_nonblocking(true)
-                    .context("make ivshmem client socket nonblocking")?;
-                let id = i64::try_from(id_index).expect("two peers fit ivshmem ID");
-                let replacing = peers[id_index].is_some();
-                if !replacing {
-                    peers[id_index] = Some(Peer {
-                        id,
-                        stream: None,
-                        receive_events: (0..vector_count)
-                            .map(|_| create_eventfd())
-                            .collect::<Result<Vec<_>>>()?,
-                    });
-                }
-                send_i64_with_fd(stream.as_raw_fd(), IVSHMEM_PROTOCOL_VERSION, None)?;
-                send_i64_with_fd(stream.as_raw_fd(), id, None)?;
-                send_i64_with_fd(
-                    stream.as_raw_fd(),
-                    IVSHMEM_SHARED_MEMORY_MESSAGE,
-                    Some(shared_memory.as_raw_fd()),
-                )?;
-                for existing in peers
-                    .iter()
-                    .enumerate()
-                    .filter(|(index, _)| *index != id_index)
-                    .filter_map(|(_, peer)| peer.as_ref())
-                {
-                    for receive_event in &existing.receive_events {
-                        send_i64_with_fd(
-                            stream.as_raw_fd(),
-                            existing.id,
-                            Some(receive_event.as_raw_fd()),
-                        )?;
+                // A client that dies or misbehaves during its own handshake
+                // must cost only that connection. Propagating the error would
+                // terminate the broker thread and make every later QEMU
+                // replacement (and its doorbell rebind) impossible.
+                if admit_peer(stream, id_index, shared_memory, peers, vector_count).is_err() {
+                    if let Some(peer) = peers[id_index].as_mut() {
+                        peer.stream = None;
                     }
                 }
-                let receive_events = &peers[id_index]
-                    .as_ref()
-                    .expect("fixed ivshmem peer slot initialized")
-                    .receive_events;
-                for receive_event in receive_events {
-                    send_i64_with_fd(stream.as_raw_fd(), id, Some(receive_event.as_raw_fd()))?;
-                }
-
-                if !replacing {
-                    for existing in peers
-                        .iter()
-                        .enumerate()
-                        .filter(|(index, _)| *index != id_index)
-                        .filter_map(|(_, peer)| peer.as_ref())
-                        .filter_map(|peer| peer.stream.as_ref())
-                    {
-                        for receive_event in receive_events {
-                            send_i64_with_fd(
-                                existing.as_raw_fd(),
-                                id,
-                                Some(receive_event.as_raw_fd()),
-                            )?;
-                        }
-                    }
-                }
-                peers[id_index]
-                    .as_mut()
-                    .expect("fixed ivshmem peer slot initialized")
-                    .stream = Some(stream);
                 peer_count.store(
                     peers
                         .iter()
@@ -297,9 +238,97 @@ fn accept_ready_peers(
                 );
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+            // The pending connection vanished or the call was interrupted
+            // before accept returned it; neither is a broker failure.
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::ConnectionAborted
+                        | io::ErrorKind::ConnectionReset
+                        | io::ErrorKind::Interrupted
+                ) => {}
             Err(error) => return Err(error).context("accept ivshmem doorbell client"),
         }
     }
+}
+
+fn admit_peer(
+    stream: UnixStream,
+    id_index: usize,
+    shared_memory: &File,
+    peers: &mut [Option<Peer>],
+    vector_count: usize,
+) -> Result<()> {
+    if !peer_is_launch_owner(&stream)? {
+        return Ok(());
+    }
+    stream
+        .set_nonblocking(true)
+        .context("make ivshmem client socket nonblocking")?;
+    let id = i64::try_from(id_index).context("two peers fit ivshmem ID")?;
+    let replacing = peers[id_index].is_some();
+    if !replacing {
+        peers[id_index] = Some(Peer {
+            id,
+            stream: None,
+            receive_events: (0..vector_count)
+                .map(|_| create_eventfd())
+                .collect::<Result<Vec<_>>>()?,
+        });
+    }
+    send_i64_with_fd(stream.as_raw_fd(), IVSHMEM_PROTOCOL_VERSION, None)?;
+    send_i64_with_fd(stream.as_raw_fd(), id, None)?;
+    send_i64_with_fd(
+        stream.as_raw_fd(),
+        IVSHMEM_SHARED_MEMORY_MESSAGE,
+        Some(shared_memory.as_raw_fd()),
+    )?;
+    for existing in peers
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index != id_index)
+        .filter_map(|(_, peer)| peer.as_ref())
+    {
+        for receive_event in &existing.receive_events {
+            send_i64_with_fd(
+                stream.as_raw_fd(),
+                existing.id,
+                Some(receive_event.as_raw_fd()),
+            )?;
+        }
+    }
+    let receive_events = &peers[id_index]
+        .as_ref()
+        .context("fixed ivshmem peer slot initialized")?
+        .receive_events;
+    for receive_event in receive_events {
+        send_i64_with_fd(stream.as_raw_fd(), id, Some(receive_event.as_raw_fd()))?;
+    }
+
+    if !replacing {
+        for existing in peers
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != id_index)
+            .filter_map(|(_, peer)| peer.as_ref())
+            .filter_map(|peer| peer.stream.as_ref())
+        {
+            for receive_event in receive_events {
+                // The surviving peer's socket failing is its own liveness
+                // problem (reaped next pass), not this client's handshake.
+                let _ = send_i64_with_fd(
+                    existing.as_raw_fd(),
+                    id,
+                    Some(receive_event.as_raw_fd()),
+                );
+            }
+        }
+    }
+    peers[id_index]
+        .as_mut()
+        .context("fixed ivshmem peer slot initialized")?
+        .stream = Some(stream);
+    Ok(())
 }
 
 fn reap_disconnected_peers(peers: &mut [Option<Peer>], peer_count: &AtomicUsize) -> Result<()> {
@@ -335,8 +364,10 @@ fn reap_disconnected_peers(peers: &mut [Option<Peer>], peer_count: &AtomicUsize)
             ) {
                 true
             } else {
-                return Err(error)
-                    .with_context(|| format!("ivshmem peer {} lifecycle socket failed", peer.id));
+                // Any other socket failure leaves the lifecycle channel
+                // unusable; treat the peer as gone instead of killing the
+                // broker for the surviving peer.
+                true
             }
         } else {
             false
@@ -512,17 +543,26 @@ impl IvshmemInputProducer {
     /// a bounded ring record with release ordering.
     pub fn notify_rustos(&self) -> Result<()> {
         let value = 1_u64.to_ne_bytes();
-        let written = unsafe {
-            libc::write(
-                self.rustos_event.as_raw_fd(),
-                value.as_ptr().cast::<libc::c_void>(),
-                value.len(),
-            )
-        };
-        if written == value.len() as isize {
-            return Ok(());
+        loop {
+            let written = unsafe {
+                libc::write(
+                    self.rustos_event.as_raw_fd(),
+                    value.as_ptr().cast::<libc::c_void>(),
+                    value.len(),
+                )
+            };
+            if written == value.len() as isize {
+                return Ok(());
+            }
+            let error = io::Error::last_os_error();
+            match error.kind() {
+                io::ErrorKind::Interrupted => continue,
+                // A nonblocking eventfd only refuses at counter saturation,
+                // which means a wake is already pending for the consumer.
+                io::ErrorKind::WouldBlock => return Ok(()),
+                _ => return Err(error).context("ring fixed RustOS input eventfd"),
+            }
         }
-        Err(io::Error::last_os_error()).context("ring fixed RustOS input eventfd")
     }
 }
 
@@ -542,30 +582,61 @@ fn recv_i64_with_fd(fd: RawFd) -> Result<(i64, Option<OwnedFd>)> {
         msg_controllen: control.0.len(),
         msg_flags: 0,
     };
-    let received = unsafe { libc::recvmsg(fd, &mut message, libc::MSG_CMSG_CLOEXEC) };
-    if received != bytes.len() as isize || message.msg_flags & libc::MSG_CTRUNC != 0 {
+    let received = loop {
+        let received = unsafe { libc::recvmsg(fd, &mut message, libc::MSG_CMSG_CLOEXEC) };
+        if received >= 0 || io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+            break received;
+        }
+        message.msg_flags = 0;
+        message.msg_controllen = control.0.len();
+    };
+    if received < 0 {
         return Err(io::Error::last_os_error()).context("receive fixed ivshmem broker record");
     }
-    let mut attached = None;
+    // Take ownership of every received descriptor before judging the message:
+    // the kernel has already installed them, so any early return below must
+    // close them rather than leak them.
+    let mut descriptors: Vec<OwnedFd> = Vec::new();
+    let mut malformed = false;
     let mut header = unsafe { libc::CMSG_FIRSTHDR(&message) };
     while !header.is_null() {
         let is_fd = unsafe {
             (*header).cmsg_level == libc::SOL_SOCKET && (*header).cmsg_type == libc::SCM_RIGHTS
         };
         if is_fd {
-            let expected = unsafe { libc::CMSG_LEN(size_of::<RawFd>() as _) as usize };
-            if unsafe { (*header).cmsg_len as usize } != expected || attached.is_some() {
-                bail!("invalid fixed ivshmem SCM_RIGHTS record");
+            let data_bytes = unsafe { (*header).cmsg_len as usize }
+                .saturating_sub(unsafe { libc::CMSG_LEN(0) as usize });
+            let count = data_bytes / size_of::<RawFd>();
+            let data = unsafe { libc::CMSG_DATA(header) };
+            for index in 0..count {
+                let raw_fd = unsafe {
+                    std::ptr::read_unaligned(data.add(index * size_of::<RawFd>()).cast::<RawFd>())
+                };
+                if raw_fd < 0 {
+                    malformed = true;
+                } else {
+                    descriptors.push(unsafe { OwnedFd::from_raw_fd(raw_fd) });
+                }
             }
-            let raw_fd =
-                unsafe { std::ptr::read_unaligned(libc::CMSG_DATA(header).cast::<RawFd>()) };
-            if raw_fd < 0 {
-                bail!("ivshmem broker returned an invalid file descriptor");
+            if data_bytes != size_of::<RawFd>() {
+                malformed = true;
             }
-            attached = Some(unsafe { OwnedFd::from_raw_fd(raw_fd) });
         }
         header = unsafe { libc::CMSG_NXTHDR(&message, header) };
     }
+    if message.msg_flags & libc::MSG_CTRUNC != 0 {
+        bail!("ivshmem broker control message was truncated");
+    }
+    if received as usize != bytes.len() {
+        bail!(
+            "ivshmem broker record was {received} bytes, expected {}",
+            bytes.len()
+        );
+    }
+    if malformed || descriptors.len() > 1 {
+        bail!("invalid fixed ivshmem SCM_RIGHTS record");
+    }
+    let attached = descriptors.pop();
     Ok((i64::from_le_bytes(bytes), attached))
 }
 

@@ -25,6 +25,9 @@ const IDLE_WATCH_WAIT: Duration = Duration::from_millis(RUNTIME_WATCH_MAX_WAIT_M
 const LAUNCH_SETTLE_DELAY: Duration = Duration::from_millis(40);
 const LAUNCH_START_TIMEOUT: Duration = Duration::from_secs(20);
 const RETRY_BACKOFF: Duration = Duration::from_millis(200);
+/// Launch requests per once-only app before sessiond stops asking. A request
+/// that was accepted but never produced a running program is not a launch.
+const MAX_LAUNCH_ATTEMPTS: u32 = 3;
 
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 struct LaunchEntry {
@@ -37,7 +40,13 @@ struct LaunchEntry {
 #[derive(Clone, Debug)]
 struct PendingLaunch {
     desktop_file_id: String,
+    package_id: String,
+    restart: bool,
     requested_at: Instant,
+    /// The program was observed running at least once. If it then vanishes
+    /// before settling it exited early; waiting out the launch timeout would
+    /// only delay the retry by 20 s.
+    seen_running: bool,
 }
 
 fn main() {
@@ -64,9 +73,15 @@ fn main() {
         "loaded {} desktop/session entries",
         launch_entries.len()
     );
+    // Packages that were observed running and settled; dependency authority.
     let mut launched_once_packages = BTreeSet::new();
+    let mut launch_attempts = BTreeMap::<String, u32>::new();
+    let mut abandoned_packages = BTreeSet::<String>::new();
     let mut pending_launch = None::<PendingLaunch>;
     let mut retry_after = BTreeMap::<String, Instant>::new();
+    // Consecutive early exits per desktop id; widens the retry delay so a
+    // crash-looping `restart` service is not relaunched every 200 ms.
+    let mut early_exits = BTreeMap::<String, u32>::new();
     let mut observed_digest = RUNNING_PROGRAMS_DIGEST_UNKNOWN;
 
     loop {
@@ -85,7 +100,13 @@ fn main() {
                     "snapshot running failed: errno={}",
                     err
                 );
-                thread::sleep(POLL_INTERVAL);
+                // A failing runtime channel must not turn into an 8 ms
+                // error-log spin; only a pending launch needs the tight cadence.
+                thread::sleep(if pending_launch.is_some() {
+                    POLL_INTERVAL
+                } else {
+                    RETRY_BACKOFF
+                });
                 continue;
             }
         };
@@ -104,8 +125,9 @@ fn main() {
             })
             .collect::<BTreeSet<_>>();
 
-        if let Some(pending) = pending_launch.as_ref() {
+        if let Some(pending) = pending_launch.as_mut() {
             if running_desktop_ids.contains(pending.desktop_file_id.as_str()) {
+                pending.seen_running = true;
                 retry_after.remove(pending.desktop_file_id.as_str());
                 if pending.requested_at.elapsed() >= LAUNCH_SETTLE_DELAY {
                     observability_client::info!(
@@ -114,27 +136,65 @@ fn main() {
                         "launch settled for {}",
                         pending.desktop_file_id
                     );
+                    if !pending.restart {
+                        launched_once_packages.insert(pending.package_id.clone());
+                    }
+                    launch_attempts.remove(pending.package_id.as_str());
+                    early_exits.remove(pending.desktop_file_id.as_str());
                     pending_launch = None;
                 }
                 thread::sleep(POLL_INTERVAL);
                 continue;
             }
 
-            if pending.requested_at.elapsed() < LAUNCH_START_TIMEOUT {
+            let exited_early = pending.seen_running;
+            if !exited_early && pending.requested_at.elapsed() < LAUNCH_START_TIMEOUT {
                 thread::sleep(POLL_INTERVAL);
                 continue;
             }
 
-            observability_client::warn!(
-                "sessiond",
-                service,
-                "launch timed out waiting for {}",
-                pending.desktop_file_id
-            );
+            if exited_early {
+                observability_client::warn!(
+                    "sessiond",
+                    service,
+                    "{} exited before its launch settled",
+                    pending.desktop_file_id
+                );
+            } else {
+                observability_client::warn!(
+                    "sessiond",
+                    service,
+                    "launch timed out waiting for {}",
+                    pending.desktop_file_id
+                );
+            }
+            let retry_delay = if exited_early {
+                let exits = early_exits.entry(pending.desktop_file_id.clone()).or_insert(0);
+                *exits = exits.saturating_add(1);
+                RETRY_BACKOFF * (1_u32 << (*exits - 1).min(6))
+            } else {
+                RETRY_BACKOFF
+            };
             retry_after.insert(
                 pending.desktop_file_id.clone(),
-                Instant::now() + RETRY_BACKOFF,
+                Instant::now() + retry_delay,
             );
+            if !pending.restart
+                && launch_attempts
+                    .get(pending.package_id.as_str())
+                    .is_some_and(|attempts| *attempts >= MAX_LAUNCH_ATTEMPTS)
+            {
+                // Dependents must not treat a program that never ran as
+                // launched, so this is not recorded in `launched_once_packages`.
+                observability_client::error!(
+                    "sessiond",
+                    service,
+                    "giving up on {} after {} launch attempts",
+                    pending.desktop_file_id,
+                    MAX_LAUNCH_ATTEMPTS
+                );
+                abandoned_packages.insert(pending.package_id.clone());
+            }
             pending_launch = None;
         }
 
@@ -162,7 +222,9 @@ fn main() {
                     "ensuring desktop service {}",
                     entry.desktop_file_id
                 );
-            } else if launched_once_packages.contains(entry.package_id.as_str()) {
+            } else if launched_once_packages.contains(entry.package_id.as_str())
+                || abandoned_packages.contains(entry.package_id.as_str())
+            {
                 continue;
             } else {
                 observability_client::info!(
@@ -176,7 +238,7 @@ fn main() {
             match runtime.request_launch_program_new_session(entry.desktop_file_id.as_str()) {
                 Ok(()) => {
                     if !entry.restart {
-                        launched_once_packages.insert(entry.package_id.clone());
+                        *launch_attempts.entry(entry.package_id.clone()).or_insert(0) += 1;
                     }
                     retry_after.remove(entry.desktop_file_id.as_str());
                     observability_client::info!(
@@ -187,7 +249,10 @@ fn main() {
                     );
                     pending_launch = Some(PendingLaunch {
                         desktop_file_id: entry.desktop_file_id.clone(),
+                        package_id: entry.package_id.clone(),
+                        restart: entry.restart,
                         requested_at: Instant::now(),
+                        seen_running: false,
                     });
                     break;
                 }

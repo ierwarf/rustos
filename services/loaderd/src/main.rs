@@ -997,6 +997,22 @@ fn stage_release_file(
             read_exact_at(fd, done as u64, &mut bytes[done..done + chunk])?;
             done += chunk;
         }
+        // The container has no trailing bytes: a snapshot longer than its
+        // header declares is a different object than the one that was signed.
+        let mut probe = [0_u8; 1];
+        let extra = syscall4(
+            SYS_PREAD64,
+            fd as u64,
+            probe.as_mut_ptr() as u64,
+            1,
+            total as u64,
+        );
+        if extra < 0 {
+            return Err((-extra) as i32);
+        }
+        if extra != 0 {
+            return Err(EINVAL);
+        }
         Ok(bytes)
     })();
     let _ = syscall1(SYS_CLOSE, fd as u64);

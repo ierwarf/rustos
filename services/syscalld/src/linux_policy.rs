@@ -48,6 +48,7 @@ const GETRANDOM_FLAG_INSECURE: u64 = 0x0004;
 const PAGE_SIZE: u64 = 4096;
 const MAP_FIXED: u64 = 0x10;
 const MAP_ANONYMOUS: u64 = 0x20;
+const MAP_FIXED_NOREPLACE: u64 = 0x10_0000;
 const MAP_DENYWRITE: u64 = 0x0800;
 const MAP_EXECUTABLE: u64 = 0x1000;
 const PROT_READ: u64 = 0x1;
@@ -192,10 +193,21 @@ pub(crate) fn handle_prlimit64(
         .or_insert_with(|| initial_state(request));
     let old_limit = state.stack_rlimit;
     if has_new_limit {
-        state.stack_rlimit = LinuxRlimit {
+        let new_limit = LinuxRlimit {
             rlim_cur: read_u64(&request.path[..LINUX_RLIMIT_SIZE], 0),
             rlim_max: read_u64(&request.path[..LINUX_RLIMIT_SIZE], 8),
         };
+        // Linux setrlimit(2): soft above hard is EINVAL, and only a
+        // privileged caller may raise the hard limit.
+        if new_limit.rlim_cur > new_limit.rlim_max {
+            response.status = errno::EINVAL;
+            return;
+        }
+        if new_limit.rlim_max > old_limit.rlim_max && state.credentials.euid != 0 {
+            response.status = errno::EPERM;
+            return;
+        }
+        state.stack_rlimit = new_limit;
     }
     if wants_old_limit {
         copy_payload(response, &old_limit);
@@ -732,10 +744,28 @@ pub(crate) fn handle_mmap(
         return;
     }
     let fixed = flags & MAP_FIXED != 0;
-    let addr = if fixed {
+    // MAP_FIXED_NOREPLACE: the address is mandatory like MAP_FIXED, but an
+    // existing mapping in the range is an error (EEXIST), never replaced.
+    // MAP_FIXED wins when both are given, as in Linux.
+    let noreplace = !fixed && flags & MAP_FIXED_NOREPLACE != 0;
+    let addr = if fixed || noreplace {
         if requested_addr == 0 || !requested_addr.is_multiple_of(PAGE_SIZE) {
             response.status = errno::EINVAL;
             return;
+        }
+        if noreplace {
+            let overlaps = requested_addr
+                .checked_add(map_len)
+                .is_none_or(|end| {
+                    state
+                        .vmas
+                        .iter()
+                        .any(|vma| vma.end > requested_addr && vma.start < end)
+                });
+            if overlaps {
+                response.status = errno::EEXIST;
+                return;
+            }
         }
         requested_addr
     } else {

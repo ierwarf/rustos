@@ -1171,6 +1171,11 @@ fn populate_netd_request_payload(
         }
         SYSCALL_OFFLOAD_OP_LINUX_SENDTO => {
             copy_current_payload(request, request.arg1, request.arg2)?;
+            if current_inet_socket(request.arg0) {
+                // Internet sockets carry no kernel-side stream bookkeeping:
+                // netd owns the whole byte stream.
+                return Ok(());
+            }
             let socket = current_unix_socket_handle(request.arg0).ok_or(LINUX_ENOTSOCK)?;
             pending_transfers.begin_send(&socket, request.payload_len as usize)
         }
@@ -1181,14 +1186,24 @@ fn populate_netd_request_payload(
             let header = usermem::read_current_user_struct::<linux_abi::LinuxMsghdr>(request.arg1)
                 .map_err(address_space_error_to_linux_errno)?;
             let mut bytes = read_current_iovec_payload(header.msg_iov, header.msg_iovlen)?;
-            let socket = current_unix_socket_handle(request.arg0).ok_or(LINUX_ENOTSOCK)?;
-            pending_transfers.begin_send(&socket, bytes.len())?;
-            let raw_control =
-                read_current_control_bytes(header.msg_control, header.msg_controllen)?;
-            let context = send_transfer_context(&socket, pending_transfers, bytes.len())?;
-            let control = encode_transfer_control_payload(raw_control.as_slice(), context)?;
-            pending_transfers.extend(control.descriptors.as_slice());
-            pending_transfers.extend_tickets(control.tickets.as_slice());
+            let control = if current_inet_socket(request.arg0) {
+                // Ancillary data on an internet socket (IP_PKTINFO, ...) has no
+                // transport here; refuse it instead of dropping it silently.
+                if header.msg_controllen != 0 {
+                    return Err(LINUX_EOPNOTSUPP);
+                }
+                EncodedControlPayload::default()
+            } else {
+                let socket = current_unix_socket_handle(request.arg0).ok_or(LINUX_ENOTSOCK)?;
+                pending_transfers.begin_send(&socket, bytes.len())?;
+                let raw_control =
+                    read_current_control_bytes(header.msg_control, header.msg_controllen)?;
+                let context = send_transfer_context(&socket, pending_transfers, bytes.len())?;
+                let control = encode_transfer_control_payload(raw_control.as_slice(), context)?;
+                pending_transfers.extend(control.descriptors.as_slice());
+                pending_transfers.extend_tickets(control.tickets.as_slice());
+                control
+            };
             // One offload payload is a bounded buffer, but that bound belongs to
             // this transport and not to the caller's ABI. Linux `sendmsg` on a
             // stream socket never answers `EINVAL` because a buffer inside the
@@ -1233,16 +1248,29 @@ fn populate_netd_request_payload(
             let total = iovec_payload_total_len(&iovecs)?;
             request.payload_len = total as u32;
             request.arg4 = header.msg_controllen;
+            if current_inet_socket(request.arg0) {
+                return Ok(());
+            }
             let socket = current_unix_socket_handle(request.arg0).ok_or(LINUX_ENOTSOCK)?;
             pending_transfers.begin_receive(&socket)?;
             Ok(())
         }
         SYSCALL_OFFLOAD_OP_LINUX_RECVFROM => {
+            if current_inet_socket(request.arg0) {
+                return Ok(());
+            }
             let socket = current_unix_socket_handle(request.arg0).ok_or(LINUX_ENOTSOCK)?;
             pending_transfers.begin_receive(&socket)
         }
         _ => Ok(()),
     }
+}
+
+fn current_inet_socket(fd: u64) -> bool {
+    matches!(
+        current_kernel_handle(fd),
+        Some(multitask::KernelHandle::InetSocket(_))
+    )
 }
 
 fn current_unix_socket_handle(fd: u64) -> Option<multitask::SocketHandle> {
@@ -1356,13 +1384,18 @@ fn consume_netd_response_payload(
             let iovecs = read_current_iovecs_payload(header.msg_iov, header.msg_iovlen)?;
             write_current_iovec_payload(&iovecs, &response.payload[data_start..control_start])?;
             header.msg_namelen = 0;
-            let receive_context = receive_context.ok_or(LINUX_ESTALE)?;
-            let (control_written, control_flags, prepared) = write_current_control_payload(
-                header.msg_control,
-                header.msg_controllen,
-                &response.payload[control_start..end],
-                receive_context,
-            )?;
+            let (control_written, control_flags, prepared) = match receive_context {
+                Some(receive_context) => write_current_control_payload(
+                    header.msg_control,
+                    header.msg_controllen,
+                    &response.payload[control_start..end],
+                    receive_context,
+                )?,
+                // Internet sockets have no receive stream context and never
+                // carry ancillary data back.
+                None if control_len == 0 => (0, 0, None),
+                None => return Err(LINUX_ESTALE),
+            };
             header.msg_controllen = control_written as u64;
             header.msg_flags = msg_flags | control_flags;
             usermem::write_current_user_struct(request.arg1, &header)
@@ -1441,7 +1474,9 @@ fn read_current_iovecs_payload(
             .checked_mul(size_of::<linux_abi::LinuxIovec>())
             .and_then(|value| u64::try_from(value).ok())
             .ok_or(LINUX_EINVAL)?;
-        let iov = usermem::read_current_user_struct::<linux_abi::LinuxIovec>(iov_ptr + offset)
+        let iov = usermem::read_current_user_struct::<linux_abi::LinuxIovec>(
+            iov_ptr.checked_add(offset).ok_or(LINUX_EFAULT)?,
+        )
             .map_err(address_space_error_to_linux_errno)?;
         iovecs.push(iov);
     }
@@ -1507,6 +1542,7 @@ fn write_current_control_payload(
     Ok((control.len(), 0, prepared))
 }
 
+#[derive(Default)]
 struct EncodedControlPayload {
     bytes: Vec<u8>,
     descriptors: Vec<kernel_ipc_runtime::api::KernelTransferredHandle>,
@@ -1674,7 +1710,7 @@ fn decoded_transfer_control_len(control: &[u8]) -> Result<usize, i64> {
         let header = read_control_header(&control[offset..])?;
         let cmsg_len = usize::try_from(header.cmsg_len).map_err(|_| LINUX_EINVAL)?;
         if cmsg_len < core::mem::size_of::<linux_abi::LinuxCmsghdr>()
-            || offset + cmsg_len > control.len()
+            || offset.checked_add(cmsg_len).is_none_or(|end| end > control.len())
         {
             return Err(LINUX_EINVAL);
         }
@@ -1713,7 +1749,7 @@ fn drop_encoded_transfer_descriptors(control: &[u8]) -> Result<(), i64> {
         let header = read_control_header(&control[offset..])?;
         let cmsg_len = usize::try_from(header.cmsg_len).map_err(|_| LINUX_EINVAL)?;
         if cmsg_len < core::mem::size_of::<linux_abi::LinuxCmsghdr>()
-            || offset + cmsg_len > control.len()
+            || offset.checked_add(cmsg_len).is_none_or(|end| end > control.len())
         {
             return Err(LINUX_EINVAL);
         }
@@ -1749,7 +1785,7 @@ where
         let header = read_control_header(&control[offset..])?;
         let cmsg_len = usize::try_from(header.cmsg_len).map_err(|_| LINUX_EINVAL)?;
         if cmsg_len < core::mem::size_of::<linux_abi::LinuxCmsghdr>()
-            || offset + cmsg_len > control.len()
+            || offset.checked_add(cmsg_len).is_none_or(|end| end > control.len())
         {
             return Err(LINUX_EINVAL);
         }

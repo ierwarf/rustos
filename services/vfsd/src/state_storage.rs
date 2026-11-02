@@ -97,14 +97,16 @@ impl VfsState {
                     }
                 }
                 if clean_relative {
-                    let mut resolved = String::with_capacity(path.len() + 1);
-                    unsafe {
-                        let bytes = resolved.as_mut_vec();
-                        bytes.push(b'/');
-                        for byte in path.as_bytes() {
-                            bytes.push(*byte);
-                        }
+                    // The fast path must honour the same bound and NUL
+                    // rejection as `normalize_absolute_path`; it skips the
+                    // normalizer only because the path has no `.`/`..`.
+                    if path.len() + 1 > VFS_IPC_PATH_CAPACITY || path.as_bytes().iter().any(|&b| b == 0 || b == b'\\')
+                    {
+                        return Err(EINVAL);
                     }
+                    let mut resolved = String::with_capacity(path.len() + 1);
+                    resolved.push('/');
+                    resolved.push_str(path);
                     return Ok(resolved);
                 }
                 return normalize_absolute_path("/", path);
@@ -241,6 +243,7 @@ impl VfsState {
             let (requested, replay_len) = unpack_u32_pair(handle.last_result);
             if requested as usize != len
                 || replay_len as usize > len
+                || replay_len as usize > dest.len()
                 || handle.last_start > file_len
             {
                 return Err(EIO);
@@ -429,7 +432,21 @@ impl VfsStorage {
         offset: u64,
         dest: &mut [u8],
     ) -> Result<usize, i32> {
-        self.read_file_slice_into(plan.path.as_str(), plan.metadata_len, offset, dest)
+        let path = plan.path.as_str();
+        if let Some(read) = early_system::read(path, offset, dest)? {
+            return Ok(read);
+        }
+        self.invalidate_caches_if_remounted();
+        if let Some(bytes) = self.file_bytes_cache.get(path) {
+            return Ok(copy_file_cache_range(bytes, offset, dest));
+        }
+        // The sealed snapshot is itself the cache for this image. Going through
+        // `read_file_slice_into` would materialize a second whole-file copy in
+        // `file_bytes_cache` (alloc + zero-fill + copy) and evict useful
+        // entries when it overflows the cache budget.
+        self.volume()?
+            .read_file_range_into(path, offset, dest)
+            .map_err(map_fat_error)
     }
 
     /// Seals the completed image and admits it to the mount-generation cache.
@@ -609,7 +626,7 @@ impl VfsStorage {
                 len,
                 inode: path_inode(path.as_bytes()),
             };
-            self.metadata_cache.insert(path.to_string(), Ok(metadata));
+            self.insert_metadata_cache(path, Ok(metadata));
             return Ok(metadata);
         }
         let result = match self.volume()?.metadata(path) {
@@ -628,9 +645,19 @@ impl VfsStorage {
                 .as_ref()
                 .is_err_and(|errno| cacheable_metadata_errno(*errno))
         {
-            self.metadata_cache.insert(path.to_string(), result);
+            self.insert_metadata_cache(path, result);
         }
         result
+    }
+
+    /// Negative and positive answers are keyed by client-chosen paths, so the
+    /// cache must have a hard entry bound or a path-probing client could
+    /// exhaust the namespace service heap.
+    fn insert_metadata_cache(&mut self, path: &str, result: Result<Metadata, i32>) {
+        if self.metadata_cache.len() >= vfsd::METADATA_CACHE_MAX_ENTRIES {
+            self.metadata_cache.clear();
+        }
+        self.metadata_cache.insert(path.to_string(), result);
     }
 
     fn dir_entries(&mut self, path: &str) -> Result<Vec<DirEntry>, i32> {
@@ -656,6 +683,9 @@ impl VfsStorage {
         }
         let fat_entries = self.volume()?.read_dir(path).map_err(map_fat_error)?;
         let resolved: Vec<DirEntry> = fat_entries.into_iter().map(DirEntry::from_fat).collect();
+        if self.dir_entries_cache.len() >= vfsd::DIR_ENTRIES_CACHE_MAX_ENTRIES {
+            self.dir_entries_cache.clear();
+        }
         self.dir_entries_cache
             .insert(path.to_string(), resolved.clone());
         entries.extend(resolved);

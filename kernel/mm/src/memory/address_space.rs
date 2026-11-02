@@ -599,18 +599,28 @@ impl ProcessAddressSpace {
             .map_err(|_| AddressSpaceError::OutOfFrames)?;
 
         let mutation = begin_address_space_mutation(self.root_phys());
+        // Removed pages are a prefix; a failure stops the loop and the prefix is
+        // still released through the reclaim barrier before the error returns.
+        let mut removed = 0usize;
+        let mut failure = None;
         for (page_index, frame_phys) in frames.iter().copied().enumerate() {
             let virtual_address = page_addr(start, page_index)
                 .expect("validated unmap range changed while removing leaves")
                 .as_u64();
-            let unmapped = self
-                .unmap_user_page(VirtAddr::new(virtual_address))
-                .ok_or(AddressSpaceError::NotMapped)?;
-            debug_assert_eq!(unmapped.as_u64(), frame_phys);
+            match self.unmap_user_page(VirtAddr::new(virtual_address)) {
+                Some(unmapped) => {
+                    debug_assert_eq!(unmapped.as_u64(), frame_phys);
+                    removed += 1;
+                }
+                None => {
+                    failure = Some(AddressSpaceError::NotMapped);
+                    break;
+                }
+            }
         }
         let _flushed_mutation = mutation.flush_for_reclaim();
 
-        for (page_index, frame_phys) in frames.iter().copied().enumerate() {
+        for (page_index, frame_phys) in frames[..removed].iter().copied().enumerate() {
             let virtual_address = page_addr(start, page_index)
                 .expect("validated unmap range changed while releasing descriptors")
                 .as_u64();
@@ -623,32 +633,10 @@ impl ProcessAddressSpace {
             }
         }
         free_removed_frames_exact(&reusable_frames);
-        Ok(page_count)
-    }
-
-    pub fn unmap_user_pages_without_free_at(
-        &mut self,
-        start: VirtAddr,
-        page_count: usize,
-    ) -> Result<usize, AddressSpaceError> {
-        validate_user_page_range(start, page_count)?;
-        for page_index in 0..page_count {
-            let virt = page_addr(start, page_index)?;
-            let phys = self
-                .translate_user(virt)
-                .ok_or(AddressSpaceError::NotMapped)?;
-            if !phys.as_u64().is_multiple_of(PAGE_4KIB_U64) {
-                return Err(AddressSpaceError::NotMapped);
-            }
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(page_count),
         }
-
-        let _mutation = begin_address_space_mutation(self.root_phys());
-        for page_index in 0..page_count {
-            let virt = page_addr(start, page_index)?;
-            self.unmap_user_page(virt)
-                .ok_or(AddressSpaceError::NotMapped)?;
-        }
-        Ok(page_count)
     }
 
     pub fn protect_user_bytes(
