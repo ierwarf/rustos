@@ -205,6 +205,27 @@ pub(in crate::multitask) fn publish_root_spawn(
     Some(pin.expect("root process publication lost pre-visibility pin"))
 }
 
+/// Names which check refused a process publication. Every one of them reaches a
+/// `fork` as `EAGAIN` through `NoFreeTaskSlot`, so without a code a Job whose
+/// exited children have not been freed yet, a full kmem budget and a lost
+/// reservation are indistinguishable. 1 Job unavailable, 2 Job process/object
+/// limit (detail: objects in the subtree, of which already reaped), 3 handle-table
+/// budget, 4 mapping-record budget, 5 reservation lost, 6 thread-stack budget.
+/// Bounded, so a refusal storm stays cheap.
+fn publish_refused<T>(site: u64, a: u64, b: u64) -> Option<T> {
+    static RECORDED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    // ORDERING: Relaxed; a counter bounding telemetry volume.
+    if RECORDED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 32 {
+        crate::debug::record_milestone(
+            crate::debug::LogCategory::Sched,
+            "process-publish-refused",
+            (site << 56) | (a & 0xffff_ffff) << 16 | (b & 0xffff),
+            0,
+        );
+    }
+    None
+}
+
 fn publish_inner(
     reservation: SpawnReservation,
     process_id: u64,
@@ -227,13 +248,15 @@ fn publish_inner(
     // A process joins its parent's job, or the explicit job; a job being killed
     // refuses, and a refused birth leaves the reservation for the caller to
     // cancel exactly as for any other publication refusal.
-    object.job = table
-        .resolve_new_member_job(reservation.job, parent_process_id)
-        .ok()?;
+    object.job = match table.resolve_new_member_job(reservation.job, parent_process_id) {
+        Ok(job) => job,
+        Err(_) => return publish_refused(1, 0, 0),
+    };
     // The authoritative admission check: reservation could not know the job a
     // fork inherits, and counts may have moved since an explicit job was checked.
     if !table.admits_process(object.job) {
-        return None;
+        let (all, pending_free) = table.refusal_census(object.job.index());
+        return publish_refused(2, all, pending_free);
     }
     // Bill the new process's descriptor slots to its job. The object is still
     // private, so no state lock is taken, and the charge is lock-free: a
@@ -244,7 +267,7 @@ fn publish_inner(
         .handles_mut()
         .bind_kmem_group(object.job.index() as usize)
     {
-        return None;
+        return publish_refused(3, 0, 0);
     }
     // The shared-mapping bookkeeping (fork-cloned records included) is billed
     // the same way, so a Job's Vma budget refuses the publication.
@@ -253,14 +276,16 @@ fn publish_inner(
         .get_mut()
         .bind_mapping_kmem(object.job.index() as usize)
     {
-        return None;
+        return publish_refused(4, 0, 0);
     }
-    let slot = table.lookup_slot_mut(reservation.handle)?;
+    let Some(slot) = table.lookup_slot_mut(reservation.handle) else {
+        return publish_refused(5, 0, 0);
+    };
     if slot.object.is_some()
         || slot.spawn_transaction_id != Some(reservation.transaction_id)
         || slot.root_spawn != root
     {
-        return None;
+        return publish_refused(5, 1, 0);
     }
     // The first thread's stack is billed with the process; nothing after this
     // point can refuse the publication, so a charge never needs unwinding.
@@ -269,7 +294,7 @@ fn publish_inner(
         object.job.index() as usize,
         super::THREAD_KMEM_BYTES,
     ) {
-        return None;
+        return publish_refused(6, 0, 0);
     }
     object.thread_kmem = super::THREAD_KMEM_BYTES;
     // The root is quiescent until the process is visible, so binding it now

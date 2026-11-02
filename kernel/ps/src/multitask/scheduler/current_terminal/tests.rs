@@ -93,7 +93,12 @@ fn actual_current_terminal_keeps_original_mm_uid_and_funding_until_last_effect()
 #[test]
 fn actual_current_fault_preserves_first_reason_and_terminal_current_without_fresh_admission() {
     current(|slot, scope| {
+        assert!(!current_task_is_being_stopped(scope), "a live Current is not being stopped");
         assert!(matches!(fault_in(scope, 14, Some(7), 0xdead, 0xbeef), UserFaultDisposition::Retired));
+        // The owner word now says terminal. That alone is what a fault on a CPU
+        // whose Current another CPU is stopping reads, when it cannot borrow the
+        // units that stop holds: such a fault is "Retired", never "Unhandled".
+        assert!(current_task_is_being_stopped(scope));
         assert_eq!(retirement_cleanup::reason(slot), Some(TaskRetireReason::UserFault {
             vector: 14, error_code: Some(7), cr2: 0xdead, rip: 0xbeef }));
         assert!(OriginalCurrent::borrow(scope).is_some());

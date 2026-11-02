@@ -414,19 +414,16 @@ fn claim(outgoing: &CurrentReturn<'_>, candidate: Candidate, class_sequence: u64
     let cpu = outgoing.original_turn().original_current().expect("claim lost original Current").0;
     let rsp = candidate.frame.saved_rsp();
     let turn = outgoing.original_turn();
-    let success = match DispatchFrame::from_selection(turn, candidate.frame, class_sequence) {
-        FrameCapture::Ready(frame) => {
-            // Announced before the claiming CAS: a re-selected Current stays a
-            // published Current throughout, so a remote stop cannot otherwise
-            // tell this claim from an ordinary executing task.
-            turn.announce_claim(candidate.slot);
-            let claimed = frame.prepare().is_some_and(|funded| funded.claim());
-            if !claimed { turn.retract_claim(); }
-            claimed
-        }
+    // Announced before the claiming CAS: a re-selected Current stays a
+    // published Current throughout, so a remote stop cannot otherwise tell
+    // this claim from an ordinary executing task. Retracted on any refusal.
+    turn.announce_claim(candidate.slot);
+    let success = match DispatchFrame::from_selection(outgoing.original_turn(), candidate.frame, class_sequence) {
+        FrameCapture::Ready(frame) => frame.prepare().is_some_and(|funded| funded.claim()),
         FrameCapture::Invalid(reason) => { quarantine(candidate.slot, candidate.id, rsp, reason); false },
         FrameCapture::Stale => false,
     };
+    if !success { turn.retract_claim(); }
     if !success && matches!(candidate.custody, FrameCustody::Direct) {
         let _ = runqueue::materialize_direct_handoff_with_generation(candidate.slot, cpu,
             runqueue::weight::value(candidate.slot), Some(candidate.generation));

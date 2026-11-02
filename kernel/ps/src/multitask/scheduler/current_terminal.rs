@@ -84,11 +84,29 @@ pub(in crate::multitask) fn fault(
 }
 fn fault_in(scope: &DispatchPreemption<'_>, vector: u8, error_code: Option<u64>, cr2: u64, rip: u64)
     -> UserFaultDisposition {
-    let Some(current) = OriginalCurrent::borrow(scope) else { return UserFaultDisposition::Unhandled; };
+    let Some(current) = OriginalCurrent::borrow(scope) else {
+        // A user fault must never take the kernel down. The borrow fails while a
+        // remote stop of this very task holds the parked units it would borrow;
+        // the owner word then already says the task is on its way out, and the
+        // answer is the one for a task that is stopped: do not resume it.
+        return if current_task_is_being_stopped(scope) {
+            UserFaultDisposition::Retired
+        } else {
+            UserFaultDisposition::Unhandled
+        };
+    };
     if !current.context().user_mode { return UserFaultDisposition::Unhandled; }
     if current.stopped() || current.stop(TaskRetireReason::UserFault { vector, error_code, cr2, rip }) {
         UserFaultDisposition::Retired
     } else { UserFaultDisposition::Unhandled }
+}
+
+/// Whether this CPU's Current already has a terminal run owner, i.e. another CPU
+/// is (or has finished) stopping it. Reads only the CPU's published Current slot
+/// and its owner word, so it needs none of the custody a stop holds.
+fn current_task_is_being_stopped(scope: &DispatchPreemption<'_>) -> bool {
+    debug_assert!(scope.is_masked());
+    cpu_local::current_cpu_task_slot().is_some_and(|slot| runqueue::owner(slot).state.is_terminal())
 }
 
 pub(in crate::multitask) fn exit() {

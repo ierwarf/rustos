@@ -64,6 +64,7 @@ pub(super) fn milestone_output_class(name: &str) -> MilestoneOutputClass {
             || name == "linux-fork-stage"
             || name == "linux-fork-procd-refused"
             || name == "root-creation-refused"
+            || name == "process-publish-refused"
             || name == "kmem-page-table-limit-smoke"
             || name == "job-policy-current-cache-checked"
             || name.starts_with("ipc-donation-")

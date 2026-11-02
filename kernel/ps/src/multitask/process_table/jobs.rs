@@ -294,6 +294,21 @@ impl ProcessTable {
             .count() as u64
     }
 
+    /// For a refused publication: how many process objects the job's subtree
+    /// holds, and how many of those are already finished with (reaped by their
+    /// parent, waiting only for the housekeeping pass to free them).
+    pub(super) fn refusal_census(&self, job: u32) -> (u64, u64) {
+        let mut all = 0;
+        let mut pending_free = 0;
+        for object in self.slots.iter().filter_map(|slot| slot.object.as_deref()) {
+            if self.job_contains(job, object.job.index) {
+                all += 1;
+                pending_free += u64::from(object.queued_for_reap);
+            }
+        }
+        (all, pending_free)
+    }
+
     fn subtree_threads(&self, job: u32) -> u64 {
         self.slots
             .iter()
