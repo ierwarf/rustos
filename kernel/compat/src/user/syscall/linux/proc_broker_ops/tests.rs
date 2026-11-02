@@ -56,7 +56,7 @@ fn process_fork_commits_child_tid_before_runnable_publication() {
         .find("eager_private_ranges.push")
         .expect("child TID eager-private span");
     let reservation = fork
-        .find("let spawn_reservation = match reserve_spawn_after_reclaim()")
+        .find("let spawn_reservation = match reserve_spawn_after_reclaim(args.source_pid)")
         .expect("pre-clone lifecycle reservation");
     let clone = fork
         .find("clone_user_space")

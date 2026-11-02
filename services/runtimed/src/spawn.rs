@@ -701,16 +701,16 @@ fn retire_failed_spawn_or_abort(pid: i32, stage: &str) {
     }
 }
 
-pub(super) fn reap_children(state: &mut BrokerState) -> bool {
-    // A child is activated only after the loop records it in `running`, so an
-    // empty owner set proves that there is nothing this process may reap. A
-    // WNOHANG wait still performs the procd ownership IPC; under SMP service
-    // pressure that call can consume its complete five-second control budget
-    // and block catalog, launch, and UI work behind an impossible reap.
-    if state.running.is_empty() {
-        return false;
-    }
-    let mut reaped_any = false;
+/// How soon after one reap round trip the next may start. Child exits are
+/// visited at about this granularity, the same order as the idle interval the
+/// loop used to observe them at.
+const REAP_INTERVAL: Duration = Duration::from_millis(20);
+
+/// Reap every child that has already exited and report `(pid, status)` for
+/// each. Runs on the reaper thread (or inline when none could be created); it
+/// is the only place the procd ownership round trip of `wait4` happens.
+pub(super) fn collect_exited_children() -> Vec<(i32, i32)> {
+    let mut exited = Vec::new();
     loop {
         let mut status = 0_i32;
         let pid = unsafe {
@@ -723,25 +723,47 @@ pub(super) fn reap_children(state: &mut BrokerState) -> bool {
             ) as i32
         };
         if pid > 0 {
-            reaped_any = true;
-            if let Some(process) = state.running.remove(&pid) {
-                if process.session_handle != 0 {
-                    release_failed_session(state, Some(process.session_handle));
-                }
-                if process.restart {
-                    super::socket::schedule_launch_retry(
-                        state,
-                        process.desktop_file_id.as_str(),
-                        libc::ECHILD,
-                    );
-                }
-            }
+            exited.push((pid, status));
             continue;
         }
-        if pid == 0 || (pid == -1 && last_errno() == libc::ECHILD) {
-            break;
+        return exited;
+    }
+}
+
+pub(super) fn reap_children(state: &mut BrokerState) -> bool {
+    // A child is activated only after the loop records it in `running`, so an
+    // empty owner set proves that there is nothing this process may reap.
+    if state.running.is_empty() && !state.child_reaper.as_ref().is_some_and(|r| r.busy()) {
+        return false;
+    }
+    // The wait itself never runs on this loop: collect what the reaper has
+    // already found, and ask it again no more often than `REAP_INTERVAL`.
+    let exited = match state.child_reaper.as_ref() {
+        Some(reaper) => {
+            let answer = reaper.poll();
+            let due = state.reap_due.is_none_or(|due| Instant::now() >= due);
+            if due && !reaper.busy() && !state.running.is_empty() && reaper.request() {
+                state.reap_due = Some(Instant::now() + REAP_INTERVAL);
+            }
+            answer.unwrap_or_default()
         }
-        break;
+        None => collect_exited_children(),
+    };
+    let mut reaped_any = false;
+    for (pid, _status) in exited {
+        reaped_any = true;
+        if let Some(process) = state.running.remove(&pid) {
+            if process.session_handle != 0 {
+                release_failed_session(state, Some(process.session_handle));
+            }
+            if process.restart {
+                super::socket::schedule_launch_retry(
+                    state,
+                    process.desktop_file_id.as_str(),
+                    libc::ECHILD,
+                );
+            }
+        }
     }
     reaped_any
 }

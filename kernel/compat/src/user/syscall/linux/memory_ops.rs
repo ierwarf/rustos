@@ -148,9 +148,7 @@ pub(super) fn syscall_linux_sigaltstack(stack_ptr: u64, old_stack_ptr: u64) -> u
 }
 
 pub(super) fn syscall_linux_brk(addr: u64) -> u64 {
-    let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_BRK);
-    request.arg0 = addr;
-    let response = match call_syscalld(request) {
+    let response = match call_syscalld_fast_mem(SYSCALL_OFFLOAD_OP_LINUX_BRK, addr, 0, 0, 0, 0, 0) {
         Ok(response) => response,
         Err(_) if !ipc_ops::service_registered(linux_abi::IPC_SERVICE_LINUX_SYSCALLD) => {
             return bootstrap_brk(addr);
@@ -173,16 +171,15 @@ pub(super) fn syscall_linux_mmap(
     fd: u64,
     offset: u64,
 ) -> u64 {
-    let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_MMAP);
-    request.arg0 = requested_addr;
-    request.arg1 = user_len;
-    request.flags = flags;
-    request.mask = prot as u32;
-    request.dirfd = fd;
-    // Pack offset into path bytes 0..8.
-    request.path[0..8].copy_from_slice(&offset.to_le_bytes());
-    request.path_len = 8;
-    let response = match call_syscalld(request) {
+    let response = match call_syscalld_fast_mem(
+        SYSCALL_OFFLOAD_OP_LINUX_MMAP,
+        requested_addr,
+        user_len,
+        prot as u32,
+        flags,
+        fd,
+        offset,
+    ) {
         Ok(response) => response,
         Err(_) if !ipc_ops::service_registered(linux_abi::IPC_SERVICE_LINUX_SYSCALLD) => {
             return match bootstrap_mmap(requested_addr, user_len, prot, flags, fd, offset) {
@@ -192,9 +189,6 @@ pub(super) fn syscall_linux_mmap(
         }
         Err(errno) => return linux_errno(errno),
     };
-    if response.status != 0 {
-        return linux_errno(response.status.unsigned_abs() as i64);
-    }
     if response.payload_len as usize != size_of::<u64>() {
         return linux_errno(LINUX_EINVAL);
     }
@@ -204,11 +198,17 @@ pub(super) fn syscall_linux_mmap(
 }
 
 pub(super) fn syscall_linux_mprotect(start: u64, user_len: u64, prot: u64) -> u64 {
-    let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_MPROTECT);
-    request.arg0 = start;
-    request.arg1 = user_len;
-    request.mask = prot as u32;
-    match call_syscalld(request).and_then(|response| ensure_empty_syscalld_response(&response)) {
+    match call_syscalld_fast_mem(
+        SYSCALL_OFFLOAD_OP_LINUX_MPROTECT,
+        start,
+        user_len,
+        prot as u32,
+        0,
+        0,
+        0,
+    )
+    .and_then(ensure_empty_fast_response)
+    {
         Ok(()) => 0,
         Err(_) if !ipc_ops::service_registered(linux_abi::IPC_SERVICE_LINUX_SYSCALLD) => {
             match bootstrap_mprotect(start, user_len, prot) {
@@ -221,10 +221,9 @@ pub(super) fn syscall_linux_mprotect(start: u64, user_len: u64, prot: u64) -> u6
 }
 
 pub(super) fn syscall_linux_munmap(start: u64, user_len: u64) -> u64 {
-    let mut request = new_syscalld_request(SYSCALL_OFFLOAD_OP_LINUX_MUNMAP);
-    request.arg0 = start;
-    request.arg1 = user_len;
-    match call_syscalld(request).and_then(|response| ensure_empty_syscalld_response(&response)) {
+    match call_syscalld_fast_mem(SYSCALL_OFFLOAD_OP_LINUX_MUNMAP, start, user_len, 0, 0, 0, 0)
+        .and_then(ensure_empty_fast_response)
+    {
         Ok(()) => 0,
         Err(_) if !ipc_ops::service_registered(linux_abi::IPC_SERVICE_LINUX_SYSCALLD) => {
             match bootstrap_munmap(start, user_len) {

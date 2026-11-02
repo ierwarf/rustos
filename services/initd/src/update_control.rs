@@ -13,7 +13,6 @@ use rustos_user_abi::syscall::{
     COMMERCIAL_MAX_ROOTD_OP_UPDATE_ARM,
     COMMERCIAL_MAX_ROOTD_OP_UPDATE_ROLLBACK,
     COMMERCIAL_MAX_ROOTD_OP_UPDATE_SEAL,
-    COMMERCIAL_MAX_ROOTD_OP_UPDATE_INSPECT,
     IPC_SERVICE_ROOTD,SYS_RUSTOS_IPC_CALL_BOUNDED,
     COMMERCIAL_MAX_LOADERD_OP_STAGE_RELEASE,COMMERCIAL_MAX_PROTOCOL_LOADERD,
     IPC_SERVICE_LOADERD,
@@ -32,15 +31,6 @@ impl Phase{
             _=>return Err(EPROTO)
         })
     }
-}
-#[derive(Clone,Copy,Debug,Eq,PartialEq)]
-pub(super) struct Trial{
-    pub phase:Phase,
-    pub epoch:u64,
-    pub previous_pid:u64,
-    pub candidate_pid:u64,
-    pub digest:[u8;32],
-    pub deadline_ns:u64,
 }
 fn exact_subject()->Result<(u64,u64),i32>{
     let pid=unsafe{libc::syscall(libc::SYS_getpid) as i64};
@@ -89,40 +79,11 @@ fn apply(op:u16,approval:Approval,expected:Phase)->Result<Phase,i32>{
     if phase!=expected{return Err(EPROTO)}
     Ok(phase)
 }
-pub(super) fn arm(approval:Approval)->Result<(),i32>{
-    apply(COMMERCIAL_MAX_ROOTD_OP_UPDATE_ARM,approval,Phase::Armed).map(|_|())
-}
-pub(super) fn require_rollback(approval:Approval)->Result<(),i32>{
-    apply(COMMERCIAL_MAX_ROOTD_OP_UPDATE_ROLLBACK,approval,
-        Phase::RollbackRequired).map(|_|())
-}
-/// A committed three-pulse trial is necessary but insufficient. The caller
-/// must first arrange signed candidate pinning and verified previous-image
-/// release in storaged. This client does not synthesize that evidence.
-pub(super) fn seal(approval:Approval)->Result<(),i32>{
-    apply(COMMERCIAL_MAX_ROOTD_OP_UPDATE_SEAL,approval,
-        Phase::Committed).map(|_|())
-}
 /// Retire a transaction whose restored incarnation passed rootd's health
 /// quorum. The approval is rebuilt from rootd's own INSPECT snapshot.
 pub(super) fn seal_rolled_back(approval:Approval)->Result<(),i32>{
     apply(COMMERCIAL_MAX_ROOTD_OP_UPDATE_SEAL,approval,
         Phase::RolledBack).map(|_|())
-}
-pub(super) fn inspect(service:u64)->Result<Trial,i32>{
-    if service==0{return Err(EINVAL)}
-    let mut request=CommercialMaxProtocolRequest::default();
-    request.header.op=COMMERCIAL_MAX_ROOTD_OP_UPDATE_INSPECT;
-    request.arg0=service;
-    let response=transact(request)?;
-    if response.payload_len!=56{return Err(EPROTO)}
-    let prev=u64::from_le_bytes(response.payload[..8].try_into().map_err(|_|EPROTO)?);
-    let candidate=u64::from_le_bytes(response.payload[8..16].try_into().map_err(|_|EPROTO)?);
-    let digest:[u8;32]=response.payload[16..48].try_into().map_err(|_|EPROTO)?;
-    let deadline=u64::from_le_bytes(response.payload[48..56].try_into().map_err(|_|EPROTO)?);
-    Ok(Trial{phase:Phase::parse(response.value1)?,
-        epoch:response.value0,previous_pid:prev,candidate_pid:candidate,
-        digest,deadline_ns:deadline})
 }
 #[cfg(test)]
 mod tests {

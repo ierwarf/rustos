@@ -18,7 +18,8 @@
 use super::*;
 use rustos_user_abi::syscall::{
     CPU_TOPOLOGY_MAX_LOGICAL_CPUS, CPU_TOPOLOGY_OBSERVATION_ABI_VERSION,
-    LinuxSyscallOffloadFastRequest, LinuxSyscallOffloadFastResponse,
+    LinuxSyscallOffloadFastMemRequest, LinuxSyscallOffloadFastRequest,
+    LinuxSyscallOffloadFastResponse,
 };
 
 pub(crate) fn call_syscalld_raw(request: &[u8]) -> Result<Vec<u8>, i64> {
@@ -226,6 +227,53 @@ pub(super) fn syscall_linux_syscalld_id_getter(op: u16) -> u64 {
         response.payload[2],
         response.payload[3],
     ]) as u64
+}
+
+/// Address-space operations over the compact frame (see
+/// `LinuxSyscallOffloadFastMemRequest`). Returns the validated response; a
+/// non-zero status from syscalld is returned as its errno, so callers keep the
+/// same error handling as with the full request.
+pub(super) fn call_syscalld_fast_mem(
+    op: u16,
+    addr: u64,
+    len: u64,
+    prot: u32,
+    flags: u64,
+    fd: u64,
+    offset: u64,
+) -> Result<LinuxSyscallOffloadFastResponse, i64> {
+    let snapshot = multitask::current_user_snapshot().ok_or(LINUX_EINVAL)?;
+    let request = LinuxSyscallOffloadFastMemRequest {
+        version: SYSCALL_OFFLOAD_ABI_VERSION,
+        op,
+        prot,
+        pid: snapshot.process_id(),
+        tid: snapshot.thread_id(),
+        addr,
+        len,
+        flags,
+        fd,
+        offset,
+    };
+    let (received, bytes) = ipc_ops::call_linux_syscall_fast_endpoint(
+        as_bytes(&request),
+        size_of::<LinuxSyscallOffloadFastResponse>(),
+    )?;
+    if received != size_of::<LinuxSyscallOffloadFastResponse>() {
+        return Err(LINUX_EINVAL);
+    }
+    let response = read_unaligned::<LinuxSyscallOffloadFastResponse>(&bytes[..received]);
+    if response.version != SYSCALL_OFFLOAD_ABI_VERSION
+        || response.op != op
+        || response.reserved0 != 0
+        || response.payload_len as usize > response.payload.len()
+    {
+        return Err(LINUX_EINVAL);
+    }
+    if response.status != 0 {
+        return Err(response.status.unsigned_abs() as i64);
+    }
+    Ok(response)
 }
 
 fn call_syscalld_fast_id(op: u16) -> Result<LinuxSyscallOffloadFastResponse, i64> {
@@ -597,6 +645,17 @@ fn validate_syscalld_response_envelope(
         || response.reserved0 != 0
         || response.payload_len as usize > response.payload.len()
     {
+        return Err(LINUX_EINVAL);
+    }
+    Ok(())
+}
+
+/// The compact-frame counterpart of `ensure_empty_syscalld_response`: status
+/// was already checked when the response was accepted.
+pub(super) fn ensure_empty_fast_response(
+    response: LinuxSyscallOffloadFastResponse,
+) -> Result<(), i64> {
+    if response.payload_len != 0 {
         return Err(LINUX_EINVAL);
     }
     Ok(())

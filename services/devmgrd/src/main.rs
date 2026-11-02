@@ -1151,18 +1151,6 @@ fn syscall1(number: u64, arg0: u64) -> i64 {
     unsafe { libc::syscall(number as libc::c_long, arg0) as i64 }
 }
 
-fn syscall2(number: u64, arg0: u64, arg1: u64) -> i64 {
-    // SAFETY: The bridge owns its descriptor; callers retain IPC buffers until return.
-    if let Some(result) =
-        unsafe { rustos_svc_runtime::syscall::try_fast_ipc(number, [arg0, arg1, 0, 0, 0, 0]) }
-    {
-        return result;
-    }
-    // SAFETY: Both raw words are admitted by the caller-specific ABI wrapper;
-    // referenced buffers, if any, remain live through this synchronous call.
-    unsafe { libc::syscall(number as libc::c_long, arg0, arg1) as i64 }
-}
-
 fn syscall3(number: u64, arg0: u64, arg1: u64, arg2: u64) -> i64 {
     // SAFETY: The bridge owns its descriptor; callers retain IPC buffers until return.
     if let Some(result) =

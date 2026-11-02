@@ -219,11 +219,15 @@ impl SessionLedger {
         Ok(released)
     }
 
+}
+
+#[cfg(test)]
+impl SessionLedger {
+    // Observation helpers for tests; production never reads these.
     pub(crate) fn live_count(&self) -> usize {
         self.entries.len()
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;

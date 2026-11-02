@@ -1338,10 +1338,6 @@ fn syscall0(number: u64) -> i64 {
     unsafe { rustos_svc_runtime::syscall::syscall0(number) }
 }
 
-fn syscall2(number: u64, arg0: u64, arg1: u64) -> i64 {
-    unsafe { rustos_svc_runtime::syscall::syscall2(number, arg0, arg1) }
-}
-
 fn syscall4(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64) -> i64 {
     unsafe { rustos_svc_runtime::syscall::syscall4(number, arg0, arg1, arg2, arg3) }
 }

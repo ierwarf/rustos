@@ -238,7 +238,7 @@ tokens = ["fn capture(", "retirement_cleanup::reuse::begin(slot, Some(id))?", "s
 
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/stack_resources/admission.rs"
-tokens = ["fn reserve(", "resources.reclaim.is_some()", "resources.closing", "resources.mm_pin.is_some()", "cell.readers.load(Ordering::Acquire) != 0", "reservation_generation.checked_add(1)?"]
+tokens = ["fn unavailable(", "resources.reclaim.is_some()", "resources.closing", "resources.mm_pin.is_some()", "cell.readers.load(Ordering::Acquire) != 0", "fn reserve(", "unavailable(cell, resources, slot)", "reservation_generation.checked_add(1)?"]
 
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/stack_resources/reuse.rs"
@@ -2811,8 +2811,9 @@ tokens = ["fn acquire", "resources.reservation.is_some()", "count.checked_add(1)
 path = "kernel/ps/src/multitask/scheduler/stack_resources/admission.rs"
 tokens = [
     "fn matches(", "task_id: ticket.task_id", "generation: ticket.generation",
-    "fn reserve(", "resources.reservation.is_some()", "resources.context.is_some()",
+    "fn unavailable(", "resources.reservation.is_some()", "resources.context.is_some()",
     "resources.stack.is_some()", "cell.pins.load(Ordering::Acquire) != 0",
+    "fn reserve(", "unavailable(cell, resources, slot)",
     "resources.reservation_generation.checked_add(1)?", "resources.reservation = Some(Reservation",
     "fn is_current(", "self.task_id == task_id", "matches(resources, self, Phase::Reserved)",
     "fn install_context(", "context.scheduling_context.is_bound_to(self.task_id)",

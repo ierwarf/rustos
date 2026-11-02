@@ -41,8 +41,13 @@ fn record_reservation(page_count: u64) {
     let before = AVOIDED_PREPARATION_TABLES.fetch_add(cost, Ordering::Relaxed);
     let avoided = before + cost;
     // A reservation adds more than one table, so an exact-multiple gate would
-    // step over its boundary and stop reporting after the first line.
-    if before == 0 || before / 256 != avoided / 256 {
+    // step over its boundary and stop reporting after the first line. Report
+    // when the running total crosses a power of two: the stream still shows the
+    // count growing, in O(log n) lines. The previous gate (every 256 tables)
+    // fired about once per 85 four-kilobyte mappings, and each line is a
+    // synchronous console frame of about 3.5 ms, so a loop of small mmaps
+    // measured the console: p99 3.4 ms and a mean four times its median.
+    if before == 0 || before.ilog2() != avoided.ilog2() {
         crate::debug::record_milestone(
             crate::debug::LogCategory::Memory,
             "pager-anon-reservation",

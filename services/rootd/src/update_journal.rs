@@ -61,10 +61,6 @@ impl UpdateJournal {
         Some(Self { device, journal, owner, transaction: 0 })
     }
 
-    pub(crate) fn failed(&self) -> bool {
-        self.journal.failed()
-    }
-
     /// Open a new release transaction. Refused while another is in flight.
     pub(crate) fn begin(&mut self, service: u64, epoch: u64, digest: [u8; 32]) -> Result<(), i32> {
         let cursor = self.journal.cursor();
@@ -88,24 +84,6 @@ impl UpdateJournal {
         self.append(service, epoch, kind, digest)
     }
 
-    /// Whether `kind` would be a legal next record, without writing it.
-    pub(crate) fn admits(&self, kind: Kind) -> bool {
-        let cursor = self.journal.cursor();
-        let probe = Record {
-            sequence: cursor.last_sequence + 1,
-            transaction: cursor.active_transaction.max(1),
-            service: cursor.active_service.max(1),
-            kind,
-            generation: cursor.generation.max(1),
-            payload_hash: [1; 32],
-        };
-        cursor.admit(probe).is_ok()
-    }
-
-    pub(crate) fn records(&self) -> usize {
-        self.device.0.len()
-    }
-
     fn append(&mut self, service: u64, epoch: u64, kind: Kind, digest: [u8; 32]) -> Result<(), i32> {
         let cursor = self.journal.cursor();
         let record = Record {
@@ -127,6 +105,29 @@ impl UpdateJournal {
     }
 }
 
+#[cfg(test)]
+impl UpdateJournal {
+    // Observation helpers for tests; production never reads these.
+    pub(crate) fn failed(&self) -> bool {
+        self.journal.failed()
+    }
+    /// Whether `kind` would be a legal next record, without writing it.
+    pub(crate) fn admits(&self, kind: Kind) -> bool {
+        let cursor = self.journal.cursor();
+        let probe = Record {
+            sequence: cursor.last_sequence + 1,
+            transaction: cursor.active_transaction.max(1),
+            service: cursor.active_service.max(1),
+            kind,
+            generation: cursor.generation.max(1),
+            payload_hash: [1; 32],
+        };
+        cursor.admit(probe).is_ok()
+    }
+    pub(crate) fn records(&self) -> usize {
+        self.device.0.len()
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

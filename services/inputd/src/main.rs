@@ -1784,10 +1784,6 @@ fn syscall1(number: u64, arg0: u64) -> i64 {
     unsafe { libc::syscall(number as libc::c_long, arg0) as i64 }
 }
 
-fn syscall2(number: u64, arg0: u64, arg1: u64) -> i64 {
-    unsafe { libc::syscall(number as libc::c_long, arg0, arg1) as i64 }
-}
-
 fn last_errno() -> i32 {
     std::io::Error::last_os_error()
         .raw_os_error()

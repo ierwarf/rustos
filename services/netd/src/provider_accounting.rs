@@ -208,20 +208,6 @@ pub(super) fn flush_acks()->usize{
     }
     done
 }
-pub(super) fn recheck_ambiguous(token:u64)->Result<(),i32>{
-    let (state,_)={lock()?.pending(token).map_err(errno)?};
-    match state {
-        State::ChargeInFlight|State::ChargePrepared|
-        State::CancelInFlight|State::CancelPrepared=>cancel_unpublished(token),
-        State::ReleaseInFlight|State::ReleasePrepared=>
-            release_after_final_close(token),
-        State::Funded=>release_after_final_close(token),
-    }
-}
-pub(super) fn unsettled(mut each:impl FnMut(u64,State,Frame))->Result<(),i32>{
-    lock()?.unresolved(|token,state,frame|each(token,state,frame));
-    Ok(())
-}
 #[cfg(test)]
 mod tests{
     use super::*;

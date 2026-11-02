@@ -275,24 +275,13 @@ use the full pool, concurrent allocations cannot share live authority, and
 retired/exhausted generations cannot alias. Static disassembly is evidence of
 instruction removal, not a cycle estimate; shipping benchmarks remain required.
 
-Same-session shipping evidence for `ipc_rt_intra_process_reply_recv` (20,000
-samples, 8 CPU, `--isolate-probe`; no phase profiling):
-
-| run | min | p50 | p99 | `vmexit_cpuid` min |
-| --- | ---: | ---: | ---: | ---: |
-| control `b44fe9e8` | 14,600 | 17,680 | 314,360 | 3,640 |
-| caller-local | 14,520 | 15,440 | 109,280 | 3,640 |
-| caller-local repeat | 14,640 | 15,960 | 188,400 | 3,680 |
-
-Both successful candidate boots passed isolation with exit 0. An intervening
-candidate boot failed compositor readiness and is **not** accepted performance
-evidence. The control full 8-CPU table also timed out before `ipcbench: end`.
-The static fast branch skips the shared `lock xadd`; ordinary replies retain it.
-The minimum is effectively unchanged, and the tail remains variable: these runs
-do **not** establish the requested p50 <10,000 / p99 <20,000 targets or a stable
-tail-latency improvement. The full 1-CPU candidate recorded min 14,160 / p50
-19,920 / p99 77,640; its control anchor moved 4,200 -> 3,600, so no 1-CPU
-before/after improvement is attributed. Evidence is in `build/bench-ipc-struct/`.
+The caller-local allocation removed one shared `lock xadd` from the fast reply
+path. Its same-session A/B at the time (8 vCPU, p50 17,680 -> 15,440) is
+superseded by later lane work and is not restated; current byte-message
+round-trip figures are in the "Current state" section of
+[IPC lane](../ai/performance/ipc-lane.md#current-state-checked-against-the-tree-2026-11-02).
+An intervening candidate boot in that A/B failed compositor readiness and was
+never accepted performance evidence. Evidence is in `build/bench-ipc-struct/`.
 
 ## Caveat
 

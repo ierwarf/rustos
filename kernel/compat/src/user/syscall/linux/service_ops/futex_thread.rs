@@ -166,6 +166,20 @@ fn current_process_is_procd_policy_owner() -> bool {
     ipc_ops::current_process_has_service_capability(ServiceCapability::ProcessPolicy)
 }
 
+/// Waits up to about 100 ms for the scheduler to have a task slot to give,
+/// kicking the housekeeping pass that returns exited tasks' slots.
+fn wait_for_task_slot() -> bool {
+    const RECLAIM_WAIT_MS: usize = 100;
+    for _ in 0..=RECLAIM_WAIT_MS {
+        if multitask::task_slot_available() {
+            return true;
+        }
+        multitask::kick_housekeeping();
+        crate::arch::rtc::sleep(1);
+    }
+    false
+}
+
 // RING3-MIGRATION-REFERENCE START: scheduler-thread substrate exception: procd
 // owns Linux clone/thread admission policy. Ring0 keeps final
 // same-address-space thread spawn and register substrate.
@@ -311,6 +325,13 @@ pub fn clone_linux_thread(
         r15: frame.r15,
     };
 
+    // A thread needs a scheduler task slot, and an exited task's slot is
+    // returned by the housekeeping pass rather than by the exit itself. Wait
+    // for it briefly, as `fork` does, instead of failing a thread create that
+    // would succeed a millisecond later.
+    if !wait_for_task_slot() {
+        return linux_errno(LINUX_EAGAIN);
+    }
     let child_tid = match multitask::spawn_user_thread_suspended(bootstrap) {
         Ok(tid) => tid,
         Err(multitask::SpawnTaskError::InvalidWeightMicros) => {

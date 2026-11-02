@@ -13,7 +13,8 @@ use rustos_user_abi::syscall::{
     identity_is_exact_sender, CommercialMaxCapabilityLeaseWire,
     CommercialMaxProtocolDescriptorWire, CommercialMaxProtocolRequest,
     CommercialMaxProtocolResponse, LifecycleDrainBrokerArgs, LifecycleEventWire,
-    LinuxSyscallOffloadFastRequest, LinuxSyscallOffloadFastResponse, LinuxSyscallOffloadRequest,
+    LinuxSyscallOffloadFastMemRequest, LinuxSyscallOffloadFastRequest,
+    LinuxSyscallOffloadFastResponse, LinuxSyscallOffloadRequest,
     LinuxSyscallOffloadResponse, Win32SyscallOffloadRequest, Win32SyscallOffloadResponse,
     COMMERCIAL_MAX_PROTOCOL_ABI_VERSION, COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS,
     COMMERCIAL_MAX_PROTOCOL_SYSCALLD, COMMERCIAL_MAX_SYSCALLD_OP_CLOCK_POLICY,
@@ -291,6 +292,12 @@ fn handle_request(
             &request, sender_pid, sender_tid,
         ));
     }
+    if received == size_of::<LinuxSyscallOffloadFastMemRequest>() {
+        let request = read_unaligned::<LinuxSyscallOffloadFastMemRequest>(bytes);
+        return SyscallOffloadReply::LinuxFast(handle_fast_mem_request(
+            &request, sender_pid, sender_tid,
+        ));
+    }
     if received == size_of::<CommercialMaxProtocolRequest>() {
         let request = read_unaligned::<CommercialMaxProtocolRequest>(bytes);
         let response = handle_commercial_request(&request, sender_pid, sender_tid);
@@ -317,6 +324,34 @@ fn handle_request(
         ..LinuxSyscallOffloadResponse::default()
     };
     SyscallOffloadReply::Linux(response)
+}
+
+fn handle_fast_mem_request(
+    request: &LinuxSyscallOffloadFastMemRequest,
+    sender_pid: u64,
+    sender_tid: u64,
+) -> LinuxSyscallOffloadFastResponse {
+    let mut fast = LinuxSyscallOffloadFastResponse {
+        version: SYSCALL_OFFLOAD_ABI_VERSION,
+        op: request.op,
+        ..LinuxSyscallOffloadFastResponse::default()
+    };
+    let full_request = match fast_offload::expand_mem_request(request, sender_pid, sender_tid) {
+        Ok(request) => request,
+        Err(status) => {
+            fast.status = status;
+            return fast;
+        }
+    };
+    let mut full_response = LinuxSyscallOffloadResponse::default();
+    handle_linux_request(
+        size_of::<LinuxSyscallOffloadRequest>(),
+        &full_request,
+        &mut full_response,
+        sender_pid,
+        sender_tid,
+    );
+    fast_offload::compact_response(request.op, &full_response)
 }
 
 fn handle_fast_linux_request(

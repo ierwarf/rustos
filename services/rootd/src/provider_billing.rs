@@ -249,20 +249,6 @@ impl ProviderBilling {
         Ok(())
     }
 
-    /// On provider exit, do NOT trust stale provider IPC to trigger refund.
-    /// Rootd requires kernel-authenticated lifecycle evidence, then drains
-    /// kernel-owned outstanding tokens before any PID reuse.
-    pub(super) fn owner_exit(
-        &mut self,owner:Owner,lifecycle_verified:bool,
-        mut drain:impl FnMut(u64)->Result<(),i32>,
-    )->Result<usize,i32>{
-        if !owner.valid()||!lifecycle_verified{return Err(EACCES)}
-        drain(owner.pid)?;
-        let before=self.funded.len();
-        self.funded.retain(|e|e.provider!=owner);
-        self.owner_watermarks.retain(|(o,_)|*o!=owner);
-        Ok(before-self.funded.len())
-    }
     /// The rootd supervisor passes only a kernel-stamped lifecycle EXIT
     /// for a confirmed netd/vfsd lease. The kernel is authoritative for
     /// cleanup even when the provider's last IPC reply was lost.
@@ -282,15 +268,14 @@ impl ProviderBilling {
         self.owner_watermarks.retain(|(o,_)|o.pid!=pid);
         Ok(before-self.funded.len())
     }
-    /// Rootd must not acknowledge a provider release merely because its
-    /// local book no longer has an entry. An absent entry is ambiguous until
-    /// the kernel's own token ledger confirms terminal nonexistence.
+}
+#[cfg(test)]
+impl ProviderBilling {
+    /// Test-only views of the book; production reconciles through the kernel
+    /// ledger, never through these.
     pub(super) fn unknown_tokens_for_pid(&self,pid:u64)->usize {
         self.funded.iter().filter(|e|e.provider.pid==pid
             &&matches!(e.state,State::ChargeUnknown|State::ReleaseUnknown)).count()
-    }
-    pub(super) fn unresolved(&self,mut f:impl FnMut(Owner,Client,u64)) {
-        for x in &self.funded {f(x.provider,x.client,x.kernel_token)}
     }
     pub(super) fn count(&self)->usize{self.funded.len()}
     pub(super) fn unsettled_count(&self)->usize{

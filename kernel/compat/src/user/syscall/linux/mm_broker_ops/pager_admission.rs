@@ -210,7 +210,7 @@ static ADMISSION_PUBLISH_FAILED: AtomicU64 = AtomicU64::new(0);
 
 fn record_admission_class(counter: &AtomicU64, name: &'static str, detail: u64) {
     let count = counter.fetch_add(1, Ordering::Relaxed) + 1;
-    if count == 1 || count.is_multiple_of(64) {
+    if count.is_power_of_two() {
         nucleus_core::debug::record_milestone(
             nucleus_core::debug::LogCategory::Compat,
             name,
@@ -243,7 +243,7 @@ fn pager_vma_error_class(error: multitask::PagerVmaError) -> u64 {
 /// so preserving the cause does not turn a hot failure into an unbounded log.
 fn record_publish_failure(start: u64, error: multitask::PagerVmaError) {
     let count = ADMISSION_PUBLISH_FAILED.fetch_add(1, Ordering::Relaxed) + 1;
-    if count == 1 || count.is_multiple_of(64) {
+    if count.is_power_of_two() {
         let occurrence_and_class = count.saturating_mul(1 << 8) | pager_vma_error_class(error);
         nucleus_core::debug::record_milestone(
             nucleus_core::debug::LogCategory::Compat,

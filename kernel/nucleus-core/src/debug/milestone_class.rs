@@ -62,6 +62,8 @@ pub(super) fn milestone_output_class(name: &str) -> MilestoneOutputClass {
             || name == "linux-thread-clone-rejected"
             || name == "linux-thread-clone-stage"
             || name == "linux-fork-stage"
+            || name == "linux-fork-procd-refused"
+            || name == "root-creation-refused"
             || name == "kmem-page-table-limit-smoke"
             || name == "job-policy-current-cache-checked"
             || name.starts_with("ipc-donation-")

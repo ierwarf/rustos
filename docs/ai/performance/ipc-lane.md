@@ -6,6 +6,30 @@ with dated phase history. The current queued-only result and unresolved SMP
 measurement failures are recorded below; historical targets are not achieved
 performance guarantees.
 
+## Current state (checked against the tree 2026-11-02)
+
+Byte-message round trips, `cargo xtask bench --rustos-vcpus 4` (4 GHz host, TSC
+ticks, p50 / min): same-process split `ipc_rt_intra_process` 9,040 / 8,720;
+fused `ipc_rt_intra_process_reply_recv` 9,000 / 7,960; cross-process
+`ipc_rt_cross_process_syscalld_getuid` 16,680 / 14,840; `null_syscall_getpid`
+640; `ipc_try_recv_empty` 1,280. The register-IPC round trip was last recorded at
+4,800 p50 (P8, 1 vCPU, alu anchor 3,720) and was not re-measured on this date.
+The core path was not changed in the session that took these numbers.
+
+Which of the optimization candidates named in the phase history are in the tree:
+
+| Candidate | State | Where |
+| --- | --- | --- |
+| Direct user copy with fault fixup (instead of bind + software walk) | built, P6 | `kernel-hal` `arch/user_access.rs`, `UserAccess` in `sysops/usermem.rs` |
+| Software-schedule trap without `int` | built, P6 | `SOFTWARE_TRAP` in `interrupt_stubs.rs` |
+| Own-funded donation edges without the ledger leaf | built, P8 | `donation_ledger/lazy.rs` |
+| Direct block of register IPC, resume shortcut | built, P7 | `fast_ipc_parked_resume` |
+| Request delivery from the lane | **not built**; estimated well under 0.5k because the endpoint/reply transport is ~1.3k over four small sections | see "Not done" under P6 |
+| Reply-object removal (L1) | **not built**; about -240, touches cancel, revoke, exit and the ledger | P3 stage 3 note |
+| Lazy SIMD | **rejected** (cross-CPU FPU flush; Linux removed it) | - |
+| Fused lane switch (~40 protocol steps: owner CAS, frame publication, resident park/take, banks) | open; the only remaining lever the P8 notes name | P8 note |
+| Rendezvous cell removing reply/ledger objects | **design draft, not implemented** | [ipc-rendezvous.md](ipc-rendezvous.md) |
+
 ## Why a lane
 
 Measured 2026-10-21 (1 vCPU, isolated `ipc_rt_intra_process_reply_recv`): a
@@ -343,16 +367,18 @@ direct request take on wake 14.4k (min 14.0k).
 13.1-13.4k (min 12.5k) and 8 vCPU p50 13.6-14.4k, mean 14.6-14.8k; with P6 1 vCPU p50
 9.7-10.0k (min 9.4k, same host window) and 8 vCPU p50 9.8-10.9k, mean 10.6-11.2k,
 cross-process getuid mean 17.2-17.6k; cross-process getuid
-mean 27.8k (was 55k). The split recv/reply probe `ipc_rt_intra_process` still
-uses the generic reply path and is unchanged (p50 ~52k).
+mean 27.8k (was 55k). At the time of P6 the split recv/reply probe
+`ipc_rt_intra_process` still used the generic reply path (p50 ~52k); it measured
+~9.0k p50 on 2026-11-02 (see Current state), so that figure no longer holds.
 
-Where the 15k goes: two lane traps ~3.4k each (lane 2.4-2.5k, `int`/frame
+Where the 15k goes (P5 era; later phases removed several of these items, see P6-P8
+and the Current state table): two lane traps ~3.4k each (lane 2.4-2.5k, `int`/frame
 save/restore/iretq ~0.9k), syscall layers ~3.9k (call admission .7, endpoint
 reserve .5, arm .35, reply-side args/validate/complete 1.2, receive arm .6,
 response take .5), and ~4.6k of syscall entry/exit, user copies and user code.
-The next large steps are structural: deliver the request into the receiver's
-context from the lane instead of the endpoint round trip, build the frame
-without `int`, and lazy SIMD.
+The structural steps proposed at that time have since been settled: the frame is
+built without `int` (P6), lazy SIMD was rejected, and delivering the request from
+the lane was evaluated as worth well under 0.5k and not built (P6 "Not done").
 
 Profile after P5 (1 vCPU, ordered TSC stamps, ~25 ticks of stamp cost each, so
 absolute values run ~1.3k high): lane::call 3.1k and lane::reply 2.5k (of which

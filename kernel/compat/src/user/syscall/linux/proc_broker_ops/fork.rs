@@ -17,22 +17,39 @@
 
 use super::*;
 
-/// Process slots are returned by the housekeeping reap pass. A full table with
-/// exited children pending is transient, so kick the pass and wait for it in
-/// short sleeps (it may run on another CPU) before reporting EAGAIN.
-fn reserve_spawn_after_reclaim() -> Option<multitask::SpawnReservation> {
+/// Process slots and scheduler task slots are returned by the housekeeping
+/// reap pass, not by the parent's `wait`. A full table with exited children
+/// pending is transient, so kick the pass and wait for it in short sleeps (it
+/// may run on another CPU) before reporting EAGAIN.
+///
+/// Both resources are waited for: the process-table reservation (taken here)
+/// and a scheduler task slot (observed here, taken when the child is
+/// created). With only the first, a sequential fork/wait loop on a machine
+/// whose 128 task slots are nearly all in use occasionally found the table
+/// free and the slot not yet retired, and the child was refused with EAGAIN
+/// after the address space had already been cloned.
+fn reserve_spawn_after_reclaim(parent_pid: u64) -> Option<multitask::SpawnReservation> {
     const RECLAIM_WAIT_MS: usize = 100;
-    if let Some(reservation) = multitask::reserve_process_spawn() {
-        return Some(reservation);
-    }
-    for _ in 0..RECLAIM_WAIT_MS {
+    // A fork joins its parent's Job, and the Job's process limit is checked
+    // authoritatively only when the child is published, after the address space
+    // has been cloned. An exited child still counts until the housekeeping pass
+    // retires it, so check it here as well and wait the same way.
+    let parent_job = multitask::process_job(parent_pid);
+    let mut waited = 0;
+    loop {
+        let job_admits = parent_job.is_none_or(multitask::job_admits_process);
+        if job_admits && multitask::task_slot_available() {
+            if let Some(reservation) = multitask::reserve_process_spawn() {
+                return Some(reservation);
+            }
+        }
+        if waited == RECLAIM_WAIT_MS {
+            return None;
+        }
         multitask::kick_housekeeping();
         crate::arch::rtc::sleep(1);
-        if let Some(reservation) = multitask::reserve_process_spawn() {
-            return Some(reservation);
-        }
+        waited += 1;
     }
-    None
 }
 
 pub(super) fn syscall_linux_rustos_proc_fork_broker(args_ptr: u64) -> u64 {
@@ -57,9 +74,9 @@ pub(super) fn syscall_linux_rustos_proc_fork_broker(args_ptr: u64) -> u64 {
     else {
         return linux_errno(LINUX_ESRCH);
     };
-    let spawn_reservation = match reserve_spawn_after_reclaim() {
+    let spawn_reservation = match reserve_spawn_after_reclaim(args.source_pid) {
         Some(reservation) => reservation,
-        None => return linux_errno(LINUX_EAGAIN),
+        None => return fork_stage_failed(20, LINUX_EAGAIN, 0),
     };
     // One mmap-lock-equivalent transaction now covers both authorities the
     // child inherits. The process state lock stabilizes page tables while the
@@ -202,7 +219,7 @@ pub(super) fn syscall_linux_rustos_proc_fork_broker(args_ptr: u64) -> u64 {
         Ok(refs) => refs,
         Err(errno) => {
             let _ = multitask::cancel_process_spawn(spawn_reservation);
-            return linux_errno(errno);
+            return fork_stage_failed(24, errno, args.source_pid);
         }
     };
     let child_pid = match multitask::spawn_user_process_state_suspended_with_parent_reservation(
@@ -216,7 +233,11 @@ pub(super) fn syscall_linux_rustos_proc_fork_broker(args_ptr: u64) -> u64 {
         Err(err) => {
             release_service_handle_refs(&inherited_service_refs);
             let _ = multitask::cancel_process_spawn(spawn_reservation);
-            return linux_errno(process_spawn_error_to_linux_errno(err));
+            return fork_stage_failed(
+                23,
+                process_spawn_error_to_linux_errno(err),
+                args.source_pid,
+            );
         }
     };
     // The child now exists but is still suspended, which is the only point at
@@ -246,13 +267,13 @@ pub(super) fn syscall_linux_rustos_proc_fork_broker(args_ptr: u64) -> u64 {
             }
             None => {
                 let _ = multitask::terminate_user_task(child_pid);
-                return linux_errno(LINUX_EAGAIN);
+                return fork_stage_failed(21, LINUX_EAGAIN, child_pid);
             }
         }
     }
     if !multitask::activate_suspended_user_task(child_pid) {
         let _ = multitask::terminate_user_task(child_pid);
-        return linux_errno(LINUX_EAGAIN);
+        return fork_stage_failed(22, LINUX_EAGAIN, child_pid);
     }
     multitask::set_next_spawn_pick_hint(child_pid);
     multitask::request_deferred_reschedule();
@@ -376,7 +397,11 @@ mod tests {
 }
 
 /// Names the step of a fork that failed (1 COW clone, 2 pager VMA inheritance,
-/// 3 child-tid store, 5+ the parent VMA hold with its `PagerVmaError`), so a
+/// 3 child-tid store, 5+ the parent VMA hold with its `PagerVmaError`, 20 no
+/// process slot after the reclaim wait, 21 the child vanished before its tid
+/// store, 22 the child could not be activated, 23 the scheduler refused the
+/// child task (slot table, Job process/thread/kmem limit), 24 inherited
+/// service handles could not be acquired), so a
 /// bare errno under concurrent address-space churn is attributable. Bounded.
 fn fork_stage_failed(stage: u64, errno: i64, detail: u64) -> u64 {
     static RECORDED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);

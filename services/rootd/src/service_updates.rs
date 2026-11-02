@@ -10,7 +10,6 @@ use super::service_manifest::POST_INIT_MANIFEST;
 use super::update_journal::UpdateJournal;
 use rustos_component_model::durable_recovery::Kind as JournalKind;
 
-const EINVAL: i32 = 22;
 const EACCES: i32 = 13;
 const ESTALE: i32 = 116;
 const EBUSY: i32 = 16;

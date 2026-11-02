@@ -6,7 +6,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 mod block;
-mod release_journal;
 
 use rustos_user_abi::performance::DVM_STORAGE_BOOT_READY_HARD_LIMIT_MS;
 use rustos_user_abi::syscall::{
@@ -401,7 +400,7 @@ fn dispatch_commercial(
             response.value0 = descriptor.id as u64;
             response.descriptor_count = 1;
             response.descriptors[0] = storage_descriptor(&descriptor, request.header.op);
-            response.capability = storage_capability(&descriptor, request.header.op);
+            response.capability = storage_capability(&descriptor);
             response.payload_len = write_payload_struct(&descriptor, &mut response.payload);
             Ok(())
         }
@@ -606,7 +605,6 @@ fn storage_descriptor(
 
 fn storage_capability(
     descriptor: &StorageBlockDescriptorWire,
-    op: u16,
 ) -> CommercialMaxCapabilityLeaseWire {
     let mut wire = CommercialMaxCapabilityLeaseWire {
         lease_id: descriptor.id as u64,
@@ -631,10 +629,6 @@ fn write_payload_struct<T>(value: &T, dest: &mut [u8]) -> u32 {
 
 fn syscall0(number: u64) -> i64 {
     unsafe { rustos_svc_runtime::syscall::syscall0(number) }
-}
-
-fn syscall2(number: u64, arg0: u64, arg1: u64) -> i64 {
-    unsafe { rustos_svc_runtime::syscall::syscall2(number, arg0, arg1) }
 }
 
 fn syscall3(number: u64, arg0: u64, arg1: u64, arg2: u64) -> i64 {

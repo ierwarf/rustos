@@ -157,7 +157,11 @@ read rather than inferred. `pager-anon-reservation` and
 `pager-fault-table-installed` were added for the same reason when reservation
 stopped building page tables: the first reports what preparation *would* have
 allocated, the second what the fault path actually allocates, so the change is
-read off one boot instead of argued from the diff.
+read off one boot instead of argued from the diff. `pager-anon-reservation` is
+emitted when the running total of avoided tables crosses a power of two (and for
+the first reservation), not every 256 tables: each console frame is a
+synchronous ~3.5 ms exit, and the earlier gate fired about once per 85
+four-kilobyte mappings, so a loop of small `mmap` calls measured the console.
 
 ---
 

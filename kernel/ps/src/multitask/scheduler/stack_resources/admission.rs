@@ -75,25 +75,43 @@ pub(in crate::multitask) fn wake_allowed(slot: usize) -> bool {
                 !crate::multitask::process_placement::root_membership::pending(handle)
             })
 }
+/// Whether `slot` cannot be reserved right now: it still holds a task, is being
+/// reclaimed, or something still reads it. One definition for `reserve` and
+/// `reservable`, so the hint can never promise a slot `reserve` would refuse
+/// for a reason it does not know.
+fn unavailable(
+    cell: &super::ResourceCell,
+    resources: &Resources,
+    slot: usize,
+) -> bool {
+    resources.reservation.is_some()
+        || resources.reclaim.is_some()
+        || resources.closing
+        || resources.mm_pin.is_some()
+        // ORDERING: Acquire pairs with lock-free reader release.
+        || cell.readers.load(Ordering::Acquire) != 0
+        || resources.context.is_some()
+        || resources.process_pin.is_some()
+        || resources.start.is_some()
+        || resources.stack.is_some()
+        || resources.binding.is_some()
+        || resources.frame_writing
+        || crate::multitask::current_identity::execution::count(slot) != 0
+        || crate::multitask::current_identity::exec_intent::busy(slot)
+        || cell.pins.load(Ordering::Acquire) != 0
+}
+
+/// A non-binding observation that `slot` could be reserved at this instant.
+pub(in crate::multitask::scheduler) fn reservable(slot: usize) -> bool {
+    RESOURCES
+        .get(slot)
+        .is_some_and(|cell| cell.with(|resources| !unavailable(cell, resources, slot)))
+}
+
 pub(in crate::multitask::scheduler) fn reserve(slot: usize, task_id: u64) -> Option<Ticket> {
     let cell = RESOURCES.get(slot)?;
     cell.with(|resources| {
-        if resources.reservation.is_some()
-            || resources.reclaim.is_some()
-            || resources.closing
-            || resources.mm_pin.is_some()
-            // ORDERING: Acquire pairs with lock-free reader release.
-            || cell.readers.load(Ordering::Acquire) != 0
-            || resources.context.is_some()
-            || resources.process_pin.is_some()
-            || resources.start.is_some()
-            || resources.stack.is_some()
-            || resources.binding.is_some()
-            || resources.frame_writing
-            || crate::multitask::current_identity::execution::count(slot) != 0
-            || crate::multitask::current_identity::exec_intent::busy(slot)
-            || cell.pins.load(Ordering::Acquire) != 0
-        {
+        if unavailable(cell, resources, slot) {
             return None;
         }
         let generation = resources.reservation_generation.checked_add(1)?;

@@ -11,14 +11,11 @@
 //! consulted from syscall entry, IPC, scheduling or fault paths.
 use alloc::vec::Vec;
 use rustos_component_model::personality::{
-    Denial, PolicyKey, PolicySnapshot, Personality, Principal, Rule, SlowRequest,
+    Denial, PolicyKey, PolicySnapshot, Principal, Rule,
 };
-use rustos_user_abi::syscall::IPC_SERVICE_LOADERD;
 
 use super::service_policy::policy_of;
 
-/// The one default namespace every personality starts with.
-pub(super) use super::service_manifest::DEFAULT_NAMESPACE;
 const MAX_RULES: usize = 32;
 const EACCES: i32 = 13;
 const EINVAL: i32 = 22;
@@ -87,6 +84,9 @@ fn errno(denial: Denial) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::service_manifest::DEFAULT_NAMESPACE;
+    use rustos_component_model::personality::{Personality, SlowRequest};
+    use rustos_user_abi::syscall::IPC_SERVICE_LOADERD;
 
     fn loaderd(pid: u64) -> (u64, Principal) {
         (IPC_SERVICE_LOADERD, Principal { pid, job_slot: 1, job_generation: 1, lease_generation: pid })

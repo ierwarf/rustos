@@ -19,7 +19,7 @@
     }
 
     #[test]
-    fn an_empty_running_set_never_enters_the_wait4_policy_round_trip() {
+    fn the_broker_loop_never_performs_the_wait4_policy_round_trip() {
         let source = include_str!("spawn.rs");
         let reap = source
             .split_once("pub(super) fn reap_children(")
@@ -28,11 +28,21 @@
             .split_once("/// How long the broker may stay idle")
             .expect("reap boundary")
             .0;
+        assert!(
+            !reap.contains("SYS_wait4"),
+            "the wait4 round trip belongs to the reaper, not the broker loop"
+        );
         let empty_guard = reap
-            .find("if state.running.is_empty() {")
+            .find("if state.running.is_empty()")
             .expect("empty owner-set guard");
-        let wait4 = reap.find("libc::SYS_wait4").expect("wait4 policy call");
-        assert!(empty_guard < wait4, "empty guard must precede wait4");
+        let request = reap.find("reaper.request()").expect("reap request");
+        assert!(empty_guard < request, "an empty owner set must not ask the reaper");
+    }
+
+    #[test]
+    fn exited_children_are_collected_once_and_an_empty_wait_reports_nothing() {
+        // On a native host no child of this test process has exited.
+        assert!(super::collect_exited_children().is_empty());
     }
 
     /// The broker loop must not perform the launch's storage reads.

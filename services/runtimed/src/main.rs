@@ -166,6 +166,16 @@ pub(crate) struct BrokerState {
     /// The signed launch catalog read. Also storage, also measured on the loop
     /// - 70 ms at its worst - and the last one that ran there.
     pub(crate) launch_catalog_load: Option<offload::Offload<catalog::LaunchCatalogLoad>>,
+    /// Child exits, collected off the loop. A WNOHANG `wait4` still performs a
+    /// procd ownership round trip, and one pass of that round trip has been seen
+    /// to consume its whole five-second control budget under SMP service
+    /// pressure: for that long the loop answered no console caller and sent no
+    /// health pulse, so rootd timed the whole service out. Absent only when the
+    /// thread cannot be created; reaping then runs inline.
+    pub(crate) child_reaper: Option<offload::Offload<Vec<(i32, i32)>>>,
+    /// Earliest time the next reap request may be made, so an idle broker does
+    /// not ask procd back to back.
+    pub(crate) reap_due: Option<Instant>,
 }
 
 impl Default for BrokerState {
@@ -203,6 +213,8 @@ impl Default for BrokerState {
                 "runtimed-qualification",
                 kvm_smp_qualification::load_kvm_smp_qualification_contract,
             ),
+            child_reaper: offload::Offload::start("runtimed-reap", spawn::collect_exited_children),
+            reap_due: None,
         }
     }
 }
@@ -255,9 +267,14 @@ fn main() {
     let _ = ensure_ui_bootstrap(&mut state);
     let mut pass = LoopPassTiming::default();
     let mut service_health = heartbeat::Heartbeat::new();
+    // Pulses come from their own thread when one can be had, so a blocked pass
+    // never silences them; otherwise the loop pulses as it always did.
+    let health_thread = heartbeat::Heartbeat::start_thread();
     loop {
         pass.begin();
-        service_health.poll();
+        if !health_thread {
+            service_health.poll();
+        }
         let mut did_work = false;
         did_work |= drain_session_request_burst(session_endpoint, &mut state) != 0;
         pass.mark(LoopPhase::Drain);

@@ -29,6 +29,13 @@ pub(super) fn prepare_storage(ticket: &Ticket) -> Option<()> {
     });
     Some(())
 }
+/// Whether some dynamic slot could be reserved now. A hint for callers that can
+/// wait out the asynchronous retirement of an exited task; the reservation
+/// itself is still taken, or refused, by `reserve`.
+pub(in crate::multitask) fn any_reservable() -> bool {
+    (super::FIRST_DYNAMIC_TASK_SLOT..super::MAX_TASK).any(admission::reservable)
+}
+
 pub(super) fn reserve(slot: usize, id: u64) -> Option<Ticket> {
     let ticket = admission::reserve(slot, id)?;
     if prepare_storage(&ticket).is_none() {

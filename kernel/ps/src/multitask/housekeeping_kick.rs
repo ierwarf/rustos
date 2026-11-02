@@ -37,6 +37,14 @@ pub fn kick_housekeeping() {
     }
 }
 
+/// Whether the scheduler has a task slot a new process could be given right
+/// now. An exited task's slot is returned by the housekeeping pass, not by the
+/// parent's `wait`, so a loop of fork and wait can briefly find none; a caller
+/// that is allowed to wait kicks the pass and asks again.
+pub fn task_slot_available() -> bool {
+    super::scheduler::task_slot_available()
+}
+
 pub fn housekeeping_kicked() -> bool {
     KICKED.load(Ordering::Acquire)
 }

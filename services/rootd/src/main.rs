@@ -74,7 +74,7 @@ use rustos_user_abi::syscall::{
     IpcRecvWithSenderArgs, LifecycleDrainBrokerArgs, LifecycleEventWire, LoaderSpawnRequest,
     LoaderSpawnResponse, RustosProcValidateDeferredSpawnBrokerArgs, RustosRootdTerminateBrokerArgs,
     RustosSchedulingContextAuthority, RustosSchedulingContextGrantBrokerArgs,
-    RustosSchedulingContextPolicy, ServiceCheckpointRecordWire,
+    RustosSchedulingContextPolicy,
     COMMERCIAL_MAX_CAPABILITY_OP_LEASE_GRANT, COMMERCIAL_MAX_CAPABILITY_OP_LEASE_RENEW,
     COMMERCIAL_MAX_CAPABILITY_OP_LEASE_REVOKE, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
     COMMERCIAL_MAX_PROTOCOL_CAPABILITY, COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS,
@@ -94,9 +94,9 @@ use rustos_user_abi::syscall::{
     COMMERCIAL_MAX_ROOTD_OP_UPDATE_STAGE, COMMERCIAL_MAX_ROOTD_OP_UPDATE_ARM,
     COMMERCIAL_MAX_ROOTD_OP_UPDATE_ROLLBACK, COMMERCIAL_MAX_ROOTD_OP_UPDATE_SEAL,
     COMMERCIAL_MAX_ROOTD_OP_UPDATE_INSPECT,
-    IPC_SERVICE_DEVMGRD, IPC_SERVICE_INITD, IPC_SERVICE_INPUTD, IPC_SERVICE_LINUX_SYSCALLD, IPC_SERVICE_LOADERD,
+    IPC_SERVICE_INITD, IPC_SERVICE_LINUX_SYSCALLD, IPC_SERVICE_LOADERD,
     IPC_SERVICE_NETD, IPC_SERVICE_PAGERD, IPC_SERVICE_PROCD, IPC_SERVICE_ROOTD,
-    IPC_SERVICE_SESSIOND, IPC_SERVICE_STORAGED, IPC_SERVICE_UISERVER, IPC_SERVICE_VFSD,
+    IPC_SERVICE_SESSIOND, IPC_SERVICE_VFSD,
     LIFECYCLE_DRAIN_BROKER_ABI_VERSION, LIFECYCLE_DRAIN_MAX_EVENTS, LIFECYCLE_EVENT_EXIT,
     LOADER_OP_ACTIVATE, LOADER_OP_SPAWN_EXEC, LOADER_REQUEST_ABI_VERSION, LOADER_SPAWN_ARG_BYTES,
     LOADER_SPAWN_ENV_BYTES, LOADER_SPAWN_EXEC_PATH_CAPACITY, LOADER_SPAWN_FLAG_DEFER_START,
@@ -1197,7 +1197,7 @@ fn fill_commercial_max_response(
             let lease = lease_by_index(leases, request.arg0 as usize)?;
             response.descriptor_count = 1;
             response.descriptors[0] = lease_descriptor(lease, request.header.op, 0);
-            response.capability = lease_capability(lease, request.header.op);
+            response.capability = lease_capability(lease);
             response.payload_len = write_payload_struct(&lease_wire(lease), &mut response.payload);
             response.value1 = lease.pid;
             Ok(())
@@ -1849,7 +1849,7 @@ fn lease_descriptor(lease: &Lease, op: u16, index: u64) -> CommercialMaxProtocol
     descriptor
 }
 
-fn lease_capability(lease: &Lease, op: u16) -> CommercialMaxCapabilityLeaseWire {
+fn lease_capability(lease: &Lease) -> CommercialMaxCapabilityLeaseWire {
     let mut capability = CommercialMaxCapabilityLeaseWire {
         lease_id: lease.pid,
         service_id: lease.service_id,
@@ -2513,20 +2513,6 @@ fn authorize_service_slow_grant(
     Ok(())
 }
 
-fn authorize_current_service_namespace(
-    leases: &[Lease],
-    post_init_leases: &[PostInitLease],
-    service_id: u64,
-    sender: IpcSenderIdentity,
-) -> Result<(), i32> {
-    if service_id == 0
-        || current_service_id_for_sender(leases, post_init_leases, sender)? != service_id
-    {
-        return Err(13);
-    }
-    Ok(())
-}
-
 fn current_service_id_for_sender(
     leases: &[Lease],
     post_init_leases: &[PostInitLease],
@@ -2557,14 +2543,6 @@ fn current_service_id_for_sender(
         owner = Some(lease.service_id);
     }
     owner.ok_or(13)
-}
-
-fn service_dependency_allowed(subject: u64, target: u64) -> bool {
-    component_policy::route_allowed(subject, target)
-}
-
-fn bootstrap_dependency_allowed(subject: u64, target: u64) -> bool {
-    component_policy::bootstrap_route_allowed(subject, target)
 }
 
 fn service_name(path: &'static [u8]) -> &'static [u8] {
@@ -3284,6 +3262,9 @@ pub unsafe extern "C" fn bcmp(lhs: *const u8, rhs: *const u8, len: usize) -> i32
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustos_user_abi::syscall::{
+        IPC_SERVICE_DEVMGRD, IPC_SERVICE_INPUTD, IPC_SERVICE_STORAGED, IPC_SERVICE_UISERVER,
+    };
 
     // The kernel now decides lookups and registrations from the policy rootd
     // installs (`kernel_policy`) and the pid -> service bindings rootd makes
@@ -3305,7 +3286,7 @@ mod tests {
             },
         )?;
         if service_policy_capability(request.arg0).is_some()
-            && service_dependency_allowed(subject, request.arg0)
+            && component_policy::route_allowed(subject, request.arg0)
         {
             Ok(())
         } else {
@@ -3554,15 +3535,15 @@ mod tests {
 
     #[test]
     fn vfsd_lookup_authority_includes_only_device_and_storage_policy() {
-        assert!(service_dependency_allowed(
+        assert!(component_policy::route_allowed(
             IPC_SERVICE_VFSD,
             IPC_SERVICE_DEVMGRD
         ));
-        assert!(service_dependency_allowed(
+        assert!(component_policy::route_allowed(
             IPC_SERVICE_VFSD,
             IPC_SERVICE_STORAGED
         ));
-        assert!(!service_dependency_allowed(
+        assert!(!component_policy::route_allowed(
             IPC_SERVICE_VFSD,
             IPC_SERVICE_NETD
         ));
@@ -3570,15 +3551,15 @@ mod tests {
 
     #[test]
     fn loaderd_lookup_authority_includes_only_immutable_vfs_source() {
-        assert!(service_dependency_allowed(
+        assert!(component_policy::route_allowed(
             IPC_SERVICE_LOADERD,
             IPC_SERVICE_VFSD
         ));
-        assert!(!service_dependency_allowed(
+        assert!(!component_policy::route_allowed(
             IPC_SERVICE_LOADERD,
             IPC_SERVICE_STORAGED
         ));
-        assert!(!service_dependency_allowed(
+        assert!(!component_policy::route_allowed(
             IPC_SERVICE_LOADERD,
             IPC_SERVICE_DEVMGRD
         ));
@@ -3586,15 +3567,15 @@ mod tests {
 
     #[test]
     fn inputd_lookup_authority_is_only_the_netd_lifecycle_handoff() {
-        assert!(service_dependency_allowed(
+        assert!(component_policy::route_allowed(
             IPC_SERVICE_INPUTD,
             IPC_SERVICE_NETD
         ));
-        assert!(!service_dependency_allowed(
+        assert!(!component_policy::route_allowed(
             IPC_SERVICE_INPUTD,
             IPC_SERVICE_DEVMGRD
         ));
-        assert!(!service_dependency_allowed(
+        assert!(!component_policy::route_allowed(
             IPC_SERVICE_INPUTD,
             IPC_SERVICE_UISERVER
         ));
@@ -3609,14 +3590,14 @@ mod tests {
             IPC_SERVICE_PROCD,
             IPC_SERVICE_PAGERD,
         ] {
-            assert!(bootstrap_dependency_allowed(INITD_LEASE_ID, service_id));
-            assert!(service_dependency_allowed(INITD_LEASE_ID, service_id));
+            assert!(component_policy::bootstrap_route_allowed(INITD_LEASE_ID, service_id));
+            assert!(component_policy::route_allowed(INITD_LEASE_ID, service_id));
         }
-        assert!(!bootstrap_dependency_allowed(
+        assert!(!component_policy::bootstrap_route_allowed(
             INITD_LEASE_ID,
             IPC_SERVICE_UISERVER
         ));
-        assert!(!service_dependency_allowed(
+        assert!(!component_policy::route_allowed(
             INITD_LEASE_ID,
             IPC_SERVICE_UISERVER
         ));
@@ -3628,23 +3609,16 @@ mod tests {
         leases[1].pid = 52;
         leases[1].state = ROOTD_LEASE_STATE_RUNNING;
         let post_init = [];
+        let sender = IpcSenderIdentity { pid: 52, tid: 7 };
+        // The namespace holder is whatever service the sender's live lease
+        // names; a different claimed service never matches it.
         assert_eq!(
-            authorize_current_service_namespace(
-                &leases,
-                &post_init,
-                IPC_SERVICE_VFSD,
-                IpcSenderIdentity { pid: 52, tid: 7 },
-            ),
-            Ok(())
+            current_service_id_for_sender(&leases, &post_init, sender),
+            Ok(IPC_SERVICE_VFSD)
         );
-        assert_eq!(
-            authorize_current_service_namespace(
-                &leases,
-                &post_init,
-                IPC_SERVICE_PROCD,
-                IpcSenderIdentity { pid: 52, tid: 7 },
-            ),
-            Err(13)
+        assert_ne!(
+            current_service_id_for_sender(&leases, &post_init, sender),
+            Ok(IPC_SERVICE_PROCD)
         );
     }
 

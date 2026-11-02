@@ -3540,6 +3540,34 @@ pub struct LinuxSyscallOffloadFastRequest {
     pub egid: u32,
 }
 
+/// Compact envelope for the address-space operations (`mmap`, `munmap`,
+/// `mprotect`, `brk`), which carry no path and no payload and are among the
+/// hottest offloads: every allocator growth, thread stack and loader mapping
+/// pays one. The full request is larger than the IPC fast lane's inline frame,
+/// so it always took the ordinary blocking transaction (heap-buffered request,
+/// scheduler wake, context switch); a request this size takes the fast lane the
+/// id getters already use. Like `LinuxSyscallOffloadFastRequest` its distinct
+/// size is the wire discriminator, `pid`/`tid` must equal the kernel-stamped
+/// sender, and it does not alias or weaken the full request ABI.
+///
+/// Field use by operation: `mmap` uses all of `addr`, `len`, `prot`, `flags`,
+/// `fd` and `offset`; `munmap` uses `addr`, `len`; `mprotect` uses `addr`,
+/// `len`, `prot`; `brk` uses `addr`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct LinuxSyscallOffloadFastMemRequest {
+    pub version: u16,
+    pub op: u16,
+    pub prot: u32,
+    pub pid: u64,
+    pub tid: u64,
+    pub addr: u64,
+    pub len: u64,
+    pub flags: u64,
+    pub fd: u64,
+    pub offset: u64,
+}
+
 impl Default for LinuxSyscallOffloadRequest {
     fn default() -> Self {
         Self {

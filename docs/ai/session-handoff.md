@@ -37,11 +37,3 @@ a selected opt-in image; check these before executing or editing.
 - A formal seal covers the whole tree (including docs): any edit unseals it, and
   multi-vCPU `kvm-smoke` re-runs `verify-all.sh --profile pr` first. A 1-vCPU
   smoke (`--rustos-vcpus 1`) does not need the seal.
-
-## Preserved dated evidence
-
-[Handoff chronology](session-handoff-log.md) preserves detailed 2026-10-29/30
-experiments, successful and failed boots, WIP policy3a checks and evidence
-paths. They describe their original source/image trees, **not** a future
-checkout or this docs-only change. Historical 40/40 boots and opt-in quota
-attempts are not new results or a blanket stability claim.

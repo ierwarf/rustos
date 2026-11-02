@@ -26,7 +26,6 @@ fn request(op: u16, job_handle: u64, pid: u64) -> RustosJobArgs {
 pub(super) struct Info {
     pub(super) id: u64,
     pub(super) parent: u64,
-    pub(super) state: u32,
     pub(super) depth: u32,
     pub(super) subtree_processes: u64,
     pub(super) usage_processes: u64,
@@ -35,7 +34,6 @@ pub(super) struct Info {
     pub(super) limit_processes: u64,
     pub(super) limit_threads: u64,
     pub(super) effective_processes: u64,
-    pub(super) effective_threads: u64,
     pub(super) limit_memory_pages: u64,
     pub(super) effective_memory_pages: u64,
     pub(super) usage_memory_pages: u64,
@@ -48,11 +46,11 @@ pub(super) fn info(handle: u64) -> Result<Info, i64> {
 
 pub(super) fn info_from_reply(reply: RustosJobArgs) -> Info {
     Info {
-        id: reply.job, parent: reply.parent_job, state: reply.state, depth: reply.depth,
+        id: reply.job, parent: reply.parent_job, depth: reply.depth,
         subtree_processes: reply.subtree_processes, usage_processes: reply.usage_processes,
         children: reply.children, rights: reply.rights,
         limit_processes: reply.limit_processes, limit_threads: reply.limit_threads,
-        effective_processes: reply.effective_processes, effective_threads: reply.effective_threads,
+        effective_processes: reply.effective_processes,
         limit_memory_pages: reply.limit_memory_pages,
         effective_memory_pages: reply.effective_memory_pages,
         usage_memory_pages: reply.usage_memory_pages,

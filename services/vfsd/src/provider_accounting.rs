@@ -81,7 +81,7 @@ impl OpenDescriptionBilling {
         if matches!(phase,State::ReleasePrepared|State::ReleaseInFlight){
             return self.ensure_release(remote_id)
         }
-        let request=self.ledger.begin_cancel(remote_id).map_err(errno)?;
+        self.ledger.begin_cancel(remote_id).map_err(errno)?;
         let request=self.ledger.dispatch_cancel(remote_id).map_err(errno)?;
         let ack=control_retry(request)?;
         self.ledger.cancelled(remote_id,ack).map_err(errno)?;
@@ -113,8 +113,6 @@ impl OpenDescriptionBilling {
             state==State::Funded && frame.client_pid==client_pid
         })
     }
-    pub(super) fn live(&self)->usize{self.ledger.live_count()}
-    pub(super) fn pending(&self)->usize{self.ledger.pending_count()}
 }
 impl VfsState {
     /// Lazily construct the provider control epoch after checkpoint replay,
@@ -153,9 +151,6 @@ impl VfsState {
     /// but unverified counts do not bypass the kernel's Job quota.
     pub(super) fn has_funded_open_description(&self,id:u64,pid:u64)->bool {
         self.billing.as_ref().is_some_and(|b|b.owns_funded(id,pid))
-    }
-    pub(super) fn billing_snapshot(&self)->(usize,usize){
-        self.billing.as_ref().map_or((0,0),|b|(b.live(),b.pending()))
     }
 }
 #[cfg(test)]

@@ -121,8 +121,8 @@ Shorten the loop before the sealed run, not instead of it.
    NAME`). Seals and builds are per worktree, so one agent's edit cannot invalidate
    another's sealed boot. Merge at a slice boundary, after preflight and a sealed run
    pass in that worktree; the script never merges for you.
-6. `docs/ai/session-handoff.md` is the short resume head; evidence and chronology go
-   to `docs/ai/session-handoff-log.md`. Both are exempt from the verification seal
-   (`formal/binding-exempt-paths.txt`) because no lane reads them as input.
+6. `docs/ai/session-handoff.md` is the short resume head; dated evidence belongs in
+   git history. It is exempt from the verification seal
+   (`formal/binding-exempt-paths.txt`) because no lane reads it as input.
    Other documents are not exempt: `check-rust-source-contracts.py` reads every
    Markdown file for documented source paths, so editing one invalidates the seal.

@@ -8,17 +8,12 @@
 //! lease/Job owner until a dual-run cutover is proven. A path or a moniker
 //! never grants authority.
 
-use super::service_manifest::INITD_LEASE_ID;
 use super::service_manifest::{
     BootstrapServiceSpec, PostInitServiceSpec, ServicePolicy, ServiceRouteSpec,
     BOOTSTRAP_MANIFEST, DEP_LOADERD, DEP_PAGERD, DEP_PROCD, DEP_SYSCALLD, DEP_VFSD,
     POST_INIT_MANIFEST, SERVICE_POLICY_MANIFEST, SERVICE_ROUTING_MANIFEST,
 };
 use rustos_component_model::Moniker;
-use rustos_user_abi::syscall::{
-    IPC_SERVICE_DEVMGRD, IPC_SERVICE_INPUTD, IPC_SERVICE_NETD, IPC_SERVICE_SESSIOND,
-    IPC_SERVICE_STORAGED, IPC_SERVICE_UISERVER,
-};
 use rustos_user_abi::syscall::{
     IPC_SERVICE_LINUX_SYSCALLD, IPC_SERVICE_LOADERD, IPC_SERVICE_PAGERD, IPC_SERVICE_PROCD,
     IPC_SERVICE_VFSD,
@@ -361,6 +356,11 @@ pub(super) fn admit_unique_live_service_pid(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::service_manifest::INITD_LEASE_ID;
+    use rustos_user_abi::syscall::{
+        IPC_SERVICE_DEVMGRD, IPC_SERVICE_INPUTD, IPC_SERVICE_NETD, IPC_SERVICE_SESSIOND,
+        IPC_SERVICE_STORAGED, IPC_SERVICE_UISERVER,
+    };
 
     #[test]
     fn reporter_manifest_is_acyclic_and_rejects_unauthorized_parents() {

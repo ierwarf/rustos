@@ -5,6 +5,7 @@ pub use self::child_wait::{register_child_waiter, unregister_child_waiter, wake_
 mod housekeeping_kick;
 pub use self::housekeeping_kick::{
     housekeeping_kicked, kick_housekeeping, register_housekeeping_task, take_housekeeping_kick,
+    task_slot_available,
 };
 mod cpu_local;
 mod current;

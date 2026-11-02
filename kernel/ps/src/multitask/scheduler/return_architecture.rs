@@ -67,6 +67,23 @@ impl<'a> ReturnArchitecture<'a> {
     /// execution-bank, or MM-root checks failed instead of collapsing them all
     /// into one `None`. Tests keep using `capture`, so the success and refusal
     /// conditions are the same expressions as before.
+    /// What the claimed incoming task's run owner looked like when a capture was
+    /// refused, packed for a milestone: bits 0..8 owner state, 8..16 owner CPU
+    /// (0xff when none), 16..32 slot, 32..64 how far the owner's generation is
+    /// from the receipt's. An intermittent refusal of check 9 or 11 used to
+    /// leave only the check number, which cannot say *what* took the task out
+    /// of `Running` between selection and installation.
+    pub(in crate::multitask) fn refusal_detail(turn: &CpuDispatchTurn<'static>) -> u64 {
+        let Some(receipt) = turn.claimed_return() else { return 0 };
+        let owner = runqueue::owner(receipt.token.slot);
+        let cpu = owner.cpu.map_or(0xff_u64, |cpu| cpu as u64 & 0xff);
+        let generation_gap = owner.generation.wrapping_sub(receipt.running_generation) as u64 & 0xffff_ffff;
+        (owner.state as u64)
+            | (cpu << 8)
+            | ((receipt.token.slot as u64 & 0xffff) << 16)
+            | (generation_gap << 32)
+    }
+
     pub(in crate::multitask) fn capture_checked(
         turn: &'a CpuDispatchTurn<'static>,
         dispatch: SchedulerDispatch,

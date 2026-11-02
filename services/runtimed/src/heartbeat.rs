@@ -46,6 +46,26 @@ impl Heartbeat {
         }
     }
 
+    /// Pulse from a thread of its own. Health is evidence that the *service* is
+    /// alive, not that the broker loop is currently free: when one blocking
+    /// service call on the loop ran its whole five-second budget, the pulses
+    /// stopped with it and rootd timed out a service that was merely waiting.
+    /// Returns `false` when the thread cannot be created, and the loop keeps
+    /// calling `poll` itself.
+    pub(super) fn start_thread() -> bool {
+        const CHECK: Duration = Duration::from_millis(250);
+        std::thread::Builder::new()
+            .name(String::from("runtimed-health"))
+            .spawn(|| {
+                let mut health = Heartbeat::new();
+                loop {
+                    health.poll();
+                    std::thread::sleep(CHECK);
+                }
+            })
+            .is_ok()
+    }
+
     fn send(&self, sequence: u64) -> Result<(), i32> {
         let endpoint = super::spawn::lookup_service_endpoint(IPC_SERVICE_ROOTD);
         if endpoint <= 0 {

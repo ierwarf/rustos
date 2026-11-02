@@ -101,6 +101,11 @@ pub(super) use task_weight::{
 #[cfg(test)]
 pub(super) use task_weight::MIN_LOAD_WEIGHT;
 
+/// See `housekeeping_kick::task_slot_available`.
+pub(in crate::multitask) fn task_slot_available() -> bool {
+    root_slots::any_reservable()
+}
+
 pub(in crate::multitask) fn local_dispatch_work_pending(cpu: usize) -> bool {
     // A direct synchronous handoff deliberately has no fair-runqueue entry.
     // Its FIFO publication and exact refused-wake retries are independent

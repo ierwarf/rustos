@@ -214,8 +214,8 @@ pub(in crate::multitask) fn allocate(
     );
     let mut turn = nucleus_core::util::lockdep::DispatchPreemption::enter();
     turn.mask_irqs();
-    let actor = Actor::capture(turn.cpu())?;
-    let admission = Admission::capture(&actor, parent, supplied)?;
+    let actor = Actor::capture(turn.cpu()).or_else(|| refused(1))?;
+    let admission = Admission::capture(&actor, parent, supplied).or_else(|| refused(2))?;
     let result = construct(
         id,
         input,
@@ -235,6 +235,27 @@ pub(in crate::multitask) fn allocate(
     );
     crate::multitask::irq::flush_deferred_target_reschedules();
     result
+}
+
+/// Names which refusal ended a root creation. Every one of them reaches the
+/// caller as the same `NoFreeTaskSlot`, which a `fork` reports as `EAGAIN`, so
+/// without a site code a transient busy cohort, an exhausted slot table and a
+/// full scheduling domain cannot be told apart. Bounded, so a storm stays cheap.
+/// 1 creator actor, 2 parent admission, 3 no reservable slot, 4 process join,
+/// 5 address-space materialization, 6 scheduling-context admission, 7 process
+/// publication.
+fn refused<T>(site: u64) -> Option<T> {
+    static RECORDED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    // ORDERING: Relaxed; a counter bounding telemetry volume.
+    if RECORDED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 32 {
+        crate::debug::record_milestone(
+            crate::debug::LogCategory::Sched,
+            "root-creation-refused",
+            site,
+            0,
+        );
+    }
+    None
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -270,19 +291,20 @@ fn construct(
         }
     }
     let vruntime = kernel_creation::creation_floor(turn.cpu());
-    let ticket =
-        (FIRST_DYNAMIC_TASK_SLOT..MAX_TASK).find_map(|slot| root_slots::reserve(slot, id))?;
+    let ticket = (FIRST_DYNAMIC_TASK_SLOT..MAX_TASK)
+        .find_map(|slot| root_slots::reserve(slot, id))
+        .or_else(|| refused(3))?;
     let mut root =
         match root_slots::RootPublication::prepare(reservation, ticket, admission.process_mask) {
             Ok(root) => root,
             Err(ticket) => {
                 root_slots::cancel_unpublished(ticket);
-                return None;
+                return refused(4);
             }
         };
     let Some(state) = input.materialize(&mut bootstrap, id) else {
         root.cancel();
-        return None;
+        return refused(5);
     };
     let phys = state.address_space_root();
     let slot = root.ticket().slot();
@@ -294,13 +316,13 @@ fn construct(
     ) {
         drop(state);
         root.cancel();
-        return None;
+        return refused(6);
     }
     let rsp = execution_image::reserved_user_entry(root.ticket(), &bootstrap, cs, ss, flags);
     let Some(handle) = root.publish_process(parent, state) else {
         scheduling_runtime::release(slot, scheduling.identity());
         root.cancel();
-        return None;
+        return refused(7);
     };
     let slot = publish(
         root,

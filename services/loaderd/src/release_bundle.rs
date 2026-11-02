@@ -102,7 +102,6 @@ mod tests {
     use super::*;
     use alloc::format;
     use alloc::vec::Vec;
-    use alloc::string::ToString;
     use rustos_release_verifier::{Manifest, TrustedKey, MANIFEST_BYTES};
     use sha2::{Digest, Sha256};
 

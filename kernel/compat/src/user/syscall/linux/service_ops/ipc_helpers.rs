@@ -179,9 +179,27 @@ pub fn procd_fork(
     request.registers = frame_to_user_registers(frame);
     match call_procd(&request) {
         Ok(response) if response.status == 0 => response.result as u64,
-        Ok(response) => linux_errno(response.status.unsigned_abs() as i64),
-        Err(errno) => linux_errno(errno),
+        Ok(response) => fork_refused(1, response.status.unsigned_abs() as i64),
+        Err(errno) => fork_refused(2, errno),
     }
+}
+
+/// A fork that procd refused (`1`: its policy reply carried the errno) or that
+/// never got an answer from procd (`2`: the call itself failed or timed out).
+/// Without this a bare `EAGAIN` from `fork` cannot be told apart from procd
+/// being unresponsive; the count is bounded so a fork storm stays cheap.
+fn fork_refused(source: u64, errno: i64) -> u64 {
+    static RECORDED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    // ORDERING: Relaxed; a counter bounding telemetry volume.
+    if RECORDED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 32 {
+        crate::debug::record_milestone(
+            crate::debug::LogCategory::Compat,
+            "linux-fork-procd-refused",
+            source,
+            errno.unsigned_abs(),
+        );
+    }
+    linux_errno(errno)
 }
 
 fn frame_to_user_registers(frame: &SyscallFrame) -> RustosUserRegisters {

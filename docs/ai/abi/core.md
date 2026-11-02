@@ -326,6 +326,31 @@ evidence; vfsd/storaged I/O, kernel fault dispatch, runtime pressure/restart,
 and Linux/Windows differential cutover are still required before Phase 8 is
 complete.
 
+### syscalld offload envelopes
+
+The kernel offloads Linux policy syscalls to `syscalld` over one endpoint and
+tells the envelopes apart by **frame size**; there is no tag field to forge.
+
+| Frame | Used for | IPC lane |
+| --- | --- | --- |
+| `LinuxSyscallOffloadFastRequest` (40 B) | `getuid`, `getgid`, `geteuid`, `getegid` | fast lane |
+| `LinuxSyscallOffloadFastMemRequest` (64 B) | `mmap`, `munmap`, `mprotect`, `brk` | fast lane |
+| `LinuxSyscallOffloadRequest` (full, path-bearing) | everything else | blocking transaction |
+
+Both compact requests answer with `LinuxSyscallOffloadFastResponse` (48 B, 32 B
+payload). The IPC fast lane admits only frames up to `IPC_FAST_INLINE_BYTES`
+(256 B); the full request is larger, so every operation sent in it pays the
+heap-buffered blocking transaction. Measured at 8 vCPU, a trivial handler
+(`umask`) over the full frame cost about 129k cycles against about 25k for
+`getuid` over a compact one, which is why the address-space operations, the
+hottest offloads, have their own compact frame (`mmap` 114k -> 31k, `munmap`
+117k -> 41k, `mprotect` 124k -> 41k cycles at the median).
+
+A compact request must carry the caller's own `pid`/`tid`
+(`identity_is_exact_sender`); `syscalld` refuses any other identity, so a
+service cannot name another process's mappings. Operations that carry a path or a
+payload larger than 32 B stay on the full request.
+
 ### Client-Job accounting schema 519
 
 Production sessiond/rootd control of client session accounting uses a

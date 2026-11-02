@@ -16,24 +16,12 @@ use rustos_user_abi::syscall::{
     SYS_RUSTOS_IPC_CALL_BOUNDED,
 };
 use rustos_user_abi::performance::IPC_BOOT_CONTROL_HARD_LIMIT_MS;
-const EINVAL:i32=22;
-const EPROTO:i32=71;
-const EAGAIN:i32=11;
 const SYS_GETPID:u64=39;
 const SYS_GETTID:u64=186;
 #[derive(Clone,Copy,Debug,Eq,PartialEq)]
 pub(super) enum AdmissionError{
     Image(rustos_release_verifier::Error),
     Invalid,Policy(i32),Transport(i32),WrongReply,
-}
-fn admit(
-    ring:&KeyRing<'_>,
-    signed:&[u8],candidate:&[u8],previous:&[u8],
-    expected_service:u64,verified_floor:u64,
-)->Result<Verified,AdmissionError>{
-    rustos_release_verifier::verify_release(
-        ring,signed,candidate,previous,expected_service,verified_floor,
-    ).map_err(AdmissionError::Image)
 }
 fn stage_approval(approved:Verified,release_epoch:u64,
                   trial_deadline_ns:u64)->Result<Approval,AdmissionError>{
@@ -103,31 +91,6 @@ pub(super) fn stage_release_bundle(
     let approval=stage_approval(verified,release_epoch,trial_deadline_ns)?;
     call_rootd_stage(approval)?;
     Ok(verified)
-}
-/// Cryptographically check both images and stage only the verified digest.
-/// The caller MUST hold an independently authenticated, fsync-and-readback
-/// old-image pin before invoking this; this API does not create that pin.
-pub(super) fn verify_and_stage(
-    ring:&KeyRing<'_>,signed:&[u8],
-    candidate:&[u8],previous:&[u8],
-    service:u64,durable_floor:u64,release_epoch:u64,
-    trial_deadline_ns:u64,
-)->Result<Verified,AdmissionError>{
-    let verified=admit(ring,signed,candidate,previous,service,durable_floor)?;
-    let approval=stage_approval(verified,release_epoch,trial_deadline_ns)?;
-    call_rootd_stage(approval)?;
-    Ok(verified)
-}
-/// Verify against the keyring sealed into this loaderd image and stage.
-/// With the shipped empty ring this always fails with `UntrustedKey`.
-pub(super) fn verify_and_stage_sealed(
-    signed:&[u8],candidate:&[u8],previous:&[u8],
-    service:u64,durable_floor:u64,release_epoch:u64,trial_deadline_ns:u64,
-)->Result<Verified,AdmissionError>{
-    let keys=super::trust_anchor::sealed_keys().map_err(AdmissionError::Image)?;
-    let ring=KeyRing::new(&keys).map_err(AdmissionError::Image)?;
-    verify_and_stage(&ring,signed,candidate,previous,service,durable_floor,
-        release_epoch,trial_deadline_ns)
 }
 #[cfg(test)]
 mod tests{

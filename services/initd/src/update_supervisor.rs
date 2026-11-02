@@ -123,11 +123,6 @@ impl UpdateReconciler {
         !IMAGE_VOLUME_IS_IMMUTABLE && self.blocked.contains_key(&service)
     }
 
-    /// Rollback demanded and not yet retired by SEAL.
-    pub(super) fn restore_pending(&self, service: u64) -> bool {
-        self.blocked.contains_key(&service)
-    }
-
     pub(super) fn poll(&mut self, now: Instant) {
         if self.next_poll.is_some_and(|due| now < due) {
             return;
@@ -291,8 +286,6 @@ mod tests {
         assert!(UpdateSnapshot::decode(11, 0, 0, &[0; 16]).is_err());
         let mut r = UpdateReconciler::default();
         r.blocked.insert(11, 1);
-        assert!(r.restore_pending(11));
-        assert!(!r.restore_pending(3));
         // With an immutable volume the catalog image may be relaunched.
         assert_eq!(r.blocks_auto_launch(11), !IMAGE_VOLUME_IS_IMMUTABLE);
     }
