@@ -102,10 +102,14 @@ pub(crate) fn guest_panic(archive: &Path) -> Option<String> {
     let log = fs::read_to_string(archive).ok()?;
     let mut location = None;
     for line in log.lines() {
-        if let Some(rest) = line.split_once("location: ").map(|(_, rest)| rest) {
+        // The guest panic handler writes these as their own lines. Matching
+        // them mid-line also matched `Os { ..., message: "..." }` inside
+        // ordinary service warnings, and a failed run was then reported as a
+        // guest panic with an unrelated errno text.
+        if let Some(rest) = line.strip_prefix("location: ") {
             location = Some(rest.trim().to_owned());
         }
-        if let Some((_, message)) = line.split_once("message: ") {
+        if let Some(message) = line.strip_prefix("message: ") {
             return Some(match location {
                 Some(at) => format!("{at}: {}", message.trim()),
                 None => message.trim().to_owned(),
@@ -140,6 +144,19 @@ mod tests {
                 "kernel/ps/src/multitask/scheduler.rs:4061:9: scheduler fallback task lost local rq custody slot=48 cpu=3"
             )
         );
+    }
+
+    /// Service warnings embed `message: "..."` inside a debug payload; that is
+    /// not a guest panic.
+    #[test]
+    fn an_embedded_error_message_is_not_a_guest_panic() {
+        let mut archive = tempfile::NamedTempFile::new().expect("archive");
+        writeln!(
+            archive,
+            "user-debug payload=[WARN ] runtimed: unreadable: Os {{ code: 38, kind: Unsupported, message: \"Function not implemented\" }}"
+        )
+        .expect("write archive");
+        assert_eq!(super::guest_panic(archive.path()), None);
     }
 
     /// A run that never booted has no panic to name, and must not be reported
