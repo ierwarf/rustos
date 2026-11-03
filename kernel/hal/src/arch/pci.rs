@@ -28,6 +28,10 @@ use x86_64::instructions::port::Port;
 const CONFIG_ADDRESS_PORT: u16 = 0x0cf8;
 const CONFIG_DATA_PORT: u16 = 0x0cfc;
 
+const fn config_word_data_port(offset: u8) -> u16 {
+    CONFIG_DATA_PORT + (offset as u16 & 2)
+}
+
 const COMMAND_OFFSET: u8 = 0x04;
 const STATUS_OFFSET: u8 = 0x06;
 const REVISION_OFFSET: u8 = 0x08;
@@ -654,12 +658,29 @@ impl PciDevice {
     }
 
     fn write_u16_raw(self, offset: u8, value: u16) {
-        let aligned = offset & !0x3;
-        let shift = ((offset & 0x2) * 8) as u32;
-        let mask = !(0xffff_u32 << shift);
-        let current = self.read_u32_raw(aligned);
-        let next = (current & mask) | ((value as u32) << shift);
-        self.write_u32_raw(aligned, next);
+        let aligned = offset & !1;
+        if let Some(addr) = crate::arch::acpi::pci_config_address(
+            self.segment,
+            self.bus,
+            self.device,
+            self.function,
+            usize::from(aligned),
+        ) {
+            // SAFETY: ECAM admission bounds the naturally aligned 16-bit access.
+            unsafe { ptr::write_volatile(addr as *mut u16, value) };
+            return;
+        }
+        if self.segment != 0 {
+            return;
+        }
+        // SAFETY: CONFIG_STATE serializes the legacy address/data transaction.
+        // A word write is essential: a dword read-modify-write of COMMAND
+        // would write back STATUS's write-one-to-clear bits.
+        unsafe {
+            Port::<u32>::new(CONFIG_ADDRESS_PORT)
+                .write(config_address(self.bus, self.device, self.function, aligned));
+            Port::<u16>::new(config_word_data_port(aligned)).write(value);
+        }
     }
 
     fn write_u32_raw(self, offset: u8, value: u32) {
@@ -937,6 +958,13 @@ mod tests {
             function,
         }
         .config_key()
+    }
+
+    #[test]
+    fn config_word_data_port_selects_only_the_requested_halfword() {
+        assert_eq!(super::config_word_data_port(0x04), 0xcfc);
+        assert_eq!(super::config_word_data_port(0x06), 0xcfe);
+        assert_eq!(super::config_word_data_port(0xfe), 0xcfe);
     }
 
     #[test]

@@ -47,17 +47,13 @@ pub(super) fn report_rootd_service_lease(
     if call < 0 {
         return Err((-call) as i32);
     }
-    if call as usize != size_of::<CommercialMaxProtocolResponse>()
-        || !response.is_valid_envelope_for(&request)
-        || response.descriptor_count != 0
+    check_rootd_status(call, &request, &response)?;
+    if response.descriptor_count != 0
         || response.payload_len != 0
         || response.value0 != service_id
         || response.value1 != u64::try_from(pid).map_err(|_| libc::EINVAL)?
     {
-        return Err(libc::EINVAL);
-    }
-    if response.status != 0 {
-        return Err(response.status);
+        return Err(libc::EPROTO);
     }
     Ok(())
 }
@@ -102,13 +98,11 @@ pub(super) fn request_scheduling_context_authority(
     if call < 0 {
         return Err((-call) as i32);
     }
-    if call as usize != size_of::<CommercialMaxProtocolResponse>()
-        || !response.is_valid_envelope_for(&request)
-        || response.status != 0
-        || response.descriptor_count != 0
+    check_rootd_status(call, &request, &response)?;
+    if response.descriptor_count != 0
         || response.payload_len as usize != size_of::<RustosSchedulingContextAuthority>()
     {
-        return Err(libc::EINVAL);
+        return Err(libc::EPROTO);
     }
     // SAFETY: The envelope proves an exact fixed repr(C) payload length;
     // unaligned decoding imposes no alignment requirement on the byte buffer.
@@ -129,6 +123,26 @@ pub(super) fn request_scheduling_context_authority(
     Ok(authority)
 }
 
+// Error replies do not carry the success-only lease or authority fields.
+// Authenticate the envelope first, then preserve rootd's errno so transient
+// admission failures remain retryable rather than becoming permanent EINVAL.
+fn check_rootd_status(
+    received: i64,
+    request: &CommercialMaxProtocolRequest,
+    response: &CommercialMaxProtocolResponse,
+) -> Result<(), i32> {
+    if received as usize != size_of::<CommercialMaxProtocolResponse>()
+        || !response.is_valid_envelope_for(request)
+        || response.status < 0
+    {
+        return Err(libc::EPROTO);
+    }
+    if response.status != 0 {
+        return Err(response.status);
+    }
+    Ok(())
+}
+
 fn lookup_rootd_endpoint() -> Result<u64, i32> {
     let endpoint = lookup_service_endpoint(IPC_SERVICE_ROOTD);
     if endpoint < 0 {
@@ -144,4 +158,23 @@ fn current_tid() -> u64 {
     // SAFETY: `gettid` has no pointer arguments and returns the calling
     // thread's kernel identity without borrowing userspace memory.
     unsafe { libc::syscall(libc::SYS_gettid as libc::c_long) as u64 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rootd_error_reply_preserves_retryable_errno_without_success_fields() {
+        let request = CommercialMaxProtocolRequest::default();
+        let mut response = CommercialMaxProtocolResponse {
+            header: request.header,
+            status: libc::EAGAIN,
+            ..CommercialMaxProtocolResponse::default()
+        };
+        let size = size_of::<CommercialMaxProtocolResponse>() as i64;
+        assert_eq!(check_rootd_status(size, &request, &response), Err(libc::EAGAIN));
+        response.header.subject_pid = 42;
+        assert_eq!(check_rootd_status(size, &request, &response), Err(libc::EPROTO));
+    }
 }

@@ -108,6 +108,14 @@ fn log_console_user_buffer_failure(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn console_reads_only_block_before_progress_and_without_nonblock() {
+        assert!(super::console_read_should_block(false, 0));
+        assert!(!super::console_read_should_block(true, 0));
+        assert!(!super::console_read_should_block(false, 1));
+        assert!(!super::console_read_should_block(true, 1));
+    }
+
+    #[test]
     fn system_console_debug_mirror_never_writes_raw_user_bytes() {
         let source = include_str!("console.rs");
         let payload = "&chunk[..chunk_len]);";
@@ -121,6 +129,7 @@ mod tests {
 pub(crate) fn read_into_current_process(
     user_ptr: u64,
     len: usize,
+    nonblocking: bool,
 ) -> Result<usize, paging::AddressSpaceError> {
     usermem::validate_current_user_write_buffer(user_ptr, len)?;
 
@@ -132,7 +141,7 @@ pub(crate) fn read_into_current_process(
 
     while total_read < len {
         let chunk_len = min(len - total_read, chunk.len());
-        let read = if total_read == 0 {
+        let read = if console_read_should_block(nonblocking, total_read) {
             tty::read_input_blocking_for_session(session, &mut chunk[..chunk_len])
         } else {
             tty::read_input_for_session(session, &mut chunk[..chunk_len])
@@ -149,4 +158,8 @@ pub(crate) fn read_into_current_process(
     }
 
     Ok(total_read)
+}
+
+fn console_read_should_block(nonblocking: bool, completed: usize) -> bool {
+    !nonblocking && completed == 0
 }

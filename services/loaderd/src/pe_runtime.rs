@@ -688,7 +688,7 @@ fn quote_command_line_arg(arg: &str) -> String {
         match ch {
             '\\' => backslashes += 1,
             '"' => {
-                for _ in 0..=backslashes {
+                for _ in 0..(backslashes * 2 + 1) {
                     quoted.push('\\');
                 }
                 quoted.push('"');
@@ -908,4 +908,14 @@ fn pe_map_flags(characteristics: u32) -> Result<u64, i32> {
         flags |= PROC_BROKER_MAP_EXEC;
     }
     Ok(flags)
+}
+
+#[cfg(test)]
+mod command_line_tests {
+    use super::quote_command_line_arg;
+
+    #[test]
+    fn quotes_double_backslashes_before_embedded_quote() {
+        assert_eq!(quote_command_line_arg("a\\\"b"), "\"a\\\\\\\"b\"");
+    }
 }

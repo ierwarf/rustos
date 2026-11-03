@@ -14,7 +14,8 @@
 //!   admission may overshoot a limit by the pages in flight at that instant,
 //!   at most one per CPU; it never lets usage drift from the ledger counts.
 //! - **Failure:** admission false refuses the allocation like a watermark
-//!   denial. Charging never fails: a page already published stays charged.
+//!   denial. Charging a published page never refuses it; counter overflow is
+//!   a fatal invariant rather than a wrapped, unaccounted charge.
 //! - **Forbidden:** allocating, taking a lock, or sleeping; charging a root that
 //!   is not bound; unbinding a root that still owns data leaves.
 //! - **Evidence:** `memory-charge-conservation`, ledger unit tests.
@@ -149,14 +150,22 @@ pub fn usage(index: usize) -> u64 {
 pub fn would_admit(index: usize, pages: u64) -> bool {
     walk(index, |cell| {
         let limit = cell.limit.load(Ordering::Relaxed);
-        limit == UNLIMITED || cell.usage.load(Ordering::Relaxed).saturating_add(pages) <= limit
+        cell.usage
+            .load(Ordering::Relaxed)
+            .checked_add(pages)
+            .is_some_and(|total| limit == UNLIMITED || total <= limit)
     })
 }
 
 /// Charges `pages` to the group and every ancestor.
 pub fn charge(index: usize, pages: u64) {
     walk(index, |cell| {
-        let old = cell.usage.fetch_add(pages, Ordering::Relaxed);
+        let old = cell
+            .usage
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |usage| {
+                usage.checked_add(pages)
+            })
+            .expect("charge group usage overflow");
         let high = cell.high.load(Ordering::Relaxed);
         if high != UNLIMITED && old <= high && old.saturating_add(pages) > high {
             cell.high_events.fetch_add(1, Ordering::Relaxed);
@@ -181,6 +190,8 @@ pub fn uncharge(index: usize, pages: u64) {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     use super::*;
 
     // The groups are process-wide statics, so each test takes its own indices.
@@ -245,6 +256,17 @@ mod tests {
     fn returning_more_than_was_charged_is_a_hard_failure() {
         init_group(47, None);
         uncharge(47, 1);
+    }
+
+    #[test]
+    fn admission_rejects_usage_overflow_even_without_a_limit() {
+        init_group(48, None);
+        charge(48, u64::MAX);
+        assert!(!would_admit(48, 1));
+        let result = std::panic::catch_unwind(|| charge(48, 1));
+        assert!(result.is_err());
+        assert_eq!(usage(48), u64::MAX);
+        uncharge(48, u64::MAX);
     }
 
     #[test]

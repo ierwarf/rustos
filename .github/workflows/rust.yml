@@ -56,6 +56,10 @@ jobs:
       run: cargo xtask config check
     - name: Check OS build
       run: cargo xtask check
+    - name: Run Python host tooling tests
+      run: |
+        python3 tools/agent/test_kvm_ab.py
+        python3 tools/bench/test_linux_guest.py
     - name: Run host tests
       run: >
         cargo test

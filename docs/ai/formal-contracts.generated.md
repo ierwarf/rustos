@@ -2,20 +2,20 @@
 # Formal Contract Registry
 
 - Schema: `3`
-- Registry SHA-256: `11119b1620eec85c2d756bce59bddfc20c6d56c05fe31d6e974bb308c825263d`
-- Models: `159`
-- Whole flows: `78`
-- Transitions: `990`
+- Registry SHA-256: `999ed49a697e2e7b152fcbd461ce3e0d787b6a062d63e64e29308d4afa38cecf`
+- Models: `160`
+- Whole flows: `79`
+- Transitions: `991`
 - Product runtime scenarios: `3`
-- Exact source witnesses: `1459`
+- Exact source witnesses: `1460`
 - Apalache pilots: `3`
 - TLAPS theorem models: `2`
 - Runtime-traced models: `7`
 - Intentional-terminal exceptions: `92` (ceiling `92`)
 - Cyclic strongly connected components: `54`
-- Supporting model bindings: `132`
+- Supporting model bindings: `133`
 - Explicit critical/high risk surfaces: `244`
-- Additional source mappings: `370`
+- Additional source mappings: `373`
 
 | Flow | Severity | Owners | Models | Requirements | Hazards | Sinks |
 | --- | --- | --- | --- | ---: | ---: | --- |
@@ -28,6 +28,7 @@
 | `bootstrap-activation-handoff` | `critical` | kernel-ps | bootstrap-activation-handoff/BootstrapActivationHandoff | 12 | 12 | first-turn, revoked |
 | `bootstrap-content-admission` | `critical` | kernel-io-manager | filesystem-content-integrity/FilesystemContentIntegrity | 2 | 2 | admitted, rejected |
 | `capability-derivation-lifecycle` | `critical` | kernel-compat, kernel-executive, kernel-ipc-runtime, kernel-object, kernel-ps, rustos-user-abi | capability-derivation-lifecycle/CapabilityDerivationLifecycle, job-handle-publication/JobHandlePublication | 28 | 28 | rejected, revoked |
+| `child-wait-publication` | `high` | kernel-ps | child-wait-publication/ChildWaitPublication | 1 | 1 | woken |
 | `commercial-envelope` | `critical` | caller, kernel-ipc, netd, service | commercial-service-envelope/CommercialServiceEnvelope | 6 | 6 | admitted, malformed-replied, peer-closed, reply-rejected, timed-out |
 | `commercial-product-boot` | `critical` | kernel-io-manager, rootd, storaged, uiserver, vfsd, wayclick, xtask, xtask-kvm | acceptance-profile-publication/AcceptanceProfilePublication, dvm-block-startup/DvmBlockStartup, dvm-display-readiness/DvmDisplayReadiness, input-ingestion-worker/InputIngestionWorker, product-boot/ProductBoot, rootd-bootstrap/RootdBootstrap, runtime-trace-causal-selection/RuntimeTraceCausalSelection, ui-frame-budget/UiFrameBudget | 23 | 23 | control-ready, failed, presented, rejected, revoked, selected, storage-usable |
 | `cow-frame-lifecycle` | `critical` | kernel-mm, kernel-ps | cow-frame-lifecycle/CowFrameLifecycle | 4 | 4 | exclusive, rejected, validated |

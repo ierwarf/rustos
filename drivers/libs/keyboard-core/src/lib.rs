@@ -320,7 +320,7 @@ impl KeyboardDriver {
     /// events are discarded before the synthetic releases so consumers never
     /// observe stale text or a key press after its provider was revoked.
     pub fn reset_provider_state(&mut self) {
-        self.parser = ScanCodeParser::new();
+        self.parser.reset();
         self.events = RingBuffer::new();
         self.text = RingBuffer::new();
         self.caps_lock = false;
@@ -440,6 +440,14 @@ impl ScanCodeParser {
             ScanCodeSet::Set2 => ScanCodeDecoder::Set2(ScancodeSet2::new()),
         };
         self.hidden_pause_prefix = false;
+    }
+
+    fn reset(&mut self) {
+        let scan_set = match self.decoder {
+            ScanCodeDecoder::Set1(_) => ScanCodeSet::Set1,
+            ScanCodeDecoder::Set2(_) => ScanCodeSet::Set2,
+        };
+        self.set_scan_set(scan_set);
     }
 
     fn push(&mut self, byte: u8) -> Option<ParsedKey> {
@@ -753,6 +761,16 @@ mod tests {
         keyboard.inject_key_transition(KeyCode::A, true);
         assert_eq!(keyboard.pop_event().unwrap().action, KeyAction::Pressed);
         assert_eq!(keyboard.pop_event().unwrap().action, KeyAction::Released);
+    }
+
+    #[test]
+    fn provider_reset_preserves_scan_code_set_and_clears_prefix() {
+        let mut keyboard = KeyboardDriver::new();
+        keyboard.set_scan_code_set(ScanCodeSet::Set2);
+        keyboard.feed_scancode(0xe0);
+        keyboard.reset_provider_state();
+        keyboard.feed_scancode(0x1c);
+        assert_eq!(keyboard.pop_event().unwrap().code, KeyCode::A);
     }
 
     #[test]

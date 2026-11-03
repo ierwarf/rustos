@@ -6,3 +6,9 @@ publish = false
 
 [dependencies]
 fatfs = { git = "https://github.com/rafalh/rust-fatfs", default-features = false, features = ["alloc", "lfn"] }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+
+[package.metadata.kani.flags]
+default-unwind = "8"

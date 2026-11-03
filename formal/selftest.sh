@@ -105,6 +105,7 @@ done
     exit 1
 }
 python3 formal/run-spec-mutations.py --check
+python3 formal/test-lane-cache.py
 python3 formal/test-implementation-mutation-runner.py
 python3 formal/test-recovery-runner.py
 for registry in \

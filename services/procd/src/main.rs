@@ -1,5 +1,8 @@
-#![no_std]
-#![no_main]
+#![cfg_attr(not(test), no_std)]
+#![cfg_attr(not(test), no_main)]
+// TEST-HARNESS: the host test target omits the service entry, so the production
+// request graph is unreachable only in that harness.
+#![cfg_attr(test, allow(dead_code, unused_imports))]
 
 extern crate alloc;
 
@@ -63,6 +66,7 @@ static PROCESS_SIGNAL_POLICY: Mutex<BTreeMap<u64, ProcessSignalPolicy>> =
 static THREAD_SIGNAL_POLICY: Mutex<BTreeMap<(u64, u64), ThreadSignalPolicy>> =
     Mutex::new(BTreeMap::new());
 
+#[cfg(not(test))]
 rustos_svc_runtime::entry!(service_main);
 
 #[cfg(not(test))]
@@ -71,6 +75,7 @@ fn panic(_info: &PanicInfo<'_>) -> ! {
     loop {}
 }
 
+#[cfg(not(test))]
 #[no_mangle]
 pub extern "C" fn rust_eh_personality() {}
 
@@ -519,7 +524,8 @@ fn handle_exec(request: &ProcdIpcRequest, response: &mut ProcdIpcResponse) {
         response.status = (-call) as i32;
         return;
     }
-    if loader_response.version != LOADER_REQUEST_ABI_VERSION
+    if call as usize != size_of::<LoaderSpawnResponse>()
+        || loader_response.version != LOADER_REQUEST_ABI_VERSION
         || loader_response.op != LOADER_OP_EXEC_TARGET
         || loader_response.reserved0 != 0
     {
@@ -760,11 +766,11 @@ fn handle_sigaltstack(request: &ProcdIpcRequest, response: &mut ProcdIpcResponse
 }
 
 fn handle_tgkill(request: &ProcdIpcRequest, response: &mut ProcdIpcResponse) {
-    let signal = request.arg2 as u32;
-    if signal > 64 {
+    if request.arg2 > 64 {
         response.status = EINVAL;
         return;
     }
+    let signal = request.arg2 as u32;
     let args = RustosProcSignalQueueBrokerArgs {
         abi_version: rustos_user_abi::syscall::PROC_BROKER_ABI_VERSION,
         signal,
@@ -808,14 +814,14 @@ fn handle_select_signal(request: &ProcdIpcRequest, response: &mut ProcdIpcRespon
     let sigchld_events = if signal == SIGCHLD {
         let events = request.arg1 as u32;
         if request.arg1 > u64::from(u32::MAX) || events & !PROCD_SIGCHLD_EVENT_MASK != 0 {
-            response.status = -EINVAL;
+            response.status = EINVAL;
             return;
         }
         response.reserved0 = events;
         events
     } else {
         if request.arg1 != 0 {
-            response.status = -EINVAL;
+            response.status = EINVAL;
             return;
         }
         0
@@ -1011,4 +1017,30 @@ fn copy_payload<T>(response: &mut ProcdIpcResponse, value: &T) {
 fn read_unaligned<T: Copy>(bytes: &[u8]) -> T {
     assert!(bytes.len() >= size_of::<T>());
     unsafe { core::ptr::read_unaligned(bytes.as_ptr().cast::<T>()) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tgkill_rejects_signal_before_narrowing() {
+        let mut request = ProcdIpcRequest::default();
+        request.arg2 = (1_u64 << 32) | 9;
+        let mut response = ProcdIpcResponse::default();
+        handle_tgkill(&request, &mut response);
+        assert_eq!(response.status, EINVAL);
+    }
+
+    #[test]
+    fn select_signal_invalid_event_flags_use_positive_errno() {
+        let mut request = ProcdIpcRequest::default();
+        request.pid = u64::MAX;
+        request.tid = u64::MAX;
+        request.arg0 = 1 << (SIGCHLD - 1);
+        request.arg1 = 1 << 32;
+        let mut response = ProcdIpcResponse::default();
+        handle_select_signal(&request, &mut response);
+        assert_eq!(response.status, EINVAL);
+    }
 }

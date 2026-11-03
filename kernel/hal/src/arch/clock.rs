@@ -33,6 +33,9 @@ const HPET_COUNTER_64_BIT_CAPABLE: u64 = 1 << 13;
 const FEMTOSECONDS_PER_SECOND: u128 = 1_000_000_000_000_000;
 const FEMTOSECONDS_PER_NANOSECOND: u128 = 1_000_000;
 const TSC_CALIBRATION_NANOS: u64 = 20_000_000;
+// This is a failure bound, not a clock: exhausting it never admits a rate.
+// A stalled HPET must not hang boot indefinitely.
+const HPET_CALIBRATION_POLL_LIMIT: usize = 10_000_000;
 const MIN_TSC_HZ: u64 = 1_000_000;
 const MAX_TSC_HZ: u64 = 10_000_000_000;
 
@@ -127,12 +130,20 @@ pub fn init() -> Option<ClockSourceInfo> {
         return current_source();
     }
 
-    let hpet = init_hpet();
+    let mut hpet = init_hpet();
     let invariant_supported = invariant_tsc_supported();
     let cpuid_frequency_hz = invariant_supported.then(cpuid_tsc_frequency_hz).flatten();
-    let calibrated_frequency_hz = (invariant_supported && cpuid_frequency_hz.is_none())
-        .then(|| hpet.and_then(calibrate_tsc_with_hpet))
-        .flatten();
+    let calibrated_frequency_hz = if invariant_supported && cpuid_frequency_hz.is_none() {
+        let calibrated = hpet.and_then(calibrate_tsc_with_hpet);
+        if calibrated.is_none() {
+            // Calibration failure may mean the HPET stopped after its initial
+            // progress check. Do not publish that same untrusted counter.
+            hpet = None;
+        }
+        calibrated
+    } else {
+        None
+    };
     *TSC_FACTS.lock() = TscAdmissionFacts {
         invariant_supported,
         cpuid_frequency_hz,
@@ -534,8 +545,8 @@ fn calibrate_tsc_with_hpet((base, period_fs, _): (u64, u64, u64)) -> Option<u64>
     let hpet_start = read_hpet_counter(base);
     let tsc_start = read_tsc_ordered();
     let target = hpet_start.checked_add(calibration_ticks)?;
-    while read_hpet_counter(base) < target {
-        spin_loop();
+    if !poll_counter_until(target, HPET_CALIBRATION_POLL_LIMIT, || read_hpet_counter(base)) {
+        return None;
     }
     let tsc_end = read_tsc_ordered();
     let hpet_end = read_hpet_counter(base);
@@ -549,6 +560,16 @@ fn calibrate_tsc_with_hpet((base, period_fs, _): (u64, u64, u64)) -> Option<u64>
         .checked_mul(FEMTOSECONDS_PER_SECOND)?
         .checked_div(elapsed_fs)?;
     u64::try_from(hz).ok()
+}
+
+fn poll_counter_until(target: u64, limit: usize, mut read: impl FnMut() -> u64) -> bool {
+    for _ in 0..limit {
+        if read() >= target {
+            return true;
+        }
+        spin_loop();
+    }
+    false
 }
 
 fn invariant_tsc_supported() -> bool {
@@ -688,6 +709,15 @@ fn hpet_frequency_hz(period_fs: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hpet_calibration_poll_rejects_a_stalled_counter() {
+        let mut reads = 0;
+        assert!(!poll_counter_until(10, 3, || { reads += 1; 9 }));
+        assert_eq!(reads, 3);
+        assert!(poll_counter_until(10, 3, || { reads += 1; reads + 6 }));
+        assert!(!poll_counter_until(0, 0, || 0));
+    }
 
     #[test]
     fn tsc_delta_conversion_is_exact_for_common_frequencies() {

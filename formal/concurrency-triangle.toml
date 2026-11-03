@@ -39,6 +39,19 @@ shuttle_test = "application_limit_drain_waits_for_process_and_page_retirement_pc
 herd_not_applicable = "rootd owns one serial probe state machine and adds no atomic publication; existing MM atomics and ledger teardown are outside this mutex projection"
 
 [[scenario]]
+id = "child-wait-publication"
+severity = "high"
+flow = "child-wait-publication"
+model = "child-wait-publication/ChildWaitPublication"
+source = "kernel/ps/src/multitask/child_wait.rs"
+source_symbol = "register_child_waiter"
+source_anchors = ["compare_exchange(0, task_id, Ordering::Acquire, Ordering::Relaxed)", "slot.parent.store(parent_pid, Ordering::Release);", "fence(Ordering::SeqCst);", "slot.task.load(Ordering::Acquire)"]
+invariant = "one reused slot and process-table status lock preserve pending recheck or wake of new task; no scheduler commit or signal proof"
+loom_test = "child_wait_reuse_and_recheck_cannot_lose_published_status"
+shuttle_test = "child_wait_reuse_and_recheck_cannot_lose_published_status_pct"
+herd_not_applicable = "the child status publication and recheck serialize on PROCESS_TABLE; a standalone fence litmus would omit that decisive lock and misrepresent the source"
+
+[[scenario]]
 id = "endpoint-publication"
 severity = "critical"
 flow = "endpoint-lifecycle"

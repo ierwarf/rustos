@@ -1060,7 +1060,7 @@ pub const VFS_LIFECYCLE_EXEC_CLOEXEC: u16 = 2;
 pub const VFS_LIFECYCLE_EXIT: u16 = 3;
 pub const VFS_LIFECYCLE_DUP: u16 = 4;
 pub const VFS_LIFECYCLE_CLOSE: u16 = 5;
-pub const BLOCK_BROKER_ABI_VERSION: u16 = 3;
+pub const BLOCK_BROKER_ABI_VERSION: u16 = 4;
 pub const BLOCK_BROKER_OP_DVM_INFO: u16 = 1;
 pub const BLOCK_BROKER_OP_DVM_SUBMIT_READ: u16 = 2;
 pub const BLOCK_BROKER_OP_DVM_SUBMIT_WRITE: u16 = 3;
@@ -2151,7 +2151,8 @@ pub struct RustosBlockBrokerArgs {
     pub buffer_ptr: u64,
     pub buffer_len: u64,
     pub timeout_ms: u64,
-    pub reserved0: u64,
+    /// Nonzero expected transport epoch for submissions; zero for other operations.
+    pub expected_generation: u64,
     pub ticket: DvmBlockTicketWire,
     pub out_ticket_ptr: u64,
     pub out_info_ptr: u64,

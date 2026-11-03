@@ -104,8 +104,11 @@ impl TransportLifecycle {
     }
 
     pub(crate) fn try_claim(&self, expected_epoch: u64) -> Option<TransportClaim<'_>> {
+        if expected_epoch == 0 || expected_epoch > MAX_EPOCH {
+            return None;
+        }
         let expected = pack(expected_epoch, TransportState::Active);
-        if expected_epoch == 0 || self.state_epoch.load(Ordering::Acquire) != expected {
+        if self.state_epoch.load(Ordering::Acquire) != expected {
             return None;
         }
         self.in_flight
@@ -263,6 +266,15 @@ impl Drop for TransportClaim<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversized_claim_epoch_cannot_alias_a_live_epoch() {
+        let lifecycle = TransportLifecycle::detached();
+        assert!(lifecycle.activate(7));
+        assert!(lifecycle.try_claim(7).is_some());
+        assert!(lifecycle.try_claim(7 + (1_u64 << (64 - STATE_BITS))).is_none());
+        assert_eq!(lifecycle.in_flight(), 0);
+    }
 
     #[test]
     fn drain_closes_admission_and_waits_for_exact_claim() {

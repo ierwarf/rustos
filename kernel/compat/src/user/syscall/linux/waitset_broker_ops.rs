@@ -107,6 +107,13 @@ static PUBLISHED_READINESS: [PublishedReadiness; PUBLISHED_READINESS_CAPACITY] =
 
 fn publish_provider_readiness(provider: u16, object_id: u64, generation: u64, ready: bool) {
     let state = (generation << 1) | u64::from(ready);
+    // Slot claiming is a two-word write (object id, then provider). Two
+    // publishers for different objects of one provider could both pass the
+    // `claimed == 0` test on the same free slot, and the CAS loser's object-id
+    // store would retarget the winner's slot to a different object. The
+    // registry lock serialises claims; readers stay lock-free. Nothing below
+    // takes another lock.
+    let _claims = WAITSET_WAITERS.lock();
     for slot in PUBLISHED_READINESS.iter() {
         // ORDERING: Acquire pairs with the Release claim below, so a reader
         // that sees the provider also sees the object id it was claimed for.
@@ -469,6 +476,35 @@ mod tests {
     use spin::Mutex;
 
     static WAITSET_TEST_GUARD: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn concurrent_publications_never_retarget_a_claimed_readiness_slot() {
+        extern crate std;
+        let _guard = WAITSET_TEST_GUARD.lock();
+        let publishers = [0_u64, 1, 2, 3].map(|lane| {
+            std::thread::spawn(move || {
+                for step in 0..3_u64 {
+                    let object = 0x7e57_0000 + lane * 3 + step;
+                    super::publish_provider_readiness(
+                        WAITSET_PROVIDER_SESSIOND,
+                        object,
+                        100 + object,
+                        object % 2 == 0,
+                    );
+                }
+            })
+        });
+        for publisher in publishers {
+            publisher.join().unwrap();
+        }
+        for object in 0x7e57_0000_u64..0x7e57_0000 + 12 {
+            assert_eq!(
+                super::published_provider_readiness(WAITSET_PROVIDER_SESSIOND, object),
+                Some((object % 2 == 0, 100 + object)),
+                "object {object:#x} lost or aliased its own readiness"
+            );
+        }
+    }
 
     #[test]
     fn readiness_generation_requires_a_strict_monotonic_advance() {

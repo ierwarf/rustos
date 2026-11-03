@@ -2408,8 +2408,8 @@ pub const RUSTOS_INPUT_KIND_SESSION_END: u8 = 3;
 pub const RUSTOS_INPUT_KIND_POINTER_POSITION: u8 = 4;
 pub const LINUX_EVDEV_KEY_MAX: u16 = 0x02ff;
 pub const RUSTOS_POINTER_BUTTON_MASK: u8 = 0x1f;
-pub const RUSTOS_POINTER_POSITION_MAX_X: u16 = 1599;
-pub const RUSTOS_POINTER_POSITION_MAX_Y: u16 = 899;
+pub const RUSTOS_POINTER_POSITION_MAX_X: u16 = 2559;
+pub const RUSTOS_POINTER_POSITION_MAX_Y: u16 = 1439;
 
 /// L0 is the only producer of this fixed input ring. The Linux DVM sends
 /// evdev records to L0 over its authenticated control channel; it never maps
@@ -4010,8 +4010,9 @@ mod tests {
         assert_eq!(bytes[5], RUSTOS_INPUT_KIND_POINTER_POSITION);
         assert_eq!(u16::from_be_bytes(bytes[16..18].try_into().unwrap()), 800);
         assert_eq!(u16::from_be_bytes(bytes[18..20].try_into().unwrap()), 450);
-        assert!(RustosInputFrame::linux_evdev_pointer_position(7, 2, 1600, 450, 0, 0, 0).is_err());
-        assert!(RustosInputFrame::linux_evdev_pointer_position(7, 2, 800, 900, 0, 0, 0).is_err());
+        assert!(RustosInputFrame::linux_evdev_pointer_position(7, 2, 2560, 450, 0, 0, 0).is_err());
+        assert!(RustosInputFrame::linux_evdev_pointer_position(7, 2, 800, 1440, 0, 0, 0).is_err());
+        assert!(RustosInputFrame::linux_evdev_pointer_position(7, 3, 2559, 1439, 0, 0, 0).is_ok());
     }
 }
 

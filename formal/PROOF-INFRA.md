@@ -26,6 +26,13 @@ into an implementation-wide or certification claim.
 | Source decision witnesses | `run-source-conformance.sh` | The exact typed count in `docs/ai/formal-contracts.generated.md` executes mapped high-risk lifecycle, RPC, and IPC decisions; a duplicate, missing, renamed, or filtered witness fails the gate | Full transition-system equivalence, concurrency beyond the tested decision, target hardware, or the other registered models |
 | Mutation sensitivity | run-spec-mutations.sh; run-herd.sh; run-implementation-mutations.sh | Each registered TLA+ property/transition mutant is killed by its named invariant and normalized counterexample trace; each herd7 order mutant reaches its exact forbidden outcome; critical/high implementation mutants are injected at a sealed exact source anchor and killed by their one resolved exact witness rather than compile or foreign-target failure | Completeness against every possible mutation, source equivalence, or a production execution of a temporary model mutant |
 
+TLC reuse requires a closed pinned-module context and the runner input binding
+for both profile and individual proofs; unbound imports or resolver overrides
+force a fresh run. The concurrency triangle cache keys its declared checkout scope, complete
+environment, command, executable identities and herd model library. Writable
+Cargo/build trees and host system files remain observable and unbound; nightly
+disables reuse. This is a bounded approximation, not a hermetic proof.
+
 Exact TLC reuse also reserves five minutes of remaining cache lifetime before a
 PR or SMP iteration begins. This prevents a pass admitted at run start from
 crossing the 24-hour boundary while Kani, mutation, and concurrency lanes finish

@@ -131,7 +131,7 @@ fn revoke_reason_codes_are_nonzero_and_unique() {
 fn revoke_reports_once_before_clearing_and_is_terminal() {
     let (_aperture, _registers, mut state) = test_state();
     let ticket = state
-        .submit(DvmBlockOperation::Read, 8, &[], 4096, false)
+        .submit(7, DvmBlockOperation::Read, 8, &[], 4096, false)
         .expect("valid request must occupy a slot before revoke");
     let expected_flags = state.geometry.flags & !DVM_BLOCK_FLAG_DVM_READY;
     let observed_flags = state.geometry.flags;
@@ -162,7 +162,7 @@ fn revoke_reports_once_before_clearing_and_is_terminal() {
     );
     assert_eq!(reports, 1);
     assert_eq!(
-        state.submit(DvmBlockOperation::Read, 8, &[], 4096, false),
+        state.submit(7, DvmBlockOperation::Read, 8, &[], 4096, false),
         Err(DvmBlockError::Revoked)
     );
 }
@@ -191,11 +191,36 @@ fn readiness_publication_is_conditional_and_non_mutating_on_mismatch() {
 }
 
 #[test]
+fn stale_submission_never_spends_the_replacement_transport() {
+    let (aperture, registers, mut state) = test_state();
+    let before = aperture.clone();
+    let request_id = state.next_request_id;
+    let operation_id = state.next_operation_id;
+    // Models an INFO observation followed by revoke/rebind before submission:
+    // the installed successor is 7, while the request still expects 6.
+    for expected in [0, 6, 8] {
+        for operation in [DvmBlockOperation::Read, DvmBlockOperation::Write, DvmBlockOperation::Flush] {
+            let bytes = [0x5a; 4096];
+            let data = if matches!(operation, DvmBlockOperation::Write) { &bytes[..] } else { &[][..] };
+            let (sector, len) = if matches!(operation, DvmBlockOperation::Flush) { (0, 0) } else { (8, 4096) };
+            assert_eq!(state.submit(expected, operation, sector, data, len, false), Err(DvmBlockError::Revoked));
+        }
+    }
+    assert_eq!(state.next_request_id, request_id);
+    assert_eq!(state.next_operation_id, operation_id);
+    assert_eq!(state.request_producer, 0);
+    assert!(state.pending.iter().all(Option::is_none));
+    assert_eq!(aperture, before);
+    assert!(registers.iter().all(|&value| value == 0));
+    assert!(!state.revoked);
+}
+
+#[test]
 fn request_and_completion_bind_exact_slot_epoch_and_durability() {
     let (mut aperture, registers, mut state) = test_state();
     let data = vec![0x5a_u8; 4096];
     let ticket = state
-        .submit(DvmBlockOperation::Write, 8, &data, 4096, true)
+        .submit(7, DvmBlockOperation::Write, 8, &data, 4096, true)
         .unwrap();
     let request_offset = DVM_BLOCK_REQUEST_RING_OFFSET as usize;
     let request: [u8; DVM_BLOCK_RECORD_BYTES] = aperture_bytes(&mut aperture)
@@ -239,7 +264,7 @@ fn request_and_completion_bind_exact_slot_epoch_and_durability() {
 fn valid_flush_completion_keeps_transport_live_for_first_64kib_read() {
     let (mut aperture, _registers, mut state) = test_state();
     let flush = state
-        .submit(DvmBlockOperation::Flush, 0, &[], 0, false)
+        .submit(7, DvmBlockOperation::Flush, 0, &[], 0, false)
         .expect("valid flush must submit");
     let request_offset = DVM_BLOCK_REQUEST_RING_OFFSET as usize;
     let request = DvmBlockRequest::decode(
@@ -272,6 +297,7 @@ fn valid_flush_completion_keeps_transport_live_for_first_64kib_read() {
 
     let read = state
         .submit(
+            7,
             DvmBlockOperation::Read,
             8,
             &[],
@@ -349,7 +375,7 @@ fn valid_flush_completion_keeps_transport_live_for_first_64kib_read() {
 fn stale_completion_revokes_the_transport() {
     let (mut aperture, _registers, mut state) = test_state();
     let ticket = state
-        .submit(DvmBlockOperation::Read, 8, &[], 4096, false)
+        .submit(7, DvmBlockOperation::Read, 8, &[], 4096, false)
         .unwrap();
     let completion = DvmBlockCompletion {
         generation: ticket.generation - 1,
@@ -404,7 +430,7 @@ fn fault_points_cover_reads_mutations_and_durability() {
         let request_id = state.next_request_id;
         let operation_id = state.next_operation_id;
         assert_eq!(
-            state.submit_with_fault_decision(operation, 8, data, data_len, false, |_| true),
+            state.submit_with_fault_decision(7, operation, 8, data, data_len, false, |_| true),
             Err(DvmBlockError::DeviceFault)
         );
         assert_eq!(state.next_request_id, request_id);
@@ -426,7 +452,7 @@ fn fault_points_cover_reads_mutations_and_durability() {
 
     let (mut aperture, registers, mut state) = test_state();
     let ticket = state
-        .submit_with_fault_decision(DvmBlockOperation::Flush, 0, &[], 0, false, |_| true)
+        .submit_with_fault_decision(7, DvmBlockOperation::Flush, 0, &[], 0, false, |_| true)
         .expect("fault injection must preserve a real DVM request/completion round trip");
     assert_eq!(state.request_producer, 1);
     assert_eq!(
@@ -465,7 +491,7 @@ fn fault_points_cover_reads_mutations_and_durability() {
 fn cancellation_keeps_the_slot_owned_until_the_exact_completion() {
     let (mut aperture, _registers, mut state) = test_state();
     let ticket = state
-        .submit(DvmBlockOperation::Read, 8, &[], 4096, false)
+        .submit(7, DvmBlockOperation::Read, 8, &[], 4096, false)
         .unwrap();
     state.cancel(ticket).unwrap();
     assert!(state.pending[ticket.data_slot as usize].is_some());
@@ -504,6 +530,7 @@ fn invalid_submission_does_not_consume_request_or_operation_identity() {
     let operation_id = state.next_operation_id;
     assert_eq!(
         state.submit_with_fault_decision(
+            7,
             DvmBlockOperation::Write,
             u64::MAX,
             &[0_u8; 4096],

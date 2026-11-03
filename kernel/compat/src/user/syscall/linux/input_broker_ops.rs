@@ -100,6 +100,18 @@ pub(super) fn syscall_linux_rustos_input_ingest_broker(args_ptr: u64) -> u64 {
     }
     // The MSI-X leaf only wakes waiters. This capability-gated broker copies
     // fixed records; inputd performs every semantic and lifecycle check.
+    // The drain below consumes ring records irreversibly, so a bad output
+    // buffer must be refused before it, not after the batch is already lost.
+    let Some(records_byte_cap) = capacity.checked_mul(core::mem::size_of::<InputDvmRecordWire>())
+    else {
+        return linux_errno(LINUX_EINVAL);
+    };
+    if let Err(err) = usermem::validate_current_user_write_buffers(&[
+        (args.out_records_ptr, records_byte_cap),
+        (args.out_count_ptr, 4),
+    ]) {
+        return linux_errno(address_space_error_to_linux_errno(err));
+    }
     let mut records = alloc::vec![InputDvmRecordWire::default(); capacity];
     let count = kernel_io_manager::api::input::service_dvm_input_pending(&mut records);
     let byte_len = match count.checked_mul(core::mem::size_of::<InputDvmRecordWire>()) {

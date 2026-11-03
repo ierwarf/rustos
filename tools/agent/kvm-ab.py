@@ -23,8 +23,10 @@ The run is read-only for the treatment tree: it only invokes `cargo xtask kvm-sm
 """
 import argparse
 import math
+import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -63,8 +65,26 @@ def selftest() -> int:
 
 
 def run(cmd, cwd, check=True, timeout=None, capture=False):
-    return subprocess.run(cmd, cwd=cwd, check=check, timeout=timeout, text=True,
-                          capture_output=capture)
+    if timeout is None:
+        return subprocess.run(cmd, cwd=cwd, check=check, text=True, capture_output=capture)
+    # Cargo launches xtask and QEMU descendants. Killing only cargo on timeout
+    # leaves guests running and can contaminate subsequent experiments.
+    with subprocess.Popen(cmd, cwd=cwd, text=True, start_new_session=True,
+                          stdout=subprocess.PIPE if capture else None,
+                          stderr=subprocess.PIPE if capture else None) as process:
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.communicate()
+            raise
+        result = subprocess.CompletedProcess(cmd, process.returncode, stdout, stderr)
+        if check:
+            result.check_returncode()
+        return result
 
 
 def provision_control_artifacts() -> None:

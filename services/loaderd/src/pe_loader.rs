@@ -360,19 +360,21 @@ fn resolve_import_closure(
     registry: &[SystemDllEntry],
     next_base: &mut u64,
 ) -> Result<(), i32> {
+    // Main may load a DLL not already in the preload set. Patch it first so
+    // every newly discovered DLL is visited by the growing worklist below.
+    patch_module_imports(main, modules, registry, next_base)?;
     let mut cursor = 0;
-    while cursor <= modules.len() {
+    while cursor < modules.len() {
         if modules.len() > PE_MAX_IMPORT_MODULES {
             return Err(ENOEXEC);
-        }
-        if cursor == modules.len() {
-            patch_module_imports(main, modules, registry, next_base)?;
-            break;
         }
         let mut module = modules.remove(cursor);
         patch_module_imports(&mut module, modules, registry, next_base)?;
         module.imports_patched = true;
         modules.insert(cursor, module);
+        if modules.len() > PE_MAX_IMPORT_MODULES {
+            return Err(ENOEXEC);
+        }
         cursor += 1;
     }
     Ok(())

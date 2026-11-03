@@ -469,8 +469,7 @@ pub fn claim_ipc_transfer_entries_by_tickets(
         // description it received on, and once a batch is bound to one, no
         // other description in the receiver set can take it.
         || receiver_open_description == 0
-        || (context.receiver_open_description != 0
-            && context.receiver_open_description != receiver_open_description)
+        || context.receiver_open_description != receiver_open_description
     {
         return Err(IpcTransferRegistryError::BindingMismatch);
     }
@@ -701,6 +700,24 @@ mod transfer_registry_tests {
         assert_eq!(tickets.len(), 1);
         commit_ipc_transfer_enqueue(&tickets).expect("publish queue ownership");
 
+        // A claim on a batch that is not yet bound to an open description is
+        // refused whatever else it presents.
+        assert!(matches!(
+            claim_ipc_transfer_entries_by_tickets(
+                &tickets, receiver, service, channel, context.stream_start,
+                RECEIVER_OPEN_DESCRIPTION,
+            ),
+            Err(IpcTransferRegistryError::BindingMismatch)
+        ));
+        // Bind the description first: each rejection below must then come from
+        // its own receiver/service/channel/stream check, not from the
+        // description check that would refuse every claim on an unbound batch.
+        bind_ipc_transfer_receiver_by_tickets(
+            &tickets, receiver, service, channel, context.stream_start,
+            RECEIVER_OPEN_DESCRIPTION,
+        )
+        .expect("bind receiving open description");
+
         for rejected in [
             claim_ipc_transfer_entries_by_tickets(
                 &tickets,
@@ -769,6 +786,13 @@ mod transfer_registry_tests {
             Err(IpcTransferRegistryError::StaleDescriptor)
         ));
 
+        assert!(matches!(
+            claim_ipc_transfer_entries_by_tickets(
+                &tickets, receiver, service, channel, context.stream_start,
+                RECEIVER_OPEN_DESCRIPTION + 1,
+            ),
+            Err(IpcTransferRegistryError::BindingMismatch)
+        ));
         let entries = claim_ipc_transfer_entries_by_tickets(
             &tickets,
             receiver,

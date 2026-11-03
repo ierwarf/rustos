@@ -381,9 +381,12 @@ rather than untyped payload formats.
 ### Job and supervisor management ABIs
 
 - SYS_RUSTOS_JOB_KMEM (0x5255_005e): versioned INSPECT and SET_LIMIT for the
-  exact boxed ProcessObject allocation byte dimension. This is **not** a
-  general kmem allocator ledger yet. Loaderd obtains actual kernel-reported
-  object size before setting application Job limits.
+  exact boxed ProcessObject allocation byte dimension, plus INSPECT_CLASS and
+  SET_CLASS_LIMIT for six separately accounted classes: handle-table slots,
+  endpoint queues, page-table frames, user-thread kernel stacks, shared-mapping
+  records, and queued IPC messages. This is **not** a total kmem allocator
+  ledger. Loaderd obtains actual kernel-reported object size before setting
+  application Job limits; class-specific limits and evidence remain distinct.
 - SYS_RUSTOS_JOB_SESSION (0x5255_005b), version 2: provider-PID and exact token
   support; kernel retains token/release watermark and rootd process-crash drain.
 - SYS_RUSTOS_JOB_MEMORY_QOS (0x5255_005c): nonblocking memory.high threshold

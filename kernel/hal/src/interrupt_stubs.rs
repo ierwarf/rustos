@@ -459,11 +459,26 @@ global_asm!(
         mov rbp, rsp
         push r12
         push r13
+        push rdi
+        push rsi
+        push rdx
+        push rcx
+        push r8
         mov r10, [rcx]
         mov r11, [rcx + 8]
         sub rsp, 0x1b0
         and rsp, -16
         mov r12, rsp
+        // The Rust dispatcher forms &SavedContext and eagerly reads both IPC
+        // argument tuples. Every field must be initialized, even on decline.
+        cld
+        xor eax, eax
+        mov ecx, 0x36
+        mov rdi, r12
+        rep stosq
+        mov rdi, [rbp - 24]
+        mov rsi, [rbp - 32]
+        mov rdx, [rbp - 40]
         movabs rax, {fast_ipc_call_schedule_tag}
         mov [r12 + 0x00], rax
         mov [r12 + 0x18], rdx
@@ -545,11 +560,26 @@ global_asm!(
         mov rbp, rsp
         push r12
         push r13
+        push rdi
+        push rsi
+        push rdx
+        push rcx
+        push r8
         mov r10, [r9]
         mov r11, [r9 + 8]
         sub rsp, 0x1b0
         and rsp, -16
         mov r12, rsp
+        cld
+        xor eax, eax
+        mov ecx, 0x36
+        mov rdi, r12
+        rep stosq
+        mov rdi, [rbp - 24]
+        mov rsi, [rbp - 32]
+        mov rdx, [rbp - 40]
+        mov rcx, [rbp - 48]
+        mov r8, [rbp - 56]
         movabs rax, {fast_ipc_reply_schedule_tag}
         mov [r12 + 0x00], rax
         mov [r12 + 0x10], rcx
@@ -613,7 +643,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_fast_ipc_schedule_builds_only_the_words_the_handler_and_the_resume_read() {
+    fn direct_fast_ipc_schedule_initializes_the_complete_context_before_dispatch() {
         let source = include_str!("interrupt_stubs.rs");
         for leaf in ["fast_ipc_call_direct_schedule", "fast_ipc_reply_direct_schedule"] {
             let body = source
@@ -623,6 +653,8 @@ mod tests {
                 .expect("direct schedule leaf");
             assert!(!body.contains("SAVE_CONTEXT"), "{leaf} must not save a full interrupt image");
             assert!(body.contains("call software_schedule_interrupt_dispatch"));
+            assert!(body.contains("mov ecx, 0x36"));
+            assert!(body.find("rep stosq").unwrap() < body.find("call software_schedule_interrupt_dispatch").unwrap());
             // Kernel-origin marker words, the resume RIP and the frame as RSP.
             assert!(body.contains("mov qword ptr [r12 + 0x178], 1"));
             assert!(body.contains("mov qword ptr [r12 + 0x180], 0"));

@@ -97,6 +97,8 @@ pub fn prepare_storage_handoff(
     validate_block_device_idle(sysfs_root, proc_root, device_root, &block_name)?;
     let node = device_root.join(&block_name);
     let (device, opened_writable) = open_exclusive_block_device(&node)?;
+    let admitted_number = read_trimmed(&sysfs_root.join("class/block").join(&block_name).join("dev"))?;
+    validate_opened_device_number(device.metadata()?.rdev(), &admitted_number)?;
     let geometry = read_block_geometry(&device, sysfs_root, &block_name)?;
     if !opened_writable && !geometry.read_only {
         bail!("physical block device denied writable open but BLKROGET reports writable media");
@@ -651,6 +653,17 @@ fn read_optional_u64(path: &Path) -> Result<Option<u64>> {
     }
 }
 
+fn validate_opened_device_number(device: libc::dev_t, admitted: &str) -> Result<()> {
+    validate_device_number(admitted)?;
+    let (major, minor) = admitted.split_once(':').expect("validated device number");
+    let major: u32 = major.parse().context("block device major number overflow")?;
+    let minor: u32 = minor.parse().context("block device minor number overflow")?;
+    if libc::major(device) != major || libc::minor(device) != minor {
+        bail!("opened block device does not match the admitted sysfs device number");
+    }
+    Ok(())
+}
+
 fn validate_device_number(value: &str) -> Result<()> {
     let Some((major, minor)) = value.split_once(':') else {
         bail!("invalid block device number");
@@ -669,7 +682,7 @@ fn validate_device_number(value: &str) -> Result<()> {
 mod tests {
     use super::{
         initialize_aperture, prepare_aperture, revoke_storage_aperture,
-        storage_epoch_identity_sha256, validate_block_device_idle,
+        storage_epoch_identity_sha256, validate_block_device_idle, validate_opened_device_number,
     };
     use driver_domain_protocol::{
         DVM_BLOCK_APERTURE_BYTES, DVM_BLOCK_FEATURE_FLUSH, DVM_BLOCK_FLAG_DVM_READY,
@@ -753,6 +766,16 @@ mod tests {
         let (_, _, next_generation) = prepare_aperture(&canonical).unwrap();
         assert_eq!(next_generation, 4);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn opened_block_device_must_match_the_admitted_sysfs_identity() {
+        let opened = libc::makedev(259, 7);
+        validate_opened_device_number(opened, "259:7").unwrap();
+        assert!(validate_opened_device_number(opened, "259:8").is_err());
+        assert!(validate_opened_device_number(opened, "260:7").is_err());
+        assert!(validate_opened_device_number(opened, "4294967296:7").is_err());
+        assert!(validate_opened_device_number(opened, "invalid").is_err());
     }
 
     #[test]

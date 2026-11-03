@@ -96,11 +96,12 @@ impl<const JOBS: usize, const ALLOCS: usize> ResourceLedger<JOBS, ALLOCS> {
             self.position(p).map_err(|_| Error::ParentMissing)?;
         }
         let slot = self.jobs.iter().position(Option::is_none).ok_or(Error::Capacity)?;
+        let next_revision = self.revision.checked_add(1).ok_or(Error::Overflow)?;
         self.jobs[slot] = Some(Job {
             key, parent, budget, charged: 0, high_events: 0,
             by_class: [0; AllocationClass::COUNT],
         });
-        self.revision = self.revision.checked_add(1).ok_or(Error::Overflow)?;
+        self.revision = next_revision;
         Ok(())
     }
     pub fn set_budget(&mut self, key: JobKey, budget: Budget) -> Result<(), Error> {
@@ -109,8 +110,9 @@ impl<const JOBS: usize, const ALLOCS: usize> ResourceLedger<JOBS, ALLOCS> {
         if self.jobs[index].ok_or(Error::MissingJob)?.charged > budget.max_bytes {
             return Err(Error::Quota);
         }
+        let next_revision = self.revision.checked_add(1).ok_or(Error::Overflow)?;
         self.jobs[index].as_mut().ok_or(Error::MissingJob)?.budget = budget;
-        self.revision = self.revision.checked_add(1).ok_or(Error::Overflow)?;
+        self.revision = next_revision;
         Ok(())
     }
     pub fn preview_charge(&self, owner: JobKey, bytes: u64) -> Result<(), Error> {
@@ -168,13 +170,14 @@ impl<const JOBS: usize, const ALLOCS: usize> ResourceLedger<JOBS, ALLOCS> {
                 return Err(Error::EvidenceMismatch);
             }
         }
+        let next_revision = self.revision.checked_add(1).ok_or(Error::Overflow)?;
         for &job_index in &chain[..len] {
             let job = self.jobs[job_index].as_mut().ok_or(Error::MissingJob)?;
             job.charged -= allocation.bytes;
             job.by_class[allocation.class.index()] -= allocation.bytes;
         }
         self.allocations[index] = None;
-        self.revision = self.revision.checked_add(1).ok_or(Error::Overflow)?;
+        self.revision = next_revision;
         Ok(())
     }
     pub fn usage(&self, key: JobKey) -> Result<(u64,u64),Error> {
@@ -190,8 +193,9 @@ impl<const JOBS: usize, const ALLOCS: usize> ResourceLedger<JOBS, ALLOCS> {
            || self.jobs.iter().flatten().any(|j|j.parent==Some(key)) {
             return Err(Error::Nonempty);
         }
+        let next_revision = self.revision.checked_add(1).ok_or(Error::Overflow)?;
         self.jobs[slot] = None;
-        self.revision = self.revision.checked_add(1).ok_or(Error::Overflow)?;
+        self.revision = next_revision;
         Ok(())
     }
     pub fn projected_headroom(&self,key:JobKey)->Result<u64,Error> {
@@ -220,6 +224,29 @@ impl<const J:usize,const A:usize> Default for ResourceLedger<J,A> {
 mod tests {
     use super::*;
     const B:Budget=Budget{max_bytes:100,high_bytes:80,min_bytes:10};
+    #[test]
+    fn revision_overflow_does_not_mutate_ledger() {
+        let mut ledger = ResourceLedger::<2, 1>::new();
+        let root = JobKey { slot: 1, generation: 1 };
+        let child = JobKey { slot: 2, generation: 1 };
+        let allocation = AllocationKey { id: 1, generation: 1 };
+        ledger.insert_job(root, None, B).unwrap();
+        ledger.record_kernel_charge(allocation, root, AllocationClass::PageTable, 5).unwrap();
+        ledger.revision = u64::MAX;
+        assert_eq!(ledger.insert_job(child, Some(root), B), Err(Error::Overflow));
+        assert_eq!(ledger.position(child), Err(Error::MissingJob));
+        let tighter = Budget { max_bytes: 50, high_bytes: 40, ..B };
+        assert_eq!(ledger.set_budget(root, tighter), Err(Error::Overflow));
+        assert_eq!(ledger.projected_headroom(root), Ok(95));
+        assert_eq!(ledger.record_kernel_release(allocation, root), Err(Error::Overflow));
+        assert_eq!(ledger.usage(root), Ok((5, 0)));
+        assert!(ledger.allocations[0].is_some());
+        ledger.revision = 0;
+        ledger.record_kernel_release(allocation, root).unwrap();
+        ledger.revision = u64::MAX;
+        assert_eq!(ledger.remove_job(root), Err(Error::Overflow));
+        assert!(ledger.position(root).is_ok());
+    }
     #[test]
     fn charges_all_ancestors_and_rejects_unfunded_sibling() {
         let mut l=ResourceLedger::<4,4>::new();

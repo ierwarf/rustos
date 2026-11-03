@@ -36,11 +36,11 @@
 #define PAGE_BYTES 4096UL
 #define SHARED_BYTES (1024UL * 1024UL)
 
-static volatile int stop;
+static int stop;
 static uint64_t maps_done;
 static uint64_t forks_done;
 static uint64_t fork_failures;
-static volatile int last_fork_errno;
+static int last_fork_errno;
 static char *shared;
 
 static void debug_line(const char *message) {
@@ -68,7 +68,7 @@ static uint64_t now_ms(void) {
 
 static void *mapper(void *unused) {
     (void)unused;
-    while (!stop) {
+    while (!__atomic_load_n(&stop, __ATOMIC_RELAXED)) {
         volatile char *region = mmap(NULL, MAP_BYTES, PROT_READ | PROT_WRITE,
                                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (region == MAP_FAILED) {
@@ -88,7 +88,7 @@ static void *mapper(void *unused) {
 
 static void *forker(void *unused) {
     (void)unused;
-    while (!stop) {
+    while (!__atomic_load_n(&stop, __ATOMIC_RELAXED)) {
         pid_t child = fork();
         if (child == 0) {
             // Only memory writes and _exit: the parent is multi-threaded.
@@ -98,7 +98,7 @@ static void *forker(void *unused) {
             _exit(7);
         }
         if (child < 0) {
-            last_fork_errno = errno;
+            __atomic_store_n(&last_fork_errno, errno, __ATOMIC_RELAXED);
             __atomic_fetch_add(&fork_failures, 1, __ATOMIC_RELAXED);
             struct timespec pause = {.tv_sec = 0, .tv_nsec = 1000000};
             nanosleep(&pause, NULL);
@@ -143,7 +143,7 @@ int main(void) {
         void *(*body)(void *) = index < MAPPERS ? mapper : forker;
         if (pthread_create(&threads[index], NULL, body, NULL) != 0) {
             debug_counters("procstress: pthread_create failed", (uint64_t)index, 0, 0);
-            stop = 1;
+            __atomic_store_n(&stop, 1, __ATOMIC_RELAXED);
             return 1;
         }
     }
@@ -152,7 +152,7 @@ int main(void) {
         struct timespec pause = {.tv_sec = 0, .tv_nsec = 50000000};
         nanosleep(&pause, NULL);
     }
-    stop = 1;
+    __atomic_store_n(&stop, 1, __ATOMIC_RELAXED);
     for (int index = 0; index < MAPPERS + FORKERS; index++) {
         pthread_join(threads[index], NULL);
     }
@@ -160,6 +160,6 @@ int main(void) {
                    __atomic_load_n(&maps_done, __ATOMIC_RELAXED),
                    __atomic_load_n(&forks_done, __ATOMIC_RELAXED),
                    __atomic_load_n(&fork_failures, __ATOMIC_RELAXED));
-    debug_counters("procstress: last fork errno", (uint64_t)last_fork_errno, 0, 0);
+    debug_counters("procstress: last fork errno", (uint64_t)__atomic_load_n(&last_fork_errno, __ATOMIC_RELAXED), 0, 0);
     return 0;
 }

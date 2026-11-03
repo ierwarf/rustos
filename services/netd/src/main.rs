@@ -1613,24 +1613,28 @@ impl InetStack {
         readiness_changed
     }
 
-    fn next_ephemeral_port(&mut self) -> u16 {
-        // Skip ports still held by a live socket (including lingering closes):
-        // smoltcp does not reject two sockets with the same local endpoint.
-        let mut candidate = self.next_port;
-        for _ in 0..=(65535 - 49152) {
-            candidate = self.next_port;
-            self.next_port = if candidate == 65535 { 49152 } else { candidate + 1 };
-            let in_use = self.sockets.iter().any(|(_, socket)| {
+    fn next_ephemeral_port(&mut self) -> Option<u16> {
+        // Include lingering closes: smoltcp does not reject duplicate local endpoints.
+        let sockets = &self.sockets;
+        select_ephemeral_port(&mut self.next_port, |candidate| {
+            sockets.iter().any(|(_, socket)| {
                 matches!(socket, smoltcp::socket::Socket::Tcp(tcp)
                     if tcp.is_open()
                         && tcp.local_endpoint().is_some_and(|ep| ep.port == candidate))
-            });
-            if !in_use {
-                break;
-            }
-        }
-        candidate
+            })
+        })
     }
+}
+
+fn select_ephemeral_port(next: &mut u16, mut in_use: impl FnMut(u16) -> bool) -> Option<u16> {
+    for _ in 0..=(u16::MAX - 49152) {
+        let candidate = *next;
+        *next = if candidate == u16::MAX { 49152 } else { candidate + 1 };
+        if !in_use(candidate) {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 fn poll_turn_changes_readiness(ingress: PollIngressSingleResult, egress: PollResult) -> bool {
@@ -1888,14 +1892,22 @@ fn handle_socketpair(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -
 fn handle_dup(request: &NetdIpcRequest) -> i32 {
     let mut state = lock_net_state();
     if let Some(socket) = state.inet_sockets.get_mut(&request.socket_token) {
-        socket.refs = socket.refs.saturating_add(1).max(1);
-        return 0;
+        return increment_socket_refs(&mut socket.refs);
     }
     let Some(socket) = state.sockets.get_mut(&request.socket_token) else {
         return libc::EBADF;
     };
-    socket.refs = socket.refs.saturating_add(1).max(1);
-    0
+    increment_socket_refs(&mut socket.refs)
+}
+
+fn increment_socket_refs(refs: &mut usize) -> i32 {
+    match refs.checked_add(1) {
+        Some(next) if *refs != 0 => {
+            *refs = next;
+            0
+        }
+        _ => libc::EOVERFLOW,
+    }
 }
 
 fn handle_close(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {
@@ -2100,6 +2112,7 @@ fn handle_connect(request: &NetdIpcRequest) -> i32 {
     if pending.len() >= *backlog {
         return libc::EAGAIN;
     }
+    let listener_owner = listener.owner;
     let channel_id = match bind_unix_connection(request, accepted) {
         Ok(channel_id) => channel_id,
         Err(errno) => return errno,
@@ -2121,12 +2134,12 @@ fn handle_connect(request: &NetdIpcRequest) -> i32 {
         peer_closed: false,
         peer_read_closed: false,
         peer_write_closed: false,
-        peer_credentials: credentials,
+        peer_credentials: listener_owner,
         recv_drain_handoff_armed: false,
         recv_closed: false,
         send_closed: false,
     });
-    let (listener_owner, listener_path) = {
+    let listener_path = {
         let Some(listener) = state.sockets.get_mut(&listener_token) else {
             return libc::ECONNREFUSED;
         };
@@ -2137,7 +2150,7 @@ fn handle_connect(request: &NetdIpcRequest) -> i32 {
         if is_wayland {
             debug_line("netd: wayland connect queued");
         }
-        (listener.owner, listener.local_path.clone())
+        listener.local_path.clone()
     };
     state.sockets.insert(
         accepted,
@@ -2233,7 +2246,9 @@ fn begin_inet_connect(request: &NetdIpcRequest) -> i32 {
             return libc::EINPROGRESS;
         }
     }
-    let local_port = stack.next_ephemeral_port();
+    let Some(local_port) = stack.next_ephemeral_port() else {
+        return libc::EADDRNOTAVAIL;
+    };
     {
         let socket = stack.sockets.get_mut::<tcp::Socket>(tcp_handle);
         socket.set_timeout(Some(smoltcp::time::Duration::from_millis(
@@ -2690,26 +2705,6 @@ fn inet_socket_revents(state: &mut NetState, token: u64, requested: u32) -> Resu
     Ok(revents)
 }
 
-fn handle_inet_poll(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {
-    let mut state = lock_net_state();
-    if !state.inet_sockets.contains_key(&request.socket_token) {
-        return libc::EBADF;
-    }
-    match state.inet_stack() {
-        Ok(stack) => {
-            stack.poll_budget(8);
-        }
-        Err(errno) => return errno,
-    }
-    match inet_socket_revents(&mut state, request.socket_token, request.arg1 as u32) {
-        Ok(revents) => {
-            response.value = revents as u64;
-            0
-        }
-        Err(errno) => errno,
-    }
-}
-
 /// `NETD_IPC_OP_POLL_BATCH`: evaluate every requested socket under one state
 /// lock acquisition and one stack advance. A socket that cannot be evaluated
 /// reports its own errno; it never fails its neighbours.
@@ -2777,25 +2772,26 @@ fn handle_poll_batch(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -
 }
 
 fn handle_poll_socket(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {
-    let status = if inet_socket_exists(request.socket_token) {
-        handle_inet_poll(request, response)
-    } else {
-        let state = lock_net_state();
-        match unix_socket_revents(&state, request.socket_token, request.arg1 as u32) {
-            Ok(revents) => {
-                response.value = revents as u64;
-                0
-            }
-            Err(errno) => errno,
+    let mut state = lock_net_state();
+    let outcome = if state.inet_sockets.contains_key(&request.socket_token) {
+        match state.inet_stack() {
+            Ok(stack) => { stack.poll_budget(8); }
+            Err(errno) => return errno,
         }
+        inet_socket_revents(&mut state, request.socket_token, request.arg1 as u32)
+    } else {
+        unix_socket_revents(&state, request.socket_token, request.arg1 as u32)
     };
-    if status == 0 {
-        let generation =
-            lock_net_state().socket_readiness_generation(request.socket_token);
-        response.payload[..8].copy_from_slice(&generation.to_le_bytes());
-        response.payload_len = 8;
+    match outcome {
+        Ok(revents) => {
+            response.value = revents as u64;
+            let generation = state.socket_readiness_generation(request.socket_token);
+            response.payload[..8].copy_from_slice(&generation.to_le_bytes());
+            response.payload_len = 8;
+            0
+        }
+        Err(errno) => errno,
     }
-    status
 }
 
 fn unix_socket_revents(state: &NetState, token: u64, requested: u32) -> Result<u32, i32> {
@@ -2863,7 +2859,7 @@ fn wait_for_socket_readiness(request: &NetdIpcRequest, response: &mut NetdIpcRes
         if let Err(errno) = request_deadline_remaining_ns(request) {
             return errno;
         }
-        let status = handle_inet_poll(request, response);
+        let status = handle_poll_socket(request, response);
         if status != 0 || response.value != 0 {
             return status;
         }
@@ -3314,7 +3310,9 @@ fn validate_sendmsg_control(control: &[u8]) -> Result<(), i32> {
     while offset + size_of::<linux_abi::LinuxCmsghdr>() <= control.len() {
         let header = read_cmsghdr(&control[offset..])?;
         let cmsg_len = usize::try_from(header.cmsg_len).map_err(|_| libc::EINVAL)?;
-        if cmsg_len < size_of::<linux_abi::LinuxCmsghdr>() || offset + cmsg_len > control.len() {
+        if cmsg_len < size_of::<linux_abi::LinuxCmsghdr>()
+            || cmsg_len > control.len() - offset
+        {
             return Err(libc::EINVAL);
         }
         if header.cmsg_level != linux_abi::SOL_SOCKET as u32 {
@@ -3325,9 +3323,11 @@ fn validate_sendmsg_control(control: &[u8]) -> Result<(), i32> {
             value if value == linux_abi::SCM_RIGHTS as u32 => {}
             _ => return Err(libc::EOPNOTSUPP),
         }
-        let aligned_next = offset
-            .checked_add(cmsg_align(cmsg_len))
-            .ok_or(libc::EINVAL)?;
+        let aligned_len = cmsg_len
+            .checked_add(size_of::<usize>() - 1)
+            .ok_or(libc::EINVAL)?
+            & !(size_of::<usize>() - 1);
+        let aligned_next = offset.checked_add(aligned_len).ok_or(libc::EINVAL)?;
         let unaligned_next = offset.checked_add(cmsg_len).ok_or(libc::EINVAL)?;
         let next = if aligned_next <= control.len() {
             aligned_next
@@ -3886,6 +3886,32 @@ mod idle_cadence_tests {
                 .any(|line| line.trim()
                     == "Some(local_poll_budget_ms_for_deadline(earliest, now_ns))")
         );
+    }
+
+    #[test]
+    fn ephemeral_port_selection_wraps_and_rejects_exhaustion() {
+        let mut next = u16::MAX;
+        assert_eq!(crate::select_ephemeral_port(&mut next, |port| port == u16::MAX), Some(49152));
+        assert_eq!(next, 49153);
+        let mut visited = 0;
+        assert_eq!(crate::select_ephemeral_port(&mut next, |_| { visited += 1; true }), None);
+        assert_eq!(visited, 16384);
+        assert_eq!(next, 49153);
+    }
+
+    #[test]
+    fn sendmsg_control_rejects_overflowing_lengths() {
+        let mut control = vec![0; std::mem::size_of::<rustos_user_abi::linux::LinuxCmsghdr>()];
+        control[..8].copy_from_slice(&u64::MAX.to_ne_bytes());
+        assert_eq!(crate::validate_sendmsg_control(&control), Err(libc::EINVAL));
+
+        let mut two_headers = vec![0; control.len() * 2];
+        let header_len = control.len();
+        two_headers[..8].copy_from_slice(&(header_len as u64).to_ne_bytes());
+        two_headers[8..12].copy_from_slice(&(rustos_user_abi::linux::SOL_SOCKET as u32).to_ne_bytes());
+        two_headers[12..16].copy_from_slice(&(rustos_user_abi::linux::SCM_RIGHTS as u32).to_ne_bytes());
+        two_headers[header_len..header_len + 8].copy_from_slice(&u64::MAX.to_ne_bytes());
+        assert_eq!(crate::validate_sendmsg_control(&two_headers), Err(libc::EINVAL));
     }
 
     #[test]

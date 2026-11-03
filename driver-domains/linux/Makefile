@@ -4,12 +4,18 @@ ROOT := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 OUT ?= $(ROOT)/out
 JOBS ?= $(shell getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)
 
-.PHONY: all fetch configure build verify stage-release clean distclean print-artifacts rebuild-agent rebuild-block rebuild-display rebuild-net dev-agent dev-block dev-display dev-net selftest-config-cache build-plan ccache-stats profile-build
+.PHONY: all fetch configure build verify stage-release clean distclean print-artifacts rebuild-agent rebuild-block rebuild-display rebuild-net dev-agent dev-block dev-display dev-net selftest-config-cache selftest-net build-plan ccache-stats profile-build
 
 all: build
 
 fetch configure build verify print-artifacts selftest-config-cache build-plan ccache-stats profile-build:
 	@OUT="$(OUT)" JOBS="$(JOBS)" "$(ROOT)/scripts/build.sh" $@
+
+# Host-only network relay regression; no Buildroot sysroot is required.
+selftest-net:
+	@tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
+		$${CC:-cc} -std=c11 -Wall -Wextra -Werror \
+		"$(ROOT)/package/rustos-dvm-net/src/rustos-dvm-net-test.c" -o "$$tmp/test" && "$$tmp/test"
 
 # Rebuild exactly one local DVM relay without discarding the Buildroot host
 # toolchain. The normal `build` target detects source changes automatically.

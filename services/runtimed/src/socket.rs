@@ -575,7 +575,11 @@ fn handle_terminate(
                 match super::spawn::terminate_pid(pid) {
                     Ok(()) => terminated = true,
                     Err(err) if err == libc::ESRCH => {
-                        state.running.remove(&pid);
+                        if let Some(process) = state.running.remove(&pid) {
+                            // Removing the record prevents the reaper from
+                            // refunding it later; settle its session now.
+                            super::spawn::release_failed_session(state, Some(process.session_handle));
+                        }
                     }
                     Err(err) => return Err(err),
                 }
@@ -840,6 +844,15 @@ mod tests {
         MAX_LAUNCH_RETRY_BACKOFF, RETRY_BACKOFF, SERVICE_REQUEST_TIMEOUT,
         STORAGE_NOT_READY_RETRY_BACKOFF, UI_SERVER_EXEC_PATH,
     };
+
+    #[test]
+    fn vanished_session_process_is_refunded_before_its_reaper_record_is_lost() {
+        let source = include_str!("socket.rs").split("#[cfg(test)]").next().unwrap();
+        let missing = source.split_once("Err(err) if err == libc::ESRCH => {").unwrap().1;
+        let removed = missing.find("state.running.remove(&pid)").unwrap();
+        let refunded = missing.find("release_failed_session(state, Some(process.session_handle))").unwrap();
+        assert!(removed < refunded);
+    }
 
     #[test]
     fn only_ui_bootstrap_or_private_smp_qualification_may_launch_before_ui_ready() {

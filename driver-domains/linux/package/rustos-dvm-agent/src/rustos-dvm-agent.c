@@ -1235,6 +1235,13 @@ static int pointer_state_configure(struct pointer_state *state, int pointer_fd) 
     state->absolute_max_x = abs_x.maximum;
     state->absolute_min_y = abs_y.minimum;
     state->absolute_max_y = abs_y.maximum;
+    state->absolute_x = scale_absolute_axis(abs_x.value, abs_x.minimum, abs_x.maximum,
+                                            DVM_POINTER_WIDTH);
+    state->absolute_y = scale_absolute_axis(abs_y.value, abs_y.minimum, abs_y.maximum,
+                                            DVM_POINTER_HEIGHT);
+    state->absolute_seen_x = 1;
+    state->absolute_seen_y = 1;
+    state->absolute_initialized = 1;
     return 0;
 }
 
@@ -1665,7 +1672,7 @@ static int consume_pointer_event(struct pointer_state *state, const struct input
 
 static int stream_input_devices(int control_fd, int keyboard_fd, int pointer_fd,
                                 unsigned int request_id, struct input_selftest *selftest) {
-    struct pollfd pollfds[2];
+    struct pollfd pollfds[3];
     struct pointer_state pointer = {0};
     if (keyboard_fd < 0 || pointer_fd < 0) {
         errno = EINVAL;
@@ -1678,6 +1685,8 @@ static int stream_input_devices(int control_fd, int keyboard_fd, int pointer_fd,
     pollfds[0].events = POLLIN;
     pollfds[1].fd = pointer_fd;
     pollfds[1].events = POLLIN;
+    pollfds[2].fd = control_fd;
+    pollfds[2].events = POLLIN | POLLRDHUP;
     for (;;) {
         int ready;
         int timeout_ms;
@@ -1685,17 +1694,22 @@ static int stream_input_devices(int control_fd, int keyboard_fd, int pointer_fd,
         unsigned int index;
         pollfds[0].revents = 0;
         pollfds[1].revents = 0;
+        pollfds[2].revents = 0;
         timeout_ms = pointer_flush_timeout_ms(&pointer);
         selftest_timeout_ms = input_selftest_timeout_ms(selftest);
         if (selftest_timeout_ms >= 0 &&
             (timeout_ms < 0 || timeout_ms > selftest_timeout_ms)) {
             timeout_ms = selftest_timeout_ms;
         }
-        ready = poll(pollfds, 2, timeout_ms);
+        ready = poll(pollfds, 3, timeout_ms);
         if (ready < 0) {
             if (errno == EINTR) {
                 continue;
             }
+            return -1;
+        }
+        if (pollfds[2].revents != 0) {
+            errno = ECONNRESET;
             return -1;
         }
         /* Cadence is independent of poll idleness: unrelated keyboard,
@@ -1756,6 +1770,12 @@ static int stream_input_devices(int control_fd, int keyboard_fd, int pointer_fd,
                     return -1;
                 }
             }
+        }
+        /* Busy evdev queues must not postpone a pending coalesced motion
+         * packet indefinitely just because poll never times out. */
+        if (pointer.pending && pointer_flush_timeout_ms(&pointer) == 0 &&
+            send_pointer_packet(control_fd, request_id, &pointer) != 0) {
+            return -1;
         }
     }
 }

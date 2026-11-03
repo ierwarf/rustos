@@ -85,6 +85,20 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_retries_finish_retirement_before_reusing_placement_authority() {
+        let main = include_str!("main.rs");
+        for function in ["fn spawn_tracked_with_attempts(", "fn spawn_initd_via_loaderd("] {
+            let body = main.split_once(function).unwrap().1.split_once("\nfn ").unwrap().0;
+            let gate = body.find("if retirement_pending {").unwrap();
+            let retire = body[gate..].find("job_lease::retire(").unwrap() + gate;
+            let retry = body[retire..].find("continue;").unwrap() + retire;
+            let ensure = body.find("job_lease::ensure(").unwrap();
+            assert!(gate < retire && retire < retry && retry < ensure);
+            assert!(body.contains("Err(11) => retirement_pending = true"));
+        }
+    }
+
+    #[test]
     fn bounded_job_retirement_retains_authority_until_empty_then_closes_once() {
         let mut lease = lease(BOOTSTRAP_MANIFEST[0]);
         lease.job_handle = Some(9);

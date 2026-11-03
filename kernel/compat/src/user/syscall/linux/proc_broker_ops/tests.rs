@@ -364,3 +364,29 @@ fn loader_commit_revalidates_live_requester_role_before_consuming_authority() {
         .expect("exec ticket consumption");
     assert!(procd_role < ticket_consume);
 }
+
+#[test]
+fn linux_runtime_addresses_must_stay_inside_the_user_window() {
+    let base = PROC_BROKER_USER_SPACE_BASE;
+    assert!(user_span_in_window(base, 1));
+    assert!(!user_span_in_window(0xffff_8000_0000_0000, 1));
+    assert!(!user_span_in_window(PROC_BROKER_USER_SPACE_END_EXCLUSIVE, 1));
+    assert!(!user_span_in_window(u64::MAX, 2));
+
+    let mut args = RustosProcSetLinuxRuntimeBrokerArgs::default();
+    assert!(linux_tls_fields_valid(&args), "no TLS means nothing to check");
+    args.has_tls = 1;
+    assert!(!linux_tls_fields_valid(&args), "zero addresses are outside the window");
+    args.tls_mapping_base = base;
+    args.tls_mapping_size = 4096;
+    args.tls_template_addr = base;
+    args.tls_template_size = 16;
+    args.tls_block_base = base;
+    args.tls_tcb_base = base + 64;
+    assert!(linux_tls_fields_valid(&args));
+    args.tls_template_size = 8192;
+    assert!(!linux_tls_fields_valid(&args), "template larger than its mapping");
+    args.tls_template_size = 16;
+    args.tls_tcb_base = 0xffff_8000_0000_0000;
+    assert!(!linux_tls_fields_valid(&args), "non-canonical tcb would panic VirtAddr::new");
+}

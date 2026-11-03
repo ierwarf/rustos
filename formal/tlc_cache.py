@@ -201,6 +201,9 @@ def validate_cached_summary(
     if min_remaining_seconds >= max_age_seconds:
         raise ValueError("TLC minimum remaining lifetime exhausts the reuse window")
     required_models = requested_profile.get("required_models", [])
+    # All reuse, not only individual-proof reuse, must bind module resolution
+    # and the runner before accepting a previous result.
+    closed_fingerprint = individual_input_fingerprint(root, model)
     if individual:
         # This only reuses one explicitly selected proof. It does not widen the
         # profile's required-model set or qualify a complete verification seal.
@@ -208,7 +211,6 @@ def validate_cached_summary(
             raise ValueError("individual TLC reuse is restricted to the PR execution policy")
         if os.environ.get("FORMAL_MUTATION_MODE", "0") != "0" or os.environ.get("TLA_ARTIFACT_DIR"):
             raise ValueError("individual TLC reuse refuses mutation or custom-output runs")
-        individual_fingerprint = individual_input_fingerprint(root, model)
     elif model not in required_models:
         raise ValueError(f"model is not selected by profile {profile}: {model}")
     if os.environ.get("TLA_SPEC_OVERRIDE") or os.environ.get("TLA_CONFIG_OVERRIDE"):
@@ -265,10 +267,9 @@ def validate_cached_summary(
                 min_remaining_seconds=min_remaining_seconds,
                 now=now,
             )
-            if individual:
-                value = json.loads(summary.read_text(encoding="utf-8"))
-                _require_equal(value.get("inputs", {}).get("individual_input_sha256"),
-                    individual_fingerprint, "closed proof input binding")
+            value = json.loads(summary.read_text(encoding="utf-8"))
+            _require_equal(value.get("inputs", {}).get("individual_input_sha256"),
+                closed_fingerprint, "closed proof input binding")
             return result
         except (OSError, ValueError, json.JSONDecodeError) as error:
             errors.append(f"{evidence_profile}: {error}")

@@ -235,8 +235,29 @@ fn validate_time_hot_path_locally(
     Ok(())
 }
 
+// Linux clock ids that are views of the two clocksources this kernel owns.
+// RAW/COARSE/BOOTTIME differ from MONOTONIC/REALTIME only in slewing,
+// resolution and suspend accounting, none of which exist here, and libc,
+// glib and runtimes read them routinely (a spurious EINVAL there panics
+// std-style `Instant::now` callers). CPU-time and TAI clocks stay unsupported.
+const CLOCK_MONOTONIC_RAW: u64 = 4;
+const CLOCK_REALTIME_COARSE: u64 = 5;
+const CLOCK_MONOTONIC_COARSE: u64 = 6;
+const CLOCK_BOOTTIME: u64 = 7;
+
+fn is_realtime_clock_id(clock_id: u64) -> bool {
+    clock_id == linux_abi::CLOCK_REALTIME || clock_id == CLOCK_REALTIME_COARSE
+}
+
 fn is_supported_clock_id(clock_id: u64) -> bool {
-    clock_id == linux_abi::CLOCK_REALTIME || clock_id == linux_abi::CLOCK_MONOTONIC
+    is_realtime_clock_id(clock_id)
+        || matches!(
+            clock_id,
+            id if id == linux_abi::CLOCK_MONOTONIC
+                || id == CLOCK_MONOTONIC_RAW
+                || id == CLOCK_MONOTONIC_COARSE
+                || id == CLOCK_BOOTTIME
+        )
 }
 
 fn validate_sleep_timespec(timespec: LinuxTimespecWire) -> Result<(), i64> {
@@ -295,9 +316,10 @@ pub fn sleep_relative_timespec_substrate(ts: LinuxTimespecWire) {
 }
 
 pub fn current_clock_timespec_substrate(clock_id: u64) -> LinuxTimespecWire {
-    match clock_id {
-        id if id == linux_abi::CLOCK_REALTIME => realtime_timespec(),
-        _ => monotonic_timespec(),
+    if is_realtime_clock_id(clock_id) {
+        realtime_timespec()
+    } else {
+        monotonic_timespec()
     }
 }
 
@@ -604,6 +626,20 @@ mod tests {
                 tv_nsec: 12_345,
             }
         );
+    }
+
+    #[test]
+    fn monotonic_and_realtime_clock_aliases_are_admitted() {
+        for id in [CLOCK_MONOTONIC_RAW, CLOCK_MONOTONIC_COARSE, CLOCK_BOOTTIME] {
+            assert!(is_supported_clock_id(id));
+            assert!(!is_realtime_clock_id(id));
+        }
+        assert!(is_supported_clock_id(CLOCK_REALTIME_COARSE));
+        assert!(is_realtime_clock_id(CLOCK_REALTIME_COARSE));
+        // CPU-time (2, 3) and TAI (11) clocks have no backing source here.
+        for id in [2, 3, 8, 11, 12] {
+            assert!(!is_supported_clock_id(id));
+        }
     }
 
     #[test]

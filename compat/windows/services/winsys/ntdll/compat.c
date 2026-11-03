@@ -26,6 +26,8 @@ typedef struct RustosCriticalSectionLite {
 
 typedef enum RustosFormatLength {
     RUSTOS_FORMAT_LENGTH_DEFAULT,
+    RUSTOS_FORMAT_LENGTH_CHAR,
+    RUSTOS_FORMAT_LENGTH_SHORT,
     RUSTOS_FORMAT_LENGTH_LONG,
     RUSTOS_FORMAT_LENGTH_LONGLONG,
     RUSTOS_FORMAT_LENGTH_SIZE,
@@ -277,7 +279,47 @@ static void rustos_scanf_skip_input_whitespace(void)
     }
 }
 
-static size_t rustos_scanf_read_token(char *dst, size_t capacity, size_t width)
+typedef enum RustosScanfIntegerKind {
+    RUSTOS_SCANF_INTEGER_SIGNED_DECIMAL,
+    RUSTOS_SCANF_INTEGER_AUTO,
+    RUSTOS_SCANF_INTEGER_UNSIGNED_DECIMAL,
+    RUSTOS_SCANF_INTEGER_HEX,
+} RustosScanfIntegerKind;
+
+static int rustos_scanf_integer_accepts(
+    RustosScanfIntegerKind kind,
+    const char *token,
+    size_t len,
+    int ch)
+{
+    int signed_kind = kind == RUSTOS_SCANF_INTEGER_SIGNED_DECIMAL
+        || kind == RUSTOS_SCANF_INTEGER_AUTO;
+    size_t begin = (signed_kind && len > 0 && (token[0] == '+' || token[0] == '-')) ? 1u : 0u;
+    size_t digits = len - begin;
+    int hex_mode;
+    if (ch == '+' || ch == '-') {
+        return len == 0 && signed_kind;
+    }
+    if ((kind == RUSTOS_SCANF_INTEGER_HEX || kind == RUSTOS_SCANF_INTEGER_AUTO)
+        && digits == 1 && token[begin] == '0' && (ch == 'x' || ch == 'X')) {
+        return TRUE;
+    }
+    hex_mode = kind == RUSTOS_SCANF_INTEGER_HEX
+        || (kind == RUSTOS_SCANF_INTEGER_AUTO && digits >= 2 && token[begin] == '0'
+            && (token[begin + 1] == 'x' || token[begin + 1] == 'X'));
+    if (hex_mode) {
+        return rustos_ascii_digit_value(ch) >= 0 && rustos_ascii_digit_value(ch) < 16;
+    }
+    return ch >= '0' && ch <= '9';
+}
+
+/* Reads only the characters one integer conversion can consume, so "12,34"
+ * parses as "%d,%d" and "12abc" leaves "abc" in the input like C scanf. */
+static size_t rustos_scanf_read_integer_token(
+    char *dst,
+    size_t capacity,
+    size_t width,
+    RustosScanfIntegerKind kind)
 {
     size_t len = 0;
     if (dst == NULL || capacity == 0) {
@@ -291,6 +333,9 @@ static size_t rustos_scanf_read_token(char *dst, size_t capacity, size_t width)
         if (width != 0 && len >= width) {
             break;
         }
+        if (!rustos_scanf_integer_accepts(kind, dst, len, ch)) {
+            break;
+        }
         dst[len++] = (char)rustos_scanf_take_input();
     }
     dst[len] = '\0';
@@ -302,56 +347,144 @@ static int rustos_write_char(void *stream, char ch)
     return rustos_write_all(stream, &ch, 1);
 }
 
-static int rustos_write_unsigned(void *stream, unsigned long long value, unsigned base, int upper)
+typedef struct RustosFormatSpec {
+    int left;
+    int plus;
+    int space;
+    int alt;
+    int zero;
+    int width;
+    int precision; /* -1 when absent */
+} RustosFormatSpec;
+
+static int rustos_write_repeat(void *stream, char ch, size_t count)
 {
-    char digits[32];
-    char buffer[32];
+    char block[16];
+    size_t index;
+    size_t total = 0;
+    for (index = 0; index < sizeof(block); index++) {
+        block[index] = ch;
+    }
+    while (count != 0) {
+        size_t chunk = count < sizeof(block) ? count : sizeof(block);
+        if (rustos_write_all(stream, block, chunk) < 0) {
+            return -1;
+        }
+        total += chunk;
+        count -= chunk;
+    }
+    return (int)total;
+}
+
+/* Emits width padding, prefix, precision zeros and body as one printf field. */
+static int rustos_write_field(
+    void *stream,
+    const RustosFormatSpec *spec,
+    const char *prefix,
+    size_t prefix_len,
+    size_t zeros,
+    const char *body,
+    size_t body_len,
+    int zero_pad_ok)
+{
+    size_t total = prefix_len + zeros + body_len;
+    size_t pad = spec->width > 0 && (size_t)spec->width > total ? (size_t)spec->width - total : 0;
+    int written = 0;
+    int part;
+    if (!spec->left && spec->zero && zero_pad_ok) {
+        zeros += pad;
+        pad = 0;
+    }
+    if (!spec->left && pad != 0) {
+        part = rustos_write_repeat(stream, ' ', pad);
+        if (part < 0) {
+            return -1;
+        }
+        written += part;
+    }
+    if (prefix_len != 0) {
+        part = rustos_write_all(stream, prefix, prefix_len);
+        if (part < 0) {
+            return -1;
+        }
+        written += part;
+    }
+    if (zeros != 0) {
+        part = rustos_write_repeat(stream, '0', zeros);
+        if (part < 0) {
+            return -1;
+        }
+        written += part;
+    }
+    if (body_len != 0) {
+        part = rustos_write_all(stream, body, body_len);
+        if (part < 0) {
+            return -1;
+        }
+        written += part;
+    }
+    if (spec->left && pad != 0) {
+        part = rustos_write_repeat(stream, ' ', pad);
+        if (part < 0) {
+            return -1;
+        }
+        written += part;
+    }
+    rustos_set_last_error(RUSTOS_ERROR_SUCCESS);
+    return written;
+}
+
+static int rustos_write_integer(
+    void *stream,
+    const RustosFormatSpec *spec,
+    unsigned long long magnitude,
+    int is_signed,
+    int negative,
+    unsigned base,
+    int upper)
+{
+    char digits[24];
+    char reversed[24];
+    char prefix[2];
+    size_t prefix_len = 0;
     size_t count = 0;
-    size_t index = 0;
-    const char *alphabet = upper ? "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-                                 : "0123456789abcdefghijklmnopqrstuvwxyz";
-    if (base < 2 || base > 36) {
+    size_t zeros = 0;
+    size_t index;
+    const char *alphabet = upper ? "0123456789ABCDEF" : "0123456789abcdef";
+    if (base < 2 || base > 16) {
         rustos_set_last_error(RUSTOS_ERROR_INVALID_PARAMETER);
         return -1;
     }
-    if (value == 0) {
-        buffer[count++] = '0';
-        return rustos_write_all(stream, buffer, count);
-    }
-    while (value != 0) {
-        digits[count++] = alphabet[value % base];
-        value /= base;
-    }
-    while (count != 0) {
-        buffer[index++] = digits[--count];
-    }
-    return rustos_write_all(stream, buffer, index);
-}
-
-static int rustos_write_signed(void *stream, long long value)
-{
-    int written = 0;
-    if (value < 0) {
-        if (rustos_write_char(stream, '-') < 0) {
-            return -1;
+    if (is_signed) {
+        if (negative) {
+            prefix[prefix_len++] = '-';
+        } else if (spec->plus) {
+            prefix[prefix_len++] = '+';
+        } else if (spec->space) {
+            prefix[prefix_len++] = ' ';
         }
-        written++;
-        return written
-            + rustos_write_unsigned(
-                stream,
-                (unsigned long long)(-(value + 1)) + 1ull,
-                10u,
-                FALSE);
+    } else if (spec->alt && base == 16 && magnitude != 0) {
+        prefix[prefix_len++] = '0';
+        prefix[prefix_len++] = upper ? 'X' : 'x';
     }
-    return rustos_write_unsigned(stream, (unsigned long long)value, 10u, FALSE);
-}
-
-static const char *rustos_skip_digits(const char *text)
-{
-    while (*text >= '0' && *text <= '9') {
-        text++;
+    if (magnitude == 0) {
+        if (spec->precision != 0) {
+            reversed[count++] = '0';
+        }
+    } else {
+        while (magnitude != 0) {
+            reversed[count++] = alphabet[magnitude % base];
+            magnitude /= base;
+        }
     }
-    return text;
+    for (index = 0; index < count; index++) {
+        digits[index] = reversed[count - 1 - index];
+    }
+    if (spec->precision >= 0 && (size_t)spec->precision > count) {
+        zeros = (size_t)spec->precision - count;
+    }
+    return rustos_write_field(
+        stream, spec, prefix, prefix_len, zeros, digits, count, spec->precision < 0);
 }
 
 static const char *rustos_parse_scanf_width(const char *cursor, size_t *width)
@@ -376,7 +509,7 @@ static const char *rustos_parse_length(const char *cursor, RustosFormatLength *l
         *length = RUSTOS_FORMAT_LENGTH_LONG;
         return cursor + 1;
     }
-    if (cursor[0] == 'z') {
+    if (cursor[0] == 'z' || cursor[0] == 'j' || cursor[0] == 't') {
         *length = RUSTOS_FORMAT_LENGTH_SIZE;
         return cursor + 1;
     }
@@ -389,6 +522,7 @@ static const char *rustos_parse_length(const char *cursor, RustosFormatLength *l
         return cursor + 3;
     }
     if (cursor[0] == 'h') {
+        *length = cursor[1] == 'h' ? RUSTOS_FORMAT_LENGTH_CHAR : RUSTOS_FORMAT_LENGTH_SHORT;
         return cursor + (cursor[1] == 'h' ? 2 : 1);
     }
     return cursor;
@@ -406,8 +540,9 @@ static int rustos_vfprintf_internal(void *stream, const char *format, RUSTOS_VA_
 
     while (*cursor != '\0') {
         RustosFormatLength length = RUSTOS_FORMAT_LENGTH_DEFAULT;
+        RustosFormatSpec spec;
         const char *spec_cursor;
-        char spec;
+        char conv;
         int written;
 
         if (*cursor != '%') {
@@ -437,93 +572,154 @@ static int rustos_vfprintf_internal(void *stream, const char *format, RUSTOS_VA_
             continue;
         }
 
-        while (*cursor == '-' || *cursor == '+' || *cursor == ' ' || *cursor == '#' || *cursor == '0') {
-            cursor++;
+        spec.left = 0;
+        spec.plus = 0;
+        spec.space = 0;
+        spec.alt = 0;
+        spec.zero = 0;
+        spec.width = 0;
+        spec.precision = -1;
+        for (;; cursor++) {
+            if (*cursor == '-') {
+                spec.left = 1;
+            } else if (*cursor == '+') {
+                spec.plus = 1;
+            } else if (*cursor == ' ') {
+                spec.space = 1;
+            } else if (*cursor == '#') {
+                spec.alt = 1;
+            } else if (*cursor == '0') {
+                spec.zero = 1;
+            } else {
+                break;
+            }
         }
         if (*cursor == '*') {
-            rustos_set_last_error(RUSTOS_ERROR_INVALID_PARAMETER);
-            return -1;
+            spec.width = __builtin_va_arg(ap, int);
+            if (spec.width < 0) {
+                spec.left = 1;
+                spec.width = spec.width == (-2147483647 - 1) ? 0x7fffffff : -spec.width;
+            }
+            cursor++;
+        } else {
+            while (*cursor >= '0' && *cursor <= '9') {
+                if (spec.width > (0x7fffffff - 9) / 10) {
+                    rustos_set_last_error(RUSTOS_ERROR_INVALID_PARAMETER);
+                    return -1;
+                }
+                spec.width = spec.width * 10 + (*cursor - '0');
+                cursor++;
+            }
         }
-        cursor = rustos_skip_digits(cursor);
         if (*cursor == '.') {
             cursor++;
+            spec.precision = 0;
             if (*cursor == '*') {
-                rustos_set_last_error(RUSTOS_ERROR_INVALID_PARAMETER);
-                return -1;
+                spec.precision = __builtin_va_arg(ap, int);
+                cursor++;
+            } else {
+                while (*cursor >= '0' && *cursor <= '9') {
+                    if (spec.precision > (0x7fffffff - 9) / 10) {
+                        rustos_set_last_error(RUSTOS_ERROR_INVALID_PARAMETER);
+                        return -1;
+                    }
+                    spec.precision = spec.precision * 10 + (*cursor - '0');
+                    cursor++;
+                }
             }
-            cursor = rustos_skip_digits(cursor);
+            if (spec.precision < 0) {
+                spec.precision = -1;
+            }
         }
         spec_cursor = rustos_parse_length(cursor, &length);
-        spec = *spec_cursor;
-        if (spec == '\0') {
+        conv = *spec_cursor;
+        if (conv == '\0') {
             rustos_set_last_error(RUSTOS_ERROR_INVALID_PARAMETER);
             return -1;
         }
 
-        switch (spec) {
+        switch (conv) {
         case 'd':
-        case 'i':
+        case 'i': {
+            long long value;
             if (length == RUSTOS_FORMAT_LENGTH_LONGLONG || length == RUSTOS_FORMAT_LENGTH_SIZE) {
-                written = rustos_write_signed(stream, __builtin_va_arg(ap, long long));
+                value = __builtin_va_arg(ap, long long);
             } else if (length == RUSTOS_FORMAT_LENGTH_LONG) {
-                written = rustos_write_signed(stream, __builtin_va_arg(ap, long));
+                value = __builtin_va_arg(ap, long);
+            } else if (length == RUSTOS_FORMAT_LENGTH_SHORT) {
+                value = (short)__builtin_va_arg(ap, int);
+            } else if (length == RUSTOS_FORMAT_LENGTH_CHAR) {
+                value = (signed char)__builtin_va_arg(ap, int);
             } else {
-                written = rustos_write_signed(stream, __builtin_va_arg(ap, int));
+                value = __builtin_va_arg(ap, int);
             }
-            break;
-        case 'u':
-            if (length == RUSTOS_FORMAT_LENGTH_LONGLONG || length == RUSTOS_FORMAT_LENGTH_SIZE) {
-                written = rustos_write_unsigned(stream, __builtin_va_arg(ap, unsigned long long), 10u, FALSE);
-            } else if (length == RUSTOS_FORMAT_LENGTH_LONG) {
-                written = rustos_write_unsigned(stream, __builtin_va_arg(ap, unsigned long), 10u, FALSE);
-            } else {
-                written = rustos_write_unsigned(stream, __builtin_va_arg(ap, unsigned int), 10u, FALSE);
-            }
-            break;
-        case 'x':
-        case 'X':
-            if (length == RUSTOS_FORMAT_LENGTH_LONGLONG || length == RUSTOS_FORMAT_LENGTH_SIZE) {
-                written = rustos_write_unsigned(
-                    stream,
-                    __builtin_va_arg(ap, unsigned long long),
-                    16u,
-                    spec == 'X');
-            } else if (length == RUSTOS_FORMAT_LENGTH_LONG) {
-                written = rustos_write_unsigned(
-                    stream,
-                    __builtin_va_arg(ap, unsigned long),
-                    16u,
-                    spec == 'X');
-            } else {
-                written = rustos_write_unsigned(
-                    stream,
-                    __builtin_va_arg(ap, unsigned int),
-                    16u,
-                    spec == 'X');
-            }
-            break;
-        case 'c':
-            written = rustos_write_char(stream, (char)__builtin_va_arg(ap, int));
-            break;
-        case 's': {
-            const char *text = __builtin_va_arg(ap, const char *);
-            written = rustos_write_literal(stream, text != NULL ? text : "(null)");
+            written = rustos_write_integer(
+                stream,
+                &spec,
+                value < 0 ? 0ull - (unsigned long long)value : (unsigned long long)value,
+                TRUE,
+                value < 0,
+                10u,
+                FALSE);
             break;
         }
-        case 'p':
-            written = rustos_write_literal(stream, "0x");
-            if (written >= 0) {
-                int tail = rustos_write_unsigned(
-                    stream,
-                    (unsigned long long)(ULONGLONG)__builtin_va_arg(ap, void *),
-                    16u,
-                    FALSE);
-                if (tail < 0) {
-                    return -1;
-                }
-                written += tail;
+        case 'u':
+        case 'x':
+        case 'X': {
+            unsigned long long value;
+            if (length == RUSTOS_FORMAT_LENGTH_LONGLONG || length == RUSTOS_FORMAT_LENGTH_SIZE) {
+                value = __builtin_va_arg(ap, unsigned long long);
+            } else if (length == RUSTOS_FORMAT_LENGTH_LONG) {
+                value = __builtin_va_arg(ap, unsigned long);
+            } else if (length == RUSTOS_FORMAT_LENGTH_SHORT) {
+                value = (unsigned short)__builtin_va_arg(ap, unsigned int);
+            } else if (length == RUSTOS_FORMAT_LENGTH_CHAR) {
+                value = (unsigned char)__builtin_va_arg(ap, unsigned int);
+            } else {
+                value = __builtin_va_arg(ap, unsigned int);
+            }
+            written = rustos_write_integer(
+                stream,
+                &spec,
+                value,
+                FALSE,
+                FALSE,
+                conv == 'u' ? 10u : 16u,
+                conv == 'X');
+            break;
+        }
+        case 'c': {
+            char ch = (char)__builtin_va_arg(ap, int);
+            written = rustos_write_field(stream, &spec, NULL, 0, 0, &ch, 1, FALSE);
+            break;
+        }
+        case 's': {
+            const char *text = __builtin_va_arg(ap, const char *);
+            size_t text_len = 0;
+            if (text == NULL) {
+                text = "(null)";
+            }
+            while (text[text_len] != '\0'
+                && (spec.precision < 0 || text_len < (size_t)spec.precision)) {
+                text_len++;
+            }
+            written = rustos_write_field(stream, &spec, NULL, 0, 0, text, text_len, FALSE);
+            break;
+        }
+        case 'p': {
+            RustosFormatSpec pointer_spec = spec;
+            unsigned long long value =
+                (unsigned long long)(ULONGLONG)__builtin_va_arg(ap, void *);
+            pointer_spec.alt = 1;
+            pointer_spec.precision = -1;
+            if (value == 0) {
+                written = rustos_write_field(stream, &pointer_spec, "0x", 2, 0, "0", 1, FALSE);
+            } else {
+                written = rustos_write_integer(
+                    stream, &pointer_spec, value, FALSE, FALSE, 16u, FALSE);
             }
             break;
+        }
         default:
             rustos_set_last_error(RUSTOS_ERROR_INVALID_PARAMETER);
             return -1;
@@ -658,7 +854,12 @@ static int rustos_vscanf_internal(const char *format, RUSTOS_VA_LIST ap)
                 if (width == 0 || width >= sizeof(token)) {
                     width = sizeof(token) - 1;
                 }
-                if (rustos_scanf_read_token(token, sizeof(token), width) == 0
+                if (rustos_scanf_read_integer_token(
+                        token,
+                        sizeof(token),
+                        width,
+                        spec == 'i' ? RUSTOS_SCANF_INTEGER_AUTO
+                                    : RUSTOS_SCANF_INTEGER_SIGNED_DECIMAL) == 0
                     || !rustos_parse_signed_token(token, &value, spec == 'i')) {
                     return assigned;
                 }
@@ -666,6 +867,10 @@ static int rustos_vscanf_internal(const char *format, RUSTOS_VA_LIST ap)
                     *(__builtin_va_arg(ap, long long *)) = value;
                 } else if (length == RUSTOS_FORMAT_LENGTH_LONG) {
                     *(__builtin_va_arg(ap, long *)) = (long)value;
+                } else if (length == RUSTOS_FORMAT_LENGTH_SHORT) {
+                    *(__builtin_va_arg(ap, short *)) = (short)value;
+                } else if (length == RUSTOS_FORMAT_LENGTH_CHAR) {
+                    *(__builtin_va_arg(ap, signed char *)) = (signed char)value;
                 } else {
                     *(__builtin_va_arg(ap, int *)) = (int)value;
                 }
@@ -681,7 +886,12 @@ static int rustos_vscanf_internal(const char *format, RUSTOS_VA_LIST ap)
                 if (width == 0 || width >= sizeof(token)) {
                     width = sizeof(token) - 1;
                 }
-                if (rustos_scanf_read_token(token, sizeof(token), width) == 0
+                if (rustos_scanf_read_integer_token(
+                        token,
+                        sizeof(token),
+                        width,
+                        spec == 'x' ? RUSTOS_SCANF_INTEGER_HEX
+                                    : RUSTOS_SCANF_INTEGER_UNSIGNED_DECIMAL) == 0
                     || !rustos_parse_unsigned_token(token, base, &value)) {
                     return assigned;
                 }
@@ -689,6 +899,10 @@ static int rustos_vscanf_internal(const char *format, RUSTOS_VA_LIST ap)
                     *(__builtin_va_arg(ap, unsigned long long *)) = value;
                 } else if (length == RUSTOS_FORMAT_LENGTH_LONG) {
                     *(__builtin_va_arg(ap, unsigned long *)) = (unsigned long)value;
+                } else if (length == RUSTOS_FORMAT_LENGTH_SHORT) {
+                    *(__builtin_va_arg(ap, unsigned short *)) = (unsigned short)value;
+                } else if (length == RUSTOS_FORMAT_LENGTH_CHAR) {
+                    *(__builtin_va_arg(ap, unsigned char *)) = (unsigned char)value;
                 } else {
                     *(__builtin_va_arg(ap, unsigned int *)) = (unsigned int)value;
                 }
@@ -856,11 +1070,14 @@ void *RtlReAllocateHeap(void *heap, ULONG flags, void *base, SIZE_T size)
     copy_len = block->size < size ? block->size : size;
     rustos_copy_bytes(new_base, base, copy_len);
     if (!NtFreeVirtualMemory(base, 0, RUSTOS_NTDLL_MEM_RELEASE)) {
+        /* The old block stays valid and owned by the caller; drop the copy. */
         RustosHeapBlock *new_block = rustos_find_heap_block(new_base);
         if (new_block != NULL) {
             new_block->base = NULL;
             new_block->size = 0;
         }
+        NtFreeVirtualMemory(new_base, 0, RUSTOS_NTDLL_MEM_RELEASE);
+        rustos_set_last_error(RUSTOS_NTDLL_ERROR_NOT_ENOUGH_MEMORY);
         return NULL;
     }
     block->base = NULL;

@@ -6,6 +6,9 @@
 //!   frame capabilities, and TLB acknowledgements cross trust boundaries.
 //! - **Lifecycle:** One miss owner loads, publishes clean, maps/COWs or dirties,
 //!   writes back, revokes mappings, waits for exact TLB ACK, then releases.
+//!   A write reported during writeback keeps the completed page dirty.
+//!   The caller must ensure a private COW capability names a distinct frame;
+//!   different capability values alone do not establish distinct frames.
 //! - **Concurrency:** The fixed cache has one linear owner today; no entry lock
 //!   may be held across vfsd/storaged IPC or kernel mapping work.
 //! - **Failure:** Capacity, stale token/generation, dirty/mapped reclaim, and
@@ -103,6 +106,7 @@ enum CacheState {
         page: CachePage,
         mappings: u32,
         writeback_token: u64,
+        redirtied: bool,
     },
     Reclaiming {
         page: CachePage,
@@ -193,11 +197,11 @@ impl PageCache {
         if frame_capability == 0 {
             return Err(CacheError::Malformed);
         }
-        let generation = self.allocate_generation()?;
-        let entry = self.entry_mut(key).ok_or(CacheError::Stale)?;
-        if entry.state != (CacheState::Loading { load_token }) {
+        if self.entry(key).map(|entry| entry.state) != Some(CacheState::Loading { load_token }) {
             return Err(CacheError::Stale);
         }
+        let generation = self.allocate_generation()?;
+        let entry = self.entry_mut(key).ok_or(CacheError::Stale)?;
         let page = CachePage {
             frame_capability,
             cache_generation: generation,
@@ -253,6 +257,9 @@ impl PageCache {
         let entry = self.entry(key).ok_or(CacheError::Stale)?;
         match entry.state {
             CacheState::Clean { page, .. } if page.cache_generation == source_generation => {
+                if page.frame_capability == private_frame_capability {
+                    return Err(CacheError::Malformed);
+                }
                 Ok(CachePage {
                     frame_capability: private_frame_capability,
                     cache_generation: source_generation,
@@ -274,6 +281,22 @@ impl PageCache {
                 Ok(())
             }
             CacheState::Dirty { page, .. } if page.cache_generation == cache_generation => Ok(()),
+            CacheState::Writeback {
+                page,
+                mappings,
+                writeback_token,
+                ..
+            }
+                if page.cache_generation == cache_generation =>
+            {
+                entry.state = CacheState::Writeback {
+                    page,
+                    mappings,
+                    writeback_token,
+                    redirtied: true,
+                };
+                Ok(())
+            }
             _ => Err(CacheError::Stale),
         }
     }
@@ -294,6 +317,7 @@ impl PageCache {
                     page,
                     mappings,
                     writeback_token,
+                    redirtied: false,
                 };
                 Ok(())
             }
@@ -312,8 +336,13 @@ impl PageCache {
                 page,
                 mappings,
                 writeback_token: expected,
+                redirtied,
             } if expected == writeback_token => {
-                entry.state = CacheState::Clean { page, mappings };
+                entry.state = if redirtied {
+                    CacheState::Dirty { page, mappings }
+                } else {
+                    CacheState::Clean { page, mappings }
+                };
                 Ok(())
             }
             _ => Err(CacheError::Stale),
@@ -641,6 +670,44 @@ mod tests {
             Err(CacheError::Stale),
             "private COW must not dirty the shared source"
         );
+    }
+
+    #[test]
+    fn private_cow_rejects_the_source_capability() {
+        let mut cache = PageCache::new();
+        let key = key(39);
+        let page = clean(&mut cache, key);
+        assert_eq!(
+            cache.private_cow(key, page.cache_generation, page.frame_capability),
+            Err(CacheError::Malformed)
+        );
+    }
+
+    #[test]
+    fn write_during_writeback_remains_dirty_after_completion() {
+        let mut cache = PageCache::new();
+        let key = key(40);
+        let page = clean(&mut cache, key);
+        cache.mark_dirty(key, page.cache_generation).unwrap();
+        cache
+            .begin_writeback(key, page.cache_generation, 45)
+            .unwrap();
+        cache.mark_dirty(key, page.cache_generation).unwrap();
+        cache.complete_writeback(key, 45).unwrap();
+        assert_eq!(
+            cache.begin_reclaim(key, page.cache_generation, 46),
+            Err(CacheError::Dirty)
+        );
+    }
+
+    #[test]
+    fn stale_publish_does_not_consume_cache_generations() {
+        let mut cache = PageCache::new();
+        assert_eq!(
+            cache.publish_clean(key(40), 7, 11),
+            Err(CacheError::Stale)
+        );
+        assert_eq!(clean(&mut cache, key(40)).cache_generation, 1);
     }
 
     #[test]

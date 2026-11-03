@@ -43,7 +43,9 @@ EXPORTS
     isxdigit
     localeconv
     malloc
+    memcmp
     memcpy
+    memmove
     memset
     printf
     putchar

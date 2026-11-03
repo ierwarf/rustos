@@ -1383,6 +1383,16 @@ pub(crate) fn archive_run_log(log_path: &Path) -> Result<()> {
     let destination = history_dir.join(format!("{stamp}-{}.log", std::process::id()));
     fs::copy(log_path, &destination)
         .with_context(|| format!("archive debugcon log to {}", destination.display()))?;
+    // The Linux DVM's serial log is truncated by the next boot just like the
+    // debugcon log, and the DVM-side failures (GPU probe timing, relay
+    // markers) cannot be diagnosed without it. Same stamp, `.dvm.txt`.
+    let dvm_serial = log_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join("linux-dvm-serial.log");
+    if dvm_serial.exists() {
+        let _ = fs::copy(&dvm_serial, destination.with_extension("dvm.txt"));
+    }
 
     // Prune oldest-first by name, which sorts by the millisecond stamp it
     // starts with, so the window stays bounded without stat-ing every entry.
@@ -1398,6 +1408,7 @@ pub(crate) fn archive_run_log(log_path: &Path) -> Result<()> {
         .take(existing.len().saturating_sub(DEBUGCON_HISTORY_LIMIT))
     {
         let _ = fs::remove_file(stale);
+        let _ = fs::remove_file(stale.with_extension("dvm.txt"));
     }
     Ok(())
 }
@@ -1489,5 +1500,30 @@ mod release_probe_tests {
         assert_eq!(release_probe_public_key_hex().len(), 64);
         assert_eq!(bundle.len(), candidate_end + RELEASE_PROBE_PREVIOUS.len());
         assert_eq!(RELEASE_PROBE_SIGNER_ID, [0x7e; 16], "loaderd's TEST_SIGNER_ID");
+    }
+}
+
+#[cfg(test)]
+mod run_archive_tests {
+    use super::archive_run_log;
+    use std::fs;
+
+    #[test]
+    fn a_run_archives_the_dvm_serial_log_beside_the_debugcon_log() {
+        let root = tempfile::tempdir().unwrap();
+        let log = root.path().join("rustos-debugcon.log");
+        fs::write(&log, "rustos").unwrap();
+        fs::write(root.path().join("linux-dvm-serial.log"), "dvm").unwrap();
+        archive_run_log(&log).unwrap();
+        let history = root.path().join("debugcon-history");
+        let mut names: Vec<_> = fs::read_dir(&history)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        assert_eq!(names.len(), 2, "{names:?}");
+        let serial = names.iter().find(|name| name.ends_with(".dvm.txt")).unwrap();
+        assert_eq!(fs::read_to_string(history.join(serial)).unwrap(), "dvm");
+        assert!(names.iter().any(|name| name.ends_with(".log")));
     }
 }

@@ -513,8 +513,8 @@ impl FrameDescriptorLedger {
         {
             return None;
         }
-        let mapping_id = self.claim_mapping(new_root, new_va)?;
         let frame = self.record(frame_phys)?;
+        let mapping_id = self.claim_mapping(new_root, new_va)?;
         let live_role = shared_live_role(kind);
         let locked_role = shared_locked_role(kind);
         let role = frame.role.load(DESCRIPTOR_ACQUIRE);
@@ -700,6 +700,7 @@ impl FrameDescriptorLedger {
             ticket.virtual_address,
             ticket.mapping_id,
             ticket.kind,
+            !ticket.converted_exclusive,
         );
         assert_eq!(result, DataLeafRelease::FrameRetained);
         self.decrement_root_data_count_with(root);
@@ -716,7 +717,7 @@ impl FrameDescriptorLedger {
                 frame
                     .role
                     .swap(ROLE_EXCLUSIVE_DATA_LIVE, DESCRIPTOR_RELEASE),
-                shared_live_role(ticket.kind)
+                shared_locked_role(ticket.kind)
             );
         }
         true
@@ -949,6 +950,7 @@ impl FrameDescriptorLedger {
             claim.virtual_address,
             claim.mapping_id,
             claim.kind,
+            true,
         );
         self.decrement_root_data_count(claim.root_phys);
         result
@@ -1070,7 +1072,7 @@ impl FrameDescriptorLedger {
                 return None;
             }
         }
-        let result = self.remove_shared_mapping_locked(frame, root_phys, va, mapping_id, kind);
+        let result = self.remove_shared_mapping_locked(frame, root_phys, va, mapping_id, kind, true);
         self.decrement_root_data_count_with(root);
         Some(result)
     }
@@ -1082,6 +1084,7 @@ impl FrameDescriptorLedger {
         va: u64,
         mapping_id: u32,
         kind: CowFrameKind,
+        unlock: bool,
     ) -> DataLeafRelease {
         let packed = frame.data_leaf_count_or_map_head.load(Ordering::Relaxed);
         let count = shared_count(packed);
@@ -1151,7 +1154,9 @@ impl FrameDescriptorLedger {
             }
             self.release_mapping_record(mapping_id);
         }
-        frame.role.store(shared_live_role(kind), DESCRIPTOR_RELEASE);
+        if unlock {
+            frame.role.store(shared_live_role(kind), DESCRIPTOR_RELEASE);
+        }
         DataLeafRelease::FrameRetained
     }
 

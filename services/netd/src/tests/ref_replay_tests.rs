@@ -1,6 +1,19 @@
 use super::*;
 
 #[test]
+fn socket_ref_increment_does_not_report_success_on_overflow() {
+    let mut refs = usize::MAX;
+    assert_eq!(increment_socket_refs(&mut refs), libc::EOVERFLOW);
+    assert_eq!(refs, usize::MAX);
+    refs = 0;
+    assert_eq!(increment_socket_refs(&mut refs), libc::EOVERFLOW);
+    assert_eq!(refs, 0);
+    refs = 1;
+    assert_eq!(increment_socket_refs(&mut refs), 0);
+    assert_eq!(refs, 2);
+}
+
+#[test]
 fn close_retry_replays_exact_result_and_rejects_operation_alias() {
     let request = NetdIpcRequest {
         version: NETD_IPC_ABI_VERSION,

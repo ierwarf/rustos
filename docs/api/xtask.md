@@ -41,7 +41,9 @@ command after correcting the error. Do not use `clean` or `distclean` unless
 After a completed build, `ccache-stats` reports cache use and `profile-build`
 attributes elapsed time by package; neither is runtime evidence.
 
-`kvm-smoke` is bounded to 30 seconds when waiting for readiness markers:
+`kvm-smoke` defaults to a 120-second boot, readiness, and active proof budget.
+Use `--timeout <seconds>` to select a value from 1 to 180; `--smp-iteration`
+requires at most 30 seconds:
 
 ```bash
 cargo xtask build
@@ -148,7 +150,9 @@ cache 손상이 입증되지 않았다면 `clean`/`distclean`을 사용하지 �
 성공 후 `ccache-stats`와 `profile-build`로 cache와 package별 시간을 확인할 수
 있지만, 이 결과는 runtime 증거가 아닙니다.
 
-`kvm-smoke`의 readiness marker 대기는 최대 30초입니다.
+`kvm-smoke`의 기본 부팅, readiness 및 active proof 시간 제한은 120초입니다.
+`--timeout <seconds>`로 1~180초를 선택할 수 있으며, `--smp-iteration`은
+최대 30초로 제한됩니다.
 
 ```bash
 cargo xtask build

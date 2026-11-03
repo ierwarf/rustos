@@ -740,10 +740,21 @@ impl Dispatch<wl_registry::WlRegistry, ()> for GameState {
                     state.buffers.clear();
                     state.buffer_available.clear();
                     for index in 0..SHM_BUFFER_COUNT {
-                        let buffer =
-                            ShmBuffer::new(&shm, WIDTH, HEIGHT, qh, index).expect("shm buffer");
-                        state.buffers.push(buffer);
-                        state.buffer_available.push(true);
+                        match ShmBuffer::new(&shm, WIDTH, HEIGHT, qh, index) {
+                            Ok(buffer) => {
+                                state.buffers.push(buffer);
+                                state.buffer_available.push(true);
+                            }
+                            Err(error) => {
+                                // Out of memory is an environmental failure, not a bug:
+                                // report it and exit the event loop instead of panicking.
+                                raw_stderr_line(&format!("wayclick: shm buffer failed: {error}"));
+                                state.buffers.clear();
+                                state.buffer_available.clear();
+                                state.running = false;
+                                return;
+                            }
+                        }
                     }
                     if state.configured {
                         state.pending_damage.mark_full();

@@ -16,8 +16,8 @@ const KIND_SESSION_END: u8 = 3;
 const KIND_POINTER_POSITION: u8 = 4;
 const LINUX_EVDEV_KEY_MAX: u16 = 0x02ff;
 const POINTER_BUTTON_MASK: u8 = 0x1f;
-const POINTER_POSITION_MAX_X: u16 = 1599;
-const POINTER_POSITION_MAX_Y: u16 = 899;
+const POINTER_POSITION_MAX_X: u16 = 2559;
+const POINTER_POSITION_MAX_Y: u16 = 1439;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct DvmOutcome {
@@ -59,7 +59,6 @@ impl DvmDecoder {
             // revoke and new policy admission into one ambiguous operation.
             return self.reset();
         }
-        self.transport_generation = record.transport_generation;
         let bytes = &record.bytes;
         let kind = bytes[5];
         let epoch = u32::from_be_bytes(bytes[8..12].try_into().expect("frame epoch"));
@@ -69,6 +68,7 @@ impl DvmDecoder {
                 if epoch != 0 && sequence == 0 && bytes[16..28].iter().all(|&byte| byte == 0) =>
             {
                 let revoke_epoch = (self.epoch != 0).then_some(self.epoch);
+                self.transport_generation = record.transport_generation;
                 self.epoch = epoch;
                 self.sequence = 0;
                 DvmOutcome {
@@ -79,7 +79,8 @@ impl DvmDecoder {
                 }
             }
             KIND_KEY
-                if epoch == self.epoch
+                if epoch != 0
+                    && epoch == self.epoch
                     && self.sequence.checked_add(1) == Some(sequence)
                     && bytes[16..18] != [0, 0]
                     && bytes[19..28].iter().all(|&byte| byte == 0) =>
@@ -113,7 +114,8 @@ impl DvmDecoder {
                 }
             }
             KIND_POINTER
-                if epoch == self.epoch
+                if epoch != 0
+                    && epoch == self.epoch
                     && self.sequence.checked_add(1) == Some(sequence)
                     && bytes[25..28].iter().all(|&byte| byte == 0)
                     && bytes[24] & !POINTER_BUTTON_MASK == 0 =>
@@ -142,7 +144,8 @@ impl DvmDecoder {
                 }
             }
             KIND_POINTER_POSITION
-                if epoch == self.epoch
+                if epoch != 0
+                    && epoch == self.epoch
                     && self.sequence.checked_add(1) == Some(sequence)
                     && bytes[25..28].iter().all(|&byte| byte == 0)
                     && bytes[24] & !POINTER_BUTTON_MASK == 0 =>
@@ -176,7 +179,8 @@ impl DvmDecoder {
                 }
             }
             KIND_SESSION_END
-                if epoch == self.epoch
+                if epoch != 0
+                    && epoch == self.epoch
                     && self.sequence.checked_add(1) == Some(sequence)
                     && bytes[16..28].iter().all(|&byte| byte == 0) =>
             {
@@ -245,6 +249,33 @@ mod tests {
         let checksum = crc32(&wire.bytes[..28]).to_be_bytes();
         wire.bytes[28..32].copy_from_slice(&checksum);
         wire
+    }
+
+    #[test]
+    fn zero_epoch_cannot_inject_events_without_a_session() {
+        for kind in [KIND_KEY, KIND_POINTER, KIND_POINTER_POSITION, KIND_SESSION_END] {
+            let mut decoder = DvmDecoder::default();
+            let mut frame = record(kind, 0, 1);
+            if kind == KIND_KEY {
+                frame.bytes[16..18].copy_from_slice(&30_u16.to_be_bytes());
+                frame.bytes[18] = 1;
+                let checksum = crc32(&frame.bytes[..28]).to_be_bytes();
+                frame.bytes[28..32].copy_from_slice(&checksum);
+            }
+            assert_eq!(decoder.consume(&frame), DvmOutcome::default());
+            assert_eq!(decoder.sequence, 0);
+        }
+    }
+
+    #[test]
+    fn rejected_frame_does_not_pin_a_fresh_transport_generation() {
+        let mut decoder = DvmDecoder::default();
+        let rejected = record(KIND_POINTER, 0, 1);
+        assert_eq!(decoder.consume(&rejected), DvmOutcome::default());
+        assert_eq!(decoder.transport_generation, 0);
+        let mut start = record(KIND_SESSION_START, 9, 0);
+        start.transport_generation = 8;
+        assert_eq!(decoder.consume(&start).grant_epoch, Some(9));
     }
 
     #[test]

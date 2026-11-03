@@ -308,6 +308,7 @@ pub(super) fn read(expected_generation: u64, lba: u64, block_count: u64) -> Resu
     let mut in_flight = Vec::with_capacity(windows.len());
     for window in windows {
         match submit(
+            expected_generation,
             BLOCK_BROKER_OP_DVM_SUBMIT_READ,
             window.lba,
             window.block_count,
@@ -413,6 +414,7 @@ pub(super) fn write(
     write_admitted_with(info()?, expected_generation, lba, block_count, bytes, || {
         clear_read_cache();
         let ticket = submit(
+            expected_generation,
             BLOCK_BROKER_OP_DVM_SUBMIT_WRITE,
             lba,
             block_count,
@@ -494,6 +496,7 @@ pub(super) fn flush_before(expected_generation: u64, deadline: Instant) -> Resul
     let args = RustosBlockBrokerArgs {
         abi_version: BLOCK_BROKER_ABI_VERSION,
         op: BLOCK_BROKER_OP_DVM_SUBMIT_FLUSH,
+        expected_generation,
         out_ticket_ptr: (&mut ticket as *mut DvmBlockTicketWire) as u64,
         ..RustosBlockBrokerArgs::default()
     };
@@ -503,6 +506,7 @@ pub(super) fn flush_before(expected_generation: u64, deadline: Instant) -> Resul
 }
 
 fn submit(
+    expected_generation: u64,
     operation: u16,
     lba: u64,
     block_count: u64,
@@ -514,6 +518,7 @@ fn submit(
     let args = RustosBlockBrokerArgs {
         abi_version: BLOCK_BROKER_ABI_VERSION,
         op: operation,
+        expected_generation,
         lba,
         block_count,
         buffer_ptr: buffer as u64,

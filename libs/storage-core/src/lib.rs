@@ -1,3 +1,12 @@
+//! Shared block-range and partition-metadata admission.
+//!
+//! - **Owner:** storage services choose devices and mounts; this library validates bytes.
+//! - **Boundary:** block geometry, FAT BPBs and GPT records are untrusted inputs.
+//! - **Lifecycle:** validate complete ranges and checksums before exposing partitions.
+//! - **Concurrency:** callers serialize device access; this library owns no global state.
+//! - **Failure:** malformed, overflowing or overlapping metadata fails closed.
+//! - **Evidence:** native parser tests and indexed bounded Kani block-range proofs;
+//!   neither establishes physical-device durability or DVM lifetime correctness.
 #![no_std]
 
 extern crate alloc;
@@ -7,7 +16,6 @@ extern crate std;
 use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;
-use core::cmp::min;
 use fatfs::IoError;
 
 pub type IoResult<T> = core::result::Result<T, StorageError>;
@@ -242,6 +250,10 @@ pub fn detect_partitions<D: BlockDevice>(dev: &mut D) -> IoResult<Vec<PartitionI
         return Ok(partitions);
     }
 
+    if mbr[510..512] != [0x55, 0xaa] {
+        return Ok(Vec::new());
+    }
+
     let mut partitions = Vec::new();
     for idx in 0..4 {
         let off = 446 + idx * 16;
@@ -277,7 +289,7 @@ pub fn detect_fat_boot_partition<D: BlockDevice>(dev: &mut D) -> IoResult<Option
 
     let mut block0 = vec![0_u8; block_size];
     dev.read_blocks(0, &mut block0)?;
-    if parse_fat_volume_metadata(&block0, total_blocks).is_some() {
+    if parse_fat_volume_metadata(&block0, u128::from(total_blocks) * block_size as u128).is_some() {
         return Ok(Some(PartitionInfo {
             start_lba: 0,
             block_count: total_blocks,
@@ -288,7 +300,10 @@ pub fn detect_fat_boot_partition<D: BlockDevice>(dev: &mut D) -> IoResult<Option
         let mut slice = BlockSlice::new(&mut *dev, partition.start_lba, partition.block_count)?;
         let mut boot_sector = vec![0_u8; block_size];
         slice.read_blocks(0, &mut boot_sector)?;
-        if parse_fat_volume_metadata(&boot_sector, partition.block_count).is_some() {
+        if parse_fat_volume_metadata(
+            &boot_sector,
+            u128::from(partition.block_count) * block_size as u128,
+        ).is_some() {
             return Ok(Some(partition));
         }
     }
@@ -297,87 +312,95 @@ pub fn detect_fat_boot_partition<D: BlockDevice>(dev: &mut D) -> IoResult<Option
 }
 
 pub fn fat_volume_id_from_boot_sector(boot_sector: &[u8]) -> Option<u32> {
-    parse_fat_volume_metadata(boot_sector, u64::MAX).map(|metadata| metadata.volume_id)
+    parse_fat_volume_metadata(boot_sector, u128::MAX).map(|metadata| metadata.volume_id)
+}
+
+// UEFI GPT header and entry array, section 5:
+// https://github.com/UEFI/UEFI-Specification-Release/blob/main/source/05_GUID_Partition_Table_Format.rst
+const MAX_GPT_ARRAY_BYTES: usize = 16 * 1024 * 1024;
+
+fn crc32_update(mut crc: u32, bytes: &[u8]) -> u32 {
+    for &byte in bytes {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xedb8_8320 & (crc & 1).wrapping_neg());
+        }
+    }
+    crc
 }
 
 fn detect_gpt_partitions<D: BlockDevice>(
-    dev: &mut D,
-    total_blocks: u64,
-    block_size: usize,
-    mbr: &[u8],
+    dev: &mut D, total_blocks: u64, block_size: usize, mbr: &[u8],
 ) -> IoResult<Option<Vec<PartitionInfo>>> {
-    if total_blocks <= 1 {
-        return Ok(None);
-    }
-    let protective = mbr[446 + 4] == 0xee;
+    if total_blocks <= 1 { return Ok(None); }
+    let protective = mbr[510..512] == [0x55, 0xaa]
+        && (0..4).any(|i| mbr[446 + i * 16 + 4] == 0xee);
     let mut header = vec![0_u8; block_size];
     dev.read_blocks(1, &mut header)?;
-    if !protective && &header[..8] != b"EFI PART" {
-        return Ok(None);
-    }
-    if &header[..8] != b"EFI PART" {
-        return Ok(None);
-    }
+    if !protective && &header[..8] != b"EFI PART" { return Ok(None); }
 
+    match read_gpt_copy(dev, total_blocks, block_size, 1, header) {
+        Ok(parts) => Ok(Some(parts)),
+        Err(StorageError::InvalidInput) => {
+            let mut backup = vec![0_u8; block_size];
+            dev.read_blocks(total_blocks - 1, &mut backup)?;
+            read_gpt_copy(dev, total_blocks, block_size, total_blocks - 1, backup).map(Some)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn read_gpt_copy<D: BlockDevice>(
+    dev: &mut D, total_blocks: u64, block_size: usize, header_lba: u64,
+    mut header: Vec<u8>,
+) -> IoResult<Vec<PartitionInfo>> {
+    let invalid = StorageError::InvalidInput;
+    if &header[..8] != b"EFI PART" || le_u32(&header, 8) != 0x0001_0000
+        || le_u32(&header, 20) != 0 || le_u64(&header, 24) != header_lba
+        || le_u64(&header, 32) != if header_lba == 1 { total_blocks - 1 } else { 1 }
+    { return Err(invalid); }
+    let header_size = le_u32(&header, 12) as usize;
+    if !(92..=block_size).contains(&header_size) { return Err(invalid); }
+    let header_crc = le_u32(&header, 16);
+    header[16..20].fill(0);
+    if !crc32_update(!0, &header[..header_size]) != header_crc { return Err(invalid); }
+
+    let first = le_u64(&header, 40);
+    let last = le_u64(&header, 48);
     let entry_lba = le_u64(&header, 72);
-    let entry_count = le_u32(&header, 80) as usize;
+    let count = le_u32(&header, 80) as usize;
     let entry_size = le_u32(&header, 84) as usize;
-    if entry_count == 0
-        || entry_count > MAX_GPT_PARTITION_ENTRIES
-        || entry_size < 56
-        || entry_size > block_size
-    {
-        return Err(StorageError::InvalidInput);
+    if count == 0 || count > MAX_GPT_PARTITION_ENTRIES || entry_size < 128
+        || !entry_size.is_multiple_of(8) || first < 2 || first > last
+        || last >= total_blocks - 1
+    { return Err(invalid); }
+    // Older UEFI revisions permitted any multiple of eight; parse these as a
+    // contiguous byte array too, including entries crossing block boundaries.
+    let bytes = count.checked_mul(entry_size).ok_or(invalid)?;
+    if bytes > MAX_GPT_ARRAY_BYTES { return Err(invalid); }
+    let blocks = bytes.div_ceil(block_size);
+    let end = entry_lba.checked_add(blocks as u64).ok_or(invalid)?;
+    if (header_lba == 1 && (entry_lba < 2 || end > first))
+        || (header_lba != 1 && (entry_lba <= last || end > header_lba))
+    { return Err(invalid); }
+    let mut data = vec![0; blocks.checked_mul(block_size).ok_or(invalid)?];
+    for (i, block) in data.chunks_exact_mut(block_size).enumerate() {
+        dev.read_blocks(entry_lba + i as u64, block)?;
     }
-
-    let entries_per_block = block_size / entry_size;
-    if entries_per_block == 0 {
-        return Err(StorageError::InvalidInput);
-    }
-
-    let entry_block_count = entry_count.div_ceil(entries_per_block);
+    if !crc32_update(!0, &data[..bytes]) != le_u32(&header, 88) { return Err(invalid); }
     let mut partitions = Vec::new();
-    let mut entry_block = vec![0_u8; block_size];
-    for block_index in 0..entry_block_count {
-        let lba = entry_lba
-            .checked_add(block_index as u64)
-            .ok_or(StorageError::InvalidInput)?;
-        if lba >= total_blocks {
-            return Err(StorageError::InvalidInput);
-        }
-        dev.read_blocks(lba, &mut entry_block)?;
-        let entries_in_this_block = min(
-            entries_per_block,
-            entry_count - block_index * entries_per_block,
-        );
-        for entry_index in 0..entries_in_this_block {
-            let off = entry_index * entry_size;
-            if entry_block[off..off + 16].iter().all(|byte| *byte == 0) {
-                continue;
-            }
-            let start_lba = le_u64(&entry_block, off + 32);
-            let end_lba = le_u64(&entry_block, off + 40);
-            if start_lba == 0 || end_lba < start_lba {
-                continue;
-            }
-            let block_count = end_lba
-                .checked_sub(start_lba)
-                .and_then(|count| count.checked_add(1))
-                .ok_or(StorageError::InvalidInput)?;
-            let end = start_lba
-                .checked_add(block_count)
-                .ok_or(StorageError::InvalidInput)?;
-            if end > total_blocks {
-                continue;
-            }
-            partitions.push(PartitionInfo {
-                start_lba,
-                block_count,
-            });
-        }
+    for entry in data[..bytes].chunks_exact(entry_size) {
+        if entry[..16].iter().all(|&byte| byte == 0) { continue; }
+        let start = le_u64(entry, 32);
+        let end = le_u64(entry, 40);
+        if start < first || end > last || start > end { return Err(invalid); }
+        let part = PartitionInfo { start_lba: start, block_count: end - start + 1 };
+        if partitions.iter().any(|existing: &PartitionInfo| {
+            start < existing.start_lba + existing.block_count && existing.start_lba <= end
+        }) { return Err(invalid); }
+        partitions.push(part);
     }
-
-    Ok(Some(partitions))
+    Ok(partitions)
 }
 
 #[derive(Clone, Copy)]
@@ -387,7 +410,7 @@ struct FatVolumeMetadata {
 
 fn parse_fat_volume_metadata(
     boot_sector: &[u8],
-    available_blocks: u64,
+    available_bytes: u128,
 ) -> Option<FatVolumeMetadata> {
     if boot_sector.len() < 512 {
         return None;
@@ -424,7 +447,9 @@ fn parse_fat_volume_metadata(
         (total, 0) => total as u32,
         (total16, total32) => (total16 as u32).min(total32),
     };
-    if total_blocks == 0 || u64::from(total_blocks) > available_blocks {
+    if total_blocks == 0
+        || u128::from(total_blocks) * u128::from(bytes_per_sector) > available_bytes
+    {
         return None;
     }
 
@@ -516,9 +541,49 @@ fn le_u64(bytes: &[u8], offset: usize) -> u64 {
     ])
 }
 
+#[cfg(kani)]
+mod proofs {
+    use super::*;
+
+    #[kani::proof]
+    fn valid_block_io_never_exceeds_device() {
+        let lba: u64 = kani::any();
+        let total: u64 = kani::any();
+        let len: usize = kani::any();
+        // Both supported sector geometries, with symbolic full-width ranges.
+        let block_size = if kani::any::<bool>() { 512 } else { 4096 };
+        let result = validate_block_io(block_size, lba, total, len);
+        if result.is_ok() {
+            assert!(len > 0 && len % block_size == 0);
+            assert!(lba <= total);
+            assert!((len / block_size) as u64 <= total - lba);
+        }
+        if lba == 0 && total == 1 && len == block_size {
+            assert!(result.is_ok());
+        }
+        kani::cover!(result.is_ok() && block_size == 512);
+        kani::cover!(result.is_ok() && block_size == 4096);
+        kani::cover!(result.is_err() && lba == u64::MAX && len == block_size);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn block_io_admission_rejects_wrap_misalignment_and_device_overrun() {
+        for sector in [512, 4096] {
+            assert_eq!(validate_block_io(sector, 0, 1, sector), Ok(()));
+            assert_eq!(validate_block_io(sector, 1, 2, sector), Ok(()));
+            for (lba, total, len) in [
+                (0, 1, 0), (0, 1, sector - 1), (1, 1, sector),
+                (u64::MAX, u64::MAX, sector),
+            ] {
+                assert_eq!(validate_block_io(sector, lba, total, len), Err(StorageError::InvalidInput));
+            }
+        }
+    }
 
     fn fat_boot_sector(total_sectors: u16, bytes_per_sector: u16) -> [u8; 512] {
         let mut sector = [0_u8; 512];
@@ -583,6 +648,99 @@ mod tests {
         sector[..512].copy_from_slice(&boot);
         sector[39..43].copy_from_slice(&0x1234_5678_u32.to_le_bytes());
         assert_eq!(fat_volume_id_from_boot_sector(&sector), Some(0x1234_5678));
+    }
+
+    #[test]
+    fn fat_capacity_is_checked_in_bytes_not_device_blocks() {
+        let mut small = MemBlockDevice::new_zeroed(512, 8);
+        small.write_blocks(0, &fat_boot_sector(8, 4096)).unwrap();
+        assert_eq!(detect_fat_boot_partition(&mut small), Ok(None));
+
+        let mut large = MemBlockDevice::new_zeroed(4096, 8);
+        let mut block = vec![0; 4096];
+        block[..512].copy_from_slice(&fat_boot_sector(64, 512));
+        large.write_blocks(0, &block).unwrap();
+        assert_eq!(detect_fat_boot_partition(&mut large), Ok(Some(PartitionInfo {
+            start_lba: 0,
+            block_count: 8,
+        })));
+    }
+
+    #[test]
+    fn ignores_unsigned_mbr_entries() {
+        let mut disk = MemBlockDevice::new_zeroed(512, 8);
+        let mut block = [0; 512];
+        block[454..458].copy_from_slice(&1_u32.to_le_bytes());
+        block[458..462].copy_from_slice(&2_u32.to_le_bytes());
+        disk.write_blocks(0, &block).unwrap();
+        assert_eq!(detect_partitions(&mut disk), Ok(Vec::new()));
+    }
+
+    fn gpt_disk() -> MemBlockDevice {
+        let mut disk = MemBlockDevice::new_zeroed(512, 100);
+        let mut mbr = [0; 512];
+        mbr[450] = 0xee;
+        mbr[510..512].copy_from_slice(&[0x55, 0xaa]);
+        disk.write_blocks(0, &mbr).unwrap();
+        // Legacy-permitted 136-byte entries: the fourth crosses a block.
+        let mut entries = vec![0; 1024];
+        entries[3 * 136] = 1;
+        entries[3 * 136 + 32..3 * 136 + 40].copy_from_slice(&10_u64.to_le_bytes());
+        entries[3 * 136 + 40..3 * 136 + 48].copy_from_slice(&12_u64.to_le_bytes());
+        disk.write_blocks(2, &entries).unwrap();
+        disk.write_blocks(97, &entries).unwrap();
+        for (at, alternate, array) in [(1_u64, 99_u64, 2_u64), (99, 1, 97)] {
+            let mut header = [0; 512];
+            header[..8].copy_from_slice(b"EFI PART");
+            header[8..12].copy_from_slice(&0x0001_0000_u32.to_le_bytes());
+            header[12..16].copy_from_slice(&92_u32.to_le_bytes());
+            header[24..32].copy_from_slice(&at.to_le_bytes());
+            header[32..40].copy_from_slice(&alternate.to_le_bytes());
+            header[40..48].copy_from_slice(&4_u64.to_le_bytes());
+            header[48..56].copy_from_slice(&96_u64.to_le_bytes());
+            header[72..80].copy_from_slice(&array.to_le_bytes());
+            header[80..84].copy_from_slice(&4_u32.to_le_bytes());
+            header[84..88].copy_from_slice(&136_u32.to_le_bytes());
+            header[88..92].copy_from_slice(&(!crc32_update(!0, &entries[..544])).to_le_bytes());
+            let crc = !crc32_update(!0, &header[..92]);
+            header[16..20].copy_from_slice(&crc.to_le_bytes());
+            disk.write_blocks(at, &header).unwrap();
+        }
+        disk
+    }
+
+    #[test]
+    fn gpt_cross_block_entries_and_backup_recovery() {
+        let mut disk = gpt_disk();
+        let expected = vec![PartitionInfo { start_lba: 10, block_count: 3 }];
+        assert_eq!(detect_partitions(&mut disk), Ok(expected.clone()));
+        disk.as_bytes_mut()[512 + 16] ^= 1;
+        assert_eq!(detect_partitions(&mut disk), Ok(expected));
+        disk.as_bytes_mut()[99 * 512 + 16] ^= 1;
+        assert_eq!(detect_partitions(&mut disk), Err(StorageError::InvalidInput));
+    }
+
+    #[test]
+    fn gpt_rejects_array_corruption_and_out_of_range_partitions() {
+        let mut disk = gpt_disk();
+        disk.as_bytes_mut()[2 * 512 + 1] ^= 1;
+        disk.as_bytes_mut()[97 * 512 + 1] ^= 1;
+        assert_eq!(detect_partitions(&mut disk), Err(StorageError::InvalidInput));
+        let mut disk = gpt_disk();
+        // Move the usable start beyond the partition, maintaining valid CRCs.
+        for at in [1, 99] {
+            let header = &mut disk.as_bytes_mut()[at * 512..(at + 1) * 512];
+            header[40..48].copy_from_slice(&11_u64.to_le_bytes());
+            header[16..20].fill(0);
+            let crc = !crc32_update(!0, &header[..92]);
+            header[16..20].copy_from_slice(&crc.to_le_bytes());
+        }
+        assert_eq!(detect_partitions(&mut disk), Err(StorageError::InvalidInput));
+    }
+
+    #[test]
+    fn gpt_crc32_known_vector() {
+        assert_eq!(!crc32_update(!0, b"123456789"), 0xcbf4_3926);
     }
 
     #[test]

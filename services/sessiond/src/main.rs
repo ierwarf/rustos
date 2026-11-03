@@ -46,7 +46,14 @@ struct PendingLaunch {
     /// The program was observed running at least once. If it then vanishes
     /// before settling it exited early; waiting out the launch timeout would
     /// only delay the retry by 20 s.
-    seen_running: bool,
+    first_seen_running: Option<Instant>,
+}
+
+impl PendingLaunch {
+    fn observe_running(&mut self, now: Instant) -> bool {
+        let first_seen = *self.first_seen_running.get_or_insert(now);
+        now.saturating_duration_since(first_seen) >= LAUNCH_SETTLE_DELAY
+    }
 }
 
 fn main() {
@@ -127,9 +134,9 @@ fn main() {
 
         if let Some(pending) = pending_launch.as_mut() {
             if running_desktop_ids.contains(pending.desktop_file_id.as_str()) {
-                pending.seen_running = true;
+                let settled = pending.observe_running(Instant::now());
                 retry_after.remove(pending.desktop_file_id.as_str());
-                if pending.requested_at.elapsed() >= LAUNCH_SETTLE_DELAY {
+                if settled {
                     observability_client::info!(
                         "sessiond",
                         service,
@@ -147,7 +154,7 @@ fn main() {
                 continue;
             }
 
-            let exited_early = pending.seen_running;
+            let exited_early = pending.first_seen_running.is_some();
             if !exited_early && pending.requested_at.elapsed() < LAUNCH_START_TIMEOUT {
                 thread::sleep(POLL_INTERVAL);
                 continue;
@@ -252,7 +259,7 @@ fn main() {
                         package_id: entry.package_id.clone(),
                         restart: entry.restart,
                         requested_at: Instant::now(),
-                        seen_running: false,
+                        first_seen_running: None,
                     });
                     break;
                 }
@@ -406,7 +413,23 @@ mod tests {
     use std::collections::BTreeMap;
     use std::time::{Duration, Instant};
 
-    use super::{idle_watch_wait, IDLE_WATCH_WAIT, LAUNCH_SETTLE_DELAY, POLL_INTERVAL};
+    use super::{idle_watch_wait, PendingLaunch, IDLE_WATCH_WAIT, LAUNCH_SETTLE_DELAY, POLL_INTERVAL};
+
+    #[test]
+    fn delayed_first_observation_does_not_settle_a_new_process() {
+        let requested_at = Instant::now();
+        let mut pending = PendingLaunch {
+            desktop_file_id: String::from("app.desktop"),
+            package_id: String::from("app"),
+            restart: false,
+            requested_at,
+            first_seen_running: None,
+        };
+        let first_seen = requested_at + Duration::from_secs(1);
+        assert!(!pending.observe_running(first_seen));
+        assert!(!pending.observe_running(first_seen + LAUNCH_SETTLE_DELAY - Duration::from_millis(1)));
+        assert!(pending.observe_running(first_seen + LAUNCH_SETTLE_DELAY));
+    }
 
     #[test]
     fn an_idle_session_parks_without_slowing_launch_settling() {

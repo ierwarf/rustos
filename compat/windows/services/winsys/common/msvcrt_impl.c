@@ -289,6 +289,10 @@ void *realloc(void *ptr, size_t size)
 
 void *calloc(size_t count, size_t size)
 {
+    if (size != 0 && count > (size_t)-1 / size) {
+        rustos_set_errno_value(RUSTOS_CRT_ENOMEM);
+        return NULL;
+    }
     rustos_sync_runtime_globals();
     return RtlAllocateHeap(rustos_process_heap(), RUSTOS_HEAP_ZERO_MEMORY, count * size);
 }
@@ -348,6 +352,9 @@ int getchar(void)
 
 char *fgets(char *buffer, int len, void *stream)
 {
+    if (len <= 0) {
+        return NULL;
+    }
     return RtlMsvcrtFgets(buffer, (UINT)(unsigned int)len, stream);
 }
 
@@ -475,6 +482,39 @@ void *memcpy(void *dst, const void *src, size_t len)
     return dst;
 }
 
+void *memmove(void *dst, const void *src, size_t len)
+{
+    unsigned char *out = (unsigned char *)dst;
+    const unsigned char *in = (const unsigned char *)src;
+    size_t index;
+    if (out == in || len == 0) {
+        return dst;
+    }
+    if (out < in || out >= in + len) {
+        for (index = 0; index < len; index++) {
+            out[index] = in[index];
+        }
+    } else {
+        for (index = len; index != 0; index--) {
+            out[index - 1] = in[index - 1];
+        }
+    }
+    return dst;
+}
+
+int memcmp(const void *lhs, const void *rhs, size_t len)
+{
+    const unsigned char *left = (const unsigned char *)lhs;
+    const unsigned char *right = (const unsigned char *)rhs;
+    size_t index;
+    for (index = 0; index < len; index++) {
+        if (left[index] != right[index]) {
+            return (int)left[index] - (int)right[index];
+        }
+    }
+    return 0;
+}
+
 void *memset(void *dst, int value, size_t len)
 {
     unsigned char *out = (unsigned char *)dst;
@@ -567,13 +607,15 @@ long strtol(const char *text, char **end_ptr, int base)
     int overflowed = 0;
     unsigned long long value =
         rustos_parse_unsigned_integer(text, end_ptr, base, &negative, &overflowed);
-    if (overflowed) {
-        return negative ? (long)(-1L - __LONG_MAX__) : __LONG_MAX__;
+    unsigned long long limit = (unsigned long long)__LONG_MAX__ + (unsigned)negative;
+    if (overflowed || value > limit) {
+        rustos_set_errno_value(RUSTOS_CRT_ERANGE);
+        return negative ? (-1L - __LONG_MAX__) : __LONG_MAX__;
     }
-    if (negative) {
-        return (long)(-(long long)value);
+    if (negative && value == limit) {
+        return -1L - __LONG_MAX__;
     }
-    return (long)value;
+    return negative ? -(long)value : (long)value;
 }
 
 unsigned long strtoul(const char *text, char **end_ptr, int base)
@@ -582,10 +624,11 @@ unsigned long strtoul(const char *text, char **end_ptr, int base)
     int overflowed = 0;
     unsigned long long value =
         rustos_parse_unsigned_integer(text, end_ptr, base, &negative, &overflowed);
-    if (negative) {
-        return (unsigned long)(0u - (unsigned long)value);
+    if (overflowed || value > (unsigned long long)(unsigned long)-1) {
+        rustos_set_errno_value(RUSTOS_CRT_ERANGE);
+        return (unsigned long)-1;
     }
-    return (unsigned long)value;
+    return negative ? 0UL - (unsigned long)value : (unsigned long)value;
 }
 
 int tolower(int ch)
@@ -601,7 +644,14 @@ int ungetc(int ch, void *stream)
 unsigned long long _strtoui64(const char *text, char **end_ptr, int base)
 {
     int negative = 0;
-    return rustos_parse_unsigned_integer(text, end_ptr, base, &negative, NULL);
+    int overflowed = 0;
+    unsigned long long value =
+        rustos_parse_unsigned_integer(text, end_ptr, base, &negative, &overflowed);
+    if (overflowed) {
+        rustos_set_errno_value(RUSTOS_CRT_ERANGE);
+        return ~0ULL;
+    }
+    return negative ? 0ULL - value : value;
 }
 
 long long _strtoi64(const char *text, char **end_ptr, int base)
@@ -610,11 +660,13 @@ long long _strtoi64(const char *text, char **end_ptr, int base)
     int overflowed = 0;
     unsigned long long value =
         rustos_parse_unsigned_integer(text, end_ptr, base, &negative, &overflowed);
-    if (overflowed) {
+    unsigned long long limit = (unsigned long long)__LONG_LONG_MAX__ + (unsigned)negative;
+    if (overflowed || value > limit) {
+        rustos_set_errno_value(RUSTOS_CRT_ERANGE);
         return negative ? (-1LL - __LONG_LONG_MAX__) : __LONG_LONG_MAX__;
     }
-    if (negative) {
-        return -(long long)value;
+    if (negative && value == limit) {
+        return -1LL - __LONG_LONG_MAX__;
     }
-    return (long long)value;
+    return negative ? -(long long)value : (long long)value;
 }

@@ -23,7 +23,6 @@ const INPUT_READER_QUEUE_CAPACITY: usize = INPUT_EVENT_BATCH * 64;
 const INPUT_READER_WATCHDOG_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 const INPUT_READER_PANIC_THRESHOLD_MS: u64 = 3_000;
 const MAX_INITIAL_INPUT_DROP_LOGS: u64 = 8;
-const MAX_WAYLAND_POINTER_FLUSH_EVENTS: u64 = 16;
 const INPUT_WAITSET_RETRY_BACKOFF: Duration = Duration::from_millis(10);
 const INPUT_WAITSET_STARTUP_BUDGET: Duration =
     Duration::from_millis(rustos_user_abi::performance::IPC_BOOT_CONTROL_HARD_LIMIT_MS);
@@ -493,7 +492,10 @@ impl InputReaderBatchCoalescer {
     fn push_pointer(&mut self, event: InputEvent) {
         if let Some(pending) = self.pending_pointer.as_mut() {
             match (pending.kind, event.kind) {
-                (INPUT_KIND_POINTER_MOTION, INPUT_KIND_POINTER_MOTION) => {
+                (INPUT_KIND_POINTER_MOTION, INPUT_KIND_POINTER_MOTION)
+                    if same_motion_direction(pending.value0, event.value0)
+                        && same_motion_direction(pending.value1, event.value1) =>
+                {
                     pending.value0 = saturating_i32_add(pending.value0, event.value0);
                     pending.value1 = saturating_i32_add(pending.value1, event.value1);
                     return;
@@ -524,6 +526,12 @@ impl InputReaderBatchCoalescer {
             self.len += 1;
         }
     }
+}
+
+// Opposing deltas cannot be combined: clamping at a display edge between
+// them changes the final position.
+fn same_motion_direction(left: i32, right: i32) -> bool {
+    left == 0 || right == 0 || (left > 0) == (right > 0)
 }
 
 fn saturating_i32_add(left: i32, right: i32) -> i32 {
@@ -605,6 +613,9 @@ pub(crate) fn process_pending_input(
         };
 
         input_events = input_events.saturating_add(1);
+        if event_index + 1 == max_events_per_tick {
+            backlog_remaining = true;
+        }
         match event.kind {
             crate::sys::INPUT_KIND_POINTER_MOTION => {
                 pointer_motion_events = pointer_motion_events.saturating_add(1);
@@ -621,42 +632,24 @@ pub(crate) fn process_pending_input(
             }
         }
 
-        let allow_wayland_pointer = false;
-        let pointer_wayland = if allow_wayland_pointer {
-            wayland.as_deref_mut()
-        } else {
-            None
-        };
         if flush_pending_pointer(
             state,
             runtime,
-            pointer_wayland,
+            wayland.as_deref_mut(),
             &mut pending_pointer,
             &mut visual_update,
         )? {
             wayland_motion_calls = wayland_motion_calls.saturating_add(1);
         }
 
-        let event_wayland = if event_index == 0 && started_at.elapsed() < INPUT_PROCESS_BUDGET {
-            wayland.as_deref_mut()
-        } else {
-            None
-        };
-        let redraw = state.handle_input_event(runtime, &event, event_wayland)?;
+        let redraw = state.handle_input_event(runtime, &event, wayland.as_deref_mut())?;
         visual_update.absorb(redraw);
-        if event_index + 1 == max_events_per_tick {
-            backlog_remaining = true;
-        }
     }
 
-    let allow_wayland_pointer = !backlog_remaining
-        && input_events <= MAX_WAYLAND_POINTER_FLUSH_EVENTS
-        && started_at.elapsed() < INPUT_PROCESS_BUDGET;
-    let pointer_wayland = if allow_wayland_pointer { wayland } else { None };
     if flush_pending_pointer(
         state,
         runtime,
-        pointer_wayland,
+        wayland,
         &mut pending_pointer,
         &mut visual_update,
     )? {
@@ -811,7 +804,7 @@ mod tests {
     fn input_reader_batch_coalesces_relative_motion() {
         let mut batch = InputReaderBatchCoalescer::default();
         batch.push(event(INPUT_KIND_POINTER_MOTION, 3, -2));
-        batch.push(event(INPUT_KIND_POINTER_MOTION, 4, 6));
+        batch.push(event(INPUT_KIND_POINTER_MOTION, 4, -6));
 
         let mut out = [InputEvent::default(); INPUT_EVENT_BATCH];
         let events = batch.drain_into(&mut out);
@@ -819,7 +812,22 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind, INPUT_KIND_POINTER_MOTION);
         assert_eq!(events[0].value0, 7);
-        assert_eq!(events[0].value1, 4);
+        assert_eq!(events[0].value1, -8);
+    }
+
+    #[test]
+    fn input_reader_batch_preserves_motion_reversal_at_display_edges() {
+        let mut batch = InputReaderBatchCoalescer::default();
+        batch.push(event(INPUT_KIND_POINTER_MOTION, -10, 0));
+        batch.push(event(INPUT_KIND_POINTER_MOTION, 5, 0));
+        let mut out = [InputEvent::default(); INPUT_EVENT_BATCH];
+        let events = batch.drain_into(&mut out);
+        assert_eq!(events.len(), 2);
+        let mut position = super::PendingPointerPosition::new(0, 0);
+        for event in events {
+            position.apply_motion(event.value0, event.value1, 100, 100);
+        }
+        assert_eq!(position.x, 5);
     }
 
     #[test]

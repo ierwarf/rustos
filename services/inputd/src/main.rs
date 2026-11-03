@@ -523,6 +523,14 @@ fn keyboard_action_to_inputd(action: KeyAction) -> u16 {
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
+    #[test]
+    fn wait_broker_retries_only_boot_transient_errnos() {
+        assert!(super::dvm_wait_errno_is_transient(libc::ENODEV));
+        assert!(super::dvm_wait_errno_is_transient(libc::EBUSY));
+        assert!(!super::dvm_wait_errno_is_transient(libc::EPERM));
+        assert!(!super::dvm_wait_errno_is_transient(libc::EINVAL));
+    }
+
     use super::{
         apply_dvm_ingress_wire, ingest_batch_needs_immediate_retry, lock_input_queue,
         lock_input_queue_for_ingestion, validate_commercial_request, DvmIngressLogState,
@@ -1183,7 +1191,21 @@ fn ingest_batch_needs_immediate_retry(drained: usize) -> bool {
     drained == INPUTD_INGEST_MAX_EVENTS
 }
 
+/// Total time the worker keeps retrying a transient wait-broker refusal before
+/// giving the failure to the supervisor by exiting.
+const DVM_WAIT_TRANSIENT_BUDGET_NS: u64 = 30_000_000_000;
+const DVM_WAIT_TRANSIENT_BACKOFF: Duration = Duration::from_millis(10);
+
+/// `ENODEV`: the DVM aperture is not admitted yet (the worker can start before
+/// the driver domain publishes it). `EBUSY`: a waiter or sleep slot is still
+/// held, e.g. by a previous worker incarnation that is being torn down. Both
+/// leave the ring unconsumed, so waiting and retrying stays fail-closed.
+fn dvm_wait_errno_is_transient(errno: i32) -> bool {
+    matches!(errno, libc::ENODEV | libc::EBUSY)
+}
+
 fn wait_for_dvm_ingress() -> Result<(), i32> {
+    let mut transient_since_ns: Option<u64> = None;
     loop {
         let result = syscall0(SYS_RUSTOS_INPUT_WAIT_BROKER);
         if result >= 0 {
@@ -1193,6 +1215,14 @@ fn wait_for_dvm_ingress() -> Result<(), i32> {
         // exiting here would drop the keyboard for the whole system.
         match last_errno() {
             libc::EINTR => continue,
+            errno if dvm_wait_errno_is_transient(errno) => {
+                let now = dvm_session_sync::monotonic_nanos();
+                let since = *transient_since_ns.get_or_insert(now);
+                if now.saturating_sub(since) >= DVM_WAIT_TRANSIENT_BUDGET_NS {
+                    return Err(errno);
+                }
+                thread::sleep(DVM_WAIT_TRANSIENT_BACKOFF);
+            }
             errno => return Err(errno),
         }
     }

@@ -468,6 +468,7 @@ pub(crate) struct AppState {
     pub(crate) surface: DisplaySurfaceCreate,
     display_fd: OwnedFd,
     gpu_compositor: Option<GpuCompositorRuntime>,
+    display_presented_once: bool,
     pub(crate) input_fds: Vec<OwnedFd>,
     console_commands: ConsoleCommandDispatcher,
     surface_fd: OwnedFd,

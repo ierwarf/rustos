@@ -158,3 +158,4 @@ exception-diagnostic-custody/ExceptionDiagnosticCustody	safety	check	an explicit
 runtime-trace-causal-selection/RuntimeTraceCausalSelection	safety	check	accepted and rejected states stutter after a bounded immutable-log scan	30	120	exhaustive	no	no	no
 job-policy-lifecycle/JobPolicyLifecycle	safety	check	every state retains a bounded policy observation action	30	120	exhaustive	no	no	no
 job-policy-publication/JobPolicyPublication	safety	check	terminal writer and reader explicitly stutter	30	120	exhaustive	no	no	no
+child-wait-publication/ChildWaitPublication	safety	check	explicit stutter covers completed bounded waiter and producer	30	120	exhaustive	no	no	no

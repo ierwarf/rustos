@@ -664,7 +664,7 @@ fn upsert_env(env: &mut Vec<String>, value: &str) {
     env.push(value.to_string());
 }
 
-fn release_failed_session(state: &mut BrokerState, session_handle: Option<u64>) {
+pub(super) fn release_failed_session(state: &mut BrokerState, session_handle: Option<u64>) {
     let Some(session) = session_handle else {
         return;
     };

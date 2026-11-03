@@ -16,7 +16,7 @@ Tags: **(verified)** read from this tree, **(proposed)** a design decision,
 **(recalled)** background knowledge not re-read for this document, **(source)**
 taken from a cited page.
 
-### 1. The current protocol
+### 1. Historical protocol (before phases 1–6)
 
 Owner: [tlb_shootdown.rs](../../kernel/hal/src/arch/tlb_shootdown.rs). Model:
 `tlb-shootdown-lifecycle`. Witnesses: triangle rows `tlb-mailbox-request` and
@@ -109,9 +109,9 @@ still waits for every acknowledgement). `tlb-wait-under-lock` records, once per
 lock class, that an acknowledgement wait began while the sender held another raw
 lock; such a lock is the one way an interrupt-off target can make the wait
 unwinnable. Two 16-vCPU `--proc-stress` boots recorded none, which rules that
-path out for the exercised workload only. Phases 1 to 7 remain unimplemented;
-none is justified by a reproduced failure yet, and phase 4 is the one aimed at
-host preemption.
+path out for the exercised workload only. This observation predates the phase
+1–6 implementation described in section 7; it does not establish that the new
+protocol fixes the observed panics. Phase 4 targets host preemption.
 
 ### 4. References
 
@@ -235,7 +235,7 @@ which want the repository's same-session control method.
 **상태: 1~6단계 구현, 7단계(INVLPGB)는 의도적으로 미구현입니다. 아래 `현재`는 개편 전 프로토콜 설명이며 현재 구현은 영어 7절을 보세요.** 현재 프로토콜은
 올바르고 fail-stop이며, 아래 모든 단계에서 정확성의 기준선으로 유지됩니다.
 
-- **현재**: 전역 `PROTOCOL_LOCK` 하나가 모든 주소공간의 변경을 직렬화하고,
+- **이전 프로토콜**: 전역 `PROTOCOL_LOCK` 하나가 모든 주소공간의 변경을 직렬화하고,
   page-table 편집부터 ack 대기와 프레임 해제까지 쥐고 있으며, 인터럽트를 끈 채
   대기합니다. 타깃당 mailbox 슬롯이 하나이고, 활성 root가 같은 CPU만 타깃이며
   (PCID가 꺼져 있어야만 건전), 2초 무응답이면 panic합니다.

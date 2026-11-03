@@ -398,6 +398,7 @@ pub fn linux_key_code_to_rustos(code: u32) -> Option<KeyCode> {
         96 => KeyCode::NumpadEnter,
         97 => KeyCode::RightCtrl,
         98 => KeyCode::NumpadSlash,
+        99 => KeyCode::PrintScreen,
         100 => KeyCode::RightAlt,
         102 => KeyCode::Home,
         103 => KeyCode::ArrowUp,
@@ -409,6 +410,7 @@ pub fn linux_key_code_to_rustos(code: u32) -> Option<KeyCode> {
         109 => KeyCode::PageDown,
         110 => KeyCode::Insert,
         111 => KeyCode::Delete,
+        119 => KeyCode::Pause,
         125 => KeyCode::LeftMeta,
         126 => KeyCode::RightMeta,
         127 => KeyCode::Menu,
@@ -496,6 +498,14 @@ mod tests {
         assert_eq!(pointer_button_to_linux(POINTER_BUTTON_LEFT), Some(BTN_LEFT));
         assert_eq!(pointer_button_to_linux(POINTER_BUTTON_X2), Some(BTN_EXTRA));
         assert_eq!(pointer_button_to_linux(0x9999), None);
+    }
+
+    #[test]
+    fn print_screen_and_pause_linux_key_codes_round_trip() {
+        for (linux, key) in [(99, KeyCode::PrintScreen), (119, KeyCode::Pause)] {
+            assert_eq!(linux_key_code_to_rustos(linux), Some(key));
+            assert_eq!(rustos_key_code_to_linux(key as u32), Some(linux as u16));
+        }
     }
 
     #[test]

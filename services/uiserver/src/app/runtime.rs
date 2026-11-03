@@ -317,11 +317,15 @@ pub(crate) fn start_console_refresh_worker(wake: UiWakeSender) -> Receiver<Conso
                         // reached anything, so it accounts for nothing.
                         let delivered = match sender.try_send(refresh) {
                             Ok(()) => true,
-                            Err(_) => {
+                            Err(TrySendError::Full(_)) => {
                                 output_generations.clear();
                                 produced_output = true;
+                                // Keep the graph edge outstanding, but do not spin
+                                // against the broker while the UI queue is full.
+                                thread::sleep(CONSOLE_POLL_SLEEP);
                                 false
                             }
+                            Err(TrySendError::Disconnected(_)) => return,
                         };
                         if collect_accounted_for_its_edge(failed_session, delivered) {
                             // The payload announced by this generation is in

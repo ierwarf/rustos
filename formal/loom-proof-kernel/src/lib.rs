@@ -1272,6 +1272,7 @@ mod tests {
         });
     }
 
+    include!("child_wait_tests.rs");
     include!("frame_token_tests.rs");
     include!("retirement_cleanup_tests.rs");
     include!("fifo_identity_tests.rs");

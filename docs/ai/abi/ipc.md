@@ -21,8 +21,9 @@
   IPC ABI v7 carries only these opaque tickets; it cannot redirect authority by
   editing a PID, epoch, channel, or stream position.
   A forged, stale, zero, or replayed ticket cannot remove the live entry. The
-  Kani parser proofs exhaust the 128-bit input partition and canonical
-  round-trip; `ipc-handle-transfer` separately checks typed registry lifetime.
+  Kani harnesses cover the 192-bit ticket input partition and canonical
+  round-trip; `ipc-handle-transfer` separately models typed registry lifetime.
+  Harness coverage is not itself evidence that a verification run passed.
 - Pending transferred-handle entries are owned by the process-handle substrate,
   not an isolated compat cache. An endpoint message that is cancelled,
   peer-closed before receive, rejected after receive-output validation, or
@@ -402,10 +403,12 @@ no cell/epoch state to refine.
 ## IPC Performance Acceptance
 
 - Kernel entry to the first completed private-compositor frame has a 3-second
-  optimization target and a 5-second hard acceptance limit. The KVM harness
-  starts this clock only after both guests exist and fails independently of the
-  broader 30-second readiness budget when
-  `uiserver: gpu-compositor active contract=3` is late. The required first
+  optimization target and a 5-second desired acceptance limit. The current KVM
+  smoke runner does not enforce a separate 5-second first-frame deadline: when
+  GUI surfaces are requested it includes `uiserver: gpu-compositor active
+  contract=3` in the markers checked against the configurable overall readiness
+  deadline, whose clock starts after both guest processes exist. Therefore a
+  passing smoke alone does not prove the 5-second target. The required first
   retained-scene gradient is published by a bounded `uiserver` bootstrap
   worker before that worker self-demotes for the optional full background;
   the GPU marker may not be synthesized from a CPU-only frame. Storage-only

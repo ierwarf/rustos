@@ -4010,12 +4010,22 @@ fn required_value<'a>(values: &'a BTreeMap<&str, &str>, key: &str, label: &str) 
         .ok_or_else(|| anyhow!("missing {label} key {key}"))
 }
 
-fn configure_socket_timeout(connection: &std::fs::File, timeout: Option<Duration>) -> Result<()> {
-    let timeout = timeout.unwrap_or_default();
-    let timeout = libc::timeval {
+fn socket_timeval(timeout: Option<Duration>) -> libc::timeval {
+    // An all-zero timeval means "block forever" to SO_RCVTIMEO/SO_SNDTIMEO.
+    // Only `None` may request that; a bounded sub-microsecond (or zero)
+    // remainder must still be a real, minimal deadline.
+    let timeout = match timeout {
+        None => Duration::ZERO,
+        Some(duration) => duration.max(Duration::from_micros(1)),
+    };
+    libc::timeval {
         tv_sec: timeout.as_secs().min(libc::time_t::MAX as u64) as libc::time_t,
         tv_usec: timeout.subsec_micros().into(),
-    };
+    }
+}
+
+fn configure_socket_timeout(connection: &std::fs::File, timeout: Option<Duration>) -> Result<()> {
+    let timeout = socket_timeval(timeout);
     for option in [libc::SO_RCVTIMEO, libc::SO_SNDTIMEO] {
         let result = unsafe {
             libc::setsockopt(
@@ -4622,6 +4632,18 @@ mod tests {
     }
 
     #[test]
+    fn bounded_socket_timeout_is_never_the_unbounded_zero_timeval() {
+        let unbounded = super::socket_timeval(None);
+        assert_eq!((unbounded.tv_sec, unbounded.tv_usec), (0, 0));
+        for bounded in [std::time::Duration::ZERO, std::time::Duration::from_nanos(999)] {
+            let value = super::socket_timeval(Some(bounded));
+            assert_eq!((value.tv_sec, value.tv_usec), (0, 1));
+        }
+        let value = super::socket_timeval(Some(std::time::Duration::from_millis(1500)));
+        assert_eq!((value.tv_sec, value.tv_usec), (1, 500_000));
+    }
+
+    #[test]
     fn input_stream_requires_bounded_exact_key_and_pointer_events() {
         let event =
             parse_message("EVENT\nid=6\nop=input-stream\ntype=key\ncode=30\nvalue=1").unwrap();
@@ -4664,7 +4686,7 @@ mod tests {
                 .is_ok()
         );
         let invalid_position = parse_message(
-            "EVENT\nid=6\nop=input-stream\ntype=pointer-position\nx=1600\ny=450\nwheel-v=0\nwheel-h=0\nbuttons=0",
+            "EVENT\nid=6\nop=input-stream\ntype=pointer-position\nx=2560\ny=450\nwheel-v=0\nwheel-h=0\nbuttons=0",
         )
         .unwrap();
         assert!(
@@ -4694,7 +4716,7 @@ mod tests {
         assert!(RustosInputFrame::linux_evdev_key(7, 1, 0, 1).is_err());
         assert!(RustosInputFrame::linux_evdev_key(7, 1, 30, 3).is_err());
         assert!(RustosInputFrame::linux_evdev_pointer(7, 3, 0, 0, 0, 0, 0x20).is_err());
-        assert!(RustosInputFrame::linux_evdev_pointer_position(7, 4, 1600, 450, 0, 0, 0).is_err());
+        assert!(RustosInputFrame::linux_evdev_pointer_position(7, 4, 2560, 450, 0, 0, 0).is_err());
     }
 
     #[test]

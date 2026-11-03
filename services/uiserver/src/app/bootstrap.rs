@@ -402,6 +402,7 @@ impl AppState {
             surface: surface_state.surface,
             display_fd,
             gpu_compositor,
+            display_presented_once: false,
             input_fds,
             console_commands,
             surface_fd: surface_state.surface_fd,
@@ -452,6 +453,19 @@ impl AppState {
         let result = runtime.present(self, scene_dirty);
         self.gpu_compositor = Some(runtime);
         result
+    }
+
+    /// Latches once the display provider has presented a frame. The latch is
+    /// never cleared: after the first presentation, protocol progress must not
+    /// depend on a later provider recovery (see the frame-permit arms in main).
+    pub(crate) fn display_has_presented(&mut self) -> bool {
+        if !self.display_presented_once {
+            self.display_presented_once = self
+                .gpu_compositor
+                .as_ref()
+                .is_some_and(GpuCompositorRuntime::has_presented);
+        }
+        self.display_presented_once
     }
 
     pub(crate) fn gpu_admits_cpu_present(&self) -> bool {

@@ -636,6 +636,7 @@ struct VfsState {
 
 #[derive(Clone)]
 struct RemoteHandle {
+    checkpoint_version: u16,
     kind: RemoteKind,
     path: String,
     cursor: u64,
@@ -881,7 +882,7 @@ fn checkpoint_handle_record(
     let path_len = u32::try_from(handle.path.len()).map_err(|_| EOVERFLOW)?;
     let refs = u32::try_from(handle.refs).map_err(|_| EOVERFLOW)?;
     let wire = OpenDescriptionCheckpointWire {
-        version: VFSD_OPEN_CHECKPOINT_VERSION,
+        version: handle.checkpoint_version,
         kind: handle_kind_u16(handle.kind),
         last_mutation,
         reserved0: 0,

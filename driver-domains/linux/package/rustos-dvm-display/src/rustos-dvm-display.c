@@ -948,6 +948,27 @@ static uint32_t select_connector_crtc(int fd, const drmModeRes *resources,
     return 0U;
 }
 
+
+/* Reduced-blanking 60 Hz timings for a mode the connector did not list. */
+static drmModeModeInfo synthesized_pool_mode(uint32_t width, uint32_t height) {
+    drmModeModeInfo mode;
+    memset(&mode, 0, sizeof(mode));
+    mode.hdisplay = (uint16_t)width;
+    mode.hsync_start = (uint16_t)(width + 48U);
+    mode.hsync_end = (uint16_t)(width + 80U);
+    mode.htotal = (uint16_t)(width + 160U);
+    mode.vdisplay = (uint16_t)height;
+    mode.vsync_start = (uint16_t)(height + 3U);
+    mode.vsync_end = (uint16_t)(height + 8U);
+    mode.vtotal = (uint16_t)(height + 30U);
+    mode.vrefresh = 60U;
+    mode.clock = (uint32_t)(((uint64_t)mode.htotal * mode.vtotal * 60U + 999U) / 1000U);
+    mode.flags = DRM_MODE_FLAG_PHSYNC | DRM_MODE_FLAG_NVSYNC;
+    mode.type = DRM_MODE_TYPE_USERDEF;
+    (void)snprintf(mode.name, sizeof(mode.name), "%ux%u", width, height);
+    return mode;
+}
+
 static int select_kms_target(int fd, const struct gui_pool_header *header, uint32_t *connector_id,
                              uint32_t *crtc_id, drmModeModeInfo *mode) {
     drmModeRes *resources = drmModeGetResources(fd);
@@ -997,9 +1018,19 @@ static int select_kms_target(int fd, const struct gui_pool_header *header, uint3
     }
     drmModeFreeResources(resources);
     if (result != 0 && fallback_connector != 0U) {
+        /* The connector offers no mode of the pool's size. Virtio-gpu has no
+         * EDID here (edid=off), so a windowed host display reports its own
+         * window size as the preferred mode. The primary plane cannot scale
+         * (the atomic check returns ERANGE when source and CRTC sizes differ),
+         * so scan out the pool at its own size with a synthesized mode
+         * instead of falling back to a connector mode of another size. */
+        relay_log("rustos-dvm-display: no connector mode %ux%u; first offered %ux%u, "
+                  "synthesizing the pool mode\n",
+                  header->width, header->height, (unsigned int)fallback_mode.hdisplay,
+                  (unsigned int)fallback_mode.vdisplay);
         *connector_id = fallback_connector;
         *crtc_id = fallback_crtc;
-        *mode = fallback_mode;
+        *mode = synthesized_pool_mode(header->width, header->height);
         return 0;
     }
     if (result != 0) {

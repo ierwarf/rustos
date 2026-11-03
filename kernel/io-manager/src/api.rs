@@ -163,24 +163,26 @@ pub mod block {
             .map_err(map_dvm_error)
     }
 
-    pub fn submit_dvm_read(sector: u64, data_len: u32) -> Result<DvmBlockTicket, DvmBlockError> {
-        crate::io::dvm_block::submit_read(sector, data_len)
+    /// Submit only to the exact admitted epoch, checked under the transport lock.
+    pub fn submit_dvm_read(expected_generation: u64, sector: u64, data_len: u32) -> Result<DvmBlockTicket, DvmBlockError> {
+        crate::io::dvm_block::submit_read(expected_generation, sector, data_len)
             .map(map_dvm_ticket)
             .map_err(map_dvm_error)
     }
 
     pub fn submit_dvm_write(
+        expected_generation: u64,
         sector: u64,
         data: &[u8],
         fua: bool,
     ) -> Result<DvmBlockTicket, DvmBlockError> {
-        crate::io::dvm_block::submit_write(sector, data, fua)
+        crate::io::dvm_block::submit_write(expected_generation, sector, data, fua)
             .map(map_dvm_ticket)
             .map_err(map_dvm_error)
     }
 
-    pub fn submit_dvm_flush() -> Result<DvmBlockTicket, DvmBlockError> {
-        crate::io::dvm_block::submit_flush()
+    pub fn submit_dvm_flush(expected_generation: u64) -> Result<DvmBlockTicket, DvmBlockError> {
+        crate::io::dvm_block::submit_flush(expected_generation)
             .map(map_dvm_ticket)
             .map_err(map_dvm_error)
     }

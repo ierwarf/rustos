@@ -130,7 +130,7 @@ fn supervise_dvm_block_readiness() {
                 }
             }
             Err(errno) => {
-                DVM_E2E_READY_GENERATION.store(0, Ordering::Release);
+                invalidate_dvm_readiness(&DVM_E2E_READY_GENERATION, &mut proven_generation);
                 log_dvm_readiness_failure(errno);
                 thread::sleep(RECV_BACKOFF);
                 continue;
@@ -140,6 +140,12 @@ fn supervise_dvm_block_readiness() {
         // revalidate the generation without a timer polling loop.
         let _ = block::wait_for_transport_event(Instant::now() + DVM_E2E_EVENT_WAIT);
     }
+}
+
+fn invalidate_dvm_readiness(published: &AtomicU64, proven_generation: &mut u64) {
+    published.store(0, Ordering::Release);
+    // Recovery of the same generation must run the barrier and republish it.
+    *proven_generation = 0;
 }
 
 fn dvm_e2e_ready_for_current_generation() -> Result<block::BlockInfo, i32> {
@@ -716,6 +722,16 @@ mod tests {
         assert!(e2e_generation_matches(7, 7));
         assert!(!e2e_generation_matches(0, 7));
         assert!(!e2e_generation_matches(7, 8));
+    }
+
+    #[test]
+    fn readiness_failure_invalidates_local_and_published_proof() {
+        let published = AtomicU64::new(7);
+        let mut proven = 7;
+        invalidate_dvm_readiness(&published, &mut proven);
+        assert_eq!(published.load(Ordering::Acquire), 0);
+        // The next observation of generation 7 must take the barrier branch.
+        assert_ne!(proven, 7);
     }
 
     #[test]

@@ -223,8 +223,9 @@ with no publication-CAS losses and no table-supply refusals. The absolute
 saving is 414 frames. What changed is which quantity the cost tracks — reserved
 address space before, touched memory after.
 
-`mmap` no longer allocates, so it no longer fails for want of a table frame,
-and a reservation always succeeds. Memory exhaustion moves to the fault, where
+Anonymous reservation no longer allocates page-table frames, so it cannot fail
+for want of a table frame at that point. Other admission failures remain possible.
+Page-table frame exhaustion moves to the fault, where
 it is a refusal — the same place and the same shape Linux puts it. The
 admission check that replaced preparation walks only the tables that already
 exist and skips the whole span of any absent level, so an untouched reservation

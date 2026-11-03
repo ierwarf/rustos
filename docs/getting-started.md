@@ -59,12 +59,13 @@ RustOS concurrently, requires the RustOS readiness marker plus the validated
 host-to-DVM control probe, then stops only the QEMU children it created. It
 preserves their debugcon, serial, and stderr captures for inspection.
 
-The DVM advertises a hash-bound `agent-v1-control` handshake. The synthetic
-keyboard smoke injects `A` into the DVM virtio keyboard and verifies Linux
-evdev code `30` plus a newly consumed `inputd` event. Separate bounded
-DVM input, display, Ethernet, and read-only block relays are exercised by
-explicit KVM options (see [xtask API](api/xtask.md)). This virtual smoke
-is not proof of physical host-keyboard capture, hardware passthrough,
+The DVM advertises a hash-bound `agent-v1-control` handshake. The optional
+`--exercise-input` self-test writes a bounded DVM uinput device, consumes it
+through the ordinary evdev relay, and requires keyboard and pointer ingress
+markers from `inputd`. It does not inject input through QMP or the DVM virtio
+keyboard. Separate bounded DVM display, Ethernet, and read-only block relays
+are exercised by explicit KVM options (see [xtask API](api/xtask.md)). This
+virtual smoke is not proof of physical host-keyboard capture, hardware passthrough,
 production driver lifecycle, or data durability.
 
 <a id="korean"></a>
@@ -124,9 +125,10 @@ cargo xtask kvm-smoke --expect 'runtimed: bootstrap ui done'
 요구하며 자신이 만든 QEMU child만 종료합니다. debugcon, serial, stderr capture는
 분석용으로 유지합니다.
 
-DVM은 해시로 검증되는 `agent-v1-control` handshake를 제공합니다. 합성
-keyboard smoke는 DVM virtio keyboard에 `A`를 주입하고 Linux evdev code
-`30` 및 `inputd`의 새 이벤트 소비를 검증합니다. 입력·화면·Ethernet·읽기 전용
+DVM은 해시로 검증되는 `agent-v1-control` handshake를 제공합니다. 선택적
+`--exercise-input` self-test는 DVM uinput device에 제한된 입력을 쓰고 일반
+evdev relay로 소비하며 `inputd`의 keyboard 및 pointer ingress marker를 요구합니다.
+QMP나 DVM virtio keyboard로 입력을 주입하지 않습니다. 화면·Ethernet·읽기 전용
 블록 relay는 별도 KVM 옵션으로 검증하며(참고: [xtask API](api/xtask.md)),
 이 가상 smoke가 물리 host keyboard capture, 하드웨어 passthrough, 상용
 드라이버 lifecycle 또는 데이터 내구성을 증명하지는 않습니다.

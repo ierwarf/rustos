@@ -5,12 +5,12 @@ edition = "2021"
 publish = false
 build = "build.rs"
 
+[features]
+# Enables a native Cargo test harness. The production service is a freestanding
+# ELF whose linker entrypoint is supplied by build.rs (same contract as rootd).
+host-test = []
+
 [dependencies]
 rustos-svc-runtime = { path = "../../libs/rustos-svc-runtime" }
 rustos-user-abi = { path = "../../libs/rustos-user-abi" }
 spin = { version = "0.10", default-features = false, features = ["spin_mutex"] }
-
-[[bin]]
-name = "procd"
-path = "src/main.rs"
-test = false

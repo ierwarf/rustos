@@ -11,9 +11,11 @@ migration plan, not an all-unimplemented feature list. Job lifecycle (step 1),
 the chunked process directory (2a), counted process/thread limits, resident
 user-page accounting (2b) and application Job placement have landed. JobPolicy
 v1's 256-bit ceiling is implemented as a **partial step 3a**; the complete
-legacy-capability cutover has not. Kernel-memory accounting,
-`memory.high/min`, unified service/runtime/IDL, component supervision,
-client-funded sessions, personality servers and operability work remain open.\nA no_std component-policy model, generated staging IDL, validated rootd role,
+legacy-capability cutover has not. Kernel-memory accounting and
+`memory.high/min` have partial implementations; unified service/runtime/IDL,
+component supervision, client-funded sessions, personality servers and
+operability work remain open.
+A no_std component-policy model, generated staging IDL, validated rootd role,
 route and supervisor-parent manifests, bounded rootd checkpoints and runtimed
 console sessions are implemented, but **do not yet constitute a completed production cutover**.
 See [Job Model as-built sections](job-model.md#phase-1-as-built) for exact status.
@@ -37,12 +39,12 @@ reporter admission now uses a manifest-declared exact parent edge.
 | --- | --- | --- |
 | Process directory | Default admission 32, non-moving chunked slots up to internal ceiling 4,096; no longer a 32-slot static array | [process table](../../kernel/ps/src/multitask/process_table.rs), [slot directory](../../kernel/ps/src/multitask/slot_dir.rs) |
 | Thread limits | Job-level counted quota; per-process structural maximum 32 | [process table](../../kernel/ps/src/multitask/process_table.rs) |
-| Job and resident memory | Generation-bound Job tree, hierarchical counted limits and resident-page charge implemented; kernel-memory and high/min policies open | [Job model](job-model.md#phase-2b-ii-memory-limit-as-built) |
+| Job and resident memory | Generation-bound Job tree, hierarchical counted limits, resident-page charge, partial kernel-memory classes and high/min mechanisms implemented; complete accounting and policy remain open | [Job model](job-model.md#phase-2b-ii-memory-limit-as-built) |
 | Application isolation | Loader application-job placement implemented; opt-in limit evidence is not general stability acceptance | [Job model](job-model.md#application-placement-step-0a-as-built-limit-proof-still-open) |
 | JobPolicy | 256-bit v1 ceiling and GET/SET operations exist, but service-capability cutover is incomplete | [job policy ABI](../../libs/rustos-user-abi/src/syscall/job_policy.rs) |
 | Service discovery | Immutable rootd service-role and routing manifests now validate legacy-equivalent positive policy; live registration still uses fixed numeric IDs | [service ABI](../../libs/rustos-user-abi/src/syscall.rs), [rootd manifest](../../services/rootd/src/service_manifest.rs) |
 | Supervision | `rootd`, `initd`, `runtimed` and `sessiond` retain distinct lifecycle responsibilities | [Services](services.md) |
-| IPC wire/runtime | Existing production wire structs and heterogeneous runtimes; generated IDL now serves live initd/rootd lease query/reclaim, while other schemas remain staging-only. The IDL does not grant authority. | [ABI contract](../ai/contracts-abi.md) |
+| IPC wire/runtime | Existing production wire structs and heterogeneous runtimes; multiple generated IDL schemas serve production control protocols, while others remain staging-only. The IDL does not grant authority. | [ABI contract](../ai/contracts-abi.md) |
 
 The **historical** audit found 32 static process slots and no per-job quotas.
 Do not repeat those findings as current implementation facts. The original
@@ -54,7 +56,7 @@ Do not repeat those findings as current implementation facts. The original
 | --- | --- | --- |
 | A. Process/service identity | Chunked process slots; generational process and Job identities | Routed named capabilities instead of numeric service identities |
 | B. Lifecycle/supervision | Individual service restart and lease contracts | Declarative component tree and one coherent supervision owner |
-| C. Resource accounting | Counted process/thread and resident user-page limits | Kernel-memory, high/min, client-funded session budgets |
+| C. Resource accounting | Counted process/thread and resident user-page limits, partial kernel-memory classes and high/min mechanisms | Complete kernel-memory accounting, high-event response, client-funded session recovery |
 | D. Personality policy | Existing user-service brokers | Remove remaining ring0 personality exceptions without weakening mechanisms |
 | E–F. Runtime/IDL | Existing `rustos-svc-runtime` and versioned `repr(C)` ABI | Shared service runtime, generated bindings and compatibility rules |
 | G. Security model | Typed Job handles and JobPolicy v1 ceiling | Full manifest-derived sandbox and legacy-capability cutover |
@@ -113,7 +115,7 @@ topology, so a component cannot reach what no ancestor passed down)**.
 | Step | Target | 2026-10-31 status |
 | --- | --- | --- |
 | 1 | Root Job, membership and group kill | Implemented |
-| 2 | Chunked process directory; Job process/thread/page quotas | memory.high event counter and memory.min rootd OOM exclusion exist; only ProcessObject bytes are charged as kmem |
+| 2 | Chunked process directory; Job process/thread/page quotas | memory.high event counter and memory.min rootd OOM exclusion exist; ProcessObject bytes and six distinct kmem classes are charged, not total kernel memory |
 | 3 | Replace legacy service authority with Job policy | JobPolicy 3a exists; cutover unproven |
 | 4 | Generated IDL and unified service runtime | Production post-init lease query/reclaim migrated to generated IDL (opcodes 517/518), scalar operations 8/9 retired; other services and shared runtime migration remain open |
 | 5 | Declarative components, realms, capability routing and one supervisor | Component graph and immutable rootd route/role manifests implemented; unified live supervisor and kernel capability transfer open |
@@ -164,8 +166,8 @@ Ring3 컴포넌트 정책 모델, 스테이징 IDL 생성, rootd의 역할/라�
 매니페스트, 체크포인트와 runtimed 콘솔 세션 상한은 구현되었습니다.
 다만 실제 서비스·커널 권한의 전체 전환을 완료했다는 뜻은 아닙니다.
 
-다음 구조적 작업은 `kmem.max_bytes`, `memory.high/min`, 서비스
-커널에서 강제되는 capability 라우팅, 단일 컴포넌트 감독, 운영 ABI/IDL 전환,
+다음 구조적 작업은 전체 kernel-memory 과금과 `memory.high/min` 정책의 완성,
+커널에서 강제되는 capability 라우팅의 완전한 전환, 단일 컴포넌트 감독, 운영 ABI/IDL 전환,
 클라이언트 부담 세션 쿼터, personality 서버와 운영성 확장입니다.
 과거 감사의 '프로세스 32개 고정 배열·Job 과금 없음'은 현재 사실이
 아닙니다. 기본 한도 32개와 내부 청크 디렉터리 상한 4,096개를

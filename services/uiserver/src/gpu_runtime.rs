@@ -200,6 +200,19 @@ impl GpuCompositorRuntime {
         matches!(self, Self::SoftwareFallback)
     }
 
+    /// Whether a frame has reached the display through this provider. A
+    /// client's first frame callback is withheld until then: it is the
+    /// product's first-frame evidence, and a callback sent while the DVM
+    /// compositor is still priming or recovering would claim a frame that
+    /// nothing has presented.
+    pub(crate) fn has_presented(&self) -> bool {
+        match self {
+            Self::SoftwareFallback => true,
+            Self::Waiting { .. } => false,
+            Self::Active(compositor) => compositor.active,
+        }
+    }
+
     pub(crate) fn new(display_fd: RawFd, display: DisplayInfo) -> Result<Self, i32> {
         let now = Instant::now();
         match gpu_provider_admission(display) {
@@ -694,6 +707,9 @@ impl GpuCompositor {
             damage.push(damage_from_rect(cursor_source_rect));
             self.cursor_motion = state.cursor_motion;
         }
+        // An empty changed rectangle carries no pixels; the wire contract
+        // rejects it, and one such rectangle would end the whole present.
+        damage.retain(|rect| rect.width != 0 && rect.height != 0);
 
         let capability = self.capability_for_slot(slot_index, self.next_content_epoch)?;
         let mut layers = self.layers.clone();
@@ -1245,6 +1261,9 @@ fn snapshot_damage_for_slot(
         return Ok(full_atlas_damage(atlas_width, atlas_height));
     }
     if retained_epoch >= current_epoch {
+        debug_line(&format!(
+            "uiserver: gpu damage epoch rejected retained={retained_epoch} current={current_epoch}"
+        ));
         return Err(EINVAL);
     }
 
@@ -1297,6 +1316,10 @@ fn validate_damage(
         let right = rect.x.checked_add(rect.width).ok_or(EINVAL)?;
         let bottom = rect.y.checked_add(rect.height).ok_or(EINVAL)?;
         if rect.width == 0 || rect.height == 0 || right > atlas_width || bottom > atlas_height {
+            debug_line(&format!(
+                "uiserver: gpu damage rejected rect={},{} {}x{} atlas={}x{}",
+                rect.x, rect.y, rect.width, rect.height, atlas_width, atlas_height
+            ));
             return Err(EINVAL);
         }
     }

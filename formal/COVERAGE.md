@@ -349,3 +349,5 @@ remote-quiescence arbitration, production equivalence or guard-removal proof.
 `cold-exec-intent/ColdExecIntent` isolates the exact cold transaction owner from CPU references. Sealed self intent stays reschedulable; image and cancellation close with local CPU exclusion. Matching process receipts, writer release and nonce are required before opening; pending terminal intent and poison remain closed. Twelve native witnesses, not full hardware/sibling/affinity/funding or guard-removal proof.
 
 `affinity-claim-admission/AffinityClaimAdmission` covers affinity leaf admission at the claim linearization point; snapshots are not grants. Empty/reset and unknown UID refuse; captured execution is not retroactively released by a desired mask update. Eight native witnesses. Complete multi-thread process-affinity and post-claim hardware/return serialization still depend on the cold directory.
+
+child-wait-publication/ChildWaitPublication: one recycled waiter slot, locked status publication/recheck, and split wake scan; Loom/Shuttle project the same race. Spurious wake hints are permitted. Scheduler arm/commit and multiple status consumers are not modeled.

@@ -57,14 +57,14 @@ pub(super) fn write(memfd: &mut multitask::MemfdHandle, user_ptr: u64, user_len:
     while copied < user_len {
         let chunk_len = (user_len - copied).min(chunk.len());
         let Some(src) = user_ptr.checked_add(copied as u64) else {
-            return linux_errno(LINUX_EINVAL);
+            return completed_or_error(copied, LINUX_EFAULT);
         };
         if let Err(err) = usermem::copy_from_current_user_exact(src, &mut chunk[..chunk_len]) {
-            return linux_errno(address_space_error_to_linux_errno(err));
+            return completed_or_error(copied, address_space_error_to_linux_errno(err));
         }
         let written = match memfd.write_from(&chunk[..chunk_len]) {
             Ok(written) => written,
-            Err(err) => return linux_errno(memfd_error_to_linux_errno(err)),
+            Err(err) => return completed_or_error(copied, memfd_error_to_linux_errno(err)),
         };
         copied += written;
         multitask::cond_resched();
@@ -100,10 +100,10 @@ where
             break;
         }
         let Some(dest) = user_ptr.checked_add(copied as u64) else {
-            return linux_errno(LINUX_EINVAL);
+            return completed_or_error(copied, LINUX_EFAULT);
         };
         if let Err(err) = usermem::write_current_user_bytes(dest, &chunk[..read_len]) {
-            return linux_errno(address_space_error_to_linux_errno(err));
+            return completed_or_error(copied, address_space_error_to_linux_errno(err));
         }
         copied += read_len;
         multitask::cond_resched();
@@ -112,6 +112,14 @@ where
         }
     }
     copied as u64
+}
+
+fn completed_or_error(completed: usize, errno: i64) -> u64 {
+    if completed != 0 {
+        completed as u64
+    } else {
+        linux_errno(errno)
+    }
 }
 
 fn bounded_buffer(user_len: usize) -> Result<Vec<u8>, i64> {
@@ -131,6 +139,13 @@ fn local_memfd_io_chunk_len(user_len: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn errors_after_completed_chunks_return_the_byte_count() {
+        assert_eq!(completed_or_error(0, LINUX_EFAULT), linux_errno(LINUX_EFAULT));
+        assert_eq!(completed_or_error(LOCAL_MEMFD_IO_CHUNK_BYTES, LINUX_EFAULT), LOCAL_MEMFD_IO_CHUNK_BYTES as u64);
+        assert_eq!(completed_or_error(1, LINUX_EINVAL), 1);
+    }
 
     #[test]
     fn local_memfd_io_chunk_is_page_multiple_and_strictly_bounded() {

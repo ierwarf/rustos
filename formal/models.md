@@ -425,3 +425,5 @@ observer activation. `robust-futex-owner-death/RobustFutexOwnerDeath` includes
 canonical shared/private cleanup-key selection. These focused models stay
 small enough for the two-minute PR TLC budget and do not trigger the unchanged
 large compositor model.
+
+child-wait-publication/ChildWaitPublication: one recycled waiter slot, locked status publication/recheck, and split wake scan; Loom/Shuttle project the same race. Spurious wake hints are permitted. Scheduler arm/commit and multiple status consumers are not modeled.

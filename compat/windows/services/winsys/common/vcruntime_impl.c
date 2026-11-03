@@ -19,7 +19,7 @@ void __security_init_cookie(void)
 void __security_check_cookie(ULONGLONG cookie)
 {
     if (cookie != __security_cookie) {
-        RtlExitUserProcess(0);
+        RtlExitUserProcess(0xC0000409u);
     }
 }
 

@@ -7,6 +7,14 @@ scenarios = "formal/product-scenarios.tsv"
 witnesses = "formal/run-source-conformance.sh"
 generated_doc = "docs/ai/formal-contracts.generated.md"
 
+[[source_mappings]]
+path = "kernel/ps/src/multitask/child_wait.rs"
+models = ["child-wait-publication/ChildWaitPublication"]
+
+[[source_mappings]]
+path = "libs/storage-core/src/lib.rs"
+models = ["dvm-volume-io/DvmVolumeIo"]
+
 [[risk_surfaces]]
 path = "kernel/nucleus-core/src/debug/milestone_class.rs"
 severity = "high"
@@ -2386,6 +2394,10 @@ models = [
 ]
 
 [[source_mappings]]
+path = "services/sessiond/src/main.rs"
+models = ["post-init-supervisor-recovery/PostInitSupervisorRecovery"]
+
+[[source_mappings]]
 path = "services/runtimed/src/socket.rs"
 models = ["smp-ring3-qualification/SmpRing3Qualification"]
 
@@ -2588,6 +2600,7 @@ required_models = [
     "acceptance-profile-publication/AcceptanceProfilePublication",
     "atomic-process-activation-batch/AtomicProcessActivationBatch",
     "bootstrap-activation-handoff/BootstrapActivationHandoff",
+    "child-wait-publication/ChildWaitPublication",
     "cpu-affinity-observation/CpuAffinityObservation",
     "cpu-online-lifecycle/CpuOnlineLifecycle",
     "cpu-topology-admission/CpuTopologyAdmission",

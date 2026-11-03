@@ -1084,31 +1084,20 @@ pub fn supervise_domain(
         )?;
         require_successful_child_exit(status)
     })();
-    let stop_error = if run_result.is_err() {
-        stop_child(&mut child, &qmp_path).err()
-    } else {
-        None
-    };
+    ensure_stopped_before_recovery(&run_result, || stop_child(&mut child, &qmp_path))?;
     let restore_result = restore_vfio_lease(lease, &mut ops);
     if restore_result.is_ok() {
         store.remove(&lease.domain_id)?;
     }
-    match (run_result, stop_error, restore_result) {
-        (Ok(status), None, Ok(())) => Ok(status),
-        (Ok(status), _, Err(restore_error)) => Err(restore_error).context(format!(
+    match (run_result, restore_result) {
+        (Ok(status), Ok(())) => Ok(status),
+        (Ok(status), Err(restore_error)) => Err(restore_error).context(format!(
             "DVM exited with {status}, but VFIO reset/restore failed; runtime record retained"
         )),
-        (Err(run_error), None, Ok(())) => Err(run_error),
-        (Err(run_error), Some(stop_error), Ok(())) => Err(run_error).context(format!(
-            "DVM supervision failed and bounded stop also failed: {stop_error:#}"
+        (Err(run_error), Ok(())) => Err(run_error),
+        (Err(run_error), Err(restore_error)) => Err(run_error).context(format!(
+            "DVM supervision failed; VFIO recovery failed: {restore_error:#}"
         )),
-        (Err(run_error), stop_error, Err(restore_error)) => Err(run_error).context(format!(
-            "DVM supervision failed; stop={}; VFIO recovery failed: {restore_error:#}",
-            stop_error
-                .map(|error| format!("failed: {error:#}"))
-                .unwrap_or_else(|| "complete".to_owned())
-        )),
-        (Ok(_), Some(_), Ok(())) => unreachable!("successful run has no stop error"),
     }
 }
 
@@ -1260,34 +1249,37 @@ pub fn supervise_storage_domain(
         )?;
         require_successful_child_exit(status)
     })();
-    let stop_error = if run_result.is_err() {
-        stop_child(&mut child, &qmp_path).err()
-    } else {
-        None
-    };
+    ensure_stopped_before_recovery(&run_result, || stop_child(&mut child, &qmp_path))?;
     let revoke_result =
         crate::storage::revoke_storage_aperture(binding.aperture_path(), binding.generation());
     let restore_result = revoke_result.and_then(|()| restore_vfio_lease(lease, &mut ops));
     if restore_result.is_ok() {
         store.remove(&lease.domain_id)?;
     }
-    match (run_result, stop_error, restore_result) {
-        (Ok(status), None, Ok(())) => Ok(status),
-        (Ok(status), _, Err(restore_error)) => Err(restore_error).context(format!(
+    match (run_result, restore_result) {
+        (Ok(status), Ok(())) => Ok(status),
+        (Ok(status), Err(restore_error)) => Err(restore_error).context(format!(
             "storage DVM exited with {status}, but revoke/reset/restore failed; records retained"
         )),
-        (Err(run_error), None, Ok(())) => Err(run_error),
-        (Err(run_error), Some(stop_error), Ok(())) => Err(run_error).context(format!(
-            "storage DVM supervision failed and bounded stop also failed: {stop_error:#}"
+        (Err(run_error), Ok(())) => Err(run_error),
+        (Err(run_error), Err(restore_error)) => Err(run_error).context(format!(
+            "storage DVM supervision failed; ownership recovery failed: {restore_error:#}"
         )),
-        (Err(run_error), stop_error, Err(restore_error)) => Err(run_error).context(format!(
-            "storage DVM supervision failed; stop={}; ownership recovery failed: {restore_error:#}",
-            stop_error
-                .map(|error| format!("failed: {error:#}"))
-                .unwrap_or_else(|| "complete".to_owned())
-        )),
-        (Ok(_), Some(_), Ok(())) => unreachable!("successful run has no stop error"),
     }
+}
+
+// Never revoke a live guest's aperture or return its devices to the host.
+// A failed stop leaves the durable record and lease available for recovery.
+fn ensure_stopped_before_recovery(
+    run_result: &Result<ExitStatus>,
+    stop: impl FnOnce() -> Result<StopResult>,
+) -> Result<()> {
+    if let Err(run_error) = run_result {
+        stop().with_context(|| {
+            format!("DVM supervision failed: {run_error:#}; stop failed, ownership and runtime records retained")
+        })?;
+    }
+    Ok(())
 }
 
 fn require_successful_child_exit(status: ExitStatus) -> Result<ExitStatus> {
@@ -2773,6 +2765,24 @@ mod tests {
     fn pidfd_binds_the_current_process_without_reporting_exit() {
         let pidfd = PidFd::open(std::process::id()).unwrap().unwrap();
         assert!(!pidfd.wait_exited(Duration::ZERO).unwrap());
+    }
+
+    #[test]
+    fn failed_stop_prevents_ownership_recovery() {
+        let failed = Err(anyhow!("readiness failed"));
+        let error = ensure_stopped_before_recovery(&failed, || Err(anyhow!("stop failed")))
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("ownership and runtime records retained"));
+        assert!(format!("{error:#}").contains("stop failed"));
+
+        let stopped = StopResult {
+            status: ExitStatus::from_raw(0),
+            kind: StopKind::Forced,
+            qmp_failure: None,
+        };
+        ensure_stopped_before_recovery(&failed, || Ok(stopped)).unwrap();
+        let success = Ok(ExitStatus::from_raw(0));
+        ensure_stopped_before_recovery(&success, || panic!("already exited")).unwrap();
     }
 
     #[test]

@@ -103,11 +103,11 @@ model. The SMP iteration profile applies the same rule to its smaller model
 set; nightly qualification never reuses TLC evidence. For explicitly selected
 `dev-plan` models outside the curated PR set, `tlc_cache.py --individual` may
 reuse the same PR execution policy, but cannot widen or satisfy a complete
-profile gate. This requires a new before/after input fingerprint from the actual
+profile gate. All reuse requires a before/after input fingerprint from the actual
 TLC runner, including its validator, pinned tool lock, TLA and CFG. Only closed
 standard-module imports qualify; local shadows, unbound imports, mutation and
 execution overrides force a fresh run. Legacy summaries without this binding
-cannot satisfy individual reuse. The runner refuses a passing result if the
+cannot satisfy reuse. The runner refuses a passing result if the
 checked TLA/CFG or a bound closed-proof input changes during checking. This is proof-evidence
 reuse, not TLC state recovery, and no artifact is touched to fabricate
 freshness. TLC's `-depth` option controls random simulation rather than the

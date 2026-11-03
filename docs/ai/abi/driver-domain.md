@@ -53,7 +53,7 @@ the deadline is a fail-closed transport-health failure. Cleanup uses its
 separately reserved lifecycle capacity and follows the same bounded rule.
 
 RDI1 version 3 preserves pointer semantics end to end. Relative evdev devices produce
-bounded delta records; absolute tablets produce bounded `0..1599 x 0..899`
+bounded delta records; absolute tablets produce bounded `0..2559 x 0..1439`
 position records only after a complete `SYN_REPORT`. Partial X/Y reports are
 staging state, identical positions are idempotent, and neither L0 nor `inputd`
 may reinterpret an absolute position as a relative delta. Ring0 has no pointer

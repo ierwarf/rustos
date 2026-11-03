@@ -778,16 +778,6 @@ impl UserProcessState {
         state
     }
 
-    pub fn inherit_fork_process_metadata_from(&mut self, parent: &Self) {
-        self.linux_sigactions = parent.linux_sigactions;
-        self.handles = parent.handles.clone();
-        self.security = parent.security;
-        self.mapping_cursor = parent.mapping_cursor;
-        self.shared_memfd_mappings = parent.shared_memfd_mappings.clone();
-        self.sync_mapping_kmem();
-        self.set_exec_path(parent.exec_path());
-    }
-
     pub fn set_mapping_cursor(&mut self, addr: u64) {
         self.mapping_cursor = align_up(addr);
         self.sync_linux_mapping_cursor();

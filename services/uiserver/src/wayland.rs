@@ -109,6 +109,12 @@ fn post_protocol_error<I: Resource>(resource: &I, message: String) {
     resource.post_error(0_u32, message);
 }
 
+fn post_pool_resize_error(resource: &wl_shm_pool::WlShmPool, message: String) {
+    diag_line(format!("uiserver: wayland protocol error: {message}"));
+    // Match libwayland's WL_SHM_ERROR_INVALID_FD for pool resize.
+    resource.post_error(wl_shm::Error::InvalidFd, message);
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct WaylandWindowSnapshot {
     pub(crate) surface_id: u32,
@@ -647,6 +653,10 @@ fn wayland_nonnegative_i32(value: i32) -> Option<usize> {
     usize::try_from(value).ok()
 }
 
+fn valid_wayland_pool_resize(current_size: usize, new_size: usize) -> bool {
+    new_size >= current_size && new_size <= MAX_WAYLAND_SHM_POOL_BYTES
+}
+
 fn validate_wayland_buffer_layout(
     offset: usize,
     width: usize,
@@ -701,9 +711,9 @@ fn surface_damage_rect(x: i32, y: i32, width: i32, height: i32) -> Option<Rect> 
 mod tests {
     use super::{
         can_retain_undamaged_buffer, checked_wayland_pixel_count, claim_wayland_rearm,
-        copy_wayland_bgra_row, transient_wayland_readiness_error, validate_wayland_buffer_layout,
-        wayland_nonnegative_i32, WaylandWindowSnapshot, MAX_WAYLAND_BUFFER_DIMENSION,
-        MAX_WAYLAND_SHM_POOL_BYTES,
+        copy_wayland_bgra_row, transient_wayland_readiness_error, valid_wayland_pool_resize,
+        validate_wayland_buffer_layout, wayland_nonnegative_i32, WaylandWindowSnapshot,
+        MAX_WAYLAND_BUFFER_DIMENSION, MAX_WAYLAND_SHM_POOL_BYTES,
     };
     use std::io::ErrorKind;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -746,6 +756,16 @@ mod tests {
             MAX_WAYLAND_SHM_POOL_BYTES,
         )
         .is_none());
+    }
+
+    #[test]
+    fn wayland_pool_resize_never_shrinks_or_exceeds_limit() {
+        assert!(!valid_wayland_pool_resize(128, 0));
+        assert!(!valid_wayland_pool_resize(128, 127));
+        assert!(valid_wayland_pool_resize(128, 128));
+        assert!(valid_wayland_pool_resize(128, 129));
+        assert!(valid_wayland_pool_resize(128, MAX_WAYLAND_SHM_POOL_BYTES));
+        assert!(!valid_wayland_pool_resize(128, MAX_WAYLAND_SHM_POOL_BYTES + 1));
     }
 
     #[test]
@@ -2614,22 +2634,15 @@ impl Dispatch<wl_shm_pool::WlShmPool, ShmPoolData> for WaylandState {
             }
             wl_shm_pool::Request::Resize { size } => {
                 let Some(size) = wayland_nonnegative_i32(size) else {
-                    post_protocol_error(resource, "wl_shm_pool.resize: invalid size".into());
+                    post_pool_resize_error(resource, "wl_shm_pool.resize: invalid size".into());
                     return;
                 };
-                if size == 0 {
-                    post_protocol_error(
-                        resource,
-                        "wl_shm_pool.resize: pool size must be non-zero".into(),
-                    );
-                    return;
-                }
                 let resize_result = {
                     if let Ok(mut pool) = data.shared.lock() {
-                        if size > MAX_WAYLAND_SHM_POOL_BYTES {
+                        if !valid_wayland_pool_resize(pool.len, size) {
                             Err(format!(
-                                "wl_shm_pool.resize: size {} exceeds safety limit {}",
-                                size, MAX_WAYLAND_SHM_POOL_BYTES
+                                "wl_shm_pool.resize: size {} must be at least {} and not exceed {}",
+                                size, pool.len, MAX_WAYLAND_SHM_POOL_BYTES
                             ))
                         } else if size > pool.mapping.len_bytes() {
                             // Growth: map the larger extent before dropping
@@ -2654,7 +2667,7 @@ impl Dispatch<wl_shm_pool::WlShmPool, ShmPoolData> for WaylandState {
                     }
                 };
                 if let Err(message) = resize_result {
-                    post_protocol_error(resource, message);
+                    post_pool_resize_error(resource, message);
                 }
             }
             _ => {}

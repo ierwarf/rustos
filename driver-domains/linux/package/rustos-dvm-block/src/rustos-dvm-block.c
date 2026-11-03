@@ -1210,8 +1210,9 @@ static int publish_block_evidence(const struct relay_state *state)
             state->device.capacity_sectors, state->device.logical_block_size,
             state->device.physical_block_size, state->header.features,
             state->device.read_only ? "yes" : "no") < 0 ||
-        fsync(evidence_fd) != 0 ||
-        close(evidence_fd) != 0) {
+        fsync(evidence_fd) != 0)
+        goto out;
+    if (close(evidence_fd) != 0) {
         evidence_fd = -1;
         goto out;
     }
@@ -1402,7 +1403,8 @@ out:
     if (result != 0)
         relay_log("rustos-dvm-block: revoked stage=%s errno=%d\n",
                   failed_stage, errno);
-    withdraw_ready(&state);
+    if (lock_fd >= 0)
+        withdraw_ready(&state);
     close_block_device(&state.device);
     close_transport(&state.transport);
     if (lock_fd >= 0)

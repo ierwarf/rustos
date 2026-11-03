@@ -223,7 +223,7 @@ mod tests {
         assert_eq!(syscall::WAITSET_PROVIDER_MAX, 4);
         assert_eq!(size_of::<syscall::WaitSetSignalBrokerArgs>(), 32);
         assert_eq!(size_of::<syscall::WaitSetInterestWire>(), 48);
-        assert_eq!(syscall::BLOCK_BROKER_ABI_VERSION, 3);
+        assert_eq!(syscall::BLOCK_BROKER_ABI_VERSION, 4);
         assert_eq!(syscall::BLOCK_BROKER_OP_DVM_INFO, 1);
         assert_eq!(syscall::BLOCK_BROKER_OP_DVM_WAIT, 7);
         assert_eq!(size_of::<syscall::RustosBlockBrokerArgs>(), 96);

@@ -499,3 +499,137 @@ fn a_register_sized_receiver_cannot_take_a_spilled_request_and_a_short_capacity_
     });
 }
 
+#[test]
+fn an_inline_sized_reply_longer_than_the_callers_capacity_is_terminal() {
+    with_isolated_ipc_test(|| {
+        let endpoint = super::super::create_endpoint().expect("create endpoint");
+        super::super::add_endpoint_receiver_waiter(endpoint, 81).expect("add waiter");
+        let (reply, _) = super::super::reserve_fast_endpoint_call_with_response_capacity(
+            endpoint, 800, 80, b"req", 4, None,
+        )
+        .expect("reserve");
+        super::super::take_fast_endpoint_request(endpoint, 81)
+            .expect("take")
+            .expect("published");
+        // The reply fits the inline frame, so only the commit transition can
+        // enforce the caller's declared 4-byte capacity.
+        let published = super::super::complete_fast_endpoint_reply_for_task(
+            reply, 81, &[1_u8; 5],
+        )
+        .expect("publish");
+        assert_eq!(published.terminal_error, Some(super::super::IpcError::BufferTooSmall));
+    });
+}
+
+
+#[test]
+fn fast_rollback_reserves_waiter_capacity_during_publication() {
+    use super::super::*;
+    super::with_isolated_ipc_test(|| {
+        let endpoint = create_endpoint().unwrap();
+        add_endpoint_receiver_waiter_with_capacity(endpoint, 100, 37).unwrap();
+        let (reply, receiver) = reserve_fast_endpoint_call(endpoint, 1, 1, b"call", None).unwrap();
+        assert_eq!(receiver, 100);
+        for task in 101..(100 + MAX_ENDPOINT_WAITERS as u64) {
+            assert_eq!(restore_endpoint_receiver_waiter(endpoint, task), Ok(true));
+        }
+        assert_eq!(restore_endpoint_receiver_waiter(endpoint, 9999), Err(IpcError::NoMemory));
+        rollback_fast_endpoint_call(endpoint, reply, 1, receiver).unwrap();
+        ENDPOINTS.with(endpoint.raw(), |object| {
+            assert_eq!(object.waiting_receivers.len(), MAX_ENDPOINT_WAITERS);
+            assert_eq!(object.waiting_receivers.front().unwrap().task_id, receiver);
+            assert_eq!(object.waiting_receivers.front().unwrap().request_capacity, 37);
+        }).unwrap();
+    });
+}
+
+#[test]
+fn owner_exit_fails_fast_call_after_receiver_takes_request() {
+    use super::super::*;
+    super::with_isolated_ipc_test(|| {
+        let endpoint = create_endpoint_for_task(Some(90)).unwrap();
+        add_endpoint_receiver_waiter(endpoint, 90).unwrap();
+        let (reply, _) = reserve_fast_endpoint_call(endpoint, 1, 1, b"call", None).unwrap();
+        assert!(take_fast_endpoint_request(endpoint, 90).unwrap().is_some());
+        let wake = fail_endpoints_owned_by_task(90, IpcError::PeerClosed);
+        assert_eq!(wake.callers(), &[1]);
+        assert!(matches!(take_fast_endpoint_response(reply, 1),
+            Ok(FastEndpointResponseTake::Error(IpcError::PeerClosed))));
+        assert!(complete_fast_endpoint_reply_for_task(reply, 90, b"late").is_err());
+    });
+}
+
+#[test]
+fn spilled_reply_requires_live_exact_receiver_and_returns_custody_once() {
+    use super::super::*;
+    with_isolated_ipc_test(|| {
+        let endpoint = create_endpoint().unwrap();
+        add_endpoint_receiver_waiter(endpoint, 31).unwrap();
+        let custody = super::test_scheduling_custody(7);
+        let (reply, _) = reserve_fast_endpoint_call_with_response_capacity(
+            endpoint, 70, 7, b"request", IPC_FAST_INLINE_BYTES + 1, Some(custody),
+        ).unwrap();
+        take_fast_endpoint_request(endpoint, 31).unwrap().unwrap();
+        let response = std::vec![42; IPC_FAST_INLINE_BYTES + 1];
+        assert_eq!(complete_fast_endpoint_reply_for_task(reply, 32, &response),
+                   Err(IpcError::PermissionDenied));
+        let completion = complete_fast_endpoint_reply_for_task(reply, 31, &response).unwrap();
+        assert_eq!(completion.completion.scheduling_context, Some(custody));
+        assert_eq!(complete_fast_endpoint_reply_for_task(reply, 31, &response),
+                   Err(IpcError::InvalidArgument));
+        assert_eq!(take_fast_endpoint_response(reply, 7),
+                   Ok(FastEndpointResponseTake::Spilled(response.clone())));
+        assert_eq!(complete_fast_endpoint_reply_for_task(reply, 31, &response),
+                   Err(IpcError::InvalidHandle));
+    });
+}
+
+#[test]
+fn fast_reservation_rejects_foreign_scheduling_custody_without_popping_waiter() {
+    use super::super::*;
+    with_isolated_ipc_test(|| {
+        let endpoint = create_endpoint().unwrap();
+        add_endpoint_receiver_waiter(endpoint, 31).unwrap();
+        let foreign = super::test_scheduling_custody(8);
+        assert_eq!(reserve_fast_endpoint_call(endpoint, 70, 7, b"call", Some(foreign)),
+                   Err(IpcError::InvalidArgument));
+        let (reply, receiver) = reserve_fast_endpoint_call(endpoint, 70, 7, b"call", None).unwrap();
+        assert_eq!(receiver, 31);
+        cancel_endpoint_call_with_transfers(reply, 7).unwrap();
+    });
+}
+
+#[test]
+fn concurrent_spilled_replies_publish_and_return_custody_only_once() {
+    use super::super::*;
+    with_isolated_ipc_test(|| {
+        let endpoint = create_endpoint().unwrap();
+        add_endpoint_receiver_waiter(endpoint, 31).unwrap();
+        let custody = super::test_scheduling_custody(7);
+        let (reply, _) = reserve_fast_endpoint_call_with_response_capacity(
+            endpoint, 70, 7, b"request", IPC_FAST_INLINE_BYTES + 1, Some(custody),
+        ).unwrap();
+        take_fast_endpoint_request(endpoint, 31).unwrap().unwrap();
+        let barrier = std::sync::Barrier::new(3);
+        let results = std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                barrier.wait();
+                complete_fast_endpoint_reply_for_task(reply, 31, &[1; IPC_FAST_INLINE_BYTES + 1])
+            });
+            let second = scope.spawn(|| {
+                barrier.wait();
+                complete_fast_endpoint_reply_for_task(reply, 31, &[2; IPC_FAST_INLINE_BYTES + 1])
+            });
+            barrier.wait();
+            [first.join().unwrap(), second.join().unwrap()]
+        });
+        assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+        assert_eq!(results.iter().filter(|r| matches!(r, Err(IpcError::InvalidArgument))).count(), 1);
+        let completion = results.into_iter().find_map(Result::ok).unwrap();
+        assert_eq!(completion.completion.scheduling_context, Some(custody));
+        let FastEndpointResponseTake::Spilled(bytes) = take_fast_endpoint_response(reply, 7).unwrap() else {
+            panic!("missing spilled response");
+        };
+        assert!(bytes == [1; IPC_FAST_INLINE_BYTES + 1] || bytes == [2; IPC_FAST_INLINE_BYTES + 1]);
+    });
+}

@@ -79,7 +79,7 @@ package = "rustos-user-abi"
 source = "libs/rustos-user-abi/src/syscall.rs"
 symbol = "IpcTransferTicketWire::decode"
 formal_model = "ipc-handle-transfer/IpcHandleTransfer"
-scope = "exhaustive 128-bit integer-only ticket decoding, canonical round-trip, and rejection of zero authority before one-shot registry lookup"
+scope = "exhaustive 192-bit integer-only ticket decoding, canonical round-trip, and rejection of zero authority before one-shot registry lookup"
 harnesses = [
   "accepted_ticket_is_nonzero_and_canonical",
   "every_nonzero_ticket_round_trips",
@@ -242,6 +242,17 @@ harnesses = [
   "packed_worker_round_trips_every_cpu_and_worker_word",
   "admitted_worker_has_every_exact_intrinsic_bound",
 ]
+depends_on = []
+
+[[proof]]
+id = "storage-block-range"
+kind = "kani"
+package = "storage-core"
+source = "libs/storage-core/src/lib.rs"
+symbol = "validate_block_io"
+formal_model = "dvm-volume-io/DvmVolumeIo"
+scope = "symbolic full-width LBA/count/byte ranges for 512-byte and 4096-byte sector admission; not GPT parser equivalence, device lifetime, or durability"
+harnesses = ["valid_block_io_never_exceeds_device"]
 depends_on = []
 
 [[proof]]

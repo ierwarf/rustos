@@ -909,6 +909,21 @@ pub(super) fn syscall_linux_rustos_ipc_register_linux_syscall_endpoint(endpoint:
         );
         return linux_errno(LINUX_ESRCH);
     }
+    // Same single-owner rule as the generic registration: a live published
+    // endpoint is revoked (explicitly or by its owner's exit) before another
+    // registrant may replace it.
+    if SERVICE_ENDPOINTS[linux_abi::IPC_SERVICE_LINUX_SYSCALLD as usize].load(Ordering::Acquire)
+        != 0
+    {
+        drop(registry_mutation);
+        record_service_endpoint_milestone(
+            "ipc-service-register-busy",
+            linux_abi::IPC_SERVICE_LINUX_SYSCALLD,
+            process_id,
+            LINUX_EBUSY as u64,
+        );
+        return linux_errno(LINUX_EBUSY);
+    }
     if !service_authorization_is_current(authorization) {
         drop(registry_mutation);
         return linux_errno(LINUX_EAGAIN);
@@ -1380,6 +1395,18 @@ fn syscall_linux_rustos_ipc_call_with_timeout(
         Err(errno) => return linux_errno(errno),
     };
     cycle_mark = charge_phase(IpcCallPhase::CopyRequest, cycle_mark);
+    // The fast path validates the reply range before the request is
+    // published; the queued path must too, or the service executes the request
+    // and the caller then fails with EFAULT/EINVAL for a bad output buffer.
+    let Ok(declared_reply_capacity) = usize::try_from(reply_capacity) else {
+        return linux_errno(LINUX_EINVAL);
+    };
+    if declared_reply_capacity != 0
+        && let Err(err) =
+            usermem::validate_current_user_write_buffer(reply_ptr, declared_reply_capacity)
+    {
+        return linux_errno(address_space_error_to_linux_errno(err));
+    }
     ipc_trace!(
         "ipc call copied: endpoint={} request_len={}",
         endpoint.raw(),
@@ -2681,6 +2708,9 @@ pub(super) fn syscall_linux_rustos_ipc_reply(
     }
     let response = match staged {
         Some(response) => response,
+        // The fast branch accepts an empty reply; a queued call must too, or a
+        // zero-length answer leaves the caller waiting until its deadline.
+        None if response_len == 0 => Vec::new(),
         None => match copy_request_from_user(response_ptr, response_len) {
             Ok(response) => response,
             Err(errno) => return linux_errno(errno),
@@ -2760,6 +2790,28 @@ fn syscall_linux_rustos_ipc_call_with_handles_timeout(args_ptr: u64, timeout_ms:
         Err(errno) => return linux_errno(errno),
     };
     let copy_ticks = crate::arch::rtc::ticks();
+    // Reject unusable reply outputs before any descriptor is exported or the
+    // request is published; a published request cannot be un-executed.
+    let Ok(declared_reply_capacity) = usize::try_from(args.reply_capacity) else {
+        return linux_errno(LINUX_EINVAL);
+    };
+    if declared_reply_capacity != 0
+        && let Err(err) =
+            usermem::validate_current_user_write_buffer(args.reply_ptr, declared_reply_capacity)
+    {
+        return linux_errno(address_space_error_to_linux_errno(err));
+    }
+    let recv_slots = if args.recv_fds_ptr != 0 {
+        usize::from(args.recv_fd_capacity)
+            .min(rustos_user_abi::syscall::IPC_MAX_TRANSFER_HANDLES)
+    } else {
+        0
+    };
+    if let Err(errno) =
+        validate_received_handle_outputs(args.recv_fds_ptr, args.recv_fd_count_ptr, recv_slots)
+    {
+        return linux_errno(errno);
+    }
     let send_handles = match export_current_fds_for_ipc(args.send_fds_ptr, args.send_fd_count) {
         Ok(handles) => handles,
         Err(errno) => return linux_errno(errno),

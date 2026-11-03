@@ -191,12 +191,7 @@ def main() -> int:
                     shadow = root / f"build/formal/tlc/{profile}/sample__Sample/Naturals.tla"
                 shadow.parent.mkdir(parents=True, exist_ok=True)
                 shadow.write_text("---- MODULE Naturals ----\n====\n", encoding="utf-8")
-            try:
-                validate_cached_summary(root, "pr", "sample/Sample", individual=True)
-            except ValueError:
-                pass
-            else:
-                raise AssertionError(f"individual proof accepted {invalidate}")
+            expect_rejected(root, invalidate)
             if invalidate.endswith("shadow"):
                 shadow.unlink()
         write_summary()
@@ -231,12 +226,7 @@ def main() -> int:
         ):
             spec.write_text("---- MODULE Sample ----\n" + imports + "====\n", encoding="utf-8")
             write_summary()
-            try:
-                validate_cached_summary(root, "pr", "sample/Sample", individual=True)
-            except ValueError:
-                pass
-            else:
-                raise AssertionError(f"unbound dependency accepted: {imports}")
+            expect_rejected(root, f"unbound dependency: {imports}")
         spec.write_text("---- MODULE Sample ----\nEXTENDS Naturals, FiniteSets\n====\n", encoding="utf-8")
         write_summary()
         validate_cached_summary(root, "pr", "sample/Sample", individual=True)

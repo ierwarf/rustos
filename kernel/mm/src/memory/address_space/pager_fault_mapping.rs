@@ -1209,10 +1209,10 @@ fn scan_present_user_leaves_in_range(
     mut read_leaf: impl FnMut(PhysAddr, usize) -> PageTableEntry,
     mut validate_leaf: impl FnMut(PagerFaultLeaf, PageTableFlags) -> Result<(), AddressSpaceError>,
 ) -> Result<Vec<PagerFaultLeaf>, AddressSpaceError> {
+    // Storage grows with the leaves actually present, never with the requested
+    // span: a sparse multi-terabyte reservation is a legal `munmap` operand and
+    // would otherwise demand `page_count * 16` bytes of kernel heap up front.
     let mut leaves = Vec::new();
-    leaves
-        .try_reserve_exact(maximum_count)
-        .map_err(|_| AddressSpaceError::OutOfFrames)?;
     let Some(pdpt_phys) = read_table(root_phys, USER_PML4_INDEX)? else {
         return Ok(leaves);
     };
@@ -1234,37 +1234,52 @@ fn scan_present_user_leaves_in_range(
             cached_p2 = usize::MAX;
             pt_phys = None;
         }
+        let Some(pd_phys) = pd_phys else {
+            // An absent page directory answers for its whole 1 GiB span.
+            virtual_address = next_level_boundary(virtual_address, PDPT_SHIFT)?;
+            continue;
+        };
         let p2 = p2_index(virt);
         if p2 != cached_p2 {
-            pt_phys = match pd_phys {
-                Some(pd_phys) => read_table(pd_phys, p2)?,
-                None => None,
-            };
+            pt_phys = read_table(pd_phys, p2)?;
             cached_p2 = p2;
         }
-        if let Some(pt_phys) = pt_phys {
-            let entry = read_leaf(pt_phys, p1_index(virt));
-            if !entry.is_unused() {
-                let flags = entry.flags();
-                if !flags.contains(PageTableFlags::PRESENT) {
-                    return Err(AddressSpaceError::InvalidFrameOwnership);
-                }
-                let leaf = PagerFaultLeaf {
-                    virtual_address,
-                    physical_address: entry.addr().as_u64(),
-                };
-                validate_leaf(leaf, flags)?;
-                if leaves.len() == maximum_count {
-                    return Err(AddressSpaceError::InvalidFrameOwnership);
-                }
-                leaves.push(leaf);
+        let Some(pt_phys) = pt_phys else {
+            // An absent page table answers for its whole 2 MiB span.
+            virtual_address = next_level_boundary(virtual_address, PD_SHIFT)?;
+            continue;
+        };
+        let entry = read_leaf(pt_phys, p1_index(virt));
+        if !entry.is_unused() {
+            let flags = entry.flags();
+            if !flags.contains(PageTableFlags::PRESENT) {
+                return Err(AddressSpaceError::InvalidFrameOwnership);
             }
+            let leaf = PagerFaultLeaf {
+                virtual_address,
+                physical_address: entry.addr().as_u64(),
+            };
+            validate_leaf(leaf, flags)?;
+            if leaves.len() == maximum_count {
+                return Err(AddressSpaceError::InvalidFrameOwnership);
+            }
+            leaves
+                .try_reserve(1)
+                .map_err(|_| AddressSpaceError::OutOfFrames)?;
+            leaves.push(leaf);
         }
         virtual_address = virtual_address
             .checked_add(PAGE_4KIB_U64)
             .ok_or(AddressSpaceError::AddressOverflow)?;
     }
     Ok(leaves)
+}
+
+/// First address past the level-`shift` span containing `virtual_address`.
+fn next_level_boundary(virtual_address: u64, shift: u32) -> Result<u64, AddressSpaceError> {
+    ((virtual_address >> shift) + 1)
+        .checked_mul(1_u64 << shift)
+        .ok_or(AddressSpaceError::AddressOverflow)
 }
 
 fn pager_fault_range_end(start: VirtAddr, page_count: usize) -> Result<u64, AddressSpaceError> {
@@ -1581,16 +1596,33 @@ mod tests {
             Err(AddressSpaceError::InvalidFrameOwnership)
         ));
         assert_entries_unchanged(&entries, &before);
-        let result = scan_present_user_leaves_in_range(
+    }
+
+    #[test]
+    fn sparse_unmap_scan_neither_reserves_by_span_nor_walks_absent_pages() {
+        // 1 TiB of address space with every page-directory absent: the scan
+        // must cost one directory read per 1 GiB, and its storage must follow
+        // the present leaves (none), not the 256 Mi pages requested.
+        const SPAN: u64 = 1 << 40;
+        let mut reads = 0_u64;
+        let leaves = scan_present_user_leaves_in_range(
             PhysAddr::new(0x1000),
             USER_SPACE_BASE,
-            USER_SPACE_BASE + PAGE_4KIB_U64,
-            usize::MAX,
-            |_, _| panic!("capacity must be reserved before directory reads"),
-            |_, _| panic!("capacity must be reserved before leaf reads"),
-            |_, _| panic!("capacity must be reserved before validation"),
-        );
-        assert!(matches!(result, Err(AddressSpaceError::OutOfFrames)));
+            USER_SPACE_BASE + SPAN,
+            (SPAN / PAGE_4KIB_U64) as usize,
+            |parent, index| {
+                reads += 1;
+                // The PDPT exists; every PD below it is absent.
+                Ok((parent.as_u64() == 0x1000 && index == USER_PML4_INDEX)
+                    .then(|| PhysAddr::new(0x2000)))
+            },
+            |_, _| panic!("absent directory must not read a leaf"),
+            |_, _| panic!("absent directory must not validate a leaf"),
+        )
+        .unwrap();
+        assert!(leaves.is_empty());
+        assert_eq!(leaves.capacity(), 0);
+        assert!(reads <= 1 + SPAN / (1 << 30));
     }
 
     #[test]

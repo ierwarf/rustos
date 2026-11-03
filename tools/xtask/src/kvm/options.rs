@@ -669,8 +669,8 @@ pub(crate) fn kvm_run_command(
         repeat: 1,
         // The interactive path owns its own `--build-image` flag above.
         build_image: false,
-        // The interactive path seals through its own `auto_verify` argument
-        // below, so the shared smoke entry must not seal a second time.
+        // The interactive path warns through its own `auto_verify` argument
+        // below, so the shared smoke entry must not check a second time.
         auto_verify: false,
         expected_markers: vec![
             RUSTOS_GPU_ACTIVE_MARKER.to_owned(),
@@ -687,13 +687,10 @@ pub(crate) fn kvm_run_command(
     if options.physical_usb_bdf.is_some() {
         validate_physical_usb_inputs(&options)?;
     }
-    // A multicore launch is admitted only by the formal profile that models
-    // its topology, and this is the interactive path: an unsealed profile here
-    // means someone edited the tree and pressed run, not that they intended to
-    // launch unverified. Seal it with the profile's own verification command
-    // rather than failing and asking for that command by hand. The spawn-time
-    // gate below still validates independently, so nothing launches on a
-    // verification that did not pass.
+    // This is the interactive path: an unsealed profile means someone edited
+    // the tree and pressed run. Sealing takes minutes and the boot claims no
+    // acceptance result, so only warn (F5 must not fail on a stale seal) and
+    // say loudly that the boot is unverified.
     if options.smp_iteration || options.rustos_vcpus > 1 {
         let profile = if options.smp_iteration {
             "smp-iteration"
@@ -748,25 +745,75 @@ pub(crate) fn kvm_run_command(
         "xtask: interactive KVM DVM guests started in {} ms; user-visible first-frame readiness is required before the outer smoke timeout",
         started_at.elapsed().as_millis(),
     );
+    let outcome = run_interactive_session(
+        config,
+        &options,
+        &layout,
+        started_at,
+        interactive_boot_started,
+        &mut rustos,
+        &mut dvm,
+    );
+    // Every exit path, including an `?` error inside the loop, must reap both
+    // guests; a leaked QEMU keeps the fixed ivshmem/vsock topology busy and
+    // makes the next F5 launch fail.
+    stop_guest(&mut dvm);
+    stop_guest(&mut rustos);
+    outcome
+}
+
+static INTERACTIVE_STOP_SIGNAL: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn note_interactive_stop_signal(_signal: libc::c_int) {
+    INTERACTIVE_STOP_SIGNAL.store(true, Ordering::SeqCst);
+}
+
+/// Turns SIGINT/SIGTERM into a flag the session loop polls, so stopping the
+/// launcher (Ctrl-C, task kill) tears down both QEMU children instead of
+/// orphaning them.
+fn install_interactive_stop_handlers() {
+    INTERACTIVE_STOP_SIGNAL.store(false, Ordering::SeqCst);
+    for signal in [libc::SIGINT, libc::SIGTERM] {
+        unsafe {
+            libc::signal(signal, note_interactive_stop_signal as *const () as libc::sighandler_t);
+        }
+    }
+}
+
+fn run_interactive_session(
+    config: &Config,
+    options: &SmokeOptions,
+    layout: &KvmLayout,
+    started_at: Instant,
+    interactive_boot_started: Instant,
+    rustos: &mut Child,
+    dvm: &mut Child,
+) -> Result<()> {
+    install_interactive_stop_handlers();
     let mut pointer_observed = false;
     let mut readiness_verified = false;
     loop {
+        if INTERACTIVE_STOP_SIGNAL.load(Ordering::SeqCst) {
+            stop_guest(dvm);
+            stop_guest(rustos);
+            return validate_interactive_session(layout, pointer_observed);
+        }
         if let Some(status) = dvm
             .try_wait()
             .context("poll interactive Linux DVM QEMU session")?
         {
-            stop_guest(&mut rustos);
+            stop_guest(rustos);
             if !status.success() {
                 bail!("interactive Linux DVM QEMU session exited with {status}")
             }
-            validate_interactive_session(&layout, pointer_observed)?;
+            validate_interactive_session(layout, pointer_observed)?;
             return Ok(());
         }
         if let Some(status) = rustos
             .try_wait()
             .context("poll interactive RustOS QEMU session")?
         {
-            stop_guest(&mut dvm);
+            stop_guest(dvm);
             bail!("interactive RustOS QEMU session exited with {status}");
         }
         let rustos_log = read_runtime_log_if_present(&layout.debugcon_log)?;
@@ -776,7 +823,7 @@ pub(crate) fn kvm_run_command(
             let reason =
                 "interactive KVM DVM session observed a watchdog, stall, crash, or relay stop";
             let evidence = write_kvm_failure_summary(
-                &layout,
+                layout,
                 reason,
                 interactive_boot_started.elapsed(),
                 &rustos_log,
@@ -784,8 +831,8 @@ pub(crate) fn kvm_run_command(
                 &[],
                 &[],
             )?;
-            stop_guest(&mut dvm);
-            stop_guest(&mut rustos);
+            stop_guest(dvm);
+            stop_guest(rustos);
             bail!(
                 "{reason}; evidence={}; inspect {} and {}",
                 evidence.display(),
@@ -793,7 +840,7 @@ pub(crate) fn kvm_run_command(
                 layout.dvm_serial_log.display(),
             );
         }
-        if !readiness_verified && interactive_display_ready(&layout, &rustos_log, &dvm_log) {
+        if !readiness_verified && interactive_display_ready(layout, &rustos_log, &dvm_log) {
             if let Err(error) = crate::formal_contracts::record_kvm_runtime_trace(
                 &config.root_dir,
                 crate::formal_contracts::KvmRuntimeObservation {
@@ -813,8 +860,8 @@ pub(crate) fn kvm_run_command(
                 &layout.debugcon_log,
                 &layout.dvm_serial_log,
             ) {
-                stop_guest(&mut dvm);
-                stop_guest(&mut rustos);
+                stop_guest(dvm);
+                stop_guest(rustos);
                 return Err(error).context("record interactive product boot trace");
             }
             readiness_verified = true;

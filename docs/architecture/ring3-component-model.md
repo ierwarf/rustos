@@ -39,8 +39,10 @@ library as replacing the existing rootd/Job/IPC authorities.
 - Ring3 IDL schemas are authored in `schemas/ring3/control.json` and
   converted deterministically to no_std Rust field definitions by
   `tools/ring3_idl_codegen.py`. CI rejects stale generated files.
-  The five declarative control-plane schemas are staging contracts only:
-  production IPC and syscall structs have **not** been switched over.
+  Several generated schemas now carry production control-plane operations;
+  other schemas remain staging contracts, and the kernel checkpoint syscall
+  and many service protocols still use `repr(C)` structures. See the live
+  schema list below.
 - `Graph::from_manifest` admits topologically sorted nested components
   one parent at a time before admitting each child. Its output is private
   until all exports and offers validate; malformed dependency indices
@@ -104,11 +106,11 @@ library as replacing the existing rootd/Job/IPC authorities.
 | Stage | Implemented source/evidence | Remaining work |
 | --- | --- | --- |
 | 1. Job lifecycle | Existing ring0 generational Job tree and typed descriptors (unchanged) | Hardware qualification, not reimplementation |
-| 2. Accounting | Existing process/thread/page limits and unvalidated kernel memory.high threshold events, Job memory.min hierarchy and rootd OOM selection | Kernel-byte charge, high-event service reaction, production acceptance |
+| 2. Accounting | Process/thread/page limits, ProcessObject and six separately charged kmem classes, memory.high threshold events, Job memory.min hierarchy and rootd OOM selection | Total kernel-byte accounting, high-event service reaction, broader runtime acceptance |
 | 3. JobPolicy | Existing 256-bit kernel policy ceilings; production negative gating of checkpoint/reclaim controls by effective JobPolicy; live 13-role rootd authority manifest | Assign positive subject grants and dual-run cutover of legacy service-capability checks |
-| 4. IDL/runtime | Generated-IDL production `initd`/`rootd` lease snapshot **and destructive reclaim** operations, exact PID/challenge-bound replies, retired scalar ops 8/9, five other staged schemas | Remaining production service protocols and outer commercial IPC envelope still require IDL/runtime cutover |
+| 4. IDL/runtime | Generated-IDL production lease snapshot/reclaim, heartbeat, update, session, checkpoint, lease-report and slow-authorization protocols | Remaining production service protocols and outer commercial IPC envelope still require IDL/runtime cutover |
 | 5. Components | New generation-bound Graph; live rootd manifest and 15-offer route validation, declarative ordered supervisor parent edges, exact live service PID collision/reporter-chain denial | Declarative activation, named kernel capability transfer and consolidated production supervisor ownership |
-| 6. Session budgets | Unvalidated kernel/rootd/runtimed client-funded console integration; per-application Job ceilings, ancestor accounting, replay-safe release receipts, cancellation and provider-exit settlement | Non-console providers, rootd-crash reconciliation, end-to-end acceptance |
+| 6. Session budgets | Kernel/rootd/runtimed console integration and netd/vfsd provider billing; per-application Job ceilings, replay-safe receipts, cancellation and provider-exit settlement | Surviving-session re-adoption after rootd restart, durable receipts and end-to-end acceptance |
 | 7. Personality split | Existing syscalld/procd/loaderd/vfsd policy split preserved | Audit remaining **slow** ring0 ABI policies and cut over with measured cost; no hotpath moves |
 | 8. Operability | New health probe, restart, event and update/rollback policy models; live bounded nested checkpoint tree, transitive exit/reclaim revocation and exact compaction | Actual persistent crash store, authenticated health reporter, image admission, restart transaction and KVM rollback |
  

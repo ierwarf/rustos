@@ -110,6 +110,31 @@ fn unix_poll_readiness_tracks_data_space_and_peer_close() {
 }
 
 #[test]
+fn single_socket_poll_returns_readiness_and_generation_together() {
+    let (first, second) = (0xba7c_1001_u64, 0xba7c_1002_u64);
+    {
+        let mut state = lock_net_state();
+        state.sockets.insert(first, connected_socket(second));
+        state.sockets.insert(second, connected_socket(first));
+        state.readiness_generations.insert(first, 91);
+    }
+    let request = NetdIpcRequest {
+        socket_token: first,
+        arg1: linux_abi::POLLOUT as u64,
+        ..NetdIpcRequest::default()
+    };
+    let mut response = NetdIpcResponse::default();
+    assert_eq!(handle_poll_socket(&request, &mut response), 0);
+    assert_eq!(response.value, linux_abi::POLLOUT as u64);
+    assert_eq!(response.payload_len, 8);
+    assert_eq!(u64::from_le_bytes(response.payload[..8].try_into().unwrap()), 91);
+    let mut state = lock_net_state();
+    state.sockets.remove(&first);
+    state.sockets.remove(&second);
+    state.readiness_generations.remove(&first);
+}
+
+#[test]
 fn local_wait_is_deferred_without_consuming_a_worker() {
     let wait = NetdIpcRequest {
         op: SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET,

@@ -9,7 +9,7 @@
 //! - **Failure:** zero/stale identities fail admission instead of manufacturing
 //!   anonymous execution authority.
 
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use kernel_object::api::identity::{ObjectIdentity, ObjectKind, ObjectOwner};
 
 pub(super) mod dispatch;
@@ -73,44 +73,61 @@ pub(super) fn drain_runtime_counters() -> SchedulingContextRuntimeCounters {
     }
 }
 
-/// First budget exhaustion of the current profile window: owner task and the
-/// quantum that consumed the budget, packed so the pair is published or lost
-/// together.
-static EXHAUSTION_OWNER: AtomicU64 = AtomicU64::new(0);
-static EXHAUSTION_CHARGED_NS: AtomicU64 = AtomicU64::new(0);
-static EXHAUSTION_LATCHED: AtomicBool = AtomicBool::new(false);
-
-/// Records one exhaustion transition without touching the debug sink.
-///
-/// The charge that consumes a budget runs under the global scheduler guard,
-/// and a debugcon record is a port write per byte, which is a VM exit per byte
-/// under KVM. Latching here and rendering from the profile drain keeps that
-/// cost outside the guard; the window's full exhaustion count is already
-/// carried by the drained counter bank, so nothing is lost by keeping only the
-/// first exact owner.
-pub(super) fn latch_budget_exhaustion(owner_task_id: u64, charged_ns: u64) {
-    if EXHAUSTION_LATCHED
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .is_err()
-    {
-        return;
-    }
-    EXHAUSTION_OWNER.store(owner_task_id, Ordering::Relaxed);
-    // ORDERING: Release publishes both fields to the drain that observes the
-    // latch through its Acquire load below.
-    EXHAUSTION_CHARGED_NS.store(charged_ns, Ordering::Release);
+/// A writer reserves the latch before filling either field; a reader reserves
+/// the published pair until both fields have been read. Neither may recycle
+/// the slot while the other owns it.
+struct ExhaustionLatch {
+    state: AtomicU8,
+    owner: AtomicU64,
+    charged_ns: AtomicU64,
 }
 
-/// Takes the window's latched exhaustion, if any. Callers must already have
-/// released the scheduler guard.
-pub(super) fn take_latched_budget_exhaustion() -> Option<(u64, u64)> {
-    if !EXHAUSTION_LATCHED.load(Ordering::Acquire) {
-        return None;
+const LATCH_EMPTY: u8 = 0;
+const LATCH_WRITING: u8 = 1;
+const LATCH_READY: u8 = 2;
+const LATCH_READING: u8 = 3;
+
+impl ExhaustionLatch {
+    const fn new() -> Self {
+        Self {
+            state: AtomicU8::new(LATCH_EMPTY),
+            owner: AtomicU64::new(0),
+            charged_ns: AtomicU64::new(0),
+        }
     }
-    let charged_ns = EXHAUSTION_CHARGED_NS.load(Ordering::Acquire);
-    let owner_task_id = EXHAUSTION_OWNER.load(Ordering::Relaxed);
-    EXHAUSTION_LATCHED.store(false, Ordering::Release);
-    Some((owner_task_id, charged_ns))
+
+    fn publish(&self, owner: u64, charged_ns: u64) {
+        if self.state.compare_exchange(
+            LATCH_EMPTY, LATCH_WRITING, Ordering::Acquire, Ordering::Relaxed,
+        ).is_err() {
+            return;
+        }
+        self.owner.store(owner, Ordering::Relaxed);
+        self.charged_ns.store(charged_ns, Ordering::Relaxed);
+        self.state.store(LATCH_READY, Ordering::Release);
+    }
+
+    fn take(&self) -> Option<(u64, u64)> {
+        self.state.compare_exchange(
+            LATCH_READY, LATCH_READING, Ordering::Acquire, Ordering::Relaxed,
+        ).ok()?;
+        let pair = (self.owner.load(Ordering::Relaxed), self.charged_ns.load(Ordering::Relaxed));
+        self.state.store(LATCH_EMPTY, Ordering::Release);
+        Some(pair)
+    }
+}
+
+static EXHAUSTION_LATCH: ExhaustionLatch = ExhaustionLatch::new();
+
+/// Latches the first exhaustion without writing to the debug sink in the
+/// scheduler guard. Later events remain counted in the runtime counter bank.
+pub(super) fn latch_budget_exhaustion(owner_task_id: u64, charged_ns: u64) {
+    EXHAUSTION_LATCH.publish(owner_task_id, charged_ns);
+}
+
+/// Takes the window's published exhaustion after releasing the scheduler guard.
+pub(super) fn take_latched_budget_exhaustion() -> Option<(u64, u64)> {
+    EXHAUSTION_LATCH.take()
 }
 
 fn saturating_add(counter: &AtomicU64, value: u64) {
@@ -682,6 +699,27 @@ impl SchedulingContext {
 #[cfg(test)]
 mod exhaustion_latch_tests {
     use super::{latch_budget_exhaustion, take_latched_budget_exhaustion};
+
+    #[test]
+    fn unpublished_or_reader_owned_latch_cannot_be_taken_or_overwritten() {
+        use super::{ExhaustionLatch, LATCH_EMPTY, LATCH_READING, LATCH_READY, LATCH_WRITING};
+        use core::sync::atomic::Ordering;
+
+        let latch = ExhaustionLatch::new();
+        latch.state.store(LATCH_WRITING, Ordering::Relaxed);
+        latch.owner.store(42, Ordering::Relaxed);
+        assert_eq!(latch.take(), None);
+        latch.publish(99, 99);
+        latch.charged_ns.store(7, Ordering::Relaxed);
+        latch.state.store(LATCH_READY, Ordering::Release);
+        assert_eq!(latch.take(), Some((42, 7)));
+        latch.state.store(LATCH_READING, Ordering::Relaxed);
+        latch.publish(99, 99);
+        assert_eq!(latch.state.load(Ordering::Relaxed), LATCH_READING);
+        latch.state.store(LATCH_EMPTY, Ordering::Release);
+        latch.publish(5, 6);
+        assert_eq!(latch.take(), Some((5, 6)));
+    }
 
     /// The latch exists so a budget exhaustion is never rendered to the debug
     /// sink from inside the global scheduler guard. It must therefore keep the

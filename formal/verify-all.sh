@@ -137,7 +137,7 @@ else
 fi
 run_parallel_lane kani env FORMAL_PROOF_INDEX_ALREADY_PASSED=1 bash formal/run-kani.sh
 run_parallel_lane verus env FORMAL_PROOF_INDEX_ALREADY_PASSED=1 bash formal/run-verus.sh
-# Skipped when its declared scope is unchanged; see formal/lane-cache.py.
+# Reuse the declared-input approximation; nightly re-audits without caching.
 run_parallel_lane concurrency-triangle python3 formal/lane-cache.py run concurrency-triangle -- \
     bash formal/run-concurrency-triangle.sh
 run_parallel_lane runtime-traces bash formal/run-runtime-traces.sh

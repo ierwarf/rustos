@@ -52,8 +52,7 @@ struct rustos_dvm_net_uio {
 
 static bool rustos_dvm_net_cursor_pair_valid(u32 producer, u32 consumer)
 {
-	return producer >= consumer &&
-	       producer - consumer <= RUSTOS_DVM_NET_SLOT_COUNT;
+	return producer - consumer <= RUSTOS_DVM_NET_SLOT_COUNT;
 }
 
 static int rustos_dvm_net_validate_aperture(struct pci_dev *pdev)

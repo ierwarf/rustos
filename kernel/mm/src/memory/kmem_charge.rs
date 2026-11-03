@@ -9,6 +9,8 @@
 //!   charge or refund is legal under any lock order and in drop glue. Admission
 //!   may let concurrent charges overshoot a limit transiently by the bytes in
 //!   flight (bounded by the CPU count times one object); refund never fails.
+//!   Overflow refuses a speculative charge; overflow of a forced charge is a
+//!   fatal invariant and never wraps the counter.
 //! - **Lifecycle:** a group stays valid after its job dies until usage drains
 //!   to zero, which the job layer waits for before reusing the slot, so a
 //!   late refund always finds the group it charged.
@@ -108,7 +110,12 @@ pub fn try_charge(class: Class, index: usize, bytes: u64) -> bool {
     let mut ok = true;
     for _ in 0..MAX_DEPTH {
         let Some(cell) = group(class, cursor) else { break };
-        let old = cell.usage.fetch_add(bytes, Ordering::Relaxed);
+        let Ok(old) = cell.usage.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |usage| {
+            usage.checked_add(bytes)
+        }) else {
+            ok = false;
+            break;
+        };
         visited[count] = Some(cell);
         count += 1;
         let limit = cell.limit.load(Ordering::Relaxed);
@@ -137,7 +144,10 @@ pub fn would_admit(class: Class, index: usize, bytes: u64) -> bool {
     for _ in 0..MAX_DEPTH {
         let Some(cell) = group(class, cursor) else { return true };
         let limit = cell.limit.load(Ordering::Relaxed);
-        if limit != UNLIMITED && cell.usage.load(Ordering::Relaxed).saturating_add(bytes) > limit {
+        let Some(total) = cell.usage.load(Ordering::Relaxed).checked_add(bytes) else {
+            return false;
+        };
+        if limit != UNLIMITED && total > limit {
             return false;
         }
         let parent = cell.parent.load(Ordering::Relaxed);
@@ -225,6 +235,7 @@ impl Meter {
 
     /// Takes over the binding and charge of `other`, leaving it unbound.
     pub fn adopt(&mut self, other: &mut Meter) {
+        assert_eq!(self.class, other.class, "cannot adopt a different kmem class");
         self.release();
         self.group = other.group.take();
         self.charged = core::mem::take(&mut other.charged);
@@ -261,7 +272,10 @@ pub fn charge_forced(class: Class, index: usize, bytes: u64) {
     let mut cursor = index;
     for _ in 0..MAX_DEPTH {
         let Some(cell) = group(class, cursor) else { return };
-        cell.usage.fetch_add(bytes, Ordering::Relaxed);
+        let updated = cell.usage.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |usage| {
+            usage.checked_add(bytes)
+        });
+        assert!(updated.is_ok(), "kmem charge group usage overflow");
         let parent = cell.parent.load(Ordering::Relaxed);
         if parent == NO_PARENT {
             return;
@@ -293,6 +307,8 @@ pub fn uncharge(class: Class, index: usize, bytes: u64) {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     use super::*;
     // Process-wide statics: every test owns distinct group indices.
     const C: Class = Class::HandleTable;
@@ -377,6 +393,34 @@ mod tests {
         assert_eq!(usage(Class::Vma, 48), 10);
         drop(heir);
         assert_eq!(usage(Class::Vma, 48), 0);
+    }
+
+    #[test]
+    fn overflowing_charge_is_refused_and_rolls_back_descendants() {
+        init_group(58, None);
+        init_group(59, Some(58));
+        assert!(try_charge(C, 58, u64::MAX));
+        assert!(!would_admit(C, 59, 1));
+        assert!(!try_charge(C, 59, 1));
+        let forced = std::panic::catch_unwind(|| charge_forced(C, 58, 1));
+        assert!(forced.is_err());
+        assert_eq!((usage(C, 59), usage(C, 58)), (0, u64::MAX));
+        uncharge(C, 58, u64::MAX);
+    }
+
+    #[test]
+    fn adopting_a_different_class_fails_before_releasing_either_meter() {
+        init_group(60, None);
+        let mut source = Meter::new(Class::Vma);
+        let mut target = Meter::new(Class::Thread);
+        assert!(source.bind(60, 2));
+        assert!(target.bind(60, 3));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            target.adopt(&mut source)
+        }));
+        assert!(result.is_err());
+        assert_eq!((source.charged(), target.charged()), (2, 3));
+        assert_eq!((usage(Class::Vma, 60), usage(Class::Thread, 60)), (2, 3));
     }
 
     #[test]

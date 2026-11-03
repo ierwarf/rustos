@@ -811,8 +811,9 @@ pub fn syscall_linux_epoll_ctl(epfd: u64, op: u64, fd: u64, event_ptr: u64) -> u
     if epfd == fd {
         return linux_errno(LINUX_EINVAL);
     }
-    let Some(epoll) = current_epoll_handle(epfd) else {
-        return linux_errno(LINUX_EINVAL);
+    let epoll = match epoll_handle_or_errno(epfd) {
+        Ok(epoll) => epoll,
+        Err(errno) => return linux_errno(errno),
     };
     let mut request = new_vfs_request(VFS_IPC_OP_POLL_QUERY);
     request.arg0 = VFS_POLL_QUERY_EPOLL_CTL;
@@ -906,6 +907,26 @@ pub fn syscall_linux_epoll_ctl(epfd: u64, op: u64, fd: u64, event_ptr: u64) -> u
     }
 }
 
+/// Linux reports a descriptor that is not open as EBADF and one that is open
+/// but not an epoll instance as EINVAL; runtimes branch on the difference.
+fn epoll_handle_or_errno(epfd: u64) -> Result<multitask::EpollHandle, i64> {
+    if let Some(epoll) = current_epoll_handle(epfd) {
+        return Ok(epoll);
+    }
+    let open = multitask::with_current_user_process_state(|_, _, process_state| {
+        process_state.handles().get(epfd).is_some()
+    })
+    .unwrap_or(false);
+    Err(if open { LINUX_EINVAL } else { LINUX_EBADF })
+}
+
+/// Names which `epoll_wait` exit produced an error: the same errno comes from
+/// several scan, registration and block-commit sites.
+fn epoll_wait_failed(site: u64, errno: i64) -> u64 {
+    debug::record_milestone(debug::LogCategory::Compat, "epoll-wait-failed", site, errno.unsigned_abs());
+    linux_errno(errno)
+}
+
 pub fn syscall_linux_epoll_wait(
     epfd: u64,
     events_ptr: u64,
@@ -916,16 +937,21 @@ pub fn syscall_linux_epoll_wait(
     let Ok(maxevents) = usize::try_from(maxevents as u32 as i32) else {
         return linux_errno(LINUX_EINVAL);
     };
-    if maxevents == 0 || maxevents > MAX_POLL_FDS {
+    // Linux's EP_MAX_EVENTS bound. Larger-than-interest-table counts are legal
+    // (libuv passes 1024) and are served in full by clamping: one wait can
+    // never report more than the table's interests.
+    if maxevents == 0 || maxevents > i32::MAX as usize / EPOLL_EVENT_SIZE {
         return linux_errno(LINUX_EINVAL);
     }
+    let maxevents = maxevents.min(MAX_POLL_FDS);
     if let Err(err) =
         usermem::validate_current_user_write_buffer(events_ptr, maxevents * EPOLL_EVENT_SIZE)
     {
         return linux_errno(address_space_error_to_linux_errno(err));
     }
-    let Some(epoll) = current_epoll_handle(epfd) else {
-        return linux_errno(LINUX_EINVAL);
+    let epoll = match epoll_handle_or_errno(epfd) {
+        Ok(epoll) => epoll,
+        Err(errno) => return linux_errno(errno),
     };
     let ticks_per_second = crate::arch::rtc::ticks_per_second().max(1);
     let deadline_tick = (timeout_ms >= 0).then(|| {
@@ -955,7 +981,7 @@ pub fn syscall_linux_epoll_wait(
                 multitask::cond_resched();
                 continue;
             }
-            Err(errno) => return linux_errno(errno),
+            Err(errno) => return epoll_wait_failed(1, errno),
         };
         if !first.ready.is_empty() {
             return write_epoll_ready_events(events_ptr, &first.ready);
@@ -980,7 +1006,7 @@ pub fn syscall_linux_epoll_wait(
             process_id,
             &first.observations,
         ) {
-            return linux_errno(errno);
+            return epoll_wait_failed(2, errno);
         }
 
         let second = match collect_epoll_readiness(epoll.token_id(), maxevents, deadline_tick, EpollScanMode::Consume) {
@@ -1006,7 +1032,7 @@ pub fn syscall_linux_epoll_wait(
             }
             Err(errno) => {
                 super::super::broker_ops::waitset_broker_ops::remove_waitset_waiters(task_id);
-                return linux_errno(errno);
+                return epoll_wait_failed(3, errno);
             }
         };
         if !second.ready.is_empty()
@@ -1021,7 +1047,7 @@ pub fn syscall_linux_epoll_wait(
         }
         if !multitask::arm_block_current_task() {
             super::super::broker_ops::waitset_broker_ops::remove_waitset_waiters(task_id);
-            return linux_errno(LINUX_EINVAL);
+            return epoll_wait_failed(4, LINUX_EINVAL);
         }
         if !super::super::broker_ops::waitset_broker_ops::waitset_waiters_match(
             task_id,
@@ -1049,7 +1075,7 @@ pub fn syscall_linux_epoll_wait(
             Some(false) => {}
             None => {
                 acknowledge_epoll_wait_block(task_id);
-                return linux_errno(LINUX_EINVAL);
+                return epoll_wait_failed(5, LINUX_EINVAL);
             }
         }
         acknowledge_epoll_wait_block(task_id);
@@ -1247,6 +1273,7 @@ fn collect_epoll_readiness(
         || count > WAITSET_MAX_INTERESTS
         || response.payload_len as usize != count.saturating_mul(WAITSET_SNAPSHOT_SIZE)
     {
+        debug::record_milestone(debug::LogCategory::Compat, "epoll-snapshot-bad-header", response.aux, ((count as u64) << 32) | u64::from(response.payload_len));
         return Err(LINUX_EINVAL);
     }
     let mut interests = Vec::with_capacity(count);
@@ -1254,6 +1281,7 @@ fn collect_epoll_readiness(
         let offset = index * WAITSET_SNAPSHOT_SIZE;
         let wire = decode_snapshot_entry(&response.payload[offset..offset + WAITSET_SNAPSHOT_SIZE]);
         if !waitset_snapshot_shape_valid(&wire) {
+            debug::record_milestone(debug::LogCategory::Compat, "epoll-snapshot-bad-entry", index as u64, (u64::from(wire.state) << 32) | u64::from(wire.interest.events));
             return Err(LINUX_EINVAL);
         }
         // A provider restart advances its endpoint epoch. Report the interest
@@ -1361,7 +1389,16 @@ fn collect_epoll_readiness(
                 revents: revoke_events,
                 generation: 1,
             },
-            Err(errno) => return Err(errno),
+            Err(errno) => {
+                crate::debug::info!(
+                    compat,
+                    "epoll provider query failed: provider={} object={:#x} errno={}",
+                    interest.provider,
+                    interest.object_id,
+                    errno
+                );
+                return Err(errno);
+            }
         });
     }
 
@@ -1519,6 +1556,7 @@ fn claim_epoll_reports(
         let response = call_vfs_ipc_request_with_timeout(&request, control::deadline_ms())?;
         ensure_vfs_status(&response)?;
         if response.payload_len as usize != chunk.len() || response.value > chunk.len() as u64 {
+            debug::record_milestone(debug::LogCategory::Compat, "epoll-claim-bad-reply", u64::from(response.payload_len), response.value);
             return Err(LINUX_EINVAL);
         }
         owned.extend(response.payload[..chunk.len()].iter().map(|flag| *flag != 0));

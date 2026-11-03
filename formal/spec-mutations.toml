@@ -17,6 +17,7 @@ required_models = [
     "atomic-process-activation-batch/AtomicProcessActivationBatch",
     "bootstrap-activation-handoff/BootstrapActivationHandoff",
     "capability-derivation-lifecycle/CapabilityDerivationLifecycle",
+    "child-wait-publication/ChildWaitPublication",
     "clocksource-deadline/ClocksourceDeadline",
     "cold-exec-intent/ColdExecIntent",
     "cow-frame-lifecycle/CowFrameLifecycle",
@@ -394,6 +395,18 @@ replace = "    /\\ TRUE"
 occurrence = 1
 invariant = "LiveChildIsAttenuatedAndExact"
 min_counterexample_states = 2
+
+[[mutation]]
+id = "child-wait-status-publication-omitted"
+kind = "transition-effect"
+severity = "high"
+model = "child-wait-publication/ChildWaitPublication"
+flow = "child-wait-publication"
+find = "Publish == /\\ producer = \"start\" /\\ status' = TRUE /\\ producer' = \"scan\""
+replace = "Publish == /\\ producer = \"start\" /\\ status' = FALSE /\\ producer' = \"scan\""
+occurrence = 1
+invariant = "NoLostWake"
+min_counterexample_states = 4
 
 [[mutation]]
 id = "clock-raw-tsc-smp-admission-guard-removed"

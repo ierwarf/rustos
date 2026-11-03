@@ -49,8 +49,9 @@ client -> UnixStream(/run/runtimed.sock) -> RuntimeRequest -> runtimed
 
 `notify_ui_ready()` is intentionally one-way and has no response payload.
 
-The protocol is fixed-size and C-layout oriented. Keep path-like request text
-under `MAX_REQUEST_PATH_BYTES`.
+The protocol is fixed-size and C-layout oriented. Path-like request text must
+be nonempty, at most `MAX_REQUEST_PATH_BYTES` bytes, and printable ASCII
+without backslashes.
 
 ### Registry Loading
 
@@ -106,8 +107,9 @@ client -> UnixStream(/run/runtimed.sock) -> RuntimeRequest -> runtimed
 
 `notify_ui_ready()`는 의도적으로 one-way이며 response payload가 없습니다.
 
-protocol은 fixed-size C-layout 중심입니다. path-like request text는
-`MAX_REQUEST_PATH_BYTES`보다 짧게 유지해야 합니다.
+protocol은 fixed-size C-layout 중심입니다. path-like request text는 비어 있지
+않은 printable ASCII여야 하고 backslash를 포함할 수 없으며,
+`MAX_REQUEST_PATH_BYTES` bytes 이하여야 합니다.
 
 ### Registry Loading
 

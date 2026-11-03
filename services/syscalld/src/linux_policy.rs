@@ -291,16 +291,16 @@ pub(crate) fn handle_setuid(
     let state = policy
         .entry(request.pid)
         .or_insert_with(|| initial_state(request));
-    if state.credentials.euid != 0
-        && state.credentials.uid != 0
-        && requested != state.credentials.uid
-        && requested != state.credentials.euid
-    {
-        response.status = errno::EACCES;
+    if state.credentials.euid == 0 {
+        state.credentials.uid = requested;
+        state.credentials.euid = requested;
+    } else if requested == state.credentials.uid || requested == state.credentials.euid {
+        // An unprivileged setuid changes only the effective identity.
+        state.credentials.euid = requested;
+    } else {
+        response.status = errno::EPERM;
         return;
     }
-    state.credentials.uid = requested;
-    state.credentials.euid = requested;
     response.status = 0;
     response.payload_len = 0;
 }
@@ -314,16 +314,15 @@ pub(crate) fn handle_setgid(
     let state = policy
         .entry(request.pid)
         .or_insert_with(|| initial_state(request));
-    if state.credentials.euid != 0
-        && state.credentials.uid != 0
-        && requested != state.credentials.gid
-        && requested != state.credentials.egid
-    {
-        response.status = errno::EACCES;
+    if state.credentials.euid == 0 {
+        state.credentials.gid = requested;
+        state.credentials.egid = requested;
+    } else if requested == state.credentials.gid || requested == state.credentials.egid {
+        state.credentials.egid = requested;
+    } else {
+        response.status = errno::EPERM;
         return;
     }
-    state.credentials.gid = requested;
-    state.credentials.egid = requested;
     response.status = 0;
     response.payload_len = 0;
 }
@@ -1434,7 +1433,7 @@ mod tests {
             ..LinuxSyscallOffloadRequest::default()
         };
         handle_setuid(&request, &mut response);
-        assert_eq!(response.status, errno::EACCES);
+        assert_eq!(response.status, errno::EPERM);
 
         let request = LinuxSyscallOffloadRequest {
             pid: 101,
@@ -1444,7 +1443,25 @@ mod tests {
             ..LinuxSyscallOffloadRequest::default()
         };
         handle_setuid(&request, &mut response);
+        assert_eq!(response.status, errno::EPERM);
+    }
+
+    #[test]
+    fn unprivileged_identity_changes_do_not_overwrite_real_ids() {
+        let pid = u64::MAX - 31;
+        let request = LinuxSyscallOffloadRequest {
+            pid, uid: 1000, euid: 2000, gid: 100, egid: 200,
+            mask: 2000, ..LinuxSyscallOffloadRequest::default()
+        };
+        let mut response = LinuxSyscallOffloadResponse::default();
+        handle_setuid(&request, &mut response);
         assert_eq!(response.status, 0);
+        handle_setgid(&LinuxSyscallOffloadRequest { mask: 200, ..request }, &mut response);
+        assert_eq!(response.status, 0);
+        let policy = policy_db().lock();
+        let credentials = policy.get(&pid).unwrap().credentials;
+        assert_eq!((credentials.uid, credentials.euid), (1000, 2000));
+        assert_eq!((credentials.gid, credentials.egid), (100, 200));
     }
 
     #[test]

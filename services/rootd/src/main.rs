@@ -511,7 +511,19 @@ fn spawn_core_service_without_wait(lease: &mut Lease) {
 fn spawn_tracked_with_attempts(lease: &mut Lease, max_attempts: u32) -> Result<(), i64> {
     let mut last_errno = 11;
     let mut attempt = 0;
+    let mut retirement_pending = false;
     while attempt < max_attempts {
+        if retirement_pending {
+            match job_lease::retire(lease) {
+                Ok(()) => retirement_pending = false,
+                Err(11) => {
+                    attempt += 1;
+                    yield_now();
+                    continue;
+                }
+                Err(errno) => return Err(errno),
+            }
+        }
         let job_handle = job_lease::ensure(lease)?;
         match spawn_exec(lease.exec_path, lease.weight_micros, job_handle, lease.service_id) {
             Ok(pid) => {
@@ -524,7 +536,8 @@ fn spawn_tracked_with_attempts(lease: &mut Lease, max_attempts: u32) -> Result<(
             Err(errno) => {
                 last_errno = errno;
                 match job_lease::retire(lease) {
-                    Ok(()) | Err(11) => {}
+                    Ok(()) => {}
+                    Err(11) => retirement_pending = true,
                     Err(errno) => return Err(errno),
                 }
                 yield_now();
@@ -567,7 +580,21 @@ fn spawn_initd_via_loaderd(
     service_checkpoints: &mut ServiceCheckpointStore,
 ) {
     let mut attempts = 0_u64;
+    let mut retirement_pending = false;
     while attempts < INITD_SPAWN_MAX_ATTEMPTS as u64 {
+        if retirement_pending {
+            match job_lease::retire(&mut leases[INITD_LEASE_INDEX]) {
+                Ok(()) => retirement_pending = false,
+                Err(11) => {
+                    attempts += 1;
+                    drain_lifecycle_events(leases, post_init_leases, service_checkpoints);
+                    serve_rootd_once(endpoint, leases, post_init_leases, service_checkpoints, false, None);
+                    yield_now();
+                    continue;
+                }
+                Err(_) => fail_closed(b"rootd: fatal failed initd job retirement\n"),
+            }
+        }
         let realm_ready = loader_realm::configure_ready(
             endpoint, leases, post_init_leases, service_checkpoints,
         );
@@ -609,7 +636,8 @@ fn spawn_initd_via_loaderd(
                 // A lost reply may hide a published child. Kill the complete
                 // attempt before lending fresh placement authority on retry.
                 match job_lease::retire(&mut leases[INITD_LEASE_INDEX]) {
-                    Ok(()) | Err(11) => {}
+                    Ok(()) => {}
+                    Err(11) => retirement_pending = true,
                     Err(_) => fail_closed(b"rootd: fatal failed initd job retirement\n"),
                 }
                 attempts = attempts.saturating_add(1);

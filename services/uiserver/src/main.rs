@@ -727,7 +727,12 @@ fn run() -> Result<(), i32> {
         let now = wayland_started;
         let service_wayland = !input.backlog_remaining || now >= next_wayland_backlog_service;
         watchdog.enter(UI_PHASE_WAYLAND);
-        let callback_due = wayland_callback_pending
+        // No frame callback before the display provider has presented once: a
+        // client reports its "first frame" on that callback, and the product
+        // first-frame evidence must not precede the display it names.
+        let display_presented = state.display_has_presented();
+        let callback_due = display_presented
+            && wayland_callback_pending
             && (wayland_frame_permit || now >= next_wayland_callback_pulse);
         let protocol_input = wayland.has_pending_protocol_input();
         if service_wayland
@@ -748,14 +753,16 @@ fn run() -> Result<(), i32> {
             }
             let frame_callback_rect = wayland.pending_frame_callback_rect();
             wayland_callback_pending = !frame_callback_rect.is_empty();
-            let callback_only = pending_update.is_empty() && !frame_callback_rect.is_empty();
+            let callback_only =
+                display_presented && pending_update.is_empty() && !frame_callback_rect.is_empty();
             if callback_only {
                 log_wayland_callback_only(&state, frame_callback_rect);
             }
             let callback_now = Instant::now();
             let callback_only_cadence_permit =
                 callback_only && callback_now >= next_wayland_callback_pulse;
-            if !frame_callback_rect.is_empty()
+            if display_presented
+                && !frame_callback_rect.is_empty()
                 && (wayland_frame_permit || callback_only_cadence_permit)
             {
                 wayland.consume_frame_callback_permit();
@@ -1074,7 +1081,11 @@ fn run() -> Result<(), i32> {
                 .min(next_console_poll)
                 .min(next_cursor_blink)
                 .min(now + RUNTIME_POLL_SLEEP);
-            if wayland_callback_pending {
+            // Before the display has presented, the callback pulse cannot fire
+            // (the tick withholds callbacks), and its deadline stays in the
+            // past: sleeping on it would turn the wait for the first present
+            // into a busy loop. The runtime poll deadline still bounds the sleep.
+            if wayland_callback_pending && state.display_has_presented() {
                 // Input readiness remains the primary wake source, but a
                 // callback-only client must never sleep past its compositor
                 // clock merely because no input or runtime poll is pending.

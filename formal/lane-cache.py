@@ -1,15 +1,10 @@
 #!/usr/bin/env python3
-"""Skip a formal lane whose declared inputs are unchanged, and prove the declaration.
+"""Reuse a sandboxed concurrency pass under a declared, bounded action key.
 
-    lane-cache.py run LANE -- COMMAND...
-
-The key covers the command, the Rust toolchain, and the bytes of every
-git-tracked file in the lane's declared scope (formal/lane-scopes.toml). On a
-hit the recorded log is replayed and the lane's artifacts are re-verified by
-digest; on a miss the lane runs inside a bubblewrap sandbox that exposes only
-the scope, so an undeclared read fails the lane rather than weakening the key.
-Without bubblewrap the lane still runs, but its result is not stored.
-RUSTOS_WITNESS_CACHE=off (nightly) forces a real run and stores nothing stale.
+The checkout scope, complete environment, command, execution-tool identities,
+herd model library and artifacts are keyed. This is still an approximation:
+writable Cargo caches, system libraries and other host files are observable.
+Nightly disables reuse to re-audit those unbound host inputs.
 """
 
 from __future__ import annotations
@@ -95,6 +90,54 @@ def sandboxed(command: list[str], files: set[Path], writable: list[str] = ()) ->
     return args + ["--chdir", str(ROOT), *command]
 
 
+def tool_inputs() -> dict[str, str]:
+    """Bind executable bytes and the actual herd model library used by the lane."""
+    tools = ("bash", "python3", "cargo", "rustc", "rustup", "git", "rg", "jq",
+             "sha256sum", "timeout", "sort", "xargs", "wc", "bwrap")
+    result = {}
+    for name in tools:
+        resolved = shutil.which(name)
+        if not resolved:
+            raise ValueError(f"missing cache tool: {name}")
+        path = Path(resolved).resolve()
+        result[name] = str(path) + ":" + hashlib.sha256(path.read_bytes()).hexdigest()
+    result["rustc-version"] = subprocess.check_output(["rustc", "-Vv"], text=True)
+    result["cargo-version"] = subprocess.check_output(["cargo", "-Vv"], text=True)
+    sysroot = Path(subprocess.check_output(["rustc", "--print", "sysroot"], text=True).strip())
+    for name in ("rustc", "cargo"):
+        path = sysroot / "bin" / name
+        if not path.is_file():
+            raise ValueError(f"missing toolchain binary: {path}")
+        result[f"toolchain-{name}"] = hashlib.sha256(path.read_bytes()).hexdigest()
+    lock = tomllib.loads((HERE / "herdtools.lock").read_text())
+    canonical = ROOT / "build/formal/tools" / f"herdtools7-{lock['version']}" / "usr/bin/herd7"
+    herd = os.environ.get("HERD7") or (str(canonical) if os.access(canonical, os.X_OK) else shutil.which("herd7"))
+    if not herd:
+        raise ValueError("herd7 unavailable")
+    herd_path = Path(herd).resolve()
+    result["herd7"] = str(herd_path) + ":" + hashlib.sha256(herd_path.read_bytes()).hexdigest()
+    libdir = Path(subprocess.check_output([herd, "-libdir"], text=True).strip())
+    if not libdir.is_dir():
+        libdir = ROOT / "build/formal/tools" / f"herdtools7-{lock['version']}-source/herd/libdir"
+    if not libdir.is_dir():
+        raise ValueError("herd7 library unavailable")
+    h = hashlib.sha256()
+    for path in sorted(libdir.rglob("*")):
+        if path.is_file():
+            h.update(path.relative_to(libdir).as_posix().encode() + b"\0" + path.read_bytes() + b"\0")
+    result["herd-libdir"] = str(libdir.resolve()) + ":" + h.hexdigest()
+    return result
+
+
+def action_key(lane: str, command: list[str], environment: dict[str, str],
+               tools: dict[str, str], inputs: str) -> str:
+    return hashlib.sha256(
+        json.dumps({"schema": 2, "lane": lane, "cmd": command,
+                    "environment": environment, "tools": tools}, sort_keys=True).encode()
+        + inputs.encode()
+    ).hexdigest()
+
+
 def main() -> int:
     if len(sys.argv) < 4 or sys.argv[1] != "run" or "--" not in sys.argv:
         print(__doc__, file=sys.stderr)
@@ -103,11 +146,12 @@ def main() -> int:
     command = sys.argv[sys.argv.index("--") + 1:]
     spec = tomllib.loads((HERE / "lane-scopes.toml").read_text())["lane"][lane]
     files, _ = scope(spec)
-    toolchain = subprocess.run(["rustc", "-Vv"], capture_output=True, text=True, cwd=ROOT).stdout
-    key = hashlib.sha256(
-        json.dumps({"lane": lane, "cmd": command, "toolchain": toolchain}).encode()
-        + digest_files(files).encode()
-    ).hexdigest()
+    try:
+        tools = tool_inputs()
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        print(f"lane {lane}: cannot bind tools ({error}); running without cache", file=sys.stderr)
+        return subprocess.run(command, cwd=ROOT).returncode
+    key = action_key(lane, command, dict(os.environ), tools, digest_files(files))
     STORE.mkdir(parents=True, exist_ok=True)
     entry = STORE / f"{lane}.json"
     off = os.environ.get("RUSTOS_WITNESS_CACHE") == "off"

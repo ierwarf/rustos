@@ -45,7 +45,7 @@ fn log_block_broker_rejection(stage: &str, args: &RustosBlockBrokerArgs) {
     let (pid, tid) = multitask::current_user_log_ids().unwrap_or((0, 0));
     nucleus_core::debug::write_debugcon_only_line(
         alloc::format!(
-            "dvm-block: broker rejected stage={} count={} pid={} tid={} op={} abi={} expected={} flags={:#x} reserved={:#x} lba={} blocks={} buffer={:#x}/{} timeout_ms={} ticket={}:{} out_ticket={:#x} out_info={:#x}",
+            "dvm-block: broker rejected stage={} count={} pid={} tid={} op={} abi={} expected={} flags={:#x} expected_generation={} lba={} blocks={} buffer={:#x}/{} timeout_ms={} ticket={}:{} out_ticket={:#x} out_info={:#x}",
             stage,
             count,
             pid,
@@ -54,7 +54,7 @@ fn log_block_broker_rejection(stage: &str, args: &RustosBlockBrokerArgs) {
             args.abi_version,
             BLOCK_BROKER_ABI_VERSION,
             args.flags,
-            args.reserved0,
+            args.expected_generation,
             args.lba,
             args.block_count,
             args.buffer_ptr,
@@ -75,7 +75,7 @@ pub(super) fn syscall_linux_rustos_block_broker(args_ptr: u64) -> u64 {
         Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
     };
     if args.abi_version != BLOCK_BROKER_ABI_VERSION
-        || args.reserved0 != 0
+        || !submission_generation_shape_valid(args.op, args.expected_generation)
         || args.flags & !BLOCK_BROKER_KNOWN_FLAGS != 0
     {
         log_block_broker_rejection("envelope", &args);
@@ -113,6 +113,16 @@ pub(super) fn syscall_linux_rustos_block_broker(args_ptr: u64) -> u64 {
             broker_dvm(&args)
         }
         _ => linux_errno(LINUX_EINVAL),
+    }
+}
+
+fn submission_generation_shape_valid(op: u16, expected_generation: u64) -> bool {
+    match op {
+        BLOCK_BROKER_OP_DVM_SUBMIT_READ | BLOCK_BROKER_OP_DVM_SUBMIT_WRITE
+        | BLOCK_BROKER_OP_DVM_SUBMIT_FLUSH => expected_generation != 0,
+        BLOCK_BROKER_OP_DVM_INFO | BLOCK_BROKER_OP_DVM_COLLECT
+        | BLOCK_BROKER_OP_DVM_CANCEL | BLOCK_BROKER_OP_DVM_WAIT => expected_generation == 0,
+        _ => false,
     }
 }
 
@@ -187,6 +197,9 @@ fn broker_dvm_submit(args: &RustosBlockBrokerArgs, write: bool) -> Result<u64, i
         return Err(LINUX_EINVAL);
     }
     let info = block_api::dvm_info().map_err(dvm_error_to_linux_errno)?;
+    if info.generation != args.expected_generation {
+        return Err(LINUX_ESTALE);
+    }
     let (sector, byte_len) =
         checked_dvm_range(args, info.logical_block_size, info.capacity_sectors)?;
     let ticket = if write {
@@ -197,9 +210,9 @@ fn broker_dvm_submit(args: &RustosBlockBrokerArgs, write: bool) -> Result<u64, i
         bytes.resize(byte_len, 0);
         usermem::copy_from_current_user_exact(args.buffer_ptr, &mut bytes)
             .map_err(address_space_error_to_linux_errno)?;
-        block_api::submit_dvm_write(sector, &bytes, args.flags & BLOCK_BROKER_FLAG_FUA != 0)
+        block_api::submit_dvm_write(args.expected_generation, sector, &bytes, args.flags & BLOCK_BROKER_FLAG_FUA != 0)
     } else {
-        block_api::submit_dvm_read(sector, u32::try_from(byte_len).map_err(|_| LINUX_EINVAL)?)
+        block_api::submit_dvm_read(args.expected_generation, sector, u32::try_from(byte_len).map_err(|_| LINUX_EINVAL)?)
     }
     .map_err(dvm_error_to_linux_errno)?;
     write_dvm_ticket(args.out_ticket_ptr, ticket).inspect_err(|_| {
@@ -221,7 +234,7 @@ fn broker_dvm_flush(args: &RustosBlockBrokerArgs) -> Result<u64, i64> {
     {
         return Err(LINUX_EINVAL);
     }
-    let ticket = block_api::submit_dvm_flush().map_err(dvm_error_to_linux_errno)?;
+    let ticket = block_api::submit_dvm_flush(args.expected_generation).map_err(dvm_error_to_linux_errno)?;
     write_dvm_ticket(args.out_ticket_ptr, ticket).inspect_err(|_| {
         let _ = block_api::cancel_dvm(ticket);
     })?;
@@ -437,5 +450,23 @@ fn dvm_error_to_linux_errno(error: DvmBlockError) -> i64 {
         DvmBlockError::Revoked => LINUX_ESTALE,
         DvmBlockError::Unsupported => LINUX_ENOSYS,
         DvmBlockError::Cancelled => LINUX_EINTR,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn submissions_require_an_epoch_and_other_operations_refuse_one() {
+        for op in [BLOCK_BROKER_OP_DVM_SUBMIT_READ, BLOCK_BROKER_OP_DVM_SUBMIT_WRITE, BLOCK_BROKER_OP_DVM_SUBMIT_FLUSH] {
+            assert!(!submission_generation_shape_valid(op, 0));
+            assert!(submission_generation_shape_valid(op, 7));
+        }
+        for op in [BLOCK_BROKER_OP_DVM_INFO, BLOCK_BROKER_OP_DVM_COLLECT, BLOCK_BROKER_OP_DVM_CANCEL, BLOCK_BROKER_OP_DVM_WAIT] {
+            assert!(submission_generation_shape_valid(op, 0));
+            assert!(!submission_generation_shape_valid(op, 7));
+        }
+        assert!(!submission_generation_shape_valid(u16::MAX, 0));
     }
 }

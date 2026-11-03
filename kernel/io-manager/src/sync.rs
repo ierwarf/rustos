@@ -2,7 +2,7 @@ use core::cell::UnsafeCell;
 use core::hint::spin_loop;
 use core::ops::{Deref, DerefMut};
 use core::panic::Location;
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 
 use spin::Mutex as RawSpinMutex;
 use x86_64::instructions::interrupts;
@@ -31,9 +31,7 @@ pub(crate) struct KernelWaitLock<T: ?Sized, const CLASS: u8> {
     state: AtomicUsize,
     owner: AtomicUsize,
     owner_depth: AtomicUsize,
-    owner_acquire_file_ptr: AtomicUsize,
-    owner_acquire_file_len: AtomicUsize,
-    owner_acquire_line: AtomicUsize,
+    owner_acquire_site: AtomicPtr<Location<'static>>,
     owner_acquire_tsc: AtomicU64,
     waiters: RawSpinMutex<WaitQueue>,
     value: UnsafeCell<T>,
@@ -111,9 +109,7 @@ impl<T, const CLASS: u8> KernelWaitLock<T, CLASS> {
             state: AtomicUsize::new(UNLOCKED),
             owner: AtomicUsize::new(0),
             owner_depth: AtomicUsize::new(0),
-            owner_acquire_file_ptr: AtomicUsize::new(0),
-            owner_acquire_file_len: AtomicUsize::new(0),
-            owner_acquire_line: AtomicUsize::new(0),
+            owner_acquire_site: AtomicPtr::new(core::ptr::null_mut()),
             owner_acquire_tsc: AtomicU64::new(0),
             waiters: RawSpinMutex::new(WaitQueue::new()),
             value: UnsafeCell::new(value),
@@ -310,6 +306,13 @@ impl<T: ?Sized, const CLASS: u8> KernelWaitLock<T, CLASS> {
     }
 
     fn wake_waiter(&self) {
+        // IRQ-context try_lock guards also wake on drop. Prevent such an IRQ
+        // from interrupting a task while it holds the same raw waiter lock.
+        #[cfg(all(rustos_boot_image, not(test)))]
+        interrupts::without_interrupts(|| {
+            wake_first_live_waiter(&self.waiters, crate::multitask::wake_task);
+        });
+        #[cfg(any(not(rustos_boot_image), test))]
         wake_first_live_waiter(&self.waiters, crate::multitask::wake_task);
     }
 
@@ -326,13 +329,8 @@ impl<T: ?Sized, const CLASS: u8> KernelWaitLock<T, CLASS> {
         acquire_site: &'static Location<'static>,
         acquire_tsc: u64,
     ) {
-        let file = acquire_site.file();
-        self.owner_acquire_file_len
-            .store(file.len(), Ordering::Release);
-        self.owner_acquire_line
-            .store(acquire_site.line() as usize, Ordering::Release);
-        self.owner_acquire_file_ptr
-            .store(file.as_ptr() as usize, Ordering::Release);
+        self.owner_acquire_site
+            .store(core::ptr::from_ref(acquire_site).cast_mut(), Ordering::Release);
         self.owner_acquire_tsc.store(acquire_tsc, Ordering::Release);
         self.owner_depth.store(1, Ordering::Release);
         self.owner.store(owner, Ordering::Release);
@@ -341,9 +339,7 @@ impl<T: ?Sized, const CLASS: u8> KernelWaitLock<T, CLASS> {
     fn clear_owner(&self) {
         self.owner.store(0, Ordering::Release);
         self.owner_depth.store(0, Ordering::Release);
-        self.owner_acquire_file_ptr.store(0, Ordering::Release);
-        self.owner_acquire_file_len.store(0, Ordering::Release);
-        self.owner_acquire_line.store(0, Ordering::Release);
+        self.owner_acquire_site.store(core::ptr::null_mut(), Ordering::Release);
         self.owner_acquire_tsc.store(0, Ordering::Release);
     }
 
@@ -368,16 +364,15 @@ impl<T: ?Sized, const CLASS: u8> KernelWaitLock<T, CLASS> {
     }
 
     fn owner_acquire_site(&self) -> (&'static str, usize) {
-        let ptr = self.owner_acquire_file_ptr.load(Ordering::Acquire);
-        let len = self.owner_acquire_file_len.load(Ordering::Acquire);
-        let line = self.owner_acquire_line.load(Ordering::Acquire);
-        if ptr == 0 || len == 0 {
-            return ("<unknown>", line);
+        let ptr = self.owner_acquire_site.load(Ordering::Acquire);
+        if ptr.is_null() {
+            return ("<unknown>", 0);
         }
-        let file = unsafe {
-            core::str::from_utf8_unchecked(core::slice::from_raw_parts(ptr as *const u8, len))
-        };
-        (file, line)
+        // Each published pointer refers to a static caller location. Reading
+        // it atomically keeps its file and line together even across unlock
+        // and a concurrent acquisition at a different call site.
+        let site = unsafe { &*ptr };
+        (site.file(), site.line() as usize)
     }
 }
 
@@ -591,6 +586,16 @@ fn current_lock_owner_token() -> usize {
 #[cfg(test)]
 mod tests {
     use super::{RawSpinMutex, WaitQueue, wake_first_live_waiter};
+
+    #[test]
+    fn wait_lock_owner_site_is_published_and_cleared_as_one_location() {
+        let lock = super::KernelWaitLock::<(), 0>::new(());
+        let site = core::panic::Location::caller();
+        lock.record_owner_metadata(1, site, 1);
+        assert_eq!(lock.owner_acquire_site(), (site.file(), site.line() as usize));
+        lock.clear_owner();
+        assert_eq!(lock.owner_acquire_site(), ("<unknown>", 0));
+    }
 
     #[test]
     fn wait_lock_unlock_skips_retired_front_waiters() {

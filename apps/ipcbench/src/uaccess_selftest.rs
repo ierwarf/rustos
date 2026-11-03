@@ -90,9 +90,9 @@ fn cow_copyout(endpoint: u64) -> bool {
     let status = call(endpoint, (&request as *const BenchMsg) as u64, page as u64);
     let echoed = unsafe { std::ptr::read_volatile(page.cast::<BenchMsg>()) };
     let mut child_status = 0;
-    unsafe { libc::waitpid(pid, &mut child_status, 0) };
+    let waited = unsafe { crate::wait_child(pid, &mut child_status) };
     unsafe { libc::munmap(mapping, PAGE) };
-    let child_ok = libc::WIFEXITED(child_status) && libc::WEXITSTATUS(child_status) == 0;
+    let child_ok = waited.is_ok() && libc::WIFEXITED(child_status) && libc::WEXITSTATUS(child_status) == 0;
     if !(status == MSG as i64 && echoed.seq == request.seq && child_ok) {
         return fail("cow-copyout", (status, echoed.seq, child_status));
     }
@@ -124,6 +124,7 @@ fn remap_race(endpoint: u64) -> bool {
     }
     let base = region as usize;
     let done = AtomicBool::new(false);
+    let remap_failed = AtomicBool::new(false);
     let mut ok = true;
     let mut calls = 0_u32;
     thread::scope(|scope| {
@@ -132,15 +133,19 @@ fn remap_race(endpoint: u64) -> bool {
             // unbounded storm would leave its backlog to the benchmark that follows.
             for _ in 0..48 {
                 unsafe {
-                    libc::munmap(base as *mut libc::c_void, PAGE);
-                    libc::mmap(
-                        base as *mut libc::c_void,
-                        PAGE,
-                        libc::PROT_READ | libc::PROT_WRITE,
-                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED,
-                        -1,
-                        0,
-                    );
+                    if libc::munmap(base as *mut libc::c_void, PAGE) != 0
+                        || libc::mmap(
+                            base as *mut libc::c_void,
+                            PAGE,
+                            libc::PROT_READ | libc::PROT_WRITE,
+                            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_FIXED,
+                            -1,
+                            0,
+                        ) != base as *mut libc::c_void
+                    {
+                        remap_failed.store(true, Ordering::Release);
+                        break;
+                    }
                     libc::usleep(300);
                 }
             }
@@ -157,7 +162,7 @@ fn remap_race(endpoint: u64) -> bool {
         }
     });
     unsafe { libc::munmap(region, PAGE) };
-    ok
+    ok && !remap_failed.load(Ordering::Acquire) && (calls > 0 || fail("race-no-calls", calls))
 }
 
 pub(crate) fn run() -> bool {
@@ -167,10 +172,10 @@ pub(crate) fn run() -> bool {
     }
     let endpoint = endpoint as u64;
     let server = thread::spawn(move || bench_server(endpoint));
-    let ok = cow_copyout(endpoint);
+    let ok = fault_recovery(endpoint) && cow_copyout(endpoint) && remap_race(endpoint);
     let stop = BenchMsg { op: BENCH_OP_STOP, seq: 0 };
     let mut reply = BenchMsg::default();
     call(endpoint, (&stop as *const BenchMsg) as u64, (&mut reply as *mut BenchMsg) as u64);
-    let _ = server.join();
-    ok
+    let joined = server.join().is_ok();
+    ok && joined
 }

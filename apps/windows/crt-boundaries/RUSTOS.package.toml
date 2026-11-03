@@ -1,0 +1,12 @@
+id = "crt-boundaries"
+kind = "app"
+execution_domain = "user"
+startup = "none"
+
+[build]
+builder = "mingw-c-exe"
+source = "main.c"
+extra_args = ["-fno-builtin"]
+
+[install]
+path = "apps/windows/crt-boundaries/crt-boundaries.exe"

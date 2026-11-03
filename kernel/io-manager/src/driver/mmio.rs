@@ -22,6 +22,7 @@ use crate::sync::KernelWaitLock;
 use x86_64::structures::paging::PageTableFlags;
 
 const PAGE_4KIB: u64 = 4096;
+const WINDOW_PAGE_BYTES: u64 = 2 * 1024 * 1024;
 const DIRECT_MAP_CACHE_FLAG_MASK: PageTableFlags = PageTableFlags::from_bits_retain(
     PageTableFlags::NO_CACHE.bits()
         | PageTableFlags::WRITE_THROUGH.bits()
@@ -121,15 +122,17 @@ fn map_with_cache_mode(phys_start: u64, size: usize, cache_mode: MmioCacheMode) 
         mapping.refcount = next_refcount;
         return mapping.virt_start as *mut c_void;
     }
-    // Exact same-range/same-mode reuse returned above. Reject every other
-    // physical overlap, even with the same cache mode: partial aliases make
-    // last-unmap restoration dependent on page-granular ownership and permit
-    // one caller to outlive another caller's admitted interval.
-    if registry
-        .mappings
-        .iter()
-        .any(|mapping| physical_ranges_overlap(mapping.phys_start, mapping.size, phys_start, size))
-    {
+    // Exact same-range/same-mode reuse returned above. Reject every other byte
+    // overlap, and reject a page overlap (2 MiB leaf in the high window) when
+    // the cache modes differ: the leaf would then carry one attribute over
+    // another mapping's bytes. Byte-disjoint ranges that share a page or leaf
+    // and a cache mode are ordinary adjacent PCI BARs; each gets its own
+    // virtual slot, so they alias harmlessly and unmap independently.
+    if registry.mappings.iter().any(|mapping| {
+        physical_ranges_overlap(mapping.phys_start, mapping.size, phys_start, size)
+            || (mapping.cache_mode != cache_mode
+                && physical_pages_overlap(mapping.phys_start, mapping.size, phys_start, size))
+    }) {
         return core::ptr::null_mut();
     }
     // Reserve publication metadata before changing any PTE or allocating a
@@ -395,6 +398,34 @@ fn physical_ranges_overlap(
     left_start < right_end && right_start < left_end
 }
 
+fn physical_pages_overlap(
+    left_start: u64,
+    left_size: usize,
+    right_start: u64,
+    right_size: usize,
+) -> bool {
+    if left_size == 0 || right_size == 0 {
+        return false;
+    }
+    let Some(left_last) = left_start.checked_add((left_size - 1) as u64) else {
+        return true;
+    };
+    let Some(right_last) = right_start.checked_add((right_size - 1) as u64) else {
+        return true;
+    };
+    // The high MMIO window maps 2 MiB leaves, unlike the direct map's
+    // potentially split 4 KiB leaves. Enforce the wider actual alias span.
+    let granularity = if left_start >= crate::memory::kernel_vm::DIRECT_MAP_PHYS_LIMIT
+        || right_start >= crate::memory::kernel_vm::DIRECT_MAP_PHYS_LIMIT
+    {
+        WINDOW_PAGE_BYTES
+    } else {
+        PAGE_4KIB
+    };
+    align_down(left_start, granularity) <= align_down(right_last, granularity)
+        && align_down(right_start, granularity) <= align_down(left_last, granularity)
+}
+
 const fn physical_range_straddles_direct_map_limit(start: u64, end_exclusive: u64) -> bool {
     start < crate::memory::kernel_vm::DIRECT_MAP_PHYS_LIMIT
         && end_exclusive > crate::memory::kernel_vm::DIRECT_MAP_PHYS_LIMIT
@@ -470,20 +501,40 @@ mod tests {
 
     #[test]
     fn overlapping_physical_ranges_reject_mixed_cache_modes() {
-        assert!(physical_ranges_overlap(
+        assert!(physical_pages_overlap(
             0x20_0000, 0x20_0000, 0x30_0000, 0x1000,
         ));
-        assert!(physical_ranges_overlap(
+        assert!(physical_pages_overlap(
             0x30_0000, 0x1000, 0x20_0000, 0x20_0000,
         ));
-        assert!(!physical_ranges_overlap(
+        assert!(!physical_pages_overlap(
             0x20_0000, 0x10_0000, 0x30_0000, 0x1000,
         ));
-        assert!(physical_ranges_overlap(
+        assert!(physical_pages_overlap(
             0x20_0000, 0x20_0000, 0x30_0000, 0x1000,
         ));
 
+        // Disjoint byte intervals still alias when their PTEs cover one page.
+        assert!(physical_pages_overlap(0x1000, 1, 0x1fff, 1));
+        assert!(!physical_pages_overlap(0x1000, 1, 0x2000, 1));
+        assert!(physical_pages_overlap(u64::MAX, 2, 0, 1));
+
+        // Adjacent BARs in one 2 MiB leaf are byte-disjoint: only a cache-mode
+        // mismatch makes the shared leaf a hazard.
+        let bar = crate::memory::kernel_vm::DIRECT_MAP_PHYS_LIMIT + 0x20_0000;
+        assert!(!physical_ranges_overlap(bar, 0x8_0000, bar + 0x8_0000, 0x2_0000));
+        // Byte overlap is detected from either side, and an unrepresentable end
+        // is treated as overlapping.
+        assert!(physical_ranges_overlap(bar, 0x8_0000, bar + 0x4_0000, 0x2_0000));
+        assert!(physical_ranges_overlap(bar + 0x4_0000, 0x2_0000, bar, 0x8_0000));
+        assert!(physical_ranges_overlap(bar, 0x8_0000, bar, 0x1000));
+        assert!(!physical_ranges_overlap(bar, 0, bar, 0x1000));
+        assert!(physical_ranges_overlap(u64::MAX, 2, 0, 1));
+        assert!(physical_pages_overlap(bar, 0x8_0000, bar + 0x8_0000, 0x2_0000));
+
         let limit = crate::memory::kernel_vm::DIRECT_MAP_PHYS_LIMIT;
+        assert!(physical_pages_overlap(limit, 1, limit + PAGE_4KIB, 1));
+        assert!(!physical_pages_overlap(limit, 1, limit + WINDOW_PAGE_BYTES, 1));
         assert!(physical_range_straddles_direct_map_limit(
             limit - PAGE_4KIB,
             limit + PAGE_4KIB

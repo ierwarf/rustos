@@ -40,19 +40,29 @@ fn enqueue_refund(token:u64)->Result<(),i32>{
     q.push_back(token);
     Ok(())
 }
+fn settle_refund_front(q:&mut VecDeque<u64>,token:u64,success:bool) {
+    if q.front()!=Some(&token) { return; }
+    if success { q.pop_front(); } else { q.rotate_left(1); }
+}
 fn refund_worker() {
     loop {
+        // Keep the in-flight token in the bounded queue until settlement.
+        // Otherwise concurrent enqueues can fill its vacated slot and a failed
+        // retry silently loses the only outstanding refund obligation.
         let token=pending_refunds().lock().ok()
-            .and_then(|mut q|q.pop_front());
+            .and_then(|q|q.front().copied());
         match token {
             Some(token)=>{
                 // A lost CHARGE ACK must be reconciled before releasing
                 // the same kernel token. Never use a second charge ID.
                 let success=release_if_funded(token).is_ok();
+                if let Ok(mut q)=pending_refunds().lock() {
+                    settle_refund_front(&mut q,token,success);
+                }
                 if !success {
-                    // Retry the exact token. Do not invent an errno-success
-                    // state merely because the socket itself is already gone.
-                    let _=enqueue_refund(token);
+                    // A stuck refund must not starve unrelated committed receipt ACKs.
+                    flush_acks();
+                    // Retry the exact token without relinquishing its slot.
                     thread::sleep(Duration::from_millis(10));
                 }
             }
@@ -211,6 +221,16 @@ pub(super) fn flush_acks()->usize{
 #[cfg(test)]
 mod tests{
     use super::*;
+    #[test]
+    fn refund_slot_survives_failed_retry_and_only_settles_matching_front(){
+        let mut q=VecDeque::from([11,12]);
+        settle_refund_front(&mut q,11,false);
+        assert_eq!(q.iter().copied().collect::<Vec<_>>(),vec![12,11]);
+        settle_refund_front(&mut q,11,true);
+        assert_eq!(q.iter().copied().collect::<Vec<_>>(),vec![12,11]);
+        settle_refund_front(&mut q,12,true);
+        assert_eq!(q.front(),Some(&11));
+    }
     #[test]
     fn unexpected_local_phase_never_claims_refund(){
         assert_eq!(errno(Error::WrongAck),libc::EPROTO);

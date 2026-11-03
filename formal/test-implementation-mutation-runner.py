@@ -192,6 +192,11 @@ def checkout_mirror_has_a_no_rsync_path() -> None:
         (root / "target" / "artifact").write_text("ignore\n", encoding="utf-8")
         (root / "driver-domains/linux/out").mkdir(parents=True)
         (root / "driver-domains/linux/out/artifact").write_text("ignore\n", encoding="utf-8")
+        (root / "formal/proof-kernel/target").mkdir(parents=True)
+        (root / "formal/proof-kernel/target/artifact").write_text("ignore\n", encoding="utf-8")
+        (root / "formal/proof-kernel/src.rs").write_text("proof source\n", encoding="utf-8")
+        (root / ".tlacache").mkdir()
+        (root / ".tlacache/state").write_text("ignore\n", encoding="utf-8")
 
         original_which = runner.shutil.which
         modes = ["fallback"] + (["rsync"] if original_which("rsync") else [])
@@ -211,6 +216,9 @@ def checkout_mirror_has_a_no_rsync_path() -> None:
             assert not (checkout / "target").exists()
             assert not (checkout / "build").exists()
             assert not (checkout / "driver-domains/linux/out").exists()
+            assert not (checkout / "formal/proof-kernel/target").exists()
+            assert not (checkout / ".tlacache").exists()
+            assert (checkout / "formal/proof-kernel/src.rs").read_text() == "proof source\n"
 
 
 def assert_process_exited(pid: int) -> None:

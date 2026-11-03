@@ -1906,6 +1906,9 @@ pub fn reserve_fast_endpoint_call_with_response_capacity(
     {
         return Err(IpcError::InvalidArgument);
     }
+    if scheduling_context.is_some_and(|custody| custody.caller_task_id() != caller_task_id) {
+        return Err(IpcError::InvalidArgument);
+    }
     // Allocated before any lock: a failure is the ordinary "no frame" fallback.
     let spill = if request.len() > IPC_FAST_INLINE_BYTES {
         let mut bytes = Vec::new();
@@ -1988,64 +1991,51 @@ pub fn rollback_fast_endpoint_call(
     caller_task_id: u64,
     receiver_task_id: u64,
 ) -> Result<FastEndpointRollback, IpcError> {
-    let exact_frame = REPLIES
-        .with(reply.raw(), |reply_object| {
-            reply_object.fast_frame.as_ref().and_then(|frame| {
-                (!reply_object.used
-                    && !reply_object.consumed
-                    && frame.endpoint_id == endpoint.raw()
-                    && frame.caller_task_id == caller_task_id
-                    && frame.receiver_task_id == receiver_task_id
-                    && frame.state == FastCallState::RequestReady)
-                    .then_some(frame.receiver_request_capacity)
-            })
-        })
-        .ok_or(IpcError::InvalidHandle)?;
-    let Some(receiver_request_capacity) = exact_frame else {
-        return Err(IpcError::PermissionDenied);
-    };
-
-    let restored = ENDPOINTS.with_mut(endpoint.raw(), |endpoint_object| {
-        if endpoint_object.fast_reply != Some(reply.raw()) {
-            return false;
-        }
-        endpoint_object.fast_reply.take();
-        endpoint_object
-            .waiting_receivers
-            .push_front(endpoint_priority::EndpointReceiverWaiter {
-                task_id: receiver_task_id,
-                request_capacity: receiver_request_capacity,
-            });
-        true
-    });
-    if restored != Some(true) {
-        return if restored.is_none() {
-            Err(IpcError::InvalidHandle)
-        } else {
-            Err(IpcError::PermissionDenied)
-        };
-    }
-
-    let rollback = REPLIES
-        .with_mut(reply.raw(), |reply_object| {
-            let frame = reply_object
-                .fast_frame
-                .as_ref()
-                .ok_or(IpcError::InvalidHandle)?;
-            if reply_object.used
-                || reply_object.consumed
-                || frame.endpoint_id != endpoint.raw()
-                || frame.caller_task_id != caller_task_id
-                || frame.receiver_task_id != receiver_task_id
-                || frame.state != FastCallState::RequestReady
-            {
-                return Err(IpcError::PermissionDenied);
+    let rollback = ENDPOINTS
+        .with_mut(endpoint.raw(), |endpoint_object| {
+            if endpoint_object.fast_reply != Some(reply.raw()) {
+                return Err(if REPLIES.with(reply.raw(), |_| ()).is_some() {
+                    IpcError::PermissionDenied
+                } else {
+                    IpcError::InvalidHandle
+                });
             }
-            reply_object.consumed = true;
-            Ok(FastEndpointRollback {
-                receiver_task_id,
-                scheduling_context: reply_object.scheduling_context.take(),
-            })
+            // Revalidate and consume under Endpoint -> Reply, before changing
+            // endpoint publication. Cancellation and receive cannot split this
+            // transaction or restore a waiter for a cancelled frame.
+            let (rollback, capacity) = REPLIES
+                .with_mut(reply.raw(), |reply_object| {
+                    let frame = reply_object.fast_frame.as_ref().ok_or(IpcError::InvalidHandle)?;
+                    if reply_object.used || reply_object.consumed
+                        || frame.endpoint_id != endpoint.raw()
+                        || frame.caller_task_id != caller_task_id
+                        || frame.receiver_task_id != receiver_task_id
+                        || frame.state != FastCallState::RequestReady
+                    {
+                        return Err(IpcError::PermissionDenied);
+                    }
+                    let capacity = frame.receiver_request_capacity;
+                    reply_object.consumed = true;
+                    Ok((FastEndpointRollback {
+                        receiver_task_id,
+                        scheduling_context: reply_object.scheduling_context.take(),
+                    }, capacity))
+                })
+                .ok_or(IpcError::InvalidHandle)??;
+            endpoint_object.fast_reply = None;
+            if let Some(waiter) = endpoint_object.waiting_receivers.iter_mut()
+                .find(|waiter| waiter.task_id == receiver_task_id)
+            {
+                waiter.request_capacity = capacity;
+            } else {
+                endpoint_object.waiting_receivers.push_front(
+                    endpoint_priority::EndpointReceiverWaiter {
+                        task_id: receiver_task_id,
+                        request_capacity: capacity,
+                    },
+                );
+            }
+            Ok(rollback)
         })
         .ok_or(IpcError::InvalidHandle)??;
     drop(REPLIES.remove(reply.raw()));
@@ -2109,38 +2099,70 @@ pub fn complete_fast_endpoint_reply_for_task(
     receiver_task_id: u64,
     response: &[u8],
 ) -> Result<FastReplyCompletion, IpcError> {
-    REPLIES
+    // Validate before preparing a potentially large buffer. This observation
+    // grants no authority: cancellation, teardown or another reply may win
+    // while allocation is in progress, so the commit repeats every check.
+    let capacity = if response.len() > IPC_FAST_INLINE_BYTES {
+        Some(
+            REPLIES.with(reply.raw(), |object| {
+                if object.used || object.consumed {
+                    return Err(IpcError::InvalidArgument);
+                }
+                let frame = object.fast_frame.as_ref().ok_or(IpcError::InvalidHandle)?;
+                if frame.receiver_task_id != receiver_task_id
+                    || frame.state != FastCallState::RequestTaken
+                {
+                    return Err(IpcError::PermissionDenied);
+                }
+                Ok(frame.caller_response_capacity)
+            }).ok_or(IpcError::InvalidHandle)??,
+        )
+    } else {
+        None
+    };
+
+    let mut terminal_error = capacity
+        .is_some_and(|capacity| response.len() > IPC_FAST_MAX_BYTES || response.len() > capacity)
+        .then_some(IpcError::BufferTooSmall);
+    let mut prepared_spill = None;
+    if terminal_error.is_none() && response.len() > IPC_FAST_INLINE_BYTES {
+        let mut bytes = Vec::new();
+        if bytes.try_reserve_exact(response.len()).is_err() {
+            terminal_error = Some(IpcError::NoMemory);
+        } else {
+            bytes.extend_from_slice(response);
+            prepared_spill = Some(alloc::boxed::Box::new(FastSpill {
+                request: Vec::new(),
+                response: bytes,
+            }));
+        }
+    }
+    let mut replaced_spill = None;
+    let result = REPLIES
         .with_mut(reply.raw(), |reply_object| {
             if reply_object.used || reply_object.consumed {
                 return Err(IpcError::InvalidArgument);
             }
-            let frame = reply_object
-                .fast_frame
-                .as_mut()
-                .ok_or(IpcError::InvalidHandle)?;
-            if frame.receiver_task_id != receiver_task_id
-                || frame.state != FastCallState::RequestTaken
-            {
+            let frame = reply_object.fast_frame.as_mut().ok_or(IpcError::InvalidHandle)?;
+            if frame.receiver_task_id != receiver_task_id || frame.state != FastCallState::RequestTaken {
                 return Err(IpcError::PermissionDenied);
             }
-            let mut terminal_error = (response.len() > IPC_FAST_MAX_BYTES
-                || response.len() > frame.caller_response_capacity)
-                .then_some(IpcError::BufferTooSmall);
-            if terminal_error.is_none() && response.len() > IPC_FAST_INLINE_BYTES {
-                let mut bytes = Vec::new();
-                if bytes.try_reserve_exact(response.len()).is_err() {
-                    terminal_error = Some(IpcError::NoMemory);
-                } else {
-                    bytes.extend_from_slice(response);
-                    frame.spill.get_or_insert_with(Default::default).response = bytes;
-                }
+            // The capacity belongs to this exact reply generation and is never
+            // mutated; still check it as part of the authoritative transition.
+            if capacity.is_some_and(|capacity| frame.caller_response_capacity != capacity) {
+                return Err(IpcError::InvalidHandle);
+            }
+            if response.len() > frame.caller_response_capacity {
+                terminal_error = Some(IpcError::BufferTooSmall);
             }
             if let Some(error) = terminal_error {
                 frame.response_len = 0;
                 frame.terminal_error = Some(error);
                 frame.state = FastCallState::ErrorReady;
             } else {
-                if response.len() <= IPC_FAST_INLINE_BYTES {
+                if let Some(spill) = prepared_spill.take() {
+                    replaced_spill = frame.spill.replace(spill);
+                } else {
                     frame.response[..response.len()].copy_from_slice(response);
                 }
                 frame.response_len = response.len();
@@ -2155,7 +2177,11 @@ pub fn complete_fast_endpoint_reply_for_task(
                 terminal_error,
             })
         })
-        .ok_or(IpcError::InvalidHandle)?
+        .ok_or(IpcError::InvalidHandle)?;
+    // Neither replaced nor rejected storage may be destroyed under a slot lock.
+    drop(replaced_spill);
+    drop(prepared_spill);
+    result
 }
 
 pub fn reject_fast_endpoint_reply_for_task(
@@ -3196,7 +3222,7 @@ pub fn restore_endpoint_receiver_waiter(
             if object.waiting_receivers.iter().any(|w| w.task_id == task_id) {
                 return Ok(false);
             }
-            if object.waiting_receivers.len() >= MAX_ENDPOINT_WAITERS {
+            if !object.waiter_capacity_available() {
                 return Err(IpcError::NoMemory);
             }
             object
@@ -3240,27 +3266,24 @@ fn fail_endpoints_owned_by(owner: EndpointOwner, err: IpcError) -> EndpointWakeS
         for receiver in endpoint.waiting_receivers {
             wake_set.push_receiver(receiver.task_id);
         }
-        if let Some(reply_id) = endpoint.fast_reply {
-            let failed = REPLIES.with_mut(reply_id, |reply| {
-                let Some(frame) = reply.fast_frame.as_mut() else {
-                    return None;
-                };
-                if reply.consumed || frame.endpoint_id != endpoint_id {
-                    return None;
-                }
-                frame.state = FastCallState::ErrorReady;
-                frame.terminal_error = Some(err);
-                reply.used = true;
-                Some((frame.caller_task_id, reply.scheduling_context.take()))
-            });
-            if let Some(Some((caller_task_id, scheduling_context))) = failed {
-                wake_set.push_caller(caller_task_id);
-                if let Some(custody) = scheduling_context {
-                    wake_set
-                        .push_scheduling_context(KernelReplyHandle::from_raw(reply_id), custody);
-                }
+        // A receiver removes fast_reply when it takes the request, but the
+        // live reply still belongs to this endpoint until completion. Fail both
+        // published and already-taken frames when the owner exits.
+        REPLIES.visit_mut(|reply_id, reply| {
+            let Some(frame) = reply.fast_frame.as_mut() else {
+                return;
+            };
+            if reply.used || reply.consumed || frame.endpoint_id != endpoint_id {
+                return;
             }
-        }
+            frame.state = FastCallState::ErrorReady;
+            frame.terminal_error = Some(err);
+            reply.used = true;
+            wake_set.push_caller(frame.caller_task_id);
+            if let Some(custody) = reply.scheduling_context.take() {
+                wake_set.push_scheduling_context(KernelReplyHandle::from_raw(reply_id), custody);
+            }
+        });
         ENDPOINT_MESSAGES.visit_mut(|message_id, message| {
             if !message.published
                 || message.endpoint_id != endpoint_id

@@ -62,6 +62,8 @@ int fputc(int ch, void *stream);
 size_t fwrite(const void *buffer, size_t size, size_t count, void *stream);
 void *localeconv(void);
 void *memcpy(void *dst, const void *src, size_t len);
+void *memmove(void *dst, const void *src, size_t len);
+int memcmp(const void *lhs, const void *rhs, size_t len);
 void *memset(void *dst, int value, size_t len);
 void *signal(int signum, void *handler);
 char *strerror(int errnum);

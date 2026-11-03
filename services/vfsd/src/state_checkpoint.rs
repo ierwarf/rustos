@@ -181,6 +181,7 @@ impl VfsState {
                 .insert(
                     record.key_hi,
                     RemoteHandle {
+                        checkpoint_version: wire.version,
                         kind,
                         path,
                         cursor: wire.cursor,

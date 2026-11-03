@@ -52,6 +52,25 @@ fn one_catalog_tracks_tables_and_exact_data_leaves() {
 }
 
 #[test]
+fn invalid_alias_frame_does_not_consume_mapping_records() {
+    let (ledger, _records, _mappings) = ledger();
+    let parent = PAGE_SIZE;
+    let child = PAGE_SIZE * 2;
+    let va = 0x8000_4000;
+    ledger.register_root(parent);
+    ledger.register_root(child);
+    let head = ledger.free_mapping_head.load(DESCRIPTOR_ACQUIRE);
+    for frame in [PAGE_SIZE * 16, PAGE_SIZE * 3 + 1] {
+        assert!(ledger
+            .prepare_shared_alias(parent, va, child, va, frame, CowFrameKind::AnonymousFork, 0)
+            .is_none());
+        assert_eq!(ledger.free_mapping_head.load(DESCRIPTOR_ACQUIRE), head);
+    }
+    ledger.unregister_root(parent);
+    ledger.unregister_root(child);
+}
+
+#[test]
 fn anonymous_aliases_are_exact_and_free_only_after_the_last_mapping() {
     let (ledger, _records, _mappings) = ledger();
     let parent = PAGE_SIZE;
@@ -113,6 +132,39 @@ fn failed_fork_alias_rolls_back_to_the_exact_exclusive_owner() {
         ledger.release_data(parent, va, frame),
         Some(DataLeafRelease::FrameReusable)
     );
+    ledger.unregister_root(parent);
+    ledger.unregister_root(child);
+}
+
+#[test]
+fn alias_removal_can_retain_role_lock_until_exclusive_conversion() {
+    let (ledger, _records, _mappings) = ledger();
+    let parent = PAGE_SIZE;
+    let child = PAGE_SIZE * 2;
+    let frame_phys = PAGE_SIZE * 3;
+    let va = 0x8000_4000;
+    ledger.register_root(parent);
+    ledger.register_root(child);
+    assert!(ledger.claim_exclusive_data(parent, va, frame_phys));
+    ledger.publish_exclusive_data(parent, va, frame_phys);
+    let ticket = ledger
+        .prepare_shared_alias(parent, va, child, va, frame_phys, CowFrameKind::AnonymousFork, 0)
+        .unwrap();
+    ledger.publish_shared_alias(ticket);
+    let frame = ledger.record(frame_phys).unwrap();
+    assert!(ledger.lock_shared(frame, CowFrameKind::AnonymousFork, false));
+    assert_eq!(
+        ledger.remove_shared_mapping_locked(
+            frame, child, va, ticket.mapping_id, CowFrameKind::AnonymousFork, false,
+        ),
+        DataLeafRelease::FrameRetained
+    );
+    assert_eq!(frame.role.load(DESCRIPTOR_ACQUIRE), ROLE_SHARED_ANONYMOUS_LOCKED);
+    // Finish the rollback's conversion and accounting before releasing the fixture.
+    frame.data_leaf_count_or_map_head.store(0, Ordering::Relaxed);
+    frame.role.store(ROLE_EXCLUSIVE_DATA_LIVE, DESCRIPTOR_RELEASE);
+    ledger.decrement_root_data_count(child);
+    assert_eq!(ledger.release_data(parent, va, frame_phys), Some(DataLeafRelease::FrameReusable));
     ledger.unregister_root(parent);
     ledger.unregister_root(child);
 }

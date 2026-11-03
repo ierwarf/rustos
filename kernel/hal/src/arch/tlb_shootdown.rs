@@ -525,14 +525,20 @@ fn acquire_global() -> (Hold, bool) {
 
 fn release(hold: Hold, restore_interrupts: bool) {
     let Hold { guard, exclusive } = hold;
-    drop(guard);
     #[cfg(rustos_boot_image)]
     {
         if exclusive {
-            // ORDERING: Release publishes the finished mutation to every
+            // Keep GLOBAL_LOCK until the exclusive bit is clear. Otherwise a
+            // succeeding global owner can set the same bit before this owner
+            // clears it, admitting shared mutations into its critical section.
+            // ORDERING: Release publishes the finished global mutation to every
             // per-space mutation admitted after the bit clears.
             GATE.fetch_and(!GATE_EXCLUSIVE, Ordering::Release);
+            drop(guard);
         } else {
+            drop(guard);
+            // ORDERING: Release publishes this shared mutation before a global
+            // owner's gate drain observes the count reaching zero.
             GATE.fetch_sub(1, Ordering::Release);
         }
         if restore_interrupts {
@@ -542,7 +548,10 @@ fn release(hold: Hold, restore_interrupts: bool) {
         }
     }
     #[cfg(not(rustos_boot_image))]
-    let _ = (exclusive, restore_interrupts);
+    {
+        drop(guard);
+        let _ = (exclusive, restore_interrupts);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1197,6 +1206,16 @@ mod tests {
         cr3_image, gate_enter_shared, paravirtual_flush_claimed, paravirtual_skip_admissible,
         scope_root, shootdown_target_is_required, stripe,
     };
+
+    #[test]
+    fn global_gate_is_cleared_before_releasing_its_owner_lock() {
+        let source = include_str!("tlb_shootdown.rs");
+        let release = source.split_once("fn release(hold: Hold").unwrap().1
+            .split_once("// Activation.").unwrap().0;
+        let exclusive = release.split_once("if exclusive {").unwrap().1
+            .split_once("} else {").unwrap().0;
+        assert!(exclusive.find("GATE.fetch_and").unwrap() < exclusive.find("drop(guard)").unwrap());
+    }
 
     #[test]
     fn same_root_activation_preserves_tlb_but_root_change_reloads_cr3() {

@@ -388,6 +388,36 @@ mod tests {
     }
 
     #[test]
+    fn transfer_and_mapping_require_the_right_for_each_handle_kind() {
+        use super::{SharedRegionRights, SocketHandleRights};
+
+        let cases = [
+            (HandleRights::File(FileHandleRights::READ), false),
+            (HandleRights::File(FileHandleRights::TRANSFER), true),
+            (HandleRights::Memfd(FileHandleRights::READ), false),
+            (HandleRights::Memfd(FileHandleRights::TRANSFER), true),
+            (HandleRights::Device(DeviceHandleRights::MAP), false),
+            (HandleRights::Device(DeviceHandleRights::TRANSFER), true),
+            (HandleRights::Socket(SocketHandleRights::PASS_FD), false),
+            (HandleRights::Socket(SocketHandleRights::TRANSFER), true),
+            (HandleRights::DisplaySurface(SharedRegionRights::MAP), false),
+            (HandleRights::DisplaySurface(SharedRegionRights::TRANSFER), true),
+            (HandleRights::Job(JobHandleRights::DUPLICATE), false),
+            (HandleRights::Job(JobHandleRights::TRANSFER), true),
+            (HandleRights::Console, false),
+            (HandleRights::Epoll, false),
+        ];
+        for (rights, expected) in cases {
+            assert_eq!(rights.allows_transfer(), expected, "{rights:?}");
+        }
+        assert!(HandleRights::Device(DeviceHandleRights::MAP).allows_shared_map());
+        assert!(!HandleRights::Device(DeviceHandleRights::TRANSFER).allows_shared_map());
+        assert!(HandleRights::DisplaySurface(SharedRegionRights::MAP).allows_shared_map());
+        assert!(!HandleRights::DisplaySurface(SharedRegionRights::TRANSFER).allows_shared_map());
+        assert!(!HandleRights::File(FileHandleRights::READ).allows_shared_map());
+    }
+
+    #[test]
     fn typed_rights_attenuation_rejects_widening_and_kind_substitution() {
         let parent = HandleRights::File(
             FileHandleRights::READ

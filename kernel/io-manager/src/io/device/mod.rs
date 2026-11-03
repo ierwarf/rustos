@@ -173,19 +173,44 @@ pub fn ioctl_from_user(
     }
 }
 
-pub(super) fn read_user_struct<T: Copy>(
+// SAFETY: Implementors must be repr(C), contain only fields for which every
+// bit pattern is valid, and have no padding (including nested fields). This
+// permits both arbitrary user bytes on input and bytewise reads on output.
+unsafe trait UserDevicePod: Copy {}
+
+// These ABI records contain only u32, u64 and byte-array fields. The size
+// assertions additionally reject padding changes to their present layouts.
+macro_rules! user_device_pod {
+    ($($ty:ty => $size:expr),+ $(,)?) => {$ (
+        const _: () = assert!(size_of::<$ty>() == $size);
+        // SAFETY: see the field and layout requirements above.
+        unsafe impl UserDevicePod for $ty {}
+    )+};
+}
+user_device_pod! {
+    device_abi::DisplayInfo => 32,
+    device_abi::DisplaySurfaceCreate => 48,
+    device_abi::DisplayPresentRequest => 8,
+    device_abi::DisplayPresentRectRequest => 24,
+    device_abi::DisplayGpuInfo => 64,
+    device_abi::DisplayGpuDamage => 16,
+    device_abi::DisplayGpuSubmitRequest => 40,
+    device_abi::DisplayGpuCompletionQuery => 264,
+}
+
+fn read_user_struct<T: UserDevicePod>(
     address_space: &paging::ProcessAddressSpace,
     user_ptr: u64,
 ) -> Result<T, DeviceError> {
-    let mut value = core::mem::MaybeUninit::<T>::uninit();
-    let bytes =
-        unsafe { slice::from_raw_parts_mut(value.as_mut_ptr().cast::<u8>(), size_of::<T>()) };
+    // SAFETY: UserDevicePod permits the all-zero bit pattern.
+    let mut value = unsafe { core::mem::zeroed::<T>() };
+    let bytes = unsafe { slice::from_raw_parts_mut((&mut value as *mut T).cast::<u8>(), size_of::<T>()) };
     address_space.validate_user_read_buffer(VirtAddr::new(user_ptr), bytes.len())?;
     address_space.copy_from_user(VirtAddr::new(user_ptr), bytes)?;
-    Ok(unsafe { value.assume_init() })
+    Ok(value)
 }
 
-pub(super) fn write_user_struct<T: Copy>(
+fn write_user_struct<T: UserDevicePod>(
     address_space: &paging::ProcessAddressSpace,
     user_ptr: u64,
     value: &T,
@@ -199,6 +224,33 @@ pub(super) fn write_user_struct<T: Copy>(
 #[cfg(test)]
 mod tests {
     use super::{DeviceAccessKind, DeviceHandle, DeviceId};
+
+    #[test]
+    fn device_pod_records_accept_all_ones_and_round_trip_bytes() {
+        fn check<T: super::UserDevicePod>() {
+            let mut value = unsafe { core::mem::zeroed::<T>() };
+            let bytes = unsafe {
+                core::slice::from_raw_parts_mut(
+                    (&mut value as *mut T).cast::<u8>(), core::mem::size_of::<T>(),
+                )
+            };
+            bytes.fill(0xff);
+            let output = unsafe {
+                core::slice::from_raw_parts(
+                    (&value as *const T).cast::<u8>(), core::mem::size_of::<T>(),
+                )
+            };
+            assert!(output.iter().all(|byte| *byte == 0xff));
+        }
+        check::<super::device_abi::DisplayInfo>();
+        check::<super::device_abi::DisplaySurfaceCreate>();
+        check::<super::device_abi::DisplayPresentRequest>();
+        check::<super::device_abi::DisplayPresentRectRequest>();
+        check::<super::device_abi::DisplayGpuInfo>();
+        check::<super::device_abi::DisplayGpuDamage>();
+        check::<super::device_abi::DisplayGpuSubmitRequest>();
+        check::<super::device_abi::DisplayGpuCompletionQuery>();
+    }
 
     #[test]
     fn device_handle_round_trip_keeps_id_and_access() {

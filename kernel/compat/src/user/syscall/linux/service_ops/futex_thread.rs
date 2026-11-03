@@ -265,7 +265,7 @@ pub fn clone_linux_thread(
         return linux_errno(LINUX_EINVAL);
     };
     let child_thread_state = match multitask::with_current_user_linux_state_mut(
-        |_, _, abi, address_space, _, linux_thread_state| {
+        |_, _, abi, _address_space, _, linux_thread_state| {
             if abi != crate::user::abi::UserAbi::Linux {
                 return Err(LINUX_ENOSYS);
             }

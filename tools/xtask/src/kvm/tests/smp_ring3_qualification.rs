@@ -46,11 +46,10 @@ pub(super) fn smoke_readiness_budget_starts_only_after_both_guests_spawn() {
 
 /// The interactive path checks its formal profile early and only warns.
 ///
-/// A missing seal on this path means an edited tree, not an intent to launch
-/// unverified, so `kvm_run_command` runs the profile's own verification rather
-/// than failing. That has to happen before the run claims a layout, a
-/// doorbell, or a relay: sealing takes minutes, and a launch that already owns
-/// host resources would hold them for the whole verification.
+/// A missing seal on this path means an edited tree; the launch prints an
+/// unverified-boot warning and proceeds. The check happens before the run
+/// claims a layout, a doorbell, or a relay so the warning precedes any host
+/// resource claim.
 pub(super) fn interactive_multicore_run_seals_formal_evidence_before_claiming_resources() {
     let source = include_str!("../options.rs");
     let interactive_start = source
@@ -72,8 +71,8 @@ pub(super) fn interactive_multicore_run_seals_formal_evidence_before_claiming_re
     assert!(seal < layout);
     assert!(layout < doorbell);
     assert!(doorbell < spawn);
-    // The seal is a repair, never a bypass: the single-CPU launch has no
-    // profile to check, and `--no-auto-verify` skips even the warning.
+    // The single-CPU launch has no profile to check, and `--no-auto-verify`
+    // skips even the warning.
     assert!(interactive[..seal].contains("options.smp_iteration || options.rustos_vcpus > 1"));
     assert!(interactive[..seal].contains("if auto_verify {"));
 }

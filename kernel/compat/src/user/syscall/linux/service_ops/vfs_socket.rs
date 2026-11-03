@@ -248,9 +248,14 @@ pub fn syscall_linux_vfs_openat(dirfd: u64, path_ptr: u64, flags: u64, mode: u64
             return linux_errno(LINUX_EINVAL);
         }
     };
-    let len = response.payload_len as usize;
-    let handle_path = match core::str::from_utf8(&response.payload[..len]) {
-        Ok(path) if !path.is_empty() && path.starts_with('/') => alloc::string::String::from(path),
+    let handle_path = match response
+        .payload
+        .get(..response.payload_len as usize)
+        .map(core::str::from_utf8)
+    {
+        Some(Ok(path)) if !path.is_empty() && path.starts_with('/') => {
+            alloc::string::String::from(path)
+        }
         _ => {
             let _ = call_vfs_remote_close_bounded(remote_id);
             return linux_errno(LINUX_EINVAL);
@@ -601,8 +606,13 @@ pub fn syscall_linux_vfs_read(fd: u64, user_ptr: u64, user_len: u64) -> u64 {
                 Err(errno) => linux_errno(errno),
             };
         }
-        return match crate::user::sysops::console::read_into_current_process(user_ptr, user_len) {
-            Ok(0) if status_flags & linux_abi::O_NONBLOCK != 0 => linux_errno(LINUX_EAGAIN),
+        let nonblocking = status_flags & linux_abi::O_NONBLOCK != 0;
+        return match crate::user::sysops::console::read_into_current_process(
+            user_ptr,
+            user_len,
+            nonblocking,
+        ) {
+            Ok(0) if nonblocking => linux_errno(LINUX_EAGAIN),
             Ok(read) => read as u64,
             Err(err) => linux_errno(address_space_error_to_linux_errno(err)),
         };
@@ -945,6 +955,10 @@ fn write_remote_vfs(fd: u64, remote_id: u64, user_ptr: u64, user_len: u64) -> u6
         }
         match call_vfs_ipc_request(&request).and_then(|response| {
             ensure_vfs_status(&response)?;
+            // A provider cannot have accepted more than it was offered.
+            if response.value > chunk_len as u64 {
+                return Err(LINUX_EINVAL);
+            }
             Ok(response.value)
         }) {
             Ok(written) => written,

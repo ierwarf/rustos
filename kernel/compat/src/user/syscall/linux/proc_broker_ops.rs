@@ -381,6 +381,12 @@ pub(super) fn syscall_linux_rustos_proc_set_linux_runtime_broker(args_ptr: u64) 
     if interp_path_len > PROC_BROKER_LINUX_INTERP_PATH_CAPACITY {
         return linux_errno(LINUX_EINVAL);
     }
+    // `actual_entry` becomes the first user RIP and the TLS fields become
+    // `VirtAddr::new` operands during commit, which panics on a non-canonical
+    // address. Reject anything outside the loader's user window here.
+    if !user_span_in_window(args.actual_entry, 1) || !linux_tls_fields_valid(&args) {
+        return linux_errno(LINUX_EINVAL);
+    }
     let initial_tls = if args.has_tls != 0 {
         Some(crate::user::linux::LinuxInitialTlsInfo {
             template_addr: args.tls_template_addr,
@@ -535,6 +541,9 @@ pub(super) fn syscall_linux_rustos_proc_set_windows_runtime_broker(args_ptr: u64
     let runtime_size = args.runtime_size;
     if let Err(errno) = validate_user_range(runtime_base, runtime_size) {
         return linux_errno(errno);
+    }
+    if validate_user_range(args.image_base, args.image_size).is_err() {
+        return linux_errno(LINUX_EINVAL);
     }
     if args.image_size == 0
         || args.image_base % PAGE_SIZE != 0
@@ -1901,6 +1910,27 @@ fn validate_user_range(start: u64, len: u64) -> Result<(), i64> {
         return Err(LINUX_EINVAL);
     }
     Ok(())
+}
+
+/// Whether `[addr, addr + len)` lies wholly inside the broker user window.
+fn user_span_in_window(addr: u64, len: u64) -> bool {
+    addr >= PROC_BROKER_USER_SPACE_BASE
+        && addr
+            .checked_add(len)
+            .is_some_and(|end| end <= PROC_BROKER_USER_SPACE_END_EXCLUSIVE)
+}
+
+fn linux_tls_fields_valid(args: &RustosProcSetLinuxRuntimeBrokerArgs) -> bool {
+    if args.has_tls == 0 {
+        return true;
+    }
+    // The template is copied into a kernel buffer sized by `tls_template_size`,
+    // so bound it by the mapping that must hold the block.
+    args.tls_template_size <= args.tls_mapping_size
+        && user_span_in_window(args.tls_mapping_base, args.tls_mapping_size)
+        && user_span_in_window(args.tls_template_addr, args.tls_template_size)
+        && user_span_in_window(args.tls_block_base, args.tls_template_size)
+        && user_span_in_window(args.tls_tcb_base, 24)
 }
 
 fn range_contains(base: u64, len: u64, ptr: u64, access_len: u64) -> bool {

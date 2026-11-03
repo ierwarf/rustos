@@ -176,6 +176,7 @@ impl VfsState {
             return Err(EROFS);
         }
         let handle = RemoteHandle {
+            checkpoint_version: VFSD_OPEN_CHECKPOINT_VERSION,
             kind: metadata.kind,
             path: path.to_string(),
             cursor: 0,
@@ -241,11 +242,10 @@ impl VfsState {
                 return Err(EIO);
             }
             let (requested, replay_len) = unpack_u32_pair(handle.last_result);
-            if requested as usize != len
-                || replay_len as usize > len
-                || replay_len as usize > dest.len()
-                || handle.last_start > file_len
-            {
+            if !vfsd::read_replay_is_valid(
+                handle.checkpoint_version, len, requested as usize, replay_len as usize,
+                dest.len(), handle.last_start, file_len,
+            ) {
                 return Err(EIO);
             }
             if replay_len == 0 {
@@ -263,8 +263,9 @@ impl VfsState {
         if offset.is_none() && self.handles.get(&id).is_some_and(cursor_mutation_prepared) {
             return Err(EBUSY);
         }
+        let requested_len = len;
         let available = file_len.saturating_sub(start);
-        let len = len.min(available as usize).min(dest.len());
+        let len = len.min(usize::try_from(available).unwrap_or(usize::MAX)).min(dest.len());
         let read = if len == 0 {
             0
         } else {
@@ -272,10 +273,11 @@ impl VfsState {
         };
         if offset.is_none() {
             let mut candidate = self.handles.get(&id).cloned().ok_or(EBADF)?;
+            candidate.checkpoint_version = VFSD_OPEN_CHECKPOINT_VERSION;
             candidate.cursor = candidate.cursor.checked_add(read as u64).ok_or(EOVERFLOW)?;
             candidate.last_mutation = VFSD_OPEN_MUTATION_READ;
             candidate.last_start = start;
-            candidate.last_result = pack_u32_pair(len, read)?;
+            candidate.last_result = pack_u32_pair(requested_len, read)?;
             self.checkpoint_handle_state(
                 request,
                 id,

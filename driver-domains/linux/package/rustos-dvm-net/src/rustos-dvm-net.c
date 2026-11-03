@@ -114,7 +114,7 @@ static int find_uio(char *name, size_t name_capacity) {
 
 static int header_is_valid(const volatile uint8_t *base) {
     uint32_t flags = le32(base + FLAGS), tx_head = le32(base + TX_HEAD), tx_tail = le32(base + TX_TAIL), rx_head = le32(base + RX_HEAD), rx_tail = le32(base + RX_TAIL);
-    return memcmp((const void *)base, MAGIC, 8) == 0 && le32(base + 8) == 1U && le32(base + 12) == HEADER_BYTES && le64(base + 16) == APERTURE_BYTES && le32(base + 24) == SLOT_COUNT && le32(base + 28) == SLOT_BYTES && le32(base + 32) == MTU && (flags & FLAG_READY) != 0 && (flags & ~KNOWN_FLAGS) == 0 && le64(base + 56) != 0 && tx_head >= tx_tail && tx_head - tx_tail <= SLOT_COUNT && rx_head >= rx_tail && rx_head - rx_tail <= SLOT_COUNT;
+    return memcmp((const void *)base, MAGIC, 8) == 0 && le32(base + 8) == 1U && le32(base + 12) == HEADER_BYTES && le64(base + 16) == APERTURE_BYTES && le32(base + 24) == SLOT_COUNT && le32(base + 28) == SLOT_BYTES && le32(base + 32) == MTU && (flags & FLAG_READY) != 0 && (flags & ~KNOWN_FLAGS) == 0 && le64(base + 56) != 0 && tx_head - tx_tail <= SLOT_COUNT && rx_head - rx_tail <= SLOT_COUNT;
 }
 
 static int open_shared(struct shared_net *net) {
@@ -168,7 +168,13 @@ static int raw_socket(struct raw_endpoint *endpoint) {
     endpoint->address.sll_protocol = htons(ETH_P_ALL);
     endpoint->address.sll_ifindex = if_nametoindex("eth0");
     if (!endpoint->address.sll_ifindex || bind(endpoint->fd, (struct sockaddr *)&endpoint->address, sizeof(endpoint->address))) { close(endpoint->fd); return -1; }
-    (void)setsockopt(endpoint->fd, SOL_PACKET, PACKET_IGNORE_OUTGOING, &ignore, sizeof(ignore)); return 0;
+    if (setsockopt(endpoint->fd, SOL_PACKET, PACKET_IGNORE_OUTGOING, &ignore, sizeof(ignore))) {
+        int saved_errno = errno;
+        close(endpoint->fd);
+        errno = saved_errno;
+        return -1;
+    }
+    return 0;
 }
 
 static void mark_dvm_ready(struct shared_net *net) {
@@ -197,12 +203,18 @@ static void drain_tx(const struct raw_endpoint *raw, struct shared_net *net) {
     }
 }
 
+static ssize_t receive_frame(int fd, uint8_t *frame, size_t capacity) {
+    /* MSG_TRUNC reports the original datagram length instead of silently
+     * forwarding an oversized Ethernet frame with its tail cut off. */
+    return recv(fd, frame, capacity, MSG_DONTWAIT | MSG_TRUNC);
+}
+
 static void drain_rx(const struct raw_endpoint *raw, struct shared_net *net) {
     uint8_t frame[MTU];
     for (;;) {
-        ssize_t len = recv(raw->fd, frame, sizeof(frame), MSG_DONTWAIT); uint32_t tail;
+        ssize_t len = receive_frame(raw->fd, frame, sizeof(frame)); uint32_t tail;
         if (len < 0) { if (errno == EAGAIN || errno == EWOULDBLOCK) return; return; }
-        if (len == 0) continue;
+        if (len == 0 || (size_t)len > sizeof(frame)) continue;
         tail = le32(net->base + RX_TAIL);
         if (net->rx_head - tail > SLOT_COUNT || net->rx_head - tail == SLOT_COUNT) return;
         volatile uint8_t *s = slot(net->base, RX_RING, net->rx_head); unsigned int i; for (i = 0; i < (unsigned int)len; i++) s[4U + i] = frame[i]; put32(s, (uint32_t)len);

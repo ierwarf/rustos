@@ -171,10 +171,14 @@ fn broker_packet_rx(args: &RustosNetBrokerArgs) -> Result<u64, i64> {
     if cap == 0 || cap > kernel_io_manager::api::network::PACKET_MTU {
         return Err(LINUX_EINVAL);
     }
+    // receive_frame dequeues; refuse a bad destination before the frame is lost.
+    usermem::validate_current_user_write_buffer(args.arg0, cap)
+        .map_err(address_space_error_to_linux_errno)?;
     let mut frame = alloc::vec![0_u8; cap];
     let count = kernel_io_manager::api::network::receive_frame(frame.as_mut_slice())
         .map_err(packet_error_to_linux_errno)?;
-    usermem::write_current_user_bytes(args.arg0, &frame[..count])
+    let received = frame.get(..count).ok_or(LINUX_EIO)?;
+    usermem::write_current_user_bytes(args.arg0, received)
         .map_err(address_space_error_to_linux_errno)?;
     Ok(count as u64)
 }

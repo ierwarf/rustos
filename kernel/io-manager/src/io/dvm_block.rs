@@ -228,19 +228,21 @@ impl DvmBlockState {
 
     fn submit(
         &mut self,
+        expected_generation: u64,
         operation: DvmBlockOperation,
         sector: u64,
         data: &[u8],
         data_len: u32,
         fua: bool,
     ) -> Result<DvmBlockTicket, DvmBlockError> {
-        self.submit_with_fault_decision(operation, sector, data, data_len, fua, |operation| {
+        self.submit_with_fault_decision(expected_generation, operation, sector, data, data_len, fua, |operation| {
             nucleus_core::util::fault_injection::should_fail(fault_point_for_operation(operation))
         })
     }
 
     fn submit_with_fault_decision(
         &mut self,
+        expected_generation: u64,
         operation: DvmBlockOperation,
         sector: u64,
         data: &[u8],
@@ -249,6 +251,11 @@ impl DvmBlockState {
         inject_fault: impl FnOnce(DvmBlockOperation) -> bool,
     ) -> Result<DvmBlockTicket, DvmBlockError> {
         let header = self.current_header()?;
+        // STATE keeps signed rebind and this admission mutually exclusive.
+        // Refuse stale/zero epochs before touching IDs, slots, data or doorbells.
+        if expected_generation == 0 || expected_generation != header.generation {
+            return Err(DvmBlockError::Revoked);
+        }
         let inject_device_fault = inject_fault(operation);
         let consumer = load_u64(self.base, REQUEST_CONSUMER_OFFSET, Ordering::Acquire);
         if self.request_producer < consumer
@@ -902,7 +909,7 @@ const fn ivshmem_doorbell_value(peer_id: u16, vector_index: u16) -> u32 {
     ((peer_id as u32) << 16) | vector_index as u32
 }
 
-pub(crate) fn submit_read(sector: u64, data_len: u32) -> Result<DvmBlockTicket, DvmBlockError> {
+pub(crate) fn submit_read(expected_generation: u64, sector: u64, data_len: u32) -> Result<DvmBlockTicket, DvmBlockError> {
     if !try_install() {
         return Err(DvmBlockError::Unavailable);
     }
@@ -910,7 +917,7 @@ pub(crate) fn submit_read(sector: u64, data_len: u32) -> Result<DvmBlockTicket, 
         .lock()
         .as_mut()
         .ok_or(DvmBlockError::Unavailable)?
-        .submit(DvmBlockOperation::Read, sector, &[], data_len, false)
+        .submit(expected_generation, DvmBlockOperation::Read, sector, &[], data_len, false)
 }
 
 pub(crate) fn info() -> Result<DvmBlockInfo, DvmBlockError> {
@@ -931,6 +938,7 @@ pub(crate) fn info() -> Result<DvmBlockInfo, DvmBlockError> {
 }
 
 pub(crate) fn submit_write(
+    expected_generation: u64,
     sector: u64,
     data: &[u8],
     fua: bool,
@@ -943,10 +951,10 @@ pub(crate) fn submit_write(
         .lock()
         .as_mut()
         .ok_or(DvmBlockError::Unavailable)?
-        .submit(DvmBlockOperation::Write, sector, data, data_len, fua)
+        .submit(expected_generation, DvmBlockOperation::Write, sector, data, data_len, fua)
 }
 
-pub(crate) fn submit_flush() -> Result<DvmBlockTicket, DvmBlockError> {
+pub(crate) fn submit_flush(expected_generation: u64) -> Result<DvmBlockTicket, DvmBlockError> {
     if !try_install() {
         return Err(DvmBlockError::Unavailable);
     }
@@ -954,7 +962,7 @@ pub(crate) fn submit_flush() -> Result<DvmBlockTicket, DvmBlockError> {
         .lock()
         .as_mut()
         .ok_or(DvmBlockError::Unavailable)?
-        .submit(DvmBlockOperation::Flush, 0, &[], 0, false)
+        .submit(expected_generation, DvmBlockOperation::Flush, 0, &[], 0, false)
 }
 
 pub(crate) fn poll(ticket: DvmBlockTicket, out: &mut [u8]) -> Result<DvmBlockPoll, DvmBlockError> {

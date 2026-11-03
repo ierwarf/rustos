@@ -97,6 +97,13 @@ impl EndpointObject {
         }
     }
 
+    // A published fast call temporarily owns the waiter's queue slot so that
+    // rollback can restore it without allocating or exceeding the bound.
+    pub(super) fn waiter_capacity_available(&self) -> bool {
+        self.waiting_receivers.len() + usize::from(self.fast_reply.is_some())
+            < super::MAX_ENDPOINT_WAITERS
+    }
+
     pub(super) fn pending_len(&self) -> usize {
         self.pending_messages
             .len()

@@ -397,3 +397,5 @@ and stale installed authority never being treated as missing bootstrap permissio
 remain bounded to their declared phases; these tests/source sequences do not establish
 physical CR3/TSS/TLS/SIMD/RSP behavior, full group/cold arbitration, abandoned-stack
 eventual cleanup, or safe global guard deletion.
+
+child-wait-publication/ChildWaitPublication: one recycled waiter slot, locked status publication/recheck, and split wake scan; Loom/Shuttle project the same race. Spurious wake hints are permitted. Scheduler arm/commit and multiple status consumers are not modeled.

@@ -28,10 +28,30 @@ TIMEOUT_RETURNCODE = -1024
 OCCURRENCE_SPEC = re.compile(r"(?:(?P<selected>[1-9][0-9]*)/)?(?P<total>[1-9][0-9]*)$")
 LISTED_TEST = re.compile(r"(?m)^(?P<name>[^\s].*): test$")
 
+# A shard checkout is copied once per shard into /tmp, which is RAM-backed on
+# this host. The live tree carries ~1.3 GiB of ignored tool output (the proof
+# kernels' own `target/` alone is ~0.9 GiB), so eight shards used to pin ~10 GiB
+# of tmpfs, overflow its quota mid-copy, and push the rest of the machine into
+# swap. None of these paths is source: they are build products, model-checker
+# state, editor caches and logs, and the clone from `HEAD` still restores any
+# tracked file that happens to live under one of them.
 _MIRROR_EXCLUDED_TOP_LEVEL = frozenset(
-    {".git", "target", "build", "logs", "perf.data"}
+    {
+        ".git",
+        "target",
+        "build",
+        "logs",
+        "perf.data",
+        ".serena",
+        ".pi",
+        ".tlacache",
+        "_apalache-out",
+        "states",
+        "result_output_dir",
+    }
 )
 _MIRROR_EXCLUDED_PATHS = (Path("driver-domains/linux/out"),)
+_MIRROR_EXCLUDED_GLOBS = ("formal/*/target", "formal/*/_apalache-out", "formal/__pycache__")
 
 
 FIELDS = (
@@ -465,7 +485,9 @@ def mirror_live_tree(root: Path, destination: Path) -> None:
         relative = path.relative_to(root)
         if relative.parts and relative.parts[0] in _MIRROR_EXCLUDED_TOP_LEVEL:
             return True
-        return any(relative == excluded_path for excluded_path in _MIRROR_EXCLUDED_PATHS)
+        return any(
+            relative == excluded_path for excluded_path in _MIRROR_EXCLUDED_PATHS
+        ) or any(relative.match(pattern) for pattern in _MIRROR_EXCLUDED_GLOBS)
 
     def ignored_names(directory: str, names: list[str]) -> set[str]:
         directory_path = Path(directory)
@@ -505,18 +527,12 @@ def prepare_checkout(root: Path, destination: Path) -> None:
         check=True,
     )
     subprocess.run(["git", "-C", str(destination), "checkout", "-q", "HEAD"], check=True)
-    excludes = (
-        ".git",
-        "target",
-        "build",
-        "logs",
-        "perf.data",
-        "driver-domains/linux/out",
-    )
     command = ["rsync", "-a", "--delete"]
     # These are repository-root artifacts, not arbitrary source directories
     # named build/target/logs (e.g. tools/xtask/src/build is product source).
-    command.extend(f"--exclude=/{value}" for value in excludes)
+    command.extend(f"--exclude=/{value}" for value in sorted(_MIRROR_EXCLUDED_TOP_LEVEL))
+    command.extend(f"--exclude=/{value}" for value in _MIRROR_EXCLUDED_PATHS)
+    command.extend(f"--exclude=/{value}" for value in _MIRROR_EXCLUDED_GLOBS)
     command.extend([f"{root}/", f"{destination}/"])
     if shutil.which("rsync") is not None:
         subprocess.run(command, check=True)

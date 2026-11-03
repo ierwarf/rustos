@@ -13,7 +13,7 @@ paths = ["formal", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo"]
 # Registries whose path-like tokens name more inputs (production sources the
 # lane anchors on); tokens that are not tracked files are ignored.
 path_refs = ["formal/concurrency-triangle.toml", "formal/concurrency-witnesses.tsv"]
-manifests = ["formal/loom-proof-kernel/Cargo.toml"]
+manifests = ["formal/loom-proof-kernel/Cargo.toml", "formal/shuttle-proof-kernel/Cargo.toml"]
 # Ignored build directories the lane writes into (bound read-write).
 writable = ["formal/loom-proof-kernel/target"]
 artifacts = [

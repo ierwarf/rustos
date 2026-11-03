@@ -267,7 +267,7 @@ pub(super) fn register_receiver(
     {
         waiter.request_capacity = request_capacity;
     } else {
-        if object.waiting_receivers.len() >= MAX_ENDPOINT_WAITERS {
+        if !object.waiter_capacity_available() {
             return Err(IpcError::NoMemory);
         }
         object

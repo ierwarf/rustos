@@ -25,8 +25,9 @@ static DWORD rustos_copy_ascii_output(char *buffer, DWORD size, const char *text
     }
     buffer[copied] = '\0';
     if (text[copied] != '\0') {
+        /* GetModuleFileName: truncated, NUL-terminated, returns nSize. */
         rustos_set_last_error(RUSTOS_ERROR_INSUFFICIENT_BUFFER);
-        return 0;
+        return size;
     }
     rustos_set_last_error(RUSTOS_ERROR_SUCCESS);
     return copied;
@@ -46,7 +47,7 @@ static DWORD rustos_copy_wide_output(WCHAR *buffer, DWORD size, const WCHAR *tex
     buffer[copied] = 0;
     if (text[copied] != 0) {
         rustos_set_last_error(RUSTOS_ERROR_INSUFFICIENT_BUFFER);
-        return 0;
+        return size;
     }
     rustos_set_last_error(RUSTOS_ERROR_SUCCESS);
     return copied;
@@ -188,6 +189,12 @@ static unsigned rustos_decode_utf8_codepoint(
         }
         result = (result << 6) | (first & 0x3fu);
     }
+    if ((needed == 3 && result < 0x800u)
+        || (needed == 4 && result < 0x10000u)
+        || (result >= 0xd800u && result <= 0xdfffu)
+        || result > 0x10ffffu) {
+        return 0;
+    }
     *codepoint = result;
     return needed;
 }
@@ -237,6 +244,8 @@ static int rustos_count_utf8_bytes(const WCHAR *src, int src_len, DWORD *require
             codepoint = 0x10000u
                 + (((codepoint - 0xd800u) << 10) | (src[consumed] - 0xdc00u));
             consumed++;
+        } else if (codepoint >= 0xdc00u && codepoint <= 0xdfffu) {
+            return FALSE;
         }
         if (codepoint < 0x80u) {
             required += 1u;
@@ -719,7 +728,8 @@ int MultiByteToWideChar(
     DWORD written = 0;
     int consumed = 0;
     (void)flags;
-    if (!rustos_is_supported_multibyte_code_page(code_page) || src == NULL) {
+    if (!rustos_is_supported_multibyte_code_page(code_page) || src == NULL
+        || src_len == 0 || dst_len < 0 || (dst == NULL && dst_len != 0)) {
         rustos_set_last_error(RUSTOS_ERROR_INVALID_PARAMETER);
         return 0;
     }
@@ -811,7 +821,8 @@ int WideCharToMultiByte(
     if (used_default != NULL) {
         *used_default = FALSE;
     }
-    if (!rustos_is_supported_multibyte_code_page(code_page) || src == NULL) {
+    if (!rustos_is_supported_multibyte_code_page(code_page) || src == NULL
+        || src_len == 0 || dst_len < 0 || (dst == NULL && dst_len != 0)) {
         rustos_set_last_error(RUSTOS_ERROR_INVALID_PARAMETER);
         return 0;
     }
@@ -873,20 +884,50 @@ int WideCharToMultiByte(
     return (int)written;
 }
 
+/*
+ * RustOS has no image loader reachable from ring3 PE code: LoadLibrary resolves
+ * only modules the loader already mapped (system DLL aliases included) and
+ * reports ERROR_MOD_NOT_FOUND for everything else.
+ */
 void *LoadLibraryA(const char *name)
 {
-    (void)name;
-    return NULL;
+    RustosLdrDataTableEntryLite *entry;
+    if (name == NULL || name[0] == '\0') {
+        rustos_set_last_error(RUSTOS_ERROR_INVALID_PARAMETER);
+        return NULL;
+    }
+    entry = rustos_find_loaded_module_a(name);
+    if (entry == NULL) {
+        rustos_set_last_error(RUSTOS_ERROR_MOD_NOT_FOUND);
+        return NULL;
+    }
+    rustos_set_last_error(RUSTOS_ERROR_SUCCESS);
+    return (void *)entry->dll_base;
 }
 
 void *LoadLibraryW(const WCHAR *name)
 {
-    (void)name;
-    return NULL;
+    RustosLdrDataTableEntryLite *entry;
+    if (name == NULL || name[0] == 0) {
+        rustos_set_last_error(RUSTOS_ERROR_INVALID_PARAMETER);
+        return NULL;
+    }
+    entry = rustos_find_loaded_module_w(name);
+    if (entry == NULL) {
+        rustos_set_last_error(RUSTOS_ERROR_MOD_NOT_FOUND);
+        return NULL;
+    }
+    rustos_set_last_error(RUSTOS_ERROR_SUCCESS);
+    return (void *)entry->dll_base;
 }
 
+/* Loader-mapped modules are never unloaded, so releasing one is a no-op. */
 int FreeLibrary(void *module)
 {
-    (void)module;
-    return 0;
+    if (module == NULL || rustos_find_loaded_module_by_base(module) == NULL) {
+        rustos_set_last_error(RUSTOS_ERROR_INVALID_HANDLE);
+        return FALSE;
+    }
+    rustos_set_last_error(RUSTOS_ERROR_SUCCESS);
+    return TRUE;
 }

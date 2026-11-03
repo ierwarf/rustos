@@ -1334,6 +1334,7 @@ while IFS='|' read -r model package test_name features; do
     fi
     group_rows["$group"]+="$witness_key"$'\n'
 done <<'EOF'
+child-wait-publication/ChildWaitPublication|kernel-ps|multitask::child_wait::tests::register_unregister_round_trip_frees_the_slot
 pager-fault-slot-lifecycle/PagerFaultSlotLifecycle|kernel-ps|multitask::scheduler::pager_handoff::tests::actual_pager_full_fifo_preserves_original_worker_wait_and_faulting_current
 pager-fault-slot-lifecycle/PagerFaultSlotLifecycle|kernel-ps|multitask::scheduler::pager_handoff::tests::actual_pager_does_not_clear_an_unrelated_rearmed_worker_wait
 frame-reader-claim/FrameReaderClaim|kernel-ps|multitask::scheduler::pager_handoff::tests::actual_pager_last_floor_effect_keeps_original_reader_binding_and_typed_phase

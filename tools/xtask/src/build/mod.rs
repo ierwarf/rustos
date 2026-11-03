@@ -1033,6 +1033,7 @@ fn build_mingw_c_exe(config: &Config, manifest: &PackageManifest) -> Result<()> 
             .arg("-Os")
             .arg("-s")
             .arg("-Wl,--image-base,0x400000")
+            .args(&manifest.build.extra_args)
             .arg("-o")
             .arg(&output)
             .arg(&source),

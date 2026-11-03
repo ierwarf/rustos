@@ -34,7 +34,7 @@ pub fn divisor_from_micros(microseconds: u64) -> u16 {
     divisor as u16
 }
 
-fn program(pit_number: u8, divisor: u16) {
+fn program_masked(pit_number: u8, divisor: u16) {
     if pit_number > MAX_CHANNEL {
         panic!("PIT number must be 0, 1, or 2");
     }
@@ -43,7 +43,9 @@ fn program(pit_number: u8, divisor: u16) {
         panic!("PIT divisor must be non-zero");
     }
 
-    interrupts::without_interrupts(|| unsafe {
+    assert!(!interrupts::are_enabled(), "PIT programming requires masked interrupts");
+    assert_eq!(nucleus_core::util::lockdep::current_cpu_index(), 0, "PIT programming is BSP-only");
+    unsafe {
         let mut command_port = Port::new(COMMAND_PORT);
         let mut data_port = Port::new(DATA_PORT_BASE + pit_number as u16);
         let channel_bits = pit_number << CHANNEL_SHIFT;
@@ -55,14 +57,16 @@ fn program(pit_number: u8, divisor: u16) {
         if let Some(last) = PROGRAMMED_DIVISOR.get(usize::from(pit_number)) {
             last.store(u32::from(divisor), Ordering::Relaxed);
         }
-    });
+    }
 }
 
 pub fn set_divisor(pit_number: u8, divisor: u16) {
-    if divisor_already_programmed(pit_number, divisor) {
-        return;
-    }
-    program(pit_number, divisor);
+    interrupts::without_interrupts(|| {
+        assert_eq!(nucleus_core::util::lockdep::current_cpu_index(), 0, "PIT programming is BSP-only");
+        if !divisor_already_programmed(pit_number, divisor) {
+            program_masked(pit_number, divisor);
+        }
+    });
 }
 
 fn divisor_already_programmed(pit_number: u8, divisor: u16) -> bool {
@@ -74,7 +78,7 @@ fn divisor_already_programmed(pit_number: u8, divisor: u16) -> bool {
 
 pub fn start_micros(pit_number: u8, microseconds: u64) {
     let divisor = divisor_from_micros(microseconds);
-    program(pit_number, divisor);
+    interrupts::without_interrupts(|| program_masked(pit_number, divisor));
 
     if pit_number == 0 {
         crate::arch::pic::enable_irq(0);

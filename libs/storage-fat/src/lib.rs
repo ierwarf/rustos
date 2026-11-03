@@ -350,6 +350,10 @@ impl<D: BlockDevice> FatVolume<D> {
         FatVolume::new(slice)
     }
 
+    fn max_dir_entries(&self) -> u64 {
+        self.device_bytes / 32 + 1
+    }
+
     pub fn open_file(&self, path: &str) -> Result<FatFile<'_, D>, FatError> {
         let normalized = normalize_fat_path(path);
         self.fs
@@ -372,7 +376,7 @@ impl<D: BlockDevice> FatVolume<D> {
         loop {
             let next = components.next();
             let want_dir = next.is_some();
-            let entry = find_entry_case_insensitive(&dir, component)?;
+            let entry = find_entry_case_insensitive(&dir, component, self.max_dir_entries())?;
             if want_dir {
                 if !entry.is_dir() {
                     return Err(fatfs::Error::InvalidInput);
@@ -409,7 +413,9 @@ impl<D: BlockDevice> FatVolume<D> {
         let (parent, child) =
             split_parent_child(normalized.as_str()).ok_or(fatfs::Error::InvalidInput)?;
         let dir = self.open_dir_by_path(parent)?;
-        for entry_result in dir.iter() {
+        let limit = self.max_dir_entries();
+        for (seen, entry_result) in dir.iter().enumerate() {
+            check_dir_walk(seen, limit)?;
             let entry = entry_result?;
             // Lookup is case-insensitive everywhere else (open/create), so
             // stat must agree or a file could open but not stat.
@@ -433,7 +439,9 @@ impl<D: BlockDevice> FatVolume<D> {
         let dir = self.open_dir_by_path(normalized.as_str())?;
 
         let mut entries = Vec::new();
-        for entry_result in dir.iter() {
+        let limit = self.max_dir_entries();
+        for (seen, entry_result) in dir.iter().enumerate() {
+            check_dir_walk(seen, limit)?;
             let entry = entry_result?;
             let name = entry.file_name();
             if name == "." || name == ".." {
@@ -602,6 +610,15 @@ pub fn normalize_fat_path(path: &str) -> String {
     normalized
 }
 
+/// A directory cannot hold more 32-byte records than fit on the device; a walk
+/// past that bound means a cyclic cluster chain in untrusted metadata.
+fn check_dir_walk(seen: usize, limit: u64) -> Result<(), FatError> {
+    if seen as u64 >= limit {
+        return Err(fatfs::Error::CorruptedFileSystem);
+    }
+    Ok(())
+}
+
 fn split_parent_child(path: &str) -> Option<(&str, &str)> {
     match path.rsplit_once('/') {
         Some((parent, child)) if !child.is_empty() => Some((parent, child)),
@@ -613,11 +630,13 @@ fn split_parent_child(path: &str) -> Option<(&str, &str)> {
 fn find_entry_case_insensitive<'a, D: BlockDevice>(
     dir: &InnerDir<'a, D>,
     name: &str,
+    limit: u64,
 ) -> Result<
     fatfs::DirEntry<'a, FatDisk<D>, fatfs::DefaultTimeProvider, fatfs::LossyOemCpConverter>,
     FatError,
 > {
-    for entry in dir.iter() {
+    for (seen, entry) in dir.iter().enumerate() {
+        check_dir_walk(seen, limit)?;
         let entry = entry?;
         if entry.file_name().eq_ignore_ascii_case(name) {
             return Ok(entry);
