@@ -5,8 +5,16 @@
 //!   canonicalized, nonoverlapping, and reserved around kernel assets.
 //! - **Lifecycle:** Reserved or free frames become allocated, then return once
 //!   to the free set; reserved frames never enter ordinary allocation.
-//! - **Concurrency:** The allocator mutation boundary is bounded and must not
-//!   invoke callbacks or services.
+//! - **Concurrency:** The central bitmap mutation boundary is bounded and must
+//!   not invoke callbacks or services. Single-frame traffic is absorbed by
+//!   per-CPU frame caches (magazines): a cache is a bounded stack of frames that
+//!   stay marked used in the central bitmap and are additionally marked in a
+//!   lock-free `cached` bitmap. Lock order is cache slot -> central allocator,
+//!   one slot at a time. A cached frame is *free*: it counts toward free
+//!   memory, the user watermark and the OOM watchdog (`free = central +
+//!   sum(cache counts)`), is returned to the central set before any contiguous
+//!   search, fixed claim or reported exhaustion, and is rejected as
+//!   `AlreadyFree` if released again.
 //! - **Failure:** Exhaustion is explicit; invalid, double, partial, and
 //!   reserved-range frees are rejected before mutation.
 //! - **Forbidden:** No fixed 4 KiB policy outside architecture page size, silent
@@ -16,7 +24,6 @@ use boot_protocol::{BootInfo, BootMemoryKind, BootMemoryRegion};
 use core::ptr;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
 use x86_64::PhysAddr;
 #[cfg(all(rustos_boot_image, not(test)))]
 use x86_64::instructions::interrupts;
@@ -60,8 +67,6 @@ pub(crate) const fn min_free_for(free_frames: usize) -> usize {
     }
 }
 
-static PHYS_ALLOCATOR: TrackedSpinLock<PhysAllocatorState, { LockClass::PhysicalAllocator as u8 }> =
-    TrackedSpinLock::new(PhysAllocatorState::new());
 
 mod frame_descriptor_ledger;
 pub use frame_descriptor_ledger::{
@@ -79,6 +84,9 @@ pub use frame_descriptor_ledger::{
 use frame_descriptor_ledger::{CowMappingRecord, FRAME_DESCRIPTORS, FrameDescriptorRecord};
 
 mod frame_batch_profile;
+mod frame_cache;
+pub use frame_cache::FrameCacheStats;
+use frame_cache::{FRAME_CACHE_SLOTS, PHYS_POOL, frame_cache_params};
 
 #[inline]
 fn irq_safe<T>(f: impl FnOnce() -> T) -> T {
@@ -115,23 +123,180 @@ pub enum FixedRangeClaimError {
 
 struct PhysAllocatorState {
     initialized: bool,
-    bitmap_ptr: *mut u64,
-    bitmap_words: usize,
-    frame_count: usize,
+    geo: Geometry,
     usable_frames: usize,
+    /// Frames free in the central bitmap. Frames parked in a per-CPU cache are
+    /// *not* counted here; see [`PhysPool::free_total`].
     free_frames: usize,
     /// Frames only kernel-class allocation may consume. See [`min_free_for`].
     min_free_frames: usize,
     next_hint: usize,
+}
+
+// SAFETY: the state is reachable only through the pool's central lock, whose
+// tracked raw-spin guard serializes every mutation and pins the holder to one
+// CPU. `Geometry` holds bitmap views whose words are atomics.
+unsafe impl Send for PhysAllocatorState {}
+
+/// Atomic word view over a frame bitmap that lives in direct-mapped memory.
+///
+/// The central `used` bitmap is mutated only under the central lock but is read
+/// lock-free by the cache release path, so every word is an `AtomicU64`.
+/// The `cached` bitmap is mutated lock-free with real atomic read-modify-writes.
+#[derive(Clone, Copy)]
+struct BitmapView {
+    ptr: *const AtomicU64,
+    words: usize,
+}
+
+// SAFETY: the view only hands out `&AtomicU64`; concurrent access is atomic.
+unsafe impl Send for BitmapView {}
+// SAFETY: as above.
+unsafe impl Sync for BitmapView {}
+
+impl BitmapView {
+    /// A view of an allocator that has no cache bitmap: every bit reads clear.
+    const EMPTY: Self = Self {
+        ptr: ptr::null(),
+        words: 0,
+    };
+
+    fn from_raw(ptr: *mut u64, words: usize) -> Self {
+        Self {
+            ptr: ptr.cast_const().cast::<AtomicU64>(),
+            words,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.words == 0 || self.ptr.is_null()
+    }
+
+    fn word(&self, index: usize) -> &AtomicU64 {
+        assert!(index < self.words, "frame bitmap word out of range");
+        // SAFETY: `index < words`, and `from_raw` was given `words` live,
+        // 8-byte-aligned words of reserved direct-mapped memory that is never
+        // freed; `AtomicU64` has the layout of `u64`.
+        unsafe { &*self.ptr.add(index) }
+    }
+
+    /// Plain word load for a bitmap whose writers hold the central lock.
+    fn load_word(&self, index: usize) -> u64 {
+        // ORDERING: Relaxed; the central lock orders every writer, and a
+        // lock-free reader only inspects bits of frames it owns.
+        self.word(index).load(Ordering::Relaxed)
+    }
+
+    fn store_word(&self, index: usize, value: u64) {
+        // ORDERING: Relaxed; only the central-lock holder stores, so the lock
+        // release publishes the word to the next holder.
+        self.word(index).store(value, Ordering::Relaxed);
+    }
+
+    fn get(&self, frame: usize) -> bool {
+        if self.is_empty() {
+            return false;
+        }
+        self.load_word(frame / BITS_PER_WORD) & (1_u64 << (frame % BITS_PER_WORD)) != 0
+    }
+
+    /// Sets the bit and returns whether it was already set.
+    fn test_and_set(&self, frame: usize) -> bool {
+        if self.is_empty() {
+            return false;
+        }
+        let bit = 1_u64 << (frame % BITS_PER_WORD);
+        // ORDERING: AcqRel makes this the single arbiter between concurrent
+        // releases of one frame and publishes the claim before the frame is
+        // pushed to a cache.
+        self.word(frame / BITS_PER_WORD)
+            .fetch_or(bit, Ordering::AcqRel)
+            & bit
+            != 0
+    }
+
+    fn clear(&self, frame: usize) {
+        if self.is_empty() {
+            return;
+        }
+        // ORDERING: Release orders the preceding central-bitmap update before
+        // the frame stops being visible as cached.
+        self.word(frame / BITS_PER_WORD)
+            .fetch_and(!(1_u64 << (frame % BITS_PER_WORD)), Ordering::Release);
+    }
+
+    fn get_acquire(&self, frame: usize) -> bool {
+        if self.is_empty() {
+            return false;
+        }
+        // ORDERING: Acquire pairs with the Release in `clear`.
+        self.word(frame / BITS_PER_WORD).load(Ordering::Acquire)
+            & (1_u64 << (frame % BITS_PER_WORD))
+            != 0
+    }
+}
+
+/// Immutable-after-init description of the frame space, copied out of the
+/// state so the cache release path can validate a frame without any lock.
+#[derive(Clone, Copy)]
+struct Geometry {
+    frame_count: usize,
     usable_ranges: [UsableFrameRange; MAX_USABLE_RANGES],
     usable_range_count: usize,
     bitmap_phys_start: u64,
+    /// Pages of both bitmaps (`used` then `cached`).
     bitmap_page_count: usize,
+    used: BitmapView,
+    cached: BitmapView,
+    cache_batch: usize,
+    cache_high: usize,
 }
 
-// SAFETY: the state is reachable only through PHYS_ALLOCATOR, whose tracked
-// raw-spin guard serializes every mutation and pins the holder to one CPU.
-unsafe impl Send for PhysAllocatorState {}
+impl Geometry {
+    const fn new() -> Self {
+        let (cache_batch, cache_high) = frame_cache_params(0);
+        Self {
+            frame_count: 0,
+            usable_ranges: [UsableFrameRange::EMPTY; MAX_USABLE_RANGES],
+            usable_range_count: 0,
+            bitmap_phys_start: 0,
+            bitmap_page_count: 0,
+            used: BitmapView::EMPTY,
+            cached: BitmapView::EMPTY,
+            cache_batch,
+            cache_high,
+        }
+    }
+
+    fn is_boot_usable(&self, frame_index: usize) -> bool {
+        self.usable_ranges[..self.usable_range_count]
+            .iter()
+            .any(|range| range.contains(frame_index))
+    }
+
+    /// Every release check that does not depend on allocation state.
+    fn validate_release(&self, phys: PhysAddr) -> Result<usize, FreeFrameError> {
+        let phys_addr = phys.as_u64();
+        if !phys_addr.is_multiple_of(PAGE_SIZE) {
+            return Err(FreeFrameError::NonPageAligned);
+        }
+        let frame_index = (phys_addr / PAGE_SIZE) as usize;
+        if frame_index >= self.frame_count {
+            return Err(FreeFrameError::OutsideAllocatorRange);
+        }
+        if !self.is_boot_usable(frame_index) {
+            return Err(FreeFrameError::Reserved);
+        }
+        if self.bitmap_phys_start != 0 {
+            let bitmap_start = self.bitmap_phys_start;
+            let bitmap_end = bitmap_start + self.bitmap_page_count as u64 * PAGE_SIZE;
+            if (bitmap_start..bitmap_end).contains(&phys_addr) {
+                return Err(FreeFrameError::BitmapBacking);
+            }
+        }
+        Ok(frame_index)
+    }
+}
 
 #[derive(Clone, Copy)]
 struct UsableFrameRange {
@@ -155,58 +320,32 @@ impl PhysAllocatorState {
     const fn new() -> Self {
         Self {
             initialized: false,
-            bitmap_ptr: ptr::null_mut(),
-            bitmap_words: 0,
-            frame_count: 0,
+            geo: Geometry::new(),
             usable_frames: 0,
             free_frames: 0,
             min_free_frames: 0,
             next_hint: 0,
-            usable_ranges: [UsableFrameRange::EMPTY; MAX_USABLE_RANGES],
-            usable_range_count: 0,
-            bitmap_phys_start: 0,
-            bitmap_page_count: 0,
-        }
-    }
-
-    fn bitmap(&self) -> &[u64] {
-        if self.bitmap_words == 0 || self.bitmap_ptr.is_null() {
-            &[]
-        } else {
-            // SAFETY: non-null (checked above) and spans `bitmap_words` u64
-            // words reserved and direct-mapped by `init`, never freed; `&self`
-            // is reachable only under the allocator lock, so no writer aliases.
-            unsafe { core::slice::from_raw_parts(self.bitmap_ptr.cast_const(), self.bitmap_words) }
-        }
-    }
-
-    fn bitmap_mut(&mut self) -> &mut [u64] {
-        if self.bitmap_words == 0 || self.bitmap_ptr.is_null() {
-            &mut []
-        } else {
-            // SAFETY: as for `bitmap`; `&mut self` is only reachable through
-            // the allocator lock's exclusive guard, so this is the only live
-            // reference to the bitmap words.
-            unsafe { core::slice::from_raw_parts_mut(self.bitmap_ptr, self.bitmap_words) }
         }
     }
 
     fn set_used(&mut self, frame_index: usize) {
         let word_index = frame_index / BITS_PER_WORD;
-        let bit_index = frame_index % BITS_PER_WORD;
-        self.bitmap_mut()[word_index] |= 1_u64 << bit_index;
+        let word = self.geo.used.load_word(word_index);
+        self.geo
+            .used
+            .store_word(word_index, word | (1_u64 << (frame_index % BITS_PER_WORD)));
     }
 
     fn set_free(&mut self, frame_index: usize) {
         let word_index = frame_index / BITS_PER_WORD;
-        let bit_index = frame_index % BITS_PER_WORD;
-        self.bitmap_mut()[word_index] &= !(1_u64 << bit_index);
+        let word = self.geo.used.load_word(word_index);
+        self.geo
+            .used
+            .store_word(word_index, word & !(1_u64 << (frame_index % BITS_PER_WORD)));
     }
 
     fn is_used(&self, frame_index: usize) -> bool {
-        let word_index = frame_index / BITS_PER_WORD;
-        let bit_index = frame_index % BITS_PER_WORD;
-        (self.bitmap()[word_index] & (1_u64 << bit_index)) != 0
+        self.geo.used.get(frame_index)
     }
 
     /// Applies `set` to every bit of `[frame_start, frame_start + page_count)`
@@ -214,7 +353,7 @@ impl PhysAllocatorState {
     /// under the allocator lock instead of one read-modify-write per frame.
     fn update_range_words(&mut self, frame_start: usize, page_count: usize, set: bool) {
         let end = frame_start.saturating_add(page_count);
-        let bitmap = self.bitmap_mut();
+        let bitmap = self.geo.used;
         let mut frame = frame_start;
         while frame < end {
             let word_index = frame / BITS_PER_WORD;
@@ -225,11 +364,8 @@ impl PhysAllocatorState {
             } else {
                 ((1_u64 << bits) - 1) << bit_index
             };
-            if set {
-                bitmap[word_index] |= mask;
-            } else {
-                bitmap[word_index] &= !mask;
-            }
+            let word = bitmap.load_word(word_index);
+            bitmap.store_word(word_index, if set { word | mask } else { word & !mask });
             frame += bits;
         }
     }
@@ -259,7 +395,7 @@ impl PhysAllocatorState {
         }
 
         let start_frame = (start / PAGE_SIZE) as usize;
-        let end_frame = ((end / PAGE_SIZE) as usize).min(self.frame_count);
+        let end_frame = ((end / PAGE_SIZE) as usize).min(self.geo.frame_count);
         let mut reserved = 0usize;
         for frame_index in start_frame..end_frame {
             if frame_is_boot_usable(self, frame_index) && !self.is_used(frame_index) {
@@ -288,7 +424,7 @@ impl PhysAllocatorState {
         let end = phys_start
             .checked_add(byte_len)
             .ok_or(FixedRangeClaimError::InvalidRange)?;
-        let allocator_end = (self.frame_count as u64)
+        let allocator_end = (self.geo.frame_count as u64)
             .checked_mul(PAGE_SIZE)
             .ok_or(FixedRangeClaimError::InvalidRange)?;
         if end > allocator_end {
@@ -317,8 +453,9 @@ impl PhysAllocatorState {
         Ok(())
     }
 
+    #[cfg(test)]
     fn alloc_contiguous_locked(&mut self, page_count: usize) -> Option<PhysAddr> {
-        self.alloc_contiguous_bounded_locked(page_count, self.frame_count)
+        self.alloc_contiguous_bounded_locked(page_count, self.geo.frame_count)
     }
 
     /// Fills `out` with up to `out.len()` single frames under one lock hold,
@@ -328,6 +465,7 @@ impl PhysAllocatorState {
     /// use this instead of a contiguous run, which is a strictly harder
     /// search this caller does not need and can fail under fragmentation
     /// where single-frame allocation would not.
+    #[cfg(test)]
     fn alloc_frames_locked(&mut self, out: &mut [PhysAddr]) -> usize {
         self.alloc_frames_locked_with_fault_gate(out, || {
             nucleus_core::util::fault_injection::should_fail("alloc.frame")
@@ -342,10 +480,20 @@ impl PhysAllocatorState {
     /// is short - heap growth, address-space retirement, IPC, the fault-frame
     /// reserve's own producer excepted - so a refusal here can still be
     /// reported and resolved instead of wedging the kernel.
-    fn alloc_user_frames_locked(&mut self, out: &mut [PhysAddr]) -> usize {
-        let admissible = self.free_frames.saturating_sub(self.min_free_frames);
+    ///
+    /// `cached_frames` are free frames parked in per-CPU caches. They are part
+    /// of the memory the reserve is measured against, but this call fills only
+    /// from the central bitmap, so a short fill with `cached_frames != 0` tells
+    /// the caller to drain the caches and retry rather than report exhaustion.
+    fn alloc_user_frames_locked(
+        &mut self,
+        out: &mut [PhysAddr],
+        cached_frames: usize,
+        should_fail: impl FnMut() -> bool,
+    ) -> usize {
+        let admissible = (self.free_frames + cached_frames).saturating_sub(self.min_free_frames);
         let want = out.len().min(admissible);
-        let filled = self.alloc_frames_locked(&mut out[..want]);
+        let filled = self.alloc_frames_locked_with_fault_gate(&mut out[..want], should_fail);
         if filled < out.len() && admissible < out.len() {
             USER_WATERMARK_DENIALS.fetch_add(1, Ordering::Relaxed);
         }
@@ -363,7 +511,7 @@ impl PhysAllocatorState {
                 crate::debug::warn!(memory, "fault injection: alloc.frame failed");
                 break;
             }
-            match self.alloc_contiguous_bounded_locked(1, self.frame_count) {
+            match self.alloc_contiguous_bounded_locked(1, self.geo.frame_count) {
                 Some(addr) => {
                     out[filled] = addr;
                     filled += 1;
@@ -379,10 +527,26 @@ impl PhysAllocatorState {
         page_count: usize,
         max_frame_exclusive: usize,
     ) -> Option<PhysAddr> {
+        let start_frame = self.find_alloc_start_locked(page_count, max_frame_exclusive)?;
+        self.commit_alloc_locked(start_frame, page_count);
+        Some(PhysAddr::new(start_frame as u64 * PAGE_SIZE))
+    }
+
+    fn commit_alloc_locked(&mut self, start_frame: usize, page_count: usize) {
+        self.mark_range_used(start_frame, page_count);
+        self.free_frames = self.free_frames.saturating_sub(page_count);
+        self.next_hint = start_frame.saturating_add(page_count);
+    }
+
+    fn find_alloc_start_locked(
+        &self,
+        page_count: usize,
+        max_frame_exclusive: usize,
+    ) -> Option<usize> {
         if !self.initialized || page_count == 0 || page_count > self.free_frames {
             return None;
         }
-        let bounded_frame_count = self.frame_count.min(max_frame_exclusive);
+        let bounded_frame_count = self.geo.frame_count.min(max_frame_exclusive);
         if page_count > bounded_frame_count {
             return None;
         }
@@ -399,12 +563,6 @@ impl PhysAllocatorState {
             bounded_frame_count,
         )
         .or_else(|| self.find_contiguous_free_range(0, start_hint, page_count, bounded_frame_count))
-        .map(|start_frame| {
-            self.mark_range_used(start_frame, page_count);
-            self.free_frames = self.free_frames.saturating_sub(page_count);
-            self.next_hint = start_frame.saturating_add(page_count);
-            PhysAddr::new(start_frame as u64 * PAGE_SIZE)
-        })
     }
 
     fn find_contiguous_free_range(
@@ -419,7 +577,7 @@ impl PhysAllocatorState {
         }
 
         let mut scanned = 0usize;
-        for range in &self.usable_ranges[..self.usable_range_count] {
+        for range in &self.geo.usable_ranges[..self.geo.usable_range_count] {
             let range_start = range.start_frame.max(start);
             let range_end = range
                 .start_frame
@@ -457,7 +615,7 @@ impl PhysAllocatorState {
             } else {
                 (1_u64 << bit_index) - 1
             };
-            let word = self.bitmap()[word_index] | before_frame_mask;
+            let word = self.geo.used.load_word(word_index) | before_frame_mask;
             if word != u64::MAX {
                 let candidate = word_index * BITS_PER_WORD + (!word).trailing_zeros() as usize;
                 if candidate < end {
@@ -480,7 +638,7 @@ impl PhysAllocatorState {
             let max_bits = remaining_word_bits
                 .min(remaining_range_bits)
                 .min(remaining_limit_bits);
-            let shifted = self.bitmap()[word_index] >> bit_index;
+            let shifted = self.geo.used.load_word(word_index) >> bit_index;
             let free_bits = (!shifted).trailing_ones() as usize;
             let advance = free_bits.min(max_bits);
             run_len += advance;
@@ -505,33 +663,38 @@ impl PhysAllocatorState {
     }
 
     fn free_frame_locked(&mut self, phys: PhysAddr) -> Result<(), FreeFrameError> {
-        let phys_addr = phys.as_u64();
-        if !phys_addr.is_multiple_of(PAGE_SIZE) {
-            return Err(FreeFrameError::NonPageAligned);
-        }
-
-        let frame_index = (phys_addr / PAGE_SIZE) as usize;
-        if frame_index >= self.frame_count {
-            return Err(FreeFrameError::OutsideAllocatorRange);
-        }
-        if !frame_is_boot_usable(self, frame_index) {
-            return Err(FreeFrameError::Reserved);
-        }
-        if self.bitmap_phys_start != 0 {
-            let bitmap_start = self.bitmap_phys_start;
-            let bitmap_end = bitmap_start + self.bitmap_page_count as u64 * PAGE_SIZE;
-            if (bitmap_start..bitmap_end).contains(&phys_addr) {
-                return Err(FreeFrameError::BitmapBacking);
-            }
-        }
-        if !self.is_used(frame_index) {
+        let frame_index = self.geo.validate_release(phys)?;
+        // The `cached` bit arbitrates against a concurrent release of the same
+        // frame through a CPU cache: whoever sets it first owns the release.
+        if self.geo.cached.test_and_set(frame_index) {
             return Err(FreeFrameError::AlreadyFree);
         }
+        if !self.is_used(frame_index) {
+            self.geo.cached.clear(frame_index);
+            return Err(FreeFrameError::AlreadyFree);
+        }
+        self.return_to_central_locked(frame_index);
+        self.geo.cached.clear(frame_index);
+        Ok(())
+    }
 
+    /// Marks a used (allocated or cached) frame free in the central bitmap.
+    /// Clearing `used` before the caller clears `cached` keeps a racing
+    /// duplicate release rejected throughout the transition.
+    fn return_to_central_locked(&mut self, frame_index: usize) {
         self.set_free(frame_index);
         self.free_frames = self.free_frames.saturating_add(1);
         self.next_hint = self.next_hint.min(frame_index);
-        Ok(())
+    }
+
+    /// Picks a free frame for a CPU cache and publishes it as `cached` before
+    /// it is marked used, so no window shows a used, uncached frame that a
+    /// duplicate release could mistake for an allocation.
+    fn take_frame_for_cache_locked(&mut self) -> Option<usize> {
+        let start = self.find_alloc_start_locked(1, self.geo.frame_count)?;
+        self.geo.cached.test_and_set(start);
+        self.commit_alloc_locked(start, 1);
+        Some(start)
     }
 
     /// Frees every frame in `frames` under one lock hold. Every failure is
@@ -559,7 +722,7 @@ impl PhysAllocatorState {
 
 pub fn init(boot_info_ptr: *const BootInfo) {
     irq_safe(|| {
-        let mut state = PHYS_ALLOCATOR.lock();
+        let mut state = PHYS_POOL.state.lock();
         if state.initialized {
             return;
         }
@@ -581,8 +744,12 @@ pub fn init(boot_info_ptr: *const BootInfo) {
 
         let frame_count = (max_phys_end / PAGE_SIZE) as usize;
         let bitmap_words = frame_count.div_ceil(BITS_PER_WORD);
-        let bitmap_bytes = bitmap_words
+        let used_bitmap_bytes = bitmap_words
             .checked_mul(core::mem::size_of::<u64>())
+            .expect("physical allocator bitmap size overflow");
+        // The `used` bitmap is followed by the same-sized `cached` bitmap.
+        let bitmap_bytes = used_bitmap_bytes
+            .checked_mul(2)
             .expect("physical allocator bitmap size overflow");
         let bitmap_pages = bitmap_bytes.div_ceil(PAGE_SIZE as usize);
         let frame_descriptor_bytes = frame_count
@@ -643,7 +810,8 @@ pub fn init(boot_info_ptr: *const BootInfo) {
         // `bitmap_bytes`, and is reached through the direct map. `init` runs
         // once before any allocation, so nothing else references the region.
         unsafe {
-            ptr::write_bytes(bitmap_ptr.cast::<u8>(), 0xff, bitmap_bytes);
+            ptr::write_bytes(bitmap_ptr.cast::<u8>(), 0, bitmap_bytes);
+            ptr::write_bytes(bitmap_ptr.cast::<u8>(), 0xff, used_bitmap_bytes);
         }
 
         let Some(frame_descriptor_phys) = find_usable_span_excluding_ranges(
@@ -699,31 +867,26 @@ pub fn init(boot_info_ptr: *const BootInfo) {
             cow_mapping_count,
         );
 
-        let mut new_state = PhysAllocatorState {
-            initialized: false,
-            bitmap_ptr,
-            bitmap_words,
-            frame_count,
-            usable_frames: 0,
-            free_frames: 0,
-            min_free_frames: 0,
-            next_hint: 0,
-            usable_ranges: [UsableFrameRange::EMPTY; MAX_USABLE_RANGES],
-            usable_range_count: 0,
-            bitmap_phys_start: bitmap_phys,
-            bitmap_page_count: bitmap_pages,
-        };
+        let mut new_state = PhysAllocatorState::new();
+        new_state.geo.frame_count = frame_count;
+        new_state.geo.used = BitmapView::from_raw(bitmap_ptr, bitmap_words);
+        // SAFETY: the allocation spans `2 * bitmap_words` words, so the second
+        // half starts `bitmap_words` words past the base, inside the region.
+        new_state.geo.cached =
+            BitmapView::from_raw(unsafe { bitmap_ptr.add(bitmap_words) }, bitmap_words);
+        new_state.geo.bitmap_phys_start = bitmap_phys;
+        new_state.geo.bitmap_page_count = bitmap_pages;
 
         for (start_phys, page_count) in usable_region_spans(memory_map) {
             let start_frame = (start_phys / PAGE_SIZE) as usize;
-            if new_state.usable_range_count >= MAX_USABLE_RANGES {
+            if new_state.geo.usable_range_count >= MAX_USABLE_RANGES {
                 panic!("boot memory map has too many usable ranges");
             }
-            new_state.usable_ranges[new_state.usable_range_count] = UsableFrameRange {
+            new_state.geo.usable_ranges[new_state.geo.usable_range_count] = UsableFrameRange {
                 start_frame,
                 page_count,
             };
-            new_state.usable_range_count += 1;
+            new_state.geo.usable_range_count += 1;
             new_state.mark_range_free(start_frame, page_count);
             new_state.usable_frames = new_state
                 .usable_frames
@@ -749,29 +912,12 @@ pub fn init(boot_info_ptr: *const BootInfo) {
         );
         new_state.reserve_phys_range(cow_mapping_phys, cow_mapping_pages as u64 * PAGE_SIZE);
         new_state.min_free_frames = min_free_for(new_state.free_frames);
+        (new_state.geo.cache_batch, new_state.geo.cache_high) =
+            frame_cache_params(new_state.usable_frames);
         new_state.initialized = true;
 
-        *state = new_state;
+        PHYS_POOL.install_locked(&mut state, new_state);
     });
-}
-
-/// Allocates one frame for a user-driven mapping, refusing to dip into the
-/// kernel reserve.
-///
-/// Anonymous first touch, copy-on-write, page-table growth for a user range,
-/// and process creation are user-class. Kernel structures that must make
-/// progress under pressure keep using [`alloc_frame`].
-pub fn alloc_frame_user() -> Option<PhysAddr> {
-    let mut out = [PhysAddr::new(0)];
-    (alloc_frames_batch_user(&mut out) == 1).then_some(out[0])
-}
-
-pub fn alloc_frame() -> Option<PhysAddr> {
-    alloc_frame_with_fault_gate(
-        nucleus_core::util::fault_injection::should_fail("alloc.frame"),
-        || crate::debug::warn!(memory, "fault injection: alloc.frame failed"),
-        || alloc_contiguous(1),
-    )
 }
 
 /// Reports whether every frame of an exact range is withheld from ordinary
@@ -784,13 +930,16 @@ pub fn alloc_frame() -> Option<PhysAddr> {
 /// permission the collision surfaces as a kernel write fault far from its
 /// cause. Ownership and hardening must be checked together, at the point the
 /// hardening happens.
+///
+/// A frame parked in a CPU cache reads as used in the central bitmap but is
+/// allocatable, so it is not withheld.
 pub fn range_is_withheld_from_allocation(phys_start: u64, byte_len: u64) -> bool {
     if byte_len == 0 || !phys_start.is_multiple_of(PAGE_SIZE) || !byte_len.is_multiple_of(PAGE_SIZE)
     {
         return false;
     }
     irq_safe(|| {
-        let state = PHYS_ALLOCATOR.lock();
+        let state = PHYS_POOL.state.lock();
         if !state.initialized {
             return false;
         }
@@ -801,9 +950,9 @@ pub fn range_is_withheld_from_allocation(phys_start: u64, byte_len: u64) -> bool
             return false;
         };
         (start_frame..start_frame.saturating_add(pages)).all(|frame| {
-            frame >= state.frame_count
+            frame >= state.geo.frame_count
                 || !frame_is_boot_usable(&state, frame)
-                || state.is_used(frame)
+                || (state.is_used(frame) && !state.geo.cached.get_acquire(frame))
         })
     })
 }
@@ -812,11 +961,33 @@ pub fn range_is_withheld_from_allocation(phys_start: u64, byte_len: u64) -> bool
 /// allocator. Architecture bootstrap code uses this only after resolving the
 /// complete fixed range and before writing any byte into it.
 pub fn claim_fixed_range(phys_start: u64, byte_len: u64) -> Result<(), FixedRangeClaimError> {
-    irq_safe(|| {
-        PHYS_ALLOCATOR
-            .lock()
-            .claim_fixed_range_locked(phys_start, byte_len)
-    })
+    irq_safe(|| PHYS_POOL.claim_fixed_range(phys_start, byte_len))
+}
+
+/// The cache slot of the calling CPU. Any slot is correct - slots are locked -
+/// so a stale or shared index costs only contention.
+#[inline]
+fn current_cache_slot() -> usize {
+    nucleus_core::util::lockdep::current_cpu_index() % FRAME_CACHE_SLOTS
+}
+
+pub fn alloc_frame() -> Option<PhysAddr> {
+    alloc_frame_with_fault_gate(
+        nucleus_core::util::fault_injection::should_fail("alloc.frame"),
+        || crate::debug::warn!(memory, "fault injection: alloc.frame failed"),
+        || alloc_contiguous(1),
+    )
+}
+
+/// Allocates one frame for a user-driven mapping, refusing to dip into the
+/// kernel reserve.
+///
+/// Anonymous first touch, copy-on-write, page-table growth for a user range,
+/// and process creation are user-class. Kernel structures that must make
+/// progress under pressure keep using [`alloc_frame`].
+pub fn alloc_frame_user() -> Option<PhysAddr> {
+    let mut out = [PhysAddr::new(0)];
+    (alloc_frames_batch_user(&mut out) == 1).then_some(out[0])
 }
 
 fn alloc_frame_with_fault_gate(
@@ -833,33 +1004,39 @@ fn alloc_frame_with_fault_gate(
 }
 
 pub fn alloc_contiguous(page_count: usize) -> Option<PhysAddr> {
-    irq_safe(|| PHYS_ALLOCATOR.lock().alloc_contiguous_locked(page_count))
+    irq_safe(|| PHYS_POOL.alloc_contiguous(current_cache_slot(), page_count, usize::MAX))
 }
 
 pub fn alloc_contiguous_below(page_count: usize, max_phys_addr_inclusive: u64) -> Option<PhysAddr> {
-    irq_safe(|| {
-        let mut state = PHYS_ALLOCATOR.lock();
-        let Some(max_end_exclusive) = max_phys_addr_inclusive.checked_add(1) else {
-            return state.alloc_contiguous_locked(page_count);
-        };
-        let max_frame_exclusive =
-            usize::try_from(max_end_exclusive / PAGE_SIZE).unwrap_or(usize::MAX);
-        state.alloc_contiguous_bounded_locked(page_count, max_frame_exclusive)
-    })
+    let max_frame_exclusive = max_phys_addr_inclusive
+        .checked_add(1)
+        .map_or(usize::MAX, |end| {
+            usize::try_from(end / PAGE_SIZE).unwrap_or(usize::MAX)
+        });
+    irq_safe(|| PHYS_POOL.alloc_contiguous(current_cache_slot(), page_count, max_frame_exclusive))
 }
 
 pub fn try_free_frame(phys: PhysAddr) -> Result<(), FreeFrameError> {
-    irq_safe(|| PHYS_ALLOCATOR.lock().free_frame_locked(phys))
+    let mut failures = [(PhysAddr::new(0), FreeFrameError::AlreadyFree)];
+    let frames = [phys];
+    match irq_safe(|| PHYS_POOL.release_frames(current_cache_slot(), &frames, &mut failures)) {
+        0 => Ok(()),
+        _ => Err(failures[0].1),
+    }
 }
 
-/// Fills `out` with independent (not necessarily adjacent) frames under one
-/// lock acquisition, for callers that would otherwise call `alloc_frame` once
-/// per page in a loop — a process's private address-space population is the
-/// motivating case. Returns the number of frames actually filled; a short
-/// fill (fewer than `out.len()`) means the allocator ran out, mirroring what
-/// a per-page `alloc_frame()` loop would have found on its next iteration.
+/// Fills `out` with independent (not necessarily adjacent) frames, for callers
+/// that would otherwise call `alloc_frame` once per page in a loop - a
+/// process's private address-space population is the motivating case. Returns
+/// the number of frames actually filled; a short fill (fewer than `out.len()`)
+/// means the allocator ran out, mirroring what a per-page `alloc_frame()` loop
+/// would have found on its next iteration.
 pub fn alloc_frames_batch(out: &mut [PhysAddr]) -> usize {
-    let filled = irq_safe(|| PHYS_ALLOCATOR.lock().alloc_frames_locked(out));
+    let filled = irq_safe(|| {
+        PHYS_POOL.alloc_frames(current_cache_slot(), out, false, || {
+            nucleus_core::util::fault_injection::should_fail("alloc.frame")
+        })
+    });
     frame_batch_profile::record_allocation(out.len(), filled);
     filled
 }
@@ -867,22 +1044,26 @@ pub fn alloc_frames_batch(out: &mut [PhysAddr]) -> usize {
 /// User-class [`alloc_frames_batch`]: fills no more than the frames above the
 /// kernel reserve. A short fill means pressure, not only exhaustion.
 pub fn alloc_frames_batch_user(out: &mut [PhysAddr]) -> usize {
-    let filled = irq_safe(|| PHYS_ALLOCATOR.lock().alloc_user_frames_locked(out));
+    let filled = irq_safe(|| {
+        PHYS_POOL.alloc_frames(current_cache_slot(), out, true, || {
+            nucleus_core::util::fault_injection::should_fail("alloc.frame")
+        })
+    });
     frame_batch_profile::record_allocation(out.len(), filled);
     filled
 }
 
 /// Frames the kernel withholds from user-class allocation.
 pub fn min_free_bytes() -> u64 {
-    irq_safe(|| PHYS_ALLOCATOR.lock().min_free_frames as u64 * PAGE_SIZE)
+    // ORDERING: Relaxed; immutable after allocator initialization.
+    PHYS_POOL.min_free.load(Ordering::Relaxed) as u64 * PAGE_SIZE
 }
 
-/// Whether free memory is at or below the user-class watermark.
+/// Whether free memory is at or below the user-class watermark. Frames parked
+/// in CPU caches count as free.
 pub fn below_user_watermark() -> bool {
-    irq_safe(|| {
-        let state = PHYS_ALLOCATOR.lock();
-        state.free_frames <= state.min_free_frames
-    })
+    // ORDERING: Relaxed; immutable after allocator initialization.
+    PHYS_POOL.free_total() <= PHYS_POOL.min_free.load(Ordering::Relaxed)
 }
 
 /// Count of user-class allocations refused or truncated by the watermark.
@@ -890,11 +1071,33 @@ pub fn user_watermark_denials() -> u64 {
     USER_WATERMARK_DENIALS.load(Ordering::Relaxed)
 }
 
-/// Frees every frame in `frames` under one lock acquisition. Failures are
-/// written into `failures` (per-slot, extras beyond its length are counted
-/// but not recorded) so the caller can log them *after* the lock and any
-/// IRQ-off region has already ended — logging must never happen while
-/// `PHYS_ALLOCATOR` is held. Returns the number of failures.
+/// Frames parked in per-CPU caches; they are included in [`free_bytes`].
+pub fn cached_frame_count() -> usize {
+    PHYS_POOL.cached_total()
+}
+
+/// Cache slow-path counters, for diagnostics.
+pub fn frame_cache_stats() -> FrameCacheStats {
+    PHYS_POOL.stats()
+}
+
+/// Returns every cached frame to the central set. Safe from any CPU at any time
+/// (slots are locked); a CPU leaving service calls this for its own slot so
+/// its frames rejoin contiguous allocation.
+pub fn drain_cpu_frame_cache(cpu_index: usize) {
+    irq_safe(|| PHYS_POOL.drain_slot(cpu_index));
+}
+
+/// Returns every CPU's cached frames to the central set.
+pub fn drain_all_frame_caches() {
+    irq_safe(|| PHYS_POOL.drain_all());
+}
+
+/// Frees every frame in `frames`. Failures are written into `failures`
+/// (per-slot, extras beyond its length are counted but not recorded) so the
+/// caller can log them *after* the lock and any IRQ-off region has already
+/// ended - logging must never happen while an allocator lock is held. Returns
+/// the number of failures.
 pub fn try_free_frames_batch(
     frames: &[PhysAddr],
     failures: &mut [(PhysAddr, FreeFrameError)],
@@ -918,7 +1121,7 @@ fn try_free_frames_batch_profiled(
     failures: &mut [(PhysAddr, FreeFrameError)],
     rollback: bool,
 ) -> usize {
-    let failed = irq_safe(|| PHYS_ALLOCATOR.lock().free_frames_locked(frames, failures));
+    let failed = irq_safe(|| PHYS_POOL.release_frames(current_cache_slot(), frames, failures));
     frame_batch_profile::record_free(frames.len(), failed, rollback);
     failed
 }
@@ -956,13 +1159,13 @@ pub fn free_frame(phys: PhysAddr) {
 }
 
 pub fn usable_bytes() -> u64 {
-    irq_safe(|| PHYS_ALLOCATOR.lock().usable_frames as u64 * PAGE_SIZE)
+    irq_safe(|| PHYS_POOL.state.lock().usable_frames as u64 * PAGE_SIZE)
 }
 
 // DIAGNOSTIC: Release kernels omit the physical-memory status printer.
 #[cfg_attr(not(rustos_debug_print_enabled), allow(dead_code))]
 pub fn free_bytes() -> u64 {
-    irq_safe(|| PHYS_ALLOCATOR.lock().free_frames as u64 * PAGE_SIZE)
+    PHYS_POOL.free_total() as u64 * PAGE_SIZE
 }
 
 fn boot_info_from_ptr(boot_info_ptr: *const BootInfo) -> &'static BootInfo {
@@ -1072,31 +1275,23 @@ fn align_up(value: u64, align: u64) -> Option<u64> {
 }
 
 fn frame_is_boot_usable(state: &PhysAllocatorState, frame_index: usize) -> bool {
-    state.usable_ranges[..state.usable_range_count]
-        .iter()
-        .any(|range| range.contains(frame_index))
+    state.geo.is_boot_usable(frame_index)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn test_state(bitmap: &mut [u64], page_count: usize, next_hint: usize) -> PhysAllocatorState {
-        let mut state = PhysAllocatorState {
-            initialized: true,
-            bitmap_ptr: bitmap.as_mut_ptr(),
-            bitmap_words: bitmap.len(),
-            frame_count: page_count,
-            usable_frames: page_count,
-            free_frames: page_count,
-            min_free_frames: 0,
-            next_hint,
-            usable_ranges: [UsableFrameRange::EMPTY; MAX_USABLE_RANGES],
-            usable_range_count: 1,
-            bitmap_phys_start: 0,
-            bitmap_page_count: 0,
-        };
-        state.usable_ranges[0] = UsableFrameRange {
+    pub(super) fn test_state(bitmap: &mut [u64], page_count: usize, next_hint: usize) -> PhysAllocatorState {
+        let mut state = PhysAllocatorState::new();
+        state.initialized = true;
+        state.geo.frame_count = page_count;
+        state.geo.used = BitmapView::from_raw(bitmap.as_mut_ptr(), bitmap.len());
+        state.usable_frames = page_count;
+        state.free_frames = page_count;
+        state.next_hint = next_hint;
+        state.geo.usable_range_count = 1;
+        state.geo.usable_ranges[0] = UsableFrameRange {
             start_frame: 0,
             page_count,
         };
@@ -1277,12 +1472,12 @@ mod tests {
 
         let mut out = [PhysAddr::new(0); 16];
         // Twelve frames sit above the reserve; the request is cut short there.
-        assert_eq!(state.alloc_user_frames_locked(&mut out), 12);
+        assert_eq!(state.alloc_user_frames_locked(&mut out, 0, || false), 12);
         assert_eq!(state.free_frames, 4);
         assert!(USER_WATERMARK_DENIALS.load(Ordering::Relaxed) > denials);
 
         // At the watermark user allocation yields nothing...
-        assert_eq!(state.alloc_user_frames_locked(&mut out[..1]), 0);
+        assert_eq!(state.alloc_user_frames_locked(&mut out[..1], 0, || false), 0);
         assert_eq!(state.free_frames, 4);
         // ...while the kernel class still reaches the reserve.
         assert_eq!(state.alloc_frames_locked(&mut out[..4]), 4);
@@ -1295,11 +1490,11 @@ mod tests {
         let mut state = test_state(&mut bitmap, 8, 0);
         state.min_free_frames = 2;
         let mut out = [PhysAddr::new(0); 8];
-        assert_eq!(state.alloc_user_frames_locked(&mut out), 6);
-        assert_eq!(state.alloc_user_frames_locked(&mut out[..1]), 0);
+        assert_eq!(state.alloc_user_frames_locked(&mut out, 0, || false), 6);
+        assert_eq!(state.alloc_user_frames_locked(&mut out[..1], 0, || false), 0);
         state.free_frame_locked(out[0]).unwrap();
         state.free_frame_locked(out[1]).unwrap();
-        assert_eq!(state.alloc_user_frames_locked(&mut out[..2]), 2);
+        assert_eq!(state.alloc_user_frames_locked(&mut out[..2], 0, || false), 2);
         assert_eq!(state.free_frames, 2);
     }
 

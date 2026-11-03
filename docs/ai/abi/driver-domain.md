@@ -251,6 +251,13 @@ partial, symlinked, malformed, or unlocked state fails closed.
 GPU completion releases the atlas read lease. A later KMS
 page-flip/present fence releases the previous front output. Neither completion
 may be synthesized from command acceptance.
+A completion query names a ticket for one SUBMITTED slot. If the slot is
+FREE, the submission it refers to no longer exists (a DVM offline epoch reset
+wiped it while the transport stayed installed), so the query returns
+`ENODEV` (`DisplayUnavailable`), not `EAGAIN`: `EAGAIN` means a live submission
+is still pending, and answering it for a wiped slot would make the caller wait
+forever for a completion that cannot arrive. `uiserver` treats `ENODEV` as
+provider loss and re-primes a fresh GPU context before new admission.
 These ownership rules follow the consumer-owned dequeue/queue/acquire/release
 shape documented by [Android BufferQueue](https://source.android.com/docs/core/graphics/arch-bq-gralloc),
 the shared-buffer constraint/lifetime split used by [Fuchsia Flatland](https://fuchsia.dev/fuchsia-src/concepts/ui/scenic/life_of_a_flatland_image),

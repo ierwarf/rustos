@@ -178,6 +178,10 @@ fn admission_clamps_each_operation_class_once_without_freshening() {
             rustos_user_abi::performance::IPC_READINESS_QUERY_HARD_LIMIT_MS,
         ),
         (
+            NETD_IPC_OP_POLL_BATCH,
+            rustos_user_abi::performance::IPC_READINESS_QUERY_HARD_LIMIT_MS,
+        ),
+        (
             NETD_IPC_OP_DVM_SESSION,
             rustos_user_abi::performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS,
         ),
@@ -517,4 +521,106 @@ fn ordinary_read_discards_ancillary_exactly_once() {
     assert_eq!(connected.incoming_bytes, 0);
     assert_eq!(connected.incoming_control_bytes, 0);
     assert!(connected.incoming.is_empty());
+}
+
+#[test]
+fn unix_rdhup_follows_peer_write_shutdown_and_close() {
+    let mut state = NetState::new();
+    state.sockets.insert(1, connected_socket(2));
+    state.sockets.insert(2, connected_socket(1));
+    let rdhup = linux_abi::POLLRDHUP as u32;
+    assert_eq!(unix_socket_revents(&state, 1, rdhup).unwrap(), 0);
+
+    let UnixSocketState::Connected(connected) = &mut state.sockets.get_mut(&1).unwrap().state
+    else {
+        unreachable!();
+    };
+    connected.peer_write_closed = true;
+    assert_eq!(unix_socket_revents(&state, 1, rdhup).unwrap(), rdhup);
+    // RDHUP is reported only when it was asked for.
+    assert_eq!(
+        unix_socket_revents(&state, 1, linux_abi::POLLOUT as u32).unwrap()
+            & rdhup,
+        0
+    );
+}
+
+fn poll_batch_request(entries: &[(u64, u32)]) -> NetdIpcRequest {
+    let mut request = NetdIpcRequest {
+        op: NETD_IPC_OP_POLL_BATCH,
+        ..NetdIpcRequest::default()
+    };
+    for (index, (token, events)) in entries.iter().enumerate() {
+        let offset = index * size_of::<NetdPollQueryWire>();
+        request.payload[offset..offset + 8].copy_from_slice(&token.to_le_bytes());
+        request.payload[offset + 8..offset + 12].copy_from_slice(&events.to_le_bytes());
+    }
+    request.payload_len = (entries.len() * size_of::<NetdPollQueryWire>()) as u32;
+    request
+}
+
+fn poll_batch_result(response: &NetdIpcResponse, index: usize) -> (u64, u32, i32) {
+    let offset = index * size_of::<NetdPollResultWire>();
+    (
+        u64::from_le_bytes(response.payload[offset..offset + 8].try_into().unwrap()),
+        u32::from_le_bytes(response.payload[offset + 8..offset + 12].try_into().unwrap()),
+        i32::from_le_bytes(response.payload[offset + 12..offset + 16].try_into().unwrap()),
+    )
+}
+
+#[test]
+fn poll_batch_answers_every_socket_in_order_and_isolates_failures() {
+    // Unique tokens: the batch handler reads the process-wide state.
+    let (first, second, missing) = (0xba7c_0001_u64, 0xba7c_0002_u64, 0xba7c_0003_u64);
+    {
+        let mut state = lock_net_state();
+        state.sockets.insert(first, connected_socket(second));
+        state.sockets.insert(second, connected_socket(first));
+    }
+    let pollout = linux_abi::POLLOUT as u32;
+    let request = poll_batch_request(&[(first, pollout), (missing, pollout), (second, pollout)]);
+    let mut response = NetdIpcResponse::default();
+    assert_eq!(handle_poll_batch(&request, &mut response), 0);
+    assert_eq!(response.value, 3);
+    assert_eq!(
+        response.payload_len as usize,
+        3 * size_of::<NetdPollResultWire>()
+    );
+    let (generation, revents, status) = poll_batch_result(&response, 0);
+    assert_eq!((revents, status), (pollout, 0));
+    assert_ne!(generation, 0);
+    // The unknown socket fails alone; its neighbours are unaffected.
+    assert_eq!(poll_batch_result(&response, 1), (0, 0, libc::EBADF));
+    assert_eq!(poll_batch_result(&response, 2).1, pollout);
+
+    // Per-socket generation moves only for the sockets that changed.
+    let before = poll_batch_result(&response, 2).0;
+    advance_readiness_generation(&[first]);
+    let mut after = NetdIpcResponse::default();
+    assert_eq!(handle_poll_batch(&request, &mut after), 0);
+    assert!(poll_batch_result(&after, 0).0 > poll_batch_result(&response, 0).0);
+    assert_eq!(poll_batch_result(&after, 2).0, before);
+
+    let mut state = lock_net_state();
+    state.sockets.remove(&first);
+    state.sockets.remove(&second);
+    state.readiness_generations.remove(&first);
+    state.readiness_generations.remove(&second);
+}
+
+#[test]
+fn poll_batch_rejects_malformed_payloads() {
+    let mut response = NetdIpcResponse::default();
+    let mut request = poll_batch_request(&[(5, 1)]);
+    request.payload_len -= 1;
+    assert_eq!(handle_poll_batch(&request, &mut response), libc::EINVAL);
+    request.payload_len = 0;
+    assert_eq!(handle_poll_batch(&request, &mut response), libc::EINVAL);
+    assert_eq!(
+        handle_poll_batch(&poll_batch_request(&[(0, 1)]), &mut response),
+        libc::EINVAL
+    );
+    let mut reserved = poll_batch_request(&[(5, 1)]);
+    reserved.payload[12] = 1;
+    assert_eq!(handle_poll_batch(&reserved, &mut response), libc::EINVAL);
 }

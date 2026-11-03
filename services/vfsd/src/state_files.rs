@@ -481,7 +481,7 @@ impl VfsState {
                 return;
             }
         };
-        response.status = mkdir_policy(path.as_str(), request.euid);
+        response.status = lock_vfs_storage().run_dirs.mkdir(path.as_str(), request.euid);
     }
 
     fn linux_mount_vfs(&mut self, response: &mut VfsIpcResponse) {

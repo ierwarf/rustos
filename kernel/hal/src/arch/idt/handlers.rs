@@ -307,6 +307,9 @@ pub fn pic_interrupt_handler(
     _error_code: Option<u64>,
 ) {
     let _irq_context = nucleus_core::util::lockdep::enter_irq_context();
+    if crate::arch::pic::consume_spurious(index) {
+        return;
+    }
     let irq = index.saturating_sub(crate::arch::pic::PIC_1_OFFSET);
     let _ = crate::hooks::dispatch_pic_irq(irq);
     crate::arch::pic::send_eoi(index);
@@ -326,6 +329,11 @@ pub fn msi_interrupt_handler(
 
 /// DVM owns input delivery. Legacy keyboard IRQs have no RustOS input policy
 /// consumer; acknowledge them so a physical/spurious line cannot wedge PIC.
+/// Local-APIC spurious vector. The architecture delivers it without setting an
+/// ISR bit, so it must return without an EOI; an absent gate would instead turn
+/// a harmless spurious delivery into a #NP.
+pub extern "x86-interrupt" fn spurious_interrupt_handler(_stack_frame: InterruptStackFrame) {}
+
 pub extern "x86-interrupt" fn keyboard_interrupt_eoi_handler(_stack_frame: InterruptStackFrame) {
     let _irq_context = nucleus_core::util::lockdep::enter_irq_context();
     crate::arch::pic::send_eoi(KEYBOARD_INTERRUPT_VECTOR);

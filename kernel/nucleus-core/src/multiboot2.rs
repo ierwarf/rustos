@@ -97,14 +97,19 @@ pub fn build_boot_info(magic: u32, mbi_addr: u32) -> *const BootInfo {
         fatal();
     }
 
+    // SAFETY: the bootloader contract passes the physical address of a
+    // Multiboot2 info structure, identity-mapped during early boot.
     let tags = unsafe { Tags::new(mbi_addr as usize) };
     let framebuffer = tags.framebuffer().unwrap_or_else(FramebufferInfo::empty);
+    // SAFETY: BSP-only and called once before publication, so no other
+    // reference to the memory-map storage exists.
     let entry_count = tags.write_memory_map(unsafe { &mut *MEMORY_MAP_STORAGE.0.get() });
     if entry_count == 0 {
         fatal();
     }
 
     let load_base = tags.load_base_addr().unwrap_or(0x20_0000) as u64;
+    // SAFETY: `_end` is a linker-provided symbol; only its address is taken.
     let image_end = unsafe { kernel_image_end() };
     let image_size = image_end.saturating_sub(load_base).max(PAGE_SIZE);
 
@@ -130,6 +135,7 @@ pub fn build_boot_info(magic: u32, mbi_addr: u32) -> *const BootInfo {
             entry_point: multiboot2_entry64_addr(),
         },
         memory_map: BootMemoryMap {
+            // SAFETY: address of the static storage only; no reference outlives this call.
             entries_ptr: unsafe { (*MEMORY_MAP_STORAGE.0.get()).as_ptr() as u64 },
             entry_count: entry_count as u32,
             _reserved0: 0,
@@ -144,6 +150,7 @@ pub fn build_boot_info(magic: u32, mbi_addr: u32) -> *const BootInfo {
         fatal();
     }
 
+    // SAFETY: BSP is the sole writer before the pointer is published.
     unsafe {
         ptr::write(BOOT_INFO_STORAGE.0.get(), boot_info);
         BOOT_INFO_STORAGE.0.get().cast_const()
@@ -173,6 +180,7 @@ fn rdseed64() -> Option<u64> {
     for _ in 0..HARDWARE_RNG_RETRIES {
         let mut value = 0_u64;
         let mut success = 0_u8;
+        // SAFETY: RDSEED support was checked by the caller via CPUID.
         unsafe {
             asm!(
                 "rdseed {value}",
@@ -194,6 +202,7 @@ fn rdrand64() -> Option<u64> {
     for _ in 0..HARDWARE_RNG_RETRIES {
         let mut value = 0_u64;
         let mut success = 0_u8;
+        // SAFETY: RDRAND support was checked by the caller via CPUID.
         unsafe {
             asm!(
                 "rdrand {value}",
@@ -227,6 +236,7 @@ struct Tags {
 
 impl Tags {
     unsafe fn new(addr: usize) -> Self {
+        // SAFETY: the caller names a readable Multiboot2 info structure.
         let total_size = unsafe { ptr::read_unaligned(addr as *const u32) } as usize;
         if total_size < 16 {
             fatal();
@@ -239,11 +249,16 @@ impl Tags {
 
     fn framebuffer(&self) -> Option<FramebufferInfo> {
         let tag = self.find_tag(TAG_FRAMEBUFFER)?;
-        if (tag.size as usize) < size_of::<RawFramebufferTag>() - 6 * size_of::<u8>()
+        // Only direct-RGB (type 1) framebuffers are admitted, and only that
+        // type carries the colour-info tail. The whole struct is read below,
+        // so a shorter tag would be read past its end.
+        if (tag.size as usize) < size_of::<RawFramebufferTag>()
             || tag.size as usize > self.total_size
         {
             return None;
         }
+        // SAFETY: `find_tag` bounded the tag inside the info structure and
+        // the size check above covers every byte of `RawFramebufferTag`.
         let raw = unsafe { ptr::read_unaligned(tag as *const RawTag as *const RawFramebufferTag) };
         if raw.framebuffer_type != 1 || raw.bpp != 24 && raw.bpp != 32 {
             return None;
@@ -281,6 +296,7 @@ impl Tags {
         if tag.size < 16 {
             return None;
         }
+        // SAFETY: `tag.size >= 16` was checked; the read is inside the tag.
         let entry_size = unsafe {
             ptr::read_unaligned((tag as *const RawTag).cast::<u8>().add(8).cast::<u32>())
         };
@@ -291,6 +307,7 @@ impl Tags {
         let mut cursor = tag as *const RawTag as usize + 16;
         let end = tag as *const RawTag as usize + tag.size as usize;
         while cursor + entry_size as usize <= end && count < output.len() {
+            // SAFETY: the loop condition keeps `entry_size >= 24` bytes inside the tag.
             let raw = unsafe { ptr::read_unaligned(cursor as *const RawMmapEntry) };
             if let Some(region) = memory_region_from_range(raw.addr, raw.len, raw.ty) {
                 append_region(output, &mut count, region);
@@ -301,22 +318,29 @@ impl Tags {
     }
 
     fn write_efi_memory_map(&self, output: &mut [BootMemoryRegion]) -> Option<usize> {
+        // Layout (Multiboot2 3.6.17): type, size, descriptor size @8,
+        // descriptor version @12, descriptors from @16.
         let tag = self.find_tag(TAG_EFI_MMAP)?;
-        if tag.size < 24 {
+        if tag.size < 16 {
             return None;
         }
         let header = tag as *const RawTag as usize;
-        let descr_size = unsafe { ptr::read_unaligned((header + 12) as *const u32) } as usize;
+        // SAFETY: `find_tag` bounded `size >= 16` bytes inside the structure.
+        let descr_size = unsafe { ptr::read_unaligned((header + 8) as *const u32) } as usize;
         if descr_size < 32 {
             return None;
         }
 
         let mut count = 0usize;
-        let mut cursor = header + 24;
+        let mut cursor = header + 16;
         let end = header + tag.size as usize;
         while cursor + descr_size <= end && count < output.len() {
+            // SAFETY: the loop condition keeps a full `descr_size >= 32` byte
+            // descriptor inside the tag, covering offsets 0, 8 and 24.
             let ty = unsafe { ptr::read_unaligned(cursor as *const u32) };
+            // SAFETY: as above.
             let phys_start = unsafe { ptr::read_unaligned((cursor + 8) as *const u64) };
+            // SAFETY: as above.
             let page_count = unsafe { ptr::read_unaligned((cursor + 24) as *const u64) };
             if page_count != 0 {
                 append_region(
@@ -338,6 +362,7 @@ impl Tags {
     fn acpi_rsdp_addr(&self) -> Option<u64> {
         self.find_tag(TAG_ACPI_NEW)
             .or_else(|| self.find_tag(TAG_ACPI_OLD))
+            // SAFETY: address arithmetic inside a tag `find_tag` bounded (size >= 8).
             .map(|tag| unsafe { (tag as *const RawTag).cast::<u8>().add(8) as u64 })
     }
 
@@ -372,6 +397,7 @@ impl Tags {
         let tag = self.find_tag(TAG_LOAD_BASE_ADDR)?;
         if tag.size as usize >= size_of::<RawLoadBaseTag>() {
             Some(
+                // SAFETY: the size check above covers `RawLoadBaseTag`.
                 unsafe { ptr::read_unaligned(tag as *const RawTag as *const RawLoadBaseTag) }
                     .load_base_addr,
             )
@@ -390,6 +416,7 @@ impl Tags {
         let end = self.base.checked_add(self.total_size)?;
         let mut found = None;
         while cursor + size_of::<RawTag>() <= end {
+            // SAFETY: the loop condition keeps a full tag header inside the structure.
             let tag = unsafe { &*(cursor as *const RawTag) };
             if tag.ty == TAG_END {
                 break;
@@ -414,6 +441,7 @@ impl Tags {
         if (tag.size as usize) < size_of::<RawModuleTag>() + expected_cmdline.len() {
             return None;
         }
+        // SAFETY: the size check above covers `RawModuleTag`.
         let raw = unsafe { ptr::read_unaligned(tag as *const RawTag as *const RawModuleTag) };
         let start = u64::from(raw.mod_start);
         let end = u64::from(raw.mod_end);
@@ -422,6 +450,7 @@ impl Tags {
         }
         let cmdline_start = tag as *const RawTag as usize + size_of::<RawModuleTag>();
         let cmdline_len = tag.size as usize - size_of::<RawModuleTag>();
+        // SAFETY: `cmdline_len` is the tag size minus the fixed header, inside the tag.
         let cmdline =
             unsafe { core::slice::from_raw_parts(cmdline_start as *const u8, cmdline_len) };
         let cmdline = cmdline.split(|byte| *byte == 0).next().unwrap_or(cmdline);
@@ -435,6 +464,7 @@ impl Tags {
         let mut cursor = self.base + 8;
         let end = self.base.checked_add(self.total_size)?;
         while cursor + size_of::<RawTag>() <= end {
+            // SAFETY: the loop condition keeps a full tag header inside the structure.
             let tag = unsafe { &*(cursor as *const RawTag) };
             if tag.ty == TAG_END {
                 break;
@@ -552,6 +582,7 @@ unsafe fn kernel_image_end() -> u64 {
     unsafe extern "C" {
         static _end: u8;
     }
+    // SAFETY: taking the address of a linker symbol; it is never read.
     unsafe { &_end as *const u8 as u64 }
 }
 
@@ -682,6 +713,41 @@ mod tests {
         finish_mbi(&mut duplicate);
         let tags = unsafe { Tags::new(duplicate.as_ptr() as usize) };
         assert_eq!(tags.early_system_image(), None);
+    }
+
+    #[test]
+    fn parses_efi_memory_map_with_spec_header_offsets() {
+        let mut mbi = mbi_header();
+        align_mbi(&mut mbi);
+        push_u32(&mut mbi, TAG_EFI_MMAP);
+        push_u32(&mut mbi, 16 + 48);
+        push_u32(&mut mbi, 48); // descriptor size
+        push_u32(&mut mbi, 1); // descriptor version
+        push_u32(&mut mbi, 7); // EfiConventionalMemory
+        push_u32(&mut mbi, 0);
+        push_u64(&mut mbi, 0x10_0000);
+        push_u64(&mut mbi, 0);
+        push_u64(&mut mbi, 16); // pages
+        push_u64(&mut mbi, 0);
+        finish_mbi(&mut mbi);
+        let tags = unsafe { Tags::new(mbi.as_ptr() as usize) };
+        let mut regions = [empty_memory_region(); 4];
+        assert_eq!(tags.write_memory_map(&mut regions), 1);
+        assert_eq!(regions[0].phys_start, 0x10_0000);
+        assert_eq!(regions[0].page_count, 16);
+        assert_eq!(regions[0].kind, BootMemoryKind::Usable);
+    }
+
+    #[test]
+    fn short_framebuffer_tag_is_not_read_past_its_end() {
+        let mut mbi = mbi_header();
+        align_mbi(&mut mbi);
+        push_u32(&mut mbi, TAG_FRAMEBUFFER);
+        push_u32(&mut mbi, 32);
+        mbi.extend_from_slice(&[0u8; 24]);
+        finish_mbi(&mut mbi);
+        let tags = unsafe { Tags::new(mbi.as_ptr() as usize) };
+        assert!(tags.framebuffer().is_none());
     }
 
     fn tags_with_framebuffer(red_position: u8, blue_position: u8) -> Vec<u8> {

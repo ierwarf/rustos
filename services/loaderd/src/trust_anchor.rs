@@ -15,7 +15,7 @@ use rustos_release_verifier::{Error, TrustedKey};
 const RECORD: usize = 16 + 8 + 32 + 8 + 1;
 static SEALED: &[u8] = include_bytes!("../trust/release-keys.bin");
 
-pub(super) fn parse(bytes: &[u8]) -> Result<Vec<TrustedKey>, Error> {
+pub fn parse(bytes: &[u8]) -> Result<Vec<TrustedKey>, Error> {
     if bytes.len() % RECORD != 0 {
         return Err(Error::Length);
     }
@@ -45,8 +45,8 @@ pub(super) fn parse(bytes: &[u8]) -> Result<Vec<TrustedKey>, Error> {
 }
 
 /// Signer id and service of the opt-in test key (see `test_key`).
-pub(super) const TEST_SIGNER_ID: [u8; 16] = [0x7e; 16];
-pub(super) const TEST_SERVICE: u64 = 3;
+pub const TEST_SIGNER_ID: [u8; 16] = [0x7e; 16];
+pub const TEST_SERVICE: u64 = 3;
 
 /// A key compiled in only when the image is built with
 /// `RUSTOS_LOADERD_TEST_RELEASE_KEY=<64 hex digits>`. It trusts exactly one
@@ -55,7 +55,7 @@ pub(super) const TEST_SERVICE: u64 = 3;
 /// must never ship: the default build leaves the ring empty and every release
 /// is refused with `UntrustedKey`.
 fn test_key() -> Option<TrustedKey> {
-    let verifying_key = loaderd::release_bundle::parse_hex_key(option_env!("RUSTOS_LOADERD_TEST_RELEASE_KEY")?)?;
+    let verifying_key = crate::release_bundle::parse_hex_key(option_env!("RUSTOS_LOADERD_TEST_RELEASE_KEY")?)?;
     Some(TrustedKey {
         signer_id: TEST_SIGNER_ID,
         service: TEST_SERVICE,
@@ -66,7 +66,7 @@ fn test_key() -> Option<TrustedKey> {
 }
 
 /// The keys sealed into this loaderd image.
-pub(super) fn sealed_keys() -> Result<Vec<TrustedKey>, Error> {
+pub fn sealed_keys() -> Result<Vec<TrustedKey>, Error> {
     let mut keys = parse(SEALED)?;
     if let Some(key) = test_key() {
         keys.push(key);

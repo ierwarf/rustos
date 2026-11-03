@@ -659,7 +659,16 @@ pub const VFS_IPC_OP_CURSOR_SETTLE: u16 = 24;
 pub const VFS_IPC_OP_CHECKPOINT_ACK: u16 = 25;
 pub const VFS_CURSOR_SETTLE_COMMIT: u64 = 1;
 pub const VFS_CURSOR_SETTLE_CANCEL: u64 = 2;
+/// Batched fd readiness: `payload_len` is `n * size_of::<LinuxPollFd>()` for
+/// `1 <= n <= VFS_POLL_BATCH_MAX` and the reply echoes the same array with
+/// `revents` filled in. `value` is the number of ready entries. The bound is
+/// the fixed request payload; a larger scan issues several batches.
 pub const VFS_POLL_QUERY_POLL: u64 = 1;
+/// Most `LinuxPollFd` entries one `VFS_POLL_QUERY_POLL` request can carry.
+pub const VFS_POLL_BATCH_MAX: usize = VFS_IPC_REQUEST_PAYLOAD_CAPACITY / 8;
+/// Most `WaitSetClaimWire` entries one `VFS_POLL_QUERY_EPOLL_CLAIM` request
+/// can carry.
+pub const VFS_EPOLL_CLAIM_MAX: usize = VFS_IPC_REQUEST_PAYLOAD_CAPACITY / 32;
 pub const VFS_POLL_QUERY_EPOLL_CREATE: u64 = 2;
 pub const VFS_POLL_QUERY_EPOLL_CTL: u64 = 3;
 pub const VFS_POLL_QUERY_EPOLL_SNAPSHOT: u64 = 4;
@@ -667,6 +676,12 @@ pub const VFS_POLL_QUERY_EPOLL_SNAPSHOT: u64 = 4;
 /// reference. Dup/fork/transfer reference accounting is kernel-local.
 pub const VFS_POLL_QUERY_EPOLL_RETIRE: u64 = 5;
 pub const VFS_POLL_QUERY_EPOLL_PURGE_OBJECT: u64 = 6;
+/// Atomically consume edge-triggered or one-shot reports. `remote_id` is the
+/// epoll token and the payload is `1 <= n <= VFS_EPOLL_CLAIM_MAX`
+/// `WaitSetClaimWire` entries; the reply
+/// payload carries one byte per entry (`1` = this caller owns the report) and
+/// `value` is the accepted count. Level-triggered interests are never claimed.
+pub const VFS_POLL_QUERY_EPOLL_CLAIM: u64 = 7;
 
 pub const WAITSET_ABI_VERSION: u16 = 1;
 pub const WAITSET_PROVIDER_VFSD: u16 = 1;
@@ -787,6 +802,54 @@ pub struct WaitSetInterestWire {
     pub events: u32,
     pub reserved0: u32,
     pub data: u64,
+}
+
+/// `WaitSetSnapshotWire::state`: a one-shot interest already reported and not
+/// yet re-armed by `EPOLL_CTL_MOD`.
+pub const WAITSET_SNAPSHOT_STATE_DISABLED: u32 = 1;
+
+/// One vfsd epoll snapshot entry: the persistent interest plus the volatile
+/// report state that edge-triggered and one-shot semantics need. The volatile
+/// part is never checkpointed; a restored interest reports once more.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WaitSetSnapshotWire {
+    pub interest: WaitSetInterestWire,
+    /// Provider generation of the last report this interest consumed (`0` =
+    /// never reported). An edge-triggered interest reports again only for a
+    /// strictly newer generation.
+    pub edge_generation: u64,
+    pub state: u32,
+    pub reserved0: u32,
+}
+
+pub const fn waitset_snapshot_shape_valid(wire: &WaitSetSnapshotWire) -> bool {
+    waitset_interest_shape_valid(&wire.interest)
+        && wire.state & !WAITSET_SNAPSHOT_STATE_DISABLED == 0
+        && wire.reserved0 == 0
+}
+
+/// One `VFS_POLL_QUERY_EPOLL_CLAIM` candidate: the interest key plus the
+/// provider generation the caller observed while it was ready.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WaitSetClaimWire {
+    pub provider: u16,
+    pub reserved0: u16,
+    pub reserved1: u32,
+    pub target_fd: u64,
+    pub object_id: u64,
+    pub generation: u64,
+}
+
+pub const fn waitset_claim_shape_valid(wire: &WaitSetClaimWire) -> bool {
+    wire.provider >= WAITSET_PROVIDER_VFSD
+        && wire.provider <= WAITSET_PROVIDER_MAX
+        && wire.reserved0 == 0
+        && wire.reserved1 == 0
+        && wire.target_fd <= u16::MAX as u64
+        && wire.object_id != 0
+        && wire.generation != 0
 }
 
 /// Validate the complete persistent epoll-interest wire shape before either
@@ -926,6 +989,28 @@ pub const NETD_POLL_MODE_QUERY: u64 = 0;
 /// Wait for a readiness transition inside netd. The wait is internally
 /// bounded and may return EAGAIN so the kernel can revalidate the descriptor.
 pub const NETD_POLL_MODE_WAIT: u64 = 1;
+/// One `NETD_IPC_OP_POLL_BATCH` request entry.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct NetdPollQueryWire {
+    pub socket_token: u64,
+    /// `POLL*` bits the caller wants evaluated (`POLLERR`/`POLLHUP` are always
+    /// reported).
+    pub events: u32,
+    pub reserved0: u32,
+}
+
+/// One `NETD_IPC_OP_POLL_BATCH` reply entry. `generation` is the socket's own
+/// readiness generation (never zero when `status == 0`); it only advances when
+/// that socket's readiness may have changed.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct NetdPollResultWire {
+    pub generation: u64,
+    pub revents: u32,
+    /// `0` or a positive errno for this socket only.
+    pub status: i32,
+}
 pub const NETD_SENDMSG_PAYLOAD_HEADER_SIZE: usize = 16;
 pub const NETD_RECVMSG_PAYLOAD_HEADER_SIZE: usize = 16;
 pub const NET_BROKER_OP_PACKET_STATUS: u16 = 0x8001;
@@ -952,6 +1037,14 @@ pub const NETD_IPC_OP_REF_ACK: u16 = 0x8004;
 /// inputd-to-netd authenticated DVM lifecycle notification. `arg0` is the
 /// non-zero transport epoch and `arg1` is one of `NETD_DVM_SESSION_*`.
 pub const NETD_IPC_OP_DVM_SESSION: u16 = 0x8005;
+/// Batched socket readiness. The payload is `n` `NetdPollQueryWire` entries
+/// (`1 <= n <= NETD_POLL_BATCH_MAX`); the reply payload is `n`
+/// `NetdPollResultWire` entries in the same order. One entry failing (for
+/// example `EBADF`) is reported in that entry's `status`, not as the reply's.
+pub const NETD_IPC_OP_POLL_BATCH: u16 = 0x8006;
+pub const NETD_POLL_BATCH_MAX: usize = WAITSET_MAX_INTERESTS;
+const _: () = assert!(size_of::<NetdPollQueryWire>() == 16 && size_of::<NetdPollResultWire>() == 16);
+const _: () = assert!(size_of::<WaitSetClaimWire>() == 32 && size_of::<WaitSetSnapshotWire>() == 64);
 pub const NETD_DVM_SESSION_GRANT: u64 = 1;
 pub const NETD_DVM_SESSION_REVOKE: u64 = 2;
 pub const NET_BROKER_PACKET_MTU: usize = 1514;

@@ -227,6 +227,7 @@ pub(super) fn drain(
             }
         } else {
             let len = (slot.len.load(Ordering::Relaxed) as usize).min(DEFERRED_LINE_BYTES);
+            // SAFETY: as above; `len` is clamped to the buffer size.
             let bytes = unsafe { core::slice::from_raw_parts(slot.bytes.get().cast::<u8>(), len) };
             emit_line(bytes);
         }

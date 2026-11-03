@@ -93,6 +93,8 @@ pub(super) fn exit_current() -> ! {
     super::halt_current_retired_task()
 }
 
+const GROUP_EXIT_DEADLOCK_NS: u64 = 30_000_000_000;
+
 fn wait(receipt: Receipt) {
     let start = crate::arch::clock::monotonic_nanos();
     while !receipt.complete() {
@@ -106,8 +108,10 @@ fn wait(receipt: Receipt) {
         if receipt.complete() {
             break;
         }
+        // A deadlock detector, not a latency bound: a host that deschedules
+        // a vCPU (or a loaded KVM guest) must not turn a slow ACK into a panic.
         assert!(
-            crate::arch::clock::monotonic_nanos().saturating_sub(start) < 2_000_000_000,
+            crate::arch::clock::monotonic_nanos().saturating_sub(start) < GROUP_EXIT_DEADLOCK_NS,
             "group exit timed out; durable process-row ownership retained"
         );
         // The ACK comes from tasks on this or another CPU; spinning on an

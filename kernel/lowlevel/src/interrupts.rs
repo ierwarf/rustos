@@ -179,14 +179,17 @@ pub fn reschedule_ipi_interrupt_handler_addr() -> u64 {
 }
 
 pub fn register_timer_interrupt_dispatch(callback: InterruptDispatch) {
+    // ORDERING: Release publishes the callback before its vector can fire.
     TIMER_INTERRUPT_DISPATCH.store(callback as usize, Ordering::Release);
 }
 
 pub fn register_rtc_interrupt_dispatch(callback: InterruptDispatch) {
+    // ORDERING: Release publishes the callback before its vector can fire.
     RTC_INTERRUPT_DISPATCH.store(callback as usize, Ordering::Release);
 }
 
 pub fn register_software_schedule_interrupt_dispatch(callback: InterruptDispatch) {
+    // ORDERING: Release publishes the callback before its vector can fire.
     SOFTWARE_SCHEDULE_INTERRUPT_DISPATCH.store(callback as usize, Ordering::Release);
 }
 
@@ -209,8 +212,12 @@ pub fn register_context_switch_commit(callback: ContextSwitchCommit) {
 }
 
 pub fn trigger_software_schedule() {
-    interrupts::without_interrupts(|| unsafe {
-        software_schedule_trap();
+    interrupts::without_interrupts(|| {
+        // SAFETY: IRQs are masked for the whole trap; the assembly leaf only
+        // raises the installed software scheduling vector and returns.
+        unsafe {
+            software_schedule_trap();
+        }
     });
 }
 
@@ -233,6 +240,8 @@ pub fn trigger_software_schedule_interruptible() {
         interrupts::are_enabled(),
         "interruptible software schedule requires IF=1"
     );
+    // SAFETY: IF=1 was asserted above, so the trap preserves an interruptible
+    // kernel continuation; the leaf raises the software vector and returns.
     unsafe {
         software_schedule_trap();
     }
@@ -395,11 +404,15 @@ extern "C" fn scheduler_context_switch_commit_dispatch() {
 }
 
 fn dispatch(slot: &AtomicUsize, context_ptr: *mut SavedContext) -> *mut SavedContext {
+    // ORDERING: Acquire pairs with the Release in `register_*_dispatch`.
     let callback_addr = slot.load(Ordering::Acquire);
     if callback_addr == 0 {
         return context_ptr;
     }
 
+    // SAFETY: slots are written only by the `register_*_interrupt_dispatch`
+    // functions, which accept the exact `InterruptDispatch` fn type, and a
+    // nonzero value is never stored otherwise.
     let callback = unsafe { mem::transmute::<usize, InterruptDispatch>(callback_addr) };
     callback(context_ptr)
 }

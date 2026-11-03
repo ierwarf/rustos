@@ -25,7 +25,7 @@ const SYS_GETTID: u64 = 186;
 /// The namespace every personality starts in; rootd's grant names the same one.
 const DEFAULT_NAMESPACE: u64 = 1;
 
-pub(super) fn personality_for_format(format: u16) -> Option<Personality> {
+pub fn personality_for_format(format: u16) -> Option<Personality> {
     match format {
         PROC_BROKER_FORMAT_ELF64 => Some(Personality::Linux),
         PROC_BROKER_FORMAT_PE64 => Some(Personality::Windows),
@@ -34,7 +34,7 @@ pub(super) fn personality_for_format(format: u16) -> Option<Personality> {
 }
 
 /// Fail-closed: `Ok` only when rootd granted this exact launch.
-pub(super) fn authorize_launch(format: u16) -> Result<(), i32> {
+pub fn authorize_launch(format: u16) -> Result<(), i32> {
     let personality = personality_for_format(format).ok_or(EINVAL)?;
     let endpoint = rustos_svc_runtime::ipc::lookup_service_endpoint(IPC_SERVICE_ROOTD);
     if endpoint <= 0 {

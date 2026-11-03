@@ -281,17 +281,15 @@ pub fn live_process_identity(handle: ProcessHandle) -> Option<ProcessIdentity> {
 
 pub fn live_process_identity_by_pid(process_id: u64) -> Option<ProcessIdentity> {
     let table = PROCESS_TABLE.lock();
-    table.slots.iter().find_map(|slot| {
-        let object = slot.object.as_deref()?;
-        (object.process_id == process_id
-            && !object.exiting
-            && !object.exec_in_progress
-            && !object.exec_state_staged)
-            .then_some(ProcessIdentity {
-                process_id,
-                process_generation: slot.generation,
-                mm_generation: object.mm_generation,
-            })
+    let index = table.find_pid_slot(process_id, |object| {
+        !object.exiting && !object.exec_in_progress && !object.exec_state_staged
+    })?;
+    let slot = &table.slots[index];
+    let object = slot.object.as_deref()?;
+    Some(ProcessIdentity {
+        process_id,
+        process_generation: slot.generation,
+        mm_generation: object.mm_generation,
     })
 }
 
@@ -489,23 +487,17 @@ pub(in crate::multitask) fn own_process_ref(
 
 pub fn retain_process_by_pid(process_id: u64) -> Option<ProcessRef> {
     let mut table = PROCESS_TABLE.lock();
-    for (index, slot) in table.slots.iter_mut().enumerate() {
-        let generation = slot.generation;
-        let Some(object) = slot.object.as_deref_mut() else {
-            continue;
-        };
-        if object.process_id != process_id {
-            continue;
-        }
-        object.ref_count = object.ref_count.checked_add(1)?;
-        let state_ptr = object.state_ptr();
-        return Some(ProcessRef {
-            handle: ProcessHandle::new(index, generation),
-            process_id,
-            pin: ProcessRefPin::Counted(state_ptr),
-        });
-    }
-    None
+    let index = table.find_pid_slot(process_id, |_| true)?;
+    let slot = &mut table.slots[index];
+    let generation = slot.generation;
+    let object = slot.object.as_deref_mut()?;
+    object.ref_count = object.ref_count.checked_add(1)?;
+    let state_ptr = object.state_ptr();
+    Some(ProcessRef {
+        handle: ProcessHandle::new(index, generation),
+        process_id,
+        pin: ProcessRefPin::Counted(state_ptr),
+    })
 }
 
 pub fn release_process_ref(handle: ProcessHandle) {

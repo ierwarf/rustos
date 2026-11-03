@@ -13,6 +13,8 @@ const ALL_IRQS_MASKED: u8 = u8::MAX;
 const PIC_1_COMMAND_PORT: u16 = 0x20;
 const PIC_2_COMMAND_PORT: u16 = 0xa0;
 const END_OF_INTERRUPT: u8 = 0x20;
+/// OCW3: the next read of the command port returns the in-service register.
+const OCW3_READ_ISR: u8 = 0x0b;
 
 lazy_static! {
     pub static ref PICS: TrackedSpinLock<ChainedPics, { LockClass::LegacyPic as u8 }> =
@@ -91,4 +93,45 @@ pub fn send_eoi(interrupt_vector: u8) {
         }
         Port::<u8>::new(PIC_1_COMMAND_PORT).write(END_OF_INTERRUPT);
     }
+}
+
+/// Whether `irq` is a spurious IRQ7/IRQ15 (the line dropped before the CPU
+/// acknowledged), and if so completes its acknowledgement.
+///
+/// A spurious interrupt sets no ISR bit, so a non-specific EOI would retire a
+/// different, genuinely in-service interrupt early. The one exception is a
+/// spurious IRQ15: the master still has the cascade input (IRQ2) in service and
+/// needs its EOI, but the slave must not get one. Returns true when the caller
+/// must not dispatch or EOI the vector itself.
+pub fn consume_spurious(interrupt_vector: u8) -> bool {
+    let irq = interrupt_vector.wrapping_sub(PIC_1_OFFSET);
+    if irq != 7 && irq != 15 {
+        return false;
+    }
+    assert_eq!(
+        nucleus_core::util::lockdep::current_cpu_index(),
+        0,
+        "legacy PIC interrupt routed to non-BSP CPU"
+    );
+    let command_port = if irq == 15 {
+        PIC_2_COMMAND_PORT
+    } else {
+        PIC_1_COMMAND_PORT
+    };
+    // SAFETY: OCW3 + command-port read on the legacy PIC is side-effect free
+    // apart from selecting which register the next read returns; only the BSP
+    // IRQ leaf touches these command ports (see `send_eoi`).
+    let in_service = unsafe {
+        let mut port = Port::<u8>::new(command_port);
+        port.write(OCW3_READ_ISR);
+        port.read()
+    };
+    if in_service & 0x80 != 0 {
+        return false;
+    }
+    if irq == 15 {
+        // SAFETY: master command port, BSP-only leaf, as above.
+        unsafe { Port::<u8>::new(PIC_1_COMMAND_PORT).write(END_OF_INTERRUPT) };
+    }
+    true
 }

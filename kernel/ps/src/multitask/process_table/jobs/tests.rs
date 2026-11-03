@@ -752,3 +752,16 @@ mod provider_incarnation {
         assert_eq!(job_charge_client_session_token(7300, 4, 7301, client_job).unwrap().usage, 1);
     }
 }
+
+#[test]
+fn a_refused_memory_limit_leaves_the_other_dimensions_untouched() {
+    let _isolation = isolate_process_table();
+    let job = job_create_child(ROOT_JOB).unwrap();
+    job_set_memory_qos(ROOT_JOB, LIMIT_UNSET, 1000).unwrap();
+    job_set_memory_qos(job, LIMIT_UNSET, 100).unwrap();
+    let before = job_info(job).unwrap().limits;
+    let mask = LimitMask::from_bits(0b111).unwrap();
+    let refused = JobLimits { processes: 2, threads: 3, memory_pages: 10 };
+    assert_eq!(job_set_limits(job, mask, refused), Err(JobError::Full));
+    assert_eq!(job_info(job).unwrap().limits, before, "no partial application");
+}

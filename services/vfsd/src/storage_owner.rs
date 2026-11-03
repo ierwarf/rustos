@@ -76,6 +76,8 @@ pub(crate) struct VfsStorage {
     /// Exact storaged DVM block-provider generation that backs `volume`.
     pub(crate) dvm_storage_epoch: u64,
     pub(crate) cache_generation: u64,
+    /// Volatile `/run` directories; see `vfsd::run_dirs`.
+    pub(crate) run_dirs: vfsd::run_dirs::RunDirectories,
 }
 
 impl VfsStorage {
@@ -91,6 +93,7 @@ impl VfsStorage {
             mount_generation: 1,
             dvm_storage_epoch: 0,
             cache_generation: 1,
+            run_dirs: vfsd::run_dirs::RunDirectories::new(),
         }
     }
 }

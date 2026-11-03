@@ -11,7 +11,8 @@
 //! - **Failure:** Signal, timeout, close, dup/exec, provider revoke/restart,
 //!   peer exit, and late reply cannot lose a wake or revive a stale waiter.
 //! - **Forbidden:** No periodic polling, one-shot timeout ignoring, fd-only
-//!   registration, unbounded provider call, or app-specific readiness path.
+//!   registration, unbounded provider call, per-descriptor provider round trip,
+//!   unclaimed edge/one-shot delivery, or app-specific readiness path.
 //! - **Evidence:** `waitset` and `input-delivery-lifecycle`.
 mod control;
 
@@ -24,6 +25,10 @@ const MAX_POLL_FDS: usize = WAITSET_MAX_INTERESTS;
 const POLLFD_SIZE: usize = size_of::<linux_abi::LinuxPollFd>();
 const EPOLL_EVENT_SIZE: usize = size_of::<linux_abi::LinuxEpollEvent>();
 const WAITSET_INTEREST_SIZE: usize = size_of::<WaitSetInterestWire>();
+const WAITSET_SNAPSHOT_SIZE: usize = size_of::<WaitSetSnapshotWire>();
+const WAITSET_CLAIM_SIZE: usize = size_of::<WaitSetClaimWire>();
+const _: () = assert!(WAITSET_MAX_INTERESTS * WAITSET_SNAPSHOT_SIZE <= VFS_IPC_PAYLOAD_CAPACITY);
+const _: () = assert!(NETD_POLL_BATCH_MAX >= MAX_POLL_FDS);
 const WAITSET_PROVIDER_QUERY_TIMEOUT_MS: u64 =
     rustos_user_abi::performance::IPC_READINESS_QUERY_HARD_LIMIT_MS;
 
@@ -178,6 +183,23 @@ struct PollReadinessState {
     observations: Vec<super::super::broker_ops::waitset_broker_ops::ProviderObservation>,
 }
 
+/// Where one `pollfd` gets its readiness from. Provider-backed descriptors are
+/// resolved together, one batched exchange per provider, after the whole array
+/// has been classified.
+enum PollRoute {
+    Done(u32),
+    Netd { token: u64 },
+    Vfs,
+}
+
+struct PollEntry {
+    ptr: u64,
+    raw: [u8; POLLFD_SIZE],
+    fd: i32,
+    events: u32,
+    revents: u32,
+}
+
 fn collect_poll_readiness(
     fds_ptr: u64,
     nfds: u64,
@@ -192,35 +214,62 @@ fn collect_poll_readiness(
         provider_timed_out: false,
         observations: Vec::with_capacity(nfds.min(WAITSET_MAX_INTERESTS)),
     };
+    let mut entries = Vec::with_capacity(nfds);
+    let mut netd_slots = Vec::new();
+    let mut netd_queries = Vec::new();
+    let mut vfs_slots = Vec::new();
     for index in 0..nfds {
         let entry_ptr = fds_ptr
             .checked_add((index * POLLFD_SIZE) as u64)
             .ok_or(LINUX_EFAULT)?;
-        let mut entry = [0_u8; POLLFD_SIZE];
-        usermem::copy_from_current_user_exact(entry_ptr, &mut entry)
+        let mut raw = [0_u8; POLLFD_SIZE];
+        usermem::copy_from_current_user_exact(entry_ptr, &mut raw)
             .map_err(address_space_error_to_linux_errno)?;
-        let (fd, events) = decode_pollfd(&entry)?;
-        let revents = if fd < 0 {
-            0
+        let (fd, events) = decode_pollfd(&raw)?;
+        let route = if fd < 0 {
+            PollRoute::Done(0)
         } else {
-            match collect_one_poll_fd(fd as u64, events, deadline_tick, &mut state) {
-                Ok(revents) => revents,
+            match route_one_poll_fd(fd as u64, events, deadline_tick, &mut state) {
+                Ok(route) => route,
                 Err(LINUX_ETIMEDOUT) => {
                     state.provider_timed_out = true;
-                    0
+                    PollRoute::Done(0)
                 }
                 Err(errno) => return Err(errno),
             }
         };
-        if revents != 0 {
+        let revents = match route {
+            PollRoute::Done(revents) => revents,
+            PollRoute::Netd { token } => {
+                netd_slots.push(index);
+                netd_queries.push((token, events));
+                0
+            }
+            PollRoute::Vfs => {
+                vfs_slots.push(index);
+                0
+            }
+        };
+        entries.push(PollEntry {
+            ptr: entry_ptr,
+            raw,
+            fd,
+            events,
+            revents,
+        });
+    }
+    resolve_poll_netd_batch(&mut entries, &netd_slots, &netd_queries, deadline_tick, &mut state)?;
+    resolve_poll_vfs_batch(&mut entries, &vfs_slots, deadline_tick, &mut state)?;
+    for entry in &entries {
+        if entry.revents != 0 {
             state.ready += 1;
         }
         // Linux stores only `revents`; rewriting fd/events would clobber a
         // concurrent edit of those fields, and an unchanged value needs no
         // store (the page may not even be writable then).
-        let revents_bytes = (revents as i16).to_le_bytes();
-        if entry[6..8] != revents_bytes {
-            usermem::write_current_user_bytes(entry_ptr + 6, &revents_bytes)
+        let revents_bytes = (entry.revents as i16).to_le_bytes();
+        if entry.raw[6..8] != revents_bytes {
+            usermem::write_current_user_bytes(entry.ptr + 6, &revents_bytes)
                 .map_err(address_space_error_to_linux_errno)?;
         }
     }
@@ -233,6 +282,76 @@ fn collect_poll_readiness(
     Ok(state)
 }
 
+fn resolve_poll_netd_batch(
+    entries: &mut [PollEntry],
+    slots: &[usize],
+    queries: &[(u64, u32)],
+    deadline_tick: Option<u64>,
+    state: &mut PollReadinessState,
+) -> Result<(), i64> {
+    if queries.is_empty() {
+        return Ok(());
+    }
+    let outcomes = match poll_netd_socket_batch(queries, waitset_provider_query_timeout_ms(deadline_tick))
+    {
+        Ok(outcomes) => outcomes,
+        Err(LINUX_ETIMEDOUT) => {
+            state.provider_timed_out = true;
+            return Ok(());
+        }
+        Err(errno) if provider_revoke_events(errno).is_some() => {
+            for slot in slots {
+                entries[*slot].revents = provider_revoke_events(errno).unwrap();
+            }
+            return Ok(());
+        }
+        Err(errno) => return Err(errno),
+    };
+    for (slot, ((token, events), outcome)) in slots.iter().zip(queries.iter().zip(outcomes)) {
+        let ready_mask = poll_ready_bits(*events | linux_abi::POLLERR as u32 | linux_abi::POLLHUP as u32);
+        entries[*slot].revents = match outcome {
+            Ok((revents, generation)) => {
+                note_poll_observation(state, WAITSET_PROVIDER_NETD, *token, generation);
+                revents & ready_mask
+            }
+            Err(errno) if provider_revoke_events(errno).is_some() => {
+                provider_revoke_events(errno).unwrap()
+            }
+            Err(errno) => return Err(errno),
+        };
+    }
+    Ok(())
+}
+
+fn resolve_poll_vfs_batch(
+    entries: &mut [PollEntry],
+    slots: &[usize],
+    deadline_tick: Option<u64>,
+    state: &mut PollReadinessState,
+) -> Result<(), i64> {
+    for chunk in slots.chunks(VFS_POLL_BATCH_MAX) {
+        let queries = chunk
+            .iter()
+            .map(|slot| (entries[*slot].fd, entries[*slot].events))
+            .collect::<Vec<_>>();
+        match poll_vfs_batch(&queries, deadline_tick) {
+            Ok(revents) => {
+                for (slot, revents) in chunk.iter().zip(revents) {
+                    entries[*slot].revents = revents;
+                }
+            }
+            Err(LINUX_ETIMEDOUT) => state.provider_timed_out = true,
+            Err(errno) if provider_revoke_events(errno).is_some() => {
+                for slot in chunk {
+                    entries[*slot].revents = provider_revoke_events(errno).unwrap();
+                }
+            }
+            Err(errno) => return Err(errno),
+        }
+    }
+    Ok(())
+}
+
 fn require_completed_provider_scan(timed_out: bool, has_ready: bool) -> Result<(), i64> {
     if timed_out && !has_ready {
         Err(LINUX_ETIMEDOUT)
@@ -241,62 +360,41 @@ fn require_completed_provider_scan(timed_out: bool, has_ready: bool) -> Result<(
     }
 }
 
-fn collect_one_poll_fd(
+fn route_one_poll_fd(
     fd: u64,
     events: u32,
     deadline_tick: Option<u64>,
     state: &mut PollReadinessState,
-) -> Result<u32, i64> {
+) -> Result<PollRoute, i64> {
     let Some(handle) = current_kernel_handle(fd) else {
-        return Ok(linux_abi::POLLNVAL as u32);
+        return Ok(PollRoute::Done(linux_abi::POLLNVAL as u32));
     };
-    let ready_mask =
-        poll_ready_bits(events | linux_abi::POLLERR as u32 | linux_abi::POLLHUP as u32);
     match handle {
-        multitask::KernelHandle::Socket(socket) => {
-            let (revents, generation) = match poll_netd_socket_token(
-                socket.token_id(),
-                events,
-                waitset_provider_query_timeout_ms(deadline_tick),
-            ) {
-                Ok(result) => result,
-                Err(errno) if provider_revoke_events(errno).is_some() => {
-                    return Ok(provider_revoke_events(errno).unwrap());
-                }
-                Err(errno) => return Err(errno),
-            };
-            note_poll_observation(state, WAITSET_PROVIDER_NETD, socket.token_id(), generation);
-            Ok(revents & ready_mask)
-        }
-        multitask::KernelHandle::InetSocket(socket) => {
-            let (revents, generation) = match poll_netd_socket_token(
-                socket.token_id(),
-                events,
-                waitset_provider_query_timeout_ms(deadline_tick),
-            ) {
-                Ok(result) => result,
-                Err(errno) if provider_revoke_events(errno).is_some() => {
-                    return Ok(provider_revoke_events(errno).unwrap());
-                }
-                Err(errno) => return Err(errno),
-            };
-            note_poll_observation(state, WAITSET_PROVIDER_NETD, socket.token_id(), generation);
-            Ok(revents & ready_mask)
-        }
+        multitask::KernelHandle::Socket(socket) => Ok(PollRoute::Netd {
+            token: socket.token_id(),
+        }),
+        multitask::KernelHandle::InetSocket(socket) => Ok(PollRoute::Netd {
+            token: socket.token_id(),
+        }),
         multitask::KernelHandle::Epoll(epoll) => {
-            let nested = collect_epoll_readiness(epoll.token_id(), 1, deadline_tick)?;
+            let nested = collect_epoll_readiness(
+                epoll.token_id(),
+                1,
+                deadline_tick,
+                EpollScanMode::Peek,
+            )?;
             for observation in nested.observations {
                 note_poll_observation_for_provider(state, observation);
             }
-            Ok(if nested.ready.is_empty() {
+            Ok(PollRoute::Done(if nested.ready.is_empty() {
                 0
             } else {
                 events & linux_abi::POLLIN as u32
-            })
+            }))
         }
         multitask::KernelHandle::Device(_) => {
             let Some((token, access, _)) = current_input_device_description(fd) else {
-                return poll_vfs_revents(fd, events, deadline_tick);
+                return Ok(PollRoute::Vfs);
             };
             if super::super::broker_ops::waitset_broker_ops::input_open_description_access(token)
                 != Some(access)
@@ -306,7 +404,7 @@ fn collect_one_poll_fd(
             let (ready, generation) = match input_readiness_for_access(access, deadline_tick) {
                 Ok(result) => result,
                 Err(errno) if provider_revoke_events(errno).is_some() => {
-                    return Ok(provider_revoke_events(errno).unwrap());
+                    return Ok(PollRoute::Done(provider_revoke_events(errno).unwrap()));
                 }
                 Err(errno) => return Err(errno),
             };
@@ -316,11 +414,11 @@ fn collect_one_poll_fd(
                 waitset_input_object_id(access),
                 generation,
             );
-            Ok(if ready {
+            Ok(PollRoute::Done(if ready {
                 events & (linux_abi::POLLIN as u32 | linux_abi::POLLPRI as u32)
             } else {
                 0
-            })
+            }))
         }
         multitask::KernelHandle::Console(console)
             if console.stream() == multitask::ConsoleStreamKind::Input
@@ -335,12 +433,17 @@ fn collect_one_poll_fd(
             ) {
                 Ok(result) => result,
                 Err(errno) if provider_revoke_events(errno).is_some() => {
-                    return Ok(provider_revoke_events(errno).unwrap());
+                    return Ok(PollRoute::Done(provider_revoke_events(errno).unwrap()));
                 }
                 Err(errno) => return Err(errno),
             };
             note_poll_observation(state, WAITSET_PROVIDER_SESSIOND, session, generation);
-            Ok(console_ready_events(console.stream(), live, ready, events))
+            Ok(PollRoute::Done(console_ready_events(
+                console.stream(),
+                live,
+                ready,
+                events,
+            )))
         }
         multitask::KernelHandle::Console(console)
             if matches!(
@@ -357,12 +460,17 @@ fn collect_one_poll_fd(
             ) {
                 Ok(result) => result,
                 Err(errno) if provider_revoke_events(errno).is_some() => {
-                    return Ok(provider_revoke_events(errno).unwrap());
+                    return Ok(PollRoute::Done(provider_revoke_events(errno).unwrap()));
                 }
                 Err(errno) => return Err(errno),
             };
             note_poll_observation(state, WAITSET_PROVIDER_SESSIOND, session, generation);
-            Ok(console_ready_events(console.stream(), live, false, events))
+            Ok(PollRoute::Done(console_ready_events(
+                console.stream(),
+                live,
+                false,
+                events,
+            )))
         }
         multitask::KernelHandle::Console(console)
             if matches!(
@@ -370,15 +478,9 @@ fn collect_one_poll_fd(
                 multitask::ConsoleStreamKind::Output | multitask::ConsoleStreamKind::Error
             ) =>
         {
-            Ok(events & linux_abi::POLLOUT as u32)
+            Ok(PollRoute::Done(events & linux_abi::POLLOUT as u32))
         }
-        _ => match poll_vfs_revents(fd, events, deadline_tick) {
-            Ok(revents) => Ok(revents),
-            Err(errno) if provider_revoke_events(errno).is_some() => {
-                Ok(provider_revoke_events(errno).unwrap())
-            }
-            Err(errno) => Err(errno),
-        },
+        _ => Ok(PollRoute::Vfs),
     }
 }
 
@@ -507,27 +609,40 @@ fn acknowledge_epoll_wait_block(task_id: u64) {
     crate::arch::rtc::disarm_sleep_waiter(task_id);
 }
 
-fn poll_vfs_revents(fd: u64, events: u32, deadline_tick: Option<u64>) -> Result<u32, i64> {
+/// Readiness of descriptors vfsd answers for, `VFS_POLL_BATCH_MAX` per round
+/// trip. The reply echoes every entry in order with `revents` filled in.
+fn poll_vfs_batch(queries: &[(i32, u32)], deadline_tick: Option<u64>) -> Result<Vec<u32>, i64> {
+    if queries.is_empty() || queries.len() > VFS_POLL_BATCH_MAX {
+        return Err(LINUX_EINVAL);
+    }
     let mut request = new_vfs_request(VFS_IPC_OP_POLL_QUERY);
     request.arg0 = VFS_POLL_QUERY_POLL;
-    request.payload_len = POLLFD_SIZE as u32;
-    request.payload[0..4].copy_from_slice(&(fd as i32).to_le_bytes());
-    request.payload[4..6].copy_from_slice(&(events as i16).to_le_bytes());
-    request.payload[6..8].copy_from_slice(&0_i16.to_le_bytes());
+    request.payload_len = (queries.len() * POLLFD_SIZE) as u32;
+    for (index, (fd, events)) in queries.iter().copied().enumerate() {
+        let offset = index * POLLFD_SIZE;
+        request.payload[offset..offset + 4].copy_from_slice(&fd.to_le_bytes());
+        request.payload[offset + 4..offset + 6].copy_from_slice(&(events as i16).to_le_bytes());
+        request.payload[offset + 6..offset + 8].copy_from_slice(&0_i16.to_le_bytes());
+    }
     let response = call_vfs_ipc_request_with_timeout(
         &request,
         waitset_provider_query_timeout_ms(deadline_tick),
     )?;
     ensure_vfs_status(&response)?;
-    if response.payload_len as usize != POLLFD_SIZE {
+    if response.payload_len as usize != queries.len() * POLLFD_SIZE {
         return Err(LINUX_EINVAL);
     }
-    let revents = i16::from_le_bytes(
-        response.payload[6..8]
-            .try_into()
-            .map_err(|_| LINUX_EINVAL)?,
-    );
-    Ok(revents as u32)
+    let mut revents = Vec::with_capacity(queries.len());
+    for index in 0..queries.len() {
+        let offset = index * POLLFD_SIZE;
+        let value = i16::from_le_bytes(
+            response.payload[offset + 6..offset + 8]
+                .try_into()
+                .map_err(|_| LINUX_EINVAL)?,
+        );
+        revents.push(value as u32);
+    }
+    Ok(revents)
 }
 
 fn poll_ready_bits(requested: u32) -> u32 {
@@ -536,7 +651,8 @@ fn poll_ready_bits(requested: u32) -> u32 {
             | linux_abi::POLLPRI as u32
             | linux_abi::POLLOUT as u32
             | linux_abi::POLLERR as u32
-            | linux_abi::POLLHUP as u32)
+            | linux_abi::POLLHUP as u32
+            | linux_abi::POLLRDHUP as u32)
 }
 
 fn console_ready_events(
@@ -744,10 +860,18 @@ pub fn syscall_linux_epoll_ctl(epfd: u64, op: u64, fd: u64, event_ptr: u64) -> u
                 Ok(event) => event,
                 Err(err) => return linux_errno(address_space_error_to_linux_errno(err)),
             };
-            if events & !poll_ready_bits(u32::MAX) != 0 {
-                return linux_errno(LINUX_EOPNOTSUPP);
+            // Linux: EPOLLEXCLUSIVE is ADD-only and combines only with the
+            // bits that make a wake-one hint meaningful. An interest added
+            // that way is later immutable (vfsd rejects the MOD too).
+            if events & linux_abi::EPOLLEXCLUSIVE != 0
+                && (op == linux_abi::EPOLL_CTL_MOD
+                    || events & !linux_abi::EPOLLEXCLUSIVE_OK_BITS != 0)
+            {
+                return linux_errno(LINUX_EINVAL);
             }
-            wire.events = events;
+            // EPOLLWAKEUP needs CAP_BLOCK_SUSPEND; RustOS has no suspend
+            // blockers, so it is dropped exactly as for an unprivileged caller.
+            wire.events = events & !linux_abi::EPOLLWAKEUP;
             wire.data = data;
         }
         linux_abi::EPOLL_CTL_DEL => {}
@@ -813,7 +937,7 @@ pub fn syscall_linux_epoll_wait(
     });
 
     loop {
-        let first = match collect_epoll_readiness(epoll.token_id(), maxevents, deadline_tick) {
+        let first = match collect_epoll_readiness(epoll.token_id(), maxevents, deadline_tick, EpollScanMode::Consume) {
             Ok(state) => state,
             Err(LINUX_ETIMEDOUT)
                 if deadline_tick.is_some_and(|deadline| crate::arch::rtc::ticks() >= deadline) =>
@@ -859,7 +983,7 @@ pub fn syscall_linux_epoll_wait(
             return linux_errno(errno);
         }
 
-        let second = match collect_epoll_readiness(epoll.token_id(), maxevents, deadline_tick) {
+        let second = match collect_epoll_readiness(epoll.token_id(), maxevents, deadline_tick, EpollScanMode::Consume) {
             Ok(state) => state,
             Err(LINUX_ETIMEDOUT)
                 if deadline_tick.is_some_and(|deadline| crate::arch::rtc::ticks() >= deadline) =>
@@ -1032,10 +1156,76 @@ fn waitset_provider_epoch(provider: u16) -> Result<u64, i64> {
     ipc_ops::service_endpoint_epoch(service_id).ok_or(LINUX_ENOSYS)
 }
 
+/// Whether a scan consumes edge-triggered and one-shot reports.
+///
+/// `epoll_wait` consumes: the events it returns are claimed in vfsd first, so
+/// two waiters on one epoll object never both receive the same edge or the same
+/// one-shot report. Nested readiness (`poll`/`epoll` on an epoll fd) only
+/// peeks; it has to answer "would `epoll_wait` return something" without
+/// stealing the report from the real waiter.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EpollScanMode {
+    Consume,
+    Peek,
+}
+
+/// One interest whose provider reported readiness the application asked for.
+struct EpollCandidate {
+    events: u32,
+    data: u64,
+    claim: WaitSetClaimWire,
+    /// Edge-triggered or one-shot: the report must be claimed in vfsd.
+    gated: bool,
+}
+
+enum InterestScan {
+    Skip,
+    Netd,
+    TimedOut,
+    Ready { revents: u32, generation: u64 },
+}
+
+/// Provider-level event bits that satisfy the Linux event mask `events`.
+fn epoll_provider_events(events: u32) -> u32 {
+    let mut provider = events & (linux_abi::EPOLLPRI | linux_abi::EPOLLRDHUP);
+    if events & (linux_abi::EPOLLIN | linux_abi::EPOLLRDNORM) != 0 {
+        provider |= linux_abi::EPOLLIN;
+    }
+    if events & (linux_abi::EPOLLOUT | linux_abi::EPOLLWRNORM) != 0 {
+        provider |= linux_abi::EPOLLOUT;
+    }
+    provider
+}
+
+/// The bits `epoll_wait` reports for provider readiness `provider_revents`
+/// against the registered mask `requested`. `EPOLLERR` and `EPOLLHUP` are
+/// always reported; the normal-data aliases appear only if they were asked for.
+fn epoll_report_events(provider_revents: u32, requested: u32) -> u32 {
+    let mut out = provider_revents
+        & (linux_abi::EPOLLPRI | linux_abi::EPOLLRDHUP | linux_abi::EPOLLERR | linux_abi::EPOLLHUP)
+        & (requested | linux_abi::EPOLLERR | linux_abi::EPOLLHUP);
+    if provider_revents & linux_abi::EPOLLIN != 0 {
+        out |= requested & (linux_abi::EPOLLIN | linux_abi::EPOLLRDNORM);
+    }
+    if provider_revents & linux_abi::EPOLLOUT != 0 {
+        out |= requested & (linux_abi::EPOLLOUT | linux_abi::EPOLLWRNORM);
+    }
+    out
+}
+
+fn decode_snapshot_entry(bytes: &[u8]) -> WaitSetSnapshotWire {
+    debug_assert!(bytes.len() >= WAITSET_SNAPSHOT_SIZE);
+    // SAFETY: the caller sliced at least `WAITSET_SNAPSHOT_SIZE` bytes and
+    // `WaitSetSnapshotWire` is plain `repr(C)` data valid for any bit pattern;
+    // `read_unaligned` tolerates the byte buffer's alignment.
+    unsafe { core::ptr::read_unaligned(bytes.as_ptr().cast::<WaitSetSnapshotWire>()) }
+}
+
 fn collect_epoll_readiness(
     epoll_token: u64,
     maxevents: usize,
     deadline_tick: Option<u64>,
+    mode: EpollScanMode,
 ) -> Result<EpollReadinessState, i64> {
     let mut request = new_vfs_request(VFS_IPC_OP_POLL_QUERY);
     request.arg0 = VFS_POLL_QUERY_EPOLL_SNAPSHOT;
@@ -1055,32 +1245,31 @@ fn collect_epoll_readiness(
     let count = response.value as usize;
     if response.aux == 0
         || count > WAITSET_MAX_INTERESTS
-        || response.payload_len as usize != count.saturating_mul(WAITSET_INTEREST_SIZE)
+        || response.payload_len as usize != count.saturating_mul(WAITSET_SNAPSHOT_SIZE)
     {
         return Err(LINUX_EINVAL);
     }
     let mut interests = Vec::with_capacity(count);
     for index in 0..count {
-        let offset = index * WAITSET_INTEREST_SIZE;
-        let wire = unsafe {
-            core::ptr::read_unaligned(
-                response.payload[offset..]
-                    .as_ptr()
-                    .cast::<WaitSetInterestWire>(),
-            )
-        };
-        if !waitset_interest_shape_valid(&wire) {
+        let offset = index * WAITSET_SNAPSHOT_SIZE;
+        let wire = decode_snapshot_entry(&response.payload[offset..offset + WAITSET_SNAPSHOT_SIZE]);
+        if !waitset_snapshot_shape_valid(&wire) {
             return Err(LINUX_EINVAL);
         }
-        let revoked = match waitset_provider_epoch(wire.provider) {
-            Ok(current_epoch) => current_epoch != wire.provider_epoch,
-            Err(errno) if provider_revoke_events(errno).is_some() => true,
+        // A provider restart advances its endpoint epoch. Report the interest
+        // as ERR|HUP, keyed by the new epoch so an edge-triggered consumer
+        // sees the revoke once rather than on every scan.
+        let (revoked, epoch_generation) = match waitset_provider_epoch(wire.interest.provider) {
+            Ok(current_epoch) => (
+                current_epoch != wire.interest.provider_epoch,
+                current_epoch.max(1),
+            ),
+            Err(errno) if provider_revoke_events(errno).is_some() => (true, 1),
             Err(errno) => return Err(errno),
         };
-        interests.push((wire, revoked));
+        interests.push((wire, revoked, epoch_generation));
     }
 
-    let mut ready = Vec::new();
     let mut observations = Vec::with_capacity(interests.len().saturating_add(1));
     observations.push(
         super::super::broker_ops::waitset_broker_ops::ProviderObservation {
@@ -1089,38 +1278,40 @@ fn collect_epoll_readiness(
             generation: response.aux,
         },
     );
-    let mut provider_timed_out = false;
-    for (interest, revoked) in interests {
-        if revoked {
-            if ready.len() < maxevents {
-                ready.push((linux_abi::EPOLLERR | linux_abi::EPOLLHUP, interest.data));
-            }
+    let revoke_events = linux_abi::EPOLLERR | linux_abi::EPOLLHUP;
+    let mut scans = Vec::with_capacity(interests.len());
+    let mut netd_slots = Vec::new();
+    let mut netd_queries = Vec::new();
+    for (index, (wire, revoked, epoch_generation)) in interests.iter().enumerate() {
+        let interest = &wire.interest;
+        if wire.state & WAITSET_SNAPSHOT_STATE_DISABLED != 0 {
+            // A reported one-shot stays silent until EPOLL_CTL_MOD re-arms it,
+            // and that mutation advances the epoll object's own generation.
+            scans.push(InterestScan::Skip);
             continue;
         }
-        let queried = (|| -> Result<u32, i64> {
+        if *revoked {
+            scans.push(InterestScan::Ready {
+                revents: revoke_events,
+                generation: *epoch_generation,
+            });
+            continue;
+        }
+        let provider_events = epoll_provider_events(interest.events);
+        if interest.provider == WAITSET_PROVIDER_NETD {
+            netd_slots.push(index);
+            netd_queries.push((interest.object_id, provider_events));
+            scans.push(InterestScan::Netd);
+            continue;
+        }
+        let queried = (|| -> Result<(u32, u64), i64> {
             Ok(match interest.provider {
-                WAITSET_PROVIDER_NETD => {
-                    let (revents, generation) = poll_netd_socket_token(
-                        interest.object_id,
-                        interest.events,
-                        waitset_provider_query_timeout_ms(deadline_tick),
-                    )?;
-                    merge_provider_observation(
-                        &mut observations,
-                        super::super::broker_ops::waitset_broker_ops::ProviderObservation {
-                            provider: WAITSET_PROVIDER_NETD,
-                            object_id: interest.object_id,
-                            generation,
-                        },
-                    );
-                    revents
-                }
                 WAITSET_PROVIDER_INPUTD => {
                     let access =
-                    super::super::broker_ops::waitset_broker_ops::input_open_description_access(
-                        interest.object_id,
-                    )
-                    .ok_or(LINUX_EBADF)?;
+                        super::super::broker_ops::waitset_broker_ops::input_open_description_access(
+                            interest.object_id,
+                        )
+                        .ok_or(LINUX_EBADF)?;
                     let (is_ready, generation) = input_readiness_for_access(access, deadline_tick)?;
                     merge_provider_observation(
                         &mut observations,
@@ -1130,11 +1321,12 @@ fn collect_epoll_readiness(
                             generation,
                         },
                     );
-                    if is_ready {
-                        interest.events & (linux_abi::EPOLLIN | linux_abi::EPOLLPRI)
+                    let revents = if is_ready {
+                        provider_events & (linux_abi::EPOLLIN | linux_abi::EPOLLPRI)
                     } else {
                         0
-                    }
+                    };
+                    (revents, generation)
                 }
                 WAITSET_PROVIDER_SESSIOND => {
                     let stream = multitask::ConsoleHandle::stream_for_token(interest.object_id)
@@ -1154,33 +1346,184 @@ fn collect_epoll_readiness(
                             generation,
                         },
                     );
-                    console_ready_events(stream, live, is_ready, interest.events)
+                    (
+                        console_ready_events(stream, live, is_ready, provider_events),
+                        generation,
+                    )
                 }
                 _ => return Err(LINUX_EIO),
             })
         })();
-        let revents =
-            match queried {
-                Ok(revents) => revents,
-                Err(LINUX_ETIMEDOUT) => {
-                    provider_timed_out = true;
-                    continue;
+        scans.push(match queried {
+            Ok((revents, generation)) => InterestScan::Ready { revents, generation },
+            Err(LINUX_ETIMEDOUT) => InterestScan::TimedOut,
+            Err(errno) if provider_revoke_events(errno).is_some() => InterestScan::Ready {
+                revents: revoke_events,
+                generation: 1,
+            },
+            Err(errno) => return Err(errno),
+        });
+    }
+
+    // Every netd-backed interest is answered by one exchange, not one each.
+    if !netd_queries.is_empty() {
+        match poll_netd_socket_batch(&netd_queries, waitset_provider_query_timeout_ms(deadline_tick)) {
+            Ok(outcomes) => {
+                for (slot, ((token, _), outcome)) in
+                    netd_slots.iter().zip(netd_queries.iter().zip(outcomes))
+                {
+                    scans[*slot] = match outcome {
+                        Ok((revents, generation)) => {
+                            merge_provider_observation(
+                                &mut observations,
+                                super::super::broker_ops::waitset_broker_ops::ProviderObservation {
+                                    provider: WAITSET_PROVIDER_NETD,
+                                    object_id: *token,
+                                    generation,
+                                },
+                            );
+                            InterestScan::Ready { revents, generation }
+                        }
+                        Err(errno) if provider_revoke_events(errno).is_some() => {
+                            InterestScan::Ready {
+                                revents: revoke_events,
+                                generation: 1,
+                            }
+                        }
+                        Err(LINUX_ETIMEDOUT) => InterestScan::TimedOut,
+                        Err(errno) => return Err(errno),
+                    };
                 }
-                Err(errno) if provider_revoke_events(errno).is_some() => {
-                    linux_abi::EPOLLERR | linux_abi::EPOLLHUP
+            }
+            Err(LINUX_ETIMEDOUT) => {
+                for slot in &netd_slots {
+                    scans[*slot] = InterestScan::TimedOut;
                 }
-                Err(errno) => return Err(errno),
-            } & poll_ready_bits(interest.events | linux_abi::EPOLLERR | linux_abi::EPOLLHUP);
-        if revents != 0 && ready.len() < maxevents {
-            ready.push((revents, interest.data));
+            }
+            Err(errno) if provider_revoke_events(errno).is_some() => {
+                for slot in &netd_slots {
+                    scans[*slot] = InterestScan::Ready {
+                        revents: revoke_events,
+                        generation: 1,
+                    };
+                }
+            }
+            Err(errno) => return Err(errno),
         }
     }
-    require_completed_provider_scan(provider_timed_out, !ready.is_empty())?;
 
+    let mut provider_timed_out = false;
+    let mut candidates = Vec::new();
+    for ((wire, _, _), scan) in interests.iter().zip(scans) {
+        let interest = &wire.interest;
+        let (revents, generation) = match scan {
+            InterestScan::Skip | InterestScan::Netd => continue,
+            InterestScan::TimedOut => {
+                provider_timed_out = true;
+                continue;
+            }
+            InterestScan::Ready { revents, generation } => (revents, generation),
+        };
+        let reported = epoll_report_events(revents, interest.events);
+        if reported == 0 {
+            continue;
+        }
+        let edge = interest.events & linux_abi::EPOLLET != 0;
+        let oneshot = interest.events & linux_abi::EPOLLONESHOT != 0;
+        // An edge was already reported when no newer provider generation exists.
+        if edge && generation <= wire.edge_generation {
+            continue;
+        }
+        candidates.push(EpollCandidate {
+            events: reported,
+            data: interest.data,
+            claim: WaitSetClaimWire {
+                provider: interest.provider,
+                target_fd: interest.target_fd,
+                object_id: interest.object_id,
+                generation,
+                ..WaitSetClaimWire::default()
+            },
+            gated: edge || oneshot,
+        });
+    }
+
+    let ready = select_epoll_events(epoll_token, &candidates, maxevents, mode)?;
+    require_completed_provider_scan(provider_timed_out, !ready.is_empty())?;
     Ok(EpollReadinessState {
         ready,
         observations,
     })
+}
+
+/// Pick up to `maxevents` events in snapshot order. Level-triggered candidates
+/// are taken as they are; edge-triggered and one-shot ones are claimed in
+/// vfsd first, and a candidate another waiter already claimed is replaced by
+/// the next one so a lost race never turns a ready set into an empty result.
+fn select_epoll_events(
+    epoll_token: u64,
+    candidates: &[EpollCandidate],
+    maxevents: usize,
+    mode: EpollScanMode,
+) -> Result<Vec<(u32, u64)>, i64> {
+    let mut ready = Vec::new();
+    let mut cursor = 0;
+    while ready.len() < maxevents && cursor < candidates.len() {
+        let take = (maxevents - ready.len()).min(candidates.len() - cursor);
+        let round = &candidates[cursor..cursor + take];
+        cursor += take;
+        let claims = if mode == EpollScanMode::Consume {
+            claim_epoll_reports(epoll_token, round)?
+        } else {
+            alloc::vec![true; round.iter().filter(|candidate| candidate.gated).count()]
+        };
+        let mut claimed = claims.into_iter();
+        for candidate in round {
+            if candidate.gated && !claimed.next().unwrap_or(false) {
+                continue;
+            }
+            ready.push((candidate.events, candidate.data));
+        }
+    }
+    Ok(ready)
+}
+
+/// Ask vfsd which of the gated candidates this caller owns. The answer is one
+/// flag per gated candidate, in order. The exchange is not replayed: a lost
+/// reply after vfsd consumed the report can drop one edge, which is why it
+/// rides the interactive rail instead of the 16 ms readiness rail.
+fn claim_epoll_reports(
+    epoll_token: u64,
+    candidates: &[EpollCandidate],
+) -> Result<Vec<bool>, i64> {
+    let gated = candidates
+        .iter()
+        .filter(|candidate| candidate.gated)
+        .map(|candidate| candidate.claim)
+        .collect::<Vec<_>>();
+    let mut owned = Vec::with_capacity(gated.len());
+    for chunk in gated.chunks(VFS_EPOLL_CLAIM_MAX) {
+        let mut request = new_vfs_request(VFS_IPC_OP_POLL_QUERY);
+        request.arg0 = VFS_POLL_QUERY_EPOLL_CLAIM;
+        request.remote_id = epoll_token;
+        request.payload_len = (chunk.len() * WAITSET_CLAIM_SIZE) as u32;
+        for (index, claim) in chunk.iter().enumerate() {
+            let offset = index * WAITSET_CLAIM_SIZE;
+            request.payload[offset..offset + 2].copy_from_slice(&claim.provider.to_le_bytes());
+            request.payload[offset + 2..offset + 4].copy_from_slice(&claim.reserved0.to_le_bytes());
+            request.payload[offset + 4..offset + 8].copy_from_slice(&claim.reserved1.to_le_bytes());
+            request.payload[offset + 8..offset + 16].copy_from_slice(&claim.target_fd.to_le_bytes());
+            request.payload[offset + 16..offset + 24].copy_from_slice(&claim.object_id.to_le_bytes());
+            request.payload[offset + 24..offset + 32].copy_from_slice(&claim.generation.to_le_bytes());
+        }
+        let response = call_vfs_ipc_request_with_timeout(&request, control::deadline_ms())?;
+        ensure_vfs_status(&response)?;
+        if response.payload_len as usize != chunk.len() || response.value > chunk.len() as u64 {
+            return Err(LINUX_EINVAL);
+        }
+        owned.extend(response.payload[..chunk.len()].iter().map(|flag| *flag != 0));
+    }
+    Ok(owned)
 }
 
 fn write_epoll_ready_events(events_ptr: u64, ready: &[(u32, u64)]) -> u64 {

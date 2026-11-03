@@ -597,12 +597,17 @@ impl VfsState {
 
 impl VfsStorage {
     fn metadata(&mut self, path: &str) -> Result<Metadata, i32> {
-        if path == "/" || path == "/proc" || path == "/run" {
+        if path == "/" || path == "/proc" || self.run_dirs.contains(path) {
             return Ok(Metadata {
                 kind: RemoteKind::Directory,
                 len: 0,
                 inode: path_inode(path.as_bytes()),
             });
+        }
+        if path.starts_with("/run/") {
+            // `/run` is vfsd's volatile namespace, not a FAT directory: a path
+            // that `mkdir` has not created does not exist on the boot volume.
+            return Err(ENOENT);
         }
         if path == "/dev" || path.starts_with("/dev/") {
             match devmgrd_lookup(path) {
@@ -673,8 +678,20 @@ impl VfsStorage {
                 Err(errno) => return Err(errno),
             }
         }
-        if path == "/proc" || path == "/run" {
+        if path == "/proc" {
             return Ok(entries);
+        }
+        if self.run_dirs.contains(path) {
+            entries.extend(
+                self.run_dirs
+                    .children(path)
+                    .into_iter()
+                    .map(|name| DirEntry::new(name, RemoteKind::Directory)),
+            );
+            return Ok(entries);
+        }
+        if path.starts_with("/run/") {
+            return Err(ENOENT);
         }
         self.invalidate_caches_if_remounted();
         if let Some(cached) = self.dir_entries_cache.get(path) {

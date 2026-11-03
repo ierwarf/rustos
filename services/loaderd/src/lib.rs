@@ -17,11 +17,16 @@
 
 #![no_std]
 
+extern crate alloc;
+
 pub mod application_jobs;
 pub mod aslr;
+pub mod personality_gate;
 pub mod placement;
+pub mod release_attestation;
 mod request_strings;
 pub mod release_bundle;
+pub mod trust_anchor;
 pub use request_strings::RequestStrings;
 
 use core::mem::size_of;

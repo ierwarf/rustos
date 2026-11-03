@@ -117,6 +117,8 @@ fn write_panic_site_marker(info: &PanicInfo<'_>) {
 
 fn emergency_debugcon_bytes(bytes: &[u8]) {
     for &byte in bytes {
+        // SAFETY: port 0xE9 is the QEMU/Bochs debug console; a byte write has
+        // no memory effect and is ignored on hardware without the device.
         unsafe {
             core::arch::asm!(
                 "out dx, al",
@@ -136,6 +138,8 @@ fn emergency_debugcon_bytes(bytes: &[u8]) {
 /// that remains valid through early kernel initialization.
 pub unsafe fn initialize_kernel(boot_info_ptr: *const BootInfo) {
     flow_info(1, "kernel initialize begin");
+    // SAFETY: this function's contract requires a readable, validated
+    // `BootInfo` that outlives early initialization.
     let boot_info = match unsafe { BootInfo::from_ptr(boot_info_ptr) } {
         Ok(boot_info) => boot_info,
         Err(error) => panic!("{}", error.as_str()),

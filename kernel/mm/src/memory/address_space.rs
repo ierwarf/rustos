@@ -29,6 +29,7 @@ mod atomic_user;
 mod execution_lifetime;
 mod frame_release;
 mod pager_fault_mapping;
+mod range_query;
 mod retirement;
 pub use execution_lifetime::{
     ActivationPin, ExecutionPin, RetirementOwner, drain_retired_address_spaces,
@@ -683,14 +684,10 @@ impl ProcessAddressSpace {
         start: VirtAddr,
         page_count: usize,
     ) -> Result<(), AddressSpaceError> {
-        validate_user_page_range(start, page_count)?;
-        for page_index in 0..page_count {
-            let virt = page_addr(start, page_index)?;
-            if self.translate_user(virt).is_none() {
-                return Err(AddressSpaceError::NotMapped);
-            }
+        match self.first_unmapped_user_page(start, page_count)? {
+            Some(_) => Err(AddressSpaceError::NotMapped),
+            None => Ok(()),
         }
-        Ok(())
     }
 
     pub fn debug_dump_user_range_state(&self, start: VirtAddr, page_count: usize, reason: &str) {

@@ -2,20 +2,20 @@
 # Formal Contract Registry
 
 - Schema: `3`
-- Registry SHA-256: `99f4fcf61a33ef97dccb1602e1d815bfacd2707986215da013ce745440a56a0e`
+- Registry SHA-256: `11119b1620eec85c2d756bce59bddfc20c6d56c05fe31d6e974bb308c825263d`
 - Models: `159`
 - Whole flows: `78`
-- Transitions: `986`
+- Transitions: `990`
 - Product runtime scenarios: `3`
-- Exact source witnesses: `1452`
+- Exact source witnesses: `1459`
 - Apalache pilots: `3`
 - TLAPS theorem models: `2`
 - Runtime-traced models: `7`
 - Intentional-terminal exceptions: `92` (ceiling `92`)
 - Cyclic strongly connected components: `54`
 - Supporting model bindings: `132`
-- Explicit critical/high risk surfaces: `243`
-- Additional source mappings: `369`
+- Explicit critical/high risk surfaces: `244`
+- Additional source mappings: `370`
 
 | Flow | Severity | Owners | Models | Requirements | Hazards | Sinks |
 | --- | --- | --- | --- | ---: | ---: | --- |
@@ -68,7 +68,7 @@
 | `pager-vma-publication` | `critical` | kernel-ps | pager-vma-publication/PagerVmaPublication | 5 | 5 | revoked |
 | `pci-resource-discovery` | `critical` | kernel-hal | pci-bar-discovery/PciBarDiscovery | 9 | 9 | published, rejected |
 | `per-cpu-clockevent-lifecycle` | `critical` | kernel-hal, kernel-ps | per-cpu-clockevent-lifecycle/PerCpuClockeventLifecycle | 7 | 7 | invariant-panic, serviced |
-| `physical-frame-lifecycle` | `critical` | kernel-mm | physical-frame-lifecycle/PhysicalFrameLifecycle | 8 | 8 | allocation-failed, rejected |
+| `physical-frame-lifecycle` | `critical` | kernel-mm | physical-frame-lifecycle/PhysicalFrameLifecycle | 12 | 12 | allocation-failed, rejected |
 | `post-init-bootstrap-barrier` | `critical` | initd | post-init-bootstrap-barrier/PostInitBootstrapBarrier | 5 | 5 | barrier-failed, consumer-started |
 | `post-init-service-authority` | `critical` | kernel-compat, loaderd, rootd | post-init-leases/PostInitLeases | 6 | 6 | denied, revoked |
 | `process-address-space-lifecycle` | `critical` | kernel-ps | exec-address-space-transaction/ExecAddressSpaceTransaction, process-address-space-lifetime/ProcessAddressSpaceLifetime | 15 | 15 | live, reclaimed, rejected |

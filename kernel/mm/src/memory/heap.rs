@@ -6,13 +6,20 @@
 //!   checked before tracker or allocator mutation.
 //! - **Lifecycle:** Allocate backing, publish one tracked live span, validate
 //!   exact layout on free, quarantine its address, then return it to the buddy.
-//! - **Concurrency:** Allocation runs with interrupts disabled under one fixed
-//!   non-nested tracker and buddy critical sections; the normal path performs no
-//!   quarantine scan.
+//! - **Concurrency:** Allocation runs with interrupts disabled. Small blocks
+//!   (at most [`MAX_CLASS_BYTES`]) are served from per-CPU size-class
+//!   magazines; the buddy lock is taken once per refill or drain *batch*, never
+//!   per allocation. The lock order is CPU cache slot -> buddy, one slot at a
+//!   time, and a busy slot is bypassed rather than waited on. Provenance lives
+//!   in [`TRACKER_SHARDS`] independent tracker shards chosen by pointer hash;
+//!   a tracker shard is a leaf: it is never held across the buddy, a cache
+//!   slot, or another shard, and the normal path performs no quarantine scan.
 //! - **Failure:** Exhaustion, tracker saturation, invalid free, double free, and
 //!   layout mismatch fail without freeing an unowned span.
 //! - **Forbidden:** No unbounded scan on successful allocation, allocator
-//!   recursion, free-before-validation, fabricated span, or policy work.
+//!   recursion, free-before-validation, fabricated span, or policy work. A
+//!   cached block is never tracked live and never handed out twice; caches
+//!   are drained before the buddy reports exhaustion.
 //! - **Evidence:** `kernel-resource-lifecycle` and `physical-frame-lifecycle`.
 
 #[cfg(not(test))]
@@ -20,10 +27,11 @@ use buddy_system_allocator::LockedHeap;
 #[cfg(not(test))]
 use core::alloc::GlobalAlloc;
 use core::alloc::Layout;
-#[cfg(not(test))]
 use core::ptr;
+use nucleus_core::util::lockdep::MAX_TRACKED_CPUS;
+use spin::Mutex;
 #[cfg(not(test))]
-use spin::{Mutex, Once};
+use spin::Once;
 #[cfg(not(test))]
 use x86_64::PhysAddr;
 #[cfg(not(test))]
@@ -42,14 +50,34 @@ const PAGE_SIZE: usize = 4096;
 const MIN_HEAP_SIZE: usize = 64 * 1024 * 1024;
 #[cfg(not(test))]
 const MAX_HEAP_SIZE: usize = 512 * 1024 * 1024;
+/// Independent tracker shards; a pointer always hashes to the same shard.
+const TRACKER_SHARD_BITS: u32 = 4;
+const TRACKER_SHARDS: usize = 1 << TRACKER_SHARD_BITS;
+/// Live-allocation slots per shard (65,536 across the heap in production).
 #[cfg(test)]
 const ACTIVE_ALLOCATION_SLOTS: usize = 128;
 #[cfg(not(test))]
-const ACTIVE_ALLOCATION_SLOTS: usize = 65_536;
+const ACTIVE_ALLOCATION_SLOTS: usize = 65_536 / TRACKER_SHARDS;
+/// Recently-freed quarantine entries per shard (8,192 across the heap).
 #[cfg(test)]
 const FREED_QUARANTINE_SLOTS: usize = 64;
 #[cfg(not(test))]
-const FREED_QUARANTINE_SLOTS: usize = 8_192;
+const FREED_QUARANTINE_SLOTS: usize = 8_192 / TRACKER_SHARDS;
+
+/// Smallest and largest block served from a CPU cache. Larger requests, and
+/// any request whose alignment exceeds its class, go straight to the buddy.
+const MIN_CLASS_SHIFT: u32 = 4;
+const MAX_CLASS_SHIFT: u32 = 11;
+const MIN_CLASS_BYTES: usize = 1 << MIN_CLASS_SHIFT;
+const MAX_CLASS_BYTES: usize = 1 << MAX_CLASS_SHIFT;
+const SIZE_CLASSES: usize = (MAX_CLASS_SHIFT - MIN_CLASS_SHIFT + 1) as usize;
+/// Bytes one CPU may park per size class, and the hard magazine capacity.
+/// Linux slab per-CPU partial lists and tcmalloc/jemalloc thread caches bound
+/// idle memory the same way: by bytes, so large classes hold few blocks.
+const CLASS_CACHE_BYTES: usize = 16 * 1024;
+const MAGAZINE_CAPACITY: usize = 64;
+const MIN_MAGAZINE_CAPACITY: usize = 8;
+const HEAP_CACHE_SLOTS: usize = MAX_TRACKED_CPUS;
 #[cfg(all(not(test), rustos_debug_print_enabled))]
 const DEBUGCON_PORT: u16 = 0x00e9;
 
@@ -59,7 +87,7 @@ static HEAP_INIT: Once<()> = Once::new();
 #[cfg(not(test))]
 static HEAP: LockedHeap<HEAP_ORDER> = LockedHeap::<HEAP_ORDER>::new();
 #[cfg(not(test))]
-static ALLOCATION_TRACKER: Mutex<AllocationTracker> = Mutex::new(AllocationTracker::new());
+static HEAP_CORE: HeapCore<BuddyBackend> = HeapCore::new(BuddyBackend);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HeapViolationKind {
@@ -107,7 +135,7 @@ enum ActiveAllocState {
     Occupied = 1,
 }
 
-/// `log2(ACTIVE_ALLOCATION_SLOTS)`; the table size is a power of two.
+/// `log2(ACTIVE_ALLOCATION_SLOTS)`; each shard's table size is a power of two.
 const ACTIVE_ALLOCATION_INDEX_BITS: u32 = ACTIVE_ALLOCATION_SLOTS.trailing_zeros();
 const _: () = assert!(ACTIVE_ALLOCATION_SLOTS.is_power_of_two());
 
@@ -287,50 +315,342 @@ struct TrackerOccupancy {
     overflow_count: usize,
 }
 
-/// Fibonacci hashing of the 16-byte allocation granule, keeping the HIGH bits
-/// of the product. The previous form masked the LOW bits of a product taken
-/// over `ptr.rotate_right(17)`; those depend only on pointer bits 17..33, so
-/// every allocation inside one 128 KiB window shared a single home slot.
+/// Fibonacci hashing of the 16-byte allocation granule. The product's top
+/// [`TRACKER_SHARD_BITS`] bits pick the shard and the next
+/// `ACTIVE_ALLOCATION_INDEX_BITS` bits are the home slot inside it, so shard
+/// and slot are independent. The previous form masked the LOW bits of a product
+/// taken over `ptr.rotate_right(17)`; those depend only on pointer bits
+/// 17..33, so every allocation inside one 128 KiB window shared a single home
+/// slot.
+#[inline]
+const fn pointer_hash(ptr: usize) -> u64 {
+    ((ptr >> 4) as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+}
+
 #[inline]
 const fn home_slot(ptr: usize) -> usize {
-    ((((ptr >> 4) as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)) >> (64 - ACTIVE_ALLOCATION_INDEX_BITS))
-        as usize
+    ((pointer_hash(ptr) << TRACKER_SHARD_BITS) >> (64 - ACTIVE_ALLOCATION_INDEX_BITS)) as usize
+}
+
+#[inline]
+const fn tracker_shard(ptr: usize) -> usize {
+    (pointer_hash(ptr) >> (64 - TRACKER_SHARD_BITS)) as usize
 }
 
 pub struct KernelAllocator;
+
+/// Where blocks ultimately come from. Production is the buddy allocator; the
+/// host tests substitute a counting system-allocator backend so the cache tier
+/// can be stress-tested across threads.
+trait BlockBackend {
+    /// One block, or null.
+    fn alloc(&self, layout: Layout) -> *mut u8;
+    /// Up to `out.len()` blocks under one backend critical section; returns
+    /// the number written.
+    fn alloc_batch(&self, layout: Layout, out: &mut [usize]) -> usize;
+    /// # Safety
+    /// `ptr` came from this backend with exactly `layout` and is not in use.
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout);
+    /// # Safety
+    /// Every pointer came from this backend with exactly `layout` and is not
+    /// in use.
+    unsafe fn dealloc_batch(&self, layout: Layout, ptrs: &[usize]);
+}
+
+#[cfg(not(test))]
+struct BuddyBackend;
+
+#[cfg(not(test))]
+impl BlockBackend for BuddyBackend {
+    fn alloc(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: `LockedHeap::alloc` takes the buddy lock itself and accepts
+        // any non-zero-size layout; callers never pass a zero-size layout.
+        unsafe { HEAP.alloc(layout) }
+    }
+
+    fn alloc_batch(&self, layout: Layout, out: &mut [usize]) -> usize {
+        let mut heap = HEAP.lock();
+        let mut filled = 0;
+        while filled < out.len() {
+            match heap.alloc(layout) {
+                Ok(block) => {
+                    out[filled] = block.as_ptr() as usize;
+                    filled += 1;
+                }
+                Err(()) => break,
+            }
+        }
+        filled
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        // SAFETY: the trait contract: `ptr` is an unused block of `layout`
+        // that this buddy handed out.
+        unsafe { HEAP.dealloc(ptr, layout) };
+    }
+
+    unsafe fn dealloc_batch(&self, layout: Layout, ptrs: &[usize]) {
+        let mut heap = HEAP.lock();
+        for &block in ptrs {
+            if let Some(block) = core::ptr::NonNull::new(block as *mut u8) {
+                // SAFETY: the trait contract: each block is an unused
+                // allocation of `layout` from this buddy.
+                unsafe { heap.dealloc(block, layout) };
+            }
+        }
+    }
+}
+
+/// A bounded LIFO of free blocks of one size class.
+struct Magazine {
+    len: usize,
+    blocks: [usize; MAGAZINE_CAPACITY],
+}
+
+impl Magazine {
+    const fn new() -> Self {
+        Self {
+            len: 0,
+            blocks: [0; MAGAZINE_CAPACITY],
+        }
+    }
+
+    fn push(&mut self, block: usize) {
+        self.blocks[self.len] = block;
+        self.len += 1;
+    }
+
+    fn pop(&mut self) -> Option<usize> {
+        self.len = self.len.checked_sub(1)?;
+        Some(self.blocks[self.len])
+    }
+}
+
+struct CpuCache {
+    magazines: [Magazine; SIZE_CLASSES],
+}
+
+impl CpuCache {
+    const fn new() -> Self {
+        Self {
+            magazines: [const { Magazine::new() }; SIZE_CLASSES],
+        }
+    }
+}
+
+/// Size class (index and block size) a layout is served from, or `None` for
+/// the buddy. A block of class size `c` is `c`-aligned, so any layout whose
+/// size and alignment are at most `c` fits it.
+#[inline]
+fn size_class(layout: Layout) -> Option<(usize, usize)> {
+    let need = layout.size().max(layout.align()).max(MIN_CLASS_BYTES);
+    if need > MAX_CLASS_BYTES {
+        return None;
+    }
+    let bytes = need.next_power_of_two();
+    Some(((bytes.trailing_zeros() - MIN_CLASS_SHIFT) as usize, bytes))
+}
+
+/// Magazine capacity of a class: a byte budget, clamped.
+#[inline]
+const fn magazine_capacity(class_bytes: usize) -> usize {
+    let by_bytes = CLASS_CACHE_BYTES / class_bytes;
+    if by_bytes < MIN_MAGAZINE_CAPACITY {
+        MIN_MAGAZINE_CAPACITY
+    } else if by_bytes > MAGAZINE_CAPACITY {
+        MAGAZINE_CAPACITY
+    } else {
+        by_bytes
+    }
+}
+
+/// The heap proper: sharded provenance tracker plus per-CPU size-class caches
+/// in front of a [`BlockBackend`].
+struct HeapCore<B: BlockBackend> {
+    backend: B,
+    shards: [Mutex<AllocationTracker>; TRACKER_SHARDS],
+    caches: [Mutex<CpuCache>; HEAP_CACHE_SLOTS],
+}
+
+impl<B: BlockBackend> HeapCore<B> {
+    const fn new(backend: B) -> Self {
+        Self {
+            backend,
+            shards: [const { Mutex::new(AllocationTracker::new()) }; TRACKER_SHARDS],
+            caches: [const { Mutex::new(CpuCache::new()) }; HEAP_CACHE_SLOTS],
+        }
+    }
+
+    fn block_layout(class_bytes: usize) -> Option<Layout> {
+        Layout::from_size_align(class_bytes, class_bytes).ok()
+    }
+
+    /// Allocates and records one span; null on exhaustion or tracker
+    /// saturation. `cpu` only chooses a cache slot, so any value is correct.
+    fn alloc(&self, cpu: usize, layout: Layout) -> *mut u8 {
+        let ptr = match size_class(layout) {
+            Some((class, bytes)) => self.alloc_small(cpu, class, bytes),
+            None => self.alloc_large(layout),
+        };
+        if ptr.is_null() {
+            return ptr;
+        }
+        // The block is unreachable by any other CPU until it is returned, so
+        // it can be recorded after every allocator lock is gone.
+        let mut tracker = self.shards[tracker_shard(ptr as usize)].lock();
+        if tracker.record_alloc(ptr as usize, layout) {
+            return ptr;
+        }
+        let occupancy = tracker.occupancy();
+        drop(tracker);
+        heap_tracker_overflow_log(ptr as usize, layout, occupancy);
+        self.release_block(cpu, ptr, layout);
+        ptr::null_mut()
+    }
+
+    fn alloc_large(&self, layout: Layout) -> *mut u8 {
+        let ptr = self.backend.alloc(layout);
+        if !ptr.is_null() {
+            return ptr;
+        }
+        // Idle cached blocks keep the buddy from coalescing; reclaim them
+        // before reporting exhaustion.
+        self.drain_all();
+        self.backend.alloc(layout)
+    }
+
+    fn alloc_small(&self, cpu: usize, class: usize, bytes: usize) -> *mut u8 {
+        let Some(block_layout) = Self::block_layout(bytes) else {
+            return ptr::null_mut();
+        };
+        if let Some(mut cache) = self.caches[cpu % HEAP_CACHE_SLOTS].try_lock() {
+            let magazine = &mut cache.magazines[class];
+            if let Some(block) = magazine.pop() {
+                return block as *mut u8;
+            }
+            // Refill: one buddy hold for a half magazine.
+            let batch = magazine_capacity(bytes) / 2;
+            let mut fresh = [0usize; MAGAZINE_CAPACITY];
+            let got = self.backend.alloc_batch(block_layout, &mut fresh[..batch]);
+            if got != 0 {
+                for &block in &fresh[1..got] {
+                    magazine.push(block);
+                }
+                return fresh[0] as *mut u8;
+            }
+        } else {
+            // Slot busy (re-entry or a CPU index shared during early boot):
+            // bypass it instead of waiting.
+            let ptr = self.backend.alloc(block_layout);
+            if !ptr.is_null() {
+                return ptr;
+            }
+        }
+        self.drain_all();
+        self.backend.alloc(block_layout)
+    }
+
+    /// Validates `layout` against provenance, then returns the span.
+    ///
+    /// # Safety
+    /// `ptr` must be a pointer this heap returned for `layout` or an invalid
+    /// one; validation rejects the latter before any block moves.
+    unsafe fn dealloc(
+        &self,
+        cpu: usize,
+        ptr: *mut u8,
+        layout: Layout,
+    ) -> Result<(), HeapViolationKind> {
+        let mut tracker = self.shards[tracker_shard(ptr as usize)].lock();
+        match tracker.begin_dealloc(ptr as usize, layout) {
+            Ok(()) => {
+                drop(tracker);
+                self.release_block(cpu, ptr, layout);
+                Ok(())
+            }
+            Err(kind) => {
+                let expected = tracker.expected_layout(ptr as usize);
+                drop(tracker);
+                heap_violation_log(kind, ptr as usize, layout, expected);
+                Err(kind)
+            }
+        }
+    }
+
+    /// Returns an already-validated, untracked block to a cache or the
+    /// backend.
+    fn release_block(&self, cpu: usize, ptr: *mut u8, layout: Layout) {
+        let Some((class, bytes)) = size_class(layout) else {
+            // SAFETY: the span was validated (or never recorded) and is no
+            // longer reachable; `layout` is the one it was allocated with.
+            unsafe { self.backend.dealloc(ptr, layout) };
+            return;
+        };
+        let Some(block_layout) = Self::block_layout(bytes) else {
+            return;
+        };
+        let Some(mut cache) = self.caches[cpu % HEAP_CACHE_SLOTS].try_lock() else {
+            // SAFETY: as above; the block was allocated with `block_layout`.
+            unsafe { self.backend.dealloc(ptr, block_layout) };
+            return;
+        };
+        let magazine = &mut cache.magazines[class];
+        let capacity = magazine_capacity(bytes);
+        if magazine.len == capacity {
+            // Spill a half magazine in one buddy hold.
+            let keep = capacity / 2;
+            // SAFETY: the spilled blocks are free, were allocated with
+            // `block_layout`, and leave the magazine before the call returns.
+            unsafe {
+                self.backend
+                    .dealloc_batch(block_layout, &magazine.blocks[keep..capacity]);
+            }
+            magazine.len = keep;
+        }
+        magazine.push(ptr as usize);
+    }
+
+    /// Returns every cached block to the backend, one slot at a time.
+    fn drain_all(&self) {
+        for slot in &self.caches {
+            let mut cache = slot.lock();
+            for (class, magazine) in cache.magazines.iter_mut().enumerate() {
+                if magazine.len == 0 {
+                    continue;
+                }
+                let Some(block_layout) = Self::block_layout(MIN_CLASS_BYTES << class) else {
+                    continue;
+                };
+                // SAFETY: cached blocks are free and were allocated with this
+                // class layout; the magazine is emptied right after.
+                unsafe {
+                    self.backend
+                        .dealloc_batch(block_layout, &magazine.blocks[..magazine.len]);
+                }
+                magazine.len = 0;
+            }
+        }
+    }
+}
 
 #[cfg(not(test))]
 unsafe impl GlobalAlloc for KernelAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         interrupts::without_interrupts(|| {
-            // The buddy and the tracker are never held together: a block is
-            // unreachable by any other CPU until this call returns it, so it
-            // can be recorded after the buddy lock is gone. Holding the
-            // tracker across the buddy search serialized both critical
-            // sections behind one another on every allocation.
-            let ptr = unsafe { HEAP.alloc(layout) };
-            if ptr.is_null() {
-                return ptr;
-            }
-            let mut tracker = ALLOCATION_TRACKER.lock();
-            if tracker.record_alloc(ptr as usize, layout) {
-                return ptr;
-            }
-            let occupancy = tracker.occupancy();
-            drop(tracker);
-            heap_tracker_overflow_log(ptr as usize, layout, occupancy);
-            unsafe { HEAP.dealloc(ptr, layout) };
-            ptr::null_mut()
+            HEAP_CORE.alloc(nucleus_core::util::lockdep::current_cpu_index(), layout)
         })
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        // SAFETY: forwarded unchanged under `GlobalAlloc::dealloc`'s contract.
         let _ = unsafe { try_dealloc(ptr, layout) };
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: forwarded unchanged under `GlobalAlloc::alloc_zeroed`'s contract.
         let ptr = unsafe { self.alloc(layout) };
         if !ptr.is_null() {
+            // SAFETY: `ptr` is a fresh allocation of `layout.size()` bytes.
             unsafe { ptr.write_bytes(0, layout.size()) };
         }
         ptr
@@ -344,19 +664,13 @@ pub(crate) unsafe fn try_dealloc(ptr: *mut u8, layout: Layout) -> Result<(), Hea
     }
 
     interrupts::without_interrupts(|| {
-        let mut tracker = ALLOCATION_TRACKER.lock();
-        match tracker.begin_dealloc(ptr as usize, layout) {
-            Ok(()) => {
-                drop(tracker);
-                unsafe { HEAP.dealloc(ptr, layout) };
-                Ok(())
-            }
-            Err(kind) => {
-                let expected = tracker.expected_layout(ptr as usize);
-                drop(tracker);
-                heap_violation_log(kind, ptr as usize, layout, expected);
-                Err(kind)
-            }
+        // SAFETY: the caller's contract; validation precedes any block move.
+        unsafe {
+            HEAP_CORE.dealloc(
+                nucleus_core::util::lockdep::current_cpu_index(),
+                ptr,
+                layout,
+            )
         }
     })
 }
@@ -392,7 +706,7 @@ fn heap_violation_log(
     });
 }
 
-#[cfg(all(not(test), not(rustos_debug_print_enabled)))]
+#[cfg(any(test, not(rustos_debug_print_enabled)))]
 fn heap_violation_log(
     _kind: HeapViolationKind,
     _ptr: usize,
@@ -430,12 +744,13 @@ fn heap_tracker_overflow_log(ptr: usize, layout: Layout, occupancy: TrackerOccup
     });
 }
 
-#[cfg(all(not(test), not(rustos_debug_print_enabled)))]
+#[cfg(any(test, not(rustos_debug_print_enabled)))]
 fn heap_tracker_overflow_log(_ptr: usize, _layout: Layout, _occupancy: TrackerOccupancy) {}
 
 #[cfg(all(not(test), rustos_debug_print_enabled))]
 fn write_literal(port: &mut Port<u8>, bytes: &[u8]) {
     for &byte in bytes {
+        // SAFETY: port 0xe9 is the debug console; a byte write has no memory effect.
         unsafe { port.write(byte) };
     }
 }
@@ -448,6 +763,7 @@ fn write_hex(port: &mut Port<u8>, value: u64) {
         let nibble = ((value >> (shift * 4)) & 0xf) as usize;
         if nibble != 0 || started || shift == 0 {
             started = true;
+            // SAFETY: port 0xe9 is the debug console; a byte write has no memory effect.
             unsafe { port.write(HEX[nibble]) };
         }
     }
@@ -455,6 +771,8 @@ fn write_hex(port: &mut Port<u8>, value: u64) {
 
 #[cfg(not(test))]
 pub fn init_heap() {
+    // SAFETY: `call_once` runs this once; the chunks come from the physical
+    // allocator, are direct-mapped, and are donated to the buddy exactly once.
     HEAP_INIT.call_once(|| unsafe {
         let usable_bytes = phys::usable_bytes() as usize;
         let target_bytes = usable_bytes
@@ -623,14 +941,348 @@ mod tests {
             let displacement = slot.wrapping_sub(home_slot(ptr)) & (ACTIVE_ALLOCATION_SLOTS - 1);
             max_displacement = max_displacement.max(displacement);
         }
-        assert!(max_displacement < count / 4, "max displacement {max_displacement}");
+        assert!(
+            max_displacement < count / 4,
+            "max displacement {max_displacement}"
+        );
         // Removing from the middle of a cluster keeps every survivor reachable.
         for index in (0..count).step_by(3) {
-            assert_eq!(tracker.begin_dealloc(0x40_0000 + index * 0x40, layout), Ok(()));
+            assert_eq!(
+                tracker.begin_dealloc(0x40_0000 + index * 0x40, layout),
+                Ok(())
+            );
         }
         for index in 0..count {
             let live = tracker.find_active_slot(0x40_0000 + index * 0x40).is_some();
             assert_eq!(live, index % 3 != 0);
+        }
+    }
+
+    extern crate std;
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    /// System-allocator backend that counts critical sections (one per
+    /// `alloc`, `alloc_batch`, `dealloc`, `dealloc_batch`) and enforces a byte
+    /// limit, standing in for the buddy lock.
+    struct TestBackend {
+        sections: AtomicUsize,
+        outstanding: AtomicUsize,
+        limit: usize,
+    }
+
+    impl TestBackend {
+        fn new(limit: usize) -> Self {
+            Self {
+                sections: AtomicUsize::new(0),
+                outstanding: AtomicUsize::new(0),
+                limit,
+            }
+        }
+
+        fn take(&self, layout: Layout) -> *mut u8 {
+            let mut current = self.outstanding.load(Ordering::Relaxed);
+            loop {
+                if current + layout.size() > self.limit {
+                    return ptr::null_mut();
+                }
+                match self.outstanding.compare_exchange(
+                    current,
+                    current + layout.size(),
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => break,
+                    Err(seen) => current = seen,
+                }
+            }
+            // SAFETY: the layout has non-zero size.
+            unsafe { std::alloc::alloc(layout) }
+        }
+    }
+
+    impl BlockBackend for TestBackend {
+        fn alloc(&self, layout: Layout) -> *mut u8 {
+            self.sections.fetch_add(1, Ordering::Relaxed);
+            self.take(layout)
+        }
+
+        fn alloc_batch(&self, layout: Layout, out: &mut [usize]) -> usize {
+            self.sections.fetch_add(1, Ordering::Relaxed);
+            let mut filled = 0;
+            while filled < out.len() {
+                let block = self.take(layout);
+                if block.is_null() {
+                    break;
+                }
+                out[filled] = block as usize;
+                filled += 1;
+            }
+            filled
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            self.sections.fetch_add(1, Ordering::Relaxed);
+            self.outstanding.fetch_sub(layout.size(), Ordering::Relaxed);
+            // SAFETY: trait contract.
+            unsafe { std::alloc::dealloc(ptr, layout) };
+        }
+
+        unsafe fn dealloc_batch(&self, layout: Layout, ptrs: &[usize]) {
+            self.sections.fetch_add(1, Ordering::Relaxed);
+            for &block in ptrs {
+                self.outstanding.fetch_sub(layout.size(), Ordering::Relaxed);
+                // SAFETY: trait contract.
+                unsafe { std::alloc::dealloc(block as *mut u8, layout) };
+            }
+        }
+    }
+
+    fn core_with_limit(limit: usize) -> &'static HeapCore<TestBackend> {
+        std::boxed::Box::leak(std::boxed::Box::new(HeapCore::new(TestBackend::new(limit))))
+    }
+
+    fn sections(core: &HeapCore<TestBackend>) -> usize {
+        core.backend.sections.load(Ordering::Relaxed)
+    }
+
+    fn live_total(core: &HeapCore<TestBackend>) -> usize {
+        core.shards
+            .iter()
+            .map(|shard| shard.lock().active_count)
+            .sum()
+    }
+
+    fn free(core: &HeapCore<TestBackend>, cpu: usize, ptr: *mut u8, layout: Layout) {
+        // SAFETY: tests pass pointers this core returned, or exercise rejection.
+        assert_eq!(unsafe { core.dealloc(cpu, ptr, layout) }, Ok(()));
+    }
+
+    #[test]
+    fn size_classes_cover_size_and_alignment() {
+        let class = |size, align| size_class(Layout::from_size_align(size, align).unwrap());
+        assert_eq!(class(1, 1), Some((0, 16)));
+        assert_eq!(class(16, 16), Some((0, 16)));
+        assert_eq!(class(17, 1), Some((1, 32)));
+        assert_eq!(class(24, 64), Some((2, 64)));
+        assert_eq!(class(2048, 8), Some((SIZE_CLASSES - 1, 2048)));
+        assert_eq!(class(2049, 8), None);
+        assert_eq!(class(8, 4096), None);
+        assert_eq!(magazine_capacity(16), MAGAZINE_CAPACITY);
+        assert_eq!(magazine_capacity(2048), MIN_MAGAZINE_CAPACITY);
+    }
+
+    #[test]
+    fn tracker_shards_are_independent_of_home_slots_and_spread() {
+        let mut per_shard = [0usize; TRACKER_SHARDS];
+        for index in 0..8192usize {
+            per_shard[tracker_shard(0x1000_0000 + index * 0x40)] += 1;
+        }
+        let expected = 8192 / TRACKER_SHARDS;
+        assert!(
+            per_shard
+                .iter()
+                .all(|&n| n > expected / 2 && n < expected * 3 / 2),
+            "{per_shard:?}"
+        );
+    }
+
+    #[test]
+    fn small_traffic_takes_the_backend_once_per_batch_not_per_call() {
+        let core = core_with_limit(usize::MAX);
+        let layout = Layout::from_size_align(48, 8).unwrap();
+        let mut held = std::vec::Vec::new();
+        for _ in 0..200 {
+            let ptr = core.alloc(0, layout);
+            assert!(!ptr.is_null());
+            held.push(ptr);
+        }
+        for ptr in held.drain(..) {
+            free(core, 0, ptr, layout);
+        }
+        for _ in 0..200 {
+            let ptr = core.alloc(0, layout);
+            assert!(!ptr.is_null());
+            held.push(ptr);
+        }
+        // 400 operations; a cache-less heap needs 400 backend critical
+        // sections, the magazine needs refills plus a few spills.
+        assert!(sections(core) < 40, "sections={}", sections(core));
+        for ptr in held.drain(..) {
+            free(core, 0, ptr, layout);
+        }
+        assert_eq!(live_total(core), 0);
+        core.drain_all();
+        assert_eq!(core.backend.outstanding.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn violations_are_rejected_before_any_block_moves() {
+        let core = core_with_limit(usize::MAX);
+        let layout = Layout::from_size_align(100, 8).unwrap();
+        let wrong = Layout::from_size_align(60, 8).unwrap();
+        let ptr = core.alloc(2, layout);
+        assert!(!ptr.is_null());
+        // SAFETY: deliberately invalid frees; validation must reject them.
+        unsafe {
+            assert_eq!(
+                core.dealloc(2, ptr, wrong),
+                Err(HeapViolationKind::LayoutMismatch)
+            );
+            assert_eq!(
+                core.dealloc(2, 0x1230 as *mut u8, layout),
+                Err(HeapViolationKind::InvalidFree)
+            );
+        }
+        free(core, 2, ptr, layout);
+        // SAFETY: as above; the span is quarantined, not reusable twice.
+        assert_eq!(
+            unsafe { core.dealloc(2, ptr, layout) },
+            Err(HeapViolationKind::DoubleFree)
+        );
+        // The rejected frees never put a block in a magazine twice.
+        let first = core.alloc(2, layout);
+        let second = core.alloc(2, layout);
+        assert_ne!(first, second);
+        free(core, 2, first, layout);
+        free(core, 2, second, layout);
+    }
+
+    #[test]
+    fn exhaustion_drains_idle_caches_before_failing() {
+        let core = core_with_limit(20 * 1024);
+        let small = Layout::from_size_align(500, 8).unwrap();
+        let mut held = std::vec::Vec::new();
+        for _ in 0..30 {
+            held.push(core.alloc(0, small));
+        }
+        for ptr in held.drain(..) {
+            free(core, 0, ptr, small);
+        }
+        // About 16 KiB of 512-byte blocks idle in magazines; the 8 KiB request
+        // fits only once they are returned to the backend.
+        let big = Layout::from_size_align(8 * 1024, 8).unwrap();
+        let ptr = core.alloc(1, big);
+        assert!(!ptr.is_null(), "idle cached blocks must be reclaimed");
+        free(core, 1, ptr, big);
+        // True exhaustion still fails.
+        let huge = Layout::from_size_align(64 * 1024, 8).unwrap();
+        assert!(core.alloc(1, huge).is_null());
+    }
+
+    #[test]
+    fn tracker_saturation_fails_the_allocation_without_leaking_the_block() {
+        let core = core_with_limit(usize::MAX);
+        let layout = Layout::from_size_align(16, 16).unwrap();
+        let mut held = std::vec::Vec::new();
+        let mut failed = 0;
+        // 16 shards x 128 slots: far more than 2048 live spans must overflow
+        // some shard.
+        for _ in 0..6000 {
+            let ptr = core.alloc(0, layout);
+            if ptr.is_null() {
+                failed += 1;
+            } else {
+                held.push(ptr);
+            }
+        }
+        assert!(failed > 0);
+        assert!(held.len() <= TRACKER_SHARDS * ACTIVE_ALLOCATION_SLOTS);
+        for ptr in held.drain(..) {
+            free(core, 0, ptr, layout);
+        }
+        core.drain_all();
+        assert_eq!(live_total(core), 0);
+        assert_eq!(
+            core.backend.outstanding.load(Ordering::Relaxed),
+            0,
+            "an allocation refused by the tracker must return its block"
+        );
+    }
+
+    /// Threads allocate mixed sizes and alignments, stamp each span with a
+    /// pattern, and free spans other threads allocated, across shared and
+    /// private cache slots. Overlap would corrupt a stamp; a lost or doubled
+    /// block would break the closing accounting.
+    #[test]
+    fn threaded_stress_keeps_spans_disjoint_and_accounting_exact() {
+        use std::sync::Mutex as StdMutex;
+        const THREADS: usize = 8;
+        const ROUNDS: usize = 3000;
+        let core = core_with_limit(usize::MAX);
+        let exchange: StdMutex<std::vec::Vec<(usize, Layout)>> =
+            StdMutex::new(std::vec::Vec::new());
+        let exchange = &exchange;
+        std::thread::scope(|scope| {
+            for thread in 0..THREADS {
+                scope.spawn(move || {
+                    let cpu = thread % 5;
+                    let mut seed = 0x2545_F491_4F6C_DD1D_u64 ^ ((thread as u64 + 1) << 17);
+                    let mut next = move || {
+                        seed ^= seed << 13;
+                        seed ^= seed >> 7;
+                        seed ^= seed << 17;
+                        seed
+                    };
+                    let mut own: std::vec::Vec<(usize, Layout)> = std::vec::Vec::new();
+                    for _ in 0..ROUNDS {
+                        let r = next();
+                        if r % 8 < 5 {
+                            let size = match r % 13 {
+                                0 => 2049 + (r >> 8) as usize % 6000,
+                                1..=3 => 200 + (r >> 8) as usize % 1800,
+                                _ => 1 + (r >> 8) as usize % 200,
+                            };
+                            let align = 1usize << ((r >> 32) % 7);
+                            let layout = Layout::from_size_align(size, align).unwrap();
+                            let ptr = core.alloc(cpu, layout);
+                            if ptr.is_null() {
+                                // Test-sized tracker shards saturate; the
+                                // refused block must not leak (checked below).
+                                continue;
+                            }
+                            assert_eq!(ptr as usize % align, 0);
+                            let stamp = (ptr as usize >> 4) as u8;
+                            // SAFETY: a fresh span of `size` bytes owned by this thread.
+                            unsafe { ptr.write_bytes(stamp, size) };
+                            own.push((ptr as usize, layout));
+                        } else if r % 8 < 7 && !own.is_empty() {
+                            let index = (r >> 8) as usize % own.len();
+                            let (ptr, layout) = own.swap_remove(index);
+                            check_and_free(core, cpu, ptr, layout);
+                        } else if r % 2 == 0 {
+                            exchange
+                                .lock()
+                                .unwrap()
+                                .extend(own.drain(..own.len().min(4)));
+                        } else {
+                            let taken = exchange.lock().unwrap().pop();
+                            if let Some((ptr, layout)) = taken {
+                                check_and_free(core, cpu, ptr, layout);
+                            }
+                        }
+                    }
+                    for (ptr, layout) in own {
+                        check_and_free(core, cpu, ptr, layout);
+                    }
+                });
+            }
+        });
+        for (ptr, layout) in exchange.lock().unwrap().drain(..) {
+            check_and_free(core, 0, ptr, layout);
+        }
+        assert_eq!(live_total(core), 0);
+        core.drain_all();
+        assert_eq!(core.backend.outstanding.load(Ordering::Relaxed), 0);
+
+        fn check_and_free(core: &HeapCore<TestBackend>, cpu: usize, ptr: usize, layout: Layout) {
+            let stamp = (ptr >> 4) as u8;
+            // SAFETY: the span is live and `layout.size()` bytes long.
+            let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, layout.size()) };
+            assert!(
+                bytes.iter().all(|&b| b == stamp),
+                "span at {ptr:#x} was overwritten"
+            );
+            free(core, cpu, ptr as *mut u8, layout);
         }
     }
 }

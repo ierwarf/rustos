@@ -562,10 +562,16 @@ flows = ["physical-frame-lifecycle", "process-lifecycle-transaction"]
 reason = "Frame reservation, allocation, and one-time release determine all physical memory ownership."
 
 [[risk_surfaces]]
+path = "kernel/mm/src/memory/phys/frame_cache.rs"
+severity = "critical"
+flows = ["physical-frame-lifecycle", "process-lifecycle-transaction"]
+reason = "Per-CPU frame caches hold free frames outside the central bitmap; a lost, duplicated, or uncounted cached frame mints or hides physical memory and skews the watermark and OOM reads."
+
+[[risk_surfaces]]
 path = "kernel/mm/src/memory/heap.rs"
 severity = "critical"
 flows = ["kernel-resource-lifecycle", "physical-frame-lifecycle"]
-reason = "Every kernel allocation passes through an IRQ-off tracker and buddy allocator; unbounded validation or provenance drift can stall or corrupt ring0."
+reason = "Every kernel allocation passes through an IRQ-off sharded provenance tracker and per-CPU size-class caches over the buddy allocator; unbounded validation, a block cached twice, or provenance drift can stall or corrupt ring0."
 
 [[risk_surfaces]]
 path = "kernel/mm/src/api.rs"
@@ -1188,6 +1194,10 @@ models = [
     "process-lifecycle-transaction/ProcessLifecycleTransaction",
     "tlb-shootdown-lifecycle/TlbShootdownLifecycle",
 ]
+
+[[source_mappings]]
+path = "kernel/mm/src/memory/phys/frame_cache.rs"
+models = ["physical-frame-lifecycle/PhysicalFrameLifecycle", "process-lifecycle-transaction/ProcessLifecycleTransaction"]
 
 [[source_mappings]]
 path = "kernel/mm/src/memory/phys/frame_descriptor_ledger.rs"

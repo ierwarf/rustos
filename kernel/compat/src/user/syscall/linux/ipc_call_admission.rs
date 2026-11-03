@@ -79,6 +79,12 @@ pub(super) fn reserve(task_id: u64) -> Result<CallSchedulingAdmission, i64> {
         // A synchronous call may not publish a reply without bounded custody
         // for its exact scheduling context. Losing this edge would let a
         // passive server execute outside the caller/domain budget.
+        debug::record_milestone(
+            debug::LogCategory::Sched,
+            "ipc-call-admission-refused",
+            task_id,
+            u64::from(admission.system_class),
+        );
         return Err(LINUX_ENOSPC);
     }
     let priority = if admission.system_class {

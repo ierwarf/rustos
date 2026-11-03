@@ -271,7 +271,12 @@ pub(super) fn syscall_linux_rustos_proc_fork_broker(args_ptr: u64) -> u64 {
             }
         }
     }
+    // Publish the child to vfsd before it can run: the child is still
+    // suspended, so its first namespace request cannot precede this event, and
+    // the parent cannot return from fork (and chdir) before it is queued.
+    offload_ops::record_process_fork(child_pid, args.source_pid);
     if !multitask::activate_suspended_user_task(child_pid) {
+        offload_ops::record_process_fork_abandoned(child_pid);
         let _ = multitask::terminate_user_task(child_pid);
         return fork_stage_failed(22, LINUX_EAGAIN, child_pid);
     }

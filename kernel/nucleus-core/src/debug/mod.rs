@@ -364,6 +364,8 @@ fn print_bytes_unlocked(bytes: &[u8]) {
         // entire run with a single instruction; KVM still amortizes the I/O
         // emulation but the host-side overhead drops by 3-5×, removing the
         // visible 700-byte stall that was producing per-second stutter.
+        // SAFETY: `rsi`/`rcx` describe a live byte slice, DF is clear under the
+        // SysV ABI, and port 0xE9 is the debug console.
         unsafe {
             core::arch::asm!(
                 "rep outsb",

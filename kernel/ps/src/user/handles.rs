@@ -4,7 +4,7 @@ use crate::user::linux as linux_abi;
 use crate::user::memfd::MemfdHandle;
 use crate::user::socket::SocketHandle;
 use alloc::string::String;
-use alloc::sync::{Arc, Weak};
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -17,8 +17,9 @@ use kernel_object::api::handle::{
     JobHandleRights, SharedRegionRights, SocketHandleRights,
 };
 use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
-use crate::multitask::slot_dir::ChunkTable;
 
+#[path = "handles/console_registry.rs"]
+mod console_registry;
 #[path = "handles/display_surface.rs"]
 mod display_surface;
 #[path = "handles/table.rs"]
@@ -65,62 +66,41 @@ pub struct ConsoleHandle {
     description: Arc<ConsoleOpenDescription>,
 }
 
-static NEXT_CONSOLE_OPEN_DESCRIPTION_TOKEN: AtomicU64 = AtomicU64::new(1);
-/// Registry entries added per growth step. The registry grows on demand, so
-/// the number of live console open descriptions is bounded by memory and by
-/// `SLOT_DIR * CONSOLE_REGISTRY_CHUNK`, not by the number of process slots.
-const CONSOLE_REGISTRY_CHUNK: usize = 128;
-
+/// Live console open descriptions, keyed by their generation-tagged token.
 static CONSOLE_OPEN_DESCRIPTIONS: TrackedSpinLock<
-    ChunkTable<Option<ConsoleDescriptionRegistryEntry>, CONSOLE_REGISTRY_CHUNK>,
+    console_registry::ConsoleRegistry,
     { LockClass::ConsoleRegistry as u8 },
-> = TrackedSpinLock::new(ChunkTable::new());
-
-struct ConsoleDescriptionRegistryEntry {
-    token: u64,
-    description: Weak<ConsoleOpenDescription>,
-    stream: ConsoleStreamKind,
-    descriptor_refs: usize,
-}
+> = TrackedSpinLock::new(console_registry::ConsoleRegistry::new());
 
 impl ConsoleHandle {
     pub fn new(stream: ConsoleStreamKind) -> Self {
-        let token = NEXT_CONSOLE_OPEN_DESCRIPTION_TOKEN
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                (current != 0).then(|| current.checked_add(1)).flatten()
-            })
-            .expect("console open-description token exhausted");
-        let description = Arc::new(ConsoleOpenDescription { token, stream });
-        loop {
-            let mut descriptions = CONSOLE_OPEN_DESCRIPTIONS.lock();
-            for slot in descriptions.iter_mut() {
-                if slot.as_ref().is_some_and(|entry| {
-                    entry.descriptor_refs == 0 || entry.description.strong_count() == 0
-                }) {
-                    *slot = None;
-                }
+        let token = loop {
+            let reserved = CONSOLE_OPEN_DESCRIPTIONS.lock().reserve();
+            if let Some(token) = reserved {
+                break token;
             }
-            if let Some(slot) = descriptions.iter_mut().find(|slot| slot.is_none()) {
-                *slot = Some(ConsoleDescriptionRegistryEntry {
-                    token,
-                    description: Arc::downgrade(&description),
-                    stream,
-                    descriptor_refs: 1,
-                });
-                return Self { description };
+            // No free slot: reclaim descriptions that vanished without a final
+            // release, and only then grow. The chunk is built with no lock
+            // held and installed without allocating; a racing creator may
+            // install first, in which case the loop just finds its free slot.
+            let mut descriptions = CONSOLE_OPEN_DESCRIPTIONS.lock();
+            descriptions.reclaim_orphans();
+            if let Some(token) = descriptions.reserve() {
+                break token;
             }
             drop(descriptions);
-            // Full after reclaiming dead entries: build the next chunk with no
-            // lock held, then install it without allocating. A racing creator
-            // may install first; the loop then simply finds its free entry.
-            let chunk = ChunkTable::<_, CONSOLE_REGISTRY_CHUNK>::build(|| None)
+            let chunk = console_registry::build_chunk()
                 .expect("console open-description registry could not grow");
-            let mut descriptions = CONSOLE_OPEN_DESCRIPTIONS.lock();
             assert!(
-                descriptions.push_chunk(chunk),
+                CONSOLE_OPEN_DESCRIPTIONS.lock().grow(chunk),
                 "console open-description registry exhausted its ceiling"
             );
-        }
+        };
+        let description = Arc::new(ConsoleOpenDescription { token, stream });
+        CONSOLE_OPEN_DESCRIPTIONS
+            .lock()
+            .install(token, &description, stream);
+        Self { description }
     }
 
     pub fn token_id(&self) -> u64 {
@@ -136,10 +116,7 @@ impl ConsoleHandle {
     pub fn is_last_reference(&self) -> bool {
         CONSOLE_OPEN_DESCRIPTIONS
             .lock()
-            .iter()
-            .flatten()
-            .find(|entry| entry.token == self.token_id())
-            .is_none_or(|entry| entry.descriptor_refs == 0)
+            .is_last_reference(self.token_id())
     }
 
     pub(crate) fn acquire_descriptor_reference(&self) {
@@ -153,38 +130,12 @@ impl ConsoleHandle {
     /// transaction. Returns false after final close and never resurrects a
     /// zero-reference console description.
     pub fn try_acquire_descriptor_reference(&self) -> bool {
-        let mut descriptions = CONSOLE_OPEN_DESCRIPTIONS.lock();
-        let Some(entry) = descriptions
-            .iter_mut()
-            .flatten()
-            .find(|entry| entry.token == self.token_id())
-        else {
-            return false;
-        };
-        if entry.descriptor_refs == 0 || entry.description.strong_count() == 0 {
-            return false;
-        }
-        entry.descriptor_refs = entry
-            .descriptor_refs
-            .checked_add(1)
-            .expect("console descriptor reference count exhausted");
-        true
+        CONSOLE_OPEN_DESCRIPTIONS.lock().try_acquire(self.token_id())
     }
 
     /// Drops one fd-table reference and reports whether it was the final one.
     pub fn release_descriptor_reference(&self) -> bool {
-        let mut descriptions = CONSOLE_OPEN_DESCRIPTIONS.lock();
-        let entry = descriptions
-            .iter_mut()
-            .flatten()
-            .find(|entry| entry.token == self.token_id())
-            .expect("live console description missing from registry");
-        assert!(
-            entry.descriptor_refs != 0,
-            "console descriptor reference count underflow"
-        );
-        entry.descriptor_refs -= 1;
-        entry.descriptor_refs == 0
+        CONSOLE_OPEN_DESCRIPTIONS.lock().release(self.token_id())
     }
 
     pub fn token_is_live(token: u64) -> bool {
@@ -195,13 +146,7 @@ impl ConsoleHandle {
         if token == 0 {
             return None;
         }
-        CONSOLE_OPEN_DESCRIPTIONS
-            .lock()
-            .iter()
-            .flatten()
-            .find(|entry| entry.token == token)
-            .filter(|entry| entry.descriptor_refs != 0 && entry.description.strong_count() != 0)
-            .map(|entry| entry.stream)
+        CONSOLE_OPEN_DESCRIPTIONS.lock().stream(token)
     }
 }
 

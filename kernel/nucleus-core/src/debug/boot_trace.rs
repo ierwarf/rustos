@@ -61,6 +61,7 @@ pub fn println_fmt(_args: fmt::Arguments<'_>) {}
 #[cfg(rustos_boot_trace_enabled)]
 fn framebuffer_from_boot_info() -> Option<Framebuffer> {
     let boot_info_ptr = BOOT_INFO_PTR.load(Ordering::Acquire);
+    // SAFETY: the pointer was published by `init` from the validated handoff.
     let boot_info = unsafe { BootInfo::from_ptr(boot_info_ptr.cast_const()) }.ok()?;
     Framebuffer::from_info(boot_info.framebuffer)
 }
@@ -124,6 +125,8 @@ impl Framebuffer {
             let row = y * self.stride_bytes;
             for x in 0..self.width {
                 let idx = row + x * self.bpp;
+                // SAFETY: `from_info` proved stride*bpp*height <= size, and
+                // x < width, y < height keep the pixel inside the mapping.
                 unsafe {
                     ptr::write(self.base.add(idx), c0);
                     ptr::write(self.base.add(idx + 1), c1);
@@ -143,6 +146,7 @@ impl Framebuffer {
         }
 
         let (c0, c1, c2) = self.color_bytes(color);
+        // SAFETY: the bounds check above keeps the whole pixel inside `size`.
         unsafe {
             ptr::write(self.base.add(idx), c0);
             ptr::write(self.base.add(idx + 1), c1);
@@ -255,6 +259,7 @@ impl LineBuffer {
     }
 
     fn as_str(&self) -> &str {
+        // SAFETY: `push_byte` is only fed printable ASCII (' '..='~').
         unsafe { str::from_utf8_unchecked(&self.bytes[..self.len]) }
     }
 }

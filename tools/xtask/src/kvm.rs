@@ -112,8 +112,8 @@ const MAX_DVM_GPU_RENDER_US: u64 = 16_667;
 const DVM_DISPLAY_WIDTH: u32 = 2560;
 const DVM_DISPLAY_HEIGHT: u32 = 1440;
 const DVM_DISPLAY_REGION_BYTES: u64 = 512 * 1024 * 1024;
-const DVM_GPU_ATLAS_WIDTH: u32 = 4096;
-const DVM_GPU_ATLAS_HEIGHT: u32 = 2048;
+const DVM_GPU_ATLAS_WIDTH: u32 = 2688;
+const DVM_GPU_ATLAS_HEIGHT: u32 = 2560;
 // Keep the KVM proof topology identical to the supervised physical-display
 // DVM. Mesa virgl plus the AMD radeonsi/LLVM runtime, firmware, the compressed
 // initrd, XZ workspace, and unpacked ramfs coexist during early boot. Keep a

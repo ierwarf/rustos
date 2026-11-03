@@ -11,6 +11,8 @@ pub(crate) const SOFTWARE_SCHEDULE_VECTOR: u8 = 0x30;
 pub(crate) const RESCHEDULE_IPI_VECTOR: u8 = 0xe0;
 pub(crate) const TLB_SHOOTDOWN_IPI_VECTOR: u8 = 0xe1;
 pub(crate) const LOCAL_TIMER_VECTOR: u8 = 0xe2;
+/// Must match `APIC_SPURIOUS_VECTOR` in `msi.rs`.
+const LOCAL_APIC_SPURIOUS_VECTOR: u8 = 0xff;
 
 lazy_static! {
     pub static ref IDT: InterruptDescriptorTable = {
@@ -63,6 +65,7 @@ lazy_static! {
         idt[KEYBOARD_INTERRUPT_VECTOR].set_handler_fn(keyboard_interrupt_eoi_handler);
         idt[MOUSE_INTERRUPT_VECTOR].set_handler_fn(mouse_interrupt_eoi_handler);
         idt[TLB_SHOOTDOWN_IPI_VECTOR].set_handler_fn(tlb_shootdown_interrupt_handler);
+        idt[LOCAL_APIC_SPURIOUS_VECTOR].set_handler_fn(spurious_interrupt_handler);
 
         idt
     };

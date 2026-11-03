@@ -617,9 +617,19 @@ impl PciDevice {
             self.function,
             offset as usize,
         ) {
+            // SAFETY: `addr` is a checked, 4-byte-aligned ECAM address inside an
+            // MCFG-admitted region below the identity-mapped limit.
             return unsafe { ptr::read_volatile(addr as *const u32) };
         }
+        // The legacy mechanism has no segment field: without ECAM a non-zero
+        // segment would silently alias the same bus/device/function of
+        // segment 0 (reads of the wrong device, writes to the wrong BAR).
+        if self.segment != 0 {
+            return u32::MAX;
+        }
 
+        // SAFETY: 0xcf8/0xcfc are the architectural PCI config ports and the
+        // address/data pair is serialized by CONFIG_STATE.
         unsafe {
             let mut address_port = Port::<u32>::new(CONFIG_ADDRESS_PORT);
             let mut data_port = Port::<u32>::new(CONFIG_DATA_PORT);
@@ -660,12 +670,19 @@ impl PciDevice {
             self.function,
             offset as usize,
         ) {
+            // SAFETY: `addr` is a checked, 4-byte-aligned ECAM address inside an
+            // MCFG-admitted region below the identity-mapped limit.
             unsafe {
                 ptr::write_volatile(addr as *mut u32, value);
             }
             return;
         }
+        if self.segment != 0 {
+            return;
+        }
 
+        // SAFETY: 0xcf8/0xcfc are the architectural PCI config ports and the
+        // address/data pair is serialized by CONFIG_STATE.
         unsafe {
             let mut address_port = Port::<u32>::new(CONFIG_ADDRESS_PORT);
             let mut data_port = Port::<u32>::new(CONFIG_DATA_PORT);
@@ -836,7 +853,10 @@ fn decode_io_resource(original_low: u32, mask_low: u32) -> Option<PciResource> {
         return None;
     }
 
-    let size = (!mask).wrapping_add(1) & 0xffff_ffff;
+    // The lowest implemented address bit is the size. Two's-complement
+    // inversion of the 32-bit-widened mask would report 0xffff_0100 for a
+    // 256-byte BAR whose upper 16 bits are unimplemented (the common case).
+    let size = mask & mask.wrapping_neg();
     if size == 0 {
         return None;
     }
@@ -898,7 +918,7 @@ mod tests {
     use super::{
         ATTACHED_FUNCTION_CAPACITY, ConfigState, PCI_BAR_MEM_TYPE_64, PCI_MSIX_TABLE_BIR_MASK,
         PCI_MSIX_TABLE_OFFSET_MASK, PciAttachMode, PciDevice, PciResource, SIZED_BAR_CAPACITY,
-        decode_mem_resource,
+        decode_io_resource, decode_mem_resource,
     };
 
     const ADMITTED: PciResource = PciResource {
@@ -1066,5 +1086,14 @@ mod tests {
         .unwrap();
         assert_eq!(full_width.start, 1_u64 << 32);
         assert_eq!(full_width.size, 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn io_bar_size_ignores_unimplemented_upper_address_bits() {
+        let io = decode_io_resource(0xc001, 0x0000_ff01).unwrap();
+        assert_eq!(io.start, 0xc000);
+        assert_eq!(io.size, 0x100);
+        let wide = decode_io_resource(0xc001, 0xffff_ff01).unwrap();
+        assert_eq!(wide.size, 0x100);
     }
 }

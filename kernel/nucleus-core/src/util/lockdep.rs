@@ -155,6 +155,8 @@ pub enum LockClass {
     SchedulerDiagnostics = 56,  // per-CPU counters/per-slot history; never nested
     SchedulerDomainAdmission = 57, // cold registry → context48 → domain49; IDs are not rank
     TaskWaitEpoch = 58, // per-slot payload/arm arbitration; no frame/queue/hardware work
+    /// Per-CPU physical-frame magazine: one slot at a time, before `PhysicalAllocator`.
+    PhysicalFrameCache = 59,
 }
 #[cfg(rustos_boot_image)]
 #[derive(Clone, Copy)]
@@ -762,12 +764,14 @@ impl<T: ?Sized, const CLASS: u8> TrackedSpinLock<T, CLASS> {
 
     #[track_caller]
     pub fn try_lock(&self) -> Option<TrackedSpinGuard<'_, T, CLASS>> {
+        // The index is taken from the preemption disable itself. Reading it
+        // first left a window in which the task could migrate before the
+        // disable, and the failed-try-lock admissibility check below would
+        // then compare a stale CPU against the one it actually ran on.
         #[cfg(rustos_boot_image)]
-        let acquire_cpu = current_cpu_index();
+        let acquire_cpu = disable_preemption();
         #[cfg(rustos_boot_image)]
         let acquire_apic_id = current_apic_id();
-        #[cfg(rustos_boot_image)]
-        disable_preemption();
         #[cfg(rustos_boot_image)]
         let acquire_site = Location::caller();
         #[cfg(not(rustos_boot_image))]

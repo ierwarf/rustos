@@ -2081,6 +2081,13 @@ physical-frame-lifecycle/PhysicalFrameLifecycle|kernel-mm|memory::phys::tests::b
 physical-frame-lifecycle/PhysicalFrameLifecycle|kernel-mm|memory::phys::tests::bounded_allocator_stays_under_limit
 physical-frame-lifecycle/PhysicalFrameLifecycle|kernel-mm|memory::phys::tests::reserve_phys_range_removes_kernel_image_from_free_set
 physical-frame-lifecycle/PhysicalFrameLifecycle|kernel-mm|memory::phys::tests::fixed_range_claim_is_atomic_exact_and_not_reallocatable
+physical-frame-lifecycle/PhysicalFrameLifecycle|kernel-mm|memory::phys::frame_cache::tests::single_frame_traffic_hits_the_cache_after_one_refill
+physical-frame-lifecycle/PhysicalFrameLifecycle|kernel-mm|memory::phys::frame_cache::tests::free_total_is_exact_through_refill_spill_and_drain
+physical-frame-lifecycle/PhysicalFrameLifecycle|kernel-mm|memory::phys::frame_cache::tests::double_free_is_rejected_in_cache_and_after_drain
+physical-frame-lifecycle/PhysicalFrameLifecycle|kernel-mm|memory::phys::frame_cache::tests::user_watermark_counts_cached_frames_and_is_exact_at_exhaustion
+physical-frame-lifecycle/PhysicalFrameLifecycle|kernel-mm|memory::phys::frame_cache::tests::exhaustion_is_reported_only_after_other_cpus_caches_are_drained
+physical-frame-lifecycle/PhysicalFrameLifecycle|kernel-mm|memory::phys::frame_cache::tests::contiguous_allocation_and_fixed_claims_see_cached_frames_as_free
+physical-frame-lifecycle/PhysicalFrameLifecycle|kernel-mm|memory::phys::frame_cache::tests::threaded_stress_never_duplicates_or_leaks_a_frame
 physical-frame-lifecycle/PhysicalFrameLifecycle|kernel-mm|memory::phys::frame_descriptor_ledger::tests::one_catalog_tracks_tables_and_exact_data_leaves
 service-heap-lifecycle/ServiceHeapLifecycle|rustos-svc-runtime|allocator::tests::freed_large_allocation_is_reused_without_growth
 service-heap-lifecycle/ServiceHeapLifecycle|rustos-svc-runtime|allocator::tests::allocator_honors_large_alignment

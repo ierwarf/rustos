@@ -547,14 +547,19 @@ fn timespec_delta_ticks(
     )
 }
 
-fn futex_wake(uaddr: u64, max_wake: u64, bitset: u32, op: u64) -> Result<u64, i64> {
-    // `val` is a C `int`. Linux's wake loop stops after `++woken >= nr_wake`,
-    // so a negative count wakes at most one waiter rather than failing.
-    let max_wake = match max_wake as u32 as i32 {
-        0 => return Ok(0),
-        n if n < 0 => 1,
+/// `val` is a C `int`. Linux's `futex_wake` stops after `++ret >= nr_wake` and
+/// only the futex2 `FLAGS_STRICT` path short-circuits `nr_wake == 0`, which the
+/// legacy `futex` syscall never sets. So 0 and negative counts wake one waiter
+/// (after the same key/address validation as any other count).
+fn futex_wake_limit(raw: u64) -> usize {
+    match raw as u32 as i32 {
+        n if n <= 0 => 1,
         n => n as usize,
-    };
+    }
+}
+
+fn futex_wake(uaddr: u64, max_wake: u64, bitset: u32, op: u64) -> Result<u64, i64> {
+    let max_wake = futex_wake_limit(max_wake);
     let (_, key) = current_futex_waiter_context(uaddr, op)?;
     Ok(wake_futex_waiters(key, max_wake, bitset) as u64)
 }

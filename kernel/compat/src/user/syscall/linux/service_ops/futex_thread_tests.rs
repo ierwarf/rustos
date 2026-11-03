@@ -177,3 +177,15 @@ fn robust_futex_offset_is_checked_before_user_access() {
     assert_eq!(robust_futex_address(u64::MAX - 3, 8), None);
     assert_eq!(robust_futex_address(paging::USER_SPACE_BASE, -4), None);
 }
+
+#[test]
+fn futex_wake_count_follows_linux_int_semantics() {
+    assert_eq!(futex_wake_limit(0), 1, "legacy FUTEX_WAKE with val 0 still wakes one");
+    assert_eq!(futex_wake_limit(u64::from(u32::MAX)), 1, "-1 wakes one");
+    assert_eq!(futex_wake_limit(0x8000_0000), 1, "INT_MIN wakes one");
+    assert_eq!(futex_wake_limit(1), 1);
+    assert_eq!(futex_wake_limit(7), 7);
+    assert_eq!(futex_wake_limit(i32::MAX as u64), i32::MAX as usize);
+    // Upper register bits are ignored: val is a 32-bit int.
+    assert_eq!(futex_wake_limit(0xdead_beef_0000_0003), 3);
+}

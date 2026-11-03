@@ -53,6 +53,23 @@ dropped record until its owner abandons it. Admission is not durable delivery.
   fields. Rootd overflow is sticky and terminal. Procd/syscalld overflow rebases
   only the affected private queue after its owner clears all cached per-process
   authority.
+- Vfsd is a fourth consumer (`LifecycleConsumer::VfsPolicy`, selected by the
+  `VfsPolicy` capability, after the rootd/syscalld/procd capabilities). It
+  receives every exit plus a `LIFECYCLE_EVENT_FORK` (`pid` = child,
+  `parent_pid` = forking process) that `proc_fork_broker` queues while the child
+  is still suspended. Vfsd drains before it interprets each request, so the
+  FIFO order exit-before-pid-reuse / fork-before-child-runs makes the per-pid
+  cwd generation-safe: exit prunes the entry, fork copies the parent's cwd (or
+  clears a stale entry under a reused pid). A fork whose activation fails queues
+  an exit-only event for the abandoned child. Overflow (`EOVERFLOW`) loses
+  identity evidence, so vfsd forgets every cwd (default `/`) and resumes from the
+  rebased empty queue; any other drain failure is logged and leaves the table
+  unchanged.
+- `/run` is vfsd's volatile in-memory directory namespace (`vfsd::run_dirs`):
+  `mkdir` of `/run/user` and `/run/user/<euid>` creates a real bounded entry that
+  `stat`/`getdents` observe (`EEXIST` for existing, `ENOENT` for a missing
+  parent); every other path stays `EROFS`. Removal of runtime directories is not
+  implemented.
 
 ## IPC Service Registry
 

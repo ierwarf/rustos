@@ -235,7 +235,15 @@ struct RawRtcDateTime {
     year: u8,
 }
 
+/// Serializes the 0x70/0x71 index+data port pair. Every access is a two-step
+/// sequence, so two CPUs (`clock_gettime` can run on any of them) would
+/// otherwise read each other's selected register. Callers hold local
+/// interrupts off, so the holder cannot be preempted by the RTC handler.
+static CMOS_LOCK: spin::Mutex<()> = spin::Mutex::new(());
+
 fn cmos_read(reg: u8) -> u8 {
+    // SAFETY: 0x70/0x71 are the architectural CMOS index/data ports; callers
+    // hold `CMOS_LOCK` so the index/data pair is not interleaved.
     unsafe {
         let mut index_port: Port<u8> = Port::new(CMOS_INDEX_PORT);
         let mut data_port: Port<u8> = Port::new(CMOS_DATA_PORT);
@@ -247,6 +255,7 @@ fn cmos_read(reg: u8) -> u8 {
 }
 
 fn cmos_write(reg: u8, value: u8) {
+    // SAFETY: as in `cmos_read`; callers hold `CMOS_LOCK`.
     unsafe {
         let mut index_port: Port<u8> = Port::new(CMOS_INDEX_PORT);
         let mut data_port: Port<u8> = Port::new(CMOS_DATA_PORT);
@@ -264,6 +273,7 @@ fn enable_nmi() {
 fn select_cmos_register(index_port: &mut Port<u8>, reg: u8, disable_nmi: bool) {
     let reg = reg & CMOS_REGISTER_MASK;
     let value = if disable_nmi { NMI_DISABLE | reg } else { reg };
+    // SAFETY: writes the architectural CMOS index port under `CMOS_LOCK`.
     unsafe {
         index_port.write(value);
     }
@@ -392,7 +402,11 @@ fn read_stable_datetime() -> Option<RtcDateTime> {
 /// cannot be read. Callers already reject that as "unreadable calendar" rather
 /// than latching a fabricated epoch.
 pub fn now() -> RtcDateTime {
-    interrupts::without_interrupts(read_stable_datetime).unwrap_or(RtcDateTime {
+    interrupts::without_interrupts(|| {
+        let _cmos = CMOS_LOCK.lock();
+        read_stable_datetime()
+    })
+    .unwrap_or(RtcDateTime {
         year: 0,
         month: 0,
         day: 0,
@@ -488,6 +502,7 @@ pub fn is_initialized() -> bool {
 
 pub fn init() {
     interrupts::without_interrupts(|| {
+        let _cmos = CMOS_LOCK.lock();
         enable_nmi();
         // The RTC remains the battery-backed calendar source, but its periodic
         // interrupt is not a monotonic clockevent. Hypervisors are permitted to
@@ -551,7 +566,10 @@ pub fn on_interrupt() {
     // current second's frame — visible as a periodic stutter. Just mark the
     // second as pending; housekeeping picks it up outside IRQ context.
     // Must read register C to acknowledge and re-arm RTC interrupts.
-    let _ = cmos_read(RTC_REG_C);
+    {
+        let _cmos = CMOS_LOCK.lock();
+        let _ = cmos_read(RTC_REG_C);
+    }
     RTC_TICKS_COMPLETED.fetch_add(1, Ordering::AcqRel);
 }
 

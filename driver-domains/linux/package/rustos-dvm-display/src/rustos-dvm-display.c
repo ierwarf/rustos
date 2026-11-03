@@ -131,16 +131,32 @@ static int write_complete(int fd, const void *buffer, size_t length);
 /* Diagnostics go to the guest serial console. A console whose host reader
  * stalls blocks write(2) once the tty buffer fills, and the relay (and the
  * GPU health probe sharing that console) would silently stop making progress
- * inside a log call. Log through a private non-blocking open of stderr and
- * drop (and count) lines the console cannot take instead of stalling. */
+ * inside a log call. Log through a private non-blocking open of stderr. A
+ * full buffer is normally transient (boot-time bursts), and the harness
+ * requires one-shot records such as "gpu-compositor primed", so wait a
+ * bounded time for room and finish partial writes before giving up. Once a
+ * line has been dropped the console counts as stuck: later lines make a
+ * single non-blocking attempt, so a dead reader costs one bounded wait, not
+ * one per line, until a write succeeds again. */
+#define RELAY_LOG_WAIT_MS 250
 static int relay_log_fd = -2;
 static uint64_t relay_log_dropped;
+static int relay_log_stuck;
+
+static uint64_t relay_log_now_ms(void) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+        return 0U;
+    return (uint64_t)now.tv_sec * 1000U + (uint64_t)now.tv_nsec / 1000000U;
+}
 
 static void relay_log(const char *format, ...) {
     char line[1024];
     va_list arguments;
     int length;
-    ssize_t written;
+    size_t offset = 0U;
+    uint64_t deadline_ms = 0U;
+    int saved_errno;
 
     va_start(arguments, format);
     length = vsnprintf(line, sizeof(line), format, arguments);
@@ -151,25 +167,43 @@ static void relay_log(const char *format, ...) {
     if ((size_t)length >= sizeof(line)) {
         length = (int)sizeof(line) - 1;
     }
+    saved_errno = errno;
     if (relay_log_fd == -2) {
-        int saved_errno = errno;
         relay_log_fd = open("/proc/self/fd/2",
                             O_WRONLY | O_NONBLOCK | O_NOCTTY | O_CLOEXEC);
-        errno = saved_errno;
     }
     if (relay_log_fd < 0) {
         (void)write(STDERR_FILENO, line, (size_t)length);
+        errno = saved_errno;
         return;
     }
-    {
-        int saved_errno = errno;
-        do {
-            written = write(relay_log_fd, line, (size_t)length);
-        } while (written < 0 && errno == EINTR);
-        if (written < 0 && relay_log_dropped != UINT64_MAX)
-            relay_log_dropped++;
-        errno = saved_errno;
+    while (offset < (size_t)length) {
+        ssize_t written = write(relay_log_fd, line + offset, (size_t)length - offset);
+        if (written > 0) {
+            offset += (size_t)written;
+            relay_log_stuck = 0;
+            continue;
+        }
+        if (written < 0 && errno == EINTR)
+            continue;
+        if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) && !relay_log_stuck) {
+            struct pollfd wait_fd = {.fd = relay_log_fd, .events = POLLOUT};
+            uint64_t now_ms = relay_log_now_ms();
+            if (deadline_ms == 0U)
+                deadline_ms = now_ms + RELAY_LOG_WAIT_MS;
+            if (now_ms < deadline_ms) {
+                (void)poll(&wait_fd, 1, (int)(deadline_ms - now_ms));
+                continue;
+            }
+        }
+        break;
     }
+    if (offset < (size_t)length) {
+        relay_log_stuck = 1;
+        if (relay_log_dropped != UINT64_MAX)
+            relay_log_dropped++;
+    }
+    errno = saved_errno;
 }
 #define DISPLAY_BYTES_PER_PIXEL 4U
 #define GUI_POOL_MAX_REGION_BYTES (512U * 1024U * 1024U)

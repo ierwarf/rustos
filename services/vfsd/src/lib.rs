@@ -2,6 +2,11 @@
 
 extern crate alloc;
 
+pub mod checkpoint_wire;
+pub mod lifecycle;
+pub mod linux_types;
+pub mod path;
+pub mod run_dirs;
 mod snapshot_lease;
 pub use snapshot_lease::ExecutableSnapshotLease;
 
@@ -9,6 +14,7 @@ use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::format;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU32, AtomicU8, Ordering};
+use rustos_user_abi::linux as linux_abi;
 use rustos_user_abi::performance::{WAITSET_MAX_EPOLL_OBJECTS, WAITSET_MAX_GLOBAL_INTERESTS};
 use rustos_user_abi::syscall::{
     DvmBlockInfoWire, ServiceCheckpointRecordWire, EARLY_SYSTEM_BROKER_MAX_IO_BYTES,
@@ -482,12 +488,30 @@ pub struct WaitSetInterestRecord {
     pub data: u64,
 }
 
+/// Linux `epoll_ctl` accepts any mask except that `EPOLLEXCLUSIVE` may only be
+/// combined with `EPOLLEXCLUSIVE_OK_BITS`.
+pub const fn epoll_event_mask_valid(events: u32) -> bool {
+    events & linux_abi::EPOLLEXCLUSIVE == 0 || events & !linux_abi::EPOLLEXCLUSIVE_OK_BITS == 0
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WaitSetRegistryError {
     Exists,
     NotFound,
     Capacity,
     Overflow,
+    /// The requested event mask is not a legal Linux `epoll_ctl` combination.
+    Invalid,
+}
+
+/// Volatile report state of one interest. It is not checkpointed: a restored
+/// interest reports once more, which edge-triggered consumers tolerate.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WaitSetReportState {
+    /// Provider generation of the last report this interest consumed.
+    pub edge_generation: u64,
+    /// A one-shot interest already reported; `EPOLL_CTL_MOD` re-arms it.
+    pub disabled: bool,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -499,6 +523,9 @@ pub struct WaitSetRegistry {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct WaitSetEpoll {
     interests: BTreeMap<WaitSetInterestKey, WaitSetInterestRecord>,
+    /// Entries exist only for interests that reported; removing an interest
+    /// removes its entry, so the map never outgrows `interests`.
+    report: BTreeMap<WaitSetInterestKey, WaitSetReportState>,
     cursor: usize,
 }
 
@@ -543,6 +570,7 @@ impl WaitSetRegistry {
             token,
             WaitSetEpoll {
                 interests: BTreeMap::new(),
+                report: BTreeMap::new(),
                 cursor: 0,
             },
         );
@@ -610,6 +638,9 @@ impl WaitSetRegistry {
             .epolls
             .get_mut(&token)
             .ok_or(WaitSetRegistryError::NotFound)?;
+        if !epoll_event_mask_valid(interest.events) {
+            return Err(WaitSetRegistryError::Invalid);
+        }
         if epoll.interests.contains_key(&interest.key) {
             return Err(WaitSetRegistryError::Exists);
         }
@@ -630,9 +661,20 @@ impl WaitSetRegistry {
             .epolls
             .get_mut(&token)
             .ok_or(WaitSetRegistryError::NotFound)?;
-        if !epoll.interests.contains_key(&interest.key) {
+        let Some(existing) = epoll.interests.get(&interest.key) else {
             return Err(WaitSetRegistryError::NotFound);
+        };
+        // Linux: an interest added with EPOLLEXCLUSIVE can never be modified,
+        // and EPOLLEXCLUSIVE can never be introduced by a modification.
+        if existing.events & linux_abi::EPOLLEXCLUSIVE != 0
+            || interest.events & linux_abi::EPOLLEXCLUSIVE != 0
+            || !epoll_event_mask_valid(interest.events)
+        {
+            return Err(WaitSetRegistryError::Invalid);
         }
+        // Modification re-arms: it clears one-shot and edge history, so the
+        // current readiness is reported again.
+        epoll.report.remove(&interest.key);
         epoll.interests.insert(interest.key, interest);
         Ok(())
     }
@@ -650,6 +692,7 @@ impl WaitSetRegistry {
             .interests
             .remove(&key)
             .ok_or(WaitSetRegistryError::NotFound)?;
+        epoll.report.remove(&key);
         self.remove_object_interest(token, interest.key);
         Ok(())
     }
@@ -677,6 +720,7 @@ impl WaitSetRegistry {
                 epoll.interests.remove(&member.key).is_some(),
                 "waitset reverse index references a missing interest"
             );
+            epoll.report.remove(&member.key);
             if epoll.interests.is_empty() {
                 epoll.cursor = 0;
             } else {
@@ -721,6 +765,51 @@ impl WaitSetRegistry {
         token: u64,
         max: usize,
     ) -> Result<Vec<WaitSetInterestRecord>, WaitSetRegistryError> {
+        Ok(self
+            .snapshot_entries(token, max)?
+            .into_iter()
+            .map(|(interest, _)| interest)
+            .collect())
+    }
+
+    /// Consumes one report for an edge-triggered or one-shot interest.
+    ///
+    /// Returns `true` only for the single caller that owns the report: a
+    /// disabled one-shot interest, a stale generation (the edge was already
+    /// reported), or a vanished interest returns `false`. Level-triggered
+    /// interests always return `true` and keep no state.
+    pub fn claim(
+        &mut self,
+        token: u64,
+        key: WaitSetInterestKey,
+        generation: u64,
+    ) -> Result<bool, WaitSetRegistryError> {
+        let epoll = self
+            .epolls
+            .get_mut(&token)
+            .ok_or(WaitSetRegistryError::NotFound)?;
+        let Some(interest) = epoll.interests.get(&key) else {
+            return Ok(false);
+        };
+        let edge = interest.events & linux_abi::EPOLLET != 0;
+        let oneshot = interest.events & linux_abi::EPOLLONESHOT != 0;
+        if !edge && !oneshot {
+            return Ok(true);
+        }
+        let state = epoll.report.entry(key).or_default();
+        if state.disabled || (edge && generation <= state.edge_generation) {
+            return Ok(false);
+        }
+        state.edge_generation = state.edge_generation.max(generation);
+        state.disabled = oneshot;
+        Ok(true)
+    }
+
+    pub fn snapshot_entries(
+        &mut self,
+        token: u64,
+        max: usize,
+    ) -> Result<Vec<(WaitSetInterestRecord, WaitSetReportState)>, WaitSetRegistryError> {
         let epoll = self
             .epolls
             .get_mut(&token)
@@ -733,7 +822,12 @@ impl WaitSetRegistry {
             .skip(start)
             .chain(epoll.interests.values().take(start))
             .take(max)
-            .copied()
+            .map(|interest| {
+                (
+                    *interest,
+                    epoll.report.get(&interest.key).copied().unwrap_or_default(),
+                )
+            })
             .collect::<Vec<_>>();
         if count != 0 {
             epoll.cursor = (start + 1) % count;
@@ -1346,5 +1440,118 @@ mod tests {
         registry.delete(41, restarted.key).unwrap();
         assert!(registry.snapshot(41, 2).unwrap().is_empty());
         assert!(registry.matching_interests(2, 101).is_empty());
+    }
+    fn interest_with(fd: u64, object_id: u64, events: u32) -> WaitSetInterestRecord {
+        WaitSetInterestRecord {
+            events,
+            ..interest(fd, object_id)
+        }
+    }
+
+    #[test]
+    fn edge_triggered_report_is_claimed_once_per_generation() {
+        let mut registry = WaitSetRegistry::default();
+        registry.create(41).unwrap();
+        let edge = interest_with(5, 101, linux_abi::EPOLLIN | linux_abi::EPOLLET);
+        registry.add(41, edge).unwrap();
+        assert_eq!(registry.claim(41, edge.key, 3), Ok(true));
+        // A second waiter that scanned the same generation loses the race.
+        assert_eq!(registry.claim(41, edge.key, 3), Ok(false));
+        assert_eq!(registry.claim(41, edge.key, 2), Ok(false));
+        assert_eq!(registry.claim(41, edge.key, 4), Ok(true));
+        let entries = registry.snapshot_entries(41, 1).unwrap();
+        assert_eq!(entries[0].1.edge_generation, 4);
+        assert!(!entries[0].1.disabled);
+    }
+
+    #[test]
+    fn oneshot_report_disables_until_modify_rearms() {
+        let mut registry = WaitSetRegistry::default();
+        registry.create(41).unwrap();
+        let oneshot = interest_with(5, 101, linux_abi::EPOLLIN | linux_abi::EPOLLONESHOT);
+        registry.add(41, oneshot).unwrap();
+        assert_eq!(registry.claim(41, oneshot.key, 1), Ok(true));
+        assert!(registry.snapshot_entries(41, 1).unwrap()[0].1.disabled);
+        assert_eq!(registry.claim(41, oneshot.key, 9), Ok(false));
+        registry.modify(41, oneshot).unwrap();
+        let entries = registry.snapshot_entries(41, 1).unwrap();
+        assert_eq!(entries[0].1, WaitSetReportState::default());
+        assert_eq!(registry.claim(41, oneshot.key, 1), Ok(true));
+    }
+
+    #[test]
+    fn level_triggered_claim_keeps_no_state() {
+        let mut registry = WaitSetRegistry::default();
+        registry.create(41).unwrap();
+        let level = interest(5, 101);
+        registry.add(41, level).unwrap();
+        assert_eq!(registry.claim(41, level.key, 1), Ok(true));
+        assert_eq!(registry.claim(41, level.key, 1), Ok(true));
+        assert_eq!(
+            registry.snapshot_entries(41, 1).unwrap()[0].1,
+            WaitSetReportState::default()
+        );
+        // A vanished interest is not an error; the claimant just loses.
+        let gone = interest(6, 102);
+        assert_eq!(registry.claim(41, gone.key, 1), Ok(false));
+        assert_eq!(
+            registry.claim(99, gone.key, 1),
+            Err(WaitSetRegistryError::NotFound)
+        );
+    }
+
+    #[test]
+    fn report_state_dies_with_its_interest() {
+        let mut registry = WaitSetRegistry::default();
+        registry.create(41).unwrap();
+        let edge = interest_with(5, 101, linux_abi::EPOLLIN | linux_abi::EPOLLET);
+        registry.add(41, edge).unwrap();
+        assert_eq!(registry.claim(41, edge.key, 5), Ok(true));
+        registry.delete(41, edge.key).unwrap();
+        registry.add(41, edge).unwrap();
+        assert_eq!(registry.claim(41, edge.key, 1), Ok(true));
+        assert_eq!(registry.claim(41, edge.key, 2), Ok(true));
+        assert_eq!(registry.purge(2, 101), 1);
+        registry.add(41, edge).unwrap();
+        assert_eq!(registry.claim(41, edge.key, 1), Ok(true));
+    }
+
+    #[test]
+    fn exclusive_is_add_only_and_restricted_to_wake_bits() {
+        let mut registry = WaitSetRegistry::default();
+        registry.create(41).unwrap();
+        let exclusive = interest_with(5, 101, linux_abi::EPOLLIN | linux_abi::EPOLLEXCLUSIVE);
+        registry.add(41, exclusive).unwrap();
+        // Immutable once added with EPOLLEXCLUSIVE.
+        assert_eq!(
+            registry.modify(41, interest(5, 101)),
+            Err(WaitSetRegistryError::Invalid)
+        );
+        // And cannot be introduced by a modification.
+        registry.add(41, interest(6, 102)).unwrap();
+        assert_eq!(
+            registry.modify(41, interest_with(6, 102, linux_abi::EPOLLEXCLUSIVE)),
+            Err(WaitSetRegistryError::Invalid)
+        );
+        // EPOLLONESHOT and EPOLLRDHUP are not in EPOLLEXCLUSIVE_OK_BITS.
+        for bad in [linux_abi::EPOLLONESHOT, linux_abi::EPOLLRDHUP, linux_abi::EPOLLPRI] {
+            assert_eq!(
+                registry.add(
+                    41,
+                    interest_with(7, 103, linux_abi::EPOLLEXCLUSIVE | linux_abi::EPOLLIN | bad)
+                ),
+                Err(WaitSetRegistryError::Invalid)
+            );
+        }
+        registry
+            .add(
+                41,
+                interest_with(
+                    7,
+                    103,
+                    linux_abi::EPOLLEXCLUSIVE | linux_abi::EPOLLIN | linux_abi::EPOLLET,
+                ),
+            )
+            .unwrap();
     }
 }

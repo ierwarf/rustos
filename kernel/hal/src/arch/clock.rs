@@ -605,6 +605,8 @@ fn read_tsc_unordered() -> u64 {
 fn read_tsc_ordered() -> u64 {
     let low: u32;
     let high: u32;
+    // SAFETY: `lfence; rdtsc` reads the counter into two registers and touches
+    // no memory; CR4.TSD is clear.
     unsafe {
         asm!(
             "lfence",

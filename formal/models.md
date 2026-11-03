@@ -42,7 +42,7 @@ model, its owner, and the properties TLC must check.
 | pager-vma-publication/PagerVmaPublication | `kernel-ps` fault-region publication | one bounded writer stamps exact process/MM/VMA generations into an all-atomic sequence record; exception readers take no process-state or scheduler lock and admit only a stable, permission-matching, non-revoked region |
 | page-table-lifecycle/PageTableLifecycle | compat MM broker and `kernel-mm` process address spaces | broker ranges are canonical, non-wrapping, and page-rounded before mutation; only live user frames map into user pages; every map/protect/unmap preserves W^X and removes unmapped access authority |
 | page-table-map-transaction/PageTableMapTransaction | `kernel-mm` intermediate table publication and leaf rollback | tables are published by CAS against a concurrent fault installer and retained on failure; a failed mapping reverses the exact leaf log, performs one shootdown, and only then frees leaf frames; every reachable table is claimed by exactly one ownership ledger |
-| physical-frame-lifecycle/PhysicalFrameLifecycle | `kernel-mm` boot physical-frame allocator | only aligned firmware-usable frames below the direct-map ceiling enter the free set; kernel/module reservations are monotonic before allocation; allocation and exact release preserve single ownership; invalid/double release and exhaustion fail without minting capacity |
+| physical-frame-lifecycle/PhysicalFrameLifecycle | `kernel-mm` boot physical-frame allocator | only aligned firmware-usable frames below the direct-map ceiling enter the free set; kernel/module reservations are monotonic before allocation; allocation and exact release preserve single ownership; per-CPU frame caches park free frames as `Cached` (used centrally, still free memory) with exact `central + cached` accounting, one release per frame, and exhaustion reported only when no frame is free or cached; invalid/double release and exhaustion fail without minting capacity |
 | service-heap-lifecycle/ServiceHeapLifecycle | `rustos-svc-runtime` allocator, syscalld VM policy, xtask KVM health oracle | dropped service allocations return exact spans to an address-ordered coalescing free set; growth occurs only after no reusable span fits; Linux mapping hints wrap to released gaps; allocation and fatal core-service failures are explicit failed runtime evidence |
 | process-address-space-lifetime/ProcessAddressSpaceLifetime | `kernel-ps` process table and `UserProcessState` | every state/address-space access holds one retained process reference and the per-process mutex; exit freezes the address-space epoch, stale exec cannot clear it, a prepared thread attachment cannot publish after exit and must release its unpublished stack, and reclamation waits for all authority to disappear |
 | process-lifecycle-transaction/ProcessLifecycleTransaction | `kernel-ps` process table plus `kernel-mm` address-space rollback and physical allocator | non-reused transactions separate spawn, exec, pending exit, and reap; attachment closes during exec/exit; exact process/MM generations reject stale completion; partial unpublished frame batches roll back after shootdown; published frames remain owned until task/reference and external authority settle |
@@ -317,11 +317,17 @@ accounting, and the key isolation property: a pending unrelated device request
 remains replyable while every sessiond worker is stalled.
 
 `rootd-restart-backoff` covers the core-service recovery boundary. An exit
-first revokes the old lease's authority and enters `RESTART_PENDING`; rootd's
-bounded timer wait must expire before a replacement can consume one retry
-budget unit. Ring0 supplies only a rootd-capability-gated timer substrate, so
-backoff choice, terminal failure, and fresh authority publication remain
-rootd policy.
+first revokes the old lease's authority and enters `RESTART_PENDING` with a
+per-lease monotonic deadline (`restart_not_before_ns`, set from the lease's
+`backoff_ms`); the deadline must pass before a replacement can consume one
+retry budget unit. The wait is non-blocking: `restart_failed_leases` only
+compares the deadline against the monotonic clock and skips the lease, so the
+supervisor's idle receive is the only sleep and rootd keeps serving IPC (and
+other leases' restarts) while a crash-looping service waits. A failed spawn or
+failed loader activation re-arms the same deadline. The rootd-capability-gated
+ring0 timer wait (`SYS_RUSTOS_ROOTD_WAIT_BROKER`) is used only by the bounded
+core-readiness wait, never for restart backoff, so backoff choice, terminal
+failure, and fresh authority publication remain rootd policy.
 
 `vfio-release-authorization` models the separate irreversible hardware handoff.
 A launch-plan topology check does not grant bind authority. Only an

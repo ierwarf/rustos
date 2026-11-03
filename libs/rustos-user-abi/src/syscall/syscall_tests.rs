@@ -221,6 +221,68 @@ fn waitset_interest_requires_the_exact_persistent_wire_shape() {
 }
 
 #[test]
+fn waitset_batch_wires_have_the_documented_layout_and_bounds() {
+    use super::{
+        NETD_POLL_BATCH_MAX, NetdPollQueryWire, NetdPollResultWire, VFS_EPOLL_CLAIM_MAX,
+        VFS_IPC_REQUEST_PAYLOAD_CAPACITY, VFS_POLL_BATCH_MAX, WAITSET_SNAPSHOT_STATE_DISABLED,
+        WaitSetClaimWire, WaitSetSnapshotWire, waitset_claim_shape_valid,
+        waitset_snapshot_shape_valid,
+    };
+    assert_eq!(core::mem::size_of::<NetdPollQueryWire>(), 16);
+    assert_eq!(core::mem::size_of::<NetdPollResultWire>(), 16);
+    assert_eq!(core::mem::size_of::<WaitSetClaimWire>(), 32);
+    assert_eq!(core::mem::size_of::<WaitSetSnapshotWire>(), 64);
+    assert!(VFS_POLL_BATCH_MAX * 8 <= VFS_IPC_REQUEST_PAYLOAD_CAPACITY);
+    assert!(VFS_EPOLL_CLAIM_MAX * 32 <= VFS_IPC_REQUEST_PAYLOAD_CAPACITY);
+    assert!(NETD_POLL_BATCH_MAX * 16 <= NETD_IPC_PAYLOAD_CAPACITY);
+
+    let interest = WaitSetInterestWire {
+        abi_version: WAITSET_ABI_VERSION,
+        provider: WAITSET_PROVIDER_VFSD,
+        target_fd: 3,
+        object_id: 9,
+        provider_epoch: 1,
+        ..WaitSetInterestWire::default()
+    };
+    let snapshot = WaitSetSnapshotWire {
+        interest,
+        edge_generation: 4,
+        state: WAITSET_SNAPSHOT_STATE_DISABLED,
+        reserved0: 0,
+    };
+    assert!(waitset_snapshot_shape_valid(&snapshot));
+    assert!(!waitset_snapshot_shape_valid(&WaitSetSnapshotWire {
+        state: 2,
+        ..snapshot
+    }));
+    assert!(!waitset_snapshot_shape_valid(&WaitSetSnapshotWire {
+        reserved0: 1,
+        ..snapshot
+    }));
+
+    let claim = WaitSetClaimWire {
+        provider: WAITSET_PROVIDER_VFSD,
+        target_fd: 3,
+        object_id: 9,
+        generation: 1,
+        ..WaitSetClaimWire::default()
+    };
+    assert!(waitset_claim_shape_valid(&claim));
+    assert!(!waitset_claim_shape_valid(&WaitSetClaimWire {
+        generation: 0,
+        ..claim
+    }));
+    assert!(!waitset_claim_shape_valid(&WaitSetClaimWire {
+        provider: WAITSET_PROVIDER_MAX + 1,
+        ..claim
+    }));
+    assert!(!waitset_claim_shape_valid(&WaitSetClaimWire {
+        reserved1: 1,
+        ..claim
+    }));
+}
+
+#[test]
 fn commercial_response_envelope_matches_exact_request_and_bounds_nested_fields() {
     let mut request = CommercialMaxProtocolRequest::default();
     request.header.protocol = 7;

@@ -38,7 +38,7 @@ use crate::errno;
 use crate::mmap_policy::{
     parse_mmap_sharing, plan_mmap, MmapFdKind, MmapPlan, MmapPlanError, MAP_PRIVATE,
 };
-use crate::vma_policy::{next_fit_with_wrap, AddressRange};
+use crate::vma_policy::{next_fit_with_wrap, AddressRange, VmaEntry, VmaMap};
 
 const DEFAULT_UMASK: u32 = 0o022;
 const GETRANDOM_MAX_BYTES: u32 = (SYSCALL_OFFLOAD_PAYLOAD_CAPACITY as u32) & !3;
@@ -124,7 +124,7 @@ struct MmPolicyState {
     mmap_next: u64,
     user_range_start: u64,
     user_range_end: u64,
-    vmas: Vec<MmVma>,
+    vmas: VmaMap<MmVma>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -153,6 +153,51 @@ impl AddressRange for MmVma {
 
     fn end(&self) -> u64 {
         self.end
+    }
+}
+
+impl VmaEntry for MmVma {
+    fn set_start(&mut self, start: u64) {
+        self.start = start;
+    }
+
+    fn set_end(&mut self, end: u64) {
+        self.end = end;
+    }
+}
+
+/// Exclusive ownership of one process's policy state for the span of a request.
+///
+/// The state is moved out of `MM_POLICY` (no copy of the VMA table) and moved
+/// back when the lease drops, on success and error paths alike. Handlers only
+/// mutate the state after the kernel broker accepted the change, so the stored
+/// state is always consistent with the live address space. The receive loop is
+/// single threaded; a second concurrent lease for the same pid would rebuild
+/// from the kernel layout, which is why no handler yields while holding one.
+struct MmLease {
+    pid: u64,
+    state: Option<MmPolicyState>,
+}
+
+impl core::ops::Deref for MmLease {
+    type Target = MmPolicyState;
+
+    fn deref(&self) -> &MmPolicyState {
+        self.state.as_ref().expect("live mm lease")
+    }
+}
+
+impl core::ops::DerefMut for MmLease {
+    fn deref_mut(&mut self) -> &mut MmPolicyState {
+        self.state.as_mut().expect("live mm lease")
+    }
+}
+
+impl Drop for MmLease {
+    fn drop(&mut self) {
+        if let Some(state) = self.state.take() {
+            save_mm_state(self.pid, state);
+        }
     }
 }
 
@@ -706,7 +751,6 @@ pub(crate) fn handle_brk(
     }
     state.brk_current = requested;
     upsert_heap_vma(&mut state);
-    save_mm_state(request.pid, state.clone());
     copy_payload(response, &state.brk_current);
 }
 
@@ -756,12 +800,7 @@ pub(crate) fn handle_mmap(
         if noreplace {
             let overlaps = requested_addr
                 .checked_add(map_len)
-                .is_none_or(|end| {
-                    state
-                        .vmas
-                        .iter()
-                        .any(|vma| vma.end > requested_addr && vma.start < end)
-                });
+                .is_none_or(|end| state.vmas.overlapping(requested_addr, end).next().is_some());
             if overlaps {
                 response.status = errno::EEXIST;
                 return;
@@ -846,7 +885,6 @@ pub(crate) fn handle_mmap(
                 },
             );
             state.mmap_next = state.mmap_next.max(addr + map_len);
-            save_mm_state(request.pid, state);
             copy_payload(response, &addr);
             return;
         }
@@ -869,7 +907,6 @@ pub(crate) fn handle_mmap(
                 },
             );
             state.mmap_next = state.mmap_next.max(mapped_addr + map_len);
-            save_mm_state(request.pid, state);
             copy_payload(response, &mapped_addr);
         }
         Err(errno) => {
@@ -984,7 +1021,6 @@ pub(crate) fn handle_mprotect(
         }
     }
     set_vma_prot(&mut state, start, end, prot);
-    save_mm_state(request.pid, state);
     response.status = 0;
     response.payload_len = 0;
 }
@@ -1022,7 +1058,6 @@ pub(crate) fn handle_munmap(
     };
     match unmap_populated_range(request.pid, &mut state, start, end) {
         Ok(()) => {
-            save_mm_state(request.pid, state);
             response.status = 0;
             response.payload_len = 0;
         }
@@ -1030,9 +1065,10 @@ pub(crate) fn handle_munmap(
     }
 }
 
-fn mm_state_for(pid: u64) -> Result<MmPolicyState, i32> {
-    if let Some(state) = mm_db().lock().get(&pid).cloned() {
-        return Ok(state);
+fn mm_state_for(pid: u64) -> Result<MmLease, i32> {
+    let stored = mm_db().lock().remove(&pid);
+    if let Some(state) = stored {
+        return Ok(MmLease { pid, state: Some(state) });
     }
     let mut layout = RustosMmLayoutBrokerResult::default();
     let args = RustosMmBrokerArgs {
@@ -1044,9 +1080,7 @@ fn mm_state_for(pid: u64) -> Result<MmPolicyState, i32> {
         ..RustosMmBrokerArgs::default()
     };
     mm_broker_call(&args)?;
-    let state = mm_state_from_layout(layout);
-    save_mm_state(pid, state.clone());
-    Ok(state)
+    Ok(MmLease { pid, state: Some(mm_state_from_layout(layout)) })
 }
 
 fn mm_state_from_layout(layout: RustosMmLayoutBrokerResult) -> MmPolicyState {
@@ -1065,7 +1099,7 @@ fn mm_state_from_layout(layout: RustosMmLayoutBrokerResult) -> MmPolicyState {
         } else {
             layout.user_range_end
         },
-        vmas: Vec::new(),
+        vmas: VmaMap::new(),
     };
     upsert_heap_vma(&mut state);
     state
@@ -1191,11 +1225,9 @@ fn replace_fixed_range_after_prevalidation(
     end: u64,
     _validated_plan: MmapPlan,
 ) -> Result<(), i32> {
-    syscalld::vma_policy::persist_fixed_removal_with(
-        state,
-        |state| unmap_populated_range(pid, state, start, end),
-        |state| save_mm_state(pid, state.clone()),
-    )
+    // `state` is the request's lease: a completed unmap that is followed by a
+    // refused replacement mapping is stored as a hole when the lease drops.
+    unmap_populated_range(pid, state, start, end)
 }
 
 fn mm_broker_call(args: &RustosMmBrokerArgs) -> Result<(), i32> {
@@ -1278,7 +1310,8 @@ fn upsert_heap_vma(state: &mut MmPolicyState) {
         return;
     }
     remove_kind(state, MmVmaKind::Heap);
-    state.vmas.push(MmVma {
+    // The heap never clobbers a record the kernel already owns inside its range.
+    state.vmas.insert_in_gaps(MmVma {
         start: state.brk_start,
         end: state.brk_mapped_end,
         prot: PROT_READ | PROT_WRITE,
@@ -1288,40 +1321,22 @@ fn upsert_heap_vma(state: &mut MmPolicyState) {
 }
 
 fn remove_kind(state: &mut MmPolicyState, kind: MmVmaKind) {
-    state.vmas.retain(|vma| vma.kind != kind);
+    state.vmas.remove_where(|vma| vma.kind == kind);
 }
 
 fn insert_vma(state: &mut MmPolicyState, vma: MmVma) {
-    remove_vma_range(state, vma.start, vma.end);
-    state.vmas.push(vma);
-    state.vmas.sort_by_key(|vma| vma.start);
+    state.vmas.insert_replacing(vma);
 }
 
 fn range_is_covered(state: &MmPolicyState, start: u64, end: u64) -> bool {
-    let mut cursor = start;
-    let mut ranges = state
-        .vmas
-        .iter()
-        .filter(|vma| vma.end > start && vma.start < end)
-        .collect::<Vec<_>>();
-    ranges.sort_by_key(|vma| vma.start);
-    for vma in ranges {
-        if vma.start > cursor {
-            return false;
-        }
-        cursor = cursor.max(vma.end);
-        if cursor >= end {
-            return true;
-        }
-    }
-    false
+    state.vmas.is_covered(start, end)
 }
 
 fn reserved_segments(state: &MmPolicyState, start: u64, end: u64) -> Vec<(u64, u64)> {
     state
         .vmas
-        .iter()
-        .filter(|vma| vma.kind == MmVmaKind::Reserved && vma.end > start && vma.start < end)
+        .overlapping(start, end)
+        .filter(|vma| vma.kind == MmVmaKind::Reserved)
         .map(|vma| (vma.start.max(start), vma.end.min(end)))
         .collect()
 }
@@ -1329,63 +1344,23 @@ fn reserved_segments(state: &MmPolicyState, start: u64, end: u64) -> Vec<(u64, u
 fn nonreserved_segments(state: &MmPolicyState, start: u64, end: u64) -> Vec<(u64, u64)> {
     state
         .vmas
-        .iter()
-        .filter(|vma| vma.kind != MmVmaKind::Reserved && vma.end > start && vma.start < end)
+        .overlapping(start, end)
+        .filter(|vma| vma.kind != MmVmaKind::Reserved)
         .map(|vma| (vma.start.max(start), vma.end.min(end)))
         .collect()
 }
 
 fn remove_vma_range(state: &mut MmPolicyState, start: u64, end: u64) {
-    let mut updated = Vec::new();
-    for vma in state.vmas.drain(..) {
-        if end <= vma.start || start >= vma.end {
-            updated.push(vma);
-            continue;
-        }
-        if start > vma.start {
-            updated.push(MmVma {
-                end: start,
-                ..vma.clone()
-            });
-        }
-        if end < vma.end {
-            updated.push(MmVma { start: end, ..vma });
-        }
-    }
-    state.vmas = updated;
-    state.vmas.sort_by_key(|vma| vma.start);
+    state.vmas.remove_range(start, end);
 }
 
 fn set_vma_prot(state: &mut MmPolicyState, start: u64, end: u64, prot: u64) {
-    let mut updated = Vec::new();
-    for vma in state.vmas.drain(..) {
-        if end <= vma.start || start >= vma.end {
-            updated.push(vma);
-            continue;
+    state.vmas.modify_range(start, end, |vma| {
+        if vma.kind == MmVmaKind::Reserved && prot != 0 {
+            vma.kind = MmVmaKind::Anonymous;
         }
-        if start > vma.start {
-            updated.push(MmVma {
-                end: start,
-                ..vma.clone()
-            });
-        }
-        updated.push(MmVma {
-            start: vma.start.max(start),
-            end: vma.end.min(end),
-            prot,
-            kind: if vma.kind == MmVmaKind::Reserved && prot != 0 {
-                MmVmaKind::Anonymous
-            } else {
-                vma.kind
-            },
-            ..vma.clone()
-        });
-        if end < vma.end {
-            updated.push(MmVma { start: end, ..vma });
-        }
-    }
-    state.vmas = updated;
-    state.vmas.sort_by_key(|vma| vma.start);
+        vma.prot = prot;
+    });
 }
 
 #[cfg(test)]
@@ -1394,6 +1369,18 @@ mod tests {
 
     use super::*;
     use rustos_user_abi::syscall::LINUX_UTSNAME_SIZE;
+
+    fn vma_map(vmas: Vec<MmVma>) -> VmaMap<MmVma> {
+        let mut map = VmaMap::new();
+        for vma in vmas {
+            map.insert_replacing(vma);
+        }
+        map
+    }
+
+    fn spans(state: &MmPolicyState) -> Vec<(u64, u64)> {
+        state.vmas.iter().map(|vma| (vma.start, vma.end)).collect()
+    }
 
     #[test]
     fn exec_discards_cached_high_guard_before_fixed_and_nonfixed_mmap() {
@@ -1496,19 +1483,17 @@ mod tests {
             mmap_next: 0x4000,
             user_range_start: 0x1000,
             user_range_end: 0x20_0000,
-            vmas: vec![MmVma {
+            vmas: vma_map(vec![MmVma {
                 start: 0x4000,
                 end: 0x9000,
                 prot: PROT_READ | PROT_WRITE,
                 mmap_flags: MAP_PRIVATE,
                 kind: MmVmaKind::Anonymous,
-            }],
+            }]),
         };
 
         remove_vma_range(&mut state, 0x5000, 0x7000);
-        assert_eq!(state.vmas.len(), 2);
-        assert_eq!((state.vmas[0].start, state.vmas[0].end), (0x4000, 0x5000));
-        assert_eq!((state.vmas[1].start, state.vmas[1].end), (0x7000, 0x9000));
+        assert_eq!(spans(&state), vec![(0x4000, 0x5000), (0x7000, 0x9000)]);
         assert!(!range_is_covered(&state, 0x4000, 0x9000));
     }
 
@@ -1521,13 +1506,13 @@ mod tests {
             mmap_next: 0x4000,
             user_range_start: 0x1000,
             user_range_end: 0x20_0000,
-            vmas: vec![MmVma {
+            vmas: vma_map(vec![MmVma {
                 start: 0x4000,
                 end: 0x8000,
                 prot: 0,
                 mmap_flags: MAP_PRIVATE | MAP_ANONYMOUS,
                 kind: MmVmaKind::Reserved,
-            }],
+            }]),
         };
 
         assert_eq!(
@@ -1536,8 +1521,9 @@ mod tests {
         );
         set_vma_prot(&mut state, 0x5000, 0x7000, PROT_READ);
         assert_eq!(state.vmas.len(), 3);
-        assert_eq!(state.vmas[1].kind, MmVmaKind::Anonymous);
-        assert_eq!(state.vmas[1].prot, PROT_READ);
+        let mid = state.vmas.iter().nth(1).unwrap();
+        assert_eq!(mid.kind, MmVmaKind::Anonymous);
+        assert_eq!(mid.prot, PROT_READ);
     }
 
     #[test]
@@ -1549,7 +1535,7 @@ mod tests {
             mmap_next: 0x4000,
             user_range_start: 0x1000,
             user_range_end: 0x20_0000,
-            vmas: vec![
+            vmas: vma_map(vec![
                 MmVma {
                     start: 0x4000,
                     end: 0x6000,
@@ -1564,12 +1550,48 @@ mod tests {
                     mmap_flags: MAP_PRIVATE | MAP_ANONYMOUS,
                     kind: MmVmaKind::Reserved,
                 },
-            ],
+            ]),
         };
 
         assert_eq!(
             nonreserved_segments(&state, 0x4000, 0x8000),
             vec![(0x4000, 0x6000)]
         );
+    }
+
+    #[test]
+    fn lease_returns_state_on_every_exit_including_a_completed_fixed_hole() {
+        let pid = u64::MAX - 23;
+        let mut seed = mm_state_from_layout(RustosMmLayoutBrokerResult {
+            brk_start: 0,
+            brk_current: 0,
+            brk_mapped_end: 0,
+            mmap_next: 0x4000,
+            user_range_start: 0x1000,
+            user_range_end: 0x20_0000,
+        });
+        insert_vma(
+            &mut seed,
+            MmVma {
+                start: 0x4000,
+                end: 0x6000,
+                prot: PROT_READ,
+                mmap_flags: MAP_PRIVATE | MAP_ANONYMOUS,
+                kind: MmVmaKind::Anonymous,
+            },
+        );
+        save_mm_state(pid, seed);
+        {
+            let mut lease = mm_state_for(pid).unwrap();
+            assert!(mm_db().lock().get(&pid).is_none(), "state moves, not copies");
+            // A fixed unmap completed, then the replacement map was refused.
+            let result: Result<(), i32> =
+                unmap_range_with(&mut lease, 0x4000, 0x6000, |_, _| Ok(()));
+            assert_eq!(result, Ok(()));
+        }
+        let lease = mm_state_for(pid).unwrap();
+        assert!(lease.vmas.is_empty(), "the hole was persisted by the lease");
+        drop(lease);
+        handle_process_exit_pid(pid);
     }
 }

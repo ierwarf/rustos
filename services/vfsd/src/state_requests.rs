@@ -217,6 +217,7 @@ impl VfsState {
                 }
             }
             VFS_POLL_QUERY_EPOLL_SNAPSHOT => self.vfs_epoll_snapshot(request, response),
+            VFS_POLL_QUERY_EPOLL_CLAIM => self.vfs_epoll_claim(request, response),
             VFS_POLL_QUERY_EPOLL_RETIRE => {
                 let key = checkpoint_epoll_key(request.remote_id);
                 if self.checkpoint_operation_replayed(request, key) {
@@ -281,7 +282,9 @@ impl VfsState {
     fn vfs_poll_once(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
         const POLLFD_SIZE: usize = size_of::<linux_abi::LinuxPollFd>();
         let len = request.payload_len as usize;
-        if !len.is_multiple_of(POLLFD_SIZE)
+        if len == 0
+            || !len.is_multiple_of(POLLFD_SIZE)
+            || len / POLLFD_SIZE > VFS_POLL_BATCH_MAX
             || len > response.payload.len().min(request.payload.len())
         {
             response.status = EINVAL;
@@ -343,34 +346,45 @@ impl VfsState {
 
     fn vfs_epoll_snapshot(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
         let maxevents = request.arg1 as usize;
-        let wire_size = size_of::<WaitSetInterestWire>();
+        let wire_size = size_of::<WaitSetSnapshotWire>();
         let capacity = response.payload.len() / wire_size;
         if maxevents == 0 || maxevents > WAITSET_MAX_INTERESTS || maxevents > capacity {
             response.status = EINVAL;
             return;
         }
-        let interests = match self.epolls.snapshot(request.remote_id, maxevents) {
+        let interests = match self.epolls.snapshot_entries(request.remote_id, maxevents) {
             Ok(interests) => interests,
             Err(err) => {
                 response.status = waitset_registry_status(err);
                 return;
             }
         };
-        for (written, interest) in interests.iter().enumerate() {
-            let wire = WaitSetInterestWire {
-                abi_version: WAITSET_ABI_VERSION,
-                provider: interest.key.provider,
-                flags: 0,
-                target_fd: interest.key.target_fd,
-                object_id: interest.key.object_id,
-                provider_epoch: interest.provider_epoch,
-                events: interest.events,
+        for (written, (interest, report)) in interests.iter().enumerate() {
+            let wire = WaitSetSnapshotWire {
+                interest: WaitSetInterestWire {
+                    abi_version: WAITSET_ABI_VERSION,
+                    provider: interest.key.provider,
+                    flags: 0,
+                    target_fd: interest.key.target_fd,
+                    object_id: interest.key.object_id,
+                    provider_epoch: interest.provider_epoch,
+                    events: interest.events,
+                    reserved0: 0,
+                    data: interest.data,
+                },
+                edge_generation: report.edge_generation,
+                state: if report.disabled {
+                    WAITSET_SNAPSHOT_STATE_DISABLED
+                } else {
+                    0
+                },
                 reserved0: 0,
-                data: interest.data,
             };
+            // SAFETY: `WaitSetSnapshotWire` is a `repr(C)` plain-data wire
+            // struct that outlives this view, which spans exactly its own bytes.
             let bytes = unsafe {
                 core::slice::from_raw_parts(
-                    (&wire as *const WaitSetInterestWire).cast::<u8>(),
+                    (&wire as *const WaitSetSnapshotWire).cast::<u8>(),
                     wire_size,
                 )
             };
@@ -380,6 +394,60 @@ impl VfsState {
         response.value = interests.len() as u64;
         response.aux = self.readiness_generation;
         response.payload_len = (interests.len() * wire_size) as u32;
+    }
+
+    /// Atomically consume edge-triggered / one-shot reports. The reply is one
+    /// byte per candidate: `1` when this caller owns the report.
+    fn vfs_epoll_claim(&mut self, request: &VfsIpcRequest, response: &mut VfsIpcResponse) {
+        const CLAIM_SIZE: usize = size_of::<WaitSetClaimWire>();
+        let len = request.payload_len as usize;
+        let count = len / CLAIM_SIZE;
+        if len == 0
+            || !len.is_multiple_of(CLAIM_SIZE)
+            || count > VFS_EPOLL_CLAIM_MAX
+            || len > request.payload.len()
+            || count > response.payload.len()
+        {
+            response.status = EINVAL;
+            return;
+        }
+        let mut claims = Vec::with_capacity(count);
+        for index in 0..count {
+            // SAFETY: `index * CLAIM_SIZE + CLAIM_SIZE <= len <= payload.len()`
+            // and `read_unaligned` tolerates the byte array's alignment.
+            let wire = unsafe {
+                core::ptr::read_unaligned(
+                    request.payload[index * CLAIM_SIZE..]
+                        .as_ptr()
+                        .cast::<WaitSetClaimWire>(),
+                )
+            };
+            if !waitset_claim_shape_valid(&wire) {
+                response.status = EINVAL;
+                return;
+            }
+            claims.push(wire);
+        }
+        let mut accepted = 0_u64;
+        for (index, wire) in claims.iter().enumerate() {
+            let key = WaitSetInterestKey {
+                target_fd: wire.target_fd,
+                provider: wire.provider,
+                object_id: wire.object_id,
+            };
+            match self.epolls.claim(request.remote_id, key, wire.generation) {
+                Ok(owned) => {
+                    response.payload[index] = u8::from(owned);
+                    accepted += u64::from(owned);
+                }
+                Err(err) => {
+                    response.status = waitset_registry_status(err);
+                    return;
+                }
+            }
+        }
+        response.value = accepted;
+        response.payload_len = count as u32;
     }
 
     fn advance_readiness_generation(&mut self, object_ids: &[u64]) {
@@ -538,7 +606,12 @@ impl VfsState {
             response.status = EINVAL;
             return;
         };
-        response.status = mkdir_policy(path, request.euid);
+        // Resolve against the caller's cwd like every other path operation: a
+        // relative path must not be judged as if it were already absolute.
+        response.status = match self.linux_resolved_path(request, path) {
+            Ok(path) => lock_vfs_storage().run_dirs.mkdir(path.as_str(), request.euid),
+            Err(errno) => errno,
+        };
     }
 
     fn linux_mount(&mut self, response: &mut LinuxSyscallOffloadResponse) {

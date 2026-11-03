@@ -346,7 +346,7 @@ tokens = [
 # Shared real root/fork constructor seals both unpublished owners before visibility.
 [[required_sequences]]
 path = "kernel/ps/src/multitask/process_table/spawn.rs"
-tokens = ["struct RootSpawnKey", "slot_generation: u64", "nonce: u64", "struct RootSpawnLoan", "live: bool", "fn seal_root_spawn(", "slot_generation == 0 || nonce == 0", "slot.spawn_transaction_id != Some(reservation.transaction_id)", "slot.root_spawn.is_some()", "slot.root_spawn = Some(key)", "fn release_root_spawn(", "!loan.live", "slot.root_spawn != Some(key)", "slot.spawn_transaction_id = None", "slot.root_spawn = None", "loan.live = false", "drop(table)", "fn publish_root_spawn(", "!loan.live", "publish_inner(key.reservation", "loan.live = false", "fn publish_inner(", "Box::new(", "PROCESS_TABLE.lock()", "slot.spawn_transaction_id != Some(reservation.transaction_id)", "slot.root_spawn != root", "slot.object = Some(object)", "pin_owner::bind(", "pin_owner::pin(reservation.handle)", "publish_slot_visibility(", "drop(table)", "fn cancel_spawn(", "slot.root_spawn.is_some()"]
+tokens = ["struct RootSpawnKey", "slot_generation: u64", "nonce: u64", "struct RootSpawnLoan", "live: bool", "fn seal_root_spawn(", "slot_generation == 0 || nonce == 0", "slot.spawn_transaction_id != Some(reservation.transaction_id)", "slot.root_spawn.is_some()", "slot.root_spawn = Some(key)", "fn release_root_spawn(", "!loan.live", "slot.root_spawn != Some(key)", "slot.spawn_transaction_id = None", "slot.root_spawn = None", "loan.live = false", "drop(table)", "fn publish_root_spawn(", "!loan.live", "publish_inner(key.reservation", "loan.live = false", "fn publish_inner(", "Box::new(", "PROCESS_TABLE.lock()", "slot.spawn_transaction_id != Some(reservation.transaction_id)", "slot.root_spawn != root", "slot.object = Some(object)", "pin_owner::bind(", "pin_owner::pin(reservation.handle)", "table.pid_index_link(reservation.handle.index(), process_id)", "publish_slot_visibility(", "drop(table)", "fn cancel_spawn(", "slot.root_spawn.is_some()"]
 [[required_sequences]]
 path = "kernel/ps/src/multitask/scheduler/root_creation.rs"
 tokens = ["enum Actor", "BindingPin", "cohort::Cohort", "fn capture(cpu:", "current_cpu_task_slot()?", "cpu_leases::owns_current(cpu, slot)", "context::read(slot)?", "task_start::read(slot)?.id", "scheduling_context.is_bound_to(id)", "capture_binding(", "thread_creation::capture_creator(slot)?", "Cohort::begin(&[(slot, id)])?", "struct Parent", "BindingPin", "cohort::Cohort", "fn parent_inputs(", "process_placement::mask(context.process_handle?)?", "impl Admission", "context.process_id == Some(pid)", "parent_inputs(*slot, *id, pid)?", "thread_creation::capture_creator(slot)?", "Cohort::begin(&[(slot, id)])?", "parent_inputs(slot, id, pid)?", ".or(inherited)?", "!policy.is_valid()", "process_mask & policy.cpu_mask", "domain_admission::admit(policy)?", "enum Input", "fn materialize(", "initialize_windows_thread_identifiers(", ".is_err()"]
@@ -2678,12 +2678,13 @@ tokens = [
     "object.ref_count != 0 || object.thread_count != 0",
     "if !pin_owner::close(index, slot.generation)",
     "let object = slot.object.take()?",
+    "table.pid_index_unlink(index, object.process_id)",
     "pub fn attach_task(",
     "if !pin_owner::is_open(handle)",
     "pub fn reap_exited_processes()",
     "let pin_reap_pending = pin_owner::take_reap_notification()",
     "table.reap_scan_pending, false) || pin_reap_pending",
-    "reclaim_slot(index, slot)",
+    "reclaim_slot(&mut table, index)",
     "drop(reclaimed)",
 ]
 

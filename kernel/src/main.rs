@@ -50,13 +50,11 @@ global_asm!(
 
 #[cfg(any(test, not(rustos_boot_image)))]
 fn main() {}
-
 #[cfg(all(not(test), rustos_boot_image))]
 #[alloc_error_handler]
 fn alloc_error_handler(layout: Layout) -> ! {
     mm_api::handle_alloc_error(layout)
 }
-
 #[cfg(all(not(test), rustos_boot_image))]
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
@@ -87,6 +85,7 @@ fn kernel_start_from_boot_info(boot_info_ptr: *const BootInfo) -> ! {
     mm_api::init_paging(boot_info_ptr);
     debug::boot_trace::println_fmt(format_args!("kernel: paging ready"));
 
+    // SAFETY: paging is initialized; target is `kernel_main_high`'s image alias.
     unsafe {
         hal_api::enter_higher_half(
             mm_api::kernel_image_addr(kernel_main_high as *const () as usize as u64),
@@ -103,6 +102,7 @@ extern "C" fn kernel_main_high(boot_info_ptr: *const BootInfo) -> ! {
     hal_api::boot::init_kernel_ibt();
     mm_api::kernel_vm::seal_kernel_image_aliases(boot_info_ptr);
     let bootstrap_stack_top = nucleus_core::bootstrap_stack::top();
+    // SAFETY: valid higher-half entry on the dedicated aligned bootstrap stack.
     unsafe {
         hal_api::call_with_stack(
             mm_api::higher_half_addr(kernel_main_bootstrap as *const () as usize as u64),

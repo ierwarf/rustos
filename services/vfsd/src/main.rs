@@ -39,11 +39,12 @@ use rustos_svc_runtime::syscall::monotonic_nanos;
 use rustos_user_abi::deadline::AbsoluteDeadline;
 use rustos_user_abi::linux as linux_abi;
 use rustos_user_abi::syscall::{
-    waitset_interest_shape_valid, CommercialMaxCapabilityLeaseWire,
+    LifecycleDrainBrokerArgs, LifecycleEventWire, LIFECYCLE_DRAIN_BROKER_ABI_VERSION,
+    LIFECYCLE_DRAIN_MAX_EVENTS, SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER, waitset_claim_shape_valid, CommercialMaxCapabilityLeaseWire,
     CommercialMaxProtocolDescriptorWire, CommercialMaxProtocolRequest,
     CommercialMaxProtocolResponse, IpcReplyWithHandlesArgs, ServiceCheckpointRecordWire,
     VfsExecutableSnapshotRequest, VfsExecutableSnapshotResponse, VfsIpcRequest, VfsIpcResponse,
-    WaitSetInterestWire, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
+    WaitSetClaimWire, WaitSetInterestWire, WaitSetSnapshotWire, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
     COMMERCIAL_MAX_PROTOCOL_MAX_DESCRIPTORS, COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR,
     COMMERCIAL_MAX_PROTOCOL_VFSD, COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_COMPACT,
     COMMERCIAL_MAX_ROOTD_OP_SERVICE_CHECKPOINT_MUTATE,
@@ -69,17 +70,22 @@ use rustos_user_abi::syscall::{
     VFS_IPC_OP_POLL_QUERY, VFS_IPC_OP_PREAD64, VFS_IPC_OP_READ, VFS_IPC_OP_READLINKAT,
     VFS_IPC_OP_STATX, VFS_IPC_OP_UMOUNT2, VFS_IPC_OP_UNLINKAT, VFS_IPC_OP_WRITE,
     VFS_IPC_PATH_CAPACITY, VFS_IPC_PAYLOAD_CAPACITY, VFS_POLL_QUERY_EPOLL_CREATE,
-    VFS_POLL_QUERY_EPOLL_CTL, VFS_POLL_QUERY_EPOLL_PURGE_OBJECT, VFS_POLL_QUERY_EPOLL_RETIRE,
-    VFS_POLL_QUERY_EPOLL_SNAPSHOT, VFS_POLL_QUERY_POLL, WAITSET_ABI_VERSION, WAITSET_MAX_INTERESTS,
+    VFS_EPOLL_CLAIM_MAX, VFS_POLL_BATCH_MAX, VFS_POLL_QUERY_EPOLL_CLAIM, VFS_POLL_QUERY_EPOLL_CTL, VFS_POLL_QUERY_EPOLL_PURGE_OBJECT,
+    VFS_POLL_QUERY_EPOLL_RETIRE, VFS_POLL_QUERY_EPOLL_SNAPSHOT, VFS_POLL_QUERY_POLL,
+    WAITSET_ABI_VERSION, WAITSET_MAX_INTERESTS, WAITSET_SNAPSHOT_STATE_DISABLED,
 };
 #[cfg(not(test))]
 use rustos_user_abi::syscall::{
     WaitSetSignalBrokerArgs, SYS_RUSTOS_WAITSET_SIGNAL_BROKER, WAITSET_PROVIDER_VFSD,
 };
 use storage_fat::{FatDirEntry, FatNodeKind, FatVolume};
+use vfsd::checkpoint_wire::{
+    checkpoint_epoll_record, checkpoint_interest_key, checkpoint_interest_record,
+    copy_file_cache_range, waitset_interest_from_wire, CHECKPOINT_EPOLL_TAG,
+};
 use vfsd::{
     cacheable_metadata_errno, checked_next_generation, checked_seek_position, checkpoint_path_key,
-    executable_snapshot_marker, executable_snapshot_resolution_base, mkdir_policy,
+    executable_snapshot_marker, executable_snapshot_resolution_base,
     persistent_mutation_status, reply_failure_diagnostic_due, should_materialize_file_cache,
     ui_bootstrap_snapshot_reply_completed, unlink_policy, valid_checkpoint_record,
     ExecutableSnapshotBacking, OpenDescriptionCheckpointWire, SeekPositionError,
@@ -93,14 +99,13 @@ use vfsd::{
 mod block;
 mod devmgrd;
 mod early_system;
-mod linux_types;
 mod snapshot_worker;
 mod storage_owner;
 mod util;
 
 use block::BootBlockDevice;
 use devmgrd::{devmgrd_dir_entries, devmgrd_lookup};
-use linux_types::{
+use vfsd::linux_types::{
     validate_linux_request, validate_vfs_request, LinuxSyscallOffloadRequest,
     LinuxSyscallOffloadResponse,
 };
@@ -216,7 +221,6 @@ fn reset_vfs_response_slot(op: u16) -> *mut VfsIpcResponse {
 const O_CREAT: u64 = 0o100;
 const O_TRUNC: u64 = 0o1000;
 const O_DIRECTORY: u64 = 0o200000;
-const CHECKPOINT_EPOLL_TAG: u64 = 1;
 type CheckpointRevisionKey = (u64, u64, u64, u64);
 
 // AT_FDCWD as u64 (represents -100 in twos complement, or 0xFFFF_FFFF_FFFF_FF9C)
@@ -315,6 +319,7 @@ fn receive_request(
 
 fn serve(endpoint: u64, mut state: VfsState) {
     let mut reply_failures = 0_u64;
+    let mut lifecycle_drain_failures = 0_u64;
     let mut request = MaybeUninit::<VfsRecvBuffer>::uninit();
     let mut reply_cap = 0_u64;
     let mut sender_pid = 0_u64;
@@ -344,6 +349,7 @@ fn serve(endpoint: u64, mut state: VfsState) {
             continue;
         }
 
+        state.drain_lifecycle_events(&mut lifecycle_drain_failures);
         let served = {
             let request = unsafe {
                 core::slice::from_raw_parts(request.as_ptr() as *const u8, received as usize)
@@ -570,6 +576,50 @@ fn demote_after_ui_bootstrap_snapshot_reply() {
     }
 }
 
+impl VfsState {
+    /// Applies every queued exit/fork before the next request is interpreted,
+    /// so cwd ownership follows process lifetime in kernel order (see
+    /// `vfsd::lifecycle`). The drain is a bounded local broker call that never
+    /// waits on another service.
+    fn drain_lifecycle_events(&mut self, failures: &mut u64) {
+        let mut events = [LifecycleEventWire::default(); LIFECYCLE_DRAIN_MAX_EVENTS];
+        let mut count = 0_u32;
+        let args = LifecycleDrainBrokerArgs {
+            abi_version: LIFECYCLE_DRAIN_BROKER_ABI_VERSION,
+            out_events_ptr: events.as_mut_ptr() as u64,
+            out_capacity: LIFECYCLE_DRAIN_MAX_EVENTS as u32,
+            out_count_ptr: &mut count as *mut u32 as u64,
+            ..LifecycleDrainBrokerArgs::default()
+        };
+        // SAFETY: `args` and the buffers it names are live and exclusively
+        // owned by this frame for the whole synchronous call.
+        let ret = unsafe {
+            rustos_svc_runtime::syscall::syscall1(
+                SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER,
+                (&args as *const LifecycleDrainBrokerArgs) as u64,
+            )
+        };
+        if ret == -(EOVERFLOW as i64) {
+            // At least one exit/fork was lost, so no pid's cwd can be trusted
+            // to belong to its current process: forget them all (default `/`).
+            self.cwd.clear();
+            ipc::debug_line("vfsd: lifecycle evidence overflow; cwd table reset");
+            return;
+        }
+        if ret < 0 {
+            *failures = failures.saturating_add(1);
+            if vfsd::reply_failure_diagnostic_due(*failures) {
+                ipc::debug_line(&format!("vfsd: lifecycle drain failed errno={}", -ret));
+            }
+            return;
+        }
+        // The count is kernel-written; never let it index past the local buffer.
+        for event in &events[..(count as usize).min(LIFECYCLE_DRAIN_MAX_EVENTS)] {
+            vfsd::lifecycle::apply_lifecycle_event(&mut self.cwd, event);
+        }
+    }
+}
+
 struct VfsState {
     /// Per-provider client-funded open-description tickets. This is NOT
     /// transferred into a kernel allocation or used in a syscall hotpath.
@@ -707,18 +757,6 @@ fn close_fd(fd: i32) {
             let _ = rustos_svc_runtime::syscall::syscall1(linux_abi::SYS_CLOSE, fd as u64);
         }
     }
-}
-
-fn copy_file_cache_range(bytes: &[u8], start: u64, dest: &mut [u8]) -> usize {
-    let Ok(start) = usize::try_from(start) else {
-        return 0;
-    };
-    let Some(source) = bytes.get(start..) else {
-        return 0;
-    };
-    let count = source.len().min(dest.len());
-    dest[..count].copy_from_slice(&source[..count]);
-    count
 }
 
 fn call_rootd_checkpoint(
@@ -934,80 +972,6 @@ fn checkpoint_handle_key(token: u64) -> CheckpointRevisionKey {
     (0, 0, token, VFSD_CHECKPOINT_HANDLE_TAG)
 }
 
-fn checkpoint_epoll_record(token: u64, tombstone: bool) -> ServiceCheckpointRecordWire {
-    let mut record = ServiceCheckpointRecordWire {
-        key_hi: token,
-        key_lo: CHECKPOINT_EPOLL_TAG,
-        ..ServiceCheckpointRecordWire::default()
-    };
-    if tombstone {
-        record.flags = SERVICE_CHECKPOINT_FLAG_TOMBSTONE;
-    }
-    record
-}
-
-fn checkpoint_interest_record(
-    epoll_token: u64,
-    interest: WaitSetInterestRecord,
-    tombstone: bool,
-) -> ServiceCheckpointRecordWire {
-    let (key_hi, key_lo) = checkpoint_interest_key(&interest);
-    let mut record = ServiceCheckpointRecordWire {
-        key_hi,
-        key_lo,
-        parent_hi: epoll_token,
-        parent_lo: CHECKPOINT_EPOLL_TAG,
-        ..ServiceCheckpointRecordWire::default()
-    };
-    if tombstone {
-        record.flags = SERVICE_CHECKPOINT_FLAG_TOMBSTONE;
-        return record;
-    }
-    let wire = WaitSetInterestWire {
-        abi_version: WAITSET_ABI_VERSION,
-        provider: interest.key.provider,
-        flags: 0,
-        target_fd: interest.key.target_fd,
-        object_id: interest.key.object_id,
-        provider_epoch: interest.provider_epoch,
-        events: interest.events,
-        reserved0: 0,
-        data: interest.data,
-    };
-    let bytes = unsafe {
-        core::slice::from_raw_parts(
-            (&wire as *const WaitSetInterestWire).cast::<u8>(),
-            size_of::<WaitSetInterestWire>(),
-        )
-    };
-    record.value_len = bytes.len() as u32;
-    record.value[..bytes.len()].copy_from_slice(bytes);
-    record
-}
-
-fn checkpoint_interest_key(interest: &WaitSetInterestRecord) -> (u64, u64) {
-    (
-        interest.key.object_id,
-        (u64::from(interest.key.provider) << 48) | interest.key.target_fd,
-    )
-}
-
-fn waitset_interest_from_wire(wire: &WaitSetInterestWire) -> Option<WaitSetInterestRecord> {
-    if !waitset_interest_shape_valid(wire) {
-        return None;
-    }
-    Some(WaitSetInterestRecord {
-        key: WaitSetInterestKey {
-            target_fd: wire.target_fd,
-            provider: wire.provider,
-            object_id: wire.object_id,
-        },
-        provider_epoch: wire.provider_epoch,
-        events: wire.events,
-        data: wire.data,
-    })
-}
-
 fn poll_ready_bits(requested: u32) -> u32 {
     requested
         & (linux_abi::EPOLLIN
@@ -1023,6 +987,7 @@ fn waitset_registry_status(err: WaitSetRegistryError) -> i32 {
         WaitSetRegistryError::NotFound => ENOENT,
         WaitSetRegistryError::Capacity => ENOSPC,
         WaitSetRegistryError::Overflow => EOVERFLOW,
+        WaitSetRegistryError::Invalid => EINVAL,
     }
 }
 
@@ -1156,77 +1121,4 @@ fn device_access_for_path(path: &str) -> u64 {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    use rustos_user_abi::syscall::IPC_MAX_INLINE_BYTES;
-
-    #[test]
-    fn vfs_requests_validate_inline_shape() {
-        let request = VfsIpcRequest {
-            operation_lo: 1,
-            ..VfsIpcRequest::default()
-        };
-        assert_eq!(validate_vfs_request(&request), Ok(()));
-        assert!(size_of::<VfsIpcRequest>() <= IPC_MAX_INLINE_BYTES);
-        assert_eq!(size_of::<VfsIpcResponse>(), IPC_MAX_INLINE_BYTES);
-    }
-
-    #[test]
-    fn waitset_checkpoint_keys_are_parent_scoped_and_round_trip_wire() {
-        let interest = WaitSetInterestRecord {
-            key: WaitSetInterestKey {
-                target_fd: 7,
-                provider: rustos_user_abi::syscall::WAITSET_PROVIDER_NETD,
-                object_id: 0xfeed_beef,
-            },
-            provider_epoch: 9,
-            events: linux_abi::EPOLLIN,
-            data: 11,
-        };
-        let record = checkpoint_interest_record(44, interest, false);
-        assert_eq!(record.parent_hi, 44);
-        assert_eq!(record.parent_lo, CHECKPOINT_EPOLL_TAG);
-        assert_eq!(record.value_len as usize, size_of::<WaitSetInterestWire>());
-        let wire = unsafe {
-            core::ptr::read_unaligned(record.value.as_ptr().cast::<WaitSetInterestWire>())
-        };
-        assert_eq!(waitset_interest_from_wire(&wire), Some(interest));
-        assert_eq!(size_of::<ServiceCheckpointRecordWire>(), 128);
-    }
-
-    #[test]
-    fn epoll_checkpoint_records_store_liveness_not_descriptor_refcounts() {
-        let live = checkpoint_epoll_record(44, false);
-        assert_eq!(live.key_hi, 44);
-        assert_eq!(live.key_lo, CHECKPOINT_EPOLL_TAG);
-        assert_eq!(live.value_len, 0);
-        assert_eq!(live.flags & SERVICE_CHECKPOINT_FLAG_TOMBSTONE, 0);
-
-        let retired = checkpoint_epoll_record(44, true);
-        assert_ne!(retired.flags & SERVICE_CHECKPOINT_FLAG_TOMBSTONE, 0);
-        assert_eq!(retired.value_len, 0);
-    }
-
-    #[test]
-    fn normalizes_cwd_relative_paths() {
-        assert_eq!(
-            normalize_absolute_path("/usr/lib", "../bin/app").unwrap(),
-            "/usr/bin/app"
-        );
-    }
-
-    #[test]
-    fn cached_file_ranges_are_exact_and_eof_bounded() {
-        let bytes = b"0123456789";
-        let mut out = [0xaa; 4];
-        assert_eq!(copy_file_cache_range(bytes, 3, &mut out), 4);
-        assert_eq!(&out, b"3456");
-        assert_eq!(copy_file_cache_range(bytes, 9, &mut out), 1);
-        assert_eq!(out[0], b'9');
-        assert_eq!(copy_file_cache_range(bytes, 10, &mut out), 0);
-        assert_eq!(copy_file_cache_range(bytes, u64::MAX, &mut out), 0);
-    }
-}
 // RING3-MIGRATION-REFERENCE END: vfsd ring3-owned VFS policy.

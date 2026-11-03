@@ -36,6 +36,7 @@ fn write_hex(value: u64) {
 
 fn write_bytes(bytes: &[u8]) {
     for &byte in bytes {
+        // SAFETY: port 0xE9 is the debug console; a byte write has no memory effect.
         unsafe {
             core::arch::asm!(
                 "out dx, al",

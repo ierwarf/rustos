@@ -91,9 +91,8 @@ pub enum JobError {
 /// A dimension no limit applies to; the job inherits its parent's.
 pub const LIMIT_UNSET: u64 = u64::MAX;
 
-/// Counted limits of one job, `LIMIT_UNSET` meaning inherit. Memory is absent on
-/// purpose: charging it needs a hook in the frame-descriptor ledger, and a limit
-/// that is stored but not enforced would be worse than none.
+/// Counted limits of one job, `LIMIT_UNSET` meaning inherit. `memory_pages` is
+/// enforced at the frame-descriptor ledger, not under the table lock.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct JobLimits {
     /// Process objects not yet reaped, in this job and every descendant.
@@ -393,11 +392,8 @@ impl ProcessTable {
             Some(id) => id,
             None => parent_process_id
                 .and_then(|pid| {
-                    self.slots
-                        .iter()
-                        .filter_map(|slot| slot.object.as_deref())
-                        .find(|object| object.process_id == pid)
-                        .map(|object| object.job)
+                    let index = self.find_pid_slot(pid, |_| true)?;
+                    self.slots[index].object.as_deref().map(|object| object.job)
                 })
                 .unwrap_or(ROOT_JOB),
         };
@@ -523,6 +519,16 @@ pub fn job_set_limits(id: JobId, mask: LimitMask, limits: JobLimits) -> Result<(
     if slot.state == JobState::Killing {
         return Err(JobError::Killing);
     }
+    // Validate every dimension before applying any: a refused MEMORY update
+    // must not leave PROCESSES/THREADS already changed.
+    // Never shrink hard memory below a previously admitted minimum.
+    // The charge group owns the limit; the fault path reads it lock-free.
+    if mask.contains(LimitMask::MEMORY) {
+        let minimum = kernel_mm::api::charge::minimum(id.index as usize);
+        if limits.memory_pages != LIMIT_UNSET && limits.memory_pages < minimum {
+            return Err(JobError::Full);
+        }
+    }
     if mask.contains(LimitMask::PROCESSES) {
         if id.index == 0 {
             super::set_process_limit(limits.processes as usize);
@@ -534,12 +540,6 @@ pub fn job_set_limits(id: JobId, mask: LimitMask, limits: JobLimits) -> Result<(
         table.jobs[id.index as usize].limits.threads = limits.threads;
     }
     if mask.contains(LimitMask::MEMORY) {
-        // Never shrink hard memory below a previously admitted minimum.
-        // The charge group owns the limit; the fault path reads it lock-free.
-        let minimum = kernel_mm::api::charge::minimum(id.index as usize);
-        if limits.memory_pages != LIMIT_UNSET && limits.memory_pages < minimum {
-            return Err(JobError::Full);
-        }
         kernel_mm::api::charge::set_limit(id.index as usize, limits.memory_pages);
     }
     Ok(())
@@ -592,12 +592,8 @@ pub fn job_collect_members(id: JobId, out: &mut [u64]) -> usize {
 /// The job `process_id` belongs to, while that process is live.
 pub fn process_job(process_id: u64) -> Option<JobId> {
     let table = PROCESS_TABLE.lock();
-    table
-        .slots
-        .iter()
-        .filter_map(|slot| slot.object.as_deref())
-        .find(|object| object.process_id == process_id)
-        .map(|object| object.job)
+    let index = table.find_pid_slot(process_id, |_| true)?;
+    table.slots[index].object.as_deref().map(|object| object.job)
 }
 
 /// True when `process_id` lives in `id`'s subtree.
@@ -605,10 +601,8 @@ pub fn job_subtree_contains_process(id: JobId, process_id: u64) -> bool {
     let table = PROCESS_TABLE.lock();
     table.job_slot(id).is_some()
         && table
-            .slots
-            .iter()
-            .filter_map(|slot| slot.object.as_deref())
-            .find(|object| object.process_id == process_id)
+            .find_pid_slot(process_id, |_| true)
+            .and_then(|index| table.slots[index].object.as_deref())
             .is_some_and(|object| table.job_contains(id.index, object.job.index))
 }
 
@@ -811,9 +805,9 @@ impl SessionOwner {
 }
 
 fn client_job_live_locked(table: &ProcessTable, pid: u64, job: JobId) -> bool {
-    table.slots.iter()
-        .filter_map(|slot| slot.object.as_deref())
-        .any(|object| object.process_id == pid && !object.exiting && object.job == job)
+    table
+        .find_pid_slot(pid, |object| !object.exiting && object.job == job)
+        .is_some()
 }
 
 fn session_charge_preflight(table: &ProcessTable, job: JobId) -> Result<(), JobError> {
@@ -891,12 +885,9 @@ pub fn job_charge_client_session_token(
     let mut table = PROCESS_TABLE.lock();
     // The provider's kernel incarnation: its process-slot generation, which
     // advances every time the slot is reused, so a recycled PID is distinct.
-    let owner_generation = table.slots.iter()
-        .find_map(|slot| {
-            slot.object.as_deref()
-                .filter(|object| object.process_id == owner_pid && !object.exiting)
-                .map(|_| slot.generation)
-        })
+    let owner_generation = table
+        .find_pid_slot(owner_pid, |object| !object.exiting)
+        .map(|index| table.slots[index].generation)
         .ok_or(JobError::Stale)?;
     if let Some(existing) = table.session_tokens.iter()
         .find(|entry| entry.owner_pid == owner_pid && entry.token == token)
@@ -1111,9 +1102,9 @@ pub fn job_charge_client_session(
     expected_job: JobId,
 ) -> Result<JobSessionInfo, JobError> {
     let mut table = PROCESS_TABLE.lock();
-    let member = table.slots.iter()
-        .filter_map(|slot| slot.object.as_deref())
-        .find(|object| object.process_id == client_pid && !object.exiting)
+    let member = table
+        .find_pid_slot(client_pid, |object| !object.exiting)
+        .and_then(|index| table.slots[index].object.as_deref())
         .map(|object| object.job)
         .ok_or(JobError::Stale)?;
     if member != expected_job {

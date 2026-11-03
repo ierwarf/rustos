@@ -34,7 +34,8 @@ pub const MSI_VECTOR_FIRST: u8 = 0x40;
 pub const MSI_VECTOR_LAST: u8 = 0xdf;
 const MSI_VECTOR_COUNT: usize = (MSI_VECTOR_LAST - MSI_VECTOR_FIRST + 1) as usize;
 const IA32_APIC_BASE: u32 = 0x1b;
-const APIC_BASE_ADDRESS_MASK: u64 = 0xffff_f000;
+// IA32_APIC_BASE[51:12]; the base may legally sit above 4 GiB.
+const APIC_BASE_ADDRESS_MASK: u64 = 0x000f_ffff_ffff_f000;
 const APIC_BASE_ENABLE: u64 = 1 << 11;
 const APIC_BASE_X2APIC: u64 = 1 << 10;
 const APIC_SPURIOUS_VECTOR_OFFSET: usize = 0x0f0;
@@ -150,6 +151,17 @@ static HANDLERS: [AtomicUsize; MSI_VECTOR_COUNT] =
     [const { AtomicUsize::new(0) }; MSI_VECTOR_COUNT];
 static ALLOCATED: [AtomicBool; MSI_VECTOR_COUNT] =
     [const { AtomicBool::new(false) }; MSI_VECTOR_COUNT];
+/// Handler invocations currently executing (or about to load the handler) per
+/// vector. `release_vector_handler` waits for this to drain after revoking the
+/// handler so a vector is never reusable while a prior-generation `dispatch`
+/// on another CPU can still run the old handler.
+static IN_FLIGHT: [AtomicUsize; MSI_VECTOR_COUNT] =
+    [const { AtomicUsize::new(0) }; MSI_VECTOR_COUNT];
+/// Upper bound on quiesce spins. A handler is a bounded leaf callback, so a
+/// healthy drain is a few hundred cycles; exceeding this means the release is
+/// running inside that vector's own dispatch (IRQ context) or a handler is
+/// wedged, and the vector is quarantined instead of reused.
+const QUIESCE_MAX_SPINS: u32 = 1 << 22;
 static ALLOCATION_CURSOR: AtomicUsize = AtomicUsize::new(0);
 static LOCAL_APIC_BASE: AtomicUsize = AtomicUsize::new(0);
 static LOCAL_APIC_PHYSICAL_BASE: AtomicU64 = AtomicU64::new(0);
@@ -753,24 +765,48 @@ impl Drop for MsiVectorLease {
     }
 }
 
+/// Revoke `handler` from `vector` and return the slot for reuse only after any
+/// in-flight `dispatch` of the prior generation has drained.
+///
+/// Must not be called from within a handler for the same vector (IRQ context on
+/// the dispatching CPU): that dispatch can never drain, so the bounded wait
+/// expires and the vector is quarantined (stays `ALLOCATED`, handler already
+/// revoked) rather than risking reuse. This fails closed and never deadlocks.
 fn release_vector_handler(vector: u8, handler: usize) {
     let Some(index) = vector_index(vector) else {
         return;
     };
-    // ORDERING: AcqRel removes the exact handler publication and observes any
-    // prior owner initialization before making its allocation reusable.
+    // ORDERING: SeqCst pairs with the SeqCst in-flight increment in `dispatch`
+    // (store/load Dekker pattern): either dispatch observes the revoked handler
+    // or this release observes the in-flight count.
     let handler_released = if handler == 0 {
-        HANDLERS[index].load(Ordering::Acquire) == 0
+        HANDLERS[index].load(Ordering::SeqCst) == 0
     } else {
+        // ORDERING: SeqCst revoke, see the Dekker pairing above.
         HANDLERS[index]
-            .compare_exchange(handler, 0, Ordering::AcqRel, Ordering::Acquire)
+            .compare_exchange(handler, 0, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
     };
-    if handler_released {
-        // ORDERING: release makes handler revocation visible before another
-        // allocator may successfully reserve this vector.
+    if handler_released && quiesce_in_flight(index, QUIESCE_MAX_SPINS) {
+        // ORDERING: release makes handler revocation and the drained dispatch
+        // visible before another allocator may successfully reserve this vector.
         ALLOCATED[index].store(false, Ordering::Release);
     }
+}
+
+/// Spin until no dispatch is in flight on `index`; false when `max_spins`
+/// expires first.
+fn quiesce_in_flight(index: usize, max_spins: u32) -> bool {
+    for _ in 0..max_spins {
+        // ORDERING: SeqCst (>= Acquire) observes the dispatch's Release decrement so the
+        // old handler's effects happen-before vector reuse.
+        if IN_FLIGHT[index].load(Ordering::SeqCst) == 0 {
+            return true;
+        }
+        spin_loop();
+    }
+    // ORDERING: final SeqCst re-check after the last spin, same pairing as above.
+    IN_FLIGHT[index].load(Ordering::SeqCst) == 0
 }
 
 /// Called only from the generic MSI IDT entries. The callback must only set a
@@ -778,11 +814,19 @@ fn release_vector_handler(vector: u8, handler: usize) {
 /// buffer work run later in the owning service/broker turn.
 pub fn dispatch(vector: u8) {
     if let Some(index) = vector_index(vector) {
-        let raw = HANDLERS[index].load(Ordering::Acquire);
+        // ORDERING: SeqCst increment is published before the handler load; pairs
+        // with the SeqCst revoke + in-flight check in `release_vector_handler`.
+        IN_FLIGHT[index].fetch_add(1, Ordering::SeqCst);
+        let raw = HANDLERS[index].load(Ordering::SeqCst);
         if raw != 0 {
+            // SAFETY: non-zero HANDLERS words are only ever stored by
+            // `register_handler` from a valid `MsiHandler` fn pointer.
             let handler: MsiHandler = unsafe { core::mem::transmute(raw) };
             handler(vector);
         }
+        // ORDERING: Release orders the handler's effects before the releaser
+        // can observe the drained count and recycle the vector.
+        IN_FLIGHT[index].fetch_sub(1, Ordering::Release);
     }
     end_of_interrupt();
 }
@@ -881,8 +925,8 @@ mod tests {
 
     use super::{
         ALLOCATED, APIC_DELIVERY_MODE_FIXED, APIC_DELIVERY_MODE_INIT, APIC_DELIVERY_MODE_STARTUP,
-        APIC_ICR_LEVEL_ASSERT, APIC_ICR_TRIGGER_LEVEL, HANDLERS, MSI_VECTOR_FIRST, MSI_VECTOR_LAST,
-        MsiVectorLease, fixed_icr_words, startup_icr_words, vector_has_registration_authority,
+        APIC_ICR_LEVEL_ASSERT, APIC_ICR_TRIGGER_LEVEL, HANDLERS, IN_FLIGHT, MSI_VECTOR_FIRST,
+        MSI_VECTOR_LAST, MsiVectorLease, release_vector_handler, fixed_icr_words, startup_icr_words, vector_has_registration_authority,
         vector_index, vector_is_valid,
     };
 
@@ -935,6 +979,55 @@ mod tests {
         drop(committed);
         assert_eq!(HANDLERS[index].load(Ordering::Acquire), 0);
         assert!(!ALLOCATED[index].load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn release_frees_vector_only_when_no_dispatch_in_flight() {
+        fn handler(_vector: u8) {}
+        let mut lease = MsiVectorLease::allocate().expect("vector");
+        assert!(lease.register_handler(handler));
+        let index = usize::from(lease.vector() - MSI_VECTOR_FIRST);
+        assert!(super::quiesce_in_flight(index, 1));
+        drop(lease);
+        // ORDERING: test-only observation after the single-threaded release.
+        assert_eq!(IN_FLIGHT[index].load(Ordering::SeqCst), 0);
+        assert!(!ALLOCATED[index].load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn dispatch_balances_in_flight_counter() {
+        fn handler(_vector: u8) {}
+        let mut lease = MsiVectorLease::allocate().expect("vector");
+        assert!(lease.register_handler(handler));
+        let index = usize::from(lease.vector() - MSI_VECTOR_FIRST);
+        // Handler runs between the matched increment/decrement; EOI needs a
+        // live APIC so only the counter protocol is exercised here.
+        // ORDERING: test-only stand-in for the dispatch increment/decrement pair.
+        IN_FLIGHT[index].fetch_add(1, Ordering::SeqCst);
+        assert!(!super::quiesce_in_flight(index, 8));
+        IN_FLIGHT[index].fetch_sub(1, Ordering::Release);
+        assert!(super::quiesce_in_flight(index, 8));
+    }
+
+    #[test]
+    fn release_quarantines_vector_when_dispatch_never_drains() {
+        fn handler(_vector: u8) {}
+        let mut lease = MsiVectorLease::allocate().expect("vector");
+        assert!(lease.register_handler(handler));
+        let index = usize::from(lease.vector() - MSI_VECTOR_FIRST);
+        // ORDERING: test-only stand-in for a dispatch that never drains.
+        IN_FLIGHT[index].fetch_add(1, Ordering::SeqCst);
+        // Bounded wait expires: this is the release-from-own-handler case.
+        assert!(!super::quiesce_in_flight(index, 1000));
+        release_vector_handler(lease.vector(), lease.handler);
+        lease.committed = true; // avoid second release in Drop
+        // ORDERING: test-only observation after the single-threaded release.
+        assert!(ALLOCATED[index].load(Ordering::Acquire), "quarantined");
+        assert_eq!(HANDLERS[index].load(Ordering::Acquire), 0);
+        // Test cleanup: drain and free the slot.
+        // ORDERING: test-only counter drain mirroring the dispatch decrement.
+        IN_FLIGHT[index].fetch_sub(1, Ordering::SeqCst);
+        ALLOCATED[index].store(false, Ordering::Release);
     }
 
     #[test]

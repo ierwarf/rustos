@@ -592,20 +592,13 @@ fn ensure_unmapped_user_pages(
     overflow_reason: &'static str,
     overlap_reason: &'static str,
 ) -> Result<(), ProcessLoadError> {
-    for page_index in 0..page_count {
-        let page_addr = start
-            .as_u64()
-            .checked_add(page_index as u64 * PAGE_SIZE)
-            .ok_or(ProcessLoadError::InvalidPe(overflow_reason))?;
-        if address_space
-            .translate_user(VirtAddr::new(page_addr))
-            .is_some()
-        {
-            return Err(ProcessLoadError::InvalidPe(overlap_reason));
-        }
+    // One page-table walk for the whole range; a range that cannot be
+    // expressed in user space fails closed with the overflow reason.
+    match address_space.first_mapped_user_page(start, page_count) {
+        Ok(None) => Ok(()),
+        Ok(Some(_)) => Err(ProcessLoadError::InvalidPe(overlap_reason)),
+        Err(_) => Err(ProcessLoadError::InvalidPe(overflow_reason)),
     }
-
-    Ok(())
 }
 
 fn initial_user_stack_top(stack_end: VirtAddr) -> Result<VirtAddr, ProcessLoadError> {

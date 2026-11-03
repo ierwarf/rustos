@@ -1239,31 +1239,62 @@ fn send_netd_ref_ack_with_timeout(request: &NetdIpcRequest, timeout_ms: u64) -> 
     Ok(())
 }
 
-pub fn poll_netd_socket_token(
-    socket_token: u64,
-    events: u32,
+/// One socket's answer inside a batched netd readiness query.
+pub type NetdPollOutcome = Result<(u32, u64), i64>;
+
+/// Evaluate every `(socket_token, events)` pair with one netd round trip.
+///
+/// The transport result is `Err` only when the exchange itself failed (timeout,
+/// revoked endpoint, malformed reply); a single socket that netd could not
+/// evaluate is that entry's `Err(errno)` and never fails its neighbours. A
+/// successful entry carries `(revents, generation)` with a non-zero generation.
+pub fn poll_netd_socket_batch(
+    queries: &[(u64, u32)],
     timeout_ms: u64,
-) -> Result<(u32, u64), i64> {
+) -> Result<Vec<NetdPollOutcome>, i64> {
+    const QUERY: usize = size_of::<NetdPollQueryWire>();
+    const RESULT: usize = size_of::<NetdPollResultWire>();
+    if queries.is_empty() {
+        return Ok(Vec::new());
+    }
+    if queries.len() > NETD_POLL_BATCH_MAX {
+        return Err(LINUX_EINVAL);
+    }
     let mut request = new_netd_socket_request(
-        SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET,
-        socket_token,
+        NETD_IPC_OP_POLL_BATCH,
+        0,
         super::vfs_meta::netd_deadline_after_class(
             ipc_ops::ServiceIpcClass::ReadinessQuery,
             Some(timeout_ms),
         ),
     );
-    request.arg1 = events as u64;
-    request.arg2 = NETD_POLL_MODE_QUERY;
+    for (index, (token, events)) in queries.iter().copied().enumerate() {
+        let offset = index * QUERY;
+        request.payload[offset..offset + 8].copy_from_slice(&token.to_le_bytes());
+        request.payload[offset + 8..offset + 12].copy_from_slice(&events.to_le_bytes());
+        request.payload[offset + 12..offset + 16].copy_from_slice(&0_u32.to_le_bytes());
+    }
+    request.payload_len = (queries.len() * QUERY) as u32;
     let response = call_netd_ipc_request_with_timeout(&request, timeout_ms)?;
-    if response.payload_len != 8 {
+    if response.value != queries.len() as u64
+        || response.payload_len as usize != queries.len() * RESULT
+    {
         return Err(LINUX_EINVAL);
     }
-    let generation =
-        u64::from_le_bytes(response.payload[..8].try_into().map_err(|_| LINUX_EINVAL)?);
-    if generation == 0 {
-        return Err(LINUX_EINVAL);
+    let mut outcomes = Vec::with_capacity(queries.len());
+    for index in 0..queries.len() {
+        let bytes = &response.payload[index * RESULT..(index + 1) * RESULT];
+        let generation = u64::from_le_bytes(bytes[0..8].try_into().map_err(|_| LINUX_EINVAL)?);
+        let revents = u32::from_le_bytes(bytes[8..12].try_into().map_err(|_| LINUX_EINVAL)?);
+        let status = i32::from_le_bytes(bytes[12..16].try_into().map_err(|_| LINUX_EINVAL)?);
+        outcomes.push(match status {
+            0 if generation != 0 => Ok((revents, generation)),
+            0 => return Err(LINUX_EINVAL),
+            errno if errno > 0 => Err(i64::from(errno)),
+            _ => return Err(LINUX_EINVAL),
+        });
     }
-    Ok((response.value as u32, generation))
+    Ok(outcomes)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

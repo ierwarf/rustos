@@ -117,6 +117,44 @@
   apply their temporary signal mask, reject a non-native sigset size, and
   return `EINTR` for a pending unmasked signal; SIGKILL/SIGSTOP can never be
   added to the temporary mask.
+  A scan asks each provider once, never once per descriptor. netd answers every
+  socket of a `poll` array or epoll snapshot in one `NETD_IPC_OP_POLL_BATCH`
+  exchange (up to `NETD_POLL_BATCH_MAX` `NetdPollQueryWire` entries in,
+  `NetdPollResultWire` entries out in order). A socket netd cannot evaluate
+  fails in its own entry (`status`), never the batch. The `generation` in each
+  entry is that socket's own readiness generation, recorded only for live
+  sockets and dropped at final close, so it advances only when that socket's
+  readiness may have changed. vfsd-backed `poll` descriptors use
+  `VFS_POLL_QUERY_POLL` with up to `VFS_POLL_BATCH_MAX` `pollfd` entries (the
+  fixed request payload bounds both batches; a larger scan issues several).
+  `VFS_POLL_QUERY_EPOLL_SNAPSHOT` returns `WaitSetSnapshotWire` entries: the
+  persistent `WaitSetInterestWire` plus volatile report state
+  (`edge_generation`, `WAITSET_SNAPSHOT_STATE_DISABLED`) that is never
+  checkpointed, so a restored interest reports once more.
+  `EPOLLET` and `EPOLLONESHOT` follow Linux's `epoll(7)`: an edge-triggered
+  interest reports again only for a provider generation newer than the one it
+  last reported, and a one-shot interest goes silent after one report until
+  `EPOLL_CTL_MOD` re-arms it (MOD also clears edge history, so current
+  readiness is reported again). `epoll_wait` turns each such report into
+  ownership with `VFS_POLL_QUERY_EPOLL_CLAIM` (up to `VFS_EPOLL_CLAIM_MAX`
+  `WaitSetClaimWire` per request, one byte per entry in the reply). vfsd
+  decides atomically, so two threads waiting on one epoll object cannot both
+  receive the same edge or one-shot event, and a candidate that lost the race
+  is replaced by the next ready one instead of producing an empty result.
+  Level-triggered interests are never claimed. Nested readiness (`poll` or
+  `epoll` on an epoll fd) only peeks and never consumes. A claim is not
+  replayed and rides the 100 ms interactive rail; a reply lost after vfsd
+  consumed the report can drop one edge, an accepted limit because a retry
+  could not tell "consumed by me" from "consumed by another waiter".
+  `EPOLLRDHUP` is evaluated by netd (peer FIN or `SHUT_WR`; AF_INET also
+  reports `POLLIN` at EOF, as reads return 0). `EPOLLEXCLUSIVE` is ADD-only,
+  accepted only with the Linux `EPOLLEXCLUSIVE_OK_BITS`, and makes the
+  interest immutable (MOD returns `EINVAL`); delivery stays level/edge as
+  registered, which Linux permits because the flag only allows waking one or
+  more waiters. `EPOLLWAKEUP` is dropped (no `CAP_BLOCK_SUSPEND`); the
+  `EPOLLRDNORM`/`EPOLLWRNORM` aliases are reported only when registered.
+  References: <https://man7.org/linux/man-pages/man7/epoll.7.html>,
+  <https://man7.org/linux/man-pages/man2/epoll_ctl.2.html>.
 - User-task retirement is a two-phase runtime boundary. The scheduler first
   revokes runnable, deadline, and IPC authority, stamps the exact task/process
   identity plus whether this was the process's last live thread, and keeps the

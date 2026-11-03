@@ -5,7 +5,7 @@ use super::*;
 use lazy_static::lazy_static;
 use nucleus_core::util::lockdep::{LockClass, TrackedSpinLock};
 use rustos_user_abi::syscall::{
-    LIFECYCLE_DRAIN_MAX_EVENTS, LIFECYCLE_EVENT_EXIT, LifecycleDrainBrokerArgs, LifecycleEventWire,
+    LIFECYCLE_DRAIN_MAX_EVENTS, LIFECYCLE_EVENT_EXIT, LIFECYCLE_EVENT_FORK, LifecycleDrainBrokerArgs, LifecycleEventWire,
     VFS_IPC_OP_PREAD64, VFS_IPC_PAYLOAD_CAPACITY,
 };
 
@@ -61,13 +61,17 @@ lazy_static! {
         TrackedSpinLock::new(LifecycleEventQueue::new());
     static ref SYSCALLD_LIFECYCLE_EVENTS: TrackedSpinLock<LifecycleEventQueue, { LockClass::CompatLifecycle as u8 }> =
         TrackedSpinLock::new(LifecycleEventQueue::new());
+    static ref VFSD_LIFECYCLE_EVENTS: TrackedSpinLock<LifecycleEventQueue, { LockClass::CompatLifecycle as u8 }> =
+        TrackedSpinLock::new(LifecycleEventQueue::new());
 }
 static ROOTD_LIFECYCLE_EVENTS_OVERFLOWED: AtomicBool = AtomicBool::new(false);
 static PROCD_LIFECYCLE_EVENTS_OVERFLOWED: AtomicBool = AtomicBool::new(false);
 static SYSCALLD_LIFECYCLE_EVENTS_OVERFLOWED: AtomicBool = AtomicBool::new(false);
+static VFSD_LIFECYCLE_EVENTS_OVERFLOWED: AtomicBool = AtomicBool::new(false);
 static ROOTD_LIFECYCLE_DRAIN_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static PROCD_LIFECYCLE_DRAIN_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 static SYSCALLD_LIFECYCLE_DRAIN_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+static VFSD_LIFECYCLE_DRAIN_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
 struct LifecycleEventQueue {
     events: [LifecycleEventWire; LIFECYCLE_DRAIN_MAX_EVENTS],
@@ -117,6 +121,8 @@ pub(super) enum LifecycleConsumer {
     RootSupervisor,
     ProcessPolicy,
     LinuxSyscallPolicy,
+    /// vfsd prunes and inherits its per-pid cwd from exit and fork evidence.
+    VfsPolicy,
 }
 
 impl LifecycleConsumer {
@@ -127,6 +133,7 @@ impl LifecycleConsumer {
             Self::RootSupervisor => &ROOTD_LIFECYCLE_EVENTS,
             Self::ProcessPolicy => &PROCD_LIFECYCLE_EVENTS,
             Self::LinuxSyscallPolicy => &SYSCALLD_LIFECYCLE_EVENTS,
+            Self::VfsPolicy => &VFSD_LIFECYCLE_EVENTS,
         }
     }
 
@@ -135,6 +142,7 @@ impl LifecycleConsumer {
             Self::RootSupervisor => &ROOTD_LIFECYCLE_EVENTS_OVERFLOWED,
             Self::ProcessPolicy => &PROCD_LIFECYCLE_EVENTS_OVERFLOWED,
             Self::LinuxSyscallPolicy => &SYSCALLD_LIFECYCLE_EVENTS_OVERFLOWED,
+            Self::VfsPolicy => &VFSD_LIFECYCLE_EVENTS_OVERFLOWED,
         }
     }
 
@@ -143,6 +151,7 @@ impl LifecycleConsumer {
             Self::RootSupervisor => &ROOTD_LIFECYCLE_DRAIN_IN_PROGRESS,
             Self::ProcessPolicy => &PROCD_LIFECYCLE_DRAIN_IN_PROGRESS,
             Self::LinuxSyscallPolicy => &SYSCALLD_LIFECYCLE_DRAIN_IN_PROGRESS,
+            Self::VfsPolicy => &VFSD_LIFECYCLE_DRAIN_IN_PROGRESS,
         }
     }
 }
@@ -179,6 +188,7 @@ pub(crate) fn record_process_exit(pid: u64, parent_pid: u64, exit_status: i32) {
         LifecycleConsumer::RootSupervisor,
         LifecycleConsumer::ProcessPolicy,
         LifecycleConsumer::LinuxSyscallPolicy,
+        LifecycleConsumer::VfsPolicy,
     ] {
         let mut events = consumer.events().lock();
         if !events.push(event) {
@@ -197,6 +207,39 @@ pub(crate) fn record_process_exec(pid: u64) {
     let consumer = LifecycleConsumer::LinuxSyscallPolicy;
     let event = LifecycleEventWire {
         event: rustos_user_abi::syscall::LIFECYCLE_EVENT_EXEC,
+        pid,
+        ..LifecycleEventWire::default()
+    };
+    if !consumer.events().lock().push(event) {
+        consumer.overflowed().store(true, Ordering::Release);
+    }
+}
+
+/// Publish a new child process to vfsd before the child can run. `pid` is the
+/// child and `parent_pid` the forking process, so vfsd can copy the parent's
+/// cwd into the child's entry before the child's first namespace request. The
+/// queue is FIFO and drained before each vfsd request, which orders this
+/// event after any earlier exit of a reused pid and before the child's first
+/// request; the parent's later `chdir` cannot overtake it.
+pub(crate) fn record_process_fork(pid: u64, parent_pid: u64) {
+    let consumer = LifecycleConsumer::VfsPolicy;
+    let event = LifecycleEventWire {
+        event: LIFECYCLE_EVENT_FORK,
+        pid,
+        parent_pid,
+        ..LifecycleEventWire::default()
+    };
+    if !consumer.events().lock().push(event) {
+        consumer.overflowed().store(true, Ordering::Release);
+    }
+}
+
+/// Withdraw a fork event whose child never became runnable, so vfsd drops the
+/// cwd it copied for a pid that no exit event will ever name.
+pub(crate) fn record_process_fork_abandoned(pid: u64) {
+    let consumer = LifecycleConsumer::VfsPolicy;
+    let event = LifecycleEventWire {
+        event: LIFECYCLE_EVENT_EXIT,
         pid,
         ..LifecycleEventWire::default()
     };
@@ -321,6 +364,25 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events.prefix(2)[0].pid, 2);
         assert_eq!(events.prefix(2)[1].pid, 3);
+    }
+
+    #[test]
+    fn vfsd_overflow_rebases_its_private_queue_only() {
+        let mut vfsd = LifecycleEventQueue::new();
+        assert!(vfsd.push(LifecycleEventWire {
+            event: LIFECYCLE_EVENT_FORK,
+            pid: 9,
+            parent_pid: 8,
+            ..LifecycleEventWire::default()
+        }));
+        let overflow = AtomicBool::new(true);
+        assert!(lifecycle_overflow_requires_rebase(
+            LifecycleConsumer::VfsPolicy,
+            &mut vfsd,
+            &overflow,
+        ));
+        assert_eq!(vfsd.len(), 0);
+        assert!(!overflow.load(Ordering::Acquire));
     }
 
     #[test]

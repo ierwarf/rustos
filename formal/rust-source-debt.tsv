@@ -111,7 +111,7 @@ kernel/compat/src/pager.rs	0	0
 kernel/compat/src/user/syscall/linux/proc_broker_ops/fork.rs	0	0
 kernel/compat/src/user/syscall/linux/pager_fault_ops.rs	0	0
 kernel/compat/src/user/syscall/linux/service_ops/process_time.rs	1	0
-kernel/hal/src/arch/msi.rs	5	19
+kernel/hal/src/arch/msi.rs	5	17
 kernel/hal/src/arch/pci.rs	4	0
 kernel/hal/src/arch/gdt.rs	4	0
 kernel/hal/src/interrupt_stubs.rs	0	0
@@ -134,7 +134,8 @@ kernel/mm/src/memory/frame_capability.rs	0	0
 kernel/mm/src/memory/kernel_vm.rs	16	0
 kernel/mm/src/memory/cache_attributes.rs	0	0
 kernel/mm/src/memory/phys.rs	0	0
-kernel/mm/src/memory/heap.rs	9	0
+kernel/mm/src/memory/phys/frame_cache.rs	0	0
+kernel/mm/src/memory/heap.rs	0	0
 kernel/mm/src/api.rs	0	0
 libs/rustos-svc-runtime/src/allocator.rs	9	5
 services/syscalld/src/linux_policy.rs	3	0

@@ -36,7 +36,8 @@ Four fixed netd request receivers prevent an unrelated caller from serializing
 all local AF_UNIX work. Blocking INET connect/send/recv waits run in a separate
 fixed eight-worker pool that releases the shared network-state lock between
 polls; there is no thread-per-request fallback. All socket poll/epoll waits now
-query netd readiness generation, register the shared bounded wait token, and
+query netd readiness generation (one `NETD_IPC_OP_POLL_BATCH` exchange per scan,
+per-socket generations), register the shared bounded wait token, and
 re-query before sleeping and after wake. Because the DVM packet ring currently
 exposes no userspace interrupt edge, netd owns one fixed 1 ms INET ingress
 worker; one bounded smoltcp poll per turn publishes a generation only when

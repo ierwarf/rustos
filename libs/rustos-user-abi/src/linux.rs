@@ -370,6 +370,26 @@ pub const EPOLLOUT: u32 = POLLOUT as u32;
 pub const EPOLLERR: u32 = POLLERR as u32;
 pub const EPOLLHUP: u32 = POLLHUP as u32;
 pub const EPOLLNVAL: u32 = POLLNVAL as u32;
+/// Peer closed or shut down its writing half (`POLLRDHUP`).
+pub const POLLRDHUP: i16 = 0x2000;
+pub const EPOLLRDHUP: u32 = POLLRDHUP as u32;
+pub const EPOLLRDNORM: u32 = 0x0040;
+pub const EPOLLRDBAND: u32 = 0x0080;
+pub const EPOLLWRNORM: u32 = 0x0100;
+pub const EPOLLWRBAND: u32 = 0x0200;
+pub const EPOLLMSG: u32 = 0x0400;
+/// `EPOLLEXCLUSIVE`: wake-up exclusivity hint, valid only with `EPOLL_CTL_ADD`.
+pub const EPOLLEXCLUSIVE: u32 = 1 << 28;
+/// `EPOLLWAKEUP`: needs `CAP_BLOCK_SUSPEND`; RustOS has no suspend blockers so
+/// it is accepted and ignored, as Linux does for an unprivileged caller.
+pub const EPOLLWAKEUP: u32 = 1 << 29;
+pub const EPOLLONESHOT: u32 = 1 << 30;
+pub const EPOLLET: u32 = 1 << 31;
+/// Bits that select delivery semantics instead of readiness.
+pub const EPOLL_MODE_BITS: u32 = EPOLLEXCLUSIVE | EPOLLWAKEUP | EPOLLONESHOT | EPOLLET;
+/// The only bits Linux allows together with `EPOLLEXCLUSIVE`.
+pub const EPOLLEXCLUSIVE_OK_BITS: u32 =
+    EPOLLIN | EPOLLOUT | EPOLLERR | EPOLLHUP | EPOLLWAKEUP | EPOLLET | EPOLLEXCLUSIVE;
 
 raw_usize! {
     NCCS = linux::NCCS;

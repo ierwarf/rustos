@@ -22,9 +22,6 @@
 
 extern crate alloc;
 
-mod personality_gate;
-mod release_attestation;
-mod trust_anchor;
 
 use alloc::borrow::ToOwned;
 use alloc::ffi::CString;
@@ -663,7 +660,7 @@ fn handle_placed_request(request: &LoaderSpawnRequest, job_handle: Option<u64>) 
     // Rootd's personality policy must grant this loader the right to launch
     // this image's personality; a refusal or an unreachable rootd fails the
     // spawn before any process state is prepared.
-    if let Err(errno) = personality_gate::authorize_launch(executable_format) {
+    if let Err(errno) = loaderd::personality_gate::authorize_launch(executable_format) {
         debug_line("loaderd: personality policy refused the launch");
         let _ = syscall1(SYS_CLOSE, fd as u64);
         response.status = errno;
@@ -1017,7 +1014,7 @@ fn stage_release_file(
     })();
     let _ = syscall1(SYS_CLOSE, fd as u64);
     let bytes = read?;
-    match release_attestation::stage_release_bundle(
+    match loaderd::release_attestation::stage_release_bundle(
         &bytes,
         service,
         durable_floor,
@@ -1036,11 +1033,11 @@ fn stage_release_file(
                 "loaderd: release stage refused service={service} epoch={release_epoch} reason={error:?}"
             ));
             Err(match error {
-                release_attestation::AdmissionError::Invalid => EINVAL,
-                release_attestation::AdmissionError::Image(_) => EACCES,
-                release_attestation::AdmissionError::Policy(errno)
-                | release_attestation::AdmissionError::Transport(errno) => errno,
-                release_attestation::AdmissionError::WrongReply => 71,
+                loaderd::release_attestation::AdmissionError::Invalid => EINVAL,
+                loaderd::release_attestation::AdmissionError::Image(_) => EACCES,
+                loaderd::release_attestation::AdmissionError::Policy(errno)
+                | loaderd::release_attestation::AdmissionError::Transport(errno) => errno,
+                loaderd::release_attestation::AdmissionError::WrongReply => 71,
             })
         }
     }

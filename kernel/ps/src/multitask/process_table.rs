@@ -260,6 +260,10 @@ struct ProcessSlot {
     object: Option<Box<ProcessObject>>,
     spawn_transaction_id: Option<u32>,
     root_spawn: Option<spawn::RootSpawnKey>,
+    /// Next slot (index + 1, 0 = end) in this slot's pid-hash chain. Meaningful
+    /// only while `object` is `Some`; maintained under the table lock together
+    /// with `ProcessTable::pid_buckets`.
+    pid_next: u32,
 }
 
 impl ProcessSlot {
@@ -269,12 +273,29 @@ impl ProcessSlot {
             object: None,
             spawn_transaction_id: None,
             root_spawn: None,
+            pid_next: 0,
         }
     }
 }
 
+/// Buckets of the pid -> slot index. Chains are intrusive (`ProcessSlot::pid_next`)
+/// so linking never allocates under the table lock; a power of two for the
+/// multiplicative hash below.
+const PID_BUCKET_BITS: u32 = 10;
+const PID_BUCKETS: usize = 1 << PID_BUCKET_BITS;
+
+fn pid_bucket(process_id: u64) -> usize {
+    (process_id.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - PID_BUCKET_BITS)) as usize
+}
+
 struct ProcessTable {
     slots: ChunkTable<ProcessSlot>,
+    /// Chain heads (slot index + 1, 0 = empty) of every slot holding a process
+    /// object, keyed by its immutable `process_id`. Linked in `publish_inner`
+    /// right after `slot.object` is stored and unlinked in `reclaim_slot` next
+    /// to `slot.object.take()`, both under the table lock. A hit is never
+    /// trusted: lookups re-read the slot's object and compare its pid.
+    pid_buckets: [u32; PID_BUCKETS],
     jobs: [jobs::JobSlot; jobs::JOB_SLOTS],
     /// Kernel-owned exact-token resource custody. This survives a rootd
     /// process crash and cannot be forged by a guessed PID/JobId.
@@ -289,6 +310,7 @@ impl ProcessTable {
     const fn new() -> Self {
         Self {
             slots: ChunkTable::new(),
+            pid_buckets: [0; PID_BUCKETS],
             jobs: {
                 let mut jobs = [const { jobs::JobSlot::empty() }; jobs::JOB_SLOTS];
                 jobs[0] = jobs::JobSlot::root();
@@ -309,6 +331,76 @@ impl ProcessTable {
 
     fn lookup_object_mut(&mut self, handle: ProcessHandle) -> Option<&mut ProcessObject> {
         self.lookup_slot_mut(handle)?.object.as_deref_mut()
+    }
+
+    /// Link `index` (whose slot just received its object) into the pid index.
+    fn pid_index_link(&mut self, index: usize, process_id: u64) {
+        let bucket = pid_bucket(process_id);
+        let head = self.pid_buckets[bucket];
+        let Some(slot) = self.slots.get_mut(index) else {
+            return;
+        };
+        debug_assert!(slot.object.is_some(), "pid index links only occupied slots");
+        slot.pid_next = head;
+        self.pid_buckets[bucket] = index as u32 + 1;
+    }
+
+    /// Unlink `index` from the chain of `process_id`. Idempotent: an index that
+    /// is not on the chain leaves the index untouched.
+    fn pid_index_unlink(&mut self, index: usize, process_id: u64) {
+        let bucket = pid_bucket(process_id);
+        let target = index as u32 + 1;
+        let mut cursor = self.pid_buckets[bucket];
+        if cursor == target {
+            let next = self.slots.get(index).map_or(0, |slot| slot.pid_next);
+            self.pid_buckets[bucket] = next;
+        } else {
+            let mut budget = self.slots.len();
+            while cursor != 0 && budget != 0 {
+                budget -= 1;
+                let Some(prev) = self.slots.get(cursor as usize - 1) else {
+                    break;
+                };
+                let next = prev.pid_next;
+                if next == target {
+                    let after = self.slots.get(index).map_or(0, |slot| slot.pid_next);
+                    self.slots[cursor as usize - 1].pid_next = after;
+                    break;
+                }
+                cursor = next;
+            }
+        }
+        if let Some(slot) = self.slots.get_mut(index) {
+            slot.pid_next = 0;
+        }
+    }
+
+    /// Lowest slot index whose object has `process_id` and satisfies `accept`.
+    /// Every chain entry is validated against the slot's own object, so a stale
+    /// or aliased entry can never produce a hit; the lowest-index rule keeps the
+    /// result identical to the full slot scan this index replaced.
+    fn find_pid_slot(
+        &self,
+        process_id: u64,
+        mut accept: impl FnMut(&ProcessObject) -> bool,
+    ) -> Option<usize> {
+        let mut cursor = self.pid_buckets[pid_bucket(process_id)];
+        let mut budget = self.slots.len();
+        let mut best: Option<usize> = None;
+        while cursor != 0 && budget != 0 {
+            budget -= 1;
+            let index = cursor as usize - 1;
+            let slot = self.slots.get(index)?;
+            if let Some(object) = slot.object.as_deref()
+                && object.process_id == process_id
+                && best.is_none_or(|current| index < current)
+                && accept(object)
+            {
+                best = Some(index);
+            }
+            cursor = slot.pid_next;
+        }
+        best
     }
 
     fn next_generation(current: u32) -> Option<u32> {
@@ -424,7 +516,8 @@ fn publish_slot_visibility(index: usize, slot: &ProcessSlot) {
     identity::publish_slot_visibility(index, slot.generation, publication);
 }
 
-fn reclaim_slot(index: usize, slot: &mut ProcessSlot) -> Option<Box<ProcessObject>> {
+fn reclaim_slot(table: &mut ProcessTable, index: usize) -> Option<Box<ProcessObject>> {
+    let slot = table.slots.get_mut(index)?;
     let object = slot.object.as_mut()?;
     if object.ref_count != 0 || object.thread_count != 0 {
         object.queued_for_reap = false;
@@ -444,7 +537,9 @@ fn reclaim_slot(index: usize, slot: &mut ProcessSlot) -> Option<Box<ProcessObjec
     // Generation exhaustion permanently retires this slot. Reusing generation
     // one would let a stale ProcessHandle alias a new process.
     slot.generation = ProcessTable::next_generation(slot.generation).unwrap_or(0);
-    publish_slot_visibility(index, slot);
+    // The pid index entry dies with the object, in the same locked section.
+    table.pid_index_unlink(index, object.process_id);
+    publish_slot_visibility(index, &table.slots[index]);
     Some(object)
 }
 
@@ -558,15 +653,8 @@ pub fn detach_task(handle: ProcessHandle) -> Option<()> {
 
 pub fn parent_process_id_of(process_id: u64) -> Option<u64> {
     let table = PROCESS_TABLE.lock();
-    for slot in table.slots.iter() {
-        let Some(object) = slot.object.as_deref() else {
-            continue;
-        };
-        if object.process_id == process_id {
-            return object.parent_process_id;
-        }
-    }
-    None
+    let index = table.find_pid_slot(process_id, |_| true)?;
+    table.slots[index].object.as_deref()?.parent_process_id
 }
 
 /// One live process in a memory census.
@@ -1008,11 +1096,7 @@ pub(in crate::multitask) fn test_exec_cancellation(
 
 pub fn note_process_exit_status(process_id: u64, status: i32) -> Option<()> {
     let mut table = PROCESS_TABLE.lock();
-    let index = table.slots.iter().position(|slot| {
-        slot.object
-            .as_deref()
-            .is_some_and(|object| object.process_id == process_id)
-    })?;
+    let index = table.find_pid_slot(process_id, |_| true)?;
     let object = table.slots[index].object.as_deref_mut()?;
     object.exit_status = Some(status);
     object.child_state_change = None;
@@ -1078,11 +1162,7 @@ fn mark_process_exiting_inner(process_id: u64, expected: Option<ProcessHandle>) 
         }
         handle.index()
     } else {
-        table.slots.iter().position(|slot| {
-            slot.object
-                .as_deref()
-                .is_some_and(|object| object.process_id == process_id)
-        })?
+        table.find_pid_slot(process_id, |_| true)?
     };
     let handle = ProcessHandle::new(index, table.slots[index].generation);
     let object = table.slots[index].object.as_deref_mut()?;
@@ -1121,11 +1201,7 @@ fn mark_process_exiting_inner(process_id: u64, expected: Option<ProcessHandle>) 
 /// service-side open-description teardown under concurrent exit_group calls.
 pub fn mark_process_exiting_once(process_id: u64) -> Option<bool> {
     let mut table = PROCESS_TABLE.lock();
-    let index = table.slots.iter().position(|slot| {
-        slot.object
-            .as_deref()
-            .is_some_and(|object| object.process_id == process_id)
-    })?;
+    let index = table.find_pid_slot(process_id, |_| true)?;
     let handle = ProcessHandle::new(index, table.slots[index].generation);
     let object = table.slots[index].object.as_deref_mut()?;
     if object.exec_in_progress {
@@ -1171,22 +1247,14 @@ pub fn is_process_exiting(process_id: u64) -> Option<bool> {
         return Some(false);
     }
     let table = PROCESS_TABLE.lock();
-    table
-        .slots
-        .iter()
-        .filter_map(|slot| slot.object.as_deref())
-        .find(|object| object.process_id == process_id)
-        .map(|object| object.exiting)
+    let index = table.find_pid_slot(process_id, |_| true)?;
+    table.slots[index].object.as_deref().map(|object| object.exiting)
 }
 
 pub fn thread_count_by_pid(process_id: u64) -> Option<usize> {
     let table = PROCESS_TABLE.lock();
-    table
-        .slots
-        .iter()
-        .filter_map(|slot| slot.object.as_deref())
-        .find(|object| object.process_id == process_id)
-        .map(|object| object.thread_count)
+    let index = table.find_pid_slot(process_id, |_| true)?;
+    table.slots[index].object.as_deref().map(|object| object.thread_count)
 }
 
 pub fn wait_for_child(
@@ -1314,7 +1382,7 @@ pub fn reap_exited_processes() -> usize {
                 let identity = slot.object.as_deref().map(|object| {
                     (handle, object.mm_generation, object.lifecycle_transaction_id)
                 });
-                let Some(object) = reclaim_slot(index, slot) else {
+                let Some(object) = reclaim_slot(&mut table, index) else {
                     continue;
                 };
                 markers[reclaimed_len] = identity;
@@ -1331,12 +1399,12 @@ pub fn reap_exited_processes() -> usize {
                 let index = scan_next;
                 scan_next += 1;
                 scanned += 1;
-                let slot = &mut table.slots[index];
+                let slot = &table.slots[index];
                 let handle = ProcessHandle::new(index, slot.generation);
                 let identity = slot.object.as_deref().map(|object| {
                     (handle, object.mm_generation, object.lifecycle_transaction_id)
                 });
-                let Some(object) = reclaim_slot(index, slot) else {
+                let Some(object) = reclaim_slot(&mut table, index) else {
                     continue;
                 };
                 markers[reclaimed_len] = identity;
@@ -1463,6 +1531,7 @@ pub(crate) mod tests {
     use crate::user::process_state::UserProcessState;
 
     mod identity_tests;
+    mod pid_index_tests;
 
     mod census_tests {
         use super::super::{MemoryCensusEntry, insert_largest};

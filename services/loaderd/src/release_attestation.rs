@@ -19,7 +19,7 @@ use rustos_user_abi::performance::IPC_BOOT_CONTROL_HARD_LIMIT_MS;
 const SYS_GETPID:u64=39;
 const SYS_GETTID:u64=186;
 #[derive(Clone,Copy,Debug,Eq,PartialEq)]
-pub(super) enum AdmissionError{
+pub enum AdmissionError{
     Image(rustos_release_verifier::Error),
     Invalid,Policy(i32),Transport(i32),WrongReply,
 }
@@ -71,22 +71,22 @@ fn call_rootd_stage(approval:Approval)->Result<(),AdmissionError>{
     if reply.value1!=1{return Err(AdmissionError::WrongReply)}
     Ok(())
 }
-fn bundle_error(error:loaderd::release_bundle::BundleError)->AdmissionError{
+fn bundle_error(error:crate::release_bundle::BundleError)->AdmissionError{
     match error{
-        loaderd::release_bundle::BundleError::Invalid=>AdmissionError::Invalid,
-        loaderd::release_bundle::BundleError::Image(error)=>AdmissionError::Image(error),
+        crate::release_bundle::BundleError::Invalid=>AdmissionError::Invalid,
+        crate::release_bundle::BundleError::Image(error)=>AdmissionError::Image(error),
     }
 }
 /// Verify a bundle against the sealed keyring and stage its digest with rootd.
 /// This is the request path behind `COMMERCIAL_MAX_LOADERD_OP_STAGE_RELEASE`;
 /// the caller must already have read the bytes from a sealed read-only file.
-pub(super) fn stage_release_bundle(
+pub fn stage_release_bundle(
     bytes:&[u8],service:u64,durable_floor:u64,release_epoch:u64,
     trial_deadline_ns:u64,
 )->Result<Verified,AdmissionError>{
-    let keys=super::trust_anchor::sealed_keys().map_err(AdmissionError::Image)?;
+    let keys=crate::trust_anchor::sealed_keys().map_err(AdmissionError::Image)?;
     let ring=KeyRing::new(&keys).map_err(AdmissionError::Image)?;
-    let verified=loaderd::release_bundle::admit_bundle(&ring,bytes,service,durable_floor)
+    let verified=crate::release_bundle::admit_bundle(&ring,bytes,service,durable_floor)
         .map_err(bundle_error)?;
     let approval=stage_approval(verified,release_epoch,trial_deadline_ns)?;
     call_rootd_stage(approval)?;
@@ -95,9 +95,10 @@ pub(super) fn stage_release_bundle(
 #[cfg(test)]
 mod tests{
     use super::*;
-    use loaderd::release_bundle::{BUNDLE_HEADER_BYTES,BUNDLE_MAGIC};
+    use alloc::vec::Vec;
+    use crate::release_bundle::{BUNDLE_HEADER_BYTES,BUNDLE_MAGIC};
     fn zero_bundle()->Vec<u8>{
-        let mut bytes=vec![0u8;BUNDLE_HEADER_BYTES+rustos_release_verifier::ENVELOPE_BYTES+2];
+        let mut bytes=alloc::vec![0u8;BUNDLE_HEADER_BYTES+rustos_release_verifier::ENVELOPE_BYTES+2];
         bytes[..8].copy_from_slice(&BUNDLE_MAGIC);
         bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
         bytes[12..16].copy_from_slice(&1u32.to_le_bytes());

@@ -1589,6 +1589,7 @@ fn try_fast_ipc_call_bytes<const N: usize>(
         {
             // The server is executing the request; nobody can wait for its
             // answer, so cancel it exactly as the slow path does.
+            bind_or_cancel_receiver_owned_reservation(reply, task_id, receiver_task_id);
             cancel_reply_wait(reply, task_id, ReplyCancelReason::InvalidArm);
         }
         return Err(LINUX_EINVAL);
@@ -1603,6 +1604,7 @@ fn try_fast_ipc_call_bytes<const N: usize>(
         }
         // A receiver already took the request: falling back to the slow path
         // would send it a second time. Wait for this request's response.
+        bind_or_cancel_receiver_owned_reservation(reply, task_id, receiver_task_id);
         false
     } else {
         fast_mark = charge_phase(IpcCallPhase::FastArm, fast_mark);
@@ -1646,6 +1648,7 @@ fn try_fast_ipc_call_bytes<const N: usize>(
             // The receiver took the request while the handoff was refused
             // (it was between its receive arm and block commit). Its reply is
             // coming: wait for it instead of resending via the slow path.
+            bind_or_cancel_receiver_owned_reservation(reply, task_id, receiver_task_id);
         }
         committed
     };
@@ -1881,6 +1884,22 @@ enum FastRollback {
     ReceiverOwnsRequest,
 }
 
+/// A receiver took a fast frame before the sender's handoff committed, so no
+/// trap or receive path will bind the caller's `reply == 0` reservation. Bind it
+/// to the receiver that now executes the request; when that is no longer
+/// possible (the reply already completed or was cancelled) drop the
+/// reservation. Either way nothing may outlive the call: `find_reservation`
+/// refuses every later call from this task while one is left behind.
+fn bind_or_cancel_receiver_owned_reservation(
+    reply: KernelReplyHandle,
+    caller_task_id: u64,
+    receiver_task_id: u64,
+) {
+    if !multitask::bind_reserved_ipc_priority(reply.raw(), caller_task_id, receiver_task_id) {
+        let _ = multitask::cancel_ipc_priority_reservation(caller_task_id);
+    }
+}
+
 fn rollback_fast_call(
     endpoint: KernelEndpointHandle,
     reply: KernelReplyHandle,
@@ -1903,7 +1922,12 @@ fn rollback_fast_call(
         {
             return Ok(FastRollback::ReceiverOwnsRequest);
         }
-        Err(error) => return Err(ipc_error_to_linux_errno(error)),
+        Err(error) => {
+            // No reply edge exists yet, so the unbound reservation would
+            // otherwise outlive the call and refuse this task's next one.
+            let _ = multitask::cancel_ipc_priority_reservation(caller_task_id);
+            return Err(ipc_error_to_linux_errno(error));
+        }
     };
     if let Some(custody) = rollback.scheduling_context {
         assert!(

@@ -182,9 +182,25 @@ pub fn enabled() -> bool {
 
 /// Copies `dst.len()` bytes from user address `src`. `false` means a fault or a
 /// disabled direct path; `dst` may be partly written.
+/// Defense in depth behind the caller's own admission: a direct copy runs
+/// with supervisor rights, so a range that is not wholly inside the canonical
+/// user half (or wraps) must never reach `rep movsb`.
+#[cfg(any(rustos_boot_image, test))]
+#[inline]
+const fn user_range_is_canonical(addr: u64, len: usize) -> bool {
+    const USER_HALF_END: u64 = 1 << 47;
+    match addr.checked_add(len as u64) {
+        Some(end) => end <= USER_HALF_END,
+        None => false,
+    }
+}
+
 #[cfg(rustos_boot_image)]
 #[inline]
 pub fn copy_from_user(dst: &mut [u8], src: u64) -> bool {
+    if !user_range_is_canonical(src, dst.len()) {
+        return false;
+    }
     // SAFETY: `dst` is a live kernel buffer; a fault in the read is recovered by
     // the fixup table and reported as failure.
     unsafe { rustos_user_copy_from(dst.as_mut_ptr(), src as *const u8, dst.len()) == 0 }
@@ -201,6 +217,9 @@ pub fn copy_from_user(_dst: &mut [u8], _src: u64) -> bool {
 #[cfg(rustos_boot_image)]
 #[inline]
 pub fn copy_to_user(dst: u64, src: &[u8]) -> bool {
+    if !user_range_is_canonical(dst, src.len()) {
+        return false;
+    }
     // SAFETY: `src` is a live kernel buffer; a fault in the write is recovered.
     unsafe { rustos_user_copy_to(dst as *mut u8, src.as_ptr(), src.len()) == 0 }
 }
@@ -217,6 +236,9 @@ pub fn copy_to_user(_dst: u64, _src: &[u8]) -> bool {
 pub fn probe_write(ptr: u64, len: usize) -> bool {
     if len == 0 {
         return true;
+    }
+    if !user_range_is_canonical(ptr, len) {
+        return false;
     }
     let last = ptr + len as u64 - 1;
     let mut page = ptr;
@@ -238,4 +260,18 @@ pub fn probe_write(ptr: u64, len: usize) -> bool {
 #[inline]
 pub fn probe_write(_ptr: u64, _len: usize) -> bool {
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::user_range_is_canonical;
+
+    #[test]
+    fn direct_copy_ranges_must_stay_in_the_canonical_user_half() {
+        assert!(user_range_is_canonical(0x1000, 0x1000));
+        assert!(user_range_is_canonical((1 << 47) - 1, 1));
+        assert!(!user_range_is_canonical((1 << 47) - 1, 2));
+        assert!(!user_range_is_canonical(0xffff_8000_0000_0000, 1));
+        assert!(!user_range_is_canonical(u64::MAX, 2));
+    }
 }

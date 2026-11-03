@@ -127,6 +127,8 @@ fn fw_cfg_signature_is_qemu() -> bool {
 
 fn fw_cfg_select(selector: u16) {
     let mut port: Port<u16> = Port::new(FW_CFG_SELECTOR_PORT);
+    // SAFETY: 0x510 is QEMU's fw_cfg selector port, reached only after the
+    // fw_cfg signature probe; a 16-bit write has no memory effect.
     unsafe {
         port.write(selector);
     }
@@ -134,6 +136,8 @@ fn fw_cfg_select(selector: u16) {
 
 fn fw_cfg_read_u8() -> u8 {
     let mut port: Port<u8> = Port::new(FW_CFG_DATA_PORT);
+    // SAFETY: 0x511 is QEMU's fw_cfg data port; reading advances only the
+    // device's own cursor and has no memory effect.
     unsafe { port.read() }
 }
 

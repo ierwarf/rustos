@@ -311,7 +311,13 @@ fn publish_inner(
         pin_owner::pin(reservation.handle).expect("new root process pin admission failed")
     });
     slot.root_spawn = None;
-    publish_slot_visibility(reservation.handle.index(), slot);
+    // Index the pid only after the object is stored; still under the table
+    // lock, so no lookup can observe the object without its index entry.
+    table.pid_index_link(reservation.handle.index(), process_id);
+    publish_slot_visibility(
+        reservation.handle.index(),
+        &table.slots[reservation.handle.index()],
+    );
     drop(table);
     record_lifecycle_marker(
         "lifecycle-spawn-publish",

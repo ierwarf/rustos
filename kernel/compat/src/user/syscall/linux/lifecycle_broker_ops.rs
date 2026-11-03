@@ -126,7 +126,8 @@ pub(super) fn syscall_linux_rustos_lifecycle_drain_broker(args_ptr: u64) -> u64 
         ipc_ops::current_process_has_service_capability(ServiceCapability::RootSupervisor);
     let is_linux_syscall_policy =
         ipc_ops::current_process_has_service_capability(ServiceCapability::LinuxSyscallPolicy);
-    if !is_process_policy && !is_root_supervisor && !is_linux_syscall_policy {
+    let is_vfs_policy = ipc_ops::current_process_has_service_capability(ServiceCapability::VfsPolicy);
+    if !is_process_policy && !is_root_supervisor && !is_linux_syscall_policy && !is_vfs_policy {
         return linux_errno(LINUX_EPERM);
     }
     let args = match usermem::read_current_user_struct::<LifecycleDrainBrokerArgs>(args_ptr) {
@@ -140,8 +141,10 @@ pub(super) fn syscall_linux_rustos_lifecycle_drain_broker(args_ptr: u64) -> u64 
         offload_ops::LifecycleConsumer::RootSupervisor
     } else if is_linux_syscall_policy {
         offload_ops::LifecycleConsumer::LinuxSyscallPolicy
-    } else {
+    } else if is_process_policy {
         offload_ops::LifecycleConsumer::ProcessPolicy
+    } else {
+        offload_ops::LifecycleConsumer::VfsPolicy
     };
     match offload_ops::drain_lifecycle_events(&args, consumer) {
         Ok(count) => count,

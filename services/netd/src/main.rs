@@ -42,10 +42,10 @@ use rustos_user_abi::syscall::{
     NET_BROKER_PACKET_STATUS_ACTIVE, NET_BROKER_PACKET_STATUS_AWAITING_AUTHENTICATED_CONTROL,
     NET_BROKER_PACKET_STATUS_UNAVAILABLE, NET_BROKER_SOCKET_PUBLICATION_VERSION,
     NETD_DVM_SESSION_GRANT, NETD_DVM_SESSION_REVOKE, NETD_IPC_ABI_VERSION, NETD_IPC_OP_DVM_SESSION,
-    NETD_IPC_OP_REF_ACK, NETD_IPC_REQUEST_HEADER_SIZE, NETD_IPC_RESPONSE_FLAG_LATENCY_HANDOFF,
+    NETD_IPC_OP_POLL_BATCH, NETD_IPC_OP_REF_ACK, NETD_IPC_REQUEST_HEADER_SIZE, NETD_IPC_RESPONSE_FLAG_LATENCY_HANDOFF,
     NETD_IPC_RESPONSE_HEADER_SIZE, NETD_POLL_MODE_QUERY, NETD_POLL_MODE_WAIT,
-    NETD_RECVMSG_PAYLOAD_HEADER_SIZE, NETD_SENDMSG_PAYLOAD_HEADER_SIZE,
-    NetBrokerPrepareSocketPublication, NetdIpcRequest, NetdIpcResponse, RustosNetBrokerArgs,
+    NETD_POLL_BATCH_MAX, NETD_RECVMSG_PAYLOAD_HEADER_SIZE, NETD_SENDMSG_PAYLOAD_HEADER_SIZE,
+    NetBrokerPrepareSocketPublication, NetdIpcRequest, NetdIpcResponse, NetdPollQueryWire, NetdPollResultWire, RustosNetBrokerArgs,
     SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_RECV_WITH_SENDER,
     SYS_RUSTOS_IPC_RECV_WITH_SENDER_BOUNDED, SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_NET_BROKER,
     SYSCALL_OFFLOAD_OP_LINUX_ACCEPT, SYSCALL_OFFLOAD_OP_LINUX_BIND, SYSCALL_OFFLOAD_OP_LINUX_CLOSE,
@@ -390,7 +390,7 @@ fn request_deadline_remaining_ns(request: &NetdIpcRequest) -> Result<u64, i32> {
 /// queued operation a later deadline than the caller originally supplied.
 fn request_deadline_class_cap(request: &NetdIpcRequest) -> Duration {
     match request.op {
-        SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET => {
+        SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET | NETD_IPC_OP_POLL_BATCH => {
             Duration::from_millis(rustos_user_abi::performance::IPC_READINESS_QUERY_HARD_LIMIT_MS)
         }
         NETD_IPC_OP_DVM_SESSION
@@ -956,6 +956,7 @@ fn dispatch_request(
             handle_recv(request, response)
         }
         SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET => handle_poll_socket(request, response),
+        NETD_IPC_OP_POLL_BATCH => handle_poll_batch(request, response),
         SYSCALL_OFFLOAD_OP_LINUX_GETSOCKNAME => handle_getsockname(request, response),
         SYSCALL_OFFLOAD_OP_LINUX_GETPEERNAME => handle_getpeername(request, response),
         SYSCALL_OFFLOAD_OP_LINUX_SETSOCKOPT => handle_setsockopt(request),
@@ -1201,6 +1202,18 @@ fn advance_readiness_generation(object_ids: &[u64]) {
             std::process::exit(134);
         })
         + 1;
+    {
+        // Record the per-socket generation before the broker publication so a
+        // poll that observes the new state can never carry an older value than
+        // the signal that follows. Only live sockets get an entry.
+        let mut state = lock_net_state();
+        for object_id in object_ids.iter().copied() {
+            if state.socket_exists(object_id) {
+                let entry = state.readiness_generations.entry(object_id).or_insert(1);
+                *entry = (*entry).max(generation);
+            }
+        }
+    }
     for object_id in object_ids.iter().copied() {
         if object_id != 0 {
             publish_readiness_generation(object_id, generation);
@@ -1279,6 +1292,7 @@ fn validate_request(received: usize, request: &NetdIpcRequest) -> Result<(), i32
         | SYSCALL_OFFLOAD_OP_LINUX_RECVMSG
         | SYSCALL_OFFLOAD_OP_LINUX_RECVFROM
         | SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET
+        | NETD_IPC_OP_POLL_BATCH
         | NETD_IPC_OP_DVM_SESSION
         | NETD_IPC_OP_REF_ACK => Ok(()),
         _ => Err(libc::EINVAL),
@@ -1356,6 +1370,8 @@ struct InetReadiness {
     can_recv: bool,
     can_send: bool,
     open: bool,
+    /// The peer's FIN was received: reads return EOF and `POLLRDHUP` is set.
+    rx_closed: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1386,6 +1402,10 @@ struct NetState {
     inet_sockets: BTreeMap<u64, InetSocket>,
     bindings: BTreeMap<String, u64>,
     inet: Option<InetStack>,
+    /// Per-socket readiness generation: the newest value published for that
+    /// socket. Entries exist only for live sockets, so the map is bounded by
+    /// the socket tables; a missing entry reads as generation 1.
+    readiness_generations: BTreeMap<u64, u64>,
 }
 
 impl NetState {
@@ -1395,7 +1415,16 @@ impl NetState {
             inet_sockets: BTreeMap::new(),
             bindings: BTreeMap::new(),
             inet: None,
+            readiness_generations: BTreeMap::new(),
         }
+    }
+
+    fn socket_exists(&self, token: u64) -> bool {
+        self.sockets.contains_key(&token) || self.inet_sockets.contains_key(&token)
+    }
+
+    fn socket_readiness_generation(&self, token: u64) -> u64 {
+        self.readiness_generations.get(&token).copied().unwrap_or(1)
     }
 
     fn token_available(&self, token: u64) -> bool {
@@ -1423,6 +1452,7 @@ impl NetState {
                         can_recv: socket.can_recv(),
                         can_send: socket.can_send(),
                         open: socket.is_open(),
+                        rx_closed: tcp_receive_closed(socket),
                     },
                 )
             })
@@ -1879,6 +1909,7 @@ fn handle_close(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32
         let Some(socket) = state.inet_sockets.remove(&request.socket_token) else {
             return libc::EBADF;
         };
+        state.readiness_generations.remove(&request.socket_token);
         if let Some(stack) = state.inet.as_mut() {
             stack.remove(socket.tcp);
             stack.poll_budget(8);
@@ -1923,6 +1954,7 @@ fn retire_unix_socket(state: &mut NetState, token: u64)
         let Some(mut socket) = state.sockets.remove(&token) else {
             continue;
         };
+        state.readiness_generations.remove(&token);
         if let Some(path) = &socket.bound_path {
             if state.bindings.get(path).copied() == Some(token) {
                 state.bindings.remove(path);
@@ -2626,30 +2658,121 @@ fn handle_inet_recv(request: &NetdIpcRequest, response: &mut NetdIpcResponse) ->
     }
 }
 
-fn handle_inet_poll(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {
-    let requested = request.arg1 as u32;
-    let mut state = lock_net_state();
-    let Some(inet) = state.inet_sockets.get(&request.socket_token) else {
-        return libc::EBADF;
-    };
-    let tcp_handle = inet.tcp;
-    let stack = match state.inet_stack() {
-        Ok(stack) => stack,
-        Err(errno) => return errno,
-    };
-    stack.poll_budget(8);
+/// The peer's FIN has been received: reads return EOF, so the socket is both
+/// readable and `POLLRDHUP`.
+fn tcp_receive_closed(socket: &tcp::Socket) -> bool {
+    matches!(
+        socket.state(),
+        tcp::State::CloseWait | tcp::State::LastAck | tcp::State::Closing | tcp::State::TimeWait
+    )
+}
+
+/// Readiness of one AF_INET socket. The caller has already advanced the
+/// stack, so a batch pays for one `poll_budget` instead of one per socket.
+fn inet_socket_revents(state: &mut NetState, token: u64, requested: u32) -> Result<u32, i32> {
+    let tcp_handle = state.inet_sockets.get(&token).ok_or(libc::EBADF)?.tcp;
+    let stack = state.inet_stack()?;
     let socket = stack.sockets.get_mut::<tcp::Socket>(tcp_handle);
+    let rx_closed = tcp_receive_closed(socket);
     let mut revents = 0_u32;
-    if requested & linux_abi::POLLIN as u32 != 0 && socket.can_recv() {
+    if requested & linux_abi::POLLIN as u32 != 0 && (socket.can_recv() || rx_closed) {
         revents |= linux_abi::POLLIN as u32;
     }
     if requested & linux_abi::POLLOUT as u32 != 0 && socket.can_send() {
         revents |= linux_abi::POLLOUT as u32;
     }
+    if requested & linux_abi::POLLRDHUP as u32 != 0 && rx_closed {
+        revents |= linux_abi::POLLRDHUP as u32;
+    }
     if !socket.is_open() {
         revents |= linux_abi::POLLHUP as u32;
     }
-    response.value = revents as u64;
+    Ok(revents)
+}
+
+fn handle_inet_poll(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {
+    let mut state = lock_net_state();
+    if !state.inet_sockets.contains_key(&request.socket_token) {
+        return libc::EBADF;
+    }
+    match state.inet_stack() {
+        Ok(stack) => {
+            stack.poll_budget(8);
+        }
+        Err(errno) => return errno,
+    }
+    match inet_socket_revents(&mut state, request.socket_token, request.arg1 as u32) {
+        Ok(revents) => {
+            response.value = revents as u64;
+            0
+        }
+        Err(errno) => errno,
+    }
+}
+
+/// `NETD_IPC_OP_POLL_BATCH`: evaluate every requested socket under one state
+/// lock acquisition and one stack advance. A socket that cannot be evaluated
+/// reports its own errno; it never fails its neighbours.
+fn handle_poll_batch(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {
+    const QUERY: usize = size_of::<NetdPollQueryWire>();
+    const RESULT: usize = size_of::<NetdPollResultWire>();
+    let len = request.payload_len as usize;
+    let count = len / QUERY;
+    if len == 0
+        || len % QUERY != 0
+        || count > NETD_POLL_BATCH_MAX
+        || count * RESULT > response.payload.len()
+    {
+        return libc::EINVAL;
+    }
+    let mut queries = Vec::with_capacity(count);
+    for index in 0..count {
+        let offset = index * QUERY;
+        let bytes = &request.payload[offset..offset + QUERY];
+        let query = NetdPollQueryWire {
+            socket_token: u64::from_le_bytes(bytes[0..8].try_into().unwrap()),
+            events: u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+            reserved0: u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
+        };
+        if query.socket_token == 0 || query.reserved0 != 0 {
+            return libc::EINVAL;
+        }
+        queries.push(query);
+    }
+    let mut state = lock_net_state();
+    if queries
+        .iter()
+        .any(|query| state.inet_sockets.contains_key(&query.socket_token))
+    {
+        if let Ok(stack) = state.inet_stack() {
+            stack.poll_budget(8);
+        }
+    }
+    for (index, query) in queries.iter().enumerate() {
+        let outcome = if state.inet_sockets.contains_key(&query.socket_token) {
+            inet_socket_revents(&mut state, query.socket_token, query.events)
+        } else {
+            unix_socket_revents(&state, query.socket_token, query.events)
+        };
+        let result = match outcome {
+            Ok(revents) => NetdPollResultWire {
+                generation: state.socket_readiness_generation(query.socket_token),
+                revents,
+                status: 0,
+            },
+            Err(errno) => NetdPollResultWire {
+                generation: 0,
+                revents: 0,
+                status: errno,
+            },
+        };
+        let offset = index * RESULT;
+        response.payload[offset..offset + 8].copy_from_slice(&result.generation.to_le_bytes());
+        response.payload[offset + 8..offset + 12].copy_from_slice(&result.revents.to_le_bytes());
+        response.payload[offset + 12..offset + 16].copy_from_slice(&result.status.to_le_bytes());
+    }
+    response.value = count as u64;
+    response.payload_len = (count * RESULT) as u32;
     0
 }
 
@@ -2667,11 +2790,9 @@ fn handle_poll_socket(request: &NetdIpcRequest, response: &mut NetdIpcResponse) 
         }
     };
     if status == 0 {
-        // ORDERING: readiness mutation produces an increment before publishing
-        // the object generation; this successful-poll consumer acquires it so
-        // its response carries a generation no older than that publication.
-        response.payload[..8]
-            .copy_from_slice(&READINESS_GENERATION.load(Ordering::Acquire).to_le_bytes());
+        let generation =
+            lock_net_state().socket_readiness_generation(request.socket_token);
+        response.payload[..8].copy_from_slice(&generation.to_le_bytes());
         response.payload_len = 8;
     }
     status
@@ -2714,6 +2835,11 @@ fn unix_socket_revents(state: &NetState, token: u64, requested: u32) -> Result<u
                 if writable {
                     revents |= linux_abi::POLLOUT as u32;
                 }
+            }
+            if requested & linux_abi::POLLRDHUP as u32 != 0
+                && (connected.peer_write_closed || connected.peer_closed)
+            {
+                revents |= linux_abi::POLLRDHUP as u32;
             }
             if connected.peer_closed {
                 revents |= linux_abi::POLLHUP as u32;
