@@ -11,7 +11,7 @@ Concrete owners and source anchors:
     services/inputd/src/dvm_protocol.rs
     services/inputd/src/main.rs
   * exact service-owned epoch admission and revocation:
-    services/netd/src/main.rs
+    services/netd/src/dispatch.rs
   * capability-gated ivshmem transport lease:
     kernel/io-manager/src/io/dvm_network.rs
 

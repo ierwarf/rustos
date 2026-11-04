@@ -172,6 +172,8 @@ for service in inputd storaged devmgrd netd; do
     source="services/$service/src/main.rs"
     if [[ "$service" == inputd ]]; then
         source="services/inputd/src/service_loop.rs"
+    elif [[ "$service" == netd ]]; then
+        source="services/netd/src/service_loop.rs"
     fi
     rg -Fq 'rustos_svc_runtime::ipc::register_service_endpoint' "$source" || {
         echo "$service does not use the single-attempt shared registration path" >&2
@@ -496,7 +498,7 @@ rg -Fq 'pub struct ReplyFailureDiagnostics' libs/rustos-svc-runtime/src/ipc.rs |
     exit 1
 }
 for service_group in \
-    'services/netd/src/main.rs' \
+    'services/netd/src/main.rs services/netd/src/service_loop.rs' \
     'services/inputd/src/main.rs services/inputd/src/service_loop.rs' \
     'services/devmgrd/src/main.rs'; do
     read -r -a service_sources <<<"$service_group"
@@ -558,7 +560,7 @@ rg -Fq 'for (_, pending, _) in &in_flight[index + 1..]' \
 }
 
 for input_wake_source in \
-    libs/driver-domain-protocol/src/lib.rs \
+    libs/driver-domain-protocol/src/input.rs \
     libs/driver-domain-host/src/lib.rs \
     kernel/io-manager/src/input/dvm_ring.rs; do
     rg -Fq 'DVM_INPUT_RING_CONSUMER_WAKE_GENERATION_OFFSET' "$input_wake_source" || {

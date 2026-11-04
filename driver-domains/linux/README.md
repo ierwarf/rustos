@@ -26,6 +26,16 @@ requires five fresh authenticated samples of direct zero-copy page flips,
 nominal-60-Hz throughput, and bounded page-flip/atomic-commit latency. The
 current active boot GPU cannot be used to collect that evidence safely.
 
+GPU render budget: each submission carries `budget_us` (at most 50 ms,
+`DVM_GPU_RENDER_MAX_BUDGET_US`), measured on the DVM's `CLOCK_MONOTONIC`, so a
+descheduled DVM vCPU on a loaded host counts against it. The first
+`DVM_GPU_COLD_SUBMIT_COUNT` (2) submissions of a context epoch (shader
+compile, cold host virgl state) get `DVM_GPU_COLD_RENDER_BUDGET_US` (500 ms).
+`dvm_gpu_effective_budget_us` (protocol crate) and
+`rustos-dvm-gpu-runtime.c` (`RUSTOS_GPU_COLD_*`) must stay in sync. A miss
+still takes the compositor offline; the relay re-primes after
+`DISPLAY_RETRY_SECONDS`.
+
 The pinned inputs are in `sources.lock`:
 
 - Buildroot 2026.05

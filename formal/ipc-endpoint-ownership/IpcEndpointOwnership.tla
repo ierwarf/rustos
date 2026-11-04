@@ -10,7 +10,7 @@ Concrete owners:
   * kernel/compat/src/user/syscall/linux/net_broker_ops.rs
   * kernel/compat/src/user/syscall/linux/service_ops/vfs_socket.rs
   * kernel/ps/src/user/handles/table.rs
-  * services/netd/src/main.rs
+  * services/netd/src/service_loop.rs
 
 An endpoint created by a user process may be served by a worker in that same
 process. A queued reply capability is bound to the owning process at enqueue

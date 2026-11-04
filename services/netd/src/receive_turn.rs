@@ -1,5 +1,13 @@
 //! One dequeued request's validation, admission and terminal reply custody.
 //!
+//! - **Owner:** `netd` owns admission of every dequeued request.
+//! - **Boundary:** Frames, sender identity (`sender_pid`/`sender_tid`) and the commercial envelope are untrusted.
+//! - **Lifecycle:** Receive, validate, check sender, clamp deadline once, dispatch, then reply or explicitly defer.
+//! - **Concurrency:** Runs on each fixed receiver thread; shared state is reached only through dispatch.
+//! - **Failure:** Negative receives own no reply; every nonnegative result reaches one terminal reply or deferral.
+//! - **Forbidden:** No dispatch before sender equality, no unvalidated frame, no silent drop of a received request.
+//! - **Evidence:** `receive_custody_tests`, `netd-deferred-reply-lifecycle`.
+//!
 //! Negative receive errors own no reply. Every nonnegative result, including
 //! an empty frame, reaches either one terminal reply or explicit deferral.
 
@@ -38,6 +46,8 @@ pub(super) fn service_received_request_with(
     };
     let request = turn.request;
     if received == size_of::<CommercialMaxProtocolRequest>() {
+        // SAFETY: the received length equals the commercial frame size and the
+        // module-level assertion proves the buffer holds and aligns it.
         let commercial = unsafe {
             &*((request as *const NetdIpcRequest).cast::<CommercialMaxProtocolRequest>())
         };
@@ -111,6 +121,11 @@ pub(super) fn dispatch_admitted_request(
                 response.reserved1 = NETD_IPC_RESPONSE_FLAG_LATENCY_HANDOFF;
             }
             status
+        }
+    } else if must_wait_for_packet_provider(request) {
+        match enqueue_provider_wait_request(*request, reply_cap) {
+            Ok(()) => return None,
+            Err(errno) => errno,
         }
     } else if is_blocking_request(request) {
         match enqueue_blocking_request(*request, reply_cap) {

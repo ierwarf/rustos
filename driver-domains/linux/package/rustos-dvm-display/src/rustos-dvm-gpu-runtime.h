@@ -8,6 +8,9 @@
 struct rustos_gpu_runtime;
 
 #define RUSTOS_GPU_PIPELINE_PRIME_BUDGET_US 500000U
+/* Mirrors DVM_GPU_COLD_SUBMIT_COUNT / DVM_GPU_COLD_RENDER_BUDGET_US. */
+#define RUSTOS_GPU_COLD_SUBMIT_COUNT 2U
+#define RUSTOS_GPU_COLD_RENDER_BUDGET_US 500000U
 
 struct rustos_gpu_damage {
     uint32_t x;

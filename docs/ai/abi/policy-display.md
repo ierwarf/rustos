@@ -35,7 +35,31 @@ timeout cannot bound service-side resource ownership. See the official
 Four fixed netd request receivers prevent an unrelated caller from serializing
 all local AF_UNIX work. Blocking INET connect/send/recv waits run in a separate
 fixed eight-worker pool that releases the shared network-state lock between
-polls; there is no thread-per-request fallback. All socket poll/epoll waits now
+polls (retry delay doubles 1/2/4 ms per attempt); there is no thread-per-request
+fallback. A `socket(AF_INET)` that finds the DVM control relay still
+`AwaitingAuthenticatedControl` (a wait of up to 5 s) never occupies a receiver:
+it is parked, with its reply capability, on a third dedicated two-worker pool
+(16 pending, separate from the blocking-I/O pool whose workers can be held for
+a whole bulk deadline). Active/unavailable providers answer inline. Netd
+sources are split by responsibility (`service_loop`, `dispatch`, `blocking`,
+`local_poll`, `ref_replay`, `socket_lifecycle`, `unix_stream`, `inet_tcp`,
+`inet_stack`, `poll`, `socket_info`, `packet_provider`, `readiness`); shared
+state types live in `main.rs`.
+
+Deferred AF_UNIX poll waiters are serviced by serialized passes: a worker that
+commits a state change and finds a pass running records a rerun request that
+the running pass honours, so no commit can be missed by an in-flight pass that
+already took the waiter queue. Table-wide ceilings (8192 AF_UNIX, 1024 INET
+sockets, `ENFILE`) bound netd's shared heap in addition to per-Job billing.
+Dup/close replay results are reclaimed only when the 4096-entry log is full and
+the completed result is older than 60 s (far above the 5 s caller lease); a
+never-acknowledged result can therefore no longer exhaust the log and turn every
+later reference mutation into `ENOSPC`. A kernel-rejected reply (`EINVAL` from a
+length-checked response) means the caller abandoned the call; it is counted
+separately from real reply faults and the operation's effect is not rolled back.
+The full INET readiness sweep is requested when a poll turn changed socket
+state or captured an ICMP error, and otherwise at most every 20 ms to find
+timer-only smoltcp transitions, instead of after every poll turn. All socket poll/epoll waits now
 query netd readiness generation (one `NETD_IPC_OP_POLL_BATCH` exchange per scan,
 per-socket generations), register the shared bounded wait token, and
 re-query before sleeping and after wake. Because the DVM packet ring currently

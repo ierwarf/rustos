@@ -1068,6 +1068,12 @@ int rustos_gpu_runtime_render_batch(struct rustos_gpu_runtime *runtime,
     frame->generation = generation;
     frame->sequence = sequence;
     frame->source_slot = binding_slot;
+    /* Cold-start allowance; must match dvm_gpu_effective_budget_us() in
+     * libs/driver-domain-protocol. Applies to every budget-bound wait below
+     * and to the render deadline enforced by the relay. */
+    if (header.submit_value <= RUSTOS_GPU_COLD_SUBMIT_COUNT &&
+        header.budget_us < RUSTOS_GPU_COLD_RENDER_BUDGET_US)
+        header.budget_us = RUSTOS_GPU_COLD_RENDER_BUDGET_US;
     frame->budget_us = header.budget_us;
     runtime->stage = runtime->dmabuf_sources_ready
         ? "gpu-batch-dmabuf-acquire"

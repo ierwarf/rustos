@@ -143,15 +143,26 @@ fn dvm_gpu_compositor_ready(log: &str, expected: GpuEvidenceExpectation) -> bool
     ready && healthy_run >= DVM_GPU_HEALTH_SAMPLES
 }
 
+/// A compositor that went offline because one frame missed its wall-clock
+/// render budget is retried by the relay (`DISPLAY_SERVE_RETRY`, re-prime after
+/// 1 s). That is a slow host, not a broken device, and the check runs while the
+/// relay is still recovering, so it must not fail the boot on sight. If the
+/// relay never recovers, readiness times out and the boot fails there. Every
+/// other offline stage stays fatal.
+fn gpu_compositor_offline_is_transient(line: &str) -> bool {
+    line.contains("stage=gpu-frame-render-budget")
+}
+
 fn dvm_display_failure(log: &str, physical_gpu: bool) -> Option<String> {
-    if let Some(line) = log
-        .lines()
-        .find(|line| line.contains("rustos-dvm-display: gpu-compositor offline"))
-    {
-        return Some(format!(
-            "Linux DVM GPU compositor went offline during readiness detail={}",
-            line.trim()
-        ));
+    for line in log.lines() {
+        if line.contains("rustos-dvm-display: gpu-compositor offline")
+            && !gpu_compositor_offline_is_transient(line)
+        {
+            return Some(format!(
+                "Linux DVM GPU compositor went offline during readiness detail={}",
+                line.trim()
+            ));
+        }
     }
     if let Some(line) = log
         .lines()

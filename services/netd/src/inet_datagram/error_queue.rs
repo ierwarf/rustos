@@ -419,6 +419,7 @@ mod tests {
             next_port: 49152,
             closing: Vec::new(),
             readiness_dirty: false,
+            last_timer_sweep: StdInstant::now(),
         };
         let mut socket = super::super::tests::staged_socket(false);
         socket.transport = add_socket(&mut stack, linux_abi::SOCK_DGRAM, 17);

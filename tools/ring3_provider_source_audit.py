@@ -103,7 +103,7 @@ def review_rootd(findings: list[Finding]) -> None:
 
 def review_service(path: str, findings: list[Finding]) -> None:
     text = source(path)
-    if path.endswith("/netd/src/main.rs"):
+    if path.endswith("/netd/src/socket_lifecycle.rs"):
         sock = lexical_block(text, "fn handle_socket(")
         pair = lexical_block(text, "fn handle_socketpair(")
         close = lexical_block(text, "fn handle_close(")
@@ -163,7 +163,7 @@ def main() -> int:
         review_rootd(findings)
         review_runtime(findings)
         for file in (
-            "services/netd/src/main.rs",
+            "services/netd/src/socket_lifecycle.rs",
             "services/vfsd/src/state_storage.rs",
             "services/vfsd/src/state_files.rs",
             "services/vfsd/src/state_requests.rs",

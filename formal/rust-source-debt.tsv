@@ -227,7 +227,6 @@ services/vfsd/src/main.rs	33	2
 services/storaged/src/block.rs	1	0
 services/inputd/src/main.rs	10	2
 services/inputd/src/service_loop.rs	0	0
-services/netd/src/main.rs	9	11
 services/runtimed/src/spawn.rs	10	0
 services/runtimed/src/socket.rs	15	0
 services/uiserver/src/wayland.rs	13	6
@@ -244,3 +243,9 @@ libs/rustos-user-abi/src/pager/region_edit.rs	0	0
 services/pagerd/src/page_cache.rs	0	0
 services/pagerd/src/main.rs	4	0
 services/netd/src/readiness.rs	0	1
+services/netd/src/blocking.rs	0	0
+services/netd/src/deadline.rs	0	0
+services/netd/src/dispatch.rs	0	0
+services/netd/src/inet_stack.rs	0	0
+services/netd/src/local_poll.rs	0	0
+services/netd/src/receive_turn.rs	0	0

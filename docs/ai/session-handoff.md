@@ -1,5 +1,46 @@
 # Session Handoff — repository snapshot, 2026-10-31
 
+## uiserver / netd / DVM hardening via subagents 2026-11-05 (uncommitted)
+
+Verified on the combined tree: `cargo xtask check`, unit tests (uiserver 158,
+netd 83, driver-domain-protocol 22, driver-domain-host 40, kernel-io-manager dvm
+34, kernel-compat 272, xtask 248), `formal/verify-all.sh --profile pr` sealed,
+1-vCPU KVM 8/8 sequential and 20/20 in 4 pinned parallel instances (private
+mount namespaces + `taskset`; Linux DVM rebuilt with `cargo xtask build-dvm`),
+one 16-vCPU kvm-smoke pass.
+
+- **uiserver**: `wayland.rs` 3333 -> ~1000 lines (`wayland/` modules). Fixed:
+  compositor-unique `surface_id` (two clients with the same `wl_surface` id
+  collided on focus/close), per-client surface/object limits, compositor-wide
+  retained-pixel budget, atlas packs the focused window first and logs dropped
+  windows, watchdog budget during a Wayland socket call = netd lease + 2 s.
+  Open: the 2560x1440 desktop texture leaves only a 2688x1118 atlas strip (a
+  maximized window can never be placed; est. 400-800 lines + KVM); Wayland I/O
+  on its own thread (1500-2500 lines); one stacking list for consoles and
+  Wayland windows (600-1000); pointer hit-test ignores consoles; SIGBUS if a
+  client truncates its shm file (no `fstat` size check).
+- **netd**: `main.rs` 3895 -> ~630 lines (14 modules). Root cause of latency:
+  provider-gated `socket(AF_INET)` slept up to 5 s on one of 4 RPC workers; it
+  now has its own 2-worker pool. Fixed a lost-wakeup in deferred AF_UNIX polls,
+  ENOSPC after 4096 unacked dup/close replays, REF_ACK truncation, per-turn
+  `readiness_dirty` sweeps, socket-table ceilings. Open: a global queued-byte
+  budget across AF_UNIX sockets (~150-250 lines); rootd billing IPC inside
+  `socket`/`accept`/`close` can outlive the 16 ms kernel rail (kernel client
+  still gives `socket`/`accept` the 16 ms class; ~300 lines for a pool).
+- **DVM**: `driver-domain-protocol` lib.rs 4150 -> 31 lines (modules). The
+  render budget (50 ms wall clock, `DVM_GPU_RENDER_MAX_BUDGET_US`) is enforced
+  by the Linux relay; the first 2 submissions of an epoch now get 500 ms (C
+  relay + Rust timeline agree on `dvm_gpu_effective_budget_us`). The xtask
+  harness no longer fails a boot on a transient `gpu-frame-render-budget`
+  offline line (the relay retries after 1 s; a relay that never recovers still
+  fails at the readiness timeout). Open: `driver-domain-host/src/lib.rs`
+  (5500 lines) split needs formal retargeting (`run-source-conformance.sh`,
+  `contracts.toml`); full host ring/teardown audit not done.
+- Formal pins were retargeted for the protocol and netd splits (see git diff of
+  `formal/`); `proof-index.toml` now names `verification.rs` for the Kani harness.
+- Not verified: the cold-budget change removing the parallel-load DVM GPU
+  failures is supported by one 20/20 series only (previous 18/20, 19/20).
+
 ## 1-vCPU uiserver livelock + WayClick flush + window cascade 2026-11-04
 
 1-vCPU root cause (measured by QEMU-monitor RIP sampling + `ipc-service-exit-revoke`

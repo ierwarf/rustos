@@ -1066,10 +1066,40 @@ flows = ["scheduler-dispatch"]
 reason = "The service loop owns byte-only reply-receive phase handling and must terminate every dequeued caller exactly once."
 
 [[risk_surfaces]]
-path = "services/netd/src/main.rs"
+path = "services/netd/src/receive_turn.rs"
 severity = "critical"
-flows = ["dvm-network-ingress", "netd-deferred-reply-lifecycle", "waitset"]
-reason = "Netd owns packet admission, one-time absolute deadline tightening, exact deferred socket reply settlement, and stack-driven readiness mutation."
+flows = ["netd-deferred-reply-lifecycle"]
+reason = "Netd admission validates sender identity and terminates every dequeued request with exactly one reply or explicit deferral."
+
+[[risk_surfaces]]
+path = "services/netd/src/deadline.rs"
+severity = "critical"
+flows = ["netd-deferred-reply-lifecycle"]
+reason = "Netd tightens the caller's absolute deadline once at admission and never refreshes it for queued or retried work."
+
+[[risk_surfaces]]
+path = "services/netd/src/local_poll.rs"
+severity = "critical"
+flows = ["netd-deferred-reply-lifecycle"]
+reason = "Detached AF_UNIX poll waiters keep one global reservation and one terminal reply; serialized passes prevent lost wakeups."
+
+[[risk_surfaces]]
+path = "services/netd/src/blocking.rs"
+severity = "critical"
+flows = ["netd-deferred-reply-lifecycle"]
+reason = "Bounded worker pools own detached reply capabilities for blocking INET work and provider-gated socket creation."
+
+[[risk_surfaces]]
+path = "services/netd/src/dispatch.rs"
+severity = "critical"
+flows = ["dvm-network-ingress"]
+reason = "Netd request dispatch admits packet-derived and socket requests; each request is bounded by its caller deadline before it reaches a handler."
+
+[[risk_surfaces]]
+path = "services/netd/src/inet_stack.rs"
+severity = "critical"
+flows = ["waitset"]
+reason = "The shared smoltcp stack and packet-broker device drive packet admission and stack-driven readiness mutation."
 
 [[risk_surfaces]]
 path = "services/netd/src/readiness.rs"
@@ -1685,12 +1715,32 @@ models = [
 ]
 
 [[source_mappings]]
-path = "services/netd/src/main.rs"
-models = [
-    "ipc-transfer-authority/IpcTransferAuthority",
-    "netd-deferred-reply/NetdDeferredReply",
-    "userspace-wait-set/UserspaceWaitSet",
-]
+path = "services/netd/src/unix_stream.rs"
+models = ["ipc-transfer-authority/IpcTransferAuthority"]
+
+[[source_mappings]]
+path = "services/netd/src/receive_turn.rs"
+models = ["netd-deferred-reply/NetdDeferredReply"]
+
+[[source_mappings]]
+path = "services/netd/src/deadline.rs"
+models = ["netd-deferred-reply/NetdDeferredReply"]
+
+[[source_mappings]]
+path = "services/netd/src/local_poll.rs"
+models = ["netd-deferred-reply/NetdDeferredReply"]
+
+[[source_mappings]]
+path = "services/netd/src/blocking.rs"
+models = ["netd-deferred-reply/NetdDeferredReply"]
+
+[[source_mappings]]
+path = "services/netd/src/inet_stack.rs"
+models = ["userspace-wait-set/UserspaceWaitSet"]
+
+[[source_mappings]]
+path = "services/netd/src/poll.rs"
+models = ["userspace-wait-set/UserspaceWaitSet"]
 
 [[source_mappings]]
 path = "services/netd/src/readiness.rs"

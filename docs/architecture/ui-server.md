@@ -117,6 +117,49 @@ peered IOBuffer remains a useful commercial-OS reference for the object shape,
 not an ABI to copy verbatim:
 <https://fuchsia.dev/fuchsia-src/reference/kernel_objects/io_buffer>.
 
+### Wayland Hardening Contract
+
+- **Surface identity.** Window snapshots, focus, drag, move, minimize and close
+  are keyed by a compositor-unique `surface_id` allocated in
+  `WaylandState::create_surface_data`. A `wl_surface` protocol object id is
+  per-client, so two clients routinely own the same one; keying on it made the
+  second client's window unfocusable and let a retire clear the wrong client's
+  focus. Internal focus comparisons use `ObjectId` equality. `0` means "no
+  surface".
+- **Admission limits.** 64 surfaces and 64 clients compositor-wide, 16 surfaces
+  and 8 tracked `wl_output`/`wl_pointer`/`wl_keyboard` objects per client, and
+  4x`MAX_WAYLAND_BUFFER_PIXELS` retained surface pixels in total. Exceeding a
+  limit is a protocol error on the offending client only; one client cannot
+  starve the others of surfaces, seat devices or heap.
+- **Known gap.** The shm pool is mapped for the size the client declares. A
+  client that truncates the backing file after `create_pool` can fault the
+  compositor on the next read; the fix needs either a kernel-side guarantee
+  (sealing / fault isolation) or a SIGBUS-safe copy path and is not done here.
+- **GPU atlas capacity.** The desktop texture occupies 2560x1440 of the
+  2688x2560 atlas, leaving a 2688x1118 strip for windows, so a maximized
+  window cannot be placed. Windows are packed in reverse draw order (focused
+  first, then topmost) and appended in draw order, so a full atlas costs the
+  window furthest down the stack its texture. Dropped windows are logged
+  (bounded, once per change of the dropped set) as `gpu atlas ... full`.
+- **Stall budget.** Wayland socket calls on the UI thread are nonblocking but
+  netd gives byte-moving operations a 5 s lease. A UI phase blocked inside such
+  a call (`WAYLAND_STEP != none`) is judged against lease plus slack (7 s)
+  instead of the 3 s phase budget; every other phase keeps 3 s.
+- **Module layout.** `wayland.rs` owns constants, shared types,
+  `WaylandCompositor`, listener-socket binding, buffer-argument validation,
+  row conversion and `pointer_button`: `formal/zero-trust-subsystems.tsv` and
+  `formal/check-performance-contracts.sh` pin those tokens to this file.
+  `wayland/` holds `state` (surface table, snapshots, configure), `input` (hit
+  test, pointer focus, keyboard), `windows` (z-order, focus, retire,
+  move/minimize/maximize/close), `buffer`, and one dispatch file per protocol
+  group (`compositor`, `output`, `seat`, `shm`, `surface`, `xdg`).
+  `sys/input.rs` holds input reads and event translation. Unit tests live in
+  `*/tests.rs` beside their module. Further splits of `render.rs`,
+  `gpu_runtime.rs`, `sys.rs` and `app/runtime.rs` are blocked on moving the
+  formal anchors that name those files (`implementation-mutations.tsv`,
+  `check-performance-contracts.sh`, `run-source-conformance.sh`,
+  `trust-boundaries.tsv`).
+
 ### Console Hosting
 
 Console-hosted programs (the shell, the PE demos) get a console session
@@ -250,6 +293,18 @@ rootd의 인증된 epoll checkpoint를 복구하며, service object는 boot entr
 capability와 sender/dependency 검사를 함께 사용합니다. 남은 release gate는
 runtime crash injection과 NVIDIA host admission 때문에 실행하지 못한 live
 KVM workload이며, 이를 source/model 성공으로 대체해 기록하지 않습니다.
+
+### Wayland 보강 계약
+
+- `surface_id`는 compositor가 발급하는 고유 값이며 per-client인 `wl_surface`
+  protocol id를 쓰지 않습니다. focus 비교는 `ObjectId`로 합니다.
+- 한도: 전체 surface 64, client 64, client당 surface 16과 output/pointer/keyboard
+  8, 보존 surface pixel 총량 상한. 초과하면 해당 client만 protocol error입니다.
+- GPU atlas가 가득 차면 focused window를 먼저 packing하고 draw order는 유지하며,
+  빠진 window는 bounded log로 남깁니다. 최대화 window는 아직 atlas에 들어가지
+  않습니다(desktop texture 2560x1440 점유).
+- Wayland socket 호출 중 UI phase는 netd 5 s lease + 여유(7 s)로, 그 외 phase는
+  3 s로 watchdog이 판정합니다.
 
 ### Console hosting
 

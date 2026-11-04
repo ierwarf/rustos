@@ -50,6 +50,25 @@ const SLOW_RUNTIME_REFRESH_THRESHOLD: Duration = Duration::from_millis(100);
 const UI_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 const UI_WATCHDOG_CHECK_INTERVAL: Duration = Duration::from_millis(250);
 const UI_PHASE_PANIC_THRESHOLD_MS: u64 = 3_000;
+/// Longest a nonblocking netd stream `sendmsg`/`recvmsg` may legitimately take
+/// to return: the 5 s state-mutation lease the kernel grants byte-moving
+/// socket operations (`docs/ai/session-handoff.md`, "Stream deadline"). The
+/// Wayland protocol runs over such sockets on the UI thread, so a stall that
+/// the lease is designed to ride out must not trip the 3 s phase watchdog.
+const NETD_STREAM_LEASE_MS: u64 = 5_000;
+/// Slack on top of the lease for scheduling and the reply path.
+const NETD_STREAM_LEASE_SLACK_MS: u64 = 2_000;
+
+/// Stall budget for the current UI phase. A phase blocked inside a Wayland
+/// socket call is judged against that call's own bound; everything else keeps
+/// the strict budget.
+fn ui_phase_panic_threshold_ms(phase_id: usize, wayland_step: usize) -> u64 {
+    if phase_id == UI_PHASE_WAYLAND && wayland_step != WAYLAND_STEP_NONE {
+        NETD_STREAM_LEASE_MS + NETD_STREAM_LEASE_SLACK_MS
+    } else {
+        UI_PHASE_PANIC_THRESHOLD_MS
+    }
+}
 const WAYLAND_BACKLOG_SERVICE_INTERVAL: Duration = Duration::from_millis(4);
 // Phase-lock callbacks to the 15 ms DVM presentation clock; a 16/15 ms beat
 // can miss adjacent permits and violate the 50 ms latency contract.
@@ -158,13 +177,14 @@ impl UiLoopWatchdog {
             } else {
                 now_ms.saturating_sub(phase_started_ms.load(Ordering::Acquire))
             };
-            if elapsed_ms < UI_PHASE_PANIC_THRESHOLD_MS {
+            let wayland_step = WAYLAND_STEP.load(Ordering::Acquire);
+            if elapsed_ms < ui_phase_panic_threshold_ms(phase_id, wayland_step) {
                 continue;
             }
             diag_line(format!(
                 "uiserver watchdog panic: phase={} step={} elapsed_ms={} loop_seq={}",
                 ui_phase_name(phase_id),
-                wayland_step_name(WAYLAND_STEP.load(Ordering::Acquire)),
+                wayland_step_name(wayland_step),
                 elapsed_ms,
                 loop_seq.load(Ordering::Acquire),
             ));
@@ -773,7 +793,9 @@ fn run() -> Result<(), i32> {
             }
             next_wayland_backlog_service = now + WAYLAND_BACKLOG_SERVICE_INTERVAL;
         } else if input.backlog_remaining {
+            note_wayland_step(WAYLAND_STEP_FLUSH);
             wayland.flush_clients();
+            note_wayland_step(WAYLAND_STEP_NONE);
         }
         watchdog.leave();
         phase_timings.wayland = wayland_started.elapsed();
@@ -1129,7 +1151,29 @@ fn wayland_service_required(protocol_input: bool, input_events: u64, callback_du
 
 #[cfg(test)]
 mod main_loop_tests {
-    use super::wayland_service_required;
+    use super::{
+        ui_phase_panic_threshold_ms, wayland_service_required, NETD_STREAM_LEASE_MS,
+        UI_PHASE_INPUT, UI_PHASE_PANIC_THRESHOLD_MS, UI_PHASE_WAYLAND, WAYLAND_STEP_DISPATCH,
+        WAYLAND_STEP_NONE,
+    };
+
+    #[test]
+    fn watchdog_budget_outlasts_the_netd_stream_lease_only_inside_a_socket_call() {
+        // A nonblocking stream call may legitimately take the whole lease.
+        assert!(
+            ui_phase_panic_threshold_ms(UI_PHASE_WAYLAND, WAYLAND_STEP_DISPATCH)
+                > NETD_STREAM_LEASE_MS
+        );
+        // Anything that is not inside such a call keeps the strict budget.
+        assert_eq!(
+            ui_phase_panic_threshold_ms(UI_PHASE_WAYLAND, WAYLAND_STEP_NONE),
+            UI_PHASE_PANIC_THRESHOLD_MS
+        );
+        assert_eq!(
+            ui_phase_panic_threshold_ms(UI_PHASE_INPUT, WAYLAND_STEP_DISPATCH),
+            UI_PHASE_PANIC_THRESHOLD_MS
+        );
+    }
 
     #[test]
     fn wayland_dispatch_requires_protocol_input_server_events_or_due_callback() {

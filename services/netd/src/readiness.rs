@@ -12,7 +12,9 @@
 //!   mutex; the global generation is monotonic and wakes accept only newer
 //!   generations, so concurrent publishers cannot downgrade a waiter.
 //! - **Failure:** Generation exhaustion exits the service for rootd restart;
-//!   a missed transition is bounded by the stack-advance full sweep.
+//!   a missed transition (smoltcp reports none for timer-only changes) is
+//!   bounded by the full sweep, requested on any reported change and at least
+//!   every `INET_TIMER_SWEEP_INTERVAL`.
 //! - **Forbidden:** No readiness change without a generation bump, no
 //!   publication under the state lock, no silent dirty-set truncation.
 //! - **Evidence:** `readiness_tests`, `local_socket_poll_tests`, and
@@ -276,6 +278,30 @@ impl Drop for NetStateGuard<'_> {
         // concurrent publishers may arrive out of order without a downgrade.
         for (token, generation) in publications {
             publish_readiness_generation(token, generation);
+        }
+    }
+}
+
+pub(super) fn publish_readiness_generation(object_id: u64, generation: u64) {
+    #[cfg(test)]
+    readiness::record_test_publication(object_id, generation);
+    #[cfg(not(test))]
+    {
+        let args = WaitSetSignalBrokerArgs {
+            abi_version: WAITSET_ABI_VERSION,
+            provider: WAITSET_PROVIDER_NETD,
+            flags: 0,
+            object_id,
+            generation,
+            reserved0: 0,
+        };
+        let result = syscall1(
+            SYS_RUSTOS_WAITSET_SIGNAL_BROKER,
+            (&args as *const WaitSetSignalBrokerArgs) as u64,
+        );
+        if result < 0 {
+            debug_line("netd: readiness generation publication failed");
+            std::process::exit(134);
         }
     }
 }

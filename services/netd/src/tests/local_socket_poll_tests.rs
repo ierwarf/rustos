@@ -289,7 +289,7 @@ fn expired_blocking_work_never_starts_a_provider_after_queueing() {
     let mut response = NetdIpcResponse::default();
 
     assert_eq!(
-        run_blocking_request_at(&request, &mut response, 21),
+        run_blocking_request_at(&request, &mut response, 0, 21),
         libc::ETIMEDOUT
     );
     assert_eq!(BLOCKING_PROVIDER_STARTS.load(Ordering::Acquire), 0);

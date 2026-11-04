@@ -202,6 +202,7 @@ fn bench_state(inet: usize, unix_pairs: u64) -> NetState {
         next_port: 49152,
         closing: Vec::new(),
         readiness_dirty: false,
+        last_timer_sweep: StdInstant::now(),
     };
     let mut state = NetState::new();
     for i in 0..inet as u64 {
@@ -282,4 +283,29 @@ fn readiness_bench() {
             }),
         );
     }
+}
+
+#[test]
+fn quiet_poll_turns_do_not_force_a_full_inet_sweep_until_the_timer_is_due() {
+    let mut state = bench_state(4, 0);
+    state.record_readiness_changes();
+    let stack = state.inet.as_mut().unwrap();
+    stack.last_timer_sweep = StdInstant::now();
+    stack.readiness_dirty = false;
+    // Host tests have no packet broker: ingress and egress are both idle.
+    let (_, changed) = stack.poll_one();
+    assert!(!changed);
+    assert!(!stack.readiness_dirty, "an idle poll must not request a sweep");
+
+    // A silent timer-driven transition is still found within the bound.
+    let Some(overdue) = StdInstant::now().checked_sub(INET_TIMER_SWEEP_INTERVAL * 2) else {
+        return;
+    };
+    stack.last_timer_sweep = overdue;
+    stack.poll_one();
+    assert!(stack.readiness_dirty);
+    assert!(stack.last_timer_sweep > overdue);
+    stack.readiness_dirty = false;
+    stack.poll_one();
+    assert!(!stack.readiness_dirty, "the sweep timer restarts after it fires");
 }

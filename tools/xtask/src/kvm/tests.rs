@@ -270,6 +270,16 @@ mod tests {
             Some("Starting crond: rustos-dvm-display: GPU KMS setup unavailable stage=gpu-kms-target errno=6".to_owned())
         );
         assert_eq!(dvm_display_failure("boot\nrelay pending\n", false), None);
+        // A render-budget miss is retried by the relay, so it is not a
+        // failure on sight; only a structural offline stage is.
+        let budget_miss = "rustos-dvm-display: gpu-compositor offline frames=0 stage=gpu-frame-render-budget gpu-stage=gpu-render-ready errno=110\n";
+        assert_eq!(dvm_display_failure(budget_miss, false), None);
+        // A structural fault stays fatal even when the relay later primes again.
+        assert!(dvm_display_failure(
+            "rustos-dvm-display: gpu-compositor offline frames=0 stage=gpu-dmabuf-acquire gpu-stage=x errno=2\nrustos-dvm-display: gpu-compositor primed contract=3\n",
+            false,
+        )
+        .is_some());
         assert!(dvm_display_failure(
             "rustos-dvm-display: gpu-compositor offline frames=1 stage=gpu-dmabuf-acquire gpu-stage=gpu-batch-validate errno=2\n",
             true,
