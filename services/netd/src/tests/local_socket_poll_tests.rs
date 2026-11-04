@@ -210,15 +210,15 @@ fn admission_clamps_each_operation_class_once_without_freshening() {
         ),
         (
             SYSCALL_OFFLOAD_OP_LINUX_DUP,
-            rustos_user_abi::performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS,
+            rustos_user_abi::performance::IPC_STATE_MUTATION_HARD_LIMIT_MS,
         ),
         (
             SYSCALL_OFFLOAD_OP_LINUX_CLOSE,
-            rustos_user_abi::performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS,
+            rustos_user_abi::performance::IPC_STATE_MUTATION_HARD_LIMIT_MS,
         ),
         (
             NETD_IPC_OP_REF_ACK,
-            rustos_user_abi::performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS,
+            rustos_user_abi::performance::IPC_STATE_MUTATION_HARD_LIMIT_MS,
         ),
         (
             SYSCALL_OFFLOAD_OP_LINUX_SOCKET,

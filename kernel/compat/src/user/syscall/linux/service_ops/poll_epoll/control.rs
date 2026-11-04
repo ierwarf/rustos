@@ -9,7 +9,7 @@
 //! - **Evidence:** `waitset` and `service-mutation-recovery`.
 
 pub(super) const fn deadline_ms() -> u64 {
-    rustos_user_abi::performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS
+    rustos_user_abi::performance::IPC_STATE_MUTATION_HARD_LIMIT_MS
 }
 
 #[cfg(test)]
@@ -17,12 +17,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn persistent_epoll_mutation_uses_the_interactive_deadline() {
+    fn persistent_epoll_mutation_uses_the_state_mutation_lease() {
         assert_eq!(
             rustos_user_abi::performance::IPC_READINESS_QUERY_HARD_LIMIT_MS,
             16
         );
-        assert_eq!(deadline_ms(), 100);
-        assert!(deadline_ms() > rustos_user_abi::performance::IPC_READINESS_QUERY_HARD_LIMIT_MS);
+        assert_eq!(deadline_ms(), 5_000);
+        assert!(deadline_ms() > rustos_user_abi::performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS);
     }
 }

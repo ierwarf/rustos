@@ -91,7 +91,7 @@ contracts.
    remove a waiter after any unrelated wake. Housekeeping completes no more
    than sixteen retirement records, sixteen reaper records and one deferred
    transfer release per turn;
-   provider replay and acknowledgement are separate, 100 ms-bounded
+   provider replay and acknowledgement are separate, lease-bounded (5 s)
    housekeeping turns rather than a synchronous foreground backlog drain.
    IPC object handles additionally bind a slot generation. Endpoint teardown
    removes the exact generation before scanning its message slots; message and

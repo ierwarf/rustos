@@ -169,6 +169,7 @@ acceptance contracts, not tuning defaults:
 | Deferred netd reference maintenance per turn | 1 ms | 1 ms | 1 replay or ACK |
 | Readiness observation | 1 frame | 16 ms | 1 per deduplicated provider |
 | Interactive policy-only control | 16 ms | 100 ms | 1; service drains at most 32 already-queued controls per turn |
+| State-changing service mutation (close/dup/settle/ACK/epoll control) | 100 ms | 5 s lease (`IPC_STATE_MUTATION_HARD_LIMIT_MS`) | 1 |
 | Boot/control transaction | 100 ms | 5 s | 1 |
 | Bulk external-device data | 5 s | 30 s | 1 |
 
@@ -188,9 +189,9 @@ cancellation witnesses.
 
 Provider lifecycle limits apply to the complete turn, not to each retry.
 Netd dup/close may retry only an early transport break inside one remaining
-100 ms interactive-control budget and moves the committed operation's ACK to
+5 s state-mutation lease and moves the committed operation's ACK to
 the housekeeping maintenance queue. VFS and netd
-maintenance each process at most one 100 ms-bounded control item per yielded
+maintenance each process at most one lease-bounded control item per yielded
 housekeeping turn, IPC
 transfer disposal releases at most one entry, and retirement acknowledges at
 most four exact task records. Backlog ownership remains explicit, but cleanup

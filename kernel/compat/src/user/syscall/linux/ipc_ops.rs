@@ -1768,6 +1768,7 @@ fn observe_inline_reply<T>(
     }
     let response = take();
     if matches!(&response, Ok(Some(_))) && now() >= deadline_tick {
+        diagnostics::note_ready_reply_discarded_at_expiry(0);
         Err(LINUX_ETIMEDOUT)
     } else {
         response
@@ -3157,6 +3158,8 @@ pub(super) fn call_linux_syscall_fast_endpoint(
 pub(super) enum ServiceIpcClass {
     ReadinessQuery,
     InteractiveControl,
+    /// State-changing calls whose timeout would leave an unknown outcome.
+    StateMutation,
     BootControl,
     BulkData,
 }
@@ -3167,6 +3170,9 @@ impl ServiceIpcClass {
             Self::ReadinessQuery => rustos_user_abi::performance::IPC_READINESS_QUERY_HARD_LIMIT_MS,
             Self::InteractiveControl => {
                 rustos_user_abi::performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS
+            }
+            Self::StateMutation => {
+                rustos_user_abi::performance::IPC_STATE_MUTATION_HARD_LIMIT_MS
             }
             Self::BootControl => rustos_user_abi::performance::IPC_BOOT_CONTROL_HARD_LIMIT_MS,
             Self::BulkData => rustos_user_abi::performance::IPC_BULK_DATA_HARD_LIMIT_MS,

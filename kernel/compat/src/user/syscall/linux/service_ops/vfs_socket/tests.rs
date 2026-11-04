@@ -8,20 +8,32 @@ fn descriptor_exhaustion_is_not_reported_as_a_bad_source_fd() {
 }
 
 #[test]
-fn netd_reference_mutation_owns_the_complete_interactive_deadline() {
+fn netd_reference_mutation_owns_the_complete_state_mutation_lease() {
     assert_eq!(
         NETD_REF_OPERATION_TIMEOUT_MS,
-        rustos_user_abi::performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS
+        rustos_user_abi::performance::IPC_STATE_MUTATION_HARD_LIMIT_MS
     );
     assert_eq!(
         super::ipc_helpers::deadline::remaining_service_timeout_ms(
             NETD_REF_OPERATION_TIMEOUT_MS,
             0,
         ),
-        Some(100)
+        Some(5_000)
     );
     assert!(
         !super::ipc_helpers::deadline::retryable_early_service_transport_error(LINUX_ETIMEDOUT)
+    );
+}
+
+#[test]
+fn foreground_final_close_stays_on_the_short_rail_while_dup_owns_the_lease() {
+    assert_eq!(
+        netd_ref_foreground_timeout_ms(SYSCALL_OFFLOAD_OP_LINUX_CLOSE),
+        rustos_user_abi::performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS
+    );
+    assert_eq!(
+        netd_ref_foreground_timeout_ms(SYSCALL_OFFLOAD_OP_LINUX_DUP),
+        rustos_user_abi::performance::IPC_STATE_MUTATION_HARD_LIMIT_MS
     );
 }
 
@@ -46,7 +58,7 @@ fn netd_reference_retry_keeps_the_original_wire_deadline() {
     assert_eq!(
         super::vfs_meta::netd_deadline_remaining_ms_at(
             retry.deadline_ns,
-            start_ns + 99 * super::vfs_meta::NETD_NANOS_PER_MILLI,
+            start_ns + 4_999 * super::vfs_meta::NETD_NANOS_PER_MILLI,
         ),
         Some(1)
     );

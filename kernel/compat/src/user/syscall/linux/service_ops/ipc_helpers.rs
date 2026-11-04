@@ -516,7 +516,7 @@ fn vfs_request_service_class(request: &VfsIpcRequest) -> ipc_ops::ServiceIpcClas
             VFS_POLL_QUERY_EPOLL_CREATE | VFS_POLL_QUERY_EPOLL_CTL |
             VFS_POLL_QUERY_EPOLL_RETIRE | VFS_POLL_QUERY_EPOLL_PURGE_OBJECT)
     {
-        ipc_ops::ServiceIpcClass::InteractiveControl
+        ipc_ops::ServiceIpcClass::StateMutation
     } else {
         ipc_ops::ServiceIpcClass::BulkData
     }
@@ -547,8 +547,8 @@ fn call_vfs_ipc_request_impl(
                 | VFS_POLL_QUERY_EPOLL_PURGE_OBJECT
         );
     let service_class = vfs_request_service_class(request);
-    let control_timeout_ms = matches!(service_class, ipc_ops::ServiceIpcClass::InteractiveControl)
-        .then_some(rustos_user_abi::performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS);
+    let control_timeout_ms = matches!(service_class, ipc_ops::ServiceIpcClass::StateMutation)
+        .then_some(rustos_user_abi::performance::IPC_STATE_MUTATION_HARD_LIMIT_MS);
     let total_timeout_ms = timeout_ms.or(control_timeout_ms).or(replay_safe_request.then_some(30_000));
     let attempts = if replay_safe_request { 3 } else { 1 };
     let mut response = None;
@@ -667,12 +667,12 @@ fn vfs_checkpoint_ack_required(request: &VfsIpcRequest) -> bool {
 fn acknowledge_vfs_checkpoint_mutation(original: &VfsIpcRequest) -> Result<(), i64> {
     let ack = vfs_checkpoint_ack_request(original);
     // A visibility ACK mutates checkpoint custody. Give it one complete
-    // interactive-control rail, never the short readiness-query deadline.
+    // state-mutation lease, never an interactive or readiness-query rail.
     let last_errno = match ipc_ops::call_service_endpoint_with_class_deadline(
         IPC_SERVICE_VFSD,
         as_bytes(&ack),
         vfs_request_service_class(&ack),
-        rustos_user_abi::performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS,
+        rustos_user_abi::performance::IPC_STATE_MUTATION_HARD_LIMIT_MS,
     ) {
         Ok(bytes) if bytes.len() == size_of::<VfsIpcResponse>() => {
             let response = read_unaligned::<VfsIpcResponse>(&bytes);
@@ -718,7 +718,7 @@ pub fn settle_vfs_cursor_mutation(prepared: &VfsIpcRequest, commit: bool) -> Res
         VFS_CURSOR_SETTLE_CANCEL
     };
     let response = call_vfs_ipc_request_with_timeout(&request,
-        rustos_user_abi::performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS)?;
+        rustos_user_abi::performance::IPC_STATE_MUTATION_HARD_LIMIT_MS)?;
     ensure_vfs_status(&response)
 }
 
@@ -835,8 +835,8 @@ fn replay_pending_vfs_mutation(lane: Option<VfsMutationLane>) -> Option<bool> {
     let response = ipc_ops::call_service_endpoint_with_class_deadline(
         IPC_SERVICE_VFSD,
         as_bytes(&request),
-        ipc_ops::ServiceIpcClass::InteractiveControl,
-        rustos_user_abi::performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS,
+        ipc_ops::ServiceIpcClass::StateMutation,
+        rustos_user_abi::performance::IPC_STATE_MUTATION_HARD_LIMIT_MS,
     )
     .ok()
     .and_then(|bytes| {

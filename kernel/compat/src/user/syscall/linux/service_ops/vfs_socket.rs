@@ -29,10 +29,24 @@ const PENDING_NETD_REF_STORAGE_CAPACITY: usize = PENDING_NETD_REF_CAPACITY + 1;
 const REMOTE_VFS_OPEN_DESCRIPTION_CAPACITY: usize = 32 * 1024;
 // DUP/CLOSE/ACK change a service-owned open-description reference. They are
 // persistent control mutations, not non-consuming readiness observations.
-// One attempt therefore owns the complete interactive rail; fragmenting this
-// into 5-6 ms calls lets netd commit after each reply capability is revoked.
+// One attempt therefore owns the complete state-mutation lease; fragmenting
+// this into 5-6 ms calls lets netd commit after each reply capability is revoked.
 const NETD_REF_OPERATION_TIMEOUT_MS: u64 =
+    rustos_user_abi::performance::IPC_STATE_MUTATION_HARD_LIMIT_MS;
+// A final CLOSE is the exception: the local descriptor is already gone and
+// nobody consumes the result, so a wedged provider must not hold close()/exec
+// for the whole lease. Its uncertain outcome is replayed by housekeeping,
+// which does use the lease.
+const NETD_REF_CLOSE_FOREGROUND_TIMEOUT_MS: u64 =
     rustos_user_abi::performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS;
+
+const fn netd_ref_foreground_timeout_ms(op: u16) -> u64 {
+    if op == SYSCALL_OFFLOAD_OP_LINUX_CLOSE {
+        NETD_REF_CLOSE_FOREGROUND_TIMEOUT_MS
+    } else {
+        NETD_REF_OPERATION_TIMEOUT_MS
+    }
+}
 const NETD_REF_OPERATION_ATTEMPTS: usize = 3;
 const NETD_MAINTENANCE_ATTEMPTS_PER_CALL: usize = 1;
 
@@ -788,6 +802,9 @@ fn call_vfs_remote_close(remote_id: u64) -> Result<(), i64> {
 fn call_vfs_remote_close_bounded(remote_id: u64) -> Result<(), i64> {
     let mut request = new_vfs_request(VFS_IPC_OP_CLOSE);
     request.remote_id = remote_id;
+    // Foreground final close: the fd is already retired and nobody consumes the
+    // result, so keep the short rail; a timeout is replayed by housekeeping
+    // under the state-mutation lease.
     call_vfs_ipc_request_with_timeout(&request,
         rustos_user_abi::performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS)
         .and_then(|response| ensure_vfs_status(&response))
@@ -1100,8 +1117,8 @@ pub fn call_netd_socket_token_op(op: u16, socket_token: u64) -> Result<u64, i64>
 
 fn call_netd_socket_token_op_bounded(op: u16, socket_token: u64) -> Result<u64, i64> {
     let deadline_ns = super::vfs_meta::netd_deadline_after_class(
-        ipc_ops::ServiceIpcClass::InteractiveControl,
-        Some(NETD_REF_OPERATION_TIMEOUT_MS),
+        ipc_ops::ServiceIpcClass::StateMutation,
+        Some(netd_ref_foreground_timeout_ms(op)),
     );
     let request = new_netd_socket_request(op, socket_token, deadline_ns);
     let mut last = LINUX_ETIMEDOUT;
@@ -1202,8 +1219,8 @@ fn drain_pending_netd_refs() -> usize {
             pending.op,
             pending.socket_token,
             super::vfs_meta::netd_deadline_after_class(
-                ipc_ops::ServiceIpcClass::InteractiveControl,
-                Some(rustos_user_abi::performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS),
+                ipc_ops::ServiceIpcClass::StateMutation,
+                Some(rustos_user_abi::performance::IPC_STATE_MUTATION_HARD_LIMIT_MS),
             ),
         );
         request.operation_hi = pending.operation_hi;
@@ -1211,13 +1228,13 @@ fn drain_pending_netd_refs() -> usize {
         let completed = if pending.acknowledge_only {
             send_netd_ref_ack_with_timeout(
                 &request,
-                rustos_user_abi::performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS,
+                rustos_user_abi::performance::IPC_STATE_MUTATION_HARD_LIMIT_MS,
             )
             .is_ok()
         } else {
             match call_netd_ipc_request_with_timeout(
                 &request,
-                rustos_user_abi::performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS,
+                rustos_user_abi::performance::IPC_STATE_MUTATION_HARD_LIMIT_MS,
             ) {
                 Ok(_) => {
                     // Split operation replay and its acknowledgement across
@@ -1252,7 +1269,7 @@ fn send_netd_ref_ack_with_timeout(request: &NetdIpcRequest, timeout_ms: u64) -> 
         NETD_IPC_OP_REF_ACK,
         request.socket_token,
         super::vfs_meta::netd_deadline_after_class(
-            ipc_ops::ServiceIpcClass::InteractiveControl,
+            ipc_ops::ServiceIpcClass::StateMutation,
             Some(timeout_ms),
         ),
     );

@@ -28,6 +28,27 @@ static ABANDONED_REPLIES: [AtomicU64; ABANDONED_REPLY_RING] =
     [const { AtomicU64::new(0) }; ABANDONED_REPLY_RING];
 static ABANDONED_REPLY_CURSOR: AtomicUsize = AtomicUsize::new(0);
 
+/// Replies that were already queued for their caller but discarded because
+/// the caller observed expiry first. Distinguishes a service that was too slow
+/// (reply rejected, caller already gone) from a caller that was merely woken
+/// late on a saturated CPU (reply ready, thrown away): only the latter would be
+/// fixed by judging a reply at its completion time.
+static READY_REPLIES_DISCARDED_AT_EXPIRY: AtomicU64 = AtomicU64::new(0);
+
+pub(super) fn note_ready_reply_discarded_at_expiry(reply: u64) {
+    // ORDERING: Relaxed is exact; this counter owns diagnostics only.
+    let total = READY_REPLIES_DISCARDED_AT_EXPIRY.fetch_add(1, Ordering::Relaxed) + 1;
+    if total > EARLY_REPLY_REJECTION_SAMPLES as u64 && !total.is_power_of_two() {
+        return;
+    }
+    nucleus_core::debug::record_milestone(
+        nucleus_core::debug::LogCategory::Compat,
+        "ipc-ready-reply-discarded",
+        reply,
+        total,
+    );
+}
+
 /// Reason code for a reply rejected because its caller abandoned the call.
 const REPLY_REJECTION_REASON_ABANDONED: u64 = 7;
 

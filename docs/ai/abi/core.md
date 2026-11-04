@@ -89,7 +89,7 @@ rather than leaving a late transition able to reactivate a retired generation.
 Kernel-owned cross-service calls use the typed limits in
 `rustos_user_abi::performance`, never an unlabelled copy of the 30-second
 ceiling: non-consuming readiness queries are capped at 16 ms, interactive
-policy-only calls at 100 ms, boot/control transactions at 5 seconds, and bulk
+policy-only calls at 100 ms, state-changing mutations (a timeout leaves their outcome unknown) at a 5 second lease sized to outlast one executable snapshot, boot/control transactions at 5 seconds, and bulk
 data at 30 seconds. A call may use a shorter application deadline but cannot
 widen its class. Bulk data is reserved for operations whose external device or
 application semantics can legitimately wait; endpoint lookup, authorization,

@@ -12,8 +12,8 @@ The producer fixes that transaction end before payload preparation and reuses
 it for every foreground retry. The kernel reply wait floors the same monotonic
 nanosecond value into its RTC tick domain and takes the earlier of the wire end
 and its already-admitted service-class end. Netd then tightens the request once
-at admission to 16 ms for readiness, 100 ms for DVM session and reference
-control, or 30 s for bulk work. Queueing, worker dequeue, provider polling, and
+at admission to 16 ms for readiness, 100 ms for DVM session control, a 5 s
+state-mutation lease for reference DUP/CLOSE/ACK, or 30 s for bulk work. Queueing, worker dequeue, provider polling, and
 retry may consume the stamped remainder but cannot mint another class budget.
 An expired detached poll makes one terminal `ETIMEDOUT` reply attempt and
 releases its slot; a reply consumed after the caller deadline is discarded,

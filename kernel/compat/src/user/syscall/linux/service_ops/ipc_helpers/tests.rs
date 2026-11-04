@@ -178,11 +178,11 @@ fn housekeeping_vfs_maintenance_is_one_bounded_replay_turn() {
 fn vfs_cursor_and_checkpoint_mutations_are_control_not_readiness_work() {
     for op in [VFS_IPC_OP_CLOSE, VFS_IPC_OP_CURSOR_SETTLE, VFS_IPC_OP_CHECKPOINT_ACK] {
         let request = VfsIpcRequest { op, ..VfsIpcRequest::default() };
-        assert!(matches!(vfs_request_service_class(&request), ipc_ops::ServiceIpcClass::InteractiveControl));
+        assert!(matches!(vfs_request_service_class(&request), ipc_ops::ServiceIpcClass::StateMutation));
     }
     for arg0 in [VFS_POLL_QUERY_EPOLL_CREATE, VFS_POLL_QUERY_EPOLL_CTL, VFS_POLL_QUERY_EPOLL_RETIRE, VFS_POLL_QUERY_EPOLL_PURGE_OBJECT] {
         let request = VfsIpcRequest { op: VFS_IPC_OP_POLL_QUERY, arg0, ..VfsIpcRequest::default() };
-        assert!(matches!(vfs_request_service_class(&request), ipc_ops::ServiceIpcClass::InteractiveControl));
+        assert!(matches!(vfs_request_service_class(&request), ipc_ops::ServiceIpcClass::StateMutation));
     }
     let read = VfsIpcRequest { op: VFS_IPC_OP_READ, ..VfsIpcRequest::default() };
     assert!(matches!(vfs_request_service_class(&read), ipc_ops::ServiceIpcClass::BulkData));

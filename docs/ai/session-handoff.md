@@ -7,7 +7,7 @@ libc reads `resolv.conf` with cursor reads; vfsd leaves the description
 "prepared" until COMMIT. A timed-out COMMIT (or a second thread on the same
 description) made the next cursor op return EBUSY (errno 16 -> EAI_SYSTEM before
 DNS TX). Fix: per-description cursor gate in
-`kernel/compat/.../service_ops/ipc_helpers.rs` (`acquire_vfs_cursor_gate`,
+`kernel/compat/src/user/syscall/linux/service_ops/ipc_helpers.rs` (`acquire_vfs_cursor_gate`,
 held prepare->copy->settle for cursor read/write/lseek/getdents64; waits up to
 5 s while replaying that description's deferred lane itself; ETIMEDOUT, never
 EBUSY). Contract: `docs/ai/abi/vfs-storage.md`. Tests + 3 new mutants killed
@@ -33,6 +33,21 @@ sealed; 16-vCPU `kvm-smoke --exercise-network --exercise-google-ping` passed
 predates this work: run A reached UI-ready but Google DNS failed gai=-11
 errno=110 (no vfsd/EBUSY diagnostics, cause not isolated); run B stalled before
 netprobe started. Not investigated further.
+
+Deadline review (2026-11-04, web + code): see `IPC_STATE_MUTATION_HARD_LIMIT_MS`
+(5 s lease, `ServiceIpcClass::StateMutation`). State-changing service calls whose
+timeout leaves the provider outcome unknown (cursor settle, checkpoint ACK,
+epoll control, netd DUP/REF_ACK, housekeeping replays) left the 16/100 ms rails.
+Foreground final CLOSE (vfs and netd) deliberately keeps the 100 ms rail (fd is
+already retired, result unused; housekeeping replays under the lease). Measured
+(1 vCPU, 4 runs): `ipc-ready-reply-discarded` = 0, so judging a reply by its
+completion time (instead of the caller's observation time) is NOT justified and
+was not implemented; vfsd already runs executable snapshots on a separate
+worker, so "yield points" in vfsd were not implemented either. At 1 vCPU, most
+`ipc-service-reply-timeout` records (8 of 10) carry caller-requested 1 ms
+best-effort budgets (uiserver), which are intentional. 1 vCPU runs: Google DNS
++ ICMP verified 4/4, but wayclick first frame / gpu-compositor flake remains
+(3 of 4 smokes failed only on that).
 
 Still open: 1-vCPU startup flake; cursor prepare lacks a reserved reconciliation
 slot / durable fence for a late prepare; restart can restore prepared state;

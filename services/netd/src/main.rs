@@ -380,11 +380,13 @@ fn request_deadline_class_cap(request: &NetdIpcRequest) -> Duration {
         SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET | NETD_IPC_OP_POLL_BATCH => {
             Duration::from_millis(rustos_user_abi::performance::IPC_READINESS_QUERY_HARD_LIMIT_MS)
         }
-        NETD_IPC_OP_DVM_SESSION
-        | SYSCALL_OFFLOAD_OP_LINUX_DUP
+        NETD_IPC_OP_DVM_SESSION => Duration::from_millis(
+            rustos_user_abi::performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS,
+        ),
+        SYSCALL_OFFLOAD_OP_LINUX_DUP
         | SYSCALL_OFFLOAD_OP_LINUX_CLOSE
         | NETD_IPC_OP_REF_ACK => Duration::from_millis(
-            rustos_user_abi::performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS,
+            rustos_user_abi::performance::IPC_STATE_MUTATION_HARD_LIMIT_MS,
         ),
         _ => Duration::from_millis(rustos_user_abi::performance::IPC_BULK_DATA_HARD_LIMIT_MS),
     }

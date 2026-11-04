@@ -29,13 +29,16 @@
   any token-addressed final provider release; a wedged vfsd/netd cannot retain
   a reusable numeric fd or block process retirement. Netd socket DUP, final
   CLOSE, and their exact replay ACK mutate the provider's open-description
-  reference and therefore own one complete bounded 100 ms interactive-control
-  attempt. They do not split the deadline or retry a real timeout; exact
+  reference and therefore own one complete bounded 5 s state-mutation lease
+  attempt (a short timeout leaves the provider outcome unknown); only a
+  foreground final CLOSE keeps the 100 ms rail, because its fd is already
+  retired and nobody consumes the result, and housekeeping replays it under
+  the lease. They do not split the deadline or retry a real timeout; exact
   mutation identity transfers to housekeeping. Checkpointed epoll
   create/ADD/MOD/DEL/retire and matching purges follow the same control rail.
   Cursor COMMIT/CANCEL and checkpoint visibility ACK likewise mutate provider
-  custody and use one full 100 ms interactive-control attempt, not the 16 ms
-  readiness rail. Final remote-VFS close uses the same control budget; if a
+  custody and use one full state-mutation lease attempt, not the 16 ms
+  readiness rail or the 100 ms interactive rail. Foreground final remote-VFS close keeps the 100 ms rail; if a
   prepared cursor rejects it with EBUSY after local fd retirement, retain the
   exact close in deferred reconciliation rather than orphan the provider.
   Deferred replay preserves all four operation arguments,

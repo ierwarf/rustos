@@ -36,7 +36,7 @@ pub(in crate::user::syscall::linux::service_ops) fn netd_timeout_class(
         op,
         SYSCALL_OFFLOAD_OP_LINUX_DUP | SYSCALL_OFFLOAD_OP_LINUX_CLOSE | NETD_IPC_OP_REF_ACK
     ) {
-        ipc_ops::ServiceIpcClass::InteractiveControl
+        ipc_ops::ServiceIpcClass::StateMutation
     } else {
         ipc_ops::ServiceIpcClass::ReadinessQuery
     }
@@ -83,7 +83,7 @@ mod tests {
     }
 
     #[test]
-    fn netd_reference_mutations_use_interactive_control_deadline() {
+    fn netd_reference_mutations_use_state_mutation_lease() {
         for op in [
             SYSCALL_OFFLOAD_OP_LINUX_DUP,
             SYSCALL_OFFLOAD_OP_LINUX_CLOSE,
@@ -91,7 +91,7 @@ mod tests {
         ] {
             assert!(matches!(
                 netd_timeout_class(op),
-                ipc_ops::ServiceIpcClass::InteractiveControl
+                ipc_ops::ServiceIpcClass::StateMutation
             ));
         }
         assert!(matches!(

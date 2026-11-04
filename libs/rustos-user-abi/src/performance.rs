@@ -28,6 +28,13 @@ pub const UI_BOOT_GPU_ACTIVATION_BUDGET_MS: u64 = 750;
 pub const IPC_READINESS_QUERY_HARD_LIMIT_MS: u64 = 16;
 /// Policy-only work that may affect an interactive syscall.
 pub const IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS: u64 = 100;
+/// State-changing service calls: descriptor close/dup, cursor settle,
+/// checkpoint ACK, epoll interest control and netd reference mutations. A
+/// timeout leaves the provider's outcome unknown and forces the replay and
+/// reconciliation machinery, so these are not charged to the interactive rail
+/// but to a lease that survives one executable snapshot queued ahead of them
+/// on a single-receiver service (see `EXECUTABLE_SNAPSHOT_HARD_LIMIT_MS`).
+pub const IPC_STATE_MUTATION_HARD_LIMIT_MS: u64 = 5_000;
 /// Maximum already-queued control requests one service processes before it
 /// returns to lifecycle, launch, socket, or other policy work.  The kernel
 /// endpoint admission ceiling must retain at least two such bursts so a busy
@@ -195,6 +202,9 @@ const _: () = assert!(
         && ROOTD_SUPERVISOR_IDLE_POLL_MS <= IPC_READINESS_QUERY_HARD_LIMIT_MS
 );
 const _: () = assert!(IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS < IPC_BOOT_CONTROL_HARD_LIMIT_MS);
+const _: () = assert!(IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS < IPC_STATE_MUTATION_HARD_LIMIT_MS);
+const _: () = assert!(EXECUTABLE_SNAPSHOT_HARD_LIMIT_MS < IPC_STATE_MUTATION_HARD_LIMIT_MS);
+const _: () = assert!(IPC_STATE_MUTATION_HARD_LIMIT_MS <= IPC_BULK_DATA_HARD_LIMIT_MS);
 const _: () = assert!(EXECUTABLE_SNAPSHOT_HARD_LIMIT_MS < IPC_BOOT_CONTROL_HARD_LIMIT_MS);
 const _: () = assert!(DVM_STORAGE_BOOT_READY_HARD_LIMIT_MS < BOOT_TO_UI_HARD_LIMIT_MS);
 const _: () = assert!(IPC_BOOT_CONTROL_HARD_LIMIT_MS < IPC_BULK_DATA_HARD_LIMIT_MS);

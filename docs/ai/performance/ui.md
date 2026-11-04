@@ -183,11 +183,11 @@
   or console deadline woke the UI loop.
 - Wayland client admission calls the generic Linux `epoll_ctl(ADD)` path inside
   `wayland-server`. Persistent epoll create/ADD/MOD/DEL/retire/purge operations
-  mutate checkpointed vfsd state and use the bounded 100 ms interactive-control
-  rail. The 16 ms rail is reserved for non-consuming readiness queries; using
+  mutate checkpointed vfsd state and use the 5 s state-mutation lease, not the
+  100 ms interactive rail (a short timeout leaves the outcome unknown). The 16 ms rail is reserved for non-consuming readiness queries; using
   it for control can reject a healthy accepted client under SMP contention.
   The exact target socket reference acquired for ADD is itself a netd DUP
-  mutation and follows the same rule: one complete 100 ms attempt, no retry of
+  mutation and follows the same rule: one complete lease attempt, no retry of
   a real timeout, and background replay ownership for uncertain completion.
 - The pre-catalog UI bootstrap reads only the signed Init environment registry.
   Its two service-local defaults are sealed in runtimed and are revalidated
@@ -232,13 +232,13 @@
   lock across the bounded netd session-authority call. A transient transition
   failure retains the decoded batch, decoder epoch, and exact unacknowledged
   revoke/grant suffix, then retries before publishing any following input; the
-  state-changing netd/broker turn owns the 100 ms interactive-control budget,
+  state-changing netd/broker turn owns the interactive-control budget,
   not the 16 ms non-consuming readiness-query budget, while the absolute
   five-second deadline still exits fail-closed. Inputd process exit
   separately clears policy readiness and old-owner records before a
   replacement worker may rearm.
-- Persistent uiserver input wait-set mutations retain their individual 100 ms
-  interactive-control reconciliation limit. Startup retries only transient
+- Persistent uiserver input wait-set mutations are kernel state-mutation calls
+  (5 s lease) with their own bounded per-call reconciliation. Startup retries only transient
   timeout, interrupted, or backpressure results within the existing five-second
   boot-control deadline; permanent shape/provider errors still fail immediately.
   This bounds recovery from a busy single-threaded policy server without

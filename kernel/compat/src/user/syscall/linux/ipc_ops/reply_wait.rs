@@ -65,6 +65,7 @@ pub(super) fn wait_for_reply_with_deadline(
                     expired_before_take,
                     reply_deadline_expired(deadline_tick),
                 ) {
+                    diagnostics::note_ready_reply_discarded_at_expiry(reply.raw());
                     disarm_reply_deadline_waiter(caller_task_id);
                     drop_transfer_descriptors(response.1.as_slice());
                     return Err(LINUX_ETIMEDOUT);
@@ -125,6 +126,7 @@ pub(super) fn wait_for_reply_with_deadline(
                     expired_before_take,
                     reply_deadline_expired(deadline_tick),
                 ) {
+                    diagnostics::note_ready_reply_discarded_at_expiry(reply.raw());
                     disarm_reply_deadline_waiter(caller_task_id);
                     let _ = multitask::cancel_block_current_task();
                     drop_transfer_descriptors(response.1.as_slice());

@@ -2138,7 +2138,7 @@ userspace-wait-set/UserspaceWaitSet|kernel-compat|user::syscall::linux::ipc_ops:
 userspace-wait-set/UserspaceWaitSet|kernel-compat|user::syscall::linux::service_ops::poll_epoll::tests::object_observations_are_deduplicated_and_keep_the_newest_generation
 userspace-wait-set/UserspaceWaitSet|kernel-compat|user::syscall::linux::broker_ops::waitset_broker_ops::tests::exact_object_publication_never_removes_a_foreign_wait_set
 userspace-wait-set/UserspaceWaitSet|kernel-compat|user::syscall::linux::service_ops::poll_epoll::tests::provider_query_timeout_never_exceeds_the_wait_deadline_or_service_cap
-userspace-wait-set/UserspaceWaitSet|kernel-compat|user::syscall::linux::service_ops::poll_epoll::control::tests::persistent_epoll_mutation_uses_the_interactive_deadline
+userspace-wait-set/UserspaceWaitSet|kernel-compat|user::syscall::linux::service_ops::poll_epoll::control::tests::persistent_epoll_mutation_uses_the_state_mutation_lease
 userspace-wait-set/UserspaceWaitSet|kernel-compat|user::syscall::linux::service_ops::poll_epoll::tests::provider_timeout_never_hides_readiness_found_earlier_in_the_scan
 userspace-wait-set/UserspaceWaitSet|kernel-compat|user::syscall::linux::service_ops::poll_epoll::tests::provider_revoke_is_reported_per_fd_as_error_and_hup
 userspace-wait-set/UserspaceWaitSet|kernel-compat|user::syscall::linux::service_ops::poll_epoll::tests::transient_vfs_reply_break_is_retried_inside_epoll_wait
@@ -2160,13 +2160,13 @@ userspace-wait-set/UserspaceWaitSet|kernel-compat|user::syscall::linux::service_
 userspace-wait-set/UserspaceWaitSet|kernel-compat|user::syscall::linux::service_ops::vfs_socket::tests::transferred_input_description_keeps_the_waitset_service_reference
 userspace-wait-set/UserspaceWaitSet|kernel-compat|user::syscall::linux::service_ops::vfs_socket::tests::fork_service_refs_come_from_the_frozen_child_handle_snapshot
 service-mutation-recovery/ServiceMutationRecovery|kernel-compat|user::syscall::linux::service_ops::vfs_socket::tests::remote_vfs_refs_are_local_and_provider_close_is_final_only
-service-mutation-recovery/ServiceMutationRecovery|kernel-compat|user::syscall::linux::service_ops::vfs_socket::tests::netd_reference_mutation_owns_the_complete_interactive_deadline
-service-mutation-recovery/ServiceMutationRecovery|kernel-compat|user::syscall::linux::service_ops::ipc_helpers::deadline::tests::netd_reference_mutations_use_interactive_control_deadline
+service-mutation-recovery/ServiceMutationRecovery|kernel-compat|user::syscall::linux::service_ops::vfs_socket::tests::netd_reference_mutation_owns_the_complete_state_mutation_lease
+service-mutation-recovery/ServiceMutationRecovery|kernel-compat|user::syscall::linux::service_ops::ipc_helpers::deadline::tests::netd_reference_mutations_use_state_mutation_lease
 ipc-reply-deadline/IpcReplyDeadline|kernel-compat|user::syscall::linux::service_ops::ipc_helpers::diagnostics::tests::terminal_failure_diagnostic_has_an_independent_bounded_lane
 ipc-reply-deadline/IpcReplyDeadline|kernel-compat|user::syscall::linux::service_ops::ipc_helpers::deadline::tests::vfs_timeout_diagnostic_identifies_the_exact_epoll_control_operation
 service-mutation-recovery/ServiceMutationRecovery|kernel-ps|user::epoll::tests::descriptor_references_are_explicit_and_transient_clones_do_not_count
 service-mutation-recovery/ServiceMutationRecovery|kernel-compat|user::syscall::linux::service_ops::ipc_helpers::tests::housekeeping_vfs_maintenance_is_one_bounded_replay_turn
-service-mutation-recovery/ServiceMutationRecovery|kernel-compat|user::syscall::linux::service_ops::poll_epoll::control::tests::persistent_epoll_mutation_uses_the_interactive_deadline
+service-mutation-recovery/ServiceMutationRecovery|kernel-compat|user::syscall::linux::service_ops::poll_epoll::control::tests::persistent_epoll_mutation_uses_the_state_mutation_lease
 service-mutation-recovery/ServiceMutationRecovery|netd|ref_replay_tests::close_retry_replays_exact_result_and_rejects_operation_alias
 service-mutation-recovery/ServiceMutationRecovery|rootd|service_checkpoint::tests::exact_retry_is_idempotent_and_stale_retry_cannot_rollback|host-test
 service-mutation-recovery/ServiceMutationRecovery|rootd|service_checkpoint::tests::parent_tombstone_atomically_revokes_children|host-test
