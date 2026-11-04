@@ -46,7 +46,7 @@ use rustos_user_abi::syscall::{
     LoaderSpawnRequest, LoaderSpawnResponse, PRODUCT_MILESTONE_INIT_IDENTITY_READY,
     ROOTD_LEASE_STATE_EMPTY, ROOTD_LEASE_STATE_EXITED, ROOTD_LEASE_STATE_RUNNING,
     RustosIpcWaitServiceEndpointArgs, RustosSchedulingContextAuthority,
-    SYS_RUSTOS_IPC_CALL_BOUNDED, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
+    SYS_RUSTOS_IPC_CALL_BOUNDED,
     SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT,
     SYS_RUSTOS_IPC_WAIT_SERVICE_ENDPOINT, SYS_RUSTOS_PRODUCT_MILESTONE,
     TASK_WEIGHT_INTERACTIVE_FLAG,
@@ -422,7 +422,7 @@ fn main() {
 fn publish_init_identity() -> Result<u64, i32> {
     // SAFETY: The endpoint-create syscall takes no user pointers; its signed
     // return is validated before it becomes publication authority.
-    let endpoint = unsafe { libc::syscall(SYS_RUSTOS_IPC_ENDPOINT_CREATE as libc::c_long) as i64 };
+    let endpoint = rustos_svc_runtime::ipc::endpoint_create_with_limits(size_of::<CommercialMaxProtocolRequest>() as u64, 0);
     let endpoint = libc_syscall_status(endpoint);
     if endpoint <= 0 {
         return Err(if endpoint < 0 {

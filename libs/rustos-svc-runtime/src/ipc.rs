@@ -82,6 +82,13 @@ pub fn endpoint_create() -> i64 {
     unsafe { syscall0(SYS_RUSTOS_IPC_ENDPOINT_CREATE) }
 }
 
+/// Declare the largest receive image and handle capacity before publication.
+/// Byte-only services choose zero handles; generic endpoints remain unchanged.
+#[inline]
+pub fn endpoint_create_with_limits(max_request_bytes: u64, max_request_handles: u64) -> i64 {
+    unsafe { syscall2(rustos_user_abi::syscall::SYS_RUSTOS_IPC_ENDPOINT_CREATE_WITH_LIMITS, max_request_bytes, max_request_handles) }
+}
+
 #[inline]
 pub fn register_linux_syscall_endpoint(endpoint: u64) -> i64 {
     unsafe { syscall1(SYS_RUSTOS_IPC_REGISTER_LINUX_SYSCALL_ENDPOINT, endpoint) }

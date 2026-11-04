@@ -388,6 +388,12 @@ reported as guest boot latency. Guest milestones remain a separate clock.
   Passing requires the normal app result plus nonzero producer and consumer
   counters in both bounded rings. It is an Ethernet transport proof, not a
   physical NIC assignment or an L0 network control plane.
+- `--exercise-google-ping` additionally opts into external Internet access and
+  requires `--exercise-network`. It enables guest libc IPv4 resolution of
+  `google.com`, then requires a checksum/source/identifier/sequence/random-payload
+  verified ICMP Echo Reply. It never substitutes host ping or TCP reachability.
+  The ordinary gateway lane remains offline and deterministic. Example:
+  `cargo xtask kvm-smoke --timeout 45 --rustos-vcpus 1 --gui-dvm-surfaces --dvm-network-shmem --dvm-block-shmem --exercise-network --exercise-google-ping`.
 - `--min-ui-fps <fps>` enables both `RUSTOS_UI_PROFILE` and
   `RUSTOS_WAYCLICK_PROFILE` only in the private KVM disk copy by replacing the
   equal-length disabled values. It also attaches the DVM block aperture because

@@ -60,7 +60,7 @@ fn panic(_info: &PanicInfo<'_>) -> ! {
 pub extern "C" fn rust_eh_personality() {}
 
 fn service_main() {
-    let endpoint = ipc::endpoint_create();
+    let endpoint = ipc::endpoint_create_with_limits(IPC_MAX_INLINE_BYTES as u64, 0);
     if endpoint < 0 || ipc::register_service_endpoint(IPC_SERVICE_PAGERD, endpoint as u64) < 0 {
         ipc::debug_line("pagerd: endpoint registration failed");
         return;

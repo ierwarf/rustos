@@ -64,6 +64,7 @@ const KVM_ACCEPTANCE_CONTRACT_MAX_BYTES: usize = 256;
 struct KvmAcceptanceContract {
     ui_profile: bool,
     network_exercise: bool,
+    google_ping: bool,
 }
 
 /// What the loop remembers about a launch the worker is running.
@@ -593,6 +594,11 @@ fn apply_kvm_acceptance_contract(entry: &mut LaunchEntry) {
     );
     if contract.network_exercise && entry.desktop_file_id == "netprobe.desktop" {
         upsert_env(&mut entry.env, "RUSTOS_NETPROBE_QEMU=1");
+        upsert_env(&mut entry.env, if contract.google_ping {
+            "RUSTOS_NETPROBE_GOOGLE=1"
+        } else {
+            "RUSTOS_NETPROBE_GOOGLE=0"
+        });
     }
 }
 
@@ -637,6 +643,7 @@ fn parse_kvm_acceptance_contract(contents: &str) -> Option<KvmAcceptanceContract
     let mut contract = false;
     let mut ui_profile = None;
     let mut network_exercise = None;
+    let mut google_ping = None;
     for line in contents.lines() {
         match line {
             "contract=rustos-kvm-acceptance-v1" if !contract => contract = true,
@@ -644,12 +651,17 @@ fn parse_kvm_acceptance_contract(contents: &str) -> Option<KvmAcceptanceContract
             "ui_profile=1" if ui_profile.is_none() => ui_profile = Some(true),
             "network_exercise=0" if network_exercise.is_none() => network_exercise = Some(false),
             "network_exercise=1" if network_exercise.is_none() => network_exercise = Some(true),
+            "google_ping=0" if google_ping.is_none() => google_ping = Some(false),
+            "google_ping=1" if google_ping.is_none() => google_ping = Some(true),
             _ => return None,
         }
     }
+    let google_ping = google_ping.unwrap_or(false);
+    if google_ping && network_exercise != Some(true) { return None; }
     Some(KvmAcceptanceContract {
         ui_profile: ui_profile.filter(|_| contract)?,
         network_exercise: network_exercise?,
+        google_ping,
     })
 }
 

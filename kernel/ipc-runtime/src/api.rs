@@ -37,6 +37,19 @@ pub mod endpoint {
         crate::ipc::create_endpoint_for_process(owner_process_id)
     }
 
+    pub fn create_for_process_with_limits(
+        owner_process_id: u64,
+        max_request_bytes: usize,
+        max_request_handles: usize,
+        kmem_group: Option<usize>,
+    ) -> Result<KernelEndpointHandle, IpcError> {
+        crate::ipc::create_endpoint_for_process_with_limits(owner_process_id, max_request_bytes, max_request_handles, kmem_group)
+    }
+
+    pub fn validate_request_shape(endpoint: KernelEndpointHandle, request_len: usize, count: usize) -> Result<(), IpcError> {
+        crate::ipc::validate_endpoint_request_shape(endpoint, request_len, count)
+    }
+
     pub fn enqueue_call(
         endpoint: KernelEndpointHandle,
         caller_task_id: u64,

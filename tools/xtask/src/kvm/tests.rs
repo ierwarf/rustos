@@ -46,6 +46,9 @@ mod tests {
     #[path = "dvm_block.rs"]
     mod dvm_block;
 
+    #[path = "google_ping.rs"]
+    mod google_ping;
+
     #[test]
     fn rustos_smp_topology_is_machine_gated_on_complete_prerequisites() {
         smp_ring3_qualification::rustos_smp_topology_is_machine_gated_on_complete_prerequisites();

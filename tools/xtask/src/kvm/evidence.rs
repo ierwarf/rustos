@@ -1283,3 +1283,46 @@ fn stop_guest(guest: &mut Child) {
     }
     let _ = guest.wait();
 }
+
+// Public-network evidence is separate from the deterministic gateway/ring proof.
+fn google_ping_reply_observed(log: &str) -> bool {
+    fn field<'a>(fields: &'a str, key: &str) -> Option<&'a str> {
+        // Rejoined debug-syscall records intentionally retain their escaped
+        // terminators. Strip only the record suffix, not arbitrary escapes.
+        let fields = fields.strip_suffix("\\r\\n")
+            .or_else(|| fields.strip_suffix("\\n")).unwrap_or(fields);
+        let mut values = fields.split_whitespace().filter_map(|field| {
+            let (name, value) = field.split_once('=')?;
+            (name == key).then_some(value)
+        });
+        let value = values.next()?;
+        values.next().is_none().then_some(value)
+    }
+    let mut resolved = None;
+    for line in log.lines() {
+        if let Some((_, fields)) = line.split_once(NETPROBE_GOOGLE_DNS_MARKER) {
+            if field(fields, "host") == Some("google.com") {
+                if let Some(ip) = field(fields, "ip").and_then(|ip| ip.parse::<std::net::Ipv4Addr>().ok()) {
+                    resolved = Some(ip);
+                }
+            }
+        }
+        let Some((_, fields)) = line.split_once(NETPROBE_GOOGLE_REPLY_MARKER) else { continue; };
+        let ip = field(fields, "ip").and_then(|ip| ip.parse::<std::net::Ipv4Addr>().ok());
+        if resolved.is_some() && ip == resolved
+            && field(fields, "host") == Some("google.com")
+            && field(fields, "id").and_then(|id| id.parse::<u16>().ok()).is_some_and(|id| id != 0)
+            && field(fields, "seq") == Some("1")
+            && field(fields, "bytes") == Some("32")
+            && field(fields, "rtt_us").and_then(|rtt| rtt.parse::<u64>().ok()).is_some_and(|rtt| rtt < 15_000_000)
+            && field(fields, "verified") == Some("1")
+        { return true; }
+    }
+    false
+}
+
+fn network_exercise_ready(exercise_network: bool, exercise_google_ping: bool, counters: Option<DvmNetworkCounters>, log: &str) -> bool {
+    (!exercise_network || (counters.is_some_and(DvmNetworkCounters::round_trip_observed)
+        && log.contains(NETPROBE_QEMU_REACHABLE_MARKER)))
+        && (!exercise_google_ping || google_ping_reply_observed(log))
+}

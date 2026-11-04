@@ -182,7 +182,8 @@ const BUILTIN_SYSTEM_DLL_ALIASES: &[(&str, &str)] = &[
 rustos_svc_runtime::entry!(service_main);
 
 fn service_main() {
-    let endpoint = rustos_svc_runtime::ipc::endpoint_create();
+    // Both receive paths accept exactly one placement Job descriptor.
+    let endpoint = rustos_svc_runtime::ipc::endpoint_create_with_limits(LOADERD_RECV_BYTES as u64, 1);
     if endpoint < 0 {
         rustos_svc_runtime::ipc::debug_line("loaderd: endpoint create failed");
         return;

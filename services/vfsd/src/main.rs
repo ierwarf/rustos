@@ -256,7 +256,7 @@ fn service_main() {
         ipc::debug_line("vfsd: checkpoint replay failed");
         return;
     }
-    let endpoint = ipc::endpoint_create();
+    let endpoint = ipc::endpoint_create_with_limits(VFS_RECV_BYTES as u64, 0);
     if endpoint < 0 {
         ipc::debug_line("vfsd: endpoint create failed");
         return;

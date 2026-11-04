@@ -1,4 +1,6 @@
 use super::*;
+
+mod inet_datagram;
 pub fn syscall_linux_vfs_lseek(fd: u64, offset: i64, whence: u64) -> u64 {
     if let Some(mut memfd) = current_memfd_handle(fd) {
         let whence = match whence {
@@ -14,6 +16,10 @@ pub fn syscall_linux_vfs_lseek(fd: u64, offset: i64, whence: u64) -> u64 {
     }
     let Some(remote) = current_remote_vfs_handle(fd) else {
         return linux_errno(LINUX_EBADF);
+    };
+    let _cursor = match acquire_vfs_cursor_gate(remote.remote_id()) {
+        Ok(gate) => gate,
+        Err(errno) => return linux_errno(errno),
     };
     let mut request = new_vfs_request(VFS_IPC_OP_LSEEK);
     request.fd = fd;
@@ -104,6 +110,10 @@ pub fn syscall_linux_vfs_getdents64(fd: u64, user_ptr: u64, user_len: u64) -> u6
         return linux_errno(errno);
     }
     let result = (|| {
+        let _cursor = match acquire_vfs_cursor_gate(remote_id) {
+            Ok(gate) => gate,
+            Err(errno) => return linux_errno(errno),
+        };
         let mut request = new_vfs_request(VFS_IPC_OP_GETDENTS64);
         request.fd = fd;
         request.remote_id = remote_id;
@@ -785,10 +795,16 @@ pub fn syscall_linux_net6_with_timeout(
         request.euid = security.euid();
         request.egid = security.egid();
     }
-    populate_netd_socket_token(&mut request);
+    let socket_snapshot = populate_netd_socket_token(&mut request);
+    let io_flags = match op {
+        SYSCALL_OFFLOAD_OP_LINUX_SENDMSG | SYSCALL_OFFLOAD_OP_LINUX_RECVMSG => arg2,
+        SYSCALL_OFFLOAD_OP_LINUX_SENDTO | SYSCALL_OFFLOAD_OP_LINUX_RECVFROM => arg3,
+        _ => 0,
+    };
     let nonblocking_bound = timeout_ms.is_none()
         && socket_op_honours_nonblock(op)
-        && request.status_flags & linux_abi::O_NONBLOCK != 0;
+        && (request.status_flags & linux_abi::O_NONBLOCK != 0
+            || io_flags & (linux_abi::MSG_DONTWAIT | linux_abi::MSG_ERRQUEUE) != 0);
     let timeout_ms = if nonblocking_bound {
         Some(rustos_user_abi::performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS)
     } else {
@@ -802,7 +818,7 @@ pub fn syscall_linux_net6_with_timeout(
         super::ipc_helpers::deadline::netd_timeout_class(op)
     });
     request.deadline_ns = netd_deadline_after_class(deadline_class, timeout_ms);
-    if let Err(errno) = populate_netd_request_payload(&mut request, &mut pending_transfers) {
+    if let Err(errno) = populate_netd_request_payload(&mut request, &mut pending_transfers, socket_snapshot.as_ref()) {
         pending_transfers.drop_pending();
         return linux_errno(errno);
     }
@@ -823,6 +839,7 @@ pub fn syscall_linux_net6_with_timeout(
                 &request,
                 &response,
                 pending_transfers.receive_context(),
+                socket_snapshot.as_ref(),
             );
             if pending_transfers.is_receive() {
                 if !consumed.is_some_and(|len| pending_transfers.commit_receive(len)) {
@@ -1123,7 +1140,33 @@ impl PendingNetdTransfers {
     }
 }
 
-fn populate_netd_socket_token(request: &mut NetdIpcRequest) {
+pub(super) struct SocketSnapshot {
+    pub(super) handle: multitask::KernelHandle,
+    pub(super) status_flags: u64,
+}
+
+impl SocketSnapshot {
+    pub(super) fn token(&self) -> u64 {
+        match &self.handle {
+            multitask::KernelHandle::Socket(s) => s.token_id(),
+            multitask::KernelHandle::InetSocket(s) => s.token_id(),
+            _ => unreachable!("socket snapshot must contain a socket"),
+        }
+    }
+    pub(super) fn is_datagram(&self) -> bool {
+        matches!(&self.handle, multitask::KernelHandle::InetSocket(s) if s.type_() == linux_abi::SOCK_DGRAM)
+    }
+}
+
+pub(super) fn snapshot_socket(fd: u64) -> Option<SocketSnapshot> {
+    multitask::with_current_user_process_state(|_, _, state| {
+        let entry = state.handles().get_entry(fd)?;
+        if !matches!(entry.handle(), multitask::KernelHandle::Socket(_) | multitask::KernelHandle::InetSocket(_)) { return None; }
+        Some(SocketSnapshot { handle: entry.handle().clone(), status_flags: entry.status_flags() })
+    }).flatten()
+}
+
+fn populate_netd_socket_token(request: &mut NetdIpcRequest) -> Option<SocketSnapshot> {
     let fd = match request.op {
         SYSCALL_OFFLOAD_OP_LINUX_BIND
         | SYSCALL_OFFLOAD_OP_LINUX_CLOSE
@@ -1141,42 +1184,49 @@ fn populate_netd_socket_token(request: &mut NetdIpcRequest) {
         | SYSCALL_OFFLOAD_OP_LINUX_RECVMSG
         | SYSCALL_OFFLOAD_OP_LINUX_RECVFROM
         | SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET => request.arg0,
-        _ => return,
+        _ => return None,
     };
-    let Some((token, status_flags)) =
-        multitask::with_current_user_process_state(|_, _, process_state| {
-            let entry = process_state.handles().get_entry(fd)?;
-            let token = match entry.handle() {
-                multitask::KernelHandle::Socket(socket) => socket.token_id(),
-                multitask::KernelHandle::InetSocket(socket) => socket.token_id(),
-                _ => return None,
-            };
-            Some((token, entry.status_flags()))
-        })
-        .flatten()
-    else {
-        return;
-    };
-    request.socket_token = token;
-    request.status_flags = status_flags;
+    let snapshot = snapshot_socket(fd)?;
+    request.socket_token = snapshot.token();
+    request.status_flags = snapshot.status_flags;
+    Some(snapshot)
 }
 
 fn populate_netd_request_payload(
     request: &mut NetdIpcRequest,
     pending_transfers: &mut PendingNetdTransfers,
+    socket: Option<&SocketSnapshot>,
 ) -> Result<(), i64> {
+    if socket.is_some_and(SocketSnapshot::is_datagram) {
+        match request.op {
+            SYSCALL_OFFLOAD_OP_LINUX_SENDTO | SYSCALL_OFFLOAD_OP_LINUX_SENDMSG => {
+                return inet_datagram::populate_send(request);
+            }
+            SYSCALL_OFFLOAD_OP_LINUX_RECVFROM => return Ok(()),
+            SYSCALL_OFFLOAD_OP_LINUX_RECVMSG => {
+                let header = usermem::read_current_user_struct::<linux_abi::LinuxMsghdr>(request.arg1)
+                    .map_err(address_space_error_to_linux_errno)?;
+                let iovecs = if header.msg_iovlen == 0 { Vec::new() } else {
+                    read_current_iovecs_payload(header.msg_iov, header.msg_iovlen)?
+                };
+                request.payload_len = iovec_payload_total_len(&iovecs)? as u32;
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
     match request.op {
         SYSCALL_OFFLOAD_OP_LINUX_BIND | SYSCALL_OFFLOAD_OP_LINUX_CONNECT => {
             copy_current_payload(request, request.arg1, request.arg2)
         }
         SYSCALL_OFFLOAD_OP_LINUX_SENDTO => {
             copy_current_payload(request, request.arg1, request.arg2)?;
-            if current_inet_socket(request.arg0) {
+            if current_inet_socket(socket) {
                 // Internet sockets carry no kernel-side stream bookkeeping:
                 // netd owns the whole byte stream.
                 return Ok(());
             }
-            let socket = current_unix_socket_handle(request.arg0).ok_or(LINUX_ENOTSOCK)?;
+            let socket = current_unix_socket_handle(socket).ok_or(LINUX_ENOTSOCK)?;
             pending_transfers.begin_send(&socket, request.payload_len as usize)
         }
         SYSCALL_OFFLOAD_OP_LINUX_SETSOCKOPT => {
@@ -1186,7 +1236,7 @@ fn populate_netd_request_payload(
             let header = usermem::read_current_user_struct::<linux_abi::LinuxMsghdr>(request.arg1)
                 .map_err(address_space_error_to_linux_errno)?;
             let mut bytes = read_current_iovec_payload(header.msg_iov, header.msg_iovlen)?;
-            let control = if current_inet_socket(request.arg0) {
+            let control = if current_inet_socket(socket) {
                 // Ancillary data on an internet socket (IP_PKTINFO, ...) has no
                 // transport here; refuse it instead of dropping it silently.
                 if header.msg_controllen != 0 {
@@ -1194,7 +1244,7 @@ fn populate_netd_request_payload(
                 }
                 EncodedControlPayload::default()
             } else {
-                let socket = current_unix_socket_handle(request.arg0).ok_or(LINUX_ENOTSOCK)?;
+                let socket = current_unix_socket_handle(socket).ok_or(LINUX_ENOTSOCK)?;
                 pending_transfers.begin_send(&socket, bytes.len())?;
                 let raw_control =
                     read_current_control_bytes(header.msg_control, header.msg_controllen)?;
@@ -1248,34 +1298,31 @@ fn populate_netd_request_payload(
             let total = iovec_payload_total_len(&iovecs)?;
             request.payload_len = total as u32;
             request.arg4 = header.msg_controllen;
-            if current_inet_socket(request.arg0) {
+            if current_inet_socket(socket) {
                 return Ok(());
             }
-            let socket = current_unix_socket_handle(request.arg0).ok_or(LINUX_ENOTSOCK)?;
+            let socket = current_unix_socket_handle(socket).ok_or(LINUX_ENOTSOCK)?;
             pending_transfers.begin_receive(&socket)?;
             Ok(())
         }
         SYSCALL_OFFLOAD_OP_LINUX_RECVFROM => {
-            if current_inet_socket(request.arg0) {
+            if current_inet_socket(socket) {
                 return Ok(());
             }
-            let socket = current_unix_socket_handle(request.arg0).ok_or(LINUX_ENOTSOCK)?;
+            let socket = current_unix_socket_handle(socket).ok_or(LINUX_ENOTSOCK)?;
             pending_transfers.begin_receive(&socket)
         }
         _ => Ok(()),
     }
 }
 
-fn current_inet_socket(fd: u64) -> bool {
-    matches!(
-        current_kernel_handle(fd),
-        Some(multitask::KernelHandle::InetSocket(_))
-    )
+fn current_inet_socket(socket: Option<&SocketSnapshot>) -> bool {
+    socket.is_some_and(|s| matches!(&s.handle, multitask::KernelHandle::InetSocket(_)))
 }
 
-fn current_unix_socket_handle(fd: u64) -> Option<multitask::SocketHandle> {
-    match current_kernel_handle(fd)? {
-        multitask::KernelHandle::Socket(socket) => Some(socket),
+fn current_unix_socket_handle(socket: Option<&SocketSnapshot>) -> Option<multitask::SocketHandle> {
+    match &socket?.handle {
+        multitask::KernelHandle::Socket(socket) => Some(socket.clone()),
         _ => None,
     }
 }
@@ -1336,10 +1383,16 @@ fn consume_netd_response_payload(
     request: &NetdIpcRequest,
     response: &NetdIpcResponse,
     receive_context: Option<(u64, u64, u8, u64)>,
+    socket: Option<&SocketSnapshot>,
 ) -> Result<(), i64> {
     let payload_len = response.payload_len as usize;
     if payload_len > NETD_IPC_PAYLOAD_CAPACITY {
         return Err(LINUX_EINVAL);
+    }
+    if socket.is_some_and(SocketSnapshot::is_datagram)
+        && matches!(request.op, SYSCALL_OFFLOAD_OP_LINUX_RECVFROM | SYSCALL_OFFLOAD_OP_LINUX_RECVMSG)
+    {
+        return inet_datagram::consume_receive(request, response);
     }
     match request.op {
         SYSCALL_OFFLOAD_OP_LINUX_RECVFROM => {
@@ -1460,7 +1513,7 @@ fn read_current_iovec_payload(iov_ptr: u64, iov_len: u64) -> Result<Vec<u8>, i64
     Ok(bytes)
 }
 
-fn read_current_iovecs_payload(
+pub(super) fn read_current_iovecs_payload(
     iov_ptr: u64,
     iov_len: u64,
 ) -> Result<Vec<linux_abi::LinuxIovec>, i64> {
@@ -1905,10 +1958,7 @@ fn write_current_sockaddr_payload(addr_ptr: u64, len_ptr: u64, payload: &[u8]) -
     if addr_ptr != 0 && !payload.is_empty() {
         let capacity = usermem::read_current_user_struct::<u32>(len_ptr)
             .map_err(address_space_error_to_linux_errno)? as usize;
-        if capacity < payload.len() {
-            return Err(LINUX_EINVAL);
-        }
-        usermem::write_current_user_bytes(addr_ptr, payload)
+        usermem::write_current_user_bytes(addr_ptr, &payload[..capacity.min(payload.len())])
             .map_err(address_space_error_to_linux_errno)?;
     }
     let len = payload.len() as u32;

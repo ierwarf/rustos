@@ -33,6 +33,35 @@
   attempt. They do not split the deadline or retry a real timeout; exact
   mutation identity transfers to housekeeping. Checkpointed epoll
   create/ADD/MOD/DEL/retire and matching purges follow the same control rail.
+  Cursor COMMIT/CANCEL and checkpoint visibility ACK likewise mutate provider
+  custody and use one full 100 ms interactive-control attempt, not the 16 ms
+  readiness rail. Final remote-VFS close uses the same control budget; if a
+  prepared cursor rejects it with EBUSY after local fd retirement, retain the
+  exact close in deferred reconciliation rather than orphan the provider.
+  Deferred replay preserves all four operation arguments,
+  flags, dirfd, mutation identity, and bounded payload; in particular an epoll
+  checkpoint ACK retains its original suboperation in arg3. Unconfirmed work
+  retains its queue owner. One explicit in-flight owner plus per-description
+  lane heads preserve order: after a failed turn only that head rotates behind
+  other ready lanes; its followers cannot run until it confirms. Admission
+  sees the in-flight owner too. The bounded allocation-free ring's selective
+  removal preserves every other entry's relative order, including wraparound.
+  A confirmed mutation awaiting ACK replaces itself by that ACK in its own
+  reserved lane slot rather than replaying an older mutation or competing for
+  fresh queue capacity.
+  Cursor-mutating foreground syscalls (cursor read, write, lseek, getdents64)
+  first take a per-description cursor gate (64 slots, 5 s wait) that is held
+  from the prepared request through user copy and COMMIT/CANCEL. The gate is
+  granted only when no other foreground owner and no queued or in-flight
+  deferred mutation exists for that description; while waiting, the caller
+  replays that description's lane itself (one replay owner at a time) instead
+  of waiting for housekeeping. vfsd therefore never sees a second cursor
+  operation on a prepared description, so a timed-out COMMIT or two threads
+  sharing a description no longer surface EBUSY (this was the libc resolv.conf
+  read: first read prepared, COMMIT timed out, the EOF read got errno 16). A
+  gate that cannot be granted in 5 s returns ETIMEDOUT, never EBUSY. Residual
+  gap: queue saturation (ENOSPC on admission) and a prepare that reaches a
+  multi-receiver vfsd after its CANCEL are not fenced; vfsd is single-receiver.
   Only non-consuming provider readiness queries use the 16 ms deadline. vfsd is
   the only intended caller of `SYS_RUSTOS_FD_*_BROKER`; gated by `VFS_POLICY`.
   Generic apps must not call those brokers directly.

@@ -828,13 +828,13 @@ fn endpoint_request_handles_require_explicit_receive_capacity() {
             recv_endpoint_with_limits(endpoint, usize::MAX),
             Err(IpcError::BufferTooSmall)
         );
-        assert_eq!(recv_endpoint(endpoint), Ok(None));
+        assert_eq!(recv_endpoint(endpoint), Err(IpcError::BufferTooSmall));
 
         let cancelled = super::cancel_endpoint_call_with_transfers(reply, 41)
             .expect("caller reclaims a request that no receiver could accept");
         assert_eq!(
             cancelled.disposition,
-            super::CancelledCallDisposition::InFlight
+            super::CancelledCallDisposition::Queued
         );
         assert_eq!(cancelled.transfers, alloc::vec![handle]);
         assert_eq!(

@@ -19,7 +19,7 @@
 use super::*;
 
 pub(super) fn run() {
-    let endpoint = syscall0(SYS_RUSTOS_IPC_ENDPOINT_CREATE);
+    let endpoint = rustos_svc_runtime::ipc::endpoint_create_with_limits(IPC_MAX_INLINE_BYTES as u64, 0);
     if endpoint < 0 {
         let _ = writeln!(
             std::io::stderr(),

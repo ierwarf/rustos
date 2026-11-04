@@ -47,24 +47,132 @@ const PENDING_VFS_MUTATION_STORAGE_CAPACITY: usize = PENDING_VFS_MUTATION_CAPACI
 const PENDING_VFS_PAYLOAD_CAPACITY: usize = 64;
 const HOUSEKEEPING_VFS_MAINTENANCE_ATTEMPTS: usize = 1;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum VfsMutationLane {
+    Description(u64),
+    Epoll(u64),
+    ProviderObject(u64, u64),
+}
+
+impl VfsMutationLane {
+    fn for_request(request: &VfsIpcRequest) -> Result<Self, i64> {
+        if request.op == VFS_IPC_OP_POLL_QUERY && request.arg0 == VFS_POLL_QUERY_EPOLL_PURGE_OBJECT {
+            return Ok(if request.arg1 == u64::from(WAITSET_PROVIDER_VFSD) {
+                Self::Description(request.arg2)
+            } else { Self::ProviderObject(request.arg1, request.arg2) });
+        }
+        if request.op == VFS_IPC_OP_CHECKPOINT_ACK && request.arg2 == u64::from(VFS_IPC_OP_POLL_QUERY) {
+            // A purge ACK carries the original mutation ID, not its target.
+            // Its queue owner must inherit the original typed lane explicitly.
+            if request.arg3 == VFS_POLL_QUERY_EPOLL_PURGE_OBJECT { return Err(LINUX_EINVAL); }
+            return Ok(Self::Epoll(request.remote_id));
+        }
+        Ok(if request.op == VFS_IPC_OP_POLL_QUERY { Self::Epoll(request.remote_id) }
+            else { Self::Description(request.remote_id) })
+    }
+}
+
 #[derive(Clone, Copy)]
 struct PendingVfsMutation {
+    lane: VfsMutationLane,
+    lane_head: bool,
     op: u16,
     fd: u64,
     remote_id: u64,
     arg0: u64,
     arg1: u64,
     arg2: u64,
+    arg3: u64,
+    flags: u32,
+    dirfd: u64,
     operation_hi: u64,
     operation_lo: u64,
     payload_len: u32,
     payload: [u8; PENDING_VFS_PAYLOAD_CAPACITY],
 }
 
+const VFS_CURSOR_GATE_SLOTS: usize = 64;
+const VFS_CURSOR_GATE_WAIT_MS: u64 = 5_000;
+
+enum VfsCursorClaim {
+    Claimed,
+    Busy,
+}
+
+struct PendingVfsMutationQueue<const N: usize> {
+    entries: RingBuffer<PendingVfsMutation, N>,
+    in_flight: Option<PendingVfsMutation>,
+    /// Descriptions whose foreground cursor transaction (prepare, copy, settle)
+    /// is open. vfsd refuses a second cursor operation on a prepared
+    /// description with EBUSY, so the compat layer serialises them here.
+    cursor_owners: [Option<u64>; VFS_CURSOR_GATE_SLOTS],
+}
+
+impl<const N: usize> PendingVfsMutationQueue<N> {
+    const fn new() -> Self {
+        Self { entries: RingBuffer::new(), in_flight: None, cursor_owners: [None; VFS_CURSOR_GATE_SLOTS] }
+    }
+
+    /// A description is claimable only when no foreground transaction owns it
+    /// and no deferred mutation (an unsettled COMMIT/CANCEL, a retained close)
+    /// is queued or being replayed for it: vfsd would still see it as prepared.
+    fn try_claim_cursor(&mut self, remote_id: u64) -> VfsCursorClaim {
+        let lane = VfsMutationLane::Description(remote_id);
+        if self.cursor_owners.contains(&Some(remote_id)) || self.any(|entry| entry.lane == lane) {
+            return VfsCursorClaim::Busy;
+        }
+        match self.cursor_owners.iter_mut().find(|slot| slot.is_none()) {
+            Some(slot) => { *slot = Some(remote_id); VfsCursorClaim::Claimed }
+            None => VfsCursorClaim::Busy,
+        }
+    }
+
+    fn release_cursor(&mut self, remote_id: u64) {
+        let slot = self.cursor_owners.iter_mut().find(|slot| **slot == Some(remote_id));
+        debug_assert!(slot.is_some(), "cursor gate released without an owner");
+        if let Some(slot) = slot { *slot = None; }
+    }
+
+    fn len(&self) -> usize { self.entries.len() }
+
+    fn any(&self, mut predicate: impl FnMut(&PendingVfsMutation) -> bool) -> bool {
+        self.in_flight.as_ref().is_some_and(&mut predicate) || self.entries.any(predicate)
+    }
+
+    fn push(&mut self, mut pending: PendingVfsMutation) -> bool {
+        pending.lane_head = !self.any(|entry| entry.lane == pending.lane);
+        self.entries.push(pending)
+    }
+
+    /// Claims the single replay owner for the first lane head (optionally of
+    /// one lane). Returns `None` while another replayer holds the owner.
+    fn pop(&mut self, lane: Option<VfsMutationLane>) -> Option<PendingVfsMutation> {
+        if self.in_flight.is_some() { return None; }
+        let pending = self.entries.remove_first(|entry| entry.lane_head && lane.is_none_or(|lane| entry.lane == lane));
+        assert!(pending.is_some() || lane.is_some() || self.entries.is_empty(), "nonempty VFS queue needs a lane head");
+        self.in_flight = pending;
+        pending
+    }
+
+    fn finish(&mut self, pending: PendingVfsMutation, retry: Option<PendingVfsMutation>) {
+        let held = self.in_flight.take().expect("VFS replay must retain its in-flight owner");
+        assert!((held.op, held.lane, held.operation_hi, held.operation_lo) ==
+            (pending.op, pending.lane, pending.operation_hi, pending.operation_lo));
+        let next = retry.or_else(|| self.entries.remove_first(|entry| entry.lane == pending.lane));
+        if let Some(mut next) = next {
+            assert_eq!(next.lane, pending.lane, "replacement must stay in its typed lane");
+            next.lane_head = true;
+            // Only lane heads rotate. Followers retain order and cannot
+            // overtake a settlement whose response alone may have been lost.
+            assert!(self.entries.push(next), "popped vfs mutation must have retry capacity");
+        }
+    }
+}
+
 static PENDING_VFS_MUTATIONS: TrackedSpinLock<
-    RingBuffer<PendingVfsMutation, PENDING_VFS_MUTATION_STORAGE_CAPACITY>,
+    PendingVfsMutationQueue<PENDING_VFS_MUTATION_STORAGE_CAPACITY>,
     { LockClass::VfsDeferredMutation as u8 },
-> = TrackedSpinLock::new(RingBuffer::new());
+> = TrackedSpinLock::new(PendingVfsMutationQueue::new());
 
 pub fn copy_string_vector(
     vector_ptr: u64,
@@ -402,6 +510,25 @@ fn vfs_request_is_replay_safe(request: &VfsIpcRequest) -> bool {
         )
 }
 
+fn vfs_request_service_class(request: &VfsIpcRequest) -> ipc_ops::ServiceIpcClass {
+    if matches!(request.op, VFS_IPC_OP_CLOSE | VFS_IPC_OP_CURSOR_SETTLE | VFS_IPC_OP_CHECKPOINT_ACK)
+        || request.op == VFS_IPC_OP_POLL_QUERY && matches!(request.arg0,
+            VFS_POLL_QUERY_EPOLL_CREATE | VFS_POLL_QUERY_EPOLL_CTL |
+            VFS_POLL_QUERY_EPOLL_RETIRE | VFS_POLL_QUERY_EPOLL_PURGE_OBJECT)
+    {
+        ipc_ops::ServiceIpcClass::InteractiveControl
+    } else {
+        ipc_ops::ServiceIpcClass::BulkData
+    }
+}
+
+fn vfs_response_needs_reconciliation(request: &VfsIpcRequest, response: &VfsIpcResponse) -> bool {
+    // The local final fd reference is already gone. A prepared cursor can
+    // reject provider close with EBUSY; that rejection must retain the exact
+    // close owner until the preceding settlement permits retirement.
+    request.op == VFS_IPC_OP_CLOSE && response.status.unsigned_abs() == LINUX_EBUSY as u32
+}
+
 fn call_vfs_ipc_request_impl(
     request: &VfsIpcRequest,
     timeout_ms: Option<u64>,
@@ -419,7 +546,10 @@ fn call_vfs_ipc_request_impl(
                 | VFS_POLL_QUERY_EPOLL_RETIRE
                 | VFS_POLL_QUERY_EPOLL_PURGE_OBJECT
         );
-    let total_timeout_ms = timeout_ms.or(replay_safe_request.then_some(30_000));
+    let service_class = vfs_request_service_class(request);
+    let control_timeout_ms = matches!(service_class, ipc_ops::ServiceIpcClass::InteractiveControl)
+        .then_some(rustos_user_abi::performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS);
+    let total_timeout_ms = timeout_ms.or(control_timeout_ms).or(replay_safe_request.then_some(30_000));
     let attempts = if replay_safe_request { 3 } else { 1 };
     let mut response = None;
     let mut last_errno = LINUX_ETIMEDOUT;
@@ -443,13 +573,13 @@ fn call_vfs_ipc_request_impl(
             Some(timeout_ms) => ipc_ops::call_service_endpoint_with_class_deadline(
                 IPC_SERVICE_VFSD,
                 as_bytes(request),
-                ipc_ops::ServiceIpcClass::BulkData,
+                service_class,
                 timeout_ms,
             ),
             None => ipc_ops::call_service_endpoint_with_class(
                 IPC_SERVICE_VFSD,
                 as_bytes(request),
-                ipc_ops::ServiceIpcClass::BulkData,
+                service_class,
             ),
         };
         match result {
@@ -511,6 +641,14 @@ fn call_vfs_ipc_request_impl(
         }
         return Err(errno);
     }
+    if vfs_response_needs_reconciliation(request, &response) {
+        enqueue_pending_vfs_mutation(request)?;
+    }
+    if response.status.unsigned_abs() == LINUX_EBUSY as u32 {
+        diagnostics::log_failed_service_call("vfsd", request.op,
+            ticks_elapsed_ms(start_ticks, crate::arch::rtc::ticks()), request.pid,
+            request.tid, LINUX_EBUSY, detail.as_deref());
+    }
     if response.status == 0 && vfs_checkpoint_ack_required(request) {
         let _ = acknowledge_vfs_checkpoint_mutation(request);
     }
@@ -528,14 +666,13 @@ fn vfs_checkpoint_ack_required(request: &VfsIpcRequest) -> bool {
 
 fn acknowledge_vfs_checkpoint_mutation(original: &VfsIpcRequest) -> Result<(), i64> {
     let ack = vfs_checkpoint_ack_request(original);
-    // A visibility ACK is already idempotent and has a background replay
-    // owner. Splitting its 16 ms rail into three calls creates requests whose
-    // reply capabilities expire before an SMP service round-trip completes.
+    // A visibility ACK mutates checkpoint custody. Give it one complete
+    // interactive-control rail, never the short readiness-query deadline.
     let last_errno = match ipc_ops::call_service_endpoint_with_class_deadline(
         IPC_SERVICE_VFSD,
         as_bytes(&ack),
-        ipc_ops::ServiceIpcClass::ReadinessQuery,
-        rustos_user_abi::performance::IPC_READINESS_QUERY_HARD_LIMIT_MS,
+        vfs_request_service_class(&ack),
+        rustos_user_abi::performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS,
     ) {
         Ok(bytes) if bytes.len() == size_of::<VfsIpcResponse>() => {
             let response = read_unaligned::<VfsIpcResponse>(&bytes);
@@ -551,7 +688,7 @@ fn acknowledge_vfs_checkpoint_mutation(original: &VfsIpcRequest) -> Result<(), i
         Ok(_) => LINUX_EINVAL,
         Err(errno) => errno,
     };
-    enqueue_pending_vfs_mutation(&ack)?;
+    enqueue_captured_vfs_mutation(PendingVfsMutation::capture_ack(original, &ack)?)?;
     Err(last_errno)
 }
 
@@ -580,21 +717,79 @@ pub fn settle_vfs_cursor_mutation(prepared: &VfsIpcRequest, commit: bool) -> Res
     } else {
         VFS_CURSOR_SETTLE_CANCEL
     };
-    let response = call_vfs_ipc_request_with_timeout(&request, 16)?;
+    let response = call_vfs_ipc_request_with_timeout(&request,
+        rustos_user_abi::performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS)?;
     ensure_vfs_status(&response)
 }
 
-fn enqueue_pending_vfs_mutation(request: &VfsIpcRequest) -> Result<(), i64> {
-    let payload_len = request.payload_len as usize;
-    if payload_len > PENDING_VFS_PAYLOAD_CAPACITY {
-        return Err(LINUX_EINVAL);
+impl PendingVfsMutation {
+    fn capture(request: &VfsIpcRequest) -> Result<Self, i64> {
+        Self::capture_in_lane(request, VfsMutationLane::for_request(request)?)
     }
+
+    fn capture_ack(original: &VfsIpcRequest, ack: &VfsIpcRequest) -> Result<Self, i64> {
+        if !vfs_checkpoint_ack_required(original) || ack.op != VFS_IPC_OP_CHECKPOINT_ACK
+            || (ack.arg0, ack.arg1) != (original.operation_hi, original.operation_lo)
+            || ack.remote_id != original.remote_id || ack.arg2 != u64::from(original.op)
+            || ack.arg3 != if original.op == VFS_IPC_OP_POLL_QUERY { original.arg0 } else { 0 }
+        { return Err(LINUX_EINVAL); }
+        Self::capture_in_lane(ack, VfsMutationLane::for_request(original)?)
+    }
+
+    fn capture_in_lane(request: &VfsIpcRequest, lane: VfsMutationLane) -> Result<Self, i64> {
+        let payload_len = request.payload_len as usize;
+        if payload_len > PENDING_VFS_PAYLOAD_CAPACITY || request.path_len != 0 {
+            return Err(LINUX_EINVAL);
+        }
+        let mut payload = [0_u8; PENDING_VFS_PAYLOAD_CAPACITY];
+        payload[..payload_len].copy_from_slice(&request.payload[..payload_len]);
+        Ok(Self {
+            lane, lane_head: true,
+            op: request.op, fd: request.fd, remote_id: request.remote_id,
+            arg0: request.arg0, arg1: request.arg1, arg2: request.arg2, arg3: request.arg3,
+            flags: request.flags, dirfd: request.dirfd,
+            operation_hi: request.operation_hi, operation_lo: request.operation_lo,
+            payload_len: request.payload_len, payload,
+        })
+    }
+
+    fn restore_into(&self, request: &mut VfsIpcRequest) {
+        request.op = self.op;
+        request.fd = self.fd;
+        request.remote_id = self.remote_id;
+        request.arg0 = self.arg0;
+        request.arg1 = self.arg1;
+        request.arg2 = self.arg2;
+        request.arg3 = self.arg3;
+        request.flags = self.flags;
+        request.dirfd = self.dirfd;
+        request.operation_hi = self.operation_hi;
+        request.operation_lo = self.operation_lo;
+        request.payload_len = self.payload_len;
+        request.payload[..self.payload_len as usize].copy_from_slice(&self.payload[..self.payload_len as usize]);
+    }
+}
+
+fn retry_vfs_mutation_later<const N: usize>(queue: &mut PendingVfsMutationQueue<N>, pending: PendingVfsMutation) {
+    // Retain this lane's first owner, allowing other lanes to progress.
+    queue.finish(pending, Some(pending));
+}
+
+fn enqueue_pending_vfs_mutation(request: &VfsIpcRequest) -> Result<(), i64> {
+    enqueue_captured_vfs_mutation(PendingVfsMutation::capture(request)?)
+}
+
+fn enqueue_captured_vfs_mutation(pending: PendingVfsMutation) -> Result<(), i64> {
+    let request = &pending;
     let mut queue = PENDING_VFS_MUTATIONS.lock();
     if queue.any(|entry| {
         if request.op == VFS_IPC_OP_CHECKPOINT_ACK {
             entry.op == VFS_IPC_OP_CHECKPOINT_ACK
+                && entry.lane == request.lane
                 && entry.arg0 == request.arg0
                 && entry.arg1 == request.arg1
+                && entry.arg2 == request.arg2
+                && entry.arg3 == request.arg3
         } else {
             entry.operation_hi == request.operation_hi && entry.operation_lo == request.operation_lo
         }
@@ -604,20 +799,7 @@ fn enqueue_pending_vfs_mutation(request: &VfsIpcRequest) -> Result<(), i64> {
     if queue.len() >= PENDING_VFS_MUTATION_CAPACITY {
         return Err(LINUX_ENOSPC);
     }
-    let mut payload = [0_u8; PENDING_VFS_PAYLOAD_CAPACITY];
-    payload[..payload_len].copy_from_slice(&request.payload[..payload_len]);
-    let admitted = queue.push(PendingVfsMutation {
-        op: request.op,
-        fd: request.fd,
-        remote_id: request.remote_id,
-        arg0: request.arg0,
-        arg1: request.arg1,
-        arg2: request.arg2,
-        operation_hi: request.operation_hi,
-        operation_lo: request.operation_lo,
-        payload_len: request.payload_len,
-        payload,
-    });
+    let admitted = queue.push(pending);
     assert!(admitted, "vfs mutation admission capacity must be reserved");
     Ok(())
 }
@@ -634,54 +816,75 @@ fn drain_pending_vfs_mutations() -> usize {
     // consumed an endless stream of already-revoked replies and starved boot.
     let mut attempted = 0usize;
     for _ in 0..HOUSEKEEPING_VFS_MAINTENANCE_ATTEMPTS {
-        let Some(pending) = PENDING_VFS_MUTATIONS.lock().pop() else {
-            return attempted;
-        };
-        attempted += 1;
-        let mut request = new_vfs_request(pending.op);
-        request.fd = pending.fd;
-        request.remote_id = pending.remote_id;
-        request.arg0 = pending.arg0;
-        request.arg1 = pending.arg1;
-        request.arg2 = pending.arg2;
-        request.operation_hi = pending.operation_hi;
-        request.operation_lo = pending.operation_lo;
-        request.payload_len = pending.payload_len;
-        let payload_len = pending.payload_len as usize;
-        request.payload[..payload_len].copy_from_slice(&pending.payload[..payload_len]);
-        let response = ipc_ops::call_service_endpoint_with_class_deadline(
-            IPC_SERVICE_VFSD,
-            as_bytes(&request),
-            ipc_ops::ServiceIpcClass::InteractiveControl,
-            rustos_user_abi::performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS,
-        )
-        .ok()
-        .and_then(|bytes| {
-            (bytes.len() == size_of::<VfsIpcResponse>())
-                .then(|| read_unaligned::<VfsIpcResponse>(&bytes))
-        });
-        let completed = response.is_some_and(|response| {
-            validate_vfs_response_envelope(request.op, &response).is_ok() && response.status == 0
-        });
-        if !completed {
-            assert!(
-                PENDING_VFS_MUTATIONS.lock().push_front(pending),
-                "popped vfs mutation must have retry capacity"
-            );
-            return attempted;
-        }
-        if vfs_checkpoint_ack_required(&request) {
-            let ack = vfs_checkpoint_ack_request(&request);
-            if enqueue_pending_vfs_mutation(&ack).is_err() {
-                assert!(
-                    PENDING_VFS_MUTATIONS.lock().push_front(pending),
-                    "popped vfs mutation must have retry capacity"
-                );
-                return attempted;
-            }
+        match replay_pending_vfs_mutation(None) {
+            Some(true) => attempted += 1,
+            Some(false) => return attempted + 1,
+            None => return attempted,
         }
     }
     attempted
+}
+
+/// Replays one lane head. `None`: nothing to replay (empty, or another
+/// replayer owns the queue); `Some(true)`: settled; `Some(false)`: the lane
+/// head failed and was parked for a later attempt.
+fn replay_pending_vfs_mutation(lane: Option<VfsMutationLane>) -> Option<bool> {
+    let pending = PENDING_VFS_MUTATIONS.lock().pop(lane)?;
+    let mut request = new_vfs_request(pending.op);
+    pending.restore_into(&mut request);
+    let response = ipc_ops::call_service_endpoint_with_class_deadline(
+        IPC_SERVICE_VFSD,
+        as_bytes(&request),
+        ipc_ops::ServiceIpcClass::InteractiveControl,
+        rustos_user_abi::performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS,
+    )
+    .ok()
+    .and_then(|bytes| {
+        (bytes.len() == size_of::<VfsIpcResponse>())
+            .then(|| read_unaligned::<VfsIpcResponse>(&bytes))
+    });
+    let completed = response.is_some_and(|response| {
+        validate_vfs_response_envelope(request.op, &response).is_ok() && response.status == 0
+    });
+    if !completed {
+        retry_vfs_mutation_later(&mut *PENDING_VFS_MUTATIONS.lock(), pending);
+        return Some(false);
+    }
+    let next = if vfs_checkpoint_ack_required(&request) {
+        // Replace the confirmed mutation by its exact ACK in the same
+        // lane, using the reserved retry slot rather than fresh admission.
+        let ack = vfs_checkpoint_ack_request(&request);
+        Some(PendingVfsMutation::capture_ack(&request, &ack).expect("exact empty visibility ACK fits"))
+    } else { None };
+    PENDING_VFS_MUTATIONS.lock().finish(pending, next);
+    Some(true)
+}
+
+/// Foreground ownership of one open file description's cursor, held from the
+/// prepared vfsd request through the user copy and its COMMIT/CANCEL.
+pub(super) struct VfsCursorGate(u64);
+
+impl Drop for VfsCursorGate {
+    fn drop(&mut self) { PENDING_VFS_MUTATIONS.lock().release_cursor(self.0); }
+}
+
+/// Orders a cursor-mutating syscall after every earlier transaction on the
+/// description: other foreground users and any unsettled deferred mutation.
+/// Reconciliation is driven here rather than left to housekeeping latency,
+/// because vfsd would answer the next cursor operation with EBUSY.
+pub(super) fn acquire_vfs_cursor_gate(remote_id: u64) -> Result<VfsCursorGate, i64> {
+    let start_ticks = crate::arch::rtc::ticks();
+    loop {
+        if matches!(PENDING_VFS_MUTATIONS.lock().try_claim_cursor(remote_id), VfsCursorClaim::Claimed) {
+            return Ok(VfsCursorGate(remote_id));
+        }
+        if ticks_elapsed_ms(start_ticks, crate::arch::rtc::ticks()) >= VFS_CURSOR_GATE_WAIT_MS {
+            return Err(LINUX_ETIMEDOUT);
+        }
+        if replay_pending_vfs_mutation(Some(VfsMutationLane::Description(remote_id))).is_none() {
+            multitask::cond_resched();
+        }
+    }
 }
 
 fn validate_vfs_response_envelope(request_op: u16, response: &VfsIpcResponse) -> Result<(), i64> {

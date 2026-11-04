@@ -543,8 +543,11 @@ pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
         }
         linux_abi::SYS_EXIT => syscall_process_exit(frame.rdi, false),
         linux_abi::SYS_EXIT_GROUP => syscall_process_exit(frame.rdi, true),
-        _ => linux_errno(LINUX_ENOSYS),
+        _ => error_ops::unimplemented_linux_syscall(frame),
     };
+    if result == linux_errno(LINUX_EBUSY) && frame.rax < 512 {
+        error_ops::record_busy_linux_syscall(frame);
+    }
 
     if frame.rax != linux_abi::SYS_RT_SIGRETURN && deliver_pending_signals_if_needed(frame) {
         return frame.rax;

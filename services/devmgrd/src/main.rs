@@ -46,7 +46,7 @@ use rustos_user_abi::syscall::{
     IPC_SERVICE_DEVMGRD, IPC_SERVICE_SESSIOND, IPC_SERVICE_UISERVER, IpcReplyWithHandlesArgs,
     RustosDeviceIoctlBrokerArgs, RustosDeviceOpenBrokerArgs, RustosIpcValidateServiceOwnerArgs,
     SYS_RUSTOS_DEVICE_IOCTL_BROKER, SYS_RUSTOS_DEVICE_OPEN_BROKER, SYS_RUSTOS_IPC_CALL,
-    SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT,
+    SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT,
     SYS_RUSTOS_IPC_RECV_WITH_SENDER, SYS_RUSTOS_IPC_REPLY, SYS_RUSTOS_IPC_REPLY_WITH_HANDLES,
     SYS_RUSTOS_IPC_VALIDATE_SERVICE_OWNER, identity_is_exact_sender,
 };
@@ -89,7 +89,7 @@ fn start_supervisor_heartbeat()->Result<(),std::io::Error>{
 
 fn main() {
     debug_line("devmgrd: service start");
-    let endpoint = syscall0(SYS_RUSTOS_IPC_ENDPOINT_CREATE);
+    let endpoint = rustos_svc_runtime::ipc::endpoint_create_with_limits(rustos_user_abi::syscall::IPC_MAX_INLINE_BYTES as u64, 0);
     if endpoint < 0 {
         let _ = writeln!(
             std::io::stderr(),

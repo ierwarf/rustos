@@ -73,6 +73,7 @@ fn prepare_layout(config: &Config, options: &SmokeOptions) -> Result<KvmLayout> 
             (private_ui_profile_requested(options) || options.exercise_network).then_some((
                 private_ui_profile_requested(options),
                 options.exercise_network,
+                options.exercise_google_ping,
             )),
             options
                 .smp_ring3_qualification
@@ -563,11 +564,12 @@ fn verify_dvm_block_ready_generation(layout: &KvmLayout, expected_generation: u6
     Ok(())
 }
 
-fn render_private_acceptance_contract(ui_profile: bool, network_exercise: bool) -> String {
+fn render_private_acceptance_contract(ui_profile: bool, network_exercise: bool, google_ping: bool) -> String {
     format!(
-        "contract=rustos-kvm-acceptance-v1\nui_profile={}\nnetwork_exercise={}\n",
+        "contract=rustos-kvm-acceptance-v1\nui_profile={}\nnetwork_exercise={}\ngoogle_ping={}\n",
         u8::from(ui_profile),
         u8::from(network_exercise),
+        u8::from(google_ping),
     )
 }
 
@@ -586,10 +588,10 @@ fn render_ipcbench_probe_contract(probe: &str) -> String {
 }
 
 /// Write every per-run KVM contract through one mounted private FAT image.
-/// Acceptance-v1 stays verbatim; Ring3 uses a disjoint path and proof mode.
+/// Ring3 qualification uses a disjoint path and proof mode.
 fn write_private_kvm_contracts(
     runtime_disk: &Path,
-    acceptance: Option<(bool, bool)>,
+    acceptance: Option<(bool, bool, bool)>,
     smp_ring3_workers: Option<u8>,
     ipcbench_probe: Option<&str>,
     oom_hog: bool,
@@ -606,12 +608,12 @@ fn write_private_kvm_contracts(
     let fs = fatfs::FileSystem::new(image, fatfs::FsOptions::new())?;
     {
         let root = fs.root_dir();
-        if let Some((ui_profile, network_exercise)) = acceptance {
+        if let Some((ui_profile, network_exercise, google_ping)) = acceptance {
             let mut contract = root
                 .create_file(PRIVATE_ACCEPTANCE_CONTRACT_PATH)
                 .context("create private KVM acceptance contract file")?;
             contract.truncate()?;
-            let contents = render_private_acceptance_contract(ui_profile, network_exercise);
+            let contents = render_private_acceptance_contract(ui_profile, network_exercise, google_ping);
             FatWrite::write_all(&mut contract, contents.as_bytes())?;
             FatWrite::flush(&mut contract)?;
         }

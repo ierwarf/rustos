@@ -104,7 +104,7 @@ use rustos_user_abi::syscall::{
     ROOTD_LEASE_STATE_RESTART_PENDING, ROOTD_LEASE_STATE_RUNNING,
     ROOTD_MEMORY_BROKER_ABI_VERSION, ROOTD_TERMINATE_BROKER_ABI_VERSION,
     RustosRootdMemoryBrokerArgs, SCHEDULING_CONTEXT_POLICY_ABI_UNSET, SYS_RUSTOS_IPC_CALL,
-    SYS_RUSTOS_IPC_ENDPOINT_CREATE, SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT,
+    SYS_RUSTOS_IPC_LOOKUP_SERVICE_ENDPOINT,
     SYS_RUSTOS_IPC_RECV_WITH_SENDER, SYS_RUSTOS_IPC_RECV_WITH_SENDER_BOUNDED,
     SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT, SYS_RUSTOS_IPC_REPLY,
     SYS_RUSTOS_IPC_TRY_RECV_WITH_SENDER, SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER,
@@ -482,7 +482,7 @@ fn post_init_lease(spec: PostInitServiceSpec) -> PostInitLease {
 }
 
 fn create_rootd_endpoint() -> u64 {
-    let endpoint = syscall0(SYS_RUSTOS_IPC_ENDPOINT_CREATE);
+    let endpoint = rustos_svc_runtime::ipc::endpoint_create_with_limits(size_of::<CommercialMaxProtocolRequest>() as u64, 0);
     if endpoint < 0 {
         fail_closed(b"rootd: fatal endpoint create failed\n");
     }

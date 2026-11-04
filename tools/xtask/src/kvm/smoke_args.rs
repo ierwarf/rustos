@@ -25,6 +25,7 @@ struct SmokeOptions {
     expect_block_flush_fault: bool,
     exercise_input: bool,
     exercise_network: bool,
+    exercise_google_ping: bool,
     gui_dvm_surfaces: bool,
     dvm_network_shmem: bool,
     dvm_block_shmem: bool,
@@ -114,6 +115,7 @@ where
         expect_block_flush_fault: false,
         exercise_input: false,
         exercise_network: false,
+        exercise_google_ping: false,
         gui_dvm_surfaces: false,
         dvm_network_shmem: false,
         dvm_block_shmem: false,
@@ -168,6 +170,7 @@ where
             "--storage-dvm-expect-flush-fault" => options.expect_block_flush_fault = true,
             "--exercise-input" => options.exercise_input = true,
             "--exercise-network" => options.exercise_network = true,
+            "--exercise-google-ping" => options.exercise_google_ping = true,
             "--gui-dvm-surfaces" => options.gui_dvm_surfaces = true,
             "--dvm-network-shmem" => options.dvm_network_shmem = true,
             "--dvm-block-shmem" => options.dvm_block_shmem = true,
@@ -457,6 +460,12 @@ where
                 .expected_markers
                 .push(WAYCLICK_FIRST_FRAME_MARKER.to_owned());
         }
+    }
+    if options.exercise_google_ping && !options.exercise_network {
+        bail!("--exercise-google-ping requires --exercise-network");
+    }
+    if options.exercise_network && options.physical_gpu_bdf.is_some() {
+        bail!("--exercise-network cannot use --physical-gpu: physical GPU topology has -net none");
     }
     if options.exercise_network && !options.dvm_network_shmem {
         bail!("--exercise-network requires --dvm-network-shmem");

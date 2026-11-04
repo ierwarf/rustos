@@ -50,6 +50,9 @@ pub(super) struct EndpointReceiverWaiter {
 #[derive(Default)]
 pub(super) struct EndpointObject {
     pub(super) owner: Option<EndpointOwner>,
+    /// Immutable transport shape, selected by the owner before publication.
+    pub(super) max_request_handles: usize,
+    pub(super) max_request_bytes: usize,
     pub(super) pending_messages: VecDeque<u64>,
     pub(super) pending_system_messages: VecDeque<u64>,
     consecutive_system_deliveries: u8,
@@ -70,6 +73,8 @@ impl EndpointObject {
     ) -> Self {
         Self {
             owner,
+            max_request_handles: super::MAX_ENDPOINT_TRANSFER_HANDLES,
+            max_request_bytes: super::MAX_ENDPOINT_INLINE_MESSAGE_BYTES,
             pending_messages,
             pending_system_messages,
             consecutive_system_deliveries: 0,

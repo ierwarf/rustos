@@ -109,6 +109,11 @@ pub const SYS_RUSTOS_CHECKPOINT_JOURNAL: u64 = 0x5255_005d;
 /// kernel never asks rootd about a lookup or a registration; rootd decides
 /// once, ahead of time, and the kernel only consults the installed table.
 pub const SYS_RUSTOS_SERVICE_POLICY: u64 = 0x5255_005f;
+/// Create a process-owned endpoint with immutable request-byte capacity in
+/// rdi (1..=IPC_MAX_INLINE_BYTES) and handle capacity in rsi
+/// (0..=IPC_MAX_TRANSFER_HANDLES). Owners declare their receive shape before
+/// publication, so incompatible requests cannot block a service queue.
+pub const SYS_RUSTOS_IPC_ENDPOINT_CREATE_WITH_LIMITS: u64 = 0x5255_0060;
 /// Capability-gated, event-driven wait for the DVM input transport. Only
 /// inputd may use this to wait for an MSI-X-published ingress batch; input
 /// policy and translation remain in the service.
@@ -971,9 +976,11 @@ pub const ROOTD_LEASE_STATE_RUNNING: u16 = 1;
 pub const ROOTD_LEASE_STATE_EXITED: u16 = 2;
 pub const ROOTD_LEASE_STATE_RESTART_PENDING: u16 = 3;
 pub const ROOTD_LEASE_STATE_FAILED: u16 = 4;
-pub const NETD_IPC_ABI_VERSION: u16 = 7;
+pub const NETD_IPC_ABI_VERSION: u16 = 8;
+pub mod netd_message;
 pub const NETD_IPC_PAYLOAD_CAPACITY: usize = 32 * 1024;
-/// Netd v7 sends only the fixed header plus `payload_len`; the unused tail of
+/// Netd v8 retains the fixed deadline header and adds copied IPv4 addresses
+/// to datagram message envelopes. Only the header plus `payload_len` is sent; the unused tail of
 /// the in-memory transport buffer is not copied through the kernel IPC path.
 pub const NETD_IPC_REQUEST_HEADER_SIZE: usize =
     core::mem::size_of::<NetdIpcRequest>() - NETD_IPC_PAYLOAD_CAPACITY;
@@ -2595,6 +2602,7 @@ pub struct NetBrokerPrepareSocketPublication {
 // module whenever the compatibility feature is selected.
 const NET_BROKER_PUBLICATION_AF_INET: u64 = 2;
 const NET_BROKER_PUBLICATION_SOCK_STREAM: u64 = 1;
+const NET_BROKER_PUBLICATION_SOCK_DGRAM: u64 = 2;
 const NET_BROKER_PUBLICATION_SOCK_TYPE_MASK: u64 = 0xf;
 const NET_BROKER_PUBLICATION_SOCK_NONBLOCK: u64 = 0o4000;
 const NET_BROKER_PUBLICATION_SOCK_CLOEXEC: u64 = 0o2000000;
@@ -2610,16 +2618,26 @@ const _: () = {
     assert!(NET_BROKER_PUBLICATION_SOCK_CLOEXEC == crate::linux::SOCK_CLOEXEC);
 };
 
+/// Closed, non-raw IPv4 socket envelope shared by publication and handle admission.
+/// Datagram ICMP permits echo only; netd enforces the packet policy in Ring3.
+pub const fn net_broker_inet_socket_shape_valid(domain: u64, socket_type: u64, protocol: u64) -> bool {
+    let base_type = socket_type & NET_BROKER_PUBLICATION_SOCK_TYPE_MASK;
+    domain == NET_BROKER_PUBLICATION_AF_INET
+        && socket_type & !(NET_BROKER_PUBLICATION_SOCK_TYPE_MASK | NET_BROKER_PUBLICATION_ALLOWED_SOCKET_FLAGS) == 0
+        && match base_type {
+            NET_BROKER_PUBLICATION_SOCK_STREAM => protocol == 0 || protocol == 6,
+            NET_BROKER_PUBLICATION_SOCK_DGRAM => protocol == 0 || protocol == 17 || protocol == 1,
+            _ => false,
+        }
+}
+
 /// Returns whether a reply-bound socket-publication record has the intrinsic,
-/// versioned AF_INET stream shape.  The broker separately binds `caller_pid`
+/// versioned AF_INET TCP, UDP or echo-datagram shape.  The broker separately binds `caller_pid`
 /// to the outer request's process identity and the reply capability to netd's
 /// live endpoint owner.
 pub const fn net_broker_socket_publication_shape_valid(
     publication: &NetBrokerPrepareSocketPublication,
 ) -> bool {
-    let base_type = publication.socket_type & NET_BROKER_PUBLICATION_SOCK_TYPE_MASK;
-    let unknown_socket_bits = publication.socket_type
-        & !(NET_BROKER_PUBLICATION_SOCK_TYPE_MASK | NET_BROKER_PUBLICATION_ALLOWED_SOCKET_FLAGS);
     publication.version == NET_BROKER_SOCKET_PUBLICATION_VERSION
         && publication.reserved0 == 0
         && publication.reserved1 == 0
@@ -2628,9 +2646,7 @@ pub const fn net_broker_socket_publication_shape_valid(
         && publication.reply_cap != 0
         && publication.caller_pid != 0
         && publication.socket_token != 0
-        && publication.domain == NET_BROKER_PUBLICATION_AF_INET
-        && base_type == NET_BROKER_PUBLICATION_SOCK_STREAM
-        && unknown_socket_bits == 0
+        && net_broker_inet_socket_shape_valid(publication.domain, publication.socket_type, publication.protocol)
 }
 
 #[cfg(kani)]
@@ -2668,10 +2684,13 @@ mod net_broker_socket_publication_verification {
             assert_ne!(publication.caller_pid, 0);
             assert_ne!(publication.socket_token, 0);
             assert_eq!(publication.domain, NET_BROKER_PUBLICATION_AF_INET);
-            assert_eq!(
-                publication.socket_type & NET_BROKER_PUBLICATION_SOCK_TYPE_MASK,
-                NET_BROKER_PUBLICATION_SOCK_STREAM
-            );
+            let base_type = publication.socket_type & NET_BROKER_PUBLICATION_SOCK_TYPE_MASK;
+            assert!(base_type == NET_BROKER_PUBLICATION_SOCK_STREAM || base_type == NET_BROKER_PUBLICATION_SOCK_DGRAM);
+            if base_type == NET_BROKER_PUBLICATION_SOCK_STREAM {
+                assert!(publication.protocol == 0 || publication.protocol == 6);
+            } else {
+                assert!(publication.protocol == 0 || publication.protocol == 17 || publication.protocol == 1);
+            }
             assert_eq!(
                 publication.socket_type
                     & !(NET_BROKER_PUBLICATION_SOCK_TYPE_MASK
@@ -2693,8 +2712,7 @@ mod net_broker_socket_publication_verification {
             || publication.caller_pid == 0
             || publication.socket_token == 0
             || publication.domain != NET_BROKER_PUBLICATION_AF_INET
-            || publication.socket_type & NET_BROKER_PUBLICATION_SOCK_TYPE_MASK
-                != NET_BROKER_PUBLICATION_SOCK_STREAM
+            || !net_broker_inet_socket_shape_valid(publication.domain, publication.socket_type, publication.protocol)
             || publication.socket_type
                 & !(NET_BROKER_PUBLICATION_SOCK_TYPE_MASK
                     | NET_BROKER_PUBLICATION_ALLOWED_SOCKET_FLAGS)
@@ -2712,6 +2730,8 @@ mod net_broker_socket_publication_verification {
         kani::cover!(
             publication.socket_type & NET_BROKER_PUBLICATION_SOCK_TYPE_MASK
                 != NET_BROKER_PUBLICATION_SOCK_STREAM
+                && publication.socket_type & NET_BROKER_PUBLICATION_SOCK_TYPE_MASK
+                != NET_BROKER_PUBLICATION_SOCK_DGRAM
         );
         kani::cover!(
             publication.socket_type

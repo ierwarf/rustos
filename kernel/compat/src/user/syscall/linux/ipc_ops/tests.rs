@@ -3,6 +3,17 @@ use super::*;
 mod inline_reply;
 
 #[test]
+fn bounded_endpoint_creation_is_an_ipc_primitive_and_rejects_invalid_shape_before_admission() {
+    let number = linux_abi::SYS_RUSTOS_IPC_ENDPOINT_CREATE_WITH_LIMITS;
+    assert!(is_linux_rustos_ipc_syscall(number));
+    assert_eq!(number, rustos_user_abi::syscall::SYS_RUSTOS_IPC_ENDPOINT_CREATE_WITH_LIMITS);
+    for (bytes, handles) in [(0, 0), (u64::MAX, 0), (16, u64::MAX),
+        (16, rustos_user_abi::syscall::IPC_MAX_TRANSFER_HANDLES as u64 + 1)] {
+        assert_eq!(syscall_linux_rustos_ipc_endpoint_create_with_limits(bytes, handles), linux_errno(LINUX_EINVAL));
+    }
+}
+
+#[test]
 fn public_ipc_calls_share_the_finite_service_deadline() {
     const {
         assert!(SERVICE_IPC_TIMEOUT_MS > 0);

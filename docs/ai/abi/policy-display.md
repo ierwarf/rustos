@@ -6,7 +6,7 @@
 
 Routed Linux ops after bootstrap: `socket`, `socketpair`, socket `dup`/`dup2`/`dup3`, socket `close`, socket `read`/`write`/`writev`, `bind`, `listen`, `accept`/`accept4`, `connect`, `sendto`, `recvfrom`, `sendmsg`, `recvmsg`, `getsockname`, `getpeername`, `setsockopt`, `getsockopt`, `shutdown`.
 
-netd invokes gated `SYS_RUSTOS_NET_BROKER` with target pid. Net broker arg struct carries six 64-bit syscall arg slots. Kernel performs handle install and target user-memory validation/copy; AF_UNIX socket lifecycle, binding/listen queues, byte queues, and socket option policy belong to netd. Version-7 `NetdIpcRequest`/`Response` frames copy an exact 136/32-byte header plus only the actual bounded payload, rather than a fixed maximum-size buffer. Request offset 112 carries a mandatory nonzero absolute `CLOCK_MONOTONIC` deadline; the frames also carry `socket_token`, fd `status_flags`, and a bounded inline payload for this service-owned socket path.
+netd invokes gated `SYS_RUSTOS_NET_BROKER` with target pid. Net broker arg struct carries six 64-bit syscall arg slots. Kernel performs handle install and target user-memory validation/copy; AF_UNIX socket lifecycle, binding/listen queues, byte queues, and socket option policy belong to netd. Version-8 `NetdIpcRequest`/`Response` frames copy an exact 136/32-byte header plus only the actual bounded payload, rather than a fixed maximum-size buffer. Request offset 112 carries a mandatory nonzero absolute `CLOCK_MONOTONIC` deadline; the frames also carry `socket_token`, fd `status_flags`, and a bounded inline payload for this service-owned socket path.
 
 The producer fixes that transaction end before payload preparation and reuses
 it for every foreground retry. The kernel reply wait floors the same monotonic
@@ -39,11 +39,20 @@ polls; there is no thread-per-request fallback. All socket poll/epoll waits now
 query netd readiness generation (one `NETD_IPC_OP_POLL_BATCH` exchange per scan,
 per-socket generations), register the shared bounded wait token, and
 re-query before sleeping and after wake. Because the DVM packet ring currently
-exposes no userspace interrupt edge, netd owns one fixed 1 ms INET ingress
-worker; one bounded smoltcp poll per turn publishes a generation only when
-smoltcp reports a socket-state transition. The worker admits at most 32
-ingress packets before yielding. This lets new external packets wake
-an already-sleeping generic wait without moving network policy into ring0.
+exposes no userspace interrupt edge, netd owns one fixed 10 ms INET ingress
+worker (100 ms while no INET sockets exist). It admits at most 32 ingress
+packets per turn. Every shared-stack poll, including polls inside request
+handlers, and cross-socket datagram/error staging participates in one tracked
+network-state transaction. Socket-table mutations retain dirty identities;
+Unix checks also include their old/current peer, without scanning unrelated
+Unix sockets. Shared INET advancement examines the resident INET set, as
+smoltcp itself does; the packet budget is not a socket-count-independent CPU
+bound. Changed readiness and its per-socket generation are recorded under the
+same mutex, including error returns and final close. Poll replies flush those
+records before reading their generation. Broker signals occur only after
+unlock; strictly-newer generation matching tolerates out-of-order signals
+from concurrent publishers. This lets new external packets wake an already
+sleeping generic wait without moving network policy into ring0.
 
 This removes avoidable copies and waits, but standard AF_UNIX data still makes
 a synchronous compat-to-netd service round trip for every send/receive. The
@@ -62,6 +71,64 @@ wake with the input reader's wake, and rearms only after main-loop dispatch. A
 client commit can therefore wake the main loop before its runtime deadline.
 Runtime/QEMU evidence remains a release gate; source/model completion alone
 does not satisfy the 55 FPS gate.
+
+### IPv4 datagrams and external echo proof
+
+- `netd` owns IPv4 TCP, UDP (`SOCK_DGRAM`, protocol 0/17), and unprivileged
+  ICMP echo (`SOCK_DGRAM`, protocol 1). Raw sockets are not admitted. Kernel
+  publication accepts only this closed type/protocol envelope and binds the
+  initial provider reference to the exact timely reply; it does not parse DNS
+  or generate IP/UDP/ICMP packets. Stack randomness, like socket capabilities,
+  is seeded from the admitted entropy broker without a deterministic fallback.
+- Netd v8 retains the 136/32-byte fixed request/response headers and the v7
+  absolute-deadline discipline. Datagram `sendto`/`recvfrom` and
+  `sendmsg`/`recvmsg` use a 16-byte envelope: four native-endian u32 fields
+  (data length, control length, output flags, address length), followed by data,
+  control and an optional copied 16-byte IPv4 sockaddr. Ancillary datagram
+  sends are explicitly unsupported. No service dereferences a caller pointer.
+- A syscall snapshots socket token, kind and flags together and retains that
+  identity through payload preparation and copyout, rather than reclassifying
+  a reusable numeric fd after IPC. Datagram `writev` sends one enveloped,
+  atomic message, including an empty nonzero-iov message; stream `writev` may
+  return a bounded prefix. `read(fd, ..., 0)` does not dequeue, whereas a
+  zero-capacity `recvfrom` consumes one datagram. `MSG_PEEK`, `MSG_TRUNC`, and
+  source-address truncation preserve Linux message semantics.
+- UDP autobinds an ephemeral port; connected receives accept only that peer.
+  Explicit UDP ports below 1024 are denied until an authoritative binding
+  capability is supplied; kernel bootstrap UID stamps cannot substitute for
+  syscalld-owned Linux credentials. Echo sockets allocate
+  a unique local identifier, rewrite the checksum and identifier, and permit
+  only Echo Request transmission and Echo Reply delivery. Foreign peer/type
+  traffic is filtered before readiness publication. One bounded staged receive
+  packet per socket supports non-consuming peek for UDP and ICMP.
+- UDP `SOL_IP/IP_RECVERR` enables a bounded error queue, including when set
+  before autobind. Ring3 Ethernet ingress validates destination MAC/IP, complete
+  outer IPv4/ICMP lengths and checksums, then preserves original ICMP error
+  bytes. Quoted local/peer endpoints and original fragmentation bits are
+  checked before destination-unreachable/time-exceeded errors enter a socket's
+  queue. Minimum quotations (original IP header plus eight UDP bytes) are
+  admitted without demanding unquoted payload; original next-hop MTU is kept.
+  The smoltcp ICMP socket re-emits/lossily reconstructs quotations and is not
+  used for this error path. No application raw socket is exposed. `SO_ERROR`, normal I/O error delivery, `POLLERR`, and
+  nonblocking `recvmsg(MSG_ERRQUEUE)` expose actual errors; the latter carries
+  `sock_extended_err` plus offender address and quoted UDP payload. Kernel
+  copyout admits only this typed, bounded control record, never SCM_RIGHTS.
+  This is required by glibc 2.39's resolver, which aborts before sending DNS if
+  `__res_enable_icmp` fails; returning fake setsockopt success is forbidden.
+- This first deployment is IPv4 unicast on the existing QEMU-usernet route.
+  IPv6, IP fragmentation, multicast, UDP reuse binding and full PMTU policy
+  are not claimed. Fixed INET buffer resizing and enabling reuse explicitly
+  fail rather than reporting an effect that did not occur. Payloads above the supported frame budget fail
+  explicitly; they are not split into independent datagrams.
+- `assets/image/etc/resolv.conf` configures libc's resolver for the current
+  QEMU DNS gateway, `10.0.2.3`; DNS policy remains userspace. Other deployments
+  must supply their own resolver/network configuration.
+- `--exercise-network` remains an offline gateway plus consumed-ring proof.
+  Opt-in `--exercise-google-ping` additionally requires guest libc resolution
+  of `google.com` and a real Echo Reply matching address, assigned identifier,
+  sequence, random payload and checksum. Host ping, TCP success, gateway-only
+  traffic and unmatched replies cannot satisfy this gate. The private KVM
+  contract's optional `google_ping` boolean requires `network_exercise=1`.
 
 ## Process Policy Surface (`procd`)
 

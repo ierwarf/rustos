@@ -100,6 +100,22 @@ impl<T: Copy, const CAPACITY: usize> RingBuffer<T, CAPACITY> {
         value
     }
 
+    /// Remove the first matching item without reordering any remaining item.
+    /// Linear bounded scan/compaction; no allocation and total at capacity 0.
+    pub fn remove_first(&mut self, mut predicate: impl FnMut(&T) -> bool) -> Option<T> {
+        let offset = (0..self.len).find(|offset| {
+            self.data[(self.head + offset) % CAPACITY].as_ref().is_some_and(&mut predicate)
+        })?;
+        let removed = self.data[(self.head + offset) % CAPACITY].take();
+        for index in offset..self.len - 1 {
+            let from = (self.head + index + 1) % CAPACITY;
+            let to = (self.head + index) % CAPACITY;
+            self.data[to] = self.data[from].take();
+        }
+        self.len -= 1;
+        removed
+    }
+
     pub fn peek(&self) -> Option<T> {
         if self.len == 0 {
             return None;
@@ -156,6 +172,21 @@ impl<T: Copy, const CAPACITY: usize> Default for RingBuffer<T, CAPACITY> {
 #[cfg(test)]
 mod tests {
     use super::RingBuffer;
+
+    #[test]
+    fn selective_removal_preserves_wrapped_order_and_capacity() {
+        let mut ring = RingBuffer::<u8, 4>::new();
+        for value in 1..=4 { assert!(ring.push(value)); }
+        assert_eq!(ring.pop(), Some(1));
+        assert_eq!(ring.pop(), Some(2));
+        assert!(ring.push(5));
+        assert!(ring.push(6));
+        assert_eq!(ring.remove_first(|value| *value == 5), Some(5));
+        assert_eq!(ring.remove_first(|value| *value == 9), None);
+        assert!(ring.push(7));
+        assert_eq!([ring.pop(), ring.pop(), ring.pop(), ring.pop()], [Some(3), Some(4), Some(6), Some(7)]);
+        assert_eq!(RingBuffer::<u8, 0>::new().remove_first(|_| true), None);
+    }
 
     #[test]
     fn zero_capacity_is_total_and_never_indexes_or_divides() {

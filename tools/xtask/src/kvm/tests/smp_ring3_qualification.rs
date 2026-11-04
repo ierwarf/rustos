@@ -456,8 +456,8 @@ pub(super) fn smp_ring3_qualification_rejects_interleaved_tampered_and_plain_fra
 
 pub(super) fn private_kvm_contract_renderers_are_canonical() {
     assert_eq!(
-        render_private_acceptance_contract(true, false),
-        "contract=rustos-kvm-acceptance-v1\nui_profile=1\nnetwork_exercise=0\n"
+        render_private_acceptance_contract(true, false, false),
+        "contract=rustos-kvm-acceptance-v1\nui_profile=1\nnetwork_exercise=0\ngoogle_ping=0\n"
     );
     assert_eq!(
         render_smp_ring3_qualification_contract(8),

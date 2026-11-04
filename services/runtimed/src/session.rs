@@ -23,7 +23,7 @@ use rustos_user_abi::syscall::{
     COMMERCIAL_MAX_SESSIOND_OP_TTY_LINE_DISCIPLINE, COMMERCIAL_MAX_SESSIOND_OP_UI_BOOTSTRAP,
     IPC_SERVICE_DEVMGRD, IPC_SERVICE_SESSIOND, SESSIOND_CONSOLE_GRAPH_WAIT_MAX_MS,
     SESSIOND_CONSOLE_READINESS_LIVE, SESSIOND_CONSOLE_READINESS_READY,
-    SESSIOND_CONSOLE_READ_WAIT_MAX_MS, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
+    SESSIOND_CONSOLE_READ_WAIT_MAX_MS,
     SYS_RUSTOS_IPC_RECV_WITH_SENDER_BOUNDED, SYS_RUSTOS_IPC_REPLY,
     SYS_RUSTOS_IPC_TRY_RECV_WITH_SENDER, SYS_RUSTOS_WAITSET_SIGNAL_BROKER, WAITSET_ABI_VERSION,
     WAITSET_PROVIDER_SESSIOND,
@@ -701,7 +701,7 @@ fn wait_for_service_endpoint(service_id: u64) -> Result<(), i32> {
 pub(super) fn create_session_endpoint() -> Option<u64> {
     let started_at = Instant::now();
     super::spawn::debug_line("runtimed: session endpoint create begin");
-    let endpoint = unsafe { libc::syscall(SYS_RUSTOS_IPC_ENDPOINT_CREATE as libc::c_long) as i64 };
+    let endpoint = rustos_svc_runtime::ipc::endpoint_create_with_limits(size_of::<CommercialMaxProtocolRequest>() as u64, 0);
     if endpoint < 0 {
         super::spawn::debug_line("runtimed: session endpoint create failed");
         return None;

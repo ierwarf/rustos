@@ -1068,8 +1068,14 @@ reason = "The service loop owns byte-only reply-receive phase handling and must 
 [[risk_surfaces]]
 path = "services/netd/src/main.rs"
 severity = "critical"
-flows = ["dvm-network-ingress", "netd-deferred-reply-lifecycle"]
-reason = "Netd owns packet admission, one-time absolute deadline tightening, and exact deferred socket reply settlement."
+flows = ["dvm-network-ingress", "netd-deferred-reply-lifecycle", "waitset"]
+reason = "Netd owns packet admission, one-time absolute deadline tightening, exact deferred socket reply settlement, and stack-driven readiness mutation."
+
+[[risk_surfaces]]
+path = "services/netd/src/readiness.rs"
+severity = "critical"
+flows = ["waitset"]
+reason = "Dirty socket identity, shared-stack staging, mutex-held generation stamping, and post-unlock publication close cross-socket readiness races."
 
 [[risk_surfaces]]
 path = "services/runtimed/src/spawn.rs"
@@ -1580,6 +1586,10 @@ models = [
 ]
 
 [[source_mappings]]
+path = "kernel/nucleus-core/src/util/ring.rs"
+models = ["service-mutation-recovery/ServiceMutationRecovery"]
+
+[[source_mappings]]
 path = "kernel/compat/src/user/syscall/linux/service_ops/ipc_helpers.rs"
 models = [
     "scheduling-context-budget/SchedulingContextBudget",
@@ -1679,7 +1689,12 @@ path = "services/netd/src/main.rs"
 models = [
     "ipc-transfer-authority/IpcTransferAuthority",
     "netd-deferred-reply/NetdDeferredReply",
+    "userspace-wait-set/UserspaceWaitSet",
 ]
+
+[[source_mappings]]
+path = "services/netd/src/readiness.rs"
+models = ["userspace-wait-set/UserspaceWaitSet"]
 
 [[source_mappings]]
 path = "kernel/ps/src/multitask/reschedule_observation.rs"
@@ -2191,6 +2206,13 @@ models = ["futex-waiter-lifecycle/FutexWaiterLifecycle"]
 [[source_mappings]]
 path = "kernel/compat/src/user/syscall/linux.rs"
 models = ["futex-waiter-lifecycle/FutexWaiterLifecycle"]
+
+# Ordinary syscall error breadcrumbs share the same serialized sink route as
+# ordinary user exceptions. This mapping covers that diagnostic custody only,
+# not a proof of the complete Linux errno/syscall surface.
+[[source_mappings]]
+path = "kernel/compat/src/user/syscall/linux/error_ops.rs"
+models = ["exception-diagnostic-custody/ExceptionDiagnosticCustody"]
 
 [[source_mappings]]
 path = "kernel/compat/src/user/syscall/linux/broker_ops.rs"

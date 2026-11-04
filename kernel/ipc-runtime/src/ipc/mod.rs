@@ -1568,10 +1568,34 @@ pub fn create_endpoint_for_process_in_group(
     create_endpoint_with_owner(Some(EndpointOwner::Process(owner_process_id)), Some(kmem_group))
 }
 
+/// The receiver declares its immutable transport capacity before any caller
+/// can publish a request. Byte-only services choose zero; heterogeneous
+/// endpoints may retain the legacy full transfer capacity.
+pub fn create_endpoint_for_process_with_limits(
+    owner_process_id: u64,
+    max_request_bytes: usize,
+    max_request_handles: usize,
+    kmem_group: Option<usize>,
+) -> Result<KernelEndpointHandle, IpcError> {
+    create_endpoint_with_owner_and_limits(Some(EndpointOwner::Process(owner_process_id)), kmem_group, max_request_bytes, max_request_handles)
+}
+
 fn create_endpoint_with_owner(
     owner: Option<EndpointOwner>,
     kmem_group: Option<usize>,
 ) -> Result<KernelEndpointHandle, IpcError> {
+    create_endpoint_with_owner_and_limits(owner, kmem_group, MAX_ENDPOINT_INLINE_MESSAGE_BYTES, MAX_ENDPOINT_TRANSFER_HANDLES)
+}
+
+fn create_endpoint_with_owner_and_limits(
+    owner: Option<EndpointOwner>,
+    kmem_group: Option<usize>,
+    max_request_bytes: usize,
+    max_request_handles: usize,
+) -> Result<KernelEndpointHandle, IpcError> {
+    if max_request_handles > MAX_ENDPOINT_TRANSFER_HANDLES || max_request_bytes == 0 || max_request_bytes > MAX_ENDPOINT_INLINE_MESSAGE_BYTES {
+        return Err(IpcError::InvalidArgument);
+    }
     if let Some(owner) = owner {
         ENDPOINT_QUOTAS.lock().reserve(owner)?;
     }
@@ -1607,6 +1631,8 @@ fn create_endpoint_with_owner(
             return Err(error);
         }
     };
+    endpoint.max_request_handles = max_request_handles;
+    endpoint.max_request_bytes = max_request_bytes;
     if let Some(group) = kmem_group {
         let bytes = endpoint.reserved_queue_bytes();
         if !kernel_mm::api::kmem_charge::try_charge(
@@ -1631,6 +1657,13 @@ fn create_endpoint_with_owner(
             Err(IpcError::NoMemory)
         }
     }
+}
+
+pub fn validate_endpoint_request_shape(endpoint: KernelEndpointHandle, request_len: usize, count: usize) -> Result<(), IpcError> {
+    ENDPOINTS.with(endpoint.raw(), |object| {
+        if request_len == 0 || request_len > object.max_request_bytes { return Err(IpcError::InvalidArgument); }
+        if count > object.max_request_handles { Err(IpcError::InvalidArgument) } else { Ok(()) }
+    }).ok_or(IpcError::InvalidHandle)?
 }
 
 fn validate_endpoint_transfer_handles(
@@ -1793,8 +1826,13 @@ fn enqueue_endpoint_call_with_handles_faultable(
     let mut kmem_guard = MessageKmemGuard(message_kmem);
 
     let receiver_owner = ENDPOINTS
-        .with(endpoint.raw(), |endpoint| endpoint.owner)
-        .ok_or(IpcError::InvalidHandle)?;
+        .with(endpoint.raw(), |endpoint| {
+            if request.len() > endpoint.max_request_bytes { return Err(IpcError::InvalidArgument); }
+            if attached_handles.len() > endpoint.max_request_handles {
+                Err(IpcError::InvalidArgument)
+            } else { Ok(endpoint.owner) }
+        })
+        .ok_or(IpcError::InvalidHandle)??;
 
     let mut request_handles = Vec::new();
     request_handles
@@ -1922,6 +1960,7 @@ pub fn reserve_fast_endpoint_call_with_response_capacity(
 
     ENDPOINTS
         .with_mut(endpoint.raw(), |endpoint_object| {
+            if request.len() > endpoint_object.max_request_bytes { return Err(IpcError::InvalidArgument); }
             if endpoint_object.has_pending() {
                 return Err(IpcError::NoMemory);
             }
@@ -2084,12 +2123,18 @@ pub fn take_fast_endpoint_request_inline<const N: usize>(
 ) -> Result<Option<FastEndpointReceived<N>>, IpcError> {
     ENDPOINTS
         .with_mut(endpoint.raw(), |endpoint_object| {
-            endpoint_receive::take_fast_request_inline::<N>(
+            let received = endpoint_receive::take_fast_request_inline::<N>(
                 endpoint_object,
                 endpoint,
                 receiver_task_id,
                 request_capacity.min(IPC_FAST_MAX_BYTES),
-            )
+            )?;
+            // Unlike receive-or-wait, a direct fast-frame take is an exact
+            // receiver operation, not a search for other available work.
+            if received.is_none() && endpoint_object.fast_reply.is_some() {
+                return Err(IpcError::PermissionDenied);
+            }
+            Ok(received)
         })
         .ok_or(IpcError::InvalidHandle)?
 }

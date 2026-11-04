@@ -156,6 +156,11 @@ raw_u64! {
     SOCK_NONBLOCK = linux::O_NONBLOCK;
     SOCK_CLOEXEC = linux::O_CLOEXEC;
     MSG_DONTWAIT = linux_net::MSG_DONTWAIT;
+    MSG_PEEK = linux_net::MSG_PEEK;
+    MSG_TRUNC = linux_net::MSG_TRUNC;
+    MSG_ERRQUEUE = linux_net::MSG_ERRQUEUE;
+    SOL_IP = linux_net::SOL_IP;
+    IP_RECVERR = linux_net::IP_RECVERR;
     MSG_NOSIGNAL = linux_net::MSG_NOSIGNAL;
     MSG_CMSG_CLOEXEC = linux_net::MSG_CMSG_CLOEXEC;
     MSG_CTRUNC = linux_net::MSG_CTRUNC;
@@ -1436,6 +1441,7 @@ pub const PRODUCT_MILESTONE_FIRST_FRAME: u64 = crate::syscall::PRODUCT_MILESTONE
 pub use crate::syscall::smp_qualification::*;
 pub const SYS_RUSTOS_SPAWN_EXEC: u64 = crate::syscall::SYS_RUSTOS_SPAWN_EXEC;
 pub const SYS_RUSTOS_IPC_ENDPOINT_CREATE: u64 = crate::syscall::SYS_RUSTOS_IPC_ENDPOINT_CREATE;
+pub const SYS_RUSTOS_IPC_ENDPOINT_CREATE_WITH_LIMITS: u64 = crate::syscall::SYS_RUSTOS_IPC_ENDPOINT_CREATE_WITH_LIMITS;
 pub const SYS_RUSTOS_IPC_CALL: u64 = crate::syscall::SYS_RUSTOS_IPC_CALL;
 pub const SYS_RUSTOS_IPC_CALL_BOUNDED: u64 = crate::syscall::SYS_RUSTOS_IPC_CALL_BOUNDED;
 pub const SYS_RUSTOS_IPC_RECV: u64 = crate::syscall::SYS_RUSTOS_IPC_RECV;

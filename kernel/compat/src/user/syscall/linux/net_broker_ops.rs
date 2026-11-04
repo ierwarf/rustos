@@ -46,7 +46,7 @@ fn dispatch_net_broker(args: &RustosNetBrokerArgs) -> Result<u64, i64> {
     }
 }
 
-/// Moves one newly-created netd AF_INET stream reference into the exact reply
+/// Moves one newly-created netd AF_INET socket reference into the exact reply
 /// message.  There is intentionally no target-process fd installation in this
 /// broker path: only the caller-side timely reply take publishes a descriptor.
 fn broker_prepare_socket_publication(args: &RustosNetBrokerArgs) -> Result<u64, i64> {

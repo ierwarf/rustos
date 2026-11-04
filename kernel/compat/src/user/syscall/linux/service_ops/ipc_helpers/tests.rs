@@ -175,7 +175,170 @@ fn housekeeping_vfs_maintenance_is_one_bounded_replay_turn() {
 }
 
 #[test]
-fn only_inet_stream_socket_creation_requires_a_prepared_reply_entry() {
+fn vfs_cursor_and_checkpoint_mutations_are_control_not_readiness_work() {
+    for op in [VFS_IPC_OP_CLOSE, VFS_IPC_OP_CURSOR_SETTLE, VFS_IPC_OP_CHECKPOINT_ACK] {
+        let request = VfsIpcRequest { op, ..VfsIpcRequest::default() };
+        assert!(matches!(vfs_request_service_class(&request), ipc_ops::ServiceIpcClass::InteractiveControl));
+    }
+    for arg0 in [VFS_POLL_QUERY_EPOLL_CREATE, VFS_POLL_QUERY_EPOLL_CTL, VFS_POLL_QUERY_EPOLL_RETIRE, VFS_POLL_QUERY_EPOLL_PURGE_OBJECT] {
+        let request = VfsIpcRequest { op: VFS_IPC_OP_POLL_QUERY, arg0, ..VfsIpcRequest::default() };
+        assert!(matches!(vfs_request_service_class(&request), ipc_ops::ServiceIpcClass::InteractiveControl));
+    }
+    let read = VfsIpcRequest { op: VFS_IPC_OP_READ, ..VfsIpcRequest::default() };
+    assert!(matches!(vfs_request_service_class(&read), ipc_ops::ServiceIpcClass::BulkData));
+}
+
+#[test]
+fn a_prepared_cursor_cannot_orphan_a_rejected_final_close() {
+    let mut request = VfsIpcRequest { op: VFS_IPC_OP_CLOSE, ..VfsIpcRequest::default() };
+    for status in [LINUX_EBUSY as i32, -(LINUX_EBUSY as i32)] {
+        let response = VfsIpcResponse { status, ..VfsIpcResponse::default() };
+        assert!(vfs_response_needs_reconciliation(&request, &response));
+    }
+    for status in [0, LINUX_EBADF as i32, LINUX_EINVAL as i32] {
+        let response = VfsIpcResponse { status, ..VfsIpcResponse::default() };
+        assert!(!vfs_response_needs_reconciliation(&request, &response));
+    }
+    request.op = VFS_IPC_OP_READ;
+    let response = VfsIpcResponse { status: LINUX_EBUSY as i32, ..VfsIpcResponse::default() };
+    assert!(!vfs_response_needs_reconciliation(&request, &response));
+}
+
+#[test]
+fn deferred_vfs_replay_preserves_all_operation_arguments_and_payload() {
+    let mut original = VfsIpcRequest {
+        op: VFS_IPC_OP_CHECKPOINT_ACK, fd: 8, remote_id: 0xfeed, flags: 3, dirfd: 9,
+        arg0: 11, arg1: 12, arg2: u64::from(VFS_IPC_OP_POLL_QUERY),
+        arg3: VFS_POLL_QUERY_EPOLL_RETIRE,
+        operation_hi: 13, operation_lo: 14, payload_len: 4,
+        ..VfsIpcRequest::default()
+    };
+    original.payload[..4].copy_from_slice(b"wire");
+    let pending = PendingVfsMutation::capture(&original).unwrap();
+    let mut replay = VfsIpcRequest::default();
+    pending.restore_into(&mut replay);
+    assert_eq!((replay.op, replay.fd, replay.remote_id, replay.flags, replay.dirfd),
+        (original.op, original.fd, original.remote_id, original.flags, original.dirfd));
+    assert_eq!((replay.arg0, replay.arg1, replay.arg2, replay.arg3),
+        (original.arg0, original.arg1, original.arg2, original.arg3));
+    assert_eq!((replay.operation_hi, replay.operation_lo), (13, 14));
+    assert_eq!(replay.payload_len, 4);
+    assert_eq!(&replay.payload[..4], b"wire");
+    original.path_len = 1;
+    assert!(matches!(PendingVfsMutation::capture(&original), Err(LINUX_EINVAL)));
+}
+
+#[test]
+fn failed_vfs_replay_retains_its_owner_without_starving_unrelated_work() {
+    let mutation = |remote_id| PendingVfsMutation::capture(&VfsIpcRequest {
+        remote_id, ..VfsIpcRequest::default()
+    }).unwrap();
+    let mut queue = PendingVfsMutationQueue::<3>::new();
+    assert!(queue.push(mutation(1)));
+    assert!(queue.push(mutation(2)));
+    let in_flight = queue.pop(None).unwrap();
+    // Foreground fills the ordinary quota while the old owner is in IPC.
+    assert!(queue.push(mutation(3)));
+    retry_vfs_mutation_later(&mut queue, in_flight);
+    for expected in [2, 3, 1] {
+        let next = queue.pop(None).unwrap();
+        assert_eq!(next.remote_id, expected);
+        queue.finish(next, None);
+    }
+    assert!(queue.pop(None).is_none());
+}
+
+#[test]
+fn lost_cursor_settlement_reply_cannot_be_overtaken_by_its_queued_close() {
+    let mutation = |op, remote_id, operation_lo| PendingVfsMutation::capture(&VfsIpcRequest {
+        op, remote_id, operation_lo, ..VfsIpcRequest::default()
+    }).unwrap();
+    let mut queue = PendingVfsMutationQueue::<4>::new();
+    assert!(queue.push(mutation(VFS_IPC_OP_CURSOR_SETTLE, 1, 10)));
+    let settlement = queue.pop(None).unwrap();
+    // Provider committed, but its reply was lost. A racing foreground close
+    // must see the still-owned in-flight lane and become a blocked follower.
+    assert!(queue.any(|entry| entry.operation_lo == 10));
+    assert!(queue.push(mutation(VFS_IPC_OP_CLOSE, 1, 20)));
+    assert!(queue.push(mutation(VFS_IPC_OP_CHECKPOINT_ACK, 2, 30)));
+    retry_vfs_mutation_later(&mut queue, settlement);
+    let unrelated = queue.pop(None).unwrap();
+    assert_eq!(unrelated.remote_id, 2);
+    queue.finish(unrelated, None);
+    let replay = queue.pop(None).unwrap();
+    assert_eq!(replay.op, VFS_IPC_OP_CURSOR_SETTLE);
+    assert_eq!(replay.operation_lo, 10);
+    queue.finish(replay, None);
+    let close = queue.pop(None).unwrap();
+    assert_eq!(close.op, VFS_IPC_OP_CLOSE);
+    queue.finish(close, None);
+    assert!(queue.pop(None).is_none());
+}
+
+#[test]
+fn multiple_failed_vfs_lanes_cannot_starve_an_unrelated_third_lane() {
+    let mut queue = PendingVfsMutationQueue::<5>::new();
+    for remote_id in [1, 1, 2, 2, 3] {
+        assert!(queue.push(PendingVfsMutation::capture(&VfsIpcRequest { remote_id, ..VfsIpcRequest::default() }).unwrap()));
+    }
+    for expected in [1, 2, 3, 1, 2, 3] {
+        let next = queue.pop(None).unwrap();
+        assert_eq!(next.remote_id, expected);
+        retry_vfs_mutation_later(&mut queue, next);
+    }
+}
+
+#[test]
+fn zero_remote_id_purges_use_provider_object_lanes_and_their_acks_keep_that_lane() {
+    let purge = |provider, object| VfsIpcRequest {
+        op: VFS_IPC_OP_POLL_QUERY, arg0: VFS_POLL_QUERY_EPOLL_PURGE_OBJECT,
+        arg1: provider, arg2: object, operation_hi: provider, operation_lo: object,
+        ..VfsIpcRequest::default()
+    };
+    let first = PendingVfsMutation::capture(&purge(u64::from(WAITSET_PROVIDER_NETD), 101)).unwrap();
+    let second = PendingVfsMutation::capture(&purge(u64::from(WAITSET_PROVIDER_NETD), 102)).unwrap();
+    let third = PendingVfsMutation::capture(&purge(u64::from(WAITSET_PROVIDER_INPUTD), 101)).unwrap();
+    assert_ne!(first.lane, second.lane);
+    assert_ne!(first.lane, third.lane);
+    let mut queue = PendingVfsMutationQueue::<4>::new();
+    assert!(queue.push(first));
+    assert!(queue.push(second));
+    assert!(queue.push(third));
+    let failed = queue.pop(None).unwrap();
+    retry_vfs_mutation_later(&mut queue, failed);
+    let successful = queue.pop(None).unwrap();
+    assert_eq!(successful.lane, second.lane);
+    let ack = VfsIpcRequest {
+        op: VFS_IPC_OP_CHECKPOINT_ACK, arg0: successful.operation_hi, arg1: successful.operation_lo,
+        arg2: u64::from(VFS_IPC_OP_POLL_QUERY), arg3: VFS_POLL_QUERY_EPOLL_PURGE_OBJECT,
+        ..VfsIpcRequest::default()
+    };
+    // The wire ACK does not carry the original target. It cannot invent a
+    // zero-object lane; foreground and background owners inherit the target.
+    assert!(matches!(PendingVfsMutation::capture(&ack), Err(LINUX_EINVAL)));
+    let mut original = VfsIpcRequest::default();
+    successful.restore_into(&mut original);
+    let pending_ack = PendingVfsMutation::capture_ack(&original, &ack).unwrap();
+    let mut conflicting = ack;
+    conflicting.arg1 ^= 1;
+    assert!(matches!(PendingVfsMutation::capture_ack(&original, &conflicting), Err(LINUX_EINVAL)));
+    queue.finish(successful, Some(pending_ack));
+    let next = queue.pop(None).unwrap();
+    assert_eq!(next.lane, third.lane);
+    queue.finish(next, None);
+    let retry = queue.pop(None).unwrap();
+    assert_eq!(retry.lane, first.lane);
+    retry_vfs_mutation_later(&mut queue, retry);
+    let visibility = queue.pop(None).unwrap();
+    assert_eq!(visibility.op, VFS_IPC_OP_CHECKPOINT_ACK);
+    assert_eq!(visibility.lane, second.lane);
+    queue.finish(visibility, None);
+    let vfs_target = PendingVfsMutation::capture(&purge(u64::from(WAITSET_PROVIDER_VFSD), 101)).unwrap();
+    assert_eq!(vfs_target.lane, VfsMutationLane::Description(101));
+}
+
+#[test]
+fn only_supported_inet_socket_creation_requires_a_prepared_reply_entry() {
     let mut request = NetdIpcRequest {
         version: NETD_IPC_ABI_VERSION,
         op: SYSCALL_OFFLOAD_OP_LINUX_SOCKET,
@@ -192,7 +355,10 @@ fn only_inet_stream_socket_creation_requires_a_prepared_reply_entry() {
     );
     request.arg0 = linux_abi::AF_INET;
     request.arg1 = linux_abi::SOCK_DGRAM;
-    assert!(!netd_reply_uses_prepared_socket(&request));
+    assert!(netd_reply_uses_prepared_socket(&request));
+    request.arg2 = 1;
+    assert!(netd_reply_uses_prepared_socket(&request));
+    request.arg2 = 0;
     request.op = SYSCALL_OFFLOAD_OP_LINUX_CLOSE;
     request.arg1 = linux_abi::SOCK_STREAM;
     assert!(!netd_reply_uses_prepared_socket(&request));
@@ -422,4 +588,41 @@ fn a_memoized_ioctl_route_never_outlives_the_registration_that_produced_it() {
         Some(DEVMGRD_IOCTL_ROUTE_DEVMGRD),
         "overflow must not evict or corrupt what is already recorded"
     );
+}
+
+#[test]
+fn cursor_gate_orders_foreground_users_after_unsettled_mutations_of_the_same_description() {
+    let settle = |remote_id| PendingVfsMutation::capture(&VfsIpcRequest {
+        op: VFS_IPC_OP_CURSOR_SETTLE, remote_id, operation_lo: 10, ..VfsIpcRequest::default()
+    }).unwrap();
+    let mut queue = PendingVfsMutationQueue::<4>::new();
+    assert!(matches!(queue.try_claim_cursor(1), VfsCursorClaim::Claimed));
+    // A second foreground user of the same description waits; others do not.
+    assert!(matches!(queue.try_claim_cursor(1), VfsCursorClaim::Busy));
+    assert!(matches!(queue.try_claim_cursor(2), VfsCursorClaim::Claimed));
+    queue.release_cursor(1);
+    // A timed-out COMMIT parked in the queue still blocks the next cursor
+    // operation: vfsd would otherwise answer it with EBUSY.
+    assert!(queue.push(settle(1)));
+    assert!(matches!(queue.try_claim_cursor(1), VfsCursorClaim::Busy));
+    // Replay ownership (in flight) counts as unsettled too.
+    let in_flight = queue.pop(Some(VfsMutationLane::Description(1))).unwrap();
+    assert!(matches!(queue.try_claim_cursor(1), VfsCursorClaim::Busy));
+    // Only one replayer owns the queue; a second one backs off, not panics.
+    assert!(queue.pop(None).is_none());
+    queue.finish(in_flight, None);
+    assert!(matches!(queue.try_claim_cursor(1), VfsCursorClaim::Claimed));
+    queue.release_cursor(1);
+    queue.release_cursor(2);
+}
+
+#[test]
+fn cursor_gate_slots_are_bounded_and_reusable() {
+    let mut queue = PendingVfsMutationQueue::<1>::new();
+    for id in 1..=VFS_CURSOR_GATE_SLOTS as u64 {
+        assert!(matches!(queue.try_claim_cursor(id), VfsCursorClaim::Claimed));
+    }
+    assert!(matches!(queue.try_claim_cursor(1_000), VfsCursorClaim::Busy));
+    queue.release_cursor(7);
+    assert!(matches!(queue.try_claim_cursor(1_000), VfsCursorClaim::Claimed));
 }

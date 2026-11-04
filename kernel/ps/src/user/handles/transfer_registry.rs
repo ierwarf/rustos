@@ -197,7 +197,7 @@ static NEXT_IPC_TRANSFER_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_IPC_TRANSFER_BATCH_GENERATION: AtomicU64 = AtomicU64::new(1);
 
 /// Registers the one initial netd-owned reference of a newly created AF_INET
-/// stream socket for reply-bound publication.
+/// TCP, UDP or ICMP-echo socket for reply-bound publication.
 ///
 /// This deliberately constructs a non-visible [`TransferredHandleEntry`]
 /// instead of installing a temporary fd and duplicating it.  The entry owns
@@ -214,9 +214,7 @@ pub fn register_new_inet_socket_transfer(
     let base_type = socket_type & linux_abi::SOCK_TYPE_MASK;
     let open_flags = socket_type & (linux_abi::SOCK_NONBLOCK | linux_abi::SOCK_CLOEXEC);
     if token == 0
-        || domain != linux_abi::AF_INET
-        || base_type != linux_abi::SOCK_STREAM
-        || socket_type != (base_type | open_flags)
+        || !rustos_user_abi::syscall::net_broker_inet_socket_shape_valid(domain, socket_type, protocol)
     {
         return Err(IpcTransferRegistryError::InvalidDescriptor);
     }

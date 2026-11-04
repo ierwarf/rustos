@@ -171,11 +171,14 @@ pub(super) fn take_fast_request_inline<const N: usize>(
                 .fast_frame
                 .as_mut()
                 .ok_or(IpcError::InvalidHandle)?;
-            if frame.endpoint_id != endpoint.raw()
-                || frame.receiver_task_id != receiver_task_id
-                || frame.state != FastCallState::RequestReady
-            {
-                return Err(IpcError::PermissionDenied);
+            if frame.endpoint_id != endpoint.raw() || frame.state != FastCallState::RequestReady {
+                return Err(IpcError::InvalidHandle);
+            }
+            if frame.receiver_task_id != receiver_task_id {
+                // This exact fast frame belongs to another authenticated
+                // receiver. It must not deny this worker queued work or a
+                // waiter registration, nor may this worker consume the frame.
+                return Ok(None);
             }
             let spilled = frame.request_len > IPC_FAST_INLINE_BYTES;
             // A spilled request needs a receiver whose inline image is the standard
@@ -194,18 +197,18 @@ pub(super) fn take_fast_request_inline<const N: usize>(
                 None
             };
             frame.state = FastCallState::RequestTaken;
-            Ok(FastEndpointReceived {
+            Ok(Some(FastEndpointReceived {
                 reply: KernelReplyHandle::from_raw(reply_id),
                 caller_process_id: frame.caller_process_id,
                 caller_task_id: frame.caller_task_id,
                 request_len: frame.request_len,
                 request,
                 spill,
-            })
+            }))
         })
         .ok_or(IpcError::PermissionDenied)??;
-    object.fast_reply = None;
-    Ok(Some(received))
+    if received.is_some() { object.fast_reply = None; }
+    Ok(received)
 }
 
 pub(super) fn take_queued_request(
@@ -214,9 +217,9 @@ pub(super) fn take_queued_request(
     request_capacity: usize,
     handle_capacity: usize,
 ) -> Result<Option<EndpointReceivedWithSender>, IpcError> {
-    // Stale identities cannot wedge a lane. Byte-capacity rejection preserves
-    // its head; handle rejection consumes the lane entry, retaining handles in
-    // the caller's cancellable message object as on the standalone path.
+    // Stale identities cannot wedge a lane. Byte and handle capacity refusal
+    // both preserve the exact request and its caller-owned transfer custody;
+    // a later capable receiver may take it, or the caller may cancel it.
     loop {
         let Some((lane, message_id)) = object.next_pending() else {
             return Ok(None);
@@ -229,7 +232,7 @@ pub(super) fn take_queued_request(
             }
             let request_too_large = message.request.len() > request_capacity;
             if request_too_large || message.attached_handles.len() > handle_capacity {
-                return (Err(IpcError::BufferTooSmall), request_too_large);
+                return (Err(IpcError::BufferTooSmall), true);
             }
             let request = core::mem::take(&mut message.request);
             let attached_handles = core::mem::take(&mut message.attached_handles);

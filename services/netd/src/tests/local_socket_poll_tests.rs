@@ -21,7 +21,7 @@ fn poisoned_deferred_queue_is_drained_for_fail_closed_replies() {
     assert!(queue.lock().unwrap().is_empty());
 }
 
-fn connected_socket(peer: u64) -> UnixSocket {
+pub(super) fn connected_socket(peer: u64) -> UnixSocket {
     UnixSocket {
         owner: Credentials::default(),
         refs: 1,
@@ -56,16 +56,14 @@ fn unix_readiness_publication_targets_only_the_socket_and_its_peer() {
     state.sockets.insert(first, connected_socket(second));
     state.sockets.insert(second, connected_socket(first));
     state.sockets.insert(unrelated, connected_socket(u64::MAX));
-    let request = NetdIpcRequest {
-        op: SYSCALL_OFFLOAD_OP_LINUX_SENDTO,
-        socket_token: first,
-        ..NetdIpcRequest::default()
-    };
-
-    assert_eq!(
-        readiness_targets_in_state(&request, &state),
-        vec![first, second]
-    );
+    state.record_readiness_changes();
+    state.readiness_publications.clear();
+    // Filling first's receive queue changes its own readability and second's
+    // writability, without touching or publishing an unrelated socket.
+    let UnixSocketState::Connected(connected) = &mut state.sockets.get_mut(&first).unwrap().state else { unreachable!() };
+    connected.incoming_bytes = SOCKET_BUFFER_CAPACITY;
+    state.record_readiness_changes();
+    assert_eq!(state.readiness_publications.iter().map(|(token, _)| *token).collect::<Vec<_>>(), vec![first, second]);
 }
 
 #[test]
@@ -112,12 +110,12 @@ fn unix_poll_readiness_tracks_data_space_and_peer_close() {
 #[test]
 fn single_socket_poll_returns_readiness_and_generation_together() {
     let (first, second) = (0xba7c_1001_u64, 0xba7c_1002_u64);
-    {
+    let generation = {
         let mut state = lock_net_state();
         state.sockets.insert(first, connected_socket(second));
         state.sockets.insert(second, connected_socket(first));
-        state.readiness_generations.insert(first, 91);
-    }
+        state.socket_readiness_generation(first)
+    };
     let request = NetdIpcRequest {
         socket_token: first,
         arg1: linux_abi::POLLOUT as u64,
@@ -127,7 +125,7 @@ fn single_socket_poll_returns_readiness_and_generation_together() {
     assert_eq!(handle_poll_socket(&request, &mut response), 0);
     assert_eq!(response.value, linux_abi::POLLOUT as u64);
     assert_eq!(response.payload_len, 8);
-    assert_eq!(u64::from_le_bytes(response.payload[..8].try_into().unwrap()), 91);
+    assert_eq!(u64::from_le_bytes(response.payload[..8].try_into().unwrap()), generation);
     let mut state = lock_net_state();
     state.sockets.remove(&first);
     state.sockets.remove(&second);
@@ -620,7 +618,11 @@ fn poll_batch_answers_every_socket_in_order_and_isolates_failures() {
 
     // Per-socket generation moves only for the sockets that changed.
     let before = poll_batch_result(&response, 2).0;
-    advance_readiness_generation(&[first]);
+    {
+        let mut state = lock_net_state();
+        let UnixSocketState::Connected(connected) = &mut state.sockets.get_mut(&first).unwrap().state else { unreachable!() };
+        connected.incoming_bytes = 1;
+    }
     let mut after = NetdIpcResponse::default();
     assert_eq!(handle_poll_batch(&request, &mut after), 0);
     assert!(poll_batch_result(&after, 0).0 > poll_batch_result(&response, 0).0);

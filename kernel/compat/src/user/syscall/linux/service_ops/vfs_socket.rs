@@ -618,17 +618,10 @@ pub fn syscall_linux_vfs_read(fd: u64, user_ptr: u64, user_len: u64) -> u64 {
         };
     }
     if current_socket_fd(fd) {
-        // The non-blocking bound lives in `syscall_linux_net6_with_timeout`,
-        // which reads it off the descriptor for every socket data operation.
-        return super::vfs_meta::syscall_linux_net6(
-            SYSCALL_OFFLOAD_OP_LINUX_RECVFROM,
-            fd,
-            user_ptr,
-            user_len,
-            0,
-            0,
-            0,
-        );
+        // read(fd, ..., 0) is non-consuming even on a datagram socket.
+        return socket_read_with_length(user_len, || super::vfs_meta::syscall_linux_net6(
+            SYSCALL_OFFLOAD_OP_LINUX_RECVFROM, fd, user_ptr, user_len, 0, 0, 0,
+        ));
     }
     if let Some(mut memfd) = current_memfd_handle(fd) {
         return super::local_memfd_io::read(&mut memfd, user_ptr, user_len);
@@ -738,18 +731,25 @@ pub fn syscall_linux_vfs_write(fd: u64, user_ptr: u64, user_len: u64) -> u64 {
 }
 
 pub fn syscall_linux_vfs_writev(fd: u64, iov_ptr: u64, iovcnt: u64) -> u64 {
-    if current_socket_fd(fd) {
-        let bytes = match read_socket_writev_payload(iov_ptr, iovcnt) {
+    if let Some(snapshot) = super::vfs_meta::snapshot_socket(fd) {
+        let bytes = match read_socket_writev_payload(iov_ptr, iovcnt, snapshot.is_datagram()) {
             Ok(bytes) => bytes,
             Err(errno) => return linux_errno(errno),
         };
+        if snapshot.is_datagram() && iovcnt != 0 {
+            return match call_netd_socket_payload(&snapshot, fd, SYSCALL_OFFLOAD_OP_LINUX_SENDTO, &bytes) {
+                Ok(sent) if sent == bytes.len() as u64 => sent,
+                Ok(_) => linux_errno(LINUX_EIO),
+                Err(errno) => linux_errno(errno),
+            };
+        }
         if bytes.is_empty() {
             return 0;
         }
         let mut written = 0usize;
         while written < bytes.len() {
             let chunk = &bytes[written..];
-            let count = match call_netd_socket_payload(fd, SYSCALL_OFFLOAD_OP_LINUX_SENDTO, chunk) {
+            let count = match call_netd_socket_payload(&snapshot, fd, SYSCALL_OFFLOAD_OP_LINUX_SENDTO, chunk) {
                 Ok(count) => count as usize,
                 Err(errno) => {
                     return if written == 0 {
@@ -788,7 +788,8 @@ fn call_vfs_remote_close(remote_id: u64) -> Result<(), i64> {
 fn call_vfs_remote_close_bounded(remote_id: u64) -> Result<(), i64> {
     let mut request = new_vfs_request(VFS_IPC_OP_CLOSE);
     request.remote_id = remote_id;
-    call_vfs_ipc_request_with_timeout(&request, 16)
+    call_vfs_ipc_request_with_timeout(&request,
+        rustos_user_abi::performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS)
         .and_then(|response| ensure_vfs_status(&response))
 }
 
@@ -823,6 +824,14 @@ fn read_remote_vfs_pinned(
     if let Err(err) = usermem::validate_current_user_write_buffer(user_ptr, user_len) {
         return linux_errno(address_space_error_to_linux_errno(err));
     }
+    // A cursor read spans prepare, user copy and settle; hold the description
+    // so no other thread or unsettled mutation interleaves a cursor operation.
+    let _cursor = if offset.is_none() {
+        match acquire_vfs_cursor_gate(remote_id) {
+            Ok(gate) => Some(gate),
+            Err(errno) => return linux_errno(errno),
+        }
+    } else { None };
     let mut copied = 0usize;
     while copied < user_len {
         let chunk_len = (user_len - copied).min(VFS_IPC_PAYLOAD_CAPACITY);
@@ -943,6 +952,10 @@ fn write_remote_vfs(fd: u64, remote_id: u64, user_ptr: u64, user_len: u64) -> u6
         return linux_errno(errno);
     }
     let result = (|| {
+        let _cursor = match acquire_vfs_cursor_gate(remote_id) {
+            Ok(gate) => gate,
+            Err(errno) => return linux_errno(errno),
+        };
         let chunk_len = user_len.min(VFS_IPC_REQUEST_PAYLOAD_CAPACITY);
         let mut request = new_vfs_request(VFS_IPC_OP_WRITE);
         request.fd = fd;
@@ -1494,52 +1507,120 @@ pub fn acquire_service_handle_ref(handle_ref: &ServiceHandleRef) -> Result<(), i
     }
 }
 
-fn call_netd_socket_payload(fd: u64, op: u16, payload: &[u8]) -> Result<u64, i64> {
-    let Some((token, status_flags)) = current_socket_token_and_flags(fd) else {
-        return Err(LINUX_EBADF);
-    };
+fn call_netd_socket_payload(snapshot: &super::vfs_meta::SocketSnapshot, fd: u64, op: u16, payload: &[u8]) -> Result<u64, i64> {
+    let token = snapshot.token();
+    let status_flags = snapshot.status_flags;
     if payload.len() > NETD_IPC_PAYLOAD_CAPACITY {
         return Err(LINUX_EINVAL);
     }
+    let timeout = (status_flags & linux_abi::O_NONBLOCK != 0)
+        .then_some(rustos_user_abi::performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS);
+    let class = timeout.map_or(ipc_ops::ServiceIpcClass::BulkData, |_| super::ipc_helpers::deadline::netd_timeout_class(op));
     let mut request = new_netd_socket_request(
-        op,
-        token,
-        super::vfs_meta::netd_deadline_after_class(ipc_ops::ServiceIpcClass::BulkData, None),
+        op, token, super::vfs_meta::netd_deadline_after_class(class, timeout),
     );
     request.arg0 = fd;
     request.status_flags = status_flags;
-    request.payload_len = payload.len() as u32;
-    request.payload[..payload.len()].copy_from_slice(payload);
-    call_netd_ipc_request(&request).map(|response| response.value)
+    populate_writev_socket_payload(&mut request, snapshot, payload)?;
+    // Plain Unix-stream writev bytes must advance the same cursor as sendmsg,
+    // or later SCM_RIGHTS tickets become bound to the wrong byte offsets.
+    let stream = match &snapshot.handle {
+        multitask::KernelHandle::Socket(socket) => Some(socket.begin_stream_send(payload.len()).ok_or(LINUX_EAGAIN)?),
+        _ => None,
+    };
+    let response = if status_flags & linux_abi::O_NONBLOCK != 0 {
+        call_netd_ipc_request_with_timeout(&request, rustos_user_abi::performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS)
+            .map_err(|errno| socket_writev_errno(errno, true))?
+    } else {
+        call_netd_ipc_request(&request)?
+    };
+    if response.value > payload.len() as u64 { return Err(LINUX_EIO); }
+    if let Some(stream) = stream {
+        if !stream.commit_send(response.value as usize) { return Err(LINUX_ESTALE); }
+    }
+    Ok(response.value)
 }
 
-fn read_socket_writev_payload(iov_ptr: u64, iovcnt: u64) -> Result<Vec<u8>, i64> {
-    let Ok(iovcnt) = usize::try_from(iovcnt) else {
-        return Err(LINUX_EINVAL);
-    };
-    if iovcnt > 16 {
-        return Err(LINUX_EINVAL);
+fn socket_writev_errno(errno: i64, nonblocking: bool) -> i64 {
+    if nonblocking && errno == LINUX_ETIMEDOUT { LINUX_EAGAIN } else { errno }
+}
+
+fn socket_read_with_length(len: u64, read: impl FnOnce() -> u64) -> u64 {
+    if len == 0 { 0 } else { read() }
+}
+
+fn populate_writev_socket_payload(request: &mut NetdIpcRequest, snapshot: &super::vfs_meta::SocketSnapshot, payload: &[u8]) -> Result<(), i64> {
+    if snapshot.is_datagram() {
+        request.payload_len = rustos_user_abi::syscall::netd_message::encode(&mut request.payload, payload, &[], 0, &[])
+            .ok_or(LINUX_EMSGSIZE)? as u32;
+    } else {
+        request.payload.get_mut(..payload.len()).ok_or(LINUX_EMSGSIZE)?.copy_from_slice(payload);
+        request.payload_len = payload.len() as u32;
     }
-    let mut payload = Vec::new();
-    for index in 0..iovcnt {
-        let Some(entry_ptr) =
-            iov_ptr.checked_add((index * size_of::<linux_abi::LinuxIovec>()) as u64)
-        else {
-            return Err(LINUX_EFAULT);
+    Ok(())
+}
+
+#[cfg(test)]
+mod datagram_regression_tests {
+    use super::*;
+    use rustos_user_abi::syscall::netd_message;
+
+    #[test]
+    fn nonblocking_writev_timeout_is_retryable_but_blocking_timeout_is_preserved() {
+        assert_eq!(socket_writev_errno(LINUX_ETIMEDOUT, true), LINUX_EAGAIN);
+        assert_eq!(socket_writev_errno(LINUX_ETIMEDOUT, false), LINUX_ETIMEDOUT);
+        assert_eq!(socket_writev_errno(LINUX_EIO, true), LINUX_EIO);
+    }
+
+    #[test]
+    fn zero_length_read_does_not_dispatch_or_consume_a_queued_packet() {
+        let mut queued = true;
+        assert_eq!(socket_read_with_length(0, || { queued = false; 9 }), 0);
+        assert!(queued);
+        assert_eq!(socket_read_with_length(1, || { queued = false; 1 }), 1);
+        assert!(!queued);
+    }
+
+    #[test]
+    fn writev_data_cannot_inject_a_datagram_envelope_and_empty_payloads_are_messages() {
+        let snapshot = super::super::vfs_meta::SocketSnapshot {
+            handle: multitask::KernelHandle::InetSocket(multitask::InetSocketHandle::from_token(9, linux_abi::AF_INET, linux_abi::SOCK_DGRAM, 17)), status_flags: 0,
         };
-        let iov = usermem::read_current_user_struct::<linux_abi::LinuxIovec>(entry_ptr)
-            .map_err(address_space_error_to_linux_errno)?;
-        let len = usize::try_from(iov.iov_len).map_err(|_| LINUX_EINVAL)?;
-        if len == 0 {
-            continue;
+        let mut injected = [0; 64];
+        let len = netd_message::encode(&mut injected, b"query", &[], 0, &[7; 16]).unwrap();
+        for payload in [&injected[..len], &b""[..]] {
+            let mut request = NetdIpcRequest::default();
+            populate_writev_socket_payload(&mut request, &snapshot, payload).unwrap();
+            let message = netd_message::decode(&request.payload[..request.payload_len as usize]).unwrap();
+            assert_eq!(message.data, payload);
+            assert!(message.address.is_empty());
         }
-        if payload.len().saturating_add(len) > NETD_IPC_PAYLOAD_CAPACITY {
-            return Err(LINUX_EINVAL);
+    }
+}
+
+fn read_socket_writev_payload(iov_ptr: u64, iovcnt: u64, datagram: bool) -> Result<Vec<u8>, i64> {
+    if iovcnt == 0 { return Ok(Vec::new()); }
+    let iovecs = super::vfs_meta::read_current_iovecs_payload(iov_ptr, iovcnt)?;
+    let mut total = 0_usize;
+    for iov in &iovecs {
+        total = total.checked_add(usize::try_from(iov.iov_len).map_err(|_| LINUX_EINVAL)?)
+            .filter(|total| *total <= isize::MAX as usize).ok_or(LINUX_EINVAL)?;
+    }
+    let capacity = NETD_IPC_PAYLOAD_CAPACITY - if datagram {
+        rustos_user_abi::syscall::netd_message::HEADER_SIZE
+    } else { 0 };
+    if datagram && total > capacity { return Err(LINUX_EMSGSIZE); }
+    // Streams may return a bounded prefix; datagrams are never split.
+    let mut payload = Vec::with_capacity(total.min(capacity));
+    for iov in iovecs {
+        let len = (iov.iov_len as usize).min(capacity - payload.len());
+        if len != 0 {
+            let start = payload.len();
+            payload.resize(start + len, 0);
+            usermem::copy_from_current_user_exact(iov.iov_base, &mut payload[start..])
+                .map_err(address_space_error_to_linux_errno)?;
         }
-        let start = payload.len();
-        payload.resize(start + len, 0);
-        usermem::copy_from_current_user_exact(iov.iov_base, &mut payload[start..])
-            .map_err(address_space_error_to_linux_errno)?;
+        if payload.len() == capacity { break; }
     }
     Ok(payload)
 }

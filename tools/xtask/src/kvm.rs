@@ -185,6 +185,8 @@ const SMP_QUALIFICATION_DEADLINE_US: u64 = SMP_QUALIFICATION_DEADLINE_MS * 1_000
 const SMP_QUALIFICATION_WORK_BITS: u32 = 24;
 const SMP_QUALIFICATION_WORK_MASK: u64 = (1_u64 << SMP_QUALIFICATION_WORK_BITS) - 1;
 const NETPROBE_QEMU_REACHABLE_MARKER: &str = "netprobe: qemu gateway reachable";
+const NETPROBE_GOOGLE_DNS_MARKER: &str = "netprobe: google DNS resolved ";
+const NETPROBE_GOOGLE_REPLY_MARKER: &str = "netprobe: google echo reply ";
 const MIN_DVM_GUEST_CID: u32 = 3;
 const VHOST_VSOCK_DEVICE: &str = "/dev/vhost-vsock";
 // Keep the ordinary boot deadline unchanged. Isolated SMP benchmarks need

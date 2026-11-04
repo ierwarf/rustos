@@ -312,15 +312,6 @@ fn uses_linux_fault_policy(abi: Option<ps_api::UserAbi>) -> bool {
     abi == Some(ps_api::UserAbi::Linux)
 }
 
-fn current_user_snapshot() -> Option<hal_api::CurrentUserSnapshot> {
-    ps_api::current_user_snapshot().map(|snapshot| hal_api::CurrentUserSnapshot {
-        abi: snapshot.abi(),
-        thread_id: snapshot.thread_id(),
-        process_id: snapshot.process_id(),
-        console_session_raw: snapshot.console_session().raw(),
-    })
-}
-
 fn current_debug_user_context() -> Option<nucleus_core::debug::CurrentUserLogContext> {
     ps_api::current_user_log_ids().map(|(process_id, thread_id)| {
         nucleus_core::debug::CurrentUserLogContext {
@@ -383,7 +374,6 @@ pub fn register() {
         try_handle_current_user_page_fault: Some(try_handle_current_user_page_fault),
         retire_current_user_task_due_to_fault: Some(retire_current_user_task_due_to_fault),
         halt_current_retired_task: Some(ps_api::halt_current_retired_task),
-        current_user_snapshot: Some(current_user_snapshot),
         is_scheduler_initialized: Some(ps_api::is_initialized),
         current_task_id: Some(ps_api::current_task_id),
         arm_block_current_task: Some(ps_api::arm_block_current_task),

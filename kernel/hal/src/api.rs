@@ -300,8 +300,8 @@ pub mod time {
 }
 
 pub use crate::hooks::{
-    CurrentUserSnapshot, HeartbeatHooks, HeartbeatSnapshot, InputEventQueueDebugSnapshot,
-    InterruptHooks, TaskHooks, UserFaultDisposition,
+    HeartbeatHooks, HeartbeatSnapshot, InputEventQueueDebugSnapshot, InterruptHooks, TaskHooks,
+    UserFaultDisposition,
 };
 pub use boot::{
     call_with_stack, enter_higher_half, init_acpi, init_clocksource, init_gdt, init_idt,

@@ -41,7 +41,6 @@ const SYS_MUNMAP: usize = 11;
 const SYS_IOCTL: usize = 16;
 const SYS_GETTID: usize = 186;
 const SYS_OPENAT: usize = 257;
-const SYS_RUSTOS_IPC_ENDPOINT_CREATE: usize = syscall_abi::SYS_RUSTOS_IPC_ENDPOINT_CREATE as usize;
 const SYS_RUSTOS_IPC_CALL: usize = syscall_abi::SYS_RUSTOS_IPC_CALL as usize;
 const SYS_RUSTOS_IPC_RECV_WITH_SENDER: usize =
     syscall_abi::SYS_RUSTOS_IPC_RECV_WITH_SENDER as usize;
@@ -145,7 +144,7 @@ fn input_translation_state() -> &'static Mutex<InputTranslationState> {
 }
 
 pub(crate) fn start_display_policy_endpoint() -> Result<(), i32> {
-    let endpoint = unsafe { syscall0(SYS_RUSTOS_IPC_ENDPOINT_CREATE) };
+    let endpoint = rustos_svc_runtime::ipc::endpoint_create_with_limits(size_of::<syscall_abi::CommercialMaxProtocolRequest>() as u64, 0) as isize;
     if is_syscall_error(endpoint) {
         return Err(errno_from_result(endpoint));
     }

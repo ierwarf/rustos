@@ -19,7 +19,7 @@ use rustos_user_abi::syscall::{
     CommercialMaxProtocolDescriptorWire, CommercialMaxProtocolRequest,
     CommercialMaxProtocolResponse, DvmBlockInfoWire, IPC_SERVICE_STORAGED, IPC_SERVICE_VFSD,
     PRODUCT_MILESTONE_STORAGE_READY, STORAGE_FLAG_READONLY, STORAGE_TRANSPORT_DVM_BLOCK,
-    STORAGED_BULK_READ_PAYLOAD_CAPACITY, SYS_RUSTOS_IPC_ENDPOINT_CREATE,
+    STORAGED_BULK_READ_PAYLOAD_CAPACITY,
     SYS_RUSTOS_IPC_RECV_WITH_SENDER, SYS_RUSTOS_IPC_REPLY, StorageBlockDescriptorWire,
     StoragedBulkReadResponse,
 };
@@ -44,7 +44,7 @@ static DVM_READINESS_LAST_ERRNO: AtomicU64 = AtomicU64::new(0);
 fn main() {
     observability_client::info!("storaged", service, "service started");
     debug_line("storaged: endpoint create begin");
-    let endpoint = syscall0(SYS_RUSTOS_IPC_ENDPOINT_CREATE);
+    let endpoint = rustos_svc_runtime::ipc::endpoint_create_with_limits(size_of::<CommercialMaxProtocolRequest>() as u64, 0);
     if endpoint < 0 {
         debug_line("storaged: endpoint create failed");
         let _ = writeln!(
@@ -631,10 +631,6 @@ fn write_payload_struct<T>(value: &T, dest: &mut [u8]) -> u32 {
     let count = bytes.len().min(dest.len());
     dest[..count].copy_from_slice(&bytes[..count]);
     count as u32
-}
-
-fn syscall0(number: u64) -> i64 {
-    unsafe { rustos_svc_runtime::syscall::syscall0(number) }
 }
 
 fn syscall3(number: u64, arg0: u64, arg1: u64, arg2: u64) -> i64 {

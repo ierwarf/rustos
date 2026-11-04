@@ -2619,7 +2619,7 @@ ipc-reply-deadline/IpcReplyDeadline|kernel-ipc-runtime|ipc::tests::prepared_repl
 ipc-reply-deadline/IpcReplyDeadline|kernel-ipc-runtime|ipc::tests::cancelling_before_reply_returns_prepared_descriptor_once
 ipc-reply-deadline/IpcReplyDeadline|kernel-ipc-runtime|ipc::tests::endpoint_failure_returns_prepared_descriptor_in_error_cleanup
 ipc-reply-deadline/IpcReplyDeadline|kernel-compat|user::syscall::linux::service_ops::ipc_helpers::tests::timely_netd_socket_decode_installs_one_exact_entry_and_returns_that_fd
-ipc-reply-deadline/IpcReplyDeadline|kernel-compat|user::syscall::linux::service_ops::ipc_helpers::tests::only_inet_stream_socket_creation_requires_a_prepared_reply_entry
+ipc-reply-deadline/IpcReplyDeadline|kernel-compat|user::syscall::linux::service_ops::ipc_helpers::tests::only_supported_inet_socket_creation_requires_a_prepared_reply_entry
 ipc-handle-transfer/IpcHandleTransfer|kernel-ps|user::handles::transfer_registry::transfer_registry_tests::failed_reply_binding_reclaims_initial_inet_descriptor_without_deferred_release
 netd-deferred-reply/NetdDeferredReply|netd|packet_provider_state_tests::rejected_prepared_inet_publication_discards_the_unpublished_token_once
 netd-deferred-reply/NetdDeferredReply|netd|packet_provider_state_tests::inet_provider_start_deadline_and_token_gate_precede_the_start_closure

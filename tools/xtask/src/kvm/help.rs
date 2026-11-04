@@ -19,6 +19,9 @@ options:
                        RustOS inputd keyboard and pointer ingress markers
   --exercise-network   run netprobe through netd and the DVM Ethernet ring;
                        requires --gui-dvm-surfaces and --dvm-network-shmem
+  --exercise-google-ping
+                       opt in to external DNS resolution and a verified Google
+                       ICMP Echo reply; requires --exercise-network (not offline)
   --ipcbench-probe <name>
                        restrict the `ipcbench` session-startup harness to one
                        named probe, so the in-kernel `ipc-call-phase-*` and

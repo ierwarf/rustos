@@ -1,17 +1,17 @@
 use super::*;
 
-/// Only AF_INET stream creation uses reply-bound descriptor publication.
+/// AF_INET TCP/UDP/echo creation uses reply-bound descriptor publication.
 /// AF_UNIX keeps its existing broker-installed fd reply, and rejected socket
 /// families/types return an ordinary byte response without a descriptor.
 pub(super) fn netd_reply_uses_prepared_socket(request: &NetdIpcRequest) -> bool {
     request.op == SYSCALL_OFFLOAD_OP_LINUX_SOCKET
         && request.arg0 == linux_abi::AF_INET
-        && request.arg1 & linux_abi::SOCK_TYPE_MASK == linux_abi::SOCK_STREAM
+        && rustos_user_abi::syscall::net_broker_inet_socket_shape_valid(request.arg0, request.arg1, request.arg2)
 }
 
 /// Socket creation is the one netd operation whose successful reply carries a
 /// descriptor. Take exactly one prepared entry under the original reply end,
-/// validate the complete v7 response and token before publication, then move
+/// validate the complete v8 response and token before publication, then move
 /// that entry into the current caller's descriptor table.
 pub(super) fn call_netd_socket_ipc_request_impl(
     request: &NetdIpcRequest,

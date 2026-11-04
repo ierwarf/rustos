@@ -485,8 +485,8 @@ fn socket_poll_owns_a_unique_offload_operation() {
 }
 
 #[test]
-fn netd_v7_deadline_wire_keeps_the_fixed_header_layout() {
-    assert_eq!(NETD_IPC_ABI_VERSION, 7);
+fn netd_v8_deadline_wire_keeps_the_fixed_header_layout() {
+    assert_eq!(NETD_IPC_ABI_VERSION, 8);
     assert_eq!(NETD_IPC_REQUEST_HEADER_SIZE, 136);
     assert_eq!(NETD_IPC_RESPONSE_HEADER_SIZE, 32);
     assert_eq!(core::mem::offset_of!(NetdIpcRequest, deadline_ns), 112);
@@ -519,7 +519,7 @@ fn prepared_socket_publication_wire_is_versioned_and_address_free() {
 }
 
 #[test]
-fn prepared_socket_publication_shape_allows_only_inet_stream_open_flags() {
+fn prepared_socket_publication_shape_allows_only_nonraw_inet_open_flags() {
     let publication = NetBrokerPrepareSocketPublication {
         version: NET_BROKER_SOCKET_PUBLICATION_VERSION,
         reply_cap: 11,
@@ -560,9 +560,22 @@ fn prepared_socket_publication_shape_allows_only_inet_stream_open_flags() {
     malformed.domain = 1;
     assert!(!net_broker_socket_publication_shape_valid(&malformed));
     malformed = publication;
-    malformed.socket_type = 2;
+    malformed.socket_type = 3;
+    malformed.protocol = 0;
     assert!(!net_broker_socket_publication_shape_valid(&malformed));
     malformed = publication;
     malformed.socket_type |= 1 << 30;
+    assert!(!net_broker_socket_publication_shape_valid(&malformed));
+    for protocol in [0, 1, 17] {
+        let mut datagram = publication;
+        datagram.socket_type = 2;
+        datagram.protocol = protocol;
+        assert!(net_broker_socket_publication_shape_valid(&datagram));
+    }
+    malformed = publication;
+    malformed.protocol = 1;
+    assert!(!net_broker_socket_publication_shape_valid(&malformed));
+    malformed.socket_type = 2;
+    malformed.protocol = 6;
     assert!(!net_broker_socket_publication_shape_valid(&malformed));
 }

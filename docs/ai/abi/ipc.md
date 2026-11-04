@@ -5,7 +5,8 @@
 ## Handle Transfer
 
 - Bounded cap-transfer via `kernel_ipc_runtime::api::KernelTransferredHandle` + `*_with_handles` endpoint APIs.
-- Byte-only recv/take wrappers must fail with `BufferTooSmall` when a queued message contains transferred handles. Older paths must never silently drop capabilities.
+- `SYS_RUSTOS_IPC_ENDPOINT_CREATE_WITH_HANDLE_LIMIT` (`0x5255_0060`) takes the owner's immutable request-handle capacity in rdi (0..=16), retaining the existing process ownership, quotas and Job charge. Ring3 service owners declare zero for byte-only protocols; loaderd declares one matching both placement receive paths. Legacy generic endpoint creation still accepts the full transfer bound. The handle-call syscall checks shape before exporting descriptors, and runtime enqueue independently rejects an incompatible batch before message/reply publication, waiter consumption or scheduling-context transfer. Failure is EINVAL, not a silently dropped request. No named-service policy table is added in Ring0.
+- Byte-only recv/take wrappers must fail with `BufferTooSmall` when a queued message contains transferred handles. Byte or handle capacity refusal preserves the exact queued request and caller-owned transfer custody, allowing a capable receiver to retry or the caller to cancel. Older paths must never silently drop capabilities.
 - Transferred handles require nonzero transfer ticket + `HandleRights::allows_transfer()` true.
 - The only Ring3 handle-transfer authority wire is exactly 24 little-endian
   bytes: nonzero `transfer_id: u64`, nonzero random `nonce: u64`, and nonzero
@@ -332,6 +333,11 @@ no cell/epoch state to refine.
   the pending fast path creates stale wake and synchronous-handoff authority
   for a task that never blocked. The executable refinement is
   `formal/endpoint-receiver-wakeup/EndpointReceiverWakeup.tla`.
+  A fast frame pinned to another authenticated receiver is not work for this
+  receiver: combined receive skips that frame and may take queued work or
+  register its own waiter, without consuming or unpinning the frame. The
+  standalone exact fast-frame take still rejects a foreign receiver with
+  `PermissionDenied`. Capacity rejection publishes no waiter for its caller.
   A timer/ordinary wake may withdraw the exact typed receive phase before
   resumption removes its runtime waiter. Popping that stale waiter must not
   cancel an otherwise valid original queued reply: cold publication retains

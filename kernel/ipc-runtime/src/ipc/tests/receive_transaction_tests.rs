@@ -73,18 +73,90 @@ fn receive_rejection_preserves_exact_fast_frame_and_publishes_no_waiter() {
         reserve_fast_endpoint_call(endpoint, 70, 7, b"four", None).unwrap();
         assert!(matches!(
             counted_receive(endpoint, 12, 16, true),
-            Err(IpcError::PermissionDenied)
+            Ok(EndpointReceive::Waiting)
         ));
         assert!(matches!(
             counted_receive(endpoint, 11, 3, true),
             Err(IpcError::BufferTooSmall)
         ));
-        assert_eq!(remove_endpoint_waiter_for_task(endpoint, 12), 0);
+        assert_eq!(remove_endpoint_waiter_for_task(endpoint, 12), 1);
         assert_eq!(remove_endpoint_waiter_for_task(endpoint, 11), 0);
         assert!(matches!(
             counted_receive(endpoint, 11, 4, false),
             Ok(EndpointReceive::Fast(_))
         ));
+    });
+}
+
+#[test]
+fn unrelated_receiver_can_take_queued_work_while_an_exact_fast_frame_is_pinned() {
+    with_isolated_ipc_test(|| {
+        let endpoint = create_endpoint().unwrap();
+        assert!(matches!(receive_or_wait(endpoint, 11, 16, 0, true), Ok(EndpointReceive::Waiting)));
+        let (fast, receiver) = reserve_fast_endpoint_call(endpoint, 70, 7, b"fast", None).unwrap();
+        assert_eq!(receiver, 11);
+        let (queued, _) = enqueue_endpoint_call(endpoint, 8, b"queued").unwrap();
+        let EndpointReceive::Queued((reply, request, _, caller)) = receive_or_wait(endpoint, 12, 16, 0, false).unwrap() else { panic!("other receiver must take queued work"); };
+        assert_eq!((reply, caller), (queued, 8));
+        assert_eq!(request, b"queued");
+        let EndpointReceive::Fast(received) = receive_or_wait(endpoint, 11, 16, 0, false).unwrap() else { panic!("pinned receiver must retain its exact fast frame"); };
+        assert_eq!(received.reply, fast);
+        assert_eq!(&received.request[..received.request_len], b"fast");
+    });
+}
+
+#[test]
+fn insufficient_handle_capacity_preserves_request_and_allows_a_later_capable_receiver() {
+    with_isolated_ipc_test(|| {
+        let endpoint = create_endpoint().unwrap();
+        let handle = super::transferable_file_handle(11);
+        let (reply, _) = enqueue_endpoint_call_with_handles(endpoint, 7, b"open", &[handle]).unwrap();
+        assert!(matches!(receive_or_wait(endpoint, 11, 16, 0, false), Err(IpcError::BufferTooSmall)));
+        let EndpointReceive::Queued((taken_reply, bytes, handles, caller)) = receive_or_wait(endpoint, 12, 16, 1, false).unwrap() else { panic!("refused request was lost"); };
+        assert_eq!((taken_reply, caller), (reply, 7));
+        assert_eq!(bytes, b"open");
+        assert_eq!(handles, alloc::vec![handle]);
+        assert!(matches!(receive_or_wait(endpoint, 12, 16, 1, false), Ok(EndpointReceive::Empty)));
+    });
+}
+
+#[test]
+fn byte_only_admission_rejects_attachments_without_wedging_the_next_call() {
+    with_isolated_ipc_test(|| {
+        let endpoint = create_endpoint_for_process_with_limits(10, 16, 0, None).unwrap();
+        assert!(matches!(receive_or_wait(endpoint, 10, 16, 0, true), Ok(EndpointReceive::Waiting)));
+        let handle = super::transferable_file_handle(11);
+        assert_eq!(validate_endpoint_request_shape(endpoint, 6, 1), Err(IpcError::InvalidArgument));
+        assert_eq!(validate_endpoint_request_shape(endpoint, 17, 0), Err(IpcError::InvalidArgument));
+        assert_eq!(enqueue_endpoint_call(endpoint, 41, b"0123456789abcdefg"), Err(IpcError::InvalidArgument));
+        assert_eq!(reserve_fast_endpoint_call(endpoint, 41, 41, b"0123456789abcdefg", None), Err(IpcError::InvalidArgument));
+        assert_eq!(enqueue_endpoint_call_with_handles_priority_and_custody(endpoint, 41, b"attack", &[handle], EndpointCallPriority::Ordinary, super::test_scheduling_custody(41)), Err(IpcError::InvalidArgument));
+        assert!(REPLIES.find_handle(|_| true).is_none());
+        assert!(ENDPOINT_MESSAGES.find_handle(|_| true).is_none());
+        assert_eq!(ENDPOINTS.with(endpoint.raw(), |object| object.waiting_receivers.len()), Some(1));
+        let (reply, receiver) = enqueue_endpoint_call(endpoint, 41, b"legitimate").unwrap();
+        assert_eq!(receiver, Some(10));
+        let EndpointReceive::Queued((received, bytes, handles, _)) = receive_or_wait(endpoint, 10, 16, 0, false).unwrap() else { panic!("legitimate request was blocked"); };
+        assert_eq!(received, reply);
+        assert_eq!(bytes, b"legitimate");
+        assert!(handles.is_empty());
+    });
+}
+
+#[test]
+fn declared_handle_limit_preserves_generic_receivers_but_rejects_oversized_batches() {
+    with_isolated_ipc_test(|| {
+        assert_eq!(create_endpoint_for_process_with_limits(10, 16, MAX_ENDPOINT_TRANSFER_HANDLES + 1, None), Err(IpcError::InvalidArgument));
+        assert_eq!(create_endpoint_for_process_with_limits(10, 0, 0, None), Err(IpcError::InvalidArgument));
+        assert_eq!(create_endpoint_for_process_with_limits(10, MAX_ENDPOINT_INLINE_MESSAGE_BYTES + 1, 0, None), Err(IpcError::InvalidArgument));
+        let endpoint = create_endpoint_for_process_with_limits(10, 16, 1, None).unwrap();
+        let handle = super::transferable_file_handle(11);
+        assert_eq!(enqueue_endpoint_call_with_handles(endpoint, 41, b"too many", &[handle, handle]), Err(IpcError::InvalidArgument));
+        let (reply, _) = enqueue_endpoint_call_with_handles(endpoint, 41, b"placement", &[handle]).unwrap();
+        assert!(matches!(receive_or_wait(endpoint, 10, 16, 0, false), Err(IpcError::BufferTooSmall)));
+        let EndpointReceive::Queued((received, _, handles, _)) = receive_or_wait(endpoint, 11, 16, 1, false).unwrap() else { panic!("capable receiver lost the request"); };
+        assert_eq!(received, reply);
+        assert_eq!(handles, alloc::vec![handle]);
     });
 }
 

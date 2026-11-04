@@ -250,6 +250,7 @@ pub(super) fn is_linux_rustos_ipc_syscall(syscall_number: u64) -> bool {
     matches!(
         syscall_number,
         linux_abi::SYS_RUSTOS_IPC_ENDPOINT_CREATE
+            | linux_abi::SYS_RUSTOS_IPC_ENDPOINT_CREATE_WITH_LIMITS
             | linux_abi::SYS_RUSTOS_IPC_CALL
             | rustos_user_abi::syscall::SYS_RUSTOS_IPC_REGISTER_CALL
             | rustos_user_abi::syscall::SYS_RUSTOS_IPC_REGISTER_RECV
@@ -303,6 +304,7 @@ pub(super) fn dispatch_linux_rustos_ipc_syscall(frame: &mut SyscallFrame) -> u64
         | rustos_user_abi::syscall::SYS_RUSTOS_IPC_REGISTER_REPLY_RECV
         | rustos_user_abi::syscall::SYS_RUSTOS_IPC_REGISTER_REPLY => registers::dispatch(frame),
         linux_abi::SYS_RUSTOS_IPC_ENDPOINT_CREATE => syscall_linux_rustos_ipc_endpoint_create(),
+        linux_abi::SYS_RUSTOS_IPC_ENDPOINT_CREATE_WITH_LIMITS => syscall_linux_rustos_ipc_endpoint_create_with_limits(frame.rdi, frame.rsi),
         linux_abi::SYS_RUSTOS_IPC_CALL => {
             ipc_trace!(
                 "ipc dispatch call: rdi={} rsi={:#x} rdx={} r10={:#x} r8={:#x}",
@@ -842,19 +844,26 @@ fn wake_exited_service_endpoint_waiters(process_id: u64) {
 // RING3-MIGRATION-REFERENCE END: rootd-owned service lookup and capability checks.
 
 pub(super) fn syscall_linux_rustos_ipc_endpoint_create() -> u64 {
+    syscall_linux_rustos_ipc_endpoint_create_with_limits(
+        rustos_user_abi::syscall::IPC_MAX_INLINE_BYTES as u64,
+        rustos_user_abi::syscall::IPC_MAX_TRANSFER_HANDLES as u64,
+    )
+}
+
+fn syscall_linux_rustos_ipc_endpoint_create_with_limits(bytes: u64, handles: u64) -> u64 {
+    let (Ok(bytes), Ok(handles)) = (usize::try_from(bytes), usize::try_from(handles)) else { return linux_errno(LINUX_EINVAL); };
+    if bytes == 0 || bytes > rustos_user_abi::syscall::IPC_MAX_INLINE_BYTES
+        || handles > rustos_user_abi::syscall::IPC_MAX_TRANSFER_HANDLES
+    { return linux_errno(LINUX_EINVAL); }
     let Some(process_id) = multitask::current_user_process_id() else {
         return linux_errno(LINUX_EINVAL);
     };
     ipc_trace!("ipc endpoint create: process={}", process_id);
     // Bill the endpoint's reserved queues to the caller's Job; a process with
     // no resolvable job (exiting) falls back to the unbilled owner path.
-    let created = match multitask::process_job(process_id) {
-        Some(job) => kernel_ipc_runtime::api::create_endpoint_for_process_in_group(
-            process_id,
-            job.charge_group(),
-        ),
-        None => kernel_ipc_runtime::api::create_endpoint_for_process(process_id),
-    };
+    let created = kernel_ipc_runtime::api::endpoint::create_for_process_with_limits(
+        process_id, bytes, handles, multitask::process_job(process_id).map(|job| job.charge_group()),
+    );
     match created {
         Ok(endpoint) => {
             ipc_trace!(
@@ -2811,6 +2820,13 @@ fn syscall_linux_rustos_ipc_call_with_handles_timeout(args_ptr: u64, timeout_ms:
         validate_received_handle_outputs(args.recv_fds_ptr, args.recv_fd_count_ptr, recv_slots)
     {
         return linux_errno(errno);
+    }
+    // Reject incompatible attachments before exporting descriptors. The
+    // runtime enqueue enforces the same immutable bound for kernel producers.
+    if let Err(error) = kernel_ipc_runtime::api::endpoint::validate_request_shape(
+        KernelEndpointHandle::from_raw(args.endpoint), request.len(), usize::from(args.send_fd_count),
+    ) {
+        return linux_errno(ipc_error_to_linux_errno(error));
     }
     let send_handles = match export_current_fds_for_ipc(args.send_fds_ptr, args.send_fd_count) {
         Ok(handles) => handles,

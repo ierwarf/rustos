@@ -489,6 +489,14 @@ fn run_one_smoke_unarchived(
             .context("network exercise lost its shared DVM network aperture")?;
         verify_dvm_network_round_trip(shared_network)?;
     }
+    if options.exercise_google_ping {
+        let rustos_log = fs::read_to_string(&layout.debugcon_log)
+            .with_context(|| format!("read {}", layout.debugcon_log.display()))?;
+        if !google_ping_reply_observed(&rustos_log) {
+            bail!("Google ping proof missing guest DNS resolution and matching ICMP Echo reply");
+        }
+        println!("xtask: Google ping proof: guest DNS resolution and verified ICMP Echo reply observed");
+    }
     // A deliberately failed flush is a negative fault proof, not a successful
     // storage-ready scenario. Replaying it through the positive product trace
     // would either fabricate readiness or reject an otherwise valid fault run.
@@ -641,6 +649,7 @@ pub(crate) fn kvm_run_command(
         expect_block_flush_fault: false,
         exercise_input: false,
         exercise_network: false,
+        exercise_google_ping: false,
         gui_dvm_surfaces: true,
         dvm_network_shmem: true,
         dvm_block_shmem: true,

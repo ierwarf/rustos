@@ -195,11 +195,24 @@
         .expect("valid private acceptance contract");
         assert!(contract.ui_profile);
         assert!(!contract.network_exercise);
+        assert!(!contract.google_ping);
         assert!(parse_kvm_acceptance_contract("ui_profile=1\nnetwork_exercise=0\n").is_none());
         assert!(parse_kvm_acceptance_contract(
             "contract=rustos-kvm-acceptance-v1\nui_profile=yes\nnetwork_exercise=0\n"
         )
         .is_none());
+    }
+
+    #[test]
+    fn google_ping_contract_is_opt_in_and_requires_network_exercise() {
+        let base = "contract=rustos-kvm-acceptance-v1\nui_profile=0\nnetwork_exercise=1\n";
+        assert!(!parse_kvm_acceptance_contract(base).unwrap().google_ping);
+        assert!(!parse_kvm_acceptance_contract(&format!("{base}google_ping=0\n")).unwrap().google_ping);
+        assert!(parse_kvm_acceptance_contract(&format!("{base}google_ping=1\n")).unwrap().google_ping);
+        for suffix in ["google_ping=yes\n", "google_ping=1\ngoogle_ping=1\n", "google_ping=0\ngoogle_ping=1\n"] {
+            assert!(parse_kvm_acceptance_contract(&format!("{base}{suffix}")).is_none());
+        }
+        assert!(parse_kvm_acceptance_contract("contract=rustos-kvm-acceptance-v1\nui_profile=0\nnetwork_exercise=0\ngoogle_ping=1\n").is_none());
     }
 
     #[test]

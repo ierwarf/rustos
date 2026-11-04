@@ -625,9 +625,9 @@ fn wait_for_parallel_boot(
             None
         };
         let dvm_network_ready = dvm_network.is_none_or(|state| state.dvm_ready);
-        let dvm_network_traffic_ready = !options.exercise_network
-            || (dvm_network.is_some_and(DvmNetworkCounters::round_trip_observed)
-                && rustos_log.contains(NETPROBE_QEMU_REACHABLE_MARKER));
+        let dvm_network_traffic_ready = network_exercise_ready(
+            options.exercise_network, options.exercise_google_ping, dvm_network, &rustos_log,
+        );
         if rustos_ready
             && smp_runtime_ready
             && smp_ring3_qualification_ready
@@ -657,6 +657,9 @@ fn wait_for_parallel_boot(
             ));
             if options.smp_ring3_qualification && !smp_ring3_qualification_ready {
                 missing_rustos.push("smp-ring3-qualification-v1".to_owned());
+            }
+            if options.exercise_google_ping && !google_ping_reply_observed(&rustos_log) {
+                missing_rustos.push("google DNS resolution and matching ICMP Echo reply".to_owned());
             }
             let missing_dvm = options
                 .expected_dvm_markers
