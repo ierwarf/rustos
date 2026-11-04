@@ -160,6 +160,7 @@ pub unsafe fn syscall6(number: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64,
 // Linux x86_64 syscall numbers used by the runtime itself.
 pub const SYS_MMAP: u64 = 9;
 pub const SYS_SCHED_YIELD: u64 = 24;
+pub const SYS_FUTEX: u64 = 202;
 pub const SYS_NANOSLEEP: u64 = 35;
 pub const SYS_EXIT_GROUP: u64 = 231;
 pub const SYS_CLOCK_GETTIME: u64 = 228;
@@ -187,6 +188,37 @@ pub fn exit_group(code: i32) -> ! {
     loop {
         unsafe { asm!("hlt", options(nomem, nostack)) }
     }
+}
+
+const FUTEX_WAIT_PRIVATE: u64 = 128;
+const FUTEX_WAKE_PRIVATE: u64 = 129;
+
+/// Sleeps on a process-private futex word while it still equals `expected`.
+/// Returns the raw kernel result; callers re-check the word, so a spurious
+/// wakeup, `EAGAIN` (the word already changed) and `EINTR` are all retried.
+///
+/// # Safety
+/// `word` must point to a live, aligned `u32` for the duration of the call.
+#[inline]
+pub unsafe fn futex_wait_private(word: *const u32, expected: u32) -> i64 {
+    // SAFETY: the caller guarantees `word`; FUTEX_WAIT only reads it.
+    syscall4(
+        SYS_FUTEX,
+        word as u64,
+        FUTEX_WAIT_PRIVATE,
+        u64::from(expected),
+        0,
+    )
+}
+
+/// Wakes up to `count` waiters of a process-private futex word.
+///
+/// # Safety
+/// `word` must point to a live, aligned `u32` for the duration of the call.
+#[inline]
+pub unsafe fn futex_wake_private(word: *const u32, count: u32) -> i64 {
+    // SAFETY: the caller guarantees `word`; FUTEX_WAKE never writes it.
+    syscall3(SYS_FUTEX, word as u64, FUTEX_WAKE_PRIVATE, u64::from(count))
 }
 
 /// Issue an anonymous private mmap. Returns the mapped base or a negative

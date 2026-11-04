@@ -738,6 +738,7 @@ fn run() -> Result<(), i32> {
         if service_wayland
             && wayland_service_required(protocol_input, input.input_events, callback_due)
         {
+            wayland.set_window_cascade_base(state.console_windows.len());
             let wayland_changed = wayland.tick();
             wayland.rearm_readiness();
             if wayland_changed {

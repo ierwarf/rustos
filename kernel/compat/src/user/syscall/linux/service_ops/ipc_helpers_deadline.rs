@@ -13,7 +13,11 @@ use super::{
 // Referenced only by this file's tests, which classify the poll-socket
 // timeout alongside the ops the production paths above use.
 #[cfg(test)]
-use super::SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET;
+use super::{
+    SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET, SYSCALL_OFFLOAD_OP_LINUX_RECVFROM,
+    SYSCALL_OFFLOAD_OP_LINUX_RECVMSG, SYSCALL_OFFLOAD_OP_LINUX_SENDMSG,
+    SYSCALL_OFFLOAD_OP_LINUX_SENDTO,
+};
 use alloc::string::String;
 
 pub(in crate::user::syscall::linux::service_ops) fn remaining_service_timeout_ms(
@@ -32,10 +36,16 @@ pub(in crate::user::syscall::linux::service_ops) fn retryable_early_service_tran
 pub(in crate::user::syscall::linux::service_ops) fn netd_timeout_class(
     op: u16,
 ) -> ipc_ops::ServiceIpcClass {
-    if matches!(
-        op,
-        SYSCALL_OFFLOAD_OP_LINUX_DUP | SYSCALL_OFFLOAD_OP_LINUX_CLOSE | NETD_IPC_OP_REF_ACK
-    ) {
+    // A stream send/receive is a state mutation for deadline purposes: netd
+    // keeps executing a request whose caller timed out, so an expired rail
+    // leaves the bytes moved (or not) with no way to tell. A 16/100 ms rail
+    // turned an ordinary netd stall on one CPU into a broken Wayland stream.
+    if super::super::vfs_meta::socket_op_moves_stream_bytes(op)
+        || matches!(
+            op,
+            SYSCALL_OFFLOAD_OP_LINUX_DUP | SYSCALL_OFFLOAD_OP_LINUX_CLOSE | NETD_IPC_OP_REF_ACK
+        )
+    {
         ipc_ops::ServiceIpcClass::StateMutation
     } else {
         ipc_ops::ServiceIpcClass::ReadinessQuery
@@ -88,6 +98,17 @@ mod tests {
             SYSCALL_OFFLOAD_OP_LINUX_DUP,
             SYSCALL_OFFLOAD_OP_LINUX_CLOSE,
             NETD_IPC_OP_REF_ACK,
+        ] {
+            assert!(matches!(
+                netd_timeout_class(op),
+                ipc_ops::ServiceIpcClass::StateMutation
+            ));
+        }
+        for op in [
+            SYSCALL_OFFLOAD_OP_LINUX_SENDTO,
+            SYSCALL_OFFLOAD_OP_LINUX_SENDMSG,
+            SYSCALL_OFFLOAD_OP_LINUX_RECVFROM,
+            SYSCALL_OFFLOAD_OP_LINUX_RECVMSG,
         ] {
             assert!(matches!(
                 netd_timeout_class(op),

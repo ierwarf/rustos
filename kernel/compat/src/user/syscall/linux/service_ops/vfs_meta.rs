@@ -805,8 +805,17 @@ pub fn syscall_linux_net6_with_timeout(
         && socket_op_honours_nonblock(op)
         && (request.status_flags & linux_abi::O_NONBLOCK != 0
             || io_flags & (linux_abi::MSG_DONTWAIT | linux_abi::MSG_ERRQUEUE) != 0);
+    // `O_NONBLOCK` bounds how long netd may wait for the *socket*, not how long
+    // the reply may take: a send or receive whose reply deadline expires has
+    // already been queued and still runs, so the caller cannot learn whether
+    // bytes moved. Byte-moving ops therefore get the state-mutation lease, not
+    // the interactive rail.
     let timeout_ms = if nonblocking_bound {
-        Some(rustos_user_abi::performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS)
+        Some(if socket_op_moves_stream_bytes(op) {
+            rustos_user_abi::performance::IPC_STATE_MUTATION_HARD_LIMIT_MS
+        } else {
+            rustos_user_abi::performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS
+        })
     } else {
         timeout_ms
     };

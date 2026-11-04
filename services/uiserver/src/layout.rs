@@ -397,17 +397,30 @@ pub(crate) fn default_console_window_rect(width: u32, height: u32, index: usize)
     let frame_height = DEFAULT_WINDOW_HEIGHT
         .min(bounds.height)
         .max(bounds.height.min(MIN_WINDOW_HEIGHT));
-    let step = index % WINDOW_CASCADE_SLOTS;
+    let (x, y) = cascade_origin(bounds, index);
 
     clamp_window_rect(
         width,
         height,
         Rect {
-            x: bounds.x + step * WINDOW_CASCADE_X,
-            y: bounds.y + step * WINDOW_CASCADE_Y,
+            x,
+            y,
             width: frame_width,
             height: frame_height,
         },
+    )
+}
+
+/// Top-left corner of the `index`-th window in the shared cascade. Console and
+/// Wayland windows draw from the same sequence: when each kind restarted at the
+/// desktop origin, a freshly launched Wayland window (larger than a console
+/// frame) was placed exactly over the consoles and hid every one of them
+/// behind the focused window.
+pub(crate) fn cascade_origin(bounds: Rect, index: usize) -> (usize, usize) {
+    let step = index % WINDOW_CASCADE_SLOTS;
+    (
+        bounds.x + step * WINDOW_CASCADE_X,
+        bounds.y + step * WINDOW_CASCADE_Y,
     )
 }
 
@@ -518,6 +531,26 @@ pub(crate) fn wayland_client_rect(outer: Rect) -> Rect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cascade_never_stacks_a_window_exactly_over_its_predecessor() {
+        let bounds = desktop_bounds(2560, 1440);
+        let mut previous = cascade_origin(bounds, 0);
+        for index in 1..WINDOW_CASCADE_SLOTS * 2 {
+            let origin = cascade_origin(bounds, index);
+            if index % WINDOW_CASCADE_SLOTS != 0 {
+                assert!(
+                    origin.0 > previous.0 && origin.1 > previous.1,
+                    "index {index}"
+                );
+            }
+            previous = origin;
+        }
+        // Console windows take the same sequence: the third console sits at
+        // the third slot, not at the origin.
+        let third = default_console_window_rect(2560, 1440, 2);
+        assert_eq!((third.x, third.y), cascade_origin(bounds, 2));
+    }
 
     fn home_cells(width: u32, height: u32, count: usize) -> Vec<HomeCell> {
         (0..count)

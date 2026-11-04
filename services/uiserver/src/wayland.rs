@@ -56,9 +56,6 @@ use crate::sys::{
 use crate::wayland_accept::{start_wayland_acceptor, WaylandAcceptor};
 
 const WAYLAND_SOCKET_NAME: &str = "wayland-0";
-const WINDOW_CASCADE_X: usize = 42;
-const WINDOW_CASCADE_Y: usize = 30;
-const WINDOW_CASCADE_SLOTS: usize = 6;
 const LINUX_BTN_LEFT: u32 = 0x110;
 const MAX_WAYLAND_SHM_POOL_BYTES: usize = 64 * 1024 * 1024;
 const MAX_WAYLAND_BUFFER_DIMENSION: usize = 8192;
@@ -464,6 +461,12 @@ impl WaylandCompositor {
         self.state.window_snapshots()
     }
 
+    /// Tell the compositor how many non-Wayland windows are already placed, so
+    /// new Wayland windows continue the shared cascade.
+    pub(crate) fn set_window_cascade_base(&mut self, windows: usize) {
+        self.state.cascade_base = windows;
+    }
+
     pub(crate) fn clear_window_damage(&mut self) {
         self.state.clear_window_damage();
     }
@@ -719,6 +722,22 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
+    fn new_wayland_window_continues_the_console_cascade() {
+        let mut state = super::WaylandState::new(2560, 1440);
+        let first = state.allocate_window_frame();
+        // With three console windows already placed, the next window must
+        // start after them rather than at the desktop origin they began from.
+        state.cascade_base = 3;
+        let after_consoles = state.allocate_window_frame();
+        assert!(after_consoles.x > first.x && after_consoles.y > first.y);
+        let console_three = crate::layout::default_console_window_rect(2560, 1440, 3);
+        assert_eq!(
+            (after_consoles.x, after_consoles.y),
+            (console_three.x, console_three.y)
+        );
+    }
+
+    #[test]
     fn wayland_readiness_requires_one_dispatch_before_rearm() {
         let needs_rearm = AtomicBool::new(true);
         assert!(claim_wayland_rearm(&needs_rearm));
@@ -852,7 +871,9 @@ struct WaylandState {
     display_width: u32,
     display_height: u32,
     next_serial: u32,
-    next_surface_index: usize,
+    /// Windows that belong to other owners (console sessions) and occupy the
+    /// first cascade slots.
+    cascade_base: usize,
     started_at: Instant,
     surfaces: Vec<SurfaceData>,
     output_resources: Vec<OutputResource>,
@@ -882,7 +903,7 @@ impl WaylandState {
             display_width,
             display_height,
             next_serial: 1,
-            next_surface_index: 0,
+            cascade_base: 0,
             started_at: Instant::now(),
             surfaces: Vec::new(),
             output_resources: Vec::new(),
@@ -921,13 +942,18 @@ impl WaylandState {
         let suggested_w = ((self.display_width as usize).saturating_mul(11) / 20).min(max_w);
         let suggested_h = ((self.display_height as usize).saturating_mul(3) / 5).min(max_h);
 
-        let index = self.next_surface_index;
-        self.next_surface_index = self.next_surface_index.saturating_add(1);
-        let step = index % WINDOW_CASCADE_SLOTS;
+        // Continue the cascade after every window already on screen, console
+        // windows included, so the new window leaves the title bars of the
+        // earlier ones visible instead of covering them exactly.
+        let live_surfaces = self
+            .surfaces
+            .iter()
+            .filter(|surface| surface.shared.lock().is_ok_and(|state| state.alive))
+            .count();
+        let index = self.cascade_base.saturating_add(live_surfaces);
 
         let desktop = layout::desktop_bounds(self.display_width, self.display_height);
-        let x = desktop.x + step * WINDOW_CASCADE_X;
-        let y = desktop.y + step * WINDOW_CASCADE_Y;
+        let (x, y) = layout::cascade_origin(desktop, index);
 
         clamp_wayland_frame(
             Rect {

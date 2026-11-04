@@ -1,5 +1,50 @@
 # Session Handoff — repository snapshot, 2026-10-31
 
+## 1-vCPU uiserver livelock + WayClick flush + window cascade 2026-11-04
+
+1-vCPU root cause (measured by QEMU-monitor RIP sampling + `ipc-service-exit-revoke`
+for service 14, then symbolized against the exe): the `rustos-svc-runtime`
+`#[global_allocator]` guarded its free list with a pure spin lock. With one CPU
+the lock holder was often not dispatched, so every other uiserver thread burned
+the shared 6 ms scheduling-context budget spinning; the holder could not run to
+release, and the UI-loop watchdog ended the process (exit 134 after 3 s).
+Fix: `libs/rustos-svc-runtime/src/allocator.rs` lock is now a 3-state futex lock
+(bounded 64-spin fast path, then `FUTEX_WAIT_PRIVATE`; unlock wakes one waiter
+only when contended); futex syscall wrappers in `syscall.rs`. Tests:
+`contended_allocations_sleep_instead_of_spinning_and_stay_disjoint`,
+`growth_callback_runs_without_allocator_lock`.
+
+WayClick: `Connection::flush` / the flush inside `blocking_dispatch` can return
+`WouldBlock` (wl_display_flush contract). `apps/wayclick/src/main.rs` treated it
+as fatal (seen as `flush failed: Io(WouldBlock)` in one 1-vCPU run). It now waits
+for POLLOUT with a 10 s budget and retries. Not investigated: why a near-empty
+AF_UNIX send reported EAGAIN (netd/AF_UNIX send path).
+
+Stream deadline (found by 1-vCPU run d-1, same cause as c-2's WouldBlock):
+nonblocking netd `sendmsg`/`recvmsg` used a 100 ms rail (class cap 16 ms) for the
+IPC *reply*. A netd stall on one CPU expired it, the request stayed queued and
+still ran, the caller got EAGAIN, and the stream was recorded broken
+(`socket-stream-break` class 5, errno 110), so WayClick saw EPIPE. `O_NONBLOCK`
+only bounds waiting on the socket, not the reply. Byte-moving ops now use the
+5 s state-mutation lease (`netd_timeout_class`, `vfs_meta.rs`); test
+`netd_reference_mutations_use_state_mutation_lease`. Risk: a wedged netd now
+blocks a nonblocking caller up to 5 s (uiserver watchdog is 3 s).
+Evidence: 4 pinned parallel 1-vCPU instances x 5 boots (private mount
+namespaces, `taskset` 3 CPUs each): 18/20 pass; both failures were Linux-DVM
+GPU render-budget (`gpu-compositor offline ... errno=110`, `dvm-gpu-ready=false`),
+not RustOS; whether parallel load causes them is not established.
+
+Window visibility: console windows and Wayland windows cascaded independently
+from the same desktop origin, so a new 800x520 WayClick window sat exactly over
+the 720x460 consoles and only the focused window was visible. Both now draw from
+`layout::cascade_origin`; `WaylandCompositor::set_window_cascade_base(console
+count)` is set before each `wayland.tick()`. Cause found by code analysis and
+unit tests (`cascade_*`, `new_wayland_window_continues_the_console_cascade`),
+not seen on screen (no screenshot facility in the harness; the QEMU
+`screendump` shows a 640x384 console, not the compositor).
+Still open: the GPU atlas drops a window silently when it does not fit
+(desktop texture takes 2560x1440 of 2688x2560).
+
 ## Network/IPC hardening + DNS EBUSY + perf batch 2026-11-04 (integrated)
 
 DNS EBUSY root cause (reasoned from vfsd state machine, not reproduced live):

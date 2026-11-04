@@ -169,7 +169,7 @@ acceptance contracts, not tuning defaults:
 | Deferred netd reference maintenance per turn | 1 ms | 1 ms | 1 replay or ACK |
 | Readiness observation | 1 frame | 16 ms | 1 per deduplicated provider |
 | Interactive policy-only control | 16 ms | 100 ms | 1; service drains at most 32 already-queued controls per turn |
-| State-changing service mutation (close/dup/settle/ACK/epoll control) | 100 ms | 5 s lease (`IPC_STATE_MUTATION_HARD_LIMIT_MS`) | 1 |
+| State-changing service mutation (close/dup/settle/ACK/epoll control; netd stream send/recv, including `O_NONBLOCK`/`MSG_DONTWAIT`) | 100 ms | 5 s lease (`IPC_STATE_MUTATION_HARD_LIMIT_MS`) | 1 |
 | Boot/control transaction | 100 ms | 5 s | 1 |
 | Bulk external-device data | 5 s | 30 s | 1 |
 

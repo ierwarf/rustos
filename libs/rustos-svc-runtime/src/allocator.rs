@@ -17,8 +17,10 @@
 //! - **Lifecycle:** Admit bootstrap memory, allocate/split, validate on free,
 //!   coalesce, retain mapped regions until process exit, and let process teardown
 //!   reclaim the mappings.
-//! - **Concurrency:** A bounded allocator lock protects metadata; growth occurs
-//!   only after releasing the metadata lock and is re-admitted before publish.
+//! - **Concurrency:** A futex-backed allocator lock (short spin, then sleep so a
+//!   descheduled holder is never starved by its waiters) protects metadata;
+//!   growth occurs only after releasing the metadata lock and is re-admitted
+//!   before publish.
 //! - **Failure:** Invalid layout, exhausted address space, corrupt metadata, and
 //!   mmap failure return allocation failure rather than fabricating memory.
 //! - **Forbidden:** No kernel-policy re-entry while locked, foreign-pointer free,
@@ -35,7 +37,7 @@ use core::mem::{align_of, size_of};
 #[cfg(feature = "global-allocator")]
 use core::ptr;
 #[cfg(feature = "global-allocator")]
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 #[cfg(feature = "global-allocator")]
 use crate::syscall;
@@ -218,9 +220,22 @@ impl AllocatorState {
 #[cfg(feature = "global-allocator")]
 struct ReclaimingAllocator {
     state: UnsafeCell<AllocatorState>,
-    locked: AtomicBool,
+    /// `UNLOCKED`, `LOCKED`, or `CONTENDED` (locked with at least one sleeper).
+    locked: AtomicU32,
     initialized: AtomicBool,
 }
+
+#[cfg(feature = "global-allocator")]
+const UNLOCKED: u32 = 0;
+#[cfg(feature = "global-allocator")]
+const LOCKED: u32 = 1;
+#[cfg(feature = "global-allocator")]
+const CONTENDED: u32 = 2;
+/// Spins before sleeping. Only useful when the holder runs on another CPU; on
+/// one CPU the holder cannot make progress while its waiter spins, so the
+/// bound is small and the wait then blocks instead of burning the budget.
+#[cfg(feature = "global-allocator")]
+const LOCK_SPINS: u32 = 64;
 
 #[cfg(feature = "global-allocator")]
 unsafe impl Sync for ReclaimingAllocator {}
@@ -230,24 +245,72 @@ impl ReclaimingAllocator {
     const fn new() -> Self {
         Self {
             state: UnsafeCell::new(AllocatorState::EMPTY),
-            locked: AtomicBool::new(false),
+            locked: AtomicU32::new(UNLOCKED),
             initialized: AtomicBool::new(false),
         }
     }
 
+    /// # Safety
+    /// The caller must pair this with exactly one `unlock` and must not touch
+    /// the returned state after it.
     unsafe fn lock(&self) -> *mut AllocatorState {
-        while self
+        // ORDERING: Acquire on success makes the previous holder's writes to
+        // the free list visible; the failure path publishes nothing.
+        if self
             .locked
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .compare_exchange(UNLOCKED, LOCKED, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
-            core::hint::spin_loop();
+            self.lock_contended();
         }
         self.state.get()
     }
 
+    /// A pure spin lock is unsound for a service heap: the holder can be
+    /// descheduled (or wait on a page fault) inside its critical section, and
+    /// every waiter then burns the process's whole scheduling budget while the
+    /// holder is starved. On one CPU that livelocked `uiserver` for good (both
+    /// the UI thread and a worker spinning in `alloc`/`dealloc`, the holder
+    /// never dispatched). Waiters therefore sleep on a futex after a short
+    /// spin and the unlock wakes one of them.
+    ///
+    /// # Safety
+    /// Same contract as `lock`.
+    #[cold]
+    unsafe fn lock_contended(&self) {
+        for _ in 0..LOCK_SPINS {
+            // ORDERING: the Relaxed load is only a hint; the acquiring
+            // compare-exchange below is what takes the lock.
+            if self.locked.load(Ordering::Relaxed) == UNLOCKED
+                && self
+                    .locked
+                    .compare_exchange(UNLOCKED, LOCKED, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok()
+            {
+                return;
+            }
+            core::hint::spin_loop();
+        }
+        // Mark the lock contended before sleeping so the holder's unlock wakes
+        // us; the swap also takes the lock if it was released meanwhile.
+        // ORDERING: Acquire when the swap observes UNLOCKED, for the same
+        // reason as the fast path.
+        while self.locked.swap(CONTENDED, Ordering::Acquire) != UNLOCKED {
+            // SAFETY: `locked` is a live process-private `AtomicU32`; the
+            // kernel only reads it, and spurious wakeups re-run the swap.
+            unsafe { syscall::futex_wait_private(self.locked.as_ptr(), CONTENDED) };
+        }
+    }
+
+    /// # Safety
+    /// The caller must hold the lock taken by `lock`.
     unsafe fn unlock(&self) {
-        self.locked.store(false, Ordering::Release);
+        // ORDERING: Release publishes the critical section's free-list writes
+        // to the next acquirer; CONTENDED means someone may be asleep.
+        if self.locked.swap(UNLOCKED, Ordering::Release) == CONTENDED {
+            // SAFETY: as in `lock_contended`; a wake with no waiter is a no-op.
+            unsafe { syscall::futex_wake_private(self.locked.as_ptr(), 1) };
+        }
     }
 
     unsafe fn initialize(&self, base: usize, len: usize) -> bool {
@@ -468,7 +531,7 @@ mod tests {
         assert!(!backing.is_null());
         let allocation = unsafe {
             allocator.allocate_with_growth(layout, |chunk| {
-                assert!(!allocator.locked.load(Ordering::Acquire));
+                assert_eq!(allocator.locked.load(Ordering::Acquire), UNLOCKED);
                 assert!(chunk >= layout.size() + HEADER_BYTES);
                 Some(backing as usize)
             })
@@ -478,6 +541,50 @@ mod tests {
             allocator.dealloc(allocation, layout);
             System.dealloc(backing, backing_layout);
         }
+    }
+
+    #[test]
+    fn contended_allocations_sleep_instead_of_spinning_and_stay_disjoint() {
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        let mut heap = std::vec![0_u8; 1024 * 1024];
+        let allocator = ReclaimingAllocator::new();
+        // SAFETY: no other thread exists yet, so the state is unshared, and
+        // `heap` outlives the allocator's use of the region.
+        unsafe {
+            assert!(
+                (&mut *allocator.state.get()).add_region(heap.as_mut_ptr() as usize, heap.len())
+            );
+        }
+        let failures = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    let layout = Layout::from_size_align(256, 16).unwrap();
+                    for round in 0..4000_usize {
+                        // SAFETY: `layout` has non-zero size; the allocator
+                        // serialises its own state.
+                        let block = unsafe { allocator.alloc(layout) };
+                        if block.is_null() {
+                            failures.fetch_add(1, AtomicOrdering::Relaxed);
+                            continue;
+                        }
+                        let stamp = (round & 0xff) as u8;
+                        // SAFETY: `block` is a live 256-byte allocation owned
+                        // by this thread until `dealloc` with the same layout.
+                        unsafe {
+                            core::ptr::write_bytes(block, stamp, layout.size());
+                            if (0..layout.size()).any(|i| *block.add(i) != stamp) {
+                                failures.fetch_add(1, AtomicOrdering::Relaxed);
+                            }
+                            allocator.dealloc(block, layout);
+                        }
+                    }
+                });
+            }
+        });
+        assert_eq!(failures.load(AtomicOrdering::Relaxed), 0);
+        assert_eq!(allocator.locked.load(Ordering::Acquire), UNLOCKED);
     }
 
     #[test]

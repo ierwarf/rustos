@@ -6,12 +6,13 @@ use std::ptr;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use wayland_client::backend::WaylandError;
 use wayland_client::protocol::{
     wl_buffer, wl_callback, wl_compositor, wl_pointer, wl_registry, wl_seat, wl_shm, wl_shm_pool,
     wl_surface,
 };
 use wayland_client::{
-    delegate_noop, ConnectError, Connection, Dispatch, Proxy, QueueHandle, WEnum,
+    delegate_noop, ConnectError, Connection, Dispatch, DispatchError, Proxy, QueueHandle, WEnum,
 };
 use wayland_protocols::xdg::shell::client::{xdg_surface, xdg_toplevel, xdg_wm_base};
 
@@ -214,23 +215,39 @@ fn main() {
     // enters its first blocking dispatch before the buffered write reaches
     // netd. Publish it explicitly; all later request batches use the matching
     // post-dispatch flush below.
-    if let Err(err) = conn.flush() {
+    if let Err(err) = flush_connection(&conn) {
         raw_stderr_line(&format!("wayclick: initial flush failed: {err:?}"));
         return;
     }
 
     let mut state = GameState::new();
     while state.running {
-        if let Err(err) = event_queue.blocking_dispatch(&mut state) {
-            raw_stderr_line(&format!("wayclick: dispatch failed: {err:?}"));
-            break;
+        match event_queue.blocking_dispatch(&mut state) {
+            Ok(_) => {}
+            // `blocking_dispatch` flushes first, and a compositor that has not
+            // yet drained the socket makes that flush report `WouldBlock`. That
+            // is backpressure, not a protocol failure: wait for the socket to
+            // become writable and dispatch again.
+            Err(DispatchError::Backend(WaylandError::Io(err)))
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) =>
+            {
+                wait_socket_writable(&conn);
+                continue;
+            }
+            Err(err) => {
+                raw_stderr_line(&format!("wayclick: dispatch failed: {err:?}"));
+                break;
+            }
         }
         // Frame callbacks enqueue the next attach/damage/commit batch while
         // dispatching pending events. `blocking_dispatch` returns immediately
         // in that case and would otherwise defer its implicit flush until the
         // next loop iteration. Flush now so the standard Wayland request batch
         // reaches the compositor in the same scheduling turn.
-        if let Err(err) = conn.flush() {
+        if let Err(err) = flush_connection(&conn) {
             raw_stderr_line(&format!("wayclick: flush failed: {err:?}"));
             break;
         }
@@ -239,6 +256,49 @@ fn main() {
             .maybe_emit(state.frame_callback.is_some(), state.redraw_pending);
     }
     raw_stderr_line("wayclick: main exit");
+}
+
+/// Longest a request flush may wait for the compositor to drain the socket.
+const FLUSH_WRITABLE_BUDGET: Duration = Duration::from_secs(10);
+const FLUSH_WRITABLE_POLL_MS: i32 = 20;
+
+/// Waits (bounded) until the Wayland socket accepts more bytes.
+fn wait_socket_writable(conn: &Connection) {
+    let mut poll_fd = libc::pollfd {
+        fd: conn.as_fd().as_raw_fd(),
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    // SAFETY: one valid pollfd for the duration of the call. An interrupted or
+    // timed-out poll only costs another flush attempt.
+    unsafe {
+        libc::poll(&mut poll_fd, 1, FLUSH_WRITABLE_POLL_MS);
+    }
+}
+
+/// `wl_display_flush` contract: `EAGAIN` means the compositor has not yet
+/// consumed earlier requests, so the client waits for the socket to become
+/// writable and retries instead of treating the connection as dead. Treating
+/// it as fatal made WayClick exit on a loaded single-CPU boot, where the
+/// compositor lagged behind its first request batch.
+fn flush_connection(conn: &Connection) -> Result<(), WaylandError> {
+    let started = Instant::now();
+    loop {
+        match conn.flush() {
+            Err(WaylandError::Io(err))
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) =>
+            {
+                if started.elapsed() >= FLUSH_WRITABLE_BUDGET {
+                    return Err(WaylandError::Io(err));
+                }
+                wait_socket_writable(conn);
+            }
+            result => return result,
+        }
+    }
 }
 
 struct GameState {
