@@ -155,6 +155,8 @@ pub(crate) struct GpuCompositor {
     cursor_source_rect: Option<Rect>,
     cursor_motion: CursorMotion,
     retained_scene_signature: u64,
+    cropped: bool,
+    capacity_pressure_logged_at: Option<Instant>,
     wayland_bindings: Vec<WaylandAtlasBinding>,
     console_bindings: Vec<ConsoleAtlasBinding>,
     next_slot: usize,
@@ -555,6 +557,8 @@ impl GpuCompositor {
                 cursor_source_rect: None,
                 cursor_motion: CursorMotion::stationary(),
                 retained_scene_signature: 0,
+                cropped: false,
+                capacity_pressure_logged_at: None,
                 wayland_bindings: Vec::new(),
                 console_bindings: Vec::new(),
                 next_slot: 0,
@@ -578,7 +582,7 @@ impl GpuCompositor {
         while self.retire_oldest(false)? {}
         let retire_elapsed = total_started.elapsed();
         let submission_started = Instant::now();
-        if self.active && submission_started < self.next_submission_at {
+        if submission_started < self.next_submission_at {
             return Err(EAGAIN);
         }
         let Some(slot_index) = self.select_submission_slot()? else {
@@ -593,7 +597,8 @@ impl GpuCompositor {
         let mut damage = Vec::new();
         let current_scene_signature = gpu_scene_reuse_signature(state);
         let mut full_rebuild = !self.active
-            || (scene_dirty && current_scene_signature != self.retained_scene_signature);
+            || (scene_dirty
+                && (self.cropped || current_scene_signature != self.retained_scene_signature));
         if scene_dirty
             && !full_rebuild
             && !update_gpu_layer_destinations(
@@ -644,6 +649,7 @@ impl GpuCompositor {
                 cursor_source_rect,
                 wayland_bindings,
                 console_bindings,
+                cropped,
             } = match build_gpu_atlas_scene(
                 state,
                 self.scratch_atlas.as_mut_slice(),
@@ -651,6 +657,7 @@ impl GpuCompositor {
                 self.info.atlas_height as usize,
                 self.info.atlas_stride_bytes as usize / size_of::<u32>(),
                 capability,
+                self.cropped && current_scene_signature == self.retained_scene_signature,
             ) {
                 Ok(scene) => scene,
                 Err(GpuSceneError::SceneNotReady) if !self.active => {
@@ -664,8 +671,26 @@ impl GpuCompositor {
                     }
                     return Ok(false);
                 }
+                Err(error @ (GpuSceneError::AtlasFull | GpuSceneError::CommandLimit)) => {
+                    // A capacity rejection is NOT a submitted scene. Keep the
+                    // previous complete front, timeline and damage history;
+                    // retry the coalesced update after the normal frame rail.
+                    // A prior incremental attempt may have touched local
+                    // pixels, so recovery must publish a complete snapshot.
+                    self.force_full_snapshot = true;
+                    self.next_submission_at = Instant::now() + GPU_FRAME_INTERVAL;
+                    let now = Instant::now();
+                    if self.capacity_pressure_logged_at.is_none_or(|last| {
+                        now.duration_since(last) >= Duration::from_secs(1)
+                    }) {
+                        diag_line(format!("uiserver: gpu scene backpressured capacity={error:?}; retaining previous complete frame"));
+                        self.capacity_pressure_logged_at = Some(now);
+                    }
+                    return Err(EAGAIN);
+                }
                 Err(err) => return Err(gpu_scene_errno(err)),
             };
+            self.capacity_pressure_logged_at = None;
             rebuild_scene_elapsed = scene_started.elapsed();
             let difference_started = Instant::now();
             damage = if self.active {
@@ -694,6 +719,7 @@ impl GpuCompositor {
             self.cursor_motion = state.cursor_motion;
             self.wayland_bindings = wayland_bindings;
             self.console_bindings = console_bindings;
+            self.cropped = cropped;
             self.retained_scene_signature = gpu_scene_reuse_signature(state);
         } else if state.cursor_motion != self.cursor_motion {
             let cursor_source_rect = self.cursor_source_rect.ok_or(EINVAL)?;
@@ -1371,13 +1397,8 @@ fn damage_union(
     })
 }
 
-/// A scene rejection that reaches this point is a contract violation, so they
-/// share one errno. Capacity limits are not rejections: a window the atlas has
-/// no room for, or one with nothing to draw, is left out of the scene before
-/// it gets here. The errno alone cannot say which contract broke, and the
-/// compositor exits on it, so the caller would be left with a bare `errno=22`
-/// and no way back to the rule that rejected the frame. Name it here, once,
-/// at the conversion.
+/// Malformed scenes are contract failures. Representability pressure is
+/// handled before this conversion as retryable whole-scene backpressure.
 fn gpu_scene_errno(error: GpuSceneError) -> i32 {
     debug_line(&format!("uiserver: gpu scene rejected reason={error:?}"));
     EINVAL

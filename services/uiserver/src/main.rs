@@ -5,6 +5,7 @@ mod clock;
 mod cursor_sprites;
 mod diagnostics;
 mod font;
+mod glyph_atlas;
 mod gpu_runtime;
 mod gpu_scene;
 mod input_loop;
@@ -498,9 +499,8 @@ fn run() -> Result<(), i32> {
     // normal asynchronous production diagnostic.
     sys::debug_line(GPU_SCENE_READY);
     diag_line(GPU_SCENE_READY);
-    // Fonts and the clock offset come from files on the boot volume, which the
-    // storage stack publishes after this service starts. Load them on a thread
-    // that waits for it; text appears once they are installed.
+    // Bundled atlases and their configured clock offset are immediately usable.
+    // Load overrides off-thread and promote them only between rendered frames.
     let ui_assets_loaded = ui_assets::start_asset_loader();
     let mut state = AppState::initialize()?;
     // Input ingress is independent of runtime catalog and Wayland startup.
@@ -662,10 +662,14 @@ fn run() -> Result<(), i32> {
 
         if let Ok(load) = ui_assets_loaded.try_recv() {
             match load {
-                ui_assets::AssetLoad::Ready(_) => {
-                    // Everything painted so far had no text; repaint it.
-                    state.desktop_cache.invalidate_chrome();
-                    pending_update.request_full();
+                ui_assets::AssetLoad::Ready(loaded) => {
+                    if ui_assets::promote(
+                        loaded,
+                        &mut state.desktop_cache,
+                        &mut state.console_windows,
+                    ) {
+                        pending_update.request_full();
+                    }
                 }
                 ui_assets::AssetLoad::Failed(reason) => {
                     diag_line(format!("uiserver: ui assets {reason}"));
@@ -845,6 +849,18 @@ fn run() -> Result<(), i32> {
         }
         watchdog.leave();
         phase_timings.console = console_phase_started.elapsed();
+
+        // UI owns cross-protocol placement. Keep the last acknowledged geometry
+        // until the Wayland owner publishes the move in its next snapshot.
+        let mut placement_changed = false;
+        for &(id, x, y) in state.pending_wayland_placements() {
+            placement_changed |= wayland.move_surface(id, x, y);
+        }
+        if placement_changed {
+            let placement_dirty = state.sync_wayland_windows(wayland.window_snapshots());
+            pending_update.absorb(VisualUpdate::partial(placement_dirty));
+        }
+        state.sync_wayland_input_focus(&mut wayland);
 
         let cursor_phase_started = Instant::now();
         let now = cursor_phase_started;

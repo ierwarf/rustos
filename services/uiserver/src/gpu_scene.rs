@@ -139,7 +139,7 @@ impl From<DvmGpuTimelineError> for GpuSceneError {
     }
 }
 
-/// Deterministic shelf packer for one immutable atlas generation. It copies
+/// Deterministic rectangle packer for one immutable atlas generation. It copies
 /// independently rasterized source surfaces into isolated regions; it never
 /// paints their final destination positions or performs z-order composition.
 /// One transparent texel around each region prevents nearest-sample bleed.
@@ -263,11 +263,30 @@ impl<'a> GpuAtlasPacker<'a> {
         self.place(source, width, height, stride_pixels, true)
     }
 
+    pub(crate) fn write_bgra_at(
+        &mut self,
+        destination: Rect,
+        source: &[u32],
+        stride_pixels: usize,
+    ) -> Result<(), GpuSceneError> {
+        self.write_at(destination, source, stride_pixels, false)
+    }
+
     pub(crate) fn write_xrgb_at(
         &mut self,
         destination: Rect,
         source: &[u32],
         stride_pixels: usize,
+    ) -> Result<(), GpuSceneError> {
+        self.write_at(destination, source, stride_pixels, true)
+    }
+
+    fn write_at(
+        &mut self,
+        destination: Rect,
+        source: &[u32],
+        stride_pixels: usize,
+        force_opaque: bool,
     ) -> Result<(), GpuSceneError> {
         let source_required = destination
             .height
@@ -328,7 +347,11 @@ impl<'a> GpuAtlasPacker<'a> {
                 .pixels
                 .get_mut(destination_start..destination_end)
                 .ok_or(GpuSceneError::InvalidLayer)?;
-            copy_xrgb_opaque_row(destination_row, source_row);
+            if force_opaque {
+                copy_xrgb_opaque_row(destination_row, source_row);
+            } else {
+                destination_row.copy_from_slice(source_row);
+            }
         }
         Ok(())
     }
@@ -350,6 +373,63 @@ impl<'a> GpuAtlasPacker<'a> {
             || stride_pixels < width
             || source_required.is_none_or(|required| required > source.len())
         {
+            return Err(GpuSceneError::InvalidLayer);
+        }
+        let destination = self.reserve(width, height)?;
+
+        for row in 0..height {
+            let source_start = row
+                .checked_mul(stride_pixels)
+                .ok_or(GpuSceneError::InvalidLayer)?;
+            let source_end = source_start
+                .checked_add(width)
+                .ok_or(GpuSceneError::InvalidLayer)?;
+            let destination_start = (destination.y + row)
+                .checked_mul(self.stride_pixels)
+                .and_then(|offset| offset.checked_add(destination.x))
+                .ok_or(GpuSceneError::InvalidLayer)?;
+            let destination_end = destination_start
+                .checked_add(width)
+                .ok_or(GpuSceneError::InvalidLayer)?;
+            let source_row = source
+                .get(source_start..source_end)
+                .ok_or(GpuSceneError::InvalidLayer)?;
+            let destination_row = self
+                .pixels
+                .get_mut(destination_start..destination_end)
+                .ok_or(GpuSceneError::InvalidLayer)?;
+            if force_opaque {
+                copy_xrgb_opaque_row(destination_row, source_row);
+            } else {
+                destination_row.copy_from_slice(source_row);
+            }
+        }
+
+        Ok(destination)
+    }
+
+    /// Largest top-left crop of a requested region that fits remaining padded
+    /// storage. The caller splits source/destination rectangles identically;
+    /// no resampling or composition is introduced by allocator fragmentation.
+    pub(crate) fn largest_available_crop(
+        &self,
+        width: usize,
+        height: usize,
+    ) -> Option<(usize, usize)> {
+        self.free
+            .iter()
+            .filter_map(|free| {
+                let width = width.min(free.width.checked_sub(2 * Self::PADDING)?);
+                let height = height.min(free.height.checked_sub(2 * Self::PADDING)?);
+                (width != 0 && height != 0).then_some((width, height))
+            })
+            .max_by_key(|&(width, height)| (width * height, width.min(height)))
+    }
+
+    /// Reserve padded source storage without rasterizing it. Fragment planning
+    /// must prove the complete scene fits before copying any layer pixels.
+    pub(crate) fn reserve(&mut self, width: usize, height: usize) -> Result<Rect, GpuSceneError> {
+        if width == 0 || height == 0 {
             return Err(GpuSceneError::InvalidLayer);
         }
         let padding = Self::PADDING;
@@ -388,36 +468,6 @@ impl<'a> GpuAtlasPacker<'a> {
             width,
             height,
         };
-        for row in 0..height {
-            let source_start = row
-                .checked_mul(stride_pixels)
-                .ok_or(GpuSceneError::InvalidLayer)?;
-            let source_end = source_start
-                .checked_add(width)
-                .ok_or(GpuSceneError::InvalidLayer)?;
-            let destination_start = (destination.y + row)
-                .checked_mul(self.stride_pixels)
-                .and_then(|offset| offset.checked_add(destination.x))
-                .ok_or(GpuSceneError::InvalidLayer)?;
-            let destination_end = destination_start
-                .checked_add(width)
-                .ok_or(GpuSceneError::InvalidLayer)?;
-            let source_row = source
-                .get(source_start..source_end)
-                .ok_or(GpuSceneError::InvalidLayer)?;
-            let destination_row = self
-                .pixels
-                .get_mut(destination_start..destination_end)
-                .ok_or(GpuSceneError::InvalidLayer)?;
-            if force_opaque {
-                copy_xrgb_opaque_row(destination_row, source_row);
-            } else {
-                destination_row.copy_from_slice(source_row);
-            }
-        }
-
-        // Commit only after every copy succeeded, so a failed placement leaves
-        // the free list untouched.
         self.carve_free_rect(free_index, free, outer_width, outer_height);
         Ok(destination)
     }

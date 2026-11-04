@@ -1,8 +1,9 @@
 //! Wall-clock time for the home screen.
 //!
 //! RustOS keeps UTC and has no timezone database, so local time is UTC plus a
-//! fixed offset from the runtime UI configuration (`clock.utc_offset_minutes`). The calendar math is
-//! pure so it can be tested without a clock.
+//! fixed offset from the active UI configuration (`clock.utc_offset_minutes`).
+//! The bundled offset is available before runtime files load. The calendar math
+//! is pure so it can be tested without a clock.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -101,7 +102,13 @@ mod tests {
     fn the_epoch_is_a_thursday_at_midnight_in_utc() {
         let reading = ClockReading::from_unix(0, 0);
         assert_eq!(
-            (reading.hour, reading.minute, reading.weekday, reading.month, reading.day),
+            (
+                reading.hour,
+                reading.minute,
+                reading.weekday,
+                reading.month,
+                reading.day
+            ),
             (0, 0, 4, 1, 1)
         );
         assert_eq!(reading.time_text(), "00:00");
@@ -115,18 +122,27 @@ mod tests {
         let reading = ClockReading::from_unix(1_793_108_046, 540);
         assert_eq!(reading.time_text(), "22:34");
         assert_eq!(reading.date_text(), "Tue, Oct 27");
-        assert_eq!(ClockReading::from_unix(1_793_108_046, 0).time_text(), "13:34");
+        assert_eq!(
+            ClockReading::from_unix(1_793_108_046, 0).time_text(),
+            "13:34"
+        );
     }
 
     #[test]
     fn the_offset_can_roll_the_date_forward_or_back() {
         // 23:30 UTC on 2026-10-27 is already the 28th in Korea...
         let late = 1_793_108_046 - (13 * 3_600 + 34 * 60 + 6) + 23 * 3_600 + 30 * 60;
-        assert_eq!(ClockReading::from_unix(late, 540).date_text(), "Wed, Oct 28");
+        assert_eq!(
+            ClockReading::from_unix(late, 540).date_text(),
+            "Wed, Oct 28"
+        );
         assert_eq!(ClockReading::from_unix(late, 540).time_text(), "08:30");
         // ...and 01:00 UTC is still the previous evening in New York (UTC-5).
         let early = late + 90 * 60;
-        assert_eq!(ClockReading::from_unix(early, -300).date_text(), "Tue, Oct 27");
+        assert_eq!(
+            ClockReading::from_unix(early, -300).date_text(),
+            "Tue, Oct 27"
+        );
         assert_eq!(ClockReading::from_unix(early, -300).time_text(), "20:00");
     }
 
@@ -137,8 +153,14 @@ mod tests {
         assert_eq!((leap.month, leap.day), (2, 29));
         assert_eq!(leap.date_text(), "Thu, Feb 29");
         // 2000-01-01 00:00 UTC was a Saturday, and 1999-12-31 23:59:59 the Friday before.
-        assert_eq!(ClockReading::from_unix(946_684_800, 0).date_text(), "Sat, Jan 1");
-        assert_eq!(ClockReading::from_unix(946_684_799, 0).date_text(), "Fri, Dec 31");
+        assert_eq!(
+            ClockReading::from_unix(946_684_800, 0).date_text(),
+            "Sat, Jan 1"
+        );
+        assert_eq!(
+            ClockReading::from_unix(946_684_799, 0).date_text(),
+            "Fri, Dec 31"
+        );
         // Times before the epoch still land on a real date.
         assert_eq!(ClockReading::from_unix(-1, 0).date_text(), "Wed, Dec 31");
         assert_eq!(ClockReading::from_unix(-1, 0).time_text(), "23:59");
@@ -153,6 +175,29 @@ mod tests {
         assert_eq!(a.time_text(), b.time_text());
         assert_eq!(c.minute_key, a.minute_key + 1, "next minute");
         assert_ne!(a.time_text(), c.time_text());
+    }
+
+    #[test]
+    fn first_clock_reading_uses_real_time_and_the_packaged_offset() {
+        let conf =
+            crate::ui_config::parse(include_str!("../../../assets/ui/bundle/ui.conf")).unwrap();
+        assert_eq!(crate::ui_assets::asset_revision(), 1);
+        assert_eq!(
+            crate::ui_assets::clock_utc_offset_minutes(),
+            conf.clock_utc_offset_minutes
+        );
+        let before = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let reading = ClockReading::now().unwrap();
+        let after = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let offset = conf.clock_utc_offset_minutes;
+        assert!(reading.minute_key >= ClockReading::from_unix(before, offset).minute_key);
+        assert!(reading.minute_key <= ClockReading::from_unix(after, offset).minute_key);
     }
 
     #[test]

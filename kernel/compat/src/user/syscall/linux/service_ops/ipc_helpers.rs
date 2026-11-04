@@ -2066,8 +2066,8 @@ fn finish_netd_ipc_response(
     mut decoded: NetdIpcResponse,
     release: impl FnOnce(&mut NetdIpcResponse) -> Result<(), i64>,
 ) -> Result<NetdIpcResponse, i64> {
-    // A failed accept may retire an unpublished peer after its listener closed.
-    // Its validated cleanup trailer still owns transfer custody on an error.
+    // A reference mutation may carry cleanup even on an error; validate and
+    // settle its custody before exposing the operation status.
     release(&mut decoded)?;
     if decoded.status != 0 {
         return Err(decoded.status.unsigned_abs() as i64);
@@ -2110,10 +2110,7 @@ fn decode_netd_ipc_response(
             && !matches!(
                 request.op,
                 SYSCALL_OFFLOAD_OP_LINUX_CLOSE | SYSCALL_OFFLOAD_OP_LINUX_RECVFROM
-            )
-            && !(request.op == SYSCALL_OFFLOAD_OP_LINUX_ACCEPT
-                && decoded.status != 0
-                && decoded.reserved0 == decoded.payload_len))
+            ))
         || decoded.reserved1 & !NETD_IPC_RESPONSE_FLAG_LATENCY_HANDOFF != 0
     {
         return Err(LINUX_EINVAL);

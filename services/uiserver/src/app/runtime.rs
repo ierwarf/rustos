@@ -711,6 +711,13 @@ impl AppState {
                 self.display.height,
                 self.console_windows.len(),
             );
+            let frame = super::stacking::place_window(
+                self.display.width,
+                self.display.height,
+                frame,
+                false,
+                &self.occupied_window_frames(),
+            );
             self.console_windows.push(ConsoleWindow::new(
                 session_handle,
                 console_session_title(session),
@@ -726,6 +733,7 @@ impl AppState {
             update.add_partial_rect(crate::render::console_window_dirty_rect(frame));
         }
 
+        self.reconcile_window_stack();
         update
     }
 
@@ -784,6 +792,18 @@ impl AppState {
 
             let frame =
                 default_console_window_rect(self.display.width, self.display.height, next.len());
+            let occupied = next
+                .iter()
+                .map(|w| w.frame)
+                .chain(self.wayland_placement_frames())
+                .collect::<Vec<_>>();
+            let frame = super::stacking::place_window(
+                self.display.width,
+                self.display.height,
+                frame,
+                false,
+                &occupied,
+            );
             next.push(ConsoleWindow::new(
                 program.session_handle,
                 runtime_program_title(program),
@@ -814,6 +834,7 @@ impl AppState {
         }
 
         self.console_windows = next;
+        self.reconcile_window_stack();
         if topology_changed {
             let mut update = VisualUpdate::partial(before_dirty);
             update.add_partial_rect(self.console_stack_dirty_rect());
@@ -838,13 +859,6 @@ impl AppState {
             && self.wayland_windows.iter().any(|window| {
                 !window.minimized && Some(window.surface_id) == self.focused_wayland_surface_id
             });
-        if self.console_windows.is_empty() {
-            self.focused_session_handle = 0;
-            return Ok(self
-                .window_rect_for_session(previous_focused)
-                .union(self.taskbar_slot_rect_for_session(previous_focused)));
-        }
-
         if wayland_focused && pending_console_focus.is_none() {
             self.focused_session_handle = 0;
             return Ok(self
@@ -855,10 +869,11 @@ impl AppState {
         self.focused_session_handle = if let Some(pending_session) = pending_console_focus {
             self.focused_wayland_surface_id = None;
             pending_session
-        } else if self
-            .console_windows
-            .iter()
-            .any(|window| window.session_handle == kernel_focused_session && !window.minimized)
+        } else if previous_focused != 0
+            && self
+                .console_windows
+                .iter()
+                .any(|window| window.session_handle == kernel_focused_session && !window.minimized)
         {
             kernel_focused_session
         } else {
@@ -876,21 +891,19 @@ impl AppState {
                 .union(self.taskbar_slot_rect_for_session(self.focused_session_handle))
                 .union(self.window_rect_for_session(self.focused_session_handle))
         };
-        while self.focused_session_handle == 0 && !self.console_windows.is_empty() {
-            let Some(fallback_session) = self
-                .console_windows
-                .iter()
-                .rev()
-                .find(|window| !window.minimized)
-                .map(|window| window.session_handle)
-            else {
-                break;
-            };
-            self.console_commands.submit_focus(fallback_session);
-            self.pending_console_focus = Some(fallback_session);
-            self.focused_session_handle = fallback_session;
-            dirty_rect = dirty_rect.union(self.window_rect_for_session(fallback_session));
-            dirty_rect = dirty_rect.union(self.taskbar_slot_rect_for_session(fallback_session));
+        if self.focused_session_handle == 0 {
+            match self.top_visible_window() {
+                Some(super::WindowId::Wayland(id)) => {
+                    self.focus_wayland_window(id);
+                    return Ok(dirty_rect
+                        .union(self.wayland_stack_dirty_rect())
+                        .union(self.taskbar_dirty_rect()));
+                }
+                Some(super::WindowId::Console(id)) => {
+                    dirty_rect = dirty_rect.union(self.focus_window(id)?);
+                }
+                None => {}
+            }
         }
 
         if self.focused_session_handle != 0 && self.focused_session_handle != previous_focused {
@@ -927,35 +940,34 @@ impl AppState {
             });
         }
 
-        // If no console explicitly owns focus, prefer the most-recently-stacked
-        // visible Wayland window before falling back to a console. Closing one
-        // Wayland app on top of another should hand focus to the next Wayland
-        // window, not jump back to a terminal in the background.
-        if let Some(fallback_surface) = self
-            .wayland_windows
-            .iter()
-            .rev()
-            .find(|window| !window.minimized)
-            .map(|window| window.surface_id)
-        {
-            if let Some(wayland) = wayland {
-                wayland.focus_surface(fallback_surface);
+        // The next visible mixed-stack window owns focus, regardless of
+        // protocol. Closing/minimizing a Wayland window must not skip a console.
+        let dirty = self
+            .window_stack_dirty_rect()
+            .union(self.wayland_stack_dirty_rect())
+            .union(self.taskbar_dirty_rect());
+        match self.top_visible_window() {
+            Some(super::WindowId::Wayland(id)) => {
+                if let Some(wayland) = wayland {
+                    wayland.focus_surface(id);
+                }
+                self.focus_wayland_window(id);
             }
-            self.focused_wayland_surface_id = Some(fallback_surface);
-            self.focused_session_handle = 0;
-            return Ok(self
-                .wayland_stack_dirty_rect()
-                .union(self.wayland_taskbar_dirty_rect()));
+            Some(super::WindowId::Console(id)) => {
+                if let Some(wayland) = wayland {
+                    wayland.clear_focus();
+                }
+                self.focus_window(id)?;
+            }
+            None => {
+                if let Some(wayland) = wayland {
+                    wayland.clear_focus();
+                }
+                self.focused_session_handle = 0;
+                self.pending_console_focus = None;
+            }
         }
-
-        let console_refocused = self.refocus_visible_console_window()?;
-        Ok(if previous_wayland_focus.is_some() {
-            self.wayland_stack_dirty_rect()
-                .union(self.wayland_taskbar_dirty_rect())
-                .union(console_refocused)
-        } else {
-            console_refocused
-        })
+        Ok(dirty)
     }
 
     pub(super) fn mark_console_session_closing(&mut self, session_handle: ConsoleSessionHandle) {
@@ -999,6 +1011,7 @@ impl AppState {
             }
         }
 
+        self.reconcile_window_stack();
         previous_len != self.console_windows.len()
             || previous_focused != self.focused_session_handle
             || previous_dragging != self.dragging_window
@@ -1023,9 +1036,15 @@ impl AppState {
         {
             window.minimized = false;
         }
+        let previous_wayland_dirty = self
+            .focused_wayland_surface_id
+            .map(|id| self.wayland_window_rect_for_surface(id))
+            .unwrap_or_default();
         self.focused_wayland_surface_id = None;
         let previous_focused = self.focused_session_handle;
-        let mut dirty_rect = self.window_rect_for_session(previous_focused);
+        let mut dirty_rect = self
+            .window_rect_for_session(previous_focused)
+            .union(previous_wayland_dirty);
         dirty_rect = dirty_rect.union(self.window_rect_for_session(session_handle));
         if self.focused_session_handle != session_handle {
             self.console_commands.submit_focus(session_handle);
@@ -1054,43 +1073,14 @@ impl AppState {
         else {
             return false;
         };
+        let raised = self.raise_window(super::WindowId::Console(session_handle));
         if index + 1 == self.console_windows.len() {
-            return false;
+            return raised;
         }
 
         let window = self.console_windows.remove(index);
         self.console_windows.push(window);
         true
-    }
-
-    pub(super) fn refocus_visible_console_window(&mut self) -> Result<canvas::Rect, i32> {
-        let previous_focused = self.focused_session_handle;
-        let Some(session_handle) = self
-            .console_windows
-            .iter()
-            .rev()
-            .find(|window| !window.minimized)
-            .map(|window| window.session_handle)
-        else {
-            self.focused_session_handle = 0;
-            return Ok(self
-                .window_rect_for_session(previous_focused)
-                .union(self.taskbar_slot_rect_for_session(previous_focused)));
-        };
-
-        let dirty_rect = self
-            .window_rect_for_session(previous_focused)
-            .union(self.window_rect_for_session(session_handle))
-            .union(self.taskbar_slot_rect_for_session(previous_focused))
-            .union(self.taskbar_slot_rect_for_session(session_handle))
-            .union(self.focused_window_reorder_dirty_rect());
-        if self.focused_session_handle != session_handle {
-            self.console_commands.submit_focus(session_handle);
-            self.pending_console_focus = Some(session_handle);
-            self.focused_session_handle = session_handle;
-        }
-
-        Ok(dirty_rect)
     }
 
     fn window_rect_for_session(&self, session_handle: ConsoleSessionHandle) -> canvas::Rect {
@@ -1155,4 +1145,3 @@ fn console_session_title(session: &ConsoleSessionInfo) -> String {
 
 #[cfg(test)]
 mod tests;
-

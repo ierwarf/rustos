@@ -1087,7 +1087,19 @@ reason = "Detached AF_UNIX poll waiters keep one global reservation and one term
 path = "services/netd/src/blocking.rs"
 severity = "critical"
 flows = ["netd-deferred-reply-lifecycle"]
-reason = "Bounded worker pools own detached reply capabilities for blocking INET work and provider-gated socket creation."
+reason = "Bounded worker pools own detached reply capabilities for blocking INET work and charge-bearing socket/socketpair/accept lifecycle requests."
+
+[[risk_surfaces]]
+path = "services/netd/src/provider_accounting.rs"
+severity = "critical"
+flows = ["netd-deferred-reply-lifecycle"]
+reason = "Before CHARGE IPC every token reserves bounded refund custody; exact nonce settlement fences accept reuse and close never performs rootd IPC."
+
+[[risk_surfaces]]
+path = "services/netd/src/socket_lifecycle.rs"
+severity = "critical"
+flows = ["netd-deferred-reply-lifecycle"]
+reason = "Funded initial references move only into exact reply-bound publication; failure owns discard/refund before accept requeue."
 
 [[risk_surfaces]]
 path = "services/netd/src/dispatch.rs"
@@ -1713,6 +1725,18 @@ models = [
     "ipc-handle-transfer/IpcHandleTransfer",
     "ipc-transfer-authority/IpcTransferAuthority",
 ]
+
+[[source_mappings]]
+path = "services/netd/src/main.rs"
+models = ["netd-deferred-reply/NetdDeferredReply", "ipc-transfer-authority/IpcTransferAuthority"]
+
+[[source_mappings]]
+path = "services/netd/src/provider_accounting.rs"
+models = ["service-mutation-recovery/ServiceMutationRecovery", "netd-deferred-reply/NetdDeferredReply"]
+
+[[source_mappings]]
+path = "services/netd/src/socket_lifecycle.rs"
+models = ["ipc-handle-transfer/IpcHandleTransfer", "netd-deferred-reply/NetdDeferredReply"]
 
 [[source_mappings]]
 path = "services/netd/src/unix_stream.rs"

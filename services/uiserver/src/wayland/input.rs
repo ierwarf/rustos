@@ -8,7 +8,20 @@ impl WaylandState {
             let Ok(surface) = surface.shared.lock() else {
                 continue;
             };
-            if !surface.alive || surface.minimized || surface.width == 0 || surface.height == 0 {
+            let grabbed = self.pointer_button_down
+                && self.pointer_focus.as_ref().is_some_and(|focus| {
+                    surface
+                        .resource
+                        .as_ref()
+                        .is_some_and(|resource| resource.id() == focus.surface.id())
+                });
+            if (!grabbed
+                && (self.pointer_button_down || self.pointer_target != Some(surface.surface_id)))
+                || !surface.alive
+                || surface.minimized
+                || surface.width == 0
+                || surface.height == 0
+            {
                 continue;
             }
             let Some(resource) = surface.resource.clone() else {
@@ -30,14 +43,14 @@ impl WaylandState {
                 width: visible_w,
                 height: visible_h,
             };
-            if !client_rect.contains(x, y) {
+            if !grabbed && !client_rect.contains(x, y) {
                 continue;
             }
             return Some(PointerHit {
                 surface: resource,
                 client_id,
-                surface_x: f64::from(x.saturating_sub(client_rect.x as u32)),
-                surface_y: f64::from(y.saturating_sub(client_rect.y as u32)),
+                surface_x: f64::from(x) - client_rect.x as f64,
+                surface_y: f64::from(y) - client_rect.y as f64,
             });
         }
         None

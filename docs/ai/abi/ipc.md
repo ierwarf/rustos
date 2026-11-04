@@ -47,10 +47,22 @@
   accept publication ends listener-budget custody without dropping control.
   Final listener close retires queued unpublished sockets and marks clients
   peer-closed. An in-flight failed accept requeues if the listener is live;
-  otherwise its cleanup-only error reply returns its unpublished peer's queued
-  authority once. Compat validates the full wire envelope and consumes release
-  trailers before returning errno. ACCEPT permits a trailer only on error and
-  only when `reserved0 == payload_len`; successful ACCEPT permits none.
+  otherwise it withdraws the unpublished peer and hands its opaque ancillary
+  block to the bounded NetPolicy `NET_BROKER_OP_RELEASE_SOCKET_CONTROL` broker.
+  The kernel decodes the complete block before moving tickets to deferred drop;
+  this path never synchronously reenters a provider. ACCEPT replies carry no
+  cleanup trailer: caller abandonment cannot strand authority in an untaken
+  byte reply. Impossible local release failure terminates netd so service-epoch
+  revocation owns cleanup. CLOSE/read cleanup trailers retain their replay and
+  validated consumer paths.
+- Initial netd SOCKET/SOCKETPAIR/ACCEPT references use version-2 reply-bound
+  publication, never direct target-process fd installation. The exact timely
+  reply take owns a validated one/two-entry batch; invisible slot reservation,
+  accept/socketpair copyout and the final deadline check precede atomic fd
+  commit. Failed binding leaves discard with netd; successful binding transfers
+  abandonment cleanup to the kernel transfer-drop owner. See the accounting
+  reservation/refund and shared AF_UNIX queue-budget invariants in
+  [Network Surface](policy-display.md#network-surface-netd).
 - Supervisor services draining independent brokers must use `SYS_RUSTOS_IPC_TRY_RECV`, not blocking `SYS_RUSTOS_IPC_RECV`. Their *idle* wait is `SYS_RUSTOS_IPC_RECV_WITH_SENDER_BOUNDED`, not a timer; see the IPC Wait Discipline section.
 - FD-table transfer goes through `kernel_ps::api::TransferredHandleEntry` + `HandleTable::{duplicate_for_transfer, install_transferred}`. Source class + rights must permit descriptor transfer; directory FDs are file capabilities and transferable for VFS migration.
 - Userspace handle-aware IPC: `SYS_RUSTOS_IPC_{CALL,RECV,REPLY}_WITH_HANDLES` with `Ipc*WithHandlesArgs`. Send handles = Linux fd arrays; received handles install into receiver fd table and return as `i32` fd arrays + `u16` count. `recv_fd_count_ptr` mandatory even when no handles returned. Counts bounded by `IPC_MAX_TRANSFER_HANDLES`.

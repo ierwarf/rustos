@@ -62,7 +62,7 @@ impl<T> SocketTable<T> {
         self.entries.values_mut()
     }
 
-    fn mark_all_dirty(&mut self) {
+    pub(super) fn mark_all_dirty(&mut self) {
         self.all_dirty = true;
     }
 
@@ -156,7 +156,9 @@ impl NetState {
     /// whole table.
     fn observe_unix(&mut self, changed: &mut Vec<u64>) {
         let mut dirty = std::mem::take(&mut self.sockets.dirty);
-        self.sockets.all_dirty = false;
+        if core::mem::take(&mut self.sockets.all_dirty) {
+            dirty.extend(self.sockets.keys().copied());
+        }
         // Unix writability depends on the peer's receive capacity. Recheck
         // both the old and current peer, including a just-retired endpoint.
         let touched: Vec<_> = dirty.iter().copied().collect();

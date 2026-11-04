@@ -122,8 +122,8 @@ pub(super) fn dispatch_admitted_request(
             }
             status
         }
-    } else if must_wait_for_packet_provider(request) {
-        match enqueue_provider_wait_request(*request, reply_cap) {
+    } else if is_accounting_request(request) {
+        match enqueue_lifecycle_request(*request, reply_cap) {
             Ok(()) => return None,
             Err(errno) => errno,
         }

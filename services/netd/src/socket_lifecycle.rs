@@ -1,4 +1,12 @@
 //! Socket creation, close/retirement, bind/listen/connect/accept and broker publication.
+//!
+//! - **Owner:** `netd` owns socket identity and queue custody; the kernel broker owns the target process descriptor table.
+//! - **Boundary:** request tokens, flags and accept channels are untrusted; publication binds the exact live reply and operation.
+//! - **Lifecycle:** socket, socketpair and accept are charged, published through a reply-bound record, then referenced until final close retires them.
+//! - **Concurrency:** table mutation happens under the network-state mutex; rootd charges run on the lifecycle pool with no lock held.
+//! - **Failure:** a rejected binding leaves discard with netd; an accepted-then-abandoned socket is handed to the kernel transfer-drop owner and never requeued.
+//! - **Forbidden:** no direct target fd installation, no listener flag inheritance onto an accepted socket, no unbounded socket table.
+//! - **Evidence:** `tests/unix_socket_lifecycle_tests.rs`, the accept flag cases in kernel `ipc_helpers/tests.rs` and the netd lifecycle mutants.
 
 use super::*;
 
@@ -15,6 +23,8 @@ pub(super) fn mint_socket_token() -> Result<u64, i32> {
         // same rejection/collision logic with the host CSPRNG, never a
         // deterministic fallback.
         #[cfg(test)]
+        // SAFETY: the kernel writes exactly `size_of::<u64>()` bytes into the
+        // live local `token`.
         let read = unsafe {
             libc::syscall(
                 libc::SYS_getrandom,
@@ -33,12 +43,20 @@ pub(super) fn mint_socket_token() -> Result<u64, i32> {
     Err(libc::EAGAIN)
 }
 
-pub(super) fn handle_socket(request: &NetdIpcRequest, response: &mut NetdIpcResponse, reply_cap: u64) -> i32 {
+pub(super) fn handle_socket(
+    request: &NetdIpcRequest,
+    response: &mut NetdIpcResponse,
+    reply_cap: u64,
+) -> i32 {
     let domain = request.arg0;
     let socket_type = request.arg1;
     let base_type = socket_type & linux_abi::SOCK_TYPE_MASK;
     if domain == linux_abi::AF_INET {
-        if !rustos_user_abi::syscall::net_broker_inet_socket_shape_valid(domain, socket_type, request.arg2) {
+        if !rustos_user_abi::syscall::net_broker_inet_socket_shape_valid(
+            domain,
+            socket_type,
+            request.arg2,
+        ) {
             return libc::EPROTONOSUPPORT;
         }
         // The provider gate is the final fallible step before publication of
@@ -59,8 +77,7 @@ pub(super) fn handle_socket(request: &NetdIpcRequest, response: &mut NetdIpcResp
         };
         // Charge the *calling process Job* before publishing a socket
         // identity. No NetState lock is held over the rootd IPC.
-        if let Err(errno)=provider_accounting::charge_before_publish(token,request.pid){
-            let _=provider_accounting::retire_final(token);
+        if let Err(errno) = provider_accounting::charge_before_publish(token, request.pid) {
             return errno;
         }
         let mut state = lock_net_state();
@@ -74,12 +91,16 @@ pub(super) fn handle_socket(request: &NetdIpcRequest, response: &mut NetdIpcResp
             request,
             rustos_svc_runtime::syscall::monotonic_nanos(),
             token_available,
-            || state.inet_stack().map(|stack| inet_datagram::add_socket(stack, base_type, request.arg2)),
+            || {
+                state
+                    .inet_stack()
+                    .map(|stack| inet_datagram::add_socket(stack, base_type, request.arg2))
+            },
         ) {
             Ok(transport) => transport,
             Err(errno) => {
                 drop(state);
-                let _=provider_accounting::retire_final(token);
+                let _ = provider_accounting::retire_final(token);
                 return errno;
             }
         };
@@ -87,8 +108,11 @@ pub(super) fn handle_socket(request: &NetdIpcRequest, response: &mut NetdIpcResp
             token,
             InetSocket {
                 refs: 1,
-                options: SocketOptions { send_buffer: INET_TCP_BUFFER_CAPACITY as i32,
-                    recv_buffer: INET_TCP_BUFFER_CAPACITY as i32, ..SocketOptions::default() },
+                options: SocketOptions {
+                    send_buffer: INET_TCP_BUFFER_CAPACITY as i32,
+                    recv_buffer: INET_TCP_BUFFER_CAPACITY as i32,
+                    ..SocketOptions::default()
+                },
                 transport,
                 local: None,
                 peer: None,
@@ -98,9 +122,13 @@ pub(super) fn handle_socket(request: &NetdIpcRequest, response: &mut NetdIpcResp
             },
         );
         drop(state);
-        return prepare_inet_socket_publication(request, response, reply_cap, token);
+        return prepare_socket_publication(request, response, reply_cap, token, 0, 0, true);
     }
-    if domain != linux_abi::AF_UNIX || base_type != linux_abi::SOCK_STREAM {
+    if !rustos_user_abi::syscall::net_broker_unix_socket_shape_valid(
+        domain,
+        socket_type,
+        request.arg2,
+    ) {
         return libc::EAFNOSUPPORT;
     }
 
@@ -108,8 +136,7 @@ pub(super) fn handle_socket(request: &NetdIpcRequest, response: &mut NetdIpcResp
         Ok(token) => token,
         Err(errno) => return errno,
     };
-    if let Err(errno)=provider_accounting::charge_before_publish(token,request.pid){
-        let _=provider_accounting::retire_final(token);
+    if let Err(errno) = provider_accounting::charge_before_publish(token, request.pid) {
         return errno;
     }
     let mut state = lock_net_state();
@@ -120,7 +147,7 @@ pub(super) fn handle_socket(request: &NetdIpcRequest, response: &mut NetdIpcResp
     }
     if !state.token_available(token) {
         drop(state);
-        let _=provider_accounting::retire_final(token);
+        let _ = provider_accounting::retire_final(token);
         return libc::EAGAIN;
     }
     state.sockets.insert(
@@ -136,13 +163,19 @@ pub(super) fn handle_socket(request: &NetdIpcRequest, response: &mut NetdIpcResp
         },
     );
     drop(state);
-    call_net_broker(request, response, token, 0, 0, true)
+    prepare_socket_publication(request, response, reply_cap, token, 0, 0, true)
 }
 
-pub(super) fn handle_socketpair(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {
-    if request.arg0 != linux_abi::AF_UNIX
-        || request.arg1 & linux_abi::SOCK_TYPE_MASK != linux_abi::SOCK_STREAM
-    {
+pub(super) fn handle_socketpair(
+    request: &NetdIpcRequest,
+    response: &mut NetdIpcResponse,
+    reply_cap: u64,
+) -> i32 {
+    if !rustos_user_abi::syscall::net_broker_unix_socket_shape_valid(
+        request.arg0,
+        request.arg1,
+        request.arg2,
+    ) {
         return libc::EAFNOSUPPORT;
     }
     let credentials = request_credentials(request);
@@ -156,13 +189,11 @@ pub(super) fn handle_socketpair(request: &NetdIpcRequest, response: &mut NetdIpc
     };
     // Socketpair owns two independently closeable descriptions. Fund each
     // once and unwind the first if the second is denied before publication.
-    if let Err(errno)=provider_accounting::charge_before_publish(left,request.pid){
-        let _=provider_accounting::retire_final(left);
+    if let Err(errno) = provider_accounting::charge_before_publish(left, request.pid) {
         return errno;
     }
-    if let Err(errno)=provider_accounting::charge_before_publish(right,request.pid){
-        let _=provider_accounting::retire_final(right);
-        let _=provider_accounting::retire_final(left);
+    if let Err(errno) = provider_accounting::charge_before_publish(right, request.pid) {
+        let _ = provider_accounting::retire_final(left);
         return errno;
     }
     let mut state = lock_net_state();
@@ -174,8 +205,8 @@ pub(super) fn handle_socketpair(request: &NetdIpcRequest, response: &mut NetdIpc
     }
     if left == right || !state.token_available(left) || !state.token_available(right) {
         drop(state);
-        let _=provider_accounting::retire_final(left);
-        let _=provider_accounting::retire_final(right);
+        let _ = provider_accounting::retire_final(left);
+        let _ = provider_accounting::retire_final(right);
         return libc::EAGAIN;
     }
     state.sockets.insert(
@@ -231,7 +262,7 @@ pub(super) fn handle_socketpair(request: &NetdIpcRequest, response: &mut NetdIpc
         },
     );
     drop(state);
-    call_net_broker(request, response, 0, left, right, true)
+    prepare_socket_publication(request, response, reply_cap, left, right, 0, true)
 }
 
 pub(super) fn handle_close(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {
@@ -252,7 +283,9 @@ pub(super) fn handle_close(request: &NetdIpcRequest, response: &mut NetdIpcRespo
         }
         drop(state);
         // No local socket lock crosses the rootd billing control IPC.
-        return provider_accounting::retire_final(request.socket_token).err().unwrap_or(0);
+        return provider_accounting::retire_final(request.socket_token)
+            .err()
+            .unwrap_or(0);
     }
     let Some(socket) = state.sockets.get_mut(&request.socket_token) else {
         return libc::EBADF;
@@ -262,15 +295,16 @@ pub(super) fn handle_close(request: &NetdIpcRequest, response: &mut NetdIpcRespo
         response.value = socket.refs as u64;
         return 0;
     }
-    let (retired, _peers, retired_tokens) =
-        retire_unix_socket(&mut state, request.socket_token);
+    let (retired, _peers, retired_tokens) = retire_unix_socket(&mut state, request.socket_token);
     drop(state);
     encode_retired_socket_release(retired, response);
-    let mut refund_error=0;
+    let mut refund_error = 0;
     for token in retired_tokens {
-        if let Err(errno)=provider_accounting::retire_final(token) {
+        if let Err(errno) = provider_accounting::retire_final(token) {
             // A missing ACK must leave the exact token in the client book.
-            if refund_error==0{refund_error=errno}
+            if refund_error == 0 {
+                refund_error = errno
+            }
         }
     }
     refund_error
@@ -278,8 +312,10 @@ pub(super) fn handle_close(request: &NetdIpcRequest, response: &mut NetdIpcRespo
 
 /// Withdraw identities and notify peers atomically; backing and authority are
 /// carried out of the state lock for destruction and the kernel release trailer.
-pub(super) fn retire_unix_socket(state: &mut NetState, token: u64)
-    -> (Vec<UnixSocket>, Vec<u64>, Vec<u64>) {
+pub(super) fn retire_unix_socket(
+    state: &mut NetState,
+    token: u64,
+) -> (Vec<UnixSocket>, Vec<u64>, Vec<u64>) {
     let mut tokens = vec![token];
     let mut retired = Vec::new();
     let mut peers = Vec::new();
@@ -299,6 +335,9 @@ pub(super) fn retire_unix_socket(state: &mut NetState, token: u64)
                 tokens.extend(pending.drain(..));
             }
             UnixSocketState::Connected(connected) => {
+                state.release_unix_queued_bytes(
+                    connected.incoming_bytes + connected.incoming_control_bytes,
+                );
                 peers.push(connected.peer);
                 if let Some(peer) = state.sockets.get_mut(&connected.peer) {
                     if let UnixSocketState::Connected(peer_connected) = &mut peer.state {
@@ -316,7 +355,10 @@ pub(super) fn retire_unix_socket(state: &mut NetState, token: u64)
     (retired, peers, retired_tokens)
 }
 
-pub(super) fn encode_retired_socket_release(retired: Vec<UnixSocket>, response: &mut NetdIpcResponse) {
+pub(super) fn encode_retired_socket_release(
+    retired: Vec<UnixSocket>,
+    response: &mut NetdIpcResponse,
+) {
     let mut released = Vec::new();
     for socket in retired {
         if let UnixSocketState::Connected(connected) = socket.state {
@@ -539,9 +581,16 @@ pub(super) fn bind_unix_connection(request: &NetdIpcRequest, accepted: u64) -> R
     }
 }
 
-pub(super) fn handle_accept(request: &NetdIpcRequest, response: &mut NetdIpcResponse) -> i32 {
-    let nonblocking = request.status_flags & linux_abi::O_NONBLOCK != 0
-        || request.arg3 & linux_abi::SOCK_NONBLOCK != 0;
+pub(super) fn handle_accept(
+    request: &NetdIpcRequest,
+    response: &mut NetdIpcResponse,
+    reply_cap: u64,
+) -> i32 {
+    if request.arg3 & !(linux_abi::SOCK_NONBLOCK | linux_abi::SOCK_CLOEXEC) != 0 {
+        return libc::EINVAL;
+    }
+    // accept4 flags control the NEW descriptor, not the listener's wait mode.
+    let nonblocking = request.status_flags & linux_abi::O_NONBLOCK != 0;
     let accepted = {
         let mut state = lock_net_state();
         let Some(listener) = state.sockets.get_mut(&request.socket_token) else {
@@ -562,6 +611,7 @@ pub(super) fn handle_accept(request: &NetdIpcRequest, response: &mut NetdIpcResp
             _ => return libc::EINVAL,
         }
     };
+    let mut charged = false;
     let result = (|| {
         let channel_id = {
             let state = lock_net_state();
@@ -588,32 +638,71 @@ pub(super) fn handle_accept(request: &NetdIpcRequest, response: &mut NetdIpcResp
         }
         // An accepted endpoint is not funded merely because it is queued.
         // Charge the client only at the public accept handoff boundary.
-        if let Err(errno)=provider_accounting::charge_before_publish(accepted,request.pid){
+        if let Err(errno) = provider_accounting::charge_before_publish(accepted, request.pid) {
             return errno;
         }
-        call_net_broker(request, response, 0, accepted, channel_id, false)
+        charged = true;
+        prepare_socket_publication(request, response, reply_cap, accepted, 0, channel_id, false)
     })();
+    if result != 0 && charged {
+        // Mark refund BEFORE requeue. Another accept cannot charge this token
+        // until the exact old nonce has settled, even after a lost ACK.
+        let _ = provider_accounting::retire_final(accepted);
+    }
     let (retired, _peers, tokens) = {
         let mut state = lock_net_state();
         settle_unix_accept(&mut state, request.socket_token, accepted, result == 0)
     };
-    if !retired.is_empty() {
-        // Failed accept after listener retirement still owns one unpublished
-        // reference. Error replies carry its release trailer too; the compat
-        // consumer must retire that authority before returning the errno.
-        encode_retired_socket_release(retired, response);
+    if let Err(errno) = release_accept_retired_control_with(retired, response, |control| {
+        let args = RustosNetBrokerArgs {
+            process_id: request.pid,
+            op: rustos_user_abi::syscall::NET_BROKER_OP_RELEASE_SOCKET_CONTROL,
+            arg0: control.as_ptr() as u64,
+            arg1: control.len() as u64,
+            ..RustosNetBrokerArgs::default()
+        };
+        if syscall1(
+            SYS_RUSTOS_NET_BROKER,
+            (&args as *const RustosNetBrokerArgs) as u64,
+        ) < 0
+        {
+            Err(last_errno())
+        } else {
+            Ok(())
+        }
+    }) {
+        // No successful/failed reply can carry this obligation after caller
+        // abandonment. An impossible local broker failure revokes this service
+        // incarnation, whose transfer epoch and Job charges are drained.
+        eprintln!("netd: accept ancillary retirement failed errno={errno}");
+        std::process::exit(134);
     }
     // Internal not-yet-public accepted sockets may be unfunded; the refund
     // predicate treats those as no-op rather than charging a ghost session.
     for token in tokens {
-        let _=provider_accounting::retire_final(token);
-    }
-    if result!=0 {
-        // A failed broker publication may requeue the accepted endpoint.
-        // Its charge is not permitted to survive the failed public handoff.
-        let _=provider_accounting::retire_final(accepted);
+        let _ = provider_accounting::retire_final(token);
     }
     result
+}
+
+/// Retired accept control must reach kernel custody even if its reply is
+/// already abandoned. The response is only temporary bounded encoding storage.
+pub(super) fn release_accept_retired_control_with(
+    retired: Vec<UnixSocket>,
+    response: &mut NetdIpcResponse,
+    release: impl FnOnce(&[u8]) -> Result<(), i32>,
+) -> Result<(), i32> {
+    if retired.is_empty() {
+        return Ok(());
+    }
+    encode_retired_socket_release(retired, response);
+    let len = response.reserved0 as usize;
+    if len != 0 {
+        release(&response.payload[..len])?
+    }
+    response.payload_len = 0;
+    response.reserved0 = 0;
+    Ok(())
 }
 
 pub(super) fn settle_unix_accept(
@@ -648,18 +737,40 @@ pub(super) fn is_wayland_path(path: &str) -> bool {
     path.ends_with("/wayland-0") || path == "wayland-0"
 }
 
-/// Publishes a newly-created AF_INET socket only through the reply that
+/// Linux accept does not inherit the listener's open-description flags.
+pub(super) fn socket_publication_type(request: &NetdIpcRequest) -> u64 {
+    if request.op == SYSCALL_OFFLOAD_OP_LINUX_ACCEPT {
+        linux_abi::SOCK_STREAM
+            | (request.arg3 & (linux_abi::SOCK_NONBLOCK | linux_abi::SOCK_CLOEXEC))
+    } else {
+        request.arg1
+    }
+}
+
+/// Publishes newly-created/accepted sockets only through the reply that
 /// requested it.  Netd keeps the initial `refs = 1` until this succeeds; on a
 /// rejection the broker has removed its invisible descriptor and this service
 /// performs the single provider-side discard.
-pub(super) fn prepare_inet_socket_publication(
+pub(super) fn prepare_socket_publication(
     request: &NetdIpcRequest,
     response: &mut NetdIpcResponse,
     reply_cap: u64,
     socket_token: u64,
+    second_socket_token: u64,
+    channel_id: u64,
+    discard_on_failure: bool,
 ) -> i32 {
+    let discard = |token| {
+        if discard_on_failure {
+            discard_unpublished_socket_tokens(token, second_socket_token, 0)
+        }
+    };
+    if let Err(errno) = request_deadline_remaining_ns(request) {
+        discard(socket_token);
+        return errno;
+    }
     if reply_cap == 0 || socket_token == 0 {
-        discard_unpublished_socket_tokens(socket_token, 0, 0);
+        discard(socket_token);
         return libc::EINVAL;
     }
     let publication = NetBrokerPrepareSocketPublication {
@@ -667,9 +778,20 @@ pub(super) fn prepare_inet_socket_publication(
         reply_cap,
         caller_pid: request.pid,
         socket_token,
-        domain: request.arg0,
-        socket_type: request.arg1,
-        protocol: request.arg2,
+        operation: request.op as u64,
+        second_socket_token,
+        channel_id,
+        domain: if request.op == SYSCALL_OFFLOAD_OP_LINUX_ACCEPT {
+            linux_abi::AF_UNIX
+        } else {
+            request.arg0
+        },
+        socket_type: socket_publication_type(request),
+        protocol: if request.op == SYSCALL_OFFLOAD_OP_LINUX_ACCEPT {
+            0
+        } else {
+            request.arg2
+        },
         ..NetBrokerPrepareSocketPublication::default()
     };
     let args = RustosNetBrokerArgs {
@@ -684,7 +806,9 @@ pub(super) fn prepare_inet_socket_publication(
         arg4: 0,
         arg5: 0,
     };
-    let prepared = settle_inet_socket_publication(
+    let prepared = settle_socket_publication_at(
+        request,
+        rustos_svc_runtime::syscall::monotonic_nanos(),
         socket_token,
         || {
             let result = syscall1(
@@ -697,7 +821,7 @@ pub(super) fn prepare_inet_socket_publication(
                 Ok(())
             }
         },
-        |token| discard_unpublished_socket_tokens(token, 0, 0),
+        discard,
     );
     if let Err(errno) = prepared {
         return errno;
@@ -706,18 +830,24 @@ pub(super) fn prepare_inet_socket_publication(
     // the kernel, then overwrites it with the fd it installed after a timely
     // reply take.  No numeric fd crosses this broker boundary.
     response.value = socket_token;
+    if second_socket_token != 0 {
+        response.payload[..8].copy_from_slice(&second_socket_token.to_ne_bytes());
+        response.payload_len = 8;
+    }
     0
 }
 
 /// Settles ownership after a prepared-reply bind attempt.  The prepare closure
 /// owns no provider cleanup; its failure is the one point at which netd still
 /// owns and must discard the unpublished initial reference.
-pub(super) fn settle_inet_socket_publication(
+pub(super) fn settle_socket_publication_at(
+    request: &NetdIpcRequest,
+    now_ns: u64,
     socket_token: u64,
     prepare: impl FnOnce() -> Result<(), i32>,
     discard: impl FnOnce(u64),
 ) -> Result<(), i32> {
-    match prepare() {
+    match request_deadline_remaining_ns_at(request, now_ns).and_then(|_| prepare()) {
         Ok(()) => Ok(()),
         Err(errno) => {
             // LIFECYCLE: The kernel reclaims only the non-visible descriptor
@@ -727,45 +857,6 @@ pub(super) fn settle_inet_socket_publication(
             Err(errno)
         }
     }
-}
-
-pub(super) fn call_net_broker(
-    request: &NetdIpcRequest,
-    response: &mut NetdIpcResponse,
-    socket_token: u64,
-    token_a: u64,
-    token_b: u64,
-    discard_tokens_on_failure: bool,
-) -> i32 {
-    let args = RustosNetBrokerArgs {
-        process_id: request.pid,
-        op: request.op,
-        reserved0: 0,
-        reserved1: 0,
-        arg0: request.arg0,
-        arg1: request.arg1,
-        arg2: request.arg2,
-        arg3: if socket_token != 0 {
-            socket_token
-        } else {
-            request.arg3
-        },
-        arg4: token_a,
-        arg5: token_b,
-    };
-    let result = syscall1(
-        SYS_RUSTOS_NET_BROKER,
-        (&args as *const RustosNetBrokerArgs) as u64,
-    );
-    if result < 0 {
-        let errno = last_errno();
-        if discard_tokens_on_failure {
-            discard_unpublished_socket_tokens(socket_token, token_a, token_b);
-        }
-        return errno;
-    }
-    response.value = result as u64;
-    0
 }
 
 pub(super) fn discard_unpublished_socket_tokens(socket_token: u64, token_a: u64, token_b: u64) {

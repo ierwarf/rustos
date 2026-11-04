@@ -36,7 +36,10 @@ pub(super) fn request_deadline_class_cap(request: &NetdIpcRequest) -> Duration {
         NETD_IPC_OP_DVM_SESSION => Duration::from_millis(
             rustos_user_abi::performance::IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS,
         ),
-        SYSCALL_OFFLOAD_OP_LINUX_DUP
+        SYSCALL_OFFLOAD_OP_LINUX_SOCKET
+        | SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR
+        | SYSCALL_OFFLOAD_OP_LINUX_ACCEPT
+        | SYSCALL_OFFLOAD_OP_LINUX_DUP
         | SYSCALL_OFFLOAD_OP_LINUX_CLOSE
         | NETD_IPC_OP_REF_ACK => Duration::from_millis(
             rustos_user_abi::performance::IPC_STATE_MUTATION_HARD_LIMIT_MS,

@@ -14,6 +14,9 @@ impl BufferData {
         if dst_width != self.shared.width
             || dst_height != self.shared.height
             || dst_stride_pixels != self.shared.width
+            || dst_width
+                .checked_mul(dst_height)
+                .is_none_or(|len| len != dst.len())
             || dst.is_empty()
         {
             return false;
@@ -30,14 +33,13 @@ impl BufferData {
         let Ok(pool) = self.shared.pool.lock() else {
             return false;
         };
-        let bytes = pool.mapping.bytes();
         let start = self.shared.offset;
         if validate_wayland_buffer_layout(
             start,
             self.shared.width,
             self.shared.height,
             self.shared.stride,
-            pool.len.min(bytes.len()),
+            pool.len,
         )
         .is_none()
         {
@@ -46,12 +48,31 @@ impl BufferData {
         let Some(width_bytes) = damage.width.checked_mul(4) else {
             return false;
         };
+        // Read into owned bytes before modifying retained pixels. A concurrent
+        // truncate can only cause short I/O, never SIGBUS or a partial update.
+        let Some(read_start) = damage
+            .y
+            .checked_mul(self.shared.stride)
+            .and_then(|row| start.checked_add(row))
+            .and_then(|pos| pos.checked_add(damage.x.checked_mul(4)?))
+        else {
+            return false;
+        };
+        let Some(read_len) = damage
+            .height
+            .checked_sub(1)
+            .and_then(|rows| rows.checked_mul(self.shared.stride))
+            .and_then(|prefix| prefix.checked_add(width_bytes))
+        else {
+            return false;
+        };
+        let Ok(bytes) = super::shm::read_shm_snapshot(pool.fd.as_raw_fd(), read_start, read_len)
+        else {
+            return false;
+        };
         let pixels = Arc::make_mut(dst);
         for row in 0..damage.height {
-            let Some(src_row) = start
-                .checked_add((damage.y + row).saturating_mul(self.shared.stride))
-                .and_then(|row_start| row_start.checked_add(damage.x.saturating_mul(4)))
-            else {
+            let Some(src_row) = row.checked_mul(self.shared.stride) else {
                 return false;
             };
             let Some(src_end) = src_row.checked_add(width_bytes) else {
@@ -81,7 +102,6 @@ impl BufferData {
 
     pub(super) fn copy_pixels(&self) -> Option<(Arc<Vec<u32>>, usize, usize, usize)> {
         let pool = self.shared.pool.lock().ok()?;
-        let bytes = pool.mapping.bytes();
         let start = self.shared.offset;
         let pixel_count = checked_wayland_pixel_count(self.shared.width, self.shared.height)?;
         let width_bytes = self.shared.width.checked_mul(4)?;
@@ -90,17 +110,18 @@ impl BufferData {
             self.shared.width,
             self.shared.height,
             self.shared.stride,
-            pool.len.min(bytes.len()),
+            pool.len,
         )?;
         if required > MAX_WAYLAND_SHM_POOL_BYTES {
             return None;
         }
 
+        let bytes = super::shm::read_shm_snapshot(pool.fd.as_raw_fd(), start, required).ok()?;
         let mut pixels = Vec::new();
         pixels.try_reserve_exact(pixel_count).ok()?;
         pixels.resize(pixel_count, 0);
         for row in 0..self.shared.height {
-            let row_start = start.checked_add(row.checked_mul(self.shared.stride)?)?;
+            let row_start = row.checked_mul(self.shared.stride)?;
             let row_end = row_start.checked_add(width_bytes)?;
             let row_bytes = bytes.get(row_start..row_end)?;
             let dst_start = row.checked_mul(self.shared.width)?;
@@ -121,7 +142,6 @@ impl BufferData {
         ))
     }
 }
-
 
 pub(super) fn can_retain_undamaged_buffer(
     has_snapshot: bool,

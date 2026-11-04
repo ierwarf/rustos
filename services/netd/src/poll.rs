@@ -117,7 +117,8 @@ pub(super) fn unix_socket_revents(state: &NetState, token: u64, requested: u32) 
                 revents |= linux_abi::POLLIN as u32;
             }
             if requested & linux_abi::POLLOUT as u32 != 0 {
-                let writable = !connected.send_closed
+                let writable = state.unix_queued_bytes < UNIX_QUEUED_BYTE_CAPACITY
+                    && !connected.send_closed
                     && !connected.peer_read_closed
                     && !connected.peer_closed
                     && peer_connected.is_some_and(|peer| {

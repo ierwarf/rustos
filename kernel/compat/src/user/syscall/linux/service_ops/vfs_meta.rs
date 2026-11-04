@@ -810,7 +810,11 @@ pub fn syscall_linux_net6_with_timeout(
     // already been queued and still runs, so the caller cannot learn whether
     // bytes moved. Byte-moving ops therefore get the state-mutation lease, not
     // the interactive rail.
-    let timeout_ms = if nonblocking_bound {
+    let creates_socket=matches!(op,SYSCALL_OFFLOAD_OP_LINUX_SOCKET
+        | SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR | SYSCALL_OFFLOAD_OP_LINUX_ACCEPT);
+    let timeout_ms = if creates_socket {
+        Some(timeout_ms.unwrap_or(rustos_user_abi::performance::IPC_STATE_MUTATION_HARD_LIMIT_MS))
+    } else if nonblocking_bound {
         Some(if socket_op_moves_stream_bytes(op) {
             rustos_user_abi::performance::IPC_STATE_MUTATION_HARD_LIMIT_MS
         } else {
@@ -1467,8 +1471,10 @@ fn consume_netd_response_payload(
             }
             Ok(())
         }
-        SYSCALL_OFFLOAD_OP_LINUX_ACCEPT
-        | SYSCALL_OFFLOAD_OP_LINUX_GETSOCKNAME
+        // Prepared socket publication copied accept/socketpair outputs before
+        // committing the invisible descriptor reservations. Never copy twice.
+        SYSCALL_OFFLOAD_OP_LINUX_ACCEPT | SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR => Ok(()),
+        SYSCALL_OFFLOAD_OP_LINUX_GETSOCKNAME
         | SYSCALL_OFFLOAD_OP_LINUX_GETPEERNAME => write_current_sockaddr_payload(
             request.arg1,
             request.arg2,
@@ -1805,6 +1811,14 @@ fn decoded_transfer_control_len(control: &[u8]) -> Result<usize, i64> {
 }
 
 fn drop_encoded_transfer_descriptors(control: &[u8]) -> Result<(), i64> {
+    let tickets=decode_transfer_release_tickets(control)?;
+    super::super::ipc_ops::drop_transfer_tickets(tickets.as_slice());
+    Ok(())
+}
+
+pub(in crate::user::syscall::linux) fn decode_transfer_release_tickets(
+    control:&[u8],
+)->Result<Vec<kernel_ipc_runtime::api::KernelTransferTicket>,i64> {
     let mut tickets = Vec::new();
     let mut offset = 0usize;
     while offset + core::mem::size_of::<linux_abi::LinuxCmsghdr>() <= control.len() {
@@ -1833,8 +1847,7 @@ fn drop_encoded_transfer_descriptors(control: &[u8]) -> Result<(), i64> {
     if offset != control.len() {
         return Err(LINUX_EINVAL);
     }
-    super::super::ipc_ops::drop_transfer_tickets(tickets.as_slice());
-    Ok(())
+    Ok(tickets)
 }
 
 fn rewrite_scm_rights_control<F>(control: &[u8], mut rewrite: F) -> Result<Vec<u8>, i64>
@@ -1956,7 +1969,7 @@ fn cmsg_align(len: usize) -> usize {
     (len + align - 1) & !(align - 1)
 }
 
-fn write_current_sockaddr_payload(addr_ptr: u64, len_ptr: u64, payload: &[u8]) -> Result<(), i64> {
+pub(super) fn write_current_sockaddr_payload(addr_ptr: u64, len_ptr: u64, payload: &[u8]) -> Result<(), i64> {
     if len_ptr == 0 {
         return if payload.is_empty() {
             Ok(())

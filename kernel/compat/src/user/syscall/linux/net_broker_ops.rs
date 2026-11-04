@@ -1,14 +1,14 @@
 use super::*;
 
 use core::sync::atomic::{AtomicU64, Ordering};
-use rustos_user_abi::syscall::{ServiceCapability,
+use rustos_user_abi::syscall::{
     NET_BROKER_OP_PACKET_LEASE_GRANT, NET_BROKER_OP_PACKET_LEASE_RESET,
     NET_BROKER_OP_PACKET_LEASE_REVOKE, NET_BROKER_OP_PACKET_RX, NET_BROKER_OP_PACKET_STATUS,
     NET_BROKER_OP_PACKET_TX, NET_BROKER_OP_PREPARE_SOCKET_PUBLICATION,
-    NET_BROKER_OP_UNIX_CONNECT_BIND, NetBrokerPrepareSocketPublication, RustosNetBrokerArgs,
-    net_broker_socket_publication_shape_valid,
+    NET_BROKER_OP_RELEASE_SOCKET_CONTROL, NET_BROKER_OP_UNIX_CONNECT_BIND,
+    NET_BROKER_SOCKET_CONTROL_CAPACITY, NetBrokerPrepareSocketPublication, RustosNetBrokerArgs,
+    ServiceCapability, net_broker_socket_publication_shape_valid,
 };
-use x86_64::VirtAddr;
 
 pub(super) fn syscall_linux_rustos_net_broker(args_ptr: u64) -> u64 {
     if !ipc_ops::current_process_has_service_capability(ServiceCapability::NetPolicy) {
@@ -31,10 +31,8 @@ pub(super) fn syscall_linux_rustos_net_broker(args_ptr: u64) -> u64 {
 
 fn dispatch_net_broker(args: &RustosNetBrokerArgs) -> Result<u64, i64> {
     match args.op {
-        SYSCALL_OFFLOAD_OP_LINUX_SOCKET => broker_socket(args),
-        SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR => broker_socketpair(args),
-        SYSCALL_OFFLOAD_OP_LINUX_ACCEPT => broker_accept(args),
         NET_BROKER_OP_UNIX_CONNECT_BIND => broker_unix_connect_bind(args),
+        NET_BROKER_OP_RELEASE_SOCKET_CONTROL => broker_release_socket_control(args),
         NET_BROKER_OP_PREPARE_SOCKET_PUBLICATION => broker_prepare_socket_publication(args),
         NET_BROKER_OP_PACKET_STATUS => broker_packet_status(),
         NET_BROKER_OP_PACKET_TX => broker_packet_tx(args),
@@ -46,7 +44,7 @@ fn dispatch_net_broker(args: &RustosNetBrokerArgs) -> Result<u64, i64> {
     }
 }
 
-/// Moves one newly-created netd AF_INET socket reference into the exact reply
+/// Moves initial netd socket/accept references into the exact reply
 /// message.  There is intentionally no target-process fd installation in this
 /// broker path: only the caller-side timely reply take publishes a descriptor.
 fn broker_prepare_socket_publication(args: &RustosNetBrokerArgs) -> Result<u64, i64> {
@@ -68,25 +66,38 @@ fn broker_prepare_socket_publication(args: &RustosNetBrokerArgs) -> Result<u64, 
         return Err(LINUX_EINVAL);
     }
     let netd_process_id = multitask::current_user_process_id().ok_or(LINUX_EPERM)?;
-    let descriptor = multitask::register_new_inet_socket_transfer(
-        publication.socket_token,
-        publication.domain,
-        publication.socket_type,
-        publication.protocol,
-    )
-    .map_err(transfer_registry_error_to_linux_errno)?;
+    let descriptors = if publication.domain == linux_abi::AF_INET {
+        alloc::vec![
+            multitask::register_new_inet_socket_transfer(
+                publication.socket_token,
+                publication.domain,
+                publication.socket_type,
+                publication.protocol,
+            )
+            .map_err(transfer_registry_error_to_linux_errno)?
+        ]
+    } else {
+        let channel = if publication.operation == SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR as u64 {
+            allocate_unix_channel_id()?
+        } else {
+            publication.channel_id
+        };
+        multitask::register_ipc_transfer_entries(initial_unix_publication_entries(
+            &publication,
+            channel,
+        )?)
+        .map_err(transfer_registry_error_to_linux_errno)?
+    };
     let reply = kernel_ipc_runtime::api::KernelReplyHandle::from_raw(publication.reply_cap);
     if let Err(error) = kernel_ipc_runtime::api::endpoint::bind_prepared_reply_handles_for_process(
         reply,
         netd_process_id,
-        alloc::vec![descriptor],
+        descriptors,
     ) {
         // LIFECYCLE: This only removes the non-visible registry entry.  Netd
         // still owns the provider's initial reference and performs the sole
         // unpublished-token discard after this broker call fails.
-        for descriptor in error.handles {
-            multitask::reclaim_unbound_inet_socket_transfer(descriptor);
-        }
+        multitask::reclaim_unbound_socket_transfers(&error.handles);
         return Err(ipc_error_to_linux_errno(error.error));
     }
     Ok(0)
@@ -111,6 +122,37 @@ fn ipc_error_to_linux_errno(error: kernel_ipc_runtime::api::IpcError) -> i64 {
         kernel_ipc_runtime::api::IpcError::BufferTooSmall => LINUX_EOVERFLOW,
         kernel_ipc_runtime::api::IpcError::NoMemory => LINUX_ENOMEM,
     }
+}
+
+/// NetPolicy owns the opaque tickets it withdraws from its queues. Decode the
+/// entire bounded block before transferring any custody; never synchronously
+/// call a provider from this broker (in particular, never reenter netd).
+fn broker_release_socket_control(args: &RustosNetBrokerArgs) -> Result<u64, i64> {
+    let len = usize::try_from(args.arg1).map_err(|_| LINUX_EINVAL)?;
+    if args.arg0 == 0
+        || len == 0
+        || len > NET_BROKER_SOCKET_CONTROL_CAPACITY
+        || args.arg2 != 0
+        || args.arg3 != 0
+        || args.arg4 != 0
+        || args.arg5 != 0
+    {
+        return Err(LINUX_EINVAL);
+    }
+    let mut control = alloc::vec![0;len];
+    usermem::copy_from_current_user_exact(args.arg0, &mut control)
+        .map_err(address_space_error_to_linux_errno)?;
+    defer_socket_control_release(&control)?;
+    Ok(0)
+}
+
+fn defer_socket_control_release(control: &[u8]) -> Result<(), i64> {
+    if control.is_empty() || control.len() > NET_BROKER_SOCKET_CONTROL_CAPACITY {
+        return Err(LINUX_EINVAL);
+    }
+    let tickets = service_ops::vfs_meta::decode_transfer_release_tickets(control)?;
+    multitask::drop_ipc_transfer_tickets(&tickets);
+    Ok(())
 }
 
 fn broker_packet_lease_reset(args: &RustosNetBrokerArgs) -> Result<u64, i64> {
@@ -193,58 +235,45 @@ fn packet_error_to_linux_errno(err: kernel_io_manager::api::network::PacketError
     }
 }
 
-fn broker_socket(args: &RustosNetBrokerArgs) -> Result<u64, i64> {
-    let domain = args.arg0;
-    let socket_type = args.arg1;
-    let protocol = args.arg2;
-    let base_type = socket_type & linux_abi::SOCK_TYPE_MASK;
-    let open_flags = socket_type & (linux_abi::SOCK_NONBLOCK | linux_abi::SOCK_CLOEXEC);
-
-    let handle = match (domain, base_type) {
-        (linux_abi::AF_UNIX, linux_abi::SOCK_STREAM) => {
-            if args.arg3 == 0 {
-                return Err(LINUX_EINVAL);
-            }
-            multitask::KernelHandle::Socket(multitask::SocketHandle::from_token(
-                args.arg3, domain, base_type, protocol,
-            ))
+/// Construct invisible initial references, never dup an installed fd. Pair
+/// registration is atomic; a failed bind leaves both references with netd.
+fn initial_unix_publication_entries(
+    publication: &NetBrokerPrepareSocketPublication,
+    channel: u64,
+) -> Result<Vec<multitask::TransferredHandleEntry>, i64> {
+    let pair = publication.operation == SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR as u64;
+    let mut entries = Vec::with_capacity(if pair { 2 } else { 1 });
+    for (token, side) in [
+        (publication.socket_token, if pair { 1 } else { 2 }),
+        (publication.second_socket_token, 2),
+    ] {
+        if token == 0 {
+            continue;
         }
-        _ => return Err(LINUX_EAFNOSUPPORT),
-    };
-
-    install_process_handle(args.process_id, handle, open_flags)
-}
-
-fn broker_socketpair(args: &RustosNetBrokerArgs) -> Result<u64, i64> {
-    if args.arg0 != linux_abi::AF_UNIX
-        || args.arg1 & linux_abi::SOCK_TYPE_MASK != linux_abi::SOCK_STREAM
-        || args.arg4 == 0
-        || args.arg5 == 0
-    {
-        return Err(LINUX_EAFNOSUPPORT);
+        let socket = multitask::SocketHandle::from_token(
+            token,
+            publication.domain,
+            linux_abi::SOCK_STREAM,
+            publication.protocol,
+        );
+        if channel != 0 && !socket.bind_channel(channel, side) {
+            return Err(LINUX_EINVAL);
+        }
+        let fd_flags = if publication.socket_type & linux_abi::SOCK_CLOEXEC != 0 {
+            multitask::FD_CLOEXEC
+        } else {
+            0
+        };
+        let entry = multitask::HandleEntry::new(
+            multitask::KernelHandle::Socket(socket),
+            fd_flags,
+            publication.socket_type & linux_abi::SOCK_NONBLOCK,
+        );
+        entries.push(
+            multitask::TransferredHandleEntry::from_initial_entry(entry).ok_or(LINUX_EINVAL)?,
+        );
     }
-    let open_flags = args.arg1 & (linux_abi::SOCK_NONBLOCK | linux_abi::SOCK_CLOEXEC);
-    let channel_id = allocate_unix_channel_id()?;
-    let left = multitask::SocketHandle::from_token(
-        args.arg4,
-        linux_abi::AF_UNIX,
-        linux_abi::SOCK_STREAM,
-        args.arg2,
-    );
-    let right = multitask::SocketHandle::from_token(
-        args.arg5,
-        linux_abi::AF_UNIX,
-        linux_abi::SOCK_STREAM,
-        args.arg2,
-    );
-    assert!(left.bind_channel(channel_id, 1));
-    assert!(right.bind_channel(channel_id, 2));
-    install_process_socket_pair(
-        args,
-        multitask::KernelHandle::Socket(left),
-        multitask::KernelHandle::Socket(right),
-        open_flags,
-    )
+    Ok(entries)
 }
 
 fn broker_unix_connect_bind(args: &RustosNetBrokerArgs) -> Result<u64, i64> {
@@ -275,109 +304,124 @@ fn allocate_unix_channel_id() -> Result<u64, i64> {
         .map_err(|_| LINUX_EOVERFLOW)
 }
 
-fn broker_accept(args: &RustosNetBrokerArgs) -> Result<u64, i64> {
-    let status_flags = process_socket_status_flags(args.process_id, args.arg0)?;
-    if args.arg4 == 0 || args.arg5 == 0 {
-        return Err(LINUX_EINVAL);
-    }
-    let socket = multitask::SocketHandle::from_token(
-        args.arg4,
-        linux_abi::AF_UNIX,
-        linux_abi::SOCK_STREAM,
-        0,
-    );
-    if !socket.bind_channel(args.arg5, 2) {
-        return Err(LINUX_EINVAL);
-    }
-    install_process_handle(
-        args.process_id,
-        multitask::KernelHandle::Socket(socket),
-        (status_flags & linux_abi::O_NONBLOCK)
-            | (args.arg3 & (linux_abi::SOCK_NONBLOCK | linux_abi::SOCK_CLOEXEC)),
-    )
-}
-
-fn process_socket_status_flags(process_id: u64, fd: u64) -> Result<u64, i64> {
-    let Some(result) = multitask::with_process_state_by_pid_mut(process_id, |process_state| {
-        let Some(entry) = process_state.handles().get_entry(fd) else {
-            return Err(LINUX_EBADF);
-        };
-        match entry.handle() {
-            multitask::KernelHandle::Socket(_) => Ok(entry.status_flags()),
-            multitask::KernelHandle::InetSocket(_) => Ok(entry.status_flags()),
-            _ => Err(LINUX_ENOTSOCK),
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn initial_unix_publication_entries_are_invisible_exact_channel_sides() {
+        for (op, second, channel) in [
+            (SYSCALL_OFFLOAD_OP_LINUX_SOCKET, 0, 0),
+            (SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR, 72, 99),
+            (SYSCALL_OFFLOAD_OP_LINUX_ACCEPT, 0, 99),
+        ] {
+            let publication = NetBrokerPrepareSocketPublication {
+                version: rustos_user_abi::syscall::NET_BROKER_SOCKET_PUBLICATION_VERSION,
+                operation: op as u64,
+                reply_cap: 11,
+                caller_pid: 12,
+                socket_token: 71,
+                second_socket_token: second,
+                channel_id: if op == SYSCALL_OFFLOAD_OP_LINUX_ACCEPT {
+                    channel
+                } else {
+                    0
+                },
+                domain: linux_abi::AF_UNIX,
+                socket_type: linux_abi::SOCK_STREAM | linux_abi::SOCK_CLOEXEC,
+                ..NetBrokerPrepareSocketPublication::default()
+            };
+            assert!(net_broker_socket_publication_shape_valid(&publication));
+            let entries = initial_unix_publication_entries(&publication, channel).unwrap();
+            assert_eq!(entries.len(), if second != 0 { 2 } else { 1 });
+            for (index, entry) in entries.iter().enumerate() {
+                let multitask::KernelHandle::Socket(socket) = entry.entry().handle() else {
+                    panic!("Unix socket")
+                };
+                assert_eq!(socket.token_id(), 71 + index as u64);
+                assert_eq!(socket.channel_id(), channel);
+                assert_eq!(
+                    socket.channel_side(),
+                    if channel == 0 {
+                        0
+                    } else if second == 0 {
+                        2
+                    } else {
+                        index as u8 + 1
+                    }
+                );
+                assert_eq!(entry.entry().fd_flags(), multitask::FD_CLOEXEC);
+            }
+            let descriptors = multitask::register_ipc_transfer_entries(entries).unwrap();
+            multitask::reclaim_unbound_socket_transfers(&descriptors);
+            assert!(
+                multitask::take_ipc_transfer_entries(&descriptors).is_err(),
+                "failed bind must reclaim every invisible descriptor"
+            );
         }
-    }) else {
-        return Err(LINUX_ESRCH);
-    };
-    result
-}
-
-fn install_process_handle(
-    process_id: u64,
-    handle: multitask::KernelHandle,
-    open_flags: u64,
-) -> Result<u64, i64> {
-    let Some(fd) = multitask::with_process_state_by_pid_mut(process_id, |process_state| {
-        process_state
-            .handles_mut()
-            .install_with_open_flags(handle, open_flags)
-    }) else {
-        return Err(LINUX_ESRCH);
-    };
-    fd.ok_or(LINUX_EMFILE)
-}
-
-fn install_process_socket_pair(
-    args: &RustosNetBrokerArgs,
-    left: multitask::KernelHandle,
-    right: multitask::KernelHandle,
-    open_flags: u64,
-) -> Result<u64, i64> {
-    if args.arg3 == 0 {
-        return Err(LINUX_EINVAL);
     }
-    let Some(result) = multitask::with_process_state_by_pid_mut(args.process_id, |process_state| {
-        process_state
-            .address_space()
-            .validate_user_write_buffer(VirtAddr::new(args.arg3), 8)
-            .map_err(address_space_error_to_linux_errno)?;
-        if !process_state.handles().can_install_additional(2) {
-            return Err(LINUX_EMFILE);
-        }
-        let Some(left_fd) = process_state
-            .handles_mut()
-            .install_with_open_flags(left, open_flags)
-        else {
-            return Err(LINUX_EMFILE);
+    #[test]
+    fn retired_accept_control_is_deferred_once_without_any_caller_reply() {
+        use kernel_ipc_runtime::api::{
+            ChannelIdentity, ProcessIdentity, ServiceIdentity, TransferContext,
         };
-        let Some(right_fd) = process_state
-            .handles_mut()
-            .install_with_open_flags(right, open_flags)
-        else {
-            let _ = process_state.handles_mut().close(left_fd);
-            return Err(LINUX_EMFILE);
+        let token = u64::MAX - 9876;
+        let entry =
+            multitask::TransferredHandleEntry::from_initial_entry(multitask::HandleEntry::new(
+                multitask::KernelHandle::Socket(multitask::SocketHandle::from_token(
+                    token,
+                    linux_abi::AF_UNIX,
+                    linux_abi::SOCK_STREAM,
+                    0,
+                )),
+                0,
+                0,
+            ))
+            .unwrap();
+        let descriptors = multitask::register_ipc_transfer_entries(alloc::vec![entry]).unwrap();
+        let tickets = multitask::bind_ipc_transfer_tickets(
+            &descriptors,
+            TransferContext {
+                source: ProcessIdentity {
+                    pid: 71,
+                    generation: 1,
+                },
+                service: ServiceIdentity {
+                    service_id: linux_abi::IPC_SERVICE_NETD,
+                    epoch: 1,
+                },
+                channel: ChannelIdentity {
+                    channel_id: 99,
+                    generation: 99,
+                    receiver_side: 2,
+                },
+                stream_start: 0,
+                stream_end: 1,
+                intended_receiver: None,
+                receiver_open_description: 0,
+            },
+        )
+        .unwrap();
+        multitask::commit_ipc_transfer_enqueue(&tickets).unwrap();
+        let mut control = alloc::vec![0;40];
+        control[..8].copy_from_slice(&40_u64.to_ne_bytes());
+        control[8..12].copy_from_slice(&(linux_abi::SOL_SOCKET as u32).to_ne_bytes());
+        control[12..16].copy_from_slice(&(linux_abi::SCM_RIGHTS as u32).to_ne_bytes());
+        control[16..24].copy_from_slice(&tickets[0].transfer_id().to_le_bytes());
+        control[24..32].copy_from_slice(&tickets[0].nonce().to_le_bytes());
+        control[32..40].copy_from_slice(&tickets[0].batch_generation().to_le_bytes());
+        let mut malformed = control.clone();
+        malformed.push(0); // Trailing bytes must reject before dropping anything.
+        assert_eq!(defer_socket_control_release(&malformed), Err(LINUX_EINVAL));
+        assert!(multitask::take_deferred_ipc_transfer_drops(1).is_empty());
+        defer_socket_control_release(&control).unwrap();
+        assert!(multitask::take_ipc_transfer_entries(&descriptors).is_err());
+        let released = multitask::take_deferred_ipc_transfer_drops(1);
+        assert_eq!(released.len(), 1);
+        let multitask::KernelHandle::Socket(socket) = released[0].entry().handle() else {
+            panic!("Unix socket")
         };
-        let (Ok(left_fd_i32), Ok(right_fd_i32)) = (i32::try_from(left_fd), i32::try_from(right_fd))
-        else {
-            let _ = process_state.handles_mut().close(left_fd);
-            let _ = process_state.handles_mut().close(right_fd);
-            return Err(LINUX_EMFILE);
-        };
-        let mut bytes = [0_u8; 8];
-        bytes[..4].copy_from_slice(&left_fd_i32.to_ne_bytes());
-        bytes[4..].copy_from_slice(&right_fd_i32.to_ne_bytes());
-        if let Err(error) = process_state
-            .address_space()
-            .copy_into_user(VirtAddr::new(args.arg3), &bytes)
-        {
-            let _ = process_state.handles_mut().close(left_fd);
-            let _ = process_state.handles_mut().close(right_fd);
-            return Err(address_space_error_to_linux_errno(error));
-        }
-        Ok(0)
-    }) else {
-        return Err(LINUX_ESRCH);
-    };
-    result
+        assert_eq!(socket.token_id(), token);
+        defer_socket_control_release(&control).unwrap();
+        assert!(multitask::take_deferred_ipc_transfer_drops(1).is_empty());
+    }
 }

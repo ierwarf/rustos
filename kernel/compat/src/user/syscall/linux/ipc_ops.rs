@@ -4051,6 +4051,15 @@ pub(super) fn prepare_transfer_tickets_for_current_process(
         receiver_open_description,
     )
     .map_err(ipc_transfer_error_to_linux_errno)?;
+    prepare_transfer_entries_for_current_process(entries)
+}
+
+/// Reserve invisible slots for an already-claimed reply batch. Copyout and
+/// deadline checks precede the exact all-or-nothing commit; Drop reconciles
+/// every provider reference on any failure.
+pub(super) fn prepare_transfer_entries_for_current_process(
+    entries: Vec<multitask::TransferredHandleEntry>,
+) -> Result<PreparedTransferInstall, i64> {
     let service_refs = service_transfer_refs(&entries);
     let reservation = multitask::with_current_user_process_state_mut(|_, _, process_state| {
         process_state.handles_mut().reserve_slots(entries.len())

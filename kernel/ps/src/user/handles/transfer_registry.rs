@@ -203,7 +203,7 @@ static NEXT_IPC_TRANSFER_BATCH_GENERATION: AtomicU64 = AtomicU64::new(1);
 /// instead of installing a temporary fd and duplicating it.  The entry owns
 /// netd's existing `refs = 1` reference.  A caller that cannot bind the
 /// returned descriptor to its exact reply must use
-/// [`reclaim_unbound_inet_socket_transfer`] and let netd discard that token;
+/// [`reclaim_unbound_socket_transfers`] and let netd discard that token;
 /// this substrate never issues provider close work for an unpublished socket.
 pub fn register_new_inet_socket_transfer(
     token: u64,
@@ -239,14 +239,14 @@ pub fn register_new_inet_socket_transfer(
     Ok(*descriptor)
 }
 
-/// Reclaims an unpublished initial AF_INET transfer without provider cleanup.
+/// Reclaims unpublished initial socket transfers without provider cleanup.
 ///
 /// Binding can fail because the caller abandoned, consumed, or never owned the
 /// reply capability.  Removing the registry entry first prevents a stranded
 /// descriptor, while dropping the local entry intentionally leaves the sole
 /// provider reference for netd's explicit unpublished-token discard path.
-pub fn reclaim_unbound_inet_socket_transfer(descriptor: KernelTransferredHandle) {
-    if let Ok(entries) = take_ipc_transfer_entries(core::slice::from_ref(&descriptor)) {
+pub fn reclaim_unbound_socket_transfers(descriptors: &[KernelTransferredHandle]) {
+    if let Ok(entries) = take_ipc_transfer_entries(descriptors) {
         drop(entries);
     }
 }
@@ -651,7 +651,7 @@ mod transfer_registry_tests {
         )
         .expect("register initial Inet socket transfer");
 
-        reclaim_unbound_inet_socket_transfer(descriptor);
+        reclaim_unbound_socket_transfers(&[descriptor]);
         assert!(matches!(
             take_ipc_transfer_entries(&[descriptor]),
             Err(IpcTransferRegistryError::StaleDescriptor)

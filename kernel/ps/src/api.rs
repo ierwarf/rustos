@@ -85,7 +85,7 @@ pub use crate::user::handles::{
     bind_ipc_transfer_receiver_by_tickets, bind_ipc_transfer_tickets,
     claim_ipc_transfer_entries_by_tickets, commit_ipc_transfer_enqueue,
     drop_ipc_transfer_descriptors, drop_ipc_transfer_tickets, drop_ipc_transfers_for_service_epoch,
-    reclaim_unbound_inet_socket_transfer, register_ipc_transfer_entries,
+    reclaim_unbound_socket_transfers, register_ipc_transfer_entries,
     register_new_inet_socket_transfer, take_deferred_ipc_transfer_drops, take_ipc_transfer_entries,
     ConsoleHandle, ConsoleStreamKind, DisplaySurfaceHandle, FileHandleSeekError,
     FileHandleSeekWhence, HandleEntry, HandleTable, InetSocketHandle, IpcTransferRegistryError,

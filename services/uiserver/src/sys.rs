@@ -67,7 +67,6 @@ const PROT_WRITE: usize = 0x2;
 const MAP_SHARED: usize = 0x01;
 const PAGE_SIZE: usize = 4096;
 const MAX_SURFACE_MAPPING_BYTES: usize = device_abi::DISPLAY_SURFACE_MAX_MAPPING_BYTES as usize;
-const MAX_SHARED_FD_MAPPING_BYTES: usize = 64 * 1024 * 1024;
 const DISPLAY_POLICY_MAX_WIDTH: u64 = 7680;
 const DISPLAY_POLICY_MAX_HEIGHT: u64 = 4320;
 const MAX_EVDEV_EVENTS_PER_READ: usize = 512;
@@ -485,30 +484,6 @@ impl Drop for SurfaceMapping {
     }
 }
 
-pub(crate) struct SharedFdMapping {
-    base: NonNull<u8>,
-    len_bytes: usize,
-}
-
-unsafe impl Send for SharedFdMapping {}
-unsafe impl Sync for SharedFdMapping {}
-
-impl SharedFdMapping {
-    pub(crate) fn bytes(&self) -> &[u8] {
-        unsafe { slice::from_raw_parts(self.base.as_ptr(), self.len_bytes) }
-    }
-
-    pub(crate) fn len_bytes(&self) -> usize {
-        self.len_bytes
-    }
-}
-
-impl Drop for SharedFdMapping {
-    fn drop(&mut self) {
-        let _ = munmap(self.base.as_ptr().cast::<c_void>(), self.len_bytes);
-    }
-}
-
 pub(crate) fn open_display() -> Result<OwnedFd, i32> {
     if running_on_rustos() {
         // RustOS exposes exactly one brokered display endpoint.  Do not fall
@@ -830,29 +805,6 @@ pub(crate) fn map_surface(surface_fd: RawFd, mapping_len: usize) -> Result<Surfa
         len_bytes: mapping_len,
     })
 }
-
-pub(crate) fn map_shared_fd_readable(
-    fd: RawFd,
-    mapping_len: usize,
-) -> Result<SharedFdMapping, i32> {
-    if mapping_len == 0 || mapping_len > MAX_SHARED_FD_MAPPING_BYTES {
-        return Err(22);
-    }
-    let mapped = mmap(
-        core::ptr::null_mut(),
-        mapping_len,
-        PROT_READ,
-        MAP_SHARED,
-        fd,
-        0,
-    )?;
-    let base = NonNull::new(mapped.cast::<u8>()).ok_or(22)?;
-    Ok(SharedFdMapping {
-        base,
-        len_bytes: mapping_len,
-    })
-}
-
 
 pub(crate) fn console_get_state(fd: RawFd) -> Result<ConsoleStateInfo, i32> {
     let mut state = ConsoleStateInfo::default();

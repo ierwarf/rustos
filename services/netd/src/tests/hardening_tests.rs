@@ -12,28 +12,26 @@ fn request_for(op: u16, arg0: u64) -> NetdIpcRequest {
 }
 
 #[test]
-fn only_af_inet_socket_creation_is_provider_gated() {
-    assert!(is_inet_socket_creation(&request_for(
+fn lifecycle_pool_is_required_for_all_charge_bearing_operations() {
+    // Every charge-bearing operation is detached, not only provider waits.
+    for op in [
         SYSCALL_OFFLOAD_OP_LINUX_SOCKET,
-        linux_abi::AF_INET
-    )));
-    assert!(!is_inet_socket_creation(&request_for(
-        SYSCALL_OFFLOAD_OP_LINUX_SOCKET,
-        linux_abi::AF_UNIX
-    )));
-    assert!(!is_inet_socket_creation(&request_for(
+        SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR,
+        SYSCALL_OFFLOAD_OP_LINUX_ACCEPT,
+    ] {
+        assert!(is_accounting_request(&request_for(op, linux_abi::AF_UNIX)));
+    }
+    for op in [
+        SYSCALL_OFFLOAD_OP_LINUX_CLOSE,
         SYSCALL_OFFLOAD_OP_LINUX_SENDTO,
-        linux_abi::AF_INET
-    )));
-    // Non-INET work never consults the provider.
-    assert!(!must_wait_for_packet_provider(&request_for(
-        SYSCALL_OFFLOAD_OP_LINUX_SOCKET,
-        linux_abi::AF_UNIX
-    )));
+        SYSCALL_OFFLOAD_OP_LINUX_POLL_SOCKET,
+    ] {
+        assert!(!is_accounting_request(&request_for(op, linux_abi::AF_UNIX)));
+    }
 }
 
 #[test]
-fn provider_wait_pool_has_its_own_bound_and_cannot_borrow_blocking_slots() {
+fn lifecycle_pool_has_its_own_bound_and_cannot_borrow_blocking_slots() {
     // A pool with no workers refuses instead of queueing a request nobody runs.
     let request = NetdIpcRequest {
         deadline_ns: u64::MAX,
@@ -50,15 +48,21 @@ fn provider_wait_pool_has_its_own_bound_and_cannot_borrow_blocking_slots() {
         Err(libc::EAGAIN)
     );
     active.store(1, Ordering::Release);
-    assert_eq!(enqueue_to_pool(queue, &pending, 2, &active, request, 1, 1), Ok(()));
-    assert_eq!(enqueue_to_pool(queue, &pending, 2, &active, request, 2, 1), Ok(()));
+    assert_eq!(
+        enqueue_to_pool(queue, &pending, 2, &active, request, 1, 1),
+        Ok(())
+    );
+    assert_eq!(
+        enqueue_to_pool(queue, &pending, 2, &active, request, 2, 1),
+        Ok(())
+    );
     assert_eq!(
         enqueue_to_pool(queue, &pending, 2, &active, request, 3, 1),
         Err(libc::EAGAIN)
     );
     assert_eq!(queue.requests.lock().unwrap().len(), 2);
     // The shared blocking-I/O counters were never touched.
-    assert_eq!(PENDING_PROVIDER_WAITS.load(Ordering::Acquire), 0);
+    assert_eq!(PENDING_LIFECYCLE_REQUESTS.load(Ordering::Acquire), 0);
 }
 
 #[test]
@@ -221,9 +225,15 @@ fn near_empty_plain_stream_send_never_reports_would_block() {
         }
         other
     });
-    assert_eq!(send_socket_message_in_state(&mut state, &request, b"x", &[]), Ok(1));
+    assert_eq!(
+        send_socket_message_in_state(&mut state, &request, b"x", &[]),
+        Ok(1)
+    );
     peer_connected(&mut state).incoming_bytes = SOCKET_BUFFER_CAPACITY - 1;
-    assert_eq!(send_socket_message_in_state(&mut state, &request, b"xy", &[]), Ok(1));
+    assert_eq!(
+        send_socket_message_in_state(&mut state, &request, b"xy", &[]),
+        Ok(1)
+    );
     assert_eq!(
         send_socket_message_in_state(&mut state, &request, b"z", &[]),
         Err(libc::EAGAIN)
@@ -262,5 +272,104 @@ fn ancillary_send_is_refused_only_by_the_listener_wide_custody_budget() {
     assert_eq!(
         send_socket_message_in_state(&mut state, &request, b"x", &control),
         Ok(1)
+    );
+}
+
+#[test]
+fn unix_global_budget_bounds_unrelated_sockets_and_releases_payload_and_control() {
+    let mut state = NetState::new();
+    // Fill one shared budget through distinct queues, not a per-socket limit.
+    let bytes = vec![7; SOCKET_BUFFER_CAPACITY];
+    for pair in 0..UNIX_QUEUED_BYTE_CAPACITY / SOCKET_BUFFER_CAPACITY {
+        let sender = pair as u64 * 2 + 1;
+        let receiver = sender + 1;
+        state.sockets.insert(
+            sender,
+            super::local_socket_poll_tests::connected_socket(receiver),
+        );
+        state.sockets.insert(
+            receiver,
+            super::local_socket_poll_tests::connected_socket(sender),
+        );
+        let request = NetdIpcRequest {
+            socket_token: sender,
+            ..NetdIpcRequest::default()
+        };
+        assert_eq!(
+            send_socket_message_in_state(&mut state, &request, &bytes, &[]),
+            Ok(bytes.len())
+        );
+    }
+    linked_extra_pair(&mut state, 1001, 1002);
+    linked_extra_pair(&mut state, 1003, 1004);
+    state.record_readiness_changes();
+    state.readiness_publications.clear();
+    let send = NetdIpcRequest {
+        socket_token: 1001,
+        ..NetdIpcRequest::default()
+    };
+    assert_eq!(state.unix_queued_bytes, UNIX_QUEUED_BYTE_CAPACITY);
+    assert_eq!(
+        send_socket_message_in_state(&mut state, &send, b"x", &[]),
+        Err(libc::EAGAIN)
+    );
+    assert_eq!(
+        unix_socket_revents(&state, 1003, linux_abi::POLLOUT as u32),
+        Ok(0)
+    );
+    let recv = NetdIpcRequest {
+        socket_token: 2,
+        ..NetdIpcRequest::default()
+    };
+    recv_socket_bytes_in_state(&mut state, &recv, &mut [0; 32], false).unwrap();
+    state.record_readiness_changes();
+    assert!(
+        state
+            .readiness_publications
+            .iter()
+            .any(|entry| entry.0 == 1003),
+        "freeing capacity must wake senders unrelated to the receiving pair"
+    );
+    assert_eq!(
+        unix_socket_revents(&state, 1003, linux_abi::POLLOUT as u32),
+        Ok(linux_abi::POLLOUT as u32)
+    );
+    let before = state.unix_queued_bytes;
+    assert_eq!(
+        send_socket_message_in_state(&mut state, &send, &[0; 25], &[0; 8]),
+        Err(libc::EAGAIN)
+    );
+    assert_eq!(
+        state.unix_queued_bytes, before,
+        "ancillary messages are atomic under global pressure"
+    );
+    assert_eq!(
+        send_socket_message_in_state(&mut state, &send, b"12345678", &[0; 24]),
+        Ok(8)
+    );
+    assert_eq!(state.unix_queued_bytes, UNIX_QUEUED_BYTE_CAPACITY);
+    let recv = NetdIpcRequest {
+        socket_token: 1002,
+        ..NetdIpcRequest::default()
+    };
+    let result = recv_socket_bytes_in_state(&mut state, &recv, &mut [0; 4], false).unwrap();
+    assert_eq!(result.discarded.len(), 24);
+    assert_eq!(state.unix_queued_bytes, UNIX_QUEUED_BYTE_CAPACITY - 28);
+    retire_unix_socket(&mut state, 1002);
+    assert_eq!(state.unix_queued_bytes, UNIX_QUEUED_BYTE_CAPACITY - 32);
+    for token in state.sockets.keys().copied().collect::<Vec<_>>() {
+        retire_unix_socket(&mut state, token);
+    }
+    assert_eq!(state.unix_queued_bytes, 0);
+}
+
+fn linked_extra_pair(state: &mut NetState, left: u64, right: u64) {
+    state.sockets.insert(
+        left,
+        super::local_socket_poll_tests::connected_socket(right),
+    );
+    state.sockets.insert(
+        right,
+        super::local_socket_poll_tests::connected_socket(left),
     );
 }

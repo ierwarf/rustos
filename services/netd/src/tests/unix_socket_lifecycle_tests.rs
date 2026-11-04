@@ -69,6 +69,7 @@ fn request(token: u64) -> NetdIpcRequest {
 }
 
 fn enqueue(state: &mut NetState, token: u64, bytes: &[u8], control: &[u8]) {
+    state.unix_queued_bytes+=bytes.len()+cmsg_align(control.len());
     let connected = connected_mut(state, token);
     connected.incoming_bytes += bytes.len();
     connected.incoming_control_bytes += cmsg_align(control.len());
@@ -277,7 +278,7 @@ fn listener_close_repeatedly_retires_pending_bytes_and_authority_once() {
             );
             let mut byte = [0];
             assert_eq!(
-                recv_connected_bytes(connected_mut(&mut state, client), &mut byte, true)
+                recv_socket_bytes_in_state(&mut state, &request(client), &mut byte, true)
                     .unwrap()
                     .read,
                 0
@@ -291,6 +292,7 @@ fn listener_close_repeatedly_retires_pending_bytes_and_authority_once() {
             let _ = retire_unix_socket(&mut state, client);
         }
         assert!(state.sockets.is_empty());
+        assert_eq!(state.unix_queued_bytes,0);
     }
 }
 
@@ -343,7 +345,7 @@ fn pending_budget_admission_is_aligned_atomic_and_shared_across_accept_pop() {
 }
 
 #[test]
-fn failed_inflight_accept_after_listener_close_carries_only_error_release_trailer() {
+fn failed_inflight_accept_after_listener_close_releases_control_without_reply() {
     let mut state = listener_state();
     for (client, marker) in [(4, 2), (5, 3)] {
         assert_eq!(
@@ -364,9 +366,20 @@ fn failed_inflight_accept_after_listener_close_carries_only_error_release_traile
         payload_len: 7,
         ..NetdIpcResponse::default()
     };
-    encode_retired_socket_release(retired, &mut error);
+    let mut releases=0;
+    release_accept_retired_control_with(retired,&mut error,|control| {
+        releases+=1;
+        let mut captured=NetdIpcResponse::default();
+        captured.payload[..control.len()].copy_from_slice(control);
+        captured.payload_len=control.len() as u32;
+        captured.reserved0=control.len() as u32;
+        assert_eq!(release_controls(&captured),vec![rights(2)]);
+        Ok(())
+    }).unwrap();
+    assert_eq!(releases,1);
     assert_eq!(error.status, libc::EIO);
-    assert_eq!(release_controls(&error), vec![rights(2)]);
+    assert_eq!(error.payload_len,0);
+    assert_eq!(error.reserved0,0);
     assert_eq!(peers, vec![4]);
     assert!(connected(&state, 4).peer_closed);
     assert!(!state.sockets.contains_key(&2));

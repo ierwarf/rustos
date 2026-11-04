@@ -1,5 +1,5 @@
 use super::{
-    packet_provider_state_from_wire, poll_turn_changes_readiness, settle_inet_socket_publication,
+    packet_provider_state_from_wire, poll_turn_changes_readiness, settle_socket_publication_at,
     start_inet_socket_provider_at, NetdIpcRequest, PacketProviderState, PollIngressSingleResult,
     PollResult, INET_READINESS_POLL_INTERVAL, NET_BROKER_PACKET_STATUS_ACTIVE,
     NET_BROKER_PACKET_STATUS_AWAITING_AUTHENTICATED_CONTROL, NET_BROKER_PACKET_STATUS_UNAVAILABLE,
@@ -15,7 +15,8 @@ fn rejected_prepared_inet_publication_discards_the_unpublished_token_once() {
     let attempts = std::cell::Cell::new(0_u8);
     let discards = std::cell::Cell::new(0_u8);
     assert_eq!(
-        settle_inet_socket_publication(
+        settle_socket_publication_at(
+            &NetdIpcRequest{deadline_ns:2,..NetdIpcRequest::default()},1,
             71,
             || {
                 attempts.set(attempts.get() + 1);
@@ -32,7 +33,7 @@ fn rejected_prepared_inet_publication_discards_the_unpublished_token_once() {
     assert_eq!(discards.get(), 1);
 
     assert_eq!(
-        settle_inet_socket_publication(72, || Ok(()), |_| { discards.set(discards.get() + 1) }),
+        settle_socket_publication_at(&NetdIpcRequest{deadline_ns:2,..NetdIpcRequest::default()},1,72, || Ok(()), |_| { discards.set(discards.get() + 1) }),
         Ok(())
     );
     assert_eq!(discards.get(), 1, "a bound reply owns subsequent cleanup");

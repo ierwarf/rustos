@@ -185,13 +185,67 @@ Large slot rows use aligned non-temporal stores into the write-combine mapping,
 and one store fence completes the copy before the commit ioctl publishes its
 generation. Small damage retains the ordinary bounded copy path.
 Console texture content and scene topology have separate generations.
-Output or terminal-cursor changes rebuild and copy only the bound console
-rectangle. Window position changes only the destination of the exact retained
-texture command and must not rebuild or copy atlas pixels. The binding includes
-the authenticated layer index and source rectangle; a mismatch fails closed
-into a structural rebuild. Window identity, dimensions, visibility, focus,
-title, or ordering changes force that rebuild. Content versions and `x/y`
-position alone must not alter the structural reuse signature.
+When every whole texture fits, output or terminal-cursor changes rebuild and
+copy only the bound console rectangle; window position changes only the
+exact retained texture command's destination, without copying atlas pixels.
+The binding authenticates layer index and source rectangle; a mismatch forces
+a structural rebuild. Window identity, actual buffer/frame dimensions,
+visibility, focus, title, or ordering changes force that rebuild. Content
+versions and `x/y` position alone do not change this whole-texture signature.
+The global `font::asset_revision()` is also structural scene identity, so
+configured-font promotion rebuilds Wayland title textures even with unchanged
+client pixels. Console raster caches retain that same revision and rebuild
+both title chrome and terminal layout when it changes, rather than permanently
+retaining bootstrap/blank glyphs. Unchanged revisions reuse existing rasters.
+
+A whole-texture capacity failure retries the COMPLETE scene as independently
+rasterized cropped fragments, not a CPU-composed framebuffer and not a subset
+of windows. The ordered-layer fragment planner subtracts only proven opaque
+upper interiors, excluding title glass, outlines and rounded corners. Wayland
+opacity is proved from retained normalized pixels (XRGB has alpha 255; ARGB
+must actually contain only alpha-255 client pixels); client opaque-region
+hints alone grant no occlusion authority. Translucent clients conservatively
+retain every lower source. Existing client-over-window-backing raster policy
+is unchanged. The dock remains above windows and the cursor remains a separate
+premultiplied texture command. Output clipping and allocator splits crop
+source and destination by identical offsets, without scaling. Large fragments
+pack first; free-space fragmentation can split a source further, but never
+change draw order or omit a nonempty remainder.
+
+The actual KVM source is 2688x2560 BGRA (26.25 MiB logical pixels per slot),
+not the wire maximum of 8192x8192/256 MiB. There is still exactly one bound
+source per frame and three slots. No pool enlargement, extra source, Ring0
+composition, or public ABI extension is involved. Planning inputs,
+intermediate fragment lists and allocator splits are bounded by 510 fragments
+(512 commands minus clear and cursor); desktop and dock consume that same
+budget. A cropped rebuild retains only one temporary full window raster at a
+time in addition to the existing retained caches and two service atlas buffers.
+
+Cropped scenes re-evaluate visibility on scene damage, including moves and
+content/opacity changes: moving an occluder can expose a previously absent
+lower source, so destination-only reuse would be incorrect. Unchanged
+whole-texture topology bypasses the unsuccessful whole-texture attempt on
+subsequent cropped updates. Cursor-only motion still changes commands (or its
+small sprite region), without repacking. Rebuild damage compares complete old
+and new atlas contents, including cleared old regions, then uses the existing
+slot-epoch reconstruction before publication.
+
+Atlas exhaustion or the fragment/command budget rejects the entire candidate
+with retryable backpressure, rate-limited pressure diagnostics and the normal
+frame retry cadence. It does not advance acquire/submit/content epochs or
+damage history, and leaves the previous complete GPU front visible. No
+per-window logs-only omission or CPU success fallback is allowed. A later
+representable scene recovers through a complete slot snapshot. The bounded
+greedy allocator is not an optimal rectangle-packing proof: adversarial
+fragmentation or large translucent stacks can explicitly backpressure even
+when aggregate source area alone seems plausible.
+
+Focused evidence: `cargo test -p uiserver` includes actual-size maximized +
+desktop/dock/cursor and overlapping-window packing, opaque-texel proofs,
+translucent-client rejection, an exact source-over pixel oracle, source-crop
+coordinates/gutters, fragment-budget rejection/recovery, and rotated-slot
+reconstruction after repack writes AND clears. These are host tests, not KVM
+latency or physical-GPU acceptance evidence.
 Wayland pointer motion is coalesced to the latest coordinates on the same
 15 ms frame cadence. Focus transitions still emit immediate enter/leave
 events, and button delivery first flushes any pending motion so observable

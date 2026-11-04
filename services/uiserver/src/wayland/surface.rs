@@ -349,12 +349,14 @@ impl Dispatch<wl_surface::WlSurface, SurfaceData> for WaylandState {
                                 mapped = true;
                                 dirty = true;
                             } else {
-                                diag_line(
-                                    "uiserver: rejecting wl_shm buffer during commit due to invalid layout",
+                                // A bad backing file is a client failure, not a
+                                // successful commit of the previous pixels.
+                                resource.post_error(
+                                    wl_shm::Error::InvalidFd,
+                                    "wl_surface.commit: unreadable or truncated shm buffer"
+                                        .to_string(),
                                 );
-                                mapped = !surface.pixels.is_empty()
-                                    && surface.width != 0
-                                    && surface.height != 0;
+                                return;
                             }
                             trigger_initial_configure = surface.needs_initial_configure
                                 && !mapped

@@ -1032,12 +1032,16 @@ pub const NET_BROKER_OP_PACKET_LEASE_RESET: u16 = 0x8006;
 /// Atomically binds a connecting AF_UNIX open description to a kernel-minted
 /// channel generation before netd publishes the accepted peer.
 pub const NET_BROKER_OP_UNIX_CONNECT_BIND: u16 = 0x8010;
-/// Prepare the one AF_INET stream socket descriptor that is attached to the
+/// Prepare initial socket/socketpair/accept descriptors attached to the
 /// current netd reply.  This is deliberately a prepare operation: it never
 /// installs an fd into the target process before that caller accepts the
 /// exact reply capability.
 pub const NET_BROKER_OP_PREPARE_SOCKET_PUBLICATION: u16 = 0x8011;
-pub const NET_BROKER_SOCKET_PUBLICATION_VERSION: u16 = 1;
+pub const NET_BROKER_SOCKET_PUBLICATION_VERSION: u16 = 2;
+/// Release a bounded opaque ancillary-control block into kernel deferred drop,
+/// independent of a caller reply. arg0=provider buffer, arg1=length; others zero.
+pub const NET_BROKER_OP_RELEASE_SOCKET_CONTROL: u16 = 0x8012;
+pub const NET_BROKER_SOCKET_CONTROL_CAPACITY: usize = 16 * 1024;
 /// Kernel-only acknowledgement that retires one completed replay-safe
 /// dup/close operation from netd's bounded reconciliation table.
 pub const NETD_IPC_OP_REF_ACK: u16 = 0x8004;
@@ -2594,12 +2598,16 @@ pub struct NetBrokerPrepareSocketPublication {
     pub protocol: u64,
     pub reserved2: u64,
     pub reserved3: u64,
+    pub operation: u64,
+    pub second_socket_token: u64,
+    pub channel_id: u64,
 }
 
 // These are the fixed x86_64 Linux socket ABI values carried by this wire.
 // `syscall` is also compiled without the optional Linux state module, so keep
 // the shape predicate available there and verify the values against that
 // module whenever the compatibility feature is selected.
+const NET_BROKER_PUBLICATION_AF_UNIX: u64 = 1;
 const NET_BROKER_PUBLICATION_AF_INET: u64 = 2;
 const NET_BROKER_PUBLICATION_SOCK_STREAM: u64 = 1;
 const NET_BROKER_PUBLICATION_SOCK_DGRAM: u64 = 2;
@@ -2611,6 +2619,7 @@ const NET_BROKER_PUBLICATION_ALLOWED_SOCKET_FLAGS: u64 =
 
 #[cfg(feature = "linux-compat-state")]
 const _: () = {
+    assert!(NET_BROKER_PUBLICATION_AF_UNIX == crate::linux::AF_UNIX);
     assert!(NET_BROKER_PUBLICATION_AF_INET == crate::linux::AF_INET);
     assert!(NET_BROKER_PUBLICATION_SOCK_STREAM == crate::linux::SOCK_STREAM);
     assert!(NET_BROKER_PUBLICATION_SOCK_TYPE_MASK == crate::linux::SOCK_TYPE_MASK);
@@ -2631,10 +2640,15 @@ pub const fn net_broker_inet_socket_shape_valid(domain: u64, socket_type: u64, p
         }
 }
 
-/// Returns whether a reply-bound socket-publication record has the intrinsic,
-/// versioned AF_INET TCP, UDP or echo-datagram shape.  The broker separately binds `caller_pid`
-/// to the outer request's process identity and the reply capability to netd's
-/// live endpoint owner.
+/// AF_UNIX stream sockets have no selectable transport protocol.
+pub const fn net_broker_unix_socket_shape_valid(domain:u64, socket_type:u64, protocol:u64)->bool {
+    domain == NET_BROKER_PUBLICATION_AF_UNIX && protocol == 0
+        && socket_type & NET_BROKER_PUBLICATION_SOCK_TYPE_MASK == NET_BROKER_PUBLICATION_SOCK_STREAM
+        && socket_type & !(NET_BROKER_PUBLICATION_SOCK_TYPE_MASK | NET_BROKER_PUBLICATION_ALLOWED_SOCKET_FLAGS) == 0
+}
+
+/// Intrinsic shape of one reply-bound socket/socketpair/accept publication.
+/// The broker separately binds caller identity and the exact live reply owner.
 pub const fn net_broker_socket_publication_shape_valid(
     publication: &NetBrokerPrepareSocketPublication,
 ) -> bool {
@@ -2646,100 +2660,77 @@ pub const fn net_broker_socket_publication_shape_valid(
         && publication.reply_cap != 0
         && publication.caller_pid != 0
         && publication.socket_token != 0
-        && net_broker_inet_socket_shape_valid(publication.domain, publication.socket_type, publication.protocol)
+        && match publication.operation {
+            op if op == SYSCALL_OFFLOAD_OP_LINUX_SOCKET as u64 => {
+                publication.second_socket_token == 0 && publication.channel_id == 0
+                    && (net_broker_inet_socket_shape_valid(publication.domain, publication.socket_type, publication.protocol)
+                        || net_broker_unix_socket_shape_valid(publication.domain, publication.socket_type, publication.protocol))
+            }
+            op if op == SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR as u64 => {
+                publication.second_socket_token != 0
+                    && publication.second_socket_token != publication.socket_token
+                    && publication.channel_id == 0
+                    && net_broker_unix_socket_shape_valid(publication.domain, publication.socket_type, publication.protocol)
+            }
+            op if op == SYSCALL_OFFLOAD_OP_LINUX_ACCEPT as u64 => {
+                publication.second_socket_token == 0 && publication.channel_id != 0
+                    && net_broker_unix_socket_shape_valid(publication.domain, publication.socket_type, publication.protocol)
+            }
+            _ => false,
+        }
 }
 
 #[cfg(kani)]
 mod net_broker_socket_publication_verification {
     use super::*;
-
-    fn arbitrary_publication() -> NetBrokerPrepareSocketPublication {
+    fn arbitrary_publication()->NetBrokerPrepareSocketPublication {
         NetBrokerPrepareSocketPublication {
-            version: kani::any(),
-            reserved0: kani::any(),
-            reserved1: kani::any(),
-            reply_cap: kani::any(),
-            caller_pid: kani::any(),
-            socket_token: kani::any(),
-            domain: kani::any(),
-            socket_type: kani::any(),
-            protocol: kani::any(),
-            reserved2: kani::any(),
-            reserved3: kani::any(),
+            version:kani::any(), reserved0:kani::any(), reserved1:kani::any(),
+            reply_cap:kani::any(), caller_pid:kani::any(), socket_token:kani::any(),
+            domain:kani::any(), socket_type:kani::any(), protocol:kani::any(),
+            reserved2:kani::any(), reserved3:kani::any(), operation:kani::any(),
+            second_socket_token:kani::any(), channel_id:kani::any(),
         }
     }
-
     #[kani::proof]
     fn accepted_socket_publication_has_every_exact_intrinsic_property() {
-        let publication = arbitrary_publication();
-        let accepted = net_broker_socket_publication_shape_valid(&publication);
+        let p=arbitrary_publication();
+        let accepted=net_broker_socket_publication_shape_valid(&p);
         kani::cover!(accepted);
         if accepted {
-            assert_eq!(publication.version, NET_BROKER_SOCKET_PUBLICATION_VERSION);
-            assert_eq!(publication.reserved0, 0);
-            assert_eq!(publication.reserved1, 0);
-            assert_eq!(publication.reserved2, 0);
-            assert_eq!(publication.reserved3, 0);
-            assert_ne!(publication.reply_cap, 0);
-            assert_ne!(publication.caller_pid, 0);
-            assert_ne!(publication.socket_token, 0);
-            assert_eq!(publication.domain, NET_BROKER_PUBLICATION_AF_INET);
-            let base_type = publication.socket_type & NET_BROKER_PUBLICATION_SOCK_TYPE_MASK;
-            assert!(base_type == NET_BROKER_PUBLICATION_SOCK_STREAM || base_type == NET_BROKER_PUBLICATION_SOCK_DGRAM);
-            if base_type == NET_BROKER_PUBLICATION_SOCK_STREAM {
-                assert!(publication.protocol == 0 || publication.protocol == 6);
-            } else {
-                assert!(publication.protocol == 0 || publication.protocol == 17 || publication.protocol == 1);
+            assert_eq!(p.version,NET_BROKER_SOCKET_PUBLICATION_VERSION);
+            assert_eq!((p.reserved0,p.reserved1,p.reserved2,p.reserved3),(0,0,0,0));
+            assert!(p.reply_cap!=0 && p.caller_pid!=0 && p.socket_token!=0);
+            assert!(net_broker_inet_socket_shape_valid(p.domain,p.socket_type,p.protocol)
+                || net_broker_unix_socket_shape_valid(p.domain,p.socket_type,p.protocol));
+            if p.operation!=SYSCALL_OFFLOAD_OP_LINUX_SOCKET as u64 {
+                assert!(net_broker_unix_socket_shape_valid(p.domain,p.socket_type,p.protocol));
             }
-            assert_eq!(
-                publication.socket_type
-                    & !(NET_BROKER_PUBLICATION_SOCK_TYPE_MASK
-                        | NET_BROKER_PUBLICATION_ALLOWED_SOCKET_FLAGS),
-                0
-            );
+            if p.operation==SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR as u64 {
+                assert!(p.second_socket_token!=0 && p.second_socket_token!=p.socket_token && p.channel_id==0);
+            } else {
+                assert_eq!(p.second_socket_token,0);
+                assert!(p.operation==SYSCALL_OFFLOAD_OP_LINUX_SOCKET as u64
+                    || p.operation==SYSCALL_OFFLOAD_OP_LINUX_ACCEPT as u64);
+                assert_eq!(p.channel_id!=0,p.operation==SYSCALL_OFFLOAD_OP_LINUX_ACCEPT as u64);
+            }
         }
     }
-
     #[kani::proof]
     fn malformed_socket_publication_intrinsic_field_is_rejected() {
-        let publication = arbitrary_publication();
-        let malformed = publication.version != NET_BROKER_SOCKET_PUBLICATION_VERSION
-            || publication.reserved0 != 0
-            || publication.reserved1 != 0
-            || publication.reserved2 != 0
-            || publication.reserved3 != 0
-            || publication.reply_cap == 0
-            || publication.caller_pid == 0
-            || publication.socket_token == 0
-            || publication.domain != NET_BROKER_PUBLICATION_AF_INET
-            || !net_broker_inet_socket_shape_valid(publication.domain, publication.socket_type, publication.protocol)
-            || publication.socket_type
-                & !(NET_BROKER_PUBLICATION_SOCK_TYPE_MASK
-                    | NET_BROKER_PUBLICATION_ALLOWED_SOCKET_FLAGS)
-                != 0;
+        let p=arbitrary_publication();
+        let malformed=p.version!=NET_BROKER_SOCKET_PUBLICATION_VERSION
+            || p.reserved0!=0 || p.reserved1!=0 || p.reserved2!=0 || p.reserved3!=0
+            || p.reply_cap==0 || p.caller_pid==0 || p.socket_token==0
+            || !(net_broker_inet_socket_shape_valid(p.domain,p.socket_type,p.protocol)
+                || net_broker_unix_socket_shape_valid(p.domain,p.socket_type,p.protocol))
+            || (p.operation!=SYSCALL_OFFLOAD_OP_LINUX_SOCKET as u64
+                && p.operation!=SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR as u64
+                && p.operation!=SYSCALL_OFFLOAD_OP_LINUX_ACCEPT as u64);
         kani::assume(malformed);
-        kani::cover!(publication.version != NET_BROKER_SOCKET_PUBLICATION_VERSION);
-        kani::cover!(publication.reserved0 != 0);
-        kani::cover!(publication.reserved1 != 0);
-        kani::cover!(publication.reserved2 != 0);
-        kani::cover!(publication.reserved3 != 0);
-        kani::cover!(publication.reply_cap == 0);
-        kani::cover!(publication.caller_pid == 0);
-        kani::cover!(publication.socket_token == 0);
-        kani::cover!(publication.domain != NET_BROKER_PUBLICATION_AF_INET);
-        kani::cover!(
-            publication.socket_type & NET_BROKER_PUBLICATION_SOCK_TYPE_MASK
-                != NET_BROKER_PUBLICATION_SOCK_STREAM
-                && publication.socket_type & NET_BROKER_PUBLICATION_SOCK_TYPE_MASK
-                != NET_BROKER_PUBLICATION_SOCK_DGRAM
-        );
-        kani::cover!(
-            publication.socket_type
-                & !(NET_BROKER_PUBLICATION_SOCK_TYPE_MASK
-                    | NET_BROKER_PUBLICATION_ALLOWED_SOCKET_FLAGS)
-                != 0
-        );
-        assert!(!net_broker_socket_publication_shape_valid(&publication));
+        kani::cover!(p.version != NET_BROKER_SOCKET_PUBLICATION_VERSION);
+        kani::cover!(p.version == NET_BROKER_SOCKET_PUBLICATION_VERSION && p.socket_token == 0);
+        assert!(!net_broker_socket_publication_shape_valid(&p));
     }
 }
 

@@ -125,14 +125,12 @@ static ABANDONED_REPLY_DIAGNOSTICS: rustos_svc_runtime::ipc::ReplyFailureDiagnos
 const NETD_REQUEST_WORKERS: usize = 4;
 const BLOCKING_WORKER_COUNT: usize = 8;
 const MAX_PENDING_BLOCKING_REQUESTS: usize = 32;
-/// Dedicated pool for `socket(AF_INET)` calls that must wait for the DVM
-/// control relay. It is separate from the blocking-I/O pool on purpose: blocking
-/// receives can hold all of those workers for their whole (up to 30 s)
-/// deadline, and socket creation must not queue behind them.
-const PROVIDER_WAIT_WORKER_COUNT: usize = 2;
-const MAX_PENDING_PROVIDER_WAITS: usize = 16;
-static PENDING_PROVIDER_WAITS: AtomicUsize = AtomicUsize::new(0);
-static ACTIVE_PROVIDER_WAIT_WORKERS: AtomicUsize = AtomicUsize::new(0);
+/// Charges and provider-gated socket creation must never occupy a receiver
+/// or queue behind bulk INET receives. Refunds have their own control worker.
+const LIFECYCLE_WORKER_COUNT: usize = 2;
+const MAX_PENDING_LIFECYCLE_REQUESTS: usize = 16;
+static PENDING_LIFECYCLE_REQUESTS: AtomicUsize = AtomicUsize::new(0);
+static ACTIVE_LIFECYCLE_WORKERS: AtomicUsize = AtomicUsize::new(0);
 const REF_REPLAY_CAPACITY: usize = 4096;
 /// A completed reference result is kept for replay at least this long even
 /// when the log is full. It is far above the caller's 5 s state-mutation lease
@@ -178,9 +176,11 @@ const MAX_LISTEN_BACKLOG: usize = 128;
 const MAX_UNIX_SOCKETS: usize = 8192;
 const MAX_INET_SOCKETS: usize = 1024;
 const SOCKET_BUFFER_CAPACITY: usize = 1024 * 1024;
+/// Shared outstanding AF_UNIX payload plus aligned ancillary custody.
+const UNIX_QUEUED_BYTE_CAPACITY: usize = 64 * 1024 * 1024;
 // Every queued ancillary byte must fit in one kernel-consumed release trailer
 // when read/close discards it. This is a lifecycle bound, not a tuning knob.
-const SOCKET_CONTROL_BUFFER_CAPACITY: usize = 16 * 1024;
+const SOCKET_CONTROL_BUFFER_CAPACITY: usize = rustos_user_abi::syscall::NET_BROKER_SOCKET_CONTROL_CAPACITY;
 const INET_TCP_BUFFER_CAPACITY: usize = 16 * 1024;
 const INET_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const INET_IO_POLL_BUDGET: usize = 256;
@@ -410,6 +410,7 @@ struct NetState {
     sockets: SocketTable<UnixSocket>,
     inet_sockets: SocketTable<InetSocket>,
     bindings: BTreeMap<String, u64>,
+    unix_queued_bytes: usize,
     inet: Option<InetStack>,
     /// Per-socket readiness generation: the newest value published for that
     /// socket. Entries exist only for live sockets, so the map is bounded by
@@ -425,6 +426,7 @@ impl NetState {
             sockets: SocketTable::new(),
             inet_sockets: SocketTable::new(),
             bindings: BTreeMap::new(),
+            unix_queued_bytes: 0,
             inet: None,
             readiness_generations: BTreeMap::new(),
             readiness_observations: BTreeMap::new(),
@@ -432,6 +434,24 @@ impl NetState {
         }
     }
 
+    fn set_unix_queued_bytes(&mut self, bytes: usize) {
+        assert!(bytes <= UNIX_QUEUED_BYTE_CAPACITY);
+        if (self.unix_queued_bytes == UNIX_QUEUED_BYTE_CAPACITY)
+            != (bytes == UNIX_QUEUED_BYTE_CAPACITY)
+        {
+            // Global capacity affects every sender, not just the current peer.
+            self.sockets.mark_all_dirty();
+        }
+        self.unix_queued_bytes = bytes;
+    }
+
+    fn release_unix_queued_bytes(&mut self, bytes: usize) {
+        self.set_unix_queued_bytes(
+            self.unix_queued_bytes
+                .checked_sub(bytes)
+                .expect("AF_UNIX queued-byte custody underflow"),
+        );
+    }
     fn socket_exists(&self, token: u64) -> bool {
         self.sockets.contains_key(&token) || self.inet_sockets.contains_key(&token)
     }

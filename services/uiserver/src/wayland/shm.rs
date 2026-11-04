@@ -49,17 +49,17 @@ impl Dispatch<wl_shm::WlShm, ()> for WaylandState {
                 );
                 return;
             }
-            let Ok(mapping) = map_shared_fd_readable(fd.as_raw_fd(), size) else {
+            let Ok(pool) = WaylandShmPoolState::new(fd, size) else {
                 post_protocol_error(
                     resource,
-                    format!("wl_shm.create_pool: failed to map fd for size={size}"),
+                    format!("wl_shm.create_pool: unreadable or undersized fd for size={size}"),
                 );
                 return;
             };
             data_init.init(
                 id,
                 ShmPoolData {
-                    shared: Arc::new(Mutex::new(WaylandShmPoolState { mapping, len: size, fd })),
+                    shared: Arc::new(Mutex::new(pool)),
                 },
             );
         }
@@ -154,14 +154,8 @@ impl Dispatch<wl_shm_pool::WlShmPool, ShmPoolData> for WaylandState {
                         );
                         return;
                     };
-                    validate_wayland_buffer_layout(
-                        offset,
-                        width,
-                        height,
-                        stride,
-                        pool.len.min(pool.mapping.len_bytes()),
-                    )
-                    .is_some()
+                    validate_wayland_buffer_layout(offset, width, height, stride, pool.len)
+                        .is_some()
                 };
                 if !layout_valid {
                     post_protocol_error(
@@ -191,29 +185,9 @@ impl Dispatch<wl_shm_pool::WlShmPool, ShmPoolData> for WaylandState {
                 };
                 let resize_result = {
                     if let Ok(mut pool) = data.shared.lock() {
-                        if !valid_wayland_pool_resize(pool.len, size) {
-                            Err(format!(
-                                "wl_shm_pool.resize: size {} must be at least {} and not exceed {}",
-                                size, pool.len, MAX_WAYLAND_SHM_POOL_BYTES
-                            ))
-                        } else if size > pool.mapping.len_bytes() {
-                            // Growth: map the larger extent before dropping
-                            // the old one; buffers observe the swap only
-                            // under this lock.
-                            match map_shared_fd_readable(pool.fd.as_raw_fd(), size) {
-                                Ok(mapping) => {
-                                    pool.mapping = mapping;
-                                    pool.len = size;
-                                    Ok(())
-                                }
-                                Err(_) => Err(format!(
-                                    "wl_shm_pool.resize: failed to map fd for size={size}"
-                                )),
-                            }
-                        } else {
-                            pool.len = size;
-                            Ok(())
-                        }
+                        pool.resize(size).map_err(|err| {
+                            format!("wl_shm_pool.resize: invalid size or unreadable backing: {err}")
+                        })
                     } else {
                         Err("wl_shm_pool.resize: pool state unavailable".into())
                     }
@@ -225,4 +199,74 @@ impl Dispatch<wl_shm_pool::WlShmPool, ShmPoolData> for WaylandState {
             _ => {}
         }
     }
+}
+
+impl WaylandShmPoolState {
+    pub(super) fn new(fd: OwnedFd, len: usize) -> std::io::Result<Self> {
+        validate_shm_extent(fd.as_raw_fd(), len)?;
+        Ok(Self { fd, len })
+    }
+
+    pub(super) fn resize(&mut self, len: usize) -> std::io::Result<()> {
+        if !valid_wayland_pool_resize(self.len, len) {
+            return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+        }
+        // Admission only. Every later copy independently reads owned bytes;
+        // neither this probe nor fstat could make an mmap safe from truncate.
+        validate_shm_extent(self.fd.as_raw_fd(), len)?;
+        self.len = len;
+        Ok(())
+    }
+}
+
+fn validate_shm_extent(fd: std::os::fd::RawFd, len: usize) -> std::io::Result<()> {
+    if len == 0 || len > MAX_WAYLAND_SHM_POOL_BYTES {
+        return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+    }
+    read_shm_snapshot(fd, len - 1, 1).map(|_| ())
+}
+
+/// Never form a reference into client-backed pages. RustOS supports pread for
+/// both local memfds (locked read_at + bounce copy) and remote VFS files.
+/// Concurrent writes need not be frame-atomic, but successful bytes belong to
+/// the compositor and remain safe after truncation, close, or object destroy.
+pub(super) fn read_shm_snapshot(
+    fd: std::os::fd::RawFd,
+    offset: usize,
+    len: usize,
+) -> std::io::Result<Vec<u8>> {
+    if offset
+        .checked_add(len)
+        .is_none_or(|end| end > MAX_WAYLAND_SHM_POOL_BYTES)
+    {
+        return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+    }
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(len)
+        .map_err(|_| std::io::Error::from_raw_os_error(libc::ENOMEM))?;
+    bytes.resize(len, 0);
+    let mut copied = 0;
+    while copied < len {
+        let count = unsafe {
+            libc::pread(
+                fd,
+                bytes[copied..].as_mut_ptr().cast(),
+                len - copied,
+                (offset + copied) as libc::off_t,
+            )
+        };
+        if count < 0 {
+            let err = std::io::Error::last_os_error();
+            if err.kind() == ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        if count == 0 {
+            return Err(std::io::Error::from(ErrorKind::UnexpectedEof));
+        }
+        copied += count as usize;
+    }
+    Ok(bytes)
 }

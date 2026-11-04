@@ -35,8 +35,14 @@ impl TerminalLayout {
     }
 
     fn for_client_rect(bounds: Rect) -> Self {
-        let cell_width = font::terminal_cell_width();
-        let cell_height = font::terminal_line_height();
+        Self::with_cell_metrics(
+            bounds,
+            font::terminal_cell_width(),
+            font::terminal_line_height(),
+        )
+    }
+
+    fn with_cell_metrics(bounds: Rect, cell_width: usize, cell_height: usize) -> Self {
         let usable_width = bounds.width.saturating_sub(TERMINAL_PADDING_X * 2);
         let usable_height = bounds.height.saturating_sub(TERMINAL_PADDING_Y * 2);
 
@@ -109,7 +115,10 @@ impl TerminalState {
     }
 
     pub(crate) fn rebuild_from_bytes(&mut self, client_rect: Rect, focused: bool, bytes: &[u8]) {
-        let layout = TerminalLayout::for_client_rect(client_rect);
+        self.rebuild_with_layout(TerminalLayout::for_client_rect(client_rect), focused, bytes);
+    }
+
+    fn rebuild_with_layout(&mut self, layout: TerminalLayout, focused: bool, bytes: &[u8]) {
         let layout_unchanged = self.initialized && self.layout == layout;
         // Incremental fast path: layout is unchanged and the new byte stream
         // extends what we previously parsed. The shell's output cache is
@@ -432,4 +441,41 @@ fn terminal_foreground() -> u32 {
 
 fn terminal_cursor_color() -> u32 {
     0x00d8_e3f1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn promoted_terminal_metrics_reflow_cached_output_without_new_bytes() {
+        let bounds = Rect {
+            x: 0,
+            y: 0,
+            width: 160,
+            height: 100,
+        };
+        let mut terminal = TerminalState::new();
+        let bytes = b"abcdefghijklmnop";
+        let initial = TerminalLayout::for_client_rect(bounds);
+        terminal.rebuild_with_layout(initial, true, bytes);
+        let larger = TerminalLayout::with_cell_metrics(
+            bounds,
+            initial.cell_width * 2,
+            initial.cell_height * 2,
+        );
+        assert!(larger.cols < initial.cols && larger.rows < initial.rows);
+        terminal.rebuild_with_layout(larger, true, bytes);
+        let mut fresh = TerminalState::new();
+        fresh.rebuild_with_layout(larger, true, bytes);
+        assert_eq!(
+            terminal.cells, fresh.cells,
+            "reflow must replay the full output cache"
+        );
+        assert_eq!(
+            (terminal.cursor_col, terminal.cursor_row),
+            (fresh.cursor_col, fresh.cursor_row)
+        );
+        assert_eq!(terminal.parsed_byte_count, bytes.len());
+    }
 }

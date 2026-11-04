@@ -1,19 +1,16 @@
-//! The user interface's runtime assets: the parsed configuration and the glyph
-//! atlases rasterized from the font files it names.
-//!
-//! Loading happens once, at startup, from the file named by `RUSTOS_UI_CONFIG`,
-//! or from where the `ui-assets` data package installs it when that is unset.
-//! A missing or invalid asset set never takes the desktop down: the server runs
-//! without text and says why in its boot log, which beats a service that exits
-//! because a font did not parse.
+//! UI assets start with build-time bundled atlases and the bundled clock offset.
+//! Configured assets load off the UI thread; the main loop explicitly promotes
+//! them between frames. Failed or unavailable overrides retain usable text.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use crate::font::{build_atlas, GlyphAtlas};
+use crate::app::{ConsoleWindow, DesktopSurfaceCache};
+use crate::glyph_atlas::{build_atlas, GlyphAtlas};
 use crate::sys::{spawn_ui_thread, UiThreadRole};
 use crate::ui_config::{self, FontRole, MAX_CONFIG_BYTES, MAX_FONT_FILE_BYTES};
 
@@ -44,11 +41,68 @@ impl LoadError {
 
 /// What the loader thread reports to the main loop.
 pub(crate) enum AssetLoad {
-    Ready(String),
+    Ready(UiAssets),
     Failed(String),
 }
 
-static ASSETS: OnceLock<UiAssets> = OnceLock::new();
+struct AssetStore {
+    configured: OnceLock<UiAssets>,
+    revision: AtomicU64,
+}
+
+impl AssetStore {
+    const fn new() -> Self {
+        Self {
+            configured: OnceLock::new(),
+            revision: AtomicU64::new(1),
+        }
+    }
+
+    fn assets(&self) -> &UiAssets {
+        self.configured.get().unwrap_or_else(|| bundled_assets())
+    }
+
+    // Only the UI thread promotes, before any drawing in that loop iteration.
+    // No renderer can see new geometry with old retained cache revisions.
+    fn promote(
+        &self,
+        loaded: UiAssets,
+        desktop: &mut DesktopSurfaceCache,
+        consoles: &mut [ConsoleWindow],
+    ) -> bool {
+        if self.configured.set(loaded).is_err() {
+            return false;
+        }
+        desktop.invalidate_chrome();
+        desktop.clock_checked = None;
+        for window in consoles {
+            window.terminal_dirty = true;
+            window.invalidate_surface();
+        }
+        self.revision.store(2, Ordering::Release);
+        true
+    }
+}
+
+static ASSETS: AssetStore = AssetStore::new();
+static BUNDLED: OnceLock<UiAssets> = OnceLock::new();
+include!(concat!(env!("OUT_DIR"), "/ui_bundled_atlases.rs"));
+
+pub(crate) fn bundled_assets() -> &'static UiAssets {
+    BUNDLED.get_or_init(make_bundled_assets)
+}
+
+pub(crate) fn asset_revision() -> u64 {
+    ASSETS.revision.load(Ordering::Acquire)
+}
+
+pub(crate) fn promote(
+    loaded: UiAssets,
+    desktop: &mut DesktopSurfaceCache,
+    consoles: &mut [ConsoleWindow],
+) -> bool {
+    ASSETS.promote(loaded, desktop, consoles)
+}
 
 /// Wait between attempts while the boot volume is not readable yet.
 const RETRY_INTERVAL: Duration = Duration::from_millis(250);
@@ -56,24 +110,13 @@ const RETRY_INTERVAL: Duration = Duration::from_millis(250);
 /// permanently missing volume keeps a thread polling.
 const RETRY_BUDGET: Duration = Duration::from_secs(60);
 
-/// The loaded assets, or `None` until the loader has installed them. Text is
-/// simply not drawn in the meantime.
-pub(crate) fn assets() -> Option<&'static UiAssets> {
-    #[cfg(test)]
-    {
-        Some(ASSETS.get_or_init(|| {
-            UiAssets::load(&repo_bundle_config()).expect("the shipped UI bundle loads")
-        }))
-    }
-    #[cfg(not(test))]
-    {
-        ASSETS.get()
-    }
+/// The active set; bundled geometry and pixels are available without storage.
+pub(crate) fn assets() -> &'static UiAssets {
+    ASSETS.assets()
 }
 
-/// The configured UTC offset, or UTC until the assets are loaded.
 pub(crate) fn clock_utc_offset_minutes() -> i32 {
-    assets().map_or(0, UiAssets::clock_utc_offset_minutes)
+    assets().clock_utc_offset_minutes()
 }
 
 /// Where the `ui-assets` data package installs its configuration. runtimed
@@ -92,8 +135,8 @@ pub(crate) fn repo_bundle_config() -> PathBuf {
 }
 
 /// Load the assets on a background thread, retrying while the boot volume is
-/// not readable yet, and install them for [`assets`]. The result arrives on the
-/// returned channel so the main loop can repaint what was drawn without text.
+/// not readable yet. The channel transfers ownership to the UI loop; the
+/// loader never publishes fonts in the middle of rendering a frame.
 pub(crate) fn start_asset_loader() -> Receiver<AssetLoad> {
     let (sender, receiver) = mpsc::channel();
     let spawned = spawn_ui_thread(
@@ -118,25 +161,19 @@ pub(crate) fn start_asset_loader() -> Receiver<AssetLoad> {
             let report = match outcome {
                 Ok(loaded) => {
                     let summary = format!("{} elapsed_ms={elapsed_ms}", loaded.summary());
-                    // Only this thread installs, and only once.
-                    let _ = ASSETS.set(loaded);
-                    AssetLoad::Ready(summary)
+                    crate::sys::diag_line(format!("uiserver: ui assets loaded {summary}"));
+                    AssetLoad::Ready(loaded)
                 }
                 Err(message) => AssetLoad::Failed(format!(
-                    "unavailable, text is not drawn: {message} elapsed_ms={elapsed_ms}"
+                    "unavailable, keeping bundled text: {message} elapsed_ms={elapsed_ms}"
                 )),
             };
-            // Report from this thread too: the main loop prints the same line when
-            // it picks the result up, but may be busy or gone by then.
-            if let AssetLoad::Ready(summary) = &report {
-                crate::sys::diag_line(format!("uiserver: ui assets loaded {summary}"));
-            }
             let _ = sender.send(report);
         },
     );
     if spawned.is_err() {
         // The thread could not start; with no sender left the channel just
-        // stays empty and the server runs without text.
+        // disconnects and the server retains bundled typography.
         crate::sys::diag_line("uiserver: ui asset loader thread failed to start");
     }
     receiver
@@ -232,13 +269,116 @@ mod tests {
 
     #[test]
     fn the_shipped_bundle_loads_every_role() {
-        let assets = assets().expect("shipped bundle loads");
+        let assets = bundled_assets();
         for role in FontRole::ALL {
             assert!(assets.atlas(role).is_some(), "{role:?} has no atlas");
         }
         assert!(assets.atlas(FontRole::Terminal).unwrap().monospace);
         assert!(!assets.atlas(FontRole::UiMedium).unwrap().monospace);
-        assert!(assets.summary().contains("fonts=4"));
+        assert_eq!(assets.summary(), "bundled build-time atlases");
+    }
+
+    #[test]
+    fn build_time_and_runtime_atlases_have_identical_geometry_and_pixels() {
+        let runtime = UiAssets::load(&repo_bundle_config()).expect("shipped runtime bundle");
+        let bundled = bundled_assets();
+        assert_eq!(
+            bundled.clock_utc_offset_minutes(),
+            runtime.clock_utc_offset_minutes()
+        );
+        for role in FontRole::ALL {
+            let a = bundled.atlas(role).unwrap();
+            let b = runtime.atlas(role).unwrap();
+            assert_eq!(a.glyphs, b.glyphs, "{role:?} geometry");
+            assert_eq!(a.alpha, b.alpha, "{role:?} pixels");
+            assert_eq!(
+                (a.line_height, a.cell_width, a.monospace),
+                (b.line_height, b.cell_width, b.monospace)
+            );
+            assert!(matches!(a.alpha, std::borrow::Cow::Borrowed(_)));
+            assert!(matches!(a.glyphs, std::borrow::Cow::Borrowed(_)));
+        }
+    }
+
+    #[test]
+    fn only_ui_loop_promotion_changes_revision_and_invalidates_caches_once() {
+        let store = AssetStore::new();
+        let mut desktop = DesktopSurfaceCache {
+            background_valid: true,
+            chrome_valid: true,
+            clock_checked: Some(Instant::now()),
+            ..DesktopSurfaceCache::default()
+        };
+        let mut windows = [ConsoleWindow::new(
+            7,
+            "Shell".into(),
+            crate::canvas::Rect {
+                x: 10,
+                y: 10,
+                width: 200,
+                height: 100,
+            },
+            0,
+        )];
+        windows[0].surface_cache.valid = true;
+        windows[0].terminal_dirty = false;
+        let mut loaded = make_bundled_assets();
+        loaded.clock_utc_offset_minutes = -300;
+        // Loader completion/queued assets are not publication.
+        assert_eq!(store.revision.load(Ordering::Acquire), 1);
+        assert_eq!(
+            store.assets().clock_utc_offset_minutes(),
+            bundled_assets().clock_utc_offset_minutes()
+        );
+        assert!(desktop.chrome_valid && windows[0].surface_cache.valid);
+        assert!(store.promote(loaded, &mut desktop, &mut windows));
+        assert_eq!(store.revision.load(Ordering::Acquire), 2);
+        assert_eq!(store.assets().clock_utc_offset_minutes(), -300);
+        assert!(!desktop.chrome_valid);
+        assert!(
+            desktop.background_valid,
+            "font changes do not discard wallpaper"
+        );
+        assert!(desktop.clock_checked.is_none());
+        assert!(!windows[0].surface_cache.valid);
+        assert!(windows[0].terminal_dirty);
+        desktop.chrome_valid = true;
+        windows[0].surface_cache.valid = true;
+        windows[0].terminal_dirty = false;
+        assert!(!store.promote(make_bundled_assets(), &mut desktop, &mut windows));
+        assert_eq!(store.revision.load(Ordering::Acquire), 2);
+        assert!(desktop.chrome_valid && windows[0].surface_cache.valid);
+        assert!(!windows[0].terminal_dirty);
+    }
+
+    #[test]
+    fn custom_fonts_and_timezone_are_preserved_at_explicit_handoff() {
+        let bytes = std::fs::read(
+            repo_bundle_config()
+                .parent()
+                .unwrap()
+                .join("fonts/MapleMono-Regular.ttf"),
+        )
+        .unwrap();
+        let dir = scratch_bundle("custom-font", "[clock]\nutc_offset_minutes = -300\n[font.terminal]\nfile = bad.ttf\nsize = 24\nline_height = 30\nmonospace = true\n", &bytes);
+        let loaded =
+            UiAssets::load(&dir.join("ui.conf")).unwrap_or_else(|error| panic!("{error:?}"));
+        std::fs::remove_dir_all(dir).unwrap();
+        let bundled = bundled_assets().atlas(FontRole::Terminal).unwrap();
+        let custom = loaded.atlas(FontRole::Terminal).unwrap();
+        assert!(custom.cell_width > bundled.cell_width);
+        assert_eq!(custom.line_height, 30);
+        let store = AssetStore::new();
+        assert!(store.promote(loaded, &mut DesktopSurfaceCache::default(), &mut []));
+        assert_eq!(store.assets().clock_utc_offset_minutes(), -300);
+        assert_eq!(
+            store
+                .assets()
+                .atlas(FontRole::Terminal)
+                .unwrap()
+                .line_height,
+            30
+        );
     }
 
     #[test]

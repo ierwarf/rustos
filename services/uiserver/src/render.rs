@@ -11,7 +11,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use crate::app::{AppState, ConsoleWindow, CursorMotion, DesktopSurfaceCache};
+use crate::app::{AppState, ConsoleWindow, CursorMotion, DesktopSurfaceCache, WindowId};
 use crate::canvas::{
     render_cursor_bgra, Rect, SurfaceCanvas, CURSOR_TEXTURE_SIZE, CURSOR_VISUAL_RADIUS,
 };
@@ -32,6 +32,7 @@ use crate::wayland::WaylandWindowSnapshot;
 mod background;
 mod chrome;
 mod colors;
+mod fragments;
 mod glass;
 mod icons;
 
@@ -124,6 +125,7 @@ pub(crate) fn render_frame(state: &mut AppState) {
     let width = state.surface.width;
     let height = state.surface.height;
     let stride_pixels = state.surface.stride_bytes as usize / 4;
+    let order = state.window_draw_order();
     let pixels = state.frame.pixels_mut();
     let mut canvas = SurfaceCanvas::new(pixels, width, height, stride_pixels);
 
@@ -139,10 +141,12 @@ pub(crate) fn render_frame(state: &mut AppState) {
         &state.desktop_cache,
         &mut state.console_windows,
         &state.wayland_windows,
+        &order,
     );
 }
 
 pub(crate) struct GpuAtlasScene {
+    pub(crate) cropped: bool,
     pub(crate) layers: Vec<GpuSceneLayer>,
     pub(crate) cursor_source_rect: Rect,
     pub(crate) wayland_bindings: Vec<WaylandAtlasBinding>,
@@ -181,18 +185,79 @@ pub(crate) fn build_gpu_atlas_scene(
     atlas_height: usize,
     atlas_stride_pixels: usize,
     atlas: GpuTextureCapability,
+    reuse_cropped_layout: bool,
 ) -> Result<GpuAtlasScene, GpuSceneError> {
+    validate_gpu_atlas_geometry(atlas, atlas_width, atlas_height, atlas_stride_pixels)?;
+    refresh_desktop_surface(state);
+    if !state.desktop_cache.fully_valid() {
+        return Err(GpuSceneError::SceneNotReady);
+    }
+    if reuse_cropped_layout {
+        return fragments::build_cropped_gpu_atlas_scene(
+            state,
+            atlas_pixels,
+            atlas_width,
+            atlas_height,
+            atlas_stride_pixels,
+            atlas,
+        );
+    }
+    match build_full_gpu_atlas_scene(
+        state,
+        atlas_pixels,
+        atlas_width,
+        atlas_height,
+        atlas_stride_pixels,
+        atlas,
+    ) {
+        Err(error) if degrades_to_cropped_scene(error) => {
+            atlas_pixels.fill(0);
+            fragments::build_cropped_gpu_atlas_scene(
+                state,
+                atlas_pixels,
+                atlas_width,
+                atlas_height,
+                atlas_stride_pixels,
+                atlas,
+            )
+        }
+        result => result,
+    }
+}
+
+/// A full-window scene that does not fit the atlas or command budget is
+/// retried as occlusion-aware cropped fragments; any other failure is a real
+/// scene error and must reach the caller unchanged.
+fn degrades_to_cropped_scene(error: GpuSceneError) -> bool {
+    matches!(
+        error,
+        GpuSceneError::AtlasFull | GpuSceneError::CommandLimit
+    )
+}
+
+fn validate_gpu_atlas_geometry(
+    atlas: GpuTextureCapability,
+    atlas_width: usize,
+    atlas_height: usize,
+    atlas_stride_pixels: usize,
+) -> Result<(), GpuSceneError> {
     if usize::try_from(atlas.width).ok() != Some(atlas_width)
         || usize::try_from(atlas.height).ok() != Some(atlas_height)
         || usize::try_from(atlas.stride_bytes).ok() != atlas_stride_pixels.checked_mul(4)
     {
         return Err(GpuSceneError::InvalidLayer);
     }
-    refresh_desktop_surface(state);
-    if !state.desktop_cache.fully_valid() {
-        return Err(GpuSceneError::SceneNotReady);
-    }
+    Ok(())
+}
 
+fn build_full_gpu_atlas_scene(
+    state: &mut AppState,
+    atlas_pixels: &mut [u32],
+    atlas_width: usize,
+    atlas_height: usize,
+    atlas_stride_pixels: usize,
+    atlas: GpuTextureCapability,
+) -> Result<GpuAtlasScene, GpuSceneError> {
     let mut packer =
         GpuAtlasPacker::new(atlas_pixels, atlas_width, atlas_height, atlas_stride_pixels)?;
     let mut layers = Vec::new();
@@ -215,10 +280,9 @@ pub(crate) fn build_gpu_atlas_scene(
         false,
     )?;
 
-    // The dock and cursor are essential and small, so they are placed before
-    // any window: windows can be multiplied by clients and by the user, and
-    // must only ever crowd one another out, never the dock or the cursor. The
-    // dock's layers are appended last so the dock still draws on top.
+    // Reserve small persistent textures before windows. If the complete scene
+    // cannot fit, retry with occlusion fragments instead of omitting a window.
+    // Dock commands remain last, independent of atlas placement order.
     let mut dock_layers = Vec::new();
     push_dock_gpu_layer(&mut packer, &mut dock_layers, atlas, state)?;
     let mut cursor = vec![0_u32; CURSOR_TEXTURE_SIZE * CURSOR_TEXTURE_SIZE];
@@ -232,51 +296,35 @@ pub(crate) fn build_gpu_atlas_scene(
         CURSOR_TEXTURE_SIZE,
     )?;
 
-    // Windows are packed in reverse draw order - the focused window first,
-    // then the topmost - but appended in draw order, so a full atlas costs the
-    // window furthest down the stack its texture and never the one the user is
-    // working in.
+    // Packing order does not affect draw order. Every nonempty window must
+    // fit; capacity pressure rejects this candidate as a whole.
     let plan = gpu_window_draw_plan(
         &state.wayland_windows,
         &state.console_windows,
         state.focused_wayland_surface_id,
         state.focused_session_handle,
+        &state.window_draw_order(),
     );
     let mut placed: Vec<Option<PlacedWindowLayer>> = plan.iter().map(|_| None).collect();
-    let mut dropped = Vec::new();
+    if plan.len() + layers.len() + dock_layers.len() + 2
+        > driver_domain_protocol::DVM_GPU_RENDER_MAX_COMMANDS as usize
+    {
+        return Err(GpuSceneError::CommandLimit);
+    }
     for (plan_index, planned) in plan.iter().enumerate().rev() {
         let mut scratch = Vec::with_capacity(1);
-        let (source_rect, nothing_to_draw, label) = match *planned {
+        let source_rect = match *planned {
             PlannedWindow::Wayland { index, focused } => {
-                let window = &state.wayland_windows[index];
-                let source_rect =
-                    push_wayland_gpu_layer(&mut packer, &mut scratch, atlas, window, focused)?;
-                (
-                    source_rect,
-                    wayland_window_outer_rect(window).is_empty(),
-                    format!("wayland:{}", window.surface_id),
-                )
+                push_wayland_gpu_layer(&mut packer, &mut scratch, atlas, &state.wayland_windows[index], focused)?
             }
             PlannedWindow::Console { index, focused } => {
-                let window = &mut state.console_windows[index];
-                let source_rect =
-                    push_console_gpu_layer(&mut packer, &mut scratch, atlas, window, focused)?;
-                (
-                    source_rect,
-                    !window.surface_cache.valid,
-                    format!("console:{}", window.session_handle),
-                )
+                push_console_gpu_layer(&mut packer, &mut scratch, atlas, &mut state.console_windows[index], focused)?
             }
         };
-        match (source_rect, scratch.pop()) {
-            (Some(source_rect), Some(layer)) => {
-                placed[plan_index] = Some(PlacedWindowLayer { layer, source_rect });
-            }
-            _ if !nothing_to_draw => dropped.push(label),
-            _ => {}
+        if let (Some(source_rect), Some(layer)) = (source_rect, scratch.pop()) {
+            placed[plan_index] = Some(PlacedWindowLayer { layer, source_rect });
         }
     }
-    note_gpu_atlas_capacity_loss(&dropped, atlas_width, atlas_height);
     for (planned, placed) in plan.iter().zip(placed) {
         let Some(PlacedWindowLayer { layer, source_rect }) = placed else {
             continue;
@@ -308,6 +356,7 @@ pub(crate) fn build_gpu_atlas_scene(
     }
     layers.extend(dock_layers);
     Ok(GpuAtlasScene {
+        cropped: false,
         layers,
         cursor_source_rect,
         wayland_bindings,
@@ -317,7 +366,7 @@ pub(crate) fn build_gpu_atlas_scene(
 
 /// One window of the GPU scene, in the order it is drawn.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PlannedWindow {
+pub(crate) enum PlannedWindow {
     Wayland { index: usize, focused: bool },
     Console { index: usize, focused: bool },
 }
@@ -327,82 +376,33 @@ struct PlacedWindowLayer {
     source_rect: Rect,
 }
 
-/// Visible windows in draw order: unfocused Wayland, unfocused consoles, then
-/// the focused window on top. This is the order the CPU path paints and the
-/// order input hit-testing assumes.
-fn gpu_window_draw_plan(
+/// Shared CPU/GPU draw plan: exact unified identity order, back to front.
+pub(crate) fn gpu_window_draw_plan(
     wayland_windows: &[WaylandWindowSnapshot],
     console_windows: &[ConsoleWindow],
     focused_wayland: Option<u32>,
     focused_session: ConsoleSessionHandle,
+    order: &[WindowId],
 ) -> Vec<PlannedWindow> {
-    let mut plan = Vec::new();
-    for (index, window) in wayland_windows.iter().enumerate() {
-        if !window.minimized && Some(window.surface_id) != focused_wayland {
-            plan.push(PlannedWindow::Wayland {
-                index,
-                focused: false,
-            });
-        }
-    }
-    for (index, window) in console_windows.iter().enumerate() {
-        if !window.minimized && window.session_handle != focused_session {
-            plan.push(PlannedWindow::Console {
-                index,
-                focused: false,
-            });
-        }
-    }
-    if let Some(surface_id) = focused_wayland {
-        if let Some(index) = wayland_windows
-            .iter()
-            .position(|window| !window.minimized && window.surface_id == surface_id)
-        {
-            plan.push(PlannedWindow::Wayland {
-                index,
-                focused: true,
-            });
-        }
-    } else if focused_session != 0 {
-        if let Some(index) = console_windows
-            .iter()
-            .position(|window| !window.minimized && window.session_handle == focused_session)
-        {
-            plan.push(PlannedWindow::Console {
-                index,
-                focused: true,
-            });
-        }
-    }
-    plan
-}
-
-const MAX_ATLAS_CAPACITY_LOSS_LOGS: usize = 8;
-static ATLAS_CAPACITY_LOSS_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
-static ATLAS_CAPACITY_LOSS_LAST: AtomicUsize = AtomicUsize::new(0);
-
-/// Windows the atlas had no room for are absent from the scene; say so once per
-/// change in the dropped set (bounded), instead of leaving an invisible window
-/// with no evidence.
-fn note_gpu_atlas_capacity_loss(dropped: &[String], atlas_width: usize, atlas_height: usize) {
-    let signature = dropped
+    order
         .iter()
-        .flat_map(|label| label.bytes())
-        .fold(dropped.len(), |acc, byte| {
-            acc.wrapping_mul(131).wrapping_add(usize::from(byte))
-        });
-    if ATLAS_CAPACITY_LOSS_LAST.swap(signature, Ordering::AcqRel) == signature || dropped.is_empty()
-    {
-        return;
-    }
-    if ATLAS_CAPACITY_LOSS_LOG_COUNT.fetch_add(1, Ordering::Relaxed) < MAX_ATLAS_CAPACITY_LOSS_LOGS
-    {
-        diag_line(format!(
-            "uiserver: gpu atlas {atlas_width}x{atlas_height} full; {} window(s) not drawn: {}",
-            dropped.len(),
-            dropped.join(",")
-        ));
-    }
+        .filter_map(|id| match *id {
+            WindowId::Wayland(id) => wayland_windows
+                .iter()
+                .position(|w| w.surface_id == id && !w.minimized)
+                .map(|index| PlannedWindow::Wayland {
+                    index,
+                    focused: focused_wayland == Some(id),
+                }),
+            WindowId::Console(id) => console_windows
+                .iter()
+                .position(|w| w.session_handle == id && !w.minimized)
+                .map(|index| PlannedWindow::Console {
+                    index,
+                    focused: focused_wayland.is_none() && focused_session == id,
+                }),
+        })
+        .collect()
 }
 
 pub(crate) fn gpu_scene_reuse_signature(state: &AppState) -> u64 {
@@ -411,11 +411,26 @@ pub(crate) fn gpu_scene_reuse_signature(state: &AppState) -> u64 {
         signature ^= value;
         signature = signature.wrapping_mul(0x0000_0100_0000_01b3);
     };
+    // Configured-font promotion must rebuild both Wayland title rasters and
+    // console bindings, even when every window/content version is unchanged.
+    mix(crate::font::asset_revision());
     mix(u64::from(state.surface.width));
     mix(u64::from(state.surface.height));
     mix(state.desktop_cache.content_version);
     mix(state.focused_session_handle);
     mix(u64::from(state.focused_wayland_surface_id.unwrap_or(0)));
+    for id in state.window_draw_order() {
+        match id {
+            WindowId::Console(id) => {
+                mix(0);
+                mix(id);
+            }
+            WindowId::Wayland(id) => {
+                mix(1);
+                mix(u64::from(id));
+            }
+        }
+    }
     mix(state.console_windows.len() as u64);
     for window in &state.console_windows {
         mix(window.session_handle);
@@ -429,6 +444,8 @@ pub(crate) fn gpu_scene_reuse_signature(state: &AppState) -> u64 {
     mix(state.wayland_windows.len() as u64);
     for window in &state.wayland_windows {
         mix(u64::from(window.surface_id));
+        mix(window.width as u64);
+        mix(window.height as u64);
         mix(window.frame.width as u64);
         mix(window.frame.height as u64);
         mix(window.minimized as u64);
@@ -469,12 +486,7 @@ pub(crate) fn update_gpu_layer_destinations(
             wayland_windows.push(window);
         }
     }
-    // Bindings, not windows, are the authority on what this scene contains: a
-    // window the atlas had no room for is absent from both, and demanding equal
-    // lengths would force a full rebuild every frame while that held. Reuse
-    // already requires an unchanged `gpu_scene_reuse_signature`, which covers
-    // every window's identity, size and minimized state, so a binding that
-    // cannot find its window is a real mismatch and still fails closed.
+    // Bindings authenticate the exact retained uncropped texture commands.
     for binding in wayland_bindings {
         let Some(window) = wayland_windows
             .iter()
@@ -495,8 +507,6 @@ pub(crate) fn update_gpu_layer_destinations(
         }
     }
 
-    // Console bindings are authoritative for the same reason: a console window
-    // the atlas had no room for has no binding.
     let focused_session = state.focused_session_handle;
     let console_focus_active = focused_wayland.is_none() && focused_session != 0;
     for binding in console_bindings {
@@ -570,8 +580,6 @@ pub(crate) fn update_wayland_gpu_textures(
             windows.push(window);
         }
     }
-    // As in `update_gpu_layer_destinations`, a window the atlas could not fit
-    // has no binding and must not force a rebuild; the bindings drive.
     if bindings.iter().any(|binding| {
         windows
             .iter()
@@ -637,8 +645,6 @@ pub(crate) fn update_console_gpu_textures(
     let console_focus_active = state.focused_wayland_surface_id.is_none() && focused_session != 0;
     let mut damage = Vec::new();
 
-    // Bindings, not windows, drive the update: a console window the atlas had
-    // no room for has no binding and must not force a rebuild every frame.
     for binding in bindings.iter_mut() {
         let Some(window) = state
             .console_windows
@@ -926,6 +932,25 @@ fn push_dock_gpu_layer(
     atlas: GpuTextureCapability,
     state: &AppState,
 ) -> Result<(), GpuSceneError> {
+    let (destination, pixels) = render_dock_gpu_texture(state)?;
+    if destination.is_empty() {
+        return Ok(());
+    }
+    push_xrgb_gpu_layer(
+        packer,
+        layers,
+        atlas,
+        &pixels,
+        destination.width,
+        destination.height,
+        destination.width,
+        destination,
+        false,
+    )
+    .map(|_| ())
+}
+
+fn render_dock_gpu_texture(state: &AppState) -> Result<(Rect, Vec<u32>), GpuSceneError> {
     let destination =
         taskbar_dirty_rect(state.surface.width, state.surface.height).intersect(Rect {
             x: 0,
@@ -934,7 +959,7 @@ fn push_dock_gpu_layer(
             height: state.surface.height as usize,
         });
     if destination.is_empty() {
-        return Ok(());
+        return Ok((destination, Vec::new()));
     }
     let pixel_count = destination
         .width
@@ -1004,18 +1029,7 @@ fn push_dock_gpu_layer(
             );
         }
     }
-    push_xrgb_gpu_layer(
-        packer,
-        layers,
-        atlas,
-        pixels.as_slice(),
-        destination.width,
-        destination.height,
-        destination.width,
-        destination,
-        false,
-    )
-    .map(|_| ())
+    Ok((destination, pixels))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1091,7 +1105,7 @@ fn push_console_gpu_layer(
     if !window.surface_cache.valid {
         return Ok(None);
     }
-    match push_xrgb_gpu_layer(
+    let source_rect = push_xrgb_gpu_layer(
         packer,
         layers,
         atlas,
@@ -1101,18 +1115,10 @@ fn push_console_gpu_layer(
         window.surface_cache.width,
         window.frame,
         true,
-    ) {
-        Ok(source_rect) => {
-            let (atlas_pixels, stride) = packer.pixels_mut();
-            apply_atlas_window_alpha(atlas_pixels, stride, source_rect, focused)?;
-            Ok(Some(source_rect))
-        }
-        // As for Wayland windows, a full atlas is a capacity limit: opening
-        // one more shell must cost that shell its texture, not end the
-        // compositor and with it every other window.
-        Err(GpuSceneError::AtlasFull) => Ok(None),
-        Err(err) => Err(err),
-    }
+    )?;
+    let (atlas_pixels, stride) = packer.pixels_mut();
+    apply_atlas_window_alpha(atlas_pixels, stride, source_rect, focused)?;
+    Ok(Some(source_rect))
 }
 
 fn push_wayland_gpu_layer(
@@ -1126,17 +1132,9 @@ fn push_wayland_gpu_layer(
     if outer.is_empty() {
         return Ok(None);
     }
+    let source_rect = packer.reserve(outer.width, outer.height)?;
     let pixels = render_wayland_gpu_texture(window, focused)?;
-    let source_rect =
-        match packer.place_xrgb(pixels.as_slice(), outer.width, outer.height, outer.width) {
-            Ok(source_rect) => source_rect,
-            // A full atlas is a capacity limit, not a malformed scene. Clients
-            // choose how many surfaces exist and how large they are, so
-            // propagating this would let any client end the compositor - and
-            // every other client's session with it - by opening windows.
-            Err(GpuSceneError::AtlasFull) => return Ok(None),
-            Err(err) => return Err(err),
-        };
+    packer.write_xrgb_at(source_rect, &pixels, outer.width)?;
     let (atlas_pixels, stride) = packer.pixels_mut();
     apply_atlas_window_alpha(atlas_pixels, stride, source_rect, focused)?;
     layers.push(GpuSceneLayer {
@@ -1269,6 +1267,7 @@ pub(crate) fn render_rect(state: &mut AppState, rect: Rect) {
     let width = state.surface.width;
     let height = state.surface.height;
     let stride_pixels = state.surface.stride_bytes as usize / 4;
+    let order = state.window_draw_order();
     let pixels = state.frame.pixels_mut();
     let mut canvas = SurfaceCanvas::with_clip(pixels, width, height, stride_pixels, rect);
 
@@ -1284,6 +1283,7 @@ pub(crate) fn render_rect(state: &mut AppState, rect: Rect) {
         &state.desktop_cache,
         &mut state.console_windows,
         &state.wayland_windows,
+        &order,
     );
 }
 
@@ -1300,6 +1300,7 @@ fn render_scene(
     desktop_cache: &DesktopSurfaceCache,
     console_windows: &mut [ConsoleWindow],
     wayland_windows: &[WaylandWindowSnapshot],
+    order: &[WindowId],
 ) {
     let clip_rect = canvas.clip_rect();
     if desktop_cache.background_valid {
@@ -1317,53 +1318,29 @@ fn render_scene(
         diag_line("uiserver: desktop background not ready; skipping desktop blit");
     }
 
-    // Background wayland windows.
-    for window in wayland_windows {
-        if window.minimized || Some(window.surface_id) == focused_wayland_surface_id {
-            continue;
-        }
-        if !rect_intersects_clip(
-            clip_rect,
-            shadow_bounds(wayland_window_outer_rect(window), WINDOW_SHADOW_STEPS),
-        ) {
-            continue;
-        }
-        chrome::draw_wayland_window(canvas, window, false);
-    }
-
-    // Background console windows.
-    for window in console_windows.iter_mut() {
-        if window.minimized || window.session_handle == focused_session_handle {
-            continue;
-        }
-        if !rect_intersects_clip(clip_rect, shadow_bounds(window.frame, WINDOW_SHADOW_STEPS)) {
-            continue;
-        }
-        chrome::draw_console_window(canvas, window, false);
-    }
-
-    // Focused window painted last so it sits on top of everything else.
-    if let Some(surface_id) = focused_wayland_surface_id {
-        if let Some(window) = wayland_windows
-            .iter()
-            .find(|window| !window.minimized && window.surface_id == surface_id)
-        {
-            if rect_intersects_clip(
-                clip_rect,
-                shadow_bounds(wayland_window_outer_rect(window), WINDOW_SHADOW_STEPS),
-            ) {
-                chrome::draw_wayland_window(canvas, window, true);
+    for planned in gpu_window_draw_plan(
+        wayland_windows,
+        console_windows,
+        focused_wayland_surface_id,
+        focused_session_handle,
+        order,
+    ) {
+        match planned {
+            PlannedWindow::Wayland { index, focused } => {
+                let window = &wayland_windows[index];
+                if rect_intersects_clip(
+                    clip_rect,
+                    shadow_bounds(wayland_window_outer_rect(window), WINDOW_SHADOW_STEPS),
+                ) {
+                    chrome::draw_wayland_window(canvas, window, focused);
+                }
             }
-        }
-    }
-
-    if focused_wayland_surface_id.is_none() && focused_session_handle != 0 {
-        if let Some(window) = console_windows
-            .iter_mut()
-            .find(|window| !window.minimized && window.session_handle == focused_session_handle)
-        {
-            if rect_intersects_clip(clip_rect, shadow_bounds(window.frame, WINDOW_SHADOW_STEPS)) {
-                chrome::draw_console_window(canvas, window, true);
+            PlannedWindow::Console { index, focused } => {
+                let window = &mut console_windows[index];
+                if rect_intersects_clip(clip_rect, shadow_bounds(window.frame, WINDOW_SHADOW_STEPS))
+                {
+                    chrome::draw_console_window(canvas, window, focused);
+                }
             }
         }
     }

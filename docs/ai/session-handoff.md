@@ -1,5 +1,32 @@
 # Session Handoff — repository snapshot, 2026-10-31
 
+## UI/network follow-up integrated (2026-11-05)
+
+Base `18b356ed`. Integrated from four parallel lanes: occlusion-aware atlas
+fragments (`render/fragments.rs`), netd accounting pool + reply-bound v2 socket
+publication (kernel transfer registry, NetPolicy release, accept4 flags never
+inherited from the listener), unified console/Wayland stacking
+(`app/stacking.rs`) with truncation-safe shm snapshots, and build-time/bootstrap
+font + glyph assets.
+
+Verified on the combined tree: `cargo xtask check`; unit tests for netd,
+user-abi, kernel-ps, kernel-compat, xtask and uiserver; `formal/verify-all.sh
+--profile pr` sealed (implementation mutations 1730 rows, registry now sorted);
+KVM `kvm-smoke` with GUI DVM + network + Google ping: 1-vCPU sequential 6/6,
+1-vCPU parallel pinned (4 instances x 3, `--no-build`) 12/12, 16-vCPU 1/1.
+
+Fixes made while integrating: module contracts, SAFETY and Kani cover
+witnesses for the new code, uiserver raw `thread::spawn` in a test replaced by
+`std::thread::scope`, and the stale atlas mutation retargeted to
+`degrades_to_cropped_scene` (the cropped fallback itself is covered only by the
+fragment unit tests, because `AppState` cannot be built without real fds).
+
+Unverified: the ring0 broker / transfer-registry / v2 ABI changes got a partial
+read review plus tests, not a full independent audit; no fresh DVM window
+capture was taken for the new stacking and fragments; `display-provider` still
+misses its 2.5 s advisory deadline (2.6-2.9 s); `linux.rs` is 625 lines against
+a 600 budget (warning only).
+
 ## uiserver / netd / DVM hardening via subagents 2026-11-05 (uncommitted)
 
 Verified on the combined tree: `cargo xtask check`, unit tests (uiserver 158,

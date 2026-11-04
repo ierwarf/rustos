@@ -49,9 +49,8 @@ use crate::layout::{
     WINDOW_BORDER, WINDOW_TITLE_HEIGHT,
 };
 use crate::sys::{
-    diag_line, map_shared_fd_readable, spawn_ui_thread, ui_profile_enabled, InputEvent,
-    SharedFdMapping, UiThreadRole, INPUT_ACTION_PRESSED, INPUT_ACTION_RELEASED,
-    INPUT_ACTION_REPEATED, INPUT_KIND_KEYBOARD,
+    diag_line, spawn_ui_thread, ui_profile_enabled, InputEvent, UiThreadRole, INPUT_ACTION_PRESSED,
+    INPUT_ACTION_RELEASED, INPUT_ACTION_REPEATED, INPUT_KIND_KEYBOARD,
 };
 use crate::wayland_accept::{start_wayland_acceptor, WaylandAcceptor};
 
@@ -494,12 +493,38 @@ impl WaylandCompositor {
         self.state.clear_window_damage();
     }
 
+    /// UI policy resolves console occlusion and chrome before Wayland routing.
+    pub(crate) fn set_pointer_target(&mut self, surface_id: Option<u32>) {
+        self.state.pointer_target = surface_id;
+        if !self.state.pointer_button_down {
+            let hit = self
+                .state
+                .hit_test_pointer(self.state.pointer_x, self.state.pointer_y);
+            self.state.update_pointer_focus(hit);
+        }
+    }
+
     pub(crate) fn pointer_motion(&mut self, x: u32, y: u32) {
         self.state.pointer_motion(x, y);
     }
 
     pub(crate) fn pointer_button(&mut self, button: u32, pressed: bool) -> bool {
         self.state.pointer_button(button, pressed)
+    }
+
+    pub(crate) fn set_keyboard_target(&mut self, surface_id: Option<u32>) {
+        let focus = surface_id.and_then(|id| {
+            let shared = self.state.find_surface_by_id(id)?;
+            let surface = shared.lock().ok()?;
+            if surface.minimized || surface.width == 0 || surface.height == 0 {
+                return None;
+            }
+            Some(KeyboardFocus {
+                surface: surface.resource.clone()?,
+                client_id: surface.client_id.clone()?,
+            })
+        });
+        self.state.set_keyboard_focus(focus);
     }
 
     pub(crate) fn keyboard_input(&mut self, event: InputEvent) -> bool {
@@ -533,7 +558,6 @@ impl WaylandCompositor {
         self.state.clear_focus();
     }
 }
-
 
 /// Decode one validated Wayland shm row. RustOS' supported architecture is
 /// little-endian, so ARGB8888 bytes already have the native `u32` layout.
@@ -847,6 +871,7 @@ struct WaylandState {
     pointer_resources: Vec<PointerResource>,
     keyboard_resources: Vec<KeyboardResource>,
     pointer_focus: Option<PointerFocus>,
+    pointer_target: Option<u32>,
     keyboard_focus: Option<KeyboardFocus>,
     pointer_x: u32,
     pointer_y: u32,
@@ -863,7 +888,6 @@ struct WaylandState {
     buffer_copy_profile_micros: u64,
     buffer_copy_profile_max_micros: u64,
 }
-
 
 #[derive(Clone)]
 struct SurfaceData {
@@ -986,10 +1010,8 @@ struct ShmPoolData {
 }
 
 struct WaylandShmPoolState {
-    mapping: SharedFdMapping,
     len: usize,
-    /// Retained so `wl_shm_pool.resize` can grow the mapping; the protocol
-    /// lets a client enlarge a pool and clients (GTK, Chromium, Firefox) do.
+    /// Shared by buffers after pool destruction; never mapped into uiserver.
     fd: OwnedFd,
 }
 

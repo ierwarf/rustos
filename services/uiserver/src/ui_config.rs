@@ -3,9 +3,10 @@
 //!
 //! The configuration is a small INI-like text file shipped in the `ui-assets`
 //! data package next to the font files it names. Its location comes from the
-//! `RUSTOS_UI_CONFIG` environment variable, so nothing about fonts or the time
-//! zone is compiled into the server. Parsing is strict: an unknown section, an
-//! unknown key, a duplicate or an out-of-range value rejects the whole file
+//! `RUSTOS_UI_CONFIG` environment variable. The shipped configuration also
+//! supplies build-time bootstrap atlases and the initial clock offset. Parsing
+//! is strict: an unknown section, an unknown key, a duplicate or an out-of-range
+//! value rejects the whole file
 //! with the offending line number, because a silently ignored typo would show
 //! up as missing text.
 
@@ -44,7 +45,6 @@ pub(crate) enum FontRole {
 }
 
 impl FontRole {
-    #[cfg(test)]
     pub(crate) const ALL: [FontRole; 4] = [
         FontRole::UiLarge,
         FontRole::UiMedium,
@@ -222,6 +222,9 @@ pub(crate) fn parse(text: &str) -> Result<UiConfig, ConfigError> {
     for (role, font) in partial {
         let missing = |what: &str| error(0, format!("font {role:?} is missing `{what}`"));
         let size_px = font.size_px.ok_or_else(|| missing("size"))?;
+        if role == FontRole::Terminal && !font.monospace.unwrap_or(false) {
+            return Err(error(0, "font Terminal requires `monospace = true`"));
+        }
         fonts.insert(
             role,
             FontSpec {
@@ -421,6 +424,17 @@ charset = clock
             .unwrap_err()
             .to_string();
         assert!(err.contains("missing `size`"), "{err}");
+    }
+
+    #[test]
+    fn terminal_fonts_cannot_publish_a_zero_width_proportional_grid() {
+        for flag in ["", "monospace = false\n"] {
+            let text = format!("[font.terminal]\nfile = a.ttf\nsize = 16\n{flag}");
+            assert!(parse(&text)
+                .unwrap_err()
+                .to_string()
+                .contains("monospace = true"));
+        }
     }
 
     #[test]

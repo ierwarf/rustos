@@ -2,6 +2,9 @@ mod bootstrap;
 mod input;
 mod launch;
 mod runtime;
+mod stacking;
+
+pub(crate) use stacking::{window_hit_test, WindowId, WindowStack};
 
 pub(crate) use bootstrap::start_launcher_program_loader;
 pub(crate) use runtime::{
@@ -285,6 +288,7 @@ pub(crate) struct LauncherProgram {
 
 #[derive(Default)]
 pub(crate) struct WindowSurfaceCache {
+    pub(crate) font_asset_revision: u64,
     pub(crate) pixels: Vec<u32>,
     pub(crate) width: usize,
     pub(crate) height: usize,
@@ -484,6 +488,8 @@ pub(crate) struct AppState {
     pub(crate) desktop_cache: DesktopSurfaceCache,
     pub(crate) launcher_programs: Vec<LauncherProgram>,
     pub(crate) console_windows: Vec<ConsoleWindow>,
+    window_stack: WindowStack,
+    pending_wayland_placements: Vec<(u32, usize, usize)>,
     closing_console_sessions: Vec<ConsoleSessionHandle>,
     pub(crate) next_console_snapshot_index: usize,
     pub(crate) wayland_windows: Vec<WaylandWindowSnapshot>,
@@ -530,6 +536,7 @@ impl AppState {
         let before_dirty = self
             .wayland_stack_dirty_rect()
             .union(self.wayland_taskbar_dirty_rect());
+        self.plan_new_wayland_placements(&windows);
         let previous_windows = std::mem::take(&mut self.wayland_windows);
         let previous_dragging = self.dragging_window;
         let previous_focus = self.focused_wayland_surface_id;
@@ -568,6 +575,7 @@ impl AppState {
 
         if !order_unchanged {
             self.wayland_windows = windows;
+            self.reconcile_window_stack();
             return before_dirty
                 .union(self.wayland_stack_dirty_rect())
                 .union(self.wayland_taskbar_dirty_rect());
@@ -600,6 +608,7 @@ impl AppState {
         }
 
         self.wayland_windows = windows;
+        self.reconcile_window_stack();
         let focus_or_drag_changed = previous_dragging != self.dragging_window
             || previous_focus != self.focused_wayland_surface_id;
         let returned_dirty = if focus_or_drag_changed {

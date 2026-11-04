@@ -169,16 +169,47 @@ ring. Layout uses the terminal monospace atlas; chrome uses the UI atlas.
 
 ### Fonts and UI Config
 
-No font or time zone is compiled into `uiserver`. At startup it reads
-`/assets/ui/ui.conf` (shipped by the `ui-assets` data package from
-`assets/ui/bundle/`; `RUSTOS_UI_CONFIG` overrides the path for development
-because runtimed launches uiserver with a fixed environment), parses each TTF it names with `fontdue`
-and rasterizes one ASCII atlas per text role (`ui_large`, `ui_medium`,
-`clock`, `terminal`). Reads are bounded (64 KiB config, 4 MiB per
-font). `ui.conf` parsing is strict and reports the offending line. If the
-config or a font is missing or invalid, the server logs why and runs without
-text instead of exiting. The home screen clock is UTC plus
-`clock.utc_offset_minutes`; RustOS has no timezone database.
+`uiserver/build.rs` pre-rasterizes the licensed Inter and Maple Mono faces from
+`assets/ui/bundle/ui.conf` into immutable glyph metrics and alpha masks in
+`OUT_DIR`. The binary embeds these atlases for all four roles (`ui_large`,
+`ui_medium`, `clock`, `terminal`) and that configuration's UTC offset (currently
++540 minutes). The first desktop frame therefore has usable title, clock, date
+and terminal typography without filesystem access or target-side font parsing.
+The same `glyph_atlas.rs` rasterizer, strict config parser and bounded reads are
+used by the build and runtime loader; there is no separate fallback layout.
+Build invalidation tracks the config, named font files and shared sources.
+Font licenses remain with the packaged fonts (`fonts/Inter-OFL.txt` and
+`fonts/MapleMono-OFL.txt`).
+
+A background loader still reads `/assets/ui/ui.conf` from the `ui-assets` data
+package (`RUSTOS_UI_CONFIG` overrides its path for development), parsing each
+named face once with `fontdue`. Reads are bounded (64 KiB config, 4 MiB per
+font). Invalid config reports the offending line when available; terminal
+roles must declare `monospace = true` so no zero-width grid can be published.
+Unavailable storage is retried on the loader thread. Missing, invalid or
+unreadable overrides retain bundled text, never a blank desktop.
+
+Loader completion transfers an owned asset set to the UI loop rather than
+publishing mid-frame. Exactly one explicit promotion switches configured fonts
+and clock offset together between frames. Missing roles in a partial override
+use the bundled atlas. `font::asset_revision()` is nonzero from startup (1),
+advances on successful promotion (2), and is a required identity in every
+retained font-dependent cache, including console rasters and the GPU scene
+signature (Wayland titles and dock text included). Promotion invalidates desktop
+chrome and every console surface, marks terminal layout/output dirty, clears
+the clock poll timestamp and requests a full scene update. Changed terminal
+metrics replay the cached output at the new grid size; unchanged metrics keep
+the incremental parser state.
+
+The clock always reads real `SystemTime`, never elapsed boot time or a fabricated
+time string. It displays UTC plus the active `clock.utc_offset_minutes`; RustOS
+has no timezone database or automatic daylight-saving transitions. Before an
+override is ready, the build-time packaged offset is used; a different override
+offset takes effect atomically with its asset handoff. Tests cover initial
+production drawing/measurement with no loader, real clock/packaged offset,
+exact generated/runtime atlas pixel and geometry parity, one-shot promotion,
+custom-font preservation and terminal output reflow. Live first-desktop DVM
+readability and combined retained GPU invalidation remain integration gates.
 
 ### Profile Trace
 
@@ -316,16 +347,22 @@ console-hosted program (shell, PE demo)은 `runtimed`에서 console session
 
 ### Font와 UI 설정
 
-`uiserver`에는 font나 time zone이 컴파일되어 들어가지 않습니다. 시작 시
-`/assets/ui/ui.conf`(`ui-assets` data package가 `assets/ui/bundle/`에서 배포.
-runtimed가 uiserver를 고정 환경으로 실행하므로 개발용으로만 `RUSTOS_UI_CONFIG`가
-경로를 override)를 읽고, 거기 적힌 TTF를 `fontdue`로
-parsing해 text role(`ui_large`, `ui_medium`, `clock`, `terminal`)마다
-ASCII atlas를 만듭니다. 읽기는 상한이 있습니다(config 64 KiB, font당 4 MiB).
-`ui.conf` parsing은 엄격하며 잘못된 줄 번호를 보고합니다. config나 font가
-없거나 잘못되면 종료하지 않고 이유를 로그에 남긴 채 text 없이 동작합니다.
-home 화면 시계는 UTC에 `clock.utc_offset_minutes`를 더한 값이며 RustOS에는
-timezone database가 없습니다.
+`uiserver/build.rs`가 `assets/ui/bundle/ui.conf`의 Inter / Maple Mono font를
+미리 rasterize하고 네 role의 atlas와 UTC offset(현재 +540분)을 binary에
+포함합니다. 첫 desktop frame의 title, clock, date, terminal text는 filesystem
+접근이나 target-side font parsing 없이 표시됩니다. build와 runtime loader는
+같은 `glyph_atlas.rs` rasterizer, config parser, bounded read를 사용합니다.
+
+background loader는 `/assets/ui/ui.conf`(개발용 `RUSTOS_UI_CONFIG` override
+가능)와 font를 읽습니다. 실패하면 bundled text를 유지합니다. UI loop가
+frame 사이에서 한 번만 font와 clock offset을 함께 promote하며 desktop chrome,
+console surface와 terminal layout을 invalidate합니다. `font::asset_revision()`
+(bootstrap 1, promotion 2)은 console raster와 retained GPU scene의 cache identity에
+포함되어야 합니다. terminal metric이 달라지면 cached output을 새 grid에 replay합니다.
+
+clock은 처음부터 실제 `SystemTime`에 active `clock.utc_offset_minutes`를
+더합니다. override가 준비되기 전에는 packaged offset을 사용하며 임의의 시각을
+만들지 않습니다. timezone database나 자동 DST 전환은 없습니다.
 
 ### Profile Trace
 
@@ -335,3 +372,63 @@ flush 되며 slow refresh / slow present regression을 진단할 때 주된
 도구입니다. 새 diag print를 추가하기 전에 이 경로를 먼저 사용하세요.
 per-frame cursor/render pipeline sample도 profile-gated입니다. 일반 KVM
 실행은 coarse `uiserver: update tick` liveness line만 유지합니다.
+
+## Mixed window and hostile SHM ownership contract
+
+`uiserver::app::stacking` owns a single back-to-front `WindowId` order for
+console sessions and compositor-unique Wayland surface identities. Raising a
+window preserves every other window's relative order, including windows of the
+other protocol. Minimize retains an identity's place but removes it from paint
+and hit testing; destruction prunes it. Focus fallback selects the highest
+remaining visible mixed-stack identity, not a protocol-preferred list. CPU and
+GPU composition consume the same draw plan. The retained GPU scene signature
+includes the complete mixed order.
+
+Pointer routing resolves the top frame in that order first. Console frames and
+upper window chrome occlude lower Wayland client areas. Only a top Wayland
+client area becomes the protocol pointer target; the protocol owner must not
+independently rescan lower surfaces. A pressed Wayland button retains its
+original surface grab through release, including motion outside that surface.
+Keyboard routing follows the explicit UI focus, including focus changes caused
+by console refresh. Input targets must be refreshed after snapshot, placement,
+minimize, and geometry changes even if the physical pointer is stationary.
+
+Initial placement also crosses protocol boundaries. Console creation checks
+existing console and Wayland origins. Newly mapped Wayland snapshots recheck
+against the mixed desktop, because allocation can precede console publication.
+Placement tries distinct legal cascade origins and, if the old cascade wraps,
+other legal origins. Identical origins are allowed only when all legal origins
+are occupied (for example a tiny output admitting just one console position).
+Requested Wayland moves reserve their destination against later console
+creation. The UI retains acknowledged geometry until a matching owner snapshot
+retires the move; enqueue is not completion. Explicit user drag/maximize cancels
+a pending initial placement. A disappearing surface retires its pending move.
+
+Wayland SHM is **never mapped or borrowed as a slice** by uiserver. The pool owns
+a readable fd and a bounded logical extent (64 MiB); buffers share its ownership
+so pool destruction and client-fd close cannot invalidate a live attachment.
+Creation and growth probe the requested extent with positioned reads; invalid
+sizes, shrink, unreadable/undersized backing, and failed growth leave the old
+extent unchanged. These probes are admission checks, not a TOCTOU safety claim.
+Every actual copy uses exact `pread` into compositor-owned bytes. EOF and I/O
+failure reject a copy; an unreadable commit disconnects that client rather than
+pretending the old pixels were a successful new commit. Damage is staged before
+mutating retained pixels, so a short read cannot partially publish an update.
+Copied pixels remain valid after truncate, fd close, pool/buffer destruction,
+and disconnect. Same-layout commits declaring no damage can retain the existing
+owned pixels without touching client storage.
+
+This strategy uses RustOS's existing `SYS_PREAD64`: memfds use locked `read_at`
+and bounded bounce copies (`kernel/compat/src/user/syscall/linux/service_ops/local_memfd_io.rs`), while VFS uses
+bounded positioned read replies. No kernel change or file seals are required.
+Concurrent client writes/truncate/regrow may yield mixed-frame contents (clients
+must synchronize their buffers), but cannot invalidate compositor memory or
+cause compositor SIGBUS. Snapshot I/O belongs to the Wayland protocol worker,
+never to the UI rendering thread when that owner is isolated.
+
+Regression evidence is in `app::stacking` (mixed history, retirement and both
+placement orders), `render::tests` (identical paint/hit order and chrome
+occlusion), and `wayland::tests` (exact pointer target/grab, undersized/truncated
+backing, transactional damage, resize rollback/growth, shared-fd lifecycle and
+concurrent truncation). Guest GUI capture and end-to-end worker/atlas validation
+remain integration checks, not claims established by host unit tests.

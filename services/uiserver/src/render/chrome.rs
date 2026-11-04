@@ -299,8 +299,11 @@ pub(crate) fn rebuild_console_window_surface(window: &mut ConsoleWindow, focused
         height,
     };
     let client_rect = window_client_rect(outer);
-    let terminal_needs_rebuild =
-        window.terminal_dirty || window.terminal.needs_layout_rebuild(client_rect);
+    let font_asset_revision = font::asset_revision();
+    let font_assets_changed = window.surface_cache.font_asset_revision != font_asset_revision;
+    let terminal_needs_rebuild = font_assets_changed
+        || window.terminal_dirty
+        || window.terminal.needs_layout_rebuild(client_rect);
 
     if window.surface_cache.valid
         && window.surface_cache.focused == focused
@@ -342,6 +345,7 @@ pub(crate) fn rebuild_console_window_surface(window: &mut ConsoleWindow, focused
     window.terminal.render(&mut canvas);
 
     window.surface_cache.focused = focused;
+    window.surface_cache.font_asset_revision = font_asset_revision;
     window.surface_cache.valid = true;
     window.surface_cache.content_version =
         window.surface_cache.content_version.wrapping_add(1).max(1);

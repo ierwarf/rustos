@@ -378,3 +378,45 @@ fn queued_frame_deadline_starts_at_predecessor_completion() {
     assert_eq!(completion_wait_origin(submitted_at, completed_at), completed_at);
     assert_eq!(completion_wait_origin(completed_at, submitted_at), completed_at);
 }
+
+#[test]
+fn repacked_fragment_damage_reconstructs_every_rotated_slot_pixel() {
+    // Moving an occluder can move cropped sources in atlas space, including
+    // clearing old regions. Both writes AND clears must reach an older slot.
+    let width = 16;
+    let height = 12;
+    let mut old = vec![0; width * height];
+    old[2 * width + 3..2 * width + 8].fill(0xff123456);
+    let mut intermediate = old.clone();
+    intermediate[2 * width + 3..2 * width + 8].fill(0);
+    intermediate[5 * width + 1..5 * width + 6].fill(0xff123456);
+    let mut desired = intermediate.clone();
+    desired[10 * width + 11] = 0xff654321;
+    let first = difference_bounds(&old, &intermediate, width, height, width).unwrap();
+    let second = difference_bounds(&intermediate, &desired, width, height, width).unwrap();
+    let history = VecDeque::from([AtlasDamageEpoch {
+        epoch: 2,
+        damage: vec![super::damage_from_rect(first)],
+    }]);
+    let requested = [super::damage_from_rect(second)];
+    let damage =
+        snapshot_damage_for_slot(1, 3, &requested, &history, width as u32, height as u32).unwrap();
+    assert_eq!(
+        damage.len(),
+        2,
+        "distant cursor damage must not inflate repack damage"
+    );
+    copy_atlas_damage_to_slot(
+        &mut old,
+        &desired,
+        width,
+        &damage,
+        width as u32,
+        height as u32,
+    )
+    .unwrap();
+    assert_eq!(
+        old, desired,
+        "cleared storage cannot reappear on slot rotation"
+    );
+}

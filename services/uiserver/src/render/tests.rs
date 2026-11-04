@@ -209,9 +209,9 @@ fn retained_gpu_window_move_updates_only_command_destination() {
 }
 
 #[test]
-fn a_window_the_atlas_cannot_fit_is_left_out_rather_than_ending_the_scene() {
-    // Clients choose how many surfaces exist and how large they are, so a
-    // full atlas must cost one window, never the compositor.
+fn a_window_that_cannot_fit_rejects_the_candidate_for_fragment_retry() {
+    // Capacity is handled at the complete-scene boundary, not by silently
+    // omitting this window.
     let mut pixels = vec![0_u32; 16 * 16];
     let mut packer = GpuAtlasPacker::new(pixels.as_mut_slice(), 16, 16, 16).expect("packer");
     let mut layers = Vec::new();
@@ -226,10 +226,8 @@ fn a_window_the_atlas_cannot_fit_is_left_out_rather_than_ending_the_scene() {
     };
 
     let window = snapshot(vec![0xff00_0000; 12], Rect::empty());
-    let placed = push_wayland_gpu_layer(&mut packer, &mut layers, atlas, &window, false)
-        .expect("a full atlas is a capacity limit, not a malformed scene");
-
-    assert!(placed.is_none());
+    let placed = push_wayland_gpu_layer(&mut packer, &mut layers, atlas, &window, false);
+    assert_eq!(placed, Err(super::GpuSceneError::AtlasFull));
     assert!(layers.is_empty());
 }
 
@@ -258,9 +256,8 @@ fn the_desktop_composite_starts_as_a_full_copy_of_the_wallpaper() {
 }
 
 #[test]
-fn a_console_window_the_atlas_cannot_fit_is_left_out_rather_than_ending_the_scene() {
-    // Opening one more shell must cost that shell its texture. Returning
-    // the error ended the compositor and froze every other window.
+fn a_console_that_cannot_fit_rejects_the_candidate_for_fragment_retry() {
+    // The caller must retry the complete scene with visible fragments.
     use crate::app::ConsoleWindow;
     let mut pixels = vec![0_u32; 16 * 16];
     let mut packer = GpuAtlasPacker::new(pixels.as_mut_slice(), 16, 16, 16).expect("packer");
@@ -282,10 +279,8 @@ fn a_console_window_the_atlas_cannot_fit_is_left_out_rather_than_ending_the_scen
     };
     let mut window = ConsoleWindow::new(7, String::from("Shell"), frame, 1);
 
-    let placed = push_console_gpu_layer(&mut packer, &mut layers, atlas, &mut window, false)
-        .expect("a full atlas is a capacity limit, not a malformed scene");
-
-    assert!(placed.is_none());
+    let placed = push_console_gpu_layer(&mut packer, &mut layers, atlas, &mut window, false);
+    assert_eq!(placed, Err(super::GpuSceneError::AtlasFull));
     assert!(layers.is_empty());
 }
 
@@ -484,40 +479,218 @@ fn plan_snapshot(surface_id: u32, minimized: bool) -> WaylandWindowSnapshot {
 fn gpu_draw_plan_paints_the_focused_window_last_and_packs_it_first() {
     use super::{gpu_window_draw_plan, PlannedWindow};
     use crate::app::ConsoleWindow;
-    let frame = Rect { x: 0, y: 0, width: 64, height: 64 };
+    use crate::app::WindowId::{Console, Wayland};
+    let frame = Rect {
+        x: 0,
+        y: 0,
+        width: 64,
+        height: 64,
+    };
     let consoles = [
         ConsoleWindow::new(1, String::from("a"), frame, 1),
         ConsoleWindow::new(2, String::from("b"), frame, 1),
     ];
-    let wayland = [plan_snapshot(10, false), plan_snapshot(11, true), plan_snapshot(12, false)];
+    let wayland = [
+        plan_snapshot(10, false),
+        plan_snapshot(11, true),
+        plan_snapshot(12, false),
+    ];
 
     // A Wayland window has focus: unfocused Wayland, then consoles, then it.
-    let plan = gpu_window_draw_plan(&wayland, &consoles, Some(12), 0);
+    let plan = gpu_window_draw_plan(
+        &wayland,
+        &consoles,
+        Some(12),
+        0,
+        &[
+            Wayland(10),
+            Console(1),
+            Console(2),
+            Wayland(11),
+            Wayland(12),
+        ],
+    );
     assert_eq!(
         plan,
         vec![
-            PlannedWindow::Wayland { index: 0, focused: false },
-            PlannedWindow::Console { index: 0, focused: false },
-            PlannedWindow::Console { index: 1, focused: false },
-            PlannedWindow::Wayland { index: 2, focused: true },
+            PlannedWindow::Wayland {
+                index: 0,
+                focused: false
+            },
+            PlannedWindow::Console {
+                index: 0,
+                focused: false
+            },
+            PlannedWindow::Console {
+                index: 1,
+                focused: false
+            },
+            PlannedWindow::Wayland {
+                index: 2,
+                focused: true
+            },
         ]
     );
-    // Packing runs the plan backwards, so the focused window claims atlas
-    // space before any window beneath it; a full atlas drops the bottom.
+    // Packing runs backwards; a capacity failure retries the complete scene
+    // as fragments rather than dropping a window.
     assert_eq!(
         plan.iter().rev().next(),
-        Some(&PlannedWindow::Wayland { index: 2, focused: true })
+        Some(&PlannedWindow::Wayland {
+            index: 2,
+            focused: true
+        })
     );
 
     // A console has focus and the focused Wayland id is gone: the console is
     // last, and a minimized or unknown focus never appears.
-    let plan = gpu_window_draw_plan(&wayland, &consoles, None, 2);
-    assert_eq!(plan.last(), Some(&PlannedWindow::Console { index: 1, focused: true }));
-    assert_eq!(plan.len(), 4, "two Wayland, two consoles; the minimized one is skipped");
-    let plan = gpu_window_draw_plan(&wayland, &consoles, Some(11), 1);
-    assert!(plan.iter().all(|window| !matches!(window, PlannedWindow::Wayland { index: 1, .. })));
-    assert!(plan.iter().all(|window| !matches!(
-        window,
-        PlannedWindow::Console { focused: true, .. }
-    )));
+    let plan = gpu_window_draw_plan(
+        &wayland,
+        &consoles,
+        None,
+        2,
+        &[Wayland(10), Console(1), Wayland(12), Console(2)],
+    );
+    assert_eq!(
+        plan.last(),
+        Some(&PlannedWindow::Console {
+            index: 1,
+            focused: true
+        })
+    );
+    assert_eq!(
+        plan.len(),
+        4,
+        "two Wayland, two consoles; the minimized one is skipped"
+    );
+    let plan = gpu_window_draw_plan(
+        &wayland,
+        &consoles,
+        Some(11),
+        1,
+        &[
+            Wayland(10),
+            Console(1),
+            Wayland(12),
+            Console(2),
+            Wayland(11),
+        ],
+    );
+    assert!(plan
+        .iter()
+        .all(|window| !matches!(window, PlannedWindow::Wayland { index: 1, .. })));
+    assert!(plan
+        .iter()
+        .all(|window| !matches!(window, PlannedWindow::Console { focused: true, .. })));
+}
+
+#[test]
+fn mixed_draw_order_and_pointer_hits_agree_when_console_occludes_wayland() {
+    use super::{gpu_window_draw_plan, PlannedWindow};
+    use crate::app::{
+        window_hit_test, ConsoleWindow,
+        WindowId::{Console, Wayland},
+    };
+    use crate::layout::WindowChromeHit;
+    let frame = Rect {
+        x: 10,
+        y: 10,
+        width: 320,
+        height: 240,
+    };
+    let mut consoles = [ConsoleWindow::new(1, "console".into(), frame, 1)];
+    let mut wayland = [plan_snapshot(1, false)];
+    wayland[0].frame = frame;
+    wayland[0].width = frame.width;
+    wayland[0].height = frame.height;
+    let order = [Wayland(1), Console(1)];
+    let hit = window_hit_test(&order, &consoles, &wayland, 100, 100);
+    assert_eq!(hit, Some((Console(1), WindowChromeHit::Client)));
+    let plan = gpu_window_draw_plan(&wayland, &consoles, None, 1, &order);
+    assert_eq!(
+        plan.last(),
+        Some(&PlannedWindow::Console {
+            index: 0,
+            focused: true
+        })
+    );
+    // Changing focus/order must expose exactly the window now painted last.
+    let raised = [Console(1), Wayland(1)];
+    assert_eq!(
+        window_hit_test(&raised, &consoles, &wayland, 100, 100),
+        Some((Wayland(1), WindowChromeHit::Client))
+    );
+    assert_eq!(
+        gpu_window_draw_plan(&wayland, &consoles, Some(1), 0, &raised).last(),
+        Some(&PlannedWindow::Wayland {
+            index: 0,
+            focused: true
+        })
+    );
+    // Minimize preserves identity position but neither paints nor captures hits.
+    consoles[0].minimized = true;
+    assert_eq!(
+        window_hit_test(&order, &consoles, &wayland, 100, 100),
+        Some((Wayland(1), WindowChromeHit::Client))
+    );
+    assert_eq!(
+        gpu_window_draw_plan(&wayland, &consoles, None, 0, &order).len(),
+        1
+    );
+}
+
+#[test]
+fn upper_wayland_chrome_occludes_lower_client_area() {
+    use crate::app::{window_hit_test, WindowId::Wayland};
+    use crate::layout::WindowChromeHit;
+    let mut lower = plan_snapshot(1, false);
+    lower.frame = Rect {
+        x: 10,
+        y: 10,
+        width: 320,
+        height: 240,
+    };
+    lower.width = 320;
+    lower.height = 240;
+    let mut upper = plan_snapshot(2, false);
+    upper.width = 320;
+    upper.height = 240;
+    upper.frame = Rect {
+        x: 20,
+        y: 100,
+        width: 320,
+        height: 240,
+    };
+    assert_eq!(
+        window_hit_test(&[Wayland(1), Wayland(2)], &[], &[lower, upper], 80, 110),
+        Some((Wayland(2), WindowChromeHit::TitleBar))
+    );
+}
+
+#[test]
+fn console_font_asset_revision_rebuilds_unchanged_title_and_terminal_raster() {
+    use crate::app::ConsoleWindow;
+    let frame = Rect {
+        x: 40,
+        y: 60,
+        width: 320,
+        height: 180,
+    };
+    let mut window = ConsoleWindow::new(7, String::from("Shell"), frame, 1);
+    window.output_cache.extend_from_slice(b"unchanged terminal");
+    super::chrome::rebuild_console_window_surface(&mut window, true);
+    let previous_version = window.surface_cache.content_version;
+    assert!(!window.terminal_dirty);
+    window.surface_cache.font_asset_revision = crate::font::asset_revision().wrapping_sub(1);
+    super::chrome::rebuild_console_window_surface(&mut window, true);
+    assert_ne!(window.surface_cache.content_version, previous_version);
+    assert_eq!(
+        window.surface_cache.font_asset_revision,
+        crate::font::asset_revision()
+    );
+    let current_version = window.surface_cache.content_version;
+    super::chrome::rebuild_console_window_surface(&mut window, true);
+    assert_eq!(
+        window.surface_cache.content_version, current_version,
+        "same font revision reuses the raster"
+    );
 }

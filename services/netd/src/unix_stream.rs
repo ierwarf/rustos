@@ -140,7 +140,7 @@ pub(super) fn recvmsg_in_state(
     };
     let data_start = NETD_RECVMSG_PAYLOAD_HEADER_SIZE;
     let data_end = data_start + requested.min(available);
-    match recv_connected_bytes(connected, &mut response.payload[data_start..data_end], true) {
+    match recv_socket_bytes_in_state(state,request,&mut response.payload[data_start..data_end],true) {
         Ok(received) => {
             let control = append_recvmsg_credentials(credentials, received.control);
             let control_start = data_start + received.read;
@@ -223,6 +223,8 @@ pub(super) fn send_socket_message_in_state(
             }
         }
     }
+    let global_room=UNIX_QUEUED_BYTE_CAPACITY.saturating_sub(state.unix_queued_bytes)
+        .saturating_sub(control_charge);
     let peer_socket = state.sockets.get_mut(&peer).ok_or(libc::EPIPE)?;
     let UnixSocketState::Connected(peer_connected) = &mut peer_socket.state else {
         return Err(libc::ENOTCONN);
@@ -230,7 +232,7 @@ pub(super) fn send_socket_message_in_state(
     if peer_connected.recv_closed {
         return Err(libc::EPIPE);
     }
-    let room = SOCKET_BUFFER_CAPACITY.saturating_sub(peer_connected.incoming_bytes);
+    let room = SOCKET_BUFFER_CAPACITY.saturating_sub(peer_connected.incoming_bytes).min(global_room);
     if room == 0 {
         return Err(libc::EAGAIN);
     }
@@ -262,6 +264,7 @@ pub(super) fn send_socket_message_in_state(
             control: control.to_vec(),
         }),
     }
+    state.set_unix_queued_bytes(state.unix_queued_bytes + write_len + control_charge);
     Ok(write_len)
 }
 
@@ -278,6 +281,15 @@ pub(super) fn recv_socket_bytes(
         });
     }
     let mut state = lock_net_state();
+    recv_socket_bytes_in_state(&mut state,request,dest,collect_control)
+}
+
+pub(super) fn recv_socket_bytes_in_state(
+    state: &mut NetState,
+    request: &NetdIpcRequest,
+    dest: &mut [u8],
+    collect_control: bool,
+) -> Result<SocketReceive, i32> {
     let socket = state
         .sockets
         .get_mut(&request.socket_token)
@@ -285,7 +297,11 @@ pub(super) fn recv_socket_bytes(
     let UnixSocketState::Connected(connected) = &mut socket.state else {
         return Err(libc::ENOTCONN);
     };
-    recv_connected_bytes(connected, dest, collect_control)
+    let before = connected.incoming_bytes + connected.incoming_control_bytes;
+    let result = recv_connected_bytes(connected, dest, collect_control);
+    let consumed = before - (connected.incoming_bytes + connected.incoming_control_bytes);
+    state.release_unix_queued_bytes(consumed);
+    result
 }
 
 pub(super) fn recv_connected_bytes(

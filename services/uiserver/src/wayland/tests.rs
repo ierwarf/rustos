@@ -259,3 +259,199 @@ fn retained_pixel_accounting_excludes_the_committing_surface() {
     let first = state.surfaces[0].shared.clone();
     assert_eq!(state.retained_surface_pixels_excluding(&first), 40);
 }
+
+fn shm_file(bytes: &[u8]) -> std::fs::File {
+    use std::os::fd::FromRawFd;
+    use std::os::unix::fs::FileExt;
+    let name = std::ffi::CString::new("uiserver-shm-regression").unwrap();
+    let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+    assert!(fd >= 0);
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    file.set_len(bytes.len() as u64).unwrap();
+    file.write_all_at(bytes, 0).unwrap();
+    file
+}
+
+fn shm_buffer(
+    pool: Arc<std::sync::Mutex<super::WaylandShmPoolState>>,
+    offset: usize,
+    width: usize,
+    height: usize,
+    stride: usize,
+) -> super::BufferData {
+    super::BufferData {
+        shared: Arc::new(super::WaylandBufferState {
+            pool,
+            offset,
+            width,
+            height,
+            stride,
+            has_alpha: false,
+        }),
+    }
+}
+
+#[test]
+fn shm_pool_rejects_undersized_backing_and_unseekable_fd() {
+    use std::os::fd::OwnedFd;
+    let file = shm_file(&[0; 4]);
+    assert!(super::WaylandShmPoolState::new(OwnedFd::from(file), 8).is_err());
+    let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+    assert!(super::WaylandShmPoolState::new(OwnedFd::from(socket), 4).is_err());
+}
+
+#[test]
+fn shm_truncate_after_pool_admission_never_dereferences_client_pages() {
+    use std::os::fd::OwnedFd;
+    let file = shm_file(&[1, 2, 3, 0, 4, 5, 6, 0]);
+    let pool =
+        super::WaylandShmPoolState::new(OwnedFd::from(file.try_clone().unwrap()), 8).unwrap();
+    let buffer = shm_buffer(Arc::new(std::sync::Mutex::new(pool)), 0, 1, 2, 4);
+    let (pixels, ..) = buffer.copy_pixels().unwrap();
+    assert_eq!(&**pixels, &[0xff03_0201, 0xff06_0504]);
+    file.set_len(0).unwrap();
+    assert!(buffer.copy_pixels().is_none());
+    assert_eq!(
+        &**pixels,
+        &[0xff03_0201, 0xff06_0504],
+        "owned pixels survive truncate"
+    );
+}
+
+#[test]
+fn shm_failed_damage_read_is_transactional_and_preserves_shared_snapshot() {
+    use std::os::fd::OwnedFd;
+    let file = shm_file(&[1, 2, 3, 0, 4, 5, 6, 0]);
+    let pool =
+        super::WaylandShmPoolState::new(OwnedFd::from(file.try_clone().unwrap()), 8).unwrap();
+    let buffer = shm_buffer(Arc::new(std::sync::Mutex::new(pool)), 0, 1, 2, 4);
+    let mut retained = Arc::new(vec![0xff11_1111, 0xff22_2222]);
+    let presented = retained.clone();
+    file.set_len(4).unwrap(); // first row is readable, second would SIGBUS under mmap
+    assert!(!buffer.copy_damage_into(
+        &mut retained,
+        1,
+        2,
+        1,
+        Rect {
+            x: 0,
+            y: 0,
+            width: 1,
+            height: 2
+        }
+    ));
+    assert_eq!(retained, presented);
+    assert!(
+        Arc::ptr_eq(&retained, &presented),
+        "failed read publishes no new pixels"
+    );
+}
+
+#[test]
+fn shm_pool_growth_validates_backing_before_publication_and_old_buffers_survive() {
+    use std::os::fd::OwnedFd;
+    use std::os::unix::fs::FileExt;
+    let file = shm_file(&[1, 2, 3, 0]);
+    let pool = Arc::new(std::sync::Mutex::new(
+        super::WaylandShmPoolState::new(OwnedFd::from(file.try_clone().unwrap()), 4).unwrap(),
+    ));
+    let old_buffer = shm_buffer(pool.clone(), 0, 1, 1, 4);
+    assert!(pool.lock().unwrap().resize(8).is_err());
+    assert_eq!(pool.lock().unwrap().len, 4);
+    file.set_len(8).unwrap();
+    file.write_all_at(&[4, 5, 6, 0], 4).unwrap();
+    pool.lock().unwrap().resize(8).unwrap();
+    assert!(pool.lock().unwrap().resize(4).is_err());
+    assert_eq!(pool.lock().unwrap().len, 8);
+    let new_buffer = shm_buffer(pool.clone(), 4, 1, 1, 4);
+    assert_eq!(old_buffer.copy_pixels().unwrap().0[0], 0xff03_0201);
+    assert_eq!(new_buffer.copy_pixels().unwrap().0[0], 0xff06_0504);
+    file.set_len(4).unwrap();
+    assert!(new_buffer.copy_pixels().is_none());
+}
+
+#[test]
+fn shm_pool_destroy_and_client_fd_close_do_not_retire_live_buffers() {
+    use std::os::fd::OwnedFd;
+    let file = shm_file(&[1, 2, 3, 0]);
+    let data = super::ShmPoolData {
+        shared: Arc::new(std::sync::Mutex::new(
+            super::WaylandShmPoolState::new(OwnedFd::from(file.try_clone().unwrap()), 4).unwrap(),
+        )),
+    };
+    let weak = Arc::downgrade(&data.shared);
+    let buffer = shm_buffer(data.shared.clone(), 0, 1, 1, 4);
+    drop(data); // wl_shm_pool.destroy
+    drop(file); // client disconnect/close
+    assert_eq!(buffer.copy_pixels().unwrap().0[0], 0xff03_0201);
+    let attached = buffer.clone();
+    drop(buffer); // wl_buffer.destroy while attachment still owns backing
+    assert!(weak.upgrade().is_some());
+    assert_eq!(attached.copy_pixels().unwrap().0[0], 0xff03_0201);
+    drop(attached);
+    assert!(
+        weak.upgrade().is_none(),
+        "last buffer/attachment retires pool fd"
+    );
+}
+
+#[test]
+fn shm_snapshots_remain_safe_while_another_thread_truncates_and_regrows() {
+    use std::os::fd::AsRawFd;
+    let file = shm_file(&vec![0x3a; 128 * 1024]);
+    let writer = file.try_clone().unwrap();
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            for _ in 0..100 {
+                writer.set_len(0).unwrap();
+                writer.set_len(128 * 1024).unwrap();
+            }
+        });
+        for _ in 0..100 {
+            // A full owned snapshot or explicit short-I/O failure are both safe.
+            if let Ok(bytes) = super::shm::read_shm_snapshot(file.as_raw_fd(), 0, 128 * 1024) {
+                assert_eq!(bytes.len(), 128 * 1024);
+            }
+        }
+    });
+}
+
+#[test]
+fn pointer_routing_requires_exact_ui_target_and_keeps_button_grab_on_original_client() {
+    use wayland_server::{protocol::wl_surface::WlSurface, Resource};
+    let display = test_display();
+    let mut handle = display.handle();
+    let mut peers = Vec::new();
+    let mut state = super::WaylandState::new(1024, 768);
+    for id in 1..=2 {
+        let (server, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let client = handle.insert_client(server, Arc::new(super::WaylandClientState)).unwrap();
+        peers.push(peer);
+        let surface = super::SurfaceData { shared: Arc::new(std::sync::Mutex::new(super::WaylandSurfaceState {
+            surface_id: id, client_id: Some(client.id()), alive: true,
+            frame: Rect { x: 10, y: 10, width: 320, height: 240 },
+            width: 320, height: 240, ..Default::default()
+        })) };
+        let resource = client.create_resource::<WlSurface, _, super::WaylandState>(&handle, 6, surface.clone()).unwrap();
+        surface.shared.lock().unwrap().resource = Some(resource);
+        state.surfaces.push(surface);
+    }
+    // An occluding console/chrome/desktop is represented by no Wayland target.
+    assert!(state.hit_test_pointer(100, 100).is_none());
+    state.pointer_target = Some(1);
+    let hit = state.hit_test_pointer(100, 100).unwrap();
+    let first_resource = state.surfaces[0].shared.lock().unwrap().resource.clone().unwrap();
+    assert_eq!(hit.surface.id(), first_resource.id(), "must not independently choose newer surface 2");
+    let first_client = hit.client_id.clone();
+    state.update_pointer_focus(Some(hit));
+    state.pointer_button_down = true;
+    state.pointer_target = Some(2);
+    let grabbed = state.hit_test_pointer(900, 700).unwrap();
+    assert_eq!(grabbed.surface.id(), first_resource.id());
+    assert_eq!(grabbed.client_id, first_client);
+    assert!(grabbed.surface_x > 320.0 && grabbed.surface_y > 240.0);
+    state.pointer_button_down = false;
+    assert!(state.hit_test_pointer(900, 700).is_none());
+    state.pointer_target = None;
+    assert!(state.hit_test_pointer(100, 100).is_none());
+}

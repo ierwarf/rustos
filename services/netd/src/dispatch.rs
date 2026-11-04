@@ -67,12 +67,12 @@ pub(super) fn dispatch_request(
     }
     let status = match request.op {
         SYSCALL_OFFLOAD_OP_LINUX_SOCKET => handle_socket(request, response, reply_cap),
-        SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR => handle_socketpair(request, response),
+        SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR => handle_socketpair(request, response, reply_cap),
         SYSCALL_OFFLOAD_OP_LINUX_DUP => handle_dup(request),
         SYSCALL_OFFLOAD_OP_LINUX_CLOSE => handle_close(request, response),
         SYSCALL_OFFLOAD_OP_LINUX_BIND => handle_bind(request),
         SYSCALL_OFFLOAD_OP_LINUX_LISTEN => handle_listen(request),
-        SYSCALL_OFFLOAD_OP_LINUX_ACCEPT => handle_accept(request, response),
+        SYSCALL_OFFLOAD_OP_LINUX_ACCEPT => handle_accept(request, response, reply_cap),
         SYSCALL_OFFLOAD_OP_LINUX_CONNECT => handle_connect(request),
         SYSCALL_OFFLOAD_OP_LINUX_SENDTO | SYSCALL_OFFLOAD_OP_LINUX_SENDMSG => {
             handle_send(request, response)

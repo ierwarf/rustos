@@ -16,6 +16,7 @@ impl WaylandState {
             pointer_resources: Vec::new(),
             keyboard_resources: Vec::new(),
             pointer_focus: None,
+            pointer_target: None,
             keyboard_focus: None,
             pointer_x: display_width / 2,
             pointer_y: display_height / 2,

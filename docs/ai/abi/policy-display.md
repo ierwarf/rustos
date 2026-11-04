@@ -13,7 +13,8 @@ it for every foreground retry. The kernel reply wait floors the same monotonic
 nanosecond value into its RTC tick domain and takes the earlier of the wire end
 and its already-admitted service-class end. Netd then tightens the request once
 at admission to 16 ms for readiness, 100 ms for DVM session control, a 5 s
-state-mutation lease for reference DUP/CLOSE/ACK, or 30 s for bulk work. Queueing, worker dequeue, provider polling, and
+state-mutation lease for SOCKET/SOCKETPAIR/ACCEPT and reference DUP/CLOSE/ACK,
+or 30 s for bulk work. Queueing, worker dequeue, provider polling, and
 retry may consume the stamped remainder but cannot mint another class budget.
 An expired detached poll makes one terminal `ETIMEDOUT` reply attempt and
 releases its slot; a reply consumed after the caller deadline is discarded,
@@ -36,21 +37,69 @@ Four fixed netd request receivers prevent an unrelated caller from serializing
 all local AF_UNIX work. Blocking INET connect/send/recv waits run in a separate
 fixed eight-worker pool that releases the shared network-state lock between
 polls (retry delay doubles 1/2/4 ms per attempt); there is no thread-per-request
-fallback. A `socket(AF_INET)` that finds the DVM control relay still
-`AwaitingAuthenticatedControl` (a wait of up to 5 s) never occupies a receiver:
-it is parked, with its reply capability, on a third dedicated two-worker pool
-(16 pending, separate from the blocking-I/O pool whose workers can be held for
-a whole bulk deadline). Active/unavailable providers answer inline. Netd
+fallback. Every `socket`, `socketpair`, and `accept` request travels with its
+reply capability to a dedicated two-worker lifecycle pool (16 pending,
+including executing work). This includes AF_UNIX and active/unavailable INET
+providers: rootd CHARGE can block independently of packet-provider readiness.
+The same pool owns the authenticated DVM-provider wait; bulk receives cannot
+consume its workers. Full/unavailable admission returns `EAGAIN` before charge;
+expired queued work replies once without entering the provider. Lifecycle work
+is dispatched once, never retried as a new socket on `EAGAIN`. Netd
 sources are split by responsibility (`service_loop`, `dispatch`, `blocking`,
 `local_poll`, `ref_replay`, `socket_lifecycle`, `unix_stream`, `inet_tcp`,
 `inet_stack`, `poll`, `socket_info`, `packet_provider`, `readiness`); shared
 state types live in `main.rs`.
 
+Socket funding and publication have distinct owners. Before the first rootd
+CHARGE IPC, netd reserves one of 4096 accounting-custody slots, including its
+eventual refund capacity. Exact CHARGE success is required before preparing any
+public descriptor. No accounting or network-state lock crosses rootd IPC.
+A lost/denied/malformed charge reply marks the reserved token for jobless
+CANCEL using its original nonce, rather than generating another charge identity.
+Known funding is released using the exact RELEASE frame. Close and failed
+publication only mark custody locally; one separate refund worker retries
+settlement and receipt ACKs without occupying RPC/lifecycle workers. Failed
+refunds rotate without surrendering their slot; permanent rootd failure fills
+the bounded book and denies new charges, never silently loses a refund.
+Failed accept marks its charge for refund **before** requeueing; another accept
+cannot fund that token (or change its client) until settlement removes custody.
+Unfunded internal queued sockets retire without rootd IPC. A failed in-flight
+accept whose listener has closed releases its queued ancillary tickets through
+a bounded, deferred-drop NetPolicy broker, not an error reply that may never be
+taken. Local broker failure terminates the incarnation instead of losing custody.
+Netd keeps this custody in memory for its incarnation; after an authenticated kernel EXIT,
+rootd's existing provider-owner retirement drains that incarnation's kernel
+Job sessions. It never treats an RPC timeout as provider-death evidence.
+
+All successful SOCKET/SOCKETPAIR/ACCEPT results now use version-2, 96-byte
+`NetBrokerPrepareSocketPublication` records. The operation, initial token(s),
+and accept channel are validated and bound to the exact live reply. The broker
+never installs a target-process fd. Before binding succeeds netd owns discard;
+a bind failure reclaims every invisible transfer and netd retires/refunds its
+initial reference(s). After binding succeeds, reply cancellation/rejection,
+caller exit, malformed decode, copyout failure, or expired publication hands
+those references to kernel deferred transfer-drop CLOSE. A timely kernel reply
+take validates tokens/flags/channel sides, reserves invisible fd slots, copies
+socketpair/accept outputs, rechecks the same end, and atomically commits the
+whole batch. Thus a delayed CHARGE or abandoned reply cannot leave an unseen fd
+or an ownerless charge. Successful accept binding ends listener custody even
+if the caller subsequently abandons; it must not requeue that transferred ref.
+These cancellation tests are deterministic native witnesses, not live rootd
+transport-fault or service-crash injection.
+
 Deferred AF_UNIX poll waiters are serviced by serialized passes: a worker that
 commits a state change and finds a pass running records a rerun request that
 the running pass honours, so no commit can be missed by an in-flight pass that
 already took the waiter queue. Table-wide ceilings (8192 AF_UNIX, 1024 INET
-sockets, `ENFILE`) bound netd's shared heap in addition to per-Job billing.
+sockets, `ENFILE`) bound identity storage in addition to per-Job billing.
+One shared 64 MiB AF_UNIX budget bounds outstanding payload plus aligned
+ancillary bytes across all sockets, including queued/in-flight accepts.
+Plain sends may take the available prefix; ancillary sends are all-or-nothing.
+Receive (including discarded control) and recursive listener/final close release
+exact queue custody under the state mutex. Read shutdown retains unread queues
+and their budget until consumption/retirement. Exhaustion returns `EAGAIN` and
+removes POLLOUT; entering/leaving exhaustion re-observes every Unix sender and
+publishes changed generations, so unrelated consumers can wake blocked senders.
 Dup/close replay results are reclaimed only when the 4096-entry log is full and
 the completed result is older than 60 s (far above the 5 s caller lease); a
 never-acknowledged result can therefore no longer exhaust the log and turn every

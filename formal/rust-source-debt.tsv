@@ -245,6 +245,8 @@ services/pagerd/src/main.rs	4	0
 services/netd/src/readiness.rs	0	1
 services/netd/src/blocking.rs	0	0
 services/netd/src/deadline.rs	0	0
+services/netd/src/provider_accounting.rs	0	0
+services/netd/src/socket_lifecycle.rs	0	0
 services/netd/src/dispatch.rs	0	0
 services/netd/src/inet_stack.rs	0	0
 services/netd/src/local_poll.rs	0	0

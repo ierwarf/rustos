@@ -4,11 +4,9 @@ use std::time::Instant;
 use runtime_control::RuntimeClient;
 
 use super::launch::launch_program_async;
-use super::{AppState, DragTarget, VisualUpdate};
+use super::{AppState, DragTarget, VisualUpdate, WindowId};
 use crate::canvas;
-use crate::layout::{
-    clamp_wayland_frame, maximized_window_rect, window_chrome_hit, WindowChromeHit,
-};
+use crate::layout::{clamp_wayland_frame, maximized_window_rect, WindowChromeHit};
 use crate::profile;
 use crate::render::{
     clamp_console_window_rect, console_window_dirty_rect, launcher_button_rect, taskbar_slot_rect,
@@ -41,7 +39,9 @@ impl AppState {
     ) -> Result<VisualUpdate, i32> {
         match event.kind {
             INPUT_KIND_KEYBOARD => {
-                if let Some(wayland) = wayland {
+                if let Some(wayland) = wayland.filter(|_| self.focused_wayland_surface_id.is_some())
+                {
+                    wayland.set_keyboard_target(self.focused_wayland_surface_id);
                     if wayland.keyboard_input(*event) {
                         return Ok(VisualUpdate::default());
                     }
@@ -84,6 +84,7 @@ impl AppState {
                 }
                 if let Some(wayland) = wayland.as_deref_mut() {
                     let started = Instant::now();
+                    self.sync_wayland_pointer_target(wayland);
                     wayland.pointer_motion(self.cursor_x, self.cursor_y);
                     profile::record_wayland_motion(started.elapsed());
                 }
@@ -113,6 +114,7 @@ impl AppState {
                 }
                 if let Some(wayland) = wayland.as_deref_mut() {
                     let started = Instant::now();
+                    self.sync_wayland_pointer_target(wayland);
                     wayland.pointer_motion(self.cursor_x, self.cursor_y);
                     profile::record_wayland_motion(started.elapsed());
                 }
@@ -157,7 +159,6 @@ impl AppState {
                     if let Some(wayland) = wayland {
                         wayland.clear_focus();
                     }
-                    self.focused_wayland_surface_id = None;
                     self.restore_console_window(session_handle)
                 }
                 TaskbarHit::Wayland(surface_id) => self.restore_wayland_window(surface_id, wayland),
@@ -166,12 +167,6 @@ impl AppState {
 
         if let Some(hit) = self.window_under_cursor() {
             return self.handle_window_hit(runtime, hit, wayland);
-        }
-
-        if let Some(wayland) = wayland {
-            if wayland.pointer_button(POINTER_BUTTON_LEFT, true) {
-                return Ok(VisualUpdate::full());
-            }
         }
 
         Ok(VisualUpdate::default())
@@ -216,67 +211,30 @@ impl AppState {
     }
 
     fn window_under_cursor(&self) -> Option<WindowHit> {
-        if let Some(surface_id) = self.focused_wayland_surface_id {
-            if let Some(window) = self
-                .wayland_windows
-                .iter()
-                .find(|window| !window.minimized && window.surface_id == surface_id)
-            {
-                let outer = wayland_window_outer_rect(window);
-                if outer.contains(self.cursor_x, self.cursor_y) {
-                    return Some(WindowHit::Wayland(
-                        window.surface_id,
-                        self.hit_window_chrome(outer),
-                    ));
-                }
-            }
-        }
-
-        if self.focused_wayland_surface_id.is_none() && self.focused_session_handle != 0 {
-            if let Some(window) = self.console_windows.iter().find(|window| {
-                !window.minimized
-                    && window.session_handle == self.focused_session_handle
-                    && window.frame.contains(self.cursor_x, self.cursor_y)
-            }) {
-                return Some(WindowHit::Console(
-                    window.session_handle,
-                    self.hit_window_chrome(window.frame),
-                ));
-            }
-        }
-
-        for window in self.console_windows.iter().rev() {
-            if window.minimized
-                || window.session_handle == self.focused_session_handle
-                || !window.frame.contains(self.cursor_x, self.cursor_y)
-            {
-                continue;
-            }
-            return Some(WindowHit::Console(
-                window.session_handle,
-                self.hit_window_chrome(window.frame),
-            ));
-        }
-
-        for window in self.wayland_windows.iter().rev() {
-            if window.minimized || Some(window.surface_id) == self.focused_wayland_surface_id {
-                continue;
-            }
-            let outer = wayland_window_outer_rect(window);
-            if !outer.contains(self.cursor_x, self.cursor_y) {
-                continue;
-            }
-            return Some(WindowHit::Wayland(
-                window.surface_id,
-                self.hit_window_chrome(outer),
-            ));
-        }
-
-        None
+        super::window_hit_test(
+            &self.window_draw_order(),
+            &self.console_windows,
+            &self.wayland_windows,
+            self.cursor_x,
+            self.cursor_y,
+        )
+        .map(|(id, chrome)| match id {
+            WindowId::Console(id) => WindowHit::Console(id, chrome),
+            WindowId::Wayland(id) => WindowHit::Wayland(id, chrome),
+        })
     }
 
-    fn hit_window_chrome(&self, outer: canvas::Rect) -> WindowChromeHit {
-        window_chrome_hit(outer, self.cursor_x, self.cursor_y)
+    pub(crate) fn sync_wayland_input_focus(&self, wayland: &mut WaylandCompositor) {
+        wayland.set_keyboard_target(self.focused_wayland_surface_id);
+        self.sync_wayland_pointer_target(wayland);
+    }
+
+    pub(crate) fn sync_wayland_pointer_target(&self, wayland: &mut WaylandCompositor) {
+        let target = match self.window_under_cursor() {
+            Some(WindowHit::Wayland(id, WindowChromeHit::Client)) => Some(id),
+            _ => None,
+        };
+        wayland.set_pointer_target(target);
     }
 
     fn handle_window_hit(
@@ -287,13 +245,21 @@ impl AppState {
     ) -> Result<VisualUpdate, i32> {
         match hit {
             WindowHit::Console(session_handle, chrome_hit) => {
-                if let Some(wayland) = wayland.as_deref_mut() {
-                    wayland.clear_focus();
+                if !matches!(
+                    chrome_hit,
+                    WindowChromeHit::Close | WindowChromeHit::Minimize
+                ) {
+                    if let Some(wayland) = wayland.as_deref_mut() {
+                        wayland.clear_focus();
+                    }
                 }
-                self.focused_wayland_surface_id = None;
                 match chrome_hit {
-                    WindowChromeHit::Close => self.close_console_window(runtime, session_handle),
-                    WindowChromeHit::Minimize => self.minimize_console_window(session_handle),
+                    WindowChromeHit::Close => {
+                        self.close_console_window(runtime, session_handle, wayland)
+                    }
+                    WindowChromeHit::Minimize => {
+                        self.minimize_console_window(session_handle, wayland)
+                    }
                     WindowChromeHit::Maximize => {
                         self.toggle_console_window_maximize(session_handle)
                     }
@@ -352,12 +318,12 @@ impl AppState {
                         ))
                     }
                     WindowChromeHit::Maximize => {
+                        self.cancel_wayland_placement(surface_id);
                         let before_dirty = self.wayland_visual_dirty_rect();
                         wayland.toggle_surface_maximized(surface_id);
                         wayland.focus_surface(surface_id);
                         let wayland_dirty = self.sync_wayland_windows(wayland.window_snapshots());
-                        self.focused_wayland_surface_id = Some(surface_id);
-                        self.focused_session_handle = 0;
+                        self.focus_wayland_window(surface_id);
                         if self.dragging_window == Some(DragTarget::Wayland(surface_id)) {
                             self.dragging_window = None;
                         }
@@ -367,8 +333,7 @@ impl AppState {
                         let before_dirty = self.wayland_visual_dirty_rect();
                         wayland.focus_surface(surface_id);
                         let wayland_dirty = self.sync_wayland_windows(wayland.window_snapshots());
-                        self.focused_wayland_surface_id = Some(surface_id);
-                        self.focused_session_handle = 0;
+                        self.focus_wayland_window(surface_id);
                         self.start_wayland_window_drag(surface_id);
                         Ok(VisualUpdate::partial(before_dirty.union(wayland_dirty)))
                     }
@@ -376,8 +341,9 @@ impl AppState {
                         let before_dirty = self.wayland_visual_dirty_rect();
                         wayland.focus_surface(surface_id);
                         let wayland_dirty = self.sync_wayland_windows(wayland.window_snapshots());
-                        self.focused_wayland_surface_id = Some(surface_id);
-                        self.focused_session_handle = 0;
+                        self.focus_wayland_window(surface_id);
+                        self.sync_wayland_pointer_target(wayland);
+                        wayland.pointer_motion(self.cursor_x, self.cursor_y);
                         if wayland.pointer_button(POINTER_BUTTON_LEFT, true) {
                             return Ok(VisualUpdate::partial(before_dirty.union(wayland_dirty)));
                         }
@@ -403,6 +369,7 @@ impl AppState {
     }
 
     fn start_wayland_window_drag(&mut self, surface_id: u32) {
+        self.cancel_wayland_placement(surface_id);
         let Some(window) = self
             .wayland_windows
             .iter()
@@ -439,31 +406,23 @@ impl AppState {
     fn minimize_console_window(
         &mut self,
         session_handle: ConsoleSessionHandle,
+        wayland: Option<&mut WaylandCompositor>,
     ) -> Result<VisualUpdate, i32> {
         if let Some(window) = self
             .console_windows
             .iter_mut()
-            .find(|window| window.session_handle == session_handle)
+            .find(|w| w.session_handle == session_handle)
         {
             window.minimized = true;
         }
         if self.focused_session_handle == session_handle {
-            let fallback = self
-                .console_windows
-                .iter()
-                .rev()
-                .find(|window| !window.minimized && window.session_handle != session_handle)
-                .map(|window| window.session_handle);
             self.focused_session_handle = 0;
-            if let Some(fallback_session) = fallback {
-                self.console_commands.submit_focus(fallback_session);
-                self.pending_console_focus = Some(fallback_session);
-                self.focused_session_handle = fallback_session;
-            }
+            self.pending_console_focus = None;
         }
         if self.dragging_window == Some(DragTarget::Console(session_handle)) {
             self.dragging_window = None;
         }
+        self.recover_focus_after_wayland_change(wayland)?;
         Ok(VisualUpdate::full())
     }
 
@@ -471,34 +430,22 @@ impl AppState {
         &mut self,
         runtime: &RuntimeClient,
         session_handle: ConsoleSessionHandle,
+        wayland: Option<&mut WaylandCompositor>,
     ) -> Result<VisualUpdate, i32> {
         self.mark_console_session_closing(session_handle);
-        let closed_was_focused = self.focused_session_handle == session_handle;
         self.console_windows
-            .retain(|window| window.session_handle != session_handle);
+            .retain(|w| w.session_handle != session_handle);
+        self.reconcile_window_stack();
         if self.console_windows.is_empty() {
             self.next_console_snapshot_index = 0;
-        } else if self.next_console_snapshot_index >= self.console_windows.len() {
+        } else {
             self.next_console_snapshot_index %= self.console_windows.len();
         }
-        if closed_was_focused {
-            // Hand focus to the most-recently-stacked visible console
-            // window, if any. Previously this loop force-minimized every
-            // other console window, which made closing one terminal
-            // mysteriously hide the rest.
+        if self.focused_session_handle == session_handle {
             self.focused_session_handle = 0;
-            let fallback = self
-                .console_windows
-                .iter()
-                .rev()
-                .find(|window| !window.minimized)
-                .map(|window| window.session_handle);
-            if let Some(fallback_session) = fallback {
-                self.console_commands.submit_focus(fallback_session);
-                self.pending_console_focus = Some(fallback_session);
-                self.focused_session_handle = fallback_session;
-            }
+            self.pending_console_focus = None;
         }
+        self.recover_focus_after_wayland_change(wayland)?;
         let _ = runtime.request_terminate_session(session_handle);
         if self.dragging_window == Some(DragTarget::Console(session_handle)) {
             self.dragging_window = None;
@@ -549,8 +496,7 @@ impl AppState {
         wayland.set_surface_minimized(surface_id, false);
         wayland.focus_surface(surface_id);
         let wayland_dirty = self.sync_wayland_windows(wayland.window_snapshots());
-        self.focused_wayland_surface_id = Some(surface_id);
-        self.focused_session_handle = 0;
+        self.focus_wayland_window(surface_id);
         Ok(VisualUpdate::partial(before_dirty.union(wayland_dirty)))
     }
 

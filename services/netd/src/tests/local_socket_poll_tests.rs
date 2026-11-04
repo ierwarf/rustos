@@ -222,7 +222,7 @@ fn admission_clamps_each_operation_class_once_without_freshening() {
         ),
         (
             SYSCALL_OFFLOAD_OP_LINUX_SOCKET,
-            rustos_user_abi::performance::IPC_BULK_DATA_HARD_LIMIT_MS,
+            rustos_user_abi::performance::IPC_STATE_MUTATION_HARD_LIMIT_MS,
         ),
     ] {
         let mut request = NetdIpcRequest {
@@ -444,9 +444,11 @@ fn install_segmented_test_socket(token: u64, segments: Vec<UnixStreamSegment>) {
         unreachable!();
     };
     connected.incoming_bytes = segments.iter().map(|segment| segment.bytes.len()).sum();
-    connected.incoming_control_bytes = segments.iter().map(|segment| segment.control.len()).sum();
+    connected.incoming_control_bytes = segments.iter().map(|segment| cmsg_align(segment.control.len())).sum();
     connected.incoming = segments.into_iter().collect();
-    net_state().lock().unwrap().sockets.insert(token, socket);
+    let mut state=net_state().lock().unwrap();
+    state.unix_queued_bytes+=connected.incoming_bytes+connected.incoming_control_bytes;
+    state.sockets.insert(token, socket);
 }
 
 #[test]

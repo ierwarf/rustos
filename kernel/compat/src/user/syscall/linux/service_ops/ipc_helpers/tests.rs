@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn netd_failed_accept_settles_cleanup_before_returning_the_error() {
+fn netd_failed_mutation_settles_cleanup_before_returning_the_error() {
     let response = NetdIpcResponse {
         status: LINUX_EAGAIN as i32,
         payload_len: 16,
@@ -21,7 +21,7 @@ fn netd_failed_accept_settles_cleanup_before_returning_the_error() {
 }
 
 #[test]
-fn netd_accept_cleanup_is_allowed_only_for_a_complete_error_trailer() {
+fn netd_accept_never_relies_on_an_error_reply_for_ancillary_release() {
     let request = NetdIpcRequest {
         op: SYSCALL_OFFLOAD_OP_LINUX_ACCEPT,
         ..NetdIpcRequest::default()
@@ -42,7 +42,7 @@ fn netd_accept_cleanup_is_allowed_only_for_a_complete_error_trailer() {
         ) };
         decode_netd_ipc_response(&request, bytes)
     };
-    assert!(decode(&response).is_ok());
+    assert!(matches!(decode(&response), Err(LINUX_EINVAL)));
     response.status = 0;
     assert!(matches!(decode(&response), Err(LINUX_EINVAL)));
     response.status = LINUX_EAGAIN as i32;
@@ -350,8 +350,8 @@ fn only_supported_inet_socket_creation_requires_a_prepared_reply_entry() {
 
     request.arg0 = linux_abi::AF_UNIX;
     assert!(
-        !netd_reply_uses_prepared_socket(&request),
-        "AF_UNIX still returns the fd installed by its legacy broker transaction"
+        netd_reply_uses_prepared_socket(&request),
+        "AF_UNIX must never install a descriptor before the timely reply take"
     );
     request.arg0 = linux_abi::AF_INET;
     request.arg1 = linux_abi::SOCK_DGRAM;
@@ -625,4 +625,74 @@ fn cursor_gate_slots_are_bounded_and_reusable() {
     assert!(matches!(queue.try_claim_cursor(1_000), VfsCursorClaim::Busy));
     queue.release_cursor(7);
     assert!(matches!(queue.try_claim_cursor(1_000), VfsCursorClaim::Claimed));
+}
+
+#[test]
+fn accepted_socket_flags_come_only_from_accept4_not_the_listener() {
+    for listener_flags in [0, linux_abi::O_NONBLOCK] {
+        for accepted_flags in [0, linux_abi::SOCK_NONBLOCK, linux_abi::SOCK_CLOEXEC,
+            linux_abi::SOCK_NONBLOCK | linux_abi::SOCK_CLOEXEC] {
+            let request = NetdIpcRequest {
+                op: SYSCALL_OFFLOAD_OP_LINUX_ACCEPT,
+                status_flags: listener_flags,
+                arg3: accepted_flags,
+                ..NetdIpcRequest::default()
+            };
+            let socket = multitask::SocketHandle::from_token(71, linux_abi::AF_UNIX, linux_abi::SOCK_STREAM, 0);
+            assert!(socket.bind_channel(99, 2));
+            let entry = multitask::TransferredHandleEntry::from_initial_entry(
+                multitask::HandleEntry::new(multitask::KernelHandle::Socket(socket),
+                    if accepted_flags & linux_abi::SOCK_CLOEXEC != 0 { multitask::FD_CLOEXEC } else { 0 },
+                    accepted_flags & linux_abi::SOCK_NONBLOCK)
+            ).unwrap();
+            let response = NetdIpcResponse { op: request.op, value: 71, ..NetdIpcResponse::default() };
+            assert!(prepared_netd_socket_response_matches(&request, &response, &[entry]),
+                "accepted flags must be independent of listener flags");
+        }
+    }
+}
+
+#[test]
+fn prepared_unix_socket_pair_and_accept_abandonment_never_install_unseen_fds() {
+    fn entries(op:u16)->Vec<multitask::TransferredHandleEntry> {
+        (0..if op==SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR {2} else {1}).map(|index| {
+            let socket=multitask::SocketHandle::from_token(71+index,linux_abi::AF_UNIX,linux_abi::SOCK_STREAM,0);
+            if op!=SYSCALL_OFFLOAD_OP_LINUX_SOCKET {
+                assert!(socket.bind_channel(99,if op==SYSCALL_OFFLOAD_OP_LINUX_ACCEPT {2} else {index as u8+1}));
+            }
+            multitask::TransferredHandleEntry::from_initial_entry(multitask::HandleEntry::new(
+                multitask::KernelHandle::Socket(socket),multitask::FD_CLOEXEC,linux_abi::SOCK_NONBLOCK)).unwrap()
+        }).collect()
+    }
+    for op in [SYSCALL_OFFLOAD_OP_LINUX_SOCKET,SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR,SYSCALL_OFFLOAD_OP_LINUX_ACCEPT] {
+        let request=NetdIpcRequest {op,arg0:linux_abi::AF_UNIX,
+            arg1:linux_abi::SOCK_STREAM | linux_abi::SOCK_NONBLOCK | linux_abi::SOCK_CLOEXEC,
+            arg3:linux_abi::SOCK_NONBLOCK | linux_abi::SOCK_CLOEXEC,
+            ..NetdIpcRequest::default()};
+        let mut response=NetdIpcResponse{op,value:71,..NetdIpcResponse::default()};
+        let count=if op==SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR {2} else {1};
+        if count==2 {
+            response.payload[..8].copy_from_slice(&72_u64.to_ne_bytes());
+            response.payload_len=8;
+        }
+        assert!(netd_reply_uses_prepared_socket(&request));
+        assert!(prepared_netd_socket_response_matches(&request,&response,&entries(op)));
+        let discarded=core::cell::Cell::new(0);
+        let installed=core::cell::Cell::new(0);
+        assert_eq!(install_prepared_netd_socket_response(&request,response,entries(op),|batch| {
+            discarded.set(discarded.get()+batch.len());
+        },||true,|_| {installed.set(installed.get()+count);Ok(alloc::vec![37;count])}),Err(LINUX_ETIMEDOUT));
+        assert_eq!(installed.get(),0);
+        assert_eq!(discarded.get(),count,"every initial reference must reach deferred close exactly once");
+        // User-copy/slot-commit failure owns and releases the whole claimed batch.
+        assert_eq!(install_prepared_netd_socket_response(&request,response,entries(op),|_|panic!("valid batch"),
+            ||false,|batch| {discarded.set(discarded.get()+batch.len());Err(LINUX_EFAULT)}),Err(LINUX_EFAULT));
+        assert_eq!(discarded.get(),2*count);
+        assert_eq!(installed.get(),0);
+        let result=install_prepared_netd_socket_response(&request,response,entries(op),|_|panic!("valid batch"),
+            ||false,|batch| {installed.set(batch.len());Ok((37..37+count as i32).collect())}).unwrap();
+        assert_eq!(installed.get(),count);
+        assert_eq!(result.value,if count==2 {0} else {37});
+        assert_eq!(result.payload_len,0);
+    }
 }

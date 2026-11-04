@@ -17,3 +17,6 @@ runtime-control = { path = "../../libs/runtime-control" }
 vte = { version = "0.15.0", default-features = false }
 wayland-protocols = { version = "0.32.12", features = ["server", "unstable"] }
 wayland-server = "0.31.13"
+
+[build-dependencies]
+fontdue = "0.9.3"

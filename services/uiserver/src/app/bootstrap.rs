@@ -418,6 +418,8 @@ impl AppState {
             desktop_cache: DesktopSurfaceCache::default(),
             launcher_programs: Vec::new(),
             console_windows: Vec::new(),
+            window_stack: super::WindowStack::default(),
+            pending_wayland_placements: Vec::new(),
             closing_console_sessions: Vec::new(),
             next_console_snapshot_index: 0,
             wayland_windows: Vec::new(),

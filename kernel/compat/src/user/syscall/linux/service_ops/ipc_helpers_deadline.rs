@@ -7,7 +7,8 @@
 
 use super::{
     LINUX_ENOSYS, LINUX_EPIPE, NETD_IPC_OP_REF_ACK, SYSCALL_OFFLOAD_OP_LINUX_CLOSE,
-    SYSCALL_OFFLOAD_OP_LINUX_DUP, VFS_IPC_OP_POLL_QUERY, VfsIpcRequest, current_remote_vfs_handle,
+    SYSCALL_OFFLOAD_OP_LINUX_DUP, SYSCALL_OFFLOAD_OP_LINUX_SOCKET,
+    SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR, SYSCALL_OFFLOAD_OP_LINUX_ACCEPT, VFS_IPC_OP_POLL_QUERY, VfsIpcRequest, current_remote_vfs_handle,
     ipc_ops,
 };
 // Referenced only by this file's tests, which classify the poll-socket
@@ -44,6 +45,7 @@ pub(in crate::user::syscall::linux::service_ops) fn netd_timeout_class(
         || matches!(
             op,
             SYSCALL_OFFLOAD_OP_LINUX_DUP | SYSCALL_OFFLOAD_OP_LINUX_CLOSE | NETD_IPC_OP_REF_ACK
+                | SYSCALL_OFFLOAD_OP_LINUX_SOCKET | SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR | SYSCALL_OFFLOAD_OP_LINUX_ACCEPT
         )
     {
         ipc_ops::ServiceIpcClass::StateMutation
@@ -95,6 +97,9 @@ mod tests {
     #[test]
     fn netd_reference_mutations_use_state_mutation_lease() {
         for op in [
+            SYSCALL_OFFLOAD_OP_LINUX_SOCKET,
+            SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR,
+            SYSCALL_OFFLOAD_OP_LINUX_ACCEPT,
             SYSCALL_OFFLOAD_OP_LINUX_DUP,
             SYSCALL_OFFLOAD_OP_LINUX_CLOSE,
             NETD_IPC_OP_REF_ACK,

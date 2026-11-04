@@ -1,4 +1,4 @@
-//! Bounded worker pools for requests that may wait (blocking INET I/O, provider-gated socket creation).
+//! Bounded worker pools for blocking INET I/O and charge-bearing socket lifecycle work.
 //!
 //! - **Owner:** `netd` owns both fixed pools; callers own only their absolute deadline.
 //! - **Boundary:** Queued requests and their reply capabilities are untrusted client work until dispatched.
@@ -12,7 +12,10 @@ use super::*;
 
 pub(super) fn blocking_retry_backoff(attempt: usize) -> Duration {
     BLOCKING_RETRY_BACKOFF
-        * (1_u32 << u32::try_from(attempt).unwrap_or(u32::MAX).min(BLOCKING_RETRY_MAX_DOUBLINGS))
+        * (1_u32
+            << u32::try_from(attempt)
+                .unwrap_or(u32::MAX)
+                .min(BLOCKING_RETRY_MAX_DOUBLINGS))
 }
 
 pub(super) fn blocking_provider_started() {
@@ -28,21 +31,16 @@ pub(super) fn is_deferred_local_poll_request(request: &NetdIpcRequest) -> bool {
         && !inet_socket_exists(request.socket_token)
 }
 
-pub(super) fn is_inet_socket_creation(request: &NetdIpcRequest) -> bool {
-    request.op == SYSCALL_OFFLOAD_OP_LINUX_SOCKET && request.arg0 == linux_abi::AF_INET
-}
-
-/// `socket(AF_INET)` may wait up to `AUTHENTICATED_CONTROL_WAIT` for the DVM
-/// control relay. That wait must never occupy one of the few fixed RPC
-/// workers: four boot-time resolver/netprobe sockets would otherwise starve
-/// every AF_UNIX request (the Wayland stream) behind it. Only the transitional
-/// state waits; an active or unavailable provider answers inline.
-pub(super) fn must_wait_for_packet_provider(request: &NetdIpcRequest) -> bool {
-    is_inet_socket_creation(request)
-        && matches!(
-            packet_provider_state(),
-            Ok(PacketProviderState::AwaitingAuthenticatedControl)
-        )
+/// All charge-bearing operations run once on the lifecycle pool, even when
+/// the packet provider is active. No rootd IPC may occupy a front-end receiver.
+/// CLOSE stays inline: final retirement only marks pre-reserved refund custody.
+pub(super) fn is_accounting_request(request: &NetdIpcRequest) -> bool {
+    matches!(
+        request.op,
+        SYSCALL_OFFLOAD_OP_LINUX_SOCKET
+            | SYSCALL_OFFLOAD_OP_LINUX_SOCKETPAIR
+            | SYSCALL_OFFLOAD_OP_LINUX_ACCEPT
+    )
 }
 
 pub(super) fn is_blocking_request(request: &NetdIpcRequest) -> bool {
@@ -109,7 +107,7 @@ pub(super) fn blocking_request_queue() -> &'static BlockingRequestQueue {
     })
 }
 
-pub(super) fn provider_wait_queue() -> &'static BlockingRequestQueue {
+pub(super) fn lifecycle_request_queue() -> &'static BlockingRequestQueue {
     static QUEUE: OnceLock<BlockingRequestQueue> = OnceLock::new();
     QUEUE.get_or_init(|| BlockingRequestQueue {
         requests: Mutex::new(VecDeque::new()),
@@ -117,33 +115,36 @@ pub(super) fn provider_wait_queue() -> &'static BlockingRequestQueue {
     })
 }
 
-pub(super) fn start_provider_wait_workers() {
-    for index in 0..PROVIDER_WAIT_WORKER_COUNT {
+pub(super) fn start_lifecycle_workers() {
+    for index in 0..LIFECYCLE_WORKER_COUNT {
         match thread::Builder::new()
-            .name(format!("netd-provider-wait-{index}"))
+            .name(format!("netd-lifecycle-{index}"))
             .spawn(|| {
-                worker_loop(provider_wait_queue(), &PENDING_PROVIDER_WAITS);
+                worker_loop(lifecycle_request_queue(), &PENDING_LIFECYCLE_REQUESTS);
             }) {
             Ok(_) => {
                 // ORDERING: spawn produces pool availability that admission
                 // consumes with Acquire before reserving a slot.
-                ACTIVE_PROVIDER_WAIT_WORKERS.fetch_add(1, Ordering::AcqRel);
+                ACTIVE_LIFECYCLE_WORKERS.fetch_add(1, Ordering::AcqRel);
             }
             Err(error) => debug_line(&format!(
-                "netd: provider-wait worker unavailable index={index} error={error}"
+                "netd: lifecycle worker unavailable index={index} error={error}"
             )),
         }
     }
 }
 
-/// Parks a provider-gated `socket(AF_INET)` on the dedicated pool. The reply
+/// Parks a charge-bearing lifecycle request on the dedicated pool. The reply
 /// capability travels with it; the worker sends the one terminal reply.
-pub(super) fn enqueue_provider_wait_request(request: NetdIpcRequest, reply_cap: u64) -> Result<(), i32> {
+pub(super) fn enqueue_lifecycle_request(
+    request: NetdIpcRequest,
+    reply_cap: u64,
+) -> Result<(), i32> {
     enqueue_to_pool(
-        provider_wait_queue(),
-        &PENDING_PROVIDER_WAITS,
-        MAX_PENDING_PROVIDER_WAITS,
-        &ACTIVE_PROVIDER_WAIT_WORKERS,
+        lifecycle_request_queue(),
+        &PENDING_LIFECYCLE_REQUESTS,
+        MAX_PENDING_LIFECYCLE_REQUESTS,
+        &ACTIVE_LIFECYCLE_WORKERS,
         request,
         reply_cap,
         rustos_svc_runtime::syscall::monotonic_nanos(),
@@ -151,7 +152,7 @@ pub(super) fn enqueue_provider_wait_request(request: NetdIpcRequest, reply_cap: 
 }
 
 pub(super) fn start_blocking_workers() {
-    start_provider_wait_workers();
+    start_lifecycle_workers();
     let queue = blocking_request_queue();
     let mut last_error = None;
     for index in 0..BLOCKING_WORKER_COUNT {
@@ -267,7 +268,10 @@ pub(super) fn blocking_worker_loop() {
     worker_loop(blocking_request_queue(), &PENDING_BLOCKING_REQUESTS)
 }
 
-pub(super) fn worker_loop(queue: &'static BlockingRequestQueue, pending_counter: &AtomicUsize) -> ! {
+pub(super) fn worker_loop(
+    queue: &'static BlockingRequestQueue,
+    pending_counter: &AtomicUsize,
+) -> ! {
     loop {
         let job = {
             let mut requests = queue.requests.lock().unwrap();
@@ -285,6 +289,7 @@ pub(super) fn worker_loop(queue: &'static BlockingRequestQueue, pending_counter:
         };
         response.status = run_blocking_request(&job.request, &mut response, job.reply_cap);
         publish_reply(job.reply_cap, &response);
+        service_local_poll_waiters();
         release_pending_slot(pending_counter);
     }
 }
@@ -315,8 +320,8 @@ pub(super) fn run_blocking_request_at(
         return errno;
     }
     blocking_provider_started();
-    if request.op == SYSCALL_OFFLOAD_OP_LINUX_SOCKET {
-        // Socket creation publishes through this very reply capability and is
+    if is_accounting_request(request) {
+        // Socket creation/accept publishes through this very reply capability and is
         // not retried: a second attempt would mint a second identity.
         return dispatch_request(request, response, reply_cap);
     }
