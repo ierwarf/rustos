@@ -25,8 +25,11 @@ No single checker is sufficient. The release gate combines:
 9. KVM evidence for 1/2/4/8 vCPUs and performance evidence from the same source
    tree and artifacts.
 
-The launcher derives multi-vCPU admission from a fresh PR verification seal
-whose schema and artifact set bind the exact current source-tree hash.
+SMP release evidence requires a fresh PR verification seal whose schema and
+artifact set bind the exact current source-tree hash. Ordinary multi-vCPU
+`kvm-smoke` and interactive `kvm-run` only warn when that seal is absent or
+stale; launching is not acceptance. `--smp-iteration` smoke separately enforces
+its narrower source-bound profile before launch and success publication.
 Checked-in readiness booleans, stale/mismatched evidence, or passing `-smp`
 directly are never release evidence. The launched topology becomes accepted
 only after every requested logical CPU emits exact online, idle-entry, first
@@ -155,10 +158,11 @@ round-trips a versioned policy stamp, and commits the effective Online
 intersection. Windows basic topology keeps reserved output zero, while
 Get/SetProcessAffinityMask, SetThreadAffinityMask, and
 GetCurrentProcessorNumber use the same dense single-group scheduler state.
-The KVM launcher accepts explicit `--rustos-vcpus 2..=16` only with a fresh
-source-bound formal seal and then requires the complete per-CPU runtime event
-matrix. Commercial release remains closed until the affinity ABI differential,
-formal/source gates, and complete 1/2/4/8 runtime/recovery matrix pass.
+`--rustos-vcpus 2..=16` selects a multi-vCPU topology, not proof of its
+qualification. Accepted SMP evidence still requires the matching source-bound
+formal seal and complete per-CPU runtime event matrix. Commercial release
+remains closed until the affinity ABI differential, formal/source gates, and
+complete 1/2/4/8 runtime/recovery matrix pass.
 
 ## 13. Required validation ladder
 

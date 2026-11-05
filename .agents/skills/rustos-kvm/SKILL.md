@@ -11,17 +11,25 @@ build routing. Do not preload either when no source/build decision needs it.
 ## Run
 
 1. Run `cargo xtask dev-plan` and its selected fast checks after edits.
-2. Build a fresh signed image only when the requested gate needs one. Reuse a
-   verified DVM artifact for RustOS-only changes.
+2. `kvm-smoke` refreshes the signed RustOS image by default; do not build it
+   separately unless preparing a custom probe image to boot with `--no-build`.
+   `kvm-run` uses the existing image unless passed `--build`. Reuse a verified
+   DVM artifact for RustOS-only changes.
 3. For DVM relay changes, run `make -C driver-domains/linux build-plan`, iterate
    with its cached lane, then one matching stable rebuild.
 4. Run one bounded `cargo xtask kvm-smoke` with an explicit timeout.
 5. Report the acceptance line, exit code, and only focused log extracts.
 
-Acceptance requires the expected final line, exit code 0, and real pointer
-ingress where the topology claims input. UI markers alone do not prove DVM,
-input, GPU, or cross-service ABI readiness. For SMP, report each requested vCPU
-cohort separately.
+Acceptance requires the expected final line and exit code 0. Base smoke
+proves input relay setup, not a live event; `--exercise-input` requires keyboard
+and pointer ingress, and interactive `kvm-run` requires real pointer ingress.
+UI markers alone do not prove DVM, input, GPU, or cross-service ABI readiness.
+
+Ordinary multi-vCPU smoke and interactive runs only warn on an unsealed tree;
+they do not run the formal gate. Multi-vCPU `--smp-iteration` smoke auto-seals
+its narrower profile; `--no-auto-verify` skips that repair, not the qualification
+seal checks. Run the PR gate explicitly for push/release evidence and report
+each requested vCPU cohort separately. See `docs/ai/commands.md` for proof flags.
 
 For physical GPU/VFIO work read `docs/ai/physical-gpu-status.md` first. A stable
 panel proves visual behavior only, not FPS, reset, revoke, latency, or recovery.

@@ -51,6 +51,25 @@
     }
 
     #[test]
+    fn smoke_option_values_cannot_swallow_topology_flags() {
+        for option in ["--expect", "--expect-dvm", "--gpu-firmware", "--physical-usb"] {
+            let error = parse_smoke_options(
+                [option, "--storage-dvm-only"].map(str::to_owned).into_iter(),
+            )
+            .unwrap_err();
+            assert_eq!(error.to_string(), format!("missing value for {option}"));
+        }
+        let options = parse_smoke_options(
+            ["--expect", "-single-dash-marker", "--expect-dvm", "marker --detail"]
+                .map(str::to_owned)
+                .into_iter(),
+        )
+        .unwrap();
+        assert!(options.expected_markers.contains(&"-single-dash-marker".to_owned()));
+        assert!(options.expected_dvm_markers.contains(&"marker --detail".to_owned()));
+    }
+
+    #[test]
     fn interactive_multicore_run_seals_formal_evidence_before_claiming_resources() {
         smp_ring3_qualification::interactive_multicore_run_seals_formal_evidence_before_claiming_resources();
     }

@@ -1,4 +1,4 @@
-use anyhow::{anyhow, bail};
+use anyhow::{Context, anyhow, bail};
 use fs_err as fs;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -384,29 +384,25 @@ fn load_project_config_file(root_dir: &Path) -> Result<(ProjectConfig, ProjectCo
 
 fn parse_project_config(path: &Path) -> Result<ProjectConfig> {
     let text = fs::read_to_string(path)?;
-    validate_project_config_text(&text)
-        .map_err(|err| anyhow!("invalid RustOS config {}: {err}", path.display()))?;
-    let parsed = toml::from_str::<ProjectConfigFile>(&text)
-        .map_err(|err| anyhow!("invalid RustOS config {}: {err}", path.display()))?;
-    validate_logging_config(&text, path)?;
-    Ok(project_from_file(parsed))
+    parse_project_config_text(&text)
+        .with_context(|| format!("invalid RustOS config {}", path.display()))
 }
 
 pub(crate) fn validate_project_config_text(text: &str) -> Result<()> {
+    parse_project_config_text(text).map(|_| ())
+}
+
+fn parse_project_config_text(text: &str) -> Result<ProjectConfig> {
     let parsed = toml::from_str::<ProjectConfigFile>(text)
         .map_err(|err| anyhow!("invalid RustOS config: {err}"))?;
+    build_log_cfg::try_parse_logging_toml(text)
+        .map_err(|err| anyhow!("invalid logging config: {err}"))?;
     let config = project_from_file(parsed);
     validate_kernel_build(&config.kernel.build)?;
     validate_fault_injection(&config.fault_injection)?;
     validate_fuzzing(&config.fuzzing)?;
     validate_lock_telemetry(&config.lock_telemetry)?;
-    Ok(())
-}
-
-fn validate_logging_config(text: &str, path: &Path) -> Result<()> {
-    build_log_cfg::try_parse_logging_toml(text)
-        .map(|_| ())
-        .map_err(|err| anyhow!("invalid logging config {}: {err}", path.display()))
+    Ok(config)
 }
 
 fn project_from_file(file: ProjectConfigFile) -> ProjectConfig {
@@ -848,9 +844,29 @@ mod tests {
     use super::{
         FaultInjectionConfig, IpcTelemetryConfig, KernelBuildConfig, LifecycleTelemetryConfig,
         LockTelemetryConfig, ProjectConfigFile, SchedulerTelemetryConfig, SyscallTelemetryConfig,
-        UsermemTelemetryConfig, apply_fault_rule_overrides, project_from_file,
-        validate_fault_injection, validate_kernel_build,
+        UsermemTelemetryConfig, apply_fault_rule_overrides, parse_project_config,
+        project_from_file, validate_fault_injection, validate_kernel_build,
+        validate_project_config_text,
     };
+
+    #[test]
+    fn project_config_text_and_file_reject_invalid_logging() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("rustos.toml");
+        for text in [
+            "[logging]\nmin_level = \"not-a-level\"\n",
+            "[logging]\nunknown_key = true\n",
+            "[logging.categories]\nunknown_category = \"debug\"\n",
+        ] {
+            std::fs::write(&path, text).unwrap();
+            assert!(validate_project_config_text(text).is_err());
+            assert!(parse_project_config(&path).is_err());
+        }
+        let text = "[logging]\nmin_level = \"debug\"\n";
+        std::fs::write(&path, text).unwrap();
+        validate_project_config_text(text).unwrap();
+        parse_project_config(&path).unwrap();
+    }
 
     /// The lock phase profile is eleven counter reads inside every tracked lock
     /// acquire and release. Measured against a build with it stubbed out, it was

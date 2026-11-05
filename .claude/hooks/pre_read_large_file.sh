@@ -42,17 +42,34 @@ deny() {
 
 [[ -z "$path" ]] && exit 0
 
-# Any explicit range or limit makes the read bounded.
+# Symbol navigation and search tools take a path as a scope, not a file read.
+tool_name="$(printf '%s' "$INPUT" | jq -r '.tool_name // ""' 2>/dev/null || true)"
+case "$tool_name" in
+  mcp__serena__read_file|Read|"") ;;
+  *) exit 0 ;;
+esac
+
+# An offset alone or a zero limit does not bound a read.
 bounded=0
-if [[ "$range_start" =~ ^[0-9]+$ && "$range_end" =~ ^[0-9]+$ ]] || [[ "$range_limit" =~ ^[0-9]+$ ]]; then
+if [[ "$range_start" =~ ^[0-9]+$ && "$range_end" =~ ^[0-9]+$ ]] \
+  && (( 10#$range_end >= 10#$range_start )); then
+  bounded=1
+elif [[ "$range_limit" =~ ^[0-9]+$ ]] && (( 10#$range_limit > 0 )); then
   bounded=1
 fi
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd -P)"
+read_cwd="$(printf '%s' "$INPUT" | jq -r '.cwd // empty' 2>/dev/null || true)"
+read_cwd="${read_cwd:-$REPO_ROOT}"
+# Serena relative_path is project-root-relative, unlike native Read paths.
+[[ "$tool_name" == mcp__serena__* ]] && read_cwd="$REPO_ROOT"
 case "$path" in
-  "$REPO_ROOT"/*) rel_path="${path#"$REPO_ROOT"/}" ;;
-  ./*) rel_path="${path#./}" ;;
-  *) rel_path="$path" ;;
+  /*) fs_path="$(realpath -m -- "$path")" ;;
+  *) fs_path="$(realpath -m -- "$read_cwd/$path")" ;;
+esac
+case "$fs_path" in
+  "$REPO_ROOT"/*) rel_path="${fs_path#"$REPO_ROOT"/}" ;;
+  *) rel_path="$fs_path" ;;
 esac
 
 case "$rel_path" in
@@ -63,23 +80,12 @@ esac
 
 (( bounded == 1 )) && exit 0
 
-# Symbol navigation and search tools take a path as a scope, not a whole-file read.
-tool_name="$(printf '%s' "$INPUT" | jq -r '.tool_name // ""' 2>/dev/null || true)"
-case "$tool_name" in
-  mcp__serena__read_file|Read|"") ;;
-  *) exit 0 ;;
-esac
-
 case "$rel_path" in
   logs/*|*/logs/*|target/*|*/target/*|build/*|*/build/*|vendor/*|*/vendor/*|Cargo.lock|*/Cargo.lock)
     deny "Whole-file read blocked: $rel_path. Search first or request a line range."
     ;;
 esac
 
-case "$path" in
-  /*) fs_path="$path" ;;
-  *) fs_path="$REPO_ROOT/$path" ;;
-esac
 [[ -f "$fs_path" ]] || exit 0
 
 size="$(stat -c%s -- "$fs_path" 2>/dev/null || echo 0)"

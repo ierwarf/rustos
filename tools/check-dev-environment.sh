@@ -61,7 +61,7 @@ if jq -s -e '
     ($launch.configurations | length) == 1 and
     ($launch.configurations[0] | .name == "RustOS: verified KVM desktop" and
       .type == "node-terminal" and .request == "launch" and
-      .command == "exec cargo xtask kvm-run --build --rustos-vcpus 8" and
+      .command == "exec cargo xtask kvm-run --build --rustos-vcpus 16" and
       .cwd == "${workspaceFolder}") and
     ($launch.configurations[0] | has("preLaunchTask") | not) and
     ([$launch | .. | strings | select(. == "build-dvm")] | length) == 0 and

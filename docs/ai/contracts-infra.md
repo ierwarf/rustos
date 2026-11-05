@@ -21,12 +21,14 @@ Package/stage schemas, runtime control, kernel API, build, fault injection, logg
   commit gating, the remote-agent commit stage, and lightweight CI all run it;
   relaxing a ceiling or adding a stable-prefix file/MCP is an explicit contract
   change rather than incidental infrastructure cleanup.
-- GitHub Actions use a fixed Ubuntu image, commit-pinned actions, bounded job
-  timeouts, and pull-request concurrency cancellation. The check job validates
-  shell syntax and the hook contract before compiling RustOS.
-- The Rust post-edit hook may reuse success only for an identical hash of all
-  staged, unstaged, and untracked content in the same canonical worktree.
-  Elapsed time alone is never evidence that a later edit passed.
+- Hosted GitHub Actions jobs use pinned Ubuntu images; agent jobs use explicit
+  self-hosted runner labels. Workflows pin actions and set bounded job timeouts
+  and concurrency cancellation. Rust CI runs formatting,
+  config/workspace checks, and host tests; the separate AI-context workflow
+  validates the context-contract script's syntax and policy checks.
+- Agent hooks do not run post-edit Rust checks or maintain reusable success
+  stamps. Validation runs explicitly after coherent batches; see
+  `token-policy.md` for guard and commit-hook behavior.
 
 ## Package Manifest
 
@@ -92,6 +94,11 @@ or launch policy.
 
 ## Fuzzing
 
+- `cargo xtask fuzz-host` replays built-in seeds followed by `--corpus` files
+  in sorted path order, verbatim, before deterministic mutation rounds. The
+  iteration budget includes replay; use enough iterations to reach every seed
+  and the desired mutation rounds. Each round applies one mutation operation
+  to every seed rather than fixing one seed to one operation.
 - Policy: `config/rustos.toml` `[fuzzing]`.
 - `enabled=false` removes `abifuzz.desktop` autostart from the staged image
   and excludes the `abifuzz` package from desktop/runtime launch registries.

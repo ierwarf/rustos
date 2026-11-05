@@ -26,28 +26,11 @@ forbid_regex() {
   if grep -Eq -- "$pattern" "$path"; then bad "$label"; else ok "$label"; fi
 }
 
-read_default() {
-  local path="$1" name="$2"
-  grep -Eo "${name}:-[0-9]+" "$path" | head -n 1 | sed 's/.*:-//'
-}
-
-assert_max_default() {
-  local path="$1" name="$2" limit="$3" value
-  value="$(read_default "$path" "$name" || true)"
-  if [[ "$value" =~ ^[0-9]+$ ]] && (( value <= limit )); then
-    ok "$name default <= $limit ($value)"
-  else
-    bad "$name default missing or above $limit (${value:-missing})"
-  fi
-}
-
 # Stable/model-visible context budgets. These are ceilings, not targets.
 max_bytes AGENTS.md 7000
 max_bytes docs/ai/token-policy.md 7000
 max_bytes docs/ai-map.md 6000
 max_bytes .claude/hooks/session_context.sh 768
-
-# OMP project configuration was retired; no OMP-specific startup contract remains.
 
 initial_prompt_line="$(grep -E '^initial_prompt:' .serena/project.yml || true)"
 initial_prompt_bytes="$(printf '%s' "$initial_prompt_line" | wc -c)"
@@ -106,7 +89,7 @@ forbid_regex .github/workflows/agent-tools-bootstrap.yml '\.claude/hooks/\*\*|\.
   "Serena bootstrap is not retriggered by unrelated hook/environment checks"
 
 # Stale policies that previously caused context/tool inflation must not reappear.
-stale_paths=(AGENTS.md .serena .agents/skills docs/ai docs/ai-map.md .claude/config.toml)
+stale_paths=(AGENTS.md .serena .agents/skills docs/ai docs/ai-map.md .claude/settings.json)
 stale_log="$(mktemp)"
 trap 'rm -f "$stale_log"' EXIT
 if git grep -n -E 'mcp-ripgrep|mcp_servers\.ripgrep|GPT-5\.4 mini' -- \

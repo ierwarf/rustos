@@ -11,15 +11,19 @@
 //!   not build.
 //! - **Failure:** a failing stage prints its first relevant diagnostic, at most
 //!   120 trailing lines, and its exact command line. The complete captured
-//!   output is retained at `build/verify/<stage>.log` for follow-up.
+//!   output is retained at `build/verify/<stage>.log` for follow-up. Passing
+//!   stages replace their logs too, so stale failures never describe a pass.
 //! - **Forbidden:** no stage may be skipped silently, and the formal seal must
 //!   be the last thing before a boot lane - a seal binds the source tree, so
 //!   anything that edits tracked files after it invalidates it.
 //! - **Evidence:** `docs/ai/commands.md`.
 
+use std::collections::VecDeque;
 use std::ffi::OsStr;
-use std::fs;
-use std::process::Command;
+use std::fs::{self, File};
+use std::io::{BufRead, BufReader};
+use std::path::Path;
+use std::process::{Command, ExitStatus, Stdio};
 use std::time::Instant;
 
 use anyhow::{Context, Result, bail};
@@ -38,8 +42,8 @@ use crate::config::Config;
 ///   tree hash, so any edit after `verify-all.sh` invalidates it, and the
 ///   resulting `formal verification run binding mismatch` reads exactly like a
 ///   boot failure. Ordering the stages here makes that unrepresentable.
-/// - **Testing packages the wrong way.** `rootd` is a freestanding binary
-///   whose default `cargo test` harness segfaults; its real tests need
+/// - **Testing packages the wrong way.** `rootd` and `procd` are freestanding
+///   binaries whose default `cargo test` harnesses segfault; their tests need
 ///   `--features host-test`. That knowledge lived nowhere and cost a
 ///   `cargo test --workspace` false alarm.
 pub(crate) fn verify(
@@ -51,27 +55,14 @@ pub(crate) fn verify(
 ) -> Result<()> {
     let started = Instant::now();
 
-    run_stage("check", || crate::build::check(config, false))?;
-    run_stage("build", || crate::build::build(config, false))?;
+    let xtask = std::env::current_exe().context("locate xtask for verify stages")?;
+    run_captured(config, "check", &xtask, &["check"])?;
+    run_captured(config, "build", &xtask, &["build"])?;
 
-    // The freestanding service binaries are excluded from the sweep and tested
-    // through the feature that gives them a native harness. `--workspace`
-    // alone builds their linker entrypoint into a libtest binary, which
-    // segfaults before a single test reports.
-    run_captured(
-        config,
-        "host-tests",
-        &config.cargo,
-        &["test", "--workspace", "--exclude", "rootd"],
-    )?;
-    run_captured(
-        config,
-        "host-tests-freestanding",
-        &config.cargo,
-        &["test", "-p", "rootd", "--features", "host-test"],
-    )?;
-
-    run_captured(config, "formal-selftest", "bash", &["formal/selftest.sh"])?;
+    // Both services' build scripts need their native feature to omit the
+    // freestanding linker entrypoint. Enable these within the workspace sweep
+    // instead of testing the same dependency closure a second time.
+    run_captured(config, "host-tests", &config.cargo, HOST_TEST_ARGS)?;
 
     // Last, and deliberately last: this seals the source tree, and every stage
     // above may edit generated evidence that the seal covers.
@@ -114,18 +105,12 @@ pub(crate) fn verify(
     Ok(())
 }
 
-fn run_stage<F>(name: &str, stage: F) -> Result<()>
-where
-    F: FnOnce() -> Result<()>,
-{
-    let started = Instant::now();
-    stage().with_context(|| format!("verify stage `{name}` failed"))?;
-    println!(
-        "xtask: verify {name} passed elapsed_seconds={}",
-        started.elapsed().as_secs()
-    );
-    Ok(())
-}
+const HOST_TEST_ARGS: &[&str] = &[
+    "test",
+    "--workspace",
+    "--features",
+    "rootd/host-test,procd/host-test",
+];
 
 const FAILURE_TAIL_LINES: usize = 120;
 
@@ -138,33 +123,28 @@ fn run_captured(
 ) -> Result<()> {
     let started = Instant::now();
     let program = program.as_ref();
-    let output = Command::new(program)
+    let log_dir = config.build_dir.join("verify");
+    fs::create_dir_all(&log_dir)
+        .with_context(|| format!("create verify log directory `{}`", log_dir.display()))?;
+    let log_path = log_dir.join(format!("{}.log", stage_log_stem(name)));
+    let mut command = Command::new(program);
+    command
         .args(args)
         .current_dir(&config.root_dir)
-        .env("CARGO_TARGET_DIR", &config.cargo_target_dir)
-        .output()
+        .env("CARGO_TARGET_DIR", &config.cargo_target_dir);
+    let status = capture_command(&mut command, &log_path)
         .with_context(|| format!("run verify stage `{name}`: {}", args.join(" ")))?;
-    if !output.status.success() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    if !status.success() {
         let command = rerun_command(config, program, args);
-        let log_dir = config.build_dir.join("verify");
-        fs::create_dir_all(&log_dir)
-            .with_context(|| format!("create verify log directory `{}`", log_dir.display()))?;
-        let log_path = log_dir.join(format!("{}.log", stage_log_stem(name)));
-        fs::write(&log_path, captured_output(&stdout, &stderr))
-            .with_context(|| format!("write failed verify stage log `{}`", log_path.display()))?;
+        let (diagnostic, tail) = failure_context(&log_path)?;
 
-        eprintln!("xtask: verify {name} failed status={}", output.status);
+        eprintln!("xtask: verify {name} failed status={}", status);
         eprintln!("rerun: {command}");
-        if let Some(diagnostic) =
-            first_relevant_diagnostic(&stderr).or_else(|| first_relevant_diagnostic(&stdout))
-        {
+        if let Some(diagnostic) = diagnostic {
             eprintln!("first diagnostic: {diagnostic}");
         } else {
             eprintln!("first diagnostic: <none matched; inspect the bounded tail>");
         }
-        let tail = failure_tail(&stdout, &stderr);
         eprintln!("last {} lines:", tail.len());
         for line in tail {
             eprintln!("{line}");
@@ -179,18 +159,34 @@ fn run_captured(
     Ok(())
 }
 
-fn captured_output(stdout: &str, stderr: &str) -> String {
-    format!("--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}")
+// Write directly to a shared file description: output remains ordered and a
+// verbose compiler/proof lane cannot accumulate its full log in xtask's heap.
+fn capture_command(command: &mut Command, log_path: &Path) -> Result<ExitStatus> {
+    let log = File::create(log_path)
+        .with_context(|| format!("create verify stage log `{}`", log_path.display()))?;
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log.try_clone()?))
+        .stderr(Stdio::from(log))
+        .status()
+        .with_context(|| format!("execute {command:?}"))
 }
 
-fn failure_tail(stdout: &str, stderr: &str) -> Vec<String> {
-    let mut lines = Vec::new();
-    lines.push("--- stdout ---".to_owned());
-    lines.extend(stdout.lines().map(str::to_owned));
-    lines.push("--- stderr ---".to_owned());
-    lines.extend(stderr.lines().map(str::to_owned));
-    let start = lines.len().saturating_sub(FAILURE_TAIL_LINES);
-    lines[start..].to_vec()
+fn failure_context(log_path: &Path) -> Result<(Option<String>, VecDeque<String>)> {
+    let mut diagnostic = None;
+    let mut tail = VecDeque::with_capacity(FAILURE_TAIL_LINES);
+    for line in BufReader::new(File::open(log_path)?).split(b'\n') {
+        let line = line?;
+        let line = String::from_utf8_lossy(&line).into_owned();
+        if diagnostic.is_none() {
+            diagnostic = first_relevant_diagnostic(&line).map(str::to_owned);
+        }
+        if tail.len() == FAILURE_TAIL_LINES {
+            tail.pop_front();
+        }
+        tail.push_back(line);
+    }
+    Ok((diagnostic, tail))
 }
 
 fn first_relevant_diagnostic(output: &str) -> Option<&str> {
@@ -218,9 +214,10 @@ fn rerun_command(config: &Config, program: &OsStr, args: &[&str]) -> String {
 }
 
 fn shell_quote(value: &str) -> String {
-    if value
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || b"-_./:=+".contains(&byte))
+    if !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_./:=+".contains(&byte))
     {
         return value.to_owned();
     }
@@ -247,20 +244,71 @@ fn stage_log_stem(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{FAILURE_TAIL_LINES, failure_tail, first_relevant_diagnostic, stage_log_stem};
+    use super::*;
 
     #[test]
-    fn failure_tail_is_bounded_to_the_declared_limit() {
-        let stdout = (0..200)
-            .map(|line| format!("stdout-{line}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let tail = failure_tail(&stdout, "stderr-final");
+    fn failure_context_is_bounded_and_keeps_the_first_diagnostic() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("stage.log");
+        let output = (0..200)
+            .map(|line| format!("progress-{line}\n"))
+            .collect::<String>();
+        fs::write(&path, format!("error: first failure\n{output}final line\n")).unwrap();
+        let (diagnostic, tail) = failure_context(&path).unwrap();
 
+        assert_eq!(diagnostic.as_deref(), Some("error: first failure"));
         assert_eq!(tail.len(), FAILURE_TAIL_LINES);
-        assert_eq!(tail.last().map(String::as_str), Some("stderr-final"));
-        assert!(tail.iter().any(|line| line == "stdout-199"));
-        assert!(!tail.iter().any(|line| line == "stdout-0"));
+        assert_eq!(tail.back().map(String::as_str), Some("final line"));
+        assert!(tail.iter().any(|line| line == "progress-199"));
+        assert!(!tail.iter().any(|line| line == "progress-0"));
+    }
+
+    #[test]
+    fn capture_command_retains_both_streams_on_success_and_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("stage.log");
+        for code in [0, 7] {
+            let mut command = Command::new("bash");
+            command.args([
+                "-c",
+                &format!("printf 'out\n'; printf 'error: err\n' >&2; exit {code}"),
+            ]);
+            let status = capture_command(&mut command, &path).unwrap();
+            assert_eq!(status.code(), Some(code));
+            assert_eq!(fs::read_to_string(&path).unwrap(), "out\nerror: err\n");
+        }
+    }
+
+    #[test]
+    fn failure_context_accepts_non_utf8_tool_output() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("stage.log");
+        fs::write(&path, b"error: \xff\n").unwrap();
+        let (diagnostic, tail) = failure_context(&path).unwrap();
+        assert_eq!(diagnostic.as_deref(), Some("error: \u{fffd}"));
+        assert_eq!(tail.len(), 1);
+    }
+
+    #[test]
+    fn host_tests_enable_each_freestanding_native_harness() {
+        assert!(HOST_TEST_ARGS.contains(&"--workspace"));
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let features = HOST_TEST_ARGS[HOST_TEST_ARGS
+            .iter()
+            .position(|arg| *arg == "--features")
+            .unwrap()
+            + 1];
+        for package in ["rootd", "procd"] {
+            let text =
+                fs::read_to_string(root.join(format!("services/{package}/Cargo.toml"))).unwrap();
+            let manifest: toml::Value = toml::from_str(&text).unwrap();
+            assert!(manifest["features"].get("host-test").is_some());
+            assert!(
+                features
+                    .split(',')
+                    .any(|feature| feature == format!("{package}/host-test"))
+            );
+        }
     }
 
     #[test]
@@ -270,6 +318,19 @@ mod tests {
             Some("thread panicked: bad state")
         );
         assert_eq!(first_relevant_diagnostic("progress\ncomplete\n"), None);
+    }
+
+    #[test]
+    fn shell_quote_preserves_empty_arguments_and_metacharacters() {
+        assert_eq!(shell_quote(""), "''");
+        for value in ["", "simple/path", "a'b", "with spaces", "$(exit 7)"] {
+            let output = Command::new("bash")
+                .args(["-c", &format!("printf '%s' {}", shell_quote(value))])
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            assert_eq!(output.stdout, value.as_bytes());
+        }
     }
 
     #[test]

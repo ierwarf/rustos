@@ -14,11 +14,12 @@ Ubuntu/Debian baseline:
 sudo apt update
 sudo apt install -y rustup gcc nasm mingw-w64 grub-efi-amd64-bin grub-common gnupg libelf-dev
 
-rustup default nightly
-rustup component add rust-src llvm-tools-preview
-rustup target add x86_64-unknown-linux-gnu
+rustup show
+rustup component add llvm-tools-preview
 ```
 
+Run the Rust commands from the checkout so `rust-toolchain.toml` selects the
+pinned toolchain, components, and targets; no global default change is needed.
 `libelf-dev` is required only when building the Linux DVM. RustOS uses the
 repository-pinned firmware at `vendor/firmware/ovmf/OVMF.fd`; set `OVMF_PATH`
 only for a deliberate replacement.
@@ -80,11 +81,12 @@ Ubuntu/Debian 기준:
 sudo apt update
 sudo apt install -y rustup gcc nasm mingw-w64 grub-efi-amd64-bin grub-common gnupg libelf-dev
 
-rustup default nightly
-rustup component add rust-src llvm-tools-preview
-rustup target add x86_64-unknown-linux-gnu
+rustup show
+rustup component add llvm-tools-preview
 ```
 
+Rust 명령은 checkout에서 실행하세요. `rust-toolchain.toml`이 고정된 toolchain,
+component, target을 선택하므로 global default를 바꿀 필요가 없습니다.
 `libelf-dev`는 Linux DVM 빌드에만 필요합니다. RustOS는
 `vendor/firmware/ovmf/OVMF.fd`의 고정 firmware를 사용합니다. `OVMF_PATH`는
 의도적으로 교체할 때만 지정하세요.

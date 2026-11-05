@@ -248,14 +248,8 @@ where
         }
         crate::build::build(config, false)?;
     }
-    // Seal once, here, before any boot and before the repeat loop.
-    //
-    // A multi-vCPU boot validates the formal profile at spawn time, and an
-    // unsealed profile fails with `formal verification run binding mismatch` -
-    // which reads exactly like a boot failure and is not one. Every working
-    // tree is unsealed the moment it is edited, so refusing here just asks the
-    // caller to run a command this process can run itself. `--repeat` made it
-    // worse: it burned every run in the batch on the same stale seal.
+    // Check once before the repeat loop. Only iteration/qualification modes
+    // auto-seal; ordinary developer launches warn without claiming a seal.
     if options.rustos_vcpus > 1 && options.auto_verify {
         if options.smp_iteration || options.smp_ring3_qualification {
             // These modes publish acceptance evidence, so they keep the strict
@@ -465,7 +459,16 @@ fn run_one_smoke_unarchived(
         // Preserve the already-latched failure, then stop both guests as usual.
         if options.physical_gpu_bdf.is_none() {
             match failure_snapshot::capture(config, &layout, options.rustos_vcpus) {
-                Ok(path) => eprintln!("xtask: failure-only CPU snapshot (possibly partial): {}", path.display()),
+                Ok(snapshot) => match snapshot.collection {
+                    Ok(()) => eprintln!(
+                        "xtask: failure-only CPU snapshot (complete): {}",
+                        snapshot.path.display(),
+                    ),
+                    Err(error) => eprintln!(
+                        "xtask: failure-only CPU snapshot (partial: {error:#}): {}",
+                        snapshot.path.display(),
+                    ),
+                },
                 Err(error) => eprintln!("xtask: could not capture failed guest CPU state: {error:#}"),
             }
         }

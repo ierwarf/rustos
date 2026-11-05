@@ -86,7 +86,7 @@ impl Monitor {
     fn remaining(&self) -> Result<Duration> {
         let remaining = self.deadline.saturating_duration_since(Instant::now());
         ensure!(!remaining.is_zero(), "failure snapshot read budget expired");
-        Ok(remaining.min(Duration::from_millis(500)))
+        Ok(remaining)
     }
 
     fn prompt(&mut self) -> Result<()> {
@@ -311,6 +311,11 @@ fn diagnostic_handle_index(handle: u64, capacity: u64) -> Option<u64> {
     (handle >> 16 != 0 && encoded != 0 && encoded <= capacity).then(|| encoded - 1)
 }
 
+pub(super) struct CapturedSnapshot {
+    pub path: std::path::PathBuf,
+    pub collection: Result<()>,
+}
+
 /// Capture only after readiness/recovery has already failed. The caller still
 /// stops both guests immediately afterwards; no resume or new acceptance pass.
 /// Incomplete captures are explicitly labelled and remain useful diagnostics.
@@ -318,7 +323,7 @@ pub(super) fn capture(
     config: &Config,
     layout: &KvmLayout,
     vcpus: u8,
-) -> Result<std::path::PathBuf> {
+) -> Result<CapturedSnapshot> {
     let kernel = config.artifact_nucleus_elf_path();
     let kernel_sha = format!("{:x}", Sha256::digest(std::fs::read(&kernel)?));
     let mut text = format!(
@@ -375,19 +380,23 @@ pub(super) fn capture(
         text.push_str(&String::from_utf8_lossy(&monitor.transcript));
         result
     })();
-    match collection {
+    write_capture(&layout.run_dir, text, collection)
+}
+
+fn write_capture(run_dir: &Path, mut text: String, collection: Result<()>) -> Result<CapturedSnapshot> {
+    match &collection {
         Ok(()) => text.push_str("\ncollection=complete\n"),
         Err(error) => text.push_str(&format!("\ncollection=partial error={error:#}\n")),
     }
     let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
-    let path = layout.run_dir.join(format!("failure-snapshot-{nonce}.log"));
+    let path = run_dir.join(format!("failure-snapshot-{nonce}.log"));
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
         .open(&path)?;
     file.write_all(text.as_bytes())?;
-    Ok(path)
+    Ok(CapturedSnapshot { path, collection })
 }
 
 /// A post-failure read window inside the original usable kernel-stack bounds.
@@ -410,6 +419,44 @@ mod tests {
     use super::*;
     use std::io::{BufRead, BufReader};
     use std::os::unix::net::UnixListener;
+
+    #[test]
+    fn snapshot_result_and_artifact_agree_on_collection_completeness() {
+        let dir = tempfile::tempdir().unwrap();
+        for (collection, footer) in [
+            (Ok(()), "collection=complete"),
+            (
+                Err(anyhow::anyhow!("monitor disconnected")),
+                "collection=partial error=monitor disconnected",
+            ),
+        ] {
+            let complete = collection.is_ok();
+            let snapshot = write_capture(dir.path(), "diagnostic_only=true\n".to_owned(), collection)
+                .unwrap();
+            assert_eq!(snapshot.collection.is_ok(), complete);
+            let text = std::fs::read_to_string(&snapshot.path).unwrap();
+            assert!(text.ends_with(&format!("{footer}\n")), "{text}");
+        }
+    }
+
+    #[test]
+    fn monitor_uses_the_remaining_budget_instead_of_a_half_second_idle_timeout() {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let mut monitor = Monitor {
+            stream: client,
+            deadline: Instant::now() + Duration::from_secs(2),
+            transcript: Vec::new(),
+        };
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                std::thread::sleep(Duration::from_millis(600));
+                server.write_all(b"QEMU monitor\n(qemu) ").unwrap();
+            });
+            monitor.prompt().unwrap();
+        });
+        monitor.deadline = Instant::now();
+        assert!(monitor.prompt().is_err());
+    }
 
     #[test]
     fn blocked_stack_diagnostic_stays_within_original_usable_kernel_range() {

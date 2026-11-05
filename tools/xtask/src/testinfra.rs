@@ -1,4 +1,4 @@
-use anyhow::{anyhow, bail};
+use anyhow::bail;
 use fs_err as fs;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
@@ -30,6 +30,7 @@ pub(crate) fn selftest(config: &Config) -> Result<()> {
             .arg("test")
             .arg("-p")
             .arg(package)
+            .current_dir(&config.root_dir)
             .env("CARGO_TARGET_DIR", &config.cargo_target_dir);
         run_command(&mut command)?;
     }
@@ -102,8 +103,7 @@ fn run_target(
     let seeds = load_seeds(target, corpus)?;
     let mut state = 0x5255_5354_4f53_u64 ^ iterations as u64;
     for index in 0..iterations {
-        let seed = &seeds[index % seeds.len()];
-        let bytes = mutate(seed, index, &mut state);
+        let bytes = fuzz_input(&seeds, index, &mut state);
         let result = catch_unwind(AssertUnwindSafe(|| exercise_target(target, &bytes)));
         if result.is_err() {
             let crash_path = write_crash(config, target, index, &bytes)?;
@@ -126,15 +126,17 @@ fn run_target(
 fn load_seeds(target: FuzzTarget, corpus: Option<&Path>) -> Result<Vec<Vec<u8>>> {
     let mut seeds = default_seeds(target);
     if let Some(corpus) = corpus {
+        let mut paths = Vec::new();
         for entry in fs::read_dir(corpus)? {
             let entry = entry?;
             if entry.file_type()?.is_file() {
-                seeds.push(fs::read(entry.path())?);
+                paths.push(entry.path());
             }
         }
-    }
-    if seeds.is_empty() {
-        return Err(anyhow!("no fuzz seeds available for {}", target.name()));
+        paths.sort();
+        for path in paths {
+            seeds.push(fs::read(path)?);
+        }
     }
     Ok(seeds)
 }
@@ -147,7 +149,7 @@ fn default_seeds(target: FuzzTarget) -> Vec<Vec<u8>> {
             b"alloc.frame=drop-every:32".to_vec(),
         ],
         FuzzTarget::ProjectConfig => vec![
-            b"[kernel.build]\ncodegen_units=1\nopt_level=\"2\"\noverflow_checks=true\ndebug_assertions=false\nlto=\"off\"\nforce_frame_pointers=true\nincremental=false\ndebuginfo=\"1\"\nembed_bitcode=false\npanic=\"abort\"\nrelocation_model=\"none\"\nstrip=\"none\"\nextra_rustflags=[]\n[fault_injection]\nenabled=false\nrules=[]\n".to_vec(),
+            b"[kernel.build]\ncodegen_units=1\nopt_level=\"2\"\noverflow_checks=true\ndebug_assertions=false\nlto=\"off\"\nforce_frame_pointers=true\nincremental=false\ndebuginfo=\"1\"\nembed_bitcode=false\npanic=\"abort\"\nrelocation_model=\"pic\"\nstrip=\"none\"\nextra_rustflags=[]\n[fault_injection]\nenabled=false\nrules=[]\n".to_vec(),
             b"[fault_injection]\nenabled=true\nrules=[\"display.present=fail\"]\n".to_vec(),
         ],
         FuzzTarget::PackageManifest => vec![
@@ -350,6 +352,19 @@ fn exercise_image_admission(bytes: &[u8]) {
     let _ = validate_pe64_import_table(&image, reloc_rva, reloc_size, 65_536);
 }
 
+// Replay each seed before mutation, then apply every mutation to every seed.
+// Using the iteration for both choices locks a seed to one operation whenever
+// the seed count is a multiple of the mutation count.
+fn fuzz_input(seeds: &[Vec<u8>], index: usize, state: &mut u64) -> Vec<u8> {
+    let seed = &seeds[index % seeds.len()];
+    let round = index / seeds.len();
+    if round == 0 {
+        seed.clone()
+    } else {
+        mutate(seed, round - 1, state)
+    }
+}
+
 fn mutate(seed: &[u8], index: usize, state: &mut u64) -> Vec<u8> {
     let mut out = seed.to_vec();
     if out.is_empty() {
@@ -391,4 +406,55 @@ fn write_crash(
         .join(format!("fuzz-crash-{}-{}.bin", target.name(), index));
     fs::write(&path, bytes)?;
     Ok(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fuzz_input_replays_seeds_before_rotating_all_mutations() {
+        let seeds = vec![b"abcdef".to_vec(); 6];
+        let mut state = 123;
+        for (index, seed) in seeds.iter().enumerate() {
+            assert_eq!(fuzz_input(&seeds, index, &mut state), *seed);
+        }
+        for operation in 0..6 {
+            for seed in 0..seeds.len() {
+                let index = (operation + 1) * seeds.len() + seed;
+                let mut expected_state = state;
+                let expected = mutate(&seeds[seed], operation, &mut expected_state);
+                assert_eq!(fuzz_input(&seeds, index, &mut state), expected);
+                assert_eq!(state, expected_state);
+            }
+        }
+    }
+
+    #[test]
+    fn corpus_seeds_are_loaded_in_path_order_and_replayed_exactly() {
+        let corpus = tempfile::tempdir().unwrap();
+        fs::write(corpus.path().join("z-crash"), b"\xff\0").unwrap();
+        fs::write(corpus.path().join("a-crash"), b"first").unwrap();
+        fs::create_dir(corpus.path().join("ignored-directory")).unwrap();
+        let defaults = default_seeds(FuzzTarget::FaultRules).len();
+        let seeds = load_seeds(FuzzTarget::FaultRules, Some(corpus.path())).unwrap();
+        assert_eq!(seeds.len(), defaults + 2);
+        let mut state = 123;
+        assert_eq!(fuzz_input(&seeds, defaults, &mut state), b"first");
+        assert_eq!(fuzz_input(&seeds, defaults + 1, &mut state), b"\xff\0");
+    }
+
+    #[test]
+    fn project_config_fuzz_seeds_are_admitted() {
+        for seed in default_seeds(FuzzTarget::ProjectConfig) {
+            validate_project_config_text(std::str::from_utf8(&seed).unwrap()).unwrap();
+        }
+    }
+
+    #[test]
+    fn mutations_handle_empty_seeds() {
+        for operation in 0..6 {
+            let _ = mutate(&[], operation, &mut 123);
+        }
+    }
 }

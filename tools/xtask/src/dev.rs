@@ -93,6 +93,7 @@ fn changed_paths(root: &Path) -> Result<Vec<PathBuf>> {
         &[
             "diff",
             "--name-only",
+            "--no-renames",
             "-z",
             "--diff-filter=ACDMRTUXB",
             "HEAD",
@@ -153,7 +154,8 @@ fn classify_changes(root: &Path, paths: &[PathBuf]) -> DevPlan {
             continue;
         };
 
-        if path.extension().is_some_and(|extension| extension == "sh") {
+        if path.extension().is_some_and(|extension| extension == "sh") && root.join(path).is_file()
+        {
             plan.push_now(format!("bash -n -- {}", shell_quote(path_text)));
         }
 
@@ -190,6 +192,7 @@ fn classify_changes(root: &Path, paths: &[PathBuf]) -> DevPlan {
             formal_source_changed = true;
         }
         if path == Path::new("tools/xtask/src/kvm.rs")
+            || path.starts_with("tools/xtask/src/kvm")
             || path_text.starts_with("libs/driver-domain-")
             || path.starts_with("services/uiserver")
         {
@@ -227,7 +230,8 @@ fn classify_changes(root: &Path, paths: &[PathBuf]) -> DevPlan {
     }
 
     if needs_kvm_dry_run {
-        plan.push_stable("cargo xtask kvm-smoke --dry-run");
+        // Input/layout validation must not trigger the default signed-image rebuild.
+        plan.push_stable("cargo xtask kvm-smoke --dry-run --no-build");
     }
 
     if !plan.stable_batch.is_empty() {
@@ -318,10 +322,6 @@ fn formal_model_name(root: &Path, path: &Path) -> Option<String> {
 
 fn is_documentation(path: &Path) -> bool {
     path.extension().is_some_and(|extension| extension == "md")
-        || matches!(
-            path.to_str(),
-            Some("AGENTS.md" | "CODE_OF_CONDUCT.md" | "CONTRIBUTING.md" | "SECURITY.md")
-        )
 }
 
 fn focused_tlc_command(model: &str) -> String {
@@ -345,6 +345,50 @@ fn push_unique(commands: &mut Vec<String>, command: String) {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn changed_paths_keeps_both_sides_of_renames_and_untracked_paths() {
+        // All Git writes stay inside this disposable repository.
+        let root = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(root.path())
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        git(&["init", "--quiet"]);
+        fs::write(root.path().join("old.sh"), "echo test\n").unwrap();
+        git(&["add", "old.sh"]);
+        let tree = git(&["write-tree"]);
+        let commit = git(&[
+            "-c",
+            "user.name=xtask-test",
+            "-c",
+            "user.email=xtask@example.invalid",
+            "commit-tree",
+            &tree,
+            "-m",
+            "fixture",
+        ]);
+        git(&["update-ref", "HEAD", &commit]);
+        git(&["mv", "old.sh", "new.sh"]);
+        fs::write(root.path().join("untracked.md"), "notes").unwrap();
+        assert_eq!(
+            changed_paths(root.path()).unwrap(),
+            vec![
+                PathBuf::from("new.sh"),
+                PathBuf::from("old.sh"),
+                PathBuf::from("untracked.md"),
+            ]
+        );
+    }
 
     #[test]
     fn docs_only_skips_builds() {
@@ -393,6 +437,8 @@ mod tests {
     #[test]
     fn formal_runner_change_batches_full_proof_gate() {
         let root = tempfile::tempdir().unwrap();
+        fs::create_dir(root.path().join("formal")).unwrap();
+        fs::write(root.path().join("formal/run-tlc.sh"), "exit 0\n").unwrap();
         let plan = classify_changes(root.path(), &[PathBuf::from("formal/run-tlc.sh")]);
         assert!(plan.now.contains(&"bash formal/selftest.sh".to_owned()));
         assert!(
@@ -436,7 +482,7 @@ mod tests {
             vec![
                 "make -C driver-domains/linux rebuild-display",
                 "cargo xtask verify-dvm",
-                "cargo xtask kvm-smoke --dry-run",
+                "cargo xtask kvm-smoke --dry-run --no-build",
             ]
         );
     }
@@ -456,9 +502,34 @@ mod tests {
             vec![
                 "cargo xtask build-dvm",
                 "cargo xtask verify-dvm",
-                "cargo xtask kvm-smoke --dry-run",
+                "cargo xtask kvm-smoke --dry-run --no-build",
             ]
         );
+    }
+
+    #[test]
+    fn deleted_scripts_do_not_get_syntax_checks() {
+        let root = tempfile::tempdir().unwrap();
+        let plan = classify_changes(root.path(), &[PathBuf::from("formal/retired.sh")]);
+        assert!(
+            !plan
+                .now
+                .iter()
+                .any(|command| command.starts_with("bash -n"))
+        );
+        assert!(plan.now.contains(&"bash formal/selftest.sh".to_owned()));
+    }
+
+    #[test]
+    fn nested_kvm_modules_get_the_same_dry_run_as_the_entry_module() {
+        let root = tempfile::tempdir().unwrap();
+        for path in ["tools/xtask/src/kvm.rs", "tools/xtask/src/kvm/smoke.rs"] {
+            let plan = classify_changes(root.path(), &[PathBuf::from(path)]);
+            assert!(
+                plan.stable_batch
+                    .contains(&"cargo xtask kvm-smoke --dry-run --no-build".to_owned())
+            );
+        }
     }
 
     #[test]

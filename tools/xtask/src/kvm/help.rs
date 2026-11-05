@@ -122,6 +122,8 @@ options:
   --dry-run            validate inputs and prepare KVM log paths without launching QEMU
   -h, --help           show this help
 
+Option values cannot start with --; prefix such paths with ./.
+
 The default proof requires RustOS to reach init handoff and the L0-style host
 broker to complete an authenticated Linux-DVM health/inventory/input-stream
 handshake. A real key requires a physical input source assigned to the DVM;

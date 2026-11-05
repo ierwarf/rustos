@@ -508,6 +508,35 @@ fn append_fault_injection(config: &Config, command: &mut Command) {
     }
 }
 
+/// Drain readiness and any already-queued terminal error together. Reading only
+/// one message can accept readiness while a failure is waiting in the same queue.
+fn poll_input_relay(
+    control_relay: &Receiver<Result<ProbeResult>>,
+    control_ready: &mut Option<ProbeResult>,
+) -> Result<()> {
+    loop {
+        match control_relay.try_recv() {
+            Ok(Ok(probe)) => {
+                if control_ready.replace(probe).is_some() {
+                    bail!("Linux DVM input relay reported readiness more than once");
+                }
+            }
+            Ok(Err(error)) => {
+                let phase = if control_ready.is_some() {
+                    "after readiness"
+                } else {
+                    "before readiness"
+                };
+                return Err(error).with_context(|| format!("Linux DVM input relay failed {phase}"));
+            }
+            Err(mpsc::TryRecvError::Disconnected) if control_ready.is_none() => {
+                bail!("Linux DVM host input relay terminated without a readiness result");
+            }
+            Err(mpsc::TryRecvError::Empty | mpsc::TryRecvError::Disconnected) => return Ok(()),
+        }
+    }
+}
+
 fn wait_for_parallel_boot(
     rustos: &mut Child,
     dvm: &mut Child,
@@ -553,35 +582,18 @@ fn wait_for_parallel_boot(
             .iter()
             .all(|marker| dvm_log.contains(marker));
         let dvm_gpu_ready = required_dvm_gpu_ready(options, &dvm_log, gpu_evidence);
-        match control_relay.try_recv() {
-            Ok(Ok(probe)) => {
-                if control_ready.replace(probe).is_some() {
-                    bail!("Linux DVM input relay reported readiness more than once");
-                }
-            }
-            Ok(Err(error)) => {
-                let phase = if control_ready.is_some() {
-                    "after readiness"
-                } else {
-                    "before readiness"
-                };
-                let reason = format!("Linux DVM input relay failed {phase}: {error:#}");
-                let evidence = write_kvm_failure_summary(
-                    layout,
-                    &reason,
-                    boot_started.elapsed(),
-                    &rustos_log,
-                    &dvm_log,
-                    &[],
-                    &[],
-                )?;
-                bail!("{reason}; evidence={}", evidence.display());
-            }
-            Err(mpsc::TryRecvError::Empty) => {}
-            Err(mpsc::TryRecvError::Disconnected) if control_ready.is_none() => {
-                bail!("Linux DVM host input relay terminated without a readiness result")
-            }
-            Err(mpsc::TryRecvError::Disconnected) => {}
+        if let Err(error) = poll_input_relay(control_relay, &mut control_ready) {
+            let reason = format!("{error:#}");
+            let evidence = write_kvm_failure_summary(
+                layout,
+                &reason,
+                boot_started.elapsed(),
+                &rustos_log,
+                &dvm_log,
+                &[],
+                &[],
+            )?;
+            bail!("{reason}; evidence={}", evidence.display());
         }
         let ui_render_fps_ready = options.min_ui_fps.is_none_or(|minimum| {
             uiserver_profile_meets_fps(&rustos_log, minimum, options.ui_proof_windows)
@@ -975,15 +987,8 @@ fn wait_for_rustos_reboot_recovery(
         {
             bail!("RustOS reboot recovery observed a watchdog, stall, crash, or relay stop");
         }
-        match control_relay.try_recv() {
-            Ok(Ok(probe)) => control_ready = Some(probe),
-            Ok(Err(error)) => return Err(error).context("RustOS reboot cohort input relay"),
-            Err(mpsc::TryRecvError::Empty) => {}
-            Err(mpsc::TryRecvError::Disconnected) if control_ready.is_none() => {
-                bail!("RustOS reboot cohort relay disconnected before authentication")
-            }
-            Err(mpsc::TryRecvError::Disconnected) => {}
-        }
+        poll_input_relay(control_relay, &mut control_ready)
+            .context("RustOS reboot cohort input relay")?;
         let base_ready = [
             RUSTOS_REBOOT_ENTRY_MARKER,
             RUSTOS_BOOT_MARKER,
@@ -1068,15 +1073,8 @@ fn wait_for_dvm_restart_recovery(
         {
             bail!("DVM restart recovery observed a watchdog, stall, crash, or relay stop");
         }
-        match control_relay.try_recv() {
-            Ok(Ok(probe)) => control_ready = Some(probe),
-            Ok(Err(error)) => return Err(error).context("restarted DVM input relay"),
-            Err(mpsc::TryRecvError::Empty) => {}
-            Err(mpsc::TryRecvError::Disconnected) if control_ready.is_none() => {
-                bail!("restarted DVM input relay disconnected before authentication")
-            }
-            Err(mpsc::TryRecvError::Disconnected) => {}
-        }
+        poll_input_relay(control_relay, &mut control_ready)
+            .context("restarted DVM input relay")?;
         let dvm_ready = options
             .expected_dvm_markers
             .iter()
@@ -1106,5 +1104,78 @@ fn wait_for_dvm_restart_recovery(
             );
         }
         thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[cfg(test)]
+mod input_relay_tests {
+    use super::*;
+
+    fn probe() -> ProbeResult {
+        ProbeResult {
+            peer_cid: MIN_DVM_GUEST_CID,
+            inventory_count: 1,
+            driver_inventory: rustos_driver_domain_host::DvmDriverInventory {
+                virtio_net_bound: false,
+                virtio_gpu_bound: false,
+                display_driver_bound: false,
+                display_relay_ready: false,
+            },
+            display_evidence: None,
+            block_evidence: None,
+        }
+    }
+
+    #[test]
+    fn queued_relay_failure_cannot_hide_behind_readiness() {
+        let (sender, receiver) = mpsc::sync_channel(2);
+        sender.send(Ok(probe())).unwrap();
+        sender
+            .send(Err(anyhow::anyhow!("stream disconnected")))
+            .unwrap();
+        let error = poll_input_relay(&receiver, &mut None).unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            "Linux DVM input relay failed after readiness: stream disconnected"
+        );
+    }
+
+    #[test]
+    fn relay_readiness_is_retained_while_waiting_for_guest_markers() {
+        let (sender, receiver) = mpsc::sync_channel(2);
+        let mut ready = None;
+        poll_input_relay(&receiver, &mut ready).unwrap();
+        assert!(ready.is_none());
+        sender.send(Ok(probe())).unwrap();
+        poll_input_relay(&receiver, &mut ready).unwrap();
+        assert_eq!(ready, Some(probe()));
+        poll_input_relay(&receiver, &mut ready).unwrap();
+        assert_eq!(ready, Some(probe()));
+        sender.send(Err(anyhow::anyhow!("later failure"))).unwrap();
+        assert!(poll_input_relay(&receiver, &mut ready).is_err());
+    }
+
+    #[test]
+    fn relay_rejects_duplicate_readiness_in_the_same_poll() {
+        let (sender, receiver) = mpsc::sync_channel(2);
+        sender.send(Ok(probe())).unwrap();
+        sender.send(Ok(probe())).unwrap();
+        let error = poll_input_relay(&receiver, &mut None).unwrap_err();
+        assert!(error.to_string().contains("readiness more than once"));
+    }
+
+    #[test]
+    fn relay_failure_or_disconnect_before_authentication_is_not_readiness() {
+        let (sender, receiver) = mpsc::sync_channel(2);
+        sender
+            .send(Err(anyhow::anyhow!("authentication failed")))
+            .unwrap();
+        let error = poll_input_relay(&receiver, &mut None).unwrap_err();
+        assert_eq!(
+            format!("{error:#}"),
+            "Linux DVM input relay failed before readiness: authentication failed"
+        );
+        drop(sender);
+        assert!(poll_input_relay(&receiver, &mut None).is_err());
     }
 }

@@ -87,4 +87,4 @@ if __name__ == "__main__":
             print(error, file=sys.stderr)
         if errors:
             raise SystemExit(f"documentation layout: {len(errors)} error(s)")
-        print(f"documentation layout passed: owner pages <= {MAX_LINES} lines; local links and headings resolve")
+        print(f"documentation layout passed: local links and headings resolve; {MAX_LINES}-line budget is advisory")

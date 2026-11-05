@@ -11,7 +11,7 @@ not be preloaded for unrelated work.
 
 | File | Role |
 | --- | --- |
-| `token-policy.md` | On-demand context/tool/output budgets and stop limits. |
+| `token-policy.md` | On-demand context/tool/output guidance and hook behavior. |
 | `task-router.md` | On-demand task → smallest context route when ownership or validation is unclear. |
 | `session-handoff.md` | Dated repository snapshot and safe resume sequence; never substitutes for live worktree status. |
 | `repo-map.md` | Source ownership and canonical entrypoints. Deeper than `docs/ai-map.md`. |
@@ -35,7 +35,7 @@ not be preloaded for unrelated work.
 ## Operating rules
 
 - Follow root `AGENTS.md`; read `token-policy.md` only when detailed budget/tool limits matter.
-- Search before opening large files. For a document above 32 KiB, open only the focused <=120-line range found by that search.
+- Search large documents by owning heading, then read the sections the task needs; follow `token-policy.md` for generated-output bounds.
 - Treat human docs (`docs/*.md` outside `docs/ai/`) as explanatory; AI docs as routed contracts, not a preload set.
 - Verify code truth before editing when a contract references a source path.
 - For OS hardening, prioritize high-risk boundaries over broad cleanup.
@@ -45,10 +45,6 @@ not be preloaded for unrelated work.
   proposing a patch. Do not disguise an unimplemented path with a fallback,
   synthetic success signal, or symptom-only tuning.
 - For blocked debugging, stop and report the structural blocker — no speculative patches.
-
-## Stable cache prefix
-
-Cache root `AGENTS.md` only. Load the task router, AI map, token policy, and focused contracts on demand. Keep task text and volatile evidence after the stable prefix; never cache logs or generated output.
 
 ## Human docs (use only when AI contracts are missing the needed behavior)
 

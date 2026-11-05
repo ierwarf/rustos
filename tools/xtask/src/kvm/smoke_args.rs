@@ -71,17 +71,9 @@ struct SmokeOptions {
     repeat: usize,
     /// Whether the lane refreshes the boot image before it launches.
     build_image: bool,
-    /// Seal an unsealed formal profile instead of refusing the launch.
-    ///
-    /// A multi-vCPU boot is admitted only by the formal profile that models
-    /// its topology, and an unsealed profile fails in a way that reads exactly
-    /// like a boot failure - `formal verification run binding mismatch`. It is
-    /// never what the caller wanted: it means the tree was edited since the
-    /// last seal, which is the normal state of a working tree. Seal it with
-    /// the profile's own command instead of failing and asking for that
-    /// command by hand, exactly as the interactive `kvm-run` path already
-    /// does. The spawn-time gate still validates independently, so nothing
-    /// launches on a verification that did not pass.
+    /// Check formal evidence before a multi-vCPU launch. Iteration/qualification
+    /// modes repair a missing seal; ordinary launches only warn. Disabling this
+    /// does not bypass the strict iteration/qualification admission checks.
     auto_verify: bool,
     expected_markers: Vec<String>,
     expected_dvm_markers: Vec<String>,
@@ -530,7 +522,7 @@ where
     I: Iterator<Item = String>,
 {
     args.next()
-        .filter(|value| !value.is_empty())
+        .filter(|value| !value.is_empty() && !value.starts_with("--"))
         .with_context(|| format!("missing value for {option}"))
 }
 

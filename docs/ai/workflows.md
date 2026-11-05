@@ -64,11 +64,13 @@ recipes below use that plan for check/build selection, not ad hoc substitutes.
 
 ## Debug KVM lifecycle
 
-1. Ensure `cargo xtask build` completed.
-2. Reuse a verified DVM or follow its `build-plan` when Linux-side inputs
+1. Reuse a verified DVM or follow its `build-plan` when Linux-side inputs
    changed; run `cargo xtask verify-dvm` before smoke.
-3. Run `cargo xtask kvm-smoke --expect '<milestone>'`. It boots RustOS and the
-   DVM concurrently, then checks both readiness signals.
+2. Run `cargo xtask kvm-smoke --timeout 30 --expect '<milestone>'`. It refreshes
+   the RustOS image, boots both guests, and checks their readiness signals.
+   Use `--no-build` only to boot a deliberately prebuilt image (for example,
+   one built with custom probe variables); report that artifact choice.
+3. For SMP seal behavior and proof modes, see [KVM smoke arguments](commands.md#kvm-smoke-arguments).
 4. Inspect focused lines in `build/kvm/rustos-debugcon.log` and
    `build/kvm/linux-dvm-serial.log`.
 5. Treat a lifecycle pass as a lifecycle pass; do not infer device transport.
@@ -103,16 +105,18 @@ recipes below use that plan for check/build selection, not ad hoc substitutes.
 
 Shorten the loop before the sealed run, not instead of it.
 
-1. `tools/agent/formal-preflight.sh` runs every static registry and source-contract
-   check in parallel (about 10 seconds): sorted ids, unique REQ/HAZ numbers, matching
+1. `tools/agent/formal-preflight.sh` runs the registered static registry and
+   source-contract checks in parallel: sorted ids, unique REQ/HAZ numbers, matching
    flows, full documented paths, mutation anchors, the AI-context contract. Run it
-   after any formal, registry or documentation edit and before `formal/verify-all.sh`.
+   after formal/registry edits and before `formal/verify-all.sh`. Documentation-only
+   changes use the focused checks in “Update docs”; preflight also invokes Cargo.
 2. A new TLA+ model touches nine files. `tools/agent/formal-register-model.py` writes
    all of its registry rows from one command line and regenerates the contract
    document; the model's invariants, at least one spec mutant and its implementation
    mutants remain the author's work.
-3. `cargo host-test` runs the `rootd` and `loaderd` unit tests. They are freestanding
-   binaries and crash with SIGSEGV without `--features host-test`.
+3. `cargo host-test` runs `rootd`, `procd`, and the `loaderd` library via the
+   `.cargo/config.toml` alias. The first two require their package-qualified
+   `host-test` features; loaderd's freestanding binary has `test=false`.
 4. Compare a change against a control with `tools/agent/kvm-ab.py`: it builds the
    control ref in its own worktree and alternates one boot of each arm, so host drift
    hits both and the working tree stays usable. It reports a Fisher exact p-value;
@@ -122,7 +126,7 @@ Shorten the loop before the sealed run, not instead of it.
    another's sealed boot. Merge at a slice boundary, after preflight and a sealed run
    pass in that worktree; the script never merges for you.
 6. `docs/ai/session-handoff.md` is the short resume head; dated evidence belongs in
-   git history. It is exempt from the verification seal
-   (`formal/binding-exempt-paths.txt`) because no lane reads it as input.
-   Other documents are not exempt: `check-rust-source-contracts.py` reads every
-   Markdown file for documented source paths, so editing one invalidates the seal.
+   git history. `formal/binding-exempt-paths.txt` is the authoritative list of prose
+   excluded from the source binding, including the handoff. Do not assume every
+   document is exempt or that only the handoff is; see
+   [binding exemptions](commands.md#kvm-smoke-arguments).

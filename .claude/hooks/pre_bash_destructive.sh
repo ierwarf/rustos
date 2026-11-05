@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 # Claude Code PreToolUse shell policy.
 #
-# One hook handles destructive-command blocking, direct-output token budgets,
-# and conditional pre-commit gates. Harmless shell calls still pay for one
-# jq/bash startup only.
+# One hook handles destructive-command blocking and conditional pre-commit
+# integrity checks. Harmless shell calls pay for one jq/bash startup only.
 
 set -euo pipefail
 
@@ -15,11 +14,9 @@ INPUT="$(cat)"
 mapfile -d '' -t fields < <(printf '%s' "$INPUT" | jq -jr '
   (.tool_input.command // .tool_input.cmd //
    .arguments.command // .arguments.cmd //
-   .params.command // .params.cmd // ""), "\u0000",
-  (.tool_input.max_output_tokens // .arguments.max_output_tokens // .params.max_output_tokens // "" | tostring), "\u0000"
+   .params.command // .params.cmd // ""), "\u0000"
 ' 2>/dev/null || true)
 cmd="${fields[0]:-}"
-max_output_tokens="${fields[1]:-}"
 
 [[ -z "$cmd" ]] && exit 0
 trimmed_cmd="${cmd#"${cmd%%[![:space:]]*}"}"
@@ -55,9 +52,22 @@ if [[ "$trimmed_cmd" =~ ^(rg|grep|git[[:space:]]+grep)[[:space:]] ]] \
   exit 0
 fi
 
-if [[ "$cmd" =~ rm[[:space:]]+-[a-zA-Z]*r[a-zA-Z]*f ]] && [[ ! "$cmd" =~ /tmp/ ]]; then
-  block_destructive "rm -rf outside /tmp"
-fi
+# A /tmp operand (or even a quoted /tmp string) must not exempt other targets.
+# Recognize combined, reordered, separate and long recursive/force options.
+# Search quoted shell bodies and substitutions conservatively too. This is a
+# destructive-command tripwire, not a shell parser or a security sandbox.
+rm_command_re='rm[[:space:]]+((-[[:alpha:]-]+[[:space:]]*)+)'
+rm_recursive_re='(^|[[:space:]])(--recursive|-[[:alpha:]]*[rR][[:alpha:]]*)($|[[:space:]])'
+rm_force_re='(^|[[:space:]])(--force|-[[:alpha:]]*f[[:alpha:]]*)($|[[:space:]])'
+rm_probe="$cmd"
+while [[ "$rm_probe" =~ $rm_command_re ]]; do
+  rm_match="${BASH_REMATCH[0]}"
+  rm_options="${BASH_REMATCH[1]}"
+  if [[ "$rm_options" =~ $rm_recursive_re && "$rm_options" =~ $rm_force_re ]]; then
+    block_destructive "recursive force removal"
+  fi
+  rm_probe="${rm_probe#*"$rm_match"}"
+done
 if [[ "$cmd" =~ (^[[:space:]]*|[[:space:];|&])[[:alnum:]_./-]*(cp|mv|install|rsync|tee|truncate)[[:space:]] ]] \
   && [[ "$cmd" =~ $write_protected_path_re ]]; then
   block_destructive "direct shell write to generated/vendor/log path"
@@ -137,7 +147,7 @@ run_gate "git diff --cached --check" 10 git diff --cached --check
 
 # The agent-policy selftest is relevant only when agent policy or
 # its owned validation infrastructure is actually part of the commit.
-if printf '%s\n' "$staged" | grep -Eq '^(AGENTS\.md|docs/ai-map\.md|\.claude/|\.claude/|\.agents/|\.serena/|\.mcp\.json|docs/ai/|tools/agent/|tools/check-dev-environment\.sh|\.github/workflows/)'; then
+if printf '%s\n' "$staged" | grep -Eq '^(AGENTS\.md|docs/ai-map\.md|\.claude/|\.pi/settings\.json|\.agents/|\.serena/|\.mcp\.json|docs/ai/|tools/agent/|tools/check-dev-environment\.sh|\.github/workflows/)'; then
   run_gate "agent hook selftest" 25 .claude/hooks/selftest.sh
 fi
 

@@ -12,12 +12,16 @@ decision. Human docs are not bootstrap context.
 
 ## Search and read
 
-Search before opening large files. Only binary artifacts and whole-file reads
-of log/build/vendor output or text above 1 MiB are blocked; symbol navigation
-and ranged reads are never limited. Read as much source as the task needs,
-including whole files and several subsystems at once; the aim is to keep logs
-and generated output out of context, not to limit what may be explored. Avoid
+Search before opening large files. File-read guards block binary artifacts and
+whole-file reads of log/build/vendor output or text above 1 MiB; scoped symbol
+navigation and searches bypass those guards. A bounded file read needs an
+explicit line range or positive limit; zero is not a bound. Read as much source
+as the task needs, including whole files and several subsystems at once. Avoid
 reopening unchanged ranges.
+
+Read guards and edit warnings resolve native tool paths from the event's
+`cwd`; Serena relative paths remain project-root-relative, even from a nested
+`cwd`. Both canonicalize traversal and symlinks before classifying paths.
 
 Batch known independent probes when that removes model/tool round trips.
 
@@ -47,17 +51,21 @@ Never patch generated/vendor output as a shortcut.
 
 ## Validation and long sessions
 
-No hook runs a check after an edit or at commit time except the agent-policy
-selftest when agent policy files are committed. Validation is chosen by the task
-and run after a coherent batch of changes: `cargo xtask dev-plan` suggests the
-checks for the changed files, `cargo xtask check` is the quick compile gate, and
-formal/KVM runs happen when the user asks for them or a task needs them. The
-hooks that remain only stop irreversible mistakes: destructive shell commands,
-force-push, hook bypass, secrets in prompts, and reading binaries or log
-dumps.
+No hook runs validation after an edit. At commit time the shell hook checks
+staged whitespace and runs the agent-policy selftest when policy files are
+staged; the selector includes `.pi/settings.json`. Validation is chosen by the
+task and run after a coherent batch: `cargo xtask dev-plan` suggests checks,
+`cargo xtask check` is the quick compile gate, and formal/KVM runs happen when
+the user asks for them or a task needs them.
 
-Hooks are silent on success and emit one primary failure diagnostic plus a tiny
-tail.
+Claude Code hooks block destructive shell commands, force-push, hook bypass,
+secrets in prompts, direct shell writes to generated/vendor paths, and unsafe
+file reads. Recursive-plus-force `rm` is conservatively denied, including
+`/tmp` targets and combined, separate, or long-form flags; `/tmp` is no bypass.
+Edit/Write tools only warn on generated paths; that is not permission to bypass
+the source-editing rules. Multi-file warnings emit one JSON response.
+
+Hooks are silent on success and keep failure diagnostics and tails bounded.
 
 Project Claude Code config intentionally does not override the model context window or
 auto-compaction threshold. Follow the selected model/runtime defaults so this

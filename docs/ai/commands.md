@@ -1,15 +1,15 @@
 # AI Commands
 
-Run from repo root. Commands are expected to be quiet on success; treat
-failure output as the primary debugging context.
+Run from repo root. Use bounded summaries of successful output and the first
+useful failure diagnostic; keep full logs outside model context.
 
 ## Build, stage, check
 
 | Command | Use | Writes | Common failure meaning |
 | --- | --- | --- | --- |
-| `cargo xtask verify` | **run the whole local pipeline as one command**: layering/manifest check, full build, host tests, formal selftest, then the `pr` seal - in that order, stopping at the first failure. Quiet on success: one line per stage with `elapsed_seconds`. A failing stage prints its stage name, exact rerun command, first relevant diagnostic, at most 120 trailing lines, and the full captured log at `build/verify/<stage>.log` | `target/`, `build/`, `build/formal/`, `build/verify/` on failure | whichever stage failed, named in its own bounded output |
+| `cargo xtask verify` | run check, build, `cargo test --workspace --features rootd/host-test,procd/host-test`, then the `pr` formal seal (which includes `formal/selftest.sh`, not a separate stage). Stop at the first failure; print one success line per stage with `elapsed_seconds`. All stage logs, including successful check/build logs, remain at `build/verify/<stage>.log`; failures print the exact rerun command, first useful diagnostic, and at most 120 trailing lines | `target/`, `build/`, `build/formal/`, `build/verify/` | whichever stage failed, named in its bounded output |
 | `cargo xtask verify --gate [--repeat N] [--rustos-vcpus N] [--min-ui-fps N]` | the same pipeline and then the acceptance boot lane, defaulting to 4 boots at 8 vCPUs with a 60 fps floor. The seal is always the stage immediately before the boots, because a seal binds the source tree and any edit after it invalidates it | as above plus `build/kvm/` | as above, plus the per-run boot failures `kvm-smoke` names |
-| `cargo xtask dev-plan` | classify all tracked and untracked changes into fast `now` checks and one-time `stable-batch` gates | none | non-UTF-8 path or unavailable Git worktree |
+| `cargo xtask dev-plan` | classify tracked and untracked changes into fast `now` checks and one-time `stable-batch` gates; suggested KVM dry-runs use `--no-build` to validate existing inputs without an implicit image rebuild | none | non-UTF-8 path or unavailable Git worktree |
 | `cargo xtask formal-contracts test [PATH ...]` | run impacted native witnesses once per exact package/feature selection; each requested pass line and the executed count are mandatory; no paths means current worktree impact | `target/` | missing, ignored, failed or excess witnesses, unmapped high-risk source, or compiler failure |
 | `cargo xtask check` | validate layering/manifests/workspace | `target/` | dependency layer violation, bad manifest, missing target |
 | `cargo xtask check --timings` | run the same check and print deterministic phase timings | `target/` | same as `check`; the slow phase identifies the next optimization target |
@@ -17,7 +17,7 @@ failure output as the primary debugging context.
 | `cargo xtask build --timings` | run the same build and print phase timings | `target/`, `build/` | same as `build`; the slow phase identifies the next optimization target |
 | `cargo xtask build-user` | userspace packages only | `target/`, `build/artifacts` | service/app compile error |
 | `cargo xtask stage` | restage built artifacts | `build/image` | missing required artifact, bad install path |
-| `cargo xtask clean` | remove generated host/build/runtime outputs | removes `target/`, `build/`, `logs/` | stale generated artifact cleanup |
+| `cargo xtask clean [--stale DAYS] [--scratch] [--dry-run]` | reclaim aged compilation residue or regenerable formal scratch; bare `clean` is the full wipe, not routine build recovery | selected generated artifacts; bare form removes `target/`, `build/`, `logs/`; `--dry-run` deletes nothing | invalid age or cleanup I/O failure |
 
 ## Run and debug
 
@@ -54,9 +54,9 @@ failure output as the primary debugging context.
 | `tools/configure-amdgpu-vfio-early-bind.sh [--apply]` | plan by default; with `--apply`, install the exact GA403UM `1002:1900` vfio-pci ID/idle-D3 policy, amdgpu blacklist, and initramfs module entry, then update initramfs without touching the live driver | `/etc/modprobe.d/rustos-amd-vfio.conf`, `/etc/initramfs-tools/modules`, initramfs | wrong/multiple AMD displays, conflicting policy, modified owned file, duplicate module entry, or initramfs failure |
 | `tools/remove-amdgpu-vfio-early-bind.sh [--apply]` | plan by default; with `--apply`, remove only the exact RustOS policy and exact initramfs module entry, update initramfs, and leave the live device untouched so amdgpu may bind on the next cold boot | same persistent files and initramfs | modified/foreign policy, duplicate entry, separate GRUB override, or initramfs failure |
 | `cargo xtask kvm-run` | start the interactive Linux-DVM display session from the existing signed RustOS image; require a kernel-timestamped WayClick first frame before the operator closes QEMU, then record real pointer ingress and healthy idle UI ticks | `build/kvm/` including a bounded `failure-summary.json` on startup/stall failure | stale RustOS image, unavailable GUI backend, `/dev/kvm`, missing acceptance evidence when the window closes, or a guest exit |
-| `cargo xtask kvm-run --build` | build/sign the RustOS image and then enter the exact same verified cached-DVM interactive path at the default sixteen-vCPU SMP topology (`--rustos-vcpus <1..=16>`, the kernel's `MAX_SUPPORTED_CPUS`); this is the sole VS Code F5 command and uses the same source-bound SMP and outer-session readiness oracles; a multicore launch whose `smp-iteration` profile is unsealed for the current tree prints a `WARNING: ... not sealed ... launching anyway` line and boots unverified (interactive runs claim nothing; run `bash formal/verify-smp-iteration.sh` or the `pr` gate to seal) | signed RustOS image plus `build/kvm/` and `build/formal/verification-run/smp-iteration.json` | build/sign failure, a failed or still-unsealed automatic verification, invalid cached DVM, a real guest/stall failure, or missing acceptance evidence when the window closes |
-| `cargo xtask kvm-run --build --no-auto-verify` | the same interactive launch, but skip the unsealed-profile warning (`kvm-smoke --smp-iteration` / `--smp-ring3-qualification` still seal by running the profile's verification, and refuse on failure) | signed RustOS image plus `build/kvm/` | stale/missing SMP evidence, plus every failure of the row above |
-| `cargo xtask kvm-run --actual-size` | the interactive session with the QEMU window at exactly 1:1 instead of scaled to fit the host screen (the default `kvm-run` scales and hides the GTK menu bar so a 1600×900 guest fits a smaller host screen) | as `kvm-run` | a host screen smaller than the guest clips the window |
+| `cargo xtask kvm-run --build` | build/sign RustOS, verify the cached DVM, and start the interactive session at the default 16 vCPUs (`--rustos-vcpus <1..=16>`); sole VS Code F5 command. An unsealed `pr` profile produces a warning, not an automatic formal run or refusal; the session is not release evidence | signed RustOS image plus `build/kvm/` | build/sign failure, invalid cached DVM, guest/stall failure, or missing interactive readiness/input evidence |
+| `cargo xtask kvm-run --build --no-auto-verify` | same interactive launch, but suppress the unsealed-profile check/warning; does not establish a seal | signed RustOS image plus `build/kvm/` | same build, DVM, guest, and readiness failures as above |
+| `cargo xtask kvm-run --actual-size` | the interactive session with the QEMU window at exactly 1:1 instead of scaled to fit the host screen (the default `kvm-run` scales and hides the GTK menu bar so a 2560×1440 guest fits a smaller host screen) | as `kvm-run` | a host screen smaller than the guest clips the window |
 | `cargo xtask kvm-run --physical-usb <BDF>` | non-commercial lab: the interactive session with one `vfio-pci`-bound xHCI controller (sole IOMMU-group member) attached to the DVM instead of the virtual DVM keyboard and pointer, so a physical USB keyboard and mouse drive the RustOS UI; no sealed profile, the binding is never changed | signed RustOS image, cached DVM, accessible `/dev/iommu` and vfio device node, large inherited memlock | non-xHCI or unbound controller, shared IOMMU group, no real pointer event before the window closes |
 | `cargo xtask kvm-smoke --physical-usb <BDF>` | the same attachment for the bounded smoke; proves boot and the authenticated DVM input relay, not delivery of a real key | as above; not combinable with `--exercise-input`, `--min-ui-fps`, or `--storage-dvm-only` | same controller admission failures |
 | `cargo run -p rustos-hostd -- discover` | read host IOMMU groups | none | IOMMU unavailable or unreadable sysfs |
@@ -75,8 +75,10 @@ failure output as the primary debugging context.
 The single F5 configuration, `RustOS: verified KVM desktop`, executes only
 `cargo xtask kvm-run --build --rustos-vcpus 16`. The sixteen-vCPU option
 keeps the interactive developer path on the maximum supported SMP topology and
-therefore requires the same fresh source-bound SMP evidence as any other
-multi-vCPU launch. The option builds and signs RustOS in-process,
+therefore exercises SMP, but does not itself qualify it. A missing or stale
+`pr` seal causes a warning and an unverified launch, not automatic verification;
+run the PR gate explicitly before claiming release evidence. The option builds
+and signs RustOS in-process,
 then the runner verifies the existing signed Linux DVM bundle before QEMU
 starts. The runner holds one nonblocking launch lock across build, shared-file
 preparation, both QEMU children, and final evidence, and assigns a
@@ -115,7 +117,7 @@ is never enabled in normal F5 or acceptance runs and is not success evidence.
 | --- | --- | --- | --- |
 | `tools/check-dev-environment.sh [--ai] [--docs] [--formal] [--physical-gpu] [--release]` | read-only diagnosis of the pinned toolchain and only the optional host capabilities needed by the selected task | none | missing or wrong-version prerequisite; never installs tools or changes host state |
 | `cargo xtask selftest` | host selftests for fault parsing, executable-image admission, ABI/layout, and runtime contracts | `target/` | contract/layout regression |
-| `cargo xtask fuzz-host --target all` | deterministic host fuzz smoke for fault rules, executable-image admission, project config, package/DVM manifests, and hostd launch-plan/device-policy/control-contract parsing | `logs/` on crash | parser panic or invariant bug |
+| `cargo xtask fuzz-host --target all [--corpus DIR]` | deterministic host fuzz smoke for fault rules, executable-image admission, project config, package/DVM manifests, and hostd parsing; replay seeds verbatim before mutation rounds, with corpus files sorted by path | `logs/` on crash | parser panic or invariant bug |
 | `cargo xtask fuzz-host --target image-admission --iterations 1000` | exercise overflow, bounds, overlap, W^X, and entry-point admission without booting a guest | `logs/` on crash | shared ELF/PE admission panic or invariant bug |
 | `bash formal/run-tlc.sh <model/name>` | exhaustively run one changed finite TLA+ model with automatic local CPU parallelism | temporary files only | invariant violation, malformed model, or unavailable pinned TLC input |
 | `bash formal/run-spec-mutations.sh --id <mutation-id>` | rerun only a previously failed TLA+ mutation and its unchanged baseline during repair; it never overwrites full-corpus evidence | `build/formal/spec-mutations/<id>/` | a surviving mutant, timeout, unrelated invariant failure, or malformed counterexample |
@@ -297,8 +299,9 @@ reported as guest boot latency. Guest milestones remain a separate clock.
   across a QEMU process replacement, but never reassigns that logical ID or
   accepts a third peer; shared transport generations, not socket reconnect,
   decide whether old work is admissible.
-- `--timeout <seconds>` is bounded to `1..=120` and applies only while waiting
-  for expected RustOS debugcon and Linux DVM serial markers.
+- `--timeout <seconds>` is bounded to `1..=180` (default 120). It bounds boot,
+  readiness, and active proof collection after launch preparation, not image
+  build time. `--smp-iteration` restricts it to at most 30 seconds.
 - `--storage-dvm-only` enables the private block aperture and removes only the
   unrelated GPU-scene/compositor acceptance requirements. It still requires
   RustOS boot/provenance, the authenticated DVM control handshake, both block
@@ -339,9 +342,9 @@ reported as guest boot latency. Guest milestones remain a separate clock.
   and separate pixel backing live in the same owner-only tmpfs directory so a
   physical VFIO device can pin every guest RAM section through IOMMUFD. Its broker accepts exactly
   two same-UID QEMU peers and two fixed reverse-vector meanings, then passes
-  only the host-created control records and eventfds. A separate 32 MiB
-  cacheable pixel pool is writable in RustOS QEMU and read-only/ROM in the DVM.
-  RustOS copies a complete immutable 1600×900 BGRA snapshot, fences the slot,
+  only the host-created control records and eventfds. A separate 512 MiB
+  cacheable pixel backing is writable in RustOS QEMU and read-only/ROM in the DVM.
+  RustOS copies a complete immutable 2560×1440 BGRA snapshot, fences the slot,
   then rings the DVM; the Linux relay reconstructs a
   pre-load invitation through its validating UIO module, returns a readiness
   acknowledgement bound to that exact generation, and permits one validated
@@ -410,40 +413,28 @@ reported as guest boot latency. Guest milestones remain a separate clock.
   observed WayClick rate range, callback gap, and redraw maximum before the
   focused log paths. The range includes non-one-second startup windows; compare
   their elapsed time with later one-second windows before attributing a stall.
-- `--rustos-vcpus <1..=16>` selects the RustOS guest topology for SMP
-  qualification. The launcher rejects counts above one unless every compiled
-  scheduler, syscall, CPU-online, reschedule-IPI, TLB, robust-futex, and
-  per-CPU-clockevent prerequisite is admitted. This option selects a test
-  topology; it is not release evidence without the matching bounded run.
+- `--rustos-vcpus <1..=16>` selects the RustOS guest topology (default 16).
+  A topology choice alone is not qualification: accepted SMP evidence requires
+  the matching formal seal and bounded per-CPU runtime proof.
 - `--repeat <1..=64>` boots the same topology repeatedly, prints each run's
   outcome, and names every failed run's panic line and archived debugcon log.
   A defect that appears in one boot of six is a *rate*, and one run cannot
   measure it. Repeating the lane in a shell loop instead loses each failing
   run's debugcon log to the next run's truncation, which is exactly the
   evidence a rare defect leaves behind.
-- **A multi-vCPU run seals its own formal profile.** The seal binds the source
-  tree hash, so every edit invalidates it, and an unsealed profile used to fail
-  every run with `formal verification run binding mismatch` - which reads
-  exactly like a boot failure and is not one. `kvm-smoke` now runs the
-  profile's own verification command first, once, before the repeat loop, the
-  same way `kvm-run` already did. `--no-auto-verify` restores the refusal for a
-  lane that wants to prove the tree was already sealed. What still holds: do
-  not edit tracked files *while* a boot lane runs, because the seal it took is
-  then behind the tree.
-- `kvm-smoke` refreshes the boot image itself before copying the disk. A no-op
-  build is about two seconds against a thirty-second boot, so the lane pays it
-  every time; `--no-build` opts out for the rare case of deliberately booting
-  the artifact already on disk. Without this the lane booted whatever was
-  already in `build/image/`, and a whole session of instrumentation
-  conclusions came from probes that were never compiled into the booted
-  kernel.
-- `cargo xtask kvm-run` seals its own profile. A multicore interactive launch
-  whose `smp-iteration` evidence is missing, expired, or bound to an older tree
-  runs `bash formal/verify-smp-iteration.sh` and revalidates before claiming a
-  layout, doorbell, or relay. Admission still comes only from that second
-  validation, so a failed verification refuses the launch; `--no-auto-verify`
-  restores the plain refusal. `kvm-smoke` likewise auto-seals before its repeat
-  loop unless `--no-auto-verify` requests plain refusal.
+- **Ordinary multi-vCPU launches do not auto-seal.** `kvm-smoke` and `kvm-run`
+  warn on missing/stale `pr` evidence and may launch unverified. Only multi-vCPU
+  smoke with `--smp-iteration` (including `--smp-ring3-qualification`) runs its
+  profile's verification command before the repeat loop. `--no-auto-verify`
+  skips that repair, but iteration/qualification still validate the seal before
+  launch and success publication; it merely suppresses the check/warning on
+  ordinary launches. Push/release claims require an explicit matching PR gate.
+  Do not edit source-binding inputs while a sealed lane runs; exempt prose is
+  listed in `formal/binding-exempt-paths.txt`.
+- `kvm-smoke` refreshes the signed boot image before copying the disk.
+  `--no-build` deliberately boots the artifact already on disk; use it for
+  custom probe builds and report that choice. `kvm-run` instead reuses the
+  image unless passed `--build`. Neither command rebuilds the Linux DVM.
 - A defect that appears in roughly one boot of ten is a reproduction question,
   not a measurement one: `cargo xtask soak --runs 25 --rustos-vcpus 8` repeats
   the bench lane, keeps going past a failure, and names every failed run with
@@ -463,8 +454,10 @@ reported as guest boot latency. Guest milestones remain a separate clock.
   guard page or unwinder pointer is followed. Layout drift makes collection partial, never changes the
   probe's result.
   `build/kvm/failure-snapshot-<nonce>.log` is private, unique, exact-kernel-SHA
-  diagnostic evidence; partial collection is explicit and monitor reads/output
-  are bounded. This happens only after failure is latched, never pauses a
+  diagnostic evidence. Monitor reads/writes use the full remaining collection
+  deadline; the artifact records `collection=complete` or `collection=partial`
+  with its error, and runner diagnostics report the matching status. Output
+  remains bounded. This happens only after failure is latched, never pauses a
   successful or physical-device run, never retries readiness, and cannot publish
   acceptance. HMP `stop`, `cpu`, `info registers`, and `xp` follow the
   [QEMU monitor reference](https://www.qemu.org/docs/master/system/monitor.html).
@@ -522,8 +515,10 @@ reported as guest boot latency. Guest milestones remain a separate clock.
 
 - `.claude/hooks/selftest.sh` for the versioned agent/hook policy bundle.
 - `mdbook build` if `mdbook` exists.
-- Inspect markdown links with pattern `\[[^]]+\]\(([^)#]+\.md)`.
-- Top-level human docs should include `[English](#english) | [한국어](#korean)`.
+- `python3 tools/agent/check-doc-layout.py` checks local Markdown links and
+  heading targets under `docs/` and `formal/`; `--selftest` tests the checker.
+  Check root docs and skills separately when their links change.
+- Human docs should include `[English](#english) | [한국어](#korean)`.
 
 ## Fast context commands
 
@@ -547,8 +542,10 @@ reported as guest boot latency. Guest milestones remain a separate clock.
 
 ## KVM display boot loop
 
-1. `cargo xtask build`
-2. `cargo xtask kvm-smoke --expect 'runtimed: bootstrap ui done'`
+1. Reuse a verified DVM (see [DVM build-speed contract](#dvm-build-speed-contract)).
+2. `cargo xtask kvm-smoke --timeout 30 --expect 'runtimed: bootstrap ui done'`
+   refreshes the RustOS image itself; use `--no-build` only for an intentional
+   prebuilt probe image.
 3. Search the relevant log for
    `error: no suitable video mode|boot framebuffer|virtio-gpu|virtio register|DisplayUnavailable|uiserver|panic|scheduler invalid`.
 

@@ -45,10 +45,23 @@
   the launch user, and uses the repository-pinned `OVMF_PATH` with QEMU. It
   starts RustOS and Linux DVM as independent KVM guests and preserves their
   logs under `build/kvm/`.
+- Value-taking smoke options reject empty or missing values, including a next
+  argument beginning with `--`; one option cannot consume the following flag
+  as its value.
+- Boot readiness and both recovery waits drain all already-queued input-relay
+  messages before accepting readiness. A queued terminal error cannot be hidden
+  behind an earlier ready result; duplicate readiness also fails closed.
+- Virtual failure snapshots use the full remaining monitor-collection deadline
+  for each read/write, not an independent shorter per-operation cutoff. The
+  artifact records `collection=complete` or `collection=partial` with the
+  collection error; the runner reports the matching complete/partial status.
+  Diagnostics remain bounded, run only after probe
+  failure, and cannot change that result or publish acceptance.
 - A successful smoke requires RustOS's default `rootd` readiness marker and
   the L0 host broker to complete the DVM
-  `health,device-inventory,driver-inventory,display-evidence-v2,block-evidence-v1,input-stream` handshake using launch-assigned KVM
-  vsock CID `4`. L0 then attaches as the fixed ivshmem peer 1 only after
+  `health,device-inventory,driver-inventory,display-evidence-v2,block-evidence-v1,input-stream` handshake using a launch-assigned,
+  process-scoped, non-reserved KVM vsock CID (derived by `guest_cid_for_process`).
+  L0 then attaches as the fixed ivshmem peer 1 only after
   RustOS has claimed peer 0, writes only fixed RDI3 session/key/pointer frames
   into the host-owned 128 KiB input ring, and signals the one RustOS MSI-X
   eventfd at most once per inputd-published consumer wake generation; QMP is
@@ -216,10 +229,10 @@
   node. The smoke and FPS GTK frontend uses `zoom-to-fit=off`, and the private
   DVM virtio-GPU disables resize-aware EDID: otherwise GTK's bootstrap window
   can request 640×480 before Linux DRM starts and force unnecessary scaling.
-  QEMU's explicit 1600×900 mode is therefore authoritative. The operator-owned
+  QEMU's explicit 2560×1440 mode is therefore authoritative. The operator-owned
   `kvm-run` window is the exception: it scales the guest to the window and hides
   the GTK menu bar (`zoom-to-fit=on,show-menubar=off`) so the whole desktop fits a
-  host screen smaller than 1600×900; `--actual-size` restores the 1:1 window. The
+  host screen smaller than 2560×1440; `--actual-size` restores the 1:1 window. The
   guest mode and the pointer mapping are unchanged. The 60 FPS proof
   requires an active GTK consumer and atomic three-buffer page-flip
   completion. The same consecutive uiserver profile windows must satisfy the

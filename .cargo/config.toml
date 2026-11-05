@@ -1,9 +1,9 @@
 [alias]
 xtask = "run -q -p xtask --"
-# `rootd`, `loaderd` and `procd` are freestanding binaries; their unit tests need the
-# `host-test` feature, and without it the test binary crashes with SIGSEGV before
-# running anything. `cargo host-test` is the whole invocation (extra args pass through).
-host-test = "test -p rootd -p loaderd -p procd --features host-test"
+# `rootd` and `procd` need native `host-test` features to omit their freestanding
+# linker entrypoints. `loaderd` tests its library; its freestanding binary has
+# test=false. Extra arguments to `cargo host-test` pass through to Cargo.
+host-test = "test -p rootd -p loaderd -p procd --features rootd/host-test,procd/host-test"
 
 # No `[target.x86_64-unknown-linux-gnu]` block, and two flags that were tried
 # and removed rather than never considered:

@@ -1,65 +1,9 @@
 #!/usr/bin/env bash
-# Shared helpers for RustOS agent hooks. Keep success paths silent and make
-# cache keys content-based so hooks can skip duplicate validation safely.
+# Shared helpers for RustOS agent hooks. Keep success paths silent and
+# validation failures bounded.
 
 rustos_repo_root() {
   cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P
-}
-
-rustos_hook_state_dir() {
-  local root="$1"
-  local key
-  key="$(printf '%s' "$root" | sha256sum | awk '{print $1}')"
-  local dir="${TMPDIR:-/tmp}/rustos-agent-hooks-${key}"
-  mkdir -p "$dir"
-  chmod 700 "$dir" 2>/dev/null || true
-  printf '%s\n' "$dir"
-}
-
-# Fingerprint the exact repository state without serializing whole diffs into a
-# temporary string. Index object ids cover staged content; dirty/untracked
-# worktree files are hashed directly. Generated/ignored trees are excluded by
-# git, matching the repository's agent policy.
-rustos_workspace_fingerprint() {
-  local root="$1"
-  (
-    cd "$root"
-    {
-      printf 'head:'
-      git rev-parse --verify HEAD
-      printf 'index:\n'
-      git diff --cached --raw --no-abbrev --no-renames
-      printf 'worktree-meta:\n'
-      git diff --raw --no-abbrev --no-renames
-      {
-        git diff --name-only -z --no-renames
-        git ls-files --others --exclude-standard -z
-      } | sort -zu | while IFS= read -r -d '' file; do
-        printf 'path:%s\0' "$file"
-        if [[ -e "$file" || -L "$file" ]]; then
-          git hash-object --no-filters -- "$file" 2>/dev/null || printf 'unhashable\n'
-        else
-          printf 'deleted\n'
-        fi
-      done
-    } | sha256sum | awk '{print $1}'
-  )
-}
-
-rustos_check_stamp_path() {
-  local root="$1"
-  printf '%s/xtask-check.ok\n' "$(rustos_hook_state_dir "$root")"
-}
-
-rustos_read_check_stamp() {
-  local root="$1"
-  cat "$(rustos_check_stamp_path "$root")" 2>/dev/null || true
-}
-
-rustos_write_check_stamp() {
-  local root="$1"
-  local fingerprint="$2"
-  printf '%s\n' "$fingerprint" >"$(rustos_check_stamp_path "$root")"
 }
 
 # Run a command with a hard wall-clock bound. stdout/stderr stay outside model
@@ -87,7 +31,7 @@ rustos_compact_failure() {
     status="failed (exit ${rc})"
   fi
 
-  first="$(grep -Enm1 '(^|[^[:alpha:]])(error(\[[^]]+\])?:|fatal:|panic|FAILED|failed:|not ok -)' "$log" 2>/dev/null || true)"
+  first="$(grep -Em1 '(^|[^[:alpha:]])(error(\[[^]]+\])?:|fatal:|panic|FAILED|failed:|not ok -)' "$log" 2>/dev/null | head -c 768 || true)"
   tail="$(tail -n 8 "$log" 2>/dev/null | head -c 2048 || true)"
 
   if [[ -n "$first" && "$tail" == *"$first"* ]]; then
