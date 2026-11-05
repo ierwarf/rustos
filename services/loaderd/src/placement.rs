@@ -25,6 +25,14 @@ impl Default for ReceivedHandles {
 
 impl ReceivedHandles {
     pub fn clear(&mut self) { self.count = 0; }
+    /// Move the one authenticated received descriptor to a longer-lived owner;
+    /// the receive loop must no longer close it. This grants no duplicate right.
+    pub fn take_one(&mut self) -> Option<i32> {
+        if self.count != 1 { return None; }
+        let fd = self.fds[0];
+        self.count = 0;
+        Some(fd)
+    }
     pub fn finish(&mut self, result: i64) -> i64 {
         if result < 0 { self.clear(); }
         result
@@ -37,6 +45,14 @@ mod tests {
     use super::*;
     use rustos_user_abi::syscall::{LOADER_OP_ACTIVATE, LOADER_OP_EXEC_TARGET};
 
+    #[test]
+    fn received_placement_moves_once_including_descriptor_zero() {
+        let mut handles = ReceivedHandles::default();
+        handles.fds[0] = 0; handles.count = 1;
+        assert_eq!(handles.take_one(), Some(0));
+        assert!(handles.as_slice().is_empty());
+        assert_eq!(handles.take_one(), None);
+    }
     #[test]
     fn placement_is_one_transferred_descriptor_and_never_exec_authority() {
         assert_eq!(job_handle(LOADER_OP_SPAWN_EXEC, &[]), Ok(None));

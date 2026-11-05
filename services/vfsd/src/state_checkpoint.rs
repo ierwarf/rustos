@@ -348,6 +348,8 @@ impl VfsStorage {
             self.dir_entries_cache.clear();
             self.file_bytes_cache.clear();
             self.file_bytes_cache_bytes = 0;
+            self.read_maps.clear();
+            self.read_map_bytes = 0;
             for snapshot in self.executable_snapshot_cache.values() {
                 close_fd(snapshot.fd);
             }

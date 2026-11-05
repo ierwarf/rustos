@@ -1076,31 +1076,16 @@ fn spawn_exec(exec_path: &str, env: &[CString]) -> Result<i32, i32> {
 
 fn spawn_exec_via_loaderd(exec_path: &str, env: &[CString]) -> Result<i32, i32> {
     let argv = [CString::new(exec_path).map_err(|_| libc::EINVAL)?];
-    let request = build_loader_spawn_request(exec_path, &argv, env)?;
+    let mut request = build_loader_spawn_request(exec_path, &argv, env)?;
     let endpoint = lookup_loader_endpoint()?;
-    let mut response = LoaderSpawnResponse::default();
-    boot_line(&format!(
-        "initd: loader call begin exec={exec_path} endpoint={endpoint}"
-    ));
-    // SAFETY: Request and response are initialized, exact-sized ABI records
-    // and remain exclusively live for the duration of the bounded call.
-    let call = unsafe {
-        rustos_svc_runtime::syscall::syscall6(
-            SYS_RUSTOS_IPC_CALL_BOUNDED,
-            endpoint as u64,
-            (&request as *const LoaderSpawnRequest) as u64,
-            size_of::<LoaderSpawnRequest>() as u64,
-            (&mut response as *mut LoaderSpawnResponse) as u64,
-            size_of::<LoaderSpawnResponse>() as u64,
-            IPC_BOOT_CONTROL_HARD_LIMIT_MS,
-        )
+    boot_line(&format!("initd: loader call begin exec={exec_path} endpoint={endpoint}"));
+    request.deadline_ns = rustos_svc_runtime::syscall::monotonic_nanos()
+        .saturating_add(IPC_BOOT_CONTROL_HARD_LIMIT_MS * 1_000_000);
+    let response: LoaderSpawnResponse = match rustos_svc_runtime::loader_client::call(endpoint as u64, &request, None) {
+        Ok(response) => response,
+        Err(errno) => { LOADER_ENDPOINT_CACHE.store(0, Ordering::Relaxed); return Err(errno); }
     };
-    if call < 0 {
-        LOADER_ENDPOINT_CACHE.store(0, Ordering::Relaxed);
-        return Err((-call) as i32);
-    }
-    if call as usize != size_of::<LoaderSpawnResponse>()
-        || response.version != LOADER_REQUEST_ABI_VERSION
+    if response.version != LOADER_REQUEST_ABI_VERSION
         || response.op != LOADER_OP_SPAWN_EXEC
     {
         return Err(libc::EINVAL);

@@ -1,0 +1,21 @@
+id = "chrome"
+kind = "app"
+execution_domain = "user"
+startup = "none"
+
+[build]
+builder = "prebuilt-app"
+source = "bundle"
+
+[install]
+path = "apps/chrome"
+layout = "directory"
+
+[[desktop.entries]]
+display_name = "Google Chrome"
+image = "apps/chrome/chrome"
+exec = "/apps/chrome/chrome"
+weight_micros = 1000
+console_hosted = false
+launch = "new-session"
+args = ["/apps/chrome/chrome", "--ozone-platform=wayland"]

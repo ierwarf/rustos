@@ -737,7 +737,7 @@ fn build_userspace_manifests(config: &Config, manifests: &[PackageManifest]) -> 
         matches!(manifest.build.builder, BuilderKind::WinsysDllBundle)
     })?;
     build_manifests_matching(config, manifests, |manifest| {
-        matches!(manifest.build.builder, BuilderKind::AssetBundle)
+        matches!(manifest.build.builder, BuilderKind::AssetBundle | BuilderKind::PrebuiltApp)
     })?;
     build_manifests_matching(config, manifests, |manifest| {
         matches!(manifest.build.builder, BuilderKind::CDemo)
@@ -864,24 +864,34 @@ fn build_manifest(config: &Config, manifest: &PackageManifest) -> Result<()> {
         BuilderKind::MingwCExe => build_mingw_c_exe(config, manifest),
         BuilderKind::CDemo => build_c_demo_manifest(config, manifest),
         BuilderKind::WinsysDllBundle => build_windows_system_dlls(config, manifest),
-        BuilderKind::AssetBundle => build_asset_bundle(config, manifest),
+        BuilderKind::AssetBundle | BuilderKind::PrebuiltApp => build_directory_bundle(config, manifest),
     }
 }
 
-/// Mirror a data package's `build.source` directory into its artifact
+/// Mirror a data or prebuilt-app package's `build.source` into its artifact
 /// directory. Only files whose contents changed are written, so an unchanged
 /// bundle does not look newer to later freshness checks, and files removed
 /// from the source are removed from the artifact.
-fn build_asset_bundle(config: &Config, manifest: &PackageManifest) -> Result<()> {
+fn build_directory_bundle(config: &Config, manifest: &PackageManifest) -> Result<()> {
     let source_root = manifest
         .resolved_source_path()
-        .with_context(|| format!("data package {} has no build.source", manifest.id))?;
+        .with_context(|| format!("bundle package {} has no build.source", manifest.id))?;
     if !source_root.is_dir() {
         bail!(
-            "data package {} source is not a directory: {}",
+            "bundle package {} source is not a directory: {}",
             manifest.id,
             source_root.display()
         );
+    }
+    if manifest.build.builder == BuilderKind::PrebuiltApp {
+        let prefix = format!("{}/", manifest.install.path);
+        for entry in &manifest.desktop.entries {
+            let image = entry.image.as_deref().context("prebuilt-app has no desktop image")?;
+            let relative = image.strip_prefix(&prefix).context("prebuilt-app image outside bundle")?;
+            if !source_root.join(relative).is_file() {
+                bail!("prebuilt-app {} missing executable: {}", manifest.id, image);
+            }
+        }
     }
     let artifact_dir = manifest.artifact_path(config);
     fs::create_dir_all(&artifact_dir)?;

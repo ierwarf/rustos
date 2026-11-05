@@ -12,7 +12,7 @@ use core::mem::size_of;
 use core::panic::PanicInfo;
 
 use rustos_svc_runtime::ipc;
-use rustos_svc_runtime::syscall::{syscall0, syscall1, syscall5};
+use rustos_svc_runtime::syscall::{syscall0, syscall1};
 use rustos_user_abi::syscall::{
     identity_is_exact_sender, procd_sigchld_is_suppressed, CommercialMaxCapabilityLeaseWire,
     CommercialMaxProtocolDescriptorWire, CommercialMaxProtocolRequest,
@@ -33,7 +33,7 @@ use rustos_user_abi::syscall::{
     PROCD_PAYLOAD_CAPACITY, PROCD_SELECT_SIGNAL_HANDLER, PROCD_SELECT_SIGNAL_IGNORE,
     PROCD_SELECT_SIGNAL_NONE, PROCD_SELECT_SIGNAL_STOP, PROCD_SELECT_SIGNAL_TERMINATE,
     PROCD_SIGCHLD_EVENT_MASK, PROC_BROKER_USER_SPACE_BASE, PROC_BROKER_USER_SPACE_END_EXCLUSIVE,
-    SYS_RUSTOS_IPC_CALL, SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER, SYS_RUSTOS_PROC_AUTHORIZE_EXEC_BROKER,
+    SYS_RUSTOS_LIFECYCLE_DRAIN_BROKER, SYS_RUSTOS_PROC_AUTHORIZE_EXEC_BROKER,
     SYS_RUSTOS_PROC_CANCEL_EXEC_BROKER, SYS_RUSTOS_PROC_FORK_BROKER,
     SYS_RUSTOS_PROC_SIGNAL_QUEUE_BROKER,
 };
@@ -425,6 +425,10 @@ fn copy_label(label: &str, target: &mut [u8], len: &mut u16) {
 }
 
 fn handle_exec(request: &ProcdIpcRequest, response: &mut ProcdIpcResponse) {
+    // The existing exec control lease starts before ticket/endpoint work and
+    // is carried unchanged through loader staging; it is not a bulk-app grant.
+    let deadline_ns = rustos_svc_runtime::syscall::monotonic_nanos().saturating_add(
+        rustos_user_abi::performance::IPC_BOOT_CONTROL_HARD_LIMIT_MS * 1_000_000);
     if request.op == PROCD_OP_EXECVEAT && unsupported_execveat_flags(request.flags as u64) {
         response.status = ENOSYS;
         return;
@@ -486,6 +490,7 @@ fn handle_exec(request: &ProcdIpcRequest, response: &mut ProcdIpcResponse) {
         target_tid: request.tid,
         exec_ticket,
         exec_dirfd: AT_FDCWD,
+        deadline_ns,
         exec_path_len: exec_path_len as u32,
         argv_count: request.argv_count,
         env_count: request.env_count,
@@ -508,24 +513,15 @@ fn handle_exec(request: &ProcdIpcRequest, response: &mut ProcdIpcResponse) {
     loader_request.env_bytes[..request.env_bytes_len as usize]
         .copy_from_slice(&request.env_bytes[..request.env_bytes_len as usize]);
 
-    let mut loader_response = LoaderSpawnResponse::default();
-    let call = unsafe {
-        syscall5(
-            SYS_RUSTOS_IPC_CALL,
-            loader_endpoint as u64,
-            (&loader_request as *const LoaderSpawnRequest) as u64,
-            size_of::<LoaderSpawnRequest>() as u64,
-            (&mut loader_response as *mut LoaderSpawnResponse) as u64,
-            size_of::<LoaderSpawnResponse>() as u64,
-        )
+    let loader_response: LoaderSpawnResponse = match rustos_svc_runtime::loader_client::call(loader_endpoint as u64, &loader_request, None) {
+        Ok(reply) => reply,
+        Err(errno) => {
+            cancel_exec_ticket(exec_ticket, request.pid, request.tid);
+            response.status = errno;
+            return;
+        }
     };
-    if call < 0 {
-        cancel_exec_ticket(exec_ticket, request.pid, request.tid);
-        response.status = (-call) as i32;
-        return;
-    }
-    if call as usize != size_of::<LoaderSpawnResponse>()
-        || loader_response.version != LOADER_REQUEST_ABI_VERSION
+    if loader_response.version != LOADER_REQUEST_ABI_VERSION
         || loader_response.op != LOADER_OP_EXEC_TARGET
         || loader_response.reserved0 != 0
     {

@@ -247,6 +247,29 @@
   descriptions, cursors, checkpointing, and the overlay decision; digest and
   exact-entry admission remain in the bounded ring0 reader.
 
+### Read-only large-file adapter
+
+`storage-core::file_io` separates 64-bit positional ReadAt/WriteAt from optional
+owned Data/Hole/Unwritten read maps. Extents are backend accelerators, never a
+kernel-visible FAT layout or a requirement for compressed/inline future files.
+FAT builds/coalesces its map once from the existing engine and checks geometry,
+overlap/cycles, full coverage, metadata admission and mutation epoch. Identity
+is the volume instance + short-directory-entry slot + nonwrapping media-write
+generation: repeated/case-alias opens agree; reused slots cannot revive a stale
+read lease. This is not a persistent inode/checkpoint identity across mutation.
+
+Ordinary read maps are bounded to 128 entries / 8 MiB; per-snapshot planning is
+bounded to 2 MiB. Detached readers hold only the checked map/device, not a FAT
+namespace borrow or a second filesystem/cache. Runtime-supplied sleeping device
+waits and per-device response storage preserve progress across blocking IPC and
+old/new mounts. Every write attempt revokes old map versions before media I/O.
+
+Executable publication uses the owner-bound asynchronous job and sealed memfd
+contract in [loader scheduling](loader-scheduling.md). VFS persistent writes and
+truncate remain EROFS. Writable object/checkpoint identity, durable mutation,
+shared buffered/mmap coherence and ext4/NTFS adapters are later phases, not
+claims made by the read-only accelerator.
+
 ## Storage Surface (`storaged`)
 
 - Kernel storage inventory, `SYS_RUSTOS_STORAGE_LIST_BROKER`, boot extent

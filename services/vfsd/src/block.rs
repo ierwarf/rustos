@@ -14,7 +14,7 @@ use rustos_user_abi::syscall::{
 };
 use storage_core::{BlockDevice, IoResult, StorageError};
 
-use super::{EAGAIN, EINVAL, EIO, ENODEV, ENOSYS};
+use super::{EAGAIN, EINVAL, EIO, ENODEV, ENOSYS, ENOMEM};
 use vfsd::{
     admit_dvm_block_geometry, cooperative_bulk_yield_state, storage_error_from_linux_status,
     storage_service_lookup_errno, validate_dvm_block_range,
@@ -31,8 +31,9 @@ const IPC_BLOCK_PAYLOAD_BYTES: usize =
 // the burst bounded while matching the snapshot writer's 256 KiB progress
 // quantum.
 const BULK_COOPERATIVE_YIELD_BYTES: usize = 256 * 1024;
-static mut STORAGED_BULK_RESPONSE_SLOT: StoragedBulkReadResponse =
-    StoragedBulkReadResponse::zeroed();
+// A detached old mount and a newly admitted mount can overlap. Response
+// storage belongs to each device lease, not one unsynchronized global slot.
+const _: () = assert!(core::mem::align_of::<StoragedBulkReadResponse>() <= core::mem::align_of::<u64>());
 // Not-ready is an expected, bounded state while the DVM proves its initial
 // generation. Keep one diagnostic transition instead of turning every glibc
 // negative probe into debugcon I/O and scheduler pressure.
@@ -43,6 +44,7 @@ pub(super) struct BootBlockDevice {
     pub(super) block_size: usize,
     pub(super) block_count: u64,
     bulk_bytes_since_yield: usize,
+    bulk_response: alloc::vec::Vec<u64>,
 }
 
 impl BootBlockDevice {
@@ -67,11 +69,16 @@ impl BootBlockDevice {
             IPC_BLOCK_PAYLOAD_BYTES,
             BLOCK_BROKER_INFO_FLAG_READ_ONLY,
         )?;
+        let words = size_of::<StoragedBulkReadResponse>().div_ceil(size_of::<u64>());
+        let mut bulk_response = alloc::vec::Vec::new();
+        bulk_response.try_reserve_exact(words).map_err(|_| ENOMEM)?;
+        bulk_response.resize(words, 0);
         Ok(Self {
             generation: info.generation,
             block_size,
             block_count,
             bulk_bytes_since_yield: 0,
+            bulk_response,
         })
     }
 
@@ -93,7 +100,7 @@ impl BootBlockDevice {
             request.arg0 = self.generation;
             request.arg1 = chunk_lba;
             request.arg2 = block_count;
-            call_storaged_bulk(&request, &mut out[done..done + byte_len])
+            call_storaged_bulk(&request, &mut out[done..done + byte_len], &mut self.bulk_response)
                 .map_err(|errno| storage_error_from_linux_status(-(errno as i64)))?;
             self.account_bulk_progress(byte_len);
             done += byte_len;
@@ -265,8 +272,9 @@ fn call_storaged(
     Ok(response)
 }
 
-fn call_storaged_bulk(request: &CommercialMaxProtocolRequest, out: &mut [u8]) -> Result<(), i32> {
-    if out.is_empty() || out.len() > STORAGED_BULK_READ_PAYLOAD_CAPACITY {
+fn call_storaged_bulk(request: &CommercialMaxProtocolRequest, out: &mut [u8], response_words: &mut [u64]) -> Result<(), i32> {
+    if out.is_empty() || out.len() > STORAGED_BULK_READ_PAYLOAD_CAPACITY
+        || response_words.len() < size_of::<StoragedBulkReadResponse>().div_ceil(size_of::<u64>()) {
         return Err(EINVAL);
     }
     let endpoint = unsafe {
@@ -285,7 +293,9 @@ fn call_storaged_bulk(request: &CommercialMaxProtocolRequest, out: &mut [u8]) ->
         return Err(errno);
     }
 
-    let response = core::ptr::addr_of_mut!(STORAGED_BULK_RESPONSE_SLOT);
+    // SAFETY: u64 storage has sufficient size/alignment (asserted above),
+    // is exclusively borrowed, and the all-integer wire type admits zero bits.
+    let response = response_words.as_mut_ptr().cast::<StoragedBulkReadResponse>();
     unsafe {
         core::ptr::write_bytes(
             response.cast::<u8>(),
@@ -294,13 +304,14 @@ fn call_storaged_bulk(request: &CommercialMaxProtocolRequest, out: &mut [u8]) ->
         );
     }
     let received = unsafe {
-        rustos_svc_runtime::syscall::syscall5(
-            SYS_RUSTOS_IPC_CALL,
+        rustos_svc_runtime::syscall::syscall6(
+            rustos_user_abi::syscall::SYS_RUSTOS_IPC_CALL_BOUNDED,
             endpoint as u64,
             (request as *const CommercialMaxProtocolRequest) as u64,
             size_of::<CommercialMaxProtocolRequest>() as u64,
             response as u64,
             size_of::<StoragedBulkReadResponse>() as u64,
+            rustos_user_abi::performance::IPC_BOOT_CONTROL_HARD_LIMIT_MS,
         )
     };
     if received < 0 {

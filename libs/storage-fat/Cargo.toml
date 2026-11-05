@@ -6,5 +6,6 @@ publish = false
 
 [dependencies]
 storage-core = { path = "../storage-core" }
+spin = "0.10.0"
 fatfs = { git = "https://github.com/rafalh/rust-fatfs", default-features = false, features = ["alloc", "lfn"] }
 

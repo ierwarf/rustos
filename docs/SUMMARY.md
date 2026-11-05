@@ -57,3 +57,4 @@
 - [Physical GPU Status](ai/physical-gpu-status.md)
 - [Kernel API Map](ai/kernel-api-map.md)
 - [Workflows](ai/workflows.md)
+- [Large-file I/O and Filesystem Expansion Plan](ai/large-file-io-plan.md)

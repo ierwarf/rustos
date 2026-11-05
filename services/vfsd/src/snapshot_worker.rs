@@ -1,6 +1,6 @@
 //! Bounded executable-snapshot worker owned independently from the VFS receive loop.
 
-use alloc::format;
+use alloc::{format, sync::Arc};
 #[cfg(not(test))]
 use core::arch::asm;
 use core::cell::UnsafeCell;
@@ -12,12 +12,15 @@ use rustos_user_abi::linux as linux_abi;
 use rustos_user_abi::syscall::{
     VfsExecutableSnapshotRequest, VfsExecutableSnapshotResponse,
     VFS_EXECUTABLE_SNAPSHOT_ABI_VERSION, VFS_EXECUTABLE_SNAPSHOT_OP_OPEN,
+    VFS_EXECUTABLE_SNAPSHOT_OP_POLL, VFS_EXECUTABLE_SNAPSHOT_OP_CANCEL,
+    VFS_EXECUTABLE_SNAPSHOT_PENDING, VFS_EXECUTABLE_SNAPSHOT_MAX_LEASE_MS,
 };
 use vfsd::{SnapshotWorkerAdmission, SnapshotWorkerSignal};
+use vfsd::snapshot_sessions::{SnapshotControl, SnapshotSessions, SessionError, SessionPoll};
 
 #[cfg(test)]
 use super::ENOSYS;
-use super::{reply_executable_snapshot, EAGAIN};
+use super::{reply_executable_snapshot, ExecutableSnapshotOpen, EAGAIN, EINVAL, EACCES, ETIMEDOUT, EOVERFLOW, ENOENT};
 
 const SNAPSHOT_WORKER_STACK_BYTES: usize = 128 * 1024;
 const SYS_CLONE: u64 = 56;
@@ -27,20 +30,26 @@ const CLONE_FILES: u64 = 0x0000_0400;
 const CLONE_SIGHAND: u64 = 0x0000_0800;
 const CLONE_THREAD: u64 = 0x0001_0000;
 
-#[derive(Clone, Copy)]
 struct SnapshotJob {
-    reply_cap: u64,
-    sender_pid: u64,
-    sender_tid: u64,
+    id: u64,
+    control: Arc<SnapshotControl>,
     request: VfsExecutableSnapshotRequest,
 }
+
+pub(super) struct CompletedSnapshot {
+    pub snapshot: ExecutableSnapshotOpen,
+    pub request: VfsExecutableSnapshotRequest,
+}
+
+static SESSIONS: spin::Mutex<SnapshotSessions<CompletedSnapshot, SNAPSHOT_WORKERS>> =
+    spin::Mutex::new(SnapshotSessions::new());
 
 struct SnapshotJobSlot(UnsafeCell<MaybeUninit<SnapshotJob>>);
 
 // SAFETY: the matching `SNAPSHOT_JOB_ADMISSION` entry is the publication
 // authority for its slot. The receive owner writes only in WRITING and
-// publishes READY with Release; one worker claims READY with Acquire, copies
-// the fixed job, and returns IDLE. Slots are never shared between admissions.
+// publishes READY with Release; one worker claims READY with Acquire, moves
+// the initialized job, and returns IDLE after completion. Slots are never shared between admissions.
 unsafe impl Sync for SnapshotJobSlot {}
 
 #[repr(C, align(16))]
@@ -49,10 +58,10 @@ struct SnapshotWorkerStack([u8; SNAPSHOT_WORKER_STACK_BYTES]);
 /// Bounded snapshot concurrency.
 ///
 /// Two, not more, and the bound is a consequence rather than a preference.
-/// Every snapshot read serializes on the single storage owner, so a third
-/// worker could only queue there; what a second worker buys is that one
-/// snapshot can allocate, seal, and reply while another holds storage, and that
-/// a second concurrent request is served instead of being rejected as overload.
+/// The underlying device is serialized, but detached data reads do not retain
+/// namespace ownership. A second worker can hash/seal/reap while its peer reads
+/// and can serve a second admitted lease instead of rejecting all overlap.
+/// Final-frame byte admission independently bounds their combined payloads.
 ///
 /// This is ownership structure, not a latency fix: a single caller issuing
 /// snapshots one at a time sees no difference. The per-snapshot phase report in
@@ -94,10 +103,10 @@ pub(super) fn demote_current_thread_or_exit(role: &str) {
     }
 }
 
-pub(super) fn reply_snapshot_status(reply_cap: u64, status: i32) -> i64 {
+pub(super) fn reply_snapshot_status(reply_cap: u64, op: u16, status: i32) -> i64 {
     let response = VfsExecutableSnapshotResponse {
         version: VFS_EXECUTABLE_SNAPSHOT_ABI_VERSION,
-        op: VFS_EXECUTABLE_SNAPSHOT_OP_OPEN,
+        op,
         status,
         ..VfsExecutableSnapshotResponse::default()
     };
@@ -112,19 +121,28 @@ pub(super) fn reply_snapshot_status(reply_cap: u64, status: i32) -> i64 {
     }
 }
 
-fn reply_snapshot_overload(reply_cap: u64) -> i64 {
-    reply_snapshot_status(reply_cap, EAGAIN)
-}
-
 pub(super) fn enqueue_executable_snapshot(
     reply_cap: u64,
     sender_pid: u64,
     sender_tid: u64,
     request: VfsExecutableSnapshotRequest,
 ) -> i64 {
-    if ensure_snapshot_worker().is_err() {
-        return reply_snapshot_overload(reply_cap);
+    let now = rustos_svc_runtime::syscall::monotonic_nanos();
+    if request.job_id != 0 || request.deadline_ns <= now {
+        return reply_snapshot_status(reply_cap, request.op, ETIMEDOUT);
     }
+    if request.deadline_ns - now > VFS_EXECUTABLE_SNAPSHOT_MAX_LEASE_MS * 1_000_000 {
+        return reply_snapshot_status(reply_cap, request.op, EINVAL);
+    }
+    if ensure_snapshot_worker().is_err() {
+        return reply_snapshot_status(reply_cap, request.op, EAGAIN);
+    }
+    let owner = (sender_pid, sender_tid);
+    let admission = { SESSIONS.lock().begin(owner, request.deadline_ns, now) };
+    let (id, control) = match admission {
+        Ok(admission) => admission,
+        Err(error) => return reply_snapshot_status(reply_cap, request.op, session_errno(error)),
+    };
     let Some(index) = SNAPSHOT_JOB_ADMISSION
         .iter()
         .position(SnapshotWorkerAdmission::try_reserve)
@@ -132,21 +150,82 @@ pub(super) fn enqueue_executable_snapshot(
         // Every worker is busy. The caller is told the provider is saturated
         // rather than being left to time out, so it can distinguish "no
         // capacity right now" from "this open failed".
-        return reply_snapshot_overload(reply_cap);
+        let rejected = { SESSIONS.lock().finish(id, Err(EAGAIN), now) };
+        drop(rejected);
+        let _ = SESSIONS.lock().cancel(id, owner, request.deadline_ns);
+        wake_snapshot_workers(SNAPSHOT_WORK_SIGNAL.publish());
+        return reply_snapshot_status(reply_cap, request.op, EAGAIN);
     };
     // SAFETY: WRITING grants the receive owner exclusive access to this exact
     // slot; no other admission can be in WRITING for the same index.
     unsafe {
         (*SNAPSHOT_JOB[index].0.get()).write(SnapshotJob {
-            reply_cap,
-            sender_pid,
-            sender_tid,
+            id,
+            control,
             request,
         });
     }
     SNAPSHOT_JOB_ADMISSION[index].publish_ready();
     wake_snapshot_workers(SNAPSHOT_WORK_SIGNAL.publish());
-    0
+    let response = VfsExecutableSnapshotResponse {
+        version: VFS_EXECUTABLE_SNAPSHOT_ABI_VERSION, op: request.op,
+        status: VFS_EXECUTABLE_SNAPSHOT_PENDING, job_id: id,
+        ..VfsExecutableSnapshotResponse::default()
+    };
+    let reply = reply_control(reply_cap, &response);
+    if reply < 0 {
+        // OPEN reply loss cannot orphan work or retain a reply capability.
+        let _ = SESSIONS.lock().cancel(id, owner, request.deadline_ns);
+        wake_snapshot_workers(SNAPSHOT_WORK_SIGNAL.publish());
+    }
+    reply
+}
+
+fn session_errno(error: SessionError) -> i32 {
+    match error {
+        SessionError::Full => EAGAIN, SessionError::Exhausted => EOVERFLOW,
+        SessionError::Unknown => ENOENT, SessionError::Owner => EACCES,
+        SessionError::Lease => ETIMEDOUT,
+    }
+}
+fn reply_control(reply_cap: u64, response: &VfsExecutableSnapshotResponse) -> i64 {
+    // SAFETY: the initialized wire value stays live during the reply copy.
+    unsafe { ipc::reply(reply_cap, (response as *const VfsExecutableSnapshotResponse).cast(), size_of::<VfsExecutableSnapshotResponse>()) }
+}
+
+pub(super) fn continue_executable_snapshot(reply_cap: u64, sender_pid: u64, sender_tid: u64,
+    request: &VfsExecutableSnapshotRequest) -> i64 {
+    if request.version != VFS_EXECUTABLE_SNAPSHOT_ABI_VERSION || request.flags != 0
+        || request.reserved0 != 0 || request.job_id == 0 || request.path_len != 0
+        || request.target_pid != 0 || request.dirfd != 0 || request.max_bytes != 0
+        || !matches!(request.op, VFS_EXECUTABLE_SNAPSHOT_OP_POLL | VFS_EXECUTABLE_SNAPSHOT_OP_CANCEL)
+    { return reply_snapshot_status(reply_cap, request.op, EINVAL); }
+    let owner = (sender_pid, sender_tid);
+    if request.op == VFS_EXECUTABLE_SNAPSHOT_OP_CANCEL {
+        let result = { SESSIONS.lock().cancel(request.job_id, owner, request.deadline_ns) };
+        wake_snapshot_workers(SNAPSHOT_WORK_SIGNAL.publish());
+        return reply_snapshot_status(reply_cap, request.op, result.map_or_else(session_errno, |_| 0));
+    }
+    let outcome = { SESSIONS.lock().poll(request.job_id, owner, request.deadline_ns,
+        rustos_svc_runtime::syscall::monotonic_nanos()) };
+    match outcome {
+        Err(error) => reply_snapshot_status(reply_cap, request.op, session_errno(error)),
+        Ok(SessionPoll::Ready(Err(errno))) => reply_snapshot_status(reply_cap, request.op, errno),
+        Ok(SessionPoll::Ready(Ok(complete))) => reply_executable_snapshot(reply_cap, request.job_id, complete),
+        Ok(SessionPoll::Pending { completed, total }) => reply_control(reply_cap, &VfsExecutableSnapshotResponse {
+            version: VFS_EXECUTABLE_SNAPSHOT_ABI_VERSION, op: request.op,
+            status: VFS_EXECUTABLE_SNAPSHOT_PENDING, job_id: request.job_id,
+            completed_bytes: completed, file_bytes: total,
+            ..VfsExecutableSnapshotResponse::default()
+        }),
+    }
+}
+
+fn reap_expired_sessions() {
+    loop {
+        let expired = { SESSIONS.lock().expire_one(rustos_svc_runtime::syscall::monotonic_nanos()) };
+        match expired { Some(payload) => drop(payload), None => break }
+    }
 }
 
 fn wake_snapshot_workers(word: &AtomicU32) {
@@ -168,6 +247,7 @@ fn wake_snapshot_workers(word: &AtomicU32) {
 
 #[cfg(not(test))]
 fn wait_snapshot_work(word: &AtomicU32, expected: u32) {
+    reap_expired_sessions();
     let timeout = linux_abi::LinuxTimespec {
         tv_sec: 0,
         tv_nsec: 1_000_000,
@@ -277,20 +357,35 @@ fn spawn_snapshot_worker(_index: usize) -> Result<(), i64> {
 
 #[cfg(not(test))]
 extern "C" fn snapshot_worker_entry() -> ! {
+    let mut demoted = false;
     loop {
+        reap_expired_sessions();
         let Some(index) =
             SNAPSHOT_WORK_SIGNAL.claim_or_wait(claim_any_ready_job, wait_snapshot_work)
         else {
             continue;
         };
+        if !demoted && super::SNAPSHOT_WORKER_DEMOTED.load(Ordering::Acquire) {
+            demote_current_thread_or_exit("snapshot-worker");
+            demoted = true;
+        }
         // SAFETY: Acquire of READY observes the complete fixed job, and BUSY
-        // excludes the receive owner from this exact slot until the copy below
+        // excludes the receive owner from this exact slot until the move below
         // has completed.
         let job = unsafe { (*SNAPSHOT_JOB[index].0.get()).assume_init_read() };
         // Storage is acquired inside, per phase, never held across the bulk
         // read.
-        let _ =
-            reply_executable_snapshot(job.reply_cap, job.sender_pid, job.sender_tid, &job.request);
+        let result = super::open_executable_snapshot(&job.request, &job.control)
+            .map(|snapshot| CompletedSnapshot { snapshot, request: job.request });
+        if let Err(errno) = &result {
+            ipc::debug_line(&format!("vfsd: executable snapshot rejected stage=open errno={errno} completed={} total={}",
+                job.control.completed_bytes(), job.control.total_bytes()));
+        }
+        let rejected = { SESSIONS.lock().finish(job.id, result,
+            rustos_svc_runtime::syscall::monotonic_nanos()) };
+        // Frame release and budget refunds happen outside every table/storage
+        // lock, on a worker, including cancellation and an abandoned client.
+        drop(rejected);
         SNAPSHOT_JOB_ADMISSION[index].release();
     }
 }

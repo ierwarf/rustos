@@ -17,7 +17,7 @@ rustos-image-admission = { path = "../../libs/rustos-image-admission" }
 
 rustos-release-verifier = { path = "../../libs/rustos-release-verifier" }
 rustos-component-model = { path = "../../libs/rustos-component-model" }
+sha2 = { version = "0.10", default-features = false }
 
 [dev-dependencies]
 ed25519-dalek = { version = "2", default-features = false }
-sha2 = { version = "0.10", default-features = false }

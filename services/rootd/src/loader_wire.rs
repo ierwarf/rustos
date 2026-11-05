@@ -16,6 +16,8 @@ pub(super) const fn empty_loader_spawn_request() -> LoaderSpawnRequest {
         target_tid: 0,
         exec_ticket: 0,
         exec_dirfd: 0,
+        deadline_ns: 0,
+        work_id: 0,
         exec_path_len: 0,
         argv_count: 0,
         env_count: 0,
@@ -52,6 +54,12 @@ pub(super) const fn empty_loader_spawn_response() -> LoaderSpawnResponse {
         status: 0,
         pid: 0,
         reserved0: 0,
+        work_id: 0,
+        completed_bytes: 0,
+        file_bytes: 0,
+        image_format: 0,
+        reserved1: 0,
+        reserved2: 0,
     }
 }
 

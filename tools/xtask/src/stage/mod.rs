@@ -535,15 +535,14 @@ fn write_application_desktop_files(config: &Config, manifests: &[PackageManifest
     fs::create_dir_all(&applications_dir)?;
 
     for manifest in manifests {
-        if !manifest.artifact_path(config).exists() {
+        if !manifest.artifact_path(config).exists()
+            || !runtime_launch_enabled_for_manifest(config, manifest)
+        {
             continue;
         }
 
         for (index, entry) in manifest.desktop.entries.iter().enumerate() {
             let desktop_file_id = desktop_file_id(manifest, index);
-            if !should_generate_application_desktop(config, manifest, &desktop_file_id) {
-                continue;
-            }
             let exec = entry.exec.as_deref().unwrap_or(&manifest.install.path);
             let deps = registry_deps(&manifest.runtime_deps)?;
             let argv = if entry.args.is_empty() {
@@ -575,21 +574,6 @@ fn write_application_desktop_files(config: &Config, manifests: &[PackageManifest
     }
 
     Ok(())
-}
-
-fn should_generate_application_desktop(
-    config: &Config,
-    manifest: &PackageManifest,
-    desktop_file_id: &str,
-) -> bool {
-    if !matches!(manifest.startup, StartupMode::None) {
-        return true;
-    }
-    config
-        .image_dir
-        .join("etc/xdg/autostart")
-        .join(desktop_file_id)
-        .is_file()
 }
 
 fn write_desktop_registry(config: &Config, manifests: &[PackageManifest]) -> Result<()> {
@@ -1224,6 +1208,43 @@ mod tests {
     };
     use fatfs::{Seek as _, Write as _};
     use std::fs::OpenOptions;
+
+    #[test]
+    fn imported_chrome_is_visible_without_any_boot_launch_entry() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = crate::config::Config::from_env().unwrap();
+        config.image_dir = temp.path().join("image");
+        config.artifact_dir = temp.path().join("artifacts");
+        let manifest: crate::package_manifest::PackageManifest = toml::from_str(
+            include_str!("../../../../apps/chrome/RUSTOS.package.toml.example"),
+        ).unwrap();
+        let artifact = manifest.artifact_path(&config);
+        std::fs::create_dir_all(&artifact).unwrap();
+        std::fs::write(artifact.join("chrome"), b"browser fixture").unwrap();
+        super::stage_manifest(&config, &manifest).unwrap();
+        let manifests = [manifest];
+        super::write_application_desktop_files(&config, &manifests).unwrap();
+        super::write_desktop_registry(&config, &manifests).unwrap();
+        super::write_runtime_launch_registry(&config, &manifests).unwrap();
+        super::write_startup_registry(&config, &manifests).unwrap();
+        let desktop = std::fs::read_to_string(config.image_dir.join(super::DESKTOP_REGISTRY_PATH)).unwrap();
+        for field in ["display_name=Google Chrome", "startup=none", "no_display=0", "autostart_enabled=0", "image=apps/chrome/chrome"] {
+            assert!(desktop.contains(field), "{desktop}");
+        }
+        let entry = std::fs::read_to_string(config.image_dir.join(super::APPLICATIONS_DIR).join("chrome.desktop")).unwrap();
+        assert!(entry.contains("X-RustOS-Startup=none"));
+        assert!(entry.contains("NoDisplay=false"));
+        for registry in [super::STARTUP_REGISTRY_PATH, super::RUNTIME_LAUNCH_REGISTRY_PATH] {
+            assert!(std::fs::read_to_string(config.image_dir.join(registry)).unwrap().trim().is_empty());
+        }
+        assert!(!config.image_dir.join("etc/xdg/autostart/chrome.desktop").exists());
+        let mut disabled_fuzzer = manifests[0].clone();
+        disabled_fuzzer.id = super::ABI_FUZZ_PACKAGE_ID.into();
+        config.project.fuzzing.enabled = false;
+        super::write_application_desktop_files(&config, &[disabled_fuzzer]).unwrap();
+        assert!(!config.image_dir.join(super::APPLICATIONS_DIR).join("abifuzz.desktop").exists());
+        assert_eq!(std::fs::read(config.image_dir.join("apps/chrome/chrome")).unwrap(), b"browser fixture");
+    }
 
     #[test]
     fn registry_deps_join_package_ids_with_commas() {

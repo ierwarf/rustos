@@ -381,14 +381,29 @@ vfs_receive_body="$(
 vfs_snapshot_worker_body="$(
     cat services/vfsd/src/snapshot_worker.rs
 )"
+vfs_snapshot_job_fields="$(sed -n '/^struct SnapshotJob {/,/^}/p' services/vfsd/src/snapshot_worker.rs)"
 if ! grep -Fq 'state.resolve_executable_snapshot_request(*request)' <<<"$vfs_receive_body" \
     || ! grep -Fq 'enqueue_executable_snapshot(reply_cap, sender_pid, sender_tid, resolved)' <<<"$vfs_receive_body" \
     || grep -Fq 'enqueue_executable_snapshot(reply_cap, sender_pid, sender_tid, *request)' <<<"$vfs_receive_body" \
-    || grep -Fq 'reply_executable_snapshot(' <<<"$vfs_receive_body" \
-    || ! grep -Fq 'reply_executable_snapshot(' <<<"$vfs_snapshot_worker_body" \
+    || ! grep -Fq 'continue_executable_snapshot(reply_cap, sender_pid, sender_tid, request)' <<<"$vfs_receive_body" \
+    || grep -Fq 'open_executable_snapshot(' <<<"$vfs_receive_body" \
+    || ! grep -Fq 'super::open_executable_snapshot(&job.request, &job.control)' <<<"$vfs_snapshot_worker_body" \
+    || grep -Fq 'reply_cap' <<<"$vfs_snapshot_job_fields" \
+    || ! grep -Fq 'control: Arc<SnapshotControl>' <<<"$vfs_snapshot_job_fields" \
     || ! grep -Fq 'SnapshotWorkerAdmission' services/vfsd/src/snapshot_worker.rs \
     || grep -Eq 'sched_yield|SYS_SCHED_YIELD' services/vfsd/src/main.rs services/vfsd/src/snapshot_worker.rs; then
-    echo 'vfsd receive owner must hand bulk snapshots to one bounded exact-owner worker slot' >&2
+    echo 'vfsd must resolve namespace once and run bounded leased bulk work without retaining reply authority' >&2
+    exit 1
+fi
+
+loader_placed_body="$(sed -n '/^fn handle_placed_request(/,/^fn authorize_loader_operation(/p' services/loaderd/src/main.rs | sed '$d')"
+if grep -Fq 'open_immutable_file_snapshot(' <<<"$loader_placed_body" \
+    || ! grep -Fq 'snapshot.take_fd()' <<<"$loader_placed_body" \
+    || ! grep -Fq 'handles.take_one()' services/loaderd/src/main.rs \
+    || ! grep -Fq 'pending.ticket.poll()' services/loaderd/src/image_staging.rs \
+    || ! grep -Fq 'authorize_loader_operation(pending.request.op, owner.0)' services/loaderd/src/image_staging.rs \
+    || ! grep -Fq 'application_launch::spawn(&pending.request' services/loaderd/src/image_staging.rs; then
+    echo 'loaderd must stage with owner-bound work, move attenuated receive custody, and construct from the same owned snapshot' >&2
     exit 1
 fi
 

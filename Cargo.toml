@@ -1,4 +1,5 @@
 [workspace]
+exclude = ["vendor/rust-fatfs"]
 
 members = [
     "boot/boot-protocol",
@@ -89,6 +90,10 @@ default-members = [
     "tools/hostd",
 ]
 
+
+# Pinned upstream c4b8847 with documented malformed-cluster validation fixes.
+[patch."https://github.com/rafalh/rust-fatfs"]
+fatfs = { path = "vendor/rust-fatfs" }
 
 [profile.release]
 panic = "abort"

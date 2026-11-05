@@ -32,11 +32,11 @@ pub(super) fn configure(
 
 pub(super) fn spawn(
     request: &LoaderSpawnRequest, sender_pid: u64, placement: Option<u64>,
-    applications: &mut ApplicationJobs,
+    applications: &mut ApplicationJobs, snapshot: Option<ImmutableFileSnapshot>,
 ) -> HandledLoaderRequest {
     let application = request.op == LOADER_OP_SPAWN_EXEC
         && rustos_svc_runtime::ipc::validate_service_owner(IPC_SERVICE_SESSIOND, sender_pid) >= 0;
-    if !application { return handle_placed_request(request, placement); }
+    if !application { return handle_placed_request(request, placement, snapshot); }
     // Runtime clients cannot substitute a service/foreign placement descriptor.
     if placement.is_some() {
         return spawn_response(LoaderSpawnResponse {
@@ -57,7 +57,7 @@ pub(super) fn spawn(
             status: errno, pid: -1, ..LoaderSpawnResponse::default()
         }),
     };
-    let mut handled = handle_placed_request(request, Some(handle));
+    let mut handled = handle_placed_request(request, Some(handle), snapshot);
     if let LoaderReply::Spawn(response) = &mut handled.reply {
         if response.status == 0 && response.pid > 0 {
             match applications.published(handle, response.pid as u64, &mut NativeJobs) {

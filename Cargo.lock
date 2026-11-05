@@ -452,7 +452,6 @@ checksum = "9f1f227452a390804cdb637b74a86990f2a7d7ba4b7d5693aac9b4dd6defd8d6"
 [[package]]
 name = "fatfs"
 version = "0.4.0"
-source = "git+https://github.com/rafalh/rust-fatfs#c4b88477b22ca7e5131fbd8891f62a5deaa88e6e"
 dependencies = [
  "bitflags 2.11.0",
  "log",
@@ -1438,6 +1437,7 @@ name = "storage-fat"
 version = "0.1.0"
 dependencies = [
  "fatfs",
+ "spin 0.10.0",
  "storage-core",
 ]
 
@@ -1647,6 +1647,7 @@ dependencies = [
  "rustos-svc-runtime",
  "rustos-user-abi",
  "sha2",
+ "spin 0.10.0",
  "storage-core",
  "storage-fat",
 ]

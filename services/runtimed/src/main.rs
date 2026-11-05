@@ -24,6 +24,7 @@ use rustos_user_abi::syscall::{
 mod catalog;
 mod kvm_smp_qualification;
 mod launch_worker;
+mod image_probe;
 mod heartbeat;
 mod offload;
 mod session;

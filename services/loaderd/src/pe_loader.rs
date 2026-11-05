@@ -6,11 +6,12 @@ fn map_pe_segments_fd(
     exec_path: &str,
     argv: &[CString],
     env: &[CString],
+    deadline: AbsoluteDeadline,
 ) -> Result<RustosProcSetWindowsRuntimeBrokerArgs, i32> {
     let mut main = load_pe_image_fd(fd, exec_path, pe_default_load_base()?, false)
         .map_err(|err| pe_step_err(exec_path, "load-pe-image-main", err))?;
     let mut modules = Vec::<LoadedPeModule>::new();
-    let registry = load_system_dll_registry()
+    let registry = load_system_dll_registry(deadline)
         .map_err(|err| pe_step_err(exec_path, "load-dll-registry", err))?;
     let mut next_base = align_up(
         main.load_base
@@ -19,9 +20,9 @@ fn map_pe_segments_fd(
         4096,
     )
     .map_err(|err| pe_step_err(exec_path, "align-next-base", err))?;
-    preload_system_dlls(&registry, &mut modules, &mut next_base)
+    preload_system_dlls(&registry, &mut modules, &mut next_base, deadline)
         .map_err(|err| pe_step_err(exec_path, "preload-dlls", err))?;
-    resolve_import_closure(&mut main, &mut modules, &registry, &mut next_base)
+    resolve_import_closure(&mut main, &mut modules, &registry, &mut next_base, deadline)
         .map_err(|err| pe_step_err(exec_path, "resolve-imports", err))?;
     let runtime = build_windows_runtime_blob(
         prepare_handle,
@@ -359,17 +360,18 @@ fn resolve_import_closure(
     modules: &mut Vec<LoadedPeModule>,
     registry: &[SystemDllEntry],
     next_base: &mut u64,
+    deadline: AbsoluteDeadline,
 ) -> Result<(), i32> {
     // Main may load a DLL not already in the preload set. Patch it first so
     // every newly discovered DLL is visited by the growing worklist below.
-    patch_module_imports(main, modules, registry, next_base)?;
+    patch_module_imports(main, modules, registry, next_base, deadline)?;
     let mut cursor = 0;
     while cursor < modules.len() {
         if modules.len() > PE_MAX_IMPORT_MODULES {
             return Err(ENOEXEC);
         }
         let mut module = modules.remove(cursor);
-        patch_module_imports(&mut module, modules, registry, next_base)?;
+        patch_module_imports(&mut module, modules, registry, next_base, deadline)?;
         module.imports_patched = true;
         modules.insert(cursor, module);
         if modules.len() > PE_MAX_IMPORT_MODULES {
@@ -385,6 +387,7 @@ fn patch_module_imports(
     modules: &mut Vec<LoadedPeModule>,
     registry: &[SystemDllEntry],
     next_base: &mut u64,
+    deadline: AbsoluteDeadline,
 ) -> Result<(), i32> {
     if module.imports_patched {
         return Ok(());
@@ -392,7 +395,7 @@ fn patch_module_imports(
     let imports = collect_imports(module)?;
     for import in imports {
         let dll_index =
-            ensure_system_dll_loaded(import.dll_name.as_slice(), modules, registry, next_base)?;
+            ensure_system_dll_loaded(import.dll_name.as_slice(), modules, registry, next_base, deadline)?;
         let target =
             resolve_export_by_index(modules, dll_index, &import.lookup, 0)?.ok_or(ENOEXEC)?;
         write_u64_at_rva(&mut module.image, import.first_thunk_rva, target)?;
@@ -481,6 +484,7 @@ fn ensure_system_dll_loaded(
     modules: &mut Vec<LoadedPeModule>,
     registry: &[SystemDllEntry],
     next_base: &mut u64,
+    deadline: AbsoluteDeadline,
 ) -> Result<usize, i32> {
     let canonical = canonical_system_dll_name_bytes(requested).ok_or(ENOEXEC)?;
     if let Some(index) = modules
@@ -493,7 +497,7 @@ fn ensure_system_dll_loaded(
         .iter()
         .find(|entry| dll_name_eq(entry.base_name.as_bytes(), canonical.as_bytes()))
         .ok_or(ENOEXEC)?;
-    let fd = open_readonly(entry.path.as_str())?;
+    let fd = open_readonly(entry.path.as_str(), deadline)?;
     let load_base = *next_base;
     let loaded = load_pe_image_fd(fd, entry.path.as_str(), load_base, true);
     let close_status = syscall1(SYS_CLOSE, fd as u64);
@@ -516,6 +520,7 @@ fn preload_system_dlls(
     registry: &[SystemDllEntry],
     modules: &mut Vec<LoadedPeModule>,
     next_base: &mut u64,
+    deadline: AbsoluteDeadline,
 ) -> Result<(), i32> {
     for entry in registry.iter().take(PE_MAX_IMPORT_MODULES) {
         if modules
@@ -524,7 +529,7 @@ fn preload_system_dlls(
         {
             continue;
         }
-        let fd = open_readonly(entry.path.as_str())?;
+        let fd = open_readonly(entry.path.as_str(), deadline)?;
         let loaded = load_pe_image_fd(fd, entry.path.as_str(), *next_base, true);
         let close_status = syscall1(SYS_CLOSE, fd as u64);
         if close_status < 0 {

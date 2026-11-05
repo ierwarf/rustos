@@ -1102,9 +1102,17 @@ pub const LINUX_CPUSET_BYTES: usize = 8;
 pub const LINUX_DEFAULT_STACK_RLIMIT_BYTES: u64 = 8 * 1024 * 1024;
 pub const LINUX_TIMESPEC_SIZE: usize = 16;
 pub const LINUX_SIGACTION_SIZE: usize = 32;
-pub const LOADER_REQUEST_ABI_VERSION: u16 = 3;
+pub const LOADER_REQUEST_ABI_VERSION: u16 = 4;
 pub const LOADER_OP_SPAWN_EXEC: u16 = 1;
 pub const LOADER_OP_EXEC_TARGET: u16 = 2;
+/// Nonblocking continuation of an authenticated image-staging transaction.
+pub const LOADER_OP_POLL_WORK: u16 = 6;
+pub const LOADER_OP_CANCEL_WORK: u16 = 7;
+/// Stage and validate only: no process prepare, mapping, commit or activation.
+pub const LOADER_OP_VALIDATE_IMAGE: u16 = 8;
+pub const LOADER_WORK_PENDING: i32 = 115;
+/// Explicit Ring3 application-work lifetime, not an IPC blocking timeout.
+pub const LOADER_APPLICATION_WORK_MAX_LEASE_MS: u64 = 180_000;
 
 /// Static half of the loader authority contract. Services and ring0 must pair
 /// this role matrix with a live kernel-owned service publication check at the
@@ -1116,6 +1124,9 @@ pub const fn loader_service_role_allows_operation(op: u16, service_id: u64) -> b
             IPC_SERVICE_ROOTD | IPC_SERVICE_INITD | IPC_SERVICE_SESSIOND
         ),
         LOADER_OP_EXEC_TARGET => service_id == IPC_SERVICE_PROCD,
+        LOADER_OP_POLL_WORK | LOADER_OP_CANCEL_WORK => matches!(service_id,
+            IPC_SERVICE_ROOTD | IPC_SERVICE_INITD | IPC_SERVICE_SESSIOND | IPC_SERVICE_PROCD),
+        LOADER_OP_VALIDATE_IMAGE => matches!(service_id, IPC_SERVICE_ROOTD | IPC_SERVICE_SESSIOND),
         LOADER_OP_CONFIGURE_JOB_REALM => service_id == IPC_SERVICE_ROOTD,
         _ => false,
     }
@@ -3430,6 +3441,10 @@ pub struct LoaderSpawnRequest {
     /// VFS directory basis for `exec_path`. Spawn requests carry zero because
     /// their paths are absolute; exec-target requests carry `AT_FDCWD`.
     pub exec_dirfd: u64,
+    /// One absolute operation lease across staging and process construction.
+    pub deadline_ns: u64,
+    /// Zero on begin; exact owner/lease-bound ID on POLL_WORK/CANCEL_WORK.
+    pub work_id: u64,
     pub exec_path_len: u32,
     pub argv_count: u16,
     pub env_count: u16,
@@ -3456,6 +3471,8 @@ impl Default for LoaderSpawnRequest {
             target_tid: 0,
             exec_ticket: 0,
             exec_dirfd: 0,
+            deadline_ns: 0,
+            work_id: 0,
             exec_path_len: 0,
             argv_count: 0,
             env_count: 0,
@@ -3484,6 +3501,13 @@ pub struct LoaderSpawnResponse {
     pub status: i32,
     pub pid: i64,
     pub reserved0: u64,
+    pub work_id: u64,
+    pub completed_bytes: u64,
+    pub file_bytes: u64,
+    /// Nonzero only after actual executable-format admission.
+    pub image_format: u16,
+    pub reserved1: u16,
+    pub reserved2: u32,
 }
 
 #[repr(C)]

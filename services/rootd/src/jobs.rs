@@ -10,8 +10,8 @@ use rustos_user_abi::syscall::{
     JOB_ABI_VERSION, JOB_BOOTSTRAP_ROOT_FD, JOB_ID_ROOT, JOB_OP_CREATE_CHILD,
     JOB_OP_DUPLICATE_HANDLE, JOB_OP_GET_INFO, JOB_OP_KILL, JOB_OP_OPEN_SUBTREE, JOB_OP_PROCESS_JOB, JOB_OP_SET_LIMITS, JOB_LIMIT_MEMORY_PAGES, JOB_LIMIT_PROCESSES, JOB_LIMIT_THREADS, JOB_LIMIT_UNSET,
     JOB_RIGHT_CREATE_JOB, JOB_RIGHT_CREATE_PROCESS, JOB_RIGHT_DUPLICATE, JOB_RIGHT_INSPECT,
-    JOB_RIGHT_TRANSFER, IpcCallWithHandlesArgs, LoaderSpawnRequest, LoaderSpawnResponse,
-    RustosJobArgs, SYS_RUSTOS_IPC_CALL_WITH_HANDLES, SYS_RUSTOS_JOB,
+    JOB_RIGHT_TRANSFER, LoaderSpawnRequest, LoaderSpawnResponse,
+    RustosJobArgs, SYS_RUSTOS_JOB,
 };
 
 fn call(mut args: RustosJobArgs) -> Result<RustosJobArgs, i64> {
@@ -114,26 +114,6 @@ pub(super) fn bootstrap_args(
     }
 }
 
-fn loader_call_args(
-    endpoint: u64,
-    request: &LoaderSpawnRequest,
-    response: &mut LoaderSpawnResponse,
-    descriptor: &i32,
-    received_count: &mut u16,
-) -> IpcCallWithHandlesArgs {
-    IpcCallWithHandlesArgs {
-        endpoint,
-        request_ptr: request as *const _ as u64,
-        request_len: core::mem::size_of::<LoaderSpawnRequest>() as u64,
-        reply_ptr: response as *mut _ as u64,
-        reply_capacity: core::mem::size_of::<LoaderSpawnResponse>() as u64,
-        send_fds_ptr: descriptor as *const _ as u64,
-        send_fd_count: 1,
-        recv_fd_count_ptr: received_count as *mut _ as u64,
-        ..IpcCallWithHandlesArgs::default()
-    }
-}
-
 /// Lend only process-creation/transfer authority to loaderd. Its receive path
 /// authenticates this process independently of the transferred descriptor.
 /// The supervisor's original descriptor retains inspect/kill authority.
@@ -148,14 +128,15 @@ pub(super) fn call_loader(
         Ok(fd) => fd,
         Err(_) => { close(borrowed); return Err(75); }
     };
-    let mut received_count = 0_u16;
-    let args = loader_call_args(endpoint, request, response, &descriptor, &mut received_count);
-    // All argument/byte/fd buffers stay live and disjoint for the blocking call.
-    let result = syscall1(SYS_RUSTOS_IPC_CALL_WITH_HANDLES, &args as *const _ as u64);
+    let mut request = *request;
+    request.deadline_ns = rustos_svc_runtime::syscall::monotonic_nanos().saturating_add(
+        rustos_user_abi::performance::IPC_BOOT_CONTROL_HARD_LIMIT_MS * 1_000_000);
+    let result = rustos_svc_runtime::loader_client::call(endpoint, &request, Some(descriptor));
     close(borrowed);
-    if result < 0 { return Err(-result); }
-    if received_count != 0 { return Err(22); }
-    Ok(result as usize)
+    match result {
+        Ok(reply) => { *response = reply; Ok(core::mem::size_of::<LoaderSpawnResponse>()) }
+        Err(errno) => Err(errno as i64),
+    }
 }
 
 /// Mints an attenuated handle to the job `job` (an id from the census) under
@@ -481,7 +462,7 @@ mod tests {
         let mut response = LoaderSpawnResponse::default();
         let descriptor = 9_i32;
         let mut count = 0_u16;
-        let args = loader_call_args(7, &request, &mut response, &descriptor, &mut count);
+        let args = rustos_svc_runtime::loader_client::placement_call_args(7, &request, &mut response, &descriptor, &mut count);
         assert_eq!((args.endpoint, args.send_fd_count, args.recv_fd_capacity, args.reserved0), (7, 1, 0, 0));
         assert_eq!(args.send_fds_ptr, &descriptor as *const _ as u64);
         assert_eq!(args.request_ptr, &request as *const _ as u64);
@@ -491,8 +472,9 @@ mod tests {
         let source = include_str!("jobs.rs").split("#[cfg(test)]").next().unwrap();
         let lend = source.split_once("pub(super) fn call_loader(").unwrap().1;
         assert!(lend.contains("duplicate(job, JOB_RIGHT_CREATE_PROCESS | JOB_RIGHT_TRANSFER)"));
-        assert!(lend.find("SYS_RUSTOS_IPC_CALL_WITH_HANDLES, &args").unwrap()
+        assert!(lend.find("loader_client::call(endpoint, &request, Some(descriptor))").unwrap()
             < lend.rfind("close(borrowed)").unwrap());
+        assert!(lend.contains("request.deadline_ns ="));
     }
 
     #[test]

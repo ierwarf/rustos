@@ -5,6 +5,12 @@ extern crate alloc;
 extern crate std;
 
 use alloc::string::String;
+use alloc::sync::Arc;
+use core::sync::atomic::{AtomicU64, Ordering};
+use spin::Mutex;
+
+mod read_map;
+pub use read_map::{FatReadView, FatReadSource};
 use alloc::vec;
 use alloc::vec::Vec;
 use core::cmp::min;
@@ -69,8 +75,33 @@ impl ReadWindow {
     }
 }
 
+struct SharedDevice<D> {
+    device: D,
+    identity: u64,
+    version: u64,
+}
+
+/// The wait strategy belongs to the embedding runtime. A Ring3 filesystem
+/// supplies a sleeping callback because a holder may be blocked in device IPC;
+/// busy spinning at a higher scheduling class would prevent its progress.
+struct DeviceCell<D> {
+    inner: Mutex<SharedDevice<D>>,
+    wait: fn(),
+}
+impl<D> DeviceCell<D> {
+    fn lock(&self) -> spin::MutexGuard<'_, SharedDevice<D>> {
+        loop {
+            if let Some(guard) = self.inner.try_lock() { return guard; }
+            (self.wait)();
+        }
+    }
+    fn into_inner(self) -> SharedDevice<D> { self.inner.into_inner() }
+}
+
+static NEXT_DEVICE_ID: AtomicU64 = AtomicU64::new(1);
+
 pub struct FatDisk<D: BlockDevice> {
-    dev: D,
+    dev: Arc<DeviceCell<D>>,
     pos: u64,
     block_size: usize,
     bytes_len: u64,
@@ -81,6 +112,10 @@ pub struct FatDisk<D: BlockDevice> {
 
 impl<D: BlockDevice> FatDisk<D> {
     pub fn new(dev: D) -> IoResult<Self> {
+        Self::new_with_wait(dev, core::hint::spin_loop)
+    }
+
+    pub fn new_with_wait(dev: D, wait: fn()) -> IoResult<Self> {
         let block_size = dev.logical_block_size();
         let block_count = dev.block_count();
         if !FAT_LOGICAL_BLOCK_SIZES.contains(&block_size) || block_count == 0 {
@@ -90,8 +125,10 @@ impl<D: BlockDevice> FatDisk<D> {
             .checked_mul(block_size as u64)
             .ok_or(StorageError::InvalidInput)?;
         let scratch = vec![0; block_size];
+        let identity = NEXT_DEVICE_ID.fetch_update(Ordering::Relaxed, Ordering::Relaxed,
+            |next| next.checked_add(1)).map_err(|_| StorageError::InvalidInput)?;
         Ok(Self {
-            dev,
+            dev: Arc::new(DeviceCell { inner: Mutex::new(SharedDevice { device: dev, identity, version: 1 }), wait }),
             pos: 0,
             block_size,
             bytes_len,
@@ -131,7 +168,7 @@ impl<D: BlockDevice> FatDisk<D> {
         let window = &mut self.windows[victim];
         window.blocks = 0;
         window.data.resize(span * block_size, 0);
-        self.dev.read_blocks(lba, &mut window.data)?;
+        self.dev.lock().device.read_blocks(lba, &mut window.data)?;
         self.tick += 1;
         window.start_lba = lba;
         window.blocks = span;
@@ -164,7 +201,9 @@ impl<D: BlockDevice> FatDisk<D> {
     }
 
     pub fn into_inner(self) -> D {
-        self.dev
+        // The only extra device reference belongs to a FatVolume, which never
+        // exposes its internal FatDisk. A standalone disk is uniquely owned.
+        Arc::try_unwrap(self.dev).ok().expect("standalone FAT disk").into_inner().device
     }
 
     fn bytes_len(&self) -> u64 {
@@ -216,7 +255,7 @@ impl<D: BlockDevice> Read for FatDisk<D> {
             if off == 0 {
                 let direct_len = (remaining / block_size) * block_size;
                 if direct_len >= READ_WINDOW_BYTES {
-                    self.dev
+                    self.dev.lock().device
                         .read_blocks(lba, &mut buf[done..done + direct_len])?;
                     self.pos += direct_len as u64;
                     done += direct_len;
@@ -241,6 +280,11 @@ impl<D: BlockDevice> Write for FatDisk<D> {
             return Ok(0);
         }
 
+        // Revoke detached maps before any potentially partial mutation.
+        {
+            let mut dev = self.dev.lock();
+            dev.version = dev.version.checked_add(1).ok_or(StorageError::InvalidInput)?;
+        }
         let max_write = min(buf.len() as u64, disk_len - self.pos) as usize;
         let mut done = 0usize;
         while done < max_write {
@@ -253,7 +297,7 @@ impl<D: BlockDevice> Write for FatDisk<D> {
                 min(block_size - off, max_write - done)
             };
             let result = if off == 0 && n % block_size == 0 {
-                self.dev.write_blocks(lba, &buf[done..done + n])
+                self.dev.lock().device.write_blocks(lba, &buf[done..done + n])
             } else {
                 self.write_partial_block(lba, off, &buf[done..done + n])
             };
@@ -270,7 +314,7 @@ impl<D: BlockDevice> Write for FatDisk<D> {
     }
 
     fn flush(&mut self) -> IoResult<()> {
-        self.dev.flush()
+        self.dev.lock().device.flush()
     }
 }
 
@@ -285,10 +329,10 @@ impl<D: BlockDevice> FatDisk<D> {
             self.scratch
                 .copy_from_slice(&window.data[start..start + block_size]);
         } else {
-            self.dev.read_blocks(lba, &mut self.scratch)?;
+            self.dev.lock().device.read_blocks(lba, &mut self.scratch)?;
         }
         self.scratch[off..off + bytes.len()].copy_from_slice(bytes);
-        self.dev.write_blocks(lba, &self.scratch)
+        self.dev.lock().device.write_blocks(lba, &self.scratch)
     }
 }
 
@@ -325,20 +369,28 @@ pub struct FatVolume<D: BlockDevice> {
     fs: FatFs<D>,
     /// Size of the underlying device in bytes; no valid file can be larger.
     device_bytes: u64,
+    device: Arc<DeviceCell<D>>,
 }
 
 pub struct FatFile<'a, D: BlockDevice>(InnerFile<'a, D>);
 
 impl<D: BlockDevice> FatVolume<D> {
     pub fn new(device: D) -> Result<Self, FatError> {
-        let disk = FatDisk::new(device).map_err(fatfs::Error::Io)?;
+        Self::new_with_wait(device, core::hint::spin_loop)
+    }
+
+    /// `wait` must allow a blocked device holder to run and must not re-enter
+    /// this filesystem. Blocking Ring3 devices should sleep/park, not spin.
+    pub fn new_with_wait(device: D, wait: fn()) -> Result<Self, FatError> {
+        let disk = FatDisk::new_with_wait(device, wait).map_err(fatfs::Error::Io)?;
         Self::from_disk(disk)
     }
 
     pub fn from_disk(disk: FatDisk<D>) -> Result<Self, FatError> {
         let device_bytes = disk.bytes_len();
+        let device = disk.dev.clone();
         let fs = fatfs::FileSystem::new(disk, fatfs::FsOptions::new())?;
-        Ok(Self { fs, device_bytes })
+        Ok(Self { fs, device_bytes, device })
     }
 
     pub fn from_partition(
@@ -673,9 +725,9 @@ mod tests {
         }
     }
 
-    struct CountingBlockDevice {
-        inner: MemBlockDevice,
-        reads: usize,
+    pub(crate) struct CountingBlockDevice {
+        pub(crate) inner: MemBlockDevice,
+        pub(crate) reads: usize,
     }
 
     impl BlockDevice for CountingBlockDevice {
@@ -701,7 +753,7 @@ mod tests {
         }
     }
 
-    fn format_disk(block_size: usize, block_count: u64, volume_id: u32) -> MemBlockDevice {
+    pub(crate) fn format_disk(block_size: usize, block_count: u64, volume_id: u32) -> MemBlockDevice {
         let mut disk = MemBlockDevice::new_zeroed(block_size, block_count);
         let mut formatter = FatDisk::new(disk).expect("valid FAT disk geometry");
         fatfs::format_volume(
@@ -749,13 +801,13 @@ mod tests {
         disk.seek(SeekFrom::Start(3)).expect("seek first range");
         disk.read(&mut first).expect("read first range");
         assert_eq!(&first, &initial[3..19]);
-        assert_eq!(disk.dev.reads, 1);
+        assert_eq!(disk.dev.lock().device.reads, 1);
 
         let mut second = [0_u8; 16];
         disk.seek(SeekFrom::Start(100)).expect("seek same block");
         disk.read(&mut second).expect("read same block");
         assert_eq!(&second, &initial[100..116]);
-        assert_eq!(disk.dev.reads, 1);
+        assert_eq!(disk.dev.lock().device.reads, 1);
 
         disk.seek(SeekFrom::Start(8)).expect("seek partial write");
         disk.write(b"cache").expect("write cached block");
@@ -763,7 +815,7 @@ mod tests {
         disk.seek(SeekFrom::Start(8)).expect("seek updated bytes");
         disk.read(&mut updated).expect("read updated bytes");
         assert_eq!(&updated, b"cache");
-        assert_eq!(disk.dev.reads, 1);
+        assert_eq!(disk.dev.lock().device.reads, 1);
 
         disk.seek(SeekFrom::Start(0)).expect("seek full write");
         disk.write(&[0xa5; 512]).expect("replace full block");
@@ -772,7 +824,7 @@ mod tests {
         disk.read(&mut replacement).expect("read replacement");
         assert_eq!(replacement, [0xa5; 4]);
         // Writes go through the cached window, so no device re-read is needed.
-        assert_eq!(disk.dev.reads, 1);
+        assert_eq!(disk.dev.lock().device.reads, 1);
     }
 
     #[test]
@@ -796,7 +848,8 @@ mod tests {
             assert_eq!(&fat[..], &pattern[(512 + 4 * index) as usize..][..4]);
         }
         // 128 KiB of data plus the FAT probes: a handful of window fills.
-        assert!(disk.dev.reads <= 6, "reads = {}", disk.dev.reads);
+        let reads = disk.dev.lock().device.reads;
+        assert!(reads <= 6, "reads = {reads}");
     }
 
     #[test]

@@ -291,6 +291,7 @@ fn finish_tracked_launch(state: &mut BrokerState, pid: Option<i32>, result: Resu
             if let Some(session) = in_flight.session_handle {
                 super::session::focus_session_after_spawn(state, session);
             }
+            super::image_probe::after_launch(in_flight.exec.as_str());
         }
         Err(errno) => {
             // Drop the record only if this loop made one. A failure before the
@@ -832,7 +833,7 @@ pub(super) fn spawn_exec(
     boot_line(format!("runtimed: loader request begin exec={}", exec_path).as_str());
     let argv_storage = build_exec_argv(exec_path, argv)?;
     let env_storage = build_exec_env(env)?;
-    let request = build_loader_spawn_request(
+    let mut request = build_loader_spawn_request(
         exec_path,
         &argv_storage,
         &env_storage,
@@ -842,24 +843,17 @@ pub(super) fn spawn_exec(
         defer_start,
     )?;
     let endpoint = lookup_loader_endpoint()?;
-    let mut response = LoaderSpawnResponse::default();
-    let call = unsafe {
-        rustos_svc_runtime::syscall::syscall6(
-            SYS_RUSTOS_IPC_CALL_BOUNDED,
-            endpoint as u64,
-            (&request as *const LoaderSpawnRequest) as u64,
-            size_of::<LoaderSpawnRequest>() as u64,
-            (&mut response as *mut LoaderSpawnResponse) as u64,
-            size_of::<LoaderSpawnResponse>() as u64,
-            IPC_BOOT_CONTROL_HARD_LIMIT_MS,
-        )
+    // UI bootstrap keeps its existing short budget. Ordinary catalog work
+    // lives on the launch worker and may collect a large immutable image;
+    // each OPEN/POLL IPC is still short and the control loop never waits here.
+    let budget_ms = if exec_path == UI_SERVER_EXEC_PATH { IPC_BOOT_CONTROL_HARD_LIMIT_MS }
+        else { rustos_user_abi::syscall::LOADER_APPLICATION_WORK_MAX_LEASE_MS };
+    request.deadline_ns = rustos_svc_runtime::syscall::monotonic_nanos().saturating_add(budget_ms * 1_000_000);
+    let response: LoaderSpawnResponse = match rustos_svc_runtime::loader_client::call(endpoint as u64, &request, None) {
+        Ok(response) => response,
+        Err(errno) => { LOADER_ENDPOINT_CACHE.store(0, Ordering::Relaxed); return Err(errno); }
     };
-    if call < 0 {
-        LOADER_ENDPOINT_CACHE.store(0, Ordering::Relaxed);
-        return Err((-call) as i32);
-    }
-    if call as usize != size_of::<LoaderSpawnResponse>()
-        || response.version != LOADER_REQUEST_ABI_VERSION
+    if response.version != LOADER_REQUEST_ABI_VERSION
         || response.op != LOADER_OP_SPAWN_EXEC
     {
         return Err(libc::EINVAL);

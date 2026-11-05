@@ -21,6 +21,15 @@
 8. Set `console_hosted = false` for UI/Wayland-style apps.
 9. Run `cargo xtask check`, then `cargo xtask build`.
 
+### Local prebuilt Linux apps
+
+Use `kind = "app"`, `builder = "prebuilt-app"`, a package-relative source
+bundle, directory installation under `apps/`, and an explicit desktop `image`
+inside that bundle. `startup = "none"` with no autostart file makes an app
+visible and manually launchable without scheduling it on boot. This does not
+certify binary compatibility. See [Chrome local import](../../apps/chrome/README.md#english)
+for the digest-pinned, optional proprietary-app workflow.
+
 ### Rust App Manifest
 
 ```toml
@@ -66,6 +75,15 @@ console_hosted = false
 7. terminal/console app은 `console_hosted = true`를 설정합니다.
 8. UI/Wayland-style app은 `console_hosted = false`를 설정합니다.
 9. `cargo xtask check`, 이후 `cargo xtask build`를 실행합니다.
+
+### 로컬 prebuilt Linux 앱
+
+`kind = "app"`, `builder = "prebuilt-app"`, 패키지 내부 source bundle,
+`apps/` 아래 directory 설치와 bundle 안의 명시적 desktop `image`를 사용합니다.
+`startup = "none"`이고 autostart 파일이 없으면 바탕화면·수동 실행에만 등록되며
+부팅 때 시작하지 않습니다. 바이너리 실행 호환성을 보장하는 기능은 아닙니다.
+고정 digest와 선택적 로컬 가져오기는 [Chrome 안내](../../apps/chrome/README.md#한국어)를
+참고하세요.
 
 ### Rust App Manifest
 

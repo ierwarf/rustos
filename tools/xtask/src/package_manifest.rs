@@ -77,6 +77,8 @@ pub(crate) enum BuilderKind {
     /// Copy `build.source` (a directory in the package) into the image
     /// unchanged. Used by data packages.
     AssetBundle,
+    /// Import an already-built application and its adjacent resources.
+    PrebuiltApp,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -314,6 +316,26 @@ fn validate_manifests(manifests: &[PackageManifest]) -> Result<()> {
                         "package {} must use install.layout = \"directory\"",
                         manifest.id
                     );
+                }
+            }
+            BuilderKind::PrebuiltApp => {
+                if manifest.kind != PackageKind::App {
+                    bail!("package {} uses prebuilt-app, which is only for kind = \"app\"", manifest.id);
+                }
+                if manifest.install.layout != InstallLayout::Directory {
+                    bail!("package {} prebuilt-app must use install.layout = \"directory\"", manifest.id);
+                }
+                let source = manifest.build.source.as_deref().unwrap_or_default();
+                if !is_normal_relative_install_path(source) {
+                    bail!("package {} prebuilt-app needs a package-relative build.source", manifest.id);
+                }
+                let prefix = format!("{}/", manifest.install.path);
+                for entry in &manifest.desktop.entries {
+                    if !entry.image.as_deref().is_some_and(|image| {
+                        is_normal_relative_install_path(image) && image.starts_with(&prefix)
+                    }) {
+                        bail!("package {} prebuilt-app desktop image must name a file inside its bundle", manifest.id);
+                    }
                 }
             }
             BuilderKind::AssetBundle => {
@@ -658,6 +680,20 @@ mod tests {
             .expect("manifest has a directory")
             .to_path_buf();
         validate_manifests(&[manifest]).map_err(|err| err.to_string())
+    }
+
+    #[test]
+    fn prebuilt_apps_require_a_directory_and_an_explicit_bundled_executable() {
+        let text = include_str!("../../../apps/chrome/RUSTOS.package.toml.example");
+        validate_at(text, "apps/chrome/RUSTOS.package.toml").unwrap();
+        for invalid in [
+            text.replace("kind = \"app\"", "kind = \"data\""),
+            text.replace("layout = \"directory\"", "layout = \"file\""),
+            text.replace("source = \"bundle\"", "source = \"../outside\""),
+            text.replace("image = \"apps/chrome/chrome\"", "image = \"apps/other/other.elf\""),
+        ] {
+            assert!(validate_at(&invalid, "apps/chrome/RUSTOS.package.toml").is_err());
+        }
     }
 
     const DATA_MANIFEST: &str = "id = \"ui-assets\"\nkind = \"data\"\nexecution_domain = \"user\"\n[build]\nbuilder = \"asset-bundle\"\nsource = \"bundle\"\n[install]\npath = \"assets/ui\"\nlayout = \"directory\"\n";

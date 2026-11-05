@@ -575,8 +575,8 @@ struct SystemDllEntry {
     base_name: String,
 }
 
-fn load_system_dll_registry() -> Result<Vec<SystemDllEntry>, i32> {
-    let bytes = read_file_to_vec(WINDOWS_DLL_REGISTRY_PATH)?;
+fn load_system_dll_registry(deadline: AbsoluteDeadline) -> Result<Vec<SystemDllEntry>, i32> {
+    let bytes = read_file_to_vec(WINDOWS_DLL_REGISTRY_PATH, deadline)?;
     let text = core::str::from_utf8(bytes.as_slice()).map_err(|_| ENOEXEC)?;
     let mut entries = Vec::new();
     for raw_line in text.lines() {
@@ -600,61 +600,23 @@ fn load_system_dll_registry() -> Result<Vec<SystemDllEntry>, i32> {
 const EFBIG_ERRNO: i32 = 27;
 const READ_FILE_TO_VEC_MAX_BYTES: usize = 1 << 20;
 
-fn read_file_to_vec(path: &str) -> Result<Vec<u8>, i32> {
-    let fd = open_readonly(path)?;
-    let mut out: Vec<u8> = Vec::with_capacity(ELF_READ_CHUNK_BYTES);
-    let mut offset = 0_u64;
-    let mut error: Option<i32> = None;
-    loop {
-        let want = ELF_READ_CHUNK_BYTES;
-        out.reserve(want);
-        let cur_len = out.len();
-        if cur_len >= READ_FILE_TO_VEC_MAX_BYTES {
-            error = Some(EFBIG_ERRNO);
-            break;
-        }
-        // Zero-fill so the kernel only ever writes into initialized memory.
-        out.resize(cur_len + want, 0);
-        let read = syscall4(
-            SYS_PREAD64,
-            fd as u64,
-            out.as_mut_ptr().wrapping_add(cur_len) as u64,
-            want as u64,
-            offset,
-        );
-        if read < 0 {
-            out.truncate(cur_len);
-            error = Some((-read) as i32);
-            break;
-        }
-        let read = read as usize;
-        out.truncate(cur_len + read);
-        if read == 0 {
-            break;
-        }
-        match offset.checked_add(read as u64) {
-            Some(new_offset) => offset = new_offset,
-            None => {
-                error = Some(EOVERFLOW);
-                break;
-            }
-        }
-        if read < want {
-            break;
-        }
-    }
-    let close_status = syscall1(SYS_CLOSE, fd as u64);
-    if let Some(err) = error {
-        return Err(err);
-    }
-    if close_status < 0 {
-        return Err((-close_status) as i32);
-    }
-    Ok(out)
+fn read_file_to_vec(path: &str, deadline: AbsoluteDeadline) -> Result<Vec<u8>, i32> {
+    let snapshot = open_immutable_file_snapshot_until(path, 0, 0, deadline)?;
+    let len = usize::try_from(snapshot.file_bytes).map_err(|_| EOVERFLOW)?;
+    if len > READ_FILE_TO_VEC_MAX_BYTES { return Err(EFBIG_ERRNO); }
+    // The source is immutable and its exact length is already admitted. This
+    // also accepts exactly the limit, unlike an extra speculative EOF window.
+    let mut out = Vec::new();
+    out.try_reserve_exact(len).map_err(|_| 12)?;
+    out.resize(len, 0);
+    if rustos_svc_runtime::syscall::monotonic_nanos() >= deadline.end_ns() { return Err(ETIMEDOUT); }
+    read_exact_at(snapshot.fd, 0, &mut out)?;
+    if rustos_svc_runtime::syscall::monotonic_nanos() >= deadline.end_ns() { return Err(ETIMEDOUT); }
+    Ok(out) // RAII closes the snapshot on every exit, including allocation error.
 }
 
-fn open_readonly(path: &str) -> Result<i32, i32> {
-    open_immutable_file_snapshot(path, 0, 0).map(|snapshot| snapshot.fd)
+fn open_readonly(path: &str, deadline: AbsoluteDeadline) -> Result<i32, i32> {
+    open_immutable_file_snapshot_until(path, 0, 0, deadline).map(|snapshot| snapshot.into_fd())
 }
 
 fn cstrings_to_strs(values: &[CString]) -> Result<Vec<&str>, i32> {

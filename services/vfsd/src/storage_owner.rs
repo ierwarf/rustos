@@ -20,6 +20,8 @@
 
 use super::*;
 use core::sync::atomic::{AtomicU64, Ordering};
+use sha2::{Digest, Sha256};
+use storage_core::file_io::{FileIdentity, ReadAt, TransferControl, TransferError, TransferFailure, transfer_exact};
 
 static NEXT_EXECUTABLE_SNAPSHOT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -66,6 +68,8 @@ pub(crate) struct VfsStorage {
     /// remount invalidates this cache before the replacement volume is used.
     pub(crate) file_bytes_cache: BTreeMap<String, Vec<u8>>,
     pub(crate) file_bytes_cache_bytes: usize,
+    pub(crate) read_maps: BTreeMap<String, storage_core::file_io::FileReadMap>,
+    pub(crate) read_map_bytes: usize,
     /// Terminally sealed executable images owned by the current mount
     /// generation. Handle transfer duplicates the descriptor into loaderd;
     /// keeping one vfsd reference lets common interpreters/DLLs be reused
@@ -88,6 +92,8 @@ impl VfsStorage {
             dir_entries_cache: BTreeMap::new(),
             file_bytes_cache: BTreeMap::new(),
             file_bytes_cache_bytes: 0,
+            read_maps: BTreeMap::new(),
+            read_map_bytes: 0,
             executable_snapshot_cache: BTreeMap::new(),
             executable_snapshot_cache_bytes: 0,
             mount_generation: 1,
@@ -196,6 +202,7 @@ impl Drop for VfsStorageGuard {
 pub(crate) struct ExecutableSnapshotPlan {
     pub(crate) path: String,
     pub(crate) file_len: usize,
+    pub(crate) read_map: Option<alloc::sync::Arc<storage_core::file_io::FileReadMap>>,
     pub(crate) metadata_len: u64,
     pub(crate) verbose: bool,
     /// The immutable bootstrap image and the DVM-mounted volume are distinct
@@ -220,25 +227,46 @@ pub(crate) enum ExecutableSnapshotAdmission {
     Read(ExecutableSnapshotPlan),
 }
 
-/// Reads a planned snapshot in one acquisition.
-///
-/// This is deliberately a single read rather than a chunked one. FAT resolves a
-/// ranged read by walking the cluster chain from the start of the file, so
-/// splitting the read into chunks turns one linear read into a quadratic one,
-/// and the cache-materialization rule only fires when the request covers the
-/// whole file. One acquisition for one device read is therefore the minimum a
-/// single-volume design can hold, and it is the same hold the pre-split code
-/// took. What the split actually removes is the second `FatVolume`, not this
-/// hold.
-fn read_planned_executable_snapshot(plan: &ExecutableSnapshotPlan) -> Result<Vec<u8>, i32> {
-    let mut bytes = Vec::new();
-    bytes.try_reserve_exact(plan.file_len).map_err(|_| ENOMEM)?;
-    bytes.resize(plan.file_len, 0);
-    let read = lock_vfs_storage().read_executable_snapshot_chunk(plan, 0, bytes.as_mut_slice())?;
-    if read != plan.file_len {
-        return Err(EIO);
+/// A source lease has no live FAT borrow. Every bounded read revalidates the
+/// exact mount/provider/map generations, then releases storage before user
+/// copy, hashing, memfd writes, sealing, or reply publication.
+struct SnapshotReader<'a> {
+    plan: &'a ExecutableSnapshotPlan,
+    source: Option<storage_fat::FatReadSource<BootBlockDevice>>,
+    read_ns: u64,
+}
+impl ReadAt for SnapshotReader<'_> {
+    type Error = i32;
+    fn identity(&self) -> FileIdentity {
+        self.plan.read_map.as_ref().map(|map| map.identity()).unwrap_or(FileIdentity {
+            volume: u64::MAX, object: self.plan.request_id, generation: self.plan.mount_generation,
+        })
     }
-    Ok(bytes)
+    fn len(&self) -> u64 { self.plan.metadata_len }
+    fn read_at(&mut self, offset: u64, output: &mut [u8]) -> Result<usize, i32> {
+        // Check namespace/provider epochs briefly, then release that owner
+        // before device IPC. The data lease contains no FAT namespace borrow.
+        let started = monotonic_nanos();
+        let result = (|| {
+            lock_vfs_storage().validate_executable_snapshot_plan(self.plan)?;
+            match self.source.as_mut() {
+                Some(source) => source.read_at(offset, output).map_err(map_range_error),
+                None => early_system::read(self.plan.path.as_str(), offset, output)?.ok_or(EIO),
+            }
+        })();
+        self.read_ns = self.read_ns.saturating_add(monotonic_nanos().saturating_sub(started));
+        result
+    }
+}
+
+fn transfer_errno(error: &TransferFailure<i32, i32>) -> i32 {
+    match &error.error {
+        TransferError::Read(errno) | TransferError::Write(errno) => *errno,
+        TransferError::Control(TransferControl::Expired) => ETIMEDOUT,
+        TransferError::Control(TransferControl::Cancelled) => 125,
+        TransferError::SourceChanged => EAGAIN,
+        _ => EIO,
+    }
 }
 
 /// Plans, reads, and commits one executable snapshot.
@@ -250,9 +278,7 @@ fn read_planned_executable_snapshot(plan: &ExecutableSnapshotPlan) -> Result<Vec
 /// writes into.
 /// The caller's absolute deadline, or `None` when it set none.
 ///
-/// A zero `deadline_ns` is "unbounded", which is what an older caller sends. It
-/// is not treated as "already expired": that would fail every request from a
-/// caller that has not been updated yet.
+/// ABI v3 admission requires a nonzero, bounded absolute job lease.
 fn request_deadline(request: &VfsExecutableSnapshotRequest) -> Option<AbsoluteDeadline> {
     (request.deadline_ns != 0).then(|| AbsoluteDeadline::after(request.deadline_ns, 0))
 }
@@ -270,14 +296,20 @@ fn budget_expired(deadline: Option<AbsoluteDeadline>, now_ns: u64) -> bool {
 
 pub(crate) fn open_executable_snapshot(
     request: &VfsExecutableSnapshotRequest,
+    control: &vfsd::snapshot_sessions::SnapshotControl,
 ) -> Result<ExecutableSnapshotOpen, i32> {
     let deadline = request_deadline(request);
     let started_ns = monotonic_nanos();
+    if control.cancelled() { return Err(125); }
     if budget_expired(deadline, started_ns) {
         return Err(ETIMEDOUT);
     }
     let plan = match lock_vfs_storage().plan_executable_snapshot(request)? {
-        ExecutableSnapshotAdmission::Cached(open) => return Ok(open),
+        ExecutableSnapshotAdmission::Cached(open) => {
+            control.set_total(open.file_bytes());
+            control.progress(open.file_bytes());
+            return Ok(open);
+        },
         ExecutableSnapshotAdmission::Read(plan) => plan,
     };
     let planned_ns = monotonic_nanos();
@@ -296,11 +328,54 @@ pub(crate) fn open_executable_snapshot(
             .as_str(),
         );
     }
+    control.set_total(plan.metadata_len);
     let path = plan.path.clone();
     let file_len = plan.file_len;
-    let bytes = read_planned_executable_snapshot(&plan)?;
+    let mut writer = SnapshotWriter::new(plan.metadata_len)?;
+    let source = match plan.read_map.as_ref() {
+        Some(map) => Some(lock_vfs_storage().volume.as_ref().ok_or(ENODEV)?
+            .read_source(map.clone()).map_err(map_range_error)?),
+        None => None,
+    };
+    let mut reader = SnapshotReader { plan: &plan, source, read_ns: 0 };
+    let window_bytes = vfsd::snapshot_budget::SNAPSHOT_WINDOW_BYTES.min(plan.file_len);
+    let mut window = Vec::new();
+    window.try_reserve_exact(window_bytes).map_err(|_| ENOMEM)?;
+    window.resize(window_bytes, 0);
+    let mut digest = Sha256::new();
+    let mut hash_ns = 0u64;
+    let transfer = transfer_exact(&mut reader, &mut writer, &mut window,
+        |bytes| {
+            control.progress(bytes);
+            if control.cancelled() { Err(TransferControl::Cancelled) }
+            else if budget_expired(deadline, monotonic_nanos()) { Err(TransferControl::Expired) }
+            else { Ok(()) }
+        },
+        |bytes| {
+            let started = monotonic_nanos();
+            digest.update(bytes);
+            hash_ns = hash_ns.saturating_add(monotonic_nanos().saturating_sub(started));
+        },
+    );
+    if let Err(error) = &transfer { control.progress(error.completed_bytes); }
+    if file_len > 128 * 1024 * 1024 {
+        ipc::debug_line(&format!("vfsd: snapshot transfer path={path} completed={} read_us={} write_us={} hash_us={} status={}",
+            control.completed_bytes(), reader.read_ns / 1000, writer.write_ns() / 1000,
+            hash_ns / 1000, transfer.as_ref().err().map_or(0, transfer_errno)));
+    }
+    transfer.map_err(|error| transfer_errno(&error))?;
+    let snapshot = writer.seal(plan.mount_generation)?;
+    if budget_expired(deadline, monotonic_nanos()) { return Err(ETIMEDOUT); }
+    let mut digest_bytes = [0; 32];
+    digest_bytes.copy_from_slice(&digest.finalize());
     let read_ns = monotonic_nanos();
-    let result = lock_vfs_storage().commit_executable_snapshot(&plan, bytes.as_slice());
+    let publication = {
+        let mut storage = lock_vfs_storage();
+        storage.commit_executable_snapshot(&plan, &snapshot, digest_bytes)
+    };
+    // The old object (including hundreds of MiB of frames on error) must be
+    // destroyed only after the storage owner has been released.
+    let result = publication.map(|cached| cached.unwrap_or(snapshot));
     let committed_ns = monotonic_nanos();
     // Emitted for every snapshot, not only slow ones. The caller can only ever
     // report "the reply did not arrive"; without a provider-side split of plan,

@@ -7,6 +7,8 @@ pub mod lifecycle;
 pub mod linux_types;
 pub mod path;
 pub mod run_dirs;
+pub mod snapshot_budget;
+pub mod snapshot_sessions;
 mod snapshot_lease;
 pub use snapshot_lease::ExecutableSnapshotLease;
 

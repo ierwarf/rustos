@@ -100,6 +100,8 @@ mod block;
 mod devmgrd;
 mod early_system;
 mod snapshot_worker;
+mod snapshot_output;
+use snapshot_output::{ExecutableSnapshotOpen, SnapshotWriter};
 mod storage_owner;
 mod util;
 
@@ -111,7 +113,7 @@ use vfsd::linux_types::{
 };
 use snapshot_worker::{
     demote_current_thread_or_exit, enqueue_executable_snapshot, ensure_snapshot_worker,
-    reply_snapshot_status,
+    reply_snapshot_status, continue_executable_snapshot,
 };
 use util::{
     build_linux_stat, build_linux_statx, encode_dirent, handle_kind_u16, is_at_fdcwd,
@@ -179,9 +181,8 @@ static mut VFS_RESPONSE_SLOT: VfsIpcResponse = VfsIpcResponse {
     payload: [0; VFS_IPC_PAYLOAD_CAPACITY],
 };
 
-const EXECUTABLE_SNAPSHOT_MAX_BYTES: u64 = 128 * 1024 * 1024;
+use rustos_user_abi::syscall::VFS_EXECUTABLE_SNAPSHOT_MAX_FILE_BYTES;
 const EXECUTABLE_SNAPSHOT_CACHE_BUDGET_BYTES: usize = 64 * 1024 * 1024;
-const EXECUTABLE_SNAPSHOT_WRITE_CHUNK_BYTES: usize = 256 * 1024;
 const UI_SERVER_EXEC_PATH: &[u8] = b"/services/uiserver/uiserver.elf";
 static SNAPSHOT_WORKER_DEMOTED: AtomicBool = AtomicBool::new(false);
 
@@ -190,8 +191,6 @@ struct ExecutableSnapshot {
     fd: i32,
     file_bytes: u64,
 }
-
-type ExecutableSnapshotOpen = vfsd::ExecutableSnapshotLease<fn(i32)>;
 
 fn linux_response_for_op(op: u16) -> LinuxSyscallOffloadResponse {
     let mut response = MaybeUninit::<LinuxSyscallOffloadResponse>::uninit();
@@ -366,12 +365,14 @@ fn serve(endpoint: u64, mut state: VfsState) {
                             sender_pid,
                         ) < 0
                     {
-                        reply_snapshot_status(reply_cap, EACCES)
-                    } else {
+                        reply_snapshot_status(reply_cap, request.op, EACCES)
+                    } else if request.op == VFS_EXECUTABLE_SNAPSHOT_OP_OPEN {
                         match state.resolve_executable_snapshot_request(*request) {
                             Ok(resolved) => enqueue_executable_snapshot(reply_cap, sender_pid, sender_tid, resolved),
-                            Err(errno) => reply_snapshot_status(reply_cap, errno),
+                            Err(errno) => reply_snapshot_status(reply_cap, request.op, errno),
                         }
+                    } else {
+                        continue_executable_snapshot(reply_cap, sender_pid, sender_tid, request)
                     },
                 )
             } else if received as usize == size_of::<VfsIpcRequest>() {
@@ -481,49 +482,20 @@ fn serve(endpoint: u64, mut state: VfsState) {
 
 fn reply_executable_snapshot(
     reply_cap: u64,
-    sender_pid: u64,
-    sender_tid: u64,
-    request: &VfsExecutableSnapshotRequest,
+    job_id: u64,
+    complete: snapshot_worker::CompletedSnapshot,
 ) -> i64 {
+    let snapshot_worker::CompletedSnapshot { snapshot, request } = complete;
     let mut response = VfsExecutableSnapshotResponse {
         version: VFS_EXECUTABLE_SNAPSHOT_ABI_VERSION,
-        op: VFS_EXECUTABLE_SNAPSHOT_OP_OPEN,
+        op: rustos_user_abi::syscall::VFS_EXECUTABLE_SNAPSHOT_OP_POLL,
+        job_id,
+        file_bytes: snapshot.file_bytes(),
+        completed_bytes: snapshot.file_bytes(),
+        mount_generation: snapshot.mount_generation(),
+        resolved_path_len: request.path_len,
         ..VfsExecutableSnapshotResponse::default()
     };
-    if request.requester_pid != sender_pid
-        || request.requester_tid != sender_tid
-        || rustos_svc_runtime::ipc::validate_service_owner(IPC_SERVICE_LOADERD, sender_pid) < 0
-    {
-        ipc::debug_line("vfsd: executable snapshot rejected stage=identity");
-        response.status = EACCES;
-        return unsafe {
-            ipc::reply(
-                reply_cap,
-                (&response as *const VfsExecutableSnapshotResponse).cast::<u8>(),
-                size_of::<VfsExecutableSnapshotResponse>(),
-            )
-        };
-    }
-
-    let snapshot = match open_executable_snapshot(request) {
-        Ok(snapshot) => snapshot,
-        Err(errno) => {
-            ipc::debug_line(
-                format!("vfsd: executable snapshot rejected stage=open errno={errno}").as_str(),
-            );
-            response.status = errno;
-            return unsafe {
-                ipc::reply(
-                    reply_cap,
-                    (&response as *const VfsExecutableSnapshotResponse).cast::<u8>(),
-                    size_of::<VfsExecutableSnapshotResponse>(),
-                )
-            };
-        }
-    };
-    response.file_bytes = snapshot.file_bytes();
-    response.mount_generation = snapshot.mount_generation();
-    response.resolved_path_len = request.path_len;
     response.resolved_path[..request.path_len as usize]
         .copy_from_slice(&request.path[..request.path_len as usize]);
     let send_fd = snapshot.fd() as u64;
@@ -672,67 +644,6 @@ include!("state_checkpoint.rs");
 include!("state_requests.rs");
 include!("state_files.rs");
 include!("state_storage.rs");
-
-fn create_terminally_sealed_snapshot(_path: &str, bytes: &[u8]) -> Result<i32, i32> {
-    let name = CString::new("vfsd-executable-snapshot").map_err(|_| EINVAL)?;
-    let fd = unsafe {
-        rustos_svc_runtime::syscall::syscall2(
-            linux_abi::SYS_MEMFD_CREATE,
-            name.as_ptr() as u64,
-            linux_abi::MFD_CLOEXEC | linux_abi::MFD_ALLOW_SEALING,
-        )
-    } as i32;
-    if fd < 0 {
-        return Err(-fd);
-    }
-
-    let result = (|| {
-        let mut written = 0_usize;
-        while written < bytes.len() {
-            let end = written
-                .saturating_add(EXECUTABLE_SNAPSHOT_WRITE_CHUNK_BYTES)
-                .min(bytes.len());
-            let status = unsafe {
-                rustos_svc_runtime::syscall::syscall3(
-                    linux_abi::SYS_WRITE,
-                    fd as u64,
-                    bytes[written..end].as_ptr() as u64,
-                    (end - written) as u64,
-                )
-            };
-            if status < 0 {
-                return Err((-status) as i32);
-            }
-            let count = usize::try_from(status).map_err(|_| EOVERFLOW)?;
-            if count == 0 || count > end - written {
-                return Err(EIO);
-            }
-            written = written.checked_add(count).ok_or(EOVERFLOW)?;
-        }
-
-        let seals = linux_abi::F_SEAL_WRITE
-            | linux_abi::F_SEAL_GROW
-            | linux_abi::F_SEAL_SHRINK
-            | linux_abi::F_SEAL_SEAL;
-        let status = unsafe {
-            rustos_svc_runtime::syscall::syscall3(
-                linux_abi::SYS_FCNTL,
-                fd as u64,
-                linux_abi::F_ADD_SEALS,
-                seals,
-            )
-        };
-        if status < 0 {
-            return Err((-status) as i32);
-        }
-        Ok(())
-    })();
-    if let Err(errno) = result {
-        close_fd(fd);
-        return Err(errno);
-    }
-    Ok(fd)
-}
 
 fn duplicate_snapshot_fd(fd: i32) -> Result<i32, i32> {
     // The caller holds storage ownership: eviction cannot close/reuse the

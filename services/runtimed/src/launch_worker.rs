@@ -113,8 +113,8 @@ impl LaunchWorker {
     }
 }
 
-/// Start the worker. Returns `None` if the thread cannot be created, which
-/// leaves the caller free to run launches inline rather than not at all.
+/// Start the worker. Thread creation failure returns `None`; the broker then
+/// refuses launches with EAGAIN instead of blocking its control loop inline.
 pub(crate) fn start(calls: LaunchCalls) -> Option<LaunchWorker> {
     // One launch in flight, one answer outstanding. A deeper queue would only
     // let the loop run ahead of a supervisor transaction it has to stay in step

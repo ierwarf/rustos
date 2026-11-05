@@ -13,6 +13,7 @@ rustos-user-abi = { path = "../../libs/rustos-user-abi", features = ["linux-comp
 storage-core = { path = "../../libs/storage-core" }
 storage-fat = { path = "../../libs/storage-fat" }
 sha2 = { version = "0.10", default-features = false }
+spin = "0.10.0"
 
 [[bin]]
 name = "vfsd"

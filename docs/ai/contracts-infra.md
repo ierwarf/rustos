@@ -42,7 +42,7 @@ Package/stage schemas, runtime control, kernel API, build, fault injection, logg
 
 | Field | Values |
 |-------|--------|
-| `kind` | `kernel`, `service`, `app`, `compat` |
+| `kind` | `kernel`, `service`, `app`, `compat`, `data` |
 | `execution_domain` | `kernel`, `user` |
 | `startup` | `none`, `init`, `session`, `desktop` |
 | `install.layout` | `file`, `directory` |
@@ -51,6 +51,24 @@ Package/stage schemas, runtime control, kernel API, build, fault injection, logg
 `desktop.entries.no_display=true` is staged into both desktop registries and
 the `.desktop` file; it hides discovery without disabling an explicit startup
 or launch policy.
+
+### Local prebuilt applications
+
+- `builder = "prebuilt-app"` is app-only and requires directory installation,
+  a normal package-relative `build.source`, and explicit desktop image paths
+  inside that install directory. Build fails when a named executable is absent;
+  the bundle is mirrored through the same build/stage path as other packages.
+- `tools/agent/import-chrome.py` imports a digest-pinned amd64 Google `.deb`
+  without executing Chrome or package scripts. Only its bounded regular-file
+  application subtree is copied; path traversal, links, special files, duplicate
+  files and privilege bits are rejected or stripped. Manifest publication is
+  last; existing imports are not overwritten. Binary/active manifest stay local
+  and ignored; the template and importer are versioned.
+- Chrome uses `startup = "none"`, no autostart overlay, and a visible desktop
+  entry pointing at the real ELF. It is installed/discoverable, not automatically
+  started. Browser/syscall/sandbox/Wayland compatibility is not certified, and
+  the importer adds no sandbox bypass or host installation. Local external
+  payloads are not checked-in formal source evidence.
 
 ### Driver-domain policy
 
@@ -207,7 +225,12 @@ or launch policy.
 - Request text max: `MAX_REQUEST_PATH_BYTES`.
 - `runtimed` loads the runtime launch catalog on its main loop after UI ready.
   Desktop metadata and runtime-launch policy have separate immutable caches;
-  one registry must never satisfy a request for the other. Initial session
+  one registry must never satisfy a request for the other. Boot policies are
+  formed only from the runtime-launch registry. Afterwards, visible, non-hidden
+  `startup=none` desktop entries are added to manual request lookup without replacing existing
+  admitted metadata or appending boot policies; a visible non-autostart app must
+  not fail lookup merely because it was omitted from the boot registry.
+  Initial session
   autostart must not depend on a background thread completing before the first
   policy drain. Accepted nonblocking clients are retained in a bounded partial
   request set and serviced incrementally; a lower-class client preempted after

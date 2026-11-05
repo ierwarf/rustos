@@ -4,7 +4,178 @@ Dated evidence, not instructions or proof of the current checkout. Resume with
 `git status --short`, `git log -1`, and the live request. `AGENTS.md` is the only
 stable repository prefix; use [task router](task-router.md) for owner contracts.
 
-## Harness maintenance (integrated, uncommitted; base `b9a5b224`)
+## Large-file I/O steps 1–3 (implemented and locally verified)
+
+Preserve all prior uncommitted Chrome desktop and planning changes. Implemented
+`storage-core::file_io` (owned 64-bit maps, ReadAt/WriteAt, bounded exact transfer,
+partial progress/cancel), FAT detached range maps over the existing engine, and
+vfsd range-map caching / incremental sealed memfd streaming without a whole-file
+Vec. Snapshot staging reserves final frames + metadata + scratch in Ring3; client
+and server share a 512-MiB materialization ceiling (separate 64-MiB image cache).
+
+Pinned upstream fatfs sources are now in `vendor/rust-fatfs` via a root Cargo
+patch: malformed reserved cluster 1 otherwise underflows offset arithmetic.
+Provenance/license/local fixes are recorded there. Adapter tests cover fragmented
+maps, cycles, reserved clusters, stale maps, budgets, short I/O and >4-GiB offsets.
+Only Ring0 change so far: fallible incremental memfd frame-vector growth,
+not filesystem policy. Do not eagerly reserve metadata for an arbitrary caller
+length before actual frame/quota admission. Initial full `cargo xtask check` passed; after the vendor
+patch, native tests passed: loaderd 35, user-abi 77, storage-core 14, storage-fat
+19, vfsd 57. No final formal or boot claim yet.
+
+Actual first 1-vCPU probe entered the 306,789,704-byte read, then hit errno
+110 at the existing 4-second lease (GUI remained ready). Snapshot ABI v3 now
+has OPEN/POLL/CANCEL, two owner/absolute-lease-bound sessions, private-sink
+progress and worker orphan/cancel cleanup; no reply cap survives bulk work.
+Data reads now use a detached FAT/device lease without the storage owner.
+Device waiters sleep (runtime callback), and device-owned bulk response buffers
+replace the unsafe global buffer when old/new mounts overlap. Identity now
+uses the real directory-entry slot + volume/write epoch, stable across case
+aliases and plans. Native tests: loaderd 37, ABI 77, core 14, FAT 21, vfsd 61;
+full check passed before the last directory-ID/incremental-memfd refinements;
+subsequent signed probe builds passed. Global IPC/control limits remain intact.
+
+Second probe failed: running the 24-second diagnostic on loaderd's receive
+owner blocked WayClick ACTIVATE after its deferred spawn, causing runtimed's
+failed-activation cleanup to panic (spawn.rs:710, errno110). Do not call this
+an async storage throughput result. Logs and summaries are in
+`build/large-io-validation/kvm-{probe-timeout,async-probe}-*`. The diagnostic
+has now moved to its own explicit User-class thread (never browser execution,
+no ordinary-image autostart). Current background build log:
+`build/large-io-validation/build-async-probe-thread.log` (bg-21).
+Follow-up isolated-thread probe preserved GUI readiness but expired its 24 s
+lease after 138,149,888 confirmed bytes. A measured 120 s bounded async job lease
+(now independent of the unchanged 4 s control RPC cap) then PASSED the complete
+306,789,704-byte seal + ELF admission on 1 vCPU with live GUI/input/WayClick.
+Evidence: `build/large-io-validation/kvm-large-job-probe{-debugcon,}.log`;
+54.627228 s total, read 53.545828 s, writes 0.877576 s, hash 0.155382 s. No
+memfd/copy/hashing bottleneck claim: read time includes IPC scheduling. Boot
+trace terminal 4068 ms, advisory display-provider 2604 >2500 ms (do not hide).
+The successful marker is `loaderd: snapshot-probe admitted ... format=1`.
+Stamped provider digest matches host SHA-256
+`fa67e06a5bcd0525739996fb8e3ecff449039e6165c15ea7968d3935e59e829e`;
+record `chrome-digest-match.json`. Independent actual-FD readback hashing is
+implemented in new VALIDATE_IMAGE but not yet boot-verified.
+
+Outer integration is now implemented (not yet boot-verified): loader ABI v4
+SPAWN/EXEC begin staging, owner/deadline-bound POLL_WORK/CANCEL_WORK, and genuine
+VALIDATE_IMAGE (no process construction). Primary bulk work stays in vfsd;
+loaderd's single actor consumes the SAME snapshot on readiness. Bootstrap/exec
+callers keep 5 s; ordinary catalog apps use a 180 s explicit work lease, primary
+snapshot at most 120 s, each RPC at most 4 s, nested ELF/PE reads clipped to the
+parent. Shared `rustos-svc-runtime::loader_client` updates rootd/initd/procd/
+runtimed together. Snapshot FD is RAII-owned, and bounded PE registry reads now
+admit exactly their length cap with fallible allocation.
+
+Native broad suite passed 479 tests, with the existing opt-in
+`memory_primitives_native_benchmark` ignored; full check passed before the last
+loan-custody correction below. Common transfer failures now include their
+confirmed prefix and preserve provider unknown-outcome errors. The new
+`RUSTOS_RUNTIME_IMAGE_PROBE` (std background thread after WayClick activation)
+uses the production loader v4 protocol and independently hashes the entire
+received sealed FD. Old loaderd diagnostic raw-clone module/flag removed.
+
+First v4 boot failed before initd: retaining the attenuated Job loan through
+fcntl duplication was unsound. Fixed by MOVING exactly one received descriptor
+with `ReceivedHandles::take_one`, including fd zero; no extra rights or kernel
+changes. Begin owns/drops the loan on EVERY failure, receive closes only its
+remaining custody. Latest loaderd tests 40/40 (broad previous suite 479, now
+480 after custody test). kernel-ps memfd tests 2/2. Source conformance passed
+1471 checks / 155 model projections; this is NOT the full PR/nightly gate.
+
+Production loader-v4 VALIDATE_IMAGE PASSED with actual sealed-FD readback hash
+matching both host and VFS stamped SHA256 (see `chrome-digest-match.json`).
+306,789,704 bytes, snapshot 50.206942 s, live GUI/input/WayClick trace terminal
+3652 ms without advisory overshoot. No browser process was created/activated.
+Signed probe log `kvm-staged-custody-probe{,-debugcon}.log`; all artifacts under
+`build/large-io-validation/`.
+
+Normal signed image RESTORED without either probe flag/thread; binary has no
+probe/Chrome-path diagnostic literals. Normal GUI smoke PASSED, terminal 4240 ms,
+but display-provider advisory 2837 >2500 ms (337 ms overshoot) remains a reported
+warning, not a matched performance regression or hard-gate failure. Staged
+Chrome is startup=none, autostart_enabled=0, logical_admin=0 and absent from
+startup/runtime-launch tables. No normal boot Chrome activity was observed.
+Recommended integration: stage the primary image asynchronously in loaderd
+(OPEN/POLL/CANCEL work ID with explicit absolute launch lease), then pass that
+same sealed snapshot into existing serial image construction; do not add
+concurrent PE-cache access or block the loader receive owner for 55 s. Add a
+shared svc-runtime client and update rootd/initd/procd/runtimed producers and
+loader ABI together. Keep bootstrap/exec budgets short; ordinary catalog apps
+may own the longer explicit job lease. Preserve record-before-activation and
+all terminal-reply/job cleanup. The outer-stage code is now present; see latest validation/custody status above.
+
+Persistent/checkpoint mutable file identity, complete hostile-directory parser
+bounds, and rootd pre-funded Job page grants are not implemented. Common transfer errors now return confirmed-prefix counts and retain provider
+unknown-outcome payloads; native tests cover short/failed writes and source
+version changes during reads. A remaining pre-existing audit gap is namespace
+path traversal: `FatVolume::plan_read` calls upstream `open_file_with_len`
+before bounded extent iteration, so file-chain budgets do not bound corrupted
+directory-chain traversal. Add cancellation/fuel/cycle-aware directory walking
+before claiming hostile-media admission; current tests do not prove it. Source guards/contracts and normal-image rebuild/smoke are now updated/passed.
+Final latest `cargo xtask check`, documentation layout/context contracts,
+proof index and `git diff --check` PASSED. Known pre-existing source-size
+warning remains: kernel/compat/src/user/syscall/linux.rs 625 >600 lines.
+User authorized committing this batch and stopping; no push authorized.
+Full formal PR/nightly, large-image SMP, faults/restart campaigns, complete
+hostile filesystem parsing and browser execution remain unverified.
+No browser execution/dependency/sandbox or screenshot claim.
+
+## Large-file I/O plan (proposal history; see implementation above)
+
+User manually tried Chrome. First real blocker is executable snapshot size:
+306,789,704-byte ELF exceeds loaderd/vfsd's 128-MiB limits. Captured 35
+`open executable snapshot failed ... errno=75` events; vfsd reports
+`stage=open`. Evidence preserved at
+`build/chrome-first-blocker/user-launch-debugcon.log`. This precedes shared
+library resolution; no evidence yet that Chrome's own code has executed.
+
+Requested plan is [large-file I/O and filesystem expansion](large-file-io-plan.md).
+Recommend common owned file/range I/O + FAT streaming/sealed snapshot first,
+then persistent VFS writes, coherent pager/cache/mmap, ext4/NTFS RO adapters,
+and recovery-gated RW (ext4 first; NTFS RW separate). Reuse existing block I/O
+and page-backed memfd. Do not merely increase the cap: current vfsd stages the
+entire file in a Vec, copies to memfd, and uses a 4-second snapshot transaction.
+Streaming alone still needs budget for final snapshot frames.
+
+Plan records official ext4/iomap/NTFS references and staged validation criteria.
+No builds, tests, boots or runtime fixes were performed by this planning task;
+only documentation/link/whitespace checks apply. Preserve the existing pending
+Chrome desktop implementation below. Next implementation batch: plan A+B.
+
+FAT reuse follow-up: RustOS already uses MIT `rafalh/rust-fatfs` (locked 0.4.0,
+commit `c4b8847...`). Compared upstream docs/licenses with ChaN FatFs R0.16
+(portable C, permissive BSD-style, CLMT fast seek) and embedded-sdmmc. Keep the
+existing Rust backend as the baseline; ChaN's duplicated-writer/open-file
+rename/delete rules still require an OS object/sharing layer. The plan now
+records this comparison and links. Research: `build/fat-port-research/`.
+No FAT replacement, code port, dependency update or new runtime validation ran.
+
+## Chrome desktop import (integrated, uncommitted; base `c1f4badc`)
+
+User asks to put Chrome on uiserver's desktop, **not** launch it on boot.
+Imported official amd64 157.0.8103.38-1 into ignored `apps/chrome/bundle/`
+(~453 MiB), using the pinned archive under `build/external-apps/chrome/`.
+No Chrome executable or package script has run. Importer/template are source
+changes; active manifest and proprietary payload are local/ignored.
+
+Added app-only `prebuilt-app` directory packaging, Chrome glyph, and a visible
+`startup=none` desktop entry. Fixed two discovered discovery seams: non-autostart
+`.desktop` generation and runtimed manual lookup now register visible manual
+apps without adding boot policies. The obsolete desktop-file generation gate
+is removed with the fuzzer enable filter retained.
+
+Verified: importer tests (4), xtask (270), uiserver (190), runtimed (73), signed
+`cargo xtask build`, `cargo xtask check`, docs and formal registry checks.
+1-vCPU GUI KVM smoke passed with `--no-build --gui-dvm-surfaces --timeout 60`;
+interactive-boot trace passed (6 events, terminal 3593 ms). Staged Chrome ELF
+matches the source digest; Chrome is absent from startup/runtime-launch tables
+and no Chrome launch was seen in the boot log. No screenshot was captured.
+Evidence: `build/chrome-desktop-validation/`. Existing warning: linux.rs 625 >
+600 lines. Full formal PR/nightly and browser execution/dependency/sandbox
+compatibility were not tested.
+
+## Harness maintenance (committed as `c1f4badc`; base `b9a5b224`)
 
 The user requested non-runtime harness cleanup, bug fixes and updates with
 subagents. No commit or push is authorized. Three isolated workers covered
@@ -61,8 +232,8 @@ must not override the newer integrated batch without checking source.
 
 ## Previously reported risks to recheck before related work
 
-These are carry-forward findings, not newly verified defects. Runtime repairs
-are outside this harness-only batch.
+These are carry-forward findings, not newly verified defects. They were not
+re-audited by the Chrome desktop batch.
 
 - No full independent audit of the latest Ring0 transfer registry / v2 ABI;
   no fresh DVM window capture. `display-provider` exceeded its advisory 2.5 s

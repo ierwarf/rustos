@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 
 use runtime_control::{
-    load_runtime_launch_program_entries, DesktopProgramEntry, StartupMode,
-    DEFAULT_RUNTIME_LAUNCH_REGISTRY_PATH,
+    load_desktop_program_entries, load_runtime_launch_program_entries, DesktopProgramEntry, StartupMode,
+    DEFAULT_APPLICATIONS_DIR, DEFAULT_RUNTIME_LAUNCH_REGISTRY_PATH,
 };
 
 use super::{
@@ -162,7 +162,24 @@ pub(super) fn load_launch_catalog(
         .as_str(),
     );
 
+    // Manual desktop apps belong in request lookup, not the boot launch list.
+    // Both registries are signed early-system inputs with independent caches.
+    register_manual_programs(
+        &mut programs,
+        load_desktop_program_entries(DEFAULT_APPLICATIONS_DIR).map_err(runtime_registry_errno)?,
+    );
     Ok((programs, launch_entries))
+}
+
+fn register_manual_programs(
+    programs: &mut BTreeMap<String, ProgramMetadata>,
+    entries: Vec<DesktopProgramEntry>,
+) {
+    for entry in entries {
+        if entry.startup == StartupMode::None && !entry.hidden && !entry.no_display {
+            insert_program_metadata(programs, entry);
+        }
+    }
 }
 
 /// Reconciles the private, DVM-volume qualification policy after the signed
@@ -473,6 +490,51 @@ mod tests {
             env: Vec::new(),
             private_smp_qualification: None,
         }
+    }
+
+    #[test]
+    fn non_autostart_desktop_apps_resolve_without_becoming_boot_policies() {
+        let manual = runtime_control::DesktopProgramEntry {
+            package_id: "chrome".into(),
+            desktop_file_id: "chrome.desktop".into(),
+            display_name: "Google Chrome".into(),
+            exec: "/apps/chrome/chrome".into(),
+            startup: StartupMode::None,
+            terminal: false,
+            autostart_enabled: false,
+            weight_micros: 1000,
+            logical_admin: false,
+            console_hosted: false,
+            args: vec!["/apps/chrome/chrome".into(), "--ozone-platform=wayland".into()],
+            env: Vec::new(),
+            runtime_deps: Vec::new(),
+            hidden: false,
+            no_display: false,
+        };
+        let mut replacement = manual.clone();
+        replacement.exec = "/wrong".into();
+        let mut state = super::BrokerState::default();
+        let mut unrelated = manual.clone();
+        unrelated.desktop_file_id = "not-a-manual-app.desktop".into();
+        unrelated.startup = StartupMode::Desktop;
+        let mut hidden = manual.clone();
+        hidden.desktop_file_id = "hidden.desktop".into();
+        hidden.hidden = true;
+        let mut service = manual.clone();
+        service.desktop_file_id = "hidden-service.desktop".into();
+        service.no_display = true;
+        super::register_manual_programs(&mut state.programs, vec![manual, unrelated, hidden, service]);
+        let resolved = super::resolve_program_request(&state, "chrome.desktop").unwrap();
+        assert_eq!(resolved.exec, "/apps/chrome/chrome");
+        assert!(super::resolve_program_request(&state, "/apps/chrome/chrome").is_ok());
+        assert!(super::load_launch_entries(&state.programs, Vec::new()).unwrap().is_empty());
+        assert!(!state.programs.contains_key("not-a-manual-app.desktop"));
+        assert!(!state.programs.contains_key("hidden.desktop"));
+        assert!(!state.programs.contains_key("hidden-service.desktop"));
+        // Desktop metadata must not overwrite an already admitted launch policy.
+        let original = state.programs["chrome.desktop"].clone();
+        super::register_manual_programs(&mut state.programs, vec![replacement]);
+        assert_eq!(state.programs["chrome.desktop"].exec, original.exec);
     }
 
     #[test]

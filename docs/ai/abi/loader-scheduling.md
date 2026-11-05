@@ -11,7 +11,7 @@ kernel-stamped sender, the live rootd owner and exactly one transferred typed
 Job descriptor. Rootd retains the realm outside all service subtrees and lends
 only inspect/create-child/create-process/set-limits/kill/duplicate/transfer.
 Loaderd retains an exact-right duplicate; retries of the same realm are
-idempotent and a different live realm is refused. Existing spawn v3 and process
+idempotent and a different live realm is refused. Spawn ABI v4 and process
 prepare v5 wire layouts are unchanged; an older loader refuses the new envelope
 rather than silently inheriting a service job.
 
@@ -64,7 +64,7 @@ production relaxed-atomic ordering. Normal-image restoration/smoke is pending.
   ELF/PE image admission; the broker owns only the bounded prepare-handle
   mechanism. The retired procd process-prepare query was a no-op format echo
   and could deadlock as `procd -> loaderd -> procd` when exec raced spawn.
-- Loader request ABI v3 requires `requester_pid` to equal the kernel-stamped
+- Loader request ABI v4 requires `requester_pid` to equal the kernel-stamped
   IPC sender. Process broker ABI v3 carries that identity into deferred
   commit: ring0 binds the suspended target PID to the exact requester in a
   bounded registry. ACTIVATE consumes that pair once; foreign callers and
@@ -97,13 +97,13 @@ production relaxed-atomic ordering. Normal-image restoration/smoke is pending.
 - Linux `execve` → `procd` (target auth) → `loaderd` (image materialization)
   → `vfsd` (namespace resolution and immutable executable snapshot). Kernel
   process state carries no cwd copy. Procd forwards the raw path plus
-  `AT_FDCWD`; loaderd's VFS executable-snapshot ABI v2 names the target PID,
+  `AT_FDCWD`; loaderd's VFS executable-snapshot ABI v3 names the target PID,
   and vfsd resolves the path against that PID's authoritative cwd before it
   admits bulk I/O. Vfsd returns the canonical absolute path and the terminally
   sealed executable handle in one reply. Loaderd uses that returned path for
   process identity and never combines a cwd string itself. Trusted bootstrap
   and ordinary spawn requests have no live target PID; they use the explicit
-  v2 stage-root basis and vfsd resolves their relative package path from `/`.
+  stage-root basis and vfsd resolves their relative package path from `/`.
   A live-target exec cannot select that basis and must use `AT_FDCWD`. If loader
   materialization fails, procd must cancel the exec ticket via
   `SYS_RUSTOS_PROC_CANCEL_EXEC_BROKER` before replying.
@@ -165,9 +165,40 @@ Commit (`COMMIT_BROKER`) builds the child address space from recorded mappings.
 When a broker request supplies `console_session = 0`, the kernel inherits the
 exact live caller (or target thread) session. Missing process/thread state is
 `EINVAL`; it must never manufacture the privileged system session.
-One loader request is one synchronous reply-capability transaction. Image
-reads and nested policy IPC remain ordinary preemption/block points, but
-loaderd must not insert voluntary scheduler yields between mapping,
+Loader ABI v4 separates primary-image staging from process construction.
+SPAWN_EXEC/EXEC_TARGET begin a bounded work lease and return EINPROGRESS with a
+nonwrapping ID. POLL_WORK/CANCEL_WORK require the exact kernel-stamped sender
+PID/TID and original absolute deadline; no reply capability survives a turn.
+Two receive-owner entries hold only immutable request bytes, a thread-bound VFS
+ticket and (for rootd) the MOVED attenuated received placement loan. Receive
+custody is consumed once, including descriptor zero; the loop must not close a
+transferred loan again. No fcntl duplication or extra Job rights are assumed. They never
+cache completed image frames between turns: vfsd expires those independently.
+The tiny request/loan entries are lazily reclaimed before the next request.
+
+On readiness the actor revalidates the original caller's live role and feeds
+the SAME owned canonical sealed snapshot into the existing serial ELF/PE
+admission/construction path. No pathname is reopened, no parallel PE state is
+introduced, and process publication is refused if the work deadline has already
+expired. Runtimed waits only on its existing launch worker, preserving the
+record-before-activation barrier and control-loop responsiveness. Rootd/initd
+and procd keep their existing 5 s whole-work budget; ordinary catalog work has
+an explicit 180 s maximum lease and primary snapshot work at most 120 s. Each
+wire call remains capped at 4 s. Interpreter and PE DLL/registry snapshot waits
+are capped by the SAME parent end instant, not fresh full transaction leases.
+Transport failures are not blindly retried; live staging IDs are cancelled on
+caller exit, with bounded cleanup grace. Lost terminal spawn replies retain the
+existing application-job retirement/supervisor custody.
+
+VALIDATE_IMAGE is a separate trusted rootd/sessiond operation: it stages and
+validates the actual sealed object (including bounded full-content readback),
+returns format/length with PID -1, and NEVER prepares/maps/commits/activates a
+process. The opt-in `RUSTOS_RUNTIME_IMAGE_PROBE` uses this production work
+protocol from a background runtimed thread after WayClick activation; ordinary
+images add neither the probe thread nor browser autostart.
+
+After staging, image reads and nested policy IPC remain ordinary preemption/
+block points, but loaderd must not insert voluntary scheduler yields between mapping,
 runtime-metadata publication, and commit while retaining that reply. Such
 yields neither release ownership nor improve correctness and can expand a
 bounded launch by whole scheduler fairness windows under concurrent System
@@ -244,18 +275,38 @@ memfd and applies
 `F_SEAL_WRITE|F_SEAL_GROW|F_SEAL_SHRINK|F_SEAL_SEAL` before publishing it.
 Relative executable paths are normalized by the vfsd endpoint receive owner
 while it exclusively owns PID cwd state; the bulk snapshot worker receives
-only the canonical absolute path. The v2 response binds that exact path to the
+only the canonical absolute path. The terminal v3 POLL response binds that path to the
 handle, byte count, and mount generation returned to loaderd. Every open owns
 an independent descriptor through terminal reply completion, including failed
 replies. A cache hit duplicates under storage ownership and captures that
 entry's mount generation; later eviction, remount, or descriptor-number reuse
 cannot retarget the pending reply. The current request's byte limit also applies
 to hits. Concurrent same-path commits reuse the winning cache entry rather than
-leaking its descriptor or double-counting cache bytes. A relative
-snapshot with no target PID or a directory basis other than `AT_FDCWD` fails
-closed until the ABI carries an authenticated remote directory handle.
-Snapshot job ownership remains the bounded IDLE→WRITING→READY→BUSY admission.
-After READY, the receive owner advances a process-private futex epoch and wakes
+leaking its descriptor or double-counting cache bytes. A live-target relative
+snapshot requires `AT_FDCWD`; PID zero uses only the explicit stage-root basis.
+Other directory bases fail closed until an authenticated remote directory
+handle is represented by the ABI.
+Snapshot ABI v3 OPEN returns EINPROGRESS plus an owner-bound, nonwrapping job
+ID; POLL returns confirmed private-sink progress or consumes the exact terminal
+result. Neither operation retains its reply capability over bulk I/O. CANCEL
+revokes publication; the worker acknowledges active cancellation at a bounded
+window and reaps completed payloads even without further client traffic. The
+kernel-stamped sender PID/TID and original absolute lease must match on every
+continuation: polling never renews the lease. A late/abandoned completion is
+discarded. Lost terminal replies close the owned descriptor; they never reopen
+a path or replay a write. Control waits remain capped at 4 s, while an explicit
+large-work lease is capped at 120 s (1-vCPU evidence collected 138,149,888 bytes
+in 24 s). This is a bounded job lifetime, not a longer blocking call. Bootstrap
+snapshot work remains capped at 4 s within its parent launch lease.
+
+Two bounded session slots retain incomplete/ready objects. Worker queue
+ownership remains IDLE→WRITING→READY→BUSY; cancellation does not reuse an active
+slot before worker acknowledgement. Data reads use a detached checked FAT map
+and shared device lease, not namespace ownership. Device waiters use the
+embedding Ring3 sleep callback, not a priority-inverting busy spin; each device
+owns its reply buffer, including overlapping old/new mount leases. On observing
+the successful UI snapshot reply, each snapshot worker demotes before further
+data work. After READY, the receive owner advances a process-private futex epoch and wakes
 both workers. A worker observes the epoch **before** scanning READY slots and
 compare-and-parks only after an empty scan, closing the scan/sleep wake race.
 The notification grants no slot or reply authority. Timed waits retain the
@@ -273,8 +324,14 @@ storage-execution scenario.
 Loaderd validates every `PT_LOAD` range against that same sealed file and
 passes the snapshot plus original file offsets to the process broker; it does
 not reopen the pathname or duplicate segment bytes. The snapshot is bounded to
-128 MiB, and the process broker rejects live VFS handles and partially sealed
-memfds. Commit may allocate and copy page-table backing, but it must not issue
+512 MiB by shared Ring3 materialization policy; PE's separate 128-MiB
+admission limit is unchanged. A 256-KiB transfer window and incremental SHA-256
+replace the file-sized heap Vec. The 640-MiB service staging reservation counts
+final frames, conservative frame-vector growth, mapping and scratch; the
+sealed-image cache has its separate 64-MiB ceiling. The reservation follows the
+owned result through reply/discard. It is not a pre-funded rootd Job grant:
+physical/Job allocation can still return ENOMEM. The process broker continues
+to reject live VFS handles and partially sealed memfds. Commit may allocate and copy page-table backing, but it must not issue
 nested vfsd/storage IPC or re-read a mutable path after validation. This closes
 the validation/commit content race, removes redundant storage reads, and keeps
 service-owned storage policy out of ring0.

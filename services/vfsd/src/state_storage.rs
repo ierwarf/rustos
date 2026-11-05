@@ -3,7 +3,15 @@
 use rustos_user_abi::syscall::{
     ProductExecutableSnapshotEvidence, VFS_EXECUTABLE_SNAPSHOT_DIRFD_ROOT,
 };
-use sha2::{Digest, Sha256};
+fn map_range_error(error: storage_core::file_io::RangeError) -> i32 {
+    use storage_core::file_io::RangeError;
+    match error {
+        RangeError::Stale => EAGAIN,
+        RangeError::Budget | RangeError::NoMemory => ENOMEM,
+        RangeError::Invalid => EIO,
+        RangeError::Io(error) => map_fat_error(storage_fat::FatError::Io(error)),
+    }
+}
 
 /// Whether an `open` metadata errno is an answer rather than a fault.
 ///
@@ -31,6 +39,8 @@ impl VfsState {
             || request.op != VFS_EXECUTABLE_SNAPSHOT_OP_OPEN
             || request.flags != 0
             || request.reserved0 != 0
+            || request.job_id != 0
+            || request.deadline_ns == 0
             || request.path_len == 0
             || request.path_len as usize > request.path.len()
         {
@@ -331,11 +341,30 @@ impl VfsStorage {
                     return Ok(read);
                 }
 
-                self.volume()?
-                    .read_file_range_into(path, start, dest)
-                    .map_err(map_fat_error)
+                self.read_mapped_file(path, file_len, start, dest)
             }
         }
+    }
+
+    fn read_mapped_file(&mut self, path: &str, len: u64, offset: u64, output: &mut [u8]) -> Result<usize, i32> {
+        use storage_core::file_io::ReadAt;
+        if !self.read_maps.contains_key(path) {
+            let map = self.volume()?.plan_read(path, vfsd::snapshot_budget::SNAPSHOT_MAP_BYTES)
+                .map_err(map_range_error)?;
+            if map.len() != len { return Err(EIO); }
+            let cost = map.metadata_bytes();
+            if self.read_maps.len() >= 128 || self.read_map_bytes.checked_add(cost).is_none_or(|n| n > 8 * 1024 * 1024) {
+                self.read_maps.clear();
+                self.read_map_bytes = 0;
+            }
+            self.read_map_bytes += cost;
+            self.read_maps.insert(path.to_string(), map);
+        }
+        let map = self.read_maps.get(path).ok_or(EIO)?;
+        if map.len() != len { return Err(EIO); }
+        let mut scratch = [0; 4096];
+        self.volume.as_ref().ok_or(ENODEV)?.read_view(map, &mut scratch)
+            .map_err(map_range_error)?.read_at(offset, output).map_err(map_range_error)
     }
 
     /// Resolves a snapshot request into either a warm cache hit or an
@@ -356,7 +385,7 @@ impl VfsStorage {
             || request.requester_pid == 0
             || request.requester_tid == 0
             || request.max_bytes == 0
-            || request.max_bytes > EXECUTABLE_SNAPSHOT_MAX_BYTES
+            || request.max_bytes > VFS_EXECUTABLE_SNAPSHOT_MAX_FILE_BYTES
             || request.path_len == 0
             || request.path_len as usize > request.path.len()
         {
@@ -408,13 +437,17 @@ impl VfsStorage {
                 self.dvm_storage_epoch
             }
         };
-        let request_id = match backing {
-            ExecutableSnapshotBacking::EarlySystem => 0,
-            ExecutableSnapshotBacking::DvmVolume => next_executable_snapshot_request_id()?,
-        };
+        let request_id = next_executable_snapshot_request_id()?;
+        let read_map = if backing == ExecutableSnapshotBacking::DvmVolume {
+            let map = self.volume()?.plan_read(path.as_str(), vfsd::snapshot_budget::SNAPSHOT_MAP_BYTES)
+                .map_err(map_range_error)?;
+            if map.len() != metadata.len { return Err(EIO); }
+            Some(alloc::sync::Arc::new(map))
+        } else { None };
         Ok(ExecutableSnapshotAdmission::Read(ExecutableSnapshotPlan {
             path,
             file_len,
+            read_map,
             metadata_len: metadata.len,
             verbose: !early_system_owned || product_interactive_snapshot,
             backing,
@@ -424,31 +457,17 @@ impl VfsStorage {
         }))
     }
 
-    /// Reads one bounded chunk of a planned snapshot.
-    ///
-    /// The caller re-acquires storage per chunk so a namespace request waits at
-    /// most one chunk, never a whole file.
-    fn read_executable_snapshot_chunk(
+    /// Only the epoch check requires namespace ownership; detached device I/O
+    /// occurs after the caller releases it.
+    fn validate_executable_snapshot_plan(
         &mut self,
         plan: &ExecutableSnapshotPlan,
-        offset: u64,
-        dest: &mut [u8],
-    ) -> Result<usize, i32> {
-        let path = plan.path.as_str();
-        if let Some(read) = early_system::read(path, offset, dest)? {
-            return Ok(read);
-        }
+    ) -> Result<(), i32> {
         self.invalidate_caches_if_remounted();
-        if let Some(bytes) = self.file_bytes_cache.get(path) {
-            return Ok(copy_file_cache_range(bytes, offset, dest));
-        }
-        // The sealed snapshot is itself the cache for this image. Going through
-        // `read_file_slice_into` would materialize a second whole-file copy in
-        // `file_bytes_cache` (alloc + zero-fill + copy) and evict useful
-        // entries when it overflows the cache budget.
-        self.volume()?
-            .read_file_range_into(path, offset, dest)
-            .map_err(map_fat_error)
+        if plan.mount_generation != self.mount_generation
+            || (plan.backing == ExecutableSnapshotBacking::DvmVolume && plan.storage_epoch != self.dvm_storage_epoch)
+        { return Err(EAGAIN); }
+        Ok(())
     }
 
     /// Seals the completed image and admits it to the mount-generation cache.
@@ -461,14 +480,20 @@ impl VfsStorage {
     fn commit_executable_snapshot(
         &mut self,
         plan: &ExecutableSnapshotPlan,
-        bytes: &[u8],
-    ) -> Result<ExecutableSnapshotOpen, i32> {
+        snapshot: &ExecutableSnapshotOpen,
+        digest_bytes: [u8; 32],
+    ) -> Result<Option<ExecutableSnapshotOpen>, i32> {
         self.invalidate_caches_if_remounted();
         if !vfsd::snapshot_plan_is_current(plan.mount_generation, self.mount_generation)
             || (plan.backing == ExecutableSnapshotBacking::DvmVolume
                 && plan.storage_epoch != self.dvm_storage_epoch)
         {
             return Err(EAGAIN);
+        }
+        if let Some(map) = plan.read_map.as_ref() {
+            if !self.volume.as_ref().is_some_and(|volume| volume.read_map_is_current(map)) {
+                return Err(EAGAIN);
+            }
         }
         let path = plan.path.clone();
         let file_len = plan.file_len;
@@ -483,12 +508,12 @@ impl VfsStorage {
                 plan.metadata_len,
                 duplicate_snapshot_fd,
                 close_fd as fn(i32),
-            );
+            ).map(Some);
         }
-        let fd = create_terminally_sealed_snapshot(path.as_str(), bytes)?;
-        let snapshot = ExecutableSnapshotOpen::from_owned(
-            fd, plan.metadata_len, plan.mount_generation, close_fd as fn(i32),
-        );
+        if snapshot.file_bytes() != plan.metadata_len || snapshot.mount_generation() != plan.mount_generation {
+            return Err(EIO);
+        }
+        let fd = snapshot.fd();
         if plan.verbose {
             ipc::debug_line(
                 executable_snapshot_marker(
@@ -508,9 +533,6 @@ impl VfsStorage {
                     );
                 }
                 ExecutableSnapshotBacking::DvmVolume => {
-                    let digest = Sha256::digest(bytes);
-                    let mut digest_bytes = [0; 32];
-                    digest_bytes.copy_from_slice(digest.as_slice());
                     let evidence = ProductExecutableSnapshotEvidence {
                         storage_epoch: plan.storage_epoch,
                         mount_generation: plan.mount_generation,
@@ -527,13 +549,13 @@ impl VfsStorage {
         }
 
         if file_len > EXECUTABLE_SNAPSHOT_CACHE_BUDGET_BYTES {
-            return Ok(snapshot);
+            return Ok(None);
         }
         // Cache admission is optional. The request still owns the original
         // sealed fd if descriptor pressure refuses the separate cache handle.
         let cache_fd = match duplicate_snapshot_fd(fd) {
             Ok(fd) => fd,
-            Err(_) => return Ok(snapshot),
+            Err(_) => return Ok(None),
         };
         if self
             .executable_snapshot_cache_bytes
@@ -554,7 +576,7 @@ impl VfsStorage {
             },
         );
         self.executable_snapshot_cache_bytes += file_len;
-        Ok(snapshot)
+        Ok(None)
     }
 }
 
@@ -721,7 +743,7 @@ impl VfsStorage {
                 }
             })?;
             let storage_epoch = device.generation;
-            let volume = FatVolume::new(device)
+            let volume = FatVolume::new_with_wait(device, || rustos_svc_runtime::syscall::sleep_millis(1))
                 .map_err(map_fat_error)
                 .inspect_err(|&errno| {
                     debug_line(&format!(

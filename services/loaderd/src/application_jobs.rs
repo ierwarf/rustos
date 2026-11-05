@@ -203,6 +203,9 @@ fn request(op: u16, handle: u64) -> RustosJobArgs {
 }
 
 impl ApplicationJobs {
+    /// Readiness only: prepare still revalidates the live typed realm authority.
+    pub fn realm_configured(&self) -> bool { self.realm.is_some() }
+
     /// Called only after live rootd-owner authentication and descriptor-count
     /// validation. The receive loop still owns/closes `candidate`; we duplicate
     /// it rather than stealing receive custody. Repeated provisioning of the
@@ -410,7 +413,7 @@ mod tests {
         assert!(spawn.find("if placement.is_some()").unwrap()
             < spawn.find("applications.prepare(limits").unwrap());
         assert!(spawn.find("applications.prepare(limits").unwrap()
-            < spawn.find("handle_placed_request(request, Some(handle))").unwrap());
+            < spawn.find("handle_placed_request(request, Some(handle), snapshot)").unwrap());
         assert!(spawn.find("applications.published(handle").unwrap()
             < spawn.find("handled.application_job = Some(handle)").unwrap());
         let main = include_str!("main.rs");
@@ -420,7 +423,16 @@ mod tests {
         assert!(failure.contains("applications.abort(handle"));
         let request = main.split_once("fn handle_request(").unwrap().1;
         assert!(request.find("authorize_loader_operation(request.op, sender_pid)").unwrap()
-            < request.find("application_launch::spawn(request, sender_pid").unwrap());
+            < request.find("image_work.begin(request").unwrap());
+        let staging = include_str!("image_staging.rs");
+        assert!(staging.find("pending.ticket.poll()").unwrap()
+            < staging.find("application_launch::spawn(&pending.request").unwrap());
+        assert!(staging.find("authorize_loader_operation(pending.request.op").unwrap()
+            < staging.find("application_launch::spawn(&pending.request").unwrap());
+        let placed = main.split_once("fn handle_placed_request(").unwrap().1;
+        let placed = placed.split_once("fn authorize_loader_operation(").unwrap().0;
+        assert!(!placed.contains("open_immutable_file_snapshot("));
+        assert!(placed.contains("snapshot.take_fd()"));
     }
 
     #[test]

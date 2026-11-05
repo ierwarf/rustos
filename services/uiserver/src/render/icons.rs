@@ -1,6 +1,6 @@
 //! App icon glyphs. Every launcher / dock slot displays a small rounded
-//! tile in an accent color with a single primitive shape (circle / rounded
-//! square / triangle / diamond) inset inside it. The shape and color are
+//! tile in an accent color with a primitive shape (circle / rounded square /
+//! triangle / diamond) or a known browser glyph inset inside it. The shape and color are
 //! derived deterministically from the app title so the same app always
 //! gets the same icon across sessions, with a small allow-list of known
 //! titles to give well-known apps a meaningful look.
@@ -19,6 +19,7 @@ enum IconShape {
     Square,
     Triangle,
     Diamond,
+    Chrome,
 }
 
 #[derive(Clone, Copy)]
@@ -42,6 +43,11 @@ fn icon_theme_for_title(title: &str) -> IconTheme {
         "files" | "file manager" | "explorer" => Some(IconTheme {
             shape: IconShape::Square,
             accent: COLOR_ACCENT_GOLD,
+            secondary: COLOR_ICON_GLYPH,
+        }),
+        "chrome" | "google chrome" => Some(IconTheme {
+            shape: IconShape::Chrome,
+            accent: COLOR_ACCENT_CYAN,
             secondary: COLOR_ICON_GLYPH,
         }),
         "browser" | "web" => Some(IconTheme {
@@ -149,6 +155,45 @@ fn draw_icon_glyph(
         }
         IconShape::Triangle => fill_triangle(canvas, rect, color, alpha),
         IconShape::Diamond => fill_diamond(canvas, rect, color, alpha),
+        IconShape::Chrome => fill_chrome(canvas, rect, alpha),
+    }
+}
+
+/// A compact browser glyph: three colored sectors around a blue centre.
+/// Integer geometry keeps this independent of image decoding or guest files.
+fn fill_chrome(canvas: &mut SurfaceCanvas<'_>, rect: Rect, alpha: u8) {
+    let size = rect.width.min(rect.height);
+    if size == 0 || alpha == 0 {
+        return;
+    }
+    let radius = size as i64;
+    let left = rect.x + (rect.width - size) / 2;
+    let top = rect.y + (rect.height - size) / 2;
+    for y in 0..size {
+        for x in 0..size {
+            let dx = 2 * x as i64 + 1 - radius;
+            let dy = 2 * y as i64 + 1 - radius;
+            let distance = dx * dx + dy * dy;
+            if distance > radius * radius {
+                continue;
+            }
+            let color = if distance * 9 <= radius * radius {
+                0xff42_85f4
+            } else if distance * 100 <= radius * radius * 16 {
+                0xffff_ffff
+            } else if dy < 0 && dx < -dy {
+                0xffea_4335
+            } else if dx > 0 {
+                0xfffb_bc05
+            } else {
+                0xff34_a853
+            };
+            canvas.fill_rect_alpha(
+                Rect { x: left + x, y: top + y, width: 1, height: 1 },
+                color,
+                alpha,
+            );
+        }
     }
 }
 
@@ -304,6 +349,22 @@ mod tests {
             f(&mut canvas)
         };
         (pixels, result)
+    }
+
+    #[test]
+    fn chrome_has_a_distinct_browser_glyph_and_obeys_transparency() {
+        for title in ["Chrome", " Google Chrome "] {
+            assert!(matches!(icon_theme_for_title(title).shape, IconShape::Chrome));
+        }
+        let rect = Rect { x: 4, y: 4, width: 24, height: 24 };
+        let (pixels, ()) = canvas_with(|canvas| fill_chrome(canvas, rect, 255));
+        for color in [0xff42_85f4, 0xffea_4335, 0xfffb_bc05, 0xff34_a853] {
+            assert!(pixels.contains(&color), "missing Chrome color {color:x}");
+        }
+        assert_eq!(pixels[4 * 32 + 4], 0, "circle corners stay clear");
+        assert_eq!(pixels[16 * 32 + 16], 0xff42_85f4);
+        let (transparent, ()) = canvas_with(|canvas| fill_chrome(canvas, rect, 0));
+        assert!(transparent.iter().all(|pixel| *pixel == 0));
     }
 
     #[test]

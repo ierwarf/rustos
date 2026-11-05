@@ -23,6 +23,7 @@ not be preloaded for unrelated work.
 | `smp-contract.md` | Multi-CPU release gate: AP startup, per-CPU scheduler/IPI/TLB/futex ownership, qualification matrix. |
 | `system-flows.md` | Machine-linked end-to-end exception, IPC, wait-set, VFS, endpoint, and restart lifecycles. |
 | `pager-protocol-contract.md` | Demand-paging protocol across ring0 and pagerd. Search the owning heading first. |
+| `large-file-io-plan.md` | Proposed bounded file I/O, executable snapshot and ext4/NTFS expansion phases; not implemented filesystem support. |
 | `address-space-lifecycle-contract.md` | Fork/unmap/pressure/teardown conformance and reservation/reclamation rules. |
 | `page-table-reclamation-contract.md` | Dynamic page-table descriptor lifetime and live empty-table reclamation order. |
 | `fork-cow-contract.md` | Admission and teardown gate before private anonymous mappings may be shared across fork. |

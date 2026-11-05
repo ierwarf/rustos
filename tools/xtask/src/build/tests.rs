@@ -5,6 +5,25 @@ use fs_err as fs;
 use std::path::Path;
 
 #[test]
+fn prebuilt_app_copies_resources_and_rejects_a_missing_desktop_executable() {
+    let root = tempfile::tempdir().unwrap();
+    let mut config = super::Config::from_env().unwrap();
+    config.artifact_dir = root.path().join("artifacts");
+    let mut manifest: super::PackageManifest = toml::from_str(
+        include_str!("../../../../apps/chrome/RUSTOS.package.toml.example"),
+    ).unwrap();
+    manifest.package_root = root.path().join("chrome");
+    let bundle = manifest.package_root.join("bundle");
+    fs::create_dir_all(bundle.join("locales")).unwrap();
+    assert!(super::build_directory_bundle(&config, &manifest).is_err());
+    fs::write(bundle.join("chrome"), b"browser fixture").unwrap();
+    fs::write(bundle.join("locales/en-US.pak"), b"resource").unwrap();
+    super::build_directory_bundle(&config, &manifest).unwrap();
+    assert_eq!(fs::read(manifest.artifact_path(&config).join("chrome")).unwrap(), b"browser fixture");
+    assert_eq!(fs::read(manifest.artifact_path(&config).join("locales/en-US.pak")).unwrap(), b"resource");
+}
+
+#[test]
 fn c_assembly_sources_are_closed_and_freshness_includes_every_unit() {
     let root = tempfile::tempdir().unwrap();
     let c = root.path().join("probe.c");

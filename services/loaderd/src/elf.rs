@@ -44,6 +44,7 @@ fn map_executable_segments(
     admission: &ExecutableAdmission,
     argv: &loaderd::RequestStrings<'_>,
     env: &loaderd::RequestStrings<'_>,
+    deadline: AbsoluteDeadline,
 ) -> Result<PreparedExecutable, i32> {
     match admission {
         ExecutableAdmission::Elf64 {
@@ -65,6 +66,7 @@ fn map_executable_segments(
                 header,
                 program_headers,
                 *load_bias,
+                deadline,
             )
             .map(|result| {
                 let mut cleanup_fds = result.backing_fds.clone();
@@ -81,7 +83,7 @@ fn map_executable_segments(
             // Materialize only on this path, not for every ELF spawn/exec.
             let argv: Vec<CString> = argv.iter().map(|value| value.to_owned()).collect();
             let env: Vec<CString> = env.iter().map(|value| value.to_owned()).collect();
-            map_pe_segments_fd(fd, prepare_handle, exec_path, &argv, &env)
+            map_pe_segments_fd(fd, prepare_handle, exec_path, &argv, &env, deadline)
                 .map(|runtime| PreparedExecutable {
                     windows_runtime: Some(runtime),
                     linux_runtime: None,
@@ -108,7 +110,7 @@ fn validate_request(received: usize, request: &LoaderSpawnRequest) -> Result<(),
         return Err(EINVAL);
     }
     if request.op == LOADER_OP_ACTIVATE {
-        if request.flags != 0
+        if request.deadline_ns != 0 || request.work_id != 0 || request.flags != 0
             || request.console_session != 0
             || request.weight_micros != 0
             || request.target_pid == 0
@@ -126,6 +128,18 @@ fn validate_request(received: usize, request: &LoaderSpawnRequest) -> Result<(),
         }
         return Ok(());
     }
+    if request.op == rustos_user_abi::syscall::LOADER_OP_VALIDATE_IMAGE {
+        let mut expected = LoaderSpawnRequest {
+            op: request.op, requester_pid: request.requester_pid,
+            deadline_ns: request.deadline_ns, exec_path_len: request.exec_path_len,
+            ..LoaderSpawnRequest::default()
+        };
+        if request.exec_path_len == 0 || request.exec_path_len as usize > request.exec_path.len() { return Err(EINVAL); }
+        expected.exec_path[..request.exec_path_len as usize].copy_from_slice(&request.exec_path[..request.exec_path_len as usize]);
+        if request.deadline_ns == 0 || *request != expected { return Err(EINVAL); }
+        return Ok(());
+    }
+    if request.deadline_ns == 0 || request.work_id != 0 { return Err(EINVAL); }
     if !matches!(request.op, LOADER_OP_SPAWN_EXEC | LOADER_OP_EXEC_TARGET)
         || request.exec_path_len == 0
         || request.exec_path_len as usize > LOADER_SPAWN_EXEC_PATH_CAPACITY
@@ -389,6 +403,7 @@ fn map_elf_segments_fd(
     prepare_handle: u64,
     dyn_load_offset: u64,
     map_interpreter: bool,
+    deadline: AbsoluteDeadline,
 ) -> Result<ElfMapResult, i32> {
     let mut header = [0_u8; ELF_HEADER_SIZE];
     trace_line(&format!(
@@ -414,6 +429,7 @@ fn map_elf_segments_fd(
         &header,
         &phdrs,
         load_bias,
+        deadline,
     )
 }
 
@@ -424,6 +440,7 @@ fn map_admitted_elf_segments_fd(
     header: &[u8; ELF_HEADER_SIZE],
     phdrs: &[u8],
     load_bias: u64,
+    deadline: AbsoluteDeadline,
 ) -> Result<ElfMapResult, i32> {
     let _phoff = read_u64(header, 32);
     let e_entry = read_u64(header, 24);
@@ -471,7 +488,7 @@ fn map_admitted_elf_segments_fd(
 
     let (interpreter_base, actual_entry, interp_path_out, interp_max_end) =
         if let Some(path) = interpreter_path.as_deref() {
-            let interp = match map_elf_interpreter(path, prepare_handle) {
+            let interp = match map_elf_interpreter(path, prepare_handle, deadline) {
                 Ok(interp) => interp,
                 Err(errno) => {
                     close_fds(&backing_fds);
@@ -506,9 +523,9 @@ fn map_admitted_elf_segments_fd(
     })
 }
 
-fn map_elf_interpreter(path: &str, prepare_handle: u64) -> Result<ElfMapResult, i32> {
-    let fd = open_immutable_file_snapshot(path, 0, 0)?.fd;
-    let mut result = match map_elf_segments_fd(fd, prepare_handle, ELF_INTERP_LOAD_OFFSET, false) {
+fn map_elf_interpreter(path: &str, prepare_handle: u64, deadline: AbsoluteDeadline) -> Result<ElfMapResult, i32> {
+    let fd = open_immutable_file_snapshot_until(path, 0, 0, deadline)?.into_fd();
+    let mut result = match map_elf_segments_fd(fd, prepare_handle, ELF_INTERP_LOAD_OFFSET, false, deadline) {
         Ok(result) => result,
         Err(errno) => {
             let _ = syscall1(SYS_CLOSE, fd as u64);

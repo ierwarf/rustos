@@ -24,6 +24,7 @@ read the sections you need, rather than paging from line 1 by habit.
 | Development-speed/tooling change | relevant `token-policy.md` section + exact active hook/config | search `commands.md` only if a build invocation is part of the issue |
 | Run/KVM/debug issue | `.agents/skills/rustos-kvm/SKILL.md` | exact KVM owner; bounded `build/kvm/` evidence after symptom is known |
 | Physical GPU/VFIO continuation | `physical-gpu-status.md` | search the owning `contracts-abi.md` heading, then exact hostd/xtask/DVM owner |
+| Large-file I/O / future ext4 or NTFS support | `large-file-io-plan.md` (proposal, not implemented support) | owning sections of `abi/vfs-storage.md`, `abi/loader-scheduling.md`, and pager contract |
 | Package/stage/registry | search the owning heading in `contracts-infra.md` | affected manifest and exact parser/stage range |
 | Kernel API/change | `kernel-api-map.md` | relevant `kernel/*/src/api.rs`, then backing symbol |
 | Kernel boot order | `kernel-api-map.md` | search the relevant `contracts-infra.md` heading, then exact boot symbol |

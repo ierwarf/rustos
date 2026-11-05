@@ -13,6 +13,8 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
+pub mod file_io;
+
 use alloc::boxed::Box;
 use alloc::vec;
 use alloc::vec::Vec;

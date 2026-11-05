@@ -69,12 +69,13 @@ use rustos_user_abi::syscall::{
     SYS_RUSTOS_PROC_MAP_DATA_BROKER, SYS_RUSTOS_PROC_MAP_FILE_BATCH_BROKER,
     SYS_RUSTOS_PROC_MAP_ZEROED_BROKER, SYS_RUSTOS_PROC_PREPARE_BROKER,
     SYS_RUSTOS_PROC_SET_LINUX_RUNTIME_BROKER, SYS_RUSTOS_PROC_SET_WINDOWS_RUNTIME_BROKER,
-    SYS_RUSTOS_SCHED_DEMOTE_SELF, VFS_EXECUTABLE_SNAPSHOT_ABI_VERSION,
-    VFS_EXECUTABLE_SNAPSHOT_OP_OPEN, VFS_IPC_PATH_CAPACITY,
+    SYS_RUSTOS_SCHED_DEMOTE_SELF, VFS_IPC_PATH_CAPACITY,
 };
 
 mod commit;
 mod application_launch;
+mod snapshot_client;
+mod image_staging;
 
 use commit::{commit_prepared_executable, LoaderOperation};
 use loaderd::{
@@ -107,7 +108,7 @@ const ENOEXEC: i32 = 8;
 const EOVERFLOW: i32 = 75;
 const ETIMEDOUT: i32 = 110;
 const ELF_READ_CHUNK_BYTES: usize = 256 * 1024;
-const ELF_MAX_SNAPSHOT_BYTES: u64 = 128 * 1024 * 1024;
+use rustos_user_abi::syscall::VFS_EXECUTABLE_SNAPSHOT_MAX_FILE_BYTES;
 const ELF_HEADER_SIZE: usize = 64;
 const ELF_PROGRAM_HEADER_SIZE: usize = 56;
 const ELF_MAX_PROGRAM_HEADERS: u16 = 128;
@@ -205,6 +206,7 @@ fn service_main() {
 
 fn serve(endpoint: u64) {
     let mut recv_error_reported = false;
+    let mut image_work = image_staging::ImageStaging::new();
     let mut request = MaybeUninit::<LoaderdRecvBuffer>::uninit();
     let mut reply_cap = 0_u64;
     let mut sender_pid = 0_u64;
@@ -242,13 +244,19 @@ fn serve(endpoint: u64) {
         let request_bytes = unsafe {
             core::slice::from_raw_parts(request.as_ptr() as *const u8, received as usize)
         };
+        image_work.reap();
         applications.collect(&mut loaderd::application_jobs::NativeJobs);
-        let handled = handle_wire_request(received as usize, request_bytes, sender_pid, sender_tid, handles.as_slice(), &mut applications);
-        // Prepare retained a generational JobId, never this descriptor. Rejected
-        // requests also release their authority before the next receive.
+        let handled = handle_wire_request(received as usize, request_bytes, sender_pid, sender_tid, &mut handles, &mut applications, &mut image_work);
+        let pending_work = match &handled.reply {
+            LoaderReply::Spawn(response) if response.status == rustos_user_abi::syscall::LOADER_WORK_PENDING => Some(response.work_id),
+            _ => None,
+        };
+        // Staging may have moved its one attenuated loan into a lease. Only
+        // still-received descriptors are closed here; no authority is cloned.
         close_fds(handles.as_slice());
         handles.clear();
         if handled.application_job.is_none()
+            && pending_work.is_none()
             && fused_loader_reply_eligible(handled.cleanup_fds.len(), handled.demote_after_reply) {
             // CONTRACT: this path owns no post-reply cleanup or class
             // transition. The response and receive buffer are disjoint and
@@ -275,6 +283,7 @@ fn serve(endpoint: u64) {
             rustos_svc_runtime::ipc::reply(reply_cap, handled.reply.as_ptr(), handled.reply.len())
         };
         if reply < 0 {
+            if let Some(id) = pending_work { image_work.cancel_owner(id, (sender_pid, sender_tid)); }
             if let Some(handle) = handled.application_job {
                 applications.abort(handle, &mut loaderd::application_jobs::NativeJobs);
             }
@@ -443,9 +452,11 @@ fn handle_wire_request(
     bytes: &[u8],
     sender_pid: u64,
     sender_tid: u64,
-    descriptors: &[i32],
+    handles: &mut loaderd::placement::ReceivedHandles,
     applications: &mut loaderd::application_jobs::ApplicationJobs,
+    image_work: &mut image_staging::ImageStaging,
 ) -> HandledLoaderRequest {
+    let descriptors = handles.as_slice();
     if received == size_of::<rustos_user_abi::syscall::LoaderJobRealmRequest>() {
         return application_launch::configure(bytes, sender_pid, descriptors, applications);
     }
@@ -470,7 +481,7 @@ fn handle_wire_request(
         }
         LoaderWireKind::Spawn => {
             let request = unsafe { &*bytes.as_ptr().cast::<LoaderSpawnRequest>() };
-            handle_request(received, request, sender_pid, descriptors, applications)
+            handle_request(received, request, sender_pid, sender_tid, handles, applications, image_work)
         }
         LoaderWireKind::Malformed => spawn_response(LoaderSpawnResponse {
             status: EINVAL,
@@ -545,19 +556,26 @@ fn handle_request(
     received: usize,
     request: &LoaderSpawnRequest,
     sender_pid: u64,
-    descriptors: &[i32],
+    sender_tid: u64,
+    handles: &mut loaderd::placement::ReceivedHandles,
     applications: &mut loaderd::application_jobs::ApplicationJobs,
+    image_work: &mut image_staging::ImageStaging,
 ) -> HandledLoaderRequest {
+    let descriptors = handles.as_slice();
     let mut response = LoaderSpawnResponse {
-        version: LOADER_REQUEST_ABI_VERSION,
-        op: request.op,
-        status: 0,
-        pid: -1,
-        reserved0: 0,
+        version: LOADER_REQUEST_ABI_VERSION, op: request.op, pid: -1,
+        ..LoaderSpawnResponse::default()
     };
     if !request.requester_is_exact_sender(sender_pid) {
         response.status = EACCES;
         return spawn_response(response);
+    }
+    if matches!(request.op, rustos_user_abi::syscall::LOADER_OP_POLL_WORK | rustos_user_abi::syscall::LOADER_OP_CANCEL_WORK) {
+        if !descriptors.is_empty() || authorize_loader_operation(request.op, sender_pid).is_err() {
+            response.status = EACCES;
+            return spawn_response(response);
+        }
+        return image_work.advance(request, (sender_pid, sender_tid), applications);
     }
     if let Err(errno) = validate_request(received, request) {
         response.status = errno;
@@ -574,12 +592,19 @@ fn handle_request(
             return spawn_response(response);
         }
     };
-    application_launch::spawn(request, sender_pid, job_handle, applications)
+    if request.op == LOADER_OP_ACTIVATE {
+        return application_launch::spawn(request, sender_pid, job_handle, applications, None);
+    }
+    let placement = if job_handle.is_some() {
+        let Some(fd) = handles.take_one() else { response.status = EINVAL; return spawn_response(response); };
+        Some(fd)
+    } else { None };
+    image_work.begin(request, (sender_pid, sender_tid), placement, applications)
 }
 
-fn handle_placed_request(request: &LoaderSpawnRequest, job_handle: Option<u64>) -> HandledLoaderRequest {
+fn handle_placed_request(request: &LoaderSpawnRequest, job_handle: Option<u64>, snapshot: Option<ImmutableFileSnapshot>) -> HandledLoaderRequest {
     let mut response = LoaderSpawnResponse {
-        version: LOADER_REQUEST_ABI_VERSION, op: request.op, status: 0, pid: -1, reserved0: 0,
+        version: LOADER_REQUEST_ABI_VERSION, op: request.op, pid: -1, ..LoaderSpawnResponse::default()
     };
     if request.op == LOADER_OP_ACTIVATE {
         let args = RustosProcActivateBrokerArgs {
@@ -616,21 +641,13 @@ fn handle_placed_request(request: &LoaderSpawnRequest, job_handle: Option<u64>) 
         }
     };
     trace_line(&format!("loaderd: spawn begin exec={requested_exec_path}"));
-    let snapshot = match open_immutable_file_snapshot(
-        requested_exec_path,
-        request.target_pid,
-        request.exec_dirfd,
-    ) {
-        Ok(snapshot) => snapshot,
-        Err(errno) => {
-            debug_line(&format!(
-                "loaderd: open executable snapshot failed exec={requested_exec_path} errno={errno}"
-            ));
-            response.status = errno;
-            return spawn_response(response);
-        }
+    // Use the exact canonical sealed image from staging; never reopen a path
+    // or restart its transfer deadline after admission.
+    let Some(mut snapshot) = snapshot else {
+        response.status = EINVAL;
+        return spawn_response(response);
     };
-    let fd = snapshot.fd;
+    let fd = snapshot.take_fd();
     let exec_path = snapshot.resolved_path.as_str();
     let exec_path_c = match CString::new(exec_path) {
         Ok(path) => path,
@@ -652,6 +669,7 @@ fn handle_placed_request(request: &LoaderSpawnRequest, job_handle: Option<u64>) 
         }
     };
     let executable_format = executable_admission.format();
+    response.image_format = executable_format;
     trace_line(&format!("loaderd: validate done exec={exec_path}"));
     if !operation.allows_format(executable_format) {
         let _ = syscall1(SYS_CLOSE, fd as u64);
@@ -705,6 +723,11 @@ fn handle_placed_request(request: &LoaderSpawnRequest, job_handle: Option<u64>) 
             return spawn_response(response);
         }
     };
+    if rustos_svc_runtime::syscall::monotonic_nanos() >= request.deadline_ns {
+        let _ = syscall1(SYS_CLOSE, fd as u64);
+        response.status = ETIMEDOUT;
+        return spawn_response(response);
+    }
     let (prepare_flags, prepare_ticket) = prepare_authority(operation, request);
     let prepare_args = RustosProcPrepareBrokerArgs {
         abi_version: PROC_BROKER_ABI_VERSION,
@@ -733,6 +756,7 @@ fn handle_placed_request(request: &LoaderSpawnRequest, job_handle: Option<u64>) 
         &executable_admission,
         &argv,
         &env,
+        AbsoluteDeadline::after(request.deadline_ns, 0),
     ) {
         Ok(prepared) => prepared,
         Err(errno) => {
@@ -770,6 +794,12 @@ fn handle_placed_request(request: &LoaderSpawnRequest, job_handle: Option<u64>) 
         }
     }
 
+    if rustos_svc_runtime::syscall::monotonic_nanos() >= request.deadline_ns {
+        close_fds(&prepared.cleanup_fds);
+        abort_prepare(prepare_handle as u64, ETIMEDOUT as u64);
+        response.status = ETIMEDOUT;
+        return spawn_response(response);
+    }
     trace_line(&format!("loaderd: commit begin exec={exec_path}"));
     let pid = commit_prepared_executable(
         operation,
@@ -981,7 +1011,7 @@ fn stage_release_file(
     trial_deadline_ns: u64,
 ) -> Result<u64, i32> {
     use loaderd::release_bundle::{bundle_length, BUNDLE_HEADER_BYTES};
-    let fd = open_immutable_file_snapshot(path, 0, 0)?.fd;
+    let fd = open_immutable_file_snapshot(path, 0, 0)?.into_fd();
     let read = (|| -> Result<Vec<u8>, i32> {
         let mut header = [0_u8; BUNDLE_HEADER_BYTES];
         read_exact_at(fd, 0, &mut header)?;
@@ -1045,7 +1075,7 @@ fn stage_release_file(
 }
 
 fn probe_image(path: &str) -> Result<u16, i32> {
-    let fd = open_immutable_file_snapshot(path, 0, 0)?.fd;
+    let fd = open_immutable_file_snapshot(path, 0, 0)?.into_fd();
     let result = validate_executable_fd(fd).map(|admission| admission.format());
     let _ = syscall1(SYS_CLOSE, fd as u64);
     result
@@ -1053,141 +1083,25 @@ fn probe_image(path: &str) -> Result<u16, i32> {
 
 struct ImmutableFileSnapshot {
     fd: i32,
+    file_bytes: u64,
     resolved_path: String,
 }
+impl ImmutableFileSnapshot {
+    fn take_fd(&mut self) -> i32 { core::mem::replace(&mut self.fd, -1) }
+    fn into_fd(mut self) -> i32 { self.take_fd() }
+}
+impl Drop for ImmutableFileSnapshot {
+    fn drop(&mut self) { if self.fd >= 0 { let _ = syscall1(SYS_CLOSE, self.fd as u64); } }
+}
 
-fn open_immutable_file_snapshot(
-    path: &str,
-    target_pid: u64,
-    dirfd: u64,
-) -> Result<ImmutableFileSnapshot, i32> {
-    if path.is_empty() || path.len() > VFS_IPC_PATH_CAPACITY || path.as_bytes().contains(&0) {
-        return Err(EINVAL);
-    }
-    let endpoint = rustos_svc_runtime::ipc::lookup_service_endpoint(IPC_SERVICE_VFSD);
-    if endpoint < 0 {
-        return Err((-endpoint) as i32);
-    }
-    let pid = syscall0(SYS_GETPID);
-    let tid = syscall0(SYS_GETTID);
-    if pid <= 0 || tid <= 0 {
-        return Err(EACCES);
-    }
-    // One absolute end instant for the whole snapshot transaction. vfsd checks
-    // the same instant before it starts bulk work and again before it replies,
-    // so a provider that has already lost the race declines instead of
-    // replying into an abandoned reply capability.
-    let deadline = AbsoluteDeadline::after(
-        rustos_svc_runtime::syscall::monotonic_nanos(),
-        EXECUTABLE_SNAPSHOT_HARD_LIMIT_MS.saturating_mul(NANOS_PER_MILLI),
-    );
-    let mut request = VfsExecutableSnapshotRequest {
-        requester_pid: pid as u64,
-        requester_tid: tid as u64,
-        target_pid,
-        dirfd,
-        max_bytes: ELF_MAX_SNAPSHOT_BYTES,
-        path_len: path.len() as u32,
-        deadline_ns: deadline.end_ns(),
-        ..VfsExecutableSnapshotRequest::default()
-    };
-    request.path[..path.len()].copy_from_slice(path.as_bytes());
-
-    let mut response = VfsExecutableSnapshotResponse::default();
-    let mut received_fd = [0_u64; 1];
-    let mut received_fd_count = 0_u16;
-    let args = IpcCallWithHandlesArgs {
-        endpoint: endpoint as u64,
-        request_ptr: (&request as *const VfsExecutableSnapshotRequest) as u64,
-        request_len: size_of::<VfsExecutableSnapshotRequest>() as u64,
-        reply_ptr: (&mut response as *mut VfsExecutableSnapshotResponse) as u64,
-        reply_capacity: size_of::<VfsExecutableSnapshotResponse>() as u64,
-        send_fds_ptr: 0,
-        send_fd_count: 0,
-        recv_fd_capacity: 1,
-        reserved0: 0,
-        recv_fds_ptr: received_fd.as_mut_ptr() as u64,
-        recv_fd_count_ptr: (&mut received_fd_count as *mut u16) as u64,
-    };
-    trace_line(&format!(
-        "loaderd: executable snapshot call begin exec={path} timeout_ms={EXECUTABLE_SNAPSHOT_HARD_LIMIT_MS}"
-    ));
-    // The call timeout is the remaining budget, never a fresh full one: this
-    // is the only site that owns the transaction's end instant.
-    let Ok(call_timeout_ms) = deadline.child_timeout_ms(
-        rustos_svc_runtime::syscall::monotonic_nanos(),
-        EXECUTABLE_SNAPSHOT_HARD_LIMIT_MS,
-    ) else {
-        debug_line(&format!(
-            "loaderd: executable snapshot budget expired before the call exec={path}"
-        ));
-        return Err(ETIMEDOUT);
-    };
-    let status = unsafe {
-        rustos_svc_runtime::syscall::syscall2(
-            SYS_RUSTOS_IPC_CALL_WITH_HANDLES_BOUNDED,
-            (&args as *const IpcCallWithHandlesArgs) as u64,
-            call_timeout_ms,
-        )
-    };
-    if status < 0 {
-        debug_line(&format!(
-            "loaderd: executable snapshot call failed exec={path} errno={}",
-            -status
-        ));
-        return Err((-status) as i32);
-    }
-    trace_line(&format!(
-        "loaderd: executable snapshot call replied exec={path} bytes={status} handles={received_fd_count}"
-    ));
-    let close_received = |count: u16, fds: &[u64; 1]| {
-        for fd in fds.iter().take(usize::from(count).min(fds.len())) {
-            let _ = syscall1(SYS_CLOSE, *fd);
-        }
-    };
-    if status as usize != size_of::<VfsExecutableSnapshotResponse>()
-        || response.version != VFS_EXECUTABLE_SNAPSHOT_ABI_VERSION
-        || response.op != VFS_EXECUTABLE_SNAPSHOT_OP_OPEN
-        || response.reserved0 != 0
-    {
-        close_received(received_fd_count, &received_fd);
-        return Err(EINVAL);
-    }
-    if response.status != 0 {
-        close_received(received_fd_count, &received_fd);
-        return Err(response.status);
-    }
-    if received_fd_count != 1
-        || response.file_bytes == 0
-        || response.file_bytes > ELF_MAX_SNAPSHOT_BYTES
-        || response.mount_generation == 0
-        || response.resolved_path_len == 0
-        || response.resolved_path_len as usize > response.resolved_path.len()
-    {
-        close_received(received_fd_count, &received_fd);
-        return Err(EINVAL);
-    }
-    let resolved_path = match core::str::from_utf8(
-        &response.resolved_path[..response.resolved_path_len as usize],
-    ) {
-        Ok(path) => path,
-        Err(_) => {
-            close_received(received_fd_count, &received_fd);
-            return Err(EINVAL);
-        }
-    };
-    if !resolved_path.starts_with('/') || resolved_path.as_bytes().contains(&0) {
-        close_received(received_fd_count, &received_fd);
-        return Err(EINVAL);
-    }
-    let fd = i32::try_from(received_fd[0]).map_err(|_| {
-        close_received(received_fd_count, &received_fd);
-        EOVERFLOW
-    })?;
-    Ok(ImmutableFileSnapshot {
-        fd,
-        resolved_path: String::from(resolved_path),
-    })
+fn open_immutable_file_snapshot(path: &str, target_pid: u64, dirfd: u64) -> Result<ImmutableFileSnapshot, i32> {
+    let deadline = AbsoluteDeadline::after(rustos_svc_runtime::syscall::monotonic_nanos(),
+        EXECUTABLE_SNAPSHOT_HARD_LIMIT_MS * NANOS_PER_MILLI);
+    open_immutable_file_snapshot_until(path, target_pid, dirfd, deadline)
+}
+fn open_immutable_file_snapshot_until(path: &str, target_pid: u64, dirfd: u64, parent: AbsoluteDeadline) -> Result<ImmutableFileSnapshot, i32> {
+    let cap = rustos_svc_runtime::syscall::monotonic_nanos().saturating_add(EXECUTABLE_SNAPSHOT_HARD_LIMIT_MS * NANOS_PER_MILLI);
+    snapshot_client::open(path, target_pid, dirfd, AbsoluteDeadline::after(parent.end_ns().min(cap), 0))
 }
 
 fn close_fds(fds: &[i32]) {
