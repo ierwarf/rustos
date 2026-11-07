@@ -20,8 +20,8 @@ surfaces or sockets they expose.
 | `sessiond` | Session policy: focus, console session lifecycle, per-user resources. | Pairs with `runtimed`. |
 | `syscalld` | Linux MM/credential and selected signal policy via gated brokers; routine clocks use the local compat timer path. | `IPC_SERVICE_SYSCALLD`. |
 | `pagerd` | Backing-object and fault-policy service; anonymous faults are served in ring0, and file-backed fault dispatch is not yet live. | `IPC_SERVICE_PAGERD`. |
-| `vfsd` | Linux VFS policy (mount table, openat resolution, FAT boot volume). | `IPC_SERVICE_VFSD`. |
-| `loaderd` | Process spawn: ELF dynamic main+interpreter, PE32+ main + System32 imports, Windows runtime broker registration. | `IPC_SERVICE_LOADERD`. |
+| `vfsd` | Linux VFS policy (mount table, openat resolution, FAT boot volume), plus leased, owner-bound executable snapshots streamed into a sealed memfd without a whole-file buffer. | `IPC_SERVICE_VFSD`. |
+| `loaderd` | Process spawn: ELF dynamic main+interpreter, PE32+ main + System32 imports, Windows runtime broker registration. Large images are staged asynchronously (loader ABI v4 begin/poll/cancel work, explicit launch lease) before the serial image build. | `IPC_SERVICE_LOADERD`. |
 | Linux DVM | Linux driver lifecycle, DRM/KMS, evdev, and virtio-net. | Fixed RDI3/ivshmem transports. |
 | `devmgrd` | RustOS device namespace and hotplug policy. | `IPC_SERVICE_DEVMGRD`. |
 | `inputd` | Authenticated DVM input routing into Wayland and console clients. | Wayland seat + console focus. |
@@ -71,8 +71,8 @@ ELF, 그리고 staged registry에 한 줄을 함께 가집니다. 아래 표는 
 | `sessiond` | session policy: focus, console session lifecycle, per-user resource. | `runtimed`와 쌍. |
 | `syscalld` | Linux MM/credential 및 일부 signal 정책. 일반 clock 호출은 compat 내부 timer 경로. | `IPC_SERVICE_SYSCALLD`. |
 | `pagerd` | backing-object 및 fault 정책. anonymous fault는 ring0가 처리하며 file-backed dispatch는 아직 실사용 경로에 연결되지 않음. | `IPC_SERVICE_PAGERD`. |
-| `vfsd` | Linux VFS policy (mount table, openat resolution, FAT boot volume). | `IPC_SERVICE_VFSD`. |
-| `loaderd` | process spawn: ELF dynamic main+interpreter, PE32+ main + System32 import, Windows runtime broker 등록. | `IPC_SERVICE_LOADERD`. |
+| `vfsd` | Linux VFS policy (mount table, openat resolution, FAT boot volume)와 whole-file buffer 없이 sealed memfd로 스트리밍하는 lease·owner 결합 executable snapshot. | `IPC_SERVICE_VFSD`. |
+| `loaderd` | process spawn: ELF dynamic main+interpreter, PE32+ main + System32 import, Windows runtime broker 등록. 큰 image는 직렬 image build 전에 비동기로 staging합니다(loader ABI v4 begin/poll/cancel work, 명시적 launch lease). | `IPC_SERVICE_LOADERD`. |
 | Linux DVM | Linux driver lifecycle, DRM/KMS, evdev, virtio-net. | 고정 RDI3/ivshmem transport. |
 | `devmgrd` | RustOS device namespace와 hotplug policy. | `IPC_SERVICE_DEVMGRD`. |
 | `inputd` | 인증된 DVM input을 Wayland와 console client로 route. | Wayland seat + console focus. |

@@ -52,6 +52,7 @@ console_hosted = false
 | `c-demo` | Host C demo/smoke artifact. |
 | `winsys-dll-bundle` | Windows system DLL bundle. |
 | `asset-bundle` | Copies the `build.source` directory verbatim; only for `kind = "data"`, which requires `install.layout = "directory"`. |
+| `prebuilt-app` | Mirrors a local, package-relative prebuilt bundle; only for `kind = "app"` with `install.layout = "directory"`. Any desktop image must name a file inside the bundle, and the build fails if a named executable is absent. See [Add an App](../guides/add-app.md). |
 
 For `c-demo`, optional `build.extra_sources = ["registers.S"]` adds explicit
 package-relative translation units alongside `build.source`. Every unit and the
@@ -132,6 +133,7 @@ console_hosted = false
 | `c-demo` | host C demo/smoke artifact |
 | `winsys-dll-bundle` | Windows system DLL bundle |
 | `asset-bundle` | `build.source` 디렉터리를 그대로 복사. `kind = "data"` 전용이며 `install.layout = "directory"` 필요 |
+| `prebuilt-app` | package 상대 경로의 로컬 prebuilt bundle을 그대로 반영. `kind = "app"`과 `install.layout = "directory"` 전용이며 desktop image는 bundle 안의 파일이어야 하고, 지정한 실행 파일이 없으면 build가 실패합니다. [앱 추가](../guides/add-app.md) 참고 |
 
 `c-demo`의 `build.extra_sources = ["registers.S"]`는 package 상대 경로의 추가
 translation unit입니다. 모든 source와 manifest를 freshness 입력으로 검사합니다.

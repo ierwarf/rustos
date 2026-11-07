@@ -1,8 +1,24 @@
-# Session Handoff — 2026-11-05
+# Session Handoff — 2026-11-07
 
 Dated evidence, not instructions or proof of the current checkout. Resume with
 `git status --short`, `git log -1`, and the live request. `AGENTS.md` is the only
 stable repository prefix; use [task router](task-router.md) for owner contracts.
+
+## Current checkout (2026-11-07)
+
+`HEAD` is `2ec1257c` (storage streaming + manual Chrome packaging); the Chrome
+desktop import and harness maintenance below are committed, not pending. The
+only uncommitted source change is an IPC reply-wait fix in
+`kernel/compat/src/user/syscall/linux/ipc_ops.rs` and `ipc_ops/reply_wait.rs`:
+a refused `arm_block_current_task_on_reply` (a prior refused reply wake still
+owns the slot's publication phase) used to cancel with `InvalidArm` and return a
+spurious `EINVAL`. The waiter now yields and retries up to
+`MAX_TRANSIENT_ARM_REFUSALS` (256) inside the deadline; the fast call rolls back
+and falls through to the slow path (`FallbackDeadlineArm`). Contract text is in
+`abi/ipc.md` (IPC reply-wait). **Unverified:** no compile, native test, formal
+or KVM run covers this change yet; the 256 bound is a judgement, not measured.
+Docs refreshed in the same pass: services table, `prebuilt-app` builder,
+xtask `kvm-smoke` option summary, CHANGELOG.
 
 ## Large-file I/O steps 1–3 (implemented and locally verified)
 
@@ -151,7 +167,7 @@ rename/delete rules still require an OS object/sharing layer. The plan now
 records this comparison and links. Research: `build/fat-port-research/`.
 No FAT replacement, code port, dependency update or new runtime validation ran.
 
-## Chrome desktop import (integrated, uncommitted; base `c1f4badc`)
+## Chrome desktop import (committed in `2ec1257c`; base `c1f4badc`)
 
 User asks to put Chrome on uiserver's desktop, **not** launch it on boot.
 Imported official amd64 157.0.8103.38-1 into ignored `apps/chrome/bundle/`

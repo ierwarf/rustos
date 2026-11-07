@@ -29,6 +29,10 @@ use super::*;
 /// same one.
 const POLLS_PER_WAIT_TURN: u32 = rustos_user_abi::performance::IPC_REPLY_WAIT_POLLS_PER_TURN;
 
+/// Yielded retries of a refused reply-wait arm before the refusal is treated
+/// as permanent (no Current bank, terminal owner) and reported as `EINVAL`.
+pub(super) const MAX_TRANSIENT_ARM_REFUSALS: u32 = 256;
+
 pub(super) fn wait_for_reply_with_deadline(
     reply: KernelReplyHandle,
     handle_capacity: usize,
@@ -36,6 +40,7 @@ pub(super) fn wait_for_reply_with_deadline(
 ) -> Result<(Vec<u8>, Vec<KernelTransferredHandle>), i64> {
     let caller_task_id = multitask::current_task_id().ok_or(LINUX_EINVAL)?;
     let mut cycle_mark = phase_mark();
+    let mut arm_refusals = 0_u32;
     loop {
         // One turn of this loop polls the response queue exactly twice: once
         // before the block is armed and once after, which is the race fix. A
@@ -89,6 +94,17 @@ pub(super) fn wait_for_reply_with_deadline(
         }
         cycle_mark = phase_mark();
         if !multitask::arm_block_current_task_on_reply(reply.raw()) {
+            // A previous refused reply wake can still own this slot's
+            // publication phase (its retry runs at a scheduler entry), and
+            // that refuses every arm until it settles. The request is already
+            // enqueued, so cancelling here turned a transient race into a
+            // spurious EINVAL for the caller; yield so the publication
+            // settles and let the deadline sample at the top bound the retry.
+            arm_refusals += 1;
+            if arm_refusals <= MAX_TRANSIENT_ARM_REFUSALS {
+                multitask::yield_now();
+                continue;
+            }
             cancel_reply_wait(reply, caller_task_id, ReplyCancelReason::InvalidArm);
             return Err(LINUX_EINVAL);
         }

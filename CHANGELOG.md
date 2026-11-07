@@ -17,6 +17,19 @@ short; detailed design and API notes live in `docs/`.
 
 ### Changed
 
+- Executable images larger than the old 128 MiB cap load through leased,
+  owner-bound snapshots: `storage-core::file_io` range maps, a vendored and
+  patched `rust-fatfs`, incremental sealed-memfd streaming in `vfsd`, and
+  asynchronous staging in `loaderd` (loader ABI v4). Local prebuilt apps use
+  the new `prebuilt-app` builder; Chrome is a visible manual desktop entry,
+  never an autostart.
+- Reply-bound socket publication, accept4 flags, netd accounting workers,
+  occlusion-aware atlas fragments and unified console/Wayland stacking landed.
+- A refused IPC reply-wait arm now yields and retries within the deadline
+  instead of failing the caller with a spurious `EINVAL`.
+- Developer harness cleanup: dev-plan routing, KVM snapshot/recovery fixes,
+  read/edit hook path resolution, and refreshed owner docs.
+
 - Human onboarding and AI handoff docs now distinguish implemented virtual-DVM
   relays from unverified physical-device release paths, and remove stale
   build-machine anecdotes and contradictory fallback instructions.

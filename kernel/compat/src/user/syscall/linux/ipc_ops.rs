@@ -1620,13 +1620,20 @@ fn try_fast_ipc_call_bytes<const N: usize>(
     note_fast_ipc(IpcFastCounter::ReservationPublished);
 
     if !multitask::arm_block_current_task_on_reply(reply.raw()) {
-        if rollback_fast_call(endpoint, reply, task_id, receiver_task_id)?
-            == FastRollback::ReceiverOwnsRequest
-        {
-            // The server is executing the request; nobody can wait for its
-            // answer, so cancel it exactly as the slow path does.
-            bind_or_cancel_receiver_owned_reservation(reply, task_id, receiver_task_id);
-            cancel_reply_wait(reply, task_id, ReplyCancelReason::InvalidArm);
+        match rollback_fast_call(endpoint, reply, task_id, receiver_task_id)? {
+            // Nothing was published: the slow path re-arms with its own
+            // bounded retry instead of failing the caller on a transient
+            // refusal.
+            FastRollback::RolledBack => {
+                note_fast_ipc(IpcFastCounter::FallbackDeadlineArm);
+                return Ok(None);
+            }
+            FastRollback::ReceiverOwnsRequest => {
+                // The server is executing the request; nobody can wait for its
+                // answer, so cancel it exactly as the slow path does.
+                bind_or_cancel_receiver_owned_reservation(reply, task_id, receiver_task_id);
+                cancel_reply_wait(reply, task_id, ReplyCancelReason::InvalidArm);
+            }
         }
         return Err(LINUX_EINVAL);
     }
@@ -1805,6 +1812,7 @@ fn collect_inline_reply<const N: usize>(
             );
         }
     }
+    let mut arm_refusals = 0_u32;
     loop {
         for armed in [false, true] {
             let take = observe_inline_reply(deadline_tick, crate::arch::rtc::ticks, || {
@@ -1836,6 +1844,12 @@ fn collect_inline_reply<const N: usize>(
             }
             if !armed {
                 if !multitask::arm_block_current_task_on_reply(reply.raw()) {
+                    // Transient: see `wait_for_reply_with_deadline`.
+                    arm_refusals += 1;
+                    if arm_refusals <= reply_wait::MAX_TRANSIENT_ARM_REFUSALS {
+                        multitask::yield_now();
+                        break;
+                    }
                     cancel_reply_wait(reply, task_id, ReplyCancelReason::InvalidArm);
                     return Err(LINUX_EINVAL);
                 }

@@ -51,6 +51,17 @@ cargo xtask verify-dvm
 cargo xtask kvm-smoke --expect 'runtimed: bootstrap ui done'
 ```
 
+`cargo xtask kvm-smoke --help` is the authoritative option list. Beyond the
+proof-selection flags above it carries opt-in lanes: `--exercise-input`,
+`--exercise-network`, `--exercise-google-ping`, `--oom-hog*`,
+`--job-policy-probe`, `--proc-stress`, `--release-stage-probe`,
+`--ipcbench-probe <name>` (restrict the `ipcbench` harness to one probe),
+`--expect-dvm <marker>` (extra Linux-DVM serial marker), `--min-ui-fps`,
+`--recovery-probe`, `--smp-iteration`, `--storage-dvm-only` and `--repeat <n>`
+(1..=64 boots reporting a pass rate). Probe lanes need the matching
+`RUSTOS_*` build switches named in the help text and are off by default.
+Option values cannot start with `--`; prefix such paths with `./`.
+
 Runtime device requirements are listed in
 [getting started](../getting-started.md#kvm-parallel-boot-smoke): QEMU,
 read/write KVM/vhost-vsock, and the virtual display's exact AMDGPU render-node
@@ -159,6 +170,16 @@ cargo xtask build
 cargo xtask verify-dvm
 cargo xtask kvm-smoke --expect 'runtimed: bootstrap ui done'
 ```
+
+`cargo xtask kvm-smoke --help`가 옵션의 기준 목록입니다. 위의 proof 선택 flag 외에
+선택적 lane으로 `--exercise-input`, `--exercise-network`,
+`--exercise-google-ping`, `--oom-hog*`, `--job-policy-probe`, `--proc-stress`,
+`--release-stage-probe`, `--ipcbench-probe <name>`(`ipcbench` harness를 한 probe로
+제한), `--expect-dvm <marker>`(추가 Linux-DVM serial marker), `--min-ui-fps`,
+`--recovery-probe`, `--smp-iteration`, `--storage-dvm-only`,
+`--repeat <n>`(1~64회 부팅 후 통과율 보고)이 있습니다. probe lane은 help에 적힌
+`RUSTOS_*` build 스위치가 필요하며 기본값은 꺼짐입니다. 옵션 값은 `--`로 시작할 수
+없으므로 그런 경로는 `./`를 앞에 붙입니다.
 
 실행 장치 조건은 [시작 안내](../getting-started.md#kvm-병렬-부팅-smoke)를 따릅니다:
 QEMU, read/write KVM/vhost-vsock, 가상 display용 정확한 AMDGPU render-node

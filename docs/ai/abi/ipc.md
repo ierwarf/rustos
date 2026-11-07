@@ -115,6 +115,16 @@ REPLY_RECV completions carry exact reply/context custody into the same deferred
 settlement-and-receive path. Handle-bearing operations retain their owning
 transfer cleanup; remote peers retain remote wake/IPI scheduling.
 
+A refused reply-wait arm is not by itself a permanent failure. A previous
+refused reply wake can still own the slot's publication phase until its retry
+runs at a scheduler entry, and every arm is refused meanwhile. The request is
+already enqueued, so the waiter yields and re-samples the deadline instead of
+cancelling; the fast-call path rolls back and falls through to this bounded
+retry (`FallbackDeadlineArm`). Only after `MAX_TRANSIENT_ARM_REFUSALS` (256)
+yielded retries is the refusal treated as permanent (no Current bank, terminal
+owner), cancelled as `InvalidArm` and reported as `EINVAL`. A fast call whose
+receiver already owns the request still cancels exactly as the slow path does.
+
 The typed `ipc::{call,recv_with_sender,reply,reply_recv_with_sender}` helpers
 select pure registers when the exact shape fits, through
 `libs/rustos-svc-runtime/src/ipc/fastcall.rs`. Receive capacity must be
