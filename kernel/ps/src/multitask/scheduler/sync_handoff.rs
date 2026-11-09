@@ -791,6 +791,10 @@ pub(super) fn model_len(cpu: usize) -> usize {
 pub(super) fn reset_all_cpus() {
     for (cpu, state) in SYNC_HANDOFFS.iter().enumerate() {
         *state.lock() = SyncHandoffState::new();
+        // ORDERING: the advertisement is cleared after the FIFO it describes is
+        // empty, under no producer: a reset that left it set would report work
+        // for a queue that no longer holds any.
+        SYNC_HANDOFF_PENDING[cpu].store(false, core::sync::atomic::Ordering::Release);
         // ORDERING: Reset publishes the cleared CPU-local streak after the
         // protected FIFO state is empty; subsequent relaxed local accesses
         // cannot revive a pre-reset fairness debt.
@@ -805,6 +809,16 @@ mod tests {
         MAX_SYNC_HANDOFF_CHAIN_TICKS, ReplyWakeHandoff, SyncHandoffRecord, SyncHandoffState,
         runqueue,
     };
+
+    #[test]
+    fn reset_withdraws_the_pending_advertisement_with_the_fifo() {
+        let _fixture = super::super::tests::boxed_scheduler();
+        assert!(super::enqueue(0, SyncHandoffRecord::new(5, 7)));
+        assert!(super::pending(0));
+        super::reset_all_cpus();
+        assert!(!super::pending(0), "a reset FIFO must not still advertise work");
+        assert_eq!(super::model_len(0), 0);
+    }
 
     #[test]
     fn cpu_handoff_words_have_separate_cache_lines() {

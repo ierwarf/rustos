@@ -108,6 +108,7 @@ impl WaylandState {
         state.current_buffer = None;
         state.content_version = next_content_version(state.content_version);
         state.pending_buffer = None;
+        self.abandon_commits(&mut state);
         let pending_releases = state.pending_buffer_releases.drain(..).collect::<Vec<_>>();
         state.pending_callbacks.clear();
         state.on_output = false;

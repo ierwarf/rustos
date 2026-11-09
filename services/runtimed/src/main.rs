@@ -264,7 +264,16 @@ fn main() {
     };
 
     let mut state = BrokerState::default();
-    let mut runtime_connections = socket::RuntimeConnections::default();
+    // The listener moves to its own thread: its syscalls can take a whole IPC
+    // deadline when netd stalls, and this loop also serves the session endpoint.
+    let mut runtime_connections = match socket::RuntimeConnections::with_acceptor(listener) {
+        Ok(connections) => connections,
+        Err(errno) => {
+            spawn::debug_line("runtimed: fatal control acceptor thread failed");
+            boot_line(&format!("runtimed: fatal control acceptor thread failed errno={errno}"));
+            return;
+        }
+    };
     let _ = ensure_ui_bootstrap(&mut state);
     let mut pass = LoopPassTiming::default();
     let mut service_health = heartbeat::Heartbeat::new();
@@ -326,7 +335,7 @@ fn main() {
         // the first desktop launch after the catalog-ready transition.
         did_work |= socket::ensure_policy_launches(&mut state);
         pass.mark(LoopPhase::PolicyLaunches);
-        did_work |= socket::service_listener(&listener, &mut runtime_connections, &mut state);
+        did_work |= socket::service_listener(&mut runtime_connections, &mut state);
         pass.mark(LoopPhase::Listener);
         if did_work {
             pass.report_if_slow("busy");

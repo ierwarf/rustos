@@ -1368,15 +1368,16 @@ ordered(body(lane, 'finish'), ['funding_label(to.slot, to.id)', 'can_forward(', 
     'publish_blocked(cpu, from.slot, rsp)', 'lane_install(', 'note_installed(', 'cpu_local::lane_publish(',
     'lane_install_placement(', 'complete(cpu, from.slot'],
     'lane claim CAS is the point of no return; every move after it is infallible')
-ordered(body(resident_source, 'park'), ['cell.pin.store(', 'cell.permit.store(',
-    'cell.generation.swap(generation, Ordering::SeqCst)',
-    'runqueue::owner(slot)', 'take(slot, generation)'],
-    'a parked cell is published before the owner re-read that revokes it')
-ordered(body(resident_source, 'take'), ['compare_exchange(generation, DRAINING', 'cell.drain()'],
-    'the generation swap decides who owns the parked loans')
+ordered(body(resident_source, 'park'), ['claim_empty(cell, generation)', 'cell.pin.store(',
+    'cell.permit.store(', 'cell.generation.swap(generation, Ordering::SeqCst)',
+    'runqueue::owner_sequenced(slot)', 'take(slot, generation)'],
+    'a parked cell is claimed, filled, published, and only then re-checked against the owner')
+ordered(body(resident_source, 'take'), ['compare_exchange(generation, BUSY', 'cell.drain()',
+    'cell.generation.store(0, Ordering::Release)'],
+    'the generation CAS decides who owns the parked loans and the word frees only after the payload read')
 runq = (base / 'runqueue.rs').read_text()
-ordered(body(runq, 'compare_exchange'), ['self.compare_exchange_raw(expected, next)?',
-    'expected.generation != next.generation', 'resident::on_owner_transition(self.slot(), expected.generation)'],
+ordered(body(runq, 'compare_exchange'), ['next.generation > expected.generation',
+    'self.compare_exchange_raw(expected, next)?', 'resident::on_owner_transition(self.slot(), expected.generation)'],
     'every owner transition out of a generation revokes its parked cell')
 ordered(body(cpu_source, 'commit_context_switch_at_rsp'), ['LANE_ACK_FROM[logical_index].load(',
     'TRANSITION_ACTIVE[logical_index].store(false', 'resident::commit_outgoing_lane(',

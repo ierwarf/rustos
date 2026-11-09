@@ -1290,4 +1290,6 @@ mod tests {
     include!("budget_dispatch_tests.rs");
     include!("smp_qualification_tests.rs");
     include!("pager_fault_tests.rs");
+    include!("scheduler_owner_word_tests.rs");
+    include!("scheduler_resident_cell_tests.rs");
 }

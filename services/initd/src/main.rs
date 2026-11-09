@@ -60,6 +60,7 @@ mod scheduling_context;
 use scheduling_context::request_scheduling_context_authority;
 mod boot_order;
 mod bootstrap_barrier;
+mod endpoint_admission;
 
 use activation::activate_pending_services;
 use boot_order::{init_exec_priority, requires_immediate_activation_after_spawn};
@@ -563,10 +564,16 @@ fn admit_running_service_endpoint(
             )
         })
         .unwrap_or_else(|| fail_closed(&format!("initd: endpoint barrier lost pid={pid}")));
-    if let Err(err) = wait_reported_service_endpoint(exec.as_str(), pid) {
+    if let Err(failure) = wait_reported_service_endpoint(exec.as_str(), pid) {
         fail_closed_after_child_cleanup(
             pid,
-            &format!("initd: fatal service endpoint not ready exec={exec} pid={pid} errno={err}"),
+            &format!(
+                "initd: fatal service endpoint not ready exec={exec} pid={pid} errno={} cause={} waited_ms={} slices={}",
+                failure.errno,
+                failure.cause.label(),
+                failure.waited_ms,
+                failure.slices
+            ),
         );
     }
     let service = running
@@ -701,8 +708,42 @@ fn report_rootd_service_lease(exec_path: &str, pid: i32) -> Result<(), i32> {
     }
 }
 
-fn wait_reported_service_endpoint(exec_path: &str, pid: i32) -> Result<(), i32> {
-    wait_reported_service_endpoint_with_timeout(exec_path, pid, IPC_BOOT_CONTROL_HARD_LIMIT_MS)
+/// Wait for `(service, pid)` to publish its endpoint within the typed
+/// admission budget. Each kernel wait is one bounded slice; a slice that times
+/// out is logged and the wait continues until `EndpointAdmission` reaches a
+/// terminal verdict. The caller stays fail-closed on `Err`.
+fn wait_reported_service_endpoint(
+    exec_path: &str,
+    pid: i32,
+) -> Result<(), endpoint_admission::Failure> {
+    use endpoint_admission::{EndpointAdmission, Step};
+    let started = Instant::now();
+    let mut admission = EndpointAdmission::new();
+    let mut step = admission.start();
+    loop {
+        let (timeout_ms, pause_ms) = match step {
+            Step::Ready => return Ok(()),
+            Step::Failed(failure) => return Err(failure),
+            Step::Wait {
+                timeout_ms,
+                pause_ms,
+            } => (timeout_ms, pause_ms),
+        };
+        if pause_ms != 0 {
+            std::thread::sleep(Duration::from_millis(pause_ms));
+        }
+        let result = wait_reported_service_endpoint_with_timeout(exec_path, pid, timeout_ms);
+        let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        if let Err(errno) = result {
+            if errno == libc::ETIMEDOUT {
+                boot_line(&format!(
+                    "initd: endpoint wait pending exec={exec_path} pid={pid} slice={} waited_ms={elapsed_ms}",
+                    admission.slices()
+                ));
+            }
+        }
+        step = admission.on_slice(result, elapsed_ms);
+    }
 }
 
 fn wait_reported_service_endpoint_with_timeout(

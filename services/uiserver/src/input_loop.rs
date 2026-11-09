@@ -21,9 +21,6 @@ const INPUT_READER_QUEUE_CAPACITY: usize = INPUT_EVENT_BATCH * 64;
 const INPUT_READER_WATCHDOG_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
 const INPUT_READER_PANIC_THRESHOLD_MS: u64 = 3_000;
 const MAX_INITIAL_INPUT_DROP_LOGS: u64 = 8;
-const INPUT_WAITSET_RETRY_BACKOFF: Duration = Duration::from_millis(10);
-const INPUT_WAITSET_STARTUP_BUDGET: Duration =
-    Duration::from_millis(rustos_user_abi::performance::IPC_BOOT_CONTROL_HARD_LIMIT_MS);
 
 pub(crate) struct InputReader {
     receiver: Receiver<InputEvent>,
@@ -241,34 +238,16 @@ fn retryable_input_waitset_error(errno: i32) -> bool {
     matches!(errno, libc::ETIMEDOUT | libc::EAGAIN | libc::EINTR)
 }
 
-fn create_input_wait_epoll(input_fds: &[OwnedFd]) -> Result<OwnedFd, i32> {
-    let deadline = Instant::now() + INPUT_WAITSET_STARTUP_BUDGET;
-    loop {
-        match create_input_wait_epoll_once(input_fds) {
-            Ok(epoll) => return Ok(epoll),
-            Err(errno) if retryable_input_waitset_error(errno) && Instant::now() < deadline => {
-                // Each persistent mutation retains its independent 100 ms
-                // reconciliation rail in compat. Boot owns a larger bounded
-                // recovery window so a single-threaded userspace server that
-                // is completing an earlier request cannot turn transient head-
-                // of-line delay into permanent loss of the display service.
-                thread::sleep(INPUT_WAITSET_RETRY_BACKOFF);
-            }
-            Err(errno) => return Err(errno),
-        }
-    }
-}
-
+/// Start the input reader and return immediately.
+///
+/// The persistent epoll registration crosses compat and can wait a whole IPC
+/// deadline per attempt under CPU contention. It therefore runs on the reader
+/// thread under the `Input` dependency's owned retry policy
+/// ([`crate::startup::Dependency::policy`]); the UI thread keeps bringing up
+/// Wayland, the boot frame and the first present meanwhile. A registration that
+/// exhausts its budget is published as `readiness state=failed cause=input`
+/// and the UI loop exits with that errno instead of dying silently mid-boot.
 pub(crate) fn start_input_reader(input_fds: Vec<OwnedFd>) -> Result<InputReader, i32> {
-    let input_wait_epoll = create_input_wait_epoll(&input_fds).map_err(|errno| {
-        // This is a synchronous boot-terminal diagnostic. The normal
-        // observability worker may not run again when persistent epoll
-        // creation or registration exhausts its bounded service deadline.
-        crate::sys::debug_line(&format!(
-            "uiserver: startup failed stage=input-waitset-create errno={errno}"
-        ));
-        errno
-    })?;
     let (sender, receiver) = mpsc::sync_channel::<InputEvent>(INPUT_READER_QUEUE_CAPACITY);
     let wake_generation = Arc::new(AtomicU64::new(0));
     let shared_wake_sender = UiWakeSender {
@@ -280,6 +259,25 @@ pub(crate) fn start_input_reader(input_fds: Vec<OwnedFd>) -> Result<InputReader,
     let reader_stats = Arc::clone(&stats);
     spawn_ui_thread(UiThreadRole::Protocol, "uiserver-input-reader", move || {
         boot_line("uiserver: input reader worker enter");
+        let startup = crate::startup::global();
+        let input_wait_epoll = match startup.drive(
+            crate::startup::Dependency::Input,
+            retryable_input_waitset_error,
+            || create_input_wait_epoll_once(&input_fds),
+        ) {
+            Ok(epoll) => epoll,
+            Err(errno) => {
+                // Synchronous boot-terminal diagnostic: the normal
+                // observability worker may not run again once the registration
+                // has spent its budget.
+                crate::sys::debug_line(&format!(
+                    "uiserver: startup failed stage=input-waitset-create errno={errno}"
+                ));
+                reader_wake_sender.signal();
+                return;
+            }
+        };
+        startup.succeed(crate::startup::Dependency::Input);
         let mut events = [InputEvent::default(); INPUT_EVENT_BATCH];
         let mut readiness = [libc::epoll_event { events: 0, u64: 0 }; 8];
         let mut first_read = true;
@@ -707,7 +705,7 @@ pub(crate) fn sleep_until_input_or(
 #[cfg(test)]
 mod tests {
     use super::{
-        create_input_wait_epoll, InputReader, InputReaderBatchCoalescer, InputReaderStats,
+        create_input_wait_epoll_once, InputReader, InputReaderBatchCoalescer, InputReaderStats,
         UiWakeSender, INPUT_EVENT_BATCH,
     };
     use crate::sys::{
@@ -727,11 +725,12 @@ mod tests {
         assert!(super::retryable_input_waitset_error(libc::EINTR));
         assert!(!super::retryable_input_waitset_error(libc::EINVAL));
         assert!(!super::retryable_input_waitset_error(libc::ENODEV));
-        assert_eq!(
-            super::INPUT_WAITSET_STARTUP_BUDGET,
-            Duration::from_millis(rustos_user_abi::performance::IPC_BOOT_CONTROL_HARD_LIMIT_MS)
-        );
-        assert!(super::INPUT_WAITSET_RETRY_BACKOFF < super::INPUT_WAITSET_STARTUP_BUDGET);
+        // The owned budget must outlast several worst-case IPC deadlines.
+        let policy = crate::startup::Dependency::Input.policy();
+        let one_call =
+            Duration::from_millis(rustos_user_abi::performance::IPC_BOOT_CONTROL_HARD_LIMIT_MS);
+        assert!(policy.total_budget >= one_call * 6);
+        assert!(policy.initial_backoff < one_call);
     }
 
     fn event(kind: u16, value0: i32, value1: i32) -> InputEvent {
@@ -865,7 +864,7 @@ mod tests {
         let read_fd = unsafe { OwnedFd::from_raw_fd(pipe_fds[0]) };
         let write_fd = unsafe { OwnedFd::from_raw_fd(pipe_fds[1]) };
         let input_fds = [read_fd];
-        let epoll = create_input_wait_epoll(&input_fds).expect("epoll input wait");
+        let epoll = create_input_wait_epoll_once(&input_fds).expect("epoll input wait");
 
         let byte = [1_u8];
         assert_eq!(

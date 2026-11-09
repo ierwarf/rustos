@@ -2,13 +2,17 @@
 //! Boundary: one cell per slot, valid only for the owner generation it names.
 //! Lifecycle: park at the ACK of a blocking return -> taken by the lane CAS, or
 //! evicted by ANY other owner-word transition of that generation.
-//! Concurrency: `generation` is the cell's single publication word; whoever
-//! swaps it to `DRAINING` (taker or evictor) owns the loans, so there is no double
-//! drop, and the word returns to zero only after the payload has been read, so a
-//! parker never overwrites a payload an evictor is still reading.
-//! Failure: a park racing a wake re-reads the owner after publishing and evicts itself.
+//! Concurrency: `generation` is the cell's single ownership word: `0` empty, a
+//! generation published, `BUSY` while one CPU moves the payload. Every payload
+//! access follows a winning CAS of that word, so there is no double drop and a
+//! payload is never written while another CPU reads it. Nobody ever waits for
+//! `BUSY`: a parker that finds the cell busy, or already holding a newer
+//! generation, just releases its loans (the task stays non-resident), so no lock
+//! order, IRQ state or stalled vCPU can make this protocol block.
+//! Failure: a park racing a wake re-reads the owner after publishing and evicts itself;
+//! a late revoking hook finds its older generation gone and does nothing.
 //! Forbidden: reading the cell without the generation CAS, parking a non-Blocked
-//! task, or letting a cell outlive its generation.
+//! task, waiting on `BUSY`, or letting a cell outlive its generation.
 //! Evidence: native residency witnesses in `irq_entry_tests/{switch,lane}.rs`;
 //! ordering is argued here, not modeled in TLA+.
 use super::{return_architecture::ArchitectureState, runqueue, stack_resources::StackPin};
@@ -33,11 +37,11 @@ struct Cell {
     permit: AtomicUsize,
     saved_rsp: AtomicUsize,
     cpu: AtomicUsize,
-    /// Written only by the parker before it publishes `generation`, read only by
-    /// the unique winner of the generation swap.
+    /// Written only by the parker that holds the cell `BUSY`, read only by the
+    /// unique winner of the generation CAS.
     arch: UnsafeCell<Option<ArchitectureState>>,
 }
-// SAFETY: `arch` is accessed only under the generation-word ownership above.
+// SAFETY: `arch` is accessed only while the accessor owns the generation word (`BUSY`).
 unsafe impl Sync for Cell {}
 impl Cell {
     const fn new() -> Self {
@@ -50,98 +54,105 @@ impl Cell {
             arch: UnsafeCell::new(None),
         }
     }
-    /// Caller won the generation swap, so the payload is exclusively theirs.
+    /// Caller holds the cell `BUSY` after a winning CAS, so the payload is exclusively theirs.
     fn drain(&self) -> Loans {
-        // ORDERING: the winning Acquire swap of `generation` orders these loads
-        // after the parker's Release store of the same word.
-        // Winning the generation swap made the payload exclusively ours; `park`
-        // overwrites it before the next publication, so no clearing exchange is needed.
+        // ORDERING: the winning Acquire CAS of `generation` orders these loads
+        // after the parker's publication of the same word.
+        // Winning the cell made the payload exclusively ours; `park` overwrites it
+        // before the next publication, so no clearing exchange is needed.
         let pin = self.pin.load(Ordering::Relaxed);
         let permit = self.permit.load(Ordering::Relaxed);
         Loans {
             pin: StackPin::from_raw(pin),
             permit: ExecutionPermit::take(permit).expect("resident cell lost its permit"),
             saved_rsp: self.saved_rsp.load(Ordering::Relaxed),
-            // SAFETY: the winning generation swap gives this caller exclusive access.
+            // SAFETY: the winning generation CAS gives this caller exclusive access.
             arch: unsafe { (*self.arch.get()).take() }.expect("resident cell lost its architecture"),
             cpu: self.cpu.load(Ordering::Relaxed),
         }
     }
 }
 
-/// Published by the winner of a take while it reads the payload out. Larger than
-/// any owner generation (those are packed below 2^64 >> shift), so it never
-/// equals a live generation.
-const DRAINING: u64 = u64::MAX;
+/// Cell word while one CPU owns the payload: a park filling it, or a take or
+/// eviction draining it. Larger than any owner generation (those are packed below
+/// 2^64 >> shift), so it never equals a live generation.
+const BUSY: u64 = u64::MAX;
 
 static CELLS: [CachePadded<Cell>; super::MAX_TASK] =
     [const { CachePadded::new(Cell::new()) }; super::MAX_TASK];
 
 /// Park `loans` for `generation`. The loans are consumed either way: when the
-/// owner already left that generation they are released here, outside any leaf.
+/// owner already left that generation, or the cell is not available, they are
+/// released here, outside any leaf. Returns whether the cell is still parked.
 pub(super) fn park(slot: usize, generation: u64, loans: Loans) -> bool {
     let cell = &CELLS[slot];
-    settle_stale_cell(slot, cell, generation);
+    if !claim_empty(cell, generation) {
+        return false;
+    }
     let Loans { pin, permit, saved_rsp, arch, cpu } = loans;
     cell.pin.store(pin.into_raw(), Ordering::Relaxed);
     cell.permit.store(permit.park(), Ordering::Relaxed);
     cell.saved_rsp.store(saved_rsp, Ordering::Relaxed);
     cell.cpu.store(cpu, Ordering::Relaxed);
-    // SAFETY: the cell is empty (settled above), so no taker can observe it
-    // before the Release store of `generation` below.
+    // SAFETY: `claim_empty` left the cell `BUSY` and ours, so no taker can read it
+    // and no other parker can write it before the swap below publishes it.
     unsafe { *cell.arch.get() = Some(arch) };
-    // ORDERING: the SeqCst exchange publishes the payload and, as a full barrier,
-    // pairs with the SeqCst owner CAS so either the evictor's hook sees this
-    // generation or our re-read below sees the evictor's new owner word (never
-    // both missed). One locked exchange where a store and a separate fence were.
+    // ORDERING: the SeqCst swap publishes the payload and, as a full barrier,
+    // pairs with the SeqCst owner CAS and the SeqCst hook load so either the
+    // evictor's hook sees this generation or our re-read below sees the evictor's
+    // new owner word (never both missed).
     let previous = cell.generation.swap(generation, Ordering::SeqCst);
-    debug_assert_eq!(previous, 0, "resident cell parked over live loans");
-    let owner = runqueue::owner(slot);
+    assert_eq!(previous, BUSY, "resident cell lost its fill claim");
+    let owner = runqueue::owner_sequenced(slot);
     if owner.generation == generation && owner.state == runqueue::RunOwnerState::Blocked {
         return true;
     }
-    // The owner moved on between the ACK and publication. Whoever swaps the
-    // word to zero owns the loans; if the hook got there first they are gone.
+    // The owner moved on between the ACK and publication. Whoever wins the cell
+    // owns the loans; if the hook got there first they are gone.
     drop(take(slot, generation));
     false
 }
 
 /// Win the cell for `generation`, or `None` if it is empty or evicted.
 pub(super) fn take(slot: usize, generation: u64) -> Option<Loans> {
+    assert!(generation != 0 && generation != BUSY, "resident take of a non-generation");
     let cell = &CELLS[slot];
     cell.generation
-        .compare_exchange(generation, DRAINING, Ordering::AcqRel, Ordering::Acquire)
+        .compare_exchange(generation, BUSY, Ordering::AcqRel, Ordering::Acquire)
         .ok()?;
     let loans = cell.drain();
-    // ORDERING: Release orders the payload reads in `drain` before the cell can
-    // be reused; `settle_stale_cell` observes zero with Acquire.
+    // ORDERING: Release orders the payload reads in `drain` before any parker can
+    // claim the empty cell (its claim CAS is Acquire).
     cell.generation.store(0, Ordering::Release);
     Some(loans)
 }
 
-/// Leaves `cell` empty for a park of `generation`.
+/// Makes `cell` `BUSY` and empty for a park of `generation`, or reports that it
+/// cannot be had right now (then the parker gives its loans up).
 ///
-/// An owner transition revokes the cell of the generation it leaves, but the
-/// revoking hook runs after that transition's CAS. If the hook's CPU is delayed
-/// (an interrupt, or a descheduled vCPU) the task can already have been woken,
-/// run and blocked again, so the cell of an older generation is still published
-/// when the new park arrives. That is not a bug in either party: whoever takes
-/// the word owns the loans, so retire the stale cell here and the late hook
-/// finds nothing. A cell that another CPU is draining is waited out, because
-/// overwriting its payload would corrupt that read.
-fn settle_stale_cell(slot: usize, cell: &Cell, generation: u64) {
-    let mut spins = 0_u64;
+/// Two parks of one slot overlap only when the first is delayed between its RSP
+/// ACK and its publication (a descheduled vCPU) while the task, already woken,
+/// runs elsewhere and blocks again; and a revoking hook runs after the owner CAS
+/// it revokes for, so it too can arrive after the task's next park. All of that
+/// resolves by generation: a published older cell is stale (its owner generation
+/// is gone, so nothing can use it) and is retired here by winning it; a busy
+/// cell, or one already holding a newer generation, makes this park the obsolete
+/// one, which only costs this task its residency.
+fn claim_empty(cell: &Cell, generation: u64) -> bool {
     loop {
-        match cell.generation.load(Ordering::Acquire) {
-            0 => return,
-            DRAINING => {
-                spins += 1;
-                assert!(spins < 1 << 30, "resident cell drain never finished");
-                core::hint::spin_loop();
-            }
-            stale => {
-                assert_ne!(stale, generation, "resident cell parked twice for one generation");
-                drop(take(slot, stale));
+        match cell.generation.load(Ordering::Relaxed) {
+            BUSY => return false,
+            newer if newer > generation => return false,
+            held => {
+                assert_ne!(held, generation, "resident cell parked twice for one generation");
+                // ORDERING: AcqRel orders a stale cell's payload reads (`drain`) after
+                // its publication and a drainer's reads before our payload writes.
+                if cell.generation.compare_exchange(held, BUSY, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+                    if held != 0 {
+                        drop(cell.drain());
+                    }
+                    return true;
+                }
             }
         }
     }
@@ -153,11 +164,35 @@ pub(super) fn is_resident(slot: usize, generation: u64) -> bool {
     CELLS[slot].generation.load(Ordering::Acquire) == generation
 }
 
+/// Raw cell word, for witnesses of the claim protocol.
+#[cfg(test)]
+pub(super) fn test_word(slot: usize) -> u64 {
+    CELLS[slot].generation.load(Ordering::Acquire)
+}
+
+/// Marks an empty cell `BUSY` as a delayed taker or parker would hold it.
+#[cfg(test)]
+pub(super) fn test_hold_busy(slot: usize) -> bool {
+    CELLS[slot].generation.compare_exchange(0, BUSY, Ordering::AcqRel, Ordering::Acquire).is_ok()
+}
+
+/// Ends [`test_hold_busy`].
+#[cfg(test)]
+pub(super) fn test_release_busy(slot: usize) {
+    assert_eq!(CELLS[slot].generation.swap(0, Ordering::AcqRel), BUSY);
+}
+
+/// Whether `slot`'s cell holds, or is moving, any loans.
+pub(super) fn occupied(slot: usize) -> bool {
+    CELLS[slot].generation.load(Ordering::Acquire) != 0
+}
+
 /// Owner-word CAS hook: the transition from `previous_generation` succeeded, so
 /// a cell published for it can never be taken by the lane. Evict it.
 #[inline]
 pub(super) fn on_owner_transition(slot: usize, previous_generation: u64) {
-    if CELLS[slot].generation.load(Ordering::Acquire) == previous_generation {
+    // ORDERING: SeqCst pairs with the parker's SeqCst publication swap (see `park`).
+    if CELLS[slot].generation.load(Ordering::SeqCst) == previous_generation {
         drop(take(slot, previous_generation));
     }
 }
@@ -165,13 +200,24 @@ pub(super) fn on_owner_transition(slot: usize, previous_generation: u64) {
 /// CPU a parked cell was parked on (valid only for the caller's generation).
 pub(super) fn parked_cpu(slot: usize, generation: u64) -> Option<usize> {
     let cell = &CELLS[slot];
-    (cell.generation.load(Ordering::Acquire) == generation).then(|| cell.cpu.load(Ordering::Relaxed))
+    if cell.generation.load(Ordering::Acquire) != generation {
+        return None;
+    }
+    let cpu = cell.cpu.load(Ordering::Acquire);
+    // The payload is rewritten only after the cell was taken and refilled, which
+    // changes the word; seeing the generation again proves `cpu` is its payload.
+    (cell.generation.load(Ordering::Relaxed) == generation).then_some(cpu)
 }
 
-/// Reference units this slot's cell holds in the execution-permit count.
+/// Reference units this slot's cell holds in the execution-permit count. A `BUSY`
+/// cell holds none: a parker still fills it (its permit is not parked yet) and a
+/// taker has already claimed the unit, so quiescence observers count it as live.
 #[inline]
 pub(in crate::multitask) fn permit_units(slot: usize) -> u32 {
-    u32::from(CELLS.get(slot).is_some_and(|cell| cell.generation.load(Ordering::Acquire) != 0))
+    u32::from(CELLS.get(slot).is_some_and(|cell| {
+        let word = cell.generation.load(Ordering::Acquire);
+        word != 0 && word != BUSY
+    }))
 }
 
 /// The ACK of a changed return. Releases the outgoing loans, or parks them when

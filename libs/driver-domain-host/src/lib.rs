@@ -2938,25 +2938,103 @@ impl Drop for InputRingSink {
     }
 }
 
+/// The two-step RustOS admission of the fixed input ring, observed from L0.
+///
+/// RustOS arms the MSI-X vector (`RUSTOS_READY`) when the aperture is
+/// installed, and admits production only once `inputd`'s ingestion worker is a
+/// live consumer (`POLICY_CONSUMER_READY`). Either half can be missing for a
+/// different reason (the kernel has not installed the aperture; `inputd` has not
+/// started, is still retrying the broker, or exited and withdrew its lease), so a
+/// timeout must say *which* half was missing and whether the policy consumer
+/// was ever seen, not just that "something" was not armed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InputArmPhase {
+    /// The transport flag is absent, or the header belongs to another
+    /// generation than the one this relay mapped.
+    AwaitingTransport,
+    AwaitingPolicyConsumer,
+    Armed,
+}
+
+#[derive(Debug, Default)]
+pub struct InputArmWatch {
+    policy_seen: bool,
+    policy_losses: u32,
+}
+
+impl InputArmWatch {
+    pub fn observe(
+        &mut self,
+        header: &DvmInputRingHeader,
+        expected_generation: u64,
+    ) -> InputArmPhase {
+        let current = header.generation == expected_generation;
+        let transport = current && header.flags & DVM_INPUT_RING_FLAG_RUSTOS_READY != 0;
+        let policy = transport && header.flags & DVM_INPUT_RING_FLAG_POLICY_CONSUMER_READY != 0;
+        if self.policy_seen && !policy {
+            // The consumer was admitted and then withdrawn: inputd exited or was
+            // torn down. Distinct from never having started.
+            self.policy_losses = self.policy_losses.saturating_add(1);
+        }
+        self.policy_seen = policy;
+        match (transport, policy) {
+            (true, true) => InputArmPhase::Armed,
+            (true, false) => InputArmPhase::AwaitingPolicyConsumer,
+            _ => InputArmPhase::AwaitingTransport,
+        }
+    }
+
+    /// The failure record for a deadline that passed in `phase`.
+    pub fn failure(
+        &self,
+        phase: InputArmPhase,
+        header: &DvmInputRingHeader,
+        expected_generation: u64,
+        waited: Duration,
+    ) -> String {
+        let missing = match phase {
+            InputArmPhase::AwaitingTransport => "the fixed input-ring vector (RUSTOS_READY)",
+            InputArmPhase::AwaitingPolicyConsumer => "a live inputd policy consumer",
+            InputArmPhase::Armed => "nothing",
+        };
+        format!(
+            "RustOS did not arm the fixed input ring: missing {missing}; state={phase:?} \
+             policy_consumer_losses={} generation={}/{expected_generation} flags={:#x} \
+             producer={} consumer={} waited_ms={}",
+            self.policy_losses,
+            header.generation,
+            header.flags,
+            header.producer,
+            header.consumer,
+            waited.as_millis()
+        )
+    }
+}
+
 impl RustosInputSink for InputRingSink {
     fn wait_for_receiver_ready(&mut self, timeout: Duration) -> Result<()> {
-        let deadline = Instant::now()
+        let started = Instant::now();
+        let deadline = started
             .checked_add(timeout)
             .ok_or_else(|| anyhow!("input-ring receiver-ready deadline overflow"))?;
+        let mut watch = InputArmWatch::default();
+        let mut poll = Duration::from_millis(1);
         loop {
             let header = self.header()?;
-            if header.generation == self.generation
-                && header.flags & DVM_INPUT_RING_FLAG_RUSTOS_READY != 0
-                && header.flags & DVM_INPUT_RING_FLAG_POLICY_CONSUMER_READY != 0
-            {
+            let phase = watch.observe(&header, self.generation);
+            if phase == InputArmPhase::Armed {
                 return Ok(());
             }
             if Instant::now() >= deadline {
                 bail!(
-                    "RustOS did not arm both the fixed input-ring vector and a live policy consumer before deadline"
+                    "{}",
+                    watch.failure(phase, &header, self.generation, started.elapsed())
                 );
             }
-            std::thread::sleep(Duration::from_millis(1));
+            // Back off toward 10 ms: a policy consumer that is minutes away is
+            // not worth a thousand wakeups per second of a loaded host.
+            std::thread::sleep(poll);
+            poll = (poll * 2).min(Duration::from_millis(10));
         }
     }
 
@@ -5514,5 +5592,76 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+}
+
+#[cfg(test)]
+mod input_arm_tests {
+    use crate::{
+        DvmInputRingHeader, InputArmPhase, InputArmWatch, DVM_INPUT_RING_APERTURE_BYTES,
+        DVM_INPUT_RING_FLAG_POLICY_CONSUMER_READY, DVM_INPUT_RING_FLAG_RUSTOS_READY,
+    };
+    use driver_domain_protocol::DVM_INPUT_RING_FLAG_READY;
+    use std::time::Duration;
+
+    fn arm_header(generation: u64, flags: u32) -> DvmInputRingHeader {
+        let mut header = DvmInputRingHeader::new(DVM_INPUT_RING_APERTURE_BYTES, generation);
+        header.flags = DVM_INPUT_RING_FLAG_READY | flags;
+        header
+    }
+
+    #[test]
+    fn input_arm_needs_both_the_transport_and_a_live_policy_consumer() {
+        let mut watch = InputArmWatch::default();
+        assert_eq!(
+            watch.observe(&arm_header(3, 0), 3),
+            InputArmPhase::AwaitingTransport
+        );
+        assert_eq!(
+            watch.observe(&arm_header(3, DVM_INPUT_RING_FLAG_RUSTOS_READY), 3),
+            InputArmPhase::AwaitingPolicyConsumer
+        );
+        let both = DVM_INPUT_RING_FLAG_RUSTOS_READY | DVM_INPUT_RING_FLAG_POLICY_CONSUMER_READY;
+        assert_eq!(
+            watch.observe(&arm_header(3, both), 3),
+            InputArmPhase::Armed
+        );
+    }
+
+    #[test]
+    fn input_arm_ignores_flags_from_another_generation() {
+        let mut watch = InputArmWatch::default();
+        let both = DVM_INPUT_RING_FLAG_RUSTOS_READY | DVM_INPUT_RING_FLAG_POLICY_CONSUMER_READY;
+        assert_eq!(
+            watch.observe(&arm_header(2, both), 3),
+            InputArmPhase::AwaitingTransport,
+            "a previous ring incarnation must not arm this relay"
+        );
+    }
+
+    #[test]
+    fn input_arm_failure_names_the_missing_half_and_a_lost_consumer() {
+        let mut watch = InputArmWatch::default();
+        let both = DVM_INPUT_RING_FLAG_RUSTOS_READY | DVM_INPUT_RING_FLAG_POLICY_CONSUMER_READY;
+        watch.observe(&arm_header(1, both), 1);
+        // inputd exits: the kernel clears the policy bit but keeps the transport.
+        let withdrawn = arm_header(1, DVM_INPUT_RING_FLAG_RUSTOS_READY);
+        let phase = watch.observe(&withdrawn, 1);
+        assert_eq!(phase, InputArmPhase::AwaitingPolicyConsumer);
+        let report = watch.failure(phase, &withdrawn, 1, Duration::from_millis(30_000));
+        assert!(report.contains("missing a live inputd policy consumer"), "{report}");
+        assert!(report.contains("policy_consumer_losses=1"), "{report}");
+        assert!(report.contains("flags=0x3"), "{report}");
+        assert!(report.contains("waited_ms=30000"), "{report}");
+
+        let mut never = InputArmWatch::default();
+        let header = arm_header(1, 0);
+        let phase = never.observe(&header, 1);
+        let report = never.failure(phase, &header, 1, Duration::from_millis(5));
+        assert!(
+            report.contains("missing the fixed input-ring vector"),
+            "{report}"
+        );
+        assert!(report.contains("policy_consumer_losses=0"), "{report}");
     }
 }

@@ -8,6 +8,7 @@ cd "$repo_root"
 
 registry=formal/zero-trust-subsystems.tsv
 models=formal/models.tsv
+validators=formal/validators.tsv
 conformance=formal/run-source-conformance.sh
 flows=formal/system-flows.tsv
 test -f "$registry" || { echo "missing $registry" >&2; exit 1; }
@@ -73,7 +74,7 @@ while IFS=$'\t' read -r boundary class owner source model shape authority lifecy
     fi
     [[ -f "$source" ]] || { echo "missing subsystem ingress source: $source" >&2; exit 1; }
     awk -F '\t' -v wanted="$model" '$1 == wanted {found++} END {exit found == 1 ? 0 : 1}' \
-        "$models" || {
+        "$models" "$validators" || {
         echo "subsystem ingress has unregistered model: $boundary ($model)" >&2
         exit 1
     }

@@ -31,6 +31,13 @@ its narrower profile; `--no-auto-verify` skips that repair, not the qualificatio
 seal checks. Run the PR gate explicitly for push/release evidence and report
 each requested vCPU cohort separately. See `docs/ai/commands.md` for proof flags.
 
+Timing profile: an idle-host boot proves readiness only for an idle host. For a
+readiness or latency claim also run `--host-cpu-pressure <percent>` (e.g. 50 and
+100), which keeps that share of the host cores the run may use pinned-busy for the
+whole run and prints `timing profile host-cpu-pressure=...`. Quote the profile
+with the result. It cannot combine with `--smp-iteration` (sealed evidence does
+not record it). See `docs/ai/formal-scope-policy.md`.
+
 For physical GPU/VFIO work read `docs/ai/physical-gpu-status.md` first. A stable
 panel proves visual behavior only, not FPS, reset, revoke, latency, or recovery.
 Do not repeat a failure-sticky physical launch in the same boot.

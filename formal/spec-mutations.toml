@@ -67,6 +67,8 @@ required_models = [
     "scheduler-cpu-distribution/SchedulerCpuDistribution",
     "scheduler-cpu-ownership/SchedulerCpuOwnership",
     "scheduler-local-authority/SchedulerLocalAuthority",
+    "scheduler-owner-word/SchedulerOwnerWord",
+    "scheduler-resident-cell/SchedulerResidentCell",
     "scheduler-terminal-claim/SchedulerTerminalClaim",
     "scheduler-thread-demotion/SchedulerThreadDemotion",
     "scheduler-wakeup/SchedulerWakeup",
@@ -3954,6 +3956,52 @@ invariant = "FairUserSelectionUsesRuntime"
 min_counterexample_states = 3
 
 [[mutation]]
+id = "scheduler-mailbox-adoption-terminal-winner-crashes"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "scheduler-owner-word/SchedulerOwnerWord"
+flow = "scheduler-owner-word"
+find = '''          THEN \* a remote stop won: the queue insertion is rolled back, the task is gone
+               /\ w' = w /\ adoptPhase' = "idle" /\ adoptObs' = adoptObs /\ crash' = crash'''
+replace = '''          THEN \* a remote stop won: the queue insertion is rolled back, the task is gone
+               /\ w' = w /\ adoptPhase' = "idle" /\ adoptObs' = adoptObs /\ crash' = "adoption-lost"'''
+occurrence = 1
+invariant = "NoPanic"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "scheduler-metadata-set-runnable-writes-terminal-word"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "scheduler-owner-word/SchedulerOwnerWord"
+flow = "scheduler-owner-word"
+find = '''SetRunnable(v) ==
+    /\ Editable
+'''
+replace = '''SetRunnable(v) ==
+    /\ w.st # Dormant
+'''
+occurrence = 1
+invariant = "TerminalWordIsCanonical"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "scheduler-metadata-wait-arm-writes-terminal-word"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "scheduler-owner-word/SchedulerOwnerWord"
+flow = "scheduler-owner-word"
+find = '''SetWaitArmed(a) ==
+    /\ Editable
+'''
+replace = '''SetWaitArmed(a) ==
+    /\ w.st # Dormant
+'''
+occurrence = 1
+invariant = "TerminalWordIsCanonical"
+min_counterexample_states = 3
+
+[[mutation]]
 id = "scheduler-outgoing-stack-owner-retained"
 kind = "transition-effect"
 severity = "critical"
@@ -3988,6 +4036,77 @@ find = '''       /\ ready' = IF previous \in (blocked \cup ready)
 replace = '''       /\ ready' = ready'''
 occurrence = 1
 invariant = "LegacyReadyHasPublishedCustody"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "scheduler-resident-cell-hook-frees-word-before-reading"
+kind = "transition-order"
+severity = "critical"
+model = "scheduler-resident-cell/SchedulerResidentCell"
+flow = "scheduler-resident-cell"
+find = '''              THEN /\ cw' = Busy
+                   /\ dph' = [dph EXCEPT !["hook"] = "won"]'''
+replace = '''              THEN /\ cw' = 0
+                   /\ dph' = [dph EXCEPT !["hook"] = "won"]'''
+occurrence = 1
+invariant = "CellLoanIsPublishedOrBeingFilled"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "scheduler-resident-cell-park-asserts-empty-cell"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "scheduler-resident-cell/SchedulerResidentCell"
+flow = "scheduler-resident-cell"
+find = '''       ELSE IF cw = Busy \/ cw > g
+          THEN /\ ppc' = [ppc EXCEPT ![g] = "done"]
+               /\ lsite' = [lsite EXCEPT ![g] = "dropped"]
+               /\ UNCHANGED <<cw, dph, dgen, stalePk, crash>>'''
+replace = '''       ELSE IF TRUE
+          THEN /\ crash' = "parked-over-live-loans"
+               /\ UNCHANGED <<ppc, lsite, cw, dph, dgen, stalePk>>'''
+occurrence = 1
+invariant = "NoPanic"
+min_counterexample_states = 3
+
+[[mutation]]
+id = "scheduler-resident-cell-park-overwrites-busy-cell"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "scheduler-resident-cell/SchedulerResidentCell"
+flow = "scheduler-resident-cell"
+find = '''    /\ IF cw = 0
+          THEN /\ cw' = Busy
+               /\ ppc' = [ppc EXCEPT ![g] = "filling"]'''
+replace = '''    /\ IF cw = 0 \/ cw = Busy
+          THEN /\ cw' = Busy
+               /\ ppc' = [ppc EXCEPT ![g] = "filling"]'''
+occurrence = 1
+invariant = "NoPanic"
+min_counterexample_states = 4
+
+[[mutation]]
+id = "scheduler-resident-cell-park-skips-owner-recheck"
+kind = "transition-guard-removal"
+severity = "critical"
+model = "scheduler-resident-cell/SchedulerResidentCell"
+flow = "scheduler-resident-cell"
+find = '''    /\ ppc' = [ppc EXCEPT ![g] = IF og = g /\ ost = "blocked" THEN "done" ELSE "taking"]'''
+replace = '''    /\ ppc' = [ppc EXCEPT ![g] = "done"]'''
+occurrence = 1
+invariant = "NoCellOutlivesItsGeneration"
+min_counterexample_states = 4
+
+[[mutation]]
+id = "scheduler-resident-cell-permit-units-count-busy-cell"
+kind = "transition-effect"
+severity = "critical"
+model = "scheduler-resident-cell/SchedulerResidentCell"
+flow = "scheduler-resident-cell"
+find = '''PermitUnits == IF cw \in Gens THEN 1 ELSE 0'''
+replace = '''PermitUnits == IF cw # 0 THEN 1 ELSE 0'''
+occurrence = 1
+invariant = "PermitUnitsAreParkedUnits"
 min_counterexample_states = 3
 
 [[mutation]]

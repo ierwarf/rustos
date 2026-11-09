@@ -7,8 +7,6 @@ capability-derivation-lifecycle/CapabilityDerivationLifecycle	safety	check	expli
 atomic-process-activation-batch/AtomicProcessActivationBatch	safety	check	committed rejected and requester-exit terminals stutter while full target identities and all-or-nothing activation remain explicit	30	120	exhaustive	no	no	no
 cpu-affinity-observation/CpuAffinityObservation	safety	check	reply and rejection terminals stutter while exact online-mask publication remains explicit	30	120	exhaustive	no	no	no
 task-affinity-lifecycle/TaskAffinityLifecycle	safety	check	rejected affinity requests stutter while successful changes retain explicit migration fork and exec progress	30	120	exhaustive	no	no	no
-acpi-table-admission/AcpiTableAdmission	safety	intentional-terminal	malformed firmware selects no partial ECAM or HPET authority	30	120	exhaustive	no	no	no
-cpu-topology-admission/CpuTopologyAdmission	safety	check	terminal admission states stutter so deadlock checking remains enabled	30	120	exhaustive	no	no	no
 cpu-online-lifecycle/CpuOnlineLifecycle	safety	check	all-failed terminal state stutters so deadlock checking remains enabled	30	120	exhaustive	no	no	no
 smp-reschedule-ipi/SmpRescheduleIpi	temporal	check	critical-section exit must flush every exact target custody bit and every published request must reach a safe dispatch	30	120	exhaustive	no	no	no
 scheduler-cpu-ownership/SchedulerCpuOwnership	safety	check	fail-closed invalid attempts and ordinary acquire release dispatch transitions all retain enabled stutter or progress	30	120	exhaustive	no	no	no
@@ -30,15 +28,12 @@ dvm-read-cache/DvmReadCache	temporal	intentional-terminal	cache request serves e
 remote-file-mapping/RemoteFileMapping	safety	intentional-terminal	exact file bytes commit or the mapping aborts without fallback or zero fill	120	900	exhaustive	no	no	no
 syscall-simd-lifecycle/SyscallSimdLifecycle	safety	intentional-terminal	ordinary return restores entering data; register return sanitizes data and restores controls on both routes; async custody remains full	120	900	exhaustive	no	no	no
 syscall-scheduler-continuation/SyscallSchedulerContinuation	safety	check	explicit returned or retired terminal stutter preserves deadlock checking	120	900	exhaustive	no	no	no
-pci-bar-discovery/PciBarDiscovery	safety	intentional-terminal	BAR discovery publishes one restored valid resource or rejects it	120	900	exhaustive	no	no	no
 physical-frame-lifecycle/PhysicalFrameLifecycle	safety	check	explicit all-reserved terminal stutter preserves deadlock checking	120	900	exhaustive	no	no	no
 clocksource-deadline/ClocksourceDeadline	temporal	intentional-terminal	retired or released waits are terminal	120	900	exhaustive	no	no	no
 deferred-start/DeferredStart	temporal	intentional-terminal	launch outcome is terminal	120	900	exhaustive	no	no	no
 devmgrd-sessiond-isolation/DevmgrdSessiondIsolation	temporal	intentional-terminal	bounded request outcome is terminal	120	900	exhaustive	no	no	no
 dma-iommu-isolation/DmaIommuIsolation	safety	intentional-terminal	revoked domain outcome is terminal	120	900	exhaustive+simulate	no	no	no
 driver-domain-fleet/DriverDomainFleet	safety	intentional-terminal	fleet admission outcome is terminal	120	900	exhaustive	no	no	no
-dual-abi-byte-parser/DualAbiByteParser	temporal	intentional-terminal	parser admission outcome is terminal	120	900	exhaustive	no	no	no
-dual-abi-image-admission/DualAbiImageAdmission	temporal	intentional-terminal	image admission outcome is terminal	120	900	exhaustive	no	no	no
 dvm-absolute-pointer/DvmAbsolutePointer	temporal	intentional-terminal	bounded input session may terminate	120	900	exhaustive	no	no	no
 dvm-agent-readiness/DvmAgentReadiness	temporal	intentional-terminal	readiness publication may terminate	120	900	exhaustive	no	no	no
 dvm-amdgpu-evidence/DvmAmdgpuEvidence	safety	intentional-terminal	evidence decision is terminal	120	900	exhaustive	no	no	no
@@ -71,7 +66,6 @@ endpoint-registry/EndpointRegistry	temporal	intentional-terminal	endpoint wait m
 endpoint-receiver-wakeup/EndpointReceiverWakeup	safety	check	explicit terminal stutter preserves deadlock checking	30	120	exhaustive	no	no	no
 exception-retirement-lifecycle/ExceptionRetirementLifecycle	temporal	intentional-terminal	exception outcome is terminal	120	900	exhaustive	no	no	no
 exec-ticket/ExecTicket	safety	intentional-terminal	ticket outcome is terminal	120	900	exhaustive+simulate	yes	no	no
-filesystem-content-integrity/FilesystemContentIntegrity	temporal	intentional-terminal	verified read decision is terminal	120	900	exhaustive	no	no	no
 futex-waiter-lifecycle/FutexWaiterLifecycle	temporal	intentional-terminal	waiter wake timeout or retirement cleanup is terminal	30	120	exhaustive	no	no	no
 gui-dvm-install/GuiDvmInstall	temporal	intentional-terminal	install decision is one-shot	120	900	exhaustive	no	no	no
 gui-dvm-pixel-authority/GuiDvmPixelAuthority	safety	intentional-terminal	pixel authority epoch may revoke	120	900	exhaustive	no	no	no
@@ -159,3 +153,5 @@ runtime-trace-causal-selection/RuntimeTraceCausalSelection	safety	check	accepted
 job-policy-lifecycle/JobPolicyLifecycle	safety	check	every state retains a bounded policy observation action	30	120	exhaustive	no	no	no
 job-policy-publication/JobPolicyPublication	safety	check	terminal writer and reader explicitly stutter	30	120	exhaustive	no	no	no
 child-wait-publication/ChildWaitPublication	safety	check	explicit stutter covers completed bounded waiter and producer	30	120	exhaustive	no	no	no
+scheduler-owner-word/SchedulerOwnerWord	safety	check	explicit stutter step is always enabled after the bounded generation range	30	120	exhaustive	no	no	no
+scheduler-resident-cell/SchedulerResidentCell	safety	check	explicit stutter step is always enabled after the bounded generation range	30	120	exhaustive	no	no	no

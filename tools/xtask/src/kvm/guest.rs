@@ -615,7 +615,11 @@ fn wait_for_parallel_boot(
         let wayclick_fps_ready = options.min_ui_fps.is_none_or(|minimum| {
             wayclick_profile_meets_fps(&rustos_log, minimum, options.ui_proof_windows)
         });
-        let ui_runtime_ready = !runtime_stall_or_crash_observed(&rustos_log);
+        // uiserver's own `readiness v1` record is the authority for UI startup;
+        // an FPS proof additionally requires that record to have settled.
+        let ui_runtime_ready = !runtime_stall_or_crash_observed(&rustos_log)
+            && (options.min_ui_fps.is_none() || ui_readiness_settled(&rustos_log));
+        let ui_startup_detail = runtime_failure_detail(&rustos_log);
         let dvm_relay_fps_ready = options.min_ui_fps.is_none_or(|minimum| {
             !options.gui_dvm_surfaces
                 || dvm_display_relay_meets_fps(&dvm_log, minimum, options.ui_proof_windows)
@@ -704,7 +708,7 @@ fn wait_for_parallel_boot(
                 |path| path.display().to_string(),
             );
             bail!(
-                "{reason}; RustOS missing={:?}; Linux-DVM missing={:?}; dvm-gpu-ready={}; ui-fps-ready={} (render={} input={} wayclick={} rustos-runtime={} dvm-relay={} dvm-runtime={}); wayclick-observed={:?}; dvm-display-ready={}; physical-gpu-frames-ready={}; dvm-network-ready={}; dvm-network-traffic-ready={}; host-input-relay-pending={}; input-ring={}/{} flags={:#x}; network-ring={:?}; evidence={}; inspect {}, {}, {}, and {}",
+                "{reason}; RustOS missing={:?}; Linux-DVM missing={:?}; dvm-gpu-ready={}; ui-fps-ready={} (render={} input={} wayclick={} rustos-runtime={} dvm-relay={} dvm-runtime={}); startup-detail={}; wayclick-observed={:?}; dvm-display-ready={}; physical-gpu-frames-ready={}; dvm-network-ready={}; dvm-network-traffic-ready={}; host-input-relay-pending={}; input-ring={}/{} flags={:#x}; network-ring={:?}; evidence={}; inspect {}, {}, {}, and {}",
                 missing_rustos,
                 missing_dvm,
                 dvm_gpu_ready,
@@ -715,6 +719,7 @@ fn wait_for_parallel_boot(
                 ui_runtime_ready,
                 dvm_relay_fps_ready,
                 dvm_runtime_ready,
+                ui_startup_detail,
                 wayclick_observed,
                 dvm_display_ready,
                 physical_gpu_frames_ready,

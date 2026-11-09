@@ -562,22 +562,7 @@ impl PciDevice {
 
     /// Run the destructive size probe with the configuration transaction held.
     fn probe_bar_locked(self, bar_index: usize, bar_slot: u8) -> Option<PciResource> {
-        let bar_offset = BAR0_OFFSET + bar_slot * 4;
-        let original_command = self.read_u16_raw(COMMAND_OFFSET);
-        let decoding_bits = original_command & (COMMAND_IO_SPACE | COMMAND_MEMORY_SPACE);
-        if decoding_bits != 0 {
-            self.write_u16_raw(
-                COMMAND_OFFSET,
-                original_command & !(COMMAND_IO_SPACE | COMMAND_MEMORY_SPACE),
-            );
-        }
-
-        let resource = self.read_resource_snapshot(bar_index, bar_offset);
-
-        if decoding_bits != 0 {
-            self.write_u16_raw(COMMAND_OFFSET, original_command);
-        }
-        resource
+        probe_bar_transaction(&mut { self }, bar_index, bar_slot)
     }
 
     /// Dense identity of one configuration function, used to key the sealed
@@ -712,47 +697,6 @@ impl PciDevice {
             data_port.write(value);
         }
     }
-
-    /// Size one BAR while the caller holds the configuration transaction and
-    /// has already disabled the function's decode.
-    fn read_resource_snapshot(self, bar_index: usize, bar_offset: u8) -> Option<PciResource> {
-        let original_low = self.read_u32_raw(bar_offset);
-        self.write_u32_raw(bar_offset, u32::MAX);
-        let mask_low = self.read_u32_raw(bar_offset);
-        // Restore the low half before touching the high half. Linux sizes the
-        // standard BAR dwords independently while decode is disabled; leaving
-        // all ones in the low half while probing a 64-bit partner can make a
-        // virtual device expose a transient, nonsensical upper mask.
-        self.write_u32_raw(bar_offset, original_low);
-
-        if (original_low & PCI_BAR_IO_SPACE) != 0 {
-            return decode_io_resource(original_low, mask_low);
-        }
-
-        let is_64bit = (original_low & PCI_BAR_MEM_TYPE_MASK) == PCI_BAR_MEM_TYPE_64;
-        if is_64bit && bar_index + 1 >= self.standard_bar_count_raw() {
-            return None;
-        }
-
-        let original_high = if is_64bit {
-            self.read_u32_raw(bar_offset + 4)
-        } else {
-            0
-        };
-
-        let mask_high = if is_64bit {
-            self.write_u32_raw(bar_offset + 4, u32::MAX);
-            self.read_u32_raw(bar_offset + 4)
-        } else {
-            0
-        };
-
-        if is_64bit {
-            self.write_u32_raw(bar_offset + 4, original_high);
-        }
-
-        decode_mem_resource(original_low, original_high, mask_low, mask_high, is_64bit)
-    }
 }
 
 /// Size every function's BARs once, then forbid any further size probe.
@@ -861,6 +805,119 @@ pub fn visit_devices(mut visit: impl FnMut(PciDevice) -> bool) {
     });
 }
 
+/// Raw configuration-space access used by the destructive BAR sizing
+/// transaction.
+///
+/// [`PciDevice`] implements it over ECAM or the legacy port pair with the
+/// `CONFIG_STATE` transaction already held by the caller. The sizing protocol
+/// is written against this trait, not against the ports, so that tests can run
+/// the production sequence against a simulated function which checks every
+/// protocol rule at the instant of the access instead of only inspecting the
+/// final state.
+trait BarConfig {
+    fn read16(&mut self, offset: u8) -> u16;
+    fn write16(&mut self, offset: u8, value: u16);
+    fn read32(&mut self, offset: u8) -> u32;
+    fn write32(&mut self, offset: u8, value: u32);
+    /// Number of standard BAR dwords the function's header type defines.
+    fn bar_dwords(&mut self) -> usize;
+}
+
+impl BarConfig for PciDevice {
+    fn read16(&mut self, offset: u8) -> u16 {
+        self.read_u16_raw(offset)
+    }
+
+    fn write16(&mut self, offset: u8, value: u16) {
+        self.write_u16_raw(offset, value);
+    }
+
+    fn read32(&mut self, offset: u8) -> u32 {
+        self.read_u32_raw(offset)
+    }
+
+    fn write32(&mut self, offset: u8, value: u32) {
+        self.write_u32_raw(offset, value);
+    }
+
+    fn bar_dwords(&mut self) -> usize {
+        self.standard_bar_count_raw()
+    }
+}
+
+/// Size one BAR inside a decode-disabled window.
+///
+/// The command register's I/O and memory decode bits are cleared before the
+/// first all-ones write and the original command word is restored on every
+/// path, so the function never decodes a transient all-ones BAR.
+fn probe_bar_transaction(
+    access: &mut impl BarConfig,
+    bar_index: usize,
+    bar_slot: u8,
+) -> Option<PciResource> {
+    let bar_offset = BAR0_OFFSET + bar_slot * 4;
+    let original_command = access.read16(COMMAND_OFFSET);
+    let decoding_bits = original_command & (COMMAND_IO_SPACE | COMMAND_MEMORY_SPACE);
+    if decoding_bits != 0 {
+        access.write16(
+            COMMAND_OFFSET,
+            original_command & !(COMMAND_IO_SPACE | COMMAND_MEMORY_SPACE),
+        );
+    }
+
+    let resource = size_bar_dwords(access, bar_index, bar_offset);
+
+    if decoding_bits != 0 {
+        access.write16(COMMAND_OFFSET, original_command);
+    }
+    resource
+}
+
+/// Size one BAR while the caller holds the configuration transaction and has
+/// already disabled the function's decode.
+fn size_bar_dwords(
+    access: &mut impl BarConfig,
+    bar_index: usize,
+    bar_offset: u8,
+) -> Option<PciResource> {
+    let original_low = access.read32(bar_offset);
+    access.write32(bar_offset, u32::MAX);
+    let mask_low = access.read32(bar_offset);
+    // Restore the low half before touching the high half. Linux sizes the
+    // standard BAR dwords independently while decode is disabled; leaving
+    // all ones in the low half while probing a 64-bit partner can make a
+    // virtual device expose a transient, nonsensical upper mask.
+    access.write32(bar_offset, original_low);
+
+    if (original_low & PCI_BAR_IO_SPACE) != 0 {
+        return decode_io_resource(original_low, mask_low);
+    }
+
+    let is_64bit = (original_low & PCI_BAR_MEM_TYPE_MASK) == PCI_BAR_MEM_TYPE_64;
+    if is_64bit && bar_index + 1 >= access.bar_dwords() {
+        return None;
+    }
+
+    let original_high = if is_64bit {
+        access.read32(bar_offset + 4)
+    } else {
+        0
+    };
+
+    let mask_high = if is_64bit {
+        access.write32(bar_offset + 4, u32::MAX);
+        access.read32(bar_offset + 4)
+    } else {
+        0
+    };
+
+    if is_64bit {
+        access.write32(bar_offset + 4, original_high);
+    }
+
+    decode_mem_resource(original_low, original_high, mask_low, mask_high, is_64bit)
+}
+
 fn config_address(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
     0x8000_0000
         | ((bus as u32) << 16)
@@ -934,6 +991,9 @@ fn decode_mem_resource(
         is_64bit,
     })
 }
+
+#[cfg(test)]
+mod bar_sizing_tests;
 
 #[cfg(test)]
 mod tests {

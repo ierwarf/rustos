@@ -29,6 +29,8 @@ mod tests {
     include!("job_policy_tests.rs");
     include!("slot_directory_tests.rs");
     include!("budget_dispatch_tests.rs");
+    include!("scheduler_owner_word_tests.rs");
+    include!("scheduler_resident_cell_tests.rs");
 
     const DEFAULT_ITERATIONS: usize = 128;
     const DEFAULT_PCT_DEPTH: usize = 3;

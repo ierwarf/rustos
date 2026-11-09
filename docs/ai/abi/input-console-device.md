@@ -61,6 +61,29 @@
   inputd discards any commit that raced withdrawal, observes the reset, and
   only then rearms policy readiness; neither a dead process nor its records can
   remain the semantic consumer of a live transport.
+- The input-ring arm handshake is two admissions, each observable by the other
+  side and each with a named failure state (design: [`../ui-startup-readiness.md`](../ui-startup-readiness.md)):
+  1. *Transport armed* (`RUSTOS_READY`): the kernel validated the aperture and
+     armed the one MSI-X vector.
+  2. *Policy consumer armed* (`POLICY_CONSUMER_READY`): set inside the first
+     successful `SYS_RUSTOS_INPUT_WAIT_BROKER` call of a capability-checked
+     inputd, i.e. the inputd ingestion worker's first wait **is** the arm
+     request and the kernel flag is its acknowledgement.
+  inputd retries a transient refusal (`ENODEV` aperture not admitted yet,
+  `EBUSY` predecessor still tearing down) for 30 s from the *first* refusal and
+  logs each state change once: `inputd: DVM ingress arm state=waiting
+  errno=<e>`, `state=armed retries=<n> waited_ms=<ms>` or `state=failed
+  errno=<e> [retries=<n> waited_ms=<ms> | permanent=true]` (a failed arm exits
+  inputd so the supervisor sees it). The L0 relay (`InputArmWatch` in
+  `rustos-driver-domain-host`) polls the header with 1 ms to 10 ms backoff for
+  the caller's timeout (30 s in the KVM harness) and, on expiry, reports which
+  half was missing, whether the policy consumer was *ever* seen and then lost
+  (`policy_consumer_losses`: inputd exited and the kernel withdrew the lease),
+  and the observed generation, flags and cursors. Flags from another ring
+  generation never arm a relay. A withdrawn consumer is re-admitted only by a
+  replacement inputd, so a supervisor that tears down the input service during
+  boot (see the `initd` fail-closed endpoint barrier in the design note) shows up
+  as `policy_consumer_losses>=1`, not as a silent deadline.
 - Inputd ABI v5 retires caller-driven `INPUTD_IPC_OP_DRAIN_INGEST` and the
   commercial INPUT_INGEST operation. `INPUTD_IPC_OP_STATS` (the kernel's poll
   recheck) and an authorized `INPUTD_IPC_OP_READ` observe only the

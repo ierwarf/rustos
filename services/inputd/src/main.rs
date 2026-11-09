@@ -531,6 +531,44 @@ mod tests {
         assert!(!super::dvm_wait_errno_is_transient(libc::EINVAL));
     }
 
+    #[test]
+    fn arm_tracker_logs_the_first_refusal_and_gives_up_at_its_budget() {
+        use super::{DvmArmStep, DvmArmTracker, DVM_WAIT_TRANSIENT_BUDGET_NS};
+        let mut tracker = DvmArmTracker::default();
+        assert_eq!(
+            tracker.refused(libc::ENODEV, 1_000),
+            Some(DvmArmStep::Retry { first: true })
+        );
+        assert_eq!(
+            tracker.refused(libc::EBUSY, 2_000),
+            Some(DvmArmStep::Retry { first: false })
+        );
+        assert_eq!(
+            tracker.refused(libc::ENODEV, 1_000 + DVM_WAIT_TRANSIENT_BUDGET_NS - 1),
+            Some(DvmArmStep::Retry { first: false }),
+            "the budget runs from the first refusal"
+        );
+        assert_eq!(
+            tracker.refused(libc::ENODEV, 1_000 + DVM_WAIT_TRANSIENT_BUDGET_NS),
+            Some(DvmArmStep::GiveUp {
+                waited_ns: DVM_WAIT_TRANSIENT_BUDGET_NS
+            })
+        );
+        assert_eq!(tracker.transient_retries, 4);
+        assert_eq!(
+            tracker.armed_after_ns(5_000),
+            Some(4_000),
+            "admission reports how long the arm was refused"
+        );
+    }
+
+    #[test]
+    fn arm_tracker_treats_permanent_errors_as_immediate_failure() {
+        let mut tracker = super::DvmArmTracker::default();
+        assert_eq!(tracker.refused(libc::EPERM, 10), None);
+        assert_eq!(tracker.armed_after_ns(20), None);
+    }
+
     use super::{
         apply_dvm_ingress_wire, ingest_batch_needs_immediate_retry, lock_input_queue,
         lock_input_queue_for_ingestion, validate_commercial_request, DvmIngressLogState,
@@ -1050,9 +1088,10 @@ fn start_dvm_ingestion_worker(queue: SharedInputQueue, log_state: Arc<DvmIngress
             let mut total_drained = 0_u64;
             let mut next_progress_report = 1_u64;
             let mut nonempty_batches = 0_u64;
+            let mut arm_logged = false;
             loop {
                 if !retry_without_wait {
-                    if let Err(errno) = wait_for_dvm_ingress() {
+                    if let Err(errno) = wait_for_dvm_ingress(&mut arm_logged) {
                         debug_line(&format!("inputd: DVM ingestion wait failed errno={errno}"));
                         std::process::exit(134);
                     }
@@ -1204,26 +1243,94 @@ fn dvm_wait_errno_is_transient(errno: i32) -> bool {
     matches!(errno, libc::ENODEV | libc::EBUSY)
 }
 
-fn wait_for_dvm_ingress() -> Result<(), i32> {
-    let mut transient_since_ns: Option<u64> = None;
+/// The inputd half of the input-ring arm handshake. RustOS sets
+/// `POLICY_CONSUMER_READY` inside the first successful wait-broker call, so
+/// this worker *is* the arm request; the L0 relay polls the flag (see
+/// `InputArmWatch` in `rustos-driver-domain-host`). Each state change is
+/// logged once, so a boot that never arms names the half that was missing
+/// instead of ending in a silent deadline on either side.
+#[derive(Debug, Default)]
+struct DvmArmTracker {
+    transient_since_ns: Option<u64>,
+    transient_retries: u64,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum DvmArmStep {
+    /// Log the first refusal, then keep retrying quietly.
+    Retry { first: bool },
+    GiveUp { waited_ns: u64 },
+}
+
+impl DvmArmTracker {
+    fn refused(&mut self, errno: i32, now_ns: u64) -> Option<DvmArmStep> {
+        if !dvm_wait_errno_is_transient(errno) {
+            return None;
+        }
+        let first = self.transient_since_ns.is_none();
+        let since = *self.transient_since_ns.get_or_insert(now_ns);
+        self.transient_retries = self.transient_retries.saturating_add(1);
+        let waited_ns = now_ns.saturating_sub(since);
+        Some(if waited_ns >= DVM_WAIT_TRANSIENT_BUDGET_NS {
+            DvmArmStep::GiveUp { waited_ns }
+        } else {
+            DvmArmStep::Retry { first }
+        })
+    }
+
+    /// Time spent refused before the broker finally admitted this consumer.
+    fn armed_after_ns(&self, now_ns: u64) -> Option<u64> {
+        self.transient_since_ns
+            .map(|since| now_ns.saturating_sub(since))
+    }
+}
+
+fn wait_for_dvm_ingress(armed_logged: &mut bool) -> Result<(), i32> {
+    let mut tracker = DvmArmTracker::default();
     loop {
         let result = syscall0(SYS_RUSTOS_INPUT_WAIT_BROKER);
         if result >= 0 {
+            if !*armed_logged {
+                *armed_logged = true;
+                let waited_ms = tracker
+                    .armed_after_ns(dvm_session_sync::monotonic_nanos())
+                    .map_or(0, |ns| ns / 1_000_000);
+                debug_line(&format!(
+                    "inputd: DVM ingress arm state=armed retries={} waited_ms={waited_ms}",
+                    tracker.transient_retries
+                ));
+            }
             return Ok(());
         }
         // A signal-style interruption is not loss of the ingress authority;
         // exiting here would drop the keyboard for the whole system.
-        match last_errno() {
-            libc::EINTR => continue,
-            errno if dvm_wait_errno_is_transient(errno) => {
-                let now = dvm_session_sync::monotonic_nanos();
-                let since = *transient_since_ns.get_or_insert(now);
-                if now.saturating_sub(since) >= DVM_WAIT_TRANSIENT_BUDGET_NS {
-                    return Err(errno);
+        let errno = last_errno();
+        if errno == libc::EINTR {
+            continue;
+        }
+        match tracker.refused(errno, dvm_session_sync::monotonic_nanos()) {
+            Some(DvmArmStep::Retry { first }) => {
+                if first {
+                    debug_line(&format!(
+                        "inputd: DVM ingress arm state=waiting errno={errno}"
+                    ));
                 }
                 thread::sleep(DVM_WAIT_TRANSIENT_BACKOFF);
             }
-            errno => return Err(errno),
+            Some(DvmArmStep::GiveUp { waited_ns }) => {
+                debug_line(&format!(
+                    "inputd: DVM ingress arm state=failed errno={errno} retries={} waited_ms={}",
+                    tracker.transient_retries,
+                    waited_ns / 1_000_000
+                ));
+                return Err(errno);
+            }
+            None => {
+                debug_line(&format!(
+                    "inputd: DVM ingress arm state=failed errno={errno} permanent=true"
+                ));
+                return Err(errno);
+            }
         }
     }
 }

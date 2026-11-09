@@ -107,6 +107,7 @@ done
 python3 formal/run-spec-mutations.py --check
 python3 formal/test-lane-cache.py
 python3 formal/test-implementation-mutation-runner.py
+python3 formal/test-classify-mutation-severity.py
 python3 formal/test-recovery-runner.py
 for registry in \
     formal/abi-divergences.tsv \
@@ -186,6 +187,7 @@ formal/check-zero-trust-ingress.sh
     exit 1
 }
 formal/check-zero-trust-subsystems.sh
+python3 formal/check-validators.py
 [[ -x formal/check-performance-contracts.sh ]] || {
     echo "performance contract checker is not executable" >&2
     exit 1

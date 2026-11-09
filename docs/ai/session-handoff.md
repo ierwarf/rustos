@@ -70,17 +70,33 @@ Open items found but not done (evidence in the agent reports of this session):
   `runqueue.rs:1284` "scheduler retire completion raced" (state Retiring). The
   panics are in code this batch did not touch; no HEAD control was run (the
   user declined it), so the 3/100 rate is not attributed. Both were root-caused
-  statically and fixed: (1) `set_runnable`/`set_wait_armed`/`set_wait_reason`
-  wrote metadata into a Retiring/Retired owner word (late `publish_frame`),
-  making the exact-value retire completion CAS lose; they now skip terminal
-  words. (2) A delayed owner-transition eviction hook let a task re-block and
-  re-park over its previous generation's cell; `park` now retires the stale cell
-  itself, and `take` publishes `DRAINING` until the payload is read so a parker
-  never overwrites an evictor's read. Neither is KVM-verified (host tests and
-  mutation rows only). Logs: `~/rustos-evidence/4vcpu-100-2026-11-09/`.
-- Observed once in ~12 full `cargo test -p kernel-ps --lib` runs:
-  `irq_entry_tests::switch::actual_queued_fifo_work_and_exhausted_chain_decline_the_shortcut`
-  failed on `sync_handoff::pending(0)` (cross-test global state); not reproduced.
+  statically and fixed (second, independent pass replaced the first-pass fix):
+  (1) every lock-free owner-word metadata writer now goes through one
+  `RunOwnerWord::edit_in_place` that refuses terminal and Dormant words (late
+  `publish_frame` made the exact `Retiring -> Retired` CAS lose); custody CASes
+  must advance the generation; mailbox adoption and migration publication treat
+  a terminal or newer-generation winner as a withdrawn record. (2) The resident
+  cell word is 0 / generation / `BUSY`: `park` claims by CAS (retiring a stale
+  older cell itself), never displaces a newer cell and never waits for `BUSY`
+  (the first pass spun in the RSP-ACK callback); `take` frees the word only after
+  the payload read. Models: `formal/scheduler-owner-word`,
+  `formal/scheduler-resident-cell`; contract `smp/scheduler.md` 7.9. Not
+  KVM-verified (host tests, TLC, Loom/Shuttle/herd7 and mutation rows only).
+  Logs: `~/rustos-evidence/4vcpu-100-2026-11-09/`.
+- DONE: the `actual_queued_fifo_work_and_exhausted_chain_decline_the_shortcut`
+  flake (stale `SYNC_HANDOFF_PENDING` flag and an unreset FIFO in the test
+  fixture): `sync_handoff::reset_all_cpus` now also withdraws the advertisement
+  and the fixture resets it. 40 consecutive runs of the test binary passed
+  (baseline 1 in 20 failed).
+- 4-vCPU x100 round 2 (2026-11-09, after the scheduler/UI/initd/runtimed rework;
+  same isolated-lane method): 92/100 passed. Failures: 1 guest panic
+  `terminal_publication.rs:212` "deferred retirement lost its terminal lifecycle or
+  kernel resume loan" (NEW site, evidence `~/rustos-evidence/4vcpu-100-round2-2026-11-09/`);
+  2 input-ring arm timeouts now reported as `state=AwaitingPolicyConsumer
+  policy_consumer_losses=0` (inputd policy consumer never became live); 5 UI/timeout
+  class (`rustos-runtime=false` x1, wayclick first frame x2, ipcbench end x1,
+  gpu-scene/compositor missing x1). The round-1 `resident.rs`/`runqueue.rs` panics did
+  not recur (0/100, round 1: 3/100: not statistically conclusive).
 - Note: Service bin targets with `test = false` are not built by
   `cargo test`; run `cargo check -p <svc>` (or `cargo xtask check`) as well.
 
@@ -367,3 +383,12 @@ re-audited by the Chrome desktop batch.
   smoke/interactive launches only warn on missing PR evidence; qualification /
   iteration modes enforce their matching seal. Run the PR gate explicitly for
   push/release evidence; see the updated build/KVM skills.
+
+## UI startup/readiness redesign (2026-11-09)
+
+Done: `services/uiserver/src/startup.rs` state machine, async wl_shm snapshot
+service + commit queue, input-ring arm watch/tracker, 16 mutation rows, docs in
+`docs/ai/ui-startup-readiness.md`. Unverified: no KVM boot; mutation rows were
+killed manually (runner `--only` blocked by stale scheduler anchors).
+Disconnected/deferred: initd 5 s endpoint barrier, harness reading
+`readiness v1`, acked OP_NOTIFY_READY. See the doc's section 9.

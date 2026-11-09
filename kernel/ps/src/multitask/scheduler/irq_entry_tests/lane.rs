@@ -48,6 +48,159 @@ fn park_receiver(slot: usize, peer: usize) {
         pin, permit, saved_rsp: token.saved_rsp, arch: peer_arch, cpu: 0 }));
 }
 
+/// Fresh loans for `peer` whose payload names `generation`, so a cell that is
+/// ever read with another generation's payload is detected.
+fn tagged_loans(slot: usize, peer: usize, generation: u64) -> resident::Loans {
+    let view = frame_publication::return_view(slot).unwrap();
+    let mut arch = stack_resources::context::retained_architecture(0, slot, ID, view).unwrap();
+    arch.fs = generation;
+    resident::Loans {
+        pin: stack_resources::cpu_leases::pin_initial(peer, ID + 1).expect("peer allocation pin"),
+        permit: current_identity::execution::initial(peer, ID + 1).expect("peer execution permit"),
+        saved_rsp: (generation as usize).wrapping_mul(16),
+        arch,
+        cpu: (generation % 4) as usize,
+    }
+}
+
+fn assert_tagged(loans: &resident::Loans, generation: u64) {
+    assert_eq!(loans.arch.fs, generation, "a taken cell carried another generation's payload");
+    assert_eq!(loans.saved_rsp, (generation as usize).wrapping_mul(16));
+    assert_eq!(loans.cpu, (generation % 4) as usize);
+}
+
+fn block_peer(peer: usize) {
+    runqueue::wait::set_reason(peer, runqueue::wait::REASON_ENDPOINT_RECEIVE, ENDPOINT);
+    runqueue::wait::set_blocked(peer, true);
+    runqueue::publish_blocked(peer, 0, runqueue::weight::value(peer));
+    frame_publication::bind_local_owner_generation(peer, runqueue::owner(peer).generation);
+}
+
+#[test]
+fn a_park_never_displaces_a_newer_cell_and_never_waits_on_a_busy_one() {
+    current_with_peer(true, |slot, peer| {
+        let peer = peer.unwrap();
+        quiet_fifo();
+        make_kernel_frame(slot);
+        make_kernel_frame(peer);
+        park_receiver(slot, peer);
+        let live = runqueue::owner(peer).generation;
+        let units = current_identity::execution::count(peer);
+        assert_eq!(resident::permit_units(peer), 1);
+
+        // An older park arrives late, after the task already parked a newer
+        // generation: it is the obsolete one and releases its own loans.
+        assert!(!resident::park(peer, live - 1, tagged_loans(slot, peer, live - 1)));
+        assert!(resident::is_resident(peer, live), "the newer cell must survive");
+        assert_eq!(current_identity::execution::count(peer), units, "the obsolete loans must be released");
+
+        // A busy cell (a taker mid-drain, a delayed parker mid-fill) is not waited
+        // for: the park gives its loans up and the cell stays exactly as found.
+        let taken = resident::take(peer, live).expect("the live cell");
+        assert_eq!(taken.cpu, 0, "the receiver parked on CPU 0");
+        drop(taken);
+        assert!(resident::test_hold_busy(peer));
+        assert_eq!(resident::permit_units(peer), 0, "a BUSY cell holds no parked permit unit");
+        let before = current_identity::execution::count(peer);
+        assert!(!resident::park(peer, live + 1, tagged_loans(slot, peer, live + 1)));
+        assert_eq!(resident::test_word(peer), u64::MAX, "a refused park must leave the busy word alone");
+        assert_eq!(current_identity::execution::count(peer), before);
+        // exec's eviction reports a busy cell as still occupied instead of
+        // pretending it is empty, so the caller keeps evicting until it is.
+        assert!(exec_transaction::evict_parked_target(peer), "a busy cell is not evicted yet");
+        resident::test_release_busy(peer);
+        assert_eq!(resident::test_word(peer), 0);
+        assert!(!exec_transaction::evict_parked_target(peer));
+    });
+}
+
+#[test]
+fn exec_eviction_drops_the_parked_cell_of_the_current_generation() {
+    current_with_peer(true, |slot, peer| {
+        let peer = peer.unwrap();
+        quiet_fifo();
+        make_kernel_frame(slot);
+        make_kernel_frame(peer);
+        park_receiver(slot, peer);
+        let units = current_identity::execution::count(peer);
+        assert_eq!(resident::permit_units(peer), 1);
+        assert!(!exec_transaction::evict_parked_target(peer));
+        assert_eq!(resident::test_word(peer), 0);
+        assert_eq!(resident::permit_units(peer), 0);
+        assert_eq!(current_identity::execution::count(peer), units,
+            "the evicted cell's permit unit must be dropped, not merely uncounted");
+    });
+}
+
+#[test]
+fn concurrent_parks_takes_and_late_hooks_never_tear_or_leak_a_cell() {
+    const THREADS: usize = 4;
+    const PER_THREAD: usize = 1500;
+    current_with_peer(true, |slot, peer| {
+        let peer = peer.unwrap();
+        quiet_fifo();
+        make_kernel_frame(slot);
+        make_kernel_frame(peer);
+        block_peer(peer);
+        let live = runqueue::owner(peer).generation;
+        let units = current_identity::execution::count(peer);
+        let pins = stack_resources::simd_resource_state(peer).unwrap().0;
+        let base = live + 1000;
+        // Every thread parks generations nobody else parks, and revokes or takes
+        // random recent ones (including `live`, the one generation the owner word
+        // still names, whose park really publishes). Loans are built up front: the
+        // admission leaves are not what is under test.
+        let mut work: Vec<Vec<(u64, resident::Loans)>> = (0..THREADS).map(|t| {
+            (0..PER_THREAD).map(|i| {
+                let generation = base + (i * THREADS + t) as u64;
+                (generation, tagged_loans(slot, peer, generation))
+            }).collect()
+        }).collect();
+        let mut live_loans: Vec<resident::Loans> = (0..PER_THREAD).map(|_| tagged_loans(slot, peer, live)).collect();
+        let published = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for (t, chunk) in work.drain(..).enumerate() {
+                let published = &published;
+                scope.spawn(move || {
+                    let mut seed = 0x9e37_79b9_7f4a_7c15_u64 ^ (t as u64 + 1);
+                    let mut next = move || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; seed };
+                    for (generation, loans) in chunk {
+                        let _ = resident::park(peer, generation, loans);
+                        let recent = base + next() % (PER_THREAD * THREADS) as u64;
+                        let target = if next() % 4 == 0 { live } else { recent };
+                        match next() % 3 {
+                            0 => if let Some(taken) = resident::take(peer, target) {
+                                assert_tagged(&taken, target);
+                                published.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            },
+                            1 => resident::on_owner_transition(peer, target),
+                            _ => std::hint::spin_loop(),
+                        }
+                    }
+                });
+            }
+            // The owner's own generation parks for real (the re-read finds it
+            // Blocked) and is taken back, as the lane does.
+            let published = &published;
+            scope.spawn(move || {
+                for loans in live_loans.drain(..) {
+                    if resident::park(peer, live, loans) {
+                        if let Some(taken) = resident::take(peer, live) {
+                            assert_tagged(&taken, live);
+                            published.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                }
+            });
+        });
+        assert_eq!(resident::test_word(peer), 0, "every cell must be settled once the racers are done");
+        assert_eq!(resident::permit_units(peer), 0);
+        assert_eq!(current_identity::execution::count(peer), units, "execution permits leaked or double-dropped");
+        assert_eq!(stack_resources::simd_resource_state(peer).unwrap().0, pins, "stack pins leaked or double-dropped");
+        assert!(published.load(std::sync::atomic::Ordering::Relaxed) > 0, "the racers never won a cell");
+    });
+}
+
 #[test]
 fn a_park_retires_the_stale_cell_of_an_older_generation_whose_evictor_is_late() {
     current_with_peer(true, |slot, peer| {

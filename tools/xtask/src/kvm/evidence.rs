@@ -3,6 +3,10 @@
 #[path = "evidence/smp_qualification.rs"]
 mod smp_qualification;
 
+#[path = "evidence/startup_readiness.rs"]
+mod startup_readiness;
+
+use startup_readiness::{startup_failure_detail, ui_readiness_failure, ui_readiness_settled};
 use smp_qualification::{KvmLaunchEvidenceSnapshot, KvmSuccessSummary, SmpEvidenceArchive};
 fn required_dvm_gpu_ready(
     options: &SmokeOptions,
@@ -683,7 +687,9 @@ fn validate_interactive_session(layout: &KvmLayout, pointer_observed: bool) -> R
     let dvm_log = read_runtime_log_if_present(&layout.dvm_serial_log)?;
     if runtime_stall_or_crash_observed(&rustos_log) || runtime_stall_or_crash_observed(&dvm_log) {
         bail!(
-            "interactive KVM DVM acceptance found a watchdog, stall, crash, or relay stop; inspect {} and {}",
+            "interactive KVM DVM acceptance found a watchdog, stall, crash, or relay stop ({}; DVM: {}); inspect {} and {}",
+            runtime_failure_detail(&rustos_log),
+            runtime_failure_detail(&dvm_log),
             layout.debugcon_log.display(),
             layout.dvm_serial_log.display(),
         );
@@ -1016,6 +1022,22 @@ fn runtime_stall_or_crash_observed(log: &str) -> bool {
     ];
     log.lines()
         .any(|line| FAILURES.iter().any(|failure| line.contains(failure)))
+        // The owner's typed record is the authority for startup failures; the
+        // free-text list above only covers crashes and stalls that have no
+        // typed record.
+        || ui_readiness_failure(log).is_some()
+}
+
+/// What to print next to a `runtime_stall_or_crash_observed` verdict: the typed
+/// startup cause when one exists, otherwise the first crash/stall marker line.
+fn runtime_failure_detail(log: &str) -> String {
+    startup_failure_detail(log)
+        .or_else(|| {
+            log.lines()
+                .find(|line| runtime_stall_or_crash_observed(line))
+                .map(|line| format!("first marker: {}", line.trim()))
+        })
+        .unwrap_or_else(|| "no failure marker".to_owned())
 }
 
 fn uiserver_display_field_is(fields: &str, name: &str, expected: u32) -> bool {
@@ -1224,7 +1246,14 @@ fn validate_ui_fps_proof(layout: &KvmLayout, options: &SmokeOptions) -> Result<(
     }
     if runtime_stall_or_crash_observed(&log) {
         bail!(
-            "KVM UI proof found a uiserver/scheduler watchdog, stall, or crash marker; inspect {}",
+            "KVM UI proof found a uiserver/scheduler watchdog, stall, or crash marker ({}); inspect {}",
+            runtime_failure_detail(&log),
+            layout.debugcon_log.display(),
+        );
+    }
+    if !ui_readiness_settled(&log) {
+        bail!(
+            "KVM UI proof passed its FPS windows but uiserver never published a settled `readiness v1` record (state=ready|degraded); inspect {}",
             layout.debugcon_log.display(),
         );
     }

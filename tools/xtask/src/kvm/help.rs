@@ -65,6 +65,14 @@ options:
                        after initial readiness, force an abrupt Linux-DVM exit
                        and/or restart RustOS in a fresh QEMU process;
                        require a new authenticated epoch and full readiness
+  --host-cpu-pressure <percent>
+                       timing profile for readiness claims: keep this percent
+                       (1..=100, rounded up to whole cores) of the host cores
+                       the run may use 100% busy, one pinned worker per core,
+                       for the whole run including every --repeat boot. The
+                       default is the idle-host profile. Not combinable with
+                       --smp-iteration, whose sealed evidence does not record
+                       the profile; ignored by --dry-run
   --smp-iteration      require framed, checksummed per-CPU scheduler lifecycle
                        evidence; restricted to a bounded 30-second KVM smoke
   --smp-ring3-qualification

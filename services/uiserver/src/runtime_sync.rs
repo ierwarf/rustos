@@ -9,6 +9,7 @@ use runtime_control::{
 };
 
 use crate::app::{HIDDEN_RUNTIME_PROGRAM_TITLES, MAX_RUNNING_PROGRAMS};
+use crate::startup::Dependency;
 use crate::sys::{spawn_ui_thread, UiThreadRole};
 
 /// Longest this worker asks runtimed to hold a reply while the running set is
@@ -53,16 +54,50 @@ pub(crate) struct RuntimeSyncHandle {
     shared: Arc<Mutex<SharedRuntimeState>>,
 }
 
-pub(crate) fn start_runtime_sync(runtime: RuntimeClient) -> RuntimeSyncHandle {
+/// Start the runtime link: one worker that owns every interaction with
+/// `runtimed` that can block.
+///
+/// Readiness toward the broker is a *level*, not an edge. `runtimed` only
+/// launches the first desktop client after it has been told the UI is ready,
+/// so a refused connect, a short write or a lost reply must not be forgotten.
+/// The worker drives the `Runtime` dependency (`crate::startup`) until
+/// `runtimed` has *acknowledged* `OP_NOTIFY_READY` (runtime-control wire v2: the
+/// reply is sent after the broker recorded the edge), under that dependency's
+/// bounded backoff, and only then enters the running-set watch. The operation is
+/// idempotent on the broker, so a retry after a lost ack is safe.
+pub(crate) fn start_runtime_sync() -> RuntimeSyncHandle {
     let shared = Arc::new(Mutex::new(SharedRuntimeState::default()));
     let worker_shared = Arc::clone(&shared);
-    spawn_ui_thread(
-        UiThreadRole::Background,
-        "uiserver-runtime-sync",
-        move || runtime_sync_worker(runtime, worker_shared),
-    )
+    spawn_ui_thread(UiThreadRole::Background, "uiserver-runtime-sync", move || {
+        let startup = crate::startup::global();
+        let runtime = match startup.drive(Dependency::Runtime, notify_error_is_retryable, || {
+            let runtime = RuntimeClient::open_default()?;
+            runtime.notify_ui_ready()?;
+            Ok(runtime)
+        }) {
+            Ok(runtime) => runtime,
+            Err(errno) => {
+                crate::sys::diag_line(format!("uiserver: ui ready notify failed errno={errno}"));
+                return;
+            }
+        };
+        startup.succeed(Dependency::Runtime);
+        crate::sys::diag_line("uiserver: ui ready notified");
+        runtime_sync_worker(runtime, worker_shared)
+    })
     .unwrap_or_else(|_| std::process::exit(134));
     RuntimeSyncHandle { shared }
+}
+
+/// Only a malformed, unsupported, unauthorised or version-mismatched request is
+/// permanent (`EPROTO`: a mixed-version build cannot converge by retrying);
+/// every transport error (refused connect, `EAGAIN`, `ETIMEDOUT`, a missing ack,
+/// a not-yet-bound socket) is the broker not being reachable *yet*.
+fn notify_error_is_retryable(errno: i32) -> bool {
+    !matches!(
+        errno,
+        libc::EINVAL | libc::EOPNOTSUPP | libc::EPERM | libc::EACCES | libc::EPROTO
+    )
 }
 
 pub(crate) fn refresh_runtime_state(
@@ -143,4 +178,19 @@ pub(crate) fn runtime_program_display_name(
     program: &RuntimeRunningProgram,
 ) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(decode_c_string(&program.display_name))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::notify_error_is_retryable;
+
+    #[test]
+    fn only_permanent_request_errors_stop_the_ready_notification() {
+        for transient in [libc::ECONNREFUSED, libc::ENOENT, libc::EAGAIN, libc::ETIMEDOUT, libc::EPIPE] {
+            assert!(notify_error_is_retryable(transient), "errno {transient}");
+        }
+        for permanent in [libc::EINVAL, libc::EOPNOTSUPP, libc::EPERM, libc::EACCES, libc::EPROTO] {
+            assert!(!notify_error_is_retryable(permanent), "errno {permanent}");
+        }
+    }
 }

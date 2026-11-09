@@ -16,6 +16,7 @@ mod loop_timing;
 mod profile;
 mod render;
 mod runtime_sync;
+mod startup;
 mod simd;
 mod sys;
 mod terminal;
@@ -37,8 +38,8 @@ use diagnostics::{install_panic_hook, log_frame_sample, log_slow_console_refresh
 use loop_timing::{log_slow_loop_iteration, LoopPhaseTimings};
 use render::start_desktop_background_loader;
 use render::{render_boot_frame, render_frame, render_rect};
-use runtime_control::RuntimeClient;
 use runtime_sync::{refresh_runtime_state, start_runtime_sync, RuntimeState};
+use startup::Dependency;
 use sys::{
     background_thread_demotion_count, boot_line, diag_line, heartbeat_line,
     spawn_ui_thread, UiThreadRole,
@@ -516,6 +517,8 @@ fn run() -> Result<(), i32> {
     // turn; placing Wayland behind those jobs made a valid desktop miss the
     // finite product-readiness deadline without any protocol failure.
     diag_line("uiserver: wayland initialize begin");
+    let startup = startup::global();
+    startup.begin(Dependency::Wayland);
     let wayland_init_started = Instant::now();
     let mut wayland = WaylandCompositor::initialize(
         state.display.width,
@@ -524,6 +527,7 @@ fn run() -> Result<(), i32> {
     )
     .ok_or_else(|| {
         diag_line("uiserver: mandatory Wayland compositor initialization failed");
+        startup.fail(Dependency::Wayland, libc::EIO, false);
         libc::EIO
     })?;
     wayland
@@ -532,8 +536,10 @@ fn run() -> Result<(), i32> {
             diag_line(format!(
                 "uiserver: Wayland readiness waiter initialization failed: {err}"
             ));
+            startup.fail(Dependency::Wayland, libc::EIO, false);
             libc::EIO
         })?;
+    startup.succeed(Dependency::Wayland);
     diag_line("uiserver: wayland initialize done");
     log_boot_stage(wayland_init_started, "wayland_initialize");
     boot_line("uiserver: run initialize done");
@@ -578,26 +584,13 @@ fn run() -> Result<(), i32> {
     let mut pending_update = VisualUpdate::default();
     let mut presented_cursor_x = state.cursor_x;
     let mut presented_cursor_y = state.cursor_y;
-    diag_line("uiserver: runtime client open begin");
-    let runtime_open_started = Instant::now();
+    // The runtime link (ready notification and running-set watch) runs on its
+    // own worker under the `Runtime` dependency's retry policy; nothing on this
+    // thread waits for runtimed.
+    diag_line("uiserver: runtime link start");
     let mut runtime_state = RuntimeState::default();
-    let runtime = RuntimeClient::open_default().map_err(|_| {
-        diag_line("uiserver: open runtimed socket failed");
-        19
-    })?;
-    diag_line("uiserver: runtime client open done");
-    log_boot_stage(runtime_open_started, "runtime_client_open");
-    let runtime_sync = RuntimeClient::open_default()
-        .map(start_runtime_sync)
-        .map_err(|_| {
-            diag_line("uiserver: open runtimed sync socket failed");
-            19
-        })?;
+    let runtime_sync = start_runtime_sync();
     sys::mark_display_policy_ready();
-    match runtime.notify_ui_ready() {
-        Ok(()) => diag_line("uiserver: ui ready notified"),
-        Err(err) => diag_line(format!("uiserver: ui ready notify failed errno={err}")),
-    }
     diag_line("uiserver: post-present init done");
     log_boot_stage(boot_started, "post_present_init");
     let launcher_programs = start_launcher_program_loader();
@@ -642,6 +635,16 @@ fn run() -> Result<(), i32> {
         loop_count = loop_count.saturating_add(1);
         total_loop_count = total_loop_count.saturating_add(1);
         watchdog.begin_loop(total_loop_count);
+        // A required dependency that spent its owned budget (or whose worker
+        // vanished) is a published, typed failure: leave with its errno so the
+        // supervisor sees the cause instead of an unexplained hang.
+        if let Some((dependency, errno)) = startup.poll_failure() {
+            diag_line(format!(
+                "uiserver: required dependency failed dependency={} errno={errno}",
+                dependency.name()
+            ));
+            return Err(errno);
+        }
         let iteration_started = Instant::now();
         let mut phase_timings = LoopPhaseTimings {
             frame_seq: loop_timing::next_frame_seq(),

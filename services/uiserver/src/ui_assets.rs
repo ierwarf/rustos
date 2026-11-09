@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 
 use crate::app::{ConsoleWindow, DesktopSurfaceCache};
 use crate::glyph_atlas::{build_atlas, GlyphAtlas};
+use crate::startup::Dependency;
 use crate::sys::{spawn_ui_thread, UiThreadRole};
 use crate::ui_config::{self, FontRole, MAX_CONFIG_BYTES, MAX_FONT_FILE_BYTES};
 
@@ -104,11 +105,17 @@ pub(crate) fn promote(
     ASSETS.promote(loaded, desktop, consoles)
 }
 
-/// Wait between attempts while the boot volume is not readable yet.
-const RETRY_INTERVAL: Duration = Duration::from_millis(250);
-/// How long the loader keeps trying before giving up, which bounds how long a
-/// permanently missing volume keeps a thread polling.
-const RETRY_BUDGET: Duration = Duration::from_secs(60);
+/// The wait between attempts and the total budget are the `Assets`
+/// dependency's owned policy (`crate::startup::Dependency::policy`), so the
+/// published readiness record and this loop can never disagree about when the
+/// loader gives up.
+fn retry_budget() -> Duration {
+    Dependency::Assets.policy().total_budget
+}
+
+fn retry_interval() -> Duration {
+    Dependency::Assets.policy().initial_backoff
+}
 
 /// The active set; bundled geometry and pixels are available without storage.
 pub(crate) fn assets() -> &'static UiAssets {
@@ -146,7 +153,9 @@ pub(crate) fn start_asset_loader() -> Receiver<AssetLoad> {
             let started = Instant::now();
             let path = config_path();
             let mut waited = false;
-            let outcome = retry_transient(RETRY_BUDGET, RETRY_INTERVAL, || {
+            let startup = crate::startup::global();
+            startup.begin(Dependency::Assets);
+            let outcome = retry_transient(retry_budget(), retry_interval(), || {
                 UiAssets::load(&path).inspect_err(|error| {
                     // One line for the whole wait, not one per attempt.
                     if !std::mem::replace(&mut waited, true) {
@@ -158,6 +167,14 @@ pub(crate) fn start_asset_loader() -> Receiver<AssetLoad> {
                 })
             });
             let elapsed_ms = started.elapsed().as_millis();
+            match &outcome {
+                Ok(_) => startup.succeed(Dependency::Assets),
+                // Bundled typography is a complete fallback, so the desktop
+                // degrades instead of failing; the record still says why.
+                Err(_) => {
+                    startup.fail(Dependency::Assets, libc::ENOENT, false);
+                }
+            }
             let report = match outcome {
                 Ok(loaded) => {
                     let summary = format!("{} elapsed_ms={elapsed_ms}", loaded.summary());

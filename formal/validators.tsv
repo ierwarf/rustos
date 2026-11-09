@@ -1,0 +1,10 @@
+# id	package	sources (comma separated)	replaces (retired TLA+ models)	checked property
+# A validator is a sequential, single-actor admission check whose executable test is the
+# complete specification. See docs/ai/formal-scope-policy.md for the admission rule and the
+# retired-model ledger. Every validator needs source-conformance witnesses and
+# implementation-mutation rows that its witnesses kill (formal/check-validators.py).
+validator:image-admission	rustos-image-admission	libs/rustos-image-admission/src/lib.rs	dual-abi-image-admission,dual-abi-byte-parser	ELF64/PE64 bytes and plans are admitted exactly when they are bounded, non-overlapping, W^X, entry-executable, relocation- and import-valid
+validator:pci-bar-sizing	kernel-hal	kernel/hal/src/arch/pci.rs	pci-bar-discovery	BAR sizing disables decode, restores each dword before the next probe, never touches a register outside the function window, and publishes one resource or none
+validator:acpi-table-admission	kernel-hal	kernel/hal/src/arch/acpi.rs	acpi-table-admission	RSDT/XSDT, MCFG and HPET are published only when exact, bounded, aligned and non-overlapping, and a rejected table publishes nothing
+validator:madt-topology-admission	kernel-hal	kernel/hal/src/arch/acpi.rs	cpu-topology-admission	MADT publishes a dense, unique, bounded CPU set with the executing BSP at logical zero or nothing
+validator:early-system-content	kernel-io-manager	kernel/io-manager/src/storage/boot_volume.rs	filesystem-content-integrity	an early-system lookup returns exactly the signed payload for a canonical table and no other bytes

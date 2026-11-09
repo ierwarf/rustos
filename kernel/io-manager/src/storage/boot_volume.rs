@@ -318,8 +318,8 @@ fn boot_info() -> Option<&'static BootInfo> {
 
 #[cfg(test)]
 mod tests {
-    use super::{BootstrapImageError, early_system_payload};
-    use alloc::vec;
+    use super::{BootstrapImageError, cached_early_system_payload, early_system_payload};
+    use alloc::{vec, vec::Vec};
     use boot_protocol::{
         EARLY_SYSTEM_ENTRY_BYTES, EARLY_SYSTEM_HEADER_BYTES, EarlySystemEntry, EarlySystemHeader,
     };
@@ -354,5 +354,234 @@ mod tests {
             early_system_payload(&image, "/services/rootd/rootd.elf"),
             Err(BootstrapImageError::Invalid)
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Content-integrity properties of the signed early-system image.
+    //
+    // These replace the retired `filesystem-content-integrity` TLA+ model, whose
+    // `VerifiedContentMatchesManifest`, `BadContentNeverVerifies` and
+    // `TerminalReadHasExactEvidenceShape` invariants were stated over two
+    // symbolic digests. Here the production table walk and SHA-256 admission
+    // run over every single-byte corruption of a real image.
+    // -----------------------------------------------------------------------
+
+    const ROOTD: &[u8] = b"services/rootd/rootd.elf";
+    const LOADERD: &[u8] = b"services/loaderd/loaderd.elf";
+
+    struct Spec<'a> {
+        path: &'a [u8],
+        payload: &'a [u8],
+        offset: u64,
+        digest: Option<[u8; 32]>,
+    }
+
+    fn spec<'a>(path: &'a [u8], payload: &'a [u8], offset: u64) -> Spec<'a> {
+        Spec {
+            path,
+            payload,
+            offset,
+            digest: None,
+        }
+    }
+
+    /// Build an image whose table lists `files` in the given order.
+    fn image(files: &[Spec<'_>], tail_slack: u64) -> Vec<u8> {
+        let end = files
+            .iter()
+            .map(|f| f.offset + f.payload.len() as u64)
+            .max()
+            .unwrap();
+        let header =
+            EarlySystemHeader::new(files.len() as u32, 4096, end + tail_slack, [0x5a; 32]).unwrap();
+        let mut bytes = vec![0_u8; header.total_bytes as usize];
+        bytes[..EARLY_SYSTEM_HEADER_BYTES].copy_from_slice(&header.encode().unwrap());
+        for (index, file) in files.iter().enumerate() {
+            let digest = file
+                .digest
+                .unwrap_or_else(|| Sha256::digest(file.payload).into());
+            let entry =
+                EarlySystemEntry::new(file.path, file.offset, file.payload.len() as u64, digest)
+                    .unwrap();
+            let at = EARLY_SYSTEM_HEADER_BYTES + index * EARLY_SYSTEM_ENTRY_BYTES;
+            bytes[at..at + EARLY_SYSTEM_ENTRY_BYTES]
+                .copy_from_slice(&entry.encode(header).unwrap());
+            bytes[file.offset as usize..file.offset as usize + file.payload.len()]
+                .copy_from_slice(file.payload);
+        }
+        bytes
+    }
+
+    fn two_file_image() -> Vec<u8> {
+        // Paths are sorted: loaderd < rootd.
+        image(
+            &[
+                spec(LOADERD, b"loaderd payload bytes", 4096),
+                spec(ROOTD, b"rootd early payload", 8192),
+            ],
+            0,
+        )
+    }
+
+    fn lookup(bytes: &[u8], path: &str) -> Result<Option<Vec<u8>>, BootstrapImageError> {
+        early_system_payload(bytes, path).map(|found| found.map(<[u8]>::to_vec))
+    }
+
+    #[test]
+    fn a_corrupted_image_never_returns_content_other_than_the_signed_payload() {
+        let pristine = two_file_image();
+        let expected = [
+            (
+                "/services/loaderd/loaderd.elf",
+                b"loaderd payload bytes".as_slice(),
+            ),
+            (
+                "/services/rootd/rootd.elf",
+                b"rootd early payload".as_slice(),
+            ),
+        ];
+        for (path, payload) in expected {
+            assert_eq!(lookup(&pristine, path).unwrap().as_deref(), Some(payload));
+        }
+        let (mut admitted_unchanged, mut refused) = (0usize, 0usize);
+        for position in 0..pristine.len() {
+            for value in [0x00_u8, 0x01, 0x7f, 0x80, 0xff] {
+                if pristine[position] == value {
+                    continue;
+                }
+                let mut corrupted = pristine.clone();
+                corrupted[position] = value;
+                for (path, payload) in expected {
+                    match lookup(&corrupted, path) {
+                        // Alignment padding is outside every digest, so a
+                        // corruption there leaves the verified content exact.
+                        Ok(Some(found)) => {
+                            assert_eq!(found, payload, "byte {position:#x}={value:#x} path {path}");
+                            admitted_unchanged += 1;
+                        }
+                        Ok(None) | Err(_) => refused += 1,
+                    }
+                }
+                assert_eq!(
+                    lookup(&corrupted, "/services/missing")
+                        .map(|v| v.is_some())
+                        .unwrap_or(false),
+                    false
+                );
+            }
+        }
+        assert!(
+            admitted_unchanged > 0 && refused > 0,
+            "{admitted_unchanged}/{refused}"
+        );
+    }
+
+    #[test]
+    fn every_truncation_of_the_image_is_refused() {
+        let pristine = two_file_image();
+        for len in 0..pristine.len() {
+            assert_eq!(
+                lookup(&pristine[..len], "/services/rootd/rootd.elf"),
+                Err(BootstrapImageError::Invalid),
+                "len {len}"
+            );
+        }
+        let mut longer = pristine.clone();
+        longer.push(0);
+        assert_eq!(
+            lookup(&longer, "/services/rootd/rootd.elf"),
+            Err(BootstrapImageError::Invalid)
+        );
+    }
+
+    #[test]
+    fn a_table_that_is_not_canonical_is_refused_even_when_every_digest_is_valid() {
+        let payload = b"shared payload";
+        // Two entries naming the same payload range overlap.
+        let overlapping = image(
+            &[spec(LOADERD, payload, 4096), spec(ROOTD, payload, 4096)],
+            0,
+        );
+        assert_eq!(
+            lookup(&overlapping, "/services/rootd/rootd.elf"),
+            Err(BootstrapImageError::Invalid)
+        );
+        // The same path twice (and any unsorted order) breaks the strict order.
+        let duplicate = image(&[spec(ROOTD, payload, 4096), spec(ROOTD, payload, 8192)], 0);
+        assert_eq!(
+            lookup(&duplicate, "/services/rootd/rootd.elf"),
+            Err(BootstrapImageError::Invalid)
+        );
+        let unsorted = image(
+            &[spec(ROOTD, payload, 4096), spec(LOADERD, payload, 8192)],
+            0,
+        );
+        assert_eq!(
+            lookup(&unsorted, "/services/rootd/rootd.elf"),
+            Err(BootstrapImageError::Invalid)
+        );
+        // Bytes after the last payload are not covered by any digest.
+        let slack = image(&[spec(ROOTD, payload, 4096)], 7);
+        assert_eq!(
+            lookup(&slack, "/services/rootd/rootd.elf"),
+            Err(BootstrapImageError::Invalid)
+        );
+        // A payload that does not start on the declared alignment.
+        let misaligned = image(&[spec(ROOTD, payload, 4096 + 8)], 0);
+        assert_eq!(
+            lookup(&misaligned, "/services/rootd/rootd.elf"),
+            Err(BootstrapImageError::Invalid)
+        );
+        // A digest that does not match the payload is refused.
+        let wrong = image(
+            &[Spec {
+                digest: Some([0x11; 32]),
+                ..spec(ROOTD, payload, 4096)
+            }],
+            0,
+        );
+        assert_eq!(
+            lookup(&wrong, "/services/rootd/rootd.elf"),
+            Err(BootstrapImageError::Invalid)
+        );
+    }
+
+    #[test]
+    fn a_path_outside_the_bootstrap_namespace_resolves_to_nothing() {
+        let pristine = two_file_image();
+        for path in [
+            "",
+            "/",
+            "//",
+            "/services/../services/rootd/rootd.elf",
+            "/services/rootd/",
+            "/missing",
+        ] {
+            assert_eq!(lookup(&pristine, path), Ok(None), "{path:?}");
+        }
+    }
+
+    #[test]
+    fn the_verified_payload_cache_is_bound_to_the_exact_image() {
+        // A leaked copy stands in for the immutable bootloader module.
+        let good: &'static [u8] = vec_leak(two_file_image());
+        let mut bad_copy = two_file_image();
+        let at = 8192;
+        bad_copy[at] ^= 0xff;
+        let bad: &'static [u8] = vec_leak(bad_copy);
+        let path = "/services/rootd/rootd.elf";
+        assert!(cached_early_system_payload(good, path).unwrap().is_some());
+        // The corrupted image has the same offsets, lengths and table digest.
+        // Only its address differs; a cache that ignored the address would
+        // return the unverified bytes.
+        assert_eq!(
+            cached_early_system_payload(bad, path),
+            Err(BootstrapImageError::Invalid)
+        );
+        assert!(cached_early_system_payload(good, path).unwrap().is_some());
+    }
+
+    fn vec_leak(bytes: Vec<u8>) -> &'static [u8] {
+        alloc::boxed::Box::leak(bytes.into_boxed_slice())
     }
 }

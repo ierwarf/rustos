@@ -190,19 +190,18 @@ impl RuntimeClient {
         Ok(())
     }
 
+    /// Tell `runtimed` the compositor is ready, and return only once `runtimed`
+    /// has recorded it and acknowledged. `Ok` means the broker holds the edge;
+    /// any error means it may not, and the caller retries (the operation is
+    /// idempotent on the server).
     pub fn notify_ui_ready(&self) -> Result<(), i32> {
         let request = RuntimeRequest {
             op: OP_NOTIFY_READY,
             target_kind: READY_COMPONENT_UI_SERVER,
             ..RuntimeRequest::default()
         };
-        self.send_oneway(&request)?;
+        let _ = self.exchange(&request)?;
         Ok(())
-    }
-
-    fn send_oneway(&self, request: &RuntimeRequest) -> Result<(), i32> {
-        let mut stream = connect_nonblocking_unix(&self.socket_path)?;
-        write_all_retry(&mut stream, as_bytes(request))
     }
 
     fn exchange(&self, request: &RuntimeRequest) -> Result<(RuntimeResponse, Vec<u8>), i32> {
@@ -410,10 +409,6 @@ fn write_all_retry_until(
         }
     }
     Ok(())
-}
-
-fn write_all_retry(stream: &mut UnixStream, bytes: &[u8]) -> Result<(), i32> {
-    write_all_retry_until(stream, bytes, RPC_IO_TIMEOUT)
 }
 
 fn read_exact_retry_until(
@@ -1287,6 +1282,94 @@ mod tests {
                 payload_count,
             )
             .expect("write formal trace");
+        }
+    }
+
+    mod ready_ack_tests {
+        use super::super::protocol::{RuntimeRequest, RuntimeResponse};
+        use super::super::{
+            as_bytes, as_bytes_mut, RuntimeClient, OP_NOTIFY_READY, PROTOCOL_VERSION,
+            READY_COMPONENT_UI_SERVER,
+        };
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixListener;
+
+        /// A one-connection server: reads one request, then lets `reply` decide
+        /// what, if anything, goes back before the stream closes.
+        fn serve_once(
+            name: &str,
+            reply: impl FnOnce(&mut std::os::unix::net::UnixStream, RuntimeRequest) + Send + 'static,
+        ) -> (RuntimeClient, std::thread::JoinHandle<()>) {
+            let dir = std::env::temp_dir().join(format!("rc-ack-{name}-{}", std::process::id()));
+            let _ = std::fs::remove_file(&dir);
+            let listener = UnixListener::bind(&dir).expect("bind");
+            let path = dir.to_str().expect("utf8 path").to_owned();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let mut request = RuntimeRequest::default();
+                stream.read_exact(as_bytes_mut(&mut request)).expect("request");
+                reply(&mut stream, request);
+                let _ = std::fs::remove_file(&dir);
+            });
+            (RuntimeClient::open(&path).expect("client"), server)
+        }
+
+        #[test]
+        fn notify_ui_ready_succeeds_only_after_the_server_acknowledges() {
+            let (client, server) = serve_once("ack", |stream, request| {
+                assert_eq!(request.version, PROTOCOL_VERSION);
+                assert_eq!(request.op, OP_NOTIFY_READY);
+                assert_eq!(request.target_kind, READY_COMPONENT_UI_SERVER);
+                let ack = RuntimeResponse {
+                    version: PROTOCOL_VERSION,
+                    op: OP_NOTIFY_READY,
+                    status: 0,
+                    count: 0,
+                };
+                stream.write_all(as_bytes(&ack)).expect("ack");
+            });
+            assert_eq!(client.notify_ui_ready(), Ok(()));
+            server.join().expect("server");
+        }
+
+        #[test]
+        fn a_write_that_is_never_acknowledged_is_not_delivery() {
+            // The pre-v2 contract treated a completed write as success. A server
+            // that reads the request and closes without replying must now be
+            // reported as a failure so the caller retries.
+            let (client, server) = serve_once("noack", |_stream, _request| {});
+            assert_eq!(client.notify_ui_ready(), Err(libc::EPIPE));
+            server.join().expect("server");
+        }
+
+        #[test]
+        fn a_server_error_reply_is_surfaced_with_its_errno() {
+            let (client, server) = serve_once("err", |stream, _request| {
+                let error = RuntimeResponse {
+                    version: PROTOCOL_VERSION,
+                    op: 0,
+                    status: -libc::EACCES,
+                    count: 0,
+                };
+                stream.write_all(as_bytes(&error)).expect("error reply");
+            });
+            assert_eq!(client.notify_ui_ready(), Err(libc::EACCES));
+            server.join().expect("server");
+        }
+
+        #[test]
+        fn a_previous_wire_version_reply_is_refused() {
+            let (client, server) = serve_once("v1", |stream, _request| {
+                let old = RuntimeResponse {
+                    version: PROTOCOL_VERSION - 1,
+                    op: OP_NOTIFY_READY,
+                    status: 0,
+                    count: 0,
+                };
+                stream.write_all(as_bytes(&old)).expect("reply");
+            });
+            assert_eq!(client.notify_ui_ready(), Err(libc::EPROTO));
+            server.join().expect("server");
         }
     }
 }

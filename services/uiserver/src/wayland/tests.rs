@@ -152,13 +152,13 @@ fn test_ticket() -> super::LiveObjectTicket {
     super::LiveObjectTicket::admit(&counter, usize::MAX, None).expect("ticket")
 }
 
-fn test_display() -> wayland_server::Display<super::WaylandState> {
+pub(super) fn test_display() -> wayland_server::Display<super::WaylandState> {
     wayland_server::Display::<super::WaylandState>::new().expect("display")
 }
 
 /// Client ids are only unique within one display, so tests that compare
 /// clients must insert them into the same display.
-fn test_client(
+pub(super) fn test_client(
     display: &wayland_server::Display<super::WaylandState>,
 ) -> wayland_server::backend::ClientId {
     use std::os::unix::net::UnixStream;
@@ -277,6 +277,18 @@ fn shm_file(bytes: &[u8]) -> std::fs::File {
     file
 }
 
+/// Plan and run a full snapshot the way a snapshot worker does.
+fn copy_pixels(buffer: &super::BufferData) -> Option<(Arc<Vec<u32>>, usize, usize, usize)> {
+    match buffer.plan_full()?.run().ok()? {
+        super::SnapshotPixels::Full {
+            pixels,
+            width,
+            height,
+        } => Some((Arc::new(pixels), width, height, width)),
+        super::SnapshotPixels::Damage { .. } => None,
+    }
+}
+
 fn shm_buffer(
     pool: Arc<std::sync::Mutex<super::WaylandShmPoolState>>,
     offset: usize,
@@ -313,10 +325,10 @@ fn shm_truncate_after_pool_admission_never_dereferences_client_pages() {
     let pool =
         super::WaylandShmPoolState::new(OwnedFd::from(file.try_clone().unwrap()), 8, test_ticket()).unwrap();
     let buffer = shm_buffer(Arc::new(std::sync::Mutex::new(pool)), 0, 1, 2, 4);
-    let (pixels, ..) = buffer.copy_pixels().unwrap();
+    let (pixels, ..) = copy_pixels(&buffer).unwrap();
     assert_eq!(&**pixels, &[0xff03_0201, 0xff06_0504]);
     file.set_len(0).unwrap();
-    assert!(buffer.copy_pixels().is_none());
+    assert!(copy_pixels(&buffer).is_none());
     assert_eq!(
         &**pixels,
         &[0xff03_0201, 0xff06_0504],
@@ -331,21 +343,21 @@ fn shm_failed_damage_read_is_transactional_and_preserves_shared_snapshot() {
     let pool =
         super::WaylandShmPoolState::new(OwnedFd::from(file.try_clone().unwrap()), 8, test_ticket()).unwrap();
     let buffer = shm_buffer(Arc::new(std::sync::Mutex::new(pool)), 0, 1, 2, 4);
-    let mut retained = Arc::new(vec![0xff11_1111, 0xff22_2222]);
+    let retained: Arc<Vec<u32>> = Arc::new(vec![0xff11_1111, 0xff22_2222]);
     let presented = retained.clone();
     file.set_len(4).unwrap(); // first row is readable, second would SIGBUS under mmap
-    assert!(!buffer.copy_damage_into(
-        &mut retained,
-        1,
-        2,
-        1,
-        Rect {
-            x: 0,
-            y: 0,
-            width: 1,
-            height: 2
-        }
-    ));
+    let damage = Rect {
+        x: 0,
+        y: 0,
+        width: 1,
+        height: 2,
+    };
+    // Planning succeeds; the read then fails short and produces no pixels, so
+    // there is nothing to blit into the retained snapshot.
+    let super::buffer::DamagePlan::Read(spec) = buffer.plan_damage(1, 2, 1, 2, damage) else {
+        panic!("a layout-compatible damage commit plans a read");
+    };
+    assert!(spec.run().is_err());
     assert_eq!(retained, presented);
     assert!(
         Arc::ptr_eq(&retained, &presented),
@@ -370,10 +382,10 @@ fn shm_pool_growth_validates_backing_before_publication_and_old_buffers_survive(
     assert!(pool.lock().unwrap().resize(4).is_err());
     assert_eq!(pool.lock().unwrap().len, 8);
     let new_buffer = shm_buffer(pool.clone(), 4, 1, 1, 4);
-    assert_eq!(old_buffer.copy_pixels().unwrap().0[0], 0xff03_0201);
-    assert_eq!(new_buffer.copy_pixels().unwrap().0[0], 0xff06_0504);
+    assert_eq!(copy_pixels(&old_buffer).unwrap().0[0], 0xff03_0201);
+    assert_eq!(copy_pixels(&new_buffer).unwrap().0[0], 0xff06_0504);
     file.set_len(4).unwrap();
-    assert!(new_buffer.copy_pixels().is_none());
+    assert!(copy_pixels(&new_buffer).is_none());
 }
 
 #[test]
@@ -389,11 +401,11 @@ fn shm_pool_destroy_and_client_fd_close_do_not_retire_live_buffers() {
     let buffer = shm_buffer(data.shared.clone(), 0, 1, 1, 4);
     drop(data); // wl_shm_pool.destroy
     drop(file); // client disconnect/close
-    assert_eq!(buffer.copy_pixels().unwrap().0[0], 0xff03_0201);
+    assert_eq!(copy_pixels(&buffer).unwrap().0[0], 0xff03_0201);
     let attached = buffer.clone();
     drop(buffer); // wl_buffer.destroy while attachment still owns backing
     assert!(weak.upgrade().is_some());
-    assert_eq!(attached.copy_pixels().unwrap().0[0], 0xff03_0201);
+    assert_eq!(copy_pixels(&attached).unwrap().0[0], 0xff03_0201);
     drop(attached);
     assert!(
         weak.upgrade().is_none(),

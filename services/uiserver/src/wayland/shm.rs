@@ -244,7 +244,7 @@ impl WaylandShmPoolState {
     pub(super) fn new(fd: OwnedFd, len: usize, ticket: LiveObjectTicket) -> std::io::Result<Self> {
         validate_shm_extent(fd.as_raw_fd(), len)?;
         Ok(Self {
-            fd,
+            fd: Arc::new(fd),
             len,
             _ticket: ticket,
         })
@@ -266,16 +266,23 @@ pub(super) fn validate_shm_extent(fd: std::os::fd::RawFd, len: usize) -> std::io
     if len == 0 || len > MAX_WAYLAND_SHM_POOL_BYTES {
         return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
     }
-    require_regular_file(fd)?;
-    read_shm_snapshot(fd, len - 1, 1).map(|_| ())
+    // Admission is metadata only: one `fstat`, no data read. The backing may
+    // still shrink afterwards, which is why every later read is a short-I/O-safe
+    // snapshot rather than a mapping.
+    let size = require_regular_file(fd)?;
+    if size < len as u64 {
+        return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+    }
+    Ok(())
 }
 
-/// A pool fd is client-chosen, and `pread` on it runs on the compositor's UI
-/// thread. Only a regular file (memfd, or a vfsd-backed file whose read is one
-/// deadline-bounded service call) has a bounded read; a FIFO, socket, tty or
-/// device can park the compositor for as long as its peer likes, so those are
-/// refused at admission instead of being read.
-fn require_regular_file(fd: std::os::fd::RawFd) -> std::io::Result<()> {
+/// A pool fd is client-chosen. Snapshot reads run on the bounded workers in
+/// `snapshot.rs`, never on the UI thread, but a worker is still a scarce
+/// resource: only a regular file (memfd, or a vfsd-backed file whose read is one
+/// deadline-bounded service call) has a bounded read. A FIFO, socket, tty or
+/// device can park a worker for as long as its peer likes, so those are refused
+/// at admission instead of being read. Returns the file size.
+fn require_regular_file(fd: std::os::fd::RawFd) -> std::io::Result<u64> {
     // SAFETY: `stat` is plain data and `fstat` fully initialises it on success.
     let mut stat: libc::stat = unsafe { std::mem::zeroed() };
     // SAFETY: `stat` is a valid out-pointer for the duration of the call.
@@ -285,7 +292,7 @@ fn require_regular_file(fd: std::os::fd::RawFd) -> std::io::Result<()> {
     if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
         return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
     }
-    Ok(())
+    Ok(u64::try_from(stat.st_size).unwrap_or(0))
 }
 
 /// Never form a reference into client-backed pages. RustOS supports pread for

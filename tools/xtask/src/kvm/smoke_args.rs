@@ -31,6 +31,10 @@ struct SmokeOptions {
     dvm_block_shmem: bool,
     rustos_vcpus: u8,
     smp_iteration: bool,
+    /// Percent of the host cores the run may use that are kept busy for the
+    /// whole run (`--host-cpu-pressure`, see `kvm/host_pressure.rs`). `None`
+    /// is the idle-host profile; `Some` is a distinct timing profile.
+    host_cpu_pressure: Option<u8>,
     /// Internal launch-policy override. This is deliberately not parsed from
     /// CLI input: benchmark may select the bounded formal model without also
     /// enabling the 30-second runtime `smp_iteration` evidence mode.
@@ -113,6 +117,7 @@ where
         dvm_block_shmem: false,
         rustos_vcpus: DEFAULT_RUSTOS_VCPUS,
         smp_iteration: false,
+        host_cpu_pressure: None,
         smp_formal_profile_override: None,
         smp_ring3_qualification: false,
         smp_evidence_cohort: None,
@@ -170,6 +175,13 @@ where
                 options.rustos_vcpus = parse_rustos_vcpus(next_value(&mut args, "--rustos-vcpus")?)?
             }
             "--smp-iteration" => options.smp_iteration = true,
+            "--host-cpu-pressure" => {
+                if options.host_cpu_pressure.is_some() {
+                    bail!("--host-cpu-pressure was supplied more than once");
+                }
+                let value = next_value(&mut args, "--host-cpu-pressure")?;
+                options.host_cpu_pressure = Some(host_pressure::parse_host_cpu_pressure(&value)?);
+            }
             "--smp-ring3-qualification" => options.smp_ring3_qualification = true,
             "--smp-evidence-cohort" => {
                 if options.smp_evidence_cohort.is_some() {
@@ -347,6 +359,14 @@ where
         options.gui_dvm_surfaces = true;
         options.exercise_input = true;
         options.dvm_block_shmem = true;
+    }
+    if options.host_cpu_pressure.is_some() && options.smp_iteration {
+        // Sealed SMP evidence does not record the timing profile; mixing an
+        // idle-host and a loaded-host record under one seal would make the
+        // seal ambiguous, so the two never combine.
+        bail!(
+            "--host-cpu-pressure cannot combine with --smp-iteration or --smp-ring3-qualification: sealed SMP evidence does not record the timing profile"
+        );
     }
     if options.smp_iteration {
         if options.timeout > Duration::from_secs(30) {

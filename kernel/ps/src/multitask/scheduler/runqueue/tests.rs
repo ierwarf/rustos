@@ -1124,17 +1124,97 @@ fn retirement_removes_local_queue_membership() {
 fn lock_free_metadata_writers_leave_a_terminal_owner_word_untouched() {
     // Retire completion and slot release are exact-value CASes on the word; a
     // late run-intent or wait write into a Retiring/Retired word would make them
-    // lose and panic ("scheduler retire completion raced").
+    // lose and panic ("scheduler retire completion raced"). Every in-place
+    // writer goes through `RunOwnerWord::edit_in_place`, which must refuse them.
     const SLOT: usize = 117;
+    let _serial = test_serial_guard();
+    reset_before_publication();
+    // A Dormant word is settled by the exact admission CAS and is left alone too.
+    let dormant_word = owner(SLOT);
+    assert_eq!(dormant_word.state, RunOwnerState::Dormant);
+    set_runnable(SLOT, true);
+    set_wait_armed(SLOT, true);
+    set_wait_reason(SLOT, 1);
+    assert_eq!(owner(SLOT), dormant_word, "a Dormant word was modified");
     for state in [RunOwnerState::Retiring, RunOwnerState::Retired] {
         let before = owner(SLOT);
         let terminal = before.next(state, None);
         OWNER_WORDS[SLOT].compare_exchange(before, terminal).unwrap();
-        set_runnable(SLOT, true);
-        set_wait_armed(SLOT, true);
-        set_wait_reason(SLOT, 1);
-        assert_eq!(owner(SLOT), terminal, "{state:?} word was modified");
+        // One writer at a time: a later writer must not be able to undo the
+        // damage of an earlier one before the word is compared.
+        let writers: [(&str, &dyn Fn()); 7] = [
+            ("set_runnable(true)", &|| set_runnable(SLOT, true)),
+            ("set_wait_armed(true)", &|| set_wait_armed(SLOT, true)),
+            ("set_wait_reason", &|| set_wait_reason(SLOT, 1)),
+            ("publish_wait_arm", &|| assert!(!publish_wait_arm(SLOT, 1))),
+            ("commit_wait", &|| assert_eq!(commit_wait(SLOT), WaitCommitOutcome::InvalidOwner)),
+            ("wake_wait_locked", &|| wake_wait_locked(SLOT)),
+            ("clear_wait_arm", &|| clear_wait_arm(SLOT)),
+        ];
+        for (name, write) in writers {
+            write();
+            assert_eq!(owner(SLOT), terminal, "{name} modified the {state:?} word");
+        }
         let dormant = terminal.next(RunOwnerState::Dormant, None);
         OWNER_WORDS[SLOT].compare_exchange(terminal, dormant).unwrap();
     }
+}
+
+#[test]
+fn in_place_edits_keep_custody_and_apply_to_a_live_word() {
+    const SLOT: usize = 116;
+    let _serial = test_serial_guard();
+    reset_before_publication();
+    admit_blocked(SLOT);
+    let blocked = owner(SLOT);
+    set_wait_reason(SLOT, 2);
+    set_wait_armed(SLOT, true);
+    let edited = owner(SLOT);
+    assert_eq!(
+        (edited.state, edited.cpu, edited.generation),
+        (blocked.state, blocked.cpu, blocked.generation),
+        "a metadata edit must not change custody or the generation"
+    );
+    assert!(edited.wait_armed && edited.wait_reason_kind == 2);
+    clear_wait_arm(SLOT);
+    assert_eq!(owner(SLOT), blocked);
+    retire(SLOT, 100);
+    release_retired(SLOT);
+    reset_before_publication();
+}
+
+#[test]
+fn a_custody_transition_must_advance_the_generation() {
+    const SLOT: usize = 115;
+    let _serial = test_serial_guard();
+    reset_before_publication();
+    let before = owner(SLOT);
+    let refused = catch_unwind(AssertUnwindSafe(|| {
+        let _ = OWNER_WORDS[SLOT].compare_exchange(before, before.with_runnable(!before.runnable));
+    }));
+    assert!(refused.is_err(), "a same-generation word must not pass as a transition");
+    assert_eq!(owner(SLOT), before, "the refused transition wrote the word");
+    reset_before_publication();
+}
+
+#[test]
+fn mailbox_adoption_survives_a_terminal_withdrawal_that_beats_its_owner_cas() {
+    let _serial = test_serial_guard();
+    reset_before_publication();
+    let slot = 114;
+    let cpu = 5;
+    admit_blocked(slot);
+    assert!(matches!(
+        publish_remote_wake(slot, cpu, 100),
+        RemoteWakeOutcome::Published { .. }
+    ));
+    // The remote terminal stop lands after the target loaded the RemoteQueued
+    // owner and before its adoption CAS.
+    force_adoption_retire(slot);
+    assert_eq!(drain_remote_wakes(cpu), 1);
+    assert_eq!(owner(slot).state, RunOwnerState::Retired);
+    assert!(!published_local_member_for_test(cpu, slot));
+    assert_eq!(published_runnable_count(cpu), 0, "the rolled-back insertion must leave no queue weight");
+    release_retired(slot);
+    reset_before_publication();
 }

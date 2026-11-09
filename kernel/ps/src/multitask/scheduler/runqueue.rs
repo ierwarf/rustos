@@ -54,7 +54,7 @@ pub(super) mod wait;
 pub(super) mod weight;
 
 #[cfg(test)]
-use ipc_handoff::publish_migrating_record;
+use ipc_handoff::{force_adoption_retire, publish_migrating_record};
 pub(super) use ipc_handoff::{claim_blocked_handoff, drain_remote_wakes, materialize_direct_handoff_with_generation, publish_handoff_mailbox, publish_local_wake, publish_remote_wake, rehome_queued_frame, rehome_queued_owned, RemoteWakeOutcome};
 #[cfg(test)]
 #[cfg(test)]
@@ -169,6 +169,14 @@ impl RunOwnerState {
     pub(super) const fn is_terminal(self) -> bool {
         matches!(self, Self::Retiring | Self::Retired)
     }
+
+    /// Whether run-intent and wait metadata may be edited in place: the slot
+    /// holds an admitted, not yet withdrawn task. A `Dormant` word is settled by
+    /// the exact admission CAS and a terminal one by the exact retire completion
+    /// and release CASes, so a late writer must leave both alone.
+    pub(super) const fn is_editable(self) -> bool {
+        !self.is_terminal() && !matches!(self, Self::Dormant)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -278,6 +286,19 @@ impl RunOwnerSnapshot {
     }
 }
 
+/// How [`RunOwnerWord::edit_in_place`] ended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InPlace {
+    /// The word is `Dormant`, `Retiring` or `Retired`; nothing was written.
+    Settled,
+    /// The edit declined the word it saw; nothing was written.
+    Refused,
+    /// The edit produced the word that was already there.
+    Unchanged,
+    /// The edit's word replaced the one it was computed from.
+    Applied,
+}
+
 /// One cache line per task: owner CASes from different CPUs on neighbouring
 /// slots no longer invalidate each other.
 #[repr(align(64))]
@@ -300,39 +321,88 @@ impl RunOwnerWord {
         RunOwnerSnapshot::decode(self.0.load(Ordering::Acquire))
     }
 
+    /// [`Self::load`] for the one reader that must be totally ordered against
+    /// the transition CAS: the resident parker's re-read after it publishes its
+    /// cell (the other half of the handshake is `resident::on_owner_transition`).
+    fn load_sequenced(&self) -> RunOwnerSnapshot {
+        RunOwnerSnapshot::decode(self.0.load(Ordering::SeqCst))
+    }
+
+    /// A custody transition: `next` is a strictly newer generation than
+    /// `expected`. The only way to leave a generation, so it revokes the
+    /// resident cell parked for it; only the lane's `compare_exchange_raw` may
+    /// keep the loans.
     fn compare_exchange(
         &self,
         expected: RunOwnerSnapshot,
         next: RunOwnerSnapshot,
     ) -> Result<(), RunOwnerSnapshot> {
+        assert!(
+            next.generation > expected.generation,
+            "scheduler owner transition did not advance the generation; in-place edits use edit_in_place"
+        );
         self.compare_exchange_raw(expected, next)?;
-        if expected.generation != next.generation {
-            // Every transition out of a generation revokes a cell parked for
-            // it; only `compare_exchange_taking` may keep the loans.
-            super::resident::on_owner_transition(self.slot(), expected.generation);
-        }
+        super::resident::on_owner_transition(self.slot(), expected.generation);
         Ok(())
     }
 
     /// The CAS without the residency hook. The caller promises to settle the
-    /// resident cell of `expected.generation` itself (take it or evict it).
+    /// resident cell of `expected.generation` itself (take it or evict it), or
+    /// not to change the generation at all (`edit_in_place`).
     fn compare_exchange_raw(
         &self,
         expected: RunOwnerSnapshot,
         next: RunOwnerSnapshot,
     ) -> Result<(), RunOwnerSnapshot> {
-        // ORDERING: AcqRel is the task-ownership linearization point; failure
-        // uses Acquire so the loser acts on the winning state. On x86 the
-        // lock-prefixed RMW also pairs with the parker's fence in `resident::park`.
+        // ORDERING: SeqCst is the task-ownership linearization point and the
+        // owner side of the resident handshake; failure uses Acquire so the
+        // loser acts on the winning state. On x86 this is the same locked RMW
+        // an AcqRel CAS would be.
         self.0
             .compare_exchange(
                 expected.encode(),
                 next.encode(),
-                Ordering::AcqRel,
+                Ordering::SeqCst,
                 Ordering::Acquire,
             )
             .map(|_| ())
             .map_err(RunOwnerSnapshot::decode)
+    }
+
+    /// The only generation-preserving mutation of an owner word: run intent and
+    /// wait-arm metadata. `edit` maps the freshly loaded snapshot to the word it
+    /// wants (`None` refuses) and may run again on a lost race.
+    ///
+    /// A terminal or `Dormant` word is never edited. `Retiring` and `Retired` are
+    /// settled by exact-value CASes (retire completion, slot release), and a late
+    /// run-intent or wait write into one made those lose and panic; `Dormant` is
+    /// settled by the exact admission CAS.
+    fn edit_in_place(
+        &self,
+        mut edit: impl FnMut(RunOwnerSnapshot) -> Option<RunOwnerSnapshot>,
+    ) -> InPlace {
+        let mut observed = self.load();
+        loop {
+            if !observed.state.is_editable() {
+                return InPlace::Settled;
+            }
+            let Some(next) = edit(observed) else {
+                return InPlace::Refused;
+            };
+            assert!(
+                next.generation == observed.generation
+                    && next.state == observed.state
+                    && next.cpu == observed.cpu,
+                "in-place owner edit changed custody observed={observed:?} next={next:?}"
+            );
+            if next == observed {
+                return InPlace::Unchanged;
+            }
+            match self.compare_exchange_raw(observed, next) {
+                Ok(()) => return InPlace::Applied,
+                Err(current) => observed = current,
+            }
+        }
     }
 
     fn slot(&self) -> usize {
@@ -809,11 +879,19 @@ pub(super) fn lower_vruntime_ceiling(slot: usize, ceiling: u64) -> u64 {
     }
 }
 
-pub(super) fn owner(slot: usize) -> RunOwnerSnapshot {
+fn word(slot: usize) -> &'static RunOwnerWord {
     OWNER_WORDS
         .get(slot)
         .expect("scheduler owner slot exceeds capacity")
-        .load()
+}
+
+pub(super) fn owner(slot: usize) -> RunOwnerSnapshot {
+    word(slot).load()
+}
+
+/// [`owner`] for the resident parker's re-read after publishing its cell.
+pub(super) fn owner_sequenced(slot: usize) -> RunOwnerSnapshot {
+    word(slot).load_sequenced()
 }
 
 /// Records whether the task still wants to run, without moving its state.
@@ -827,25 +905,11 @@ pub(super) fn owner(slot: usize) -> RunOwnerSnapshot {
 ///
 /// The generation is deliberately not advanced: this is not a custody change,
 /// and bumping it would invalidate a mailbox record that is still correct.
+/// A terminal or Dormant word is left alone (see [`RunOwnerWord::edit_in_place`]).
 pub(super) fn set_runnable(slot: usize, runnable: bool) {
-    let word = OWNER_WORDS
-        .get(slot)
-        .expect("scheduler owner slot exceeds capacity");
-    loop {
-        let observed = word.load();
-        // A terminal owner word is settled by exact-value CASes (retire
-        // completion, slot release); metadata written into it would make
-        // those CASes lose and panic.
-        if observed.runnable == runnable || observed.state.is_terminal() {
-            return;
-        }
-        if word
-            .compare_exchange(observed, observed.with_runnable(runnable))
-            .is_ok()
-        {
-            return;
-        }
-    }
+    word(slot).edit_in_place(|observed| {
+        (observed.runnable != runnable).then(|| observed.with_runnable(runnable))
+    });
 }
 
 /// Result of atomically converting the current running task's wait arm into a
@@ -859,91 +923,51 @@ pub(super) enum WaitCommitOutcome {
 
 pub(super) fn publish_wait_arm(slot: usize, reason_kind: u8) -> bool {
     assert!(reason_kind != 0 && reason_kind < (1 << OWNER_WAIT_REASON_BITS) as u8);
-    let word = &OWNER_WORDS[slot];
-    loop {
-        let observed = word.load();
-        if observed.state != RunOwnerState::Running || !observed.runnable {
-            return false;
-        }
-        let next = observed.with_wait(true, reason_kind);
-        if word.compare_exchange(observed, next).is_ok() {
-            return true;
-        }
-    }
+    let outcome = word(slot).edit_in_place(|observed| {
+        (observed.state == RunOwnerState::Running && observed.runnable)
+            .then(|| observed.with_wait(true, reason_kind))
+    });
+    matches!(outcome, InPlace::Applied | InPlace::Unchanged)
 }
 
 pub(super) fn clear_wait_arm(slot: usize) {
-    let word = &OWNER_WORDS[slot];
-    loop {
-        let observed = word.load();
-        if !observed.wait_armed && observed.wait_reason_kind == 0 {
-            return;
-        }
-        if word
-            .compare_exchange(observed, observed.with_wait(false, 0))
-            .is_ok()
-        {
-            return;
-        }
-    }
+    word(slot).edit_in_place(|observed| {
+        (observed.wait_armed || observed.wait_reason_kind != 0)
+            .then(|| observed.with_wait(false, 0))
+    });
 }
 
 pub(super) fn set_wait_armed(slot: usize, armed: bool) {
-    let word = &OWNER_WORDS[slot];
-    loop {
-        let observed = word.load();
-        if observed.state.is_terminal() {
-            return;
-        }
-        if word
-            .compare_exchange(
-                observed,
-                observed.with_wait(armed, observed.wait_reason_kind),
-            )
-            .is_ok()
-        {
-            return;
-        }
-    }
+    word(slot).edit_in_place(|observed| Some(observed.with_wait(armed, observed.wait_reason_kind)));
 }
 
 pub(super) fn set_wait_reason(slot: usize, reason_kind: u8) {
     assert!(reason_kind < (1 << OWNER_WAIT_REASON_BITS) as u8);
-    let word = &OWNER_WORDS[slot];
-    loop {
-        let observed = word.load();
-        if observed.state.is_terminal() {
-            return;
-        }
-        if word
-            .compare_exchange(
-                observed,
-                observed.with_wait(observed.wait_armed, reason_kind),
-            )
-            .is_ok()
-        {
-            return;
-        }
-    }
+    word(slot).edit_in_place(|observed| Some(observed.with_wait(observed.wait_armed, reason_kind)));
 }
 
 pub(super) fn commit_wait(slot: usize) -> WaitCommitOutcome {
-    let word = &OWNER_WORDS[slot];
-    loop {
-        let observed = word.load();
+    let mut outcome = WaitCommitOutcome::InvalidOwner;
+    let edit = word(slot).edit_in_place(|observed| {
         if observed.state != RunOwnerState::Running || !observed.runnable {
-            return WaitCommitOutcome::InvalidOwner;
+            outcome = WaitCommitOutcome::InvalidOwner;
+            return None;
         }
         if !observed.wait_armed {
-            return WaitCommitOutcome::WakeWon;
+            outcome = WaitCommitOutcome::WakeWon;
+            return None;
         }
-        let next = observed
-            .with_runnable(false)
-            .with_wait(false, observed.wait_reason_kind);
-        if word.compare_exchange(observed, next).is_ok() {
-            return WaitCommitOutcome::Committed;
-        }
+        outcome = WaitCommitOutcome::Committed;
+        Some(
+            observed
+                .with_runnable(false)
+                .with_wait(false, observed.wait_reason_kind),
+        )
+    });
+    if edit == InPlace::Settled {
+        return WaitCommitOutcome::InvalidOwner;
     }
+    outcome
 }
 
 /// Clears any wait epoch and, while the task still owns this CPU, restores its
@@ -955,26 +979,18 @@ pub(super) fn wake_wait(slot: usize) {
 // Called only while the SAME wait-payload epoch leaf is retained. Queue/owner
 // CAS arbitration remains atomic; this leaf never crosses queue locks or work.
 fn wake_wait_locked(slot: usize) {
-    let word = &OWNER_WORDS[slot];
-    loop {
-        let observed = word.load();
-        let runnable = if matches!(
-            observed.state,
-            RunOwnerState::Local
-                | RunOwnerState::RemoteQueued
-                | RunOwnerState::Running
-                | RunOwnerState::Migrating
-                | RunOwnerState::DirectHandoff
-        ) {
-            true
-        } else {
-            observed.runnable
-        };
-        let next = observed.with_runnable(runnable).with_wait(false, 0);
-        if next == observed || word.compare_exchange(observed, next).is_ok() {
-            return;
-        }
-    }
+    word(slot).edit_in_place(|observed| {
+        let runnable = observed.runnable
+            || matches!(
+                observed.state,
+                RunOwnerState::Local
+                    | RunOwnerState::RemoteQueued
+                    | RunOwnerState::Running
+                    | RunOwnerState::Migrating
+                    | RunOwnerState::DirectHandoff
+            );
+        Some(observed.with_runnable(runnable).with_wait(false, 0))
+    });
 }
 
 pub(super) fn wait_blocked(owner: RunOwnerSnapshot) -> bool {

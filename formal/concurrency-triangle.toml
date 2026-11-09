@@ -440,6 +440,44 @@ shuttle_test = "local_frame_claim_never_uses_stale_owner_generation_pct"
 herd_not_applicable = "this claim combines generation-bound frame publication, queue owner identity, execution-stack custody, and the serialized dispatch claim; a single ISA publication litmus cannot represent the owner and claim protocol"
 
 [[scenario]]
+id = "scheduler-owner-word-metadata-vs-retire"
+severity = "critical"
+flow = "scheduler-owner-word"
+model = "scheduler-owner-word/SchedulerOwnerWord"
+source = "kernel/ps/src/multitask/scheduler/runqueue.rs"
+source_symbol = "edit_in_place"
+source_anchors = [
+  "if !observed.state.is_editable() {",
+  "return InPlace::Settled;",
+  "self.compare_exchange_raw(observed, next)",
+  "scheduler retire completion raced observed={observed:?}",
+]
+invariant = "a lock-free run-intent or wait-arm writer edits only a live owner word and refuses Retiring, Retired and Dormant words, so the exact Retiring-to-Retired completion CAS never loses to a late publish_frame write and a terminal word never carries metadata"
+loom_test = "owner_word_terminal_beats_late_metadata_writers"
+shuttle_test = "owner_word_terminal_beats_late_metadata_writers_pct"
+herd_not_applicable = "every decision is one exact compare-exchange on a single owner word; a locked RMW has no weaker ISA outcome, so there is no multi-location publication order for an x86 litmus to constrain"
+
+[[scenario]]
+id = "scheduler-resident-cell-delayed-hook"
+severity = "critical"
+flow = "scheduler-resident-cell"
+model = "scheduler-resident-cell/SchedulerResidentCell"
+source = "kernel/ps/src/multitask/scheduler/resident.rs"
+source_symbol = "park"
+source_anchors = [
+  "claim_empty(cell, generation)",
+  "cell.generation.swap(generation, Ordering::SeqCst)",
+  "runqueue::owner_sequenced(slot)",
+  "drop(take(slot, generation));",
+]
+invariant = "a park claims the cell by CAS before touching the payload, publishes with a SeqCst swap and re-reads the owner word, so an arbitrarily delayed revoking hook for an older generation, or a hook that ran before the publication, never lets a payload be overwritten while read, parked over live loans, dropped twice, leaked, or kept past its generation"
+loom_test = "resident_cell_delayed_hook_reparks_without_overwrite_or_double_drop"
+shuttle_test = "resident_cell_delayed_hook_reparks_without_overwrite_or_double_drop_pct"
+herd_test = "formal/litmus/x86_64/scheduler_resident_cell_publication.litmus"
+herd_mutant = "formal/litmus/x86_64/scheduler_resident_cell_publication.mutant.litmus"
+herd_cat = "x86tso-mixed.cat"
+
+[[scenario]]
 id = "scheduler-retained-current-frame"
 severity = "critical"
 flow = "scheduler-dispatch"

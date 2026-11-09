@@ -1139,6 +1139,12 @@ mod verification {
 }
 
 #[cfg(test)]
+extern crate std;
+
+#[cfg(test)]
+mod exhaustive_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

@@ -1,5 +1,17 @@
 #!/usr/bin/env python3
-"""Prove that critical implementation-contract regressions are detected."""
+"""Prove that registered implementation-contract regressions are detected.
+
+Severity gate (docs/ai/formal-scope-policy.md, section 2):
+
+* critical and high rows are blocking in every profile: each must be executed
+  and killed by its exact witness (100%).
+* medium and low rows are advisory. The ``nightly`` profile (the default for a
+  direct run) executes every one and fails on any survivor. The ``pr`` profile
+  executes them only for packages with a changed file and reports a survivor
+  as a WARNING line (also recorded in the summary), never silently.
+* A witness that cannot be established (baseline failure) is a registry defect
+  and fails in every profile for every severity.
+"""
 
 from __future__ import annotations
 
@@ -25,6 +37,10 @@ from pathlib import Path
 
 
 TIMEOUT_RETURNCODE = -1024
+BLOCKING_SEVERITIES = frozenset({"critical", "high"})
+ADVISORY_SEVERITIES = frozenset({"medium", "low"})
+SEVERITIES = BLOCKING_SEVERITIES | ADVISORY_SEVERITIES
+PROFILES = ("pr", "nightly")
 OCCURRENCE_SPEC = re.compile(r"(?:(?P<selected>[1-9][0-9]*)/)?(?P<total>[1-9][0-9]*)$")
 LISTED_TEST = re.compile(r"(?m)^(?P<name>[^\s].*): test$")
 
@@ -243,8 +259,11 @@ def read_registry(
             anchor_issues.append(message)
         else:
             semantic_rows[semantic] = (identity, number)
-        if mutation["severity"] not in {"critical", "high"}:
-            raise SystemExit(f"{identity}: mutation is not critical/high")
+        if mutation["severity"] not in SEVERITIES:
+            raise SystemExit(
+                f"{identity}: severity {mutation['severity']!r} is not one of "
+                + "|".join(sorted(SEVERITIES))
+            )
         if mutation["target"] not in {"all", "lib"}:
             raise SystemExit(f"{identity}: target must be all or lib")
         raw_occurrence = str(mutation["occurrence"])
@@ -1206,6 +1225,79 @@ def run_shards(
     return outcomes
 
 
+def changed_packages(root: Path, base: str | None = None) -> set[str]:
+    """Cargo packages owning a file changed against ``base`` (default HEAD).
+
+    Uncommitted and untracked files count. A path with no ancestor manifest
+    (docs, formal registries) selects no package; the nightly profile is what
+    re-audits everything those could influence.
+    """
+    names: set[str] = set()
+    changed = subprocess.check_output(
+        ["git", "diff", "--name-only", base or "HEAD", "--"], cwd=root, text=True
+    ).splitlines()
+    changed += subprocess.check_output(
+        ["git", "ls-files", "--others", "--exclude-standard"], cwd=root, text=True
+    ).splitlines()
+    for relative in changed:
+        current = (root / relative).parent
+        while current != root and root in current.parents:
+            manifest = current / "Cargo.toml"
+            if manifest.is_file():
+                try:
+                    name = tomllib.loads(manifest.read_text(encoding="utf-8")).get(
+                        "package", {}
+                    ).get("name")
+                except tomllib.TOMLDecodeError:
+                    name = None
+                if isinstance(name, str):
+                    names.add(name)
+                    break
+            current = current.parent
+    return names
+
+
+def select_for_profile(
+    mutations: list[dict[str, str | int]],
+    profile: str,
+    changed: set[str],
+) -> tuple[list[dict[str, str | int]], list[dict[str, str | int]]]:
+    """Return (rows to execute, advisory rows not executed by this profile)."""
+    if profile not in PROFILES:
+        raise SystemExit(f"unknown mutation profile {profile!r}")
+    selected: list[dict[str, str | int]] = []
+    skipped: list[dict[str, str | int]] = []
+    for mutation in mutations:
+        if mutation["severity"] in BLOCKING_SEVERITIES or profile == "nightly":
+            selected.append(mutation)
+        elif str(mutation["package"]) in changed:
+            selected.append(mutation)
+        else:
+            skipped.append(mutation)
+    return selected, skipped
+
+
+def partition_outcomes(
+    outcomes: list[dict[str, str | int]], profile: str
+) -> tuple[list[dict[str, str | int]], list[dict[str, str | int]]]:
+    """Split non-killed outcomes into (gate failures, warnings).
+
+    Only a ``survived`` medium/low mutant under the ``pr`` profile is a
+    warning. Everything else that was not killed fails the gate.
+    """
+    failures: list[dict[str, str | int]] = []
+    warnings: list[dict[str, str | int]] = []
+    for outcome in outcomes:
+        if outcome.get("status") == "killed":
+            continue
+        advisory_survivor = (
+            outcome.get("severity") in ADVISORY_SEVERITIES
+            and outcome.get("status") == "survived"
+        )
+        (warnings if advisory_survivor and profile == "pr" else failures).append(outcome)
+    return failures, warnings
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Kill registered implementation mutants with their exact witnesses."
@@ -1216,6 +1308,16 @@ def main() -> int:
         default=[],
         metavar="ID",
         help="run one registered mutation; repeat for a focused change set",
+    )
+    parser.add_argument(
+        "--profile",
+        choices=PROFILES,
+        default="nightly",
+        help=(
+            "nightly (default): execute every row, any survivor fails; pr: execute "
+            "critical/high always and medium/low only for changed packages, "
+            "reporting medium/low survivors as warnings"
+        ),
     )
     parser.add_argument(
         "--check",
@@ -1247,6 +1349,16 @@ def main() -> int:
             for mutation in mutations
             if str(mutation["id"]) in focused_ids
         ]
+    changed = (
+        changed_packages(root, os.environ.get("RUSTOS_MUTATION_CHANGED_BASE"))
+        if args.profile == "pr" and not focused_ids
+        else set()
+    )
+    if focused_ids:
+        # A focused run executes exactly what was asked for, whatever its severity.
+        skipped: list[dict[str, str | int]] = []
+    else:
+        mutations, skipped = select_for_profile(mutations, args.profile, changed)
     artifact_dir = root / "build/formal/implementation-mutations"
     artifact_dir.mkdir(parents=True, exist_ok=True)
     target_dir = artifact_dir / "target"
@@ -1289,7 +1401,19 @@ def main() -> int:
             )
     outcomes.sort(key=lambda outcome: str(outcome["id"]))
 
-    failures = [outcome for outcome in outcomes if outcome.get("status") != "killed"]
+    failures, warnings = partition_outcomes(outcomes, args.profile)
+    for outcome in warnings:
+        print(
+            f"WARNING implementation mutation survivor ({outcome['severity']}): "
+            f"{outcome['id']}: {outcome['detail']}",
+            file=sys.stderr,
+        )
+    if skipped:
+        print(
+            f"implementation mutations: {len(skipped)} medium/low rows not executed "
+            f"under profile={args.profile} (no changed package); nightly executes them",
+            file=sys.stderr,
+        )
     if failures:
         for outcome in failures:
             print(
@@ -1306,14 +1430,24 @@ def main() -> int:
         {key: value for key, value in outcome.items() if key != "detail"}
         for outcome in outcomes
     ]
+    killed = [entry for entry in results if entry.get("status") == "killed"]
+    blocking = [entry for entry in results if entry["severity"] in BLOCKING_SEVERITIES]
 
     summary = {
         "schema": "rustos-implementation-mutation-evidence-v1",
         "status": "passed",
         "registry_sha256": registry_sha256,
         "mutation_count": len(results),
-        "kill_count": len(results),
-        "kill_ratio": 1.0,
+        "kill_count": len(killed),
+        "kill_ratio": len(killed) / len(results) if results else 1.0,
+        "blocking_kill_ratio": 1.0,
+        "profile": args.profile,
+        "blocking_count": len(blocking),
+        "advisory": {
+            "executed": len(results) - len(blocking),
+            "survivors": sorted(str(entry["id"]) for entry in warnings),
+            "not_executed": sorted(str(entry["id"]) for entry in skipped),
+        },
         "mutations": results,
         "scope": "focused" if focused_ids else "complete",
         "cache": {
@@ -1328,8 +1462,9 @@ def main() -> int:
     checkpoint_path(summary_path).unlink(missing_ok=True)
     scope = "focused" if focused_ids else "complete"
     print(
-        f"implementation mutations passed scope={scope} "
-        f"killed={len(results)}/{len(results)} "
+        f"implementation mutations passed scope={scope} profile={args.profile} "
+        f"killed={len(killed)}/{len(results)} warnings={len(warnings)} "
+        f"skipped={len(skipped)} "
         f"reused={len(reused)} executed={len(pending)}"
     )
     return 0

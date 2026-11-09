@@ -766,6 +766,9 @@ fn le_u64(bytes: &[u8]) -> u64 {
 }
 
 #[cfg(test)]
+mod admission_tests;
+
+#[cfg(test)]
 mod tests {
     use alloc::{vec, vec::Vec};
 

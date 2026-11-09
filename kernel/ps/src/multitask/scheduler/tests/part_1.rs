@@ -19,6 +19,7 @@ impl Drop for RunqueuePublicationReset {
     fn drop(&mut self) {
         super::runqueue::reset_before_publication();
         crate::multitask::process_placement::reset_for_tests();
+        super::sync_handoff::reset_all_cpus();
     }
 }
 
@@ -94,6 +95,10 @@ pub(super) fn boxed_scheduler() -> SchedulerTestFixture {
     super::runqueue::reset_before_publication();
     super::scheduling_runtime::reset_for_test();
     crate::multitask::process_placement::reset_for_tests();
+    // The synchronous-handoff FIFO, its pending advertisement and the chain
+    // budget are process-wide statics too: a previous fixture's leftovers made
+    // witnesses that start from "no queued work" fail depending on test order.
+    super::sync_handoff::reset_all_cpus();
     SchedulerTestFixture {
         _runqueue_reset: RunqueuePublicationReset,
         _runtime_serial: runtime_serial,

@@ -56,12 +56,19 @@ end state; each phase is measured and reported, none is promised.
 1. **Resident blocked IPC tasks.** A task that blocks in an endpoint receive
    or reply wait on a CPU keeps its CPU-bank loans (allocation pin and
    execution permit and placement grant) parked in its resident cell instead
-   of releasing them at the RSP ACK. Residency is one bit in the owner word
-   (`resident`, valid only for `Blocked`/`DirectHandoff`). Every owner CAS that
-   clears the bit evicts (drops) the cell inside `RunOwnerWord::compare_exchange`,
-   so wake, terminal, migration and every legacy claim stay correct without
-   edits; only the lane's `compare_exchange_taking` takes the loans. Flows that
-   need quiescence (pins == 0) call `resident::evict(slot)` first.
+   of releasing them at the RSP ACK. The cell (`resident.rs`) is one per slot and
+   its word is `0`, the owner generation it is parked for, or `BUSY` while a CPU
+   moves the payload; the cell is valid only for that generation. Every custody
+   transition of the owner word (`RunOwnerWord::compare_exchange`) evicts the cell
+   of the generation it leaves after its CAS, so wake, terminal, migration and
+   every legacy claim stay correct without edits; only the lane's raw CAS
+   (`lane_cas`) followed by `resident::take` keeps the loans. Payload access
+   always follows a winning CAS of the word, and nothing waits for `BUSY`: a park
+   that finds the cell busy or holding a newer generation releases its own loans
+   and the task simply stays non-resident (contract:
+   [SMP 7.9](../smp/scheduler.md#79-owner-word-writers-and-the-resident-ipc-cell)).
+   Flows that need quiescence (pins == 0) call `evict_parked_target` until the
+   cell is empty.
 2. **Shared schedule boundary.** With IRQs masked,
    `software_schedule_interrupt_dispatch` attempts `ipc_lane::{call,reply}`
    before opening a `CpuDispatchTurn`. `Switched` returns the peer's saved RSP;

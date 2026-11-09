@@ -251,6 +251,16 @@ pub(in crate::multitask::scheduler) fn publish_remote_wake(
     }
 }
 
+#[cfg(test)]
+static TEST_ADOPTION_RETIRE_SLOT: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(usize::MAX);
+
+/// Makes the next adoption of `slot` lose its owner CAS to a terminal withdrawal.
+#[cfg(test)]
+pub(super) fn force_adoption_retire(slot: usize) {
+    TEST_ADOPTION_RETIRE_SLOT.store(slot, Ordering::SeqCst);
+}
+
 pub(in crate::multitask::scheduler) fn drain_remote_wakes(cpu: usize) -> usize {
     validate_cpu(cpu);
     // ORDERING: Acquire pairs with the producer's 0-to-1 edge, published only
@@ -292,9 +302,27 @@ pub(in crate::multitask::scheduler) fn drain_remote_wakes(cpu: usize) -> usize {
         let next = observed.next(RunOwnerState::Local, Some(cpu));
         // Lock-free run-intent and wait writers may change metadata bits of
         // the `RemoteQueued` owner under this adoption; custody (state, CPU,
-        // generation) cannot change while the exact mailbox record is held.
+        // generation) can only end in a terminal withdrawal while the exact
+        // mailbox record is held.
+        #[cfg(test)]
+        if TEST_ADOPTION_RETIRE_SLOT
+            .compare_exchange(record.slot, usize::MAX, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            // A remote terminal withdrawal between the load and the CAS.
+            retire(record.slot, record.weight);
+        }
         let mut expected = observed;
+        let mut adopted = true;
         while let Err(winner) = OWNER_WORDS[record.slot].compare_exchange(expected, next) {
+            if winner.state.is_terminal() || winner.generation > record.generation {
+                // A remote terminal withdrawal (possibly already released and
+                // the slot reused) took the task off its mailbox custody after
+                // the load above; it no longer needs the queue.
+                rq.remove(record.slot, record.weight);
+                adopted = false;
+                break;
+            }
             if winner.state != RunOwnerState::RemoteQueued
                 || winner.cpu != Some(cpu)
                 || winner.generation != record.generation
@@ -303,7 +331,9 @@ pub(in crate::multitask::scheduler) fn drain_remote_wakes(cpu: usize) -> usize {
             }
             expected = winner;
         }
-        frame_publication::bind_local_owner_generation(record.slot, next.generation);
+        if adopted {
+            frame_publication::bind_local_owner_generation(record.slot, next.generation);
+        }
     }
     RUN_QUEUES[cpu].publish_load(&rq);
     count
@@ -460,7 +490,9 @@ pub(super) fn publish_migrating_record(
         // the `Migrating` owner without a custody change; only a different
         // custody generation is a broken transfer.
         loop {
-            if observed.state.is_terminal() {
+            // A terminal stop beat the publication, and the slot may already
+            // have been released and reused: either way the record is void.
+            if observed.state.is_terminal() || observed.generation > migrating.generation {
                 return RemoteWakeOutcome::Rejected;
             }
             if observed.state != RunOwnerState::Migrating

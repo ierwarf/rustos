@@ -7,6 +7,7 @@ cd "$repo_root"
 
 registry=formal/system-flows.tsv
 models=formal/models.tsv
+validators=formal/validators.tsv
 witnesses=formal/run-source-conformance.sh
 
 test -f "$registry" || { echo "missing $registry" >&2; exit 1; }
@@ -71,7 +72,7 @@ while IFS=$'\t' read -r flow transition requirement hazard severity owner from e
     fi
     [[ -f "$source" ]] || { echo "missing flow source: $source" >&2; exit 1; }
     awk -F $'\t' -v wanted="$model" '$1 == wanted { found++ } END { exit(found == 1 ? 0 : 1) }' \
-        "$models" || { echo "unregistered flow model: $model" >&2; exit 1; }
+        "$models" "$validators" || { echo "unregistered flow model: $model" >&2; exit 1; }
     grep -Fq -- "$model|$witness_package|$witness_test" "$witnesses" || {
         echo "missing source witness for $flow/$transition: $model -> $witness_package $witness_test" >&2
         exit 1

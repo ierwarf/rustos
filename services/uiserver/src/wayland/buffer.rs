@@ -2,24 +2,37 @@
 
 use super::*;
 
+/// How a damaged commit is satisfied from its buffer.
+pub(super) enum DamagePlan {
+    /// The damage lies outside the buffer: nothing to read, still a commit.
+    Empty,
+    /// Read exactly the damaged rows.
+    Read(SnapshotSpec),
+    /// The retained pixels cannot take a patch (first buffer or a layout
+    /// change); the caller must plan a full snapshot instead.
+    NeedsFull,
+}
+
 impl BufferData {
-    pub(super) fn copy_damage_into(
+    /// Plan a damage-only snapshot. Planning takes the pool lock only long
+    /// enough to clone the descriptor handle: the read itself runs on a
+    /// snapshot worker and never under this lock, so a slow client fd cannot
+    /// block `create_buffer`/`resize` on the UI thread.
+    pub(super) fn plan_damage(
         &self,
-        dst: &mut Arc<Vec<u32>>,
         dst_width: usize,
         dst_height: usize,
         dst_stride_pixels: usize,
+        dst_len: usize,
         damage: Rect,
-    ) -> bool {
+    ) -> DamagePlan {
         if dst_width != self.shared.width
             || dst_height != self.shared.height
             || dst_stride_pixels != self.shared.width
-            || dst_width
-                .checked_mul(dst_height)
-                .is_none_or(|len| len != dst.len())
-            || dst.is_empty()
+            || dst_width.checked_mul(dst_height) != Some(dst_len)
+            || dst_len == 0
         {
-            return false;
+            return DamagePlan::NeedsFull;
         }
         let damage = damage.intersect(Rect {
             x: 0,
@@ -28,10 +41,10 @@ impl BufferData {
             height: self.shared.height,
         });
         if damage.is_empty() {
-            return true;
+            return DamagePlan::Empty;
         }
-        let Ok(pool) = self.shared.pool.lock() else {
-            return false;
+        let Some((fd, pool_len)) = self.pool_handle() else {
+            return DamagePlan::NeedsFull;
         };
         let start = self.shared.offset;
         if validate_wayland_buffer_layout(
@@ -39,107 +52,69 @@ impl BufferData {
             self.shared.width,
             self.shared.height,
             self.shared.stride,
-            pool.len,
+            pool_len,
         )
         .is_none()
         {
-            return false;
+            return DamagePlan::NeedsFull;
         }
-        let Some(width_bytes) = damage.width.checked_mul(4) else {
-            return false;
-        };
-        // Read into owned bytes before modifying retained pixels. A concurrent
-        // truncate can only cause short I/O, never SIGBUS or a partial update.
-        let Some(read_start) = damage
-            .y
-            .checked_mul(self.shared.stride)
-            .and_then(|row| start.checked_add(row))
-            .and_then(|pos| pos.checked_add(damage.x.checked_mul(4)?))
-        else {
-            return false;
-        };
-        let Some(read_len) = damage
-            .height
-            .checked_sub(1)
-            .and_then(|rows| rows.checked_mul(self.shared.stride))
-            .and_then(|prefix| prefix.checked_add(width_bytes))
-        else {
-            return false;
-        };
-        let Ok(bytes) = super::shm::read_shm_snapshot(pool.fd.as_raw_fd(), read_start, read_len)
-        else {
-            return false;
-        };
-        let pixels = Arc::make_mut(dst);
-        for row in 0..damage.height {
-            let Some(src_row) = row.checked_mul(self.shared.stride) else {
-                return false;
-            };
-            let Some(src_end) = src_row.checked_add(width_bytes) else {
-                return false;
-            };
-            let Some(row_bytes) = bytes.get(src_row..src_end) else {
-                return false;
-            };
-            let Some(dst_row) = (damage.y + row)
-                .checked_mul(dst_stride_pixels)
-                .and_then(|row_start| row_start.checked_add(damage.x))
-            else {
-                return false;
-            };
-            let Some(dst_end) = dst_row.checked_add(damage.width) else {
-                return false;
-            };
-            let Some(row_pixels) = pixels.get_mut(dst_row..dst_end) else {
-                return false;
-            };
-            if !copy_wayland_bgra_row(row_bytes, row_pixels, self.shared.has_alpha) {
-                return false;
-            }
-        }
-        true
+        let spec = (|| {
+            let width_bytes = damage.width.checked_mul(4)?;
+            let read_start = damage
+                .y
+                .checked_mul(self.shared.stride)
+                .and_then(|row| start.checked_add(row))
+                .and_then(|pos| pos.checked_add(damage.x.checked_mul(4)?))?;
+            let read_len = damage
+                .height
+                .checked_sub(1)?
+                .checked_mul(self.shared.stride)?
+                .checked_add(width_bytes)?;
+            Some(SnapshotSpec {
+                fd,
+                read_start,
+                read_len,
+                layout: SnapshotLayout::Damage {
+                    damage,
+                    stride: self.shared.stride,
+                    has_alpha: self.shared.has_alpha,
+                },
+            })
+        })();
+        spec.map_or(DamagePlan::NeedsFull, DamagePlan::Read)
     }
 
-    pub(super) fn copy_pixels(&self) -> Option<(Arc<Vec<u32>>, usize, usize, usize)> {
-        let pool = self.shared.pool.lock().ok()?;
-        let start = self.shared.offset;
-        let pixel_count = checked_wayland_pixel_count(self.shared.width, self.shared.height)?;
-        let width_bytes = self.shared.width.checked_mul(4)?;
+    /// Plan a complete snapshot of this buffer, or `None` when its layout no
+    /// longer fits the pool (for example after the pool backing shrank).
+    pub(super) fn plan_full(&self) -> Option<SnapshotSpec> {
+        let (fd, pool_len) = self.pool_handle()?;
+        checked_wayland_pixel_count(self.shared.width, self.shared.height)?;
         let required = validate_wayland_buffer_layout(
-            start,
+            self.shared.offset,
             self.shared.width,
             self.shared.height,
             self.shared.stride,
-            pool.len,
+            pool_len,
         )?;
         if required > MAX_WAYLAND_SHM_POOL_BYTES {
             return None;
         }
+        Some(SnapshotSpec {
+            fd,
+            read_start: self.shared.offset,
+            read_len: required,
+            layout: SnapshotLayout::Full {
+                width: self.shared.width,
+                height: self.shared.height,
+                stride: self.shared.stride,
+                has_alpha: self.shared.has_alpha,
+            },
+        })
+    }
 
-        let bytes = super::shm::read_shm_snapshot(pool.fd.as_raw_fd(), start, required).ok()?;
-        let mut pixels = Vec::new();
-        pixels.try_reserve_exact(pixel_count).ok()?;
-        pixels.resize(pixel_count, 0);
-        for row in 0..self.shared.height {
-            let row_start = row.checked_mul(self.shared.stride)?;
-            let row_end = row_start.checked_add(width_bytes)?;
-            let row_bytes = bytes.get(row_start..row_end)?;
-            let dst_start = row.checked_mul(self.shared.width)?;
-            let dst_end = dst_start.checked_add(self.shared.width)?;
-            if !copy_wayland_bgra_row(
-                row_bytes,
-                pixels.get_mut(dst_start..dst_end)?,
-                self.shared.has_alpha,
-            ) {
-                return None;
-            }
-        }
-        Some((
-            Arc::new(pixels),
-            self.shared.width,
-            self.shared.height,
-            self.shared.width,
-        ))
+    fn pool_handle(&self) -> Option<(Arc<OwnedFd>, usize)> {
+        let pool = self.shared.pool.lock().ok()?;
+        Some((Arc::clone(&pool.fd), pool.len))
     }
 }
 

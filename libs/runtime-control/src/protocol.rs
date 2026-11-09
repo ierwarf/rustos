@@ -27,7 +27,16 @@
 
 use std::mem::size_of;
 
-pub const PROTOCOL_VERSION: u16 = 1;
+/// Wire version. Frame layouts are unchanged since 1; the version tracks
+/// exchange semantics so a mixed build fails loudly (`EPROTO`) instead of
+/// stalling on a reply that never comes.
+///
+/// - 1: `OP_NOTIFY_READY` was a one-way write; the sender closed the stream
+///   without reading, so "delivered" meant only "written".
+/// - 2: `OP_NOTIFY_READY` is acknowledged like every other mutation: the server
+///   replies `status = 0, count = 0` after it has recorded the edge, and the
+///   client treats that reply, not the write, as delivery.
+pub const PROTOCOL_VERSION: u16 = 2;
 
 pub const OP_SNAPSHOT_RUNNING_PROGRAMS: u16 = 1;
 pub const OP_REQUEST_LAUNCH_PATH: u16 = 2;

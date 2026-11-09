@@ -1,6 +1,5 @@
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::mpsc::{self, Receiver};
-use std::thread;
 use std::time::Instant;
 
 use runtime_control::{load_desktop_program_entries, StartupMode, DEFAULT_APPLICATIONS_DIR};
@@ -19,13 +18,12 @@ use crate::sys::{
     SurfaceMapping, UiThreadRole, EAGAIN, ENODEV, ESTALE, PIXEL_FORMAT_BGRA8888,
 };
 const SURFACE_CREATE_RETRIES: usize = 4;
-// Retry budget for waiting on a primary display provider (for example the DVM
-// display aperture). The earliest snapshot may still be the kernel firmware
-// framebuffer, or GET_INFO may return EAGAIN/ENODEV before the provider is
-// published. Polling for at most 1s at 50ms intervals matches the product-boot
-// contract without hiding a missing provider behind an unbounded startup wait.
-const PRIMARY_DISPLAY_WAIT_ATTEMPTS: usize = 20;
-const PRIMARY_DISPLAY_WAIT_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+// The wait for a primary display provider (for example the DVM display
+// aperture) is owned by `crate::startup::Dependency::Display`: its budget and
+// backoff live in one policy table instead of a private attempt counter. The
+// earliest snapshot may still be the kernel firmware framebuffer, or GET_INFO
+// may return EAGAIN/ENODEV before the provider is published; both are
+// retryable inside that budget, anything else fails immediately with its errno.
 
 /// Display validation outcome split between "wait and retry" failures (the
 /// primary provider has not yet registered) and hard configuration errors
@@ -151,51 +149,42 @@ fn validate_surface_metadata(
     Ok(surface_mapping_len)
 }
 
-fn wait_for_primary_display(
-    display_fd: i32,
-    wait_attempts: &mut usize,
-) -> Result<(DisplayInfo, usize), i32> {
-    loop {
-        match display_get_info(display_fd) {
-            Ok(display) => match validate_display_info_with_retry(&display) {
-                Ok(stride) => return Ok((display, stride)),
-                Err(DisplayValidationError::Fatal(err)) => return Err(err),
-                Err(DisplayValidationError::NotPrimaryYet) => {
-                    if *wait_attempts == 0 {
-                        diag_line(
-                            format!(
-                                "uiserver: waiting for primary display provider (initial flags={:#x} gen={})",
-                                display.flags, display.generation,
-                            )
-                            .as_str(),
-                        );
+fn wait_for_primary_display(display_fd: i32) -> Result<(DisplayInfo, usize), i32> {
+    use crate::startup::{global, Dependency};
+    let mut first_wait_logged = false;
+    global().drive(
+        Dependency::Display,
+        |errno| errno == EAGAIN,
+        || {
+            let mut note = |detail: String| {
+                if !std::mem::replace(&mut first_wait_logged, true) {
+                    diag_line(format!("uiserver: waiting for primary display provider ({detail})").as_str());
+                }
+            };
+            match display_get_info(display_fd) {
+                Ok(display) => match validate_display_info_with_retry(&display) {
+                    Ok(stride) => Ok((display, stride)),
+                    Err(DisplayValidationError::Fatal(err)) => Err(err),
+                    Err(DisplayValidationError::NotPrimaryYet) => {
+                        note(format!(
+                            "initial flags={:#x} gen={}",
+                            display.flags, display.generation
+                        ));
+                        Err(EAGAIN)
                     }
+                },
+                Err(errno) if display_info_unavailable_is_retryable(errno) => {
+                    note(format!("get-info errno={errno}"));
+                    Err(EAGAIN)
                 }
-            },
-            Err(errno) if display_info_unavailable_is_retryable(errno) => {
-                if *wait_attempts == 0 {
-                    diag_line(
-                        format!(
-                            "uiserver: waiting for primary display provider (get-info errno={errno})"
-                        )
-                        .as_str(),
-                    );
+                Err(errno) => {
+                    debug_line(&format!("uiserver: display_get_info failed errno={errno}"));
+                    diag_line("uiserver: display_get_info failed");
+                    Err(13)
                 }
             }
-            Err(errno) => {
-                debug_line(&format!("uiserver: display_get_info failed errno={errno}"));
-                diag_line("uiserver: display_get_info failed");
-                return Err(13);
-            }
-        }
-
-        *wait_attempts += 1;
-        if *wait_attempts >= PRIMARY_DISPLAY_WAIT_ATTEMPTS {
-            diag_line("uiserver: primary display provider never registered");
-            return Err(14);
-        }
-        thread::sleep(PRIMARY_DISPLAY_WAIT_DELAY);
-    }
+        },
+    )
 }
 
 fn fetch_surface_state(display_fd: i32) -> Result<DisplaySurfaceState, i32> {
@@ -204,22 +193,11 @@ fn fetch_surface_state(display_fd: i32) -> Result<DisplaySurfaceState, i32> {
     // `runtimed` can spawn uiserver before the DVM/hardware display provider
     // is published, leaving only the firmware fallback for which surface
     // creation is unsupported.
-    let mut wait_attempts = 0usize;
     for attempt in 0..SURFACE_CREATE_RETRIES {
         // Re-fetch display info each surface attempt: after a generation
         // mismatch (or the primary-provider wait below) the geometry may have
         // changed and we need fresh dimensions for create_surface.
-        let (display, display_stride_bytes) =
-            wait_for_primary_display(display_fd, &mut wait_attempts)?;
-        if wait_attempts > 0 && attempt == 0 {
-            diag_line(
-                format!(
-                    "uiserver: primary display ready after {} retries width={} height={} flags={:#x} gen={}",
-                    wait_attempts, display.width, display.height, display.flags, display.generation,
-                )
-                .as_str(),
-            );
-        }
+        let (display, display_stride_bytes) = wait_for_primary_display(display_fd)?;
 
         let display_contract = format!(
             "uiserver: display_get_info attempt={} width={} height={} stride={} bpp={} fmt={} flags={:#x} gen={}",
@@ -321,14 +299,19 @@ impl AppState {
         // worker now so atlas creation and DVM priming overlap those serial
         // device opens. The worker result is still revalidated against the
         // final surface generation before it becomes active authority.
-        let mut gpu_display_wait_attempts = 0;
-        let (gpu_display, _) =
-            wait_for_primary_display(display_fd.as_raw_fd(), &mut gpu_display_wait_attempts)?;
+        let (gpu_display, _) = wait_for_primary_display(display_fd.as_raw_fd())?;
         boot_line("uiserver: gpu compositor init begin");
+        // The GPU compositor owns its internal deadlines (`GPU_READY_TIMEOUT`,
+        // `GPU_FIRST_FRAME_TIMEOUT`); the readiness machine only observes it,
+        // and its own budget guards a worker that never reports.
+        let startup = crate::startup::global();
+        startup.begin(crate::startup::Dependency::Gpu);
         let gpu_compositor = Some(GpuCompositorRuntime::new(
             display_fd.as_raw_fd(),
             gpu_display,
-        )?);
+        ).inspect_err(|errno| {
+            startup.fail(crate::startup::Dependency::Gpu, *errno, false);
+        })?);
         boot_line("uiserver: gpu compositor init done");
         diag_line("uiserver: init open_input begin");
         boot_line("uiserver: init open_input begin");
@@ -356,6 +339,7 @@ impl AppState {
         let surface_state = fetch_surface_state(display_fd.as_raw_fd())?;
         diag_line("uiserver: init fetch_surface done");
         boot_line("uiserver: init fetch_surface done");
+        crate::startup::global().succeed(crate::startup::Dependency::Display);
         boot_line("uiserver: input pointer surface publish begin");
         match publish_input_pointer_surface(surface_state.display) {
             Ok(()) => {
@@ -593,7 +577,6 @@ fn load_launcher_programs() -> Vec<LauncherProgram> {
 mod tests {
     use super::{
         display_info_unavailable_is_retryable, validate_surface_metadata,
-        PRIMARY_DISPLAY_WAIT_ATTEMPTS, PRIMARY_DISPLAY_WAIT_DELAY,
     };
     use crate::sys::{
         DisplayInfo, DisplaySurfaceCreate, EAGAIN, EINVAL, ENODEV, PIXEL_FORMAT_BGRA8888,
@@ -639,10 +622,11 @@ mod tests {
         assert!(display_info_unavailable_is_retryable(ENODEV));
         assert!(display_info_unavailable_is_retryable(EAGAIN));
         assert!(!display_info_unavailable_is_retryable(EINVAL));
-        assert!(
-            PRIMARY_DISPLAY_WAIT_DELAY.saturating_mul(PRIMARY_DISPLAY_WAIT_ATTEMPTS as u32)
-                <= std::time::Duration::from_secs(1)
-        );
+        // The wait is bounded, and by a budget that survives a loaded boot: a
+        // 1 s private counter used to turn a slow provider into a dead service.
+        let policy = crate::startup::Dependency::Display.policy();
+        assert!(policy.total_budget >= std::time::Duration::from_secs(10));
+        assert!(policy.total_budget <= std::time::Duration::from_secs(60));
     }
 
     #[test]

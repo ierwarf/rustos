@@ -941,6 +941,7 @@ impl GpuCompositor {
                 self.next_content_epoch,
             );
             diag_line(active_contract);
+            crate::startup::global().succeed(crate::startup::Dependency::Gpu);
         }
         self.active = true;
         self.next_slot = (slot_index + 1) % self.slots.len();

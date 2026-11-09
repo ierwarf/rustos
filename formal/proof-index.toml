@@ -28,7 +28,7 @@ kind = "kani"
 package = "rustos-image-admission"
 source = "libs/rustos-image-admission/src/lib.rs"
 symbol = "admit_image"
-formal_model = "dual-abi-image-admission/DualAbiImageAdmission"
+formal_model = "validator:image-admission"
 scope = "bounded parser, arithmetic, W^X, relocation, import, and region-admission paths"
 harnesses = [
   "accepted_entry_is_bounded_and_executable",

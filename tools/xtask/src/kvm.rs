@@ -39,6 +39,7 @@ use crate::util::{resolve_command_path, run_command};
 
 mod failure_snapshot;
 mod hecs;
+mod host_pressure;
 
 const DVM_KERNEL: &str = "rustos-linux-dvm-x86_64.bzImage";
 const DVM_ROOTFS: &str = "rustos-linux-dvm-x86_64.rootfs.cpio.zst";

@@ -74,6 +74,10 @@ See [SMP scheduler and handoff contract](smp/scheduler.md#77-kernel-derived-endp
 
 See [SMP scheduler and handoff contract](smp/scheduler.md#78-atomic-startup-cohort-activation).
 
+### 7.9 Owner-word writers and the resident IPC cell
+
+See [SMP scheduler and handoff contract](smp/scheduler.md#79-owner-word-writers-and-the-resident-ipc-cell).
+
 ## 8. Address spaces and TLB shootdown
 
 See [SMP memory, process and failure contract](smp/memory-lifecycle.md#8-address-spaces-and-tlb-shootdown).

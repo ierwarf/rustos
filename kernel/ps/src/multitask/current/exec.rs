@@ -248,9 +248,9 @@ pub fn exec_user_process_by_pid_checked(
     // without a scheduler turn, so the transition stays published. A yield is
     // a scheduler entry on that CPU and completes it; the image transaction
     // refuses a target that still has an execution owner.
-    exec_transaction::evict_parked_target(slot);
     let owner_wait_start = crate::arch::clock::monotonic_nanos();
-    while (cpu_local::task_execution_owner(slot).is_some()
+    while (exec_transaction::evict_parked_target(slot)
+        || cpu_local::task_execution_owner(slot).is_some()
         || exec_transaction::image_bank_busy(slot))
         && crate::arch::clock::monotonic_nanos().saturating_sub(owner_wait_start)
             < EXEC_REMOTE_QUIESCE_TIMEOUT_NS

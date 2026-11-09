@@ -140,6 +140,41 @@ mod tests {
     }
 
     #[test]
+    fn host_cpu_pressure_is_an_opt_in_timing_profile_with_a_bounded_operand() {
+        let parse = |extra: &[&str]| parse_smoke_options(extra.iter().map(|arg| arg.to_string()));
+        assert_eq!(parse(&[]).unwrap().host_cpu_pressure, None);
+        assert_eq!(
+            parse(&["--host-cpu-pressure", "50"]).unwrap().host_cpu_pressure,
+            Some(50)
+        );
+        assert_eq!(
+            parse(&["--host-cpu-pressure", "100", "--repeat", "3"])
+                .unwrap()
+                .host_cpu_pressure,
+            Some(100)
+        );
+        for bad in ["0", "101", "-1", "abc", "50%"] {
+            assert!(parse(&["--host-cpu-pressure", bad]).is_err(), "{bad} accepted");
+        }
+        assert!(parse(&["--host-cpu-pressure"]).is_err());
+        assert!(parse(&["--host-cpu-pressure", "10", "--host-cpu-pressure", "20"]).is_err());
+        assert!(parse(&["--host-cpu-pressure", "10", "--smp-iteration"]).is_err());
+        assert!(
+            parse(&[
+                "--host-cpu-pressure",
+                "10",
+                "--smp-iteration",
+                "--smp-ring3-qualification",
+                "--smp-evidence-cohort",
+                "0123456789abcdef0123456789abcdef",
+                "--rustos-vcpus",
+                "2",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
     fn physical_usb_attaches_one_controller_and_is_exclusive_with_virtual_input() {
         let parse = |extra: &[&str]| {
             parse_smoke_options(extra.iter().map(|arg| arg.to_string()))

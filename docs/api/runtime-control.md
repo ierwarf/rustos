@@ -38,7 +38,7 @@ client.request_terminate_session(session_handle)?;
 | `request_launch_path_new_session(exec_path)` | Compatibility wrapper for path launch. |
 | `request_terminate_session(session_handle)` | Terminate a session. |
 | `request_terminate_pid(pid)` | Terminate a process id. |
-| `notify_ui_ready()` | Send a one-way UI-ready notification to `runtimed`. |
+| `notify_ui_ready()` | Report UI readiness; returns `Ok` only after `runtimed` acknowledged it. |
 
 ### Data Flow
 
@@ -47,7 +47,11 @@ client -> UnixStream(/run/runtimed.sock) -> RuntimeRequest -> runtimed
       <- RuntimeResponse + optional RuntimeRunningProgram payload
 ```
 
-`notify_ui_ready()` is intentionally one-way and has no response payload.
+`notify_ui_ready()` is request/response like every other mutation (wire version
+2): `runtimed` records the edge, then replies `status = 0, count = 0`. The reply,
+not the write, is delivery. The operation is idempotent, so a caller that lost
+the reply retries. Version 1 was a one-way write; a version mismatch is refused
+with `EPROTO` instead of stalling.
 
 The protocol is fixed-size and C-layout oriented. Path-like request text must
 be nonempty, at most `MAX_REQUEST_PATH_BYTES` bytes, and printable ASCII
@@ -96,7 +100,7 @@ client.request_terminate_session(session_handle)?;
 | `request_launch_path_new_session(exec_path)` | path launch용 compatibility wrapper입니다. |
 | `request_terminate_session(session_handle)` | session을 종료합니다. |
 | `request_terminate_pid(pid)` | process id를 종료합니다. |
-| `notify_ui_ready()` | UI-ready를 `runtimed`에 one-way로 알립니다. |
+| `notify_ui_ready()` | UI-ready를 알리며 `runtimed`가 acknowledge한 뒤에만 `Ok`를 반환합니다. |
 
 ### Data Flow
 
@@ -105,7 +109,10 @@ client -> UnixStream(/run/runtimed.sock) -> RuntimeRequest -> runtimed
       <- RuntimeResponse + optional RuntimeRunningProgram payload
 ```
 
-`notify_ui_ready()`는 의도적으로 one-way이며 response payload가 없습니다.
+`notify_ui_ready()`는 다른 mutation과 같은 request/response입니다(wire version 2).
+`runtimed`가 edge를 기록한 뒤 `status = 0, count = 0`으로 응답하며, write가 아니라 이 응답이
+전달 완료입니다. 연산은 idempotent이므로 응답을 잃은 호출자는 재시도합니다. version 1은
+one-way write였고, version 불일치는 stall 대신 `EPROTO`로 거부됩니다.
 
 protocol은 fixed-size C-layout 중심입니다. path-like request text는 비어 있지
 않은 printable ASCII여야 하고 backslash를 포함할 수 없으며,

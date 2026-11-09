@@ -123,6 +123,7 @@ pub(crate) struct ContractManifest {
     pub schema: u32,
     pub max_intentional_terminal_models: usize,
     pub models: PathBuf,
+    pub validators: PathBuf,
     pub model_bindings: PathBuf,
     pub flows: PathBuf,
     pub scenarios: PathBuf,
@@ -187,6 +188,9 @@ pub(crate) struct ProductScenarioStep {
 pub(crate) struct ContractRegistry {
     pub manifest: ContractManifest,
     pub models: BTreeMap<String, ModelRecord>,
+    /// Validator ids (`validator:<name>`) that replace a TLA+ model for a
+    /// sequential admission check; see `formal/validators.tsv`.
+    pub validators: BTreeSet<String>,
     pub model_bindings: Vec<ModelBinding>,
     pub transitions: Vec<Transition>,
     pub scenarios: Vec<ProductScenarioStep>,
@@ -219,6 +223,7 @@ impl ContractRegistry {
             bail!("unsupported formal contract schema {}", manifest.schema);
         }
         let models = parse_models(&root.join(&manifest.models))?;
+        let validators = parse_validators(&root.join(&manifest.validators), &models)?;
         let model_bindings = parse_model_bindings(&root.join(&manifest.model_bindings))?;
         let transitions = parse_transitions(&root.join(&manifest.flows))?;
         let scenarios = parse_product_scenarios(&root.join(&manifest.scenarios))?;
@@ -226,6 +231,7 @@ impl ContractRegistry {
         Ok(Self {
             manifest,
             models,
+            validators,
             model_bindings,
             transitions,
             scenarios,
@@ -259,9 +265,11 @@ impl ContractRegistry {
             if !hazards.insert(&transition.hazard) {
                 bail!("duplicate formal hazard {}", transition.hazard);
             }
-            if !self.models.contains_key(&transition.model) {
+            if !self.models.contains_key(&transition.model)
+                && !self.validators.contains(&transition.model)
+            {
                 bail!(
-                    "transition {}/{} uses unknown model {}",
+                    "transition {}/{} uses unknown model or validator {}",
                     transition.flow,
                     transition.id,
                     transition.model
@@ -1152,6 +1160,33 @@ fn is_unregistered_high_risk_source(path: &Path) -> bool {
         || path.contains("/input/dvm_")
 }
 
+fn parse_validators(path: &Path, models: &BTreeMap<String, ModelRecord>) -> Result<BTreeSet<String>> {
+    let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let mut validators = BTreeSet::new();
+    for (index, line) in text.lines().enumerate() {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let fields = line.split('\t').collect::<Vec<_>>();
+        if fields.len() != 5 {
+            bail!(
+                "{}:{} has {} validator fields",
+                path.display(),
+                index + 1,
+                fields.len()
+            );
+        }
+        let id = fields[0];
+        if !id.starts_with("validator:") || models.contains_key(id) {
+            bail!("{}:{} invalid validator id {id}", path.display(), index + 1);
+        }
+        if !validators.insert(id.to_owned()) {
+            bail!("{}:{} duplicate validator {id}", path.display(), index + 1);
+        }
+    }
+    Ok(validators)
+}
+
 fn parse_models(path: &Path) -> Result<BTreeMap<String, ModelRecord>> {
     let text = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
     let mut models = BTreeMap::new();
@@ -1407,6 +1442,7 @@ fn registry_hash(registry: &ContractRegistry) -> String {
     );
     for path in [
         &registry.manifest.models,
+        &registry.manifest.validators,
         &registry.manifest.model_bindings,
         &registry.manifest.flows,
         &registry.manifest.scenarios,

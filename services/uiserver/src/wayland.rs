@@ -55,11 +55,13 @@ use crate::sys::{
 use crate::wayland_accept::{start_wayland_acceptor, WaylandAcceptor};
 
 mod buffer;
+mod commit;
 mod compositor;
 mod input;
 mod output;
 mod seat;
 mod shm;
+mod snapshot;
 mod state;
 mod surface;
 #[cfg(test)]
@@ -68,6 +70,8 @@ mod windows;
 mod xdg;
 
 use self::buffer::*;
+use self::commit::CommitSlot;
+use self::snapshot::{SnapshotLayout, SnapshotPixels, SnapshotService, SnapshotSpec};
 
 const WAYLAND_SOCKET_NAME: &str = "wayland-0";
 const LINUX_BTN_LEFT: u32 = 0x110;
@@ -218,6 +222,7 @@ impl WaylandCompositor {
             ));
             return None;
         }
+        let snapshot_waker = ui_wake_sender.clone();
         let acceptor = match start_wayland_acceptor(listener, ui_wake_sender) {
             Ok(acceptor) => acceptor,
             Err(err) => {
@@ -229,6 +234,7 @@ impl WaylandCompositor {
             }
         };
         let state = WaylandState::new(display_width, display_height);
+        state.snapshots.set_waker(snapshot_waker);
         {
             let handle = display.handle();
             handle.create_global::<WaylandState, wl_compositor::WlCompositor, _>(6, ());
@@ -342,6 +348,7 @@ impl WaylandCompositor {
     /// cross-service VFS/NETD traffic and scheduler churn.
     pub(crate) fn has_pending_protocol_input(&self) -> bool {
         self.acceptor.has_pending()
+            || self.state.snapshots_need_service()
             || self
                 .readiness
                 .as_ref()
@@ -384,6 +391,10 @@ impl WaylandCompositor {
             }
         }
         let accept_elapsed = accept_started.elapsed();
+        // Apply finished client-buffer reads and fail the overdue ones before
+        // dispatching new requests, so a completed commit's release and
+        // configure precede the next request from the same client.
+        self.state.pump_snapshots();
 
         let dispatch_started = Instant::now();
         crate::note_wayland_step(crate::WAYLAND_STEP_DISPATCH);
@@ -956,6 +967,8 @@ struct WaylandState {
     buffer_copy_profile_bytes: u64,
     buffer_copy_profile_micros: u64,
     buffer_copy_profile_max_micros: u64,
+    /// Off-thread, budgeted client-buffer reads (`wayland/snapshot.rs`).
+    snapshots: SnapshotService,
 }
 
 #[derive(Clone)]
@@ -1035,6 +1048,9 @@ struct WaylandSurfaceState {
     last_damage: Rect,
     pending_callbacks: Vec<PendingFrameCallback>,
     pending_buffer_releases: Vec<wl_buffer::WlBuffer>,
+    /// The commit whose pixels are being read off-thread, and the one queued
+    /// behind it (`wayland/commit.rs`).
+    commit: CommitSlot,
     pixels: Arc<Vec<u32>>,
     width: usize,
     height: usize,
@@ -1083,7 +1099,9 @@ struct ShmPoolData {
 struct WaylandShmPoolState {
     len: usize,
     /// Shared by buffers after pool destruction; never mapped into uiserver.
-    fd: OwnedFd,
+    /// Reference-counted so a snapshot job that is mid-`pread` keeps the
+    /// descriptor open: a closed-and-reused fd number must never be read.
+    fd: Arc<OwnedFd>,
     /// Held while the descriptor is open, which outlives the pool object while
     /// any buffer still references it.
     _ticket: LiveObjectTicket,

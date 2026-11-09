@@ -136,6 +136,9 @@ or launch policy.
   also have a direct entry in `formal/README.md`, `formal/COVERAGE.md`, and
   `formal/CONFORMANCE.md` so execution, failed-gate ownership, and source
   correspondence cannot drift independently.
+  Sequential parsers and validators are not models: they are registered in
+  `formal/validators.tsv` and governed, with the tool-selection rule, severity
+  rubric and model triage, by `docs/ai/formal-scope-policy.md`.
 - PR evidence is `bash formal/verify-all.sh --profile pr`: exhaustive finite
   TLC, non-vacuous Kani, Verus, concrete runtime trace replay, native
   Linux/Windows ABI reference comparison, a bounded restart/crash-consistency

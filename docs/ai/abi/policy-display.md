@@ -305,8 +305,9 @@ Kernel keeps only: user-copy, address-space replacement, scheduler mutation, pen
   post-unmap region ledger before removing the first PTE. Metadata allocation
   failure is reported as `OutOfFrames`; it cannot abort mid-commit or leave
   page tables and the address-space region ledger describing different spans.
-- An allocator failure, `fatal service endpoint not ready`, watchdog, or
-  scheduler-stall marker is a failed KVM health outcome and is retained in the
+- An allocator failure, `fatal service endpoint not ready`, a failed
+  `uiserver: readiness v1` record, watchdog, or scheduler-stall marker is a
+  failed KVM health outcome and is retained in the
   bounded causal evidence. No interactive frozen window may remain classified
   as a healthy session merely because QEMU itself is still running.
 - Windows syscall policy: `Win32SyscallOffloadRequest`/`Response` + `SYSCALL_OFFLOAD_OP_WIN32_*` range. Kernel dispatcher calls service policy first, validates ABI/status, and must fail closed with a non-success NTSTATUS on malformed or denied responses before performing only the narrow privileged action.
@@ -337,13 +338,21 @@ do not admit a service, a module-loading path, or a future ABI reuse.
   fallback. The only accepted normal provider is the validated DVM aperture.
 - Built-in framebuffer registration accepts only the DVM primary-provider flag;
   do not infer ownership from geometry or `display_info()` presence.
-- A `wl_shm` pool fd is client-chosen and uiserver reads it with `pread` on the
-  compositor thread (`read_shm_snapshot`; it never maps client pages). Admission
-  and resize therefore require a regular file (memfd or a vfsd-backed file whose
-  read is one deadline-bounded service call); FIFOs, sockets, ttys and devices,
-  whose read can block for as long as a peer chooses, are refused with a
-  protocol error. A vfsd-backed pool is still read synchronously: its worst case
-  is the vfsd call deadline, not unbounded.
+- A `wl_shm` pool fd is client-chosen and uiserver never maps it. Pool
+  admission is metadata only (`fstat`: a regular file at least as long as the
+  pool); FIFOs, sockets, ttys and devices, whose read can block for as long as a
+  peer chooses, are refused with a protocol error. Pixels are obtained by
+  `wl_surface.commit` as a non-blocking transaction (`wayland/commit.rs`): the
+  UI thread plans the read, a bounded snapshot worker pool
+  (`wayland/snapshot.rs`, at most 4 workers, one running job per client)
+  `pread`s and converts it, and the UI thread applies the finished pixels on a
+  later tick. No client fd is read on the compositor thread. Budgets: 16 jobs
+  and 128 MiB in flight per client, 256 MiB overall, 12 s per job (over-budget
+  or expired jobs fail the commit with `wl_shm.invalid_fd`); a retiring surface
+  cancels its read. Commits that arrive while a read is in flight queue behind
+  it and coalesce per surface (newest attachment wins, damage unions), so
+  per-surface order is preserved. Snapshot jobs hold an `Arc<OwnedFd>`: a
+  closed pool descriptor is never reused under a running `pread`.
 - Display readiness is a two-stage observation. The bootstrap `display_get_info`
   snapshot must carry both primary-provider and DVM-scanout provenance; it may
   precede GPU-atlas creation. The later kernel-stamped
@@ -362,8 +371,27 @@ do not admit a service, a module-loading path, or a future ABI reuse.
 - If the DVM provider is unavailable, normal presentation fails closed. It
   must not synthesize a boot-framebuffer or direct-GPU fallback. During boot,
   `uiserver` treats only `EAGAIN`/`ENODEV` from display-info lookup as transient
-  provider-publication ordering and retries within the 1 s product-boot
-  deadline; every other error is terminal and deadline expiry remains fatal.
+  provider-publication ordering and retries them under the `Display`
+  dependency's owned policy (25 ms to 250 ms backoff, 30 s budget); every other
+  error is terminal and an exhausted budget is a published `readiness
+  state=failed cause=display` followed by a nonzero exit.
+- uiserver readiness is one typed state machine (`services/uiserver/src/startup.rs`,
+  design in [`../ui-startup-readiness.md`](../ui-startup-readiness.md)). Six
+  dependencies (`assets`, `display`, `input`, `wayland`, `runtime`, `gpu`) each
+  own a retry policy and a total budget; `assets` is optional (bundled
+  fallback), the rest are required. The canonical, single source of truth is the
+  line `uiserver: readiness v1 state=<starting|ready|degraded|failed> gen=<n>
+  [cause=<dep> errno=<n>] assets=.. display=.. input=.. wayland=.. runtime=..
+  gpu=..`, printed on every transition (`gen` strictly increases). Per
+  dependency: `pending`, `attempting#<n>`, `backoff#<n>`, `ready`,
+  `failed#<attempts>/errno<e>`. `Failed` is terminal and never contradicted by a
+  late success. A required failure (including an attempt that never reported
+  within its budget) makes the UI loop exit with that errno.
+- The runtime link is a level, not an edge: a dedicated worker retries the
+  `OP_NOTIFY_READY` until `runtimed` acknowledges it (runtime-control wire v2,
+  see `../../api/runtime-control.md`) under the `runtime` policy, then runs the
+  running-set watch. The compositor
+  thread never waits on `runtimed`.
 - A DVM-backed physical scanout is usable for normal desktop rendering but is
   not a trusted-attention display. The trusted-UI status endpoint fails closed
   until an independently attested scanout and input path are deployed; drawing

@@ -1337,7 +1337,7 @@ while IFS='|' read -r model package test_name features; do
     fi
     printf '%s\n' "$witness_key" >> "$seen"
     awk -F '\t' -v wanted="$model" '$1 == wanted { found++ } END { exit(found == 1 ? 0 : 1) }' \
-        formal/models.tsv || { echo "source conformance model is not registered: $model" >&2; exit 1; }
+        formal/models.tsv formal/validators.tsv || { echo "source conformance model is not registered: $model" >&2; exit 1; }
     group="$package|$features"
     if [[ -z "${group_rows[$group]+set}" ]]; then
         group_order+=("$group")
@@ -1518,10 +1518,20 @@ service-call-authority/ServiceCallAuthority|nucleus-core|util::lockdep::tests::d
 process-address-space-lifetime/ProcessAddressSpaceLifetime|kernel-ps|multitask::process_table::tests::exiting_process_rejects_new_thread_attachment
 early-system-admission/EarlySystemAdmission|boot-protocol|tests::early_system_records_are_fixed_bounded_and_canonical
 early-system-admission/EarlySystemAdmission|boot-protocol|tests::rejects_an_all_zero_rng_seed
-dual-abi-image-admission/DualAbiImageAdmission|rustos-image-admission|tests::complete_elf64_header_and_program_table_share_the_admission_gate
-dual-abi-image-admission/DualAbiImageAdmission|rustos-image-admission|tests::complete_pe64_headers_and_sections_share_the_admission_gate
-dual-abi-image-admission/DualAbiImageAdmission|rustos-image-admission|tests::rejects_out_of_range_and_overflowing_regions
-dual-abi-image-admission/DualAbiImageAdmission|rustos-image-admission|tests::rejects_writable_executable_region
+validator:image-admission|rustos-image-admission|tests::complete_elf64_header_and_program_table_share_the_admission_gate
+validator:image-admission|rustos-image-admission|tests::complete_pe64_headers_and_sections_share_the_admission_gate
+validator:image-admission|rustos-image-admission|tests::rejects_out_of_range_and_overflowing_regions
+validator:image-admission|rustos-image-admission|tests::rejects_writable_executable_region
+validator:image-admission|rustos-image-admission|exhaustive_tests::admit_image_agrees_with_the_plan_predicate_for_zero_to_two_regions
+validator:image-admission|rustos-image-admission|exhaustive_tests::elf64_every_truncation_of_the_program_table_is_rejected
+validator:image-admission|rustos-image-admission|exhaustive_tests::elf64_exec_images_agree_with_the_byte_predicate_for_two_load_segments
+validator:image-admission|rustos-image-admission|exhaustive_tests::pe64_every_truncated_or_extended_table_is_rejected
+validator:image-admission|rustos-image-admission|exhaustive_tests::pe64_images_agree_with_the_layout_predicate_for_two_sections
+validator:image-admission|rustos-image-admission|exhaustive_tests::pe64_relocation_block_with_an_unaligned_page_rva_is_invalid
+validator:image-admission|rustos-image-admission|tests::pe64_import_table_requires_bounded_ascii_and_a_null_descriptor
+validator:image-admission|rustos-image-admission|tests::pe64_import_thunks_reject_reserved_bits_and_unbounded_names
+validator:image-admission|rustos-image-admission|tests::pe64_relocation_requires_a_table_when_the_image_is_rebased
+validator:image-admission|rustos-image-admission|tests::raw_elf_load_segment_enforces_file_alignment_bounds_and_wx
 dvm-input-ring/DvmInputRing|driver-domain-protocol|tests::input_ring_has_separate_cursor_cache_lines_and_rejects_tampering
 dvm-input-ring/DvmInputRing|driver-domain-protocol|tests::input_frame_requires_nonzero_provenance_bounds_and_stable_checksum
 dvm-input-ring/DvmInputRing|kernel-io-manager|input::dvm_ring::tests::policy_consumer_readiness_requires_transport_and_is_idempotent
@@ -1621,9 +1631,11 @@ clocksource-deadline/ClocksourceDeadline|kernel-ps|multitask::scheduler::wake_pu
 clocksource-deadline/ClocksourceDeadline|kernel-compat|user::syscall::linux::service_ops::process_time::tests::time_hot_path_admission_is_local_and_complete
 clocksource-deadline/ClocksourceDeadline|kernel-compat|user::syscall::linux::service_ops::process_time::tests::a_monotonic_instant_between_two_ticks_keeps_its_own_resolution
 clocksource-deadline/ClocksourceDeadline|kernel-ps|multitask::scheduler::tests::scheduler_block_arm_is_exact_race_safe_and_terminally_revoked
-cpu-topology-admission/CpuTopologyAdmission|kernel-hal|arch::acpi::tests::madt_cpu_topology_is_dense_unique_bounded_and_atomic
-cpu-topology-admission/CpuTopologyAdmission|kernel-hal|arch::acpi::tests::madt_rejects_truncation_and_bad_apic_override
-cpu-topology-admission/CpuTopologyAdmission|kernel-hal|arch::acpi::tests::madt_normalizes_the_executing_bsp_to_logical_cpu_zero
+validator:madt-topology-admission|kernel-hal|arch::acpi::tests::madt_cpu_topology_is_dense_unique_bounded_and_atomic
+validator:madt-topology-admission|kernel-hal|arch::acpi::tests::madt_rejects_truncation_and_bad_apic_override
+validator:madt-topology-admission|kernel-hal|arch::acpi::tests::madt_normalizes_the_executing_bsp_to_logical_cpu_zero
+validator:madt-topology-admission|kernel-hal|arch::acpi::admission_tests::madt_admission_agrees_with_the_topology_predicate_and_is_atomic
+validator:madt-topology-admission|kernel-hal|arch::acpi::admission_tests::madt_over_capacity_keeps_the_first_cpus_in_firmware_order
 cpu-online-lifecycle/CpuOnlineLifecycle|kernel-hal|arch::smp::tests::cpu_lifecycle_publication_is_dense_generation_bound_and_ordered
 cpu-online-lifecycle/CpuOnlineLifecycle|kernel-hal|arch::smp::tests::cpu_lifecycle_rejects_skipped_state
 cpu-online-lifecycle/CpuOnlineLifecycle|kernel-hal|arch::smp::tests::cpu_lifecycle_rejects_stale_generation
@@ -2012,7 +2024,9 @@ synchronous-ipc-handoff-concurrency/SynchronousIpcHandoffConcurrency|kernel-ps|m
 ipc-priority-inheritance/IpcPriorityInheritance|kernel-ps|multitask::scheduler::tests::synchronous_ipc_donation_promotes_and_revokes_a_transitive_user_chain
 ipc-priority-inheritance/IpcPriorityInheritance|kernel-ps|multitask::scheduler::donation_publication::tests::actual_queued_receive_moves_original_reply_funding_from_wake_candidate_to_consumer
 ipc-priority-queue/IpcPriorityQueue|kernel-ipc-runtime|ipc::tests::receiver_waiter_tests::endpoint_system_calls_bypass_backlog_without_starving_ordinary_lane
-pci-bar-discovery/PciBarDiscovery|kernel-hal|arch::pci::tests::mem64_bar_size_uses_the_lowest_implemented_mask_bit
+validator:pci-bar-sizing|kernel-hal|arch::pci::tests::mem64_bar_size_uses_the_lowest_implemented_mask_bit
+validator:pci-bar-sizing|kernel-hal|arch::pci::bar_sizing_tests::bar_sizing_obeys_the_probe_protocol_for_every_device_shape
+validator:pci-bar-sizing|kernel-hal|arch::pci::bar_sizing_tests::a_64bit_bar_in_the_last_dword_is_rejected_without_touching_the_next_register
 dvm-volume-io/DvmVolumeIo|vfsd|tests::dvm_block_range_rejects_empty_overflow_and_end_overrun
 dvm-volume-io/DvmVolumeIo|vfsd|tests::storage_geometry_rejects_provider_overflow_unknown_flags_and_foreign_binding
 dvm-volume-io/DvmVolumeIo|storage-fat|tests::fat_disk_rejects_untrusted_or_overflowing_geometry_before_allocation
@@ -2240,10 +2254,13 @@ dvm-gpu-admission/DvmGpuAdmission|uiserver|gpu_runtime::tests::completion_timeou
 msi-vector-lifecycle/MsiVectorLifecycle|kernel-hal|arch::msi::tests::unallocated_vector_has_no_registration_authority
 msi-vector-lifecycle/MsiVectorLifecycle|kernel-hal|arch::msi::tests::failed_unpublished_vector_lease_revokes_exact_handler_and_slot
 msi-vector-lifecycle/MsiVectorLifecycle|kernel-hal|arch::msi::tests::committed_vector_remains_revocable_until_permanent_publication
-acpi-table-admission/AcpiTableAdmission|kernel-hal|arch::acpi::tests::root_sdt_requires_exact_signature_width_and_entry_alignment
-acpi-table-admission/AcpiTableAdmission|kernel-hal|arch::acpi::tests::mcfg_admission_is_atomic_bounded_aligned_and_nonoverlapping
-acpi-table-admission/AcpiTableAdmission|kernel-hal|arch::acpi::tests::ecam_region_range_and_config_address_are_checked_end_to_end
-acpi-table-admission/AcpiTableAdmission|kernel-hal|arch::acpi::tests::hpet_gas_requires_memory_qword_zero_offset_and_aligned_range
+validator:acpi-table-admission|kernel-hal|arch::acpi::tests::root_sdt_requires_exact_signature_width_and_entry_alignment
+validator:acpi-table-admission|kernel-hal|arch::acpi::tests::mcfg_admission_is_atomic_bounded_aligned_and_nonoverlapping
+validator:acpi-table-admission|kernel-hal|arch::acpi::tests::ecam_region_range_and_config_address_are_checked_end_to_end
+validator:acpi-table-admission|kernel-hal|arch::acpi::tests::hpet_gas_requires_memory_qword_zero_offset_and_aligned_range
+validator:acpi-table-admission|kernel-hal|arch::acpi::admission_tests::root_sdt_admission_agrees_with_signature_width_and_entry_alignment
+validator:acpi-table-admission|kernel-hal|arch::acpi::admission_tests::mcfg_admission_agrees_with_the_ecam_predicate_and_is_atomic
+validator:acpi-table-admission|kernel-hal|arch::acpi::admission_tests::hpet_admission_agrees_with_the_exact_memory_gas_predicate
 persistent-mutation-admission/PersistentMutationAdmission|vfsd|tests::persistent_mutation_admission_remains_read_only
 deferred-start/DeferredStart|runtimed|spawn::tests::failed_spawn_cleanup_accepts_only_exact_retirement_or_esrch
 deferred-start/DeferredStart|initd|tests::failed_service_cleanup_accepts_only_exact_retirement_or_esrch
@@ -2610,7 +2627,12 @@ task-affinity-lifecycle/TaskAffinityLifecycle|syscalld|affinity_policy::tests::s
 task-affinity-lifecycle/TaskAffinityLifecycle|syscalld|affinity_policy::tests::windows_affinity_admission_is_handle_exact_and_online_bounded
 task-affinity-lifecycle/TaskAffinityLifecycle|syscalld|affinity_policy::tests::windows_process_affinity_query_binds_both_output_pointers_and_process_mask
 task-affinity-lifecycle/TaskAffinityLifecycle|kernel-compat|user::syscall::windows::dispatch::tests::windows_current_processor_number_is_exact_and_online_bounded
-filesystem-content-integrity/FilesystemContentIntegrity|kernel-io-manager|storage::boot_volume::tests::early_system_lookup_verifies_exact_path_and_payload_digest
+validator:early-system-content|kernel-io-manager|storage::boot_volume::tests::early_system_lookup_verifies_exact_path_and_payload_digest
+validator:early-system-content|kernel-io-manager|storage::boot_volume::tests::a_corrupted_image_never_returns_content_other_than_the_signed_payload
+validator:early-system-content|kernel-io-manager|storage::boot_volume::tests::every_truncation_of_the_image_is_refused
+validator:early-system-content|kernel-io-manager|storage::boot_volume::tests::a_table_that_is_not_canonical_is_refused_even_when_every_digest_is_valid
+validator:early-system-content|kernel-io-manager|storage::boot_volume::tests::a_path_outside_the_bootstrap_namespace_resolves_to_nothing
+validator:early-system-content|kernel-io-manager|storage::boot_volume::tests::the_verified_payload_cache_is_bound_to_the_exact_image
 post-init-leases/PostInitLeases|rootd|tests::reporter_exit_cascades_and_capability_requires_live_reporter_chain|host-test
 post-init-leases/PostInitLeases|rootd|tests::post_init_lease_requires_the_exact_declared_executable_path|host-test
 post-init-leases/PostInitLeases|kernel-compat|user::syscall::linux::proc_broker_ops::tests::deferred_activation_authority_is_exact_one_shot_and_nontransferable
@@ -2675,8 +2697,6 @@ entropy-broker-boundary/EntropyBrokerBoundary|kernel-compat|user::syscall::linux
 devmgrd-sessiond-isolation/DevmgrdSessiondIsolation|runtimed|session::tests::session_ingress_requires_exact_sender_or_narrow_devmgrd_delegation
 dma-iommu-isolation/DmaIommuIsolation|rustos-driver-domain-host|tests::launch_plan_requires_the_complete_iommu_group
 driver-domain-fleet/DriverDomainFleet|rustos-driver-domain-host|tests::fleet_policy_requires_disjoint_domain_cid_group_and_pci_authority
-dual-abi-byte-parser/DualAbiByteParser|rustos-image-admission|tests::complete_elf64_header_and_program_table_share_the_admission_gate
-dual-abi-byte-parser/DualAbiByteParser|rustos-image-admission|tests::complete_pe64_headers_and_sections_share_the_admission_gate
 dvm-absolute-pointer/DvmAbsolutePointer|driver-domain-protocol|tests::absolute_pointer_frame_is_bounded_and_keeps_position_semantics
 dvm-agent-readiness/DvmAgentReadiness|xtask|kvm::tests::dvm_agent_local_readiness_is_process_owned_and_atomic
 dvm-amdgpu-supply/DvmAmdgpuSupply|rustos-driver-domain-host|tests::physical_display_assignment_is_bound_to_exact_amdgpu_identity
@@ -2820,6 +2840,16 @@ job-policy-publication/JobPolicyPublication|xtask|kvm::job_policy_tests::policy_
 job-policy-publication/JobPolicyPublication|kernel-ps|multitask::process_table::jobs::policy::tests::published_membership_is_exact_and_refuses_hidden_exec_or_stale_process_publication
 job-policy-publication/JobPolicyPublication|kernel-ps|multitask::process_table::jobs::policy::tests::policy_cache_checks_all_words_and_rejects_missing_stale_or_revoked_identity
 job-policy-publication/JobPolicyPublication|kernel-ps|multitask::process_table::jobs::policy::tests::current_binding_ceiling_read_never_borrows_table_or_recovers_hidden_membership
+scheduler-owner-word/SchedulerOwnerWord|kernel-ps|multitask::scheduler::runqueue::tests::in_place_edits_keep_custody_and_apply_to_a_live_word
+scheduler-owner-word/SchedulerOwnerWord|kernel-ps|multitask::scheduler::runqueue::tests::a_custody_transition_must_advance_the_generation
+scheduler-owner-word/SchedulerOwnerWord|kernel-ps|multitask::scheduler::runqueue::tests::lock_free_metadata_writers_leave_a_terminal_owner_word_untouched
+scheduler-owner-word/SchedulerOwnerWord|kernel-ps|multitask::scheduler::runqueue::tests::mailbox_adoption_survives_a_terminal_withdrawal_that_beats_its_owner_cas
+scheduler-resident-cell/SchedulerResidentCell|kernel-ps|multitask::scheduler::irq_entry_tests::lane::a_park_never_displaces_a_newer_cell_and_never_waits_on_a_busy_one
+scheduler-resident-cell/SchedulerResidentCell|kernel-ps|multitask::scheduler::irq_entry_tests::lane::a_park_retires_the_stale_cell_of_an_older_generation_whose_evictor_is_late
+scheduler-resident-cell/SchedulerResidentCell|kernel-ps|multitask::scheduler::irq_entry_tests::lane::concurrent_parks_takes_and_late_hooks_never_tear_or_leak_a_cell
+scheduler-resident-cell/SchedulerResidentCell|kernel-ps|multitask::scheduler::irq_entry_tests::lane::exec_eviction_drops_the_parked_cell_of_the_current_generation
+scheduler-resident-cell/SchedulerResidentCell|kernel-ps|multitask::scheduler::irq_entry_tests::lane::actual_lane_call_switches_to_the_parked_receiver_and_parks_the_caller_at_the_ack
+scheduler-resident-cell/SchedulerResidentCell|kernel-ps|multitask::scheduler::irq_entry_tests::lane::actual_lane_reply_returns_to_the_parked_caller_and_both_hops_share_one_funding
 EOF
 
 # Every group is an independent Cargo selection over an already-built target

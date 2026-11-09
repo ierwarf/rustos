@@ -1,0 +1,11 @@
+X86_64 SchedulerResidentCellPublication
+"A parker publishing its cell and an owner transition's revoking hook cannot each miss the other"
+{
+uint64_t cell=0; uint64_t owner=7;
+uint64_t 0:rax; uint64_t 1:rax;
+}
+P0                       | P1                       ;
+movq $3,(cell)           | movq $9,(owner)          ;
+mfence                   | mfence                   ;
+movq (owner),%rax        | movq (cell),%rax         ;
+exists (0:rax=7 /\ 1:rax=0)

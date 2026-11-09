@@ -1,0 +1,10 @@
+X86_64 SchedulerResidentCellPublicationMutant
+"Without the full barriers the parked cell is neither seen by the hook nor revoked by the parker's re-read"
+{
+uint64_t cell=0; uint64_t owner=7;
+uint64_t 0:rax; uint64_t 1:rax;
+}
+P0                       | P1                       ;
+movq $3,(cell)           | movq $9,(owner)          ;
+movq (owner),%rax        | movq (cell),%rax         ;
+exists (0:rax=7 /\ 1:rax=0)

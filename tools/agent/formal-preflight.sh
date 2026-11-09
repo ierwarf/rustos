@@ -23,6 +23,7 @@ checks=(
   "doc-layout|python3 tools/agent/check-doc-layout.py"
   "formal-contracts|cargo xtask formal-contracts check"
   "system-flows|bash formal/check-system-flows.sh"
+  "validators|python3 formal/check-validators.py"
   "concurrency-triangle|python3 formal/check-concurrency-triangle.py"
   "proof-index|python3 formal/check-proof-index.py"
   "proof-boundaries|python3 formal/check-proof-boundaries.py"

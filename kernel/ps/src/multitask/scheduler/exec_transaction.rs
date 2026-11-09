@@ -412,10 +412,15 @@ pub(in crate::multitask::scheduler) fn refuse<T>(reason: ImageRefusal) -> Option
 /// A quiesced target that blocked in an IPC wait can still be parked in the
 /// resident lane, which keeps its stack pin and execution permit. The image
 /// writer needs both gone, so settle the cell as any other owner transition
-/// would: whoever wins the cell's generation swap owns and drops the loans.
-pub(in crate::multitask) fn evict_parked_target(slot: usize) {
+/// would: whoever wins the cell owns and drops the loans.
+///
+/// Returns whether the cell is still occupied. A park that is mid-fill, a drain
+/// that has not dropped its loans yet, or a late park that lands after this
+/// call, is not evicted by it; the caller re-evicts until the cell is empty.
+pub(in crate::multitask) fn evict_parked_target(slot: usize) -> bool {
     let generation = runqueue::owner(slot).generation;
     super::resident::on_owner_transition(slot, generation);
+    super::resident::occupied(slot)
 }
 
 /// Whether the target's image bank is still published as the prepared or

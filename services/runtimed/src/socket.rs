@@ -6,7 +6,12 @@
 //! - **Lifecycle:** Accept, obtain kernel peer credentials, authorize live
 //!   role, parse exact frame, dispatch, reply, and close/revoke on process exit.
 //! - **Concurrency:** Connection work is bounded; no global runtime-state lock
-//!   is held across blocking I/O or process-control IPC.
+//!   is held across blocking I/O or process-control IPC. `accept4` and
+//!   `SO_PEERCRED` run on a dedicated acceptor thread and reach the broker
+//!   through a bounded queue: each AF_UNIX syscall is a netd IPC with its own
+//!   reply deadline, and the broker loop also serves the session endpoint, so it
+//!   must not issue them. Reads of already-admitted clients and reply writes
+//!   still run on the broker (see `docs/ai/ui-startup-readiness.md`, deferred).
 //! - **Failure:** Partial/malformed frame, unauthorized peer, timeout, queue
 //!   pressure, command failure, and owner exit close without state confusion.
 //! - **Forbidden:** No path/name authorization, unbounded allocation, implicit
@@ -18,6 +23,7 @@ use std::io::{ErrorKind, Read, Write};
 use std::mem::size_of;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
 use runtime_control::RuntimeRunningProgram;
@@ -61,16 +67,88 @@ struct RuntimeWatchClient {
     deadline: Instant,
 }
 
+/// A connection the acceptor thread has accepted and authenticated at the
+/// kernel level (peer credentials), not yet read from.
+struct AcceptedClient {
+    stream: UnixStream,
+    peer: RuntimePeerCredentials,
+    accepted_at: Instant,
+}
+
 pub(super) struct RuntimeConnections {
     pending: VecDeque<PendingRuntimeClient>,
     watchers: VecDeque<RuntimeWatchClient>,
+    /// Connections handed over by the acceptor thread. The broker thread never
+    /// calls `accept4`/`SO_PEERCRED` itself: on RustOS every AF_UNIX syscall is
+    /// an IPC to netd with its own reply deadline, so a stalled netd would
+    /// freeze the one loop that also drains the session endpoint.
+    accepted: Receiver<AcceptedClient>,
+    acceptor_stop_reported: bool,
 }
 
-impl Default for RuntimeConnections {
-    fn default() -> Self {
+impl RuntimeConnections {
+    /// Move the listener onto its own acceptor thread and return the broker's
+    /// side of the hand-off. The queue is bounded, so a slow broker applies
+    /// back-pressure to the listener backlog instead of pinning descriptors.
+    pub(super) fn with_acceptor(listener: UnixListener) -> Result<Self, i32> {
+        let (sender, receiver) = mpsc::sync_channel(MAX_PENDING_RUNTIME_CLIENTS);
+        std::thread::Builder::new()
+            .name(String::from("runtimed-accept"))
+            .spawn(move || accept_loop(&listener, |client| sender.send(client).is_ok()))
+            .map_err(|err| err.raw_os_error().unwrap_or(libc::EAGAIN))?;
+        Ok(Self::from_receiver(receiver))
+    }
+
+    fn from_receiver(accepted: Receiver<AcceptedClient>) -> Self {
         Self {
             pending: VecDeque::with_capacity(MAX_PENDING_RUNTIME_CLIENTS),
             watchers: VecDeque::with_capacity(MAX_RUNTIME_WATCHERS),
+            accepted,
+            acceptor_stop_reported: false,
+        }
+    }
+}
+
+/// Pause between accept polls and after a failed accept. A failed `accept4`
+/// that returns only after an IPC deadline must not become a hot loop.
+const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+
+/// Accept until `deliver` reports the broker is gone. Never exits on an
+/// accept error: the control socket must outlive a transient netd stall.
+fn accept_loop(listener: &UnixListener, mut deliver: impl FnMut(AcceptedClient) -> bool) {
+    let mut consecutive_errors = 0_u32;
+    loop {
+        match accept_runtime_client(listener) {
+            Ok((stream, peer)) => {
+                consecutive_errors = 0;
+                let client = AcceptedClient {
+                    stream,
+                    peer,
+                    accepted_at: Instant::now(),
+                };
+                if !deliver(client) {
+                    return;
+                }
+            }
+            Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                std::thread::sleep(ACCEPT_POLL_INTERVAL);
+            }
+            Err(err) => {
+                // Log the first failure of a run, then every 64th, so a
+                // persistent fault is visible without flooding the console.
+                if consecutive_errors % 64 == 0 {
+                    observability_client::error!(
+                        "runtimed",
+                        service,
+                        "accept failed: errno={} consecutive={}",
+                        super::util::io_errno(err),
+                        consecutive_errors + 1
+                    );
+                }
+                consecutive_errors = consecutive_errors.saturating_add(1);
+                std::thread::sleep(ACCEPT_ERROR_BACKOFF);
+            }
         }
     }
 }
@@ -157,8 +235,10 @@ fn bind_timing(stage: &str, started_at: Instant) {
     );
 }
 
+/// Adopt connections the acceptor thread has queued, then make progress on the
+/// ones already pending. Never performs a socket-creation or accept syscall, so
+/// its cost is bounded by the (nonblocking) reads of clients already admitted.
 pub(super) fn service_listener(
-    listener: &UnixListener,
     connections: &mut RuntimeConnections,
     state: &mut BrokerState,
 ) -> bool {
@@ -167,28 +247,34 @@ pub(super) fn service_listener(
         if connections.pending.len() >= MAX_PENDING_RUNTIME_CLIENTS {
             break;
         }
-        match accept_runtime_client(listener) {
-            Ok((stream, peer)) => {
+        match connections.accepted.try_recv() {
+            Ok(accepted) => {
                 did_work = true;
                 connections.pending.push_back(PendingRuntimeClient {
-                    stream,
-                    peer,
+                    stream: accepted.stream,
+                    peer: accepted.peer,
                     request: RuntimeRequest::default(),
                     bytes_read: 0,
-                    deadline: Instant::now() + SERVICE_REQUEST_TIMEOUT,
+                    // The request clock starts when the peer connected, not
+                    // when this pass got around to it.
+                    deadline: accepted.accepted_at + SERVICE_REQUEST_TIMEOUT,
                 });
                 if state.ui_ready && !state.launch_catalog_loaded {
                     break;
                 }
             }
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
-            Err(err) => {
-                observability_client::error!(
-                    "runtimed",
-                    service,
-                    "accept failed: errno={}",
-                    super::util::io_errno(err)
-                );
+            Err(TryRecvError::Empty) => break,
+            Err(TryRecvError::Disconnected) => {
+                // The acceptor thread ended, so the control socket is dead.
+                // Say so once per pass rather than pretend it is idle.
+                if !connections.acceptor_stop_reported {
+                    connections.acceptor_stop_reported = true;
+                    observability_client::error!(
+                        "runtimed",
+                        service,
+                        "control socket acceptor stopped"
+                    );
+                }
                 break;
             }
         }
@@ -619,13 +705,30 @@ fn handle_ready(
     if request.target_kind != READY_COMPONENT_UI_SERVER {
         return Err(libc::EOPNOTSUPP);
     }
-    state.ui_ready = true;
-    observability_client::info!("runtimed", service, "ui ready received");
-    boot_line("runtimed: ui ready received");
-    // RuntimeClient::notify_ui_ready is deliberately one-way; the compositor
-    // closes this stream after the request, so replying here can stall boot.
-    let _ = stream;
+    // Record the edge before acknowledging it: the ack means "runtimed holds
+    // this", so it must not be sent for state that could still be lost.
+    // Retries are idempotent; only the first one is logged.
+    if !state.ui_ready {
+        state.ui_ready = true;
+        observability_client::info!("runtimed", service, "ui ready received");
+        boot_line("runtimed: ui ready received");
+    }
+    // A client that already gave up (closed the stream) loses only the ack:
+    // the edge is recorded, and its retry is a no-op.
+    if let Err(errno) = super::util::write_response(stream, ready_ack()) {
+        boot_line(&format!("runtimed: ui ready ack not delivered errno={errno}"));
+    }
     Ok(())
+}
+
+/// The acknowledgement of a recorded `OP_NOTIFY_READY` (wire version 2).
+fn ready_ack() -> RuntimeResponse {
+    RuntimeResponse {
+        version: PROTOCOL_VERSION,
+        op: OP_NOTIFY_READY,
+        status: 0,
+        count: 0,
+    }
 }
 
 pub(super) fn ensure_policy_launches(state: &mut BrokerState) -> bool {
@@ -827,20 +930,22 @@ fn last_errno() -> i32 {
 mod tests {
     use std::collections::VecDeque;
     use std::io::{ErrorKind, Read, Write};
-    use std::os::unix::net::UnixStream;
-    use std::time::Instant;
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::time::{Duration, Instant};
 
     use super::{
-        launch_may_precede_ui_ready, launch_retry_backoff, read_request_progress,
+        handle_ready, launch_may_precede_ui_ready, launch_retry_backoff, read_request_progress,
         runtime_request_role_authorized, PendingRuntimeClient, RequestReadProgress,
-        RuntimeConnections, RuntimePeerCredentials, OP_NOTIFY_READY, OP_REQUEST_LAUNCH_PATH,
+        AcceptedClient, RuntimeConnections, RuntimePeerCredentials, OP_NOTIFY_READY, OP_REQUEST_LAUNCH_PATH,
         OP_REQUEST_TERMINATE, OP_SNAPSHOT_RUNNING_PROGRAMS, OP_WATCH_RUNNING_PROGRAMS,
     };
     use crate::kvm_smp_qualification::{
         inject_kvm_smp_qualification_launch, KvmSmpQualificationContract,
     };
     use crate::{
-        BrokerState, LaunchEntry, RunningProcess, RuntimeRequest, DEFAULT_USER_TASK_WEIGHT_MICROS,
+        BrokerState, LaunchEntry, RunningProcess, RuntimeRequest, RuntimeResponse,
+        MAX_PENDING_RUNTIME_CLIENTS,
+        DEFAULT_USER_TASK_WEIGHT_MICROS, PROTOCOL_VERSION, READY_COMPONENT_UI_SERVER,
         MAX_LAUNCH_RETRY_BACKOFF, RETRY_BACKOFF, SERVICE_REQUEST_TIMEOUT,
         STORAGE_NOT_READY_RETRY_BACKOFF, UI_SERVER_EXEC_PATH,
     };
@@ -1018,7 +1123,7 @@ mod tests {
     fn a_change_to_the_running_set_answers_every_parked_watch() {
         let mut state = state_running(&[11]);
         let digest = super::running_programs_digest(&super::running_program_snapshot(&state));
-        let mut connections = RuntimeConnections::default();
+        let (_acceptor, mut connections) = test_connections();
         let peers = (0..3)
             .map(|_| {
                 let (peer, server) = UnixStream::pair().expect("socket pair");
@@ -1051,7 +1156,7 @@ mod tests {
     fn an_expired_park_re_arms_the_watcher_instead_of_holding_it_forever() {
         let state = state_running(&[11]);
         let digest = super::running_programs_digest(&super::running_program_snapshot(&state));
-        let mut connections = RuntimeConnections::default();
+        let (_acceptor, mut connections) = test_connections();
         let (peer, server) = UnixStream::pair().expect("socket pair");
         // A zero budget is the shortest legal park: the caller is told nothing
         // changed rather than left unable to distinguish that from a hang.
@@ -1127,6 +1232,166 @@ mod tests {
             true
         ));
         assert!(!runtime_request_role_authorized(u16::MAX, true, true));
+    }
+
+    fn test_connections() -> (
+        std::sync::mpsc::SyncSender<AcceptedClient>,
+        RuntimeConnections,
+    ) {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(MAX_PENDING_RUNTIME_CLIENTS);
+        (sender, RuntimeConnections::from_receiver(receiver))
+    }
+
+    fn accepted_at(age: Duration) -> (UnixStream, AcceptedClient) {
+        let (peer, server) = UnixStream::pair().expect("socket pair");
+        server.set_nonblocking(true).expect("nonblocking");
+        (
+            peer,
+            AcceptedClient {
+                stream: server,
+                peer: RuntimePeerCredentials { pid: 1 },
+                accepted_at: Instant::now() - age,
+            },
+        )
+    }
+
+    #[test]
+    fn a_stalled_acceptor_never_holds_up_the_broker_pass() {
+        // The acceptor thread is the one that can sit inside an IPC deadline.
+        // While it has nothing to hand over, the broker pass must return
+        // immediately and report no work, not wait for it.
+        let (_acceptor, mut connections) = test_connections();
+        let mut state = BrokerState::default();
+        let started = Instant::now();
+        assert!(!super::service_listener(&mut connections, &mut state));
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert!(connections.pending.is_empty());
+    }
+
+    #[test]
+    fn accepted_clients_are_adopted_and_their_request_clock_starts_at_accept() {
+        let (acceptor, mut connections) = test_connections();
+        let (_peer, client) = accepted_at(Duration::from_secs(2));
+        let accepted_at = client.accepted_at;
+        acceptor.send(client).expect("queue");
+        let mut state = BrokerState::default();
+        assert!(super::service_listener(&mut connections, &mut state));
+        let pending = connections.pending.front().expect("adopted");
+        assert_eq!(pending.deadline, accepted_at + SERVICE_REQUEST_TIMEOUT);
+        assert!(
+            pending.deadline < Instant::now() + SERVICE_REQUEST_TIMEOUT,
+            "time spent queued behind a stalled pass counts against the client"
+        );
+    }
+
+    #[test]
+    fn adoption_is_bounded_by_the_pending_queue() {
+        let (acceptor, mut connections) = test_connections();
+        let mut peers = Vec::new();
+        for _ in 0..MAX_PENDING_RUNTIME_CLIENTS {
+            let (peer, client) = accepted_at(Duration::ZERO);
+            peers.push(peer);
+            acceptor.send(client).expect("queue");
+        }
+        let mut state = BrokerState::default();
+        for _ in 0..4 {
+            super::service_listener(&mut connections, &mut state);
+        }
+        assert_eq!(connections.pending.len(), MAX_PENDING_RUNTIME_CLIENTS);
+        let (_peer, extra) = accepted_at(Duration::ZERO);
+        acceptor.send(extra).expect("queued, not adopted");
+        super::service_listener(&mut connections, &mut state);
+        assert_eq!(
+            connections.pending.len(),
+            MAX_PENDING_RUNTIME_CLIENTS,
+            "a full pending queue leaves the rest with the acceptor"
+        );
+    }
+
+    #[test]
+    fn the_acceptor_thread_delivers_a_real_connection_with_kernel_credentials() {
+        let dir = std::env::temp_dir().join(format!("rtd-accept-{}", std::process::id()));
+        let _ = std::fs::remove_file(&dir);
+        let listener = UnixListener::bind(&dir).expect("bind");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let mut connections = RuntimeConnections::with_acceptor(listener).expect("acceptor");
+        let _client = UnixStream::connect(&dir).expect("connect");
+        let mut state = BrokerState::default();
+        let started = Instant::now();
+        while connections.pending.is_empty() {
+            super::service_listener(&mut connections, &mut state);
+            assert!(started.elapsed() < Duration::from_secs(5), "never adopted");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            connections.pending.front().expect("adopted").peer.pid,
+            std::process::id() as i32
+        );
+        let _ = std::fs::remove_file(&dir);
+    }
+
+    fn ready_request() -> RuntimeRequest {
+        RuntimeRequest {
+            version: PROTOCOL_VERSION,
+            op: OP_NOTIFY_READY,
+            target_kind: READY_COMPONENT_UI_SERVER,
+            ..RuntimeRequest::default()
+        }
+    }
+
+    fn read_ack(peer: &mut UnixStream) -> RuntimeResponse {
+        let mut response = RuntimeResponse::default();
+        peer.read_exact(super::super::util::as_bytes_mut(&mut response))
+            .expect("ack frame");
+        response
+    }
+
+    #[test]
+    fn ui_ready_is_recorded_and_then_acknowledged() {
+        let (mut peer, mut server) = UnixStream::pair().expect("socket pair");
+        let mut state = BrokerState::default();
+        assert!(!state.ui_ready);
+        handle_ready(&mut server, &mut state, ready_request()).expect("handled");
+        assert!(state.ui_ready, "the edge is recorded before the ack leaves");
+        drop(server); // an absent ack must read as EOF, never as a hang
+        let ack = read_ack(&mut peer);
+        assert_eq!(ack.version, PROTOCOL_VERSION);
+        assert_eq!(ack.op, OP_NOTIFY_READY);
+        assert_eq!((ack.status, ack.count), (0, 0));
+    }
+
+    #[test]
+    fn a_retried_ui_ready_is_idempotent_and_acknowledged_again() {
+        let mut state = BrokerState::default();
+        for _ in 0..2 {
+            let (mut peer, mut server) = UnixStream::pair().expect("socket pair");
+            handle_ready(&mut server, &mut state, ready_request()).expect("handled");
+            drop(server);
+            assert_eq!(read_ack(&mut peer).status, 0);
+            assert!(state.ui_ready);
+        }
+    }
+
+    #[test]
+    fn a_client_that_closed_before_the_ack_still_leaves_the_edge_recorded() {
+        let (peer, mut server) = UnixStream::pair().expect("socket pair");
+        drop(peer);
+        let mut state = BrokerState::default();
+        handle_ready(&mut server, &mut state, ready_request()).expect("not fatal");
+        assert!(state.ui_ready);
+    }
+
+    #[test]
+    fn ui_ready_for_an_unknown_component_is_refused_without_recording() {
+        let (_peer, mut server) = UnixStream::pair().expect("socket pair");
+        let mut state = BrokerState::default();
+        let mut request = ready_request();
+        request.target_kind = READY_COMPONENT_UI_SERVER + 1;
+        assert_eq!(
+            handle_ready(&mut server, &mut state, request),
+            Err(libc::EOPNOTSUPP)
+        );
+        assert!(!state.ui_ready);
     }
 
     #[test]

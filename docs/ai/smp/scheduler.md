@@ -475,3 +475,58 @@ before runnable publication while forbidding requester exit, dispatch, or reply
 between those steps. The existing `bootstrap-activation-handoff` model
 continues to prove general FIFO first-turn custody after publication.
 
+### 7.9 Owner-word writers and the resident IPC cell
+
+Every write to a task's owner word is one of three kinds, and each kind has one
+code path in `scheduler/runqueue.rs`:
+
+- **Custody transition** (`RunOwnerWord::compare_exchange`): the new word has a
+  strictly greater generation. It revokes the resident cell parked for the
+  generation it leaves (`resident::on_owner_transition`) after the CAS.
+- **Lane claim** (`lane_cas`, the raw CAS): the caller settles the cell of the
+  generation it leaves itself, by taking it.
+- **In-place metadata edit** (`RunOwnerWord::edit_in_place`): run intent and
+  wait-arm bits only. It keeps state, CPU and generation, and it never writes a
+  `Retiring` or `Retired` word. Retire completion and slot release are
+  exact-value CASes; a late `publish_frame` run-intent write or wait write into
+  a terminal word made them lose and panic. `set_runnable`, the wait-arm
+  writers, `commit_wait` and `wake_wait_locked` are the only callers, so a new
+  metadata writer cannot reintroduce that race without bypassing the helper.
+
+Mailbox adoption (`drain_remote_wakes`) can lose its CAS to a remote terminal
+withdrawal as well as to a metadata edit; it rolls the queue insertion back on a
+terminal winner and panics only on a custody change that is not terminal.
+
+The resident cell (`scheduler/resident.rs`) is the loans a Blocked IPC task keeps
+at its RSP ACK. Its single word is `0` (empty), a generation (published for that
+owner generation) or `BUSY` (one CPU is filling or draining the payload). Rules:
+
+- Payload is touched only after winning the word by CAS: a parker claims
+  `0 -> BUSY` (or retires a published older generation by the same CAS), a taker
+  or evictor claims `generation -> BUSY` and stores `0` after reading. No two CPUs
+  access one payload and no loan is dropped twice.
+- Nobody waits for `BUSY`. A park that finds the cell busy, or holding a newer
+  generation, releases its own loans and the task stays non-resident. This
+  matters because the overlap is real: a park can be delayed between its RSP ACK
+  and its publication (a descheduled vCPU) while the task is woken, runs on
+  another CPU and parks again, and a revoking hook runs after the CAS it revokes
+  for, so it can arrive after the task's next park. The ACK callback runs with
+  IRQs masked, so a wait there could only be a lock-order or liveness hazard.
+- The parker publishes with a SeqCst swap and re-reads the owner word SeqCst; the
+  owner CAS is SeqCst and the hook's cell load is SeqCst. Either the hook sees the
+  published generation or the parker sees the new owner word.
+- `BUSY` counts no parked permit unit (`permit_units`): quiescence observers
+  count an in-flight unit as live, and `exec` re-evicts until the cell is empty.
+- The lane's `take` after winning `lane_cas` never loses the cell: the lane runs
+  only for a cell parked on its own CPU (`parked_cpu == Some(cpu)`), and that
+  CPU's `park` call (including its owner re-read and self-take) has returned by
+  then because both run with IRQs masked on one CPU; `exec` excludes the lane's
+  CAS with its intent before evicting. TLA+ found the violation when this
+  serialization was dropped, so it is part of the model, not an accident.
+- Formal evidence: `formal/scheduler-owner-word/SchedulerOwnerWord.tla`,
+  `formal/scheduler-resident-cell/SchedulerResidentCell.tla` (both checked by
+  `run-tlc.sh`; spec mutants in `spec-mutations.toml`), the Loom/Shuttle kernels
+  `owner_word_terminal_beats_late_metadata_writers` and
+  `resident_cell_delayed_hook_reparks_without_overwrite_or_double_drop`, and the
+  herd7 litmus `scheduler_resident_cell_publication`.
+

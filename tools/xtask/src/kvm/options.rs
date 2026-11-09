@@ -265,6 +265,17 @@ where
             );
         }
     }
+    // Hold the loaded-host timing profile for every repeat, and only for a real
+    // launch: it starts after the image build so the build itself is not slowed,
+    // and ends when this function returns, whichever way it returns.
+    let _host_pressure = match options.host_cpu_pressure {
+        Some(percent) if !options.dry_run => {
+            let pressure = host_pressure::HostCpuPressure::start(percent)?;
+            println!("{}", pressure.describe());
+            Some(pressure)
+        }
+        _ => None,
+    };
     if options.repeat == 1 {
         return run_one_smoke(config, &options, runtime_trace_deadlines);
     }
@@ -669,6 +680,7 @@ pub(crate) fn kvm_run_command(
         // Interactive SMP uses the same exact-tree bounded evidence profile as
         // the topology smoke run. It is observation, not a release/FPS claim.
         smp_iteration: rustos_vcpus > 1,
+        host_cpu_pressure: None,
         smp_formal_profile_override: None,
         smp_ring3_qualification: false,
         smp_evidence_cohort: None,

@@ -50,9 +50,12 @@ def kani_harness_has_cover(source: str, name: str) -> bool:
 
 def registered_models() -> set[str]:
     models: set[str] = set()
-    for line in MODELS.read_text(encoding="utf-8").splitlines():
-        if line and not line.startswith("#"):
-            models.add(line.split("\t", 1)[0])
+    # A proof may be tied to a TLA+ model or to a registered validator
+    # (formal/validators.tsv), which replaces a model for sequential admission.
+    for registry in (MODELS, FORMAL / "validators.tsv"):
+        for line in registry.read_text(encoding="utf-8").splitlines():
+            if line and not line.startswith("#"):
+                models.add(line.split("\t", 1)[0])
     return models
 
 

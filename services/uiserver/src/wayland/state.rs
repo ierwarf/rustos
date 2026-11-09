@@ -32,6 +32,7 @@ impl WaylandState {
             buffer_copy_profile_bytes: 0,
             buffer_copy_profile_micros: 0,
             buffer_copy_profile_max_micros: 0,
+            snapshots: SnapshotService::new(),
         }
     }
 

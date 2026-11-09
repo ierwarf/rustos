@@ -131,9 +131,11 @@ if [[ "$profile" == nightly ]]; then
     export RUSTOS_WITNESS_CACHE=off
     run_parallel_lane implementation-mutations env \
         RUSTOS_IMPLEMENTATION_MUTATION_CACHE=off \
-        bash formal/run-implementation-mutations.sh
+        bash formal/run-implementation-mutations.sh --profile nightly
 else
-    run_parallel_lane implementation-mutations bash formal/run-implementation-mutations.sh
+    # PR: critical/high always, medium/low only for changed packages (warnings).
+    run_parallel_lane implementation-mutations \
+        bash formal/run-implementation-mutations.sh --profile pr
 fi
 run_parallel_lane kani env FORMAL_PROOF_INDEX_ALREADY_PASSED=1 bash formal/run-kani.sh
 run_parallel_lane verus env FORMAL_PROOF_INDEX_ALREADY_PASSED=1 bash formal/run-verus.sh

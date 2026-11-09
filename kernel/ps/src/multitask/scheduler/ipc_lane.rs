@@ -367,6 +367,9 @@ fn finish(
         generic();
         return Outcome::Generic;
     };
+    // The cell is parked for this CPU (`parked_cpu`), so its own `park` call has
+    // returned and no self-take races this one; exec's intent excludes the CAS
+    // above before it evicts (see docs/ai/smp/scheduler.md 7.9).
     let loans = resident::take(to.slot, generation).expect("lane claim won the owner CAS without its cell");
     grant.bind_claimed(running);
 

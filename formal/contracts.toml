@@ -1,6 +1,7 @@
 schema = 3
-max_intentional_terminal_models = 92
+max_intentional_terminal_models = 87
 models = "formal/models.tsv"
+validators = "formal/validators.tsv"
 model_bindings = "formal/model-bindings.tsv"
 flows = "formal/system-flows.tsv"
 scenarios = "formal/product-scenarios.tsv"
@@ -1468,7 +1469,6 @@ models = [
 path = "kernel/hal/src/api.rs"
 models = [
     "cpu-online-lifecycle/CpuOnlineLifecycle",
-    "cpu-topology-admission/CpuTopologyAdmission",
 ]
 
 [[source_mappings]]
@@ -2168,9 +2168,23 @@ models = [
     "ipc-fast-handoff/IpcFastHandoff",
     "scheduler-cpu-distribution/SchedulerCpuDistribution",
     "scheduler-local-authority/SchedulerLocalAuthority",
+    "scheduler-owner-word/SchedulerOwnerWord",
+    "scheduler-resident-cell/SchedulerResidentCell",
     "synchronous-ipc-handoff-concurrency/SynchronousIpcHandoffConcurrency",
     "synchronous-ipc-handoff/SynchronousIpcHandoff",
 ]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/resident.rs"
+models = ["scheduler-resident-cell/SchedulerResidentCell"]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/ipc_lane.rs"
+models = ["scheduler-resident-cell/SchedulerResidentCell"]
+
+[[source_mappings]]
+path = "kernel/ps/src/multitask/scheduler/runqueue/ipc_handoff.rs"
+models = ["scheduler-owner-word/SchedulerOwnerWord"]
 
 [[source_mappings]]
 path = "kernel/ps/src/multitask/scheduler/runqueue/claim.rs"
@@ -2699,7 +2713,6 @@ required_models = [
     "child-wait-publication/ChildWaitPublication",
     "cpu-affinity-observation/CpuAffinityObservation",
     "cpu-online-lifecycle/CpuOnlineLifecycle",
-    "cpu-topology-admission/CpuTopologyAdmission",
     "cross-cpu-task-retirement/CrossCpuTaskRetirement",
     "endpoint-publication/EndpointPublication",
     "endpoint-receiver-wakeup/EndpointReceiverWakeup",
@@ -2763,7 +2776,6 @@ required_models = [
     "bootstrap-activation-handoff/BootstrapActivationHandoff",
     "cpu-affinity-observation/CpuAffinityObservation",
     "task-affinity-lifecycle/TaskAffinityLifecycle",
-    "cpu-topology-admission/CpuTopologyAdmission",
     "cpu-online-lifecycle/CpuOnlineLifecycle",
     "smp-reschedule-ipi/SmpRescheduleIpi",
     "scheduler-cpu-ownership/SchedulerCpuOwnership",
@@ -3209,7 +3221,7 @@ models = ["cold-exec-intent/ColdExecIntent", "exec-address-space-transaction/Exe
 
 [[source_mappings]]
 path = "kernel/ps/src/multitask/scheduler/exec_transaction.rs"
-models = ["cold-exec-intent/ColdExecIntent", "mm-activation-close/MmActivationClose"]
+models = ["cold-exec-intent/ColdExecIntent", "mm-activation-close/MmActivationClose", "scheduler-resident-cell/SchedulerResidentCell"]
 
 [[source_mappings]]
 path = "kernel/ps/src/multitask/current_identity/execution.rs"

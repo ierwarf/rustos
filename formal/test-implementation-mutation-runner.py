@@ -413,6 +413,104 @@ def interrupted_lane_resumes_from_exact_key_checkpoint() -> None:
             assert reused and not pending, "exact-key checkpointed kill was not resumed"
 
 
+def severity_gate_covers_critical_high_medium_and_low() -> None:
+    """Blocking vs advisory severities, profile selection and warning policy."""
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        (root / "formal").mkdir()
+        for package in ("alpha", "beta"):
+            (root / package).mkdir()
+            (root / package / "Cargo.toml").write_text(
+                f'[package]\nname = "{package}"\nversion = "0.0.0"\n', encoding="utf-8"
+            )
+            (root / package / "lib.rs").write_text("fn f() { let n = 1; }\n", encoding="utf-8")
+
+        def registry(rows: list[tuple[str, str, str]]) -> None:
+            lines = [
+                "\t".join(
+                    [identity, severity, f"{package}/lib.rs", "n = 1", f"n = {index + 2}", "1",
+                     package, "-", "lib", "tests::t", "60000"]
+                )
+                for index, (identity, severity, package) in enumerate(rows)
+            ]
+            (root / "formal/implementation-mutations.tsv").write_text(
+                "\n".join(lines) + "\n", encoding="utf-8"
+            )
+
+        registry([("a", "critical", "alpha"), ("b", "high", "alpha"),
+                  ("c", "medium", "beta"), ("d", "low", "alpha")])
+        rows = runner.read_registry(root)
+        assert [row["severity"] for row in rows] == ["critical", "high", "medium", "low"]
+        try:
+            registry([("a", "urgent", "alpha")])
+            runner.read_registry(root)
+        except SystemExit as error:
+            assert "urgent" in str(error)
+        else:
+            raise AssertionError("unknown severity admitted")
+
+        # nightly executes everything; pr executes blocking rows plus advisory
+        # rows of changed packages only, and reports the rest as skipped.
+        selected, skipped = runner.select_for_profile(rows, "nightly", set())
+        assert [r["id"] for r in selected] == ["a", "b", "c", "d"] and not skipped
+        selected, skipped = runner.select_for_profile(rows, "pr", set())
+        assert [r["id"] for r in selected] == ["a", "b"]
+        assert [r["id"] for r in skipped] == ["c", "d"]
+        selected, skipped = runner.select_for_profile(rows, "pr", {"alpha"})
+        assert [r["id"] for r in selected] == ["a", "b", "d"]
+        assert [r["id"] for r in skipped] == ["c"]
+        try:
+            runner.select_for_profile(rows, "weekly", set())
+        except SystemExit:
+            pass
+        else:
+            raise AssertionError("unknown profile admitted")
+
+    def outcome(identity: str, severity: str, status: str) -> dict[str, str]:
+        return {"id": identity, "severity": severity, "status": status, "detail": "x"}
+
+    mixed = [
+        outcome("ok", "critical", "killed"),
+        outcome("c", "critical", "survived"),
+        outcome("h", "high", "survived"),
+        outcome("m", "medium", "survived"),
+        outcome("l", "low", "survived"),
+        outcome("mb", "medium", "baseline-failed"),
+    ]
+    failures, warnings = runner.partition_outcomes(mixed, "pr")
+    assert [o["id"] for o in failures] == ["c", "h", "mb"], "critical/high/baseline must fail"
+    assert [o["id"] for o in warnings] == ["m", "l"], "pr warns on medium/low survivors"
+    failures, warnings = runner.partition_outcomes(mixed, "nightly")
+    assert [o["id"] for o in failures] == ["c", "h", "m", "l", "mb"] and not warnings
+
+    with tempfile.TemporaryDirectory() as raw:
+        root = Path(raw)
+        env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@t",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@t"}
+
+        def git(*args: str) -> None:
+            subprocess.run(["git", *args], cwd=root, env=env, check=True,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        for package in ("alpha", "beta"):
+            (root / package / "src").mkdir(parents=True)
+            (root / package / "Cargo.toml").write_text(
+                f'[package]\nname = "{package}"\n', encoding="utf-8")
+            (root / package / "src/lib.rs").write_text("x\n", encoding="utf-8")
+        (root / "docs").mkdir()
+        (root / "docs/a.md").write_text("x\n", encoding="utf-8")
+        git("init", "-q")
+        git("add", "-A")
+        git("commit", "-q", "-m", "base")
+        assert runner.changed_packages(root) == set()
+        (root / "docs/a.md").write_text("y\n", encoding="utf-8")
+        assert runner.changed_packages(root) == set(), "docs select no package"
+        (root / "alpha/src/lib.rs").write_text("y\n", encoding="utf-8")
+        assert runner.changed_packages(root) == {"alpha"}
+        (root / "beta/src/new.rs").write_text("z\n", encoding="utf-8")
+        assert runner.changed_packages(root) == {"alpha", "beta"}, "untracked counts"
+
+
 def main() -> int:
     witness = "ipc::tests::exact_contract"
     started = sealed_output(witness, "running 1 test\n")
@@ -451,6 +549,7 @@ def main() -> int:
     mismatched_cache_key_never_falls_back_to_legacy_source_match()
     cache_key_ignores_runner_edits_outside_kill_semantics()
     interrupted_lane_resumes_from_exact_key_checkpoint()
+    severity_gate_covers_critical_high_medium_and_low()
 
     print("implementation mutation runner selftest passed")
     return 0
