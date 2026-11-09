@@ -1584,12 +1584,22 @@ static int atomic_gpu_initial_modeset(struct kms_display *display,
     }
     display->setup_stage = "gpu-prime-mode-blob";
     if (drmModeCreatePropertyBlob(display->fd, &display->mode, sizeof(display->mode),
-                                  &display->mode_blob_id) != 0)
+                                  &display->mode_blob_id) != 0) {
+        int saved = errno;
+        close(frame->in_fence_fd);
+        frame->in_fence_fd = -1;
+        errno = saved;
         return -1;
+    }
     display->setup_stage = "gpu-prime-atomic-request";
     request = drmModeAtomicAlloc();
-    if (request == NULL)
+    if (request == NULL) {
+        int saved = errno;
+        close(frame->in_fence_fd);
+        frame->in_fence_fd = -1;
+        errno = saved;
         return -1;
+    }
     display->setup_stage = "gpu-prime-atomic-commit";
     result = drmModeAtomicAddProperty(request, display->connector_id,
                                       display->properties.connector_crtc_id,
@@ -2028,7 +2038,8 @@ static int select_gpu_submission(const struct shared_display *shared,
     uint64_t selected_sequence = UINT64_MAX;
     uint32_t selected_slot = UINT32_MAX;
     uint32_t slot;
-    const uint8_t *record;
+    const uint8_t *shared_record;
+    uint8_t record[GPU_ATLAS_SUBMIT_BYTES];
     uint64_t command_offset;
     uint64_t atlas_offset;
     uint64_t batch_offset;
@@ -2055,8 +2066,16 @@ static int select_gpu_submission(const struct shared_display *shared,
     __atomic_thread_fence(__ATOMIC_ACQUIRE);
     command_offset = shared->atlas.command_offset +
                      (uint64_t)selected_slot * GPU_ATLAS_COMMAND_SLOT_BYTES;
-    record = gpu_pixel_pointer(shared, command_offset, GPU_ATLAS_SUBMIT_BYTES);
-    if (record == NULL || memcmp(record, GPU_ATLAS_SUBMIT_MAGIC, 8U) != 0 ||
+    shared_record = gpu_pixel_pointer(shared, command_offset, GPU_ATLAS_SUBMIT_BYTES);
+    if (shared_record == NULL) {
+        errno = EPROTO;
+        return -1;
+    }
+    /* The host owns this memory and may rewrite it while we validate. Snapshot
+     * the record once so every length, count and identity used below is the
+     * exact value that was checked (damage_count indexes a fixed array). */
+    memcpy(record, shared_record, sizeof(record));
+    if (memcmp(record, GPU_ATLAS_SUBMIT_MAGIC, 8U) != 0 ||
         read_le32(record + 8U) != GPU_ATLAS_VERSION ||
         read_le32(record + 12U) != GPU_ATLAS_SUBMIT_BYTES ||
         read_le32(record + 16U) != selected_slot ||

@@ -81,6 +81,13 @@ const MADV_POPULATE_WRITE: u64 = 23;
 const MADV_DONTNEED_LOCKED: u64 = 24;
 const MFD_CLOEXEC: u64 = 0x0001;
 const MFD_ALLOW_SEALING: u64 = 0x0002;
+/// Most VMA records one process may hold in this service. Records are not
+/// merged when adjacent, so the bound is above Linux's `max_map_count`; it
+/// exists so a hostile process cannot grow syscalld's heap without limit by
+/// issuing many small distinct mappings or protection splits.
+const MAX_VMA_RECORDS: usize = 262_144;
+/// One mprotect can split at most the two boundary records.
+const VMA_SPLIT_HEADROOM: usize = 2;
 const MEMFD_NAME_MAX: usize = 249;
 const ARCH_SET_FS: u64 = 0x1002;
 const ARCH_GET_FS: u64 = 0x1003;
@@ -453,7 +460,14 @@ pub(crate) fn handle_setpgid(
     };
     let mut policy = policy_db().lock();
     let _ = ensure_state_with_inheritance(&mut policy, request);
-    if target_pid != request.pid && !policy.contains_key(&target_pid) {
+    // POSIX: a process may move only itself or one of its children. Anything
+    // else (including an unrelated tracked pid) is ESRCH, never an edit of
+    // another process's group.
+    if target_pid != request.pid
+        && !policy
+            .get(&target_pid)
+            .is_some_and(|child| child.parent_pid == request.pid)
+    {
         response.status = errno::ESRCH;
         return;
     }
@@ -534,13 +548,15 @@ pub(crate) fn handle_getrandom(
         response.status = errno::EINVAL;
         return;
     }
-    let requested_len = request.flags as u32;
+    // `buflen` is a 64-bit size_t: clamp before narrowing, or a length with
+    // only high bits set would truncate to zero and report an empty success.
+    let requested_len = request.flags;
     if requested_len == 0 {
         response.status = 0;
         response.payload_len = 0;
         return;
     }
-    let len = requested_len.min(GETRANDOM_MAX_BYTES) as usize;
+    let len = requested_len.min(u64::from(GETRANDOM_MAX_BYTES)) as usize;
     let result = unsafe {
         rustos_svc_runtime::syscall::syscall2(
             SYS_RUSTOS_ENTROPY_BROKER,
@@ -786,6 +802,11 @@ pub(crate) fn handle_mmap(
         response.status = errno;
         return;
     }
+    // A MAP_FIXED replacement can split two boundary records and add one.
+    if state.vmas.len().saturating_add(1 + VMA_SPLIT_HEADROOM) > MAX_VMA_RECORDS {
+        response.status = errno::ENOMEM;
+        return;
+    }
     let fixed = flags & MAP_FIXED != 0;
     // MAP_FIXED_NOREPLACE: the address is mandatory like MAP_FIXED, but an
     // existing mapping in the range is an error (EEXIST), never replaced.
@@ -899,13 +920,13 @@ pub(crate) fn handle_mmap(
                 &mut state,
                 MmVma {
                     start: mapped_addr,
-                    end: mapped_addr + map_len,
+                    end: mapped_addr.saturating_add(map_len),
                     prot,
                     mmap_flags: flags,
                     kind,
                 },
             );
-            state.mmap_next = state.mmap_next.max(mapped_addr + map_len);
+            state.mmap_next = state.mmap_next.max(mapped_addr.saturating_add(map_len));
             copy_payload(response, &mapped_addr);
         }
         Err(errno) => {
@@ -950,6 +971,10 @@ pub(crate) fn handle_mprotect(
             return;
         }
     };
+    if state.vmas.len().saturating_add(VMA_SPLIT_HEADROOM) > MAX_VMA_RECORDS {
+        response.status = errno::ENOMEM;
+        return;
+    }
     if !range_is_covered(&state, start, end) {
         // The range may have been mapped directly by the kernel (e.g. the main
         // ELF binary's PT_LOAD segments).  Fall through to MM_BROKER_OP_PROTECT
@@ -1462,6 +1487,24 @@ mod tests {
         let credentials = policy.get(&pid).unwrap().credentials;
         assert_eq!((credentials.uid, credentials.euid), (1000, 2000));
         assert_eq!((credentials.gid, credentials.egid), (100, 200));
+    }
+
+    #[test]
+    fn setpgid_refuses_an_unrelated_tracked_process() {
+        let (victim, attacker, child) = (u64::MAX - 41, u64::MAX - 42, u64::MAX - 43);
+        let req = |pid, parent_pid, dirfd, arg0| LinuxSyscallOffloadRequest {
+            pid, parent_pid, dirfd, arg0, ..LinuxSyscallOffloadRequest::default()
+        };
+        let mut response = LinuxSyscallOffloadResponse::default();
+        handle_getpgid(&req(victim, 1, 0, 0), &mut response);
+        handle_getpgid(&req(child, attacker, 0, 0), &mut response);
+        handle_setpgid(&req(attacker, 1, victim, 77), &mut response);
+        assert_eq!(response.status, errno::ESRCH);
+        assert_eq!(policy_db().lock()[&victim].pgid, victim);
+        let mut response = LinuxSyscallOffloadResponse::default();
+        handle_setpgid(&req(attacker, 1, child, 77), &mut response);
+        assert_eq!(response.status, 0);
+        assert_eq!(policy_db().lock()[&child].pgid, 77);
     }
 
     #[test]

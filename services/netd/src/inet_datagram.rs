@@ -57,11 +57,19 @@ pub(super) fn add_socket(stack: &mut InetStack, type_: u64, protocol: u64) -> In
     }
 }
 
+/// Pure classifier: reads under the raw mutex so the guard's drop does not run
+/// a readiness sweep for a lookup that mutated nothing (see `inet_socket_exists`).
 pub(super) fn is_datagram(token: u64) -> bool {
-    lock_net_state()
-        .inet_sockets
-        .get(&token)
-        .is_some_and(|s| s.transport.is_datagram())
+    match net_state().lock() {
+        Ok(state) => state
+            .inet_sockets
+            .get(&token)
+            .is_some_and(|s| s.transport.is_datagram()),
+        Err(_) => {
+            eprintln!("netd: state lock poisoned; exiting");
+            std::process::exit(101)
+        }
+    }
 }
 
 pub(super) struct ReceivedPacket {

@@ -125,6 +125,7 @@ fn sha256_file(path: &Path) -> Result<String> {
     let sha256sum = resolve_command_path(OsStr::new("sha256sum"))
         .context("missing sha256sum required to verify Linux DVM artifacts")?;
     let output = Command::new(sha256sum)
+        .arg("--")
         .arg(path)
         .output()
         .with_context(|| format!("failed to hash {}", path.display()))?;

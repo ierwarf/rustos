@@ -70,11 +70,12 @@ fn create_dvm_block_aperture(path: &Path, disk: &Path, signing_key_path: &Path) 
     if !header.is_valid() {
         bail!("refusing to create invalid fixed DVM block header");
     }
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .read(true)
-        .write(true)
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).truncate(true).read(true).write(true);
+    // Private from creation: set_permissions below would leave a umask-wide
+    // window for a newly created aperture.
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options
         .open(path)
         .with_context(|| format!("create DVM block aperture {}", path.display()))?;
     file.set_len(DVM_BLOCK_APERTURE_BYTES)

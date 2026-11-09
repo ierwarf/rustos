@@ -109,3 +109,13 @@ fn unmap_descriptor_plan_is_complete_before_first_pte_remove() {
     assert_eq!(planned.len(), 3);
     assert_eq!(planned[2], 3 * PAGE_4KIB_U64);
 }
+
+#[test]
+fn external_frames_must_be_aligned_and_below_the_physical_ceiling() {
+    let limit = 1_u64 << 40;
+    assert!(external_frame_is_encodable(0x1000, limit));
+    assert!(external_frame_is_encodable(limit - PAGE_4KIB_U64, limit));
+    assert!(!external_frame_is_encodable(0x1001, limit));
+    assert!(!external_frame_is_encodable(limit, limit));
+    assert!(!external_frame_is_encodable(u64::MAX & !(PAGE_4KIB_U64 - 1), limit));
+}

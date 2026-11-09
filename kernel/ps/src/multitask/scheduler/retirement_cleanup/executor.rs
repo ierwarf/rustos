@@ -44,7 +44,9 @@ mod tests;
 impl Fence {
     pub(in crate::multitask) fn capture() -> Self {
         let mut generations = [0; MAX_TASK];
-        for slot in FIRST_DYNAMIC_TASK_SLOT..MAX_TASK {
+        // A Pending/Claimed kernel row is never idle, so the busy index covers it;
+        // a publisher holding its leaf now is ordered after this capture.
+        for slot in busy_slots() {
             let row = CELLS[slot].state.lock();
             if matches!(
                 row.kernel,

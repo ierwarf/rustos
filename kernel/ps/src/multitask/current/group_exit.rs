@@ -67,23 +67,33 @@ pub(super) fn exit_current() -> ! {
             drop(preemption);
             super::exit_current_task();
         };
-        if let Some(receipt) = exit_membership::queued_for(handle) {
-            receipt
-        } else {
-            let pending = PendingExit::begin(handle, (slot, tid))
-                .expect("self exit lost exact publication seal");
-            // A concurrent exec can retain exit_pending. The durable work waits
-            // for its census release and successful process mark before effects.
-            let _ = super::super::process_table::mark_process_exiting_for_handle(handle, pid);
-            pending.publish(
-                pid,
-                Reason::Exited {
-                    slot,
-                    task_id: tid,
-                    process_id: pid,
-                    logical_cpu: preemption.cpu(),
-                },
-            )
+        loop {
+            if let Some(receipt) = exit_membership::queued_for(handle) {
+                break receipt;
+            }
+            if let Some(pending) = PendingExit::begin(handle, (slot, tid)) {
+                // A concurrent exec can retain exit_pending. The durable work waits
+                // for its census release and successful process mark before effects.
+                let _ =
+                    super::super::process_table::mark_process_exiting_for_handle(handle, pid);
+                break pending.publish(
+                    pid,
+                    Reason::Exited {
+                        slot,
+                        task_id: tid,
+                        process_id: pid,
+                        logical_cpu: preemption.cpu(),
+                    },
+                );
+            }
+            // A sibling terminator on another CPU may hold the unpublished seal
+            // (non-yielding); it publishes or rolls back shortly. Any other
+            // refusal is a genuinely lost seal.
+            assert!(
+                exit_membership::publication_in_flight(handle),
+                "self exit lost exact publication seal"
+            );
+            core::hint::spin_loop();
         }
     };
     wait(receipt);

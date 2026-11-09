@@ -351,7 +351,9 @@ pub(super) fn dispatch_linux_syscall(frame: &mut SyscallFrame) -> u64 {
         linux_abi::SYS_GETPID => syscall_linux_getpid(),
         linux_abi::SYS_FORK => syscall_linux_fork(frame),
         linux_abi::SYS_WAIT4 => {
-            syscall_linux_wait4(frame.rdi as i64, frame.rsi, frame.rdx, frame.r10)
+            // `pid` is a C `int`; the register's upper half is not ABI, and a
+            // zero-extended -1 would otherwise name a nonexistent child.
+            syscall_linux_wait4(frame.rdi as i32 as i64, frame.rsi, frame.rdx, frame.r10)
         }
         linux_abi::SYS_CLONE => syscall_linux_clone(frame),
         linux_abi::SYS_UNAME => syscall_linux_syscalld_uname(frame.rdi),
@@ -565,6 +567,9 @@ fn syscall_process_exit(status: u64, exit_group: bool) -> u64 {
             record_linux_process_termination(process_id, wait_status);
         } else {
             cleanup_proc_broker_exec_state_for_thread(process_id, thread_id);
+            // The process lives on, so procd must learn this thread is gone
+            // now; its per-thread signal state is otherwise kept until exit.
+            offload_ops::record_thread_exit(process_id, thread_id);
         }
     }
     if exit_group {

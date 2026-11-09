@@ -172,6 +172,8 @@ static DROPPED_FRAMES: AtomicU64 = AtomicU64::new(0);
 /// state transitions run at the next normal present boundary.
 static GUI_DVM_CONTROL_IRQ_PENDING: AtomicBool = AtomicBool::new(false);
 static GUI_DVM_OFFLINE_IRQ_PENDING: AtomicBool = AtomicBool::new(false);
+/// Single-consumer admission for the DVM return record.
+static GUI_DVM_CONTROL_DRAIN: AtomicBool = AtomicBool::new(false);
 static GUI_DVM_PEER_READY: AtomicBool = AtomicBool::new(false);
 /// Last invitation whose rebind was reported. Diagnostic only.
 static GUI_DVM_LOGGED_INVITATION: AtomicU64 = AtomicU64::new(0);
@@ -595,6 +597,39 @@ pub(crate) fn query_gpu_atlas_completion(
     let Some(ack_offset) = dvm_gpu_atlas_completion_ack_offset(binding_slot) else {
         return DvmGpuCompletionOutcome::Invalid;
     };
+    // Retirement is single-owner: the surface handle is process-wide, so two
+    // threads can query one slot concurrently. Without an exclusive claim the
+    // loser would run the clear below after the winner freed the slot and a
+    // new submission republished it, wiping that submission's capability words
+    // and freeing a slot the DVM still owns. Claiming SUBMITTED -> WRITING
+    // makes submitters see the slot busy and other queriers see it pending.
+    // ORDERING: AcqRel claims the slot and, on success, observes every Release
+    // store a racing submit made before its SUBMITTED publication.
+    let claimed = GPU_SLOT_STATE[slot].compare_exchange(
+        GPU_SLOT_SUBMITTED,
+        GPU_SLOT_WRITING,
+        // ORDERING: AcqRel claim; Acquire on failure observes the owner.
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    );
+    if claimed.is_err() {
+        return DvmGpuCompletionOutcome::Pending;
+    }
+    // ORDERING: Acquire pairs with the submit's Release sequence store.
+    if GPU_SLOT_SEQUENCE[slot].load(Ordering::Acquire) != expected_sequence {
+        // The slot was retired and resubmitted between the first state load and
+        // this claim; the bytes validated above belong to the old submission.
+        // ORDERING: AcqRel hands the claim back; a failed CAS means a reset
+        // freed the slot and it must not be resurrected.
+        let _ = GPU_SLOT_STATE[slot].compare_exchange(
+            GPU_SLOT_WRITING,
+            GPU_SLOT_SUBMITTED,
+            // ORDERING: AcqRel hand-back; failure only observes a reset.
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        return DvmGpuCompletionOutcome::Pending;
+    }
     write_u64(ack_offset, expected_sequence);
     GPU_SLOT_GENERATION[slot].store(0, Ordering::Release);
     GPU_SLOT_SEQUENCE[slot].store(0, Ordering::Release);
@@ -1120,9 +1155,16 @@ pub(crate) fn on_framebuffer_installed(framebuffer_addr: u64) {
         GPU_ATLAS_WIDTH.store(0, Ordering::Release);
         GPU_ATLAS_HEIGHT.store(0, Ordering::Release);
         GPU_ATLAS_STRIDE_BYTES.store(0, Ordering::Release);
-        reset_gpu_slots();
         INSTALLED.store(false, Ordering::Release);
         TRANSPORT_REVOKED.store(true, Ordering::Release);
+        // `reset_gpu_slots` asserts that no submit/query claim is in flight, and
+        // a concurrent ioctl may legitimately hold one while the provider is
+        // replaced. Skip the reset then instead of panicking: both flags above
+        // already fail every later submit/query, and a reinstall reinitializes
+        // every slot, so no stale slot state can survive.
+        if GPU_LIFECYCLE.in_flight() == 0 {
+            reset_gpu_slots();
+        }
     }
 }
 

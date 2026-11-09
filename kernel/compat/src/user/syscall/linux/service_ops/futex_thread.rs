@@ -1204,7 +1204,8 @@ fn valid_arch_prctl_locally(code: u64, arg: u64) -> bool {
 }
 
 pub fn syscall_linux_kill(pid: u64, signal: u64) -> u64 {
-    let pid_i64 = pid as i64;
+    // `pid` is a C `int`; the register's upper half is not ABI.
+    let pid_i64 = pid as u32 as i32 as i64;
     if pid_i64 == 0 || pid_i64 < -1 {
         return linux_errno(LINUX_ENOSYS);
     }
@@ -1214,7 +1215,7 @@ pub fn syscall_linux_kill(pid: u64, signal: u64) -> u64 {
             None => return linux_errno(LINUX_ENOSYS),
         }
     } else {
-        pid
+        pid_i64 as u64
     };
     procd_tgkill(target_pid, target_pid, signal)
 }

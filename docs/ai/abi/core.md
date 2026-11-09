@@ -53,6 +53,19 @@ dropped record until its owner abandons it. Admission is not durable delivery.
   fields. Rootd overflow is sticky and terminal. Procd/syscalld overflow rebases
   only the affected private queue after its owner clears all cached per-process
   authority.
+- Procd additionally receives `LIFECYCLE_EVENT_THREAD_EXIT` (`pid`, `tid`),
+  queued by `syscall_process_exit` when a non-last thread exits while its process
+  lives on. `LifecycleEventWire` is 32 bytes (`event`, `exit_status`, `pid`,
+  `parent_pid`, `tid`); drain ABI version 2. Thread exits use a separate
+  256-entry queue (`PROCD_THREAD_EXIT_EVENTS`, never locked together with the
+  process queue) appended behind the process events in the same drain, so thread
+  churn cannot overflow the process queue and trigger procd's forget-everything
+  reset. If that queue is full the producer sets a sticky loss marker that the
+  drain reports as `LIFECYCLE_EVENT_THREAD_EXIT_LOST` after the queued exits
+  (restored if copyout fails). procd then drops thread entries with no
+  sigaltstack (the mask is re-seeded from the kernel on the next request) and
+  keeps sigaltstack entries until process exit: a bounded residue, not a loss of
+  live state. Thread exit is emitted only to procd.
 - Vfsd is a fourth consumer (`LifecycleConsumer::VfsPolicy`, selected by the
   `VfsPolicy` capability, after the rootd/syscalld/procd capabilities). It
   receives every exit plus a `LIFECYCLE_EVENT_FORK` (`pid` = child,

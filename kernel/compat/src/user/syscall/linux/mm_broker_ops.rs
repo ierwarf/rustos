@@ -302,7 +302,7 @@ fn broker_map_anon(args: &RustosMmBrokerArgs) -> Result<(), i64> {
                     return Err(errno);
                 }
             };
-            return write_out(args, &result);
+            return publish_map_result(args, &result);
         }
         pager_admission::AnonymousAdmission::Eager(_) => {}
         pager_admission::AnonymousAdmission::Failed(errno) => return Err(errno),
@@ -334,7 +334,7 @@ fn broker_map_anon(args: &RustosMmBrokerArgs) -> Result<(), i64> {
             return Err(errno);
         }
     };
-    write_out(args, &mapped)
+    publish_map_result(args, &mapped)
 }
 
 fn broker_map_file_private(args: &RustosMmBrokerArgs) -> Result<(), i64> {
@@ -368,7 +368,7 @@ fn broker_map_file_private(args: &RustosMmBrokerArgs) -> Result<(), i64> {
         let _ = broker_unmap(args);
         return Err(errno);
     }
-    write_out(args, &map_result)
+    publish_map_result(args, &map_result)
 }
 
 fn broker_map_memfd_shared(args: &RustosMmBrokerArgs) -> Result<(), i64> {
@@ -407,7 +407,7 @@ fn broker_map_memfd_shared(args: &RustosMmBrokerArgs) -> Result<(), i64> {
     }) else {
         return Err(LINUX_ESRCH);
     };
-    write_out(args, &result?)
+    publish_map_result(args, &result?)
 }
 
 fn broker_map_device_shared(args: &RustosMmBrokerArgs) -> Result<(), i64> {
@@ -463,10 +463,15 @@ fn broker_map_device_shared(args: &RustosMmBrokerArgs) -> Result<(), i64> {
             return Err(LINUX_EINVAL);
         }
         if let Some(region) = surface.mapped_region() {
-            return Ok::<RustosMmMapBrokerResult, i64>(RustosMmMapBrokerResult {
-                addr: region.start.as_u64(),
-                len: region.end().as_u64().saturating_sub(region.start.as_u64()),
-            });
+            // Already mapped by an earlier call: reporting it again publishes
+            // nothing new, so a failed result write must not tear it down.
+            return Ok::<(RustosMmMapBrokerResult, bool), i64>((
+                RustosMmMapBrokerResult {
+                    addr: region.start.as_u64(),
+                    len: region.end().as_u64().saturating_sub(region.start.as_u64()),
+                },
+                false,
+            ));
         }
         let external_mapping = surface.external_physical_mapping();
         let mut shared_region_hold = None;
@@ -521,14 +526,22 @@ fn broker_map_device_shared(args: &RustosMmBrokerArgs) -> Result<(), i64> {
             .ok_or(LINUX_EBADF)?;
         *slot = KernelHandle::DisplaySurface(surface);
         process_state.set_mapping_cursor(region.end().as_u64());
-        Ok::<RustosMmMapBrokerResult, i64>(RustosMmMapBrokerResult {
-            addr: region.start.as_u64(),
-            len: args.len,
-        })
+        Ok::<(RustosMmMapBrokerResult, bool), i64>((
+            RustosMmMapBrokerResult {
+                addr: region.start.as_u64(),
+                len: args.len,
+            },
+            true,
+        ))
     }) else {
         return Err(LINUX_ESRCH);
     };
-    write_out(args, &result?)
+    let (result, fresh) = result?;
+    if fresh {
+        publish_map_result(args, &result)
+    } else {
+        write_out(args, &result)
+    }
 }
 
 fn broker_protect(args: &RustosMmBrokerArgs) -> Result<(), i64> {
@@ -538,6 +551,20 @@ fn broker_protect(args: &RustosMmBrokerArgs) -> Result<(), i64> {
     let end = checked_mapping_end(start, page_count)?;
     let page_flags = protection_to_page_flags(args.prot)?;
     let pager_prot = pager_admission::pager_protection(args.prot).ok_or(LINUX_EINVAL)?;
+
+    // A shared memfd mapping admitted read-only was never counted as writable
+    // nor checked against F_SEAL_WRITE; granting write later would bypass both.
+    // Refuse before any pager-VMA rewrite so a mixed range changes nothing.
+    if page_flags.contains(PageTableFlags::WRITABLE) {
+        let Some(forbidden) = multitask::with_process_state_by_pid_mut(args.target_pid, |state| {
+            state.shared_memfd_range_forbids_write_upgrade(start, end)
+        }) else {
+            return Err(LINUX_ESRCH);
+        };
+        if forbidden {
+            return Err(LINUX_EACCES);
+        }
+    }
 
     match retry_transient_range_edit("mprotect", || {
         multitask::protect_pager_vma_for_process(
@@ -584,6 +611,12 @@ fn broker_protect(args: &RustosMmBrokerArgs) -> Result<(), i64> {
     }
 
     let Some(result) = multitask::with_process_state_by_pid_mut(args.target_pid, |process_state| {
+        // Re-check under the lock that performs the PTE rewrite.
+        if page_flags.contains(PageTableFlags::WRITABLE)
+            && process_state.shared_memfd_range_forbids_write_upgrade(start, end)
+        {
+            return Err(LINUX_EACCES);
+        }
         process_state
             .address_space_mut()
             .protect_user_bytes(VirtAddr::new(start), len, page_flags)
@@ -837,6 +870,31 @@ fn copy_file_mapping(
         copied += read;
     }
     Ok(())
+}
+
+/// Reports a freshly published mapping to the broker caller.
+///
+/// The mapping is already live in the target when the result is written, and
+/// the caller only learns of it through that result. A failed write (bad or
+/// short out buffer, unmapped page) would therefore leave a mapping nobody
+/// knows about, so it is retired through the ordinary unmap path before the
+/// error is returned.
+fn publish_map_result(
+    args: &RustosMmBrokerArgs,
+    result: &RustosMmMapBrokerResult,
+) -> Result<(), i64> {
+    let Err(errno) = write_out(args, result) else {
+        return Ok(());
+    };
+    let undo = RustosMmBrokerArgs {
+        addr: result.addr,
+        len: args.len,
+        ..*args
+    };
+    // `broker_unmap` names its own refusal; the write error is the one the
+    // caller must see.
+    let _ = broker_unmap(&undo);
+    Err(errno)
 }
 
 fn write_out<T: Copy>(args: &RustosMmBrokerArgs, value: &T) -> Result<(), i64> {

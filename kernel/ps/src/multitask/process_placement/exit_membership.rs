@@ -103,6 +103,21 @@ pub(in crate::multitask) fn queued_for(handle: ProcessHandle) -> Option<Receipt>
     })
 }
 
+/// True while another admission holds the unpublished Waiting seal of `handle`.
+/// That window is non-yielding on its owner's CPU and ends either in
+/// publication (then `queued_for` answers) or in rollback (the seal reopens), so
+/// a self-exit that finds neither a receipt nor a free seal waits it out instead
+/// of mistaking a concurrent terminator for a lost seal.
+pub(in crate::multitask) fn publication_in_flight(handle: ProcessHandle) -> bool {
+    cell(handle).is_some_and(|cell| {
+        cell.with(|s| {
+            s.handle == Some(handle)
+                && s.exit
+                    .is_some_and(|r| !r.queued && r.phase == Phase::Waiting)
+        })
+    })
+}
+
 pub(in crate::multitask) fn target_by_pid(pid: u64) -> Option<(ProcessHandle, Member)> {
     for cell in CELLS.iter() {
         if let Some(target) = cell.with(|s| {

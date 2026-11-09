@@ -323,7 +323,17 @@ pub(super) fn valid_process_fork_plan_locally(args: &RustosProcForkBrokerArgs) -
     let supported =
         linux_abi::CSIGNAL | linux_abi::CLONE_CHILD_SETTID | linux_abi::CLONE_CHILD_CLEARTID;
     let exit_signal = args.clone_flags & linux_abi::CSIGNAL;
-    args.clone_flags & !supported == 0
+    // The child's initial rip/rsp become `VirtAddr::new` operands, which panics
+    // on a non-canonical address. The registers originate from the forking
+    // user thread (its rsp is arbitrary), so reject them here, not there.
+    let child_stack = if args.stack_ptr != 0 {
+        args.stack_ptr
+    } else {
+        args.registers.rsp
+    };
+    VirtAddr::try_new(args.registers.rip).is_ok()
+        && VirtAddr::try_new(child_stack).is_ok()
+        && args.clone_flags & !supported == 0
         && (exit_signal == 0 || exit_signal == linux_abi::SIGCHLD)
         && args.ptid_ptr == 0
         && args.tls == 0

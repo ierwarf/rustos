@@ -377,7 +377,11 @@ pub(super) fn syscall_linux_syscalld_setpgid(target_pid: u64, pgid: u64) -> u64 
 }
 
 pub(super) fn syscall_linux_syscalld_getrandom(user_ptr: u64, user_len: u64, flags: u64) -> u64 {
-    let Ok(len) = usize::try_from(user_len) else {
+    // Linux clamps a single read-style request to MAX_RW_COUNT. Without the
+    // clamp an attacker-sized length keeps this thread in a service round trip
+    // loop for as long as the user mapping stays writable.
+    const MAX_RW_COUNT: usize = 0x7fff_f000;
+    let Ok(len) = usize::try_from(user_len).map(|len| len.min(MAX_RW_COUNT)) else {
         return linux_errno(LINUX_EINVAL);
     };
     if len == 0 {

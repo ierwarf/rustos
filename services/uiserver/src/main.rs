@@ -701,7 +701,6 @@ fn run() -> Result<(), i32> {
             input_loop::process_pending_input(
                 &mut state,
                 Some(&mut wayland),
-                &runtime,
                 &input_events,
             ),
         )?;

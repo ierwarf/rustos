@@ -36,7 +36,7 @@
 //! changes only that fault's speculative run length and safely uses the
 //! default; readers that make admission decisions retry in normal context.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering, fence};
 
 use rustos_user_abi::pager::{
     PAGER_FAULT_ABI_VERSION, PAGER_FAULT_RUN_PAGES_MAX, PAGER_MAX_VMAS_PER_PROCESS,
@@ -170,8 +170,12 @@ impl PublishedAnonymousPolicy {
                 reserved1: [0; 2],
             };
 
-            // ORDERING: equality with the first Acquire proves no writer
-            // invalidated or committed the payload during this attempt.
+            // ORDERING: the Acquire fence keeps the Relaxed payload loads above
+            // from being reordered after the second sequence load (an Acquire
+            // load alone only orders later accesses); equality with the first
+            // Acquire then proves no writer invalidated or committed the
+            // payload during this attempt.
+            fence(Ordering::Acquire);
             let after = self.sequence.load(Ordering::Acquire);
             if before == after {
                 return Ok(Some(policy));

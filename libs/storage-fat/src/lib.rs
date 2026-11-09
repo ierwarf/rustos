@@ -499,6 +499,9 @@ impl<D: BlockDevice> FatVolume<D> {
             if name == "." || name == ".." {
                 continue;
             }
+            entries
+                .try_reserve(1)
+                .map_err(|_| fatfs::Error::NotEnoughSpace)?;
             entries.push(FatDirEntry {
                 name,
                 kind: if entry.is_dir() {
@@ -556,7 +559,13 @@ impl<D: BlockDevice> FatVolume<D> {
             return Err(fatfs::Error::InvalidInput);
         }
         let expected_len = usize::try_from(len).map_err(|_| fatfs::Error::InvalidInput)?;
-        let mut bytes = vec![0_u8; expected_len];
+        // The device may be far larger than free memory; report exhaustion
+        // instead of aborting the service.
+        let mut bytes = Vec::new();
+        bytes
+            .try_reserve_exact(expected_len)
+            .map_err(|_| fatfs::Error::NotEnoughSpace)?;
+        bytes.resize(expected_len, 0);
         let mut done = 0usize;
         while done < bytes.len() {
             let chunk_len = (bytes.len() - done).min(FILE_READ_CHUNK_CAP);

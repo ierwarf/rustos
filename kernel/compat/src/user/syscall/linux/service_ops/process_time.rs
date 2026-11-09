@@ -541,8 +541,11 @@ pub fn syscall_linux_futex(
 
 pub fn syscall_linux_clone3(frame: &SyscallFrame) -> u64 {
     let expected_size = size_of::<linux_abi::LinuxCloneArgs>();
+    // CLONE_ARGS_SIZE_VER0: anything smaller cannot carry the mandatory fields
+    // (flags through tls) and is EINVAL, not a zero-padded request.
+    const CLONE_ARGS_SIZE_VER0: usize = 64;
     let provided_size = match usize::try_from(frame.rsi) {
-        Ok(size) if size != 0 && size <= expected_size => size,
+        Ok(size) if (CLONE_ARGS_SIZE_VER0..=expected_size).contains(&size) => size,
         _ => return linux_errno(LINUX_EINVAL),
     };
     let mut args = linux_abi::LinuxCloneArgs::default();

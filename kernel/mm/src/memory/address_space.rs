@@ -543,6 +543,17 @@ impl ProcessAddressSpace {
         }
 
         validate_user_page_range(start, frames.len())?;
+        // The frames are external (a lease, memfd or device aperture), so each
+        // must be an encodable leaf target before any PTE changes: an unaligned
+        // address makes `set_addr` panic and a too-wide one is a reserved-bit
+        // fault the first time the process touches the page.
+        let addressable_limit = super::cache_attributes::max_physical_address();
+        if frames
+            .iter()
+            .any(|&frame| !external_frame_is_encodable(frame, addressable_limit))
+        {
+            return Err(AddressSpaceError::InvalidFrameOwnership);
+        }
         let page_flags = normalize_user_page_flags(flags)? | leaf_flags;
         let mut mapped_pages = Vec::new();
         mapped_pages
@@ -1068,6 +1079,15 @@ fn plan_user_page_unmap(
         frames.push(phys.as_u64());
     }
     Ok(frames)
+}
+
+/// Whether `frame` is a page-aligned frame wholly below the CPU's physical
+/// address ceiling (`limit` is exclusive).
+fn external_frame_is_encodable(frame: u64, limit: u64) -> bool {
+    frame.is_multiple_of(PAGE_4KIB_U64)
+        && frame
+            .checked_add(PAGE_4KIB_U64)
+            .is_some_and(|end| end <= limit)
 }
 
 fn byte_len_to_page_count(byte_len: usize) -> Result<usize, AddressSpaceError> {

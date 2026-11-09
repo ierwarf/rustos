@@ -15,6 +15,7 @@
 #include <linux/vm_sockets.h>
 #include <poll.h>
 #include <sched.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -2025,6 +2026,11 @@ static void serve(const struct control_contract *contract) {
     control_port = control_port_from_secret(secret);
     if (prctl(PR_SET_DUMPABLE, 0) != 0) {
         die("disable DVM control agent dumpability failed");
+    }
+    /* A host that closes the vsock mid-reply must surface as EPIPE from
+     * write_all(), not terminate the agent and drop its readiness lock. */
+    if (signal(SIGPIPE, SIG_IGN) == SIG_ERR) {
+        die("ignore SIGPIPE failed");
     }
     if (input_selftest_start(&selftest) != 0) {
         die("input selftest requested but uinput setup failed");

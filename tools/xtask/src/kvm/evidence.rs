@@ -338,8 +338,16 @@ fn dvm_display_relay_ready(log: &str, physical_amdgpu: bool) -> bool {
         })
 }
 
+/// Guest consoles carry raw bytes (debugcon port 0xe9, Linux serial), so a log
+/// is not guaranteed UTF-8. Decoding lossily keeps marker matching working
+/// instead of turning one stray byte into a harness read error; a replacement
+/// character can never complete a marker.
+fn read_log_lossy(path: &Path) -> std::io::Result<String> {
+    Ok(String::from_utf8_lossy(&std::fs::read(path)?).into_owned())
+}
+
 fn read_runtime_log_if_present(path: &Path) -> Result<String> {
-    match fs::read_to_string(path) {
+    match read_log_lossy(path) {
         Ok(log) => Ok(rejoin_user_debug_records(&log)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
         Err(error) => Err(error).with_context(|| format!("read runtime log {}", path.display())),
@@ -1221,7 +1229,8 @@ fn validate_ui_fps_proof(layout: &KvmLayout, options: &SmokeOptions) -> Result<(
         );
     }
     if options.gui_dvm_surfaces {
-        let dvm_log = fs::read_to_string(&layout.dvm_serial_log)?;
+        let dvm_log = read_log_lossy(&layout.dvm_serial_log)
+            .with_context(|| format!("read {}", layout.dvm_serial_log.display()))?;
         if !dvm_display_relay_meets_fps(&dvm_log, minimum_fps, options.ui_proof_windows) {
             bail!(
                 "KVM UI FPS proof failed after guest shutdown: require {} external DVM atomic-page-flip relay samples at or above {} FPS; inspect {}",
@@ -1336,4 +1345,18 @@ fn network_exercise_ready(exercise_network: bool, exercise_google_ping: bool, co
     (!exercise_network || (counters.is_some_and(DvmNetworkCounters::round_trip_observed)
         && log.contains(NETPROBE_QEMU_REACHABLE_MARKER)))
         && (!exercise_google_ping || google_ping_reply_observed(log))
+}
+
+#[cfg(test)]
+mod lossy_log_tests {
+    use super::*;
+
+    #[test]
+    fn a_non_utf8_console_byte_does_not_hide_later_markers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("console.log");
+        std::fs::write(&path, b"\xff\xfe garbage\nname=product-storage-ready\n").unwrap();
+        let log = read_runtime_log_if_present(&path).unwrap();
+        assert!(rustos_marker_present(&log, RUSTOS_DVM_BLOCK_E2E_MARKER));
+    }
 }

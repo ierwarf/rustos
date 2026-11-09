@@ -538,7 +538,12 @@ fn read_pci_hex_u16(path: &Path, field: &str, bdf: &str) -> Result<u16> {
 
 fn amd_pci_identity(sysfs_root: &Path, bdf: &str) -> Result<AmdPciIdentity> {
     let bytes = bdf.as_bytes();
-    if bytes.len() != 12 || bytes[4] != b':' || bytes[7] != b':' || bytes[10] != b'.' {
+    if !bdf.is_ascii()
+        || bytes.len() != 12
+        || bytes[4] != b':'
+        || bytes[7] != b':'
+        || bytes[10] != b'.'
+    {
         bail!("invalid AMD display PCI BDF {bdf:?}");
     }
     let bus = u32::from_str_radix(&bdf[5..7], 16)
@@ -1000,7 +1005,11 @@ pub fn supervise_domain(
     let contract = artifacts.control.clone();
     let secret = ControlSecret::random()?;
     let secret_path = store.write_secret(&lease.domain_id, &secret)?;
-    let listener = HostControlListener::bind(lease.dvm_guest_cid, contract, secret)?;
+    let listener = discard_runtime_on_error(
+        store,
+        &lease.domain_id,
+        HostControlListener::bind(lease.dvm_guest_cid, contract, secret),
+    )?;
     let runtime_dir = store.prepare_domain_dir(&lease.domain_id)?;
     let amd_vfct = if physical_display.driver() == "amdgpu" {
         match prepare_amdgpu_vfct(sysfs_root, &display_bdf, &runtime_dir) {
@@ -1022,9 +1031,11 @@ pub fn supervise_domain(
     };
 
     let mut ops = SysfsVfioOps::new(sysfs_root);
-    reset_vfio_group(lease, &mut ops)?;
-    install_signal_handlers()?;
+    discard_runtime_on_error(store, &lease.domain_id, reset_vfio_group(lease, &mut ops))?;
+    // Clear before installing so a termination request delivered right after
+    // installation is not discarded.
     TERMINATE_REQUESTED.store(false, Ordering::Release);
+    discard_runtime_on_error(store, &lease.domain_id, install_signal_handlers())?;
     let (mut child, mut launch_gate) = match spawn_qemu_gated(QemuLaunchInputs {
         qemu: &qemu,
         lease,
@@ -1176,7 +1187,11 @@ pub fn supervise_storage_domain(
     let contract = artifacts.control.clone();
     let secret = ControlSecret::random()?;
     let secret_path = store.write_secret(&lease.domain_id, &secret)?;
-    let listener = HostControlListener::bind(lease.dvm_guest_cid, contract, secret)?;
+    let listener = discard_runtime_on_error(
+        store,
+        &lease.domain_id,
+        HostControlListener::bind(lease.dvm_guest_cid, contract, secret),
+    )?;
     let runtime_dir = store.prepare_domain_dir(&lease.domain_id)?;
     let qmp_path = match prepare_qmp_socket(&runtime_dir) {
         Ok(path) => path,
@@ -1187,9 +1202,11 @@ pub fn supervise_storage_domain(
     };
 
     let mut ops = SysfsVfioOps::new(sysfs_root);
-    reset_vfio_group(lease, &mut ops)?;
-    install_signal_handlers()?;
+    discard_runtime_on_error(store, &lease.domain_id, reset_vfio_group(lease, &mut ops))?;
+    // Clear before installing so a termination request delivered right after
+    // installation is not discarded.
     TERMINATE_REQUESTED.store(false, Ordering::Release);
+    discard_runtime_on_error(store, &lease.domain_id, install_signal_handlers())?;
     let (mut child, mut launch_gate) = match spawn_storage_qemu_gated(
         &qemu,
         lease,
@@ -1266,6 +1283,20 @@ pub fn supervise_storage_domain(
             "storage DVM supervision failed; ownership recovery failed: {restore_error:#}"
         )),
     }
+}
+
+// A failed pre-launch step must not leave this run's control secret behind:
+// `write_secret` is create-new, so a stale file would wedge every retry.
+// Nothing has been spawned yet, so removing the runtime directory is safe.
+fn discard_runtime_on_error<T>(
+    store: &RuntimeStore,
+    domain_id: &str,
+    result: Result<T>,
+) -> Result<T> {
+    if result.is_err() {
+        let _ = store.remove(domain_id);
+    }
+    result
 }
 
 // Never revoke a live guest's aperture or return its devices to the host.
@@ -1394,12 +1425,12 @@ fn spawn_qemu_gated(inputs: QemuLaunchInputs<'_>) -> Result<(Child, UnixStream)>
         .arg("-fw_cfg")
         .arg(format!(
             "name=opt/rustos/dvm-control-secret,file={}",
-            secret.display()
+            qemu_option_path(secret)?
         ))
         .arg("-chardev")
         .arg(format!(
             "socket,id=dvm-display-doorbell,path={}",
-            display_doorbell.display()
+            qemu_option_path(display_doorbell)?
         ))
         .args([
             "-device",
@@ -1408,7 +1439,7 @@ fn spawn_qemu_gated(inputs: QemuLaunchInputs<'_>) -> Result<(Child, UnixStream)>
         .arg("-object")
         .arg(format!(
             "memory-backend-file,id=dvm-display-pixels,mem-path={},size={DVM_PIXEL_BYTES},share=on,readonly=on,rom=on",
-            display_pixels.display()
+            qemu_option_path(display_pixels)?
         ))
         .arg("-device")
         .arg(format!(
@@ -1533,12 +1564,12 @@ fn spawn_storage_qemu_gated(
         .arg("-fw_cfg")
         .arg(format!(
             "name=opt/rustos/dvm-control-secret,file={}",
-            secret.display()
+            qemu_option_path(secret)?
         ))
         .arg("-chardev")
         .arg(format!(
             "socket,id=dvm-block-doorbell,path={}",
-            block_doorbell.display()
+            qemu_option_path(block_doorbell)?
         ))
         .args([
             "-device",
@@ -1825,6 +1856,19 @@ fn prepare_qmp_socket(runtime_dir: &Path) -> Result<PathBuf> {
         }
     }
     Ok(path)
+}
+
+/// Render a path for use inside a comma-separated QEMU option. QEMU splits
+/// option values on `,` (escaped only by doubling), so a path containing one
+/// would inject extra properties; refuse it instead.
+fn qemu_option_path(path: &Path) -> Result<&str> {
+    let text = path
+        .to_str()
+        .ok_or_else(|| anyhow!("QEMU option path {} is not UTF-8", path.display()))?;
+    if text.is_empty() || text.contains([',', '\n', '\r', '\0']) {
+        bail!("path {text:?} cannot be represented as a QEMU option property");
+    }
+    Ok(text)
 }
 
 fn qmp_server_argument(path: &Path) -> Result<String> {
@@ -2770,8 +2814,8 @@ mod tests {
     #[test]
     fn failed_stop_prevents_ownership_recovery() {
         let failed = Err(anyhow!("readiness failed"));
-        let error = ensure_stopped_before_recovery(&failed, || Err(anyhow!("stop failed")))
-            .unwrap_err();
+        let error =
+            ensure_stopped_before_recovery(&failed, || Err(anyhow!("stop failed"))).unwrap_err();
         assert!(format!("{error:#}").contains("ownership and runtime records retained"));
         assert!(format!("{error:#}").contains("stop failed"));
 
@@ -2836,6 +2880,16 @@ mod tests {
             commands[1].get("id").and_then(serde_json::Value::as_str),
             Some(QMP_POWERDOWN_ID)
         );
+    }
+
+    #[test]
+    fn qemu_option_paths_reject_property_injection_and_bad_bdf() {
+        assert!(qemu_option_path(Path::new("/run/a,b")).is_err());
+        assert!(qemu_option_path(Path::new("/run/a\nb")).is_err());
+        assert_eq!(qemu_option_path(Path::new("/run/a")).unwrap(), "/run/a");
+        // Multi-byte text at a slice boundary must be an error, not a panic.
+        assert!(amd_pci_identity(Path::new("/nonexistent"), "0000:\u{e9}0:08.0").is_err());
+        assert!(amd_pci_identity(Path::new("/nonexistent"), "0000:0\u{e9}:08.0").is_err());
     }
 
     #[test]

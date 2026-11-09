@@ -566,8 +566,8 @@ fn write_application_desktop_files(config: &Config, manifests: &[PackageManifest
                 weight = entry.weight_micros,
                 logical_admin = desktop_bool(entry.logical_admin),
                 console_hosted = desktop_bool(entry.console_hosted),
-                argv = desktop_value(&entry.args.join("|"))?,
-                env = desktop_value(&entry.env.join("|"))?,
+                argv = desktop_value(&join_registry_list(&entry.args)?)?,
+                env = desktop_value(&join_registry_list(&entry.env)?)?,
             );
             fs::write(applications_dir.join(&desktop_file_id), content)?;
         }
@@ -594,7 +594,7 @@ fn write_desktop_registry(config: &Config, manifests: &[PackageManifest]) -> Res
                 String::new()
             } else {
                 args.iter()
-                    .map(|arg| registry_value(arg))
+                    .map(|arg| registry_list_item(arg))
                     .collect::<Result<Vec<_>>>()?
                     .join("|")
             };
@@ -604,7 +604,7 @@ fn write_desktop_registry(config: &Config, manifests: &[PackageManifest]) -> Res
                 entry
                     .env
                     .iter()
-                    .map(|item| registry_value(item))
+                    .map(|item| registry_list_item(item))
                     .collect::<Result<Vec<_>>>()?
                     .join("|")
             };
@@ -666,7 +666,7 @@ fn write_runtime_launch_registry(config: &Config, manifests: &[PackageManifest])
                 String::new()
             } else {
                 args.iter()
-                    .map(|arg| registry_value(arg))
+                    .map(|arg| registry_list_item(arg))
                     .collect::<Result<Vec<_>>>()?
                     .join("|")
             };
@@ -676,7 +676,7 @@ fn write_runtime_launch_registry(config: &Config, manifests: &[PackageManifest])
                 entry
                     .env
                     .iter()
-                    .map(|item| registry_value(item))
+                    .map(|item| registry_list_item(item))
                     .collect::<Result<Vec<_>>>()?
                     .join("|")
             };
@@ -970,6 +970,23 @@ fn registry_value(value: &str) -> Result<String> {
         bail!("registry value contains unsupported whitespace: {value:?}");
     }
     Ok(value.to_owned())
+}
+
+/// An element of a `|`-joined registry list. A literal `|` would split it into
+/// two elements when the registry is parsed.
+fn registry_list_item(value: &str) -> Result<String> {
+    if value.contains('|') {
+        bail!("registry list value contains unsupported separator: {value:?}");
+    }
+    registry_value(value)
+}
+
+fn join_registry_list(items: &[String]) -> Result<String> {
+    Ok(items
+        .iter()
+        .map(|item| registry_list_item(item))
+        .collect::<Result<Vec<_>>>()?
+        .join("|"))
 }
 
 fn registry_deps(deps: &[String]) -> Result<String> {
@@ -1294,6 +1311,15 @@ mod tests {
                 "missing early-system dynamic runtime dependency {required}"
             );
         }
+    }
+
+    #[test]
+    fn registry_list_items_reject_the_list_separator() {
+        assert_eq!(
+            super::join_registry_list(&["a".into(), "b=c".into()]).unwrap(),
+            "a|b=c"
+        );
+        assert!(super::join_registry_list(&["a|b".into()]).is_err());
     }
 
     #[test]

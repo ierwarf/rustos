@@ -1049,6 +1049,7 @@ static int rustos_dvm_ivshmem_probe(struct pci_dev *pdev,
 	struct rustos_dvm_ivshmem *state;
 	struct resource *registers;
 	struct resource *shared;
+	u8 atlas_header[RUSTOS_GPU_ATLAS_HEADER_BYTES];
 	int result;
 
 	result = pcim_enable_device(pdev);
@@ -1104,18 +1105,23 @@ static int rustos_dvm_ivshmem_probe(struct pci_dev *pdev,
 		(RUSTOS_GUI_PIXEL_REGION_BYTES - RUSTOS_GUI_POOL_HEADER_BYTES) /
 		RUSTOS_GUI_POOL_SLOT_COUNT)
 		return -EPROTO;
-	state->gpu_command_offset =
-		readq(state->shared + RUSTOS_GPU_ATLAS_HEADER_OFFSET + 24U);
-	state->gpu_atlas_offset =
-		readq(state->shared + RUSTOS_GPU_ATLAS_HEADER_OFFSET + 32U);
-	state->gpu_atlas_slot_bytes =
-		readq(state->shared + RUSTOS_GPU_ATLAS_HEADER_OFFSET + 40U);
-	state->gpu_atlas_width =
-		readl(state->shared + RUSTOS_GPU_ATLAS_HEADER_OFFSET + 48U);
-	state->gpu_atlas_height =
-		readl(state->shared + RUSTOS_GPU_ATLAS_HEADER_OFFSET + 52U);
-	state->gpu_atlas_stride =
-		readl(state->shared + RUSTOS_GPU_ATLAS_HEADER_OFFSET + 56U);
+	/*
+	 * The host can rewrite BAR2 after the probe-time discovery copy. Snapshot
+	 * the atlas header once more and take every cached field from the same
+	 * validated copy so the exporter's bounds never come from an unchecked
+	 * second fetch.
+	 */
+	memcpy_fromio(atlas_header,
+		      state->shared + RUSTOS_GPU_ATLAS_HEADER_OFFSET,
+		      sizeof(atlas_header));
+	if (!rustos_dvm_valid_gpu_atlas_header(atlas_header))
+		return -EPROTO;
+	state->gpu_command_offset = rustos_dvm_read_le64(atlas_header + 24);
+	state->gpu_atlas_offset = rustos_dvm_read_le64(atlas_header + 32);
+	state->gpu_atlas_slot_bytes = rustos_dvm_read_le64(atlas_header + 40);
+	state->gpu_atlas_width = rustos_dvm_read_le32(atlas_header + 48);
+	state->gpu_atlas_height = rustos_dvm_read_le32(atlas_header + 52);
+	state->gpu_atlas_stride = rustos_dvm_read_le32(atlas_header + 56);
 	atomic_set(&state->host_invited, 0);
 	atomic_set(&state->relay_ready, 0);
 	atomic_set(&state->gpu_prime_ready, 0);

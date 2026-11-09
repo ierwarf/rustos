@@ -123,11 +123,13 @@ impl MemfdHandle {
 
     pub fn read_into(&mut self, dest: &mut [u8]) -> usize {
         let mut open = self.inner.lock();
-        let object = open.object.clone();
+        // Split the borrow so the object stays reachable through the open
+        // description without an `Arc` clone on every sequential read.
+        let MemfdOpenState { object, cursor } = &mut *open;
         let state = object.state.lock();
-        let read = read_at_locked(state.frames.as_slice(), state.len, open.cursor, dest);
+        let read = read_at_locked(state.frames.as_slice(), state.len, *cursor, dest);
         drop(state);
-        open.cursor = open.cursor.saturating_add(read);
+        *cursor = cursor.saturating_add(read);
         read
     }
 
@@ -298,6 +300,13 @@ impl MemfdMappingHold {
     /// never recycled, so an unmap/remap cannot alias a sleeping futex key.
     pub fn object_id(&self) -> u64 {
         self.token.object.object_id
+    }
+
+    /// Whether this mapping was admitted writable. A mapping admitted
+    /// read-only (for example under `F_SEAL_WRITE`) must never be upgraded to
+    /// write later, or the seal would be bypassed through `mprotect`.
+    pub fn is_writable(&self) -> bool {
+        self.token.writable
     }
 
     pub fn path(&self) -> String {

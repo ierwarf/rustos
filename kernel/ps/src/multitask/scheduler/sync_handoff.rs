@@ -469,19 +469,23 @@ impl SyncHandoffState {
     }
 
     pub(super) fn remove_slot(&mut self, slot: usize) {
-        let mut compact = [None; MAX_TASK];
+        // Compact in place, preserving FIFO order. The write cursor never
+        // passes the read cursor (`retained <= offset`), so no unread record is
+        // overwritten, and this avoids two MAX_TASK-record stack images on the
+        // terminal-withdrawal path while the FIFO leaf is held.
         let mut retained = 0_usize;
         for offset in 0..self.len {
             let index = (self.head + offset) % MAX_TASK;
             if let Some(record) = self.records[index]
                 && record.slot != slot
             {
-                compact[retained] = Some(record);
+                self.records[(self.head + retained) % MAX_TASK] = Some(record);
                 retained += 1;
             }
         }
-        self.records = compact;
-        self.head = 0;
+        for offset in retained..self.len {
+            self.records[(self.head + offset) % MAX_TASK] = None;
+        }
         self.len = retained;
     }
 

@@ -637,9 +637,13 @@ for phase in \
         exit 1
     }
 done
-rg -Uq 'trace_line\(&format!\(\n[[:space:]]*"loaderd: executable snapshot call begin' \
-    "$loaderd_main" || {
-    echo "loaderd executable snapshot trace regained synchronous console output" >&2
+# Streaming snapshots poll repeatedly; progress output must stay rate bounded
+# instead of printing once per Pending reply.
+snapshot_client=services/loaderd/src/snapshot_client.rs
+rg -Uq 'if completed >= self\.next_report \{\s*debug_line\(&format!\("loaderd: snapshot progress' \
+    "$snapshot_client" &&
+    rg -Fq 'self.next_report += 64 * 1024 * 1024;' "$snapshot_client" || {
+    echo "loaderd snapshot progress output is no longer rate bounded" >&2
     exit 1
 }
 rg -Fq 'reply_failure_diagnostic_due(reply_failures)' services/vfsd/src/main.rs || {

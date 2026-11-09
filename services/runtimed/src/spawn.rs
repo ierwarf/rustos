@@ -682,9 +682,9 @@ pub(super) fn release_failed_session(state: &mut BrokerState, session_handle: Op
         return;
     };
     if state.charged_sessions.remove(&session) {
-        session_accounting::release(session).unwrap_or_else(|errno| {
-            panic!("runtimed: fatal exact client-session refund failed token={session} errno={errno}")
-        });
+        // An unconfirmed refund is retried from the loop (`retry_deferred_cleanup`);
+        // the session is otherwise torn down exactly as for a confirmed one.
+        session_accounting::release_or_defer(session);
     }
     state.session_runtime.remove_session(session);
     super::session::clear_focused_session_if(state, session);
@@ -706,11 +706,41 @@ fn cleanup_failed_spawn(
     }
 }
 
+/// Children whose kill was refused. Retried from the loop until the kernel
+/// confirms the kill or reports the pid gone. Keyed by pid, so bounded by the
+/// pid space and idempotent.
+static UNRETIRED_PIDS: std::sync::Mutex<std::collections::BTreeSet<i32>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+fn unretired_pids() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<i32>> {
+    UNRETIRED_PIDS.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn retire_failed_spawn_or_abort(pid: i32, stage: &str) {
     if let Err(errno) = cleanup_failed_spawn(pid, terminate_pid) {
-        panic!(
-            "runtimed: fatal failed-spawn cleanup rejected stage={stage} pid={pid} errno={errno}"
+        // A refused kill must not take the whole service down (DoS); the pid
+        // is not in `running`, so keep retrying it until it is gone.
+        observability_client::error!(
+            "runtimed",
+            service,
+            "failed-spawn cleanup deferred stage={stage} pid={pid} errno={errno}"
         );
+        if pid > 0 {
+            unretired_pids().insert(pid);
+        }
+    }
+}
+
+/// Retry deferred child kills and Job-session refunds. Cheap when idle.
+fn retry_deferred_cleanup() {
+    let pids: Vec<i32> = unretired_pids().iter().copied().collect();
+    for pid in pids {
+        if cleanup_failed_spawn(pid, terminate_pid).is_ok() {
+            unretired_pids().remove(&pid);
+        }
+    }
+    if session_accounting::has_deferred() {
+        session_accounting::retry_deferred();
     }
 }
 
@@ -744,9 +774,19 @@ pub(super) fn collect_exited_children() -> Vec<(i32, i32)> {
 }
 
 pub(super) fn reap_children(state: &mut BrokerState) -> bool {
+    // Deferred cleanup talks to rootd/procd, so it shares the reap cadence
+    // instead of running on every idle pass.
+    let cleanup_pending = !unretired_pids().is_empty() || session_accounting::has_deferred();
+    if cleanup_pending && state.reap_due.is_none_or(|due| Instant::now() >= due) {
+        retry_deferred_cleanup();
+        state.reap_due = Some(Instant::now() + REAP_INTERVAL);
+    }
     // A child is activated only after the loop records it in `running`, so an
     // empty owner set proves that there is nothing this process may reap.
-    if state.running.is_empty() && !state.child_reaper.as_ref().is_some_and(|r| r.busy()) {
+    if state.running.is_empty()
+        && !cleanup_pending
+        && !state.child_reaper.as_ref().is_some_and(|r| r.busy())
+    {
         return false;
     }
     // The wait itself never runs on this loop: collect what the reaper has

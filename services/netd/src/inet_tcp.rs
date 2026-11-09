@@ -69,6 +69,17 @@ pub(super) fn begin_inet_connect(request: &NetdIpcRequest) -> i32 {
     inet_connect_status(&mut state, request.socket_token)
 }
 
+/// The 10 s connect budget is smoltcp's socket timeout, which keeps applying to
+/// the established connection (abort when the peer stays silent with data
+/// queued). Once the handshake completed, raise it to the Linux
+/// `tcp_retries2` horizon so a transient stall does not reset the stream.
+pub(super) fn settle_established_timeout(socket: &mut tcp::Socket) {
+    let established = smoltcp::time::Duration::from_secs(INET_ESTABLISHED_TIMEOUT.as_secs());
+    if socket.may_send() && socket.timeout().is_some_and(|t| t < established) {
+        socket.set_timeout(Some(established));
+    }
+}
+
 /// Evaluates an in-flight active open. A terminal outcome disarms the
 /// deadline so it is reported exactly once (to `connect` or to `SO_ERROR`).
 pub(super) fn inet_connect_status(state: &mut NetState, token: u64) -> i32 {
@@ -84,9 +95,10 @@ pub(super) fn inet_connect_status(state: &mut NetState, token: u64) -> i32 {
         Ok(stack) => stack,
         Err(errno) => return errno,
     };
-    let socket = stack.sockets.get::<tcp::Socket>(tcp_handle);
+    let socket = stack.sockets.get_mut::<tcp::Socket>(tcp_handle);
     let status = if socket.may_send() {
         debug_line("netd: inet connect ok");
+        settle_established_timeout(socket);
         0
     } else if !socket.is_open() {
         if deadline.is_some_and(|d| StdInstant::now() + TIMEOUT_SLACK >= d) {
@@ -187,7 +199,12 @@ pub(super) fn handle_inet_recv(request: &NetdIpcRequest, response: &mut NetdIpcR
     stack.poll_budget(8);
     let socket = stack.sockets.get_mut::<tcp::Socket>(tcp_handle);
     if socket.can_recv() {
-        match socket.recv_slice(&mut response.payload[data_start..data_start + limit]) {
+        // MSG_PEEK must leave the bytes queued; consuming them would corrupt
+        // the stream for liveness probes such as `recv(fd, &b, 1, MSG_PEEK)`.
+        let peek = request_msg_flags(request) & libc::MSG_PEEK as u64 != 0;
+        let dest = &mut response.payload[data_start..data_start + limit];
+        let outcome = if peek { socket.peek_slice(dest) } else { socket.recv_slice(dest) };
+        match outcome {
             Ok(read) => {
                 response.value = read as u64;
                 response.payload_len = (data_start + read) as u32;

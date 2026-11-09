@@ -544,7 +544,11 @@ pub(crate) fn build_efi(config: &Config) -> Result<()> {
     if let Some(sbat) = config.rustos_grub_sbat.as_ref() {
         command.arg("--sbat").arg(sbat);
     }
-    run_command(&mut command)
+    let result = run_command(&mut command);
+    // The directory only carries the embedded grub.cfg inputs; never leak one
+    // per build.
+    let _ = remove_dir_if_exists(&temp_dir);
+    result
 }
 
 pub(crate) fn build_nucleus(config: &Config) -> Result<()> {
@@ -637,6 +641,16 @@ fn ensure_grub_signing_material(config: &Config) -> Result<GrubSigningMaterial> 
     }
 
     if !gpg_secret_key_exists(config, &gpg_home, &signing_key)? {
+        // Only a "Name <mail>" user id can name a development key to create. A
+        // key id or fingerprint names an existing key; generating a new key
+        // whose user id is that string would silently sign with an unrelated
+        // key instead of the one the caller asked for.
+        if !signing_key.contains('<') {
+            bail!(
+                "GRUB signing key {signing_key} has no secret key in {}; refusing to generate a key for a key id or fingerprint",
+                gpg_home.display()
+            );
+        }
         generate_grub_dev_key(config, &gpg_home, &signing_key)?;
     }
 

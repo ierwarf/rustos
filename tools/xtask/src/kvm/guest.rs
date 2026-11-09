@@ -500,7 +500,8 @@ fn append_fault_injection(config: &Config, command: &mut Command) {
     if !config.project.fault_injection.enabled {
         return;
     }
-    let payload = config.project.fault_injection.rules.join(";");
+    // QEMU option values separate on ',' and escape it by doubling.
+    let payload = config.project.fault_injection.rules.join(";").replace(',', ",,");
     if !payload.is_empty() {
         command
             .arg("-fw_cfg")
@@ -554,10 +555,12 @@ fn wait_for_parallel_boot(
         // The debug syscall envelopes every 256-byte chunk separately, so a
         // long service line arrives as several records and must be put back
         // together before any predicate below reads a field off it.
-        let rustos_log = rejoin_user_debug_records(&fs::read_to_string(
-            &layout.debugcon_log,
-        )?);
-        let dvm_log = fs::read_to_string(&layout.dvm_serial_log)?;
+        let rustos_log = rejoin_user_debug_records(
+            &read_log_lossy(&layout.debugcon_log)
+                .with_context(|| format!("read {}", layout.debugcon_log.display()))?,
+        );
+        let dvm_log = read_log_lossy(&layout.dvm_serial_log)
+            .with_context(|| format!("read {}", layout.dvm_serial_log.display()))?;
         if options.expect_block_flush_fault && rustos_log.contains(RUSTOS_DVM_BLOCK_E2E_MARKER) {
             bail!(
                 "storage-DVM flush fault proof observed an impossible media-barrier success marker"
@@ -592,8 +595,12 @@ fn wait_for_parallel_boot(
                 &dvm_log,
                 &[],
                 &[],
-            )?;
-            bail!("{reason}; evidence={}", evidence.display());
+            )
+            .map_or_else(
+                |error| format!("unavailable ({error:#})"),
+                |path| path.display().to_string(),
+            );
+            bail!("{reason}; evidence={evidence}");
         }
         let ui_render_fps_ready = options.min_ui_fps.is_none_or(|minimum| {
             uiserver_profile_meets_fps(&rustos_log, minimum, options.ui_proof_windows)
@@ -691,7 +698,11 @@ fn wait_for_parallel_boot(
                 &dvm_log,
                 &missing_rustos,
                 &missing_dvm,
-            )?;
+            )
+            .map_or_else(
+                |error| format!("unavailable ({error:#})"),
+                |path| path.display().to_string(),
+            );
             bail!(
                 "{reason}; RustOS missing={:?}; Linux-DVM missing={:?}; dvm-gpu-ready={}; ui-fps-ready={} (render={} input={} wayclick={} rustos-runtime={} dvm-relay={} dvm-runtime={}); wayclick-observed={:?}; dvm-display-ready={}; physical-gpu-frames-ready={}; dvm-network-ready={}; dvm-network-traffic-ready={}; host-input-relay-pending={}; input-ring={}/{} flags={:#x}; network-ring={:?}; evidence={}; inspect {}, {}, {}, and {}",
                 missing_rustos,
@@ -714,7 +725,7 @@ fn wait_for_parallel_boot(
                 input.consumer,
                 input.flags,
                 dvm_network,
-                evidence.display(),
+                evidence,
                 layout.debugcon_log.display(),
                 layout.dvm_serial_log.display(),
                 layout.rustos_stderr_log.display(),
@@ -734,19 +745,19 @@ fn runtime_log_len(path: &Path) -> Result<usize> {
 }
 
 fn runtime_log_suffix(path: &Path, offset: usize) -> Result<String> {
-    let log = match fs::read_to_string(path) {
-        Ok(log) => log,
+    // The offset indexes raw file bytes: slice before decoding.
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(String::new()),
         Err(error) => {
             return Err(error).with_context(|| format!("read runtime log {}", path.display()));
         }
     };
-    let suffix = log
+    let suffix = bytes
         .get(offset..)
         .context("runtime log was truncated during a recovery proof")?;
-    // The offset indexes the raw file, so slice first and rejoin the chunked
-    // ring 3 records afterwards.
-    Ok(rejoin_user_debug_records(suffix))
+    // Rejoin the chunked ring 3 records after slicing.
+    Ok(rejoin_user_debug_records(&String::from_utf8_lossy(suffix)))
 }
 
 fn archive_recovery_log(path: &Path) -> Result<()> {

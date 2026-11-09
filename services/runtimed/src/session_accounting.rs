@@ -121,13 +121,49 @@ pub(super) fn charge(token: u64, pid: i32) -> Result<(), i32> {
             // A lost ACK cannot be distinguished from a committed charge.
             // Canonical release writes a tombstone even if the request did
             // not reach rootd. Activation is forbidden until cancellation.
-            bounded_retry(COMMERCIAL_MAX_ROOTD_OP_SESSION_ACCOUNT_RELEASE, token, 0)
-                .unwrap_or_else(|refund| {
-                    panic!("runtimed: ambiguous client Job charge token={token} refund={refund}");
-                });
+            // A refund that cannot be confirmed now is deferred and retried by
+            // the broker loop; it must never take the whole service down.
+            release_or_defer(token);
             Err(error)
         }
         Err(error) => Err(error),
+    }
+}
+
+/// Tokens whose canonical release could not be confirmed. Release is
+/// idempotent at rootd (it writes a tombstone), so retrying is always safe.
+/// Bounded by the number of session handles ever issued to failed launches;
+/// entries leave on the first confirmed release.
+static DEFERRED_RELEASES: std::sync::Mutex<std::collections::BTreeSet<u64>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+fn deferred_releases() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<u64>> {
+    DEFERRED_RELEASES.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Release `token` now; if rootd cannot confirm, keep it for `retry_deferred`.
+pub(super) fn release_or_defer(token: u64) {
+    if let Err(errno) = release(token) {
+        observability_client::error!(
+            "runtimed",
+            service,
+            "client Job release deferred token={token} errno={errno}"
+        );
+        deferred_releases().insert(token);
+    }
+}
+
+pub(super) fn has_deferred() -> bool {
+    !deferred_releases().is_empty()
+}
+
+/// Retry every deferred release once; confirmed ones are forgotten.
+pub(super) fn retry_deferred() {
+    let tokens: Vec<u64> = deferred_releases().iter().copied().collect();
+    for token in tokens {
+        if release(token).is_ok() {
+            deferred_releases().remove(&token);
+        }
     }
 }
 

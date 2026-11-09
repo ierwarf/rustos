@@ -392,7 +392,9 @@ pub(super) fn busy_slots() -> impl Iterator<Item = usize> {
 }
 
 pub(in crate::multitask) fn complete(cleanup: RetiredTaskCleanup) -> bool {
-    let complete = (FIRST_DYNAMIC_TASK_SLOT..MAX_TASK).any(|slot| CELLS[slot].complete(cleanup));
+    // A Claimed cleanup row is never idle, so the busy index reaches it without
+    // walking every row leaf.
+    let complete = busy_slots().any(|slot| CELLS[slot].complete(cleanup));
     if complete {
         mark_reap_pending();
     }

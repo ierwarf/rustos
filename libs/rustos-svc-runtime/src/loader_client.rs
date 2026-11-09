@@ -107,6 +107,17 @@ pub fn call(endpoint: u64, request: &LoaderSpawnRequest, placement: Option<i32>)
 mod tests {
     use super::*;
     #[test]
+    fn placement_call_sends_exactly_one_borrowed_descriptor() {
+        let request = LoaderSpawnRequest::default();
+        let mut response = LoaderSpawnResponse::default();
+        let descriptor = 9_i32;
+        let mut count = 0_u16;
+        let args = placement_call_args(7, &request, &mut response, &descriptor, &mut count);
+        assert_eq!((args.endpoint, args.send_fd_count, args.recv_fd_capacity, args.reserved0), (7, 1, 0, 0));
+        assert_eq!(args.send_fds_ptr, &descriptor as *const _ as u64);
+        assert_eq!(args.recv_fd_count_ptr, &mut count as *mut _ as u64);
+    }
+    #[test]
     fn pending_never_impersonates_a_process_and_requires_exact_work_identity() {
         let mut r = LoaderSpawnResponse { version: LOADER_REQUEST_ABI_VERSION, op: LOADER_OP_SPAWN_EXEC,
             status: LOADER_WORK_PENDING, pid: -1, work_id: 9, ..LoaderSpawnResponse::default() };

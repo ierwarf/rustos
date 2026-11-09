@@ -373,3 +373,27 @@ fn linked_extra_pair(state: &mut NetState, left: u64, right: u64) {
         super::local_socket_poll_tests::connected_socket(left),
     );
 }
+
+#[test]
+fn unix_peek_leaves_queued_bytes_and_flags_ancillary_data() {
+    let mut state = NetState::new();
+    let mut socket = super::local_socket_poll_tests::connected_socket(0);
+    if let UnixSocketState::Connected(connected) = &mut socket.state {
+        connected.incoming.push_back(UnixStreamSegment {
+            bytes: b"ab".iter().copied().collect(),
+            control: Vec::new(),
+        });
+        connected.incoming.push_back(UnixStreamSegment {
+            bytes: b"cd".iter().copied().collect(),
+            control: vec![0; 8],
+        });
+        connected.incoming_bytes = 4;
+    }
+    state.sockets.insert(7, socket);
+    let mut dest = [0_u8; 3];
+    assert_eq!(peek_connected_bytes(&state, 7, &mut dest), Ok((3, true)));
+    assert_eq!(&dest, b"abc");
+    let mut dest = [0_u8; 8];
+    assert_eq!(peek_connected_bytes(&state, 7, &mut dest), Ok((4, true)));
+    assert_eq!(peek_connected_bytes(&state, 9, &mut dest), Err(libc::EBADF));
+}

@@ -84,6 +84,16 @@ const MAX_WAYLAND_SURFACES_PER_CLIENT: usize = 16;
 /// ceiling 64 surfaces could pin 4 GiB of heap.
 const MAX_WAYLAND_TOTAL_SURFACE_PIXELS: usize = 4 * MAX_WAYLAND_BUFFER_PIXELS;
 const MAX_WAYLAND_CLIENTS: usize = 64;
+/// Live `wl_shm_pool` backing descriptors one client may pin. A pool's fd stays
+/// open until its last `wl_buffer` is gone, so the count tracks the fd, not the
+/// protocol object.
+const MAX_WAYLAND_SHM_POOLS_PER_CLIENT: usize = 32;
+/// Compositor-wide ceiling on pinned shm descriptors; the process descriptor
+/// table is shared with input, GPU and service IPC.
+const MAX_WAYLAND_SHM_POOLS_TOTAL: usize = 256;
+const MAX_WAYLAND_BUFFERS_PER_CLIENT: usize = 256;
+const MAX_WAYLAND_REGIONS_PER_CLIENT: usize = 64;
+const MAX_WAYLAND_DECORATIONS_PER_CLIENT: usize = 16;
 const MAX_WAYLAND_OUTSTANDING_CONFIGURES: usize = 16;
 const MAX_WAYLAND_TITLE_BYTES: usize = 256;
 /// Tracked output, pointer or keyboard objects one client may hold at once.
@@ -357,7 +367,7 @@ impl WaylandCompositor {
                     match self
                         .display
                         .handle()
-                        .insert_client(stream, Arc::new(WaylandClientState))
+                        .insert_client(stream, Arc::new(WaylandClientState::default()))
                     {
                         Ok(client) => {
                             self.clients.push(client.id());
@@ -850,10 +860,69 @@ impl WaylandState {
     }
 }
 
-#[derive(Debug)]
-struct WaylandClientState;
+/// Per-client live-object counters. The protocol backend caps neither object
+/// count nor pinned descriptors, so a client that never destroys what it
+/// creates would otherwise grow compositor memory and the shared fd table
+/// without bound.
+#[derive(Debug, Default)]
+struct WaylandClientState {
+    shm_pools: Arc<AtomicUsize>,
+    buffers: Arc<AtomicUsize>,
+    regions: Arc<AtomicUsize>,
+    decorations: Arc<AtomicUsize>,
+}
 
 impl ClientData for WaylandClientState {}
+
+/// Process-wide count of pinned shm pool descriptors (see
+/// `MAX_WAYLAND_SHM_POOLS_TOTAL`).
+static LIVE_SHM_POOLS: AtomicUsize = AtomicUsize::new(0);
+
+/// RAII admission ticket for one counted client object. The counters are
+/// released when the object's user data (or the state it is embedded in) is
+/// dropped, so destroy, client disconnect and error paths release exactly once.
+struct LiveObjectTicket {
+    per_client: Arc<AtomicUsize>,
+    global: Option<&'static AtomicUsize>,
+}
+
+impl LiveObjectTicket {
+    /// Admit one object against `per_client_limit` and, when given, a
+    /// process-wide `global` counter. Returns `None` when a limit is reached.
+    fn admit(
+        per_client: &Arc<AtomicUsize>,
+        per_client_limit: usize,
+        global: Option<(&'static AtomicUsize, usize)>,
+    ) -> Option<Self> {
+        // ORDERING: Relaxed - the counters are independent admission counts;
+        // they publish no other memory and every update is a single RMW.
+        if per_client.fetch_add(1, Ordering::Relaxed) >= per_client_limit {
+            per_client.fetch_sub(1, Ordering::Relaxed);
+            return None;
+        }
+        if let Some((total, limit)) = global {
+            if total.fetch_add(1, Ordering::Relaxed) >= limit {
+                total.fetch_sub(1, Ordering::Relaxed);
+                per_client.fetch_sub(1, Ordering::Relaxed);
+                return None;
+            }
+        }
+        Some(Self {
+            per_client: Arc::clone(per_client),
+            global: global.map(|(total, _)| total),
+        })
+    }
+}
+
+impl Drop for LiveObjectTicket {
+    fn drop(&mut self) {
+        // ORDERING: Relaxed, paired with the admission increments above.
+        self.per_client.fetch_sub(1, Ordering::Relaxed);
+        if let Some(total) = self.global {
+            total.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
 
 struct WaylandState {
     display_width: u32,
@@ -1002,6 +1071,8 @@ struct WaylandBufferState {
     height: usize,
     stride: usize,
     has_alpha: bool,
+    /// Released when the last reference to this buffer goes away.
+    _ticket: LiveObjectTicket,
 }
 
 #[derive(Clone)]
@@ -1013,10 +1084,18 @@ struct WaylandShmPoolState {
     len: usize,
     /// Shared by buffers after pool destruction; never mapped into uiserver.
     fd: OwnedFd,
+    /// Held while the descriptor is open, which outlives the pool object while
+    /// any buffer still references it.
+    _ticket: LiveObjectTicket,
 }
 
-#[derive(Default)]
-struct RegionData;
+struct RegionData {
+    _ticket: LiveObjectTicket,
+}
+
+struct DecorationData {
+    _ticket: LiveObjectTicket,
+}
 
 #[derive(Default)]
 struct OutputData;

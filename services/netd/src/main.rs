@@ -183,6 +183,9 @@ const UNIX_QUEUED_BYTE_CAPACITY: usize = 64 * 1024 * 1024;
 const SOCKET_CONTROL_BUFFER_CAPACITY: usize = rustos_user_abi::syscall::NET_BROKER_SOCKET_CONTROL_CAPACITY;
 const INET_TCP_BUFFER_CAPACITY: usize = 16 * 1024;
 const INET_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Abort horizon for an established connection whose peer stays silent with
+/// data queued (Linux `tcp_retries2` default, about 15 minutes).
+const INET_ESTABLISHED_TIMEOUT: Duration = Duration::from_secs(924);
 const INET_IO_POLL_BUDGET: usize = 256;
 /// Bound on how long a closed-by-owner connection may linger to finish its FIN
 /// exchange, and on how many may do so at once (each pins 32 KiB of buffers).

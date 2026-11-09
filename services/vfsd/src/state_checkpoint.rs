@@ -29,8 +29,12 @@ impl VfsState {
                 cursor,
                 None,
             )?;
+            // A malformed reply length is an I/O fault, not a slice panic.
             let page = rustos_svc_runtime::checkpoint_idl::decode_framed(
-                &response.payload[..response.payload_len as usize],
+                response
+                    .payload
+                    .get(..response.payload_len as usize)
+                    .ok_or(EIO)?,
             )
             .map_err(|_| EIO)?;
             let record_count = page.len();

@@ -307,3 +307,20 @@ fn exact_process_exit_marker_refuses_foreign_pid_without_setting_exit_on_origina
         assert_eq!(process_table::is_process_exiting(ID), Some(true));
     });
 }
+
+#[test]
+fn unpublished_seal_is_in_flight_until_publication_or_rollback() {
+    fixture(|h| {
+        assert!(!publication_in_flight(h));
+        let pending = PendingExit::begin(h, (SLOT, ID)).unwrap();
+        assert!(publication_in_flight(h));
+        drop(pending);
+        assert!(!publication_in_flight(h));
+        let receipt = submit(h);
+        assert!(!publication_in_flight(h));
+        assert!(queued_for(h).is_some());
+        let (census, _) = claim_next().unwrap();
+        finish(census);
+        assert!(receipt.complete());
+    });
+}

@@ -2,11 +2,15 @@
 use super::*;
 use crate::multitask::{cpu_local, scheduler::exec_transaction};
 
+/// Quiescence is a deadlock detector, not a latency bound: a descheduled vCPU or
+/// loaded host must not turn a slow sibling ACK into a failure. Expiry cancels
+/// the exec (the caller sees an error) instead of stopping the kernel.
+const EXEC_QUIESCE_DEADLINE_NS: u64 = 30_000_000_000;
+
 pub fn exec_current_user_process(
     address_space: ProcessAddressSpace,
     mut bootstrap: super::super::UserTaskBootstrap,
 ) -> Option<alloc::vec::Vec<crate::user::handles::KernelHandle>> {
-    const EXEC_REMOTE_QUIESCE_TIMEOUT_NS: u64 = 2_000_000_000;
     let linux_process_state = bootstrap.linux_process_state.take()?;
     let linux_memory_map = bootstrap.linux_memory_map.take()?;
     let linux_runtime_profile = bootstrap.linux_runtime_profile.take()?;
@@ -45,11 +49,17 @@ pub fn exec_current_user_process(
             }
         }
         if crate::arch::clock::monotonic_nanos().saturating_sub(start)
-            >= EXEC_REMOTE_QUIESCE_TIMEOUT_NS
+            >= EXEC_QUIESCE_DEADLINE_NS
         {
-            panic!(
-                "scheduler invariant: exec timed out quiescing remote process threads handle={process_handle:?}"
+            crate::debug::record_milestone(
+                crate::debug::LogCategory::Process,
+                "exec-quiesce-deadline",
+                intent.slot() as u64,
+                intent.task_id(),
             );
+            drop(census);
+            cancel_intent(intent);
+            return None;
         }
         // The ACK comes from tasks on this or another CPU; spinning on an
         // already-requested reschedule would hold a single CPU for a quantum.
@@ -210,11 +220,17 @@ pub fn exec_user_process_by_pid_checked(
             }
         }
         if crate::arch::clock::monotonic_nanos().saturating_sub(start)
-            >= EXEC_REMOTE_QUIESCE_TIMEOUT_NS
+            >= EXEC_QUIESCE_DEADLINE_NS
         {
-            panic!(
-                "scheduler invariant: target exec timed out quiescing remote threads process={process_id} thread={thread_id}"
+            crate::debug::record_milestone(
+                crate::debug::LogCategory::Process,
+                "exec-quiesce-deadline",
+                process_id,
+                thread_id,
             );
+            drop(census);
+            cancel_intent(intent);
+            return Err(ExecRefusal::Quiescence);
         }
         // The ACK comes from tasks on this or another CPU; spinning on an
         // already-requested reschedule would hold a single CPU for a quantum.

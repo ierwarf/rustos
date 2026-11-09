@@ -611,6 +611,7 @@ impl SharedRegionObject {
 
 struct SharedRegionReclaimQueue {
     entries: [Option<SharedRegionObject>; MAX_SHARED_REGION_OBJECTS],
+    head: usize,
     len: usize,
 }
 
@@ -618,33 +619,39 @@ impl SharedRegionReclaimQueue {
     const fn new() -> Self {
         Self {
             entries: [const { None }; MAX_SHARED_REGION_OBJECTS],
+            head: 0,
             len: 0,
         }
     }
 
     fn push(&mut self, object: SharedRegionObject) {
-        let slot = self
-            .entries
-            .get_mut(self.len)
-            .expect("shared-region reclaim admission invariant violated");
-        *slot = Some(object);
+        assert!(
+            self.len < MAX_SHARED_REGION_OBJECTS,
+            "shared-region reclaim admission invariant violated"
+        );
+        let tail = (self.head + self.len) % MAX_SHARED_REGION_OBJECTS;
+        self.entries[tail] = Some(object);
         self.len += 1;
     }
 
+    /// O(1) under the reclaim lock: the previous shift-down moved up to
+    /// `MAX_SHARED_REGION_OBJECTS` entries on every serviced reclaim step.
     fn pop_front(&mut self) -> Option<SharedRegionObject> {
-        let object = self.entries.first_mut()?.take()?;
-        for index in 1..self.len {
-            self.entries[index - 1] = self.entries[index].take();
+        if self.len == 0 {
+            return None;
         }
+        let object = self.entries[self.head].take();
+        self.head = (self.head + 1) % MAX_SHARED_REGION_OBJECTS;
         self.len -= 1;
-        Some(object)
+        object
     }
 
     #[cfg(test)]
     fn clear(&mut self) {
-        for slot in &mut self.entries[..self.len] {
+        for slot in &mut self.entries {
             *slot = None;
         }
+        self.head = 0;
         self.len = 0;
     }
 }
@@ -3430,7 +3437,11 @@ pub fn shared_region_frames(region: KernelSharedRegionHandle) -> Option<Vec<u64>
         let (phys_start, page_count) = SHARED_REGIONS.with(region.raw(), |object| {
             (object.phys_start, object.page_count)
         })?;
-        let mut frames = Vec::with_capacity(page_count);
+        // A fallible reservation: the page count is bounded but a 256 MiB
+        // region still needs a 512 KiB vector, and an allocation failure must
+        // refuse the request instead of aborting the kernel.
+        let mut frames = Vec::new();
+        frames.try_reserve_exact(page_count).ok()?;
         for page_index in 0..page_count {
             frames.push(phys_start + page_index as u64 * PAGE_SIZE as u64);
         }

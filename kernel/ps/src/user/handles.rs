@@ -119,6 +119,9 @@ impl ConsoleHandle {
             .is_last_reference(self.token_id())
     }
 
+    // TEST-HARNESS: production paths use the fallible variant so a stale
+    // description is refused rather than asserted on.
+    #[cfg(test)]
     pub(crate) fn acquire_descriptor_reference(&self) {
         assert!(
             self.try_acquire_descriptor_reference(),

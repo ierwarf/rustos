@@ -426,7 +426,9 @@ fn run_one_smoke_unarchived(
     let boot_started = Instant::now();
     phase("smoke-guests-spawned");
     let deadline = boot_started + options.timeout;
-    let result: Result<ProbeResult> = (|| {
+    // A panic in a log predicate must not unwind past the reaper below and
+    // orphan both QEMU processes (they hold the fixed ivshmem/vsock topology).
+    let result: Result<ProbeResult> = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<ProbeResult> {
         let probe = wait_for_parallel_boot(
             &mut rustos,
             &mut dvm,
@@ -453,7 +455,14 @@ fn run_one_smoke_unarchived(
             input_relay_gate: Arc::clone(&input_relay_gate),
         }
         .run(&mut rustos, &mut dvm, probe)
-    })();
+    })) {
+        Ok(result) => result,
+        Err(panic) => {
+            stop_guest(&mut rustos);
+            stop_guest(&mut dvm);
+            std::panic::resume_unwind(panic);
+        }
+    };
     let result = failure_snapshot::after_failed_probe(result, || {
         // Diagnostic HMP is never used for acceptance or physical-device runs.
         // Preserve the already-latched failure, then stop both guests as usual.
@@ -493,7 +502,7 @@ fn run_one_smoke_unarchived(
         verify_dvm_network_round_trip(shared_network)?;
     }
     if options.exercise_google_ping {
-        let rustos_log = fs::read_to_string(&layout.debugcon_log)
+        let rustos_log = read_log_lossy(&layout.debugcon_log)
             .with_context(|| format!("read {}", layout.debugcon_log.display()))?;
         if !google_ping_reply_observed(&rustos_log) {
             bail!("Google ping proof missing guest DNS resolution and matching ICMP Echo reply");
@@ -527,7 +536,7 @@ fn run_one_smoke_unarchived(
         )?;
     }
     if options.job_policy_probe {
-        let rustos_log = fs::read_to_string(&layout.debugcon_log)
+        let rustos_log = read_log_lossy(&layout.debugcon_log)
             .with_context(|| format!("read {}", layout.debugcon_log.display()))?;
         let proof = validate_job_policy_log(&rustos_log)?;
         println!(
@@ -536,7 +545,7 @@ fn run_one_smoke_unarchived(
         );
     }
     if options.oom_hog {
-        let rustos_log = fs::read_to_string(&layout.debugcon_log)
+        let rustos_log = read_log_lossy(&layout.debugcon_log)
             .with_context(|| format!("read {}", layout.debugcon_log.display()))?;
         if options.oom_hog_job_limit {
             let evidence = validate_application_limit_log(&rustos_log)?;
@@ -757,15 +766,25 @@ pub(crate) fn kvm_run_command(
         "xtask: interactive KVM DVM guests started in {} ms; user-visible first-frame readiness is required before the outer smoke timeout",
         started_at.elapsed().as_millis(),
     );
-    let outcome = run_interactive_session(
-        config,
-        &options,
-        &layout,
-        started_at,
-        interactive_boot_started,
-        &mut rustos,
-        &mut dvm,
-    );
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_interactive_session(
+            config,
+            &options,
+            &layout,
+            started_at,
+            interactive_boot_started,
+            &mut rustos,
+            &mut dvm,
+        )
+    }));
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(panic) => {
+            stop_guest(&mut dvm);
+            stop_guest(&mut rustos);
+            std::panic::resume_unwind(panic);
+        }
+    };
     // Every exit path, including an `?` error inside the loop, must reap both
     // guests; a leaked QEMU keeps the fixed ivshmem/vsock topology busy and
     // makes the next F5 launch fail.

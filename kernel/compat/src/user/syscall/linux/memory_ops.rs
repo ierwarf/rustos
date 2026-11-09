@@ -337,7 +337,11 @@ fn bootstrap_mmap(
                 find_bootstrap_mmap_start(address_space, state, requested_addr, len)?
             };
             let end = checked_bootstrap_mapping_end(state, start, len)?;
-            if end <= state.brk_mapped_end {
+            // The bootstrap mmap area lies wholly above the heap. A range that
+            // starts inside the mapped heap would, for `MAP_FIXED`, unmap live
+            // heap pages the brk state still counts as mapped (a straddling
+            // range passed the old `end <=` test), so refuse any overlap.
+            if start < state.brk_mapped_end {
                 return Err(LINUX_ENOMEM);
             }
             if fixed {

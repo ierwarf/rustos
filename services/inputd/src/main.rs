@@ -1302,6 +1302,12 @@ fn dispatch_read(
         .requested_len
         .min(approved_len)
         .min(INPUTD_READ_PAYLOAD_CAPACITY as u64) as usize;
+    // Read the broker counters before dequeuing: a failure after events were
+    // popped would drop them with an error reply.
+    let mut stats = match fetch_broker_stats() {
+        Ok(stats) => stats,
+        Err(errno) => return errno,
+    };
     let status = match request.access {
         INPUTD_ACCESS_NATIVE => fill_native_payload(queue, &mut response.payload, requested),
         INPUTD_ACCESS_EVDEV => fill_evdev_payload(queue, &mut response.payload, requested),
@@ -1311,10 +1317,8 @@ fn dispatch_read(
         return status.err().unwrap_or(libc::EINVAL);
     };
     response.payload_len = len as u32;
-    match fetch_stats(queue) {
-        Ok(stats) => response.stats = stats,
-        Err(errno) => return errno,
-    }
+    merge_queue_stats(&mut stats, queue);
+    response.stats = stats;
     0
 }
 
@@ -1605,6 +1609,12 @@ fn consume_read_authorization(
 }
 
 fn fetch_stats(queue: &InputQueue) -> Result<InputStatsWire, i32> {
+    let mut stats = fetch_broker_stats()?;
+    merge_queue_stats(&mut stats, queue);
+    Ok(stats)
+}
+
+fn fetch_broker_stats() -> Result<InputStatsWire, i32> {
     let mut stats = InputStatsWire::default();
     let args = InputStatsBrokerArgs {
         abi_version: INPUTD_IPC_ABI_VERSION,
@@ -1619,13 +1629,16 @@ fn fetch_stats(queue: &InputQueue) -> Result<InputStatsWire, i32> {
     if result < 0 {
         return Err(last_errno());
     }
+    Ok(stats)
+}
+
+fn merge_queue_stats(stats: &mut InputStatsWire, queue: &InputQueue) {
     stats.queued = stats.queued.saturating_add(queue.len() as u64);
     stats.dropped_discrete = stats
         .dropped_discrete
         .saturating_add(queue.dropped_discrete);
     stats.dropped_lossy = stats.dropped_lossy.saturating_add(queue.dropped_lossy);
     stats.readiness_generation = queue.readiness_generation;
-    Ok(stats)
 }
 
 fn publish_readiness(generation: u64, ready: bool) {

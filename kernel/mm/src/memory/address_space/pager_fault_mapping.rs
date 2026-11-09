@@ -807,10 +807,6 @@ impl ProcessAddressSpace {
             return Err(AddressSpaceError::NotMapped);
         }
 
-        let mut frames = Vec::new();
-        frames
-            .try_reserve_exact(page_count)
-            .map_err(|_| AddressSpaceError::OutOfFrames)?;
         for (page_index, leaf) in leaves.iter().copied().enumerate() {
             let virt = page_addr(start, page_index)?;
             if leaf.virtual_address != virt.as_u64() {
@@ -823,33 +819,11 @@ impl ProcessAddressSpace {
             ) {
                 return Err(AddressSpaceError::InvalidFrameOwnership);
             }
-            frames.push(leaf.physical_address);
         }
-        let mutation = begin_address_space_mutation(self.root_phys());
-        for leaf in leaves.iter().copied() {
-            let virt = VirtAddr::new(leaf.virtual_address);
-            let unmapped = self
-                .unmap_user_page(virt)
-                .ok_or(AddressSpaceError::NotMapped)?;
-            debug_assert_eq!(unmapped.as_u64(), leaf.physical_address);
-        }
-        let _flushed_mutation = mutation.flush_for_reclaim();
-        frames.clear();
-        for leaf in leaves.iter().copied() {
-            match phys::release_data_leaf(
-                self.pml4_frame_phys,
-                leaf.virtual_address,
-                leaf.physical_address,
-            ) {
-                Some(phys::DataLeafRelease::FrameReusable) => {
-                    frames.push(leaf.physical_address);
-                }
-                Some(phys::DataLeafRelease::FrameRetained) => {}
-                None => panic!("unmapped pager leaf lost exact data descriptor"),
-            }
-        }
-        free_removed_frames_exact(&frames);
-        Ok(page_count)
+        // The shared transaction rolls any removed prefix through the reclaim
+        // barrier and descriptor release even when a removal fails midway, so
+        // an early error can never strand a removed PTE's descriptor or frame.
+        self.unmap_preflighted_user_leaves(leaves, &[])
     }
 
     /// Updates protection on the present subset of a prepared pager range.

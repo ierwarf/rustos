@@ -97,7 +97,8 @@ pub fn prepare_storage_handoff(
     validate_block_device_idle(sysfs_root, proc_root, device_root, &block_name)?;
     let node = device_root.join(&block_name);
     let (device, opened_writable) = open_exclusive_block_device(&node)?;
-    let admitted_number = read_trimmed(&sysfs_root.join("class/block").join(&block_name).join("dev"))?;
+    let admitted_number =
+        read_trimmed(&sysfs_root.join("class/block").join(&block_name).join("dev"))?;
     validate_opened_device_number(device.metadata()?.rdev(), &admitted_number)?;
     let geometry = read_block_geometry(&device, sysfs_root, &block_name)?;
     if !opened_writable && !geometry.read_only {
@@ -525,9 +526,14 @@ fn flush_block_device_bounded(file: &File, timeout: Duration) -> Result<()> {
             return Err(io::Error::last_os_error()).context("wait for storage flush");
         }
         if Instant::now() >= deadline {
-            unsafe {
-                libc::kill(child, libc::SIGKILL);
-                libc::waitpid(child, std::ptr::null_mut(), 0);
+            unsafe { libc::kill(child, libc::SIGKILL) };
+            // A child stuck in uninterruptible I/O may ignore SIGKILL; reap
+            // with a bound so the signed deadline stays a real deadline.
+            let reap_deadline = Instant::now() + Duration::from_secs(1);
+            while unsafe { libc::waitpid(child, std::ptr::null_mut(), libc::WNOHANG) } == 0
+                && Instant::now() < reap_deadline
+            {
+                std::thread::sleep(Duration::from_millis(10));
             }
             bail!("physical storage flush exceeded signed handoff deadline");
         }
@@ -656,8 +662,12 @@ fn read_optional_u64(path: &Path) -> Result<Option<u64>> {
 fn validate_opened_device_number(device: libc::dev_t, admitted: &str) -> Result<()> {
     validate_device_number(admitted)?;
     let (major, minor) = admitted.split_once(':').expect("validated device number");
-    let major: u32 = major.parse().context("block device major number overflow")?;
-    let minor: u32 = minor.parse().context("block device minor number overflow")?;
+    let major: u32 = major
+        .parse()
+        .context("block device major number overflow")?;
+    let minor: u32 = minor
+        .parse()
+        .context("block device minor number overflow")?;
     if libc::major(device) != major || libc::minor(device) != minor {
         bail!("opened block device does not match the admitted sysfs device number");
     }

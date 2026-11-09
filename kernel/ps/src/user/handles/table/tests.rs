@@ -769,3 +769,25 @@ mod kmem_billing {
         assert_eq!(kmem_charge::usage(Class::HandleTable, 61), 0);
     }
 }
+
+#[test]
+fn fork_clone_leaves_a_stale_console_descriptor_closed_instead_of_panicking() {
+    let mut table = HandleTable::new();
+    let stale = super::ConsoleHandle::new(ConsoleStreamKind::Output);
+    let fd = table.install(KernelHandle::Console(stale.clone())).unwrap();
+    // Withdraw the table's reference behind its back: the description is now
+    // dead although a slot still names it.
+    assert!(stale.release_descriptor_reference());
+    assert!(!super::ConsoleHandle::token_is_live(stale.token_id()));
+
+    let child = table.clone();
+    assert!(child.get_entry(fd).is_none(), "stale fd must not be inherited");
+    assert!(child.get_entry(0).is_some(), "live stdin is inherited");
+    // The parent keeps its own slot; its stale reference is not double-freed
+    // by the child's drop.
+    drop(child);
+    assert!(table.get_entry(fd).is_some());
+    // Leak the table so its drop does not release a description that was
+    // already fully released above.
+    core::mem::forget(table);
+}

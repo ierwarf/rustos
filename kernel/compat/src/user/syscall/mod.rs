@@ -25,7 +25,9 @@ const USER_RFLAGS_FORBIDDEN_MASK: u64 = RFlags::TRAP_FLAG.bits()
     | RFlags::NESTED_TASK.bits()
     | RFlags::IOPL_LOW.bits()
     | RFlags::IOPL_HIGH.bits()
-    | RFlags::VIRTUAL_8086_MODE.bits();
+    | RFlags::VIRTUAL_8086_MODE.bits()
+    | RFlags::VIRTUAL_INTERRUPT.bits()
+    | RFlags::VIRTUAL_INTERRUPT_PENDING.bits();
 
 pub(crate) fn retire_current_linux_task_due_to_fault(
     vector: u8,
@@ -627,7 +629,12 @@ fn syscall_return_contract(frame: &SyscallFrame) -> Option<SysretReturnContract>
 }
 
 fn user_rflags_are_sysret_safe(rflags: u64) -> bool {
-    (rflags & USER_RFLAGS_RESERVED_BIT_1) != 0 && (rflags & USER_RFLAGS_FORBIDDEN_MASK) == 0
+    // IF must be set: ring3 cannot clear it itself (IOPL 0), so a frame with IF
+    // clear came from a register image another path (exec transition, signal
+    // restore) composed, and returning to it would run user code with
+    // interrupts masked, immune to preemption.
+    let required = USER_RFLAGS_RESERVED_BIT_1 | RFlags::INTERRUPT_FLAG.bits();
+    (rflags & required) == required && (rflags & USER_RFLAGS_FORBIDDEN_MASK) == 0
 }
 
 fn user_address_is_sysret_safe(addr: u64) -> bool {
@@ -774,6 +781,7 @@ mod tests {
         let mut frame = valid_frame();
         frame.user_rflags = 0x200;
         assert!(!user_rflags_are_sysret_safe(frame.user_rflags));
+        assert!(!user_rflags_are_sysret_safe(0x2));
         assert!(syscall_return_contract(&frame).is_none());
 
         frame = valid_frame();

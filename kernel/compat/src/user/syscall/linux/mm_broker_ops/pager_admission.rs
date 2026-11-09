@@ -64,9 +64,6 @@ const _: () = assert!(
     "one process's VMA table must fit inside the pager's region table"
 );
 
-/// Services that resolve or carry faults.
-///
-
 /// Epoch stamped into every ring0-owned anonymous object.
 ///
 /// The wire field is named for the pager because a pager-backed object's epoch

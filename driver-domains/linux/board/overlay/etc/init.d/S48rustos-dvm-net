@@ -133,6 +133,7 @@ start_relays() {
         start_relay display /usr/libexec/rustos-dvm-display
     else
         echo "rustos-dvm: display MSI-X UIO module unavailable; refusing display relay" >&2
+        stop_relay gpu
         return 1
     fi
     if modprobe rustos_dvm_net_uio; then

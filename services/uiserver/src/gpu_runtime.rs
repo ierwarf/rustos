@@ -28,6 +28,7 @@ use std::vec::Vec;
 
 use driver_domain_protocol::{
     DvmGpuAtlasCompletion, DvmGpuAtlasDamage, DvmGpuPrimeCompletion, DvmGpuPrimeCompletionStatus,
+    DVM_GPU_RENDER_MAX_IN_FLIGHT,
 };
 use rustos_user_abi::device::{DISPLAY_INFO_FLAG_DVM_SCANOUT, DISPLAY_INFO_FLAG_GPU_COMPOSITOR};
 use rustos_user_abi::syscall::PRODUCT_MILESTONE_DISPLAY_READY;
@@ -49,6 +50,8 @@ use crate::sys::{
     UiThreadRole, EAGAIN, EINVAL, ENODEV, ESTALE,
 };
 
+// Upper bound on one atlas backing (the shipped atlas is 2048x2048 BGRA, 16 MiB).
+const MAX_GPU_ATLAS_BYTES: usize = 256 * 1024 * 1024;
 const GPU_READY_RETRY: Duration = Duration::from_millis(50);
 const GPU_READY_RETRY_MAX: Duration = Duration::from_millis(400);
 const GPU_READY_TIMEOUT: Duration = Duration::from_secs(20);
@@ -417,9 +420,24 @@ impl GpuCompositor {
             current_display.flags,
             current_display.generation,
         ));
+        // The provider descriptor is untrusted: a zero slot count would make
+        // every later `% slots.len()` divide by zero, and an unbounded atlas
+        // would turn one descriptor into an arbitrary-size allocation.
+        let row_bytes = (info.atlas_width as usize).checked_mul(size_of::<u32>());
+        if info.slot_count == 0
+            || info.slot_count > DVM_GPU_RENDER_MAX_IN_FLIGHT
+            || info.atlas_width == 0
+            || info.atlas_height == 0
+            || info.atlas_stride_bytes as usize % size_of::<u32>() != 0
+            || row_bytes.is_none_or(|row| (info.atlas_stride_bytes as usize) < row)
+        {
+            debug_line("uiserver: GPU initialization rejected stage=atlas-geometry");
+            return Err(EINVAL);
+        }
         let logical_bytes = usize::try_from(info.atlas_stride_bytes)
             .ok()
             .and_then(|stride| stride.checked_mul(info.atlas_height as usize))
+            .filter(|bytes| *bytes <= MAX_GPU_ATLAS_BYTES)
             .ok_or_else(|| {
                 debug_line("uiserver: GPU initialization rejected stage=atlas-size-overflow");
                 EINVAL
@@ -453,7 +471,10 @@ impl GpuCompositor {
                 EINVAL
             })?;
             let surface_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
-            let mapping_len = usize::try_from(surface.mapping_len).map_err(|_| {
+            let mapping_len = usize::try_from(surface.mapping_len)
+                .ok()
+                .filter(|len| *len >= logical_bytes)
+                .ok_or_else(|| {
                 debug_line(&format!(
                     "uiserver: GPU initialization rejected stage=atlas-map-size slot={slot_index} bytes={}",
                     surface.mapping_len

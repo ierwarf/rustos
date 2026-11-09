@@ -198,7 +198,7 @@ impl GlobalDispatch<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1, ()> for
 impl Dispatch<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1, ()> for WaylandState {
     fn request(
         _state: &mut Self,
-        _client: &Client,
+        client: &Client,
         resource: &zxdg_decoration_manager_v1::ZxdgDecorationManagerV1,
         request: zxdg_decoration_manager_v1::Request,
         _data: &(),
@@ -207,27 +207,48 @@ impl Dispatch<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1, ()> for Wayla
     ) {
         if let zxdg_decoration_manager_v1::Request::GetToplevelDecoration { id, toplevel } = request
         {
-            let Some(surface_data) = toplevel.data::<SurfaceData>().cloned() else {
+            if toplevel.data::<SurfaceData>().is_none() {
                 post_protocol_error(
                     resource,
                     "zxdg_decoration_manager_v1.get_toplevel_decoration: toplevel is unavailable"
                         .into(),
                 );
                 return;
+            }
+            let Some(ticket) = client
+                .get_data::<WaylandClientState>()
+                .and_then(|counts| {
+                    LiveObjectTicket::admit(
+                        &counts.decorations,
+                        MAX_WAYLAND_DECORATIONS_PER_CLIENT,
+                        None,
+                    )
+                })
+            else {
+                post_protocol_error(
+                    resource,
+                    format!(
+                        "zxdg_decoration_manager_v1.get_toplevel_decoration: decoration limit \
+                         {MAX_WAYLAND_DECORATIONS_PER_CLIENT} reached"
+                    ),
+                );
+                return;
             };
-            let decoration = data_init.init(id, surface_data);
+            let decoration = data_init.init(id, DecorationData { _ticket: ticket });
             decoration.configure(zxdg_toplevel_decoration_v1::Mode::ServerSide);
         }
     }
 }
 
-impl Dispatch<zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1, SurfaceData> for WaylandState {
+impl Dispatch<zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1, DecorationData>
+    for WaylandState
+{
     fn request(
         _state: &mut Self,
         _client: &Client,
         resource: &zxdg_toplevel_decoration_v1::ZxdgToplevelDecorationV1,
         request: zxdg_toplevel_decoration_v1::Request,
-        _data: &SurfaceData,
+        _data: &DecorationData,
         _handle: &DisplayHandle,
         _data_init: &mut DataInit<'_, Self>,
     ) {

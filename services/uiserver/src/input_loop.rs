@@ -5,8 +5,6 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use runtime_control::RuntimeClient;
-
 use crate::app::{
     AppState, InputProcessingResult, VisualUpdate, INPUT_EVENT_BATCH, INPUT_PROCESS_BUDGET,
     MAX_INPUT_READ_BATCHES_PER_TICK,
@@ -583,7 +581,6 @@ impl PendingPointerPosition {
 pub(crate) fn process_pending_input(
     state: &mut AppState,
     wayland: Option<&mut WaylandCompositor>,
-    runtime: &RuntimeClient,
     events: &InputReader,
 ) -> Result<InputProcessingResult, i32> {
     let previous_cursor_x = state.cursor_x;
@@ -634,7 +631,6 @@ pub(crate) fn process_pending_input(
 
         if flush_pending_pointer(
             state,
-            runtime,
             wayland.as_deref_mut(),
             &mut pending_pointer,
             &mut visual_update,
@@ -642,13 +638,12 @@ pub(crate) fn process_pending_input(
             wayland_motion_calls = wayland_motion_calls.saturating_add(1);
         }
 
-        let redraw = state.handle_input_event(runtime, &event, wayland.as_deref_mut())?;
+        let redraw = state.handle_input_event(&event, wayland.as_deref_mut())?;
         visual_update.absorb(redraw);
     }
 
     if flush_pending_pointer(
         state,
-        runtime,
         wayland,
         &mut pending_pointer,
         &mut visual_update,
@@ -679,7 +674,6 @@ pub(crate) fn process_pending_input(
 
 fn flush_pending_pointer(
     state: &mut AppState,
-    runtime: &RuntimeClient,
     wayland: Option<&mut WaylandCompositor>,
     pending_pointer: &mut PendingPointerPosition,
     visual_update: &mut VisualUpdate,
@@ -688,7 +682,7 @@ fn flush_pending_pointer(
         return Ok(false);
     };
 
-    let redraw = state.handle_input_event(runtime, &event, wayland)?;
+    let redraw = state.handle_input_event(&event, wayland)?;
     visual_update.absorb(redraw);
     Ok(true)
 }

@@ -169,6 +169,10 @@ struct Peer {
     id: i64,
     stream: Option<UnixStream>,
     receive_events: Vec<OwnedFd>,
+    /// The surviving peer has been told about this slot's eventfds. A
+    /// handshake that failed before announcing leaves the slot allocated but
+    /// unannounced, so the next connection must still announce it.
+    announced: bool,
 }
 
 fn serve(
@@ -271,6 +275,7 @@ fn admit_peer(
         peers[id_index] = Some(Peer {
             id,
             stream: None,
+            announced: false,
             receive_events: (0..vector_count)
                 .map(|_| create_eventfd())
                 .collect::<Result<Vec<_>>>()?,
@@ -305,7 +310,7 @@ fn admit_peer(
         send_i64_with_fd(stream.as_raw_fd(), id, Some(receive_event.as_raw_fd()))?;
     }
 
-    if !replacing {
+    if !peers[id_index].as_ref().is_some_and(|peer| peer.announced) {
         for existing in peers
             .iter()
             .enumerate()
@@ -316,18 +321,15 @@ fn admit_peer(
             for receive_event in receive_events {
                 // The surviving peer's socket failing is its own liveness
                 // problem (reaped next pass), not this client's handshake.
-                let _ = send_i64_with_fd(
-                    existing.as_raw_fd(),
-                    id,
-                    Some(receive_event.as_raw_fd()),
-                );
+                let _ = send_i64_with_fd(existing.as_raw_fd(), id, Some(receive_event.as_raw_fd()));
             }
         }
     }
-    peers[id_index]
+    let slot = peers[id_index]
         .as_mut()
-        .context("fixed ivshmem peer slot initialized")?
-        .stream = Some(stream);
+        .context("fixed ivshmem peer slot initialized")?;
+    slot.announced = true;
+    slot.stream = Some(stream);
     Ok(())
 }
 

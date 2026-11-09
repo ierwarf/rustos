@@ -675,7 +675,9 @@ pub(super) fn build_initial_memory_map(
     image: &LinuxProcessImageInfo,
     exec_path: &str,
     user_stack: Option<UserStackState>,
-) -> LinuxMemoryMapState {
+) -> Result<LinuxMemoryMapState, ProcessLoadError> {
+    // The image metadata may come from loaderd, so inconsistent mappings are
+    // load errors rather than ring0 panics.
     let mut maps = LinuxMemoryMapState::new();
 
     for mapping in &image.image_mappings {
@@ -696,9 +698,12 @@ pub(super) fn build_initial_memory_map(
             mapping.flags,
             name,
         )
-        .expect("initial ELF VMA bounds are invalid");
-        maps.insert_area(area)
-            .expect("initial ELF VMA ranges unexpectedly overlap");
+        .ok_or(ProcessLoadError::InvalidElf(
+            "initial ELF VMA bounds are invalid",
+        ))?;
+        maps.insert_area(area).map_err(|_| {
+            ProcessLoadError::InvalidElf("initial ELF VMA ranges unexpectedly overlap")
+        })?;
     }
 
     if let Some(tls) = image.initial_tls {
@@ -710,8 +715,9 @@ pub(super) fn build_initial_memory_map(
             LinuxVmaFlags::private_anon(true, true, false),
             LinuxVmaName::None,
         ) {
-            maps.insert_area(area)
-                .expect("initial TLS mapping overlaps an existing VMA");
+            maps.insert_area(area).map_err(|_| {
+                ProcessLoadError::InvalidElf("initial TLS mapping overlaps an existing VMA")
+            })?;
         }
     }
 
@@ -724,11 +730,12 @@ pub(super) fn build_initial_memory_map(
             LinuxVmaName::Label("[stack]"),
         )
     {
-        maps.insert_area(area)
-            .expect("initial stack mapping overlaps an existing VMA");
+        maps.insert_area(area).map_err(|_| {
+            ProcessLoadError::InvalidElf("initial stack mapping overlaps an existing VMA")
+        })?;
     }
 
-    maps
+    Ok(maps)
 }
 
 fn elf_initial_tls_info(
@@ -1300,13 +1307,21 @@ fn validate_segment_alignment(ph: &ProgramHeader<'_>) -> Result<(), ProcessLoadE
         ));
     }
 
-    if align > 1 && ((ph.virtual_addr() ^ ph.offset()) & (align - 1)) != 0 {
+    if !segment_vaddr_offset_congruent(ph.virtual_addr(), ph.offset(), align) {
         return Err(ProcessLoadError::InvalidElf(
             "PT_LOAD virtual address and file offset are misaligned",
         ));
     }
 
     Ok(())
+}
+
+/// Page-granular copy-in (`segment_page_file_copy_range`) places file byte
+/// `offset` at `vaddr`, so congruence modulo the page size is required even
+/// when p_align is 0/1 or smaller than a page.
+fn segment_vaddr_offset_congruent(vaddr: u64, offset: u64, align: u64) -> bool {
+    let congruence_mask = cmp::max(align, PAGE_SIZE) - 1;
+    (vaddr ^ offset) & congruence_mask == 0
 }
 
 fn segment_page_flags(ph: &ProgramHeader<'_>) -> PageTableFlags {
@@ -1674,6 +1689,49 @@ mod tests {
             .position(|pair| pair[0] == linux_abi::AT_EGID)
             .expect("AT_EGID present");
         assert_eq!(auxv[egid_index * 2 + 1], 1000);
+    }
+
+    #[test]
+    fn segment_congruence_is_page_granular_even_for_small_p_align() {
+        use super::segment_vaddr_offset_congruent as congruent;
+        assert!(congruent(0x401000, 0x1000, 0));
+        assert!(congruent(0x401234, 0x234, 1));
+        assert!(!congruent(0x401000, 0x234, 1));
+        assert!(!congruent(0x401234, 0x1000, 16));
+        assert!(!congruent(0x611000, 0x1000, 0x20_0000));
+        assert!(congruent(0x20_1000, 0x1000, 0x20_0000));
+    }
+
+    #[test]
+    fn inconsistent_image_mappings_are_load_errors_not_panics() {
+        use super::build_initial_memory_map;
+        use crate::user::linux::{LinuxImageMapping, LinuxImageMappingPathKind, LinuxVmaFlags};
+        let mapping = |start, end| LinuxImageMapping {
+            start,
+            end,
+            offset: 0,
+            flags: LinuxVmaFlags::new(true, false, false, true),
+            path_kind: LinuxImageMappingPathKind::None,
+        };
+        let mut image = LinuxProcessImageInfo {
+            entry: 0,
+            interpreter_base: 0,
+            interpreter_path: None,
+            program_headers: 0,
+            program_header_entry_size: 0,
+            program_header_count: 0,
+            brk_start: 0,
+            bootstrap_heap_base: 0,
+            bootstrap_heap_len: 0,
+            initial_tls: None,
+            image_mappings: vec![mapping(0x40_0000, 0x40_2000), mapping(0x40_1000, 0x40_3000)],
+            runtime_search_paths: Vec::new(),
+        };
+        assert!(build_initial_memory_map(&image, "/x", None).is_err());
+        image.image_mappings = vec![mapping(0x40_2000, 0x40_2000)];
+        assert!(build_initial_memory_map(&image, "/x", None).is_err());
+        image.image_mappings = vec![mapping(0x40_0000, 0x40_1000), mapping(0x40_1000, 0x40_2000)];
+        assert!(build_initial_memory_map(&image, "/x", None).is_ok());
     }
 
     #[test]

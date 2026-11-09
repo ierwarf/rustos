@@ -1188,8 +1188,11 @@ fn syscall6(number: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64, 
 }
 
 fn last_errno() -> i32 {
+    // A failed call that left errno at 0 must still be an error: a 0 status
+    // here would be replied to the caller as a granted open/ioctl.
     std::io::Error::last_os_error()
         .raw_os_error()
+        .filter(|errno| *errno > 0)
         .unwrap_or(libc::EIO)
 }
 

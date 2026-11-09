@@ -7,6 +7,10 @@ use std::borrow::Cow;
 const ASCII_START: u8 = 32;
 const ASCII_END: u8 = 126;
 const GLYPH_COUNT: usize = (ASCII_END - ASCII_START + 1) as usize;
+/// A face file is untrusted: its advances and bearings pick the cell size, so a
+/// hostile face must not turn into an arbitrary-size raster allocation.
+const MAX_GLYPH_CELL_WIDTH: usize = 2048;
+const MAX_ATLAS_ALPHA_BYTES: usize = 64 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct GlyphMetrics {
@@ -38,6 +42,11 @@ pub(crate) fn build_atlas(face: &Font, spec: &FontSpec) -> Result<GlyphAtlas, St
 
     let natural_line_height = line_metrics.new_line_size.ceil().max(1.0) as usize;
     let line_height = spec.line_height_px.map_or(natural_line_height, usize::from);
+    if line_height > MAX_GLYPH_CELL_WIDTH {
+        return Err(format!(
+            "font line height is {line_height} px, more than {MAX_GLYPH_CELL_WIDTH}"
+        ));
+    }
     let baseline = line_metrics.ascent.ceil() as isize
         + line_height.saturating_sub(natural_line_height) as isize / 2;
 
@@ -51,8 +60,14 @@ pub(crate) fn build_atlas(face: &Font, spec: &FontSpec) -> Result<GlyphAtlas, St
         }
         let (metrics, bitmap) = face.rasterize(ch, px);
         let width = measured_cell_width(&metrics, spec.monospace);
+        let advance = metrics.advance_width.ceil() as usize;
+        if width > MAX_GLYPH_CELL_WIDTH || advance > MAX_GLYPH_CELL_WIDTH {
+            return Err(format!(
+                "glyph {ch:?} cell is {width}x{advance} px wide, more than {MAX_GLYPH_CELL_WIDTH}"
+            ));
+        }
         if spec.monospace {
-            monospace_width = monospace_width.max(width.max(metrics.advance_width.ceil() as usize));
+            monospace_width = monospace_width.max(width.max(advance));
         }
         rasterized.push(Some((metrics, bitmap, width)));
     }
@@ -81,6 +96,11 @@ pub(crate) fn build_atlas(face: &Font, spec: &FontSpec) -> Result<GlyphAtlas, St
         } else {
             measured_width.max(1)
         };
+        if alpha.len() + glyph_width * line_height > MAX_ATLAS_ALPHA_BYTES {
+            return Err(format!(
+                "font atlas exceeds {MAX_ATLAS_ALPHA_BYTES} bytes at {glyph_width}x{line_height} px cells"
+            ));
+        }
         glyphs.push(GlyphMetrics {
             width: glyph_width,
             height: line_height,

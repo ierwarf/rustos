@@ -88,10 +88,15 @@ def tracked_rust_files() -> list[Path]:
         cwd=ROOT,
         text=True,
     )
+    # `vendor/` is pinned upstream source (see vendor/*/RUSTOS-PATCHES.md): it
+    # cannot carry this repository's rationale tags, so the repo's own source
+    # contracts do not apply to it.
     return [
         ROOT / relative
         for relative in output.splitlines()
-        if relative and (ROOT / relative).is_file()
+        if relative
+        and not relative.startswith("vendor/")
+        and (ROOT / relative).is_file()
     ]
 
 

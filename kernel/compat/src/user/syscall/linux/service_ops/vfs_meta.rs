@@ -252,8 +252,9 @@ pub fn syscall_linux_vfs_readlinkat(
     let Ok(user_len) = usize::try_from(user_len) else {
         return linux_errno(LINUX_EINVAL);
     };
+    // readlinkat(2): a zero bufsiz is EINVAL, not an empty success.
     if user_len == 0 {
-        return 0;
+        return linux_errno(LINUX_EINVAL);
     }
     if let Err(err) = usermem::validate_current_user_write_buffer(user_ptr, user_len) {
         return linux_errno(address_space_error_to_linux_errno(err));
@@ -1233,7 +1234,13 @@ fn populate_netd_request_payload(
             copy_current_payload(request, request.arg1, request.arg2)
         }
         SYSCALL_OFFLOAD_OP_LINUX_SENDTO => {
-            copy_current_payload(request, request.arg1, request.arg2)?;
+            // Stream sockets take a bounded prefix and report it, exactly as
+            // `sendmsg` and `writev` do below; failing a large `write` with
+            // `EINVAL` because one offload payload is smaller than the buffer
+            // is a transport limit leaking into the caller's ABI. Datagram
+            // sockets are never split and took the dedicated branch above.
+            let prefix_len = request.arg2.min(NETD_IPC_PAYLOAD_CAPACITY as u64);
+            copy_current_payload(request, request.arg1, prefix_len)?;
             if current_inet_socket(socket) {
                 // Internet sockets carry no kernel-side stream bookkeeping:
                 // netd owns the whole byte stream.

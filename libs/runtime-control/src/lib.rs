@@ -234,8 +234,13 @@ pub const RUNNING_PROGRAMS_DIGEST_UNKNOWN: u64 = NO_RUNNING_PROGRAMS_DIGEST;
 /// How long a watch may sit on the socket before the caller calls the server
 /// dead. A parked reply is expected to take the full requested wait, so the
 /// deadline has to leave room for it plus the round trip that carries it.
+///
+/// The server clamps the park to [`RUNTIME_WATCH_MAX_WAIT_MS`], so the deadline
+/// is derived from the clamped wait. An unclamped caller-supplied `wait` such as
+/// `Duration::MAX` would make `Instant::now() + timeout` overflow and panic.
 fn watch_io_timeout(wait: Duration) -> Duration {
-    wait.saturating_add(RPC_IO_TIMEOUT)
+    wait.min(Duration::from_millis(u64::from(RUNTIME_WATCH_MAX_WAIT_MS)))
+        .saturating_add(RPC_IO_TIMEOUT)
 }
 
 fn decode_running_programs(
@@ -1099,6 +1104,12 @@ mod tests {
             super::OP_NOTIFY_READY => "ready",
             _ => "unknown",
         }
+    }
+
+    #[test]
+    fn watch_deadline_is_bounded_for_unbounded_waits() {
+        let bound = super::watch_io_timeout(std::time::Duration::MAX);
+        assert!(std::time::Instant::now().checked_add(bound).is_some());
     }
 
     #[test]

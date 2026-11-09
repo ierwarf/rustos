@@ -190,11 +190,15 @@ pub fn publish_inherited_pager_vma_for_process(
     if page_count == 0 {
         return Err(crate::multitask::pager_vma::PagerVmaError::Pressure);
     }
-    record_reservation(page_count as u64);
     let identity = retained
         .live_identity()
         .ok_or(crate::multitask::pager_vma::PagerVmaError::Stale)?;
-    crate::multitask::pager_vma::publish(retained.handle(), identity, template, ceiling)
+    // Count only publications that actually reserved address space; a refused
+    // overlap/ceiling/stale publication must not inflate the telemetry.
+    let published =
+        crate::multitask::pager_vma::publish(retained.handle(), identity, template, ceiling)?;
+    record_reservation(page_count as u64);
+    Ok(published)
 }
 
 /// Resolve one current-task fault without scheduler or process-state locks.

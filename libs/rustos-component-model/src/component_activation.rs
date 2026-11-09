@@ -38,6 +38,9 @@ pub enum Error {
 struct Slot {
     component:Component,state:State,evidence:Option<LeaseEvidence>,
     transaction:u64,
+    /// Position in the prepared manifest; `dependency_mask` bits name this,
+    /// never a physical slot (retirement leaves holes that would shift it).
+    manifest_index:usize,
 }
 pub struct ActivationBook<const N:usize> {
     slots:[Option<Slot>;N],
@@ -85,12 +88,12 @@ impl<const N:usize> ActivationBook<N> {
         }
         let count=self.slots.iter().filter(|s|s.is_none()).count();
         if count<manifest.len(){return Err(Error::Capacity)}
-        for &node in manifest {
+        for (manifest_index,&node) in manifest.iter().enumerate() {
             let idx=self.slots.iter().position(Option::is_none)
                 .ok_or(Error::Capacity)?;
             self.slots[idx]=Some(Slot{
                 component:node,state:State::Prepared,
-                evidence:None,transaction,
+                evidence:None,transaction,manifest_index,
             });
         }
         self.transaction=transaction;
@@ -132,7 +135,8 @@ impl<const N:usize> ActivationBook<N> {
         for bit in 0..64 {
             if s.component.dependency_mask & (1u64<<bit)!=0 {
                 let dependency=self.slots.iter().flatten()
-                    .filter(|x|x.transaction==tx).nth(bit as usize)
+                    .find(|x|x.transaction==tx
+                        && x.manifest_index==bit as usize)
                     .ok_or(Error::Dependency)?;
                 if dependency.state!=State::Published {
                     return Err(Error::Dependency)
@@ -210,5 +214,27 @@ mod tests {
         assert_eq!(b.can_publish(2,2),Err(Error::Dependency));
         b.published(1,2,wp,true).unwrap();
         b.published(2,2,wc,true).unwrap();
+    }
+    #[test]
+    fn dependency_bits_name_manifest_position_not_slot_order() {
+        let x=Component{id:1,generation:1,parent:0,executable:9,dependency_mask:0};
+        let y=Component{id:2,generation:1,parent:0,executable:10,dependency_mask:0};
+        let z=Component{id:3,generation:1,parent:0,executable:11,dependency_mask:1};
+        let mut b=ActivationBook::<4>::new(1);
+        b.prepare(&[x,y,z],2).unwrap();
+        let ev=|c,pid|LeaseEvidence{component:c,generation:1,pid,lease:9,job_generation:1};
+        for (id,pid) in [(1,100),(2,101),(3,102)] {
+            b.spawned(id,2,ev(id,pid)).unwrap();
+            b.ready(id,2,ev(id,pid)).unwrap();
+        }
+        b.published(2,2,ev(2,101),true).unwrap();
+        // X (bit 0) is still unpublished: Y being published must not
+        // satisfy Z's dependency.
+        assert_eq!(b.can_publish(3,2),Err(Error::Dependency));
+        b.begin_drain(1,2).unwrap();
+        b.revoked(1,2,true).unwrap();
+        b.retire(1,2).unwrap();
+        // Retiring X leaves a hole; the bit must not slide onto Y.
+        assert_eq!(b.can_publish(3,2),Err(Error::Dependency));
     }
 }

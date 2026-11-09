@@ -424,7 +424,15 @@ pub fn debug_line_static(message: &'static str) {
 /// the per-service `debug_line()` helpers that previously called
 /// `libc::syscall`.
 pub fn debug_line(message: &str) {
-    let mut line = Vec::from(message.as_bytes());
+    // Diagnostics are also emitted from allocation-failure reporting, so a
+    // failed framing buffer degrades to two writes instead of aborting.
+    let mut line = Vec::new();
+    if line.try_reserve_exact(message.len() + 1).is_err() {
+        debug_bytes(message.as_bytes());
+        debug_bytes(b"\n");
+        return;
+    }
+    line.extend_from_slice(message.as_bytes());
     line.push(b'\n');
     debug_bytes(&line);
 }

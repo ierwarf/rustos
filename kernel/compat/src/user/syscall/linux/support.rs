@@ -286,6 +286,10 @@ fn install_rt_signal_frame(
     saved_mask: u64,
     action: LinuxSigActionWire,
 ) -> Result<(), i64> {
+    // Resolve the signal bit before the first frame mutation so a refusal can
+    // never leave a half-redirected syscall frame behind.
+    let signal_bit =
+        crate::user::sysops::linux::linux_signal_bit(signal).ok_or(LINUX_EINVAL)?;
     let saved_stack = current_signal_stack()?;
     let using_altstack = should_use_signal_altstack(frame.user_rsp, saved_stack, action.flags);
     let frame_top = signal_frame_top(frame.user_rsp, saved_stack, action.flags)?;
@@ -317,9 +321,6 @@ fn install_rt_signal_frame(
     frame.rdi = signal;
     frame.rsi = new_rsp + linux_rt_sigframe_info_offset() as u64;
     frame.rdx = new_rsp + linux_rt_sigframe_ucontext_offset() as u64;
-    let Some(signal_bit) = crate::user::sysops::linux::linux_signal_bit(signal) else {
-        return Err(LINUX_EINVAL);
-    };
     let _ = multitask::with_current_user_process_and_linux_thread_state_mut(
         |_, _, _, _, linux_thread_state| {
             if let Some(state) = linux_thread_state.as_mut() {
@@ -333,10 +334,19 @@ fn install_rt_signal_frame(
     Ok(())
 }
 
+/// Linux restores only the arithmetic/status flags plus AC from a signal frame
+/// (user-writable memory); IOPL, NT, VM, TF, DF and IF stay under kernel
+/// control. Anything else in the saved image is ignored, not trusted, so a
+/// forged `eflags` cannot reach the sysret gate (which would kill the task).
+fn sigreturn_user_rflags(current: u64, saved: u64) -> u64 {
+    const RESTORABLE: u64 = 0x1 | 0x4 | 0x10 | 0x40 | 0x80 | 0x800 | 0x4_0000;
+    ((current & !RESTORABLE) | (saved & RESTORABLE)) | 0x202
+}
+
 fn restore_syscall_frame(frame: &mut SyscallFrame, context: LinuxSigContext64) {
     frame.user_rsp = context.rsp;
     frame.user_rip = context.rip;
-    frame.user_rflags = context.eflags;
+    frame.user_rflags = sigreturn_user_rflags(frame.user_rflags, context.eflags);
     frame.rax = context.rax;
     frame.rdi = context.rdi;
     frame.rsi = context.rsi;
@@ -442,13 +452,11 @@ fn linux_signal_stack_from_stack_t(stack: LinuxStackT) -> linux_abi::LinuxSignal
 }
 
 fn linux_rt_sigframe_ucontext_offset() -> usize {
-    let base = core::ptr::null::<LinuxRtSigFrame>();
-    unsafe { core::ptr::addr_of!((*base).uc) as usize }
+    core::mem::offset_of!(LinuxRtSigFrame, uc)
 }
 
 fn linux_rt_sigframe_info_offset() -> usize {
-    let base = core::ptr::null::<LinuxRtSigFrame>();
-    unsafe { core::ptr::addr_of!((*base).info) as usize }
+    core::mem::offset_of!(LinuxRtSigFrame, info)
 }
 
 fn clear_current_pending_signal(signal: u64, selected_sigchld_events: u32) {
@@ -604,5 +612,19 @@ mod tests {
         let stop = crate::user::sysops::linux::linux_signal_bit(linux_abi::SIGSTOP).unwrap();
         let catchable = crate::user::sysops::linux::linux_signal_bit(linux_abi::SIGCHLD).unwrap();
         assert_eq!(sanitize_signal_mask(kill | stop | catchable), catchable);
+    }
+}
+
+#[cfg(test)]
+mod sigreturn_rflags_tests {
+    use super::sigreturn_user_rflags;
+
+    #[test]
+    fn forged_sigreturn_eflags_cannot_set_privileged_bits() {
+        let forged = u64::MAX;
+        let out = sigreturn_user_rflags(0x202, forged);
+        assert_eq!(out & (0x100 | 0x400 | 0x4000 | 0x3000 | 0x2_0000), 0);
+        assert_eq!(out & 0x202, 0x202);
+        assert_eq!(sigreturn_user_rflags(0x202, 0x1 | 0x40), 0x243);
     }
 }

@@ -547,7 +547,11 @@ impl PhysicalStoragePolicy {
         {
             bail!("DVM block evidence does not match the signed controller and handoff epoch");
         }
+        // The consumer derives a byte capacity (512-byte sectors) from the
+        // DVM-reported sector count; an overflowing product is a fabricated
+        // geometry.
         if evidence.capacity_sectors == 0
+            || evidence.capacity_sectors.checked_mul(512).is_none()
             || evidence.logical_block_size < 512
             || !evidence.logical_block_size.is_power_of_two()
             || !evidence.logical_block_size.is_multiple_of(512)
@@ -2936,7 +2940,9 @@ impl Drop for InputRingSink {
 
 impl RustosInputSink for InputRingSink {
     fn wait_for_receiver_ready(&mut self, timeout: Duration) -> Result<()> {
-        let deadline = Instant::now() + timeout;
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .ok_or_else(|| anyhow!("input-ring receiver-ready deadline overflow"))?;
         loop {
             let header = self.header()?;
             if header.generation == self.generation
@@ -3358,11 +3364,16 @@ impl HostControlListener {
     }
 
     fn accept_authenticated(&self, timeout: Option<Duration>) -> Result<std::fs::File> {
-        let deadline = timeout.map(|duration| std::time::Instant::now() + duration);
+        let deadline = timeout
+            .map(|duration| {
+                std::time::Instant::now()
+                    .checked_add(duration)
+                    .ok_or_else(|| anyhow!("Linux DVM vsock accept deadline overflow"))
+            })
+            .transpose()?;
         let mut connection = loop {
-            let remaining = deadline.map(|deadline| {
-                deadline.saturating_duration_since(std::time::Instant::now())
-            });
+            let remaining = deadline
+                .map(|deadline| deadline.saturating_duration_since(std::time::Instant::now()));
             let timeout_ms = remaining
                 .map(|duration| {
                     // Round up so a sub-millisecond remainder still waits.
@@ -4623,6 +4634,15 @@ mod tests {
                 .validate_evidence(&evidence, 10, "nvme0n1")
                 .is_err()
         );
+        let mut overflowing = evidence.clone();
+        overflowing.capacity_sectors = u64::MAX / 256;
+        assert!(
+            policy
+                .physical_storage()
+                .unwrap()
+                .validate_evidence(&overflowing, 9, "nvme0n1")
+                .is_err()
+        );
 
         let unavailable = parse_message(
             "RESPONSE\nid=5\nop=block-evidence-v1\nstatus=unavailable\ngeneration=0\ndriver=missing\npci-vendor=0000\npci-device=0000\nguest-pci-bdf=none\nblock-name=none\ncapacity-sectors=0\nlogical-block-size=0\nphysical-block-size=0\nfeatures=0000000000000000\nread-only=no",
@@ -4635,7 +4655,10 @@ mod tests {
     fn bounded_socket_timeout_is_never_the_unbounded_zero_timeval() {
         let unbounded = super::socket_timeval(None);
         assert_eq!((unbounded.tv_sec, unbounded.tv_usec), (0, 0));
-        for bounded in [std::time::Duration::ZERO, std::time::Duration::from_nanos(999)] {
+        for bounded in [
+            std::time::Duration::ZERO,
+            std::time::Duration::from_nanos(999),
+        ] {
             let value = super::socket_timeval(Some(bounded));
             assert_eq!((value.tv_sec, value.tv_usec), (0, 1));
         }

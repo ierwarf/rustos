@@ -1,5 +1,5 @@
 use std::string::String;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError, TryLockError};
 use std::thread;
 use std::time::Duration;
 
@@ -69,8 +69,13 @@ pub(crate) fn refresh_runtime_state(
     sync: &RuntimeSyncHandle,
     runtime_state: &mut RuntimeState,
 ) -> Result<bool, i32> {
-    let Ok(snapshot) = sync.shared.try_lock().map(|state| state.clone()) else {
-        return Ok(false);
+    // The shared state is plain data replaced whole under the lock, so a
+    // poisoned guard still holds a consistent snapshot; refusing it would
+    // freeze the taskbar for the life of the process.
+    let snapshot = match sync.shared.try_lock() {
+        Ok(state) => state.clone(),
+        Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner().clone(),
+        Err(TryLockError::WouldBlock) => return Ok(false),
     };
     if snapshot.generation == runtime_state.generation {
         return Ok(false);
@@ -106,7 +111,7 @@ fn runtime_sync_worker(runtime: RuntimeClient, shared: Arc<Mutex<SharedRuntimeSt
         let running_count = snapshot.len().min(MAX_RUNNING_PROGRAMS);
         running_programs[..running_count].copy_from_slice(&snapshot[..running_count]);
 
-        let mut shared = shared.lock().unwrap();
+        let mut shared = shared.lock().unwrap_or_else(PoisonError::into_inner);
         // The digest covers runtimed's whole set; this window covers only the
         // part the UI can show. A change past the visible cap is real to the
         // broker and invisible here, so it must not become a repaint.

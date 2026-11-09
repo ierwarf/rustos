@@ -30,6 +30,9 @@ pub const ELF64_PF_W: u32 = 2;
 pub const ELF64_PF_R: u32 = 4;
 pub const ELF64_KNOWN_PF: u32 = ELF64_PF_X | ELF64_PF_W | ELF64_PF_R;
 
+/// Longest NUL-terminated name admitted in a PE import/export table. Without
+/// a cap every one of up to 65536 imports could scan the whole image.
+pub const PE64_MAX_C_STRING_BYTES: usize = 4096;
 pub const PE64_RELOC_ABSOLUTE: u16 = 0;
 pub const PE64_RELOC_DIR64: u16 = 10;
 pub const PE64_FILE_RELOCS_STRIPPED: u16 = 0x0001;
@@ -257,6 +260,17 @@ pub fn admit_pe64_image_headers(
         || !image_size.is_multiple_of(section_alignment)
         || !headers_size.is_multiple_of(file_alignment)
     {
+        return Err(ByteAdmissionError::InvalidValue);
+    }
+    // The header block that is copied to the image must contain the whole
+    // NT header and section table; otherwise the table would alias a section
+    // payload or lie outside the image the loader materializes.
+    let header_span = pe_offset
+        .checked_add(PE64_FILE_HEADER_SIZE as u64)
+        .and_then(|v| v.checked_add(optional_size as u64))
+        .and_then(|v| v.checked_add(section_headers.len() as u64))
+        .ok_or(ByteAdmissionError::AddressOverflow)?;
+    if header_span > headers_size {
         return Err(ByteAdmissionError::InvalidValue);
     }
     let mapped_image_size = align_up_4k(image_size)?;
@@ -837,7 +851,8 @@ fn validate_ascii_c_string(
                 Err(ByteAdmissionError::InvalidValue)
             };
         }
-        if !byte.is_ascii() || byte.is_ascii_control() {
+        if !byte.is_ascii() || byte.is_ascii_control() || cursor - start >= PE64_MAX_C_STRING_BYTES
+        {
             return Err(ByteAdmissionError::InvalidValue);
         }
         cursor += 1;
@@ -1387,6 +1402,25 @@ mod tests {
         assert_eq!(admitted.entry_point, 0x401000);
         assert_eq!(admitted.section_count, 1);
         assert_eq!(admitted.sections[0].virtual_address, 0x1000);
+
+        let mut headers_too_small = optional;
+        headers_too_small[60..64].copy_from_slice(&0x200_u32.to_le_bytes());
+        let mut late_pe = dos;
+        late_pe[0x3c..0x40].copy_from_slice(&0x1f0_u32.to_le_bytes());
+        assert_eq!(
+            admit_pe64_image_headers(
+                &late_pe,
+                &file,
+                &headers_too_small,
+                &section,
+                0x400000,
+                0x1000,
+                0x800000,
+                128 * 1024 * 1024,
+                false,
+            ),
+            Err(ByteAdmissionError::InvalidValue)
+        );
 
         let mut bad_directory_pair = optional;
         bad_directory_pair[112..116].copy_from_slice(&0x1000_u32.to_le_bytes());

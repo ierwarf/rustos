@@ -593,7 +593,10 @@ pub(super) fn choose_local_next_with(
             && slot == current_slot
             && current_runtime_ns >= SCHED_MAX_BURST_NS
         {
-            let alternate = match class(current_slot) {
+            let Ok(current_class) = observed_class(current_slot) else {
+                return fallback(LocalFallbackReason::PublicationUnavailable);
+            };
+            let alternate = match current_class {
                 LocalClass::System => prefer_local(alternate_system, local_alternate_system),
                 LocalClass::User => prefer_local(alternate_user, local_alternate_user),
             };
@@ -601,16 +604,25 @@ pub(super) fn choose_local_next_with(
                 slot = alternate_slot;
             }
         }
-        if !voluntary_yield
+        // A class publication withdrawn by a racing retirement between the
+        // scan and here is an incomplete observation, never a panic.
+        let granularity_applies = if !voluntary_yield
             && !reservation_applied
             && slot != current_slot
             && current_is_live!()
-            // Legacy fairness preempts across a higher-priority class, but
-            // applies min-granularity to same/lower-priority peers. The current
-            // frame is actively executing, so retaining it needs no stable
-            // saved-frame token; every replacement still passed one above.
-            && class(slot) >= class(current_slot)
         {
+            match (observed_class(slot), observed_class(current_slot)) {
+                // Legacy fairness preempts across a higher-priority class, but
+                // applies min-granularity to same/lower-priority peers. The current
+                // frame is actively executing, so retaining it needs no stable
+                // saved-frame token; every replacement still passed one above.
+                (Ok(candidate), Ok(current)) => candidate >= current,
+                _ => return fallback(LocalFallbackReason::PublicationUnavailable),
+            }
+        } else {
+            false
+        };
+        if granularity_applies {
             let advantage =
                 runqueue::vruntime(current_slot).saturating_sub(runqueue::vruntime(slot));
             if current_runtime_ns < SCHED_MIN_GRANULARITY_NS

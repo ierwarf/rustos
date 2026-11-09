@@ -71,9 +71,17 @@ impl WaylandState {
             "uiserver: retire_surface begin surface={surface_id}"
         ));
         if let Some(object_id) = object_id.as_ref() {
+            // Only the surface that owns the pointer grab ends it; retiring an
+            // unrelated surface must not drop another client's drag.
+            let owned_grab = self
+                .pointer_focus
+                .as_ref()
+                .is_some_and(|focus| focus.surface.id() == *object_id);
             self.clear_focus_for_surface(object_id);
+            if owned_grab {
+                self.pointer_button_down = false;
+            }
         }
-        self.pointer_button_down = false;
         self.sync_surface_output(shared, false);
         let Ok(mut state) = shared.lock() else {
             diag_line(format!(

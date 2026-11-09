@@ -111,8 +111,13 @@ struct FrameGrant {
 }
 
 struct FrameGrantSlot {
-    state: AtomicU8,
-    generation: AtomicU64,
+    /// Generation and lifecycle state in one word: `generation << 8 | state`.
+    ///
+    /// They share a word so a claim's compare-exchange names the generation it
+    /// validated. With a separate state byte, a stale claimer could pass its
+    /// checks against grant A, lose the slot to a consumer and a republisher,
+    /// and then win `Live -> Claimed` on grant B in the same slot.
+    word: AtomicU64,
     frame_phys: AtomicU64,
     fault_token: AtomicU64,
     process_generation: AtomicU64,
@@ -126,8 +131,7 @@ struct FrameGrantSlot {
 impl FrameGrantSlot {
     const fn empty() -> Self {
         Self {
-            state: AtomicU8::new(FRAME_GRANT_FREE),
-            generation: AtomicU64::new(0),
+            word: AtomicU64::new(slot_word(0, FRAME_GRANT_FREE)),
             frame_phys: AtomicU64::new(0),
             fault_token: AtomicU64::new(0),
             process_generation: AtomicU64::new(0),
@@ -144,6 +148,22 @@ const FRAME_GRANT_FREE: u8 = 0;
 const FRAME_GRANT_PUBLISHING: u8 = 1;
 const FRAME_GRANT_LIVE: u8 = 2;
 const FRAME_GRANT_CLAIMED: u8 = 3;
+const SLOT_STATE_BITS: u32 = 8;
+const SLOT_STATE_MASK: u64 = (1_u64 << SLOT_STATE_BITS) - 1;
+// A generation up to `HANDLE_MAX_GENERATION` (48 bits) must fit above the state.
+const _: () = assert!(HANDLE_MAX_GENERATION.leading_zeros() >= SLOT_STATE_BITS);
+
+const fn slot_word(generation: u64, state: u8) -> u64 {
+    (generation << SLOT_STATE_BITS) | state as u64
+}
+
+const fn slot_generation(word: u64) -> u64 {
+    word >> SLOT_STATE_BITS
+}
+
+const fn slot_state(word: u64) -> u8 {
+    (word & SLOT_STATE_MASK) as u8
+}
 
 const FAULT_FRAME_POOL_COLD: u8 = 0;
 const FAULT_FRAME_POOL_FILLING: u8 = 1;
@@ -418,15 +438,20 @@ impl FrameGrantTable {
         }
         for (index, slot) in self.slots.iter().enumerate() {
             // ORDERING: claiming Free with Acquire excludes a competing
-            // publisher before this writer computes or replaces the slot's
-            // non-reusable generation and payload.
+            // publisher before this writer replaces the slot's payload; the
+            // generation is carried unchanged through Publishing.
+            let observed = slot.word.load(Ordering::Relaxed);
+            if slot_state(observed) != FRAME_GRANT_FREE {
+                continue;
+            }
+            let previous_generation = slot_generation(observed);
             if slot
-                .state
+                .word
                 .compare_exchange(
-                    FRAME_GRANT_FREE,
-                    FRAME_GRANT_PUBLISHING,
-                    // ORDERING: this acquire owns the free slot before a
-                    // publisher may derive its next generation.
+                    observed,
+                    slot_word(previous_generation, FRAME_GRANT_PUBLISHING),
+                    // ORDERING: this acquire owns the free slot before the
+                    // publisher writes any payload field.
                     Ordering::Acquire,
                     // ORDERING: a losing publisher observes no payload and
                     // retries another bounded slot without synchronization.
@@ -436,24 +461,23 @@ impl FrameGrantTable {
             {
                 continue;
             }
-            // ORDERING: only the publisher that owns Publishing may read the
-            // prior generation; Live readers cannot observe a partial update.
-            let Some(generation) = slot.generation.load(Ordering::Relaxed).checked_add(1) else {
-                // ORDERING: Release ends the private Publishing interval; no
-                // reader may have observed payload from this rejected slot.
-                slot.state.store(FRAME_GRANT_FREE, Ordering::Release);
-                continue;
-            };
+            let generation = previous_generation + 1;
             if generation > HANDLE_MAX_GENERATION {
                 // ORDERING: Release makes this exhausted attempt visible as
                 // Free while its non-wrapping generation remains retained.
-                slot.state.store(FRAME_GRANT_FREE, Ordering::Release);
+                slot.word.store(
+                    slot_word(previous_generation, FRAME_GRANT_FREE),
+                    Ordering::Release,
+                );
                 continue;
             }
             let Some(handle) = encode_handle(index, generation) else {
                 // ORDERING: Release abandons only this unpublished slot;
                 // callers cannot observe an invalid handle or payload.
-                slot.state.store(FRAME_GRANT_FREE, Ordering::Release);
+                slot.word.store(
+                    slot_word(previous_generation, FRAME_GRANT_FREE),
+                    Ordering::Release,
+                );
                 continue;
             };
             slot.frame_phys.store(frame_phys, Ordering::Relaxed);
@@ -470,10 +494,11 @@ impl FrameGrantTable {
             slot.rights.store(rights, Ordering::Relaxed);
             slot.from_fault_pool
                 .store(u8::from(from_fault_pool), Ordering::Relaxed);
-            slot.generation.store(generation, Ordering::Relaxed);
-            // ORDERING: the live Release publishes every grant field; a claim
-            // acquires this state before it compares any authority field.
-            slot.state.store(FRAME_GRANT_LIVE, Ordering::Release);
+            // ORDERING: the live Release publishes every grant field and the
+            // new generation; a claim acquires this word before it compares any
+            // authority field.
+            slot.word
+                .store(slot_word(generation, FRAME_GRANT_LIVE), Ordering::Release);
             return Ok(handle);
         }
         Err(FrameGrantError::Pressure)
@@ -489,8 +514,9 @@ impl FrameGrantTable {
         let slot = self.slots.get(index).ok_or(FrameGrantError::Stale)?;
         // ORDERING: acquiring Live pairs with publication's final Release so
         // all following relaxed payload observations describe one grant.
-        if slot.state.load(Ordering::Acquire) != FRAME_GRANT_LIVE
-            || slot.generation.load(Ordering::Relaxed) != generation
+        let observed = slot.word.load(Ordering::Acquire);
+        if slot_state(observed) != FRAME_GRANT_LIVE
+            || slot_generation(observed) != generation
             || slot.fault_token.load(Ordering::Relaxed) != binding.fault_token
             || slot.process_generation.load(Ordering::Relaxed) != binding.process_generation
             || slot.mm_generation.load(Ordering::Relaxed) != binding.mm_generation
@@ -502,12 +528,14 @@ impl FrameGrantTable {
             return Err(FrameGrantError::Stale);
         }
         // ORDERING: the AcqRel claim is the single consume linearization
-        // point; a concurrent cancel or reply observes Claimed and fails.
+        // point; a concurrent cancel or reply observes Claimed and fails. It
+        // expects the exact word validated above, so a slot consumed and
+        // republished since then (a different generation) cannot be claimed.
         if slot
-            .state
+            .word
             .compare_exchange(
-                FRAME_GRANT_LIVE,
-                FRAME_GRANT_CLAIMED,
+                observed,
+                slot_word(generation, FRAME_GRANT_CLAIMED),
                 // ORDERING: AcqRel both sees the published payload and makes
                 // this one-shot claimant visible before it consumes the page.
                 Ordering::AcqRel,
@@ -527,7 +555,8 @@ impl FrameGrantTable {
         };
         // ORDERING: consuming a grant is terminal for this generation; only
         // after its exact frame copy is local may a new publisher reuse slot.
-        slot.state.store(FRAME_GRANT_FREE, Ordering::Release);
+        slot.word
+            .store(slot_word(generation, FRAME_GRANT_FREE), Ordering::Release);
         Ok(grant)
     }
 }
@@ -854,6 +883,44 @@ mod tests {
         assert_eq!(
             table.take(stale, binding, FRAME_RIGHT_READ),
             Err(FrameGrantError::Stale)
+        );
+    }
+
+    #[test]
+    fn claim_is_bound_to_the_validated_generation() {
+        let table = FrameGrantTable::new();
+        let binding = binding(23);
+        let first = table
+            .publish(0x7000, binding, FRAME_RIGHT_READ, false)
+            .unwrap();
+        let (index, generation) = decode_handle(first).unwrap();
+        // ORDERING: single-threaded model of a claimer's validating load.
+        let word = table.slots[index].word.load(Ordering::Acquire);
+        assert_eq!(slot_state(word), FRAME_GRANT_LIVE);
+        assert_eq!(slot_generation(word), generation);
+        table.take(first, binding, FRAME_RIGHT_READ).unwrap();
+        let second = table
+            .publish(0x8000, binding, FRAME_RIGHT_READ, false)
+            .unwrap();
+        // A claimer that validated `word` (generation 1) must not be able to
+        // claim the republished grant: the packed word no longer matches.
+        assert!(
+            table.slots[index]
+                .word
+                .compare_exchange(
+                    word,
+                    slot_word(generation, FRAME_GRANT_CLAIMED),
+                    // ORDERING: same orderings as the production claim.
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_err()
+        );
+        assert_eq!(
+            table
+                .take(second, binding, FRAME_RIGHT_READ)
+                .map(|grant| grant.frame_phys),
+            Ok(0x8000)
         );
     }
 

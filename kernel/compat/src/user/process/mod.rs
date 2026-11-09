@@ -527,7 +527,7 @@ fn build_process_bootstrap(
                     &image,
                     launch.linux.exec_path,
                     user_stack,
-                )),
+                )?),
                 Some(linux::build_runtime_profile(&image, launch.linux)),
                 Some(image.initial_thread_state()),
                 None,

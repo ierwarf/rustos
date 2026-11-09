@@ -1245,9 +1245,10 @@ impl FrameDescriptorLedger {
             }
             let mapping = self.mapping(id)?;
             let next = u32::try_from(mapping.next.load(Ordering::Relaxed)).ok()?;
-            let generation = free_head_generation(head)
-                .checked_add(1)
-                .expect("COW mapping free-list generation exhausted");
+            // The tag only has to differ across one CAS window, so it wraps; a
+            // panic here would let sustained fork churn kill ring0 after 2^32
+            // free-list operations.
+            let generation = free_head_generation(head).wrapping_add(1);
             let desired = pack_free_head(generation, next);
             match self.free_mapping_head.compare_exchange_weak(
                 head,
@@ -1285,9 +1286,10 @@ impl FrameDescriptorLedger {
             mapping
                 .next
                 .store(u64::from(free_head_id(head)), Ordering::Relaxed);
-            let generation = free_head_generation(head)
-                .checked_add(1)
-                .expect("COW mapping free-list generation exhausted");
+            // The tag only has to differ across one CAS window, so it wraps; a
+            // panic here would let sustained fork churn kill ring0 after 2^32
+            // free-list operations.
+            let generation = free_head_generation(head).wrapping_add(1);
             let desired = pack_free_head(generation, id);
             match self.free_mapping_head.compare_exchange_weak(
                 head,

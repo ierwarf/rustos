@@ -297,7 +297,12 @@ pub fn init(boot_info_ptr: *const BootInfo) {
         crate::debug::println!("ACPI RSDP unavailable: loader supplied no RSDP.");
         return;
     }
-    let rsdp = &boot_info.acpi_rsdp[..boot_info.acpi_rsdp_len as usize];
+    // `BootInfo::validate` bounds the length; `get` keeps a violated
+    // invariant from becoming a ring0 panic during hardware discovery.
+    let Some(rsdp) = boot_info.acpi_rsdp.get(..boot_info.acpi_rsdp_len as usize) else {
+        crate::debug::println!("ACPI RSDP unavailable: loader length out of range.");
+        return;
+    };
     let rsdp_addr = state.rsdp_addr;
     let mut discovery = AcpiDiscovery {
         rsdp_present: true,

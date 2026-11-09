@@ -158,6 +158,12 @@ impl Drop for TransferredHandleEntry {
     }
 }
 
+/// Result of probing for the lowest installable descriptor slot.
+enum FreeSlot {
+    Standard(usize),
+    Dynamic(usize),
+}
+
 /// Bytes charged to the owning Job for one dynamic descriptor slot.
 const SLOT_BYTES: u64 = core::mem::size_of::<Option<HandleEntry>>() as u64;
 
@@ -180,28 +186,26 @@ pub struct HandleTable {
 
 impl Clone for HandleTable {
     fn clone(&self) -> Self {
-        let cloned = Self {
-            standard: self.standard.clone(),
-            entries: self.entries.clone(),
+        // A slot whose descriptor reference can no longer be acquired (its
+        // backing object was torn down under the parent) is left closed in the
+        // child. Failing the whole fork with a panic would let one stale
+        // descriptor take down the kernel, and keeping the entry would hand
+        // the child an fd without the reference that must back it.
+        let clone_slot = |slot: &Option<HandleEntry>| {
+            slot.as_ref()
+                .filter(|entry| acquire_entry_descriptor_reference(entry))
+                .cloned()
+        };
+        Self {
+            standard: core::array::from_fn(|index| clone_slot(&self.standard[index])),
+            entries: self.entries.iter().map(clone_slot).collect(),
             // An in-flight receive transaction belongs to the calling
             // process only. Forked children must not inherit invisible slots.
             reserved: BTreeMap::new(),
             next_reservation_id: self.next_reservation_id,
             // A fork child is billed by its own publication into a job.
             kmem: None,
-        };
-        for entry in cloned
-            .standard
-            .iter()
-            .chain(cloned.entries.iter())
-            .flatten()
-        {
-            assert!(
-                acquire_entry_descriptor_reference(entry),
-                "fork cloned a stale descriptor-backed kernel object"
-            );
         }
-        cloned
     }
 }
 
@@ -320,6 +324,32 @@ impl HandleTable {
     }
 
     pub fn install_entry_min(&mut self, entry: HandleEntry, min_fd: u64) -> Option<u64> {
+        self.place_entry_min(entry, min_fd).ok()
+    }
+
+    /// Places `entry` in the lowest free slot at or above `min_fd`. On refusal
+    /// the entry is handed back untouched so a caller that owns a descriptor
+    /// reference for it can withdraw that reference instead of leaking it.
+    fn place_entry_min(&mut self, entry: HandleEntry, min_fd: u64) -> Result<u64, HandleEntry> {
+        let Some(slot) = self.find_slot_min(min_fd) else {
+            return Err(entry);
+        };
+        match slot {
+            FreeSlot::Standard(index) => {
+                self.standard[index] = Some(entry);
+                Ok(index as u64)
+            }
+            FreeSlot::Dynamic(index) => {
+                if self.grow_entries(index + 1).is_none() {
+                    return Err(entry);
+                }
+                self.entries[index] = Some(entry);
+                Ok(FIRST_DYNAMIC_FD as u64 + index as u64)
+            }
+        }
+    }
+
+    fn find_slot_min(&self, min_fd: u64) -> Option<FreeSlot> {
         if min_fd > MAX_DYNAMIC_FD {
             return None;
         }
@@ -333,8 +363,7 @@ impl HandleTable {
                 (entry.is_none() && !self.reserved.contains_key(&(index as u64))).then_some(index)
             })
         {
-            self.standard[index] = Some(entry);
-            return Some(index as u64);
+            return Some(FreeSlot::Standard(index));
         }
         let start_index = dynamic_index(min_fd.max(FIRST_DYNAMIC_FD as u64))?;
         if let Some(index) =
@@ -347,17 +376,14 @@ impl HandleTable {
                     (entry.is_none() && !self.reserved.contains_key(&fd)).then_some(index)
                 })
         {
-            self.entries[index] = Some(entry);
-            return Some(FIRST_DYNAMIC_FD as u64 + index as u64);
+            return Some(FreeSlot::Dynamic(index));
         }
 
         let mut index = self.entries.len().max(start_index);
         while index < max_dynamic_entries() {
             let fd = FIRST_DYNAMIC_FD as u64 + index as u64;
             if !self.reserved.contains_key(&fd) {
-                self.grow_entries(index + 1)?;
-                self.entries[index] = Some(entry);
-                return Some(fd);
+                return Some(FreeSlot::Dynamic(index));
             }
             index = index.checked_add(1)?;
         }
@@ -397,7 +423,7 @@ impl HandleTable {
     }
 
     pub fn install_transferred(&mut self, transferred: TransferredHandleEntry) -> Option<u64> {
-        self.install_entry(transferred.into_entry())
+        self.install_transferred_min(transferred, 0)
     }
 
     pub fn install_transferred_min(
@@ -405,7 +431,17 @@ impl HandleTable {
         transferred: TransferredHandleEntry,
         min_fd: u64,
     ) -> Option<u64> {
-        self.install_entry_min(transferred.into_entry(), min_fd)
+        let entry = transferred.into_entry();
+        match self.place_entry_min(entry, min_fd) {
+            Ok(fd) => Some(fd),
+            Err(entry) => {
+                // `into_entry` disarmed the wrapper's drop-time withdrawal, so
+                // a refused install must withdraw the acquired descriptor
+                // reference here or it would leak for the object's lifetime.
+                release_entry_descriptor_reference(Some(&entry));
+                None
+            }
+        }
     }
 
     pub fn can_install_additional(&self, count: usize) -> bool {
@@ -839,10 +875,9 @@ fn max_dynamic_entries() -> usize {
 
 fn acquire_entry_descriptor_reference(entry: &HandleEntry) -> bool {
     match entry.handle() {
-        KernelHandle::Console(console) => {
-            console.acquire_descriptor_reference();
-            true
-        }
+        // A console description already fully released must not be revived
+        // (or panic the kernel); the caller refuses the dup/transfer/fork.
+        KernelHandle::Console(console) => console.try_acquire_descriptor_reference(),
         KernelHandle::DisplaySurface(surface) => surface
             .shared_region()
             .is_none_or(crate::ipc::retain_shared_region_descriptor),

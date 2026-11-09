@@ -779,7 +779,16 @@ fn complete_claimed_reply(claimed: ps_api::PagerFaultReservation, reply: PagerFa
     if mapped {
         // Fault-around. The faulting page is served; populate the short run
         // pagerd asked for while we are still in ordinary syscall context.
-        populate_run(claimed.request, reply.frame_rights, reply.map_run_pages);
+        //
+        // The wire validator only bounds `map_run_pages` by the global run
+        // maximum. Clip it here to the run the VMA itself can still support,
+        // so a pager cannot extend the run past the faulting region into a
+        // guard or hole whose unused leaf this loop would otherwise fill with
+        // a page carrying the faulting VMA's rights.
+        let run_pages = reply
+            .map_run_pages
+            .min(u64::from(offered_run_pages(claimed.request)));
+        populate_run(claimed.request, reply.frame_rights, run_pages);
     }
     let _ = ps_api::consume_pager_fault_reply(claimed.token);
     // A successful grant claim permanently transfers one wired reserve frame

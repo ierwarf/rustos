@@ -289,6 +289,14 @@ fn handle_request(
     sender_pid: u64,
     sender_tid: u64,
 ) -> SyscallOffloadReply {
+    // Every `read_unaligned` below reads `received` bytes out of `bytes`; a
+    // length the kernel reports beyond the receive buffer is never trusted.
+    if received > bytes.len() {
+        return SyscallOffloadReply::Linux(LinuxSyscallOffloadResponse {
+            status: errno::EINVAL,
+            ..LinuxSyscallOffloadResponse::default()
+        });
+    }
     if received == size_of::<LinuxSyscallOffloadFastRequest>() {
         let request = read_unaligned::<LinuxSyscallOffloadFastRequest>(bytes);
         return SyscallOffloadReply::LinuxFast(handle_fast_linux_request(

@@ -185,8 +185,13 @@ static void drain_tx(const struct raw_endpoint *raw, struct shared_net *net) {
     uint32_t head = le32(net->base + TX_HEAD);
     while (head - net->tx_tail <= SLOT_COUNT && head != net->tx_tail) {
         volatile uint8_t *s = slot(net->base, TX_RING, net->tx_tail); uint32_t len = le32(s);
-        if (len == 0 || len > MTU) break;
         uint8_t frame[MTU]; unsigned int i; ssize_t sent;
+        if (len == 0 || len > MTU) {
+            /* A malformed length must not wedge the whole TX ring: the slot is
+             * already published, so drop it and advance past it. */
+            net->tx_tail++; put32(net->base + TX_TAIL, net->tx_tail);
+            continue;
+        }
         for (i = 0; i < len; i++) frame[i] = s[4U + i];
         sent = sendto(raw->fd, frame, len, MSG_DONTWAIT, (const struct sockaddr *)&raw->address, sizeof(raw->address));
         if (sent != (ssize_t)len) {

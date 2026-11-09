@@ -117,10 +117,15 @@ impl IpcTransferRegistry {
     }
 
     fn remove(&mut self, transfer_id: u64) -> Option<TransferredHandleEntry> {
-        let slot = self
+        let index = self
             .slots
-            .iter_mut()
-            .find(|slot| slot.transfer_id == transfer_id)?;
+            .iter()
+            .position(|slot| slot.transfer_id == transfer_id)?;
+        self.remove_at(index)
+    }
+
+    fn remove_at(&mut self, index: usize) -> Option<TransferredHandleEntry> {
+        let slot = self.slots.get_mut(index)?;
         let entry = slot.entry.take()?;
         *slot = IpcTransferSlot::empty();
         self.len -= 1;
@@ -536,11 +541,8 @@ pub fn drop_ipc_transfers_for_service_epoch(service_id: u64, epoch: u64) {
         let matches = objects.slots[index].context.is_some_and(|context| {
             context.service.service_id == service_id && context.service.epoch == epoch
         });
-        if matches {
-            let transfer_id = objects.slots[index].transfer_id;
-            if let Some(entry) = objects.remove(transfer_id) {
-                deferred.push(entry);
-            }
+        if matches && let Some(entry) = objects.remove_at(index) {
+            deferred.push(entry);
         }
     }
 }

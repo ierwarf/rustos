@@ -62,9 +62,8 @@ pub fn reserve_spawn_in(job: Option<jobs::JobId>) -> Option<SpawnReservation> {
             return None;
         }
     }
-    let transaction_id = allocate_lifecycle_transaction_id()?;
     let limit = process_limit();
-    let handle = loop {
+    let (handle, transaction_id) = loop {
         let mut table = PROCESS_TABLE.lock();
         let free = table
             .slots
@@ -78,9 +77,13 @@ pub fn reserve_spawn_in(job: Option<jobs::JobId>) -> Option<SpawnReservation> {
                     && slot.generation != 0
             });
         if let Some((index, slot)) = free {
+            // The lifecycle id namespace never wraps, so it is consumed only
+            // once a slot is actually claimed: a full table (an `EAGAIN` fork
+            // storm) must not burn identities that can never be reissued.
+            let transaction_id = allocate_lifecycle_transaction_id()?;
             let handle = ProcessHandle::new(index, slot.generation);
             slot.spawn_transaction_id = Some(transaction_id);
-            break handle;
+            break (handle, transaction_id);
         }
         // No free slot below the limit: grow by one chunk if the limit admits
         // more slots than exist, otherwise the table is genuinely full.

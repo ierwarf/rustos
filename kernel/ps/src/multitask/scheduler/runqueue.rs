@@ -1235,12 +1235,17 @@ fn retire_slot(slot: usize, weight: u32, wait_for_claim: bool) -> RetireOutcome 
         if owner.state == RunOwnerState::Local {
             let cpu = owner.cpu.expect("local scheduler owner omitted CPU");
             let mut rq = RUN_QUEUES[cpu].inner.lock();
-            if rq.contains(slot) {
-                rq.remove(slot, weight);
-            }
             let retiring = owner.next(RunOwnerState::Retiring, Some(cpu));
+            // The owner CAS precedes the membership removal. Claim, block and
+            // rehome all need this rq lock, so only lock-free run-intent or
+            // wait metadata can make the CAS fail; unlinking first would leave
+            // a `Local` owner without membership once the lock drops on the
+            // retry, which the next claim or rehome treats as a broken queue.
             if OWNER_WORDS[slot].compare_exchange(owner, retiring).is_err() {
                 continue;
+            }
+            if rq.contains(slot) {
+                rq.remove(slot, weight);
             }
             OWNER_WORDS[slot]
                 .compare_exchange(retiring, retiring.next(RunOwnerState::Retired, None))

@@ -342,17 +342,8 @@ impl Tags {
             let phys_start = unsafe { ptr::read_unaligned((cursor + 8) as *const u64) };
             // SAFETY: as above.
             let page_count = unsafe { ptr::read_unaligned((cursor + 24) as *const u64) };
-            if page_count != 0 {
-                append_region(
-                    output,
-                    &mut count,
-                    BootMemoryRegion {
-                        phys_start,
-                        page_count,
-                        kind: efi_memory_kind(ty),
-                        _reserved0: 0,
-                    },
-                );
+            if let Some(region) = efi_memory_region(ty, phys_start, page_count) {
+                append_region(output, &mut count, region);
             }
             cursor += descr_size;
         }
@@ -504,6 +495,24 @@ fn memory_region_from_range(phys_start: u64, len: u64, ty: u32) -> Option<BootMe
     })
 }
 
+/// An EFI descriptor is admitted only when it is page aligned and its end
+/// address is representable. The Multiboot2 path above realigns and rejects
+/// overflow; this path used to forward the loader's raw words, so a malformed
+/// descriptor could wrap `phys_start + pages * 4096` in the consumers of the
+/// published map.
+fn efi_memory_region(ty: u32, phys_start: u64, page_count: u64) -> Option<BootMemoryRegion> {
+    if page_count == 0 || !phys_start.is_multiple_of(PAGE_SIZE) {
+        return None;
+    }
+    phys_start.checked_add(page_count.checked_mul(PAGE_SIZE)?)?;
+    Some(BootMemoryRegion {
+        phys_start,
+        page_count,
+        kind: efi_memory_kind(ty),
+        _reserved0: 0,
+    })
+}
+
 fn append_region(output: &mut [BootMemoryRegion], count: &mut usize, region: BootMemoryRegion) {
     if region.page_count == 0 || *count >= output.len() {
         return;
@@ -618,6 +627,15 @@ mod tests {
         assert_eq!(efi_memory_kind(9), BootMemoryKind::AcpiReclaim);
         assert_eq!(efi_memory_kind(10), BootMemoryKind::AcpiNvs);
         assert_eq!(efi_memory_kind(11), BootMemoryKind::Mmio);
+    }
+
+    #[test]
+    fn rejects_malformed_efi_descriptors() {
+        assert!(efi_memory_region(7, 0x10_0000, 16).is_some());
+        assert!(efi_memory_region(7, 0x10_0000, 0).is_none());
+        assert!(efi_memory_region(7, 0x10_0800, 16).is_none());
+        assert!(efi_memory_region(7, u64::MAX - 0xfff, 2).is_none());
+        assert!(efi_memory_region(7, 0x1000, u64::MAX / 2).is_none());
     }
 
     #[test]

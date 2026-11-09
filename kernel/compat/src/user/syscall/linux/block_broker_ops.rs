@@ -291,7 +291,13 @@ fn broker_dvm_collect(args: &RustosBlockBrokerArgs) -> Result<u64, i64> {
         DvmBlockPoll::Pending => Err(LINUX_EAGAIN),
         DvmBlockPoll::Completed(completed) => {
             if completed != 0 {
-                usermem::write_current_user_bytes(args.buffer_ptr, &bytes[..completed])
+                // The transport reports the byte count; never let a count
+                // larger than the staging buffer become a ring0 slice panic.
+                let Some(filled) = bytes.get(..completed) else {
+                    let _ = block_api::finish_dvm(ticket);
+                    return Err(LINUX_EIO);
+                };
+                usermem::write_current_user_bytes(args.buffer_ptr, filled)
                     .map_err(address_space_error_to_linux_errno)?;
             }
             block_api::finish_dvm(ticket)

@@ -49,8 +49,10 @@ pub struct ProviderClient {
     service:u64, epoch:u64,pid:u64,
     next_request_id:u64,next_nonce:u64,
     sessions:BTreeMap<u64,Session>,
-    // Committed Release/Cancel frames (Phase::Accepted) keyed by token nonce.
-    ack_outbox:BTreeMap<u64,Frame>,
+    // Committed Release/Cancel frames (Phase::Accepted) keyed by (token epoch,
+    // token nonce): `rotate_epoch` restarts nonces, so the nonce alone would let
+    // a new epoch overwrite a still-unacknowledged receipt of the previous one.
+    ack_outbox:BTreeMap<(u64,u64),Frame>,
 }
 impl ProviderClient {
     pub fn new(service:u64,pid:u64,epoch:u64)->Result<Self,Error>{
@@ -199,7 +201,7 @@ impl ProviderClient {
         }
         let mut frame=committed;
         frame.phase=Phase::Accepted;
-        self.ack_outbox.insert(frame.token_nonce,frame);
+        self.ack_outbox.insert((frame.token_epoch,frame.token_nonce),frame);
     }
     /// Oldest terminal receipt not yet acknowledged to rootd. Retried until
     /// `ack_done`; a transport error leaves it queued (idempotent at rootd).
@@ -209,13 +211,14 @@ impl ProviderClient {
     pub fn ack_pending(&self)->usize{self.ack_outbox.len()}
     /// Retire an outbox entry only for rootd's exact Committed reply.
     pub fn ack_done(&mut self,sent:Frame,reply:Frame)->Result<(),Error>{
-        let queued=self.ack_outbox.get(&sent.token_nonce).copied()
+        let key=(sent.token_epoch,sent.token_nonce);
+        let queued=self.ack_outbox.get(&key).copied()
             .ok_or(Error::Missing)?;
         if queued!=sent{return Err(Error::WrongAck)}
         reply.validate_ack(queued).map_err(|_|Error::WrongAck)?;
         if reply.phase!=Phase::Committed||reply.status!=0
             ||reply.kernel_receipt!=0{return Err(Error::WrongAck)}
-        self.ack_outbox.remove(&sent.token_nonce);
+        self.ack_outbox.remove(&key);
         Ok(())
     }
     /// Bounded drain for owners that hold the client by `&mut` (no shared
@@ -264,6 +267,11 @@ impl ProviderClient {
         }
     }
 }
+/// Positive errno of a negative syscall result; an out-of-range value is a
+/// protocol violation, never a wrapped or panicking negation.
+fn errno_of(result:i64)->i32{
+    result.checked_neg().and_then(|e|i32::try_from(e).ok()).unwrap_or(EPROTO)
+}
 /// Send one receipt-ACK outbox frame (Phase::Accepted) and return rootd's
 /// reply. Failure merely leaves the frame queued: the rootd tombstone is
 /// compaction state only and the nonce watermark already fences re-charging.
@@ -291,12 +299,13 @@ pub fn call_rootd(frame:Frame)->Result<Frame,i32>{
         _=>return Err(EINVAL),
     };
     let endpoint=ipc::lookup_service_endpoint(IPC_SERVICE_ROOTD);
-    if endpoint<=0{return Err(if endpoint==0{EPROTO}else{(-endpoint) as i32})}
+    if endpoint<=0{return Err(if endpoint==0{EPROTO}else{errno_of(endpoint)})}
     let pid=unsafe{syscall::syscall0(SYS_GETPID)};
     let tid=unsafe{syscall::syscall0(SYS_GETTID)};
     if pid<=0||tid<=0||frame.provider_pid!=pid as u64{return Err(EINVAL)}
     let bytes=provider_wire::encode(frame).map_err(|_|EINVAL)?;
     let mut req=CommercialMaxProtocolRequest::default();
+    if bytes.len()>req.payload.len(){return Err(EINVAL)}
     req.header.version=COMMERCIAL_MAX_PROTOCOL_ABI_VERSION;
     req.header.protocol=COMMERCIAL_MAX_PROTOCOL_ROOTD_SUPERVISOR;
     req.header.op=op;
@@ -313,7 +322,7 @@ pub fn call_rootd(frame:Frame)->Result<Frame,i32>{
         size_of::<CommercialMaxProtocolResponse>() as u64,
         IPC_BOOT_CONTROL_HARD_LIMIT_MS,
     )};
-    if got<0{return Err((-got) as i32)}
+    if got<0{return Err(errno_of(got))}
     if got as usize!=size_of::<CommercialMaxProtocolResponse>()
         ||!reply.is_valid_envelope_for(&req)
         ||reply.descriptor_count!=0||reply.value0!=0||reply.value1!=0{
@@ -385,6 +394,25 @@ mod tests {
         }
         assert_eq!(b.ack_pending(),MAX_ACK_OUTBOX);
         assert_eq!(b.next_ack().unwrap().token_nonce,4);
+    }
+    #[test]
+    fn epoch_rotation_does_not_overwrite_an_unacknowledged_receipt(){
+        let mut b=ProviderClient::new(3,81,7).unwrap();
+        let charge=b.begin_charge(1,70).unwrap();
+        b.dispatch_charge(1).unwrap();
+        let cancel=b.begin_cancel(1).unwrap();
+        b.dispatch_cancel(1).unwrap();
+        b.cancelled(1,Frame{phase:Phase::Committed,..cancel}).unwrap();
+        b.rotate_epoch(8).unwrap();
+        // Nonces restart at 1 in the new epoch and must not replace epoch 7's.
+        let next=b.begin_charge(2,70).unwrap();
+        assert_eq!(next.token_nonce,charge.token_nonce);
+        b.dispatch_charge(2).unwrap();
+        let cancel=b.begin_cancel(2).unwrap();
+        b.dispatch_cancel(2).unwrap();
+        b.cancelled(2,Frame{phase:Phase::Committed,..cancel}).unwrap();
+        assert_eq!(b.ack_pending(),2);
+        assert_eq!(b.next_ack().unwrap().token_epoch,7);
     }
     #[test]
     fn wrong_job_and_nonce_never_settle(){

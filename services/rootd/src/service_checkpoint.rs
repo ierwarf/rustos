@@ -285,6 +285,22 @@ impl ServiceCheckpointStore {
         descendants
             .try_reserve_exact(self.records.len())
             .map_err(|_| ENOMEM)?;
+        // Keys are unique within a service, so a key-sorted index of this
+        // service's records answers each parent lookup in O(log n) instead of
+        // a full-ledger scan per record (quadratic stall of the single-threaded
+        // supervisor). It is reserved fallibly before any state changes.
+        let key_of = |index: usize| {
+            let wire = &self.records[index].wire;
+            (wire.key_hi, wire.key_lo)
+        };
+        let mut by_key = Vec::new();
+        by_key
+            .try_reserve_exact(self.records.len())
+            .map_err(|_| ENOMEM)?;
+        by_key.extend(
+            (0..self.records.len()).filter(|&index| self.records[index].service_id == service_id),
+        );
+        by_key.sort_unstable_by_key(|&index| key_of(index));
         for (index, record) in self.records.iter().enumerate() {
             if record.service_id != service_id {
                 descendants.push(false);
@@ -296,9 +312,10 @@ impl ServiceCheckpointStore {
             } else if parent == ancestor_key {
                 true
             } else {
-                let parent_index = self
-                    .find_key(service_id, parent.0, parent.1)
-                    .ok_or(ESTALE)?;
+                let parent_index = by_key
+                    .binary_search_by_key(&parent, |&candidate| key_of(candidate))
+                    .map(|slot| by_key[slot])
+                    .map_err(|_| ESTALE)?;
                 if parent_index >= index {
                     return Err(EPROTO);
                 }

@@ -155,6 +155,8 @@ pub fn running_programs_digest(programs: &[RuntimeRunningProgram]) -> u64 {
     const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
     const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
+    // SAFETY: `RuntimeRunningProgram` is `repr(C)` with no padding (asserted
+    // below) and only integer/byte-array fields, so every byte is initialised.
     let bytes = unsafe {
         std::slice::from_raw_parts(
             programs.as_ptr().cast::<u8>(),

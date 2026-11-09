@@ -218,14 +218,19 @@ pub fn install_runtime_rules(spec: &str) -> Result<usize, InstallFaultRulesError
         });
     }
     let count = replacement.len();
-    *RUNTIME_RULES.lock() = replacement;
+    // Swap under the lock but free the old campaign after releasing it: the
+    // deallocation may re-enter an allocator path that consults `should_fail`,
+    // which would self-deadlock on this non-reentrant spin lock.
+    let previous = core::mem::replace(&mut *RUNTIME_RULES.lock(), replacement);
     RUNTIME_ENABLED.store(count != 0, Ordering::Release);
+    drop(previous);
     Ok(count)
 }
 
 pub fn clear_runtime_rules() {
-    RUNTIME_RULES.lock().clear();
+    let previous = core::mem::take(&mut *RUNTIME_RULES.lock());
     RUNTIME_ENABLED.store(false, Ordering::Release);
+    drop(previous);
 }
 
 pub fn runtime_rules_enabled() -> bool {

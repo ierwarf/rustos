@@ -166,6 +166,9 @@ fn rpc_retry(request: Frame) -> Result<Frame, i32> {
     Err(last)
 }
 pub(super) fn charge_before_publish(token: u64, client_pid: u64) -> Result<Receipt, i32> {
+    // A ledger that cannot initialise must fail the charge, not start a refund
+    // worker whose `expect` on the same ledger would abort the whole service.
+    ledger()?;
     start_refund_worker();
     // Reservation and charge preparation are one local transaction. Existing
     // custody (including a queued failed accept) is NOT a new charge attempt.

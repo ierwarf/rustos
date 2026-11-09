@@ -192,6 +192,21 @@ pub unsafe extern "C" fn memcpy(dest: *mut u8, src: *const u8, len: usize) -> *m
 pub unsafe extern "C" fn memmove(dest: *mut u8, src: *const u8, len: usize) -> *mut u8 {
     if !dest.is_null() && !src.is_null() && len != 0 {
         if (dest as usize) <= (src as usize) {
+            #[cfg(target_arch = "x86_64")]
+            if len >= 32 {
+                // Ascending copy is the architectural REP MOVSB order, so it is
+                // exact for any forward overlap (dest <= src). DF is clear per
+                // the C ABI. Large moves (Vec::remove, buffer shifts) no longer
+                // pay one volatile load/store pair per byte.
+                core::arch::asm!(
+                    "rep movsb",
+                    inout("rdi") dest => _,
+                    inout("rsi") src => _,
+                    inout("rcx") len => _,
+                    options(nostack, preserves_flags),
+                );
+                return dest;
+            }
             let mut index = 0;
             while index < len {
                 let byte = ptr::read_volatile(src.add(index));

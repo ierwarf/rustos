@@ -46,8 +46,6 @@ impl<V: VmaEntry> VmaMap<V> {
         Self { map: BTreeMap::new() }
     }
 
-    // TEST-HARNESS: used by tests and the lib build; the bin only queries ranges.
-    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.map.len()
     }

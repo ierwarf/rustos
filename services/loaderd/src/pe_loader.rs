@@ -36,7 +36,7 @@ fn map_pe_segments_fd(
     .map_err(|err| pe_step_err(exec_path, "build-runtime-blob", err))?;
     patch_crt_runtime_exports(&mut modules, &runtime)
         .map_err(|err| pe_step_err(exec_path, "patch-crt-modules", err))?;
-    patch_crt_runtime_exports_for_main(&mut main, &modules, &runtime)
+    patch_crt_runtime_exports_for_main(&mut main, &runtime)
         .map_err(|err| pe_step_err(exec_path, "patch-crt-main", err))?;
     map_loaded_pe_module(prepare_handle, &main)
         .map_err(|err| pe_step_err(exec_path, "map-main-pages", err))?;
@@ -136,7 +136,9 @@ fn load_pe_image_fd(
     }
 
     let image_len = usize::try_from(align_up(size_of_image, 4096)?).map_err(|_| EOVERFLOW)?;
-    let mut image = vec![0_u8; image_len];
+    let mut image = Vec::new();
+    image.try_reserve_exact(image_len).map_err(|_| ENOMEM)?;
+    image.resize(image_len, 0);
     let header_len = usize::try_from(size_of_headers).map_err(|_| EOVERFLOW)?;
     read_exact_at(fd, 0, &mut image[..header_len])?;
 
@@ -423,6 +425,7 @@ fn collect_imports(module: &LoadedPeModule) -> Result<Vec<ImportPatch>, i32> {
         return Ok(Vec::new());
     }
     let mut imports = Vec::new();
+    let mut string_budget = PE_MAX_NAME_TABLE_BYTES;
     let mut descriptor = import_dir.rva as usize;
     let limit = descriptor
         .checked_add(import_dir.size as usize)
@@ -438,6 +441,9 @@ fn collect_imports(module: &LoadedPeModule) -> Result<Vec<ImportPatch>, i32> {
             break;
         }
         let dll_name = read_c_string_at_rva(&module.image, name_rva)?.to_vec();
+        if dll_name.len() > PE_MAX_DLL_NAME_BYTES {
+            return Err(ENOEXEC);
+        }
         let mut lookup_rva = if original_first_thunk != 0 {
             original_first_thunk
         } else {
@@ -459,6 +465,13 @@ fn collect_imports(module: &LoadedPeModule) -> Result<Vec<ImportPatch>, i32> {
                 let name_rva = (entry & 0x7fff_ffff) as u32;
                 ExportLookup::Name(read_import_name_at_rva(&module.image, name_rva)?.to_vec())
             };
+            let lookup_len = match &lookup {
+                ExportLookup::Name(name) => name.len(),
+                ExportLookup::Ordinal(_) => 0,
+            };
+            string_budget = string_budget
+                .checked_sub(dll_name.len() + lookup_len)
+                .ok_or(ENOEXEC)?;
             imports.push(ImportPatch {
                 dll_name: dll_name.clone(),
                 lookup,
@@ -497,6 +510,9 @@ fn ensure_system_dll_loaded(
         .iter()
         .find(|entry| dll_name_eq(entry.base_name.as_bytes(), canonical.as_bytes()))
         .ok_or(ENOEXEC)?;
+    if modules.len() >= PE_MAX_IMPORT_MODULES {
+        return Err(ENOEXEC);
+    }
     let fd = open_readonly(entry.path.as_str(), deadline)?;
     let load_base = *next_base;
     let loaded = load_pe_image_fd(fd, entry.path.as_str(), load_base, true);
@@ -605,6 +621,7 @@ fn build_export_cache(
     let address_of_names = read_u32(image, offset + 32);
     let address_of_name_ordinals = read_u32(image, offset + 36);
     if function_count == 0
+        || function_count > PE_MAX_EXPORTS
         || name_count > function_count
         || name_rva == 0
         || address_of_functions == 0
@@ -624,6 +641,7 @@ fn build_export_cache(
     {
         return Err(ENOEXEC);
     }
+    let mut string_budget = PE_MAX_NAME_TABLE_BYTES;
     let mut functions = Vec::with_capacity(function_count as usize);
     for index in 0..function_count {
         let table = (address_of_functions as usize)
@@ -633,7 +651,17 @@ fn build_export_cache(
             return Err(ENOEXEC);
         }
         let rva = read_u32(image, table);
-        functions.push(classify_export_target(image, directory, rva)?);
+        let target = classify_export_target(image, directory, rva)?;
+        if let ExportTarget::Forwarder { dll_name, symbol } = &target {
+            let symbol_len = match symbol {
+                ExportLookup::Name(name) => name.len(),
+                ExportLookup::Ordinal(_) => 4,
+            };
+            string_budget = string_budget
+                .checked_sub(dll_name.len() + symbol_len)
+                .ok_or(ENOEXEC)?;
+        }
+        functions.push(target);
     }
     let mut names = Vec::with_capacity(name_count as usize);
     for index in 0..name_count {
@@ -651,6 +679,7 @@ fn build_export_cache(
         if function_index >= function_count {
             return Err(ENOEXEC);
         }
+        string_budget = string_budget.checked_sub(export_name.len()).ok_or(ENOEXEC)?;
         names.push((export_name, function_index));
     }
     Ok(Some(ExportCache {
@@ -725,16 +754,10 @@ fn patch_crt_runtime_exports(
 
 fn patch_crt_runtime_exports_for_main(
     main: &mut LoadedPeModule,
-    modules: &[LoadedPeModule],
     runtime: &RustosProcSetWindowsRuntimeBrokerArgs,
 ) -> Result<(), i32> {
-    let mut scratch = modules.to_vec();
-    scratch.push(main.clone());
-    patch_crt_runtime_exports(&mut scratch, runtime)?;
-    if let Some(updated) = scratch.pop() {
-        main.image = updated.image;
-    }
-    Ok(())
+    // Each module is patched independently; no need to copy the DLL images.
+    patch_crt_runtime_exports(core::slice::from_mut(main), runtime)
 }
 
 fn patch_export_u64(module: &mut LoadedPeModule, symbol: &[u8], value: u64) -> Result<(), i32> {

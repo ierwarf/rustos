@@ -37,8 +37,14 @@ pub(crate) fn soak(
     rustos_vcpus: u8,
     isolate_probe: Option<&str>,
 ) -> Result<()> {
+    // Zero runs would "pass" having booted nothing, and the count is operator
+    // input, so bound it instead of trusting it.
+    anyhow::ensure!(
+        (1..=1000).contains(&runs),
+        "soak --runs must be in 1..=1000, got {runs}"
+    );
     let history = config.build_dir.join("kvm/debugcon-history");
-    let mut outcomes = Vec::with_capacity(runs);
+    let mut outcomes = Vec::new();
     for index in 1..=runs {
         let before = newest_archive(&history);
         let result = crate::bench::bench(config, None, None, rustos_vcpus, isolate_probe, None, None);

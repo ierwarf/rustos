@@ -139,6 +139,15 @@ const PE_MAX_IMAGE_BYTES: u64 = 128 * 1024 * 1024;
 const PE_MAX_IMPORT_MODULES: usize = 64;
 const PE_MAX_IMPORTS: usize = 65_536;
 const PE_MAX_FORWARDER_DEPTH: usize = 8;
+const ENOMEM: i32 = 12;
+/// Longest NUL-terminated name read from an untrusted PE image.
+const PE_MAX_C_STRING_BYTES: usize = 4096;
+/// Longest import DLL name that can still match a built-in system DLL alias.
+const PE_MAX_DLL_NAME_BYTES: usize = 256;
+/// Largest function table accepted from an untrusted export directory.
+const PE_MAX_EXPORTS: u32 = 65_536;
+/// Total bytes copied out of an image into name tables (imports or exports).
+const PE_MAX_NAME_TABLE_BYTES: usize = 8 * 1024 * 1024;
 const WINDOWS_DLL_REGISTRY_PATH: &str = "system/registry/compat/windows-system-dlls.txt";
 const WINDOWS_RUNTIME_STRING_LIMIT: usize = 64 * 1024;
 const WINDOWS_FILE_STRUCT_SIZE: usize = 0x30;

@@ -135,7 +135,12 @@ fetch_one() {
         curl --fail --location --retry 3 --silent --show-error \
             --output "$tmp" "$url"
     fi
-    sha256_ok "$expected" "$tmp" || die "checksum mismatch for $url"
+    # Never keep a rejected download: --continue-at would resume from the bad
+    # bytes on every later run and fail permanently.
+    sha256_ok "$expected" "$tmp" || {
+        rm -f -- "$tmp"
+        die "checksum mismatch for $url"
+    }
     mv -- "$tmp" "$file"
 }
 

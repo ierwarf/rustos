@@ -59,9 +59,11 @@ pub(super) fn evidence(log: &str, workers: u8) -> Result<HecsEvidence> {
     let mut observations = Vec::new();
     for worker in 0..u32::from(workers) {
         let start = lifecycle.iter().find(|event|
-            event.worker_id == worker && event.phase == "smp-qualification-start").unwrap();
+            event.worker_id == worker && event.phase == "smp-qualification-start")
+            .with_context(|| format!("HECS lacks start record for worker={worker}"))?;
         let finish = lifecycle.iter().find(|event|
-            event.worker_id == worker && event.phase == "smp-qualification-finish").unwrap();
+            event.worker_id == worker && event.phase == "smp-qualification-finish")
+            .with_context(|| format!("HECS lacks finish record for worker={worker}"))?;
         let exact = |name: &str| -> Result<&VerifiedMilestoneFrame> {
             let matching = frames.iter().filter(|frame|
                 frame.event == name && frame.event_arg0 as u32 == worker).collect::<Vec<_>>();

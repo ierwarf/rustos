@@ -40,6 +40,21 @@ fn process_fork_admits_libc_child_tid_contract_and_rejects_shared_state() {
 }
 
 #[test]
+fn process_fork_rejects_non_canonical_child_registers() {
+    let mut args = RustosProcForkBrokerArgs {
+        clone_flags: linux_abi::SIGCHLD,
+        ..RustosProcForkBrokerArgs::default()
+    };
+    assert!(valid_process_fork_plan_locally(&args));
+    args.registers.rsp = 0x8000_0000_0000_0000;
+    assert!(!valid_process_fork_plan_locally(&args));
+    args.stack_ptr = PROC_BROKER_USER_SPACE_BASE;
+    assert!(valid_process_fork_plan_locally(&args));
+    args.registers.rip = 0x0001_0000_0000_0000;
+    assert!(!valid_process_fork_plan_locally(&args));
+}
+
+#[test]
 fn process_fork_commits_child_tid_before_runnable_publication() {
     let source = include_str!("fork.rs");
     let fork = source

@@ -186,8 +186,11 @@ fn apply_win32_mechanism(
                 Err(error) => affinity_error_to_ntstatus(error),
             }
         }
+        // The request stamp predates the syscalld round trip, during which an
+        // application processor can be admitted and this task scheduled onto
+        // it. Judge membership against the mask as it is now, not the stamp.
         Api::RustosGetCurrentProcessorNumber => current_processor_number(
-            request.arg4,
+            kernel_hal::api::cpu::admitted_online_mask() | request.arg4,
             nucleus_core::util::lockdep::current_cpu_index(),
         ),
         _ => policy_result,

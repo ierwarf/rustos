@@ -147,6 +147,11 @@ fn wayland_snapshot_equality_uses_content_version_not_pixels() {
     assert_ne!(first, second);
 }
 
+fn test_ticket() -> super::LiveObjectTicket {
+    let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    super::LiveObjectTicket::admit(&counter, usize::MAX, None).expect("ticket")
+}
+
 fn test_display() -> wayland_server::Display<super::WaylandState> {
     wayland_server::Display::<super::WaylandState>::new().expect("display")
 }
@@ -160,7 +165,7 @@ fn test_client(
     let (server_end, _client_end) = UnixStream::pair().expect("socket pair");
     display
         .handle()
-        .insert_client(server_end, std::sync::Arc::new(super::WaylandClientState))
+        .insert_client(server_end, std::sync::Arc::new(super::WaylandClientState::default()))
         .expect("client")
         .id()
 }
@@ -287,6 +292,7 @@ fn shm_buffer(
             height,
             stride,
             has_alpha: false,
+            _ticket: test_ticket(),
         }),
     }
 }
@@ -295,9 +301,9 @@ fn shm_buffer(
 fn shm_pool_rejects_undersized_backing_and_unseekable_fd() {
     use std::os::fd::OwnedFd;
     let file = shm_file(&[0; 4]);
-    assert!(super::WaylandShmPoolState::new(OwnedFd::from(file), 8).is_err());
+    assert!(super::WaylandShmPoolState::new(OwnedFd::from(file), 8, test_ticket()).is_err());
     let (socket, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
-    assert!(super::WaylandShmPoolState::new(OwnedFd::from(socket), 4).is_err());
+    assert!(super::WaylandShmPoolState::new(OwnedFd::from(socket), 4, test_ticket()).is_err());
 }
 
 #[test]
@@ -305,7 +311,7 @@ fn shm_truncate_after_pool_admission_never_dereferences_client_pages() {
     use std::os::fd::OwnedFd;
     let file = shm_file(&[1, 2, 3, 0, 4, 5, 6, 0]);
     let pool =
-        super::WaylandShmPoolState::new(OwnedFd::from(file.try_clone().unwrap()), 8).unwrap();
+        super::WaylandShmPoolState::new(OwnedFd::from(file.try_clone().unwrap()), 8, test_ticket()).unwrap();
     let buffer = shm_buffer(Arc::new(std::sync::Mutex::new(pool)), 0, 1, 2, 4);
     let (pixels, ..) = buffer.copy_pixels().unwrap();
     assert_eq!(&**pixels, &[0xff03_0201, 0xff06_0504]);
@@ -323,7 +329,7 @@ fn shm_failed_damage_read_is_transactional_and_preserves_shared_snapshot() {
     use std::os::fd::OwnedFd;
     let file = shm_file(&[1, 2, 3, 0, 4, 5, 6, 0]);
     let pool =
-        super::WaylandShmPoolState::new(OwnedFd::from(file.try_clone().unwrap()), 8).unwrap();
+        super::WaylandShmPoolState::new(OwnedFd::from(file.try_clone().unwrap()), 8, test_ticket()).unwrap();
     let buffer = shm_buffer(Arc::new(std::sync::Mutex::new(pool)), 0, 1, 2, 4);
     let mut retained = Arc::new(vec![0xff11_1111, 0xff22_2222]);
     let presented = retained.clone();
@@ -353,7 +359,7 @@ fn shm_pool_growth_validates_backing_before_publication_and_old_buffers_survive(
     use std::os::unix::fs::FileExt;
     let file = shm_file(&[1, 2, 3, 0]);
     let pool = Arc::new(std::sync::Mutex::new(
-        super::WaylandShmPoolState::new(OwnedFd::from(file.try_clone().unwrap()), 4).unwrap(),
+        super::WaylandShmPoolState::new(OwnedFd::from(file.try_clone().unwrap()), 4, test_ticket()).unwrap(),
     ));
     let old_buffer = shm_buffer(pool.clone(), 0, 1, 1, 4);
     assert!(pool.lock().unwrap().resize(8).is_err());
@@ -376,7 +382,7 @@ fn shm_pool_destroy_and_client_fd_close_do_not_retire_live_buffers() {
     let file = shm_file(&[1, 2, 3, 0]);
     let data = super::ShmPoolData {
         shared: Arc::new(std::sync::Mutex::new(
-            super::WaylandShmPoolState::new(OwnedFd::from(file.try_clone().unwrap()), 4).unwrap(),
+            super::WaylandShmPoolState::new(OwnedFd::from(file.try_clone().unwrap()), 4, test_ticket()).unwrap(),
         )),
     };
     let weak = Arc::downgrade(&data.shared);
@@ -425,7 +431,7 @@ fn pointer_routing_requires_exact_ui_target_and_keeps_button_grab_on_original_cl
     let mut state = super::WaylandState::new(1024, 768);
     for id in 1..=2 {
         let (server, peer) = std::os::unix::net::UnixStream::pair().unwrap();
-        let client = handle.insert_client(server, Arc::new(super::WaylandClientState)).unwrap();
+        let client = handle.insert_client(server, Arc::new(super::WaylandClientState::default())).unwrap();
         peers.push(peer);
         let surface = super::SurfaceData { shared: Arc::new(std::sync::Mutex::new(super::WaylandSurfaceState {
             surface_id: id, client_id: Some(client.id()), alive: true,
@@ -454,4 +460,25 @@ fn pointer_routing_requires_exact_ui_target_and_keeps_button_grab_on_original_cl
     assert!(state.hit_test_pointer(900, 700).is_none());
     state.pointer_target = None;
     assert!(state.hit_test_pointer(100, 100).is_none());
+}
+
+#[test]
+fn live_object_tickets_enforce_limits_and_release_on_drop() {
+    use super::LiveObjectTicket;
+    use std::sync::atomic::AtomicUsize;
+    static TOTAL: AtomicUsize = AtomicUsize::new(0);
+    let per_client = Arc::new(AtomicUsize::new(0));
+    let a = LiveObjectTicket::admit(&per_client, 2, Some((&TOTAL, 3))).expect("first");
+    let b = LiveObjectTicket::admit(&per_client, 2, Some((&TOTAL, 3))).expect("second");
+    assert!(LiveObjectTicket::admit(&per_client, 2, Some((&TOTAL, 3))).is_none());
+    assert_eq!(per_client.load(Ordering::Relaxed), 2, "rejection must not leak a count");
+    // The global ceiling rejects a different client and rolls back its own count.
+    let other = Arc::new(AtomicUsize::new(0));
+    let c = LiveObjectTicket::admit(&other, 2, Some((&TOTAL, 3))).expect("third global");
+    assert!(LiveObjectTicket::admit(&other, 2, Some((&TOTAL, 3))).is_none());
+    assert_eq!(other.load(Ordering::Relaxed), 1);
+    drop((a, b, c));
+    assert_eq!(per_client.load(Ordering::Relaxed), 0);
+    assert_eq!(other.load(Ordering::Relaxed), 0);
+    assert_eq!(TOTAL.load(Ordering::Relaxed), 0);
 }

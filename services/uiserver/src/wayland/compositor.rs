@@ -48,7 +48,25 @@ impl Dispatch<wl_compositor::WlCompositor, ()> for WaylandState {
                 }
             }
             wl_compositor::Request::CreateRegion { id } => {
-                data_init.init(id, RegionData);
+                let Some(ticket) = client
+                    .get_data::<WaylandClientState>()
+                    .and_then(|counts| {
+                        LiveObjectTicket::admit(
+                            &counts.regions,
+                            MAX_WAYLAND_REGIONS_PER_CLIENT,
+                            None,
+                        )
+                    })
+                else {
+                    post_protocol_error(
+                        resource,
+                        format!(
+                            "wl_compositor.create_region: region limit {MAX_WAYLAND_REGIONS_PER_CLIENT} reached"
+                        ),
+                    );
+                    return;
+                };
+                data_init.init(id, RegionData { _ticket: ticket });
             }
             _ => {}
         }

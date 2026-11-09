@@ -25,7 +25,7 @@ use rustos_user_abi::syscall::{
     COMMERCIAL_MAX_PROCD_OP_WAIT_NAMESPACE, COMMERCIAL_MAX_PROTOCOL_ABI_VERSION,
     COMMERCIAL_MAX_PROTOCOL_PROCD, IPC_MAX_INLINE_BYTES, IPC_SERVICE_LOADERD, IPC_SERVICE_PROCD,
     LIFECYCLE_DRAIN_BROKER_ABI_VERSION, LIFECYCLE_DRAIN_MAX_EVENTS, LIFECYCLE_EVENT_EXIT,
-    LINUX_SIGACTION_SIZE, LOADER_OP_EXEC_TARGET, LOADER_REQUEST_ABI_VERSION,
+    LIFECYCLE_EVENT_THREAD_EXIT, LIFECYCLE_EVENT_THREAD_EXIT_LOST, LINUX_SIGACTION_SIZE, LOADER_OP_EXEC_TARGET, LOADER_REQUEST_ABI_VERSION,
     LOADER_SPAWN_MAX_ARG_COUNT, LOADER_SPAWN_MAX_ENV_COUNT, PROCD_ARG_BYTES, PROCD_ENV_BYTES,
     PROCD_IPC_ABI_VERSION, PROCD_OP_EXECVE, PROCD_OP_EXECVEAT, PROCD_OP_FORK,
     PROCD_OP_RT_SIGACTION, PROCD_OP_RT_SIGPROCMASK, PROCD_OP_SELECT_SIGNAL, PROCD_OP_SIGALTSTACK,
@@ -242,12 +242,32 @@ fn drain_lifecycle_events() {
         return;
     }
     for event in &events[..count as usize] {
-        if event.event == LIFECYCLE_EVENT_EXIT {
+        apply_lifecycle_event(event);
+    }
+}
+
+fn apply_lifecycle_event(event: &LifecycleEventWire) {
+    match event.event {
+        LIFECYCLE_EVENT_EXIT => {
             PROCESS_SIGNAL_POLICY.lock().remove(&event.pid);
             THREAD_SIGNAL_POLICY
                 .lock()
                 .retain(|(pid, _), _| *pid != event.pid);
         }
+        LIFECYCLE_EVENT_THREAD_EXIT => {
+            THREAD_SIGNAL_POLICY.lock().remove(&(event.pid, event.tid));
+        }
+        LIFECYCLE_EVENT_THREAD_EXIT_LOST => {
+            // The kernel dropped thread-exit events, so some dead threads are
+            // unnamed. Without a liveness probe, drop exactly the entries a
+            // live thread can recreate unchanged: the mask is re-seeded from the
+            // kernel's own copy on the thread's next request. Entries holding a
+            // sigaltstack stay until their process exits.
+            THREAD_SIGNAL_POLICY
+                .lock()
+                .retain(|_, state| state.has_sigaltstack());
+        }
+        _ => {}
     }
 }
 
@@ -699,7 +719,7 @@ fn handle_rt_sigprocmask(request: &ProcdIpcRequest, response: &mut ProcdIpcRespo
         .or_insert_with(|| ThreadSignalPolicy::initial_from_request(request));
     let old = state.signal_mask;
     if has_set {
-        let unblockable = signal_bit(SIGKILL).unwrap_or(0) | signal_bit(SIGSTOP).unwrap_or(0);
+        let unblockable = unblockable_signal_bits();
         match request.arg0 {
             SIG_BLOCK => state.signal_mask |= requested & !unblockable,
             SIG_UNBLOCK => state.signal_mask &= !requested,
@@ -851,6 +871,10 @@ fn signal_bit(signal: usize) -> Option<u64> {
     Some(1_u64 << (signal - 1))
 }
 
+fn unblockable_signal_bits() -> u64 {
+    signal_bit(SIGKILL).unwrap_or(0) | signal_bit(SIGSTOP).unwrap_or(0)
+}
+
 fn default_ignore(signal: usize) -> bool {
     matches!(signal, 17 | 18 | 23 | 28)
 }
@@ -892,29 +916,43 @@ impl Default for ThreadSignalPolicy {
 }
 
 impl ThreadSignalPolicy {
+    /// True when the entry carries state the kernel cannot re-supply.
+    fn has_sigaltstack(&self) -> bool {
+        let default = Self::default();
+        self.sigaltstack_sp != default.sigaltstack_sp
+            || self.sigaltstack_size != default.sigaltstack_size
+            || self.sigaltstack_flags != default.sigaltstack_flags
+    }
+
     fn initial_from_request(request: &ProcdIpcRequest) -> Self {
+        // The seed mask is peer-supplied; SIGKILL and SIGSTOP are never
+        // blockable, exactly as in `handle_rt_sigprocmask`.
         Self {
-            signal_mask: request.arg5,
+            signal_mask: request.arg5 & !unblockable_signal_bits(),
             ..Self::default()
         }
     }
 }
 
 fn inherit_signal_policy_after_fork(parent_pid: u64, parent_tid: u64, child_pid: u64) {
-    let parent_policy = { PROCESS_SIGNAL_POLICY.lock().get(&parent_pid).copied() };
-    if let Some(parent) = parent_policy {
-        PROCESS_SIGNAL_POLICY.lock().insert(child_pid, parent);
+    // A child pid is a fresh identity: it either inherits the parent's state or
+    // starts empty. Replace (or drop) any entry left by an earlier owner of the
+    // same pid so a missed exit event can never leak its dispositions or mask.
+    {
+        let mut processes = PROCESS_SIGNAL_POLICY.lock();
+        match processes.get(&parent_pid).copied() {
+            Some(parent) => {
+                processes.insert(child_pid, parent);
+            }
+            None => {
+                processes.remove(&child_pid);
+            }
+        }
     }
-    let parent_thread = {
-        THREAD_SIGNAL_POLICY
-            .lock()
-            .get(&(parent_pid, parent_tid))
-            .copied()
-    };
-    if let Some(parent_thread) = parent_thread {
-        THREAD_SIGNAL_POLICY
-            .lock()
-            .insert((child_pid, child_pid), parent_thread);
+    let mut threads = THREAD_SIGNAL_POLICY.lock();
+    threads.retain(|(pid, _), _| *pid != child_pid);
+    if let Some(parent_thread) = threads.get(&(parent_pid, parent_tid)).copied() {
+        threads.insert((child_pid, child_pid), parent_thread);
     }
 }
 
@@ -1026,6 +1064,74 @@ mod tests {
         let mut response = ProcdIpcResponse::default();
         handle_tgkill(&request, &mut response);
         assert_eq!(response.status, EINVAL);
+    }
+
+    #[test]
+    fn peer_seeded_thread_mask_never_blocks_sigkill_or_sigstop() {
+        let mut request = ProcdIpcRequest::default();
+        request.arg5 = u64::MAX;
+        let state = ThreadSignalPolicy::initial_from_request(&request);
+        assert_eq!(state.signal_mask & unblockable_signal_bits(), 0);
+        assert_eq!(state.signal_mask, !unblockable_signal_bits());
+    }
+
+    #[test]
+    fn fork_replaces_stale_child_pid_policy() {
+        let (parent, child) = (u64::MAX - 10, u64::MAX - 11);
+        PROCESS_SIGNAL_POLICY.lock().insert(child, ProcessSignalPolicy::default());
+        THREAD_SIGNAL_POLICY.lock().insert((child, 100), ThreadSignalPolicy::default());
+        inherit_signal_policy_after_fork(parent, parent, child);
+        assert!(!PROCESS_SIGNAL_POLICY.lock().contains_key(&child));
+        assert!(THREAD_SIGNAL_POLICY.lock().keys().all(|(pid, _)| *pid != child));
+    }
+
+    fn lifecycle_event(event: u16, pid: u64, tid: u64) -> LifecycleEventWire {
+        LifecycleEventWire {
+            event,
+            pid,
+            tid,
+            ..LifecycleEventWire::default()
+        }
+    }
+
+    #[test]
+    fn thread_exit_frees_only_that_thread() {
+        let pid = u64::MAX - 20;
+        // Entries own a sigaltstack so a concurrent loss-marker test, which
+        // prunes the shared map, cannot remove them.
+        let mut state = ThreadSignalPolicy::default();
+        state.sigaltstack_size = 0x4000;
+        {
+            let mut threads = THREAD_SIGNAL_POLICY.lock();
+            threads.insert((pid, 1), state);
+            threads.insert((pid, 2), state);
+        }
+        PROCESS_SIGNAL_POLICY.lock().insert(pid, ProcessSignalPolicy::default());
+        apply_lifecycle_event(&lifecycle_event(LIFECYCLE_EVENT_THREAD_EXIT, pid, 2));
+        let threads = THREAD_SIGNAL_POLICY.lock();
+        assert!(threads.contains_key(&(pid, 1)));
+        assert!(!threads.contains_key(&(pid, 2)));
+        assert!(PROCESS_SIGNAL_POLICY.lock().contains_key(&pid));
+        drop(threads);
+        apply_lifecycle_event(&lifecycle_event(LIFECYCLE_EVENT_EXIT, pid, 0));
+        assert!(THREAD_SIGNAL_POLICY.lock().keys().all(|(entry, _)| *entry != pid));
+    }
+
+    #[test]
+    fn lost_thread_exit_keeps_only_state_the_kernel_cannot_resupply() {
+        let pid = u64::MAX - 21;
+        let mut with_stack = ThreadSignalPolicy::default();
+        with_stack.sigaltstack_sp = 0x7000;
+        with_stack.sigaltstack_size = 0x4000;
+        {
+            let mut threads = THREAD_SIGNAL_POLICY.lock();
+            threads.insert((pid, 1), ThreadSignalPolicy::default());
+            threads.insert((pid, 2), with_stack);
+        }
+        apply_lifecycle_event(&lifecycle_event(LIFECYCLE_EVENT_THREAD_EXIT_LOST, 0, 0));
+        let threads = THREAD_SIGNAL_POLICY.lock();
+        assert!(!threads.contains_key(&(pid, 1)));
+        assert!(threads.contains_key(&(pid, 2)));
     }
 
     #[test]

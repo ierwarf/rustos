@@ -1,9 +1,7 @@
 use std::string::String;
 use std::time::Instant;
 
-use runtime_control::RuntimeClient;
-
-use super::launch::launch_program_async;
+use super::launch::{launch_program_async, terminate_session_async};
 use super::{AppState, DragTarget, VisualUpdate, WindowId};
 use crate::canvas;
 use crate::layout::{clamp_wayland_frame, maximized_window_rect, WindowChromeHit};
@@ -33,7 +31,6 @@ enum WindowHit {
 impl AppState {
     pub(crate) fn handle_input_event(
         &mut self,
-        runtime: &RuntimeClient,
         event: &InputEvent,
         mut wayland: Option<&mut WaylandCompositor>,
     ) -> Result<VisualUpdate, i32> {
@@ -65,8 +62,10 @@ impl AppState {
                 let previous_y = self.cursor_y;
                 let previous_dirty =
                     self.cursor_visual_dirty_rect(self.surface.width, self.surface.height);
-                let next_x = (self.cursor_x as i32 + event.value0).max(0) as u32;
-                let next_y = (self.cursor_y as i32 + event.value1).max(0) as u32;
+                let next_x = (i64::from(self.cursor_x) + i64::from(event.value0))
+                    .clamp(0, i64::from(u32::MAX)) as u32;
+                let next_y = (i64::from(self.cursor_y) + i64::from(event.value1))
+                    .clamp(0, i64::from(u32::MAX)) as u32;
                 self.cursor_x = next_x.min(self.display.width.saturating_sub(1));
                 self.cursor_y = next_y.min(self.display.height.saturating_sub(1));
                 self.record_cursor_motion(previous_x, previous_y);
@@ -123,7 +122,7 @@ impl AppState {
             INPUT_KIND_POINTER_BUTTON if event.code == POINTER_BUTTON_LEFT => {
                 self.left_button_down = event.action == sys::INPUT_ACTION_PRESSED;
                 if self.left_button_down {
-                    return self.handle_left_press(runtime, wayland);
+                    return self.handle_left_press(wayland);
                 }
                 if self.dragging_window.is_some() {
                     let update = self.drag_window_to_cursor(wayland.as_deref_mut());
@@ -141,7 +140,6 @@ impl AppState {
 
     fn handle_left_press(
         &mut self,
-        runtime: &RuntimeClient,
         wayland: Option<&mut WaylandCompositor>,
     ) -> Result<VisualUpdate, i32> {
         // Home-screen launchers sit under the windows, so a visible window
@@ -166,7 +164,7 @@ impl AppState {
         }
 
         if let Some(hit) = self.window_under_cursor() {
-            return self.handle_window_hit(runtime, hit, wayland);
+            return self.handle_window_hit(hit, wayland);
         }
 
         Ok(VisualUpdate::default())
@@ -239,7 +237,6 @@ impl AppState {
 
     fn handle_window_hit(
         &mut self,
-        runtime: &RuntimeClient,
         hit: WindowHit,
         mut wayland: Option<&mut WaylandCompositor>,
     ) -> Result<VisualUpdate, i32> {
@@ -254,9 +251,7 @@ impl AppState {
                     }
                 }
                 match chrome_hit {
-                    WindowChromeHit::Close => {
-                        self.close_console_window(runtime, session_handle, wayland)
-                    }
+                    WindowChromeHit::Close => self.close_console_window(session_handle, wayland),
                     WindowChromeHit::Minimize => {
                         self.minimize_console_window(session_handle, wayland)
                     }
@@ -428,7 +423,6 @@ impl AppState {
 
     fn close_console_window(
         &mut self,
-        runtime: &RuntimeClient,
         session_handle: ConsoleSessionHandle,
         wayland: Option<&mut WaylandCompositor>,
     ) -> Result<VisualUpdate, i32> {
@@ -446,7 +440,9 @@ impl AppState {
             self.pending_console_focus = None;
         }
         self.recover_focus_after_wayland_change(wayland)?;
-        let _ = runtime.request_terminate_session(session_handle);
+        // The runtimed RPC may wait out its 5 s I/O deadline, longer than the
+        // UI phase watchdog tolerates, so it never runs on the input phase.
+        terminate_session_async(session_handle);
         if self.dragging_window == Some(DragTarget::Console(session_handle)) {
             self.dragging_window = None;
         }

@@ -474,9 +474,10 @@ impl PciDevice {
         for _ in 0..48 {
             if offset < 0x40
                 || offset & 0x3 != 0
-                || usize::from(offset)
-                    .checked_add(PCI_MSIX_CAPABILITY_BYTES)
-                    .is_none_or(|end| end > self.config_size() as usize)
+                // Config accessors take a `u8` offset, so the whole capability
+                // must sit inside the first 256 bytes even under ECAM; an offset
+                // such as 0xfc would otherwise wrap `offset + 4` below.
+                || usize::from(offset) + PCI_MSIX_CAPABILITY_BYTES > 256
             {
                 return None;
             }

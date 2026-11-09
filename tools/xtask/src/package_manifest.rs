@@ -264,6 +264,19 @@ fn validate_manifests(manifests: &[PackageManifest]) -> Result<()> {
                 manifest.manifest_path.display()
             );
         }
+        // The id becomes a file name (`<id>.desktop`) and a tab-separated
+        // registry field, so it must be a plain token.
+        if !manifest
+            .id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+        {
+            bail!(
+                "package id {:?} in {} must contain only ASCII letters, digits, '-' and '_'",
+                manifest.id,
+                manifest.manifest_path.display()
+            );
+        }
         if !ids.insert(manifest.id.as_str()) {
             bail!("duplicate package id: {}", manifest.id);
         }
@@ -283,6 +296,23 @@ fn validate_manifests(manifests: &[PackageManifest]) -> Result<()> {
                 previous.display(),
                 manifest.manifest_path.display()
             );
+        }
+
+        // Package-relative inputs must stay inside the package: they are
+        // joined onto `package_root` and later read, copied or compiled.
+        for source in manifest
+            .build
+            .source
+            .iter()
+            .chain(manifest.build.extra_sources.iter())
+        {
+            if !is_normal_relative_install_path(source) {
+                bail!(
+                    "package {} has build source {} outside its package directory",
+                    manifest.id,
+                    source
+                );
+            }
         }
 
         match manifest.build.builder {
@@ -320,21 +350,33 @@ fn validate_manifests(manifests: &[PackageManifest]) -> Result<()> {
             }
             BuilderKind::PrebuiltApp => {
                 if manifest.kind != PackageKind::App {
-                    bail!("package {} uses prebuilt-app, which is only for kind = \"app\"", manifest.id);
+                    bail!(
+                        "package {} uses prebuilt-app, which is only for kind = \"app\"",
+                        manifest.id
+                    );
                 }
                 if manifest.install.layout != InstallLayout::Directory {
-                    bail!("package {} prebuilt-app must use install.layout = \"directory\"", manifest.id);
+                    bail!(
+                        "package {} prebuilt-app must use install.layout = \"directory\"",
+                        manifest.id
+                    );
                 }
                 let source = manifest.build.source.as_deref().unwrap_or_default();
                 if !is_normal_relative_install_path(source) {
-                    bail!("package {} prebuilt-app needs a package-relative build.source", manifest.id);
+                    bail!(
+                        "package {} prebuilt-app needs a package-relative build.source",
+                        manifest.id
+                    );
                 }
                 let prefix = format!("{}/", manifest.install.path);
                 for entry in &manifest.desktop.entries {
                     if !entry.image.as_deref().is_some_and(|image| {
                         is_normal_relative_install_path(image) && image.starts_with(&prefix)
                     }) {
-                        bail!("package {} prebuilt-app desktop image must name a file inside its bundle", manifest.id);
+                        bail!(
+                            "package {} prebuilt-app desktop image must name a file inside its bundle",
+                            manifest.id
+                        );
                     }
                 }
             }
@@ -627,6 +669,18 @@ mod tests {
     }
 
     #[test]
+    fn build_sources_cannot_escape_the_package() {
+        for source in ["../x", "/etc/passwd", "a/../../x"] {
+            let text =
+                DATA_MANIFEST.replace("source = \"bundle\"", &format!("source = \"{source}\""));
+            let err = validate_at(&text, "assets/ui/RUSTOS.package.toml").unwrap_err();
+            assert!(err.contains("outside its package directory"), "{err}");
+        }
+        let text = DATA_MANIFEST.replace("[install]", "extra_sources = [\"../x\"]\n[install]");
+        assert!(validate_at(&text, "assets/ui/RUSTOS.package.toml").is_err());
+    }
+
+    #[test]
     fn install_paths_must_be_normal_relative_components() {
         assert!(is_normal_relative_install_path("services/initd/initd.elf"));
         assert!(!is_normal_relative_install_path(""));
@@ -690,7 +744,10 @@ mod tests {
             text.replace("kind = \"app\"", "kind = \"data\""),
             text.replace("layout = \"directory\"", "layout = \"file\""),
             text.replace("source = \"bundle\"", "source = \"../outside\""),
-            text.replace("image = \"apps/chrome/chrome\"", "image = \"apps/other/other.elf\""),
+            text.replace(
+                "image = \"apps/chrome/chrome\"",
+                "image = \"apps/other/other.elf\"",
+            ),
         ] {
             assert!(validate_at(&invalid, "apps/chrome/RUSTOS.package.toml").is_err());
         }

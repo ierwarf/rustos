@@ -286,6 +286,33 @@ fn process_shared_region_quota_is_bounded_until_reclaim_completes() {
 }
 
 #[test]
+fn reclaim_queue_is_fifo_across_head_wraparound() {
+    with_isolated_ipc_test(|| {
+        // Cycle more objects than the queue holds so `head` wraps, and keep
+        // two in flight so a pop never empties the queue between pushes.
+        let mut pending = std::collections::VecDeque::new();
+        for round in 0..(super::MAX_SHARED_REGION_OBJECTS * 2 + 3) {
+            let region = create_shared_region(1 + round % 7).expect("create region");
+            pending.push_back(region);
+            if pending.len() > 2 {
+                release_shared_region(pending.pop_front().unwrap());
+                assert_eq!(service_deferred_shared_region_reclaims(64), 1);
+            }
+        }
+        for region in pending {
+            release_shared_region(region);
+        }
+        let mut reclaimed = 0;
+        while service_deferred_shared_region_reclaims(64) != 0 {
+            reclaimed += 1;
+        }
+        assert_eq!(reclaimed, 2);
+        assert_eq!(super::SHARED_REGION_ADMITTED.load(Ordering::Acquire), 0);
+        assert_eq!(super::SHARED_REGION_BYTES_ADMITTED.load(Ordering::Acquire), 0);
+    });
+}
+
+#[test]
 fn named_ports_retain_port_name() {
     with_isolated_ipc_test(|| {
         let mut name = crate::ipc_core::PortName::empty();

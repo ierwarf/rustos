@@ -12,6 +12,16 @@
 
 use super::*;
 
+struct ControlDrainGuard;
+
+impl Drop for ControlDrainGuard {
+    fn drop(&mut self) {
+        // ORDERING: Release publishes every acknowledgement and slot release
+        // before another CPU may become the control-record owner.
+        GUI_DVM_CONTROL_DRAIN.store(false, Ordering::Release);
+    }
+}
+
 /// Handle the DVM's one fixed return record. A guest cannot free a writing
 /// slot, invent a generation, or advance the sequence more than once without
 /// a host acknowledgement. Unsupported focus changes fail closed because the
@@ -41,6 +51,21 @@ pub(super) fn drain_dvm_control() {
     if !GUI_DVM_CONTROL_IRQ_PENDING.swap(false, Ordering::AcqRel) {
         return;
     }
+    // The control record is single-consumer: two concurrent drains would both
+    // validate one release against its pre-free slot state, and the loser would
+    // then see the freed slot and revoke the transport as an unauthorized
+    // release. ORDERING: AcqRel is the admission edge; Acquire on failure
+    // observes the owner's progress. A loser re-arms the pending bit so a
+    // record that arrived after the owner read the sequence is not lost.
+    if GUI_DVM_CONTROL_DRAIN
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        // ORDERING: Release re-arms the pending bit for the next drainer.
+        GUI_DVM_CONTROL_IRQ_PENDING.store(true, Ordering::Release);
+        return;
+    }
+    let _control_drain = ControlDrainGuard;
     let expected = GUI_DVM_EXPECTED_INVITATION.load(Ordering::Acquire);
     let ready_ack = read_u64(DVM_GUI_SURFACE_POOL_READY_ACK_OFFSET);
     if expected != 0 && expected == ready_ack {

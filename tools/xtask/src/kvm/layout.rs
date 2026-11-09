@@ -34,6 +34,16 @@ fn prepare_layout(config: &Config, options: &SmokeOptions) -> Result<KvmLayout> 
     }
 
     let run_dir = config.build_dir.join("kvm");
+    // Every QEMU option below embeds paths under these roots; a ',' would split
+    // the option value and let path text inject QEMU properties.
+    for path in [&run_dir, &config.boot_disk_image, &config.ovmf_path] {
+        if path.to_string_lossy().contains(',') {
+            bail!(
+                "KVM path contains an unsupported QEMU option separator: {}",
+                path.display()
+            );
+        }
+    }
     fs::create_dir_all(&run_dir)?;
     fs::set_permissions(&run_dir, std::fs::Permissions::from_mode(0o700)).with_context(|| {
         format!(

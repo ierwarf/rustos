@@ -591,6 +591,7 @@ pub enum BootInfoValidationError {
     InvalidBootVolume,
     InvalidReservedStorageBootstrap,
     InvalidEarlySystemImage,
+    InvalidAcpiRsdp,
 }
 
 impl BootInfoValidationError {
@@ -608,6 +609,7 @@ impl BootInfoValidationError {
                 "boot info retired storage bootstrap fields are nonzero"
             }
             Self::InvalidEarlySystemImage => "boot info early system image is invalid",
+            Self::InvalidAcpiRsdp => "boot info ACPI RSDP length exceeds the protocol copy",
         }
     }
 }
@@ -624,6 +626,11 @@ impl BootInfo {
             return Err(BootInfoValidationError::InvalidRngSeed);
         }
 
+        // The consumer slices `acpi_rsdp[..acpi_rsdp_len]`; an oversized length
+        // would otherwise be a ring0 panic on loader-supplied data.
+        if self.acpi_rsdp_len as usize > ACPI_RSDP_MAX_BYTES {
+            return Err(BootInfoValidationError::InvalidAcpiRsdp);
+        }
         self.framebuffer.validate()?;
         self.boot_volume.validate()?;
         if self._reserved_storage_bootstrap != [0; 2] {
@@ -743,6 +750,22 @@ mod tests {
     #[test]
     fn validates_final_boot_info() {
         assert!(valid_boot_info().validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_out_of_range_acpi_rsdp_length() {
+        let mut info = valid_boot_info();
+        for len in [0, 1, 20, 36] {
+            info.acpi_rsdp_len = len;
+            assert!(info.validate_staged().is_ok());
+        }
+        for len in [37, u32::MAX] {
+            info.acpi_rsdp_len = len;
+            assert_eq!(
+                info.validate_staged(),
+                Err(BootInfoValidationError::InvalidAcpiRsdp)
+            );
+        }
     }
 
     #[test]

@@ -17,12 +17,18 @@ const MAX_LAUNCHES_IN_FLIGHT: usize = 4;
 /// Tracks which programs have a launch request in flight.
 pub(super) struct LaunchGate {
     in_flight: Mutex<Vec<String>>,
+    capacity: usize,
 }
 
 impl LaunchGate {
     pub(super) const fn new() -> Self {
+        Self::with_capacity(MAX_LAUNCHES_IN_FLIGHT)
+    }
+
+    pub(super) const fn with_capacity(capacity: usize) -> Self {
         Self {
             in_flight: Mutex::new(Vec::new()),
+            capacity,
         }
     }
 
@@ -33,7 +39,7 @@ impl LaunchGate {
             .in_flight
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if in_flight.len() >= MAX_LAUNCHES_IN_FLIGHT || in_flight.iter().any(|id| id == program) {
+        if in_flight.len() >= self.capacity || in_flight.iter().any(|id| id == program) {
             return false;
         }
         in_flight.push(program.to_owned());
@@ -74,6 +80,54 @@ pub(super) fn launch_program_async(desktop_file_id: String) {
         // Losing one launch is recoverable; ending the compositor is not.
         LAUNCH_GATE.finish(&desktop_file_id);
         diag_line("uiserver: launch thread could not be spawned; request dropped");
+    }
+}
+
+/// Terminate requests that may be in flight at once. Console sessions are
+/// capped far below this, so a request is only refused for a handle that is
+/// already being terminated.
+const MAX_TERMINATES_IN_FLIGHT: usize = 16;
+const TERMINATE_ATTEMPTS: u32 = 3;
+const TERMINATE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+
+static TERMINATE_GATE: LaunchGate = LaunchGate::with_capacity(MAX_TERMINATES_IN_FLIGHT);
+
+/// Ask runtimed to end a console session without blocking the UI thread. The
+/// RPC may wait out its full I/O deadline, which exceeds the UI phase
+/// watchdog; the window is already gone from the UI by the time this runs.
+pub(super) fn terminate_session_async(session_handle: u64) {
+    let key = format!("terminate:{session_handle}");
+    if !TERMINATE_GATE.try_begin(&key) {
+        diag_line("uiserver: terminate request ignored: already terminating or too many in flight");
+        return;
+    }
+    let for_thread = key.clone();
+    let spawned = sys::spawn_ui_thread(
+        sys::UiThreadRole::Background,
+        "uiserver-session-terminate",
+        move || {
+            let mut result = Err(libc::EIO);
+            for attempt in 0..TERMINATE_ATTEMPTS {
+                if attempt != 0 {
+                    std::thread::sleep(TERMINATE_RETRY_DELAY);
+                }
+                result = RuntimeClient::open_default()
+                    .and_then(|runtime| runtime.request_terminate_session(session_handle));
+                if result.is_ok() {
+                    break;
+                }
+            }
+            if let Err(errno) = result {
+                diag_line(format!(
+                    "uiserver: terminate session {session_handle} failed errno={errno}"
+                ));
+            }
+            TERMINATE_GATE.finish(for_thread.as_str());
+        },
+    );
+    if spawned.is_err() {
+        TERMINATE_GATE.finish(&key);
+        diag_line("uiserver: terminate thread could not be spawned; request dropped");
     }
 }
 

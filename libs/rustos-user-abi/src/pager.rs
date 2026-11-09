@@ -577,6 +577,7 @@ impl PagerFaultReplyWire {
             && self.action == PAGER_ACTION_MAP_ZEROED
             && self.frame_capability == dispatch.zeroed_frame_capability
             && self.frame_rights & !dispatch.granted_frame_rights == 0
+            && self.map_run_pages <= dispatch.map_run_pages_offered as u64
             && self.is_canonical_for(dispatch.request)
     }
 }
@@ -705,6 +706,24 @@ mod tests {
             }
             .is_canonical_zeroed_for(PagerFaultDispatchWire {
                 granted_frame_rights: VM_PROT_WRITE,
+                ..dispatch
+            })
+        );
+        // A reply may never ask for a longer run than the dispatch offered.
+        assert!(
+            !PagerFaultReplyWire {
+                map_run_pages: 2,
+                ..reply
+            }
+            .is_canonical_zeroed_for(dispatch)
+        );
+        assert!(
+            PagerFaultReplyWire {
+                map_run_pages: 2,
+                ..reply
+            }
+            .is_canonical_zeroed_for(PagerFaultDispatchWire {
+                map_run_pages_offered: 2,
                 ..dispatch
             })
         );

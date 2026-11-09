@@ -1223,6 +1223,12 @@ fn composite_wayland_client(
             .ok_or(GpuSceneError::InvalidLayer)?;
         for (destination, source) in destination.iter_mut().zip(source) {
             let alpha = *source >> 24;
+            if alpha == 0xff {
+                // Opaque client pixels (the common case) replace the chrome
+                // pre-fill; the blend below reduces to the colour channels.
+                *destination = *source & 0x00ff_ffff;
+                continue;
+            }
             let inverse = 255_u32.saturating_sub(alpha);
             let source_b = *source & 0xff;
             let source_g = (*source >> 8) & 0xff;

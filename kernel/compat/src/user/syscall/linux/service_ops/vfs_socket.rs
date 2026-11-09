@@ -1208,7 +1208,42 @@ pub(super) fn service_deferred_netd_refs() -> usize {
     drain_pending_netd_refs()
 }
 
+/// Releases the single-drainer claim on every exit path.
+struct NetdRefDrainClaim;
+
+impl Drop for NetdRefDrainClaim {
+    fn drop(&mut self) {
+        // ORDERING: release publishes the drainer's queue mutations to the
+        // next claimant, which acquires the flag before touching the queue.
+        NETD_REF_DRAINING.store(false, core::sync::atomic::Ordering::Release);
+    }
+}
+
+/// At most one drainer owns a popped replay item at a time. The ring keeps one
+/// spare slot beyond the enqueue cap precisely so a single popped item can be
+/// pushed back to the front after producers refilled the queue; a second
+/// concurrent drainer would break that bound and the push-back assertions.
+static NETD_REF_DRAINING: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
 fn drain_pending_netd_refs() -> usize {
+    // ORDERING: acquire pairs with the claim release above, so the next
+    // drainer observes the queue exactly as the previous one left it.
+    if NETD_REF_DRAINING
+        .compare_exchange(
+            false,
+            true,
+            // ORDERING: acquire pairs with the drop-time release above.
+            core::sync::atomic::Ordering::Acquire,
+            // ORDERING: a lost claim touches nothing the winner published and
+            // returns immediately, so the failure load needs no ordering.
+            core::sync::atomic::Ordering::Relaxed,
+        )
+        .is_err()
+    {
+        return 0;
+    }
+    let _claim = NetdRefDrainClaim;
     let mut attempted = 0usize;
     for _ in 0..NETD_MAINTENANCE_ATTEMPTS_PER_CALL {
         let Some(pending) = PENDING_NETD_REFS.lock().pop() else {

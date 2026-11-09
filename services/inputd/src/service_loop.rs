@@ -91,25 +91,30 @@ pub(super) fn serve(endpoint: u64) {
                 &mut sender_tid,
             )
         } else if request_size == size_of::<InputdPointerSurfaceRequest>() {
-            debug_line("inputd: pointer surface request received");
             let request = read_unaligned::<InputdPointerSurfaceRequest>(&request_buf);
             let mut response = InputdIpcResponse {
                 version: INPUTD_IPC_ABI_VERSION,
                 op: request.op,
                 ..InputdIpcResponse::default()
             };
-            response.status = {
-                let mut queue = lock_input_queue(&queue);
-                if rustos_svc_runtime::ipc::validate_service_owner(IPC_SERVICE_UISERVER, sender_pid)
-                    < 0
-                {
-                    libc::EACCES
-                } else {
+            // Authenticate before taking the queue lock or emitting any
+            // diagnostic: an unauthorized sender must cost neither.
+            response.status = if rustos_svc_runtime::ipc::validate_service_owner(
+                IPC_SERVICE_UISERVER,
+                sender_pid,
+            ) < 0
+            {
+                libc::EACCES
+            } else {
+                debug_line("inputd: pointer surface request received");
+                let status = {
+                    let mut queue = lock_input_queue(&queue);
                     dispatch_pointer_surface_request(&request, &mut queue)
-                }
+                };
+                debug_line("inputd: pointer surface state applied");
+                status
             };
             response.approved_len = (response.status == 0) as u64;
-            debug_line("inputd: pointer surface state applied");
             log_dvm_ingress_observations(&queue, &dvm_ingress_log_state);
             reply_recv_input_request(
                 endpoint,

@@ -222,6 +222,9 @@ impl NetState {
             let after = match (inet.as_mut(), socket) {
                 (Some(stack), Some(socket)) => {
                     inet_datagram::stage_socket(stack, socket);
+                    if let InetTransport::Tcp(handle) = socket.transport {
+                        settle_established_timeout(stack.sockets.get_mut::<tcp::Socket>(handle));
+                    }
                     Some(Readiness::Inet(inet_datagram::readiness(stack, socket)))
                 }
                 _ => None,

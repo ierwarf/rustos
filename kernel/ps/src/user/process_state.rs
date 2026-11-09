@@ -475,6 +475,18 @@ impl UserProcessState {
         overlaps
     }
 
+    /// Whether any part of `[start, end)` is a shared memfd mapping that was
+    /// admitted read-only. Such a range may not gain write permission: the
+    /// writable admission is where `F_SEAL_WRITE` and the writable-mapping
+    /// count are enforced, so a later `mprotect(PROT_WRITE)` would bypass both.
+    pub fn shared_memfd_range_forbids_write_upgrade(&self, start: u64, end: u64) -> bool {
+        self.shared_memfd_mappings
+            .iter()
+            .any(|mapping| {
+                end > mapping.start && start < mapping.end() && !mapping.hold.is_writable()
+            })
+    }
+
     pub fn release_shared_memfd_mappings_in_range(&mut self, start: u64, end: u64) {
         // Every munmap/mprotect-style release lands here; most ranges touch no
         // shared mapping, so do not rebuild (and reallocate) the list for them.
@@ -681,10 +693,12 @@ impl UserProcessState {
                         .checked_add(address - mapping.start)
                         .ok_or(AddressSpaceError::AddressOverflow)?,
                 };
-                assert!(
-                    resolved.replace(key).is_none(),
-                    "shared futex invariant: overlapping stable backing mappings"
-                );
+                // Overlapping stable backings would make the rendezvous key
+                // ambiguous. Refuse the wait/wake instead of panicking the
+                // kernel on a process-visible mapping state.
+                if resolved.replace(key).is_some() {
+                    return Err(AddressSpaceError::AlreadyMapped);
+                }
             }
         }
         for mapping in &self.shared_region_mappings {
@@ -696,10 +710,12 @@ impl UserProcessState {
                         .checked_add(address - mapping.start)
                         .ok_or(AddressSpaceError::AddressOverflow)?,
                 };
-                assert!(
-                    resolved.replace(key).is_none(),
-                    "shared futex invariant: overlapping stable backing mappings"
-                );
+                // Overlapping stable backings would make the rendezvous key
+                // ambiguous. Refuse the wait/wake instead of panicking the
+                // kernel on a process-visible mapping state.
+                if resolved.replace(key).is_some() {
+                    return Err(AddressSpaceError::AlreadyMapped);
+                }
             }
         }
         resolved.ok_or(AddressSpaceError::NotMapped)

@@ -1178,8 +1178,9 @@ pub const PROC_BROKER_PREPARE_FLAG_EXEC_TICKET: u32 = 1 << 0;
 /// Mutually exclusive with EXEC_TICKET: exec never changes process membership.
 pub const PROC_BROKER_PREPARE_FLAG_JOB_HANDLE: u32 = 1 << 1;
 /// Lifecycle fan-out is an independent contract. Do not couple its wire
-/// version to process prepare/commit ABI revisions.
-pub const LIFECYCLE_DRAIN_BROKER_ABI_VERSION: u16 = 1;
+/// version to process prepare/commit ABI revisions. Version 2 moved
+/// `exit_status` ahead of the pids and appended `tid` to `LifecycleEventWire`.
+pub const LIFECYCLE_DRAIN_BROKER_ABI_VERSION: u16 = 2;
 /// Root-supervisor termination is versioned independently from every other
 /// process broker operation.
 pub const ROOTD_TERMINATE_BROKER_ABI_VERSION: u16 = 1;
@@ -1339,6 +1340,14 @@ pub const LIFECYCLE_DRAIN_MAX_EVENTS: usize = 32;
 pub const LIFECYCLE_EVENT_EXIT: u16 = 1;
 pub const LIFECYCLE_EVENT_FORK: u16 = 2;
 pub const LIFECYCLE_EVENT_EXEC: u16 = 3;
+/// A non-last thread of `pid` exited; `tid` names it. Delivered to procd only,
+/// on a queue separate from process events so thread churn can never overflow
+/// the process-lifecycle queue.
+pub const LIFECYCLE_EVENT_THREAD_EXIT: u16 = 4;
+/// One or more `LIFECYCLE_EVENT_THREAD_EXIT` events were dropped because the
+/// consumer's thread-exit queue was full. Carries no pid/tid; the consumer
+/// must reclaim whatever per-thread state it can prove stale on its own.
+pub const LIFECYCLE_EVENT_THREAD_EXIT_LOST: u16 = 5;
 
 pub const COMMERCIAL_MAX_PROTOCOL_ABI_VERSION: u16 = 1;
 pub const COMMERCIAL_MAX_PROTOCOL_NAME_CAPACITY: usize = 32;
@@ -2143,12 +2152,13 @@ impl Default for InputdReadResponse {
 pub struct LifecycleEventWire {
     pub event: u16,
     pub reserved0: u16,
-    pub reserved1: u32,
+    pub exit_status: i32,
     pub pid: u64,
     pub parent_pid: u64,
-    pub exit_status: i32,
-    pub reserved2: u32,
+    pub tid: u64,
 }
+
+const _: () = assert!(core::mem::size_of::<LifecycleEventWire>() == 32);
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

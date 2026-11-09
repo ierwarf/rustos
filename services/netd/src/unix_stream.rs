@@ -85,6 +85,20 @@ pub(super) fn handle_recv(request: &NetdIpcRequest, response: &mut NetdIpcRespon
     if request.op == SYSCALL_OFFLOAD_OP_LINUX_RECVMSG {
         return handle_recvmsg(request, response);
     }
+    if request_msg_flags(request) & libc::MSG_PEEK as u64 != 0 {
+        let requested = usize::try_from(request.arg2).unwrap_or(usize::MAX);
+        let limit = requested.min(response.payload.len() - SOCKET_CONTROL_BUFFER_CAPACITY);
+        let state = lock_net_state();
+        return match peek_connected_bytes(&state, request.socket_token, &mut response.payload[..limit]) {
+            Ok((read, _)) => {
+                response.value = read as u64;
+                response.payload_len = read as u32;
+                response.reserved0 = 0;
+                0
+            }
+            Err(errno) => errno,
+        };
+    }
     let requested = if request.op == SYSCALL_OFFLOAD_OP_LINUX_RECVMSG {
         request.payload_len as usize
     } else {
@@ -116,6 +130,30 @@ pub(super) fn recvmsg_in_state(
     request: &NetdIpcRequest,
     response: &mut NetdIpcResponse,
 ) -> i32 {
+    if request_msg_flags(request) & libc::MSG_PEEK as u64 != 0 {
+        let requested = request.payload_len as usize;
+        let room = response.payload.len() - NETD_RECVMSG_PAYLOAD_HEADER_SIZE;
+        let data_end = NETD_RECVMSG_PAYLOAD_HEADER_SIZE + requested.min(room);
+        return match peek_connected_bytes(
+            state,
+            request.socket_token,
+            &mut response.payload[NETD_RECVMSG_PAYLOAD_HEADER_SIZE..data_end],
+        ) {
+            Ok((read, control_present)) => {
+                // Ancillary custody (SCM_RIGHTS) cannot be duplicated by a
+                // peek; report it as truncated and leave it queued.
+                let flags = if control_present { libc::MSG_CTRUNC as u32 } else { 0 };
+                response.payload[0..4].copy_from_slice(&(read as u32).to_ne_bytes());
+                response.payload[4..8].copy_from_slice(&0_u32.to_ne_bytes());
+                response.payload[8..12].copy_from_slice(&flags.to_ne_bytes());
+                response.payload[12..16].copy_from_slice(&0_u32.to_ne_bytes());
+                response.payload_len = (NETD_RECVMSG_PAYLOAD_HEADER_SIZE + read) as u32;
+                response.value = read as u64;
+                0
+            }
+            Err(errno) => errno,
+        };
+    }
     let Some(socket) = state.sockets.get_mut(&request.socket_token) else {
         return libc::EBADF;
     };
@@ -370,6 +408,40 @@ pub(super) fn recv_connected_bytes(
         control,
         discarded,
     })
+}
+
+/// `MSG_PEEK`: copies queued stream bytes without dequeuing anything. Returns
+/// the byte count and whether any peeked segment carries ancillary data.
+pub(super) fn peek_connected_bytes(
+    state: &NetState,
+    token: u64,
+    dest: &mut [u8],
+) -> Result<(usize, bool), i32> {
+    let socket = state.sockets.get(&token).ok_or(libc::EBADF)?;
+    let UnixSocketState::Connected(connected) = &socket.state else {
+        return Err(libc::ENOTCONN);
+    };
+    if connected.incoming_bytes == 0 {
+        if connected.peer_closed || connected.peer_write_closed {
+            return Ok((0, false));
+        }
+        return Err(libc::EAGAIN);
+    }
+    let mut read = 0usize;
+    let mut control_present = false;
+    for segment in &connected.incoming {
+        if read == dest.len() {
+            break;
+        }
+        control_present |= !segment.control.is_empty();
+        let count = (dest.len() - read).min(segment.bytes.len());
+        let (first, second) = segment.bytes.as_slices();
+        let first_len = count.min(first.len());
+        dest[read..read + first_len].copy_from_slice(&first[..first_len]);
+        dest[read + first_len..read + count].copy_from_slice(&second[..count - first_len]);
+        read += count;
+    }
+    Ok((read, control_present))
 }
 
 pub(super) fn pending_recvmsg_control_len(

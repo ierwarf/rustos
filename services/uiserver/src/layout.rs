@@ -483,7 +483,10 @@ pub(crate) fn clamp_wayland_frame(frame: Rect, display_width: u32, display_heigh
     let max_x = bounds
         .x
         .saturating_add(bounds.width)
-        .saturating_sub(min_visible);
+        .saturating_sub(min_visible)
+        // A desktop narrower than the visible-title requirement would invert
+        // the range, and `clamp` panics when min > max.
+        .max(min_x);
 
     // Vertical: title bar must stay below the topbar and above the dock
     // (otherwise the window can't be grabbed back). The body may extend
@@ -493,7 +496,8 @@ pub(crate) fn clamp_wayland_frame(frame: Rect, display_width: u32, display_heigh
     let max_y = bounds
         .y
         .saturating_add(bounds.height)
-        .saturating_sub(title_strip.min(outer_h));
+        .saturating_sub(title_strip.min(outer_h))
+        .max(min_y);
 
     Rect {
         x: frame.x.clamp(min_x, max_x),
@@ -550,6 +554,29 @@ mod tests {
         // the third slot, not at the origin.
         let third = default_console_window_rect(2560, 1440, 2);
         assert_eq!((third.x, third.y), cascade_origin(bounds, 2));
+    }
+
+    #[test]
+    fn clamping_a_wayland_frame_on_a_tiny_desktop_never_panics() {
+        for (width, height) in [
+            (0_u32, 0_u32),
+            (60, 100),
+            (80, 150),
+            (200, 160),
+            (1280, 720),
+        ] {
+            let frame = clamp_wayland_frame(
+                Rect {
+                    x: usize::MAX / 2,
+                    y: usize::MAX / 2,
+                    width: 800,
+                    height: 600,
+                },
+                width,
+                height,
+            );
+            assert!(frame.width >= 1 && frame.height >= 1);
+        }
     }
 
     fn home_cells(width: u32, height: u32, count: usize) -> Vec<HomeCell> {

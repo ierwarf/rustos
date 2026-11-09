@@ -8,7 +8,14 @@ use super::{EIO, ENOENT, EOVERFLOW};
 
 pub(super) fn file_len(path: &str) -> Result<Option<u64>, i32> {
     let mut out = 0_u64;
-    let mut args = request(path, EARLY_SYSTEM_BROKER_OP_INFO)?;
+    // A path the broker cannot even name (empty, or longer than its capacity)
+    // is not a boot-image entry; it belongs to the volume, so it must not fail
+    // the lookup with EOVERFLOW before the FAT namespace is consulted.
+    let mut args = match request(path, EARLY_SYSTEM_BROKER_OP_INFO) {
+        Ok(args) => args,
+        Err(EOVERFLOW) => return Ok(None),
+        Err(errno) => return Err(errno),
+    };
     args.out_file_len_ptr = (&mut out as *mut u64) as u64;
     match syscall(&args) {
         Ok(0) if out != 0 => Ok(Some(out)),

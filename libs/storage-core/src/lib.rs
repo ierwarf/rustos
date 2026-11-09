@@ -244,7 +244,7 @@ pub fn detect_partitions<D: BlockDevice>(dev: &mut D) -> IoResult<Vec<PartitionI
         return Err(StorageError::NotPresent);
     }
 
-    let mut block0 = vec![0_u8; block_size];
+    let mut block0 = zeroed_buffer(block_size)?;
     dev.read_blocks(0, &mut block0)?;
     let mbr = &block0[..512];
 
@@ -289,7 +289,7 @@ pub fn detect_fat_boot_partition<D: BlockDevice>(dev: &mut D) -> IoResult<Option
         return Err(StorageError::NotPresent);
     }
 
-    let mut block0 = vec![0_u8; block_size];
+    let mut block0 = zeroed_buffer(block_size)?;
     dev.read_blocks(0, &mut block0)?;
     if parse_fat_volume_metadata(&block0, u128::from(total_blocks) * block_size as u128).is_some() {
         return Ok(Some(PartitionInfo {
@@ -300,7 +300,7 @@ pub fn detect_fat_boot_partition<D: BlockDevice>(dev: &mut D) -> IoResult<Option
 
     for partition in detect_partitions(dev)? {
         let mut slice = BlockSlice::new(&mut *dev, partition.start_lba, partition.block_count)?;
-        let mut boot_sector = vec![0_u8; block_size];
+        let mut boot_sector = zeroed_buffer(block_size)?;
         slice.read_blocks(0, &mut boot_sector)?;
         if parse_fat_volume_metadata(
             &boot_sector,
@@ -321,6 +321,17 @@ pub fn fat_volume_id_from_boot_sector(boot_sector: &[u8]) -> Option<u32> {
 // https://github.com/UEFI/UEFI-Specification-Release/blob/main/source/05_GUID_Partition_Table_Format.rst
 const MAX_GPT_ARRAY_BYTES: usize = 16 * 1024 * 1024;
 
+/// Device-geometry-sized scratch buffers come from an untrusted device
+/// description, so exhaustion is an error rather than an allocator abort.
+fn zeroed_buffer(len: usize) -> IoResult<Vec<u8>> {
+    let mut buffer = Vec::new();
+    buffer
+        .try_reserve_exact(len)
+        .map_err(|_| StorageError::Unsupported)?;
+    buffer.resize(len, 0);
+    Ok(buffer)
+}
+
 fn crc32_update(mut crc: u32, bytes: &[u8]) -> u32 {
     for &byte in bytes {
         crc ^= u32::from(byte);
@@ -337,14 +348,14 @@ fn detect_gpt_partitions<D: BlockDevice>(
     if total_blocks <= 1 { return Ok(None); }
     let protective = mbr[510..512] == [0x55, 0xaa]
         && (0..4).any(|i| mbr[446 + i * 16 + 4] == 0xee);
-    let mut header = vec![0_u8; block_size];
+    let mut header = zeroed_buffer(block_size)?;
     dev.read_blocks(1, &mut header)?;
     if !protective && &header[..8] != b"EFI PART" { return Ok(None); }
 
     match read_gpt_copy(dev, total_blocks, block_size, 1, header) {
         Ok(parts) => Ok(Some(parts)),
         Err(StorageError::InvalidInput) => {
-            let mut backup = vec![0_u8; block_size];
+            let mut backup = zeroed_buffer(block_size)?;
             dev.read_blocks(total_blocks - 1, &mut backup)?;
             read_gpt_copy(dev, total_blocks, block_size, total_blocks - 1, backup).map(Some)
         }
@@ -385,7 +396,7 @@ fn read_gpt_copy<D: BlockDevice>(
     if (header_lba == 1 && (entry_lba < 2 || end > first))
         || (header_lba != 1 && (entry_lba <= last || end > header_lba))
     { return Err(invalid); }
-    let mut data = vec![0; blocks.checked_mul(block_size).ok_or(invalid)?];
+    let mut data = zeroed_buffer(blocks.checked_mul(block_size).ok_or(invalid)?)?;
     for (i, block) in data.chunks_exact_mut(block_size).enumerate() {
         dev.read_blocks(entry_lba + i as u64, block)?;
     }

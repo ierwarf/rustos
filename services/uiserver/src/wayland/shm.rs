@@ -20,7 +20,7 @@ impl GlobalDispatch<wl_shm::WlShm, ()> for WaylandState {
 impl Dispatch<wl_shm::WlShm, ()> for WaylandState {
     fn request(
         _state: &mut Self,
-        _client: &Client,
+        client: &Client,
         resource: &wl_shm::WlShm,
         request: wl_shm::Request,
         _data: &(),
@@ -49,7 +49,25 @@ impl Dispatch<wl_shm::WlShm, ()> for WaylandState {
                 );
                 return;
             }
-            let Ok(pool) = WaylandShmPoolState::new(fd, size) else {
+            let Some(counts) = client.get_data::<WaylandClientState>() else {
+                post_protocol_error(resource, "wl_shm.create_pool: client state missing".into());
+                return;
+            };
+            let Some(ticket) = LiveObjectTicket::admit(
+                &counts.shm_pools,
+                MAX_WAYLAND_SHM_POOLS_PER_CLIENT,
+                Some((&LIVE_SHM_POOLS, MAX_WAYLAND_SHM_POOLS_TOTAL)),
+            ) else {
+                post_protocol_error(
+                    resource,
+                    format!(
+                        "wl_shm.create_pool: pool limit reached \
+                         (per client {MAX_WAYLAND_SHM_POOLS_PER_CLIENT}, total {MAX_WAYLAND_SHM_POOLS_TOTAL})"
+                    ),
+                );
+                return;
+            };
+            let Ok(pool) = WaylandShmPoolState::new(fd, size, ticket) else {
                 post_protocol_error(
                     resource,
                     format!("wl_shm.create_pool: unreadable or undersized fd for size={size}"),
@@ -69,7 +87,7 @@ impl Dispatch<wl_shm::WlShm, ()> for WaylandState {
 impl Dispatch<wl_shm_pool::WlShmPool, ShmPoolData> for WaylandState {
     fn request(
         _state: &mut Self,
-        _client: &Client,
+        client: &Client,
         resource: &wl_shm_pool::WlShmPool,
         request: wl_shm_pool::Request,
         data: &ShmPoolData,
@@ -146,6 +164,26 @@ impl Dispatch<wl_shm_pool::WlShmPool, ShmPoolData> for WaylandState {
                     );
                     return;
                 };
+                let Some(counts) = client.get_data::<WaylandClientState>() else {
+                    post_protocol_error(
+                        resource,
+                        "wl_shm_pool.create_buffer: client state missing".into(),
+                    );
+                    return;
+                };
+                let Some(ticket) = LiveObjectTicket::admit(
+                    &counts.buffers,
+                    MAX_WAYLAND_BUFFERS_PER_CLIENT,
+                    None,
+                ) else {
+                    post_protocol_error(
+                        resource,
+                        format!(
+                            "wl_shm_pool.create_buffer: buffer limit {MAX_WAYLAND_BUFFERS_PER_CLIENT} reached"
+                        ),
+                    );
+                    return;
+                };
                 let layout_valid = {
                     let Ok(pool) = data.shared.lock() else {
                         post_protocol_error(
@@ -174,6 +212,7 @@ impl Dispatch<wl_shm_pool::WlShmPool, ShmPoolData> for WaylandState {
                             height,
                             stride,
                             has_alpha,
+                            _ticket: ticket,
                         }),
                     },
                 );
@@ -202,9 +241,13 @@ impl Dispatch<wl_shm_pool::WlShmPool, ShmPoolData> for WaylandState {
 }
 
 impl WaylandShmPoolState {
-    pub(super) fn new(fd: OwnedFd, len: usize) -> std::io::Result<Self> {
+    pub(super) fn new(fd: OwnedFd, len: usize, ticket: LiveObjectTicket) -> std::io::Result<Self> {
         validate_shm_extent(fd.as_raw_fd(), len)?;
-        Ok(Self { fd, len })
+        Ok(Self {
+            fd,
+            len,
+            _ticket: ticket,
+        })
     }
 
     pub(super) fn resize(&mut self, len: usize) -> std::io::Result<()> {

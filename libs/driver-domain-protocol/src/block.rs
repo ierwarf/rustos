@@ -136,6 +136,10 @@ impl DvmBlockHeader {
             && self.features & DVM_BLOCK_REQUIRED_FEATURES == DVM_BLOCK_REQUIRED_FEATURES
             && self.generation != 0
             && self.capacity_sectors != 0
+            // Capacity is counted in 512-byte sectors; every consumer derives
+            // a byte capacity from it, so a product that overflows u64 is
+            // never a real device.
+            && self.capacity_sectors.checked_mul(512).is_some()
             && valid_block_size(self.logical_block_size)
             && valid_block_size(self.physical_block_size)
             && self.physical_block_size >= self.logical_block_size

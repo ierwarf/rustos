@@ -436,6 +436,20 @@ struct StagedArtifact<'a> {
     final_path: PathBuf,
     temporary_path: PathBuf,
     bytes: &'a [u8],
+    /// True only for a temporary this value created, so cleanup never removes
+    /// a file that already existed (`create_new` refused it).
+    created: bool,
+}
+
+impl Drop for StagedArtifact<'_> {
+    fn drop(&mut self) {
+        // A failed stage, snapshot re-check or earlier publish must not leave
+        // private temporaries behind; after a successful publish the file is
+        // already gone and this is a no-op.
+        if self.created {
+            let _ = fs::remove_file(&self.temporary_path);
+        }
+    }
 }
 
 impl<'a> StagedArtifact<'a> {
@@ -451,20 +465,21 @@ impl<'a> StagedArtifact<'a> {
             final_path,
             temporary_path,
             bytes,
+            created: false,
         }
     }
 
     fn stage(&mut self) -> Result<()> {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&self.temporary_path)
-            .with_context(|| {
-                format!(
-                    "create private SMP evidence temporary {}",
-                    self.temporary_path.display()
-                )
-            })?;
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut file = options.open(&self.temporary_path).with_context(|| {
+            format!(
+                "create private SMP evidence temporary {}",
+                self.temporary_path.display()
+            )
+        })?;
+        self.created = true;
         file.write_all(self.bytes).with_context(|| {
             format!(
                 "write private SMP evidence temporary {}",
@@ -572,7 +587,9 @@ mod tests {
         staged.stage().unwrap();
         assert!(staged.publish().is_err());
         assert_eq!(fs::read(&final_path).unwrap(), b"first");
-        fs::remove_file(staged.temporary_path).unwrap();
+        let temporary = staged.temporary_path.clone();
+        drop(staged);
+        assert!(!temporary.exists(), "failed publish left its temporary behind");
     }
 
     fn snapshot_for_paths(root: &Path, paths: &[PathBuf]) -> KvmLaunchEvidenceSnapshot {

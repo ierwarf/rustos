@@ -150,6 +150,16 @@ impl TtyCollection {
         let slot_index = session.slot_index()?;
         let slot = self.sessions.get_mut(slot_index)?;
 
+        // A handle older than the slot's current binding is a closed session:
+        // rebinding the slot to it would erase the live session's input,
+        // termios and waiter, and expose that state to the stale holder.
+        if let Some(bound) = slot.as_ref()
+            && bound.handle != session
+            && (bound.handle.generation().wrapping_sub(session.generation()) as i32) > 0
+        {
+            return None;
+        }
+
         let needs_reset = !matches!(
             slot.as_ref(),
             Some(bound) if bound.handle == session
@@ -231,6 +241,20 @@ mod tests {
 
         assert!(tty.remove_input_waiter(task_id));
         assert!(!tty.remove_input_waiter(task_id));
+    }
+
+    #[test]
+    fn stale_session_generation_cannot_rebind_or_reset_live_slot() {
+        let mut tty = TtyCollection::new();
+        let live = ConsoleSessionHandle::from_parts(2, 5);
+        let stale = ConsoleSessionHandle::from_parts(2, 4);
+        assert!(tty.session_mut(live).unwrap().input.push(b'x'));
+        assert!(tty.session_mut(stale).is_none());
+        assert_eq!(tty.session_mut(live).unwrap().input.len(), 1);
+        // A newer generation still rebinds the slot with fresh state.
+        let newer = ConsoleSessionHandle::from_parts(2, 6);
+        assert_eq!(tty.session_mut(newer).unwrap().input.len(), 0);
+        assert!(tty.session_mut(live).is_none());
     }
 
     #[test]

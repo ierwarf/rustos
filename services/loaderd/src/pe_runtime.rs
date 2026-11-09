@@ -709,14 +709,13 @@ fn read_c_string_at_rva(image: &[u8], rva: u32) -> Result<&[u8], i32> {
     if start >= image.len() {
         return Err(ENOEXEC);
     }
-    let mut end = start;
-    while end < image.len() {
-        if image[end] == 0 {
-            return Ok(&image[start..end]);
-        }
-        end += 1;
+    // Bounded scan: the untrusted table may point thousands of entries at one
+    // long unterminated run, so an unbounded scan multiplies into a CPU DoS.
+    let window = &image[start..image.len().min(start + PE_MAX_C_STRING_BYTES + 1)];
+    match window.iter().position(|byte| *byte == 0) {
+        Some(len) => Ok(&window[..len]),
+        None => Err(ENOEXEC),
     }
-    Err(ENOEXEC)
 }
 
 fn read_import_name_at_rva(image: &[u8], rva: u32) -> Result<&[u8], i32> {

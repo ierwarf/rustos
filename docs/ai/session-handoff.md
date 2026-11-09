@@ -4,6 +4,53 @@ Dated evidence, not instructions or proof of the current checkout. Resume with
 `git status --short`, `git log -1`, and the live request. `AGENTS.md` is the only
 stable repository prefix; use [task router](task-router.md) for owner contracts.
 
+## Hardening pass (2026-11-09, uncommitted)
+
+Whole-tree hardening by area-owning agents (kernel/ps, compat, mm, hal,
+io-manager, nucleus/ipc-runtime, libs, services, uiserver, xtask/hostd, DVM C).
+HEAD `ca51fc54` already contained the IPC reply-wait retry; that part of the
+section below is stale. Validated on the final tree: `cargo xtask check`,
+native tests for every touched crate (kernel-ps 1069, kernel-compat 280,
+kernel-mm 141, ...), `cargo xtask formal-contracts check` and `test` (927
+witness tests), `formal/check-rust-source-contracts.py`, and
+`formal/run-source-conformance.sh`. **Not run:** TLC/Apalache, the mutation
+lane (`formal/verify-all.sh --profile pr`), any KVM boot, `build-dvm`. The
+mutation row `pager-frame-grant-generation-bypass` was rewritten for the new
+packed `FrameGrantSlot` word and must be re-killed by the PR gate. DVM C/shell
+fixes are only syntax-checked: a DVM rebuild is required before they ship.
+
+Behaviour changes that need a KVM boot to confirm: sysret gate now requires IF
+and forbids VIF/VIP; `broker_protect` refuses PROT_WRITE on read-only shared
+memfd mappings (F_SEAL_WRITE); stream-socket `write` sends a bounded prefix;
+`setpgid` limited to self/children; syscalld VMA cap 262144; Wayland
+per-client object caps; GPU-atlas completion claim CAS; runqueue
+`retire_slot` / remote-wake adoption retries; exec quiescence expiry now
+cancels the exec instead of panicking (30 s).
+
+Open items found but not done (evidence in the agent reports of this session):
+- FIXED: `formal/check-performance-contracts.sh` required the removed loaderd
+  trace `executable snapshot call begin`; it now pins the rate-bounded snapshot
+  progress output in `snapshot_client.rs`.
+- Lifecycle transaction id is a global non-wrapping u32
+  (`process_table.rs`); ~4.3e9 spawn/exec/exit fail all later ones closed.
+  Widen to u64 across ps, object api and formal models.
+- DONE (uncommitted, host-tested only; no KVM): procd thread-exit lifecycle
+  event (`LIFECYCLE_EVENT_THREAD_EXIT`, drain ABI v2, separate 256-entry procd
+  queue + `THREAD_EXIT_LOST` marker; see `docs/ai/abi/core.md`). Residue: after
+  a lost marker, dead threads that own a sigaltstack stay until process exit.
+- `write_current_user_struct<T: Copy>` copies padding (kernel stack infoleak
+  risk, ~25 compat callers): bound it with a no-padding marker trait.
+- pagerd `BACKING/RELEASE/PROTECT_OBJECT` ops have no in-tree caller and are
+  gated only by sender == claimed identity; delete them or pin the sender.
+- inputd `AUTHORIZE_READ` self-authorisation relies on kernel endpoint lookup
+  policy being restrictive; confirm in kernel/compat.
+- `map_prepared_pager_fault_frame_at` has no extent parameter; callers must
+  clip (compat now clips to `offered_run_pages`).
+- memfd `ensure_len_locked` zeroes a whole grow under the object spinlock;
+  vfsd caches key FAT paths without 8.3/case alias canonicalisation;
+  netd blocking pools lack a per-pid quota; `read_shm_snapshot` blocks the UI
+  thread on a client fd; `advance_readiness_generation` panics on EPERM.
+
 ## Current checkout (2026-11-07)
 
 `HEAD` is `2ec1257c` (storage streaming + manual Chrome packaging); the Chrome

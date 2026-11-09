@@ -35,7 +35,8 @@ impl InetStack {
         };
         let mut config = SmolConfig::new(HardwareAddress::Ethernet(QEMU_USERNET_MAC));
         // TCP sequence/stack randomness must not share a deterministic boot seed.
-        config.random_seed = mint_socket_token()?;
+        let seed = mint_socket_token()?;
+        config.random_seed = seed;
         let mut iface = Interface::new(config, &mut device, smol_now());
         iface.update_ip_addrs(|ip_addrs| {
             let _ = ip_addrs.push(IpCidr::new(IpAddress::Ipv4(QEMU_USERNET_ADDR), 24));
@@ -48,7 +49,8 @@ impl InetStack {
             iface,
             sockets: SocketSet::new(Vec::new()),
             device,
-            next_port: 49152,
+            // Unpredictable start so off-path peers cannot guess the next source port.
+            next_port: 49152 + (seed % 16384) as u16,
             closing: Vec::new(),
             readiness_dirty: false,
             last_timer_sweep: StdInstant::now(),
@@ -76,7 +78,18 @@ impl InetStack {
                 .push((handle, StdInstant::now() + INET_CLOSE_LINGER));
         } else {
             socket.abort();
-            self.sockets.remove(handle);
+            self.discard_aborted(&[handle]);
+        }
+    }
+
+    /// Removes aborted sockets after one egress pass: `abort` only queues the
+    /// RST, so removing first would leave the peer holding a dead connection.
+    fn discard_aborted(&mut self, handles: &[SocketHandle]) {
+        let _ = self
+            .iface
+            .poll_egress(smol_now(), &mut self.device, &mut self.sockets);
+        for handle in handles {
+            self.sockets.remove(*handle);
         }
     }
 
@@ -86,15 +99,19 @@ impl InetStack {
         }
         let now = StdInstant::now();
         let sockets = &mut self.sockets;
+        let mut expired = Vec::new();
         self.closing.retain(|(handle, deadline)| {
             let socket = sockets.get_mut::<tcp::Socket>(*handle);
             if socket.is_open() && now < *deadline {
                 return true;
             }
             socket.abort();
-            sockets.remove(*handle);
+            expired.push(*handle);
             false
         });
+        if !expired.is_empty() {
+            self.discard_aborted(&expired);
+        }
     }
 
     pub(super) fn poll_one(&mut self) -> (bool, bool) {

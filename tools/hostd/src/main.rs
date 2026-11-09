@@ -822,15 +822,23 @@ fn verify_release_authorization(
     let device_policy = trusted_canonical_regular_file(&device_policy, owner)?;
     let fleet_policy = trusted_canonical_regular_file(&fleet_policy, owner)?;
     let gpgv = trusted_canonical_regular_file(std::path::Path::new("/usr/bin/gpgv"), 0)?;
-    let status = ProcessCommand::new(gpgv)
+    // Require an explicit VALIDSIG status line rather than trusting the exit
+    // status alone, and reject signatures made by expired or revoked keys.
+    let output = ProcessCommand::new(gpgv)
+        .env_clear()
+        .env("LC_ALL", "C")
+        .arg("--status-fd=1")
         .arg("--keyring")
         .arg(&release_keyring)
         .arg(&release_signature)
         .arg(&release_manifest)
-        .status()
+        .output()
         .map_err(|error| anyhow::anyhow!("start gpgv for release authorization: {error}"))?;
-    if !status.success() {
-        anyhow::bail!("release authorization signature verification failed");
+    if !output.status.success() || !gpgv_status_is_valid(&output.stdout) {
+        anyhow::bail!(
+            "release authorization signature verification failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
     }
     let authorization = ReleaseAuthorization::from_env_file(&release_manifest)?;
     let now_unix = current_unix_time()?;
@@ -844,6 +852,29 @@ fn verify_release_authorization(
     verify_sha256_file(&fleet_policy, authorization.fleet_policy_sha256())?;
     DriverDomainFleetPolicy::from_env_file(&fleet_policy)?.validate_for_lease(lease)?;
     authorization.into_vfio_release_binding(&release_manifest_sha256, now_unix)
+}
+
+/// True when gpgv's machine-readable status holds a VALIDSIG and no bad,
+/// expired, or revoked signature report.
+fn gpgv_status_is_valid(status: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(status);
+    let mut valid = false;
+    for line in text.lines() {
+        let Some(tag) = line
+            .strip_prefix("[GNUPG:] ")
+            .and_then(|rest| rest.split_ascii_whitespace().next())
+        else {
+            continue;
+        };
+        match tag {
+            "VALIDSIG" => valid = true,
+            "BADSIG" | "ERRSIG" | "EXPSIG" | "EXPKEYSIG" | "REVKEYSIG" | "NO_PUBKEY" => {
+                return false;
+            }
+            _ => {}
+        }
+    }
+    valid
 }
 
 fn current_unix_time() -> Result<u64> {
@@ -862,4 +893,24 @@ fn verify_sha256_file(path: &std::path::Path, expected: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::gpgv_status_is_valid;
+
+    #[test]
+    fn gpgv_status_requires_validsig_and_rejects_expired_keys() {
+        assert!(gpgv_status_is_valid(
+            b"[GNUPG:] GOODSIG AB cn\n[GNUPG:] VALIDSIG AB 2026 1 0 4 0 1 8 00 AB\n"
+        ));
+        assert!(!gpgv_status_is_valid(b""));
+        assert!(!gpgv_status_is_valid(b"[GNUPG:] GOODSIG AB cn\n"));
+        assert!(!gpgv_status_is_valid(
+            b"[GNUPG:] EXPKEYSIG AB cn\n[GNUPG:] VALIDSIG AB x\n"
+        ));
+        assert!(!gpgv_status_is_valid(
+            b"[GNUPG:] VALIDSIG AB x\n[GNUPG:] BADSIG AB cn\n"
+        ));
+    }
 }
