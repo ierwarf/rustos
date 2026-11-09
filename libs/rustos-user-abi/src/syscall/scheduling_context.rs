@@ -168,3 +168,6 @@ impl RustosSchedulingContextSnapshot {
                     && self.timeout_fault_action == SCHEDULING_CONTEXT_TIMEOUT_ACTION_NONE))
     }
 }
+
+// Copy-out safety: no padding bytes (see `wire`).
+crate::user_wire!(RustosSchedulingContextSnapshot { abi_version: u16, reserved0: u16, flags: u32, executing_task_id: u64, context_owner_task_id: u64, context_identity_slot: u64, context_identity_generation: u64, domain: u64, policy_epoch: u64, budget_ns: u64, period_ns: u64, context_available_ns: u64, context_pending_refill_ns: u64, context_next_eligible_ns: u64, context_consumed_ns: u64, context_exhaustion_count: u64, context_refill_count: u64, context_overflow_merge_count: u64, timeout_fault_count: u64, timeout_fault_consumed_ns: u64, timeout_fault_budget_ns: u64, timeout_fault_period_ns: u64, timeout_fault_reply: u64, timeout_endpoint_cap: u64, timeout_fault_action: u64, domain_available_ns: u64, domain_pending_refill_ns: u64, domain_next_eligible_ns: u64, domain_consumed_ns: u64, domain_exhaustion_count: u64, domain_refill_count: u64, domain_overflow_merge_count: u64 });

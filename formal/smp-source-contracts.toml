@@ -3649,7 +3649,7 @@ path = "kernel/ps/src/multitask/scheduler/resident.rs"
 tokens = [
     "pub(super) fn park(", "cell.pin.store(", "cell.permit.store(", "cell.generation.swap(generation, Ordering::SeqCst)",
     "runqueue::owner(slot)", "pub(super) fn take(",
-    "compare_exchange(generation, 0", "pub(super) fn on_owner_transition(",
+    "compare_exchange(generation, DRAINING", "pub(super) fn on_owner_transition(",
     "pub(in crate::multitask) fn commit_outgoing(", "cpu_leases::take_outgoing(cpu)", "banks::take_outgoing(cpu)",
     "parkable(from, &pin, &permit)", "kernel_frame_rsp(cpu, from, generation)", "outgoing_arch(cpu, from)",
 ]

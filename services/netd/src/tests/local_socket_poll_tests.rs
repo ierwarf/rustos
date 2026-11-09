@@ -318,7 +318,7 @@ fn expired_detached_local_poll_replies_and_releases_exactly_once() {
             reply_count.set(reply_count.get() + 1);
             reply_status.set(response.status);
         },
-        || release_count.set(release_count.get() + 1),
+        |_pid| release_count.set(release_count.get() + 1),
     );
 
     assert!(still_waiting.is_none());

@@ -171,6 +171,11 @@ Ring0 serving faults means two protocols now publish without one. Both are
 registered in `formal/concurrency-triangle.toml`, which is the only reason
 either is checkable.
 
+`map_prepared_pager_fault_frame_at` takes the `UserRegion` extent the caller
+validated the fault against and refuses (`AddressOutOfRange`) a mapping address
+outside it before any physical-root admission, so a caller can no longer map a
+frame outside the region it was authorised for by passing a stale address.
+
 ### The fault-install permit
 
 An installer registers, re-reads the publication sequence, and only then writes

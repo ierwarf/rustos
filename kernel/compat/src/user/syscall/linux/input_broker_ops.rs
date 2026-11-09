@@ -119,12 +119,10 @@ pub(super) fn syscall_linux_rustos_input_ingest_broker(args_ptr: u64) -> u64 {
         None => return linux_errno(LINUX_EINVAL),
     };
     if byte_len != 0 {
-        // `InputDvmRecordWire` is a repr(C), fully initialized wire object.
         // Copy the admitted batch through usermem once: per-record page-table
         // validation made ingress cost proportional to event count and could
         // not sustain the already-bounded DVM producer.
-        let bytes = unsafe { core::slice::from_raw_parts(records.as_ptr().cast::<u8>(), byte_len) };
-        if let Err(err) = usermem::write_current_user_bytes(args.out_records_ptr, bytes) {
+        if let Err(err) = usermem::write_current_user_slice(args.out_records_ptr, &records[..count]) {
             return linux_errno(address_space_error_to_linux_errno(err));
         }
     }

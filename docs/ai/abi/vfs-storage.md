@@ -264,6 +264,19 @@ namespace borrow or a second filesystem/cache. Runtime-supplied sleeping device
 waits and per-device response storage preserve progress across blocking IPC and
 old/new mounts. Every write attempt revokes old map versions before media I/O.
 
+FAT path identity: the volume matches names ASCII-case-insensitively (and the
+engine resolves a long name and its 8.3 alias to one entry), so `/BIN/Ls` and
+`/bin/ls` are one file. Vfsd's `path_inode`/checkpoint `content_identity` hash
+the ASCII-lowercased path, and every path-addressed cache (file bytes, read
+maps, sealed executable snapshots, metadata, directory listings) is keyed by
+`fat_cache_key` (the lowercased path) so case spellings share one entry. Both
+live in `vfsd::path` so their tests run. Residual: an 8.3 *alias spelling*
+(`PROGRA~1`) hashes and caches as its own path, not as its long name; a handle
+opened through it gets a different inode and cache entry than the long name. A
+true alias identity needs the directory-entry slot, which is the persistent-
+inode design deferred in the large-file plan; `content_identity` must stay a
+pure function of the path text until then so checkpoint replay stays valid.
+
 Executable publication uses the owner-bound asynchronous job and sealed memfd
 contract in [loader scheduling](loader-scheduling.md). VFS persistent writes and
 truncate remain EROFS. Writable object/checkpoint identity, durable mutation,

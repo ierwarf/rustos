@@ -1372,7 +1372,7 @@ ordered(body(resident_source, 'park'), ['cell.pin.store(', 'cell.permit.store(',
     'cell.generation.swap(generation, Ordering::SeqCst)',
     'runqueue::owner(slot)', 'take(slot, generation)'],
     'a parked cell is published before the owner re-read that revokes it')
-ordered(body(resident_source, 'take'), ['compare_exchange(generation, 0', 'cell.drain()'],
+ordered(body(resident_source, 'take'), ['compare_exchange(generation, DRAINING', 'cell.drain()'],
     'the generation swap decides who owns the parked loans')
 runq = (base / 'runqueue.rs').read_text()
 ordered(body(runq, 'compare_exchange'), ['self.compare_exchange_raw(expected, next)?',

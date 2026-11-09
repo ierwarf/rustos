@@ -314,7 +314,8 @@ impl VfsStorage {
             Some(read) => Ok(read),
             None => {
                 self.invalidate_caches_if_remounted();
-                if let Some(bytes) = self.file_bytes_cache.get(path) {
+                let key = fat_cache_key(path);
+                if let Some(bytes) = self.file_bytes_cache.get(&key) {
                     return Ok(copy_file_cache_range(bytes, start, dest));
                 }
 
@@ -337,7 +338,7 @@ impl VfsStorage {
                         self.file_bytes_cache_bytes = 0;
                     }
                     self.file_bytes_cache_bytes += bytes.len();
-                    self.file_bytes_cache.insert(path.to_string(), bytes);
+                    self.file_bytes_cache.insert(key, bytes);
                     return Ok(read);
                 }
 
@@ -348,7 +349,8 @@ impl VfsStorage {
 
     fn read_mapped_file(&mut self, path: &str, len: u64, offset: u64, output: &mut [u8]) -> Result<usize, i32> {
         use storage_core::file_io::ReadAt;
-        if !self.read_maps.contains_key(path) {
+        let key = fat_cache_key(path);
+        if !self.read_maps.contains_key(&key) {
             let map = self.volume()?.plan_read(path, vfsd::snapshot_budget::SNAPSHOT_MAP_BYTES)
                 .map_err(map_range_error)?;
             if map.len() != len { return Err(EIO); }
@@ -358,9 +360,9 @@ impl VfsStorage {
                 self.read_map_bytes = 0;
             }
             self.read_map_bytes += cost;
-            self.read_maps.insert(path.to_string(), map);
+            self.read_maps.insert(key.clone(), map);
         }
-        let map = self.read_maps.get(path).ok_or(EIO)?;
+        let map = self.read_maps.get(&key).ok_or(EIO)?;
         if map.len() != len { return Err(EIO); }
         let mut scratch = [0; 4096];
         self.volume.as_ref().ok_or(ENODEV)?.read_view(map, &mut scratch)
@@ -403,7 +405,7 @@ impl VfsStorage {
         let early_system_owned = early_system::file_len(path.as_str())?.is_some();
 
         self.invalidate_caches_if_remounted();
-        if let Some(snapshot) = self.executable_snapshot_cache.get(path.as_str()).copied() {
+        if let Some(snapshot) = self.executable_snapshot_cache.get(fat_cache_key(path.as_str()).as_str()).copied() {
             return ExecutableSnapshotOpen::duplicate_cached(
                 snapshot.fd,
                 snapshot.file_bytes,
@@ -500,7 +502,7 @@ impl VfsStorage {
         // Another worker may have published the same path while this plan
         // read without storage ownership. Reuse that entry instead of leaking
         // its descriptor and counting the same image twice.
-        if let Some(snapshot) = self.executable_snapshot_cache.get(path.as_str()).copied() {
+        if let Some(snapshot) = self.executable_snapshot_cache.get(fat_cache_key(path.as_str()).as_str()).copied() {
             return ExecutableSnapshotOpen::duplicate_cached(
                 snapshot.fd,
                 snapshot.file_bytes,
@@ -569,7 +571,7 @@ impl VfsStorage {
             self.executable_snapshot_cache_bytes = 0;
         }
         self.executable_snapshot_cache.insert(
-            path,
+            fat_cache_key(path.as_str()),
             ExecutableSnapshot {
                 fd: cache_fd,
                 file_bytes: plan.metadata_len,
@@ -646,7 +648,7 @@ impl VfsStorage {
             }
         }
         self.invalidate_caches_if_remounted();
-        if let Some(entry) = self.metadata_cache.get(path) {
+        if let Some(entry) = self.metadata_cache.get(fat_cache_key(path).as_str()) {
             return *entry;
         }
         if let Some(len) = early_system::file_len(path)? {
@@ -686,7 +688,7 @@ impl VfsStorage {
         if self.metadata_cache.len() >= vfsd::METADATA_CACHE_MAX_ENTRIES {
             self.metadata_cache.clear();
         }
-        self.metadata_cache.insert(path.to_string(), result);
+        self.metadata_cache.insert(fat_cache_key(path), result);
     }
 
     fn dir_entries(&mut self, path: &str) -> Result<Vec<DirEntry>, i32> {
@@ -718,7 +720,7 @@ impl VfsStorage {
             return Err(ENOENT);
         }
         self.invalidate_caches_if_remounted();
-        if let Some(cached) = self.dir_entries_cache.get(path) {
+        if let Some(cached) = self.dir_entries_cache.get(fat_cache_key(path).as_str()) {
             entries.extend_from_slice(cached);
             return Ok(entries);
         }
@@ -728,7 +730,7 @@ impl VfsStorage {
             self.dir_entries_cache.clear();
         }
         self.dir_entries_cache
-            .insert(path.to_string(), resolved.clone());
+            .insert(fat_cache_key(path), resolved.clone());
         entries.extend(resolved);
         Ok(entries)
     }

@@ -433,14 +433,34 @@ pub fn write_retained_user_bytes_batch(
         .ok_or(paging::AddressSpaceError::NotMapped)?
 }
 
-pub fn write_current_user_struct<T: Copy>(
+/// Copies `value` to user memory. `T: UserWire` proves the value has no padding,
+/// so no uninitialised kernel byte can reach user space.
+pub fn write_current_user_struct<T: rustos_user_abi::wire::UserWire>(
     user_ptr: u64,
     value: &T,
 ) -> Result<(), paging::AddressSpaceError> {
+    // SAFETY: `T: UserWire` guarantees every byte of `*value` is initialised,
+    // and the slice borrows `value` for the duration of the copy.
     let bytes = unsafe {
         core::slice::from_raw_parts(
             core::ptr::addr_of!(*value).cast::<u8>(),
             core::mem::size_of::<T>(),
+        )
+    };
+    write_current_user_bytes(user_ptr, bytes)
+}
+
+/// Copies a batch of padding-free wire records to user memory in one pass.
+pub fn write_current_user_slice<T: rustos_user_abi::wire::UserWire>(
+    user_ptr: u64,
+    values: &[T],
+) -> Result<(), paging::AddressSpaceError> {
+    // SAFETY: `T: UserWire` guarantees every byte of each element is
+    // initialised; the slice covers exactly `values` and borrows it.
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            values.as_ptr().cast::<u8>(),
+            core::mem::size_of_val(values),
         )
     };
     write_current_user_bytes(user_ptr, bytes)

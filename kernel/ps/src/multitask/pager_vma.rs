@@ -828,7 +828,11 @@ pub fn validate_fault_request(
 /// access authority are all revalidated under the exact process-state lock.
 pub fn with_validated_fault_address_space<R>(
     request: rustos_user_abi::pager::PagerFaultRequestWire,
-    f: impl FnOnce(u64, &mut crate::memory::paging::ProcessAddressSpace) -> R,
+    f: impl FnOnce(
+        u64,
+        crate::memory::paging::UserRegion,
+        &mut crate::memory::paging::ProcessAddressSpace,
+    ) -> R,
 ) -> Result<R, PagerVmaError> {
     let index = usize::try_from(
         request
@@ -860,7 +864,19 @@ pub fn with_validated_fault_address_space<R>(
             {
                 return Err(PagerVmaError::Stale);
             }
-            Ok(f(process_id, state.address_space_mut()))
+            // The exact span the validated VMA covers. Mapping helpers take it
+            // so a leaf can never be installed past the VMA the fault was
+            // validated against, whatever run length a caller computed.
+            let page_count = region
+                .end
+                .checked_sub(region.start)
+                .and_then(|bytes| usize::try_from(bytes / PAGER_PAGE_BYTES).ok())
+                .ok_or(PagerVmaError::Stale)?;
+            let extent = crate::memory::paging::UserRegion {
+                start: x86_64::VirtAddr::new(region.start),
+                page_count,
+            };
+            Ok(f(process_id, extent, state.address_space_mut()))
         })
         .ok_or(PagerVmaError::Stale)?
 }

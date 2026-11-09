@@ -423,6 +423,23 @@ fn shm_snapshots_remain_safe_while_another_thread_truncates_and_regrows() {
 }
 
 #[test]
+fn shm_pool_admission_refuses_fds_whose_read_can_block_the_compositor() {
+    use std::os::fd::AsRawFd;
+    let file = shm_file(&vec![0x3a; 4096]);
+    assert!(super::shm::validate_shm_extent(file.as_raw_fd(), 4096).is_ok());
+
+    let mut ends = [0 as libc::c_int; 2];
+    // SAFETY: `ends` is a valid two-element out-array.
+    assert_eq!(unsafe { libc::pipe(ends.as_mut_ptr()) }, 0);
+    for end in ends {
+        let error = super::shm::validate_shm_extent(end, 4096).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EINVAL));
+        // SAFETY: both fds were created above and are closed exactly once.
+        unsafe { libc::close(end) };
+    }
+}
+
+#[test]
 fn pointer_routing_requires_exact_ui_target_and_keeps_button_grab_on_original_client() {
     use wayland_server::{protocol::wl_surface::WlSurface, Resource};
     let display = test_display();

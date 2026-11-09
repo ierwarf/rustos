@@ -1580,3 +1580,8 @@ mod tests {
         );
     }
 }
+
+// Copy-out safety: no padding bytes (see `wire`).
+crate::user_wire!(LinuxMsghdr { msg_name: u64, msg_namelen: u32, __pad0: u32, msg_iov: u64, msg_iovlen: u64, msg_control: u64, msg_controllen: u64, msg_flags: u32, __pad1: u32 });
+crate::user_wire!(LinuxRusage { ru_utime: LinuxTimeval, ru_stime: LinuxTimeval, ru_maxrss: i64, ru_ixrss: i64, ru_idrss: i64, ru_isrss: i64, ru_minflt: i64, ru_majflt: i64, ru_nswap: i64, ru_inblock: i64, ru_oublock: i64, ru_msgsnd: i64, ru_msgrcv: i64, ru_nsignals: i64, ru_nvcsw: i64, ru_nivcsw: i64 });
+crate::user_wire!(LinuxTimeval { tv_sec: i64, tv_usec: i64 });

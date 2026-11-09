@@ -3,7 +3,9 @@
 //! Lifecycle: park at the ACK of a blocking return -> taken by the lane CAS, or
 //! evicted by ANY other owner-word transition of that generation.
 //! Concurrency: `generation` is the cell's single publication word; whoever
-//! swaps it to zero (taker or evictor) owns the loans, so there is no double drop.
+//! swaps it to `DRAINING` (taker or evictor) owns the loans, so there is no double
+//! drop, and the word returns to zero only after the payload has been read, so a
+//! parker never overwrites a payload an evictor is still reading.
 //! Failure: a park racing a wake re-reads the owner after publishing and evicts itself.
 //! Forbidden: reading the cell without the generation CAS, parking a non-Blocked
 //! task, or letting a cell outlive its generation.
@@ -67,6 +69,11 @@ impl Cell {
     }
 }
 
+/// Published by the winner of a take while it reads the payload out. Larger than
+/// any owner generation (those are packed below 2^64 >> shift), so it never
+/// equals a live generation.
+const DRAINING: u64 = u64::MAX;
+
 static CELLS: [CachePadded<Cell>; super::MAX_TASK] =
     [const { CachePadded::new(Cell::new()) }; super::MAX_TASK];
 
@@ -74,17 +81,13 @@ static CELLS: [CachePadded<Cell>; super::MAX_TASK] =
 /// owner already left that generation they are released here, outside any leaf.
 pub(super) fn park(slot: usize, generation: u64, loans: Loans) -> bool {
     let cell = &CELLS[slot];
-    assert_eq!(
-        cell.generation.load(Ordering::Relaxed),
-        0,
-        "resident cell parked over live loans"
-    );
+    settle_stale_cell(slot, cell, generation);
     let Loans { pin, permit, saved_rsp, arch, cpu } = loans;
     cell.pin.store(pin.into_raw(), Ordering::Relaxed);
     cell.permit.store(permit.park(), Ordering::Relaxed);
     cell.saved_rsp.store(saved_rsp, Ordering::Relaxed);
     cell.cpu.store(cpu, Ordering::Relaxed);
-    // SAFETY: the cell is empty (asserted above), so no taker can observe it
+    // SAFETY: the cell is empty (settled above), so no taker can observe it
     // before the Release store of `generation` below.
     unsafe { *cell.arch.get() = Some(arch) };
     // ORDERING: the SeqCst exchange publishes the payload and, as a full barrier,
@@ -107,9 +110,41 @@ pub(super) fn park(slot: usize, generation: u64, loans: Loans) -> bool {
 pub(super) fn take(slot: usize, generation: u64) -> Option<Loans> {
     let cell = &CELLS[slot];
     cell.generation
-        .compare_exchange(generation, 0, Ordering::AcqRel, Ordering::Acquire)
+        .compare_exchange(generation, DRAINING, Ordering::AcqRel, Ordering::Acquire)
         .ok()?;
-    Some(cell.drain())
+    let loans = cell.drain();
+    // ORDERING: Release orders the payload reads in `drain` before the cell can
+    // be reused; `settle_stale_cell` observes zero with Acquire.
+    cell.generation.store(0, Ordering::Release);
+    Some(loans)
+}
+
+/// Leaves `cell` empty for a park of `generation`.
+///
+/// An owner transition revokes the cell of the generation it leaves, but the
+/// revoking hook runs after that transition's CAS. If the hook's CPU is delayed
+/// (an interrupt, or a descheduled vCPU) the task can already have been woken,
+/// run and blocked again, so the cell of an older generation is still published
+/// when the new park arrives. That is not a bug in either party: whoever takes
+/// the word owns the loans, so retire the stale cell here and the late hook
+/// finds nothing. A cell that another CPU is draining is waited out, because
+/// overwriting its payload would corrupt that read.
+fn settle_stale_cell(slot: usize, cell: &Cell, generation: u64) {
+    let mut spins = 0_u64;
+    loop {
+        match cell.generation.load(Ordering::Acquire) {
+            0 => return,
+            DRAINING => {
+                spins += 1;
+                assert!(spins < 1 << 30, "resident cell drain never finished");
+                core::hint::spin_loop();
+            }
+            stale => {
+                assert_ne!(stale, generation, "resident cell parked twice for one generation");
+                drop(take(slot, stale));
+            }
+        }
+    }
 }
 
 /// Observation for admission decisions; grants nothing.

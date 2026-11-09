@@ -66,6 +66,17 @@ dropped record until its owner abandons it. Admission is not durable delivery.
   sigaltstack (the mask is re-seeded from the kernel on the next request) and
   keeps sigaltstack entries until process exit: a bounded residue, not a loss of
   live state. Thread exit is emitted only to procd.
+- The lifecycle transaction id is a global non-wrapping `u64` allocator
+  (`process_table.rs`); the trace marker records its low 32 bits. Exhaustion
+  (practically unreachable) fails every later spawn/exec/exit closed instead of
+  wrapping onto a live id.
+- User copy-out of a struct goes through `usermem::write_current_user_struct` /
+  `write_current_user_slice`, which require `rustos_user_abi::wire::UserWire`.
+  Implement it only with `user_wire!(Type { field: Ty, .. })`: the macro lists
+  every field (a missing or mistyped field is a compile error), requires each
+  field to be `UserWire` itself, and asserts the field sizes sum to the type's
+  size. A struct with padding therefore cannot be copied out; the padding must
+  be an explicit zeroed field. Do not hand-cast a struct to bytes for copy-out.
 - Vfsd is a fourth consumer (`LifecycleConsumer::VfsPolicy`, selected by the
   `VfsPolicy` capability, after the rootd/syscalld/procd capabilities). It
   receives every exit plus a `LIFECYCLE_EVENT_FORK` (`pid` = child,

@@ -14,6 +14,15 @@
   Abandoned/cancelled callers therefore retain only bounded, expiring state.
   Failed stats preparation publishes no grant, and a full live quota returns
   `EAGAIN` without silently evicting another reader's authority.
+  The grant is issued by ring0 on behalf of the descriptor's owner: inputd
+  cannot see the fd table, so it trusts the `(pid, tid, fd, access)` tuple only
+  because no ordinary process can reach the inputd endpoint. That holds because
+  `authorize_service_lookup` fails closed for any caller rootd has not bound to a
+  service identity, and rootd's routing matrix
+  (`component_policy::immutable_routing_table_matches_legacy_service_capability_matrix`)
+  lets only initd and uiserver look up `IPC_SERVICE_INPUTD`. Widening that matrix
+  hands the holder the ability to mint read grants for any pid, so such a change
+  must also move the grant check into ring0.
 - inputd owns a single System-class `inputd-dvm-ingress` worker. It waits in
   `SYS_RUSTOS_INPUT_WAIT_BROKER`, which arms before sleeping and rechecks raw
   producer/consumer cursors after registration; the MSI-X leaf only wakes that

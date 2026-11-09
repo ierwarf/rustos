@@ -833,7 +833,10 @@ pub(super) fn set_runnable(slot: usize, runnable: bool) {
         .expect("scheduler owner slot exceeds capacity");
     loop {
         let observed = word.load();
-        if observed.runnable == runnable {
+        // A terminal owner word is settled by exact-value CASes (retire
+        // completion, slot release); metadata written into it would make
+        // those CASes lose and panic.
+        if observed.runnable == runnable || observed.state.is_terminal() {
             return;
         }
         if word
@@ -889,6 +892,9 @@ pub(super) fn set_wait_armed(slot: usize, armed: bool) {
     let word = &OWNER_WORDS[slot];
     loop {
         let observed = word.load();
+        if observed.state.is_terminal() {
+            return;
+        }
         if word
             .compare_exchange(
                 observed,
@@ -906,6 +912,9 @@ pub(super) fn set_wait_reason(slot: usize, reason_kind: u8) {
     let word = &OWNER_WORDS[slot];
     loop {
         let observed = word.load();
+        if observed.state.is_terminal() {
+            return;
+        }
         if word
             .compare_exchange(
                 observed,

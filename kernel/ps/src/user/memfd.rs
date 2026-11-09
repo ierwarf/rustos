@@ -145,15 +145,17 @@ impl MemfdHandle {
         }
 
         let mut open = self.inner.lock();
-        let mut state = open.object.state.lock();
         let end = open
             .cursor
             .checked_add(src.len())
             .ok_or(MemfdError::InvalidArgument)?;
-        check_write_seals(&state, end)?;
-        ensure_len_locked(&mut state, end)?;
-        write_at_locked(state.frames.as_slice(), open.cursor, src);
-        drop(state);
+        let cursor = open.cursor;
+        grow_then(
+            &open.object,
+            end,
+            |state| check_write_seals(state, end),
+            |state| write_at_locked(state.frames.as_slice(), cursor, src),
+        )?;
         open.cursor = end;
         Ok(src.len())
     }
@@ -218,13 +220,18 @@ impl MemfdHandle {
             return Ok(());
         }
 
-        if len > state.len {
-            if state.seals & linux_abi::F_SEAL_GROW as u32 != 0 {
-                return Err(MemfdError::PermissionDenied);
-            }
-            ensure_len_locked(&mut state, len)?;
-        }
-        Ok(())
+        drop(state);
+        grow_then(
+            &object,
+            len,
+            |state| {
+                if state.len < len && state.seals & linux_abi::F_SEAL_GROW as u32 != 0 {
+                    return Err(MemfdError::PermissionDenied);
+                }
+                Ok(())
+            },
+            |_| (),
+        )
     }
 
     pub fn seals(&self) -> u32 {
@@ -370,41 +377,91 @@ fn next_mapping_counts(
     Ok((mapping_count, writable_mapping_count))
 }
 
-fn ensure_len_locked(state: &mut MemfdState, len: usize) -> Result<(), MemfdError> {
-    // Only grows. A write that ends inside the file must not shorten it:
-    // shrinking is `truncate`'s job, which also releases frames and zeroes the
-    // retained tail.
-    if len <= state.len {
-        return Ok(());
-    }
+/// Zero-filled frames allocated outside the object lock. Dropping them frees
+/// any frame that was not installed, so every early return releases its pages.
+struct StagedFrames(Vec<u64>);
 
-    let required_pages = len.div_ceil(PAGE_SIZE);
-    let original_len = state.frames.len();
-    while state.frames.len() < required_pages {
-        // Grow metadata only as frames are admitted. Reserving the entire
-        // caller-requested length first would retain huge kernel vectors even
-        // when the physical/job quota refuses the very first page.
-        let Some(frame_phys) = state.frames.try_reserve(1).ok()
-            .and_then(|_| phys::alloc_frame_user()) else {
-            for frame_phys in state.frames.drain(original_len..) {
-                phys::free_frame(PhysAddr::new(frame_phys));
+impl StagedFrames {
+    /// Allocates and zeroes `count` frames without holding any lock, so a large
+    /// grow never stalls readers, mappers or sealers of the same object.
+    fn zeroed(count: usize) -> Result<Self, MemfdError> {
+        let mut staged = Self(Vec::new());
+        staged.0.try_reserve_exact(count).map_err(|_| MemfdError::NoMemory)?;
+        for _ in 0..count {
+            let frame_phys = phys::alloc_frame_user().ok_or(MemfdError::NoMemory)?;
+            // The frame is recorded before it is touched so a failure below
+            // cannot leak it.
+            staged.0.push(frame_phys.as_u64());
+            // SAFETY: the freshly allocated frame is exclusively owned by this
+            // staging buffer, the higher-half direct map covers one complete
+            // page, and nothing publishes the frame until it is installed.
+            unsafe {
+                ptr::write_bytes(
+                    kernel_vm::higher_half_addr(frame_phys.as_u64()) as *mut u8,
+                    0,
+                    PAGE_SIZE,
+                );
             }
-            return Err(MemfdError::NoMemory);
-        };
-        // SAFETY: The freshly allocated frame is exclusively owned by this
-        // object, the higher-half direct map covers one complete page, and no
-        // handle publishes the frame until zeroing completes.
-        unsafe {
-            ptr::write_bytes(
-                kernel_vm::higher_half_addr(frame_phys.as_u64()) as *mut u8,
-                0,
-                PAGE_SIZE,
-            );
         }
-        state.frames.push(frame_phys.as_u64());
+        Ok(staged)
     }
-    state.len = len;
-    Ok(())
+}
+
+impl Drop for StagedFrames {
+    fn drop(&mut self) {
+        for frame_phys in self.0.drain(..) {
+            phys::free_frame(PhysAddr::new(frame_phys));
+        }
+    }
+}
+
+/// Bounded retries when concurrent grow/shrink keep invalidating a staged plan.
+const GROW_ATTEMPTS: usize = 8;
+
+/// Grows the object to at least `len` bytes, then runs `then` under the object
+/// lock with the length guaranteed.
+///
+/// Frame allocation and zeroing happen with the lock dropped; the plan is
+/// re-validated (`check`) and re-sized after relocking because a seal, a
+/// truncate or another grower may have changed the object meanwhile. Frames that
+/// are no longer needed are freed, and a plan that keeps being invalidated fails
+/// with `Busy` instead of looping forever.
+fn grow_then<R>(
+    object: &MemfdObject,
+    len: usize,
+    check: impl Fn(&MemfdState) -> Result<(), MemfdError>,
+    then: impl FnOnce(&mut MemfdState) -> R,
+) -> Result<R, MemfdError> {
+    let required_pages = len.div_ceil(PAGE_SIZE);
+    for _ in 0..GROW_ATTEMPTS {
+        let missing = {
+            let mut state = object.state.lock();
+            check(&state)?;
+            if state.frames.len() >= required_pages {
+                // Only grows: a write ending inside the file must not shorten
+                // it (shrinking is `truncate`'s job).
+                state.len = state.len.max(len);
+                return Ok(then(&mut state));
+            }
+            required_pages - state.frames.len()
+        };
+        let mut staged = StagedFrames::zeroed(missing)?;
+        let mut state = object.state.lock();
+        check(&state)?;
+        let still_missing = required_pages.saturating_sub(state.frames.len());
+        let take = still_missing.min(staged.0.len());
+        state
+            .frames
+            .try_reserve(take)
+            .map_err(|_| MemfdError::NoMemory)?;
+        let keep = staged.0.len() - take;
+        state.frames.extend(staged.0.drain(keep..));
+        // Surplus frames (a concurrent grower won part of the range) are freed
+        // by `staged`'s Drop after the lock is released below.
+        drop(state);
+        drop(staged);
+    }
+    Err(MemfdError::Busy)
 }
 
 fn align_up_len(len: usize) -> Option<usize> {
@@ -467,6 +524,41 @@ fn write_at_locked(frames: &[u64], offset: usize, src: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn empty_object(seals: u32) -> MemfdObject {
+        MemfdObject {
+            object_id: 1,
+            state: Mutex::new(MemfdState {
+                name: String::from("test"),
+                len: 0,
+                frames: Vec::new(),
+                seals,
+                mapping_count: 0,
+                writable_mapping_count: 0,
+            }),
+        }
+    }
+
+    #[test]
+    fn grow_then_checks_before_it_allocates_and_runs_the_action_under_the_lock() {
+        // A seal that refuses the grow must fail before any frame is staged.
+        // This host test has no frame allocator, so reaching `StagedFrames`
+        // would fail with `NoMemory` instead of the seal's error.
+        let sealed = empty_object(linux_abi::F_SEAL_GROW as u32);
+        let refused = grow_then(
+            &sealed,
+            PAGE_SIZE,
+            |state| check_write_seals(state, PAGE_SIZE),
+            |_| (),
+        );
+        assert_eq!(refused, Err(MemfdError::PermissionDenied));
+
+        // A zero-length request needs no frames and still runs the action.
+        let object = empty_object(0);
+        let ran = grow_then(&object, 0, |_| Ok(()), |state| state.len);
+        assert_eq!(ran, Ok(0));
+        assert!(object.state.lock().frames.is_empty());
+    }
 
     #[test]
     fn memfd_seals_reject_growth_and_mapping_counter_overflow() {

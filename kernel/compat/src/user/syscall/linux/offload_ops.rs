@@ -352,16 +352,7 @@ pub(super) fn drain_lifecycle_events(
     let count = snapshot.len();
     let out_count = count as u32;
     if out_count != 0 {
-        // SAFETY: `LifecycleEventWire` is `repr(C)` with no padding (explicit
-        // reserved fields only), `snapshot` holds `count` initialized elements
-        // and stays borrowed for the slice's lifetime.
-        let bytes = unsafe {
-            core::slice::from_raw_parts(
-                snapshot.as_ptr().cast::<u8>(),
-                count * core::mem::size_of::<LifecycleEventWire>(),
-            )
-        };
-        if let Err(error) = usermem::write_current_user_bytes(args.out_events_ptr, bytes) {
+        if let Err(error) = usermem::write_current_user_slice(args.out_events_ptr, &snapshot) {
             restore_thread_loss(thread_loss_taken);
             return Err(address_space_error_to_linux_errno(error));
         }

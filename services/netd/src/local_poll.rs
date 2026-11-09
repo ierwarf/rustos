@@ -61,11 +61,17 @@ pub(super) fn defer_local_poll_request_at(
     // Keep the expiry check ahead of the reservation so an old request cannot
     // exhaust the detached local-poll bound without receiving a reply.
     request_deadline_remaining_ns_at(&request, now_ns)?;
+    let pid = request.pid;
+    if !LOCAL_POLL_CLIENTS.reserve(pid, per_client_limit(MAX_PENDING_BLOCKING_REQUESTS)) {
+        return Err(libc::EAGAIN);
+    }
     if !reserve_pending_slot(&PENDING_LOCAL_POLLS, MAX_PENDING_BLOCKING_REQUESTS) {
+        LOCAL_POLL_CLIENTS.release(pid);
         return Err(libc::EAGAIN);
     }
     let Ok(mut waiters) = local_poll_waiters().lock() else {
         release_pending_slot(&PENDING_LOCAL_POLLS);
+        LOCAL_POLL_CLIENTS.release(pid);
         return Err(libc::EAGAIN);
     };
     waiters.push_back(DeferredLocalPoll {
@@ -137,7 +143,7 @@ pub(super) fn service_local_poll_waiters_pass() {
             |reply_cap, response| {
                 let _ = publish_reply(reply_cap, response);
             },
-            || release_pending_slot(&PENDING_LOCAL_POLLS),
+            |pid| release_local_poll_slot(pid),
         ) {
             still_waiting.push_back(waiter);
         }
@@ -157,7 +163,7 @@ pub(super) fn service_local_poll_waiters_pass() {
                         ..NetdIpcResponse::default()
                     };
                     let _ = publish_reply(waiter.reply_cap, &response);
-                    release_pending_slot(&PENDING_LOCAL_POLLS);
+                    release_local_poll_slot(waiter.request.pid);
                 }
             }
         }
@@ -176,7 +182,7 @@ pub(super) fn service_one_local_poll_waiter<F, R>(
 ) -> Option<DeferredLocalPoll>
 where
     F: FnOnce(u64, &NetdIpcResponse),
-    R: FnOnce(),
+    R: FnOnce(u64),
 {
     let mut response = NetdIpcResponse {
         version: NETD_IPC_ABI_VERSION,
@@ -197,7 +203,7 @@ where
         response.reserved1 = NETD_IPC_RESPONSE_FLAG_LATENCY_HANDOFF;
     }
     reply(waiter.reply_cap, &response);
-    release();
+    release(waiter.request.pid);
     None
 }
 
@@ -213,6 +219,11 @@ pub(super) fn take_deferred_queue<T>(locked: LockResult<MutexGuard<'_, VecDeque<
             (std::mem::take(&mut *waiters), true)
         }
     }
+}
+
+pub(super) fn release_local_poll_slot(pid: u64) {
+    release_pending_slot(&PENDING_LOCAL_POLLS);
+    LOCAL_POLL_CLIENTS.release(pid);
 }
 
 pub(super) fn reserve_pending_slot(counter: &AtomicUsize, limit: usize) -> bool {

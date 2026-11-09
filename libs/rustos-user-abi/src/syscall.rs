@@ -3845,3 +3845,22 @@ pub use product_snapshot_evidence::{
     SYS_RUSTOS_PRODUCT_EXECUTABLE_SNAPSHOT_EVIDENCE,
     product_executable_snapshot_evidence_shape_valid,
 };
+
+// Copy-out safety: no padding bytes (see `wire`).
+crate::user_wire!(DvmBlockInfoWire { generation: u64, capacity_sectors: u64, features: u64, logical_block_size: u32, physical_block_size: u32, flags: u32, reserved0: u32 });
+crate::user_wire!(DvmBlockTicketWire { generation: u64, request_id: u64, data_slot: u32, reserved0: u32 });
+crate::user_wire!(InputStatsWire { pointer_packet_submits: u64, read_calls: u64, read_events: u64, lock_active: u64, lock_last_seq: u64, queued: u64, dropped_discrete: u64, dropped_lossy: u64, flags: u32, reserved0: u32, readiness_generation: u64 });
+crate::user_wire!(RustosJobArgs { abi_version: u16, op: u16, flags: u32, job_handle: u64, pid: u64, result_handle: u64, job: u64, parent_job: u64, state: u32, depth: u32, processes: u64, subtree_processes: u64, children: u64, kills: u64, remaining: u64, rights: u32, reserved0: u32, limit_mask: u32, reserved1: u32, limit_processes: u64, limit_threads: u64, effective_processes: u64, effective_threads: u64, usage_processes: u64, usage_threads: u64, limit_memory_pages: u64, effective_memory_pages: u64, usage_memory_pages: u64 });
+crate::user_wire!(RustosJobSessionArgs { abi_version: u16, op: u16, flags: u32, job_handle: u64, client_pid: u64, job_id: u64, limit: u64, effective: u64, usage: u64, reserved: u64, provider_pid: u64, token: u64 });
+crate::user_wire!(RustosJobKmemArgs { abi_version: u16, op: u16, flags: u32, job_handle: u64, process_object_max_bytes: u64, usage_process_object_bytes: u64, object_size_bytes: u64, job: u64, reserved: u64 });
+crate::user_wire!(RustosJobMemoryQosArgs { abi_version: u16, op: u16, flags: u32, job_handle: u64, high_pages: u64, min_pages: u64, effective_high_pages: u64, usage_pages: u64, high_crossings: u64, reserved: u64 });
+crate::user_wire!(RustosCheckpointJournalArgs { abi_version: u16, op: u16, flags: u32, cursor: u64, next_cursor: u64, service_id: u64, record_kind: u16, done: u16, reserved: u32, record: ServiceCheckpointRecordWire });
+crate::user_wire!(RustosRootdMemoryBrokerArgs { abi_version: u16, reserved0: u16, flags: u32, usable_pages: u64, free_pages: u64, min_free_pages: u64, watermark_denials: u64, entry_count: u32, reserved1: u32, entries: [RootdMemoryCensusEntry; ROOTD_MEMORY_CENSUS_MAX_ENTRIES] });
+crate::user_wire!(LifecycleEventWire { event: u16, reserved0: u16, exit_status: i32, pid: u64, parent_pid: u64, tid: u64 });
+crate::user_wire!(LifecycleDrainBrokerArgs { abi_version: u16, reserved0: u16, reserved1: u32, out_events_ptr: u64, out_capacity: u32, reserved2: u32, out_count_ptr: u64 });
+crate::user_wire!(ServiceCheckpointRecordWire { version: u16, flags: u16, value_len: u32, key_hi: u64, key_lo: u64, parent_hi: u64, parent_lo: u64, operation_hi: u64, operation_lo: u64, revision: u64, value: [u8; SERVICE_CHECKPOINT_VALUE_CAPACITY] });
+crate::user_wire!(RootdMemoryCensusEntry { process_id: u64, parent_process_id: u64, resident_pages: u64, job: u64 });
+crate::user_wire!(RustosMmLayoutBrokerResult { brk_start: u64, brk_current: u64, brk_mapped_end: u64, mmap_next: u64, user_range_start: u64, user_range_end: u64 });
+crate::user_wire!(RustosMmFdBrokerResult { kind: u16, reserved0: u16, path_len: u32, rights: u64, len: u64, path: [u8; MM_BROKER_PATH_CAPACITY] });
+crate::user_wire!(RustosMmMapBrokerResult { addr: u64, len: u64 });
+crate::user_wire!(InputDvmRecordWire { transport_generation: u64, flags: u32, len: u16, reserved0: u16, bytes: [u8; INPUTD_DVM_RECORD_BYTES] });

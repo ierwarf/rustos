@@ -3,7 +3,7 @@ extern crate std;
 use crate::multitask::{process_table, scheduler};
 const SLOT: usize = 125;
 const ID: u64 = 125001;
-fn stamp(n: u32) -> ExecReservation {
+fn stamp(n: u64) -> ExecReservation {
     process_table::test_exec_stamp(2, 3, n)
 }
 fn metadata() -> TaskIdentity {

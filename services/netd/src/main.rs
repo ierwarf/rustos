@@ -23,7 +23,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::io::Write;
 use std::mem::size_of;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Condvar, LockResult, Mutex, MutexGuard, OnceLock};
+use std::sync::{Condvar, LockResult, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant as StdInstant};
 
@@ -141,6 +141,7 @@ const REF_REPLAY_CAPACITY: usize = 4096;
 const REF_REPLAY_MIN_RETENTION: Duration = Duration::from_secs(60);
 static PENDING_BLOCKING_REQUESTS: AtomicUsize = AtomicUsize::new(0);
 static PENDING_LOCAL_POLLS: AtomicUsize = AtomicUsize::new(0);
+static LOCAL_POLL_CLIENTS: ClientSlots = ClientSlots::new();
 static ACTIVE_BLOCKING_WORKERS: AtomicUsize = AtomicUsize::new(0);
 static READINESS_GENERATION: AtomicU64 = AtomicU64::new(1);
 #[cfg(test)]
@@ -256,6 +257,15 @@ struct BlockingRequest {
 struct BlockingRequestQueue {
     requests: Mutex<VecDeque<BlockingRequest>>,
     available: Condvar,
+    /// Pending slots (queued plus running) per requesting process.
+    clients: ClientSlots,
+}
+
+/// Per-process share of a bounded pending-request pool. The pool bound alone
+/// lets one process that parks `limit` requests refuse every other client
+/// with `EAGAIN`; this ledger reserves the remainder for the others.
+struct ClientSlots {
+    held: Mutex<BTreeMap<u64, usize>>,
 }
 
 struct DeferredLocalPoll {

@@ -15,6 +15,7 @@ pub mod performance;
 pub mod syscall;
 pub mod ui;
 pub mod windows;
+pub mod wire;
 
 #[cfg(test)]
 mod tests {

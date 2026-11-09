@@ -262,11 +262,30 @@ impl WaylandShmPoolState {
     }
 }
 
-fn validate_shm_extent(fd: std::os::fd::RawFd, len: usize) -> std::io::Result<()> {
+pub(super) fn validate_shm_extent(fd: std::os::fd::RawFd, len: usize) -> std::io::Result<()> {
     if len == 0 || len > MAX_WAYLAND_SHM_POOL_BYTES {
         return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
     }
+    require_regular_file(fd)?;
     read_shm_snapshot(fd, len - 1, 1).map(|_| ())
+}
+
+/// A pool fd is client-chosen, and `pread` on it runs on the compositor's UI
+/// thread. Only a regular file (memfd, or a vfsd-backed file whose read is one
+/// deadline-bounded service call) has a bounded read; a FIFO, socket, tty or
+/// device can park the compositor for as long as its peer likes, so those are
+/// refused at admission instead of being read.
+fn require_regular_file(fd: std::os::fd::RawFd) -> std::io::Result<()> {
+    // SAFETY: `stat` is plain data and `fstat` fully initialises it on success.
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `stat` is a valid out-pointer for the duration of the call.
+    if unsafe { libc::fstat(fd, &mut stat) } < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return Err(std::io::Error::from_raw_os_error(libc::EINVAL));
+    }
+    Ok(())
 }
 
 /// Never form a reference into client-backed pages. RustOS supports pread for

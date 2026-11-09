@@ -149,3 +149,7 @@ mod tests {
                    child.intersection(parent.intersection(grandparent)));
     }
 }
+
+// Copy-out safety: no padding bytes (see `wire`).
+crate::user_wire!(RustosJobPolicyArgs { abi_version: u16, op: u16, flags: u32, job_handle: u64, job: u64, own: RustosJobPolicy, effective: RustosJobPolicy, reserved: u64 });
+crate::user_wire!(RustosJobPolicy { words: [u64; JOB_POLICY_WORDS] });

@@ -1119,3 +1119,22 @@ fn retirement_removes_local_queue_membership() {
     release_retired(slot);
     reset_before_publication();
 }
+
+#[test]
+fn lock_free_metadata_writers_leave_a_terminal_owner_word_untouched() {
+    // Retire completion and slot release are exact-value CASes on the word; a
+    // late run-intent or wait write into a Retiring/Retired word would make them
+    // lose and panic ("scheduler retire completion raced").
+    const SLOT: usize = 117;
+    for state in [RunOwnerState::Retiring, RunOwnerState::Retired] {
+        let before = owner(SLOT);
+        let terminal = before.next(state, None);
+        OWNER_WORDS[SLOT].compare_exchange(before, terminal).unwrap();
+        set_runnable(SLOT, true);
+        set_wait_armed(SLOT, true);
+        set_wait_reason(SLOT, 1);
+        assert_eq!(owner(SLOT), terminal, "{state:?} word was modified");
+        let dormant = terminal.next(RunOwnerState::Dormant, None);
+        OWNER_WORDS[SLOT].compare_exchange(terminal, dormant).unwrap();
+    }
+}

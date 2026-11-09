@@ -469,9 +469,10 @@ impl<D: BlockDevice> FatVolume<D> {
         for (seen, entry_result) in dir.iter().enumerate() {
             check_dir_walk(seen, limit)?;
             let entry = entry_result?;
-            // Lookup is case-insensitive everywhere else (open/create), so
-            // stat must agree or a file could open but not stat.
-            if !entry.file_name().eq_ignore_ascii_case(child) {
+            // Lookup is case-insensitive and accepts the 8.3 alias everywhere
+            // else (open/create), so stat must agree or a file could open but
+            // not stat.
+            if !entry_matches(&entry, child) {
                 continue;
             }
             return Ok(FatMetadata {
@@ -484,6 +485,32 @@ impl<D: BlockDevice> FatVolume<D> {
             });
         }
         Err(fatfs::Error::NotFound)
+    }
+
+    /// Resolves `path` to the one spelling the volume stores: every component
+    /// replaced by its on-disk (long) name. Case variants and 8.3 aliases of
+    /// the same node all resolve to the same string, so callers can key caches
+    /// and derive identities from it without the aliases splitting an object
+    /// into several. The returned path has no leading separator.
+    pub fn canonical_path(&self, path: &str) -> Result<String, FatError> {
+        let normalized = normalize_fat_path(path);
+        let mut canonical = String::with_capacity(normalized.len());
+        let mut dir = self.fs.root_dir();
+        let mut components = normalized.split('/').filter(|c| !c.is_empty()).peekable();
+        while let Some(component) = components.next() {
+            let entry = find_entry_case_insensitive(&dir, component, self.max_dir_entries())?;
+            if !canonical.is_empty() {
+                canonical.push('/');
+            }
+            canonical.push_str(&entry.file_name());
+            if components.peek().is_some() {
+                if !entry.is_dir() {
+                    return Err(fatfs::Error::InvalidInput);
+                }
+                dir = entry.to_dir();
+            }
+        }
+        Ok(canonical)
     }
 
     pub fn read_dir(&self, path: &str) -> Result<Vec<FatDirEntry>, FatError> {
@@ -699,11 +726,21 @@ fn find_entry_case_insensitive<'a, D: BlockDevice>(
     for (seen, entry) in dir.iter().enumerate() {
         check_dir_walk(seen, limit)?;
         let entry = entry?;
-        if entry.file_name().eq_ignore_ascii_case(name) {
+        if entry_matches(&entry, name) {
             return Ok(entry);
         }
     }
     Err(fatfs::Error::NotFound)
+}
+
+/// True when `name` designates `entry`: its long name or its 8.3 short alias,
+/// compared ASCII-case-insensitively exactly as fatfs's own path lookup does.
+fn entry_matches<D: BlockDevice>(
+    entry: &fatfs::DirEntry<'_, FatDisk<D>, fatfs::DefaultTimeProvider, fatfs::LossyOemCpConverter>,
+    name: &str,
+) -> bool {
+    entry.file_name().eq_ignore_ascii_case(name)
+        || entry.short_file_name().eq_ignore_ascii_case(name)
 }
 
 #[cfg(test)]
@@ -859,6 +896,51 @@ mod tests {
         // 128 KiB of data plus the FAT probes: a handful of window fills.
         let reads = disk.dev.lock().device.reads;
         assert!(reads <= 6, "reads = {reads}");
+    }
+
+    #[test]
+    fn case_variants_and_short_aliases_resolve_to_one_canonical_path() {
+        let disk = format_disk(512, 4096, 0x0A0B_0C0D);
+        let volume = FatVolume::new(disk).expect("open FAT volume");
+        volume.create_dir("Program Files").expect("create dir");
+        {
+            let mut file = volume
+                .create_file("Program Files/Very Long Name.txt")
+                .expect("create long-named file");
+            file.write_all(b"x").expect("write");
+            file.flush().expect("flush");
+        }
+        let canonical = "Program Files/Very Long Name.txt";
+        let short_dir = volume
+            .read_dir("")
+            .expect("root listing")
+            .into_iter()
+            .next()
+            .expect("one entry");
+        assert_eq!(short_dir.name, "Program Files");
+        for alias in [
+            "program files/very long name.txt",
+            "PROGRAM FILES\\VERY LONG NAME.TXT",
+            "/Program Files/Very Long Name.txt",
+            "PROGRA~1/VERYLO~1.TXT",
+            "progra~1/verylo~1.txt",
+        ] {
+            assert_eq!(
+                volume.canonical_path(alias).expect(alias),
+                canonical,
+                "{alias}"
+            );
+            // stat must agree with open for every alias.
+            let meta = volume.metadata(alias).expect(alias);
+            assert_eq!((meta.kind, meta.len), (FatNodeKind::File, 1), "{alias}");
+        }
+        assert!(volume.canonical_path("Program Files/missing").is_err());
+        assert!(
+            volume
+                .canonical_path("Program Files/Very Long Name.txt/below-a-file")
+                .is_err()
+        );
+        volume.unmount().expect("unmount");
     }
 
     #[test]

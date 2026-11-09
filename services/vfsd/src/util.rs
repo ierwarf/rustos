@@ -13,7 +13,7 @@ use super::{
     DEVICE_FILE_MODE_BITS, DT_CHR, DT_DIR, DT_REG, EINVAL,
 };
 use storage_fat::FatError;
-pub(super) use vfsd::path::normalize_absolute_path;
+pub(super) use vfsd::path::{fat_cache_key, normalize_absolute_path, path_inode};
 use vfsd::storage_io_error_to_linux_errno;
 
 pub(super) fn is_at_fdcwd(dirfd: u64) -> bool {
@@ -115,15 +115,6 @@ pub(super) fn encode_dirent(entry: &DirEntry, next_offset: usize) -> Vec<u8> {
     bytes[19..19 + entry.name.len()].copy_from_slice(entry.name.as_bytes());
     bytes[19 + entry.name.len()] = 0;
     bytes
-}
-
-pub(super) fn path_inode(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-    for byte in bytes {
-        hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x1000_0000_01b3);
-    }
-    hash.max(1)
 }
 
 pub(super) fn linux_request_path(

@@ -31,25 +31,58 @@ Open items found but not done (evidence in the agent reports of this session):
 - FIXED: `formal/check-performance-contracts.sh` required the removed loaderd
   trace `executable snapshot call begin`; it now pins the rate-bounded snapshot
   progress output in `snapshot_client.rs`.
-- Lifecycle transaction id is a global non-wrapping u32
-  (`process_table.rs`); ~4.3e9 spawn/exec/exit fail all later ones closed.
-  Widen to u64 across ps, object api and formal models.
+- DONE (uncommitted, host-tested only; no KVM): lifecycle transaction id is a
+  non-wrapping u64 (`process_table.rs`).
 - DONE (uncommitted, host-tested only; no KVM): procd thread-exit lifecycle
   event (`LIFECYCLE_EVENT_THREAD_EXIT`, drain ABI v2, separate 256-entry procd
   queue + `THREAD_EXIT_LOST` marker; see `docs/ai/abi/core.md`). Residue: after
   a lost marker, dead threads that own a sigaltstack stay until process exit.
-- `write_current_user_struct<T: Copy>` copies padding (kernel stack infoleak
-  risk, ~25 compat callers): bound it with a no-padding marker trait.
-- pagerd `BACKING/RELEASE/PROTECT_OBJECT` ops have no in-tree caller and are
-  gated only by sender == claimed identity; delete them or pin the sender.
-- inputd `AUTHORIZE_READ` self-authorisation relies on kernel endpoint lookup
-  policy being restrictive; confirm in kernel/compat.
-- `map_prepared_pager_fault_frame_at` has no extent parameter; callers must
-  clip (compat now clips to `offered_run_pages`).
-- memfd `ensure_len_locked` zeroes a whole grow under the object spinlock;
-  vfsd caches key FAT paths without 8.3/case alias canonicalisation;
-  netd blocking pools lack a per-pid quota; `read_shm_snapshot` blocks the UI
-  thread on a client fd; `advance_readiness_generation` panics on EPERM.
+- DONE: `UserWire` + `user_wire!` (`libs/rustos-user-abi/src/wire.rs`) makes a
+  padded struct impossible to copy out; `write_current_user_struct` and the new
+  `write_current_user_slice` require it, raw casts in offload/input broker ops
+  are gone.
+- DONE: pagerd region-table edits (BACKING/RELEASE/PROTECT) are ring0-only;
+  other pagerd ops keep the exact-subject rule.
+- DONE: inputd `AUTHORIZE_READ` trust boundary documented in
+  `docs/ai/abi/input-console-device.md` (relies on the rootd capability matrix;
+  widening it requires moving the grant check into ring0).
+- DONE: `map_prepared_pager_fault_frame_at` takes and enforces the validated
+  extent.
+- DONE: memfd grow stages frames outside the object spinlock (`grow_then`).
+- DONE: FAT engine matches case/8.3 aliases through `entry_matches`; vfsd
+  `path_inode` and all FAT caches fold ASCII case (`vfsd::path`). Residual: an
+  8.3 alias spelling is still its own inode/cache entry (see
+  `docs/ai/abi/vfs-storage.md`).
+- DONE: netd pending pools keep a per-pid half-pool share (`ClientSlots`).
+  Residual: admission is fair, worker time is bounded only by request deadlines.
+- DONE: `wl_shm` pools must be regular files; a vfsd-backed pool is still read
+  synchronously on the UI thread (bounded by the vfsd call deadline). Moving the
+  snapshot copy off the compositor thread is a larger uiserver redesign.
+- DONE: vfsd readiness-generation publication failure is fail-stop
+  (`exit_group(134)`) instead of a panic.
+- 4-vCPU isolated boot run (2026-11-09, tree with the changes above, sealed PR
+  gate): 2 lanes x 50 boots, private `BUILD_DIR`/`TMPDIR` per lane, shared
+  read-only boot image (QEMU `-snapshot`), disjoint `taskset` cores 0-7 / 8-15,
+  `--gui-dvm-surfaces --dvm-block-shmem --timeout 50 --expect "ipcbench: end"`.
+  91/100 passed. Failures: 6 UI/timeout class (ipcbench-end or compositor/
+  wayclick missing, one input-ring arm timeout) and 3 guest scheduler panics, all
+  on lane 1: `resident.rs:77` "resident cell parked over live loans" (x2) and
+  `runqueue.rs:1284` "scheduler retire completion raced" (state Retiring). The
+  panics are in code this batch did not touch; no HEAD control was run (the
+  user declined it), so the 3/100 rate is not attributed. Both were root-caused
+  statically and fixed: (1) `set_runnable`/`set_wait_armed`/`set_wait_reason`
+  wrote metadata into a Retiring/Retired owner word (late `publish_frame`),
+  making the exact-value retire completion CAS lose; they now skip terminal
+  words. (2) A delayed owner-transition eviction hook let a task re-block and
+  re-park over its previous generation's cell; `park` now retires the stale cell
+  itself, and `take` publishes `DRAINING` until the payload is read so a parker
+  never overwrites an evictor's read. Neither is KVM-verified (host tests and
+  mutation rows only). Logs: `~/rustos-evidence/4vcpu-100-2026-11-09/`.
+- Observed once in ~12 full `cargo test -p kernel-ps --lib` runs:
+  `irq_entry_tests::switch::actual_queued_fifo_work_and_exhausted_chain_decline_the_shortcut`
+  failed on `sync_handoff::pending(0)` (cross-test global state); not reproduced.
+- Note: Service bin targets with `test = false` are not built by
+  `cargo test`; run `cargo check -p <svc>` (or `cargo xtask check`) as well.
 
 ## Current checkout (2026-11-07)
 

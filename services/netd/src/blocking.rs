@@ -10,6 +10,61 @@
 
 use super::*;
 
+/// One process may hold at most half of a pool's pending slots, so a single
+/// client (or a runaway one) can never turn the whole pool into `EAGAIN` for
+/// everyone else. This bounds admission, not worker time: a held worker is
+/// still released by the request's own absolute deadline.
+pub(super) fn per_client_limit(pool_limit: usize) -> usize {
+    (pool_limit / 2).max(1)
+}
+
+impl BlockingRequestQueue {
+    pub(super) fn new() -> Self {
+        Self {
+            requests: Mutex::new(VecDeque::new()),
+            available: Condvar::new(),
+            clients: ClientSlots::new(),
+        }
+    }
+}
+
+impl ClientSlots {
+    pub(super) const fn new() -> Self {
+        Self {
+            held: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    pub(super) fn reserve(&self, pid: u64, limit: usize) -> bool {
+        // A poisoned ledger still holds a structurally valid map; refusing
+        // admission forever would be worse than trusting its counts.
+        let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
+        let slot = held.entry(pid).or_insert(0);
+        if *slot >= limit {
+            return false;
+        }
+        *slot += 1;
+        true
+    }
+
+    pub(super) fn release(&self, pid: u64) {
+        let mut held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
+        match held.get_mut(&pid) {
+            Some(slot) if *slot > 1 => *slot -= 1,
+            Some(_) => {
+                held.remove(&pid);
+            }
+            None => debug_assert!(false, "client slot released without a reservation"),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn held_by(&self, pid: u64) -> usize {
+        let held = self.held.lock().unwrap_or_else(PoisonError::into_inner);
+        held.get(&pid).copied().unwrap_or(0)
+    }
+}
+
 pub(super) fn blocking_retry_backoff(attempt: usize) -> Duration {
     BLOCKING_RETRY_BACKOFF
         * (1_u32
@@ -101,18 +156,12 @@ pub(super) fn consume_local_recv_drain_handoff(socket_token: u64) -> bool {
 
 pub(super) fn blocking_request_queue() -> &'static BlockingRequestQueue {
     static QUEUE: OnceLock<BlockingRequestQueue> = OnceLock::new();
-    QUEUE.get_or_init(|| BlockingRequestQueue {
-        requests: Mutex::new(VecDeque::new()),
-        available: Condvar::new(),
-    })
+    QUEUE.get_or_init(BlockingRequestQueue::new)
 }
 
 pub(super) fn lifecycle_request_queue() -> &'static BlockingRequestQueue {
     static QUEUE: OnceLock<BlockingRequestQueue> = OnceLock::new();
-    QUEUE.get_or_init(|| BlockingRequestQueue {
-        requests: Mutex::new(VecDeque::new()),
-        available: Condvar::new(),
-    })
+    QUEUE.get_or_init(BlockingRequestQueue::new)
 }
 
 pub(super) fn start_lifecycle_workers() {
@@ -234,18 +283,20 @@ pub(super) fn enqueue_to_pool(
     if active_workers.load(Ordering::Acquire) == 0 {
         return Err(libc::EAGAIN);
     }
+    // The per-process share is taken before the pool slot so a process at its
+    // share never consumes pool capacity it will have to give back.
+    let pid = request.pid;
+    if !queue
+        .clients
+        .reserve(pid, per_client_limit(pending_limit))
+    {
+        return Err(libc::EAGAIN);
+    }
     // ORDERING: successful admission produces a reserved pending slot; worker
     // completion and rollback consume/release that slot, so AcqRel makes the
     // bounded-capacity decision linearizable against those releases.
-    if pending_counter
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |pending| {
-            if pending >= pending_limit {
-                return None;
-            }
-            Some(pending + 1)
-        })
-        .is_err()
-    {
+    if !reserve_pending_slot(pending_counter, pending_limit) {
+        queue.clients.release(pid);
         return Err(libc::EAGAIN);
     }
     let Ok(mut requests) = queue.requests.lock() else {
@@ -253,6 +304,7 @@ pub(super) fn enqueue_to_pool(
         // admission consumes this released slot, so the rollback must publish
         // the decrement before another bounded reservation succeeds.
         pending_counter.fetch_sub(1, Ordering::AcqRel);
+        queue.clients.release(pid);
         return Err(libc::EAGAIN);
     };
     requests.push_back(BlockingRequest {
@@ -291,6 +343,7 @@ pub(super) fn worker_loop(
         publish_reply(job.reply_cap, &response);
         service_local_poll_waiters();
         release_pending_slot(pending_counter);
+        queue.clients.release(job.request.pid);
     }
 }
 

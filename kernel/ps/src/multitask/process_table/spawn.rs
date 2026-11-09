@@ -19,7 +19,7 @@ use super::*;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SpawnReservation {
     pub(super) handle: ProcessHandle,
-    pub(super) transaction_id: u32,
+    pub(super) transaction_id: u64,
     /// Job requested at reservation; `None` joins the parent's job.
     pub(super) job: Option<jobs::JobId>,
 }
@@ -34,7 +34,7 @@ impl SpawnReservation {
         )
     }
 
-    pub const fn transaction_id(self) -> u32 {
+    pub const fn transaction_id(self) -> u64 {
         self.transaction_id
     }
 

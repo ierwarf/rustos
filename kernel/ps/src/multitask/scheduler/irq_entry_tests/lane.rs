@@ -49,6 +49,36 @@ fn park_receiver(slot: usize, peer: usize) {
 }
 
 #[test]
+fn a_park_retires_the_stale_cell_of_an_older_generation_whose_evictor_is_late() {
+    current_with_peer(true, |slot, peer| {
+        let peer = peer.unwrap();
+        quiet_fifo();
+        make_kernel_frame(slot);
+        make_kernel_frame(peer);
+        park_receiver(slot, peer);
+        let stale = runqueue::owner(peer).generation;
+        assert!(resident::is_resident(peer, stale));
+        // The owner left `stale`, but its revoking hook has not run yet, and the
+        // task has meanwhile blocked again: a park for the next generation
+        // arrives over the still-published old cell.
+        let token = frame_publication::observed_frame_token(peer, 0, false).unwrap();
+        let view = frame_publication::return_view(slot).unwrap();
+        let arch = stack_resources::context::retained_architecture(0, slot, ID, view).unwrap();
+        let pin = stack_resources::cpu_leases::pin_initial(peer, ID + 1).expect("peer allocation pin");
+        let permit = current_identity::execution::initial(peer, ID + 1).expect("peer execution permit");
+        let parked = resident::park(peer, stale + 1, resident::Loans {
+            pin, permit, saved_rsp: token.saved_rsp, arch, cpu: 0 });
+        // The owner word still names `stale`, so the new park evicts itself.
+        assert!(!parked);
+        assert!(!resident::is_resident(peer, stale), "the stale cell must be retired");
+        assert!(!resident::is_resident(peer, stale + 1));
+        // The late hook finds nothing and must not double-drop.
+        resident::on_owner_transition(peer, stale);
+        assert_eq!(resident::permit_units(peer), 0);
+    });
+}
+
+#[test]
 fn actual_lane_call_switches_to_the_parked_receiver_and_parks_the_caller_at_the_ack() {
     current_with_peer(true, |slot, peer| {
         let peer = peer.unwrap();

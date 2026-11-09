@@ -50,6 +50,14 @@ sources are split by responsibility (`service_loop`, `dispatch`, `blocking`,
 `inet_stack`, `poll`, `socket_info`, `packet_provider`, `readiness`); shared
 state types live in `main.rs`.
 
+Every pending-request pool (blocking INET, lifecycle, deferred local poll) also
+keeps a per-process ledger (`ClientSlots`, keyed by the request's `pid`): one
+process may hold at most half the pool's slots, queued or executing, so a single
+client cannot turn the whole pool into `EAGAIN` for everyone else. The share is
+taken before the pool slot and released with it. This bounds admission, not
+worker time; a worker held by a slow request is still freed only by that
+request's own absolute deadline.
+
 Socket funding and publication have distinct owners. Before the first rootd
 CHARGE IPC, netd reserves one of 4096 accounting-custody slots, including its
 eventual refund capacity. Exact CHARGE success is required before preparing any
@@ -329,6 +337,13 @@ do not admit a service, a module-loading path, or a future ABI reuse.
   fallback. The only accepted normal provider is the validated DVM aperture.
 - Built-in framebuffer registration accepts only the DVM primary-provider flag;
   do not infer ownership from geometry or `display_info()` presence.
+- A `wl_shm` pool fd is client-chosen and uiserver reads it with `pread` on the
+  compositor thread (`read_shm_snapshot`; it never maps client pages). Admission
+  and resize therefore require a regular file (memfd or a vfsd-backed file whose
+  read is one deadline-bounded service call); FIFOs, sockets, ttys and devices,
+  whose read can block for as long as a peer chooses, are refused with a
+  protocol error. A vfsd-backed pool is still read synchronously: its worst case
+  is the vfsd call deadline, not unbounded.
 - Display readiness is a two-stage observation. The bootstrap `display_get_info`
   snapshot must carry both primary-provider and DVM-scanout provenance; it may
   precede GPU-atlas creation. The later kernel-stamped

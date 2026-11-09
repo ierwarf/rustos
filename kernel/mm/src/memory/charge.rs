@@ -295,6 +295,12 @@ mod admission_wiring_tests {
             assert!(at - admit < 400, "{what}: admission must sit right before the claim");
         }
         let other = mapping.split_once("pub fn map_prepared_pager_fault_frame_at(").unwrap().1;
+        // The VMA extent is checked before anything is admitted or claimed, so
+        // an out-of-extent request can neither charge nor leak a frame claim.
+        assert!(
+            other.find("extent.end().as_u64()").unwrap()
+                < other.find("phys::root_admits(root_phys, 1)").unwrap()
+        );
         assert!(
             other.find("phys::root_admits(root_phys, 1)").unwrap()
                 < other.find("phys::claim_data_leaf(root_phys, virtual_address, frame_phys)").unwrap()

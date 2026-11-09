@@ -216,3 +216,9 @@ pub struct ConsoleWaitGraphRequest {
     pub wait_ms: u32,
     pub reserved: u32,
 }
+
+// Copy-out safety: no padding bytes (see `wire`).
+crate::user_wire!(ConsoleStateInfo { focused_session_handle: u64, session_count: u32, reserved: u32 });
+crate::user_wire!(ConsoleSnapshotSessionsRequest { sessions_ptr: u64, capacity: u64, count: u64 });
+crate::user_wire!(ConsoleSnapshotSessionOutputRequest { session_handle: u64, bytes_ptr: u64, capacity: u64, count: u64 });
+crate::user_wire!(ConsoleWaitGraphRequest { generation: u64, wait_ms: u32, reserved: u32 });

@@ -59,9 +59,39 @@ fn normalize_component(normalized: &mut String, component: &str) {
     normalized.push_str(component);
 }
 
+/// Identity of a path, stable across ASCII case: the boot volume is FAT, whose
+/// lookup is case-insensitive (`/BIN/Ls` and `/bin/ls` are one file), so the
+/// inode and checkpoint content identity must not tell them apart. 8.3 short
+/// aliases still hash as their own spelling; see the vfsd contract in
+/// `docs/ai/abi/vfs-storage.md`.
+pub fn path_inode(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in bytes {
+        hash ^= u64::from(byte.to_ascii_lowercase());
+        hash = hash.wrapping_mul(0x1000_0000_01b3);
+    }
+    hash.max(1)
+}
+
+/// Key under which path-addressed storage caches file their entries. The FAT
+/// engine matches names ASCII-case-insensitively, so every case spelling of one
+/// path must reach one entry instead of caching the same bytes, listing or
+/// sealed executable image once per spelling.
+pub fn fat_cache_key(path: &str) -> String {
+    path.to_ascii_lowercase()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn case_spellings_of_one_fat_path_share_inode_and_cache_key() {
+        assert_eq!(path_inode(b"/BIN/Ls"), path_inode(b"/bin/ls"));
+        assert_eq!(fat_cache_key("/BIN/Ls"), fat_cache_key("/bin/ls"));
+        assert_ne!(path_inode(b"/bin/ls"), path_inode(b"/bin/lt"));
+        assert_ne!(path_inode(b""), 0);
+    }
 
     #[test]
     fn normalizes_cwd_relative_paths() {

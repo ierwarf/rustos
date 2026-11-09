@@ -70,7 +70,7 @@ pub struct ExecReservation {
     handle: ProcessHandle,
     expected_mm_generation: u32,
     next_mm_generation: u32,
-    transaction_id: u32,
+    transaction_id: u64,
 }
 
 impl ExecReservation {
@@ -88,12 +88,12 @@ impl ExecReservation {
             ObjectOwner::Ps,
             ObjectKind::LifecycleToken,
             self.handle.lifecycle_token_slot()?,
-            u64::from(self.transaction_id),
+            self.transaction_id,
         )
     }
 
     #[cfg(test)]
-    pub const fn transaction_id(self) -> u32 {
+    pub const fn transaction_id(self) -> u64 {
         self.transaction_id
     }
 
@@ -179,8 +179,8 @@ struct ProcessObject {
     thread_count: usize,
     mm_generation: u32,
     mm_execution: kernel_mm::api::address_space::ExecutionPin,
-    lifecycle_transaction_id: u32,
-    pending_exit_transaction_id: Option<u32>,
+    lifecycle_transaction_id: u64,
+    pending_exit_transaction_id: Option<u64>,
     exec_in_progress: bool,
     exec_commit_authorized: bool,
     exec_state_staged: bool,
@@ -220,7 +220,7 @@ impl ProcessObject {
         process_id: u64,
         parent_process_id: Option<u64>,
         state: UserProcessState,
-        lifecycle_transaction_id: u32,
+        lifecycle_transaction_id: u64,
         job: jobs::JobId,
     ) -> Self {
         Self {
@@ -258,7 +258,7 @@ impl ProcessObject {
 struct ProcessSlot {
     generation: u32,
     object: Option<Box<ProcessObject>>,
-    spawn_transaction_id: Option<u32>,
+    spawn_transaction_id: Option<u64>,
     root_spawn: Option<spawn::RootSpawnKey>,
     /// Next slot (index + 1, 0 = end) in this slot's pid-hash chain. Meaningful
     /// only while `object` is `Some`; maintained under the table lock together
@@ -453,37 +453,40 @@ pub use spawn::{publish_spawn};
 static PROCESS_TABLE: ProcessTableLock = ProcessTableLock::new(ProcessTable::new());
 
 /// One namespace for spawn/exec/exit/reap transactions. IDs never wrap: after
-/// the final u32 identity is consumed, new lifecycle admission fails closed
-/// instead of letting a stale marker or one-shot token alias later work.
+/// the final u64 identity is consumed, new lifecycle admission fails closed
+/// instead of letting a stale marker or one-shot token alias later work. At
+/// 2^64 transactions that bound is unreachable in practice; it exists so the
+/// failure mode is closed rather than an alias if it ever were reached.
 static NEXT_LIFECYCLE_TRANSACTION_ID: AtomicU64 = AtomicU64::new(1);
 
-fn allocate_lifecycle_transaction_id() -> Option<u32> {
+fn allocate_lifecycle_transaction_id() -> Option<u64> {
     allocate_nonwrapping_lifecycle_transaction_id(&NEXT_LIFECYCLE_TRANSACTION_ID)
 }
 
-fn allocate_nonwrapping_lifecycle_transaction_id(counter: &AtomicU64) -> Option<u32> {
+fn allocate_nonwrapping_lifecycle_transaction_id(counter: &AtomicU64) -> Option<u64> {
     counter
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-            (current != 0 && current <= u64::from(u32::MAX)).then(|| current + 1)
+            (current != 0 && current != u64::MAX).then(|| current + 1)
         })
         .ok()
-        .and_then(|current| u32::try_from(current).ok())
 }
 
 /// A fixed lifecycle marker encodes all authority-bearing fields without
 /// relying on PID labels: arg0 is `(process_generation << 32) | one_based_slot`
-/// and arg1 is `(mm_generation << 32) | transaction_id`.
+/// and arg1 is `(mm_generation << 32) | (transaction_id as u32)`. The trace
+/// carries the low 32 bits of the id only; the authority-bearing comparisons in
+/// the process table use the full u64.
 #[cfg(rustos_lifecycle_trace)]
 fn record_lifecycle_marker(
     name: &'static str,
     handle: ProcessHandle,
     mm_generation: u32,
-    transaction_id: u32,
+    transaction_id: u64,
 ) {
     let Some(process_token) = handle.lifecycle_token_slot() else {
         return;
     };
-    let mm_transaction = (u64::from(mm_generation) << 32) | u64::from(transaction_id);
+    let mm_transaction = (u64::from(mm_generation) << 32) | (transaction_id & u64::from(u32::MAX));
     crate::debug::record_milestone(
         crate::debug::LogCategory::Process,
         name,
@@ -498,7 +501,7 @@ fn record_lifecycle_marker(
     _name: &'static str,
     _handle: ProcessHandle,
     _mm_generation: u32,
-    _transaction_id: u32,
+    _transaction_id: u64,
 ) {
 }
 
@@ -1366,7 +1369,7 @@ pub fn reap_exited_processes() -> usize {
         // the number of process slots.
         let mut reclaimed: [Option<Box<ProcessObject>>; REAP_BATCH] =
             [const { None }; REAP_BATCH];
-        let mut markers: [Option<(ProcessHandle, u32, u32)>; REAP_BATCH] =
+        let mut markers: [Option<(ProcessHandle, u32, u64)>; REAP_BATCH] =
             [const { None }; REAP_BATCH];
         let mut reclaimed_len = 0usize;
         let finished = {
@@ -1489,7 +1492,7 @@ fn reset_for_tests() {
 
 /// Fixture stamps carry no live process authority; production still uses begin_exec.
 #[cfg(test)]
-pub(super) fn test_exec_stamp(generation: u32, mm: u32, transaction: u32) -> ExecReservation {
+pub(super) fn test_exec_stamp(generation: u32, mm: u32, transaction: u64) -> ExecReservation {
     ExecReservation {
         handle: ProcessHandle::new(0, generation),
         expected_mm_generation: mm,
@@ -1726,10 +1729,21 @@ pub(crate) mod tests {
             Some(2)
         );
 
-        let exhausted = AtomicU64::new(u64::from(u32::MAX));
+        // The old u32 ceiling is no longer an exhaustion point.
+        let past_u32 = AtomicU64::new(u64::from(u32::MAX));
+        assert_eq!(
+            super::allocate_nonwrapping_lifecycle_transaction_id(&past_u32),
+            Some(u64::from(u32::MAX))
+        );
+        assert_eq!(
+            super::allocate_nonwrapping_lifecycle_transaction_id(&past_u32),
+            Some(u64::from(u32::MAX) + 1)
+        );
+
+        let exhausted = AtomicU64::new(u64::MAX - 1);
         assert_eq!(
             super::allocate_nonwrapping_lifecycle_transaction_id(&exhausted),
-            Some(u32::MAX)
+            Some(u64::MAX - 1)
         );
         assert_eq!(
             super::allocate_nonwrapping_lifecycle_transaction_id(&exhausted),

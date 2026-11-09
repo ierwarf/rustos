@@ -756,11 +756,12 @@ fn complete_claimed_reply(claimed: ps_api::PagerFaultReservation, reply: PagerFa
         let _ = wake_fault_owner(claimed.token, claimed.request.task_id);
         return;
     };
-    let mapped = ps_api::with_validated_fault_address_space(claimed.request, |_, address_space| {
+    let mapped = ps_api::with_validated_fault_address_space(claimed.request, |_, extent, address_space| {
         address_space.map_prepared_pager_fault_frame_at(
             VirtAddr::new(claimed.request.virtual_address),
             frame.as_u64(),
             page_flags(reply.frame_rights),
+            extent,
         )
     })
     .is_ok_and(|result| result.is_ok());
@@ -865,8 +866,13 @@ fn populate_run(request: PagerFaultRequestWire, rights: u32, run_pages: u64) {
         // Each page revalidates independently. A concurrent unmap or exec
         // between two pages of the same run must stop the run, not map into an
         // address space that no longer owns the range.
-        let mapped = ps_api::with_validated_fault_address_space(request, |_, space| {
-            space.map_prepared_pager_fault_frame_at(VirtAddr::new(address), frame.as_u64(), flags)
+        let mapped = ps_api::with_validated_fault_address_space(request, |_, extent, space| {
+            space.map_prepared_pager_fault_frame_at(
+                VirtAddr::new(address),
+                frame.as_u64(),
+                flags,
+                extent,
+            )
         })
         .is_ok_and(|result| result.is_ok());
         if !mapped {

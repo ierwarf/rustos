@@ -897,7 +897,7 @@ fn publish_map_result(
     Err(errno)
 }
 
-fn write_out<T: Copy>(args: &RustosMmBrokerArgs, value: &T) -> Result<(), i64> {
+fn write_out<T: rustos_user_abi::wire::UserWire>(args: &RustosMmBrokerArgs, value: &T) -> Result<(), i64> {
     if args.out_ptr == 0 {
         return Ok(());
     }

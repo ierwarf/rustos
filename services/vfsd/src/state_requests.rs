@@ -472,7 +472,12 @@ impl VfsState {
                 )
             };
             if status < 0 {
-                panic!("vfsd readiness generation publication failed");
+                // A server that can no longer publish readiness would leave
+                // waiters asleep behind a lost wake. Fail-stop with the same
+                // diagnostic-then-exit protocol netd and inputd use, so rootd
+                // restarts it instead of the panic path unwinding mid-request.
+                ipc::debug_line("vfsd: readiness generation publication failed");
+                rustos_svc_runtime::syscall::exit_group(134);
             }
         }
     }

@@ -37,10 +37,7 @@ fn lifecycle_pool_has_its_own_bound_and_cannot_borrow_blocking_slots() {
         deadline_ns: u64::MAX,
         ..request_for(SYSCALL_OFFLOAD_OP_LINUX_SOCKET, linux_abi::AF_INET)
     };
-    let queue: &'static BlockingRequestQueue = Box::leak(Box::new(BlockingRequestQueue {
-        requests: Mutex::new(VecDeque::new()),
-        available: Condvar::new(),
-    }));
+    let queue: &'static BlockingRequestQueue = Box::leak(Box::new(BlockingRequestQueue::new()));
     let pending = AtomicUsize::new(0);
     let active = AtomicUsize::new(0);
     assert_eq!(
@@ -52,17 +49,62 @@ fn lifecycle_pool_has_its_own_bound_and_cannot_borrow_blocking_slots() {
         enqueue_to_pool(queue, &pending, 2, &active, request, 1, 1),
         Ok(())
     );
+    // The same client is held to half the pool; a second one fills the rest.
     assert_eq!(
         enqueue_to_pool(queue, &pending, 2, &active, request, 2, 1),
+        Err(libc::EAGAIN)
+    );
+    let other = NetdIpcRequest { pid: 2, ..request };
+    assert_eq!(
+        enqueue_to_pool(queue, &pending, 2, &active, other, 2, 1),
         Ok(())
     );
+    let third = NetdIpcRequest { pid: 3, ..request };
     assert_eq!(
-        enqueue_to_pool(queue, &pending, 2, &active, request, 3, 1),
+        enqueue_to_pool(queue, &pending, 2, &active, third, 3, 1),
         Err(libc::EAGAIN)
     );
     assert_eq!(queue.requests.lock().unwrap().len(), 2);
     // The shared blocking-I/O counters were never touched.
     assert_eq!(PENDING_LIFECYCLE_REQUESTS.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn one_client_cannot_take_more_than_its_share_of_a_pool() {
+    let queue: &'static BlockingRequestQueue = Box::leak(Box::new(BlockingRequestQueue::new()));
+    let pending = AtomicUsize::new(0);
+    let active = AtomicUsize::new(1);
+    let from = |pid: u64| NetdIpcRequest {
+        pid,
+        deadline_ns: u64::MAX,
+        ..request_for(SYSCALL_OFFLOAD_OP_LINUX_RECVFROM, linux_abi::AF_INET)
+    };
+    // Pool of 4: a client holds at most per_client_limit(4) == 2 of them.
+    assert_eq!(per_client_limit(4), 2);
+    for cap in 1..=2 {
+        assert_eq!(enqueue_to_pool(queue, &pending, 4, &active, from(10), cap, 1), Ok(()));
+    }
+    assert_eq!(
+        enqueue_to_pool(queue, &pending, 4, &active, from(10), 3, 1),
+        Err(libc::EAGAIN)
+    );
+    // The refusal reserved nothing: another client still has the rest.
+    assert_eq!(pending.load(Ordering::Acquire), 2);
+    assert_eq!(queue.clients.held_by(10), 2);
+    for cap in 3..=4 {
+        assert_eq!(enqueue_to_pool(queue, &pending, 4, &active, from(11), cap, 1), Ok(()));
+    }
+    // A full pool refuses a third client without charging it.
+    assert_eq!(
+        enqueue_to_pool(queue, &pending, 4, &active, from(12), 5, 1),
+        Err(libc::EAGAIN)
+    );
+    assert_eq!(queue.clients.held_by(12), 0);
+    // Completion returns the share.
+    release_pending_slot(&pending);
+    queue.clients.release(10);
+    assert_eq!(queue.clients.held_by(10), 1);
+    assert_eq!(enqueue_to_pool(queue, &pending, 4, &active, from(10), 6, 1), Ok(()));
 }
 
 #[test]

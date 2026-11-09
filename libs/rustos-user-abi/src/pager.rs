@@ -743,3 +743,8 @@ mod tests {
         );
     }
 }
+
+// Copy-out safety: no padding bytes (see `wire`).
+crate::user_wire!(PagerFaultDispatchWire { request: PagerFaultRequestWire, zeroed_frame_capability: u64, granted_frame_rights: u32, map_run_pages_offered: u32, reserved1: [u64; 2] });
+crate::user_wire!(PagerFaultRequestWire { version: u16, access: u16, fault_flags: u16, reserved0: u16, fault_token: u64, process_handle: u64, process_generation: u64, task_id: u64, task_generation: u64, mm_generation: u64, vma_generation: u64, virtual_address: u64, object_offset: u64, deadline_ns: u64, scheduling_domain: u64, charge_token: u64, object: PagerObjectIdentityWire, reserved1: [u64; 2] });
+crate::user_wire!(PagerObjectIdentityWire { object_type: u16, reserved0: u16, rights: u32, backing_service: u64, slot: u64, generation: u64, pager_epoch: u64, backing_generation: u64 });

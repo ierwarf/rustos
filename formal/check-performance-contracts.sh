@@ -600,7 +600,7 @@ rg -Fq 'arm_sleep_waiter_until_tick(task_id, watchdog_deadline)' \
     echo "inputd lost-interrupt watchdog is not part of the armed wait contract" >&2
     exit 1
 }
-rg -Fq 'write_current_user_bytes(args.out_records_ptr, bytes)' \
+rg -Fq 'write_current_user_slice(args.out_records_ptr, &records[..count])' \
     kernel/compat/src/user/syscall/linux/input_broker_ops.rs || {
     echo "input ingestion regressed to per-record user-copy validation" >&2
     exit 1

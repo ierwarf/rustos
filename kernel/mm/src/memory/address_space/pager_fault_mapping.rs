@@ -740,13 +740,21 @@ impl ProcessAddressSpace {
         Ok(true)
     }
 
+    /// Installs one pre-zeroed pager frame at `start`, which must lie inside
+    /// `extent`: the VMA span the caller validated the fault against. The
+    /// extent is part of the signature so a run length computed by a caller can
+    /// never place a leaf in a guard page or hole past that VMA.
     pub fn map_prepared_pager_fault_frame_at(
         &mut self,
         start: VirtAddr,
         frame_phys: u64,
         flags: PageTableFlags,
+        extent: UserRegion,
     ) -> Result<(), AddressSpaceError> {
         validate_user_page_range(start, 1)?;
+        if start.as_u64() < extent.start.as_u64() || start.as_u64() >= extent.end().as_u64() {
+            return Err(AddressSpaceError::AddressOutOfRange);
+        }
         if frame_phys == 0 || !frame_phys.is_multiple_of(PAGE_4KIB_U64) {
             return Err(AddressSpaceError::InvalidFrameOwnership);
         }

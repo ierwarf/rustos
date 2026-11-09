@@ -390,15 +390,28 @@ const fn access_is_allowed(access: u16, prot: u32) -> bool {
 
 /// Authenticates pager requests against the sender identity stamped by ring0.
 ///
-/// Fault resolution is itself dispatched by ring0, whose receive-side identity
-/// is exactly `(0, 0)`. User-originated operations retain the ordinary,
-/// nonzero exact-subject rule.
+/// Fault resolution and every region-table edit (backing, release, protect) are
+/// ring0 operations: ring0 owns the VMA table and the pager's region table is
+/// only its replica, so a user process must never be able to admit, drop or
+/// re-protect a region for itself or for a pid it names in the payload. Ring0's
+/// receive-side identity is exactly `(0, 0)`. Every other operation retains the
+/// ordinary, nonzero exact-subject rule.
 pub fn request_sender_is_authorized(
     request: &rustos_user_abi::syscall::CommercialMaxProtocolRequest,
     sender_pid: u64,
     sender_tid: u64,
 ) -> bool {
-    if request.header.op == rustos_user_abi::syscall::COMMERCIAL_MAX_PAGERD_OP_FAULT_RESOLVE {
+    use rustos_user_abi::syscall::{
+        COMMERCIAL_MAX_PAGERD_OP_BACKING_OBJECT, COMMERCIAL_MAX_PAGERD_OP_FAULT_RESOLVE,
+        COMMERCIAL_MAX_PAGERD_OP_PROTECT_OBJECT, COMMERCIAL_MAX_PAGERD_OP_RELEASE_OBJECT,
+    };
+    if matches!(
+        request.header.op,
+        COMMERCIAL_MAX_PAGERD_OP_FAULT_RESOLVE
+            | COMMERCIAL_MAX_PAGERD_OP_BACKING_OBJECT
+            | COMMERCIAL_MAX_PAGERD_OP_RELEASE_OBJECT
+            | COMMERCIAL_MAX_PAGERD_OP_PROTECT_OBJECT
+    ) {
         sender_pid == 0 && sender_tid == 0
     } else {
         request.subject_is_exact_sender(sender_pid, sender_tid)
@@ -426,7 +439,8 @@ mod sender_auth_tests {
     use super::request_sender_is_authorized;
     use rustos_user_abi::syscall::{
         CommercialMaxProtocolRequest, COMMERCIAL_MAX_PAGERD_OP_BACKING_OBJECT,
-        COMMERCIAL_MAX_PAGERD_OP_FAULT_RESOLVE,
+        COMMERCIAL_MAX_PAGERD_OP_FAULT_RESOLVE, COMMERCIAL_MAX_PAGERD_OP_PAGE_CACHE_POLICY,
+        COMMERCIAL_MAX_PAGERD_OP_PROTECT_OBJECT, COMMERCIAL_MAX_PAGERD_OP_RELEASE_OBJECT,
     };
 
     fn request(op: u16, subject_pid: u64, subject_tid: u64) -> CommercialMaxProtocolRequest {
@@ -450,8 +464,22 @@ mod sender_auth_tests {
     }
 
     #[test]
-    fn backing_object_retains_exact_user_subject_rule() {
-        let request = request(COMMERCIAL_MAX_PAGERD_OP_BACKING_OBJECT, 47, 53);
+    fn region_table_edits_are_ring0_only_even_with_a_matching_user_subject() {
+        for op in [
+            COMMERCIAL_MAX_PAGERD_OP_BACKING_OBJECT,
+            COMMERCIAL_MAX_PAGERD_OP_RELEASE_OBJECT,
+            COMMERCIAL_MAX_PAGERD_OP_PROTECT_OBJECT,
+        ] {
+            let user = request(op, 47, 53);
+            assert!(!request_sender_is_authorized(&user, 47, 53));
+            let kernel = request(op, 0, 0);
+            assert!(request_sender_is_authorized(&kernel, 0, 0));
+        }
+    }
+
+    #[test]
+    fn other_operations_retain_exact_user_subject_rule() {
+        let request = request(COMMERCIAL_MAX_PAGERD_OP_PAGE_CACHE_POLICY, 47, 53);
         assert!(request_sender_is_authorized(&request, 47, 53));
         assert!(!request_sender_is_authorized(&request, 0, 0));
     }
