@@ -1,6 +1,19 @@
 use super::*;
 
 #[test]
+fn pthread_clone_plan_is_local_and_rejects_nonthread_or_bad_tls_flags() {
+    let required = linux_abi::CLONE_VM | linux_abi::CLONE_FS
+        | linux_abi::CLONE_FILES | linux_abi::CLONE_SIGHAND | linux_abi::CLONE_THREAD;
+    let stack = paging::USER_SPACE_BASE + 0x10000;
+    let tls = paging::USER_SPACE_BASE + 0x20000;
+    assert!(valid_thread_plan_locally(required | linux_abi::CLONE_SETTLS, stack, tls));
+    assert!(!valid_thread_plan_locally(required & !linux_abi::CLONE_THREAD, stack, tls));
+    assert!(!valid_thread_plan_locally(required, 0, tls));
+    assert!(!valid_thread_plan_locally(required | 1, stack, tls),
+        "thread clone cannot supply a nonzero exit signal");
+}
+
+#[test]
 fn futex_return_advances_retired_thread_cleanup_before_userspace_join_resumes() {
     let source = include_str!("futex_thread.rs");
     let dispatch = source

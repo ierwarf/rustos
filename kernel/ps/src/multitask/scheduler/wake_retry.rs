@@ -293,7 +293,13 @@ pub(super) fn service_with(
                         .flatten()
                         .any(|newer| newer.task_id == token.task_id)
                     {
-                        let _ = queue.insert(token);
+                        assert!(
+                            queue.insert(token),
+                            "scheduler exact wake retry silently lost token task={} slot={} epoch={}",
+                            token.task_id,
+                            token.slot,
+                            token.serial,
+                        );
                     }
                 });
             }

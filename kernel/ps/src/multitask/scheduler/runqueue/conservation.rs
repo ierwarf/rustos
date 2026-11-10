@@ -19,7 +19,7 @@
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use super::ownership::{self, FLIGHT_DEPTH};
-use super::{RunOwnerState, MAILBOX_PENDING, MAX_TASK};
+use super::{RunOwnerState, MAX_TASK};
 
 /// 2 s at the 1024 Hz scheduler tick: three orders of magnitude above
 /// scheduling latency and above the ~13 ms 8-vCPU stalls in the IPC notes.
@@ -84,15 +84,25 @@ pub(in crate::multitask::scheduler) fn scan(now_ticks: u64) {
     NEXT_SCAN.store(now_ticks.saturating_add(PERIOD_TICKS), Ordering::Relaxed);
     let mut emitted = 0;
     scan_slots(now_ticks, |report| {
-        if emitted >= MAX_REPORTS_PER_SCAN
-            || REPORTS.fetch_add(1, Ordering::Relaxed) >= MAX_REPORTS_PER_BOOT
-        {
+        if !reserve_report_slot(emitted) {
             return;
         }
         emitted += 1;
         emit(report);
     });
     SCANNING.store(false, Ordering::Release);
+}
+
+/// Reserve a diagnostic only when it can actually be emitted. A fetch_add
+/// after the per-scan limit silently spent the entire boot budget on reports
+/// that were never printed; fetch_update also avoids spending past the cap.
+fn reserve_report_slot(emitted_this_scan: usize) -> bool {
+    emitted_this_scan < MAX_REPORTS_PER_SCAN
+        && REPORTS
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                (count < MAX_REPORTS_PER_BOOT).then_some(count + 1)
+            })
+            .is_ok()
 }
 
 /// The classification pass, separated from rate limiting for witnesses. The
@@ -112,8 +122,19 @@ pub(super) fn scan_slots(now_ticks: u64, mut report: impl FnMut(CustodyReport)) 
         let age_ticks = now_ticks.saturating_sub(SUSPECT_SINCE[slot].load(Ordering::Relaxed));
         if age_ticks < THRESHOLD_TICKS
             || REPORTED_WORD[slot].load(Ordering::Relaxed) == word
-            || !confirm(slot, word, gap)
         {
+            continue;
+        }
+        if !confirm(slot, word, gap) {
+            // A valid FIFO/mailbox receipt resets the *missing* age. A later
+            // loss must persist for its own threshold, not inherit this age.
+            SUSPECT_WORD[slot].store(0, Ordering::Relaxed);
+            continue;
+        }
+        // Ownership may have changed while the slow mailbox/FIFO check took
+        // its leaf. Never report a missing record for a newer incarnation.
+        if ownership::owner_raw(slot) != word {
+            SUSPECT_WORD[slot].store(0, Ordering::Relaxed);
             continue;
         }
         REPORTED_WORD[slot].store(word, Ordering::Relaxed);
@@ -129,10 +150,12 @@ fn classify(slot: usize, word: u64) -> Option<CustodyGap> {
             (!super::published_local_membership(slot, cpu)).then_some(CustodyGap::LocalWithoutMembership)
         }
         RunOwnerState::RemoteQueued => {
-            let cpu = owner.cpu?;
-            // ORDERING: Acquire, as the drainer's own pending load.
-            (MAILBOX_PENDING.get(cpu)?.load(Ordering::Acquire) == 0)
-                .then_some(CustodyGap::RemoteWithoutMailbox)
+            // The global MAILBOX_PENDING edge proves only that *some* record
+            // was queued for this CPU. An unrelated task can keep it raised
+            // while this exact generation has no record. The per-slot proof
+            // takes the mailbox leaf only when this word has aged two seconds.
+            owner.cpu?;
+            Some(CustodyGap::RemoteWithoutMailbox)
         }
         // Every unexecuted DirectHandoff word is tracked (an in-flight fused
         // `DirectSwitch` legitimately has no record within its dispatch turn);
@@ -154,6 +177,9 @@ fn classify(slot: usize, word: u64) -> Option<CustodyGap> {
 fn confirm(slot: usize, word: u64, gap: CustodyGap) -> bool {
     let owner = super::RunOwnerSnapshot::decode(word);
     match (gap, owner.cpu) {
+        (CustodyGap::RemoteWithoutMailbox, Some(cpu)) => {
+            !super::mailbox_holds_generation(cpu, slot, owner.generation)
+        }
         (CustodyGap::DirectWithoutFifo, Some(cpu)) => {
             !super::super::sync_handoff::pending(cpu)
                 || !super::super::sync_handoff::holds_direct_record(cpu, slot, owner.generation)

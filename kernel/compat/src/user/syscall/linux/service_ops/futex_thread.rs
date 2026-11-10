@@ -192,7 +192,10 @@ fn wait_for_task_slot() -> bool {
 fn clone_stage_failed(stage: u64, errno: i64, address: u64) -> u64 {
     static RECORDED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
     // ORDERING: Relaxed; a counter bounding telemetry volume.
-    if stage != 1 && RECORDED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 32 {
+    // The policy service is not guaranteed to emit an unconditional debugcon
+    // record. Stage 1 is the most useful discriminator for sporadic EINVAL
+    // under concurrent boot, so include it in the same bounded budget.
+    if RECORDED.fetch_add(1, core::sync::atomic::Ordering::Relaxed) < 32 {
         nucleus_core::debug::record_milestone(
             nucleus_core::debug::LogCategory::Compat,
             "linux-thread-clone-stage",
@@ -228,7 +231,7 @@ pub fn clone_linux_thread(
     }
     if current_process_is_procd_policy_owner() {
         if !valid_thread_plan_locally(flags, child_stack, tls) {
-            return linux_errno(LINUX_EINVAL);
+            return clone_stage_failed(5, LINUX_EINVAL, flags);
         }
     } else {
         let mut request = new_procd_request(PROCD_OP_THREAD_PLAN);
@@ -262,7 +265,7 @@ pub fn clone_linux_thread(
         }
     }
     let Some(console_session) = multitask::current_console_session() else {
-        return linux_errno(LINUX_EINVAL);
+        return clone_stage_failed(6, LINUX_EINVAL, flags);
     };
     let child_thread_state = match multitask::with_current_user_linux_state_mut(
         |_, _, abi, _address_space, _, linux_thread_state| {
@@ -298,8 +301,8 @@ pub fn clone_linux_thread(
         },
     ) {
         Some(Ok(state)) => state,
-        Some(Err(errno)) => return linux_errno(errno),
-        None => return linux_errno(LINUX_ENOSYS),
+        Some(Err(errno)) => return clone_stage_failed(7, errno, flags),
+        None => return clone_stage_failed(8, LINUX_ENOSYS, flags),
     };
 
     let mut bootstrap = multitask::UserTaskBootstrap::new(
@@ -332,14 +335,16 @@ pub fn clone_linux_thread(
     // for it briefly, as `fork` does, instead of failing a thread create that
     // would succeed a millisecond later.
     if !wait_for_task_slot() {
-        return linux_errno(LINUX_EAGAIN);
+        return clone_stage_failed(9, LINUX_EAGAIN, flags);
     }
     let child_tid = match multitask::spawn_user_thread_suspended(bootstrap) {
         Ok(tid) => tid,
         Err(multitask::SpawnTaskError::InvalidWeightMicros) => {
-            return linux_errno(LINUX_EINVAL);
+            return clone_stage_failed(10, LINUX_EINVAL, flags);
         }
-        Err(multitask::SpawnTaskError::NoFreeTaskSlot) => return linux_errno(LINUX_EAGAIN),
+        Err(multitask::SpawnTaskError::NoFreeTaskSlot) => {
+            return clone_stage_failed(11, LINUX_EAGAIN, flags);
+        },
     };
     let child_tid_bytes = (child_tid as u32).to_le_bytes();
     if flags & (linux_abi::CLONE_PARENT_SETTID | linux_abi::CLONE_CHILD_SETTID) != 0 {
@@ -357,7 +362,7 @@ pub fn clone_linux_thread(
     }
     if !multitask::activate_suspended_user_task(child_tid) {
         let _ = multitask::terminate_user_task(child_tid);
-        return linux_errno(LINUX_EAGAIN);
+        return clone_stage_failed(12, LINUX_EAGAIN, flags);
     }
     // Publish the runnable child only after every shared-memory clone field is
     // committed. The one-shot handoff is now safe: the child cannot observe a

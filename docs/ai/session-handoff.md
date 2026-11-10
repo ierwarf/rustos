@@ -4,6 +4,44 @@ Dated evidence, not instructions or proof of the current checkout. Resume with
 `git status --short`, `git log -1`, and the live request. `AGENTS.md` is the only
 stable repository prefix; use [task router](task-router.md) for owner contracts.
 
+## Follow-up static hardening (2026-11-10, GitHub source only)
+
+Starting GitHub master: `b823ebcd`. This pass crosses Ring0 scheduler/IPC,
+Linux clone admission and Ring3 startup services. It is a **source-only
+audit**; no local checkout, build, test or KVM evidence is available here.
+
+- `runqueue/conservation.rs`: a different task's mailbox pending bit no
+  longer hides a missing exact RemoteQueued receipt. After an unchanged word
+  has aged two seconds, the scanner checks the corresponding slot/generation
+  under the mailbox leaf and verifies the owner word again before reporting.
+  A valid mailbox/FIFO receipt resets the missing-age clock. Report budgets
+  are reserved only for lines actually emitted (the prior fetch_add consumed
+  the boot-wide budget on suppressed reports). Add host regressions for
+  unrelated mailbox traffic and exhausted report budgets.
+- `wake_retry.rs`: a reinsertion of an exact pending wait token may no longer
+  fail silently in the retry service. Invariant violation becomes a tagged
+  panic rather than disguising a lost reply or receiver wake. The regular
+  refusal path still reports queue saturation through its existing milestone.
+- `futex_thread.rs`: every rejected Linux clone plan, including the procd
+  admission stage, returns the existing errno with bounded stage/errno evidence
+  on debugcon. Local policy, missing console, Linux thread state, task-slot
+  exhaustion, invalid scheduling weight and activation failures now have
+  distinct stages. No clone admission policy was weakened.
+- `devmgrd`: all four ioctl workers must be successfully created before the
+  service endpoint is registered. A worker creation error no longer triggers
+  a generic std::thread panic; it logs the exact errno and fails closed,
+  letting the supervisor observe a genuine exit.
+- `inputd`: DVM worker thread-start failure reports the raw OS errno.
+  `runtimed`: malformed listener paths are rejected before socket allocation,
+  preventing a bootstrap FD leak. Both services retain their existing authority
+  and startup admission rules.
+
+**Still not established:** whether these changes improve the 4-lane
+4-vCPU 100-boot success rate, whether EINVAL is a clone-policy mismatch or
+a lower-layer concurrent task admission failure, and whether the remaining
+stalls share one root cause. Require actual build, native witnesses, formal PR
+gate, and the same-isolation KVM comparison before claiming a fix.
+
 ## Ring0 static audit (2026-11-10, GitHub audit branch)
 
 Starting tree was `75203b1d` (the predecessor `b82b50eb` was replaced by a
@@ -17,8 +55,9 @@ add a real runqueue regression test; reset consecutive reply-arm refusals after
 a successful arm; remove the second infallible allocation of `FastSpill`
 metadata from Ring0 by keeping that metadata inline. Contract text was updated.
 
-New external boot evidence reported by the user: lane 0 failed 25/25
-50-second 4-vCPU parallel smoke runs, common cause
+New external boot evidence reported by the user: lane 0 **run 25/25**
+(the 25th attempt, not 25 failures) of the 50-second 4-vCPU parallel
+smoke failed with
 `initd endpoint admission failed: exec=services/runtimed/runtimed.elf
 pid=122 errno=3 cause=service-exited waited_ms=5058 slices=2`;
 DVM display/relay/input ready but `rustos-runtime=false`, no wayclick frame.

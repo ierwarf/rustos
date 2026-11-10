@@ -295,6 +295,16 @@ impl RemoteWakeMailbox {
         self.len -= 1;
         Some(record)
     }
+
+    /// Exact mailbox receipt for the slow, aged custody-conservation probe.
+    /// The global pending edge is not a per-task proof: another queued task
+    /// can keep it raised while this task's record is missing.
+    fn holds_generation(&self, slot: usize, generation: u64) -> bool {
+        (0..self.len).any(|offset| {
+            let record = self.records[(self.head + offset) % self.records.len()];
+            record.slot == slot && record.generation == generation
+        })
+    }
 }
 
 impl EnqueueDuty {
@@ -342,6 +352,13 @@ static REMOTE_WAKE_MAILBOXES: [IrqLeaf<RemoteWakeMailbox, { LockClass::Scheduler
     MAX_TRACKED_CPUS] = [const { IrqLeaf::new(RemoteWakeMailbox::new()) }; MAX_TRACKED_CPUS];
 static MAILBOX_PENDING: [CachePadded<AtomicU64>; MAX_TRACKED_CPUS] =
     [const { CachePadded::new(AtomicU64::new(0)) }; MAX_TRACKED_CPUS];
+
+/// Exact read-only check used only after a RemoteQueued owner has remained
+/// suspect for two seconds. This does not authorize placement or dispatch.
+pub(super) fn mailbox_holds_generation(cpu: usize, slot: usize, generation: u64) -> bool {
+    validate_cpu(cpu);
+    REMOTE_WAKE_MAILBOXES[cpu].lock().holds_generation(slot, generation)
+}
 #[cfg(test)]
 static TEST_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[cfg(test)]

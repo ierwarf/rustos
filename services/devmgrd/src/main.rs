@@ -105,7 +105,16 @@ fn main() {
     // that window. The caller then abandoned its reply capability, this
     // service's late reply was rejected, and the capability it carried was
     // never installed, which surfaced much later as a permission error.
-    let sessiond_workers = start_sessiond_ioctl_workers();
+    let sessiond_workers = match start_sessiond_ioctl_workers() {
+        Ok(workers) => workers,
+        Err(errno) => {
+            // A worker spawn failure previously panicked inside thread::spawn,
+            // hiding the actual clone errno behind initd's ESRCH. No endpoint
+            // has been registered yet; fail closed without partial admission.
+            debug_line(&format!("devmgrd: fatal ioctl worker spawn failed errno={errno}"));
+            return;
+        }
+    };
     // Separates a stall in thread creation from one in endpoint registration.
     debug_line("devmgrd: ioctl workers started");
     let register =
@@ -127,7 +136,7 @@ fn main() {
     serve(endpoint as u64, &sessiond_workers);
 }
 
-fn start_sessiond_ioctl_workers() -> SessiondIoctlWorkers {
+fn start_sessiond_ioctl_workers() -> Result<SessiondIoctlWorkers, i32> {
     let mut senders = Vec::with_capacity(SESSIOND_IOCTL_WORKERS);
     let mut receivers = Vec::with_capacity(SESSIOND_IOCTL_WORKERS);
     for _ in 0..SESSIOND_IOCTL_WORKERS {
@@ -136,13 +145,16 @@ fn start_sessiond_ioctl_workers() -> SessiondIoctlWorkers {
         senders.push(sender);
         receivers.push(receiver);
     }
-    for receiver in receivers {
-        thread::spawn(move || sessiond_ioctl_worker(receiver));
+    for (index, receiver) in receivers.into_iter().enumerate() {
+        thread::Builder::new()
+            .name(format!("devmgrd-ioctl-{index}"))
+            .spawn(move || sessiond_ioctl_worker(receiver))
+            .map_err(|err| err.raw_os_error().unwrap_or(libc::EAGAIN))?;
     }
-    SessiondIoctlWorkers {
+    Ok(SessiondIoctlWorkers {
         senders,
         next_worker: AtomicUsize::new(0),
-    }
+    })
 }
 
 impl SessiondIoctlWorkers {

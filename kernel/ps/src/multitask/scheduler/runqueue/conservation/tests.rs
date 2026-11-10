@@ -61,6 +61,55 @@ fn queued_mailboxed_and_blocked_tasks_are_conserved() {
 }
 
 #[test]
+fn unrelated_mailbox_work_cannot_hide_a_lost_remote_owner_record() {
+    const GOOD: usize = 96;
+    const LOST: usize = 97;
+    const CPU: usize = 4;
+    let _serial = test_serial_guard();
+    reset_before_publication();
+    admit_blocked(GOOD);
+    admit_blocked(LOST);
+    assert!(matches!(
+        publish_remote_wake(GOOD, CPU, 100),
+        RemoteWakeOutcome::Published { .. }
+    ));
+    // A different RemoteQueued task has no mailbox receipt, but GOOD still
+    // holds the shared pending edge for CPU. The old scan missed LOST forever.
+    let blocked = owner(LOST);
+    let stranded =
+        RunOwnerSnapshot::new(RunOwnerState::RemoteQueued, Some(CPU), blocked.generation + 1);
+    test_force_word(LOST, blocked, stranded).unwrap();
+    assert!(reports(200).iter().all(|r| r.slot != LOST));
+    let found = reports(200 + THRESHOLD_TICKS);
+    assert!(found.iter().any(|r| r.slot == LOST && r.gap == CustodyGap::RemoteWithoutMailbox));
+    assert!(found.iter().all(|r| r.slot != GOOD));
+    retire(GOOD, 100);
+    retire(LOST, 100);
+    release_retired(GOOD);
+    release_retired(LOST);
+    reset_before_publication();
+}
+
+#[test]
+fn suppressed_diagnostics_never_spend_the_global_report_budget() {
+    let _serial = test_serial_guard();
+    reset_before_publication();
+    assert!(!reserve_report_slot(MAX_REPORTS_PER_SCAN));
+    assert_eq!(REPORTS.load(Ordering::Relaxed), 0);
+    for emitted in 0..MAX_REPORTS_PER_SCAN {
+        assert!(reserve_report_slot(emitted));
+    }
+    assert!(!reserve_report_slot(MAX_REPORTS_PER_SCAN));
+    assert_eq!(REPORTS.load(Ordering::Relaxed), MAX_REPORTS_PER_SCAN);
+    for _ in MAX_REPORTS_PER_SCAN..MAX_REPORTS_PER_BOOT {
+        assert!(reserve_report_slot(0));
+    }
+    assert!(!reserve_report_slot(0));
+    assert_eq!(REPORTS.load(Ordering::Relaxed), MAX_REPORTS_PER_BOOT);
+    reset_before_publication();
+}
+
+#[test]
 fn a_custody_change_restarts_the_age() {
     const SLOT: usize = 94;
     let _serial = test_serial_guard();

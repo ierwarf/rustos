@@ -655,8 +655,9 @@ from the timer and RTC interrupt dispatch (`irq.rs`, after the runtime-profile
 publication, outside every scheduler leaf, via
 `runqueue_policy::custody_conservation_scan`), one CPU at a time, at most every
 256 ticks. A word naming run custody without its record (Local without published
-rq membership, RemoteQueued with no pending mailbox edge, DirectHandoff with no
-FIFO record of its generation, Migrating, Blocked with run intent, Running with
+rq membership, RemoteQueued missing its **exact slot and generation** from the
+target mailbox, DirectHandoff with no FIFO record of its generation, Migrating,
+Blocked with run intent, Running with
 no executing CPU) whose exact value stays unchanged for 2048 ticks is reported
 once as milestone `scheduler-custody-lost` (arg0 = slot | gap << 8 | age << 16,
 arg1 = word) plus up to 7 `scheduler-custody-ring` entries; at most 4 per scan

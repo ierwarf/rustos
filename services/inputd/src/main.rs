@@ -1223,8 +1223,14 @@ fn start_dvm_ingestion_worker(queue: SharedInputQueue, log_state: Arc<DvmIngress
                 }
             }
         });
-    if result.is_err() {
-        debug_line("inputd: DVM ingestion worker spawn failed");
+    if let Err(error) = result {
+        // The generic Rust thread panic only says EINVAL/ENOMEM; record the
+        // syscall errno on debugcon so a failed clone is distinguishable
+        // from a policy-consumer wait that never makes progress.
+        debug_line(&format!(
+            "inputd: DVM ingestion worker spawn failed errno={}",
+            error.raw_os_error().unwrap_or(libc::EAGAIN),
+        ));
         std::process::exit(134);
     }
 }

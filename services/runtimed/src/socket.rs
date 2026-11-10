@@ -163,6 +163,10 @@ pub(super) fn bind_listener(path: &str) -> Result<UnixListener, i32> {
     let started_at = Instant::now();
     bind_timing("begin", started_at);
 
+    // Validate the path before obtaining the descriptor. CString::new can
+    // reject an embedded NUL; doing it after socket() leaked that descriptor
+    // on the error path of an otherwise fallible bootstrap operation.
+    let path = CString::new(path).map_err(|_| libc::EINVAL)?;
     let socket_fd = unsafe {
         libc::socket(
             libc::AF_UNIX,
@@ -175,7 +179,6 @@ pub(super) fn bind_listener(path: &str) -> Result<UnixListener, i32> {
     }
     bind_timing("socket", started_at);
 
-    let path = CString::new(path).map_err(|_| libc::EINVAL)?;
     let unlink_rc = unsafe { libc::unlink(path.as_ptr()) };
     if unlink_rc < 0 {
         let err = last_errno();
@@ -949,6 +952,11 @@ mod tests {
         MAX_LAUNCH_RETRY_BACKOFF, RETRY_BACKOFF, SERVICE_REQUEST_TIMEOUT,
         STORAGE_NOT_READY_RETRY_BACKOFF, UI_SERVER_EXEC_PATH,
     };
+
+    #[test]
+    fn malformed_listener_path_is_rejected_before_opening_any_socket() {
+        assert_eq!(bind_listener("bad\0path").err(), Some(libc::EINVAL));
+    }
 
     #[test]
     fn vanished_session_process_is_refunded_before_its_reaper_record_is_lost() {
