@@ -114,6 +114,7 @@ fn installation_invites_the_gpu_peer_before_publication_without_a_cpu_frame() {
             SHARED_HEADER_ADDR.store(0, Ordering::Release);
             SHARED_DOORBELL_ADDR.store(0, Ordering::Release);
             GUI_DVM_EXPECTED_INVITATION.store(0, Ordering::Release);
+            GUI_DVM_LOGGED_INVITATION.store(0, Ordering::Release);
         }
     }
     let _restore = Restore;
@@ -160,4 +161,53 @@ fn missing_gui_dvm_is_unavailable_not_a_fallback_provider() {
         try_publish_full(core::ptr::null(), 1, 1, 4),
         DvmPresentOutcome::Unavailable
     );
+}
+
+#[test]
+fn offline_epoch_reset_clears_logged_invitation_when_reinviting_same_generation() {
+    use super::*;
+
+    let _serial = TRANSPORT_TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+    let mut header = alloc::vec![0_u8; 4096];
+    let mut doorbell = alloc::vec![0_u32; 4];
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            INSTALLED.store(false, Ordering::Release);
+            TRANSPORT_REVOKED.store(false, Ordering::Release);
+            SHARED_HEADER_ADDR.store(0, Ordering::Release);
+            SHARED_DOORBELL_ADDR.store(0, Ordering::Release);
+            GUI_DVM_PEER_READY.store(false, Ordering::Release);
+            GUI_DVM_EXPECTED_INVITATION.store(0, Ordering::Release);
+            GUI_DVM_LOGGED_INVITATION.store(0, Ordering::Release);
+            GUI_DVM_OFFLINE_IRQ_PENDING.store(false, Ordering::Release);
+            GUI_DVM_CONTROL_IRQ_PENDING.store(false, Ordering::Release);
+            GPU_EPOCH_RESET_PENDING.store(false, Ordering::Release);
+            GPU_CONTEXT_EPOCH.store(GPU_INITIAL_CONTEXT_EPOCH, Ordering::Release);
+            SLOT_STATE[0].store(GUI_SLOT_FREE, Ordering::Release);
+            SLOT_GENERATION[0].store(0, Ordering::Release);
+            let _ = GPU_LIFECYCLE.finish_drain();
+            let _ = GPU_LIFECYCLE.activate(u64::from(GPU_INITIAL_CONTEXT_EPOCH));
+        }
+    }
+    let _restore = Restore;
+    SHARED_HEADER_ADDR.store(header.as_mut_ptr() as usize, Ordering::Release);
+    SHARED_DOORBELL_ADDR.store(doorbell.as_mut_ptr() as usize, Ordering::Release);
+    INSTALLED.store(true, Ordering::Release);
+    TRANSPORT_REVOKED.store(false, Ordering::Release);
+    let _ = GPU_LIFECYCLE.finish_drain();
+    assert!(GPU_LIFECYCLE.activate(1));
+    GPU_CONTEXT_EPOCH.store(1, Ordering::Release);
+    SLOT_STATE[0].store(GUI_SLOT_READY, Ordering::Release);
+    SLOT_GENERATION[0].store(2, Ordering::Release);
+    GUI_DVM_PEER_READY.store(true, Ordering::Release);
+    GUI_DVM_EXPECTED_INVITATION.store(2, Ordering::Release);
+    GUI_DVM_LOGGED_INVITATION.store(2, Ordering::Release);
+
+    GUI_DVM_OFFLINE_IRQ_PENDING.store(true, Ordering::Release);
+    peer::drain_dvm_control();
+
+    assert_eq!(GPU_CONTEXT_EPOCH.load(Ordering::Acquire), 2);
+    assert_eq!(GUI_DVM_EXPECTED_INVITATION.load(Ordering::Acquire), 2);
+    assert_eq!(GUI_DVM_LOGGED_INVITATION.load(Ordering::Acquire), 0);
 }

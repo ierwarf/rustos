@@ -102,6 +102,8 @@ pub(super) fn try_install_serialized() -> bool {
     // lose a DVM offline/control notification. Spurious drains are harmless.
     GUI_DVM_PEER_READY.store(false, Ordering::Release);
     GUI_DVM_EXPECTED_INVITATION.store(0, Ordering::Release);
+    // ORDERING: Release clears rebind log state for the freshly installed pool.
+    GUI_DVM_LOGGED_INVITATION.store(0, Ordering::Release);
     GUI_DVM_ACKED_CONTROL_SEQUENCE.store(0, Ordering::Release);
     TRANSPORT_REVOKED.store(false, Ordering::Release);
     for state in &SLOT_STATE {

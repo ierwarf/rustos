@@ -2471,6 +2471,7 @@ static int serve_gpu_display(struct shared_display *shared) {
     int peer_ready_sent = 0;
     int peer_ready_confirmed = 0;
     int active_logged = 0;
+    int frame_in_flight = 0;
     uint64_t ready_marker_generation = 0U;
     int ready_lock = -1;
     uint32_t event_count = 0U;
@@ -2625,6 +2626,7 @@ static int serve_gpu_display(struct shared_display *shared) {
                                  recovery_generation != 0U ? hard_deadline :
                                  gpu_deadline_min(hard_deadline, startup_deadline));
             }
+            frame_in_flight = 1;
             if (dmabuf_sources) {
                 display.setup_stage = "gpu-dmabuf-acquire";
                 acquire_fence_fd = acquire_gpu_source_fence(&display, &submission);
@@ -2643,6 +2645,7 @@ static int serve_gpu_display(struct shared_display *shared) {
                 publish_gpu_completion(shared, &frame, render_time_ns, presented_ns,
                                        front_submit_value) != 0)
                 goto fail;
+            frame_in_flight = 0;
             gpu_watchdog_arm(ready_marker_generation == recovery_generation &&
                              recovery_generation != 0U ? 0U : startup_deadline);
             front_submit_value = frame.submit_value;
@@ -2757,11 +2760,11 @@ fail:
               (unsigned long long)presented_frames,
               display.setup_stage == NULL ? "unknown" : display.setup_stage,
               rustos_gpu_runtime_stage(runtime), errno);
-    {
+    gpu_watchdog_stop(&watchdog);
+    report_host_offline(shared);
+    if (frame_in_flight) {
         int saved_errno = errno != 0 ? errno : EIO;
         const char *cause = display.setup_stage == NULL ? "unknown" : display.setup_stage;
-        gpu_watchdog_stop(&watchdog);
-        report_host_offline(shared);
         recovery_marker("failed", cause, saved_errno, presented_frames, 0U);
         relay_log("rustos-dvm-display: terminal GPU quarantine quiescence=unproven\n");
         /* Do not destroy or reuse resources with possibly in-flight DMA/KMS.
@@ -2769,6 +2772,8 @@ fail:
         for (;;)
             pause();
     }
+    close_gpu_kms_display(&display, runtime);
+    return scheduler.fatal ? DISPLAY_SERVE_FATAL : DISPLAY_SERVE_RETRY;
 }
 
 static int serve_display(void) {

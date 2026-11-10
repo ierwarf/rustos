@@ -2108,6 +2108,7 @@ impl FileLeaseStore {
         if !metadata.file_type().is_file() {
             bail!("VFIO lease {} is not a regular file", path.display());
         }
+        // SAFETY: `geteuid` is an argument-free POSIX query with no memory hazards.
         if metadata.uid() != unsafe { libc::geteuid() } || metadata.mode() & 0o077 != 0 {
             bail!(
                 "VFIO lease {} has unsafe ownership or permissions",
@@ -2139,6 +2140,7 @@ impl FileLeaseStore {
         if !metadata.file_type().is_dir() {
             bail!("VFIO lease path {} is not a directory", self.root.display());
         }
+        // SAFETY: `geteuid` is an argument-free POSIX query with no memory hazards.
         if metadata.uid() != unsafe { libc::geteuid() } {
             bail!(
                 "VFIO lease directory {} has an unexpected owner",

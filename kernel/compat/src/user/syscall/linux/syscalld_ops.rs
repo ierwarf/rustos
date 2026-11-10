@@ -540,8 +540,11 @@ fn park_for_child_event(
     let Some(task_id) = multitask::current_task_id() else {
         return ChildParking::Unavailable;
     };
-    if !multitask::arm_block_current_task() {
-        return ChildParking::Unavailable;
+    while !multitask::arm_block_current_task() {
+        if multitask::current_task_id() != Some(task_id) {
+            return ChildParking::Unavailable;
+        }
+        multitask::cond_resched();
     }
     if !multitask::register_child_waiter(parent_pid, task_id) {
         let _ = multitask::cancel_block_current_task();

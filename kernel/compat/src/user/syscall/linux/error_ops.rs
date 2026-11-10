@@ -1,5 +1,37 @@
 use super::*;
 
+pub(super) const LINUX_EPERM: i64 = 1;
+pub(super) const LINUX_ENOENT: i64 = 2;
+pub(super) const LINUX_ESRCH: i64 = 3;
+pub(super) const LINUX_EINTR: i64 = 4;
+pub(super) const LINUX_EIO: i64 = 5;
+pub(super) const LINUX_E2BIG: i64 = 7;
+pub(super) const LINUX_ENOEXEC: i64 = 8;
+pub(super) const LINUX_EBADF: i64 = 9;
+pub(super) const LINUX_ECHILD: i64 = 10;
+pub(super) const LINUX_EAGAIN: i64 = 11;
+pub(super) const LINUX_ENOMEM: i64 = 12;
+pub(super) const LINUX_EACCES: i64 = 13;
+pub(super) const LINUX_EFAULT: i64 = 14;
+pub(super) const LINUX_EBUSY: i64 = 16;
+pub(super) const LINUX_EEXIST: i64 = 17;
+pub(super) const LINUX_ENODEV: i64 = 19;
+pub(super) const LINUX_ENOTDIR: i64 = 20;
+pub(super) const LINUX_EINVAL: i64 = 22;
+pub(super) const LINUX_EMFILE: i64 = 24;
+pub(super) const LINUX_ENOTTY: i64 = 25;
+pub(super) const LINUX_ENOSPC: i64 = 28;
+pub(super) const LINUX_EROFS: i64 = 30;
+pub(super) const LINUX_EPIPE: i64 = 32;
+pub(super) const LINUX_ERANGE: i64 = 34;
+pub(super) const LINUX_ENOSYS: i64 = 38;
+pub(super) const LINUX_EOVERFLOW: i64 = 75;
+pub(super) const LINUX_ENOTSOCK: i64 = 88;
+pub(super) const LINUX_EMSGSIZE: i64 = 90;
+pub(super) const LINUX_EOPNOTSUPP: i64 = 95;
+pub(super) const LINUX_ETIMEDOUT: i64 = 110;
+pub(super) const LINUX_ESTALE: i64 = 116;
+
 /// Diagnose each unsupported standard Linux syscall once, without copying user
 /// data or logging on the successful syscall hot path. Numeric arguments are
 /// retained to distinguish feature probes from required ABI operations.

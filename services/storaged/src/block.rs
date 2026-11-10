@@ -41,6 +41,7 @@ static READ_CACHE: Mutex<ReadCacheSet> = Mutex::new(ReadCacheSet::new());
 static PROVIDER_QUARANTINED: AtomicBool = AtomicBool::new(false);
 
 fn require_unquarantined(quarantined: &AtomicBool) -> Result<(), i32> {
+    // ORDERING: Acquire pairs with Release in `quarantine_provider`.
     if quarantined.load(Ordering::Acquire) {
         Err(libc::EIO)
     } else {
@@ -49,6 +50,7 @@ fn require_unquarantined(quarantined: &AtomicBool) -> Result<(), i32> {
 }
 
 fn quarantine_provider(ticket: DvmBlockTicketWire, cause: &str) {
+    // ORDERING: Release latches quarantine before cache invalidation.
     PROVIDER_QUARANTINED.store(true, Ordering::Release);
     clear_read_cache();
     eprintln!(
@@ -713,6 +715,7 @@ mod tests {
     fn quarantined_provider_rejects_admission() {
         let quarantined = AtomicBool::new(false);
         assert_eq!(require_unquarantined(&quarantined), Ok(()));
+        // ORDERING: Release pairs with Acquire in `require_unquarantined`.
         quarantined.store(true, Ordering::Release);
         assert_eq!(require_unquarantined(&quarantined), Err(libc::EIO));
     }

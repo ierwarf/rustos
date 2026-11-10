@@ -404,8 +404,14 @@ fn futex_wait(
 ) -> Result<u64, i64> {
     let deadline_tick = futex_wait_deadline_tick(op, timeout_ptr)?;
     let (task_id, address_space_root, retained) = current_futex_binding()?;
-    if !multitask::arm_block_current_task() {
-        return Err(LINUX_ENOSYS);
+    while !multitask::arm_block_current_task() {
+        if multitask::current_task_id() != Some(task_id) {
+            return Err(LINUX_ENOSYS);
+        }
+        if deadline_tick.is_some_and(|deadline| crate::arch::rtc::ticks() >= deadline) {
+            return Err(LINUX_ETIMEDOUT);
+        }
+        multitask::cond_resched();
     }
     let registration = retained.with_process_state(|process_state| {
         let key = futex_key_for_process_state(process_state, address_space_root, uaddr, op)?;

@@ -34,6 +34,9 @@ pub(super) fn drain_dvm_control() {
         GPU_EPOCH_RESET_PENDING.store(true, Ordering::Release);
         GUI_DVM_PEER_READY.store(false, Ordering::Release);
         GUI_DVM_EXPECTED_INVITATION.store(0, Ordering::Release);
+        // ORDERING: Release clears logged-rebind state and session counters
+        // before the replacement epoch can re-invite the same generation.
+        GUI_DVM_LOGGED_INVITATION.store(0, Ordering::Release);
         GPU_PRIME_DURATION_NS.store(0, Ordering::Release);
         GPU_SUBMIT_FLAGS.store(0, Ordering::Release);
         GPU_SESSION_SUBMISSIONS.store(0, Ordering::Release);
@@ -143,6 +146,8 @@ pub(super) fn revoke_transport(reason: &str, sequence: u64) {
     GPU_SUBMIT_FLAGS.store(0, Ordering::Release);
     GUI_DVM_PEER_READY.store(false, Ordering::Release);
     GUI_DVM_EXPECTED_INVITATION.store(0, Ordering::Release);
+    // ORDERING: Release resets rebind logging and host ack sequence together.
+    GUI_DVM_LOGGED_INVITATION.store(0, Ordering::Release);
     GUI_DVM_ACKED_CONTROL_SEQUENCE.store(sequence, Ordering::Release);
     write_u64(DVM_GUI_SURFACE_POOL_HOST_ACK_OFFSET, sequence);
     let _ = service_gpu_epoch_reset();
@@ -191,6 +196,9 @@ pub(super) fn service_gpu_epoch_reset() -> bool {
         )
         .as_bytes(),
     );
+    // ORDERING: Release clears prior epoch rebind logging before re-inviting
+    // the newest ready slot into the replacement context epoch.
+    GUI_DVM_LOGGED_INVITATION.store(0, Ordering::Release);
     // Recovery must not depend on unrelated cursor or client damage.
     reinvite_newest_ready_slot();
     true

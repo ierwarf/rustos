@@ -1,8 +1,48 @@
-# Session Handoff — 2026-11-07
+# Session Handoff — 2026-11-11
 
 Dated evidence, not instructions or proof of the current checkout. Resume with
 `git status --short`, `git log -1`, and the live request. `AGENTS.md` is the only
 stable repository prefix; use [task router](task-router.md) for owner contracts.
+
+## KVM runtime & DVM normalization (2026-11-11, local; verified)
+
+Starting `7cbe0711`:
+
+- **DVM display wire/quarantine contract (`driver-domains/linux/package/rustos-dvm-display/src/rustos-dvm-display.c`):**
+  Restored `frame_in_flight` tracking in `serve_gpu_display` so failures during
+  active frame DMA/KMS operations quarantine in `for (;;) pause();` while
+  failures outside frame operations close KMS/GPU and return
+  `scheduler.fatal ? DISPLAY_SERVE_FATAL : DISPLAY_SERVE_RETRY;`. Rebuilt the
+  DVM rootfs (`make -C driver-domains/linux build`) and verified with
+  `bash formal/run-dvm-timeout-tests.sh` and `cargo xtask verify-dvm`.
+- **DVM peer offline/epoch-reset invitation logging (`kernel/io-manager/src/io/dvm_display/{peer,installation}.rs`):**
+  Reset `GUI_DVM_LOGGED_INVITATION` on offline IRQ, `revoke_transport()`,
+  `service_gpu_epoch_reset()`, and transport installation so a restarted DVM
+  peer re-invited with the same generation (`1`) emits `gui: dvm display
+  invited generation=1` for the new epoch. Added unit test
+  `offline_epoch_reset_clears_logged_invitation_when_reinviting_same_generation`.
+- **Cross-CPU `TypedWake` pending-phase retry on `arm_block_current_task*` (`kernel/compat/src/user/syscall/linux/**`):**
+  When an RPC reply or wake completes on another vCPU, `TypedWake` holds
+  `state.pending = Some(serial)` until `drop(typed)` at the tail of
+  `retained_wake_admitted`. Callers in `poll_epoll.rs`, `input_broker_ops.rs`,
+  `block_broker_ops.rs`, `futex_thread.rs`, `syscalld_ops.rs`, and `ipc_ops.rs`
+  that immediately call `multitask::arm_block_current_task*` now yield/resched
+  and retry their loop while `multitask::current_task_id() == Some(task_id)`
+  instead of returning a spurious `EINVAL` (`epoll-wait-failed` site=4).
+- **Source contracts & failure-snapshot completeness (`kernel/compat/src/user/syscall/linux.rs`, `tools/xtask/src/kvm/failure_snapshot.rs`, etc.):**
+  Moved `LINUX_E*` constants into `linux/error_ops.rs` (`linux.rs` 630 -> 592
+  lines, within the 600-line budget), added missing `// SAFETY:` and
+  `// ORDERING:` comments in `libs/driver-domain-host/src/lib.rs`,
+  `kernel/io-manager/src/io/dvm_network.rs`, and `services/storaged/src/block.rs`,
+  and updated `failure_snapshot.rs` (`OWNER_WORDS` symbol path and `REPLIES`
+  slab stride `704 -> 768`) so failure snapshots complete with
+  `collection=complete`.
+- **Verified:** `python3 formal/check-rust-source-contracts.py`,
+  `python3 formal/check-dispatch-source-contracts.py`, `cargo xtask check`,
+  `cargo test -p kernel-io-manager -p kernel-compat -p xtask`, 1-vCPU
+  `kvm-smoke`, 16-vCPU `kvm-smoke --recovery-probe all`, 16-vCPU full stress
+  (`--gui-dvm-surfaces --dvm-network-shmem --dvm-block-shmem --exercise-input --exercise-network --proc-stress --expect "ipcbench: end" --repeat 2`),
+  and 16-vCPU `kvm-smoke --oom-hog`. Not run: `formal/verify-all.sh --profile pr`.
 
 ## Timeout/recovery integration (2026-11-10, local; validation in progress)
 

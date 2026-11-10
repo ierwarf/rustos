@@ -149,7 +149,11 @@ pub(super) fn syscall_linux_rustos_input_wait_broker() -> u64 {
             return linux_errno(LINUX_EINVAL);
         };
         if !multitask::arm_block_current_task() {
-            return linux_errno(LINUX_EINVAL);
+            if multitask::current_task_id() != Some(task_id) {
+                return linux_errno(LINUX_EINVAL);
+            }
+            multitask::cond_resched();
+            continue;
         }
         if !kernel_io_manager::api::input::transport::arm_inputd_ingestion_waiter(task_id) {
             let _ = multitask::cancel_block_current_task();

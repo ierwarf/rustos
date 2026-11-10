@@ -136,7 +136,11 @@ pub fn syscall_linux_poll(fds_ptr: u64, nfds: u64, timeout_ms: i64) -> u64 {
         }
         if !multitask::arm_block_current_task() {
             super::super::broker_ops::waitset_broker_ops::remove_waitset_waiters(task_id);
-            return linux_errno(LINUX_EINVAL);
+            if multitask::current_task_id() != Some(task_id) {
+                return linux_errno(LINUX_EINVAL);
+            }
+            multitask::cond_resched();
+            continue;
         }
         if !super::super::broker_ops::waitset_broker_ops::waitset_waiters_match(
             task_id,
@@ -1047,7 +1051,14 @@ pub fn syscall_linux_epoll_wait(
         }
         if !multitask::arm_block_current_task() {
             super::super::broker_ops::waitset_broker_ops::remove_waitset_waiters(task_id);
-            return epoll_wait_failed(4, LINUX_EINVAL);
+            // A prior typed reply wake from the readiness scan can still own
+            // this slot's pending wake phase on another CPU; yield and rescan
+            // rather than turning a transient cross-CPU phase into EINVAL.
+            if multitask::current_task_id() != Some(task_id) {
+                return epoll_wait_failed(4, LINUX_EINVAL);
+            }
+            multitask::cond_resched();
+            continue;
         }
         if !super::super::broker_ops::waitset_broker_ops::waitset_waiters_match(
             task_id,

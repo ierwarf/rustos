@@ -540,19 +540,23 @@ mod tests {
         use core::sync::atomic::{AtomicU64, Ordering};
         let lease = super::TransportLeaseLock::new(TransportLease { epoch: 7 });
         let publication_epoch = AtomicU64::new(41);
+        // ORDERING: Test models Acquire/Release publication epoch handoff.
         let captured = publication_epoch.load(Ordering::Acquire);
         {
             let mut replacement = DvmTransportPublicationGuard { lease: lease.lock() };
             replacement.reset_predecessor();
+            // ORDERING: Release publishes the successor epoch under the lease guard.
             publication_epoch.store(42, Ordering::Release);
         }
         lease.lock().activate(9);
         let stale = super::authorized_lease(&lease, || {
             assert!(lease.try_lock().is_none(), "authority must be rechecked under the transport lock");
+            // ORDERING: Acquire observes the successor publication epoch.
             publication_epoch.load(Ordering::Acquire) == captured
         });
         assert!(matches!(stale, Err(crate::network::PacketError::Revoked)));
         assert_eq!(lease.lock().epoch, 9, "late grant/reset/revoke cannot touch the successor");
+        // ORDERING: Acquire validates the current owner epoch under the lease lock.
         let mut live = super::authorized_lease(&lease, || publication_epoch.load(Ordering::Acquire) == 42).unwrap();
         assert!(live.revoke_exact(9));
     }

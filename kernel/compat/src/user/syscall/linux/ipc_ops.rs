@@ -1248,7 +1248,11 @@ pub(super) fn syscall_linux_rustos_ipc_wait_service_endpoint(args_ptr: u64) -> u
             return linux_errno(LINUX_ETIMEDOUT);
         }
         if !multitask::arm_block_current_task() {
-            return linux_errno(LINUX_EINVAL);
+            if multitask::current_task_id() != Some(task_id) {
+                return linux_errno(LINUX_EINVAL);
+            }
+            multitask::cond_resched();
+            continue;
         }
         if !register_service_endpoint_waiter(ServiceEndpointWaiter {
             task_id,
@@ -2091,7 +2095,11 @@ pub(super) fn syscall_linux_rustos_ipc_recv(
             }
             Ok(None) => {
                 if !multitask::arm_block_current_task_on_endpoint(endpoint.raw()) {
-                    return linux_errno(LINUX_EINVAL);
+                    if endpoint.raw() == 0 || multitask::current_task_id() != Some(task_id) {
+                        return linux_errno(LINUX_EINVAL);
+                    }
+                    multitask::yield_now();
+                    continue;
                 }
                 let pending =
                     match kernel_ipc_runtime::api::add_endpoint_receiver_waiter_with_capacity(
@@ -2439,7 +2447,12 @@ fn recv_with_sender_blocking_prepared_inner<const N: usize>(
         // under one guard; a sender after publication still withdraws this arm
         // before commit, exactly as in the split check-arm-recheck protocol.
         if !multitask::arm_block_current_task_on_endpoint(endpoint.raw()) {
-            return Err((LINUX_EINVAL, yielded));
+            if endpoint.raw() == 0 || multitask::current_task_id() != Some(task_id) {
+                return Err((LINUX_EINVAL, yielded));
+            }
+            multitask::yield_now();
+            yielded = true;
+            continue;
         }
         let may_wait = deadline_tick.is_none_or(|deadline| crate::arch::rtc::ticks() < deadline);
         let received = kernel_ipc_runtime::api::endpoint::receive_or_wait_inline::<N>(
@@ -3065,7 +3078,11 @@ pub(super) fn syscall_linux_rustos_ipc_recv_with_handles(args_ptr: u64) -> u64 {
             }
             Ok(None) => {
                 if !multitask::arm_block_current_task_on_endpoint(endpoint.raw()) {
-                    return linux_errno(LINUX_EINVAL);
+                    if endpoint.raw() == 0 || multitask::current_task_id() != Some(task_id) {
+                        return linux_errno(LINUX_EINVAL);
+                    }
+                    multitask::yield_now();
+                    continue;
                 }
                 let pending =
                     match kernel_ipc_runtime::api::add_endpoint_receiver_waiter_with_capacity(

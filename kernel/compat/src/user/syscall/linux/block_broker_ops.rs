@@ -357,7 +357,11 @@ fn broker_dvm_wait(args: &RustosBlockBrokerArgs) -> Result<u64, i64> {
         }
         let task_id = multitask::current_task_id().ok_or(LINUX_EINVAL)?;
         if !multitask::arm_block_current_task() {
-            return Err(LINUX_EINVAL);
+            if multitask::current_task_id() != Some(task_id) {
+                return Err(LINUX_EINVAL);
+            }
+            multitask::cond_resched();
+            continue;
         }
         if !block_api::arm_dvm_waiter(task_id) {
             let _ = multitask::cancel_block_current_task();

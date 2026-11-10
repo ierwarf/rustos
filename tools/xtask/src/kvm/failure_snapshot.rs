@@ -23,7 +23,7 @@ const MAX_SYMBOL_BYTES: u64 = 16 * 1024;
 // linked symbol sizes must agree before any handle-derived row is read.
 const IPC_SLABS: &[(&str, u64, u64)] = &[
     ("kernel_ipc_runtime::ipc::ENDPOINTS", 512, 192),
-    ("kernel_ipc_runtime::ipc::REPLIES", 128, 704),
+    ("kernel_ipc_runtime::ipc::REPLIES", 128, 768),
     ("kernel_ipc_runtime::ipc::ENDPOINT_MESSAGES", 128, 192),
 ];
 const MAX_IPC_ROWS: usize = 64;
@@ -33,7 +33,7 @@ const SYMBOLS: &[&str] = &[
     "kernel_ps::multitask::cpu_local::CURRENT_TASK_SLOTS",
     "kernel_ps::multitask::cpu_local::TRANSITION_ACTIVE",
     "kernel_ps::multitask::current_identity::IDENTITIES",
-    "kernel_ps::multitask::scheduler::runqueue::OWNER_WORDS",
+    "kernel_ps::multitask::scheduler::runqueue::ownership::OWNER_WORDS",
     "kernel_ps::multitask::scheduler::runqueue::KERNEL_STACK_BASE",
     "kernel_ps::multitask::scheduler::runqueue::KERNEL_STACK_TOP",
     "kernel_ps::multitask::scheduler::runqueue::wait::REASON_ID",
@@ -161,7 +161,8 @@ impl Monitor {
     fn owner_words(&self) -> Result<Vec<u64>> {
         const SLOTS: usize = 128;
         const WORDS_PER_LINE: usize = 8;
-        let words = self.words("kernel_ps::multitask::scheduler::runqueue::OWNER_WORDS")?;
+        let words =
+            self.words("kernel_ps::multitask::scheduler::runqueue::ownership::OWNER_WORDS")?;
         match words.len() {
             SLOTS => Ok(words),
             len if len == SLOTS * WORDS_PER_LINE => {
@@ -519,7 +520,7 @@ mod tests {
         // These are explicit earlier HMP table inputs, not guest authority.
         for (name, words) in [
             (
-                "kernel_ps::multitask::scheduler::runqueue::OWNER_WORDS",
+                "kernel_ps::multitask::scheduler::runqueue::ownership::OWNER_WORDS",
                 owners,
             ),
             (
@@ -621,7 +622,10 @@ mod tests {
         monitor.symbol("original-owner", 0x1000, 16).unwrap();
         assert_eq!(monitor.words("original-owner").unwrap(), [0x4005, 0x10002]);
         assert!(!String::from_utf8_lossy(&monitor.transcript).contains("COMMAND cont"));
-        let tables = BTreeMap::from([(IPC_SLABS[0].0.to_owned(), (0x1000, 512 * 192 + 64))]);
+        let tables = BTreeMap::from([(
+            IPC_SLABS[0].0.to_owned(),
+            (0x1000, IPC_SLABS[0].1 * IPC_SLABS[0].2 + 64),
+        )]);
         let mut seen = (0..MAX_IPC_ROWS as u64).map(|index| (0, index)).collect();
         assert!(monitor.ipc_row(&tables, 0, 0x10065, &mut seen).is_err());
         assert!(
@@ -699,8 +703,9 @@ mod wide_guest_tests {
         let (client, mut server) = UnixStream::pair().unwrap();
         server.write_all(b"(qemu) ").unwrap();
         let mut monitor = Monitor::over(client, 1).unwrap();
-        let mut dump =
-            String::from("\nSYMBOL kernel_ps::multitask::scheduler::runqueue::OWNER_WORDS\n");
+        let mut dump = String::from(
+            "\nSYMBOL kernel_ps::multitask::scheduler::runqueue::ownership::OWNER_WORDS\n",
+        );
         for line in 0..128 {
             // The owner leads each 64-byte line; the other seven words are padding.
             dump.push_str(&format!("{:016x}: 0x{:016x}", line * 64, line + 1));
