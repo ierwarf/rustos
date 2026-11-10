@@ -925,7 +925,9 @@ struct FastCallFrame {
     /// Request and response bytes that do not fit the inline images. Present only
     /// for a message larger than `IPC_FAST_INLINE_BYTES`; the common frame pays one
     /// null check at retirement.
-    spill: Option<alloc::boxed::Box<FastSpill>>,
+    // Keep the two fallibly allocated byte vectors, but not a second
+    // infallibly allocated Box metadata object on the kernel IPC path.
+    spill: Option<FastSpill>,
 }
 
 #[derive(Clone, Default)]
@@ -1959,7 +1961,7 @@ pub fn reserve_fast_endpoint_call_with_response_capacity(
         let mut bytes = Vec::new();
         bytes.try_reserve_exact(request.len()).map_err(|_| IpcError::NoMemory)?;
         bytes.extend_from_slice(request);
-        Some(alloc::boxed::Box::new(FastSpill { request: bytes, response: Vec::new() }))
+        Some(FastSpill { request: bytes, response: Vec::new() })
     } else {
         None
     };
@@ -2183,10 +2185,10 @@ pub fn complete_fast_endpoint_reply_for_task(
             terminal_error = Some(IpcError::NoMemory);
         } else {
             bytes.extend_from_slice(response);
-            prepared_spill = Some(alloc::boxed::Box::new(FastSpill {
+            prepared_spill = Some(FastSpill {
                 request: Vec::new(),
                 response: bytes,
-            }));
+            });
         }
     }
     let mut replaced_spill = None;
