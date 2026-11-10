@@ -36,19 +36,9 @@ pub(super) const CALL_DEADLINE_MS: u64 =
 /// exposes no absolute value, so it cannot express a deadline another service
 /// is meant to honour.
 pub(super) fn monotonic_nanos() -> u64 {
-    let mut ts = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    // SAFETY: the call writes exactly one `timespec` through this exclusive
-    // borrow and takes no other pointer.
-    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) } != 0 {
-        return 0;
-    }
-    u64::try_from(ts.tv_sec)
-        .unwrap_or(0)
-        .saturating_mul(NANOS_PER_SEC)
-        .saturating_add(u64::try_from(ts.tv_nsec).unwrap_or(0))
+    // Use the same checked clock as every no_std authority owner. A broken
+    // clock fails the service closed rather than extending retained grants.
+    rustos_svc_runtime::syscall::monotonic_nanos()
 }
 
 pub(super) fn retry_backoff_for_attempt(attempt: u32) -> u64 {

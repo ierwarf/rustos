@@ -12,7 +12,7 @@ use rustos_user_abi::performance::IPC_BOOT_CONTROL_HARD_LIMIT_MS;
 
 use super::{
     boot_line, fail_closed, reclaim_rootd_post_init_lease, record_launch_failure,
-    rootd_post_init_lease_query, rootd_service_id_for_exec,
+    rootd_post_init_lease_query, rootd_service_id_for_exec, startup_timeout_ms,
     wait_reported_service_endpoint_with_timeout, RetryState, RunningService, StartupLaunchEntry,
     ROOTD_LEASE_RECOVERY_TIMEOUT, ROOTD_LEASE_STATE_EMPTY, ROOTD_LEASE_STATE_EXITED,
     ROOTD_LEASE_STATE_RUNNING,
@@ -44,11 +44,21 @@ struct QueryAttempt {
 
 impl LeaseQueryRecovery {
     fn begin(&self, service_id: u64, now: Instant) -> Result<QueryAttempt, i32> {
+        self.begin_parent(service_id, now, None)
+    }
+
+    fn begin_parent(
+        &self,
+        service_id: u64,
+        now: Instant,
+        parent: Option<Instant>,
+    ) -> Result<QueryAttempt, i32> {
         let deadline = self
             .deadlines
             .get(&service_id)
             .copied()
             .unwrap_or_else(|| now + Duration::from_millis(IPC_BOOT_CONTROL_HARD_LIMIT_MS));
+        let deadline = parent.map_or(deadline, |end| end.min(deadline));
         let remaining = deadline.saturating_duration_since(now).as_millis();
         // A zero-millisecond wire timeout is invalid. Refuse rather than round
         // up and widen the original deadline or start a new five-second call.
@@ -70,6 +80,10 @@ impl LeaseQueryRecovery {
         now: Instant,
         result: Result<(u64, u16), i32>,
     ) -> Result<Option<(u64, u16)>, i32> {
+        if now >= attempt.deadline {
+            self.deadlines.remove(&service_id);
+            return Err(libc::ETIMEDOUT);
+        }
         match result {
             Ok(snapshot) => {
                 self.deadlines.remove(&service_id);
@@ -109,6 +123,8 @@ impl RootdLeaseReconciler {
         launched_once_packages: &mut BTreeSet<String>,
         retry_state: &mut BTreeMap<String, RetryState>,
         now: Instant,
+        parent_deadline: Option<Instant>,
+        initially_admitted: &mut BTreeSet<String>,
     ) {
         let recovery = &mut self.leases;
         for entry in startup_entries {
@@ -116,13 +132,16 @@ impl RootdLeaseReconciler {
                 continue;
             };
             let query_failed = |errno: i32| -> ! {
+                if parent_deadline.is_some() {
+                    fail_closed(&format!("initd: fatal startup failure v=1 phase=lease-query exec={} service_id={service_id} errno={errno}", entry.exec));
+                }
                 fail_closed(&format!(
                 "initd: fatal rootd post-init lease query failed service_id={service_id} errno={errno}"
             ))
             };
             let attempt = self
                 .queries
-                .begin(service_id, now)
+                .begin_parent(service_id, Instant::now(), parent_deadline)
                 .unwrap_or_else(|errno| query_failed(errno));
             let result = rootd_post_init_lease_query(service_id, attempt.timeout_ms);
             let Some((pid, state)) = self
@@ -158,8 +177,10 @@ impl RootdLeaseReconciler {
                             deadline: now + ROOTD_LEASE_RECOVERY_TIMEOUT,
                         };
                     }
-                    match wait_reported_service_endpoint_with_timeout(entry.exec.as_str(), pid, 1) {
+                    match startup_timeout_ms(parent_deadline, 1, Instant::now()).and_then(|timeout| wait_reported_service_endpoint_with_timeout(entry.exec.as_str(), pid, timeout)) {
                     Ok(()) => {
+                        startup_timeout_ms(parent_deadline, 1, Instant::now()).unwrap_or_else(|errno| query_failed(errno));
+                        initially_admitted.insert(entry.package_id.clone());
                         running.insert(
                             pid,
                             RunningService {
@@ -180,7 +201,7 @@ impl RootdLeaseReconciler {
                     }
                     Err(errno) if errno == libc::ETIMEDOUT && now < state.deadline => {}
                     Err(errno) if errno == libc::ETIMEDOUT || errno == libc::ESRCH => {
-                        reclaim_rootd_post_init_lease(service_id, pid as u64).unwrap_or_else(
+                        reclaim_rootd_post_init_lease(service_id, pid as u64, parent_deadline).unwrap_or_else(
                             |reclaim_errno| {
                                 fail_closed(&format!(
                                     "initd: fatal rootd stale lease reclaim failed service_id={service_id} pid={pid} errno={reclaim_errno}"
@@ -207,7 +228,7 @@ impl RootdLeaseReconciler {
                         }
                     }
                     if pid != 0 {
-                        reclaim_rootd_post_init_lease(service_id, pid).unwrap_or_else(|errno| {
+                        reclaim_rootd_post_init_lease(service_id, pid, parent_deadline).unwrap_or_else(|errno| {
                         fail_closed(&format!(
                             "initd: fatal rootd exited lease reclaim failed service_id={service_id} pid={pid} errno={errno}"
                         ))
@@ -217,7 +238,7 @@ impl RootdLeaseReconciler {
                 _ => {
                     recovery.remove(&service_id);
                     if pid != 0 {
-                        reclaim_rootd_post_init_lease(service_id, pid).unwrap_or_else(|errno| {
+                        reclaim_rootd_post_init_lease(service_id, pid, parent_deadline).unwrap_or_else(|errno| {
                         fail_closed(&format!(
                             "initd: fatal rootd terminal lease reclaim failed service_id={service_id} pid={pid} errno={errno}"
                         ))
@@ -232,6 +253,31 @@ impl RootdLeaseReconciler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parent_deadline_clips_query_retries_without_reminting() {
+        let now = Instant::now();
+        let parent = now + Duration::from_millis(200);
+        let mut recovery = LeaseQueryRecovery::default();
+        let first = recovery.begin_parent(4, now, Some(parent)).unwrap();
+        assert_eq!(first.timeout_ms, 200);
+        assert_eq!(
+            recovery.complete(4, first, now, Err(libc::EAGAIN)),
+            Ok(None)
+        );
+        let later = now + Duration::from_millis(150);
+        assert_eq!(
+            recovery
+                .begin_parent(4, later, Some(parent))
+                .unwrap()
+                .timeout_ms,
+            50
+        );
+        assert!(matches!(
+            recovery.begin_parent(4, parent, Some(parent)),
+            Err(libc::ETIMEDOUT)
+        ));
+    }
 
     #[test]
     fn transient_query_refusal_preserves_state_and_one_original_deadline() {

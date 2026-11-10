@@ -2049,6 +2049,24 @@ impl FileLeaseStore {
         sync_directory(&self.root)
     }
 
+    /// Persist the one-time storage binding without changing lease authority.
+    /// Callers serialize updates for the physical IOMMU group.
+    pub fn update_prepared(&self, record: &VfioLeaseRecord, now_unix: u64) -> Result<()> {
+        record.authorization_valid_at(now_unix)?;
+        let previous = self.load(&record.domain_id)?;
+        let mut expected = record.clone();
+        expected.storage_binding = None;
+        if record.state != VfioLeaseState::Prepared
+            || record.storage_binding.is_none()
+            || previous.storage_binding.is_some()
+            || previous != expected
+        {
+            bail!("prepared VFIO update changes identity, authority, or existing binding");
+        }
+        replace_private(&self.path_for(&record.domain_id)?, &record.to_env()?)?;
+        sync_directory(&self.root)
+    }
+
     pub fn mark_active(&self, record: &mut VfioLeaseRecord, now_unix: u64) -> Result<()> {
         if record.state != VfioLeaseState::Prepared {
             bail!("only a prepared VFIO lease can become active");
@@ -2755,9 +2773,12 @@ pub struct DvmDisplayEvidence {
 pub trait RustosInputSink {
     /// Wait until RustOS has validated the exact shared ring and armed its one
     /// MSI-X receiver. This is boot admission, never a data-plane poll.
-    fn wait_for_receiver_ready(&mut self, timeout: Duration) -> Result<()>;
+    fn wait_for_receiver_ready(&mut self, deadline: Instant) -> Result<()>;
 
     fn send_input_frame(&mut self, frame: &RustosInputFrame) -> Result<()>;
+
+    /// Publish the session-start frame within the original setup deadline.
+    fn send_setup_frame(&mut self, frame: &RustosInputFrame, deadline: Option<Instant>) -> Result<()>;
 
     /// Cleanup frames have reserved L0 queue capacity, so a DVM cannot fill
     /// normal traffic capacity and suppress its own releases/session end.
@@ -2850,11 +2871,13 @@ impl InputRingSink {
         read_input_ring_header(self.mapped)
     }
 
-    fn write_frame(&mut self, frame: &RustosInputFrame, cleanup: bool) -> Result<()> {
+    fn write_frame(&mut self, frame: &RustosInputFrame, cleanup: bool, parent: Option<Instant>) -> Result<()> {
         let deadline = Instant::now()
             .checked_add(INPUT_RING_CREDIT_TIMEOUT)
             .ok_or_else(|| anyhow!("input-ring credit deadline overflow"))?;
+        let deadline = parent.map_or(deadline, |end| end.min(deadline));
         let header = loop {
+            if Instant::now() >= deadline { bail!("fixed input-ring credit deadline expired"); }
             let header = self.header()?;
             if header.generation != self.generation || header.producer != self.producer_cursor {
                 bail!("input-ring producer lifecycle changed while L0 relay was live");
@@ -2881,7 +2904,7 @@ impl InputRingSink {
                     INPUT_RING_CREDIT_TIMEOUT.as_millis()
                 );
             }
-            std::thread::sleep(Duration::from_millis(1));
+            std::thread::sleep(Duration::from_millis(1).min(deadline.saturating_duration_since(Instant::now())));
         };
         let offset = usize::try_from(DvmInputRingHeader::record_offset(header.producer))
             .context("input-ring record offset does not fit usize")?;
@@ -3012,38 +3035,39 @@ impl InputArmWatch {
 }
 
 impl RustosInputSink for InputRingSink {
-    fn wait_for_receiver_ready(&mut self, timeout: Duration) -> Result<()> {
+    fn wait_for_receiver_ready(&mut self, deadline: Instant) -> Result<()> {
         let started = Instant::now();
-        let deadline = started
-            .checked_add(timeout)
-            .ok_or_else(|| anyhow!("input-ring receiver-ready deadline overflow"))?;
         let mut watch = InputArmWatch::default();
         let mut poll = Duration::from_millis(1);
         loop {
             let header = self.header()?;
             let phase = watch.observe(&header, self.generation);
-            if phase == InputArmPhase::Armed {
-                return Ok(());
-            }
             if Instant::now() >= deadline {
                 bail!(
                     "{}",
                     watch.failure(phase, &header, self.generation, started.elapsed())
                 );
             }
+            if phase == InputArmPhase::Armed {
+                return Ok(());
+            }
             // Back off toward 10 ms: a policy consumer that is minutes away is
             // not worth a thousand wakeups per second of a loaded host.
-            std::thread::sleep(poll);
+            std::thread::sleep(poll.min(deadline.saturating_duration_since(Instant::now())));
             poll = (poll * 2).min(Duration::from_millis(10));
         }
     }
 
     fn send_input_frame(&mut self, frame: &RustosInputFrame) -> Result<()> {
-        self.write_frame(frame, false)
+        self.write_frame(frame, false, None)
+    }
+
+    fn send_setup_frame(&mut self, frame: &RustosInputFrame, deadline: Option<Instant>) -> Result<()> {
+        self.write_frame(frame, false, deadline)
     }
 
     fn send_input_cleanup_frame(&mut self, frame: &RustosInputFrame) -> Result<()> {
-        self.write_frame(frame, true)
+        self.write_frame(frame, true, None)
     }
 }
 
@@ -3254,8 +3278,9 @@ impl HostControlListener {
     }
 
     pub fn probe_once(&self, timeout: Duration) -> Result<ProbeResult> {
-        let mut connection = self.accept_authenticated(Some(timeout))?;
-        self.probe_connection(&mut connection)
+        let deadline = Some(Instant::now().checked_add(timeout).ok_or_else(|| anyhow!("probe deadline overflow"))?);
+        let mut connection = self.accept_authenticated(deadline)?;
+        self.probe_connection(&mut connection, deadline)
     }
 
     /// Relay Linux evdev keyboard and pointer events from one authenticated
@@ -3312,14 +3337,19 @@ impl HostControlListener {
         sink: &mut impl RustosInputSink,
         on_ready: impl FnOnce(&ProbeResult) -> Result<()>,
     ) -> Result<InputRelayResult> {
-        let mut connection = self.accept_authenticated(setup_timeout)?;
-        let probe = self.probe_connection(&mut connection)?;
+        let deadline = setup_timeout.map(|timeout| Instant::now().checked_add(timeout)
+            .ok_or_else(|| anyhow!("input relay setup deadline overflow"))).transpose()?;
+        let mut connection = self.accept_authenticated(deadline)?;
+        let probe = self.probe_connection(&mut connection, deadline)?;
         // RustOS must have validated the fixed ring and armed its wake vector
         // before L0 asks the DVM agent to open the input stream. In the KVM
         // self-test that request arms uinput immediately, so this admission
         // prevents a boot-time producer from racing an uninstalled consumer.
-        sink.wait_for_receiver_ready(receiver_timeout)?;
-        let ready = request(&mut connection, INPUT_STREAM_REQUEST_ID, "input-stream")?;
+        remaining_setup(deadline)?;
+        let receiver_deadline = Instant::now().checked_add(receiver_timeout)
+            .ok_or_else(|| anyhow!("input receiver deadline overflow"))?;
+        sink.wait_for_receiver_ready(deadline.map_or(receiver_deadline, |end| end.min(receiver_deadline)))?;
+        let ready = request(&mut connection, INPUT_STREAM_REQUEST_ID, "input-stream", deadline)?;
         if !has_exact_fields(
             &ready,
             &["id", "op", "status", "format", "keyboard", "pointer"],
@@ -3337,7 +3367,13 @@ impl HostControlListener {
         // also bound the lifetime of RustOS's independent fixed network ring.
         // A later network-only domain must receive a distinct authenticated
         // lifecycle signal rather than inheriting this input-DVM epoch.
-        sink.send_input_frame(&RustosInputFrame::session_start(epoch)?)?;
+        remaining_setup(deadline)?;
+        sink.send_setup_frame(&RustosInputFrame::session_start(epoch)?, deadline)?;
+        if let Err(error) = remaining_setup(deadline) {
+            let _ = sink.send_input_cleanup_frame(&RustosInputFrame::session_end(epoch, 1)?);
+            let _ = sink.finish_input_relay();
+            return Err(error);
+        }
         // Endpoint setup has a deadline, but a live input device may stay idle
         // indefinitely. A disconnect is still reported as a relay failure after
         // L0 emits releases and a session-end marker to prevent stuck input.
@@ -3441,17 +3477,9 @@ impl HostControlListener {
         }
     }
 
-    fn accept_authenticated(&self, timeout: Option<Duration>) -> Result<std::fs::File> {
-        let deadline = timeout
-            .map(|duration| {
-                std::time::Instant::now()
-                    .checked_add(duration)
-                    .ok_or_else(|| anyhow!("Linux DVM vsock accept deadline overflow"))
-            })
-            .transpose()?;
-        let mut connection = loop {
-            let remaining = deadline
-                .map(|deadline| deadline.saturating_duration_since(std::time::Instant::now()));
+    fn accept_authenticated(&self, deadline: Option<Instant>) -> Result<std::fs::File> {
+        let connection = loop {
+            let remaining = remaining_setup(deadline)?;
             let timeout_ms = remaining
                 .map(|duration| {
                     // Round up so a sub-millisecond remainder still waits.
@@ -3509,23 +3537,22 @@ impl HostControlListener {
             }
             break connection;
         };
-        configure_socket_timeout(&connection, timeout)?;
-        let hello = read_message(&mut connection)?;
+        let hello = read_setup_message(&connection, deadline)?;
         validate_hello(&hello, &self.contract)?;
-        authenticate_control_peer(&mut connection, &hello, &self.control_secret)?;
-        write_message(&mut connection, &welcome_message(&self.contract))?;
+        authenticate_control_peer(&connection, &hello, &self.control_secret, deadline)?;
+        write_setup_message(&connection, &welcome_message(&self.contract), deadline)?;
         Ok(connection)
     }
 
-    fn probe_connection(&self, connection: &mut std::fs::File) -> Result<ProbeResult> {
-        let health = request(connection, 1, "health")?;
+    fn probe_connection(&self, connection: &mut std::fs::File, deadline: Option<Instant>) -> Result<ProbeResult> {
+        let health = request(connection, 1, "health", deadline)?;
         if !has_exact_fields(&health, &["id", "op", "status", "value"])
             || health.get("status") != Some(&"ok".to_owned())
             || health.get("value") != Some(&"ready".to_owned())
         {
             bail!("Linux DVM health probe was not ready");
         }
-        let inventory = request(connection, 2, "device-inventory")?;
+        let inventory = request(connection, 2, "device-inventory", deadline)?;
         if !has_exact_fields(&inventory, &["id", "op", "status", "count"])
             || inventory.get("status") != Some(&"ok".to_owned())
         {
@@ -3536,7 +3563,7 @@ impl HostControlListener {
             .ok_or_else(|| anyhow!("Linux DVM inventory response omitted count"))?
             .parse::<u32>()
             .context("invalid Linux DVM inventory count")?;
-        let drivers = request(connection, 3, "driver-inventory")?;
+        let drivers = request(connection, 3, "driver-inventory", deadline)?;
         if !has_exact_fields(
             &drivers,
             &[
@@ -3558,9 +3585,9 @@ impl HostControlListener {
             display_driver_bound: parse_driver_inventory_state(&drivers, "display-driver")?,
             display_relay_ready: parse_ready_inventory_state(&drivers, "display-relay")?,
         };
-        let display = request(connection, 4, "display-evidence-v2")?;
+        let display = request(connection, 4, "display-evidence-v2", deadline)?;
         let display_evidence = parse_display_evidence(&display)?;
-        let block = request(connection, 5, "block-evidence-v1")?;
+        let block = request(connection, 5, "block-evidence-v1", deadline)?;
         let block_evidence = parse_block_evidence(&block)?;
         Ok(ProbeResult {
             peer_cid: self.expected_dvm_cid,
@@ -4099,6 +4126,14 @@ fn required_value<'a>(values: &'a BTreeMap<&str, &str>, key: &str, label: &str) 
         .ok_or_else(|| anyhow!("missing {label} key {key}"))
 }
 
+fn remaining_setup(deadline: Option<Instant>) -> Result<Option<Duration>> {
+    deadline.map(|end| {
+        let remaining = end.saturating_duration_since(Instant::now());
+        if remaining.is_zero() { bail!("Linux DVM setup deadline expired"); }
+        Ok(remaining)
+    }).transpose()
+}
+
 fn socket_timeval(timeout: Option<Duration>) -> libc::timeval {
     // An all-zero timeval means "block forever" to SO_RCVTIMEO/SO_SNDTIMEO.
     // Only `None` may request that; a bounded sub-microsecond (or zero)
@@ -4137,9 +4172,10 @@ fn request(
     connection: &mut std::fs::File,
     id: u32,
     operation: &str,
+    deadline: Option<Instant>,
 ) -> Result<BTreeMap<String, String>> {
-    write_message(connection, &format!("REQUEST\nid={id}\nop={operation}"))?;
-    let response = parse_message(&read_message(connection)?)?;
+    write_setup_message(connection, &format!("REQUEST\nid={id}\nop={operation}"), deadline)?;
+    let response = parse_message(&read_setup_message(connection, deadline)?)?;
     if response.kind != "RESPONSE"
         || response.fields.get("id") != Some(&id.to_string())
         || response.fields.get("op") != Some(&operation.to_owned())
@@ -4188,20 +4224,22 @@ fn validate_hello(source: &str, contract: &ControlContract) -> Result<()> {
 }
 
 fn authenticate_control_peer(
-    connection: &mut std::fs::File,
+    connection: &std::fs::File,
     hello: &str,
     control_secret: &ControlSecret,
+    deadline: Option<Instant>,
 ) -> Result<()> {
     let mut nonce = [0_u8; CONTROL_SECRET_BYTES];
     fs::File::open("/dev/urandom")
         .context("open /dev/urandom for DVM control challenge")?
         .read_exact(&mut nonce)
         .context("read DVM control challenge")?;
-    write_message(
+    write_setup_message(
         connection,
         &format!("CHALLENGE\nnonce={}", encode_hex(&nonce)),
+        deadline,
     )?;
-    let proof = parse_message(&read_message(connection)?)?;
+    let proof = parse_message(&read_setup_message(connection, deadline)?)?;
     if proof.kind != "PROOF" || !has_exact_fields(&proof.fields, &["mac"]) {
         bail!("rejected Linux DVM control proof shape");
     }
@@ -4378,6 +4416,55 @@ fn parse_message(source: &str) -> Result<Message> {
     Ok(Message { kind, fields })
 }
 
+// MSG_DONTWAIT prevents a single fragmented socket operation from reminting
+// SO_RCVTIMEO. Each poll and transfer uses the same absolute setup deadline.
+fn setup_transfer(connection: &std::fs::File, bytes: &mut [u8], write: bool, deadline: Option<Instant>) -> Result<()> {
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let timeout = remaining_setup(deadline)?.map(|left| left.as_micros().div_ceil(1000).min(i32::MAX as u128) as i32).unwrap_or(-1);
+        let mut fd = libc::pollfd { fd: connection.as_raw_fd(), events: if write { libc::POLLOUT } else { libc::POLLIN }, revents: 0 };
+        let ready = unsafe { libc::poll(&mut fd, 1, timeout) };
+        if ready == 0 { bail!("Linux DVM setup deadline expired"); }
+        if ready < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted { continue; }
+            return Err(error).context("poll Linux DVM setup socket");
+        }
+        remaining_setup(deadline)?;
+        let n = unsafe {
+            if write { libc::send(connection.as_raw_fd(), bytes[offset..].as_ptr().cast(), bytes.len() - offset, libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) }
+            else { libc::recv(connection.as_raw_fd(), bytes[offset..].as_mut_ptr().cast(), bytes.len() - offset, libc::MSG_DONTWAIT) }
+        };
+        if n == 0 { bail!("Linux DVM setup socket closed"); }
+        if n < 0 {
+            let error = std::io::Error::last_os_error();
+            if matches!(error.kind(), std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock) { continue; }
+            return Err(error).context("transfer Linux DVM setup socket");
+        }
+        offset += n as usize;
+    }
+    remaining_setup(deadline)?;
+    Ok(())
+}
+
+fn read_setup_message(connection: &std::fs::File, deadline: Option<Instant>) -> Result<String> {
+    let mut length = [0_u8; 4];
+    setup_transfer(connection, &mut length, false, deadline)?;
+    let length = u32::from_be_bytes(length) as usize;
+    if length == 0 || length > MAX_CONTROL_FRAME { bail!("invalid DVM control frame length {length}"); }
+    let mut payload = vec![0; length];
+    setup_transfer(connection, &mut payload, false, deadline)?;
+    String::from_utf8(payload).context("DVM control frame is not UTF-8")
+}
+
+fn write_setup_message(connection: &std::fs::File, message: &str, deadline: Option<Instant>) -> Result<()> {
+    if message.is_empty() || message.len() > MAX_CONTROL_FRAME { bail!("invalid outbound DVM control frame length"); }
+    let mut length = (message.len() as u32).to_be_bytes();
+    setup_transfer(connection, &mut length, true, deadline)?;
+    let mut payload = message.as_bytes().to_vec();
+    setup_transfer(connection, &mut payload, true, deadline)
+}
+
 fn read_message(connection: &mut std::fs::File) -> Result<String> {
     let mut length = [0_u8; 4];
     connection
@@ -4392,17 +4479,6 @@ fn read_message(connection: &mut std::fs::File) -> Result<String> {
         .read_exact(&mut payload)
         .context("read DVM control frame payload")?;
     String::from_utf8(payload).context("DVM control frame is not UTF-8")
-}
-
-fn write_message(connection: &mut std::fs::File, message: &str) -> Result<()> {
-    if message.is_empty() || message.len() > MAX_CONTROL_FRAME {
-        bail!("invalid outbound DVM control frame length");
-    }
-    connection
-        .write_all(&(message.len() as u32).to_be_bytes())
-        .and_then(|()| connection.write_all(message.as_bytes()))
-        .and_then(|()| connection.flush())
-        .context("write DVM control frame")
 }
 
 #[cfg(test)]
@@ -4435,6 +4511,41 @@ mod tests {
     use anyhow::Result;
 
     const VALID: &str = "CONTROL_SCHEMA=1\nCONTROL_PROTOCOL=agent-v1\nCONTROL_STATE=control\nCONTROL_TRANSPORT=kvm-vsock\nCONTROL_AUTHENTICATION=dvm-agent-hmac-sha256-v1\nCONTROL_CAPABILITIES=health,device-inventory,driver-inventory,display-evidence-v2,block-evidence-v1,input-stream\n";
+
+    #[test]
+    fn fragmented_setup_frame_cannot_refresh_absolute_deadline() {
+        use std::io::Write;
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixStream;
+        use std::time::{Duration, Instant};
+        let (reader, mut writer) = UnixStream::pair().unwrap();
+        let reader = std::fs::File::from(OwnedFd::from(reader));
+        let worker = std::thread::spawn(move || {
+            for byte in [0_u8, 0, 0, 2, b'o', b'k'] {
+                if writer.write_all(&[byte]).is_err() { break; }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let start = Instant::now();
+        assert!(super::read_setup_message(&reader, Some(start + Duration::from_millis(45))).is_err());
+        assert!(start.elapsed() < Duration::from_millis(500));
+        drop(reader);
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn setup_phases_share_the_original_deadline() {
+        use std::io::Write;
+        use std::os::fd::OwnedFd;
+        use std::os::unix::net::UnixStream;
+        use std::time::{Duration, Instant};
+        let (reader, mut writer) = UnixStream::pair().unwrap();
+        let reader = std::fs::File::from(OwnedFd::from(reader));
+        writer.write_all(&[0, 0, 0, 1, b'a']).unwrap();
+        let deadline = Some(Instant::now() + Duration::from_millis(30));
+        assert_eq!(super::read_setup_message(&reader, deadline).unwrap(), "a");
+        assert!(super::read_setup_message(&reader, deadline).is_err());
+    }
 
     #[test]
     fn input_ring_control_words_are_atomic_and_ordered() {
@@ -5330,6 +5441,24 @@ mod tests {
             VfioLeaseState::Active
         );
         store.remove("linux-dvm-net0").unwrap();
+    }
+
+    #[test]
+    fn prepared_storage_update_preserves_identity_and_is_one_shot() {
+        let root = TestSysfs::new(&[]);
+        let store = FileLeaseStore::new(root.path().join("leases"));
+        let lease = validated_lease(&["0000:02:00.0"]);
+        let ops = FakeVfioOps::with_drivers(&[("0000:02:00.0", Some("nvme"))]);
+        let mut record = inspect_vfio_lease(&lease, &ops, release_binding()).unwrap();
+        store.create_prepared(&record, 150).unwrap();
+        record.bind_storage_handoff("0000:02:00.0", "nvme0n1", &root.path().join("aperture"), 7, &"ab".repeat(32)).unwrap();
+        let mut altered = record.clone();
+        altered.iommu_group += 1;
+        assert!(store.update_prepared(&altered, 150).is_err());
+        assert!(store.load(&lease.domain_id).unwrap().storage_handoff().is_none());
+        store.update_prepared(&record, 150).unwrap();
+        assert_eq!(store.load(&lease.domain_id).unwrap(), record);
+        assert!(store.update_prepared(&record, 150).is_err());
     }
 
     #[test]

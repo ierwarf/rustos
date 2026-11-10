@@ -27,16 +27,15 @@
 
 use std::mem::size_of;
 
-/// Wire version. Frame layouts are unchanged since 1; the version tracks
-/// exchange semantics so a mixed build fails loudly (`EPROTO`) instead of
-/// stalling on a reply that never comes.
-///
-/// - 1: `OP_NOTIFY_READY` was a one-way write; the sender closed the stream
-///   without reading, so "delivered" meant only "written".
-/// - 2: `OP_NOTIFY_READY` is acknowledged like every other mutation: the server
-///   replies `status = 0, count = 0` after it has recorded the edge, and the
-///   client treats that reply, not the write, as delivery.
-pub const PROTOCOL_VERSION: u16 = 2;
+/// Version 3 adds absolute monotonic deadlines and replay identity.
+pub const PROTOCOL_VERSION: u16 = 3;
+/// Query an existing transaction; never create one.
+pub const REQUEST_FLAG_QUERY: u32 = 1;
+/// A transaction deadline may be at most this far after identity creation.
+/// Admission and replay cannot renew the identity's age.
+pub const MAX_TRANSACTION_LIFETIME_NS: u64 = 30_000_000_000;
+/// Replay metadata expires this long after the immutable admission horizon.
+pub const TRANSACTION_REPLAY_RETENTION_NS: u64 = 60_000_000_000;
 
 pub const OP_SNAPSHOT_RUNNING_PROGRAMS: u16 = 1;
 pub const OP_REQUEST_LAUNCH_PATH: u16 = 2;
@@ -75,7 +74,7 @@ pub const RUNTIME_WATCH_MAX_WAIT_MS: u16 = 2_000;
 pub const MAX_RUNTIME_WATCHERS: usize = 8;
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RuntimeRequest {
     pub version: u16,
     pub op: u16,
@@ -89,6 +88,14 @@ pub struct RuntimeRequest {
     /// uninitialised padding bytes would cross the socket. Always zero.
     pub reserved: u32,
     pub target_value: u64,
+    /// CLOCK_MONOTONIC deadline for this transport attempt.
+    pub deadline_ns: u64,
+    /// Stable identity and original admission deadline for a mutation.
+    pub transaction_id_hi: u64,
+    pub transaction_id_lo: u64,
+    pub transaction_deadline_ns: u64,
+    pub flags: u32,
+    pub reserved2: u32,
     pub text: [u8; MAX_REQUEST_PATH_BYTES],
 }
 
@@ -102,6 +109,12 @@ impl Default for RuntimeRequest {
             text_len: 0,
             reserved: 0,
             target_value: 0,
+            deadline_ns: 0,
+            transaction_id_hi: 0,
+            transaction_id_lo: 0,
+            transaction_deadline_ns: 0,
+            flags: 0,
+            reserved2: 0,
             text: [0; MAX_REQUEST_PATH_BYTES],
         }
     }
@@ -190,7 +203,7 @@ pub fn running_programs_digest(programs: &[RuntimeRunningProgram]) -> u64 {
 pub const NO_RUNNING_PROGRAMS_DIGEST: u64 = 0;
 
 const _: () = assert!(size_of::<RuntimeRunningProgram>() == 184);
-const _: () = assert!(size_of::<RuntimeRequest>() == 152);
+const _: () = assert!(size_of::<RuntimeRequest>() == 192);
 const _: () = assert!(size_of::<RuntimeResponse>() == 12);
 const _: () = assert!(!op_carries_program_payload(OP_REQUEST_LAUNCH_PATH));
 const _: () = assert!(!op_carries_program_payload(OP_NOTIFY_READY));

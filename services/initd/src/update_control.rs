@@ -38,7 +38,7 @@ fn exact_subject()->Result<(u64,u64),i32>{
     if pid<=0||tid<=0{return Err(libc::ESRCH)}
     Ok((pid as u64,tid as u64))
 }
-fn transact(mut request:CommercialMaxProtocolRequest)
+fn transact(mut request:CommercialMaxProtocolRequest, deadline:Option<std::time::Instant>)
     ->Result<CommercialMaxProtocolResponse,i32>{
     let endpoint=rustos_svc_runtime::ipc::lookup_service_endpoint(IPC_SERVICE_ROOTD);
     if endpoint<=0{return Err(if endpoint==0{libc::EAGAIN}else{(-endpoint) as i32})}
@@ -54,7 +54,7 @@ fn transact(mut request:CommercialMaxProtocolRequest)
         size_of::<CommercialMaxProtocolRequest>() as u64,
         (&mut response as *mut CommercialMaxProtocolResponse) as u64,
         size_of::<CommercialMaxProtocolResponse>() as u64,
-        IPC_BOOT_CONTROL_HARD_LIMIT_MS,
+        super::startup_timeout_ms(deadline,IPC_BOOT_CONTROL_HARD_LIMIT_MS,std::time::Instant::now())?,
     )};
     if got<0{return Err((-got) as i32)}
     if got as usize!=size_of::<CommercialMaxProtocolResponse>()
@@ -63,7 +63,7 @@ fn transact(mut request:CommercialMaxProtocolRequest)
     if response.status!=0{return Err(response.status)}
     Ok(response)
 }
-fn apply(op:u16,approval:Approval,expected:Phase)->Result<Phase,i32>{
+fn apply(op:u16,approval:Approval,expected:Phase, deadline:Option<std::time::Instant>)->Result<Phase,i32>{
     if !matches!(op,COMMERCIAL_MAX_ROOTD_OP_UPDATE_ARM|
         COMMERCIAL_MAX_ROOTD_OP_UPDATE_ROLLBACK|
         COMMERCIAL_MAX_ROOTD_OP_UPDATE_SEAL){return Err(EINVAL)}
@@ -73,7 +73,7 @@ fn apply(op:u16,approval:Approval,expected:Phase)->Result<Phase,i32>{
     request.header.op=op;
     request.payload_len=wire.len() as u32;
     request.payload[..wire.len()].copy_from_slice(&wire);
-    let response=transact(request)?;
+    let response=transact(request,deadline)?;
     if response.payload_len!=0||response.value0!=approval.epoch{return Err(EPROTO)}
     let phase=Phase::parse(response.value1)?;
     if phase!=expected{return Err(EPROTO)}
@@ -81,9 +81,9 @@ fn apply(op:u16,approval:Approval,expected:Phase)->Result<Phase,i32>{
 }
 /// Retire a transaction whose restored incarnation passed rootd's health
 /// quorum. The approval is rebuilt from rootd's own INSPECT snapshot.
-pub(super) fn seal_rolled_back(approval:Approval)->Result<(),i32>{
+pub(super) fn seal_rolled_back(approval:Approval,deadline:Option<std::time::Instant>)->Result<(),i32>{
     apply(COMMERCIAL_MAX_ROOTD_OP_UPDATE_SEAL,approval,
-        Phase::RolledBack).map(|_|())
+        Phase::RolledBack,deadline).map(|_|())
 }
 #[cfg(test)]
 mod tests {
@@ -102,7 +102,7 @@ mod tests {
 /// verified release generation. Loaderd, not initd, holds the keyring and
 /// decides; initd only names the bundle, service, epoch and deadline.
 pub(super) fn stage_release_via_loaderd(
-    path:&str,service:u64,epoch:u64,trial_deadline_ns:u64,durable_floor:u64,
+    path:&str,service:u64,epoch:u64,trial_deadline_ns:u64,durable_floor:u64, deadline:Option<std::time::Instant>,
 )->Result<u64,i32>{
     let mut request=CommercialMaxProtocolRequest::default();
     if path.is_empty()||path.len()>request.path.len()||path.as_bytes().contains(&0){
@@ -128,7 +128,7 @@ pub(super) fn stage_release_via_loaderd(
         size_of::<CommercialMaxProtocolRequest>() as u64,
         (&mut response as *mut CommercialMaxProtocolResponse) as u64,
         size_of::<CommercialMaxProtocolResponse>() as u64,
-        STAGE_RELEASE_CALL_TIMEOUT_MS,
+        super::startup_timeout_ms(deadline,STAGE_RELEASE_CALL_TIMEOUT_MS,std::time::Instant::now())?,
     )};
     if got<0{return Err((-got) as i32)}
     if got as usize!=size_of::<CommercialMaxProtocolResponse>()

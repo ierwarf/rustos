@@ -19,29 +19,30 @@ pub enum PacketError {
     Busy,
     TooLarge,
     WouldBlock,
+    Revoked,
 }
 
 pub fn available() -> bool {
-    transport_status() == PacketTransportStatus::Active
+    transport_status(|| true) == Ok(PacketTransportStatus::Active)
 }
 
-pub fn transport_status() -> PacketTransportStatus {
-    crate::io::dvm_network::transport_status()
+pub fn transport_status(authorize: impl FnOnce() -> bool) -> Result<PacketTransportStatus, PacketError> {
+    crate::io::dvm_network::transport_status(authorize)
 }
 
-pub fn transmit_frame(frame: &[u8]) -> Result<usize, PacketError> {
+pub fn transmit_frame(frame: &[u8], authorize: impl FnOnce() -> bool) -> Result<usize, PacketError> {
     if frame.is_empty() {
         return Ok(0);
     }
     if frame.len() > PACKET_MTU {
         return Err(PacketError::TooLarge);
     }
-    crate::io::dvm_network::transmit(frame)
+    crate::io::dvm_network::transmit(frame, authorize)
 }
 
-pub fn receive_frame(out: &mut [u8]) -> Result<usize, PacketError> {
+pub fn receive_frame(out: &mut [u8], authorize: impl FnOnce() -> bool) -> Result<usize, PacketError> {
     if out.is_empty() {
         return Err(PacketError::Invalid);
     }
-    crate::io::dvm_network::receive(out)
+    crate::io::dvm_network::receive(out, authorize)
 }

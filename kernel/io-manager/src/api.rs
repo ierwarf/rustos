@@ -316,33 +316,42 @@ pub mod console {
 
 pub mod network {
     pub use crate::network::{PACKET_MTU, PacketError, PacketTransportStatus};
+    pub use crate::io::dvm_network::DvmTransportPublicationGuard;
+
+    /// Acquire in sleepable context before the registry mutation spinlock.
+    /// The authorized registrar resets predecessor authority only on commit.
+    pub fn begin_dvm_transport_publication() -> DvmTransportPublicationGuard<'static> {
+        crate::io::dvm_network::begin_transport_publication()
+    }
 
     pub fn available() -> bool {
         crate::network::available()
     }
 
-    pub fn transport_status() -> PacketTransportStatus {
-        crate::network::transport_status()
+    /// The exact owner/epoch is revalidated while the transport lease is held.
+    /// The callback must be bounded, nonblocking registry validation only.
+    pub fn transport_status(authorize: impl FnOnce() -> bool) -> Result<PacketTransportStatus, PacketError> {
+        crate::network::transport_status(authorize)
     }
 
-    pub fn transmit_frame(frame: &[u8]) -> Result<usize, PacketError> {
-        crate::network::transmit_frame(frame)
+    pub fn transmit_frame(frame: &[u8], authorize: impl FnOnce() -> bool) -> Result<usize, PacketError> {
+        crate::network::transmit_frame(frame, authorize)
     }
 
-    pub fn receive_frame(out: &mut [u8]) -> Result<usize, PacketError> {
-        crate::network::receive_frame(out)
+    pub fn receive_frame(out: &mut [u8], authorize: impl FnOnce() -> bool) -> Result<usize, PacketError> {
+        crate::network::receive_frame(out, authorize)
     }
 
-    pub fn grant_dvm_transport_lease(generation: u32) -> bool {
-        crate::io::dvm_network::grant_transport_lease(generation)
+    pub fn grant_dvm_transport_lease(generation: u32, authorize: impl FnOnce() -> bool) -> bool {
+        crate::io::dvm_network::grant_transport_lease(generation, authorize)
     }
 
-    pub fn revoke_dvm_transport_lease(generation: u32) -> bool {
-        crate::io::dvm_network::revoke_transport_lease(generation)
+    pub fn revoke_dvm_transport_lease(generation: u32, authorize: impl FnOnce() -> bool) -> bool {
+        crate::io::dvm_network::revoke_transport_lease(generation, authorize)
     }
 
-    pub fn reset_dvm_transport_lease() {
-        crate::io::dvm_network::reset_transport_lease();
+    pub fn reset_dvm_transport_lease(authorize: impl FnOnce() -> bool) -> bool {
+        crate::io::dvm_network::reset_transport_lease(authorize)
     }
 }
 

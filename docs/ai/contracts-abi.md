@@ -4,6 +4,9 @@ IPC service IDs, broker syscalls, handle transfer, and service routing. For pack
 Cross-owner composition is indexed by `system-flows.md` and
 `formal/system-flows.tsv`; this file remains the detailed owner/wire contract.
 
+Deadline propagation, mutation custody and provider recovery are composed in
+[Timeout and recovery ownership](timeout-recovery.md), with links to each owner.
+
 ## Kernel/Userspace ABI Surface
 
 See [Core ABI and service registry](abi/core.md#kerneluserspace-abi-surface).

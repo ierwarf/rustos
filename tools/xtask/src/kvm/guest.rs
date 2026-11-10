@@ -561,6 +561,9 @@ fn wait_for_parallel_boot(
         );
         let dvm_log = read_log_lossy(&layout.dvm_serial_log)
             .with_context(|| format!("read {}", layout.dvm_serial_log.display()))?;
+        if let Some(failure) = startup_failure_detail(&rustos_log) {
+            bail!("RustOS startup failed before readiness: {failure}");
+        }
         if options.expect_block_flush_fault && rustos_log.contains(RUSTOS_DVM_BLOCK_E2E_MARKER) {
             bail!(
                 "storage-DVM flush fault proof observed an impossible media-barrier success marker"

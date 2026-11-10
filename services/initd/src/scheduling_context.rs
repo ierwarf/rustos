@@ -7,6 +7,7 @@ use super::*;
 
 pub(super) fn request_scheduling_context_authority(
     exec_path: &str,
+    deadline: Option<Instant>,
 ) -> Result<RustosSchedulingContextAuthority, i32> {
     let endpoint = lookup_service_endpoint(IPC_SERVICE_ROOTD)?;
     let mut request = CommercialMaxProtocolRequest::default();
@@ -33,7 +34,7 @@ pub(super) fn request_scheduling_context_authority(
             size_of::<CommercialMaxProtocolRequest>() as u64,
             (&mut response as *mut CommercialMaxProtocolResponse) as u64,
             size_of::<CommercialMaxProtocolResponse>() as u64,
-            IPC_BOOT_CONTROL_HARD_LIMIT_MS,
+            startup_timeout_ms(deadline, IPC_BOOT_CONTROL_HARD_LIMIT_MS, Instant::now())?,
         ) as i64
     };
     if call < 0 {

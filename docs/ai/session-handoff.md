@@ -4,6 +4,36 @@ Dated evidence, not instructions or proof of the current checkout. Resume with
 `git status --short`, `git log -1`, and the live request. `AGENTS.md` is the only
 stable repository prefix; use [task router](task-router.md) for owner contracts.
 
+## Timeout/recovery integration (2026-11-10, local; validation in progress)
+
+Base `a0f8b219`; user authorized full implementation, verification and commit,
+**not push**. Isolated workers and independent reviewers used
+**openai-codex/gpt-6.1-terra:high** as requested. Initial Sol workers were paused
+clean before edits. All implementation lanes are integrated in the main index;
+worker commits are not separate main-branch milestones.
+
+Implemented netd authorized publication/lease retirement plus exact owner/epoch
+revalidation after lock waits; deadline-bound reply-arm retries instead of
+256-turn EINVAL; checked/fail-stop service clock; clipped loader cancellation
+without discarding delivered child custody; runtime RPC v3 identity/replay and
+real worker commit, with sessiond/UI reconciliation. Replay expiry is anchored
+to immutable identity age, and dependency lifetime is distinct from restart
+ownership. Startup/host framing consume parent deadlines, including Pending.
+GPU/block watchdogs retain unsafe resources; the block supervisor alone publishes
+completion cursors. Physical hostd has explicitly provisioned persistent
+quarantine and fresh ownership/reset on every supported recovery, including
+crash-recoverable cleanup. Unsupported partial handoff stays quarantined.
+KVM traces now replay launch-private files and bind the actual launched image,
+then atomically publish the optional shared artifact. Timing remains advisory.
+
+Independent review findings were fixed and targeted re-reviews passed. Earlier
+workspace check/native batches passed; the DVM rebuild and native C witnesses
+passed. Final integrated check/native/formal PR/KVM runs are still pending.
+Evidence is under `build/timeout-audit-20261110/`; old `/tmp` evidence was lost
+across the harness restart. No physical VFIO actions were run. Known external
+assumptions: durable backing, hardware reset effectiveness and trusted privileged
+administration; no claim of physical qualification. Final commit is pending.
+
 ## Continued wake and Ring3 worker-lifecycle audit (2026-11-10)
 
 Starting GitHub master: `7b817e9e`. This is a static GitHub-source

@@ -4,6 +4,22 @@
 
 ## Network Surface (`netd`)
 
+Netd bootstrap does not invoke a NetPolicy-gated broker before it owns a live
+endpoint. Rootd-authorized registration acquires the transport-publication
+lease in sleepable context, then the registry mutation spinlock. Only after
+revalidating the exact registrar, rootd epoch and empty publication slot does
+it reset predecessor transport authority and publish the new endpoint. Packet
+operations serialize on that lease, so no client can use a new owner with the
+predecessor lease. Rejected registration leaves the active lease untouched;
+the sleepable lease is never acquired under the registry spinlock. Every
+packet/lease broker operation also captures the exact netd owner/publication
+epoch and revalidates it after acquiring that same transport lock. A syscall
+admitted by a predecessor before sleeping cannot grant, reset, revoke or
+consume packets through the successor. The validation callback is bounded
+registry observation, never a service call. This is mechanical
+authority/lifetime coupling, not Ring0 network policy. Runtime
+session grant/revoke remains inputd/netd policy and keeps its capability gate.
+
 Routed Linux ops after bootstrap: `socket`, `socketpair`, socket `dup`/`dup2`/`dup3`, socket `close`, socket `read`/`write`/`writev`, `bind`, `listen`, `accept`/`accept4`, `connect`, `sendto`, `recvfrom`, `sendmsg`, `recvmsg`, `getsockname`, `getpeername`, `setsockopt`, `getsockopt`, `shutdown`.
 
 netd invokes gated `SYS_RUSTOS_NET_BROKER` with target pid. Net broker arg struct carries six 64-bit syscall arg slots. Kernel performs handle install and target user-memory validation/copy; AF_UNIX socket lifecycle, binding/listen queues, byte queues, and socket option policy belong to netd. Version-8 `NetdIpcRequest`/`Response` frames copy an exact 136/32-byte header plus only the actual bounded payload, rather than a fixed maximum-size buffer. Request offset 112 carries a mandatory nonzero absolute `CLOCK_MONOTONIC` deadline; the frames also carry `socket_token`, fd `status_flags`, and a bounded inline payload for this service-owned socket path.
@@ -386,8 +402,10 @@ do not admit a service, a module-loading path, or a future ABI reuse.
 - uiserver readiness is one typed state machine (`services/uiserver/src/startup.rs`,
   design in [`../ui-startup-readiness.md`](../ui-startup-readiness.md)). Six
   dependencies (`assets`, `display`, `input`, `wayland`, `runtime`, `gpu`) each
-  own a retry policy and a total budget; `assets` is optional (bundled
-  fallback), the rest are required. The canonical, single source of truth is the
+  own a retry policy and a total budget measured from the UI startup epoch,
+  including `pending` dependencies whose worker never began; a retry cannot
+  restart the budget. `assets` is optional (bundled fallback), the rest are
+  required. The canonical, single source of truth is the
   line `uiserver: readiness v1 state=<starting|ready|degraded|failed> gen=<n>
   [cause=<dep> errno=<n>] assets=.. display=.. input=.. wayland=.. runtime=..
   gpu=..`, printed on every transition (`gen` strictly increases). Per
@@ -396,7 +414,7 @@ do not admit a service, a module-loading path, or a future ABI reuse.
   late success. A required failure (including an attempt that never reported
   within its budget) makes the UI loop exit with that errno.
 - The runtime link is a level, not an edge: a dedicated worker retries the
-  `OP_NOTIFY_READY` until `runtimed` acknowledges it (runtime-control wire v2,
+  `OP_NOTIFY_READY` until `runtimed` acknowledges it (runtime-control wire v3,
   see `../../api/runtime-control.md`) under the `runtime` policy, then runs the
   running-set watch. The compositor
   thread never waits on `runtimed`.

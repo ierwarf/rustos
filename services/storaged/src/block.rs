@@ -16,6 +16,7 @@
 //! - **Evidence:** `dvm-block-startup`, `dvm-read-cache`,
 //!   `dvm-volume-io`, and `durable-block-mutation`.
 use std::mem::size_of;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -35,6 +36,26 @@ const READ_CACHE_WINDOW_LIMIT: usize = 8;
 const READ_AHEAD_IN_FLIGHT_LIMIT: usize = 2;
 const _: () = assert!(READ_AHEAD_IN_FLIGHT_LIMIT < READ_CACHE_WINDOW_LIMIT);
 static READ_CACHE: Mutex<ReadCacheSet> = Mutex::new(ReadCacheSet::new());
+// A timeout does not cancel Linux I/O. Never re-admit this process after an
+// uncertain operation: only external quiescence/revocation can make reuse safe.
+static PROVIDER_QUARANTINED: AtomicBool = AtomicBool::new(false);
+
+fn require_unquarantined(quarantined: &AtomicBool) -> Result<(), i32> {
+    if quarantined.load(Ordering::Acquire) {
+        Err(libc::EIO)
+    } else {
+        Ok(())
+    }
+}
+
+fn quarantine_provider(ticket: DvmBlockTicketWire, cause: &str) {
+    PROVIDER_QUARANTINED.store(true, Ordering::Release);
+    clear_read_cache();
+    eprintln!(
+        "storaged: dvm provider quarantined generation={} request_id={} slot={} cause={cause} quiescence=unproven",
+        ticket.generation, ticket.request_id, ticket.data_slot
+    );
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) struct BlockInfo {
@@ -214,6 +235,7 @@ pub(super) fn wait_until_ready(deadline: Instant) -> Result<BlockInfo, i32> {
 }
 
 fn info_once() -> Result<BlockInfo, i32> {
+    require_unquarantined(&PROVIDER_QUARANTINED)?;
     let mut wire = DvmBlockInfoWire::default();
     let args = RustosBlockBrokerArgs {
         abi_version: BLOCK_BROKER_ABI_VERSION,
@@ -222,6 +244,7 @@ fn info_once() -> Result<BlockInfo, i32> {
         ..RustosBlockBrokerArgs::default()
     };
     syscall_block(&args)?;
+    require_unquarantined(&PROVIDER_QUARANTINED)?;
     if wire.generation == 0
         || wire.capacity_sectors == 0
         || wire.logical_block_size < 512
@@ -297,6 +320,7 @@ pub(super) fn read(expected_generation: u64, lba: u64, block_count: u64) -> Resu
     let (cached, continues_read_ahead) =
         read_cache_lookup(info.generation, lba, block_count, byte_len)?;
     if let Some(bytes) = cached {
+        require_unquarantined(&PROVIDER_QUARANTINED)?;
         return Ok(bytes);
     }
     let window_limit = if continues_read_ahead {
@@ -426,6 +450,11 @@ pub(super) fn write(
         // between the pre-write clear and that landing would repopulate the
         // cache with old bytes. Drop the cache again once the write settles.
         let result = wait_and_collect(ticket, None);
+        if result.is_err() {
+            // Neither a local timeout nor a transport error proves that the
+            // submitted mutation did not reach the media. Do not replay it.
+            quarantine_provider(ticket, "write-outcome-unknown");
+        }
         clear_read_cache();
         result
     })
@@ -500,6 +529,7 @@ pub(super) fn flush_before(expected_generation: u64, deadline: Instant) -> Resul
         out_ticket_ptr: (&mut ticket as *mut DvmBlockTicketWire) as u64,
         ..RustosBlockBrokerArgs::default()
     };
+    require_unquarantined(&PROVIDER_QUARANTINED)?;
     syscall_block(&args)?;
     validate_ticket(ticket)?;
     wait_and_collect_before(ticket, None, deadline)
@@ -527,6 +557,7 @@ fn submit(
         out_ticket_ptr: (&mut ticket as *mut DvmBlockTicketWire) as u64,
         ..RustosBlockBrokerArgs::default()
     };
+    require_unquarantined(&PROVIDER_QUARANTINED)?;
     syscall_block(&args)?;
     validate_ticket(ticket)?;
     Ok(ticket)
@@ -573,10 +604,12 @@ fn wait_and_collect_before(
 
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
+            quarantine_provider(ticket, "completion-timeout");
             cancel_best_effort(ticket);
             return Err(libc::ETIMEDOUT);
         }
         let Some(timeout_ms) = bounded_wait_timeout_ms(remaining) else {
+            quarantine_provider(ticket, "completion-timeout");
             cancel_best_effort(ticket);
             return Err(libc::ETIMEDOUT);
         };
@@ -590,6 +623,9 @@ fn wait_and_collect_before(
             Ok(_) | Err(libc::EINTR) => {}
             Err(libc::ETIMEDOUT) if Instant::now() < deadline => {}
             Err(error) => {
+                if error == libc::ETIMEDOUT {
+                    quarantine_provider(ticket, "completion-timeout");
+                }
                 eprintln!(
                     "storaged: dvm completion rejected stage=wait request_id={} slot={} timeout_ms={timeout_ms} errno={error}",
                     ticket.request_id, ticket.data_slot
@@ -672,6 +708,14 @@ fn syscall_block(args: &RustosBlockBrokerArgs) -> Result<u64, i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quarantined_provider_rejects_admission() {
+        let quarantined = AtomicBool::new(false);
+        assert_eq!(require_unquarantined(&quarantined), Ok(()));
+        quarantined.store(true, Ordering::Release);
+        assert_eq!(require_unquarantined(&quarantined), Err(libc::EIO));
+    }
 
     fn info() -> BlockInfo {
         BlockInfo {

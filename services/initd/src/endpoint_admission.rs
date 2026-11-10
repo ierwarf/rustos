@@ -73,7 +73,10 @@ pub(super) struct Failure {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Step {
     /// Wait in the kernel for at most `timeout_ms` after sleeping `pause_ms`.
-    Wait { timeout_ms: u64, pause_ms: u64 },
+    Wait {
+        timeout_ms: u64,
+        pause_ms: u64,
+    },
     Ready,
     Failed(Failure),
 }
@@ -88,6 +91,17 @@ pub(super) struct EndpointAdmission {
 impl EndpointAdmission {
     pub(super) const fn new() -> Self {
         Self::with_limits(ENDPOINT_ADMISSION_BUDGET_MS, ENDPOINT_ADMISSION_SLICE_MS)
+    }
+
+    pub(super) const fn clipped(parent_remaining_ms: u64) -> Self {
+        Self::with_limits(
+            if parent_remaining_ms < ENDPOINT_ADMISSION_BUDGET_MS {
+                parent_remaining_ms
+            } else {
+                ENDPOINT_ADMISSION_BUDGET_MS
+            },
+            ENDPOINT_ADMISSION_SLICE_MS,
+        )
     }
 
     const fn with_limits(budget_ms: u64, slice_ms: u64) -> Self {
@@ -126,6 +140,14 @@ impl EndpointAdmission {
 
     /// Fold the result of one kernel slice (`Ok` = endpoint admitted).
     pub(super) fn on_slice(&mut self, result: Result<(), i32>, elapsed_ms: u64) -> Step {
+        if elapsed_ms >= self.budget_ms {
+            return Step::Failed(Failure {
+                cause: FailCause::BudgetExhausted,
+                errno: libc::ETIMEDOUT,
+                waited_ms: elapsed_ms,
+                slices: self.slices,
+            });
+        }
         let errno = match result {
             Ok(()) => return Step::Ready,
             Err(errno) => errno,
@@ -153,6 +175,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parent_remaining_clips_first_and_last_slices() {
+        let mut wait = EndpointAdmission::clipped(6_000);
+        assert_eq!(
+            wait.start(),
+            Step::Wait {
+                timeout_ms: 5_000,
+                pause_ms: 0
+            }
+        );
+        assert_eq!(
+            wait.on_slice(Err(libc::ETIMEDOUT), 5_000),
+            Step::Wait {
+                timeout_ms: 1_000,
+                pause_ms: 0
+            }
+        );
+        assert!(matches!(
+            wait.on_slice(Err(libc::ETIMEDOUT), 6_000),
+            Step::Failed(_)
+        ));
+        assert!(matches!(
+            EndpointAdmission::clipped(0).start(),
+            Step::Failed(_)
+        ));
+    }
+
+    #[test]
     fn budget_is_at_least_two_ipc_deadlines() {
         assert!(ENDPOINT_ADMISSION_BUDGET_MS >= 2 * IPC_BOOT_CONTROL_HARD_LIMIT_MS);
     }
@@ -160,7 +209,11 @@ mod tests {
     #[test]
     fn a_single_timed_out_slice_is_not_a_verdict() {
         let mut wait = EndpointAdmission::new();
-        let Step::Wait { timeout_ms, pause_ms } = wait.start() else {
+        let Step::Wait {
+            timeout_ms,
+            pause_ms,
+        } = wait.start()
+        else {
             panic!("first step waits");
         };
         assert_eq!(timeout_ms, ENDPOINT_ADMISSION_SLICE_MS);
@@ -247,7 +300,10 @@ mod tests {
         wait.start();
         assert_eq!(
             wait.on_slice(Err(libc::EINTR), 1),
-            Step::Wait { timeout_ms: 50, pause_ms: EARLY_RETURN_PAUSE_MS }
+            Step::Wait {
+                timeout_ms: 50,
+                pause_ms: EARLY_RETURN_PAUSE_MS
+            }
         );
         let Step::Failed(failure) = wait.on_slice(Err(libc::EINTR), 100) else {
             panic!("an interrupted wait cannot outlive the budget");

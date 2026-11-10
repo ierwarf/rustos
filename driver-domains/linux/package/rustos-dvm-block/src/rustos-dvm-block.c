@@ -18,8 +18,10 @@
 #include <sys/file.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -49,6 +51,8 @@
      (uint64_t)DVM_BLOCK_QUEUE_DEPTH * DVM_BLOCK_DATA_SLOT_BYTES)
 #define DVM_BLOCK_APERTURE_BYTES (8ULL * 1024ULL * 1024ULL)
 
+_Static_assert(ATOMIC_BOOL_LOCK_FREE == 2,
+               "process-shared watchdog gate requires lock-free atomics");
 _Static_assert(DVM_BLOCK_USED_BYTES <= DVM_BLOCK_APERTURE_BYTES,
                "block ring and data slots exceed the fixed PCI BAR");
 _Static_assert((DVM_BLOCK_APERTURE_BYTES &
@@ -87,9 +91,12 @@ _Static_assert((DVM_BLOCK_APERTURE_BYTES &
 #define COMPLETION_PRODUCER_OFFSET 88U
 #define COMPLETION_CONSUMER_OFFSET 96U
 #define UIO_NAME "rustos-dvm-block"
+#ifndef READY_DIR
 #define READY_DIR "/run/rustos-dvm"
+#endif
 #define BLOCK_EVIDENCE_FILE "block-evidence-v1.env"
 #define BLOCK_EVIDENCE_NEXT ".block-evidence-v1.next"
+#define BLOCK_WATCHDOG_TIMEOUT_MS 10000
 
 struct block_header {
     uint64_t region_bytes;
@@ -157,6 +164,17 @@ struct relay_state {
     uint64_t last_operation_id;
     uint64_t durable_through;
     bool ready_published;
+    int watchdog_fd;
+    _Atomic bool *quarantined;
+};
+
+struct watchdog_event {
+    uint64_t request_id;
+    uint32_t operation;
+    uint32_t begin;
+    uint64_t request_consumer;
+    uint64_t completion_producer;
+    uint8_t completion[DVM_BLOCK_RECORD_BYTES];
 };
 
 static volatile sig_atomic_t stop_requested;
@@ -1060,10 +1078,44 @@ static int verify_live_header(struct relay_state *state)
     return 0;
 }
 
+static int watchdog_event_send(int fd, const struct watchdog_event *event)
+{
+    ssize_t count;
+    do {
+        count = send(fd, event, sizeof(*event), MSG_NOSIGNAL);
+    } while (count < 0 && errno == EINTR);
+    if (count != (ssize_t)sizeof(*event)) {
+        if (count >= 0) errno = EIO;
+        return -1;
+    }
+    return 0;
+}
+
+/* Only the supervisor publishes cursors.  A stopped worker cannot hold up
+ * timeout or publish after the supervisor transitions to quarantine. */
+static int publish_watchdog_completion(struct relay_state *state,
+                                       const struct watchdog_event *event)
+{
+    volatile uint8_t *record;
+    if (atomic_load_explicit(state->quarantined, memory_order_acquire)) {
+        errno = EIO;
+        return -1;
+    }
+    if (load_cursor(state->transport.base, REQUEST_CONSUMER_OFFSET, __ATOMIC_ACQUIRE) != event->request_consumer ||
+        load_cursor(state->transport.base, COMPLETION_PRODUCER_OFFSET, __ATOMIC_ACQUIRE) != event->completion_producer) {
+        errno = EPROTO;
+        return -1;
+    }
+    record = state->transport.base + DVM_BLOCK_COMPLETION_RING_OFFSET +
+             (event->completion_producer % DVM_BLOCK_QUEUE_DEPTH) * DVM_BLOCK_RECORD_BYTES;
+    write_record(record, event->completion);
+    store_cursor(state->transport.base, REQUEST_CONSUMER_OFFSET, event->request_consumer + 1U, __ATOMIC_RELEASE);
+    store_cursor(state->transport.base, COMPLETION_PRODUCER_OFFSET, event->completion_producer + 1U, __ATOMIC_RELEASE);
+    return 0;
+}
+
 static int drain_requests(struct relay_state *state)
 {
-    unsigned int completed = 0U;
-
     if (verify_live_header(state) != 0)
         return -1;
     for (;;) {
@@ -1090,10 +1142,10 @@ static int drain_requests(struct relay_state *state)
                             COMPLETION_PRODUCER_OFFSET,
                             __ATOMIC_ACQUIRE);
             volatile uint8_t *request_record;
-            volatile uint8_t *completion_record;
             struct block_request request;
             struct block_completion completion;
-            uint8_t encoded[DVM_BLOCK_RECORD_BYTES];
+            struct watchdog_event event = {0};
+            uint8_t ack;
 
             if (!valid_cursor_pair(completion_producer,
                                    completion_consumer) ||
@@ -1114,25 +1166,29 @@ static int drain_requests(struct relay_state *state)
             state->last_request_id = request.request_id;
             if (request.operation != DVM_BLOCK_OP_READ)
                 state->last_operation_id = request.operation_id;
+            event.request_id = request.request_id;
+            event.operation = request.operation;
+            event.begin = 1U;
+            if (atomic_load_explicit(state->quarantined, memory_order_acquire) ||
+                watchdog_event_send(state->watchdog_fd, &event) != 0)
+                return -1;
             (void)execute_request(state, &request, &completion);
-            encode_completion(encoded, &completion);
-            completion_record =
-                state->transport.base +
-                DVM_BLOCK_COMPLETION_RING_OFFSET +
-                (completion_producer % DVM_BLOCK_QUEUE_DEPTH) *
-                    DVM_BLOCK_RECORD_BYTES;
-            write_record(completion_record, encoded);
-            store_cursor(state->transport.base, REQUEST_CONSUMER_OFFSET,
-                         request_consumer + 1U, __ATOMIC_RELEASE);
-            store_cursor(state->transport.base,
-                         COMPLETION_PRODUCER_OFFSET,
-                         completion_producer + 1U, __ATOMIC_RELEASE);
+            if (atomic_load_explicit(state->quarantined, memory_order_acquire)) {
+                errno = EIO;
+                return -1;
+            }
+            event.begin = 0U;
+            event.request_consumer = request_consumer;
+            event.completion_producer = completion_producer;
+            encode_completion(event.completion, &completion);
+            if (watchdog_event_send(state->watchdog_fd, &event) != 0 ||
+                read(state->watchdog_fd, &ack, 1) != 1 || ack != 1U) {
+                errno = EIO;
+                return -1;
+            }
             request_consumer++;
-            completed++;
         }
     }
-    if (completed != 0U && notify_host(&state->transport) != 0)
-        return -1;
     return 0;
 }
 
@@ -1309,6 +1365,12 @@ static void withdraw_ready(struct relay_state *state)
 {
     int directory_fd;
 
+    if (state->ready_published && state->transport.base != NULL) {
+        (void)fetch_and_flags(state->transport.base,
+                              ~DVM_BLOCK_FLAG_DVM_READY);
+        (void)notify_host(&state->transport);
+        state->ready_published = false;
+    }
     directory_fd = open(READY_DIR, O_RDONLY | O_DIRECTORY | O_CLOEXEC |
                                       O_NOFOLLOW);
     if (directory_fd >= 0) {
@@ -1317,12 +1379,97 @@ static void withdraw_ready(struct relay_state *state)
         (void)fsync(directory_fd);
         close(directory_fd);
     }
-    if (!state->ready_published || state->transport.base == NULL)
-        return;
-    (void)fetch_and_flags(state->transport.base,
-                          ~DVM_BLOCK_FLAG_DVM_READY);
-    (void)notify_host(&state->transport);
-    state->ready_published = false;
+}
+
+/* The supervisor remains alive and retains the lock after a failure. SIGKILL
+ * cannot establish that a task in D state has stopped touching the device. */
+static void supervise_worker(struct relay_state *state, int event_fd, pid_t worker,
+                             unsigned int timeout_ms)
+{
+    struct watchdog_event active = {0};
+    struct timespec deadline = {0};
+    const char *cause = "worker-lost";
+    for (;;) {
+        struct pollfd pfd = {.fd = event_fd, .events = POLLIN};
+        int timeout = -1;
+        int result;
+        if (active.request_id != 0U) {
+            struct timespec now;
+            int64_t remaining;
+            if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+                cause = "clock-error";
+                break;
+            }
+            remaining = (deadline.tv_sec - now.tv_sec) * INT64_C(1000) +
+                        (deadline.tv_nsec - now.tv_nsec + 999999) / 1000000;
+            if (remaining <= 0) {
+                cause = "io-timeout";
+                break;
+            }
+            timeout = remaining > INT_MAX ? INT_MAX : (int)remaining;
+        }
+        result = poll(&pfd, 1, timeout);
+        if (result < 0 && errno == EINTR && !stop_requested)
+            continue;
+        if (result == 0) {
+            cause = "io-timeout";
+            break;
+        }
+        if (result <= 0 || !(pfd.revents & POLLIN))
+            break;
+        {
+            struct watchdog_event event;
+            ssize_t count = read(event_fd, &event, sizeof(event));
+            if (count != (ssize_t)sizeof(event) || event.request_id == 0U ||
+                event.begin > 1U ||
+                (event.begin && active.request_id != 0U) ||
+                (!event.begin && (event.request_id != active.request_id ||
+                                   event.operation != active.operation))) {
+                cause = "watchdog-protocol";
+                break;
+            }
+            if (event.begin) {
+                active = event;
+                if (clock_gettime(CLOCK_MONOTONIC, &deadline) != 0) {
+                    cause = "clock-error";
+                    break;
+                }
+                deadline.tv_sec += timeout_ms / 1000U;
+                deadline.tv_nsec += (long)(timeout_ms % 1000U) * 1000000L;
+                if (deadline.tv_nsec >= 1000000000L) {
+                    deadline.tv_sec++;
+                    deadline.tv_nsec -= 1000000000L;
+                }
+            } else {
+                struct timespec now;
+                uint8_t ack = 1U;
+                if (clock_gettime(CLOCK_MONOTONIC, &now) != 0 ||
+                    now.tv_sec > deadline.tv_sec ||
+                    (now.tv_sec == deadline.tv_sec && now.tv_nsec >= deadline.tv_nsec)) {
+                    cause = "io-timeout";
+                    break;
+                }
+                if (publish_watchdog_completion(state, &event) != 0 ||
+                    notify_host(&state->transport) != 0 ||
+                    send(event_fd, &ack, 1, MSG_NOSIGNAL) != 1) {
+                    cause = "completion-publication";
+                    break;
+                }
+                active.request_id = 0U;
+            }
+        }
+    }
+    atomic_store_explicit(state->quarantined, true, memory_order_release);
+    withdraw_ready(state);
+    relay_log("rustos-dvm-block: quarantine generation=%" PRIu64
+              " request_id=%" PRIu64 " operation=%u cause=%s outcome=unknown quiescence=unproven\n",
+              state->header.generation, active.request_id, active.operation, cause);
+    (void)kill(worker, SIGKILL);
+    close(event_fd);
+    /* Keep lock and mappings pinned. Hostd must not restart/reassign this
+     * generation until independent quiescence has been established. */
+    for (;;)
+        pause();
 }
 
 static int serve(void)
@@ -1331,11 +1478,15 @@ static int serve(void)
     struct relay_state state;
     int lock_fd = -1;
     int result = 1;
+    bool watchdog_worker = false;
+    int events[2] = {-1, -1};
+    pid_t worker;
     const char *failed_stage = "signal";
 
     memset(&state, 0, sizeof(state));
     state.transport.uio_fd = -1;
     state.device.fd = -1;
+    state.watchdog_fd = -1;
     memset(&action, 0, sizeof(action));
     action.sa_handler = handle_signal;
     sigemptyset(&action.sa_mask);
@@ -1378,6 +1529,26 @@ static int serve(void)
         state.device.logical_block_size,
         state.device.physical_block_size, state.header.features);
 
+    failed_stage = "watchdog";
+    state.quarantined = mmap(NULL, sizeof(*state.quarantined), PROT_READ | PROT_WRITE,
+                             MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (state.quarantined == MAP_FAILED) {
+        state.quarantined = NULL;
+        goto out;
+    }
+    atomic_init(state.quarantined, false);
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, events) != 0)
+        goto out;
+    worker = fork();
+    if (worker < 0)
+        goto out;
+    if (worker > 0) {
+        close(events[1]);
+        supervise_worker(&state, events[0], worker, BLOCK_WATCHDOG_TIMEOUT_MS);
+    }
+    close(events[0]);
+    watchdog_worker = true;
+    state.watchdog_fd = events[1];
     for (;;) {
         uint32_t event_count;
         ssize_t count;
@@ -1403,12 +1574,66 @@ out:
     if (result != 0)
         relay_log("rustos-dvm-block: revoked stage=%s errno=%d\n",
                   failed_stage, errno);
-    if (lock_fd >= 0)
+    if (lock_fd >= 0 && !watchdog_worker)
         withdraw_ready(&state);
     close_block_device(&state.device);
     close_transport(&state.transport);
     if (lock_fd >= 0)
         close(lock_fd);
+    return result;
+}
+
+/* Pause a worker after its final quarantine check, then quarantine before
+ * it sends the prepared completion. Only the supervisor owns the cursor. */
+static int selftest_quarantine_publication(void)
+{
+    struct relay_state state = {0};
+    struct watchdog_event event = {.request_id = 1U};
+    int sockets[2] = {-1, -1};
+    int status = 0;
+    int result = -1;
+    pid_t child = -1;
+    char byte;
+    state.transport.base = mmap(NULL, DVM_BLOCK_APERTURE_BYTES, PROT_READ | PROT_WRITE,
+                                MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    state.quarantined = mmap(NULL, sizeof(*state.quarantined), PROT_READ | PROT_WRITE,
+                             MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (state.transport.base == MAP_FAILED || state.quarantined == MAP_FAILED)
+        goto out;
+    atomic_init(state.quarantined, false);
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sockets) != 0)
+        goto out;
+    child = fork();
+    if (child < 0) goto out;
+    if (child == 0) {
+        close(sockets[0]);
+        if (atomic_load_explicit(state.quarantined, memory_order_acquire) ||
+            send(sockets[1], "R", 1, MSG_NOSIGNAL) != 1 ||
+            read(sockets[1], &byte, 1) != 1 ||
+            watchdog_event_send(sockets[1], &event) != 0)
+            _exit(1);
+        _exit(0);
+    }
+    close(sockets[1]); sockets[1] = -1;
+    if (read(sockets[0], &byte, 1) != 1 || byte != 'R') goto out;
+    atomic_store_explicit(state.quarantined, true, memory_order_release);
+    if (send(sockets[0], "G", 1, MSG_NOSIGNAL) != 1 ||
+        read(sockets[0], &event, sizeof(event)) != (ssize_t)sizeof(event) ||
+        publish_watchdog_completion(&state, &event) == 0 ||
+        load_cursor(state.transport.base, COMPLETION_PRODUCER_OFFSET, __ATOMIC_ACQUIRE) != 0U ||
+        load_cursor(state.transport.base, REQUEST_CONSUMER_OFFSET, __ATOMIC_ACQUIRE) != 0U ||
+        waitpid(child, &status, 0) != child || !WIFEXITED(status) || WEXITSTATUS(status) != 0)
+        goto out;
+    child = -1;
+    result = 0;
+out:
+    if (child > 0) { (void)kill(child, SIGKILL); (void)waitpid(child, NULL, 0); }
+    if (sockets[0] >= 0) close(sockets[0]);
+    if (sockets[1] >= 0) close(sockets[1]);
+    if (state.transport.base != NULL && state.transport.base != MAP_FAILED)
+        munmap((void *)state.transport.base, DVM_BLOCK_APERTURE_BYTES);
+    if (state.quarantined != NULL && state.quarantined != MAP_FAILED)
+        munmap(state.quarantined, sizeof(*state.quarantined));
     return result;
 }
 
@@ -1520,6 +1745,8 @@ static int selftest(void)
         completion.durable_through_operation_id != 2U)
         goto out;
 
+    if (selftest_quarantine_publication() != 0)
+        goto out;
     result = 0;
 out:
     if (backing != NULL)

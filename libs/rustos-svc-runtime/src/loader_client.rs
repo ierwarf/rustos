@@ -55,22 +55,42 @@ fn rpc(endpoint: u64, request: &LoaderSpawnRequest, placement: Option<i32>, tran
             request as *const _ as u64, size_of::<LoaderSpawnRequest>() as u64,
             &mut response as *mut _ as u64, size_of::<LoaderSpawnResponse>() as u64, timeout) }
     };
+    delivered_rpc_response(status, response)
+}
+
+fn delivered_rpc_response(status: i64, response: LoaderSpawnResponse) -> Result<LoaderSpawnResponse, i32> {
     if status < 0 { return Err((-status) as i32); }
     if status as usize != size_of::<LoaderSpawnResponse>() { return Err(22); }
+    // The kernel admitted and consumed the reply under the original deadline.
+    // A delivered terminal reply transfers child custody. Being scheduled
+    // after expiry cannot discard its PID and orphan a committed spawn.
     Ok(response)
 }
+fn cancellation_deadline(request_end: u64, now: u64) -> AbsoluteDeadline {
+    AbsoluteDeadline::after(request_end.min(now.saturating_add(
+        IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS * NANOS_PER_MILLI,
+    )), 0)
+}
+
 struct WorkLease { endpoint: u64, request: LoaderSpawnRequest, active: bool }
 impl Drop for WorkLease {
     fn drop(&mut self) {
         if !self.active { return; }
         self.request.op = LOADER_OP_CANCEL_WORK;
-        let grace = AbsoluteDeadline::after(crate::syscall::monotonic_nanos(), IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS * NANOS_PER_MILLI);
-        let _ = rpc(self.endpoint, &self.request, None, grace);
+        // Cleanup cannot extend the transaction that authorized this ticket.
+        // At expiry loaderd/vfsd's independent lease retirement owns cleanup;
+        // do not start another full RPC or fabricate time in a destructor.
+        let Ok(now) = crate::syscall::try_monotonic_nanos() else { return; };
+        let cleanup = cancellation_deadline(self.request.deadline_ns, now);
+        if cleanup.remaining_ns(now).is_some() {
+            let _ = rpc(self.endpoint, &self.request, None, cleanup);
+        }
     }
 }
 /// `placement` is borrowed and exported only on begin. Returned terminal op is
 /// the original operation (the semantic result, not the POLL wire envelope).
-/// Transport failures are not retried; a live ticket is cancelled on exit.
+/// Transport failures are not retried; cancellation uses only the original
+/// lease remainder. Expired tickets are retired independently by loaderd/vfsd.
 pub fn call(endpoint: u64, request: &LoaderSpawnRequest, placement: Option<i32>) -> Result<LoaderSpawnResponse, i32> {
     if !matches!(request.op, LOADER_OP_SPAWN_EXEC | LOADER_OP_EXEC_TARGET | LOADER_OP_VALIDATE_IMAGE)
         || request.deadline_ns == 0 || request.work_id != 0 || request.requester_pid == 0
@@ -94,7 +114,10 @@ pub fn call(endpoint: u64, request: &LoaderSpawnRequest, placement: Option<i32>)
         completed = response.completed_bytes;
         total = response.file_bytes;
         match state {
-            ReplyState::Pending(_) => crate::syscall::sleep_millis(5),
+            ReplyState::Pending(_) => {
+                let remaining = deadline.remaining_ns(crate::syscall::monotonic_nanos()).ok_or(110)?;
+                crate::syscall::sleep_millis((remaining / NANOS_PER_MILLI).min(5));
+            }
             ReplyState::Terminal => {
                 lease.active = response.status != 0;
                 response.op = request.op;
@@ -106,6 +129,30 @@ pub fn call(endpoint: u64, request: &LoaderSpawnRequest, placement: Option<i32>)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loader_cancellation_never_remints_the_expired_parent_budget() {
+        assert_eq!(cancellation_deadline(100, 99).remaining_ns(99), Some(1));
+        assert_eq!(cancellation_deadline(100, 100).remaining_ns(100), None);
+        assert_eq!(cancellation_deadline(100, 101).remaining_ns(101), None);
+        assert_eq!(cancellation_deadline(u64::MAX, 1).remaining_ns(1), Some(IPC_INTERACTIVE_CONTROL_HARD_LIMIT_MS * NANOS_PER_MILLI));
+    }
+    #[test]
+    fn a_delivered_spawn_keeps_child_custody_when_the_client_resumes_after_expiry() {
+        let deadline = AbsoluteDeadline::after(0, 100);
+        let response = LoaderSpawnResponse {
+            version: LOADER_REQUEST_ABI_VERSION, op: LOADER_OP_POLL_WORK,
+            pid: 41, image_format: PROC_BROKER_FORMAT_ELF64,
+            completed_bytes: 8, file_bytes: 8, ..LoaderSpawnResponse::default()
+        };
+        // Delivery was settled before expiry; the caller is next scheduled
+        // only at 101. The transport result, not a later clock sample, owns PID.
+        assert!(deadline.remaining_ns(101).is_none());
+        let delivered = delivered_rpc_response(size_of::<LoaderSpawnResponse>() as i64, response).unwrap();
+        assert_eq!(validate_reply(&delivered, LOADER_OP_POLL_WORK, LOADER_OP_SPAWN_EXEC, 9), Ok(ReplyState::Terminal));
+        assert_eq!(delivered.pid, 41);
+    }
+
     #[test]
     fn placement_call_sends_exactly_one_borrowed_descriptor() {
         let request = LoaderSpawnRequest::default();

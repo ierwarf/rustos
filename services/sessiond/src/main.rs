@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 use runtime_control::protocol::RUNTIME_WATCH_MAX_WAIT_MS;
 use runtime_control::{
     decode_c_string, load_autostart_program_entries, load_startup_entries, DesktopProgramEntry,
-    RuntimeClient, StartupMode, DEFAULT_APPLICATIONS_DIR, DEFAULT_AUTOSTART_DIR,
-    RUNNING_PROGRAMS_DIGEST_UNKNOWN,
+    MutationOutcome, RuntimeClient, RuntimeTransaction, StartupMode, DEFAULT_APPLICATIONS_DIR,
+    DEFAULT_AUTOSTART_DIR, RUNNING_PROGRAMS_DIGEST_UNKNOWN,
 };
 /// Cadence while a launch is in flight. Settling and timeout are both judged
 /// against this loop, so it has to stay tight whenever something is pending.
@@ -35,6 +35,40 @@ struct LaunchEntry {
     desktop_file_id: String,
     runtime_deps: Vec<String>,
     restart: bool,
+}
+
+#[derive(Clone, Debug)]
+struct PendingRpc {
+    entry: LaunchEntry,
+    transaction: RuntimeTransaction,
+    next_query: Instant,
+}
+
+impl PendingRpc {
+    fn query(&self, runtime: &RuntimeClient) -> RpcDecision {
+        rpc_decision(runtime.query_transaction(&self.transaction))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RpcDecision {
+    Committed,
+    Rejected(i32),
+    Query,
+    Unknown(i32),
+}
+
+fn may_auto_launch(entry: &LaunchEntry, abandoned_packages: &BTreeSet<String>) -> bool {
+    !abandoned_packages.contains(entry.package_id.as_str())
+}
+
+fn rpc_decision(outcome: MutationOutcome) -> RpcDecision {
+    match outcome {
+        MutationOutcome::Committed => RpcDecision::Committed,
+        MutationOutcome::Rejected(err) => RpcDecision::Rejected(err),
+        MutationOutcome::Pending | MutationOutcome::Transport(_) => RpcDecision::Query,
+        MutationOutcome::Unknown(err) => RpcDecision::Unknown(err),
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -85,6 +119,7 @@ fn main() {
     let mut launch_attempts = BTreeMap::<String, u32>::new();
     let mut abandoned_packages = BTreeSet::<String>::new();
     let mut pending_launch = None::<PendingLaunch>;
+    let mut pending_rpc = None::<PendingRpc>;
     let mut retry_after = BTreeMap::<String, Instant>::new();
     // Consecutive early exits per desktop id; widens the retry delay so a
     // crash-looping `restart` service is not relaunched every 200 ms.
@@ -92,6 +127,57 @@ fn main() {
     let mut observed_digest = RUNNING_PROGRAMS_DIGEST_UNKNOWN;
 
     loop {
+        if let Some(mut pending) = pending_rpc.take() {
+            let now = Instant::now();
+            if now < pending.next_query {
+                thread::sleep(pending.next_query.saturating_duration_since(now));
+                pending_rpc = Some(pending);
+                continue;
+            }
+            match pending.query(&runtime) {
+                RpcDecision::Committed => {
+                    if !pending.entry.restart {
+                        *launch_attempts
+                            .entry(pending.entry.package_id.clone())
+                            .or_insert(0) += 1;
+                    }
+                    retry_after.remove(pending.entry.desktop_file_id.as_str());
+                    pending_launch = Some(PendingLaunch {
+                        desktop_file_id: pending.entry.desktop_file_id,
+                        package_id: pending.entry.package_id,
+                        restart: pending.entry.restart,
+                        requested_at: Instant::now(),
+                        first_seen_running: None,
+                    });
+                }
+                RpcDecision::Rejected(err) => {
+                    observability_client::error!(
+                        "sessiond",
+                        service,
+                        "launch {} rejected: errno={err}",
+                        pending.entry.desktop_file_id
+                    );
+                    retry_after.insert(
+                        pending.entry.desktop_file_id,
+                        Instant::now() + RETRY_BACKOFF,
+                    );
+                }
+                RpcDecision::Query => {
+                    pending.next_query = Instant::now() + RETRY_BACKOFF;
+                    pending_rpc = Some(pending);
+                }
+                RpcDecision::Unknown(err) => {
+                    observability_client::error!(
+                        "sessiond",
+                        service,
+                        "launch {} outcome unknown: errno={err}; automatic launch disabled",
+                        pending.entry.desktop_file_id
+                    );
+                    abandoned_packages.insert(pending.entry.package_id);
+                }
+            }
+            continue;
+        }
         let observed = observe_running_programs(
             &runtime,
             pending_launch.is_some(),
@@ -175,8 +261,17 @@ fn main() {
                     pending.desktop_file_id
                 );
             }
+            if !exited_early {
+                // A committed launch absent from a bounded snapshot is not
+                // proof that no child exists. Never auto-create another one.
+                abandoned_packages.insert(pending.package_id.clone());
+                pending_launch = None;
+                continue;
+            }
             let retry_delay = if exited_early {
-                let exits = early_exits.entry(pending.desktop_file_id.clone()).or_insert(0);
+                let exits = early_exits
+                    .entry(pending.desktop_file_id.clone())
+                    .or_insert(0);
                 *exits = exits.saturating_add(1);
                 RETRY_BACKOFF * (1_u32 << (*exits - 1).min(6))
             } else {
@@ -206,6 +301,9 @@ fn main() {
         }
 
         for entry in &launch_entries {
+            if !may_auto_launch(entry, &abandoned_packages) {
+                continue;
+            }
             if !runtime_deps_satisfied(
                 &entry.runtime_deps,
                 &running_packages,
@@ -242,8 +340,24 @@ fn main() {
                 );
             }
 
-            match runtime.request_launch_program_new_session(entry.desktop_file_id.as_str()) {
-                Ok(()) => {
+            let transaction = match runtime.launch_transaction(entry.desktop_file_id.as_str()) {
+                Ok(transaction) => transaction,
+                Err(err) => {
+                    observability_client::error!(
+                        "sessiond",
+                        service,
+                        "launch {} could not be prepared: errno={err}",
+                        entry.desktop_file_id
+                    );
+                    retry_after.insert(
+                        entry.desktop_file_id.clone(),
+                        Instant::now() + RETRY_BACKOFF,
+                    );
+                    continue;
+                }
+            };
+            match rpc_decision(runtime.submit_transaction(&transaction)) {
+                RpcDecision::Committed => {
                     if !entry.restart {
                         *launch_attempts.entry(entry.package_id.clone()).or_insert(0) += 1;
                     }
@@ -251,7 +365,7 @@ fn main() {
                     observability_client::info!(
                         "sessiond",
                         service,
-                        "launch request queued for {}",
+                        "launch committed for {}",
                         entry.desktop_file_id
                     );
                     pending_launch = Some(PendingLaunch {
@@ -263,7 +377,7 @@ fn main() {
                     });
                     break;
                 }
-                Err(err) => {
+                RpcDecision::Rejected(err) => {
                     retry_after.insert(
                         entry.desktop_file_id.clone(),
                         Instant::now() + RETRY_BACKOFF,
@@ -271,9 +385,26 @@ fn main() {
                     observability_client::error!(
                         "sessiond",
                         service,
-                        "launch {} failed: errno={err}",
+                        "launch {} rejected: errno={err}",
                         entry.desktop_file_id
                     );
+                }
+                RpcDecision::Query => {
+                    pending_rpc = Some(PendingRpc {
+                        entry: entry.clone(),
+                        transaction,
+                        next_query: Instant::now() + RETRY_BACKOFF,
+                    });
+                    break;
+                }
+                RpcDecision::Unknown(err) => {
+                    observability_client::error!(
+                        "sessiond",
+                        service,
+                        "launch {} outcome unknown: errno={err}; automatic launch disabled",
+                        entry.desktop_file_id
+                    );
+                    abandoned_packages.insert(entry.package_id.clone());
                 }
             }
         }
@@ -413,7 +544,113 @@ mod tests {
     use std::collections::BTreeMap;
     use std::time::{Duration, Instant};
 
-    use super::{idle_watch_wait, PendingLaunch, IDLE_WATCH_WAIT, LAUNCH_SETTLE_DELAY, POLL_INTERVAL};
+    use super::{
+        idle_watch_wait, may_auto_launch, rpc_decision, LaunchEntry, PendingLaunch, PendingRpc,
+        RpcDecision, IDLE_WATCH_WAIT, LAUNCH_SETTLE_DELAY, POLL_INTERVAL,
+    };
+    use runtime_control::MutationOutcome;
+
+    #[test]
+    fn uncertain_startup_launch_is_held_and_never_automatically_recreated() {
+        let entry = LaunchEntry {
+            package_id: "app".into(),
+            desktop_file_id: "app.desktop".into(),
+            runtime_deps: Vec::new(),
+            restart: true,
+        };
+        let mut abandoned = std::collections::BTreeSet::new();
+        assert_eq!(
+            rpc_decision(MutationOutcome::Transport(5)),
+            RpcDecision::Query
+        );
+        assert_eq!(rpc_decision(MutationOutcome::Pending), RpcDecision::Query);
+        if let RpcDecision::Unknown(_) = rpc_decision(MutationOutcome::Unknown(116)) {
+            abandoned.insert(entry.package_id.clone());
+        }
+        for _ in 0..5 {
+            assert!(!may_auto_launch(&entry, &abandoned));
+        }
+        assert_eq!(
+            rpc_decision(MutationOutcome::Committed),
+            RpcDecision::Committed
+        );
+        assert_eq!(
+            rpc_decision(MutationOutcome::Rejected(22)),
+            RpcDecision::Rejected(22)
+        );
+    }
+
+    #[test]
+    fn pending_rpc_queries_the_same_identity_until_restart_is_unknown() {
+        use runtime_control::protocol::{
+            RuntimeRequest, RuntimeResponse, PROTOCOL_VERSION, REQUEST_FLAG_QUERY,
+        };
+        use runtime_control::RuntimeClient;
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixListener;
+
+        let path = std::env::temp_dir().join(format!("sessiond-rpc-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let client = RuntimeClient::open(path.to_str().unwrap()).unwrap();
+        let server = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for status in [-115, -114, -116] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = RuntimeRequest::default();
+                let bytes = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        (&mut request as *mut RuntimeRequest).cast::<u8>(),
+                        std::mem::size_of::<RuntimeRequest>(),
+                    )
+                };
+                stream.read_exact(bytes).unwrap();
+                requests.push(request);
+                let response = RuntimeResponse {
+                    version: PROTOCOL_VERSION,
+                    op: if status == -116 { 0 } else { request.op },
+                    status,
+                    count: 0,
+                };
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(
+                        (&response as *const RuntimeResponse).cast::<u8>(),
+                        std::mem::size_of::<RuntimeResponse>(),
+                    )
+                };
+                stream.write_all(bytes).unwrap();
+            }
+            std::fs::remove_file(path).unwrap();
+            requests
+        });
+        let entry = LaunchEntry {
+            package_id: "app".into(),
+            desktop_file_id: "app.desktop".into(),
+            runtime_deps: Vec::new(),
+            restart: true,
+        };
+        let pending = PendingRpc {
+            transaction: client.launch_transaction(&entry.desktop_file_id).unwrap(),
+            entry: entry.clone(),
+            next_query: Instant::now(),
+        };
+        assert_eq!(pending.query(&client), RpcDecision::Query);
+        assert_eq!(pending.query(&client), RpcDecision::Query);
+        assert_eq!(pending.query(&client), RpcDecision::Unknown(116));
+        let mut abandoned = std::collections::BTreeSet::new();
+        abandoned.insert(pending.entry.package_id);
+        assert!(!may_auto_launch(&entry, &abandoned));
+        let requests = server.join().unwrap();
+        for request in &requests {
+            assert_eq!(request.flags, REQUEST_FLAG_QUERY);
+            assert_eq!(request.transaction_id_hi, requests[0].transaction_id_hi);
+            assert_eq!(request.transaction_id_lo, requests[0].transaction_id_lo);
+            assert_eq!(
+                request.transaction_deadline_ns,
+                requests[0].transaction_deadline_ns
+            );
+        }
+    }
 
     #[test]
     fn delayed_first_observation_does_not_settle_a_new_process() {
@@ -427,7 +664,9 @@ mod tests {
         };
         let first_seen = requested_at + Duration::from_secs(1);
         assert!(!pending.observe_running(first_seen));
-        assert!(!pending.observe_running(first_seen + LAUNCH_SETTLE_DELAY - Duration::from_millis(1)));
+        assert!(
+            !pending.observe_running(first_seen + LAUNCH_SETTLE_DELAY - Duration::from_millis(1))
+        );
         assert!(pending.observe_running(first_seen + LAUNCH_SETTLE_DELAY));
     }
 

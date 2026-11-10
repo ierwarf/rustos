@@ -244,11 +244,23 @@ pub unsafe fn mmap_anonymous(len: usize) -> i64 {
 /// wall clock is not ordering authority: it can step, and a stepped budget
 /// either fails a healthy transaction or lets an expired one continue.
 ///
-/// A failed read returns 0, which reads as "no time has passed" rather than as
-/// an expiry, so a clock fault cannot fabricate a deadline violation. The
-/// caller sees the transaction run to its other terminal condition instead.
+/// Fallible callers may use [`try_monotonic_nanos`]. A service that requires a
+/// clock to uphold its authority leases must fail-stop on a broken clock, not
+/// fabricate zero (which turns finite deadlines into unlimited authority).
 #[inline]
 pub fn monotonic_nanos() -> u64 {
+    match try_monotonic_nanos() {
+        Ok(now) => now,
+        Err(_) => {
+            crate::ipc::debug_bytes(b"service: fatal monotonic clock unavailable\n");
+            exit_group(125)
+        }
+    }
+}
+
+/// Read the kernel-wide CLOCK_MONOTONIC nanosecond domain without fallback.
+#[inline]
+pub fn try_monotonic_nanos() -> Result<u64, rustos_user_abi::deadline::MonotonicClockError> {
     let mut ts = KTimespec::default();
     // SAFETY: the syscall writes exactly one `KTimespec` through this exclusive
     // borrow and consumes no other pointer.
@@ -259,12 +271,31 @@ pub fn monotonic_nanos() -> u64 {
             (&mut ts as *mut KTimespec) as u64,
         )
     };
-    if status < 0 {
-        return 0;
+    decode_monotonic_read(status, ts)
+}
+
+fn decode_monotonic_read(
+    status: i64,
+    ts: KTimespec,
+) -> Result<u64, rustos_user_abi::deadline::MonotonicClockError> {
+    if status != 0 {
+        return Err(rustos_user_abi::deadline::MonotonicClockError::Syscall(status));
     }
-    let seconds = u64::try_from(ts.tv_sec).unwrap_or(0);
-    let nanos = u64::try_from(ts.tv_nsec).unwrap_or(0);
-    seconds.saturating_mul(1_000_000_000).saturating_add(nanos)
+    rustos_user_abi::deadline::checked_monotonic_nanos(ts.tv_sec, ts.tv_nsec)
+}
+
+#[cfg(test)]
+mod clock_tests {
+    use super::*;
+    use rustos_user_abi::deadline::MonotonicClockError;
+
+    #[test]
+    fn failed_clock_read_is_an_error_not_an_immortal_deadline() {
+        assert_eq!(decode_monotonic_read(-14, KTimespec::default()), Err(MonotonicClockError::Syscall(-14)));
+        assert_eq!(decode_monotonic_read(1, KTimespec::default()), Err(MonotonicClockError::Syscall(1)));
+        assert_eq!(decode_monotonic_read(0, KTimespec { tv_sec: 0, tv_nsec: -1 }), Err(MonotonicClockError::InvalidTimespec));
+        assert_eq!(decode_monotonic_read(0, KTimespec { tv_sec: 2, tv_nsec: 3 }), Ok(2_000_000_003));
+    }
 }
 
 #[inline]

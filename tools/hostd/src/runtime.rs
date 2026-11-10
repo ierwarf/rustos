@@ -18,7 +18,7 @@ use driver_domain_protocol::{
 use rustos_driver_domain_host::{
     ControlContract, ControlSecret, DeviceClass, DeviceTransport, DriverDomainPolicy,
     DvmBlockEvidence, HostControlListener, PhysicalDisplayPolicy, SysfsVfioOps, ValidatedLease,
-    VfioLeaseRecord, VfioLeaseState, reset_vfio_group, restore_vfio_lease,
+    VfioLeaseRecord, VfioLeaseState, VfioOps, reset_vfio_group, restore_vfio_lease,
     validate_host_display_assignment, validate_physical_display_assignment,
     validate_physical_display_identity, validate_physical_storage_assignment,
     validate_physical_storage_identity, validate_reset_scope_assignment,
@@ -148,6 +148,7 @@ extern "C" fn request_termination(_signal: libc::c_int) {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimeState {
+    Prelaunch,
     Starting,
     Ready,
     Stopping,
@@ -156,6 +157,7 @@ pub enum RuntimeState {
 impl RuntimeState {
     fn as_str(self) -> &'static str {
         match self {
+            Self::Prelaunch => "prelaunch",
             Self::Starting => "starting",
             Self::Ready => "ready",
             Self::Stopping => "stopping",
@@ -164,6 +166,7 @@ impl RuntimeState {
 
     fn parse(value: &str) -> Result<Self> {
         match value {
+            "prelaunch" => Ok(Self::Prelaunch),
             "starting" => Ok(Self::Starting),
             "ready" => Ok(Self::Ready),
             "stopping" => Ok(Self::Stopping),
@@ -180,6 +183,7 @@ pub struct RuntimeRecord {
     pub iommu_group: u32,
     pub pid: u32,
     pub process_start_ticks: u64,
+    pub boot_id: String,
     pub launched_at_unix: u64,
     pub qemu_sha256: String,
     pub artifact_manifest_sha256: String,
@@ -190,13 +194,14 @@ pub struct RuntimeRecord {
 impl RuntimeRecord {
     fn encode(&self) -> String {
         format!(
-            "DVM_RUNTIME_SCHEMA=2\nRUNTIME_STATE={}\nDOMAIN_ID={}\nDVM_GUEST_CID={}\nIOMMU_GROUP={}\nIOMMU_MODE={IOMMU_MODE}\nPID={}\nPROCESS_START_TICKS={}\nLAUNCHED_AT_UNIX={}\nQEMU_SHA256={}\nDVM_ARTIFACT_MANIFEST_SHA256={}\nDEVICE_POLICY_SHA256={}\nRELEASE_MANIFEST_SHA256={}\n",
+            "DVM_RUNTIME_SCHEMA=3\nRUNTIME_STATE={}\nDOMAIN_ID={}\nDVM_GUEST_CID={}\nIOMMU_GROUP={}\nIOMMU_MODE={IOMMU_MODE}\nPID={}\nPROCESS_START_TICKS={}\nBOOT_ID={}\nLAUNCHED_AT_UNIX={}\nQEMU_SHA256={}\nDVM_ARTIFACT_MANIFEST_SHA256={}\nDEVICE_POLICY_SHA256={}\nRELEASE_MANIFEST_SHA256={}\n",
             self.state.as_str(),
             self.domain_id,
             self.dvm_guest_cid,
             self.iommu_group,
             self.pid,
             self.process_start_ticks,
+            self.boot_id,
             self.launched_at_unix,
             self.qemu_sha256,
             self.artifact_manifest_sha256,
@@ -207,7 +212,7 @@ impl RuntimeRecord {
 
     fn parse(source: &str, label: &str) -> Result<Self> {
         let values = parse_env(source, label)?;
-        const REQUIRED: [&str; 13] = [
+        const REQUIRED: [&str; 14] = [
             "DVM_RUNTIME_SCHEMA",
             "RUNTIME_STATE",
             "DOMAIN_ID",
@@ -216,6 +221,7 @@ impl RuntimeRecord {
             "IOMMU_MODE",
             "PID",
             "PROCESS_START_TICKS",
+            "BOOT_ID",
             "LAUNCHED_AT_UNIX",
             "QEMU_SHA256",
             "DVM_ARTIFACT_MANIFEST_SHA256",
@@ -224,7 +230,7 @@ impl RuntimeRecord {
         ];
         if values.len() != REQUIRED.len()
             || values.keys().any(|key| !REQUIRED.contains(&key.as_str()))
-            || value(&values, "DVM_RUNTIME_SCHEMA", label)? != "2"
+            || value(&values, "DVM_RUNTIME_SCHEMA", label)? != "3"
             || value(&values, "IOMMU_MODE", label)? != IOMMU_MODE
         {
             bail!("unsupported DVM runtime record {label}");
@@ -237,16 +243,24 @@ impl RuntimeRecord {
         }
         let pid = value(&values, "PID", label)?.parse()?;
         let process_start_ticks = value(&values, "PROCESS_START_TICKS", label)?.parse()?;
-        if pid == 0 || process_start_ticks == 0 {
+        let state = RuntimeState::parse(value(&values, "RUNTIME_STATE", label)?)?;
+        if (state == RuntimeState::Prelaunch && (pid != 0 || process_start_ticks != 0))
+            || (state != RuntimeState::Prelaunch && (pid == 0 || process_start_ticks == 0))
+        {
             bail!("invalid DVM runtime process identity");
         }
+        let boot_id = value(&values, "BOOT_ID", label)?;
+        if !valid_boot_id(boot_id) {
+            bail!("invalid DVM runtime boot identity");
+        }
         Ok(Self {
-            state: RuntimeState::parse(value(&values, "RUNTIME_STATE", label)?)?,
+            state,
             domain_id,
             dvm_guest_cid,
             iommu_group: value(&values, "IOMMU_GROUP", label)?.parse()?,
             pid,
             process_start_ticks,
+            boot_id: boot_id.to_owned(),
             launched_at_unix: value(&values, "LAUNCHED_AT_UNIX", label)?.parse()?,
             qemu_sha256: parse_sha256(value(&values, "QEMU_SHA256", label)?)?,
             artifact_manifest_sha256: parse_sha256(value(
@@ -315,6 +329,35 @@ impl RuntimeStore {
         ensure_trusted_directory(&directory, unsafe { libc::geteuid() }, true)?;
         sync_directory(&directory)?;
         Ok(directory)
+    }
+
+    pub fn create_prelaunch(&self, lease: &VfioLeaseRecord, qemu_sha256: &str) -> Result<()> {
+        let record = RuntimeRecord {
+            state: RuntimeState::Prelaunch,
+            domain_id: lease.domain_id.clone(),
+            dvm_guest_cid: lease.dvm_guest_cid,
+            iommu_group: lease.iommu_group,
+            pid: 0,
+            process_start_ticks: 0,
+            boot_id: current_boot_id()?,
+            launched_at_unix: current_unix_time()?,
+            qemu_sha256: parse_sha256(qemu_sha256)?,
+            artifact_manifest_sha256: lease.dvm_artifact_manifest_sha256()?.to_owned(),
+            device_policy_sha256: lease.device_policy_sha256()?.to_owned(),
+            release_manifest_sha256: lease.release_manifest_sha256()?.to_owned(),
+        };
+        let directory = self.prepare_domain_dir(&lease.domain_id)?;
+        let path = directory.join("runtime.env");
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(path)?;
+        file.write_all(record.encode().as_bytes())?;
+        file.sync_all()?;
+        sync_directory(&directory)?;
+        sync_directory(&self.root)
     }
 
     pub fn write_secret(&self, domain_id: &str, secret: &ControlSecret) -> Result<PathBuf> {
@@ -956,6 +999,10 @@ pub fn supervise_domain(
     if lease.state != VfioLeaseState::Active {
         bail!("DVM supervision requires an active VFIO lease");
     }
+    let intent = store.load(&lease.domain_id)?;
+    if intent.state != RuntimeState::Prelaunch || !intent.matches(lease) {
+        bail!("DVM supervision requires the exact unreleased prelaunch intent");
+    }
     if lease.storage_handoff().is_some() {
         bail!("display DVM supervision rejects a storage-bound VFIO lease");
     }
@@ -1005,17 +1052,12 @@ pub fn supervise_domain(
     let contract = artifacts.control.clone();
     let secret = ControlSecret::random()?;
     let secret_path = store.write_secret(&lease.domain_id, &secret)?;
-    let listener = discard_runtime_on_error(
-        store,
-        &lease.domain_id,
-        HostControlListener::bind(lease.dvm_guest_cid, contract, secret),
-    )?;
+    let listener = HostControlListener::bind(lease.dvm_guest_cid, contract, secret)?;
     let runtime_dir = store.prepare_domain_dir(&lease.domain_id)?;
     let amd_vfct = if physical_display.driver() == "amdgpu" {
         match prepare_amdgpu_vfct(sysfs_root, &display_bdf, &runtime_dir) {
             Ok(artifact) => Some(artifact),
             Err(error) => {
-                let _ = store.remove(&lease.domain_id);
                 return Err(error).context("prepare exact host AMD VFCT before device reset");
             }
         }
@@ -1025,17 +1067,16 @@ pub fn supervise_domain(
     let qmp_path = match prepare_qmp_socket(&runtime_dir) {
         Ok(path) => path,
         Err(error) => {
-            let _ = store.remove(&lease.domain_id);
             return Err(error).context("prepare private QMP shutdown endpoint");
         }
     };
 
     let mut ops = SysfsVfioOps::new(sysfs_root);
-    discard_runtime_on_error(store, &lease.domain_id, reset_vfio_group(lease, &mut ops))?;
+    reset_vfio_group(lease, &mut ops)?;
     // Clear before installing so a termination request delivered right after
     // installation is not discarded.
     TERMINATE_REQUESTED.store(false, Ordering::Release);
-    discard_runtime_on_error(store, &lease.domain_id, install_signal_handlers())?;
+    install_signal_handlers()?;
     let (mut child, mut launch_gate) = match spawn_qemu_gated(QemuLaunchInputs {
         qemu: &qemu,
         lease,
@@ -1050,14 +1091,7 @@ pub fn supervise_domain(
     }) {
         Ok(child) => child,
         Err(start_error) => {
-            let restore = restore_vfio_lease(lease, &mut ops);
-            let _ = store.remove(&lease.domain_id);
-            return match restore {
-                Ok(()) => Err(start_error),
-                Err(restore_error) => Err(start_error).context(format!(
-                    "DVM start failed and VFIO recovery failed: {restore_error:#}"
-                )),
-            };
+            return Err(start_error).context("gated DVM spawn failed; recovery required");
         }
     };
     let run_result = (|| {
@@ -1069,6 +1103,7 @@ pub fn supervise_domain(
             iommu_group: lease.iommu_group,
             pid: child.id(),
             process_start_ticks,
+            boot_id: current_boot_id()?,
             launched_at_unix: current_unix_time()?,
             qemu_sha256,
             artifact_manifest_sha256: lease.dvm_artifact_manifest_sha256()?.to_owned(),
@@ -1096,20 +1131,7 @@ pub fn supervise_domain(
         require_successful_child_exit(status)
     })();
     ensure_stopped_before_recovery(&run_result, || stop_child(&mut child, &qmp_path))?;
-    let restore_result = restore_vfio_lease(lease, &mut ops);
-    if restore_result.is_ok() {
-        store.remove(&lease.domain_id)?;
-    }
-    match (run_result, restore_result) {
-        (Ok(status), Ok(())) => Ok(status),
-        (Ok(status), Err(restore_error)) => Err(restore_error).context(format!(
-            "DVM exited with {status}, but VFIO reset/restore failed; runtime record retained"
-        )),
-        (Err(run_error), Ok(())) => Err(run_error),
-        (Err(run_error), Err(restore_error)) => Err(run_error).context(format!(
-            "DVM supervision failed; VFIO recovery failed: {restore_error:#}"
-        )),
-    }
+    run_result.context("DVM quarantined; explicit recovery required")
 }
 
 pub fn supervise_storage_domain(
@@ -1120,6 +1142,10 @@ pub fn supervise_storage_domain(
 ) -> Result<ExitStatus> {
     if lease.state != VfioLeaseState::Active {
         bail!("storage DVM supervision requires an active VFIO lease");
+    }
+    let intent = store.load(&lease.domain_id)?;
+    if intent.state != RuntimeState::Prelaunch || !intent.matches(lease) {
+        bail!("storage supervision requires the exact unreleased prelaunch intent");
     }
     lease.authorization_valid_at(current_unix_time()?)?;
     let binding = lease
@@ -1187,26 +1213,21 @@ pub fn supervise_storage_domain(
     let contract = artifacts.control.clone();
     let secret = ControlSecret::random()?;
     let secret_path = store.write_secret(&lease.domain_id, &secret)?;
-    let listener = discard_runtime_on_error(
-        store,
-        &lease.domain_id,
-        HostControlListener::bind(lease.dvm_guest_cid, contract, secret),
-    )?;
+    let listener = HostControlListener::bind(lease.dvm_guest_cid, contract, secret)?;
     let runtime_dir = store.prepare_domain_dir(&lease.domain_id)?;
     let qmp_path = match prepare_qmp_socket(&runtime_dir) {
         Ok(path) => path,
         Err(error) => {
-            let _ = store.remove(&lease.domain_id);
             return Err(error).context("prepare private storage-DVM QMP endpoint");
         }
     };
 
     let mut ops = SysfsVfioOps::new(sysfs_root);
-    discard_runtime_on_error(store, &lease.domain_id, reset_vfio_group(lease, &mut ops))?;
+    reset_vfio_group(lease, &mut ops)?;
     // Clear before installing so a termination request delivered right after
     // installation is not discarded.
     TERMINATE_REQUESTED.store(false, Ordering::Release);
-    discard_runtime_on_error(store, &lease.domain_id, install_signal_handlers())?;
+    install_signal_handlers()?;
     let (mut child, mut launch_gate) = match spawn_storage_qemu_gated(
         &qemu,
         lease,
@@ -1218,18 +1239,7 @@ pub fn supervise_storage_domain(
     ) {
         Ok(child) => child,
         Err(start_error) => {
-            let revoke = crate::storage::revoke_storage_aperture(
-                binding.aperture_path(),
-                binding.generation(),
-            );
-            let restore = revoke.and_then(|()| restore_vfio_lease(lease, &mut ops));
-            let _ = store.remove(&lease.domain_id);
-            return match restore {
-                Ok(()) => Err(start_error),
-                Err(restore_error) => Err(start_error).context(format!(
-                    "storage DVM start failed and ownership recovery failed: {restore_error:#}"
-                )),
-            };
+            return Err(start_error).context("gated storage DVM spawn failed; recovery required");
         }
     };
     let run_result = (|| {
@@ -1241,6 +1251,7 @@ pub fn supervise_storage_domain(
             iommu_group: lease.iommu_group,
             pid: child.id(),
             process_start_ticks,
+            boot_id: current_boot_id()?,
             launched_at_unix: current_unix_time()?,
             qemu_sha256,
             artifact_manifest_sha256: lease.dvm_artifact_manifest_sha256()?.to_owned(),
@@ -1267,36 +1278,7 @@ pub fn supervise_storage_domain(
         require_successful_child_exit(status)
     })();
     ensure_stopped_before_recovery(&run_result, || stop_child(&mut child, &qmp_path))?;
-    let revoke_result =
-        crate::storage::revoke_storage_aperture(binding.aperture_path(), binding.generation());
-    let restore_result = revoke_result.and_then(|()| restore_vfio_lease(lease, &mut ops));
-    if restore_result.is_ok() {
-        store.remove(&lease.domain_id)?;
-    }
-    match (run_result, restore_result) {
-        (Ok(status), Ok(())) => Ok(status),
-        (Ok(status), Err(restore_error)) => Err(restore_error).context(format!(
-            "storage DVM exited with {status}, but revoke/reset/restore failed; records retained"
-        )),
-        (Err(run_error), Ok(())) => Err(run_error),
-        (Err(run_error), Err(restore_error)) => Err(run_error).context(format!(
-            "storage DVM supervision failed; ownership recovery failed: {restore_error:#}"
-        )),
-    }
-}
-
-// A failed pre-launch step must not leave this run's control secret behind:
-// `write_secret` is create-new, so a stale file would wedge every retry.
-// Nothing has been spawned yet, so removing the runtime directory is safe.
-fn discard_runtime_on_error<T>(
-    store: &RuntimeStore,
-    domain_id: &str,
-    result: Result<T>,
-) -> Result<T> {
-    if result.is_err() {
-        let _ = store.remove(domain_id);
-    }
-    result
+    run_result.context("DVM quarantined; explicit recovery required")
 }
 
 // Never revoke a live guest's aperture or return its devices to the host.
@@ -1320,31 +1302,187 @@ fn require_successful_child_exit(status: ExitStatus) -> Result<ExitStatus> {
     Ok(status)
 }
 
+// VFIO_GROUP_SET_CONTAINER takes exclusive ownership of the entire IOMMU
+// group, including against iommufd users. Hold both descriptors through the
+// reset; failing to claim is not evidence that another owner is quiescent.
+struct RecoveryGroupClaim {
+    _group: fs::File,
+    _container: fs::File,
+}
+
+fn claim_recovery_group(group: u32) -> Result<RecoveryGroupClaim> {
+    const VFIO_GET_API_VERSION: libc::c_ulong = 0x3b64;
+    const VFIO_GROUP_SET_CONTAINER: libc::c_ulong = 0x3b68;
+    let open = |path: &Path| -> Result<fs::File> {
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+            .open(path)?;
+        let metadata = file.metadata()?;
+        if !metadata.file_type().is_char_device() || metadata.uid() != 0 {
+            bail!("unsafe VFIO recovery device {}", path.display());
+        }
+        Ok(file)
+    };
+    let container = open(Path::new("/dev/vfio/vfio"))?;
+    if unsafe { libc::ioctl(container.as_raw_fd(), VFIO_GET_API_VERSION) } != 0 {
+        bail!("VFIO recovery API unavailable");
+    }
+    let group_fd = open(&Path::new("/dev/vfio").join(group.to_string()))?;
+    let container_fd = container.as_raw_fd();
+    if unsafe {
+        libc::ioctl(
+            group_fd.as_raw_fd(),
+            VFIO_GROUP_SET_CONTAINER,
+            &container_fd,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error())
+            .context("cannot exclusively claim VFIO recovery group");
+    }
+    Ok(RecoveryGroupClaim {
+        _group: group_fd,
+        _container: container,
+    })
+}
+
+fn pristine_prepared(lease: &VfioLeaseRecord, ops: &impl VfioOps) -> Result<()> {
+    if lease.state != VfioLeaseState::Prepared || lease.storage_handoff().is_some() {
+        bail!("prepared intent is not pristine");
+    }
+    for (bdf, driver) in &lease.original_drivers {
+        if &ops.current_driver(bdf)? != driver
+            || ops.current_driver_override(bdf)? != lease.original_driver_overrides[bdf]
+        {
+            bail!("prepared intent device identity or ownership changed for {bdf}");
+        }
+    }
+    Ok(())
+}
+
 pub fn recover_domain(
     lease: &VfioLeaseRecord,
     sysfs_root: &Path,
     store: &RuntimeStore,
+    validated: &ValidatedLease,
+    phase: crate::quarantine::Phase,
+    mark_reset: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
-    if lease.state != VfioLeaseState::Active {
-        bail!("DVM recovery requires an active VFIO lease");
-    }
-    match store.load(&lease.domain_id) {
-        Ok(record) => {
-            if !record.matches(lease) {
-                bail!("DVM runtime record does not match durable VFIO lease");
-            }
-            let qmp_path = store.domain_dir(&lease.domain_id)?.join("qmp.sock");
-            terminate_recovered_process(record.pid, record.process_start_ticks, &qmp_path)?;
-        }
-        Err(error) if is_missing_runtime(&error) => {}
-        Err(error) => return Err(error),
-    }
-    if let Some(storage) = lease.storage_handoff() {
-        crate::storage::revoke_storage_aperture(storage.aperture_path(), storage.generation())?;
-    }
     let mut ops = SysfsVfioOps::new(sysfs_root);
-    restore_vfio_lease(lease, &mut ops)?;
-    store.remove(&lease.domain_id)
+    if phase == crate::quarantine::Phase::Reserved {
+        return pristine_prepared(lease, &ops);
+    }
+    if lease.state == VfioLeaseState::Active {
+        match store.load(&lease.domain_id) {
+            Ok(record) => {
+                if !record.matches(lease) {
+                    bail!("DVM runtime record does not match durable VFIO lease");
+                }
+                if record.state != RuntimeState::Prelaunch && record.boot_id == current_boot_id()? {
+                    let qmp_path = store.domain_dir(&lease.domain_id)?.join("qmp.sock");
+                    terminate_recovered_process(record.pid, record.process_start_ticks, &qmp_path)?;
+                }
+                // A different boot only establishes that the old process is gone;
+                // exclusive ownership and reset below establish device quiescence.
+            }
+            Err(error) if is_missing_runtime(&error) => {
+                bail!("missing runtime process identity; independent recovery unsupported")
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    validate_reset_scope_assignment(validated, sysfs_root)?;
+    match fs::symlink_metadata(sysfs_root.join("bus/pci/drivers/none")) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).context("inspect PCI no-bind override"),
+        Ok(_) => bail!("PCI driver named none defeats the no-bind recovery override"),
+    }
+    // The complete group must still be VFIO-bound. A partial bind, an
+    // unsupported reset, or another owner remains quarantined.
+    recover_reset_and_restore(
+        lease,
+        &mut ops,
+        || claim_recovery_group(lease.iommu_group),
+        || {
+            if let Some(storage) = lease.storage_handoff() {
+                crate::storage::revoke_storage_aperture(
+                    storage.aperture_path(),
+                    storage.generation(),
+                )?;
+            }
+            Ok(())
+        },
+        mark_reset,
+    )?;
+    Ok(())
+}
+
+fn recover_reset_and_restore<C>(
+    lease: &VfioLeaseRecord,
+    ops: &mut impl VfioOps,
+    claim: impl FnOnce() -> Result<C>,
+    revoke: impl FnOnce() -> Result<()>,
+    mark_reset: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let claim = claim()?;
+    require_complete_vfio_binding(lease, ops)?;
+    let mut reset_record = lease.clone();
+    reset_record.state = VfioLeaseState::Active;
+    reset_vfio_group(&reset_record, ops)?;
+    revoke()?;
+    mark_reset()?;
+    withdraw_vfio_access(lease, ops)?;
+    drop(claim);
+    let mut restore_record = lease.clone();
+    restore_record.state = VfioLeaseState::Prepared;
+    restore_vfio_lease(&restore_record, ops)
+}
+
+fn require_complete_vfio_binding(lease: &VfioLeaseRecord, ops: &impl VfioOps) -> Result<()> {
+    for bdf in lease.original_drivers.keys() {
+        if ops.current_driver(bdf)?.as_deref() != Some("vfio-pci") {
+            bail!(
+                "recovery requires the entire group VFIO-bound; partial restoration at {bdf} is unsupported"
+            );
+        }
+    }
+    Ok(())
+}
+
+// A nonmatching override prevents automatic rebinding while the live VFIO
+// claim is held through removal of every VFIO device. Linux releases the group
+// claim when the last VFIO device is unregistered. Partial withdrawal is not
+// replayable without independent ownership proof.
+fn withdraw_vfio_access(lease: &VfioLeaseRecord, ops: &mut impl VfioOps) -> Result<()> {
+    require_complete_vfio_binding(lease, ops)?;
+    for bdf in lease.original_drivers.keys() {
+        ops.set_driver_override(bdf, "none")?;
+        if ops.current_driver_override(bdf)? != "none" {
+            bail!("failed to exclude automatic PCI rebinding for {bdf}");
+        }
+    }
+    for bdf in lease.original_drivers.keys() {
+        ops.unbind_driver(bdf, "vfio-pci")?;
+        if ops.current_driver(bdf)?.is_some() {
+            bail!("PCI function {bdf} remained bound after VFIO withdrawal");
+        }
+    }
+    for bdf in lease.original_drivers.keys() {
+        if ops.current_driver(bdf)?.is_some() || ops.current_driver_override(bdf)? != "none" {
+            bail!("PCI function {bdf} changed ownership during VFIO withdrawal");
+        }
+    }
+    Ok(())
+}
+
+pub fn persist_activation(
+    record: &mut VfioLeaseRecord,
+    mark_active: impl FnOnce(&mut VfioLeaseRecord) -> Result<()>,
+) -> Result<()> {
+    mark_active(record)
+        .context("VFIO activation record failed; VFIO binding and quarantine retained for recovery")
 }
 
 struct QemuLaunchInputs<'a> {
@@ -1383,11 +1521,15 @@ fn spawn_qemu_gated(inputs: QemuLaunchInputs<'_>) -> Result<(Child, UnixStream)>
         .create_new(true)
         .mode(0o600)
         .open(runtime_dir.join("qemu.stderr.log"))?;
-    let mut command = Command::new(qemu);
     let qmp_argument = qmp_server_argument(qmp_path)?;
     let (parent_gate, child_gate) = UnixStream::pair().context("create DVM launch gate")?;
     let parent_gate_fd = parent_gate.as_raw_fd();
     let child_gate_fd = child_gate.as_raw_fd();
+    let mut command = Command::new(std::env::current_exe()?);
+    command
+        .arg("__exec-gated")
+        .arg(child_gate_fd.to_string())
+        .arg(qemu);
     command
         .arg("-name")
         .arg(format!("rustos-dvm-{}", lease.domain_id))
@@ -1469,9 +1611,9 @@ fn spawn_qemu_gated(inputs: QemuLaunchInputs<'_>) -> Result<(Child, UnixStream)>
         }
         command.arg("-device").arg(device);
     }
-    // The child cannot exec QEMU (and therefore cannot open VFIO) until the
-    // parent has fsync'd the exact PID/start-time runtime record. If hostd
-    // crashes first, closing the peer makes pre_exec fail closed.
+    // The wrapper execs first so Command::spawn can return. It cannot exec
+    // QEMU until the parent durably records its process identity and releases
+    // the inherited gate. EOF makes the wrapper exit without executing QEMU.
     unsafe {
         command.pre_exec(move || {
             for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
@@ -1479,21 +1621,10 @@ fn spawn_qemu_gated(inputs: QemuLaunchInputs<'_>) -> Result<(Child, UnixStream)>
             }
             libc::umask(0o077);
             libc::close(parent_gate_fd);
-            let mut byte = 0_u8;
-            loop {
-                let read = libc::read(child_gate_fd, (&mut byte as *mut u8).cast(), 1);
-                if read == 1 {
-                    libc::close(child_gate_fd);
-                    return Ok(());
-                }
-                if read == 0 {
-                    return Err(std::io::Error::from_raw_os_error(libc::EPIPE));
-                }
-                let error = std::io::Error::last_os_error();
-                if error.raw_os_error() != Some(libc::EINTR) {
-                    return Err(error);
-                }
+            if libc::fcntl(child_gate_fd, libc::F_SETFD, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
             }
+            Ok(())
         });
     }
     let child = command
@@ -1522,11 +1653,15 @@ fn spawn_storage_qemu_gated(
         .create_new(true)
         .mode(0o600)
         .open(runtime_dir.join("qemu.stderr.log"))?;
-    let mut command = Command::new(qemu);
     let qmp_argument = qmp_server_argument(qmp_path)?;
     let (parent_gate, child_gate) = UnixStream::pair().context("create storage-DVM launch gate")?;
     let parent_gate_fd = parent_gate.as_raw_fd();
     let child_gate_fd = child_gate.as_raw_fd();
+    let mut command = Command::new(std::env::current_exe()?);
+    command
+        .arg("__exec-gated")
+        .arg(child_gate_fd.to_string())
+        .arg(qemu);
     command
         .arg("-name")
         .arg(format!("rustos-dvm-{}", lease.domain_id))
@@ -1590,21 +1725,10 @@ fn spawn_storage_qemu_gated(
             }
             libc::umask(0o077);
             libc::close(parent_gate_fd);
-            let mut byte = 0_u8;
-            loop {
-                let read = libc::read(child_gate_fd, (&mut byte as *mut u8).cast(), 1);
-                if read == 1 {
-                    libc::close(child_gate_fd);
-                    return Ok(());
-                }
-                if read == 0 {
-                    return Err(std::io::Error::from_raw_os_error(libc::EPIPE));
-                }
-                let error = std::io::Error::last_os_error();
-                if error.raw_os_error() != Some(libc::EINTR) {
-                    return Err(error);
-                }
+            if libc::fcntl(child_gate_fd, libc::F_SETFD, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
             }
+            Ok(())
         });
     }
     let child = command
@@ -2543,6 +2667,326 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::process::ExitStatusExt;
 
+    struct RecoveryOps {
+        driver: Option<String>,
+        override_name: String,
+        reset_fails: bool,
+        resets: usize,
+        claimed: Option<std::rc::Rc<std::cell::Cell<bool>>>,
+        partial_bdf: Option<String>,
+    }
+    impl VfioOps for RecoveryOps {
+        fn vfio_driver_present(&self) -> Result<bool> {
+            Ok(true)
+        }
+        fn vfio_idle_d3_disabled(&self) -> Result<bool> {
+            Ok(true)
+        }
+        fn current_driver(&self, bdf: &str) -> Result<Option<String>> {
+            if self.partial_bdf.as_deref() == Some(bdf) {
+                return Ok(Some("amdgpu".into()));
+            }
+            Ok(self.driver.clone())
+        }
+        fn current_driver_override(&self, _: &str) -> Result<String> {
+            Ok(self.override_name.clone())
+        }
+        fn set_driver_override(&mut self, _: &str, driver: &str) -> Result<()> {
+            if driver == "none" && self.claimed.as_ref().is_some_and(|v| !v.get()) {
+                bail!("override without claim");
+            }
+            self.override_name = driver.into();
+            Ok(())
+        }
+        fn clear_driver_override(&mut self, _: &str) -> Result<()> {
+            self.override_name.clear();
+            Ok(())
+        }
+        fn unbind_driver(&mut self, _: &str, _: &str) -> Result<()> {
+            if self.claimed.as_ref().is_some_and(|v| !v.get()) {
+                bail!("unbind without claim");
+            }
+            self.driver = None;
+            Ok(())
+        }
+        fn bind_driver(&mut self, _: &str, driver: &str) -> Result<()> {
+            if self.claimed.as_ref().is_some_and(|v| v.get()) {
+                bail!("host bind while claim held");
+            }
+            self.driver = Some(driver.into());
+            Ok(())
+        }
+        fn reset_methods(&self, _: &str) -> Result<String> {
+            Ok("flr".into())
+        }
+        fn reset_scope_bdfs(&self, bdf: &str) -> Result<std::collections::BTreeSet<String>> {
+            Ok([bdf.to_owned()].into())
+        }
+        fn bus_master_enabled(&self, _: &str) -> Result<bool> {
+            Ok(false)
+        }
+        fn disable_bus_master(&mut self, _: &str) -> Result<()> {
+            Ok(())
+        }
+        fn reset_device(&mut self, _: &str) -> Result<()> {
+            if self.claimed.as_ref().is_some_and(|v| !v.get()) {
+                bail!("reset without claim");
+            }
+            self.resets += 1;
+            if self.reset_fails {
+                bail!("reset failed");
+            }
+            Ok(())
+        }
+    }
+    fn recovery_fixture() -> (VfioLeaseRecord, RecoveryOps) {
+        let lease = ValidatedLease {
+            domain_id: "gpu".into(),
+            dvm_guest_cid: 4,
+            iommu_group: 7,
+            pci_bdfs: vec!["0000:01:00.0".into()],
+        };
+        let ops = RecoveryOps {
+            driver: Some("amdgpu".into()),
+            override_name: String::new(),
+            reset_fails: false,
+            resets: 0,
+            claimed: None,
+            partial_bdf: None,
+        };
+        let record = rustos_driver_domain_host::inspect_vfio_lease_preflight(&lease, &ops).unwrap();
+        (record, ops)
+    }
+    #[test]
+    fn prelaunch_intent_is_durable_and_cannot_replace_existing_process() {
+        let path = std::env::current_dir().unwrap().join(format!(
+            ".hostd-prelaunch-{}-{}",
+            std::process::id(),
+            PRIVATE_REPLACE_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        let store = RuntimeStore::new(&path);
+        let lease = ValidatedLease {
+            domain_id: "gpu".into(),
+            dvm_guest_cid: 4,
+            iommu_group: 7,
+            pci_bdfs: vec!["0000:01:00.0".into()],
+        };
+        let (_, ops) = recovery_fixture();
+        let digest = "ab".repeat(32);
+        let binding = rustos_driver_domain_host::VfioReleaseBinding::new(
+            &digest,
+            &digest,
+            &digest,
+            &digest,
+            1,
+            u64::MAX,
+        )
+        .unwrap();
+        let record = rustos_driver_domain_host::inspect_vfio_lease(&lease, &ops, binding).unwrap();
+        store.create_prelaunch(&record, &digest).unwrap();
+        let intent = RuntimeStore::new(&path).load("gpu").unwrap();
+        assert!(intent.matches(&record));
+        assert_eq!(intent.state, RuntimeState::Prelaunch);
+        assert_eq!((intent.pid, intent.process_start_ticks), (0, 0));
+        assert!(store.create_prelaunch(&record, &digest).is_err());
+        assert_eq!(store.load("gpu").unwrap(), intent);
+        store.remove("gpu").unwrap();
+        fs::remove_dir_all(path).unwrap();
+    }
+    #[test]
+    fn pristine_prepared_requires_exact_original_ownership() {
+        let (record, mut ops) = recovery_fixture();
+        pristine_prepared(&record, &ops).unwrap();
+        ops.driver = Some("vfio-pci".into());
+        assert!(pristine_prepared(&record, &ops).is_err());
+        ops.driver = Some("amdgpu".into());
+        ops.override_name = "vfio-pci".into();
+        assert!(pristine_prepared(&record, &ops).is_err());
+    }
+    #[test]
+    fn recovery_requires_exclusive_claim_reset_and_revocation_before_restore() {
+        let (record, mut ops) = recovery_fixture();
+        ops.driver = Some("vfio-pci".into());
+        ops.override_name = "vfio-pci".into();
+        assert!(
+            recover_reset_and_restore(
+                &record,
+                &mut ops,
+                || -> Result<()> { bail!("busy") },
+                || Ok(()),
+                || Ok(())
+            )
+            .is_err()
+        );
+        assert_eq!(ops.resets, 0);
+        ops.reset_fails = true;
+        assert!(
+            recover_reset_and_restore(&record, &mut ops, || Ok(()), || Ok(()), || Ok(())).is_err()
+        );
+        assert_eq!(ops.driver.as_deref(), Some("vfio-pci"));
+        ops.reset_fails = false;
+        assert!(
+            recover_reset_and_restore(
+                &record,
+                &mut ops,
+                || Ok(()),
+                || -> Result<()> { bail!("revoke failed") },
+                || Ok(())
+            )
+            .is_err()
+        );
+        assert_eq!(ops.driver.as_deref(), Some("vfio-pci"));
+        assert!(
+            recover_reset_and_restore(
+                &record,
+                &mut ops,
+                || Ok(()),
+                || Ok(()),
+                || -> Result<()> { bail!("reset journal fsync failed") }
+            )
+            .is_err()
+        );
+        assert_eq!(ops.driver.as_deref(), Some("vfio-pci"));
+        recover_reset_and_restore(&record, &mut ops, || Ok(()), || Ok(()), || Ok(())).unwrap();
+        assert_eq!(ops.driver.as_deref(), Some("amdgpu"));
+        assert_eq!(ops.override_name, "");
+    }
+
+    struct TestRecoveryClaim(std::rc::Rc<std::cell::Cell<bool>>);
+    impl Drop for TestRecoveryClaim {
+        fn drop(&mut self) {
+            self.0.set(false);
+        }
+    }
+
+    #[test]
+    fn reset_phase_replay_requires_fresh_claim_and_reset() {
+        let (record, mut ops) = recovery_fixture();
+        let claimed = std::rc::Rc::new(std::cell::Cell::new(false));
+        ops.claimed = Some(claimed.clone());
+        ops.driver = Some("vfio-pci".into());
+        ops.override_name = "vfio-pci".into();
+        // Simulate the reset phase being made durable, then the process dying
+        // before VFIO withdrawal. A new owner acquired the group meanwhile.
+        let persisted = std::cell::Cell::new(false);
+        assert!(
+            recover_reset_and_restore(
+                &record,
+                &mut ops,
+                || {
+                    claimed.set(true);
+                    Ok(TestRecoveryClaim(claimed.clone()))
+                },
+                || Ok(()),
+                || {
+                    persisted.set(true);
+                    bail!("crash after journal")
+                }
+            )
+            .is_err()
+        );
+        assert!(persisted.get());
+        assert_eq!(ops.resets, 1);
+        assert!(!claimed.get());
+        assert!(
+            recover_reset_and_restore(
+                &record,
+                &mut ops,
+                || -> Result<TestRecoveryClaim> { bail!("intervening VFIO owner") },
+                || Ok(()),
+                || Ok(())
+            )
+            .is_err()
+        );
+        assert_eq!(ops.resets, 1);
+        assert_eq!(ops.driver.as_deref(), Some("vfio-pci"));
+        assert_eq!(ops.override_name, "vfio-pci");
+        recover_reset_and_restore(
+            &record,
+            &mut ops,
+            || {
+                claimed.set(true);
+                Ok(TestRecoveryClaim(claimed.clone()))
+            },
+            || Ok(()),
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(ops.resets, 2);
+        assert_eq!(ops.driver.as_deref(), Some("amdgpu"));
+        assert!(!claimed.get());
+    }
+
+    #[test]
+    fn recovery_rejects_partially_restored_group_before_any_reset_or_unbind() {
+        let (mut record, mut ops) = recovery_fixture();
+        let second = "0000:01:00.1".to_owned();
+        record
+            .original_drivers
+            .insert(second.clone(), Some("amdgpu".into()));
+        record
+            .original_driver_overrides
+            .insert(second.clone(), String::new());
+        ops.partial_bdf = Some(second);
+        ops.driver = Some("vfio-pci".into());
+        ops.override_name = "vfio-pci".into();
+        let claimed = std::rc::Rc::new(std::cell::Cell::new(false));
+        ops.claimed = Some(claimed.clone());
+        assert!(
+            recover_reset_and_restore(
+                &record,
+                &mut ops,
+                || {
+                    claimed.set(true);
+                    Ok(TestRecoveryClaim(claimed.clone()))
+                },
+                || Ok(()),
+                || Ok(())
+            )
+            .is_err()
+        );
+        assert_eq!(ops.resets, 0);
+        assert_eq!(ops.driver.as_deref(), Some("vfio-pci"));
+        assert_eq!(ops.override_name, "vfio-pci");
+        assert!(!claimed.get());
+    }
+
+    #[test]
+    fn failed_activation_persists_vfio_ownership_for_admitted_recovery() {
+        for durable_active in [false, true] {
+            let (mut record, mut ops) = recovery_fixture();
+            ops.driver = Some("vfio-pci".into());
+            ops.override_name = "vfio-pci".into();
+            let error = persist_activation(&mut record, |record| {
+                if durable_active {
+                    record.state = VfioLeaseState::Active;
+                }
+                bail!("injected mark_active failure")
+            })
+            .unwrap_err();
+            assert!(format!("{error:#}").contains("VFIO binding and quarantine retained"));
+            assert_eq!(ops.driver.as_deref(), Some("vfio-pci"));
+            assert_eq!(ops.override_name, "vfio-pci");
+            let claimed = std::rc::Rc::new(std::cell::Cell::new(false));
+            ops.claimed = Some(claimed.clone());
+            recover_reset_and_restore(
+                &record,
+                &mut ops,
+                || {
+                    claimed.set(true);
+                    Ok(TestRecoveryClaim(claimed.clone()))
+                },
+                || Ok(()),
+                || Ok(()),
+            )
+            .unwrap();
+            assert_eq!(ops.resets, 1);
+            assert_eq!(ops.driver.as_deref(), Some("amdgpu"));
+        }
+    }
+
     fn vfct_fixture(target: AmdPciIdentity) -> Vec<u8> {
         let image_len = 0x80_usize;
         let image_offset = ACPI_VFCT_HEADER_BYTES;
@@ -2762,10 +3206,36 @@ mod tests {
     fn runtime_record_rejects_pid_reuse_inputs_and_unknown_keys() {
         let digest = "a".repeat(64);
         let valid = format!(
-            "DVM_RUNTIME_SCHEMA=2\nRUNTIME_STATE=ready\nDOMAIN_ID=linux-dvm-gpu0\nDVM_GUEST_CID=4\nIOMMU_GROUP=17\nIOMMU_MODE={IOMMU_MODE}\nPID=42\nPROCESS_START_TICKS=99\nLAUNCHED_AT_UNIX=100\nQEMU_SHA256={digest}\nDVM_ARTIFACT_MANIFEST_SHA256={digest}\nDEVICE_POLICY_SHA256={digest}\nRELEASE_MANIFEST_SHA256={digest}\n"
+            "DVM_RUNTIME_SCHEMA=3\nRUNTIME_STATE=ready\nDOMAIN_ID=linux-dvm-gpu0\nDVM_GUEST_CID=4\nIOMMU_GROUP=17\nIOMMU_MODE={IOMMU_MODE}\nPID=42\nPROCESS_START_TICKS=99\nBOOT_ID=12345678-1234-1234-1234-123456789abc\nLAUNCHED_AT_UNIX=100\nQEMU_SHA256={digest}\nDVM_ARTIFACT_MANIFEST_SHA256={digest}\nDEVICE_POLICY_SHA256={digest}\nRELEASE_MANIFEST_SHA256={digest}\n"
         );
         assert!(RuntimeRecord::parse(&valid, "test").is_ok());
+        let prelaunch = valid
+            .replace("RUNTIME_STATE=ready", "RUNTIME_STATE=prelaunch")
+            .replace("PID=42", "PID=0")
+            .replace("PROCESS_START_TICKS=99", "PROCESS_START_TICKS=0");
+        assert_eq!(
+            RuntimeRecord::parse(&prelaunch, "test").unwrap().state,
+            RuntimeState::Prelaunch
+        );
+        assert!(RuntimeRecord::parse(&prelaunch.replace("PID=0", "PID=42"), "test").is_err());
+        assert!(
+            RuntimeRecord::parse(
+                &prelaunch.replace("RUNTIME_STATE=prelaunch", "RUNTIME_STATE=starting"),
+                "test"
+            )
+            .is_err()
+        );
         assert!(RuntimeRecord::parse(&valid.replace("PID=42", "PID=0"), "test").is_err());
+        assert!(
+            RuntimeRecord::parse(
+                &valid.replace(
+                    "BOOT_ID=12345678-1234-1234-1234-123456789abc",
+                    "BOOT_ID=corrupt"
+                ),
+                "test"
+            )
+            .is_err()
+        );
         assert!(RuntimeRecord::parse(&(valid + "EXTRA=1\n"), "test").is_err());
     }
 
@@ -2902,4 +3372,51 @@ mod tests {
             "unix:/run/rustos/qmp.sock,server=on,wait=off"
         );
     }
+}
+
+fn current_boot_id() -> Result<String> {
+    let id = fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
+    let id = id.trim();
+    if !valid_boot_id(id) {
+        bail!("invalid host boot identity");
+    }
+    Ok(id.to_owned())
+}
+
+fn valid_boot_id(id: &str) -> bool {
+    id.len() == 36
+        && id.bytes().enumerate().all(|(i, b)| {
+            if matches!(i, 8 | 13 | 18 | 23) {
+                b == b'-'
+            } else {
+                b.is_ascii_hexdigit()
+            }
+        })
+}
+
+pub fn exec_gated_wrapper() -> Result<()> {
+    let mut args = std::env::args_os().skip(2);
+    let fd: i32 = args
+        .next()
+        .ok_or_else(|| anyhow!("missing gate fd"))?
+        .to_string_lossy()
+        .parse()?;
+    let program = args
+        .next()
+        .ok_or_else(|| anyhow!("missing gated program"))?;
+    let mut byte = 0u8;
+    loop {
+        let n = unsafe { libc::read(fd, (&mut byte as *mut u8).cast(), 1) };
+        if n == 1 && byte == 1 {
+            break;
+        }
+        if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        bail!("gated launch not authorized");
+    }
+    unsafe {
+        libc::close(fd);
+    }
+    Err(Command::new(program).args(args).exec().into())
 }

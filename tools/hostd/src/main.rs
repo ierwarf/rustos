@@ -9,24 +9,25 @@ use rustos_driver_domain_host::{
     ControlContract, ControlSecret, DeviceClass, DeviceTransport, DriverDomainFleetPolicy,
     DriverDomainPolicy, FileLeaseStore, HostControlListener, InputRingSink, IommuTopology,
     LaunchPlan, ReleaseAuthorization, SysfsVfioOps, ValidatedLease, VfioOps, VfioReleaseBinding,
-    acquire_vfio_lease, inspect_vfio_lease, inspect_vfio_lease_preflight, restore_vfio_lease,
+    acquire_vfio_lease, inspect_vfio_lease, inspect_vfio_lease_preflight,
     validate_host_display_assignment, validate_physical_display_assignment,
     validate_physical_storage_assignment, validate_reset_scope_assignment,
     validate_vfio_bind_dma_quiescence,
 };
 
+mod quarantine;
 mod runtime;
 mod storage;
 
 use runtime::{
     RuntimeStore, StorageSuperviseConfig, SuperviseConfig, export_amdgpu_guest_vfct,
-    export_amdgpu_vbios, preflight_physical_runtime_inputs, probe_iommufd, recover_domain,
-    supervise_domain, supervise_storage_domain, verify_artifacts,
+    export_amdgpu_vbios, persist_activation, preflight_physical_runtime_inputs, probe_iommufd,
+    recover_domain, supervise_domain, supervise_storage_domain, verify_artifacts,
 };
 use runtime::{sha256_file, trusted_canonical_regular_file};
 use storage::{
-    load_storage_epoch_signing_key, prepare_storage_handoff, revoke_storage_aperture,
-    storage_epoch_identity_sha256, storage_epoch_verifying_key_sha256,
+    load_storage_epoch_signing_key, prepare_storage_handoff, storage_epoch_identity_sha256,
+    storage_epoch_verifying_key_sha256,
 };
 
 #[derive(Parser)]
@@ -41,6 +42,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Explicitly provision the persistent root-owned physical-device authority.
+    ProvisionAuthority,
     /// List host IOMMU groups without changing a device binding.
     Discover {
         #[arg(long, default_value = "/sys")]
@@ -140,7 +143,7 @@ enum Command {
         plan: PathBuf,
         #[arg(long, default_value = "/sys")]
         sysfs_root: PathBuf,
-        #[arg(long, default_value = "/run/rustos-hostd/leases")]
+        #[arg(long, default_value = "/var/lib/rustos-hostd/leases")]
         state_root: PathBuf,
         /// Perform driver override, unbind, and vfio-pci bind after durable state is written.
         #[arg(long)]
@@ -183,7 +186,7 @@ enum Command {
         plan: PathBuf,
         #[arg(long, default_value = "/sys")]
         sysfs_root: PathBuf,
-        #[arg(long, default_value = "/run/rustos-hostd/leases")]
+        #[arg(long, default_value = "/var/lib/rustos-hostd/leases")]
         state_root: PathBuf,
         /// Restore original drivers and remove the durable lease only after success.
         #[arg(long)]
@@ -196,9 +199,9 @@ enum Command {
         plan: PathBuf,
         #[arg(long, default_value = "/sys")]
         sysfs_root: PathBuf,
-        #[arg(long, default_value = "/run/rustos-hostd/leases")]
+        #[arg(long, default_value = "/var/lib/rustos-hostd/leases")]
         state_root: PathBuf,
-        #[arg(long, default_value = "/run/rustos-hostd/domains")]
+        #[arg(long, default_value = "/var/lib/rustos-hostd/domains")]
         runtime_root: PathBuf,
         #[arg(long, default_value = "/usr/bin/qemu-system-x86_64")]
         qemu: PathBuf,
@@ -221,9 +224,9 @@ enum Command {
         plan: PathBuf,
         #[arg(long, default_value = "/sys")]
         sysfs_root: PathBuf,
-        #[arg(long, default_value = "/run/rustos-hostd/leases")]
+        #[arg(long, default_value = "/var/lib/rustos-hostd/leases")]
         state_root: PathBuf,
-        #[arg(long, default_value = "/run/rustos-hostd/domains")]
+        #[arg(long, default_value = "/var/lib/rustos-hostd/domains")]
         runtime_root: PathBuf,
         #[arg(long, default_value = "/usr/bin/qemu-system-x86_64")]
         qemu: PathBuf,
@@ -245,9 +248,9 @@ enum Command {
         plan: PathBuf,
         #[arg(long, default_value = "/sys")]
         sysfs_root: PathBuf,
-        #[arg(long, default_value = "/run/rustos-hostd/leases")]
+        #[arg(long, default_value = "/var/lib/rustos-hostd/leases")]
         state_root: PathBuf,
-        #[arg(long, default_value = "/run/rustos-hostd/domains")]
+        #[arg(long, default_value = "/var/lib/rustos-hostd/domains")]
         runtime_root: PathBuf,
     },
     /// Verify one self-contained schema-8 DVM release bundle without launching it.
@@ -258,6 +261,9 @@ enum Command {
 }
 
 fn main() -> Result<()> {
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("__exec-gated")) {
+        return runtime::exec_gated_wrapper();
+    }
     let cli = Cli::parse();
     match cli.command {
         Command::Discover { sysfs_root } => {
@@ -452,6 +458,13 @@ fn main() -> Result<()> {
                 std::thread::sleep(Duration::from_secs(1));
             }
         }
+        Command::ProvisionAuthority => {
+            quarantine::Authority::provision(std::path::Path::new(quarantine::ROOT))?;
+            println!(
+                "rustos-hostd: physical authority provisioned at {}",
+                quarantine::ROOT
+            );
+        }
         Command::Acquire {
             plan,
             sysfs_root,
@@ -470,6 +483,9 @@ fn main() -> Result<()> {
             proc_root,
         } => {
             let lease = validate_plan(&plan, &sysfs_root)?;
+            require_authority_paths(&state_root, None)?;
+            let authority = quarantine::Authority::open(std::path::Path::new(quarantine::ROOT))?;
+            let _group_lock = authority.lock(&format!("group-{}", lease.iommu_group))?;
             let mut ops = SysfsVfioOps::new(&sysfs_root);
             let mut activation_policy = None;
             let release_binding = if activate {
@@ -514,6 +530,13 @@ fn main() -> Result<()> {
             if !activate {
                 return Ok(());
             }
+            {
+                let _inventory_lock = authority.lock("inventory")?;
+                authority.reserve(&lease)?;
+            }
+            let store = FileLeaseStore::new(&state_root);
+            store.create_prepared(&record, current_unix_time()?)?;
+            authority.mark_mutating(&lease)?;
             let policy = activation_policy
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("missing activation device policy"))?;
@@ -538,6 +561,16 @@ fn main() -> Result<()> {
                     physical_storage,
                     &aperture,
                     &epoch_signing_key,
+                    |evidence| {
+                        record.bind_storage_handoff(
+                            &evidence.controller_bdf,
+                            &evidence.block_name,
+                            &evidence.aperture_path,
+                            evidence.header.generation,
+                            &storage_epoch_identity_sha256(&evidence.header),
+                        )?;
+                        store.update_prepared(&record, current_unix_time()?)
+                    },
                 )?)
             } else {
                 if block_aperture.is_some() {
@@ -545,18 +578,6 @@ fn main() -> Result<()> {
                 }
                 None
             };
-            if let Some(guard) = &storage_handoff {
-                let evidence = guard.evidence();
-                record.bind_storage_handoff(
-                    &evidence.controller_bdf,
-                    &evidence.block_name,
-                    &evidence.aperture_path,
-                    evidence.header.generation,
-                    &storage_epoch_identity_sha256(&evidence.header),
-                )?;
-            }
-            let store = FileLeaseStore::new(state_root);
-            store.create_prepared(&record, current_unix_time()?)?;
             let final_assignment_check = (|| {
                 validate_reset_scope_assignment(&lease, &sysfs_root)?;
                 validate_vfio_bind_dma_quiescence(&sysfs_root)?;
@@ -585,14 +606,8 @@ fn main() -> Result<()> {
                 }
             })();
             if let Err(error) = final_assignment_check {
-                let cleanup_error = store.remove(&record.domain_id).err();
-                if let Some(cleanup_error) = cleanup_error {
-                    anyhow::bail!(
-                        "physical display assignment changed before VFIO binding: {error:#}; prepared lease cleanup failed: {cleanup_error:#}"
-                    );
-                }
                 anyhow::bail!(
-                    "physical display assignment changed before VFIO binding; prepared lease removed: {error:#}"
+                    "physical assignment changed; prepared lease and quarantine retained: {error:#}"
                 );
             }
             if let Err(error) = acquire_vfio_lease(&record, &mut ops, current_unix_time()?) {
@@ -600,17 +615,11 @@ fn main() -> Result<()> {
                     "VFIO acquire failed; prepared lease retained for explicit recovery with release --activate: {error:#}"
                 );
             }
-            if let Err(error) = store.mark_active(&mut record, current_unix_time()?) {
-                let restore_error = restore_vfio_lease(&record, &mut ops).err();
-                if let Some(restore_error) = restore_error {
-                    anyhow::bail!(
-                        "VFIO lease activation record failed: {error:#}; rollback failed: {restore_error:#}"
-                    );
-                }
-                anyhow::bail!(
-                    "VFIO device binding was rolled back because lease activation record failed: {error:#}"
-                );
-            }
+            RuntimeStore::new(quarantine::DOMAINS)
+                .create_prelaunch(&record, policy.qemu_sha256())?;
+            persist_activation(&mut record, |record| {
+                store.mark_active(record, current_unix_time()?)
+            })?;
             let storage_evidence = storage_handoff.take().map(|guard| guard.commit());
             println!(
                 "rustos-hostd: VFIO lease active domain={} iommu_group={}",
@@ -634,6 +643,9 @@ fn main() -> Result<()> {
             activate,
         } => {
             let lease = validate_plan(&plan, &sysfs_root)?;
+            require_authority_paths(&state_root, None)?;
+            let authority = quarantine::Authority::open(std::path::Path::new(quarantine::ROOT))?;
+            let _group_lock = authority.lock(&format!("group-{}", lease.iommu_group))?;
             let store = FileLeaseStore::new(state_root);
             let record = store.load(&lease.domain_id)?;
             validate_record_matches_lease(&record, &lease)?;
@@ -647,23 +659,7 @@ fn main() -> Result<()> {
             if !activate {
                 return Ok(());
             }
-            if record.storage_handoff().is_some()
-                && record.state == rustos_driver_domain_host::VfioLeaseState::Active
-            {
-                anyhow::bail!(
-                    "active storage leases must use recover with the runtime store so the exact DVM process is terminated before aperture revocation"
-                );
-            }
-            if let Some(storage) = record.storage_handoff() {
-                revoke_storage_aperture(storage.aperture_path(), storage.generation())?;
-            }
-            let mut ops = SysfsVfioOps::new(sysfs_root);
-            restore_vfio_lease(&record, &mut ops)?;
-            store.remove(&record.domain_id)?;
-            println!(
-                "rustos-hostd: VFIO lease released domain={} iommu_group={}",
-                record.domain_id, record.iommu_group
-            );
+            anyhow::bail!("physical release requires recover; raw driver restoration is forbidden");
         }
         Command::Supervise {
             plan,
@@ -678,6 +674,13 @@ fn main() -> Result<()> {
             timeout_secs,
         } => {
             let lease = validate_plan(&plan, &sysfs_root)?;
+            require_authority_paths(&state_root, Some(&runtime_root))?;
+            let authority = quarantine::Authority::open(std::path::Path::new(quarantine::ROOT))?;
+            let _group_lock = authority.lock(&format!("group-{}", lease.iommu_group))?;
+            authority.require(&lease)?;
+            if authority.phase(&lease)? != quarantine::Phase::Mutating {
+                anyhow::bail!("supervision requires a mutating active reservation");
+            }
             let lease_store = FileLeaseStore::new(&state_root);
             let mut record = lease_store.load(&lease.domain_id)?;
             validate_record_matches_lease(&record, &lease)?;
@@ -695,7 +698,13 @@ fn main() -> Result<()> {
                     setup_timeout: Duration::from_secs(timeout_secs.clamp(1, 30)),
                 },
             )?;
-            lease_store.remove(&lease.domain_id)?;
+            finish_recovery(
+                &authority,
+                &lease,
+                &sysfs_root,
+                &lease_store,
+                &runtime_store,
+            )?;
             println!(
                 "rustos-hostd: supervised DVM stopped domain={} status={status}",
                 lease.domain_id
@@ -708,11 +717,19 @@ fn main() -> Result<()> {
             runtime_root,
         } => {
             let lease = validate_plan(&plan, &sysfs_root)?;
+            require_authority_paths(&state_root, Some(&runtime_root))?;
+            let authority = quarantine::Authority::open(std::path::Path::new(quarantine::ROOT))?;
+            let _group_lock = authority.lock(&format!("group-{}", lease.iommu_group))?;
+            authority.require(&lease)?;
             let lease_store = FileLeaseStore::new(&state_root);
-            let record = lease_store.load(&lease.domain_id)?;
-            validate_record_matches_lease(&record, &lease)?;
-            recover_domain(&record, &sysfs_root, &RuntimeStore::new(runtime_root))?;
-            lease_store.remove(&lease.domain_id)?;
+            let runtime_store = RuntimeStore::new(runtime_root);
+            finish_recovery(
+                &authority,
+                &lease,
+                &sysfs_root,
+                &lease_store,
+                &runtime_store,
+            )?;
             println!(
                 "rustos-hostd: recovered DVM lease domain={} iommu_group={}",
                 lease.domain_id, lease.iommu_group
@@ -731,6 +748,13 @@ fn main() -> Result<()> {
             timeout_secs,
         } => {
             let lease = validate_plan(&plan, &sysfs_root)?;
+            require_authority_paths(&state_root, Some(&runtime_root))?;
+            let authority = quarantine::Authority::open(std::path::Path::new(quarantine::ROOT))?;
+            let _group_lock = authority.lock(&format!("group-{}", lease.iommu_group))?;
+            authority.require(&lease)?;
+            if authority.phase(&lease)? != quarantine::Phase::Mutating {
+                anyhow::bail!("supervision requires a mutating active reservation");
+            }
             let lease_store = FileLeaseStore::new(&state_root);
             let mut record = lease_store.load(&lease.domain_id)?;
             validate_record_matches_lease(&record, &lease)?;
@@ -748,7 +772,13 @@ fn main() -> Result<()> {
                     setup_timeout: Duration::from_secs(timeout_secs.clamp(1, 30)),
                 },
             )?;
-            lease_store.remove(&lease.domain_id)?;
+            finish_recovery(
+                &authority,
+                &lease,
+                &sysfs_root,
+                &lease_store,
+                &runtime_store,
+            )?;
             println!(
                 "rustos-hostd: supervised storage DVM stopped domain={} status={status}",
                 lease.domain_id
@@ -913,4 +943,61 @@ mod tests {
             b"[GNUPG:] VALIDSIG AB x\n[GNUPG:] BADSIG AB cn\n"
         ));
     }
+}
+
+fn require_authority_paths(
+    state: &std::path::Path,
+    runtime: Option<&std::path::Path>,
+) -> Result<()> {
+    if state != std::path::Path::new(quarantine::LEASES)
+        || runtime.is_some_and(|p| p != std::path::Path::new(quarantine::DOMAINS))
+    {
+        anyhow::bail!("physical devices require the canonical persistent hostd authority");
+    }
+    Ok(())
+}
+
+fn error_is_not_found(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+    })
+}
+
+fn finish_recovery(
+    authority: &quarantine::Authority,
+    lease: &ValidatedLease,
+    sysfs_root: &std::path::Path,
+    lease_store: &FileLeaseStore,
+    runtime_store: &RuntimeStore,
+) -> Result<()> {
+    use quarantine::Phase;
+    let phase = authority.phase(lease)?;
+    if phase != Phase::Complete {
+        match lease_store.load(&lease.domain_id) {
+            Ok(record) => {
+                validate_record_matches_lease(&record, lease)?;
+                recover_domain(&record, sysfs_root, runtime_store, lease, phase, || {
+                    if phase == Phase::Mutating {
+                        authority.advance(lease, Phase::Mutating, Phase::Reset)?;
+                    }
+                    Ok(())
+                })?;
+            }
+            Err(error) if phase == Phase::Reserved && error_is_not_found(&error) => {}
+            Err(error) => return Err(error),
+        }
+        let current = authority.phase(lease)?;
+        authority.advance(lease, current, Phase::Complete)?;
+    }
+    authority.finish_complete(
+        lease,
+        || runtime_store.remove(&lease.domain_id),
+        || match lease_store.remove(&lease.domain_id) {
+            Ok(()) => Ok(()),
+            Err(error) if error_is_not_found(&error) => Ok(()),
+            Err(error) => Err(error),
+        },
+    )
 }

@@ -13,6 +13,8 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <poll.h>
+#include <pthread.h>
+#include <stdatomic.h>
 #include <sched.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -34,6 +36,7 @@
 #include <xf86drmMode.h>
 
 #include "rustos-dvm-gpu-runtime.h"
+#include "rustos-dvm-gpu-deadline.h"
 #include "rustos-dvm-gpu-backends.h"
 
 #define IVSHMEM_VENDOR_ID "0x1af4"
@@ -170,7 +173,7 @@ static void relay_log(const char *format, ...) {
     saved_errno = errno;
     if (relay_log_fd == -2) {
         relay_log_fd = open("/proc/self/fd/2",
-                            O_WRONLY | O_NONBLOCK | O_NOCTTY | O_CLOEXEC);
+                            O_WRONLY | O_NONBLOCK | O_NOCTTY | O_CLOEXEC | O_APPEND);
     }
     if (relay_log_fd < 0) {
         (void)write(STDERR_FILENO, line, (size_t)length);
@@ -325,6 +328,23 @@ static int display_scheduler_enter(struct display_scheduler_guard *guard) {
 #define DISPLAY_RETRY_SECONDS 1U
 #define UIO_BIND_RETRIES 50U
 #define UIO_BIND_RETRY_NS (20ULL * 1000ULL * 1000ULL)
+#define DISPLAY_RECOVERY_LIMIT_MS 30000U
+
+static uint64_t recovery_generation;
+static uint64_t recovery_started_ms;
+static unsigned int recovery_attempt;
+
+static void recovery_marker(const char *state, const char *cause, int error,
+                            uint64_t frames, uint64_t sequence) {
+    uint64_t now = relay_log_now_ms();
+    relay_log("rustos-dvm-display: %s v=1 generation=%llu attempt=%u state=%s cause=%s errno=%d elapsed_ms=%llu frames=%llu sequence=%llu\n",
+              recovery_generation ? "recovery" : "bootstrap",
+              (unsigned long long)recovery_generation, recovery_attempt,
+              state, cause, error,
+              (unsigned long long)(now >= recovery_started_ms ? now - recovery_started_ms : 0U),
+              (unsigned long long)frames, (unsigned long long)sequence);
+}
+
 
 struct gui_pool_header {
     uint64_t region_bytes;
@@ -365,6 +385,18 @@ struct shared_display {
     struct gui_pool_header header;
     struct gpu_atlas_header atlas;
 };
+
+struct gpu_watchdog {
+    _Atomic uint64_t deadline_ns;
+    _Atomic uint64_t generation;
+    _Atomic unsigned int attempt;
+    _Atomic uint64_t started_ms;
+    _Atomic int stopping;
+    const struct shared_display *shared;
+    pthread_t thread;
+};
+
+static struct gpu_watchdog *active_watchdog;
 
 struct atomic_property_ids {
     uint32_t connector_crtc_id;
@@ -877,6 +909,59 @@ static void report_host_offline(const struct shared_display *shared) {
  * wait so a stopped RustOS peer cannot turn DVM recovery into an infinite
  * wait.
  */
+static void *gpu_watchdog_main(void *argument) {
+    struct gpu_watchdog *watchdog = argument;
+    const struct timespec interval = {.tv_sec = 0, .tv_nsec = 10000000};
+    while (!atomic_load_explicit(&watchdog->stopping, memory_order_acquire)) {
+        uint64_t deadline = atomic_load_explicit(&watchdog->deadline_ns, memory_order_acquire);
+        struct timespec now;
+        if (deadline && clock_gettime(CLOCK_MONOTONIC, &now) == 0 &&
+            (uint64_t)now.tv_sec * 1000000000ULL + (uint64_t)now.tv_nsec >= deadline &&
+            atomic_compare_exchange_strong(&watchdog->deadline_ns, &deadline, 0U)) {
+            char line[320];
+            uint64_t generation = atomic_load(&watchdog->generation);
+            unsigned int attempt = atomic_load(&watchdog->attempt);
+            int fd, length;
+            (void)notify_host_offline(watchdog->shared);
+            length = snprintf(line, sizeof(line),
+                "rustos-dvm-display: %s v=1 generation=%llu attempt=%u state=failed cause=hard-watchdog errno=%d elapsed_ms=%llu frames=0 sequence=0 quiescence=unproven\n",
+                generation ? "recovery" : "bootstrap", (unsigned long long)generation,
+                attempt, ETIMEDOUT,
+                (unsigned long long)(((uint64_t)now.tv_sec * 1000U +
+                    (uint64_t)now.tv_nsec / 1000000U) - atomic_load(&watchdog->started_ms)));
+            fd = open("/proc/self/fd/2", O_WRONLY | O_NONBLOCK | O_CLOEXEC | O_APPEND);
+            if (fd >= 0) {
+                if (length > 0 && (size_t)length < sizeof(line))
+                    (void)write(fd, line, (size_t)length);
+                close(fd);
+            }
+            /* Retain every fd, mapping, fence and GBM object. A stopped GPU
+             * thread is not a reset or proof that DMA has quiesced. */
+            (void)kill(getpid(), SIGSTOP);
+            for (;;)
+                pause();
+        }
+        (void)nanosleep(&interval, NULL);
+    }
+    return NULL;
+}
+
+static void gpu_watchdog_arm(uint64_t deadline) {
+    if (active_watchdog != NULL) {
+        atomic_store(&active_watchdog->generation, recovery_generation);
+        atomic_store(&active_watchdog->attempt, recovery_attempt);
+        atomic_store(&active_watchdog->started_ms, recovery_started_ms);
+        atomic_store_explicit(&active_watchdog->deadline_ns, deadline, memory_order_release);
+    }
+}
+
+static void gpu_watchdog_stop(struct gpu_watchdog *watchdog) {
+    atomic_store(&watchdog->deadline_ns, 0U);
+    atomic_store_explicit(&watchdog->stopping, 1, memory_order_release);
+    (void)pthread_join(watchdog->thread, NULL);
+    active_watchdog = NULL;
+}
+
 static int revoke_predecessor_lease(const struct shared_display *shared) {
     const unsigned int attempts = 200U;
     unsigned int attempt;
@@ -1538,19 +1623,27 @@ static void gpu_page_flip_completed(int fd, unsigned int sequence, unsigned int 
         wait->page_flip_complete = 1;
 }
 
-static int wait_sync_file(int fd, uint32_t timeout_us) {
+static int wait_sync_file_until(int fd, uint64_t deadline_ns) {
     struct pollfd pollfd = {.fd = fd, .events = POLLIN, .revents = 0};
-    int timeout_ms = (int)((timeout_us + 999U) / 1000U);
-    int result;
-    do {
-        result = poll(&pollfd, 1U, timeout_ms);
-    } while (result < 0 && errno == EINTR);
-    if (result <= 0 || (pollfd.revents & POLLIN) == 0 ||
-        (pollfd.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
-        errno = result == 0 ? ETIMEDOUT : EIO;
-        return -1;
+    for (;;) {
+        uint64_t now, remaining;
+        int result;
+        if (monotonic_time_ns(&now) != 0 ||
+            gpu_deadline_remaining(now, deadline_ns, &remaining) != 0)
+            return -1;
+        result = poll(&pollfd, 1U, (int)((remaining + 999999ULL) / 1000000ULL));
+        if (result < 0 && errno == EINTR)
+            continue;
+        if (result <= 0 || (pollfd.revents & POLLIN) == 0 ||
+            (pollfd.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
+            errno = result == 0 ? ETIMEDOUT : EIO;
+            return -1;
+        }
+        if (monotonic_time_ns(&now) != 0 ||
+            gpu_deadline_remaining(now, deadline_ns, &remaining) != 0)
+            return -1;
+        return 0;
     }
-    return 0;
 }
 
 static int add_gpu_plane_properties(const struct kms_display *display,
@@ -1567,7 +1660,8 @@ static int add_gpu_plane_properties(const struct kms_display *display,
 static int atomic_gpu_initial_modeset(struct kms_display *display,
                                       struct rustos_gpu_runtime *runtime,
                                       struct rustos_gpu_frame *frame,
-                                      int *present_fence_observed) {
+                                      int *present_fence_observed,
+                                      uint64_t prime_deadline_ns) {
     drmModeAtomicReq *request;
     int out_fence_fd = -1;
     int result;
@@ -1577,7 +1671,7 @@ static int atomic_gpu_initial_modeset(struct kms_display *display,
     }
     *present_fence_observed = 0;
     display->setup_stage = "gpu-prime-render-fence";
-    if (wait_sync_file(frame->in_fence_fd, frame->budget_us) != 0) {
+    if (wait_sync_file_until(frame->in_fence_fd, prime_deadline_ns) != 0) {
         close(frame->in_fence_fd);
         frame->in_fence_fd = -1;
         return -1;
@@ -1627,7 +1721,16 @@ static int atomic_gpu_initial_modeset(struct kms_display *display,
     }
     if (out_fence_fd >= 0) {
         display->setup_stage = "gpu-prime-present-fence";
-        result = wait_sync_file(out_fence_fd, DISPLAY_PAGEFLIP_TIMEOUT_MS * 1000U);
+        {
+            uint64_t now, present_deadline;
+            if (monotonic_time_ns(&now) != 0 ||
+                gpu_deadline_after(now, (uint64_t)DISPLAY_PAGEFLIP_TIMEOUT_MS * 1000000ULL,
+                                   &present_deadline) != 0)
+                result = -1;
+            else
+                result = wait_sync_file_until(out_fence_fd,
+                    gpu_deadline_min(prime_deadline_ns, present_deadline));
+        }
         close(out_fence_fd);
         if (result != 0)
             return -1;
@@ -1705,8 +1808,8 @@ static int atomic_gpu_page_flip(struct kms_display *display,
         errno = EOVERFLOW;
         return -1;
     }
-    deadline_ns = commit_started_ns +
-                  (uint64_t)DISPLAY_PAGEFLIP_TIMEOUT_MS * 1000000ULL;
+    deadline_ns = gpu_deadline_min(frame->operation_deadline_ns,
+                  commit_started_ns + (uint64_t)DISPLAY_PAGEFLIP_TIMEOUT_MS * 1000000ULL);
     display->setup_stage = "gpu-frame-present-fences";
     while (!wait.page_flip_complete || !out_complete || !render_complete) {
         uint64_t now_ns;
@@ -1720,7 +1823,12 @@ static int atomic_gpu_page_flip(struct kms_display *display,
             result = 0;
             goto fail_fences;
         }
-        remaining_ns = deadline_ns - now_ns;
+        if (!render_complete && now_ns >= frame->render_deadline_ns) {
+            result = 0;
+            goto fail_fences;
+        }
+        remaining_ns = (render_complete ? deadline_ns :
+            gpu_deadline_min(deadline_ns, frame->render_deadline_ns)) - now_ns;
         timeout_ms = (int)((remaining_ns + 999999ULL) / 1000000ULL);
         if (timeout_ms <= 0)
             timeout_ms = 1;
@@ -1742,6 +1850,15 @@ static int atomic_gpu_page_flip(struct kms_display *display,
             (pollfds[2].revents & (POLLERR | POLLHUP | POLLNVAL)) != 0) {
             if (result > 0)
                 errno = EIO;
+            goto fail_fences;
+        }
+        if (monotonic_time_ns(&now_ns) != 0) {
+            result = -1;
+            goto fail_fences;
+        }
+        if (now_ns >= deadline_ns ||
+            (!render_complete && now_ns >= frame->render_deadline_ns)) {
+            result = 0;
             goto fail_fences;
         }
         if ((pollfds[0].revents & POLLIN) != 0 && drmHandleEvent(display->fd, &event) != 0) {
@@ -1806,6 +1923,16 @@ fail_fences:
     return -1;
 }
 
+static void terminal_gpu_quarantine(const struct shared_display *shared,
+                                    const char *stage, int error) {
+    gpu_watchdog_arm(0U);
+    report_host_offline(shared);
+    recovery_marker("failed", stage, error, 0U, 0U);
+    relay_log("rustos-dvm-display: terminal GPU quarantine quiescence=unproven\n");
+    for (;;)
+        pause();
+}
+
 static int open_gpu_kms_display(const struct shared_display *shared,
                                 struct kms_display *display,
                                 struct rustos_gpu_runtime **runtime_out,
@@ -1815,6 +1942,7 @@ static int open_gpu_kms_display(const struct shared_display *shared,
     int source_fds[GPU_ATLAS_SLOT_COUNT] = {-1, -1, -1};
     uint64_t prime_started_ns;
     uint64_t prime_completed_ns;
+    uint64_t prime_deadline_ns;
     const struct rustos_gpu_backend_policy *backend;
     int saved;
     if (runtime_out == NULL || prime_duration_ns == NULL || prime_present_fence == NULL) {
@@ -1844,8 +1972,16 @@ static int open_gpu_kms_display(const struct shared_display *shared,
         load_atomic_property_ids(display) != 0)
         goto fail;
     display->setup_stage = "gpu-egl-gbm";
-    if (monotonic_time_ns(&prime_started_ns) != 0)
+    if (monotonic_time_ns(&prime_started_ns) != 0 ||
+        gpu_deadline_after(prime_started_ns, GPU_PIPELINE_PRIME_MAX_NS,
+                           &prime_deadline_ns) != 0)
         goto fail;
+    if (active_watchdog != NULL) {
+        uint64_t outer = atomic_load(&active_watchdog->deadline_ns);
+        if (outer != 0U)
+            prime_deadline_ns = gpu_deadline_min(prime_deadline_ns, outer);
+    }
+    gpu_watchdog_arm(prime_deadline_ns);
     if (rustos_gpu_runtime_open(display->fd, shared->header.width,
                                 shared->header.height, shared->atlas.atlas_width,
                                 shared->atlas.atlas_height,
@@ -1905,18 +2041,12 @@ static int open_gpu_kms_display(const struct shared_display *shared,
     if (rustos_gpu_runtime_render_bootstrap(*runtime_out, &bootstrap) != 0) {
         saved = errno == 0 ? EIO : errno;
         display->setup_stage = rustos_gpu_runtime_stage(*runtime_out);
-        rustos_gpu_runtime_close(*runtime_out);
-        *runtime_out = NULL;
-        errno = saved;
-        goto fail;
+        terminal_gpu_quarantine(shared, display->setup_stage, saved);
     }
     if (atomic_gpu_initial_modeset(display, *runtime_out, &bootstrap,
-                                   prime_present_fence) != 0) {
+                                   prime_present_fence, prime_deadline_ns) != 0) {
         saved = errno == 0 ? EIO : errno;
-        rustos_gpu_runtime_close(*runtime_out);
-        *runtime_out = NULL;
-        errno = saved;
-        goto fail;
+        terminal_gpu_quarantine(shared, display->setup_stage, saved);
     }
     if (monotonic_time_ns(&prime_completed_ns) != 0) {
         rustos_gpu_runtime_close(*runtime_out);
@@ -1930,6 +2060,7 @@ static int open_gpu_kms_display(const struct shared_display *shared,
         errno = prime_completed_ns > prime_started_ns ? ETIMEDOUT : EPROTO;
         goto fail;
     }
+    gpu_watchdog_arm(0U);
     *prime_duration_ns = prime_completed_ns - prime_started_ns;
     display->setup_stage = "gpu-ready";
     return 0;
@@ -2305,6 +2436,21 @@ static int acknowledge_gpu_host_invitation(const struct shared_display *shared,
     return acknowledge_host_invitation(shared);
 }
 
+static void bind_recovery_generation(const struct shared_display *shared) {
+    uint64_t generation = read_le64(shared->base + GUI_POOL_INVITATION_OFFSET);
+    if (generation != 0U && !(generation & 1U) && generation != recovery_generation) {
+        recovery_generation = generation;
+        recovery_attempt = 1U;
+        recovery_started_ms = relay_log_now_ms();
+        if (active_watchdog != NULL) {
+            atomic_store(&active_watchdog->generation, generation);
+            atomic_store(&active_watchdog->attempt, recovery_attempt);
+            atomic_store(&active_watchdog->started_ms, recovery_started_ms);
+        }
+        recovery_marker("starting", "invitation", 0, 0U, 0U);
+    }
+}
+
 static int serve_gpu_display(struct shared_display *shared) {
     struct kms_display display;
     struct display_scheduler_guard scheduler = {0};
@@ -2325,6 +2471,7 @@ static int serve_gpu_display(struct shared_display *shared) {
     int peer_ready_sent = 0;
     int peer_ready_confirmed = 0;
     int active_logged = 0;
+    uint64_t ready_marker_generation = 0U;
     int ready_lock = -1;
     uint32_t event_count = 0U;
     uint64_t diag_wakes = 0U;
@@ -2332,18 +2479,37 @@ static int serve_gpu_display(struct shared_display *shared) {
     uint64_t diag_max_frame_ns = 0U;
     uint64_t diag_last_ns = 0U;
     uint64_t diag_last_slow_ns = 0U;
+    uint64_t startup_now, startup_deadline;
+    struct gpu_watchdog watchdog = {.shared = shared};
+    int thread_error = pthread_create(&watchdog.thread, NULL, gpu_watchdog_main, &watchdog);
+    if (thread_error != 0) {
+        errno = thread_error;
+        return -1;
+    }
+    active_watchdog = &watchdog;
+    if (monotonic_time_ns(&startup_now) != 0 || recovery_started_ms == 0U ||
+        gpu_deadline_after(recovery_started_ms * 1000000ULL,
+                           (uint64_t)DISPLAY_RECOVERY_LIMIT_MS * 1000000ULL,
+                           &startup_deadline) != 0 || startup_now >= startup_deadline) {
+        gpu_watchdog_stop(&watchdog);
+        return -1;
+    }
+    gpu_watchdog_arm(startup_deadline);
     if (open_gpu_kms_display(shared, &display, &runtime, &prime_duration_ns,
                              &prime_present_fence) != 0) {
         relay_log("rustos-dvm-display: GPU KMS setup unavailable stage=%s errno=%d\n",
                   display.setup_stage == NULL ? "unknown" : display.setup_stage, errno);
+        gpu_watchdog_stop(&watchdog);
         return -1;
     }
+    gpu_watchdog_arm(startup_deadline);
     const int dmabuf_sources = rustos_gpu_runtime_uses_dmabuf_sources(runtime);
     shared->uio_fd = open_uio_interrupt(shared);
     if (shared->uio_fd < 0 || map_gpu_pixel_pool(shared) != 0) {
         relay_log("rustos-dvm-display: GPU read-only pixel mapping unavailable errno=%d\n",
                   errno);
         close_gpu_kms_display(&display, runtime);
+        gpu_watchdog_stop(&watchdog);
         return -1;
     }
     relay_log("rustos-dvm-display: gpu-compositor primed contract=3 driver=%s renderer=%s "
@@ -2400,6 +2566,17 @@ static int serve_gpu_display(struct shared_display *shared) {
                 break;
             peer_ready_sent = 1;
         }
+        {
+            uint64_t previous_generation = recovery_generation;
+            bind_recovery_generation(shared);
+            if (previous_generation != recovery_generation) {
+                if (gpu_deadline_after(recovery_started_ms * 1000000ULL,
+                                       (uint64_t)DISPLAY_RECOVERY_LIMIT_MS * 1000000ULL,
+                                       &startup_deadline) != 0)
+                    goto fail;
+                gpu_watchdog_arm(startup_deadline);
+            }
+        }
         if (!peer_ready_confirmed && host_confirmed_peer_ready(shared)) {
             if (display_scheduler_enter(&scheduler) != 0) {
                 relay_log(
@@ -2439,7 +2616,15 @@ static int serve_gpu_display(struct shared_display *shared) {
                           (unsigned long long)diag_rescan_hits);
             }
             if (monotonic_time_ns(&frame_started_ns) != 0)
-                frame_started_ns = 0U;
+                goto fail;
+            {
+                uint64_t hard_deadline;
+                if (gpu_deadline_after(frame_started_ns, 600000000ULL, &hard_deadline) != 0)
+                    goto fail;
+                gpu_watchdog_arm(ready_marker_generation == recovery_generation &&
+                                 recovery_generation != 0U ? hard_deadline :
+                                 gpu_deadline_min(hard_deadline, startup_deadline));
+            }
             if (dmabuf_sources) {
                 display.setup_stage = "gpu-dmabuf-acquire";
                 acquire_fence_fd = acquire_gpu_source_fence(&display, &submission);
@@ -2450,13 +2635,16 @@ static int serve_gpu_display(struct shared_display *shared) {
                     (size_t)shared->atlas.atlas_slot_bytes, submission.damage,
                     submission.damage_count, submission.batch,
                     submission.batch_bytes, submission.slot, submission.generation,
-                    submission.sequence, acquire_fence_fd, &frame) != 0 ||
+                    submission.sequence, frame_started_ns, acquire_fence_fd,
+                    &watchdog.deadline_ns, &frame) != 0 ||
                 atomic_gpu_page_flip(&display, runtime, &frame, &presented_ns,
                                      &render_time_ns, &atomic_commit_time_ns,
                                      &atomic_commit_measurements) != 0 ||
                 publish_gpu_completion(shared, &frame, render_time_ns, presented_ns,
                                        front_submit_value) != 0)
                 goto fail;
+            gpu_watchdog_arm(ready_marker_generation == recovery_generation &&
+                             recovery_generation != 0U ? 0U : startup_deadline);
             front_submit_value = frame.submit_value;
             presented_frames++;
             if (frame_started_ns != 0U && monotonic_time_ns(&frame_finished_ns) == 0 &&
@@ -2489,7 +2677,8 @@ static int serve_gpu_display(struct shared_display *shared) {
                 if (ready_lock < 0)
                     goto fail;
             }
-            if (!active_logged && ready_lock >= 0) {
+            if (ready_lock >= 0 && (!active_logged ||
+                (recovery_generation != 0U && ready_marker_generation != recovery_generation))) {
                 relay_log(
                     "rustos-dvm-display: active width=%u height=%u stride=%u format=BGRA8888 event=ivshmem-msix-uio irq_count=%u source-path=%s zero-copy=%u gpu-composition=1 explicit-fence=1 scanout_buffers=%u cpu-final-compose=0 staged-damage-copy=%u\n",
                     shared->header.width, shared->header.height,
@@ -2499,7 +2688,9 @@ static int serve_gpu_display(struct shared_display *shared) {
                     dmabuf_sources ? 0U : 1U);
                 active_logged = 1;
             }
-            if (presented_frames == 1U || presented_frames % GPU_FRAME_LOG_INTERVAL == 0U) {
+            if (presented_frames == 1U ||
+                (recovery_generation != 0U && ready_marker_generation != recovery_generation) ||
+                presented_frames % GPU_FRAME_LOG_INTERVAL == 0U) {
                 relay_log("rustos-dvm-display: gpu-frame sequence=%llu submit=%llu "
                           "output=%u render_us=%llu source-path=%s zero-copy=%u "
                           "gpu-fence=1 present-fence=1\n",
@@ -2508,6 +2699,12 @@ static int serve_gpu_display(struct shared_display *shared) {
                           (unsigned long long)((render_time_ns + 999U) / 1000U),
                           dmabuf_sources ? "dmabuf" : "staged-copy",
                           dmabuf_sources ? 1U : 0U);
+            }
+            if (active_logged && recovery_generation != 0U &&
+                ready_marker_generation != recovery_generation) {
+                recovery_marker("ready", "frame-presented", 0, presented_frames, frame.sequence);
+                ready_marker_generation = recovery_generation;
+                gpu_watchdog_arm(0U);
             }
             if (report_relay_stats(&display, dmabuf_sources, presented_frames,
                                    atomic_commit_time_ns,
@@ -2560,9 +2757,18 @@ fail:
               (unsigned long long)presented_frames,
               display.setup_stage == NULL ? "unknown" : display.setup_stage,
               rustos_gpu_runtime_stage(runtime), errno);
-    report_host_offline(shared);
-    close_gpu_kms_display(&display, runtime);
-    return scheduler.fatal ? DISPLAY_SERVE_FATAL : DISPLAY_SERVE_RETRY;
+    {
+        int saved_errno = errno != 0 ? errno : EIO;
+        const char *cause = display.setup_stage == NULL ? "unknown" : display.setup_stage;
+        gpu_watchdog_stop(&watchdog);
+        report_host_offline(shared);
+        recovery_marker("failed", cause, saved_errno, presented_frames, 0U);
+        relay_log("rustos-dvm-display: terminal GPU quarantine quiescence=unproven\n");
+        /* Do not destroy or reuse resources with possibly in-flight DMA/KMS.
+         * External recovery must prove quiescence before replacing this owner. */
+        for (;;)
+            pause();
+    }
 }
 
 static int serve_display(void) {
@@ -2573,6 +2779,7 @@ static int serve_display(void) {
         relay_log("rustos-dvm-display: shared aperture unavailable errno=%d\n", errno);
         return -1;
     }
+    bind_recovery_generation(&shared);
     if (revoke_predecessor_lease(&shared) != 0) {
         relay_log("rustos-dvm-display: predecessor lease revoke failed errno=%d\n", errno);
         close_shared_display(&shared);
@@ -2594,10 +2801,19 @@ int main(int argc, char **argv) {
         relay_log("rustos-dvm-display: process owner unavailable errno=%d\n", errno);
         return EXIT_FAILURE;
     }
+    recovery_started_ms = relay_log_now_ms();
     for (;;) {
-        int result = serve_display();
-        if (result == DISPLAY_SERVE_FATAL) {
-            relay_log("rustos-dvm-display: fatal scheduler restore failure; exiting\n");
+        int result;
+        int saved_errno;
+        recovery_attempt++;
+        recovery_marker(recovery_attempt == 1U ? "starting" : "recovering",
+                        "attempt", 0, 0U, 0U);
+        result = serve_display();
+        saved_errno = errno != 0 ? errno : EIO;
+        if (result != 0 && (result == DISPLAY_SERVE_FATAL ||
+            relay_log_now_ms() - recovery_started_ms >= DISPLAY_RECOVERY_LIMIT_MS)) {
+            recovery_marker("failed", result == DISPLAY_SERVE_FATAL ? "fatal" : "recovery-budget",
+                            saved_errno, 0U, 0U);
             close(owner_fd);
             return EXIT_FAILURE;
         }

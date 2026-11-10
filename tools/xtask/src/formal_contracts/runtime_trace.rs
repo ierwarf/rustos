@@ -18,14 +18,11 @@ pub(crate) struct KvmRuntimeObservation {
     pub network: bool,
     pub ui_budget: bool,
     pub storage_only: bool,
-    /// Whether a step that lands after its absolute deadline fails the run.
-    ///
-    /// The interactive lane is operator-owned and, by its own documented
-    /// contract, does not terminate on a boot-to-UI deadline: a developer
-    /// pausing at a breakpoint or a cold host cache is not a product
-    /// regression. It still records every observed timestamp, so the
-    /// measurement stays available; only the acceptance lanes enforce it.
-    pub enforce_deadlines: bool,
+    /// Publish the functional acceptance artifact instead of the interactive
+    /// artifact. Per-step timing remains explicitly advisory in this trace
+    /// lane; the CLI's independent startup deadline still bounds liveness.
+    /// A successful replay is not proof of the product's timing SLO.
+    pub acceptance_artifact: bool,
 }
 
 #[derive(Serialize)]
@@ -61,6 +58,7 @@ pub(crate) fn record_kvm_runtime_trace(
     observation: KvmRuntimeObservation,
     rustos_log_path: &Path,
     dvm_log_path: &Path,
+    launched_image: &Path,
 ) -> Result<()> {
     let topology = if observation.storage_only {
         "storage-dvm"
@@ -76,7 +74,7 @@ pub(crate) fn record_kvm_runtime_trace(
     let registry = ContractRegistry::load(root)?;
     registry.validate(root)?;
     let source_tree_sha256 = super::evidence::source_tree_hash(root)?;
-    let rustos_boot_image_sha256 = super::evidence::hash_file(&root.join("build/rustos-boot.img"))
+    let rustos_boot_image_sha256 = super::evidence::hash_file(launched_image)
         .context("hash launched RustOS boot image for runtime evidence")?;
     let dvm_manifest_sha256 = super::evidence::hash_file(
         &root.join("driver-domains/linux/out/artifacts/rustos-linux-dvm-x86_64.manifest"),
@@ -113,14 +111,18 @@ pub(crate) fn record_kvm_runtime_trace(
     let run_id = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64;
     let artifact_dir = root.join("build/formal/runtime-traces");
     fs::create_dir_all(&artifact_dir)?;
-    // A lane that does not enforce deadlines must not overwrite the acceptance
-    // artifact: `run-runtime-traces.sh` replays that file strictly, so one
-    // relaxed interactive session would otherwise fail every later seal.
-    let trace = artifact_dir.join(if observation.enforce_deadlines {
-        "kvm-p0.jsonl"
-    } else {
-        "kvm-p0-interactive.jsonl"
-    });
+    // Never replay a shared filename: independent lanes may finish together.
+    // Keep each verified trace beside the exact launch's private logs.
+    let private_dir = rustos_log_path.parent().context("runtime log lacks a launch directory")?
+        .join("runtime-traces");
+    fs::create_dir_all(&private_dir)?;
+    let sequence = TRACE_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let run_name = format!("kvm-{run_id}-{}-{sequence}", std::process::id());
+    // Interactive observations must not replace the functional acceptance
+    // artifact. Both kinds keep their recorded timestamps and advisory timing
+    // classification; replay validates causal, identity and source bindings.
+    let artifact_name = if observation.acceptance_artifact { "kvm-p0" } else { "kvm-p0-interactive" };
+    let trace = private_dir.join(format!("{run_name}.jsonl"));
     let mut output = Vec::new();
     for step in steps {
         let not_before_us = required_timestamp_us(step, &observed_guest_ts_us)?;
@@ -194,13 +196,10 @@ pub(crate) fn record_kvm_runtime_trace(
     fs::write(&trace, output)?;
 
     let checker = root.join("formal/check-kvm-runtime-trace.py");
-    let summary = artifact_dir.join(if observation.enforce_deadlines {
-        "kvm-p0-summary.json"
-    } else {
-        "kvm-p0-interactive-summary.json"
-    });
+    let summary = private_dir.join(format!("{run_name}-summary.json"));
     let mut command = Command::new("python3");
-    command.arg(checker).arg(&trace).arg("--deadlines-advisory");
+    command.arg(checker).arg(&trace).arg("--deadlines-advisory")
+        .arg("--boot-image").arg(launched_image);
     let status = command
         .args(["--registry"])
         .arg(root.join("formal/product-scenarios.tsv"))
@@ -211,9 +210,27 @@ pub(crate) fn record_kvm_runtime_trace(
         .status()
         .context("replay KVM P0 runtime trace")?;
     if !status.success() {
-        bail!("KVM P0 runtime trace did not conform to its product scenario");
+        bail!("KVM P0 runtime trace did not conform to its product scenario; trace={}", trace.display());
     }
+    // Only fully replayed output becomes the optional gate artifact. Copy to
+    // a unique file on the destination filesystem, then atomically replace.
+    publish_verified_trace(&trace, &artifact_dir.join(format!("{artifact_name}.jsonl")), &run_name)?;
+    publish_verified_trace(&summary, &artifact_dir.join(format!("{artifact_name}-summary.json")), &run_name)?;
+    println!("xtask: runtime trace timing=advisory evidence={}", trace.display());
     Ok(())
+}
+
+static TRACE_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn publish_verified_trace(source: &Path, destination: &Path, run_name: &str) -> Result<()> {
+    let temporary = destination.with_extension(format!("{run_name}.tmp"));
+    let result = (|| {
+        fs::copy(source, &temporary)?;
+        fs::rename(&temporary, destination)?;
+        Ok(())
+    })();
+    if result.is_err() { let _ = fs::remove_file(&temporary); }
+    result
 }
 
 fn required_timestamp_us(
@@ -366,6 +383,35 @@ mod tests {
         FNV1A64_OFFSET_BASIS, FNV1A64_PRIME, ProductScenarioStep, find_structured_step,
         milestone_evidence_matches, required_timestamp_us, verified_milestone,
     };
+
+    #[test]
+    fn parallel_lanes_publish_complete_verified_files_without_sharing_replay_input() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first.jsonl");
+        let second = directory.path().join("second.jsonl");
+        let destination = directory.path().join("kvm-p0.jsonl");
+        let a = vec![b'a'; 128 * 1024];
+        let b = vec![b'b'; 128 * 1024];
+        std::fs::write(&first, &a).unwrap();
+        std::fs::write(&second, &b).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut handles = Vec::new();
+        for (name, source) in [("first", first.clone()), ("second", second.clone())] {
+            let barrier = barrier.clone();
+            let destination = destination.clone();
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                super::publish_verified_trace(&source, &destination, name).unwrap();
+            }));
+        }
+        barrier.wait();
+        for handle in handles { handle.join().unwrap(); }
+        let published = std::fs::read(destination).unwrap();
+        assert!(published == a || published == b);
+        assert_eq!(std::fs::read(first).unwrap(), a);
+        assert_eq!(std::fs::read(second).unwrap(), b);
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 3);
+    }
 
     fn framed(semantic: &str) -> String {
         let checksum = semantic

@@ -56,6 +56,10 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("trace", type=Path)
     parser.add_argument("--root", type=Path, required=True)
+    parser.add_argument(
+        "--boot-image", type=Path,
+        help="exact image launched by this private run (default: root/build/rustos-boot.img)",
+    )
     parser.add_argument("--registry", type=Path, required=True)
     parser.add_argument("--topology", required=True)
     parser.add_argument("--summary", type=Path, required=True)
@@ -64,9 +68,8 @@ def main() -> int:
         action="store_true",
         help=(
             "report a step that landed after its absolute deadline instead of "
-            "rejecting the event; the operator-owned interactive lane records "
-            "the overshoot without failing, while every acceptance lane "
-            "keeps enforcing it"
+            "rejecting the event; this proves functional causal conformance, "
+            "not the timing SLO"
         ),
     )
     parser.add_argument(
@@ -247,9 +250,8 @@ def main() -> int:
     trace_sha256 = hashlib.sha256(args.trace.read_bytes()).hexdigest()
     registry_sha256 = hashlib.sha256(args.registry.read_bytes()).hexdigest()
     current_source_sha256 = source_tree_sha256(args.root.resolve())
-    rustos_boot_image_sha256 = hashlib.sha256(
-        (args.root / "build/rustos-boot.img").read_bytes()
-    ).hexdigest()
+    boot_image = args.boot_image or args.root / "build/rustos-boot.img"
+    rustos_boot_image_sha256 = hashlib.sha256(boot_image.read_bytes()).hexdigest()
     dvm_manifest_sha256 = hashlib.sha256(
         (
             args.root

@@ -540,10 +540,11 @@ fn run_one_smoke_unarchived(
                 network: options.exercise_network,
                 ui_budget: options.min_ui_fps.is_some(),
                 storage_only: options.storage_only,
-                enforce_deadlines,
+                acceptance_artifact: enforce_deadlines,
             },
             &layout.debugcon_log,
             &layout.dvm_serial_log,
+            &layout.runtime_disk,
         )?;
     }
     if options.job_policy_probe {
@@ -823,6 +824,24 @@ fn install_interactive_stop_handlers() {
     }
 }
 
+fn interactive_deadline_expired(ready: bool, boot_elapsed: Duration, recovery_elapsed: Option<Duration>, timeout: Duration) -> bool {
+    if ready { recovery_elapsed.is_some_and(|elapsed| elapsed >= timeout) }
+    else { boot_elapsed >= timeout }
+}
+
+#[cfg(test)]
+mod interactive_deadline_tests {
+    use super::*;
+    #[test]
+    fn quiet_startup_and_recovery_expire_but_ready_idle_is_unbounded() {
+        let limit = Duration::from_secs(120);
+        assert!(!interactive_deadline_expired(false, limit - Duration::from_secs(1), None, limit));
+        assert!(interactive_deadline_expired(false, limit, None, limit));
+        assert!(!interactive_deadline_expired(true, limit * 2, None, limit));
+        assert!(interactive_deadline_expired(true, limit * 2, Some(limit), limit));
+    }
+}
+
 fn run_interactive_session(
     config: &Config,
     options: &SmokeOptions,
@@ -835,6 +854,7 @@ fn run_interactive_session(
     install_interactive_stop_handlers();
     let mut pointer_observed = false;
     let mut readiness_verified = false;
+    let mut recovery_started = None;
     loop {
         if INTERACTIVE_STOP_SIGNAL.load(Ordering::SeqCst) {
             stop_guest(dvm);
@@ -883,6 +903,29 @@ fn run_interactive_session(
                 layout.dvm_serial_log.display(),
             );
         }
+        let display_state = latest_display_recovery(&dvm_log).map(|record| record.state);
+        if let Some(reason) = startup_failure_detail(&rustos_log)
+            .or_else(|| dvm_display_failure(&dvm_log, options.physical_gpu_bdf.is_some()))
+        {
+            stop_guest(dvm);
+            stop_guest(rustos);
+            bail!("interactive startup failed: {reason}");
+        }
+        let recovering = readiness_verified && matches!(display_state,
+            Some(DisplayRecoveryState::Starting | DisplayRecoveryState::Recovering));
+        if recovering {
+            recovery_started.get_or_insert_with(Instant::now);
+        } else {
+            recovery_started = None;
+        }
+        let timeout = Duration::from_secs(DEFAULT_SMOKE_TIMEOUT);
+        if interactive_deadline_expired(readiness_verified, interactive_boot_started.elapsed(), recovery_started.map(|started| started.elapsed()), timeout) {
+            let reason = if recovering { "interactive display recovery timed out" } else { "interactive startup timed out" };
+            let evidence = write_kvm_failure_summary(layout, reason, interactive_boot_started.elapsed(), &rustos_log, &dvm_log, &[], &[])?;
+            stop_guest(dvm);
+            stop_guest(rustos);
+            bail!("{reason}; evidence={}", evidence.display());
+        }
         if !readiness_verified && interactive_display_ready(layout, &rustos_log, &dvm_log) {
             if let Err(error) = crate::formal_contracts::record_kvm_runtime_trace(
                 &config.root_dir,
@@ -898,10 +941,11 @@ fn run_interactive_session(
                     network: false,
                     ui_budget: false,
                     storage_only: false,
-                    enforce_deadlines: false,
+                    acceptance_artifact: false,
                 },
                 &layout.debugcon_log,
                 &layout.dvm_serial_log,
+                &layout.runtime_disk,
             ) {
                 stop_guest(dvm);
                 stop_guest(rustos);

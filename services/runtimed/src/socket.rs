@@ -26,6 +26,8 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
+use crate::runtime_transactions::Outcome;
+use runtime_control::protocol::{MAX_TRANSACTION_LIFETIME_NS, REQUEST_FLAG_QUERY};
 use runtime_control::RuntimeRunningProgram;
 use rustos_user_abi::syscall::IPC_SERVICE_UISERVER;
 
@@ -307,6 +309,29 @@ fn service_pending_clients(connections: &mut RuntimeConnections, state: &mut Bro
                     write_runtime_error(&mut client.stream, err);
                     continue;
                 }
+                let anchor = Instant::now();
+                let now_ns = match runtime_control::monotonic_nanos() {
+                    Ok(now) => now,
+                    Err(err) => {
+                        write_runtime_error(&mut client.stream, err);
+                        continue;
+                    }
+                };
+                if client.request.deadline_ns <= now_ns
+                    || client.request.deadline_ns - now_ns > MAX_TRANSACTION_LIFETIME_NS
+                {
+                    write_runtime_error(&mut client.stream, libc::ETIMEDOUT);
+                    continue;
+                }
+                let remaining = Duration::from_nanos(client.request.deadline_ns - now_ns);
+                client.deadline = client.deadline.min(anchor + remaining);
+                if matches!(
+                    client.request.op,
+                    OP_REQUEST_LAUNCH_PATH | OP_REQUEST_TERMINATE
+                ) {
+                    service_mutation(&mut client, state, now_ns);
+                    continue;
+                }
                 if client.request.op == OP_WATCH_RUNNING_PROGRAMS {
                     begin_running_program_watch(client, state, &mut connections.watchers);
                     continue;
@@ -351,9 +376,7 @@ fn begin_running_program_watch(
         // Once the response starts, a failed nonblocking write may already
         // have sent a partial header or payload. Drop the socket rather than
         // appending a second, misleading error frame.
-        let _ = write_running_programs(
-            &mut client.stream, OP_WATCH_RUNNING_PROGRAMS, &programs,
-        );
+        let _ = write_running_programs(&mut client.stream, OP_WATCH_RUNNING_PROGRAMS, &programs);
         return;
     }
 
@@ -361,7 +384,7 @@ fn begin_running_program_watch(
     watchers.push_back(RuntimeWatchClient {
         stream: client.stream,
         known_digest,
-        deadline: Instant::now() + Duration::from_millis(wait_ms),
+        deadline: (Instant::now() + Duration::from_millis(wait_ms)).min(client.deadline),
     });
 }
 
@@ -408,9 +431,7 @@ pub(super) fn service_running_program_watchers(
         answered = true;
         // The watcher owns exactly one terminal frame. A partial failed
         // write is terminal for this socket; never append an error frame.
-        let _ = write_running_programs(
-            &mut watcher.stream, OP_WATCH_RUNNING_PROGRAMS, &programs,
-        );
+        let _ = write_running_programs(&mut watcher.stream, OP_WATCH_RUNNING_PROGRAMS, &programs);
     }
     answered
 }
@@ -418,14 +439,21 @@ pub(super) fn service_running_program_watchers(
 fn read_request_progress(client: &mut PendingRuntimeClient) -> Result<RequestReadProgress, i32> {
     let request_bytes = super::util::as_bytes_mut(&mut client.request);
     while client.bytes_read < request_bytes.len() {
+        if Instant::now() >= client.deadline {
+            return Err(libc::ETIMEDOUT);
+        }
         match client.stream.read(&mut request_bytes[client.bytes_read..]) {
             Ok(0) => return Err(libc::EPIPE),
             Ok(read) => client.bytes_read += read,
             Err(err) if err.kind() == ErrorKind::WouldBlock => {
                 return Ok(RequestReadProgress::Pending);
             }
+            Err(err) if err.kind() == ErrorKind::Interrupted => continue,
             Err(err) => return Err(super::util::io_errno(err)),
         }
+    }
+    if Instant::now() >= client.deadline {
+        return Err(libc::ETIMEDOUT);
     }
     Ok(RequestReadProgress::Complete)
 }
@@ -545,11 +573,13 @@ fn dispatch_request(
     let result = match request.op {
         OP_SNAPSHOT_RUNNING_PROGRAMS => {
             response_started = true;
-            write_running_programs(stream, OP_SNAPSHOT_RUNNING_PROGRAMS,
-                &running_program_snapshot(state))
+            write_running_programs(
+                stream,
+                OP_SNAPSHOT_RUNNING_PROGRAMS,
+                &running_program_snapshot(state),
+            )
         }
-        OP_REQUEST_LAUNCH_PATH => handle_launch(stream, state, request, &mut response_started),
-        OP_REQUEST_TERMINATE => handle_terminate(stream, state, request, &mut response_started),
+
         OP_NOTIFY_READY => handle_ready(stream, state, request),
         _ => Err(libc::EINVAL),
     };
@@ -607,11 +637,82 @@ fn write_running_programs(
     Ok(())
 }
 
-fn handle_launch(
-    stream: &mut UnixStream,
+/// Record admission before invoking any side-effect, and retain the result even
+/// when sending a reply fails or the client disconnects.
+fn service_mutation(client: &mut PendingRuntimeClient, state: &mut BrokerState, now_ns: u64) {
+    let request = client.request;
+    let query = request.flags == REQUEST_FLAG_QUERY;
+    let admission = state
+        .runtime_transactions
+        .admit(client.peer.pid, request, now_ns, query);
+    let (key, mut outcome, fresh) = match admission {
+        Ok(value) => value,
+        Err(err) => {
+            write_runtime_error(&mut client.stream, err);
+            return;
+        }
+    };
+    if fresh {
+        let anchor = Instant::now();
+        let result = runtime_control::monotonic_nanos().and_then(|now| {
+            let left = request
+                .transaction_deadline_ns
+                .checked_sub(now)
+                .ok_or(libc::ETIMEDOUT)?;
+            if left == 0 {
+                return Err(libc::ETIMEDOUT);
+            }
+            let deadline = client.deadline.min(anchor + Duration::from_nanos(left));
+            if Instant::now() >= deadline {
+                return Err(libc::ETIMEDOUT);
+            }
+            if request.op == OP_REQUEST_LAUNCH_PATH {
+                let remaining_ns = u64::try_from(
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .as_nanos(),
+                )
+                .map_err(|_| libc::EOVERFLOW)?;
+                let effective_ns = now.checked_add(remaining_ns).ok_or(libc::EOVERFLOW)?;
+                begin_rpc_launch(state, request, key, deadline, effective_ns)
+            } else {
+                terminate_request(state, request, deadline)
+            }
+        });
+        if request.op == OP_REQUEST_TERMINATE || result.is_err() {
+            outcome = match result {
+                Err(libc::EOWNERDEAD) => Outcome::Unknown,
+                result => Outcome::Finished(result),
+            };
+            state.runtime_transactions.finish(key, outcome);
+        }
+    }
+    let status = match outcome {
+        Outcome::Queued => -libc::EINPROGRESS,
+        Outcome::Admitted => -libc::EALREADY,
+        Outcome::Finished(Ok(())) => 0,
+        Outcome::Finished(Err(err)) => -err,
+        Outcome::Unknown => -libc::EOWNERDEAD,
+    };
+    if Instant::now() < client.deadline {
+        let _ = super::util::write_response(
+            &mut client.stream,
+            RuntimeResponse {
+                version: PROTOCOL_VERSION,
+                op: request.op,
+                status,
+                count: 0,
+            },
+        );
+    }
+}
+
+fn begin_rpc_launch(
     state: &mut BrokerState,
     request: RuntimeRequest,
-    response_started: &mut bool,
+    key: crate::runtime_transactions::TransactionKey,
+    deadline: Instant,
+    deadline_ns: u64,
 ) -> Result<(), i32> {
     if request.target_kind != LAUNCH_TARGET_NEW_SESSION {
         return Err(libc::EOPNOTSUPP);
@@ -625,7 +726,7 @@ fn handle_launch(
     ) {
         return Err(libc::EAGAIN);
     }
-    super::spawn::spawn_tracked_process(
+    super::spawn::begin_rpc_launch(
         state,
         LaunchEntry {
             package_id: metadata.package_id,
@@ -641,30 +742,27 @@ fn handle_launch(
             env: metadata.env,
             private_smp_qualification: None,
         },
-    )?;
-    *response_started = true;
-    super::util::write_response(
-        stream,
-        RuntimeResponse {
-            version: PROTOCOL_VERSION,
-            op: OP_REQUEST_LAUNCH_PATH,
-            status: 0,
-            count: 0,
-        },
+        key,
+        deadline,
+        deadline_ns
+            .min(request.deadline_ns)
+            .min(request.transaction_deadline_ns),
     )
 }
 
-fn handle_terminate(
-    stream: &mut UnixStream,
+fn terminate_request(
     state: &mut BrokerState,
     request: RuntimeRequest,
-    response_started: &mut bool,
+    deadline: Instant,
 ) -> Result<(), i32> {
+    if Instant::now() >= deadline {
+        return Err(libc::ETIMEDOUT);
+    }
     let mut terminated = false;
     match request.target_kind {
         TERMINATE_TARGET_PID => {
             let pid = i32::try_from(request.target_value).map_err(|_| libc::EINVAL)?;
-            super::spawn::terminate_pid(pid)?;
+            super::spawn::terminate_pid(pid).map_err(|_| libc::EOWNERDEAD)?;
             terminated = true;
         }
         TERMINATE_TARGET_SESSION => {
@@ -678,22 +776,52 @@ fn handle_terminate(
                 .map(|program| program.pid)
                 .collect::<Vec<_>>();
             for pid in pids {
+                if Instant::now() >= deadline {
+                    return Err(if terminated {
+                        libc::EOWNERDEAD
+                    } else {
+                        libc::ETIMEDOUT
+                    });
+                }
                 match super::spawn::terminate_pid(pid) {
                     Ok(()) => terminated = true,
                     Err(err) if err == libc::ESRCH => {
                         if let Some(process) = state.running.remove(&pid) {
                             // Removing the record prevents the reaper from
                             // refunding it later; settle its session now.
-                            super::spawn::release_failed_session(state, Some(process.session_handle));
+                            super::spawn::release_failed_session(
+                                state,
+                                Some(process.session_handle),
+                            );
                         }
                     }
-                    Err(err) => return Err(err),
+                    Err(_) => return Err(libc::EOWNERDEAD),
                 }
             }
-            if super::spawn::close_console_session(
-                super::spawn::ensure_console_fd(state)?,
-                request.target_value,
-            )? {
+            if Instant::now() >= deadline {
+                return Err(if terminated {
+                    libc::EOWNERDEAD
+                } else {
+                    libc::ETIMEDOUT
+                });
+            }
+            let console = super::spawn::ensure_console_fd(state).map_err(|err| {
+                if terminated {
+                    libc::EOWNERDEAD
+                } else {
+                    err
+                }
+            })?;
+            if Instant::now() >= deadline {
+                return Err(if terminated {
+                    libc::EOWNERDEAD
+                } else {
+                    libc::ETIMEDOUT
+                });
+            }
+            if super::spawn::close_console_session(console, request.target_value)
+                .map_err(|_| libc::EOWNERDEAD)?
+            {
                 state.session_runtime.remove_session(request.target_value);
                 super::session::clear_focused_session_if(state, request.target_value);
                 terminated = true;
@@ -706,16 +834,7 @@ fn handle_terminate(
         return Err(libc::ESRCH);
     }
 
-    *response_started = true;
-    super::util::write_response(
-        stream,
-        RuntimeResponse {
-            version: PROTOCOL_VERSION,
-            op: OP_REQUEST_TERMINATE,
-            status: 0,
-            count: 0,
-        },
-    )
+    Ok(())
 }
 
 fn handle_ready(
@@ -737,7 +856,9 @@ fn handle_ready(
     // A client that already gave up (closed the stream) loses only the ack:
     // the edge is recorded, and its retry is a no-op.
     if let Err(errno) = super::util::write_response(stream, ready_ack()) {
-        boot_line(&format!("runtimed: ui ready ack not delivered errno={errno}"));
+        boot_line(&format!(
+            "runtimed: ui ready ack not delivered errno={errno}"
+        ));
     }
     Ok(())
 }
@@ -956,21 +1077,55 @@ mod tests {
 
     use super::{
         bind_listener, dispatch_request, handle_ready, launch_may_precede_ui_ready,
-        launch_retry_backoff, read_request_progress,
-        runtime_request_role_authorized, PendingRuntimeClient, RequestReadProgress,
-        AcceptedClient, RuntimeConnections, RuntimePeerCredentials, OP_NOTIFY_READY, OP_REQUEST_LAUNCH_PATH,
-        OP_REQUEST_TERMINATE, OP_SNAPSHOT_RUNNING_PROGRAMS, OP_WATCH_RUNNING_PROGRAMS,
+        launch_retry_backoff, read_request_progress, runtime_request_role_authorized,
+        AcceptedClient, PendingRuntimeClient, RequestReadProgress, RuntimeConnections,
+        RuntimePeerCredentials, OP_NOTIFY_READY, OP_REQUEST_LAUNCH_PATH, OP_REQUEST_TERMINATE,
+        OP_SNAPSHOT_RUNNING_PROGRAMS, OP_WATCH_RUNNING_PROGRAMS,
     };
     use crate::kvm_smp_qualification::{
         inject_kvm_smp_qualification_launch, KvmSmpQualificationContract,
     };
     use crate::{
         BrokerState, LaunchEntry, RunningProcess, RuntimeRequest, RuntimeResponse,
-        MAX_PENDING_RUNTIME_CLIENTS,
-        DEFAULT_USER_TASK_WEIGHT_MICROS, PROTOCOL_VERSION, READY_COMPONENT_UI_SERVER,
-        MAX_LAUNCH_RETRY_BACKOFF, RETRY_BACKOFF, SERVICE_REQUEST_TIMEOUT,
+        DEFAULT_USER_TASK_WEIGHT_MICROS, MAX_LAUNCH_RETRY_BACKOFF, MAX_PENDING_RUNTIME_CLIENTS,
+        PROTOCOL_VERSION, READY_COMPONENT_UI_SERVER, RETRY_BACKOFF, SERVICE_REQUEST_TIMEOUT,
         STORAGE_NOT_READY_RETRY_BACKOFF, UI_SERVER_EXEC_PATH,
     };
+
+    #[test]
+    fn failed_mutation_reply_keeps_the_terminal_outcome_for_query() {
+        let mut state = BrokerState::default();
+        let now = runtime_control::monotonic_nanos().unwrap();
+        let request = RuntimeRequest {
+            op: OP_REQUEST_TERMINATE,
+            target_kind: crate::TERMINATE_TARGET_PID,
+            target_value: u64::MAX,
+            transaction_id_hi: now,
+            transaction_id_lo: 1,
+            transaction_deadline_ns: now + 1_000_000_000,
+            deadline_ns: now + 1_000_000_000,
+            ..RuntimeRequest::default()
+        };
+        let (stream, peer) = UnixStream::pair().unwrap();
+        drop(peer);
+        let mut client = PendingRuntimeClient {
+            stream,
+            peer: RuntimePeerCredentials { pid: 42 },
+            request,
+            bytes_read: 0,
+            deadline: Instant::now() + Duration::from_secs(1),
+        };
+        super::service_mutation(&mut client, &mut state, now);
+        let (_, outcome, fresh) = state
+            .runtime_transactions
+            .admit(42, request, now + 1, true)
+            .unwrap();
+        assert_eq!(
+            outcome,
+            crate::runtime_transactions::Outcome::Finished(Err(libc::EINVAL))
+        );
+        assert!(!fresh);
+    }
 
     #[test]
     fn malformed_listener_path_is_rejected_before_opening_any_socket() {
@@ -982,13 +1137,13 @@ mod tests {
         let (mut stream, _peer) = UnixStream::pair().expect("socket pair");
         let mut state = BrokerState::default();
         let denied = RuntimeRequest {
-            op: OP_REQUEST_LAUNCH_PATH,
+            op: 0,
             target_kind: 0,
             ..RuntimeRequest::default()
         };
         assert_eq!(
             dispatch_request(&mut stream, denied, &mut state),
-            Err((libc::EOPNOTSUPP, false)),
+            Err((libc::EINVAL, false)),
             "policy rejection must still receive a terminal error envelope",
         );
         // Snapshot begins writing immediately. A disconnected peer is used
@@ -999,17 +1154,29 @@ mod tests {
             ..RuntimeRequest::default()
         };
         assert!(
-            matches!(dispatch_request(&mut stream, snapshot, &mut state), Err((_, true))),
+            matches!(
+                dispatch_request(&mut stream, snapshot, &mut state),
+                Err((_, true))
+            ),
             "write failure must never trigger a second reply frame",
         );
     }
 
     #[test]
     fn vanished_session_process_is_refunded_before_its_reaper_record_is_lost() {
-        let source = include_str!("socket.rs").split("#[cfg(test)]").next().unwrap();
-        let missing = source.split_once("Err(err) if err == libc::ESRCH => {").unwrap().1;
-        let removed = missing.find("state.running.remove(&pid)").unwrap();
-        let refunded = missing.find("release_failed_session(state, Some(process.session_handle))").unwrap();
+        let source = include_str!("socket.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        let missing = source
+            .split_once("Err(err) if err == libc::ESRCH => {")
+            .unwrap()
+            .1;
+        let compact: String = missing.chars().filter(|ch| !ch.is_whitespace()).collect();
+        let removed = compact.find("state.running.remove(&pid)").unwrap();
+        let refunded = compact
+            .find("release_failed_session(state,Some(process.session_handle),)")
+            .unwrap();
         assert!(removed < refunded);
     }
 

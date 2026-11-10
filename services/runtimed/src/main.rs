@@ -17,16 +17,15 @@ pub(crate) use runtime_control::protocol::{
 };
 use rustos_user_abi::console as console_abi;
 use rustos_user_abi::performance::IPC_CONTROL_DRAIN_BUDGET;
-use rustos_user_abi::syscall::{
-    SYS_RUSTOS_SCHED_DEMOTE_SELF, TASK_WEIGHT_INTERACTIVE_FLAG,
-};
+use rustos_user_abi::syscall::{SYS_RUSTOS_SCHED_DEMOTE_SELF, TASK_WEIGHT_INTERACTIVE_FLAG};
 
 mod catalog;
+mod heartbeat;
+mod image_probe;
 mod kvm_smp_qualification;
 mod launch_worker;
-mod image_probe;
-mod heartbeat;
 mod offload;
+mod runtime_transactions;
 mod session;
 mod socket;
 mod spawn;
@@ -161,6 +160,7 @@ pub(crate) struct BrokerState {
     pub(crate) launch_worker: Option<launch_worker::LaunchWorker>,
     pub(crate) launch_worker_retry_at: Option<Instant>,
     pub(crate) launch_in_flight: Option<spawn::InFlightLaunch>,
+    pub(crate) runtime_transactions: runtime_transactions::Transactions,
     /// The private qualification contract read, which reaches DVM-volume
     /// storage and took 104 ms on the loop.
     pub(crate) qualification_load: Option<
@@ -209,6 +209,7 @@ impl Default for BrokerState {
             launch_worker: launch_worker::start(spawn::launch_calls()),
             launch_worker_retry_at: None,
             launch_in_flight: None,
+            runtime_transactions: runtime_transactions::Transactions::default(),
             launch_catalog_load: offload::Offload::start(
                 "runtimed-launch-catalog",
                 catalog::load_launch_catalog_off_loop,
@@ -248,7 +249,9 @@ fn main() {
         Err(err) => {
             // This failure exits the process before session endpoint publication.
             // Initd only sees ESRCH; keep the actual cause on unconditional debugcon.
-            spawn::debug_line(&format!("runtimed: fatal runtime socket bind failed errno={err}"));
+            spawn::debug_line(&format!(
+                "runtimed: fatal runtime socket bind failed errno={err}"
+            ));
             observability_client::error!(
                 "runtimed",
                 service,
@@ -275,8 +278,12 @@ fn main() {
     let mut runtime_connections = match socket::RuntimeConnections::with_acceptor(listener) {
         Ok(connections) => connections,
         Err(errno) => {
-            spawn::debug_line(&format!("runtimed: fatal control acceptor thread failed errno={errno}"));
-            boot_line(&format!("runtimed: fatal control acceptor thread failed errno={errno}"));
+            spawn::debug_line(&format!(
+                "runtimed: fatal control acceptor thread failed errno={errno}"
+            ));
+            boot_line(&format!(
+                "runtimed: fatal control acceptor thread failed errno={errno}"
+            ));
             return;
         }
     };
@@ -606,8 +613,12 @@ fn require_post_ui_user_class() {
         spawn::debug_line("runtimed: post-ui scheduling class=user");
         return;
     }
-    let errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EPERM);
-    spawn::debug_line(&format!("runtimed: fatal post-ui scheduling demotion failed errno={errno}"));
+    let errno = std::io::Error::last_os_error()
+        .raw_os_error()
+        .unwrap_or(libc::EPERM);
+    spawn::debug_line(&format!(
+        "runtimed: fatal post-ui scheduling demotion failed errno={errno}"
+    ));
     std::process::exit(134);
 }
 

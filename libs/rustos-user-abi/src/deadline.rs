@@ -37,6 +37,31 @@ pub const fn reply_observation_allows_publication(
     !expired_before_take && !expired_after_take
 }
 
+/// A monotonic clock read failed; this is not a timestamp or deadline expiry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MonotonicClockError {
+    Syscall(i64),
+    InvalidTimespec,
+    Overflow,
+}
+
+/// Decode a successful CLOCK_MONOTONIC read without fabricating time on error.
+pub const fn checked_monotonic_nanos(
+    seconds: i64,
+    nanos: i64,
+) -> Result<u64, MonotonicClockError> {
+    if seconds < 0 || nanos < 0 || nanos >= NANOS_PER_SEC as i64 {
+        return Err(MonotonicClockError::InvalidTimespec);
+    }
+    match (seconds as u64).checked_mul(NANOS_PER_SEC) {
+        Some(base) => match base.checked_add(nanos as u64) {
+            Some(value) => Ok(value),
+            None => Err(MonotonicClockError::Overflow),
+        },
+        None => Err(MonotonicClockError::Overflow),
+    }
+}
+
 /// The transaction budget is exhausted. Callers fail closed; they do not retry.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DeadlineExpired;
@@ -108,6 +133,10 @@ impl AbsoluteDeadline {
     /// This is the whole point of the type. A nested call that starts its own
     /// full timeout can outlive the transaction that authorized it.
     pub const fn child_timeout_ns(&self, now_ns: u64, cap_ns: u64) -> Result<u64, DeadlineExpired> {
+        // Zero is "unbounded" in several syscall ABIs, never a child lease.
+        if cap_ns == 0 {
+            return Err(DeadlineExpired);
+        }
         match self.remaining_ns(now_ns) {
             None => Err(DeadlineExpired),
             Some(remaining) if remaining < cap_ns => Ok(remaining),
@@ -148,6 +177,19 @@ mod tests {
     const MS: u64 = NANOS_PER_MILLI;
 
     #[test]
+    fn clock_failure_and_malformed_time_never_become_zero_time() {
+        assert_eq!(checked_monotonic_nanos(0, 0), Ok(0));
+        assert_eq!(checked_monotonic_nanos(7, 42), Ok(7_000_000_042));
+        for (seconds, nanos) in [(-1, 0), (0, -1), (0, 1_000_000_000)] {
+            assert_eq!(checked_monotonic_nanos(seconds, nanos), Err(MonotonicClockError::InvalidTimespec));
+        }
+        assert_eq!(checked_monotonic_nanos(i64::MAX, 0), Err(MonotonicClockError::Overflow));
+        let limit = (u64::MAX / NANOS_PER_SEC) as i64;
+        assert_eq!(checked_monotonic_nanos(limit, (u64::MAX % NANOS_PER_SEC) as i64), Ok(u64::MAX));
+        assert_eq!(checked_monotonic_nanos(limit, (u64::MAX % NANOS_PER_SEC) as i64 + 1), Err(MonotonicClockError::Overflow));
+    }
+
+    #[test]
     fn a_child_call_never_outlives_the_transaction_that_authorized_it() {
         // The V5-DEADLINE-012 counterexample: a 5 s budget, a 100 ms per-call
         // cap, and only a few ms left.
@@ -173,6 +215,8 @@ mod tests {
         assert_eq!(deadline.child_timeout_ns(1_500, 100), Err(DeadlineExpired));
         assert_eq!(deadline.child_timeout_ms(1_500, 100), Err(DeadlineExpired));
         assert_eq!(deadline.retry_backoff_ns(1_500, 100), Err(DeadlineExpired));
+        assert_eq!(deadline.child_timeout_ns(1_000, 0), Err(DeadlineExpired));
+        assert_eq!(deadline.child_timeout_ms(1_000, 0), Err(DeadlineExpired));
     }
 
     #[test]

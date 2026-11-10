@@ -101,8 +101,9 @@ if [[ "$(rg -Fc 'control_drain::drain_rootd_control_requests' "$rootd")" -ne 2 ]
     echo "rootd early and steady-state loops must share the bounded control drain" >&2
     exit 1
 fi
-rg -Fq '&& served == 0' "$rootd" || {
-    echo "rootd can sleep through an already-progressing boot control burst" >&2
+rg -Fq 'bootstrap_idle_boundary(' "$rootd" \
+    && rg -Fq 'if served == 0 {' "$rootd" || {
+    echo "rootd lost its tested progress-aware bootstrap idle boundary" >&2
     exit 1
 }
 rg -Fq 'ROOTD_SUPERVISOR_IDLE_POLL_MS: u64 = 10' "$performance" || {
@@ -377,7 +378,7 @@ for witness in \
     'const OWNER_WAIT_ARMED_BIT:' \
     '.with_runnable(false)' \
     '.with_wait(false, observed.wait_reason_kind)'; do
-    rg -Fq "$witness" kernel/ps/src/multitask/scheduler/runqueue.rs || {
+    rg -Fq "$witness" kernel/ps/src/multitask/scheduler/runqueue/ownership.rs || {
         echo "scheduler atomic owner/wait commit witness missing: $witness" >&2
         exit 1
     }

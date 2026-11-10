@@ -174,7 +174,21 @@ fn start_supervisor_heartbeat()->Result<(),std::io::Error>{
         }).map(|_|())
 }
 
+/// Clip a child operation to its parent's absolute deadline without rounding up.
+fn startup_timeout_ms(deadline: Option<Instant>, cap_ms: u64, now: Instant) -> Result<u64, i32> {
+    let remaining = deadline.map(|end| end.saturating_duration_since(now).as_millis())
+        .unwrap_or(u128::from(cap_ms));
+    let timeout = remaining.min(u128::from(cap_ms)) as u64;
+    if timeout == 0 { Err(libc::ETIMEDOUT) } else { Ok(timeout) }
+}
+
+fn startup_unadmitted<'a>(entries: &'a [StartupLaunchEntry], admitted: &BTreeSet<String>) -> Option<&'a StartupLaunchEntry> {
+    entries.iter().find(|entry| !admitted.contains(&entry.package_id))
+}
+
 fn main() {
+    // Functional ceiling is distinct from the 10-second product SLO.
+    let startup_deadline = Instant::now() + Duration::from_secs(120);
     boot_line("initd: main enter");
     if let Err(errno) = publish_init_identity() {
         boot_line(format!("initd: identity publication failed errno={errno}").as_str());
@@ -197,6 +211,7 @@ fn main() {
             0_u64,
         )
     };
+    let mut initially_admitted = BTreeSet::<String>::new();
     let load_started = Instant::now();
     boot_line("initd: load entries begin");
     let startup_entries = load_init_entries();
@@ -221,10 +236,21 @@ fn main() {
     let mut defer_secondary_services_until = None::<Instant>;
     let mut next_rootd_lease_reconciliation = Instant::now();
     let mut initial_lease_reconciliation = true;
+    let mut startup_complete = false;
 
     loop {
         reap_children(&mut running, &mut retry_state);
-        update_recovery.poll(Instant::now());
+        if !startup_complete && startup_unadmitted(&startup_entries, &initially_admitted).is_none() {
+            startup_complete = true;
+            boot_line("initd: startup admission complete");
+        }
+        if !startup_complete && Instant::now() >= startup_deadline {
+            let entry = startup_unadmitted(&startup_entries, &initially_admitted).unwrap();
+            let pids = running.keys().copied().collect::<Vec<_>>();
+            fail_closed_after_children_cleanup(&pids, &format!("initd: fatal startup timeout v=1 phase=admission exec={} package={} errno={}", entry.exec, entry.package_id, libc::ETIMEDOUT));
+        }
+        let parent_deadline = (!startup_complete).then_some(startup_deadline);
+        update_recovery.poll(Instant::now(), parent_deadline);
 
         let now = Instant::now();
         if now >= next_rootd_lease_reconciliation {
@@ -236,7 +262,7 @@ fn main() {
                 &mut running,
                 &mut launched_once_packages,
                 &mut retry_state,
-                now,
+                now, parent_deadline, &mut initially_admitted,
             );
             if initial_lease_reconciliation {
                 boot_line(&format!(
@@ -281,12 +307,14 @@ fn main() {
                         &mut ready_packages,
                         &mut launched_once_packages,
                         &mut defer_secondary_services_until,
+                        parent_deadline, &mut initially_admitted,
                     );
                 }
                 settle_bootstrap_endpoint_barrier(
                     &mut running,
                     &mut ready_packages,
                     &mut launched_once_packages,
+                    parent_deadline, &mut initially_admitted,
                 );
             }
             if !launch_gate_satisfied(entry.exec.as_str(), &running) {
@@ -339,9 +367,11 @@ fn main() {
                     &mut ready_packages,
                     &mut launched_once_packages,
                     &mut defer_secondary_services_until,
+                    parent_deadline, &mut initially_admitted,
                 );
             }
-            match spawn_exec(entry.exec.as_str(), &init_env) {
+            let entry_deadline = parent_deadline;
+            match spawn_exec(entry.exec.as_str(), &init_env, entry_deadline) {
                 Ok(pid) => {
                     running.insert(
                         pid,
@@ -357,7 +387,10 @@ fn main() {
                         retry.note_spawned(Instant::now());
                     }
                     pending_activations.push(pid);
-                    if let Err(err) = report_rootd_service_lease(entry.exec.as_str(), pid) {
+                    if let Err(err) = report_rootd_service_lease(entry.exec.as_str(), pid, entry_deadline) {
+                        if entry_deadline.is_some() {
+                            fail_closed_after_children_cleanup(&pending_activations, &format!("initd: fatal startup failure v=1 phase=lease-report exec={} pid={pid} errno={err}", entry.exec));
+                        }
                         fail_closed_after_children_cleanup(
                             &pending_activations,
                             &format!(
@@ -383,12 +416,17 @@ fn main() {
                             &mut ready_packages,
                             &mut launched_once_packages,
                             &mut defer_secondary_services_until,
+                            parent_deadline, &mut initially_admitted,
                         );
                     }
                     launched_this_round = true;
                     continue;
                 }
                 Err(err) => {
+                    if entry_deadline.is_some_and(|end| Instant::now() >= end) {
+                        let pids = running.keys().copied().collect::<Vec<_>>();
+                        fail_closed_after_children_cleanup(&pids, &format!("initd: fatal startup timeout v=1 phase=spawn exec={} errno={}", entry.exec, libc::ETIMEDOUT));
+                    }
                     observability_client::error!(
                         "initd",
                         service,
@@ -406,6 +444,7 @@ fn main() {
             &mut ready_packages,
             &mut launched_once_packages,
             &mut defer_secondary_services_until,
+            parent_deadline, &mut initially_admitted,
         );
         if launched_this_round {
             thread::yield_now();
@@ -461,17 +500,10 @@ fn secondary_service_deferred(exec: &str, now: Instant, deadline: Option<Instant
 fn load_init_entries() -> Vec<StartupLaunchEntry> {
     let entries = match load_startup_entries(DEFAULT_STARTUP_REGISTRY_PATH) {
         Ok(entries) => entries,
-        Err(err) => {
-            observability_client::warn!(
-                "initd",
-                service,
-                "startup registry unavailable path={} kind={:?} errno={:?}",
-                DEFAULT_STARTUP_REGISTRY_PATH,
-                err.kind(),
-                err.raw_os_error()
-            );
-            return Vec::new();
-        }
+        Err(err) => fail_closed(&format!(
+            "initd: fatal startup failure v=1 phase=registry path={} errno={}",
+            DEFAULT_STARTUP_REGISTRY_PATH, err.raw_os_error().unwrap_or(libc::EIO)
+        ))
     };
 
     let mut launch_entries = entries
@@ -535,6 +567,8 @@ fn settle_bootstrap_endpoint_barrier(
     running: &mut BTreeMap<i32, RunningService>,
     ready_packages: &mut BTreeSet<String>,
     launched_once_packages: &mut BTreeSet<String>,
+    startup_deadline: Option<Instant>,
+    initially_admitted: &mut BTreeSet<String>,
 ) {
     let pending = running
         .iter()
@@ -544,7 +578,7 @@ fn settle_bootstrap_endpoint_barrier(
         .map(|(pid, _)| *pid)
         .collect::<Vec<_>>();
     for pid in pending {
-        admit_running_service_endpoint(running, ready_packages, launched_once_packages, pid);
+        admit_running_service_endpoint(running, ready_packages, launched_once_packages, pid, startup_deadline, initially_admitted);
     }
 }
 
@@ -553,6 +587,8 @@ fn admit_running_service_endpoint(
     ready_packages: &mut BTreeSet<String>,
     launched_once_packages: &mut BTreeSet<String>,
     pid: i32,
+    startup_deadline: Option<Instant>,
+    initially_admitted: &mut BTreeSet<String>,
 ) {
     let (exec, package_id, restart) = running
         .get(&pid)
@@ -564,7 +600,8 @@ fn admit_running_service_endpoint(
             )
         })
         .unwrap_or_else(|| fail_closed(&format!("initd: endpoint barrier lost pid={pid}")));
-    if let Err(failure) = wait_reported_service_endpoint(exec.as_str(), pid) {
+    let deadline = startup_deadline;
+    if let Err(failure) = wait_reported_service_endpoint(exec.as_str(), pid, deadline) {
         fail_closed_after_child_cleanup(
             pid,
             &format!(
@@ -580,6 +617,7 @@ fn admit_running_service_endpoint(
         .get_mut(&pid)
         .unwrap_or_else(|| fail_closed(&format!("initd: endpoint admission lost pid={pid}")));
     service.endpoint_ready = true;
+    initially_admitted.insert(package_id.clone());
     ready_packages.insert(package_id.clone());
     if !restart {
         launched_once_packages.insert(package_id);
@@ -654,7 +692,7 @@ fn classify_service_ready_status(status: i64) -> Result<bool, i32> {
     Err(libc::EPROTO)
 }
 
-fn report_rootd_service_lease(exec_path: &str, pid: i32) -> Result<(), i32> {
+fn report_rootd_service_lease(exec_path: &str, pid: i32, deadline: Option<Instant>) -> Result<(), i32> {
     let Some(service_id) = rootd_service_id_for_exec(exec_path) else {
         return Ok(());
     };
@@ -678,7 +716,7 @@ fn report_rootd_service_lease(exec_path: &str, pid: i32) -> Result<(), i32> {
                 ));
             }
         }
-        match report_rootd_service_lease_inner(service_id, exec_path, pid as u64) {
+        match report_rootd_service_lease_inner(service_id, exec_path, pid as u64, startup_timeout_ms(deadline, IPC_BOOT_CONTROL_HARD_LIMIT_MS, Instant::now())?) {
             Ok(()) => {
                 boot_line(&format!(
                     "initd: rootd lease report success exec={} pid={pid} attempt={attempt}",
@@ -715,10 +753,14 @@ fn report_rootd_service_lease(exec_path: &str, pid: i32) -> Result<(), i32> {
 fn wait_reported_service_endpoint(
     exec_path: &str,
     pid: i32,
+    deadline: Option<Instant>,
 ) -> Result<(), endpoint_admission::Failure> {
     use endpoint_admission::{EndpointAdmission, Step};
     let started = Instant::now();
-    let mut admission = EndpointAdmission::new();
+    let budget_ms = deadline.map(|end| u64::try_from(end.saturating_duration_since(started).as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(endpoint_admission::ENDPOINT_ADMISSION_BUDGET_MS)
+        .min(endpoint_admission::ENDPOINT_ADMISSION_BUDGET_MS);
+    let mut admission = EndpointAdmission::clipped(budget_ms);
     let mut step = admission.start();
     loop {
         let (timeout_ms, pause_ms) = match step {
@@ -732,7 +774,12 @@ fn wait_reported_service_endpoint(
         if pause_ms != 0 {
             std::thread::sleep(Duration::from_millis(pause_ms));
         }
-        let result = wait_reported_service_endpoint_with_timeout(exec_path, pid, timeout_ms);
+        // Account for pauses and scheduling delay before every syscall.
+        let elapsed = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let remaining = budget_ms.saturating_sub(elapsed);
+        let result = if remaining == 0 { Err(libc::ETIMEDOUT) } else {
+            wait_reported_service_endpoint_with_timeout(exec_path, pid, timeout_ms.min(remaining))
+        };
         let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
         if let Err(errno) = result {
             if errno == libc::ETIMEDOUT {
@@ -811,7 +858,7 @@ fn rootd_post_init_lease_query(service_id: u64, timeout_ms: u64) -> Result<(u64,
     ).map_err(|_| libc::EINVAL)
 }
 
-fn reclaim_rootd_post_init_lease(service_id: u64, pid: u64) -> Result<(), i32> {
+fn reclaim_rootd_post_init_lease(service_id: u64, pid: u64, deadline: Option<Instant>) -> Result<(), i32> {
     if service_id == 0 || pid == 0 {
         return Err(libc::EINVAL);
     }
@@ -829,7 +876,7 @@ fn reclaim_rootd_post_init_lease(service_id: u64, pid: u64) -> Result<(), i32> {
         COMMERCIAL_MAX_ROOTD_OP_POST_INIT_LEASE_RECLAIM_IDL,
         0,
         0,
-        IPC_BOOT_CONTROL_HARD_LIMIT_MS,
+        startup_timeout_ms(deadline, IPC_BOOT_CONTROL_HARD_LIMIT_MS, Instant::now())?,
         &frame,
     )?;
     if response.value0 != 0 || response.value1 != 0 {
@@ -901,7 +948,7 @@ fn rootd_exec_for_service_id(service_id: u64) -> Option<&'static str> {
     rustos_component_model::service_catalog::initd_owned_exec_for_id(service_id)
 }
 
-fn report_rootd_service_lease_inner(service_id: u64, exec_path: &str, pid: u64) -> Result<(), i32> {
+fn report_rootd_service_lease_inner(service_id: u64, exec_path: &str, pid: u64, timeout_ms: u64) -> Result<(), i32> {
     let endpoint = lookup_service_endpoint(IPC_SERVICE_ROOTD)?;
     let mut request = CommercialMaxProtocolRequest::default();
     request.header.version = COMMERCIAL_MAX_PROTOCOL_ABI_VERSION;
@@ -929,7 +976,7 @@ fn report_rootd_service_lease_inner(service_id: u64, exec_path: &str, pid: u64) 
             size_of::<CommercialMaxProtocolRequest>() as u64,
             (&mut response as *mut CommercialMaxProtocolResponse) as u64,
             size_of::<CommercialMaxProtocolResponse>() as u64,
-            IPC_BOOT_CONTROL_HARD_LIMIT_MS,
+            timeout_ms,
         )
     };
     if call < 0 {
@@ -1106,22 +1153,22 @@ fn fail_closed_after_children_cleanup(pids: &[i32], message: &str) -> ! {
     fail_closed(message)
 }
 
-fn spawn_exec(exec_path: &str, env: &[CString]) -> Result<i32, i32> {
+fn spawn_exec(exec_path: &str, env: &[CString], deadline: Option<Instant>) -> Result<i32, i32> {
     boot_line(&format!("initd: spawn begin exec={exec_path}"));
     if service_ready(IPC_SERVICE_LOADERD) {
-        return spawn_exec_via_loaderd(exec_path, env);
+        return spawn_exec_via_loaderd(exec_path, env, deadline);
     }
 
     Err(libc::EAGAIN)
 }
 
-fn spawn_exec_via_loaderd(exec_path: &str, env: &[CString]) -> Result<i32, i32> {
+fn spawn_exec_via_loaderd(exec_path: &str, env: &[CString], deadline: Option<Instant>) -> Result<i32, i32> {
     let argv = [CString::new(exec_path).map_err(|_| libc::EINVAL)?];
-    let mut request = build_loader_spawn_request(exec_path, &argv, env)?;
+    let mut request = build_loader_spawn_request(exec_path, &argv, env, deadline)?;
     let endpoint = lookup_loader_endpoint()?;
     boot_line(&format!("initd: loader call begin exec={exec_path} endpoint={endpoint}"));
     request.deadline_ns = rustos_svc_runtime::syscall::monotonic_nanos()
-        .saturating_add(IPC_BOOT_CONTROL_HARD_LIMIT_MS * 1_000_000);
+        .saturating_add(startup_timeout_ms(deadline, IPC_BOOT_CONTROL_HARD_LIMIT_MS, Instant::now())? * 1_000_000);
     let response: LoaderSpawnResponse = match rustos_svc_runtime::loader_client::call(endpoint as u64, &request, None) {
         Ok(response) => response,
         Err(errno) => { LOADER_ENDPOINT_CACHE.store(0, Ordering::Relaxed); return Err(errno); }
@@ -1149,6 +1196,7 @@ fn build_loader_spawn_request(
     exec_path: &str,
     argv: &[CString],
     env: &[CString],
+    deadline: Option<Instant>,
 ) -> Result<LoaderSpawnRequest, i32> {
     let canonical_exec_path = if exec_path.starts_with('/') {
         exec_path.to_owned()
@@ -1172,7 +1220,7 @@ fn build_loader_spawn_request(
         argv_count: u16::try_from(argv.len()).map_err(|_| libc::E2BIG)?,
         env_count: u16::try_from(env.len()).map_err(|_| libc::E2BIG)?,
         requester_pid: u64::from(std::process::id()),
-        scheduling_context: request_scheduling_context_authority(canonical_exec_path.as_str())?,
+        scheduling_context: request_scheduling_context_authority(canonical_exec_path.as_str(), deadline)?,
         ..LoaderSpawnRequest::default()
     };
     request.exec_path[..exec_bytes.len()].copy_from_slice(exec_bytes);
@@ -1274,6 +1322,21 @@ mod tests {
         classify_service_ready_status, cleanup_spawned_service, endpoint_wait_args,
         exec_weight_micros,
     };
+
+    #[test]
+    fn startup_deadline_clips_operations_and_detects_unlaunched_dependency() {
+        use std::collections::BTreeSet;
+        use std::time::{Duration, Instant};
+        let now = Instant::now();
+        let deadline = now + Duration::from_millis(600);
+        assert_eq!(super::startup_timeout_ms(Some(deadline), 5_000, now), Ok(600));
+        assert_eq!(super::startup_timeout_ms(Some(deadline), 5_000, deadline), Err(libc::ETIMEDOUT));
+        let entries = vec![super::StartupLaunchEntry { package_id: "missing".into(), exec: "services/missing".into(), runtime_deps: vec!["never-ready".into()], restart: true }];
+        let mut admitted = BTreeSet::new();
+        assert_eq!(super::startup_unadmitted(&entries, &admitted).unwrap().package_id, "missing");
+        admitted.insert("missing".into());
+        assert!(super::startup_unadmitted(&entries, &admitted).is_none());
+    }
 
     #[test]
     fn libc_errno_is_not_misreported_as_eperm_at_the_readiness_or_rpc_boundary() {

@@ -22,18 +22,18 @@ use std::time::Instant;
 
 use rustos_user_abi::performance::IPC_BOOT_CONTROL_HARD_LIMIT_MS;
 use rustos_user_abi::syscall::{
-    LOADER_ACTIVATE_BATCH_ABI_VERSION, LOADER_ACTIVATE_BATCH_MAX_TARGETS, LOADER_OP_ACTIVATE_BATCH,
-    LoaderActivateBatchRequest, LoaderActivateBatchResponse, SYS_RUSTOS_IPC_CALL_BOUNDED,
+    LoaderActivateBatchRequest, LoaderActivateBatchResponse, LOADER_ACTIVATE_BATCH_ABI_VERSION,
+    LOADER_ACTIVATE_BATCH_MAX_TARGETS, LOADER_OP_ACTIVATE_BATCH, SYS_RUSTOS_IPC_CALL_BOUNDED,
 };
 
 use super::bootstrap_barrier::endpoint_admission_may_overlap;
 use super::{
-    LOADER_ENDPOINT_CACHE, RUNTIMED_EXEC_PATH, RunningService,
-    SECONDARY_SERVICE_DEFER_AFTER_RUNTIMED, admit_running_service_endpoint, boot_line, fail_closed,
-    fail_closed_after_children_cleanup, lookup_loader_endpoint,
+    admit_running_service_endpoint, boot_line, fail_closed, fail_closed_after_children_cleanup,
+    lookup_loader_endpoint, RunningService, LOADER_ENDPOINT_CACHE, RUNTIMED_EXEC_PATH,
+    SECONDARY_SERVICE_DEFER_AFTER_RUNTIMED,
 };
 
-fn activate_spawned_services(pids: &[i32]) -> Result<(), i32> {
+fn activate_spawned_services(pids: &[i32], deadline: Option<Instant>) -> Result<(), i32> {
     let request = activation_batch_request(pids)?;
     let endpoint = lookup_loader_endpoint()?;
     let mut response = LoaderActivateBatchResponse::default();
@@ -47,7 +47,7 @@ fn activate_spawned_services(pids: &[i32]) -> Result<(), i32> {
             size_of::<LoaderActivateBatchRequest>() as u64,
             (&mut response as *mut LoaderActivateBatchResponse) as u64,
             size_of::<LoaderActivateBatchResponse>() as u64,
-            IPC_BOOT_CONTROL_HARD_LIMIT_MS,
+            super::startup_timeout_ms(deadline, IPC_BOOT_CONTROL_HARD_LIMIT_MS, Instant::now())?,
         ) as i64
     };
     if call < 0 {
@@ -100,11 +100,23 @@ pub(super) fn activate_pending_services(
     ready_packages: &mut BTreeSet<String>,
     launched_once_packages: &mut BTreeSet<String>,
     defer_secondary_services_until: &mut Option<Instant>,
+    startup_deadline: Option<Instant>,
+    initially_admitted: &mut BTreeSet<String>,
 ) {
     if pending.is_empty() {
         return;
     }
-    if let Err(errno) = activate_spawned_services(pending) {
+    let deadline = startup_deadline;
+    if let Err(errno) = activate_spawned_services(pending, deadline) {
+        if deadline.is_some() {
+            fail_closed_after_children_cleanup(
+                pending,
+                &format!(
+                    "initd: fatal startup failure v=1 phase=activation count={} errno={errno}",
+                    pending.len()
+                ),
+            );
+        }
         fail_closed_after_children_cleanup(
             pending,
             &format!(
@@ -128,7 +140,14 @@ pub(super) fn activate_pending_services(
                 "initd: endpoint barrier pending exec={exec} pid={pid}"
             ));
         } else {
-            admit_running_service_endpoint(running, ready_packages, launched_once_packages, pid);
+            admit_running_service_endpoint(
+                running,
+                ready_packages,
+                launched_once_packages,
+                pid,
+                startup_deadline,
+                initially_admitted,
+            );
         }
         if exec == RUNTIMED_EXEC_PATH && !SECONDARY_SERVICE_DEFER_AFTER_RUNTIMED.is_zero() {
             *defer_secondary_services_until =

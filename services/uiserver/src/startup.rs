@@ -145,7 +145,7 @@ impl RetryPolicy {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DepState {
-    /// Nothing has started. The budget clock has not started either.
+    /// Nothing has started; the startup epoch still bounds this state.
     Pending,
     Attempting {
         attempt: u32,
@@ -202,8 +202,6 @@ pub(crate) enum Next {
 #[derive(Clone, Copy, Debug)]
 struct Slot {
     state: DepState,
-    /// When the first attempt began. The total budget is measured from here.
-    first_begin: Option<Duration>,
     attempts: u32,
 }
 
@@ -224,7 +222,6 @@ impl StartupMachine {
         Self {
             slots: [Slot {
                 state: DepState::Pending,
-                first_begin: None,
                 attempts: 0,
             }; 6],
             generation: 0,
@@ -250,14 +247,20 @@ impl StartupMachine {
     /// Start (or restart after a backoff) one attempt. Returns the attempt
     /// number, or `None` when the dependency is already terminal.
     pub(crate) fn begin_attempt(&mut self, dep: Dependency, now: Duration) -> Option<u32> {
+        self.expire(now);
         let slot = &mut self.slots[dep.index()];
         if matches!(slot.state, DepState::Ready { .. } | DepState::Failed { .. }) {
             return None;
         }
-        slot.first_begin.get_or_insert(now);
         slot.attempts = slot.attempts.saturating_add(1);
         let attempt = slot.attempts;
-        self.set(dep, DepState::Attempting { attempt, since: now });
+        self.set(
+            dep,
+            DepState::Attempting {
+                attempt,
+                since: now,
+            },
+        );
         Some(attempt)
     }
 
@@ -265,12 +268,12 @@ impl StartupMachine {
     /// dependency is refused: `Failed` is terminal so a published failure is
     /// never contradicted. Returns whether the state changed.
     pub(crate) fn succeed(&mut self, dep: Dependency, now: Duration) -> bool {
+        self.expire(now);
         let slot = &mut self.slots[dep.index()];
         match slot.state {
             DepState::Ready { .. } | DepState::Failed { .. } => false,
             _ => {
                 let attempts = slot.attempts.max(1);
-                slot.first_begin.get_or_insert(now);
                 self.set(dep, DepState::Ready { attempts, at: now });
                 true
             }
@@ -285,14 +288,17 @@ impl StartupMachine {
         retryable: bool,
         now: Duration,
     ) -> Next {
+        self.expire(now);
         let policy = dep.policy();
         let slot = self.slots[dep.index()];
-        if matches!(slot.state, DepState::Ready { .. } | DepState::Failed { .. }) {
+        if let DepState::Failed { errno, .. } = slot.state {
+            return Next::Exhausted { errno };
+        }
+        if matches!(slot.state, DepState::Ready { .. }) {
             return Next::Exhausted { errno };
         }
         let attempts = slot.attempts.max(1);
-        let began = slot.first_begin.unwrap_or(now);
-        let spent = now.saturating_sub(began);
+        let spent = now;
         let backoff = policy.backoff_after(attempts);
         let attempts_left = policy.max_attempts == 0 || attempts < policy.max_attempts;
         // The retry has to *finish its wait* inside the budget; otherwise the
@@ -329,16 +335,13 @@ impl StartupMachine {
         let mut expired = Vec::new();
         for dep in Dependency::ALL {
             let slot = self.slots[dep.index()];
-            let Some(began) = slot.first_begin else {
-                continue;
-            };
             if !matches!(
                 slot.state,
-                DepState::Attempting { .. } | DepState::Backoff { .. }
+                DepState::Pending | DepState::Attempting { .. } | DepState::Backoff { .. }
             ) {
                 continue;
             }
-            if now.saturating_sub(began) >= dep.policy().total_budget {
+            if now >= dep.policy().total_budget {
                 self.set(
                     dep,
                     DepState::Failed {
@@ -397,7 +400,9 @@ impl StartupMachine {
                 DepState::Attempting { attempt, .. } | DepState::Backoff { attempt, .. } => {
                     line.push_str(&format!("#{attempt}"));
                 }
-                DepState::Failed { errno, attempts, .. } => {
+                DepState::Failed {
+                    errno, attempts, ..
+                } => {
                     line.push_str(&format!("#{attempts}/errno{errno}"));
                 }
                 _ => {}
@@ -441,11 +446,10 @@ impl Startup {
     pub(crate) fn begin(&self, dep: Dependency) -> Option<u32> {
         let mut machine = self.lock();
         let now = self.now();
-        let before = machine.state(dep);
+        let generation = machine.generation;
         let attempt = machine.begin_attempt(dep, now);
-        // Only the first attempt is a readiness-visible edge; later attempts
-        // are already described by the Backoff state they left.
-        if attempt == Some(1) && before == DepState::Pending {
+        // Beginning an attempt may also expire another pending dependency.
+        if machine.generation != generation {
             let line = machine.report();
             drop(machine);
             self.publish(&line);
@@ -456,7 +460,9 @@ impl Startup {
     pub(crate) fn succeed(&self, dep: Dependency) {
         let mut machine = self.lock();
         let now = self.now();
-        if machine.succeed(dep, now) {
+        let generation = machine.generation;
+        let changed = machine.succeed(dep, now);
+        if changed || machine.generation != generation {
             let line = machine.report();
             drop(machine);
             self.publish(&line);
@@ -509,7 +515,23 @@ impl Startup {
                 });
             }
             match operation() {
-                Ok(value) => return Ok(value),
+                Ok(value) => {
+                    let mut machine = self.lock();
+                    let expired = machine.expire(self.now());
+                    let failure = match machine.state(dep) {
+                        DepState::Failed { errno, .. } => Some(errno),
+                        _ => None,
+                    };
+                    if !expired.is_empty() {
+                        let line = machine.report();
+                        drop(machine);
+                        self.publish(&line);
+                    }
+                    return match failure {
+                        Some(errno) => Err(errno),
+                        None => Ok(value),
+                    };
+                }
                 Err(errno) => match self.fail(dep, errno, retryable(errno)) {
                     Next::RetryAfter(delay) => std::thread::sleep(delay),
                     Next::Exhausted { errno } => return Err(errno),
@@ -537,7 +559,9 @@ mod tests {
             machine.succeed(dep, t(2));
         }
         assert_eq!(machine.readiness(), Readiness::Ready);
-        assert!(machine.report().starts_with("uiserver: readiness v1 state=ready "));
+        assert!(machine
+            .report()
+            .starts_with("uiserver: readiness v1 state=ready "));
     }
 
     #[test]
@@ -556,6 +580,11 @@ mod tests {
         // ETIMEDOUT. The input budget (45 s) must allow several attempts; the
         // old 10 s budget allowed two and then killed the service.
         let mut machine = StartupMachine::new();
+        for dep in Dependency::ALL {
+            if dep != Dependency::Input {
+                machine.succeed(dep, t(0));
+            }
+        }
         let mut now = t(0);
         let mut attempts = 0;
         loop {
@@ -571,7 +600,10 @@ mod tests {
             }
         }
         assert!(attempts >= 6, "attempts={attempts}");
-        assert!(now <= secs(45) + secs(5), "failure published after the owned deadline");
+        assert!(
+            now <= secs(45) + secs(5),
+            "failure published after the owned deadline"
+        );
         assert_eq!(
             machine.readiness(),
             Readiness::Failed(Dependency::Input, libc::ETIMEDOUT)
@@ -583,7 +615,12 @@ mod tests {
         let mut machine = StartupMachine::new();
         machine.begin_attempt(Dependency::Display, t(0));
         let next = machine.fail_attempt(Dependency::Display, libc::EINVAL, false, t(1));
-        assert_eq!(next, Next::Exhausted { errno: libc::EINVAL });
+        assert_eq!(
+            next,
+            Next::Exhausted {
+                errno: libc::EINVAL
+            }
+        );
         assert_eq!(
             machine.readiness(),
             Readiness::Failed(Dependency::Display, libc::EINVAL)
@@ -599,7 +636,10 @@ mod tests {
         assert!(!machine.succeed(Dependency::Runtime, t(2)));
         assert!(machine.begin_attempt(Dependency::Runtime, t(3)).is_none());
         assert_eq!(machine.generation(), generation);
-        assert!(matches!(machine.state(Dependency::Runtime), DepState::Failed { .. }));
+        assert!(matches!(
+            machine.state(Dependency::Runtime),
+            DepState::Failed { .. }
+        ));
     }
 
     #[test]
@@ -607,6 +647,11 @@ mod tests {
         // The worker began an attempt and never reported (died or blocked
         // forever). Nothing else would ever move this dependency.
         let mut machine = StartupMachine::new();
+        for dep in Dependency::ALL {
+            if dep != Dependency::Runtime {
+                machine.succeed(dep, t(0));
+            }
+        }
         machine.begin_attempt(Dependency::Runtime, t(0));
         assert!(machine.expire(secs(119)).is_empty());
         assert_eq!(machine.readiness(), Readiness::Starting);
@@ -618,10 +663,32 @@ mod tests {
     }
 
     #[test]
-    fn a_dependency_that_never_started_is_not_expired() {
+    fn a_dependency_that_never_started_expires_from_startup_epoch() {
         let mut machine = StartupMachine::new();
-        assert!(machine.expire(secs(3_600)).is_empty());
-        assert_eq!(machine.readiness(), Readiness::Starting);
+        assert!(machine.expire(secs(29)).is_empty());
+        assert_eq!(machine.expire(secs(30)), vec![Dependency::Display]);
+        assert_eq!(
+            machine.readiness(),
+            Readiness::Failed(Dependency::Display, libc::ETIMEDOUT)
+        );
+        assert!(machine
+            .begin_attempt(Dependency::Display, secs(31))
+            .is_none());
+    }
+
+    #[test]
+    fn success_at_deadline_cannot_revive_unreported_dependency() {
+        let mut machine = StartupMachine::new();
+        machine.begin_attempt(Dependency::Input, t(0));
+        assert!(!machine.succeed(Dependency::Input, secs(45)));
+        assert_eq!(
+            machine.state(Dependency::Input),
+            DepState::Failed {
+                attempts: 1,
+                errno: libc::ETIMEDOUT,
+                at: secs(45),
+            }
+        );
     }
 
     #[test]
@@ -645,7 +712,9 @@ mod tests {
         machine.begin_attempt(Dependency::Gpu, t(0));
         assert_eq!(
             machine.fail_attempt(Dependency::Gpu, libc::ENODEV, true, t(1)),
-            Next::Exhausted { errno: libc::ENODEV }
+            Next::Exhausted {
+                errno: libc::ENODEV
+            }
         );
     }
 
@@ -672,10 +741,12 @@ mod tests {
         machine.fail_attempt(Dependency::Input, libc::ETIMEDOUT, true, t(1));
         let report = machine.report();
         assert!(!report.contains('\n'));
-        let order: Vec<usize> = ["assets=", "display=", "input=", "wayland=", "runtime=", "gpu="]
-            .iter()
-            .map(|key| report.find(key).expect(key))
-            .collect();
+        let order: Vec<usize> = [
+            "assets=", "display=", "input=", "wayland=", "runtime=", "gpu=",
+        ]
+        .iter()
+        .map(|key| report.find(key).expect(key))
+        .collect();
         assert!(order.windows(2).all(|pair| pair[0] < pair[1]));
         assert!(report.contains(" input=backoff#1"));
     }

@@ -19,6 +19,13 @@ into another crate's private modules when `api.rs` exposes a wrapper.
 | Boot orchestration/hooks | `kernel_executive::boot` | `kernel/executive/src/boot.rs`, `kernel/executive/src/lib.rs` |
 | Logging/panic/boot trace | `nucleus_core::debug` | `kernel/nucleus-core/src/debug/mod.rs` |
 
+`io_api::network::begin_dvm_transport_publication` is a sleepable registrar
+mechanism, not a Ring3 policy decision. Acquire it before the service-registry
+spinlock, revalidate rootd authorization/ownership under that lock, then call
+`reset_predecessor` before the endpoint Release publication. Keep the guard
+until that commit is visible. Rejected admission must drop it without reset;
+never call the ordinary sleepable lease reset while holding the registry lock.
+
 Page-cache victim selection, COW/writeback policy, and backing-generation
 authority are not kernel APIs. They belong to `pagerd`; kernel-mm exposes only
 opaque generation-bound all-atomic frame grants, normal-time pager-leaf

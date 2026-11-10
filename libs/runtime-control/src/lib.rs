@@ -5,6 +5,7 @@ use std::mem::size_of;
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::net::UnixStream;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
@@ -22,7 +23,7 @@ use protocol::{
     LAUNCH_TARGET_NEW_SESSION, MAX_REQUEST_PATH_BYTES, MAX_RUNTIME_PROGRAMS,
     NO_RUNNING_PROGRAMS_DIGEST, OP_NOTIFY_READY, OP_REQUEST_LAUNCH_PATH, OP_REQUEST_TERMINATE,
     OP_SNAPSHOT_RUNNING_PROGRAMS, OP_WATCH_RUNNING_PROGRAMS, PROTOCOL_VERSION,
-    READY_COMPONENT_UI_SERVER, RUNTIME_WATCH_MAX_WAIT_MS, TERMINATE_TARGET_PID,
+    READY_COMPONENT_UI_SERVER, REQUEST_FLAG_QUERY, RUNTIME_WATCH_MAX_WAIT_MS, TERMINATE_TARGET_PID,
     TERMINATE_TARGET_SESSION,
 };
 
@@ -99,6 +100,59 @@ struct RuntimeEnvEntry {
     value: String,
 }
 
+/// A mutation identity retained by the caller for retry and outcome queries.
+/// Reusing this object never requests a second side effect.
+#[derive(Clone, Debug)]
+pub struct RuntimeTransaction {
+    request: RuntimeRequest,
+}
+
+/// A validated server outcome is distinct from a lost or malformed reply.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MutationOutcome {
+    Committed,
+    Pending,
+    Rejected(i32),
+    Unknown(i32),
+    Transport(i32),
+}
+
+impl RuntimeTransaction {
+    /// Queries have their own bounded transport attempt but cannot extend the
+    /// original transaction's admission deadline or replay retention.
+    pub fn query_remaining(&self) -> Result<Duration, i32> {
+        let end = self
+            .request
+            .transaction_deadline_ns
+            .checked_add(protocol::TRANSACTION_REPLAY_RETENTION_NS)
+            .ok_or(libc::EOVERFLOW)?;
+        let remaining = end.checked_sub(monotonic_nanos()?).ok_or(libc::ESTALE)?;
+        if remaining == 0 {
+            return Err(libc::ESTALE);
+        }
+        Ok(Duration::from_nanos(remaining))
+    }
+}
+
+static NEXT_TRANSACTION: AtomicU64 = AtomicU64::new(1);
+
+/// Read the kernel-wide monotonic clock used by the runtime wire protocol.
+pub fn monotonic_nanos() -> Result<u64, i32> {
+    let mut ts = std::mem::MaybeUninit::<libc::timespec>::uninit();
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, ts.as_mut_ptr()) } != 0 {
+        return Err(last_errno());
+    }
+    let ts = unsafe { ts.assume_init() };
+    let secs = u64::try_from(ts.tv_sec).map_err(|_| libc::EIO)?;
+    let nanos = u64::try_from(ts.tv_nsec).map_err(|_| libc::EIO)?;
+    if nanos >= 1_000_000_000 {
+        return Err(libc::EIO);
+    }
+    secs.checked_mul(1_000_000_000)
+        .and_then(|n| n.checked_add(nanos))
+        .ok_or(libc::EOVERFLOW)
+}
+
 pub struct RuntimeClient {
     socket_path: String,
 }
@@ -153,41 +207,133 @@ impl RuntimeClient {
         Ok((programs, digest))
     }
 
-    pub fn request_launch_program_new_session(&self, desktop_file_id: &str) -> Result<(), i32> {
-        let request = request_with_path(
+    fn transaction(&self, mut request: RuntimeRequest) -> Result<RuntimeTransaction, i32> {
+        let now = monotonic_nanos()?;
+        let sequence = NEXT_TRANSACTION
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+            .map_err(|_| libc::EOVERFLOW)?;
+        request.transaction_id_hi = now;
+        request.transaction_id_lo = sequence;
+        request.transaction_deadline_ns = now
+            .checked_add(RPC_IO_TIMEOUT.as_nanos() as u64)
+            .ok_or(libc::EOVERFLOW)?;
+        Ok(RuntimeTransaction { request })
+    }
+
+    pub fn launch_transaction(&self, desktop_file_id: &str) -> Result<RuntimeTransaction, i32> {
+        self.transaction(request_with_path(
             OP_REQUEST_LAUNCH_PATH,
             LAUNCH_TARGET_NEW_SESSION,
             0,
             desktop_file_id,
-        )?;
-        let _ = self.exchange(&request)?;
-        Ok(())
+        )?)
     }
 
-    pub fn request_launch_path_new_session(&self, exec_path: &str) -> Result<(), i32> {
-        self.request_launch_program_new_session(exec_path)
-    }
-
-    pub fn request_terminate_session(&self, session_handle: u64) -> Result<(), i32> {
-        let request = RuntimeRequest {
+    pub fn terminate_session_transaction(
+        &self,
+        session_handle: u64,
+    ) -> Result<RuntimeTransaction, i32> {
+        self.transaction(RuntimeRequest {
             op: OP_REQUEST_TERMINATE,
             target_kind: TERMINATE_TARGET_SESSION,
             target_value: session_handle,
             ..RuntimeRequest::default()
-        };
-        let _ = self.exchange(&request)?;
-        Ok(())
+        })
     }
 
-    pub fn request_terminate_pid(&self, pid: u64) -> Result<(), i32> {
-        let request = RuntimeRequest {
+    pub fn terminate_pid_transaction(&self, pid: u64) -> Result<RuntimeTransaction, i32> {
+        self.transaction(RuntimeRequest {
             op: OP_REQUEST_TERMINATE,
             target_kind: TERMINATE_TARGET_PID,
             target_value: pid,
             ..RuntimeRequest::default()
+        })
+    }
+
+    /// Submit once. Every later attempt must query this same identity.
+    pub fn submit_transaction(&self, transaction: &RuntimeTransaction) -> MutationOutcome {
+        let remaining = match monotonic_nanos().and_then(|now| {
+            transaction
+                .request
+                .transaction_deadline_ns
+                .checked_sub(now)
+                .ok_or(libc::ETIMEDOUT)
+        }) {
+            Ok(ns) if ns > 0 => Duration::from_nanos(ns),
+            // The caller may have submitted this identity already. A local
+            // deadline or clock error says nothing about that earlier attempt.
+            Ok(_) => return MutationOutcome::Unknown(libc::ETIMEDOUT),
+            Err(err) => return MutationOutcome::Unknown(err),
         };
-        let _ = self.exchange(&request)?;
-        Ok(())
+        self.mutation_exchange(&transaction.request, remaining.min(RPC_IO_TIMEOUT))
+    }
+
+    /// Query without admitting a new operation, even after its admission deadline.
+    pub fn query_transaction(&self, transaction: &RuntimeTransaction) -> MutationOutcome {
+        let remaining = match transaction.query_remaining() {
+            Ok(remaining) => remaining,
+            Err(err) => return MutationOutcome::Unknown(err),
+        };
+        let mut request = transaction.request;
+        request.flags = REQUEST_FLAG_QUERY;
+        self.mutation_exchange(&request, remaining.min(Duration::from_millis(500)))
+    }
+
+    fn mutation_exchange(&self, request: &RuntimeRequest, timeout: Duration) -> MutationOutcome {
+        match self.mutation_exchange_inner(request, timeout) {
+            Ok(outcome) => outcome,
+            Err(err) => MutationOutcome::Transport(err),
+        }
+    }
+
+    fn mutation_exchange_inner(
+        &self,
+        request: &RuntimeRequest,
+        timeout: Duration,
+    ) -> Result<MutationOutcome, i32> {
+        let deadline = Instant::now().checked_add(timeout).ok_or(libc::EOVERFLOW)?;
+        let mut wire = *request;
+        let now = monotonic_nanos()?;
+        wire.deadline_ns = now
+            .checked_add(
+                u64::try_from(
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .as_nanos(),
+                )
+                .map_err(|_| libc::EOVERFLOW)?,
+            )
+            .ok_or(libc::EOVERFLOW)?;
+        let mut stream = connect_nonblocking_unix(&self.socket_path, deadline)?;
+        write_all_retry_until(&mut stream, as_bytes(&wire), deadline)?;
+        let mut response = RuntimeResponse::default();
+        read_exact_retry_until(&mut stream, as_bytes_mut(&mut response), deadline)?;
+        check_deadline(deadline)?;
+        if response.version != PROTOCOL_VERSION
+            || response.count != 0
+            || response.status > 0
+            || (response.op != request.op && !(response.op == 0 && response.status < 0))
+        {
+            return Err(libc::EPROTO);
+        }
+        let outcome = match response.status {
+            0 => MutationOutcome::Committed,
+            status => {
+                let err = status.checked_neg().ok_or(libc::EPROTO)?;
+                if response.op == 0 && request.flags == REQUEST_FLAG_QUERY {
+                    MutationOutcome::Unknown(err)
+                } else {
+                    match err {
+                        libc::EINPROGRESS | libc::EALREADY if response.op == request.op => {
+                            MutationOutcome::Pending
+                        }
+                        libc::EOWNERDEAD | libc::ESTALE => MutationOutcome::Unknown(err),
+                        _ => MutationOutcome::Rejected(err),
+                    }
+                }
+            }
+        };
+        Ok(outcome)
     }
 
     /// Tell `runtimed` the compositor is ready, and return only once `runtimed`
@@ -213,16 +359,35 @@ impl RuntimeClient {
         request: &RuntimeRequest,
         io_timeout: Duration,
     ) -> Result<(RuntimeResponse, Vec<u8>), i32> {
-        let mut stream = connect_nonblocking_unix(&self.socket_path)?;
-        write_all_retry_until(&mut stream, as_bytes(request), io_timeout)?;
+        let deadline = Instant::now()
+            .checked_add(io_timeout)
+            .ok_or(libc::EOVERFLOW)?;
+        self.exchange_until(request, deadline)
+    }
+
+    fn exchange_until(
+        &self,
+        request: &RuntimeRequest,
+        deadline: Instant,
+    ) -> Result<(RuntimeResponse, Vec<u8>), i32> {
+        check_deadline(deadline)?;
+        let mut wire_request = *request;
+        let clock_ns = monotonic_nanos()?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        wire_request.deadline_ns = clock_ns
+            .checked_add(u64::try_from(remaining.as_nanos()).map_err(|_| libc::EOVERFLOW)?)
+            .ok_or(libc::EOVERFLOW)?;
+        let mut stream = connect_nonblocking_unix(&self.socket_path, deadline)?;
+        write_all_retry_until(&mut stream, as_bytes(&wire_request), deadline)?;
 
         let mut response = RuntimeResponse::default();
-        read_exact_retry_until(&mut stream, as_bytes_mut(&mut response), io_timeout)?;
+        read_exact_retry_until(&mut stream, as_bytes_mut(&mut response), deadline)?;
         let payload_len = response_payload_len(request, &response)?;
         let mut payload = vec![0_u8; payload_len];
         if payload_len != 0 {
-            read_exact_retry_until(&mut stream, &mut payload, io_timeout)?;
+            read_exact_retry_until(&mut stream, &mut payload, deadline)?;
         }
+        check_deadline(deadline)?;
         Ok((response, payload))
     }
 }
@@ -309,7 +474,14 @@ fn response_payload_len(
     }
 }
 
-fn connect_nonblocking_unix(path: &str) -> Result<UnixStream, i32> {
+fn connect_nonblocking_unix(path: &str, deadline: Instant) -> Result<UnixStream, i32> {
+    let path = CString::new(path).map_err(|_| libc::EINVAL)?;
+    let mut addr = unsafe { std::mem::zeroed::<libc::sockaddr_un>() };
+    let path_bytes = path.as_bytes_with_nul();
+    if path_bytes.len() > addr.sun_path.len() {
+        return Err(libc::ENAMETOOLONG);
+    }
+    check_deadline(deadline)?;
     let fd = unsafe {
         libc::socket(
             libc::AF_UNIX,
@@ -318,17 +490,14 @@ fn connect_nonblocking_unix(path: &str) -> Result<UnixStream, i32> {
         )
     };
     if fd < 0 {
-        return Err(last_errno());
+        let err = last_errno();
+        check_deadline(deadline)?;
+        return Err(err);
     }
 
-    let path = CString::new(path).map_err(|_| libc::EINVAL)?;
-    let mut addr = unsafe { std::mem::zeroed::<libc::sockaddr_un>() };
+    let stream = unsafe { UnixStream::from_raw_fd(fd) };
+    check_deadline(deadline)?;
     addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
-    let path_bytes = path.as_bytes_with_nul();
-    if path_bytes.len() > addr.sun_path.len() {
-        let _ = unsafe { libc::close(fd) };
-        return Err(libc::ENAMETOOLONG);
-    }
     for (index, byte) in path_bytes.iter().enumerate() {
         addr.sun_path[index] = *byte as libc::c_char;
     }
@@ -340,13 +509,52 @@ fn connect_nonblocking_unix(path: &str) -> Result<UnixStream, i32> {
             size_of::<libc::sockaddr_un>() as libc::socklen_t,
         )
     };
-    if rc < 0 {
-        let err = last_errno();
-        let _ = unsafe { libc::close(fd) };
-        return Err(err);
+    let connect_errno = if rc < 0 { Some(last_errno()) } else { None };
+    check_deadline(deadline)?;
+    if let Some(err) = connect_errno {
+        if err != libc::EINPROGRESS && err != libc::EALREADY && err != libc::EINTR {
+            return Err(err);
+        }
+        loop {
+            wait_for_socket_ready(stream.as_raw_fd(), deadline, libc::POLLOUT)?;
+            let mut socket_error: libc::c_int = 0;
+            let mut len = size_of::<libc::c_int>() as libc::socklen_t;
+            let rc = unsafe {
+                libc::getsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_ERROR,
+                    (&mut socket_error as *mut libc::c_int).cast(),
+                    &mut len,
+                )
+            };
+            let socket_errno = if rc < 0 { Some(last_errno()) } else { None };
+            check_deadline(deadline)?;
+            if let Some(err) = socket_errno {
+                return Err(err);
+            }
+            if len as usize != size_of::<libc::c_int>() {
+                return Err(libc::EPROTO);
+            }
+            if socket_error == libc::EINPROGRESS || socket_error == libc::EALREADY {
+                continue;
+            }
+            if socket_error != 0 {
+                return Err(socket_error);
+            }
+            break;
+        }
     }
+    check_deadline(deadline)?;
+    Ok(stream)
+}
 
-    Ok(unsafe { UnixStream::from_raw_fd(fd) })
+fn check_deadline(deadline: Instant) -> Result<(), i32> {
+    if Instant::now() >= deadline {
+        Err(libc::ETIMEDOUT)
+    } else {
+        Ok(())
+    }
 }
 
 /// Wait until the socket is ready in `events`, or the deadline passes.
@@ -362,76 +570,85 @@ fn connect_nonblocking_unix(path: &str) -> Result<UnixStream, i32> {
 /// The caller's deadline is passed in rather than recomputed here, so the total
 /// bound stays `RPC_IO_TIMEOUT` for the whole transfer instead of resetting on
 /// every partial chunk.
-fn wait_for_socket_ready(stream: &UnixStream, deadline: Instant, events: i16) -> Result<(), i32> {
-    let now = Instant::now();
-    if now >= deadline {
-        return Err(libc::ETIMEDOUT);
-    }
-    let timeout_ms = i32::try_from((deadline - now).as_millis())
-        .unwrap_or(i32::MAX)
-        .max(1);
-    let mut poll_fd = libc::pollfd {
-        fd: stream.as_raw_fd(),
-        events,
-        revents: 0,
-    };
-    let ready = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
-    if ready < 0 {
-        let err = last_errno();
-        // A signal is not a transfer failure. Returning lets the caller retry
-        // the operation; the shared deadline still bounds the loop.
-        if err == libc::EINTR {
-            return Ok(());
+fn wait_for_socket_ready(fd: i32, deadline: Instant, events: i16) -> Result<(), i32> {
+    loop {
+        let now = Instant::now();
+        if now >= deadline {
+            return Err(libc::ETIMEDOUT);
         }
-        return Err(err);
+        let timeout_ms = i32::try_from((deadline - now).as_millis())
+            .unwrap_or(i32::MAX)
+            .max(1);
+        let mut poll_fd = libc::pollfd {
+            fd,
+            events,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut poll_fd, 1, timeout_ms) };
+        let poll_errno = if ready < 0 { Some(last_errno()) } else { None };
+        check_deadline(deadline)?;
+        if let Some(err) = poll_errno {
+            if err == libc::EINTR {
+                continue;
+            }
+            return Err(err);
+        }
+        if ready == 0 {
+            return Err(libc::ETIMEDOUT);
+        }
+        return Ok(());
     }
-    if ready == 0 {
-        return Err(libc::ETIMEDOUT);
+}
+
+fn transfer_until(
+    total: usize,
+    mut transfer: impl FnMut(usize) -> std::io::Result<usize>,
+    mut check: impl FnMut() -> Result<(), i32>,
+    mut wait: impl FnMut() -> Result<(), i32>,
+) -> Result<(), i32> {
+    let mut offset = 0;
+    while offset < total {
+        check()?;
+        let result = transfer(offset);
+        check()?;
+        match result {
+            Ok(0) => return Err(libc::EPIPE),
+            Ok(n) if n <= total - offset => offset += n,
+            Ok(_) => return Err(libc::EIO),
+            Err(err) if err.kind() == ErrorKind::WouldBlock => wait()?,
+            Err(err) if err.kind() == ErrorKind::Interrupted => {}
+            Err(err) => return Err(io_errno(err)),
+        }
     }
-    Ok(())
+    check()
 }
 
 fn write_all_retry_until(
     stream: &mut UnixStream,
-    mut bytes: &[u8],
-    io_timeout: Duration,
+    bytes: &[u8],
+    deadline: Instant,
 ) -> Result<(), i32> {
-    let deadline = Instant::now() + io_timeout;
-    while !bytes.is_empty() {
-        match stream.write(bytes) {
-            Ok(0) => return Err(libc::EPIPE),
-            Ok(written) => bytes = &bytes[written..],
-            Err(err) if err.kind() == ErrorKind::WouldBlock => {
-                wait_for_socket_ready(stream, deadline, libc::POLLOUT)?;
-            }
-            Err(err) if err.kind() == ErrorKind::Interrupted => {}
-            Err(err) => return Err(io_errno(err)),
-        }
-    }
-    Ok(())
+    let fd = stream.as_raw_fd();
+    transfer_until(
+        bytes.len(),
+        |offset| stream.write(&bytes[offset..]),
+        || check_deadline(deadline),
+        || wait_for_socket_ready(fd, deadline, libc::POLLOUT),
+    )
 }
 
 fn read_exact_retry_until(
     stream: &mut UnixStream,
-    mut bytes: &mut [u8],
-    io_timeout: Duration,
+    bytes: &mut [u8],
+    deadline: Instant,
 ) -> Result<(), i32> {
-    let deadline = Instant::now() + io_timeout;
-    while !bytes.is_empty() {
-        match stream.read(bytes) {
-            Ok(0) => return Err(libc::EPIPE),
-            Ok(read) => {
-                let remaining = bytes;
-                bytes = &mut remaining[read..];
-            }
-            Err(err) if err.kind() == ErrorKind::WouldBlock => {
-                wait_for_socket_ready(stream, deadline, libc::POLLIN)?;
-            }
-            Err(err) if err.kind() == ErrorKind::Interrupted => {}
-            Err(err) => return Err(io_errno(err)),
-        }
-    }
-    Ok(())
+    let fd = stream.as_raw_fd();
+    transfer_until(
+        bytes.len(),
+        |offset| stream.read(&mut bytes[offset..]),
+        || check_deadline(deadline),
+        || wait_for_socket_ready(fd, deadline, libc::POLLIN),
+    )
 }
 
 pub fn decode_c_string(bytes: &[u8]) -> String {
@@ -1102,6 +1319,94 @@ mod tests {
     }
 
     #[test]
+    fn partial_progress_and_interrupts_do_not_remint_deadline() {
+        use std::cell::Cell;
+        let tick = Cell::new(0);
+        let mut calls = 0;
+        let result = super::transfer_until(
+            8,
+            |_| {
+                calls += 1;
+                tick.set(tick.get() + 1);
+                if calls == 2 {
+                    Err(std::io::Error::from(std::io::ErrorKind::Interrupted))
+                } else {
+                    Ok(1)
+                }
+            },
+            || {
+                if tick.get() >= 3 {
+                    Err(libc::ETIMEDOUT)
+                } else {
+                    Ok(())
+                }
+            },
+            || unreachable!(),
+        );
+        assert_eq!(result, Err(libc::ETIMEDOUT));
+        assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn successive_phases_share_one_expiry() {
+        use std::cell::Cell;
+        let tick = Cell::new(0);
+        let transfer = |_| {
+            tick.set(tick.get() + 1);
+            Ok(1)
+        };
+        let check = || {
+            if tick.get() >= 3 {
+                Err(libc::ETIMEDOUT)
+            } else {
+                Ok(())
+            }
+        };
+        assert_eq!(
+            super::transfer_until(2, transfer, check, || unreachable!()),
+            Ok(())
+        );
+        let transfer = |_| {
+            tick.set(tick.get() + 1);
+            Ok(1)
+        };
+        let check = || {
+            if tick.get() >= 3 {
+                Err(libc::ETIMEDOUT)
+            } else {
+                Ok(())
+            }
+        };
+        assert_eq!(
+            super::transfer_until(2, transfer, check, || unreachable!()),
+            Err(libc::ETIMEDOUT)
+        );
+    }
+
+    #[test]
+    fn expired_deadline_rejects_ready_io_and_empty_completion() {
+        use std::os::unix::net::UnixStream;
+        use std::time::{Duration, Instant};
+        let (mut client, mut peer) = UnixStream::pair().unwrap();
+        use std::io::Write;
+        peer.write_all(b"x").unwrap();
+        let expired = Instant::now() - Duration::from_millis(1);
+        let mut byte = [0];
+        assert_eq!(
+            super::read_exact_retry_until(&mut client, &mut byte, expired),
+            Err(libc::ETIMEDOUT)
+        );
+        assert_eq!(
+            super::write_all_retry_until(&mut client, b"x", expired),
+            Err(libc::ETIMEDOUT)
+        );
+        assert_eq!(
+            super::write_all_retry_until(&mut client, b"", expired),
+            Err(libc::ETIMEDOUT)
+        );
+    }
+
+    #[test]
     fn watch_deadline_is_bounded_for_unbounded_waits() {
         let bound = super::watch_io_timeout(std::time::Duration::MAX);
         assert!(std::time::Instant::now().checked_add(bound).is_some());
@@ -1307,11 +1612,101 @@ mod tests {
             let server = std::thread::spawn(move || {
                 let (mut stream, _) = listener.accept().expect("accept");
                 let mut request = RuntimeRequest::default();
-                stream.read_exact(as_bytes_mut(&mut request)).expect("request");
+                stream
+                    .read_exact(as_bytes_mut(&mut request))
+                    .expect("request");
                 reply(&mut stream, request);
                 let _ = std::fs::remove_file(&dir);
             });
             (RuntimeClient::open(&path).expect("client"), server)
+        }
+
+        #[test]
+        fn mutation_query_retains_identity_and_original_deadline() {
+            let path = std::env::temp_dir().join(format!("rc-transaction-{}", std::process::id()));
+            let _ = std::fs::remove_file(&path);
+            let listener = UnixListener::bind(&path).unwrap();
+            let socket = path.to_str().unwrap().to_owned();
+            let server = std::thread::spawn(move || {
+                let mut requests = Vec::new();
+                for status in [-libc::EINPROGRESS, 0] {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let mut request = RuntimeRequest::default();
+                    stream.read_exact(as_bytes_mut(&mut request)).unwrap();
+                    requests.push(request);
+                    stream
+                        .write_all(as_bytes(&RuntimeResponse {
+                            version: PROTOCOL_VERSION,
+                            op: request.op,
+                            status,
+                            count: 0,
+                        }))
+                        .unwrap();
+                }
+                let _ = std::fs::remove_file(path);
+                requests
+            });
+            let client = RuntimeClient::open(&socket).unwrap();
+            let transaction = client.launch_transaction("app.desktop").unwrap();
+            assert_eq!(
+                client.submit_transaction(&transaction),
+                super::super::MutationOutcome::Pending
+            );
+            assert_eq!(
+                client.query_transaction(&transaction),
+                super::super::MutationOutcome::Committed
+            );
+            let requests = server.join().unwrap();
+            assert_eq!(requests[0].transaction_id_hi, requests[1].transaction_id_hi);
+            assert_eq!(requests[0].transaction_id_lo, requests[1].transaction_id_lo);
+            assert_eq!(
+                requests[0].transaction_deadline_ns,
+                requests[1].transaction_deadline_ns
+            );
+            assert_eq!(requests[0].flags, 0);
+            assert_eq!(
+                requests[1].flags,
+                super::super::protocol::REQUEST_FLAG_QUERY
+            );
+        }
+
+        #[test]
+        fn expired_resubmission_cannot_claim_an_earlier_attempt_failed() {
+            let client = RuntimeClient::open("/unused").unwrap();
+            let mut transaction = client.launch_transaction("app.desktop").unwrap();
+            transaction.request.transaction_deadline_ns = 1;
+            assert_eq!(
+                client.submit_transaction(&transaction),
+                super::super::MutationOutcome::Unknown(libc::ETIMEDOUT)
+            );
+        }
+
+        #[test]
+        fn mutation_distinguishes_validated_rejection_from_lost_reply() {
+            let (client, server) = serve_once("mutation-reject", |stream, request| {
+                stream
+                    .write_all(as_bytes(&RuntimeResponse {
+                        version: PROTOCOL_VERSION,
+                        op: request.op,
+                        status: -libc::EINVAL,
+                        count: 0,
+                    }))
+                    .unwrap();
+            });
+            let transaction = client.launch_transaction("app.desktop").unwrap();
+            assert_eq!(
+                client.submit_transaction(&transaction),
+                super::super::MutationOutcome::Rejected(libc::EINVAL)
+            );
+            server.join().unwrap();
+
+            let (client, server) = serve_once("mutation-lost", |_stream, _request| {});
+            let transaction = client.launch_transaction("app.desktop").unwrap();
+            assert_eq!(
+                client.submit_transaction(&transaction),
+                super::super::MutationOutcome::Transport(libc::EPIPE)
+            );
+            server.join().unwrap();
         }
 
         #[test]

@@ -4,6 +4,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdatomic.h>
 
 struct rustos_gpu_runtime;
 
@@ -30,6 +31,8 @@ struct rustos_gpu_frame {
     uint64_t generation;
     uint64_t sequence;
     uint64_t render_started_ns;
+    uint64_t render_deadline_ns;
+    uint64_t operation_deadline_ns;
     uint32_t budget_us;
 };
 
@@ -48,7 +51,9 @@ int rustos_gpu_runtime_render_batch(struct rustos_gpu_runtime *runtime,
                                     uint32_t damage_count,
                                     const uint8_t *batch, size_t batch_bytes,
                                     uint32_t binding_slot, uint64_t generation,
-                                    uint64_t sequence, int source_acquire_fence_fd,
+                                    uint64_t sequence, uint64_t operation_started_ns,
+                                    int source_acquire_fence_fd,
+                                    _Atomic uint64_t *watchdog_deadline_ns,
                                     struct rustos_gpu_frame *frame);
 void rustos_gpu_runtime_presented(struct rustos_gpu_runtime *runtime,
                                   uint32_t output_index);

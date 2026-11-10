@@ -93,7 +93,7 @@ done < <(find formal -mindepth 2 -maxdepth 2 -name '*.cfg' | sort)
 for lock in formal/tla2tools.lock formal/kani.lock formal/verus.lock formal/apalache.lock formal/tlaps.lock; do
     [[ -s "$lock" ]] || { echo "missing tool lock: $lock" >&2; exit 1; }
 done
-for script in formal/run-{all-tlc,tlc,tlc-simulate,kani,verus,proof-index,runtime-traces,source-conformance,miri,loom,shuttle,herd,concurrency-triangle,fuzz-smoke,apalache,tlaps,abi-differential,recovery-scenarios,implementation-mutations,sanitizers}.sh; do
+for script in formal/run-{all-tlc,tlc,tlc-simulate,kani,verus,proof-index,runtime-traces,source-conformance,dvm-timeout-tests,miri,loom,shuttle,herd,concurrency-triangle,fuzz-smoke,apalache,tlaps,abi-differential,recovery-scenarios,implementation-mutations,sanitizers}.sh; do
     [[ -x "$script" ]] || { echo "formal runner is not executable: $script" >&2; exit 1; }
 done
 [[ -s formal/spec-mutations.toml ]] || {

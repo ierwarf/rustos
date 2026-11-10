@@ -91,6 +91,7 @@ pub fn prepare_storage_handoff(
     policy: &PhysicalStoragePolicy,
     aperture_path: &Path,
     epoch_signing_key: &SigningKey,
+    persist_binding: impl FnOnce(&StorageHandoffEvidence) -> Result<()>,
 ) -> Result<StorageHandoffGuard> {
     let controller_bdf = validate_physical_storage_assignment(lease, sysfs_root, policy)?;
     let block_name = discover_whole_block_device(sysfs_root, &controller_bdf)?;
@@ -124,16 +125,19 @@ pub fn prepare_storage_handoff(
     if !header.is_valid() {
         bail!("derived physical storage geometry does not satisfy the block transport ABI");
     }
+    let evidence = StorageHandoffEvidence {
+        controller_bdf,
+        block_name,
+        aperture_path,
+        header,
+    };
+    // Persist the exact future epoch before its first shared-memory mutation.
+    persist_binding(&evidence)?;
     initialize_aperture(&aperture, header)?;
     Ok(StorageHandoffGuard {
         device,
         aperture,
-        evidence: StorageHandoffEvidence {
-            controller_bdf,
-            block_name,
-            aperture_path,
-            header,
-        },
+        evidence,
         committed: false,
     })
 }

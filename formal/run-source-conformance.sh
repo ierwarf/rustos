@@ -10,6 +10,10 @@ records="$(mktemp)"
 seen="$(mktemp)"
 trap 'rm -f "$records" "$seen"' EXIT
 
+# These native C witnesses exercise the actual relay bodies, not duplicated
+# models or source substrings. Keep them fail-closed in the PR witness lane.
+bash formal/run-dvm-timeout-tests.sh
+
 # The boot nucleus intentionally uses the hosted x86_64 Cargo target for its
 # object format and selects bare-metal behavior with `rustos_boot_image`.
 # `target_os = "none"` therefore compiles the host branch into the real image
@@ -1631,6 +1635,8 @@ clocksource-deadline/ClocksourceDeadline|kernel-ps|multitask::scheduler::wake_pu
 clocksource-deadline/ClocksourceDeadline|kernel-compat|user::syscall::linux::service_ops::process_time::tests::time_hot_path_admission_is_local_and_complete
 clocksource-deadline/ClocksourceDeadline|kernel-compat|user::syscall::linux::service_ops::process_time::tests::a_monotonic_instant_between_two_ticks_keeps_its_own_resolution
 clocksource-deadline/ClocksourceDeadline|kernel-ps|multitask::scheduler::tests::scheduler_block_arm_is_exact_race_safe_and_terminally_revoked
+clocksource-deadline/ClocksourceDeadline|rustos-user-abi|deadline::tests::clock_failure_and_malformed_time_never_become_zero_time
+clocksource-deadline/ClocksourceDeadline|rustos-svc-runtime|syscall::clock_tests::failed_clock_read_is_an_error_not_an_immortal_deadline
 validator:madt-topology-admission|kernel-hal|arch::acpi::tests::madt_cpu_topology_is_dense_unique_bounded_and_atomic
 validator:madt-topology-admission|kernel-hal|arch::acpi::tests::madt_rejects_truncation_and_bad_apic_override
 validator:madt-topology-admission|kernel-hal|arch::acpi::tests::madt_normalizes_the_executing_bsp_to_logical_cpu_zero
@@ -2296,6 +2302,9 @@ post-init-bootstrap-barrier/PostInitBootstrapBarrier|initd|bootstrap_barrier::te
 post-init-bootstrap-barrier/PostInitBootstrapBarrier|initd|bootstrap_barrier::tests::bootstrap_barrier_requires_every_exact_endpoint_admission
 post-init-bootstrap-barrier/PostInitBootstrapBarrier|initd|boot_order::tests::runtimed_bootstrap_does_not_wait_for_storage_dvm_publication
 post-init-bootstrap-barrier/PostInitBootstrapBarrier|initd|tests::endpoint_barrier_wait_is_exact_pid_bound_and_bounded
+post-init-bootstrap-barrier/PostInitBootstrapBarrier|initd|tests::startup_deadline_clips_operations_and_detects_unlaunched_dependency
+product-boot/ProductBoot|uiserver|startup::tests::a_dependency_that_never_started_expires_from_startup_epoch
+product-boot/ProductBoot|xtask|kvm::interactive_deadline_tests::quiet_startup_and_recovery_expire_but_ready_idle_is_unbounded
 bootstrap-activation-handoff/BootstrapActivationHandoff|kernel-ps|multitask::scheduler::activation_batch_tests::spawn_handoff_is_fifo_deduplicated_and_precedes_ipc_handoff
 bootstrap-activation-handoff/BootstrapActivationHandoff|kernel-ps|multitask::scheduler::tests::overdue_system_continuation_precedes_a_fresh_latency_handoff
 atomic-process-activation-batch/AtomicProcessActivationBatch|kernel-ps|multitask::current_identity::cohort::tests::cohort_admission_is_closed_through_every_partial_publication_and_one_release_opens_all
@@ -2641,6 +2650,13 @@ endpoint-publication/EndpointPublication|kernel-compat|user::syscall::linux::ipc
 runtime-control-rpc/RuntimeControlRpc|runtime-control|tests::successful_response_must_echo_the_request_opcode
 runtime-control-rpc/RuntimeControlRpc|runtime-control|tests::malformed_status_and_oversized_snapshot_fail_closed
 runtime-control-authority/RuntimeControlAuthority|runtimed|socket::tests::runtime_control_mutations_require_live_uiserver_or_logical_admin
+runtime-control-authority/RuntimeControlAuthority|runtimed|runtime_transactions::tests::peer_and_complete_request_fingerprint_are_bound
+service-mutation-recovery/ServiceMutationRecovery|runtimed|runtime_transactions::tests::replay_returns_original_late_commit_without_a_second_admission
+service-mutation-recovery/ServiceMutationRecovery|runtimed|runtime_transactions::tests::evicted_finished_identity_cannot_acquire_an_extended_deadline
+service-mutation-recovery/ServiceMutationRecovery|runtimed|runtime_transactions::tests::unknown_records_remain_bounded_and_expire_without_readmitting_old_ids
+service-mutation-recovery/ServiceMutationRecovery|sessiond|tests::uncertain_startup_launch_is_held_and_never_automatically_recreated
+service-mutation-recovery/ServiceMutationRecovery|uiserver|app::launch::tests::server_restart_unknown_never_resubmits_the_action
+product-boot/ProductBoot|runtimed|spawn::launch_bookkeeping_tests::rpc_launch_is_not_committed_until_worker_finishes_and_is_replayable
 runtime-control-authority/RuntimeControlAuthority|runtimed|socket::tests::partial_background_client_never_busy_waits_the_policy_loop
 ipc-reply-deadline/IpcReplyDeadline|kernel-ipc-runtime|ipc::tests::endpoint_cancel_dequeued_call_invalidates_late_reply
 ipc-reply-deadline/IpcReplyDeadline|kernel-ipc-runtime|ipc::tests::endpoint_cancel_rejects_wrong_caller_without_consuming_reply
@@ -2650,6 +2666,9 @@ ipc-reply-deadline/IpcReplyDeadline|rootd|control_drain::tests::root_control_dra
 ipc-reply-deadline/IpcReplyDeadline|runtimed|tests::session_control_drain_services_a_bounded_ready_burst
 ipc-reply-deadline/IpcReplyDeadline|kernel-compat|user::syscall::linux::ipc_ops::tests::public_ipc_calls_share_the_finite_service_deadline
 ipc-reply-deadline/IpcReplyDeadline|kernel-compat|user::syscall::linux::ipc_ops::reply_wait::tests::the_wait_polls_twice_per_turn_and_arms_only_after_the_first_poll
+ipc-reply-deadline/IpcReplyDeadline|kernel-compat|user::syscall::linux::ipc_ops::reply_wait::tests::reply_arm_refusal_is_bounded_by_deadline_not_scheduler_turn_count
+product-boot/ProductBoot|rustos-svc-runtime|loader_client::tests::loader_cancellation_never_remints_the_expired_parent_budget
+product-boot/ProductBoot|rustos-svc-runtime|loader_client::tests::a_delivered_spawn_keeps_child_custody_when_the_client_resumes_after_expiry
 ipc-reply-deadline/IpcReplyDeadline|kernel-compat|user::syscall::linux::ipc_ops::tests::stable_service_endpoint_snapshot_rejects_revoked_owners
 ipc-reply-deadline/IpcReplyDeadline|kernel-ipc-runtime|ipc::tests::prepared_reply_bind_rejects_foreign_and_duplicate_owner_without_mutation
 ipc-reply-deadline/IpcReplyDeadline|kernel-ipc-runtime|ipc::tests::cancelling_before_reply_returns_prepared_descriptor_once
@@ -2708,6 +2727,8 @@ dvm-gpu-admission/DvmGpuAdmission|uiserver|gpu_runtime::tests::dvm_gpu_admission
 dvm-gpu-atlas-transport/DvmGpuAtlasTransport|driver-domain-protocol|tests::gpu_atlas_transport_separates_immutable_sources_from_completions
 dvm-input-revocation/DvmInputRevocation|kernel-io-manager|input::dvm_ring::tests::policy_consumer_withdrawal_preserves_transport_but_stops_production
 dvm-network-control/DvmNetworkControl|kernel-io-manager|io::dvm_network::tests::control_lease_requires_nonzero_epoch_and_exact_revocation
+dvm-network-control/DvmNetworkControl|kernel-io-manager|io::dvm_network::tests::netd_publication_serializes_reset_and_preserves_rejected_admission
+dvm-network-control/DvmNetworkControl|kernel-io-manager|io::dvm_network::tests::a_predecessor_operation_cannot_mutate_the_successor_after_waiting
 exec-ticket/ExecTicket|kernel-compat|user::syscall::linux::proc_broker_ops::tests::deferred_activation_authority_is_exact_one_shot_and_nontransferable
 gui-dvm-pixel-authority/GuiDvmPixelAuthority|driver-domain-protocol|tests::gpu_timeline_is_monotonic_bounded_and_reset_by_epoch
 gui-dvm-surface/GuiDvmSurface|driver-domain-protocol|tests::gui_surface_control_is_fixed_and_capability_bounded

@@ -29,9 +29,28 @@ use super::*;
 /// same one.
 const POLLS_PER_WAIT_TURN: u32 = rustos_user_abi::performance::IPC_REPLY_WAIT_POLLS_PER_TURN;
 
-/// Yielded retries of a refused reply-wait arm before the refusal is treated
-/// as permanent (no Current bank, terminal owner) and reported as `EINVAL`.
-pub(super) const MAX_TRANSIENT_ARM_REFUSALS: u32 = 256;
+/// A scheduler publication refusal is not an invalid caller argument. Only
+/// expiry or loss of the exact Current subject ends its retry authority.
+fn reply_arm_retry_admission(expired: bool, exact_caller: bool) -> Result<(), i64> {
+    if expired {
+        Err(LINUX_ETIMEDOUT)
+    } else if !exact_caller {
+        Err(LINUX_ESRCH)
+    } else {
+        Ok(())
+    }
+}
+
+pub(super) fn retry_refused_reply_arm(caller_task_id: u64, deadline_tick: u64) -> Result<(), i64> {
+    reply_arm_retry_admission(
+        reply_deadline_expired(deadline_tick),
+        multitask::current_task_id() == Some(caller_task_id),
+    )?;
+    // Scheduler entry services the exact deferred publication that refused
+    // this arm. Do not spin under a Current loan or invent another deadline.
+    multitask::yield_now();
+    Ok(())
+}
 
 pub(super) fn wait_for_reply_with_deadline(
     reply: KernelReplyHandle,
@@ -40,7 +59,6 @@ pub(super) fn wait_for_reply_with_deadline(
 ) -> Result<(Vec<u8>, Vec<KernelTransferredHandle>), i64> {
     let caller_task_id = multitask::current_task_id().ok_or(LINUX_EINVAL)?;
     let mut cycle_mark = phase_mark();
-    let mut arm_refusals = 0_u32;
     loop {
         // One turn of this loop polls the response queue exactly twice: once
         // before the block is armed and once after, which is the race fix. A
@@ -100,18 +118,17 @@ pub(super) fn wait_for_reply_with_deadline(
             // enqueued, so cancelling here turned a transient race into a
             // spurious EINVAL for the caller; yield so the publication
             // settles and let the deadline sample at the top bound the retry.
-            arm_refusals += 1;
-            if arm_refusals <= MAX_TRANSIENT_ARM_REFUSALS {
-                multitask::yield_now();
-                continue;
+            if let Err(errno) = retry_refused_reply_arm(caller_task_id, deadline_tick) {
+                let reason = if errno == LINUX_ETIMEDOUT {
+                    ReplyCancelReason::DeadlineBeforeArm
+                } else {
+                    ReplyCancelReason::InvalidArm
+                };
+                cancel_reply_wait(reply, caller_task_id, reason);
+                return Err(errno);
             }
-            cancel_reply_wait(reply, caller_task_id, ReplyCancelReason::InvalidArm);
-            return Err(LINUX_EINVAL);
+            continue;
         }
-        // Count *consecutive* refused arms. A successful scheduler arm
-        // ends the previous publication race, even if the timer arm or the
-        // subsequent commit must retry within the original deadline.
-        arm_refusals = 0;
         if !arm_reply_deadline_waiter(caller_task_id, deadline_tick) {
             let _ = multitask::cancel_block_current_task();
             multitask::yield_now();
@@ -224,6 +241,15 @@ pub(super) fn take_endpoint_response_for_wait(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reply_arm_refusal_is_bounded_by_deadline_not_scheduler_turn_count() {
+        for _ in 0..4096 {
+            assert_eq!(super::reply_arm_retry_admission(false, true), Ok(()));
+        }
+        assert_eq!(super::reply_arm_retry_admission(true, true), Err(super::LINUX_ETIMEDOUT));
+        assert_eq!(super::reply_arm_retry_admission(false, false), Err(super::LINUX_ESRCH));
+    }
+
     /// Witness for the cost invariants in `ipc-reply-deadline`.
     ///
     /// `WaitTurnPollsAtMostTwice` and `TimerArmedOnlyAfterAPoll` are statements
@@ -269,10 +295,12 @@ mod tests {
              pay the arm and disarm pair"
         );
 
-        let reset = body.find("arm_refusals = 0;").expect("successful arm resets retry streak");
+        assert!(!body.contains("MAX_TRANSIENT_ARM_REFUSALS"),
+            "scheduler speed is not authority to cancel a live reply");
+        let retry = body.find("retry_refused_reply_arm(caller_task_id, deadline_tick)")
+            .expect("refusal retains the exact original caller and deadline");
         let timer_arm = body.find("if !arm_reply_deadline_waiter(").expect("deadline arm");
-        assert!(arm < reset && reset < timer_arm,
-            "successful reply block arm must clear previous transient refusals");
+        assert!(arm < retry && retry < timer_arm);
 
         let ceiling = body
             .find("polls, POLLS_PER_WAIT_TURN,")

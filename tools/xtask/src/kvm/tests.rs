@@ -361,6 +361,12 @@ mod tests {
     fn dvm_gpu_compositor_requires_real_virgl_fences_and_bounded_latency() {
         let ready = "rustos-dvm-gpu: ready contract=1 driver=virtio_gpu renderer=virgl_(AMD_Radeon_780M) backend-class=virtual-staged certification=registered commands=3 gpu-fence=1 acquire-fence=1 prime_us=12000 frames=120 fps_milli=60001 avg_us=400 max_us=900 wall_max_us=1000 frame_hash_a=ac8906df9029660b frame_hash_b=bc8906df9029660b hash-stable=1 hash-dynamic=1 negative=5 software=0 scheduler=rr priority=8 rttime-soft-us=50000 rttime-hard-us=100000 rttime-hard-action=terminate scheduler-restored=normal performance-target=1 scope-public-abi=0 scope-ui-connected=0 scope-scanout=0\nrustos-dvm-gpu: health sequence=1 completion_us=900 acquire-fence=1\nrustos-dvm-gpu: health sequence=2 completion_us=900 acquire-fence=1\nrustos-dvm-gpu: health sequence=3 completion_us=900 acquire-fence=1";
         assert!(dvm_gpu_compositor_ready(ready, VIRTUAL_GPU_EVIDENCE));
+        let options = parse_smoke_options(Vec::<String>::new().into_iter()).unwrap();
+        let display_ready = format!("{ready}\nrustos-dvm-display: recovery v=1 generation=7 attempt=1 state=starting cause=invitation errno=0\nrustos-dvm-display: recovery v=1 generation=7 attempt=1 state=ready cause=frame-presented errno=0 frames=1 sequence=1\n");
+        assert!(required_dvm_gpu_ready(&options, &display_ready, VIRTUAL_GPU_EVIDENCE),
+            "the independent probe primes before the compositor attempt begins");
+        let recovering = format!("{display_ready}rustos-dvm-display: recovery v=1 generation=7 attempt=2 state=recovering cause=fence errno=110\n");
+        assert!(!required_dvm_gpu_ready(&options, &recovering, VIRTUAL_GPU_EVIDENCE));
         let recovered = format!(
             "{}\nrustos-dvm-gpu: health sequence=1 completion_us=20000 acquire-fence=1\nrustos-dvm-gpu: health sequence=2 completion_us=900 acquire-fence=1\nrustos-dvm-gpu: health sequence=3 completion_us=900 acquire-fence=1\nrustos-dvm-gpu: health sequence=4 completion_us=900 acquire-fence=1",
             ready.lines().next().unwrap()
@@ -851,6 +857,9 @@ uiserver profile: elapsed_ms=1000 frame_hz_milli=60000 input_events=60 input_gap
         ));
         assert!(runtime_stall_or_crash_observed(
             "initd: fatal service endpoint not ready exec=services/runtimed/runtimed.elf"
+        ));
+        assert!(runtime_stall_or_crash_observed(
+            "service: fatal monotonic clock unavailable"
         ));
         assert!(!runtime_stall_or_crash_observed(
             "uiserver: panic hook installed"

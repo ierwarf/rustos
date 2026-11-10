@@ -120,12 +120,12 @@ refused reply wake can still own the slot's publication phase until its retry
 runs at a scheduler entry, and every arm is refused meanwhile. The request is
 already enqueued, so the waiter yields and re-samples the deadline instead of
 cancelling; the fast-call path rolls back and falls through to this bounded
-retry (`FallbackDeadlineArm`). Only after `MAX_TRANSIENT_ARM_REFUSALS` (256)
-**consecutive** yielded refusals is the refusal treated as permanent (no
-Current bank, terminal owner), cancelled as `InvalidArm` and reported as
-`EINVAL`. A successful scheduler arm resets the refusal streak; otherwise
-several unrelated arm/commit turns in one long call can accumulate to a false
-permanent failure. The original absolute reply deadline always bounds retries. A fast call whose
+retry (`FallbackDeadlineArm`). Refusals never acquire a turn-count ceiling:
+256 scheduler entries are neither a duration nor proof of an invalid argument.
+The retained exact caller and original absolute deadline authorize every retry;
+loss of that subject returns `ESRCH`, and expiry returns `ETIMEDOUT`. Yielding
+enters the scheduler that services the deferred publication; no new call or
+reply deadline is created. A fast call whose
 receiver already owns the request still cancels exactly as the slow path does.
 
 The typed `ipc::{call,recv_with_sender,reply,reply_recv_with_sender}` helpers

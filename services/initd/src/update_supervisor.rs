@@ -123,7 +123,7 @@ impl UpdateReconciler {
         !IMAGE_VOLUME_IS_IMMUTABLE && self.blocked.contains_key(&service)
     }
 
-    pub(super) fn poll(&mut self, now: Instant) {
+    pub(super) fn poll(&mut self, now: Instant, parent_deadline: Option<Instant>) {
         if self.next_poll.is_some_and(|due| now < due) {
             return;
         }
@@ -135,10 +135,10 @@ impl UpdateReconciler {
         if children.is_empty() {
             return;
         }
-        self.release_probe();
+        self.release_probe(parent_deadline);
         let service = children[self.cursor % children.len()].id;
         self.cursor = self.cursor.wrapping_add(1);
-        match self.fetch(service) {
+        match self.fetch(service, parent_deadline) {
             Ok(snapshot) => {
                 if snapshot.phase == UpdatePhase::RollbackRequired {
                     if self.blocked.insert(service, snapshot.epoch).is_none() {
@@ -158,7 +158,7 @@ impl UpdateReconciler {
                         digest: snapshot.digest,
                         trial_deadline_ns: snapshot.deadline_ns,
                     };
-                    if super::update_control::seal_rolled_back(approval).is_ok() {
+                    if super::update_control::seal_rolled_back(approval, parent_deadline).is_ok() {
                         self.blocked.remove(&service);
                         boot_line(&format!(
                             "initd: update rollback COMPLETE service={} epoch={} (restored incarnation healthy)",
@@ -190,7 +190,7 @@ impl UpdateReconciler {
     /// verified digest to rootd. It is compiled in only with
     /// `RUSTOS_INITD_RELEASE_PROBE=1`, so product images never poll. With the
     /// shipped empty keyring the answer is EACCES, which is logged and final.
-    fn release_probe(&mut self) {
+    fn release_probe(&mut self, parent_deadline: Option<Instant>) {
         if option_env!("RUSTOS_INITD_RELEASE_PROBE") != Some("1")
             || self.probe_done
             || self.probe_polls >= RELEASE_PROBE_MAX_POLLS
@@ -210,7 +210,7 @@ impl UpdateReconciler {
             RELEASE_PROBE_SERVICE,
             RELEASE_PROBE_EPOCH,
             deadline,
-            RELEASE_PROBE_FLOOR,
+            RELEASE_PROBE_FLOOR, parent_deadline,
         ) {
             Ok(generation) => {
                 self.probe_done = true;
@@ -248,12 +248,12 @@ impl UpdateReconciler {
         }
     }
 
-    fn fetch(&self, service: u64) -> Result<UpdateSnapshot, i32> {
+    fn fetch(&self, service: u64, parent_deadline: Option<Instant>) -> Result<UpdateSnapshot, i32> {
         let reply = call_rootd_supervisor_with_payload(
             COMMERCIAL_MAX_ROOTD_OP_UPDATE_INSPECT,
             service,
             0,
-            UPDATE_CALL_TIMEOUT_MS,
+            super::startup_timeout_ms(parent_deadline, UPDATE_CALL_TIMEOUT_MS, Instant::now())?,
             &[],
         )?;
         UpdateSnapshot::decode(

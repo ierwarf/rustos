@@ -25,7 +25,7 @@ use driver_domain_protocol::{
 };
 
 use crate::network::{PacketError, PacketTransportStatus};
-use crate::sync::KernelWaitLock;
+use crate::sync::{KernelWaitGuard, KernelWaitLock};
 
 const IVSHMEM_VENDOR_ID: u16 = 0x1af4;
 const IVSHMEM_DEVICE_ID: u16 = 0x1110;
@@ -61,6 +61,33 @@ struct DvmNetworkState {
 #[derive(Clone, Copy)]
 struct TransportLease {
     epoch: u32,
+}
+
+/// Pins the predecessor lease while a rootd-authorized netd publication is
+/// validated and committed. Acquire before the service-registry spinlock;
+/// resetting through this guard never acquires a sleepable lock under it.
+/// Packet and session operations cannot observe the publication with the old
+/// lease: they share this lock and proceed only after the reset is committed.
+pub struct DvmTransportPublicationGuard<'a> {
+    lease: KernelWaitGuard<
+        'a,
+        TransportLease,
+        { nucleus_core::util::lockdep::LockClass::DvmNetworkLeaseWait as u8 },
+    >,
+}
+
+impl DvmTransportPublicationGuard<'_> {
+    /// Call only after exact service publication authority has been validated.
+    /// Dropping an uncommitted guard leaves the current lease unchanged.
+    pub fn reset_predecessor(&mut self) {
+        self.lease.epoch = 0;
+    }
+}
+
+pub(crate) fn begin_transport_publication() -> DvmTransportPublicationGuard<'static> {
+    DvmTransportPublicationGuard {
+        lease: TRANSPORT_LEASE.lock(),
+    }
 }
 
 impl TransportLease {
@@ -204,30 +231,50 @@ const fn fixed_network_shared_bar_shape(is_io: bool, prefetchable: bool, size: u
     !is_io && prefetchable && size == DVM_NET_APERTURE_BYTES
 }
 
-pub(crate) fn transport_status() -> PacketTransportStatus {
+type TransportLeaseLock = KernelWaitLock<
+    TransportLease, { nucleus_core::util::lockdep::LockClass::DvmNetworkLeaseWait as u8 },
+>;
+type TransportLeaseGuard<'a> = KernelWaitGuard<
+    'a, TransportLease, { nucleus_core::util::lockdep::LockClass::DvmNetworkLeaseWait as u8 },
+>;
+
+fn authorized_lease(
+    lock: &TransportLeaseLock,
+    authorize: impl FnOnce() -> bool,
+) -> Result<TransportLeaseGuard<'_>, PacketError> {
+    let lease = lock.lock();
+    // Revalidate after any wait, in publication's lease -> registry order.
+    // A predecessor syscall cannot restore or revoke successor authority.
+    if !authorize() {
+        return Err(PacketError::Revoked);
+    }
+    Ok(lease)
+}
+
+pub(crate) fn transport_status(authorize: impl FnOnce() -> bool) -> Result<PacketTransportStatus, PacketError> {
     if !INSTALLED.load(Ordering::Acquire) && !try_install() {
-        return PacketTransportStatus::Unavailable;
+        return Ok(PacketTransportStatus::Unavailable);
     }
     // The aperture is host-created and header-validated, but mapping it does
     // not make a DVM live.  A guest-writable ready bit could be forged.  Hold
     // the lease across the state check so SESSION_END cannot race a reported
     // available transport with a later packet submission.
-    let lease = TRANSPORT_LEASE.lock();
+    let lease = authorized_lease(&TRANSPORT_LEASE, authorize)?;
     if STATE.lock().is_none() {
-        return PacketTransportStatus::Unavailable;
+        return Ok(PacketTransportStatus::Unavailable);
     }
-    if lease.is_active() {
+    Ok(if lease.is_active() {
         PacketTransportStatus::Active
     } else {
         PacketTransportStatus::AwaitingAuthenticatedControl
-    }
+    })
 }
 
-pub(crate) fn transmit(frame: &[u8]) -> Result<usize, PacketError> {
+pub(crate) fn transmit(frame: &[u8], authorize: impl FnOnce() -> bool) -> Result<usize, PacketError> {
     // Lock ordering is always control lease, then ring state.  Revocation
     // waits for an already-started bounded packet operation, then makes every
     // later operation fail as NoDevice rather than using an untrusted aperture.
-    let lease = TRANSPORT_LEASE.lock();
+    let lease = authorized_lease(&TRANSPORT_LEASE, authorize)?;
     if !lease.is_active() {
         return Err(PacketError::NoDevice);
     }
@@ -258,8 +305,8 @@ pub(crate) fn transmit(frame: &[u8]) -> Result<usize, PacketError> {
     Ok(frame.len())
 }
 
-pub(crate) fn receive(out: &mut [u8]) -> Result<usize, PacketError> {
-    let lease = TRANSPORT_LEASE.lock();
+pub(crate) fn receive(out: &mut [u8], authorize: impl FnOnce() -> bool) -> Result<usize, PacketError> {
+    let lease = authorized_lease(&TRANSPORT_LEASE, authorize)?;
     if !lease.is_active() {
         return Err(PacketError::NoDevice);
     }
@@ -342,16 +389,16 @@ fn advance_rx_consumer(state: &mut DvmNetworkState) {
 /// Enforce a netd-selected transport generation. The kernel validates only
 /// non-zero generation and exact-revoke semantics; input-session ownership and
 /// recovery policy remain entirely in inputd/netd.
-pub(crate) fn grant_transport_lease(epoch: u32) -> bool {
+pub(crate) fn grant_transport_lease(epoch: u32, authorize: impl FnOnce() -> bool) -> bool {
     if epoch == 0 {
         return false;
     }
 
-    if !INSTALLED.load(Ordering::Acquire) && !try_install() {
-        // Remember a live service-selected generation even when PCI probing
-        // is temporarily early. A later install starts with an empty receive
-        // view and can then use this lease; no DVM header value can create it.
-        return TRANSPORT_LEASE.lock().activate(epoch);
+    let installed = INSTALLED.load(Ordering::Acquire) || try_install();
+    let Ok(mut lease) = authorized_lease(&TRANSPORT_LEASE, authorize) else { return false; };
+    if !installed {
+        // Only the still-current policy owner may retain an early generation.
+        return lease.activate(epoch);
     }
 
     // Readers hold TRANSPORT_LEASE before STATE, so reset the receive cursor
@@ -359,7 +406,6 @@ pub(crate) fn grant_transport_lease(epoch: u32) -> bool {
     // backlog from a retired session. A forged producer never advances a
     // RustOS-owned cursor during this reset.
     let (activated, discarded) = {
-        let mut lease = TRANSPORT_LEASE.lock();
         let mut state = STATE.lock();
         let Some(state) = state.as_mut() else {
             return false;
@@ -367,6 +413,7 @@ pub(crate) fn grant_transport_lease(epoch: u32) -> bool {
         let discarded = state.discard_retired_receive_backlog();
         (lease.activate(epoch), discarded)
     };
+    drop(lease);
     if activated {
         // Do not call the logging path while either transport lock is held.
         crate::debug::println!(
@@ -379,9 +426,9 @@ pub(crate) fn grant_transport_lease(epoch: u32) -> bool {
 
 /// Revoke exactly the netd-selected transport generation. An old cleanup
 /// cannot tear down a newer lease.
-pub(crate) fn revoke_transport_lease(epoch: u32) -> bool {
+pub(crate) fn revoke_transport_lease(epoch: u32, authorize: impl FnOnce() -> bool) -> bool {
     let revoked = {
-        let mut lease = TRANSPORT_LEASE.lock();
+        let Ok(mut lease) = authorized_lease(&TRANSPORT_LEASE, authorize) else { return false; };
         lease.revoke_exact(epoch)
     };
     if revoked {
@@ -392,8 +439,10 @@ pub(crate) fn revoke_transport_lease(epoch: u32) -> bool {
 
 /// Clear any generation when netd starts or loses its service-owned state.
 /// This is capability-gated by the net broker and carries no device policy.
-pub(crate) fn reset_transport_lease() {
-    TRANSPORT_LEASE.lock().epoch = 0;
+pub(crate) fn reset_transport_lease(authorize: impl FnOnce() -> bool) -> bool {
+    let Ok(mut lease) = authorized_lease(&TRANSPORT_LEASE, authorize) else { return false; };
+    lease.epoch = 0;
+    true
 }
 
 impl DvmNetworkState {
@@ -464,7 +513,49 @@ fn write_u32(base: *mut u8, offset: usize, value: u32) {
 
 #[cfg(test)]
 mod tests {
-    use super::{DVM_NET_APERTURE_BYTES, TransportLease, fixed_network_shared_bar_shape};
+    use super::{DVM_NET_APERTURE_BYTES, DvmTransportPublicationGuard, TransportLease, fixed_network_shared_bar_shape};
+
+    #[test]
+    fn netd_publication_serializes_reset_and_preserves_rejected_admission() {
+        let lease = crate::sync::KernelWaitLock::<
+            _, { nucleus_core::util::lockdep::LockClass::DvmNetworkLeaseWait as u8 },
+        >::new(TransportLease { epoch: 7 });
+        {
+            let rejected = DvmTransportPublicationGuard { lease: lease.lock() };
+            assert!(lease.try_lock().is_none(), "packet operations must await publication");
+            drop(rejected);
+        }
+        assert_eq!(lease.lock().epoch, 7, "denied registration cannot revoke a live lease");
+        {
+            let mut admitted = DvmTransportPublicationGuard { lease: lease.lock() };
+            admitted.reset_predecessor();
+            assert_eq!(admitted.lease.epoch, 0);
+            assert!(lease.try_lock().is_none(), "reset and publication retain one guard");
+        }
+        assert_eq!(lease.lock().epoch, 0, "new owner begins without predecessor authority");
+    }
+
+    #[test]
+    fn a_predecessor_operation_cannot_mutate_the_successor_after_waiting() {
+        use core::sync::atomic::{AtomicU64, Ordering};
+        let lease = super::TransportLeaseLock::new(TransportLease { epoch: 7 });
+        let publication_epoch = AtomicU64::new(41);
+        let captured = publication_epoch.load(Ordering::Acquire);
+        {
+            let mut replacement = DvmTransportPublicationGuard { lease: lease.lock() };
+            replacement.reset_predecessor();
+            publication_epoch.store(42, Ordering::Release);
+        }
+        lease.lock().activate(9);
+        let stale = super::authorized_lease(&lease, || {
+            assert!(lease.try_lock().is_none(), "authority must be rechecked under the transport lock");
+            publication_epoch.load(Ordering::Acquire) == captured
+        });
+        assert!(matches!(stale, Err(crate::network::PacketError::Revoked)));
+        assert_eq!(lease.lock().epoch, 9, "late grant/reset/revoke cannot touch the successor");
+        let mut live = super::authorized_lease(&lease, || publication_epoch.load(Ordering::Acquire) == 42).unwrap();
+        assert!(live.revoke_exact(9));
+    }
 
     #[test]
     fn network_shared_ring_requires_exact_prefetchable_write_back_memory() {

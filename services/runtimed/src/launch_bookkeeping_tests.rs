@@ -22,10 +22,10 @@ fn entry() -> LaunchEntry {
 fn state_with_worker() -> BrokerState {
     BrokerState {
         launch_worker: crate::launch_worker::start(LaunchCalls {
-            spawn: |_, _| Ok(41),
-            report_lease: |_, _| Ok(()),
-            bind_and_activate: |_, _| panic!("a timed-out or duplicate child cannot activate"),
-            await_endpoint: |_| panic!("an unactivated child has no endpoint"),
+            spawn: |_, _, _| Ok(41),
+            report_lease: |_, _, _| Ok(()),
+            bind_and_activate: |_, _, _| panic!("a timed-out or duplicate child cannot activate"),
+            await_endpoint: |_, _| panic!("an unactivated child has no endpoint"),
             retire: |pid, _| assert_eq!(pid, 41),
         }),
         ..BrokerState::default()
@@ -119,4 +119,85 @@ fn duplicate_completion_preserves_the_record_the_launch_did_not_insert() {
     finish_tracked_launch(&mut state, pid, result);
     assert_eq!(state.running.get(&41).unwrap().package_id, "original");
     assert!(state.launch_in_flight.is_none());
+}
+
+#[test]
+fn rpc_launch_is_not_committed_until_worker_finishes_and_is_replayable() {
+    use crate::runtime_transactions::Outcome;
+    use crate::{OP_REQUEST_LAUNCH_PATH, RuntimeRequest};
+    for (exec, completed_once) in [("app.elf", true), ("services/daemon/daemon.elf", false)] {
+        let mut state = BrokerState {
+            launch_worker: crate::launch_worker::start(LaunchCalls {
+                spawn: |_, _, _| Ok(41),
+                report_lease: |_, _, _| Ok(()),
+                bind_and_activate: |_, _, _| Ok(()),
+                await_endpoint: |_, _| Ok(()),
+                retire: |_, _| {},
+            }),
+            ..BrokerState::default()
+        };
+        let now = runtime_control::monotonic_nanos().unwrap();
+        let request = RuntimeRequest {
+            op: OP_REQUEST_LAUNCH_PATH,
+            transaction_id_hi: now,
+            transaction_id_lo: 1,
+            transaction_deadline_ns: now + 2_000_000_000,
+            ..RuntimeRequest::default()
+        };
+        let (key, outcome, fresh) = state
+            .runtime_transactions
+            .admit(42, request, now, false)
+            .unwrap();
+        assert!(fresh);
+        assert_eq!(outcome, Outcome::Queued);
+        let mut launch = entry();
+        launch.exec = exec.into();
+        begin_rpc_launch(
+            &mut state,
+            launch,
+            key,
+            Instant::now() + Duration::from_secs(2),
+            request.transaction_deadline_ns,
+        )
+        .unwrap();
+        assert!(matches!(wait_for_progress(&state), LaunchProgress::Started));
+        state.runtime_transactions.finish(key, Outcome::Admitted);
+        let LaunchProgress::Spawned { pid, record_ack } = wait_for_progress(&state) else {
+            panic!("spawned")
+        };
+        assert_eq!(
+            state
+                .runtime_transactions
+                .admit(42, request, now + 1, true)
+                .unwrap()
+                .1,
+            Outcome::Admitted
+        );
+        record_spawned_launch(&mut state, pid, record_ack);
+        let LaunchProgress::Finished { pid, result } = wait_for_progress(&state) else {
+            panic!("finished")
+        };
+        finish_tracked_launch(&mut state, pid, result);
+        let (_, outcome, fresh) = state
+            .runtime_transactions
+            .admit(42, request, now + 3_000_000_000, true)
+            .unwrap();
+        assert_eq!(outcome, Outcome::Finished(Ok(())));
+        assert!(!fresh);
+        assert_eq!(state.launched_once.contains("pkg"), completed_once);
+        assert!(
+            !state.running.get(&41).unwrap().restart,
+            "RPC service restart custody must not move back into runtimed"
+        );
+        state.running.remove(&41);
+        assert_eq!(
+            crate::catalog::runtime_deps_satisfied(
+                &[String::from("pkg")],
+                &crate::catalog::running_packages(&state),
+                &state.launched_once,
+            ),
+            completed_once,
+            "only committed one-shots satisfy dependencies after exit"
+        );
+    }
 }

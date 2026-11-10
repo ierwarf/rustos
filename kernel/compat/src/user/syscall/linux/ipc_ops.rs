@@ -1035,6 +1035,11 @@ pub(super) fn syscall_linux_rustos_ipc_register_service_endpoint(
             return linux_errno(errno);
         }
     };
+    // Acquire the sleepable transport lease before the raw registry lock.
+    // Rootd authorized this registrar above; the guard only couples exact
+    // owner publication to retirement of predecessor transport authority.
+    let mut network_publication = (service_id == linux_abi::IPC_SERVICE_NETD)
+        .then(kernel_io_manager::api::network::begin_dvm_transport_publication);
     let registry_mutation = SERVICE_ENDPOINT_REGISTRY_MUTATION.lock();
     if multitask::is_user_process_exiting(process_id) {
         drop(registry_mutation);
@@ -1074,6 +1079,9 @@ pub(super) fn syscall_linux_rustos_ipc_register_service_endpoint(
     if service_id == linux_abi::IPC_SERVICE_ROOTD && sealed_rootd_owner == 0 {
         ROOTD_BOOTSTRAP_OWNER.store(process_id, Ordering::Release);
     }
+    if let Some(publication) = network_publication.as_mut() {
+        publication.reset_predecessor();
+    }
     SERVICE_ENDPOINT_CAPS[index].store(authorization.capability.to_wire(), Ordering::Release);
     SERVICE_ENDPOINT_OWNERS[index].store(process_id, Ordering::Release);
     if authorization.capability.contains(ServiceCapability::PagerPolicy) {
@@ -1086,6 +1094,8 @@ pub(super) fn syscall_linux_rustos_ipc_register_service_endpoint(
     // the rootd-authorized owner and capability written above.
     SERVICE_ENDPOINTS[index].store(endpoint, Ordering::Release);
     drop(registry_mutation);
+    // No packet operation can use the new owner with the predecessor lease.
+    drop(network_publication);
     ipc_trace!(
         "ipc service registered: service={} endpoint={} owner={} caps={:#x}",
         service_id,
@@ -1831,7 +1841,6 @@ fn collect_inline_reply<const N: usize>(
             );
         }
     }
-    let mut arm_refusals = 0_u32;
     loop {
         for armed in [false, true] {
             let take = observe_inline_reply(deadline_tick, crate::arch::rtc::ticks, || {
@@ -1864,13 +1873,16 @@ fn collect_inline_reply<const N: usize>(
             if !armed {
                 if !multitask::arm_block_current_task_on_reply(reply.raw()) {
                     // Transient: see `wait_for_reply_with_deadline`.
-                    arm_refusals += 1;
-                    if arm_refusals <= reply_wait::MAX_TRANSIENT_ARM_REFUSALS {
-                        multitask::yield_now();
-                        break;
+                    if let Err(errno) = reply_wait::retry_refused_reply_arm(task_id, deadline_tick) {
+                        let reason = if errno == LINUX_ETIMEDOUT {
+                            ReplyCancelReason::DeadlineBeforeArm
+                        } else {
+                            ReplyCancelReason::InvalidArm
+                        };
+                        cancel_reply_wait(reply, task_id, reason);
+                        return Err(errno);
                     }
-                    cancel_reply_wait(reply, task_id, ReplyCancelReason::InvalidArm);
-                    return Err(LINUX_EINVAL);
+                    break;
                 }
                 if !arm_reply_deadline_waiter(task_id, deadline_tick) {
                     let _ = multitask::cancel_block_current_task();

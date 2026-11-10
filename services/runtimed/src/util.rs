@@ -66,6 +66,18 @@ pub(super) fn request_path(request: &RuntimeRequest) -> Result<String, i32> {
 }
 
 pub(super) fn validate_runtime_request(request: &RuntimeRequest) -> Result<(), i32> {
+    let is_mutation = matches!(request.op, OP_REQUEST_LAUNCH_PATH | OP_REQUEST_TERMINATE);
+    if request.reserved != 0
+        || request.reserved2 != 0
+        || (request.flags != 0 && request.flags != runtime_control::protocol::REQUEST_FLAG_QUERY)
+        || (!is_mutation
+            && (request.flags != 0
+                || request.transaction_id_hi != 0
+                || request.transaction_id_lo != 0
+                || request.transaction_deadline_ns != 0))
+    {
+        return Err(libc::EINVAL);
+    }
     // `wait_ms` is meaningful only where the server may park the reply. Every
     // other op must still send zero, so the field cannot quietly acquire a
     // second meaning on a path that never reads it.

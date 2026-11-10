@@ -10,6 +10,7 @@ pub(super) fn report_rootd_service_lease(
     service_id: u64,
     exec_path: &str,
     pid: i32,
+    deadline_ns: Option<u64>,
 ) -> Result<(), i32> {
     let endpoint = lookup_rootd_endpoint()?;
     let mut request = CommercialMaxProtocolRequest::default();
@@ -31,6 +32,7 @@ pub(super) fn report_rootd_service_lease(
     request.payload[..report.len()].copy_from_slice(&report);
 
     let mut response = CommercialMaxProtocolResponse::default();
+    let timeout_ms = bounded_timeout_ms(deadline_ns)?;
     // SAFETY: Both records are fixed-size, live, and correctly mutable for the
     // syscall; ring0 validates endpoint ownership and complete user ranges.
     let call = unsafe {
@@ -41,7 +43,7 @@ pub(super) fn report_rootd_service_lease(
             size_of::<CommercialMaxProtocolRequest>() as u64,
             (&mut response as *mut CommercialMaxProtocolResponse) as u64,
             size_of::<CommercialMaxProtocolResponse>() as u64,
-            IPC_BOOT_CONTROL_HARD_LIMIT_MS,
+            timeout_ms,
         )
     };
     if call < 0 {
@@ -60,6 +62,7 @@ pub(super) fn report_rootd_service_lease(
 
 pub(super) fn request_scheduling_context_authority(
     exec_path: &str,
+    deadline_ns: Option<u64>,
 ) -> Result<RustosSchedulingContextAuthority, i32> {
     let endpoint = lookup_service_endpoint(IPC_SERVICE_ROOTD);
     if endpoint <= 0 {
@@ -82,6 +85,7 @@ pub(super) fn request_scheduling_context_authority(
     request.path_len = path.len() as u32;
     request.path[..path.len()].copy_from_slice(path);
     let mut response = CommercialMaxProtocolResponse::default();
+    let timeout_ms = bounded_timeout_ms(deadline_ns)?;
     // SAFETY: Both fixed-size records remain live for the syscall and ring0
     // validates endpoint authority and complete user ranges before copying.
     let call = unsafe {
@@ -92,7 +96,7 @@ pub(super) fn request_scheduling_context_authority(
             size_of::<CommercialMaxProtocolRequest>() as u64,
             (&mut response as *mut CommercialMaxProtocolResponse) as u64,
             size_of::<CommercialMaxProtocolResponse>() as u64,
-            IPC_BOOT_CONTROL_HARD_LIMIT_MS,
+            timeout_ms,
         )
     };
     if call < 0 {
@@ -173,8 +177,14 @@ mod tests {
             ..CommercialMaxProtocolResponse::default()
         };
         let size = size_of::<CommercialMaxProtocolResponse>() as i64;
-        assert_eq!(check_rootd_status(size, &request, &response), Err(libc::EAGAIN));
+        assert_eq!(
+            check_rootd_status(size, &request, &response),
+            Err(libc::EAGAIN)
+        );
         response.header.subject_pid = 42;
-        assert_eq!(check_rootd_status(size, &request, &response), Err(libc::EPROTO));
+        assert_eq!(
+            check_rootd_status(size, &request, &response),
+            Err(libc::EPROTO)
+        );
     }
 }

@@ -15,7 +15,12 @@ fn required_dvm_gpu_ready(
     log: &str,
     expected: GpuEvidenceExpectation,
 ) -> bool {
-    options.storage_only || dvm_gpu_compositor_ready(log, expected)
+    // The GPU probe is a separate process and primes before the display
+    // invitation exists. Scope compositor evidence to its attempt, but retain
+    // the probe's independent ready/health/fault lifecycle for this DVM boot.
+    options.storage_only || (dvm_gpu_compositor_ready(log, expected)
+        && (latest_display_recovery(log).is_none()
+            || current_display_attempt_log(log).is_some()))
 }
 
 fn dvm_gpu_compositor_ready(log: &str, expected: GpuEvidenceExpectation) -> bool {
@@ -149,6 +154,139 @@ fn dvm_gpu_compositor_ready(log: &str, expected: GpuEvidenceExpectation) -> bool
     ready && healthy_run >= DVM_GPU_HEALTH_SAMPLES
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DisplayRecoveryState { Starting, Recovering, Ready, Failed }
+
+#[derive(Debug, PartialEq, Eq)]
+struct DisplayRecovery {
+    generation: u64,
+    attempt: u64,
+    state: DisplayRecoveryState,
+    cause: String,
+    errno: i32,
+}
+
+fn parse_display_recovery(line: &str) -> Option<DisplayRecovery> {
+    let (bootstrap, fields) = if let Some((_, fields)) = line.split_once("rustos-dvm-display: recovery ") {
+        (false, fields)
+    } else {
+        (true, line.split_once("rustos-dvm-display: bootstrap ")?.1)
+    };
+    let field = |key: &str| fields.split_whitespace().find_map(|item| {
+        let (name, value) = item.split_once('=')?;
+        (name == key).then_some(value.trim_end_matches("\\n"))
+    });
+    if field("v")? != "1" { return None; }
+    let generation = field("generation")?.parse::<u64>().ok()?;
+    if bootstrap && generation != 0 { return None; }
+    let state = match field("state")? {
+        "starting" => DisplayRecoveryState::Starting,
+        "recovering" => DisplayRecoveryState::Recovering,
+        "ready" if generation != 0
+            && field("frames")?.parse::<u64>().ok()? > 0
+            && field("sequence")?.parse::<u64>().ok()? > 0 => DisplayRecoveryState::Ready,
+        "failed" => DisplayRecoveryState::Failed,
+        _ => return None,
+    };
+    Some(DisplayRecovery { generation, attempt: field("attempt")?.parse().ok()?, state,
+        cause: field("cause")?.to_owned(), errno: field("errno")?.parse().ok()? })
+}
+
+fn latest_display_recovery(log: &str) -> Option<DisplayRecovery> {
+    let mut latest: Option<DisplayRecovery> = None;
+    for record in log.lines().filter_map(parse_display_recovery) {
+        let replace = latest.as_ref().is_none_or(|previous| {
+            let old = (previous.generation, previous.attempt);
+            let new = (record.generation, record.attempt);
+            new > old || (new == old && previous.state != DisplayRecoveryState::Failed)
+        });
+        if replace { latest = Some(record); }
+    }
+    latest
+}
+
+// Evidence from an older owner attempt cannot establish the current one.
+fn current_display_attempt_log(log: &str) -> Option<&str> {
+    let latest = latest_display_recovery(log)?;
+    if latest.generation == 0 || latest.state != DisplayRecoveryState::Ready { return None; }
+    let mut begin = None;
+    let mut ready_begin = None;
+    let mut ready_end = None;
+    let mut scope_end = log.len();
+    let mut offset = 0;
+    for line in log.split_inclusive('\n') {
+        if let Some(record) = parse_display_recovery(line) {
+            if ready_end.is_some() && record.generation == 0 { scope_end = scope_end.min(offset); }
+            if record.generation > 0 && (record.generation, record.attempt) != (latest.generation, latest.attempt)
+                && matches!(record.state, DisplayRecoveryState::Ready | DisplayRecoveryState::Failed) { begin = None; }
+            if record.attempt == latest.attempt
+                && (record.generation == latest.generation || record.generation == 0)
+                && matches!(record.state, DisplayRecoveryState::Starting | DisplayRecoveryState::Recovering)
+            { begin = Some(offset); }
+            if record.generation == latest.generation && record.attempt == latest.attempt
+                && record.state == DisplayRecoveryState::Ready {
+                ready_begin = begin;
+                ready_end = Some(offset + line.len());
+                scope_end = log.len();
+            }
+        }
+        offset += line.len();
+    }
+    // The current attempt can continue to emit evidence after ready; do not let
+    // unrelated later pre-invitation records change its lower bound.
+    let start = ready_begin?;
+    let _ = ready_end?;
+    Some(&log[start..scope_end])
+}
+
+#[cfg(test)]
+mod display_recovery_tests {
+    use super::*;
+
+    #[test]
+    fn newer_ready_suppresses_stale_failure_but_terminal_fails_fast() {
+        let failed = "rustos-dvm-display: recovery v=1 generation=1 attempt=1 state=failed cause=render errno=5";
+        let ready = "rustos-dvm-display: recovery v=1 generation=2 attempt=1 state=ready cause=none errno=0 frames=1 sequence=1";
+        assert!(dvm_display_failure(failed, false).is_some());
+        let log = format!("{ready}\n{failed}\nrustos-dvm-display: gpu-compositor offline stage=gpu-dmabuf-acquire");
+        assert_eq!(latest_display_recovery(&log).unwrap().state, DisplayRecoveryState::Ready);
+        assert_eq!(dvm_display_failure(&log, false), None);
+    }
+
+    #[test]
+    fn bootstrap_failure_and_bound_session_order_are_distinct() {
+        let pre_failed = "rustos-dvm-display: recovery v=1 generation=0 attempt=3 state=failed cause=invitation errno=5";
+        assert!(dvm_display_failure(pre_failed, false).is_some());
+        assert!(latest_display_recovery("rustos-dvm-display: recovery v=1 generation=0 attempt=1 state=ready cause=none errno=0").is_none());
+        let bound = "rustos-dvm-display: recovery v=1 generation=4 attempt=1 state=ready cause=none errno=0 frames=1 sequence=1";
+        assert_eq!(latest_display_recovery(&format!("{bound}\n{pre_failed}")).unwrap().state, DisplayRecoveryState::Ready);
+    }
+
+    #[test]
+    fn old_evidence_cannot_complete_a_new_attempt() {
+        let log = "rustos-dvm-display: recovery v=1 generation=1 attempt=1 state=ready cause=none errno=0 frames=1 sequence=1\nrustos-dvm-display: active old\nrustos-dvm-display: recovery v=1 generation=2 attempt=1 state=starting cause=none errno=0\n";
+        assert!(current_display_attempt_log(log).is_none());
+        assert!(!dvm_display_relay_ready(log, false));
+        let ready = format!("{log}rustos-dvm-display: recovery v=1 generation=2 attempt=1 state=ready cause=none errno=0 frames=1 sequence=2\n");
+        assert!(!current_display_attempt_log(&ready).unwrap().contains("active old"));
+    }
+
+    #[test]
+    fn terminal_failure_cannot_be_revived_inside_the_same_attempt() {
+        let log = "rustos-dvm-display: recovery v=1 generation=7 attempt=2 state=failed cause=fence errno=110\nrustos-dvm-display: recovery v=1 generation=7 attempt=2 state=ready cause=none errno=0 frames=1 sequence=1";
+        assert_eq!(latest_display_recovery(log).unwrap().state, DisplayRecoveryState::Failed);
+        assert!(parse_display_recovery("rustos-dvm-display: recovery v=1 generation=7 attempt=3 state=ready cause=none errno=0 frames=0 sequence=0").is_none());
+        assert!(dvm_display_failure("rustos-dvm-display: bootstrap v=1 generation=0 attempt=1 state=failed cause=prime errno=110", false).is_some());
+    }
+
+    #[test]
+    fn recovery_is_not_terminal() {
+        let log = "rustos-dvm-display: recovery v=1 generation=1 attempt=2 state=recovering cause=render errno=110";
+        assert_eq!(dvm_display_failure(log, false), None);
+        assert_eq!(latest_display_recovery(log).unwrap().state, DisplayRecoveryState::Recovering);
+    }
+}
+
 /// A compositor that went offline because one frame missed its wall-clock
 /// render budget is retried by the relay (`DISPLAY_SERVE_RETRY`, re-prime after
 /// 1 s). That is a slow host, not a broken device, and the check runs while the
@@ -160,6 +298,11 @@ fn gpu_compositor_offline_is_transient(line: &str) -> bool {
 }
 
 fn dvm_display_failure(log: &str, physical_gpu: bool) -> Option<String> {
+    if let Some(record) = latest_display_recovery(log) {
+        return (record.state == DisplayRecoveryState::Failed).then(|| format!(
+            "Linux DVM display failed generation={} attempt={} cause={} errno={}",
+            record.generation, record.attempt, record.cause, record.errno));
+    }
     for line in log.lines() {
         if line.contains("rustos-dvm-display: gpu-compositor offline")
             && !gpu_compositor_offline_is_transient(line)
@@ -303,7 +446,11 @@ fn dvm_display_relay_ready(log: &str, physical_amdgpu: bool) -> bool {
         DVM_DISPLAY_HEIGHT,
     )
     .stride_bytes;
-    let active = log.lines().any(|line| {
+    let current = if latest_display_recovery(log).is_some() {
+        let Some(current) = current_display_attempt_log(log) else { return false; };
+        current
+    } else { log };
+    let active = current.lines().any(|line| {
         let has_interrupt = line
             .split_whitespace()
             .find_map(|field| field.strip_prefix("irq_count="))
@@ -1019,6 +1166,7 @@ fn runtime_stall_or_crash_observed(log: &str) -> bool {
         "[drm:virtio_gpu_dequeue_ctrl_func] *ERROR*",
         "panicked at ",
         "fatal runtime error",
+        "service: fatal monotonic clock unavailable",
         "memory allocation of ",
         "fatal service endpoint not ready",
         "BUG:",

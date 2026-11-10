@@ -139,6 +139,16 @@ before arming a finite deadline. A future mutable time policy must be admitted
 once through an immutable scheduler-local lease, never through each clock read
 or sleep.
 
+Ring3 authority deadlines use the same kernel-wide `CLOCK_MONOTONIC`
+nanosecond domain. `try_monotonic_nanos` distinguishes syscall failure,
+malformed timespec and arithmetic overflow from a valid zero timestamp.
+The infallible service-runtime wrapper emits a fatal clock diagnostic and
+exits with status 125 on error; it never fabricates zero or saturates invalid
+time into an unlimited lease. Inputd uses that same checked reader. A caller
+that can safely abort one transaction may use the fallible API instead of
+terminating its service. Monotonic instants are not portable across the
+RustOS/DVM/L0 clock domains.
+
 Endpoints registered via `SYS_RUSTOS_IPC_REGISTER_SERVICE_ENDPOINT`, looked up by stable `IPC_SERVICE_*` id. Registering endpoint `0` revokes; later lookups fail closed.
 Before final endpoint cleanup, a terminating process is marked exiting. Endpoint
 publication, explicit revoke, and exit cleanup share one registry mutation

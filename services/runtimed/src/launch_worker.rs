@@ -28,7 +28,7 @@
 use std::cell::Cell;
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError, TrySendError};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::kvm_smp_qualification::KvmSmpQualificationContract;
 use crate::LaunchEntry;
@@ -52,10 +52,14 @@ pub(crate) struct LaunchJob {
     pub(crate) qualification_contract: Option<KvmSmpQualificationContract>,
     pub(crate) session_handle: Option<u64>,
     pub(crate) is_ui_server: bool,
+    pub(crate) deadline: Option<Instant>,
+    pub(crate) deadline_ns: Option<u64>,
+    pub(crate) report_started: bool,
 }
 
 /// What the worker tells the loop.
 pub(crate) enum LaunchProgress {
+    Started,
     /// The child exists and is start-suspended. The worker is now blocked
     /// waiting for the loop to record it; it cannot activate until then.
     Spawned {
@@ -84,11 +88,14 @@ pub(crate) enum RecordAck {
 /// The blocking calls a launch makes, injected so the protocol can be tested
 /// without a loader, a console, or ring0.
 pub(crate) struct LaunchCalls {
-    pub(crate) spawn: fn(&LaunchEntry, u64) -> Result<i32, i32>,
-    pub(crate) report_lease: fn(&LaunchEntry, i32) -> Result<(), i32>,
-    pub(crate) bind_and_activate:
-        fn(i32, Option<KvmSmpQualificationContract>) -> Result<(), (&'static str, i32)>,
-    pub(crate) await_endpoint: fn(i32) -> Result<(), i32>,
+    pub(crate) spawn: fn(&LaunchEntry, u64, Option<u64>) -> Result<i32, i32>,
+    pub(crate) report_lease: fn(&LaunchEntry, i32, Option<u64>) -> Result<(), i32>,
+    pub(crate) bind_and_activate: fn(
+        i32,
+        Option<KvmSmpQualificationContract>,
+        Option<u64>,
+    ) -> Result<(), (&'static str, i32)>,
+    pub(crate) await_endpoint: fn(i32, Option<u64>) -> Result<(), i32>,
     pub(crate) retire: fn(i32, &str),
 }
 
@@ -171,18 +178,43 @@ fn execute(
     progress: &SyncSender<LaunchProgress>,
     calls: &LaunchCalls,
 ) -> LaunchProgress {
-    let pid = match (calls.spawn)(&job.entry, job.session_handle.unwrap_or(0)) {
+    if job.deadline.is_some_and(|end| Instant::now() >= end) {
+        return LaunchProgress::Finished {
+            pid: None,
+            result: Err(libc::ETIMEDOUT),
+        };
+    }
+    if job.report_started && progress.send(LaunchProgress::Started).is_err() {
+        return LaunchProgress::Finished {
+            pid: None,
+            result: Err(libc::EOWNERDEAD),
+        };
+    }
+    let pid = match (calls.spawn)(&job.entry, job.session_handle.unwrap_or(0), job.deadline_ns) {
         Ok(pid) => pid,
         Err(errno) => {
             return LaunchProgress::Finished {
                 pid: None,
-                result: Err(errno),
-            }
+                // The spawn boundary can fail after loaderd created a child;
+                // its errno alone does not prove that no side effect occurred.
+                result: Err(if job.report_started {
+                    libc::EOWNERDEAD
+                } else {
+                    errno
+                }),
+            };
         }
     };
 
+    if job.deadline.is_some_and(|end| Instant::now() >= end) {
+        (calls.retire)(pid, "rpc-deadline");
+        return LaunchProgress::Finished {
+            pid: Some(pid),
+            result: Err(libc::ETIMEDOUT),
+        };
+    }
     if job.is_ui_server {
-        if let Err(errno) = (calls.report_lease)(&job.entry, pid) {
+        if let Err(errno) = (calls.report_lease)(&job.entry, pid, job.deadline_ns) {
             (calls.retire)(pid, "rootd-lease-report");
             return LaunchProgress::Finished {
                 pid: Some(pid),
@@ -204,7 +236,12 @@ fn execute(
             result: Err(libc::EPIPE),
         };
     }
-    match acks.recv_timeout(RECORD_ACK_BUDGET) {
+    let ack_budget = job
+        .deadline
+        .map(|end| end.saturating_duration_since(Instant::now()))
+        .unwrap_or(RECORD_ACK_BUDGET)
+        .min(RECORD_ACK_BUDGET);
+    match acks.recv_timeout(ack_budget) {
         Ok(RecordAck::Recorded) => {}
         Ok(RecordAck::Duplicate) => {
             (calls.retire)(pid, "duplicate-pid");
@@ -225,19 +262,36 @@ fn execute(
         }
     }
 
-    if let Err((stage, errno)) = (calls.bind_and_activate)(pid, job.qualification_contract) {
+    if job.deadline.is_some_and(|end| Instant::now() >= end) {
+        (calls.retire)(pid, "rpc-deadline");
+        return LaunchProgress::Finished {
+            pid: Some(pid),
+            result: Err(libc::ETIMEDOUT),
+        };
+    }
+    if let Err((stage, errno)) =
+        (calls.bind_and_activate)(pid, job.qualification_contract, job.deadline_ns)
+    {
         (calls.retire)(pid, stage);
         return LaunchProgress::Finished {
             pid: Some(pid),
-            result: Err(errno),
+            result: Err(if job.report_started {
+                libc::EOWNERDEAD
+            } else {
+                errno
+            }),
         };
     }
     if job.is_ui_server {
-        if let Err(errno) = (calls.await_endpoint)(pid) {
+        if let Err(errno) = (calls.await_endpoint)(pid, job.deadline_ns) {
             (calls.retire)(pid, "endpoint-wait");
             return LaunchProgress::Finished {
                 pid: Some(pid),
-                result: Err(errno),
+                result: Err(if job.report_started {
+                    libc::EOWNERDEAD
+                } else {
+                    errno
+                }),
             };
         }
     }
@@ -274,12 +328,35 @@ mod tests {
 
     fn calls() -> LaunchCalls {
         LaunchCalls {
-            spawn: |_, _| Ok(41),
-            report_lease: |_, _| Ok(()),
-            bind_and_activate: |_, _| Ok(()),
-            await_endpoint: |_| Ok(()),
+            spawn: |_, _, _| Ok(41),
+            report_lease: |_, _, _| Ok(()),
+            bind_and_activate: |_, _, _| Ok(()),
+            await_endpoint: |_, _| Ok(()),
             retire: |_, _| {},
         }
+    }
+
+    #[test]
+    fn expired_rpc_job_never_spawns_a_child() {
+        let mut calls = calls();
+        calls.spawn = |_, _, _| panic!("expired job must not spawn");
+        let (sender, _receiver) = mpsc::sync_channel(2);
+        let job = LaunchJob {
+            entry: entry(),
+            qualification_contract: None,
+            session_handle: None,
+            is_ui_server: false,
+            deadline: Some(Instant::now() - Duration::from_millis(1)),
+            deadline_ns: Some(1),
+            report_started: true,
+        };
+        assert!(matches!(
+            execute(&job, &sender, &calls),
+            LaunchProgress::Finished {
+                pid: None,
+                result: Err(libc::ETIMEDOUT)
+            }
+        ));
     }
 
     /// A child may not become runnable before the loop has recorded it.
@@ -295,7 +372,7 @@ mod tests {
         ORDER.store(0, Ordering::SeqCst);
         ACTIVATED_AT.store(-1, Ordering::SeqCst);
         let mut calls = calls();
-        calls.bind_and_activate = |_, _| {
+        calls.bind_and_activate = |_, _, _| {
             ACTIVATED_AT.store(ORDER.fetch_add(1, Ordering::SeqCst), Ordering::SeqCst);
             Ok(())
         };
@@ -306,6 +383,9 @@ mod tests {
                 qualification_contract: None,
                 session_handle: None,
                 is_ui_server: false,
+                deadline: None,
+                deadline_ns: None,
+                report_started: false,
             })
             .expect("the first job is accepted");
 
@@ -347,7 +427,7 @@ mod tests {
         calls.retire = |_, _| {
             RETIRED.fetch_add(1, Ordering::SeqCst);
         };
-        calls.bind_and_activate = |_, _| panic!("a duplicate must never be activated");
+        calls.bind_and_activate = |_, _, _| panic!("a duplicate must never be activated");
         let worker = super::start(calls).expect("worker starts");
         worker
             .submit(LaunchJob {
@@ -355,6 +435,9 @@ mod tests {
                 qualification_contract: None,
                 session_handle: None,
                 is_ui_server: false,
+                deadline: None,
+                deadline_ns: None,
+                report_started: false,
             })
             .expect("the first job is accepted");
 
@@ -385,6 +468,9 @@ mod tests {
             qualification_contract: None,
             session_handle: None,
             is_ui_server: false,
+            deadline: None,
+            deadline_ns: None,
+            report_started: false,
         };
         worker.submit(job()).expect("the first job is accepted");
         // The first job occupies the worker until it is acknowledged, so the
@@ -410,8 +496,8 @@ mod tests {
         ACTIVATED.store(0, Ordering::SeqCst);
         RETIRED.store(0, Ordering::SeqCst);
         let mut calls = calls();
-        calls.spawn = |_, session| Ok(session as i32);
-        calls.bind_and_activate = |pid, _| {
+        calls.spawn = |_, session, _| Ok(session as i32);
+        calls.bind_and_activate = |pid, _, _| {
             ACTIVATED.store(pid, Ordering::SeqCst);
             Ok(())
         };
@@ -425,6 +511,9 @@ mod tests {
             qualification_contract: None,
             session_handle: Some(pid),
             is_ui_server: false,
+            deadline: None,
+            deadline_ns: None,
+            report_started: false,
         };
         worker.submit(job(41)).expect("A submitted");
         let LaunchProgress::Spawned {
@@ -490,6 +579,9 @@ mod tests {
                 qualification_contract: None,
                 session_handle: None,
                 is_ui_server: false,
+                deadline: None,
+                deadline_ns: None,
+                report_started: false,
             }),
             Err(libc::EPIPE),
         );

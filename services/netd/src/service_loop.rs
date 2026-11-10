@@ -15,15 +15,9 @@ pub(super) fn run() {
         return;
     }
 
-    // Do not advertise the endpoint before resetting the inherited DVM
-    // transport lease. Another CPU could otherwise dispatch a new socket
-    // request against that lease while this startup path revoked it.
-    if let Err(errno) = call_packet_broker(NET_BROKER_OP_PACKET_LEASE_RESET, 0, 0) {
-        debug_line(&format!(
-            "netd: failed to reset inherited DVM transport lease errno={errno}"
-        ));
-        return;
-    }
+    // Registration atomically retires predecessor transport authority before
+    // publishing the rootd-authorized owner. A pre-registration packet-broker
+    // call cannot hold NetPolicy; a post-registration reset races new work.
     let register =
         rustos_svc_runtime::ipc::register_service_endpoint(IPC_SERVICE_NETD, endpoint as u64);
     if register < 0 {
@@ -201,16 +195,17 @@ pub(super) fn publish_reply(reply_cap: u64, response: &NetdIpcResponse) -> i64 {
 #[cfg(test)]
 mod startup_publication_tests {
     #[test]
-    fn packet_lease_reset_precedes_discoverable_netd_endpoint() {
+    fn publication_does_not_require_a_preexisting_netpolicy_endpoint() {
         let source = include_str!("service_loop.rs");
         let start = source.split("pub(super) fn run()").nth(1)
             .and_then(|body| body.split("/// Own health proof").next())
             .expect("netd startup source");
-        let reset = start.find("call_packet_broker(NET_BROKER_OP_PACKET_LEASE_RESET")
-            .expect("reset inherited lease");
-        let register = start.find("register_service_endpoint(IPC_SERVICE_NETD")
-            .expect("advertise network service");
-        assert!(reset < register, "new requests cannot race the previous DVM lease reset");
+        assert!(start.contains("register_service_endpoint(IPC_SERVICE_NETD"));
+        assert!(!start.contains("call_packet_broker("),
+            "startup must not require NetPolicy before registration or reset a published lease");
+        // Runtime lease serialization is also exercised by kernel-io-manager's
+        // netd_publication_serializes_reset_and_preserves_rejected_admission.
+
     }
 }
 

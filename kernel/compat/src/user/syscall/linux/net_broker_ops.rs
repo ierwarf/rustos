@@ -155,6 +155,17 @@ fn defer_socket_control_release(control: &[u8]) -> Result<(), i64> {
     Ok(())
 }
 
+/// Snapshot authority before waiting for the transport lock, then revalidate
+/// its exact owner/epoch inside that lock. The entry capability check alone
+/// cannot authorize an operation that sleeps across netd replacement.
+fn packet_authority() -> Result<impl FnOnce() -> bool, i64> {
+    let pid = multitask::current_user_process_id().ok_or(LINUX_ESRCH)?;
+    let expected = ipc_ops::live_service_endpoint_owner_and_epoch(linux_abi::IPC_SERVICE_NETD)
+        .filter(|(owner, _)| *owner == pid)
+        .ok_or(LINUX_EPERM)?;
+    Ok(move || ipc_ops::live_service_endpoint_owner_and_epoch(linux_abi::IPC_SERVICE_NETD) == Some(expected))
+}
+
 fn broker_packet_lease_reset(args: &RustosNetBrokerArgs) -> Result<u64, i64> {
     if args.arg0 != 0
         || args.arg1 != 0
@@ -165,8 +176,8 @@ fn broker_packet_lease_reset(args: &RustosNetBrokerArgs) -> Result<u64, i64> {
     {
         return Err(LINUX_EINVAL);
     }
-    kernel_io_manager::api::network::reset_dvm_transport_lease();
-    Ok(0)
+    kernel_io_manager::api::network::reset_dvm_transport_lease(packet_authority()?)
+        .then_some(0).ok_or(LINUX_ESTALE)
 }
 
 fn broker_packet_lease(args: &RustosNetBrokerArgs, grant: bool) -> Result<u64, i64> {
@@ -180,16 +191,18 @@ fn broker_packet_lease(args: &RustosNetBrokerArgs, grant: bool) -> Result<u64, i
     {
         return Err(LINUX_EINVAL);
     }
+    let authority = packet_authority()?;
     let changed = if grant {
-        kernel_io_manager::api::network::grant_dvm_transport_lease(generation)
+        kernel_io_manager::api::network::grant_dvm_transport_lease(generation, authority)
     } else {
-        kernel_io_manager::api::network::revoke_dvm_transport_lease(generation)
+        kernel_io_manager::api::network::revoke_dvm_transport_lease(generation, authority)
     };
     if changed { Ok(1) } else { Err(LINUX_ESTALE) }
 }
 
 fn broker_packet_status() -> Result<u64, i64> {
-    Ok(kernel_io_manager::api::network::transport_status() as u64)
+    kernel_io_manager::api::network::transport_status(packet_authority()?)
+        .map(|status| status as u64).map_err(packet_error_to_linux_errno)
 }
 
 fn broker_packet_tx(args: &RustosNetBrokerArgs) -> Result<u64, i64> {
@@ -203,7 +216,7 @@ fn broker_packet_tx(args: &RustosNetBrokerArgs) -> Result<u64, i64> {
     let mut frame = alloc::vec![0_u8; len];
     usermem::copy_from_current_user_exact(args.arg0, frame.as_mut_slice())
         .map_err(address_space_error_to_linux_errno)?;
-    kernel_io_manager::api::network::transmit_frame(frame.as_slice())
+    kernel_io_manager::api::network::transmit_frame(frame.as_slice(), packet_authority()?)
         .map(|count| count as u64)
         .map_err(packet_error_to_linux_errno)
 }
@@ -217,7 +230,7 @@ fn broker_packet_rx(args: &RustosNetBrokerArgs) -> Result<u64, i64> {
     usermem::validate_current_user_write_buffer(args.arg0, cap)
         .map_err(address_space_error_to_linux_errno)?;
     let mut frame = alloc::vec![0_u8; cap];
-    let count = kernel_io_manager::api::network::receive_frame(frame.as_mut_slice())
+    let count = kernel_io_manager::api::network::receive_frame(frame.as_mut_slice(), packet_authority()?)
         .map_err(packet_error_to_linux_errno)?;
     let received = frame.get(..count).ok_or(LINUX_EIO)?;
     usermem::write_current_user_bytes(args.arg0, received)
@@ -232,6 +245,7 @@ fn packet_error_to_linux_errno(err: kernel_io_manager::api::network::PacketError
         kernel_io_manager::api::network::PacketError::Busy => LINUX_EAGAIN,
         kernel_io_manager::api::network::PacketError::TooLarge => LINUX_EMSGSIZE,
         kernel_io_manager::api::network::PacketError::WouldBlock => LINUX_EAGAIN,
+        kernel_io_manager::api::network::PacketError::Revoked => LINUX_ESTALE,
     }
 }
 

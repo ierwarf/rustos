@@ -154,6 +154,14 @@ or launch policy.
   qualification. It runs from `selftest.sh`;
   widening a deadline, restoring an unclassified 30-second helper, or wrapping
   endpoint publication in a retry loop is a contract failure before TLC.
+- KVM product traces are written and replayed in the launch-owned log
+  directory with a unique process/run sequence, and bind the exact runtime
+  disk passed to QEMU (not the default shared build image). Only successfully
+  replayed files are atomically published to the optional shared
+  `build/formal/runtime-traces/kvm-p0*.jsonl` artifacts. Parallel boots never
+  validate a filename another lane can overwrite. Trace timing is explicitly
+  advisory in this lane; functional conformance is not timing-SLO evidence,
+  and neither interactive nor diagnostic startup limits widen the product SLO.
 - Nightly evidence is `bash formal/verify-all.sh --profile nightly`: the PR
   tier plus selected fixed-seed simulation, Miri, Loom, Apalache, TLAPS, and
   bounded Rust/C libFuzzer lanes, plus pinned address/thread instrumentation
@@ -204,11 +212,18 @@ or launch policy.
   separate private copies with nothing comparing them, so a divergence would
   have surfaced as a runtime `EPROTO` rather than a build failure.
 - Default socket: `/run/runtimed.sock`.
-- Main methods: `snapshot_running_programs`, `watch_running_programs`,
-  `request_launch_program_new_session`, `request_terminate_session`,
-  `request_terminate_pid`, `notify_ui_ready`.
-- `notify_ui_ready` is one-way: runtimed records readiness without replying,
-  so compositor bootstrap never waits on a closed readiness stream.
+- Protocol v3 carries one monotonic attempt deadline and stable mutation
+  identity. Main methods: `snapshot_running_programs`, `watch_running_programs`,
+  `launch_transaction`, `terminate_session_transaction`,
+  `terminate_pid_transaction`, `submit_transaction`, `query_transaction`,
+  `notify_ui_ready`. The unsafe one-shot mutation wrappers are removed.
+- Launch/terminate callers retain and reconcile the same identity after a lost
+  reply; queueing is not success. Authentication, bounded replay age, worker
+  commit and restart-unknown semantics are owned by
+  [runtime RPC deadlines](runtime-rpc-deadlines.md).
+- `notify_ui_ready` is idempotent request/response: runtimed records readiness
+  then acknowledges it. A dedicated worker, never the compositor frame turn,
+  waits for that acknowledgement.
 - `watch_running_programs` is `snapshot_running_programs` with the reply
   withheld until the running set stops matching the digest the caller passes
   back. It is how uiserver's taskbar and sessiond's restart policy observe

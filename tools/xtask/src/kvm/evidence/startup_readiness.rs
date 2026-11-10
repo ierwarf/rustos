@@ -132,7 +132,9 @@ pub(super) fn initd_endpoint_failure(log: &str) -> Option<String> {
 
 /// The first startup failure in `log` as a human-readable cause, if any.
 pub(super) fn startup_failure_detail(log: &str) -> Option<String> {
-    initd_endpoint_failure(log).or_else(|| ui_readiness_failure(log))
+    const STARTUP_TIMEOUT: &str = "initd: fatal startup timeout v=1 ";
+    log.lines().find(|line| line.contains(STARTUP_TIMEOUT) || line.contains("initd: fatal startup failure v=1 ")).map(|line| line.trim().to_owned())
+        .or_else(|| initd_endpoint_failure(log)).or_else(|| ui_readiness_failure(log))
 }
 
 /// True when a UI proof run may rely on the UI having completed startup.
@@ -254,6 +256,12 @@ mod tests {
     // Format asserted by `startup::tests` in uiserver.
     const READY: &str = "user-debug payload=uiserver: readiness v1 state=ready gen=14 assets=ready#1 display=ready#1 input=ready#1 wayland=ready#1 runtime=ready#1 gpu=ready#1\\n";
     const FAILED: &str = "user-debug payload=uiserver: readiness v1 state=failed gen=9 cause=input errno=110 assets=ready#1 display=ready#1 input=failed#7/errno110 wayland=ready#1 runtime=backoff#2 gpu=attempting#1\\n";
+
+    #[test]
+    fn typed_parent_timeout_fails_immediately_with_unlaunched_executable() {
+        let log = "initd: fatal startup timeout v=1 phase=admission exec=services/inputd/inputd.elf package=inputd errno=110";
+        assert_eq!(startup_failure_detail(log).as_deref(), Some(log));
+    }
 
     #[test]
     fn initd_failure_from_the_real_run_45_line_names_service_and_errno() {

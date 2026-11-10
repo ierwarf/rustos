@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 
 #include "rustos-dvm-gpu-runtime.h"
+#include "rustos-dvm-gpu-deadline.h"
 
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
@@ -996,7 +997,9 @@ int rustos_gpu_runtime_render_batch(struct rustos_gpu_runtime *runtime,
                                     uint32_t damage_count,
                                     const uint8_t *batch, size_t batch_bytes,
                                     uint32_t binding_slot, uint64_t generation,
-                                    uint64_t sequence, int source_acquire_fence_fd,
+                                    uint64_t sequence, uint64_t operation_started_ns,
+                                    int source_acquire_fence_fd,
+                                    _Atomic uint64_t *watchdog_deadline_ns,
                                     struct rustos_gpu_frame *frame) {
     struct gpu_batch_header header;
     struct gpu_source source;
@@ -1004,6 +1007,7 @@ int rustos_gpu_runtime_render_batch(struct rustos_gpu_runtime *runtime,
     int source_referenced = 0;
     GLsync acquire_fence;
     GLenum wait_result;
+    uint64_t now_ns, remaining_ns;
     if (runtime != NULL)
         runtime->stage = "gpu-batch-validate";
     if (runtime == NULL)
@@ -1012,8 +1016,8 @@ int rustos_gpu_runtime_render_batch(struct rustos_gpu_runtime *runtime,
         (!runtime->dmabuf_sources_ready && source_acquire_fence_fd >= 0) ||
         atlas_pixels == NULL ||
         (damage_count != 0U && damage == NULL) || damage_count > 64U ||
-        batch == NULL || frame == NULL ||
-        generation == 0U || sequence == 0U ||
+        batch == NULL || frame == NULL || watchdog_deadline_ns == NULL ||
+        generation == 0U || sequence == 0U || operation_started_ns == 0U ||
         atlas_bytes != (size_t)runtime->atlas_stride_bytes * runtime->atlas_height) {
         return reject_source_acquire_fence(source_acquire_fence_fd, EPROTO);
     }
@@ -1075,6 +1079,20 @@ int rustos_gpu_runtime_render_batch(struct rustos_gpu_runtime *runtime,
         header.budget_us < RUSTOS_GPU_COLD_RENDER_BUDGET_US)
         header.budget_us = RUSTOS_GPU_COLD_RENDER_BUDGET_US;
     frame->budget_us = header.budget_us;
+    if (gpu_deadline_after(operation_started_ns, (uint64_t)header.budget_us * 1000ULL,
+                           &frame->render_deadline_ns) != 0 ||
+        gpu_deadline_after(frame->render_deadline_ns, 100000000ULL,
+                           &frame->operation_deadline_ns) != 0 ||
+        monotonic_ns(&now_ns) != 0 ||
+        gpu_deadline_remaining(now_ns, frame->render_deadline_ns, &remaining_ns) != 0)
+        return reject_source_acquire_fence(source_acquire_fence_fd, errno);
+    {
+        uint64_t armed = atomic_load_explicit(watchdog_deadline_ns, memory_order_acquire);
+        while (armed != 0U && frame->operation_deadline_ns < armed &&
+               !atomic_compare_exchange_weak(watchdog_deadline_ns, &armed,
+                                             frame->operation_deadline_ns))
+            ;
+    }
     runtime->stage = runtime->dmabuf_sources_ready
         ? "gpu-batch-dmabuf-acquire"
         : "gpu-batch-atlas-upload";
@@ -1109,8 +1127,13 @@ int rustos_gpu_runtime_render_batch(struct rustos_gpu_runtime *runtime,
             return -1;
         }
         glFlush();
+        if (monotonic_ns(&now_ns) != 0 ||
+            gpu_deadline_remaining(now_ns, frame->render_deadline_ns, &remaining_ns) != 0) {
+            glDeleteSync(acquire_fence);
+            return -1;
+        }
         wait_result = glClientWaitSync(acquire_fence, GL_SYNC_FLUSH_COMMANDS_BIT,
-                                       (GLuint64)header.budget_us * 1000ULL);
+                                       (GLuint64)remaining_ns);
         glDeleteSync(acquire_fence);
         if (wait_result != GL_ALREADY_SIGNALED &&
             wait_result != GL_CONDITION_SATISFIED) {
@@ -1121,7 +1144,9 @@ int rustos_gpu_runtime_render_batch(struct rustos_gpu_runtime *runtime,
     runtime->completed_acquire = header.acquire_value;
     runtime->last_content_epoch = source.content_epoch;
     runtime->stage = "gpu-batch-render-clock";
-    if (monotonic_ns(&frame->render_started_ns) != 0)
+    if (monotonic_ns(&frame->render_started_ns) != 0 ||
+        gpu_deadline_remaining(frame->render_started_ns, frame->render_deadline_ns,
+                               &remaining_ns) != 0)
         return -1;
     runtime->stage = "gpu-batch-command-draw";
     glUseProgram(runtime->program);

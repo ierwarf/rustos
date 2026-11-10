@@ -67,6 +67,12 @@ struct KvmAcceptanceContract {
     google_ping: bool,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum DependencyLifetime {
+    WhileRunning,
+    CommittedOnce,
+}
+
 /// What the loop remembers about a launch the worker is running.
 ///
 /// The worker never touches `BrokerState`, so everything the terminal
@@ -82,12 +88,14 @@ pub(crate) struct InFlightLaunch {
     /// Set once the loop has recorded the child, which is what tells the
     /// failure path whether there is a record to drop.
     pub(crate) recorded_pid: Option<i32>,
+    pub(crate) rpc_transaction: Option<crate::runtime_transactions::TransactionKey>,
+    dependency_lifetime: DependencyLifetime,
 }
 
 /// The calls the launch worker makes, bound to the real services.
 pub(super) fn launch_calls() -> crate::launch_worker::LaunchCalls {
     crate::launch_worker::LaunchCalls {
-        spawn: |entry, session_handle| {
+        spawn: |entry, session_handle, deadline_ns| {
             // Applied here rather than on the loop. It reads a policy file from
             // the DVM volume, and it deliberately does not cache a failure - the
             // file is legitimately absent until storaged is up - so every launch
@@ -100,7 +108,7 @@ pub(super) fn launch_calls() -> crate::launch_worker::LaunchCalls {
             let entry = &entry;
             // The child is created start-suspended. It becomes runnable only
             // after the loop has recorded it; see `launch_worker`.
-            spawn_exec(
+            spawn_exec_with_deadline(
                 entry.exec.as_str(),
                 entry.args.as_slice(),
                 entry.env.as_slice(),
@@ -108,21 +116,21 @@ pub(super) fn launch_calls() -> crate::launch_worker::LaunchCalls {
                 entry.weight_micros,
                 session_handle,
                 true,
+                deadline_ns,
             )
         },
-        report_lease: |entry, pid| {
-            report_rootd_service_lease(IPC_SERVICE_UISERVER, entry.exec.as_str(), pid)
+        report_lease: |entry, pid, deadline| {
+            report_rootd_service_lease(IPC_SERVICE_UISERVER, entry.exec.as_str(), pid, deadline)
         },
-        bind_and_activate: |pid, contract| {
-            bind_then_activate_spawned_process(
-                pid,
-                contract,
-                bind_smp_qualification,
-                activate_spawned_process,
-            )
+        bind_and_activate: |pid, contract, deadline| {
+            bind_then_activate_spawned_process(pid, contract, bind_smp_qualification, |pid| {
+                activate_spawned_process_with_deadline(pid, deadline)
+            })
             .map_err(|(stage, errno)| (stage.cleanup_stage(), errno))
         },
-        await_endpoint: |pid| wait_for_service_endpoint(IPC_SERVICE_UISERVER, pid).map(|_| ()),
+        await_endpoint: |pid, deadline| {
+            wait_for_service_endpoint(IPC_SERVICE_UISERVER, pid, deadline).map(|_| ())
+        },
         retire: retire_failed_spawn_or_abort,
     }
 }
@@ -134,6 +142,32 @@ pub(super) fn launch_calls() -> crate::launch_worker::LaunchCalls {
 /// and because a session that exists before the child does is what lets the
 /// compositor show the window while the image is still loading.
 pub(super) fn begin_tracked_launch(state: &mut BrokerState, entry: LaunchEntry) -> Result<(), i32> {
+    begin_tracked_launch_inner(state, entry, None, None, None)
+}
+
+pub(super) fn begin_rpc_launch(
+    state: &mut BrokerState,
+    entry: LaunchEntry,
+    key: crate::runtime_transactions::TransactionKey,
+    deadline: Instant,
+    deadline_ns: u64,
+) -> Result<(), i32> {
+    begin_tracked_launch_inner(state, entry, Some(key), Some(deadline), Some(deadline_ns))
+}
+
+fn begin_tracked_launch_inner(
+    state: &mut BrokerState,
+    entry: LaunchEntry,
+    rpc_transaction: Option<crate::runtime_transactions::TransactionKey>,
+    deadline: Option<Instant>,
+    deadline_ns: Option<u64>,
+) -> Result<(), i32> {
+    if state.launch_in_flight.is_some() {
+        return Err(libc::EBUSY);
+    }
+    if deadline.is_some_and(|end| Instant::now() >= end) {
+        return Err(libc::ETIMEDOUT);
+    }
     // The acceptance contract is applied by the worker; it is a storage read
     // and it only rewrites the child's environment, so nothing decided below
     // depends on it.
@@ -169,7 +203,21 @@ pub(super) fn begin_tracked_launch(state: &mut BrokerState, entry: LaunchEntry) 
         restart: entry.restart,
         logical_admin: entry.logical_admin,
         recorded_pid: None,
+        rpc_transaction,
+        // Automatic restart custody stays with sessiond for RPC requests.
+        // Dependency lifetime is separate: service executables must remain
+        // running, while a committed one-shot can satisfy a later dependency.
+        dependency_lifetime: if entry.restart
+            || (rpc_transaction.is_some() && entry.exec.starts_with("services/")) {
+            DependencyLifetime::WhileRunning
+        } else {
+            DependencyLifetime::CommittedOnce
+        },
     };
+    if deadline.is_some_and(|end| Instant::now() >= end) {
+        release_failed_session(state, session_handle);
+        return Err(libc::ETIMEDOUT);
+    }
     let submitted = state
         .launch_worker
         .as_ref()
@@ -179,6 +227,9 @@ pub(super) fn begin_tracked_launch(state: &mut BrokerState, entry: LaunchEntry) 
                 qualification_contract,
                 session_handle,
                 is_ui_server,
+                deadline,
+                deadline_ns,
+                report_started: rpc_transaction.is_some(),
             })
         })
         .unwrap_or(Err(libc::EPIPE));
@@ -208,7 +259,10 @@ const LAUNCH_WORKER_RETRY_BACKOFF: Duration = Duration::from_millis(500);
 pub(super) fn service_launch_worker(state: &mut BrokerState) -> bool {
     let mut applied = false;
     if state.launch_worker.is_none() {
-        if state.launch_worker_retry_at.is_none_or(|due| Instant::now() >= due) {
+        if state
+            .launch_worker_retry_at
+            .is_none_or(|due| Instant::now() >= due)
+        {
             state.launch_worker_retry_at = Some(Instant::now() + LAUNCH_WORKER_RETRY_BACKOFF);
             state.launch_worker = crate::launch_worker::start(launch_calls());
             if state.launch_worker.is_some() {
@@ -230,16 +284,18 @@ pub(super) fn service_launch_worker(state: &mut BrokerState) -> bool {
                 // report Disconnected. A recorded child that has no terminal
                 // outcome must be retired before its session charge is refunded
                 // and its launch slot is made available for a new attempt.
-                let recorded = state.launch_in_flight.as_ref().and_then(|flight| flight.recorded_pid);
+                let recorded = state
+                    .launch_in_flight
+                    .as_ref()
+                    .and_then(|flight| flight.recorded_pid);
                 state.launch_worker = None;
-                state.launch_worker_retry_at =
-                    Some(Instant::now() + LAUNCH_WORKER_RETRY_BACKOFF);
+                state.launch_worker_retry_at = Some(Instant::now() + LAUNCH_WORKER_RETRY_BACKOFF);
                 debug_line("runtimed: launch worker disconnected; retiring in-flight launch");
                 if let Some(pid) = recorded {
                     retire_failed_spawn_or_abort(pid, "launch-worker-disconnected");
                 }
                 if state.launch_in_flight.is_some() {
-                    finish_tracked_launch(state, recorded, Err(libc::EPIPE));
+                    finish_tracked_launch(state, recorded, Err(libc::EOWNERDEAD));
                 }
                 return true;
             }
@@ -247,6 +303,17 @@ pub(super) fn service_launch_worker(state: &mut BrokerState) -> bool {
         };
         applied = true;
         match progress {
+            crate::launch_worker::LaunchProgress::Started => {
+                if let Some(key) = state
+                    .launch_in_flight
+                    .as_ref()
+                    .and_then(|flight| flight.rpc_transaction)
+                {
+                    state
+                        .runtime_transactions
+                        .finish(key, crate::runtime_transactions::Outcome::Admitted);
+                }
+            }
             crate::launch_worker::LaunchProgress::Spawned { pid, record_ack } => {
                 record_spawned_launch(state, pid, record_ack);
             }
@@ -309,6 +376,13 @@ fn finish_tracked_launch(state: &mut BrokerState, pid: Option<i32>, result: Resu
     let Some(in_flight) = state.launch_in_flight.take() else {
         return;
     };
+    if let Some(key) = in_flight.rpc_transaction {
+        let outcome = match result {
+            Err(libc::EOWNERDEAD) => crate::runtime_transactions::Outcome::Unknown,
+            result => crate::runtime_transactions::Outcome::Finished(result),
+        };
+        state.runtime_transactions.finish(key, outcome);
+    }
     match result {
         Ok(()) => {
             observability_client::info!(
@@ -322,13 +396,18 @@ fn finish_tracked_launch(state: &mut BrokerState, pid: Option<i32>, result: Resu
             state
                 .launch_failure_counts
                 .remove(in_flight.desktop_file_id.as_str());
-            if !in_flight.restart {
+            // A committed one-shot is dependency evidence regardless of who
+            // requested it. Sessiond and direct RPC launches use the same DAG
+            // as catalog launches even after the one-shot process has exited.
+            if in_flight.dependency_lifetime == DependencyLifetime::CommittedOnce {
                 state.launched_once.insert(in_flight.package_id);
             }
             if let Some(session) = in_flight.session_handle {
                 super::session::focus_session_after_spawn(state, session);
             }
-            super::image_probe::after_launch(in_flight.exec.as_str());
+            if in_flight.rpc_transaction.is_none() {
+                super::image_probe::after_launch(in_flight.exec.as_str());
+            }
         }
         Err(errno) => {
             // Drop the record only if this loop made one. A failure before the
@@ -341,7 +420,13 @@ fn finish_tracked_launch(state: &mut BrokerState, pid: Option<i32>, result: Resu
                 state.running.remove(&recorded);
             }
             release_failed_session(state, in_flight.session_handle);
-            if is_permanent_launch_failure(errno) {
+            if in_flight.rpc_transaction.is_some() {
+                observability_client::error!(
+                    "runtimed",
+                    service,
+                    "RPC launch failed: errno={errno}"
+                );
+            } else if is_permanent_launch_failure(errno) {
                 observability_client::warn!(
                     "runtimed",
                     service,
@@ -445,7 +530,8 @@ pub(super) fn spawn_tracked_process(
         .as_str(),
     );
     if is_ui_server {
-        if let Err(err) = report_rootd_service_lease(IPC_SERVICE_UISERVER, entry.exec.as_str(), pid)
+        if let Err(err) =
+            report_rootd_service_lease(IPC_SERVICE_UISERVER, entry.exec.as_str(), pid, None)
         {
             retire_failed_spawn_or_abort(pid, "rootd-lease-report");
             release_failed_session(state, session_handle);
@@ -498,7 +584,7 @@ pub(super) fn spawn_tracked_process(
         return Err(err);
     }
     if is_ui_server {
-        if let Err(err) = wait_for_service_endpoint(IPC_SERVICE_UISERVER, pid) {
+        if let Err(err) = wait_for_service_endpoint(IPC_SERVICE_UISERVER, pid, None) {
             state.running.remove(&pid);
             retire_failed_spawn_or_abort(pid, "endpoint-wait");
             release_failed_session(state, session_handle);
@@ -632,11 +718,14 @@ fn apply_kvm_acceptance_contract(entry: &mut LaunchEntry) {
     );
     if contract.network_exercise && entry.desktop_file_id == "netprobe.desktop" {
         upsert_env(&mut entry.env, "RUSTOS_NETPROBE_QEMU=1");
-        upsert_env(&mut entry.env, if contract.google_ping {
-            "RUSTOS_NETPROBE_GOOGLE=1"
-        } else {
-            "RUSTOS_NETPROBE_GOOGLE=0"
-        });
+        upsert_env(
+            &mut entry.env,
+            if contract.google_ping {
+                "RUSTOS_NETPROBE_GOOGLE=1"
+            } else {
+                "RUSTOS_NETPROBE_GOOGLE=0"
+            },
+        );
     }
 }
 
@@ -695,7 +784,9 @@ fn parse_kvm_acceptance_contract(contents: &str) -> Option<KvmAcceptanceContract
         }
     }
     let google_ping = google_ping.unwrap_or(false);
-    if google_ping && network_exercise != Some(true) { return None; }
+    if google_ping && network_exercise != Some(true) {
+        return None;
+    }
     Some(KvmAcceptanceContract {
         ui_profile: ui_profile.filter(|_| contract)?,
         network_exercise: network_exercise?,
@@ -750,7 +841,9 @@ static UNRETIRED_PIDS: std::sync::Mutex<std::collections::BTreeSet<i32>> =
     std::sync::Mutex::new(std::collections::BTreeSet::new());
 
 fn unretired_pids() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<i32>> {
-    UNRETIRED_PIDS.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    UNRETIRED_PIDS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn retire_failed_spawn_or_abort(pid: i32, stage: &str) {
@@ -839,10 +932,8 @@ pub(super) fn reap_children(state: &mut BrokerState) -> bool {
                 // fresh reaper; a failed thread start takes the existing
                 // synchronous fallback on the next pass.
                 debug_line("runtimed: child reaper worker disconnected; recreating");
-                state.child_reaper = super::offload::Offload::start(
-                    "runtimed-reap",
-                    collect_exited_children,
-                );
+                state.child_reaper =
+                    super::offload::Offload::start("runtimed-reap", collect_exited_children);
             } else {
                 let due = state.reap_due.is_none_or(|due| Instant::now() >= due);
                 if due && !reaper.busy() && !state.running.is_empty() && reaper.request() {
@@ -921,6 +1012,28 @@ pub(super) fn spawn_exec(
     session_handle: u64,
     defer_start: bool,
 ) -> Result<i32, i32> {
+    spawn_exec_with_deadline(
+        exec_path,
+        argv,
+        env,
+        logical_admin,
+        weight_micros,
+        session_handle,
+        defer_start,
+        None,
+    )
+}
+
+fn spawn_exec_with_deadline(
+    exec_path: &str,
+    argv: &[String],
+    env: &[String],
+    logical_admin: bool,
+    weight_micros: u64,
+    session_handle: u64,
+    defer_start: bool,
+    deadline_ns: Option<u64>,
+) -> Result<i32, i32> {
     boot_line(format!("runtimed: loader request begin exec={}", exec_path).as_str());
     let argv_storage = build_exec_argv(exec_path, argv)?;
     let env_storage = build_exec_env(env)?;
@@ -932,21 +1045,34 @@ pub(super) fn spawn_exec(
         weight_micros,
         session_handle,
         defer_start,
+        deadline_ns,
     )?;
     let endpoint = lookup_loader_endpoint()?;
     // UI bootstrap keeps its existing short budget. Ordinary catalog work
     // lives on the launch worker and may collect a large immutable image;
     // each OPEN/POLL IPC is still short and the control loop never waits here.
-    let budget_ms = if exec_path == UI_SERVER_EXEC_PATH { IPC_BOOT_CONTROL_HARD_LIMIT_MS }
-        else { rustos_user_abi::syscall::LOADER_APPLICATION_WORK_MAX_LEASE_MS };
-    request.deadline_ns = rustos_svc_runtime::syscall::monotonic_nanos().saturating_add(budget_ms * 1_000_000);
-    let response: LoaderSpawnResponse = match rustos_svc_runtime::loader_client::call(endpoint as u64, &request, None) {
-        Ok(response) => response,
-        Err(errno) => { LOADER_ENDPOINT_CACHE.store(0, Ordering::Relaxed); return Err(errno); }
+    let budget_ms = if exec_path == UI_SERVER_EXEC_PATH {
+        IPC_BOOT_CONTROL_HARD_LIMIT_MS
+    } else {
+        rustos_user_abi::syscall::LOADER_APPLICATION_WORK_MAX_LEASE_MS
     };
-    if response.version != LOADER_REQUEST_ABI_VERSION
-        || response.op != LOADER_OP_SPAWN_EXEC
-    {
+    let now = runtime_control::monotonic_nanos()?;
+    let budget_end = now
+        .checked_add(budget_ms * 1_000_000)
+        .ok_or(libc::EOVERFLOW)?;
+    request.deadline_ns = deadline_ns.unwrap_or(budget_end).min(budget_end);
+    if now >= request.deadline_ns {
+        return Err(libc::ETIMEDOUT);
+    }
+    let response: LoaderSpawnResponse =
+        match rustos_svc_runtime::loader_client::call(endpoint as u64, &request, None) {
+            Ok(response) => response,
+            Err(errno) => {
+                LOADER_ENDPOINT_CACHE.store(0, Ordering::Relaxed);
+                return Err(errno);
+            }
+        };
+    if response.version != LOADER_REQUEST_ABI_VERSION || response.op != LOADER_OP_SPAWN_EXEC {
         return Err(libc::EINVAL);
     }
     if response.status != 0 {
@@ -973,6 +1099,7 @@ fn build_loader_spawn_request(
     weight_micros: u64,
     session_handle: u64,
     defer_start: bool,
+    deadline_ns: Option<u64>,
 ) -> Result<LoaderSpawnRequest, i32> {
     let canonical_exec_path = if exec_path.starts_with('/') {
         exec_path.to_owned()
@@ -1001,7 +1128,10 @@ fn build_loader_spawn_request(
         argv_count: u16::try_from(argv.len()).map_err(|_| libc::E2BIG)?,
         env_count: u16::try_from(env.len()).map_err(|_| libc::E2BIG)?,
         requester_pid: u64::from(std::process::id()),
-        scheduling_context: request_scheduling_context_authority(canonical_exec_path.as_str())?,
+        scheduling_context: request_scheduling_context_authority(
+            canonical_exec_path.as_str(),
+            deadline_ns,
+        )?,
         ..LoaderSpawnRequest::default()
     };
     request.exec_path[..exec_bytes.len()].copy_from_slice(exec_bytes);
@@ -1012,6 +1142,22 @@ fn build_loader_spawn_request(
 }
 
 fn activate_spawned_process(pid: i32) -> Result<(), i32> {
+    activate_spawned_process_with_deadline(pid, None)
+}
+
+fn bounded_timeout_ms(deadline_ns: Option<u64>) -> Result<u64, i32> {
+    match deadline_ns {
+        None => Ok(IPC_BOOT_CONTROL_HARD_LIMIT_MS),
+        Some(end) => rustos_user_abi::deadline::AbsoluteDeadline::after(end, 0)
+            .child_timeout_ms(
+                runtime_control::monotonic_nanos()?,
+                IPC_BOOT_CONTROL_HARD_LIMIT_MS,
+            )
+            .map_err(|_| libc::ETIMEDOUT),
+    }
+}
+
+fn activate_spawned_process_with_deadline(pid: i32, deadline_ns: Option<u64>) -> Result<(), i32> {
     let request = LoaderSpawnRequest {
         version: LOADER_REQUEST_ABI_VERSION,
         op: LOADER_OP_ACTIVATE,
@@ -1020,6 +1166,7 @@ fn activate_spawned_process(pid: i32) -> Result<(), i32> {
         ..LoaderSpawnRequest::default()
     };
     let endpoint = lookup_loader_endpoint()?;
+    let timeout_ms = bounded_timeout_ms(deadline_ns)?;
     let mut response = LoaderSpawnResponse::default();
     let call = unsafe {
         rustos_svc_runtime::syscall::syscall6(
@@ -1029,7 +1176,7 @@ fn activate_spawned_process(pid: i32) -> Result<(), i32> {
             size_of::<LoaderSpawnRequest>() as u64,
             (&mut response as *mut LoaderSpawnResponse) as u64,
             size_of::<LoaderSpawnResponse>() as u64,
-            IPC_BOOT_CONTROL_HARD_LIMIT_MS,
+            timeout_ms,
         )
     };
     if call < 0 {
@@ -1050,12 +1197,16 @@ fn activate_spawned_process(pid: i32) -> Result<(), i32> {
     Ok(())
 }
 
-fn wait_for_service_endpoint(service_id: u64, pid: i32) -> Result<u64, i32> {
+fn wait_for_service_endpoint(
+    service_id: u64,
+    pid: i32,
+    deadline_ns: Option<u64>,
+) -> Result<u64, i32> {
     let args = RustosIpcWaitServiceEndpointArgs {
         abi_version: IPC_WAIT_SERVICE_ENDPOINT_ABI_VERSION,
         service_id,
         expected_pid: u64::try_from(pid).map_err(|_| libc::EINVAL)?,
-        timeout_ms: IPC_BOOT_CONTROL_HARD_LIMIT_MS,
+        timeout_ms: bounded_timeout_ms(deadline_ns)?,
         ..RustosIpcWaitServiceEndpointArgs::default()
     };
     let result = unsafe {
