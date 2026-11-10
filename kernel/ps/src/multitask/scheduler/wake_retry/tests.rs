@@ -141,6 +141,31 @@ fn retry_only_work_defeats_idle_return_until_the_last_token_is_resolved() {
 }
 
 #[test]
+fn prolonged_refusal_preserves_exact_wait_and_reports_once() {
+    let token = Token {
+        task_id: ID,
+        slot: 7,
+        serial: 19,
+        kind: runqueue::wait::REASON_ENDPOINT_REPLY,
+        id: TOKEN,
+        expires_tick: 4_000,
+    };
+    let (retained, reported) = retain_prolonged_retry(token, 4_000);
+    assert!(reported);
+    assert_eq!(retained.expires_tick, u64::MAX);
+    assert_eq!(
+        (retained.task_id, retained.slot, retained.serial, retained.kind, retained.id),
+        (token.task_id, token.slot, token.serial, token.kind, token.id),
+    );
+    let (again, repeated) = retain_prolonged_retry(retained, 100_000);
+    assert_eq!(again, retained);
+    assert!(!repeated, "a prolonged wait may be reported only once");
+    let (early, reported) = retain_prolonged_retry(token, 3_999);
+    assert_eq!(early, token);
+    assert!(!reported);
+}
+
+#[test]
 fn retry_drops_a_token_whose_slot_names_another_task() {
     root(|slot| {
         let scope = scope();

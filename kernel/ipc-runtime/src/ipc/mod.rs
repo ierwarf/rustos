@@ -3162,18 +3162,49 @@ pub fn cancel_endpoint_calls_for_task(
     mut release_scheduling_context: impl FnMut(KernelReplyHandle, ReplySchedulingContextCustody),
 ) -> usize {
     let mut cancelled = 0usize;
+    // A remote receiver may consume the exact reply after the scan selected
+    // its message but before this retire path acquires its terminal locks.
+    // Once that receiver has set reply.consumed it owns the final removal.
+    // Keep such generations out of subsequent scans of this *same* pass:
+    // otherwise the find-first loop repeatedly sees the in-flight terminal
+    // message and panics after MAX_ENDPOINT_MESSAGE_OBJECTS iterations.
+    let mut other_terminal = [0_u64; MAX_ENDPOINT_MESSAGE_OBJECTS];
+    let mut other_terminal_count = 0usize;
     for _ in 0..MAX_ENDPOINT_MESSAGE_OBJECTS {
-        let Some(message_id) = ENDPOINT_MESSAGES
-            .find_handle(|message| message.published && message.caller_task_id == task_id)
-        else {
+        let Some(message_id) = ENDPOINT_MESSAGES.find_handle(|message| {
+            message.published
+                && message.caller_task_id == task_id
+                && !other_terminal[..other_terminal_count].contains(&message.reply_id)
+        }) else {
             break;
         };
         let Some(reply_id) = ENDPOINT_MESSAGES.with(message_id, |message| message.reply_id) else {
             continue;
         };
-        let cancelled_call =
-            cancel_endpoint_call_with_transfers(KernelReplyHandle::from_raw(reply_id), task_id)
-                .expect("published task-owned endpoint call lost exact cancellation state");
+        let cancelled_call = match cancel_endpoint_call_with_transfers(
+            KernelReplyHandle::from_raw(reply_id), task_id,
+        ) {
+            Ok(call) => call,
+            Err(IpcError::InvalidHandle) => {
+                // Either the exact message disappeared, or its reply already
+                // has a different terminal owner. The latter leaves a narrow
+                // interval before the winning consumer removes the message.
+                if ENDPOINT_MESSAGES.with(message_id, |_| ()).is_none() {
+                    continue;
+                }
+                if REPLIES.with(reply_id, |reply| reply.consumed) == Some(true) {
+                    other_terminal[other_terminal_count] = reply_id;
+                    other_terminal_count += 1;
+                    continue;
+                }
+                panic!(
+                    "published task-owned endpoint call lost live cancellation binding task={task_id} reply={reply_id}"
+                );
+            }
+            Err(error) => panic!(
+                "published task-owned endpoint call cancellation failed task={task_id} reply={reply_id} error={error:?}"
+            ),
+        };
         release_transfers(&cancelled_call.transfers);
         if let Some(custody) = cancelled_call.scheduling_context {
             release_scheduling_context(KernelReplyHandle::from_raw(reply_id), custody);
@@ -3181,7 +3212,11 @@ pub fn cancel_endpoint_calls_for_task(
         cancelled += 1;
     }
     if ENDPOINT_MESSAGES
-        .find_handle(|message| message.published && message.caller_task_id == task_id)
+        .find_handle(|message| {
+            message.published
+                && message.caller_task_id == task_id
+                && !other_terminal[..other_terminal_count].contains(&message.reply_id)
+        })
         .is_some()
     {
         panic!(
@@ -3198,9 +3233,17 @@ pub fn cancel_endpoint_calls_for_task(
         }) else {
             return cancelled;
         };
-        let cancelled_call =
-            cancel_endpoint_call_with_transfers(KernelReplyHandle::from_raw(reply_id), task_id)
-                .expect("published task-owned fast call lost exact cancellation state");
+        let cancelled_call = match cancel_endpoint_call_with_transfers(
+            KernelReplyHandle::from_raw(reply_id), task_id,
+        ) {
+            Ok(call) => call,
+            // The exact fast reply may have been consumed and removed since
+            // find_handle. The predicate excludes every consumed reply.
+            Err(IpcError::InvalidHandle) => continue,
+            Err(error) => panic!(
+                "published task-owned fast call cancellation failed task={task_id} reply={reply_id} error={error:?}"
+            ),
+        };
         if let Some(custody) = cancelled_call.scheduling_context {
             release_scheduling_context(KernelReplyHandle::from_raw(reply_id), custody);
         }

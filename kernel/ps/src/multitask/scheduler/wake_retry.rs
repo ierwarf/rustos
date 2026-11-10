@@ -8,7 +8,8 @@
 //! - **Lifecycle:** refused wake -> record while that wait instance is
 //!   published -> retried at every IRQ/scheduler entry of the recording CPU ->
 //!   dropped once woken, once the wait instance completed or changed, once the
-//!   slot names another task, or after a bounded window.
+//!   slot names another task. Once a bounded diagnostic window expires, a
+//!   still-live exact wait retains its retry rather than losing wake custody.
 //! - **Failure:** a refusal is usually a transient window (the target between
 //!   Current and a published frame, a busy frame reader, a racing typed wake).
 //!   Dropping it left the waiter parked until an unrelated event or its own
@@ -26,7 +27,8 @@ use nucleus_core::util::lockdep::{DispatchPreemption, MAX_TRACKED_CPUS};
 use super::runqueue::wait::{WaitInstance, wait_instance};
 use super::{MAX_TASK, runqueue_policy, stack_resources, task_directory, wake_publication};
 
-/// How long one wait instance is retried before the refusal is reported.
+/// Age at which a refused exact wake is reported. The deadline is for
+/// diagnostics, not permission to discard a still-live waiter.
 const RETRY_WINDOW_TICKS: u64 = 4 * crate::arch::rtc::ticks_per_second();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -257,6 +259,16 @@ fn retry_after_observing(
     }
 }
 
+/// A prolonged refusal is still a live exact wait. Warn once and retain
+/// exactly the same wait identity/serial until an actual terminal transition.
+fn retain_prolonged_retry(mut token: Token, now: u64) -> (Token, bool) {
+    let prolonged = now >= token.expires_tick && token.expires_tick != u64::MAX;
+    if prolonged {
+        token.expires_tick = u64::MAX;
+    }
+    (token, prolonged)
+}
+
 /// Retries every token this CPU recorded. Called at each IRQ/scheduler entry
 /// after the deferred wake drain; returns how many tokens were resolved.
 pub(in crate::multitask) fn service(scope: &DispatchPreemption<'_>) -> usize {
@@ -276,17 +288,19 @@ pub(super) fn service_with(
     for token in batch.tokens[..batch.len].iter().flatten().copied() {
         match retry(scope, token, eligible_cpus) {
             Retry::Done => resolved += 1,
-            Retry::Keep if now >= token.expires_tick => {
-                crate::debug::record_milestone(
-                    crate::debug::LogCategory::Sched,
-                    "kernel-scheduler-wake-retry-exhausted",
-                    token.task_id,
-                    (u64::from(token.kind) << 56) | (token.id & 0x00ff_ffff_ffff_ffff),
-                );
-            }
             Retry::Keep => {
+                let (token, prolonged) = retain_prolonged_retry(token, now);
+                if prolonged {
+                    crate::debug::record_milestone(
+                        crate::debug::LogCategory::Sched,
+                        "kernel-scheduler-wake-retry-prolonged",
+                        token.task_id,
+                        (u64::from(token.kind) << 56) | (token.id & 0x00ff_ffff_ffff_ffff),
+                    );
+                }
                 // A wake refused inside this pass may already have recorded a
                 // newer observation of the same task; keep the newer one.
+                // Time alone never withdraws one-shot reply/receive custody.
                 with_queue(scope, |queue| {
                     if !queue.tokens[..queue.len]
                         .iter()

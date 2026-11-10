@@ -311,8 +311,16 @@ fn service_pending_clients(connections: &mut RuntimeConnections, state: &mut Bro
                     begin_running_program_watch(client, state, &mut connections.watchers);
                     continue;
                 }
-                if let Err(err) = dispatch_request(&mut client.stream, client.request, state) {
-                    write_runtime_error(&mut client.stream, err);
+                if let Err((err, response_started)) =
+                    dispatch_request(&mut client.stream, client.request, state)
+                {
+                    // A nonblocking write_all can send a *prefix* before it
+                    // fails with EAGAIN. Appending another error frame would
+                    // corrupt the response stream. Only pre-write rejections
+                    // are allowed to transmit a fresh terminal error.
+                    if !response_started {
+                        write_runtime_error(&mut client.stream, err);
+                    }
                 }
             }
             Err(err) => {
@@ -340,11 +348,12 @@ fn begin_running_program_watch(
     let known_digest = client.request.target_value;
     if running_programs_digest(&programs) != known_digest || watchers.len() >= MAX_RUNTIME_WATCHERS
     {
-        if let Err(err) =
-            write_running_programs(&mut client.stream, OP_WATCH_RUNNING_PROGRAMS, &programs)
-        {
-            write_runtime_error(&mut client.stream, err);
-        }
+        // Once the response starts, a failed nonblocking write may already
+        // have sent a partial header or payload. Drop the socket rather than
+        // appending a second, misleading error frame.
+        let _ = write_running_programs(
+            &mut client.stream, OP_WATCH_RUNNING_PROGRAMS, &programs,
+        );
         return;
     }
 
@@ -397,11 +406,11 @@ pub(super) fn service_running_program_watchers(
             continue;
         }
         answered = true;
-        if let Err(err) =
-            write_running_programs(&mut watcher.stream, OP_WATCH_RUNNING_PROGRAMS, &programs)
-        {
-            write_runtime_error(&mut watcher.stream, err);
-        }
+        // The watcher owns exactly one terminal frame. A partial failed
+        // write is terminal for this socket; never append an error frame.
+        let _ = write_running_programs(
+            &mut watcher.stream, OP_WATCH_RUNNING_PROGRAMS, &programs,
+        );
     }
     answered
 }
@@ -524,22 +533,27 @@ fn admit_request(
     authorize_runtime_request(request, peer, state)
 }
 
+/// The second result bit tells the broker whether an outbound response may
+/// already have partially reached the peer. Only a pre-write policy rejection
+/// can be followed by a fresh error envelope on the same stream.
 fn dispatch_request(
     stream: &mut UnixStream,
     request: RuntimeRequest,
     state: &mut BrokerState,
-) -> Result<(), i32> {
-    match request.op {
-        OP_SNAPSHOT_RUNNING_PROGRAMS => write_running_programs(
-            stream,
-            OP_SNAPSHOT_RUNNING_PROGRAMS,
-            &running_program_snapshot(state),
-        ),
-        OP_REQUEST_LAUNCH_PATH => handle_launch(stream, state, request),
-        OP_REQUEST_TERMINATE => handle_terminate(stream, state, request),
+) -> Result<(), (i32, bool)> {
+    let mut response_started = false;
+    let result = match request.op {
+        OP_SNAPSHOT_RUNNING_PROGRAMS => {
+            response_started = true;
+            write_running_programs(stream, OP_SNAPSHOT_RUNNING_PROGRAMS,
+                &running_program_snapshot(state))
+        }
+        OP_REQUEST_LAUNCH_PATH => handle_launch(stream, state, request, &mut response_started),
+        OP_REQUEST_TERMINATE => handle_terminate(stream, state, request, &mut response_started),
         OP_NOTIFY_READY => handle_ready(stream, state, request),
         _ => Err(libc::EINVAL),
-    }
+    };
+    result.map_err(|err| (err, response_started))
 }
 
 /// The exact running-program array a reply would carry, in the exact order it
@@ -597,6 +611,7 @@ fn handle_launch(
     stream: &mut UnixStream,
     state: &mut BrokerState,
     request: RuntimeRequest,
+    response_started: &mut bool,
 ) -> Result<(), i32> {
     if request.target_kind != LAUNCH_TARGET_NEW_SESSION {
         return Err(libc::EOPNOTSUPP);
@@ -627,6 +642,7 @@ fn handle_launch(
             private_smp_qualification: None,
         },
     )?;
+    *response_started = true;
     super::util::write_response(
         stream,
         RuntimeResponse {
@@ -642,6 +658,7 @@ fn handle_terminate(
     stream: &mut UnixStream,
     state: &mut BrokerState,
     request: RuntimeRequest,
+    response_started: &mut bool,
 ) -> Result<(), i32> {
     let mut terminated = false;
     match request.target_kind {
@@ -689,6 +706,7 @@ fn handle_terminate(
         return Err(libc::ESRCH);
     }
 
+    *response_started = true;
     super::util::write_response(
         stream,
         RuntimeResponse {
@@ -956,6 +974,33 @@ mod tests {
     #[test]
     fn malformed_listener_path_is_rejected_before_opening_any_socket() {
         assert_eq!(bind_listener("bad\0path").err(), Some(libc::EINVAL));
+    }
+
+    #[test]
+    fn dispatch_failure_classifies_prewrite_rejection_separately_from_started_reply() {
+        let (mut stream, _peer) = UnixStream::pair().expect("socket pair");
+        let mut state = BrokerState::default();
+        let denied = RuntimeRequest {
+            op: OP_REQUEST_LAUNCH_PATH,
+            target_kind: 0,
+            ..RuntimeRequest::default()
+        };
+        assert_eq!(
+            dispatch_request(&mut stream, denied, &mut state),
+            Err((libc::EOPNOTSUPP, false)),
+            "policy rejection must still receive a terminal error envelope",
+        );
+        // Snapshot begins writing immediately. A disconnected peer is used
+        // to force an I/O error after the response path is entered.
+        drop(_peer);
+        let snapshot = RuntimeRequest {
+            op: OP_SNAPSHOT_RUNNING_PROGRAMS,
+            ..RuntimeRequest::default()
+        };
+        assert!(
+            matches!(dispatch_request(&mut stream, snapshot, &mut state), Err((_, true))),
+            "write failure must never trigger a second reply frame",
+        );
     }
 
     #[test]
